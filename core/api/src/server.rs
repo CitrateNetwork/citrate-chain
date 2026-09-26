@@ -493,6 +493,44 @@ pub struct RpcConfig {
     /// SECURITY: Must only be true in devnet/dev mode. In production, clients
     /// must use eth_sendRawTransaction with a proper signature. (C-02)
     pub allow_eth_send_transaction: bool,
+    /// PBA-L1a-023: explicit `Host` header allowlist (e.g. `["rpc.example.org"]`,
+    /// `"host:*"` for any port). Empty = the default policy of
+    /// [`rpc_host_allowlist`]: a loopback-bound node that is not behind a
+    /// configured trusted proxy answers loopback `Host`s only (DNS-rebinding
+    /// defence); every other deployment keeps accepting any `Host`.
+    pub allowed_hosts: Vec<String>,
+}
+
+/// PBA-L1a-023: the `Host` allowlist the HTTP RPC server enforces, or `None`
+/// for "any host".
+///
+/// Same policy as geth `--http.vhosts=localhost`. A reverse proxy in front of a loopback node
+/// forwards the public `Host`, so a proxied node (trusted proxies configured)
+/// or a public bind keeps the permissive default unless `allowed_hosts` names
+/// the public hostnames explicitly.
+pub fn rpc_host_allowlist(
+    listen_addr: &SocketAddr,
+    allowed_hosts: &[String],
+    trusted_proxies_configured: bool,
+) -> Option<Vec<String>> {
+    if !allowed_hosts.is_empty() {
+        let mut hosts = allowed_hosts.to_vec();
+        hosts.extend(
+            ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+                .iter()
+                .map(|h| h.to_string()),
+        );
+        return Some(hosts);
+    }
+    if listen_addr.ip().is_loopback() && !trusted_proxies_configured {
+        return Some(
+            ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+                .iter()
+                .map(|h| h.to_string())
+                .collect(),
+        );
+    }
+    None
 }
 
 impl Default for RpcConfig {
@@ -512,6 +550,7 @@ impl Default for RpcConfig {
             threads: 16,
             rate_limit: RateLimitConfig::default(),
             allow_eth_send_transaction: false, // Secure default: reject unsigned tx
+            allowed_hosts: Vec::new(),
         }
     }
 }
@@ -2720,6 +2759,11 @@ impl RpcServer {
         let threads = self.config.threads;
         let cors_origins = self.config.cors_origins.clone();
         let rate_limit_config = self.config.rate_limit.clone();
+        let host_allowlist = rpc_host_allowlist(
+            &listen_addr,
+            &self.config.allowed_hosts,
+            !rate_limit_config.trusted_proxies.is_empty(),
+        );
         let io = self.io_handler;
 
         // PIL-49c: surface the kernel accept-backlog as a Prometheus gauge
@@ -2733,8 +2777,25 @@ impl RpcServer {
             std::sync::mpsc::sync_channel::<Result<CloseHandle, String>>(1);
 
         let join_handle = std::thread::spawn(move || {
-            let mut builder =
-                ServerBuilder::new(io).request_middleware(RateLimiter::new(rate_limit_config));
+            // PBA-L1a-009/-016: wrap the method table in the request-shape
+            // middleware (batch cap, per-element bucket charge, heavy-method
+            // cost). It shares the HTTP limiter's per-client buckets.
+            let limiter = RateLimiter::new(rate_limit_config);
+            let mut limited = jsonrpc_core::MetaIoHandler::with_middleware(
+                crate::rpc_limits::RpcLimits::new(Some(limiter.handle())),
+            );
+            limited.extend_with(io);
+            let mut builder = ServerBuilder::new(limited).request_middleware(limiter);
+            // PBA-L1a-023: Host allowlist (DNS-rebinding defence).
+            if let Some(hosts) = host_allowlist {
+                info!("RPC Host allowlist: {:?}", hosts);
+                builder = builder.allowed_hosts(DomainsValidation::AllowOnly(
+                    hosts
+                        .iter()
+                        .map(|h| jsonrpc_http_server::Host::from(h.as_str()))
+                        .collect(),
+                ));
+            }
             // WP-X.1: Config-driven CORS — wildcard only allowed on localhost
             if cors_origins.iter().any(|o| o == "*") {
                 tracing::warn!("CORS wildcard '*' configured — this is unsafe for public deployments. Use explicit origins in production.");

@@ -33,6 +33,80 @@ const MAX_SUBSCRIPTIONS_PER_CONN: usize = 64;
 const WS_MAX_MESSAGE_SIZE: usize = 1_048_576;
 /// Idle timeout: a connection with no inbound message for this long is dropped.
 const WS_IDLE_TIMEOUT_SECS: u64 = 60;
+/// PBA-L1a-005: a client must complete the WebSocket upgrade within this window.
+const WS_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+/// PBA-L1a-005: most simultaneous sockets (pre- AND post-handshake) from one IP.
+const MAX_WS_CONNECTIONS_PER_IP: usize = 32;
+/// PBA-L1a-005: accept-error backoff bounds (EMFILE/ENFILE must not kill the loop).
+const WS_ACCEPT_BACKOFF_MIN_MS: u64 = 50;
+const WS_ACCEPT_BACKOFF_MAX_MS: u64 = 1_000;
+
+/// PBA-L1a-005: socket admission limits, counted from `accept()` (not from the
+/// end of the handshake) so never-upgraded sockets are bounded too.
+#[derive(Debug, Clone, Copy)]
+pub struct WsLimits {
+    pub max_sockets: usize,
+    pub max_per_ip: usize,
+    pub handshake_timeout: std::time::Duration,
+}
+
+impl Default for WsLimits {
+    fn default() -> Self {
+        Self {
+            max_sockets: MAX_WS_CONNECTIONS,
+            max_per_ip: MAX_WS_CONNECTIONS_PER_IP,
+            handshake_timeout: std::time::Duration::from_secs(WS_HANDSHAKE_TIMEOUT_SECS),
+        }
+    }
+}
+
+/// PBA-L1a-005: held for a socket's whole lifetime; releases its global and
+/// per-IP slots on drop.
+struct SocketSlot {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    ip: std::net::IpAddr,
+    per_ip: Arc<std::sync::Mutex<HashMap<std::net::IpAddr, usize>>>,
+}
+
+impl Drop for SocketSlot {
+    fn drop(&mut self) {
+        let mut m = self.per_ip.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = m.get_mut(&self.ip) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                m.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// PBA-L1a-005: the accept loop, generic over the accept source so the
+/// "an accept error does not end the loop" property is testable: errors are
+/// logged and retried with backoff.
+pub async fn run_accept_loop<A, AF, H>(mut accept: A, mut handle: H)
+where
+    A: FnMut() -> AF,
+    AF: std::future::Future<Output = std::io::Result<(TcpStream, SocketAddr)>>,
+    H: FnMut(TcpStream, SocketAddr),
+{
+    let mut backoff_ms = WS_ACCEPT_BACKOFF_MIN_MS;
+    loop {
+        match accept().await {
+            Ok((stream, peer)) => {
+                backoff_ms = WS_ACCEPT_BACKOFF_MIN_MS;
+                handle(stream, peer);
+            }
+            Err(e) => {
+                error!(
+                    "WebSocket accept error (retrying in {} ms): {}",
+                    backoff_ms, e
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(WS_ACCEPT_BACKOFF_MAX_MS);
+            }
+        }
+    }
+}
 
 /// Subscription types for eth_subscribe
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -220,6 +294,12 @@ pub struct EthSubscriptionServer {
     pending_tx_tx: broadcast::Sender<Hash>,
     /// Active connections
     connections: Arc<RwLock<HashMap<String, Arc<RwLock<ConnectionState>>>>>,
+    /// PBA-L1a-005: socket admission limits.
+    limits: WsLimits,
+    /// PBA-L1a-005: global socket slots, taken at accept().
+    socket_slots: Arc<tokio::sync::Semaphore>,
+    /// PBA-L1a-005: live sockets per remote IP.
+    per_ip: Arc<std::sync::Mutex<HashMap<std::net::IpAddr, usize>>>,
 }
 
 /// State for each WebSocket connection
@@ -253,6 +333,7 @@ impl EthSubscriptionServer {
         let (new_heads_tx, _) = broadcast::channel(100);
         let (pending_tx_tx, _) = broadcast::channel(1000);
 
+        let limits = WsLimits::default();
         Self {
             addr,
             storage,
@@ -260,7 +341,36 @@ impl EthSubscriptionServer {
             new_heads_tx,
             pending_tx_tx,
             connections: Arc::new(RwLock::new(HashMap::new())),
+            socket_slots: Arc::new(tokio::sync::Semaphore::new(limits.max_sockets)),
+            per_ip: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            limits,
         }
+    }
+
+    /// PBA-L1a-005: override the socket admission limits (tests, operators).
+    pub fn with_limits(mut self, limits: WsLimits) -> Self {
+        self.socket_slots = Arc::new(tokio::sync::Semaphore::new(limits.max_sockets));
+        self.limits = limits;
+        self
+    }
+
+    /// PBA-L1a-005: claim a global + per-IP slot for a freshly accepted socket,
+    /// or `None` when either limit is reached (the socket is then dropped).
+    fn try_claim_slot(&self, ip: std::net::IpAddr) -> Option<SocketSlot> {
+        let permit = self.socket_slots.clone().try_acquire_owned().ok()?;
+        {
+            let mut m = self.per_ip.lock().unwrap_or_else(|e| e.into_inner());
+            let n = m.entry(ip).or_insert(0);
+            if *n >= self.limits.max_per_ip {
+                return None;
+            }
+            *n += 1;
+        }
+        Some(SocketSlot {
+            _permit: permit,
+            ip,
+            per_ip: self.per_ip.clone(),
+        })
     }
 
     /// Get sender for broadcasting new block headers
@@ -288,15 +398,28 @@ impl EthSubscriptionServer {
         let listener = TcpListener::bind(self.addr).await?;
         info!("Ethereum subscription WebSocket server listening on ws://{}", self.addr);
 
-        while let Ok((stream, peer_addr)) = listener.accept().await {
-            let server = self.clone();
-            tokio::spawn(async move {
-                if let Err(e) = server.handle_connection(stream, peer_addr).await {
-                    error!("WebSocket connection error from {}: {}", peer_addr, e);
-                }
-            });
-        }
-
+        // PBA-L1a-005: never exits on an accept error (backoff + retry), and
+        // every accepted socket must claim a global + per-IP slot BEFORE the
+        // handshake, which itself is time-bounded.
+        let server = self.clone();
+        run_accept_loop(
+            || listener.accept(),
+            move |stream, peer_addr| {
+                let Some(slot) = server.try_claim_slot(peer_addr.ip()) else {
+                    debug!("Refusing WebSocket socket from {}: socket limit reached", peer_addr);
+                    drop(stream);
+                    return;
+                };
+                let server = server.clone();
+                tokio::spawn(async move {
+                    let _slot = slot;
+                    if let Err(e) = server.handle_connection(stream, peer_addr).await {
+                        error!("WebSocket connection error from {}: {}", peer_addr, e);
+                    }
+                });
+            },
+        )
+        .await;
         Ok(())
     }
 
@@ -314,7 +437,13 @@ impl EthSubscriptionServer {
             max_frame_size: Some(WS_MAX_MESSAGE_SIZE),
             ..Default::default()
         };
-        let ws_stream = accept_async_with_config(stream, Some(ws_config)).await?;
+        // PBA-L1a-005: a socket that never completes the upgrade is dropped.
+        let ws_stream = tokio::time::timeout(
+            self.limits.handshake_timeout,
+            accept_async_with_config(stream, Some(ws_config)),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("WebSocket handshake timed out from {}", peer_addr))??;
         let (mut write, mut read) = ws_stream.split();
 
         let conn_id = format!("{}-{}", peer_addr, chrono::Utc::now().timestamp_millis());
@@ -509,6 +638,18 @@ impl EthSubscriptionServer {
                 })).unwrap_or_default());
             }
         };
+
+        // PBA-L1a-010 (variant): the logs-subscription filter is retained for
+        // the connection's lifetime, so bound it exactly like eth_newFilter.
+        if sub_type == EthSubscriptionType::Logs && request.params.len() > 1 {
+            if let Err(msg) = crate::filter::validate_log_filter_criteria(&request.params[1]) {
+                return Some(serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request.id,
+                    "error": { "code": -32602, "message": msg }
+                })).unwrap_or_default());
+            }
+        }
 
         // Parse filter for logs subscription
         let filter = if sub_type == EthSubscriptionType::Logs && request.params.len() > 1 {

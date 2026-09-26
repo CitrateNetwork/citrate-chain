@@ -13,14 +13,20 @@ use std::path::PathBuf;
 
 use crate::config::Config;
 use crate::utils::keystore;
+use zeroize::Zeroizing;
 
 #[derive(Subcommand)]
 pub enum AccountCommands {
     /// Create a new account
     Create {
-        /// Password for the keystore
-        #[arg(short, long)]
+        /// DEPRECATED (PBA-L4-009): password on argv is visible in `ps`,
+        /// shell history and audit logs. Prefer --password-file or the prompt.
+        #[arg(short, long, conflicts_with = "password_file")]
         password: Option<String>,
+
+        /// Read the keystore password from this file (first line).
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
 
         /// Output path for the keystore file
         #[arg(short, long)]
@@ -64,9 +70,14 @@ pub enum AccountCommands {
         #[arg(long, value_name = "HEX", conflicts_with_all = ["key_stdin", "key_file"])]
         insecure_key_from_arg: Option<String>,
 
-        /// Password for the keystore. If omitted, prompts on stdin.
-        #[arg(short, long)]
+        /// DEPRECATED (PBA-L4-009): password on argv is visible in `ps`,
+        /// shell history and audit logs. If omitted, prompts on stdin.
+        #[arg(short, long, conflicts_with = "password_file")]
         password: Option<String>,
+
+        /// Read the keystore password from this file (first line).
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
     },
 
     /// Export account private key.
@@ -91,15 +102,26 @@ pub enum AccountCommands {
         #[arg(long)]
         confirm_stdout: bool,
 
-        /// Password for the keystore. If omitted, prompts on stdin.
-        #[arg(short, long)]
+        /// DEPRECATED (PBA-L4-009): password on argv is visible in `ps`,
+        /// shell history and audit logs. If omitted, prompts on stdin.
+        #[arg(short, long, conflicts_with = "password_file")]
         password: Option<String>,
+
+        /// Read the keystore password from this file (first line).
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
     },
 }
 
 pub async fn execute(cmd: AccountCommands, config: &Config) -> Result<()> {
     match cmd {
-        AccountCommands::Create { password, output } => {
+        AccountCommands::Create {
+            password,
+            password_file,
+            output,
+        } => {
+            let password =
+                resolve_password(password, password_file, "Enter password for keystore: ")?;
             create_account(config, password, output)?;
         }
         AccountCommands::List => {
@@ -113,8 +135,11 @@ pub async fn execute(cmd: AccountCommands, config: &Config) -> Result<()> {
             key_file,
             insecure_key_from_arg,
             password,
+            password_file,
         } => {
             let key_hex = read_import_key(key_stdin, key_file, insecure_key_from_arg)?;
+            let password =
+                resolve_password(password, password_file, "Enter password for keystore: ")?;
             import_account(config, &key_hex, password)?;
         }
         AccountCommands::Export {
@@ -122,7 +147,9 @@ pub async fn execute(cmd: AccountCommands, config: &Config) -> Result<()> {
             out,
             confirm_stdout,
             password,
+            password_file,
         } => {
+            let password = resolve_password(password, password_file, "Enter keystore password: ")?;
             export_account(config, &address, out, confirm_stdout, password)?;
         }
     }
@@ -131,7 +158,7 @@ pub async fn execute(cmd: AccountCommands, config: &Config) -> Result<()> {
 
 fn create_account(
     config: &Config,
-    password: Option<String>,
+    password: Zeroizing<String>,
     output: Option<PathBuf>,
 ) -> Result<()> {
     // Generate new ed25519 keypair from random bytes
@@ -143,13 +170,6 @@ fn create_account(
 
     // Derive address from public key
     let address = derive_address(verifying_key.as_bytes());
-
-    // Get password (prompt if not provided)
-    let password = match password {
-        Some(p) => p,
-        None => rpassword::prompt_password("Enter password for keystore: ")
-            .context("Failed to read password from terminal")?,
-    };
 
     // Save to keystore
     let keystore_path = output.unwrap_or_else(|| {
@@ -243,7 +263,7 @@ async fn get_balance(config: &Config, address: &str) -> Result<()> {
     Ok(())
 }
 
-fn import_account(config: &Config, private_key: &str, password: Option<String>) -> Result<()> {
+fn import_account(config: &Config, private_key: &str, password: Zeroizing<String>) -> Result<()> {
     // Parse private key (32 bytes for ed25519)
     let key_bytes =
         hex::decode(private_key.trim_start_matches("0x")).context("Invalid private key format")?;
@@ -259,13 +279,6 @@ fn import_account(config: &Config, private_key: &str, password: Option<String>) 
     // Derive public key and address
     let verifying_key = signing_key.verifying_key();
     let address = derive_address(verifying_key.as_bytes());
-
-    // Get password
-    let password = match password {
-        Some(p) => p,
-        None => rpassword::prompt_password("Enter password for keystore: ")
-            .context("Failed to read password from terminal")?,
-    };
 
     // Save to keystore
     let keystore_path = config
@@ -289,7 +302,7 @@ fn export_account(
     address: &str,
     out: Option<PathBuf>,
     confirm_stdout: bool,
-    password: Option<String>,
+    password: Zeroizing<String>,
 ) -> Result<()> {
     let address = address.trim_start_matches("0x");
     let keystore_path = config.keystore_path.join(format!("{}.json", address));
@@ -310,16 +323,10 @@ fn export_account(
         );
     }
 
-    // Get password
-    let password = match password {
-        Some(p) => p,
-        None => rpassword::prompt_password("Enter keystore password: ")
-            .context("Failed to read password from terminal")?,
-    };
-
     // Load and decrypt key
     let signing_key = keystore::load_key(&keystore_path, &password)?;
-    let key_hex = hex::encode(signing_key.to_bytes());
+    // PBA-L4-009: wipe the hex-encoded secret when this scope ends.
+    let key_hex = Zeroizing::new(hex::encode(signing_key.to_bytes()));
 
     eprintln!(
         "{}",
@@ -327,7 +334,7 @@ fn export_account(
     );
 
     if let Some(path) = out {
-        write_secret_file(&path, &key_hex)
+        write_secret_file(&path, key_hex.as_str())
             .with_context(|| format!("Failed to write private key to {}", path.display()))?;
         eprintln!(
             "Private key written to {} (mode 0600 on Unix). Delete or `shred` after use.",
@@ -335,10 +342,45 @@ fn export_account(
         );
     } else {
         // confirm_stdout is true here per the gate above.
-        println!("{}", key_hex);
+        println!("{}", key_hex.as_str());
     }
 
     Ok(())
+}
+
+/// PBA-L4-009: resolve the keystore password without putting it on argv.
+///
+/// Order: `--password-file` (first line), then the legacy `--password` argv
+/// value (with a loud warning — argv is visible in `ps`, shell history and
+/// audit logs), then an interactive no-echo prompt. Returned `Zeroizing` so
+/// the password is wiped when the command finishes.
+fn resolve_password(
+    password: Option<String>,
+    password_file: Option<PathBuf>,
+    prompt: &str,
+) -> Result<Zeroizing<String>> {
+    if let Some(path) = password_file {
+        let raw = Zeroizing::new(
+            fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read password file {}", path.display()))?,
+        );
+        let line = raw.lines().next().unwrap_or("").to_string();
+        return Ok(Zeroizing::new(line));
+    }
+    if let Some(p) = password {
+        eprintln!(
+            "{}",
+            "⚠️  WARNING: --password puts the keystore password on the command line \
+             (visible in `ps`, shell history and audit logs). Use --password-file or the \
+             interactive prompt."
+                .yellow()
+                .bold()
+        );
+        return Ok(Zeroizing::new(p));
+    }
+    Ok(Zeroizing::new(
+        rpassword::prompt_password(prompt).context("Failed to read password from terminal")?,
+    ))
 }
 
 /// RM-K / WP-K1.6: helper for the `account import` private-key input
@@ -395,6 +437,24 @@ fn write_secret_file(path: &std::path::Path, contents: &str) -> std::io::Result<
     file.write_all(contents.as_bytes())?;
     file.write_all(b"\n")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests_pba_l4_009 {
+    use super::*;
+
+    /// PBA-L4-009: `--password-file` reads the first line (no trailing newline)
+    /// and takes precedence, so scripts never need the password on argv.
+    #[test]
+    fn pba_l4_009_password_file_is_read_and_preferred() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let f = dir.path().join("pw");
+        std::fs::write(&f, "hunter2-hunter2\nignored\n").expect("write");
+        let p = resolve_password(Some("from-argv".into()), Some(f), "unused").expect("resolve");
+        assert_eq!(p.as_str(), "hunter2-hunter2");
+        let p = resolve_password(Some("from-argv".into()), None, "unused").expect("resolve");
+        assert_eq!(p.as_str(), "from-argv");
+    }
 }
 
 #[cfg(test)]

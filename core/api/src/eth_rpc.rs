@@ -45,6 +45,70 @@ pub const RPC_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// formatting a `json!` macro containing a literal this long.
 const EMPTY_LOGS_BLOOM: &str = "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
 
+/// PBA-L1a-002: the most blocks one `eth_feeHistory` call may span (geth: 1024).
+pub const FEE_HISTORY_MAX_BLOCKS: u64 = 1024;
+
+/// PBA-L1a-002: the most `rewardPercentiles` one `eth_feeHistory` call may ask
+/// for (geth caps at 100). Each percentile costs one string per block in the
+/// response, so this bounds the response at `1024 * 100` entries.
+pub const FEE_HISTORY_MAX_PERCENTILES: usize = 100;
+
+/// PBA-L1a-002: method-budget cost of an `eth_feeHistory` call: a base of 10
+/// (like `eth_getLogs`) plus one unit per 1024 response entries, so the
+/// largest legal call costs 111 of the 1000-unit per-second budget.
+pub fn fee_history_cost(block_count: u64, percentiles: usize) -> u32 {
+    let entries = block_count.saturating_mul((percentiles as u64).saturating_add(1));
+    let extra = entries.div_ceil(1024);
+    10u32.saturating_add(u32::try_from(extra).unwrap_or(u32::MAX))
+}
+
+/// PBA-L1a-002: parse and validate `eth_feeHistory`'s `rewardPercentiles`.
+///
+/// Absent/`null` means "no rewards". Otherwise it must be an array of at most
+/// [`FEE_HISTORY_MAX_PERCENTILES`] finite numbers in `0..=100`, monotonically
+/// non-decreasing (the geth contract). Anything else is `-32602 invalid params`
+/// instead of being silently filtered, so an oversized list can never reach the
+/// per-block reward loop.
+pub fn parse_reward_percentiles(v: Option<&Value>) -> Result<Vec<f64>, jsonrpc_core::Error> {
+    let arr = match v {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(arr)) => arr,
+        Some(_) => {
+            return Err(jsonrpc_core::Error::invalid_params(
+                "rewardPercentiles must be an array of numbers",
+            ))
+        }
+    };
+    if arr.len() > FEE_HISTORY_MAX_PERCENTILES {
+        return Err(jsonrpc_core::Error::invalid_params(format!(
+            "rewardPercentiles has {} entries; at most {} are allowed",
+            arr.len(),
+            FEE_HISTORY_MAX_PERCENTILES
+        )));
+    }
+    let mut out = Vec::with_capacity(arr.len());
+    let mut prev = 0.0f64;
+    for p in arr {
+        let pct = p.as_f64().ok_or_else(|| {
+            jsonrpc_core::Error::invalid_params("rewardPercentiles entries must be numbers")
+        })?;
+        if !pct.is_finite() || !(0.0..=100.0).contains(&pct) {
+            return Err(jsonrpc_core::Error::invalid_params(format!(
+                "rewardPercentiles entry {} is outside 0..=100",
+                pct
+            )));
+        }
+        if pct < prev {
+            return Err(jsonrpc_core::Error::invalid_params(
+                "rewardPercentiles must be monotonically non-decreasing",
+            ));
+        }
+        prev = pct;
+        out.push(pct);
+    }
+    Ok(out)
+}
+
 /// CHAIN-B-D002: reject a caller-supplied gas limit above the RPC gas cap.
 /// Extracted as a seam so the bound is unit-testable without standing up a
 /// full RPC server + executor.
@@ -766,20 +830,15 @@ pub fn register_eth_methods(
         let base_nonce = block_on(state_api.get_nonce(Address(addr_bytes))).unwrap_or_default();
 
         if tag.eq_ignore_ascii_case("pending") {
-            // Include pending mempool transactions from this sender
-            let mp = mempool_nonce.clone();
-            let total = block_on(mp.stats()).total_transactions;
-            let txs = block_on(mp.get_transactions(total));
-            let mut max_nonce = None;
-            for tx in txs {
-                // Derive sender address from tx.from
-                let sender_addr = citrate_execution::address_utils::normalize_address(&tx.from);
-                if sender_addr.0 == addr_bytes {
-                    max_nonce = Some(max_nonce.map_or(tx.nonce, |m: u64| m.max(tx.nonce)));
-                }
-            }
-            let pending_nonce = match max_nonce {
-                Some(m) if m + 1 > base_nonce => m + 1,
+            // Include pending mempool transactions from this sender.
+            // PBA-L1a-021: walk the mempool's per-sender nonce index instead
+            // of cloning every pending transaction per call; the successor is
+            // computed with `checked_add` inside `pending_nonce_matching`.
+            let pending = block_on(mempool_nonce.pending_nonce_matching(|pk| {
+                citrate_execution::address_utils::normalize_address(pk).0 == addr_bytes
+            }));
+            let pending_nonce = match pending {
+                Some(next) if next > base_nonce => next,
                 _ => base_nonce,
             };
             return Ok(Value::String(format!("0x{:x}", pending_nonce)));
@@ -1405,7 +1464,24 @@ pub fn register_eth_methods(
             .and_then(|v| v.as_str())
             .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
             .unwrap_or(1)
-            .min(1024); // Cap at 1024 blocks
+            .min(FEE_HISTORY_MAX_BLOCKS);
+
+        // PBA-L1a-002: validate `rewardPercentiles` before touching storage,
+        // and charge the method budget in proportion to the response it can
+        // produce (blocks x (1 + percentiles)).
+        let percentiles = parse_reward_percentiles(params.get(2))?;
+        crate::rate_limit::check_method_budget(fee_history_cost(block_count, percentiles.len()))?;
+
+        // PBA-L1a-020: `blockCount = 0` used to reach `block_count - 1` and
+        // underflow (panic under overflow-checks). geth answers an empty history.
+        if block_count == 0 {
+            return Ok(json!({
+                "oldestBlock": "0x0",
+                "reward": [],
+                "baseFeePerGas": [],
+                "gasUsedRatio": []
+            }));
+        }
 
         // Get current height
         let api = ChainApi::new(storage_fee.clone());
@@ -1427,13 +1503,6 @@ pub fn register_eth_methods(
         let mut base_fees: Vec<String> = Vec::new();
         let mut gas_used_ratios: Vec<f64> = Vec::new();
         let mut rewards: Vec<Vec<String>> = Vec::new();
-
-        // Parse reward percentiles if provided
-        let percentiles: Vec<f64> = params
-            .get(2)
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|p| p.as_f64()).collect())
-            .unwrap_or_default();
 
         for height in start_height..=current_height {
             // Get block hash at height
@@ -1581,6 +1650,9 @@ pub fn register_eth_methods(
         }
 
         let filter = &params[0];
+        // PBA-L1a-010: bound the criteria before parsing or retaining them.
+        crate::filter::validate_log_filter_criteria(filter)
+            .map_err(jsonrpc_core::Error::invalid_params)?;
 
         // Get current height for "latest" resolution
         let current_height = storage_logs.blocks.get_latest_height().unwrap_or(0);
@@ -1804,6 +1876,9 @@ pub fn register_eth_methods(
         }
 
         let filter = &params[0];
+        // PBA-L1a-010: bound the criteria before parsing or retaining them.
+        crate::filter::validate_log_filter_criteria(filter)
+            .map_err(jsonrpc_core::Error::invalid_params)?;
         let current_height = storage_new_filter.blocks.get_latest_height().unwrap_or(0);
 
         // Parse fromBlock

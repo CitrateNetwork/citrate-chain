@@ -37,6 +37,54 @@ pub struct Filter {
 /// node OOMs. 10k is far above any honest indexer's working set.
 pub const MAX_FILTERS: usize = 10_000;
 
+/// PBA-L1a-010: most `address` entries one log filter may carry.
+pub const MAX_FILTER_ADDRESSES: usize = 32;
+/// PBA-L1a-010: most topic positions one log filter may carry. An EVM log has
+/// at most 4 topics (LOG0..LOG4), so a 5th position can never match anything.
+pub const MAX_FILTER_TOPIC_POSITIONS: usize = 4;
+/// PBA-L1a-010: most alternatives (OR list) in one topic position.
+pub const MAX_FILTER_TOPIC_ALTERNATIVES: usize = 32;
+
+/// PBA-L1a-010: bound the size of `eth_getLogs` / `eth_newFilter` /
+/// `eth_subscribe("logs")` criteria BEFORE they are parsed or retained.
+///
+/// Oversized criteria are `-32602 invalid params`, never silently truncated.
+pub fn validate_log_filter_criteria(filter: &serde_json::Value) -> Result<(), String> {
+    use serde_json::Value;
+    match filter.get("address") {
+        Some(Value::Array(addrs)) if addrs.len() > MAX_FILTER_ADDRESSES => {
+            return Err(format!(
+                "filter has {} addresses; at most {} are allowed",
+                addrs.len(),
+                MAX_FILTER_ADDRESSES
+            ));
+        }
+        _ => {}
+    }
+    if let Some(Value::Array(topics)) = filter.get("topics") {
+        if topics.len() > MAX_FILTER_TOPIC_POSITIONS {
+            return Err(format!(
+                "filter has {} topic positions; at most {} are allowed",
+                topics.len(),
+                MAX_FILTER_TOPIC_POSITIONS
+            ));
+        }
+        for (i, pos) in topics.iter().enumerate() {
+            if let Value::Array(alts) = pos {
+                if alts.len() > MAX_FILTER_TOPIC_ALTERNATIVES {
+                    return Err(format!(
+                        "topic position {} has {} alternatives; at most {} are allowed",
+                        i,
+                        alts.len(),
+                        MAX_FILTER_TOPIC_ALTERNATIVES
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Filter registry for managing eth_newFilter/eth_getFilterChanges state
 pub struct FilterRegistry {
     filters: RwLock<HashMap<u64, Filter>>,

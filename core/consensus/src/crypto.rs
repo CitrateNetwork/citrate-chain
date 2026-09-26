@@ -52,23 +52,34 @@ pub fn verify_transaction(tx: &Transaction) -> Result<bool, CryptoError> {
             Ok(false)
         }
     } else {
-        // ed25519 native transaction verification
-        verify_ed25519_transaction(tx)
+        // ed25519 native transaction verification (V2 or V1 preimage).
+        verify_ed25519_transaction(tx, true)
     }
 }
 
-/// Verify an ed25519 native transaction signature
-fn verify_ed25519_transaction(tx: &Transaction) -> Result<bool, CryptoError> {
-    // Get canonical bytes to verify (everything except signature)
-    let message = canonical_tx_bytes(tx)?;
-
+/// Verify an ed25519 native transaction signature.
+///
+/// Accepts the V2 preimage ([`canonical_tx_bytes_v2`], which binds
+/// `chain_id` and every fee/type field under a domain tag) and, when
+/// `accept_v1`, the V1 preimage ([`canonical_tx_bytes`]).
+fn verify_ed25519_transaction(tx: &Transaction, accept_v1: bool) -> Result<bool, CryptoError> {
     // Convert our types to ed25519-dalek types
     let public_key =
         VerifyingKey::from_bytes(tx.from.as_bytes()).map_err(|_| CryptoError::InvalidPublicKey)?;
 
     let signature = DalekSignature::from_bytes(tx.signature.as_bytes());
 
-    // Verify the signature
+    if public_key
+        .verify(&canonical_tx_bytes_v2(tx), &signature)
+        .is_ok()
+    {
+        return Ok(true);
+    }
+    if !accept_v1 {
+        return Ok(false);
+    }
+    // V1 canonical bytes.
+    let message = canonical_tx_bytes(tx)?;
     match public_key.verify(&message, &signature) {
         Ok(_) => Ok(true),
         Err(_) => Ok(false),
@@ -79,13 +90,101 @@ fn verify_ed25519_transaction(tx: &Transaction) -> Result<bool, CryptoError> {
 /// bytes. Unlike [`verify_transaction`] it never consults `ecdsa_verified`.
 /// Used by `tx_auth` (PBA-R2).
 pub(crate) fn verify_ed25519_signature(tx: &Transaction) -> Result<bool, CryptoError> {
-    verify_ed25519_transaction(tx)
+    // V2 or legacy V1 preimage, same policy as `verify_transaction`.
+    verify_ed25519_transaction(tx, true)
 }
 
 /// The exact bytes a native ed25519 transaction signature covers.
 pub fn canonical_signing_bytes(tx: &Transaction) -> Vec<u8> {
     // `canonical_tx_bytes` cannot fail (it only appends); keep one encoder.
     canonical_tx_bytes(tx).unwrap_or_default()
+}
+
+/// [`verify_transaction`] with an explicit native-signature policy:
+/// `accept_v1 = false` accepts only V2 native signatures.
+pub fn verify_transaction_with_policy(
+    tx: &Transaction,
+    accept_v1: bool,
+) -> Result<bool, CryptoError> {
+    if is_ecdsa_transaction(tx) {
+        return verify_transaction(tx);
+    }
+    verify_ed25519_transaction(tx, accept_v1)
+}
+
+/// Sign with the V2 native preimage (binds `chain_id`, fee caps,
+/// tx type and access list under a domain tag). `tx.chain_id` must be set.
+pub fn sign_transaction_v2(
+    tx: &mut Transaction,
+    signing_key: &SigningKey,
+) -> Result<(), CryptoError> {
+    if tx.chain_id.is_none() {
+        return Err(CryptoError::SerializationError(
+            "V2 native signing requires chain_id".to_string(),
+        ));
+    }
+    tx.from = PublicKey::new(signing_key.verifying_key().to_bytes());
+    let signature: DalekSignature = signing_key.sign(&canonical_tx_bytes_v2(tx));
+    tx.signature = Signature::new(signature.to_bytes());
+    Ok(())
+}
+
+/// Domain tag for the V2 native transaction preimage.
+pub const NATIVE_TX_V2_DOMAIN: &[u8] = b"CITRATE-NATIVE-TX-V2\0";
+
+/// V2 canonical bytes for native (ed25519) transactions. The V2 preimage
+/// binds `chain_id`, `eth_tx_type`, the fee caps and `access_list` in
+/// addition to the V1 fields: every field except `hash`, `signature` and the
+/// node-local `ecdsa_verified` / `tx_type` (derived from `data`), under a
+/// domain tag, with length/presence prefixes so no two field layouts share
+/// an encoding.
+pub fn canonical_tx_bytes_v2(tx: &Transaction) -> Vec<u8> {
+    fn opt_u64(out: &mut Vec<u8>, v: Option<u64>) {
+        match v {
+            Some(x) => {
+                out.push(1);
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+            None => out.push(0),
+        }
+    }
+    let mut data = Vec::with_capacity(160 + tx.data.len());
+    data.extend_from_slice(NATIVE_TX_V2_DOMAIN);
+    opt_u64(&mut data, tx.chain_id);
+    data.extend_from_slice(&tx.nonce.to_le_bytes());
+    data.extend_from_slice(tx.from.as_bytes());
+    match &tx.to {
+        Some(to) => {
+            data.push(1);
+            data.extend_from_slice(to.as_bytes());
+        }
+        None => data.push(0),
+    }
+    data.extend_from_slice(&tx.value.to_le_bytes());
+    data.extend_from_slice(&tx.gas_limit.to_le_bytes());
+    data.extend_from_slice(&tx.gas_price.to_le_bytes());
+    opt_u64(&mut data, tx.max_fee_per_gas);
+    opt_u64(&mut data, tx.max_priority_fee_per_gas);
+    data.push(tx.eth_tx_type);
+    match &tx.access_list {
+        Some(list) => {
+            data.push(1);
+            data.extend_from_slice(&(list.len() as u64).to_le_bytes());
+            for (addr, keys) in list {
+                data.extend_from_slice(&(addr.len() as u64).to_le_bytes());
+                data.extend_from_slice(addr);
+                data.extend_from_slice(&(keys.len() as u64).to_le_bytes());
+                for k in keys {
+                    data.extend_from_slice(&(k.len() as u64).to_le_bytes());
+                    data.extend_from_slice(k);
+                }
+            }
+        }
+        None => data.push(0),
+    }
+    data.extend_from_slice(&(tx.data.len() as u64).to_le_bytes());
+    data.extend_from_slice(&tx.data);
+    data
 }
 
 /// Sign a transaction (for testing and dev tools)
@@ -333,6 +432,88 @@ pub fn verify_block_signature(block: &Block) -> Result<bool, CryptoError> {
 mod tests {
     use super::*;
     use crate::types::Hash;
+
+    fn pba_native_tx() -> Transaction {
+        Transaction {
+            hash: Hash::new([1; 32]),
+            nonce: 7,
+            from: PublicKey::new([0; 32]),
+            to: Some(PublicKey::new([2; 32])),
+            value: 1_000,
+            gas_limit: 21_000,
+            gas_price: 1_000_000_000,
+            data: vec![1, 2, 3],
+            chain_id: Some(40204),
+            max_fee_per_gas: Some(3_000_000_000),
+            max_priority_fee_per_gas: Some(1_000_000_000),
+            eth_tx_type: 0,
+            access_list: Some(vec![(vec![0xAA; 20], vec![vec![0xBB; 32]])]),
+            ..Default::default()
+        }
+    }
+
+    /// The V2 preimage binds every non-signature field: changing any of them
+    /// invalidates the signature.
+    #[test]
+    fn pba_l4_002_v2_signature_binds_every_field() {
+        let key = SigningKey::from_bytes(&[0x42; 32]);
+        let mut tx = pba_native_tx();
+        sign_transaction_v2(&mut tx, &key).expect("sign v2");
+        assert!(verify_transaction(&tx).expect("verify"), "V2 signature verifies");
+        assert!(verify_transaction_with_policy(&tx, false).expect("verify"), "V2 passes strict policy");
+
+        type Mutation = fn(&mut Transaction);
+        let mutations: [(&str, Mutation); 13] = [
+            ("chain_id", |t| t.chain_id = Some(1337)),
+            ("chain_id none", |t| t.chain_id = None),
+            ("nonce", |t| t.nonce += 1),
+            ("to", |t| t.to = Some(PublicKey::new([3; 32]))),
+            ("to none", |t| t.to = None),
+            ("value", |t| t.value += 1),
+            ("gas_limit", |t| t.gas_limit += 1),
+            ("gas_price", |t| t.gas_price += 1),
+            ("max_fee", |t| t.max_fee_per_gas = Some(9)),
+            ("max_prio", |t| t.max_priority_fee_per_gas = None),
+            ("eth_tx_type", |t| t.eth_tx_type = 2),
+            ("access_list", |t| t.access_list = None),
+            ("data", |t| t.data.push(0)),
+        ];
+        for (name, m) in mutations {
+            let mut changed = tx.clone();
+            m(&mut changed);
+            assert!(
+                !verify_transaction(&changed).expect("verify"),
+                "V2 signature must not survive rewriting `{name}`"
+            );
+        }
+    }
+
+    /// The signature policy switch: V1 signatures verify under the default
+    /// policy and not under the V2-only policy.
+    #[test]
+    fn native_signature_policy_switch() {
+        let key = SigningKey::from_bytes(&[0x43; 32]);
+        let mut tx = pba_native_tx();
+        tx.chain_id = Some(1337);
+        sign_transaction(&mut tx, &key).expect("sign v1");
+        assert!(
+            verify_transaction_with_policy(&tx, true).expect("verify"),
+            "default policy accepts V1"
+        );
+        assert!(
+            !verify_transaction_with_policy(&tx, false).expect("verify"),
+            "V2-only policy rejects V1"
+        );
+    }
+
+    /// V2 signing requires a chain id.
+    #[test]
+    fn pba_l4_002_v2_requires_chain_id() {
+        let key = SigningKey::from_bytes(&[0x44; 32]);
+        let mut tx = pba_native_tx();
+        tx.chain_id = None;
+        assert!(sign_transaction_v2(&mut tx, &key).is_err());
+    }
 
     #[test]
     fn test_transaction_signing_and_verification() {

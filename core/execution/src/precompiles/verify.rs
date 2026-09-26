@@ -116,7 +116,21 @@ pub mod gas_costs {
 
 /// Route to the right precompile by address.
 pub fn execute(address: &Address, input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
+    execute_at(address, input, gas_limit, false)
+}
+
+/// Route with the consensus activation flag (`hardened` = at/after
+/// `pba_hardening_height`). Only 0x0109 changes behaviour (PBA-L1a-013).
+pub fn execute_at(
+    address: &Address,
+    input: &[u8],
+    gas_limit: u64,
+    hardened: bool,
+) -> Result<PrecompileResult> {
     let addr = address.as_fixed_bytes();
+    if hardened && addr == &addresses::MERKLE_VERIFY_TENSOR {
+        return merkle_verify_tensor_hardened(input, gas_limit);
+    }
     if addr == &addresses::TENSOR_COMMIT {
         tensor_commit(input, gas_limit)
     } else if addr == &addresses::INFERENCE_PROOF_VERIFY {
@@ -371,6 +385,26 @@ pub fn merkle_verify_tensor(input: &[u8], gas_limit: u64) -> Result<PrecompileRe
         gas_used,
         success: true, // success=true means "the precompile ran"; the bool result is in `output`.
     })
+}
+
+/// 0x0109 with a leaf-index range check (at/after `pba_hardening_height`).
+///
+/// A leaf index must fit in `proof_depth` bits (the path walks exactly those
+/// bits); a `leaf_index >= 2^proof_depth` returns result word 0. Every proof
+/// whose index fits keeps its result, and the commitment format is unchanged.
+pub fn merkle_verify_tensor_hardened(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
+    let mut result = merkle_verify_tensor(input, gas_limit)?;
+    // merkle_verify_tensor validated the layout: input[32..64] is leaf_index,
+    // input[96] is the proof depth (<= 32).
+    let depth = input[96] as u32;
+    let index = &input[32..64];
+    let high_zero = index[..28].iter().all(|&b| b == 0);
+    let lo32 = u32::from_be_bytes([index[28], index[29], index[30], index[31]]);
+    let fits = high_zero && (depth >= 32 || (lo32 >> depth) == 0);
+    if !fits {
+        result.output = vec![0u8; 32];
+    }
+    Ok(result)
 }
 
 /// 0x0108 INFERENCE_PROOF_VERIFY — Halo2-KZG verifier, **version-

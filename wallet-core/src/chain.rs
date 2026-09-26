@@ -214,6 +214,25 @@ impl TransactionBuilder {
         signing_key: &SigningKey,
         nonce: u64,
     ) -> Result<SignedTransaction, WalletError> {
+        self.sign_native(signing_key, nonce, false)
+    }
+
+    /// Sign with the V2 native preimage, which binds `chain_id` and every
+    /// fee/type field under a domain tag. Nodes verify V2 from this release on.
+    pub fn sign_v2(
+        self,
+        signing_key: &SigningKey,
+        nonce: u64,
+    ) -> Result<SignedTransaction, WalletError> {
+        self.sign_native(signing_key, nonce, true)
+    }
+
+    fn sign_native(
+        self,
+        signing_key: &SigningKey,
+        nonce: u64,
+        v2: bool,
+    ) -> Result<SignedTransaction, WalletError> {
         use citrate_consensus::types as cc_types;
 
         // Build the chain's Transaction struct.
@@ -229,9 +248,18 @@ impl TransactionBuilder {
             } else {
                 // 20-byte EVM address → embed in first 20 bytes, zero-pad to 32.
                 // 32-byte native pubkey → copy as-is.
+                // PBA-L4-004: any other length used to be silently zero-padded
+                // (short) or truncated (long) into a DIFFERENT destination and
+                // signed. Reject it, exactly like the secp256k1 path does.
+                if decoded.len() != 20 && decoded.len() != 32 {
+                    return Err(WalletError::InvalidAddress(format!(
+                        "recipient must be a 20-byte EVM address or a 32-byte native key, \
+                         got {} bytes",
+                        decoded.len()
+                    )));
+                }
                 let mut pk_bytes = [0u8; 32];
-                let copy_len = decoded.len().min(32);
-                pk_bytes[..copy_len].copy_from_slice(&decoded[..copy_len]);
+                pk_bytes[..decoded.len()].copy_from_slice(&decoded);
                 Some(cc_types::PublicKey::new(pk_bytes))
             }
         } else {
@@ -260,8 +288,12 @@ impl TransactionBuilder {
         // Sign via the chain's canonical byte format so `verify_transaction`
         // on the node side accepts the signature. `sign_transaction` also
         // refreshes `tx.from` from the signing key (defensive).
-        citrate_consensus::crypto::sign_transaction(&mut tx, signing_key)
-            .map_err(|e| WalletError::SigningFailed(format!("ed25519 sign failed: {:?}", e)))?;
+        if v2 {
+            citrate_consensus::crypto::sign_transaction_v2(&mut tx, signing_key)
+        } else {
+            citrate_consensus::crypto::sign_transaction(&mut tx, signing_key)
+        }
+        .map_err(|e| WalletError::SigningFailed(format!("ed25519 sign failed: {:?}", e)))?;
 
         // Hash the signed transaction so `hash` is populated for UI display.
         // The chain may recompute this; it's not authoritative here.

@@ -221,6 +221,62 @@ struct BucketEntry {
     last_access: Instant,
 }
 
+/// PBA-L1a-009: a cloneable handle onto a [`RateLimiter`]'s per-client request
+/// buckets, so the JSON-RPC layer (which sees batch sizes the HTTP middleware
+/// cannot) can charge each batch element as a request against the same bucket.
+#[derive(Clone)]
+pub struct RateLimitHandle {
+    buckets: Arc<DashMap<String, BucketEntry>>,
+    max_requests: u32,
+    window_secs: u64,
+}
+
+impl RateLimitHandle {
+    /// Charge `units` extra requests to `client_key`'s bucket in the current
+    /// window. Returns `false` (and leaves the bucket saturated) when that
+    /// pushes the client over `max_requests`.
+    pub fn charge(&self, client_key: &str, units: u32) -> bool {
+        let now = Instant::now();
+        let window = std::time::Duration::from_secs(self.window_secs);
+        let mut entry = self
+            .buckets
+            .entry(client_key.to_string())
+            .or_insert_with(|| BucketEntry {
+                count: 0,
+                window_start: now,
+                last_access: now,
+            });
+        if now.duration_since(entry.window_start) >= window {
+            entry.count = 0;
+            entry.window_start = now;
+        }
+        entry.last_access = now;
+        entry.count = entry.count.saturating_add(units);
+        entry.count <= self.max_requests
+    }
+
+    /// Charge `units` to the client the HTTP middleware attributed the current
+    /// request to. With no attribution this fails CLOSED exactly like
+    /// [`check_method_budget`] (REM-3), unless the devnet anonymous opt-in is set.
+    pub fn charge_current_client(&self, units: u32) -> bool {
+        let key = current_client_key();
+        if key.is_empty() {
+            return anonymous_opt_in(
+                std::env::var("CITRATE_ALLOW_ANONYMOUS_RATE_LIMIT")
+                    .ok()
+                    .as_deref(),
+            );
+        }
+        self.charge(&key, units)
+    }
+}
+
+/// The REM-3 devnet opt-in value (`1` / `true`, case-insensitive).
+fn anonymous_opt_in(v: Option<&str>) -> bool {
+    v.map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Per-client sliding window rate limiter implementing `RequestMiddleware`.
 pub struct RateLimiter {
     config: RateLimitConfig,
@@ -253,6 +309,16 @@ impl RateLimiter {
             trusted_set,
             api_key,
             last_eviction: Arc::new(std::sync::Mutex::new(Instant::now())),
+        }
+    }
+
+    /// PBA-L1a-009: a handle the JSON-RPC middleware uses to charge batch
+    /// elements to the same per-client buckets this limiter enforces.
+    pub fn handle(&self) -> RateLimitHandle {
+        RateLimitHandle {
+            buckets: self.buckets.clone(),
+            max_requests: self.config.max_requests,
+            window_secs: self.config.window_secs,
         }
     }
 
@@ -501,6 +567,47 @@ fn extract_method_name(body: &[u8]) -> Option<&str> {
     let start = 1;
     let end = after_colon[start..].find('"')?;
     Some(&after_colon[start..start + end])
+}
+
+#[cfg(test)]
+mod tests_pba_l1a_009 {
+    use super::*;
+
+    fn handle(max: u32, window_secs: u64) -> RateLimitHandle {
+        RateLimiter::new(RateLimitConfig {
+            max_requests: max,
+            window_secs,
+            ..Default::default()
+        })
+        .handle()
+    }
+
+    /// PBA-L1a-009: batch elements share the per-client bucket, and the
+    /// bucket resets when its window has elapsed.
+    #[test]
+    fn charge_counts_units_and_resets_expired_window() {
+        let h = handle(3, 60);
+        assert!(h.charge("a", 3));
+        assert!(!h.charge("a", 1), "over max");
+        assert!(h.charge("b", 1), "buckets are per client");
+        // window 0: every call starts a fresh window
+        let z = handle(1, 0);
+        for _ in 0..3 {
+            assert!(z.charge("c", 1), "expired window must reset the count");
+        }
+    }
+
+    /// PBA-L1a-009: with no attributed client, charging follows the
+    /// REM-3 fail-closed rule and its devnet opt-in (pure helper; the env
+    /// var itself is exercised by `test_rem_3_*` under its own lock).
+    #[test]
+    fn anonymous_opt_in_values() {
+        assert!(anonymous_opt_in(Some("1")));
+        assert!(anonymous_opt_in(Some("TRUE")));
+        assert!(!anonymous_opt_in(Some("0")));
+        assert!(!anonymous_opt_in(Some("yes")));
+        assert!(!anonymous_opt_in(None));
+    }
 }
 
 #[cfg(test)]

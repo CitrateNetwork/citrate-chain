@@ -1510,7 +1510,10 @@ impl Executor {
 
     /// PBA-R2: the block-validity hardening this executor enforces.
     pub fn pba_hardening(&self) -> citrate_consensus::hardening::PbaHardening {
-        match self.pba_hardening_height.load(std::sync::atomic::Ordering::SeqCst) {
+        match self
+            .pba_hardening_height
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             u64::MAX => citrate_consensus::hardening::PbaHardening::off(),
             h => citrate_consensus::hardening::PbaHardening::at(h),
         }
@@ -2007,7 +2010,7 @@ impl Executor {
             .record_balance(from, balance - gas_cost);
 
         // Parse and execute transaction type.
-        let tx_type = self.parse_transaction_type(tx)?;
+        let tx_type = Self::parse_transaction_type(tx)?;
 
         // EXEC-02 / WP-C3 — PANIC ISOLATION.
         //
@@ -2064,8 +2067,8 @@ impl Executor {
                 // checks off, underflows to a ~2^64 refund = a SALT mint). On
                 // honest traffic `gas_used <= gas_limit`, so this equals the
                 // subtraction; it only diverges on the (attacker/underflow) edge.
-                let refund =
-                    U256::from(tx.gas_limit.saturating_sub(context.gas_used)) * U256::from(tx.gas_price);
+                let refund = U256::from(tx.gas_limit.saturating_sub(context.gas_used))
+                    * U256::from(tx.gas_price);
                 let current_balance = {
                     let j = context.journal.lock();
                     j.pending_balance(&from)
@@ -2248,8 +2251,12 @@ impl Executor {
         result.map(|(receipt, _writes)| receipt)
     }
 
-    /// Parse transaction data into type
-    fn parse_transaction_type(&self, tx: &Transaction) -> Result<TransactionType, ExecutionError> {
+    /// Parse transaction data into type.
+    ///
+    /// Pure (reads only the transaction). Public so the mempool admits only
+    /// what this exact parser accepts: a payload rejected here fails before a
+    /// receipt exists, so it must never reach block selection.
+    pub fn parse_transaction_type(tx: &Transaction) -> Result<TransactionType, ExecutionError> {
         // Simple parsing based on transaction data
         // In production, this would use proper ABI encoding/decoding
 
@@ -2280,42 +2287,30 @@ impl Executor {
             };
             let to = crate::address_utils::normalize_address(to_pk);
 
-            // Check first 4 bytes for function selector
-            if tx.data.len() >= 4 {
-                match &tx.data[0..4] {
-                    [0x01, 0x00, 0x00, 0x00] => {
-                        // Register model
-                        self.parse_register_model(&tx.data[4..])
-                    }
-                    [0x02, 0x00, 0x00, 0x00] => {
-                        // Inference request
-                        self.parse_inference_request(&tx.data[4..])
-                    }
-                    [0x03, 0x00, 0x00, 0x00] => {
-                        // Update model
-                        self.parse_update_model(&tx.data[4..])
-                    }
-                    _ => {
-                        // Generic call
-                        Ok(TransactionType::Call {
-                            to,
-                            data: tx.data.clone(),
-                            value: U256::from(tx.value),
-                        })
-                    }
+            // Dispatch on the shared classifier (the mempool and producer use
+            // the same one, so selection and execution agree on what an AI
+            // operation is).
+            match citrate_consensus::types::AiOpKind::classify(true, &tx.data) {
+                Some(citrate_consensus::types::AiOpKind::RegisterModel) => {
+                    Self::parse_register_model(&tx.data[4..])
                 }
-            } else {
-                Ok(TransactionType::Call {
+                Some(citrate_consensus::types::AiOpKind::InferenceRequest) => {
+                    Self::parse_inference_request(&tx.data[4..])
+                }
+                Some(citrate_consensus::types::AiOpKind::UpdateModel) => {
+                    Self::parse_update_model(&tx.data[4..])
+                }
+                None => Ok(TransactionType::Call {
                     to,
                     data: tx.data.clone(),
                     value: U256::from(tx.value),
-                })
+                }),
             }
         }
     }
 
     /// Parse register model transaction
-    fn parse_register_model(&self, data: &[u8]) -> Result<TransactionType, ExecutionError> {
+    fn parse_register_model(data: &[u8]) -> Result<TransactionType, ExecutionError> {
         if data.len() < 36 {
             return Err(ExecutionError::InvalidInput);
         }
@@ -2411,7 +2406,7 @@ impl Executor {
     }
 
     /// Parse inference request
-    fn parse_inference_request(&self, data: &[u8]) -> Result<TransactionType, ExecutionError> {
+    fn parse_inference_request(data: &[u8]) -> Result<TransactionType, ExecutionError> {
         if data.len() < 32 {
             return Err(ExecutionError::InvalidInput);
         }
@@ -2430,7 +2425,7 @@ impl Executor {
     }
 
     /// Parse update model transaction
-    fn parse_update_model(&self, data: &[u8]) -> Result<TransactionType, ExecutionError> {
+    fn parse_update_model(data: &[u8]) -> Result<TransactionType, ExecutionError> {
         if data.len() < 36 {
             return Err(ExecutionError::InvalidInput);
         }
@@ -3943,6 +3938,19 @@ impl Executor {
         // Base gas cost
         context.use_gas(self.gas_schedule.inference_base)?;
 
+        // At/after `pba_hardening_height` block execution does not consult a
+        // node-local model runtime: the request reverts deterministically
+        // (base gas burned, nonce advanced, no model-state or balance writes)
+        // on every node.
+        if crate::activation::pba_hardening_active(context.block_number) {
+            return Err(ExecutionError::Reverted(
+                "in-consensus inference is disabled: node-local model \
+                 execution is not part of block execution; submit inference \
+                 results as signed transactions instead"
+                    .to_string(),
+            ));
+        }
+
         // Additional gas per MB of input
         let input_mb = (input_data.len() / 1_048_576) as u64;
         // CHAIN-B-B010: `saturating_mul` on an attacker-sized input length;
@@ -4020,8 +4028,10 @@ impl Executor {
         model.usage_stats.total_inferences += 1;
         // CHAIN-B-B010: monotonically-growing accumulator over a model's
         // lifetime; `saturating_add` so a long-lived model cannot panic here.
-        model.usage_stats.total_gas_used =
-            model.usage_stats.total_gas_used.saturating_add(context.gas_used);
+        model.usage_stats.total_gas_used = model
+            .usage_stats
+            .total_gas_used
+            .saturating_add(context.gas_used);
         model.usage_stats.last_used = context.timestamp;
         self.state_db.update_model(model_id, model)?;
 

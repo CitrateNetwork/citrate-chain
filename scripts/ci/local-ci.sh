@@ -157,6 +157,7 @@ consensus_tripwires() {
   local rc=0 t
   for t in \
     "scripts/ci/fork_choice_add_block_parity_tripwire.sh" \
+    "scripts/ci/check_pba_exec_tripwires.sh" \
   ; do
     if [ ! -x "$t" ]; then
       echo "missing/!executable tripwire: $t"; rc=1; continue

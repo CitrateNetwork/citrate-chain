@@ -31,6 +31,12 @@ type S1 = nova_snark::spartan::snark::RelaxedR1CSSNARK<E1, EE1>;
 type S2 = nova_snark::spartan::snark::RelaxedR1CSSNARK<E2, EE2>;
 
 type Vk = VerifierKey<E1, E2, FixedCommDFoldStep, S1, S2>;
+
+/// A decoded fold-proof verifier key. PBA-L1a-015: decode the (27 MB) baked key
+/// ONCE with [`decode_verifier_key`] and verify every proof against the decoded
+/// key with [`verify_fold_proof_with_key`], instead of re-deserializing it on
+/// every precompile call.
+pub type FoldVerifierKey = Vk;
 type Snark = CompressedSNARK<E1, E2, FixedCommDFoldStep, S1, S2>;
 
 /// Why a fold-proof verification failed. `Display` is safe to surface (no secret material).
@@ -96,6 +102,48 @@ pub fn verify_fold_proof(
     depth: usize,
     z0_be: &[[u8; 32]],
 ) -> Result<([u8; 32], [u8; 32]), VerifyError> {
+    // Cheap input checks and the (small) proof decode run BEFORE the key decode, so
+    // garbage input is rejected without touching the verifier key.
+    let (snark, canonical_z0) = decode_proof_and_state(proof_bytes, num_steps, depth, z0_be)?;
+    let vk = decode_verifier_key(vk_bytes)?;
+    finish_verify(&vk, &snark, num_steps, &canonical_z0)
+}
+
+/// The canonical initial public state for a `num_steps`-leaf, `depth`-deep fold, as the
+/// big-endian `bytes32` words a caller passes to the precompile.
+pub fn canonical_initial_state_be(
+    num_steps: usize,
+    depth: usize,
+) -> Result<Vec<[u8; 32]>, VerifyError> {
+    canonical_initial_state(num_steps, depth)
+        .map(|z| z.into_iter().map(scalar_to_be_bytes).collect())
+        .map_err(|_| VerifyError::NonCanonicalInitialState)
+}
+
+/// Decode a serialized verifier key (bincode).
+pub fn decode_verifier_key(vk_bytes: &[u8]) -> Result<FoldVerifierKey, VerifyError> {
+    bincode::deserialize(vk_bytes).map_err(|_| VerifyError::Decode)
+}
+
+/// [`verify_fold_proof`] against an already-decoded key (PBA-L1a-015). Same relation,
+/// same results; the key is not re-deserialized per call.
+pub fn verify_fold_proof_with_key(
+    vk: &FoldVerifierKey,
+    proof_bytes: &[u8],
+    num_steps: usize,
+    depth: usize,
+    z0_be: &[[u8; 32]],
+) -> Result<([u8; 32], [u8; 32]), VerifyError> {
+    let (snark, canonical_z0) = decode_proof_and_state(proof_bytes, num_steps, depth, z0_be)?;
+    finish_verify(vk, &snark, num_steps, &canonical_z0)
+}
+
+fn decode_proof_and_state(
+    proof_bytes: &[u8],
+    num_steps: usize,
+    depth: usize,
+    z0_be: &[[u8; 32]],
+) -> Result<(Snark, Vec<Scalar>), VerifyError> {
     if z0_be.len() != MAX_DEPTH + 7 {
         return Err(VerifyError::BadArity);
     }
@@ -110,11 +158,18 @@ pub fn verify_fold_proof(
         return Err(VerifyError::NonCanonicalInitialState);
     }
 
-    let vk: Vk = bincode::deserialize(vk_bytes).map_err(|_| VerifyError::Decode)?;
     let snark: Snark = bincode::deserialize(proof_bytes).map_err(|_| VerifyError::Decode)?;
+    Ok((snark, canonical_z0))
+}
 
+fn finish_verify(
+    vk: &FoldVerifierKey,
+    snark: &Snark,
+    num_steps: usize,
+    canonical_z0: &[Scalar],
+) -> Result<([u8; 32], [u8; 32]), VerifyError> {
     let zn = snark
-        .verify(&vk, num_steps, &canonical_z0)
+        .verify(vk, num_steps, canonical_z0)
         .map_err(|_| VerifyError::Invalid)?;
 
     if zn.len() <= DATACOMMIT_INDEX {

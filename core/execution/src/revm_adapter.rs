@@ -569,11 +569,31 @@ pub struct BlockContext {
 /// `Precompile::Standard` is a bare fn pointer and cannot).
 struct CitratePurePrecompile {
     addr: Address,
+    /// PBA-R2: at/after `pba_hardening_height` for the block being executed.
+    hardened: bool,
+}
+
+/// PBA-L1a-022: a reserved-but-unbridged Citrate precompile address. Only
+/// registered once the hardening is active; every call fails the frame.
+struct CitrateReservedPrecompile;
+
+impl StatefulPrecompile for CitrateReservedPrecompile {
+    fn call(&self, _bytes: &Bytes, _gas_limit: u64, _env: &Env) -> RevmPrecompileResult {
+        Err(RevmPrecompileErrors::Error(RevmPrecompileError::other(
+            "Citrate precompile address is reserved and not available to contract code \
+             (PBA-L1a-022)",
+        )))
+    }
 }
 
 impl StatefulPrecompile for CitratePurePrecompile {
     fn call(&self, bytes: &Bytes, gas_limit: u64, _env: &Env) -> RevmPrecompileResult {
-        match crate::precompiles::execute_pure(&self.addr, bytes.as_ref(), gas_limit) {
+        match crate::precompiles::execute_pure_at(
+            &self.addr,
+            bytes.as_ref(),
+            gas_limit,
+            self.hardened,
+        ) {
             Ok(res) => {
                 if !res.success {
                     // The pure families signal failure via Err; a
@@ -602,7 +622,15 @@ impl StatefulPrecompile for CitratePurePrecompile {
 /// `Evm::builder()` in this adapter — call AND create paths — so serial
 /// execution, `eth_call`, and deployment-time constructor code all see the
 /// same precompile set.
-fn register_citrate_precompiles<EXT, DB: Database>(handler: &mut EvmHandler<'_, EXT, DB>) {
+///
+/// `hardened` (PBA-R2) is `pba_hardening_active(block_number)` for the block
+/// being executed: it selects the post-activation precompile semantics and
+/// registers the reserved addresses. Before activation the precompile SET is
+/// unchanged, so EIP-2929 warm/cold gas for those addresses is unchanged too.
+fn register_citrate_precompiles<EXT, DB: Database>(
+    handler: &mut EvmHandler<'_, EXT, DB>,
+    hardened: bool,
+) {
     let prev = handler.pre_execution.load_precompiles.clone();
     handler.pre_execution.load_precompiles = Arc::new(move || {
         let mut precompiles = prev();
@@ -610,10 +638,25 @@ fn register_citrate_precompiles<EXT, DB: Database>(handler: &mut EvmHandler<'_, 
             (
                 RevmAddress::from_slice(raw),
                 ContextPrecompile::Ordinary(Precompile::Stateful(Arc::new(
-                    CitratePurePrecompile { addr: Address(*raw) },
+                    CitratePurePrecompile {
+                        addr: Address(*raw),
+                        hardened,
+                    },
                 ))),
             )
         }));
+        if hardened {
+            precompiles.extend(crate::precompiles::reserved_unbridged_addresses().into_iter().map(
+                |raw| {
+                    (
+                        RevmAddress::from_slice(&raw),
+                        ContextPrecompile::Ordinary(Precompile::Stateful(Arc::new(
+                            CitrateReservedPrecompile,
+                        ))),
+                    )
+                },
+            ));
+        }
         precompiles
     });
 }
@@ -683,13 +726,17 @@ pub fn execute_contract_create_with_context(
     // Build EVM with transaction
     let coinbase = block_ctx.coinbase;
     let prevrandao = block_ctx.prevrandao;
+    // PBA-R2: consensus activation for the hardened precompile semantics.
+    let pba_hardened = crate::activation::pba_hardening_active(block_number);
     let mut evm = Evm::builder()
         .with_db(&mut db)
         // WP-B0 (TD-28): expose the pure Citrate precompile families
         // (verify/compute/learning/x402) to contract code. Without this,
         // STATICCALLs to e.g. 0x0108 hit an empty account and silently
         // return success with no data.
-        .append_handler_register(register_citrate_precompiles)
+        .append_handler_register_box(Box::new(move |h| {
+            register_citrate_precompiles(h, pba_hardened)
+        }))
         .modify_cfg_env(|cfg| {
             cfg.chain_id = chain_id;
         })
@@ -886,13 +933,17 @@ pub fn execute_contract_call_with_context(
     // Build EVM with transaction
     let coinbase = block_ctx.coinbase;
     let prevrandao = block_ctx.prevrandao;
+    // PBA-R2: consensus activation for the hardened precompile semantics.
+    let pba_hardened = crate::activation::pba_hardening_active(block_number);
     let mut evm = Evm::builder()
         .with_db(&mut db)
         // WP-B0 (TD-28): expose the pure Citrate precompile families
         // (verify/compute/learning/x402) to contract code. Without this,
         // STATICCALLs to e.g. 0x0108 hit an empty account and silently
         // return success with no data.
-        .append_handler_register(register_citrate_precompiles)
+        .append_handler_register_box(Box::new(move |h| {
+            register_citrate_precompiles(h, pba_hardened)
+        }))
         .modify_cfg_env(|cfg| {
             cfg.chain_id = chain_id;
         })

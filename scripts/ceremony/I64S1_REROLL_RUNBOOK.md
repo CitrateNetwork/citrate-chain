@@ -54,7 +54,13 @@ git checkout main && git pull
 # diverge on any tx exercising 0x0130 — a reroll makes them agree from block 0. The deployed binary is
 # the `citrate` bin (rsync'd to /usr/local/bin/citrate-node). Verify 0x0130 is LIVE after building:
 #   an eth_call to 0x0130 must NOT return the "requires the `commd-fold-verify` feature" error.
-cargo build --release -p citrate-node --features commd-fold-verify
+# `commd-fold-verify` is now in citrate-node's DEFAULT feature set (and the binary refuses
+# to compile without it), so the plain build below is identical to release.yml / release-tier2.yml /
+# the Dockerfile / every script. Do not add `--features` or `--no-default-features` here: the CI
+# tripwire scripts/ci/check_pba_exec_tripwires.sh rejects any citrate-node build that does.
+# `citrate --version` prints "(consensus features: commd-fold-verify)"; `citrate consensus` shows
+# the full fingerprint (now including commd-fold-verify).
+cargo build --release -p citrate-node
 
 # Consensus-critical sanity:
 cargo test -p citrate-economics --lib \
