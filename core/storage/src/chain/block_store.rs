@@ -464,6 +464,104 @@ impl BlockStore {
         Ok(())
     }
 
+    /// Remove a set of blocks (and every index entry that names them) in one
+    /// atomic batch, then rewind the latest-height marker to the highest
+    /// surviving block.
+    ///
+    /// Unlike [`Self::delete_block`], an index entry is removed only when it
+    /// names a purged block: the height and blue-score maps are
+    /// last-writer-wins, and a surviving sibling at the same height keeps (or
+    /// takes over) its entry. Used at start-up to drop blocks that are invalid
+    /// under the node's activation rules.
+    pub fn purge_blocks(&self, doomed: &HashSet<Hash>) -> Result<u64> {
+        let _put_guard = self.put_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if doomed.is_empty() {
+            return Ok(self.cached_latest_height.load(AtomicOrdering::SeqCst));
+        }
+        let mut batch = self.db.batch();
+        let mut vacated_heights: HashSet<u64> = HashSet::new();
+        let mut parents: HashSet<Hash> = HashSet::new();
+        for hash in doomed {
+            let Some(block) = self.get_block(hash)? else {
+                continue;
+            };
+            self.db
+                .batch_delete_cf(&mut batch, CF_BLOCKS, hash.as_bytes())?;
+            self.db
+                .batch_delete_cf(&mut batch, CF_HEADERS, hash.as_bytes())?;
+            self.db
+                .batch_delete_cf(&mut batch, CF_DAG_RELATIONS, &parent_children_key(hash))?;
+            let hk = height_to_key(block.header.height);
+            if self.db.get_cf(CF_METADATA, &hk)?.as_deref() == Some(hash.as_bytes()) {
+                self.db.batch_delete_cf(&mut batch, CF_METADATA, &hk)?;
+                vacated_heights.insert(block.header.height);
+            }
+            let bk = blue_score_key(block.header.blue_score);
+            if self.db.get_cf(CF_BLUE_SET, &bk)?.as_deref() == Some(hash.as_bytes()) {
+                self.db.batch_delete_cf(&mut batch, CF_BLUE_SET, &bk)?;
+            }
+            parents.extend(block.parents());
+        }
+        for parent in parents.difference(doomed) {
+            let children = self.get_children(parent)?;
+            let kept: Vec<Hash> = children
+                .iter()
+                .copied()
+                .filter(|c| !doomed.contains(c))
+                .collect();
+            if kept.len() != children.len() {
+                let bytes = bincode::serialize(&kept)?;
+                self.db.batch_put_cf(
+                    &mut batch,
+                    CF_DAG_RELATIONS,
+                    &parent_children_key(parent),
+                    &bytes,
+                )?;
+            }
+        }
+
+        // Surviving headers: re-point vacated heights and find the new top.
+        let mut latest = 0u64;
+        let mut refill: std::collections::HashMap<u64, Hash> = std::collections::HashMap::new();
+        for (key, value) in self.db.iter_cf(CF_HEADERS)? {
+            let Some(hash) = Hash::try_from_bytes(key.as_ref()) else {
+                continue;
+            };
+            if doomed.contains(&hash) {
+                continue;
+            }
+            if let Ok(header) = bincode::deserialize::<BlockHeader>(&value) {
+                latest = latest.max(header.height);
+                if vacated_heights.contains(&header.height) {
+                    refill.entry(header.height).or_insert(hash);
+                }
+            }
+        }
+        for (height, hash) in &refill {
+            self.db.batch_put_cf(
+                &mut batch,
+                CF_METADATA,
+                &height_to_key(*height),
+                hash.as_bytes(),
+            )?;
+        }
+        self.db.batch_put_cf(
+            &mut batch,
+            CF_METADATA,
+            LATEST_HEIGHT_KEY,
+            &latest.to_be_bytes(),
+        )?;
+        self.db.write_batch_sync(batch)?;
+        self.cached_latest_height
+            .store(latest, AtomicOrdering::SeqCst);
+        info!(
+            "Purged {} block(s); latest stored height is now {}",
+            doomed.len(),
+            latest
+        );
+        Ok(latest)
+    }
+
     /// Compact the block storage
     pub fn compact(&self) -> Result<()> {
         self.db.compact_cf(CF_BLOCKS)?;

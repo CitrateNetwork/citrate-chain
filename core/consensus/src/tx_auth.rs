@@ -953,7 +953,6 @@ mod tests {
         }
     }
 
-
     /// Each EVM envelope field alone makes a native tx unauthenticated (the
     /// native signature does not cover any of them).
     #[test]
@@ -962,7 +961,10 @@ mod tests {
         let muts: Vec<Mutation> = vec![
             ("eth_tx_type", Box::new(|t| t.eth_tx_type = 1)),
             ("max_fee", Box::new(|t| t.max_fee_per_gas = Some(1))),
-            ("max_prio", Box::new(|t| t.max_priority_fee_per_gas = Some(1))),
+            (
+                "max_prio",
+                Box::new(|t| t.max_priority_fee_per_gas = Some(1)),
+            ),
             ("access_list", Box::new(|t| t.access_list = Some(vec![]))),
         ];
         for (name, m) in muts {
@@ -1077,5 +1079,56 @@ mod tests {
             tx_root_for_height(PbaHardening::at(10), 10, one),
             tx_root_v2(one)
         );
+    }
+
+    /// EIP-2 boundary: `s <= floor(n/2)` is low-s and valid; `floor(n/2) + 1`
+    /// is the first high-s value. n is odd, so there is no s with 2s == n.
+    ///
+    /// The vector is a legacy EIP-155 transfer whose ECDSA `s` equals
+    /// floor(n/2) exactly. It was built by fixing the nonce k and s, then
+    /// solving for the private key d = (s*k - z) / r mod n, and checked with an
+    /// independent ECDSA verification. Without it, relaxing the check to
+    /// `s >= floor(n/2)` passed every other test.
+    #[test]
+    fn low_s_boundary_is_inclusive_at_half_n() {
+        fn hex32(s: &str) -> [u8; 32] {
+            let mut out = [0u8; 32];
+            for (i, b) in out.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("hex");
+            }
+            out
+        }
+        let s_half = hex32("7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0");
+        assert_eq!(s_half, HALF_N, "vector s is exactly floor(n/2)");
+        let r = hex32("bb50e2d89a4ed70663d080659fe0ad4b9bc3e06c17a227433966cb59ceee020d");
+        let from20 = hex32("2f550c59d8200c040819f8ddf18880c8e9794e1b000000000000000000000000");
+        let mut to = [0u8; 32];
+        to[..20].copy_from_slice(&[0xBB; 20]);
+        let mk = |s: [u8; 32]| {
+            let mut sig = [0u8; 64];
+            sig[..32].copy_from_slice(&r);
+            sig[32..].copy_from_slice(&s);
+            Transaction {
+                nonce: 0,
+                from: PublicKey::new(from20),
+                to: Some(PublicKey::new(to)),
+                value: 1,
+                gas_limit: 21_000,
+                gas_price: 1_000_000_000,
+                signature: Signature::new(sig),
+                chain_id: Some(40204),
+                ..Default::default()
+            }
+        };
+
+        // s == floor(n/2): accepted (EIP-2 low-s), and it recovers the sender.
+        let at_half = mk(s_half);
+        let id = authenticate(&at_half).expect("s == floor(n/2) is a valid low-s signature");
+        assert_ne!(id, Hash::default());
+
+        // s == floor(n/2) + 1: the first high-s value, rejected before recovery.
+        let mut s_above = s_half;
+        s_above[31] += 1;
+        assert_eq!(authenticate(&mk(s_above)), Err(TxAuthError::HighS));
     }
 }

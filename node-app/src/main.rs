@@ -117,9 +117,9 @@ async fn main() -> Result<()> {
         .unwrap_or(DEFAULT_CHAIN_ID);
     // PBA-R2: honour the fleet activation height (CITRATE_PBA_HARDENING_HEIGHT)
     // so eth_call / eth_estimateGas apply the same rules as the node.
-    let pba = citrate_execution::activation::init_pba_hardening_height(None)
+    let pba = citrate_execution::activation::init_pba_hardening_for_chain(chain_id, None, false)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-    info!("PBA hardening activation height: {:?}", pba);
+    info!("PBA hardening activation: {}", pba.describe());
     let state_db = Arc::new(StateDB::new());
     let executor = Arc::new(Executor::with_chain_id_and_inference_mode(
         state_db,

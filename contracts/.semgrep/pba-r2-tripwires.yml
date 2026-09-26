@@ -76,6 +76,108 @@ rules:
         - "**/rbac/TenantHierarchy.sol"
         - "**/ColorCirclesNFT.sol"
 
+  # PBA-L2-002 (class): a constructor that seeds governance / owner / admin
+  # from an argument must run that argument through InitialAdmin.check (or
+  # compare it to InitialAdmin.CREATE2_FACTORY), so the factory can never be
+  # named as the key.
+  - id: pba-l2-002-constructor-admin-unchecked
+    languages: [solidity]
+    severity: ERROR
+    message: >
+      PBA-L2-002: this constructor stores a governance / owner / admin key from
+      an argument without InitialAdmin.check(). Run the argument through
+      InitialAdmin.check() so the CREATE2 factory is refused.
+    patterns:
+      - pattern-inside: |
+          constructor(...) { ... }
+      - pattern-either:
+          - patterns:
+              - pattern: $SLOT = $ARG;
+              - metavariable-regex:
+                  metavariable: $SLOT
+                  regex: (?i)^_?(governance|governor|owner|owners|admin|authority|guardian|rootgovernance)_?$
+          - patterns:
+              - pattern: $H($ARG);
+              - metavariable-regex:
+                  metavariable: $H
+                  regex: ^(_transferOwnership|_initGovernance|_setOwner|_setGovernance|_setGovernor|_setAuthority)$
+          - pattern: _grantRole(DEFAULT_ADMIN_ROLE, $ARG);
+      - metavariable-regex:
+          metavariable: $ARG
+          regex: ^[A-Za-z_][A-Za-z0-9_]*$
+      - pattern-not-inside: |
+          constructor(...) { ... <... InitialAdmin.check($ARG) ...>; ... }
+      - pattern-not-inside: |
+          constructor(...) { ... <... InitialAdmin.check($ARG[$I]) ...>; ... }
+      - pattern-not-inside: |
+          constructor(...) { ... <... $ARG == InitialAdmin.CREATE2_FACTORY ...>; ... }
+      - pattern-not-inside: |
+          constructor(...) { ... <... $ARG != InitialAdmin.CREATE2_FACTORY ...>; ... }
+    paths:
+      include:
+        - "*.sol"
+      exclude:
+        # Frozen or pinned CREATE2 addresses: changing their source moves the
+        # address. Revisit these at their own redeploy ceremonies.
+        # Exact src/ paths (matched whether semgrep runs from the repo root on
+        # contracts/src or from contracts/ on src).
+        - "/src/core_membership/*.sol"
+        - "/contracts/src/core_membership/*.sol"
+        - "/src/aa/factory/CitrateWalletFactory.sol"
+        - "/contracts/src/aa/factory/CitrateWalletFactory.sol"
+        - "/src/aa/paymaster/CitratePaymaster.sol"
+        - "/contracts/src/aa/paymaster/CitratePaymaster.sol"
+        - "/src/MentorMatcher.sol"
+        - "/contracts/src/MentorMatcher.sol"
+        - "/src/edu/ai-gateway/AIInferenceRouterPortable.sol"
+        - "/contracts/src/edu/ai-gateway/AIInferenceRouterPortable.sol"
+        - "/src/edu/ai-gateway/AILearningCycleCorePortable.sol"
+        - "/contracts/src/edu/ai-gateway/AILearningCycleCorePortable.sol"
+        # Not deployed through the salted ceremony (NFT demo).
+        - "/src/ColorCirclesNFT.sol"
+        - "/contracts/src/ColorCirclesNFT.sol"
+
+  # PBA-L2-002 (class, OpenZeppelin Ownable): `Ownable(arg)` in the constructor
+  # header needs the same check in the body (Ownable only refuses zero).
+  - id: pba-l2-002-ownable-unchecked
+    languages: [solidity]
+    severity: ERROR
+    message: >
+      PBA-L2-002: `Ownable(arg)` without InitialAdmin.check(arg) in the
+      constructor. Ownable refuses only the zero address, not the CREATE2
+      factory.
+    patterns:
+      - pattern: |
+          constructor(...) Ownable($ARG) { ... }
+      - metavariable-regex:
+          metavariable: $ARG
+          regex: ^[A-Za-z_][A-Za-z0-9_]*$
+      - pattern-not: |
+          constructor(...) Ownable($ARG) { ... InitialAdmin.check($ARG); ... }
+    paths:
+      include:
+        - "*.sol"
+      exclude:
+        # Frozen or pinned CREATE2 addresses: changing their source moves the
+        # address. Revisit these at their own redeploy ceremonies.
+        # Exact src/ paths (matched whether semgrep runs from the repo root on
+        # contracts/src or from contracts/ on src).
+        - "/src/core_membership/*.sol"
+        - "/contracts/src/core_membership/*.sol"
+        - "/src/aa/factory/CitrateWalletFactory.sol"
+        - "/contracts/src/aa/factory/CitrateWalletFactory.sol"
+        - "/src/aa/paymaster/CitratePaymaster.sol"
+        - "/contracts/src/aa/paymaster/CitratePaymaster.sol"
+        - "/src/MentorMatcher.sol"
+        - "/contracts/src/MentorMatcher.sol"
+        - "/src/edu/ai-gateway/AIInferenceRouterPortable.sol"
+        - "/contracts/src/edu/ai-gateway/AIInferenceRouterPortable.sol"
+        - "/src/edu/ai-gateway/AILearningCycleCorePortable.sol"
+        - "/contracts/src/edu/ai-gateway/AILearningCycleCorePortable.sol"
+        # Not deployed through the salted ceremony (NFT demo).
+        - "/src/ColorCirclesNFT.sol"
+        - "/contracts/src/ColorCirclesNFT.sol"
+
   # PBA-L2-014 / PBA-L2-036 (and CHAIN-B-C008/C024): an M-of-N signature path
   # that records a caller-NAMED `signer` without binding it to the caller lets
   # one key satisfy the whole threshold.

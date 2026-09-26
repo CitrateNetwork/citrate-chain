@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "../lib/InitialAdmin.sol";
+
 /// @title DefensePrimeComplianceRegistry — Compliance posture matrix for DPF-11.
 /// @notice Per-(framework, scope) compliance attestations with a
 ///         5-state posture machine + append-only history.
@@ -100,7 +102,7 @@ contract DefensePrimeComplianceRegistry {
 
     constructor(address initialGovernance) {
         if (initialGovernance == address(0)) revert ZeroGovernance();
-        governance = initialGovernance;
+        governance = InitialAdmin.check(initialGovernance); // PBA-L2-002: never the CREATE2 factory
     }
 
     // ── Governance ─────────────────────────────────────────────────────

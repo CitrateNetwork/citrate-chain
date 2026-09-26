@@ -23,7 +23,7 @@ import {P256} from "../../src/aa/lib/webauthn/P256.sol";
 ///           P256_VERIFIER_SALT      bytes32 salt Daimo used (default 0x0)
 ///         Run:
 ///           forge script script/aa/DeployP256Verifier.s.sol --rpc-url $RPC --broadcast --account deployer
-///         Then gate: forge script script/CheckDeployedAdmins.s.sol --rpc-url $RPC
+///         Then gate (post-redeploy): REQUIRE_ALL_CODE=true forge script script/CheckDeployedAdmins.s.sol --rpc-url $RPC
 contract DeployP256Verifier is Script {
     address internal constant ARACHNID_FACTORY = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
 

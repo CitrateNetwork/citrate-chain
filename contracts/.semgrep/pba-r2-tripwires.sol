@@ -49,3 +49,127 @@ contract Signers {
         return oracle.isSignedThresholdMet(id);
     }
 }
+
+contract AdminUnchecked {
+    address governance;
+    constructor(address g) {
+        if (g == address(0)) revert();
+        // ruleid: pba-l2-002-constructor-admin-unchecked
+        governance = g;
+    }
+}
+
+contract AdminChecked {
+    address governance;
+    constructor(address g) {
+        // ok: pba-l2-002-constructor-admin-unchecked
+        governance = InitialAdmin.check(g);
+    }
+}
+
+contract AdminCheckedFirst {
+    address owner;
+    constructor(address g) {
+        InitialAdmin.check(g);
+        // ok: pba-l2-002-constructor-admin-unchecked
+        owner = g;
+    }
+}
+
+contract OwnersChecked {
+    address[3] owners;
+    constructor(address[3] memory o) {
+        for (uint8 i = 0; i < 3; i++) {
+            InitialAdmin.check(o[i]);
+        }
+        // ok: pba-l2-002-constructor-admin-unchecked
+        owners = o;
+    }
+}
+
+contract FactoryCompared {
+    address private _governance;
+    address guardian;
+    constructor(address g, address h) {
+        if (g == InitialAdmin.CREATE2_FACTORY) revert();
+        require(h != InitialAdmin.CREATE2_FACTORY, "factory");
+        // ok: pba-l2-002-constructor-admin-unchecked
+        _governance = g;
+        // ok: pba-l2-002-constructor-admin-unchecked
+        guardian = h;
+    }
+}
+
+contract NotAnAdminSlot {
+    address vault;
+    constructor(address v) {
+        // ok: pba-l2-002-constructor-admin-unchecked
+        vault = v;
+    }
+}
+
+contract RoleUnchecked {
+    constructor(address a) {
+        // ruleid: pba-l2-002-constructor-admin-unchecked
+        _grantRole(DEFAULT_ADMIN_ROLE, a);
+    }
+}
+
+contract HelperUnchecked {
+    constructor(address a) {
+        // ruleid: pba-l2-002-constructor-admin-unchecked
+        _transferOwnership(a);
+    }
+}
+
+contract OwnableUnchecked is Ownable {
+    // ruleid: pba-l2-002-ownable-unchecked
+    constructor(address o) ERC721("a", "b") Ownable(o) {}
+}
+
+contract OwnableChecked is Ownable {
+    // ok: pba-l2-002-ownable-unchecked
+    constructor(address o) ERC721("a", "b") Ownable(o) {
+        InitialAdmin.check(o);
+    }
+}
+
+contract OwnableCheckedInline is Ownable {
+    // ok: pba-l2-002-ownable-unchecked
+    constructor(address o) Ownable(InitialAdmin.check(o)) {}
+}
+
+contract GovernorUnchecked {
+    address governor;
+    constructor(address g) {
+        // ruleid: pba-l2-002-constructor-admin-unchecked
+        governor = g;
+    }
+}
+
+contract AuthorityUnchecked {
+    address public authority;
+    constructor(address a) {
+        // ruleid: pba-l2-002-constructor-admin-unchecked
+        authority = a;
+    }
+}
+
+contract AuthorityHelperUnchecked {
+    constructor(address a) {
+        // ruleid: pba-l2-002-constructor-admin-unchecked
+        _setAuthority(a);
+    }
+}
+
+contract GovernorChecked {
+    address governor;
+    address authority;
+    constructor(address g, address a) {
+        // ok: pba-l2-002-constructor-admin-unchecked
+        governor = InitialAdmin.check(g);
+        InitialAdmin.check(a);
+        // ok: pba-l2-002-constructor-admin-unchecked
+        authority = a;
+    }
+}

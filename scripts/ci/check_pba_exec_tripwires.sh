@@ -12,7 +12,7 @@
 #   T3  PBA-L1a-017  node/src/main.rs keeps the periodic Mempool::clear_expired.
 #   T4  PBA-L1a-024  the metrics server never defaults to 0.0.0.0.
 #   T5  PBA-R2       node/src/main.rs publishes the activation height from
-#                    citrate_consensus::hardening::init_pba_hardening_height
+#                    citrate_consensus::hardening::init_pba_hardening_for_chain
 #                    (config + env override), never from the raw config field.
 #
 # Usage: check_pba_exec_tripwires.sh            # scan the tree
@@ -67,7 +67,7 @@ metrics_wildcard() { # <node main.rs>
 }
 
 activation_resolved() { # <node main.rs>
-  grep -q 'init_pba_hardening_height(' "$1" 2>/dev/null \
+  grep -qE 'init_pba_hardening_(height|for_chain)\(' "$1" 2>/dev/null \
     && ! grep -qE 'set_pba_hardening_height\([[:space:]]*config\.chain\.pba_hardening_height' "$1" 2>/dev/null
 }
 
@@ -89,7 +89,7 @@ run_scan() { # <root>
     echo "T4 PBA-L1a-024: metrics server defaults to 0.0.0.0:"; echo "$out"; rc=1
   fi
   if ! activation_resolved "$root/node/src/main.rs"; then
-    echo "T5 PBA-R2: main.rs must publish via init_pba_hardening_height (config + env override)"; rc=1
+    echo "T5 PBA-R2: main.rs must publish via the shared activation resolver (pin + env + config)"; rc=1
   fi
   return "$rc"
 }

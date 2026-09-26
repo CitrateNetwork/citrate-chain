@@ -56,11 +56,28 @@ Feature: ComputePool DataParallel federated training (CM-07)
     And StepCommitted events for step 1 from w2 and w3 still land
     But the coordinator never submits commitEpoch(J, 0, _)
     Then the on-chain coordinatorFor(J, epoch=0) remains set (liveness TBD)
-    When CoordinationTimeout blocks pass and any worker calls
-      `reassignCoordinator(J, epoch=0)`
-    Then the original coordinator is slashed via ComputePool.slashCoordinator
-    And a new coordinator is VRF-elected for epoch=0 from remaining workers
+    When CoordinationTimeout blocks pass and the requester calls
+      `reassignCoordinator(J, newCoordinator)`
+    Then the coordinator is replaced by the requester's choice
+    And the original coordinator is NOT slashed (a requester swap is not a
+      stall adjudication; epochs routinely exceed CoordinationTimeout)
     And training resumes
+    # PBA-L2-003: only the requester or governance may appoint a coordinator.
+    # A joined worker calling reassignCoordinator reverts "not authorized".
+
+  Scenario: Governance adjudicates a stalled coordinator
+    Given job J is in Training state and its coordinator made no progress
+      for CoordinationTimeout blocks
+    When governance calls `reassignCoordinator(J, newCoordinator)`
+    Then the stalled coordinator is liveness-slashed 0.1% of its stake
+    And the slash is retained in retainedSlashAndBonds (sweepRetained)
+
+  Scenario: Requester disappears; workers expire the stalled job
+    Given job J is in Training state with no commitEpoch for STALL_EXPIRY_BLOCKS
+    When any joined worker calls `expireStalledTraining(J)`
+    Then J moves to Awaiting and the challenge window starts
+    And after the window finalizeTrainingJob pays committed epochs and
+      refunds the uncommitted budget to the requester
 
   # ── Worker drop-out ──
 

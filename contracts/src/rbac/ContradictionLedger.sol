@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "../lib/InitialAdmin.sol";
+
 /// @title ContradictionLedger — Belnap 4-valued state ledger
 /// @notice Records contradictions (Belnap "B" state) preserved in the
 ///         system. The demo-distinctive moment: when two attested
@@ -120,7 +122,7 @@ contract ContradictionLedger {
 
     constructor(address initialGovernance) {
         if (initialGovernance == address(0)) revert ZeroGovernance();
-        governance = initialGovernance;
+        governance = InitialAdmin.check(initialGovernance); // PBA-L2-002: never the CREATE2 factory
     }
 
     // ── Governance transfer (two-step) ──────────────────────────────

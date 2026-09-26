@@ -74,3 +74,36 @@ Feature: ComputePool settlement authority + requester timeout-refund (INFER-S2)
     Given any reachable sequence of dispatch / complete / fail / reclaim calls
     Then a job's payment is paid out, or refunded, or still escrowed — never two of these
     And reclaimExpiredJob never returns more than job.payment
+
+  # ── PBA-L2-022 / L2-023: exit and payout liveness ──
+
+  Scenario: a dispatched coordinator cannot leave before its job terminates
+    Given the job has been dispatched by the coordinator (activeJobs = 1)
+    And the coordinator called requestLeave and LEAVE_COOLDOWN blocks passed
+    When the coordinator calls leavePool
+    Then the call reverts with "Has active jobs"
+    # TLA: ActiveJobsAccurate, NoLeaveWithOpenDispatch in ComputePoolSettlement.tla
+
+  Scenario: a member whose receive reverts cannot block settlement
+    Given a pool member is a contract that reverts on receive
+    When the coordinator calls completeJob
+    Then the job becomes Completed
+    And that member's share is credited to payoutPending (claimPayout)
+
+  # ── Coordinator reassignment: caller + stake accounting ──
+
+  Scenario: only a current pool member can reassign a stalled coordinator
+    Given the job has been Executing for more than COORDINATION_TIMEOUT blocks
+    When an address that is not an active pool member calls reassignCoordinator
+    Then the call reverts with "Not a pool member"
+    # TLA: Reassign(j, caller) requires IsMember(caller)
+
+  Scenario: a liveness slash keeps pool stake accounting whole
+    Given the dispatched coordinator stalled past COORDINATION_TIMEOUT
+    When a pool member calls reassignCoordinator
+    Then the coordinator's stake and pool.totalStaked both drop by the slash
+    And the slash is added to slashedStakeRetained
+    And the job returns to Pending with the coordinator's activeJobs decremented
+    When the coordinator later requests leave, waits LEAVE_COOLDOWN, and leaves
+    Then only the post-slash stake is returned and pool.totalStaked drops by it
+    # TLA: TotalStakedMatchesMembers, StakeConservation in ComputePoolSettlement.tla

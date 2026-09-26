@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "../lib/InitialAdmin.sol";
+
 /// @title TripwireRegistry — FedRAMP AU-9 tripwire firing anchor (DPF-15).
 /// @notice Per planset 04_FEDRAMP_COMPLIANCE.md § Tripwires, this
 ///         contract anchors tripwire firings as immutable on-chain
@@ -85,7 +87,7 @@ contract TripwireRegistry {
 
     constructor(address initialGovernance) {
         if (initialGovernance == address(0)) revert ZeroGovernance();
-        governance = initialGovernance;
+        governance = InitialAdmin.check(initialGovernance); // PBA-L2-002: never the CREATE2 factory
     }
 
     function setRecorder(address recorder, bool authorized) external {

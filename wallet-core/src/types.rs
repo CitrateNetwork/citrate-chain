@@ -136,7 +136,8 @@ impl NetworkConfig {
     pub fn devnet() -> Self {
         Self {
             name: "devnet".to_string(),
-            chain_id: 40204,
+            // Local dev chains run on 1337 (node DEV_CHAIN_ID).
+            chain_id: 1337,
             rpc_url: "http://localhost:8545".to_string(),
             explorer_url: None,
             faucet_url: None,
@@ -180,7 +181,7 @@ mod tests {
     #[test]
     fn test_network_presets() {
         let devnet = NetworkConfig::devnet();
-        assert_eq!(devnet.chain_id, 40204);
+        assert_eq!(devnet.chain_id, 1337);
         assert!(devnet.rpc_url.contains("localhost"));
 
         let testnet = NetworkConfig::testnet();

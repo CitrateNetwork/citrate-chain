@@ -59,6 +59,30 @@ cast code <address> --rpc-url https://rpc.citrate.ai   # "0x" means nothing is d
 python3 verification/check_address_code.py --check      # read-only sweep of the whole book
 ```
 
+## ZK-tier compute jobs: client contract
+
+`ComputeMarketplace` binds ZK proofs to the job through the public inputs the
+0x0108 v1 inference circuit proves: `input_commitment ‖ model_commitment ‖
+output_commitment`, each a canonical BN254 scalar (`< ComputeVerifier.BN254_SCALAR_MODULUS`).
+
+- **Which jobs:** any job whose effective tier is `ZKProof`, whether requested
+  explicitly or **auto-upgraded because `maxPrice` exceeds 10 SALT**
+  (`ComputeVerifier.VALUE_THRESHOLD`).
+- **Requester:** pass the circuit's 32-byte **input commitment** as `inputHash`
+  (not a keccak/sha hash of the input bytes); `modelHash` must also be `< r`.
+  Otherwise `postJob` / `autoAssignJob` revert.
+- **Provider:** after proving, call `submitCommitment(jobId,
+  verifier.zkProofCommitment(jobId, proofData))`; at least one block later call
+  `submitResult(jobId, outputCommitment32, proofData)` where `proofData =
+  proofLen ‖ proof ‖ publicInputs(96 bytes)`. The provider may re-commit until
+  it reveals. Malformed output commitments revert (no slash).
+  Provider tooling must always reveal the proof it last committed; only the
+  latest commitment is checked, so revealing an earlier one fails verification.
+- **Payment:** `completeJob` is accepted `DISPUTE_WINDOW` (100) blocks after a
+  Valid verdict.
+- **TEE tier:** oracles sign `ComputeVerifier.teeAttestationDigest(jobId, attestation)`
+  (EIP-191 wrapped).
+
 ## Interacting with Contracts
 
 ```bash
