@@ -1,6 +1,6 @@
 {
   "generated_at": "2026-09-27T18:36:30Z",
-  "source_commit": "chore/r2-address-book-redeploy",
+  "source_commit": "a2d64e67144517d7dfe553ebd5223372c804e602",
   "note": "Single machine-readable source of truth for every public technical claim about citrate-chain. Each value is tied to source files and, where applicable, reproducible evidence. Website and marketing facts MUST be generated from this file, not hand-copied. Numbers here were measured/derived from the code at source_commit; see verification_status per claim. See verification/README.md for status definitions.",
   "claims": {
     "salt_total_supply": {
@@ -191,7 +191,9 @@
         "codeless_in_book": 0,
         "genesis_deployers": 2,
         "top_level_extra": 2,
-        "precompile_addresses_listed": 21
+        "precompile_addresses_listed": 21,
+        "planned_codeless": 5,
+        "snapshot_with_code_total": 85
       },
       "source_files": [
         "contracts/addresses/40204.json"
@@ -201,10 +203,10 @@
         "verification/check_address_code.py"
       ],
       "reproduction_command": "python3 verification/check_address_code.py --check  # read-only eth_getCode on every book entry; --offline validates the committed snapshot without network",
-      "count_method": "Entries in contracts (69) + aaStack (7) = 76 book entries. eth_getCode at the probed block: 57 have code, 19 are codeless (not deployed). genesis.ArachnidDeterministicDeployer (1) and two top-level entries (CitrateMemberSBT, MembershipStakeVault) are tracked separately and have code. Precompiles (21) are codeless by design.",
-      "last_verified_at": "2026-09-25T05:30:00Z",
-      "verification_status": "measured-here",
-      "notes": "The public number is 57 contracts with code on chain 40204, NOT 76. The 19 codeless book entries (the governance and cooperative set: AnchorRegistry, MeetingRegistry, GovernanceTemplateRegistry, GovernanceProtocolFactory, PolicyBinding, CapabilityGrant, VoteAllowance, Sortition, PatronageLedger, ModelCooperative, FacilitySBTImpl, NetworkSBTImpl, FacilitySBT, NetworkSBT, CitrateCooperativeFactory, CoopDeployer, CoopMembershipSBT, ContributionRewardPool, CoopGovernor) are NOT deployed; a value transfer to one of them succeeds and strands the value. The book (deployedAt 2026-09-12) is the canonical table; never hand-copy addresses into READMEs."
+      "count_method": "contracts (74) + aaStack (7) = 81 gated book entries; eth_getCode at the probed block shows all 81 have code and 0 are codeless (this is the figure check_address_code.py --check gates on: with_code_on_chain == 81, codeless_in_book == 0). The address-code snapshot's with_code_count of 85 = these 81 + 2 genesis deployers (ArachnidDeterministicDeployer, P256Verifier) + 2 top-level entries (CitrateMemberSBT, MembershipStakeVault), all of which have code and are tracked separately. The governance section (GOVERNANCE + GUARDIAN, each a 2-of-3 MultisigTimelock2of3) is verified by the deploy-admin gate, not counted here. Codeless by design: 21 precompile addresses (VM precompiles, no bytecode) and 5 planned.* entries (not yet deployed).",
+      "last_verified_at": "2026-09-27T18:34:50Z",
+      "verification_status": "verified",
+      "notes": "Regenerated after the R2 contract redeploy (hard fork H=247436) at chain block 288390. Probe: python3 verification/check_address_code.py --probe --rpc https://rpc.citrate.ai."
     },
     "precompiles": {
       "scope": "citrate-chain",
