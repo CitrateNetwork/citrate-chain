@@ -1302,27 +1302,6 @@ impl Mempool {
         }
     }
 
-    /// Evict the lowest priority transaction (unconditional).
-    #[cfg_attr(not(test), allow(dead_code))]
-    async fn evict_lowest_priority(&self) -> Result<(), MempoolError> {
-        let priority_queue = self.priority_queue.read().await;
-
-        // Find the transaction with the lowest priority
-        let lowest = priority_queue
-            .iter()
-            .min_by_key(|(_, priority)| priority.score())
-            .map(|(hash, _)| *hash);
-
-        drop(priority_queue);
-
-        if let Some(hash) = lowest {
-            self.remove_transaction(&hash).await;
-            Ok(())
-        } else {
-            Err(MempoolError::Full)
-        }
-    }
-
     /// PBA-N9 (security#134): payable/priority-aware eviction. Evict the pool's
     /// lowest-priority transaction ONLY when it is NOT strictly higher priority
     /// than `incoming` (which admission has already verified is payable). If every
