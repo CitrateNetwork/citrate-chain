@@ -17,6 +17,16 @@ contract OrphanedByFactory {
     }
 }
 
+/// Stand-in for a contract whose governance was never handed off: its
+/// governance getter still returns the deployer EOA.
+contract StillDeployerGoverned {
+    address public immutable governance;
+
+    constructor(address g) {
+        governance = g;
+    }
+}
+
 contract AdminChecksHarness is AdminChecks {
     function problem(address t) external view returns (string memory) {
         return _factoryAdminProblem(t);
@@ -29,6 +39,7 @@ contract AdminChecksHarness is AdminChecks {
 contract PBA_L2_002_Fixed is Test {
     address constant FACTORY = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
     address intended = makeAddr("multisig");
+    address deployer = makeAddr("deployer");
 
     function _viaFactory(bytes memory initCode, bytes32 salt) internal returns (bool ok, address deployed) {
         bytes memory ret;
@@ -81,10 +92,10 @@ contract PBA_L2_002_Fixed is Test {
         CheckDeployedAdmins c = new CheckDeployedAdmins();
         vm.expectRevert(bytes("CheckDeployedAdmins: CREATE2 factory holds an admin slot (see log)"));
         c.check(
-            string.concat('{"contracts":{"Orphan":"', vm.toString(address(o)), '",', planned, '},"aaStack":{}}'), false
+            _book(string.concat('"Orphan":"', vm.toString(address(o)), '",', planned)), false
         );
 
-        string memory ok = string.concat('{"contracts":{"Good":"', vm.toString(address(good)), '",', planned, '},"aaStack":{}}');
+        string memory ok = _book(string.concat('"Good":"', vm.toString(address(good)), '",', planned));
         CheckDeployedAdmins c2 = new CheckDeployedAdmins();
         c2.check(ok, false);
         assertEq(c2.factoryAdmin(), 0);
@@ -98,5 +109,36 @@ contract PBA_L2_002_Fixed is Test {
         CheckDeployedAdmins c4 = new CheckDeployedAdmins();
         vm.expectRevert(bytes("CheckDeployedAdmins: P-256 verifier not provisioned"));
         c4.check(ok, false);
+    }
+
+    /// CheckDeployedAdmins fails when the book's deployer EOA still governs a
+    /// deployed contract, and passes once governance is the multisig.
+    function test_L2_002_checkDeployedAdmins_flagsDeployerGovernance() public {
+        vm.etch(0xc2b78104907F722DABAc4C69f826a522B2754De4, hex"600160005260206000f3");
+        StillDeployerGoverned stale = new StillDeployerGoverned(deployer);
+        StillDeployerGoverned handed = new StillDeployerGoverned(intended);
+
+        CheckDeployedAdmins c = new CheckDeployedAdmins();
+        vm.expectRevert(bytes("CheckDeployedAdmins: deployer EOA holds governance/owner/DEFAULT_ADMIN (see log)"));
+        c.check(_book(string.concat('"Stale":"', vm.toString(address(stale)), '"')), false);
+
+        CheckDeployedAdmins c2 = new CheckDeployedAdmins();
+        c2.check(_book(string.concat('"Handed":"', vm.toString(address(handed)), '"')), false);
+        assertEq(c2.deployerAdmin(), 0);
+    }
+
+    /// A book without a `deployer` entry fails closed rather than skipping
+    /// the deployer-EOA class.
+    function test_L2_002_checkDeployedAdmins_requiresDeployerEntry() public {
+        vm.etch(0xc2b78104907F722DABAc4C69f826a522B2754De4, hex"600160005260206000f3");
+        CheckDeployedAdmins c = new CheckDeployedAdmins();
+        vm.expectRevert();
+        c.check('{"contracts":{},"aaStack":{}}', false);
+    }
+
+    function _book(string memory contractsBody) internal view returns (string memory) {
+        return string.concat(
+            '{"deployer":"', vm.toString(deployer), '","contracts":{', contractsBody, '},"aaStack":{}}'
+        );
     }
 }
