@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-09-25T05:30:00Z",
-  "source_commit": "21726055c9d1af28c1ad2e3c95f3db5c61a2b8fc",
+  "generated_at": "2026-09-27T18:36:30Z",
+  "source_commit": "a2d64e67144517d7dfe553ebd5223372c804e602",
   "note": "Single machine-readable source of truth for every public technical claim about citrate-chain. Each value is tied to source files and, where applicable, reproducible evidence. Website and marketing facts MUST be generated from this file, not hand-copied. Numbers here were measured/derived from the code at source_commit; see verification_status per claim. See verification/README.md for status definitions.",
   "claims": {
     "salt_total_supply": {
@@ -8,8 +8,12 @@
       "value": 1000000000000,
       "unit": "whole SALT (base tokens; multiply by 10^decimals for wei)",
       "human": "1 trillion SALT",
-      "source_files": ["core/economics/src/lib.rs:62"],
-      "evidence_files": ["core/economics/src/token.rs:26-27"],
+      "source_files": [
+        "core/economics/src/lib.rs:62"
+      ],
+      "evidence_files": [
+        "core/economics/src/token.rs:26-27"
+      ],
       "reproduction_command": "grep -n 'TOTAL_SUPPLY' core/economics/src/lib.rs",
       "last_verified_at": "2026-09-24T02:37:00Z",
       "verification_status": "reproducible-from-source",
@@ -18,8 +22,12 @@
     "decimals": {
       "scope": "citrate-chain",
       "value": 18,
-      "source_files": ["core/economics/src/token.rs:9"],
-      "evidence_files": ["core/economics/src/lib.rs:66-71"],
+      "source_files": [
+        "core/economics/src/token.rs:9"
+      ],
+      "evidence_files": [
+        "core/economics/src/lib.rs:66-71"
+      ],
       "reproduction_command": "grep -n 'DECIMALS' core/economics/src/token.rs",
       "last_verified_at": "2026-09-24T02:37:00Z",
       "verification_status": "reproducible-from-source"
@@ -28,8 +36,14 @@
       "scope": "citrate-chain",
       "value": 40204,
       "value_hex": "0x9d0c",
-      "source_files": ["node/config/mainnet.toml:6", "node/config/testnet.toml:5", "testnet-config.toml:2"],
-      "evidence_files": ["contracts/addresses/40204.json"],
+      "source_files": [
+        "node/config/mainnet.toml:6",
+        "node/config/testnet.toml:5",
+        "testnet-config.toml:2"
+      ],
+      "evidence_files": [
+        "contracts/addresses/40204.json"
+      ],
       "reproduction_command": "grep -rn 'chain_id' node/config/*.toml testnet-config.toml",
       "last_verified_at": "2026-09-24T02:37:00Z",
       "verification_status": "reproducible-from-source",
@@ -38,8 +52,14 @@
     "ghostdag_k": {
       "scope": "citrate-chain",
       "value": 18,
-      "source_files": ["node/config/testnet.toml:8", "node/config/mainnet.toml:9", "testnet-config.toml:5"],
-      "evidence_files": ["core/consensus/src/ghostdag.rs"],
+      "source_files": [
+        "node/config/testnet.toml:8",
+        "node/config/mainnet.toml:9",
+        "testnet-config.toml:5"
+      ],
+      "evidence_files": [
+        "core/consensus/src/ghostdag.rs"
+      ],
       "reproduction_command": "grep -rn 'ghostdag_k' node/config/*.toml testnet-config.toml",
       "last_verified_at": "2026-09-24T02:37:00Z",
       "verification_status": "reproducible-from-source",
@@ -47,9 +67,19 @@
     },
     "block_time": {
       "scope": "citrate-chain",
-      "value": {"measured_live_seconds": 2, "measured_range_seconds": [1.9, 2.0], "config_target_seconds": 1},
+      "value": {
+        "measured_live_seconds": 2,
+        "measured_range_seconds": [
+          1.9,
+          2.0
+        ],
+        "config_target_seconds": 1
+      },
       "unit": "seconds",
-      "source_files": ["node/config/testnet.toml:7", "node/config/testnet.toml:40"],
+      "source_files": [
+        "node/config/testnet.toml:7",
+        "node/config/testnet.toml:40"
+      ],
       "evidence_files": [],
       "reproduction_command": "grep -n 'block_time\\|target_block_time' node/config/testnet.toml  # config target=1s. Live: sample consecutive block timestamps via RPC (eth_getBlockByNumber) and diff them -> ~1.9-2.0s.",
       "last_verified_at": "2026-09-24T03:02:28Z",
@@ -60,8 +90,13 @@
       "scope": "citrate-chain",
       "value": 50,
       "unit": "blocks",
-      "source_files": ["node/config/testnet.toml:49-52"],
-      "evidence_files": ["core/consensus/tests/checkpoint_tests.rs", "core/consensus/tests/h01_h02_checkpoint_safety.rs"],
+      "source_files": [
+        "node/config/testnet.toml:49-52"
+      ],
+      "evidence_files": [
+        "core/consensus/tests/checkpoint_tests.rs",
+        "core/consensus/tests/h01_h02_checkpoint_safety.rs"
+      ],
       "reproduction_command": "sed -n '48,53p' node/config/testnet.toml",
       "last_verified_at": "2026-09-24T02:37:00Z",
       "verification_status": "reproducible-from-source",
@@ -69,9 +104,23 @@
     },
     "deterministic_checkpoint_finality": {
       "scope": "citrate-chain",
-      "value": {"running": false, "specified_interval_blocks": 50, "specified_committee_size": 100, "specified_quorum_threshold": 67, "seconds_estimate_if_running": null},
-      "source_files": ["node/config/testnet.toml:49-52", "core/consensus/src/checkpoint.rs:382", "node/src/main.rs:1520-1530,1592-1606"],
-      "evidence_files": ["core/consensus/tests/h01_h02_checkpoint_safety.rs", "specs/tla/consensus/CheckpointVoteSafety.tla", "verification/check_claims.py"],
+      "value": {
+        "running": false,
+        "specified_interval_blocks": 50,
+        "specified_committee_size": 100,
+        "specified_quorum_threshold": 67,
+        "seconds_estimate_if_running": null
+      },
+      "source_files": [
+        "node/config/testnet.toml:49-52",
+        "core/consensus/src/checkpoint.rs:382",
+        "node/src/main.rs:1520-1530,1592-1606"
+      ],
+      "evidence_files": [
+        "core/consensus/tests/h01_h02_checkpoint_safety.rs",
+        "specs/tla/consensus/CheckpointVoteSafety.tla",
+        "verification/check_claims.py"
+      ],
       "reproduction_command": "python3 verification/check_claims.py  # fails if this claim says running=true while no non-test code path calls .propose(",
       "last_verified_at": "2026-09-25T05:30:00Z",
       "verification_status": "specified-not-running",
@@ -79,9 +128,17 @@
     },
     "confirmation_latency": {
       "scope": "citrate-chain",
-      "value": {"probabilistic_block_seconds": 2, "deterministic_checkpoint_seconds_estimate": null, "explorer_depth_heuristic_blocks": 100},
-      "source_files": ["node/config/testnet.toml:7"],
-      "evidence_files": ["docs/consensus/EXECUTE_ON_RECEIVE_state_application.md:70-82"],
+      "value": {
+        "probabilistic_block_seconds": 2,
+        "deterministic_checkpoint_seconds_estimate": null,
+        "explorer_depth_heuristic_blocks": 100
+      },
+      "source_files": [
+        "node/config/testnet.toml:7"
+      ],
+      "evidence_files": [
+        "docs/consensus/EXECUTE_ON_RECEIVE_state_application.md:70-82"
+      ],
       "reproduction_command": "grep -n 'finality\\|checkpoint' docs/consensus/EXECUTE_ON_RECEIVE_state_application.md",
       "last_verified_at": "2026-09-25T05:30:00Z",
       "verification_status": "documented-pre-audit",
@@ -89,9 +146,19 @@
     },
     "foundry_tests": {
       "scope": "citrate-chain/contracts",
-      "value": {"passed": 2913, "failed": 0, "skipped": 0, "suites": 158},
-      "source_files": ["contracts/"],
-      "evidence_files": ["contracts/foundry.toml", "foundry.toml"],
+      "value": {
+        "passed": 2913,
+        "failed": 0,
+        "skipped": 0,
+        "suites": 158
+      },
+      "source_files": [
+        "contracts/"
+      ],
+      "evidence_files": [
+        "contracts/foundry.toml",
+        "foundry.toml"
+      ],
       "reproduction_command": "cd contracts && forge test --use 0.8.36",
       "count_method": "forge test --use 0.8.36 final summary line ('2913 tests passed, 0 failed, 0 skipped')",
       "last_verified_at": "2026-09-24T02:37:00Z",
@@ -100,8 +167,13 @@
     },
     "rust_tests": {
       "scope": "citrate-chain",
-      "value": {"tests": 4379, "doctests_included": false},
-      "source_files": ["Cargo.toml"],
+      "value": {
+        "tests": 4379,
+        "doctests_included": false
+      },
+      "source_files": [
+        "Cargo.toml"
+      ],
       "evidence_files": [],
       "reproduction_command": "cargo test --workspace -- --list 2>/dev/null | grep -c ': test'",
       "count_method": "cargo test --workspace -- --list | grep -c ': test' (each ': test' line is one #[test]/#[tokio::test] case). The per-binary 'N tests' summary lines sum to the same 4379, cross-checking the count.",
@@ -111,14 +183,30 @@
     },
     "deployed_contracts": {
       "scope": "citrate-chain",
-      "value": {"contracts": 69, "aa_stack": 7, "book_entries_contracts_plus_aa": 76, "with_code_on_chain": 57, "codeless_in_book": 19, "genesis_deployers": 1, "top_level_extra": 2, "precompile_addresses_listed": 21},
-      "source_files": ["contracts/addresses/40204.json"],
-      "evidence_files": ["verification/address-code.snapshot.json", "verification/check_address_code.py"],
+      "value": {
+        "contracts": 74,
+        "aa_stack": 7,
+        "book_entries_contracts_plus_aa": 81,
+        "with_code_on_chain": 81,
+        "codeless_in_book": 0,
+        "genesis_deployers": 2,
+        "top_level_extra": 2,
+        "precompile_addresses_listed": 21,
+        "planned_codeless": 5,
+        "snapshot_with_code_total": 85
+      },
+      "source_files": [
+        "contracts/addresses/40204.json"
+      ],
+      "evidence_files": [
+        "verification/address-code.snapshot.json",
+        "verification/check_address_code.py"
+      ],
       "reproduction_command": "python3 verification/check_address_code.py --check  # read-only eth_getCode on every book entry; --offline validates the committed snapshot without network",
-      "count_method": "Entries in contracts (69) + aaStack (7) = 76 book entries. eth_getCode at the probed block: 57 have code, 19 are codeless (not deployed). genesis.ArachnidDeterministicDeployer (1) and two top-level entries (CitrateMemberSBT, MembershipStakeVault) are tracked separately and have code. Precompiles (21) are codeless by design.",
-      "last_verified_at": "2026-09-25T05:30:00Z",
-      "verification_status": "measured-here",
-      "notes": "The public number is 57 contracts with code on chain 40204, NOT 76. The 19 codeless book entries (the governance and cooperative set: AnchorRegistry, MeetingRegistry, GovernanceTemplateRegistry, GovernanceProtocolFactory, PolicyBinding, CapabilityGrant, VoteAllowance, Sortition, PatronageLedger, ModelCooperative, FacilitySBTImpl, NetworkSBTImpl, FacilitySBT, NetworkSBT, CitrateCooperativeFactory, CoopDeployer, CoopMembershipSBT, ContributionRewardPool, CoopGovernor) are NOT deployed; a value transfer to one of them succeeds and strands the value. The book (deployedAt 2026-09-12) is the canonical table; never hand-copy addresses into READMEs."
+      "count_method": "contracts (74) + aaStack (7) = 81 gated book entries; eth_getCode at the probed block shows all 81 have code and 0 are codeless (this is the figure check_address_code.py --check gates on: with_code_on_chain == 81, codeless_in_book == 0). The address-code snapshot's with_code_count of 85 = these 81 + 2 genesis deployers (ArachnidDeterministicDeployer, P256Verifier) + 2 top-level entries (CitrateMemberSBT, MembershipStakeVault), all of which have code and are tracked separately. The governance section (GOVERNANCE + GUARDIAN, each a 2-of-3 MultisigTimelock2of3) is verified by the deploy-admin gate, not counted here. Codeless by design: 21 precompile addresses (VM precompiles, no bytecode) and 5 planned.* entries (not yet deployed).",
+      "last_verified_at": "2026-09-27T18:34:50Z",
+      "verification_status": "verified",
+      "notes": "Regenerated after the R2 contract redeploy (hard fork H=247436) at chain block 288390. Probe: python3 verification/check_address_code.py --probe --rpc https://rpc.citrate.ai."
     },
     "precompiles": {
       "scope": "citrate-chain",
@@ -132,8 +220,14 @@
         "x402": "0x0200-0x0202",
         "listed_in_address_table": 21
       },
-      "source_files": ["core/execution/src/precompiles/mod.rs:139-154", "core/execution/src/precompiles/inference.rs:19-35"],
-      "evidence_files": ["contracts/addresses/40204.json", "core/execution/src/precompiles/"],
+      "source_files": [
+        "core/execution/src/precompiles/mod.rs:139-154",
+        "core/execution/src/precompiles/inference.rs:19-35"
+      ],
+      "evidence_files": [
+        "contracts/addresses/40204.json",
+        "core/execution/src/precompiles/"
+      ],
       "reproduction_command": "sed -n '80,160p' core/execution/src/precompiles/mod.rs; python3 -c \"import json;print(json.load(open('contracts/addresses/40204.json'))['precompiles'])\"",
       "last_verified_at": "2026-09-24T02:37:00Z",
       "verification_status": "reproducible-from-source",
@@ -141,9 +235,20 @@
     },
     "model_registry_precompile_flag": {
       "scope": "citrate-chain/contracts",
-      "value": {"model_registry_constant": "0x0000000000000000000000000000000000001000", "artifact_constant": "0x0000000000000000000000000000000000001002", "canonical_model_deploy": "0x0000000000000000000000000000000000000100", "canonical_model_inference": "0x0000000000000000000000000000000000000101", "agrees": false},
-      "source_files": ["contracts/src/ModelRegistry.sol:17-18"],
-      "evidence_files": ["core/execution/src/precompiles/inference.rs:19-35", "contracts/addresses/40204.json"],
+      "value": {
+        "model_registry_constant": "0x0000000000000000000000000000000000001000",
+        "artifact_constant": "0x0000000000000000000000000000000000001002",
+        "canonical_model_deploy": "0x0000000000000000000000000000000000000100",
+        "canonical_model_inference": "0x0000000000000000000000000000000000000101",
+        "agrees": false
+      },
+      "source_files": [
+        "contracts/src/ModelRegistry.sol:17-18"
+      ],
+      "evidence_files": [
+        "core/execution/src/precompiles/inference.rs:19-35",
+        "contracts/addresses/40204.json"
+      ],
       "reproduction_command": "grep -n 'PRECOMPILE' contracts/src/ModelRegistry.sol",
       "last_verified_at": "2026-09-24T02:37:00Z",
       "verification_status": "measured-here",
@@ -156,7 +261,10 @@
           "value": 750,
           "verification_status": "derived-from-config",
           "derivation": "block_gas_limit(30,000,000) / gas_per_simple_transfer(21,000) / measured_block_time(~2s) ~= 714, rounded to ~750 for simple transfers",
-          "source_files": ["core/sequencer/src/mempool.rs:179", "core/sequencer/src/block_builder.rs:74"],
+          "source_files": [
+            "core/sequencer/src/mempool.rs:179",
+            "core/sequencer/src/block_builder.rs:74"
+          ],
           "reproduction_command": "grep -n 'MAX_GAS_PER_BLOCK' core/sequencer/src/mempool.rs; python3 -c 'print(30_000_000/21000/2)'  # ~714; tools/citrate-bench can confirm the live figure once bench signers are funded (signs client-side via eth_sendRawTransaction)",
           "notes": "Peak is gas-limit bound: there is NO 10,000 TPS headroom on the current testnet. A block holds at most 30M/21k = ~1428 simple transfers, and blocks land ~every 2s, so sustained simple-transfer throughput is ~750 TPS."
         },
@@ -178,8 +286,17 @@
           "notes": "SEPARATE, HIGHER metric: the executor's in-memory parallel-execution throughput (not end-to-end network TPS, which is RPC/signature/gas-limit bound and far lower). In-process microbench via core/execution/benches/tps_parallel.rs; no committed artifact yet."
         }
       },
-      "source_files": ["core/sequencer/src/mempool.rs:179", "core/sequencer/src/block_builder.rs:74", "CLAUDE.md:165-171"],
-      "evidence_files": ["tools/citrate-bench/", "core/execution/benches/tps_parallel.rs", "core/execution/benches/parallel_bench.rs", "core/execution/benches/mvcc_bench.rs"],
+      "source_files": [
+        "core/sequencer/src/mempool.rs:179",
+        "core/sequencer/src/block_builder.rs:74",
+        "CLAUDE.md:165-171"
+      ],
+      "evidence_files": [
+        "tools/citrate-bench/",
+        "core/execution/benches/tps_parallel.rs",
+        "core/execution/benches/parallel_bench.rs",
+        "core/execution/benches/mvcc_bench.rs"
+      ],
       "reproduction_command": "grep -n 'MAX_GAS_PER_BLOCK' core/sequencer/src/mempool.rs && python3 -c 'print(30_000_000/21000/2)'",
       "last_verified_at": "2026-09-24T03:02:28Z",
       "verification_status": "mixed (see per-sub-metric statuses)",
@@ -187,10 +304,35 @@
     },
     "tla_specs": {
       "scope": "public repositories (federation)",
-      "value": {"public_repo_specs": 102, "public_claim": "100+"},
-      "public_repo_breakdown": {"citrate-chain": 71, "nat": 8, "nist-agent": 6, "coop": 4, "core": 4, "memories": 3, "comms": 2, "explorer": 2, "agentile": 1, "cluster": 1},
-      "source_files": ["citrate-chain/specs/tla/", "nat/specs/tla/", "nist-agent/specs/tla/", "coop/specs/tla/", "core/specs/tla/", "citrate-memories/specs/", "citrate-comms/formal/", "citrate-explorer/specs/tla/"],
-      "evidence_files": ["citrate-chain/specs/tla/consensus/GhostDAGConsensus.tla"],
+      "value": {
+        "public_repo_specs": 102,
+        "public_claim": "100+"
+      },
+      "public_repo_breakdown": {
+        "citrate-chain": 71,
+        "nat": 8,
+        "nist-agent": 6,
+        "coop": 4,
+        "core": 4,
+        "memories": 3,
+        "comms": 2,
+        "explorer": 2,
+        "agentile": 1,
+        "cluster": 1
+      },
+      "source_files": [
+        "citrate-chain/specs/tla/",
+        "nat/specs/tla/",
+        "nist-agent/specs/tla/",
+        "coop/specs/tla/",
+        "core/specs/tla/",
+        "citrate-memories/specs/",
+        "citrate-comms/formal/",
+        "citrate-explorer/specs/tla/"
+      ],
+      "evidence_files": [
+        "citrate-chain/specs/tla/consensus/GhostDAGConsensus.tla"
+      ],
       "reproduction_command": "for r in citrate-chain nat nist-agent coop core citrate-memories citrate-comms citrate-explorer; do gh repo clone CitrateNetwork/$r; done && find . -name '*.tla' | wc -l",
       "count_method": "Clone the PUBLIC repos and run: find -name '*.tla' | wc -l. 102 specs today (chain 71 + nat 8 + nist-agent 6 + coop 4 + core 4 + memories 3 + comms 2 + explorer 2 + agentile 1 + cluster 1); the public-facing claim is '100+'.",
       "last_verified_at": "2026-09-23T18:00:00Z",
@@ -201,8 +343,12 @@
       "scope": "citrate-agentile-archive (formal verification)",
       "value": 50000000000,
       "human": "50B+ states",
-      "source_files": ["citrate-agentile-archive/formal/specs/wallet/TransactionSigningFlow.tla"],
-      "evidence_files": ["citrate-agentile-archive/formal/specs/wallet/TransactionSigningFlow.tla"],
+      "source_files": [
+        "citrate-agentile-archive/formal/specs/wallet/TransactionSigningFlow.tla"
+      ],
+      "evidence_files": [
+        "citrate-agentile-archive/formal/specs/wallet/TransactionSigningFlow.tla"
+      ],
       "reproduction_command": "java -jar tla2tools.jar -config wallet/TransactionSigningFlow.cfg wallet/TransactionSigningFlow.tla  # spec lives in the private internal archive; re-run to reproduce the ~50B-state model-check",
       "last_verified_at": "2026-09-23T18:00:00Z",
       "verification_status": "owner-run-reproducible-from-spec",
@@ -210,9 +356,16 @@
     },
     "evm_revm": {
       "scope": "citrate-chain",
-      "value": {"engine": "revm", "version": "=10"},
-      "source_files": ["core/execution/Cargo.toml:45"],
-      "evidence_files": ["core/execution/src/revm_adapter.rs"],
+      "value": {
+        "engine": "revm",
+        "version": "=10"
+      },
+      "source_files": [
+        "core/execution/Cargo.toml:45"
+      ],
+      "evidence_files": [
+        "core/execution/src/revm_adapter.rs"
+      ],
       "reproduction_command": "grep -n 'revm = ' core/execution/Cargo.toml",
       "last_verified_at": "2026-09-24T02:37:00Z",
       "verification_status": "reproducible-from-source",
@@ -220,9 +373,25 @@
     },
     "consensus_ghostdag": {
       "scope": "citrate-chain",
-      "value": {"algorithm": "GhostDAG", "k": 18, "finality": "probabilistic (checkpoint committee specified, not running)", "vrf": "strict", "stake_gating_default": "off", "live_block_producers": 1, "validator_registry_active_set": 1},
-      "source_files": ["core/consensus/src/ghostdag.rs", "node/config/testnet.toml:8"],
-      "evidence_files": ["core/consensus/README.md", "core/consensus/SAFETY_AUDIT.md", "core/consensus/tests/proptest_consensus.rs", "core/consensus/tests/real_tests.rs"],
+      "value": {
+        "algorithm": "GhostDAG",
+        "k": 18,
+        "finality": "probabilistic (checkpoint committee specified, not running)",
+        "vrf": "strict",
+        "stake_gating_default": "off",
+        "live_block_producers": 1,
+        "validator_registry_active_set": 1
+      },
+      "source_files": [
+        "core/consensus/src/ghostdag.rs",
+        "node/config/testnet.toml:8"
+      ],
+      "evidence_files": [
+        "core/consensus/README.md",
+        "core/consensus/SAFETY_AUDIT.md",
+        "core/consensus/tests/proptest_consensus.rs",
+        "core/consensus/tests/real_tests.rs"
+      ],
       "reproduction_command": "ls core/consensus/src/ghostdag.rs && grep -n 'ghostdag_k' node/config/testnet.toml",
       "last_verified_at": "2026-09-24T02:37:00Z",
       "verification_status": "reproducible-from-source",
@@ -231,8 +400,14 @@
     "audit_status": {
       "scope": "citrate-chain",
       "value": "pre external audit",
-      "source_files": ["AUDIT_TIER.md"],
-      "evidence_files": ["audit.toml", "SECURITY.md", "audits/"],
+      "source_files": [
+        "AUDIT_TIER.md"
+      ],
+      "evidence_files": [
+        "audit.toml",
+        "SECURITY.md",
+        "audits/"
+      ],
       "reproduction_command": "sed -n '1,20p' AUDIT_TIER.md",
       "last_verified_at": "2026-09-24T02:37:00Z",
       "verification_status": "documented-pre-audit",
