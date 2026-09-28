@@ -22,7 +22,7 @@ use hex;
 use jsonrpc_core::{IoHandler, Params, Value};
 use primitive_types::U256;
 use serde_json::json;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// CHAIN-B-D002: hard ceiling on the gas limit an unauthenticated `eth_call` /
@@ -283,6 +283,38 @@ fn eth_block_json(
 }
 
 /// Add Ethereum-compatible RPC methods to the IoHandler
+/// Resolve an Ethereum JSON-RPC block tag to a concrete block height.
+///
+/// Stage 0 of the checkpoint-finality wiring (docs/consensus/CHECKPOINT_FINALITY_WIRING.md
+/// §4.6). Factored so all ~8 block-tag parse sites in this module learn the new
+/// `finalized`/`safe` tags from one place instead of being patched individually.
+///
+/// - `"latest" | "pending"` => `current_height`
+/// - `"earliest"` => `0`
+/// - `"finalized" | "safe"` => `finalized_height` (a BFT gadget treats `safe` == `finalized`)
+/// - `"0x..."` hex => the parsed height (`None` on a malformed hex literal)
+/// - anything else (including a missing/`None` tag) => `None`
+///
+/// Before the first finalized checkpoint the node's finalized height is 0, so
+/// `finalized`/`safe` resolve to genesis (block 0) and never error.
+pub fn resolve_block_tag(
+    tag: Option<&str>,
+    current_height: u64,
+    finalized_height: u64,
+) -> Option<u64> {
+    match tag {
+        Some("latest") | Some("pending") => Some(current_height),
+        Some("earliest") => Some(0),
+        Some("finalized") | Some("safe") => Some(finalized_height),
+        Some(hex_str) if hex_str.starts_with("0x") => u64::from_str_radix(&hex_str[2..], 16).ok(),
+        _ => None,
+    }
+}
+
+/// Backwards-compatible entry point that wires the ETH RPC methods without a
+/// live finalized-height source (used by tests and any caller that does not yet
+/// have the canonical applicator's `finalized_height` handle). `finalized`/`safe`
+/// then resolve to genesis (block 0). Prefer [`register_eth_methods_with_finality`].
 pub fn register_eth_methods(
     io_handler: &mut IoHandler,
     storage: Arc<StorageManager>,
@@ -291,6 +323,34 @@ pub fn register_eth_methods(
     chain_id: u64,
     filter_registry: Arc<FilterRegistry>,
     pause_flag: Option<Arc<AtomicBool>>,
+) {
+    register_eth_methods_with_finality(
+        io_handler,
+        storage,
+        mempool,
+        executor,
+        chain_id,
+        filter_registry,
+        pause_flag,
+        Arc::new(AtomicU64::new(0)),
+    );
+}
+
+/// Register the Ethereum-compatible RPC methods, threading a `finalized_height`
+/// handle so the `finalized`/`safe` block tags resolve to the real BFT-finalized
+/// height. The handle is the same `Arc<AtomicU64>` that `canonical_apply.rs`
+/// exposes via `finalized_height_handle()` and the node's 5 s finality poll keeps
+/// current. Stage 0: read-only surface — no change to block acceptance/validity.
+#[allow(clippy::too_many_arguments)]
+pub fn register_eth_methods_with_finality(
+    io_handler: &mut IoHandler,
+    storage: Arc<StorageManager>,
+    mempool: Arc<Mempool>,
+    executor: Arc<Executor>,
+    chain_id: u64,
+    filter_registry: Arc<FilterRegistry>,
+    pause_flag: Option<Arc<AtomicBool>>,
+    finalized_height: Arc<AtomicU64>,
 ) {
     // eth_blockNumber - Returns the latest block number
     let storage_bn = storage.clone();
@@ -307,6 +367,7 @@ pub fn register_eth_methods(
 
     // eth_getBlockByNumber - Returns block by number
     let storage_gbn = storage.clone();
+    let finalized_gbn = finalized_height.clone();
     io_handler.add_sync_method("eth_getBlockByNumber", move |params: Params| {
         let api = ChainApi::new(storage_gbn.clone());
 
@@ -323,26 +384,27 @@ pub fn register_eth_methods(
         // Parse includeTransactions flag (default false)
         let include_transactions = params.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
 
-        // Parse block number from hex string or "latest"
+        // Parse block number from a block tag / hex string.
+        // "latest"/"pending" keep their existing height-bookkeeping-race
+        // behaviour (fall back to Null when the height lookup errors); every
+        // other tag (earliest / finalized / safe / hex) goes through the shared
+        // resolver so `finalized`/`safe` are honoured uniformly (Stage 0).
         let is_latest = params[0].as_str() == Some("latest");
         let block_number = match params[0].as_str() {
             Some("latest") | Some("pending") => match block_on(api.get_height()) {
                 Ok(h) => h,
                 Err(_) => return Ok(Value::Null),
             },
-            Some("earliest") => 0,
-            Some(hex_str) if hex_str.starts_with("0x") => {
-                match u64::from_str_radix(&hex_str[2..], 16) {
-                    Ok(n) => n,
-                    Err(_) => {
-                        return Err(jsonrpc_core::Error::invalid_params("Invalid block number"))
+            other => {
+                let finalized = finalized_gbn.load(Ordering::SeqCst);
+                match resolve_block_tag(other, 0, finalized) {
+                    Some(n) => n,
+                    None => {
+                        return Err(jsonrpc_core::Error::invalid_params(
+                            "Invalid block number format",
+                        ))
                     }
                 }
-            }
-            _ => {
-                return Err(jsonrpc_core::Error::invalid_params(
-                    "Invalid block number format",
-                ))
             }
         };
 
@@ -824,7 +886,14 @@ pub fn register_eth_methods(
             }
         };
 
-        // Optional second param: block tag ("latest" | "pending" | "earliest")
+        // Optional second param: block tag ("latest" | "pending" | "earliest"
+        // | "finalized" | "safe"). Stage 0 note: `get_nonce` reads the current
+        // committed account state, not per-height historical state, so every tag
+        // other than "pending" (latest / earliest / finalized / safe) returns the
+        // latest committed nonce — as it always has. `finalized`/`safe` are
+        // accepted here (they never error); serving a true historical nonce at
+        // the finalized height needs a state-at-height read that this endpoint
+        // does not have and is out of scope for Stage 0.
         let tag = params.get(1).and_then(|v| v.as_str()).unwrap_or("latest");
 
         let base_nonce = block_on(state_api.get_nonce(Address(addr_bytes))).unwrap_or_default();
@@ -1636,6 +1705,7 @@ pub fn register_eth_methods(
 
     // eth_getLogs - Get logs matching filter criteria
     let storage_logs = storage.clone();
+    let finalized_logs = finalized_height.clone();
     io_handler.add_sync_method("eth_getLogs", move |params: Params| {
         // WP-I.4: eth_getLogs costs 10 budget units
         crate::rate_limit::check_method_budget(10)?;
@@ -1656,42 +1726,35 @@ pub fn register_eth_methods(
 
         // Get current height for "latest" resolution
         let current_height = storage_logs.blocks.get_latest_height().unwrap_or(0);
+        let finalized = finalized_logs.load(Ordering::SeqCst);
 
-        // Parse fromBlock (default to 0)
+        // Parse fromBlock (default to 0). Absent field keeps its default; a
+        // present tag is resolved via the shared resolver (adds finalized/safe).
         let from_block = match filter.get("fromBlock").and_then(|v| v.as_str()) {
-            Some("latest") | Some("pending") => current_height,
-            Some("earliest") => 0,
-            Some(hex_str) if hex_str.starts_with("0x") => u64::from_str_radix(&hex_str[2..], 16)
-                .map_err(|_| {
-                    jsonrpc_core::Error::invalid_params(format!(
-                        "Invalid hex fromBlock: {}",
-                        hex_str
-                    ))
-                })?,
             None => 0,
-            Some(other) => {
-                return Err(jsonrpc_core::Error::invalid_params(format!(
-                    "Invalid fromBlock: {}",
-                    other
-                )))
-            }
+            Some(tag) => match resolve_block_tag(Some(tag), current_height, finalized) {
+                Some(h) => h,
+                None => {
+                    return Err(jsonrpc_core::Error::invalid_params(format!(
+                        "Invalid fromBlock: {}",
+                        tag
+                    )))
+                }
+            },
         };
 
-        // Parse toBlock (default to latest)
+        // Parse toBlock (default to latest). Same handling as fromBlock.
         let to_block = match filter.get("toBlock").and_then(|v| v.as_str()) {
-            Some("latest") | Some("pending") => current_height,
-            Some("earliest") => 0,
-            Some(hex_str) if hex_str.starts_with("0x") => u64::from_str_radix(&hex_str[2..], 16)
-                .map_err(|_| {
-                    jsonrpc_core::Error::invalid_params(format!("Invalid hex toBlock: {}", hex_str))
-                })?,
             None => current_height,
-            Some(other) => {
-                return Err(jsonrpc_core::Error::invalid_params(format!(
-                    "Invalid toBlock: {}",
-                    other
-                )))
-            }
+            Some(tag) => match resolve_block_tag(Some(tag), current_height, finalized) {
+                Some(h) => h,
+                None => {
+                    return Err(jsonrpc_core::Error::invalid_params(format!(
+                        "Invalid toBlock: {}",
+                        tag
+                    )))
+                }
+            },
         };
 
         // Limit block range to prevent excessive queries
@@ -1864,6 +1927,7 @@ pub fn register_eth_methods(
 
     // eth_newFilter - Create a new log filter
     let storage_new_filter = storage.clone();
+    let finalized_new_filter = finalized_height.clone();
     let filter_registry_new = filter_registry.clone();
     io_handler.add_sync_method("eth_newFilter", move |params: Params| {
         let params: Vec<Value> = match params.parse() {
@@ -1880,28 +1944,21 @@ pub fn register_eth_methods(
         crate::filter::validate_log_filter_criteria(filter)
             .map_err(jsonrpc_core::Error::invalid_params)?;
         let current_height = storage_new_filter.blocks.get_latest_height().unwrap_or(0);
+        let finalized = finalized_new_filter.load(Ordering::SeqCst);
 
-        // Parse fromBlock
-        let from_block = match filter.get("fromBlock").and_then(|v| v.as_str()) {
-            Some("latest") | Some("pending") => Some(current_height),
-            Some("earliest") => Some(0),
-            Some(hex_str) if hex_str.starts_with("0x") => {
-                u64::from_str_radix(&hex_str[2..], 16).ok()
-            }
-            None => None,
-            _ => None,
-        };
+        // Parse fromBlock (None on absent/unrecognised, unchanged; adds finalized/safe).
+        let from_block = resolve_block_tag(
+            filter.get("fromBlock").and_then(|v| v.as_str()),
+            current_height,
+            finalized,
+        );
 
-        // Parse toBlock
-        let to_block = match filter.get("toBlock").and_then(|v| v.as_str()) {
-            Some("latest") | Some("pending") => Some(current_height),
-            Some("earliest") => Some(0),
-            Some(hex_str) if hex_str.starts_with("0x") => {
-                u64::from_str_radix(&hex_str[2..], 16).ok()
-            }
-            None => None,
-            _ => None,
-        };
+        // Parse toBlock (None on absent/unrecognised, unchanged; adds finalized/safe).
+        let to_block = resolve_block_tag(
+            filter.get("toBlock").and_then(|v| v.as_str()),
+            current_height,
+            finalized,
+        );
 
         // Parse address filter
         let addresses: Vec<Address> = match filter.get("address") {
@@ -2541,6 +2598,7 @@ pub fn register_eth_methods(
 
     // eth_getBlockTransactionCountByNumber(blockTag) — uint count.
     let storage_btcbn = storage.clone();
+    let finalized_btcbn = finalized_height.clone();
     io_handler.add_sync_method(
         "eth_getBlockTransactionCountByNumber",
         move |params: Params| {
@@ -2551,12 +2609,11 @@ pub fn register_eth_methods(
             if parsed.is_empty() {
                 return Err(jsonrpc_core::Error::invalid_params("missing block tag"));
             }
-            let number = match parsed[0].as_str() {
-                Some("latest") | Some("pending") => block_on(api.get_height()).unwrap_or(0),
-                Some("earliest") => 0,
-                Some(s) if s.starts_with("0x") => u64::from_str_radix(&s[2..], 16)
-                    .map_err(|_| jsonrpc_core::Error::invalid_params("bad hex block number"))?,
-                _ => return Err(jsonrpc_core::Error::invalid_params("bad block tag")),
+            let current = block_on(api.get_height()).unwrap_or(0);
+            let finalized = finalized_btcbn.load(Ordering::SeqCst);
+            let number = match resolve_block_tag(parsed[0].as_str(), current, finalized) {
+                Some(n) => n,
+                None => return Err(jsonrpc_core::Error::invalid_params("bad block tag")),
             };
             match block_on(api.get_block(crate::types::request::BlockId::Number(number))) {
                 Ok(block) => Ok(Value::String(format!("0x{:x}", block.transactions.len()))),
@@ -2600,6 +2657,7 @@ pub fn register_eth_methods(
     // object at position `index` of the block. Used by `cast block --index`
     // and Foundry's broadcast verification.
     let storage_tbni = storage.clone();
+    let finalized_tbni = finalized_height.clone();
     io_handler.add_sync_method(
         "eth_getTransactionByBlockNumberAndIndex",
         move |params: Params| {
@@ -2612,12 +2670,11 @@ pub fn register_eth_methods(
                     "expected [blockTag, index]",
                 ));
             }
-            let number = match parsed[0].as_str() {
-                Some("latest") | Some("pending") => block_on(api.get_height()).unwrap_or(0),
-                Some("earliest") => 0,
-                Some(s) if s.starts_with("0x") => u64::from_str_radix(&s[2..], 16)
-                    .map_err(|_| jsonrpc_core::Error::invalid_params("bad hex block number"))?,
-                _ => return Err(jsonrpc_core::Error::invalid_params("bad block tag")),
+            let current = block_on(api.get_height()).unwrap_or(0);
+            let finalized = finalized_tbni.load(Ordering::SeqCst);
+            let number = match resolve_block_tag(parsed[0].as_str(), current, finalized) {
+                Some(n) => n,
+                None => return Err(jsonrpc_core::Error::invalid_params("bad block tag")),
             };
             let idx_str = parsed[1]
                 .as_str()
