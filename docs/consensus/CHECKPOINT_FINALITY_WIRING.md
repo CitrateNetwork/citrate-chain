@@ -70,32 +70,50 @@ Everything the reorg-floor needs is already in place; it activates automatically
 
 ## 3. Parameters and the 12-second derivation
 
+> **Revised per MAC independent review (2026-09-28) — supersedes the first draft.**
+> Two corrections drive this section: (a) **voting must happen at depth D past the
+> checkpoint block**, not at the tip — a tip block can still lose to a heavier GhostDAG
+> sibling, and once the floor is enforced honest nodes would lock onto the loser; and
+> (b) the quorum is **`floor(2n/3)+1`** (the standard BFT bound the code uses), not
+> `ceil(2n/3)+1` (which gave 68 for n=100 and contradicted §7's 3-of-4).
+
 Worst-case finality latency for a block:
 
 ```
-T_final(worst) = interval_blocks × block_time + T_vote_aggregation
+T_final(worst) ≈ (interval_blocks + D) × block_time + T_vote_aggregation
 ```
 
-Measured `block_time = 2.00 s` (steady across 1/5/50/200-block windows on live 40204).
-Budget `T_vote_aggregation ≤ 2 s` (ed25519 verify is ~50 µs/vote; the constraint is gossip
-propagation of committee votes, not CPU).
+where `D` = confirmation depth: the committee signs the checkpoint block only once it is
+buried `D` blocks deep, so a sibling reorg past it is negligible. Measured
+`block_time = 2.00 s` (steady across 1/5/50/200-block windows on live 40204). Budget
+`T_vote_aggregation ≤ 2 s` (ed25519 verify is ~50 µs/vote; the constraint is gossip
+propagation, not CPU).
 
-| interval | cadence | worst-case finality | verdict |
-|---|---|---|---|
-| **5** | 10 s | **~12 s** | **chosen** (target, with vote budget) |
-| 4 | 8 s | ~10 s | fallback if T_vote proves > 2 s under load |
-| 50 (current default) | 100 s | ~100 s+ | why finality "never felt real" |
+To hold **≤12 s**: `(interval + D) × block_time + T_vote ≤ 12` ⟹ at 2 s blocks,
+`interval + D ≤ 5`.
 
-**Chosen parameters (mainnet-target):**
-- `interval = 5` blocks (10 s cadence)
-- `committee_size = 100` (cap; effective = min(100, |active set|))
-- `quorum = ceil(2/3 · effective_committee) + 1` — **derived from the effective committee**,
-  *not* the hardcoded 67. This is the one code-behavior change to `CheckpointConfig`
-  semantics: today `quorum_threshold` is a fixed 67, which can never be met below 100
-  validators. **D-2.**
-- Vote-aggregation budget: 2 s. If field telemetry shows p99 > 2 s, drop `interval` to 4.
+| block_time | interval | D (safety depth) | worst-case | note |
+|---|---|---|---|---|
+| **2 s (no change)** | **2** | **3** | 2·(2+3)+2 = **12 s** | chosen default; D=3 is a thin but workable margin on top of BFT sigs |
+| 2 s | 3 | 2 | **12 s** | more frequent checkpoints, shallower confirmations |
+| **1 s (block-time change)** | 4 | 5 | 1·(4+5)+2 = **11 s** | **safer D=5** within budget — the reason to consider halving block time |
 
-Average finality ≈ `(interval/2)·block_time + T_vote ≈ 5 + 2 = 7 s`.
+**The block-time tradeoff (decision for owner).** At 2 s blocks the ≤12 s budget forces a
+shallow `D` (≤3). Halving to **1 s blocks** roughly doubles the confirmation-depth budget
+(`interval+D ≤ 10`), buying a much safer `D=5` while still finishing in ~11 s. Block-time is
+a cadence change (validity-affecting: timestamp spacing / difficulty) → it *would* need a
+coordinated activation, unlike the rest of this design (§6). **D-1:** keep 2 s blocks with
+`D=3`, or halve to 1 s for a deeper safety margin.
+
+**Chosen parameters (mainnet-target, pending D-1):**
+- `interval = 2`, `D = 3` (2 s blocks) — worst-case ~12 s, average ~9 s.
+- `committee_size = 100` (cap; effective = `min(100, |active set|)`).
+- `quorum = floor(2 · n / 3) + 1` over the **effective** committee `n` (67 for n=100, 3 for
+  n=4). Replaces the hardcoded 67, which can never be met below 100 validators. **D-2.**
+- **Minimum committee for finality = 4** (tolerates 1 Byzantine at quorum 3). Below 4, the
+  node proposes/collects votes but **does not finalize** — a 1- or 2-member committee must
+  never self-finalize (that is centralized rubber-stamping, not BFT). **D-2a.**
+- Vote-aggregation budget: 2 s; if field p99 > 2 s, trade one block of `interval` for margin.
 
 ---
 
@@ -133,17 +151,30 @@ domain-separated message (binds `chain_id` + `height` + `block_hash`, rejecting 
 and cross-height replay per TLA+ H-02), and de-duplicated per voter (equivocation → first
 vote wins, second rejected/loggable-as-slashable — D-5).
 
-### 4.5 Enforcement (already wired)
-The 5 s poll (`main.rs:1839`) copies `latest_finalized_height()` into the
-`finalized_height` AtomicU64 (`canonical_apply.rs:219`). The reorg guard already **rejects**
-any reorg whose fork point is below that floor (invariant I4,
-`canonical_apply.rs:657`). No new enforcement code — it comes alive when the floor advances.
+### 4.5 Enforcement (real code — a height alone is NOT enough)
+> **Revised per MAC review.** The floor is a *height*, but the certificate finalizes a
+> specific *hash*. Raising the floor on height alone can pin a node to the WRONG branch.
+
+The 5 s poll (`main.rs:1839`) into the `finalized_height` AtomicU64 (`canonical_apply.rs:219`)
+and the existing reorg guard (`canonical_apply.rs:657`) are the substrate, but enforcement
+needs **new code**:
+- The finalized floor is a **`(height, block_hash)` pair**, carried by the quorum certificate.
+- **Before** raising the local floor — at run time **and at boot** — verify the certified
+  `block_hash` is the block at that height on **this node's own canonical chain**. If it is
+  not, the node is on a losing branch: it must **not** raise the floor blindly (that would
+  lock it to the wrong branch); instead it reorgs to the certified branch if it can, else
+  **halts finality progress and alarms** (a safety stop, never a silent wrong-branch pin).
+- Only after the hash check passes does the reorg guard reject fork points below the floor.
 
 ### 4.6 RPC surface
-Add `finalized` and `safe` block tags to `eth_rpc.rs` (`:326`, `:1657`). `finalized` resolves
-to the block at `latest_finalized_height()`; `safe` == `finalized` for a BFT gadget (no
-separate "safe" notion). Before the first finalized checkpoint, resolve to genesis (block 0),
-never error. This closes the `verification/claims.json:127` gap and helps dim 8.
+Add `finalized` and `safe` block tags to `eth_rpc.rs`. **There are ~8 block-tag parse sites,
+not 2** (`:329, :832, :1662, :1683, :1886, :1897, :2555, :2616`) — all must learn the new
+tags, so factor a single `resolve_block_tag` helper rather than patching each. The RPC layer
+**cannot read the finalized height today** — plumb a handle (the same `finalized_height`
+AtomicU64 / a `get_finalized_height()` on the api object) into the RPC context. `finalized`
+resolves to the block at the finalized height; `safe` == `finalized` for a BFT gadget. Before
+the first finalized checkpoint, resolve to genesis (block 0), never error. Closes
+`verification/claims.json:127`, helps dim 8.
 
 ### 4.7 Config & remnants
 - Plumb `CheckpointNodeConfig` (`config.rs:65`) → `CheckpointConfig` (today `main.rs:1767`
@@ -176,24 +207,31 @@ never error. This closes the `verification/claims.json:127` gap and helps dim 8.
 
 ---
 
-## 6. Activation (coordinated soft fork)
+## 6. Activation (node-local — NO block-validity fork)
 
-Enforcing the finalized floor in fork-choice is a **consensus-rule change**: pre-activation,
-nodes accept reorgs the post-activation rule rejects. Therefore:
+> **Corrected per MAC review.** My first draft called for an activation *height*. That was
+> wrong: **votes are gossip, never carried in blocks**, so finality changes fork-choice, RPC
+> tags and persistence — but **block validity is unchanged**. A node on the old code simply
+> doesn't enforce the floor (weaker fork-choice), it never rejects a block the new code
+> accepts. So this needs **no new consensus activation height and no reroll** — it is a
+> node-local rollout.
 
-- Gate the **enforcement** (S2 reorg-floor rejection) behind an **activation height**
-  `CITRATE_CHECKPOINT_FINALITY_ACTIVATION` (env + `consensus_manifest.rs`, mirroring the
-  existing `CITRATE_BLOCK_V2` / registry-activation pattern, `main.rs:1786`).
-- Ship the **producer/vote/RPC** machinery behind `CITRATE_CHECKPOINT_FINALITY=1`, default
-  **off**. Merged flag-off it is a strict no-op (no propose, no vote, floor stays 0).
-- **Rollout:** (1) merge flag-off; (2) stand up the validator committee (§7); (3) enable the
-  producer flag fleet-wide and observe votes/finalization on a canary without enforcement;
-  (4) set the enforcement activation height once finalization is proven healthy. No genesis
-  reroll; existing state, addresses, and balances untouched.
+- **Rollout by a compiled pin, not an env var.** `hardening.rs` moved to compiled activation
+  pins; follow that pattern for enabling floor enforcement, so the rollout point is baked into
+  the binary (auditable, not a runtime toggle). Ship the producer/vote/RPC/enforcement code;
+  the compiled pin decides when enforcement goes live.
+- **Sequenced rollout (safety):** (1) merge with enforcement pinned OFF — producers still
+  propose/sign/broadcast and RPC serves `finalized`, but the floor is observed, not enforced;
+  (2) stand up the validator committee (§7); (3) observe healthy finalization on the fleet;
+  (4) flip the compiled pin ON in a release once finalization is proven and late-joiners can
+  fetch certificates (§ verifier-revisions #10). Existing state, addresses, balances
+  untouched.
+- The **reorg guard itself is already live and ungated** (`canonical_apply.rs:657`); what the
+  pin gates is *raising the floor above 0*, i.e. whether finalized certificates actually
+  constrain fork-choice.
 
-Because activation is height-gated and every node ships the same binary, an honest fleet
-transitions atomically; a straggler on the old binary would (correctly) diverge and must
-upgrade — standard soft-fork discipline (see `feedback_deploy_from_main_only`).
+A straggler on old code is weaker (won't honor finality) but not forked off — it still
+accepts the same blocks. Coordinate the enable-release per `feedback_deploy_from_main_only`.
 
 ---
 
@@ -258,19 +296,70 @@ message).
 - **Stage 1 — producer side, flag-off:** committee feed (§4.1), production `propose` (§4.2),
   outbound sign+broadcast vote (§4.3), behind `CITRATE_CHECKPOINT_FINALITY`. No-op until
   enabled.
+  Stage 1 also carries the liveness fixes (early-vote buffer + vote relay, §11.5), the
+  epoch-pinned committee (§11.6), pending/voted pruning (§11.9), late-joiner certificate sync
+  (§11.10), and the `check_claims.py` tightening (§11.11).
 - **Stage 2 — verification:** integration + adversarial tests (§8) + TLA+/conformance in CI.
-- **Stage 3 — activation:** height-gated enforcement flag + rollout (§6), *after* the
-  committee exists (§7).
+- **Stage 3 — enable:** flip the compiled enforcement pin (§6, node-local, NO activation
+  height) in a release, *after* the committee exists (§7) and late-joiners can fetch certs.
 
 ---
 
 ## 10. Open decisions
 
-- **D-1.** Confirm `interval = 5` (10 s) as the target; accept ~12 s worst-case. Fallback 4.
-- **D-2.** Quorum derived as `ceil(2/3·n)+1` from the effective committee (replaces fixed 67).
+- **D-1.** Block time / depth: keep **2 s blocks with `interval=2, D=3`** (~12 s), or halve to
+  **1 s blocks** for a safer `D=5` at ~11 s (§3). Block-time change is the only part that
+  would need a coordinated activation.
+- **D-2.** Quorum = **`floor(2n/3)+1`** over the effective committee (67 for n=100, 3 for n=4).
+- **D-2a.** Minimum committee for finality = **4** (no 1- or 2-member self-finalization).
 - **D-3.** Leave depth-based `FinalityTracker` unwired / out of scope (checkpoints override).
 - **D-4.** Producer has access to the validator signing key to sign votes — confirm plumbing.
 - **D-5.** Equivocation handling: reject-second-only, or also emit a slashable report to the
   `ValidatorRegistry` slasher path? (Recommend: reject now, slashable-report as a follow-up.)
 - **D-6.** Checkpoint persistence: adopt `CF_CHECKPOINTS` or delete it and keep the
   `dag_metadata` scheme (recommend: keep `dag_metadata`, delete the dead CF).
+
+---
+
+## 11. Verifier revisions (MAC independent review, 2026-09-28) — checklist
+
+The §3/§4.5/§4.6/§6 rewrites above resolve MAC's points 1–4, 7, 8. The rest are folded into
+the design + test bar and tracked here so #12 addresses every one:
+
+- **(2) quorum & min committee** — `floor(2n/3)+1`, min 4 (§3, D-2/D-2a). Resolved.
+- **(3) vote at depth D** — no tip voting (§3). Resolved.
+- **(4) floor is a hash, enforcement is real code** — `(height,hash)` cert, verify on-chain at
+  runtime + boot, halt-not-pin on mismatch (§4.5). Resolved.
+- **(5) liveness — early votes & relay:** **buffer** inbound votes that arrive *before* this
+  node proposes the checkpoint (keyed by `(height,hash)`, replayed into `submit_vote` on
+  propose), and **re-gossip** every accepted, valid vote to peers (today the inbound handler
+  `main.rs:3328` neither buffers nor relays). Add to Stage 1 + an integration test.
+- **(6) epoch-pinned committee:** derive the committee from the **finalized validator-set
+  snapshot of the checkpoint's OWN epoch**, not the live active set — nodes crossing an epoch
+  boundary at different wall-clock times must compute the identical committee. Wire off the
+  `registry_sync` epoch snapshot, not the tip. Add a cross-epoch determinism test.
+- **(7) compiled pin, not env** — §6. Resolved.
+- **(8) all ~8 RPC tag sites + finalized-height handle** — §4.6. Resolved.
+- **(9) memory bound:** prune `pending` checkpoints and the per-height `voted` set once a
+  height is finalized or falls below the floor (unbounded growth during a quorum stall today).
+  Add a bound + a stall soak assertion.
+- **(10) late joiners:** a syncing node must be able to **fetch finalized checkpoint
+  certificates** during sync (new `GetCheckpoint`/`CheckpointCert` p2p messages + apply on
+  receipt), else its floor stays 0 until it participates live. Add to Stage 1 + a sync test.
+- **(11) claims tripwire:** `check_claims.py` currently passes on any non-test `.propose(`
+  call — a default-off flag would false-positive "running". Tighten it (require the flag/pin
+  ON **and** an outbound vote path) **in the same PR**; MAC flips the tripwire only when
+  finality actually runs. Add.
+- **(1, config) chain_id:** stop hard-coding 40204 in `CheckpointConfig::default` — take
+  `chain_id` from node chain config so devnet 1337 signs correct vote messages (§4.7).
+
+**Design confirmation (MAC):** node-local, **no new activation height**; votes are gossip, so
+fork-choice / RPC / persistence change but block validity does not. MAC holds the full memo
+with the test + mutation plan (owner to relay).
+
+**Adjacent (#14, not this PR):** failed txs bill the full gas limit but the receipt reports
+only pre-failure gas (`executor.rs:~2084/2104`) → flows into `gas_used`
+(`producer.rs:1456`) and `receipt_root` (`~2241`), both in the block hash
+(`types.rs:358/370`). Consensus-visible; today only `state_root` is checked by followers, so
+not validity-affecting yet — but the fix changes `receipt_root`, so #14 **does** need its own
+new activation height (legacy bytes identical below it, full-limit receipt at/above it).
