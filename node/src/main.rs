@@ -3788,6 +3788,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // advances the applied tip. Present iff execute-on-receive (v2) is enabled.
         if let Some(app) = &canonical_applicator {
             producer_instance = producer_instance.with_applied_tip_lock(app.advance_lock());
+            // #126 (producer catch-up gate): refuse to seal while this node is rebuilding
+            // its applied state from genesis or has not yet hydrated its DAG after a
+            // restart, so a lagging/replaying node never forks the fleet by sealing on a
+            // stale (but self-consistent) applied tip.
+            producer_instance = producer_instance.with_produce_catchup_gate(app);
         }
 
         // WP-I.3: Share the same pause_flag between RPC server and producer
