@@ -1,6 +1,6 @@
 # Checkpoint Finality Wiring — 12-second Deterministic Finality (WP-S.3)
 
-**Status:** SPEC / proposed · **Target:** ≤12 s worst-case deterministic finality
+**Status:** SPEC / proposed — **not yet running** (target design, no production caller). Target design: ≤12 s worst-case deterministic finality
 **Author:** chain-ops · **Reviewers:** @CitrateNetwork/maintainers
 **Related:** `FEATURE_REFERENCE.md` (WP-S.3), `specs/tla/consensus/CheckpointVoteSafety.tla`,
 `docs/consensus/EXECUTE_ON_RECEIVE_state_application.md` (invariant I4), `verification/claims.json`
@@ -29,7 +29,7 @@ committee exist (see §7).
 ## 1. Goals / non-goals
 
 **Goals**
-- G1. Deterministic finality with a **≤12 s worst-case** and ~6–7 s average latency.
+- G1. **Target design (not yet running):** deterministic finality with a **≤12 s worst-case** and ~6–7 s average latency.
 - G2. **Safety over liveness**: never finalize two conflicting checkpoints; never revert state
   below a finalized checkpoint. A stalled committee halts finality, never forks it.
 - G3. Portable, deterministic committee selection and vote validation (no float, no
@@ -190,7 +190,8 @@ the first finalized checkpoint, resolve to genesis (block 0), never error. Close
 
 - **S1 (no conflicting finality):** two checkpoints at the same height with different
   block_hash can never both reach quorum with an honest ≥2/3 committee.
-- **S2 (no revert below finality / I4):** committed state is never reverted below
+- **S2 (no revert below finality / I4):** once checkpoint finality runs (not in effect
+  today, no production caller), committed state is never reverted below
   `latest_finalized_height()`; a reorg with fork point below the floor is `Rejected`.
 - **S3 (replay resistance):** a vote signed for `(chain_id', H', hash')` is rejected on any
   other `(chain_id, H, hash)` — domain separation (TLA+ `CanonicalMessageBindsChain`,
