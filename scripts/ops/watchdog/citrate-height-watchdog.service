@@ -1,0 +1,6 @@
+[Unit]
+Description=Citrate block-producer height watchdog (anti-wedge auto-recovery)
+After=citrate-node.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/citrate-height-watchdog.sh
