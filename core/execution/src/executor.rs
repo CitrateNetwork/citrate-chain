@@ -2156,6 +2156,32 @@ impl Executor {
             }
         };
 
+        // R2-RES-04 — receipt gas_used MUST equal the gas the sender was
+        // actually CHARGED, not the pre-failure work meter.
+        //
+        // A FAILED/reverted tx pays its FULL gas limit: the failure arm above
+        // records `balance - gas_cost` with `gas_cost = gas_limit * gas_price`
+        // and grants NO refund, so the sender is debited `gas_limit`. But the
+        // receipt used to report `context.gas_used` (the gas burned up to the
+        // point of the revert), which is strictly smaller. That under-report
+        // fed two consensus-visible, block-hash fields: the header `gas_used`
+        // (sum of receipt gas_used, node/src/producer.rs) and `receipt_root`
+        // (which hashes receipt.gas_used). Observed: 1000 reverting txs charged
+        // 30M gas but the header reported ~700k.
+        //
+        // A SUCCESSFUL tx is refunded `(gas_limit - gas_used) * gas_price`, so
+        // its charged gas IS `context.gas_used` — reported unchanged.
+        //
+        // ACTIVATION: unconditional / always-on. This changes `receipt_root`,
+        // a block-hash field, but the fix ships with the fresh reroll genesis —
+        // that genesis IS the activation boundary, so no mid-chain height gate
+        // is needed (the current chain never runs this binary pre-reroll).
+        let charged_gas_used = if status {
+            context.gas_used
+        } else {
+            tx.gas_limit
+        };
+
         // Create receipt
         let receipt = TransactionReceipt {
             tx_hash: tx.hash,
@@ -2163,7 +2189,7 @@ impl Executor {
             block_number: block.header.height,
             from,
             to: tx.to.map(|pk| crate::address_utils::normalize_address(&pk)),
-            gas_used: context.gas_used,
+            gas_used: charged_gas_used,
             status,
             logs: context.logs.clone(),
             output: context.output.clone(),
@@ -2173,8 +2199,8 @@ impl Executor {
         };
 
         info!(
-            "Transaction {} executed: status={}, gas_used={}",
-            tx.hash, status, context.gas_used
+            "Transaction {} executed: status={}, gas_used={} (pre-failure meter={})",
+            tx.hash, status, charged_gas_used, context.gas_used
         );
 
         // Assemble the final WriteSet for MVCC version bumping:
