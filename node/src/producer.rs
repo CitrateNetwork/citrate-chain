@@ -83,6 +83,21 @@ pub struct EquivocationVoteConfig {
     pub activation_height: u64,
 }
 
+/// #126 (producer catch-up gate): the signals a producing node consults BEFORE it
+/// seals a block, so a node that is lagging / mid-rebuild / not-yet-hydrated refuses
+/// to produce (skips the slot) rather than sealing on a stale, self-consistent applied
+/// tip and forking the fleet. Strictly conservative: it only ever makes the producer
+/// REFRAIN — it never causes a block to be sealed that would not have been before.
+#[derive(Clone)]
+pub struct ProduceCatchupGate {
+    /// Set while the canonical applicator rebuilds applied state from genesis (its
+    /// applied tip is being rewritten, so live executor state is not any committable tip).
+    rebuild_in_progress: Arc<AtomicBool>,
+    /// "DAG hydration complete" signal. `None` ⇒ no fork-choice wired (tests / fixed-tip
+    /// stubs) ⇒ treat as hydrated so the gate is inert there.
+    dag_hydrated: Option<Arc<AtomicBool>>,
+}
+
 /// Block producer for mining new blocks
 pub struct BlockProducer {
     storage: Arc<StorageManager>,
@@ -171,6 +186,11 @@ pub struct BlockProducer {
     /// the sealed block as the new applied tip before releasing it. `None` disables the
     /// interlock (pre-reroll / execute-on-receive off), preserving legacy behavior.
     applied_tip_lock: Option<Arc<tokio::sync::Mutex<crate::canonical_apply::AppliedState>>>,
+
+    /// #126 (producer catch-up gate): when set, the producer refuses to seal while a
+    /// spine rebuild is in progress or before the DAG has hydrated after a restart.
+    /// `None` disables the gate (legacy / tests), preserving prior behavior.
+    produce_gate: Option<ProduceCatchupGate>,
 
     /// Producer-side circuit breaker for rounds that panic on the same
     /// mempool transaction (see [`PanicBreaker`]).
@@ -469,6 +489,7 @@ impl BlockProducer {
             registry_sync: None,
             emit_v2_headers: false,
             applied_tip_lock: None,
+            produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
         }
     }
@@ -534,6 +555,7 @@ impl BlockProducer {
             registry_sync: None,
             emit_v2_headers: false,
             applied_tip_lock: None,
+            produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
         }
     }
@@ -598,6 +620,7 @@ impl BlockProducer {
             registry_sync: None,
             emit_v2_headers: false,
             applied_tip_lock: None,
+            produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
         }
     }
@@ -741,6 +764,7 @@ impl BlockProducer {
             registry_sync: None,
             emit_v2_headers: false,
             applied_tip_lock: None,
+            produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
         }
     }
@@ -894,6 +918,7 @@ impl BlockProducer {
             registry_sync: None,
             emit_v2_headers: false,
             applied_tip_lock: None,
+            produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
         }
     }
@@ -979,6 +1004,21 @@ impl BlockProducer {
         lock: Arc<tokio::sync::Mutex<crate::canonical_apply::AppliedState>>,
     ) -> Self {
         self.applied_tip_lock = Some(lock);
+        self
+    }
+
+    /// #126 (producer catch-up gate): wire the canonical applicator's rebuild + DAG-
+    /// hydration signals so the producer refuses to seal while a lagging/replaying node
+    /// has not caught up. Pass the same `CanonicalApplicator` whose `advance_lock` was
+    /// shared via [`Self::with_applied_tip_lock`].
+    pub fn with_produce_catchup_gate(
+        mut self,
+        app: &crate::canonical_apply::CanonicalApplicator,
+    ) -> Self {
+        self.produce_gate = Some(ProduceCatchupGate {
+            rebuild_in_progress: app.rebuild_in_progress_handle(),
+            dag_hydrated: app.dag_hydrated_handle(),
+        });
         self
     }
 
@@ -1166,6 +1206,34 @@ impl BlockProducer {
         // Pinned by `tests::mp_s1_produced_block_state_root_must_bind_to_its_
         // declared_parent`, which FAILS on the pre-fix code with the same
         // StateRootMismatch the fleet logged.
+        // MP-S1 / #126 — PRODUCER CATCH-UP GATE (anti-fork, the other half of the
+        // crash-consistency fix). The `selected_parent == applied_tip` check below is a
+        // SELF-CONSISTENCY check only: after an unclean restart a node can hold a stale
+        // but internally-consistent applied tip (durable state matching a durable tip)
+        // while it is still replaying / rebuilding / hydrating its DAG — and it would
+        // then happily seal on that stale tip and fork the fleet. Refuse to produce
+        // unless the node is NOT mid-rebuild and IS hydrated. Strictly conservative:
+        // this only ever makes the producer REFRAIN (skip the slot); it never seals
+        // anything it would not have sealed before.
+        if let Some(gate) = self.produce_gate.as_ref() {
+            if gate.rebuild_in_progress.load(Ordering::SeqCst) {
+                return Err(anyhow::anyhow!(
+                    "MP-S1/#126: refusing to produce — a canonical spine rebuild is in progress \
+                     (the applied tip is being rewritten from genesis). Skipping this slot; \
+                     the rebuild will converge the applied tip."
+                ));
+            }
+            if let Some(hydrated) = &gate.dag_hydrated {
+                if !hydrated.load(Ordering::SeqCst) {
+                    return Err(anyhow::anyhow!(
+                        "MP-S1/#126: refusing to produce — the DAG has not finished hydrating \
+                         after restart, so the applied tip is not yet authoritative. Skipping \
+                         this slot until hydration completes."
+                    ));
+                }
+            }
+        }
+
         if let Some(guard) = applied_guard.as_ref() {
             let applied = guard.tip();
             if selected_parent != applied.hash {
@@ -3447,6 +3515,42 @@ mod tests {
             ..Default::default()
         }));
         (tmp, storage, state_db, executor, mempool)
+    }
+
+    /// #126 (producer catch-up gate, anti-fork). A producer wired to the canonical
+    /// applicator's rebuild signal must REFUSE to seal while a spine rebuild is in
+    /// progress (the applied tip is being rewritten from genesis), then resume once the
+    /// rebuild clears. Strictly conservative: the gate only ever makes the producer
+    /// refrain — it never seals a block it would not have sealed before.
+    #[tokio::test]
+    async fn mp_s1_126_producer_refuses_to_seal_while_rebuilding() {
+        let (_tmp, storage, _state_db, executor, mempool) = producer_fixture();
+        let app = Arc::new(crate::canonical_apply::CanonicalApplicator::new(
+            executor.clone(),
+            storage.clone(),
+        ));
+        let producer = test_producer(&storage, &executor, &mempool)
+            .with_applied_tip_lock(app.advance_lock())
+            .with_produce_catchup_gate(&app);
+        let rebuild = app.rebuild_in_progress_handle();
+
+        // Mid-rebuild: the producer refuses this slot.
+        rebuild.store(true, Ordering::SeqCst);
+        let err = producer
+            .produce_block()
+            .await
+            .expect_err("must refuse to produce while a spine rebuild is in progress");
+        assert!(
+            err.to_string().contains("#126"),
+            "the refusal must be the catch-up gate, got: {err}"
+        );
+
+        // Rebuild done: the producer seals normally again.
+        rebuild.store(false, Ordering::SeqCst);
+        producer
+            .produce_block()
+            .await
+            .expect("produces once the rebuild has cleared");
     }
 
     /// The AI slice is capped at a third of the block's declared gas; AI ops
