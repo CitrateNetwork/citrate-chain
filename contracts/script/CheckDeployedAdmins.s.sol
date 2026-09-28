@@ -32,6 +32,7 @@ import {P256} from "../src/aa/lib/webauthn/P256.sol";
 ///         VERIFIER present, 0 NO-CODE -> PASS (reconcile the book first).
 contract CheckDeployedAdmins is Script, AdminChecks {
     uint256 public factoryAdmin;
+    uint256 public deployerAdmin;
     uint256 public noCode;
     bool public verifierMissing;
 
@@ -43,19 +44,22 @@ contract CheckDeployedAdmins is Script, AdminChecks {
     /// @notice The gate over an address-book JSON document (sections
     ///         `.contracts` and `.aaStack`). Reverts on failure.
     function check(string memory json, bool requireAllCode) public {
-        _sweep(json, ".contracts");
-        _sweep(json, ".aaStack");
+        address deployer = vm.parseJsonAddress(json, ".deployer");
+        _sweep(json, ".contracts", deployer);
+        _sweep(json, ".aaStack", deployer);
         verifierMissing = P256.VERIFIER.code.length == 0;
         if (verifierMissing) console.log("VERIFIER missing: no code at", P256.VERIFIER);
         console.log("FACTORY-ADMIN failures:", factoryAdmin);
+        console.log("DEPLOYER-ADMIN failures:", deployerAdmin);
         console.log("NO-CODE entries (reported):", noCode);
         console.log("VERIFIER present:", !verifierMissing);
         require(factoryAdmin == 0, "CheckDeployedAdmins: CREATE2 factory holds an admin slot (see log)");
+        require(deployerAdmin == 0, "CheckDeployedAdmins: deployer EOA holds governance/owner/DEFAULT_ADMIN (see log)");
         require(!verifierMissing, "CheckDeployedAdmins: P-256 verifier not provisioned");
         if (requireAllCode) require(noCode == 0, "CheckDeployedAdmins: address-book entries without code");
     }
 
-    function _sweep(string memory json, string memory section) internal {
+    function _sweep(string memory json, string memory section, address deployer) internal {
         string[] memory names = vm.parseJsonKeys(json, section);
         for (uint256 i = 0; i < names.length; i++) {
             address target = vm.parseJsonAddress(json, string.concat(section, ".", names[i]));
@@ -68,6 +72,11 @@ contract CheckDeployedAdmins is Script, AdminChecks {
             if (bytes(problem).length != 0) {
                 console.log(string.concat("FACTORY-ADMIN ", names[i], ": ", problem), target);
                 factoryAdmin++;
+            }
+            string memory dproblem = _deployerAdminProblem(target, deployer);
+            if (bytes(dproblem).length != 0) {
+                console.log(string.concat("DEPLOYER-ADMIN ", names[i], ": ", dproblem), target);
+                deployerAdmin++;
             }
         }
     }

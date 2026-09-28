@@ -48,6 +48,27 @@ abstract contract AdminChecks {
         return "";
     }
 
+    /// @notice Like `_factoryAdminProblem` but for an arbitrary EOA holder — the
+    ///         deployer EOA must not retain governance/owner/DEFAULT_ADMIN on any
+    ///         deployed book contract after the governance hand-off (PBA follow-up).
+    function _deployerAdminProblem(address target, address deployer) internal view returns (string memory) {
+        if (target.code.length == 0) return "no code at address";
+        (bool ok, address a) = _readAddress(target, abi.encodeWithSignature("governance()"));
+        if (ok && a == deployer) return "governance() is the deployer EOA";
+        (ok, a) = _readAddress(target, abi.encodeWithSignature("pendingGovernance()"));
+        if (ok && a == deployer) return "pendingGovernance() is the deployer EOA";
+        (ok, a) = _readAddress(target, abi.encodeWithSignature("owner()"));
+        if (ok && a == deployer) return "owner() is the deployer EOA";
+        (ok, a) = _readAddress(target, abi.encodeWithSignature("provider()"));
+        if (ok && a == deployer) return "provider() is the deployer EOA";
+        bool has;
+        (ok, has) = _readBool(
+            target, abi.encodeWithSignature("hasRole(bytes32,address)", DEFAULT_ADMIN_ROLE, deployer)
+        );
+        if (ok && has) return "deployer EOA holds DEFAULT_ADMIN_ROLE";
+        return "";
+    }
+
     /// @notice Revert if `target` names the CREATE2 factory in any admin slot.
     function _assertNoFactoryAdmin(string memory name, address target) internal view {
         string memory problem = _factoryAdminProblem(target);
