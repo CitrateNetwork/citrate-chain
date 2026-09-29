@@ -83,6 +83,21 @@ pub struct EquivocationVoteConfig {
     pub activation_height: u64,
 }
 
+/// #126 (producer catch-up gate): the signals a producing node consults BEFORE it
+/// seals a block, so a node that is lagging / mid-rebuild / not-yet-hydrated refuses
+/// to produce (skips the slot) rather than sealing on a stale, self-consistent applied
+/// tip and forking the fleet. Strictly conservative: it only ever makes the producer
+/// REFRAIN — it never causes a block to be sealed that would not have been before.
+#[derive(Clone)]
+pub struct ProduceCatchupGate {
+    /// Set while the canonical applicator rebuilds applied state from genesis (its
+    /// applied tip is being rewritten, so live executor state is not any committable tip).
+    rebuild_in_progress: Arc<AtomicBool>,
+    /// "DAG hydration complete" signal. `None` ⇒ no fork-choice wired (tests / fixed-tip
+    /// stubs) ⇒ treat as hydrated so the gate is inert there.
+    dag_hydrated: Option<Arc<AtomicBool>>,
+}
+
 /// Block producer for mining new blocks
 pub struct BlockProducer {
     storage: Arc<StorageManager>,
@@ -171,6 +186,11 @@ pub struct BlockProducer {
     /// the sealed block as the new applied tip before releasing it. `None` disables the
     /// interlock (pre-reroll / execute-on-receive off), preserving legacy behavior.
     applied_tip_lock: Option<Arc<tokio::sync::Mutex<crate::canonical_apply::AppliedState>>>,
+
+    /// #126 (producer catch-up gate): when set, the producer refuses to seal while a
+    /// spine rebuild is in progress or before the DAG has hydrated after a restart.
+    /// `None` disables the gate (legacy / tests), preserving prior behavior.
+    produce_gate: Option<ProduceCatchupGate>,
 
     /// Producer-side circuit breaker for rounds that panic on the same
     /// mempool transaction (see [`PanicBreaker`]).
@@ -469,6 +489,7 @@ impl BlockProducer {
             registry_sync: None,
             emit_v2_headers: false,
             applied_tip_lock: None,
+            produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
         }
     }
@@ -534,6 +555,7 @@ impl BlockProducer {
             registry_sync: None,
             emit_v2_headers: false,
             applied_tip_lock: None,
+            produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
         }
     }
@@ -598,6 +620,7 @@ impl BlockProducer {
             registry_sync: None,
             emit_v2_headers: false,
             applied_tip_lock: None,
+            produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
         }
     }
@@ -741,6 +764,7 @@ impl BlockProducer {
             registry_sync: None,
             emit_v2_headers: false,
             applied_tip_lock: None,
+            produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
         }
     }
@@ -894,6 +918,7 @@ impl BlockProducer {
             registry_sync: None,
             emit_v2_headers: false,
             applied_tip_lock: None,
+            produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
         }
     }
@@ -979,6 +1004,21 @@ impl BlockProducer {
         lock: Arc<tokio::sync::Mutex<crate::canonical_apply::AppliedState>>,
     ) -> Self {
         self.applied_tip_lock = Some(lock);
+        self
+    }
+
+    /// #126 (producer catch-up gate): wire the canonical applicator's rebuild + DAG-
+    /// hydration signals so the producer refuses to seal while a lagging/replaying node
+    /// has not caught up. Pass the same `CanonicalApplicator` whose `advance_lock` was
+    /// shared via [`Self::with_applied_tip_lock`].
+    pub fn with_produce_catchup_gate(
+        mut self,
+        app: &crate::canonical_apply::CanonicalApplicator,
+    ) -> Self {
+        self.produce_gate = Some(ProduceCatchupGate {
+            rebuild_in_progress: app.rebuild_in_progress_handle(),
+            dag_hydrated: app.dag_hydrated_handle(),
+        });
         self
     }
 
@@ -1166,6 +1206,34 @@ impl BlockProducer {
         // Pinned by `tests::mp_s1_produced_block_state_root_must_bind_to_its_
         // declared_parent`, which FAILS on the pre-fix code with the same
         // StateRootMismatch the fleet logged.
+        // MP-S1 / #126 — PRODUCER CATCH-UP GATE (anti-fork, the other half of the
+        // crash-consistency fix). The `selected_parent == applied_tip` check below is a
+        // SELF-CONSISTENCY check only: after an unclean restart a node can hold a stale
+        // but internally-consistent applied tip (durable state matching a durable tip)
+        // while it is still replaying / rebuilding / hydrating its DAG — and it would
+        // then happily seal on that stale tip and fork the fleet. Refuse to produce
+        // unless the node is NOT mid-rebuild and IS hydrated. Strictly conservative:
+        // this only ever makes the producer REFRAIN (skip the slot); it never seals
+        // anything it would not have sealed before.
+        if let Some(gate) = self.produce_gate.as_ref() {
+            if gate.rebuild_in_progress.load(Ordering::SeqCst) {
+                return Err(anyhow::anyhow!(
+                    "MP-S1/#126: refusing to produce — a canonical spine rebuild is in progress \
+                     (the applied tip is being rewritten from genesis). Skipping this slot; \
+                     the rebuild will converge the applied tip."
+                ));
+            }
+            if let Some(hydrated) = &gate.dag_hydrated {
+                if !hydrated.load(Ordering::SeqCst) {
+                    return Err(anyhow::anyhow!(
+                        "MP-S1/#126: refusing to produce — the DAG has not finished hydrating \
+                         after restart, so the applied tip is not yet authoritative. Skipping \
+                         this slot until hydration completes."
+                    ));
+                }
+            }
+        }
+
         if let Some(guard) = applied_guard.as_ref() {
             let applied = guard.tip();
             if selected_parent != applied.hash {
@@ -2072,6 +2140,10 @@ impl BlockProducer {
         let executor = self.executor.clone();
         let mut budget = SelectionBudget::new(MAX_GAS_PER_BLOCK);
         let mut ai_declared: u64 = 0;
+        // PBA-N9: candidates the budget deems permanently unincludable (unpayable
+        // alone / oversized) are removed from the pool after the pass, so a flood
+        // of them cannot persist for `tx_expiry_secs` (3600s) or waste every round.
+        let mut to_drop: Vec<Hash> = Vec::new();
         for tx in ai_txs {
             if seen.contains(&tx.hash) {
                 continue;
@@ -2082,13 +2154,17 @@ impl BlockProducer {
             if next > MAX_AI_GAS_PER_BLOCK {
                 continue;
             }
-            if budget.try_admit(&tx, |from| {
+            match budget.admit_outcome(&tx, |from| {
                 let addr = citrate_execution::address_utils::normalize_address(from);
                 (executor.get_nonce(&addr), executor.get_balance(&addr))
             }) {
-                ai_declared = next;
-                seen.insert(tx.hash);
-                selected.push(tx);
+                AdmitOutcome::Admitted => {
+                    ai_declared = next;
+                    seen.insert(tx.hash);
+                    selected.push(tx);
+                }
+                AdmitOutcome::Drop => to_drop.push(tx.hash),
+                AdmitOutcome::Skip => {}
             }
         }
         // Count and byte caps apply to EXECUTED transactions (see
@@ -2117,13 +2193,17 @@ impl BlockProducer {
             if !window.fits(&tx) {
                 continue;
             }
-            if budget.try_admit(&tx, |from| {
+            match budget.admit_outcome(&tx, |from| {
                 let addr = citrate_execution::address_utils::normalize_address(from);
                 (executor.get_nonce(&addr), executor.get_balance(&addr))
             }) {
-                window.record(&tx);
-                seen.insert(tx.hash);
-                selected.push(tx);
+                AdmitOutcome::Admitted => {
+                    window.record(&tx);
+                    seen.insert(tx.hash);
+                    selected.push(tx);
+                }
+                AdmitOutcome::Drop => to_drop.push(tx.hash),
+                AdmitOutcome::Skip => {}
             }
         }
         let total_gas = ai_declared;
@@ -2133,6 +2213,18 @@ impl BlockProducer {
             total_gas,
             MAX_GAS_PER_BLOCK
         );
+
+        // PBA-N9: drop the permanently-unincludable candidates from the pool.
+        // A failure before a receipt costs the sender nothing on chain, and here
+        // the candidate was never even executed, so removal (not a ban) is the
+        // conservative choice: the sender may re-submit once funded, and the
+        // admission balance check will gate the re-submission.
+        if !to_drop.is_empty() {
+            debug!("PBA-N9: dropping {} unpayable candidates", to_drop.len());
+            for hash in to_drop {
+                let _ = self.mempool.remove_transaction(&hash).await;
+            }
+        }
 
         Ok(selected)
     }
@@ -2631,10 +2723,39 @@ impl BlockGasMeter {
     }
 }
 
+/// PBA-N9 (security#134): the outcome of considering a candidate for selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmitOutcome {
+    /// Selected into the block.
+    Admitted,
+    /// Not selectable this round, but keep it pooled: its nonce is not yet the
+    /// sender's next nonce, or it is affordable alone but not alongside this
+    /// sender's earlier candidates already taken this round (a later block may
+    /// include it).
+    Skip,
+    /// Drop it from the pool: it can never be validly included as-is — larger
+    /// than a whole block, its successor nonce would overflow, or its sender's
+    /// COMMITTED balance cannot cover even this single transaction. Leaving such
+    /// a candidate pooled lets a flood persist to `tx_expiry_secs` (3600s) and
+    /// burns selection work every round (the N9 producer half).
+    Drop,
+}
+
+/// Per-sender budget state tracked across a single selection pass.
+struct SenderBudget {
+    /// Next nonce expected from this sender, advanced per admitted candidate.
+    next_nonce: u64,
+    /// Committed balance remaining after the candidates already admitted.
+    remaining: primitive_types::U256,
+    /// The sender's committed balance at the start of the pass (for deciding
+    /// whether a rejected candidate is unpayable alone vs. only cumulatively).
+    original: primitive_types::U256,
+}
+
 pub(crate) struct SelectionBudget {
     max_gas: u64,
-    /// sender -> (next expected nonce, remaining balance) after admitted txs.
-    senders: HashMap<PublicKey, (u64, primitive_types::U256)>,
+    /// sender -> budget state after admitted txs.
+    senders: HashMap<PublicKey, SenderBudget>,
 }
 
 impl SelectionBudget {
@@ -2645,37 +2766,72 @@ impl SelectionBudget {
         }
     }
 
-    /// Admit `tx` if it fits and is payable; `state` returns the sender's
-    /// on-chain `(nonce, balance)` (queried once per sender).
-    pub(crate) fn try_admit<F>(&mut self, tx: &Transaction, state: F) -> bool
+    /// Classify `tx` against the budget and, when admitted, advance the sender's
+    /// nonce and spend its balance. `state` returns the sender's on-chain
+    /// `(nonce, balance)` (queried once per sender). PBA-N9: distinguishes a
+    /// candidate that should be DROPPED (unpayable alone / oversized) from one
+    /// that should be kept pooled (`Skip`): the fee-market cost bound uses
+    /// `max_fee_per_gas` (falling back to `gas_price`) plus `value`, so a
+    /// genuinely-payable transaction is never dropped.
+    pub(crate) fn admit_outcome<F>(&mut self, tx: &Transaction, state: F) -> AdmitOutcome
     where
         F: FnOnce(&PublicKey) -> (u64, primitive_types::U256),
     {
         use primitive_types::U256;
         if tx.gas_limit > self.max_gas {
-            return false; // can never fit a block: skip it, keep filling (SEQ-H2)
+            // Can never fit a block (SEQ-H2). It is dead weight in the pool.
+            return AdmitOutcome::Drop;
         }
-        let (next_nonce, balance) = *self
-            .senders
-            .entry(tx.from)
-            .or_insert_with(|| state(&tx.from));
+        let entry = self.senders.entry(tx.from).or_insert_with(|| {
+            let (next_nonce, balance) = state(&tx.from);
+            SenderBudget {
+                next_nonce,
+                remaining: balance,
+                original: balance,
+            }
+        });
+        let next_nonce = entry.next_nonce;
+        let remaining = entry.remaining;
+        let original = entry.original;
         if tx.nonce != next_nonce {
-            return false;
+            // Future/gap nonce (or already consumed): keep it pooled.
+            return AdmitOutcome::Skip;
         }
         let Some(after_nonce) = next_nonce.checked_add(1) else {
-            return false;
+            // u64::MAX nonce has no successor: never includable.
+            return AdmitOutcome::Drop;
         };
+        let price = tx.max_fee_per_gas.unwrap_or(tx.gas_price);
         let cost = U256::from(tx.gas_limit)
-            .checked_mul(U256::from(tx.gas_price))
+            .checked_mul(U256::from(price))
             .and_then(|g| g.checked_add(U256::from(tx.value)));
         let Some(cost) = cost else {
-            return false;
+            // Absurd (overflowing) declared cost: unpayable against any balance.
+            return AdmitOutcome::Drop;
         };
-        if balance < cost {
-            return false;
+        if original < cost {
+            // The sender cannot afford even this one transaction on its own.
+            return AdmitOutcome::Drop;
         }
-        self.senders.insert(tx.from, (after_nonce, balance - cost));
-        true
+        if remaining < cost {
+            // Affordable alone, but not alongside this sender's earlier admitted
+            // candidates this round: keep it pooled for a later block.
+            return AdmitOutcome::Skip;
+        }
+        entry.next_nonce = after_nonce;
+        entry.remaining = remaining - cost;
+        AdmitOutcome::Admitted
+    }
+
+    /// Admit `tx` if it fits and is payable; `state` returns the sender's
+    /// on-chain `(nonce, balance)` (queried once per sender). Thin wrapper over
+    /// [`Self::admit_outcome`] kept for the budget-semantics unit tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn try_admit<F>(&mut self, tx: &Transaction, state: F) -> bool
+    where
+        F: FnOnce(&PublicKey) -> (u64, primitive_types::U256),
+    {
+        matches!(self.admit_outcome(tx, state), AdmitOutcome::Admitted)
     }
 }
 
@@ -3063,6 +3219,151 @@ mod tests {
         assert!(!b.try_admit(&max, |_: &PublicKey| (u64::MAX, U256::MAX)));
     }
 
+    /// PBA-N9 (security#134, rescore #20): an unfunded pool flood must not evict
+    /// honest transactions or empty blocks.
+    ///
+    /// Verifier harness for the mempool-DoS finding: `eth_/tx_sendRawTransaction`
+    /// and P2P gossip all route through `Mempool::add_transaction`, which — before
+    /// the fix — checked signature + nonce but NEVER sender balance. An attacker
+    /// could flood a bounded pool with unfunded, high-fee transactions; they were
+    /// admitted (no balance check), evicted honest lower-fee transactions (a full
+    /// pool evicted purely on priority), and then the producer skipped them unpaid
+    /// while leaving them pooled for `tx_expiry_secs` — empty blocks at zero cost.
+    ///
+    /// With the fix (cumulative sender-balance admission on every ingress path +
+    /// payable-aware eviction), each unfunded flood transaction is rejected with
+    /// `InsufficientBalance`, the honest transaction survives, and the produced
+    /// block contains it.
+    #[tokio::test]
+    async fn verify5_n9_unfunded_pool_flood_evicts_honest() {
+        use citrate_sequencer::mempool::MempoolError;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let storage =
+            Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).expect("storage"));
+        let state_db = Arc::new(citrate_execution::StateDB::new());
+        let executor = Arc::new(Executor::with_storage_and_chain_id(
+            state_db.clone(),
+            Some(storage.state.clone()),
+            40204,
+        ));
+
+        // Production wiring: nonce + balance readers over the executor's state
+        // view. Small pool so an admitted flood would clearly evict the honest tx.
+        let mempool = Arc::new(
+            Mempool::new(MempoolConfig {
+                require_valid_signature: false,
+                max_size: 4,
+                ..Default::default()
+            })
+            .with_state_nonce_reader({
+                let exec = executor.clone();
+                Arc::new(move |pk: &PublicKey| {
+                    exec.get_nonce(&citrate_execution::address_utils::normalize_address(pk))
+                })
+            })
+            .with_state_balance_reader({
+                let exec = executor.clone();
+                Arc::new(move |pk: &PublicKey| {
+                    let bal = exec
+                        .get_balance(&citrate_execution::address_utils::normalize_address(pk));
+                    let cap = U256::from(u128::MAX);
+                    (if bal > cap { cap } else { bal }).low_u128()
+                })
+            }),
+        );
+
+        let honest = Address([0x11; 20]);
+        let recipient = Address([0x33; 20]);
+        let honest_price = 1_000_000_000u64;
+        let honest_cost = 21_000u128 * honest_price as u128;
+        state_db.accounts.create_account_if_not_exists(honest);
+        state_db.accounts.set_balance(honest, U256::from(honest_cost));
+
+        let honest_tx = {
+            let mut t = transfer_tx(0xA1, honest, recipient, 0);
+            t.gas_price = honest_price; // exactly funds one transfer
+            t
+        };
+        mempool
+            .add_transaction(honest_tx.clone(), TxClass::Standard)
+            .await
+            .expect("honest tx is funded and admitted");
+
+        // Flood: 32 unfunded senders (no account -> balance 0), each a high-fee
+        // transfer that, pre-fix, would have out-prioritised and evicted the
+        // honest tx from the 4-slot pool.
+        let mut rejected = 0usize;
+        for i in 0..32u8 {
+            let mut flood = transfer_tx(0x40 + i, Address([0x80 + i; 20]), recipient, 0);
+            flood.gas_price = 1_000_000_000_000; // 1000x the honest fee
+            match mempool.add_transaction(flood, TxClass::Standard).await {
+                Err(MempoolError::InsufficientBalance { .. }) => rejected += 1,
+                other => panic!("unfunded flood tx must be rejected for balance, got {other:?}"),
+            }
+        }
+        assert_eq!(rejected, 32, "every unfunded flood tx must be rejected");
+
+        // The honest tx survived the flood.
+        assert!(
+            mempool.contains(&honest_tx.hash).await,
+            "N9: honest tx must not be evicted by an unfunded flood"
+        );
+        assert_eq!(
+            mempool.stats().await.total_transactions,
+            1,
+            "only the honest tx remains pooled"
+        );
+
+        // Cumulative check: a single sender's individually-affordable-but-
+        // collectively-unaffordable second tx is also rejected. The honest sender
+        // is funded for exactly ONE transfer, so a second (nonce 1) is unpayable
+        // on top of the pooled first.
+        let honest_2 = {
+            let mut t = transfer_tx(0xA2, honest, recipient, 1);
+            t.gas_price = honest_price;
+            t
+        };
+        assert!(
+            matches!(
+                mempool.add_transaction(honest_2, TxClass::Standard).await,
+                Err(MempoolError::InsufficientBalance { .. })
+            ),
+            "N9: a collectively-unaffordable second tx must be rejected against the pending set"
+        );
+
+        // The producer selects the honest tx and produces a non-empty block.
+        let producer = BlockProducer::new(
+            storage.clone(),
+            executor,
+            mempool,
+            embedded_pubkey(Address([0x44; 20])),
+            test_signing_key(),
+            2,
+        );
+        let selected = producer
+            .select_transactions_with_ai_priority()
+            .await
+            .expect("selection");
+        let selected_hashes: Vec<Hash> = selected.iter().map(|t| t.hash).collect();
+        assert!(
+            selected_hashes.contains(&honest_tx.hash),
+            "honest tx must be selected; got {selected_hashes:?}"
+        );
+
+        let block_hash = producer.produce_block().await.expect("produce block");
+        let block = storage
+            .blocks
+            .get_block(&block_hash)
+            .expect("read block")
+            .expect("block stored");
+        let block_hashes: Vec<Hash> = block.transactions.iter().map(|t| t.hash).collect();
+        assert!(
+            block_hashes.contains(&honest_tx.hash),
+            "N9: the produced block must include the honest tx (not be empty); got {block_hashes:?}"
+        );
+    }
+
     #[test]
     fn producer_ai_slice_cap_value() {
         assert_eq!(MAX_AI_GAS_PER_BLOCK, 10_000_000);
@@ -3214,6 +3515,42 @@ mod tests {
             ..Default::default()
         }));
         (tmp, storage, state_db, executor, mempool)
+    }
+
+    /// #126 (producer catch-up gate, anti-fork). A producer wired to the canonical
+    /// applicator's rebuild signal must REFUSE to seal while a spine rebuild is in
+    /// progress (the applied tip is being rewritten from genesis), then resume once the
+    /// rebuild clears. Strictly conservative: the gate only ever makes the producer
+    /// refrain — it never seals a block it would not have sealed before.
+    #[tokio::test]
+    async fn mp_s1_126_producer_refuses_to_seal_while_rebuilding() {
+        let (_tmp, storage, _state_db, executor, mempool) = producer_fixture();
+        let app = Arc::new(crate::canonical_apply::CanonicalApplicator::new(
+            executor.clone(),
+            storage.clone(),
+        ));
+        let producer = test_producer(&storage, &executor, &mempool)
+            .with_applied_tip_lock(app.advance_lock())
+            .with_produce_catchup_gate(&app);
+        let rebuild = app.rebuild_in_progress_handle();
+
+        // Mid-rebuild: the producer refuses this slot.
+        rebuild.store(true, Ordering::SeqCst);
+        let err = producer
+            .produce_block()
+            .await
+            .expect_err("must refuse to produce while a spine rebuild is in progress");
+        assert!(
+            err.to_string().contains("#126"),
+            "the refusal must be the catch-up gate, got: {err}"
+        );
+
+        // Rebuild done: the producer seals normally again.
+        rebuild.store(false, Ordering::SeqCst);
+        producer
+            .produce_block()
+            .await
+            .expect("produces once the rebuild has cleared");
     }
 
     /// The AI slice is capped at a third of the block's declared gas; AI ops

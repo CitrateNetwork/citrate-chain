@@ -321,3 +321,161 @@ fn test_rem_2_producer_finality_bundle_all_fsynced() {
         sync_delta, nosync_delta
     );
 }
+
+// ---------------------------------------------------------------------------
+// #126 / #32 — crash-consistent REORG store reconciliation.
+//
+// The linear/produce commit path was already crash-consistent (state + tip in
+// one fsync'd batch). The REORG path was NOT: `reconcile_store_from` wrote the
+// account/storage diff in a sync batch WITHOUT the tip, then advanced the applied
+// tip via a SEPARATE non-fsync `put_cf`, with account-deletes and code as further
+// separate point writes. A kill-9 between the synced state batch and the tip write
+// left the durable tip out of step with durable state → genesis-replay + fork on
+// restart. Fix: accounts + storage + account-deletes + code + applied-tip all commit
+// in ONE `write_batch_sync`, so there is NO window in which they can tear.
+// ---------------------------------------------------------------------------
+
+/// #32 (the uncovered path): a reorg reconcile that PUTS an account, DELETES an
+/// abandoned-branch account, writes new contract STORAGE + CODE, and advances the
+/// APPLIED TIP must commit as exactly ONE fsync'd batch (no torn window), and after
+/// reopening the store the flat state AND the applied tip must be mutually consistent
+/// (both post-reorg) with the tip at the true last-durable value (no genesis fallback).
+#[tokio::test]
+async fn test_126_reorg_reconcile_commits_state_and_tip_in_one_sync_batch() {
+    let temp = TempDir::new().expect("temp dir");
+    let account_a = Address([0xA1; 20]); // modified on the winning branch
+    let account_b = Address([0xB2; 20]); // abandoned-branch account → DELETED on reorg
+    let contract_c = Address([0xCC; 20]); // new contract on the winning branch
+    let slot_key = vec![0x01u8; 32];
+    let slot_val = vec![0x02u8; 32];
+    let code = vec![0x60u8, 0x00, 0x60, 0x00, 0xF3]; // trivial bytecode
+    let new_tip_hash = Hash::new([0x7E; 32]);
+    let new_tip_height = 424_242u64;
+
+    let (code_hash, sync_delta, nosync_delta) = {
+        let db = Arc::new(RocksDB::open(temp.path()).expect("open db"));
+        let store = Arc::new(StateStore::new(db.clone()));
+        let state_db = Arc::new(StateDB::new());
+        let executor = Executor::with_storage(state_db.clone(), Some(store.clone()));
+
+        // FORK-POINT world: A=100 and B=200, fully persisted (the store's baseline).
+        state_db.accounts.set_balance(account_a, U256::from(100u64));
+        // Snapshot with only A resident — used later to make B non-resident (deleted).
+        let snap_only_a = state_db.snapshot();
+        state_db.accounts.set_balance(account_b, U256::from(200u64));
+        let baseline = state_db.snapshot(); // fork point == what the store reflects
+        executor
+            .persist_state_changes()
+            .await
+            .expect("persist fork-point state");
+
+        // WINNING branch in-memory: drop B (restore the A-only set), bump A, and deploy
+        // contract C with one storage slot and code.
+        state_db.restore(snap_only_a);
+        state_db.accounts.set_balance(account_a, U256::from(150u64));
+        state_db.accounts.set_balance(contract_c, U256::from(300u64));
+        let code_hash = state_db.set_code(contract_c, code.clone());
+        state_db.set_storage(contract_c, slot_key.clone(), slot_val.clone());
+
+        // The reorg commit: exactly ONE fsync'd batch carrying puts + delete + code + tip.
+        let sync_before = db.write_batch_sync_count();
+        let nosync_before = db.write_batch_count();
+        executor
+            .reconcile_store_from(&baseline, Some((new_tip_hash, new_tip_height)))
+            .expect("reorg reconcile");
+        let sync_delta = db.write_batch_sync_count() - sync_before;
+        let nosync_delta = db.write_batch_count() - nosync_before;
+        (code_hash, sync_delta, nosync_delta)
+        // executor / store / state_db / db all drop here → RocksDB closes.
+    };
+
+    assert_eq!(
+        sync_delta, 1,
+        "#126: the whole reorg reconcile (accounts + storage + delete + code + tip) \
+         must commit as ONE fsync'd batch — no torn window. Got sync_delta={}, nosync_delta={}",
+        sync_delta, nosync_delta
+    );
+    assert_eq!(
+        nosync_delta, 0,
+        "#126: the reorg reconcile must not use the non-fsync write_batch path (a crash \
+         could then roll back part of the commit). Got sync_delta={}, nosync_delta={}",
+        sync_delta, nosync_delta
+    );
+
+    // REOPEN from disk (models the post-kill-9 restart) and assert durable state AND
+    // durable tip are consistent — both post-reorg, never torn.
+    let db2 = Arc::new(RocksDB::open(temp.path()).expect("reopen db"));
+    let store2 = StateStore::new(db2.clone());
+    let blocks2 = BlockStore::new(db2.clone());
+
+    assert_eq!(
+        store2.get_account(&account_a).expect("get A").expect("A present").balance,
+        U256::from(150u64),
+        "#126: winning-branch account update is durable"
+    );
+    assert!(
+        store2.get_account(&account_b).expect("get B").is_none(),
+        "#126: abandoned-branch account was deleted in the same atomic batch"
+    );
+    assert_eq!(
+        store2.get_account(&contract_c).expect("get C").expect("C present").balance,
+        U256::from(300u64),
+        "#126: new contract account is durable"
+    );
+    assert_eq!(
+        store2.get_storage(&contract_c, &slot_key).expect("get C storage"),
+        Some(slot_val),
+        "#126: new contract storage slot is durable"
+    );
+    assert_eq!(
+        store2.get_code(&code_hash).expect("get code"),
+        Some(code),
+        "#126: contract code landed in the SAME atomic batch (not a separate point write)"
+    );
+    assert_eq!(
+        blocks2.get_applied_tip().expect("get applied tip"),
+        Some((new_tip_hash, new_tip_height)),
+        "#126: the durable applied tip advanced to the winning tip IN the same batch — \
+         so a restart resumes at the true last-durable tip, never a stale one (no genesis fallback)"
+    );
+}
+
+/// #126: `Executor::reconcile_store_from` must route the whole reorg commit through the
+/// single atomic `write_reorg_batch_sync` — NOT through separate `store.delete_account`
+/// / `store.put_code` / `store.write_state_batch_sync` point writes, and NOT via a
+/// separate applied-tip write. Analogous to
+/// `test_k1_1_executor_persist_state_changes_has_no_direct_point_writes`.
+#[test]
+fn test_126_reconcile_store_from_has_no_direct_point_writes() {
+    let source = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../execution/src/executor.rs"
+    ))
+    .expect("read executor source");
+    let start = source
+        .find("pub fn reconcile_store_from")
+        .expect("reconcile_store_from exists");
+    // The function ends at the next item doc-comment after its body.
+    let end = source[start..]
+        .find("/// EXECUTE-ON-RECEIVE — the verified")
+        .map(|offset| start + offset)
+        .expect("reconcile_store_from section end");
+    let body = &source[start..end];
+
+    assert!(
+        body.contains("write_reorg_batch_sync"),
+        "#126: reconcile_store_from must commit via the atomic write_reorg_batch_sync"
+    );
+    assert!(
+        !body.contains("store.write_state_batch_sync(")
+            && !body.contains("store.delete_account(")
+            && !body.contains("store.put_code("),
+        "#126: reconcile_store_from must not issue separate point writes for state / \
+         account-deletes / code — they must all go through the one atomic batch"
+    );
+    assert!(
+        !body.contains("put_applied_tip"),
+        "#126: reconcile_store_from must not advance the tip via a separate (non-atomic) \
+         write — the tip is threaded into write_reorg_batch_sync"
+    );
+}
