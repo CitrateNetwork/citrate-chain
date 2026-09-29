@@ -453,10 +453,20 @@ pub trait StateStoreTrait: Send + Sync {
     /// the same `write_batch_sync` closes that window: the whole reconciliation commits
     /// or nothing does.
     ///
-    /// The default here is the NON-atomic fallback for in-memory test stores that model
-    /// no crash: it writes state, then deletes, then code, and the tip LAST (so even the
-    /// fallback never advances the tip ahead of the state it describes). The real
-    /// RocksDB-backed `StateStore` overrides this with a single cross-CF `WriteBatch`.
+    /// VERIFY-255-F1-L1 (crash-sweep harness gap): this is a REQUIRED trait method —
+    /// there is deliberately NO default impl. A non-atomic default (state, then deletes,
+    /// then code, then the tip, as separate writes) is exactly the pre-#126 shape whose
+    /// kill-9 window forks the fleet; worse, it let the adopted crash sweep pass even
+    /// when the real atomic impl was deleted, because the sweep's abort counter wraps
+    /// this ONE call — a fallback that issues its sub-writes directly on the inner store
+    /// bypasses the counter, so no abort point ever lands mid-reorg-batch and the sweep
+    /// stays GREEN. Requiring the method turns any store that does NOT commit the reorg
+    /// as one synced batch into a COMPILE error, so deleting the real
+    /// `StateStore::write_reorg_batch_sync` turns the sweep RED (it no longer compiles)
+    /// instead of silently passing. Store-less test doubles must supply an explicit impl
+    /// (a faithful single-batch one, or a delegating one) rather than inherit a default.
+    /// The real RocksDB-backed `StateStore` implements it with a single cross-CF
+    /// `WriteBatch` fsync'd once via `write_batch_sync`.
     fn write_reorg_batch_sync(
         &self,
         accounts: &[(Address, crate::types::AccountState)],
@@ -464,21 +474,7 @@ pub trait StateStoreTrait: Send + Sync {
         account_dels: &[Address],
         code: &[(Hash, Vec<u8>)],
         applied_tip: Option<(Hash, u64)>,
-    ) -> anyhow::Result<()> {
-        // NB: tip is written LAST so a crash in this non-atomic fallback can only ever
-        // leave the tip BEHIND the state, never ahead of it (the safe direction).
-        self.write_state_batch_sync(accounts, storage)?;
-        for addr in account_dels {
-            self.delete_account(addr)?;
-        }
-        for (code_hash, code) in code {
-            self.put_code(code_hash, code)?;
-        }
-        if let Some((hash, height)) = applied_tip {
-            self.put_applied_tip_meta(&hash, height)?;
-        }
-        Ok(())
-    }
+    ) -> anyhow::Result<()>;
 
     /// Persist the applied-tip pointer (block hash + height). Default no-op for test
     /// stores; the real `StateStore` writes it to `CF_METADATA`. Used by the atomic
