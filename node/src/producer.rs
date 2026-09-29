@@ -3,8 +3,9 @@ use citrate_consensus::crypto::{self, Ed25519SigningKey};
 use citrate_consensus::dag_store::{DagStore, DagStoreError};
 use citrate_consensus::ghostdag::GhostDag;
 use citrate_consensus::tip_selection::TipSelector;
+use citrate_consensus::hardening::PbaHardening;
 use citrate_consensus::types::{
-    BlockBuilder, BlockHeader, GhostDagParams, Hash, PublicKey, Transaction, VrfProof,
+    Block, BlockBuilder, BlockHeader, GhostDagParams, Hash, PublicKey, Transaction, VrfProof,
 };
 use citrate_economics::{RewardCalculator, RewardConfig, UnifiedEconomicsManager};
 use citrate_execution::revm_adapter::BlockContext;
@@ -16,9 +17,10 @@ use citrate_network::{GossipProtocol, NetworkMessage, PeerManager};
 use citrate_sequencer::mempool::Mempool;
 use citrate_storage::{state_manager::StateManager as AIStateManager, StorageManager};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::time::{interval, Duration};
 use tracing::{debug, error, info, warn};
 
@@ -83,11 +85,32 @@ pub struct EquivocationVoteConfig {
     pub activation_height: u64,
 }
 
+/// F2 (network-height catch-up gate): the gap, in blocks, above which the producer
+/// enters the "behind the network" refuse band (hysteresis high-water mark).
+pub const CATCHUP_REFUSE_GAP: u64 = 3;
+/// F2: the gap at/below which a refusing producer RESUMES (hysteresis low-water mark).
+/// Strictly below [`CATCHUP_REFUSE_GAP`], so a gap that oscillates in `(RESUME, REFUSE]`
+/// does not flap production on and off.
+pub const CATCHUP_RESUME_GAP: u64 = 1;
+/// F2: if the producer refuses for this long with NO sync progress (its applied tip
+/// never advances), it raises a stall ALERT and latches production OFF until a
+/// human-in-command override. Any applied-tip advance resets this timer.
+pub const CATCHUP_STALL_ALERT: Duration = Duration::from_secs(60);
+
 /// #126 (producer catch-up gate): the signals a producing node consults BEFORE it
 /// seals a block, so a node that is lagging / mid-rebuild / not-yet-hydrated refuses
 /// to produce (skips the slot) rather than sealing on a stale, self-consistent applied
 /// tip and forking the fleet. Strictly conservative: it only ever makes the producer
 /// REFRAIN — it never causes a block to be sealed that would not have been before.
+///
+/// F2 (network-height catch-up) EXTENDS the #126 gate: on top of the node-local
+/// rebuild/hydration signals it also refuses to seal while this node is BEHIND its
+/// peers, where "behind" is measured ONLY from [`AttestedNetworkHead`] — the highest
+/// peer block height that carries a valid proposer signature AND chains (parentHash
+/// ancestry) to a block this node HOLDS. It NEVER reads `PeerInfo.head_height` (a
+/// once-set, self-reported Hello field) or `SyncManager.target_height` (a liar-
+/// controlled MAX of claims). Still strictly conservative: it only ever makes the
+/// producer REFRAIN.
 #[derive(Clone)]
 pub struct ProduceCatchupGate {
     /// Set while the canonical applicator rebuilds applied state from genesis (its
@@ -96,6 +119,472 @@ pub struct ProduceCatchupGate {
     /// "DAG hydration complete" signal. `None` ⇒ no fork-choice wired (tests / fixed-tip
     /// stubs) ⇒ treat as hydrated so the gate is inert there.
     dag_hydrated: Option<Arc<AtomicBool>>,
+    /// F2: highest VALIDLY-SIGNED, CHAIN-DESCENDING peer head height observed (see
+    /// [`AttestedNetworkHead`]). `None` ⇒ F2 disabled (the plain #126 gate). `0` ⇒ no
+    /// attested-ahead evidence yet (fresh node / no peers) ⇒ never "behind".
+    attested_ahead: Option<Arc<AtomicU64>>,
+    /// F2: hysteresis + stall state, shared behind a lock so the live values persist
+    /// across produce rounds. `parking_lot::Mutex` (no `.await` is held while locked).
+    behind: Arc<Mutex<CatchupBehindState>>,
+    /// F2: human-in-command override. Set true (via [`BlockProducer::catchup_override_handle`])
+    /// to resume production after a stall alert; nothing else clears the stall latch.
+    override_resume: Arc<AtomicBool>,
+    /// F2: surfaced stall-alert signal for the monitor/RPC (true while latched OFF).
+    stall_alert: Arc<AtomicBool>,
+    /// F2: how long the producer may refuse with no sync progress before alerting +
+    /// latching. Defaults to [`CATCHUP_STALL_ALERT`]; shrunk by tests.
+    stall_alert_after: Duration,
+    /// VERIFY-255-F2-H1: the shared attested-candidate record. `Some` ⇒ the ahead measure
+    /// is RE-DERIVED against the live fork-choice head each round by
+    /// [`ProduceCatchupGate::recompute_attested_ahead`] (production + the H1 tests). `None`
+    /// ⇒ `attested_ahead` is used as-is (the hysteresis/stall state-machine unit tests set
+    /// the watermark directly), so those tests keep exercising `evaluate_network_height`
+    /// unchanged.
+    attested_observed: Option<Arc<AttestedInner>>,
+    /// VERIFY-255-F2-H1: the finalized-reorg floor. A candidate at/below it can never be
+    /// "ahead" of the canonical head, so recompute prunes it. `None` ⇒ floor 0.
+    finalized_floor: Option<Arc<AtomicU64>>,
+}
+
+/// F2: hysteresis + stall bookkeeping for [`ProduceCatchupGate`].
+struct CatchupBehindState {
+    /// True while in the refuse band (latched between `REFUSE_GAP` and `RESUME_GAP`).
+    refusing: bool,
+    /// Applied tip observed at the previous evaluation; used to detect sync progress.
+    last_applied_tip: u64,
+    /// When the applied tip last advanced (an advance resets the stall timer).
+    last_progress: Instant,
+    /// Set once a >`stall_alert_after` no-progress stall is detected; only the
+    /// human-in-command override clears it (NEVER auto-resume after a stall).
+    stalled_latch: bool,
+}
+
+impl Default for CatchupBehindState {
+    fn default() -> Self {
+        Self {
+            refusing: false,
+            last_applied_tip: 0,
+            last_progress: Instant::now(),
+            stalled_latch: false,
+        }
+    }
+}
+
+/// F2 (network-height catch-up gate): the record of attested peer blocks from which the
+/// producer gate derives "how far ahead is the network".
+///
+/// [`AttestedNetworkHead::observe`] folds in a received block IFF it satisfies ALL of:
+///   1. the header binds its own hash (`verify_hash_for`) — a spoofed height/parent
+///      inside a validly-signed envelope is rejected;
+///   2. the block carries a valid ed25519 PROPOSER signature over that hash
+///      (`crypto::verify_block_signature`);
+///   3. its `selected_parent_hash` resolves to a block THIS node HOLDS, exactly one
+///      height below it (`get_block(parent).height + 1 == height`) — i.e. it chains,
+///      via parentHash ancestry, to a block we already have.
+///
+/// This is deliberately NOT `PeerInfo.head_height` (set once at the Hello handshake,
+/// self-reported, never refreshed) and NOT `SyncManager.target_height` (a running MAX
+/// of unauthenticated claims that a single liar advertising `u64::MAX` controls). A
+/// peer that merely CLAIMS a height (Hello, or a signed header that forks off a block
+/// we do not hold) never contributes; only a signed block that extends our held chain does.
+///
+/// VERIFY-255-F2-H1 (fleet-halt liveness): the gate does NOT read a lifetime `fetch_max`
+/// over these heights. Such a monotonic max, taken over blocks on ANY branch, is wrong
+/// because GhostDAG's canonical head is by BLUE-SCORE, not height — an attacker's signed
+/// side branch, or an honest-but-LOSING branch whose height exceeds the (lower) canonical
+/// head, would pin the watermark above the selected chain and make an honest producer
+/// refuse forever (it can never "catch up" to a height that is not on its canonical line),
+/// latching the fleet OFF. Instead the observed blocks are kept as CANDIDATES here, and
+/// [`ProduceCatchupGate::recompute_attested_ahead`] re-derives the ahead measure EACH
+/// round against the live fork-choice-selected head: a candidate counts only while it
+/// still DESCENDS FROM the current selected head, so a side/losing branch never counts and
+/// a reorg re-bases the measure for free. `best()` retains the raw max for telemetry only.
+#[derive(Clone, Default)]
+pub struct AttestedNetworkHead {
+    inner: Arc<AttestedInner>,
+}
+
+/// Shared record behind [`AttestedNetworkHead`] and the producer gate. Bounded.
+#[derive(Default)]
+pub struct AttestedInner {
+    /// Highest attested height ever folded — TELEMETRY / upper-bound ONLY (see the H1
+    /// note above; the gate does NOT use this as its ahead measure).
+    best: AtomicU64,
+    /// Observed attested candidate blocks: `block_hash -> height`. The gate counts one as
+    /// "ahead" only while it still descends from the live fork-choice head. Bounded to
+    /// [`ATTESTED_OBSERVED_CAP`] by evicting the lowest-height entry.
+    observed: Mutex<BTreeMap<Hash, u64>>,
+}
+
+/// Cap on retained attested candidates (a few reorg windows of headroom; the gate prunes
+/// entries at/below the finalized floor on every recompute, so this only bounds a burst).
+const ATTESTED_OBSERVED_CAP: usize = 4096;
+
+impl AttestedNetworkHead {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A clonable handle to the shared observed-candidate record, wired into the producer
+    /// gate via [`BlockProducer::with_network_height_gate`] and updated at the block-receive
+    /// sites through [`AttestedNetworkHead::observe`].
+    pub fn handle(&self) -> Arc<AttestedInner> {
+        self.inner.clone()
+    }
+
+    /// The current best attested-ahead height (monitor/telemetry surface). NOTE: this is
+    /// the raw lifetime max, NOT the gate's ahead measure (which is fork-choice-relative).
+    #[allow(dead_code)]
+    pub fn best(&self) -> u64 {
+        self.inner.best.load(Ordering::SeqCst)
+    }
+
+    /// F2: fold a received peer block into the observed-candidate record IFF it is a
+    /// validly-signed header that binds its own hash AND chains to a block we hold, one
+    /// height above it. Returns true when it counted. The block is recorded as a CANDIDATE
+    /// only — whether it counts as "ahead" is decided per-round by the gate against the live
+    /// fork-choice head (VERIFY-255-F2-H1), so recording a side/losing-branch block here is
+    /// harmless (it will never descend from the selected head).
+    pub fn observe(&self, storage: &StorageManager, block: &Block) -> bool {
+        match Self::attested_height(storage, block) {
+            Some(h) => {
+                self.inner.best.fetch_max(h, Ordering::SeqCst);
+                let mut obs = self.inner.observed.lock();
+                obs.insert(block.header.block_hash, h);
+                // Stay bounded: evict the lowest-height candidate on overflow. The gate
+                // also prunes at/below the finalized floor on every recompute.
+                while obs.len() > ATTESTED_OBSERVED_CAP {
+                    if let Some(min_hash) =
+                        obs.iter().min_by_key(|(_, ht)| **ht).map(|(k, _)| *k)
+                    {
+                        obs.remove(&min_hash);
+                    } else {
+                        break;
+                    }
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The signature + ancestry check. `Some(height)` iff the block is attested-ahead
+    /// evidence per the rules on [`AttestedNetworkHead`]; `None` otherwise.
+    fn attested_height(storage: &StorageManager, block: &Block) -> Option<u64> {
+        let hardening = PbaHardening::from_process();
+        // (1) the header binds its own hash — reject a forged height/parent.
+        if !block.verify_hash_for(hardening) {
+            return None;
+        }
+        // (2) valid proposer signature over the block hash.
+        if !matches!(crypto::verify_block_signature(block), Ok(true)) {
+            return None;
+        }
+        // (3) chains (parentHash ancestry) to a block WE HOLD, one height above it.
+        let parent_hash = block.header.selected_parent_hash;
+        if parent_hash == Hash::default() {
+            // genesis / rootless header: not evidence the network is AHEAD of us.
+            return None;
+        }
+        let parent = storage.blocks.get_block(&parent_hash).ok().flatten()?;
+        if block.header.height != parent.header.height.saturating_add(1) {
+            return None;
+        }
+        Some(block.header.height)
+    }
+}
+
+/// M1 (VERIFY-255-F2-M1): read-only snapshot of the F2 catch-up gate for the node's
+/// ops/status surface (a Prometheus gauge and/or a status RPC field). Carries no handles,
+/// so it is safe to expose read-only.
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(dead_code)] // read via `status_snapshot()` (tests + future status-RPC wiring); the
+                    // live ops surface is the `citrate_producer_catchup_*` metrics gauges.
+pub struct CatchupGateStatus {
+    /// Whether the network-height half of the gate is wired at all.
+    pub enabled: bool,
+    /// True while the producer is in the refuse band (skipping slots because it is behind).
+    pub refusing: bool,
+    /// True while a >stall-window no-progress refusal has latched production OFF (needs the
+    /// local-admin override to resume).
+    pub alert_latched: bool,
+    /// The fork-choice-relative attested-ahead watermark the last evaluation used.
+    pub attested_ahead: u64,
+    /// The applied tip the last evaluation compared against.
+    pub applied_tip: u64,
+    /// `attested_ahead - applied_tip` (0 when caught up).
+    pub gap: u64,
+}
+
+impl ProduceCatchupGate {
+    /// VERIFY-255-F2-H1: RE-DERIVE the "ahead" watermark against the LIVE fork-choice head.
+    ///
+    /// `selected` is the current fork-choice-selected tip `(hash, height)` — GhostDAG's
+    /// `select_tip`, resolved to a height via storage — or `None` when there is no selected
+    /// tip yet (fresh / un-hydrated node ⇒ no evidence the network is ahead). The watermark
+    /// becomes `max(selected_height, highest attested CANDIDATE that still descends from the
+    /// selected head)` and is `store`d into `attested_ahead` (NOT `fetch_max`ed), so:
+    ///   * an attacker's signed side branch off a parent we hold, or an honest LOSING branch
+    ///     whose height exceeds the (lower blue-score) canonical head, does NOT descend from
+    ///     the selected head ⇒ never counts (fixes (a) and (b));
+    ///   * a reorg that moves the selected head re-bases the watermark for free (the old
+    ///     branch's candidates stop descending from the new head);
+    ///   * there is no monotonic lifetime max to strand an honest producer above its chain.
+    /// Candidates at/below the finalized floor are pruned in passing (bounded record).
+    /// No-op unless both the candidate record and the scratch watermark are wired.
+    fn recompute_attested_ahead(&self, selected: Option<(Hash, u64)>, storage: &StorageManager) {
+        let (Some(scratch), Some(observed)) =
+            (self.attested_ahead.as_ref(), self.attested_observed.as_ref())
+        else {
+            return;
+        };
+        let floor = self
+            .finalized_floor
+            .as_ref()
+            .map(|f| f.load(Ordering::SeqCst))
+            .unwrap_or(0);
+        let (sel_hash, sel_height) = match selected {
+            Some(s) => s,
+            None => {
+                // No selected tip ⇒ we have no fork-choice line to be "behind" on.
+                scratch.store(0, Ordering::SeqCst);
+                return;
+            }
+        };
+        let mut best = sel_height;
+        let mut obs = observed.observed.lock();
+        // Prune anything the finalized floor has passed — it can never be ahead again.
+        obs.retain(|_, ht| *ht > floor);
+        // VERIFY-255-P1 (perf): a SINGLE shared "reaches-head / doesn't-reach-head" memo
+        // for the whole round. The old code re-walked `selected_parent` links SEPARATELY
+        // per candidate (O(n²) storage reads over n held candidates, all under the applied-
+        // tip lock). Side-branch candidates never raise `best`, so every one of them used
+        // to be walked in full. With the memo each node's ancestry verdict is computed once
+        // and reused: a walk that reaches an already-decided node short-circuits, so the
+        // whole recompute visits each held node at most once ⇒ O(n). The verdict per
+        // candidate is IDENTICAL to the old per-candidate walk (see
+        // `p1_memoized_matches_per_candidate_reference`), so the gate's semantics are
+        // unchanged; only the cost is.
+        let mut memo: HashMap<Hash, bool> = HashMap::new();
+        for (hash, ht) in obs.iter() {
+            if *ht <= best {
+                continue;
+            }
+            if Self::descends_from_memo(storage, *hash, sel_hash, sel_height, floor, &mut memo) {
+                best = *ht;
+            }
+        }
+        scratch.store(best, Ordering::SeqCst);
+    }
+
+    /// VERIFY-255-P1: the O(n) memoized form of the descent check. Walks `start`'s
+    /// selected-parent ancestry (through blocks WE HOLD) and reports whether it passes
+    /// through `target` (the fork-choice head), memoizing EVERY node visited on the way in
+    /// `memo` (`hash -> reaches-target`). A later candidate whose chain hits an already-
+    /// memoized node stops there and reuses that verdict, so across a whole recompute each
+    /// distinct held node is visited at most once. The stop conditions are identical to the
+    /// non-memoized reference [`Self::descends_from`]: `true` on reaching `target`; `false`
+    /// on dropping to/below `target_height` or the finalized `floor` without matching, on a
+    /// block we do not hold, or on reaching the genesis root. The per-walk step cap still
+    /// bounds a single corrupt-parent loop (a cycle never resolves, so it hits the cap).
+    fn descends_from_memo(
+        storage: &StorageManager,
+        start: Hash,
+        target: Hash,
+        target_height: u64,
+        floor: u64,
+        memo: &mut HashMap<Hash, bool>,
+    ) -> bool {
+        if let Some(&verdict) = memo.get(&start) {
+            return verdict;
+        }
+        // Nodes on the current chain whose verdict equals the terminal result; filled in
+        // once the walk resolves so future candidates crossing them short-circuit.
+        let mut path: Vec<Hash> = Vec::new();
+        let mut cursor = start;
+        // A generous cap: far beyond any legitimate unapplied lead, so a corrupt parent
+        // pointer loop can never spin the producer.
+        let result = loop {
+            if let Some(&verdict) = memo.get(&cursor) {
+                // Reached an already-decided node: the whole path shares its verdict.
+                break verdict;
+            }
+            if cursor == target {
+                break true;
+            }
+            if cursor == Hash::default() {
+                break false; // reached the genesis root without meeting the target.
+            }
+            if path.len() >= 100_000 {
+                break false; // corrupt-parent loop guard (matches the reference cap).
+            }
+            let Some(block) = storage.blocks.get_block(&cursor).ok().flatten() else {
+                break false; // ancestry not fully held ⇒ cannot prove it extends the head.
+            };
+            let h = block.header.height;
+            if h <= target_height || h <= floor {
+                // Dropped to/below the selected head's height (or the floor) without
+                // meeting it: on a sibling / side / losing branch, not above the head.
+                break false;
+            }
+            path.push(cursor);
+            cursor = block.header.selected_parent_hash;
+        };
+        for node in path {
+            memo.insert(node, result);
+        }
+        result
+    }
+
+    /// VERIFY-255-P1 reference: the ORIGINAL per-candidate descent walk (no shared memo),
+    /// retained under `cfg(test)` as the oracle the O(n) memoized path is checked against by
+    /// `p1_memoized_matches_per_candidate_reference`. Not used in production.
+    #[cfg(test)]
+    fn descends_from(
+        storage: &StorageManager,
+        start: Hash,
+        target: Hash,
+        target_height: u64,
+        floor: u64,
+    ) -> bool {
+        let mut cursor = start;
+        for _ in 0..100_000u32 {
+            if cursor == target {
+                return true;
+            }
+            if cursor == Hash::default() {
+                return false; // reached the genesis root without meeting the target.
+            }
+            let Some(block) = storage.blocks.get_block(&cursor).ok().flatten() else {
+                return false; // ancestry not fully held ⇒ cannot prove it extends the head.
+            };
+            let h = block.header.height;
+            if h <= target_height || h <= floor {
+                return false;
+            }
+            cursor = block.header.selected_parent_hash;
+        }
+        false
+    }
+
+    /// M1 (VERIFY-255-F2-M1): a read-only snapshot of the gate state for the ops/status
+    /// surface — producing vs refusing (with the current gap), whether the stall alert is
+    /// latched, and the watermark + applied tip it was computed from.
+    #[allow(dead_code)]
+    pub fn status_snapshot(&self) -> CatchupGateStatus {
+        let attested = self
+            .attested_ahead
+            .as_ref()
+            .map(|a| a.load(Ordering::SeqCst))
+            .unwrap_or(0);
+        let st = self.behind.lock();
+        CatchupGateStatus {
+            enabled: self.attested_ahead.is_some(),
+            refusing: st.refusing,
+            alert_latched: self.stall_alert.load(Ordering::SeqCst) || st.stalled_latch,
+            attested_ahead: attested,
+            applied_tip: st.last_applied_tip,
+            gap: attested.saturating_sub(st.last_applied_tip),
+        }
+    }
+
+    /// F2: decide whether the node is too far BEHIND its peers to seal this slot.
+    /// `local_tip` is the node's applied-tip height (read under the same advance lock
+    /// the producer holds for its build). Returns `Err` to make the producer REFRAIN.
+    ///
+    /// Hysteresis: enter the refuse band when `attested - local_tip > REFUSE_GAP`,
+    /// leave it only at `<= RESUME_GAP`. If refusing for `stall_alert_after` with no
+    /// applied-tip advance, raise the alert and latch OFF until the human override.
+    fn evaluate_network_height(&self, local_tip: u64) -> anyhow::Result<()> {
+        let Some(attested) = self.attested_ahead.as_ref() else {
+            return Ok(()); // F2 disabled ⇒ plain #126 gate.
+        };
+        let attested = attested.load(Ordering::SeqCst);
+        let gap = attested.saturating_sub(local_tip);
+        let mut st = self.behind.lock();
+
+        // Human-in-command override always wins: clear the stall latch and resume.
+        //
+        // VERIFY-255-F2-M1: the override is a ONE-SHOT "resume now" command, not a switch
+        // that disables the gate until restart. Consume it here (store false back) so the
+        // next round re-evaluates normally: if the node is genuinely still behind it will
+        // re-engage rather than silently forking. Every use is logged.
+        if self.override_resume.swap(false, Ordering::SeqCst) {
+            warn!(
+                "F2/#126: human-in-command catch-up override CONSUMED — resuming block \
+                 production this round (was {gap} block(s) behind, applied_tip={local_tip}, \
+                 attested_ahead={attested}). The override auto-clears; the gate re-evaluates \
+                 next round."
+            );
+            st.refusing = false;
+            st.stalled_latch = false;
+            st.last_applied_tip = local_tip;
+            st.last_progress = Instant::now();
+            self.stall_alert.store(false, Ordering::SeqCst);
+            return Ok(());
+        }
+
+        // Sync progress (the applied tip advanced) resets the stall timer.
+        if local_tip > st.last_applied_tip {
+            st.last_applied_tip = local_tip;
+            st.last_progress = Instant::now();
+        }
+
+        // Once a no-progress stall has latched, ONLY the override (above) resumes —
+        // never auto-resume, even if the gap happens to close afterwards.
+        if st.stalled_latch {
+            return Err(anyhow::anyhow!(
+                "F2/#126: refusing to produce — behind the network by {gap} block(s) and STALLED \
+                 (no sync progress for over {}s). A human-in-command override is required to \
+                 resume; auto-resume after a stall is disabled so a partitioned/wedged node \
+                 cannot silently fork the fleet.",
+                self.stall_alert_after.as_secs()
+            ));
+        }
+
+        // Hysteresis on the gap to the best attested-ahead head.
+        if st.refusing {
+            if gap <= CATCHUP_RESUME_GAP {
+                st.refusing = false;
+                self.stall_alert.store(false, Ordering::SeqCst);
+                return Ok(());
+            }
+        } else if gap > CATCHUP_REFUSE_GAP {
+            st.refusing = true;
+            st.last_applied_tip = local_tip;
+            st.last_progress = Instant::now();
+        }
+
+        if !st.refusing {
+            return Ok(());
+        }
+
+        // Refusing: raise the stall alert + latch after `stall_alert_after` with no
+        // applied-tip progress.
+        if st.last_progress.elapsed() >= self.stall_alert_after {
+            st.stalled_latch = true;
+            self.stall_alert.store(true, Ordering::SeqCst);
+            error!(
+                "F2/#126 STALL ALERT: block production refused for over {}s with NO sync progress \
+                 while {gap} block(s) behind the network (attested_ahead={attested}, \
+                 applied_tip={local_tip}). Production is LATCHED OFF until a human-in-command \
+                 override.",
+                self.stall_alert_after.as_secs()
+            );
+            return Err(anyhow::anyhow!(
+                "F2/#126: refusing to produce — {gap} block(s) behind the network and stalled \
+                 >{}s; human-in-command override required to resume.",
+                self.stall_alert_after.as_secs()
+            ));
+        }
+
+        Err(anyhow::anyhow!(
+            "F2/#126: refusing to produce — this node is {gap} block(s) behind the network's best \
+             attested (validly-signed, chain-descending) head {attested} vs applied tip \
+             {local_tip}. Skipping this slot until sync catches up (resume at gap <= {}).",
+            CATCHUP_RESUME_GAP
+        ))
+    }
 }
 
 /// Block producer for mining new blocks
@@ -1018,8 +1507,72 @@ impl BlockProducer {
         self.produce_gate = Some(ProduceCatchupGate {
             rebuild_in_progress: app.rebuild_in_progress_handle(),
             dag_hydrated: app.dag_hydrated_handle(),
+            attested_ahead: None,
+            behind: Arc::new(Mutex::new(CatchupBehindState::default())),
+            override_resume: Arc::new(AtomicBool::new(false)),
+            stall_alert: Arc::new(AtomicBool::new(false)),
+            stall_alert_after: CATCHUP_STALL_ALERT,
+            attested_observed: None,
+            // VERIFY-255-F2-H1: the reorg floor is the applicator's finalized height, so a
+            // candidate below finality is never treated as "ahead".
+            finalized_floor: Some(app.finalized_height_handle()),
         });
         self
+    }
+
+    /// F2 (network-height catch-up gate): wire the [`AttestedNetworkHead`] observed-candidate
+    /// record so the producer additionally refuses to seal while this node is BEHIND its
+    /// peers ON THE FORK-CHOICE-SELECTED CHAIN (see
+    /// [`ProduceCatchupGate::recompute_attested_ahead`] + [`Self::evaluate_network_height`]).
+    /// Extends the #126 gate; must be chained AFTER [`Self::with_produce_catchup_gate`].
+    /// No-op if the #126 gate is not wired.
+    ///
+    /// VERIFY-255-F2-H1: the gate's `attested_ahead` becomes a per-round SCRATCH watermark
+    /// that `recompute_attested_ahead` overwrites (`store`, not a lifetime `fetch_max`) with
+    /// the max attested height that still descends from the live selected head — so a
+    /// side/losing branch never pins it and a reorg re-bases it.
+    pub fn with_network_height_gate(mut self, attested: &AttestedNetworkHead) -> Self {
+        if let Some(gate) = self.produce_gate.as_mut() {
+            gate.attested_ahead = Some(Arc::new(AtomicU64::new(0)));
+            gate.attested_observed = Some(attested.handle());
+        }
+        self
+    }
+
+    /// M1 (VERIFY-255-F2-M1): share the human-in-command override flag with a LOCAL admin
+    /// channel (a loopback-bound, operator-token-authenticated RPC method — never the public
+    /// RPC). Setting the flag resumes production for exactly one round; the gate consumes it
+    /// (auto-clears) on the next resume. Must be chained AFTER [`Self::with_produce_catchup_gate`].
+    pub fn with_catchup_override(mut self, flag: Arc<AtomicBool>) -> Self {
+        if let Some(gate) = self.produce_gate.as_mut() {
+            gate.override_resume = flag;
+        }
+        self
+    }
+
+    /// F2: shrink the no-progress stall-alert window (tests only; production uses the
+    /// [`CATCHUP_STALL_ALERT`] default).
+    #[allow(dead_code)]
+    pub fn with_catchup_stall_alert_after(mut self, after: Duration) -> Self {
+        if let Some(gate) = self.produce_gate.as_mut() {
+            gate.stall_alert_after = after;
+        }
+        self
+    }
+
+    /// F2: the surfaced stall-alert flag (true while production is latched OFF after a
+    /// >60s no-progress stall). The monitor/RPC reads this to page a human (ops surface
+    /// wired to the RPC in a follow-up).
+    #[allow(dead_code)]
+    pub fn catchup_alert_handle(&self) -> Option<Arc<AtomicBool>> {
+        self.produce_gate.as_ref().map(|g| g.stall_alert.clone())
+    }
+
+    /// F2: the human-in-command override flag — set true to resume production after a
+    /// stall alert (ops surface wired to the RPC in a follow-up).
+    #[allow(dead_code)]
+    pub fn catchup_override_handle(&self) -> Option<Arc<AtomicBool>> {
+        self.produce_gate.as_ref().map(|g| g.override_resume.clone())
     }
 
     /// VALIDATOR-S1 (v5): if `height` is a snapshot boundary S(E), rebuild the shared
@@ -1144,6 +1697,33 @@ impl BlockProducer {
 
     /// Produce a single block
     async fn produce_block(&self) -> anyhow::Result<Hash> {
+        // VERIFY-255-P1 (perf): RE-DERIVE the F2 attested-ahead watermark BEFORE acquiring
+        // the applied-tip lock. The recompute reads only the fork-choice-selected head, the
+        // shared candidate record, and storage — none of which require that lock — and its
+        // descent walk is now O(n) in held candidates (a single shared memo per round). The
+        // receive-path applier (`CanonicalApplicator::apply_received`) takes the SAME lock,
+        // so doing the walk off the lock means a large held side branch (a validator or a
+        // long orphaned branch, up to the 4,096 candidate cap) can never block block
+        // application while the producer measures how far behind it is. The verdict lands in
+        // the gate's atomic watermark, which `evaluate_network_height` reads below under the
+        // lock. Semantics are unchanged: the watermark is re-derived every round and counts
+        // only candidates that still descend from the live selected head.
+        if let Some(gate) = self.produce_gate.as_ref() {
+            if gate.attested_observed.is_some() {
+                let selected = match self.ghostdag.select_tip().await {
+                    Ok(hash) => self
+                        .storage
+                        .blocks
+                        .get_block(&hash)
+                        .ok()
+                        .flatten()
+                        .map(|b| (hash, b.header.height)),
+                    Err(_) => None,
+                };
+                gate.recompute_attested_ahead(selected, &self.storage);
+            }
+        }
+
         // EXECUTE-ON-RECEIVE (step 2): hold the shared state-advance lock across the
         // whole build. The receive-path applier (`CanonicalApplicator::apply_received`)
         // takes the same lock, so production and reception never concurrently mutate the
@@ -1232,6 +1812,40 @@ impl BlockProducer {
                     ));
                 }
             }
+            // F2 — NETWORK-HEIGHT CATCH-UP. Refuse to seal while this node is BEHIND its
+            // peers, judged ONLY from the best VALIDLY-SIGNED, CHAIN-DESCENDING peer head
+            // (never a self-reported Hello height / sync target). `local_tip` is read from
+            // the applied-tip lock we already hold for the whole build (0 in the legacy /
+            // no-lock path, where `attested_ahead` is also never wired ⇒ inert). Strictly
+            // additive: this only ever makes the producer REFRAIN.
+            let local_tip = applied_guard
+                .as_ref()
+                .map(|g| g.tip().height)
+                .unwrap_or(0);
+            // VERIFY-255-F2-H1: the attested-ahead watermark was RE-DERIVED against the LIVE
+            // fork-choice-selected head at the top of this method — GhostDAG's `select_tip`
+            // (the SAME authority the drain reorgs toward), resolved to a height via storage.
+            // A candidate counts only while it still descends from that head, so an attacker
+            // side branch or an honest losing branch never inflates the gap, and a reorg
+            // re-bases the measure. VERIFY-255-P1: that recompute now runs OFF this lock (it
+            // needs only storage + the candidate record), so only the cheap evaluation and
+            // status publish below stay under the lock.
+            let gate_result = gate.evaluate_network_height(local_tip);
+            // VERIFY-255-F2-M1: publish the gate's read-only status to the loopback ops/
+            // metrics surface every round (producing vs refusing(gap) vs alert-latched, plus
+            // the watermark + applied tip), so the fleet monitor can see WHY a producer is
+            // skipping slots. Only while F2 is wired.
+            if let Some(scratch) = gate.attested_ahead.as_ref() {
+                let attested_now = scratch.load(Ordering::SeqCst);
+                citrate_api::metrics_server::update_producer_catchup_status(
+                    gate_result.is_err(),
+                    gate.stall_alert.load(Ordering::SeqCst),
+                    attested_now.saturating_sub(local_tip),
+                    attested_now,
+                    local_tip,
+                );
+            }
+            gate_result?;
         }
 
         if let Some(guard) = applied_guard.as_ref() {
@@ -4824,6 +5438,713 @@ mod tests {
             "follower and the producer it agrees with must be on the same applied block"
         );
     }
+
+    // =====================================================================
+    // F2 (2026-09-28): PRODUCER NETWORK-HEIGHT CATCH-UP GATE.
+    //
+    // Extends the #126 producer seal gate so a node that is BEHIND its peers
+    // refuses to seal. "Behind" is measured ONLY from `AttestedNetworkHead` —
+    // the highest peer block height that (1) binds its own hash, (2) carries a
+    // valid proposer signature, and (3) chains (parentHash ancestry) to a block
+    // we hold, one height above it. It NEVER reads `PeerInfo.head_height` (a
+    // once-set self-reported Hello field) or `SyncManager.target_height` (a
+    // liar-controlled MAX of claims). 0 peers / no attested-ahead header => not
+    // behind => a lone post-reroll producer seals normally. Hysteresis:
+    // refuse when gap > REFUSE_GAP (3), resume only at <= RESUME_GAP (1). A
+    // >stall-window refusal with NO sync progress alerts + latches OFF until a
+    // human-in-command override. Strictly additive: only ever makes the
+    // producer REFRAIN; no block-validity change; no activation height.
+    // =====================================================================
+
+    /// Build a v2 block at `height` off `parent`, hash-bound for the live
+    /// hardening, optionally signed by `sign` (whose verifying key is set as the
+    /// proposer, so `verify_block_signature` passes).
+    fn f2_block(
+        height: u64,
+        parent: Hash,
+        sign: Option<&Ed25519SigningKey>,
+    ) -> Block {
+        let proposer = match sign {
+            Some(sk) => PublicKey::new(sk.verifying_key().to_bytes()),
+            None => PublicKey::new([0x11; 32]),
+        };
+        let mut b = BlockBuilder::new()
+            .version(2)
+            .height(height)
+            .parent(parent)
+            .coinbase([0x33; 20])
+            .timestamp(1000 + height)
+            .proposer(proposer)
+            .vrf_reveal(VrfProof {
+                proof: vec![1u8; 8],
+                output: Hash::new([0x5B; 32]),
+            })
+            .transactions(vec![])
+            .state_root(Hash::default())
+            .blue_score(height)
+            .blue_work(citrate_consensus::types::blue_work_for_score(height))
+            .build_unhashed();
+        b.header.block_hash = b.compute_hash_for(PbaHardening::from_process());
+        if let Some(sk) = sign {
+            b.signature = crypto::sign_block(&b.header.block_hash, sk);
+        }
+        b
+    }
+
+    /// Build a `ProduceCatchupGate` directly for the hysteresis / stall unit
+    /// tests (avoids `produce_block`'s tip-advancing side effects, so `local_tip`
+    /// is whatever the test passes to `evaluate_network_height`). `attested_observed`
+    /// is `None`, so `evaluate_network_height` reads the raw watermark the test sets —
+    /// exercising the state machine directly, independent of the H1 recompute.
+    fn f2_gate(attested: Arc<AtomicU64>, stall_after: Duration) -> ProduceCatchupGate {
+        ProduceCatchupGate {
+            rebuild_in_progress: Arc::new(AtomicBool::new(false)),
+            dag_hydrated: None,
+            attested_ahead: Some(attested),
+            behind: Arc::new(Mutex::new(CatchupBehindState::default())),
+            override_resume: Arc::new(AtomicBool::new(false)),
+            stall_alert: Arc::new(AtomicBool::new(false)),
+            stall_alert_after: stall_after,
+            attested_observed: None,
+            finalized_floor: None,
+        }
+    }
+
+    /// Produce a short canonical chain the producer OWNS, returning the fork-choice
+    /// head (`select_tip`) block at height `n`. Both `select_tip` and the applied tip
+    /// then sit at `n`, so an attested extension above `n` is genuinely "ahead".
+    async fn f2_own_chain_to(producer: &BlockProducer, storage: &StorageManager, n: u64) -> Block {
+        for _ in 0..n {
+            producer
+                .produce_block()
+                .await
+                .expect("seals its own canonical chain");
+        }
+        let head = producer
+            .ghostdag()
+            .select_tip()
+            .await
+            .expect("select_tip after producing a chain");
+        let head_blk = storage.blocks.get_block(&head).unwrap().unwrap();
+        assert_eq!(head_blk.header.height, n, "own chain must reach height {n}");
+        head_blk
+    }
+
+    /// TEST 1 — behind a GENUINE EXTENSION of our canonical chain. A peer delivers
+    /// validly-signed blocks that DESCEND FROM our fork-choice-selected head and lead it
+    /// by > REFUSE_GAP: the producer REFUSES. It RESUMES once the gap drops to
+    /// <= RESUME_GAP. VERIFY-255-F2-H1: "ahead" is measured against the fork-choice head,
+    /// so only an extension of the SELECTED chain (not any signed side branch) refuses.
+    #[tokio::test]
+    async fn f2_behind_one_attested_peer_refuses_then_resumes() {
+        let (_tmp, storage, _state_db, executor, mempool) = producer_fixture();
+        let app = Arc::new(crate::canonical_apply::CanonicalApplicator::new(
+            executor.clone(),
+            storage.clone(),
+        ));
+        let attested = AttestedNetworkHead::new();
+        let producer = test_producer(&storage, &executor, &mempool)
+            .with_v2_headers(true)
+            .with_applied_tip_lock(app.advance_lock())
+            .with_produce_catchup_gate(&app)
+            .with_network_height_gate(&attested);
+
+        // Own canonical chain to height 3: select_tip == applied tip == 3.
+        let head = f2_own_chain_to(&producer, &storage, 3).await;
+
+        // A peer delivers a GENUINE EXTENSION 4..=7 descending from our selected head.
+        // The watermark recomputes to 7; applied tip is 3 ⇒ gap 4 > REFUSE_GAP (3).
+        let sk = test_signing_key();
+        let mut parent = head.clone();
+        for h in 4..=7u64 {
+            let ext = f2_block(h, parent.header.block_hash, Some(&sk));
+            storage.blocks.put_block(&ext).expect("hold extension block");
+            assert!(
+                attested.observe(&storage, &ext),
+                "a validly-signed child of a held block is attested-ahead evidence"
+            );
+            parent = ext;
+        }
+
+        let err = producer
+            .produce_block()
+            .await
+            .expect_err("must refuse to seal while a genuine extension leads us by > REFUSE_GAP");
+        assert!(
+            err.to_string().contains("F2") && err.to_string().contains("behind the network"),
+            "the refusal must be the F2 catch-up gate, got: {err}"
+        );
+
+        // Sync adopts those blocks so they are no longer AHEAD of the head we produce on:
+        // the attested candidates fall away, the gap closes to <= RESUME_GAP and the
+        // producer resumes (hysteresis).
+        attested.handle().observed.lock().clear();
+        producer
+            .produce_block()
+            .await
+            .expect("produces once within RESUME_GAP of the selected head");
+    }
+
+    /// TEST 2 — Hello-lie(+1000). A peer that merely CLAIMS a head 1000 ahead
+    /// (a Hello, or a signed header that JUMPS height) never moves the gate: the
+    /// gate consults only attested, chain-linked blocks, never a self-reported height,
+    /// so the producer keeps sealing.
+    #[tokio::test]
+    async fn f2_hello_lie_advertised_height_is_ignored() {
+        let (_tmp, storage, _state_db, executor, mempool) = producer_fixture();
+        let app = Arc::new(crate::canonical_apply::CanonicalApplicator::new(
+            executor.clone(),
+            storage.clone(),
+        ));
+        let attested = AttestedNetworkHead::new();
+        let producer = test_producer(&storage, &executor, &mempool)
+            .with_applied_tip_lock(app.advance_lock())
+            .with_produce_catchup_gate(&app)
+            .with_network_height_gate(&attested);
+
+        // (a) A bare Hello claim delivers no signed, chain-linked block, so
+        //     nothing is ever observed: the record stays empty.
+        assert_eq!(attested.best(), 0);
+
+        // (b) The "+1000" made concrete as a validly-signed block that JUMPS to
+        //     height 1000 off a held height-0 parent. Height continuity
+        //     (height == parent.height + 1) rejects it, so it is NOT counted.
+        let sk = test_signing_key();
+        let parent0 = f2_block(0, Hash::default(), None);
+        storage.blocks.put_block(&parent0).expect("hold parent@0");
+        let jump = f2_block(1000, parent0.header.block_hash, Some(&sk));
+        assert!(
+            !attested.observe(&storage, &jump),
+            "a height-jumping signed header must NOT become attested evidence"
+        );
+        assert_eq!(attested.best(), 0, "a +1000 claim never moves the gate");
+
+        producer
+            .produce_block()
+            .await
+            .expect("seals normally: a self-reported +1000 head is not attested evidence");
+    }
+
+    /// TEST 3 — signed-fork-header. A validly-signed header whose parent we do
+    /// NOT hold (it forks off an unknown block) is NOT attested-ahead evidence,
+    /// so the producer keeps sealing.
+    #[tokio::test]
+    async fn f2_signed_fork_header_off_unknown_parent_is_not_attested() {
+        let (_tmp, storage, _state_db, executor, mempool) = producer_fixture();
+        let app = Arc::new(crate::canonical_apply::CanonicalApplicator::new(
+            executor.clone(),
+            storage.clone(),
+        ));
+        let attested = AttestedNetworkHead::new();
+        let producer = test_producer(&storage, &executor, &mempool)
+            .with_applied_tip_lock(app.advance_lock())
+            .with_produce_catchup_gate(&app)
+            .with_network_height_gate(&attested);
+
+        // A perfectly-signed, hash-bound block at height 9 — but its parent
+        // (0xEE..) is a block we have never seen. No ancestry to a held block.
+        let sk = test_signing_key();
+        let fork = f2_block(9, Hash::new([0xEE; 32]), Some(&sk));
+        assert!(fork.verify_hash_for(PbaHardening::from_process()));
+        assert!(matches!(
+            citrate_consensus::crypto::verify_block_signature(&fork),
+            Ok(true)
+        ));
+        assert!(
+            !attested.observe(&storage, &fork),
+            "a signed header off an unknown parent is not chain-descending evidence"
+        );
+        assert_eq!(attested.best(), 0);
+
+        producer
+            .produce_block()
+            .await
+            .expect("seals normally: an unrooted signed fork header is not attested evidence");
+    }
+
+    /// TEST 4 — 0-peers. No attested-ahead header at all (a lone post-reroll
+    /// producer): the node is not behind and seals normally.
+    #[tokio::test]
+    async fn f2_zero_peers_produces_normally() {
+        let (_tmp, storage, _state_db, executor, mempool) = producer_fixture();
+        let app = Arc::new(crate::canonical_apply::CanonicalApplicator::new(
+            executor.clone(),
+            storage.clone(),
+        ));
+        let attested = AttestedNetworkHead::new();
+        let producer = test_producer(&storage, &executor, &mempool)
+            .with_applied_tip_lock(app.advance_lock())
+            .with_produce_catchup_gate(&app)
+            .with_network_height_gate(&attested);
+
+        assert_eq!(attested.best(), 0, "no peers, no evidence");
+        producer
+            .produce_block()
+            .await
+            .expect("a lone producer with no attested-ahead peers seals normally");
+    }
+
+    /// TEST 5 — boundary-flapping. Hysteresis: enter the refuse band above
+    /// REFUSE_GAP, leave it only at/below RESUME_GAP; a gap oscillating in the
+    /// deadband (RESUME, REFUSE] does NOT toggle production.
+    #[test]
+    fn f2_boundary_flapping_hysteresis_no_toggle() {
+        assert!(CATCHUP_RESUME_GAP < CATCHUP_REFUSE_GAP, "deadband must be non-empty");
+        let attested = Arc::new(AtomicU64::new(0));
+        let gate = f2_gate(attested.clone(), Duration::from_secs(3600)); // no stalls here
+        let local_tip = 0u64;
+        let refuses = |g: u64| {
+            attested.store(g, Ordering::SeqCst);
+            gate.evaluate_network_height(local_tip).is_err()
+        };
+
+        // gap 5 (> REFUSE_GAP): enter the refuse band.
+        assert!(refuses(5), "gap 5 must refuse");
+        // gap 4, then 2: still inside the deadband while already refusing.
+        assert!(refuses(4), "gap 4 must stay refusing (hysteresis)");
+        assert!(refuses(2), "gap 2 must stay refusing (still > RESUME_GAP)");
+        // gap 1 (<= RESUME_GAP): resume.
+        assert!(!refuses(1), "gap 1 must resume");
+        // gap 3 (<= REFUSE_GAP): stays producing — 3 is not > REFUSE_GAP.
+        assert!(!refuses(3), "gap 3 must NOT re-enter the refuse band");
+        // gap 4 (> REFUSE_GAP): re-enter.
+        assert!(refuses(4), "gap 4 must refuse again after producing");
+    }
+
+    /// TEST 6 — stalled-sync-alert. Refusing for > the stall window with NO sync
+    /// progress raises an ALERT (surfaced signal) and LATCHES production OFF; it
+    /// never auto-resumes — only the human-in-command override resumes it.
+    #[test]
+    fn f2_stalled_sync_alert_requires_human_override() {
+        let attested = Arc::new(AtomicU64::new(5)); // gap 5 vs tip 0
+        let gate = f2_gate(attested.clone(), Duration::from_millis(120));
+        let alert = gate.stall_alert.clone();
+        let over = gate.override_resume.clone();
+        let local_tip = 0u64;
+
+        // First round: refuses (behind), no alert yet.
+        assert!(gate.evaluate_network_height(local_tip).is_err());
+        assert!(!alert.load(Ordering::SeqCst), "no alert before the stall window");
+
+        // No sync progress for longer than the stall window.
+        std::thread::sleep(Duration::from_millis(180));
+        let err = gate
+            .evaluate_network_height(local_tip)
+            .expect_err("stalled while behind must keep refusing");
+        assert!(alert.load(Ordering::SeqCst), "the stall alert must be surfaced");
+        assert!(
+            err.to_string().contains("override"),
+            "the stall refusal must demand a human-in-command override, got: {err}"
+        );
+
+        // No auto-resume even if the gap now closes — the latch holds.
+        attested.store(0, Ordering::SeqCst);
+        assert!(
+            gate.evaluate_network_height(local_tip).is_err(),
+            "must NOT auto-resume after a stall latch, even at gap 0"
+        );
+
+        // Human-in-command override resumes and clears the alert.
+        over.store(true, Ordering::SeqCst);
+        assert!(
+            gate.evaluate_network_height(local_tip).is_ok(),
+            "the human override must resume production"
+        );
+        assert!(!alert.load(Ordering::SeqCst), "override clears the alert");
+    }
+
+    /// TEST 6b — sync progress resets the stall timer (never alerts while
+    /// catching up), and the producer resumes once within RESUME_GAP.
+    #[test]
+    fn f2_sync_progress_resets_stall_timer() {
+        let attested = Arc::new(AtomicU64::new(50));
+        let gate = f2_gate(attested.clone(), Duration::from_millis(120));
+        let alert = gate.stall_alert.clone();
+
+        // Behind by 50; refuse. Advance the applied tip repeatedly (sync
+        // progress) across more than one stall window: the timer keeps resetting
+        // and no alert fires.
+        for tip in [0u64, 10, 20, 30, 40] {
+            assert!(gate.evaluate_network_height(tip).is_err(), "still behind at tip {tip}");
+            std::thread::sleep(Duration::from_millis(60));
+            assert!(!alert.load(Ordering::SeqCst), "progress must reset the stall timer");
+        }
+        // Within RESUME_GAP now: resume cleanly, no override needed.
+        assert!(gate.evaluate_network_height(50).is_ok(), "resume once caught up");
+    }
+
+    /// TEST 7 — revert-check. The F2 gate must stay WIRED: `produce_block` calls
+    /// `evaluate_network_height`, and that check reads the attested watermark
+    /// (never `head_height` / `target_height`). Deleting the gate call or the
+    /// attested read turns this red — the same revert guard MAC's harness uses.
+    #[test]
+    fn f2_revert_check_gate_wired_and_uses_attested_not_selfreported() {
+        let src = include_str!("producer.rs");
+        let pb = src
+            .find("async fn produce_block(&self)")
+            .expect("produce_block present");
+        // Bound the body at the next method definition so the call must live
+        // INSIDE produce_block, not merely somewhere later in the file.
+        let after = &src[pb..];
+        let end = after[1..]
+            .find("\n    async fn ")
+            .or_else(|| after[1..].find("\n    fn "))
+            .map(|e| e + 1)
+            .unwrap_or(after.len());
+        let body = &after[..end];
+        assert!(
+            body.contains("evaluate_network_height(local_tip)"),
+            "produce_block must call the F2 network-height gate"
+        );
+        let ev = src
+            .find("fn evaluate_network_height(")
+            .expect("evaluate_network_height present");
+        let ebody = &src[ev..ev + 3000];
+        assert!(
+            ebody.contains("self.attested_ahead")
+                && ebody.contains("CATCHUP_REFUSE_GAP")
+                && ebody.contains("CATCHUP_RESUME_GAP"),
+            "the gate must judge behindness from the attested head with hysteresis"
+        );
+        assert!(
+            !ebody.contains("head_height") && !ebody.contains("target_height"),
+            "the gate must NEVER read PeerInfo.head_height or SyncManager.target_height"
+        );
+    }
+
+    /// Build a signed chain of `n` blocks on top of `base`, holding each in storage AND
+    /// recording it as an attested candidate (as the receive path does). Returns the tip.
+    /// These blocks are NOT added to GhostDAG, so `select_tip` is unaffected — exactly the
+    /// shape of a side/losing branch we hold headers for but that fork-choice has not
+    /// selected.
+    fn f2_signed_side_chain(
+        attested: &AttestedNetworkHead,
+        storage: &StorageManager,
+        base: &Block,
+        n: u64,
+        sk: &Ed25519SigningKey,
+    ) -> Block {
+        let mut parent = base.clone();
+        for _ in 0..n {
+            let b = f2_block(parent.header.height + 1, parent.header.block_hash, Some(sk));
+            storage.blocks.put_block(&b).expect("hold side block");
+            assert!(
+                attested.observe(storage, &b),
+                "a signed child of a held block is recorded as a candidate"
+            );
+            parent = b;
+        }
+        parent
+    }
+
+    /// VERIFY-255-F2-H1 acceptance (a): a validator's signed SIDE FORK off a parent we hold
+    /// — 6 admitted blocks that do NOT descend from our fork-choice-selected head — must
+    /// NOT make an honest producer refuse. Under the old lifetime `fetch_max` watermark it
+    /// pinned the gap at +6 and latched the fleet OFF forever; measured against the selected
+    /// head it never counts.
+    #[tokio::test]
+    async fn f2_h1_signed_side_branch_off_held_parent_does_not_refuse() {
+        let (_tmp, storage, _state_db, executor, mempool) = producer_fixture();
+        let app = Arc::new(crate::canonical_apply::CanonicalApplicator::new(
+            executor.clone(),
+            storage.clone(),
+        ));
+        let attested = AttestedNetworkHead::new();
+        let producer = test_producer(&storage, &executor, &mempool)
+            .with_v2_headers(true)
+            .with_applied_tip_lock(app.advance_lock())
+            .with_produce_catchup_gate(&app)
+            .with_network_height_gate(&attested);
+
+        // Own canonical chain to height 3 (select_tip == applied tip == 3).
+        let _head = f2_own_chain_to(&producer, &storage, 3).await;
+        // Fork off an EARLIER held block (height 1): 6 signed side-branch blocks (tip @7).
+        let base1_hash = storage
+            .blocks
+            .get_block_by_height(1)
+            .unwrap()
+            .expect("hold block @1");
+        let base1 = storage.blocks.get_block(&base1_hash).unwrap().unwrap();
+        let attacker = Ed25519SigningKey::from_bytes(&[0x5E; 32]);
+        let side_tip = f2_signed_side_chain(&attested, &storage, &base1, 6, &attacker);
+        assert_eq!(side_tip.header.height, 7, "side fork reaches height 7");
+        assert_eq!(
+            attested.best(),
+            7,
+            "the raw lifetime max IS 7 (the candidates were recorded) — the fix is that the \
+             GATE does not use it"
+        );
+
+        // The honest producer must still seal: the side fork does not descend from the
+        // selected head @3, so it is NOT ahead.
+        producer
+            .produce_block()
+            .await
+            .expect("VERIFY-255-F2-H1 (a): a signed side fork must NOT halt the honest producer");
+    }
+
+    /// VERIFY-255-F2-H1 acceptance (b): an honest but LOSING branch whose height (9) exceeds
+    /// the canonical head (5) — GhostDAG's canonical head is routinely LOWER than a longer
+    /// losing branch — must NOT make the producer refuse. The losing branch does not descend
+    /// from the selected head, so it never counts; no attacker required.
+    #[tokio::test]
+    async fn f2_h1_losing_branch_above_canonical_does_not_refuse() {
+        let (_tmp, storage, _state_db, executor, mempool) = producer_fixture();
+        let app = Arc::new(crate::canonical_apply::CanonicalApplicator::new(
+            executor.clone(),
+            storage.clone(),
+        ));
+        let attested = AttestedNetworkHead::new();
+        let producer = test_producer(&storage, &executor, &mempool)
+            .with_v2_headers(true)
+            .with_applied_tip_lock(app.advance_lock())
+            .with_produce_catchup_gate(&app)
+            .with_network_height_gate(&attested);
+
+        // Canonical chain to height 5 (select_tip == applied tip == 5).
+        let _head = f2_own_chain_to(&producer, &storage, 5).await;
+        // A longer LOSING branch off block @1 reaching height 9.
+        let base1_hash = storage
+            .blocks
+            .get_block_by_height(1)
+            .unwrap()
+            .expect("hold block @1");
+        let base1 = storage.blocks.get_block(&base1_hash).unwrap().unwrap();
+        let k = Ed25519SigningKey::from_bytes(&[0x42; 32]);
+        let losing_tip = f2_signed_side_chain(&attested, &storage, &base1, 8, &k);
+        assert_eq!(losing_tip.header.height, 9, "losing branch reaches height 9");
+        assert_eq!(attested.best(), 9, "raw lifetime max is 9 (candidates recorded)");
+
+        // Canonical head is 5; the losing branch at 9 does not descend from it, so gap == 0.
+        producer.produce_block().await.expect(
+            "VERIFY-255-F2-H1 (b): a longer losing branch must NOT halt production on the \
+             (lower) canonical head",
+        );
+    }
+
+    /// VERIFY-255-F2-M1: the human-in-command override is ONE-SHOT — it resumes exactly one
+    /// round and auto-clears, so a still-behind node re-engages the gate rather than being
+    /// silently disabled until restart.
+    #[test]
+    fn f2_m1_override_auto_clears_after_one_resume() {
+        let attested = Arc::new(AtomicU64::new(50)); // gap 50 vs tip 0
+        let gate = f2_gate(attested.clone(), Duration::from_secs(3600));
+        let over = gate.override_resume.clone();
+        let tip = 0u64;
+
+        assert!(gate.evaluate_network_height(tip).is_err(), "behind ⇒ refuse");
+        over.store(true, Ordering::SeqCst);
+        assert!(
+            gate.evaluate_network_height(tip).is_ok(),
+            "override resumes this one round"
+        );
+        assert!(
+            !over.load(Ordering::SeqCst),
+            "the override auto-clears after the resume (one-shot, not latched)"
+        );
+        assert!(
+            gate.evaluate_network_height(tip).is_err(),
+            "still 50 behind and override consumed ⇒ the gate re-engages"
+        );
+    }
+
+    /// VERIFY-255-F2-M1: the read-only status snapshot reflects producing / refusing(gap) /
+    /// alert-latched plus the watermark + applied tip — the values the ops surface exposes.
+    #[test]
+    fn f2_m1_status_snapshot_reflects_gate_state() {
+        let attested = Arc::new(AtomicU64::new(10));
+        let gate = f2_gate(attested.clone(), Duration::from_millis(80));
+
+        // Caught up: producing.
+        assert!(gate.evaluate_network_height(10).is_ok());
+        let s = gate.status_snapshot();
+        assert!(s.enabled && !s.refusing && !s.alert_latched);
+        assert_eq!((s.attested_ahead, s.applied_tip, s.gap), (10, 10, 0));
+
+        // Behind by 6: refusing, gap surfaced.
+        assert!(gate.evaluate_network_height(4).is_err());
+        let s = gate.status_snapshot();
+        assert!(s.refusing, "status must show refusing while behind");
+        assert_eq!(s.gap, 6, "status must surface the current gap");
+
+        // Stall long enough with no progress: alert latched.
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(gate.evaluate_network_height(4).is_err());
+        assert!(
+            gate.status_snapshot().alert_latched,
+            "status must show the alert latched after a no-progress stall"
+        );
+    }
+
+    /// A catch-up gate with the H1 candidate record + scratch watermark wired (unlike
+    /// [`f2_gate`], which leaves `attested_observed` `None` to drive the hysteresis state
+    /// machine directly), so `recompute_attested_ahead` runs its real fork-choice-relative
+    /// descent against the shared observed-candidate record.
+    fn f2_observed_gate(att: &AttestedNetworkHead, floor: Option<u64>) -> ProduceCatchupGate {
+        ProduceCatchupGate {
+            rebuild_in_progress: Arc::new(AtomicBool::new(false)),
+            dag_hydrated: None,
+            attested_ahead: Some(Arc::new(AtomicU64::new(0))),
+            behind: Arc::new(Mutex::new(CatchupBehindState::default())),
+            override_resume: Arc::new(AtomicBool::new(false)),
+            stall_alert: Arc::new(AtomicBool::new(false)),
+            stall_alert_after: Duration::from_secs(3600),
+            attested_observed: Some(att.handle()),
+            finalized_floor: floor.map(|f| Arc::new(AtomicU64::new(f))),
+        }
+    }
+
+    /// VERIFY-255-P1 (perf): the fork-choice descent recompute over a FULL observed-candidate
+    /// set (the 4,096 cap) must complete well under the release budget. Before the fix the
+    /// descent was re-walked SEPARATELY per candidate (O(n²) storage reads, MAC's release
+    /// numbers: 182 ms @500, ~3.0 s @2,000, ~12.5 s @4,000) and it ran under the applied-tip
+    /// lock, so a large held side branch (a validator or a long orphaned branch) starved
+    /// block application. With the shared per-round memo the recompute visits each held node
+    /// at most once (O(n)); this asserts the release bound MAC re-verifies (< 50 ms), with a
+    /// generous debug ceiling that still fails hard if the O(n²) walk ever returns (188 s
+    /// debug @4,000 in MAC's evidence). The recompute is timed OUTSIDE any lock — it is
+    /// invoked off the applied-tip lock in `produce_block`.
+    #[tokio::test]
+    async fn r255_p1_recompute_over_full_candidate_set_is_fast() {
+        let (_tmp, storage, _state_db, executor, mempool) = producer_fixture();
+        let app = Arc::new(crate::canonical_apply::CanonicalApplicator::new(
+            executor.clone(),
+            storage.clone(),
+        ));
+        let attested = AttestedNetworkHead::new();
+        let producer = test_producer(&storage, &executor, &mempool)
+            .with_v2_headers(true)
+            .with_applied_tip_lock(app.advance_lock())
+            .with_produce_catchup_gate(&app)
+            .with_network_height_gate(&attested);
+
+        // Own canonical chain to height 3 (select_tip == applied tip == 3).
+        let head = f2_own_chain_to(&producer, &storage, 3).await;
+
+        // A long held SIDE branch off block @1 — the DoS shape: thousands of admitted,
+        // validly-signed, held blocks ABOVE the selected head that do NOT descend from it.
+        // Fill the observed record to its exact cap so this is near worst case.
+        let base1_hash = storage
+            .blocks
+            .get_block_by_height(1)
+            .unwrap()
+            .expect("hold block @1");
+        let base1 = storage.blocks.get_block(&base1_hash).unwrap().unwrap();
+        let attacker = Ed25519SigningKey::from_bytes(&[0x7C; 32]);
+        f2_signed_side_chain(
+            &attested,
+            &storage,
+            &base1,
+            ATTESTED_OBSERVED_CAP as u64 + 2,
+            &attacker,
+        );
+        assert_eq!(
+            attested.handle().observed.lock().len(),
+            ATTESTED_OBSERVED_CAP,
+            "the observed record is at its full cap for the worst-case measurement"
+        );
+
+        let gate = f2_observed_gate(&attested, None);
+        let selected = Some((head.header.block_hash, head.header.height));
+
+        // Warm the block cache once, then time a single recompute (the per-round cost).
+        gate.recompute_attested_ahead(selected, &storage);
+        let t0 = std::time::Instant::now();
+        gate.recompute_attested_ahead(selected, &storage);
+        let ms = t0.elapsed().as_millis();
+
+        // The side branch never descends from the selected head @3 ⇒ watermark stays at 3.
+        assert_eq!(
+            gate.attested_ahead.as_ref().unwrap().load(Ordering::SeqCst),
+            3,
+            "a held side branch above the head must not inflate the watermark"
+        );
+
+        let bound_ms: u128 = if cfg!(debug_assertions) { 5_000 } else { 50 };
+        println!(
+            "R255-P1: recompute over {} held candidates -> {ms} ms (bound {bound_ms} ms, debug={})",
+            ATTESTED_OBSERVED_CAP,
+            cfg!(debug_assertions)
+        );
+        assert!(
+            ms < bound_ms,
+            "recompute over {} held candidates took {ms} ms (bound {bound_ms} ms, \
+             debug={}); the O(n²) per-candidate walk has returned",
+            ATTESTED_OBSERVED_CAP,
+            cfg!(debug_assertions)
+        );
+    }
+
+    /// VERIFY-255-P1 (correctness): on a MIXED observed set — a losing side branch AND a
+    /// genuine extension of the selected head — the O(n) memoized watermark must equal the
+    /// watermark computed by the ORIGINAL per-candidate walk ([`ProduceCatchupGate::
+    /// descends_from`], retained under `cfg(test)` as the oracle). Guarantees the perf fix
+    /// did not change the gate's H1 semantics.
+    #[tokio::test]
+    async fn r255_p1_memoized_matches_per_candidate_reference() {
+        let (_tmp, storage, _state_db, executor, mempool) = producer_fixture();
+        let app = Arc::new(crate::canonical_apply::CanonicalApplicator::new(
+            executor.clone(),
+            storage.clone(),
+        ));
+        let attested = AttestedNetworkHead::new();
+        let producer = test_producer(&storage, &executor, &mempool)
+            .with_v2_headers(true)
+            .with_applied_tip_lock(app.advance_lock())
+            .with_produce_catchup_gate(&app)
+            .with_network_height_gate(&attested);
+
+        // Own canonical chain to height 4 (selected head @4).
+        let head = f2_own_chain_to(&producer, &storage, 4).await;
+
+        // (1) a losing side branch off block @1 up to height 12 (never descends from @4).
+        let base1_hash = storage
+            .blocks
+            .get_block_by_height(1)
+            .unwrap()
+            .expect("hold block @1");
+        let base1 = storage.blocks.get_block(&base1_hash).unwrap().unwrap();
+        let side_k = Ed25519SigningKey::from_bytes(&[0x2A; 32]);
+        f2_signed_side_chain(&attested, &storage, &base1, 11, &side_k);
+        // (2) a GENUINE extension of the selected head @4 up to height 9 (descends from it).
+        let ext_k = Ed25519SigningKey::from_bytes(&[0x3B; 32]);
+        let ext_tip = f2_signed_side_chain(&attested, &storage, &head, 5, &ext_k);
+        assert_eq!(ext_tip.header.height, 9, "extension reaches height 9");
+
+        let selected = (head.header.block_hash, head.header.height);
+        let floor = 0u64;
+
+        // Reference: the ORIGINAL per-candidate walk, independent of the shared memo.
+        let mut reference_best = selected.1;
+        {
+            let obs = attested.handle();
+            let obs = obs.observed.lock();
+            for (hash, ht) in obs.iter() {
+                if *ht <= reference_best {
+                    continue;
+                }
+                if ProduceCatchupGate::descends_from(
+                    &storage, *hash, selected.0, selected.1, floor,
+                ) {
+                    reference_best = *ht;
+                }
+            }
+        }
+
+        // Memoized production path.
+        let gate = f2_observed_gate(&attested, None);
+        gate.recompute_attested_ahead(Some(selected), &storage);
+        let memoized_best = gate.attested_ahead.as_ref().unwrap().load(Ordering::SeqCst);
+
+        assert_eq!(
+            memoized_best, reference_best,
+            "the memoized watermark must equal the per-candidate reference on a mixed set"
+        );
+        assert_eq!(
+            memoized_best, 9,
+            "only the genuine extension counts; the watermark tracks the selected chain to 9"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4903,8 +6224,7 @@ mod multi_producer_regression {
             !merging.is_empty(),
             "merging blocks must take the real calculate_blue_set path"
         );
-    }
-}
+    }}
 
 #[cfg(test)]
 mod blue_score_band_regression {
@@ -5040,8 +6360,7 @@ mod pba_l1b_001_producer_filter {
             window.contains("tx_auth::verify_for_block(&t, chain_id)"),
             "PBA-L1b-001: produce_block must filter candidates with tx_auth::verify_for_block"
         );
-    }
-}
+    }}
 
 /// Producer circuit breaker and round rollback: a transaction that makes
 /// every production round panic is found, evicted and quarantined, and a
