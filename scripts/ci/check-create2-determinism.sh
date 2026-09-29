@@ -28,6 +28,14 @@ set -euo pipefail
 # the gate is reroll-agnostic no matter what environment invoked it.
 unset CITRATE_REROLL
 
+# Run the determinism suites SINGLE-THREADED. `vm.setEnv` is process-global in
+# foundry, and some suites mutate env (e.g. AaDeterminismHardening sets
+# CITRATE_AA_OWNER/IDENTITY_SIGNER/SPONSOR_SIGNER) while other tests read the same
+# vars. Under the default parallel runner, with the ceremony env loaded, that races
+# ~2/12 and yields a FALSE "do not proceed" at the cut. Serial execution removes the
+# race so the gate is deterministic regardless of the ambient (ceremony) environment.
+FORGE_DET_FLAGS="--threads 1"
+
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 CONTRACTS="${REPO_ROOT}/contracts"
 
@@ -50,9 +58,9 @@ rc=0
 for s in "${SUITES[@]}"; do
   if [[ -f "$s" ]]; then
     log "→ $s"
-    if ! FOUNDRY_PROFILE=default forge test --match-path "$s" >/dev/null 2>&1; then
+    if ! FOUNDRY_PROFILE=default forge test $FORGE_DET_FLAGS --match-path "$s" >/dev/null 2>&1; then
       err "determinism suite FAILED: $s"
-      FOUNDRY_PROFILE=default forge test --match-path "$s" || true
+      FOUNDRY_PROFILE=default forge test $FORGE_DET_FLAGS --match-path "$s" || true
       rc=1
     fi
   else
@@ -65,9 +73,9 @@ done
 # via-IR bytecode, so it must run isolated. See MAC item #5.
 if [[ -f "test/CoreMembershipCreate2.t.sol" ]]; then
   log "→ test/CoreMembershipCreate2.t.sol (profile=membership, closure-scoped)"
-  if ! FOUNDRY_PROFILE=membership forge test >/dev/null 2>&1; then
+  if ! FOUNDRY_PROFILE=membership forge test $FORGE_DET_FLAGS >/dev/null 2>&1; then
     err "membership CREATE2 gate FAILED"
-    FOUNDRY_PROFILE=membership forge test || true
+    FOUNDRY_PROFILE=membership forge test $FORGE_DET_FLAGS || true
     rc=1
   fi
 fi
