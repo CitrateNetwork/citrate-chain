@@ -2678,8 +2678,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // clones existed only to feed the two open-coded admission ladders and
         // are gone with them.
         let max_seen_for_rx = max_seen_height.clone();
-        // F2: attested-network-head handle for the receive tasks.
-        let attested_for_rx = attested_network_head.handle();
+        // F2: attested-network-head handle for the receive tasks (clonable; `observe`
+        // records the block as a candidate the producer gate re-evaluates per round).
+        let attested_for_rx = attested_network_head.clone();
 
         // SYNC-S1 / D2: the network handler's handle on the single admission
         // path (constructed at function scope above, alongside the genesis seed
@@ -2934,13 +2935,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                             block.header.height,
                                         );
                                         // F2: an admitted block is signed + genesis-linked;
-                                        // fold it into the attested-network-head watermark
-                                        // (re-checks signature + parent ancestry itself).
-                                        producer::AttestedNetworkHead::observe(
-                                            &attested_for_rx,
-                                            &storage_for_handler,
-                                            &block,
-                                        );
+                                        // record it as an attested candidate (re-checks
+                                        // signature + parent ancestry itself). The producer
+                                        // gate decides per round whether it is still "ahead"
+                                        // of the fork-choice head (VERIFY-255-F2-H1).
+                                        attested_for_rx.observe(&storage_for_handler, &block);
                                         if completed_partial {
                                             tracing::warn!(
                                                 "Completed a partial admission of gossiped block {} @ {}",
@@ -3163,13 +3162,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                         if block.header.height > highest_admitted {
                                             highest_admitted = block.header.height;
                                         }
-                                        // F2: fold the signed, genesis-linked synced block
-                                        // into the attested-network-head watermark.
-                                        producer::AttestedNetworkHead::observe(
-                                            &attested_for_rx,
-                                            &storage_for_handler,
-                                            &block,
-                                        );
+                                        // F2: record the signed, genesis-linked synced block
+                                        // as an attested candidate (see the H1 note above).
+                                        attested_for_rx.observe(&storage_for_handler, &block);
                                         if completed_partial {
                                             tracing::warn!(
                                                 "Completed a partial admission of synced block {} @ {}",
@@ -3541,6 +3536,13 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // flag and stops producing blocks.
     let pause_flag = Arc::new(AtomicBool::new(false));
 
+    // VERIFY-255-F2-M1: shared handle to the producer F2 catch-up human-in-command override.
+    // Hoisted here (like `pause_flag`) so the same Arc reaches BOTH the RPC server (which
+    // registers the loopback-only, operator-authenticated `citrate_producerCatchupResume`)
+    // and the producer gate (`with_catchup_override`, below). The RPC server is built before
+    // the gate, so the flag must exist first.
+    let catchup_override = Arc::new(AtomicBool::new(false));
+
     // Start RPC server if enabled
     let rpc_handle = if config.rpc.enabled {
         info!("Starting RPC server on {}", config.rpc.listen_addr);
@@ -3604,6 +3606,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // forward-sync liveness: let eth_syncing report highestBlock from the
             // sync driver's max-seen height (truthful "stalled" vs "synced").
             Some(max_seen_height.clone()),
+            // VERIFY-255-F2-M1: the catch-up override handle. Only wired into a
+            // loopback-bound RPC (the server refuses to register it on a public bind).
+            Some(catchup_override.clone()),
         );
 
         // PIL-12: spawn the Ethereum-compatible subscription server next
@@ -3822,7 +3827,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // its peers — measured only from validly-signed, chain-descending peer heads
             // (`attested_network_head`), never a self-reported Hello height / sync target.
             producer_instance =
-                producer_instance.with_network_height_gate(attested_network_head.handle());
+                producer_instance.with_network_height_gate(&attested_network_head);
+            // VERIFY-255-F2-M1: share the catch-up override with the gate so the loopback
+            // admin RPC (`citrate_producerCatchupResume`) can resume a latched producer. The
+            // gate consumes it (auto-clears) on the next resume.
+            producer_instance = producer_instance.with_catchup_override(catchup_override.clone());
         }
 
         // WP-I.3: Share the same pause_flag between RPC server and producer

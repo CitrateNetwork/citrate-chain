@@ -608,6 +608,7 @@ impl RpcServer {
             economics_manager,
             None,
             None,
+            None,
         )
     }
 
@@ -628,6 +629,12 @@ impl RpcServer {
         // eth_syncing reports {currentBlock, highestBlock} instead of a bare `false`
         // whenever the applied tip is behind it (forward-sync observability).
         sync_highest: Option<Arc<std::sync::atomic::AtomicU64>>,
+        // VERIFY-255-F2-M1: shared handle to the producer's F2 catch-up human-in-command
+        // override. When Some AND the RPC is bound to a LOOPBACK interface, the operator-only
+        // `citrate_producerCatchupResume` method is registered (require_operator_auth). It is
+        // NEVER registered on a public bind, so the override cannot be reached over the
+        // public RPC. Setting it resumes production one round; the gate auto-clears it.
+        catchup_override: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> Self {
         let mut io_handler = IoHandler::new();
 
@@ -682,6 +689,48 @@ impl RpcServer {
                     Ok(serde_json::Value::Bool(false))
                 }
             });
+        }
+
+        // VERIFY-255-F2-M1: producer F2 catch-up human-in-command override, on a LOCAL
+        // ADMIN channel only. Registered IFF (a) the flag is wired AND (b) the RPC is bound
+        // to a loopback interface — so it is NEVER reachable on a public RPC — and every
+        // call additionally requires the operator token (`require_operator_auth`,
+        // constant-time, fail-closed). Setting the flag resumes production for one round;
+        // the gate consumes it (auto-clears) on the next resume, so it cannot silently
+        // disable the gate until restart. The read-only gate status is on the loopback
+        // metrics surface (`citrate_producer_catchup_*`).
+        if let Some(override_flag) = catchup_override {
+            if config.listen_addr.ip().is_loopback() {
+                io_handler.add_sync_method(
+                    "citrate_producerCatchupResume",
+                    move |params: Params| {
+                        rpc_request("citrate_producerCatchupResume");
+                        let value: serde_json::Value = match params.parse() {
+                            Ok(v) => v,
+                            Err(e) => {
+                                return Err(jsonrpc_core::Error::invalid_params(e.to_string()))
+                            }
+                        };
+                        let map = value
+                            .as_object()
+                            .ok_or_else(|| jsonrpc_core::Error::invalid_params("Expected object"))?;
+                        require_operator_auth(map)?;
+                        override_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        warn!(
+                            "VERIFY-255-F2-M1: producer catch-up override ARMED via local admin \
+                             RPC — production will resume for one round, then the override \
+                             auto-clears and the gate re-evaluates."
+                        );
+                        Ok(serde_json::json!({ "override_armed": true }))
+                    },
+                );
+            } else {
+                warn!(
+                    "VERIFY-255-F2-M1: RPC is bound to a public interface ({}); the producer \
+                     catch-up override is NOT registered (local-admin only).",
+                    config.listen_addr
+                );
+            }
         }
 
         // Register economics-related RPC methods
@@ -3200,6 +3249,34 @@ mod tests {
                 && snapshot_window.contains("PendingQuery::from_params_map")
                 && snapshot_window.contains("get_pending"),
             "T0-07: alternate pending-detail method must use the same bounded operator path"
+        );
+    }
+
+    /// VERIFY-255-F2-M1: the producer catch-up override must stay a LOCAL-ADMIN control —
+    /// registered only behind a loopback bind and gated by the operator token. This source
+    /// tripwire fails if either guard is dropped, so the override can never leak onto a
+    /// public RPC.
+    #[test]
+    fn catchup_override_is_loopback_and_operator_gated() {
+        let src = include_str!("server.rs");
+        let idx = src
+            .find("add_sync_method(\n                    \"citrate_producerCatchupResume\"")
+            .or_else(|| src.find("\"citrate_producerCatchupResume\""))
+            .expect("server.rs must register citrate_producerCatchupResume");
+        // The registration must sit inside the loopback guard...
+        let before = &src[..idx];
+        let guard = before
+            .rfind("if config.listen_addr.ip().is_loopback()")
+            .expect("override registration must be inside the loopback guard");
+        // ...with no intervening method registration between the guard and this method.
+        assert!(
+            !src[guard..idx].contains("add_sync_method("),
+            "the catch-up override must be the method guarded by is_loopback()"
+        );
+        let window = &src[idx..(idx + 1_200).min(src.len())];
+        assert!(
+            window.contains("require_operator_auth"),
+            "the catch-up override closure must require operator auth"
         );
     }
 
