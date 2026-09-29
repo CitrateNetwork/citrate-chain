@@ -1617,6 +1617,19 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             exec.get_nonce(&citrate_execution::address_utils::normalize_address(pk))
         })
     })
+    // PBA-N9 (security#134): reject a transaction on every ingress path when the
+    // sender's committed balance cannot cover it together with its already-pooled
+    // transactions. Without this the pool admits unfunded floods that evict honest
+    // txs and yield empty blocks at zero cost. Balances are far below u128::MAX
+    // (supply is 1e30 wei), so the U256->u128 saturation never loses precision.
+    .with_state_balance_reader({
+        let exec = executor.clone();
+        Arc::new(move |pk: &citrate_consensus::types::PublicKey| {
+            let bal = exec.get_balance(&citrate_execution::address_utils::normalize_address(pk));
+            let cap = primitive_types::U256::from(u128::MAX);
+            (if bal > cap { cap } else { bal }).low_u128()
+        })
+    })
     // Native signatures: from tip H - 1 the pool admits only the chain-bound
     // (v2) digest and evicts legacy ones (`citrate_consensus::native_sig`).
     .with_native_sig_policy(citrate_consensus::hardening::PbaHardening::from_process(), {

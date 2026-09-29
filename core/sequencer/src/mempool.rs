@@ -40,6 +40,14 @@ pub enum MempoolError {
 
     #[error("Invalid signature")]
     InvalidSignature,
+
+    /// PBA-N9 (security#134): the sender's committed balance cannot cover the
+    /// max cost of this transaction together with the max cost of the sender's
+    /// already-pooled transactions. Rejected at admission on every ingress path
+    /// so an unfunded flood can never pool, evict honest txs, or waste block
+    /// selection. `max_cost = gas_limit * max_fee_per_gas + value`.
+    #[error("Insufficient balance: sender balance {balance} < required {required}")]
+    InsufficientBalance { balance: u128, required: u128 },
 }
 
 /// Transaction class for categorization
@@ -285,6 +293,14 @@ impl BoundedHashSet {
 /// txs already buffered here).
 pub type StateNonceReader = Arc<dyn Fn(&PublicKey) -> u64 + Send + Sync>;
 
+/// PBA-N9 (security#134): reads a sender's COMMITTED (on-chain) SALT balance,
+/// wired to the executor exactly like [`StateNonceReader`]. Admission uses it to
+/// reject a transaction (on every ingress path) whose sender cannot pay for it
+/// together with the sender's already-pooled transactions. Balances are far
+/// below `u128::MAX` (total supply is 1e30 wei), so `u128` is lossless here and
+/// avoids pulling `primitive_types` into this crate.
+pub type StateBalanceReader = Arc<dyn Fn(&PublicKey) -> u128 + Send + Sync>;
+
 /// Transaction mempool
 pub struct Mempool {
     /// Configuration
@@ -335,6 +351,11 @@ pub struct Mempool {
     /// PBA-L1a-001: optional committed-nonce reader (see [`StateNonceReader`]).
     state_nonce: Option<StateNonceReader>,
 
+    /// PBA-N9: optional committed-balance reader (see [`StateBalanceReader`]).
+    /// When set, admission rejects a transaction whose sender cannot fund it
+    /// together with its already-pooled transactions.
+    state_balance: Option<StateBalanceReader>,
+
     /// PBA-L1a-004: senders temporarily refused admission (until the instant),
     /// set by the producer when a sender's transaction fails before a receipt
     /// exists (such a failure costs the sender nothing on chain).
@@ -373,6 +394,7 @@ impl Mempool {
             evicted: Arc::new(RwLock::new(BoundedHashSet::new(EVICTED_CAP))),
             total_size: Arc::new(RwLock::new(0)),
             state_nonce: None,
+            state_balance: None,
             banned: Arc::new(RwLock::new(HashMap::new())),
             native_sig: None,
             native_sig_swept: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -499,6 +521,30 @@ impl Mempool {
         self
     }
 
+    /// PBA-N9 (security#134): admit a transaction only if the sender's committed
+    /// balance covers the max cost of the sender's already-pooled transactions
+    /// PLUS this one. Wired to the executor's balance view. Without it the pool
+    /// admits unfunded transactions on every ingress path, letting an attacker
+    /// evict honest transactions and produce empty blocks at zero cost.
+    pub fn with_state_balance_reader(mut self, reader: StateBalanceReader) -> Self {
+        self.state_balance = Some(reader);
+        self
+    }
+
+    /// PBA-N9: the maximum SALT a transaction can remove from its sender's
+    /// balance: `gas_limit * max_fee_per_gas + value`. Uses the EIP-1559 fee cap
+    /// (`max_fee_per_gas`, falling back to the legacy `gas_price`) so the bound
+    /// never under-charges a fee-market transaction. Saturating arithmetic: an
+    /// absurd product or sum caps at `u128::MAX`, which is unpayable against any
+    /// real balance, so a genuinely-payable transaction is never rejected while
+    /// `gas_limit` is bounded (admission rejects `gas_limit > MAX_GAS_PER_BLOCK`).
+    pub fn tx_max_cost(tx: &Transaction) -> u128 {
+        let price = tx.max_fee_per_gas.unwrap_or(tx.gas_price) as u128;
+        (tx.gas_limit as u128)
+            .saturating_mul(price)
+            .saturating_add(tx.value)
+    }
+
     /// Add a transaction to the mempool
     pub async fn add_transaction(
         &self,
@@ -611,19 +657,63 @@ impl Mempool {
             ));
         }
 
-        // Check mempool size limit
-        if self.transactions.read().await.len() >= self.config.max_size {
-            // Try to evict lower priority transaction
-            self.evict_lowest_priority().await?;
-        }
-        // PBA-L1a-017: enforce the byte budget too (evict lowest priority
-        // until the new transaction fits; `Full` if nothing is left to evict).
-        let incoming_size = self.calculate_tx_size(&tx);
-        while *self.total_size.read().await + incoming_size > MAX_POOL_BYTES {
-            self.evict_lowest_priority().await?;
+        // PBA-N9 (security#134): cumulative sender-balance admission check.
+        //
+        // Before this, admission checked signature + nonce but NEVER balance, on
+        // any ingress path (native `tx_sendRawTransaction`, `eth_sendRawTransaction`,
+        // P2P gossip — all route through here). An attacker could flood the pool
+        // with unfunded, individually-cheap-but-collectively-unaffordable, high-fee
+        // transactions; they were admitted, evicted honest lower-fee transactions
+        // (a full pool evicted purely on priority), then the producer skipped them
+        // unpaid, leaving them pooled for `tx_expiry_secs` (3600s) — empty blocks at
+        // zero cost.
+        //
+        // Reject unless the sender's COMMITTED balance covers the summed max cost
+        // of the sender's already-pooled transactions PLUS this one. This accounts
+        // for the sender's PENDING set (not each tx in isolation), so N txs that are
+        // individually affordable but collectively unaffordable are rejected. Runs
+        // BEFORE any eviction, so an unpayable newcomer can never evict a payable tx.
+        //
+        // Conservative: it only ever REJECTS unfunded txs (uses `max_fee_per_gas`
+        // for the cost bound and includes `value`), so a genuinely-payable tx is
+        // never refused. Inert unless a balance reader is wired.
+        if let Some(read_balance) = &self.state_balance {
+            let balance = read_balance(&sender);
+            let incoming_cost = Self::tx_max_cost(&tx);
+            let pooled_cost: u128 = {
+                let by_sender = self.by_sender.read().await;
+                match by_sender.get(&sender) {
+                    Some(hashes) => {
+                        let txs = self.transactions.read().await;
+                        hashes.iter().fold(0u128, |acc, h| {
+                            acc.saturating_add(
+                                txs.get(h)
+                                    .map(|mtx| Self::tx_max_cost(&mtx.tx))
+                                    .unwrap_or(0),
+                            )
+                        })
+                    }
+                    None => 0,
+                }
+            };
+            let required = pooled_cost.saturating_add(incoming_cost);
+            if balance < required {
+                tracing::warn!(
+                    "PBA-N9: sender {:?} cannot fund tx: balance={} < pooled {} + incoming {} = {}",
+                    sender,
+                    balance,
+                    pooled_cost,
+                    incoming_cost,
+                    required
+                );
+                return Err(MempoolError::InsufficientBalance { balance, required });
+            }
         }
 
-        // Create mempool transaction with AI-aware priority
+        // Create mempool transaction with AI-aware priority. Compute the priority
+        // BEFORE any eviction so eviction can be payable/priority-aware (PBA-N9):
+        // the incoming tx is already known payable here, and it must not displace
+        // a strictly-higher-priority tx to take its place.
         let timestamp = chrono::Utc::now().timestamp() as u64;
 
         // AI operations are ordered by fee like everything else (class
@@ -631,6 +721,20 @@ impl Mempool {
         let ai_priority = 0;
         let priority = TxPriority::new_with_ai(tx.gas_price, class, timestamp, ai_priority);
         let tx_size = self.calculate_tx_size(&tx);
+
+        // Check mempool size limit
+        if self.transactions.read().await.len() >= self.config.max_size {
+            // PBA-N9: make room for this (payable) newcomer only if the pool holds
+            // something no better than it; never displace a strictly-higher tx.
+            self.evict_lower_priority_than(priority).await?;
+        }
+        // PBA-L1a-017: enforce the byte budget too (evict lowest priority
+        // until the new transaction fits; `Full` if nothing is left to evict).
+        // PBA-N9: same priority guard — never displace a better tx.
+        let incoming_size = tx_size;
+        while *self.total_size.read().await + incoming_size > MAX_POOL_BYTES {
+            self.evict_lower_priority_than(priority).await?;
+        }
 
         let mempool_tx = MempoolTx {
             tx: tx.clone(),
@@ -1198,23 +1302,41 @@ impl Mempool {
         }
     }
 
-    /// Evict the lowest priority transaction
-    async fn evict_lowest_priority(&self) -> Result<(), MempoolError> {
+    /// PBA-N9 (security#134): payable/priority-aware eviction. Evict the pool's
+    /// lowest-priority transaction ONLY when it is NOT strictly higher priority
+    /// than `incoming` (which admission has already verified is payable). If every
+    /// pooled transaction is strictly better than the newcomer, refuse the
+    /// newcomer (`Full`) rather than displace a superior transaction.
+    ///
+    /// This closes the eviction half of N9: previously a full pool evicted its
+    /// lowest-fee entry for ANY newcomer, so an unfunded high-fee flood evicted
+    /// honest lower-fee (but payable) transactions. Combined with the balance
+    /// admission check above, an unpayable newcomer never reaches eviction at all;
+    /// and a lower-priority newcomer can no longer push out a strictly-better tx.
+    ///
+    /// Equal-priority eviction is allowed on purpose: tied transactions are
+    /// interchangeable in value, and allowing the tie keeps the count / byte-budget
+    /// caps enforceable (a pool full of equal-fee txs must still make room).
+    async fn evict_lower_priority_than(
+        &self,
+        incoming: TxPriority,
+    ) -> Result<(), MempoolError> {
         let priority_queue = self.priority_queue.read().await;
 
-        // Find the transaction with the lowest priority
         let lowest = priority_queue
             .iter()
             .min_by_key(|(_, priority)| priority.score())
-            .map(|(hash, _)| *hash);
+            .map(|(hash, priority)| (*hash, *priority));
 
         drop(priority_queue);
 
-        if let Some(hash) = lowest {
-            self.remove_transaction(&hash).await;
-            Ok(())
-        } else {
-            Err(MempoolError::Full)
+        match lowest {
+            Some((hash, lowest_priority)) if lowest_priority.score() <= incoming.score() => {
+                self.remove_transaction(&hash).await;
+                Ok(())
+            }
+            // Every pooled tx is strictly better than the newcomer: keep them.
+            _ => Err(MempoolError::Full),
         }
     }
 
