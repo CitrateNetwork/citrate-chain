@@ -608,6 +608,7 @@ impl RpcServer {
             economics_manager,
             None,
             None,
+            None,
         )
     }
 
@@ -628,6 +629,10 @@ impl RpcServer {
         // eth_syncing reports {currentBlock, highestBlock} instead of a bare `false`
         // whenever the applied tip is behind it (forward-sync observability).
         sync_highest: Option<Arc<std::sync::atomic::AtomicU64>>,
+        // BFT-finalized height source (the canonical applicator's `finalized_height`
+        // handle). Backs the `finalized`/`safe` RPC block tags. When None, the tags
+        // resolve to genesis (block 0) — the documented pre-checkpoint behaviour.
+        finalized_height: Option<Arc<std::sync::atomic::AtomicU64>>,
     ) -> Self {
         let mut io_handler = IoHandler::new();
 
@@ -643,7 +648,7 @@ impl RpcServer {
 
         // Register Ethereum-compatible RPC methods
         // WP-I.3: Pass pause_flag so emergency methods are actually registered
-        eth_rpc::register_eth_methods(
+        eth_rpc::register_eth_methods_with_finality(
             &mut io_handler,
             storage.clone(),
             mempool.clone(),
@@ -651,6 +656,7 @@ impl RpcServer {
             chain_id,
             filter_registry,
             pause_flag,
+            finalized_height.unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicU64::new(0))),
         );
 
         // Truthful eth_syncing OVERRIDE (last registration wins): report progress

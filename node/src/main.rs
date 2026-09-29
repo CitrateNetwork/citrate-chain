@@ -1777,7 +1777,18 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // WP-W.1: Create CheckpointManager for BFT finality vote handling
     let checkpoint_manager = {
         use citrate_consensus::checkpoint::{CheckpointConfig, CheckpointManager};
-        let cp_config = CheckpointConfig::default();
+        // Stage 0 checkpoint finality: build the consensus CheckpointConfig from the
+        // node's `[checkpoint]` config instead of `default()`, and bind `chain_id`
+        // to the node's chain config (NOT a hardcoded 40204) so a devnet (e.g. 1337)
+        // signs/verifies vote messages for its own chain. `quorum_threshold` is
+        // carried through for reference, but finalization derives the effective
+        // quorum `floor(2n/3)+1` from the actual committee size (see checkpoint.rs).
+        let cp_config = CheckpointConfig {
+            interval: config.checkpoint.interval,
+            committee_size: config.checkpoint.committee_size,
+            quorum_threshold: config.checkpoint.quorum_threshold,
+            chain_id: config.chain.chain_id,
+        };
         let kv = Arc::new(persistent_dag::RocksDbKvStore::new(storage.db.clone()));
         Arc::new(CheckpointManager::with_persistence(
             cp_config,
@@ -3592,6 +3603,13 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // forward-sync liveness: let eth_syncing report highestBlock from the
             // sync driver's max-seen height (truthful "stalled" vs "synced").
             Some(max_seen_height.clone()),
+            // Stage 0 checkpoint finality: back the `finalized`/`safe` RPC tags with
+            // the same `finalized_height` handle the canonical applicator exposes and
+            // the 5 s finality poll keeps current. None (no applicator) => tags resolve
+            // to genesis (block 0), never error.
+            canonical_applicator
+                .as_ref()
+                .map(|app| app.finalized_height_handle()),
         );
 
         // PIL-12: spawn the Ethereum-compatible subscription server next
