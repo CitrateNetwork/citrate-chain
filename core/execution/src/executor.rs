@@ -437,6 +437,49 @@ pub trait StateStoreTrait: Send + Sync {
         Ok(())
     }
 
+    /// #126 (crash-consistent reorg commit): atomically persist a REORG store
+    /// reconciliation — account puts + storage changes + account DELETIONS +
+    /// contract CODE + the applied-tip pointer — in ONE fsync'd write batch.
+    ///
+    /// The linear/produce commit path is already crash-consistent (one fsync'd
+    /// batch via [`Self::write_state_batch_with_applied_tip`]). The reorg path was
+    /// NOT: `reconcile_store_from` wrote the account/storage diff in a sync batch
+    /// WITHOUT the tip, then advanced the applied tip through a SEPARATE, non-fsync
+    /// `put_cf`, and issued account-deletes + code as further separate point writes.
+    /// A kill-9 between the synced state batch and the tip write left a durable tip
+    /// out of step with durable state → on restart the reloaded root != the committed
+    /// root → genesis-replay "snapshot fallback", and a producer could then seal on
+    /// the stale self-consistent tip → FORK. Routing deletes, code AND the tip through
+    /// the same `write_batch_sync` closes that window: the whole reconciliation commits
+    /// or nothing does.
+    ///
+    /// The default here is the NON-atomic fallback for in-memory test stores that model
+    /// no crash: it writes state, then deletes, then code, and the tip LAST (so even the
+    /// fallback never advances the tip ahead of the state it describes). The real
+    /// RocksDB-backed `StateStore` overrides this with a single cross-CF `WriteBatch`.
+    fn write_reorg_batch_sync(
+        &self,
+        accounts: &[(Address, crate::types::AccountState)],
+        storage: &[StateStorageChange],
+        account_dels: &[Address],
+        code: &[(Hash, Vec<u8>)],
+        applied_tip: Option<(Hash, u64)>,
+    ) -> anyhow::Result<()> {
+        // NB: tip is written LAST so a crash in this non-atomic fallback can only ever
+        // leave the tip BEHIND the state, never ahead of it (the safe direction).
+        self.write_state_batch_sync(accounts, storage)?;
+        for addr in account_dels {
+            self.delete_account(addr)?;
+        }
+        for (code_hash, code) in code {
+            self.put_code(code_hash, code)?;
+        }
+        if let Some((hash, height)) = applied_tip {
+            self.put_applied_tip_meta(&hash, height)?;
+        }
+        Ok(())
+    }
+
     /// Persist the applied-tip pointer (block hash + height). Default no-op for test
     /// stores; the real `StateStore` writes it to `CF_METADATA`. Used by the atomic
     /// [`Self::write_state_batch_with_applied_tip`] default fallback.
@@ -1194,9 +1237,16 @@ impl Executor {
     /// Correctness rests on `baseline` being exactly what the store reflects: the
     /// reorg captures it before reverting, and the pre-reorg forward path
     /// (`apply_block`, per block) kept store == in-memory, so it holds.
+    /// `applied_tip`: the durable tip the store should name AFTER this reconcile —
+    /// #126 threads it through so the tip lands in the SAME fsync'd batch as the
+    /// reconciled state, and the caller passes the committed point each reconcile
+    /// leaves the store at (winning tip on success, fork point on the pre-reapply
+    /// revert, prior tip on abort). `None` writes state only (leaves the tip put) —
+    /// used by test-level mechanic checks that do not exercise the tip.
     pub fn reconcile_store_from(
         &self,
         baseline: &crate::state::StateSnapshot,
+        applied_tip: Option<(Hash, u64)>,
     ) -> anyhow::Result<()> {
         use std::collections::{HashMap, HashSet};
         let store = match &self.state_store {
@@ -1249,17 +1299,29 @@ impl Executor {
             }
         }
 
-        if !account_puts.is_empty() || !storage_changes.is_empty() {
-            store.write_state_batch_sync(&account_puts, &storage_changes)?;
-        }
-        for addr in &account_dels {
-            store.delete_account(addr)?;
-        }
-        // Persist contract code deployed on the winning branch (deferred from
-        // `set_code`). Code is content-addressed, so any leftover code from an
-        // abandoned branch is an unreferenced (harmless) orphan.
-        for (code_hash, code) in self.state_db.take_dirty_code() {
-            store.put_code(&code_hash, &code)?;
+        // #126: accounts + storage + account-deletes + contract code + the applied-tip
+        // pointer commit in ONE fsync'd batch (`write_reorg_batch_sync`). Previously the
+        // account/storage diff went through a sync batch WITHOUT the tip, and the deletes,
+        // code and tip were SEPARATE (the tip via a non-fsync `put_cf`) — a crash between
+        // them tore durable state from the durable tip and forked the node on restart.
+        //
+        // Contract code deployed on the winning branch is deferred from `set_code`; it is
+        // content-addressed, so any leftover code from an abandoned branch is an
+        // unreferenced (harmless) orphan.
+        let code = self.state_db.take_dirty_code();
+        let must_commit = !account_puts.is_empty()
+            || !storage_changes.is_empty()
+            || !account_dels.is_empty()
+            || !code.is_empty()
+            || applied_tip.is_some();
+        if must_commit {
+            store.write_reorg_batch_sync(
+                &account_puts,
+                &storage_changes,
+                &account_dels,
+                &code,
+                applied_tip,
+            )?;
         }
         Ok(())
     }
@@ -2094,6 +2156,32 @@ impl Executor {
             }
         };
 
+        // R2-RES-04 — receipt gas_used MUST equal the gas the sender was
+        // actually CHARGED, not the pre-failure work meter.
+        //
+        // A FAILED/reverted tx pays its FULL gas limit: the failure arm above
+        // records `balance - gas_cost` with `gas_cost = gas_limit * gas_price`
+        // and grants NO refund, so the sender is debited `gas_limit`. But the
+        // receipt used to report `context.gas_used` (the gas burned up to the
+        // point of the revert), which is strictly smaller. That under-report
+        // fed two consensus-visible, block-hash fields: the header `gas_used`
+        // (sum of receipt gas_used, node/src/producer.rs) and `receipt_root`
+        // (which hashes receipt.gas_used). Observed: 1000 reverting txs charged
+        // 30M gas but the header reported ~700k.
+        //
+        // A SUCCESSFUL tx is refunded `(gas_limit - gas_used) * gas_price`, so
+        // its charged gas IS `context.gas_used` — reported unchanged.
+        //
+        // ACTIVATION: unconditional / always-on. This changes `receipt_root`,
+        // a block-hash field, but the fix ships with the fresh reroll genesis —
+        // that genesis IS the activation boundary, so no mid-chain height gate
+        // is needed (the current chain never runs this binary pre-reroll).
+        let charged_gas_used = if status {
+            context.gas_used
+        } else {
+            tx.gas_limit
+        };
+
         // Create receipt
         let receipt = TransactionReceipt {
             tx_hash: tx.hash,
@@ -2101,7 +2189,7 @@ impl Executor {
             block_number: block.header.height,
             from,
             to: tx.to.map(|pk| crate::address_utils::normalize_address(&pk)),
-            gas_used: context.gas_used,
+            gas_used: charged_gas_used,
             status,
             logs: context.logs.clone(),
             output: context.output.clone(),
@@ -2111,8 +2199,8 @@ impl Executor {
         };
 
         info!(
-            "Transaction {} executed: status={}, gas_used={}",
-            tx.hash, status, context.gas_used
+            "Transaction {} executed: status={}, gas_used={} (pre-failure meter={})",
+            tx.hash, status, charged_gas_used, context.gas_used
         );
 
         // Assemble the final WriteSet for MVCC version bumping:

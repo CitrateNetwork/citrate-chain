@@ -1399,6 +1399,25 @@ pub fn register_eth_methods(
 
         match res {
             Ok(receipt) => {
+                // R2-RES-04 side-effect guard: since a failed tx's receipt now
+                // reports the full charged `gas_limit` (not the gas actually
+                // consumed), a reverting simulation would otherwise make the
+                // estimate below balloon to the whole simulation limit
+                // (e.g. 30M for a 15M-default sim). A wallet trusting that would
+                // submit a max-gas tx and burn `gas_limit * gas_price` on the
+                // revert, and low-balance senders would be refused at admission.
+                // Mirror `eth_call`: surface a reverting/failed simulation as a
+                // JSON-RPC "execution reverted" error instead of a gas number.
+                // Only a SUCCESSFUL simulation yields an estimate.
+                if !receipt.status {
+                    let mut err =
+                        jsonrpc_core::Error::new(jsonrpc_core::ErrorCode::ServerError(-32000));
+                    err.message = match receipt.revert_reason.as_deref() {
+                        Some(r) => format!("execution reverted: {r}"),
+                        None => "execution reverted (no reason)".to_string(),
+                    };
+                    return Err(err);
+                }
                 // PIL-47b: `simulate_transaction` returns the *net*
                 // gas_used after EIP-2200 SSTORE refunds. The REAL tx
                 // front-loads the gross SSTORE charge (up to ~42k for a
