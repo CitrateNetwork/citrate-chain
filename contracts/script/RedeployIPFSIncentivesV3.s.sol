@@ -67,7 +67,7 @@ contract RedeployIPFSIncentivesV3 is ScriptEnv, AdminChecks {
     function run() external {
         address kyc = envAddressOr("KYC_REGISTRY", KYC_REGISTRY_40204);
         address foldVerifier = envAddressOr("FOLD_VERIFIER", FOLD_VERIFIER_PRECOMPILE);
-        address admin = envAddressOr("GOVERNANCE", deployerAddress());
+        address admin = requiredGovernance("GOVERNANCE", deployerAddress());
 
         console.log("=== citrate-chain#170: redeploy IPFSIncentivesV3 (sound CommD bond) ===");
         console.log("KYCRegistry (existing):", kyc);

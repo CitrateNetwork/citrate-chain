@@ -31,6 +31,28 @@ abstract contract ScriptEnv is Script {
         }
     }
 
+    /// @notice Read a governance/owner/admin address that must NOT be the
+    ///         deployer on the production chain. Off-chain (dev/test) it falls
+    ///         back to `deployer` for convenience, but on chain 40204 the deploy
+    ///         REVERTS unless `key` is set to a non-deployer address.
+    /// @dev Fail-closed remediation of findings G2/G4: several ceremony scripts
+    ///      defaulted governance to the deployer, so a run that forgot to set
+    ///      GOVERNANCE would silently leave the deployer EOA holding admin. This
+    ///      makes that impossible on 40204 while keeping local dev flows working.
+    ///      Mirrors the block.chainid == 40204 guard used for EXPECTED_IPFS_V3 in
+    ///      DeployFederatedLearning.
+    function requiredGovernance(string memory key, address deployer)
+        internal
+        view
+        returns (address gov)
+    {
+        gov = envAddressOr(key, deployer);
+        require(
+            block.chainid != 40204 || gov != deployer,
+            string.concat(key, " must be set to a non-deployer address on 40204")
+        );
+    }
+
     function envUintOr(string memory key, uint256 fallbackValue)
         internal
         view

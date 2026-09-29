@@ -13,7 +13,7 @@ import "../src/TEEAttestationRegistry.sol";
 contract DeployTEEAttestationRegistry is ScriptEnv {
     function run() external {
         address deployer = deployerAddress();
-        address governance = envAddressOr("GOVERNANCE", deployer);
+        address governance = requiredGovernance("GOVERNANCE", deployer);
 
         console.log("=== Deploying TEEAttestationRegistry (CM-08) ===");
         console.log("Deployer:  ", deployer);

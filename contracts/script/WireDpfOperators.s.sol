@@ -71,7 +71,15 @@ contract WireDpfOperators is Script {
     address constant TENANT_HIERARCHY            = 0x9101f6f1AB0A9FFF84e61B8D9E426E22723bc765;
     address constant CLASSIFICATION_REGISTRY     = 0xd4b1680684106888b7c55d19fB236b41c192340e;
     address constant ROLE_ESCALATION             = 0xC9B8c0bd4BDf70502095276dEE2b3f4d5da1488e;
-    address constant MULTISIG_ENVELOPE           = 0x01f6293FEB59C5950A484F35CE4317B40d8F76be;
+    // G5: OLD-chain envelope (dead after a reroll). Prefer the env override; on
+    // 40204 the resolved address must have code. NOTE: the other constants in this
+    // post-deploy ops script are ALSO stale after the reroll and must be repointed
+    // from the regenerated book before this sweep is run on the new chain.
+    address constant MULTISIG_ENVELOPE_LEGACY_DEFAULT = 0x01f6293FEB59C5950A484F35CE4317B40d8F76be;
+    function _multisigEnvelope() internal view returns (address e) {
+        try vm.envAddress("MULTISIG_ENVELOPE") returns (address a) { e = a; } catch { e = MULTISIG_ENVELOPE_LEGACY_DEFAULT; }
+        require(block.chainid != 40204 || e.code.length != 0, "MULTISIG_ENVELOPE must be a deployed envelope on 40204");
+    }
     address constant AGENT_DECISION_REGISTRY_V2  = 0xb524C66176f11613c3A43b0B7DB796cce607C013;
     address constant CONTRADICTION_LEDGER        = 0x8997e9838Fe5BB451d9D518FaEF5e4Bac49e341D;
 
