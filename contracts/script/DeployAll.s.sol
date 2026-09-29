@@ -115,16 +115,24 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
 
     function deploy() public returns (Deployed memory d) {
         address deployer = deployerAddress();
-        return deployWith(deployer, envAddressOr("GOVERNANCE", deployer), envAddressOr("GUARDIAN", deployer));
+        return deployWith(deployer, requiredGovernance("GOVERNANCE", deployer), requiredGovernance("GUARDIAN", deployer));
     }
 
     /// @notice The ceremony with explicit keys (no environment reads), so a
     ///         caller or test is not affected by concurrently changing env.
     function deployWith(address deployer, address governance, address guardian) public returns (Deployed memory d) {
 
+        bool reroll = _isReroll();
+        // Under the reroll switch the three otherwise-kept-live registries deploy
+        // FRESH and multisig-governed (governance), not deployer-governed. On the
+        // normal live path this is `deployer`, preserving the existing addresses.
+        address regGov = reroll ? governance : deployer;
+
         console.log("=== Citrate Full Contract Deployment ===");
         console.log("Deployer:", deployer);
+        console.log("Governance:", governance);
         console.log("Chain ID:", block.chainid);
+        console.log("CITRATE_REROLL (fresh-keys reroll mode):", reroll);
         console.log("");
 
         // The signer is selected by the forge CLI, not by this script.
@@ -150,9 +158,9 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         address keptAdr = _keptLive("AgentDecisionRegistry");
         AgentDecisionRegistry agentRegistry = keptAdr != address(0)
             ? AgentDecisionRegistry(payable(keptAdr))
-            : (_isLive("AgentDecisionRegistry", abi.encodePacked(type(AgentDecisionRegistry).creationCode, abi.encode(deployer)))
-            ? AgentDecisionRegistry(payable(_create2Address("AgentDecisionRegistry", abi.encodePacked(type(AgentDecisionRegistry).creationCode, abi.encode(deployer)))))
-            : new AgentDecisionRegistry{salt: Salts.salt("AgentDecisionRegistry")}(deployer));
+            : (_isLive("AgentDecisionRegistry", abi.encodePacked(type(AgentDecisionRegistry).creationCode, abi.encode(regGov)))
+            ? AgentDecisionRegistry(payable(_create2Address("AgentDecisionRegistry", abi.encodePacked(type(AgentDecisionRegistry).creationCode, abi.encode(regGov)))))
+            : new AgentDecisionRegistry{salt: Salts.salt("AgentDecisionRegistry")}(regGov));
         console.log("  AgentDecisionRegistry:", address(agentRegistry));
 
         // RM-L / WP-L1.1: SpecRegistry now requires governance address
@@ -161,9 +169,9 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         address keptSpec = _keptLive("SpecRegistry");
         SpecRegistry specRegistry = keptSpec != address(0)
             ? SpecRegistry(payable(keptSpec))
-            : (_isLive("SpecRegistry", abi.encodePacked(type(SpecRegistry).creationCode, abi.encode(deployer)))
-            ? SpecRegistry(payable(_create2Address("SpecRegistry", abi.encodePacked(type(SpecRegistry).creationCode, abi.encode(deployer)))))
-            : new SpecRegistry{salt: Salts.salt("SpecRegistry")}(deployer));
+            : (_isLive("SpecRegistry", abi.encodePacked(type(SpecRegistry).creationCode, abi.encode(regGov)))
+            ? SpecRegistry(payable(_create2Address("SpecRegistry", abi.encodePacked(type(SpecRegistry).creationCode, abi.encode(regGov)))))
+            : new SpecRegistry{salt: Salts.salt("SpecRegistry")}(regGov));
         console.log("  SpecRegistry:", address(specRegistry));
 
         IPFSIncentives ipfs = (_isLive("IPFSIncentives", abi.encodePacked(type(IPFSIncentives).creationCode, abi.encode(governance)))
@@ -229,16 +237,16 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         MarketMakerAllocation mmAlloc = keptMma != address(0)
             ? MarketMakerAllocation(payable(keptMma))
             : (_isLive("MarketMakerAllocation", abi.encodePacked(type(MarketMakerAllocation).creationCode, abi.encode(
-            deployer,   // market maker (deployer for now, DAO changes later)
-            deployer    // governance
+            regGov,   // market maker (deployer live / governance under reroll; DAO changes later)
+            regGov    // governance
         )))
             ? MarketMakerAllocation(payable(_create2Address("MarketMakerAllocation", abi.encodePacked(type(MarketMakerAllocation).creationCode, abi.encode(
-            deployer,   // market maker (deployer for now, DAO changes later)
-            deployer    // governance
+            regGov,   // market maker (deployer live / governance under reroll; DAO changes later)
+            regGov    // governance
         )))))
             : new MarketMakerAllocation{salt: Salts.salt("MarketMakerAllocation")}(
-            deployer,   // market maker (deployer for now, DAO changes later)
-            deployer    // governance
+            regGov,   // market maker (deployer live / governance under reroll; DAO changes later)
+            regGov    // governance
         ));
         console.log("  MarketMakerAllocation:", address(mmAlloc));
 
@@ -295,10 +303,20 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         // for lazy per-(addr, dim) score reads — the matcher does not
         // mirror that state; it staticcalls it on demand. Governance
         // is the deployer for testnet; mainnet should use the multisig.
-        MentorMatcher mentorMatcher = (_isLive("MentorMatcher", abi.encodePacked(type(MentorMatcher).creationCode, abi.encode(deployer)))
+        bool mentorLive = _isLive("MentorMatcher", abi.encodePacked(type(MentorMatcher).creationCode, abi.encode(deployer)));
+        MentorMatcher mentorMatcher = (mentorLive
             ? MentorMatcher(payable(_create2Address("MentorMatcher", abi.encodePacked(type(MentorMatcher).creationCode, abi.encode(deployer)))))
             : new MentorMatcher{salt: Salts.salt("MentorMatcher")}(deployer));
-        mentorMatcher.setContributionAccounting(address(contributions));
+        // MentorMatcher is born deployer-governed so the deployer can run the
+        // onlyGovernance config below; then hand governance to the multisig (G2).
+        // Kept ctor(deployer) so the CREATE2 address is unchanged. Only configure +
+        // hand over on a FRESH deploy: on reuse the contract is already configured
+        // and governance is already the multisig, so re-running setContributionAccounting
+        // as the deployer would revert NotGovernance() (idempotent-rerun safety).
+        if (!mentorLive) {
+            mentorMatcher.setContributionAccounting(address(contributions));
+            if (governance != deployer) mentorMatcher.setGovernance(governance);
+        }
         console.log("  MentorMatcher:", address(mentorMatcher));
 
         // =====================================================================
@@ -390,43 +408,52 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         // =====================================================================
         console.log("--- Layer 6: Treasury & Governance ---");
 
-        StablecoinTreasury treasury = (_isLive("StablecoinTreasury", abi.encodePacked(type(StablecoinTreasury).creationCode, abi.encode(deployer)))
-            ? StablecoinTreasury(payable(_create2Address("StablecoinTreasury", abi.encodePacked(type(StablecoinTreasury).creationCode, abi.encode(deployer)))))
-            : new StablecoinTreasury{salt: Salts.salt("StablecoinTreasury")}(deployer));
+        // G2: born governance-owned (Governable is two-step, so a post-deploy
+        // transfer would leave the deployer as live governance until the multisig
+        // accepts — instead we construct with `governance` directly).
+        StablecoinTreasury treasury = (_isLive("StablecoinTreasury", abi.encodePacked(type(StablecoinTreasury).creationCode, abi.encode(governance)))
+            ? StablecoinTreasury(payable(_create2Address("StablecoinTreasury", abi.encodePacked(type(StablecoinTreasury).creationCode, abi.encode(governance)))))
+            : new StablecoinTreasury{salt: Salts.salt("StablecoinTreasury")}(governance));
         console.log("  StablecoinTreasury:", address(treasury));
 
         BulkComputeGateway gateway = (_isLive("BulkComputeGateway", abi.encodePacked(type(BulkComputeGateway).creationCode, abi.encode(
             address(treasury),
             address(oracle),
-            deployer   // admin
+            governance   // admin (G2: governance, not deployer)
         )))
             ? BulkComputeGateway(payable(_create2Address("BulkComputeGateway", abi.encodePacked(type(BulkComputeGateway).creationCode, abi.encode(
             address(treasury),
             address(oracle),
-            deployer   // admin
+            governance   // admin
         )))))
             : new BulkComputeGateway{salt: Salts.salt("BulkComputeGateway")}(
             address(treasury),
             address(oracle),
-            deployer   // admin
+            governance   // admin
         ));
-        treasury.setAuthorizedActivityRecorder(address(gateway), true);
+        // treasury.setAuthorizedActivityRecorder is onlyGovernance. When governance
+        // is the deployer (local dev) we can wire it here; on the production reroll
+        // (governance = multisig) it is a POST-CUT governance wiring step:
+        //   StablecoinTreasury.setAuthorizedActivityRecorder(BulkComputeGateway, true)
+        if (governance == deployer) {
+            treasury.setAuthorizedActivityRecorder(address(gateway), true);
+        }
         console.log("  BulkComputeGateway:", address(gateway));
 
         TestnetFarmingAccounting farming = (_isLive("TestnetFarmingAccounting", abi.encodePacked(type(TestnetFarmingAccounting).creationCode, abi.encode(
             address(contributions),
             address(treasury),
-            deployer   // governance
+            governance   // G2: governance-owned, not deployer
         )))
             ? TestnetFarmingAccounting(payable(_create2Address("TestnetFarmingAccounting", abi.encodePacked(type(TestnetFarmingAccounting).creationCode, abi.encode(
             address(contributions),
             address(treasury),
-            deployer   // governance
+            governance   // G2: governance-owned, not deployer
         )))))
             : new TestnetFarmingAccounting{salt: Salts.salt("TestnetFarmingAccounting")}(
             address(contributions),
             address(treasury),
-            deployer   // governance
+            governance   // G2: governance-owned, not deployer
         ));
         console.log("  TestnetFarmingAccounting:", address(farming));
 
@@ -535,8 +562,25 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
     address internal constant KEEP_SPEC_REGISTRY = 0x8cE7000C83D0ef5276A70BDC34bF2fa2FE0159ff;
     address internal constant KEEP_MARKET_MAKER_ALLOCATION = 0xfCC747D35d616c48bddef98a31B7e8ebC8786864;
 
+    /// @notice Fresh-keys reroll switch (owner-decided, MAC audit). When set,
+    ///         the WHOLE script deploys fresh — critically the three otherwise
+    ///         kept-live registries below deploy fresh (multisig-governed) instead
+    ///         of resolving to a legacy 40204 pin whose code does not exist on the
+    ///         re-rolled chain (which would revert `_keptLive`'s code assertion).
+    ///         Set `CITRATE_REROLL=1` in the reroll ceremony env; leave unset for
+    ///         a live (non-reroll) deploy so the existing addresses are preserved.
+    function _isReroll() internal view virtual returns (bool) {
+        return envUintOr("CITRATE_REROLL", 0) == 1;
+    }
+
     function _keptLive(string memory name) internal view returns (address a) {
         if (block.chainid != 40204) return address(0);
+        // Fresh-keys reroll: do NOT resolve the legacy pin (it has no code on the
+        // re-rolled chain). Fall through to the normal deploy-fresh path.
+        if (_isReroll()) {
+            console.log(string.concat("  reroll: deploying FRESH (not kept-live) ", name));
+            return address(0);
+        }
         bytes32 h = keccak256(bytes(name));
         if (h == keccak256("AgentDecisionRegistry")) a = KEEP_AGENT_DECISION_REGISTRY;
         else if (h == keccak256("SpecRegistry")) a = KEEP_SPEC_REGISTRY;
@@ -567,9 +611,12 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         _assertGovernance("HeartbeatMonitor", d.heartbeat, governance);
         _assertGovernance("DisputeResolution", d.dispute, governance);
         _assertGovernance("ComputePricingOracle", d.oracle, governance);
-        // Contracts that already took an explicit key (deployer) keep it.
-        _assertGovernance("MentorMatcher", d.mentorMatcher, deployer);
-        _assertGovernance("StablecoinTreasury", d.treasury, deployer);
+        // G2: these must be governance-held after deploy (MentorMatcher hands over
+        // via setGovernance once configured; StablecoinTreasury is born governance-owned).
+        _assertGovernance("MentorMatcher", d.mentorMatcher, governance);
+        _assertGovernance("StablecoinTreasury", d.treasury, governance);
+        _assertGovernance("BulkComputeGateway", d.gateway, governance);
+        _assertGovernance("TestnetFarmingAccounting", d.farming, governance);
         (bool ok, address provider) = _readAddress(d.paywall, abi.encodeWithSignature("provider()"));
         require(ok && provider == governance, "X402Paywall: provider is not the intended key");
 

@@ -29,10 +29,20 @@ interface IRoleEscalation {
 /// @dev Env: DEPLOY_KEY (role-admin + drafter), MSIG_SIGNER1_KEY, MSIG_SIGNER2_KEY.
 contract ProvisionWithMultisig is Script {
     IClassification constant CLASS = IClassification(0xd4b1680684106888b7c55d19fB236b41c192340e);
-    IMultiSig constant MSE = IMultiSig(0x01f6293FEB59C5950A484F35CE4317B40d8F76be);
+    // G5: OLD-chain envelope (dead after a reroll). Read from env; on 40204 the
+    // resolved address must have code. NOTE: CLASS/ROLE above are also old-chain
+    // addresses that must be repointed from the regenerated book before this
+    // demo provisioning is run on the new chain.
+    address constant MULTISIG_ENVELOPE_LEGACY_DEFAULT = 0x01f6293FEB59C5950A484F35CE4317B40d8F76be;
     IRoleEscalation constant ROLE = IRoleEscalation(0xC9B8c0bd4BDf70502095276dEE2b3f4d5da1488e);
 
+    function _multisigEnvelope() internal view returns (address e) {
+        try vm.envAddress("MULTISIG_ENVELOPE") returns (address a) { e = a; } catch { e = MULTISIG_ENVELOPE_LEGACY_DEFAULT; }
+        require(block.chainid != 40204 || e.code.length != 0, "MULTISIG_ENVELOPE must be a deployed envelope on 40204");
+    }
+
     function run() external {
+        IMultiSig MSE = IMultiSig(_multisigEnvelope());
         uint256 adminKey = vm.envUint("DEPLOY_KEY");
         uint256 s1 = vm.envUint("MSIG_SIGNER1_KEY");
         uint256 s2 = vm.envUint("MSIG_SIGNER2_KEY");

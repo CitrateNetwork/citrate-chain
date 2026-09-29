@@ -40,6 +40,84 @@ Do not start until every box in §0 is checked.
 
 ---
 
+## §FK — Fresh-Keys Reroll mode (owner ruling + MAC audit citrate-security)
+
+This runbook's default (I64-S1) is an **additions-only, addresses-preserved**
+reroll. The **fresh-keys reroll** is different and owner-decided: brand-new keys
+(deployer / treasury / faucet / governance + guardian multisigs / AA signers /
+membership owner), fund **only** the fresh keys in genesis (replay-safety;
+`chainId` stays **40204**), and **accept that ~57 addresses move**. Run it like this:
+
+1. **Generate the fresh keys** and fill
+   `contracts/addresses/GENESIS_ALLOC_TEMPLATE.json` (addresses-only — MAC confirms
+   every filled address has ZERO old-chain history). Slot the role addresses into
+   `core/economics/src/genesis.rs` (`fn testnet_beta`) role constants and rebuild
+   the binary (§1). The genesis funds **only** these fresh addresses.
+
+2. **Export the fresh keys** for the deploy scripts (they DERIVE every address —
+   no hardcodes). Nothing below is a literal in-repo:
+   ```bash
+   export DEPLOYER_ADDRESS=<fresh deployer>          # CEREMONY_DEPLOYER_ADDRESS too
+   export GOVERNANCE=<fresh governance multisig>     # DeployAll admin/governance
+   export GUARDIAN=<fresh guardian multisig>         # TreasuryGovernor guardian
+   export VALIDATOR_GOVERNANCE=<fresh validator gov> # ValidatorRegistry governance_/slasher_
+   export MEMBERSHIP_OWNER=<fresh grant signer>      # CitrateMemberSBT + vault owner
+   export CITRATE_AA_OWNER=<fresh AA owner>          # factory/paymaster owner
+   export CITRATE_AA_IDENTITY_SIGNER=<fresh signer>  # factory deploy-permit signer
+   export CITRATE_AA_SPONSOR_SIGNER=<fresh signer>   # paymaster sponsor signer
+   ```
+
+3. **Deploy fresh** with the reroll switch — `regenesis.sh --reroll` sets
+   `CITRATE_REROLL=1`, which makes `DeployAll` deploy the three otherwise
+   kept-live registries (`AgentDecisionRegistry` / `SpecRegistry` /
+   `MarketMakerAllocation`) **fresh + multisig-governed** instead of resolving to
+   a legacy 40204 pin that has no code on the re-rolled chain (which would revert):
+   ```bash
+   RPC_URL="$RPC_URL" bash scripts/ops/regenesis.sh --reroll --with-aa --broadcast --account deployer
+   ```
+   `regenesis.sh` does a **clean full `forge build` FIRST** (compile-scope
+   determinism — see below), deploys the ValidatorRegistry and exports its address
+   as `VALIDATOR_REGISTRY` so `DeployCoreMembership` derives it (never a frozen
+   literal), provisions the P256 verifier from vendored init code, and finally
+   runs `check-create2-determinism.sh`.
+
+4. **Fan out** the moved addresses — every consumer + droplet env is listed in
+   `scripts/ceremony/REROLL_FANOUT.md`.
+
+### Clean-build-cache step (MAC item #5) — REQUIRED before the membership deploy
+
+`CitrateMemberSBT`'s CREATE2 address depends on **compile scope**: under via-IR,
+solc's bytecode for an unchanged contract can differ between a script-only closure
+compile and a whole-repo build. Two safeguards, both mandatory:
+- `regenesis.sh` runs `forge clean && forge build` as **Step 0** so the ceremony
+  starts from a clean, whole-repo-pinned cache.
+- The membership CREATE2 gate runs under its **own closure-scoped profile**
+  (`foundry.toml [profile.membership]`, separate `out-membership`/`cache-membership`)
+  so its addresses are computed exactly as `forge script DeployCoreMembership`
+  (its own closure) would — never reusing whole-repo artifacts:
+  ```bash
+  cd contracts && FOUNDRY_PROFILE=membership forge test
+  ```
+
+### §FK.coop — Co-op factory is a SEPARATE-REPO ceremony (MAC item #9)
+
+The fresh-keys reroll must ALSO redeploy citrate-coop's `CitrateCooperativeFactory`
++ `CoopDeployer` — they live in **citrate-coop**, not this repo, and are NOT
+vendored here. Deploy them from that repo BEFORE `emit-address-table.sh`'s final
+verify (it asserts code at every book address, including the co-op factory):
+
+```bash
+cd ../citrate-coop/contracts
+forge script script/DeployCoop.s.sol \
+  --rpc-url "$RPC_URL" --sender "$DEPLOYER_ADDRESS" --account deployer --broadcast --slow
+```
+
+> Known open item (memory): `createCooperative` reverts because the chain does not
+> bump the nonce from ctor CREATEs — deploy the factory only after that fix
+> (no `new CoopDeployer()` in the ctor, or the EIP-161 fix) lands in citrate-coop.
+
+---
+
 ## §1 — Build the i64 binary + prove parity
 
 ```bash

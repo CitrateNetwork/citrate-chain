@@ -29,8 +29,17 @@ contract DeployDpf09AppsContracts is ScriptEnv {
 
     function run() external returns (address appRegistry, address crossOrgIndex) {
         address deployer = deployerAddress();
-        address governance = envAddressOr("GOVERNANCE", deployer);
+        address governance = requiredGovernance("GOVERNANCE", deployer);
         address envelopeOracle = envAddressOr("MULTISIG_ENVELOPE", MULTISIG_ENVELOPE_STAGE_1);
+        // G5: MULTISIG_ENVELOPE_STAGE_1 is an OLD-chain address with no code after a
+        // reroll; AppRegistry embeds this oracle in its constructor args, so wiring it
+        // to a dead address would silently ship a broken registry. Fail-closed on 40204:
+        // the ceremony must forward the freshly-deployed MultiSigEnvelope (runtime, like
+        // VALIDATOR_REGISTRY). Off-chain dev keeps the constant default.
+        require(
+            block.chainid != 40204 || envelopeOracle.code.length != 0,
+            "MULTISIG_ENVELOPE must be set to the deployed envelope on 40204 (old default has no code)"
+        );
 
         console.log("=== DPF-09 Apps & Contracts deployment (Stage 7) ===");
         console.log("Deployer:        ", deployer);

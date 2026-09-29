@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import "forge-std/Script.sol";
 import {P256} from "../../src/aa/lib/webauthn/P256.sol";
+import {P256VerifierInitCode} from "./lib/P256VerifierInitCode.sol";
 
 /// @title DeployP256Verifier — provision the P-256 verifier the passkey validator calls (PBA-L2-011)
 /// @notice `P256.VERIFIER` (0xc2b7…De4) is Daimo's canonical P256Verifier, a
@@ -17,10 +18,12 @@ import {P256} from "../../src/aa/lib/webauthn/P256.sol";
 ///         broadcast unless it equals `P256.VERIFIER`. Supplying the wrong
 ///         bytes cannot put anything else at that address.
 ///
-///         Env (the canonical init code is NOT vendored in this repo):
-///           P256_VERIFIER_INITCODE  hex init code of daimo-eth/p256-verifier
-///                                   (the exact bytes Daimo deployed)
-///           P256_VERIFIER_SALT      bytes32 salt Daimo used (default 0x0)
+///         Init code: the canonical Daimo init code is NOW VENDORED in-repo at
+///         `script/aa/lib/P256VerifierInitCode.sol` (reroll-reproducible from
+///         this repo alone). The env overrides remain for flexibility but are
+///         OPTIONAL — with neither set, the vendored bytes + salt-0 are used.
+///           P256_VERIFIER_INITCODE  (optional) hex init code override
+///           P256_VERIFIER_SALT      (optional) bytes32 salt (default = vendored)
 ///         Run:
 ///           forge script script/aa/DeployP256Verifier.s.sol --rpc-url $RPC --broadcast --account deployer
 ///         Then gate (post-redeploy): REQUIRE_ALL_CODE=true forge script script/CheckDeployedAdmins.s.sol --rpc-url $RPC
@@ -33,8 +36,9 @@ contract DeployP256Verifier is Script {
             return;
         }
         require(ARACHNID_FACTORY.code.length != 0, "Arachnid CREATE2 deployer missing");
-        bytes memory initCode = vm.envBytes("P256_VERIFIER_INITCODE");
-        bytes32 salt = vm.envOr("P256_VERIFIER_SALT", bytes32(0));
+        // Default to the vendored canonical Daimo init code; env may override.
+        bytes memory initCode = vm.envOr("P256_VERIFIER_INITCODE", P256VerifierInitCode.initCode());
+        bytes32 salt = vm.envOr("P256_VERIFIER_SALT", P256VerifierInitCode.SALT);
         address predicted = computeAddress(salt, initCode);
         console.log("predicted:", predicted);
         require(predicted == P256.VERIFIER, "init code/salt do not produce P256.VERIFIER; refusing");

@@ -13,7 +13,7 @@ import "../src/defense_prime/SponsorEvidenceRegistry.sol";
 contract DeployDpf16Sponsor is ScriptEnv, GovernanceOps {
     function run() external returns (address sponsor) {
         address deployer = deployerAddress();
-        address governance = envAddressOr("GOVERNANCE", deployer);
+        address governance = requiredGovernance("GOVERNANCE", deployer);
 
         console.log("=== DPF-16 Sponsor Evidence deployment (Stage 14) ===");
         console.log("Deployer:        ", deployer);

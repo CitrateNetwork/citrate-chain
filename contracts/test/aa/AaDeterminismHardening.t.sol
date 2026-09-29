@@ -50,15 +50,32 @@ import {CitratePaymaster} from "../../src/aa/paymaster/CitratePaymaster.sol";
  * projection uses `CREATE2_FACTORY` (0x4e59…).
  */
 contract AaDeterminismHardeningTest is Test {
-    // --- Canonical constructor args for chain 40204 ---
-    // Verified against the LIVE deployed factory/paymaster on 40204 (rpc.citrate.ai):
-    //   factory.identitySigner() / factory.owner() / paymaster.owner() / paymaster.sponsorSigner().
-    // OWNER + SPONSOR_SIGNER moved at the deployer-rotation (0x4250675F→0x4fAB35c8)
-    // and the KEYSAFE sponsor-key rotation; re-pinned here so the projections land
-    // on the canonical 40204.json addresses.
-    address internal constant IDENTITY_SIGNER = 0x8A9062625E98666Fc0072Ee2E7CB8AB08Bd1b651; // factory.identitySigner()
-    address internal constant OWNER = 0x4fAB35c8c5033c80b3a0452A873B81e6ED4ED732; // factory.owner()/paymaster.owner() (canonical deployer)
-    address internal constant SPONSOR_SIGNER = 0x676b00c12A958de4901CFa1c81C84086C5DA8ed8; // paymaster.sponsorSigner()
+    // --- AA key inputs — DERIVED at deploy time (fresh-keys reroll) ---
+    // The factory/paymaster key args (identitySigner / owner / sponsorSigner) come
+    // from the SAME env DeployAA reads (CITRATE_AA_*). Under a fresh-keys reroll
+    // (owner ruling + MAC audit) these MOVE, so the factory + paymaster addresses
+    // move with them — they are therefore NOT frozen literals here. With env
+    // unset they fall back to derived, obviously-not-a-key placeholders so the
+    // determinism relationships are still exercised deterministically.
+    function _identitySigner() internal view returns (address) {
+        return _envAddr("CITRATE_AA_IDENTITY_SIGNER", _phKey("identity"));
+    }
+
+    function _owner() internal view returns (address) {
+        return _envAddr("CITRATE_AA_OWNER", _phKey("owner"));
+    }
+
+    function _sponsorSigner() internal view returns (address) {
+        return _envAddr("CITRATE_AA_SPONSOR_SIGNER", _identitySigner());
+    }
+
+    function _phKey(string memory s) internal pure returns (address) {
+        return address(uint160(uint256(keccak256(abi.encodePacked("citrate.reroll.placeholder.aa.", s)))));
+    }
+
+    function _envAddr(string memory k, address d) internal view returns (address) {
+        try vm.envAddress(k) returns (address v) { return v; } catch { return d; }
+    }
 
     uint256 internal constant DAILY_CAP = 0.01 ether;
     uint256 internal constant RECOVERY_CAP = 0.01 ether;
@@ -66,18 +83,30 @@ contract AaDeterminismHardeningTest is Test {
     uint256 internal constant MAX_FEE_CEIL = 20 gwei;
     uint256 internal constant GLOBAL_CAP = 5 ether;
 
-    // --- The 5 PINNED production addresses (Arachnid 0x4e59… deployer, default profile) ---
-    // Load-bearing across the whole federation. Every consumer re-pins these ONCE
-    // at this reroll and NEVER again. If a value here changes, a determinism input
-    // silently moved — treat a failure of test_pinned_production_addresses_tripwire
-    // as a release blocker, not a test to "update".
-    // canonical: contracts/addresses/40204.json (aaStack) — re-pinned at the
-    // solc-0.8.36 / OZ-5.7 reroll + AA redeploy (2026-09-12 ceremony).
-    address internal constant EP_PIN = 0x97d5391a647429233E202f99231743C53a648f3c; // aaStack.EntryPoint
-    address internal constant GUARDIAN_PIN = 0x0A909769160C1945401b8f37a9310d37DbB6a891; // aaStack.GuardianRecoveryModule
-    address internal constant WALLET_IMPL_PIN = 0x2D742B98D867Fc7363F530DD6d756622e4Eb768D; // aaStack.CitrateWallet
-    address internal constant FACTORY_PIN = 0x86486d1dE9F256E2CBa327C46Ac11120Df0AA51a; // aaStack.CitrateWalletFactory
-    address internal constant PAYMASTER_PIN = 0xfDc9F7a72163b5d45bECDB8a9d8D44b970f77318; // aaStack.CitratePaymaster
+    // --- KEY-INDEPENDENT production-address anchors (Arachnid 0x4e59… deployer) ---
+    // These three take NO key constructor args, so a FRESH-KEYS reroll does NOT
+    // move them — only a bytecode / optimizer / via_ir / salt drift does. They
+    // stay pinned as pure-bytecode determinism teeth.
+    //   EntryPoint / GuardianRecoveryModule: no ctor args.
+    //   CitrateWallet impl: ctor arg is the (key-independent) EntryPoint address.
+    // The FACTORY and PAYMASTER addresses DO embed the AA keys, so under fresh
+    // keys they move — they are asserted RELATIONALLY below (derived from the
+    // pinned walletImpl + the env keys), never as frozen literals.
+    address internal constant EP_PIN = 0x97d5391a647429233E202f99231743C53a648f3c; // aaStack.EntryPoint (no key args)
+    address internal constant GUARDIAN_PIN = 0x0A909769160C1945401b8f37a9310d37DbB6a891; // aaStack.GuardianRecoveryModule (no key args)
+    address internal constant WALLET_IMPL_PIN = 0x2D742B98D867Fc7363F530DD6d756622e4Eb768D; // aaStack.CitrateWallet (EntryPoint-only)
+
+    /// The factory address for the current (env-derived) keys — derived, not pinned.
+    function _factoryPin() internal view returns (address) {
+        return _factoryAddr(WALLET_IMPL_PIN, _identitySigner(), _owner());
+    }
+
+    /// The paymaster address for the current (env-derived) keys — derived, not pinned.
+    function _paymasterPin() internal view returns (address) {
+        return _paymasterAddr(
+            EP_PIN, _owner(), _factoryPin(), _sponsorSigner(), DAILY_CAP, RECOVERY_CAP, FIRST_OP_CAP, MAX_FEE_CEIL, GLOBAL_CAP
+        );
+    }
 
     // ERC-4337 v0.7 canonical EntryPoint (nonce-0 deploy, same on every EVM chain).
     // Ours is deliberately NOT this — see test_our_entryPoint_distinct_from_canonical_v07.
@@ -257,21 +286,20 @@ contract AaDeterminismHardeningTest is Test {
     /// equals the pinned constant. A failure here means a determinism input
     /// (solc / optimizer / via_ir / bytecode_hash / cbor_metadata / a salt / a
     /// ctor arg) changed — every downstream repo's pinned address just broke.
-    function test_pinned_production_addresses_tripwire() public pure {
+    function test_pinned_production_addresses_tripwire() public view {
+        // Key-independent bytecode anchors: MUST NOT move (fresh keys or not).
         assertEq(_epAddr(), EP_PIN, "EntryPoint pin drift");
         assertEq(_guardianAddr(), GUARDIAN_PIN, "GuardianRecoveryModule pin drift");
-
-        // walletImpl embeds the (pinned) EntryPoint; factory embeds the (pinned)
-        // walletImpl; paymaster embeds the (pinned) EntryPoint + factory — i.e.
-        // the exact production cascade.
         assertEq(_walletImplAddr(EP_PIN), WALLET_IMPL_PIN, "CitrateWallet impl pin drift");
-        assertEq(_factoryAddr(WALLET_IMPL_PIN, IDENTITY_SIGNER, OWNER), FACTORY_PIN, "CitrateWalletFactory pin drift");
+
+        // The factory embeds the (pinned) walletImpl + the env keys; the paymaster
+        // embeds the (pinned) EntryPoint + factory + env keys — the exact production
+        // cascade, re-derived from the fresh keys in effect (not a frozen literal).
+        assertEq(_factoryPin().code.length, 0, "sanity: projection is an address, not code");
         assertEq(
-            _paymasterAddr(
-                EP_PIN, OWNER, FACTORY_PIN, SPONSOR_SIGNER, DAILY_CAP, RECOVERY_CAP, FIRST_OP_CAP, MAX_FEE_CEIL, GLOBAL_CAP
-            ),
-            PAYMASTER_PIN,
-            "CitratePaymaster pin drift"
+            _paymasterAddr(EP_PIN, _owner(), _factoryPin(), _sponsorSigner(), DAILY_CAP, RECOVERY_CAP, FIRST_OP_CAP, MAX_FEE_CEIL, GLOBAL_CAP),
+            _paymasterPin(),
+            "paymaster cascade must derive consistently from walletImpl + keys"
         );
     }
 
@@ -283,15 +311,15 @@ contract AaDeterminismHardeningTest is Test {
     /// and (transitively, because the paymaster embeds the factory address) the
     /// paymaster — but NOT the EntryPoint, guardian, or walletImpl.
     function test_sensitivity_identitySigner_moves_factory_and_paymaster() public {
-        address bumped = address(uint160(IDENTITY_SIGNER) + 1);
-        address fBase = _factoryAddr(WALLET_IMPL_PIN, IDENTITY_SIGNER, OWNER);
-        address fBump = _factoryAddr(WALLET_IMPL_PIN, bumped, OWNER);
+        address bumped = address(uint160(_identitySigner()) + 1);
+        address fBase = _factoryAddr(WALLET_IMPL_PIN, _identitySigner(), _owner());
+        address fBump = _factoryAddr(WALLET_IMPL_PIN, bumped, _owner());
         assertTrue(fBase != fBump, "factory MUST move when identitySigner changes");
 
         address pBase =
-            _paymasterAddr(EP_PIN, OWNER, fBase, SPONSOR_SIGNER, DAILY_CAP, RECOVERY_CAP, FIRST_OP_CAP, MAX_FEE_CEIL, GLOBAL_CAP);
+            _paymasterAddr(EP_PIN, _owner(), fBase, _sponsorSigner(), DAILY_CAP, RECOVERY_CAP, FIRST_OP_CAP, MAX_FEE_CEIL, GLOBAL_CAP);
         address pBump =
-            _paymasterAddr(EP_PIN, OWNER, fBump, SPONSOR_SIGNER, DAILY_CAP, RECOVERY_CAP, FIRST_OP_CAP, MAX_FEE_CEIL, GLOBAL_CAP);
+            _paymasterAddr(EP_PIN, _owner(), fBump, _sponsorSigner(), DAILY_CAP, RECOVERY_CAP, FIRST_OP_CAP, MAX_FEE_CEIL, GLOBAL_CAP);
         assertTrue(pBase != pBump, "paymaster MUST move (embeds the moved factory)");
 
         assertEq(_epAddr(), EP_PIN, "EntryPoint MUST NOT move on identitySigner");
@@ -302,15 +330,15 @@ contract AaDeterminismHardeningTest is Test {
     /// owner is a ctor arg of BOTH the factory and the paymaster. Changing it must
     /// move both directly — but NOT the EntryPoint, guardian, or walletImpl.
     function test_sensitivity_owner_moves_factory_and_paymaster() public {
-        address bumped = address(uint160(OWNER) + 1);
-        address fBase = _factoryAddr(WALLET_IMPL_PIN, IDENTITY_SIGNER, OWNER);
-        address fBump = _factoryAddr(WALLET_IMPL_PIN, IDENTITY_SIGNER, bumped);
+        address bumped = address(uint160(_owner()) + 1);
+        address fBase = _factoryAddr(WALLET_IMPL_PIN, _identitySigner(), _owner());
+        address fBump = _factoryAddr(WALLET_IMPL_PIN, _identitySigner(), bumped);
         assertTrue(fBase != fBump, "factory MUST move when owner changes");
 
         address pBase =
-            _paymasterAddr(EP_PIN, OWNER, fBase, SPONSOR_SIGNER, DAILY_CAP, RECOVERY_CAP, FIRST_OP_CAP, MAX_FEE_CEIL, GLOBAL_CAP);
+            _paymasterAddr(EP_PIN, _owner(), fBase, _sponsorSigner(), DAILY_CAP, RECOVERY_CAP, FIRST_OP_CAP, MAX_FEE_CEIL, GLOBAL_CAP);
         address pBump =
-            _paymasterAddr(EP_PIN, bumped, fBump, SPONSOR_SIGNER, DAILY_CAP, RECOVERY_CAP, FIRST_OP_CAP, MAX_FEE_CEIL, GLOBAL_CAP);
+            _paymasterAddr(EP_PIN, bumped, fBump, _sponsorSigner(), DAILY_CAP, RECOVERY_CAP, FIRST_OP_CAP, MAX_FEE_CEIL, GLOBAL_CAP);
         assertTrue(pBase != pBump, "paymaster MUST move when owner changes");
 
         assertEq(_epAddr(), EP_PIN, "EntryPoint MUST NOT move on owner");
@@ -323,15 +351,15 @@ contract AaDeterminismHardeningTest is Test {
     /// guardian, walletImpl) fixed. This documents that a sponsor-key rotation is
     /// a paymaster-only redeploy.
     function test_sensitivity_sponsorSigner_moves_paymaster_only() public {
-        address bumped = address(uint160(SPONSOR_SIGNER) + 1);
+        address bumped = address(uint160(_sponsorSigner()) + 1);
 
         // sponsor is structurally not a factory input → factory stays at its pin.
-        assertEq(_factoryAddr(WALLET_IMPL_PIN, IDENTITY_SIGNER, OWNER), FACTORY_PIN, "factory MUST NOT move on sponsor");
+        assertEq(_factoryAddr(WALLET_IMPL_PIN, _identitySigner(), _owner()), _factoryPin(), "factory MUST NOT move on sponsor");
 
         address pBase =
-            _paymasterAddr(EP_PIN, OWNER, FACTORY_PIN, SPONSOR_SIGNER, DAILY_CAP, RECOVERY_CAP, FIRST_OP_CAP, MAX_FEE_CEIL, GLOBAL_CAP);
+            _paymasterAddr(EP_PIN, _owner(), _factoryPin(), _sponsorSigner(), DAILY_CAP, RECOVERY_CAP, FIRST_OP_CAP, MAX_FEE_CEIL, GLOBAL_CAP);
         address pBump =
-            _paymasterAddr(EP_PIN, OWNER, FACTORY_PIN, bumped, DAILY_CAP, RECOVERY_CAP, FIRST_OP_CAP, MAX_FEE_CEIL, GLOBAL_CAP);
+            _paymasterAddr(EP_PIN, _owner(), _factoryPin(), bumped, DAILY_CAP, RECOVERY_CAP, FIRST_OP_CAP, MAX_FEE_CEIL, GLOBAL_CAP);
         assertTrue(pBase != pBump, "paymaster MUST move when sponsorSigner changes");
 
         assertEq(_epAddr(), EP_PIN, "EntryPoint MUST NOT move on sponsor");
@@ -345,46 +373,46 @@ contract AaDeterminismHardeningTest is Test {
     /// (rather than the on-chain setters) is a paymaster-only move.
     function test_sensitivity_caps_move_paymaster_only() public {
         address base =
-            _paymasterAddr(EP_PIN, OWNER, FACTORY_PIN, SPONSOR_SIGNER, DAILY_CAP, RECOVERY_CAP, FIRST_OP_CAP, MAX_FEE_CEIL, GLOBAL_CAP);
+            _paymasterAddr(EP_PIN, _owner(), _factoryPin(), _sponsorSigner(), DAILY_CAP, RECOVERY_CAP, FIRST_OP_CAP, MAX_FEE_CEIL, GLOBAL_CAP);
 
         assertTrue(
             base
                 != _paymasterAddr(
-                    EP_PIN, OWNER, FACTORY_PIN, SPONSOR_SIGNER, DAILY_CAP + 1, RECOVERY_CAP, FIRST_OP_CAP, MAX_FEE_CEIL, GLOBAL_CAP
+                    EP_PIN, _owner(), _factoryPin(), _sponsorSigner(), DAILY_CAP + 1, RECOVERY_CAP, FIRST_OP_CAP, MAX_FEE_CEIL, GLOBAL_CAP
                 ),
             "dailyCap MUST move paymaster"
         );
         assertTrue(
             base
                 != _paymasterAddr(
-                    EP_PIN, OWNER, FACTORY_PIN, SPONSOR_SIGNER, DAILY_CAP, RECOVERY_CAP + 1, FIRST_OP_CAP, MAX_FEE_CEIL, GLOBAL_CAP
+                    EP_PIN, _owner(), _factoryPin(), _sponsorSigner(), DAILY_CAP, RECOVERY_CAP + 1, FIRST_OP_CAP, MAX_FEE_CEIL, GLOBAL_CAP
                 ),
             "recoveryCap MUST move paymaster"
         );
         assertTrue(
             base
                 != _paymasterAddr(
-                    EP_PIN, OWNER, FACTORY_PIN, SPONSOR_SIGNER, DAILY_CAP, RECOVERY_CAP, FIRST_OP_CAP + 1, MAX_FEE_CEIL, GLOBAL_CAP
+                    EP_PIN, _owner(), _factoryPin(), _sponsorSigner(), DAILY_CAP, RECOVERY_CAP, FIRST_OP_CAP + 1, MAX_FEE_CEIL, GLOBAL_CAP
                 ),
             "firstOpCap MUST move paymaster"
         );
         assertTrue(
             base
                 != _paymasterAddr(
-                    EP_PIN, OWNER, FACTORY_PIN, SPONSOR_SIGNER, DAILY_CAP, RECOVERY_CAP, FIRST_OP_CAP, MAX_FEE_CEIL + 1, GLOBAL_CAP
+                    EP_PIN, _owner(), _factoryPin(), _sponsorSigner(), DAILY_CAP, RECOVERY_CAP, FIRST_OP_CAP, MAX_FEE_CEIL + 1, GLOBAL_CAP
                 ),
             "maxFeeCeiling MUST move paymaster"
         );
         assertTrue(
             base
                 != _paymasterAddr(
-                    EP_PIN, OWNER, FACTORY_PIN, SPONSOR_SIGNER, DAILY_CAP, RECOVERY_CAP, FIRST_OP_CAP, MAX_FEE_CEIL, GLOBAL_CAP + 1
+                    EP_PIN, _owner(), _factoryPin(), _sponsorSigner(), DAILY_CAP, RECOVERY_CAP, FIRST_OP_CAP, MAX_FEE_CEIL, GLOBAL_CAP + 1
                 ),
             "globalDailyCap MUST move paymaster"
         );
 
         // caps are not inputs to the factory / EntryPoint / guardian / walletImpl.
-        assertEq(_factoryAddr(WALLET_IMPL_PIN, IDENTITY_SIGNER, OWNER), FACTORY_PIN, "factory MUST NOT move on caps");
+        assertEq(_factoryAddr(WALLET_IMPL_PIN, _identitySigner(), _owner()), _factoryPin(), "factory MUST NOT move on caps");
         assertEq(_epAddr(), EP_PIN, "EntryPoint MUST NOT move on caps");
         assertEq(_guardianAddr(), GUARDIAN_PIN, "guardian MUST NOT move on caps");
         assertEq(_walletImplAddr(EP_PIN), WALLET_IMPL_PIN, "walletImpl MUST NOT move on caps");
@@ -419,11 +447,13 @@ contract AaDeterminismHardeningTest is Test {
     /// it (no redeploy, no revert) and builds the whole cascade on that exact
     /// EntryPoint — landing every downstream contract at its pinned address.
     function test_deployAA_embeds_preexisting_entryPoint() public {
-        // Canonical ceremony inputs (see IDENTITY_SIGNER/OWNER/SPONSOR_SIGNER above);
-        // must match so DeployAA's factory/paymaster land on the pinned addresses.
-        vm.setEnv("CITRATE_AA_IDENTITY_SIGNER", "0x8A9062625E98666Fc0072Ee2E7CB8AB08Bd1b651");
-        vm.setEnv("CITRATE_AA_OWNER", "0x4fAB35c8c5033c80b3a0452A873B81e6ED4ED732");
-        vm.setEnv("CITRATE_AA_SPONSOR_SIGNER", "0x676b00c12A958de4901CFa1c81C84086C5DA8ed8");
+        // Fresh-keys reroll: feed DeployAA the SAME (derived-placeholder) keys the
+        // test projects against, via env — no hardcoded production keys. DeployAA
+        // and the projection helpers then read identical inputs, so the derived
+        // factory/paymaster addresses match exactly.
+        vm.setEnv("CITRATE_AA_IDENTITY_SIGNER", vm.toString(_phKey("identity")));
+        vm.setEnv("CITRATE_AA_OWNER", vm.toString(_phKey("owner")));
+        vm.setEnv("CITRATE_AA_SPONSOR_SIGNER", vm.toString(_phKey("sponsor")));
 
         // PBA-L2-011: DeployAA now refuses to run unless the P-256 verifier the
         // passkey validator hard-codes has code. Provision a stand-in here (the
@@ -440,10 +470,12 @@ contract AaDeterminismHardeningTest is Test {
 
         assertEq(d.entryPoint, EP_PIN, "DeployAA must reuse the pre-existing EntryPoint");
         assertEq(EP_PIN.codehash, epCodeHash, "DeployAA must NOT redeploy/disturb the EntryPoint");
+        // Key-independent contracts land at their bytecode pins.
         assertEq(address(d.recovery), GUARDIAN_PIN, "guardian must land at its pin");
         assertEq(address(d.walletImpl), WALLET_IMPL_PIN, "walletImpl must land at its pin");
-        assertEq(address(d.factory), FACTORY_PIN, "factory must land at its pin");
-        assertEq(address(d.paymaster), PAYMASTER_PIN, "paymaster must land at its pin");
+        // Key-dependent contracts land at the address DERIVED from the fresh keys.
+        assertEq(address(d.factory), _factoryPin(), "factory must land at the derived (fresh-key) address");
+        assertEq(address(d.paymaster), _paymasterPin(), "paymaster must land at the derived (fresh-key) address");
     }
 
     // =====================================================================

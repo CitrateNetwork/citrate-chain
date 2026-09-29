@@ -1,0 +1,135 @@
+{
+  "_README": [
+    "FRESH-KEYS REROLL genesis-allocation template (owner ruling + MAC audit citrate-security).",
+    "chainId stays 40204. This reroll funds ONLY brand-new keys in genesis, so no",
+    "allocation carries any old-chain history (replay-safety).",
+    "",
+    "HOW TO USE: at ceremony time, generate each fresh key, paste its address into",
+    "'address' (replacing the 0x000..000 placeholder) and set 'filled': true, then",
+    "slot the values into the matching genesis.rs role constant named in 'genesis_const'",
+    "(core/economics/src/genesis.rs, fn testnet_beta) before rebuilding the node binary.",
+    "MAC verification: every 'address' below MUST be a freshly generated key with ZERO",
+    "prior transactions on the old chain — confirm before signing off.",
+    "",
+    "Balances are in SALT (whole tokens); the genesis builder multiplies by 1e18.",
+    "The Arachnid CREATE2 factory is NOT a key: it is the fixed EIP-2470 deployer",
+    "(0x4e59b44847b379578588920cA78FbF26c0B4956C), pre-stamped from a presigned tx —",
+    "it is listed as fixed:true and MUST NOT be rotated (its address fixes every",
+    "CREATE2 projection)."
+  ],
+  "chain_id": 40204,
+  "supply_total_salt": 1000000000000,
+  "mining_pool_max_salt": 414840000000,
+  "allocations": [
+    {
+      "role": "treasury",
+      "genesis_const": "TESTNET_TREASURY_ADDRESS",
+      "purpose": "Main supply / ecosystem fund; funds future allocations.",
+      "balance_salt": 500000000000,
+      "fresh_key": true,
+      "filled": false,
+      "address": "0x0000000000000000000000000000000000000000"
+    },
+    {
+      "role": "reserve_legacy_faucet",
+      "genesis_const": "TESTNET_FAUCET_ADDRESS",
+      "purpose": "Reserve wallet (the live faucet does NOT sign with this).",
+      "balance_salt": 50000000000,
+      "fresh_key": true,
+      "filled": false,
+      "address": "0x0000000000000000000000000000000000000000"
+    },
+    {
+      "role": "deployer",
+      "genesis_const": "TESTNET_DEPLOYER_ADDRESS",
+      "purpose": "Ceremony deployer (nonce-0 fresh). Signs every CREATE2 ceremony tx. Set DEPLOYER_ADDRESS / CEREMONY_DEPLOYER_ADDRESS to this for regenesis.sh.",
+      "balance_salt": 10000000000,
+      "fresh_key": true,
+      "filled": false,
+      "address": "0x0000000000000000000000000000000000000000"
+    },
+    {
+      "role": "team_dev",
+      "genesis_const": "TESTNET_TEAM_ADDRESS",
+      "purpose": "Development and testing.",
+      "balance_salt": 10000000000,
+      "fresh_key": true,
+      "filled": false,
+      "address": "0x0000000000000000000000000000000000000000"
+    },
+    {
+      "role": "validator_ops",
+      "genesis_const": "TESTNET_VALIDATOR_ADDRESS",
+      "purpose": "Block production / staking ops.",
+      "balance_salt": 5000000000,
+      "fresh_key": true,
+      "filled": false,
+      "address": "0x0000000000000000000000000000000000000000"
+    },
+    {
+      "role": "faucet_signer",
+      "genesis_const": "DETERMINISTIC_FAUCET_SIGNER_ADDRESS",
+      "purpose": "Live faucet service signing key (derived; pre-funded so a reroll needs no manual top-up).",
+      "balance_salt": 10000000000,
+      "fresh_key": true,
+      "filled": false,
+      "address": "0x0000000000000000000000000000000000000000"
+    },
+    {
+      "role": "validator_staker_1",
+      "genesis_const": "VALIDATOR_STAKER_1_ADDRESS",
+      "purpose": "Dedicated validator-staker EOA (fleet node 1); bonds >= 32k minStake before activation.",
+      "balance_salt": 40000000,
+      "fresh_key": true,
+      "filled": false,
+      "address": "0x0000000000000000000000000000000000000000"
+    },
+    {
+      "role": "validator_staker_2",
+      "genesis_const": "VALIDATOR_STAKER_2_ADDRESS",
+      "purpose": "Dedicated validator-staker EOA (fleet node 2).",
+      "balance_salt": 40000000,
+      "fresh_key": true,
+      "filled": false,
+      "address": "0x0000000000000000000000000000000000000000"
+    },
+    {
+      "role": "validator_staker_3",
+      "genesis_const": "VALIDATOR_STAKER_3_ADDRESS",
+      "purpose": "Dedicated validator-staker EOA (fleet node 3).",
+      "balance_salt": 40000000,
+      "fresh_key": true,
+      "filled": false,
+      "address": "0x0000000000000000000000000000000000000000"
+    },
+    {
+      "role": "validator_staker_4",
+      "genesis_const": "VALIDATOR_STAKER_4_ADDRESS",
+      "purpose": "Dedicated validator-staker EOA (fleet node 4).",
+      "balance_salt": 40000000,
+      "fresh_key": true,
+      "filled": false,
+      "address": "0x0000000000000000000000000000000000000000"
+    },
+    {
+      "role": "arachnid_create2_factory",
+      "genesis_const": "arachnid_deterministic_deployer_account()",
+      "purpose": "EIP-2470 deterministic CREATE2 deployer. NOT a key. Pre-stamped bytecode from a presigned tx. Its address fixes every CREATE2 projection — do not rotate.",
+      "balance_salt": 0,
+      "fresh_key": false,
+      "fixed": true,
+      "filled": true,
+      "address": "0x4e59b44847b379578588920cA78FbF26c0B4956C"
+    }
+  ],
+  "post_genesis_governance_keys": {
+    "_note": "NOT genesis-funded, but they are the fresh keys the deploy scripts derive addresses from. Set them in the regenesis.sh env (see the runbook). They MOVE the deployed contract addresses.",
+    "GOVERNANCE": "fresh governance multisig — DeployAll admin/governance arg",
+    "GUARDIAN": "fresh guardian multisig — TreasuryGovernor guardian arg",
+    "VALIDATOR_GOVERNANCE": "fresh validator governance — ValidatorRegistry governance_/slasher_",
+    "MEMBERSHIP_OWNER": "fresh grant/treasury signer — CitrateMemberSBT owner + vault initialize owner",
+    "CITRATE_AA_OWNER": "fresh AA owner multisig — factory/paymaster owner",
+    "CITRATE_AA_IDENTITY_SIGNER": "fresh AA identity signer — factory deploy-permit signer",
+    "CITRATE_AA_SPONSOR_SIGNER": "fresh AA sponsor signer — paymaster sponsorship signer"
+  }
+}

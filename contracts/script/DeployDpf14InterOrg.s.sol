@@ -12,7 +12,7 @@ import "../src/defense_prime/CrossOrgEnvelope.sol";
 contract DeployDpf14InterOrg is ScriptEnv, GovernanceOps {
     function run() external returns (address crossOrg) {
         address deployer = deployerAddress();
-        address governance = envAddressOr("GOVERNANCE", deployer);
+        address governance = requiredGovernance("GOVERNANCE", deployer);
 
         console.log("=== DPF-14 Inter-Org deployment (Stage 12) ===");
         console.log("Deployer:        ", deployer);

@@ -12,7 +12,7 @@ import "../src/defense_prime/TripwireRegistry.sol";
 contract DeployDpf15Compliance is ScriptEnv, GovernanceOps {
     function run() external returns (address tripwire) {
         address deployer = deployerAddress();
-        address governance = envAddressOr("GOVERNANCE", deployer);
+        address governance = requiredGovernance("GOVERNANCE", deployer);
 
         console.log("=== DPF-15 Compliance deployment (Stage 13) ===");
         console.log("Deployer:        ", deployer);
