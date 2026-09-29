@@ -1617,6 +1617,19 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             exec.get_nonce(&citrate_execution::address_utils::normalize_address(pk))
         })
     })
+    // PBA-N9 (security#134): reject a transaction on every ingress path when the
+    // sender's committed balance cannot cover it together with its already-pooled
+    // transactions. Without this the pool admits unfunded floods that evict honest
+    // txs and yield empty blocks at zero cost. Balances are far below u128::MAX
+    // (supply is 1e30 wei), so the U256->u128 saturation never loses precision.
+    .with_state_balance_reader({
+        let exec = executor.clone();
+        Arc::new(move |pk: &citrate_consensus::types::PublicKey| {
+            let bal = exec.get_balance(&citrate_execution::address_utils::normalize_address(pk));
+            let cap = primitive_types::U256::from(u128::MAX);
+            (if bal > cap { cap } else { bal }).low_u128()
+        })
+    })
     // Native signatures: from tip H - 1 the pool admits only the chain-bound
     // (v2) digest and evicts legacy ones (`citrate_consensus::native_sig`).
     .with_native_sig_policy(citrate_consensus::hardening::PbaHardening::from_process(), {
@@ -3788,6 +3801,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // advances the applied tip. Present iff execute-on-receive (v2) is enabled.
         if let Some(app) = &canonical_applicator {
             producer_instance = producer_instance.with_applied_tip_lock(app.advance_lock());
+            // #126 (producer catch-up gate): refuse to seal while this node is rebuilding
+            // its applied state from genesis or has not yet hydrated its DAG after a
+            // restart, so a lagging/replaying node never forks the fleet by sealing on a
+            // stale (but self-consistent) applied tip.
+            producer_instance = producer_instance.with_produce_catchup_gate(app);
         }
 
         // WP-I.3: Share the same pause_flag between RPC server and producer
