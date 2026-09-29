@@ -21,6 +21,13 @@
 # ============================================================================
 set -euo pipefail
 
+# Determinism is a property of the DEFAULT (non-reroll) deploy: the reroll switch
+# (CITRATE_REROLL) flips _keptLive()/regGov in DeployAll, which moves addresses and
+# would make these relationship assertions test a different graph than the canonical
+# one. regenesis.sh and the ceremony env export CITRATE_REROLL, so scrub it here so
+# the gate is reroll-agnostic no matter what environment invoked it.
+unset CITRATE_REROLL
+
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 CONTRACTS="${REPO_ROOT}/contracts"
 

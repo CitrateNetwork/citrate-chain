@@ -437,17 +437,17 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         TestnetFarmingAccounting farming = (_isLive("TestnetFarmingAccounting", abi.encodePacked(type(TestnetFarmingAccounting).creationCode, abi.encode(
             address(contributions),
             address(treasury),
-            deployer   // governance
+            governance   // G2: governance-owned, not deployer
         )))
             ? TestnetFarmingAccounting(payable(_create2Address("TestnetFarmingAccounting", abi.encodePacked(type(TestnetFarmingAccounting).creationCode, abi.encode(
             address(contributions),
             address(treasury),
-            deployer   // governance
+            governance   // G2: governance-owned, not deployer
         )))))
             : new TestnetFarmingAccounting{salt: Salts.salt("TestnetFarmingAccounting")}(
             address(contributions),
             address(treasury),
-            deployer   // governance
+            governance   // G2: governance-owned, not deployer
         ));
         console.log("  TestnetFarmingAccounting:", address(farming));
 
@@ -610,6 +610,7 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         _assertGovernance("MentorMatcher", d.mentorMatcher, governance);
         _assertGovernance("StablecoinTreasury", d.treasury, governance);
         _assertGovernance("BulkComputeGateway", d.gateway, governance);
+        _assertGovernance("TestnetFarmingAccounting", d.farming, governance);
         (bool ok, address provider) = _readAddress(d.paywall, abi.encodeWithSignature("provider()"));
         require(ok && provider == governance, "X402Paywall: provider is not the intended key");
 
