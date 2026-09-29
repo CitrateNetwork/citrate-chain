@@ -40,15 +40,16 @@ import "../src/ValidatorRegistry.sol";
 ///     --rpc-url $CITRATE_TESTNET_RPC --sender $DEPLOYER_ADDRESS
 contract DeployValidatorRegistry is ScriptEnv {
     // ─────────────────────────────────────────────────────────────────────────
-    // Canonical genesis DEPLOYER — the genesis root of trust (10M SALT, deploys
-    // everything). See core/economics/src/genesis.rs TESTNET_DEPLOYER_ADDRESS.
-    // Used as the default admin trio below.
-    // ROTATED 2026-07-20: prior 0x4250675F…000c6 was exposed by a `bash -x` trace;
-    // rotated to the fresh DGX-generated deployer. This VALUE is a constructor arg
-    // (governance_ + slasher_), so changing it MOVES the CREATE2 address — the new
-    // projection is re-pinned as CITRATE_VALIDATOR_REGISTRY on every fleet node.
+    // Governance / slasher are the admin keys. They are constructor args
+    // (governance_ + slasher_), so their VALUES fix the CREATE2 address — under a
+    // FRESH-KEYS reroll the projected registry address MOVES (accepted, owner
+    // ruling + MAC audit). They are DERIVED at deploy time from env, NEVER a
+    // frozen literal, so the reroll funds/administers only the fresh keys:
+    //   VALIDATOR_GOVERNANCE  → GOVERNANCE  → CEREMONY_DEPLOYER_ADDRESS → DEPLOYER_ADDRESS
+    // With nothing set, a derived, obviously-not-a-key placeholder keeps tests +
+    // the address projection deterministic; the real ceremony MUST set
+    // VALIDATOR_GOVERNANCE (the fresh governance multisig / signer).
     // ─────────────────────────────────────────────────────────────────────────
-    address public constant GENESIS_DEPLOYER = 0x4fAB35c8c5033c80b3a0452A873B81e6ED4ED732;
 
     // Canonical Arachnid deterministic CREATE2 factory (EIP-2470), pre-stamped in
     // every Citrate genesis profile. Forge routes `new X{salt:}` through it, so
@@ -66,15 +67,33 @@ contract DeployValidatorRegistry is ScriptEnv {
     //                 can re-point it post-deploy (queueSlasher/executeSlasher).
     //   rewardMinter_ : IMMUTABLE in the contract — the execution-layer system
     //                 address allowed to call creditReward(). See RECONCILE note.
-    // Defaulting all three to the genesis DEPLOYER is the recommended bootstrap.
+    // Defaulting all three to the fresh governance key is the recommended bootstrap.
     // ═════════════════════════════════════════════════════════════════════════
-    address public constant GOVERNANCE = GENESIS_DEPLOYER;
-    address public constant SLASHER = GENESIS_DEPLOYER;
 
-    // NOTE (WS-4 reconcile): governance_ and slasher_ are the genesis DEPLOYER
-    // (0x4250675F…000c6). rewardMinter_ is DIFFERENT — it is the WS-4 execution
-    // sentinel, NOT the deployer (see REWARD_MINTER below), because WS-4's
-    // creditReward system-call uses that sentinel as msg.sender.
+    /// Derived, obviously-not-a-key devnet fallback (no literal key in-repo). The
+    /// real reroll MUST set VALIDATOR_GOVERNANCE to the fresh governance.
+    function _placeholderGovernance() internal pure returns (address) {
+        return address(uint160(uint256(keccak256("citrate.reroll.placeholder.governance"))));
+    }
+
+    /// governance_ — DERIVED at deploy time (see the block above); never a literal.
+    function GOVERNANCE() public view returns (address) {
+        return envAddressOr(
+            "VALIDATOR_GOVERNANCE",
+            envAddressOr("GOVERNANCE", envAddressOr("CEREMONY_DEPLOYER_ADDRESS", envAddressOr("DEPLOYER_ADDRESS", _placeholderGovernance())))
+        );
+    }
+
+    /// slasher_ — DERIVED; defaults to governance. Governance can re-point it
+    /// post-deploy (queueSlasher/executeSlasher) without moving the address.
+    function SLASHER() public view returns (address) {
+        return envAddressOr("VALIDATOR_SLASHER", GOVERNANCE());
+    }
+
+    // NOTE (WS-4 reconcile): governance_ and slasher_ are the fresh governance key.
+    // rewardMinter_ is DIFFERENT — it is the WS-4 execution sentinel, NOT a key
+    // (see REWARD_MINTER below), because WS-4's creditReward system-call uses that
+    // sentinel as msg.sender. It stays a fixed constant across the reroll.
 
     // ── rewardMinter_ — RECONCILE WITH WS-4 §R' (built in parallel) ─────────────
     // rewardMinter is IMMUTABLE in ValidatorRegistry and is the ONLY address that
@@ -147,10 +166,10 @@ contract DeployValidatorRegistry is ScriptEnv {
 
     /// abi-encoded constructor args (the tail of the init_code). Single source of
     /// truth consumed by run(), projectedAddress(), and the determinism test.
-    function ctorArgs() public pure returns (bytes memory) {
+    function ctorArgs() public view returns (bytes memory) {
         return abi.encode(
-            GOVERNANCE,
-            SLASHER,
+            GOVERNANCE(),
+            SLASHER(),
             REWARD_MINTER,
             MIN_STAKE,
             BLOCK_SUBSIDY,
@@ -161,14 +180,15 @@ contract DeployValidatorRegistry is ScriptEnv {
 
     /// Full CREATE2 init_code = creationCode ++ abi.encode(args). `bytecode_hash =
     /// "none"` (foundry.toml) strips solc metadata so this is byte-reproducible.
-    function initCode() public pure returns (bytes memory) {
+    function initCode() public view returns (bytes memory) {
         return abi.encodePacked(type(ValidatorRegistry).creationCode, ctorArgs());
     }
 
-    /// Pure CREATE2 address projection for a given deployer:
+    /// CREATE2 address projection for a given deployer:
     ///   keccak256(0xff ++ deployer ++ salt ++ keccak256(init_code))[12:].
-    /// `projectedAddress(ARACHNID_FACTORY)` is the reroll address the fleet pins.
-    function projectedAddress(address deployer) public pure returns (address) {
+    /// `projectedAddress(ARACHNID_FACTORY)` is the reroll address the fleet pins
+    /// (for the env-derived governance/slasher in effect at deploy time).
+    function projectedAddress(address deployer) public view returns (address) {
         bytes32 h = keccak256(
             abi.encodePacked(bytes1(0xff), deployer, registrySalt(), keccak256(initCode()))
         );
@@ -183,8 +203,8 @@ contract DeployValidatorRegistry is ScriptEnv {
         console.log("chainid                :", block.chainid);
         console.log("signer (deployer)      :", deployer);
         console.log("Arachnid factory       :", ARACHNID_FACTORY);
-        console.log("governance_            :", GOVERNANCE);
-        console.log("slasher_               :", SLASHER);
+        console.log("governance_            :", GOVERNANCE());
+        console.log("slasher_               :", SLASHER());
         console.log("rewardMinter_ (WS-4!)  :", REWARD_MINTER);
         console.log("minStake_        (wei) :", MIN_STAKE);
         console.log("blockSubsidy_    (wei) :", BLOCK_SUBSIDY);
@@ -194,8 +214,8 @@ contract DeployValidatorRegistry is ScriptEnv {
 
         vm.startBroadcast();
         ValidatorRegistry registry = new ValidatorRegistry{salt: registrySalt()}(
-            GOVERNANCE,
-            SLASHER,
+            GOVERNANCE(),
+            SLASHER(),
             REWARD_MINTER,
             MIN_STAKE,
             BLOCK_SUBSIDY,

@@ -122,9 +122,17 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
     ///         caller or test is not affected by concurrently changing env.
     function deployWith(address deployer, address governance, address guardian) public returns (Deployed memory d) {
 
+        bool reroll = _isReroll();
+        // Under the reroll switch the three otherwise-kept-live registries deploy
+        // FRESH and multisig-governed (governance), not deployer-governed. On the
+        // normal live path this is `deployer`, preserving the existing addresses.
+        address regGov = reroll ? governance : deployer;
+
         console.log("=== Citrate Full Contract Deployment ===");
         console.log("Deployer:", deployer);
+        console.log("Governance:", governance);
         console.log("Chain ID:", block.chainid);
+        console.log("CITRATE_REROLL (fresh-keys reroll mode):", reroll);
         console.log("");
 
         // The signer is selected by the forge CLI, not by this script.
@@ -150,9 +158,9 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         address keptAdr = _keptLive("AgentDecisionRegistry");
         AgentDecisionRegistry agentRegistry = keptAdr != address(0)
             ? AgentDecisionRegistry(payable(keptAdr))
-            : (_isLive("AgentDecisionRegistry", abi.encodePacked(type(AgentDecisionRegistry).creationCode, abi.encode(deployer)))
-            ? AgentDecisionRegistry(payable(_create2Address("AgentDecisionRegistry", abi.encodePacked(type(AgentDecisionRegistry).creationCode, abi.encode(deployer)))))
-            : new AgentDecisionRegistry{salt: Salts.salt("AgentDecisionRegistry")}(deployer));
+            : (_isLive("AgentDecisionRegistry", abi.encodePacked(type(AgentDecisionRegistry).creationCode, abi.encode(regGov)))
+            ? AgentDecisionRegistry(payable(_create2Address("AgentDecisionRegistry", abi.encodePacked(type(AgentDecisionRegistry).creationCode, abi.encode(regGov)))))
+            : new AgentDecisionRegistry{salt: Salts.salt("AgentDecisionRegistry")}(regGov));
         console.log("  AgentDecisionRegistry:", address(agentRegistry));
 
         // RM-L / WP-L1.1: SpecRegistry now requires governance address
@@ -161,9 +169,9 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         address keptSpec = _keptLive("SpecRegistry");
         SpecRegistry specRegistry = keptSpec != address(0)
             ? SpecRegistry(payable(keptSpec))
-            : (_isLive("SpecRegistry", abi.encodePacked(type(SpecRegistry).creationCode, abi.encode(deployer)))
-            ? SpecRegistry(payable(_create2Address("SpecRegistry", abi.encodePacked(type(SpecRegistry).creationCode, abi.encode(deployer)))))
-            : new SpecRegistry{salt: Salts.salt("SpecRegistry")}(deployer));
+            : (_isLive("SpecRegistry", abi.encodePacked(type(SpecRegistry).creationCode, abi.encode(regGov)))
+            ? SpecRegistry(payable(_create2Address("SpecRegistry", abi.encodePacked(type(SpecRegistry).creationCode, abi.encode(regGov)))))
+            : new SpecRegistry{salt: Salts.salt("SpecRegistry")}(regGov));
         console.log("  SpecRegistry:", address(specRegistry));
 
         IPFSIncentives ipfs = (_isLive("IPFSIncentives", abi.encodePacked(type(IPFSIncentives).creationCode, abi.encode(governance)))
@@ -229,16 +237,16 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         MarketMakerAllocation mmAlloc = keptMma != address(0)
             ? MarketMakerAllocation(payable(keptMma))
             : (_isLive("MarketMakerAllocation", abi.encodePacked(type(MarketMakerAllocation).creationCode, abi.encode(
-            deployer,   // market maker (deployer for now, DAO changes later)
-            deployer    // governance
+            regGov,   // market maker (deployer live / governance under reroll; DAO changes later)
+            regGov    // governance
         )))
             ? MarketMakerAllocation(payable(_create2Address("MarketMakerAllocation", abi.encodePacked(type(MarketMakerAllocation).creationCode, abi.encode(
-            deployer,   // market maker (deployer for now, DAO changes later)
-            deployer    // governance
+            regGov,   // market maker (deployer live / governance under reroll; DAO changes later)
+            regGov    // governance
         )))))
             : new MarketMakerAllocation{salt: Salts.salt("MarketMakerAllocation")}(
-            deployer,   // market maker (deployer for now, DAO changes later)
-            deployer    // governance
+            regGov,   // market maker (deployer live / governance under reroll; DAO changes later)
+            regGov    // governance
         ));
         console.log("  MarketMakerAllocation:", address(mmAlloc));
 
@@ -535,8 +543,25 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
     address internal constant KEEP_SPEC_REGISTRY = 0x8cE7000C83D0ef5276A70BDC34bF2fa2FE0159ff;
     address internal constant KEEP_MARKET_MAKER_ALLOCATION = 0xfCC747D35d616c48bddef98a31B7e8ebC8786864;
 
+    /// @notice Fresh-keys reroll switch (owner-decided, MAC audit). When set,
+    ///         the WHOLE script deploys fresh — critically the three otherwise
+    ///         kept-live registries below deploy fresh (multisig-governed) instead
+    ///         of resolving to a legacy 40204 pin whose code does not exist on the
+    ///         re-rolled chain (which would revert `_keptLive`'s code assertion).
+    ///         Set `CITRATE_REROLL=1` in the reroll ceremony env; leave unset for
+    ///         a live (non-reroll) deploy so the existing addresses are preserved.
+    function _isReroll() internal view virtual returns (bool) {
+        return envUintOr("CITRATE_REROLL", 0) == 1;
+    }
+
     function _keptLive(string memory name) internal view returns (address a) {
         if (block.chainid != 40204) return address(0);
+        // Fresh-keys reroll: do NOT resolve the legacy pin (it has no code on the
+        // re-rolled chain). Fall through to the normal deploy-fresh path.
+        if (_isReroll()) {
+            console.log(string.concat("  reroll: deploying FRESH (not kept-live) ", name));
+            return address(0);
+        }
         bytes32 h = keccak256(bytes(name));
         if (h == keccak256("AgentDecisionRegistry")) a = KEEP_AGENT_DECISION_REGISTRY;
         else if (h == keccak256("SpecRegistry")) a = KEEP_SPEC_REGISTRY;
