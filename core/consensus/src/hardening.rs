@@ -165,12 +165,12 @@ pub const RELEASE_GENESIS: &[(u64, [u8; 32])] = &[
     // move the genesis state root).
     (
         40204,
-        hex32("da19940680331c102688e1eae602d7430160885643a7e1d943d3e94717dd4bb9"),
+        hex32("0f2b567fad0a376f11d1d1d58511c089b40cceb4810f77eb7eed1e22558ebf72"),
     ),
     // team_testnet (re-pinned 2026-09-29 for the fresh-keys reroll)
     (
         40204,
-        hex32("aa80140327a42f1e301f697b212d220e4e883fa3e8c9ff24f465d72fefff01f9"),
+        hex32("fe64ce75be7bb924fba0f56dea0a0f1a1987c49ce15c58014898979691d22e50"),
     ),
     // mainnet
     (
@@ -638,8 +638,8 @@ mod tests {
             hex32("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")[..8],
             [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]
         );
-        assert_eq!(RELEASE_GENESIS[0].1[..4], [0xda, 0x19, 0x94, 0x06]);
-        assert_eq!(RELEASE_GENESIS[0].1[31], 0xb9);
+        assert_eq!(RELEASE_GENESIS[0].1[..4], [0x0f, 0x2b, 0x56, 0x7f]);
+        assert_eq!(RELEASE_GENESIS[0].1[31], 0x72);
     }
 
     #[test]

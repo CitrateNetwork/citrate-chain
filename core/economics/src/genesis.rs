@@ -17,10 +17,12 @@ use std::collections::HashMap;
 // all rotated to BRAND-NEW keys generated on the DGX (encrypted Foundry keystore,
 // private keys never leave the box). Rationale: chainId 40204 is preserved, so any
 // reused genesis-funded key would have replayable old-chain tx history — fresh keys
-// close that. DETERMINISTIC_FAUCET_SIGNER_ADDRESS is intentionally NOT rotated (it
-// derives from a fixed public string, not the deployer key). Signing stays on DGX
-// for this alpha reroll; proper genesis ceremony (HW wallets + 3rd-party signers)
-// follows post-reroll + multi-operator soak.
+// close that. The faucet signer (FAUCET_SIGNER_ADDRESS) is ALSO rotated: the old
+// address was the publicly-derivable keccak256("citrate-faucet-testnet-v1") key, so
+// funding it was a honeypot anyone could sweep — it now points at a fresh DGX key
+// (set as FAUCET_PRIVATE_KEY on the faucet service). Signing stays on DGX for this
+// alpha reroll; proper genesis ceremony (HW wallets + 3rd-party signers) follows
+// post-reroll + multi-operator soak.
 pub const TESTNET_TREASURY_ADDRESS: Address = Address([
     0xa5, 0xd0, 0x97, 0xc0, 0xab, 0xbb, 0x3b, 0x6b, 0xbd, 0xb7,
     0x5b, 0xd0, 0x6d, 0x51, 0xb4, 0x4f, 0x92, 0x77, 0xe6, 0xd4,
@@ -71,9 +73,16 @@ pub const SAUL_DEPLOYER_ADDRESS: Address = Address([
     0x9f, 0x5b, 0x15, 0x6c, 0x53, 0x30, 0x5d, 0x4b, 0x20, 0xc9,
     0x4c, 0xa0, 0x8e, 0x32, 0x19, 0xd1, 0xc0, 0xe7, 0x40, 0x1a,
 ]);
-pub const DETERMINISTIC_FAUCET_SIGNER_ADDRESS: Address = Address([
-    0x66, 0x80, 0xb4, 0x3a, 0xf0, 0x9d, 0x9b, 0x35, 0x13, 0x32,
-    0xbf, 0x53, 0x78, 0xeb, 0x58, 0x0e, 0x3b, 0x39, 0x01, 0x82,
+// Faucet signing account, funded so the faucet service can pay out grants + gas.
+// FRESH-KEYS REROLL 2026-09-29: rotated OFF the old deterministic address
+// (keccak256("citrate-faucet-testnet-v1") — a PUBLICLY derivable key; funding it
+// was a 10B-SALT honeypot anyone could sweep) to a brand-new DGX-generated key.
+// The faucet service loads it from FAUCET_PRIVATE_KEY (faucet/src/main.rs); the
+// deterministic fallback is gated behind the `unsafe-deterministic-key` feature
+// (default OFF) so production refuses to start without the env key.
+pub const FAUCET_SIGNER_ADDRESS: Address = Address([
+    0x9c, 0x04, 0x6a, 0x90, 0xce, 0xd2, 0xde, 0xdf, 0xe2, 0xcd,
+    0x53, 0x29, 0xa1, 0xb1, 0x43, 0xe7, 0x0f, 0xea, 0x1a, 0xd9,
 ]);
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -281,7 +290,7 @@ impl Default for GenesisConfig {
         // Default addresses for testnet
         let treasury = TESTNET_TREASURY_ADDRESS;
         let ecosystem = TESTNET_ECOSYSTEM_ADDRESS;
-        let faucet = DETERMINISTIC_FAUCET_SIGNER_ADDRESS;
+        let faucet = FAUCET_SIGNER_ADDRESS;
 
         // Test accounts with initial balances
         let test_accounts = vec![
@@ -379,12 +388,13 @@ impl GenesisConfig {
                 account(TESTNET_TEAM_ADDRESS, 10_000_000_000),
                 // Validator — block production and staking (5B SALT)
                 account(TESTNET_VALIDATOR_ADDRESS, 5_000_000_000),
-                // Faucet signing key — the address the live faucet service derives
-                // from keccak256("citrate-faucet-testnet-v1") (faucet/src/main.rs).
+                // Faucet signing key — the fresh DGX faucet-signer the live service
+                // loads from FAUCET_PRIVATE_KEY (faucet/src/main.rs). Rotated off the
+                // old publicly-derivable keccak256("citrate-faucet-testnet-v1") key.
                 // RELEASE R1 / OPS_DGX_HANDOFF D-2: fold the pre-fund into genesis
                 // so a re-roll no longer needs a manual `cast send` to top it up.
                 // (10B SALT — 1000×-scaled with the 1T reroll.)
-                account(DETERMINISTIC_FAUCET_SIGNER_ADDRESS, 10_000_000_000),
+                account(FAUCET_SIGNER_ADDRESS, 10_000_000_000),
                 // VALIDATOR-S1 (WS-5): 4 dedicated validator-staker EOAs, one per
                 // fleet node, each pre-funded with 40,000 SALT (>= 32k minStake +
                 // gas) so the registration ceremony can bond them before S(1)=800.
@@ -475,10 +485,10 @@ impl GenesisConfig {
             code: None,
         });
 
-        // Faucet signing key account (0x6680b43af09d9b351332bf5378eb580e3b390182)
-        // Deterministic key from "citrate-faucet-testnet-v1". Pre-funded with 10M SALT.
+        // Faucet signing key account (fresh DGX key, FAUCET_PRIVATE_KEY).
+        // Rotated off the old deterministic "citrate-faucet-testnet-v1" key. Pre-funded 10M SALT.
         accounts.push(GenesisAccount {
-            address: DETERMINISTIC_FAUCET_SIGNER_ADDRESS,
+            address: FAUCET_SIGNER_ADDRESS,
             balance: latt_to_wei(10_000_000),
             nonce: 0,
             code: None,
@@ -852,8 +862,8 @@ mod tests {
     }
 
     /// RELEASE R1 / OPS_DGX_HANDOFF D-2 regression: testnet_beta() MUST pre-fund
-    /// the DETERMINISTIC faucet signer (0x6680…, the address the live faucet
-    /// service derives from keccak256("citrate-faucet-testnet-v1")). Before this
+    /// the faucet signer (FAUCET_SIGNER_ADDRESS — the fresh DGX key the live faucet
+    /// service loads from FAUCET_PRIVATE_KEY). Before this
     /// fix the address had ZERO genesis balance and every re-roll required a
     /// manual `cast send` to top it up. The legacy `node` config's
     /// `initial_accounts` listed it but those are explicitly skipped — only this
@@ -865,7 +875,7 @@ mod tests {
         let faucet_signer = config
             .accounts
             .iter()
-            .find(|account| account.address == DETERMINISTIC_FAUCET_SIGNER_ADDRESS)
+            .find(|account| account.address == FAUCET_SIGNER_ADDRESS)
             .expect("testnet beta must pre-fund the deterministic faucet signer (R1/D-2)");
 
         assert_eq!(faucet_signer.balance, latt_to_wei(10_000_000_000));
@@ -1076,7 +1086,7 @@ mod tests {
         );
         assert_eq!(executor.get_balance(&SAUL_DEPLOYER_ADDRESS), U256::zero());
         assert_eq!(
-            executor.get_balance(&DETERMINISTIC_FAUCET_SIGNER_ADDRESS),
+            executor.get_balance(&FAUCET_SIGNER_ADDRESS),
             U256::zero()
         );
     }
