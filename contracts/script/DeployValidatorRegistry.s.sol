@@ -77,11 +77,18 @@ contract DeployValidatorRegistry is ScriptEnv {
     }
 
     /// governance_ — DERIVED at deploy time (see the block above); never a literal.
-    function GOVERNANCE() public view returns (address) {
-        return envAddressOr(
-            "VALIDATOR_GOVERNANCE",
-            envAddressOr("GOVERNANCE", envAddressOr("CEREMONY_DEPLOYER_ADDRESS", envAddressOr("DEPLOYER_ADDRESS", _placeholderGovernance())))
-        );
+    function GOVERNANCE() public view returns (address gov) {
+        // Prefer an explicit governance address; fall back to the deployer /
+        // placeholder ONLY off-chain. Fail-closed on 40204 (findings G2/G4):
+        // the production reroll must name a non-deployer governance.
+        gov = envAddressOr("VALIDATOR_GOVERNANCE", envAddressOr("GOVERNANCE", address(0)));
+        if (gov == address(0)) {
+            require(
+                block.chainid != 40204,
+                "VALIDATOR_GOVERNANCE or GOVERNANCE must be set on 40204"
+            );
+            gov = envAddressOr("CEREMONY_DEPLOYER_ADDRESS", envAddressOr("DEPLOYER_ADDRESS", _placeholderGovernance()));
+        }
     }
 
     /// slasher_ — DERIVED; defaults to governance. Governance can re-point it

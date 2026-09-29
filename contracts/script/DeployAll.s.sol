@@ -115,7 +115,7 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
 
     function deploy() public returns (Deployed memory d) {
         address deployer = deployerAddress();
-        return deployWith(deployer, envAddressOr("GOVERNANCE", deployer), envAddressOr("GUARDIAN", deployer));
+        return deployWith(deployer, requiredGovernance("GOVERNANCE", deployer), requiredGovernance("GUARDIAN", deployer));
     }
 
     /// @notice The ceremony with explicit keys (no environment reads), so a
@@ -303,10 +303,20 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         // for lazy per-(addr, dim) score reads — the matcher does not
         // mirror that state; it staticcalls it on demand. Governance
         // is the deployer for testnet; mainnet should use the multisig.
-        MentorMatcher mentorMatcher = (_isLive("MentorMatcher", abi.encodePacked(type(MentorMatcher).creationCode, abi.encode(deployer)))
+        bool mentorLive = _isLive("MentorMatcher", abi.encodePacked(type(MentorMatcher).creationCode, abi.encode(deployer)));
+        MentorMatcher mentorMatcher = (mentorLive
             ? MentorMatcher(payable(_create2Address("MentorMatcher", abi.encodePacked(type(MentorMatcher).creationCode, abi.encode(deployer)))))
             : new MentorMatcher{salt: Salts.salt("MentorMatcher")}(deployer));
-        mentorMatcher.setContributionAccounting(address(contributions));
+        // MentorMatcher is born deployer-governed so the deployer can run the
+        // onlyGovernance config below; then hand governance to the multisig (G2).
+        // Kept ctor(deployer) so the CREATE2 address is unchanged. Only configure +
+        // hand over on a FRESH deploy: on reuse the contract is already configured
+        // and governance is already the multisig, so re-running setContributionAccounting
+        // as the deployer would revert NotGovernance() (idempotent-rerun safety).
+        if (!mentorLive) {
+            mentorMatcher.setContributionAccounting(address(contributions));
+            if (governance != deployer) mentorMatcher.setGovernance(governance);
+        }
         console.log("  MentorMatcher:", address(mentorMatcher));
 
         // =====================================================================
@@ -398,43 +408,52 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         // =====================================================================
         console.log("--- Layer 6: Treasury & Governance ---");
 
-        StablecoinTreasury treasury = (_isLive("StablecoinTreasury", abi.encodePacked(type(StablecoinTreasury).creationCode, abi.encode(deployer)))
-            ? StablecoinTreasury(payable(_create2Address("StablecoinTreasury", abi.encodePacked(type(StablecoinTreasury).creationCode, abi.encode(deployer)))))
-            : new StablecoinTreasury{salt: Salts.salt("StablecoinTreasury")}(deployer));
+        // G2: born governance-owned (Governable is two-step, so a post-deploy
+        // transfer would leave the deployer as live governance until the multisig
+        // accepts — instead we construct with `governance` directly).
+        StablecoinTreasury treasury = (_isLive("StablecoinTreasury", abi.encodePacked(type(StablecoinTreasury).creationCode, abi.encode(governance)))
+            ? StablecoinTreasury(payable(_create2Address("StablecoinTreasury", abi.encodePacked(type(StablecoinTreasury).creationCode, abi.encode(governance)))))
+            : new StablecoinTreasury{salt: Salts.salt("StablecoinTreasury")}(governance));
         console.log("  StablecoinTreasury:", address(treasury));
 
         BulkComputeGateway gateway = (_isLive("BulkComputeGateway", abi.encodePacked(type(BulkComputeGateway).creationCode, abi.encode(
             address(treasury),
             address(oracle),
-            deployer   // admin
+            governance   // admin (G2: governance, not deployer)
         )))
             ? BulkComputeGateway(payable(_create2Address("BulkComputeGateway", abi.encodePacked(type(BulkComputeGateway).creationCode, abi.encode(
             address(treasury),
             address(oracle),
-            deployer   // admin
+            governance   // admin
         )))))
             : new BulkComputeGateway{salt: Salts.salt("BulkComputeGateway")}(
             address(treasury),
             address(oracle),
-            deployer   // admin
+            governance   // admin
         ));
-        treasury.setAuthorizedActivityRecorder(address(gateway), true);
+        // treasury.setAuthorizedActivityRecorder is onlyGovernance. When governance
+        // is the deployer (local dev) we can wire it here; on the production reroll
+        // (governance = multisig) it is a POST-CUT governance wiring step:
+        //   StablecoinTreasury.setAuthorizedActivityRecorder(BulkComputeGateway, true)
+        if (governance == deployer) {
+            treasury.setAuthorizedActivityRecorder(address(gateway), true);
+        }
         console.log("  BulkComputeGateway:", address(gateway));
 
         TestnetFarmingAccounting farming = (_isLive("TestnetFarmingAccounting", abi.encodePacked(type(TestnetFarmingAccounting).creationCode, abi.encode(
             address(contributions),
             address(treasury),
-            deployer   // governance
+            governance   // G2: governance-owned, not deployer
         )))
             ? TestnetFarmingAccounting(payable(_create2Address("TestnetFarmingAccounting", abi.encodePacked(type(TestnetFarmingAccounting).creationCode, abi.encode(
             address(contributions),
             address(treasury),
-            deployer   // governance
+            governance   // G2: governance-owned, not deployer
         )))))
             : new TestnetFarmingAccounting{salt: Salts.salt("TestnetFarmingAccounting")}(
             address(contributions),
             address(treasury),
-            deployer   // governance
+            governance   // G2: governance-owned, not deployer
         ));
         console.log("  TestnetFarmingAccounting:", address(farming));
 
@@ -592,9 +611,12 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         _assertGovernance("HeartbeatMonitor", d.heartbeat, governance);
         _assertGovernance("DisputeResolution", d.dispute, governance);
         _assertGovernance("ComputePricingOracle", d.oracle, governance);
-        // Contracts that already took an explicit key (deployer) keep it.
-        _assertGovernance("MentorMatcher", d.mentorMatcher, deployer);
-        _assertGovernance("StablecoinTreasury", d.treasury, deployer);
+        // G2: these must be governance-held after deploy (MentorMatcher hands over
+        // via setGovernance once configured; StablecoinTreasury is born governance-owned).
+        _assertGovernance("MentorMatcher", d.mentorMatcher, governance);
+        _assertGovernance("StablecoinTreasury", d.treasury, governance);
+        _assertGovernance("BulkComputeGateway", d.gateway, governance);
+        _assertGovernance("TestnetFarmingAccounting", d.farming, governance);
         (bool ok, address provider) = _readAddress(d.paywall, abi.encodeWithSignature("provider()"));
         require(ok && provider == governance, "X402Paywall: provider is not the intended key");
 

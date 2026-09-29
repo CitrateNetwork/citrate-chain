@@ -69,7 +69,7 @@ contract DeployCoreMembership is ScriptEnv {
     /// grant signer), defaulting to the ceremony deployer when unset. Under
     /// fresh keys this moves — accepted (owner ruling, MAC audit).
     function _membershipOwner() internal view returns (address o) {
-        o = envAddressOr("MEMBERSHIP_OWNER", deployerAddress());
+        o = requiredGovernance("MEMBERSHIP_OWNER", deployerAddress());
         require(o != address(0), "set MEMBERSHIP_OWNER (or CEREMONY_DEPLOYER_ADDRESS)");
     }
 
