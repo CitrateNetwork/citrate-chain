@@ -36,8 +36,29 @@ pub enum CheckpointError {
     #[error("Quorum not reached: {0}/{1} votes")]
     QuorumNotReached(usize, usize),
 
+    #[error("Committee too small to finalize: {0} < {1} (minimum)")]
+    CommitteeTooSmall(usize, usize),
+
     #[error("Storage error: {0}")]
     StorageError(String),
+}
+
+/// Minimum committee size that may finalize a checkpoint.
+///
+/// docs/consensus/CHECKPOINT_FINALITY_WIRING.md §3 (D-2a): a 1- or 2-member
+/// committee must never self-finalize — that is centralized rubber-stamping,
+/// not BFT. Below this size the manager still proposes and collects votes but
+/// never finalizes. A committee of 4 tolerates 1 Byzantine member at quorum 3.
+pub const MIN_FINALITY_COMMITTEE: usize = 4;
+
+/// Derived BFT quorum for an effective committee of size `n`: `floor(2n/3) + 1`.
+///
+/// docs/consensus/CHECKPOINT_FINALITY_WIRING.md §3 (D-2). This is the standard
+/// BFT threshold (e.g. 67 for n=100, 3 for n=4) and replaces the fixed 67, which
+/// could never be met below 100 validators. Callers gate on
+/// [`MIN_FINALITY_COMMITTEE`] before using this value.
+pub fn derived_quorum(n: usize) -> usize {
+    2 * n / 3 + 1
 }
 
 /// Domain separator prefix for checkpoint vote canonical messages.
@@ -169,9 +190,31 @@ pub struct Checkpoint {
 }
 
 impl Checkpoint {
-    /// Check if quorum has been reached.
+    /// Check if quorum has been reached against an explicit threshold.
     pub fn has_quorum(&self, threshold: usize) -> bool {
         self.votes.len() >= threshold
+    }
+
+    /// The effective quorum for THIS checkpoint, derived from its own committee
+    /// size: `floor(2n/3)+1`. Returns `None` when the committee is smaller than
+    /// [`MIN_FINALITY_COMMITTEE`], i.e. too small to finalize at all.
+    pub fn effective_quorum(&self) -> Option<usize> {
+        let n = self.committee.len();
+        if n < MIN_FINALITY_COMMITTEE {
+            None
+        } else {
+            Some(derived_quorum(n))
+        }
+    }
+
+    /// Whether this checkpoint has reached its DERIVED quorum. `false` when the
+    /// committee is below [`MIN_FINALITY_COMMITTEE`] (never self-finalize a tiny
+    /// committee) or when it simply has too few votes.
+    pub fn has_derived_quorum(&self) -> bool {
+        match self.effective_quorum() {
+            Some(q) => self.votes.len() >= q,
+            None => false,
+        }
     }
 
     /// Get the number of votes collected.
@@ -478,13 +521,18 @@ impl CheckpointManager {
             &vote.voter.as_bytes()[..4],
             vote.height,
             checkpoint.votes.len() + 1,
-            self.config.quorum_threshold
+            checkpoint
+                .effective_quorum()
+                .map(|q| q.to_string())
+                .unwrap_or_else(|| "n/a (committee < min)".to_string())
         );
 
         checkpoint.votes.insert(vote.voter, vote.signature);
 
-        // Check quorum
-        if checkpoint.has_quorum(self.config.quorum_threshold) {
+        // Check quorum. Uses the derived `floor(2n/3)+1` over this checkpoint's
+        // effective committee; a committee below MIN_FINALITY_COMMITTEE never
+        // reaches quorum (has_derived_quorum returns false).
+        if checkpoint.has_derived_quorum() {
             return Ok(true);
         }
 
@@ -501,13 +549,23 @@ impl CheckpointManager {
             .remove(&height)
             .ok_or(CheckpointError::BlockNotFound(Hash::default()))?;
 
-        if !checkpoint.has_quorum(self.config.quorum_threshold) {
+        // Minimum-committee guard (§3, D-2a): a committee below
+        // MIN_FINALITY_COMMITTEE must never finalize. Put the checkpoint back and
+        // refuse — no self-finalization by a 1- or 2-member committee.
+        let effective_quorum = match checkpoint.effective_quorum() {
+            Some(q) => q,
+            None => {
+                let n = checkpoint.committee.len();
+                pending.insert(height, checkpoint);
+                return Err(CheckpointError::CommitteeTooSmall(n, MIN_FINALITY_COMMITTEE));
+            }
+        };
+
+        if !checkpoint.has_derived_quorum() {
             // Put it back
+            let votes = checkpoint.votes.len();
             pending.insert(height, checkpoint);
-            return Err(CheckpointError::QuorumNotReached(
-                pending[&height].votes.len(),
-                self.config.quorum_threshold,
-            ));
+            return Err(CheckpointError::QuorumNotReached(votes, effective_quorum));
         }
 
         checkpoint.status = CheckpointStatus::Finalized;
@@ -548,7 +606,7 @@ impl CheckpointManager {
             "Finalized checkpoint at height {} with {}/{} votes",
             height,
             checkpoint.votes.len(),
-            self.config.quorum_threshold
+            effective_quorum
         );
 
         let cp = checkpoint.clone();
@@ -836,5 +894,92 @@ mod tests {
         };
         let result = mgr.submit_vote(vote).await;
         assert!(matches!(result, Err(CheckpointError::InvalidSignature(_))));
+    }
+
+    /// Derived quorum `floor(2n/3)+1` matches the spec's reference values.
+    #[test]
+    fn test_derived_quorum_values() {
+        assert_eq!(derived_quorum(4), 3, "n=4 => floor(8/3)+1 = 3");
+        assert_eq!(derived_quorum(100), 67, "n=100 => floor(200/3)+1 = 67");
+        // A few more boundary points for confidence.
+        assert_eq!(derived_quorum(5), 4);
+        assert_eq!(derived_quorum(7), 5);
+        assert_eq!(derived_quorum(10), 7);
+    }
+
+    /// `effective_quorum` is `None` (never finalizable) below the minimum
+    /// committee, and the derived quorum at/above it.
+    #[test]
+    fn test_effective_quorum_min_committee() {
+        let mk = |n: usize| Checkpoint {
+            height: 5,
+            block_hash: Hash::new([1; 32]),
+            committee: (0..n as u8).map(make_pubkey).collect(),
+            votes: HashMap::new(),
+            status: CheckpointStatus::Pending,
+        };
+        assert_eq!(mk(1).effective_quorum(), None);
+        assert_eq!(mk(3).effective_quorum(), None, "3 < MIN_FINALITY_COMMITTEE");
+        assert_eq!(mk(4).effective_quorum(), Some(3));
+        assert_eq!(mk(100).effective_quorum(), Some(67));
+    }
+
+    /// A committee below MIN_FINALITY_COMMITTEE (here 3) never reaches quorum and
+    /// never finalizes, even with a valid vote from every member.
+    #[tokio::test]
+    async fn test_below_min_committee_does_not_finalize() {
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let config = CheckpointConfig::for_testing();
+        let blocks = build_chain(&dag, 6).await;
+        let mgr = CheckpointManager::new(config, dag);
+
+        // Committee of 3 (< MIN_FINALITY_COMMITTEE = 4).
+        let committee: Vec<PublicKey> = (0..3).map(make_pubkey).collect();
+        mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+
+        // Every one of the 3 members casts a valid vote — none reaches quorum.
+        for i in 0..3u8 {
+            let vote = make_signed_vote(i, 5, &blocks[5].hash());
+            let quorum_reached = mgr.submit_vote(vote).await.unwrap();
+            assert!(
+                !quorum_reached,
+                "committee < 4 must never reach quorum (vote {})",
+                i + 1
+            );
+        }
+
+        // Explicit finalize is refused with CommitteeTooSmall.
+        let result = mgr.finalize_checkpoint(5).await;
+        assert!(
+            matches!(result, Err(CheckpointError::CommitteeTooSmall(3, 4))),
+            "expected CommitteeTooSmall(3, 4), got {:?}",
+            result
+        );
+    }
+
+    /// A committee of exactly MIN_FINALITY_COMMITTEE (4) finalizes at the derived
+    /// quorum of 3.
+    #[tokio::test]
+    async fn test_min_committee_finalizes_at_derived_quorum() {
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let config = CheckpointConfig::for_testing();
+        let blocks = build_chain(&dag, 6).await;
+        let mgr = CheckpointManager::new(config, dag);
+
+        let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+        mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+
+        // 2 votes: below derived quorum (3).
+        for i in 0..2u8 {
+            let vote = make_signed_vote(i, 5, &blocks[5].hash());
+            assert!(!mgr.submit_vote(vote).await.unwrap());
+        }
+        // 3rd vote reaches the derived quorum of 3.
+        let vote = make_signed_vote(2, 5, &blocks[5].hash());
+        assert!(mgr.submit_vote(vote).await.unwrap(), "3 of 4 => quorum");
+
+        let cp = mgr.finalize_checkpoint(5).await.unwrap();
+        assert_eq!(cp.status, CheckpointStatus::Finalized);
+        assert_eq!(cp.votes.len(), 3);
     }
 }
