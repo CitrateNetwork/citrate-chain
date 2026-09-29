@@ -3,8 +3,9 @@ use citrate_consensus::crypto::{self, Ed25519SigningKey};
 use citrate_consensus::dag_store::{DagStore, DagStoreError};
 use citrate_consensus::ghostdag::GhostDag;
 use citrate_consensus::tip_selection::TipSelector;
+use citrate_consensus::hardening::PbaHardening;
 use citrate_consensus::types::{
-    BlockBuilder, BlockHeader, GhostDagParams, Hash, PublicKey, Transaction, VrfProof,
+    Block, BlockBuilder, BlockHeader, GhostDagParams, Hash, PublicKey, Transaction, VrfProof,
 };
 use citrate_economics::{RewardCalculator, RewardConfig, UnifiedEconomicsManager};
 use citrate_execution::revm_adapter::BlockContext;
@@ -19,6 +20,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::time::{interval, Duration};
 use tracing::{debug, error, info, warn};
 
@@ -83,11 +85,32 @@ pub struct EquivocationVoteConfig {
     pub activation_height: u64,
 }
 
+/// F2 (network-height catch-up gate): the gap, in blocks, above which the producer
+/// enters the "behind the network" refuse band (hysteresis high-water mark).
+pub const CATCHUP_REFUSE_GAP: u64 = 3;
+/// F2: the gap at/below which a refusing producer RESUMES (hysteresis low-water mark).
+/// Strictly below [`CATCHUP_REFUSE_GAP`], so a gap that oscillates in `(RESUME, REFUSE]`
+/// does not flap production on and off.
+pub const CATCHUP_RESUME_GAP: u64 = 1;
+/// F2: if the producer refuses for this long with NO sync progress (its applied tip
+/// never advances), it raises a stall ALERT and latches production OFF until a
+/// human-in-command override. Any applied-tip advance resets this timer.
+pub const CATCHUP_STALL_ALERT: Duration = Duration::from_secs(60);
+
 /// #126 (producer catch-up gate): the signals a producing node consults BEFORE it
 /// seals a block, so a node that is lagging / mid-rebuild / not-yet-hydrated refuses
 /// to produce (skips the slot) rather than sealing on a stale, self-consistent applied
 /// tip and forking the fleet. Strictly conservative: it only ever makes the producer
 /// REFRAIN — it never causes a block to be sealed that would not have been before.
+///
+/// F2 (network-height catch-up) EXTENDS the #126 gate: on top of the node-local
+/// rebuild/hydration signals it also refuses to seal while this node is BEHIND its
+/// peers, where "behind" is measured ONLY from [`AttestedNetworkHead`] — the highest
+/// peer block height that carries a valid proposer signature AND chains (parentHash
+/// ancestry) to a block this node HOLDS. It NEVER reads `PeerInfo.head_height` (a
+/// once-set, self-reported Hello field) or `SyncManager.target_height` (a liar-
+/// controlled MAX of claims). Still strictly conservative: it only ever makes the
+/// producer REFRAIN.
 #[derive(Clone)]
 pub struct ProduceCatchupGate {
     /// Set while the canonical applicator rebuilds applied state from genesis (its
@@ -96,6 +119,216 @@ pub struct ProduceCatchupGate {
     /// "DAG hydration complete" signal. `None` ⇒ no fork-choice wired (tests / fixed-tip
     /// stubs) ⇒ treat as hydrated so the gate is inert there.
     dag_hydrated: Option<Arc<AtomicBool>>,
+    /// F2: highest VALIDLY-SIGNED, CHAIN-DESCENDING peer head height observed (see
+    /// [`AttestedNetworkHead`]). `None` ⇒ F2 disabled (the plain #126 gate). `0` ⇒ no
+    /// attested-ahead evidence yet (fresh node / no peers) ⇒ never "behind".
+    attested_ahead: Option<Arc<AtomicU64>>,
+    /// F2: hysteresis + stall state, shared behind a lock so the live values persist
+    /// across produce rounds. `parking_lot::Mutex` (no `.await` is held while locked).
+    behind: Arc<Mutex<CatchupBehindState>>,
+    /// F2: human-in-command override. Set true (via [`BlockProducer::catchup_override_handle`])
+    /// to resume production after a stall alert; nothing else clears the stall latch.
+    override_resume: Arc<AtomicBool>,
+    /// F2: surfaced stall-alert signal for the monitor/RPC (true while latched OFF).
+    stall_alert: Arc<AtomicBool>,
+    /// F2: how long the producer may refuse with no sync progress before alerting +
+    /// latching. Defaults to [`CATCHUP_STALL_ALERT`]; shrunk by tests.
+    stall_alert_after: Duration,
+}
+
+/// F2: hysteresis + stall bookkeeping for [`ProduceCatchupGate`].
+struct CatchupBehindState {
+    /// True while in the refuse band (latched between `REFUSE_GAP` and `RESUME_GAP`).
+    refusing: bool,
+    /// Applied tip observed at the previous evaluation; used to detect sync progress.
+    last_applied_tip: u64,
+    /// When the applied tip last advanced (an advance resets the stall timer).
+    last_progress: Instant,
+    /// Set once a >`stall_alert_after` no-progress stall is detected; only the
+    /// human-in-command override clears it (NEVER auto-resume after a stall).
+    stalled_latch: bool,
+}
+
+impl Default for CatchupBehindState {
+    fn default() -> Self {
+        Self {
+            refusing: false,
+            last_applied_tip: 0,
+            last_progress: Instant::now(),
+            stalled_latch: false,
+        }
+    }
+}
+
+/// F2 (network-height catch-up gate): the ONLY source of "how far ahead is the network".
+///
+/// It records the highest peer block height that satisfies ALL of:
+///   1. the header binds its own hash (`verify_hash_for`) — a spoofed height/parent
+///      inside a validly-signed envelope is rejected;
+///   2. the block carries a valid ed25519 PROPOSER signature over that hash
+///      (`crypto::verify_block_signature`);
+///   3. its `selected_parent_hash` resolves to a block THIS node HOLDS, exactly one
+///      height below it (`get_block(parent).height + 1 == height`) — i.e. it chains,
+///      via parentHash ancestry, to a block we already have.
+///
+/// This is deliberately NOT `PeerInfo.head_height` (set once at the Hello handshake,
+/// self-reported, never refreshed) and NOT `SyncManager.target_height` (a running MAX
+/// of unauthenticated claims that a single liar advertising `u64::MAX` controls). A
+/// peer that merely CLAIMS a height (Hello, or a signed header that forks off a block
+/// we do not hold) never raises this watermark; only a signed block that extends our
+/// held chain does. `fetch_max` keeps it monotonic within a reroll epoch.
+#[derive(Clone, Default)]
+pub struct AttestedNetworkHead {
+    height: Arc<AtomicU64>,
+}
+
+impl AttestedNetworkHead {
+    pub fn new() -> Self {
+        Self {
+            height: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// A clonable handle to the raw watermark, wired into the producer gate via
+    /// [`BlockProducer::with_network_height_gate`] and updated at the block-receive
+    /// sites through [`AttestedNetworkHead::observe`].
+    pub fn handle(&self) -> Arc<AtomicU64> {
+        self.height.clone()
+    }
+
+    /// The current best attested-ahead height (monitor/telemetry surface).
+    #[allow(dead_code)]
+    pub fn best(&self) -> u64 {
+        self.height.load(Ordering::SeqCst)
+    }
+
+    /// F2: fold a received peer block into `height` IFF it is a validly-signed header
+    /// that binds its own hash AND chains to a block we hold, one height above it.
+    /// Returns true when it counted. `height` is the raw handle (so this can be called
+    /// from the p2p receive tasks without holding the [`AttestedNetworkHead`]).
+    pub fn observe(height: &AtomicU64, storage: &StorageManager, block: &Block) -> bool {
+        match Self::attested_height(storage, block) {
+            Some(h) => {
+                height.fetch_max(h, Ordering::SeqCst);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The signature + ancestry check. `Some(height)` iff the block is attested-ahead
+    /// evidence per the rules on [`AttestedNetworkHead`]; `None` otherwise.
+    fn attested_height(storage: &StorageManager, block: &Block) -> Option<u64> {
+        let hardening = PbaHardening::from_process();
+        // (1) the header binds its own hash — reject a forged height/parent.
+        if !block.verify_hash_for(hardening) {
+            return None;
+        }
+        // (2) valid proposer signature over the block hash.
+        if !matches!(crypto::verify_block_signature(block), Ok(true)) {
+            return None;
+        }
+        // (3) chains (parentHash ancestry) to a block WE HOLD, one height above it.
+        let parent_hash = block.header.selected_parent_hash;
+        if parent_hash == Hash::default() {
+            // genesis / rootless header: not evidence the network is AHEAD of us.
+            return None;
+        }
+        let parent = storage.blocks.get_block(&parent_hash).ok().flatten()?;
+        if block.header.height != parent.header.height.saturating_add(1) {
+            return None;
+        }
+        Some(block.header.height)
+    }
+}
+
+impl ProduceCatchupGate {
+    /// F2: decide whether the node is too far BEHIND its peers to seal this slot.
+    /// `local_tip` is the node's applied-tip height (read under the same advance lock
+    /// the producer holds for its build). Returns `Err` to make the producer REFRAIN.
+    ///
+    /// Hysteresis: enter the refuse band when `attested - local_tip > REFUSE_GAP`,
+    /// leave it only at `<= RESUME_GAP`. If refusing for `stall_alert_after` with no
+    /// applied-tip advance, raise the alert and latch OFF until the human override.
+    fn evaluate_network_height(&self, local_tip: u64) -> anyhow::Result<()> {
+        let Some(attested) = self.attested_ahead.as_ref() else {
+            return Ok(()); // F2 disabled ⇒ plain #126 gate.
+        };
+        let attested = attested.load(Ordering::SeqCst);
+        let gap = attested.saturating_sub(local_tip);
+        let mut st = self.behind.lock();
+
+        // Human-in-command override always wins: clear the stall latch and resume.
+        if self.override_resume.load(Ordering::SeqCst) {
+            st.refusing = false;
+            st.stalled_latch = false;
+            st.last_applied_tip = local_tip;
+            st.last_progress = Instant::now();
+            self.stall_alert.store(false, Ordering::SeqCst);
+            return Ok(());
+        }
+
+        // Sync progress (the applied tip advanced) resets the stall timer.
+        if local_tip > st.last_applied_tip {
+            st.last_applied_tip = local_tip;
+            st.last_progress = Instant::now();
+        }
+
+        // Once a no-progress stall has latched, ONLY the override (above) resumes —
+        // never auto-resume, even if the gap happens to close afterwards.
+        if st.stalled_latch {
+            return Err(anyhow::anyhow!(
+                "F2/#126: refusing to produce — behind the network by {gap} block(s) and STALLED \
+                 (no sync progress for over {}s). A human-in-command override is required to \
+                 resume; auto-resume after a stall is disabled so a partitioned/wedged node \
+                 cannot silently fork the fleet.",
+                self.stall_alert_after.as_secs()
+            ));
+        }
+
+        // Hysteresis on the gap to the best attested-ahead head.
+        if st.refusing {
+            if gap <= CATCHUP_RESUME_GAP {
+                st.refusing = false;
+                self.stall_alert.store(false, Ordering::SeqCst);
+                return Ok(());
+            }
+        } else if gap > CATCHUP_REFUSE_GAP {
+            st.refusing = true;
+            st.last_applied_tip = local_tip;
+            st.last_progress = Instant::now();
+        }
+
+        if !st.refusing {
+            return Ok(());
+        }
+
+        // Refusing: raise the stall alert + latch after `stall_alert_after` with no
+        // applied-tip progress.
+        if st.last_progress.elapsed() >= self.stall_alert_after {
+            st.stalled_latch = true;
+            self.stall_alert.store(true, Ordering::SeqCst);
+            error!(
+                "F2/#126 STALL ALERT: block production refused for over {}s with NO sync progress \
+                 while {gap} block(s) behind the network (attested_ahead={attested}, \
+                 applied_tip={local_tip}). Production is LATCHED OFF until a human-in-command \
+                 override.",
+                self.stall_alert_after.as_secs()
+            );
+            return Err(anyhow::anyhow!(
+                "F2/#126: refusing to produce — {gap} block(s) behind the network and stalled \
+                 >{}s; human-in-command override required to resume.",
+                self.stall_alert_after.as_secs()
+            ));
+        }
+
+        Err(anyhow::anyhow!(
+            "F2/#126: refusing to produce — this node is {gap} block(s) behind the network's best \
+             attested (validly-signed, chain-descending) head {attested} vs applied tip \
+             {local_tip}. Skipping this slot until sync catches up (resume at gap <= {}).",
+            CATCHUP_RESUME_GAP
+        ))
+    }
 }
 
 /// Block producer for mining new blocks
@@ -1018,8 +1251,50 @@ impl BlockProducer {
         self.produce_gate = Some(ProduceCatchupGate {
             rebuild_in_progress: app.rebuild_in_progress_handle(),
             dag_hydrated: app.dag_hydrated_handle(),
+            attested_ahead: None,
+            behind: Arc::new(Mutex::new(CatchupBehindState::default())),
+            override_resume: Arc::new(AtomicBool::new(false)),
+            stall_alert: Arc::new(AtomicBool::new(false)),
+            stall_alert_after: CATCHUP_STALL_ALERT,
         });
         self
+    }
+
+    /// F2 (network-height catch-up gate): wire the [`AttestedNetworkHead`] watermark so
+    /// the producer additionally refuses to seal while this node is BEHIND its peers
+    /// (see [`ProduceCatchupGate::evaluate_network_height`]). Extends the #126 gate; must
+    /// be chained AFTER [`Self::with_produce_catchup_gate`]. No-op if the #126 gate is
+    /// not wired.
+    pub fn with_network_height_gate(mut self, attested_ahead: Arc<AtomicU64>) -> Self {
+        if let Some(gate) = self.produce_gate.as_mut() {
+            gate.attested_ahead = Some(attested_ahead);
+        }
+        self
+    }
+
+    /// F2: shrink the no-progress stall-alert window (tests only; production uses the
+    /// [`CATCHUP_STALL_ALERT`] default).
+    #[allow(dead_code)]
+    pub fn with_catchup_stall_alert_after(mut self, after: Duration) -> Self {
+        if let Some(gate) = self.produce_gate.as_mut() {
+            gate.stall_alert_after = after;
+        }
+        self
+    }
+
+    /// F2: the surfaced stall-alert flag (true while production is latched OFF after a
+    /// >60s no-progress stall). The monitor/RPC reads this to page a human (ops surface
+    /// wired to the RPC in a follow-up).
+    #[allow(dead_code)]
+    pub fn catchup_alert_handle(&self) -> Option<Arc<AtomicBool>> {
+        self.produce_gate.as_ref().map(|g| g.stall_alert.clone())
+    }
+
+    /// F2: the human-in-command override flag — set true to resume production after a
+    /// stall alert (ops surface wired to the RPC in a follow-up).
+    #[allow(dead_code)]
+    pub fn catchup_override_handle(&self) -> Option<Arc<AtomicBool>> {
+        self.produce_gate.as_ref().map(|g| g.override_resume.clone())
     }
 
     /// VALIDATOR-S1 (v5): if `height` is a snapshot boundary S(E), rebuild the shared
@@ -1232,6 +1507,17 @@ impl BlockProducer {
                     ));
                 }
             }
+            // F2 — NETWORK-HEIGHT CATCH-UP. Refuse to seal while this node is BEHIND its
+            // peers, judged ONLY from the best VALIDLY-SIGNED, CHAIN-DESCENDING peer head
+            // (never a self-reported Hello height / sync target). `local_tip` is read from
+            // the applied-tip lock we already hold for the whole build (0 in the legacy /
+            // no-lock path, where `attested_ahead` is also never wired ⇒ inert). Strictly
+            // additive: this only ever makes the producer REFRAIN.
+            let local_tip = applied_guard
+                .as_ref()
+                .map(|g| g.tip().height)
+                .unwrap_or(0);
+            gate.evaluate_network_height(local_tip)?;
         }
 
         if let Some(guard) = applied_guard.as_ref() {
@@ -4591,6 +4877,350 @@ mod tests {
             "follower and the producer it agrees with must be on the same applied block"
         );
     }
+
+    // =====================================================================
+    // F2 (2026-09-28): PRODUCER NETWORK-HEIGHT CATCH-UP GATE.
+    //
+    // Extends the #126 producer seal gate so a node that is BEHIND its peers
+    // refuses to seal. "Behind" is measured ONLY from `AttestedNetworkHead` —
+    // the highest peer block height that (1) binds its own hash, (2) carries a
+    // valid proposer signature, and (3) chains (parentHash ancestry) to a block
+    // we hold, one height above it. It NEVER reads `PeerInfo.head_height` (a
+    // once-set self-reported Hello field) or `SyncManager.target_height` (a
+    // liar-controlled MAX of claims). 0 peers / no attested-ahead header => not
+    // behind => a lone post-reroll producer seals normally. Hysteresis:
+    // refuse when gap > REFUSE_GAP (3), resume only at <= RESUME_GAP (1). A
+    // >stall-window refusal with NO sync progress alerts + latches OFF until a
+    // human-in-command override. Strictly additive: only ever makes the
+    // producer REFRAIN; no block-validity change; no activation height.
+    // =====================================================================
+
+    /// Build a v2 block at `height` off `parent`, hash-bound for the live
+    /// hardening, optionally signed by `sign` (whose verifying key is set as the
+    /// proposer, so `verify_block_signature` passes).
+    fn f2_block(
+        height: u64,
+        parent: Hash,
+        sign: Option<&Ed25519SigningKey>,
+    ) -> Block {
+        let proposer = match sign {
+            Some(sk) => PublicKey::new(sk.verifying_key().to_bytes()),
+            None => PublicKey::new([0x11; 32]),
+        };
+        let mut b = BlockBuilder::new()
+            .version(2)
+            .height(height)
+            .parent(parent)
+            .coinbase([0x33; 20])
+            .timestamp(1000 + height)
+            .proposer(proposer)
+            .vrf_reveal(VrfProof {
+                proof: vec![1u8; 8],
+                output: Hash::new([0x5B; 32]),
+            })
+            .transactions(vec![])
+            .state_root(Hash::default())
+            .blue_score(height)
+            .blue_work(citrate_consensus::types::blue_work_for_score(height))
+            .build_unhashed();
+        b.header.block_hash = b.compute_hash_for(PbaHardening::from_process());
+        if let Some(sk) = sign {
+            b.signature = crypto::sign_block(&b.header.block_hash, sk);
+        }
+        b
+    }
+
+    /// Build a `ProduceCatchupGate` directly for the hysteresis / stall unit
+    /// tests (avoids `produce_block`'s tip-advancing side effects, so `local_tip`
+    /// is whatever the test passes to `evaluate_network_height`).
+    fn f2_gate(attested: Arc<AtomicU64>, stall_after: Duration) -> ProduceCatchupGate {
+        ProduceCatchupGate {
+            rebuild_in_progress: Arc::new(AtomicBool::new(false)),
+            dag_hydrated: None,
+            attested_ahead: Some(attested),
+            behind: Arc::new(Mutex::new(CatchupBehindState::default())),
+            override_resume: Arc::new(AtomicBool::new(false)),
+            stall_alert: Arc::new(AtomicBool::new(false)),
+            stall_alert_after: stall_after,
+        }
+    }
+
+    /// TEST 1 — behind-1-attested-peer. A single peer delivers a validly-signed
+    /// block that chains to a block we hold and is > REFUSE_GAP ahead of our
+    /// applied tip: the producer REFUSES. It RESUMES once the gap drops to
+    /// <= RESUME_GAP.
+    #[tokio::test]
+    async fn f2_behind_one_attested_peer_refuses_then_resumes() {
+        let (_tmp, storage, _state_db, executor, mempool) = producer_fixture();
+        let app = Arc::new(crate::canonical_apply::CanonicalApplicator::new(
+            executor.clone(),
+            storage.clone(),
+        ));
+        let attested = Arc::new(AtomicU64::new(0));
+        let producer = test_producer(&storage, &executor, &mempool)
+            .with_applied_tip_lock(app.advance_lock())
+            .with_produce_catchup_gate(&app)
+            .with_network_height_gate(attested.clone());
+
+        // One attested peer at height 5 (applied tip is 0, gap 5 > REFUSE_GAP 3).
+        // Hold a parent at height 4 so the height-5 child chains to a block we hold.
+        let sk = test_signing_key();
+        let parent4 = f2_block(4, Hash::new([0x40; 32]), None);
+        storage.blocks.put_block(&parent4).expect("hold parent@4");
+        let child5 = f2_block(5, parent4.header.block_hash, Some(&sk));
+        assert!(
+            AttestedNetworkHead::observe(&attested, &storage, &child5),
+            "a validly-signed child of a held block must be attested-ahead evidence"
+        );
+        assert_eq!(attested.load(Ordering::SeqCst), 5);
+
+        let err = producer
+            .produce_block()
+            .await
+            .expect_err("must refuse to seal while 5 behind the attested network head");
+        assert!(
+            err.to_string().contains("F2") && err.to_string().contains("behind the network"),
+            "the refusal must be the F2 catch-up gate, got: {err}"
+        );
+
+        // Caught up to within RESUME_GAP: the producer seals again (hysteresis).
+        attested.store(1, Ordering::SeqCst);
+        producer
+            .produce_block()
+            .await
+            .expect("produces once within RESUME_GAP of the attested head");
+    }
+
+    /// TEST 2 — Hello-lie(+1000). A peer that merely CLAIMS a head 1000 ahead
+    /// (a Hello, or a signed header that JUMPS height) never moves the gate: the
+    /// gate consults only `AttestedNetworkHead`, never a self-reported height,
+    /// so the producer keeps sealing.
+    #[tokio::test]
+    async fn f2_hello_lie_advertised_height_is_ignored() {
+        let (_tmp, storage, _state_db, executor, mempool) = producer_fixture();
+        let app = Arc::new(crate::canonical_apply::CanonicalApplicator::new(
+            executor.clone(),
+            storage.clone(),
+        ));
+        let attested = Arc::new(AtomicU64::new(0));
+        let producer = test_producer(&storage, &executor, &mempool)
+            .with_applied_tip_lock(app.advance_lock())
+            .with_produce_catchup_gate(&app)
+            .with_network_height_gate(attested.clone());
+
+        // (a) A bare Hello claim delivers no signed, chain-linked block, so
+        //     nothing is ever observed: the watermark stays 0.
+        assert_eq!(attested.load(Ordering::SeqCst), 0);
+
+        // (b) The "+1000" made concrete as a validly-signed block that JUMPS to
+        //     height 1000 off a held height-0 parent. Height continuity
+        //     (height == parent.height + 1) rejects it, so it is NOT counted.
+        let sk = test_signing_key();
+        let parent0 = f2_block(0, Hash::default(), None);
+        storage.blocks.put_block(&parent0).expect("hold parent@0");
+        let jump = f2_block(1000, parent0.header.block_hash, Some(&sk));
+        assert!(
+            !AttestedNetworkHead::observe(&attested, &storage, &jump),
+            "a height-jumping signed header must NOT raise the attested watermark"
+        );
+        assert_eq!(
+            attested.load(Ordering::SeqCst),
+            0,
+            "a +1000 claim never moves the gate"
+        );
+
+        producer
+            .produce_block()
+            .await
+            .expect("seals normally: a self-reported +1000 head is not attested evidence");
+    }
+
+    /// TEST 3 — signed-fork-header. A validly-signed header whose parent we do
+    /// NOT hold (it forks off an unknown block) is NOT attested-ahead evidence,
+    /// so the producer keeps sealing.
+    #[tokio::test]
+    async fn f2_signed_fork_header_off_unknown_parent_is_not_attested() {
+        let (_tmp, storage, _state_db, executor, mempool) = producer_fixture();
+        let app = Arc::new(crate::canonical_apply::CanonicalApplicator::new(
+            executor.clone(),
+            storage.clone(),
+        ));
+        let attested = Arc::new(AtomicU64::new(0));
+        let producer = test_producer(&storage, &executor, &mempool)
+            .with_applied_tip_lock(app.advance_lock())
+            .with_produce_catchup_gate(&app)
+            .with_network_height_gate(attested.clone());
+
+        // A perfectly-signed, hash-bound block at height 9 — but its parent
+        // (0xEE..) is a block we have never seen. No ancestry to a held block.
+        let sk = test_signing_key();
+        let fork = f2_block(9, Hash::new([0xEE; 32]), Some(&sk));
+        assert!(fork.verify_hash_for(PbaHardening::from_process()));
+        assert!(matches!(
+            citrate_consensus::crypto::verify_block_signature(&fork),
+            Ok(true)
+        ));
+        assert!(
+            !AttestedNetworkHead::observe(&attested, &storage, &fork),
+            "a signed header off an unknown parent is not chain-descending evidence"
+        );
+        assert_eq!(attested.load(Ordering::SeqCst), 0);
+
+        producer
+            .produce_block()
+            .await
+            .expect("seals normally: an unrooted signed fork header is not attested evidence");
+    }
+
+    /// TEST 4 — 0-peers. No attested-ahead header at all (a lone post-reroll
+    /// producer): the node is not behind and seals normally.
+    #[tokio::test]
+    async fn f2_zero_peers_produces_normally() {
+        let (_tmp, storage, _state_db, executor, mempool) = producer_fixture();
+        let app = Arc::new(crate::canonical_apply::CanonicalApplicator::new(
+            executor.clone(),
+            storage.clone(),
+        ));
+        let attested = Arc::new(AtomicU64::new(0));
+        let producer = test_producer(&storage, &executor, &mempool)
+            .with_applied_tip_lock(app.advance_lock())
+            .with_produce_catchup_gate(&app)
+            .with_network_height_gate(attested.clone());
+
+        assert_eq!(attested.load(Ordering::SeqCst), 0, "no peers, no evidence");
+        producer
+            .produce_block()
+            .await
+            .expect("a lone producer with no attested-ahead peers seals normally");
+    }
+
+    /// TEST 5 — boundary-flapping. Hysteresis: enter the refuse band above
+    /// REFUSE_GAP, leave it only at/below RESUME_GAP; a gap oscillating in the
+    /// deadband (RESUME, REFUSE] does NOT toggle production.
+    #[test]
+    fn f2_boundary_flapping_hysteresis_no_toggle() {
+        assert!(CATCHUP_RESUME_GAP < CATCHUP_REFUSE_GAP, "deadband must be non-empty");
+        let attested = Arc::new(AtomicU64::new(0));
+        let gate = f2_gate(attested.clone(), Duration::from_secs(3600)); // no stalls here
+        let local_tip = 0u64;
+        let refuses = |g: u64| {
+            attested.store(g, Ordering::SeqCst);
+            gate.evaluate_network_height(local_tip).is_err()
+        };
+
+        // gap 5 (> REFUSE_GAP): enter the refuse band.
+        assert!(refuses(5), "gap 5 must refuse");
+        // gap 4, then 2: still inside the deadband while already refusing.
+        assert!(refuses(4), "gap 4 must stay refusing (hysteresis)");
+        assert!(refuses(2), "gap 2 must stay refusing (still > RESUME_GAP)");
+        // gap 1 (<= RESUME_GAP): resume.
+        assert!(!refuses(1), "gap 1 must resume");
+        // gap 3 (<= REFUSE_GAP): stays producing — 3 is not > REFUSE_GAP.
+        assert!(!refuses(3), "gap 3 must NOT re-enter the refuse band");
+        // gap 4 (> REFUSE_GAP): re-enter.
+        assert!(refuses(4), "gap 4 must refuse again after producing");
+    }
+
+    /// TEST 6 — stalled-sync-alert. Refusing for > the stall window with NO sync
+    /// progress raises an ALERT (surfaced signal) and LATCHES production OFF; it
+    /// never auto-resumes — only the human-in-command override resumes it.
+    #[test]
+    fn f2_stalled_sync_alert_requires_human_override() {
+        let attested = Arc::new(AtomicU64::new(5)); // gap 5 vs tip 0
+        let gate = f2_gate(attested.clone(), Duration::from_millis(120));
+        let alert = gate.stall_alert.clone();
+        let over = gate.override_resume.clone();
+        let local_tip = 0u64;
+
+        // First round: refuses (behind), no alert yet.
+        assert!(gate.evaluate_network_height(local_tip).is_err());
+        assert!(!alert.load(Ordering::SeqCst), "no alert before the stall window");
+
+        // No sync progress for longer than the stall window.
+        std::thread::sleep(Duration::from_millis(180));
+        let err = gate
+            .evaluate_network_height(local_tip)
+            .expect_err("stalled while behind must keep refusing");
+        assert!(alert.load(Ordering::SeqCst), "the stall alert must be surfaced");
+        assert!(
+            err.to_string().contains("override"),
+            "the stall refusal must demand a human-in-command override, got: {err}"
+        );
+
+        // No auto-resume even if the gap now closes — the latch holds.
+        attested.store(0, Ordering::SeqCst);
+        assert!(
+            gate.evaluate_network_height(local_tip).is_err(),
+            "must NOT auto-resume after a stall latch, even at gap 0"
+        );
+
+        // Human-in-command override resumes and clears the alert.
+        over.store(true, Ordering::SeqCst);
+        assert!(
+            gate.evaluate_network_height(local_tip).is_ok(),
+            "the human override must resume production"
+        );
+        assert!(!alert.load(Ordering::SeqCst), "override clears the alert");
+    }
+
+    /// TEST 6b — sync progress resets the stall timer (never alerts while
+    /// catching up), and the producer resumes once within RESUME_GAP.
+    #[test]
+    fn f2_sync_progress_resets_stall_timer() {
+        let attested = Arc::new(AtomicU64::new(50));
+        let gate = f2_gate(attested.clone(), Duration::from_millis(120));
+        let alert = gate.stall_alert.clone();
+
+        // Behind by 50; refuse. Advance the applied tip repeatedly (sync
+        // progress) across more than one stall window: the timer keeps resetting
+        // and no alert fires.
+        for tip in [0u64, 10, 20, 30, 40] {
+            assert!(gate.evaluate_network_height(tip).is_err(), "still behind at tip {tip}");
+            std::thread::sleep(Duration::from_millis(60));
+            assert!(!alert.load(Ordering::SeqCst), "progress must reset the stall timer");
+        }
+        // Within RESUME_GAP now: resume cleanly, no override needed.
+        assert!(gate.evaluate_network_height(50).is_ok(), "resume once caught up");
+    }
+
+    /// TEST 7 — revert-check. The F2 gate must stay WIRED: `produce_block` calls
+    /// `evaluate_network_height`, and that check reads the attested watermark
+    /// (never `head_height` / `target_height`). Deleting the gate call or the
+    /// attested read turns this red — the same revert guard MAC's harness uses.
+    #[test]
+    fn f2_revert_check_gate_wired_and_uses_attested_not_selfreported() {
+        let src = include_str!("producer.rs");
+        let pb = src
+            .find("async fn produce_block(&self)")
+            .expect("produce_block present");
+        // Bound the body at the next method definition so the call must live
+        // INSIDE produce_block, not merely somewhere later in the file.
+        let after = &src[pb..];
+        let end = after[1..]
+            .find("\n    async fn ")
+            .or_else(|| after[1..].find("\n    fn "))
+            .map(|e| e + 1)
+            .unwrap_or(after.len());
+        let body = &after[..end];
+        assert!(
+            body.contains("evaluate_network_height(local_tip)"),
+            "produce_block must call the F2 network-height gate"
+        );
+        let ev = src
+            .find("fn evaluate_network_height(")
+            .expect("evaluate_network_height present");
+        let ebody = &src[ev..ev + 3000];
+        assert!(
+            ebody.contains("self.attested_ahead")
+                && ebody.contains("CATCHUP_REFUSE_GAP")
+                && ebody.contains("CATCHUP_RESUME_GAP"),
+            "the gate must judge behindness from the attested head with hysteresis"
+        );
+        assert!(
+            !ebody.contains("head_height") && !ebody.contains("target_height"),
+            "the gate must NEVER read PeerInfo.head_height or SyncManager.target_height"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4670,8 +5300,7 @@ mod multi_producer_regression {
             !merging.is_empty(),
             "merging blocks must take the real calculate_blue_set path"
         );
-    }
-}
+    }}
 
 #[cfg(test)]
 mod blue_score_band_regression {
@@ -4807,8 +5436,7 @@ mod pba_l1b_001_producer_filter {
             window.contains("tx_auth::verify_for_block(&t, chain_id)"),
             "PBA-L1b-001: produce_block must filter candidates with tx_auth::verify_for_block"
         );
-    }
-}
+    }}
 
 /// Producer circuit breaker and round rollback: a transaction that makes
 /// every production round panic is found, evicted and quarantined, and a

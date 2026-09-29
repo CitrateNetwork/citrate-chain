@@ -1971,6 +1971,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // server can read it.
     let max_seen_height = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
+    // F2 (producer network-height catch-up gate): the highest peer block height that is
+    // VALIDLY SIGNED and CHAINS to a block we hold (see `AttestedNetworkHead`). This is
+    // the ONLY "how far ahead is the network" signal the producer gate consults — it is
+    // deliberately SEPARATE from `max_seen_height` (which mixes in clamped UNVERIFIED
+    // claims for sync-target purposes) and never derived from `PeerInfo.head_height` or
+    // `SyncManager.target_height`. Updated at both block-receive sites below.
+    let attested_network_head = producer::AttestedNetworkHead::new();
+
     // Start P2P listener and connect to bootstrap nodes
     {
         // Prepare head info — advertise our APPLIED tip (height + hash), NOT the
@@ -2670,6 +2678,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // clones existed only to feed the two open-coded admission ladders and
         // are gone with them.
         let max_seen_for_rx = max_seen_height.clone();
+        // F2: attested-network-head handle for the receive tasks.
+        let attested_for_rx = attested_network_head.handle();
 
         // SYNC-S1 / D2: the network handler's handle on the single admission
         // path (constructed at function scope above, alongside the genesis seed
@@ -2923,6 +2933,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                             &max_seen_for_rx,
                                             block.header.height,
                                         );
+                                        // F2: an admitted block is signed + genesis-linked;
+                                        // fold it into the attested-network-head watermark
+                                        // (re-checks signature + parent ancestry itself).
+                                        producer::AttestedNetworkHead::observe(
+                                            &attested_for_rx,
+                                            &storage_for_handler,
+                                            &block,
+                                        );
                                         if completed_partial {
                                             tracing::warn!(
                                                 "Completed a partial admission of gossiped block {} @ {}",
@@ -3145,6 +3163,13 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                         if block.header.height > highest_admitted {
                                             highest_admitted = block.header.height;
                                         }
+                                        // F2: fold the signed, genesis-linked synced block
+                                        // into the attested-network-head watermark.
+                                        producer::AttestedNetworkHead::observe(
+                                            &attested_for_rx,
+                                            &storage_for_handler,
+                                            &block,
+                                        );
                                         if completed_partial {
                                             tracing::warn!(
                                                 "Completed a partial admission of synced block {} @ {}",
@@ -3793,6 +3818,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // restart, so a lagging/replaying node never forks the fleet by sealing on a
             // stale (but self-consistent) applied tip.
             producer_instance = producer_instance.with_produce_catchup_gate(app);
+            // F2 (network-height catch-up): also refuse to seal while this node is BEHIND
+            // its peers — measured only from validly-signed, chain-descending peer heads
+            // (`attested_network_head`), never a self-reported Hello height / sync target.
+            producer_instance =
+                producer_instance.with_network_height_gate(attested_network_head.handle());
         }
 
         // WP-I.3: Share the same pause_flag between RPC server and producer

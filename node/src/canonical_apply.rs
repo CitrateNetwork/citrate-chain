@@ -200,6 +200,20 @@ pub enum ApplyOutcome {
     AlreadyApplied,
 }
 
+/// F3: RAII guard that clears `rebuild_in_progress` when it drops — on a normal
+/// return AND during a panic unwind or task cancellation. `maybe_runtime_rebuild`
+/// holds one across `recover_to_head`, so a panic mid-rebuild can no longer leave the
+/// flag stuck true (which would wedge the #126-gated producer until a node restart).
+struct RebuildInProgressGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for RebuildInProgressGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Execute-on-receive driver. Owns the shared applied-state lock (tip + reorg
 /// snapshot ring), the deterministic reward calculator, and an optional
 /// fork-choice source; drives `Executor::apply_block`.
@@ -1322,6 +1336,14 @@ impl CanonicalApplicator {
         if self.rebuild_in_progress.swap(true, Ordering::SeqCst) {
             return;
         }
+        // F3: clear `rebuild_in_progress` on EVERY exit path via an RAII guard. This flag
+        // gates block production (the #126 catch-up gate refuses while it is set), so a
+        // PANIC or future cancellation inside `recover_to_head` used to leave it stuck
+        // true and wedge production until a node restart. The guard's `Drop` runs on a
+        // normal return AND during unwind, so a panic mid-rebuild now clears it.
+        let _rebuild_guard = RebuildInProgressGuard {
+            flag: self.rebuild_in_progress.clone(),
+        };
         warn!("runtime reorg: rebuilding applied state from genesis via the canonical spine (deep-fork self-heal)");
         match self.recover_to_head(genesis_state, genesis_hash).await {
             Ok(true) => info!("runtime reorg: spine rebuild converged to the fork-choice head"),
@@ -1330,7 +1352,7 @@ impl CanonicalApplicator {
             }
             Err(e) => warn!("runtime reorg: spine rebuild failed (continuing on current tip): {e}"),
         }
-        self.rebuild_in_progress.store(false, Ordering::SeqCst);
+        // `_rebuild_guard` clears `rebuild_in_progress` here as it drops.
     }
 
     /// STARTUP RECOVERY for the same-height-sibling wedge (2026-08-06; chain 40204
@@ -7040,4 +7062,405 @@ mod tests {
             "fleet-wide registry (vested-share) parity after cross-policy reorg"
         );
     }
+
+    // =====================================================================
+    // INDEPENDENT VERIFIER (2026-09-28, MAC Lane D): citrate-chain PR #251
+    // crash-consistency. Local-only harness, appended at the end of the first
+    // `mod tests` in node/src/canonical_apply.rs.
+    //
+    // Crash model: a CHILD process (this test binary re-invoked) runs a real
+    // scenario over a RocksDB dir: genesis persist, apply a1, a2 (linear path),
+    // then a fork-choice reorg to the heavier B branch (b2, b3). Its executor
+    // writes through `V251AbortStore`, which calls `std::process::abort()`
+    // (no destructors, no flush: equivalent to kill -9 at that instant) right
+    // BEFORE its k-th write call. The parent then reopens the directory,
+    // hydrates state exactly as `start_node` does (all accounts + storage from
+    // the store) and checks the boot invariant SRP-S3 enforces:
+    //   hydrated_root == state_root(block at the durable applied tip)
+    // (or == the genesis root when no tip is persisted yet). A torn commit
+    // fails this and would halt the node at boot / fork it.
+    // A second test SIGKILLs the child at random wall-clock instants.
+    // =====================================================================
+
+    use citrate_execution::executor::{StateStorageChange as V251Change, StateStoreTrait as V251Trait};
+    use citrate_execution::types::AccountState as V251Acct;
+
+    const V251_DIR: &str = "V251_CHILD_DIR";
+    const V251_ABORT_AT: &str = "V251_ABORT_AT";
+    const V251_LOOP: &str = "V251_LOOP";
+
+    /// Delegating store that aborts the process before its k-th write.
+    struct V251AbortStore {
+        inner: Arc<citrate_storage::state::StateStore>,
+        writes: AtomicU64,
+        abort_at: u64,
+    }
+
+    impl V251AbortStore {
+        fn w(&self, what: &str) {
+            let n = self.writes.fetch_add(1, Ordering::SeqCst) + 1;
+            if std::env::var("V251_TRACE").is_ok() {
+                eprintln!("V251 write#{n} {what}");
+            }
+            if n == self.abort_at {
+                eprintln!("V251 ABORT before write#{n} {what}");
+                std::process::abort();
+            }
+        }
+    }
+
+    impl V251Trait for V251AbortStore {
+        fn put_account(&self, a: &Address, s: &V251Acct) -> anyhow::Result<()> {
+            self.w("put_account");
+            V251Trait::put_account(&*self.inner, a, s)
+        }
+        fn get_account(&self, a: &Address) -> anyhow::Result<Option<V251Acct>> {
+            V251Trait::get_account(&*self.inner, a)
+        }
+        fn put_code(&self, h: &Hash, c: &[u8]) -> anyhow::Result<()> {
+            self.w("put_code");
+            V251Trait::put_code(&*self.inner, h, c)
+        }
+        fn get_code(&self, h: &Hash) -> anyhow::Result<Option<Vec<u8>>> {
+            V251Trait::get_code(&*self.inner, h)
+        }
+        fn put_storage(&self, a: &Address, k: &[u8], v: &[u8]) -> anyhow::Result<()> {
+            self.w("put_storage");
+            V251Trait::put_storage(&*self.inner, a, k, v)
+        }
+        fn get_storage(&self, a: &Address, k: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+            V251Trait::get_storage(&*self.inner, a, k)
+        }
+        fn delete_storage(&self, a: &Address, k: &[u8]) -> anyhow::Result<()> {
+            self.w("delete_storage");
+            V251Trait::delete_storage(&*self.inner, a, k)
+        }
+        fn delete_account(&self, a: &Address) -> anyhow::Result<()> {
+            self.w("delete_account");
+            V251Trait::delete_account(&*self.inner, a)
+        }
+        fn write_state_batch_sync(
+            &self,
+            a: &[(Address, V251Acct)],
+            s: &[V251Change],
+        ) -> anyhow::Result<()> {
+            self.w("write_state_batch_sync");
+            V251Trait::write_state_batch_sync(&*self.inner, a, s)
+        }
+        fn write_state_batch_with_applied_tip(
+            &self,
+            a: &[(Address, V251Acct)],
+            s: &[V251Change],
+            t: Option<(Hash, u64)>,
+        ) -> anyhow::Result<()> {
+            self.w("write_state_batch_with_applied_tip");
+            V251Trait::write_state_batch_with_applied_tip(&*self.inner, a, s, t)
+        }
+        // V251_REORG_OVERRIDE_BEGIN
+        fn write_reorg_batch_sync(
+            &self,
+            a: &[(Address, V251Acct)],
+            s: &[V251Change],
+            d: &[Address],
+            c: &[(Hash, Vec<u8>)],
+            t: Option<(Hash, u64)>,
+        ) -> anyhow::Result<()> {
+            self.w("write_reorg_batch_sync");
+            V251Trait::write_reorg_batch_sync(&*self.inner, a, s, d, c, t)
+        }
+        // V251_REORG_OVERRIDE_END
+        fn put_applied_tip_meta(&self, h: &Hash, n: u64) -> anyhow::Result<()> {
+            self.w("put_applied_tip_meta");
+            V251Trait::put_applied_tip_meta(&*self.inner, h, n)
+        }
+        fn put_account_version(&self, a: &Address, v: u64) -> anyhow::Result<()> {
+            self.w("put_account_version");
+            V251Trait::put_account_version(&*self.inner, a, v)
+        }
+        fn put_account_versions(&self, e: &[(Address, u64)]) -> anyhow::Result<()> {
+            self.w("put_account_versions");
+            V251Trait::put_account_versions(&*self.inner, e)
+        }
+        fn get_all_account_versions(&self) -> anyhow::Result<Vec<(Address, u64)>> {
+            V251Trait::get_all_account_versions(&*self.inner)
+        }
+        fn put_global_version(&self, v: u64) -> anyhow::Result<()> {
+            self.w("put_global_version");
+            V251Trait::put_global_version(&*self.inner, v)
+        }
+        fn get_global_version(&self) -> anyhow::Result<Option<u64>> {
+            V251Trait::get_global_version(&*self.inner)
+        }
+    }
+
+    fn v251_genesis_root() -> Hash {
+        let e = Executor::new(Arc::new(StateDB::new()));
+        e.set_balance(&Address(ALICE), U256::from(FUND));
+        e.calculate_state_root()
+    }
+
+    /// The deterministic blocks of the scenario (independent in-memory producers).
+    async fn v251_blocks() -> (Block, Block, Block, Block) {
+        let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pa.set_balance(&Address(ALICE), U256::from(FUND));
+        let a1 = produce(&pa, Hash::default(), 1, VRF_OUT, vec![transfer(ALICE, DAVE, 1_000, 0)]).await;
+        let a2 = produce(&pa, a1.header.block_hash, 2, VRF_OUT, vec![transfer(ALICE, BOB, 1_000, 1)]).await;
+        let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pb.set_balance(&Address(ALICE), U256::from(FUND));
+        let _b1 = produce(&pb, Hash::default(), 1, VRF_OUT, vec![transfer(ALICE, DAVE, 1_000, 0)]).await;
+        let vrf_b = [0x5B; 32];
+        let b2 = produce(&pb, a1.header.block_hash, 2, vrf_b, vec![transfer(ALICE, CAROL, 1_000, 1)]).await;
+        let b3 = produce(&pb, b2.header.block_hash, 3, vrf_b, vec![transfer(ALICE, CAROL, 1_000, 2)]).await;
+        (a1, a2, b2, b3)
+    }
+
+    /// CHILD body: the scenario, with every executor write going through the
+    /// abort store. Prints the total write count when it completes.
+    async fn v251_child_scenario(dir: &std::path::Path, abort_at: u64) {
+        let storage = Arc::new(StorageManager::new(dir, PruningConfig::default()).expect("storage"));
+        let store = Arc::new(V251AbortStore {
+            inner: storage.state.clone(),
+            writes: AtomicU64::new(0),
+            abort_at,
+        });
+        let exec = Arc::new(Executor::with_storage(Arc::new(StateDB::new()), Some(store.clone())));
+        exec.set_balance(&Address(ALICE), U256::from(FUND));
+        exec.persist_state_changes().await.expect("persist genesis");
+        let (a1, a2, b2, b3) = v251_blocks().await;
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        persist(&storage, &a1);
+        app.apply_received(&a1).await;
+        persist(&storage, &a2);
+        app.apply_received(&a2).await;
+        persist(&storage, &b2);
+        persist(&storage, &b3);
+        if std::env::var("V251_SCENARIO").as_deref() == Ok("recover") {
+            // Restart-style deep recovery: a fresh applicator (ring = tip only)
+            // cannot reorg; recover_to_head rebuilds from genesis to b3.
+            drop(app);
+            let mut app2 = CanonicalApplicator::new(exec.clone(), storage.clone());
+            app2.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+            let g = Executor::new(Arc::new(StateDB::new()));
+            g.set_balance(&Address(ALICE), U256::from(FUND));
+            let ok = app2
+                .recover_to_head(g.state_snapshot(), Hash::default())
+                .await
+                .expect("recover_to_head");
+            assert!(ok, "child: recovery reached b3");
+            assert_eq!(app2.applied_tip().await.height, 3, "child: recovered to B");
+        } else {
+            app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+            app.apply_received(&b3).await;
+            assert_eq!(app.applied_tip().await.height, 3, "child: reorged to B");
+        }
+        println!("V251_TOTAL_WRITES={}", store.writes.load(Ordering::SeqCst));
+    }
+
+    /// Reopen `dir` like `start_node` and check the boot invariant.
+    /// Returns (tip height or None, invariant holds, detail).
+    fn v251_check(dir: &std::path::Path, a1: &Block, a2: &Block, b2: &Block, b3: &Block) -> (Option<u64>, bool, String) {
+        let storage = StorageManager::new(dir, PruningConfig::default()).expect("reopen");
+        let sdb = StateDB::new();
+        for (addr, acct) in storage.state.get_all_accounts().expect("accounts") {
+            sdb.accounts.load_account(addr, acct);
+        }
+        for ((addr, key), val) in storage.state.get_all_storage().expect("storage") {
+            sdb.set_storage(addr, key.as_bytes().to_vec(), val.as_bytes().to_vec());
+        }
+        let n_accounts = storage.state.get_all_accounts().map(|v| v.len()).unwrap_or(0);
+        let root = sdb.calculate_state_root();
+        let tip = storage.blocks.get_applied_tip().ok().flatten();
+        if tip.is_none() && n_accounts == 0 {
+            return (None, true, "pre-genesis (nothing persisted yet)".to_string());
+        }
+        let expected = match tip {
+            None => v251_genesis_root(),
+            // Height 0 = genesis (the scenario's genesis hash is Hash::default();
+            // in production it is block 0, whose state_root is the genesis root).
+            Some((_, 0)) => v251_genesis_root(),
+            Some((h, _)) => {
+                let named = [a1, a2, b2, b3]
+                    .iter()
+                    .find(|b| b.header.block_hash == h)
+                    .map(|b| b.state_root);
+                named.unwrap_or_else(|| {
+                    storage.blocks.get_block(&h).ok().flatten().map(|b| b.state_root).unwrap_or_default()
+                })
+            }
+        };
+        let label = |h: &Hash| {
+            [("a1", a1), ("a2", a2), ("b2", b2), ("b3", b3)]
+                .iter()
+                .find(|(_, b)| b.header.block_hash == *h)
+                .map(|(n, _)| n.to_string())
+                .unwrap_or_else(|| format!("{h}"))
+        };
+        let which_root = [("genesis", v251_genesis_root()), ("a1", a1.state_root), ("a2", a2.state_root), ("b2", b2.state_root), ("b3", b3.state_root)]
+            .iter()
+            .find(|(_, r)| *r == root)
+            .map(|(n, _)| n.to_string())
+            .unwrap_or_else(|| "UNKNOWN".to_string());
+        let detail = format!(
+            "tip={} durable_state_is={} ok={}",
+            tip.map(|(h, n)| format!("{}@{n}", label(&h))).unwrap_or_else(|| "none".into()),
+            which_root,
+            root == expected
+        );
+        (tip.map(|t| t.1), root == expected, detail)
+    }
+
+    fn v251_spawn(test: &str, envs: &[(&str, String)]) -> std::process::Child {
+        let exe = std::env::current_exe().expect("exe");
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args([test, "--exact", "--nocapture", "--test-threads=1"]);
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        cmd.spawn().expect("spawn child")
+    }
+
+    /// Child entry point (a no-op unless V251_CHILD_DIR is set).
+    #[tokio::test]
+    async fn verify251_child() {
+        let Ok(dir) = std::env::var(V251_DIR) else { return };
+        let dir = std::path::PathBuf::from(dir);
+        if std::env::var(V251_LOOP).is_ok() {
+            // Random-SIGKILL mode: run the scenario repeatedly on fresh subdirs.
+            for i in 0.. {
+                let sub = dir.join(format!("run{i}"));
+                std::fs::create_dir_all(&sub).expect("subdir");
+                std::fs::write(dir.join("current"), sub.to_string_lossy().as_bytes()).expect("current");
+                v251_child_scenario(&sub, u64::MAX).await;
+                std::fs::remove_dir_all(&sub).ok();
+            }
+        }
+        let abort_at: u64 = std::env::var(V251_ABORT_AT).ok().and_then(|v| v.parse().ok()).unwrap_or(u64::MAX);
+        v251_child_scenario(&dir, abort_at).await;
+    }
+
+    /// Deterministic crash at EVERY write boundary of the scenario.
+    #[tokio::test]
+    async fn verify251_abort_at_every_write_keeps_state_and_tip_consistent() {
+        v251_abort_sweep("reorg").await;
+    }
+
+    #[tokio::test]
+    async fn verify251_abort_at_every_write_recover_to_head() {
+        v251_abort_sweep("recover").await;
+    }
+
+    async fn v251_abort_sweep(scenario: &str) {
+        if std::env::var(V251_DIR).is_ok() {
+            return;
+        }
+        let test = "canonical_apply::tests::verify251_child";
+        let (a1, a2, b2, b3) = v251_blocks().await;
+        // Dry run: count writes.
+        let dry = tempfile::tempdir().expect("dir");
+        let out = v251_spawn(test, &[(V251_DIR, dry.path().to_string_lossy().into()), ("V251_SCENARIO", scenario.to_string())])
+            .wait_with_output()
+            .expect("dry");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let total: u64 = stdout
+            .lines()
+            .find_map(|l| l.split("V251_TOTAL_WRITES=").nth(1).map(|v| v.trim().parse().unwrap()))
+            .unwrap_or_else(|| panic!("dry run failed: {stdout}\n{}", String::from_utf8_lossy(&out.stderr)));
+        let (_, ok, d) = v251_check(dry.path(), &a1, &a2, &b2, &b3);
+        println!("V251 [{scenario}] dry run: total_writes={total} final: {d}");
+        assert!(ok);
+        let mut torn = Vec::new();
+        for k in 1..=total {
+            let dir = tempfile::tempdir().expect("dir");
+            let out = v251_spawn(
+                test,
+                &[(V251_DIR, dir.path().to_string_lossy().into()), (V251_ABORT_AT, k.to_string()), ("V251_SCENARIO", scenario.to_string())],
+            )
+            .wait_with_output()
+            .expect("child");
+            let err = String::from_utf8_lossy(&out.stderr);
+            let what = err.lines().find(|l| l.contains("V251 ABORT")).unwrap_or("?").to_string();
+            let (_, ok, d) = v251_check(dir.path(), &a1, &a2, &b2, &b3);
+            println!("V251 [{scenario}] abort k={k:>2} [{what}] -> {d}");
+            if !ok {
+                torn.push(format!("k={k} {what} {d}"));
+            }
+        }
+        assert!(torn.is_empty(), "TORN durable state/tip after crash: {torn:#?}");
+    }
+
+    /// Random wall-clock SIGKILL of a child looping the scenario.
+    #[tokio::test]
+    async fn verify251_random_sigkill_keeps_state_and_tip_consistent() {
+        if std::env::var(V251_DIR).is_ok() {
+            return;
+        }
+        let test = "canonical_apply::tests::verify251_child";
+        let (a1, a2, b2, b3) = v251_blocks().await;
+        let mut seed: u64 = 0x2510_2510_2510_2510;
+        let mut torn = Vec::new();
+        let rounds = 40;
+        for r in 0..rounds {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let dir = tempfile::tempdir().expect("dir");
+            let mut child = v251_spawn(
+                test,
+                &[(V251_DIR, dir.path().to_string_lossy().into()), (V251_LOOP, "1".into())],
+            );
+            let wait_ms = 300 + seed % 1500;
+            std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+            child.kill().expect("SIGKILL");
+            let _ = child.wait();
+            let current = std::fs::read_to_string(dir.path().join("current")).unwrap_or_default();
+            if current.is_empty() || !std::path::Path::new(&current).join("CURRENT").exists() {
+                println!("V251 sigkill r={r}: child had not started a run");
+                continue;
+            }
+            let (_, ok, d) = v251_check(std::path::Path::new(&current), &a1, &a2, &b2, &b3);
+            println!("V251 sigkill r={r} after {wait_ms} ms -> {d}");
+            if !ok {
+                torn.push(format!("r={r} {d}"));
+            }
+        }
+        assert!(torn.is_empty(), "TORN after SIGKILL: {torn:#?}");
+    }
+
+    // =====================================================================
+    // F3 (2026-09-28): a panic mid-rebuild must clear `rebuild_in_progress`.
+    // Before the RAII guard, `maybe_runtime_rebuild` cleared the flag with a
+    // plain store AFTER the await, so a panic (or cancellation) inside
+    // `recover_to_head` left it stuck true and wedged the #126-gated producer
+    // until a node restart. The guard's `Drop` runs during unwind, so the flag
+    // is cleared even on panic.
+    // =====================================================================
+    #[test]
+    fn f3_rebuild_in_progress_guard_clears_flag_on_panic() {
+        let flag = Arc::new(AtomicBool::new(false));
+        // Enter a rebuild (as `maybe_runtime_rebuild` does with swap(true)).
+        assert!(!flag.swap(true, Ordering::SeqCst));
+        let f = flag.clone();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = RebuildInProgressGuard { flag: f };
+            panic!("simulated panic mid-rebuild");
+        }));
+        assert!(r.is_err(), "the panic must propagate");
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "F3: rebuild_in_progress must be cleared after a panic mid-rebuild"
+        );
+    }
+
+    #[test]
+    fn f3_rebuild_in_progress_guard_clears_flag_on_normal_return() {
+        let flag = Arc::new(AtomicBool::new(false));
+        assert!(!flag.swap(true, Ordering::SeqCst));
+        {
+            let _guard = RebuildInProgressGuard { flag: flag.clone() };
+            assert!(flag.load(Ordering::SeqCst), "flag held during the rebuild");
+        }
+        assert!(!flag.load(Ordering::SeqCst), "flag cleared on normal drop");
+    }
+
 }
