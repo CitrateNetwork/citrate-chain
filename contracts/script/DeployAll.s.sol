@@ -303,14 +303,20 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         // for lazy per-(addr, dim) score reads — the matcher does not
         // mirror that state; it staticcalls it on demand. Governance
         // is the deployer for testnet; mainnet should use the multisig.
-        MentorMatcher mentorMatcher = (_isLive("MentorMatcher", abi.encodePacked(type(MentorMatcher).creationCode, abi.encode(deployer)))
+        bool mentorLive = _isLive("MentorMatcher", abi.encodePacked(type(MentorMatcher).creationCode, abi.encode(deployer)));
+        MentorMatcher mentorMatcher = (mentorLive
             ? MentorMatcher(payable(_create2Address("MentorMatcher", abi.encodePacked(type(MentorMatcher).creationCode, abi.encode(deployer)))))
             : new MentorMatcher{salt: Salts.salt("MentorMatcher")}(deployer));
         // MentorMatcher is born deployer-governed so the deployer can run the
         // onlyGovernance config below; then hand governance to the multisig (G2).
-        // Kept ctor(deployer) so the CREATE2 address is unchanged.
-        mentorMatcher.setContributionAccounting(address(contributions));
-        if (governance != deployer) mentorMatcher.setGovernance(governance);
+        // Kept ctor(deployer) so the CREATE2 address is unchanged. Only configure +
+        // hand over on a FRESH deploy: on reuse the contract is already configured
+        // and governance is already the multisig, so re-running setContributionAccounting
+        // as the deployer would revert NotGovernance() (idempotent-rerun safety).
+        if (!mentorLive) {
+            mentorMatcher.setContributionAccounting(address(contributions));
+            if (governance != deployer) mentorMatcher.setGovernance(governance);
+        }
         console.log("  MentorMatcher:", address(mentorMatcher));
 
         // =====================================================================
