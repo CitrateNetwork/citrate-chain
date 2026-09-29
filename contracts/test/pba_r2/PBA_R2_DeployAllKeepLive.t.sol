@@ -7,6 +7,14 @@ import {AgentDecisionRegistry} from "../../src/AgentDecisionRegistry.sol";
 import {SpecRegistry} from "../../src/SpecRegistry.sol";
 import {MarketMakerAllocation} from "../../src/MarketMakerAllocation.sol";
 
+/// Test harness: forces the fresh-keys reroll switch ON without touching the
+/// process env (env-based switching is racy under forge's parallel test runner).
+contract DeployAllRerollHarness is DeployAll {
+    function _isReroll() internal pure override returns (bool) {
+        return true;
+    }
+}
+
 /// Keep-live pins in DeployAll (owner decision D2 = KEEP): on 40204 the live
 /// AgentDecisionRegistry / SpecRegistry / MarketMakerAllocation are reused,
 /// elsewhere the normal reuse-or-deploy path runs.
@@ -58,5 +66,26 @@ contract PBA_R2_DeployAllKeepLive is Test {
         assertGt(d.agentRegistry.code.length, 0);
         assertGt(d.specRegistry.code.length, 0);
         assertGt(d.mmAlloc.code.length, 0);
+    }
+
+    /// FRESH-KEYS reroll (CITRATE_REROLL=1, here via the harness override): on
+    /// 40204 the three otherwise kept-live registries DEPLOY FRESH
+    /// (multisig-governed) instead of resolving to a legacy pin whose code does
+    /// not exist on the re-rolled chain (which would revert `_keptLive`'s code
+    /// assertion). No live code is planted here — proving the reroll path does
+    /// NOT touch the legacy pins.
+    function test_rerollMode_on40204_deploysFreshNotKept() public {
+        vm.chainId(40204);
+        DeployAll a = DeployAll(new DeployAllRerollHarness());
+        DeployAll.Deployed memory d = a.deployWith(SENDER, multisig, multisig);
+        // Fresh (not the legacy live pins), and multisig-governed.
+        assertTrue(d.agentRegistry != LIVE_ADR, "ADR must be fresh under reroll");
+        assertTrue(d.specRegistry != LIVE_SPEC, "SpecRegistry must be fresh under reroll");
+        assertTrue(d.mmAlloc != LIVE_MMA, "MMA must be fresh under reroll");
+        assertGt(d.agentRegistry.code.length, 0, "ADR deployed");
+        assertGt(d.specRegistry.code.length, 0, "SpecRegistry deployed");
+        assertGt(d.mmAlloc.code.length, 0, "MMA deployed");
+        assertGt(d.registry.code.length, 0, "rest of the stack still deploys");
+        assertGt(d.governor.code.length, 0, "rest of the stack still deploys");
     }
 }
