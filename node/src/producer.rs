@@ -355,22 +355,91 @@ impl ProduceCatchupGate {
         let mut obs = observed.observed.lock();
         // Prune anything the finalized floor has passed — it can never be ahead again.
         obs.retain(|_, ht| *ht > floor);
+        // VERIFY-255-P1 (perf): a SINGLE shared "reaches-head / doesn't-reach-head" memo
+        // for the whole round. The old code re-walked `selected_parent` links SEPARATELY
+        // per candidate (O(n²) storage reads over n held candidates, all under the applied-
+        // tip lock). Side-branch candidates never raise `best`, so every one of them used
+        // to be walked in full. With the memo each node's ancestry verdict is computed once
+        // and reused: a walk that reaches an already-decided node short-circuits, so the
+        // whole recompute visits each held node at most once ⇒ O(n). The verdict per
+        // candidate is IDENTICAL to the old per-candidate walk (see
+        // `p1_memoized_matches_per_candidate_reference`), so the gate's semantics are
+        // unchanged; only the cost is.
+        let mut memo: HashMap<Hash, bool> = HashMap::new();
         for (hash, ht) in obs.iter() {
             if *ht <= best {
                 continue;
             }
-            if Self::descends_from(storage, *hash, sel_hash, sel_height, floor) {
+            if Self::descends_from_memo(storage, *hash, sel_hash, sel_height, floor, &mut memo) {
                 best = *ht;
             }
         }
         scratch.store(best, Ordering::SeqCst);
     }
 
-    /// Walk `start`'s selected-parent ancestry (through blocks WE HOLD) and report whether
-    /// it passes through `target` (the fork-choice head) — i.e. `start` strictly extends the
-    /// selected chain. Stops (false) as soon as the walk drops to/below the target's height
-    /// without matching (a sibling / side branch), falls below the finalized floor, hits a
-    /// block we do not hold, or reaches the genesis root. Bounded by a hard step cap.
+    /// VERIFY-255-P1: the O(n) memoized form of the descent check. Walks `start`'s
+    /// selected-parent ancestry (through blocks WE HOLD) and reports whether it passes
+    /// through `target` (the fork-choice head), memoizing EVERY node visited on the way in
+    /// `memo` (`hash -> reaches-target`). A later candidate whose chain hits an already-
+    /// memoized node stops there and reuses that verdict, so across a whole recompute each
+    /// distinct held node is visited at most once. The stop conditions are identical to the
+    /// non-memoized reference [`Self::descends_from`]: `true` on reaching `target`; `false`
+    /// on dropping to/below `target_height` or the finalized `floor` without matching, on a
+    /// block we do not hold, or on reaching the genesis root. The per-walk step cap still
+    /// bounds a single corrupt-parent loop (a cycle never resolves, so it hits the cap).
+    fn descends_from_memo(
+        storage: &StorageManager,
+        start: Hash,
+        target: Hash,
+        target_height: u64,
+        floor: u64,
+        memo: &mut HashMap<Hash, bool>,
+    ) -> bool {
+        if let Some(&verdict) = memo.get(&start) {
+            return verdict;
+        }
+        // Nodes on the current chain whose verdict equals the terminal result; filled in
+        // once the walk resolves so future candidates crossing them short-circuit.
+        let mut path: Vec<Hash> = Vec::new();
+        let mut cursor = start;
+        // A generous cap: far beyond any legitimate unapplied lead, so a corrupt parent
+        // pointer loop can never spin the producer.
+        let result = loop {
+            if let Some(&verdict) = memo.get(&cursor) {
+                // Reached an already-decided node: the whole path shares its verdict.
+                break verdict;
+            }
+            if cursor == target {
+                break true;
+            }
+            if cursor == Hash::default() {
+                break false; // reached the genesis root without meeting the target.
+            }
+            if path.len() >= 100_000 {
+                break false; // corrupt-parent loop guard (matches the reference cap).
+            }
+            let Some(block) = storage.blocks.get_block(&cursor).ok().flatten() else {
+                break false; // ancestry not fully held ⇒ cannot prove it extends the head.
+            };
+            let h = block.header.height;
+            if h <= target_height || h <= floor {
+                // Dropped to/below the selected head's height (or the floor) without
+                // meeting it: on a sibling / side / losing branch, not above the head.
+                break false;
+            }
+            path.push(cursor);
+            cursor = block.header.selected_parent_hash;
+        };
+        for node in path {
+            memo.insert(node, result);
+        }
+        result
+    }
+
+    /// VERIFY-255-P1 reference: the ORIGINAL per-candidate descent walk (no shared memo),
+    /// retained under `cfg(test)` as the oracle the O(n) memoized path is checked against by
+    /// `p1_memoized_matches_per_candidate_reference`. Not used in production.
+    #[cfg(test)]
     fn descends_from(
         storage: &StorageManager,
         start: Hash,
@@ -379,8 +448,6 @@ impl ProduceCatchupGate {
         floor: u64,
     ) -> bool {
         let mut cursor = start;
-        // A generous cap: far beyond any legitimate unapplied lead, so a corrupt parent
-        // pointer loop can never spin the producer.
         for _ in 0..100_000u32 {
             if cursor == target {
                 return true;
@@ -393,8 +460,6 @@ impl ProduceCatchupGate {
             };
             let h = block.header.height;
             if h <= target_height || h <= floor {
-                // Dropped to/below the selected head's height (or the floor) without
-                // meeting it: `start` is on a sibling / side / losing branch, not above it.
                 return false;
             }
             cursor = block.header.selected_parent_hash;
@@ -1632,6 +1697,33 @@ impl BlockProducer {
 
     /// Produce a single block
     async fn produce_block(&self) -> anyhow::Result<Hash> {
+        // VERIFY-255-P1 (perf): RE-DERIVE the F2 attested-ahead watermark BEFORE acquiring
+        // the applied-tip lock. The recompute reads only the fork-choice-selected head, the
+        // shared candidate record, and storage — none of which require that lock — and its
+        // descent walk is now O(n) in held candidates (a single shared memo per round). The
+        // receive-path applier (`CanonicalApplicator::apply_received`) takes the SAME lock,
+        // so doing the walk off the lock means a large held side branch (a validator or a
+        // long orphaned branch, up to the 4,096 candidate cap) can never block block
+        // application while the producer measures how far behind it is. The verdict lands in
+        // the gate's atomic watermark, which `evaluate_network_height` reads below under the
+        // lock. Semantics are unchanged: the watermark is re-derived every round and counts
+        // only candidates that still descend from the live selected head.
+        if let Some(gate) = self.produce_gate.as_ref() {
+            if gate.attested_observed.is_some() {
+                let selected = match self.ghostdag.select_tip().await {
+                    Ok(hash) => self
+                        .storage
+                        .blocks
+                        .get_block(&hash)
+                        .ok()
+                        .flatten()
+                        .map(|b| (hash, b.header.height)),
+                    Err(_) => None,
+                };
+                gate.recompute_attested_ahead(selected, &self.storage);
+            }
+        }
+
         // EXECUTE-ON-RECEIVE (step 2): hold the shared state-advance lock across the
         // whole build. The receive-path applier (`CanonicalApplicator::apply_received`)
         // takes the same lock, so production and reception never concurrently mutate the
@@ -1730,25 +1822,14 @@ impl BlockProducer {
                 .as_ref()
                 .map(|g| g.tip().height)
                 .unwrap_or(0);
-            // VERIFY-255-F2-H1: before judging behindness, RE-DERIVE the attested-ahead
-            // watermark against the LIVE fork-choice-selected head — GhostDAG's `select_tip`
+            // VERIFY-255-F2-H1: the attested-ahead watermark was RE-DERIVED against the LIVE
+            // fork-choice-selected head at the top of this method — GhostDAG's `select_tip`
             // (the SAME authority the drain reorgs toward), resolved to a height via storage.
             // A candidate counts only while it still descends from that head, so an attacker
             // side branch or an honest losing branch never inflates the gap, and a reorg
-            // re-bases the measure. Only runs when the candidate record is wired.
-            if gate.attested_observed.is_some() {
-                let selected = match self.ghostdag.select_tip().await {
-                    Ok(hash) => self
-                        .storage
-                        .blocks
-                        .get_block(&hash)
-                        .ok()
-                        .flatten()
-                        .map(|b| (hash, b.header.height)),
-                    Err(_) => None,
-                };
-                gate.recompute_attested_ahead(selected, &self.storage);
-            }
+            // re-bases the measure. VERIFY-255-P1: that recompute now runs OFF this lock (it
+            // needs only storage + the candidate record), so only the cheap evaluation and
+            // status publish below stay under the lock.
             let gate_result = gate.evaluate_network_height(local_tip);
             // VERIFY-255-F2-M1: publish the gate's read-only status to the loopback ops/
             // metrics surface every round (producing vs refusing(gap) vs alert-latched, plus
@@ -5659,6 +5740,176 @@ mod tests {
         assert!(
             gate.status_snapshot().alert_latched,
             "status must show the alert latched after a no-progress stall"
+        );
+    }
+
+    /// A catch-up gate with the H1 candidate record + scratch watermark wired (unlike
+    /// [`f2_gate`], which leaves `attested_observed` `None` to drive the hysteresis state
+    /// machine directly), so `recompute_attested_ahead` runs its real fork-choice-relative
+    /// descent against the shared observed-candidate record.
+    fn f2_observed_gate(att: &AttestedNetworkHead, floor: Option<u64>) -> ProduceCatchupGate {
+        ProduceCatchupGate {
+            rebuild_in_progress: Arc::new(AtomicBool::new(false)),
+            dag_hydrated: None,
+            attested_ahead: Some(Arc::new(AtomicU64::new(0))),
+            behind: Arc::new(Mutex::new(CatchupBehindState::default())),
+            override_resume: Arc::new(AtomicBool::new(false)),
+            stall_alert: Arc::new(AtomicBool::new(false)),
+            stall_alert_after: Duration::from_secs(3600),
+            attested_observed: Some(att.handle()),
+            finalized_floor: floor.map(|f| Arc::new(AtomicU64::new(f))),
+        }
+    }
+
+    /// VERIFY-255-P1 (perf): the fork-choice descent recompute over a FULL observed-candidate
+    /// set (the 4,096 cap) must complete well under the release budget. Before the fix the
+    /// descent was re-walked SEPARATELY per candidate (O(n²) storage reads, MAC's release
+    /// numbers: 182 ms @500, ~3.0 s @2,000, ~12.5 s @4,000) and it ran under the applied-tip
+    /// lock, so a large held side branch (a validator or a long orphaned branch) starved
+    /// block application. With the shared per-round memo the recompute visits each held node
+    /// at most once (O(n)); this asserts the release bound MAC re-verifies (< 50 ms), with a
+    /// generous debug ceiling that still fails hard if the O(n²) walk ever returns (188 s
+    /// debug @4,000 in MAC's evidence). The recompute is timed OUTSIDE any lock — it is
+    /// invoked off the applied-tip lock in `produce_block`.
+    #[tokio::test]
+    async fn r255_p1_recompute_over_full_candidate_set_is_fast() {
+        let (_tmp, storage, _state_db, executor, mempool) = producer_fixture();
+        let app = Arc::new(crate::canonical_apply::CanonicalApplicator::new(
+            executor.clone(),
+            storage.clone(),
+        ));
+        let attested = AttestedNetworkHead::new();
+        let producer = test_producer(&storage, &executor, &mempool)
+            .with_v2_headers(true)
+            .with_applied_tip_lock(app.advance_lock())
+            .with_produce_catchup_gate(&app)
+            .with_network_height_gate(&attested);
+
+        // Own canonical chain to height 3 (select_tip == applied tip == 3).
+        let head = f2_own_chain_to(&producer, &storage, 3).await;
+
+        // A long held SIDE branch off block @1 — the DoS shape: thousands of admitted,
+        // validly-signed, held blocks ABOVE the selected head that do NOT descend from it.
+        // Fill the observed record to its exact cap so this is near worst case.
+        let base1_hash = storage
+            .blocks
+            .get_block_by_height(1)
+            .unwrap()
+            .expect("hold block @1");
+        let base1 = storage.blocks.get_block(&base1_hash).unwrap().unwrap();
+        let attacker = Ed25519SigningKey::from_bytes(&[0x7C; 32]);
+        f2_signed_side_chain(
+            &attested,
+            &storage,
+            &base1,
+            ATTESTED_OBSERVED_CAP as u64 + 2,
+            &attacker,
+        );
+        assert_eq!(
+            attested.handle().observed.lock().len(),
+            ATTESTED_OBSERVED_CAP,
+            "the observed record is at its full cap for the worst-case measurement"
+        );
+
+        let gate = f2_observed_gate(&attested, None);
+        let selected = Some((head.header.block_hash, head.header.height));
+
+        // Warm the block cache once, then time a single recompute (the per-round cost).
+        gate.recompute_attested_ahead(selected, &storage);
+        let t0 = std::time::Instant::now();
+        gate.recompute_attested_ahead(selected, &storage);
+        let ms = t0.elapsed().as_millis();
+
+        // The side branch never descends from the selected head @3 ⇒ watermark stays at 3.
+        assert_eq!(
+            gate.attested_ahead.as_ref().unwrap().load(Ordering::SeqCst),
+            3,
+            "a held side branch above the head must not inflate the watermark"
+        );
+
+        let bound_ms: u128 = if cfg!(debug_assertions) { 5_000 } else { 50 };
+        println!(
+            "R255-P1: recompute over {} held candidates -> {ms} ms (bound {bound_ms} ms, debug={})",
+            ATTESTED_OBSERVED_CAP,
+            cfg!(debug_assertions)
+        );
+        assert!(
+            ms < bound_ms,
+            "recompute over {} held candidates took {ms} ms (bound {bound_ms} ms, \
+             debug={}); the O(n²) per-candidate walk has returned",
+            ATTESTED_OBSERVED_CAP,
+            cfg!(debug_assertions)
+        );
+    }
+
+    /// VERIFY-255-P1 (correctness): on a MIXED observed set — a losing side branch AND a
+    /// genuine extension of the selected head — the O(n) memoized watermark must equal the
+    /// watermark computed by the ORIGINAL per-candidate walk ([`ProduceCatchupGate::
+    /// descends_from`], retained under `cfg(test)` as the oracle). Guarantees the perf fix
+    /// did not change the gate's H1 semantics.
+    #[tokio::test]
+    async fn r255_p1_memoized_matches_per_candidate_reference() {
+        let (_tmp, storage, _state_db, executor, mempool) = producer_fixture();
+        let app = Arc::new(crate::canonical_apply::CanonicalApplicator::new(
+            executor.clone(),
+            storage.clone(),
+        ));
+        let attested = AttestedNetworkHead::new();
+        let producer = test_producer(&storage, &executor, &mempool)
+            .with_v2_headers(true)
+            .with_applied_tip_lock(app.advance_lock())
+            .with_produce_catchup_gate(&app)
+            .with_network_height_gate(&attested);
+
+        // Own canonical chain to height 4 (selected head @4).
+        let head = f2_own_chain_to(&producer, &storage, 4).await;
+
+        // (1) a losing side branch off block @1 up to height 12 (never descends from @4).
+        let base1_hash = storage
+            .blocks
+            .get_block_by_height(1)
+            .unwrap()
+            .expect("hold block @1");
+        let base1 = storage.blocks.get_block(&base1_hash).unwrap().unwrap();
+        let side_k = Ed25519SigningKey::from_bytes(&[0x2A; 32]);
+        f2_signed_side_chain(&attested, &storage, &base1, 11, &side_k);
+        // (2) a GENUINE extension of the selected head @4 up to height 9 (descends from it).
+        let ext_k = Ed25519SigningKey::from_bytes(&[0x3B; 32]);
+        let ext_tip = f2_signed_side_chain(&attested, &storage, &head, 5, &ext_k);
+        assert_eq!(ext_tip.header.height, 9, "extension reaches height 9");
+
+        let selected = (head.header.block_hash, head.header.height);
+        let floor = 0u64;
+
+        // Reference: the ORIGINAL per-candidate walk, independent of the shared memo.
+        let mut reference_best = selected.1;
+        {
+            let obs = attested.handle();
+            let obs = obs.observed.lock();
+            for (hash, ht) in obs.iter() {
+                if *ht <= reference_best {
+                    continue;
+                }
+                if ProduceCatchupGate::descends_from(
+                    &storage, *hash, selected.0, selected.1, floor,
+                ) {
+                    reference_best = *ht;
+                }
+            }
+        }
+
+        // Memoized production path.
+        let gate = f2_observed_gate(&attested, None);
+        gate.recompute_attested_ahead(Some(selected), &storage);
+        let memoized_best = gate.attested_ahead.as_ref().unwrap().load(Ordering::SeqCst);
+
+        assert_eq!(
+            memoized_best, reference_best,
+            "the memoized watermark must equal the per-candidate reference on a mixed set"
+        );
+        assert_eq!(
+            memoized_best, 9,
+            "only the genuine extension counts; the watermark tracks the selected chain to 9"
         );
     }
 }

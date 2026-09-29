@@ -1667,6 +1667,19 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         None
     };
     if let Some(addr) = metrics_addr {
+        // VERIFY-255-O1 (INFO): the metrics endpoint serves read-only status gauges
+        // (including the F2 catch-up gauges) and defaults to loopback. If an operator has
+        // pointed CITRATE_METRICS_ADDR at a non-loopback interface, those gauges become
+        // reachable off-box. That is read-only data, so this is a startup WARN (not a
+        // refusal); the operator-gated catch-up OVERRIDE RPC stays loopback-gated regardless.
+        if !addr.ip().is_loopback() {
+            tracing::warn!(
+                "CITRATE_METRICS_ADDR binds the metrics/status gauges to non-loopback {} — \
+                 these read-only gauges will be reachable off-box. Bind 127.0.0.1 (the default) \
+                 and expose metrics via a trusted scraper/proxy if you need remote access.",
+                addr
+            );
+        }
         tokio::spawn(async move {
             if let Err(e) = citrate_api::metrics_server::MetricsServer::new(addr)
                 .start()
