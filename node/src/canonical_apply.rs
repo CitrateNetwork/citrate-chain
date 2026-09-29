@@ -252,8 +252,9 @@ pub struct CanonicalApplicator {
     genesis: OnceLock<(StateSnapshot, Hash)>,
     /// Guards against overlapping runtime spine rebuilds (each is a long, lock-held
     /// operation). Set while `maybe_runtime_rebuild` runs; a concurrent trigger is a
-    /// no-op. See `drive_drain`.
-    rebuild_in_progress: AtomicBool,
+    /// no-op. See `drive_drain`. `Arc` so the producer can observe it (#126 catch-up
+    /// gate): a node mid-rebuild must not seal (its applied tip is being rewritten).
+    rebuild_in_progress: Arc<AtomicBool>,
     /// "DAG hydration complete" signal (restart-liveness fix, 2026-08-11). Wired from
     /// `GhostDag::dag_hydrated_handle` in `with_fork_choice`. The runtime deep-fork
     /// rebuild (`maybe_runtime_rebuild`) gates on THIS instead of a block-height
@@ -311,7 +312,7 @@ impl CanonicalApplicator {
             registry_policy_resync: None,
             registry_policy_seed: None,
             genesis: OnceLock::new(),
-            rebuild_in_progress: AtomicBool::new(false),
+            rebuild_in_progress: Arc::new(AtomicBool::new(false)),
             dag_hydrated: None,
         }
     }
@@ -466,6 +467,22 @@ impl CanonicalApplicator {
     /// [`record_produced`] before release.
     pub fn advance_lock(&self) -> Arc<Mutex<AppliedState>> {
         self.lock.clone()
+    }
+
+    /// #126 (producer catch-up gate): a handle to the "spine rebuild in progress" flag.
+    /// The producer refuses to seal while this is set — a rebuild is rewriting the
+    /// applied tip from genesis, so the executor's live state is transiently NOT the
+    /// state of any committable tip.
+    pub fn rebuild_in_progress_handle(&self) -> Arc<AtomicBool> {
+        self.rebuild_in_progress.clone()
+    }
+
+    /// #126 (producer catch-up gate): a handle to the "DAG hydration complete" signal
+    /// (`None` when no fork-choice is wired — tests / fixed-tip stubs — meaning "treat
+    /// as hydrated"). The producer refuses to seal until this is set, so a node still
+    /// hydrating its DAG after a restart cannot produce on a not-yet-authoritative tip.
+    pub fn dag_hydrated_handle(&self) -> Option<Arc<AtomicBool>> {
+        self.dag_hydrated.clone()
     }
 
     /// Current applied tip (locks briefly).
@@ -819,14 +836,23 @@ impl CanonicalApplicator {
         // aborted reorg still leaves the store byte-identical to before the attempt
         // (HIGH-2 / invariant I2). Only committed branch states (fork point / pre_state /
         // winning) are ever written — never an un-rollback-able candidate.
-        if let Err(e) = self.executor.reconcile_store_from(&pre_state) {
-            // The account+storage write is a single atomic batch (unchanged on failure).
+        // #126: land the FORK-POINT tip in the SAME fsync'd batch as the fork-point
+        // state, so a crash during the (in-memory-only) reapply below leaves durable
+        // state and durable tip both AT THE FORK POINT — never torn. On success the tip
+        // advances to the winning tip (below); on abort it is restored to pre_tip.
+        if let Err(e) = self
+            .executor
+            .reconcile_store_from(&pre_state, Some((fork.hash, fork.height)))
+        {
+            // The reconcile is a single atomic batch (unchanged on failure).
             // Restore in-memory state + the §R' policy cell and best-effort re-reconcile
-            // the store back to pre_state, then decline the reorg — world state is left
-            // as before the attempt (invariant I3).
+            // the store back to pre_state (with pre_tip), then decline the reorg — world
+            // state is left as before the attempt (invariant I3).
             self.executor.state_restore(pre_state.clone());
             self.executor.restore_reward_policy(pre_policy.clone());
-            let _ = self.executor.reconcile_store_from(&base_snapshot);
+            let _ = self
+                .executor
+                .reconcile_store_from(&base_snapshot, Some((pre_tip.hash, pre_tip.height)));
             warn!(
                 "execute-on-receive: reorg to {} aborted — could not revert store to fork point {} @ {}: {} (reverted to {})",
                 new_tip, fork.hash, fork.height, e, pre_tip.hash
@@ -879,7 +905,10 @@ impl CanonicalApplicator {
                 if let Err(e) = hook(gov).await {
                     self.executor.state_restore(pre_state.clone());
                     self.executor.restore_reward_policy(pre_policy.clone());
-                    if let Err(re) = self.executor.reconcile_store_from(&base_snapshot) {
+                    if let Err(re) = self
+                        .executor
+                        .reconcile_store_from(&base_snapshot, Some((pre_tip.hash, pre_tip.height)))
+                    {
                         warn!(
                             "execute-on-receive: reorg to {} abort — store restore failed: {re}",
                             new_tip
@@ -923,11 +952,14 @@ impl CanonicalApplicator {
                                 self.executor.state_restore(pre_state.clone());
                                 self.executor.restore_reward_policy(pre_policy.clone());
                                 // The store was reverted to the fork point before reapply;
-                                // reconcile it back to pre_state so the abort leaves the
-                                // durable store byte-identical to before the reorg (I2).
+                                // reconcile it back to pre_state (with pre_tip in the same
+                                // atomic batch) so the abort leaves the durable store AND
+                                // durable tip byte-identical to before the reorg (I2).
                                 // memory == pre_state, store == fork point (== base_snapshot).
-                                if let Err(re) = self.executor.reconcile_store_from(&base_snapshot)
-                                {
+                                if let Err(re) = self.executor.reconcile_store_from(
+                                    &base_snapshot,
+                                    Some((pre_tip.hash, pre_tip.height)),
+                                ) {
                                     warn!(
                                         "execute-on-receive: reorg to {} abort — store restore to pre_state failed: {re}",
                                         new_tip
@@ -955,7 +987,10 @@ impl CanonicalApplicator {
                     self.executor.state_restore(pre_state);
                     self.executor.restore_reward_policy(pre_policy.clone());
                     // memory == pre_state, store == fork point (== base_snapshot).
-                    if let Err(re) = self.executor.reconcile_store_from(&base_snapshot) {
+                    if let Err(re) = self
+                        .executor
+                        .reconcile_store_from(&base_snapshot, Some((pre_tip.hash, pre_tip.height)))
+                    {
                         warn!(
                             "execute-on-receive: reorg to {} abort — store restore to pre_state failed: {re}",
                             new_tip
@@ -978,7 +1013,18 @@ impl CanonicalApplicator {
         // writing the account+storage diff and deleting abandoned-created accounts — so
         // RocksDB matches memory and a restart-after-reorg hydrates correctly. Baseline
         // is `base_snapshot` (the fork point == what the store now holds), NOT pre_state.
-        if let Err(e) = self.executor.reconcile_store_from(&base_snapshot) {
+        // #126: on the store-backed path the winning tip now lands in the SAME fsync'd
+        // batch as the winning-branch state (see `reconcile_store_from` →
+        // `write_reorg_batch_sync`), so durable state and the durable applied tip can
+        // never be torn across a crash. That atomic write is the crash-consistency
+        // guarantee — the previously-sole, non-fsync `put_applied_tip` that followed this
+        // reconcile (and came AFTER a state batch that OMITTED the tip) was the bug. The
+        // `put_applied_tip` below is kept only as a redundant idempotent re-write (and as
+        // the durable write for store-less test executors); see its comment.
+        if let Err(e) = self
+            .executor
+            .reconcile_store_from(&base_snapshot, Some((tip.hash, tip.height)))
+        {
             warn!(
                 "execute-on-receive: reorg to {} applied in-memory but store reconcile failed: {}",
                 new_tip, e
@@ -1005,9 +1051,21 @@ impl CanonicalApplicator {
         state
             .snapshots
             .retain(|h, _| *h <= tip.height && *h >= floor);
+        // #126: on the store-backed (production) path the durable applied tip was
+        // ALREADY advanced ATOMICALLY with the reconciled state inside the fsync'd
+        // `write_reorg_batch_sync` above (the state store and block store share one
+        // RocksDB, so `APPLIED_TIP_KEY` is the same key) — that is the crash-consistency
+        // guarantee, and it is the ONLY durable tip advance that matters on that path.
+        // This re-write is therefore an IDEMPOTENT no-op in production (same value, right
+        // after the atomic commit, so it can NEVER create a state-ahead-of-tip window —
+        // the pre-fix bug was this being the SOLE, non-atomic tip write AFTER a batch that
+        // omitted the tip). It remains the durable tip write ONLY for a store-less executor
+        // (tests), whose reconcile is a no-op and which has no separate durable state to
+        // tear from. Exactly the pattern used by `persist_applied` / `record_produced` on
+        // the linear path.
         if let Err(e) = self.storage.blocks.put_applied_tip(&tip.hash, tip.height) {
             warn!(
-                "execute-on-receive: reorged to {} @ {} but failed to persist tip: {}",
+                "execute-on-receive: reorged to {} @ {} but failed to re-persist tip: {}",
                 tip.hash, tip.height, e
             );
         }
@@ -1362,7 +1420,13 @@ impl CanonicalApplicator {
         // from(&pre)` writes the diff pre(losing)->current(genesis) into the store, so
         // every read-through now resolves to genesis.
         self.executor.state_restore(genesis_state.clone());
-        self.executor.reconcile_store_from(&pre)?;
+        // #126: reset the durable tip to genesis in the SAME fsync'd batch as the
+        // genesis-state reset, so a crash mid-rebuild leaves durable state and durable
+        // tip both AT GENESIS (consistent — the node just re-syncs from genesis) rather
+        // than a genesis store under a stale higher tip (torn → fork on restart). The
+        // forward spine replay below re-advances the tip atomically per block.
+        self.executor
+            .reconcile_store_from(&pre, Some((genesis_hash, 0)))?;
         // VALIDATE the reconstructed genesis against the persisted genesis block. A
         // wrong reconstruction (chain-id / genesis-profile drift) aborts here; restore
         // both memory and store to the pre-recovery state first.
@@ -1371,7 +1435,10 @@ impl CanonicalApplicator {
             if rebuilt_root != g0.state_root {
                 let genesis_now = self.executor.state_snapshot();
                 self.executor.state_restore(pre);
-                let _ = self.executor.reconcile_store_from(&genesis_now);
+                // #126: restore the durable tip to pre_tip alongside the reverse reconcile.
+                let _ = self
+                    .executor
+                    .reconcile_store_from(&genesis_now, Some((pre_tip.hash, pre_tip.height)));
                 state.snapshots = pre_snapshots;
                 warn!(
                     "canonical recovery: reconstructed genesis root {} != persisted block-0 root {} — \
@@ -1469,7 +1536,10 @@ impl CanonicalApplicator {
             // started.
             let partial = self.executor.state_snapshot();
             self.executor.state_restore(pre);
-            let _ = self.executor.reconcile_store_from(&partial);
+            // #126: restore the durable tip to pre_tip alongside the reverse reconcile.
+            let _ = self
+                .executor
+                .reconcile_store_from(&partial, Some((pre_tip.hash, pre_tip.height)));
             state.tip = pre_tip;
             state.snapshots = pre_snapshots;
             self.publish_applied_height(&state);
@@ -6025,7 +6095,7 @@ mod tests {
         // to the fork point relative to `pre_state`. DAVE is in `pre_state` but not
         // in current (cold) memory → the store-revert DELETES it.
         exec.state_restore(base_snapshot.clone());
-        exec.reconcile_store_from(&pre_snapshot)
+        exec.reconcile_store_from(&pre_snapshot, None)
             .expect("store-revert to fork point");
         let cold_read = store_backed(&storage);
         assert_eq!(
@@ -6037,7 +6107,7 @@ mod tests {
         // Reorg step 2 (abort arm): reconcile the store back to `pre_state` from the
         // cold base. Memory is restored to pre_state; DAVE is put back.
         exec.state_restore(pre_snapshot.clone());
-        exec.reconcile_store_from(&base_snapshot)
+        exec.reconcile_store_from(&base_snapshot, None)
             .expect("store restore to pre_state");
         assert_eq!(
             dump_store(&storage),

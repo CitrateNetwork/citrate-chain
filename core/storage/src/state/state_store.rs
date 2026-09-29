@@ -135,6 +135,83 @@ impl StateStoreTrait for StateStore {
         Ok(())
     }
 
+    /// #126 (crash-consistent reorg commit): persist a REORG store reconciliation —
+    /// account puts, storage changes, account DELETIONS, contract CODE, and the
+    /// applied-tip pointer — in ONE cross-CF `WriteBatch` committed with
+    /// `write_batch_sync` (fsync). The whole reconciliation commits or nothing does,
+    /// so a crash can never leave the durable applied tip out of step with durable
+    /// state (the reorg fork on restart this closes). Mirrors the atomic layout of
+    /// [`Self::write_state_batch_with_applied_tip`] but also carries account deletes
+    /// (`CF_ACCOUNTS`) and contract code (`CF_CODE`) in the same batch.
+    fn write_reorg_batch_sync(
+        &self,
+        accounts: &[(Address, AccountState)],
+        storage: &[StateStorageChange],
+        account_dels: &[Address],
+        code: &[(Hash, Vec<u8>)],
+        applied_tip: Option<(Hash, u64)>,
+    ) -> Result<()> {
+        if accounts.is_empty()
+            && storage.is_empty()
+            && account_dels.is_empty()
+            && code.is_empty()
+            && applied_tip.is_none()
+        {
+            return Ok(());
+        }
+
+        let mut batch = self.db.batch();
+        for (address, account) in accounts {
+            let account_bytes = bincode::serialize(account)?;
+            self.db
+                .batch_put_cf(&mut batch, CF_ACCOUNTS, &address.0, &account_bytes)?;
+        }
+        for change in storage {
+            let storage_key = storage_key(&change.address, &change.key);
+            match &change.value {
+                Some(value) => {
+                    self.db
+                        .batch_put_cf(&mut batch, CF_STORAGE, &storage_key, value)?;
+                }
+                None => {
+                    self.db
+                        .batch_delete_cf(&mut batch, CF_STORAGE, &storage_key)?;
+                }
+            }
+        }
+        for address in account_dels {
+            self.db
+                .batch_delete_cf(&mut batch, CF_ACCOUNTS, &address.0)?;
+        }
+        for (code_hash, code) in code {
+            self.db
+                .batch_put_cf(&mut batch, CF_CODE, code_hash.as_bytes(), code)?;
+        }
+        if let Some((hash, height)) = applied_tip {
+            // Same key + layout as BlockStore::put_applied_tip (hash[32] || height_be[8]).
+            let mut buf = [0u8; 40];
+            buf[..32].copy_from_slice(hash.as_bytes());
+            buf[32..].copy_from_slice(&height.to_be_bytes());
+            self.db.batch_put_cf(
+                &mut batch,
+                CF_METADATA,
+                crate::chain::block_store::APPLIED_TIP_KEY,
+                &buf,
+            )?;
+        }
+
+        self.db.write_batch_sync(batch)?;
+        debug!(
+            "Stored reorg reconcile batch: {} put, {} storage, {} delete(s), {} code, tip={}",
+            accounts.len(),
+            storage.len(),
+            account_dels.len(),
+            code.len(),
+            applied_tip.is_some()
+        );
+        Ok(())
+    }
+
     /// SRP-S3b: persist the applied-tip pointer alone (non-atomic fallback path). The
     /// atomic [`Self::write_state_batch_with_applied_tip`] is preferred for the commit path.
     fn put_applied_tip_meta(&self, hash: &Hash, height: u64) -> Result<()> {
