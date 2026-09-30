@@ -13,7 +13,7 @@
    "address": "0x915FadA6FD295fDA20D30496301147348683a14a",
    "status": "canonical",
    "section": "governance",
-   "key": "GOVERNANCE"
+   "name": "GOVERNANCE"
   },
   {
    "nonce": 1,
@@ -24,7 +24,7 @@
    "address": "0x3921bF4AF37a11abC8A4B7d405a3f917e084Dc8B",
    "status": "canonical",
    "section": "governance",
-   "key": "GUARDIAN"
+   "name": "GUARDIAN"
   },
   {
    "nonce": 2,
@@ -35,7 +35,7 @@
    "address": "0xBa4aBd4f3fcA5365b2451b4E9662e4Cfd22b3ad5",
    "status": "canonical",
    "section": "contracts",
-   "key": "ValidatorRegistry"
+   "name": "ValidatorRegistry"
   },
   {
    "nonce": 3,
@@ -46,7 +46,7 @@
    "address": "0x807cB7eE477Ae58C321cAEd980CEB11D78048e84",
    "status": "canonical",
    "section": "contracts",
-   "key": "ModelRegistry"
+   "name": "ModelRegistry"
   },
   {
    "nonce": 4,
@@ -57,7 +57,7 @@
    "address": "0xAa918302B94a4B0E75E01e019cc6b819B4F7c906",
    "status": "canonical",
    "section": "contracts",
-   "key": "WrappedSALT"
+   "name": "WrappedSALT"
   },
   {
    "nonce": 5,
@@ -68,7 +68,7 @@
    "address": "0x94A204DaC83C99F5ce2C8ac19fc101C07D8b9A41",
    "status": "canonical",
    "section": "contracts",
-   "key": "AgentDecisionRegistry"
+   "name": "AgentDecisionRegistry"
   },
   {
    "nonce": 6,
@@ -79,7 +79,7 @@
    "address": "0xf38D10dFb550EE3Bce1332A887adC0D2C75EB642",
    "status": "canonical",
    "section": "contracts",
-   "key": "SpecRegistry"
+   "name": "SpecRegistry"
   },
   {
    "nonce": 7,
@@ -90,7 +90,7 @@
    "address": "0xc37aB44b145a31E8c458996437080326Fd19e129",
    "status": "canonical",
    "section": "contracts",
-   "key": "IPFSIncentives"
+   "name": "IPFSIncentives"
   },
   {
    "nonce": 8,
@@ -101,7 +101,7 @@
    "address": "0x7F7b6e8D9Ad0A8b4e6152Df6167E49E48AFB3463",
    "status": "canonical",
    "section": "contracts",
-   "key": "X402Facilitator"
+   "name": "X402Facilitator"
   },
   {
    "nonce": 9,
@@ -112,7 +112,7 @@
    "address": "0x13e50000FFFc95D910D42Cd8D679c28F6265a970",
    "status": "canonical",
    "section": "contracts",
-   "key": "X402Paywall"
+   "name": "X402Paywall"
   },
   {
    "nonce": 10,
@@ -123,7 +123,7 @@
    "address": "0x68Aa320Be609A073fC8ebB7dBCD237270A5DEEb0",
    "status": "canonical",
    "section": "contracts",
-   "key": "LiquidStakingPool"
+   "name": "LiquidStakingPool"
   },
   {
    "nonce": 11,
@@ -134,7 +134,7 @@
    "address": "0x52a47cAF8902D8214d1e246E74aA3Ad099DA47D1",
    "status": "canonical",
    "section": "contracts",
-   "key": "ContributionAccounting"
+   "name": "ContributionAccounting"
   },
   {
    "nonce": 12,
@@ -145,7 +145,7 @@
    "address": "0xee9501285F7b3c8Bb99B8aF70F95b402F4D2468b",
    "status": "canonical",
    "section": "contracts",
-   "key": "NematocystSlashing"
+   "name": "NematocystSlashing"
   },
   {
    "nonce": 13,
@@ -156,7 +156,7 @@
    "address": "0xb5dDD7c5146c240D53Ce6c7e87E5aCB59E4f7351",
    "status": "canonical",
    "section": "contracts",
-   "key": "MarketMakerAllocation"
+   "name": "MarketMakerAllocation"
   },
   {
    "nonce": 14,
@@ -167,7 +167,7 @@
    "address": "0x5517A9fDD70d503a57898c86eFeaaeEF8FE06413",
    "status": "canonical",
    "section": "contracts",
-   "key": "ModelMarketplace"
+   "name": "ModelMarketplace"
   },
   {
    "nonce": 15,
@@ -178,7 +178,7 @@
    "address": "0xe1A717f0656b000e33A78B97507Cd0440Ad62570",
    "status": "canonical",
    "section": "contracts",
-   "key": "InferenceRouter"
+   "name": "InferenceRouter"
   },
   {
    "nonce": 16,
@@ -189,7 +189,7 @@
    "address": "0x985036F3441258B8Ff6DDa8a43EA40EEEb1D02A6",
    "status": "canonical",
    "section": "contracts",
-   "key": "LoRAFactory"
+   "name": "LoRAFactory"
   },
   {
    "nonce": 17,
@@ -200,7 +200,7 @@
    "address": "0xBA5C9c886d65a969d02e40d7FBbADe316AD81E66",
    "status": "canonical",
    "section": "contracts",
-   "key": "LearningPool"
+   "name": "LearningPool"
   },
   {
    "nonce": 18,
@@ -211,7 +211,7 @@
    "address": "0x4254d5aeb3Fb90A5038e1bC5E10b30d0021990Bd",
    "status": "canonical",
    "section": "contracts",
-   "key": "LearningCycleManager"
+   "name": "LearningCycleManager"
   },
   {
    "nonce": 19,
@@ -222,7 +222,7 @@
    "address": "0xe2b56b2BFcaeB3c8d14400184eAb01BBC980cC05",
    "status": "canonical",
    "section": "contracts",
-   "key": "ClassroomRegistry"
+   "name": "ClassroomRegistry"
   },
   {
    "nonce": 20,
@@ -233,7 +233,7 @@
    "address": "0x05d6a67279972273F23124EF95237956Ef923C05",
    "status": "canonical",
    "section": "contracts",
-   "key": "MentorMatcher"
+   "name": "MentorMatcher"
   },
   {
    "nonce": 21,
@@ -264,7 +264,7 @@
    "address": "0xA483021adE196D642e6500B2D92c5E077186Ee00",
    "status": "canonical",
    "section": "contracts",
-   "key": "ComputeVerifier"
+   "name": "ComputeVerifier"
   },
   {
    "nonce": 24,
@@ -275,7 +275,7 @@
    "address": "0xE4fD2413d19946E7a8e78733E62C1531139430Bb",
    "status": "canonical",
    "section": "contracts",
-   "key": "ComputeMarketplace"
+   "name": "ComputeMarketplace"
   },
   {
    "nonce": 25,
@@ -286,7 +286,7 @@
    "address": "0x47FFB16216a5431dcF852f70Fe534c556cE807eF",
    "status": "canonical",
    "section": "contracts",
-   "key": "ComputePool"
+   "name": "ComputePool"
   },
   {
    "nonce": 26,
@@ -297,7 +297,7 @@
    "address": "0x85c1A278ed86169C5087616d879013e9337a7013",
    "status": "canonical",
    "section": "contracts",
-   "key": "HeartbeatMonitor"
+   "name": "HeartbeatMonitor"
   },
   {
    "nonce": 27,
@@ -308,7 +308,7 @@
    "address": "0xea0E6716A8A0bA39DF1d30552CFeC0bBab36D602",
    "status": "canonical",
    "section": "contracts",
-   "key": "DisputeResolution"
+   "name": "DisputeResolution"
   },
   {
    "nonce": 28,
@@ -319,7 +319,7 @@
    "address": "0xDfaF0b02846Ac33f1fC753ACC2c1D7D0B2F1aE4e",
    "status": "canonical",
    "section": "contracts",
-   "key": "ComputePricingOracle"
+   "name": "ComputePricingOracle"
   },
   {
    "nonce": 29,
@@ -330,7 +330,7 @@
    "address": "0x6867F82401F2773bf625887cC5b1FA1d6EAfa352",
    "status": "canonical",
    "section": "contracts",
-   "key": "StablecoinTreasury"
+   "name": "StablecoinTreasury"
   },
   {
    "nonce": 30,
@@ -341,7 +341,7 @@
    "address": "0x9CF7DdBFbba683a14ceF4Eb0e7934f79ec10C586",
    "status": "canonical",
    "section": "contracts",
-   "key": "BulkComputeGateway"
+   "name": "BulkComputeGateway"
   },
   {
    "nonce": 31,
@@ -352,7 +352,7 @@
    "address": "0xE19aef1A41b883021222aC7596c7ca96A62C6156",
    "status": "canonical",
    "section": "contracts",
-   "key": "TestnetFarmingAccounting"
+   "name": "TestnetFarmingAccounting"
   },
   {
    "nonce": 32,
@@ -363,7 +363,7 @@
    "address": "0xe0537e5f14C087EC865E152B9D3356d721E5a24F",
    "status": "canonical",
    "section": "contracts",
-   "key": "TreasuryGovernor"
+   "name": "TreasuryGovernor"
   },
   {
    "nonce": 33,
@@ -374,7 +374,7 @@
    "address": "0x66f78C103D6EE077CD2875C71D676540708d5356",
    "status": "canonical",
    "section": "contracts",
-   "key": "ModelAccessControl"
+   "name": "ModelAccessControl"
   },
   {
    "nonce": 34,
@@ -385,7 +385,7 @@
    "address": "0x6693b6FcBc5bf3935bEEB7a21654bDfBd90e84b6",
    "status": "canonical",
    "section": "contracts",
-   "key": "TEEAttestationRegistry"
+   "name": "TEEAttestationRegistry"
   },
   {
    "nonce": 35,
@@ -396,7 +396,7 @@
    "address": "0x1D71814BbC78ae994CA5B6eE9c4b9378178b2B36",
    "status": "canonical",
    "section": "contracts",
-   "key": "ComputePoolTraining"
+   "name": "ComputePoolTraining"
   },
   {
    "nonce": 36,
@@ -407,7 +407,7 @@
    "address": "0x7eAb0072153FB71E292A5e272e6Ac66E3f86D094",
    "status": "canonical",
    "section": "contracts",
-   "key": "InstitutionalVault"
+   "name": "InstitutionalVault"
   },
   {
    "nonce": 37,
@@ -418,7 +418,7 @@
    "address": "0xF2D989FFA09719aa9ee2020Fbf09aD0924ccb486",
    "status": "canonical",
    "section": "contracts",
-   "key": "ClassroomClusterV1"
+   "name": "ClassroomClusterV1"
   },
   {
    "nonce": 38,
@@ -429,7 +429,7 @@
    "address": "0x1531224eECc9dFe1CdcCd80Be1BD35804005F181",
    "status": "canonical",
    "section": "contracts",
-   "key": "EduForwarder"
+   "name": "EduForwarder"
   },
   {
    "nonce": 39,
@@ -440,7 +440,7 @@
    "address": "0x365e98100B879a7A54Dc3FED969C977D21be59A0",
    "status": "canonical",
    "section": "contracts",
-   "key": "BudgetAllocation"
+   "name": "BudgetAllocation"
   },
   {
    "nonce": 40,
@@ -451,7 +451,7 @@
    "address": "0x6E357EDCfc392bAc92b55e1f39f0FA8FC4e8E03A",
    "status": "canonical",
    "section": "contracts",
-   "key": "CashoutRequest"
+   "name": "CashoutRequest"
   },
   {
    "nonce": 41,
@@ -462,7 +462,7 @@
    "address": "0xdA30A0408b1690AfA739fB63901a6608547F4dA6",
    "status": "canonical",
    "section": "contracts",
-   "key": "AIModelRegistryPortable"
+   "name": "AIModelRegistryPortable"
   },
   {
    "nonce": 42,
@@ -473,7 +473,7 @@
    "address": "0xb8603904aEBeFefa317D9DeDF60B19A120366715",
    "status": "canonical",
    "section": "contracts",
-   "key": "AIInferenceRouterPortable"
+   "name": "AIInferenceRouterPortable"
   },
   {
    "nonce": 43,
@@ -484,7 +484,7 @@
    "address": "0x42196F4257E5AfAa9fF92735f88aa0c23fBe8b91",
    "status": "canonical",
    "section": "contracts",
-   "key": "AILearningCycleCorePortable"
+   "name": "AILearningCycleCorePortable"
   },
   {
    "nonce": 44,
@@ -495,7 +495,7 @@
    "address": "0xc2b78104907F722DABAc4C69f826a522B2754De4",
    "status": "canonical",
    "section": "genesis",
-   "key": "P256Verifier"
+   "name": "P256Verifier"
   },
   {
    "nonce": 45,
@@ -506,7 +506,7 @@
    "address": "0x97d5391a647429233E202f99231743C53a648f3c",
    "status": "canonical",
    "section": "aaStack",
-   "key": "EntryPoint"
+   "name": "EntryPoint"
   },
   {
    "nonce": 46,
@@ -517,7 +517,7 @@
    "address": "0x0f421a99A0b8F6138Dea12F45A523Cb896D09fc7",
    "status": "canonical",
    "section": "aaStack",
-   "key": "WebAuthnP256Validator"
+   "name": "WebAuthnP256Validator"
   },
   {
    "nonce": 47,
@@ -528,7 +528,7 @@
    "address": "0xD2d35421379Ae5b461e216BFcdD1B7e6a64BBC40",
    "status": "canonical",
    "section": "aaStack",
-   "key": "CitrateECDSAValidator"
+   "name": "CitrateECDSAValidator"
   },
   {
    "nonce": 48,
@@ -539,7 +539,7 @@
    "address": "0x0A909769160C1945401b8f37a9310d37DbB6a891",
    "status": "canonical",
    "section": "aaStack",
-   "key": "GuardianRecoveryModule"
+   "name": "GuardianRecoveryModule"
   },
   {
    "nonce": 49,
@@ -550,7 +550,7 @@
    "address": "0x2D742B98D867Fc7363F530DD6d756622e4Eb768D",
    "status": "canonical",
    "section": "aaStack",
-   "key": "CitrateWallet"
+   "name": "CitrateWallet"
   },
   {
    "nonce": 50,
@@ -561,7 +561,7 @@
    "address": "0x24e2a41E48Fb3d5A054528bF017ebAeC0aC94EFf",
    "status": "canonical",
    "section": "aaStack",
-   "key": "CitrateWalletFactory"
+   "name": "CitrateWalletFactory"
   },
   {
    "nonce": 51,
@@ -572,7 +572,7 @@
    "address": "0x8E65bff91E4c53556E1Cee8b0135ffb09D427E58",
    "status": "canonical",
    "section": "aaStack",
-   "key": "CitratePaymaster"
+   "name": "CitratePaymaster"
   },
   {
    "nonce": 52,
@@ -583,7 +583,7 @@
    "address": "0xA24aa35fbA269f8755C2173779cc3DBC9690c4C9",
    "status": "canonical",
    "section": "contracts",
-   "key": "CitrateMemberSBT"
+   "name": "CitrateMemberSBT"
   },
   {
    "nonce": 53,
@@ -594,7 +594,7 @@
    "address": "0x7D6B92757e928ab4207Be3B54166Ecd2C491Aa92",
    "status": "canonical",
    "section": "contracts",
-   "key": "MemberBond"
+   "name": "MemberBond"
   },
   {
    "nonce": 54,
@@ -605,7 +605,7 @@
    "address": "0x72035977F3Ec295C70e2A734AcbDFfB0C98E6F0b",
    "status": "canonical",
    "section": "contracts",
-   "key": "MembershipStakeVaultImpl"
+   "name": "MembershipStakeVaultImpl"
   },
   {
    "nonce": 55,
@@ -616,7 +616,7 @@
    "address": "0x4C0f8b27c509cBA4A32E1Cd2BC5709bBD2699024",
    "status": "canonical",
    "section": "contracts",
-   "key": "MembershipStakeVault"
+   "name": "MembershipStakeVault"
   },
   {
    "nonce": 56,
@@ -627,7 +627,7 @@
    "address": "0x2B687899EF4aF05A18F4f36cE1fE9d51c017A97c",
    "status": "canonical",
    "section": "contracts",
-   "key": "SkillRegistry"
+   "name": "SkillRegistry"
   },
   {
    "nonce": 57,
@@ -638,7 +638,7 @@
    "address": "0x028f98faeFeE5FF58cb494E493eD8f636aa3042B",
    "status": "canonical",
    "section": "contracts",
-   "key": "InstitutionTreeV1"
+   "name": "InstitutionTreeV1"
   },
   {
    "nonce": 58,
@@ -649,7 +649,7 @@
    "address": "0xa301FA601702B0fb850201182cEF381E312c63ee",
    "status": "canonical",
    "section": "contracts",
-   "key": "ComplianceRegistry"
+   "name": "ComplianceRegistry"
   },
   {
    "nonce": 59,
@@ -680,7 +680,7 @@
    "address": "0x41e0f9A4dCD29C650dc58Ee569BF267fD9ba4817",
    "status": "canonical",
    "section": "contracts",
-   "key": "AnchorRegistry"
+   "name": "AnchorRegistry"
   },
   {
    "nonce": 62,
@@ -691,7 +691,7 @@
    "address": "0x58ac5816c42a3d293552Fe368C4db53b89edB02c",
    "status": "canonical",
    "section": "contracts",
-   "key": "FacilitySBTImpl"
+   "name": "FacilitySBTImpl"
   },
   {
    "nonce": 63,
@@ -702,7 +702,7 @@
    "address": "0xb266e583A30cb47cFF54d9d7429aD55DC68C5e57",
    "status": "canonical",
    "section": "contracts",
-   "key": "FacilitySBT"
+   "name": "FacilitySBT"
   },
   {
    "nonce": 64,
@@ -713,7 +713,7 @@
    "address": "0x01D34046343a171ec7cd4DB8978adbaB095EF955",
    "status": "canonical",
    "section": "contracts",
-   "key": "NetworkSBTImpl"
+   "name": "NetworkSBTImpl"
   },
   {
    "nonce": 65,
@@ -724,7 +724,7 @@
    "address": "0x823c5031A273a304C5a087a3F414F228907Ad7DB",
    "status": "canonical",
    "section": "contracts",
-   "key": "NetworkSBT"
+   "name": "NetworkSBT"
   },
   {
    "nonce": 66,
@@ -755,7 +755,7 @@
    "address": "0xBaC05BC639af6eF107F40fe606f1c4A22b7836A2",
    "status": "canonical",
    "section": "contracts",
-   "key": "CitAgentTimelock"
+   "name": "CitAgentTimelock"
   },
   {
    "nonce": 69,
@@ -766,7 +766,7 @@
    "address": "0xB1Bb65Fc3F2188Ff1209845cBe64eba985461689",
    "status": "canonical",
    "section": "contracts",
-   "key": "OrganizationSBT"
+   "name": "OrganizationSBT"
   },
   {
    "nonce": 70,
@@ -777,7 +777,7 @@
    "address": "0xd16b1ad6e744F3E92223C65F492c35D36ae07c7b",
    "status": "canonical",
    "section": "contracts",
-   "key": "AgentSBT"
+   "name": "AgentSBT"
   },
   {
    "nonce": 71,
@@ -788,7 +788,7 @@
    "address": "0xb2b1DF947d8064797083CE6024DCe0C64999C79C",
    "status": "canonical",
    "section": "contracts",
-   "key": "CapsuleRegistry"
+   "name": "CapsuleRegistry"
   },
   {
    "nonce": 72,
@@ -799,7 +799,7 @@
    "address": "0xB38b0e8b264d828A4e55276033B54800C223De45",
    "status": "canonical",
    "section": "contracts",
-   "key": "CitAgentAnchorRegistry"
+   "name": "CitAgentAnchorRegistry"
   },
   {
    "nonce": 73,
@@ -810,7 +810,7 @@
    "address": "0x84247a5f65370947c792181A3afeD5AC0F452EC8",
    "status": "canonical",
    "section": "contracts",
-   "key": "BenchmarkRegistry"
+   "name": "BenchmarkRegistry"
   },
   {
    "nonce": 74,
@@ -851,7 +851,7 @@
    "address": "0x7e92a5CbD49659fe594B503b50B26F5BD7060e90",
    "status": "canonical",
    "section": "contracts",
-   "key": "TenantHierarchy"
+   "name": "TenantHierarchy"
   },
   {
    "nonce": 78,
@@ -862,7 +862,7 @@
    "address": "0x37844e433f6E1Df3eBdaa9FdF2cFC44c222f251d",
    "status": "canonical",
    "section": "contracts",
-   "key": "ClassificationRegistry"
+   "name": "ClassificationRegistry"
   },
   {
    "nonce": 79,
@@ -873,7 +873,7 @@
    "address": "0xAab258228E85A22C99Cb298915277521eb7049D9",
    "status": "canonical",
    "section": "contracts",
-   "key": "RoleEscalation"
+   "name": "RoleEscalation"
   },
   {
    "nonce": 80,
@@ -884,7 +884,7 @@
    "address": "0x3052Ef8C8d6B71f1fF12703C65b33f29F6627Bbf",
    "status": "canonical",
    "section": "contracts",
-   "key": "MultiSigEnvelope"
+   "name": "MultiSigEnvelope"
   },
   {
    "nonce": 81,
@@ -895,7 +895,7 @@
    "address": "0x678D03b31A77F146b8977E1128c2f57D3e3583F7",
    "status": "canonical",
    "section": "contracts",
-   "key": "AgentDecisionRegistryV2"
+   "name": "AgentDecisionRegistryV2"
   },
   {
    "nonce": 82,
@@ -906,7 +906,7 @@
    "address": "0xdeB5D07716a20838b1b7287c51bCA00e8d12D20d",
    "status": "canonical",
    "section": "contracts",
-   "key": "ContradictionLedger"
+   "name": "ContradictionLedger"
   },
   {
    "nonce": 83,
@@ -947,7 +947,7 @@
    "address": "0x94Aca73127c7A34d5872A861D0A7C9393030Fa2E",
    "status": "canonical",
    "section": "contracts",
-   "key": "QuorumAnchorRegistry"
+   "name": "QuorumAnchorRegistry"
   },
   {
    "nonce": 87,
@@ -958,7 +958,7 @@
    "address": "0x4B0C7Cf5feF3B6f5A8b042E2E71788450Ec70De4",
    "status": "canonical",
    "section": "contracts",
-   "key": "MeetingRegistry"
+   "name": "MeetingRegistry"
   },
   {
    "nonce": 88,
@@ -969,7 +969,7 @@
    "address": "0xFF6481c1F532E52aA1EFaaEEF117A29e1F84bC82",
    "status": "canonical",
    "section": "contracts",
-   "key": "GovernanceTemplateRegistry"
+   "name": "GovernanceTemplateRegistry"
   },
   {
    "nonce": 89,
@@ -980,7 +980,7 @@
    "address": "0x17c2e4e24e8E041302cBbe8C51A7996949719Df6",
    "status": "canonical",
    "section": "contracts",
-   "key": "GovernanceProtocolFactory"
+   "name": "GovernanceProtocolFactory"
   },
   {
    "nonce": 90,
@@ -991,7 +991,7 @@
    "address": "0x2e54Ea789a4EeC4A4e360b9436B04085419a29e9",
    "status": "canonical",
    "section": "contracts",
-   "key": "PolicyBinding"
+   "name": "PolicyBinding"
   },
   {
    "nonce": 91,
@@ -1002,7 +1002,7 @@
    "address": "0x1670F43B5eC0cd18088147d4fd7543E51A679d30",
    "status": "canonical",
    "section": "contracts",
-   "key": "CapabilityGrant"
+   "name": "CapabilityGrant"
   },
   {
    "nonce": 92,
@@ -1013,7 +1013,7 @@
    "address": "0x2271042A2f4F4783949ee74733A2AbfE0c50018C",
    "status": "canonical",
    "section": "contracts",
-   "key": "VoteAllowance"
+   "name": "VoteAllowance"
   },
   {
    "nonce": 93,
@@ -1024,7 +1024,7 @@
    "address": "0xB934aE6B6836ad17F2525b6428CcE7A5F7D6F0ec",
    "status": "canonical",
    "section": "contracts",
-   "key": "Sortition"
+   "name": "Sortition"
   },
   {
    "nonce": 94,
@@ -1035,7 +1035,7 @@
    "address": "0x60FF23F311E5Cbec702E62aFC99F96F36180347d",
    "status": "canonical",
    "section": "contracts",
-   "key": "PartProvenanceRegistry"
+   "name": "PartProvenanceRegistry"
   },
   {
    "nonce": 95,
@@ -1056,7 +1056,7 @@
    "address": "0x3A40A13EEa4a28Fc3A86E6cc9ab3F4CDF4C85f26",
    "status": "canonical",
    "section": "contracts",
-   "key": "SupplierRegistry"
+   "name": "SupplierRegistry"
   },
   {
    "nonce": 97,
@@ -1067,7 +1067,7 @@
    "address": "0x577Fb91D26569820A64bB752d78Da008EF04666d",
    "status": "canonical",
    "section": "contracts",
-   "key": "MoqRegistry"
+   "name": "MoqRegistry"
   },
   {
    "nonce": 98,
@@ -1078,7 +1078,7 @@
    "address": "0x100d4e9Eb591f20Cc39D9A0080F2811ea12CA28E",
    "status": "canonical",
    "section": "contracts",
-   "key": "DefensePrimeFLScopeIndex"
+   "name": "DefensePrimeFLScopeIndex"
   },
   {
    "nonce": 99,
@@ -1089,7 +1089,7 @@
    "address": "0xA0C18325Ee5426A26Feff56b3d2F7C6EF8264ad0",
    "status": "canonical",
    "section": "contracts",
-   "key": "AppRegistry"
+   "name": "AppRegistry"
   },
   {
    "nonce": 100,
@@ -1100,7 +1100,7 @@
    "address": "0xD62f4A63054e53B1cbE10a1956AA607D65CD2FDd",
    "status": "canonical",
    "section": "contracts",
-   "key": "CrossOrgIndex"
+   "name": "CrossOrgIndex"
   },
   {
    "nonce": 101,
@@ -1121,7 +1121,7 @@
    "address": "0xAc20e8F340c15D990270832650bB76d0805fe473",
    "status": "canonical",
    "section": "contracts",
-   "key": "AuditBundleRegistry"
+   "name": "AuditBundleRegistry"
   },
   {
    "nonce": 103,
@@ -1132,7 +1132,7 @@
    "address": "0xd99dF90C0385ba89be36Bf5FBc42d6bc950920E6",
    "status": "canonical",
    "section": "contracts",
-   "key": "DefensePrimeComplianceRegistry"
+   "name": "DefensePrimeComplianceRegistry"
   },
   {
    "nonce": 104,
@@ -1143,7 +1143,7 @@
    "address": "0xC8127F90D5b7B7e88B48Ec7312c2cB5884a3f1D6",
    "status": "canonical",
    "section": "contracts",
-   "key": "RoleGrantTenantIndex"
+   "name": "RoleGrantTenantIndex"
   },
   {
    "nonce": 105,
@@ -1154,7 +1154,7 @@
    "address": "0xE97f4529A0C9e8c81FB32ad72D3a578F92dE4b79",
    "status": "canonical",
    "section": "contracts",
-   "key": "EntityRegistry"
+   "name": "EntityRegistry"
   },
   {
    "nonce": 106,
@@ -1165,7 +1165,7 @@
    "address": "0xA9E05E9Bd0DDB62CabDcBBe263429a093B21aeC9",
    "status": "canonical",
    "section": "contracts",
-   "key": "TinaWorkpaperRegistry"
+   "name": "TinaWorkpaperRegistry"
   },
   {
    "nonce": 107,
@@ -1176,7 +1176,7 @@
    "address": "0x3b2913E078fa859dc10Aa9EA90A6FCF3E1D47480",
    "status": "canonical",
    "section": "contracts",
-   "key": "CrossOrgEnvelope"
+   "name": "CrossOrgEnvelope"
   },
   {
    "nonce": 108,
@@ -1187,7 +1187,7 @@
    "address": "0xaC5e1E599788540a5E97B1258d6bd99c417Ce9eA",
    "status": "canonical",
    "section": "contracts",
-   "key": "TripwireRegistry"
+   "name": "TripwireRegistry"
   },
   {
    "nonce": 109,
@@ -1198,7 +1198,7 @@
    "address": "0xc5CA4ae343367995b49570d97759643A289F298D",
    "status": "canonical",
    "section": "contracts",
-   "key": "SponsorEvidenceRegistry"
+   "name": "SponsorEvidenceRegistry"
   },
   {
    "nonce": 110,
@@ -1209,7 +1209,7 @@
    "address": "0x7B955B307c4EbBeA469C40FfeD41AD08a8ECe075",
    "status": "canonical",
    "section": "contracts",
-   "key": "ReleaseManifestRegistry"
+   "name": "ReleaseManifestRegistry"
   },
   {
    "nonce": 111,
@@ -1220,7 +1220,7 @@
    "address": "0x2a45692244dE4A87172061F604b1167D2c7f6C3b",
    "status": "canonical",
    "section": "contracts",
-   "key": "KYCRegistry"
+   "name": "KYCRegistry"
   },
   {
    "nonce": 112,
@@ -1231,7 +1231,7 @@
    "address": "0x7747745AA3d78c93993DD1eF6aCD8CC8AFED8aEC",
    "status": "canonical",
    "section": "contracts",
-   "key": "IPFSIncentivesV2"
+   "name": "IPFSIncentivesV2"
   },
   {
    "nonce": 113,
@@ -1242,7 +1242,7 @@
    "address": "0xe016f7655172dCc8039863484F1A8C306553867D",
    "status": "canonical",
    "section": "contracts",
-   "key": "IPFSIncentivesV3"
+   "name": "IPFSIncentivesV3"
   },
   {
    "nonce": 114,
@@ -1253,7 +1253,7 @@
    "address": "0xB5D143dC15dD9C570D198c7156Fe427ccEFc7377",
    "status": "canonical",
    "section": "contracts",
-   "key": "AggregationChallenge"
+   "name": "AggregationChallenge"
   },
   {
    "nonce": 115,
@@ -1264,7 +1264,7 @@
    "address": "0xbE60946E62697e99697bdF90b59700D4D76f5E60",
    "status": "canonical",
    "section": "contracts",
-   "key": "ComputePoolPipeline"
+   "name": "ComputePoolPipeline"
   }
  ]
 }
