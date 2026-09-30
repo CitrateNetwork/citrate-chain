@@ -266,6 +266,19 @@ mod tests {
     }
 
     #[test]
+    fn panic_s1_total_supply_crosses_halvings_exactly() {
+        // interval 10, 10 SALT: blocks 0..10 at 10, 10..20 at 5, 20..25 at 2 (5 >> 1).
+        let calc = RewardCalculator::new(RewardConfig {
+            halving_interval: 10,
+            ..RewardConfig::default()
+        });
+        assert_eq!(calc.total_supply_at_height(10).expect("valid"), salt(100));
+        assert_eq!(calc.total_supply_at_height(20).expect("valid"), salt(150));
+        assert_eq!(calc.total_supply_at_height(25).expect("valid"), salt(160));
+        assert_eq!(calc.total_supply_at_height(0).expect("valid"), U256::zero());
+    }
+
+    #[test]
     fn panic_s1_invalid_config_is_rejected_not_panicked() {
         let block = BlockBuilder::new().height(5).build_unhashed();
         let zero_halving = RewardCalculator::new(RewardConfig {

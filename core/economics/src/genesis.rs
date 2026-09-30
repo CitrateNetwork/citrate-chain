@@ -1136,6 +1136,30 @@ mod tests {
     }
 
     #[test]
+    fn panic_s1_canonical_block_hash_commits_to_its_fields() {
+        // Determinism alone passes for a constant hash (a mutant returning
+        // Hash::default() survived). The hash must be non-zero and must change
+        // when any committed root changes.
+        let base = create_canonical_genesis_block(CANONICAL_GENESIS_TIMESTAMP);
+        let h = calculate_canonical_block_hash(&base);
+        assert_ne!(h, Hash::default());
+        let mut other = base.clone();
+        other.state_root = Hash::new([0x5A; 32]);
+        assert_ne!(
+            calculate_canonical_block_hash(&other),
+            h,
+            "state_root is committed"
+        );
+        let mut other = base.clone();
+        other.tx_root = Hash::new([0x5B; 32]);
+        assert_ne!(
+            calculate_canonical_block_hash(&other),
+            h,
+            "tx_root is committed"
+        );
+    }
+
+    #[test]
     fn test_address_from_hex_invalid_length() {
         // Too short
         let result = address_from_hex("0x1234");
