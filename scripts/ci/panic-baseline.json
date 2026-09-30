@@ -17,14 +17,6 @@
    "indexing_slicing": 1,
    "panic": 1
   },
-  "core/consensus": {
-   "arithmetic_side_effects": 46,
-   "expect_used": 1,
-   "indexing_slicing": 22,
-   "panic": 1,
-   "string_slice": 1,
-   "unreachable": 1
-  },
   "core/economics": {
    "arithmetic_side_effects": 157,
    "indexing_slicing": 3,
@@ -122,5 +114,5 @@
   "arithmetic_side_effects",
   "string_slice"
  ],
- "total": 2209
+ "total": 2137
 }

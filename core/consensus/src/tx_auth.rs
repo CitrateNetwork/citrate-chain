@@ -136,7 +136,8 @@ pub fn verify_for_block(tx: &Transaction, chain_id: u64) -> Result<Hash, TxAuthE
 /// Minimal big-endian bytes (RLP integer encoding: zero is the empty string).
 fn be_trim(bytes: &[u8]) -> &[u8] {
     let first = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
-    &bytes[first..]
+    // first <= len (position, or len itself), so this is never None.
+    bytes.get(first..).unwrap_or_default()
 }
 
 fn append_u128(s: &mut rlp::RlpStream, v: u128) {
@@ -283,7 +284,10 @@ fn evm_signed_hash(tx: &Transaction, chain_id: u64, recid: u8) -> Result<Hash, T
         0 => {
             // EIP-155: v = chain_id * 2 + 35 + recid. chain_id is a u64, so
             // compute in u128 (a chain id near u64::MAX must not overflow).
-            let v: u128 = (chain_id as u128) * 2 + 35 + recid as u128;
+            let v: u128 = u128::from(chain_id)
+                .saturating_mul(2)
+                .saturating_add(35)
+                .saturating_add(recid as u128);
             s.begin_list(9);
             s.append(&tx.nonce);
             s.append(&tx.gas_price);
@@ -374,7 +378,7 @@ fn authenticate_evm(tx: &Transaction) -> Result<Hash, TxAuthError> {
         };
         let uncompressed = pk.serialize_uncompressed();
         let addr = Keccak256::digest(&uncompressed[1..]);
-        if &addr[12..] == from20 {
+        if addr.get(12..) == Some(from20) {
             return evm_signed_hash(tx, chain_id, recid);
         }
     }
@@ -573,6 +577,14 @@ pub fn tx_root_for_height(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panic_s1_be_trim_is_total() {
+        assert_eq!(be_trim(&[]), &[] as &[u8]);
+        assert_eq!(be_trim(&[0, 0, 0]), &[] as &[u8]);
+        assert_eq!(be_trim(&[0, 1, 2]), &[1, 2]);
+        assert_eq!(be_trim(&[5]), &[5]);
+    }
     use crate::types::{PublicKey, Signature};
 
     /// A named field mutation applied to a transaction.

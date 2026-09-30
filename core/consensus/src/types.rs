@@ -20,6 +20,10 @@ impl Hash {
     /// caller decoding an UNTRUSTED / on-disk value (which may be corrupt
     /// or truncated) MUST use [`Self::try_from_bytes`] instead — a short
     /// RocksDB value would otherwise crash-loop the node.
+    // Callers pass a known 32-byte buffer (digest output, or a key already checked
+    // `len() == 32`); untrusted/persisted bytes go through `try_from_bytes`.
+    // INVARIANT: documented panicking contract, SECREM-01 CONS-6 (test: test_hash_display)
+    #[allow(clippy::indexing_slicing)]
     pub fn from_bytes(bytes: &[u8]) -> Self {
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&bytes[..32]);
@@ -30,12 +34,7 @@ impl Hash {
     /// Returns `None` if fewer than 32 bytes are available instead of
     /// panicking.
     pub fn try_from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 32 {
-            return None;
-        }
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&bytes[..32]);
-        Some(Self(hash))
+        bytes.first_chunk::<32>().map(|h| Self(*h))
     }
 
     pub fn as_bytes(&self) -> &[u8; 32] {
@@ -49,7 +48,7 @@ impl Hash {
 
 impl fmt::Display for Hash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", &self.to_hex()[..8])
+        write!(f, "{}", self.to_hex().get(..8).unwrap_or_default())
     }
 }
 
@@ -252,7 +251,6 @@ pub struct Block {
     // --- Learning extension fields (Paper II §6.1, Sprint M WP-M.2b) ---
     // These are optional sidecars. Non-learning nodes set them to None.
     // They are NOT included in compute_hash() — consensus is unaffected.
-
     /// Per-dimension embedding vector from this node's local model (~3 KB at d=768).
     #[serde(default)]
     pub learning_embedding: Option<Vec<f32>>,
@@ -374,9 +372,7 @@ impl Block {
         }
 
         let hash_bytes = hasher.finalize();
-        let mut hash_array = [0u8; 32];
-        hash_array.copy_from_slice(&hash_bytes[..32]);
-        Hash::new(hash_array)
+        Hash::new(hash_bytes.into())
     }
 
     /// Verify that the block's advertised hash matches the canonical computation.
@@ -474,10 +470,10 @@ pub enum AiOpKind {
 
 impl AiOpKind {
     pub fn classify(has_to: bool, data: &[u8]) -> Option<Self> {
-        if !has_to || data.len() < 4 {
+        if !has_to {
             return None;
         }
-        match &data[0..4] {
+        match data.first_chunk::<4>()? {
             [0x01, 0x00, 0x00, 0x00] => Some(AiOpKind::RegisterModel),
             [0x02, 0x00, 0x00, 0x00] => Some(AiOpKind::InferenceRequest),
             [0x03, 0x00, 0x00, 0x00] => Some(AiOpKind::UpdateModel),
@@ -492,8 +488,8 @@ impl AiOpKind {
 
 impl TransactionType {
     pub fn from_data(data: &[u8]) -> Self {
-        if data.len() >= 4 {
-            match &data[0..4] {
+        if let Some(selector) = data.first_chunk::<4>() {
+            match selector {
                 [0x01, 0x00, 0x00, 0x00] => TransactionType::ModelDeploy,
                 [0x02, 0x00, 0x00, 0x00] => TransactionType::ModelUpdate,
                 [0x03, 0x00, 0x00, 0x00] => TransactionType::InferenceRequest,
@@ -1015,7 +1011,7 @@ impl Default for BlockBuilder {
 /// value is never consumed. If the work function ever changes, it changes
 /// here, behind a height-gated activation.
 pub fn blue_work_for_score(blue_score: u64) -> u128 {
-    blue_score as u128 * 1_000_000
+    u128::from(blue_score).saturating_mul(1_000_000)
 }
 
 /// Blue set information for a block
@@ -1046,7 +1042,7 @@ impl BlueSet {
 
     pub fn insert(&mut self, hash: Hash) {
         self.blocks.insert(hash);
-        self.score += 1;
+        self.score = self.score.saturating_add(1);
     }
 
     pub fn size(&self) -> usize {
@@ -1103,6 +1099,49 @@ impl Tip {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panic_s1_selector_decoding_never_panics_on_short_data() {
+        for len in 0..4 {
+            let data = vec![0x01u8; len];
+            assert_eq!(AiOpKind::classify(true, &data), None, "len {len}");
+            assert_eq!(
+                TransactionType::from_data(&data),
+                TransactionType::from_data(&[]),
+                "len {len}"
+            );
+        }
+        assert_eq!(
+            AiOpKind::classify(true, &[0x01, 0, 0, 0]),
+            Some(AiOpKind::RegisterModel)
+        );
+        assert_eq!(AiOpKind::classify(false, &[0x01, 0, 0, 0]), None);
+        assert_eq!(
+            TransactionType::from_data(&[0x02, 0, 0, 0, 9]),
+            TransactionType::ModelUpdate
+        );
+    }
+
+    #[test]
+    fn panic_s1_try_from_bytes_bounds() {
+        assert!(Hash::try_from_bytes(&[7u8; 31]).is_none());
+        assert_eq!(Hash::try_from_bytes(&[7u8; 32]), Some(Hash::new([7u8; 32])));
+        let mut long = [9u8; 40];
+        long[0] = 1;
+        let h = Hash::try_from_bytes(&long).expect("40 bytes decode");
+        assert_eq!(h.as_bytes()[0], 1);
+        assert_eq!(h.as_bytes()[31], 9);
+    }
+
+    #[test]
+    fn panic_s1_display_and_work_are_total() {
+        assert_eq!(format!("{}", Hash::new([0xab; 32])), "abababab");
+        assert_eq!(
+            blue_work_for_score(u64::MAX),
+            u128::from(u64::MAX) * 1_000_000
+        );
+        assert_eq!(blue_work_for_score(3), 3_000_000);
+    }
 
     #[test]
     fn test_hash_display() {
@@ -1427,10 +1466,7 @@ mod tests {
 
     #[test]
     fn test_block_builder_computes_hash() {
-        let block = BlockBuilder::new()
-            .height(5)
-            .timestamp(12345)
-            .build();
+        let block = BlockBuilder::new().height(5).timestamp(12345).build();
 
         // build() should compute the hash
         assert_ne!(block.header.block_hash, Hash::default());
@@ -1510,7 +1546,11 @@ mod ai_op_kind_tests {
             assert_eq!(AiOpKind::classify(false, &data), None);
         }
         assert_eq!(AiOpKind::classify(true, &[0x01, 0, 0]), None, "short data");
-        assert_eq!(AiOpKind::classify(true, &[0x01, 0, 0, 1]), None, "non-zero tail byte");
+        assert_eq!(
+            AiOpKind::classify(true, &[0x01, 0, 0, 1]),
+            None,
+            "non-zero tail byte"
+        );
         let mut tx = Transaction {
             to: Some(PublicKey::new([1; 32])),
             data: vec![0x02, 0, 0, 0],

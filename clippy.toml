@@ -1,0 +1,14 @@
+# PANIC-S1 (citrate-federation sprint 2026-09-30-panic-s1-chain-panic-surface).
+# `arithmetic_side_effects` flags every operator on non-primitive types. Elliptic-
+# curve points and scalars implement MODULAR group/field arithmetic: `+ - *` on
+# them wraps in the group by definition and cannot overflow or panic. Listing
+# them keeps the lint meaningful (integer overflow) instead of drowning it in
+# false positives. Add a type here ONLY if its operators are total (never panic).
+arithmetic-side-effects-allowed = [
+    "p256::ProjectivePoint",
+    "p256::Scalar",
+    "p256::AffinePoint",
+    "primeorder::ProjectivePoint",
+    "primeorder::projective::ProjectivePoint",
+    "p256::arithmetic::scalar::Scalar",
+]
