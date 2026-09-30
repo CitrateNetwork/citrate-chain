@@ -1,7 +1,20 @@
 // citrate/core/economics/src/genesis.rs
+// PANIC-S1 G2: this module is on the block/genesis path (T1). Production code here
+// may not panic; money math returns errors (D3 = reject).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
 
 use crate::latt_to_wei;
-use crate::token::DECIMALS;
 use citrate_consensus::types::{
     Block, BlockBuilder, BlockHeader, EmbeddedModel, Hash, ModelId as ConsensusModelId,
     ModelMetadata as ConsensusModelMetadata, ModelType, PublicKey, RequiredModel, VrfProof,
@@ -24,54 +37,54 @@ use std::collections::HashMap;
 // alpha reroll; proper genesis ceremony (HW wallets + 3rd-party signers) follows
 // post-reroll + multi-operator soak.
 pub const TESTNET_TREASURY_ADDRESS: Address = Address([
-    0xa5, 0xd0, 0x97, 0xc0, 0xab, 0xbb, 0x3b, 0x6b, 0xbd, 0xb7,
-    0x5b, 0xd0, 0x6d, 0x51, 0xb4, 0x4f, 0x92, 0x77, 0xe6, 0xd4,
+    0xa5, 0xd0, 0x97, 0xc0, 0xab, 0xbb, 0x3b, 0x6b, 0xbd, 0xb7, 0x5b, 0xd0, 0x6d, 0x51, 0xb4, 0x4f,
+    0x92, 0x77, 0xe6, 0xd4,
 ]);
 // Deployer wallet for contract deployment.
 // ROTATED 2026-09-29 (fresh-keys reroll): fresh DGX-generated deployer. All 4
 // validator stakers below are re-derived from THIS deployer key via
 // keccak256(DEPLOYER_PRIVATE_KEY ‖ "citrate/validator-staker/{i}/v1").
 pub const TESTNET_DEPLOYER_ADDRESS: Address = Address([
-    0xa3, 0x51, 0x2b, 0xe8, 0x0a, 0xbe, 0x86, 0x43, 0x95, 0x25,
-    0xa3, 0xe5, 0xa1, 0x85, 0x88, 0x4a, 0xb0, 0xcc, 0xb8, 0x7a,
+    0xa3, 0x51, 0x2b, 0xe8, 0x0a, 0xbe, 0x86, 0x43, 0x95, 0x25, 0xa3, 0xe5, 0xa1, 0x85, 0x88, 0x4a,
+    0xb0, 0xcc, 0xb8, 0x7a,
 ]);
 // Faucet signing wallet
 pub const TESTNET_FAUCET_ADDRESS: Address = Address([
-    0x10, 0x89, 0xd3, 0x92, 0xd7, 0x29, 0x30, 0xfb, 0x33, 0x07,
-    0x49, 0xf6, 0xb9, 0xd5, 0xa0, 0x58, 0x70, 0xd9, 0x9c, 0x16,
+    0x10, 0x89, 0xd3, 0x92, 0xd7, 0x29, 0x30, 0xfb, 0x33, 0x07, 0x49, 0xf6, 0xb9, 0xd5, 0xa0, 0x58,
+    0x70, 0xd9, 0x9c, 0x16,
 ]);
 // Team/Dev wallet
 pub const TESTNET_TEAM_ADDRESS: Address = Address([
-    0x82, 0x7e, 0x17, 0x7c, 0xc5, 0x10, 0xd4, 0x60, 0x63, 0x28,
-    0x21, 0x65, 0x32, 0x28, 0xc9, 0x49, 0x62, 0x64, 0x7b, 0x8e,
+    0x82, 0x7e, 0x17, 0x7c, 0xc5, 0x10, 0xd4, 0x60, 0x63, 0x28, 0x21, 0x65, 0x32, 0x28, 0xc9, 0x49,
+    0x62, 0x64, 0x7b, 0x8e,
 ]);
 // Validator coinbase wallet
 pub const TESTNET_VALIDATOR_ADDRESS: Address = Address([
-    0x08, 0x1d, 0x1c, 0xed, 0xb0, 0xb9, 0xcf, 0xdd, 0xa2, 0x62,
-    0x86, 0xdf, 0x59, 0x2e, 0xc8, 0x65, 0xa9, 0x3d, 0x4e, 0x01,
+    0x08, 0x1d, 0x1c, 0xed, 0xb0, 0xb9, 0xcf, 0xdd, 0xa2, 0x62, 0x86, 0xdf, 0x59, 0x2e, 0xc8, 0x65,
+    0xa9, 0x3d, 0x4e, 0x01,
 ]);
 // Legacy ecosystem address (kept for backward compat, no genesis funding)
 pub const TESTNET_ECOSYSTEM_ADDRESS: Address = Address([0x22; 20]);
 pub const LEGACY_FAUCET_PLACEHOLDER_ADDRESS: Address = Address([0x33; 20]);
 pub const HARDHAT_DEFAULT_ADDRESS: Address = Address([
-    0xf3, 0x9f, 0xd6, 0xe5, 0x1a, 0xad, 0x88, 0xf6, 0xf4, 0xce,
-    0x6a, 0xb8, 0x82, 0x72, 0x79, 0xcf, 0xff, 0xb9, 0x22, 0x66,
+    0xf3, 0x9f, 0xd6, 0xe5, 0x1a, 0xad, 0x88, 0xf6, 0xf4, 0xce, 0x6a, 0xb8, 0x82, 0x72, 0x79, 0xcf,
+    0xff, 0xb9, 0x22, 0x66,
 ]);
 pub const HARDHAT_SECONDARY_ADDRESS: Address = Address([
-    0x70, 0x99, 0x79, 0x70, 0xc5, 0x18, 0x12, 0xdc, 0x3a, 0x01,
-    0x0c, 0x7d, 0x01, 0xb5, 0x0e, 0x0d, 0x17, 0xdc, 0x79, 0xc8,
+    0x70, 0x99, 0x79, 0x70, 0xc5, 0x18, 0x12, 0xdc, 0x3a, 0x01, 0x0c, 0x7d, 0x01, 0xb5, 0x0e, 0x0d,
+    0x17, 0xdc, 0x79, 0xc8,
 ]);
 pub const HARDHAT_TERTIARY_ADDRESS: Address = Address([
-    0x3c, 0x44, 0xcd, 0xdd, 0xb6, 0xa9, 0x00, 0xfa, 0x2b, 0x58,
-    0x5d, 0xd2, 0x99, 0xe0, 0x3d, 0x12, 0xfa, 0x42, 0x93, 0xbc,
+    0x3c, 0x44, 0xcd, 0xdd, 0xb6, 0xa9, 0x00, 0xfa, 0x2b, 0x58, 0x5d, 0xd2, 0x99, 0xe0, 0x3d, 0x12,
+    0xfa, 0x42, 0x93, 0xbc,
 ]);
 pub const FOUNDRY_RECOVERED_DEPLOYER_ADDRESS: Address = Address([
-    0xfc, 0xad, 0x0b, 0x19, 0xbb, 0x29, 0xd4, 0x67, 0x45, 0x31,
-    0xd6, 0xf1, 0x15, 0x23, 0x7e, 0x16, 0xaf, 0xce, 0x37, 0x7c,
+    0xfc, 0xad, 0x0b, 0x19, 0xbb, 0x29, 0xd4, 0x67, 0x45, 0x31, 0xd6, 0xf1, 0x15, 0x23, 0x7e, 0x16,
+    0xaf, 0xce, 0x37, 0x7c,
 ]);
 pub const SAUL_DEPLOYER_ADDRESS: Address = Address([
-    0x9f, 0x5b, 0x15, 0x6c, 0x53, 0x30, 0x5d, 0x4b, 0x20, 0xc9,
-    0x4c, 0xa0, 0x8e, 0x32, 0x19, 0xd1, 0xc0, 0xe7, 0x40, 0x1a,
+    0x9f, 0x5b, 0x15, 0x6c, 0x53, 0x30, 0x5d, 0x4b, 0x20, 0xc9, 0x4c, 0xa0, 0x8e, 0x32, 0x19, 0xd1,
+    0xc0, 0xe7, 0x40, 0x1a,
 ]);
 // Faucet signing account, funded so the faucet service can pay out grants + gas.
 // FRESH-KEYS REROLL 2026-09-29: rotated OFF the old deterministic address
@@ -81,8 +94,8 @@ pub const SAUL_DEPLOYER_ADDRESS: Address = Address([
 // deterministic fallback is gated behind the `unsafe-deterministic-key` feature
 // (default OFF) so production refuses to start without the env key.
 pub const FAUCET_SIGNER_ADDRESS: Address = Address([
-    0x9c, 0x04, 0x6a, 0x90, 0xce, 0xd2, 0xde, 0xdf, 0xe2, 0xcd,
-    0x53, 0x29, 0xa1, 0xb1, 0x43, 0xe7, 0x0f, 0xea, 0x1a, 0xd9,
+    0x9c, 0x04, 0x6a, 0x90, 0xce, 0xd2, 0xde, 0xdf, 0xe2, 0xcd, 0x53, 0x29, 0xa1, 0xb1, 0x43, 0xe7,
+    0x0f, 0xea, 0x1a, 0xd9,
 ]);
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -109,20 +122,20 @@ pub const FAUCET_SIGNER_ADDRESS: Address = Address([
 // ~/.citrate-reroll-keys/derive_stakers.sh. The registration ceremony re-derives
 // the staker keys with the SAME scheme, so the funded addresses match the signers.
 pub const VALIDATOR_STAKER_1_ADDRESS: Address = Address([
-    0xb4, 0xe4, 0x27, 0x31, 0x90, 0x8a, 0x00, 0xfe, 0xa7, 0xe1,
-    0xae, 0xdb, 0x08, 0x17, 0xe7, 0x8b, 0x41, 0x68, 0x89, 0xc5,
+    0xb4, 0xe4, 0x27, 0x31, 0x90, 0x8a, 0x00, 0xfe, 0xa7, 0xe1, 0xae, 0xdb, 0x08, 0x17, 0xe7, 0x8b,
+    0x41, 0x68, 0x89, 0xc5,
 ]);
 pub const VALIDATOR_STAKER_2_ADDRESS: Address = Address([
-    0x62, 0x29, 0x8a, 0x95, 0x85, 0xad, 0x2c, 0x07, 0x89, 0x4b,
-    0x51, 0x72, 0xce, 0x05, 0x0e, 0x4f, 0xc8, 0x39, 0xd9, 0xee,
+    0x62, 0x29, 0x8a, 0x95, 0x85, 0xad, 0x2c, 0x07, 0x89, 0x4b, 0x51, 0x72, 0xce, 0x05, 0x0e, 0x4f,
+    0xc8, 0x39, 0xd9, 0xee,
 ]);
 pub const VALIDATOR_STAKER_3_ADDRESS: Address = Address([
-    0x53, 0x1c, 0x70, 0x58, 0x60, 0x88, 0xd7, 0x1e, 0xd9, 0x17,
-    0x08, 0xb4, 0xa7, 0x80, 0x31, 0x62, 0xfd, 0x19, 0xc8, 0xae,
+    0x53, 0x1c, 0x70, 0x58, 0x60, 0x88, 0xd7, 0x1e, 0xd9, 0x17, 0x08, 0xb4, 0xa7, 0x80, 0x31, 0x62,
+    0xfd, 0x19, 0xc8, 0xae,
 ]);
 pub const VALIDATOR_STAKER_4_ADDRESS: Address = Address([
-    0x73, 0xf6, 0xee, 0x78, 0x87, 0x4e, 0x7d, 0xc7, 0x2e, 0x34,
-    0x9a, 0xfa, 0xd6, 0x8a, 0xf6, 0x7f, 0x2e, 0x21, 0xa8, 0x29,
+    0x73, 0xf6, 0xee, 0x78, 0x87, 0x4e, 0x7d, 0xc7, 0x2e, 0x34, 0x9a, 0xfa, 0xd6, 0x8a, 0xf6, 0x7f,
+    0x2e, 0x21, 0xa8, 0x29,
 ]);
 
 /// Per-staker genesis funding: 40,000,000 SALT. Scaled 1000× with the 1T-supply
@@ -158,8 +171,8 @@ fn account(address: Address, balance_latt: u64) -> GenesisAccount {
 ///
 /// Source of the bytecode: https://github.com/Arachnid/deterministic-deployment-proxy
 pub const ARACHNID_DETERMINISTIC_DEPLOYER_ADDRESS: Address = Address([
-    0x4e, 0x59, 0xb4, 0x48, 0x47, 0xb3, 0x79, 0x57, 0x85, 0x88,
-    0x92, 0x0c, 0xa7, 0x8f, 0xbf, 0x26, 0xc0, 0xb4, 0x95, 0x6c,
+    0x4e, 0x59, 0xb4, 0x48, 0x47, 0xb3, 0x79, 0x57, 0x85, 0x88, 0x92, 0x0c, 0xa7, 0x8f, 0xbf, 0x26,
+    0xc0, 0xb4, 0x95, 0x6c,
 ]);
 
 /// 69-byte deployed runtime of {@link ARACHNID_DETERMINISTIC_DEPLOYER_ADDRESS}.
@@ -240,9 +253,9 @@ fn create_embedded_bge_m3() -> EmbeddedModel {
 
 fn create_required_mistral_7b() -> RequiredModel {
     let sha256_bytes: [u8; 32] = [
-        0x12, 0x70, 0xd2, 0x2c, 0x0f, 0xbb, 0x3d, 0x09, 0x2f, 0xb7, 0x25, 0xd4, 0xd9, 0x6c,
-        0x45, 0x7b, 0x7b, 0x68, 0x7a, 0x5f, 0x5a, 0x71, 0x5a, 0xbe, 0x1e, 0x81, 0x8d, 0xa3,
-        0x03, 0xe5, 0x62, 0xb6,
+        0x12, 0x70, 0xd2, 0x2c, 0x0f, 0xbb, 0x3d, 0x09, 0x2f, 0xb7, 0x25, 0xd4, 0xd9, 0x6c, 0x45,
+        0x7b, 0x7b, 0x68, 0x7a, 0x5f, 0x5a, 0x71, 0x5a, 0xbe, 0x1e, 0x81, 0x8d, 0xa3, 0x03, 0xe5,
+        0x62, 0xb6,
     ];
 
     RequiredModel::new(
@@ -328,10 +341,10 @@ impl Default for GenesisConfig {
 impl GenesisConfig {
     /// Create mainnet genesis configuration
     pub fn mainnet() -> Self {
-        let treasury = address_from_hex("0x1111111111111111111111111111111111111111")
-            .unwrap_or_else(|e| panic!("Invalid hardcoded mainnet address: treasury: {e}"));
-        let ecosystem = address_from_hex("0x2222222222222222222222222222222222222222")
-            .unwrap_or_else(|e| panic!("Invalid hardcoded mainnet address: ecosystem: {e}"));
+        // 0x1111…1111 / 0x2222…2222 written as the byte arrays they parse to: no
+        // runtime parse, so no panic path (PANIC-S1). Pinned by test_mainnet_config.
+        let treasury = Address([0x11; 20]);
+        let ecosystem = Address([0x22; 20]);
 
         // Team allocations (15% = 150M SALT, vested over 4 years)
         let team_allocations = HashMap::new();
@@ -508,28 +521,28 @@ impl GenesisConfig {
         }
     }
 
-    /// Get total pre-allocated supply
-    pub fn total_preallocation(&self) -> U256 {
-        let mut total = U256::zero();
-
-        for account in &self.accounts {
-            total += account.balance;
-        }
-
-        for balance in self.team_allocations.values() {
-            total += *balance;
-        }
-
-        total
+    /// Get total pre-allocated supply, or `None` if the sum overflows U256
+    /// (PANIC-S1 D3: such a config is rejected by `validate`, never saturated).
+    pub fn total_preallocation(&self) -> Option<U256> {
+        self.accounts
+            .iter()
+            .map(|a| a.balance)
+            .chain(self.team_allocations.values().copied())
+            .try_fold(U256::zero(), |acc, b| acc.checked_add(b))
     }
 
     /// Validate genesis configuration
     pub fn validate(&self) -> Result<(), GenesisError> {
         // Check total allocation doesn't exceed supply
-        let total_supply = U256::from(crate::TOTAL_SUPPLY) * U256::from(10).pow(U256::from(DECIMALS));
-        let preallocated = self.total_preallocation();
-
-        if preallocated + self.mining_pool_max > total_supply {
+        let total_supply = U256::from(crate::TOTAL_SUPPLY)
+            .checked_mul(crate::wei_per_salt())
+            .ok_or(GenesisError::ExceedsSupply)?;
+        // Overflow anywhere in the sum is, by definition, more than the supply cap.
+        let allocated = self
+            .total_preallocation()
+            .and_then(|p| p.checked_add(self.mining_pool_max))
+            .ok_or(GenesisError::ExceedsSupply)?;
+        if allocated > total_supply {
             return Err(GenesisError::ExceedsSupply);
         }
 
@@ -557,7 +570,9 @@ pub enum GenesisError {
     Invalid(String),
 }
 
-// Helper function to create Address from hex string
+// Helper function to create Address from hex string (test-only since PANIC-S1:
+// mainnet() now writes its constants as byte arrays).
+#[cfg(test)]
 fn address_from_hex(hex: &str) -> Result<Address, hex::FromHexError> {
     let bytes = hex::decode(hex.trim_start_matches("0x"))?;
     if bytes.len() != 20 {
@@ -647,10 +662,7 @@ pub fn calculate_canonical_block_hash(block: &Block) -> Hash {
     hasher.update(block.receipt_root.as_bytes());
     hasher.update(block.artifact_root.as_bytes());
 
-    let hash_bytes = hasher.finalize();
-    let mut hash_array = [0u8; 32];
-    hash_array.copy_from_slice(&hash_bytes[..32]);
-    Hash::new(hash_array)
+    Hash::new(hasher.finalize().into())
 }
 
 /// Initialize genesis state in the executor's state DB.
@@ -663,13 +675,14 @@ pub fn calculate_canonical_block_hash(block: &Block) -> Hash {
 ///
 /// The returned state root is used to compute the genesis block hash.
 /// All nodes MUST call this function to produce matching genesis blocks.
+///
+/// PANIC-S1: an invalid config is returned as an error (the node refuses to start
+/// with a clean message) instead of panicking.
 pub fn initialize_shared_genesis_state(
     executor: &Arc<Executor>,
     config: &GenesisConfig,
-) -> [u8; 32] {
-    config
-        .validate()
-        .unwrap_or_else(|e| panic!("invalid shared genesis configuration: {e}"));
+) -> Result<[u8; 32], GenesisError> {
+    config.validate()?;
 
     // 1. Initialize genesis accounts
     for account in &config.accounts {
@@ -683,7 +696,10 @@ pub fn initialize_shared_genesis_state(
         tracing::info!(
             "Genesis account 0x{}: {} SALT",
             hex::encode(account.address.0),
-            account.balance / U256::from(10).pow(U256::from(18))
+            account
+                .balance
+                .checked_div(crate::wei_per_salt())
+                .unwrap_or_default()
         );
     }
 
@@ -698,14 +714,10 @@ pub fn initialize_shared_genesis_state(
     let state_root = executor.state_db().commit();
     let root_bytes: [u8; 32] = *state_root.as_bytes();
 
-    tracing::info!(
-        "Genesis state root: 0x{}",
-        hex::encode(&root_bytes[..8])
-    );
+    tracing::info!("Genesis state root: 0x{}", hex::encode(&root_bytes[..8]));
 
-    root_bytes
+    Ok(root_bytes)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -720,7 +732,7 @@ mod tests {
     #[test]
     fn test_total_preallocation() {
         let config = GenesisConfig::default();
-        let total = config.total_preallocation();
+        let total = config.total_preallocation().expect("no overflow");
 
         // 10M faucet + 100M treasury + 250M ecosystem + 2K test accounts + 30K hardhat accounts
         let expected = latt_to_wei(360_032_000);
@@ -764,7 +776,10 @@ mod tests {
             ("default", GenesisConfig::default()),
             ("mainnet", GenesisConfig::mainnet()),
             ("testnet_beta", GenesisConfig::testnet_beta()),
-            ("team_testnet_genesis", GenesisConfig::team_testnet_genesis()),
+            (
+                "team_testnet_genesis",
+                GenesisConfig::team_testnet_genesis(),
+            ),
         ] {
             let arachnid = config
                 .accounts
@@ -786,7 +801,11 @@ mod tests {
                  well-known address (notably the eth-infinitism ERC-4337 \
                  bundler) finds the contract on boot"
             );
-            assert_eq!(code.len(), 69, "{label}: Arachnid runtime is exactly 69 bytes");
+            assert_eq!(
+                code.len(),
+                69,
+                "{label}: Arachnid runtime is exactly 69 bytes"
+            );
         }
     }
 
@@ -800,8 +819,8 @@ mod tests {
         assert_eq!(
             ARACHNID_DETERMINISTIC_DEPLOYER_ADDRESS.0,
             [
-                0x4e, 0x59, 0xb4, 0x48, 0x47, 0xb3, 0x79, 0x57, 0x85, 0x88,
-                0x92, 0x0c, 0xa7, 0x8f, 0xbf, 0x26, 0xc0, 0xb4, 0x95, 0x6c,
+                0x4e, 0x59, 0xb4, 0x48, 0x47, 0xb3, 0x79, 0x57, 0x85, 0x88, 0x92, 0x0c, 0xa7, 0x8f,
+                0xbf, 0x26, 0xc0, 0xb4, 0x95, 0x6c,
             ]
         );
     }
@@ -884,7 +903,7 @@ mod tests {
     #[test]
     fn test_testnet_beta_total_preallocation() {
         let config = GenesisConfig::testnet_beta();
-        let total = config.total_preallocation();
+        let total = config.total_preallocation().expect("no overflow");
 
         // 500B treasury + 50B reserve + 10B deployer + 10B team + 5B validator
         // + 10B deterministic faucet signer (R1/D-2) + 4×40M VALIDATOR-S1 stakers
@@ -909,13 +928,13 @@ mod tests {
         }
 
         // Verify deployer accounts
-        assert_eq!(config.accounts[13].balance, latt_to_wei(1_000_000));  // dev deployer
-        assert_eq!(config.accounts[14].balance, latt_to_wei(5_000_000));  // Saul deployer
+        assert_eq!(config.accounts[13].balance, latt_to_wei(1_000_000)); // dev deployer
+        assert_eq!(config.accounts[14].balance, latt_to_wei(5_000_000)); // Saul deployer
 
         // Verify system accounts
-        assert_eq!(config.accounts[0].balance, latt_to_wei(10_000_000));  // faucet
+        assert_eq!(config.accounts[0].balance, latt_to_wei(10_000_000)); // faucet
         assert_eq!(config.accounts[1].balance, latt_to_wei(100_000_000)); // treasury
-        assert_eq!(config.accounts[2].balance, latt_to_wei(50_000_000));  // ecosystem
+        assert_eq!(config.accounts[2].balance, latt_to_wei(50_000_000)); // ecosystem
     }
 
     #[test]
@@ -934,7 +953,7 @@ mod tests {
     #[test]
     fn test_team_testnet_genesis_total_preallocation() {
         let config = GenesisConfig::team_testnet_genesis();
-        let total = config.total_preallocation();
+        let total = config.total_preallocation().expect("no overflow");
         // 10M faucet + 100M treasury + 50M ecosystem + 10*100K validators + 1M dev deployer + 5M Larry deployer + 10M faucet key = 177M SALT
         let expected = latt_to_wei(177_000_000);
         assert_eq!(total, expected);
@@ -951,7 +970,10 @@ mod tests {
             nonce: 0,
             code: None,
         });
-        assert!(matches!(config.validate(), Err(GenesisError::ExceedsSupply)));
+        assert!(matches!(
+            config.validate(),
+            Err(GenesisError::ExceedsSupply)
+        ));
     }
 
     #[test]
@@ -965,7 +987,10 @@ mod tests {
             nonce: 0,
             code: None,
         });
-        assert!(matches!(config.validate(), Err(GenesisError::DuplicateAddress(_))));
+        assert!(matches!(
+            config.validate(),
+            Err(GenesisError::DuplicateAddress(_))
+        ));
     }
 
     /// WP-1.3: Genesis state root determinism test.
@@ -984,11 +1009,11 @@ mod tests {
         // Initialize two independent executors
         let state_db_1 = Arc::new(StateDB::new());
         let executor_1 = Arc::new(Executor::with_chain_id(state_db_1, config.chain_id));
-        let root_1 = initialize_shared_genesis_state(&executor_1, &config);
+        let root_1 = initialize_shared_genesis_state(&executor_1, &config).expect("valid genesis");
 
         let state_db_2 = Arc::new(StateDB::new());
         let executor_2 = Arc::new(Executor::with_chain_id(state_db_2, config.chain_id));
-        let root_2 = initialize_shared_genesis_state(&executor_2, &config);
+        let root_2 = initialize_shared_genesis_state(&executor_2, &config).expect("valid genesis");
 
         assert_eq!(
             root_1, root_2,
@@ -1016,7 +1041,8 @@ mod tests {
         // With model registration (via shared function)
         let state_db_with = Arc::new(StateDB::new());
         let executor_with = Arc::new(Executor::with_chain_id(state_db_with, config.chain_id));
-        let root_with = initialize_shared_genesis_state(&executor_with, &config);
+        let root_with =
+            initialize_shared_genesis_state(&executor_with, &config).expect("valid genesis");
 
         // Without model registration (manual account init only). Mirrors
         // {@link initialize_shared_genesis_state} EXACTLY for the account
@@ -1057,7 +1083,7 @@ mod tests {
         config.team_allocations.insert(team_member, team_amount);
 
         let expected = latt_to_wei(360_032_000) + team_amount;
-        assert_eq!(config.total_preallocation(), expected);
+        assert_eq!(config.total_preallocation().expect("no overflow"), expected);
     }
 
     #[test]
@@ -1076,7 +1102,7 @@ mod tests {
 
         let state_db = Arc::new(StateDB::new());
         let executor = Arc::new(Executor::with_chain_id(state_db, config.chain_id));
-        let _ = initialize_shared_genesis_state(&executor, &config);
+        let _ = initialize_shared_genesis_state(&executor, &config).expect("valid genesis");
 
         assert_eq!(executor.get_balance(&only_declared), latt_to_wei(123));
         assert_eq!(executor.get_balance(&HARDHAT_DEFAULT_ADDRESS), U256::zero());
@@ -1085,10 +1111,7 @@ mod tests {
             U256::zero()
         );
         assert_eq!(executor.get_balance(&SAUL_DEPLOYER_ADDRESS), U256::zero());
-        assert_eq!(
-            executor.get_balance(&FAUCET_SIGNER_ADDRESS),
-            U256::zero()
-        );
+        assert_eq!(executor.get_balance(&FAUCET_SIGNER_ADDRESS), U256::zero());
     }
 
     #[test]
@@ -1120,6 +1143,34 @@ mod tests {
     }
 
     #[test]
+    fn panic_s1_mainnet_constant_addresses_equal_their_hex_literals() {
+        // mainnet() used to parse these strings at runtime (with a panic path);
+        // the byte arrays that replaced them must be identical.
+        let cfg = GenesisConfig::mainnet();
+        assert_eq!(
+            address_from_hex("0x2222222222222222222222222222222222222222").unwrap(),
+            cfg.ecosystem_fund
+        );
+        assert_eq!(
+            Address([0x11; 20]),
+            address_from_hex("0x1111111111111111111111111111111111111111").unwrap()
+        );
+    }
+
+    #[test]
+    fn panic_s1_validate_rejects_overflowing_allocation_instead_of_panicking() {
+        let mut cfg = GenesisConfig::mainnet();
+        cfg.accounts.push(GenesisAccount {
+            address: Address([0xAB; 20]),
+            balance: U256::MAX,
+            nonce: 0,
+            code: None,
+        });
+        assert!(cfg.total_preallocation().is_none(), "sum overflows U256");
+        assert!(matches!(cfg.validate(), Err(GenesisError::ExceedsSupply)));
+    }
+
+    #[test]
     fn test_address_from_hex_valid() {
         let result = address_from_hex("0x0000000000000000000000000000000000000001");
         assert!(result.is_ok());
@@ -1132,14 +1183,12 @@ mod tests {
         // A genesis config with zero-balance accounts should be valid
         let config = GenesisConfig {
             chain_id: 40204,
-            accounts: vec![
-                GenesisAccount {
-                    address: Address([0x01; 20]),
-                    balance: U256::zero(),
-                    nonce: 0,
-                    code: None,
-                },
-            ],
+            accounts: vec![GenesisAccount {
+                address: Address([0x01; 20]),
+                balance: U256::zero(),
+                nonce: 0,
+                code: None,
+            }],
             treasury_address: Address([0x11; 20]),
             team_allocations: HashMap::new(),
             ecosystem_fund: Address([0x22; 20]),
@@ -1164,7 +1213,7 @@ mod tests {
     ///
     /// Acceptance: for each declared account, `get_balance` matches
     /// `account.balance` byte-for-byte; sum of observed balances equals
-    /// `config.total_preallocation()`.
+    /// `config.total_preallocation().expect("no overflow")`.
     #[test]
     fn test_p4_3_testnet_beta_declared_equals_initialized() {
         use citrate_execution::state::state_db::StateDB;
@@ -1176,7 +1225,7 @@ mod tests {
 
         let state_db = Arc::new(StateDB::new());
         let executor = Arc::new(Executor::with_chain_id(state_db, config.chain_id));
-        let _root = initialize_shared_genesis_state(&executor, &config);
+        let _root = initialize_shared_genesis_state(&executor, &config).expect("valid genesis");
 
         let mut total_observed = U256::zero();
         for account in &config.accounts {
@@ -1203,7 +1252,7 @@ mod tests {
         );
         assert_eq!(
             declared_total,
-            config.total_preallocation(),
+            config.total_preallocation().expect("no overflow"),
             "declared total must equal config.total_preallocation()"
         );
     }
@@ -1223,7 +1272,7 @@ mod tests {
 
         let state_db = Arc::new(StateDB::new());
         let executor = Arc::new(Executor::with_chain_id(state_db, config.chain_id));
-        let _root = initialize_shared_genesis_state(&executor, &config);
+        let _root = initialize_shared_genesis_state(&executor, &config).expect("valid genesis");
 
         let mut total_observed = U256::zero();
         for account in &config.accounts {
@@ -1245,6 +1294,9 @@ mod tests {
             .iter()
             .fold(U256::zero(), |acc, a| acc + a.balance);
         assert_eq!(declared_total, total_observed);
-        assert_eq!(declared_total, config.total_preallocation());
+        assert_eq!(
+            declared_total,
+            config.total_preallocation().expect("no overflow")
+        );
     }
 }
