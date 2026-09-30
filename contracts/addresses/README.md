@@ -78,6 +78,36 @@ The script reads every `broadcast/Deploy*.s.sol/40204/run-latest.json`
 against the committed copy; if it changes, commit + push, then run
 each consumer's `sync-addresses` script and open the one-file PRs.
 
+### Fresh-keys reroll (2026-09-29): book comes from the chain, not broadcasts
+
+The 2026-09-29 book was **not** produced by `emit-address-table.sh`. Its
+broadcast inputs were unreliable: some scripts were run more than once
+(a failed tunnel batch followed by a successful on-box batch), and some
+`run-latest.json` files were overwritten by an rsync. On top of that, the
+emitter falls back to stale addresses when a broadcast is missing.
+Simulating the deploy scripts doesn't work either: the governance / DPF /
+cit_agent / Quorum scripts use plain `new` (nonce-based CREATE), so a
+simulation now prints *next-nonce* addresses that have no code.
+
+Instead, the book is derived from the chain itself.
+`40204.provenance.json` records every transaction the deployer
+(`0xa3512bE8…`) sent on the fresh chain: nonces 0–115, contiguous, all
+with `status=1`. For each transaction it records the tx hash, block, the
+created address, and the forge artifact whose creation code prefixes the
+init code. It also marks each entry `canonical` or `orphan`, where an
+orphan is the leftover of a partial first run that a complete rerun
+superseded. The canonical instance was confirmed from on-chain wiring
+(ownership handover, constructor references). Anyone can re-verify any
+row with `cast receipt <tx>` / `cast code <address>` against
+`https://rpc.citrate.ai`.
+
+Where one contract type has several live instances, the book prefixes
+the key with its role. `AnchorRegistry` is the standalone instance that
+citrate-quorum's book test requires, and the others are
+`QuorumAnchorRegistry` and `CitAgentAnchorRegistry`. The cit_agent
+2-of-3 timelock is `CitAgentTimelock`. The coop pair and the `planned`
+coop block are absent because coop is not deployed on this chain yet.
+
 ## Adding a new contract
 
 When a new ceremony script adds a contract to chain 40204:
