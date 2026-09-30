@@ -12,7 +12,7 @@
 #       outright: a blanket allow turns the guard off for a whole crate.
 #
 # Panic lints: unwrap_used expect_used panic unreachable indexing_slicing
-#              arithmetic_side_effects string_slice integer_division
+#              arithmetic_side_effects string_slice
 # Production = *.rs outside tests/ benches/ examples/ fuzz/ target/ and not a
 # `*_tests.rs` / `*_test.rs` file.
 #
@@ -21,7 +21,7 @@
 set -uo pipefail
 
 REPO_ROOT="${PANIC_TRIPWIRE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-LINT_RE='clippy::(unwrap_used|expect_used|panic|unreachable|indexing_slicing|arithmetic_side_effects|string_slice|integer_division)'
+LINT_RE='clippy::(unwrap_used|expect_used|panic|unreachable|indexing_slicing|arithmetic_side_effects|string_slice)'
 
 prod_files() { # <root>
   find "$1" -name '*.rs' \

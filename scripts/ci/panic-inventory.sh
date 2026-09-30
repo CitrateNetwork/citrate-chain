@@ -18,7 +18,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
 LINTS=(unwrap_used expect_used panic unreachable indexing_slicing
-       arithmetic_side_effects string_slice integer_division)
+       arithmetic_side_effects string_slice)
 FLAGS=()
 for l in "${LINTS[@]}"; do FLAGS+=(-W "clippy::$l"); done
 

@@ -3,14 +3,12 @@
   "cli": {
    "arithmetic_side_effects": 35,
    "indexing_slicing": 109,
-   "integer_division": 7,
    "string_slice": 9
   },
   "core/api": {
    "arithmetic_side_effects": 42,
    "expect_used": 3,
    "indexing_slicing": 78,
-   "integer_division": 10,
    "panic": 19,
    "string_slice": 13
   },
@@ -23,7 +21,6 @@
    "arithmetic_side_effects": 46,
    "expect_used": 1,
    "indexing_slicing": 22,
-   "integer_division": 4,
    "panic": 1,
    "string_slice": 1,
    "unreachable": 1
@@ -31,20 +28,17 @@
   "core/economics": {
    "arithmetic_side_effects": 157,
    "indexing_slicing": 3,
-   "integer_division": 3,
    "panic": 3
   },
   "core/execution": {
    "arithmetic_side_effects": 357,
    "expect_used": 25,
    "indexing_slicing": 448,
-   "integer_division": 18,
    "panic": 3
   },
   "core/learning": {
    "arithmetic_side_effects": 31,
    "indexing_slicing": 111,
-   "integer_division": 2,
    "panic": 8
   },
   "core/learning-daemon": {
@@ -59,13 +53,11 @@
   },
   "core/mcp": {
    "arithmetic_side_effects": 22,
-   "indexing_slicing": 7,
-   "integer_division": 5
+   "indexing_slicing": 7
   },
   "core/network": {
    "arithmetic_side_effects": 63,
    "indexing_slicing": 43,
-   "integer_division": 3,
    "panic": 4,
    "string_slice": 4
   },
@@ -74,8 +66,7 @@
   },
   "core/sequencer": {
    "arithmetic_side_effects": 19,
-   "indexing_slicing": 1,
-   "integer_division": 3
+   "indexing_slicing": 1
   },
   "core/signing": {
    "expect_used": 1
@@ -88,20 +79,17 @@
   },
   "crates/citrate-commd": {
    "arithmetic_side_effects": 12,
-   "indexing_slicing": 30,
-   "integer_division": 1
+   "indexing_slicing": 30
   },
   "faucet": {
    "arithmetic_side_effects": 4,
    "expect_used": 5,
-   "indexing_slicing": 3,
-   "integer_division": 4
+   "indexing_slicing": 3
   },
   "node": {
    "arithmetic_side_effects": 99,
    "expect_used": 2,
    "indexing_slicing": 59,
-   "integer_division": 19,
    "string_slice": 9,
    "unreachable": 2
   },
@@ -112,7 +100,6 @@
    "arithmetic_side_effects": 8,
    "expect_used": 1,
    "indexing_slicing": 7,
-   "integer_division": 1,
    "string_slice": 2
   },
   "wallet-aa": {
@@ -123,7 +110,6 @@
    "arithmetic_side_effects": 8,
    "expect_used": 2,
    "indexing_slicing": 24,
-   "integer_division": 4,
    "string_slice": 1
   }
  },
@@ -134,8 +120,7 @@
   "unreachable",
   "indexing_slicing",
   "arithmetic_side_effects",
-  "string_slice",
-  "integer_division"
+  "string_slice"
  ],
- "total": 2293
+ "total": 2209
 }

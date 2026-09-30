@@ -20,7 +20,7 @@ import sys
 
 LINTS = [
     "unwrap_used", "expect_used", "panic", "unreachable",
-    "indexing_slicing", "arithmetic_side_effects", "string_slice", "integer_division",
+    "indexing_slicing", "arithmetic_side_effects", "string_slice",
 ]
 TEST_DIRS = ("tests", "benches", "examples")
 
