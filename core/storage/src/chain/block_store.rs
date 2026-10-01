@@ -39,7 +39,7 @@ const REWARD_SNAPSHOT_AT_PREFIX: &[u8] = b"reward_snapshot_at:";
 
 /// Build the per-epoch reward-snapshot key for snapshot height S(E).
 fn reward_snapshot_at_key(snapshot_height: u64) -> Vec<u8> {
-    let mut k = Vec::with_capacity(REWARD_SNAPSHOT_AT_PREFIX.len() + 8);
+    let mut k = Vec::with_capacity(REWARD_SNAPSHOT_AT_PREFIX.len().saturating_add(8));
     k.extend_from_slice(REWARD_SNAPSHOT_AT_PREFIX);
     k.extend_from_slice(&snapshot_height.to_be_bytes());
     k
@@ -267,8 +267,11 @@ impl BlockStore {
         // Iterate through height mappings to find the highest
         let mut max_height = 0u64;
         for (key, _) in self.db.iter_cf(CF_METADATA)? {
-            if key.len() == 9 && key[0] == b'h' {
-                let height = u64::from_be_bytes(key[1..9].try_into()?);
+            if let Some((b'h', h)) = key.split_first() {
+                let Ok(height_bytes) = <[u8; 8]>::try_from(h) else {
+                    continue;
+                };
+                let height = u64::from_be_bytes(height_bytes);
                 max_height = max_height.max(height);
             }
         }
@@ -287,7 +290,7 @@ impl BlockStore {
                     }
                 }
             }
-            max_height -= 1;
+            max_height = max_height.saturating_sub(1); // loop guard: max_height > 0
         }
         Ok(max_height)
     }
@@ -345,15 +348,16 @@ impl BlockStore {
     pub fn get_applied_tip(&self) -> Result<Option<(Hash, u64)>> {
         match self.db.get_cf(CF_METADATA, APPLIED_TIP_KEY)? {
             Some(bytes) if bytes.len() >= 40 => {
-                let hash = match Hash::try_from_bytes(&bytes[..32]) {
+                let hash = match Hash::try_from_bytes(&bytes) {
                     Some(h) => h,
                     None => return Ok(None),
                 };
-                let height = u64::from_be_bytes(
-                    bytes[32..40]
-                        .try_into()
-                        .expect("40-byte buffer sliced to 8 bytes"),
-                );
+                let Some(height_bytes) =
+                    bytes.get(32..40).and_then(|s| <[u8; 8]>::try_from(s).ok())
+                else {
+                    return Ok(None);
+                };
+                let height = u64::from_be_bytes(height_bytes);
                 Ok(Some((hash, height)))
             }
             _ => Ok(None),
@@ -391,11 +395,11 @@ impl BlockStore {
         let mut parents_with_children = HashSet::new();
         for (key, value) in self.db.iter_cf(CF_DAG_RELATIONS)? {
             let key_bytes = key.as_ref();
-            if key_bytes.len() == 33 && key_bytes[0] == b'c' && !value.is_empty() {
+            if key_bytes.len() == 33 && key_bytes.first() == Some(&b'c') && !value.is_empty() {
                 // SECREM-01 CONS-6: key length checked above (33), so the
                 // 32-byte tail is sound; use the fallible decode anyway to
                 // keep the no-panic invariant uniform across this module.
-                if let Some(parent_hash) = Hash::try_from_bytes(&key_bytes[1..]) {
+                if let Some(parent_hash) = key_bytes.get(1..).and_then(Hash::try_from_bytes) {
                     parents_with_children.insert(parent_hash);
                 }
             }

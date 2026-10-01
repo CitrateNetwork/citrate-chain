@@ -72,9 +72,7 @@ impl AIStateTree {
         hasher.update(inference_root.as_bytes());
         hasher.update(lora_root.as_bytes());
 
-        let hash_bytes = hasher.finalize();
-        let mut hash_array = [0u8; 32];
-        hash_array.copy_from_slice(&hash_bytes[..32]);
+        let hash_array: [u8; 32] = hasher.finalize().into();
         Ok(Hash::new(hash_array))
     }
 
@@ -108,9 +106,7 @@ impl AIStateTree {
             hasher.update(model_state.usage_stats.total_gas_used.to_le_bytes());
         }
 
-        let hash_bytes = hasher.finalize();
-        let mut hash_array = [0u8; 32];
-        hash_array.copy_from_slice(&hash_bytes[..32]);
+        let hash_array: [u8; 32] = hasher.finalize().into();
         Ok(Hash::new(hash_array))
     }
 
@@ -148,9 +144,7 @@ impl AIStateTree {
             hasher.update([status_byte]);
         }
 
-        let hash_bytes = hasher.finalize();
-        let mut hash_array = [0u8; 32];
-        hash_array.copy_from_slice(&hash_bytes[..32]);
+        let hash_array: [u8; 32] = hasher.finalize().into();
         Ok(Hash::new(hash_array))
     }
 
@@ -177,9 +171,7 @@ impl AIStateTree {
             }
         }
 
-        let hash_bytes = hasher.finalize();
-        let mut hash_array = [0u8; 32];
-        hash_array.copy_from_slice(&hash_bytes[..32]);
+        let hash_array: [u8; 32] = hasher.finalize().into();
         Ok(Hash::new(hash_array))
     }
 
@@ -206,9 +198,7 @@ impl AIStateTree {
             }
         }
 
-        let hash_bytes = hasher.finalize();
-        let mut hash_array = [0u8; 32];
-        hash_array.copy_from_slice(&hash_bytes[..32]);
+        let hash_array: [u8; 32] = hasher.finalize().into();
         Ok(Hash::new(hash_array))
     }
 
@@ -252,16 +242,17 @@ impl AIStateTree {
         hasher.update(model_id.0.as_bytes());
         hasher.update(input_hash.as_bytes());
 
-        let hash_bytes = hasher.finalize();
-        let mut hash_array = [0u8; 32];
-        hash_array.copy_from_slice(&hash_bytes[..32]);
+        let hash_array: [u8; 32] = hasher.finalize().into();
         Hash::new(hash_array)
     }
 
     /// Prune old inference cache entries
     pub fn prune_inference_cache(&mut self, max_age: u64, current_time: u64) {
         self.inference_cache
-            .retain(|_, result| current_time - result.timestamp < max_age);
+            // PANIC-S1: a cache entry stamped later than `current_time` (clock skew,
+            // block-time vs wall-time) used to underflow and panic here. Treat it as
+            // age 0 (keep it) instead.
+            .retain(|_, result| current_time.saturating_sub(result.timestamp) < max_age);
     }
 }
 

@@ -47,9 +47,7 @@ impl StateManager {
         hasher.update(storage_root.as_bytes());
         hasher.update(ai_root.as_bytes());
 
-        let hash_bytes = hasher.finalize();
-        let mut hash_array = [0u8; 32];
-        hash_array.copy_from_slice(&hash_bytes[..32]);
+        let hash_array: [u8; 32] = hasher.finalize().into();
 
         let unified_root = Hash::new(hash_array);
 
@@ -83,9 +81,7 @@ impl StateManager {
             hasher.update(account.code_hash.as_bytes());
         }
 
-        let hash_bytes = hasher.finalize();
-        let mut hash_array = [0u8; 32];
-        hash_array.copy_from_slice(&hash_bytes[..32]);
+        let hash_array: [u8; 32] = hasher.finalize().into();
         Ok(Hash::new(hash_array))
     }
 
@@ -113,9 +109,7 @@ impl StateManager {
             hasher.update(value.as_bytes());
         }
 
-        let hash_bytes = hasher.finalize();
-        let mut hash_array = [0u8; 32];
-        hash_array.copy_from_slice(&hash_bytes[..32]);
+        let hash_array: [u8; 32] = hasher.finalize().into();
         Ok(Hash::new(hash_array))
     }
 

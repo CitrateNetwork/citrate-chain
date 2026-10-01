@@ -29,6 +29,7 @@
 // the desktop-node workload this mode targets. Key rotation (wipe-and-
 // resync with a new key) resets the count.
 
+use super::bytes::Reader;
 use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
@@ -347,7 +348,8 @@ impl EncryptionMeta {
                 std::fs::File::create(&tmp).map_err(|e| AtRestError::MetaIo(e.to_string()))?;
             f.write_all(json.as_bytes())
                 .map_err(|e| AtRestError::MetaIo(e.to_string()))?;
-            f.sync_all().map_err(|e| AtRestError::MetaIo(e.to_string()))?;
+            f.sync_all()
+                .map_err(|e| AtRestError::MetaIo(e.to_string()))?;
         }
         std::fs::rename(&tmp, Self::path(data_dir))
             .map_err(|e| AtRestError::MetaIo(e.to_string()))?;
@@ -357,9 +359,8 @@ impl EncryptionMeta {
     fn commitment_bytes(&self) -> Result<[u8; 32], AtRestError> {
         let raw = hex::decode(&self.key_commitment)
             .map_err(|e| AtRestError::InvalidMeta(format!("invalid key_commitment hex: {e}")))?;
-        raw.try_into().map_err(|_| {
-            AtRestError::InvalidMeta("key_commitment must be 32 bytes".to_string())
-        })
+        raw.try_into()
+            .map_err(|_| AtRestError::InvalidMeta("key_commitment must be 32 bytes".to_string()))
     }
 }
 
@@ -496,8 +497,8 @@ impl AtRestCipher {
         // for domain separation (citrate-comms EncryptedStore pattern).
         let context = format!("{CF_KEY_CONTEXT_PREFIX}{cf}");
         let subkey = blake3::derive_key(&context, master);
-        // 32-byte key length is correct by construction.
-        Aes256Gcm::new_from_slice(&subkey).expect("AES-256-GCM accepts 32-byte keys")
+        // `subkey` is a [u8; 32]: the fixed-size constructor is infallible (no expect).
+        Aes256Gcm::new(&subkey.into())
     }
 
     fn cipher_for(&self, cf: &str) -> Aes256Gcm {
@@ -511,7 +512,8 @@ impl AtRestCipher {
     /// AAD = column family || 0x00 || record key: binds each ciphertext to
     /// its exact location in the database.
     fn aad(cf: &str, record_key: &[u8]) -> Vec<u8> {
-        let mut aad = Vec::with_capacity(cf.len() + 1 + record_key.len());
+        let mut aad =
+            Vec::with_capacity(cf.len().saturating_add(1).saturating_add(record_key.len()));
         aad.extend_from_slice(cf.as_bytes());
         aad.push(0x00);
         aad.extend_from_slice(record_key);
@@ -519,7 +521,12 @@ impl AtRestCipher {
     }
 
     /// Encrypt a value for storage under (cf, record_key).
-    pub fn seal(&self, cf: &str, record_key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, AtRestError> {
+    pub fn seal(
+        &self,
+        cf: &str,
+        record_key: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, AtRestError> {
         let cipher = self.cipher_for(cf);
 
         // thread_rng is a CSPRNG (ChaCha12, periodically reseeded from the
@@ -539,7 +546,7 @@ impl AtRestCipher {
             )
             .map_err(|_| AtRestError::EncryptFailed(cf.to_string()))?;
 
-        let mut out = Vec::with_capacity(VALUE_PREFIX_LEN + ciphertext.len());
+        let mut out = Vec::with_capacity(VALUE_PREFIX_LEN.saturating_add(ciphertext.len()));
         out.extend_from_slice(&QSSP_MAGIC);
         out.push(AT_REST_VALUE_VERSION);
         out.push(AT_REST_ALG_AES_256_GCM);
@@ -561,27 +568,30 @@ impl AtRestCipher {
         record_key: &[u8],
         stored: &[u8],
     ) -> Result<Vec<u8>, AtRestError> {
-        if stored.len() < 4 || stored[0..4] != QSSP_MAGIC {
+        if !stored.starts_with(&QSSP_MAGIC) {
             return Err(AtRestError::NotEncrypted(cf.to_string()));
         }
         if stored.len() < MIN_SEALED_LEN {
             return Err(AtRestError::DecryptFailed(cf.to_string()));
         }
-        let version = stored[4];
-        let algorithm = stored[5];
+        let failed = || AtRestError::DecryptFailed(cf.to_string());
+        let mut r = Reader::new(stored);
+        let _magic: [u8; 4] = r.array().ok_or_else(failed)?;
+        let version = r.u8().ok_or_else(failed)?;
+        let algorithm = r.u8().ok_or_else(failed)?;
         if version != AT_REST_VALUE_VERSION || algorithm != AT_REST_ALG_AES_256_GCM {
             return Err(AtRestError::UnsupportedFormat(version, algorithm));
         }
 
         let cipher = self.cipher_for(cf);
-        let nonce = &stored[6..6 + 12];
+        let nonce: [u8; 12] = r.array().ok_or_else(failed)?;
         let aad = Self::aad(cf, record_key);
 
         let plaintext = cipher
             .decrypt(
-                Nonce::from_slice(nonce),
+                Nonce::from_slice(&nonce),
                 Payload {
-                    msg: &stored[VALUE_PREFIX_LEN..],
+                    msg: r.rest(),
                     aad: &aad,
                 },
             )
@@ -598,8 +608,8 @@ impl AtRestCipher {
     /// Check whether stored bytes carry the at-rest envelope prefix.
     pub fn looks_sealed(stored: &[u8]) -> bool {
         stored.len() >= MIN_SEALED_LEN
-            && stored[0..4] == QSSP_MAGIC
-            && stored[4] == AT_REST_VALUE_VERSION
+            && stored.starts_with(&QSSP_MAGIC)
+            && stored.get(4) == Some(&AT_REST_VALUE_VERSION)
     }
 
     /// Key commitment of the active key (matches `encryption.meta`).
@@ -767,8 +777,8 @@ mod tests {
 
         // Wrong key is rejected at open.
         let wrong = EncryptionAtRestConfig::with_raw_key([4u8; 32]);
-        let err = AtRestCipher::open_or_init(tmp.path(), &wrong)
-            .expect_err("wrong key must be rejected");
+        let err =
+            AtRestCipher::open_or_init(tmp.path(), &wrong).expect_err("wrong key must be rejected");
         assert!(matches!(err, AtRestError::WrongKey));
     }
 
