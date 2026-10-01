@@ -69,9 +69,9 @@
    "indexing_slicing": 3
   },
   "node": {
-   "arithmetic_side_effects": 99,
-   "expect_used": 2,
-   "indexing_slicing": 59,
+   "arithmetic_side_effects": 67,
+   "expect_used": 1,
+   "indexing_slicing": 34,
    "string_slice": 9,
    "unreachable": 2
   },
@@ -104,5 +104,5 @@
   "arithmetic_side_effects",
   "string_slice"
  ],
- "total": 1481
+ "total": 1423
 }

@@ -15,7 +15,11 @@ import re
 import sys
 
 T1_CRATES = {"core/execution", "core/consensus", "core/storage",
-             "core/primitives", "core/bridge", "crates/citrate-commd", "crates/citrate-commd-fold"}
+             "crates/citrate-commd", "crates/citrate-commd-fold"}
+# Not linked into the node binary (PANIC-S1 WP-3 triage): core/bridge has no
+# dependent crate; core/primitives is the unused `cargo new` template (`add`),
+# depended on only by experiment-runner. T3 + CLEAN-S1.
+UNLINKED_CRATES = {"core/bridge", "core/primitives"}
 T2_CRATES = {"core/network", "core/api", "core/sequencer", "core/mcp", "core/marketplace", "core/signing"}
 NODE_T1 = re.compile(r"node/src/(canonical_apply|producer|block_|import|registry_sync|sync|state_)")
 NODE_T2 = re.compile(r"node/src/(rpc|p2p|network|mempool|gossip)")
@@ -45,12 +49,21 @@ def tier(s):
     c, f = s["crate"], s["file"]
     if c == "core/economics":
         return "T1" if f in ECONOMICS_T1_FILES else "T2"
+    # The IPFS client (model/artifact pinning) is node-local, not on the block
+    # apply path; its failures never touch consensus state.
+    if f.startswith("core/storage/src/ipfs/"):
+        return "T2"
     if c == "core/execution":
         if f == "core/execution/src/metrics.rs":
             return "T3"
         return "T2" if EXECUTION_UNREACHABLE.search(f) else "T1"
+    if c in UNLINKED_CRATES:
+        return "T3"
     if c == "node":
         if "/bin/" in f:
+            return "T3"
+        # Private module, never imported (its re-export is commented out): dead.
+        if f == "node/src/sync/efficient_sync.rs":
             return "T3"
         return "T1" if NODE_T1.search(f) else ("T2" if NODE_T2.search(f) else "T3")
     if c in T1_CRATES:
