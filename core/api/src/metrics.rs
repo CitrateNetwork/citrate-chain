@@ -4,11 +4,10 @@ use once_cell::sync::Lazy;
 use prometheus::{register_int_counter_vec, register_int_gauge, IntCounterVec, IntGauge};
 
 /// Unwrap a metric registration.
-// INVARIANT: every metric name, help string and label set passed here is a
-// compile-time constant, and names are unique process-wide, so registration in
-// the default registry cannot fail at runtime. Test
-// `panic_s1_every_metric_registers_once` forces every metric in this crate to
-// register in one process and fails on any duplicate or invalid definition.
+// Every metric name, help string and label set passed here is a compile-time
+// constant and names are unique process-wide, so registration in the default
+// registry cannot fail at runtime.
+// INVARIANT: constant, unique metric definitions (test: panic_s1_every_metric_registers_once)
 #[allow(clippy::panic)]
 pub(crate) fn must<T>(registration: prometheus::Result<T>, what: &str) -> T {
     registration.unwrap_or_else(|e| panic!("{what}: {e}"))
