@@ -49,6 +49,10 @@ def tier(s):
     c, f = s["crate"], s["file"]
     if c == "core/economics":
         return "T1" if f in ECONOMICS_T1_FILES else "T2"
+    # The IPFS client (model/artifact pinning) is node-local, not on the block
+    # apply path; its failures never touch consensus state.
+    if f.startswith("core/storage/src/ipfs/"):
+        return "T2"
     if c == "core/execution":
         if f == "core/execution/src/metrics.rs":
             return "T3"
