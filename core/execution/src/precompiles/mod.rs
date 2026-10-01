@@ -1052,10 +1052,14 @@ impl PrecompileExecutor {
 /// vector. Mirrors Geth's pattern: `if signature.s_normalized() !=
 /// signature.s() { reject }`.
 pub fn recover_address(hash: &[u8], r: &[u8], s: &[u8], recovery_id: u8) -> Option<[u8; 20]> {
-    // Create signature from r and s components
+    // Create signature from r and s components. Each must be exactly 32 bytes;
+    // anything else is not a signature (previously a `copy_from_slice` panic).
+    let r: &[u8; 32] = r.try_into().ok()?;
+    let s: &[u8; 32] = s.try_into().ok()?;
     let mut sig_bytes = [0u8; 64];
-    sig_bytes[..32].copy_from_slice(r);
-    sig_bytes[32..].copy_from_slice(s);
+    let (sig_r, sig_s) = sig_bytes.split_at_mut(32);
+    sig_r.copy_from_slice(r);
+    sig_s.copy_from_slice(s);
 
     let signature = Signature::from_bytes((&sig_bytes).into()).ok()?;
 
@@ -1077,20 +1081,13 @@ pub fn recover_address(hash: &[u8], r: &[u8], s: &[u8], recovery_id: u8) -> Opti
     let pubkey_uncompressed = pubkey_bytes.as_bytes();
 
     // Skip the 0x04 prefix and hash the 64 bytes of the public key
-    if pubkey_uncompressed.len() != 65 {
-        return None;
-    }
+    let [_prefix, xy @ ..]: &[u8; 65] = pubkey_uncompressed.try_into().ok()?;
 
-    // Keccak256 hash of the public key (without the 0x04 prefix)
-    let mut hasher = Keccak256::new();
-    hasher.update(&pubkey_uncompressed[1..65]);
-    let hash_result = hasher.finalize();
-
-    // Take last 20 bytes as the address
-    let mut address = [0u8; 20];
-    address.copy_from_slice(&hash_result[12..32]);
-
-    Some(address)
+    // Keccak256 hash of the public key (without the 0x04 prefix); the address is
+    // its last 20 bytes.
+    let hash_result: [u8; 32] = Keccak256::digest(xy).into();
+    let (_, address) = hash_result.split_at(12);
+    address.try_into().ok()
 }
 
 /// Result from precompile execution
@@ -1928,5 +1925,14 @@ mod tests {
                 "0x01{selector:02x} must be refused by execute_pure (got: {err})"
             );
         }
+    }
+
+    /// PANIC-S1: wrong-length r/s is "no signature", never a panic.
+    #[test]
+    fn panic_s1_recover_address_rejects_wrong_length_components() {
+        let h = [7u8; 32];
+        assert_eq!(recover_address(&h, &[1u8; 31], &[1u8; 32], 0), None);
+        assert_eq!(recover_address(&h, &[1u8; 32], &[1u8; 33], 0), None);
+        assert_eq!(recover_address(&h, &[], &[], 0), None);
     }
 }
