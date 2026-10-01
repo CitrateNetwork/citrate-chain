@@ -25,6 +25,20 @@
 //! identical whether learning is enabled or disabled. This is verified by
 //! property-based tests in the `safety` module.
 
+// PANIC-S1 G2: production code in this crate may not panic (tests excepted).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 pub mod adapters;
 pub mod aggregation;
 pub mod belnap;

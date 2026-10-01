@@ -122,18 +122,18 @@ impl ProfileComputer {
 
     /// Record that this node observed (produced or validated) a block.
     pub fn record_block(&mut self) {
-        self.blocks_seen += 1;
-        self.blocks_total += 1;
+        self.blocks_seen = self.blocks_seen.saturating_add(1);
+        self.blocks_total = self.blocks_total.saturating_add(1);
     }
 
     /// Record that this node missed a block (was offline or slow).
     pub fn record_missed_block(&mut self) {
-        self.blocks_total += 1;
+        self.blocks_total = self.blocks_total.saturating_add(1);
     }
 
     /// Record that this node created and shared an adapter.
     pub fn record_adapter_created(&mut self) {
-        self.adapters_created += 1;
+        self.adapters_created = self.adapters_created.saturating_add(1);
     }
 
     /// Add a domain to the active set without recording an inference.
@@ -163,7 +163,12 @@ impl ProfileComputer {
         let latency_ms = if self.latencies.is_empty() {
             0
         } else {
-            self.latencies.iter().sum::<u64>() / self.latencies.len() as u64
+            // Saturating sum: an iterator `sum()` overflow panics under overflow-checks.
+            self.latencies
+                .iter()
+                .fold(0u64, |acc, &l| acc.saturating_add(l))
+                .checked_div(self.latencies.len() as u64)
+                .unwrap_or(0)
         };
 
         let uptime = if self.blocks_total == 0 {

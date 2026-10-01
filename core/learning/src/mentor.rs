@@ -91,8 +91,8 @@ pub fn select_mentors(
     // Top half are potential mentors; bottom half potential mentees.
     // When the count is odd, the middle node falls into the mentee set.
     let midpoint = sorted.len() / 2;
-    let potential_mentors = &sorted[..midpoint.max(1)];
-    let potential_mentees = &sorted[midpoint..];
+    let potential_mentors = sorted.get(..midpoint.max(1)).unwrap_or(&sorted);
+    let potential_mentees = sorted.get(midpoint..).unwrap_or_default();
 
     for (mentee_key, mentee_profile) in potential_mentees {
         let mut best: Option<(PublicKey, f64, Vec<String>)> = None;
@@ -137,7 +137,10 @@ pub fn select_mentors(
         }
 
         if let Some((mentor_key, score, shared)) = best {
-            *mentor_load.entry(mentor_key).or_insert(0) += 1;
+            {
+                let load = mentor_load.entry(mentor_key).or_insert(0);
+                *load = load.saturating_add(1);
+            }
 
             let Some(mentor_profile) = potential_mentors
                 .iter()
@@ -303,7 +306,7 @@ pub fn validate_pairing(
     }
     // u32 + u32 fits in u64 — promote to avoid wraparound on
     // adversarial inputs.
-    let combined = mentee_acc_q16 as u64 + min_accuracy_gap_q16 as u64;
+    let combined = (mentee_acc_q16 as u64).saturating_add(min_accuracy_gap_q16 as u64);
     if (mentor_acc_q16 as u64) <= combined {
         return PairingValidity::AccuracyGapTooSmall;
     }

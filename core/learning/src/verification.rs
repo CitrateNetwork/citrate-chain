@@ -73,7 +73,7 @@ impl ByzantineDetector {
             });
         }
 
-        let dim = embeddings[0].dim();
+        let dim = embeddings.first().map_or(0, |e| e.dim());
         let mut sum = EmbeddingVector::zeros(dim);
         for e in embeddings {
             sum = sum.add(e)?;
@@ -173,7 +173,7 @@ impl ByzantineDetector {
             .iter()
             .map(|d| (d - mean_dist) * (d - mean_dist))
             .sum::<f32>()
-            / (distances.len() - 1) as f32;
+            / distances.len().saturating_sub(1) as f32;
 
         Ok(variance.sqrt())
     }

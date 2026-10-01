@@ -383,10 +383,7 @@ pub fn compute_learning_root(
     // Domain separation: checkpoint height
     hasher.update(checkpoint_height.to_le_bytes());
 
-    let hash_bytes = hasher.finalize();
-    let mut result = [0u8; 32];
-    result.copy_from_slice(&hash_bytes[..32]);
-    result
+    hasher.finalize().into()
 }
 
 // ---------------------------------------------------------------------------
@@ -455,7 +452,7 @@ impl PeerProfileStore {
 
         // Prune old checkpoints if limit exceeded
         if self.max_checkpoints > 0 && self.known_heights.len() > self.max_checkpoints {
-            let prune_count = self.known_heights.len() - self.max_checkpoints;
+            let prune_count = self.known_heights.len().saturating_sub(self.max_checkpoints);
             let heights_to_remove: Vec<u64> =
                 self.known_heights.drain(..prune_count).collect();
             for h in &heights_to_remove {

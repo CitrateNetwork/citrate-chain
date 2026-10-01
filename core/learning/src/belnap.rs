@@ -165,6 +165,11 @@ pub fn softmax_weights(blue_scores: &[f32], temperature: f32) -> Vec<f32> {
 /// Panics if embeddings/confidences/blue_scores lengths don't match, or if any
 /// confidence slice length doesn't match the embedding dimension.
 #[allow(clippy::needless_range_loop)]
+// The asserts at the top of this function establish n == confidences.len() ==
+// blue_scores.len() (== weights.len()) and that every embedding and confidence row
+// has `dim` entries, so every `[i]`, `[k]` (< n) and `[j]` (< dim) index is in range.
+// INVARIANT: shapes asserted on entry (test: panic_s1_aggregation_bit_exact)
+#[allow(clippy::indexing_slicing)]
 pub fn classify_belnap(
     embeddings: &[&EmbeddingVector],
     confidences: &[&[f32]],
@@ -338,10 +343,10 @@ pub fn blue_scores_to_trust_weights(blue_scores: &[u64], temperature: f32) -> Ve
 ///
 /// Panics (debug only) if participant rows have inconsistent lengths.
 pub fn reduce_belnap_states(classifications: &[Vec<BelnapValue>]) -> Vec<BelnapValue> {
-    if classifications.is_empty() {
+    let Some(first) = classifications.first() else {
         return vec![];
-    }
-    let dim = classifications[0].len();
+    };
+    let dim = first.len();
     debug_assert!(
         classifications.iter().all(|row| row.len() == dim),
         "all participant classification rows must have equal length"
@@ -349,8 +354,8 @@ pub fn reduce_belnap_states(classifications: &[Vec<BelnapValue>]) -> Vec<BelnapV
 
     let mut state = vec![BelnapValue::Neither; dim];
     for row in classifications {
-        for j in 0..dim {
-            state[j] = state[j].join(row[j]);
+        for (s, &v) in state.iter_mut().zip(row) {
+            *s = s.join(v);
         }
     }
     state

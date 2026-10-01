@@ -168,20 +168,20 @@ impl<'a> AggregationInput<'a> {
                 ),
             });
         }
-        let dim = self.embeddings[0].dim();
-        for (i, emb) in self.embeddings.iter().enumerate() {
+        let dim = self.embeddings.first().map_or(0, |e| e.dim());
+        for (i, (emb, conf)) in self.embeddings.iter().zip(self.confidences).enumerate() {
             if emb.dim() != dim {
                 return Err(LearningError::DimensionMismatch {
                     expected: dim,
                     got: emb.dim(),
                 });
             }
-            if self.confidences[i].len() != dim {
+            if conf.len() != dim {
                 return Err(LearningError::AggregationFailed {
                     reason: format!(
                         "participant {} confidence dim {} != embedding dim {}",
                         i,
-                        self.confidences[i].len(),
+                        conf.len(),
                         dim
                     ),
                 });
@@ -215,7 +215,6 @@ impl ParaconsistentAggregator {
     /// 3. Reduce to consensus state vector via join across participants
     /// 4. Compute confidence-weighted embedding: `e_agg[j] = Σ(wᵢ · cᵢⱼ · eᵢⱼ) / Σ(wᵢ · cᵢⱼ)`
     /// 5. L2-normalize and return
-    #[allow(clippy::needless_range_loop)]
     pub fn aggregate_paraconsistent(
         &self,
         input: &AggregationInput<'_>,
@@ -230,7 +229,7 @@ impl ParaconsistentAggregator {
             });
         }
 
-        let dim = input.embeddings[0].dim();
+        let dim = input.embeddings.first().map_or(0, |e| e.dim());
         if dim != self.expected_dim {
             return Err(LearningError::DimensionMismatch {
                 expected: self.expected_dim,
@@ -270,22 +269,31 @@ impl ParaconsistentAggregator {
         let mut numerator = vec![0.0f32; dim];
         let mut denominator = vec![0.0f32; dim];
 
-        for i in 0..n {
-            let w_i = trust_weights[i];
-            for j in 0..dim {
-                let c_ij = input.confidences[i][j].clamp(0.0, 1.0);
-                let effective_weight = w_i * c_ij;
-                numerator[j] += effective_weight * input.embeddings[i].data[j];
-                denominator[j] += effective_weight;
+        // validate() checked every participant has `dim` embedding and confidence
+        // entries; same i-outer / j-inner accumulation order as indexed loops.
+        for ((&w_i, conf), emb) in trust_weights
+            .iter()
+            .zip(input.confidences)
+            .zip(input.embeddings)
+        {
+            for (((num, den), &c), &e) in numerator
+                .iter_mut()
+                .zip(denominator.iter_mut())
+                .zip(conf.iter())
+                .zip(&emb.data)
+            {
+                let effective_weight = w_i * c.clamp(0.0, 1.0);
+                *num += effective_weight * e;
+                *den += effective_weight;
             }
         }
 
         let mut e_agg_data = vec![0.0f32; dim];
         let mut total_effective_weight = 0.0f32;
-        for j in 0..dim {
-            if denominator[j] > f32::EPSILON {
-                e_agg_data[j] = numerator[j] / denominator[j];
-                total_effective_weight += denominator[j];
+        for ((out, &num), &den) in e_agg_data.iter_mut().zip(&numerator).zip(&denominator) {
+            if den > f32::EPSILON {
+                *out = num / den;
+                total_effective_weight += den;
             }
         }
 
@@ -681,5 +689,51 @@ mod proptests {
             prop_assert_eq!(result.state_vector[target_j], BelnapValue::Both,
                 "disagreement at dim {} should produce Both", target_j);
         }
+    }
+
+    /// PANIC-S1: bit-exact fingerprint over paraconsistent aggregation, Belnap
+    /// classification and state reduction. Recorded on the pre-conversion code.
+    fn aggregation_fingerprint() -> String {
+        use crate::belnap::{classify_belnap, reduce_belnap_states, BelnapValue};
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut feed = |bytes: &[u8]| {
+            for &b in bytes {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        let dim = 5;
+        for round in 0..20u32 {
+            let embs: Vec<EmbeddingVector> = (0..4u32)
+                .map(|p| EmbeddingVector::new((0..dim).map(|j| ((round * 3 + p * 5 + j as u32 * 7) % 13) as f32 / 6.5 - 1.0).collect()).unwrap())
+                .collect();
+            let confs: Vec<Vec<f32>> = (0..4u32)
+                .map(|p| (0..dim).map(|j| ((round + p * 2 + j as u32) % 10) as f32 / 9.0).collect())
+                .collect();
+            let er: Vec<&EmbeddingVector> = embs.iter().collect();
+            let cr: Vec<&[f32]> = confs.iter().map(|c| c.as_slice()).collect();
+            let blue: Vec<f32> = (0..4u32).map(|p| (round + p) as f32).collect();
+            let input = AggregationInput {
+                embeddings: &er,
+                confidences: &cr,
+                blue_scores: &blue,
+                temperature: 2.0,
+                theta_high: 0.5,
+                theta_low: 0.2,
+            };
+            let r = ParaconsistentAggregator::new(dim).aggregate_paraconsistent(&input).unwrap();
+            for v in &r.embedding.data { feed(&v.to_bits().to_le_bytes()); }
+            feed(&r.confidence.to_bits().to_le_bytes());
+            let cls = classify_belnap(&er, &cr, &blue, 2.0, 0.5, 0.2);
+            for row in &cls { for v in row { feed(&[*v as u8]); } }
+            for v in reduce_belnap_states(&cls) { feed(&[v as u8]); }
+            let _ = BelnapValue::Neither;
+        }
+        format!("{h:016x}")
+    }
+
+    #[test]
+    fn panic_s1_aggregation_bit_exact() {
+        assert_eq!(aggregation_fingerprint(), "4bca867f455733d2");
     }
 }

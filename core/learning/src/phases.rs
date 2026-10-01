@@ -112,7 +112,7 @@ impl PhaseManager {
 
     /// Record a submission in the current phase.
     pub fn record_submission(&mut self) {
-        self.state.submissions += 1;
+        self.state.submissions = self.state.submissions.saturating_add(1);
     }
 
     /// Mark the current phase's condition as met.
@@ -166,7 +166,7 @@ impl PhaseManager {
 
         // If completing Act → Observe, increment round
         if old_phase == OodaPhase::Act {
-            self.state.round += 1;
+            self.state.round = self.state.round.saturating_add(1);
         }
 
         self.state.phase = new_phase;
@@ -282,7 +282,7 @@ impl MacroPhaseManager {
         match self.phase {
             NetworkLearningPhase::Collection => {
                 if confidence_mean >= self.config.macro_confidence_threshold {
-                    self.consecutive_above += 1;
+                    self.consecutive_above = self.consecutive_above.saturating_add(1);
                 } else {
                     self.consecutive_above = 0;
                 }
@@ -303,7 +303,7 @@ impl MacroPhaseManager {
             NetworkLearningPhase::RoutingActive => {
                 if let Some(loss) = router_loss {
                     if loss < self.config.macro_loss_threshold {
-                        self.consecutive_above += 1;
+                        self.consecutive_above = self.consecutive_above.saturating_add(1);
                     } else {
                         self.consecutive_above = 0;
                     }
@@ -411,7 +411,7 @@ impl LearningPipeline {
         creator: [u8; 32],
         checkpoint_height: u64,
     ) -> LearningResult<LoraAdapter> {
-        self.round += 1;
+        self.round = self.round.saturating_add(1);
 
         let metadata = AdapterMetadata {
             name: format!("pipeline-round-{}", self.round),
