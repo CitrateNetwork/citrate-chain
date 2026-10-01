@@ -29,6 +29,20 @@
 // reward path, which is a pure function of `header.height` + `transactions`.
 // This module recomputes that same basic reward to build the credit list.
 
+// PANIC-S1 G2: block production / apply / sync path (T1); panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use std::sync::Arc;
 
 use std::collections::BTreeMap;
@@ -568,11 +582,13 @@ impl CanonicalApplicator {
         let mut extensions: Vec<Block> = children
             .into_iter()
             .filter_map(|h| self.storage.blocks.get_block(&h).ok().flatten())
-            .filter(|b| b.selected_parent() == tip.hash && b.header.height == tip.height + 1)
+            .filter(|b| {
+                b.selected_parent() == tip.hash && Some(b.header.height) == tip.height.checked_add(1)
+            })
             .collect();
         match extensions.len() {
             0 => Ok(None),
-            1 => Ok(Some(extensions.pop().expect("len == 1"))),
+            1 => Ok(extensions.pop()),
             _ => Err(()),
         }
     }
