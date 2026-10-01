@@ -87,13 +87,15 @@ pub(crate) fn argon2_for_version(version: u32) -> Result<argon2::Argon2<'static>
             Ok(Argon2::default())
         }
         KDF_VERSION_CURRENT => {
-            let params = Params::new(65536, 3, 1, Some(32))
-                .expect("WAL-01: Argon2 v2 params (m=65536, t=3, p=1, out=32) are statically valid; see docs/security/KDF_POLICY.md");
+            let params = Params::new(65536, 3, 1, Some(32)).map_err(|e| {
+                WalletError::KeyGeneration(format!("WAL-01: Argon2 v2 params rejected: {e}"))
+            })?;
             Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
         }
         KDF_VERSION_LOW_MEMORY => {
-            let params = Params::new(46336, 1, 1, Some(32))
-                .expect("WAL-01: Argon2 low-memory params (m=46336, t=1, p=1, out=32) are statically valid; see docs/security/KDF_POLICY.md");
+            let params = Params::new(46336, 1, 1, Some(32)).map_err(|e| {
+                WalletError::KeyGeneration(format!("WAL-01: Argon2 low-memory params rejected: {e}"))
+            })?;
             Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
         }
         unknown => Err(WalletError::Decryption(format!(
@@ -290,7 +292,10 @@ impl KeyManager {
         // ZeroizeOnDrop derive.
         let seed: Zeroizing<Vec<u8>> = Zeroizing::new(mnemonic_obj.to_seed("").to_vec());
         let mut secret: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
-        secret.copy_from_slice(&seed[..32]);
+        // A BIP-39 seed is 64 bytes; the ed25519 secret is its first 32.
+        secret.copy_from_slice(seed.first_chunk::<32>().ok_or_else(|| {
+            WalletError::KeyGeneration("BIP-39 seed shorter than 32 bytes".into())
+        })?);
         let signing_key = Ed25519SigningKey::from_bytes(&secret);
         let verifying_key = signing_key.verifying_key();
         let pubkey_bytes = verifying_key.to_bytes();
@@ -383,7 +388,10 @@ impl KeyManager {
         // WAL-04: seed + derived secret bytes are zeroed on drop.
         let seed: Zeroizing<Vec<u8>> = Zeroizing::new(mnemonic_obj.to_seed("").to_vec());
         let mut secret: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
-        secret.copy_from_slice(&seed[..32]);
+        // A BIP-39 seed is 64 bytes; the ed25519 secret is its first 32.
+        secret.copy_from_slice(seed.first_chunk::<32>().ok_or_else(|| {
+            WalletError::KeyGeneration("BIP-39 seed shorter than 32 bytes".into())
+        })?);
         let signing_key = Ed25519SigningKey::from_bytes(&secret);
         let verifying_key = signing_key.verifying_key();
         let pubkey_bytes = verifying_key.to_bytes();
@@ -454,7 +462,7 @@ impl KeyManager {
     pub fn unlock(&self, password: &str) -> Result<usize, WalletError> {
         let entries = self.entries_read();
         let mut unlocked = self.unlocked_write();
-        let mut count = 0;
+        let mut count: usize = 0;
 
         for entry in entries.iter() {
             match decrypt_key(entry, password) {
@@ -470,7 +478,7 @@ impl KeyManager {
                         }
                     };
                     unlocked.insert(entry.address.clone(), unified);
-                    count += 1;
+                    count = count.saturating_add(1);
                 }
                 Err(_) => {
                     // Wrong password for this key — continue trying others
@@ -538,7 +546,7 @@ impl KeyManager {
                 ..migrated
             };
             new_entries.push(migrated);
-            upgraded += 1;
+            upgraded = upgraded.saturating_add(1);
         }
 
         if upgraded == 0 {
@@ -614,7 +622,10 @@ impl KeyManager {
             .ok_or_else(|| WalletError::KeyNotFound(address.to_string()))?;
 
         // Verify password before deletion
-        decrypt_key(&entries[idx], password)?;
+        let entry = entries
+            .get(idx)
+            .ok_or_else(|| WalletError::KeyNotFound(address.to_string()))?;
+        decrypt_key(entry, password)?;
 
         entries.remove(idx);
         self.unlocked_write().remove(address);
@@ -648,8 +659,8 @@ impl KeyManager {
 /// Derive an EVM-compatible address from an Ed25519 public key.
 /// Address = Keccak-256(pubkey)[12..32]
 pub fn derive_address_from_ed25519(pubkey_bytes: &[u8; 32]) -> String {
-    let hash = Keccak256::digest(pubkey_bytes);
-    let address_bytes = &hash[12..32];
+    let hash: [u8; 32] = Keccak256::digest(pubkey_bytes).into();
+    let [_, _, _, _, _, _, _, _, _, _, _, _, address_bytes @ ..] = hash;
     format!("0x{}", hex::encode(address_bytes))
 }
 
@@ -658,9 +669,9 @@ pub fn derive_address_from_ed25519(pubkey_bytes: &[u8; 32]) -> String {
 pub fn derive_address_from_secp256k1(signing_key: &k256::ecdsa::SigningKey) -> String {
     let vk = signing_key.verifying_key();
     let uncompressed = vk.to_encoded_point(false);
-    let pubkey_bytes = &uncompressed.as_bytes()[1..]; // skip the 0x04 prefix
-    let hash = Keccak256::digest(pubkey_bytes);
-    let address_bytes = &hash[12..32];
+    let pubkey_bytes = uncompressed.as_bytes().get(1..).unwrap_or_default(); // skip the 0x04 prefix
+    let hash: [u8; 32] = Keccak256::digest(pubkey_bytes).into();
+    let [_, _, _, _, _, _, _, _, _, _, _, _, address_bytes @ ..] = hash;
     format!("0x{}", hex::encode(address_bytes))
 }
 
@@ -833,7 +844,7 @@ const KEYSTORE_AAD_DOMAIN: &[u8] = b"citrate-keystore-v2";
 #[cfg(feature = "native")]
 fn keystore_v2_aad(kdf_version: u32, key_type: KeyType, address: &str) -> Vec<u8> {
     let mut aad = Vec::with_capacity(
-        KEYSTORE_AAD_DOMAIN.len() + 4 + 1 + address.len(),
+        KEYSTORE_AAD_DOMAIN.len().saturating_add(5).saturating_add(address.len()),
     );
     aad.extend_from_slice(KEYSTORE_AAD_DOMAIN);
     aad.extend_from_slice(&kdf_version.to_le_bytes());

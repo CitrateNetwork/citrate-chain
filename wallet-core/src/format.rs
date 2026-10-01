@@ -81,8 +81,10 @@ pub fn grains_str_to_salt(grains: &str) -> String {
 /// along with a unit suffix.
 pub fn grains_str_to_salt_display(grains: &str) -> String {
     let salt = grains_str_to_salt(grains);
-    let parts: Vec<&str> = salt.split('.').collect();
-    let whole = parts[0];
+    let (whole, frac) = match salt.split_once('.') {
+        Some((w, f)) => (w, Some(f)),
+        None => (salt.as_str(), None),
+    };
     let whole_with_commas = if whole.len() <= 3 {
         whole.to_string()
     } else {
@@ -96,8 +98,8 @@ pub fn grains_str_to_salt_display(grains: &str) -> String {
             .rev()
             .collect()
     };
-    if parts.len() > 1 {
-        format!("{}.{} {}", whole_with_commas, parts[1], UNIT_NAME)
+    if let Some(frac) = frac {
+        format!("{}.{} {}", whole_with_commas, frac, UNIT_NAME)
     } else {
         format!("{} {}", whole_with_commas, UNIT_NAME)
     }
@@ -138,7 +140,7 @@ pub fn wei_to_salt_fixed(wei: u128, decimals: usize) -> String {
         return whole.to_string();
     }
 
-    let truncated = &frac_str[..decimals.min(18)];
+    let truncated = frac_str.get(..decimals.min(18)).unwrap_or(&frac_str);
     format!("{}.{}", whole, truncated)
 }
 
@@ -150,22 +152,22 @@ pub fn salt_to_wei(salt: &str) -> Result<u128, String> {
         return Err("Empty amount".to_string());
     }
 
-    let parts: Vec<&str> = salt.split('.').collect();
-    match parts.len() {
-        1 => {
+    let too_large = || "Amount too large".to_string();
+    let mut parts = salt.split('.');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(whole_str), None, None) => {
             // Whole number only
-            let whole: u128 = parts[0].parse()
-                .map_err(|_| format!("Invalid number: {}", parts[0]))?;
-            Ok(whole * WEI_PER_SALT)
+            let whole: u128 = whole_str.parse()
+                .map_err(|_| format!("Invalid number: {}", whole_str))?;
+            whole.checked_mul(WEI_PER_SALT).ok_or_else(too_large)
         }
-        2 => {
+        (Some(whole_str), Some(frac_str), None) => {
             // Has decimal part
-            let whole: u128 = if parts[0].is_empty() { 0 } else {
-                parts[0].parse()
-                    .map_err(|_| format!("Invalid whole part: {}", parts[0]))?
+            let whole: u128 = if whole_str.is_empty() { 0 } else {
+                whole_str.parse()
+                    .map_err(|_| format!("Invalid whole part: {}", whole_str))?
             };
 
-            let frac_str = parts[1];
             if frac_str.len() > 18 {
                 return Err("Too many decimal places (max 18)".to_string());
             }
@@ -175,7 +177,10 @@ pub fn salt_to_wei(salt: &str) -> Result<u128, String> {
             let frac: u128 = padded.parse()
                 .map_err(|_| format!("Invalid decimal part: {}", frac_str))?;
 
-            Ok(whole * WEI_PER_SALT + frac)
+            whole
+                .checked_mul(WEI_PER_SALT)
+                .and_then(|w| w.checked_add(frac))
+                .ok_or_else(too_large)
         }
         _ => Err("Invalid amount format".to_string()),
     }
@@ -186,8 +191,10 @@ pub fn salt_to_wei(salt: &str) -> Result<u128, String> {
 pub fn format_salt_display(wei: u128) -> String {
     let salt = wei_to_salt(wei);
     // Add comma separators for large numbers
-    let parts: Vec<&str> = salt.split('.').collect();
-    let whole = parts[0];
+    let (whole, frac) = match salt.split_once('.') {
+        Some((w, f)) => (w, Some(f)),
+        None => (salt.as_str(), None),
+    };
 
     if whole.len() <= 3 {
         format!("{} SALT", salt)
@@ -202,8 +209,8 @@ pub fn format_salt_display(wei: u128) -> String {
             .rev()
             .collect();
 
-        if parts.len() > 1 {
-            format!("{}.{} SALT", with_commas, parts[1])
+        if let Some(frac) = frac {
+            format!("{}.{} SALT", with_commas, frac)
         } else {
             format!("{} SALT", with_commas)
         }
@@ -333,5 +340,23 @@ mod tests {
         for g in [0u128, 1, WEI_PER_SALT, 42 * WEI_PER_SALT + 123, u128::MAX / 2] {
             assert_eq!(grains_to_salt(g), wei_to_salt(g));
         }
+    }
+
+    /// PANIC-S1: amounts beyond u128 wei are an error, not a crash.
+    #[test]
+    fn panic_s1_salt_to_wei_rejects_overflow() {
+        assert_eq!(salt_to_wei("1"), Ok(WEI_PER_SALT));
+        assert_eq!(salt_to_wei("1.5"), Ok(WEI_PER_SALT + WEI_PER_SALT / 2));
+        assert_eq!(salt_to_wei(".25"), Ok(WEI_PER_SALT / 4));
+        let max_whole = u128::MAX / WEI_PER_SALT;
+        assert!(salt_to_wei(&max_whole.to_string()).is_ok());
+        assert_eq!(salt_to_wei(&(max_whole + 1).to_string()), Err("Amount too large".into()));
+        assert_eq!(
+            salt_to_wei(&format!("{max_whole}.999999999999999999")),
+            Err("Amount too large".into())
+        );
+        assert!(salt_to_wei("1.2.3").is_err());
+        assert_eq!(format_salt_display(1_234 * WEI_PER_SALT + WEI_PER_SALT / 2), "1,234.5 SALT");
+        assert_eq!(wei_to_salt_fixed(WEI_PER_SALT / 2, 30), format!("0.{}", "5".to_string() + &"0".repeat(17)));
     }
 }

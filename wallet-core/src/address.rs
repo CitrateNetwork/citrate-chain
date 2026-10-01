@@ -143,11 +143,9 @@ fn eip55_checksum_body(lowercase_body: &str) -> String {
     let hash = Keccak256::digest(lowercase_body.as_bytes());
     let mut out = String::with_capacity(40);
     for (i, ch) in lowercase_body.chars().enumerate() {
-        let nib = if i % 2 == 0 {
-            hash[i / 2] >> 4
-        } else {
-            hash[i / 2] & 0x0f
-        };
+        // i < 40 and the hash is 32 bytes, so the byte always exists.
+        let byte = hash.get(i / 2).copied().unwrap_or(0);
+        let nib = if i % 2 == 0 { byte >> 4 } else { byte & 0x0f };
         if ch.is_ascii_alphabetic() && nib >= 8 {
             out.push(ch.to_ascii_uppercase());
         } else {
