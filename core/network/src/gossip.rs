@@ -185,7 +185,10 @@ impl GossipProtocol {
         // Check if already seen
         if let Some(seen) = self.seen_blocks.get(&hash) {
             if seen.propagated {
-                self.stats.write().await.duplicates_filtered += 1;
+                {
+            let mut stats = self.stats.write().await;
+            stats.duplicates_filtered = stats.duplicates_filtered.saturating_add(1);
+        }
                 return Ok(());
             }
         }
@@ -200,7 +203,10 @@ impl GossipProtocol {
             },
         );
 
-        self.stats.write().await.blocks_received += 1;
+        {
+            let mut stats = self.stats.write().await;
+            stats.blocks_received = stats.blocks_received.saturating_add(1);
+        }
 
         // Validate block (full integrity checks — WP-G.3)
         if !self.validate_block(&block).await {
@@ -244,7 +250,10 @@ impl GossipProtocol {
         // Check if already seen
         if let Some(seen) = self.seen_transactions.get(&hash) {
             if seen.propagated {
-                self.stats.write().await.duplicates_filtered += 1;
+                {
+            let mut stats = self.stats.write().await;
+            stats.duplicates_filtered = stats.duplicates_filtered.saturating_add(1);
+        }
                 return Ok(());
             }
         }
@@ -259,7 +268,10 @@ impl GossipProtocol {
             },
         );
 
-        self.stats.write().await.transactions_received += 1;
+        {
+            let mut stats = self.stats.write().await;
+            stats.transactions_received = stats.transactions_received.saturating_add(1);
+        }
 
         // Validate transaction (basic checks)
         if !self.validate_transaction(&tx).await {
@@ -362,7 +374,10 @@ impl GossipProtocol {
             }
         }
 
-        self.stats.write().await.blocks_propagated += 1;
+        {
+            let mut stats = self.stats.write().await;
+            stats.blocks_propagated = stats.blocks_propagated.saturating_add(1);
+        }
 
         Ok(())
     }
@@ -395,7 +410,10 @@ impl GossipProtocol {
             }
         }
 
-        self.stats.write().await.transactions_propagated += 1;
+        {
+            let mut stats = self.stats.write().await;
+            stats.transactions_propagated = stats.transactions_propagated.saturating_add(1);
+        }
 
         Ok(())
     }
@@ -458,13 +476,19 @@ impl GossipProtocol {
 
         // 3. Check dedup cache
         if self.seen_learning.contains_key(&dedup_key) {
-            self.stats.write().await.learning_duplicates_filtered += 1;
+            {
+            let mut stats = self.stats.write().await;
+            stats.learning_duplicates_filtered = stats.learning_duplicates_filtered.saturating_add(1);
+        }
             return Ok(());
         }
 
         // 4. Mark as seen
         self.seen_learning.insert(dedup_key, Instant::now());
-        self.stats.write().await.learning_received += 1;
+        {
+            let mut stats = self.stats.write().await;
+            stats.learning_received = stats.learning_received.saturating_add(1);
+        }
 
         info!(
             "[LEARNING] checkpoint={} type={} from={}",
@@ -519,7 +543,10 @@ impl GossipProtocol {
             }
         }
 
-        self.stats.write().await.learning_propagated += 1;
+        {
+            let mut stats = self.stats.write().await;
+            stats.learning_propagated = stats.learning_propagated.saturating_add(1);
+        }
 
         Ok(())
     }
@@ -787,7 +814,7 @@ impl GossipProtocol {
 
             items.sort_by_key(|&(_, time)| time);
 
-            let to_remove = items.len() - self.config.max_seen_cache;
+            let to_remove = items.len().saturating_sub(self.config.max_seen_cache);
             for (hash, _) in items.into_iter().take(to_remove) {
                 self.seen_blocks.remove(&hash);
             }
@@ -802,7 +829,7 @@ impl GossipProtocol {
 
             items.sort_by_key(|&(_, time)| time);
 
-            let to_remove = items.len() - self.config.max_seen_cache;
+            let to_remove = items.len().saturating_sub(self.config.max_seen_cache);
             for (hash, _) in items.into_iter().take(to_remove) {
                 self.seen_transactions.remove(&hash);
             }
@@ -823,7 +850,7 @@ impl GossipProtocol {
 
             items.sort_by_key(|&(_, time)| time);
 
-            let to_remove = items.len() - self.config.max_seen_cache;
+            let to_remove = items.len().saturating_sub(self.config.max_seen_cache);
             for (key, _) in items.into_iter().take(to_remove) {
                 self.seen_learning.remove(&key);
             }

@@ -33,7 +33,9 @@ use crate::errors::WalletError;
 const CLI_KEYSTORE_AAD_DOMAIN: &[u8] = b"citrate-cli-keystore-v2";
 
 fn cli_keystore_aad(kdf_version: u32, public_key: &[u8]) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(CLI_KEYSTORE_AAD_DOMAIN.len() + 4 + public_key.len());
+    let mut aad = Vec::with_capacity(
+        CLI_KEYSTORE_AAD_DOMAIN.len().saturating_add(4).saturating_add(public_key.len()),
+    );
     aad.extend_from_slice(CLI_KEYSTORE_AAD_DOMAIN);
     aad.extend_from_slice(&kdf_version.to_le_bytes());
     aad.extend_from_slice(public_key);
@@ -61,8 +63,9 @@ fn argon2_for_version(version: u32) -> Result<Argon2<'static>, WalletError> {
     match version {
         KDF_VERSION_LEGACY => Ok(Argon2::default()),
         KDF_VERSION_CURRENT => {
-            let params = Params::new(65536, 3, 1, Some(32))
-                .expect("WAL-01: Argon2 v2 params (m=65536, t=3, p=1, out=32) are statically valid; see docs/security/KDF_POLICY.md");
+            let params = Params::new(65536, 3, 1, Some(32)).map_err(|e| {
+                WalletError::Other(format!("WAL-01: Argon2 v2 params rejected: {e}"))
+            })?;
             Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
         }
         unknown => Err(WalletError::Decryption(format!(
@@ -283,7 +286,9 @@ impl KeyStore {
 
         // WAL-04: AES key erased on drop.
         let mut aes_key: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
-        aes_key.copy_from_slice(&key_bytes[..32]);
+        aes_key.copy_from_slice(key_bytes.first_chunk::<32>().ok_or_else(|| {
+            WalletError::Decryption("argon2 output shorter than 32 bytes".to_string())
+        })?);
 
         // Create cipher
         let key = Key::<Aes256Gcm>::from_slice(aes_key.as_ref());
@@ -352,7 +357,9 @@ impl KeyStore {
 
         // WAL-04: AES key erased on drop.
         let mut aes_key: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
-        aes_key.copy_from_slice(&key_bytes[..32]);
+        aes_key.copy_from_slice(key_bytes.first_chunk::<32>().ok_or_else(|| {
+            WalletError::Decryption("argon2 output shorter than 32 bytes".to_string())
+        })?);
 
         // Create cipher
         let key = Key::<Aes256Gcm>::from_slice(aes_key.as_ref());
@@ -499,7 +506,7 @@ pub fn migrate_to_unified_keystore(
             "RM-G2.1: migration failed for entry {}: {}",
             idx, e,
         )))?;
-        migrated += 1;
+        migrated = migrated.saturating_add(1);
     }
 
     // Re-lock the legacy keystore so the in-memory plaintext

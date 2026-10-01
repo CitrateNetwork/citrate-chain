@@ -132,13 +132,23 @@ struct ModelInfo {
 
 /// Bytes an announcement asks us to hold, for the size cap.
 fn announcement_bytes(owner: &[u8], metadata: &ModelMetadata, weight_cid: &str) -> usize {
-    owner.len()
-        + metadata.name.len()
-        + metadata.version.len()
-        + metadata.description.len()
-        + metadata.framework.len()
-        + (metadata.input_shape.len() + metadata.output_shape.len()) * 8
-        + weight_cid.len()
+    // Saturating: a peer-supplied announcement must never overflow the size check.
+    let shapes = metadata
+        .input_shape
+        .len()
+        .saturating_add(metadata.output_shape.len())
+        .saturating_mul(8);
+    [
+        owner.len(),
+        metadata.name.len(),
+        metadata.version.len(),
+        metadata.description.len(),
+        metadata.framework.len(),
+        shapes,
+        weight_cid.len(),
+    ]
+    .into_iter()
+    .fold(0usize, usize::saturating_add)
 }
 
 impl AINetworkHandler {
@@ -808,7 +818,7 @@ impl AINetworkHandler {
 
         // Generate deterministic "input data" based on hash
         // This simulates actual data retrieval from off-chain storage
-        let data_size = (hash_value % 1000 + 100) as usize; // 100-1099 elements
+        let data_size = (hash_value.checked_rem(1000).unwrap_or(0) as usize).saturating_add(100); // 100-1099 elements
         let mut input_data = Vec::with_capacity(data_size);
 
         for i in 0..data_size {

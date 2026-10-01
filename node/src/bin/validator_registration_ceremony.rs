@@ -22,6 +22,20 @@
 //!
 //! Mock budget: 0. No `.unwrap()`. Real RPC, real signatures, real submission.
 
+// PANIC-S1 G2: production code in this crate may not panic (tests excepted).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -146,7 +160,7 @@ async fn main() -> Result<()> {
     let stake_wei = salt_to_wei(cli.stake_salt);
 
     for (i, spec) in specs.iter().enumerate() {
-        println!("\n─── node #{} ───────────────────────────────", i + 1);
+        println!("\n─── node #{} ───────────────────────────────", i.saturating_add(1));
         register_one(&client, &cli, registry, stake_wei, spec).await?;
     }
 
@@ -203,7 +217,7 @@ async fn register_one(
     let calldata = encode_register_validator(&proposer_pubkey, &sig_bytes);
 
     if cli.dry_run {
-        println!("[dry-run] calldata (0x{}...) — not broadcast", hex::encode(&calldata[..8]));
+        println!("[dry-run] calldata (0x{}...) — not broadcast", hex::encode(calldata.get(..8).unwrap_or(&calldata)));
         return Ok(());
     }
 
@@ -214,7 +228,7 @@ async fn register_one(
     let bal = eth_balance(client, &cli.rpc_url, &staker)
         .await
         .context("eth_getBalance(staker)")?;
-    let needed = stake_wei + (cli.gas_price as u128) * (cli.gas_limit as u128);
+    let needed = stake_wei.saturating_add((cli.gas_price as u128).saturating_mul(cli.gas_limit as u128));
     if bal < needed {
         bail!(
             "staker 0x{} balance {} wei < required {} wei (stake + max gas). Fund it in genesis.",
@@ -280,7 +294,7 @@ fn encode_register_validator(proposer_pubkey: &[u8; 32], sig: &[u8; 64]) -> Vec<
 fn evm_address_of_secp256k1(key: &Secp256k1SigningKey) -> [u8; 20] {
     let vk = key.verifying_key();
     let point = vk.to_encoded_point(false);
-    let hash = keccak256(&point.as_bytes()[1..]);
+    let hash = keccak256(point.as_bytes().get(1..).unwrap_or_default());
     let mut out = [0u8; 20];
     out.copy_from_slice(&hash[12..32]);
     out
@@ -299,7 +313,7 @@ fn word_u64(v: u64) -> [u8; 32] {
 }
 
 fn salt_to_wei(salt: u64) -> u128 {
-    (salt as u128) * 1_000_000_000_000_000_000u128
+    (salt as u128).saturating_mul(1_000_000_000_000_000_000u128)
 }
 
 /// The block height at/after which the seed-timing guard refuses (without
@@ -383,26 +397,26 @@ fn parse_nodes(nodes: &[String]) -> Result<Vec<NodeSpec>> {
 /// Enforce one-staker-one-pubkey off-chain (the contract enforces it too, but a
 /// duplicate here would waste gas on a guaranteed revert).
 fn reject_duplicates(specs: &[NodeSpec]) -> Result<()> {
-    for i in 0..specs.len() {
-        for j in (i + 1)..specs.len() {
-            if specs[i].coinbase == specs[j].coinbase {
+    for (i, a_spec) in specs.iter().enumerate() {
+        for (j, b_spec) in specs.iter().enumerate().skip(i.saturating_add(1)) {
+            if a_spec.coinbase == b_spec.coinbase {
                 bail!(
                     "duplicate coinbase 0x{} (nodes #{} and #{}) — each node needs a DISTINCT \
                      coinbase or they derive the same proposer key",
-                    hex::encode(specs[i].coinbase),
-                    i + 1,
-                    j + 1
+                    hex::encode(a_spec.coinbase),
+                    i.saturating_add(1),
+                    j.saturating_add(1)
                 );
             }
-            let a = evm_address_of_secp256k1(&specs[i].staker_key);
-            let b = evm_address_of_secp256k1(&specs[j].staker_key);
+            let a = evm_address_of_secp256k1(&a_spec.staker_key);
+            let b = evm_address_of_secp256k1(&b_spec.staker_key);
             if a == b {
                 bail!(
                     "duplicate staker 0x{} (nodes #{} and #{}) — one-staker-one-pubkey requires 4 \
                      distinct funded stakers",
                     hex::encode(a),
-                    i + 1,
-                    j + 1
+                    i.saturating_add(1),
+                    j.saturating_add(1)
                 );
             }
         }
@@ -478,8 +492,10 @@ async fn eth_registration_nonce(
         bail!("registrationNonce return not 32 bytes ({} bytes)", bytes.len());
     }
     // Low 8 bytes of the big-endian uint256 (nonce never realistically exceeds u64).
-    let mut b8 = [0u8; 8];
-    b8.copy_from_slice(&bytes[24..32]);
+    let b8: [u8; 8] = bytes
+        .get(24..32)
+        .and_then(|b| b.try_into().ok())
+        .context("registrationNonce return not 32 bytes")?;
     Ok(u64::from_be_bytes(b8))
 }
 

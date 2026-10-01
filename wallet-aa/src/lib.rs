@@ -28,6 +28,20 @@
 //!    auth.citrate.ai to construct the signature, and by clients to
 //!    verify they're submitting the correct signature offline.
 
+// PANIC-S1 G2: production code in this crate may not panic (tests excepted).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 

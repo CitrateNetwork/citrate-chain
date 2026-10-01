@@ -1,3 +1,17 @@
+// PANIC-S1 G2: production code in this crate may not panic (tests excepted).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -47,13 +61,6 @@ fn resolve_inference_mode(args: &[String]) -> InferenceMode {
     production_default
 }
 
-/// Parse a hardcoded socket address literal. This is infallible for valid literals
-/// but avoids a bare `.unwrap()` call in production code.
-fn hardcoded_addr(s: &str) -> SocketAddr {
-    s.parse()
-        .unwrap_or_else(|_| unreachable!("BUG: invalid hardcoded address literal: {}", s))
-}
-
 fn data_dir() -> PathBuf {
     std::env::var_os("CITRATE_DATA_DIR")
         .map(PathBuf::from)
@@ -65,14 +72,14 @@ fn rpc_addr() -> SocketAddr {
         .ok()
         .and_then(|s| s.parse().ok())
         // WP-X.1: Default to loopback (was 0.0.0.0 — exposed to all interfaces)
-        .unwrap_or_else(|| hardcoded_addr("127.0.0.1:8545"))
+        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 8545)))
 }
 
 fn metrics_addr() -> SocketAddr {
     std::env::var("CITRATE_METRICS_ADDR")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| hardcoded_addr("0.0.0.0:9100"))
+        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 9100)))
 }
 
 async fn metrics_handler() -> impl IntoResponse {
@@ -162,8 +169,8 @@ async fn main() -> Result<()> {
 
     // API service (WebSocket and REST addresses)
     // WP-X.1: Default to loopback (was 0.0.0.0)
-    let ws_addr: SocketAddr = hardcoded_addr("127.0.0.1:8546");
-    let rest_addr: SocketAddr = hardcoded_addr("127.0.0.1:3000");
+    let ws_addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 8546));
+    let rest_addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 3000));
     let api = ApiService::new(
         rpc_cfg,
         ws_addr,

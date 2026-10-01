@@ -1,5 +1,19 @@
 // citrate/core/economics/src/lib.rs
 
+// PANIC-S1 G2: production code in this crate may not panic (tests excepted).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 pub mod dynamic_pricing;
 pub mod enhanced_rewards;
 pub mod estimator;
@@ -70,6 +84,19 @@ pub const TOTAL_SUPPLY: u128 = 1_000_000_000_000;
         clippy::panic
     )
 )]
+/// `a × b ÷ d` for non-consensus economics (RPC estimates, policy math): the
+/// product saturates instead of overflowing and a zero divisor yields zero, so no
+/// input can panic the caller. Consensus reward math (`rewards.rs`) does NOT use
+/// this; it rejects on overflow (PANIC-S1 D3).
+pub fn mul_div(a: U256, b: U256, d: U256) -> U256 {
+    a.saturating_mul(b).checked_div(d).unwrap_or_default()
+}
+
+/// `n` whole SALT in wei, saturating.
+pub fn salt(n: u64) -> U256 {
+    U256::from(n).saturating_mul(wei_per_salt())
+}
+
 pub fn wei_per_salt() -> U256 {
     // 10^18 < 2^60: the checked form cannot fail; it just keeps that a proof.
     U256::from(10u8)

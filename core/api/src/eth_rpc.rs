@@ -203,11 +203,10 @@ fn simulation_block_context(storage: &Arc<StorageManager>) -> (u64, u64) {
 }
 
 fn pubkey_hex_to_evm_address(hex_str: &str) -> String {
-    if hex_str.len() == 64 && hex_str[40..].chars().all(|c| c == '0') {
-        // EVM address embedded in first 20 bytes
-        format!("0x{}", &hex_str[..40])
-    } else if hex_str.len() >= 40 {
-        format!("0x{}", &hex_str[..40])
+    // The first 20 bytes (40 hex chars) are the EVM address, whether or not the
+    // rest is zero padding. Non-ASCII input has no 40-char prefix and falls through.
+    if let Some(prefix) = hex_str.get(..40) {
+        format!("0x{}", prefix)
     } else {
         format!("0x{}", hex_str)
     }
@@ -306,7 +305,9 @@ pub fn resolve_block_tag(
         Some("latest") | Some("pending") => Some(current_height),
         Some("earliest") => Some(0),
         Some("finalized") | Some("safe") => Some(finalized_height),
-        Some(hex_str) if hex_str.starts_with("0x") => u64::from_str_radix(&hex_str[2..], 16).ok(),
+        Some(hex_str) => hex_str
+            .strip_prefix("0x")
+            .and_then(|h| u64::from_str_radix(h, 16).ok()),
         _ => None,
     }
 }
@@ -433,8 +434,8 @@ pub fn register_eth_methods_with_finality(
         // behaviour (fall back to Null when the height lookup errors); every
         // other tag (earliest / finalized / safe / hex) goes through the shared
         // resolver so `finalized`/`safe` are honoured uniformly (Stage 0).
-        let is_latest = params[0].as_str() == Some("latest");
-        let block_number = match params[0].as_str() {
+        let is_latest = arg(&params, 0).as_str() == Some("latest");
+        let block_number = match arg(&params, 0).as_str() {
             Some("latest") | Some("pending") => match block_on(api.get_height()) {
                 Ok(h) => h,
                 Err(_) => return Ok(Value::Null),
@@ -460,7 +461,7 @@ pub fn register_eth_methods_with_finality(
             match block_on(api.get_block(crate::types::request::BlockId::Number(try_height))) {
                 Ok(block) => break Ok(block),
                 Err(_) if is_latest && try_height > 0 => {
-                    try_height -= 1;
+                    try_height = try_height.saturating_sub(1);
                     continue;
                 }
                 Err(e) => break Err(e),
@@ -522,8 +523,8 @@ pub fn register_eth_methods_with_finality(
         let include_transactions = params.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
 
         // Parse block hash
-        let hash_str = match params[0].as_str() {
-            Some(h) if h.starts_with("0x") => &h[2..],
+        let hash_str = match arg(&params, 0).as_str() {
+            Some(h) if h.starts_with("0x") => h.get(2..).unwrap_or_default(),
             Some(h) => h,
             None => return Err(jsonrpc_core::Error::invalid_params("Invalid hash format")),
         };
@@ -592,8 +593,8 @@ pub fn register_eth_methods_with_finality(
             ));
         }
 
-        let hash_str = match params[0].as_str() {
-            Some(h) if h.starts_with("0x") => &h[2..],
+        let hash_str = match arg(&params, 0).as_str() {
+            Some(h) if h.starts_with("0x") => h.get(2..).unwrap_or_default(),
             Some(h) => h,
             None => return Err(jsonrpc_core::Error::invalid_params("Invalid hash format")),
         };
@@ -725,8 +726,8 @@ pub fn register_eth_methods_with_finality(
             ));
         }
 
-        let hash_str = match params[0].as_str() {
-            Some(h) if h.starts_with("0x") => &h[2..],
+        let hash_str = match arg(&params, 0).as_str() {
+            Some(h) if h.starts_with("0x") => h.get(2..).unwrap_or_default(),
             Some(h) => h,
             None => return Err(jsonrpc_core::Error::invalid_params("Invalid hash format")),
         };
@@ -829,8 +830,8 @@ pub fn register_eth_methods_with_finality(
             latest_height,
         )?;
 
-        let addr_str = match params[0].as_str() {
-            Some(a) if a.starts_with("0x") => &a[2..],
+        let addr_str = match arg(&params, 0).as_str() {
+            Some(a) if a.starts_with("0x") => a.get(2..).unwrap_or_default(),
             Some(a) => a,
             None => {
                 return Err(jsonrpc_core::Error::invalid_params(
@@ -884,8 +885,8 @@ pub fn register_eth_methods_with_finality(
             latest_height,
         )?;
 
-        let addr_str = match params[0].as_str() {
-            Some(a) if a.starts_with("0x") => &a[2..],
+        let addr_str = match arg(&params, 0).as_str() {
+            Some(a) if a.starts_with("0x") => a.get(2..).unwrap_or_default(),
             Some(a) => a,
             None => {
                 return Err(jsonrpc_core::Error::invalid_params(
@@ -930,8 +931,8 @@ pub fn register_eth_methods_with_finality(
             return Err(jsonrpc_core::Error::invalid_params("Missing address"));
         }
 
-        let addr_str = match params[0].as_str() {
-            Some(a) if a.starts_with("0x") => &a[2..],
+        let addr_str = match arg(&params, 0).as_str() {
+            Some(a) if a.starts_with("0x") => a.get(2..).unwrap_or_default(),
             Some(a) => a,
             None => {
                 return Err(jsonrpc_core::Error::invalid_params(
@@ -1027,8 +1028,8 @@ pub fn register_eth_methods_with_finality(
             ));
         }
 
-        let tx_data = match params[0].as_str() {
-            Some(d) if d.starts_with("0x") => &d[2..],
+        let tx_data = match arg(&params, 0).as_str() {
+            Some(d) if d.starts_with("0x") => d.get(2..).unwrap_or_default(),
             Some(d) => d,
             None => {
                 tracing::error!("Invalid transaction format");
@@ -1040,7 +1041,7 @@ pub fn register_eth_methods_with_finality(
 
         tracing::debug!(
             "Raw tx data (first 100 bytes): {}",
-            &tx_data[..tx_data.len().min(200)]
+            tx_data.get(..tx_data.len().min(200)).unwrap_or(tx_data)
         );
 
         let tx_bytes = match hex::decode(tx_data) {
@@ -1168,7 +1169,7 @@ pub fn register_eth_methods_with_finality(
         )?;
 
         // call object
-        let obj = match &params[0] {
+        let obj = match &arg(&params, 0) {
             Value::Object(map) => map,
             _ => return Err(jsonrpc_core::Error::invalid_params("Invalid call object")),
         };
@@ -1393,7 +1394,7 @@ pub fn register_eth_methods_with_finality(
         )?;
 
         // call object
-        let obj = match &params[0] {
+        let obj = match &arg(&params, 0) {
             Value::Object(map) => map,
             _ => {
                 // Invalid params - return default
@@ -1674,7 +1675,7 @@ pub fn register_eth_methods_with_finality(
         }
 
         // Determine the newest block of the requested window. `newestBlock`
-        // (params[1]) is a block tag; the finality Stage 0 state-read tag work
+        // (arg(&params, 1)) is a block tag; the finality Stage 0 state-read tag work
         // honours `finalized`/`safe` here by anchoring the window at the
         // finalized height. Fee history reads persisted block headers, so this
         // is a real historical read (not latest state mislabelled as finalized).
@@ -1699,7 +1700,8 @@ pub fn register_eth_methods_with_finality(
         }
 
         // Calculate start height
-        let start_height = current_height.saturating_sub(block_count - 1);
+        // block_count >= 1 (the zero case returned above).
+        let start_height = current_height.saturating_sub(block_count.saturating_sub(1));
 
         // Collect fee data from blocks
         let mut base_fees: Vec<String> = Vec::new();
@@ -1731,7 +1733,7 @@ pub fn register_eth_methods_with_finality(
                             if let Ok(Some(receipt)) =
                                 storage_fee.transactions.get_receipt(&tx.hash)
                             {
-                                gas_from_receipts += receipt.gas_used;
+                                gas_from_receipts = gas_from_receipts.saturating_add(receipt.gas_used);
                                 has_receipt_data = true;
                             }
                         }
@@ -1767,11 +1769,12 @@ pub fn register_eth_methods_with_finality(
                         // Fallback: calculate from block fullness (older blocks)
                         let target_gas = block_gas_limit / 2;
                         if total_gas_used > target_gas {
-                            let delta = total_gas_used - target_gas;
-                            1_000_000_000_u64
-                                + (delta as f64 / target_gas as f64 * 125_000_000.0) as u64
+                            let delta = total_gas_used.saturating_sub(target_gas);
+                            1_000_000_000_u64.saturating_add(
+                                (delta as f64 / target_gas as f64 * 125_000_000.0) as u64,
+                            )
                         } else {
-                            let delta = target_gas - total_gas_used;
+                            let delta = target_gas.saturating_sub(total_gas_used);
                             1_000_000_000_u64.saturating_sub(
                                 (delta as f64 / target_gas as f64 * 125_000_000.0) as u64,
                             )
@@ -1792,7 +1795,8 @@ pub fn register_eth_methods_with_finality(
 
                         let mut block_rewards: Vec<String> = Vec::new();
                         for pct in &percentiles {
-                            let idx = ((pct / 100.0) * (tips.len() - 1) as f64).floor() as usize;
+                            // tips is non-empty here.
+                            let idx = ((pct / 100.0) * tips.len().saturating_sub(1) as f64).floor() as usize;
                             let tip = tips.get(idx).copied().unwrap_or(0);
                             block_rewards.push(format!("0x{:x}", tip));
                         }
@@ -1852,7 +1856,7 @@ pub fn register_eth_methods_with_finality(
             return Err(jsonrpc_core::Error::invalid_params("Missing filter object"));
         }
 
-        let filter = &params[0];
+        let filter = &arg(&params, 0);
         // PBA-L1a-010: bound the criteria before parsing or retaining them.
         crate::filter::validate_log_filter_criteria(filter)
             .map_err(jsonrpc_core::Error::invalid_params)?;
@@ -2024,7 +2028,7 @@ pub fn register_eth_methods_with_finality(
                                 if i >= log.topics.len() {
                                     false // Log doesn't have this topic position
                                 } else {
-                                    allowed_topics.contains(&log.topics[i])
+                                    log.topics.get(i).is_some_and(|t| allowed_topics.contains(t))
                                 }
                             }
                         }
@@ -2049,7 +2053,7 @@ pub fn register_eth_methods_with_finality(
                         "removed": false
                     }));
 
-                    log_index_global += 1;
+                    log_index_global = log_index_global.saturating_add(1);
                     let _ = log_index_in_tx; // Suppress unused warning
                 }
             }
@@ -2072,7 +2076,7 @@ pub fn register_eth_methods_with_finality(
             return Err(jsonrpc_core::Error::invalid_params("Missing filter object"));
         }
 
-        let filter = &params[0];
+        let filter = &arg(&params, 0);
         // PBA-L1a-010: bound the criteria before parsing or retaining them.
         crate::filter::validate_log_filter_criteria(filter)
             .map_err(jsonrpc_core::Error::invalid_params)?;
@@ -2227,7 +2231,7 @@ pub fn register_eth_methods_with_finality(
             return Err(jsonrpc_core::Error::invalid_params("Missing filter ID"));
         }
 
-        let filter_id = match params[0].as_str() {
+        let filter_id = match arg(&params, 0).as_str() {
             Some(hex_str) => {
                 let hex = hex_str.trim_start_matches("0x");
                 u64::from_str_radix(hex, 16).map_err(|_| {
@@ -2257,7 +2261,7 @@ pub fn register_eth_methods_with_finality(
             return Err(jsonrpc_core::Error::invalid_params("Missing filter ID"));
         }
 
-        let filter_id = match params[0].as_str() {
+        let filter_id = match arg(&params, 0).as_str() {
             Some(hex_str) => {
                 let hex = hex_str.trim_start_matches("0x");
                 u64::from_str_radix(hex, 16).map_err(|_| {
@@ -2291,7 +2295,7 @@ pub fn register_eth_methods_with_finality(
             FilterType::Block => {
                 // Return new block hashes since last poll
                 let mut block_hashes = Vec::new();
-                for height in (last_poll_block + 1)..=current_height {
+                for height in last_poll_block.saturating_add(1)..=current_height {
                     if let Ok(Some(hash)) =
                         storage_filter_changes.blocks.get_block_by_height(height)
                     {
@@ -2314,7 +2318,7 @@ pub fn register_eth_methods_with_finality(
                 ref topics,
             } => {
                 // Calculate effective block range
-                let effective_from = last_poll_block + 1;
+                let effective_from = last_poll_block.saturating_add(1);
                 let effective_to = match to_block {
                     Some(t) => t.min(current_height),
                     None => current_height,
@@ -2366,7 +2370,7 @@ pub fn register_eth_methods_with_finality(
                                         if i >= log.topics.len() {
                                             false
                                         } else {
-                                            allowed_topics.contains(&log.topics[i])
+                                            log.topics.get(i).is_some_and(|t| allowed_topics.contains(t))
                                         }
                                     }
                                 },
@@ -2412,7 +2416,7 @@ pub fn register_eth_methods_with_finality(
             return Err(jsonrpc_core::Error::invalid_params("Missing filter ID"));
         }
 
-        let filter_id = match params[0].as_str() {
+        let filter_id = match arg(&params, 0).as_str() {
             Some(hex_str) => {
                 let hex = hex_str.trim_start_matches("0x");
                 u64::from_str_radix(hex, 16).map_err(|_| {
@@ -2484,7 +2488,7 @@ pub fn register_eth_methods_with_finality(
                                         if i >= log.topics.len() {
                                             false
                                         } else {
-                                            allowed_topics.contains(&log.topics[i])
+                                            log.topics.get(i).is_some_and(|t| allowed_topics.contains(t))
                                         }
                                     }
                                 },
@@ -2574,7 +2578,7 @@ pub fn register_eth_methods_with_finality(
             return Err(jsonrpc_core::Error::invalid_params("Missing transaction hash"));
         }
 
-        let tx_hash_str = match params[0].as_str() {
+        let tx_hash_str = match arg(&params, 0).as_str() {
             Some(s) => s,
             None => return Err(jsonrpc_core::Error::invalid_params("Invalid transaction hash")),
         };
@@ -2686,7 +2690,7 @@ pub fn register_eth_methods_with_finality(
         )?;
 
         // address (required, 20 bytes)
-        let addr_str = parsed[0]
+        let addr_str = arg(&parsed, 0)
             .as_str()
             .ok_or_else(|| jsonrpc_core::Error::invalid_params("address must be a hex string"))?;
         let addr_hex = addr_str.trim_start_matches("0x");
@@ -2703,7 +2707,7 @@ pub fn register_eth_methods_with_finality(
 
         // slot (required, up to 32 bytes — left-pad if shorter). Foundry
         // sends both `"0x0"` and `"0x00000…0001"` interchangeably.
-        let slot_str = parsed[1]
+        let slot_str = arg(&parsed, 1)
             .as_str()
             .ok_or_else(|| jsonrpc_core::Error::invalid_params("slot must be a hex string"))?;
         let slot_hex = slot_str.trim_start_matches("0x");
@@ -2719,7 +2723,8 @@ pub fn register_eth_methods_with_finality(
                 "slot must be ≤ 32 bytes",
             ));
         }
-        let mut slot_key = vec![0u8; 32 - slot_bytes.len()];
+        // slot_bytes.len() <= 32 (checked above).
+        let mut slot_key = vec![0u8; 32usize.saturating_sub(slot_bytes.len())];
         slot_key.append(&mut slot_bytes);
 
         // The 3rd param (blockTag) is parsed for forwards-compat with the
@@ -2728,12 +2733,10 @@ pub fn register_eth_methods_with_finality(
         match block_on(state_api.get_storage(address, slot_key)) {
             Ok(value) => {
                 // Always return left-padded 32-byte hex.
-                let mut padded = vec![0u8; 32];
-                let len = value.len().min(32);
-                if len > 0 {
-                    let src_start = value.len().saturating_sub(len);
-                    padded[32 - len..].copy_from_slice(&value[src_start..]);
-                }
+                // Left-pad the last (up to) 32 bytes.
+                let tail = value.get(value.len().saturating_sub(32)..).unwrap_or_default();
+                let mut padded = vec![0u8; 32usize.saturating_sub(tail.len())];
+                padded.extend_from_slice(tail);
                 Ok(Value::String(format!("0x{}", hex::encode(padded))))
             }
             Err(_) => Ok(Value::String(format!("0x{}", "0".repeat(64)))),
@@ -2755,7 +2758,7 @@ pub fn register_eth_methods_with_finality(
             }
             let current = block_on(api.get_height()).unwrap_or(0);
             let finalized = finalized_btcbn.load(Ordering::SeqCst);
-            let number = match resolve_block_tag(parsed[0].as_str(), current, finalized) {
+            let number = match resolve_block_tag(arg(&parsed, 0).as_str(), current, finalized) {
                 Some(n) => n,
                 None => return Err(jsonrpc_core::Error::invalid_params("bad block tag")),
             };
@@ -2778,7 +2781,7 @@ pub fn register_eth_methods_with_finality(
             if parsed.is_empty() {
                 return Err(jsonrpc_core::Error::invalid_params("missing block hash"));
             }
-            let hex_str = parsed[0]
+            let hex_str = arg(&parsed, 0)
                 .as_str()
                 .map(|s| s.trim_start_matches("0x"))
                 .ok_or_else(|| jsonrpc_core::Error::invalid_params("hash must be a string"))?;
@@ -2816,11 +2819,11 @@ pub fn register_eth_methods_with_finality(
             }
             let current = block_on(api.get_height()).unwrap_or(0);
             let finalized = finalized_tbni.load(Ordering::SeqCst);
-            let number = match resolve_block_tag(parsed[0].as_str(), current, finalized) {
+            let number = match resolve_block_tag(arg(&parsed, 0).as_str(), current, finalized) {
                 Some(n) => n,
                 None => return Err(jsonrpc_core::Error::invalid_params("bad block tag")),
             };
-            let idx_str = parsed[1]
+            let idx_str = arg(&parsed, 1)
                 .as_str()
                 .ok_or_else(|| jsonrpc_core::Error::invalid_params("index must be hex string"))?;
             let idx = usize::from_str_radix(idx_str.trim_start_matches("0x"), 16)
@@ -2865,7 +2868,7 @@ pub fn register_eth_methods_with_finality(
                     "expected [blockHash, index]",
                 ));
             }
-            let hex_str = parsed[0]
+            let hex_str = arg(&parsed, 0)
                 .as_str()
                 .map(|s| s.trim_start_matches("0x"))
                 .ok_or_else(|| jsonrpc_core::Error::invalid_params("hash must be a string"))?;
@@ -2877,7 +2880,7 @@ pub fn register_eth_methods_with_finality(
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&bytes);
             let hash = Hash::new(arr);
-            let idx_str = parsed[1]
+            let idx_str = arg(&parsed, 1)
                 .as_str()
                 .ok_or_else(|| jsonrpc_core::Error::invalid_params("index must be hex string"))?;
             let idx = usize::from_str_radix(idx_str.trim_start_matches("0x"), 16)
@@ -2945,7 +2948,7 @@ pub fn register_eth_methods_with_finality(
         if parsed.is_empty() {
             return Err(jsonrpc_core::Error::invalid_params("missing data"));
         }
-        let hex_str = parsed[0]
+        let hex_str = arg(&parsed, 0)
             .as_str()
             .map(|s| s.trim_start_matches("0x"))
             .ok_or_else(|| jsonrpc_core::Error::invalid_params("data must be hex string"))?;
@@ -3183,9 +3186,12 @@ pub fn register_eth_methods_with_finality(
                 ));
             }
 
-            let mut addr_arr = [0u8; 20];
-            addr_arr.copy_from_slice(&addr_bytes[..20]);
-            let address = Address(addr_arr);
+            let Some(addr_arr) = addr_bytes.first_chunk::<20>() else {
+                return Err(jsonrpc_core::Error::invalid_params(
+                    "Address must be at least 20 bytes",
+                ));
+            };
+            let address = Address(*addr_arr);
 
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3216,6 +3222,15 @@ pub fn register_eth_methods_with_finality(
             }))
         });
     }
+}
+
+
+/// Positional JSON-RPC argument `i`, or `null` when absent, so a short params
+/// array flows into each method's existing "invalid params" path instead of
+/// panicking the handler.
+pub(crate) fn arg(params: &[Value], i: usize) -> &Value {
+    static NULL: Value = Value::Null;
+    params.get(i).unwrap_or(&NULL)
 }
 
 #[cfg(test)]

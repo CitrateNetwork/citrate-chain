@@ -93,11 +93,9 @@ fn check_block(
 
 fn read_checked(storage: &StorageManager) -> Option<(u64, u64)> {
     let v = storage.db.get_cf(CF_METADATA, CHECKED_KEY).ok().flatten()?;
-    if v.len() != 16 {
-        return None;
-    }
-    let h = u64::from_be_bytes(v[..8].try_into().ok()?);
-    let through = u64::from_be_bytes(v[8..].try_into().ok()?);
+    let (h, through) = v.split_first_chunk::<8>()?;
+    let through: &[u8; 8] = through.try_into().ok()?;
+    let (h, through) = (u64::from_be_bytes(*h), u64::from_be_bytes(*through));
     Some((h, through))
 }
 
@@ -161,7 +159,7 @@ pub fn purge_invalid_post_activation(
         let Some(block) = storage.blocks.get_block(hash)? else {
             continue;
         };
-        report.checked += 1;
+        report.checked = report.checked.saturating_add(1);
         let sp = block.selected_parent();
         let doomed_parent = block
             .parents()
@@ -176,7 +174,7 @@ pub fn purge_invalid_post_activation(
         };
         if let Err(why) = verdict {
             if is_legacy_format(hardening, &block) {
-                report.legacy_format += 1;
+                report.legacy_format = report.legacy_format.saturating_add(1);
             }
             report.purged.insert(*hash);
             reasons.insert(*hash, why);
@@ -298,7 +296,7 @@ impl LegacyFormatPeers {
             let tracked = m.contains_key(peer) || m.len() < MAX_TRACKED_PEERS;
             let key = if tracked { peer } else { OTHER_PEERS };
             let c = m.entry(key.to_string()).or_insert(0);
-            *c += 1;
+            *c = c.saturating_add(1);
             (key.to_string(), *c, m.len())
         };
         metrics::counter!(METRIC_LEGACY_FORMAT_BLOCKS, 1, "peer" => label.clone());

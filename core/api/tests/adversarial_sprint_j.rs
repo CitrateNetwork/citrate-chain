@@ -363,8 +363,8 @@ fn ac04_different_heights_different_hashes() {
 fn ac05_peer_id_bound_to_noise_key() {
     use citrate_network::noise::NoiseKeypair;
 
-    let kp1 = NoiseKeypair::generate();
-    let kp2 = NoiseKeypair::generate();
+    let kp1 = NoiseKeypair::generate().expect("keygen");
+    let kp2 = NoiseKeypair::generate().expect("keygen");
 
     let id1 = kp1.derive_peer_id();
     let id2 = kp2.derive_peer_id();
@@ -389,7 +389,7 @@ fn ac05_sybil_peer_id_does_not_match_noise_id() {
     use citrate_network::noise::NoiseKeypair;
     use citrate_network::peer::PeerId;
 
-    let kp = NoiseKeypair::generate();
+    let kp = NoiseKeypair::generate().expect("keygen");
     let noise_id = kp.derive_peer_id();
 
     // Attacker creates many fake PeerIds

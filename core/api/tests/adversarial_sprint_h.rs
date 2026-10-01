@@ -66,7 +66,7 @@ fn compute_tx_root(txs: &[Transaction]) -> Hash {
 /// NoiseKeypair::derive_peer_id() produces a deterministic PeerId from the public key.
 #[test]
 fn h1_noise_keypair_derives_deterministic_peer_id() {
-    let kp = NoiseKeypair::generate();
+    let kp = NoiseKeypair::generate().expect("keygen");
     let id1 = kp.derive_peer_id();
     let id2 = kp.derive_peer_id();
     assert_eq!(id1, id2, "H.1: PeerId must be deterministic from same key");
@@ -75,8 +75,8 @@ fn h1_noise_keypair_derives_deterministic_peer_id() {
 /// Different Noise keypairs produce different PeerIds.
 #[test]
 fn h1_different_keys_produce_different_peer_ids() {
-    let kp1 = NoiseKeypair::generate();
-    let kp2 = NoiseKeypair::generate();
+    let kp1 = NoiseKeypair::generate().expect("keygen");
+    let kp2 = NoiseKeypair::generate().expect("keygen");
     let id1 = kp1.derive_peer_id();
     let id2 = kp2.derive_peer_id();
     assert_ne!(id1, id2, "H.1: Different keys must produce different PeerIds");
@@ -85,7 +85,7 @@ fn h1_different_keys_produce_different_peer_ids() {
 /// PeerId format is `noise_<hex>` for cryptographic binding.
 #[test]
 fn h1_peer_id_format_is_noise_hex() {
-    let kp = NoiseKeypair::generate();
+    let kp = NoiseKeypair::generate().expect("keygen");
     let id = kp.derive_peer_id();
     assert!(
         id.0.starts_with("noise_"),
@@ -103,7 +103,7 @@ fn h1_peer_id_format_is_noise_hex() {
 /// An attacker claiming a random PeerId cannot match a Noise-derived identity.
 #[test]
 fn h1_attacker_random_id_does_not_match_noise_id() {
-    let kp = NoiseKeypair::generate();
+    let kp = NoiseKeypair::generate().expect("keygen");
     let noise_id = kp.derive_peer_id();
     let attacker_id = PeerId::new("peer_12345678".to_string());
     assert_ne!(

@@ -280,9 +280,8 @@ fn derive_operator_address(rest_api_key: &Option<String>) -> Address {
         Some(key) => {
             // Keccak256(api_key)[12..32] = deterministic 20-byte address
             use sha3::{Digest, Keccak256};
-            let hash = Keccak256::digest(key.as_bytes());
-            let mut addr = [0u8; 20];
-            addr.copy_from_slice(&hash[12..32]);
+            let hash: [u8; 32] = Keccak256::digest(key.as_bytes()).into();
+            let [_, _, _, _, _, _, _, _, _, _, _, _, addr @ ..] = hash;
             Address(addr)
         }
         None => {

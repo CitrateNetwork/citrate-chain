@@ -1,3 +1,17 @@
+// PANIC-S1 G2: production code in this crate may not panic (tests excepted).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use axum::{
     extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode},
@@ -149,9 +163,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let faucet_address = {
         use sha3::{Digest, Keccak256};
         let point = faucet_pubkey.to_encoded_point(false);
-        let hash = Keccak256::digest(&point.as_bytes()[1..]);
-        let mut addr = [0u8; 20];
-        addr.copy_from_slice(&hash[12..]);
+        let hash: [u8; 32] = Keccak256::digest(point.as_bytes().get(1..).unwrap_or_default()).into();
+        let [_, _, _, _, _, _, _, _, _, _, _, _, addr @ ..] = hash;
         Address(addr)
     };
 
@@ -647,7 +660,7 @@ async fn request_tokens(
     // Append a uint as a minimal big-endian byte string (leading zeros stripped).
     fn append_uint(s: &mut rlp::RlpStream, be: &[u8]) {
         let i = be.iter().position(|&b| b != 0).unwrap_or(be.len());
-        s.append(&be[i..].to_vec());
+        s.append(&be.get(i..).unwrap_or_default().to_vec());
     }
 
     let to_vec = recipient.0.to_vec(); // 20-byte EVM address
@@ -685,7 +698,11 @@ async fn request_tokens(
     };
     let r = sig.r().to_bytes();
     let s_ = sig.s().to_bytes();
-    let v = chain_id * 2 + 35 + recid.to_byte() as u64;
+    // chain_id is the faucet's own configured chain (40204); saturation is unreachable.
+    let v = chain_id
+        .saturating_mul(2)
+        .saturating_add(35)
+        .saturating_add(recid.to_byte() as u64);
 
     // Full tx: rlp([nonce, gasPrice, gasLimit, to, value, data, v, r, s])
     let mut ft = rlp::RlpStream::new_list(9);
@@ -863,7 +880,7 @@ fn decode_faucet_key_hex(hex_str: &str) -> Result<[u8; 32], String> {
 fn check_cooldown(last_request_elapsed_secs: Option<u64>, cooldown_secs: u64) -> Result<(), String> {
     if let Some(elapsed) = last_request_elapsed_secs {
         if elapsed < cooldown_secs {
-            let remaining = cooldown_secs - elapsed;
+            let remaining = cooldown_secs.saturating_sub(elapsed);
             let hours = remaining / 3600;
             let minutes = (remaining % 3600) / 60;
             return Err(format!("Rate limited: {}h {}m remaining before next claim", hours, minutes));
