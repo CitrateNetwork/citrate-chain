@@ -62,7 +62,7 @@ pub struct Q16Weights {
 impl Q16Weights {
     /// Encode as big-endian bytes (i64 each, total = 8 * values.len()).
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(8 * self.values.len());
+        let mut bytes = Vec::with_capacity(self.values.len().saturating_mul(8));
         for v in &self.values {
             bytes.extend_from_slice(&v.to_be_bytes());
         }
@@ -160,12 +160,12 @@ impl MemoryIpfsClient {
 
     /// Test helper: how many distinct objects have been pinned.
     pub fn pin_count(&self) -> usize {
-        self.pinned.lock().expect("lock").len()
+        self.pinned.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
     }
 
     /// Test helper: retrieve pinned bytes by CID.
     pub fn fetch(&self, cid: &str) -> Option<Vec<u8>> {
-        let pinned = self.pinned.lock().expect("lock");
+        let pinned = self.pinned.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         pinned
             .iter()
             .find(|(c, _)| c == cid)
@@ -186,8 +186,9 @@ impl IpfsClient for MemoryIpfsClient {
         // Real Kubo CIDs are base-CID-encoded multihashes; this stub
         // is just unique-and-deterministic enough for tests.
         let hash = Keccak256::digest(bytes);
-        let cid = format!("cid-{}", hex::encode(&hash[..8]));
-        let mut pinned = self.pinned.lock().expect("lock");
+        let [h0, h1, h2, h3, h4, h5, h6, h7, ..]: [u8; 32] = hash.into();
+        let cid = format!("cid-{}", hex::encode([h0, h1, h2, h3, h4, h5, h6, h7]));
+        let mut pinned = self.pinned.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // Idempotent: if already pinned, don't duplicate.
         if !pinned.iter().any(|(c, _)| c == &cid) {
             pinned.push((cid.clone(), bytes.to_vec()));
@@ -232,7 +233,7 @@ impl<C: ChainAdapter, I: IpfsClient, T: TrainingBackend> RoutingTrainer<C, I, T>
     /// Test/operator helper: seed the trainer with weights from a
     /// previous cycle (or genesis weights at startup).
     pub fn seed_previous_weights(&self, w: Q16Weights) {
-        let mut prev = self.previous_weights.lock().expect("lock");
+        let mut prev = self.previous_weights.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         *prev = Some(w);
     }
 
@@ -272,7 +273,7 @@ where
 
         debug!(cycle_id, "running training backend");
         let prev = {
-            let lock = self.previous_weights.lock().expect("lock");
+            let lock = self.previous_weights.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             lock.clone()
         };
         let new_weights = self
@@ -296,7 +297,7 @@ where
 
         // Cache as previous_weights for the next cycle's SGD init.
         {
-            let mut prev = self.previous_weights.lock().expect("lock");
+            let mut prev = self.previous_weights.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             *prev = Some(new_weights);
         }
 
@@ -486,12 +487,12 @@ mod tests {
         );
 
         // No previous weights initially.
-        assert!(trainer.previous_weights.lock().expect("lock").is_none());
+        assert!(trainer.previous_weights.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_none());
 
         trainer.train(1).await.expect("ok");
 
         // Now previous_weights is populated for the next cycle.
-        assert!(trainer.previous_weights.lock().expect("lock").is_some());
+        assert!(trainer.previous_weights.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some());
     }
 
     #[test]

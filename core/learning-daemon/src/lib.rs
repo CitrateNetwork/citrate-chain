@@ -48,6 +48,20 @@
 //!   - HttpChainAdapter (production RPC): WP-3.5 slice 2
 //!     (this WP ships only the trait + fake impl for unit tests).
 
+// PANIC-S1 G2: production code in this crate may not panic (tests excepted).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 #![warn(missing_docs)]
 
 pub mod aggregator;

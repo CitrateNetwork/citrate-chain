@@ -476,10 +476,10 @@ mod tests {
             "pipeline ran sequentially? elapsed={elapsed:?} \
              (delay={delay:?}, sequential bound = 2*delay)"
         );
-        assert_eq!(agg_seen.lock().expect("lock").len(), 1);
-        assert_eq!(train_seen.lock().expect("lock").len(), 1);
-        assert_eq!(agg_seen.lock().expect("lock")[0].0, 2);
-        assert_eq!(train_seen.lock().expect("lock")[0].0, 1);
+        assert_eq!(agg_seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(), 1);
+        assert_eq!(train_seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(), 1);
+        assert_eq!(agg_seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[0].0, 2);
+        assert_eq!(train_seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[0].0, 1);
     }
 
     #[tokio::test]
@@ -506,7 +506,7 @@ mod tests {
         a.expect("aggregate ok");
         t.expect("train ok");
         // Trainer was NOT invoked.
-        assert_eq!(train_seen.lock().expect("lock").len(), 0);
+        assert_eq!(train_seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(), 0);
     }
 
     #[tokio::test]

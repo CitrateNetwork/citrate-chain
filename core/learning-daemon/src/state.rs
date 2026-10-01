@@ -174,7 +174,7 @@ impl DaemonState {
 
     /// Read the current high water mark.
     pub fn last_processed_block(&self) -> BlockNumber {
-        let cache = self.cache.lock().expect("lock");
+        let cache = self.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.last_processed_block
     }
 
@@ -183,7 +183,7 @@ impl DaemonState {
     /// value below the current HWM
     /// (`LearningDaemon.tla::BlockHWMMonotonic`).
     pub fn set_last_processed_block(&self, n: BlockNumber) -> DaemonResult<()> {
-        let mut cache = self.cache.lock().expect("lock");
+        let mut cache = self.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if n < cache.last_processed_block {
             return Err(DaemonError::Invariant(format!(
                 "BlockHWMMonotonic violation: tried {} < current {}",
@@ -208,7 +208,7 @@ impl DaemonState {
     ///
     /// Bypasses the forward-only check in `set_last_processed_block`.
     pub fn rollback_last_processed_block(&self, n: BlockNumber) -> DaemonResult<()> {
-        let mut cache = self.cache.lock().expect("lock");
+        let mut cache = self.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let cf_meta = self.db.cf_handle(CF_META).ok_or_else(|| {
             DaemonError::Persistence("missing meta cf".into())
         })?;
@@ -223,7 +223,7 @@ impl DaemonState {
     /// has never been recorded (the absence of a record means we
     /// haven't aggregated yet).
     pub fn cycle_status(&self, cycle_id: CycleId) -> CycleStatus {
-        let cache = self.cache.lock().expect("lock");
+        let cache = self.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         cache
             .cycle_status
             .get(&cycle_id)
@@ -239,7 +239,7 @@ impl DaemonState {
         cycle_id: CycleId,
         new_status: CycleStatus,
     ) -> DaemonResult<()> {
-        let mut cache = self.cache.lock().expect("lock");
+        let mut cache = self.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let current = cache
             .cycle_status
             .get(&cycle_id)
@@ -263,7 +263,7 @@ impl DaemonState {
 
     /// Read the finalize status of a cycle. Defaults to `NotCalled`.
     pub fn finalize_status(&self, cycle_id: CycleId) -> FinalizeStatus {
-        let cache = self.cache.lock().expect("lock");
+        let cache = self.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         cache
             .finalize_status
             .get(&cycle_id)
@@ -275,7 +275,7 @@ impl DaemonState {
     /// transition NotCalled → Called only. Re-firing returns
     /// `Err(DaemonError::Invariant)`.
     pub fn mark_finalized(&self, cycle_id: CycleId) -> DaemonResult<()> {
-        let mut cache = self.cache.lock().expect("lock");
+        let mut cache = self.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let current = cache
             .finalize_status
             .get(&cycle_id)

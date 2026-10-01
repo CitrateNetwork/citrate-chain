@@ -86,7 +86,7 @@ impl MemoryEmbeddingCache {
 
     /// Test helper: insert an embedding entry for a cycle.
     pub fn insert(&self, cycle_id: CycleId, entry: EmbeddingEntry) {
-        let mut entries = self.entries.lock().expect("lock");
+        let mut entries = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         entries.entry(cycle_id).or_default().push(entry);
     }
 }
@@ -99,7 +99,7 @@ impl Default for MemoryEmbeddingCache {
 
 impl EmbeddingCache for MemoryEmbeddingCache {
     fn embeddings_for_cycle(&self, cycle_id: CycleId) -> Vec<EmbeddingEntry> {
-        let entries = self.entries.lock().expect("lock");
+        let entries = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         entries.get(&cycle_id).cloned().unwrap_or_default()
     }
 }
@@ -132,7 +132,7 @@ impl<C: ChainAdapter> BelnapAggregator<C> {
             state,
             cache,
             threshold_pos_q16: q16_zero_point_eight,
-            threshold_neg_q16: -q16_zero_point_eight,
+            threshold_neg_q16: q16_zero_point_eight.saturating_neg(),
         }
     }
 
@@ -149,10 +149,10 @@ impl<C: ChainAdapter> BelnapAggregator<C> {
     /// (which is `#[cfg(test)]` only over there — we recreate the
     /// encoder here since the daemon needs it in production).
     fn encode_belnap_input(&self, entries: &[EmbeddingEntry]) -> DaemonResult<Vec<u8>> {
-        if entries.is_empty() {
+        let Some(first) = entries.first() else {
             return Err(DaemonError::Aggregation("no embeddings to aggregate".into()));
-        }
-        let dim = entries[0].embedding.len();
+        };
+        let dim = first.embedding.len();
         if dim == 0 {
             return Err(DaemonError::Aggregation("embedding dim is zero".into()));
         }
@@ -180,7 +180,12 @@ impl<C: ChainAdapter> BelnapAggregator<C> {
             )));
         }
 
-        let mut bytes = Vec::with_capacity(24 + 16 * n * dim + 8 * n);
+        let mut bytes = Vec::with_capacity(
+            n.saturating_mul(dim)
+                .saturating_mul(16)
+                .saturating_add(n.saturating_mul(8))
+                .saturating_add(24),
+        );
         bytes.extend_from_slice(&(dim as u32).to_be_bytes());
         bytes.extend_from_slice(&(n as u32).to_be_bytes());
         for e in entries {
