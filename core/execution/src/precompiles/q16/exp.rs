@@ -84,6 +84,10 @@ const X_MIN_Q16: i64 = -16 * (1 << 16);
 /// are all spec-defined. The cross-platform fixture in
 /// `tests/cross_platform/q16_determinism.rs` (RM-M2 WP-M2.9)
 /// freezes the byte output for a fixture sweep.
+// INVARIANT: arithmetic is reached only for x in (X_MIN_Q16, X_MAX_Q16); the bounds
+// argued inline hold on that whole domain. Test panic_s1_q16_exp_exhaustive_no_overflow
+// evaluates all ~3.3M such inputs with overflow checks on (PANIC-S1 PROVE+KEEP).
+#[allow(clippy::arithmetic_side_effects)]
 pub fn q16_exp(x: Q16) -> Q16 {
     let x_raw = x.0;
 
@@ -417,6 +421,17 @@ mod tests {
                 "exp({}) = {:?} is negative",
                 x_raw, r
             );
+        }
+    }
+
+    /// PANIC-S1 PROVE+KEEP: every input that passes the saturation gates is
+    /// evaluated with debug overflow checks on, so no arithmetic step can panic,
+    /// and the result is a valid non-negative Q16.
+    #[test]
+    fn panic_s1_q16_exp_exhaustive_no_overflow() {
+        for raw in (X_MIN_Q16 + 1)..X_MAX_Q16 {
+            let y = q16_exp(Q16(raw));
+            assert!(y.0 >= 0, "exp({raw}) = {} < 0", y.0);
         }
     }
 }

@@ -27,6 +27,17 @@ pub fn dot(a: &[Q16], b: &[Q16]) -> Q16 {
     acc
 }
 
+/// Element `(row, col)` of a row-major matrix with `stride` columns. Callers
+/// validate shapes, so this is always in range; out-of-range reads as zero rather
+/// than panicking.
+fn at(m: &[Q16], row: usize, stride: usize, col: usize) -> Q16 {
+    row.checked_mul(stride)
+        .and_then(|r| r.checked_add(col))
+        .and_then(|idx| m.get(idx))
+        .copied()
+        .unwrap_or(Q16::ZERO)
+}
+
 /// Matrix multiplication. `a` is rows_a × cols_a, `b` is
 /// cols_a × cols_b, output is rows_a × cols_b. All matrices
 /// stored row-major.
@@ -41,18 +52,19 @@ pub fn matmul(
     cols_a: usize,
     cols_b: usize,
 ) -> Vec<Q16> {
-    debug_assert_eq!(a.len(), rows_a * cols_a);
-    debug_assert_eq!(b.len(), cols_a * cols_b);
-    let mut out = vec![Q16::ZERO; rows_a * cols_b];
+    debug_assert_eq!(rows_a.checked_mul(cols_a), Some(a.len()));
+    debug_assert_eq!(cols_a.checked_mul(cols_b), Some(b.len()));
+    // Row-major output, built in index order (identical to `out[i * cols_b + j]`).
+    let mut out = Vec::with_capacity(rows_a.saturating_mul(cols_b));
     for i in 0..rows_a {
         for j in 0..cols_b {
             let mut acc = Q16::ZERO;
             for k in 0..cols_a {
-                let aik = a[i * cols_a + k];
-                let bkj = b[k * cols_b + j];
+                let aik = at(a, i, cols_a, k);
+                let bkj = at(b, k, cols_b, j);
                 acc = acc.saturating_add(aik.saturating_mul(bkj));
             }
-            out[i * cols_b + j] = acc;
+            out.push(acc);
         }
     }
     out
@@ -68,14 +80,17 @@ pub fn linear(
     out_dim: usize,
     in_dim: usize,
 ) -> Vec<Q16> {
-    debug_assert_eq!(weights.len(), out_dim * in_dim);
+    debug_assert_eq!(out_dim.checked_mul(in_dim), Some(weights.len()));
     debug_assert_eq!(input.len(), in_dim);
     debug_assert_eq!(bias.len(), out_dim);
     let mut out = Vec::with_capacity(out_dim);
     for i in 0..out_dim {
-        let row = &weights[i * in_dim..(i + 1) * in_dim];
+        let row = i
+            .checked_mul(in_dim)
+            .and_then(|start| weights.get(start..start.checked_add(in_dim)?))
+            .unwrap_or_default();
         let mut acc = dot(row, input);
-        acc = acc.saturating_add(bias[i]);
+        acc = acc.saturating_add(bias.get(i).copied().unwrap_or(Q16::ZERO));
         out.push(acc);
     }
     out
@@ -93,11 +108,12 @@ pub fn relu(input: &[Q16]) -> Vec<Q16> {
 /// `cols × rows`, both row-major. Caller validates
 /// `input.len() == rows * cols`.
 pub fn transpose(input: &[Q16], rows: usize, cols: usize) -> Vec<Q16> {
-    debug_assert_eq!(input.len(), rows * cols);
-    let mut out = vec![Q16::ZERO; rows * cols];
-    for i in 0..rows {
-        for j in 0..cols {
-            out[j * rows + i] = input[i * cols + j];
+    debug_assert_eq!(rows.checked_mul(cols), Some(input.len()));
+    // Output index j * rows + i, so build with j outer and i inner.
+    let mut out = Vec::with_capacity(rows.saturating_mul(cols));
+    for j in 0..cols {
+        for i in 0..rows {
+            out.push(at(input, i, cols, j));
         }
     }
     out
@@ -120,11 +136,11 @@ pub fn transpose(input: &[Q16], rows: usize, cols: usize) -> Vec<Q16> {
 ///   propagating saturation pathology.
 pub fn softmax(input: &[Q16]) -> Vec<Q16> {
     use super::q16_exp;
-    if input.is_empty() {
+    let Some(&first) = input.first() else {
         return Vec::new();
-    }
+    };
     // Find max for numerical stability.
-    let max_val = input.iter().fold(input[0], |a, &b| {
+    let max_val = input.iter().fold(first, |a, &b| {
         if b.0 > a.0 { b } else { a }
     });
     // Compute exp(x[i] - max).
