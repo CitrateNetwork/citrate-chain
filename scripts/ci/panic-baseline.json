@@ -5,21 +5,6 @@
    "indexing_slicing": 109,
    "string_slice": 9
   },
-  "core/api": {
-   "arithmetic_side_effects": 42,
-   "expect_used": 3,
-   "indexing_slicing": 78,
-   "panic": 19,
-   "string_slice": 13
-  },
-  "core/bridge": {
-   "arithmetic_side_effects": 15,
-   "indexing_slicing": 1,
-   "panic": 1
-  },
-  "core/economics": {
-   "arithmetic_side_effects": 135
-  },
   "core/execution": {
    "arithmetic_side_effects": 171,
    "indexing_slicing": 196,
@@ -34,65 +19,6 @@
    "arithmetic_side_effects": 9,
    "expect_used": 33,
    "indexing_slicing": 2
-  },
-  "core/marketplace": {
-   "arithmetic_side_effects": 42,
-   "indexing_slicing": 3,
-   "string_slice": 1
-  },
-  "core/mcp": {
-   "arithmetic_side_effects": 22,
-   "indexing_slicing": 7
-  },
-  "core/network": {
-   "arithmetic_side_effects": 63,
-   "indexing_slicing": 43,
-   "panic": 4,
-   "string_slice": 4
-  },
-  "core/primitives": {
-   "arithmetic_side_effects": 1
-  },
-  "core/sequencer": {
-   "arithmetic_side_effects": 19,
-   "indexing_slicing": 1
-  },
-  "core/signing": {
-   "expect_used": 1
-  },
-  "core/storage": {
-   "panic": 2
-  },
-  "faucet": {
-   "arithmetic_side_effects": 4,
-   "expect_used": 5,
-   "indexing_slicing": 3
-  },
-  "node": {
-   "arithmetic_side_effects": 67,
-   "expect_used": 1,
-   "indexing_slicing": 34,
-   "string_slice": 9,
-   "unreachable": 2
-  },
-  "node-app": {
-   "unreachable": 1
-  },
-  "wallet": {
-   "arithmetic_side_effects": 8,
-   "expect_used": 1,
-   "indexing_slicing": 7,
-   "string_slice": 2
-  },
-  "wallet-aa": {
-   "arithmetic_side_effects": 4,
-   "expect_used": 3
-  },
-  "wallet-core": {
-   "arithmetic_side_effects": 8,
-   "expect_used": 2,
-   "indexing_slicing": 24,
-   "string_slice": 1
   }
  },
  "lints": [
@@ -104,5 +30,5 @@
   "arithmetic_side_effects",
   "string_slice"
  ],
- "total": 1423
+ "total": 717
 }
