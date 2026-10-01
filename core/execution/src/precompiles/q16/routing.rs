@@ -502,7 +502,7 @@ pub fn execute(input: &[u8], gas_limit: u64) -> Result<crate::precompiles::Preco
 
     // Compute params from the header so gas accounting is accurate
     // BEFORE doing the full decode + tensor allocation.
-    let params_hint = if let (true, Some([_, i, h, o])) = (input.len() >= HEADER_LEN, header_words(input)) {
+    let params_hint = if let Some([_, i, h, o]) = header_words(input) {
         let (i, h, o) = (i as u64, h as u64, o as u64);
         // Same formula as RoutingShape::params(), but in u64 with
         // saturating arithmetic so a malicious header can't overflow.
@@ -1142,6 +1142,38 @@ mod tests {
                 confidence: Q16::from_raw(conf_raw),
             };
             proptest::prop_assert_eq!(encode_output(&out).len(), 16);
+        }
+    }
+
+    /// PANIC-S1 G4: each of the six layer lengths is checked on its own.
+    #[test]
+    fn panic_s1_validate_checks_every_layer_length() {
+        let s = RoutingShape::V1;
+        let (i, h, o) = (s.input_dim as usize, s.hidden_dim as usize, s.output_dim as usize);
+        let good = RoutingInput {
+            arch_version: ARCH_VERSION,
+            shape: s,
+            input: vec![Q16::ZERO; i],
+            w1: vec![Q16::ZERO; h * i],
+            b1: vec![Q16::ZERO; h],
+            w2: vec![Q16::ZERO; h * h],
+            b2: vec![Q16::ZERO; h],
+            w3: vec![Q16::ZERO; o * h],
+            b3: vec![Q16::ZERO; o],
+        };
+        assert_eq!(validate(&good), Ok(()));
+        let fields: [fn(&mut RoutingInput) -> &mut Vec<Q16>; 6] = [
+            |x| &mut x.w1,
+            |x| &mut x.b1,
+            |x| &mut x.w2,
+            |x| &mut x.b2,
+            |x| &mut x.w3,
+            |x| &mut x.b3,
+        ];
+        for field in fields {
+            let mut bad = good.clone();
+            field(&mut bad).pop();
+            assert_eq!(validate(&bad), Err(RoutingError::LengthMismatch));
         }
     }
 }

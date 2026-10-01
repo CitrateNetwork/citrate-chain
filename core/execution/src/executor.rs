@@ -5545,4 +5545,26 @@ mod tests {
             .expect("registered");
         assert!(matches!(m.access_policy, AccessPolicy::PayPerUse { fee } if fee == U256::from(77u8)));
     }
+
+    /// PANIC-S1 G4: value sent to a precompile moves through the journal.
+    #[tokio::test]
+    async fn panic_s1_value_to_precompile_moves_through_journal() {
+        let state_db = Arc::new(StateDB::new());
+        let executor = Executor::new(state_db.clone());
+        let from = Address([5; 20]);
+        state_db.accounts.set_balance(from, U256::from(100u64));
+        let gov = Executor::governance_precompile_address();
+        state_db.set_storage(gov, b"ADMIN".to_vec(), from.0.to_vec());
+        let block = create_test_block();
+        let mut ctx = big_gas_ctx(&block);
+        let mut data = selector4(b"getParam(bytes32)").to_vec();
+        data.extend_from_slice(&[0u8; 32]);
+        executor
+            .execute_call(from, gov, data, U256::from(30u64), &mut ctx)
+            .await
+            .unwrap();
+        let j = ctx.journal.lock();
+        assert_eq!(j.pending_balance(&from), Some(U256::from(70u64)));
+        assert_eq!(j.pending_balance(&gov), Some(U256::from(30u64)));
+    }
 }

@@ -795,4 +795,14 @@ mod tests {
         assert!(r.is_err());
         assert!(r.unwrap_err().to_string().contains("Unknown compute"));
     }
+
+    /// PANIC-S1 G4: gas is exactly base + per-element × len.
+    #[test]
+    fn panic_s1_dot_gas_is_exact() {
+        let mut input = q16_tensor_from_ints(&[3], &[1, 2, 3]);
+        input.extend_from_slice(&q16_tensor_from_ints(&[3], &[4, 5, 6]));
+        let r = dot(&input, 1_000_000).unwrap();
+        assert_eq!(r.gas_used, gas_costs::DOT_BASE + 3 * gas_costs::DOT_PER_ELEMENT);
+        assert_eq!(gas_cost(10, 3, 4), 22);
+    }
 }

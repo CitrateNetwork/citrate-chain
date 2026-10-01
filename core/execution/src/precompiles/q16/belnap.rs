@@ -265,11 +265,8 @@ pub fn decode(input: &[u8]) -> Result<BelnapInput, BelnapError> {
     // = 24 + 16*n*dim + 8*n
     // which matches our body_len + HEADER_LEN = 8 + (16*n*dim + 8*n) + 16.
 
-    let thresholds = match input.get(cursor..) {
-        Some(t) if t.len() == 16 => t,
-        _ => return Err(BelnapError::LengthMismatch),
-    };
-    let mut threshold_words = take_q16(thresholds, &mut 0, 2)?.into_iter();
+    // The total-length check above leaves exactly the two 8-byte thresholds here.
+    let mut threshold_words = take_q16(input, &mut cursor, 2)?.into_iter();
     let (Some(threshold_pos), Some(threshold_neg)) =
         (threshold_words.next(), threshold_words.next())
     else {
