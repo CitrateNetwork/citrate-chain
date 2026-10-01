@@ -62,8 +62,7 @@ impl AccessSetExtractor for DefaultAccessSetExtractor {
             // If it's a contract call, add storage keys based on data
             if !tx.data.is_empty() {
                 // Function selector is first 4 bytes
-                if tx.data.len() >= 4 {
-                    let selector = &tx.data[0..4];
+                if let Some(selector) = tx.data.get(0..4) {
                     let storage_key =
                         format!("storage:{}:{}", hex::encode(to.0), hex::encode(selector))
                             .into_bytes();
@@ -74,7 +73,7 @@ impl AccessSetExtractor for DefaultAccessSetExtractor {
         }
 
         // Model transactions access model registry
-        if tx.data.len() > 32 && tx.data[0] == 0xA0 {
+        if tx.data.len() > 32 && tx.data.first() == Some(&0xA0) {
             access_set.reads.insert(b"registry:models".to_vec());
             access_set.writes.insert(b"registry:models".to_vec());
         }

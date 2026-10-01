@@ -191,10 +191,7 @@ impl RetryHarness {
     {
         // --- Fast path: bounded retries ---
         for attempt in 0..self.max_retries {
-            let mut journal = self.coord.new_pinned_journal();
-            let pin = journal
-                .pinned_version()
-                .expect("new_pinned_journal returns a pinned journal");
+            let (mut journal, pin) = self.coord.new_pinned_journal_with_pin();
             execute(&mut journal, pin);
 
             match self.coord.try_commit(&journal) {
