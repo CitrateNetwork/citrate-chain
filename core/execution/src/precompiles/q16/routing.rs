@@ -129,7 +129,12 @@ impl RoutingShape {
         let i = self.input_dim as u64;
         let h = self.hidden_dim as u64;
         let o = self.output_dim as u64;
-        h * i + h + h * h + h + o * h + o
+        h.saturating_mul(i)
+            .saturating_add(h)
+            .saturating_add(h.saturating_mul(h))
+            .saturating_add(h)
+            .saturating_add(o.saturating_mul(h))
+            .saturating_add(o)
     }
 }
 
@@ -214,10 +219,8 @@ pub fn decode(input: &[u8]) -> Result<RoutingInput, RoutingError> {
         return Err(RoutingError::InputTooLarge);
     }
 
-    let arch_version = u32::from_be_bytes(input[0..4].try_into().expect("4 bytes"));
-    let input_dim = u32::from_be_bytes(input[4..8].try_into().expect("4 bytes"));
-    let hidden_dim = u32::from_be_bytes(input[8..12].try_into().expect("4 bytes"));
-    let output_dim = u32::from_be_bytes(input[12..16].try_into().expect("4 bytes"));
+    let [arch_version, input_dim, hidden_dim, output_dim] =
+        header_words(input).ok_or(RoutingError::InputTooShort)?;
 
     if input_dim == 0 || hidden_dim == 0 || output_dim == 0 {
         return Err(RoutingError::DimZero);
@@ -270,33 +273,13 @@ pub fn decode(input: &[u8]) -> Result<RoutingInput, RoutingError> {
 
     let mut cursor = HEADER_LEN;
 
-    let input_vec = decode_q16_slice(&input[cursor..cursor + i * 8])
-        .ok_or(RoutingError::LengthMismatch)?;
-    cursor += i * 8;
-
-    let w1 = decode_q16_slice(&input[cursor..cursor + h * i * 8])
-        .ok_or(RoutingError::LengthMismatch)?;
-    cursor += h * i * 8;
-
-    let b1 = decode_q16_slice(&input[cursor..cursor + h * 8])
-        .ok_or(RoutingError::LengthMismatch)?;
-    cursor += h * 8;
-
-    let w2 = decode_q16_slice(&input[cursor..cursor + h * h * 8])
-        .ok_or(RoutingError::LengthMismatch)?;
-    cursor += h * h * 8;
-
-    let b2 = decode_q16_slice(&input[cursor..cursor + h * 8])
-        .ok_or(RoutingError::LengthMismatch)?;
-    cursor += h * 8;
-
-    let w3 = decode_q16_slice(&input[cursor..cursor + o * h * 8])
-        .ok_or(RoutingError::LengthMismatch)?;
-    cursor += o * h * 8;
-
-    let b3 = decode_q16_slice(&input[cursor..cursor + o * 8])
-        .ok_or(RoutingError::LengthMismatch)?;
-    cursor += o * 8;
+    let input_vec = take_q16(input, &mut cursor, i)?;
+    let w1 = take_q16(input, &mut cursor, w1_count)?;
+    let b1 = take_q16(input, &mut cursor, h)?;
+    let w2 = take_q16(input, &mut cursor, w2_count)?;
+    let b2 = take_q16(input, &mut cursor, h)?;
+    let w3 = take_q16(input, &mut cursor, w3_count)?;
+    let b3 = take_q16(input, &mut cursor, o)?;
 
     debug_assert_eq!(cursor, input.len());
 
@@ -313,15 +296,29 @@ pub fn decode(input: &[u8]) -> Result<RoutingInput, RoutingError> {
     })
 }
 
-fn decode_q16_slice(bytes: &[u8]) -> Option<Vec<Q16>> {
-    if !bytes.len().is_multiple_of(8) {
-        return None;
-    }
-    let mut out = Vec::with_capacity(bytes.len() / 8);
-    for chunk in bytes.chunks_exact(8) {
-        out.push(Q16::from_raw(i64::from_be_bytes(chunk.try_into().expect("8 bytes"))));
-    }
-    Some(out)
+/// The four big-endian u32 header words: arch_version, input/hidden/output dims.
+fn header_words(input: &[u8]) -> Option<[u32; 4]> {
+    let header: &[u8; 16] = input.first_chunk::<16>()?;
+    let [a0, a1, a2, a3, b0, b1, b2, b3, c0, c1, c2, c3, d0, d1, d2, d3] = *header;
+    Some([
+        u32::from_be_bytes([a0, a1, a2, a3]),
+        u32::from_be_bytes([b0, b1, b2, b3]),
+        u32::from_be_bytes([c0, c1, c2, c3]),
+        u32::from_be_bytes([d0, d1, d2, d3]),
+    ])
+}
+
+/// Decode the next `count` big-endian Q16 values at `*cursor` and advance it.
+fn take_q16(input: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<Q16>, RoutingError> {
+    let len = count.checked_mul(8).ok_or(RoutingError::LengthMismatch)?;
+    let end = cursor.checked_add(len).ok_or(RoutingError::LengthMismatch)?;
+    let bytes = input.get(*cursor..end).ok_or(RoutingError::LengthMismatch)?;
+    *cursor = end;
+    Ok(bytes
+        .chunks_exact(8)
+        .filter_map(|chunk| <[u8; 8]>::try_from(chunk).ok())
+        .map(|b| Q16::from_raw(i64::from_be_bytes(b)))
+        .collect())
 }
 
 /// Encode a `RoutingOutput` into wire-format bytes (16 bytes total).
@@ -357,13 +354,13 @@ pub fn validate(input: &RoutingInput) -> Result<(), RoutingError> {
     if input.input.len() != i {
         return Err(RoutingError::LengthMismatch);
     }
-    if input.w1.len() != h * i || input.b1.len() != h {
+    if Some(input.w1.len()) != h.checked_mul(i) || input.b1.len() != h {
         return Err(RoutingError::LengthMismatch);
     }
-    if input.w2.len() != h * h || input.b2.len() != h {
+    if Some(input.w2.len()) != h.checked_mul(h) || input.b2.len() != h {
         return Err(RoutingError::LengthMismatch);
     }
-    if input.w3.len() != o * h || input.b3.len() != o {
+    if Some(input.w3.len()) != o.checked_mul(h) || input.b3.len() != o {
         return Err(RoutingError::LengthMismatch);
     }
     Ok(())
@@ -451,11 +448,11 @@ pub fn forward_decoded(input: &RoutingInput) -> RoutingOutput {
 /// guarantees output_dim > 0 via `validate()` so this is unreachable
 /// in production.
 fn argmax(values: &[Q16]) -> (usize, Q16) {
-    if values.is_empty() {
+    let Some(&first) = values.first() else {
         return (0, Q16::ZERO);
-    }
+    };
     let mut best_i = 0usize;
-    let mut best_v = values[0];
+    let mut best_v = first;
     for (i, v) in values.iter().enumerate().skip(1) {
         if v.0 > best_v.0 {
             best_i = i;
@@ -491,10 +488,8 @@ pub fn execute(input: &[u8], gas_limit: u64) -> Result<crate::precompiles::Preco
 
     // Compute params from the header so gas accounting is accurate
     // BEFORE doing the full decode + tensor allocation.
-    let params_hint = if input.len() >= HEADER_LEN {
-        let i = u32::from_be_bytes(input[4..8].try_into().expect("4 bytes")) as u64;
-        let h = u32::from_be_bytes(input[8..12].try_into().expect("4 bytes")) as u64;
-        let o = u32::from_be_bytes(input[12..16].try_into().expect("4 bytes")) as u64;
+    let params_hint = if let (true, Some([_, i, h, o])) = (input.len() >= HEADER_LEN, header_words(input)) {
+        let (i, h, o) = (i as u64, h as u64, o as u64);
         // Same formula as RoutingShape::params(), but in u64 with
         // saturating arithmetic so a malicious header can't overflow.
         h.saturating_mul(i)
