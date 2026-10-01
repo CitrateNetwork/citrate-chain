@@ -179,6 +179,14 @@ pub const RELEASE_GENESIS: &[(u64, [u8; 32])] = &[
     ),
 ];
 
+// INVARIANT: compile-time only. Every call is inside a `const` item, so a bad
+// literal is a BUILD error, never a runtime panic. Pinned by the build itself and
+// by the release-genesis constants test in this module.
+#[allow(
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
 const fn hex32(s: &str) -> [u8; 32] {
     const fn nib(c: u8) -> u8 {
         match c {
@@ -283,7 +291,10 @@ impl ResolvedActivation {
             self.chain_id
         );
         let d = Sha3_256::digest(pre.as_bytes());
-        format!("0x{}", hex::encode(&d[..16]))
+        format!(
+            "0x{}",
+            d.first_chunk::<16>().map(hex::encode).unwrap_or_default()
+        )
     }
 }
 

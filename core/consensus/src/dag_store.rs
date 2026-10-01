@@ -78,7 +78,8 @@ fn push_children_op(ops: &mut Vec<KvOp>, parent: &Hash, children: &[Hash]) {
         Err(e) => {
             tracing::error!(
                 "M-06: serialize children for {} failed: {} — skipping persistence",
-                parent, e
+                parent,
+                e
             );
         }
     }
@@ -316,7 +317,7 @@ impl DagStore {
             .map_err(|e| err("blocks", e))?
         {
             if key.len() == 32 && doomed.contains(&Hash::from_bytes(&key)) {
-                removed += 1;
+                removed = removed.saturating_add(1);
                 ops.push(KvOp::Delete {
                     cf: cf::DAG_BLOCKS.to_string(),
                     key: key.clone(),
@@ -638,7 +639,13 @@ impl DagStore {
         }
 
         // Proposer pubkey must be non-zero
-        if block.header.proposer_pubkey.as_bytes().iter().all(|&b| b == 0) {
+        if block
+            .header
+            .proposer_pubkey
+            .as_bytes()
+            .iter()
+            .all(|&b| b == 0)
+        {
             return Err("Block has zero proposer public key".to_string());
         }
 
@@ -677,7 +684,10 @@ impl DagStore {
         let parent_hash = block.selected_parent();
         let blocks = self.blocks.read().await;
         let parent = blocks.get(&parent_hash).ok_or_else(|| {
-            format!("Parent block {} not found for VRF verification", parent_hash)
+            format!(
+                "Parent block {} not found for VRF verification",
+                parent_hash
+            )
         })?;
 
         let prev_vrf_output = parent.header.vrf_reveal.output;
@@ -811,7 +821,8 @@ impl DagStore {
             } else {
                 tracing::warn!(
                     "Block {} VRF plausibility check failed (permissive mode): {}",
-                    hash, e
+                    hash,
+                    e
                 );
             }
         }
@@ -850,7 +861,8 @@ impl DagStore {
             Err(e) => {
                 tracing::error!(
                     "M-06: serialize block {} failed: {} — skipping persistence",
-                    hash, e
+                    hash,
+                    e
                 );
             }
         }
@@ -910,7 +922,8 @@ impl DagStore {
             Err(e) => {
                 tracing::error!(
                     "M-06: serialize height index {} failed: {} — skipping persistence",
-                    height, e
+                    height,
+                    e
                 );
             }
         }
@@ -943,7 +956,10 @@ impl DagStore {
                 .or_insert_with(Vec::new)
                 .push(hash);
             for merge_parent in &block.header.merge_parent_hashes {
-                children.entry(*merge_parent).or_insert_with(Vec::new).push(hash);
+                children
+                    .entry(*merge_parent)
+                    .or_insert_with(Vec::new)
+                    .push(hash);
             }
             children.insert(hash, Vec::new());
             drop(children);
@@ -1077,7 +1093,7 @@ impl DagStore {
 
         let mut blocks = self.blocks.write().await;
         let mut blocks_by_height = self.blocks_by_height.write().await;
-        let mut pruned_count = 0;
+        let mut pruned_count: usize = 0;
 
         // Remove blocks below pruning height
         let heights_to_remove: Vec<u64> = blocks_by_height
@@ -1096,7 +1112,7 @@ impl DagStore {
                         // forever (the anchor keyspace would then grow without
                         // bound, which is the leak pruning exists to stop).
                         self.persist_delete_derived_blue_score(&hash);
-                        pruned_count += 1;
+                        pruned_count = pruned_count.saturating_add(1);
                     }
                 }
                 // Remove height index from persistence
@@ -1136,7 +1152,6 @@ impl Default for DagStore {
         Self::new()
     }
 }
-
 
 #[derive(Debug, Clone)]
 pub struct DagStats {
@@ -1365,7 +1380,10 @@ mod tests {
         store_strict.store_block(genesis2.clone()).await.unwrap();
         let block2 = create_block_with_vrf([2; 32], 1, genesis2.hash());
         assert!(
-            matches!(store_strict.store_block(block2).await, Err(DagStoreError::InvalidVrf(_))),
+            matches!(
+                store_strict.store_block(block2).await,
+                Err(DagStoreError::InvalidVrf(_))
+            ),
             "strict-mode fallback must reject a forgeable legacy SHA3 proof"
         );
     }
@@ -1431,6 +1449,40 @@ mod tests {
                 .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                 .unwrap_or_default())
         }
+    }
+
+    #[test]
+    fn panic_s1_purge_persisted_blocks_counts_and_filters_exactly() {
+        let kv = MemKvStore::new();
+        let doomed_a = Hash::new([0xA1; 32]);
+        let doomed_b = Hash::new([0xB2; 32]);
+        let keep = Hash::new([0xC3; 32]);
+        for h in [doomed_a, doomed_b, keep] {
+            kv.kv_put(cf::DAG_BLOCKS, h.as_bytes(), b"blk").unwrap();
+        }
+        // A malformed (short) key must be ignored, never decoded.
+        kv.kv_put(cf::DAG_BLOCKS, &[0xA1; 7], b"junk").unwrap();
+
+        let doomed: HashSet<Hash> = [doomed_a, doomed_b, Hash::new([0xEE; 32])]
+            .into_iter()
+            .collect();
+        let removed = DagStore::purge_persisted_blocks(&kv, &doomed).expect("purge");
+        assert_eq!(removed, 2, "exactly the two stored doomed blocks");
+
+        let left: Vec<Vec<u8>> = kv
+            .kv_iter_cf(cf::DAG_BLOCKS)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(left.contains(&keep.as_bytes().to_vec()));
+        assert!(left.contains(&vec![0xA1; 7]));
+        assert_eq!(left.len(), 2);
+
+        assert_eq!(
+            DagStore::purge_persisted_blocks(&kv, &HashSet::new()).unwrap(),
+            0
+        );
     }
 
     /// WP-S.1: Store a block, drop the DagStore, recreate from same KvStore — block survives.
@@ -1518,8 +1570,8 @@ mod tests {
         // On disk this leaves the wedged state: two tips {genesis, head}.
         // Reload with the fix — the height-0 orphan genesis must be dropped.
         drop(store);
-        let store2 = DagStore::persistent_with_strict_vrf(kv, false)
-            .expect("reload should succeed");
+        let store2 =
+            DagStore::persistent_with_strict_vrf(kv, false).expect("reload should succeed");
         let tips = store2.get_tips().await;
         assert_eq!(
             tips.len(),
@@ -1557,12 +1609,18 @@ mod tests {
         store.store_block(genesis).await.expect("seed genesis");
         let tips = store.get_tips().await;
         assert_eq!(tips.len(), 1, "seeded genesis must be the sole tip");
-        assert_eq!(tips[0].hash, genesis_hash, "genesis is the height-0 root tip");
+        assert_eq!(
+            tips[0].hash, genesis_hash,
+            "genesis is the height-0 root tip"
+        );
 
         // Block 1 now links to genesis (parent = genesis_hash, NOT the zero hash).
         let b1 = create_test_block([1; 32], 1, genesis_hash);
         let b1_hash = b1.hash();
-        store.store_block(b1).await.expect("store b1 linked to genesis");
+        store
+            .store_block(b1)
+            .await
+            .expect("store b1 linked to genesis");
 
         // Genesis has a child ⇒ no longer a tip; block 1 is the sole tip.
         let tips = store.get_tips().await;
@@ -1579,8 +1637,8 @@ mod tests {
 
         // Survives a reload — parity with the read/repair half.
         drop(store);
-        let store2 = DagStore::persistent_with_strict_vrf(kv, false)
-            .expect("reload should succeed");
+        let store2 =
+            DagStore::persistent_with_strict_vrf(kv, false).expect("reload should succeed");
         let tips = store2.get_tips().await;
         assert_eq!(tips.len(), 1, "one tip after reload");
         assert_eq!(
@@ -1783,7 +1841,11 @@ mod tests {
         // equivocation. detect_equivocation must surface block `a`.
         let b = block_by_proposer([0xB2; 32], 1, genesis.hash(), 7);
         let found = store.detect_equivocation(&b).await;
-        assert_eq!(found, Some(a.hash()), "must detect the equivocating sibling");
+        assert_eq!(
+            found,
+            Some(a.hash()),
+            "must detect the equivocating sibling"
+        );
     }
 
     #[tokio::test]
@@ -1818,22 +1880,36 @@ mod tests {
         // In-set whale (well above minStake) — eligible.
         let whale = PublicKey::new([0x9A; 32]);
         selector
-            .register_validator(Validator { pubkey: whale, stake: 1_000_000, is_active: true })
+            .register_validator(Validator {
+                pubkey: whale,
+                stake: 1_000_000,
+                is_active: true,
+            })
             .await;
         // Below-minStake proposer — ineligible by membership.
         let proposer = PublicKey::new([7; 32]);
         selector
-            .register_validator(Validator { pubkey: proposer, stake: 1, is_active: true })
+            .register_validator(Validator {
+                pubkey: proposer,
+                stake: 1,
+                is_active: true,
+            })
             .await;
 
         // Eligibility no longer depends on the VRF output (integer/deterministic).
         let any_output = Hash::new([0xFF; 32]);
         assert!(
-            !selector.is_eligible_proposer(&proposer, &any_output, 1).await.unwrap(),
+            !selector
+                .is_eligible_proposer(&proposer, &any_output, 1)
+                .await
+                .unwrap(),
             "below-minStake proposer must be ineligible (membership gate)"
         );
         assert!(
-            selector.is_eligible_proposer(&whale, &any_output, 1).await.unwrap(),
+            selector
+                .is_eligible_proposer(&whale, &any_output, 1)
+                .await
+                .unwrap(),
             "above-minStake member must be eligible"
         );
 
@@ -1900,10 +1976,8 @@ mod tests {
     #[allow(non_snake_case)]
     async fn test_C1_03_backdated_timestamp_rejected() {
         let store = Arc::new(DagStore::with_permissive_vrf_for_testing());
-        let ghostdag = crate::ghostdag::GhostDag::new(
-            crate::types::GhostDagParams::default(),
-            store.clone(),
-        );
+        let ghostdag =
+            crate::ghostdag::GhostDag::new(crate::types::GhostDagParams::default(), store.clone());
 
         // Genesis at height 0, blue_score 0, timestamp 1000 — stored in the
         // dag_store so the consistency gate can resolve it as selected parent.
