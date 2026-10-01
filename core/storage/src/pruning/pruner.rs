@@ -360,7 +360,12 @@ mod tests {
                 .unwrap();
         }
 
+        // Not a state row ('x' prefix): never touched, even for an old block.
+        let foreign = state_key(b'x', &Hash::new([1; 32]));
+        db.put_cf(CF_STATE, &foreign, b"x").unwrap();
+
         let stats = pruner.prune().await.unwrap();
+        assert!(db.get_cf(CF_STATE, &foreign).unwrap().is_some());
         assert_eq!(
             stats.states_pruned, 2,
             "heights 1 and 2 are below 5 - 2 = 3"

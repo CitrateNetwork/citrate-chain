@@ -841,4 +841,19 @@ mod tests {
             .unwrap();
         assert!(store.get_applied_tip().unwrap().is_none());
     }
+
+    /// PANIC-S1 mutation: a block with a stored child is not a tip.
+    #[test]
+    fn panic_s1_get_tips_excludes_parents() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(RocksDB::open(temp_dir.path()).unwrap());
+        let store = BlockStore::new(db);
+
+        let parent = create_test_block(1, Hash::new([0xA0; 32]));
+        let child = create_test_block(2, parent.header.block_hash);
+        store.put_block(&parent).unwrap();
+        store.put_block(&child).unwrap();
+
+        assert_eq!(store.get_tips().unwrap(), vec![child.header.block_hash]);
+    }
 }

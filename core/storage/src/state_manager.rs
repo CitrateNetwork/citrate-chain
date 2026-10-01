@@ -316,4 +316,24 @@ mod tests {
             .unwrap();
         assert_ne!(sm.calculate_storage_root().await.unwrap(), empty);
     }
+
+    /// PANIC-S1 mutation: the manager-level prune reaches the AI cache.
+    #[test]
+    fn panic_s1_manager_prunes_stale_inference_cache() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(RocksDB::open(temp_dir.path()).unwrap());
+        let sm = StateManager::new(db);
+        sm.ai_state
+            .write()
+            .cache_inference(crate::state::ai_state::InferenceResult {
+                model_id: ModelId(Hash::new([1; 32])),
+                input_hash: Hash::new([2; 32]),
+                output: vec![],
+                gas_used: 0,
+                timestamp: 0,
+                proof: None,
+            });
+        sm.prune_inference_cache(60);
+        assert!(sm.ai_state.read().inference_cache.is_empty());
+    }
 }
