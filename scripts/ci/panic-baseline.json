@@ -21,7 +21,7 @@
    "arithmetic_side_effects": 135
   },
   "core/execution": {
-   "arithmetic_side_effects": 357,
+   "arithmetic_side_effects": 352,
    "expect_used": 25,
    "indexing_slicing": 448,
    "panic": 3
@@ -62,14 +62,7 @@
    "expect_used": 1
   },
   "core/storage": {
-   "arithmetic_side_effects": 48,
-   "expect_used": 2,
-   "indexing_slicing": 73,
    "panic": 2
-  },
-  "crates/citrate-commd": {
-   "arithmetic_side_effects": 12,
-   "indexing_slicing": 30
   },
   "faucet": {
    "arithmetic_side_effects": 4,
@@ -112,5 +105,5 @@
   "arithmetic_side_effects",
   "string_slice"
  ],
- "total": 2109
+ "total": 1939
 }

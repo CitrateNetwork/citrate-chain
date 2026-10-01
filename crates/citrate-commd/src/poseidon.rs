@@ -48,8 +48,12 @@ pub fn poseidon_hash(inputs: &[Fr]) -> Fr {
     let config = &*POSEIDON_CONFIG_BN254;
     let mut sponge = PoseidonSponge::<Fr>::new(config);
     sponge.absorb(&inputs.to_vec());
-    let result = sponge.squeeze_native_field_elements(1);
-    result[0]
+    // squeeze(1) returns exactly one element; `first()` keeps that a fact of the code.
+    sponge
+        .squeeze_native_field_elements(1)
+        .first()
+        .copied()
+        .unwrap_or_else(|| Fr::from(0u64))
 }
 
 /// The shared Poseidon config, so an in-circuit chip can load the SAME ARK + MDS.
@@ -68,18 +72,22 @@ pub fn poseidon_config() -> &'static PoseidonConfig<Fr> {
 /// this native one, lane-for-lane — a strictly stronger check than `poseidon_hash` alone. It is the
 /// single canonical source of the permutation; `permute([0, a, b])[1] == poseidon_hash(&[a, b])` is
 /// asserted in the tests below.
-pub fn poseidon_permute(state_in: &[Fr]) -> Vec<Fr> {
+///
+/// PANIC-S1: the state is a fixed `[Fr; 3]` (rate 2 + capacity 1), matching the frozen config's
+/// width. It used to take `&[Fr]` and index the 3-wide ARK/MDS by the slice length, so any
+/// wider slice panicked; the array type makes a wrong width a COMPILE error instead.
+pub fn poseidon_permute(state_in: &[Fr; 3]) -> [Fr; 3] {
     use ark_ff::{Field as _, Zero as _};
     let cfg = &*POSEIDON_CONFIG_BN254;
-    let width = state_in.len();
-    let mut state = state_in.to_vec();
+    let mut state = *state_in;
     let half = cfg.full_rounds / 2;
-    let total = cfg.full_rounds + cfg.partial_rounds;
-    for r in 0..total {
-        let is_full = r < half || r >= half + cfg.partial_rounds;
+    let total = cfg.full_rounds.saturating_add(cfg.partial_rounds);
+    let partial_end = half.saturating_add(cfg.partial_rounds);
+    for (r, ark_r) in cfg.ark.iter().enumerate().take(total) {
+        let is_full = r < half || r >= partial_end;
         // ARK.
-        for (i, s) in state.iter_mut().enumerate() {
-            *s += cfg.ark[r][i];
+        for (s, c) in state.iter_mut().zip(ark_r) {
+            *s += c;
         }
         // S-box (x^alpha).
         if is_full {
@@ -90,13 +98,9 @@ pub fn poseidon_permute(state_in: &[Fr]) -> Vec<Fr> {
             state[0] = state[0].pow([cfg.alpha]);
         }
         // MDS mix.
-        let mut mixed = vec![Fr::zero(); width];
-        for (i, m) in mixed.iter_mut().enumerate() {
-            let mut acc = Fr::zero();
-            for (j, s) in state.iter().enumerate() {
-                acc += cfg.mds[i][j] * s;
-            }
-            *m = acc;
+        let mut mixed = [Fr::zero(); 3];
+        for (m, mds_i) in mixed.iter_mut().zip(&cfg.mds) {
+            *m = state.iter().zip(mds_i).map(|(s, c)| *c * s).sum();
         }
         state = mixed;
     }

@@ -5,23 +5,20 @@
 //! This module integrates AES-256-GCM encryption with IPFS storage,
 //! ensuring models are encrypted before being stored on the distributed network.
 
-use anyhow::{Result, anyhow};
-use serde::{Deserialize, Serialize};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use parking_lot::RwLock;
 
 use citrate_execution::crypto::encryption::{
-    ModelEncryption, EncryptionConfig,
-    EncryptionMetadata, EncryptedKey, RecipientPublicKeys,
+    EncryptedKey, EncryptionConfig, EncryptionMetadata, ModelEncryption, RecipientPublicKeys,
 };
-use citrate_execution::crypto::key_manager::{
-    KeyManager, KeyPurpose,
-};
-use primitive_types::{H256, H160};
+use citrate_execution::crypto::key_manager::{KeyManager, KeyPurpose};
+use primitive_types::{H160, H256};
 
-use super::{Cid, ModelMetadata, IPFSService};
+use super::{Cid, IPFSService, ModelMetadata};
 
 /// Encrypted model manifest stored on IPFS
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,7 +119,7 @@ impl EncryptedIPFSStore {
         let encryption_config = EncryptionConfig {
             use_hardware: cfg!(target_os = "macos"),
             key_rotation_enabled: true,
-            max_key_age: config.key_rotation_days as u64 * 24 * 3600,
+            max_key_age: (config.key_rotation_days as u64).saturating_mul(24 * 3600),
             compress: config.compress,
         };
 
@@ -147,14 +144,13 @@ impl EncryptedIPFSStore {
     ) -> Result<Cid> {
         // Derive encryption key for this model using BIP-44 style path
         // m/44'/60'/0'/1/{model_index} where model_index is derived from model_id
-        let model_index = u32::from_be_bytes([
-            model_id.0[0], model_id.0[1], model_id.0[2], model_id.0[3]
-        ]) % 0x80000000; // Ensure non-hardened range
+        let model_index =
+            u32::from_be_bytes([model_id.0[0], model_id.0[1], model_id.0[2], model_id.0[3]])
+                % 0x80000000; // Ensure non-hardened range
         let key_path = format!("m/44'/60'/0'/1/{}", model_index);
-        let derived_key = self.key_manager.derive_key(
-            &key_path,
-            KeyPurpose::ModelEncryption,
-        )?;
+        let derived_key = self
+            .key_manager
+            .derive_key(&key_path, KeyPurpose::ModelEncryption)?;
 
         // Chunk the model data
         let chunks = self.chunk_model_data(model_data)?;
@@ -162,11 +158,7 @@ impl EncryptedIPFSStore {
 
         // Encrypt each chunk and upload to IPFS
         for (index, chunk) in chunks.iter().enumerate() {
-            let encrypted_chunk = self.encrypt_chunk(
-                chunk,
-                &derived_key.key,
-                index,
-            )?;
+            let encrypted_chunk = self.encrypt_chunk(chunk, &derived_key.key, index)?;
 
             // Store size before moving data
             let data_len = encrypted_chunk.data.len() as u64;
@@ -242,16 +234,16 @@ impl EncryptedIPFSStore {
         }
 
         // Find encrypted key for recipient
-        let encrypted_key = manifest.encrypted_keys
+        let encrypted_key = manifest
+            .encrypted_keys
             .iter()
             .find(|k| k.recipient == recipient)
             .ok_or_else(|| anyhow!("No encrypted key found for recipient"))?;
 
         // Decrypt the symmetric key
-        let symmetric_key = self.encryption.decrypt_key_for_recipient(
-            encrypted_key,
-            recipient_key,
-        )?;
+        let symmetric_key = self
+            .encryption
+            .decrypt_key_for_recipient(encrypted_key, recipient_key)?;
 
         // Download and decrypt all chunks
         let mut decrypted_data = Vec::new();
@@ -303,15 +295,15 @@ impl EncryptedIPFSStore {
         }
 
         // Decrypt the symmetric key using owner's key
-        let owner_encrypted_key = manifest.encrypted_keys
+        let owner_encrypted_key = manifest
+            .encrypted_keys
             .iter()
             .find(|k| k.recipient == owner)
             .ok_or_else(|| anyhow!("Owner key not found"))?;
 
-        let symmetric_key = self.encryption.decrypt_key_for_recipient(
-            owner_encrypted_key,
-            owner_key,
-        )?;
+        let symmetric_key = self
+            .encryption
+            .decrypt_key_for_recipient(owner_encrypted_key, owner_key)?;
 
         // Create encrypted key for new user
         let new_encrypted_key = self.encryption.encrypt_key_for_recipient(
@@ -332,7 +324,9 @@ impl EncryptedIPFSStore {
         self.ipfs.pin(&new_manifest_cid).await?;
 
         // Update cache
-        self.manifest_cache.write().insert(manifest.model_id, manifest);
+        self.manifest_cache
+            .write()
+            .insert(manifest.model_id, manifest);
 
         Ok(Cid(new_manifest_cid))
     }
@@ -364,7 +358,9 @@ impl EncryptedIPFSStore {
         };
 
         // Use the encryption module for actual encryption
-        let encrypted_result = self.encryption.encrypt_chunk(&data_to_encrypt, key, index)?;
+        let encrypted_result = self
+            .encryption
+            .encrypt_chunk(&data_to_encrypt, key, index)?;
 
         Ok(EncryptedChunkData {
             data: encrypted_result.data,
@@ -382,7 +378,9 @@ impl EncryptedIPFSStore {
         auth_tag: &[u8; 16],
     ) -> Result<Vec<u8>> {
         // Use the encryption module for actual decryption
-        let decrypted = self.encryption.decrypt_chunk(encrypted_data, key, nonce, auth_tag)?;
+        let decrypted = self
+            .encryption
+            .decrypt_chunk(encrypted_data, key, nonce, auth_tag)?;
 
         // Decompress if needed
         if self.config.compress {
@@ -425,7 +423,7 @@ impl EncryptedIPFSStore {
 
     /// Calculate hash for integrity verification
     fn calculate_hash(&self, data: &[u8]) -> H256 {
-        use sha3::{Sha3_256, Digest};
+        use sha3::{Digest, Sha3_256};
         let mut hasher = Sha3_256::new();
         hasher.update(data);
         H256::from_slice(hasher.finalize().as_slice())
@@ -471,7 +469,13 @@ impl IPFSOperations for IPFSService {
     async fn add(&self, data: Vec<u8>) -> Result<String> {
         // Implementation would call IPFS HTTP API
         // POST /api/v0/add
-        Ok(format!("Qm{}", hex::encode(&data[..16])))
+        // PANIC-S1: `&data[..16]` panicked on inputs under 16 bytes. NOTE: this whole
+        // `IPFSOperations` impl is a placeholder (fabricated CID, no-op pin/cat) with no
+        // callers; tracked separately as a Rule-1 finding, not removed in this PR.
+        Ok(format!(
+            "Qm{}",
+            hex::encode(data.get(..16).unwrap_or(&data))
+        ))
     }
 
     async fn cat(&self, _cid: &str) -> Result<Vec<u8>> {
@@ -543,14 +547,17 @@ mod tests {
         };
 
         // Store encrypted model
-        let manifest_cid = store.store_encrypted_model(
-            model_id,
-            model_data,
-            metadata,
-            owner,
-            vec![user],
-            &public_keys,
-        ).await.unwrap();
+        let manifest_cid = store
+            .store_encrypted_model(
+                model_id,
+                model_data,
+                metadata,
+                owner,
+                vec![user],
+                &public_keys,
+            )
+            .await
+            .unwrap();
 
         assert!(!manifest_cid.0.is_empty());
     }

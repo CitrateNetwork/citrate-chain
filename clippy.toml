@@ -11,4 +11,8 @@ arithmetic-side-effects-allowed = [
     "primeorder::ProjectivePoint",
     "primeorder::projective::ProjectivePoint",
     "p256::arithmetic::scalar::Scalar",
+    # BN254 scalar field (citrate-commd Poseidon): modular field arithmetic.
+    "ark_bn254::Fr",
+    "ark_ff::Fp",
+    "ark_ff::fields::models::fp::Fp",
 ]
