@@ -111,7 +111,7 @@ async fn export_snapshot(
             .context("Failed to connect to RPC endpoint")?;
 
         let result: serde_json::Value = response.json().await?;
-        let block_hex = result["result"]
+        let block_hex = result.get("result").unwrap_or(&serde_json::Value::Null)
             .as_str()
             .context("Failed to get block number")?;
         println!("  Latest block: {}", block_hex);
@@ -132,7 +132,7 @@ async fn export_snapshot(
         .context("Failed to get block details")?;
 
     let block_result: serde_json::Value = response.json().await?;
-    let block = block_result["result"]
+    let block = block_result.get("result").unwrap_or(&serde_json::Value::Null)
         .as_object()
         .context("Block not found")?;
 

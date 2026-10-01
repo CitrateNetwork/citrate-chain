@@ -201,7 +201,7 @@ fn list_accounts(config: &Config) -> Result<()> {
 
     println!("{}", "Accounts:".bold());
 
-    let mut count = 0;
+    let mut count = 0usize;
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
@@ -209,7 +209,7 @@ fn list_accounts(config: &Config) -> Result<()> {
         if path.extension().and_then(|s| s.to_str()) == Some("json") {
             if let Some(filename) = path.file_stem().and_then(|s| s.to_str()) {
                 println!("  • 0x{}", filename);
-                count += 1;
+                count = count.saturating_add(1);
             }
         }
     }
@@ -244,14 +244,14 @@ async fn get_balance(config: &Config, address: &str) -> Result<()> {
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(balance_hex) = result["result"].as_str() {
+    if let Some(balance_hex) = result.get("result").unwrap_or(&serde_json::Value::Null).as_str() {
         let balance = u128::from_str_radix(balance_hex.trim_start_matches("0x"), 16)
             .context("Failed to parse balance")?;
 
         println!("Address: {}", format!("0x{}", address).cyan());
         println!("Balance: {} wei", balance);
         println!("         {} ETH", balance as f64 / 1e18);
-    } else if let Some(error) = result["error"].as_object() {
+    } else if let Some(error) = result.get("error").unwrap_or(&serde_json::Value::Null).as_object() {
         anyhow::bail!(
             "RPC error: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -624,10 +624,8 @@ fn derive_address(pubkey: &[u8; 32]) -> [u8; 20] {
     // Full pubkey: Keccak256 hash, take last 20 bytes
     let mut hasher = Keccak256::new();
     hasher.update(pubkey);
-    let hash = hasher.finalize();
-
-    let mut address = [0u8; 20];
-    address.copy_from_slice(&hash[12..]);
+    let hash: [u8; 32] = hasher.finalize().into();
+    let [_, _, _, _, _, _, _, _, _, _, _, _, address @ ..] = hash;
     address
 }
 

@@ -135,7 +135,7 @@ async fn model_deploy_wizard(config: &Config) -> Result<()> {
 
     let selected_tags: Vec<String> = tag_indices
         .into_iter()
-        .map(|i| available_tags[i].to_string())
+        .filter_map(|i| available_tags.get(i).map(|t| t.to_string()))
         .collect();
 
     // Step 7: Account selection

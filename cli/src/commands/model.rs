@@ -396,13 +396,13 @@ async fn deploy_model(
         println!("Waiting for confirmation...");
         let receipt = wait_for_receipt(config, tx_hash).await?;
 
-        let status = receipt["status"].as_str().unwrap_or_default();
+        let status = receipt.get("status").unwrap_or(&serde_json::Value::Null).as_str().unwrap_or_default();
         if status == "0x1" || status == "0x01" {
             println!("{}", "✓ Model deployment confirmed".green().bold());
-            if let Some(block) = receipt["blockNumber"].as_str() {
+            if let Some(block) = receipt.get("blockNumber").unwrap_or(&serde_json::Value::Null).as_str() {
                 println!("Included in block: {}", block);
             }
-            if let Some(gas_used) = receipt["gasUsed"].as_str() {
+            if let Some(gas_used) = receipt.get("gasUsed").unwrap_or(&serde_json::Value::Null).as_str() {
                 println!("Gas Used: {}", gas_used);
             }
             println!(
@@ -415,7 +415,7 @@ async fn deploy_model(
             println!("{}", serde_json::to_string_pretty(&receipt)?);
             anyhow::bail!("Model deployment transaction failed");
         }
-    } else if let Some(error) = result["error"].as_object() {
+    } else if let Some(error) = result.get("error").unwrap_or(&serde_json::Value::Null).as_object() {
         anyhow::bail!(
             "Deployment failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -463,7 +463,7 @@ async fn run_inference(
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(output) = result["result"]["output"].as_object() {
+    if let Some(output) = result.get("result").unwrap_or(&serde_json::Value::Null).get("output").unwrap_or(&serde_json::Value::Null).as_object() {
         println!("{}", "✓ Inference completed successfully".green());
 
         // Save output if path specified
@@ -478,15 +478,15 @@ async fn run_inference(
         }
 
         if with_proof {
-            if let Some(proof) = result["result"]["proof"].as_str() {
+            if let Some(proof) = result.get("result").unwrap_or(&serde_json::Value::Null).get("proof").unwrap_or(&serde_json::Value::Null).as_str() {
                 println!("\nProof ID: {}", proof.cyan());
             }
         }
 
-        if let Some(exec_time) = result["result"]["execution_time_ms"].as_u64() {
+        if let Some(exec_time) = result.get("result").unwrap_or(&serde_json::Value::Null).get("execution_time_ms").unwrap_or(&serde_json::Value::Null).as_u64() {
             println!("Execution time: {}ms", exec_time);
         }
-    } else if let Some(error) = result["error"].as_object() {
+    } else if let Some(error) = result.get("error").unwrap_or(&serde_json::Value::Null).as_object() {
         anyhow::bail!(
             "Inference failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -512,10 +512,14 @@ async fn list_models(
     });
 
     if let Some(owner) = owner {
-        params["owner"] = json!(owner);
+        if let Some(obj) = params.as_object_mut() {
+            obj.insert("owner".into(), json!(owner));
+        }
     }
     if let Some(model_type) = model_type {
-        params["type"] = json!(model_type);
+        if let Some(obj) = params.as_object_mut() {
+            obj.insert("type".into(), json!(model_type));
+        }
     }
 
     let response = client
@@ -532,7 +536,7 @@ async fn list_models(
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(models) = result["result"]["models"].as_array() {
+    if let Some(models) = result.get("result").unwrap_or(&serde_json::Value::Null).get("models").unwrap_or(&serde_json::Value::Null).as_array() {
         if models.is_empty() {
             println!("{}", "No models found".yellow());
         } else {
@@ -552,7 +556,7 @@ async fn list_models(
                 println!();
             }
         }
-    } else if let Some(error) = result["error"].as_object() {
+    } else if let Some(error) = result.get("error").unwrap_or(&serde_json::Value::Null).as_object() {
         anyhow::bail!(
             "Query failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -583,10 +587,10 @@ async fn get_model_info(config: &Config, model_id: &str) -> Result<()> {
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(model) = result["result"]["model"].as_object() {
+    if let Some(model) = result.get("result").unwrap_or(&serde_json::Value::Null).get("model").unwrap_or(&serde_json::Value::Null).as_object() {
         println!("{}", "Model Information:".bold());
         println!("{}", serde_json::to_string_pretty(model)?);
-    } else if let Some(error) = result["error"].as_object() {
+    } else if let Some(error) = result.get("error").unwrap_or(&serde_json::Value::Null).as_object() {
         anyhow::bail!(
             "Query failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -704,13 +708,13 @@ async fn update_model(
 
         println!("Waiting for confirmation...");
         let receipt = wait_for_receipt(config, tx_hash).await?;
-        let status = receipt["status"].as_str().unwrap_or_default();
+        let status = receipt.get("status").unwrap_or(&serde_json::Value::Null).as_str().unwrap_or_default();
         if status == "0x1" || status == "0x01" {
             println!("{}", "✓ Model update confirmed".green().bold());
-            if let Some(block) = receipt["blockNumber"].as_str() {
+            if let Some(block) = receipt.get("blockNumber").unwrap_or(&serde_json::Value::Null).as_str() {
                 println!("Included in block: {}", block);
             }
-            if let Some(gas_used) = receipt["gasUsed"].as_str() {
+            if let Some(gas_used) = receipt.get("gasUsed").unwrap_or(&serde_json::Value::Null).as_str() {
                 println!("Gas Used: {}", gas_used);
             }
         } else {
@@ -718,7 +722,7 @@ async fn update_model(
             println!("{}", serde_json::to_string_pretty(&receipt)?);
             anyhow::bail!("Model update transaction failed");
         }
-    } else if let Some(error) = result["error"].as_object() {
+    } else if let Some(error) = result.get("error").unwrap_or(&serde_json::Value::Null).as_object() {
         anyhow::bail!(
             "Update failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -752,7 +756,9 @@ async fn verify_proof(
     });
 
     if let Some(hash) = output_hash.as_ref() {
-        params["output_hash"] = json!(hash);
+        if let Some(obj) = params.as_object_mut() {
+            obj.insert("output_hash".into(), json!(hash));
+        }
     }
 
     let response = client
@@ -769,11 +775,11 @@ async fn verify_proof(
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(valid) = result["result"]["valid"].as_bool() {
+    if let Some(valid) = result.get("result").unwrap_or(&serde_json::Value::Null).get("valid").unwrap_or(&serde_json::Value::Null).as_bool() {
         if valid {
             println!("{}", "✓ Proof is VALID".green().bold());
 
-            if let Some(details) = result["result"]["details"].as_object() {
+            if let Some(details) = result.get("result").unwrap_or(&serde_json::Value::Null).get("details").unwrap_or(&serde_json::Value::Null).as_object() {
                 println!("\nProof Details:");
                 println!(
                     "  Model ID: {}",
@@ -803,11 +809,11 @@ async fn verify_proof(
         } else {
             println!("{}", "✗ Proof is INVALID".red().bold());
 
-            if let Some(reason) = result["result"]["reason"].as_str() {
+            if let Some(reason) = result.get("result").unwrap_or(&serde_json::Value::Null).get("reason").unwrap_or(&serde_json::Value::Null).as_str() {
                 println!("Reason: {}", reason);
             }
         }
-    } else if let Some(error) = result["error"].as_object() {
+    } else if let Some(error) = result.get("error").unwrap_or(&serde_json::Value::Null).as_object() {
         anyhow::bail!(
             "Verification failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -1043,7 +1049,7 @@ async fn download_hf_model(
                 };
                 println!(
                     "  {} {} ({}){}{}",
-                    format!("{}.", i + 1).bold(),
+                    format!("{}.", i.saturating_add(1)).bold(),
                     file.rfilename.cyan(),
                     size,
                     quant.green(),
@@ -1144,10 +1150,10 @@ async fn download_hf_model(
             .context("Failed to write to disk")?;
         hasher.update(&chunk);
 
-        downloaded += chunk.len() as u64;
+        downloaded = downloaded.saturating_add(chunk.len() as u64);
 
         // Report progress every 10MB
-        if downloaded - last_report >= 10_000_000 || downloaded == total_size {
+        if downloaded.saturating_sub(last_report) >= 10_000_000 || downloaded == total_size {
             if total_size > 0 {
                 let pct = (downloaded as f64 / total_size as f64 * 100.0) as u64;
                 print!(
@@ -1175,7 +1181,7 @@ async fn download_hf_model(
     println!("{}", "Download complete!".green().bold());
     println!("  File: {}", file_path.display());
     println!("  Size: {}", format_size(downloaded));
-    println!("  SHA256: {}", &hash[..16]);
+    println!("  SHA256: {}", hash.get(..16).unwrap_or(&hash));
 
     // Try to auto-pin to IPFS if daemon is running
     if let Ok(ipfs_response) = client
@@ -1249,11 +1255,11 @@ async fn auto_pin_to_ipfs(client: &reqwest::Client, file_path: &PathBuf) -> Resu
 
 async fn wait_for_receipt(config: &Config, tx_hash: &str) -> Result<serde_json::Value> {
     let client = reqwest::Client::new();
-    let mut attempts = 0;
+    let mut attempts = 0usize;
     const MAX_ATTEMPTS: usize = 30;
 
     loop {
-        attempts += 1;
+        attempts = attempts.saturating_add(1);
 
         let response = client
             .post(&config.rpc_endpoint)
@@ -1269,7 +1275,7 @@ async fn wait_for_receipt(config: &Config, tx_hash: &str) -> Result<serde_json::
 
         let result: serde_json::Value = response.json().await?;
 
-        if let Some(receipt) = result["result"].as_object() {
+        if let Some(receipt) = result.get("result").unwrap_or(&serde_json::Value::Null).as_object() {
             return Ok(serde_json::Value::Object(receipt.clone()));
         }
 

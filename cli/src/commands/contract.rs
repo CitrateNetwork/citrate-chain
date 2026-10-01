@@ -234,7 +234,7 @@ async fn deploy_contract(
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(tx_hash) = result["result"].as_str() {
+    if let Some(tx_hash) = result.get("result").unwrap_or(&serde_json::Value::Null).as_str() {
         println!("{}", "✓ Contract deployment initiated".green());
         println!("Transaction: {}", tx_hash.cyan());
 
@@ -243,14 +243,14 @@ async fn deploy_contract(
 
         let receipt = wait_for_receipt(config, tx_hash).await?;
 
-        if let Some(contract_address) = receipt["contractAddress"].as_str() {
+        if let Some(contract_address) = receipt.get("contractAddress").unwrap_or(&serde_json::Value::Null).as_str() {
             println!("{}", "✓ Contract deployed successfully".green().bold());
             println!("Contract Address: {}", contract_address.cyan().bold());
-            println!("Gas Used: {}", receipt["gasUsed"].as_str().unwrap_or("N/A"));
+            println!("Gas Used: {}", receipt.get("gasUsed").unwrap_or(&serde_json::Value::Null).as_str().unwrap_or("N/A"));
         } else {
             anyhow::bail!("Contract deployment failed");
         }
-    } else if let Some(error) = result["error"].as_object() {
+    } else if let Some(error) = result.get("error").unwrap_or(&serde_json::Value::Null).as_object() {
         anyhow::bail!(
             "Deployment failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -313,7 +313,7 @@ async fn call_contract(
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(tx_hash) = result["result"].as_str() {
+    if let Some(tx_hash) = result.get("result").unwrap_or(&serde_json::Value::Null).as_str() {
         println!("{}", "✓ Transaction sent".green());
         println!("Transaction: {}", tx_hash.cyan());
 
@@ -322,18 +322,18 @@ async fn call_contract(
 
         let receipt = wait_for_receipt(config, tx_hash).await?;
 
-        if receipt["status"].as_str() == Some("0x1") {
+        if receipt.get("status").unwrap_or(&serde_json::Value::Null).as_str() == Some("0x1") {
             println!("{}", "✓ Transaction successful".green().bold());
-            println!("Gas Used: {}", receipt["gasUsed"].as_str().unwrap_or("N/A"));
+            println!("Gas Used: {}", receipt.get("gasUsed").unwrap_or(&serde_json::Value::Null).as_str().unwrap_or("N/A"));
 
             // Decode logs if any
-            if let Some(logs) = receipt["logs"].as_array() {
+            if let Some(logs) = receipt.get("logs").unwrap_or(&serde_json::Value::Null).as_array() {
                 if !logs.is_empty() {
                     println!("\nEvents emitted:");
                     for log in logs {
                         if let Some(topics) = log["topics"].as_array() {
-                            if !topics.is_empty() {
-                                println!("  Event: {}", topics[0].as_str().unwrap_or("Unknown"));
+                            if let Some(topic0) = topics.first() {
+                                println!("  Event: {}", topic0.as_str().unwrap_or("Unknown"));
                             }
                         }
                     }
@@ -342,7 +342,7 @@ async fn call_contract(
         } else {
             anyhow::bail!("Transaction failed");
         }
-    } else if let Some(error) = result["error"].as_object() {
+    } else if let Some(error) = result.get("error").unwrap_or(&serde_json::Value::Null).as_object() {
         anyhow::bail!(
             "Call failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -389,14 +389,14 @@ async fn read_contract(
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(data) = result["result"].as_str() {
+    if let Some(data) = result.get("result").unwrap_or(&serde_json::Value::Null).as_str() {
         println!("{}", "Result:".bold());
         println!("Raw: {}", data);
 
         // Try to decode as common types
         if data.len() == 66 {
             // Possibly uint256
-            if let Ok(value) = u128::from_str_radix(&data[2..], 16) {
+            if let Ok(value) = u128::from_str_radix(data.get(2..).unwrap_or_default(), 16) {
                 println!("Decoded (uint): {}", value);
             }
         } else if data.len() == 42 {
@@ -404,7 +404,7 @@ async fn read_contract(
             println!("Decoded (address): {}", data);
         } else if data.len() > 2 {
             // Try as string
-            if let Ok(bytes) = hex::decode(&data[2..]) {
+            if let Ok(bytes) = hex::decode(data.get(2..).unwrap_or_default()) {
                 if let Ok(text) = String::from_utf8(bytes.clone()) {
                     if text
                         .chars()
@@ -415,7 +415,7 @@ async fn read_contract(
                 }
             }
         }
-    } else if let Some(error) = result["error"].as_object() {
+    } else if let Some(error) = result.get("error").unwrap_or(&serde_json::Value::Null).as_object() {
         anyhow::bail!(
             "Call failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -444,11 +444,11 @@ async fn get_contract_code(config: &Config, address: &str, output: Option<PathBu
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(code) = result["result"].as_str() {
+    if let Some(code) = result.get("result").unwrap_or(&serde_json::Value::Null).as_str() {
         if code == "0x" {
             println!("{}", "No contract code at this address".yellow());
         } else {
-            let code_bytes = hex::decode(&code[2..]).context("Invalid code format")?;
+            let code_bytes = hex::decode(code.get(2..).unwrap_or_default()).context("Invalid code format")?;
 
             println!("{}", "Contract code retrieved".green());
             println!("Size: {} bytes", code_bytes.len());
@@ -459,13 +459,13 @@ async fn get_contract_code(config: &Config, address: &str, output: Option<PathBu
                 println!("Code saved to: {:?}", path);
             } else {
                 println!("\nBytecode (first 100 bytes):");
-                println!("{}", &code[..code.len().min(202)]);
+                println!("{}", code.get(..202).unwrap_or(code));
                 if code.len() > 202 {
-                    println!("... ({} more bytes)", (code.len() - 202) / 2);
+                    println!("... ({} more bytes)", (code.len().saturating_sub(202)) / 2);
                 }
             }
         }
-    } else if let Some(error) = result["error"].as_object() {
+    } else if let Some(error) = result.get("error").unwrap_or(&serde_json::Value::Null).as_object() {
         anyhow::bail!(
             "Query failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -536,15 +536,15 @@ async fn verify_contract(
 
     let result: serde_json::Value = response.json().await?;
 
-    if result["result"]["verified"].as_bool() == Some(true) {
+    if result.get("result").unwrap_or(&serde_json::Value::Null).get("verified").unwrap_or(&serde_json::Value::Null).as_bool() == Some(true) {
         println!("{}", "✓ Contract verified successfully".green().bold());
         println!(
             "Verification ID: {}",
-            result["result"]["verification_id"]
+            result.get("result").unwrap_or(&serde_json::Value::Null).get("verification_id").unwrap_or(&serde_json::Value::Null)
                 .as_str()
                 .unwrap_or("N/A")
         );
-    } else if let Some(error) = result["error"].as_object() {
+    } else if let Some(error) = result.get("error").unwrap_or(&serde_json::Value::Null).as_object() {
         anyhow::bail!(
             "Verification failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -571,7 +571,7 @@ async fn get_verification(config: &Config, address: &str) -> Result<()> {
         .context("Failed to connect to RPC endpoint")?;
 
     let v: serde_json::Value = response.json().await?;
-    if let Some(rec) = v["result"].as_object() {
+    if let Some(rec) = v.get("result").unwrap_or(&serde_json::Value::Null).as_object() {
         println!("{}", "Verification Record:".bold());
         println!(
             "Address: {}",
@@ -611,7 +611,7 @@ async fn list_verifications(config: &Config) -> Result<()> {
         .context("Failed to connect to RPC endpoint")?;
 
     let v: serde_json::Value = response.json().await?;
-    if let Some(arr) = v["result"].as_array() {
+    if let Some(arr) = v.get("result").unwrap_or(&serde_json::Value::Null).as_array() {
         println!("{} {}", arr.len(), "verification record(s)".bold());
         for rec in arr {
             if let Some(addr) = rec["address"].as_str() {
@@ -644,7 +644,7 @@ async fn wait_for_receipt(config: &Config, tx_hash: &str) -> Result<serde_json::
 
         let result: serde_json::Value = response.json().await?;
 
-        if let Some(receipt) = result["result"].as_object() {
+        if let Some(receipt) = result.get("result").unwrap_or(&serde_json::Value::Null).as_object() {
             return Ok(json!(receipt));
         }
     }
@@ -659,8 +659,8 @@ fn encode_method_call(method_sig: &str, args: serde_json::Value) -> Result<Strin
     // Compute 4-byte selector from full signature
     let mut hasher = Keccak256::new();
     hasher.update(method_sig.as_bytes());
-    let hash = hasher.finalize();
-    let selector = &hash[..4];
+    let [s0, s1, s2, s3, ..]: [u8; 32] = hasher.finalize().into();
+    let selector = &[s0, s1, s2, s3][..];
 
     // Parse types from signature, e.g. "transfer(address,uint256)"
     let open = method_sig.find('(').context(
@@ -670,7 +670,10 @@ fn encode_method_call(method_sig: &str, args: serde_json::Value) -> Result<Strin
     let close = method_sig
         .rfind(')')
         .context("Invalid method signature: missing ')'")?;
-    let types_str = &method_sig[open + 1..close];
+    // `(` and `)` are ASCII, so open + 1 is a char boundary.
+    let types_str = method_sig
+        .get(open.saturating_add(1)..close)
+        .context("Invalid method signature: ')' before '('")?;
     let types: Vec<String> = if types_str.trim().is_empty() {
         vec![]
     } else {
@@ -742,7 +745,7 @@ fn encode_method_call(method_sig: &str, args: serde_json::Value) -> Result<Strin
             // uint types
             ty if ty.starts_with("uint") => {
                 // Determine bit size (default 256)
-                let bits: u16 = ty[4..].parse().unwrap_or(256);
+                let bits: u16 = ty.get(4..).unwrap_or_default().parse().unwrap_or(256);
                 if bits == 0 || !bits.is_multiple_of(8) || bits > 256 {
                     bail!("unsupported uint size: {}", bits);
                 }
@@ -766,7 +769,10 @@ fn encode_method_call(method_sig: &str, args: serde_json::Value) -> Result<Strin
                             if bytes.len() > 32 {
                                 bail!("uint hex too large (max 32 bytes)");
                             }
-                            word[32 - bytes.len()..32].copy_from_slice(&bytes);
+                            // bytes.len() <= 32 (checked above): right-align.
+                            if let Some(dst) = word.get_mut(32usize.saturating_sub(bytes.len())..) {
+                                dst.copy_from_slice(&bytes);
+                            }
                         } else {
                             // Decimal string, parse into u128
                             let val = ss.parse::<u128>().context("invalid uint decimal string")?;
@@ -786,7 +792,7 @@ fn encode_method_call(method_sig: &str, args: serde_json::Value) -> Result<Strin
         }
     }
 
-    let mut out = Vec::with_capacity(4 + encoded.len());
+    let mut out = Vec::with_capacity(encoded.len().saturating_add(4));
     out.extend_from_slice(selector);
     out.extend_from_slice(&encoded);
     Ok(format!("0x{}", hex::encode(out)))

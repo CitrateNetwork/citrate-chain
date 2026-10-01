@@ -192,7 +192,7 @@ async fn monitor_network(
             .await
         {
             if let Ok(result) = response.json::<serde_json::Value>().await {
-                if let Some(height) = result["result"].as_str() {
+                if let Some(height) = result.get("result").unwrap_or(&serde_json::Value::Null).as_str() {
                     stats.insert("height", height.to_string());
                 }
             }
@@ -211,7 +211,7 @@ async fn monitor_network(
             .await
         {
             if let Ok(result) = response.json::<serde_json::Value>().await {
-                if let Some(peers) = result["result"].as_str() {
+                if let Some(peers) = result.get("result").unwrap_or(&serde_json::Value::Null).as_str() {
                     stats.insert("peers", peers.to_string());
                 }
             }
@@ -230,7 +230,7 @@ async fn monitor_network(
             .await
         {
             if let Ok(result) = response.json::<serde_json::Value>().await {
-                if let Some(gas_price) = result["result"].as_str() {
+                if let Some(gas_price) = result.get("result").unwrap_or(&serde_json::Value::Null).as_str() {
                     stats.insert("gas_price", gas_price.to_string());
                 }
             }
@@ -270,7 +270,7 @@ async fn monitor_network(
                 .await
             {
                 if let Ok(result) = response.json::<serde_json::Value>().await {
-                    if let Some(dag_info) = result["result"].as_object() {
+                    if let Some(dag_info) = result.get("result").unwrap_or(&serde_json::Value::Null).as_object() {
                         println!("  Blue Score: {}",
                             dag_info["blue_score"].as_str().unwrap_or("0").cyan());
                         println!("  DAG Width: {}",
@@ -303,7 +303,7 @@ async fn monitor_network(
                 .await
             {
                 if let Ok(result) = response.json::<serde_json::Value>().await {
-                    if let Some(mempool_info) = result["result"].as_object() {
+                    if let Some(mempool_info) = result.get("result").unwrap_or(&serde_json::Value::Null).as_object() {
                         println!("  Pending Txs: {}",
                             mempool_info["pending_count"].as_u64().unwrap_or(0).to_string().cyan());
                         println!("  Queue Size: {}",
@@ -319,7 +319,7 @@ async fn monitor_network(
             }
         }
 
-        iterations += 1;
+        iterations = iterations.saturating_add(1);
         ticker.tick().await;
     }
 
@@ -345,11 +345,13 @@ async fn benchmark_network(
     println!("🚀 Starting benchmark...");
 
     // Send transactions in batches
-    for batch in 0..(tx_count / concurrency) {
+    // `--concurrency 0` used to divide by zero; treat it as 1.
+    let concurrency = concurrency.max(1);
+    for batch in 0..tx_count.checked_div(concurrency).unwrap_or(0) {
         for tx_index in 0..concurrency {
             let client = client.clone();
             let endpoint = config.rpc_endpoint.clone();
-            let nonce = (batch * concurrency + tx_index) as u64;
+            let nonce = batch.saturating_mul(concurrency).saturating_add(tx_index) as u64;
 
             let handle = tokio::spawn(async move {
                 // Generate a unique test transaction for each request
@@ -371,7 +373,12 @@ async fn benchmark_network(
         }
 
         // Progress indicator
-        let progress = ((batch + 1) * concurrency * 100) / tx_count;
+        let progress = batch
+            .saturating_add(1)
+            .saturating_mul(concurrency)
+            .saturating_mul(100)
+            .checked_div(tx_count)
+            .unwrap_or(100);
         print!("\rProgress: {}% ", progress);
         use std::io::{self, Write};
         let _ = io::stdout().flush();
@@ -381,13 +388,13 @@ async fn benchmark_network(
     }
 
     // Wait for all transactions
-    let mut successful = 0;
-    let mut failed = 0;
+    let mut successful = 0usize;
+    let mut failed = 0usize;
 
     for handle in handles {
         match handle.await {
-            Ok(Ok(_)) => successful += 1,
-            _ => failed += 1,
+            Ok(Ok(_)) => successful = successful.saturating_add(1),
+            _ => failed = failed.saturating_add(1),
         }
     }
 
@@ -428,13 +435,13 @@ async fn analyze_topology(
         .await
     {
         if let Ok(result) = response.json::<serde_json::Value>().await {
-            if let Some(peers) = result["result"].as_array() {
+            if let Some(peers) = result.get("result").unwrap_or(&serde_json::Value::Null).as_array() {
                 peers_data = peers.clone();
 
                 if show_peers {
                     println!("Connected Peers: {}", peers.len());
                     for (i, peer) in peers.iter().enumerate() {
-                        println!("  Peer {}: {}", i + 1, peer["address"].as_str().unwrap_or("Unknown"));
+                        println!("  Peer {}: {}", i.saturating_add(1), peer.get("address").unwrap_or(&serde_json::Value::Null).as_str().unwrap_or("Unknown"));
                     }
                 }
 
@@ -463,7 +470,7 @@ async fn analyze_topology(
         .await
     {
         response.json::<serde_json::Value>().await.ok()
-            .and_then(|r| r["result"].clone().into())
+            .and_then(|r| r.get("result").unwrap_or(&serde_json::Value::Null).clone().into())
     } else {
         None
     };
@@ -541,7 +548,9 @@ async fn stress_test(
     println!();
 
     let start_time = std::time::Instant::now();
-    let end_time = start_time + Duration::from_secs(duration);
+    let end_time = start_time
+        .checked_add(Duration::from_secs(duration))
+        .unwrap_or(start_time);
 
     let mut handles = Vec::new();
     let client = reqwest::Client::new();
@@ -550,11 +559,12 @@ async fn stress_test(
     for worker_id in 0..workers {
         let client = client.clone();
         let endpoint = config.rpc_endpoint.clone();
-        let worker_tps = target_tps / workers as u64;
+        // A target below the worker count (or 0 workers) used to divide by zero.
+        let worker_tps = target_tps.checked_div(workers as u64).unwrap_or(0).max(1);
 
         let handle = tokio::spawn(async move {
-            let mut tx_count = 0;
-            let mut interval = interval(Duration::from_millis(1000 / worker_tps));
+            let mut tx_count = 0u64;
+            let mut interval = interval(Duration::from_millis(1000u64.checked_div(worker_tps).unwrap_or(1000)));
 
             while std::time::Instant::now() < end_time {
                 interval.tick().await;
@@ -574,7 +584,7 @@ async fn stress_test(
                     .send()
                     .await;
 
-                tx_count += 1;
+                tx_count = tx_count.saturating_add(1);
             }
 
             tx_count
@@ -586,7 +596,7 @@ async fn stress_test(
     // Monitor progress
     while std::time::Instant::now() < end_time {
         let elapsed = start_time.elapsed().as_secs();
-        let remaining = duration - elapsed;
+        let remaining = duration.saturating_sub(elapsed);
         print!("\rTime remaining: {}s ", remaining);
         use std::io::{self, Write};
         let _ = io::stdout().flush();
@@ -594,10 +604,10 @@ async fn stress_test(
     }
 
     // Collect results
-    let mut total_txs = 0;
+    let mut total_txs = 0u64;
     for handle in handles {
         if let Ok(count) = handle.await {
-            total_txs += count;
+            total_txs = total_txs.saturating_add(count);
         }
     }
 
@@ -643,7 +653,7 @@ async fn debug_transaction(
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(tx) = result["result"].as_object() {
+    if let Some(tx) = result.get("result").unwrap_or(&serde_json::Value::Null).as_object() {
         println!("{}", "Transaction Details:".bold());
         println!("  From: {}", tx["from"].as_str().unwrap_or("N/A"));
         println!("  To: {}", tx["to"].as_str().unwrap_or("N/A"));
@@ -670,7 +680,7 @@ async fn debug_transaction(
 
             if let Ok(receipt_response) = receipt_response {
                 if let Ok(receipt_result) = receipt_response.json::<serde_json::Value>().await {
-                    if let Some(receipt) = receipt_result["result"].as_object() {
+                    if let Some(receipt) = receipt_result.get("result").unwrap_or(&serde_json::Value::Null).as_object() {
                         println!("  Status: {}",
                             if receipt["status"].as_str().unwrap_or("0x0") == "0x1" {
                                 "Success".green()
@@ -685,14 +695,14 @@ async fn debug_transaction(
                             if !logs.is_empty() {
                                 println!("  Logs:");
                                 for (i, log) in logs.iter().take(5).enumerate() {
-                                    println!("    Log {}: {}", i + 1,
+                                    println!("    Log {}: {}", i.saturating_add(1),
                                         log["topics"].as_array()
                                             .and_then(|topics| topics.first())
                                             .and_then(|topic| topic.as_str())
                                             .unwrap_or("Unknown topic"));
                                 }
                                 if logs.len() > 5 {
-                                    println!("    ... and {} more logs", logs.len() - 5);
+                                    println!("    ... and {} more logs", logs.len().saturating_sub(5));
                                 }
                             }
                         }
@@ -711,7 +721,7 @@ async fn debug_transaction(
 
                         if let Ok(trace_response) = trace_response {
                             if let Ok(trace_result) = trace_response.json::<serde_json::Value>().await {
-                                if let Some(trace) = trace_result["result"].as_object() {
+                                if let Some(trace) = trace_result.get("result").unwrap_or(&serde_json::Value::Null).as_object() {
                                     println!("  Call Type: {}", trace["type"].as_str().unwrap_or("UNKNOWN"));
                                     if let Some(calls) = trace["calls"].as_array() {
                                         println!("  Subcalls: {}", calls.len());
@@ -771,7 +781,7 @@ async fn model_analytics(
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(stats) = result["result"].as_object() {
+    if let Some(stats) = result.get("result").unwrap_or(&serde_json::Value::Null).as_object() {
         println!("{}", "Model Statistics:".bold());
         println!("  Total Inferences: {}", stats["total_inferences"].as_u64().unwrap_or(0));
         println!("  Average Execution Time: {}ms", stats["avg_execution_time"].as_f64().unwrap_or(0.0));

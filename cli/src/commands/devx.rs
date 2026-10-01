@@ -103,7 +103,8 @@ fn to_checksum(addr: &[u8; 20]) -> String {
         if ch.is_ascii_digit() {
             out.push(ch);
         } else {
-            let nibble = (hash[i / 2] >> (if i % 2 == 0 { 4 } else { 0 })) & 0xf;
+            let byte = hash.get(i / 2).copied().unwrap_or(0);
+            let nibble = (byte >> (if i % 2 == 0 { 4 } else { 0 })) & 0xf;
             out.push(if nibble >= 8 { ch.to_ascii_uppercase() } else { ch });
         }
     }
@@ -131,14 +132,14 @@ pub fn execute(cmd: DevxCommands) -> Result<()> {
         DevxCommands::Contract { section } => {
             let c = contract()?;
             let out = match section.as_str() {
-                "chain" => c["chain"].clone(),
-                "aa" => serde_json::json!({ "aaStack": c["aaStack"], "membership": c["membership"] }),
-                "identity" => c["identity"].clone(),
-                "gateway" => c["gateway"].clone(),
-                "entitlements" => c["entitlements"].clone(),
+                "chain" => c.get("chain").unwrap_or(&serde_json::Value::Null).clone(),
+                "aa" => serde_json::json!({ "aaStack": c.get("aaStack").unwrap_or(&serde_json::Value::Null), "membership": c.get("membership").unwrap_or(&serde_json::Value::Null) }),
+                "identity" => c.get("identity").unwrap_or(&serde_json::Value::Null).clone(),
+                "gateway" => c.get("gateway").unwrap_or(&serde_json::Value::Null).clone(),
+                "entitlements" => c.get("entitlements").unwrap_or(&serde_json::Value::Null).clone(),
                 _ => serde_json::json!({
-                    "chain": c["chain"], "aaStack": c["aaStack"], "membership": c["membership"],
-                    "identity": c["identity"], "entitlements": c["entitlements"], "gateway": c["gateway"],
+                    "chain": c.get("chain").unwrap_or(&serde_json::Value::Null), "aaStack": c.get("aaStack").unwrap_or(&serde_json::Value::Null), "membership": c.get("membership").unwrap_or(&serde_json::Value::Null),
+                    "identity": c.get("identity").unwrap_or(&serde_json::Value::Null), "entitlements": c.get("entitlements").unwrap_or(&serde_json::Value::Null), "gateway": c.get("gateway").unwrap_or(&serde_json::Value::Null),
                 }),
             };
             println!("{}", serde_json::to_string_pretty(&out)?);
@@ -146,8 +147,8 @@ pub fn execute(cmd: DevxCommands) -> Result<()> {
         DevxCommands::PredictAddress { user_id, uuid } => {
             let uid = resolve_user_id(user_id, uuid)?;
             let c = contract()?;
-            let factory = parse_addr20(&c["aaStack"]["CitrateWalletFactory"])?;
-            let implementation = parse_addr20(&c["aaStack"]["CitrateWallet"])?;
+            let factory = parse_addr20(c.get("aaStack").unwrap_or(&serde_json::Value::Null).get("CitrateWalletFactory").unwrap_or(&serde_json::Value::Null))?;
+            let implementation = parse_addr20(c.get("aaStack").unwrap_or(&serde_json::Value::Null).get("CitrateWallet").unwrap_or(&serde_json::Value::Null))?;
             let addr = predict_address(factory, implementation, &uid);
             let out = serde_json::json!({
                 "userId": format!("0x{}", hex::encode(uid)),
