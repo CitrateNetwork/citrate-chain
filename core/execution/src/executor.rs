@@ -5151,12 +5151,17 @@ mod tests {
 
         let state_db = Arc::new(StateDB::new());
         let executor = Executor::new(state_db.clone());
-        state_db.accounts.set_balance(alice_addr, need - U256::one());
+        state_db
+            .accounts
+            .set_balance(alice_addr, need - U256::one());
         let err = executor
             .execute_transaction(&create_test_block(), &tx)
             .await
             .expect_err("one wei short");
-        assert!(matches!(err, ExecutionError::InsufficientBalance { .. }), "{err}");
+        assert!(
+            matches!(err, ExecutionError::InsufficientBalance { .. }),
+            "{err}"
+        );
     }
 
     #[test]
@@ -5169,7 +5174,11 @@ mod tests {
         let mut ctx = ExecutionContext::new(&block, &tx);
         for short in [&[][..], &[1, 2, 3][..]] {
             assert!(matches!(
-                rt.block_on(executor.execute_governance_precompile(short, Address([1; 20]), &mut ctx)),
+                rt.block_on(executor.execute_governance_precompile(
+                    short,
+                    Address([1; 20]),
+                    &mut ctx
+                )),
                 Err(ExecutionError::InvalidInput)
             ));
             assert!(matches!(
@@ -5254,7 +5263,12 @@ mod tests {
         state_db
             .register_model(
                 id,
-                test_model(owner, AccessPolicy::PayPerUse { fee: U256::from(1000u64) }),
+                test_model(
+                    owner,
+                    AccessPolicy::PayPerUse {
+                        fee: U256::from(1000u64),
+                    },
+                ),
             )
             .unwrap();
         state_db.accounts.set_balance(caller, U256::from(10_000u64));
@@ -5299,7 +5313,11 @@ mod tests {
             .execute_submit_gradient(a, job_id, vec![], vec![], &mut ctx)
             .await
             .unwrap();
-        assert_eq!(state_db.accounts.get_balance(&a), U256::zero(), "not complete yet");
+        assert_eq!(
+            state_db.accounts.get_balance(&a),
+            U256::zero(),
+            "not complete yet"
+        );
         executor
             .execute_submit_gradient(b, job_id, vec![], vec![], &mut ctx)
             .await
@@ -5352,7 +5370,9 @@ mod tests {
         let m = state_db
             .get_model(&ModelId(Hash::new([0x45; 32])))
             .expect("registered");
-        assert!(matches!(m.access_policy, AccessPolicy::PayPerUse { fee } if fee == U256::from(77u8)));
+        assert!(
+            matches!(m.access_policy, AccessPolicy::PayPerUse { fee } if fee == U256::from(77u8))
+        );
     }
 
     /// PANIC-S1 G4: value sent to a precompile moves through the journal.

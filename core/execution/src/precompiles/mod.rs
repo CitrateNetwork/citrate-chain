@@ -374,12 +374,24 @@ impl PrecompileExecutor {
             });
         }
 
-        // Parse input
-        let hash = &input[0..32];
-        // v is in the last byte of the 32-byte v field (bytes 32-64)
-        let v = input[63];
-        let r = &input[64..96];
-        let s = &input[96..128];
+        // hash(32) ‖ v word(32, v in the last byte) ‖ r(32) ‖ s(32); length checked above.
+        let zero = || PrecompileResult {
+            output: vec![0u8; 32],
+            gas_used: GAS_COST,
+            success: true,
+        };
+        let Some((hash, rest)) = input.split_first_chunk::<32>() else {
+            return Ok(zero());
+        };
+        let Some((&[.., v], rest)) = rest.split_first_chunk::<32>() else {
+            return Ok(zero());
+        };
+        let Some((r, rest)) = rest.split_first_chunk::<32>() else {
+            return Ok(zero());
+        };
+        let Some(s) = rest.first_chunk::<32>() else {
+            return Ok(zero());
+        };
 
         // Recovery ID: v should be 27 or 28 for standard Ethereum signatures
         // (or 0/1 for some implementations)
@@ -410,8 +422,7 @@ impl PrecompileExecutor {
         };
 
         // Return zero-padded 32-byte address (12 zero bytes + 20-byte address)
-        let mut output = vec![0u8; 32];
-        output[12..32].copy_from_slice(&recovered_address);
+        let output = word_right_aligned(&recovered_address);
 
         Ok(PrecompileResult {
             output,
@@ -421,7 +432,7 @@ impl PrecompileExecutor {
     }
 
     fn sha256(&self, input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
-        let gas_cost = 60 + (input.len() as u64).div_ceil(32) * 12;
+        let gas_cost = word_gas(input, 60, 12);
         if gas_limit < gas_cost {
             return Err(anyhow::anyhow!("Insufficient gas"));
         }
@@ -439,7 +450,7 @@ impl PrecompileExecutor {
     }
 
     fn ripemd160(&self, input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
-        let gas_cost = 600 + (input.len() as u64).div_ceil(32) * 120;
+        let gas_cost = word_gas(input, 600, 120);
         if gas_limit < gas_cost {
             return Err(anyhow::anyhow!("Insufficient gas"));
         }
@@ -451,8 +462,7 @@ impl PrecompileExecutor {
         let hash = hasher.finalize();
 
         // Output is 32 bytes: 12 zero bytes + 20-byte hash (right-aligned)
-        let mut output = vec![0u8; 32];
-        output[12..32].copy_from_slice(&hash);
+        let output = word_right_aligned(&hash);
 
         Ok(PrecompileResult {
             output,
@@ -462,7 +472,7 @@ impl PrecompileExecutor {
     }
 
     fn identity(&self, input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
-        let gas_cost = 15 + (input.len() as u64).div_ceil(32) * 3;
+        let gas_cost = word_gas(input, 15, 3);
         if gas_limit < gas_cost {
             return Err(anyhow::anyhow!("Insufficient gas"));
         }
@@ -478,17 +488,28 @@ impl PrecompileExecutor {
         // EIP-198: MODEXP precompile
         // Input: Blen (32 bytes) || Elen (32 bytes) || Mlen (32 bytes) || B || E || M
         // Output: B^E mod M, left-padded to Mlen bytes
+        //
+        // Lengths are attacker-chosen: every offset/size below saturates, so an
+        // absurd length prices itself out at the gas check instead of overflowing.
 
-        // Helper to read length from 32-byte big-endian field
+        // Read a length: the low 8 bytes of the 32-byte big-endian word at `offset`
+        // (0 if the word is past the end of the input).
         fn read_len(data: &[u8], offset: usize) -> usize {
-            if offset + 32 > data.len() {
-                return 0;
+            data.get(offset..)
+                .and_then(|rest| rest.first_chunk::<32>())
+                .map_or(0, |w| {
+                    let [.., a, b, c, d, e, f, g, h] = *w;
+                    u64::from_be_bytes([a, b, c, d, e, f, g, h]) as usize
+                })
+        }
+
+        // `len` bytes of `data` starting at `start`, zero-padded past the input end.
+        fn padded(data: &[u8], start: usize, len: usize) -> Vec<u8> {
+            let mut out = vec![0u8; len];
+            for (o, b) in out.iter_mut().zip(data.get(start..).unwrap_or_default()) {
+                *o = *b;
             }
-            // Take last 8 bytes as usize (lengths won't exceed u64::MAX in practice)
-            let slice = &data[offset..offset + 32];
-            let mut bytes = [0u8; 8];
-            bytes.copy_from_slice(&slice[24..32]);
-            u64::from_be_bytes(bytes) as usize
+            out
         }
 
         // Read lengths
@@ -508,79 +529,52 @@ impl PrecompileExecutor {
         // Calculate gas cost (EIP-2565 simplified formula)
         let max_len = std::cmp::max(b_len, m_len);
         let words = max_len.div_ceil(8);
-        let multiplication_complexity = words * words;
+        let multiplication_complexity = words.saturating_mul(words);
 
-        // Calculate iteration count from exponent
-        let e_start = 96 + b_len;
-        let iteration_count = if e_len <= 32 {
-            // Get the exponent data
-            let mut e_bytes = vec![0u8; 32];
-            let e_end = std::cmp::min(e_start + e_len, input.len());
-            if e_start < input.len() {
-                let copy_len = e_end - e_start;
-                e_bytes[32 - copy_len..].copy_from_slice(&input[e_start..e_end]);
-            }
-            let exp = BigUint::from_bytes_be(&e_bytes);
-            if exp.is_zero() {
-                0
-            } else {
-                exp.bits() as usize - 1
-            }
+        // Calculate iteration count from the exponent's first (up to) 32 bytes. The
+        // available bytes are right-aligned in a 32-byte word (as before; a short
+        // input therefore shifts the head right rather than zero-filling the tail).
+        let e_start = b_len.saturating_add(96);
+        let head_len = e_len.min(32);
+        let avail = input.get(e_start..).unwrap_or_default();
+        let head = avail.get(..head_len).unwrap_or(avail);
+        let mut e_bytes = [0u8; 32];
+        if let Some(dst) = e_bytes.get_mut(32usize.saturating_sub(head.len())..) {
+            dst.copy_from_slice(head);
+        }
+        let exp_head = BigUint::from_bytes_be(&e_bytes);
+        let head_bits = if exp_head.is_zero() {
+            0
         } else {
-            // For exponents > 32 bytes, use first 32 bytes
-            let mut e_bytes = vec![0u8; 32];
-            let e_end = std::cmp::min(e_start + 32, input.len());
-            if e_start < input.len() {
-                let copy_len = e_end - e_start;
-                e_bytes[32 - copy_len..].copy_from_slice(&input[e_start..e_end]);
-            }
-            let exp_head = BigUint::from_bytes_be(&e_bytes);
-            let head_bits = if exp_head.is_zero() {
-                0
-            } else {
-                exp_head.bits() as usize - 1
-            };
-            8 * (e_len - 32) + head_bits
+            (exp_head.bits() as usize).saturating_sub(1)
+        };
+        let iteration_count = if e_len <= 32 {
+            head_bits
+        } else {
+            e_len
+                .saturating_sub(32)
+                .saturating_mul(8)
+                .saturating_add(head_bits)
         };
 
         let gas_cost = std::cmp::max(
             200,
-            (multiplication_complexity * std::cmp::max(iteration_count, 1)) as u64 / 3,
+            (multiplication_complexity.saturating_mul(std::cmp::max(iteration_count, 1)) as u64)
+                .checked_div(3)
+                .unwrap_or(0),
         );
 
         if gas_limit < gas_cost {
             return Err(anyhow::anyhow!("Insufficient gas"));
         }
 
-        // Extract base, exponent, modulus from input
-        let data_start = 96;
-        let b_start = data_start;
-        let b_end = b_start + b_len;
-        let e_start = b_end;
-        let e_end = e_start + e_len;
-        let m_start = e_end;
-        let m_end = m_start + m_len;
-
-        // Read values, padding with zeros if input is too short
-        let mut b_bytes = vec![0u8; b_len];
-        let mut e_bytes = vec![0u8; e_len];
-        let mut m_bytes = vec![0u8; m_len];
-
-        if b_start < input.len() {
-            let copy_end = std::cmp::min(b_end, input.len());
-            let copy_len = copy_end - b_start;
-            b_bytes[..copy_len].copy_from_slice(&input[b_start..copy_end]);
-        }
-        if e_start < input.len() {
-            let copy_end = std::cmp::min(e_end, input.len());
-            let copy_len = copy_end - e_start;
-            e_bytes[..copy_len].copy_from_slice(&input[e_start..copy_end]);
-        }
-        if m_start < input.len() {
-            let copy_end = std::cmp::min(m_end, input.len());
-            let copy_len = copy_end - m_start;
-            m_bytes[..copy_len].copy_from_slice(&input[m_start..copy_end]);
-        }
+        // Extract base, exponent, modulus from input, zero-padded if it is short.
+        let b_start = 96usize;
+        let e_start = b_start.saturating_add(b_len);
+        let m_start = e_start.saturating_add(e_len);
+        let b_bytes = padded(input, b_start, b_len);
+        let e_bytes = padded(input, e_start, e_len);
+        let m_bytes = padded(input, m_start, m_len);
 
         let base = BigUint::from_bytes_be(&b_bytes);
         let exp = BigUint::from_bytes_be(&e_bytes);
@@ -593,15 +587,14 @@ impl PrecompileExecutor {
             base.modpow(&exp, &modulus)
         };
 
-        // Convert to bytes, left-padded to m_len
+        // Convert to bytes: the low m_len bytes, left-padded to m_len.
         let result_bytes = result.to_bytes_be();
+        let low = result_bytes
+            .get(result_bytes.len().saturating_sub(m_len)..)
+            .unwrap_or_default();
         let mut output = vec![0u8; m_len];
-        if result_bytes.len() <= m_len {
-            let start = m_len - result_bytes.len();
-            output[start..].copy_from_slice(&result_bytes);
-        } else {
-            // Shouldn't happen if modulus is correct, but handle anyway
-            output.copy_from_slice(&result_bytes[result_bytes.len() - m_len..]);
+        if let Some(dst) = output.get_mut(m_len.saturating_sub(low.len())..) {
+            dst.copy_from_slice(low);
         }
 
         Ok(PrecompileResult {
@@ -622,8 +615,9 @@ impl PrecompileExecutor {
 
         // Pad input to 128 bytes if needed
         let mut padded = [0u8; 128];
-        let copy_len = std::cmp::min(input.len(), 128);
-        padded[..copy_len].copy_from_slice(&input[..copy_len]);
+        for (p, b) in padded.iter_mut().zip(input) {
+            *p = *b;
+        }
 
         // Parse point 1
         let p1 = match Self::parse_g1_point(&padded[0..64]) {
@@ -665,8 +659,9 @@ impl PrecompileExecutor {
 
         // Pad input to 96 bytes if needed
         let mut padded = [0u8; 96];
-        let copy_len = std::cmp::min(input.len(), 96);
-        padded[..copy_len].copy_from_slice(&input[..copy_len]);
+        for (p, b) in padded.iter_mut().zip(input) {
+            *p = *b;
+        }
 
         // Parse point
         let p = match Self::parse_g1_point(&padded[0..64]) {
@@ -709,17 +704,15 @@ impl PrecompileExecutor {
         }
 
         let k = input.len() / 192;
-        let gas_cost = 45000 + k as u64 * 34000;
+        let gas_cost = (k as u64).saturating_mul(34000).saturating_add(45000);
         if gas_limit < gas_cost {
             return Err(anyhow::anyhow!("Insufficient gas"));
         }
 
         // Empty input is valid and returns 1
         if k == 0 {
-            let mut output = vec![0u8; 32];
-            output[31] = 1;
             return Ok(PrecompileResult {
-                output,
+                output: bool_word(true),
                 gas_used: gas_cost,
                 success: true,
             });
@@ -729,11 +722,12 @@ impl PrecompileExecutor {
         let mut g1_points = Vec::with_capacity(k);
         let mut g2_points = Vec::with_capacity(k);
 
-        for i in 0..k {
-            let offset = i * 192;
+        // The length is a multiple of 192 (checked above): exactly k pairs.
+        for (i, pair) in input.chunks_exact(192).enumerate() {
+            let (g1_bytes, g2_bytes) = pair.split_at(64);
 
             // Parse G1 point (64 bytes)
-            let g1 = match Self::parse_g1_point(&input[offset..offset + 64]) {
+            let g1 = match Self::parse_g1_point(g1_bytes) {
                 Some(p) => p,
                 None => {
                     return Err(anyhow::anyhow!("Invalid G1 point in pair {}", i));
@@ -741,7 +735,7 @@ impl PrecompileExecutor {
             };
 
             // Parse G2 point (128 bytes)
-            let g2 = match Self::parse_g2_point(&input[offset + 64..offset + 192]) {
+            let g2 = match Self::parse_g2_point(g2_bytes) {
                 Some(p) => p,
                 None => {
                     return Err(anyhow::anyhow!("Invalid G2 point in pair {}", i));
@@ -758,13 +752,8 @@ impl PrecompileExecutor {
         // Check if result equals identity (1 in GT)
         let is_one = result.0 == ark_bn254::Fq12::ONE;
 
-        let mut output = vec![0u8; 32];
-        if is_one {
-            output[31] = 1;
-        }
-
         Ok(PrecompileResult {
-            output,
+            output: bool_word(is_one),
             gas_used: gas_cost,
             success: true,
         })
@@ -783,71 +772,52 @@ impl PrecompileExecutor {
             ));
         }
 
-        // Parse rounds (4 bytes big-endian)
-        let rounds = u32::from_be_bytes([input[0], input[1], input[2], input[3]]) as u64;
+        // rounds(4, BE) ‖ h(64 = 8 × u64 LE) ‖ m(128 = 16 × u64 LE) ‖ t(16 = 2 × u64 LE)
+        // ‖ f(1); the length is exactly 213 (checked above).
+        let bad = || anyhow::anyhow!("Invalid BLAKE2F input");
+        let (rounds_be, rest) = input.split_first_chunk::<4>().ok_or_else(bad)?;
+        let rounds = u32::from_be_bytes(*rounds_be) as u64;
 
         // Gas cost is the number of rounds
         if gas_limit < rounds {
             return Err(anyhow::anyhow!("Insufficient gas"));
         }
 
+        let (h_bytes, rest) = rest.split_first_chunk::<64>().ok_or_else(bad)?;
+        let (m_bytes, rest) = rest.split_first_chunk::<128>().ok_or_else(bad)?;
+        let (t0_le, rest) = rest.split_first_chunk::<8>().ok_or_else(bad)?;
+        let (t1_le, rest) = rest.split_first_chunk::<8>().ok_or_else(bad)?;
+        let &[f] = rest else {
+            return Err(bad());
+        };
+
         // Parse final block flag (must be 0 or 1)
-        let f = input[212];
         if f > 1 {
             return Err(anyhow::anyhow!("Invalid final block flag: {}", f));
         }
 
+        let le_words = |bytes: &[u8], out: &mut [u64]| {
+            for (w, chunk) in out.iter_mut().zip(bytes.chunks_exact(8)) {
+                if let Ok(arr) = <[u8; 8]>::try_from(chunk) {
+                    *w = u64::from_le_bytes(arr);
+                }
+            }
+        };
         // Parse state vector h (64 bytes = 8 x u64 little-endian)
         let mut h = [0u64; 8];
-        for (i, h_val) in h.iter_mut().enumerate() {
-            let offset = 4 + i * 8;
-            *h_val = u64::from_le_bytes([
-                input[offset],
-                input[offset + 1],
-                input[offset + 2],
-                input[offset + 3],
-                input[offset + 4],
-                input[offset + 5],
-                input[offset + 6],
-                input[offset + 7],
-            ]);
-        }
-
+        le_words(h_bytes, &mut h);
         // Parse message block m (128 bytes = 16 x u64 little-endian)
         let mut m = [0u64; 16];
-        for (i, m_val) in m.iter_mut().enumerate() {
-            let offset = 68 + i * 8;
-            *m_val = u64::from_le_bytes([
-                input[offset],
-                input[offset + 1],
-                input[offset + 2],
-                input[offset + 3],
-                input[offset + 4],
-                input[offset + 5],
-                input[offset + 6],
-                input[offset + 7],
-            ]);
-        }
-
+        le_words(m_bytes, &mut m);
         // Parse offset counters t (16 bytes = 2 x u64 little-endian)
-        let t0 = u64::from_le_bytes([
-            input[196], input[197], input[198], input[199], input[200], input[201], input[202],
-            input[203],
-        ]);
-        let t1 = u64::from_le_bytes([
-            input[204], input[205], input[206], input[207], input[208], input[209], input[210],
-            input[211],
-        ]);
+        let t0 = u64::from_le_bytes(*t0_le);
+        let t1 = u64::from_le_bytes(*t1_le);
 
         // BLAKE2b compression function F
         Self::blake2b_compress(&mut h, &m, t0, t1, f == 1, rounds as usize);
 
         // Serialize output (64 bytes = 8 x u64 little-endian)
-        let mut output = vec![0u8; 64];
-        for i in 0..8 {
-            let bytes = h[i].to_le_bytes();
-            output[i * 8..(i + 1) * 8].copy_from_slice(&bytes);
-        }
+        let output: Vec<u8> = h.iter().flat_map(|w| w.to_le_bytes()).collect();
 
         Ok(PrecompileResult {
             output,
@@ -857,6 +827,10 @@ impl PrecompileExecutor {
     }
 
     /// BLAKE2b compression function F
+    // Every index below is a compile-time constant < 16 (`g`'s a/b/c/d and the SIGMA
+    // table entries) or `i % 10` into the 10-row SIGMA table.
+    // INVARIANT: constant in-range indices (test: eip_test_vectors blake2f vectors)
+    #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
     fn blake2b_compress(h: &mut [u64; 8], m: &[u64; 16], t0: u64, t1: u64, f: bool, rounds: usize) {
         // BLAKE2b IV
         const IV: [u64; 8] = [
@@ -895,6 +869,8 @@ impl PrecompileExecutor {
         }
 
         // Mixing function G
+        // INVARIANT: called only with literal indices < 16 (test: eip_test_vectors blake2f vectors)
+        #[allow(clippy::indexing_slicing)]
         #[inline]
         fn g(v: &mut [u64; 16], a: usize, b: usize, c: usize, d: usize, x: u64, y: u64) {
             v[a] = v[a].wrapping_add(v[b]).wrapping_add(x);
@@ -930,27 +906,16 @@ impl PrecompileExecutor {
 
     /// Parse a G1 point from 64 bytes (x: 32 bytes, y: 32 bytes, big-endian)
     fn parse_g1_point(input: &[u8]) -> Option<G1Affine> {
-        if input.len() < 64 {
-            return None;
-        }
+        let (x_be, rest) = input.split_first_chunk::<32>()?;
+        let y_be = rest.first_chunk::<32>()?;
 
         // Check for point at infinity (both coordinates zero)
-        let all_zeros = input[..64].iter().all(|&b| b == 0);
-        if all_zeros {
+        if x_be.iter().chain(y_be).all(|&b| b == 0) {
             return Some(G1Affine::identity());
         }
 
-        // Parse x coordinate (big-endian)
-        let mut x_bytes = [0u8; 32];
-        x_bytes.copy_from_slice(&input[0..32]);
-        x_bytes.reverse(); // Convert to little-endian for arkworks
-        let x = Fq::from_le_bytes_mod_order(&x_bytes);
-
-        // Parse y coordinate (big-endian)
-        let mut y_bytes = [0u8; 32];
-        y_bytes.copy_from_slice(&input[32..64]);
-        y_bytes.reverse();
-        let y = Fq::from_le_bytes_mod_order(&y_bytes);
+        let x = fq_from_be(x_be);
+        let y = fq_from_be(y_be);
 
         // Construct point and validate it's on the curve
         let point = G1Affine::new(x, y);
@@ -963,42 +928,23 @@ impl PrecompileExecutor {
 
     /// Parse a G2 point from 128 bytes (x_im, x_re, y_im, y_re each 32 bytes, big-endian)
     fn parse_g2_point(input: &[u8]) -> Option<G2Affine> {
-        if input.len() < 128 {
-            return None;
-        }
+        // EVM encoding: x_imaginary ‖ x_real ‖ y_imaginary ‖ y_real (32 bytes each)
+        let (x_im, rest) = input.split_first_chunk::<32>()?;
+        let (x_re, rest) = rest.split_first_chunk::<32>()?;
+        let (y_im, rest) = rest.split_first_chunk::<32>()?;
+        let y_re = rest.first_chunk::<32>()?;
 
         // Check for point at infinity
-        let all_zeros = input[..128].iter().all(|&b| b == 0);
-        if all_zeros {
+        if [x_im, x_re, y_im, y_re]
+            .iter()
+            .all(|w| w.iter().all(|&b| b == 0))
+        {
             return Some(G2Affine::identity());
         }
 
-        // Parse x coordinate (Fq2 = c0 + c1*u where c0 is real, c1 is imaginary)
-        // EVM encoding: x_imaginary (32) || x_real (32)
-        let mut x_im_bytes = [0u8; 32];
-        x_im_bytes.copy_from_slice(&input[0..32]);
-        x_im_bytes.reverse();
-        let x_im = Fq::from_le_bytes_mod_order(&x_im_bytes);
-
-        let mut x_re_bytes = [0u8; 32];
-        x_re_bytes.copy_from_slice(&input[32..64]);
-        x_re_bytes.reverse();
-        let x_re = Fq::from_le_bytes_mod_order(&x_re_bytes);
-
-        let x = Fq2::new(x_re, x_im);
-
-        // Parse y coordinate
-        let mut y_im_bytes = [0u8; 32];
-        y_im_bytes.copy_from_slice(&input[64..96]);
-        y_im_bytes.reverse();
-        let y_im = Fq::from_le_bytes_mod_order(&y_im_bytes);
-
-        let mut y_re_bytes = [0u8; 32];
-        y_re_bytes.copy_from_slice(&input[96..128]);
-        y_re_bytes.reverse();
-        let y_re = Fq::from_le_bytes_mod_order(&y_re_bytes);
-
-        let y = Fq2::new(y_re, y_im);
+        // Fq2 = c0 + c1*u where c0 is real, c1 is imaginary
+        let x = Fq2::new(fq_from_be(x_re), fq_from_be(x_im));
+        let y = Fq2::new(fq_from_be(y_re), fq_from_be(y_im));
 
         // Construct point and validate
         let point = G2Affine::new(x, y);
@@ -1011,34 +957,49 @@ impl PrecompileExecutor {
 
     /// Serialize a G1 point to 64 bytes (x: 32 bytes, y: 32 bytes, big-endian)
     fn serialize_g1_point(point: &G1Affine) -> Vec<u8> {
-        let mut output = vec![0u8; 64];
-
         if point.is_zero() {
-            return output;
+            return vec![0u8; 64];
         }
 
-        // Serialize x (convert from little-endian to big-endian)
-        let x_bigint: BigInt<4> = point.x.into_bigint();
-        let mut x_bytes = [0u8; 32];
-        for (i, limb) in x_bigint.0.iter().enumerate() {
-            let bytes = limb.to_le_bytes();
-            x_bytes[i * 8..(i + 1) * 8].copy_from_slice(&bytes);
-        }
-        x_bytes.reverse();
-        output[0..32].copy_from_slice(&x_bytes);
-
-        // Serialize y
-        let y_bigint: BigInt<4> = point.y.into_bigint();
-        let mut y_bytes = [0u8; 32];
-        for (i, limb) in y_bigint.0.iter().enumerate() {
-            let bytes = limb.to_le_bytes();
-            y_bytes[i * 8..(i + 1) * 8].copy_from_slice(&bytes);
-        }
-        y_bytes.reverse();
-        output[32..64].copy_from_slice(&y_bytes);
-
+        // Big-endian x ‖ y from arkworks' little-endian limbs.
+        let to_be = |limbs: BigInt<4>| -> Vec<u8> {
+            let mut le: Vec<u8> = limbs.0.iter().flat_map(|l| l.to_le_bytes()).collect();
+            le.reverse();
+            le
+        };
+        let mut output = to_be(point.x.into_bigint());
+        output.extend(to_be(point.y.into_bigint()));
         output
     }
+}
+
+/// An Fq element from a 32-byte big-endian word (reduced mod p, as before).
+fn fq_from_be(be: &[u8; 32]) -> Fq {
+    let mut le = *be;
+    le.reverse();
+    Fq::from_le_bytes_mod_order(&le)
+}
+
+/// A 32-byte word with `bytes` right-aligned (left zero-padded).
+fn word_right_aligned(bytes: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; 32usize.saturating_sub(bytes.len())];
+    out.extend_from_slice(bytes.get(..32).unwrap_or(bytes));
+    out
+}
+
+/// The 32-byte boolean word `0x…01` / `0x…00`.
+fn bool_word(value: bool) -> Vec<u8> {
+    let mut out = [0u8; 32];
+    out[31] = u8::from(value);
+    out.to_vec()
+}
+
+/// `base + per_word × ⌈len / 32⌉` (saturating).
+fn word_gas(input: &[u8], base: u64, per_word: u64) -> u64 {
+    (input.len() as u64)
+        .div_ceil(32)
+        .saturating_mul(per_word)
+        .saturating_add(base)
 }
 
 /// Recover Ethereum address from ECDSA signature components.
@@ -1934,5 +1895,25 @@ mod tests {
         assert_eq!(recover_address(&h, &[1u8; 31], &[1u8; 32], 0), None);
         assert_eq!(recover_address(&h, &[1u8; 32], &[1u8; 33], 0), None);
         assert_eq!(recover_address(&h, &[], &[], 0), None);
+    }
+
+    /// PANIC-S1: modexp with attacker-sized length words (the old code overflowed
+    /// `96 + b_len` and `words * words`) is priced out at the gas check, never panics.
+    #[test]
+    fn panic_s1_modexp_huge_lengths_are_rejected_not_panicked() {
+        let pe = PrecompileExecutor::new();
+        for (b, e, m) in [
+            (u64::MAX, 1, 1),
+            (1, u64::MAX, 1),
+            (1, 1, u64::MAX),
+            (u64::MAX, u64::MAX, u64::MAX),
+        ] {
+            let mut input = vec![0u8; 96];
+            input[24..32].copy_from_slice(&b.to_be_bytes());
+            input[56..64].copy_from_slice(&e.to_be_bytes());
+            input[88..96].copy_from_slice(&m.to_be_bytes());
+            input.extend_from_slice(&[7u8; 8]);
+            assert!(pe.modexp(&input, 10_000_000).is_err(), "({b}, {e}, {m})");
+        }
     }
 }

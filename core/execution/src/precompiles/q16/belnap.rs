@@ -70,7 +70,6 @@
         clippy::string_slice
     )
 )]
-
 #![allow(dead_code)] // some helpers used only by tests until WP-1.5
 
 use super::Q16;
@@ -160,7 +159,9 @@ impl std::fmt::Display for BelnapError {
             BelnapError::NZero => write!(f, "n must be > 0"),
             BelnapError::DimTooLarge => write!(f, "dim exceeds cap of {MAX_DIM}"),
             BelnapError::NTooLarge => write!(f, "n exceeds cap of {MAX_N}"),
-            BelnapError::LengthMismatch => write!(f, "input length does not match declared (dim, n)"),
+            BelnapError::LengthMismatch => {
+                write!(f, "input length does not match declared (dim, n)")
+            }
         }
     }
 }
@@ -219,7 +220,9 @@ pub fn decode(input: &[u8]) -> Result<BelnapInput, BelnapError> {
         .and_then(|nd| nd.checked_mul(16)) // embeddings + confidences = 2 * 8 bytes
         .and_then(|nd16| nd16.checked_add(n.checked_mul(8)?)) // + weights
         .ok_or(BelnapError::LengthMismatch)?;
-    let expected_total = HEADER_LEN.checked_add(body_len).ok_or(BelnapError::LengthMismatch)?;
+    let expected_total = HEADER_LEN
+        .checked_add(body_len)
+        .ok_or(BelnapError::LengthMismatch)?;
 
     if input.len() != expected_total {
         return Err(BelnapError::LengthMismatch);
@@ -351,11 +354,7 @@ pub fn encode_output(output: &BelnapOutput) -> Vec<u8> {
 /// thresholds for unbalanced data); the WP-1.3 helper uses only `threshold_pos`.
 ///
 /// Pure / deterministic / Q16-only.
-pub fn classify_dim_threshold(
-    embedding: Q16,
-    confidence: Q16,
-    threshold_pos: Q16,
-) -> Option<bool> {
+pub fn classify_dim_threshold(embedding: Q16, confidence: Q16, threshold_pos: Q16) -> Option<bool> {
     if confidence.0 < threshold_pos.0 {
         return None;
     }
@@ -554,7 +553,10 @@ pub fn aggregate_decoded(input: &BelnapInput) -> BelnapOutput {
 /// Gas: `GAS_BASE + GAS_PER_DIM * dim` = `2000 + 50 * dim`.
 /// Decode failures (`InputTooShort`, malformed bytes) charge `GAS_BASE`
 /// so a malformed-input griefer still pays for the parse work.
-pub fn execute(input: &[u8], gas_limit: u64) -> Result<crate::precompiles::PrecompileResult, anyhow::Error> {
+pub fn execute(
+    input: &[u8],
+    gas_limit: u64,
+) -> Result<crate::precompiles::PrecompileResult, anyhow::Error> {
     execute_at(input, gas_limit, false)
 }
 
@@ -568,11 +570,7 @@ pub fn gas_for(input: &[u8], hardened: bool) -> u64 {
     }
     let n_hint = be_u32_at(input, 4).map_or(0, u64::from);
     let n_hint = n_hint.clamp(1, MAX_N as u64);
-    GAS_BASE.saturating_add(
-        GAS_PER_DIM
-            .saturating_mul(dim_hint)
-            .saturating_mul(n_hint),
-    )
+    GAS_BASE.saturating_add(GAS_PER_DIM.saturating_mul(dim_hint).saturating_mul(n_hint))
 }
 
 /// Precompile entry with the consensus activation flag (see [`gas_for`]).
@@ -647,9 +645,7 @@ mod tests {
         assert_eq!(bytes.len(), 9 * dim, "output bytes length must be 9 * dim");
         let mut aggregated_values = Vec::with_capacity(dim);
         for d in 0..dim {
-            let raw = i64::from_be_bytes(
-                bytes[d * 8..(d + 1) * 8].try_into().expect("8 bytes"),
-            );
+            let raw = i64::from_be_bytes(bytes[d * 8..(d + 1) * 8].try_into().expect("8 bytes"));
             aggregated_values.push(Q16::from_raw(raw));
         }
         let states_off = 8 * dim;
@@ -868,10 +864,7 @@ mod tests {
     fn classify_below_threshold_neither() {
         let conf = Q16::from_f64(0.5);
         let thr = Q16::from_f64(0.8);
-        assert_eq!(
-            classify_dim_threshold(Q16::from_f64(1.0), conf, thr),
-            None
-        );
+        assert_eq!(classify_dim_threshold(Q16::from_f64(1.0), conf, thr), None);
     }
 
     #[test]
@@ -910,10 +903,7 @@ mod tests {
         // (`>= 0` rule). Documented in fn docs.
         let conf = Q16::from_f64(0.9);
         let thr = Q16::from_f64(0.8);
-        assert_eq!(
-            classify_dim_threshold(Q16::ZERO, conf, thr),
-            Some(true)
-        );
+        assert_eq!(classify_dim_threshold(Q16::ZERO, conf, thr), Some(true));
     }
 
     #[test]
@@ -1092,7 +1082,10 @@ mod tests {
             threshold_neg: Q16::from_f64(-0.8),
         };
         let bytes = encode_input(&input);
-        let out = parse_output(&aggregate(&bytes).expect("aggregates without panic"), input.dim);
+        let out = parse_output(
+            &aggregate(&bytes).expect("aggregates without panic"),
+            input.dim,
+        );
         // Two high-conf positive-weight participants on opposing sides
         // → state=Both. Aggregated value is well-defined Q16 (no panic,
         // no wrap — saturating throughout).
@@ -1194,9 +1187,9 @@ mod tests {
         let mut bytes = vec![0u8; 16];
         bytes[0..4].copy_from_slice(&u32::MAX.to_be_bytes()); // huge dim
         bytes[4..8].copy_from_slice(&1u32.to_be_bytes()); // n=1
-        // input is too short for the actual decode; the gas pre-charge
-        // path will compute total_gas = GAS_BASE + GAS_PER_DIM * MAX_DIM
-        // = 2000 + 50*1024 = 53200. Pass 100_000.
+                                                          // input is too short for the actual decode; the gas pre-charge
+                                                          // path will compute total_gas = GAS_BASE + GAS_PER_DIM * MAX_DIM
+                                                          // = 2000 + 50*1024 = 53200. Pass 100_000.
         let result = execute(&bytes, 100_000);
         // Decode fails (length mismatch); execute surfaces it as anyhow.
         assert!(result.is_err());
@@ -1265,7 +1258,9 @@ mod tests {
         // than the 100k iterations we run.
         let mut state: u64 = 0xBE_1A_AF_DE_AD_BE_EF_42;
         let next = |s: &mut u64| -> u64 {
-            *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *s
         };
 

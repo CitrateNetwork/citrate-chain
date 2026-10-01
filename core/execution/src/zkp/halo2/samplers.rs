@@ -164,7 +164,9 @@ pub fn drg_parents(
     while parents.len() < degree {
         let r = draw_u64(TAG_DRG, seed, v_u64, counter);
         // v >= 1 here (v == 0 returned above), so this is always Some.
-        let candidate = (r as usize).checked_rem(v).ok_or(SamplerError::EmptyGraph)?;
+        let candidate = (r as usize)
+            .checked_rem(v)
+            .ok_or(SamplerError::EmptyGraph)?;
         if !parents.contains(&candidate) {
             parents.push(candidate);
         }
@@ -228,7 +230,9 @@ pub fn expander_parents(
     while parents.len() < degree {
         let r = draw_u64(TAG_EXP, seed, v_u64, counter);
         // n >= 1 here (checked above), so this is always Some.
-        let candidate = (r as usize).checked_rem(n).ok_or(SamplerError::EmptyGraph)?;
+        let candidate = (r as usize)
+            .checked_rem(n)
+            .ok_or(SamplerError::EmptyGraph)?;
         if !parents.contains(&candidate) {
             parents.push(candidate);
         }

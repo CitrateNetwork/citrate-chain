@@ -196,7 +196,10 @@ mod tests {
         let mut model = vec![0xA0];
         model.extend_from_slice(&[0u8; 32]); // 33 bytes
         assert!(with(model.clone()).writes.contains(&registry));
-        assert!(!with(model[..32].to_vec()).writes.contains(&registry), "32 bytes is not enough");
+        assert!(
+            !with(model[..32].to_vec()).writes.contains(&registry),
+            "32 bytes is not enough"
+        );
         let mut other = model;
         other[0] = 0xA1;
         assert!(!with(other).writes.contains(&registry));

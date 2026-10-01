@@ -51,28 +51,34 @@ use crate::types::Address;
 /// Precompile addresses for AI deterministic compute operations.
 pub mod addresses {
     /// 0x010A — TENSOR_MATMUL_Q16
-    pub const TENSOR_MATMUL_Q16: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x0A];
+    pub const TENSOR_MATMUL_Q16: [u8; 20] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x0A,
+    ];
 
     /// 0x010B — TENSOR_DOT_Q16
-    pub const TENSOR_DOT_Q16: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x0B];
+    pub const TENSOR_DOT_Q16: [u8; 20] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x0B,
+    ];
 
     /// 0x010C — TENSOR_SOFTMAX_Q16
-    pub const TENSOR_SOFTMAX_Q16: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x0C];
+    pub const TENSOR_SOFTMAX_Q16: [u8; 20] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x0C,
+    ];
 
     /// 0x010D — TENSOR_RELU_Q16
-    pub const TENSOR_RELU_Q16: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x0D];
+    pub const TENSOR_RELU_Q16: [u8; 20] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x0D,
+    ];
 
     /// 0x010E — TENSOR_LINEAR_Q16
-    pub const TENSOR_LINEAR_Q16: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x0E];
+    pub const TENSOR_LINEAR_Q16: [u8; 20] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x0E,
+    ];
 
     /// 0x010F — TENSOR_TRANSPOSE_Q16
-    pub const TENSOR_TRANSPOSE_Q16: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x0F];
+    pub const TENSOR_TRANSPOSE_Q16: [u8; 20] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x0F,
+    ];
 }
 
 /// Gas costs.
@@ -235,8 +241,7 @@ pub fn matmul(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
     // Decode A.
     let (a_view, a_consumed) = decode_one(input).map_err(map_format_error)?;
     // Decode B (starts at offset a_consumed).
-    let (b_view, _b_consumed) =
-        decode_one(rest(input, a_consumed)).map_err(map_format_error)?;
+    let (b_view, _b_consumed) = decode_one(rest(input, a_consumed)).map_err(map_format_error)?;
 
     // Shape validation BEFORE any heap allocation for output data.
     if a_view.shape.len() != 2 {
@@ -286,13 +291,7 @@ pub fn matmul(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
     let b = parse_q16_tensor(&b_view)?;
 
     // Compute.
-    let out = q16_ops::matmul(
-        &a,
-        &b,
-        rows_a as usize,
-        cols_a as usize,
-        cols_b as usize,
-    );
+    let out = q16_ops::matmul(&a, &b, rows_a as usize, cols_a as usize, cols_b as usize);
 
     // Encode.
     let bytes = encode_q16_tensor(&[rows_a, cols_b], &out)?;
@@ -313,8 +312,7 @@ pub fn matmul(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
 /// **Gas:** `2000 + 4 × len`.
 pub fn dot(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
     let (a_view, a_consumed) = decode_one(input).map_err(map_format_error)?;
-    let (b_view, _b_consumed) =
-        decode_one(rest(input, a_consumed)).map_err(map_format_error)?;
+    let (b_view, _b_consumed) = decode_one(rest(input, a_consumed)).map_err(map_format_error)?;
 
     if a_view.shape.len() != 1 || b_view.shape.len() != 1 {
         return Err(anyhow!(
@@ -337,8 +335,11 @@ pub fn dot(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
         ));
     }
 
-    let gas_used =
-        gas_cost(gas_costs::DOT_BASE, gas_costs::DOT_PER_ELEMENT, len_a as u64);
+    let gas_used = gas_cost(
+        gas_costs::DOT_BASE,
+        gas_costs::DOT_PER_ELEMENT,
+        len_a as u64,
+    );
     check_gas(gas_used, gas_limit, "TENSOR_DOT_Q16")?;
 
     let a = parse_q16_tensor(&a_view)?;
@@ -376,8 +377,11 @@ pub fn softmax(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
         ));
     }
 
-    let gas_used =
-        gas_cost(gas_costs::SOFTMAX_BASE, gas_costs::SOFTMAX_PER_ELEMENT, len as u64);
+    let gas_used = gas_cost(
+        gas_costs::SOFTMAX_BASE,
+        gas_costs::SOFTMAX_PER_ELEMENT,
+        len as u64,
+    );
     check_gas(gas_used, gas_limit, "TENSOR_SOFTMAX_Q16")?;
 
     let v = parse_q16_tensor(&view)?;
@@ -414,8 +418,11 @@ pub fn relu(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
         ));
     }
 
-    let gas_used =
-        gas_cost(gas_costs::RELU_BASE, gas_costs::RELU_PER_ELEMENT, len as u64);
+    let gas_used = gas_cost(
+        gas_costs::RELU_BASE,
+        gas_costs::RELU_PER_ELEMENT,
+        len as u64,
+    );
     check_gas(gas_used, gas_limit, "TENSOR_RELU_Q16")?;
 
     let v = parse_q16_tensor(&view)?;
@@ -444,8 +451,7 @@ pub fn linear(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
     // Decode W.
     let (w_view, w_consumed) = decode_one(input).map_err(map_format_error)?;
     // Decode x.
-    let (x_view, x_consumed) =
-        decode_one(rest(input, w_consumed)).map_err(map_format_error)?;
+    let (x_view, x_consumed) = decode_one(rest(input, w_consumed)).map_err(map_format_error)?;
     // Decode b.
     let (b_view, _b_consumed) =
         decode_one(rest(input, w_consumed.saturating_add(x_consumed))).map_err(map_format_error)?;
@@ -535,8 +541,11 @@ pub fn transpose(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
         ));
     }
 
-    let gas_used =
-        gas_cost(gas_costs::TRANSPOSE_BASE, gas_costs::TRANSPOSE_PER_ELEMENT, total);
+    let gas_used = gas_cost(
+        gas_costs::TRANSPOSE_BASE,
+        gas_costs::TRANSPOSE_PER_ELEMENT,
+        total,
+    );
     check_gas(gas_used, gas_limit, "TENSOR_TRANSPOSE_Q16")?;
 
     let v = parse_q16_tensor(&view)?;
@@ -599,8 +608,15 @@ mod tests {
         input.extend_from_slice(&a);
         let r = matmul(&input, 1_000_000).unwrap();
         let out = decode_to_q16_vec(&r.output);
-        assert_eq!(out, vec![Q16::from_int(1), Q16::from_int(2),
-                             Q16::from_int(3), Q16::from_int(4)]);
+        assert_eq!(
+            out,
+            vec![
+                Q16::from_int(1),
+                Q16::from_int(2),
+                Q16::from_int(3),
+                Q16::from_int(4)
+            ]
+        );
     }
 
     #[test]
@@ -703,7 +719,10 @@ mod tests {
         // [-2, -1, 0, 1, 2] → [0, 0, 0, 1, 2]
         let v = q16_tensor_from_ints(&[5], &[-2, -1, 0, 1, 2]);
         let r = relu(&v, 100_000).unwrap();
-        let out: Vec<i32> = decode_to_q16_vec(&r.output).iter().map(|q| q16_to_int(*q)).collect();
+        let out: Vec<i32> = decode_to_q16_vec(&r.output)
+            .iter()
+            .map(|q| q16_to_int(*q))
+            .collect();
         assert_eq!(out, vec![0, 0, 0, 1, 2]);
     }
 
@@ -719,8 +738,10 @@ mod tests {
         // first — the cap is structurally enforced by the format.
         let v = q16_tensor_from_ints(&[4], &[-2, 0, 1, 2]);
         let r = relu(&v, 100_000_000).unwrap();
-        let out: Vec<i32> =
-            decode_to_q16_vec(&r.output).iter().map(|q| q16_to_int(*q)).collect();
+        let out: Vec<i32> = decode_to_q16_vec(&r.output)
+            .iter()
+            .map(|q| q16_to_int(*q))
+            .collect();
         assert_eq!(out, vec![0, 0, 1, 2]);
     }
 
@@ -736,7 +757,10 @@ mod tests {
         input.extend_from_slice(&x);
         input.extend_from_slice(&b);
         let r = linear(&input, 1_000_000).unwrap();
-        let out: Vec<i32> = decode_to_q16_vec(&r.output).iter().map(|q| q16_to_int(*q)).collect();
+        let out: Vec<i32> = decode_to_q16_vec(&r.output)
+            .iter()
+            .map(|q| q16_to_int(*q))
+            .collect();
         assert_eq!(out, vec![13, 24]);
     }
 
@@ -760,7 +784,10 @@ mod tests {
         // [[1,2,3],[4,5,6]] → [[1,4],[2,5],[3,6]]
         let m = q16_tensor_from_ints(&[2, 3], &[1, 2, 3, 4, 5, 6]);
         let r = transpose(&m, 100_000).unwrap();
-        let out: Vec<i32> = decode_to_q16_vec(&r.output).iter().map(|q| q16_to_int(*q)).collect();
+        let out: Vec<i32> = decode_to_q16_vec(&r.output)
+            .iter()
+            .map(|q| q16_to_int(*q))
+            .collect();
         assert_eq!(out, vec![1, 4, 2, 5, 3, 6]);
         // Also verify the output's shape header:
         let view = tensor_format::decode_exact(&r.output).unwrap();
@@ -802,7 +829,10 @@ mod tests {
         let mut input = q16_tensor_from_ints(&[3], &[1, 2, 3]);
         input.extend_from_slice(&q16_tensor_from_ints(&[3], &[4, 5, 6]));
         let r = dot(&input, 1_000_000).unwrap();
-        assert_eq!(r.gas_used, gas_costs::DOT_BASE + 3 * gas_costs::DOT_PER_ELEMENT);
+        assert_eq!(
+            r.gas_used,
+            gas_costs::DOT_BASE + 3 * gas_costs::DOT_PER_ELEMENT
+        );
         assert_eq!(gas_cost(10, 3, 4), 22);
     }
 }

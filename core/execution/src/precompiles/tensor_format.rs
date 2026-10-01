@@ -205,7 +205,9 @@ pub enum TensorFormatError {
     #[error("trailing bytes: input had {extra} bytes beyond the encoded tensor")]
     TrailingBytes { extra: usize },
 
-    #[error("data length {got} does not match expected {expected} (element_count × dtype.byte_size)")]
+    #[error(
+        "data length {got} does not match expected {expected} (element_count × dtype.byte_size)"
+    )]
     DataLengthMismatch { expected: usize, got: usize },
 }
 
@@ -214,7 +216,10 @@ pub enum TensorFormatError {
 /// concatenated tensors — e.g. matmul takes two).
 pub fn decode_one<'a>(input: &'a [u8]) -> Result<(TensorView<'a>, usize), TensorFormatError> {
     let Some((&rank_byte, after_rank)) = input.split_first() else {
-        return Err(TensorFormatError::Truncated { expected: 1, got: 0 });
+        return Err(TensorFormatError::Truncated {
+            expected: 1,
+            got: 0,
+        });
     };
     let rank = rank_byte as usize;
     if rank > MAX_RANK {
@@ -237,14 +242,15 @@ pub fn decode_one<'a>(input: &'a [u8]) -> Result<(TensorView<'a>, usize), Tensor
     let mut shape = Vec::with_capacity(rank);
     let mut element_count: usize = 1;
     for (axis, dim_bytes) in shape_bytes.chunks_exact(4).enumerate() {
-        let dim = u32::from_be_bytes(
-            dim_bytes
-                .try_into()
-                .map_err(|_| TensorFormatError::Truncated {
-                    expected: header_len,
-                    got: input.len(),
-                })?,
-        );
+        let dim =
+            u32::from_be_bytes(
+                dim_bytes
+                    .try_into()
+                    .map_err(|_| TensorFormatError::Truncated {
+                        expected: header_len,
+                        got: input.len(),
+                    })?,
+            );
         if dim == 0 {
             return Err(TensorFormatError::ZeroDimension { axis });
         }
@@ -542,7 +548,13 @@ mod tests {
         // shape=[2,3] = 6 elements; q16 expects 48 bytes but we pass 8.
         let bad = vec![0u8; 8];
         let err = encode(&[2, 3], Dtype::Q16_16, &bad).unwrap_err();
-        assert!(matches!(err, TensorFormatError::DataLengthMismatch { expected: 48, got: 8 }));
+        assert!(matches!(
+            err,
+            TensorFormatError::DataLengthMismatch {
+                expected: 48,
+                got: 8
+            }
+        ));
     }
 
     // ----- Property-based: roundtrip ALWAYS holds. -----

@@ -42,8 +42,9 @@ use super::PrecompileResult;
 /// Canonical WP-B0 address layout: byte 18 = 0x01 (Citrate family),
 /// byte 19 = 0x20 (crypto sub-page selector). Reachable from Solidity as
 /// `address(0x0120)`.
-pub const ED25519_VERIFY: [u8; 20] =
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x20];
+pub const ED25519_VERIFY: [u8; 20] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x20,
+];
 
 /// Flat gas cost for an Ed25519 verification.
 ///
@@ -130,7 +131,6 @@ fn verify(input: &[u8]) -> bool {
     if message.len() > MAX_MESSAGE_LEN {
         return false;
     }
-
 
     // Parse the verifying key; reject non-decompressable encodings.
     let verifying_key = match VerifyingKey::from_bytes(pubkey_bytes) {

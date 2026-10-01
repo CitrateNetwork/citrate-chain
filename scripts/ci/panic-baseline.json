@@ -1,26 +1,5 @@
 {
- "crates": {
-  "cli": {
-   "arithmetic_side_effects": 35,
-   "indexing_slicing": 109,
-   "string_slice": 9
-  },
-  "core/execution": {
-   "arithmetic_side_effects": 171,
-   "indexing_slicing": 196,
-   "panic": 3
-  },
-  "core/learning": {
-   "arithmetic_side_effects": 31,
-   "indexing_slicing": 111,
-   "panic": 8
-  },
-  "core/learning-daemon": {
-   "arithmetic_side_effects": 9,
-   "expect_used": 33,
-   "indexing_slicing": 2
-  }
- },
+ "crates": {},
  "lints": [
   "unwrap_used",
   "expect_used",
@@ -30,5 +9,5 @@
   "arithmetic_side_effects",
   "string_slice"
  ],
- "total": 717
+ "total": 0
 }

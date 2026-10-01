@@ -77,7 +77,6 @@
         clippy::string_slice
     )
 )]
-
 #![allow(dead_code)] // some helpers exposed for the RM-FL-3 daemon path
 
 use super::ops as q16_ops;
@@ -203,10 +202,15 @@ impl std::fmt::Display for RoutingError {
         match self {
             RoutingError::InputTooShort => write!(f, "input shorter than 16-byte header"),
             RoutingError::InputTooLarge => write!(f, "input exceeds {MAX_INPUT_BYTES} bytes"),
-            RoutingError::ArchVersionUnregistered => write!(f, "arch_version unregistered (current: {ARCH_VERSION})"),
+            RoutingError::ArchVersionUnregistered => {
+                write!(f, "arch_version unregistered (current: {ARCH_VERSION})")
+            }
             RoutingError::ShapeMismatch => write!(f, "shape mismatch for declared arch_version"),
             RoutingError::DimZero => write!(f, "input/hidden/output dim must be > 0"),
-            RoutingError::LengthMismatch => write!(f, "input length does not match declared (arch_version, shape)"),
+            RoutingError::LengthMismatch => write!(
+                f,
+                "input length does not match declared (arch_version, shape)"
+            ),
         }
     }
 }
@@ -246,7 +250,11 @@ pub fn decode(input: &[u8]) -> Result<RoutingInput, RoutingError> {
         return Err(RoutingError::ArchVersionUnregistered);
     }
 
-    let shape = RoutingShape { input_dim, hidden_dim, output_dim };
+    let shape = RoutingShape {
+        input_dim,
+        hidden_dim,
+        output_dim,
+    };
 
     // Shape check for the declared version. The registered version
     // requires the canonical shape; future versions plug in here.
@@ -267,12 +275,18 @@ pub fn decode(input: &[u8]) -> Result<RoutingInput, RoutingError> {
     let w2_count = h.checked_mul(h).ok_or_else(lm)?;
     let w3_count = o.checked_mul(h).ok_or_else(lm)?;
     let body_q16_count = i
-        .checked_add(w1_count).ok_or_else(lm)?
-        .checked_add(h).ok_or_else(lm)?           // b1
-        .checked_add(w2_count).ok_or_else(lm)?
-        .checked_add(h).ok_or_else(lm)?           // b2
-        .checked_add(w3_count).ok_or_else(lm)?
-        .checked_add(o).ok_or_else(lm)?;          // b3
+        .checked_add(w1_count)
+        .ok_or_else(lm)?
+        .checked_add(h)
+        .ok_or_else(lm)? // b1
+        .checked_add(w2_count)
+        .ok_or_else(lm)?
+        .checked_add(h)
+        .ok_or_else(lm)? // b2
+        .checked_add(w3_count)
+        .ok_or_else(lm)?
+        .checked_add(o)
+        .ok_or_else(lm)?; // b3
 
     let body_bytes = body_q16_count
         .checked_mul(8)
@@ -325,8 +339,12 @@ fn header_words(input: &[u8]) -> Option<[u32; 4]> {
 /// Decode the next `count` big-endian Q16 values at `*cursor` and advance it.
 fn take_q16(input: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<Q16>, RoutingError> {
     let len = count.checked_mul(8).ok_or(RoutingError::LengthMismatch)?;
-    let end = cursor.checked_add(len).ok_or(RoutingError::LengthMismatch)?;
-    let bytes = input.get(*cursor..end).ok_or(RoutingError::LengthMismatch)?;
+    let end = cursor
+        .checked_add(len)
+        .ok_or(RoutingError::LengthMismatch)?;
+    let bytes = input
+        .get(*cursor..end)
+        .ok_or(RoutingError::LengthMismatch)?;
     *cursor = end;
     Ok(bytes
         .chunks_exact(8)
@@ -351,10 +369,7 @@ pub fn validate(input: &RoutingInput) -> Result<(), RoutingError> {
     if input.arch_version != ARCH_VERSION {
         return Err(RoutingError::ArchVersionUnregistered);
     }
-    if input.shape.input_dim == 0
-        || input.shape.hidden_dim == 0
-        || input.shape.output_dim == 0
-    {
+    if input.shape.input_dim == 0 || input.shape.hidden_dim == 0 || input.shape.output_dim == 0 {
         return Err(RoutingError::DimZero);
     }
     if input.arch_version == ARCH_VERSION && input.shape != RoutingShape::V1 {
@@ -491,7 +506,10 @@ fn argmax(values: &[Q16]) -> (usize, Q16) {
 /// caller can't trick saturating-mul into asking for u64::MAX gas
 /// because the body length check rejects oversize inputs at the
 /// MAX_INPUT_BYTES boundary first.
-pub fn execute(input: &[u8], gas_limit: u64) -> Result<crate::precompiles::PrecompileResult, anyhow::Error> {
+pub fn execute(
+    input: &[u8],
+    gas_limit: u64,
+) -> Result<crate::precompiles::PrecompileResult, anyhow::Error> {
     use crate::precompiles::PrecompileResult;
 
     if gas_limit < GAS_BASE {
@@ -558,13 +576,13 @@ mod tests {
                 bytes.extend_from_slice(&v.to_be_bytes());
             }
         };
-        push(&mut bytes, i, value);                 // input
-        push(&mut bytes, h * i, value);             // W1
-        push(&mut bytes, h, value);                 // b1
-        push(&mut bytes, h * h, value);             // W2
-        push(&mut bytes, h, value);                 // b2
-        push(&mut bytes, o * h, value);             // W3
-        push(&mut bytes, o, value);                 // b3
+        push(&mut bytes, i, value); // input
+        push(&mut bytes, h * i, value); // W1
+        push(&mut bytes, h, value); // b1
+        push(&mut bytes, h * h, value); // W2
+        push(&mut bytes, h, value); // b2
+        push(&mut bytes, o * h, value); // W3
+        push(&mut bytes, o, value); // b3
 
         bytes
     }
@@ -611,8 +629,16 @@ mod tests {
     fn shape_params_canonical_in_planset_window() {
         // Planset RM-FL-2 window: 100K–500K params.
         let p = RoutingShape::V1.params();
-        assert!(p >= 100_000, "params {} below planset window lower bound", p);
-        assert!(p <= 500_000, "params {} above planset window upper bound", p);
+        assert!(
+            p >= 100_000,
+            "params {} below planset window lower bound",
+            p
+        );
+        assert!(
+            p <= 500_000,
+            "params {} above planset window upper bound",
+            p
+        );
         // Exact: 128*768 + 128 + 128*128 + 128 + 3*128 + 3 = 115,331
         assert_eq!(p, 115_331);
     }
@@ -848,7 +874,11 @@ mod tests {
         let confidence = Q16::from_raw(i64::from_be_bytes(
             bytes[8..16].try_into().expect("8 bytes"),
         ));
-        RoutingOutput { mentor_id, adapter_id, confidence }
+        RoutingOutput {
+            mentor_id,
+            adapter_id,
+            confidence,
+        }
     }
 
     /// Build a canonical-shape input directly via `forward_decoded`
@@ -885,12 +915,14 @@ mod tests {
         assert!(
             out.mentor_id < input.shape.output_dim,
             "mentor_id {} must be < output_dim {}",
-            out.mentor_id, input.shape.output_dim
+            out.mentor_id,
+            input.shape.output_dim
         );
         assert!(
             out.adapter_id < input.shape.output_dim,
             "adapter_id {} must be < output_dim {}",
-            out.adapter_id, input.shape.output_dim
+            out.adapter_id,
+            input.shape.output_dim
         );
         // confidence is a Q16 value in roughly [0, ONE]; with uniform
         // softmax over 3 classes it should be ≈ Q16(0x5555) ≈ 0.333.
@@ -919,7 +951,9 @@ mod tests {
         let max = Q16::MAX;
         let min = Q16::MIN;
         let alternating = |n: usize| {
-            (0..n).map(|k| if k % 2 == 0 { max } else { min }).collect::<Vec<_>>()
+            (0..n)
+                .map(|k| if k % 2 == 0 { max } else { min })
+                .collect::<Vec<_>>()
         };
         let input = RoutingInput {
             arch_version: ARCH_VERSION,
@@ -959,10 +993,7 @@ mod tests {
         bytes[8..12].copy_from_slice(&128u32.to_be_bytes());
         bytes[12..16].copy_from_slice(&3u32.to_be_bytes());
         let result = execute(&bytes, 100_000);
-        assert!(
-            result.is_err(),
-            "execute must reject gas_limit below total"
-        );
+        assert!(result.is_err(), "execute must reject gas_limit below total");
     }
 
     #[test]
@@ -984,11 +1015,14 @@ mod tests {
         bytes[4..8].copy_from_slice(&u32::MAX.to_be_bytes()); // huge input_dim
         bytes[8..12].copy_from_slice(&u32::MAX.to_be_bytes()); // huge hidden_dim
         bytes[12..16].copy_from_slice(&u32::MAX.to_be_bytes()); // huge output_dim
-        // Even with u64::MAX gas_limit, the decode still has to fail
-        // (input.len() < expected_total). The gas pre-charge clamps to
-        // u64::MAX via saturating_mul; the decode then rejects.
+                                                                // Even with u64::MAX gas_limit, the decode still has to fail
+                                                                // (input.len() < expected_total). The gas pre-charge clamps to
+                                                                // u64::MAX via saturating_mul; the decode then rejects.
         let result = execute(&bytes, u64::MAX);
-        assert!(result.is_err(), "malformed-header overflow must error cleanly");
+        assert!(
+            result.is_err(),
+            "malformed-header overflow must error cleanly"
+        );
     }
 
     // ====================================================================
@@ -1034,7 +1068,10 @@ mod tests {
             b3,
         };
         let out = forward_decoded(&input);
-        assert_eq!(out.mentor_id, 1, "argmax should select the slot with the largest logit");
+        assert_eq!(
+            out.mentor_id, 1,
+            "argmax should select the slot with the largest logit"
+        );
         assert_eq!(out.adapter_id, 1, "v1: adapter_id == mentor_id");
     }
 
@@ -1072,7 +1109,9 @@ mod tests {
         // hex-clean approximation: 0xR0_07_1N_6 → 0x_07_F0_07_17).
         let mut state: u64 = 0x_07_F0_07_17_DE_AD_BE_EF_u64;
         let next = |s: &mut u64| -> u64 {
-            *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *s
         };
 
@@ -1149,7 +1188,11 @@ mod tests {
     #[test]
     fn panic_s1_validate_checks_every_layer_length() {
         let s = RoutingShape::V1;
-        let (i, h, o) = (s.input_dim as usize, s.hidden_dim as usize, s.output_dim as usize);
+        let (i, h, o) = (
+            s.input_dim as usize,
+            s.hidden_dim as usize,
+            s.output_dim as usize,
+        );
         let good = RoutingInput {
             arch_version: ARCH_VERSION,
             shape: s,

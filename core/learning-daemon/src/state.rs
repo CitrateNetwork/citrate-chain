@@ -130,9 +130,9 @@ impl DaemonState {
         }
 
         // Cycle status.
-        let cf_cycle = db.cf_handle(CF_CYCLE_STATUS).ok_or_else(|| {
-            DaemonError::Persistence("missing cycle_status cf".into())
-        })?;
+        let cf_cycle = db
+            .cf_handle(CF_CYCLE_STATUS)
+            .ok_or_else(|| DaemonError::Persistence("missing cycle_status cf".into()))?;
         let iter = db.iterator_cf(&cf_cycle, rocksdb::IteratorMode::Start);
         for kv in iter {
             let (k, v) = kv?;
@@ -150,9 +150,9 @@ impl DaemonState {
         }
 
         // Finalize status.
-        let cf_final = db.cf_handle(CF_FINALIZE_STATUS).ok_or_else(|| {
-            DaemonError::Persistence("missing finalize_status cf".into())
-        })?;
+        let cf_final = db
+            .cf_handle(CF_FINALIZE_STATUS)
+            .ok_or_else(|| DaemonError::Persistence("missing finalize_status cf".into()))?;
         let iter = db.iterator_cf(&cf_final, rocksdb::IteratorMode::Start);
         for kv in iter {
             let (k, v) = kv?;
@@ -174,7 +174,10 @@ impl DaemonState {
 
     /// Read the current high water mark.
     pub fn last_processed_block(&self) -> BlockNumber {
-        let cache = self.cache.lock().expect("lock");
+        let cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.last_processed_block
     }
 
@@ -183,16 +186,20 @@ impl DaemonState {
     /// value below the current HWM
     /// (`LearningDaemon.tla::BlockHWMMonotonic`).
     pub fn set_last_processed_block(&self, n: BlockNumber) -> DaemonResult<()> {
-        let mut cache = self.cache.lock().expect("lock");
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if n < cache.last_processed_block {
             return Err(DaemonError::Invariant(format!(
                 "BlockHWMMonotonic violation: tried {} < current {}",
                 n, cache.last_processed_block
             )));
         }
-        let cf_meta = self.db.cf_handle(CF_META).ok_or_else(|| {
-            DaemonError::Persistence("missing meta cf".into())
-        })?;
+        let cf_meta = self
+            .db
+            .cf_handle(CF_META)
+            .ok_or_else(|| DaemonError::Persistence("missing meta cf".into()))?;
         let mut batch = WriteBatch::default();
         batch.put_cf(&cf_meta, META_LAST_BLOCK, n.to_be_bytes());
         self.db.write(batch)?;
@@ -208,10 +215,14 @@ impl DaemonState {
     ///
     /// Bypasses the forward-only check in `set_last_processed_block`.
     pub fn rollback_last_processed_block(&self, n: BlockNumber) -> DaemonResult<()> {
-        let mut cache = self.cache.lock().expect("lock");
-        let cf_meta = self.db.cf_handle(CF_META).ok_or_else(|| {
-            DaemonError::Persistence("missing meta cf".into())
-        })?;
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cf_meta = self
+            .db
+            .cf_handle(CF_META)
+            .ok_or_else(|| DaemonError::Persistence("missing meta cf".into()))?;
         let mut batch = WriteBatch::default();
         batch.put_cf(&cf_meta, META_LAST_BLOCK, n.to_be_bytes());
         self.db.write(batch)?;
@@ -223,7 +234,10 @@ impl DaemonState {
     /// has never been recorded (the absence of a record means we
     /// haven't aggregated yet).
     pub fn cycle_status(&self, cycle_id: CycleId) -> CycleStatus {
-        let cache = self.cache.lock().expect("lock");
+        let cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         cache
             .cycle_status
             .get(&cycle_id)
@@ -234,12 +248,11 @@ impl DaemonState {
     /// Set the status for a cycle. Per `AggregationIdempotent` +
     /// `NoCommitWithoutAggregate`: pending → computed → committed.
     /// Backwards transitions return `Err(DaemonError::Invariant)`.
-    pub fn set_cycle_status(
-        &self,
-        cycle_id: CycleId,
-        new_status: CycleStatus,
-    ) -> DaemonResult<()> {
-        let mut cache = self.cache.lock().expect("lock");
+    pub fn set_cycle_status(&self, cycle_id: CycleId, new_status: CycleStatus) -> DaemonResult<()> {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let current = cache
             .cycle_status
             .get(&cycle_id)
@@ -250,9 +263,10 @@ impl DaemonState {
                 "invalid cycle_status transition for cycle {cycle_id}: {current:?} -> {new_status:?}"
             )));
         }
-        let cf_cycle = self.db.cf_handle(CF_CYCLE_STATUS).ok_or_else(|| {
-            DaemonError::Persistence("missing cycle_status cf".into())
-        })?;
+        let cf_cycle = self
+            .db
+            .cf_handle(CF_CYCLE_STATUS)
+            .ok_or_else(|| DaemonError::Persistence("missing cycle_status cf".into()))?;
         let value = bincode::serialize(&new_status)?;
         let mut batch = WriteBatch::default();
         batch.put_cf(&cf_cycle, cycle_id.to_be_bytes(), value);
@@ -263,7 +277,10 @@ impl DaemonState {
 
     /// Read the finalize status of a cycle. Defaults to `NotCalled`.
     pub fn finalize_status(&self, cycle_id: CycleId) -> FinalizeStatus {
-        let cache = self.cache.lock().expect("lock");
+        let cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         cache
             .finalize_status
             .get(&cycle_id)
@@ -275,7 +292,10 @@ impl DaemonState {
     /// transition NotCalled → Called only. Re-firing returns
     /// `Err(DaemonError::Invariant)`.
     pub fn mark_finalized(&self, cycle_id: CycleId) -> DaemonResult<()> {
-        let mut cache = self.cache.lock().expect("lock");
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let current = cache
             .finalize_status
             .get(&cycle_id)
@@ -286,14 +306,17 @@ impl DaemonState {
                 "FinalizeAtMostOnce violation for cycle {cycle_id}"
             )));
         }
-        let cf_final = self.db.cf_handle(CF_FINALIZE_STATUS).ok_or_else(|| {
-            DaemonError::Persistence("missing finalize_status cf".into())
-        })?;
+        let cf_final = self
+            .db
+            .cf_handle(CF_FINALIZE_STATUS)
+            .ok_or_else(|| DaemonError::Persistence("missing finalize_status cf".into()))?;
         let value = bincode::serialize(&FinalizeStatus::Called)?;
         let mut batch = WriteBatch::default();
         batch.put_cf(&cf_final, cycle_id.to_be_bytes(), value);
         self.db.write(batch)?;
-        cache.finalize_status.insert(cycle_id, FinalizeStatus::Called);
+        cache
+            .finalize_status
+            .insert(cycle_id, FinalizeStatus::Called);
         Ok(())
     }
 }
@@ -336,7 +359,9 @@ mod tests {
         assert_eq!(state.last_processed_block(), 5);
         state.set_last_processed_block(10).expect("ok");
         assert_eq!(state.last_processed_block(), 10);
-        let err = state.set_last_processed_block(7).expect_err("backward rejects");
+        let err = state
+            .set_last_processed_block(7)
+            .expect_err("backward rejects");
         assert!(format!("{err}").contains("BlockHWMMonotonic"));
     }
 
@@ -379,7 +404,9 @@ mod tests {
     #[test]
     fn cycle_status_no_backward_transition() {
         let (state, _dir) = fresh_state();
-        state.set_cycle_status(1, CycleStatus::Computed).expect("ok");
+        state
+            .set_cycle_status(1, CycleStatus::Computed)
+            .expect("ok");
         let err = state
             .set_cycle_status(1, CycleStatus::Pending)
             .expect_err("rejects backward");
@@ -401,11 +428,15 @@ mod tests {
         {
             let state = DaemonState::open(dir.path()).expect("open 1");
             state.set_last_processed_block(42).expect("ok");
-            state.set_cycle_status(1, CycleStatus::Computed).expect("ok");
-            state.set_cycle_status(1, CycleStatus::Committed).expect("ok");
+            state
+                .set_cycle_status(1, CycleStatus::Computed)
+                .expect("ok");
+            state
+                .set_cycle_status(1, CycleStatus::Committed)
+                .expect("ok");
             state.mark_finalized(1).expect("ok");
         } // First incarnation drops; RocksDB closes.
-        // Second incarnation — same path, fresh process.
+          // Second incarnation — same path, fresh process.
         let state = DaemonState::open(dir.path()).expect("open 2");
         assert_eq!(state.last_processed_block(), 42);
         assert_eq!(state.cycle_status(1), CycleStatus::Committed);
@@ -415,9 +446,13 @@ mod tests {
     #[test]
     fn cycle_status_idempotent_set() {
         let (state, _dir) = fresh_state();
-        state.set_cycle_status(1, CycleStatus::Computed).expect("ok");
+        state
+            .set_cycle_status(1, CycleStatus::Computed)
+            .expect("ok");
         // Setting the same status again is fine.
-        state.set_cycle_status(1, CycleStatus::Computed).expect("idempotent");
+        state
+            .set_cycle_status(1, CycleStatus::Computed)
+            .expect("idempotent");
     }
 
     #[test]

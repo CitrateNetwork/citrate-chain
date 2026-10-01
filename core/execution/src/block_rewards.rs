@@ -335,7 +335,12 @@ mod tests {
     use super::*;
     use citrate_consensus::types::{Hash, PublicKey, Signature};
 
-    fn mk_tx(eth_tx_type: u8, gas_price: u64, max_prio: Option<u64>, gas_limit: u64) -> Transaction {
+    fn mk_tx(
+        eth_tx_type: u8,
+        gas_price: u64,
+        max_prio: Option<u64>,
+        gas_limit: u64,
+    ) -> Transaction {
         Transaction {
             hash: Hash::default(),
             nonce: 0,
@@ -348,7 +353,11 @@ mod tests {
             signature: Signature::new([0u8; 64]),
             tx_type: None,
             eth_tx_type,
-            max_fee_per_gas: if eth_tx_type == 2 { Some(gas_price) } else { None },
+            max_fee_per_gas: if eth_tx_type == 2 {
+                Some(gas_price)
+            } else {
+                None
+            },
             max_priority_fee_per_gas: max_prio,
             access_list: None,
             chain_id: None,
@@ -441,7 +450,7 @@ mod tests {
     #[test]
     fn subsidy_vests_on_an_idle_chain() {
         let ten_salt = U256::from(10_000_000_000_000_000_000u128); // 10 SALT
-        // No fees whatsoever — the exact condition that paid zero before.
+                                                                   // No fees whatsoever — the exact condition that paid zero before.
         assert_eq!(vested_share(U256::zero(), 10_000), U256::zero());
         assert_eq!(total_vested(U256::zero(), 10_000, ten_salt), ten_salt);
         // And the zero short-circuit in `settle_block_rewards` is no longer taken.
@@ -487,7 +496,10 @@ mod tests {
         assert_eq!(decode_u256_word(&word).expect("decode"), ceil);
         // The narrow decoder saturates — proving why it must not be used here.
         assert_eq!(decode_u64_word(&word).expect("decode"), u64::MAX);
-        assert!(decode_u256_word(&word[..31]).is_err(), "short word must error");
+        assert!(
+            decode_u256_word(&word[..31]).is_err(),
+            "short word must error"
+        );
     }
 
     #[test]
@@ -554,7 +566,12 @@ mod proptests {
     use proptest::prelude::*;
 
     /// EIP-1559 tip oracle, written independently of the implementation.
-    fn expected_tip(eth_tx_type: u8, gas_price: u64, max_prio: Option<u64>, base_fee: u64) -> Option<u64> {
+    fn expected_tip(
+        eth_tx_type: u8,
+        gas_price: u64,
+        max_prio: Option<u64>,
+        base_fee: u64,
+    ) -> Option<u64> {
         if gas_price < base_fee {
             return None;
         }
@@ -819,7 +836,16 @@ mod proptests {
     /// — the same on every node, so producer and receiver never split a wei.
     #[test]
     fn vested_share_rounding_property() {
-        let pools: [u128; 8] = [0, 1, 7, 9_999, 10_000, 10_001, 123_456_789, u64::MAX as u128];
+        let pools: [u128; 8] = [
+            0,
+            1,
+            7,
+            9_999,
+            10_000,
+            10_001,
+            123_456_789,
+            u64::MAX as u128,
+        ];
         let bpss: [u64; 7] = [0, 1, 2500, 3333, 5000, 9999, 10000];
         for &p in &pools {
             for &bps in &bpss {
