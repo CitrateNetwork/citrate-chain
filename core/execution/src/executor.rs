@@ -3067,9 +3067,7 @@ impl Executor {
         from: Address,
         context: &mut ExecutionContext,
     ) -> Result<(), ExecutionError> {
-        if data.len() < 4 {
-            return Err(ExecutionError::InvalidInput);
-        }
+        // Shorter than a selector is invalid input.
         let selector = data.get(0..4).ok_or(ExecutionError::InvalidInput)?;
         let args = data.get(4..).ok_or(ExecutionError::InvalidInput)?;
 
@@ -3238,9 +3236,7 @@ impl Executor {
         from: Address,
         context: &mut ExecutionContext,
     ) -> Result<(), ExecutionError> {
-        if data.len() < 4 {
-            return Err(ExecutionError::InvalidInput);
-        }
+        // Shorter than a selector is invalid input.
         let selector = data.get(0..4).ok_or(ExecutionError::InvalidInput)?;
         let args = data.get(4..).ok_or(ExecutionError::InvalidInput)?;
 
@@ -5312,5 +5308,65 @@ mod tests {
         );
         assert_eq!(state_db.accounts.get_balance(&alice_addr), fund);
         assert_eq!(state_db.accounts.get_nonce(&alice_addr), u64::MAX);
+    }
+
+    #[test]
+    fn panic_s1_register_model_policy_2_is_restricted() {
+        let data = register_model_data(2, None, None);
+        match Executor::parse_register_model(&data).expect("valid") {
+            TransactionType::RegisterModel { access_policy, .. } => {
+                assert!(matches!(access_policy, AccessPolicy::Restricted(ref v) if v.is_empty()))
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// PANIC-S1 mutation: a sender holding EXACTLY gas + value can transact; one wei
+    /// less is rejected before dispatch.
+    #[tokio::test]
+    async fn panic_s1_exact_balance_boundary() {
+        let alice = PublicKey::new([1; 32]);
+        let bob = PublicKey::new([2; 32]);
+        let alice_addr = Address::from_public_key(&alice);
+        let tx = create_test_tx(alice, Some(bob), 1000, 0);
+        let need = gas_fee(tx.gas_limit, tx.gas_price) + U256::from(1000u64);
+
+        let state_db = Arc::new(StateDB::new());
+        let executor = Executor::new(state_db.clone());
+        state_db.accounts.set_balance(alice_addr, need);
+        let receipt = executor
+            .execute_transaction(&create_test_block(), &tx)
+            .await
+            .expect("exact balance suffices");
+        assert!(receipt.status);
+
+        let state_db = Arc::new(StateDB::new());
+        let executor = Executor::new(state_db.clone());
+        state_db.accounts.set_balance(alice_addr, need - U256::one());
+        let err = executor
+            .execute_transaction(&create_test_block(), &tx)
+            .await
+            .expect_err("one wei short");
+        assert!(matches!(err, ExecutionError::InsufficientBalance { .. }), "{err}");
+    }
+
+    #[test]
+    fn panic_s1_governance_and_model_precompiles_reject_short_selector() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let state_db = Arc::new(StateDB::new());
+        let executor = Executor::new(state_db);
+        let block = create_test_block();
+        let tx = create_test_tx(PublicKey::new([1; 32]), None, 0, 0);
+        let mut ctx = ExecutionContext::new(&block, &tx);
+        for short in [&[][..], &[1, 2, 3][..]] {
+            assert!(matches!(
+                rt.block_on(executor.execute_governance_precompile(short, Address([1; 20]), &mut ctx)),
+                Err(ExecutionError::InvalidInput)
+            ));
+            assert!(matches!(
+                rt.block_on(executor.execute_model_precompile(short, Address([1; 20]), &mut ctx)),
+                Err(ExecutionError::InvalidInput)
+            ));
+        }
     }
 }
