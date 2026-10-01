@@ -51,10 +51,8 @@ impl Address {
             use sha3::{Digest, Keccak256};
             let mut hasher = Keccak256::default();
             hasher.update(pubkey.0);
-            let hash = hasher.finalize();
-
-            let mut addr = [0u8; 20];
-            addr.copy_from_slice(&hash[12..32]);
+            let hash: [u8; 32] = hasher.finalize().into();
+            let [_, _, _, _, _, _, _, _, _, _, _, _, addr @ ..] = hash;
             Address(addr)
         }
     }
@@ -655,4 +653,6 @@ pub enum ExecutionError {
     /// node at or above the activation height.
     #[error("Invalid block body: {0}")]
     InvalidBlockBody(String),
+    #[error("Arithmetic overflow: {0}")]
+    Overflow(&'static str),
 }

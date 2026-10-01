@@ -18,6 +18,20 @@
 // input; malformed input returns the "false" word with `success: true`,
 // mirroring ECRECOVER / the x402 verifiers.
 
+// PANIC-S1 G2: precompile reachable from the REVM bridge; panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use anyhow::{anyhow, Result};
 use ed25519_dalek::{Signature, VerifyingKey};
 
@@ -54,9 +68,9 @@ const MIN_INPUT_LEN: usize = 96;
 
 /// 32-byte big-endian word: all zero except the low byte, which is 1.
 fn true_word() -> Vec<u8> {
-    let mut out = vec![0u8; 32];
+    let mut out = [0u8; 32];
     out[31] = 1;
-    out
+    out.to_vec()
 }
 
 /// 32-byte all-zero word (the "false" / invalid result).
@@ -105,23 +119,21 @@ fn verify(input: &[u8]) -> bool {
     if input.len() < MIN_INPUT_LEN {
         return false;
     }
-
-    let message = &input[96..];
+    // pubkey(32) ‖ sig(64) ‖ message.
+    let Some((pubkey_bytes, rest)) = input.split_first_chunk::<32>() else {
+        return false;
+    };
+    let Some((sig_bytes, message)) = rest.split_first_chunk::<64>() else {
+        return false;
+    };
     // Bound the O(len) hashing cost covered by the flat gas charge.
     if message.len() > MAX_MESSAGE_LEN {
         return false;
     }
 
-    // pubkey(32) — infallible slice, fixed length.
-    let mut pubkey_bytes = [0u8; 32];
-    pubkey_bytes.copy_from_slice(&input[0..32]);
-
-    // sig(64) — infallible slice, fixed length.
-    let mut sig_bytes = [0u8; 64];
-    sig_bytes.copy_from_slice(&input[32..96]);
 
     // Parse the verifying key; reject non-decompressable encodings.
-    let verifying_key = match VerifyingKey::from_bytes(&pubkey_bytes) {
+    let verifying_key = match VerifyingKey::from_bytes(pubkey_bytes) {
         Ok(k) => k,
         Err(_) => return false,
     };
@@ -136,7 +148,7 @@ fn verify(input: &[u8]) -> bool {
 
     // Signature parsing is infallible in ed25519-dalek 2.x (structural
     // validation of S/R happens inside verify_strict).
-    let signature = Signature::from_bytes(&sig_bytes);
+    let signature = Signature::from_bytes(sig_bytes);
 
     // Strict verification: rejects non-canonical S and small-order R;
     // gives the single-valued (SUF-CMA) acceptance predicate consensus

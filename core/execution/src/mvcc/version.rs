@@ -57,11 +57,11 @@ impl StateVersion {
     pub fn try_advance(&self, expected: ReadVersion) -> Result<ReadVersion, ReadVersion> {
         match self.inner.compare_exchange(
             expected.0,
-            expected.0 + 1,
+            expected.0.saturating_add(1),
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => Ok(ReadVersion(expected.0 + 1)),
+            Ok(_) => Ok(ReadVersion(expected.0.saturating_add(1))),
             Err(observed) => Err(ReadVersion(observed)),
         }
     }
@@ -72,7 +72,7 @@ impl StateVersion {
     /// Uses `fetch_add` so the operation is atomic even if some CAS races
     /// ran concurrently before we took the fallback lock.
     pub fn advance_unconditional(&self) -> ReadVersion {
-        ReadVersion(self.inner.fetch_add(1, Ordering::AcqRel) + 1)
+        ReadVersion(self.inner.fetch_add(1, Ordering::AcqRel).saturating_add(1))
     }
 }
 

@@ -62,8 +62,7 @@ impl AccessSetExtractor for DefaultAccessSetExtractor {
             // If it's a contract call, add storage keys based on data
             if !tx.data.is_empty() {
                 // Function selector is first 4 bytes
-                if tx.data.len() >= 4 {
-                    let selector = &tx.data[0..4];
+                if let Some(selector) = tx.data.get(0..4) {
                     let storage_key =
                         format!("storage:{}:{}", hex::encode(to.0), hex::encode(selector))
                             .into_bytes();
@@ -74,7 +73,7 @@ impl AccessSetExtractor for DefaultAccessSetExtractor {
         }
 
         // Model transactions access model registry
-        if tx.data.len() > 32 && tx.data[0] == 0xA0 {
+        if tx.data.len() > 32 && tx.data.first() == Some(&0xA0) {
             access_set.reads.insert(b"registry:models".to_vec());
             access_set.writes.insert(b"registry:models".to_vec());
         }
@@ -181,5 +180,25 @@ mod tests {
         let groups = scheduler.schedule(vec![tx1, tx2, tx3]);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 3);
+    }
+
+    /// PANIC-S1 G4: only a call with > 32 bytes of data starting 0xA0 touches the
+    /// model registry.
+    #[test]
+    fn panic_s1_model_registry_access_rule() {
+        let registry = b"registry:models".to_vec();
+        let ex = DefaultAccessSetExtractor;
+        let with = |data: Vec<u8>| {
+            let mut tx = make_test_tx([1; 32], Some([2; 32]), 0);
+            tx.data = data;
+            ex.extract(&tx)
+        };
+        let mut model = vec![0xA0];
+        model.extend_from_slice(&[0u8; 32]); // 33 bytes
+        assert!(with(model.clone()).writes.contains(&registry));
+        assert!(!with(model[..32].to_vec()).writes.contains(&registry), "32 bytes is not enough");
+        let mut other = model;
+        other[0] = 0xA1;
+        assert!(!with(other).writes.contains(&registry));
     }
 }

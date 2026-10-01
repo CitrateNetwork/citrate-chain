@@ -27,6 +27,20 @@
 // pin the exact bytes for a sweep of canonical inputs. Drift forks
 // the chain.
 
+// PANIC-S1 G2: precompile reachable from the REVM bridge; panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use anyhow::{anyhow, Result};
 
 use super::q16::{ops as q16_ops, Q16};
@@ -139,29 +153,29 @@ fn parse_q16_tensor(view: &TensorView<'_>) -> Result<Vec<Q16>> {
         ));
     }
     let n = view.element_count();
-    if view.data.len() != n * 8 {
+    // element_count <= MAX_ELEMENTS (decode-validated), so this cannot saturate.
+    let expected = n.saturating_mul(8);
+    if view.data.len() != expected {
         return Err(anyhow!(
             "tensor data length mismatch: expected {} bytes, got {}",
-            n * 8,
+            expected,
             view.data.len()
         ));
     }
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        // RM-M2 tensor wire format carries each Q16 element as 8 bytes
-        // (i64, little-endian) post-I64-S1 widening — a lossless decode
-        // of the i64-backed Q16 type.
-        let bytes: [u8; 8] = view.data[i * 8..i * 8 + 8]
-            .try_into()
-            .expect("8 bytes by construction (length validated above)");
-        out.push(Q16(i64::from_le_bytes(bytes)));
-    }
-    Ok(out)
+    // RM-M2 tensor wire format carries each Q16 element as 8 bytes
+    // (i64, little-endian) post-I64-S1 widening — a lossless decode
+    // of the i64-backed Q16 type. Length validated above: exactly n chunks.
+    Ok(view
+        .data
+        .chunks_exact(8)
+        .filter_map(|c| <[u8; 8]>::try_from(c).ok())
+        .map(|bytes| Q16(i64::from_le_bytes(bytes)))
+        .collect())
 }
 
 /// Encode a `Vec<Q16>` as a Q16.16 tensor with given shape.
 fn encode_q16_tensor(shape: &[u32], data: &[Q16]) -> Result<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(data.len() * 8);
+    let mut bytes = Vec::with_capacity(data.len().saturating_mul(8));
     for q in data {
         // Each Q16 element is written as 8 bytes (i64, little-endian)
         // post-I64-S1 widening — the full i64 backing value with no
@@ -169,6 +183,34 @@ fn encode_q16_tensor(shape: &[u32], data: &[Q16]) -> Result<Vec<u8>> {
         bytes.extend_from_slice(&q.0.to_le_bytes());
     }
     encode(shape, Dtype::Q16_16, &bytes).map_err(map_format_error)
+}
+
+/// `base + per_unit × units`. Every caller caps `units` first, so this never
+/// actually saturates; saturation only keeps it total.
+fn gas_cost(base: u64, per_unit: u64, units: u64) -> u64 {
+    per_unit.saturating_mul(units).saturating_add(base)
+}
+
+/// The input after the first `consumed` bytes (`consumed` comes from
+/// `decode_one`, so it is always within `input`).
+fn rest(input: &[u8], consumed: usize) -> &[u8] {
+    input.get(consumed..).unwrap_or_default()
+}
+
+/// Shape of a rank-1 tensor. Callers check the rank first.
+fn dim1(shape: &[u32]) -> Result<u32> {
+    match shape {
+        [n] => Ok(*n),
+        _ => Err(anyhow!("expected rank 1, got rank {}", shape.len())),
+    }
+}
+
+/// Shape of a rank-2 tensor. Callers check the rank first.
+fn dims2(shape: &[u32]) -> Result<(u32, u32)> {
+    match shape {
+        [r, c] => Ok((*r, *c)),
+        _ => Err(anyhow!("expected rank 2, got rank {}", shape.len())),
+    }
 }
 
 fn check_gas(needed: u64, have: u64, op: &'static str) -> Result<()> {
@@ -194,7 +236,7 @@ pub fn matmul(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
     let (a_view, a_consumed) = decode_one(input).map_err(map_format_error)?;
     // Decode B (starts at offset a_consumed).
     let (b_view, _b_consumed) =
-        decode_one(&input[a_consumed..]).map_err(map_format_error)?;
+        decode_one(rest(input, a_consumed)).map_err(map_format_error)?;
 
     // Shape validation BEFORE any heap allocation for output data.
     if a_view.shape.len() != 2 {
@@ -209,10 +251,8 @@ pub fn matmul(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
             b_view.shape.len()
         ));
     }
-    let rows_a = a_view.shape[0];
-    let cols_a = a_view.shape[1];
-    let rows_b = b_view.shape[0];
-    let cols_b = b_view.shape[1];
+    let (rows_a, cols_a) = dims2(&a_view.shape)?;
+    let (rows_b, cols_b) = dims2(&b_view.shape)?;
 
     if rows_a > caps::MATMUL_DIM_MAX
         || cols_a > caps::MATMUL_DIM_MAX
@@ -233,9 +273,12 @@ pub fn matmul(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
         ));
     }
 
-    let gas_used = gas_costs::MATMUL_BASE
-        + gas_costs::MATMUL_PER_MULADD
-            * (rows_a as u64) * (cols_a as u64) * (cols_b as u64);
+    // Dims are capped above, so none of this saturates.
+    let gas_used = gas_costs::MATMUL_PER_MULADD
+        .saturating_mul(rows_a as u64)
+        .saturating_mul(cols_a as u64)
+        .saturating_mul(cols_b as u64)
+        .saturating_add(gas_costs::MATMUL_BASE);
     check_gas(gas_used, gas_limit, "TENSOR_MATMUL_Q16")?;
 
     // Parse data.
@@ -271,7 +314,7 @@ pub fn matmul(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
 pub fn dot(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
     let (a_view, a_consumed) = decode_one(input).map_err(map_format_error)?;
     let (b_view, _b_consumed) =
-        decode_one(&input[a_consumed..]).map_err(map_format_error)?;
+        decode_one(rest(input, a_consumed)).map_err(map_format_error)?;
 
     if a_view.shape.len() != 1 || b_view.shape.len() != 1 {
         return Err(anyhow!(
@@ -280,8 +323,8 @@ pub fn dot(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
             b_view.shape.len()
         ));
     }
-    let len_a = a_view.shape[0];
-    let len_b = b_view.shape[0];
+    let len_a = dim1(&a_view.shape)?;
+    let len_b = dim1(&b_view.shape)?;
     if len_a != len_b {
         return Err(anyhow!(
             "dot: length mismatch: A has {len_a}, B has {len_b}"
@@ -295,7 +338,7 @@ pub fn dot(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
     }
 
     let gas_used =
-        gas_costs::DOT_BASE + gas_costs::DOT_PER_ELEMENT * (len_a as u64);
+        gas_cost(gas_costs::DOT_BASE, gas_costs::DOT_PER_ELEMENT, len_a as u64);
     check_gas(gas_used, gas_limit, "TENSOR_DOT_Q16")?;
 
     let a = parse_q16_tensor(&a_view)?;
@@ -325,7 +368,7 @@ pub fn softmax(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
             view.shape.len()
         ));
     }
-    let len = view.shape[0];
+    let len = dim1(&view.shape)?;
     if len > caps::SOFTMAX_LEN_MAX {
         return Err(anyhow!(
             "softmax: length cap exceeded: {len} (max {})",
@@ -334,7 +377,7 @@ pub fn softmax(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
     }
 
     let gas_used =
-        gas_costs::SOFTMAX_BASE + gas_costs::SOFTMAX_PER_ELEMENT * (len as u64);
+        gas_cost(gas_costs::SOFTMAX_BASE, gas_costs::SOFTMAX_PER_ELEMENT, len as u64);
     check_gas(gas_used, gas_limit, "TENSOR_SOFTMAX_Q16")?;
 
     let v = parse_q16_tensor(&view)?;
@@ -363,7 +406,7 @@ pub fn relu(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
             view.shape.len()
         ));
     }
-    let len = view.shape[0];
+    let len = dim1(&view.shape)?;
     if len > caps::RELU_LEN_MAX {
         return Err(anyhow!(
             "relu: length cap exceeded: {len} (max {})",
@@ -372,7 +415,7 @@ pub fn relu(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
     }
 
     let gas_used =
-        gas_costs::RELU_BASE + gas_costs::RELU_PER_ELEMENT * (len as u64);
+        gas_cost(gas_costs::RELU_BASE, gas_costs::RELU_PER_ELEMENT, len as u64);
     check_gas(gas_used, gas_limit, "TENSOR_RELU_Q16")?;
 
     let v = parse_q16_tensor(&view)?;
@@ -402,10 +445,10 @@ pub fn linear(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
     let (w_view, w_consumed) = decode_one(input).map_err(map_format_error)?;
     // Decode x.
     let (x_view, x_consumed) =
-        decode_one(&input[w_consumed..]).map_err(map_format_error)?;
+        decode_one(rest(input, w_consumed)).map_err(map_format_error)?;
     // Decode b.
     let (b_view, _b_consumed) =
-        decode_one(&input[w_consumed + x_consumed..]).map_err(map_format_error)?;
+        decode_one(rest(input, w_consumed.saturating_add(x_consumed))).map_err(map_format_error)?;
 
     if w_view.shape.len() != 2 {
         return Err(anyhow!(
@@ -425,10 +468,9 @@ pub fn linear(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
             b_view.shape.len()
         ));
     }
-    let out_dim = w_view.shape[0];
-    let in_dim = w_view.shape[1];
-    let x_len = x_view.shape[0];
-    let b_len = b_view.shape[0];
+    let (out_dim, in_dim) = dims2(&w_view.shape)?;
+    let x_len = dim1(&x_view.shape)?;
+    let b_len = dim1(&b_view.shape)?;
 
     if out_dim > caps::MATMUL_DIM_MAX || in_dim > caps::MATMUL_DIM_MAX {
         return Err(anyhow!(
@@ -447,9 +489,12 @@ pub fn linear(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
         ));
     }
 
-    let gas_used = gas_costs::LINEAR_BASE
-        + gas_costs::LINEAR_PER_MULADD * (out_dim as u64) * (in_dim as u64)
-        + gas_costs::LINEAR_PER_BIAS * (out_dim as u64);
+    let gas_used = gas_cost(
+        gas_costs::LINEAR_BASE,
+        gas_costs::LINEAR_PER_MULADD,
+        (out_dim as u64).saturating_mul(in_dim as u64),
+    )
+    .saturating_add(gas_costs::LINEAR_PER_BIAS.saturating_mul(out_dim as u64));
     check_gas(gas_used, gas_limit, "TENSOR_LINEAR_Q16")?;
 
     let w = parse_q16_tensor(&w_view)?;
@@ -480,9 +525,9 @@ pub fn transpose(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
             view.shape.len()
         ));
     }
-    let rows = view.shape[0];
-    let cols = view.shape[1];
-    let total = (rows as u64) * (cols as u64);
+    let (rows, cols) = dims2(&view.shape)?;
+    // u32 × u32 fits in u64.
+    let total = (rows as u64).saturating_mul(cols as u64);
     if total > caps::TRANSPOSE_ELEMS_MAX as u64 {
         return Err(anyhow!(
             "transpose: total elements cap exceeded: {total} (max {})",
@@ -491,7 +536,7 @@ pub fn transpose(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
     }
 
     let gas_used =
-        gas_costs::TRANSPOSE_BASE + gas_costs::TRANSPOSE_PER_ELEMENT * total;
+        gas_cost(gas_costs::TRANSPOSE_BASE, gas_costs::TRANSPOSE_PER_ELEMENT, total);
     check_gas(gas_used, gas_limit, "TENSOR_TRANSPOSE_Q16")?;
 
     let v = parse_q16_tensor(&view)?;
@@ -749,5 +794,15 @@ mod tests {
         let r = execute(&bogus, &[], 1_000_000);
         assert!(r.is_err());
         assert!(r.unwrap_err().to_string().contains("Unknown compute"));
+    }
+
+    /// PANIC-S1 G4: gas is exactly base + per-element × len.
+    #[test]
+    fn panic_s1_dot_gas_is_exact() {
+        let mut input = q16_tensor_from_ints(&[3], &[1, 2, 3]);
+        input.extend_from_slice(&q16_tensor_from_ints(&[3], &[4, 5, 6]));
+        let r = dot(&input, 1_000_000).unwrap();
+        assert_eq!(r.gas_used, gas_costs::DOT_BASE + 3 * gas_costs::DOT_PER_ELEMENT);
+        assert_eq!(gas_cost(10, 3, 4), 22);
     }
 }

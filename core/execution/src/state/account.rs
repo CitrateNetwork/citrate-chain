@@ -76,12 +76,17 @@ impl AccountManager {
             });
         }
 
-        // Deduct from sender
-        self.set_balance(*from, from_balance - value);
+        // Compute the credit before writing anything, so an overflow writes nothing.
+        let to_balance = self.get_balance(to);
+        let new_to = to_balance
+            .checked_add(value)
+            .ok_or(ExecutionError::Overflow("recipient balance"))?;
+
+        // Deduct from sender (guarded by the balance check above)
+        self.set_balance(*from, from_balance.saturating_sub(value));
 
         // Add to receiver
-        let to_balance = self.get_balance(to);
-        self.set_balance(*to, to_balance + value);
+        self.set_balance(*to, new_to);
 
         debug!("Transferred {} from {} to {}", value, from, to);
         Ok(())
@@ -102,7 +107,7 @@ impl AccountManager {
     /// Increment nonce
     pub fn increment_nonce(&self, address: &Address) {
         let mut account = self.get_account(address);
-        account.nonce += 1;
+        account.nonce = account.nonce.saturating_add(1);
         self.set_account(*address, account);
     }
 

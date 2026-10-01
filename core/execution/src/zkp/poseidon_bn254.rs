@@ -83,8 +83,12 @@ pub fn poseidon_hash(inputs: &[Fr]) -> Fr {
     let config = &*POSEIDON_CONFIG_BN254;
     let mut sponge = PoseidonSponge::<Fr>::new(config);
     sponge.absorb(&inputs.to_vec());
-    let result = sponge.squeeze_native_field_elements(1);
-    result[0]
+    // Squeezing 1 element always yields exactly one.
+    sponge
+        .squeeze_native_field_elements(1)
+        .first()
+        .copied()
+        .unwrap_or_else(|| Fr::from(0u64))
 }
 
 /// Get a reference to the Poseidon configuration. Used by the

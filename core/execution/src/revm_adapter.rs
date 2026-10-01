@@ -1,5 +1,19 @@
 // citrate/core/execution/src/revm_adapter.rs
 
+// PANIC-S1 G2: consensus path (EVM state adapter); panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use crate::mvcc::{JournalHandle, WriteSet};
 use crate::state::StateDB;
 use crate::types::{Address, ExecutionError, Log as CitrateLog};
@@ -333,10 +347,7 @@ impl Database for StateDBAdapter {
             let mut j = journal.lock();
             j.record_read(addr);
             if let Some(pending) = j.pending_storage(&addr, &key_bytes).map(|v| v.to_vec()) {
-                let mut padded = [0u8; 32];
-                let len = pending.len().min(32);
-                padded[32 - len..].copy_from_slice(&pending[pending.len() - len..]);
-                return Ok(RevmU256::from_be_bytes(padded));
+                return Ok(RevmU256::from_be_bytes(right_align_32(&pending)));
             }
         }
 
@@ -361,12 +372,7 @@ impl Database for StateDBAdapter {
             vec![0u8; 32]
         };
 
-        // Pad to 32 bytes if needed
-        let mut padded = [0u8; 32];
-        let len = value_bytes.len().min(32);
-        padded[32 - len..].copy_from_slice(&value_bytes[value_bytes.len() - len..]);
-
-        Ok(RevmU256::from_be_bytes(padded))
+        Ok(RevmU256::from_be_bytes(right_align_32(&value_bytes)))
     }
 
     fn block_hash(&mut self, number: RevmU256) -> Result<B256, Self::Error> {
@@ -1040,6 +1046,20 @@ pub fn execute_contract_call_with_context(
             reason, gas_used
         ))),
     }
+}
+
+
+/// A storage value as a 32-byte big-endian word: the last (up to) 32 bytes,
+/// right-aligned and zero-padded on the left.
+fn right_align_32(bytes: &[u8]) -> [u8; 32] {
+    let tail = bytes
+        .get(bytes.len().saturating_sub(32)..)
+        .unwrap_or_default();
+    let mut padded = [0u8; 32];
+    if let Some(dst) = padded.get_mut(32usize.saturating_sub(tail.len())..) {
+        dst.copy_from_slice(tail);
+    }
+    padded
 }
 
 #[cfg(test)]
@@ -1917,5 +1937,18 @@ mod tests {
             one_eth - U256::from(2000u64),
             "caller is down exactly the top-level value"
         );
+    }
+
+    #[test]
+    fn panic_s1_right_align_32_matches_word_semantics() {
+        assert_eq!(right_align_32(&[]), [0u8; 32]);
+        let mut one = [0u8; 32];
+        one[31] = 7;
+        assert_eq!(right_align_32(&[7]), one);
+        let long: Vec<u8> = (0u8..40).collect();
+        let want: [u8; 32] = long[8..].try_into().unwrap();
+        assert_eq!(right_align_32(&long), want);
+        let exact: [u8; 32] = [9; 32];
+        assert_eq!(right_align_32(&exact), exact);
     }
 }

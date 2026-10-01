@@ -148,9 +148,15 @@ impl CommitCoordinator {
 
     /// Convenience: create a fresh journal pinned at the current version.
     pub fn new_pinned_journal(&self) -> ScratchJournal {
+        self.new_pinned_journal_with_pin().0
+    }
+
+    /// [`Self::new_pinned_journal`] plus the version it was pinned at.
+    pub fn new_pinned_journal_with_pin(&self) -> (ScratchJournal, ReadVersion) {
+        let pin = self.current_version();
         let mut journal = ScratchJournal::new();
-        journal.pin_at(self.current_version());
-        journal
+        journal.pin_at(pin);
+        (journal, pin)
     }
 
     /// Access the account version tracker for reads during tx execution.
