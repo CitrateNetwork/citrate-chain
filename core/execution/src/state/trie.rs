@@ -1,5 +1,19 @@
 // citrate/core/execution/src/state/trie.rs
 
+// PANIC-S1 G2: consensus path (state root); panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 // Merkle Patricia Trie implementation
 use citrate_consensus::types::Hash;
 use serde::{Deserialize, Serialize};
