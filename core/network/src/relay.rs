@@ -108,7 +108,7 @@ impl RelayService {
                 .entry(from.clone())
                 .and_modify(|s| {
                     s.last_active = Instant::now();
-                    s.bytes_relayed += payload.len() as u64;
+                    s.bytes_relayed = s.bytes_relayed.saturating_add(payload.len() as u64);
                 })
                 .or_insert(RelaySession {
                     requester: from.clone(),
@@ -182,7 +182,7 @@ impl RelayService {
         let mut sessions = self.sessions.write().await;
         let before = sessions.len();
         sessions.retain(|_, s| s.last_active.elapsed() < SESSION_TTL);
-        let removed = before - sessions.len();
+        let removed = before.saturating_sub(sessions.len());
         if removed > 0 {
             debug!("Cleaned up {} expired relay sessions", removed);
         }

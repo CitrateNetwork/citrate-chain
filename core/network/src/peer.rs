@@ -268,7 +268,7 @@ impl Peer {
         match self.send_tx.try_send(message) {
             Ok(()) => {
                 let mut info = self.info.write().await;
-                info.messages_sent += 1;
+                info.messages_sent = info.messages_sent.saturating_add(1);
                 info.update_last_seen();
                 info.send_drops = 0;
                 Ok(())
@@ -561,10 +561,10 @@ impl PeerManager {
 
         // Update stats
         let mut stats = self.stats.write().await;
-        stats.total_connected += 1;
+        stats.total_connected = stats.total_connected.saturating_add(1);
         match direction {
-            Direction::Inbound => stats.inbound_count += 1,
-            Direction::Outbound => stats.outbound_count += 1,
+            Direction::Inbound => stats.inbound_count = stats.inbound_count.saturating_add(1),
+            Direction::Outbound => stats.outbound_count = stats.outbound_count.saturating_add(1),
         }
 
         info!("Added peer: {}", peer_id);
@@ -663,7 +663,7 @@ impl PeerManager {
     /// the IP is banned so the peer cannot evade the ban by simply
     /// reconnecting from a different source port.
     pub async fn ban_peer(&self, addr: SocketAddr) {
-        let expires = Instant::now() + self.config.ban_duration;
+        let expires = ban_expiry(self.config.ban_duration);
         self.banned_peers.insert(addr, expires);
         self.banned_ips.insert(addr.ip(), expires);
         warn!("Banned peer {} until {:?} ({:?} from now)", addr, expires, self.config.ban_duration);
@@ -676,7 +676,7 @@ impl PeerManager {
     /// follows the identity across IP changes. Prefer this over
     /// `ban_peer` whenever a PeerId is available.
     pub async fn ban_peer_with_id(&self, peer_id: &PeerId, addr: SocketAddr) {
-        let expires = Instant::now() + self.config.ban_duration;
+        let expires = ban_expiry(self.config.ban_duration);
         self.banned_peer_ids.insert(peer_id.clone(), expires);
         self.ban_peer(addr).await;
         warn!("Banned peer identity {} until {:?}", peer_id, expires);
@@ -730,7 +730,7 @@ impl PeerManager {
     pub async fn update_peer_score(&self, peer_id: &PeerId, delta: i32) {
         if let Some(peer) = self.get_peer(peer_id) {
             let mut info = peer.info.write().await;
-            info.score += delta;
+            info.score = info.score.saturating_add(delta);
 
             // Ban if score too low
             if info.score < self.config.score_threshold {
@@ -767,11 +767,11 @@ impl PeerManager {
     /// Broadcast a message to all connected peers
     pub async fn broadcast(&self, message: &NetworkMessage) -> Result<(), NetworkError> {
         let peers = self.get_all_peers();
-        let mut send_count = 0;
+        let mut send_count: usize = 0;
 
         for peer in peers {
             if (peer.send(message.clone()).await).is_ok() {
-                send_count += 1;
+                send_count = send_count.saturating_add(1);
             }
         }
 
@@ -980,7 +980,7 @@ async fn handle_incoming(
                 }
             }
             let mut inf = peer.info.write().await;
-            inf.messages_received += 1;
+            inf.messages_received = inf.messages_received.saturating_add(1);
             inf.update_last_seen();
         } else {
             break;
@@ -1109,6 +1109,16 @@ where
 {
     let bytes = bincode::serialize(msg).map_err(|e| NetworkError::DecodeError(e.to_string()))?;
     sink.send(bytes.into()).await.map_err(NetworkError::Io)
+}
+
+
+/// When a ban of `duration` ends. An absurdly large configured duration (past
+/// `Instant`'s range) is treated as a one-year ban instead of panicking.
+fn ban_expiry(duration: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(duration)
+        .or_else(|| now.checked_add(Duration::from_secs(365 * 24 * 60 * 60)))
+        .unwrap_or(now)
 }
 
 #[cfg(test)]

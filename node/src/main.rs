@@ -3927,7 +3927,8 @@ fn load_or_generate_noise_keypair(
         citrate_network::NoiseKeypair::from_bytes(&key_bytes)
             .map_err(|e| anyhow::anyhow!("Failed to parse noise key: {}", e))
     } else {
-        let kp = citrate_network::NoiseKeypair::generate();
+        let kp = citrate_network::NoiseKeypair::generate()
+            .map_err(|e| anyhow::anyhow!("Failed to generate noise key: {}", e))?;
         let key_bytes = Zeroizing::new(kp.to_bytes());
         write_secret_file_0600(noise_key_path, &key_bytes)?;
         info!(
