@@ -113,6 +113,10 @@ pub struct IpfsDaemon {
 impl IpfsDaemon {
     /// Create a new IPFS daemon manager
     pub fn new(config: DaemonConfig) -> Self {
+        // INVARIANT: with this static configuration `build()` fails only if the TLS
+        // backend cannot initialize at all, in which case no client of this kind can
+        // exist; there is no degraded mode to fall back to (PANIC-S1 PROVE+KEEP).
+        #[allow(clippy::panic)]
         let http_client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()

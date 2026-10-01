@@ -35,6 +35,20 @@
 //     Fixed: get_marketplace_stats now snapshots interactions first, drops the lock,
 //     then acquires stats (write). Both paths now follow interactions-before-stats.
 
+// PANIC-S1 G2: production code in this crate may not panic (tests excepted).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use std::sync::Arc;
 
 pub mod analytics_engine;

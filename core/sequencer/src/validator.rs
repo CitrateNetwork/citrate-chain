@@ -325,7 +325,8 @@ impl<S: StateProvider> TxValidator<S> {
         });
 
         // Reset window if expired
-        if current_time - entry.window_start >= window_size {
+        // Saturating: a wall clock that steps backwards must not panic the limiter.
+        if current_time.saturating_sub(entry.window_start) >= window_size {
             entry.count = 0;
             entry.window_start = current_time;
         }
@@ -335,7 +336,7 @@ impl<S: StateProvider> TxValidator<S> {
             return Err(ValidationError::RateLimitExceeded);
         }
 
-        entry.count += 1;
+        entry.count = entry.count.saturating_add(1);
         Ok(())
     }
 

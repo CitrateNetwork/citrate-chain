@@ -35,7 +35,7 @@ impl Default for UnifiedEconomicsConfig {
             rewards_config: EnhancedRewardConfig::default(),
             revenue_share_config: RevenueShareConfig::default(),
             gas_governance_ratio: 0.1, // 10% weight from gas usage
-            minimum_governance_balance: U256::from(100) * U256::from(10).pow(U256::from(18)), // 100 SALT
+            minimum_governance_balance: crate::salt(100), // 100 SALT
             economic_security_threshold: 0.67, // 67% threshold for economic security
         }
     }
@@ -173,20 +173,20 @@ impl UnifiedEconomicsManager {
         // Token-based power (primary component)
         let token_balance = self.token.balance_of(&address);
         let staked_balance = self.staking_balances.get(&address).copied().unwrap_or(U256::zero());
-        let token_power = token_balance + staked_balance;
+        let token_power = token_balance.saturating_add(staked_balance);
 
         // Gas usage power (network participation)
         let gas_usage_power = self.calculate_gas_usage_power(&address, block_height);
 
         // Staking power (additional weight for validators)
-        let staking_power = staked_balance * U256::from(120) / U256::from(100); // 20% bonus for staking
+        let staking_power = crate::mul_div(staked_balance, U256::from(120), U256::from(100)); // 20% bonus for staking
 
         // Reputation power (AI contributions)
         let reputation_score = self.reputation_scores.get(&address).copied().unwrap_or(0.0);
-        let reputation_power = U256::from((reputation_score * 1000.0) as u64) * U256::from(10).pow(U256::from(15)); // Scale reputation
+        let reputation_power = U256::from((reputation_score * 1000.0) as u64).saturating_mul(U256::exp10(15)); // Scale reputation
 
         // Calculate total linear power
-        let total_power = token_power + gas_usage_power + staking_power + reputation_power;
+        let total_power = token_power.saturating_add(gas_usage_power).saturating_add(staking_power).saturating_add(reputation_power);
 
         // Apply quadratic voting to prevent plutocracy
         let quadratic_power = self.calculate_quadratic_power(total_power);
@@ -211,7 +211,7 @@ impl UnifiedEconomicsManager {
         // Transfer to staking
         self.token.burn(&staker, amount)?;
         let current_stake = self.staking_balances.get(&staker).copied().unwrap_or(U256::zero());
-        self.staking_balances.insert(staker, current_stake + amount);
+        self.staking_balances.insert(staker, current_stake.saturating_add(amount));
 
         Ok(())
     }
@@ -224,7 +224,7 @@ impl UnifiedEconomicsManager {
         }
 
         // Remove from staking
-        self.staking_balances.insert(staker, staked - amount);
+        self.staking_balances.insert(staker, staked.saturating_sub(amount));
 
         // Return tokens (mint back)
         self.token.mint(&staker, amount)?;
@@ -241,8 +241,10 @@ impl UnifiedEconomicsManager {
         block_height: u64,
     ) -> Result<()> {
         // Check minimum balance for governance participation
-        let total_balance = self.token.balance_of(&voter) +
-                           self.staking_balances.get(&voter).copied().unwrap_or(U256::zero());
+        let total_balance = self
+            .token
+            .balance_of(&voter)
+            .saturating_add(self.staking_balances.get(&voter).copied().unwrap_or(U256::zero()));
 
         if total_balance < self.config.minimum_governance_balance {
             return Err(anyhow!("Insufficient balance for governance participation"));
@@ -285,8 +287,8 @@ impl UnifiedEconomicsManager {
         }
 
         // Calculate burn amount
-        let burn_amount = amount * U256::from(burn_percentage) / U256::from(100);
-        let remainder = amount - burn_amount;
+        let burn_amount = crate::mul_div(amount, U256::from(burn_percentage), U256::from(100));
+        let remainder = amount.saturating_sub(burn_amount);
 
         // Burn portion of gas fees
         if burn_amount > U256::zero() {
@@ -304,7 +306,7 @@ impl UnifiedEconomicsManager {
 
     /// Calculate economic security of the network
     pub fn calculate_economic_security(&self) -> f64 {
-        let total_staked: U256 = self.staking_balances.values().fold(U256::zero(), |acc, &x| acc + x);
+        let total_staked: U256 = self.staking_balances.values().fold(U256::zero(), |acc, &x| acc.saturating_add(x));
         let total_supply = self.token.circulating_supply();
 
         if total_supply.is_zero() {
@@ -348,10 +350,10 @@ impl UnifiedEconomicsManager {
                 // query height — reachable via getVotingPower's hard-coded 0.
                 .filter(|(height, _)| block_height.saturating_sub(*height) <= 100) // Last 100 blocks
                 .map(|(_, gas)| *gas)
-                .fold(U256::zero(), |acc, x| acc + x);
+                .fold(U256::zero(), |acc, x| acc.saturating_add(x));
 
             // Convert gas usage to voting power (scaled down)
-            recent_usage * U256::from((self.config.gas_governance_ratio * 100.0) as u64) / U256::from(100)
+            crate::mul_div(recent_usage, U256::from((self.config.gas_governance_ratio * 100.0) as u64), U256::from(100))
         } else {
             U256::zero()
         }
@@ -407,7 +409,7 @@ impl UnifiedEconomicsManager {
     }
 
     fn calculate_economic_state(&self, block_height: u64) -> EconomicState {
-        let total_staked: U256 = self.staking_balances.values().fold(U256::zero(), |acc, &x| acc + x);
+        let total_staked: U256 = self.staking_balances.values().fold(U256::zero(), |acc, &x| acc.saturating_add(x));
         let treasury_balance = self.token.balance_of(&Address([0x11; 20])); // Treasury placeholder
 
         EconomicState {
@@ -483,7 +485,7 @@ impl UnifiedEconomicsManager {
             if *staked_amount > U256::zero() {
                 self.revenue_sharing.update_contribution(
                     *address,
-                    *staked_amount / U256::from(100), // Scale down for contribution scoring
+                    staked_amount.checked_div(U256::from(100)).unwrap_or_default(), // Scale down for contribution scoring
                     1, // One block of activity
                 )?;
             }
@@ -555,7 +557,7 @@ mod tests {
         let mut economics = UnifiedEconomicsManager::new(config);
 
         let address = Address([1; 20]);
-        let amount = U256::from(1000) * U256::from(10).pow(U256::from(18));
+        let amount = crate::salt(1000);
 
         // Mint some tokens
         economics.token.mint(&address, amount).unwrap();
@@ -571,7 +573,7 @@ mod tests {
         let mut economics = UnifiedEconomicsManager::new(config);
 
         let address = Address([1; 20]);
-        let amount = U256::from(1000) * U256::from(10).pow(U256::from(18));
+        let amount = crate::salt(1000);
 
         // Mint and stake tokens
         economics.token.mint(&address, amount).unwrap();
