@@ -404,7 +404,9 @@ mod tests {
             block_hashes: HashMap::new(),
         });
         let tmpl = template(pba, height, parent, coinbase, vrf, vec![], Hash::default());
-        let r = RewardCalculator::new(canonical_reward_config()).calculate_reward(&tmpl);
+        let r = RewardCalculator::new(canonical_reward_config())
+            .calculate_reward(&tmpl)
+            .expect("canonical reward");
         for (addr, amt) in [
             (Address(coinbase), r.validator_reward),
             (Address([0x11; 20]), r.treasury_reward),
@@ -600,7 +602,9 @@ mod tests {
                 .block_on(exec.execute_transaction(&tmpl, &tx))
                 .expect("executes on the old rules")
         });
-        let r = RewardCalculator::new(canonical_reward_config()).calculate_reward(&tmpl);
+        let r = RewardCalculator::new(canonical_reward_config())
+            .calculate_reward(&tmpl)
+            .expect("canonical reward");
         for (addr, amt) in [
             (Address(CB_STALE), r.validator_reward),
             (Address([0x11; 20]), r.treasury_reward),

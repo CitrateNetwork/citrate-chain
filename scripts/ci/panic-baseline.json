@@ -18,9 +18,7 @@
    "panic": 1
   },
   "core/economics": {
-   "arithmetic_side_effects": 157,
-   "indexing_slicing": 3,
-   "panic": 3
+   "arithmetic_side_effects": 135
   },
   "core/execution": {
    "arithmetic_side_effects": 357,
@@ -114,5 +112,5 @@
   "arithmetic_side_effects",
   "string_slice"
  ],
- "total": 2137
+ "total": 2109
 }

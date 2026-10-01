@@ -14,15 +14,26 @@ import json
 import re
 import sys
 
-T1_CRATES = {"core/execution", "core/economics", "core/consensus", "core/storage",
+T1_CRATES = {"core/execution", "core/consensus", "core/storage",
              "core/primitives", "core/bridge", "crates/citrate-commd", "crates/citrate-commd-fold"}
 T2_CRATES = {"core/network", "core/api", "core/sequencer", "core/mcp", "core/marketplace", "core/signing"}
 NODE_T1 = re.compile(r"node/src/(canonical_apply|producer|block_|import|registry_sync|sync|state_)")
 NODE_T2 = re.compile(r"node/src/(rpc|p2p|network|mempool|gossip)")
 
 
+# core/economics is split by call path (PANIC-S1 WP-2b triage): only the block-
+# reward calculator (node canonical_apply / producer) and genesis construction are
+# on the consensus path. The UnifiedEconomicsManager stack (token, governance,
+# pricing, enhanced rewards, revenue sharing) and the institutional estimator are
+# reached ONLY from read-only RPC; the producer never reads them for rewards.
+ECONOMICS_T1_FILES = {"core/economics/src/rewards.rs", "core/economics/src/genesis.rs",
+                      "core/economics/src/lib.rs"}
+
+
 def tier(s):
     c, f = s["crate"], s["file"]
+    if c == "core/economics":
+        return "T1" if f in ECONOMICS_T1_FILES else "T2"
     if c == "node":
         if "/bin/" in f:
             return "T3"

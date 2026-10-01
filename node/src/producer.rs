@@ -1558,7 +1558,11 @@ impl BlockProducer {
             .ghostdag_params(self.ghostdag.params().clone())
             .transactions(executed_transactions.clone())
             .build_unhashed();
-        let reward = self.reward_calculator.calculate_reward(&temp_block);
+        // PANIC-S1 D3: an uncomputable reward rejects the block (never panics/saturates).
+        let reward = self
+            .reward_calculator
+            .calculate_reward(&temp_block)
+            .map_err(|e| anyhow::anyhow!("block reward rejected: {e}"))?;
         // `basic_credits` mirrors `canonical_apply::reward_credits` exactly:
         // [(coinbase, validator_reward), (0x11..treasury, treasury_reward)]. Below the
         // VALIDATOR-S1 activation (or before a snapshot is materialized) this credits only
@@ -3265,8 +3269,8 @@ mod tests {
             .with_state_balance_reader({
                 let exec = executor.clone();
                 Arc::new(move |pk: &PublicKey| {
-                    let bal = exec
-                        .get_balance(&citrate_execution::address_utils::normalize_address(pk));
+                    let bal =
+                        exec.get_balance(&citrate_execution::address_utils::normalize_address(pk));
                     let cap = U256::from(u128::MAX);
                     (if bal > cap { cap } else { bal }).low_u128()
                 })
@@ -3278,7 +3282,9 @@ mod tests {
         let honest_price = 1_000_000_000u64;
         let honest_cost = 21_000u128 * honest_price as u128;
         state_db.accounts.create_account_if_not_exists(honest);
-        state_db.accounts.set_balance(honest, U256::from(honest_cost));
+        state_db
+            .accounts
+            .set_balance(honest, U256::from(honest_cost));
 
         let honest_tx = {
             let mut t = transfer_tx(0xA1, honest, recipient, 0);
@@ -4162,7 +4168,8 @@ mod tests {
         *receiver.reward_policy_handle().write() = Some(mk_policy());
         receiver.set_validator_activation_height(0);
         let reward = RewardCalculator::new(crate::canonical_apply::canonical_reward_config())
-            .calculate_reward(&sealed);
+            .calculate_reward(&sealed)
+            .expect("canonical reward");
         let basic_credits = [
             (Address(sealed.header.coinbase), reward.validator_reward),
             (Address(TREASURY), reward.treasury_reward),
@@ -4417,7 +4424,8 @@ mod tests {
             block: &Block,
         ) -> Result<Hash, citrate_execution::types::ExecutionError> {
             let reward = RewardCalculator::new(crate::canonical_apply::canonical_reward_config())
-                .calculate_reward(block);
+                .calculate_reward(block)
+                .expect("canonical reward");
             let credits = [
                 (Address(block.header.coinbase), reward.validator_reward),
                 (Address(TREASURY), reward.treasury_reward),
