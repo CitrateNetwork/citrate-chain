@@ -54,6 +54,76 @@ pub mod gas_costs {
 
 /// EIP-3009 TransferWithAuthorization type hash (constant, computed once)
 /// keccak256("TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)")
+/// One EIP-3009 authorization: from(20) ‖ to(20) ‖ value(32) ‖ validAfter(32) ‖
+/// validBefore(32) ‖ nonce(32) ‖ v(1) ‖ r(32) ‖ s(32).
+const AUTH_ENTRY_LEN: usize = 233;
+
+/// A 32-byte result word: `flag` in byte 0, `addr` in bytes 12..32, zero elsewhere.
+fn address_word(flag: u8, addr: [u8; 20]) -> [u8; 32] {
+    let mut word = [0u8; 32];
+    word[0] = flag;
+    for (dst, src) in word.iter_mut().skip(12).zip(addr) {
+        *dst = src;
+    }
+    word
+}
+
+/// Verify one EIP-3009 TransferWithAuthorization under `domain_separator`.
+///
+/// Returns the result word shared by 0x0201 and each 0x0202 entry: byte 0 is 1
+/// iff the signature recovers to `from`, bytes 12..32 hold the recovered signer;
+/// the word is all zero when `v` is not a recovery id or recovery fails.
+fn verify_authorization(
+    domain_separator: &[u8; 32],
+    entry: &[u8; AUTH_ENTRY_LEN],
+    typehash: &[u8; 32],
+) -> [u8; 32] {
+    let parsed = (|| {
+        let (from, rest) = entry.split_first_chunk::<20>()?;
+        let (to, rest) = rest.split_first_chunk::<20>()?;
+        let (value, rest) = rest.split_first_chunk::<32>()?;
+        let (valid_after, rest) = rest.split_first_chunk::<32>()?;
+        let (valid_before, rest) = rest.split_first_chunk::<32>()?;
+        let (nonce, rest) = rest.split_first_chunk::<32>()?;
+        let (&v, rest) = rest.split_first()?;
+        let (r, rest) = rest.split_first_chunk::<32>()?;
+        let s = rest.first_chunk::<32>()?;
+        Some((*from, *to, value, valid_after, valid_before, nonce, v, r, s))
+    })();
+    let Some((from, to, value, valid_after, valid_before, nonce, v, r, s)) = parsed else {
+        return [0u8; 32];
+    };
+
+    // structHash = keccak256(typehash ‖ abi.encode(from, to, value, validAfter,
+    // validBefore, nonce)); addresses are left-padded to 32 bytes.
+    let mut hasher = Keccak256::new();
+    hasher.update(typehash);
+    hasher.update(address_word(0, from));
+    hasher.update(address_word(0, to));
+    hasher.update(value);
+    hasher.update(valid_after);
+    hasher.update(valid_before);
+    hasher.update(nonce);
+    let struct_hash: [u8; 32] = hasher.finalize().into();
+
+    // EIP-712 digest
+    let mut digest_hasher = Keccak256::new();
+    digest_hasher.update([0x19, 0x01]);
+    digest_hasher.update(domain_separator);
+    digest_hasher.update(struct_hash);
+    let digest = digest_hasher.finalize();
+
+    let recovery_id = match v {
+        27 | 0 => 0u8,
+        28 | 1 => 1u8,
+        _ => return [0u8; 32],
+    };
+    match super::recover_address(&digest, r, s, recovery_id) {
+        Some(recovered) => address_word(u8::from(recovered == from), recovered),
+        None => [0u8; 32],
+    }
+}
+
 fn transfer_with_authorization_typehash() -> [u8; 32] {
     let mut hasher = Keccak256::new();
     hasher.update(b"TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)");
@@ -100,11 +170,27 @@ fn eip712_verify(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
         });
     }
 
-    let domain_separator = &input[0..32];
-    let struct_hash = &input[32..64];
-    let v = input[64];
-    let r = &input[65..97];
-    let s = &input[97..129];
+    // domain(32) ‖ structHash(32) ‖ v(1) ‖ r(32) ‖ s(32); length checked above.
+    let zero = || PrecompileResult {
+        output: vec![0u8; 32],
+        gas_used: gas_costs::EIP712_VERIFY,
+        success: true,
+    };
+    let Some((domain_separator, rest)) = input.split_first_chunk::<32>() else {
+        return Ok(zero());
+    };
+    let Some((struct_hash, rest)) = rest.split_first_chunk::<32>() else {
+        return Ok(zero());
+    };
+    let Some((&v, rest)) = rest.split_first() else {
+        return Ok(zero());
+    };
+    let Some((r, rest)) = rest.split_first_chunk::<32>() else {
+        return Ok(zero());
+    };
+    let Some(s) = rest.first_chunk::<32>() else {
+        return Ok(zero());
+    };
 
     // Compute EIP-712 digest: keccak256("\x19\x01" || domainSeparator || structHash)
     let mut hasher = Keccak256::new();
@@ -141,11 +227,8 @@ fn eip712_verify(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
     };
 
     // Return zero-padded address
-    let mut output = vec![0u8; 32];
-    output[12..32].copy_from_slice(&recovered);
-
     Ok(PrecompileResult {
-        output,
+        output: address_word(0, recovered).to_vec(),
         gas_used: gas_costs::EIP712_VERIFY,
         success: true,
     })
@@ -186,87 +269,15 @@ fn transfer_auth_verify(input: &[u8], gas_limit: u64) -> Result<PrecompileResult
         });
     }
 
-    let domain_separator = &input[0..32];
-    let from = &input[32..52];
-    let to = &input[52..72];
-    let value = &input[72..104];
-    let valid_after = &input[104..136];
-    let valid_before = &input[136..168];
-    let nonce = &input[168..200];
-    let v = input[200];
-    let r = &input[201..233];
-    let s = &input[233..265];
-
-    // Reconstruct EIP-3009 struct hash
-    // structHash = keccak256(typehash || abi.encode(from, to, value, validAfter, validBefore, nonce))
     let typehash = transfer_with_authorization_typehash();
-
-    let mut struct_data = Vec::with_capacity(32 + 6 * 32); // typehash + 6 ABI-encoded fields
-    struct_data.extend_from_slice(&typehash);
-
-    // ABI-encode `from` as address (left-padded to 32 bytes)
-    let mut from_padded = [0u8; 32];
-    from_padded[12..32].copy_from_slice(from);
-    struct_data.extend_from_slice(&from_padded);
-
-    // ABI-encode `to` as address
-    let mut to_padded = [0u8; 32];
-    to_padded[12..32].copy_from_slice(to);
-    struct_data.extend_from_slice(&to_padded);
-
-    // value, validAfter, validBefore are already 32 bytes
-    struct_data.extend_from_slice(value);
-    struct_data.extend_from_slice(valid_after);
-    struct_data.extend_from_slice(valid_before);
-
-    // nonce is bytes32 (already 32 bytes)
-    struct_data.extend_from_slice(nonce);
-
-    let mut hasher = Keccak256::new();
-    hasher.update(&struct_data);
-    let struct_hash: [u8; 32] = hasher.finalize().into();
-
-    // Compute EIP-712 digest
-    let mut digest_hasher = Keccak256::new();
-    digest_hasher.update([0x19, 0x01]);
-    digest_hasher.update(domain_separator);
-    digest_hasher.update(struct_hash);
-    let digest = digest_hasher.finalize();
-
-    // Parse recovery ID
-    let recovery_id = match v {
-        27 => 0u8,
-        28 => 1u8,
-        0 => 0u8,
-        1 => 1u8,
-        _ => {
-            return Ok(PrecompileResult {
-                output: vec![0u8; 32],
-                gas_used: gas_costs::TRANSFER_AUTH_VERIFY,
-                success: true,
-            });
-        }
-    };
-
-    // Recover address
-    let recovered = match super::recover_address(&digest, r, s, recovery_id) {
-        Some(addr) => addr,
-        None => {
-            return Ok(PrecompileResult {
-                output: vec![0u8; 32],
-                gas_used: gas_costs::TRANSFER_AUTH_VERIFY,
-                success: true,
-            });
-        }
-    };
-
-    // Check if recovered signer == from
-    let valid = recovered == <[u8; 20]>::try_from(from).unwrap_or([0u8; 20]);
-
-    // Output: validity byte + zero-padded signer
-    let mut output = vec![0u8; 32];
-    output[0] = if valid { 1 } else { 0 };
-    output[12..32].copy_from_slice(&recovered);
+    let output = match input
+        .split_first_chunk::<32>()
+        .and_then(|(domain, rest)| Some((domain, rest.first_chunk::<AUTH_ENTRY_LEN>()?)))
+    {
+        Some((domain_separator, entry)) => verify_authorization(domain_separator, entry, &typehash),
+        None => [0u8; 32],
+    }
+    .to_vec();
 
     Ok(PrecompileResult {
         output,
@@ -302,96 +313,46 @@ fn batch_payment_verify(input: &[u8], gas_limit: u64) -> Result<PrecompileResult
         return Err(anyhow!("Invalid batch payment input: too short"));
     }
 
-    let domain_separator = &input[0..32];
-    let count = u16::from_be_bytes([input[32], input[33]]) as usize;
+    let Some((domain_separator, rest)) = input.split_first_chunk::<32>() else {
+        return Err(anyhow!("Invalid batch payment input: too short"));
+    };
+    let Some((count_bytes, entries)) = rest.split_first_chunk::<2>() else {
+        return Err(anyhow!("Invalid batch payment input: too short"));
+    };
+    let count = u16::from_be_bytes(*count_bytes) as usize;
 
-    let total_gas = gas_costs::BATCH_BASE + (count as u64) * gas_costs::BATCH_PER_PAYMENT;
+    // count <= u16::MAX, so none of the size/gas arithmetic below saturates.
+    let total_gas = gas_costs::BATCH_PER_PAYMENT
+        .saturating_mul(count as u64)
+        .saturating_add(gas_costs::BATCH_BASE);
     if gas_limit < total_gas {
         return Err(anyhow!("Insufficient gas for batch payment verify"));
     }
 
     // Per-entry: from(20)+to(20)+value(32)+validAfter(32)+validBefore(32)+nonce(32)+v(1)+r(32)+s(32) = 233
-    let entry_size: usize = 233;
-    let expected_len = 34 + count * entry_size;
+    let expected_len = count.saturating_mul(AUTH_ENTRY_LEN).saturating_add(34);
     if input.len() < expected_len {
         return Err(anyhow!("Invalid batch payment input: expected {} bytes, got {}", expected_len, input.len()));
     }
 
     let typehash = transfer_with_authorization_typehash();
     let mut verified_count: u16 = 0;
-    let mut results = Vec::with_capacity(count * 32);
+    let mut results = Vec::with_capacity(count.saturating_mul(32));
 
-    for i in 0..count {
-        let offset = 34 + i * entry_size;
-        let entry = &input[offset..offset + entry_size];
-
-        let from = &entry[0..20];
-        let to = &entry[20..40];
-        let value = &entry[40..72];
-        let valid_after = &entry[72..104];
-        let valid_before = &entry[104..136];
-        let nonce = &entry[136..168];
-        let v = entry[168];
-        let r = &entry[169..201];
-        let s = &entry[201..233];
-
-        // Reconstruct struct hash
-        let mut struct_data = Vec::with_capacity(32 + 6 * 32);
-        struct_data.extend_from_slice(&typehash);
-
-        let mut from_padded = [0u8; 32];
-        from_padded[12..32].copy_from_slice(from);
-        struct_data.extend_from_slice(&from_padded);
-
-        let mut to_padded = [0u8; 32];
-        to_padded[12..32].copy_from_slice(to);
-        struct_data.extend_from_slice(&to_padded);
-
-        struct_data.extend_from_slice(value);
-        struct_data.extend_from_slice(valid_after);
-        struct_data.extend_from_slice(valid_before);
-        struct_data.extend_from_slice(nonce);
-
-        let mut hasher = Keccak256::new();
-        hasher.update(&struct_data);
-        let struct_hash: [u8; 32] = hasher.finalize().into();
-
-        // EIP-712 digest
-        let mut digest_hasher = Keccak256::new();
-        digest_hasher.update([0x19, 0x01]);
-        digest_hasher.update(domain_separator);
-        digest_hasher.update(struct_hash);
-        let digest = digest_hasher.finalize();
-
-        // Recovery ID
-        let recovery_id = match v {
-            27 => 0u8,
-            28 => 1u8,
-            0 => 0u8,
-            1 => 1u8,
-            _ => {
-                let mut result = vec![0u8; 32];
-                result[0] = 0;
-                results.extend_from_slice(&result);
-                continue;
-            }
-        };
-
-        // Recover and verify
-        let mut result = vec![0u8; 32];
-        if let Some(recovered) = super::recover_address(&digest, r, s, recovery_id) {
-            let valid = recovered == <[u8; 20]>::try_from(from).unwrap_or([0u8; 20]);
-            result[0] = if valid { 1 } else { 0 };
-            result[12..32].copy_from_slice(&recovered);
-            if valid {
-                verified_count += 1;
-            }
+    for entry in entries
+        .chunks_exact(AUTH_ENTRY_LEN)
+        .take(count)
+        .filter_map(|e| <&[u8; AUTH_ENTRY_LEN]>::try_from(e).ok())
+    {
+        let result = verify_authorization(domain_separator, entry, &typehash);
+        if result[0] == 1 {
+            verified_count = verified_count.saturating_add(1);
         }
         results.extend_from_slice(&result);
     }
 
     // Construct output: verified_count (2 bytes) + results
-    let mut output = Vec::with_capacity(2 + results.len());
+    let mut output = Vec::with_capacity(results.len().saturating_add(2));
     output.extend_from_slice(&verified_count.to_be_bytes());
     output.extend_from_slice(&results);
 
@@ -718,5 +679,33 @@ mod tests {
 
         let result = eip712_verify(&input, 3_450);
         assert!(result.is_ok());
+    }
+
+    /// PANIC-S1: 0x0201 and each 0x0202 entry share one verifier; the same signed
+    /// authorization yields the byte-identical result word through both, and the
+    /// signer is exactly `from`.
+    #[test]
+    fn panic_s1_transfer_auth_and_batch_entry_agree() {
+        let domain_separator = [0x11u8; 32];
+        let from_key = SigningKey::random(&mut OsRng);
+        let to = [0x22u8; 20];
+        let value = [0u8; 32];
+        let valid_after = [0u8; 32];
+        let mut valid_before = [0u8; 32];
+        valid_before[31] = 0xFF;
+        let nonce = [0x33u8; 32];
+        let single = create_test_transfer_auth(
+            &domain_separator, &from_key, &to, &value, &valid_after, &valid_before, &nonce,
+        );
+        let word = transfer_auth_verify(&single, 10_000).unwrap().output;
+        assert_eq!(word[0], 1);
+        assert_eq!(&word[12..32], &single[32..52], "signer == from");
+
+        let mut batch = domain_separator.to_vec();
+        batch.extend_from_slice(&1u16.to_be_bytes());
+        batch.extend_from_slice(&single[32..]);
+        let out = batch_payment_verify(&batch, 1_000_000).unwrap().output;
+        assert_eq!(&out[..2], &1u16.to_be_bytes());
+        assert_eq!(&out[2..34], &word[..]);
     }
 }
