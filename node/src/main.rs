@@ -66,7 +66,6 @@ mod network_inference;
 mod persistent_dag;
 mod producer;
 mod registry_sync;
-mod sync;
 mod sync_peer;
 
 use citrate_consensus::dag_store::DagStore;
