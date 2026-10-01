@@ -122,7 +122,7 @@ impl TransactionApi {
                 .sum::<u64>()
         });
 
-        Ok(base_gas + data_gas)
+        Ok(base_gas.saturating_add(data_gas))
     }
 
     /// Get current gas price

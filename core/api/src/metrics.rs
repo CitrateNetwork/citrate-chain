@@ -3,13 +3,26 @@
 use once_cell::sync::Lazy;
 use prometheus::{register_int_counter_vec, register_int_gauge, IntCounterVec, IntGauge};
 
+/// Unwrap a metric registration.
+// INVARIANT: every metric name, help string and label set passed here is a
+// compile-time constant, and names are unique process-wide, so registration in
+// the default registry cannot fail at runtime. Test
+// `panic_s1_every_metric_registers_once` forces every metric in this crate to
+// register in one process and fails on any duplicate or invalid definition.
+#[allow(clippy::panic)]
+pub(crate) fn must<T>(registration: prometheus::Result<T>, what: &str) -> T {
+    registration.unwrap_or_else(|e| panic!("{what}: {e}"))
+}
+
 pub static RPC_REQUESTS: Lazy<IntCounterVec> = Lazy::new(|| {
-    register_int_counter_vec!(
-        "citrate_rpc_requests_total",
-        "Total JSON-RPC requests by method",
-        &["method"]
+    crate::metrics::must(
+        register_int_counter_vec!(
+            "citrate_rpc_requests_total",
+            "Total JSON-RPC requests by method",
+            &["method"]
+        ),
+        "register citrate_rpc_requests_total",
     )
-    .unwrap_or_else(|e| panic!("register citrate_rpc_requests_total: {e}"))
 });
 
 #[inline]
@@ -30,12 +43,14 @@ pub fn rpc_request(method: &str) {
 ///
 /// Summed across all listen-fds bound to the configured RPC port.
 pub static RPC_ACCEPT_QUEUE_DEPTH: Lazy<IntGauge> = Lazy::new(|| {
-    register_int_gauge!(
-        "citrate_rpc_accept_queue_depth",
-        "Sum of kernel accept-backlog sizes across all RPC listen sockets (Linux). \
+    crate::metrics::must(
+        register_int_gauge!(
+            "citrate_rpc_accept_queue_depth",
+            "Sum of kernel accept-backlog sizes across all RPC listen sockets (Linux). \
          Healthy under load is 0; sustained > 1 means worker threads are stalled."
+        ),
+        "register citrate_rpc_accept_queue_depth",
     )
-    .unwrap_or_else(|e| panic!("register citrate_rpc_accept_queue_depth: {e}"))
 });
 
 /// PIL-49c: spawn a background task on the shared rpc_runtime that samples
@@ -50,16 +65,17 @@ pub fn spawn_accept_queue_sampler(port: u16, interval_secs: u64) {
     let interval = std::time::Duration::from_secs(interval_secs.max(1));
     // Drive the loop on the shared rpc_runtime so we don't fight the
     // jsonrpc-http-server's internal tokio runtime for threads.
-    std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("rpc-accept-q-sampler".into())
-        .spawn(move || {
-            loop {
-                let depth = sample_accept_queue_depth(port);
-                RPC_ACCEPT_QUEUE_DEPTH.set(depth as i64);
-                std::thread::sleep(interval);
-            }
-        })
-        .expect("spawn rpc-accept-q-sampler thread");
+        .spawn(move || loop {
+            let depth = sample_accept_queue_depth(port);
+            RPC_ACCEPT_QUEUE_DEPTH.set(depth as i64);
+            std::thread::sleep(interval);
+        });
+    // Observability only: a node that cannot spawn the sampler keeps serving RPC.
+    if let Err(e) = spawned {
+        tracing::error!("could not spawn rpc-accept-q-sampler thread: {e}");
+    }
 }
 
 /// Read `/proc/net/tcp` once and sum the RxQ across all LISTEN sockets
@@ -133,5 +149,36 @@ mod tests {
         // should return 0 cleanly, not panic.
         let depth = sample_accept_queue_depth(65535);
         assert_eq!(depth, 0);
+    }
+}
+
+#[cfg(test)]
+mod panic_s1_tests {
+    use once_cell::sync::Lazy;
+
+    /// PANIC-S1: pins `must()`'s INVARIANT. Every metric in this crate registers in
+    /// one process; a duplicate name or invalid definition panics here, in a test,
+    /// instead of in a node's RPC handler. (This caught a real duplicate:
+    /// `citrate_rpc_requests_total` was registered twice with different labels.)
+    #[test]
+    fn panic_s1_every_metric_registers_once() {
+        Lazy::force(&crate::metrics::RPC_REQUESTS);
+        Lazy::force(&crate::metrics::RPC_ACCEPT_QUEUE_DEPTH);
+        Lazy::force(&crate::metrics_server::RPC_REQUEST_DURATION);
+        Lazy::force(&crate::metrics_server::RPC_REQUEST_COUNT);
+        Lazy::force(&crate::metrics_server::MEMPOOL_SIZE);
+        Lazy::force(&crate::metrics_server::MEMPOOL_BYTES);
+        Lazy::force(&crate::metrics_server::STORAGE_READ_DURATION);
+        Lazy::force(&crate::metrics_server::STORAGE_WRITE_DURATION);
+        Lazy::force(&crate::metrics_server::CACHE_HIT_RATE);
+        Lazy::force(&crate::metrics_server::CACHE_SIZE);
+        Lazy::force(&crate::metrics_server::DAG_HEIGHT);
+        Lazy::force(&crate::metrics_server::DAG_TIPS_COUNT);
+        Lazy::force(&crate::metrics_server::DAG_BLUE_SCORE);
+        Lazy::force(&crate::metrics_server::EXECUTION_TIME);
+        Lazy::force(&crate::metrics_server::PARALLEL_EXECUTION_GROUPS);
+        Lazy::force(&crate::metrics_server::PEER_COUNT);
+        Lazy::force(&crate::metrics_server::NETWORK_BYTES_RECEIVED);
+        Lazy::force(&crate::metrics_server::NETWORK_BYTES_SENT);
     }
 }
