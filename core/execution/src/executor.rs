@@ -1,5 +1,19 @@
 // citrate/core/execution/src/executor.rs
 
+// PANIC-S1 G2: the transaction executor is panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use crate::inference::metal_runtime::MetalRuntime;
 use crate::metrics::{PRECOMPILE_CALLS_TOTAL, VM_EXECUTIONS_TOTAL, VM_GAS_USED};
 use crate::mvcc::{CommitCoordinator, JournalHandle, ScratchJournal, WriteSet};
@@ -34,6 +48,54 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     } else {
         "non-string panic payload".to_string()
     }
+}
+
+/// Bounds-checked cursor read for tx-data decoding: returns `data[*offset..*offset + n]`
+/// and advances `offset`, or `InvalidInput` if that would run past the end.
+fn take<'a>(data: &'a [u8], offset: &mut usize, n: usize) -> Result<&'a [u8], ExecutionError> {
+    let end = offset.checked_add(n).ok_or(ExecutionError::InvalidInput)?;
+    let bytes = data.get(*offset..end).ok_or(ExecutionError::InvalidInput)?;
+    *offset = end;
+    Ok(bytes)
+}
+
+/// [`take`] into a fixed-size array.
+fn take_array<const N: usize>(data: &[u8], offset: &mut usize) -> Result<[u8; N], ExecutionError> {
+    take(data, offset, N)?
+        .try_into()
+        .map_err(|_| ExecutionError::InvalidInput)
+}
+
+/// Trailing artifact CID shared by register/update: absent when fewer than 4 bytes
+/// remain or the length is 0; a declared length longer than the data is invalid.
+fn parse_optional_cid(data: &[u8], offset: &mut usize) -> Result<Option<String>, ExecutionError> {
+    if data.len().saturating_sub(*offset) < 4 {
+        return Ok(None);
+    }
+    let cid_len = u32::from_be_bytes(take_array::<4>(data, offset)?) as usize;
+    if cid_len == 0 {
+        return Ok(None);
+    }
+    String::from_utf8(take(data, offset, cid_len)?.to_vec())
+        .map(Some)
+        .map_err(|_| ExecutionError::InvalidInput)
+}
+
+/// Gas fee in wei. INVARIANT: u64 × u64 < 2^128, so this never saturates in U256.
+fn gas_fee(gas: u64, gas_price: u64) -> U256 {
+    U256::from(gas).saturating_mul(U256::from(gas_price))
+}
+
+/// 4-byte ABI function selector of a canonical signature.
+fn selector4(signature: &[u8]) -> [u8; 4] {
+    use sha3::{Digest, Keccak256};
+    let [a, b, c, d, ..]: [u8; 32] = Keccak256::digest(signature).into();
+    [a, b, c, d]
+}
+
+/// Arguments of a classified AI operation (calldata after the 4-byte selector).
+fn ai_op_args(data: &[u8]) -> Result<&[u8], ExecutionError> {
+    data.get(4..).ok_or(ExecutionError::InvalidInput)
 }
 
 pub struct ExecutionContext {
@@ -979,7 +1041,7 @@ impl Executor {
                 store.put_code(&code_hash, &code)?;
             }
 
-            let count = account_changes.len() + storage_changes.len();
+            let count = account_changes.len().saturating_add(storage_changes.len());
             // Write state + the applied-tip pointer ATOMICALLY. Always write when a tip
             // is supplied (even with 0 dirty changes — the tip must still advance).
             if count > 0 || applied_tip.is_some() {
@@ -1120,9 +1182,7 @@ impl Executor {
 
         let mut hasher = Keccak256::new();
         hasher.update(onnx_bytes);
-        let h = hasher.finalize();
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&h[..32]);
+        let arr: [u8; 32] = hasher.finalize().into();
 
         let model_hash = Hash::new(arr);
         let model_id = ModelId(model_hash);
@@ -1694,7 +1754,10 @@ impl Executor {
                         amount
                     );
                 }
-                self.set_balance(addr, bal + *amount);
+                let credited = bal.checked_add(*amount).ok_or_else(|| {
+                    ExecutionError::RewardSettlement("basic reward overflows balance".into())
+                })?;
+                self.set_balance(addr, credited);
             }
         }
 
@@ -1829,7 +1892,10 @@ impl Executor {
         // Transiently fund the minter so REVM's caller-balance precheck (>= value)
         // passes; gas price is 0 so nothing is charged. Recorded for restore.
         let minter_before = self.get_balance(&minter);
-        self.set_balance(&minter, minter_before + amount);
+        let funded = minter_before.checked_add(amount).ok_or_else(|| {
+            ExecutionError::RewardSettlement("transient minter funding overflows".into())
+        })?;
+        self.set_balance(&minter, funded);
 
         // §R' runs at end-of-block for the block at `height`, so it is gated on
         // the same height as user transactions in that block.
@@ -1892,7 +1958,10 @@ impl Executor {
                 if value_semantics == crate::revm_adapter::ValueSemantics::LegacyDropInternal {
                     self.set_balance(&minter, minter_before);
                     let reg_bal = self.get_balance(&registry_addr);
-                    self.set_balance(&registry_addr, reg_bal + amount);
+                    let credited = reg_bal.checked_add(amount).ok_or_else(|| {
+                        ExecutionError::RewardSettlement("registry credit overflows balance".into())
+                    })?;
+                    self.set_balance(&registry_addr, credited);
                 }
                 Ok(true)
             }
@@ -2050,18 +2119,25 @@ impl Executor {
         }
 
         // Check balance for gas, journal-first.
-        let gas_cost = U256::from(tx.gas_limit) * U256::from(tx.gas_price);
+        let gas_cost = gas_fee(tx.gas_limit, tx.gas_price);
         let balance = {
             let j = context.journal.lock();
             j.pending_balance(&from)
                 .unwrap_or_else(|| self.state_db.accounts.get_balance(&from))
         };
-        if balance < gas_cost + U256::from(tx.value) {
+        // INVARIANT: gas_cost < 2^128 and value < 2^64, so the sum cannot saturate.
+        let need = gas_cost.saturating_add(U256::from(tx.value));
+        if balance < need {
             return Err(ExecutionError::InsufficientBalance {
-                need: gas_cost + U256::from(tx.value),
+                need,
                 have: balance,
             });
         }
+        // Reject before dispatch rather than overflow the nonce after it.
+        let next_nonce = tx
+            .nonce
+            .checked_add(1)
+            .ok_or(ExecutionError::Overflow("sender nonce"))?;
 
         // Sprint P950-A-5 WP-A.5.2: deduct gas cost into the journal rather
         // than state_db. REVM's `Database::basic` does journal-first lookup
@@ -2069,7 +2145,7 @@ impl Executor {
         context
             .journal
             .lock()
-            .record_balance(from, balance - gas_cost);
+            .record_balance(from, balance.saturating_sub(gas_cost));
 
         // Parse and execute transaction type.
         let tx_type = Self::parse_transaction_type(tx)?;
@@ -2129,8 +2205,7 @@ impl Executor {
                 // checks off, underflows to a ~2^64 refund = a SALT mint). On
                 // honest traffic `gas_used <= gas_limit`, so this equals the
                 // subtraction; it only diverges on the (attacker/underflow) edge.
-                let refund = U256::from(tx.gas_limit.saturating_sub(context.gas_used))
-                    * U256::from(tx.gas_price);
+                let refund = gas_fee(tx.gas_limit.saturating_sub(context.gas_used), tx.gas_price);
                 let current_balance = {
                     let j = context.journal.lock();
                     j.pending_balance(&from)
@@ -2138,8 +2213,10 @@ impl Executor {
                 };
                 {
                     let mut j = context.journal.lock();
-                    j.record_nonce(from, tx.nonce + 1);
-                    j.record_balance(from, current_balance + refund);
+                    j.record_nonce(from, next_nonce);
+                    // INVARIANT: balances are bounded by total supply (< 2^80 wei), so
+                    // adding a refund (< 2^128) cannot saturate.
+                    j.record_balance(from, current_balance.saturating_add(refund));
                 }
                 true
             }
@@ -2150,8 +2227,8 @@ impl Executor {
                 // nothing was written to state_db during execution.
                 let mut j = context.journal.lock();
                 j.discard_writes();
-                j.record_balance(from, balance - gas_cost);
-                j.record_nonce(from, tx.nonce + 1);
+                j.record_balance(from, balance.saturating_sub(gas_cost));
+                j.record_nonce(from, next_nonce);
                 false
             }
         };
@@ -2380,13 +2457,13 @@ impl Executor {
             // operation is).
             match citrate_consensus::types::AiOpKind::classify(true, &tx.data) {
                 Some(citrate_consensus::types::AiOpKind::RegisterModel) => {
-                    Self::parse_register_model(&tx.data[4..])
+                    Self::parse_register_model(ai_op_args(&tx.data)?)
                 }
                 Some(citrate_consensus::types::AiOpKind::InferenceRequest) => {
-                    Self::parse_inference_request(&tx.data[4..])
+                    Self::parse_inference_request(ai_op_args(&tx.data)?)
                 }
                 Some(citrate_consensus::types::AiOpKind::UpdateModel) => {
-                    Self::parse_update_model(&tx.data[4..])
+                    Self::parse_update_model(ai_op_args(&tx.data)?)
                 }
                 None => Ok(TransactionType::Call {
                     to,
@@ -2399,26 +2476,10 @@ impl Executor {
 
     /// Parse register model transaction
     fn parse_register_model(data: &[u8]) -> Result<TransactionType, ExecutionError> {
-        if data.len() < 36 {
-            return Err(ExecutionError::InvalidInput);
-        }
-
-        let model_hash = Hash::new(
-            data[0..32]
-                .try_into()
-                .map_err(|_| ExecutionError::InvalidInput)?,
-        );
-        let meta_len = u32::from_be_bytes(
-            data[32..36]
-                .try_into()
-                .map_err(|_| ExecutionError::InvalidInput)?,
-        ) as usize;
-        let mut offset = 36;
-        if data.len() < offset + meta_len {
-            return Err(ExecutionError::InvalidInput);
-        }
-        let metadata_bytes = &data[offset..offset + meta_len];
-        offset += meta_len;
+        let mut offset = 0;
+        let model_hash = Hash::new(take_array::<32>(data, &mut offset)?);
+        let meta_len = u32::from_be_bytes(take_array::<4>(data, &mut offset)?) as usize;
+        let metadata_bytes = take(data, &mut offset, meta_len)?;
 
         let mut metadata: ModelMetadata =
             serde_json::from_slice(metadata_bytes).map_err(|_| ExecutionError::InvalidInput)?;
@@ -2442,48 +2503,19 @@ impl Executor {
             metadata.output_shape = vec![1];
         }
 
-        if offset >= data.len() {
-            return Err(ExecutionError::InvalidInput);
-        }
-        let policy_byte = data[offset];
-        offset += 1;
+        let [policy_byte] = take_array::<1>(data, &mut offset)?;
 
         let access_policy = match policy_byte {
             0 => AccessPolicy::Public,
             1 => AccessPolicy::Private,
             2 => AccessPolicy::Restricted(Vec::new()),
-            3 => {
-                if data.len() < offset + 32 {
-                    return Err(ExecutionError::InvalidInput);
-                }
-                let mut fee_bytes = [0u8; 32];
-                fee_bytes.copy_from_slice(&data[offset..offset + 32]);
-                offset += 32;
-                AccessPolicy::PayPerUse {
-                    fee: U256::from_big_endian(&fee_bytes),
-                }
-            }
+            3 => AccessPolicy::PayPerUse {
+                fee: U256::from_big_endian(take(data, &mut offset, 32)?),
+            },
             _ => AccessPolicy::Public,
         };
 
-        let mut artifact_cid: Option<String> = None;
-        if data.len() >= offset + 4 {
-            let cid_len = u32::from_be_bytes(
-                data[offset..offset + 4]
-                    .try_into()
-                    .map_err(|_| ExecutionError::InvalidInput)?,
-            ) as usize;
-            offset += 4;
-            if cid_len > 0 {
-                if data.len() < offset + cid_len {
-                    return Err(ExecutionError::InvalidInput);
-                }
-                artifact_cid = Some(
-                    String::from_utf8(data[offset..offset + cid_len].to_vec())
-                        .map_err(|_| ExecutionError::InvalidInput)?,
-                );
-            }
-        }
+        let artifact_cid = parse_optional_cid(data, &mut offset)?;
 
         Ok(TransactionType::RegisterModel {
             model_hash,
@@ -2495,45 +2527,23 @@ impl Executor {
 
     /// Parse inference request
     fn parse_inference_request(data: &[u8]) -> Result<TransactionType, ExecutionError> {
-        if data.len() < 32 {
-            return Err(ExecutionError::InvalidInput);
-        }
-
-        let model_id = ModelId(Hash::new(
-            data[0..32]
-                .try_into()
-                .map_err(|_| ExecutionError::InvalidInput)?,
-        ));
+        let mut offset = 0;
+        let model_id = ModelId(Hash::new(take_array::<32>(data, &mut offset)?));
+        let input_data = data.get(offset..).unwrap_or_default().to_vec();
 
         Ok(TransactionType::InferenceRequest {
             model_id,
-            input_data: data[32..].to_vec(),
+            input_data,
             max_gas: 1_000_000,
         })
     }
 
     /// Parse update model transaction
     fn parse_update_model(data: &[u8]) -> Result<TransactionType, ExecutionError> {
-        if data.len() < 36 {
-            return Err(ExecutionError::InvalidInput);
-        }
-
-        let model_id = ModelId(Hash::new(
-            data[0..32]
-                .try_into()
-                .map_err(|_| ExecutionError::InvalidInput)?,
-        ));
-        let meta_len = u32::from_be_bytes(
-            data[32..36]
-                .try_into()
-                .map_err(|_| ExecutionError::InvalidInput)?,
-        ) as usize;
-        let mut offset = 36;
-        if data.len() < offset + meta_len {
-            return Err(ExecutionError::InvalidInput);
-        }
-        let metadata_bytes = &data[offset..offset + meta_len];
-        offset += meta_len;
+        let mut offset = 0;
+        let model_id = ModelId(Hash::new(take_array::<32>(data, &mut offset)?));
+        let meta_len = u32::from_be_bytes(take_array::<4>(data, &mut offset)?) as usize;
+        let metadata_bytes = take(data, &mut offset, meta_len)?;
 
         let mut metadata: ModelMetadata =
             serde_json::from_slice(metadata_bytes).map_err(|_| ExecutionError::InvalidInput)?;
@@ -2556,27 +2566,7 @@ impl Executor {
 
         // created_at is already set from deserialization
 
-        let artifact_cid = if data.len() >= offset + 4 {
-            let cid_len = u32::from_be_bytes(
-                data[offset..offset + 4]
-                    .try_into()
-                    .map_err(|_| ExecutionError::InvalidInput)?,
-            ) as usize;
-            offset += 4;
-            if cid_len > 0 {
-                if data.len() < offset + cid_len {
-                    return Err(ExecutionError::InvalidInput);
-                }
-                Some(
-                    String::from_utf8(data[offset..offset + cid_len].to_vec())
-                        .map_err(|_| ExecutionError::InvalidInput)?,
-                )
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let artifact_cid = parse_optional_cid(data, &mut offset)?;
 
         Ok(TransactionType::UpdateModel {
             model_id,
@@ -2697,10 +2687,14 @@ impl Executor {
             });
         }
 
+        let new_to = to_balance
+            .checked_add(value)
+            .ok_or(ExecutionError::Overflow("recipient balance"))?;
         {
             let mut j = context.journal.lock();
-            j.record_balance(from, from_balance - value);
-            j.record_balance(to, to_balance + value);
+            // Guarded by the `from_balance < value` check above.
+            j.record_balance(from, from_balance.saturating_sub(value));
+            j.record_balance(to, new_to);
         }
 
         // PIL-48b: Native value transfers emit no logs — that's how Ethereum
@@ -2754,10 +2748,14 @@ impl Executor {
             });
         }
 
+        let new_to = to_balance
+            .checked_add(value)
+            .ok_or(ExecutionError::Overflow("recipient balance"))?;
         {
             let mut j = context.journal.lock();
-            j.record_balance(from, from_balance - value);
-            j.record_balance(to, to_balance + value);
+            // Guarded by the `from_balance < value` check above.
+            j.record_balance(from, from_balance.saturating_sub(value));
+            j.record_balance(to, new_to);
         }
 
         Ok(())
@@ -3069,17 +3067,16 @@ impl Executor {
         from: Address,
         context: &mut ExecutionContext,
     ) -> Result<(), ExecutionError> {
-        use sha3::{Digest, Keccak256};
         if data.len() < 4 {
             return Err(ExecutionError::InvalidInput);
         }
-        let selector = &data[0..4];
-        let args = &data[4..];
+        let selector = data.get(0..4).ok_or(ExecutionError::InvalidInput)?;
+        let args = data.get(4..).ok_or(ExecutionError::InvalidInput)?;
 
-        let sel_set_admin = &Keccak256::digest(b"setAdmin(address)")[..4];
-        let sel_queue = &Keccak256::digest(b"queueSetParam(bytes32,bytes,uint64)")[..4];
-        let sel_execute = &Keccak256::digest(b"executeSetParam(bytes32)")[..4];
-        let sel_get = &Keccak256::digest(b"getParam(bytes32)")[..4];
+        let sel_set_admin = &selector4(b"setAdmin(address)");
+        let sel_queue = &selector4(b"queueSetParam(bytes32,bytes,uint64)");
+        let sel_execute = &selector4(b"executeSetParam(bytes32)");
+        let sel_get = &selector4(b"getParam(bytes32)");
 
         let gov_addr = Self::governance_precompile_address();
 
@@ -3095,15 +3092,7 @@ impl Executor {
         let current_admin: Option<Address> = self
             .state_db
             .get_storage(&gov_addr, &admin_key)
-            .and_then(|v| {
-                if v.len() >= 20 {
-                    let mut a = [0u8; 20];
-                    a.copy_from_slice(&v[..20]);
-                    Some(Address(a))
-                } else {
-                    None
-                }
-            });
+            .and_then(|v| v.first_chunk::<20>().map(|a| Address(*a)));
 
         if selector == sel_set_admin {
             // RM-B1 / WP-B3.3: admin can be set in two ways —
@@ -3123,7 +3112,7 @@ impl Executor {
                 return Err(ExecutionError::InvalidInput);
             }
             let mut addr = [0u8; 20];
-            addr.copy_from_slice(&args[12..32]);
+            addr.copy_from_slice(args.get(12..32).ok_or(ExecutionError::InvalidInput)?);
             self.state_db
                 .set_storage(gov_addr, admin_key, addr.to_vec());
             return Ok(());
@@ -3143,16 +3132,16 @@ impl Executor {
             if args.len() < 96 {
                 return Err(ExecutionError::InvalidInput);
             }
-            let key = &args[0..32];
+            let key = args.get(0..32).ok_or(ExecutionError::InvalidInput)?;
             let mut offb = [0u8; 32];
-            offb.copy_from_slice(&args[32..64]);
+            offb.copy_from_slice(args.get(32..64).ok_or(ExecutionError::InvalidInput)?);
             let off = primitive_types::U256::from_big_endian(&offb);
             let off_usize: usize = off.try_into().unwrap_or(usize::MAX);
             if off_usize == usize::MAX {
                 return Err(ExecutionError::InvalidInput);
             }
             let mut eta_bytes = [0u8; 32];
-            eta_bytes.copy_from_slice(&args[64..96]);
+            eta_bytes.copy_from_slice(args.get(64..96).ok_or(ExecutionError::InvalidInput)?);
             let eta_u256 = primitive_types::U256::from_big_endian(&eta_bytes);
             let eta: u64 = eta_u256.try_into().unwrap_or(u64::MAX);
             // CHAIN-B-B002 variant: `off_usize == usize::MAX` is rejected above,
@@ -3168,7 +3157,10 @@ impl Executor {
                 return Err(ExecutionError::InvalidInput);
             }
             let mut lenb = [0u8; 32];
-            lenb.copy_from_slice(&data[dyn_start..dyn_end]);
+            lenb.copy_from_slice(
+                data.get(dyn_start..dyn_end)
+                    .ok_or(ExecutionError::InvalidInput)?,
+            );
             let len = primitive_types::U256::from_big_endian(&lenb);
             let l: usize = len.try_into().unwrap_or(usize::MAX);
             let val_start = dyn_end;
@@ -3178,7 +3170,9 @@ impl Executor {
             if data.len() < val_end {
                 return Err(ExecutionError::InvalidInput);
             }
-            let value = &data[val_start..val_end];
+            let value = data
+                .get(val_start..val_end)
+                .ok_or(ExecutionError::InvalidInput)?;
             // Store pending
             let mut pending_key = b"PENDING:".to_vec();
             pending_key.extend_from_slice(key);
@@ -3195,7 +3189,7 @@ impl Executor {
             if args.len() < 32 {
                 return Err(ExecutionError::InvalidInput);
             }
-            let key = &args[0..32];
+            let key = args.get(0..32).ok_or(ExecutionError::InvalidInput)?;
             let mut pending_key = b"PENDING:".to_vec();
             pending_key.extend_from_slice(key);
             if let Some(stored) = self.state_db.get_storage(&gov_addr, &pending_key) {
@@ -3203,12 +3197,12 @@ impl Executor {
                     return Err(ExecutionError::InvalidInput);
                 }
                 let mut eta_bytes = [0u8; 8];
-                eta_bytes.copy_from_slice(&stored[..8]);
+                eta_bytes.copy_from_slice(stored.get(..8).ok_or(ExecutionError::InvalidInput)?);
                 let eta = u64::from_le_bytes(eta_bytes);
                 if context.timestamp < eta {
                     return Err(ExecutionError::Reverted("Timelock not expired".into()));
                 }
-                let value = &stored[8..];
+                let value = stored.get(8..).ok_or(ExecutionError::InvalidInput)?;
                 let mut param_key = b"PARAM:".to_vec();
                 param_key.extend_from_slice(key);
                 self.state_db
@@ -3224,7 +3218,7 @@ impl Executor {
             if args.len() < 32 {
                 return Err(ExecutionError::InvalidInput);
             }
-            let key = &args[0..32];
+            let key = args.get(0..32).ok_or(ExecutionError::InvalidInput)?;
             let mut param_key = b"PARAM:".to_vec();
             param_key.extend_from_slice(key);
             if let Some(value) = self.state_db.get_storage(&gov_addr, &param_key) {
@@ -3244,30 +3238,28 @@ impl Executor {
         from: Address,
         context: &mut ExecutionContext,
     ) -> Result<(), ExecutionError> {
-        use sha3::{Digest, Keccak256};
         if data.len() < 4 {
             return Err(ExecutionError::InvalidInput);
         }
-        let selector = &data[0..4];
-        let args = &data[4..];
+        let selector = data.get(0..4).ok_or(ExecutionError::InvalidInput)?;
+        let args = data.get(4..).ok_or(ExecutionError::InvalidInput)?;
 
-        let sel_register = &Keccak256::digest(b"registerModel(bytes32,string)")[..4];
-        let sel_register_ex =
-            &Keccak256::digest(b"registerModel(bytes32,string,uint8,uint256)")[..4];
-        let sel_infer = &Keccak256::digest(b"executeInference(bytes32,bytes)")[..4];
-        let sel_pin = &Keccak256::digest(b"pin(string,uint256)")[..4];
-        let sel_status = &Keccak256::digest(b"status(string)")[..4];
+        let sel_register = &selector4(b"registerModel(bytes32,string)");
+        let sel_register_ex = &selector4(b"registerModel(bytes32,string,uint8,uint256)");
+        let sel_infer = &selector4(b"executeInference(bytes32,bytes)");
+        let sel_pin = &selector4(b"pin(string,uint256)");
+        let sel_status = &selector4(b"status(string)");
 
         if selector == sel_register || selector == sel_register_ex {
             if args.len() < 64 {
                 return Err(ExecutionError::InvalidInput);
             }
             let mut mh = [0u8; 32];
-            mh.copy_from_slice(&args[0..32]);
+            mh.copy_from_slice(args.get(0..32).ok_or(ExecutionError::InvalidInput)?);
             let model_hash = Hash::new(mh);
 
             let mut off = [0u8; 32];
-            off.copy_from_slice(&args[32..64]);
+            off.copy_from_slice(args.get(32..64).ok_or(ExecutionError::InvalidInput)?);
             let offset = primitive_types::U256::from_big_endian(&off);
             let offset_usize: usize = offset.try_into().unwrap_or(usize::MAX);
             if offset_usize == usize::MAX {
@@ -3285,7 +3277,10 @@ impl Executor {
                 return Err(ExecutionError::InvalidInput);
             }
             let mut lb = [0u8; 32];
-            lb.copy_from_slice(&data[dyn_start..dyn_end]);
+            lb.copy_from_slice(
+                data.get(dyn_start..dyn_end)
+                    .ok_or(ExecutionError::InvalidInput)?,
+            );
             let len = primitive_types::U256::from_big_endian(&lb);
             let len_usize: usize = len.try_into().unwrap_or(usize::MAX);
             let cid_start = dyn_end;
@@ -3295,7 +3290,11 @@ impl Executor {
             if data.len() < cid_end {
                 return Err(ExecutionError::InvalidInput);
             }
-            let cid = String::from_utf8_lossy(&data[cid_start..cid_end]).to_string();
+            let cid = String::from_utf8_lossy(
+                data.get(cid_start..cid_end)
+                    .ok_or(ExecutionError::InvalidInput)?,
+            )
+            .to_string();
 
             let md = ModelMetadata {
                 name: "OnchainModel".to_string(),
@@ -3311,14 +3310,14 @@ impl Executor {
                 if args.len() < 128 {
                     return Err(ExecutionError::InvalidInput);
                 }
-                let pol_u8 = args[95];
+                let pol_u8 = *args.get(95).ok_or(ExecutionError::InvalidInput)?;
                 match pol_u8 {
                     0 => AccessPolicy::Public,
                     1 => AccessPolicy::Private,
                     2 => AccessPolicy::Restricted(Vec::new()),
                     3 => {
                         let mut pb = [0u8; 32];
-                        pb.copy_from_slice(&args[96..128]);
+                        pb.copy_from_slice(args.get(96..128).ok_or(ExecutionError::InvalidInput)?);
                         let fee = primitive_types::U256::from_big_endian(&pb);
                         AccessPolicy::PayPerUse { fee }
                     }
@@ -3353,11 +3352,11 @@ impl Executor {
                 return Err(ExecutionError::InvalidInput);
             }
             let mut mh = [0u8; 32];
-            mh.copy_from_slice(&args[0..32]);
+            mh.copy_from_slice(args.get(0..32).ok_or(ExecutionError::InvalidInput)?);
             let model_id = ModelId(Hash::new(mh));
 
             let mut off = [0u8; 32];
-            off.copy_from_slice(&args[32..64]);
+            off.copy_from_slice(args.get(32..64).ok_or(ExecutionError::InvalidInput)?);
             let offset = primitive_types::U256::from_big_endian(&off);
             let offset_usize: usize = offset.try_into().unwrap_or(usize::MAX);
             if offset_usize == usize::MAX {
@@ -3375,7 +3374,10 @@ impl Executor {
                 return Err(ExecutionError::InvalidInput);
             }
             let mut lb = [0u8; 32];
-            lb.copy_from_slice(&data[dyn_start..dyn_end]);
+            lb.copy_from_slice(
+                data.get(dyn_start..dyn_end)
+                    .ok_or(ExecutionError::InvalidInput)?,
+            );
             let len = primitive_types::U256::from_big_endian(&lb);
             let len_usize: usize = len.try_into().unwrap_or(usize::MAX);
             let bytes_start = dyn_end;
@@ -3385,7 +3387,10 @@ impl Executor {
             if data.len() < bytes_end {
                 return Err(ExecutionError::InvalidInput);
             }
-            let input_data = data[bytes_start..bytes_end].to_vec();
+            let input_data = data
+                .get(bytes_start..bytes_end)
+                .ok_or(ExecutionError::InvalidInput)?
+                .to_vec();
 
             let res = self
                 .execute_inference(
@@ -3412,7 +3417,7 @@ impl Executor {
                 return Err(ExecutionError::InvalidInput);
             }
             let mut off = [0u8; 32];
-            off.copy_from_slice(&args[0..32]);
+            off.copy_from_slice(args.get(0..32).ok_or(ExecutionError::InvalidInput)?);
             let offset = primitive_types::U256::from_big_endian(&off);
             // CHAIN-B-B002: the ABI offset word is attacker-controlled.
             // `unwrap_or(usize::MAX)` followed by `4 + off_usize` overflows and,
@@ -3421,7 +3426,7 @@ impl Executor {
             // offset becomes a revert (`InvalidInput`), never a panic.
             let off_usize: usize = offset.try_into().unwrap_or(usize::MAX);
             let mut repb = [0u8; 32];
-            repb.copy_from_slice(&args[32..64]);
+            repb.copy_from_slice(args.get(32..64).ok_or(ExecutionError::InvalidInput)?);
             let replicas_u256 = primitive_types::U256::from_big_endian(&repb);
             let replicas: usize = replicas_u256.try_into().unwrap_or(1);
             let dyn_start = off_usize
@@ -3434,7 +3439,10 @@ impl Executor {
                 return Err(ExecutionError::InvalidInput);
             }
             let mut lenb = [0u8; 32];
-            lenb.copy_from_slice(&data[dyn_start..dyn_end]);
+            lenb.copy_from_slice(
+                data.get(dyn_start..dyn_end)
+                    .ok_or(ExecutionError::InvalidInput)?,
+            );
             let len = primitive_types::U256::from_big_endian(&lenb);
             let l: usize = len.try_into().unwrap_or(usize::MAX);
             let s = dyn_end;
@@ -3442,7 +3450,8 @@ impl Executor {
             if data.len() < e {
                 return Err(ExecutionError::InvalidInput);
             }
-            let cid = String::from_utf8_lossy(&data[s..e]).to_string();
+            let cid = String::from_utf8_lossy(data.get(s..e).ok_or(ExecutionError::InvalidInput)?)
+                .to_string();
             if let Some(art) = &self.artifact_service {
                 art.pin(&cid, replicas).await?;
             }
@@ -3454,7 +3463,7 @@ impl Executor {
                 return Err(ExecutionError::InvalidInput);
             }
             let mut off = [0u8; 32];
-            off.copy_from_slice(&args[0..32]);
+            off.copy_from_slice(args.get(0..32).ok_or(ExecutionError::InvalidInput)?);
             let offset = primitive_types::U256::from_big_endian(&off);
             // CHAIN-B-B002: see pin() above — checked arithmetic so an
             // attacker-controlled ABI offset reverts instead of panicking.
@@ -3469,7 +3478,10 @@ impl Executor {
                 return Err(ExecutionError::InvalidInput);
             }
             let mut lenb = [0u8; 32];
-            lenb.copy_from_slice(&data[dyn_start..dyn_end]);
+            lenb.copy_from_slice(
+                data.get(dyn_start..dyn_end)
+                    .ok_or(ExecutionError::InvalidInput)?,
+            );
             let len = primitive_types::U256::from_big_endian(&lenb);
             let l: usize = len.try_into().unwrap_or(usize::MAX);
             let s = dyn_end;
@@ -3477,7 +3489,8 @@ impl Executor {
             if data.len() < e {
                 return Err(ExecutionError::InvalidInput);
             }
-            let cid = String::from_utf8_lossy(&data[s..e]).to_string();
+            let cid = String::from_utf8_lossy(data.get(s..e).ok_or(ExecutionError::InvalidInput)?)
+                .to_string();
             let status = if let Some(art) = &self.artifact_service {
                 art.status(&cid).await?
             } else {
@@ -3579,14 +3592,8 @@ impl Executor {
             .state_db
             .get_storage(&gov_addr, b"PARAM:artifact_replication")
         {
-            if !bytes.is_empty() {
-                return bytes[0].max(1) as usize;
-            }
-            if bytes.len() >= 8 {
-                let mut arr = [0u8; 8];
-                arr.copy_from_slice(&bytes[..8]);
-                let v = u64::from_le_bytes(arr);
-                return v.max(1) as usize;
+            if let Some(&first) = bytes.first() {
+                return first.max(1) as usize;
             }
         }
         1
@@ -3715,11 +3722,12 @@ impl Executor {
         }
 
         // Simulate tensor operation
-        let op_type = input[0];
-        let dimensions = u32::from_le_bytes([input[1], input[2], input[3], input[4]]);
+        let mut offset = 0;
+        let [op_type] = take_array::<1>(input, &mut offset)?;
+        let dimensions = u32::from_le_bytes(take_array::<4>(input, &mut offset)?);
 
         // Gas cost based on tensor dimensions
-        let tensor_gas = dimensions as u64 * 100;
+        let tensor_gas = u64::from(dimensions).saturating_mul(100);
         context.use_gas(tensor_gas)?;
 
         info!(
@@ -3742,11 +3750,7 @@ impl Executor {
             return Err(ExecutionError::InvalidInput);
         }
 
-        let model_hash = Hash::new(
-            input[0..32]
-                .try_into()
-                .map_err(|_| ExecutionError::InvalidInput)?,
-        );
+        let model_hash = Hash::new(take_array::<32>(input, &mut 0)?);
         let model_id = ModelId(model_hash);
 
         // Check if model exists
@@ -3776,20 +3780,16 @@ impl Executor {
             return Err(ExecutionError::InvalidInput);
         }
 
-        let model_hash = Hash::new(
-            input[0..32]
-                .try_into()
-                .map_err(|_| ExecutionError::InvalidInput)?,
-        );
+        let model_hash = Hash::new(take_array::<32>(input, &mut 0)?);
         let model_id = ModelId(model_hash);
-        let inference_data = &input[32..];
+        let inference_data = input.get(32..).unwrap_or_default();
 
         // Execute inference
         self.execute_inference(
             context.origin,
             model_id,
             inference_data.to_vec(),
-            context.gas_limit - context.gas_used,
+            context.gas_limit.saturating_sub(context.gas_used),
             context,
         )
         .await?;
@@ -3811,7 +3811,7 @@ impl Executor {
 
         // Simulate proof generation
         let proof_size = input.len().min(1024);
-        let proof_gas = proof_size as u64 * 1000;
+        let proof_gas = (proof_size as u64).saturating_mul(1000);
         context.use_gas(proof_gas)?;
 
         info!("ZK proof generated for {} bytes of input", input.len());
@@ -3832,11 +3832,14 @@ impl Executor {
             return Err(ExecutionError::InvalidInput);
         }
 
-        let proof = &input[0..64];
-        let public_inputs = &input[64..];
+        let (proof, public_inputs) = input
+            .split_first_chunk::<64>()
+            .ok_or(ExecutionError::InvalidInput)?;
 
         // Simulate verification
-        let verify_gas = 5000 + (public_inputs.len() as u64 * 10);
+        let verify_gas = (public_inputs.len() as u64)
+            .saturating_mul(10)
+            .saturating_add(5000);
         context.use_gas(verify_gas)?;
 
         // Check if proof is valid (simplified)
@@ -3964,7 +3967,10 @@ impl Executor {
 
         model.metadata = new_metadata;
         model.metadata.created_at = context.timestamp;
-        model.version += 1;
+        model.version = model
+            .version
+            .checked_add(1)
+            .ok_or(ExecutionError::Overflow("model version"))?;
         let updated_model = model.clone();
 
         self.state_db.update_model(model_id, model)?;
@@ -4064,8 +4070,11 @@ impl Executor {
             AccessPolicy::PayPerUse { fee } => {
                 // Split fee: 10% protocol treasury, 90% to model owner
                 let treasury_address = Address([0x11; 20]);
-                let treasury_cut = *fee / U256::from(10u8);
-                let owner_cut = *fee - treasury_cut;
+                let treasury_cut = fee
+                    .checked_div(U256::from(10u8))
+                    .ok_or(ExecutionError::Overflow("treasury cut"))?;
+                // treasury_cut <= fee, so this cannot saturate.
+                let owner_cut = fee.saturating_sub(treasury_cut);
                 // Perform transfers
                 self.state_db
                     .accounts
@@ -4075,7 +4084,9 @@ impl Executor {
                         .accounts
                         .transfer(&from, &treasury_address, treasury_cut)?;
                 }
-                model.usage_stats.total_fees_earned += *fee;
+                // Lifetime accumulator (CHAIN-B-B010 convention): saturate, never panic.
+                model.usage_stats.total_fees_earned =
+                    model.usage_stats.total_fees_earned.saturating_add(*fee);
             }
             _ => return Err(ExecutionError::AccessDenied),
         }
@@ -4113,7 +4124,7 @@ impl Executor {
         }
 
         // Update usage stats
-        model.usage_stats.total_inferences += 1;
+        model.usage_stats.total_inferences = model.usage_stats.total_inferences.saturating_add(1);
         // CHAIN-B-B010: monotonically-growing accumulator over a model's
         // lifetime; `saturating_add` so a long-lived model cannot panic here.
         model.usage_stats.total_gas_used = model
@@ -4153,7 +4164,10 @@ impl Executor {
             job.participants.push(from);
         }
 
-        job.gradients_submitted += 1;
+        job.gradients_submitted = job
+            .gradients_submitted
+            .checked_add(1)
+            .ok_or(ExecutionError::Overflow("gradients submitted"))?;
 
         // Check if job complete
         if job.gradients_submitted >= job.gradients_required {
@@ -4161,12 +4175,27 @@ impl Executor {
             job.completed_at = Some(context.timestamp);
 
             // Distribute rewards
-            let reward_per_participant = job.reward_pool / U256::from(job.participants.len());
-            for participant in &job.participants {
-                let balance = self.state_db.accounts.get_balance(participant);
-                self.state_db
-                    .accounts
-                    .set_balance(*participant, balance + reward_per_participant);
+            // `participants` is non-empty: `from` was pushed above if absent.
+            let reward_per_participant = job
+                .reward_pool
+                .checked_div(U256::from(job.participants.len()))
+                .ok_or(ExecutionError::Overflow("reward per participant"))?;
+            // Compute every credit before writing any, so an overflow leaves no
+            // partial distribution behind.
+            let credits = job
+                .participants
+                .iter()
+                .map(|participant| {
+                    self.state_db
+                        .accounts
+                        .get_balance(participant)
+                        .checked_add(reward_per_participant)
+                        .map(|balance| (*participant, balance))
+                        .ok_or(ExecutionError::Overflow("participant reward"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            for (participant, balance) in credits {
+                self.state_db.accounts.set_balance(participant, balance);
             }
         }
 
@@ -5144,5 +5173,144 @@ mod tests {
             1,
             "nonce must advance on the isolated-panic revert (sender paid gas)"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // PANIC-S1 WP-2a: executor decode + money-path conversions.
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn register_model_data(policy: u8, fee: Option<u8>, cid: Option<&[u8]>) -> Vec<u8> {
+        let meta = serde_json::to_vec(&ModelMetadata {
+            name: "m".into(),
+            ..Default::default()
+        })
+        .expect("metadata json");
+        let mut d = vec![0xAB; 32];
+        d.extend_from_slice(&(meta.len() as u32).to_be_bytes());
+        d.extend_from_slice(&meta);
+        d.push(policy);
+        if let Some(f) = fee {
+            let mut word = [0u8; 32];
+            word[31] = f;
+            d.extend_from_slice(&word);
+        }
+        if let Some(c) = cid {
+            d.extend_from_slice(&(c.len() as u32).to_be_bytes());
+            d.extend_from_slice(c);
+        }
+        d
+    }
+
+    #[test]
+    fn panic_s1_register_model_decode_round_trips() {
+        let data = register_model_data(3, Some(7), Some(b"bafyCID"));
+        match Executor::parse_register_model(&data).expect("valid") {
+            TransactionType::RegisterModel {
+                model_hash,
+                metadata,
+                access_policy,
+                artifact_cid,
+            } => {
+                assert_eq!(model_hash, Hash::new([0xAB; 32]));
+                assert_eq!(metadata.name, "m");
+                assert!(
+                    matches!(access_policy, AccessPolicy::PayPerUse { fee } if fee == U256::from(7u8))
+                );
+                assert_eq!(artifact_cid.as_deref(), Some("bafyCID"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// Every truncation of a valid payload decodes or rejects; none panics. A cut
+    /// inside the declared CID is invalid, a cut before its length word means "no CID".
+    #[test]
+    fn panic_s1_register_model_decode_every_truncation() {
+        let data = register_model_data(3, Some(7), Some(b"bafyCID"));
+        let cid_len_at = data.len() - 7 - 4;
+        for cut in 0..=data.len() {
+            let prefix = &data[..cut];
+            let parsed = Executor::parse_register_model(prefix);
+            if cut < cid_len_at {
+                // Only the full header + fee prefix (exactly `cid_len_at` bytes) parses.
+                assert!(parsed.is_err(), "cut {cut}");
+            } else if cut == cid_len_at || cut < cid_len_at + 4 {
+                match parsed.expect("no-cid prefix parses") {
+                    TransactionType::RegisterModel { artifact_cid, .. } => {
+                        assert!(artifact_cid.is_none(), "cut {cut}")
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            } else if cut < data.len() {
+                assert!(parsed.is_err(), "cut {cut} lands inside the CID");
+            } else {
+                assert!(parsed.is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn panic_s1_optional_cid_and_ai_op_args() {
+        let mut off = 0;
+        assert_eq!(parse_optional_cid(&[0, 0, 0], &mut off).unwrap(), None);
+        let mut off = 0;
+        assert_eq!(parse_optional_cid(&[0, 0, 0, 0], &mut off).unwrap(), None);
+        assert_eq!(off, 4);
+        let mut off = 0;
+        assert!(parse_optional_cid(&[0, 0, 0, 5, b'a'], &mut off).is_err());
+        let mut off = 1;
+        assert_eq!(
+            parse_optional_cid(&[9, 0, 0, 0, 2, b'h', b'i'], &mut off).unwrap(),
+            Some("hi".to_string())
+        );
+
+        assert!(ai_op_args(&[1, 2, 3]).is_err());
+        assert_eq!(ai_op_args(&[1, 2, 3, 4]).unwrap(), &[] as &[u8]);
+        assert_eq!(ai_op_args(&[1, 2, 3, 4, 5]).unwrap(), &[5]);
+
+        let mut off = usize::MAX;
+        assert!(
+            take(&[1, 2], &mut off, 1).is_err(),
+            "offset overflow rejects"
+        );
+    }
+
+    #[test]
+    fn panic_s1_gas_fee_and_selector_are_exact() {
+        assert_eq!(
+            gas_fee(u64::MAX, u64::MAX),
+            U256::from(u64::MAX) * U256::from(u64::MAX)
+        );
+        assert_eq!(gas_fee(21_000, 3), U256::from(63_000u64));
+        assert_eq!(
+            selector4(b"transfer(address,uint256)"),
+            [0xa9, 0x05, 0x9c, 0xbb]
+        );
+    }
+
+    /// A sender at nonce u64::MAX cannot advance: the tx is rejected before dispatch
+    /// and nothing (balance, nonce) changes. Pre-PANIC-S1 this panicked after dispatch.
+    #[tokio::test]
+    async fn panic_s1_nonce_at_max_is_rejected_not_panicked() {
+        let state_db = Arc::new(StateDB::new());
+        let executor = Executor::new(state_db.clone());
+        let alice = PublicKey::new([1; 32]);
+        let bob = PublicKey::new([2; 32]);
+        let alice_addr = Address::from_public_key(&alice);
+        let fund = U256::from(1_000_000_000_000_000u128);
+        state_db.accounts.set_balance(alice_addr, fund);
+        state_db.accounts.set_nonce(alice_addr, u64::MAX);
+
+        let tx = create_test_tx(alice, Some(bob), 1000, u64::MAX);
+        let err = executor
+            .execute_transaction(&create_test_block(), &tx)
+            .await
+            .expect_err("nonce overflow must reject");
+        assert!(
+            matches!(err, ExecutionError::Overflow("sender nonce")),
+            "{err}"
+        );
+        assert_eq!(state_db.accounts.get_balance(&alice_addr), fund);
+        assert_eq!(state_db.accounts.get_nonce(&alice_addr), u64::MAX);
     }
 }

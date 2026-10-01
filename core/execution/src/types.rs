@@ -655,4 +655,6 @@ pub enum ExecutionError {
     /// node at or above the activation height.
     #[error("Invalid block body: {0}")]
     InvalidBlockBody(String),
+    #[error("Arithmetic overflow: {0}")]
+    Overflow(&'static str),
 }
