@@ -61,7 +61,6 @@
         clippy::string_slice
     )
 )]
-
 #![warn(missing_docs)]
 
 pub mod aggregator;
@@ -83,8 +82,8 @@ pub use finalizer::{try_finalize_cycle, ChainFinalizer};
 pub use orchestrator::Orchestrator;
 pub use state::{CycleStatus, DaemonState, FinalizeStatus};
 pub use trainer::{
-    weights_record, IpfsClient, MemoryIpfsClient, Q16Weights, RoutingTrainer,
-    StubTrainingBackend, TrainingBackend,
+    weights_record, IpfsClient, MemoryIpfsClient, Q16Weights, RoutingTrainer, StubTrainingBackend,
+    TrainingBackend,
 };
 pub use types::{BlockNumber, CycleId, EmbeddingSubmission};
 pub use watcher::BlockWatcher;

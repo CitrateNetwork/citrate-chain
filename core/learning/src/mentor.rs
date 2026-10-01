@@ -70,9 +70,7 @@ pub struct MentorPairing {
 /// 4. Complementarity = max(1, |shared_domains|) * (mentor.accuracy - mentee.accuracy).
 ///
 /// Returns an empty vec when fewer than 2 participants are provided.
-pub fn select_mentors(
-    profiles: &[(PublicKey, PerformanceProfile)],
-) -> Vec<MentorPairing> {
+pub fn select_mentors(profiles: &[(PublicKey, PerformanceProfile)]) -> Vec<MentorPairing> {
     if profiles.len() < 2 {
         return vec![];
     }
@@ -142,11 +140,10 @@ pub fn select_mentors(
                 *load = load.saturating_add(1);
             }
 
-            let Some(mentor_profile) = potential_mentors
-                .iter()
-                .find(|(k, _)| *k == mentor_key) else {
-                    continue;
-                };
+            let Some(mentor_profile) = potential_mentors.iter().find(|(k, _)| *k == mentor_key)
+            else {
+                continue;
+            };
 
             pairings.push(MentorPairing {
                 mentor: mentor_key,
@@ -235,7 +232,7 @@ pub fn generate_adapter_for_mentee(
             checkpoint_height,
         ),
         round,
-        participant_count: 2, // mentor + mentee
+        participant_count: 2,          // mentor + mentee
         created_at: checkpoint_height, // use checkpoint height as timestamp proxy
     };
 
@@ -359,7 +356,15 @@ mod validate_pairing_tests {
         let (cap, floor, gap) = defaults();
         let same = addr(0xC3);
         let v = validate_pairing(
-            &same, &same, q16_pct(85), q16_pct(40), 0, cap, floor, gap, false,
+            &same,
+            &same,
+            q16_pct(85),
+            q16_pct(40),
+            0,
+            cap,
+            floor,
+            gap,
+            false,
         );
         assert_eq!(v, PairingValidity::SelfMentor);
     }
@@ -726,15 +731,9 @@ mod tests {
         // Mentor 2 shares 1 domain.
         // Mentor 1 should win because 3 * gap > 1 * gap.
         let profiles = vec![
-            (
-                pubkey(1),
-                profile(0.95, &["nlp", "vision", "audio"]),
-            ),
+            (pubkey(1), profile(0.95, &["nlp", "vision", "audio"])),
             (pubkey(2), profile(0.95, &["nlp"])),
-            (
-                pubkey(3),
-                profile(0.50, &["nlp", "vision", "audio"]),
-            ),
+            (pubkey(3), profile(0.50, &["nlp", "vision", "audio"])),
         ];
 
         let pairings = select_mentors(&profiles);
@@ -812,15 +811,9 @@ mod tests {
         let mentor_emb = vec![1.0f32, 0.8, 0.6];
         let mentee_emb = vec![0.2f32, 0.3, 0.1];
 
-        let adapter = generate_adapter_for_mentee(
-            &mentor_emb,
-            &mentee_emb,
-            pubkey(1),
-            100,
-            5,
-            vec![0u8; 64],
-        )
-        .unwrap();
+        let adapter =
+            generate_adapter_for_mentee(&mentor_emb, &mentee_emb, pubkey(1), 100, 5, vec![0u8; 64])
+                .unwrap();
 
         // Delta should be mentor - mentee.
         assert!((adapter.delta.data[0] - 0.8).abs() < 1e-6);
@@ -841,14 +834,8 @@ mod tests {
     /// Adapter generation rejects mismatched dimensions.
     #[test]
     fn test_generate_adapter_for_mentee_dimension_mismatch() {
-        let result = generate_adapter_for_mentee(
-            &[1.0, 2.0],
-            &[1.0],
-            pubkey(1),
-            100,
-            1,
-            vec![0u8; 64],
-        );
+        let result =
+            generate_adapter_for_mentee(&[1.0, 2.0], &[1.0], pubkey(1), 100, 1, vec![0u8; 64]);
         assert!(result.is_err());
     }
 }

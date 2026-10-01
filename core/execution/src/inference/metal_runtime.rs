@@ -3,7 +3,7 @@
 //! Metal GPU runtime for AI inference on Apple Silicon
 //! Supports M1, M2, M3 and future Apple Silicon chips
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,11 +17,11 @@ use super::coreml_bridge::CoreMLInference;
 /// Supported model formats for Metal GPU
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MetalModelFormat {
-    CoreML,           // Apple's native format
-    ONNX,            // With CoreML conversion
-    MLX,             // Apple's new ML framework
-    TensorFlowLite,  // Optimized TF Lite
-    PyTorchMobile,   // PT Mobile with Metal backend
+    CoreML,         // Apple's native format
+    ONNX,           // With CoreML conversion
+    MLX,            // Apple's new ML framework
+    TensorFlowLite, // Optimized TF Lite
+    PyTorchMobile,  // PT Mobile with Metal backend
 }
 
 /// Metal GPU capabilities
@@ -79,10 +79,10 @@ pub struct ModelConfig {
 pub enum QuantizationType {
     Float32,
     Float16,
-    BFloat16,  // M3 and later
+    BFloat16, // M3 and later
     Int8,
-    Int4,      // For LLMs
-    Mixed,     // Mixed precision
+    Int4,  // For LLMs
+    Mixed, // Mixed precision
 }
 
 /// Metal inference runtime
@@ -96,10 +96,10 @@ impl MetalRuntime {
     /// Create new Metal runtime, detecting hardware capabilities
     pub fn new() -> Result<Self> {
         let capabilities = Self::detect_capabilities()?;
-        
+
         // Calculate available memory for models
         let available_memory_gb = capabilities.unified_memory_gb.saturating_sub(4); // Reserve 4GB for system
-        
+
         Ok(Self {
             capabilities,
             loaded_models: HashMap::new(),
@@ -125,7 +125,10 @@ impl MetalRuntime {
     /// Load a model optimized for Metal
     pub async fn load_model(&mut self, model: MetalModel) -> Result<()> {
         // Check if we have enough memory
-        if !self.memory_pool.can_allocate(model.config.memory_required_mb) {
+        if !self
+            .memory_pool
+            .can_allocate(model.config.memory_required_mb)
+        {
             return Err(anyhow!("Insufficient unified memory for model"));
         }
 
@@ -142,21 +145,17 @@ impl MetalRuntime {
             optimized_model.config.memory_required_mb,
         )?;
 
-        self.loaded_models.insert(
-            optimized_model.id.clone(),
-            Arc::new(optimized_model),
-        );
+        self.loaded_models
+            .insert(optimized_model.id.clone(), Arc::new(optimized_model));
 
         Ok(())
     }
 
     /// Run inference on Metal GPU
-    pub async fn infer(
-        &self,
-        model_id: &str,
-        input: &[f32],
-    ) -> Result<Vec<f32>> {
-        let model = self.loaded_models.get(model_id)
+    pub async fn infer(&self, model_id: &str, input: &[f32]) -> Result<Vec<f32>> {
+        let model = self
+            .loaded_models
+            .get(model_id)
             .ok_or_else(|| anyhow!("Model not loaded"))?;
 
         // Route to appropriate backend
@@ -188,7 +187,7 @@ impl MetalRuntime {
         }
 
         model.metal_optimized = true;
-        
+
         // Enable Neural Engine for appropriate models
         if self.should_use_neural_engine(&model) {
             model.uses_neural_engine = true;
@@ -203,17 +202,15 @@ impl MetalRuntime {
         // - Vision models
         // - Small to medium language models
         // - Models with Int8 quantization
-        matches!(model.config.quantization, QuantizationType::Int8 | QuantizationType::Int4)
-            && model.config.memory_required_mb < 2048 // Less than 2GB
+        matches!(
+            model.config.quantization,
+            QuantizationType::Int8 | QuantizationType::Int4
+        ) && model.config.memory_required_mb < 2048 // Less than 2GB
     }
 
     /// CoreML inference - NOW WITH ACTUAL IMPLEMENTATION
     #[cfg(target_os = "macos")]
-    async fn infer_coreml(
-        &self,
-        model: &MetalModel,
-        _input: &[f32],
-    ) -> Result<Vec<f32>> {
+    async fn infer_coreml(&self, model: &MetalModel, _input: &[f32]) -> Result<Vec<f32>> {
         // For CoreML bridge, we need to save weights to a temp file
         // In production, this would use cached files or direct memory mapping
         let temp_dir = std::env::temp_dir();
@@ -225,74 +222,50 @@ impl MetalRuntime {
         }
 
         // Convert input shape to i32 for CoreML
-        let input_shape: Vec<i32> = model.config.input_shape
-            .iter()
-            .map(|&x| x as i32)
-            .collect();
+        let input_shape: Vec<i32> = model.config.input_shape.iter().map(|&x| x as i32).collect();
 
         // Run inference through CoreML
         let start = Instant::now();
-        let output = CoreMLInference::execute(
-            &model_path,
-            _input.to_vec(),
-            input_shape,
-        ).await?;
+        let output = CoreMLInference::execute(&model_path, _input.to_vec(), input_shape).await?;
 
         // Update performance stats
         let inference_time_ms = start.elapsed().as_secs_f64() * 1000.0;
-        tracing::info!("CoreML inference completed in {:.2}ms on {:?}",
-                   inference_time_ms, self.capabilities.chip_type);
+        tracing::info!(
+            "CoreML inference completed in {:.2}ms on {:?}",
+            inference_time_ms,
+            self.capabilities.chip_type
+        );
 
         Ok(output)
     }
 
     /// CoreML inference - Fallback for non-macOS
     #[cfg(not(target_os = "macos"))]
-    async fn infer_coreml(
-        &self,
-        _model: &MetalModel,
-        _input: &[f32],
-    ) -> Result<Vec<f32>> {
+    async fn infer_coreml(&self, _model: &MetalModel, _input: &[f32]) -> Result<Vec<f32>> {
         Err(anyhow!("CoreML is only available on macOS"))
     }
 
     /// MLX inference (Apple's new framework)
-    async fn infer_mlx(
-        &self,
-        model: &MetalModel,
-        _input: &[f32],
-    ) -> Result<Vec<f32>> {
+    async fn infer_mlx(&self, model: &MetalModel, _input: &[f32]) -> Result<Vec<f32>> {
         // MLX is optimized for Apple Silicon
         // Particularly good for LLMs
         Ok(vec![0.0; model.config.output_shape.iter().product()])
     }
 
     /// ONNX with Metal backend
-    async fn infer_onnx_metal(
-        &self,
-        model: &MetalModel,
-        _input: &[f32],
-    ) -> Result<Vec<f32>> {
+    async fn infer_onnx_metal(&self, model: &MetalModel, _input: &[f32]) -> Result<Vec<f32>> {
         // ONNX Runtime with Metal execution provider
         Ok(vec![0.0; model.config.output_shape.iter().product()])
     }
 
     /// TensorFlow Lite inference
-    async fn infer_tflite(
-        &self,
-        model: &MetalModel,
-        _input: &[f32],
-    ) -> Result<Vec<f32>> {
+    async fn infer_tflite(&self, model: &MetalModel, _input: &[f32]) -> Result<Vec<f32>> {
         // TF Lite with Metal delegate
         Ok(vec![0.0; model.config.output_shape.iter().product()])
     }
 
     /// PyTorch Mobile inference
-    async fn infer_pytorch_mobile(
-        &self,
-        model: &MetalModel,
-        _input: &[f32],
-    ) -> Result<Vec<f32>> {
+    async fn infer_pytorch_mobile(&self, model: &MetalModel, _input: &[f32]) -> Result<Vec<f32>> {
         // PyTorch Mobile with Metal backend
         Ok(vec![0.0; model.config.output_shape.iter().product()])
     }
@@ -338,7 +311,9 @@ impl UnifiedMemoryPool {
 
     fn used_mb(&self) -> u32 {
         // Saturating: an iterator `sum()` overflow panics under overflow-checks.
-        self.allocations.values().fold(0, |acc: u32, &v| acc.saturating_add(v))
+        self.allocations
+            .values()
+            .fold(0, |acc: u32, &v| acc.saturating_add(v))
     }
 
     fn available_mb(&self) -> u32 {
@@ -427,11 +402,11 @@ mod tests {
     fn test_memory_pool() {
         let mut pool = UnifiedMemoryPool::new(1000);
         assert!(pool.can_allocate(500));
-        
+
         pool.allocate("model1", 500).unwrap();
         assert_eq!(pool.used_mb(), 500);
         assert_eq!(pool.available_mb(), 500);
-        
+
         assert!(!pool.can_allocate(600));
     }
 
@@ -439,9 +414,10 @@ mod tests {
     fn test_recommended_models() {
         let models = recommended_models_for_metal();
         assert!(!models.is_empty());
-        
+
         // Check that we have CoreML models
-        let coreml_models: Vec<_> = models.iter()
+        let coreml_models: Vec<_> = models
+            .iter()
             .filter(|m| matches!(m.format, MetalModelFormat::CoreML))
             .collect();
         assert!(!coreml_models.is_empty());

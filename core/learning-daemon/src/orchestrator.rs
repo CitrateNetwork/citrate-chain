@@ -120,7 +120,8 @@ impl<C: ChainAdapter + 'static> Orchestrator<C> {
                 // aggregator's idempotency guard on the next
                 // pass — the orchestrator does NOT touch them
                 // here to avoid losing partial work.
-                self.state.rollback_last_processed_block(fork_at.saturating_sub(1))?;
+                self.state
+                    .rollback_last_processed_block(fork_at.saturating_sub(1))?;
                 Ok(())
             }
         }
@@ -153,7 +154,8 @@ impl<C: ChainAdapter + 'static> Orchestrator<C> {
                 let local = self.state.cycle_status(cycle_id);
                 if local == CycleStatus::Computed {
                     // Promote local view to Committed.
-                    self.state.set_cycle_status(cycle_id, CycleStatus::Committed)?;
+                    self.state
+                        .set_cycle_status(cycle_id, CycleStatus::Committed)?;
                 } else if local == CycleStatus::Pending {
                     // Another daemon committed for this cycle;
                     // skip our own aggregation pass and just track
@@ -227,10 +229,7 @@ impl<C: ChainAdapter + 'static> Orchestrator<C> {
         // its own contract. This wrapper adds no extra side effects.
         match previous {
             Some(prev) => {
-                tokio::join!(
-                    self.aggregator.aggregate(current),
-                    self.trainer.train(prev),
-                )
+                tokio::join!(self.aggregator.aggregate(current), self.trainer.train(prev),)
             }
             None => {
                 // Bootstrap case: no previous cycle to train on yet.
@@ -361,8 +360,7 @@ mod tests {
     fn make_orchestrator() -> (Orchestrator<FakeChain>, Arc<FakeChain>, TempDir) {
         let chain = Arc::new(FakeChain::new());
         let dir = TempDir::new().expect("tempdir");
-        let state =
-            Arc::new(DaemonState::open(dir.path()).expect("state open"));
+        let state = Arc::new(DaemonState::open(dir.path()).expect("state open"));
         let orch = Orchestrator::new(
             chain.clone(),
             state,
@@ -379,9 +377,8 @@ mod tests {
         let (tx, rx) = tokio::sync::watch::channel(false);
         // Fire shutdown after a short delay; run_loop must observe it
         // and return Ok(()) without panicking.
-        let handle = tokio::spawn(async move {
-            orch.run_loop(Duration::from_millis(20), rx).await
-        });
+        let handle =
+            tokio::spawn(async move { orch.run_loop(Duration::from_millis(20), rx).await });
         tokio::time::sleep(Duration::from_millis(40)).await;
         tx.send(true).expect("send shutdown");
         // run_loop returns Ok(()) on clean shutdown; the triple-expect
@@ -440,8 +437,7 @@ mod tests {
         // them so total wall-clock is closer to 1*delay.
         let chain = Arc::new(FakeChain::new());
         let dir = TempDir::new().expect("tempdir");
-        let state =
-            Arc::new(DaemonState::open(dir.path()).expect("state open"));
+        let state = Arc::new(DaemonState::open(dir.path()).expect("state open"));
         let agg_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let train_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let delay = Duration::from_millis(50);
@@ -453,13 +449,7 @@ mod tests {
             delay,
             seen: train_seen.clone(),
         });
-        let orch = Orchestrator::new(
-            chain,
-            state,
-            agg,
-            train,
-            Arc::new(StubFinalizer),
-        );
+        let orch = Orchestrator::new(chain, state, agg, train, Arc::new(StubFinalizer));
 
         let start = std::time::Instant::now();
         let (a, t) = orch.aggregate_and_train_pipeline(2, Some(1)).await;
@@ -476,10 +466,34 @@ mod tests {
             "pipeline ran sequentially? elapsed={elapsed:?} \
              (delay={delay:?}, sequential bound = 2*delay)"
         );
-        assert_eq!(agg_seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(), 1);
-        assert_eq!(train_seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(), 1);
-        assert_eq!(agg_seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[0].0, 2);
-        assert_eq!(train_seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[0].0, 1);
+        assert_eq!(
+            agg_seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
+        assert_eq!(
+            train_seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
+        assert_eq!(
+            agg_seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)[0]
+                .0,
+            2
+        );
+        assert_eq!(
+            train_seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)[0]
+                .0,
+            1
+        );
     }
 
     #[tokio::test]
@@ -488,8 +502,7 @@ mod tests {
         // training is a no-op.
         let chain = Arc::new(FakeChain::new());
         let dir = TempDir::new().expect("tempdir");
-        let state =
-            Arc::new(DaemonState::open(dir.path()).expect("state open"));
+        let state = Arc::new(DaemonState::open(dir.path()).expect("state open"));
         let train_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let train = Arc::new(DelayTrainer {
             delay: Duration::from_millis(0),
@@ -506,7 +519,13 @@ mod tests {
         a.expect("aggregate ok");
         t.expect("train ok");
         // Trainer was NOT invoked.
-        assert_eq!(train_seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(), 0);
+        assert_eq!(
+            train_seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -515,9 +534,8 @@ mod tests {
         // loop treats that as a shutdown signal and exits cleanly.
         let (orch, _chain, _dir) = make_orchestrator();
         let (tx, rx) = tokio::sync::watch::channel(false);
-        let handle = tokio::spawn(async move {
-            orch.run_loop(Duration::from_millis(20), rx).await
-        });
+        let handle =
+            tokio::spawn(async move { orch.run_loop(Duration::from_millis(20), rx).await });
         tokio::time::sleep(Duration::from_millis(40)).await;
         drop(tx);
         tokio::time::timeout(Duration::from_secs(1), handle)

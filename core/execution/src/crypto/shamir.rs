@@ -3,7 +3,7 @@
 //! Shamir's Secret Sharing implementation
 //! Provides secure threshold secret sharing using finite field arithmetic
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
@@ -31,7 +31,9 @@ impl FieldElement {
 
     /// One element
     pub fn one() -> Self {
-        Self { limbs: [1, 0, 0, 0] }
+        Self {
+            limbs: [1, 0, 0, 0],
+        }
     }
 
     /// Create from bytes (little-endian)
@@ -58,7 +60,8 @@ impl FieldElement {
     pub fn from_u64(val: u64) -> Self {
         Self {
             limbs: [val, 0, 0, 0],
-        }.reduce()
+        }
+        .reduce()
     }
 
     /// Reduce modulo field prime
@@ -96,9 +99,15 @@ impl FieldElement {
         let mut result = [0u64; 4];
         let mut carry = 0u64;
 
-        for ((r, &a), &b) in result.iter_mut().zip(self.limbs.iter()).zip(other.limbs.iter()) {
+        for ((r, &a), &b) in result
+            .iter_mut()
+            .zip(self.limbs.iter())
+            .zip(other.limbs.iter())
+        {
             // Three u64 values cannot overflow u128.
-            let sum = (a as u128).saturating_add(b as u128).saturating_add(carry as u128);
+            let sum = (a as u128)
+                .saturating_add(b as u128)
+                .saturating_add(carry as u128);
             *r = sum as u64;
             carry = (sum >> 64) as u64;
         }
@@ -111,7 +120,11 @@ impl FieldElement {
         let mut result = [0u64; 4];
         let mut borrow = 0u64;
 
-        for ((r, &a), &b) in result.iter_mut().zip(self.limbs.iter()).zip(other.limbs.iter()) {
+        for ((r, &a), &b) in result
+            .iter_mut()
+            .zip(self.limbs.iter())
+            .zip(other.limbs.iter())
+        {
             let (diff, new_borrow) = a.overflowing_sub(b);
             let (final_diff, extra_borrow) = diff.overflowing_sub(borrow);
             *r = final_diff;

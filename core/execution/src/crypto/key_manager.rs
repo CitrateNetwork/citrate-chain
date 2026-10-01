@@ -3,14 +3,14 @@
 // Hierarchical Deterministic (HD) Key Management System
 // Manages encryption keys for models with support for key derivation and rotation
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
+use hmac::{Hmac, Mac};
+use parking_lot::RwLock;
+use primitive_types::{H160, H256};
 use serde::{Deserialize, Serialize};
-use sha3::{Sha3_256, Sha3_512, Digest};
-use primitive_types::{H256, H160};
+use sha3::{Digest, Sha3_256, Sha3_512};
 use std::collections::HashMap;
 use std::sync::Arc;
-use parking_lot::RwLock;
-use hmac::{Hmac, Mac};
 
 type HmacSha512 = Hmac<Sha3_512>;
 
@@ -175,14 +175,12 @@ impl KeyManager {
     }
 
     /// Derive key for a specific path
-    pub fn derive_key(
-        &self,
-        path: &str,
-        purpose: KeyPurpose,
-    ) -> Result<DerivedKey> {
-        let master_key = self.master_key
+    pub fn derive_key(&self, path: &str, purpose: KeyPurpose) -> Result<DerivedKey> {
+        let master_key = self
+            .master_key
             .ok_or_else(|| anyhow!("Master key not initialized"))?;
-        let chain_code = self.chain_code
+        let chain_code = self
+            .chain_code
             .ok_or_else(|| anyhow!("Chain code not initialized"))?;
 
         // Parse path (e.g., "m/44'/60'/0'/0/0")
@@ -197,7 +195,8 @@ impl KeyManager {
         // Derive for each path component
         for component in components.iter().skip(1) {
             let (index, _hardened) = if let Some(idx_str) = component.strip_suffix('\'') {
-                let idx = idx_str.parse::<u32>()
+                let idx = idx_str
+                    .parse::<u32>()
                     .map_err(|_| anyhow!("Invalid path component"))?;
                 // Check for overflow before adding
                 if idx > 0x7FFFFFFF {
@@ -205,17 +204,15 @@ impl KeyManager {
                 }
                 (idx | 0x8000_0000, true) // Hardened derivation (idx <= 0x7FFF_FFFF)
             } else {
-                let idx = component.parse::<u32>()
+                let idx = component
+                    .parse::<u32>()
                     .map_err(|_| anyhow!("Invalid path component"))?;
                 (idx, false)
             };
 
             // Perform child key derivation
-            let (child_key, child_chain) = self.derive_child_key(
-                &current_key,
-                &current_chain,
-                index,
-            )?;
+            let (child_key, child_chain) =
+                self.derive_child_key(&current_key, &current_chain, index)?;
 
             current_key = child_key;
             current_chain = child_chain;
@@ -244,7 +241,9 @@ impl KeyManager {
         };
 
         // Cache the derived key
-        self.derived_keys.write().insert(key_id, derived_key.clone());
+        self.derived_keys
+            .write()
+            .insert(key_id, derived_key.clone());
 
         Ok(derived_key)
     }
@@ -331,18 +330,15 @@ impl KeyManager {
             encrypted_shares,
         };
 
-        self.threshold_keys.write().insert(model_id, threshold_key.clone());
+        self.threshold_keys
+            .write()
+            .insert(model_id, threshold_key.clone());
 
         Ok(threshold_key)
     }
 
     /// Split secret using Shamir's Secret Sharing (simplified)
-    fn split_secret(
-        &self,
-        secret: &[u8; 32],
-        threshold: u32,
-        total: u32,
-    ) -> Result<Vec<Vec<u8>>> {
+    fn split_secret(&self, secret: &[u8; 32], threshold: u32, total: u32) -> Result<Vec<Vec<u8>>> {
         // Simplified implementation
         // In production, use proper Shamir's Secret Sharing
 
@@ -426,11 +422,7 @@ impl KeyManager {
     }
 
     /// Set access policy for a model
-    pub fn set_access_policy(
-        &self,
-        model_id: H256,
-        policy: AccessPolicy,
-    ) -> Result<()> {
+    pub fn set_access_policy(&self, model_id: H256, policy: AccessPolicy) -> Result<()> {
         self.access_policies.write().insert(model_id, policy);
         Ok(())
     }
@@ -443,7 +435,8 @@ impl KeyManager {
         access_type: AccessType,
     ) -> Result<bool> {
         let policies = self.access_policies.read();
-        let policy = policies.get(&model_id)
+        let policy = policies
+            .get(&model_id)
             .ok_or_else(|| anyhow!("No policy found for model"))?;
 
         // Owner always has access
@@ -533,8 +526,12 @@ mod tests {
         let seed = [0u8; 64];
         let manager = KeyManager::from_seed(&seed).unwrap();
 
-        let key1 = manager.derive_key("m/44'/60'/0'/0/0", KeyPurpose::ModelEncryption).unwrap();
-        let key2 = manager.derive_key("m/44'/60'/0'/0/1", KeyPurpose::ModelEncryption).unwrap();
+        let key1 = manager
+            .derive_key("m/44'/60'/0'/0/0", KeyPurpose::ModelEncryption)
+            .unwrap();
+        let key2 = manager
+            .derive_key("m/44'/60'/0'/0/1", KeyPurpose::ModelEncryption)
+            .unwrap();
 
         assert_ne!(key1.key, key2.key);
         assert_ne!(key1.key_id, key2.key_id);
@@ -548,11 +545,13 @@ mod tests {
         let model_id = H256::random();
         let holders = vec![H160::random(), H160::random(), H160::random()];
 
-        let threshold_key = manager.create_threshold_key(
-            model_id,
-            2, // 2 of 3
-            holders.clone(),
-        ).unwrap();
+        let threshold_key = manager
+            .create_threshold_key(
+                model_id,
+                2, // 2 of 3
+                holders.clone(),
+            )
+            .unwrap();
 
         assert_eq!(threshold_key.threshold, 2);
         assert_eq!(threshold_key.total_shares, 3);
@@ -578,10 +577,16 @@ mod tests {
         manager.set_access_policy(model_id, policy).unwrap();
 
         // Owner should have full access
-        assert!(manager.check_access(model_id, owner, AccessType::Full).unwrap());
+        assert!(manager
+            .check_access(model_id, owner, AccessType::Full)
+            .unwrap());
 
         // User should have inference access only
-        assert!(manager.check_access(model_id, user, AccessType::Inference).unwrap());
-        assert!(!manager.check_access(model_id, user, AccessType::Full).unwrap());
+        assert!(manager
+            .check_access(model_id, user, AccessType::Inference)
+            .unwrap());
+        assert!(!manager
+            .check_access(model_id, user, AccessType::Full)
+            .unwrap());
     }
 }

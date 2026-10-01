@@ -307,7 +307,10 @@ mod tests {
             journal.record_write(addr(2), balance_write(100));
         });
 
-        assert_eq!(result.retries, 1, "exactly one retry (first attempt aborts, second commits)");
+        assert_eq!(
+            result.retries, 1,
+            "exactly one retry (first attempt aborts, second commits)"
+        );
         assert!(!result.fallback_used);
         assert_eq!(h.metrics().retries(), 1);
         assert_eq!(h.metrics().commits(), 1);
@@ -358,7 +361,10 @@ mod tests {
             let r = h.execute(|journal, _pin| {
                 journal.record_write(addr(i), balance_write(i as u64));
             });
-            assert!(!r.fallback_used, "sequential non-conflicting should never fall back");
+            assert!(
+                !r.fallback_used,
+                "sequential non-conflicting should never fall back"
+            );
             assert_eq!(r.retries, 0);
         }
         assert_eq!(h.current_version(), ReadVersion::from_raw(10));

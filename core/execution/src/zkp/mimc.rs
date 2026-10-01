@@ -163,7 +163,11 @@ mod tests {
     #[test]
     fn test_mimc_hash_empty() {
         let h = mimc_hash(&[]);
-        assert_eq!(h, Fr::from(0u64), "Hash of empty input should be zero state");
+        assert_eq!(
+            h,
+            Fr::from(0u64),
+            "Hash of empty input should be zero state"
+        );
     }
 
     #[test]
@@ -191,7 +195,10 @@ mod tests {
         let circuit_hash = mimc_hash_circuit(cs.clone(), &data_vars).unwrap();
         let circuit_val = circuit_hash.value().unwrap();
 
-        assert_eq!(native_hash, circuit_val, "Circuit hash must match native hash");
+        assert_eq!(
+            native_hash, circuit_val,
+            "Circuit hash must match native hash"
+        );
         assert!(cs.is_satisfied().unwrap(), "Constraints must be satisfied");
     }
 
@@ -223,7 +230,11 @@ mod tests {
     fn test_mimc_hash_order_matters() {
         let a = vec![Fr::from(1u64), Fr::from(2u64)];
         let b = vec![Fr::from(2u64), Fr::from(1u64)];
-        assert_ne!(mimc_hash(&a), mimc_hash(&b), "[1,2] and [2,1] must hash differently");
+        assert_ne!(
+            mimc_hash(&a),
+            mimc_hash(&b),
+            "[1,2] and [2,1] must hash differently"
+        );
     }
 
     #[test]

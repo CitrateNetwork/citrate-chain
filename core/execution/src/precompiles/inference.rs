@@ -4,10 +4,10 @@
 // Addresses 0x0100 - 0x0106 are reserved for AI operations. The legacy 0x0104
 // commitment route is retained as an address tombstone and always rejects.
 
+use crate::types::Address;
 use anyhow::{anyhow, Result};
 use ethereum_types::{H160, H256, U256};
 use sha3::Digest;
-use crate::types::Address;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::runtime::Handle;
@@ -17,8 +17,7 @@ use crate::inference::metal_runtime::{MetalModel, MetalModelFormat, MetalRuntime
 /// Precompile addresses for AI operations
 pub mod addresses {
     /// 0x0100: Model deployment and registration
-    pub const MODEL_DEPLOY: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0];
+    pub const MODEL_DEPLOY: [u8; 20] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0];
 
     /// 0x0101: Model inference execution
     pub const MODEL_INFERENCE: [u8; 20] =
@@ -33,8 +32,7 @@ pub mod addresses {
         [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3];
 
     /// 0x0104: Retired legacy proof-verification address (always rejects)
-    pub const PROOF_VERIFY: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 4];
+    pub const PROOF_VERIFY: [u8; 20] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 4];
 
     /// 0x0105: Model performance benchmarking
     pub const MODEL_BENCHMARK: [u8; 20] =
@@ -206,7 +204,8 @@ impl InferencePrecompile {
         owner: Address,
         policy: crate::types::AccessPolicy,
     ) {
-        self.model_access.insert(model_id, ModelAccessEntry { owner, policy });
+        self.model_access
+            .insert(model_id, ModelAccessEntry { owner, policy });
     }
 
     /// Check if a caller is authorized to access a model
@@ -220,9 +219,7 @@ impl InferencePrecompile {
                 match &entry.policy {
                     crate::types::AccessPolicy::Public => true,
                     crate::types::AccessPolicy::Private => false,
-                    crate::types::AccessPolicy::Restricted(allowlist) => {
-                        allowlist.contains(caller)
-                    }
+                    crate::types::AccessPolicy::Restricted(allowlist) => allowlist.contains(caller),
                     crate::types::AccessPolicy::PayPerUse { .. } => true, // Fee check is separate
                 }
             }
@@ -317,8 +314,13 @@ impl InferencePrecompile {
         // checked addition. Pre-fix `as u64` truncated, letting
         // a forged size pass the equality check while overflowing
         // arithmetic on the weights_start computation below.
-        let model_size_u256 = U256::from_big_endian(input.get(0..32).ok_or_else(|| anyhow!("input too short"))?);
-        let metadata_size_u256 = U256::from_big_endian(input.get(32..64).ok_or_else(|| anyhow!("input too short"))?);
+        let model_size_u256 =
+            U256::from_big_endian(input.get(0..32).ok_or_else(|| anyhow!("input too short"))?);
+        let metadata_size_u256 = U256::from_big_endian(
+            input
+                .get(32..64)
+                .ok_or_else(|| anyhow!("input too short"))?,
+        );
         let model_size: usize = model_size_u256
             .try_into()
             .map_err(|_| anyhow!("M-02: model_size exceeds usize"))?;
@@ -378,10 +380,13 @@ impl InferencePrecompile {
     fn run_inference(&self, input: &[u8], gas_limit: u64) -> Result<PrecompileOutput> {
         // Parse input: model_id (32 bytes) || caller (20 bytes) || input_data
         if input.len() < 52 {
-            return Err(anyhow!("Invalid input for inference: need model_id (32) + caller (20) + data"));
+            return Err(anyhow!(
+                "Invalid input for inference: need model_id (32) + caller (20) + data"
+            ));
         }
 
-        let model_id = H256::from_slice(input.get(0..32).ok_or_else(|| anyhow!("input too short"))?);
+        let model_id =
+            H256::from_slice(input.get(0..32).ok_or_else(|| anyhow!("input too short"))?);
         let (caller_bytes, input_data) = input
             .get(32..)
             .and_then(|rest| rest.split_first_chunk::<20>())
@@ -390,18 +395,22 @@ impl InferencePrecompile {
 
         // Enforce access control
         if !self.check_access(&model_id, &caller) {
-            return Err(anyhow!("Access denied: caller {} not authorized for model {}",
-                hex::encode(caller.0), hex::encode(model_id)));
+            return Err(anyhow!(
+                "Access denied: caller {} not authorized for model {}",
+                hex::encode(caller.0),
+                hex::encode(model_id)
+            ));
         }
 
         // Get model from cache
-        let model = self.model_cache
+        let model = self
+            .model_cache
             .get(&model_id)
             .ok_or_else(|| anyhow!("Model not found"))?;
 
         // Calculate gas cost
         let input_elements = input_data.len() / 4; // Assuming f32 inputs
-        // Saturating product: iterator `product()` overflow panics under overflow-checks.
+                                                   // Saturating product: iterator `product()` overflow panics under overflow-checks.
         let output_elements = model
             .config
             .output_shape
@@ -410,7 +419,9 @@ impl InferencePrecompile {
 
         let gas_cost = (input_elements as u64)
             .saturating_mul(gas_costs::INFERENCE_PER_INPUT)
-            .saturating_add((output_elements as u64).saturating_mul(gas_costs::INFERENCE_PER_OUTPUT))
+            .saturating_add(
+                (output_elements as u64).saturating_mul(gas_costs::INFERENCE_PER_OUTPUT),
+            )
             .saturating_add(gas_costs::INFERENCE_BASE);
 
         if gas_cost > gas_limit {
@@ -429,9 +440,8 @@ impl InferencePrecompile {
         let model_id_str = model.id.clone();
         let handle = Handle::current();
 
-        let output = handle.block_on(async move {
-            runtime.infer(&model_id_str, &input_floats).await
-        })?;
+        let output =
+            handle.block_on(async move { runtime.infer(&model_id_str, &input_floats).await })?;
 
         // Convert output to bytes
         let mut output_bytes = Vec::with_capacity(output.len().saturating_mul(4));
@@ -442,7 +452,10 @@ impl InferencePrecompile {
         Ok(PrecompileOutput {
             output: output_bytes,
             gas_used: gas_cost,
-            logs: vec![format!("Inference completed for model {}", hex::encode(model_id))],
+            logs: vec![format!(
+                "Inference completed for model {}",
+                hex::encode(model_id)
+            )],
         })
     }
 
@@ -453,18 +466,24 @@ impl InferencePrecompile {
             return Err(anyhow!("Invalid input for batch inference"));
         }
 
-        let model_id = H256::from_slice(input.get(0..32).ok_or_else(|| anyhow!("input too short"))?);
+        let model_id =
+            H256::from_slice(input.get(0..32).ok_or_else(|| anyhow!("input too short"))?);
         // `as_u32()` panicked on a batch size above u32; an empty batch has no items.
-        let batch_size: u32 = U256::from_big_endian(input.get(32..64).ok_or_else(|| anyhow!("input too short"))?)
-            .try_into()
-            .map_err(|_| anyhow!("batch size exceeds u32"))?;
+        let batch_size: u32 = U256::from_big_endian(
+            input
+                .get(32..64)
+                .ok_or_else(|| anyhow!("input too short"))?,
+        )
+        .try_into()
+        .map_err(|_| anyhow!("batch size exceeds u32"))?;
         if batch_size == 0 {
             return Err(anyhow!("Empty batch"));
         }
         let batch_data = input.get(64..).unwrap_or_default();
 
         // Get model
-        let model = self.model_cache
+        let model = self
+            .model_cache
             .get(&model_id)
             .ok_or_else(|| anyhow!("Model not found"))?;
 
@@ -481,7 +500,10 @@ impl InferencePrecompile {
 
         // Process batch
         // batch_size >= 1 (checked above), so every item range is within batch_data.
-        let item_size = batch_data.len().checked_div(batch_size as usize).unwrap_or(0);
+        let item_size = batch_data
+            .len()
+            .checked_div(batch_size as usize)
+            .unwrap_or(0);
         let mut all_outputs = Vec::new();
 
         for i in 0..batch_size as usize {
@@ -500,9 +522,8 @@ impl InferencePrecompile {
             let model_id_str = model.id.clone();
             let handle = Handle::current();
 
-            let output = handle.block_on(async move {
-                runtime.infer(&model_id_str, &input_floats).await
-            })?;
+            let output = handle
+                .block_on(async move { runtime.infer(&model_id_str, &input_floats).await })?;
 
             // Collect output
             for value in output {
@@ -529,7 +550,8 @@ impl InferencePrecompile {
         }
 
         let model_id = H256::from_slice(input);
-        let model = self.model_cache
+        let model = self
+            .model_cache
             .get(&model_id)
             .ok_or_else(|| anyhow!("Model not found"))?;
 
@@ -569,7 +591,8 @@ impl InferencePrecompile {
         }
 
         let model_id = H256::from_slice(input);
-        let model = self.model_cache
+        let model = self
+            .model_cache
             .get(&model_id)
             .ok_or_else(|| anyhow!("Model not found"))?;
 
@@ -616,7 +639,7 @@ impl InferencePrecompile {
         let gas_cost = gas_costs::BASE_COST.saturating_add(match operation {
             0 => gas_costs::MODEL_DEPLOY_PER_KB.saturating_mul(input.len() as u64 / 1024), // Encrypt
             1 => gas_costs::INFERENCE_PER_INPUT.saturating_mul(2), // Decrypt
-            2 | 3 => gas_costs::BASE_COST, // Grant/revoke access
+            2 | 3 => gas_costs::BASE_COST,                         // Grant/revoke access
             _ => return Err(anyhow!("Invalid encryption operation")),
         });
 
@@ -631,8 +654,11 @@ impl InferencePrecompile {
                 Ok(PrecompileOutput {
                     output: model_id.as_bytes().to_vec(),
                     gas_used: gas_cost,
-                    logs: vec![format!("Model {} encrypted for {}",
-                        hex::encode(model_id), hex::encode(address))],
+                    logs: vec![format!(
+                        "Model {} encrypted for {}",
+                        hex::encode(model_id),
+                        hex::encode(address)
+                    )],
                 })
             }
             1 => {
@@ -645,8 +671,11 @@ impl InferencePrecompile {
                 Ok(PrecompileOutput {
                     output: vec![1], // Success indicator
                     gas_used: gas_cost,
-                    logs: vec![format!("Model {} decrypted for {}",
-                        hex::encode(model_id), hex::encode(address))],
+                    logs: vec![format!(
+                        "Model {} decrypted for {}",
+                        hex::encode(model_id),
+                        hex::encode(address)
+                    )],
                 })
             }
             2 => {
@@ -654,13 +683,20 @@ impl InferencePrecompile {
                 if input.len() < 73 {
                     return Err(anyhow!("Missing new user address"));
                 }
-                let new_user = H160::from_slice(input.get(53..73).ok_or_else(|| anyhow!("Missing new user address"))?);
+                let new_user = H160::from_slice(
+                    input
+                        .get(53..73)
+                        .ok_or_else(|| anyhow!("Missing new user address"))?,
+                );
 
                 Ok(PrecompileOutput {
                     output: vec![1], // Success
                     gas_used: gas_cost,
-                    logs: vec![format!("Access granted to {} for model {}",
-                        hex::encode(new_user), hex::encode(model_id))],
+                    logs: vec![format!(
+                        "Access granted to {} for model {}",
+                        hex::encode(new_user),
+                        hex::encode(model_id)
+                    )],
                 })
             }
             3 => {
@@ -668,13 +704,20 @@ impl InferencePrecompile {
                 if input.len() < 73 {
                     return Err(anyhow!("Missing user address to revoke"));
                 }
-                let revoked_user = H160::from_slice(input.get(53..73).ok_or_else(|| anyhow!("Missing user address to revoke"))?);
+                let revoked_user = H160::from_slice(
+                    input
+                        .get(53..73)
+                        .ok_or_else(|| anyhow!("Missing user address to revoke"))?,
+                );
 
                 Ok(PrecompileOutput {
                     output: vec![1], // Success
                     gas_used: gas_cost,
-                    logs: vec![format!("Access revoked from {} for model {}",
-                        hex::encode(revoked_user), hex::encode(model_id))],
+                    logs: vec![format!(
+                        "Access revoked from {} for model {}",
+                        hex::encode(revoked_user),
+                        hex::encode(model_id)
+                    )],
                 })
             }
             _ => Err(anyhow!("Invalid encryption operation")),
@@ -754,8 +797,8 @@ mod tests {
 
         let mut proof = Vec::with_capacity(64 + statement.len());
         proof.extend_from_slice(&commitment); // 32 bytes
-        proof.extend_from_slice(response);     // 32 bytes
-        proof.extend_from_slice(statement);    // variable
+        proof.extend_from_slice(response); // 32 bytes
+        proof.extend_from_slice(statement); // variable
         proof
     }
 
@@ -812,11 +855,7 @@ mod tests {
         let owner = Address([0xAA; 20]);
         let random_caller = Address([0xBB; 20]);
 
-        precompile.register_model_access(
-            model_id,
-            owner,
-            crate::types::AccessPolicy::Public,
-        );
+        precompile.register_model_access(model_id, owner, crate::types::AccessPolicy::Public);
 
         // Public model: anyone can access
         assert!(precompile.check_access(&model_id, &random_caller));
@@ -832,11 +871,7 @@ mod tests {
         let owner = Address([0xAA; 20]);
         let random_caller = Address([0xBB; 20]);
 
-        precompile.register_model_access(
-            model_id,
-            owner,
-            crate::types::AccessPolicy::Private,
-        );
+        precompile.register_model_access(model_id, owner, crate::types::AccessPolicy::Private);
 
         // Private model: only owner can access
         assert!(precompile.check_access(&model_id, &owner));
@@ -883,11 +918,17 @@ mod tests {
 
         // Must NOT be the old synthetic values
         assert_ne!(latency, 5.2, "latency_ms must not be synthetic 5.2");
-        assert_ne!(throughput, 192.0, "throughput_rps must not be synthetic 192");
+        assert_ne!(
+            throughput, 192.0,
+            "throughput_rps must not be synthetic 192"
+        );
         assert_eq!(latency, 0.0);
         assert_eq!(throughput, 0.0);
 
         // Must have the honesty note
-        assert!(benchmark_json["_note"].as_str().unwrap().contains("no benchmark has been executed"));
+        assert!(benchmark_json["_note"]
+            .as_str()
+            .unwrap()
+            .contains("no benchmark has been executed"));
     }
 }

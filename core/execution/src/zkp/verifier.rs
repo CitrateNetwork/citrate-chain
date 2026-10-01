@@ -128,9 +128,7 @@ impl Verifier {
         };
 
         // Verify hashes match — public inputs are decimal u128 strings (first 16 bytes)
-        let to_field_str = |hash: &[u8]| -> String {
-            super::be_u128_prefix(hash).to_string()
-        };
+        let to_field_str = |hash: &[u8]| -> String { super::be_u128_prefix(hash).to_string() };
 
         if to_field_str(expected_model_hash) != *model_hash_str
             || to_field_str(expected_input_hash) != *input_hash_str
@@ -166,9 +164,7 @@ impl Verifier {
         };
 
         // Verify hashes match — public inputs are decimal u128 strings (first 16 bytes)
-        let to_field_str = |hash: &[u8]| -> String {
-            super::be_u128_prefix(hash).to_string()
-        };
+        let to_field_str = |hash: &[u8]| -> String { super::be_u128_prefix(hash).to_string() };
 
         if to_field_str(expected_model_hash) != *model_hash_str
             || to_field_str(expected_dataset_hash) != *dataset_hash_str
@@ -215,8 +211,7 @@ impl Verifier {
                 field_elements.push(value);
             } else {
                 // Try to parse as number (u128 to support 128-bit hash truncations)
-                let num: u128 = input.parse()
-                    .map_err(|_| ZKPError::InvalidPublicInputs)?;
+                let num: u128 = input.parse().map_err(|_| ZKPError::InvalidPublicInputs)?;
                 field_elements.push(Fr::from(num));
             }
         }

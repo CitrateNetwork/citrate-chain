@@ -425,7 +425,8 @@ mod tests {
         let _ = execute_at(&input, u64::MAX, true);
         let start = std::time::Instant::now();
         for _ in 0..8 {
-            let err = execute_at(&input, u64::MAX, true).expect_err("garbage proof must be rejected");
+            let err =
+                execute_at(&input, u64::MAX, true).expect_err("garbage proof must be rejected");
             assert!(err.to_string().contains("FOLD_COMMD_VERIFY"), "{err}");
         }
         let elapsed = start.elapsed();

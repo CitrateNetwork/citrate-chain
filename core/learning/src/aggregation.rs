@@ -19,10 +19,7 @@ use serde::{Deserialize, Serialize};
 /// Trait for embedding aggregation strategies.
 pub trait Aggregator: Send + Sync {
     /// Aggregate a set of weighted embeddings into a single result.
-    fn aggregate(
-        &self,
-        embeddings: &[(EmbeddingVector, f32)],
-    ) -> LearningResult<EmbeddingVector>;
+    fn aggregate(&self, embeddings: &[(EmbeddingVector, f32)]) -> LearningResult<EmbeddingVector>;
 }
 
 /// Weighted mean aggregation (Algorithm 1 from Paper II).
@@ -39,10 +36,7 @@ impl WeightedMeanAggregator {
 }
 
 impl Aggregator for WeightedMeanAggregator {
-    fn aggregate(
-        &self,
-        embeddings: &[(EmbeddingVector, f32)],
-    ) -> LearningResult<EmbeddingVector> {
+    fn aggregate(&self, embeddings: &[(EmbeddingVector, f32)]) -> LearningResult<EmbeddingVector> {
         if embeddings.is_empty() {
             return Ok(EmbeddingVector::zeros(self.expected_dim));
         }
@@ -328,9 +322,7 @@ mod tests {
         let e1 = EmbeddingVector::new(vec![1.0, 0.0]).unwrap();
         let e2 = EmbeddingVector::new(vec![0.0, 1.0]).unwrap();
 
-        let result = aggregator
-            .aggregate(&[(e1, 1.0), (e2, 1.0)])
-            .unwrap();
+        let result = aggregator.aggregate(&[(e1, 1.0), (e2, 1.0)]).unwrap();
 
         // Equal weights → average → normalize
         // (0.5, 0.5) normalized → (0.707, 0.707)
@@ -346,9 +338,7 @@ mod tests {
         let e1 = EmbeddingVector::new(vec![1.0, 0.0]).unwrap();
         let e2 = EmbeddingVector::new(vec![0.0, 1.0]).unwrap();
 
-        let result = aggregator
-            .aggregate(&[(e1, 1.0), (e2, 0.0)])
-            .unwrap();
+        let result = aggregator.aggregate(&[(e1, 1.0), (e2, 0.0)]).unwrap();
 
         // Only e1 contributes → (1.0, 0.0) normalized
         assert!((result.data[0] - 1.0).abs() < 1e-6);
@@ -384,7 +374,9 @@ mod tests {
         let aggregator = agg(2);
         // Can't create invalid EmbeddingVector via new(), but we can
         // bypass by constructing directly
-        let bad = EmbeddingVector { data: vec![f32::NAN, 1.0] };
+        let bad = EmbeddingVector {
+            data: vec![f32::NAN, 1.0],
+        };
         let result = aggregator.aggregate(&[(bad, 1.0)]);
         assert!(result.is_err());
     }
@@ -392,7 +384,9 @@ mod tests {
     #[test]
     fn test_inf_rejection() {
         let aggregator = agg(2);
-        let bad = EmbeddingVector { data: vec![f32::INFINITY, 1.0] };
+        let bad = EmbeddingVector {
+            data: vec![f32::INFINITY, 1.0],
+        };
         let result = aggregator.aggregate(&[(bad, 1.0)]);
         assert!(result.is_err());
     }
@@ -441,8 +435,11 @@ mod tests {
 
         assert_eq!(result.state_vector.len(), 2);
         for &v in &result.state_vector {
-            assert_eq!(v, BelnapValue::True,
-                "unanimous agreement should produce True state vector");
+            assert_eq!(
+                v,
+                BelnapValue::True,
+                "unanimous agreement should produce True state vector"
+            );
         }
         assert_eq!(result.embedding.dim(), 2);
     }
@@ -464,8 +461,11 @@ mod tests {
         };
         let result = agg.aggregate_paraconsistent(&input).unwrap();
 
-        assert_eq!(result.state_vector[0], BelnapValue::Both,
-            "comparable-trust disagreement should produce Both");
+        assert_eq!(
+            result.state_vector[0],
+            BelnapValue::Both,
+            "comparable-trust disagreement should produce Both"
+        );
     }
 
     // PC-T13c: e_agg and state_vector are independent
@@ -527,8 +527,11 @@ mod tests {
         let result = agg.aggregate_paraconsistent(&input).unwrap();
 
         for &v in &result.state_vector {
-            assert_eq!(v, BelnapValue::Neither,
-                "low confidence should produce Neither");
+            assert_eq!(
+                v,
+                BelnapValue::Neither,
+                "low confidence should produce Neither"
+            );
         }
     }
 
@@ -551,7 +554,9 @@ mod tests {
     #[test]
     fn test_paraconsistent_nan_rejection() {
         let agg = ParaconsistentAggregator::new(2);
-        let bad = EmbeddingVector { data: vec![f32::NAN, 1.0] };
+        let bad = EmbeddingVector {
+            data: vec![f32::NAN, 1.0],
+        };
         let conf = make_conf(2, 0.9);
         let input = AggregationInput {
             embeddings: &[&bad],
@@ -576,8 +581,8 @@ mod proptests {
 
     /// Strategy: 2-8 participants, 2-16 dimensions, valid f32 values
     #[allow(clippy::type_complexity)]
-    fn aggregation_inputs(
-    ) -> impl Strategy<Value = (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<f32>, usize)> {
+    fn aggregation_inputs() -> impl Strategy<Value = (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<f32>, usize)>
+    {
         (2usize..=8, 2usize..=16).prop_flat_map(|(n, dim)| {
             let embeddings = proptest::collection::vec(
                 proptest::collection::vec(-10.0f32..10.0f32, dim..=dim),
@@ -705,10 +710,21 @@ mod proptests {
         let dim = 5;
         for round in 0..20u32 {
             let embs: Vec<EmbeddingVector> = (0..4u32)
-                .map(|p| EmbeddingVector::new((0..dim).map(|j| ((round * 3 + p * 5 + j as u32 * 7) % 13) as f32 / 6.5 - 1.0).collect()).unwrap())
+                .map(|p| {
+                    EmbeddingVector::new(
+                        (0..dim)
+                            .map(|j| ((round * 3 + p * 5 + j as u32 * 7) % 13) as f32 / 6.5 - 1.0)
+                            .collect(),
+                    )
+                    .unwrap()
+                })
                 .collect();
             let confs: Vec<Vec<f32>> = (0..4u32)
-                .map(|p| (0..dim).map(|j| ((round + p * 2 + j as u32) % 10) as f32 / 9.0).collect())
+                .map(|p| {
+                    (0..dim)
+                        .map(|j| ((round + p * 2 + j as u32) % 10) as f32 / 9.0)
+                        .collect()
+                })
                 .collect();
             let er: Vec<&EmbeddingVector> = embs.iter().collect();
             let cr: Vec<&[f32]> = confs.iter().map(|c| c.as_slice()).collect();
@@ -721,12 +737,22 @@ mod proptests {
                 theta_high: 0.5,
                 theta_low: 0.2,
             };
-            let r = ParaconsistentAggregator::new(dim).aggregate_paraconsistent(&input).unwrap();
-            for v in &r.embedding.data { feed(&v.to_bits().to_le_bytes()); }
+            let r = ParaconsistentAggregator::new(dim)
+                .aggregate_paraconsistent(&input)
+                .unwrap();
+            for v in &r.embedding.data {
+                feed(&v.to_bits().to_le_bytes());
+            }
             feed(&r.confidence.to_bits().to_le_bytes());
             let cls = classify_belnap(&er, &cr, &blue, 2.0, 0.5, 0.2);
-            for row in &cls { for v in row { feed(&[*v as u8]); } }
-            for v in reduce_belnap_states(&cls) { feed(&[v as u8]); }
+            for row in &cls {
+                for v in row {
+                    feed(&[*v as u8]);
+                }
+            }
+            for v in reduce_belnap_states(&cls) {
+                feed(&[v as u8]);
+            }
             let _ = BelnapValue::Neither;
         }
         format!("{h:016x}")

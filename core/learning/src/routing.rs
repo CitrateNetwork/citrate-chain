@@ -285,10 +285,7 @@ impl Router for MlpRouter {
     ) -> LearningResult<f32> {
         if target >= self.output_dim {
             return Err(LearningError::RoutingFailed {
-                reason: format!(
-                    "target {} >= num_destinations {}",
-                    target, self.output_dim
-                ),
+                reason: format!("target {} >= num_destinations {}", target, self.output_dim),
             });
         }
 
@@ -435,10 +432,7 @@ mod tests {
         assert_eq!(belnap_one_hot(&BelnapValue::True), [1.0, 0.0, 0.0, 0.0]);
         assert_eq!(belnap_one_hot(&BelnapValue::False), [0.0, 1.0, 0.0, 0.0]);
         assert_eq!(belnap_one_hot(&BelnapValue::Both), [0.0, 0.0, 1.0, 0.0]);
-        assert_eq!(
-            belnap_one_hot(&BelnapValue::Neither),
-            [0.0, 0.0, 0.0, 1.0]
-        );
+        assert_eq!(belnap_one_hot(&BelnapValue::Neither), [0.0, 0.0, 0.0, 1.0]);
 
         // Test flat encoding length
         let state = vec![BelnapValue::True, BelnapValue::False, BelnapValue::Both];
@@ -558,7 +552,12 @@ mod tests {
     fn mlp_fingerprint() -> String {
         let dim = 6;
         let mut r = MlpRouter::new(dim, 5, 4, 42);
-        let states = [BelnapValue::True, BelnapValue::False, BelnapValue::Both, BelnapValue::Neither];
+        let states = [
+            BelnapValue::True,
+            BelnapValue::False,
+            BelnapValue::Both,
+            BelnapValue::Neither,
+        ];
         // FNV-1a over the raw f32 bits (dependency-free, stable across builds).
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         let mut feed = |bytes: [u8; 4]| {
@@ -568,8 +567,18 @@ mod tests {
             }
         };
         for step in 0..50usize {
-            let q = EmbeddingVector::new((0..dim).map(|i| ((step * 7 + i * 3) % 11) as f32 / 11.0 - 0.4).collect()).unwrap();
-            let e = EmbeddingVector::new((0..dim).map(|i| ((step * 5 + i) % 9) as f32 / 9.0 - 0.5).collect()).unwrap();
+            let q = EmbeddingVector::new(
+                (0..dim)
+                    .map(|i| ((step * 7 + i * 3) % 11) as f32 / 11.0 - 0.4)
+                    .collect(),
+            )
+            .unwrap();
+            let e = EmbeddingVector::new(
+                (0..dim)
+                    .map(|i| ((step * 5 + i) % 9) as f32 / 9.0 - 0.5)
+                    .collect(),
+            )
+            .unwrap();
             let sv: Vec<BelnapValue> = (0..dim).map(|i| states[(step + i) % 4]).collect();
             let loss = r.train_step(&q, &e, &sv, step % 4, 0.05).unwrap();
             feed(loss.to_bits().to_le_bytes());

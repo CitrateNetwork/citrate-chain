@@ -2,8 +2,8 @@
 
 // Account manager for handling account states
 use crate::types::{AccountState, Address, ExecutionError, ModelId};
-use dashmap::DashMap;
 use citrate_consensus::types::Hash;
+use dashmap::DashMap;
 use primitive_types::U256;
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -114,11 +114,7 @@ impl AccountManager {
     /// Check nonce matches expected value (does NOT increment).
     /// Use this before EVM execution so revm sees the correct pre-tx nonce
     /// for CREATE address derivation.
-    pub fn check_nonce(
-        &self,
-        address: &Address,
-        expected: u64,
-    ) -> Result<(), ExecutionError> {
+    pub fn check_nonce(&self, address: &Address, expected: u64) -> Result<(), ExecutionError> {
         let current = self.get_nonce(address);
         if current != expected {
             return Err(ExecutionError::InvalidNonce {

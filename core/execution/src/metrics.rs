@@ -16,12 +16,12 @@ fn must<T>(registration: prometheus::Result<T>, what: &str) -> T {
 pub static VM_EXECUTIONS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     must(
         register_counter_vec!(
-        "citrate_vm_executions_total",
-        "Number of VM execution calls",
-        &["status"]
-    ),
-    "register citrate_vm_executions_total",
-)
+            "citrate_vm_executions_total",
+            "Number of VM execution calls",
+            &["status"]
+        ),
+        "register citrate_vm_executions_total",
+    )
 });
 
 pub static VM_GAS_USED: Lazy<Histogram> = Lazy::new(|| {
@@ -34,12 +34,12 @@ pub static VM_GAS_USED: Lazy<Histogram> = Lazy::new(|| {
 pub static PRECOMPILE_CALLS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     must(
         register_counter_vec!(
-        "citrate_precompile_calls_total",
-        "Total precompile calls",
-        &["precompile", "method", "status"]
-    ),
-    "register citrate_precompile_calls_total",
-)
+            "citrate_precompile_calls_total",
+            "Total precompile calls",
+            &["precompile", "method", "status"]
+        ),
+        "register citrate_precompile_calls_total",
+    )
 });
 
 #[cfg(test)]

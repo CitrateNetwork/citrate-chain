@@ -62,7 +62,9 @@ fn contract() -> Result<Value> {
 }
 
 fn parse_addr20(v: &Value) -> Result<[u8; 20]> {
-    let s = v.as_str().ok_or_else(|| anyhow!("expected an address string"))?;
+    let s = v
+        .as_str()
+        .ok_or_else(|| anyhow!("expected an address string"))?;
     let bytes = hex::decode(s.strip_prefix("0x").unwrap_or(s)).context("address hex")?;
     if bytes.len() != 20 {
         return Err(anyhow!("address must be 20 bytes, got {}", bytes.len()));
@@ -105,7 +107,11 @@ fn to_checksum(addr: &[u8; 20]) -> String {
         } else {
             let byte = hash.get(i / 2).copied().unwrap_or(0);
             let nibble = (byte >> (if i % 2 == 0 { 4 } else { 0 })) & 0xf;
-            out.push(if nibble >= 8 { ch.to_ascii_uppercase() } else { ch });
+            out.push(if nibble >= 8 {
+                ch.to_ascii_uppercase()
+            } else {
+                ch
+            });
         }
     }
     out
@@ -133,10 +139,18 @@ pub fn execute(cmd: DevxCommands) -> Result<()> {
             let c = contract()?;
             let out = match section.as_str() {
                 "chain" => c.get("chain").unwrap_or(&serde_json::Value::Null).clone(),
-                "aa" => serde_json::json!({ "aaStack": c.get("aaStack").unwrap_or(&serde_json::Value::Null), "membership": c.get("membership").unwrap_or(&serde_json::Value::Null) }),
-                "identity" => c.get("identity").unwrap_or(&serde_json::Value::Null).clone(),
+                "aa" => {
+                    serde_json::json!({ "aaStack": c.get("aaStack").unwrap_or(&serde_json::Value::Null), "membership": c.get("membership").unwrap_or(&serde_json::Value::Null) })
+                }
+                "identity" => c
+                    .get("identity")
+                    .unwrap_or(&serde_json::Value::Null)
+                    .clone(),
                 "gateway" => c.get("gateway").unwrap_or(&serde_json::Value::Null).clone(),
-                "entitlements" => c.get("entitlements").unwrap_or(&serde_json::Value::Null).clone(),
+                "entitlements" => c
+                    .get("entitlements")
+                    .unwrap_or(&serde_json::Value::Null)
+                    .clone(),
                 _ => serde_json::json!({
                     "chain": c.get("chain").unwrap_or(&serde_json::Value::Null), "aaStack": c.get("aaStack").unwrap_or(&serde_json::Value::Null), "membership": c.get("membership").unwrap_or(&serde_json::Value::Null),
                     "identity": c.get("identity").unwrap_or(&serde_json::Value::Null), "entitlements": c.get("entitlements").unwrap_or(&serde_json::Value::Null), "gateway": c.get("gateway").unwrap_or(&serde_json::Value::Null),
@@ -147,8 +161,18 @@ pub fn execute(cmd: DevxCommands) -> Result<()> {
         DevxCommands::PredictAddress { user_id, uuid } => {
             let uid = resolve_user_id(user_id, uuid)?;
             let c = contract()?;
-            let factory = parse_addr20(c.get("aaStack").unwrap_or(&serde_json::Value::Null).get("CitrateWalletFactory").unwrap_or(&serde_json::Value::Null))?;
-            let implementation = parse_addr20(c.get("aaStack").unwrap_or(&serde_json::Value::Null).get("CitrateWallet").unwrap_or(&serde_json::Value::Null))?;
+            let factory = parse_addr20(
+                c.get("aaStack")
+                    .unwrap_or(&serde_json::Value::Null)
+                    .get("CitrateWalletFactory")
+                    .unwrap_or(&serde_json::Value::Null),
+            )?;
+            let implementation = parse_addr20(
+                c.get("aaStack")
+                    .unwrap_or(&serde_json::Value::Null)
+                    .get("CitrateWallet")
+                    .unwrap_or(&serde_json::Value::Null),
+            )?;
             let addr = predict_address(factory, implementation, &uid);
             let out = serde_json::json!({
                 "userId": format!("0x{}", hex::encode(uid)),
@@ -178,13 +202,18 @@ mod tests {
         let implementation = parse_addr20(&c["aaStack"]["CitrateWallet"]).expect("impl");
         let uid = [0x42u8; 32];
         let addr = predict_address(factory, implementation, &uid);
-        assert_eq!(to_checksum(&addr), "0xfb43484CDbA25C6457C2775C1d6dfeD71cE4e720");
+        assert_eq!(
+            to_checksum(&addr),
+            "0xfb43484CDbA25C6457C2775C1d6dfeD71cE4e720"
+        );
     }
 
     #[test]
     fn uuid_derivation_is_lowercase_keccak() {
-        let a = resolve_user_id(None, Some("DEADBEEF-0000-4000-8000-000000000000".into())).expect("upper");
-        let b = resolve_user_id(None, Some("deadbeef-0000-4000-8000-000000000000".into())).expect("lower");
+        let a = resolve_user_id(None, Some("DEADBEEF-0000-4000-8000-000000000000".into()))
+            .expect("upper");
+        let b = resolve_user_id(None, Some("deadbeef-0000-4000-8000-000000000000".into()))
+            .expect("lower");
         assert_eq!(a, b);
     }
 

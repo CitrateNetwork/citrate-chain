@@ -195,7 +195,11 @@ async fn eth_call_precompile(config: &Config, data_hex: String) -> Result<String
     if let Some(err) = v.get("error") {
         anyhow::bail!(err.to_string());
     }
-    Ok(v.get("result").unwrap_or(&serde_json::Value::Null).as_str().unwrap_or("").to_string())
+    Ok(v.get("result")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_str()
+        .unwrap_or("")
+        .to_string())
 }
 
 #[cfg(test)]
@@ -269,8 +273,8 @@ mod tests {
 
     #[test]
     fn test_encode_set_admin_format() {
-        let result = encode_set_admin("0x1111111111111111111111111111111111111111")
-            .expect("encode");
+        let result =
+            encode_set_admin("0x1111111111111111111111111111111111111111").expect("encode");
         assert!(result.starts_with("0x"));
         // selector (4 bytes = 8 hex) + address word (32 bytes = 64 hex) + "0x" prefix
         assert_eq!(result.len(), 2 + (4 + 32) * 2);

@@ -30,8 +30,8 @@
 use anyhow::{anyhow, Result};
 use sha3::{Digest, Keccak256};
 
-use crate::types::Address;
 use super::PrecompileResult;
+use crate::types::Address;
 
 /// Precompile addresses for x402 payment operations
 pub mod addresses {
@@ -271,7 +271,9 @@ fn eip712_verify(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
 /// but the parser at line 172 below requires 265. Fixed above.
 fn transfer_auth_verify(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
     if gas_limit < gas_costs::TRANSFER_AUTH_VERIFY {
-        return Err(anyhow!("Insufficient gas for TransferWithAuthorization verify"));
+        return Err(anyhow!(
+            "Insufficient gas for TransferWithAuthorization verify"
+        ));
     }
 
     // domain(32) + from(20) + to(20) + value(32) + validAfter(32) + validBefore(32) + nonce(32) + v(1) + r(32) + s(32) = 265
@@ -346,7 +348,11 @@ fn batch_payment_verify(input: &[u8], gas_limit: u64) -> Result<PrecompileResult
     // Per-entry: from(20)+to(20)+value(32)+validAfter(32)+validBefore(32)+nonce(32)+v(1)+r(32)+s(32) = 233
     let expected_len = count.saturating_mul(AUTH_ENTRY_LEN).saturating_add(34);
     if input.len() < expected_len {
-        return Err(anyhow!("Invalid batch payment input: expected {} bytes, got {}", expected_len, input.len()));
+        return Err(anyhow!(
+            "Invalid batch payment input: expected {} bytes, got {}",
+            expected_len,
+            input.len()
+        ));
     }
 
     let typehash = transfer_with_authorization_typehash();
@@ -510,7 +516,8 @@ mod tests {
         let domain_separator = [0xABu8; 32];
         let struct_hash = [0xCDu8; 32];
 
-        let (input, expected_address) = create_test_eip712_signature(&domain_separator, &struct_hash);
+        let (input, expected_address) =
+            create_test_eip712_signature(&domain_separator, &struct_hash);
 
         let result = eip712_verify(&input, 10_000).expect("should succeed");
         assert!(result.success);
@@ -568,7 +575,13 @@ mod tests {
         let nonce = [0x33u8; 32];
 
         let input = create_test_transfer_auth(
-            &domain_separator, &from_key, &to, &value, &valid_after, &valid_before, &nonce,
+            &domain_separator,
+            &from_key,
+            &to,
+            &value,
+            &valid_after,
+            &valid_before,
+            &nonce,
         );
 
         let result = transfer_auth_verify(&input, 10_000).expect("should succeed");
@@ -592,7 +605,13 @@ mod tests {
         let nonce = [0x33u8; 32];
 
         let mut input = create_test_transfer_auth(
-            &domain_separator, &from_key, &to, &value, &valid_after, &valid_before, &nonce,
+            &domain_separator,
+            &from_key,
+            &to,
+            &value,
+            &valid_after,
+            &valid_before,
+            &nonce,
         );
 
         // Tamper with the `from` field (bytes 32..52) — replace with a different address
@@ -626,7 +645,13 @@ mod tests {
 
             // Build this entry's auth input (without domain_separator prefix since batch shares it)
             let full_input = create_test_transfer_auth(
-                &domain_separator, &from_key, &to, &value, &valid_after, &valid_before, &nonce,
+                &domain_separator,
+                &from_key,
+                &to,
+                &value,
+                &valid_after,
+                &valid_before,
+                &nonce,
             );
 
             // Extract the per-entry portion (skip domain_separator)
@@ -661,7 +686,13 @@ mod tests {
         let from_key1 = SigningKey::random(&mut OsRng);
         let nonce1 = [0x01u8; 32];
         let full1 = create_test_transfer_auth(
-            &domain_separator, &from_key1, &to, &value, &valid_after, &valid_before, &nonce1,
+            &domain_separator,
+            &from_key1,
+            &to,
+            &value,
+            &valid_after,
+            &valid_before,
+            &nonce1,
         );
         input.extend_from_slice(&full1[32..]);
 
@@ -669,7 +700,13 @@ mod tests {
         let from_key2 = SigningKey::random(&mut OsRng);
         let nonce2 = [0x02u8; 32];
         let mut full2 = create_test_transfer_auth(
-            &domain_separator, &from_key2, &to, &value, &valid_after, &valid_before, &nonce2,
+            &domain_separator,
+            &from_key2,
+            &to,
+            &value,
+            &valid_after,
+            &valid_before,
+            &nonce2,
         );
         // Tamper the from field in the entry (bytes 32..52 in full input, but we're using full2[32..] so from is at offset 0..20)
         let tampered_entry_start = 32; // skip domain in full2
@@ -709,7 +746,13 @@ mod tests {
         valid_before[31] = 0xFF;
         let nonce = [0x33u8; 32];
         let single = create_test_transfer_auth(
-            &domain_separator, &from_key, &to, &value, &valid_after, &valid_before, &nonce,
+            &domain_separator,
+            &from_key,
+            &to,
+            &value,
+            &valid_after,
+            &valid_before,
+            &nonce,
         );
         let word = transfer_auth_verify(&single, 10_000).unwrap().output;
         assert_eq!(word[0], 1);
@@ -733,7 +776,8 @@ mod tests {
         let zero = [0u8; 32];
         for n in 0u8..=255 {
             let nonce = [n; 32];
-            let mut input = create_test_transfer_auth(&domain, &key, &to, &zero, &zero, &zero, &nonce);
+            let mut input =
+                create_test_transfer_auth(&domain, &key, &to, &zero, &zero, &zero, &nonce);
             if input[200] != 27 {
                 continue; // recid 1; try another nonce
             }

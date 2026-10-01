@@ -60,7 +60,10 @@ pub async fn execute(cmd: NetworkCommands, config: &Config) -> Result<()> {
         NetworkCommands::Peers => get_peers(config).await?,
         NetworkCommands::Sync => get_sync_status(config).await?,
         NetworkCommands::DagStats => get_dag_stats(config).await?,
-        NetworkCommands::Bootnodes { bootnodes, timeout_ms } => {
+        NetworkCommands::Bootnodes {
+            bootnodes,
+            timeout_ms,
+        } => {
             check_bootnodes(bootnodes, timeout_ms).await?;
         }
     }
@@ -76,11 +79,18 @@ async fn check_bootnodes(bootnodes_arg: Option<String>, timeout_ms: u64) -> Resu
     use tokio::time::timeout;
 
     let list: Vec<String> = if let Some(s) = bootnodes_arg {
-        s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
+        s.split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
     } else {
         // Fall back to reading from CITRATE_BOOTNODES env var or a default config
         match std::env::var("CITRATE_BOOTNODES") {
-            Ok(s) => s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect(),
+            Ok(s) => s
+                .split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect(),
             Err(_) => {
                 anyhow::bail!(
                     "No bootnodes specified. Use --bootnodes <list> or set CITRATE_BOOTNODES env var."
@@ -93,7 +103,15 @@ async fn check_bootnodes(bootnodes_arg: Option<String>, timeout_ms: u64) -> Resu
         anyhow::bail!("Bootnode list is empty");
     }
 
-    println!("{}", format!("Checking {} bootnodes (timeout: {}ms)", list.len(), timeout_ms).bold());
+    println!(
+        "{}",
+        format!(
+            "Checking {} bootnodes (timeout: {}ms)",
+            list.len(),
+            timeout_ms
+        )
+        .bold()
+    );
     println!();
 
     let mut reachable = 0usize;
@@ -102,7 +120,10 @@ async fn check_bootnodes(bootnodes_arg: Option<String>, timeout_ms: u64) -> Resu
 
     for bootnode in &list {
         // Strip identity prefix (noise_abc@host:port -> host:port)
-        let addr_str = bootnode.split_once('@').map(|(_, rest)| rest).unwrap_or(bootnode);
+        let addr_str = bootnode
+            .split_once('@')
+            .map(|(_, rest)| rest)
+            .unwrap_or(bootnode);
 
         // Try to parse as SocketAddr first; if that fails, try hostname resolution
         let socket_addrs: Vec<std::net::SocketAddr> = if let Ok(addr) = addr_str.parse() {
@@ -111,7 +132,12 @@ async fn check_bootnodes(bootnodes_arg: Option<String>, timeout_ms: u64) -> Resu
             match tokio::net::lookup_host(addr_str).await {
                 Ok(iter) => iter.collect(),
                 Err(e) => {
-                    println!("  {} {}: DNS resolution failed ({})", "✗".red(), bootnode, e);
+                    println!(
+                        "  {} {}: DNS resolution failed ({})",
+                        "✗".red(),
+                        bootnode,
+                        e
+                    );
                     unreachable = unreachable.saturating_add(1);
                     continue;
                 }
@@ -139,7 +165,13 @@ async fn check_bootnodes(bootnodes_arg: Option<String>, timeout_ms: u64) -> Resu
                     println!("  {} {} ({}): {}", "✗".red(), bootnode, addr, e);
                 }
                 Err(_) => {
-                    println!("  {} {} ({}): timeout after {}ms", "✗".red(), bootnode, addr, timeout_ms);
+                    println!(
+                        "  {} {} ({}): timeout after {}ms",
+                        "✗".red(),
+                        bootnode,
+                        addr,
+                        timeout_ms
+                    );
                 }
             }
         }
@@ -189,7 +221,11 @@ async fn get_status(config: &Config) -> Result<()> {
         .context("Failed to connect to RPC endpoint")?;
 
     let result: serde_json::Value = response.json().await?;
-    let network_id = result.get("result").unwrap_or(&serde_json::Value::Null).as_str().unwrap_or("Unknown");
+    let network_id = result
+        .get("result")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_str()
+        .unwrap_or("Unknown");
 
     // Get latest block
     let response = client
@@ -204,7 +240,11 @@ async fn get_status(config: &Config) -> Result<()> {
         .await?;
 
     let result: serde_json::Value = response.json().await?;
-    let block_number = if let Some(hex) = result.get("result").unwrap_or(&serde_json::Value::Null).as_str() {
+    let block_number = if let Some(hex) = result
+        .get("result")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_str()
+    {
         u64::from_str_radix(hex.get(2..).unwrap_or_default(), 16).unwrap_or(0)
     } else {
         0
@@ -223,7 +263,10 @@ async fn get_status(config: &Config) -> Result<()> {
         .await?;
 
     let result: serde_json::Value = response.json().await?;
-    let syncing = !result.get("result").unwrap_or(&serde_json::Value::Null).is_boolean();
+    let syncing = !result
+        .get("result")
+        .unwrap_or(&serde_json::Value::Null)
+        .is_boolean();
 
     println!("{}", "Network Status:".bold());
     println!("RPC Endpoint: {}", config.rpc_endpoint.cyan());
@@ -270,7 +313,11 @@ async fn get_block(config: &Config, block: &str) -> Result<()> {
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(block) = result.get("result").unwrap_or(&serde_json::Value::Null).as_object() {
+    if let Some(block) = result
+        .get("result")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_object()
+    {
         println!("{}", "Block Information:".bold());
         println!(
             "Number: {}",
@@ -334,7 +381,11 @@ async fn get_block(config: &Config, block: &str) -> Result<()> {
         if let Some(blue_score) = block["blueScore"].as_u64() {
             println!("Blue Score: {}", blue_score);
         }
-    } else if let Some(error) = result.get("error").unwrap_or(&serde_json::Value::Null).as_object() {
+    } else if let Some(error) = result
+        .get("error")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_object()
+    {
         anyhow::bail!(
             "Query failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -363,7 +414,11 @@ async fn get_transaction(config: &Config, tx_hash: &str) -> Result<()> {
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(tx) = result.get("result").unwrap_or(&serde_json::Value::Null).as_object() {
+    if let Some(tx) = result
+        .get("result")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_object()
+    {
         println!("{}", "Transaction Details:".bold());
         println!("Hash: {}", tx["hash"].as_str().unwrap_or("N/A").cyan());
         println!("From: {}", tx["from"].as_str().unwrap_or("N/A"));
@@ -432,7 +487,11 @@ async fn get_transaction(config: &Config, tx_hash: &str) -> Result<()> {
 
             let receipt_result: serde_json::Value = receipt_response.json().await?;
 
-            if let Some(receipt) = receipt_result.get("result").unwrap_or(&serde_json::Value::Null).as_object() {
+            if let Some(receipt) = receipt_result
+                .get("result")
+                .unwrap_or(&serde_json::Value::Null)
+                .as_object()
+            {
                 println!("\nReceipt:");
 
                 let status = receipt["status"].as_str().unwrap_or("0x0");
@@ -467,7 +526,11 @@ async fn get_transaction(config: &Config, tx_hash: &str) -> Result<()> {
                 }
             }
         }
-    } else if let Some(error) = result.get("error").unwrap_or(&serde_json::Value::Null).as_object() {
+    } else if let Some(error) = result
+        .get("error")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_object()
+    {
         anyhow::bail!(
             "Query failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -496,14 +559,22 @@ async fn get_gas_price(config: &Config) -> Result<()> {
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(price_hex) = result.get("result").unwrap_or(&serde_json::Value::Null).as_str() {
+    if let Some(price_hex) = result
+        .get("result")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_str()
+    {
         let price = u64::from_str_radix(price_hex.trim_start_matches("0x"), 16).unwrap_or(0);
 
         println!("{}", "Current Gas Price:".bold());
         println!("  {} wei", price);
         println!("  {} gwei", price as f64 / 1e9);
         println!("  {} ETH", price as f64 / 1e18);
-    } else if let Some(error) = result.get("error").unwrap_or(&serde_json::Value::Null).as_object() {
+    } else if let Some(error) = result
+        .get("error")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_object()
+    {
         anyhow::bail!(
             "Query failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -532,7 +603,11 @@ async fn get_peers(config: &Config) -> Result<()> {
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(count_hex) = result.get("result").unwrap_or(&serde_json::Value::Null).as_str() {
+    if let Some(count_hex) = result
+        .get("result")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_str()
+    {
         let count = u64::from_str_radix(count_hex.trim_start_matches("0x"), 16).unwrap_or(0);
 
         println!("{}", "Network Peers:".bold());
@@ -553,12 +628,20 @@ async fn get_peers(config: &Config) -> Result<()> {
         if let Ok(response) = response {
             let result: serde_json::Value = response.json().await?;
 
-            if let Some(peers) = result.get("result").unwrap_or(&serde_json::Value::Null).as_array() {
+            if let Some(peers) = result
+                .get("result")
+                .unwrap_or(&serde_json::Value::Null)
+                .as_array()
+            {
                 if !peers.is_empty() {
                     println!("\nPeer Details:");
                     for (i, peer) in peers.iter().take(5).enumerate() {
                         if let Some(enode) = peer["enode"].as_str() {
-                            println!("  {}. {}", i.saturating_add(1), enode.get(..60).unwrap_or(enode));
+                            println!(
+                                "  {}. {}",
+                                i.saturating_add(1),
+                                enode.get(..60).unwrap_or(enode)
+                            );
                         }
                     }
 
@@ -568,7 +651,11 @@ async fn get_peers(config: &Config) -> Result<()> {
                 }
             }
         }
-    } else if let Some(error) = result.get("error").unwrap_or(&serde_json::Value::Null).as_object() {
+    } else if let Some(error) = result
+        .get("error")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_object()
+    {
         anyhow::bail!(
             "Query failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -597,7 +684,11 @@ async fn get_sync_status(config: &Config) -> Result<()> {
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(sync) = result.get("result").unwrap_or(&serde_json::Value::Null).as_object() {
+    if let Some(sync) = result
+        .get("result")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_object()
+    {
         println!("{}", "Sync Status: SYNCING".yellow().bold());
 
         if let Some(current) = sync["currentBlock"].as_str() {
@@ -626,10 +717,19 @@ async fn get_sync_status(config: &Config) -> Result<()> {
             let bar = "█".repeat(filled) + &"░".repeat(bar_width.saturating_sub(filled));
             println!("[{}]", bar);
         }
-    } else if result.get("result").unwrap_or(&serde_json::Value::Null).as_bool() == Some(false) {
+    } else if result
+        .get("result")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_bool()
+        == Some(false)
+    {
         println!("{}", "Sync Status: SYNCED".green().bold());
         println!("Node is fully synchronized with the network");
-    } else if let Some(error) = result.get("error").unwrap_or(&serde_json::Value::Null).as_object() {
+    } else if let Some(error) = result
+        .get("error")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_object()
+    {
         anyhow::bail!(
             "Query failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -659,7 +759,11 @@ async fn get_dag_stats(config: &Config) -> Result<()> {
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(stats) = result.get("result").unwrap_or(&serde_json::Value::Null).as_object() {
+    if let Some(stats) = result
+        .get("result")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_object()
+    {
         println!("{}", "DAG Statistics:".bold());
         println!(
             "Total Blocks: {}",
@@ -687,7 +791,11 @@ async fn get_dag_stats(config: &Config) -> Result<()> {
                 }
             }
         }
-    } else if let Some(error) = result.get("error").unwrap_or(&serde_json::Value::Null).as_object() {
+    } else if let Some(error) = result
+        .get("error")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_object()
+    {
         // Method might not be available
         if error["message"]
             .as_str()

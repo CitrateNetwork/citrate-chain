@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use clap::Subcommand;
 use colored::Colorize;
-use dialoguer::{Confirm, Input, Select, MultiSelect, theme::ColorfulTheme};
+use dialoguer::{theme::ColorfulTheme, Confirm, Input, MultiSelect, Select};
 use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
@@ -74,7 +74,7 @@ async fn model_deploy_wizard(config: &Config) -> Result<()> {
         "Public (free access)",
         "Private (owner only)",
         "Restricted (allowlist)",
-        "Pay-per-use"
+        "Pay-per-use",
     ];
 
     let access_selection = Select::with_theme(&theme)
@@ -125,7 +125,7 @@ async fn model_deploy_wizard(config: &Config) -> Result<()> {
         "Regression",
         "Generation",
         "Research",
-        "Production"
+        "Production",
     ];
 
     let tag_indices = MultiSelect::with_theme(&theme)
@@ -155,8 +155,22 @@ async fn model_deploy_wizard(config: &Config) -> Result<()> {
     if let Some(p) = &price {
         println!("Price: {} wei", p.cyan());
     }
-    println!("Encrypted: {}", if use_encryption { "Yes".green() } else { "No".red() });
-    println!("Analytics: {}", if enable_analytics { "Enabled".green() } else { "Disabled".red() });
+    println!(
+        "Encrypted: {}",
+        if use_encryption {
+            "Yes".green()
+        } else {
+            "No".red()
+        }
+    );
+    println!(
+        "Analytics: {}",
+        if enable_analytics {
+            "Enabled".green()
+        } else {
+            "Disabled".red()
+        }
+    );
     println!("Tags: {}", selected_tags.join(", ").cyan());
     println!("Account: {}", account.cyan());
     println!();
@@ -235,16 +249,33 @@ async fn model_deploy_wizard(config: &Config) -> Result<()> {
 
         println!();
         println!("{}", "Next steps:".bold());
-        println!("• Monitor deployment: citrate advanced tx-debug {}",
-                res.get("tx_hash").and_then(|v| v.as_str()).unwrap_or("TX_HASH"));
-        println!("• Test inference: citrate model inference --model-id {}",
-                res.get("model_id").and_then(|v| v.as_str()).unwrap_or("MODEL_ID"));
-        println!("• View analytics: citrate advanced model-stats {}",
-                res.get("model_id").and_then(|v| v.as_str()).unwrap_or("MODEL_ID"));
-
+        println!(
+            "• Monitor deployment: citrate advanced tx-debug {}",
+            res.get("tx_hash")
+                .and_then(|v| v.as_str())
+                .unwrap_or("TX_HASH")
+        );
+        println!(
+            "• Test inference: citrate model inference --model-id {}",
+            res.get("model_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("MODEL_ID")
+        );
+        println!(
+            "• View analytics: citrate advanced model-stats {}",
+            res.get("model_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("MODEL_ID")
+        );
     } else if let Some(error) = result.get("error") {
         println!("{}", "❌ Deployment failed".red().bold());
-        println!("Error: {}", error.get("message").and_then(|v| v.as_str()).unwrap_or("Unknown error"));
+        println!(
+            "Error: {}",
+            error
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error")
+        );
     }
 
     Ok(())
@@ -263,7 +294,7 @@ async fn dev_setup_wizard(_config: &Config) -> Result<()> {
         "Model Training (Python)",
         "Frontend dApp (React/TypeScript)",
         "CLI Tool (Rust)",
-        "Full Stack Application"
+        "Full Stack Application",
     ];
 
     let project_selection = Select::with_theme(&theme)
@@ -295,7 +326,10 @@ async fn dev_setup_wizard(_config: &Config) -> Result<()> {
         _ => {}
     }
 
-    println!("{}", "✅ Development environment setup complete!".green().bold());
+    println!(
+        "{}",
+        "✅ Development environment setup complete!".green().bold()
+    );
     println!("Project created in: {}", project_name.cyan());
     println!();
     println!("{}", "Next steps:".bold());
@@ -316,7 +350,7 @@ async fn contract_wizard(_config: &Config) -> Result<()> {
         "Model Registry",
         "Payment Processor",
         "Governance Contract",
-        "Custom Contract"
+        "Custom Contract",
     ];
 
     let contract_selection = Select::with_theme(&theme)
@@ -361,7 +395,7 @@ async fn network_wizard(_config: &Config) -> Result<()> {
         "Local Development (localhost:8545)",
         "Citrate Testnet",
         "Citrate Mainnet",
-        "Custom RPC Endpoint"
+        "Custom RPC Endpoint",
     ];
 
     let network_selection = Select::with_theme(&theme)
@@ -373,11 +407,9 @@ async fn network_wizard(_config: &Config) -> Result<()> {
         0 => "http://localhost:8545".to_string(),
         1 => "https://testnet-rpc.citrate.ai".to_string(),
         2 => "https://rpc.citrate.ai".to_string(),
-        3 => {
-            Input::with_theme(&theme)
-                .with_prompt("Custom RPC URL")
-                .interact()?
-        }
+        3 => Input::with_theme(&theme)
+            .with_prompt("Custom RPC URL")
+            .interact()?,
         _ => "http://localhost:8545".to_string(),
     };
 
@@ -419,7 +451,8 @@ fn setup_contract_project(name: &str, _use_templates: bool) -> Result<()> {
     fs::create_dir_all(format!("{}/scripts", name))?;
     fs::create_dir_all(format!("{}/test", name))?;
 
-    let readme = format!(r#"# {}
+    let readme = format!(
+        r#"# {}
 
 Solidity smart contract project for Citrate blockchain.
 
@@ -436,7 +469,9 @@ forge test
 ```bash
 forge script script/Deploy.s.sol --rpc-url $RPC_URL --broadcast
 ```
-"#, name);
+"#,
+        name
+    );
 
     fs::write(format!("{}/README.md", name), readme)?;
     Ok(())
@@ -461,7 +496,8 @@ fn setup_frontend_project(name: &str, _use_templates: bool) -> Result<()> {
     fs::create_dir_all(format!("{}/src", name))?;
     fs::create_dir_all(format!("{}/public", name))?;
 
-    let package_json = format!(r#"{{
+    let package_json = format!(
+        r#"{{
   "name": "{}",
   "version": "0.1.0",
   "dependencies": {{
@@ -470,7 +506,9 @@ fn setup_frontend_project(name: &str, _use_templates: bool) -> Result<()> {
     "ethers": "^5.7.0"
   }}
 }}
-"#, name);
+"#,
+        name
+    );
 
     fs::write(format!("{}/package.json", name), package_json)?;
     Ok(())
@@ -479,7 +517,8 @@ fn setup_frontend_project(name: &str, _use_templates: bool) -> Result<()> {
 fn setup_rust_project(name: &str, _use_templates: bool) -> Result<()> {
     fs::create_dir_all(format!("{}/src", name))?;
 
-    let cargo_toml = format!(r#"[package]
+    let cargo_toml = format!(
+        r#"[package]
 name = "{}"
 version = "0.1.0"
 edition = "2021"
@@ -488,7 +527,9 @@ edition = "2021"
 tokio = {{ version = "1.0", features = ["full"] }}
 serde = {{ version = "1.0", features = ["derive"] }}
 reqwest = {{ version = "0.11", features = ["json"] }}
-"#, name);
+"#,
+        name
+    );
 
     fs::write(format!("{}/Cargo.toml", name), cargo_toml)?;
     Ok(())
@@ -503,7 +544,8 @@ fn setup_fullstack_project(name: &str, use_templates: bool) -> Result<()> {
 
 // Contract template generators
 fn generate_erc20_template(name: &str) -> String {
-    format!(r#"// SPDX-License-Identifier: MIT
+    format!(
+        r#"// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
@@ -518,11 +560,16 @@ contract {} is ERC20, Ownable {{
         _mint(to, amount);
     }}
 }}
-"#, name, name, name.to_uppercase())
+"#,
+        name,
+        name,
+        name.to_uppercase()
+    )
 }
 
 fn generate_erc721_template(name: &str) -> String {
-    format!(r#"// SPDX-License-Identifier: MIT
+    format!(
+        r#"// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
@@ -538,11 +585,14 @@ contract {} is ERC721, Ownable {{
         _safeMint(to, tokenId);
     }}
 }}
-"#, name, name, name)
+"#,
+        name, name, name
+    )
 }
 
 fn generate_model_registry_template(name: &str) -> String {
-    format!(r#"// SPDX-License-Identifier: MIT
+    format!(
+        r#"// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
 contract {} {{
@@ -578,11 +628,14 @@ contract {} {{
         emit ModelRegistered(modelId, msg.sender, ipfsHash);
     }}
 }}
-"#, name)
+"#,
+        name
+    )
 }
 
 fn generate_payment_processor_template(name: &str) -> String {
-    format!(r#"// SPDX-License-Identifier: MIT
+    format!(
+        r#"// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
 contract {} {{
@@ -614,11 +667,14 @@ contract {} {{
         payable(msg.sender).transfer(amount);
     }}
 }}
-"#, name)
+"#,
+        name
+    )
 }
 
 fn generate_governance_template(name: &str) -> String {
-    format!(r#"// SPDX-License-Identifier: MIT
+    format!(
+        r#"// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
 contract {} {{
@@ -657,11 +713,14 @@ contract {} {{
         emit VoteCast(proposalId, msg.sender);
     }}
 }}
-"#, name)
+"#,
+        name
+    )
 }
 
 fn generate_custom_template(name: &str) -> String {
-    format!(r#"// SPDX-License-Identifier: MIT
+    format!(
+        r#"// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
 contract {} {{
@@ -678,5 +737,7 @@ contract {} {{
 
     // Add your custom contract logic here
 }}
-"#, name)
+"#,
+        name
+    )
 }

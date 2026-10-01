@@ -551,7 +551,10 @@ impl PrecompileExecutor {
         let iteration_count = if e_len <= 32 {
             head_bits
         } else {
-            e_len.saturating_sub(32).saturating_mul(8).saturating_add(head_bits)
+            e_len
+                .saturating_sub(32)
+                .saturating_mul(8)
+                .saturating_add(head_bits)
         };
 
         let gas_cost = std::cmp::max(
@@ -932,7 +935,10 @@ impl PrecompileExecutor {
         let y_re = rest.first_chunk::<32>()?;
 
         // Check for point at infinity
-        if [x_im, x_re, y_im, y_re].iter().all(|w| w.iter().all(|&b| b == 0)) {
+        if [x_im, x_re, y_im, y_re]
+            .iter()
+            .all(|w| w.iter().all(|&b| b == 0))
+        {
             return Some(G2Affine::identity());
         }
 
@@ -1896,7 +1902,12 @@ mod tests {
     #[test]
     fn panic_s1_modexp_huge_lengths_are_rejected_not_panicked() {
         let pe = PrecompileExecutor::new();
-        for (b, e, m) in [(u64::MAX, 1, 1), (1, u64::MAX, 1), (1, 1, u64::MAX), (u64::MAX, u64::MAX, u64::MAX)] {
+        for (b, e, m) in [
+            (u64::MAX, 1, 1),
+            (1, u64::MAX, 1),
+            (1, 1, u64::MAX),
+            (u64::MAX, u64::MAX, u64::MAX),
+        ] {
             let mut input = vec![0u8; 96];
             input[24..32].copy_from_slice(&b.to_be_bytes());
             input[56..64].copy_from_slice(&e.to_be_bytes());

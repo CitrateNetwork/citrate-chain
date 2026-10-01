@@ -239,7 +239,11 @@ mod tests {
 
         let profile = pc.compute_profile();
         let diff = (profile.accuracy - 0.7).abs();
-        assert!(diff < 1e-9, "Expected accuracy ~0.7, got {}", profile.accuracy);
+        assert!(
+            diff < 1e-9,
+            "Expected accuracy ~0.7, got {}",
+            profile.accuracy
+        );
     }
 
     #[test]
@@ -254,7 +258,11 @@ mod tests {
         pc.record_inference(true, 50, "nlp");
 
         let profile = pc.compute_profile();
-        assert_eq!(profile.latency_ms, 30, "Expected avg latency 30, got {}", profile.latency_ms);
+        assert_eq!(
+            profile.latency_ms, 30,
+            "Expected avg latency 30, got {}",
+            profile.latency_ms
+        );
     }
 
     #[test]
@@ -281,7 +289,10 @@ mod tests {
 
         assert_eq!(profile.accuracy, 0.0, "Empty window should have 0 accuracy");
         assert_eq!(profile.latency_ms, 0, "Empty window should have 0 latency");
-        assert_eq!(profile.uptime, 1.0, "Empty window should default to 1.0 uptime");
+        assert_eq!(
+            profile.uptime, 1.0,
+            "Empty window should default to 1.0 uptime"
+        );
         assert_eq!(profile.adapter_count, 0);
         assert!(profile.domains.is_empty());
     }
@@ -303,8 +314,14 @@ mod tests {
         }
 
         let profile = pc.compute_profile();
-        assert_eq!(profile.accuracy, 1.0, "After eviction, all entries should be correct");
-        assert_eq!(profile.latency_ms, 10, "After eviction, avg latency should be 10");
+        assert_eq!(
+            profile.accuracy, 1.0,
+            "After eviction, all entries should be correct"
+        );
+        assert_eq!(
+            profile.latency_ms, 10,
+            "After eviction, avg latency should be 10"
+        );
         assert_eq!(pc.inference_count(), 5, "Window should be at capacity");
     }
 

@@ -156,8 +156,14 @@ mod tests {
         let ks2 = KnowledgeState::new(emb2, conf2, [2u8; 32], 2, 200).unwrap();
 
         let merged = ks1.merge(&ks2).unwrap();
-        assert_eq!(merged.confidence[0], BelnapValue::True.join(BelnapValue::False)); // Both
-        assert_eq!(merged.confidence[1], BelnapValue::Neither.join(BelnapValue::True)); // True
+        assert_eq!(
+            merged.confidence[0],
+            BelnapValue::True.join(BelnapValue::False)
+        ); // Both
+        assert_eq!(
+            merged.confidence[1],
+            BelnapValue::Neither.join(BelnapValue::True)
+        ); // True
         assert_eq!(merged.round, 2);
         assert_eq!(merged.timestamp, 200);
     }

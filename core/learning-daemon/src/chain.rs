@@ -192,9 +192,7 @@ impl FakeChain {
             rpc_call_count: 0,
         };
         // Genesis hash is deterministic.
-        inner
-            .block_hashes
-            .insert(0, H256::repeat_byte(0x00));
+        inner.block_hashes.insert(0, H256::repeat_byte(0x00));
         Self {
             inner: Mutex::new(inner),
         }
@@ -204,7 +202,10 @@ impl FakeChain {
     /// gets a deterministic hash derived from its number so reorg
     /// tests can swap it via `set_block_hash`.
     pub fn produce_block(&self) -> BlockNumber {
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.finalized_block = inner.finalized_block.saturating_add(1);
         let n = inner.finalized_block;
         let hash = H256::from_low_u64_be(n);
@@ -216,7 +217,10 @@ impl FakeChain {
     /// watcher will pick it up the next time `learning_events`
     /// covers the block.
     pub fn emit_event(&self, block_number: BlockNumber, event: LearningEvent) {
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.timeline.push((block_number, event));
     }
 
@@ -224,32 +228,47 @@ impl FakeChain {
     /// modeling a chain reorg. The watcher's reorg-detection logic
     /// should observe the mismatch.
     pub fn set_block_hash(&self, n: BlockNumber, new_hash: H256) {
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.block_hashes.insert(n, new_hash);
     }
 
     /// Test helper: arm the next RPC call to return an error. One-shot.
     pub fn arm_next_error(&self, msg: impl Into<String>) {
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.next_error = Some(msg.into());
     }
 
     /// Test helper: read out the daemon's submitted commits. Used by
     /// scenario assertions.
     pub fn submitted_commits(&self) -> Vec<(CycleId, Vec<u8>)> {
-        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.submitted_commits.clone()
     }
 
     /// Test helper: read out the daemon's submitted finalize calls.
     pub fn submitted_finalizes(&self) -> Vec<CycleId> {
-        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.submitted_finalizes.clone()
     }
 
     /// Test helper: read out the daemon's submitted routing-weights commits.
     pub fn routing_weights_commits(&self) -> Vec<RoutingWeightsCommit> {
-        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.submitted_routing_weights.clone()
     }
 
@@ -257,7 +276,10 @@ impl FakeChain {
     /// this fake. Used by WP-3.10 to verify the watcher's
     /// round-trip count after parallelization.
     pub fn rpc_call_count(&self) -> usize {
-        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.rpc_call_count
     }
 
@@ -265,7 +287,10 @@ impl FakeChain {
     /// the RPC call counter as a side effect so it's accurate
     /// even on failed calls.
     fn take_armed_error(&self) -> Option<String> {
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.rpc_call_count = inner.rpc_call_count.saturating_add(1);
         inner.next_error.take()
     }
@@ -283,7 +308,10 @@ impl ChainAdapter for FakeChain {
         if let Some(msg) = self.take_armed_error() {
             return Err(crate::error::DaemonError::Chain(msg));
         }
-        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok(inner.finalized_block)
     }
 
@@ -291,17 +319,16 @@ impl ChainAdapter for FakeChain {
         if let Some(msg) = self.take_armed_error() {
             return Err(crate::error::DaemonError::Chain(msg));
         }
-        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner
-            .block_hashes
-            .get(&n)
-            .copied()
-            .ok_or_else(|| {
-                crate::error::DaemonError::Chain(format!(
-                    "block {n} not produced yet (finalized={})",
-                    inner.finalized_block
-                ))
-            })
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.block_hashes.get(&n).copied().ok_or_else(|| {
+            crate::error::DaemonError::Chain(format!(
+                "block {n} not produced yet (finalized={})",
+                inner.finalized_block
+            ))
+        })
     }
 
     async fn learning_events(
@@ -312,7 +339,10 @@ impl ChainAdapter for FakeChain {
         if let Some(msg) = self.take_armed_error() {
             return Err(crate::error::DaemonError::Chain(msg));
         }
-        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok(inner
             .timeline
             .iter()
@@ -329,8 +359,13 @@ impl ChainAdapter for FakeChain {
         if let Some(msg) = self.take_armed_error() {
             return Err(crate::error::DaemonError::Chain(msg));
         }
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner.submitted_commits.push((cycle_id, state_vector.to_vec()));
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner
+            .submitted_commits
+            .push((cycle_id, state_vector.to_vec()));
         // Deterministic tx hash from cycle id for test assertions.
         Ok(H256::from_low_u64_be(cycle_id.saturating_add(0xC0_00)))
     }
@@ -339,7 +374,10 @@ impl ChainAdapter for FakeChain {
         if let Some(msg) = self.take_armed_error() {
             return Err(crate::error::DaemonError::Chain(msg));
         }
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Per FinalizeAtMostOnce: the on-chain contract rejects the
         // second call. Our fake mirrors that.
         if inner.submitted_finalizes.contains(&cycle_id) {
@@ -360,7 +398,10 @@ impl ChainAdapter for FakeChain {
         if let Some(msg) = self.take_armed_error() {
             return Err(crate::error::DaemonError::Chain(msg));
         }
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // The fake doesn't de-duplicate — production may. The
         // daemon's trainer is idempotent regardless via
         // deterministic CID.

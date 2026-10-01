@@ -98,10 +98,9 @@ impl TensorOps {
         }
 
         // Both have >= 2 dimensions (checked above).
-        let (Some(&a_cols), Some(&b_rows)) = (
-            a_shape.last(),
-            b_shape.get(b_shape.len().saturating_sub(2)),
-        ) else {
+        let (Some(&a_cols), Some(&b_rows)) =
+            (a_shape.last(), b_shape.get(b_shape.len().saturating_sub(2)))
+        else {
             return Err(TensorError::IncompatibleShapes);
         };
 
@@ -196,12 +195,9 @@ impl TensorOps {
     /// Apply Softmax activation along the last axis
     pub fn softmax(tensor: &Tensor) -> Result<Tensor, TensorError> {
         // A 0-dimensional tensor has no last axis.
-        let axis = tensor
-            .shape
-            .0
-            .len()
-            .checked_sub(1)
-            .ok_or_else(|| TensorError::InvalidShape("softmax needs at least 1 dimension".to_string()))?;
+        let axis = tensor.shape.0.len().checked_sub(1).ok_or_else(|| {
+            TensorError::InvalidShape("softmax needs at least 1 dimension".to_string())
+        })?;
 
         // Compute exp(x - max) for numerical stability
         let max = tensor
@@ -407,11 +403,26 @@ mod panic_s1_tests {
     fn panic_s1_tensor_shape_errors_do_not_panic() {
         let small = Tensor::zeros(vec![1, 1, 2, 2]);
         let kernel = Tensor::zeros(vec![1, 1, 3, 3]);
-        assert!(TensorOps::maxpool2d(&small, (3, 3), (1, 1)).is_err(), "window > input");
-        assert!(TensorOps::maxpool2d(&small, (1, 1), (0, 1)).is_err(), "zero stride");
-        assert!(TensorOps::conv2d(&small, &kernel, (1, 1), (0, 0)).is_err(), "kernel > input");
-        assert!(TensorOps::conv2d(&small, &kernel, (1, 1), (1, 1)).is_ok(), "padding makes it fit");
-        assert!(TensorOps::softmax(&Tensor::zeros(vec![])).is_err(), "0-d softmax");
+        assert!(
+            TensorOps::maxpool2d(&small, (3, 3), (1, 1)).is_err(),
+            "window > input"
+        );
+        assert!(
+            TensorOps::maxpool2d(&small, (1, 1), (0, 1)).is_err(),
+            "zero stride"
+        );
+        assert!(
+            TensorOps::conv2d(&small, &kernel, (1, 1), (0, 0)).is_err(),
+            "kernel > input"
+        );
+        assert!(
+            TensorOps::conv2d(&small, &kernel, (1, 1), (1, 1)).is_ok(),
+            "padding makes it fit"
+        );
+        assert!(
+            TensorOps::softmax(&Tensor::zeros(vec![])).is_err(),
+            "0-d softmax"
+        );
         let a = Tensor::zeros(vec![2, 3]);
         let b = Tensor::zeros(vec![3, 2]);
         assert!(TensorOps::add(&a, &b).is_err());

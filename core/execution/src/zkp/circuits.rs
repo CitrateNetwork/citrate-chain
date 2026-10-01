@@ -172,13 +172,19 @@ impl ConstraintSynthesizer<Fr> for StateTransitionCircuit {
         let tx_pub = FpVar::new_input(cs.clone(), || Ok(Fr::from(tx_field)))?;
 
         // Private witnesses
-        let _old_state_vars: Vec<_> = self.old_state_root.iter()
+        let _old_state_vars: Vec<_> = self
+            .old_state_root
+            .iter()
             .map(|byte| UInt8::new_witness(cs.clone(), || Ok(*byte)))
             .collect::<Result<_, _>>()?;
-        let _new_state_vars: Vec<_> = self.new_state_root.iter()
+        let _new_state_vars: Vec<_> = self
+            .new_state_root
+            .iter()
             .map(|byte| UInt8::new_witness(cs.clone(), || Ok(*byte)))
             .collect::<Result<_, _>>()?;
-        let _tx_hash_vars: Vec<_> = self.transaction_hash.iter()
+        let _tx_hash_vars: Vec<_> = self
+            .transaction_hash
+            .iter()
             .map(|byte| UInt8::new_witness(cs.clone(), || Ok(*byte)))
             .collect::<Result<_, _>>()?;
 

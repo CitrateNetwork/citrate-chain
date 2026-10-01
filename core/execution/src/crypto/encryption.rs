@@ -1,21 +1,20 @@
-
 // citrate/core/execution/src/crypto/encryption.rs
 
 // AES-256-GCM encryption for secure model storage
 // Provides encryption at rest for AI model weights and metadata
 
-use anyhow::{Result, anyhow};
-use serde::{Deserialize, Serialize};
 use aes_gcm::{
     aead::{Aead, KeyInit, OsRng},
-    Aes256Gcm, Nonce, Key
+    Aes256Gcm, Key, Nonce,
 };
+use anyhow::{anyhow, Result};
+use primitive_types::{H160, H256};
 use rand::RngCore;
-use sha3::{Sha3_256, Digest};
-use primitive_types::{H256, H160};
+use serde::{Deserialize, Serialize};
+use sha3::{Digest, Sha3_256};
 use std::collections::HashMap;
 
-use super::ecdh::{ECIES, ECIESMessage};
+use super::ecdh::{ECIESMessage, ECIES};
 
 /// Public keys used to wrap a model key for each authorized address.
 pub type RecipientPublicKeys = HashMap<H160, [u8; 33]>;
@@ -233,11 +232,8 @@ impl ModelEncryption {
             let recipient_pubkey = recipient_public_keys
                 .get(recipient)
                 .ok_or_else(|| anyhow!("missing public key for recipient {}", recipient))?;
-            let encrypted_key = self.encrypt_key_for_recipient(
-                &key_bytes,
-                recipient,
-                recipient_pubkey,
-            )?;
+            let encrypted_key =
+                self.encrypt_key_for_recipient(&key_bytes, recipient, recipient_pubkey)?;
             encrypted_keys.push(encrypted_key);
         }
 
@@ -279,7 +275,8 @@ impl ModelEncryption {
         }
 
         // Find encrypted key for this recipient
-        let encrypted_key = encrypted_model.encrypted_keys
+        let encrypted_key = encrypted_model
+            .encrypted_keys
             .iter()
             .find(|k| k.recipient == recipient_address)
             .ok_or_else(|| anyhow!("No encrypted key found for recipient"))?;
@@ -464,7 +461,8 @@ impl ModelEncryption {
         }
 
         // Decrypt the symmetric key
-        let encrypted_key = encrypted_model.encrypted_keys
+        let encrypted_key = encrypted_model
+            .encrypted_keys
             .iter()
             .find(|k| k.recipient == owner)
             .ok_or_else(|| anyhow!("Owner key not found"))?;
@@ -472,11 +470,8 @@ impl ModelEncryption {
         let symmetric_key = self.decrypt_key_for_recipient(encrypted_key, owner_key)?;
 
         // Encrypt for new user
-        let new_encrypted_key = self.encrypt_key_for_recipient(
-            &symmetric_key,
-            &new_user,
-            new_user_pubkey,
-        )?;
+        let new_encrypted_key =
+            self.encrypt_key_for_recipient(&symmetric_key, &new_user, new_user_pubkey)?;
 
         // Update access list
         encrypted_model.access_list.push(new_user);
@@ -521,7 +516,8 @@ impl ModelEncryption {
         // Decrypt and re-encrypt with new access list
         let plaintext = self.decrypt_model(encrypted_model, owner_key, owner)?;
 
-        let new_access_list: Vec<H160> = encrypted_model.access_list
+        let new_access_list: Vec<H160> = encrypted_model
+            .access_list
             .iter()
             .filter(|&&addr| addr != revoked_user)
             .cloned()
@@ -598,7 +594,6 @@ impl ModelEncryption {
 
         Ok(decrypted)
     }
-
 }
 
 /// Public convenience functions
@@ -652,22 +647,13 @@ mod tests {
         let (owner, user, public_keys, owner_key) = key_material();
 
         // Encrypt
-        let encrypted = encrypt_model(
-            model_data,
-            owner,
-            vec![user],
-            &public_keys,
-        ).unwrap();
+        let encrypted = encrypt_model(model_data, owner, vec![user], &public_keys).unwrap();
 
         assert_ne!(encrypted.ciphertext, model_data);
         assert_eq!(encrypted.access_list.len(), 2); // owner + user
 
         // Decrypt
-        let decrypted = decrypt_model(
-            &encrypted,
-            &owner_key,
-            owner,
-        ).unwrap();
+        let decrypted = decrypt_model(&encrypted, &owner_key, owner).unwrap();
 
         assert_eq!(decrypted, model_data);
     }
@@ -686,15 +672,12 @@ mod tests {
                 owner,
                 ECIES::from_private_key([1u8; 32]).unwrap().public_key(),
             )]),
-        ).unwrap();
+        )
+        .unwrap();
 
         // Unauthorized user should fail
         let unauthorized_key = [2u8; 32];
-        let result = decrypt_model(
-            &encrypted,
-            &unauthorized_key,
-            unauthorized,
-        );
+        let result = decrypt_model(&encrypted, &unauthorized_key, unauthorized);
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Access denied"));
@@ -703,12 +686,10 @@ mod tests {
     #[test]
     fn test_legacy_api_fails_closed() {
         let encryption = ModelEncryption::new(EncryptionConfig::default());
-        let result = encryption.encrypt_model(
-            H256::random(),
-            b"model",
-            H160::random(),
-            vec![],
-        );
-        assert!(result.unwrap_err().to_string().contains("public keys are required"));
+        let result = encryption.encrypt_model(H256::random(), b"model", H160::random(), vec![]);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("public keys are required"));
     }
 }

@@ -54,7 +54,6 @@
         clippy::string_slice
     )
 )]
-
 #![allow(dead_code)]
 
 pub mod belnap;

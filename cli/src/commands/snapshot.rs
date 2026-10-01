@@ -83,11 +83,7 @@ pub async fn execute(cmd: SnapshotCommands, config: &Config) -> Result<()> {
     }
 }
 
-async fn export_snapshot(
-    config: &Config,
-    output: PathBuf,
-    at_block: Option<String>,
-) -> Result<()> {
+async fn export_snapshot(config: &Config, output: PathBuf, at_block: Option<String>) -> Result<()> {
     println!("{}", "Exporting chain state snapshot...".cyan());
 
     let client = reqwest::Client::new();
@@ -111,7 +107,9 @@ async fn export_snapshot(
             .context("Failed to connect to RPC endpoint")?;
 
         let result: serde_json::Value = response.json().await?;
-        let block_hex = result.get("result").unwrap_or(&serde_json::Value::Null)
+        let block_hex = result
+            .get("result")
+            .unwrap_or(&serde_json::Value::Null)
             .as_str()
             .context("Failed to get block number")?;
         println!("  Latest block: {}", block_hex);
@@ -132,7 +130,9 @@ async fn export_snapshot(
         .context("Failed to get block details")?;
 
     let block_result: serde_json::Value = response.json().await?;
-    let block = block_result.get("result").unwrap_or(&serde_json::Value::Null)
+    let block = block_result
+        .get("result")
+        .unwrap_or(&serde_json::Value::Null)
         .as_object()
         .context("Block not found")?;
 
@@ -168,7 +168,8 @@ async fn export_snapshot(
     };
 
     let json = serde_json::to_string_pretty(&manifest)?;
-    fs::write(&output, json).with_context(|| format!("Failed to write snapshot to {:?}", output))?;
+    fs::write(&output, json)
+        .with_context(|| format!("Failed to write snapshot to {:?}", output))?;
 
     println!("{}", "Snapshot exported successfully!".green().bold());
     println!("  File: {}", output.display());
@@ -178,11 +179,7 @@ async fn export_snapshot(
     Ok(())
 }
 
-async fn import_snapshot(
-    config: &Config,
-    input: PathBuf,
-    skip_validation: bool,
-) -> Result<()> {
+async fn import_snapshot(config: &Config, input: PathBuf, skip_validation: bool) -> Result<()> {
     println!("{}", "Importing chain state snapshot...".cyan());
 
     let data = fs::read_to_string(&input)
@@ -211,8 +208,7 @@ async fn import_snapshot(
     // Import accounts via RPC (would need a custom citrate_importSnapshot method)
     println!(
         "{}",
-        "Snapshot loaded. Use `citrate devnet --snapshot` to start from this state."
-            .yellow()
+        "Snapshot loaded. Use `citrate devnet --snapshot` to start from this state.".yellow()
     );
 
     Ok(())

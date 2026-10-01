@@ -84,6 +84,6 @@ pub use citrate_consensus::types::Hash;
 pub use state::{AccountManager, StateDB, StateRoot, Trie};
 
 pub use executor::{ExecutionContext, Executor, InferenceService, DEFAULT_CHAIN_ID};
+pub use inference::metal_runtime::{MetalCapabilities, MetalRuntime};
 pub use parallel::ParallelExecutor;
 pub use precompiles::{PrecompileExecutor, PrecompileResult};
-pub use inference::metal_runtime::{MetalRuntime, MetalCapabilities};

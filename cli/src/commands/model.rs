@@ -244,11 +244,7 @@ pub async fn execute(cmd: ModelCommands, config: &Config) -> Result<()> {
         ModelCommands::Verify { proof, output_hash } => {
             verify_proof(config, proof, output_hash).await?;
         }
-        ModelCommands::Search {
-            query,
-            limit,
-            gguf,
-        } => {
+        ModelCommands::Search { query, limit, gguf } => {
             search_hf_models(&query, limit, gguf).await?;
         }
         ModelCommands::Download {
@@ -396,26 +392,41 @@ async fn deploy_model(
         println!("Waiting for confirmation...");
         let receipt = wait_for_receipt(config, tx_hash).await?;
 
-        let status = receipt.get("status").unwrap_or(&serde_json::Value::Null).as_str().unwrap_or_default();
+        let status = receipt
+            .get("status")
+            .unwrap_or(&serde_json::Value::Null)
+            .as_str()
+            .unwrap_or_default();
         if status == "0x1" || status == "0x01" {
             println!("{}", "✓ Model deployment confirmed".green().bold());
-            if let Some(block) = receipt.get("blockNumber").unwrap_or(&serde_json::Value::Null).as_str() {
+            if let Some(block) = receipt
+                .get("blockNumber")
+                .unwrap_or(&serde_json::Value::Null)
+                .as_str()
+            {
                 println!("Included in block: {}", block);
             }
-            if let Some(gas_used) = receipt.get("gasUsed").unwrap_or(&serde_json::Value::Null).as_str() {
+            if let Some(gas_used) = receipt
+                .get("gasUsed")
+                .unwrap_or(&serde_json::Value::Null)
+                .as_str()
+            {
                 println!("Gas Used: {}", gas_used);
             }
             println!(
                 "{}",
-                "Model registered on-chain. You can query it via `citrate_getModel`."
-                    .italic()
+                "Model registered on-chain. You can query it via `citrate_getModel`.".italic()
             );
         } else {
             println!("{}", "✗ Model deployment reverted".red().bold());
             println!("{}", serde_json::to_string_pretty(&receipt)?);
             anyhow::bail!("Model deployment transaction failed");
         }
-    } else if let Some(error) = result.get("error").unwrap_or(&serde_json::Value::Null).as_object() {
+    } else if let Some(error) = result
+        .get("error")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_object()
+    {
         anyhow::bail!(
             "Deployment failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -463,7 +474,13 @@ async fn run_inference(
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(output) = result.get("result").unwrap_or(&serde_json::Value::Null).get("output").unwrap_or(&serde_json::Value::Null).as_object() {
+    if let Some(output) = result
+        .get("result")
+        .unwrap_or(&serde_json::Value::Null)
+        .get("output")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_object()
+    {
         println!("{}", "✓ Inference completed successfully".green());
 
         // Save output if path specified
@@ -478,15 +495,31 @@ async fn run_inference(
         }
 
         if with_proof {
-            if let Some(proof) = result.get("result").unwrap_or(&serde_json::Value::Null).get("proof").unwrap_or(&serde_json::Value::Null).as_str() {
+            if let Some(proof) = result
+                .get("result")
+                .unwrap_or(&serde_json::Value::Null)
+                .get("proof")
+                .unwrap_or(&serde_json::Value::Null)
+                .as_str()
+            {
                 println!("\nProof ID: {}", proof.cyan());
             }
         }
 
-        if let Some(exec_time) = result.get("result").unwrap_or(&serde_json::Value::Null).get("execution_time_ms").unwrap_or(&serde_json::Value::Null).as_u64() {
+        if let Some(exec_time) = result
+            .get("result")
+            .unwrap_or(&serde_json::Value::Null)
+            .get("execution_time_ms")
+            .unwrap_or(&serde_json::Value::Null)
+            .as_u64()
+        {
             println!("Execution time: {}ms", exec_time);
         }
-    } else if let Some(error) = result.get("error").unwrap_or(&serde_json::Value::Null).as_object() {
+    } else if let Some(error) = result
+        .get("error")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_object()
+    {
         anyhow::bail!(
             "Inference failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -536,7 +569,13 @@ async fn list_models(
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(models) = result.get("result").unwrap_or(&serde_json::Value::Null).get("models").unwrap_or(&serde_json::Value::Null).as_array() {
+    if let Some(models) = result
+        .get("result")
+        .unwrap_or(&serde_json::Value::Null)
+        .get("models")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_array()
+    {
         if models.is_empty() {
             println!("{}", "No models found".yellow());
         } else {
@@ -556,7 +595,11 @@ async fn list_models(
                 println!();
             }
         }
-    } else if let Some(error) = result.get("error").unwrap_or(&serde_json::Value::Null).as_object() {
+    } else if let Some(error) = result
+        .get("error")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_object()
+    {
         anyhow::bail!(
             "Query failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -587,10 +630,20 @@ async fn get_model_info(config: &Config, model_id: &str) -> Result<()> {
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(model) = result.get("result").unwrap_or(&serde_json::Value::Null).get("model").unwrap_or(&serde_json::Value::Null).as_object() {
+    if let Some(model) = result
+        .get("result")
+        .unwrap_or(&serde_json::Value::Null)
+        .get("model")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_object()
+    {
         println!("{}", "Model Information:".bold());
         println!("{}", serde_json::to_string_pretty(model)?);
-    } else if let Some(error) = result.get("error").unwrap_or(&serde_json::Value::Null).as_object() {
+    } else if let Some(error) = result
+        .get("error")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_object()
+    {
         anyhow::bail!(
             "Query failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -661,7 +714,10 @@ async fn update_model(
 
     let mut params = serde_json::Map::new();
     params.insert("model_id".to_string(), json!(model_id));
-    params.insert("metadata".to_string(), serde_json::Value::Object(metadata_obj.clone()));
+    params.insert(
+        "metadata".to_string(),
+        serde_json::Value::Object(metadata_obj.clone()),
+    );
     params.insert("from".to_string(), json!(from_account));
 
     if let Some(data_b64) = model_data_b64 {
@@ -708,13 +764,25 @@ async fn update_model(
 
         println!("Waiting for confirmation...");
         let receipt = wait_for_receipt(config, tx_hash).await?;
-        let status = receipt.get("status").unwrap_or(&serde_json::Value::Null).as_str().unwrap_or_default();
+        let status = receipt
+            .get("status")
+            .unwrap_or(&serde_json::Value::Null)
+            .as_str()
+            .unwrap_or_default();
         if status == "0x1" || status == "0x01" {
             println!("{}", "✓ Model update confirmed".green().bold());
-            if let Some(block) = receipt.get("blockNumber").unwrap_or(&serde_json::Value::Null).as_str() {
+            if let Some(block) = receipt
+                .get("blockNumber")
+                .unwrap_or(&serde_json::Value::Null)
+                .as_str()
+            {
                 println!("Included in block: {}", block);
             }
-            if let Some(gas_used) = receipt.get("gasUsed").unwrap_or(&serde_json::Value::Null).as_str() {
+            if let Some(gas_used) = receipt
+                .get("gasUsed")
+                .unwrap_or(&serde_json::Value::Null)
+                .as_str()
+            {
                 println!("Gas Used: {}", gas_used);
             }
         } else {
@@ -722,7 +790,11 @@ async fn update_model(
             println!("{}", serde_json::to_string_pretty(&receipt)?);
             anyhow::bail!("Model update transaction failed");
         }
-    } else if let Some(error) = result.get("error").unwrap_or(&serde_json::Value::Null).as_object() {
+    } else if let Some(error) = result
+        .get("error")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_object()
+    {
         anyhow::bail!(
             "Update failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -775,11 +847,23 @@ async fn verify_proof(
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(valid) = result.get("result").unwrap_or(&serde_json::Value::Null).get("valid").unwrap_or(&serde_json::Value::Null).as_bool() {
+    if let Some(valid) = result
+        .get("result")
+        .unwrap_or(&serde_json::Value::Null)
+        .get("valid")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_bool()
+    {
         if valid {
             println!("{}", "✓ Proof is VALID".green().bold());
 
-            if let Some(details) = result.get("result").unwrap_or(&serde_json::Value::Null).get("details").unwrap_or(&serde_json::Value::Null).as_object() {
+            if let Some(details) = result
+                .get("result")
+                .unwrap_or(&serde_json::Value::Null)
+                .get("details")
+                .unwrap_or(&serde_json::Value::Null)
+                .as_object()
+            {
                 println!("\nProof Details:");
                 println!(
                     "  Model ID: {}",
@@ -809,11 +893,21 @@ async fn verify_proof(
         } else {
             println!("{}", "✗ Proof is INVALID".red().bold());
 
-            if let Some(reason) = result.get("result").unwrap_or(&serde_json::Value::Null).get("reason").unwrap_or(&serde_json::Value::Null).as_str() {
+            if let Some(reason) = result
+                .get("result")
+                .unwrap_or(&serde_json::Value::Null)
+                .get("reason")
+                .unwrap_or(&serde_json::Value::Null)
+                .as_str()
+            {
                 println!("Reason: {}", reason);
             }
         }
-    } else if let Some(error) = result.get("error").unwrap_or(&serde_json::Value::Null).as_object() {
+    } else if let Some(error) = result
+        .get("error")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_object()
+    {
         anyhow::bail!(
             "Verification failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -845,9 +939,8 @@ fn format_size(bytes: u64) -> String {
 fn extract_quantization(filename: &str) -> Option<String> {
     let lower = filename.to_lowercase();
     let patterns = [
-        "q4_k_m", "q4_k_s", "q5_k_m", "q5_k_s", "q6_k", "q8_0",
-        "q4_0", "q4_1", "q5_0", "q5_1", "q2_k", "q3_k_s", "q3_k_m",
-        "q3_k_l", "iq2_xs", "iq2_s", "iq3_xs", "iq3_s", "f16", "f32",
+        "q4_k_m", "q4_k_s", "q5_k_m", "q5_k_s", "q6_k", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1",
+        "q2_k", "q3_k_s", "q3_k_m", "q3_k_l", "iq2_xs", "iq2_s", "iq3_xs", "iq3_s", "f16", "f32",
     ];
     for pattern in &patterns {
         if lower.contains(pattern) {
@@ -905,9 +998,9 @@ async fn search_hf_models(query: &str, limit: usize, gguf_only: bool) -> Result<
         models
             .iter()
             .filter(|m| {
-                m.tags.as_ref().is_some_and(|tags| {
-                    tags.iter().any(|t| t.eq_ignore_ascii_case("gguf"))
-                })
+                m.tags
+                    .as_ref()
+                    .is_some_and(|tags| tags.iter().any(|t| t.eq_ignore_ascii_case("gguf")))
             })
             .collect()
     } else {
@@ -922,10 +1015,7 @@ async fn search_hf_models(query: &str, limit: usize, gguf_only: bool) -> Result<
         return Ok(());
     }
 
-    println!(
-        "{}",
-        format!("Found {} model(s):", filtered.len()).bold()
-    );
+    println!("{}", format!("Found {} model(s):", filtered.len()).bold());
     println!();
 
     for model in &filtered {
@@ -944,11 +1034,7 @@ async fn search_hf_models(query: &str, limit: usize, gguf_only: bool) -> Result<
             "Likes:".bold(),
             model.likes.unwrap_or(0)
         );
-        println!(
-            "  {} citrate model download {}",
-            "Download:".bold(),
-            id
-        );
+        println!("  {} citrate model download {}", "Download:".bold(), id);
         println!();
     }
 
@@ -1005,14 +1091,16 @@ async fn download_hf_model(
         let gguf_files: Vec<&HFSibling> = model
             .siblings
             .as_ref()
-            .map(|s| s.iter().filter(|f| f.rfilename.ends_with(".gguf")).collect())
+            .map(|s| {
+                s.iter()
+                    .filter(|f| f.rfilename.ends_with(".gguf"))
+                    .collect()
+            })
             .unwrap_or_default();
 
         if gguf_files.is_empty() {
             println!("{}", "No GGUF files found in this repository.".yellow());
-            println!(
-                "Available files (showing first 20):"
-            );
+            println!("Available files (showing first 20):");
             if let Some(siblings) = &model.siblings {
                 for f in siblings.iter().take(20) {
                     let size = f
@@ -1057,14 +1145,8 @@ async fn download_hf_model(
                 );
             }
             println!();
-            println!(
-                "{}",
-                "To download, run:".bold()
-            );
-            println!(
-                "  citrate model download {} --file <FILENAME>",
-                repo_id
-            );
+            println!("{}", "To download, run:".bold());
+            println!("  citrate model download {} --file <FILENAME>", repo_id);
         }
 
         return Ok(());
@@ -1105,25 +1187,18 @@ async fn download_hf_model(
         repo_id, filename
     );
 
-    let mut request = client
-        .get(&url)
-        .header("User-Agent", "citrate-cli/0.1.0");
+    let mut request = client.get(&url).header("User-Agent", "citrate-cli/0.1.0");
 
     if let Some(ref tok) = token {
         request = request.bearer_auth(tok);
     }
 
-    let response = request
-        .send()
-        .await
-        .context("Failed to start download")?;
+    let response = request.send().await.context("Failed to start download")?;
 
     if !response.status().is_success() {
         let status = response.status();
         if status.as_u16() == 401 || status.as_u16() == 403 {
-            anyhow::bail!(
-                "Access denied. Use --token <HF_TOKEN> for gated models."
-            );
+            anyhow::bail!("Access denied. Use --token <HF_TOKEN> for gated models.");
         }
         anyhow::bail!("Download failed: HTTP {}", status);
     }
@@ -1146,8 +1221,7 @@ async fn download_hf_model(
     use futures_util::StreamExt;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("Download interrupted")?;
-        file.write_all(&chunk)
-            .context("Failed to write to disk")?;
+        file.write_all(&chunk).context("Failed to write to disk")?;
         hasher.update(&chunk);
 
         downloaded = downloaded.saturating_add(chunk.len() as u64);
@@ -1194,16 +1268,10 @@ async fn download_hf_model(
             println!("{}", "IPFS daemon detected, pinning model...".cyan());
             match auto_pin_to_ipfs(&client, &file_path).await {
                 Ok(cid) => {
-                    println!(
-                        "{}",
-                        format!("Pinned to IPFS: {}", cid).green()
-                    );
+                    println!("{}", format!("Pinned to IPFS: {}", cid).green());
                 }
                 Err(e) => {
-                    println!(
-                        "{}",
-                        format!("IPFS pin failed (non-fatal): {}", e).yellow()
-                    );
+                    println!("{}", format!("IPFS pin failed (non-fatal): {}", e).yellow());
                 }
             }
         }
@@ -1223,8 +1291,7 @@ async fn auto_pin_to_ipfs(client: &reqwest::Client, file_path: &PathBuf) -> Resu
 
     let form = reqwest::multipart::Form::new().part(
         "file",
-        reqwest::multipart::Part::bytes(file_data)
-            .file_name(file_name.to_string()),
+        reqwest::multipart::Part::bytes(file_data).file_name(file_name.to_string()),
     );
 
     let response = client
@@ -1275,12 +1342,19 @@ async fn wait_for_receipt(config: &Config, tx_hash: &str) -> Result<serde_json::
 
         let result: serde_json::Value = response.json().await?;
 
-        if let Some(receipt) = result.get("result").unwrap_or(&serde_json::Value::Null).as_object() {
+        if let Some(receipt) = result
+            .get("result")
+            .unwrap_or(&serde_json::Value::Null)
+            .as_object()
+        {
             return Ok(serde_json::Value::Object(receipt.clone()));
         }
 
         if attempts >= MAX_ATTEMPTS {
-            anyhow::bail!("Transaction receipt not found after {} attempts", MAX_ATTEMPTS);
+            anyhow::bail!(
+                "Transaction receipt not found after {} attempts",
+                MAX_ATTEMPTS
+            );
         }
 
         sleep(Duration::from_secs(2)).await;
@@ -1319,15 +1393,30 @@ mod tests {
 
     #[test]
     fn test_extract_quantization_common() {
-        assert_eq!(extract_quantization("model.Q4_K_M.gguf"), Some("Q4_K_M".to_string()));
-        assert_eq!(extract_quantization("model.Q5_K_S.gguf"), Some("Q5_K_S".to_string()));
-        assert_eq!(extract_quantization("model.Q8_0.gguf"), Some("Q8_0".to_string()));
-        assert_eq!(extract_quantization("model.F16.gguf"), Some("F16".to_string()));
+        assert_eq!(
+            extract_quantization("model.Q4_K_M.gguf"),
+            Some("Q4_K_M".to_string())
+        );
+        assert_eq!(
+            extract_quantization("model.Q5_K_S.gguf"),
+            Some("Q5_K_S".to_string())
+        );
+        assert_eq!(
+            extract_quantization("model.Q8_0.gguf"),
+            Some("Q8_0".to_string())
+        );
+        assert_eq!(
+            extract_quantization("model.F16.gguf"),
+            Some("F16".to_string())
+        );
     }
 
     #[test]
     fn test_extract_quantization_case_insensitive() {
-        assert_eq!(extract_quantization("Model.q4_k_m.GGUF"), Some("Q4_K_M".to_string()));
+        assert_eq!(
+            extract_quantization("Model.q4_k_m.GGUF"),
+            Some("Q4_K_M".to_string())
+        );
     }
 
     #[test]

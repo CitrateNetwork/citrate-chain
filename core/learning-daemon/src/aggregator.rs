@@ -52,10 +52,7 @@ pub trait EmbeddingCache: Send + Sync {
     /// Each tuple: `(submitter, embedding[dim], confidence[dim], weight)`.
     /// All values are raw Q16 (i64) bits; dim is consistent across
     /// participants (the aggregator validates).
-    fn embeddings_for_cycle(
-        &self,
-        cycle_id: CycleId,
-    ) -> Vec<EmbeddingEntry>;
+    fn embeddings_for_cycle(&self, cycle_id: CycleId) -> Vec<EmbeddingEntry>;
 }
 
 /// One participant's contribution to a cycle.
@@ -86,7 +83,10 @@ impl MemoryEmbeddingCache {
 
     /// Test helper: insert an embedding entry for a cycle.
     pub fn insert(&self, cycle_id: CycleId, entry: EmbeddingEntry) {
-        let mut entries = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         entries.entry(cycle_id).or_default().push(entry);
     }
 }
@@ -99,7 +99,10 @@ impl Default for MemoryEmbeddingCache {
 
 impl EmbeddingCache for MemoryEmbeddingCache {
     fn embeddings_for_cycle(&self, cycle_id: CycleId) -> Vec<EmbeddingEntry> {
-        let entries = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         entries.get(&cycle_id).cloned().unwrap_or_default()
     }
 }
@@ -120,11 +123,7 @@ pub struct BelnapAggregator<C: ChainAdapter> {
 
 impl<C: ChainAdapter> BelnapAggregator<C> {
     /// Construct a new aggregator with default thresholds.
-    pub fn new(
-        chain: Arc<C>,
-        state: Arc<DaemonState>,
-        cache: Arc<dyn EmbeddingCache>,
-    ) -> Self {
+    pub fn new(chain: Arc<C>, state: Arc<DaemonState>, cache: Arc<dyn EmbeddingCache>) -> Self {
         // Default Q16(0.8) ≈ 0x0000_CCCC = 52428.
         let q16_zero_point_eight: i64 = 52428;
         Self {
@@ -150,7 +149,9 @@ impl<C: ChainAdapter> BelnapAggregator<C> {
     /// encoder here since the daemon needs it in production).
     fn encode_belnap_input(&self, entries: &[EmbeddingEntry]) -> DaemonResult<Vec<u8>> {
         let Some(first) = entries.first() else {
-            return Err(DaemonError::Aggregation("no embeddings to aggregate".into()));
+            return Err(DaemonError::Aggregation(
+                "no embeddings to aggregate".into(),
+            ));
         };
         let dim = first.embedding.len();
         if dim == 0 {
@@ -221,7 +222,11 @@ impl<C: ChainAdapter + 'static> Aggregator for BelnapAggregator<C> {
         // body.
         let current = self.state.cycle_status(cycle_id);
         if current != CycleStatus::Pending {
-            debug!(cycle_id, ?current, "aggregate skipping (idempotent — already past pending)");
+            debug!(
+                cycle_id,
+                ?current,
+                "aggregate skipping (idempotent — already past pending)"
+            );
             return Ok(());
         }
 
@@ -243,7 +248,8 @@ impl<C: ChainAdapter + 'static> Aggregator for BelnapAggregator<C> {
         // "computed" intermediate state the spec requires; if the
         // commit fails, restart will see "computed" and resubmit
         // (which is idempotent at the chain level).
-        self.state.set_cycle_status(cycle_id, CycleStatus::Computed)?;
+        self.state
+            .set_cycle_status(cycle_id, CycleStatus::Computed)?;
 
         // Submit commit to chain.
         let tx_hash = self
@@ -258,7 +264,8 @@ impl<C: ChainAdapter + 'static> Aggregator for BelnapAggregator<C> {
         // orchestrator.rs::dispatch_event), so this is the local
         // optimistic update; the event handler is the
         // authoritative confirmation.
-        self.state.set_cycle_status(cycle_id, CycleStatus::Committed)?;
+        self.state
+            .set_cycle_status(cycle_id, CycleStatus::Committed)?;
 
         Ok(())
     }
@@ -327,7 +334,9 @@ mod tests {
         cache.insert(1, make_entry(0x01, 32768));
 
         // Pre-set state to Computed (simulating restart-after-commit-pending).
-        state.set_cycle_status(1, CycleStatus::Computed).expect("ok");
+        state
+            .set_cycle_status(1, CycleStatus::Computed)
+            .expect("ok");
 
         let agg = BelnapAggregator::new(chain.clone(), state.clone(), cache);
         agg.aggregate(1).await.expect("ok");
@@ -345,8 +354,12 @@ mod tests {
         let cache = Arc::new(MemoryEmbeddingCache::new());
         cache.insert(1, make_entry(0x01, 32768));
 
-        state.set_cycle_status(1, CycleStatus::Computed).expect("ok");
-        state.set_cycle_status(1, CycleStatus::Committed).expect("ok");
+        state
+            .set_cycle_status(1, CycleStatus::Computed)
+            .expect("ok");
+        state
+            .set_cycle_status(1, CycleStatus::Committed)
+            .expect("ok");
 
         let agg = BelnapAggregator::new(chain.clone(), state.clone(), cache);
         agg.aggregate(1).await.expect("ok");
@@ -361,8 +374,8 @@ mod tests {
         let cache = Arc::new(MemoryEmbeddingCache::new());
         let mut bad = make_entry(0x01, 32768);
         bad.confidence = vec![32768, 32768]; // dim=2
-        // First entry has dim=1 (single-element embedding); second has
-        // mismatched confidence dim=2 vs embedding dim=1.
+                                             // First entry has dim=1 (single-element embedding); second has
+                                             // mismatched confidence dim=2 vs embedding dim=1.
         cache.insert(1, bad);
 
         let agg = BelnapAggregator::new(chain.clone(), state.clone(), cache);
@@ -405,6 +418,9 @@ mod tests {
         // The Belnap precompile must accept these bytes (forward()
         // decodes them internally; here we just confirm Ok).
         let result = belnap::aggregate(&bytes);
-        assert!(result.is_ok(), "Belnap accepts our encoded bytes: {result:?}");
+        assert!(
+            result.is_ok(),
+            "Belnap accepts our encoded bytes: {result:?}"
+        );
     }
 }

@@ -16,11 +16,8 @@ use aes_gcm::{
 };
 use anyhow::{anyhow, Result};
 use hmac::Mac;
-use k256::{
-    elliptic_curve::sec1::ToEncodedPoint,
-    PublicKey, SecretKey,
-};
 use k256::elliptic_curve::zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use k256::{elliptic_curve::sec1::ToEncodedPoint, PublicKey, SecretKey};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::Sha256;
@@ -198,9 +195,7 @@ impl ECIES {
 
     /// Derive encryption and MAC keys from shared secret using HKDF-SHA256
     #[allow(clippy::type_complexity)]
-    fn derive_keys(
-        shared_secret: &[u8; 32],
-    ) -> Result<(Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>)> {
+    fn derive_keys(shared_secret: &[u8; 32]) -> Result<(Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>)> {
         // HKDF-Extract
         let mut mac = <HmacSha256 as Mac>::new_from_slice(b"CITRATE_ECIES_SALT")
             .map_err(|e| anyhow!("HMAC init failed: {}", e))?;
@@ -308,7 +303,10 @@ mod tests {
             ManuallyDrop::drop(&mut e);
             std::ptr::read_volatile(key_ptr)
         };
-        assert_eq!(after, [0u8; 32], "private key must be wiped when ECIES drops");
+        assert_eq!(
+            after, [0u8; 32],
+            "private key must be wiped when ECIES drops"
+        );
     }
 
     /// PBA-L4-006: ECDH / HKDF intermediates are `Zeroizing` buffers, and the

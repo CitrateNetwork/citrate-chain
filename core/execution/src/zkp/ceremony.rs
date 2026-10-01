@@ -124,7 +124,9 @@ impl CeremonyState {
                 };
                 Ok(())
             }
-            Self::Accepting { .. } => Err("Ceremony is already accepting contributions".to_string()),
+            Self::Accepting { .. } => {
+                Err("Ceremony is already accepting contributions".to_string())
+            }
             Self::Finalized { .. } => Err("Ceremony is already finalized".to_string()),
         }
     }

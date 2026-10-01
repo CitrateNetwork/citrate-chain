@@ -236,10 +236,7 @@ pub fn tensor_commit(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
     // chunk is implicitly zero-padded by `from_le_bytes_mod_order` — the
     // length prefix in the canonical format already disambiguates
     // padding from real data.
-    let chunks: Vec<Fr> = input
-        .chunks(31)
-        .map(Fr::from_le_bytes_mod_order)
-        .collect();
+    let chunks: Vec<Fr> = input.chunks(31).map(Fr::from_le_bytes_mod_order).collect();
 
     let h = poseidon_hash(&chunks);
 
@@ -598,8 +595,8 @@ pub fn inference_proof_verify(input: &[u8], gas_limit: u64) -> Result<Precompile
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::tensor_format::{encode, Dtype};
+    use super::*;
 
     /// Build a valid Q16 encoded tensor for use in tests.
     /// I64-S1: Q16 elements are 8 bytes (i64, little-endian) on the wire.
@@ -697,7 +694,8 @@ mod tests {
     fn tensor_commit_gas_metering() {
         let t = q16_tensor(&[2], &[1, 2]); // 1+8+1+8 = 18 bytes
         let words = (18u64).div_ceil(32); // = 1
-        let expected_gas = gas_costs::TENSOR_COMMIT_BASE + gas_costs::TENSOR_COMMIT_PER_WORD * words;
+        let expected_gas =
+            gas_costs::TENSOR_COMMIT_BASE + gas_costs::TENSOR_COMMIT_PER_WORD * words;
 
         // Exactly enough gas → succeeds.
         let r = tensor_commit(&t, expected_gas).unwrap();
@@ -812,12 +810,7 @@ mod tests {
     }
 
     /// Build the wire-format input bytes for 0x0109.
-    fn merkle_input(
-        commitment: &Fr,
-        leaf_index: u32,
-        leaf_value: &Fr,
-        siblings: &[Fr],
-    ) -> Vec<u8> {
+    fn merkle_input(commitment: &Fr, leaf_index: u32, leaf_value: &Fr, siblings: &[Fr]) -> Vec<u8> {
         let mut out = Vec::with_capacity(97 + siblings.len() * 32);
         out.extend_from_slice(&fr_to_be_bytes(commitment));
         // leaf_index: zero-padded BE u32 in the low 4 bytes of a 32-byte field
@@ -874,7 +867,12 @@ mod tests {
 
     #[test]
     fn merkle_verify_rejects_tampered_sibling() {
-        let leaves = vec![Fr::from(1u64), Fr::from(2u64), Fr::from(3u64), Fr::from(4u64)];
+        let leaves = vec![
+            Fr::from(1u64),
+            Fr::from(2u64),
+            Fr::from(3u64),
+            Fr::from(4u64),
+        ];
         let (root, paths) = build_merkle_tree(&leaves);
 
         let mut bad_path = paths[0].clone();
@@ -887,7 +885,12 @@ mod tests {
 
     #[test]
     fn merkle_verify_rejects_wrong_leaf_index() {
-        let leaves = vec![Fr::from(1u64), Fr::from(2u64), Fr::from(3u64), Fr::from(4u64)];
+        let leaves = vec![
+            Fr::from(1u64),
+            Fr::from(2u64),
+            Fr::from(3u64),
+            Fr::from(4u64),
+        ];
         let (root, paths) = build_merkle_tree(&leaves);
 
         // Use leaf 0's value+path but claim it's at leaf 1.
@@ -901,7 +904,12 @@ mod tests {
 
     #[test]
     fn merkle_verify_rejects_wrong_value() {
-        let leaves = vec![Fr::from(1u64), Fr::from(2u64), Fr::from(3u64), Fr::from(4u64)];
+        let leaves = vec![
+            Fr::from(1u64),
+            Fr::from(2u64),
+            Fr::from(3u64),
+            Fr::from(4u64),
+        ];
         let (root, paths) = build_merkle_tree(&leaves);
 
         // Correct index + path, wrong value.
@@ -956,8 +964,7 @@ mod tests {
         let input = merkle_input(&root, 0, &leaves[0], &paths[0]);
 
         // depth=2 → expected gas = 3000 + 200×2 = 3400.
-        let expected_gas = gas_costs::MERKLE_VERIFY_BASE
-            + gas_costs::MERKLE_VERIFY_PER_LEVEL * 2;
+        let expected_gas = gas_costs::MERKLE_VERIFY_BASE + gas_costs::MERKLE_VERIFY_PER_LEVEL * 2;
         assert_eq!(expected_gas, 3_400);
 
         let r = merkle_verify_tensor(&input, expected_gas).unwrap();
@@ -979,6 +986,9 @@ mod tests {
 
         let input = merkle_input(&leaf_hash, 0, &leaf_value, &[]);
         let r = merkle_verify_tensor(&input, 1_000_000).unwrap();
-        assert!(extract_bool(&r.output), "depth-0 (root == leaf hash) must verify");
+        assert!(
+            extract_bool(&r.output),
+            "depth-0 (root == leaf hash) must verify"
+        );
     }
 }

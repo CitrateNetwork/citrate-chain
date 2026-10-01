@@ -366,9 +366,18 @@ mod tests {
         assert!(matches!(outcome, CommitOutcome::Committed { .. }));
 
         // Accounts 1 and 2 bumped to v1; account 3 unchanged at v0.
-        assert_eq!(coord.tracker().version_of(&addr(1)), ReadVersion::from_raw(1));
-        assert_eq!(coord.tracker().version_of(&addr(2)), ReadVersion::from_raw(1));
-        assert_eq!(coord.tracker().version_of(&addr(3)), ReadVersion::from_raw(0));
+        assert_eq!(
+            coord.tracker().version_of(&addr(1)),
+            ReadVersion::from_raw(1)
+        );
+        assert_eq!(
+            coord.tracker().version_of(&addr(2)),
+            ReadVersion::from_raw(1)
+        );
+        assert_eq!(
+            coord.tracker().version_of(&addr(3)),
+            ReadVersion::from_raw(0)
+        );
     }
 
     #[test]
@@ -391,7 +400,10 @@ mod tests {
         // invalidated because account 1 is at v1 and A pinned at v0.
         let outcome_a = coord.try_commit(&journal_a);
         match outcome_a {
-            CommitOutcome::Aborted { reason, current_version } => {
+            CommitOutcome::Aborted {
+                reason,
+                current_version,
+            } => {
                 assert_eq!(reason, AbortReason::ReadSetInvalidated);
                 assert_eq!(current_version, ReadVersion::from_raw(1));
             }
@@ -414,8 +426,14 @@ mod tests {
         journal_b.record_read(addr(3));
         journal_b.record_write(addr(4), balance_write(200));
 
-        assert!(matches!(coord.try_commit(&journal_a), CommitOutcome::Committed { .. }));
-        assert!(matches!(coord.try_commit(&journal_b), CommitOutcome::Committed { .. }));
+        assert!(matches!(
+            coord.try_commit(&journal_a),
+            CommitOutcome::Committed { .. }
+        ));
+        assert!(matches!(
+            coord.try_commit(&journal_b),
+            CommitOutcome::Committed { .. }
+        ));
         assert_eq!(coord.current_version(), ReadVersion::from_raw(2));
     }
 
@@ -434,7 +452,10 @@ mod tests {
         journal_b.record_read(addr(1));
         journal_b.record_write(addr(1), balance_write(200));
 
-        assert!(matches!(coord.try_commit(&journal_a), CommitOutcome::Committed { .. }));
+        assert!(matches!(
+            coord.try_commit(&journal_a),
+            CommitOutcome::Committed { .. }
+        ));
         let outcome_b = coord.try_commit(&journal_b);
         assert!(matches!(
             outcome_b,
@@ -459,7 +480,10 @@ mod tests {
         // Intervening commit by someone else
         let mut intervening = coord.new_pinned_journal();
         intervening.record_write(addr(1), balance_write(50));
-        assert!(matches!(coord.try_commit(&intervening), CommitOutcome::Committed { .. }));
+        assert!(matches!(
+            coord.try_commit(&intervening),
+            CommitOutcome::Committed { .. }
+        ));
 
         // Our journal aborts
         assert!(matches!(
@@ -471,7 +495,10 @@ mod tests {
         journal.pin_at(coord.current_version());
         journal.record_read(addr(1));
         journal.record_write(addr(1), balance_write(100));
-        assert!(matches!(coord.try_commit(&journal), CommitOutcome::Committed { .. }));
+        assert!(matches!(
+            coord.try_commit(&journal),
+            CommitOutcome::Committed { .. }
+        ));
     }
 
     #[test]
@@ -509,9 +536,18 @@ mod tests {
         let v = coord.commit_writes_serialized(&ws);
         assert_eq!(v, ReadVersion::from_raw(1));
         assert_eq!(coord.current_version(), ReadVersion::from_raw(1));
-        assert_eq!(coord.tracker().version_of(&addr(1)), ReadVersion::from_raw(1));
-        assert_eq!(coord.tracker().version_of(&addr(2)), ReadVersion::from_raw(1));
-        assert_eq!(coord.tracker().version_of(&addr(3)), ReadVersion::from_raw(0));
+        assert_eq!(
+            coord.tracker().version_of(&addr(1)),
+            ReadVersion::from_raw(1)
+        );
+        assert_eq!(
+            coord.tracker().version_of(&addr(2)),
+            ReadVersion::from_raw(1)
+        );
+        assert_eq!(
+            coord.tracker().version_of(&addr(3)),
+            ReadVersion::from_raw(0)
+        );
     }
 
     #[test]
@@ -521,7 +557,9 @@ mod tests {
         // serialized-execution contract: callers are responsible for
         // ensuring no concurrent commits happen (via the exec_lock).
         let coord = CommitCoordinator::new();
-        coord.tracker().bump(addr(99), ReadVersion::from_raw(u64::MAX / 2));
+        coord
+            .tracker()
+            .bump(addr(99), ReadVersion::from_raw(u64::MAX / 2));
         let mut ws = WriteSet::new();
         ws.record_write(addr(1));
         let v = coord.commit_writes_serialized(&ws);
@@ -539,8 +577,7 @@ mod tests {
 
         type Event = (u8, &'static str, Instant);
         let coord = Arc::new(CommitCoordinator::new());
-        let events: Arc<tokio::sync::Mutex<Vec<Event>>> =
-            Arc::new(tokio::sync::Mutex::new(vec![]));
+        let events: Arc<tokio::sync::Mutex<Vec<Event>>> = Arc::new(tokio::sync::Mutex::new(vec![]));
 
         let coord1 = Arc::clone(&coord);
         let ev1 = Arc::clone(&events);
@@ -646,11 +683,22 @@ mod tests {
             .count();
         let aborted = outcomes
             .iter()
-            .filter(|o| matches!(o, CommitOutcome::Aborted { reason: AbortReason::ReadSetInvalidated, .. }))
+            .filter(|o| {
+                matches!(
+                    o,
+                    CommitOutcome::Aborted {
+                        reason: AbortReason::ReadSetInvalidated,
+                        ..
+                    }
+                )
+            })
             .count();
 
         assert_eq!(committed, 1, "exactly one worker from a common pin commits");
-        assert_eq!(aborted, 7, "the seven losers all abort with ReadSetInvalidated");
+        assert_eq!(
+            aborted, 7,
+            "the seven losers all abort with ReadSetInvalidated"
+        );
         assert_eq!(coord.current_version(), ReadVersion::from_raw(1));
     }
 

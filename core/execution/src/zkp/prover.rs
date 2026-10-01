@@ -138,7 +138,10 @@ impl Prover {
         // For now, return None and fix in the setup() to also store raw VKs.
         //
         // WORKAROUND: Re-extract from the proving key, which contains the VK.
-        self.proving_keys.read().get(&proof_type).map(|pk| pk.vk.clone())
+        self.proving_keys
+            .read()
+            .get(&proof_type)
+            .map(|pk| pk.vk.clone())
     }
 
     /// Generate proof for model execution
@@ -220,9 +223,7 @@ impl Prover {
             .map_err(|e| ZKPError::ProvingError(e.to_string()))?;
 
         // Public inputs must match circuit's new_input() allocations
-        let to_field_str = |hash: &[u8]| -> String {
-            super::be_u128_prefix(hash).to_string()
-        };
+        let to_field_str = |hash: &[u8]| -> String { super::be_u128_prefix(hash).to_string() };
 
         let public_inputs = vec![
             to_field_str(&model_hash),
@@ -263,9 +264,7 @@ impl Prover {
         let proof = Groth16::<Bls12_381>::prove(&pk, circuit, &mut rng)
             .map_err(|e| ZKPError::ProvingError(e.to_string()))?;
 
-        let to_field_str = |hash: &[u8]| -> String {
-            super::be_u128_prefix(hash).to_string()
-        };
+        let to_field_str = |hash: &[u8]| -> String { super::be_u128_prefix(hash).to_string() };
 
         let public_inputs = vec![
             to_field_str(&old_state_root),
@@ -308,9 +307,7 @@ impl Prover {
         let proof = Groth16::<Bls12_381>::prove(&pk, circuit, &mut rng)
             .map_err(|e| ZKPError::ProvingError(e.to_string()))?;
 
-        let to_field_str = |hash: &[u8]| -> String {
-            super::be_u128_prefix(hash).to_string()
-        };
+        let to_field_str = |hash: &[u8]| -> String { super::be_u128_prefix(hash).to_string() };
 
         let public_inputs = vec![
             to_field_str(&data_hash),

@@ -34,7 +34,9 @@ pub struct StateVersion {
 impl StateVersion {
     /// Construct a fresh version counter at zero (genesis).
     pub fn new() -> Self {
-        Self { inner: AtomicU64::new(0) }
+        Self {
+            inner: AtomicU64::new(0),
+        }
     }
 
     /// Read the current global version. Acquire ordering so that subsequent
