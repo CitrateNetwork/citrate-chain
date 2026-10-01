@@ -13,6 +13,20 @@
 // ADDRESS NOTE: 0x0107–0x0109 are taken (tensor-commit / halo2-proof / merkle-tensor); this new
 // verification family starts at 0x0130. The Solidity side defaults `foldVerifier` to `address(0x0130)`.
 
+// PANIC-S1 G2: precompile reachable from the REVM bridge; panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use anyhow::{anyhow, Result};
 
 use crate::precompiles::PrecompileResult;

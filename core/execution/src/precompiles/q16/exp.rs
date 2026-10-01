@@ -37,6 +37,20 @@
 // freezes a fixture set; mutation of any constant below breaks
 // it.
 
+// PANIC-S1 G2: precompile reachable from the REVM bridge; panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use super::Q16;
 
 /// `ln(2) × 2³²`, rounded. Used for high-precision range reduction

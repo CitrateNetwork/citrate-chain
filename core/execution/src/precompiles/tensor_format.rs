@@ -56,6 +56,20 @@
 // with a new format — not a v2 of this one. This avoids the v1/v2
 // branching that compounds across every dispatcher.
 
+// PANIC-S1 G2: precompile reachable from the REVM bridge; panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use thiserror::Error;
 
 /// Hard caps for the format. These are the absolute upper bounds at

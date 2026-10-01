@@ -22,6 +22,20 @@
 // `tests/poseidon_frozen_v1.rs` is the canary; do not "fix" that test
 // to make it pass. See its top-of-file procedure block.
 
+// PANIC-S1 G2: precompile reachable from the REVM bridge; panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use anyhow::{anyhow, Result};
 use ark_bn254::Fr;
 use ark_ff::{BigInteger, PrimeField};

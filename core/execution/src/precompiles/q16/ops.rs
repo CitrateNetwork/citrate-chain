@@ -7,6 +7,20 @@
 // dispatchers in RM-M2 will do it; LinearChip's differential
 // test does it via the calling-test plumbing).
 
+// PANIC-S1 G2: precompile reachable from the REVM bridge; panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use super::Q16;
 
 /// Dot product over Q16 vectors. Returns `Σ a[i] · b[i]` with

@@ -64,6 +64,20 @@
 // Changing it requires a hardfork. Verified by tripwire
 // `check_routing_arch_locked.py` (WP-2.4).
 
+// PANIC-S1 G2: precompile reachable from the REVM bridge; panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 #![allow(dead_code)] // some helpers exposed for the RM-FL-3 daemon path
 
 use super::ops as q16_ops;

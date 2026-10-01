@@ -27,6 +27,20 @@
 // pin the exact bytes for a sweep of canonical inputs. Drift forks
 // the chain.
 
+// PANIC-S1 G2: precompile reachable from the REVM bridge; panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use anyhow::{anyhow, Result};
 
 use super::q16::{ops as q16_ops, Q16};

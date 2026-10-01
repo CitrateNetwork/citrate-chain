@@ -41,6 +41,20 @@
 // differential test needs it. The precompile dispatcher and
 // RM-M2 governance machinery land in their own sprint.
 
+// PANIC-S1 G2: precompile reachable from the REVM bridge; panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 #![allow(dead_code)]
 
 pub mod belnap;
