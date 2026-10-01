@@ -76,22 +76,19 @@ impl Trie {
                 mut children,
                 value: branch_value,
             } => {
-                if key.is_empty() {
+                match split_nibble(key) {
                     // Update branch value
-                    TrieNode::Branch {
+                    None => TrieNode::Branch {
                         children,
                         value: Some(value),
-                    }
-                } else {
-                    let index = key[0] as usize;
-                    *children[index] = Self::insert_node(
-                        *children[index].clone(),
-                        &key[1..],
-                        value,
-                    );
-                    TrieNode::Branch {
-                        children,
-                        value: branch_value,
+                    },
+                    Some((index, rest)) => {
+                        let child = take_child(&mut children, index);
+                        set_child(&mut children, index, Self::insert_node(child, rest, value));
+                        TrieNode::Branch {
+                            children,
+                            value: branch_value,
+                        }
                     }
                 }
             }
@@ -103,7 +100,7 @@ impl Trie {
                     // Entire prefix matches
                     TrieNode::Extension {
                         prefix: prefix.clone(),
-                        node: Box::new(Self::insert_node(*node, &key[common.len()..], value)),
+                        node: Box::new(Self::insert_node(*node, tail(key, common.len()), value)),
                     }
                 } else {
                     // Partial match - split extension
@@ -150,22 +147,14 @@ impl Trie {
                 }
             }
 
-            TrieNode::Branch { children, value } => {
-                if key.is_empty() {
-                    value.clone()
-                } else {
-                    let index = key[0] as usize;
-                    Self::get_node(&children[index], &key[1..])
-                }
-            }
+            TrieNode::Branch { children, value } => match split_nibble(key) {
+                None => value.clone(),
+                Some((index, rest)) => Self::get_node(child(children, index), rest),
+            },
 
-            TrieNode::Extension { prefix, node } => {
-                if key.starts_with(prefix) {
-                    Self::get_node(node, &key[prefix.len()..])
-                } else {
-                    None
-                }
-            }
+            TrieNode::Extension { prefix, node } => key
+                .strip_prefix(prefix.as_slice())
+                .and_then(|rest| Self::get_node(node, rest)),
         }
     }
 
@@ -194,25 +183,25 @@ impl Trie {
                 mut children,
                 value,
             } => {
-                if key.is_empty() {
+                match split_nibble(key) {
                     // Remove branch value
-                    TrieNode::Branch {
+                    None => TrieNode::Branch {
                         children,
                         value: None,
-                    }
-                } else {
-                    let index = key[0] as usize;
-                    *children[index] =
-                        Self::remove_node(*children[index].clone(), &key[1..]);
+                    },
+                    Some((index, rest)) => {
+                        let child = take_child(&mut children, index);
+                        set_child(&mut children, index, Self::remove_node(child, rest));
 
-                    // Check if branch can be simplified
-                    Self::simplify_branch(children, value)
+                        // Check if branch can be simplified
+                        Self::simplify_branch(children, value)
+                    }
                 }
             }
 
             TrieNode::Extension { prefix, node } => {
-                if key.starts_with(&prefix) {
-                    let new_node = Self::remove_node(*node, &key[prefix.len()..]);
+                if let Some(rest) = key.strip_prefix(prefix.as_slice()) {
+                    let new_node = Self::remove_node(*node, rest);
                     if matches!(new_node, TrieNode::Empty) {
                         TrieNode::Empty
                     } else {
@@ -273,55 +262,75 @@ impl Trie {
     fn create_branch(key1: Vec<u8>, value1: Vec<u8>, key2: Vec<u8>, value2: Vec<u8>) -> TrieNode {
         let mut children: [Box<TrieNode>; 16] = default_children();
 
-        if key1.is_empty() {
+        match (split_nibble(&key1), split_nibble(&key2)) {
             // key1 goes to branch value
-            let index = key2[0] as usize;
-            *children[index] = TrieNode::Leaf {
-                key: key2[1..].to_vec(),
-                value: value2,
-            };
-            TrieNode::Branch {
-                children,
-                value: Some(value1),
-            }
-        } else if key2.is_empty() {
-            // key2 goes to branch value
-            let index = key1[0] as usize;
-            *children[index] = TrieNode::Leaf {
-                key: key1[1..].to_vec(),
-                value: value1,
-            };
-            TrieNode::Branch {
-                children,
-                value: Some(value2),
-            }
-        } else {
-            // Both go to children
-            let index1 = key1[0] as usize;
-            let index2 = key2[0] as usize;
-
-            if index1 == index2 {
-                *children[index1] = Self::create_branch(
-                    key1[1..].to_vec(),
-                    value1,
-                    key2[1..].to_vec(),
-                    value2,
+            (None, Some((index, rest))) => {
+                set_child(
+                    &mut children,
+                    index,
+                    TrieNode::Leaf {
+                        key: rest.to_vec(),
+                        value: value2,
+                    },
                 );
-            } else {
-                *children[index1] = TrieNode::Leaf {
-                    key: key1[1..].to_vec(),
-                    value: value1,
-                };
-                *children[index2] = TrieNode::Leaf {
-                    key: key2[1..].to_vec(),
-                    value: value2,
-                };
+                TrieNode::Branch {
+                    children,
+                    value: Some(value1),
+                }
             }
-
-            TrieNode::Branch {
-                children,
-                value: None,
+            // key2 goes to branch value
+            (Some((index, rest)), None) => {
+                set_child(
+                    &mut children,
+                    index,
+                    TrieNode::Leaf {
+                        key: rest.to_vec(),
+                        value: value1,
+                    },
+                );
+                TrieNode::Branch {
+                    children,
+                    value: Some(value2),
+                }
             }
+            // Both go to children
+            (Some((index1, rest1)), Some((index2, rest2))) => {
+                if index1 == index2 {
+                    set_child(
+                        &mut children,
+                        index1,
+                        Self::create_branch(rest1.to_vec(), value1, rest2.to_vec(), value2),
+                    );
+                } else {
+                    set_child(
+                        &mut children,
+                        index1,
+                        TrieNode::Leaf {
+                            key: rest1.to_vec(),
+                            value: value1,
+                        },
+                    );
+                    set_child(
+                        &mut children,
+                        index2,
+                        TrieNode::Leaf {
+                            key: rest2.to_vec(),
+                            value: value2,
+                        },
+                    );
+                }
+                TrieNode::Branch {
+                    children,
+                    value: None,
+                }
+            }
+            // INVARIANT: unreachable. Callers only split two DIFFERENT keys, and equal
+            // leading nibbles recurse on the tails, so both can't run out together.
+            // Equal keys mean "update", which is what this returns.
+            (None, None) => TrieNode::Leaf {
+                key: key2,
+                value: value2,
+            },
         }
     }
 
@@ -332,33 +341,43 @@ impl Trie {
         value: Vec<u8>,
         common_len: usize,
     ) -> TrieNode {
-        let common = &prefix[..common_len];
-        let remaining_prefix = &prefix[common_len..];
-        let remaining_key = &key[common_len..];
+        // `common_len` is the shared-prefix length of `prefix` and `key`, so it is
+        // within both.
+        let (common, remaining_prefix) = prefix
+            .split_at_checked(common_len)
+            .unwrap_or((prefix.as_slice(), &[]));
+        let remaining_key = tail(&key, common_len);
 
         let mut children: [Box<TrieNode>; 16] = default_children();
 
-        if !remaining_prefix.is_empty() {
-            let index = remaining_prefix[0] as usize;
-            if remaining_prefix.len() == 1 {
-                *children[index] = node;
+        if let Some((index, rest)) = split_nibble(remaining_prefix) {
+            if rest.is_empty() {
+                set_child(&mut children, index, node);
             } else {
-                *children[index] = TrieNode::Extension {
-                    prefix: remaining_prefix[1..].to_vec(),
-                    node: Box::new(node),
-                };
+                set_child(
+                    &mut children,
+                    index,
+                    TrieNode::Extension {
+                        prefix: rest.to_vec(),
+                        node: Box::new(node),
+                    },
+                );
             }
         }
 
-        let branch_value = if remaining_key.is_empty() {
-            Some(value)
-        } else {
-            let index = remaining_key[0] as usize;
-            *children[index] = TrieNode::Leaf {
-                key: remaining_key[1..].to_vec(),
-                value,
-            };
-            None
+        let branch_value = match split_nibble(remaining_key) {
+            None => Some(value),
+            Some((index, rest)) => {
+                set_child(
+                    &mut children,
+                    index,
+                    TrieNode::Leaf {
+                        key: rest.to_vec(),
+                        value,
+                    },
+                );
+                None
+            }
         };
 
         let branch = TrieNode::Branch {
@@ -383,9 +402,9 @@ impl Trie {
             .filter(|(_, child)| !matches!(child.as_ref(), TrieNode::Empty))
             .collect();
 
-        if non_empty.len() == 1 && value.is_none() {
+        if let ([(index, child)], None) = (non_empty.as_slice(), &value) {
             // Only one child - convert to extension or leaf
-            let (index, child) = non_empty[0];
+            let index = *index;
             match child.as_ref() {
                 TrieNode::Leaf { key, value } => {
                     let mut new_key = vec![index as u8];
@@ -397,7 +416,7 @@ impl Trie {
                 }
                 _ => TrieNode::Extension {
                     prefix: vec![index as u8],
-                    node: child.clone(),
+                    node: Box::clone(child),
                 },
             }
         } else {
@@ -414,12 +433,43 @@ impl Default for Trie {
 
 /// Convert bytes to nibbles (4-bit values)
 fn to_nibbles(bytes: &[u8]) -> Vec<u8> {
-    let mut nibbles = Vec::with_capacity(bytes.len() * 2);
+    let mut nibbles = Vec::with_capacity(bytes.len().saturating_mul(2));
     for byte in bytes {
         nibbles.push(byte >> 4);
         nibbles.push(byte & 0x0f);
     }
     nibbles
+}
+
+/// Split a nibble path into its first nibble, as a child index, and the rest. The
+/// mask is the identity on nibbles (always < 16); it makes the index provably in range.
+fn split_nibble(key: &[u8]) -> Option<(usize, &[u8])> {
+    key.split_first()
+        .map(|(&nibble, rest)| (usize::from(nibble & 0x0f), rest))
+}
+
+/// `key[n..]`, or empty if `n` is past the end (callers only pass `n <= key.len()`).
+fn tail(key: &[u8], n: usize) -> &[u8] {
+    key.get(n..).unwrap_or_default()
+}
+
+static EMPTY_NODE: TrieNode = TrieNode::Empty;
+
+fn child(children: &[Box<TrieNode>; 16], index: usize) -> &TrieNode {
+    children.get(index).map_or(&EMPTY_NODE, |c| c.as_ref())
+}
+
+fn take_child(children: &mut [Box<TrieNode>; 16], index: usize) -> TrieNode {
+    children
+        .get_mut(index)
+        .map(|c| std::mem::take(c.as_mut()))
+        .unwrap_or_default()
+}
+
+fn set_child(children: &mut [Box<TrieNode>; 16], index: usize, node: TrieNode) {
+    if let Some(slot) = children.get_mut(index) {
+        **slot = node;
+    }
 }
 
 /// Find common prefix length
@@ -570,36 +620,101 @@ mod nondeterminism_probe {
             let (k, v) = &pairs[(idx * 37 + 11) % n];
             t3.insert(k.clone(), v.clone());
         }
-        assert_eq!(t1.root_hash(), t2.root_hash(), "reversed insertion order changed the root");
-        assert_eq!(t1.root_hash(), t3.root_hash(), "shuffled insertion order changed the root");
+        assert_eq!(
+            t1.root_hash(),
+            t2.root_hash(),
+            "reversed insertion order changed the root"
+        );
+        assert_eq!(
+            t1.root_hash(),
+            t3.root_hash(),
+            "shuffled insertion order changed the root"
+        );
     }
 }
-
 
 #[cfg(test)]
 mod trie_shuffle_probe {
     use super::*;
     #[test]
     fn address_keys_all_orders() {
-        let mk = |i: u8| { let mut k = vec![0u8; 20]; k[0]=i; k[19]=i.wrapping_mul(3).wrapping_add(1); k };
+        let mk = |i: u8| {
+            let mut k = vec![0u8; 20];
+            k[0] = i;
+            k[19] = i.wrapping_mul(3).wrapping_add(1);
+            k
+        };
         let val = |i: u8| vec![i.wrapping_mul(7); 32];
         let orders: Vec<Vec<u8>> = vec![
             (0u8..48).collect(),
             (0u8..48).rev().collect(),
-            (0u8..48).map(|i| ((i as usize *37+5)%48) as u8).collect(),
-            (0u8..48).map(|i| ((i as usize *13+7)%48) as u8).collect(),
+            (0u8..48)
+                .map(|i| ((i as usize * 37 + 5) % 48) as u8)
+                .collect(),
+            (0u8..48)
+                .map(|i| ((i as usize * 13 + 7) % 48) as u8)
+                .collect(),
         ];
         let mut roots = Vec::new();
         for ord in &orders {
             let mut t = Trie::new();
-            for &i in ord { t.insert(mk(i), val(i)); }
+            for &i in ord {
+                t.insert(mk(i), val(i));
+            }
             roots.push(t.root_hash());
         }
         for (idx, r) in roots.iter().enumerate() {
             eprintln!("order {idx}: root {}", hex::encode(&r.as_bytes()[..8]));
         }
         for idx in 1..roots.len() {
-            assert_eq!(roots[0], roots[idx], "trie root differs for order {idx} vs 0");
+            assert_eq!(
+                roots[0], roots[idx],
+                "trie root differs for order {idx} vs 0"
+            );
         }
+    }
+
+    /// PANIC-S1 golden vector: a deterministic mix of inserts and removes over
+    /// variable-length keys that prefix one another (exercising branch values,
+    /// extension splits and branch simplification). The digest folds the root after
+    /// every op; it was recorded on the pre-PANIC-S1 trie, so any change to the
+    /// state-root function fails this test.
+    fn golden_digest() -> String {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut trie = Trie::new();
+        let mut live: Vec<Vec<u8>> = Vec::new();
+        let mut fold = Keccak256::new();
+        for _ in 0..2_000 {
+            let r = next();
+            if r % 4 == 0 && !live.is_empty() {
+                let k = live.swap_remove((r >> 8) as usize % live.len());
+                trie.remove(&k);
+            } else {
+                let len = 1 + (r >> 4) as usize % 5;
+                let key: Vec<u8> = (0..len)
+                    .map(|i| ((r >> (16 + 8 * i)) & 0x13) as u8)
+                    .collect();
+                let value = (r >> 32).to_be_bytes().to_vec();
+                trie.insert(key.clone(), value.clone());
+                assert_eq!(trie.get(&key), Some(value));
+                live.push(key);
+            }
+            fold.update(trie.root_hash().as_bytes());
+        }
+        hex::encode(fold.finalize())
+    }
+
+    #[test]
+    fn panic_s1_trie_root_golden_vector() {
+        assert_eq!(
+            golden_digest(),
+            "93c7dc7f168d8201e6a06ab9ac81c1a3136861ce1731306b58e046adbf6d6dc2"
+        );
     }
 }
