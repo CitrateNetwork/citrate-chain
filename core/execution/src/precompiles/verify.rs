@@ -207,7 +207,9 @@ pub fn tensor_commit(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
     // Gas: per-32-byte-word + base. `div_ceil` so a 1-byte input still
     // costs at least one word.
     let words = (input.len() as u64).div_ceil(32);
-    let gas_used = gas_costs::TENSOR_COMMIT_BASE + gas_costs::TENSOR_COMMIT_PER_WORD * words;
+    let gas_used = gas_costs::TENSOR_COMMIT_PER_WORD
+        .saturating_mul(words)
+        .saturating_add(gas_costs::TENSOR_COMMIT_BASE);
     if gas_limit < gas_used {
         return Err(anyhow!(
             "Insufficient gas for TENSOR_COMMIT: need {gas_used}, have {gas_limit}"
@@ -231,9 +233,11 @@ pub fn tensor_commit(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
     let bigint = h.into_bigint();
     let mut bytes_le = bigint.to_bytes_le();
     bytes_le.reverse();
+    let n = bytes_le.len().min(32);
     let mut out = vec![0u8; 32];
-    let off = 32 - bytes_le.len().min(32);
-    out[off..].copy_from_slice(&bytes_le[..bytes_le.len().min(32)]);
+    if let (Some(dst), Some(src)) = (out.get_mut(32usize.saturating_sub(n)..), bytes_le.get(..n)) {
+        dst.copy_from_slice(src);
+    }
 
     Ok(PrecompileResult {
         output: out,
@@ -299,10 +303,14 @@ pub fn merkle_verify_tensor(input: &[u8], gas_limit: u64) -> Result<PrecompileRe
         ));
     }
 
-    let commitment_bytes: [u8; 32] = input[0..32].try_into().expect("32 bytes");
-    let leaf_index_bytes: [u8; 32] = input[32..64].try_into().expect("32 bytes");
-    let leaf_value_bytes: [u8; 32] = input[64..96].try_into().expect("32 bytes");
-    let proof_depth = input[96];
+    let header = merkle_header(input)?;
+    let (commitment_bytes, leaf_index_bytes, leaf_value_bytes, proof_depth, siblings) = (
+        header.commitment,
+        header.leaf_index,
+        header.leaf_value,
+        header.depth,
+        header.siblings,
+    );
 
     if proof_depth > gas_costs::MERKLE_VERIFY_MAX_DEPTH {
         return Err(anyhow!(
@@ -312,7 +320,8 @@ pub fn merkle_verify_tensor(input: &[u8], gas_limit: u64) -> Result<PrecompileRe
         ));
     }
 
-    let expected_input_len = 97usize + (proof_depth as usize) * 32;
+    // proof_depth <= MERKLE_VERIFY_MAX_DEPTH, so this cannot saturate.
+    let expected_input_len = (proof_depth as usize).saturating_mul(32).saturating_add(97);
     if input.len() != expected_input_len {
         return Err(anyhow!(
             "MERKLE_VERIFY_TENSOR input length mismatch: expected {}, got {}",
@@ -321,8 +330,9 @@ pub fn merkle_verify_tensor(input: &[u8], gas_limit: u64) -> Result<PrecompileRe
         ));
     }
 
-    let gas_used = gas_costs::MERKLE_VERIFY_BASE
-        + gas_costs::MERKLE_VERIFY_PER_LEVEL * proof_depth as u64;
+    let gas_used = gas_costs::MERKLE_VERIFY_PER_LEVEL
+        .saturating_mul(proof_depth as u64)
+        .saturating_add(gas_costs::MERKLE_VERIFY_BASE);
     if gas_limit < gas_used {
         return Err(anyhow!(
             "Insufficient gas for MERKLE_VERIFY_TENSOR: need {gas_used}, have {gas_limit}"
@@ -349,18 +359,11 @@ pub fn merkle_verify_tensor(input: &[u8], gas_limit: u64) -> Result<PrecompileRe
     // at 32 levels, so only the low 32 bits of the 256-bit field
     // element matter for path direction. We extract those from the
     // big-endian bytes (bytes 28..32 are the low 32 bits in BE order).
-    let leaf_index_lo32 = u32::from_be_bytes(
-        leaf_index_bytes[28..32]
-            .try_into()
-            .expect("4 bytes by slice"),
-    );
+    let leaf_index_lo32 = low_u32(&leaf_index_bytes);
 
-    for level in 0..(proof_depth as usize) {
-        let off = 97 + level * 32;
-        let sibling_bytes: [u8; 32] = input[off..off + 32]
-            .try_into()
-            .expect("32 bytes");
-        let sibling_fr = Fr::from_be_bytes_mod_order(&sibling_bytes);
+    // The length check above makes `siblings` exactly proof_depth 32-byte words.
+    for (level, sibling_bytes) in siblings.chunks_exact(32).enumerate() {
+        let sibling_fr = Fr::from_be_bytes_mod_order(sibling_bytes);
 
         let bit = (leaf_index_lo32 >> level) & 1;
         current = if bit == 0 {
@@ -375,16 +378,53 @@ pub fn merkle_verify_tensor(input: &[u8], gas_limit: u64) -> Result<PrecompileRe
     // Compare reconstructed root to expected commitment.
     let valid = current == target_root_fr;
 
-    let mut output = vec![0u8; 32];
+    let mut output = [0u8; 32];
     if valid {
         output[31] = 1;
     }
+    let output = output.to_vec();
 
     Ok(PrecompileResult {
         output,
         gas_used,
         success: true, // success=true means "the precompile ran"; the bool result is in `output`.
     })
+}
+
+/// MERKLE_VERIFY_TENSOR fixed header: commitment(32) ‖ leaf_index(32) ‖
+/// leaf_value(32) ‖ proof_depth(1), followed by the sibling words.
+struct MerkleHeader<'a> {
+    commitment: [u8; 32],
+    leaf_index: [u8; 32],
+    leaf_value: [u8; 32],
+    depth: u8,
+    siblings: &'a [u8],
+}
+
+fn merkle_header(input: &[u8]) -> Result<MerkleHeader<'_>> {
+    let short = || {
+        anyhow!(
+            "MERKLE_VERIFY_TENSOR input too short: need ≥ 97 bytes, got {}",
+            input.len()
+        )
+    };
+    let (commitment, rest) = input.split_first_chunk::<32>().ok_or_else(short)?;
+    let (leaf_index, rest) = rest.split_first_chunk::<32>().ok_or_else(short)?;
+    let (leaf_value, rest) = rest.split_first_chunk::<32>().ok_or_else(short)?;
+    let (&depth, siblings) = rest.split_first().ok_or_else(short)?;
+    Ok(MerkleHeader {
+        commitment: *commitment,
+        leaf_index: *leaf_index,
+        leaf_value: *leaf_value,
+        depth,
+        siblings,
+    })
+}
+
+/// The low 32 bits of a big-endian 256-bit word.
+fn low_u32(word: &[u8; 32]) -> u32 {
+    let [.., a, b, c, d] = *word;
+    u32::from_be_bytes([a, b, c, d])
 }
 
 /// 0x0109 with a leaf-index range check (at/after `pba_hardening_height`).
@@ -396,10 +436,11 @@ pub fn merkle_verify_tensor_hardened(input: &[u8], gas_limit: u64) -> Result<Pre
     let mut result = merkle_verify_tensor(input, gas_limit)?;
     // merkle_verify_tensor validated the layout: input[32..64] is leaf_index,
     // input[96] is the proof depth (<= 32).
-    let depth = input[96] as u32;
-    let index = &input[32..64];
-    let high_zero = index[..28].iter().all(|&b| b == 0);
-    let lo32 = u32::from_be_bytes([index[28], index[29], index[30], index[31]]);
+    let header = merkle_header(input)?;
+    let depth = header.depth as u32;
+    let index = &header.leaf_index;
+    let high_zero = index.iter().take(28).all(|&b| b == 0);
+    let lo32 = low_u32(index);
     let fits = high_zero && (depth >= 32 || (lo32 >> depth) == 0);
     if !fits {
         result.output = vec![0u8; 32];
@@ -467,15 +508,13 @@ pub fn inference_proof_verify(input: &[u8], gas_limit: u64) -> Result<Precompile
     // inference base (the historical default) and let the verifier
     // surface the structured Truncated error.
     const VERSION_OFFSET: usize = 96;
-    let version = if input.len() >= VERSION_OFFSET + 4 {
-        u32::from_be_bytes(
-            input[VERSION_OFFSET..VERSION_OFFSET + 4]
-                .try_into()
-                .expect("4B"),
-        )
-    } else {
+    let version = match input
+        .get(VERSION_OFFSET..)
+        .and_then(|rest| rest.first_chunk::<4>())
+    {
+        Some(v) => u32::from_be_bytes(*v),
         // Unknown — default to the inference (v1) gas schedule.
-        crate::zkp::halo2::CIRCUIT_VERSION_LINEAR_Q16
+        None => crate::zkp::halo2::CIRCUIT_VERSION_LINEAR_Q16,
     };
 
     let (base, per_byte) = match version {
@@ -497,7 +536,7 @@ pub fn inference_proof_verify(input: &[u8], gas_limit: u64) -> Result<Precompile
     };
 
     // Gas charge first — covers parsing + verification effort.
-    let gas_used = base.saturating_add(per_byte * input.len() as u64);
+    let gas_used = base.saturating_add(per_byte.saturating_mul(input.len() as u64));
     if gas_limit < gas_used {
         return Err(anyhow!(
             "Insufficient gas for INFERENCE_PROOF_VERIFY: need {gas_used}, have {gas_limit}"
