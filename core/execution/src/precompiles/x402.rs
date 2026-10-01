@@ -722,4 +722,28 @@ mod tests {
         assert_eq!(&out[..2], &1u16.to_be_bytes());
         assert_eq!(&out[2..34], &word[..]);
     }
+
+    /// PANIC-S1 G4: v = 0/1 and v = 27/28 are the same recovery id. Find a
+    /// signature with recid 0 deterministically and check both encodings verify.
+    #[test]
+    fn panic_s1_v_zero_and_v_27_are_equivalent() {
+        let key = SigningKey::from_bytes(&[7u8; 32].into()).unwrap();
+        let domain = [0x11u8; 32];
+        let to = [0x22u8; 20];
+        let zero = [0u8; 32];
+        for n in 0u8..=255 {
+            let nonce = [n; 32];
+            let mut input = create_test_transfer_auth(&domain, &key, &to, &zero, &zero, &zero, &nonce);
+            if input[200] != 27 {
+                continue; // recid 1; try another nonce
+            }
+            let w27 = transfer_auth_verify(&input, 10_000).unwrap().output;
+            input[200] = 0;
+            let w0 = transfer_auth_verify(&input, 10_000).unwrap().output;
+            assert_eq!(w27[0], 1);
+            assert_eq!(w0, w27);
+            return;
+        }
+        panic!("no recid-0 signature in 256 nonces");
+    }
 }

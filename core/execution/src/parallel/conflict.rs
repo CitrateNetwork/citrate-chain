@@ -181,4 +181,24 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 3);
     }
+
+    /// PANIC-S1 G4: only a call with > 32 bytes of data starting 0xA0 touches the
+    /// model registry.
+    #[test]
+    fn panic_s1_model_registry_access_rule() {
+        let registry = b"registry:models".to_vec();
+        let ex = DefaultAccessSetExtractor;
+        let with = |data: Vec<u8>| {
+            let mut tx = make_test_tx([1; 32], Some([2; 32]), 0);
+            tx.data = data;
+            ex.extract(&tx)
+        };
+        let mut model = vec![0xA0];
+        model.extend_from_slice(&[0u8; 32]); // 33 bytes
+        assert!(with(model.clone()).writes.contains(&registry));
+        assert!(!with(model[..32].to_vec()).writes.contains(&registry), "32 bytes is not enough");
+        let mut other = model;
+        other[0] = 0xA1;
+        assert!(!with(other).writes.contains(&registry));
+    }
 }

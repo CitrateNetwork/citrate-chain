@@ -5369,4 +5369,180 @@ mod tests {
             ));
         }
     }
+
+    // ── PANIC-S1 G4: tests for live paths the mutation run found unpinned ──
+
+    fn big_gas_ctx(block: &Block) -> ExecutionContext {
+        let mut tx = create_test_tx(PublicKey::new([9; 32]), None, 0, 0);
+        tx.gas_limit = 50_000_000;
+        ExecutionContext::new(block, &tx)
+    }
+
+    fn test_model(owner: Address, policy: AccessPolicy) -> ModelState {
+        ModelState {
+            owner,
+            model_hash: Hash::new([0x77; 32]),
+            version: 1,
+            metadata: ModelMetadata {
+                name: "m".into(),
+                ..Default::default()
+            },
+            access_policy: policy,
+            usage_stats: crate::types::UsageStats::default(),
+        }
+    }
+
+    #[test]
+    fn panic_s1_genesis_model_is_registered_under_its_content_hash() {
+        let state_db = Arc::new(StateDB::new());
+        let executor = Executor::new(state_db.clone());
+        executor.register_genesis_model_from_bytes(b"onnx-bytes", "genesis", 7);
+        let id = ModelId(Hash::new(Keccak256::digest(b"onnx-bytes").into()));
+        let model = state_db.get_model(&id).expect("registered");
+        assert_eq!(model.metadata.name, "genesis");
+        assert_eq!(model.metadata.size_bytes, 10);
+        assert_eq!(model.metadata.created_at, 7);
+    }
+
+    #[tokio::test]
+    async fn panic_s1_update_model_bumps_version_for_owner_only() {
+        let state_db = Arc::new(StateDB::new());
+        let executor = Executor::new(state_db.clone());
+        let owner = Address([1; 20]);
+        let id = ModelId(Hash::new([0x42; 32]));
+        state_db
+            .register_model(id, test_model(owner, AccessPolicy::Public))
+            .unwrap();
+        let block = create_test_block();
+        let mut ctx = big_gas_ctx(&block);
+        let md = ModelMetadata {
+            name: "v2".into(),
+            ..Default::default()
+        };
+        executor
+            .execute_update_model(owner, id, md.clone(), None, &mut ctx)
+            .await
+            .unwrap();
+        let m = state_db.get_model(&id).unwrap();
+        assert_eq!(m.version, 2);
+        assert_eq!(m.metadata.name, "v2");
+        assert!(matches!(
+            executor
+                .execute_update_model(Address([2; 20]), id, md, None, &mut ctx)
+                .await,
+            Err(ExecutionError::AccessDenied)
+        ));
+    }
+
+    #[tokio::test]
+    async fn panic_s1_pay_per_use_inference_splits_fee_90_10() {
+        let state_db = Arc::new(StateDB::new());
+        let executor = Executor::new(state_db.clone());
+        let owner = Address([1; 20]);
+        let caller = Address([2; 20]);
+        let treasury = Address([0x11; 20]);
+        let id = ModelId(Hash::new([0x43; 32]));
+        state_db
+            .register_model(
+                id,
+                test_model(owner, AccessPolicy::PayPerUse { fee: U256::from(1000u64) }),
+            )
+            .unwrap();
+        state_db.accounts.set_balance(caller, U256::from(10_000u64));
+        let block = create_test_block();
+        let mut ctx = big_gas_ctx(&block);
+        executor
+            .execute_inference(caller, id, vec![1, 2], 10_000_000, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(state_db.accounts.get_balance(&caller), U256::from(9_000u64));
+        assert_eq!(state_db.accounts.get_balance(&owner), U256::from(900u64));
+        assert_eq!(state_db.accounts.get_balance(&treasury), U256::from(100u64));
+        let m = state_db.get_model(&id).unwrap();
+        assert_eq!(m.usage_stats.total_fees_earned, U256::from(1000u64));
+        assert_eq!(m.usage_stats.total_inferences, 1);
+    }
+
+    #[tokio::test]
+    async fn panic_s1_gradient_completion_splits_pool_between_participants() {
+        let state_db = Arc::new(StateDB::new());
+        let executor = Executor::new(state_db.clone());
+        let job_id = JobId(Hash::new([0x44; 32]));
+        state_db
+            .create_training_job(crate::types::TrainingJob {
+                id: job_id,
+                owner: Address([9; 20]),
+                model_id: ModelId(Hash::new([1; 32])),
+                dataset_hash: Hash::new([2; 32]),
+                participants: vec![],
+                gradients_submitted: 0,
+                gradients_required: 2,
+                reward_pool: U256::from(100u64),
+                status: JobStatus::Active,
+                created_at: 0,
+                completed_at: None,
+            })
+            .unwrap();
+        let block = create_test_block();
+        let mut ctx = big_gas_ctx(&block);
+        let (a, b) = (Address([3; 20]), Address([4; 20]));
+        executor
+            .execute_submit_gradient(a, job_id, vec![], vec![], &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(state_db.accounts.get_balance(&a), U256::zero(), "not complete yet");
+        executor
+            .execute_submit_gradient(b, job_id, vec![], vec![], &mut ctx)
+            .await
+            .unwrap();
+        let job = state_db.get_training_job(&job_id).unwrap();
+        assert_eq!(job.status, JobStatus::Completed);
+        assert_eq!(job.gradients_submitted, 2);
+        assert_eq!(state_db.accounts.get_balance(&a), U256::from(50u64));
+        assert_eq!(state_db.accounts.get_balance(&b), U256::from(50u64));
+    }
+
+    #[test]
+    fn panic_s1_artifact_replicas_reads_governance_param() {
+        let state_db = Arc::new(StateDB::new());
+        let executor = Executor::new(state_db.clone());
+        assert_eq!(executor.default_artifact_replicas(), 1, "unset");
+        let gov = Executor::governance_precompile_address();
+        let key = b"PARAM:artifact_replication".to_vec();
+        state_db.set_storage(gov, key.clone(), vec![3]);
+        assert_eq!(executor.default_artifact_replicas(), 3);
+        state_db.set_storage(gov, key, vec![0]);
+        assert_eq!(executor.default_artifact_replicas(), 1, "floored at 1");
+    }
+
+    #[tokio::test]
+    async fn panic_s1_model_precompile_register_ex_pay_per_use() {
+        let state_db = Arc::new(StateDB::new());
+        let executor = Executor::new(state_db.clone());
+        let block = create_test_block();
+        let mut ctx = big_gas_ctx(&block);
+        let mut data = selector4(b"registerModel(bytes32,string,uint8,uint256)").to_vec();
+        data.extend_from_slice(&[0x45; 32]); // model hash
+        let mut word = [0u8; 32];
+        word[31] = 128; // string offset (relative to args)
+        data.extend_from_slice(&word);
+        let mut pol = [0u8; 32];
+        pol[31] = 3; // PayPerUse
+        data.extend_from_slice(&pol);
+        let mut fee = [0u8; 32];
+        fee[31] = 77;
+        data.extend_from_slice(&fee);
+        let mut len = [0u8; 32];
+        len[31] = 3;
+        data.extend_from_slice(&len);
+        data.extend_from_slice(b"cid");
+        executor
+            .execute_model_precompile(&data, Address([1; 20]), &mut ctx)
+            .await
+            .unwrap();
+        let m = state_db
+            .get_model(&ModelId(Hash::new([0x45; 32])))
+            .expect("registered");
+        assert!(matches!(m.access_policy, AccessPolicy::PayPerUse { fee } if fee == U256::from(77u8)));
+    }
 }
