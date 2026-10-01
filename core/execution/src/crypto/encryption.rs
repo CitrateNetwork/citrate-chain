@@ -200,13 +200,9 @@ impl ModelEncryption {
             .map_err(|e| anyhow!("Encryption failed: {}", e))?;
 
         // Extract authentication tag (last 16 bytes of ciphertext in GCM)
-        let (encrypted_data, auth_tag) = if ciphertext.len() >= 16 {
-            let split_point = ciphertext.len() - 16;
-            let mut tag = [0u8; 16];
-            tag.copy_from_slice(&ciphertext[split_point..]);
-            (ciphertext[..split_point].to_vec(), tag)
-        } else {
-            return Err(anyhow!("Invalid ciphertext length"));
+        let (encrypted_data, auth_tag) = match ciphertext.split_last_chunk::<16>() {
+            Some((data, tag)) => (data.to_vec(), *tag),
+            None => return Err(anyhow!("Invalid ciphertext length")),
         };
 
         // Calculate plaintext hash for integrity
@@ -567,13 +563,9 @@ impl ModelEncryption {
             .map_err(|e| anyhow!("Encryption failed: {}", e))?;
 
         // Extract auth tag (last 16 bytes)
-        let (encrypted_data, auth_tag) = if ciphertext.len() >= 16 {
-            let split_point = ciphertext.len() - 16;
-            let mut tag = [0u8; 16];
-            tag.copy_from_slice(&ciphertext[split_point..]);
-            (ciphertext[..split_point].to_vec(), tag)
-        } else {
-            return Err(anyhow!("Invalid ciphertext length"));
+        let (encrypted_data, auth_tag) = match ciphertext.split_last_chunk::<16>() {
+            Some((data, tag)) => (data.to_vec(), *tag),
+            None => return Err(anyhow!("Invalid ciphertext length")),
         };
 
         Ok(EncryptedChunkData {

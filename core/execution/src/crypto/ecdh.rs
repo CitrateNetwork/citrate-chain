@@ -136,13 +136,10 @@ impl ECIES {
             .map_err(|e| anyhow!("AES encryption failed: {:?}", e))?;
 
         // Split ciphertext and auth tag
-        if encrypted_data.len() < 16 {
+        let Some((ciphertext, auth_tag)) = encrypted_data.split_last_chunk::<16>() else {
             return Err(anyhow!("Invalid encrypted data length"));
-        }
-
-        let (ciphertext, tag_bytes) = encrypted_data.split_at(encrypted_data.len() - 16);
-        let mut auth_tag = [0u8; 16];
-        auth_tag.copy_from_slice(tag_bytes);
+        };
+        let auth_tag = *auth_tag;
 
         Ok(ECIESMessage {
             ephemeral_pubkey: ephemeral.public_key,

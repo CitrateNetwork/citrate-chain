@@ -174,7 +174,7 @@ impl Prover {
         // Public inputs must match what the circuit allocates via new_input().
         // The circuit truncates each hash to the first 16 bytes interpreted as u128.
         let to_field_str = |hash: &[u8]| -> String {
-            let val = hash.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128);
+            let val = super::be_u128_prefix(hash);
             val.to_string()
         };
 
@@ -221,7 +221,7 @@ impl Prover {
 
         // Public inputs must match circuit's new_input() allocations
         let to_field_str = |hash: &[u8]| -> String {
-            hash.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128).to_string()
+            super::be_u128_prefix(hash).to_string()
         };
 
         let public_inputs = vec![
@@ -264,7 +264,7 @@ impl Prover {
             .map_err(|e| ZKPError::ProvingError(e.to_string()))?;
 
         let to_field_str = |hash: &[u8]| -> String {
-            hash.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128).to_string()
+            super::be_u128_prefix(hash).to_string()
         };
 
         let public_inputs = vec![
@@ -309,7 +309,7 @@ impl Prover {
             .map_err(|e| ZKPError::ProvingError(e.to_string()))?;
 
         let to_field_str = |hash: &[u8]| -> String {
-            hash.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128).to_string()
+            super::be_u128_prefix(hash).to_string()
         };
 
         let public_inputs = vec![

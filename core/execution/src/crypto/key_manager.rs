@@ -161,11 +161,11 @@ impl KeyManager {
         let result = mac.finalize();
         let bytes = result.into_bytes();
 
-        let mut master_key = [0u8; 32];
-        let mut chain_code = [0u8; 32];
-
-        master_key.copy_from_slice(&bytes[..32]);
-        chain_code.copy_from_slice(&bytes[32..64]);
+        // HMAC-SHA512 output is 64 bytes: key ‖ chain code.
+        let (master_key, chain_code): ([u8; 32], [u8; 32]) = bytes
+            .split_first_chunk::<32>()
+            .and_then(|(k, rest)| Some((*k, *rest.first_chunk::<32>()?)))
+            .ok_or_else(|| anyhow!("HMAC output shorter than 64 bytes"))?;
 
         let mut manager = Self::new();
         manager.master_key = Some(master_key);
@@ -187,7 +187,7 @@ impl KeyManager {
 
         // Parse path (e.g., "m/44'/60'/0'/0/0")
         let components: Vec<&str> = path.split('/').collect();
-        if components.is_empty() || components[0] != "m" {
+        if components.first() != Some(&"m") {
             return Err(anyhow!("Invalid derivation path"));
         }
 
@@ -203,7 +203,7 @@ impl KeyManager {
                 if idx > 0x7FFFFFFF {
                     return Err(anyhow!("Path component too large for hardened derivation"));
                 }
-                (idx + 0x80000000, true) // Hardened derivation
+                (idx | 0x8000_0000, true) // Hardened derivation (idx <= 0x7FFF_FFFF)
             } else {
                 let idx = component.parse::<u32>()
                     .map_err(|_| anyhow!("Invalid path component"))?;
@@ -239,7 +239,7 @@ impl KeyManager {
             key: current_key,
             path: path.to_string(),
             created_at: now,
-            expires_at: now + 30 * 24 * 3600, // 30 days default
+            expires_at: now.saturating_add(30 * 24 * 3600), // 30 days default
             purpose,
         };
 
@@ -272,11 +272,11 @@ impl KeyManager {
         let result = mac.finalize();
         let bytes = result.into_bytes();
 
-        let mut child_key = [0u8; 32];
-        let mut child_chain = [0u8; 32];
-
-        child_key.copy_from_slice(&bytes[..32]);
-        child_chain.copy_from_slice(&bytes[32..64]);
+        // HMAC-SHA512 output is 64 bytes: key ‖ chain code.
+        let (child_key, child_chain): ([u8; 32], [u8; 32]) = bytes
+            .split_first_chunk::<32>()
+            .and_then(|(k, rest)| Some((*k, *rest.first_chunk::<32>()?)))
+            .ok_or_else(|| anyhow!("HMAC output shorter than 64 bytes"))?;
 
         Ok((child_key, child_chain))
     }
@@ -303,9 +303,9 @@ impl KeyManager {
         let model_hash = {
             let mut hasher = sha3::Sha3_256::new();
             hasher.update(model_id.as_bytes());
-            let result = hasher.finalize();
+            let [a, b, c, d, ..]: [u8; 32] = hasher.finalize().into();
             // Use a smaller value to avoid overflow in hardened derivation
-            u32::from_be_bytes([result[0], result[1], result[2], result[3]]) % 1000000 // Limit to 6 digits
+            u32::from_be_bytes([a, b, c, d]) % 1_000_000 // Limit to 6 digits
         };
         let secret = self.derive_key(
             &format!("m/44'/1337'/{}'", model_hash),
@@ -317,9 +317,9 @@ impl KeyManager {
 
         // Encrypt each share for its holder
         let mut encrypted_shares = HashMap::new();
-        for (i, holder) in share_holders.iter().enumerate() {
+        for (holder, share) in share_holders.iter().zip(&shares) {
             // In production, encrypt with holder's public key
-            let encrypted_share = self.encrypt_share(&shares[i], holder)?;
+            let encrypted_share = self.encrypt_share(share, holder)?;
             encrypted_shares.insert(*holder, encrypted_share);
         }
 
@@ -369,8 +369,8 @@ impl KeyManager {
         // In production, use holder's public key for encryption
         // Simplified version for demonstration
         let mut encrypted = share.to_vec();
-        for (i, byte) in encrypted.iter_mut().enumerate() {
-            *byte ^= holder.as_bytes()[i % 20];
+        for (byte, key) in encrypted.iter_mut().zip(holder.as_bytes().iter().cycle()) {
+            *byte ^= key;
         }
         Ok(encrypted)
     }
@@ -402,12 +402,10 @@ impl KeyManager {
         // Reconstruct secret (simplified)
         // In production, use proper Shamir's reconstruction
         let mut secret = [0u8; 32];
-        if !decrypted_shares.is_empty() {
-            let first_share = &decrypted_shares[0];
-            if first_share.len() >= 34 {
-                secret.copy_from_slice(&first_share[2..34]);
+        if let Some(first_share) = decrypted_shares.first() {
+            if let (Some(body), Some(&index)) = (first_share.get(2..34), first_share.first()) {
+                secret.copy_from_slice(body);
                 // XOR back to get original
-                let index = first_share[0];
                 for byte in secret.iter_mut() {
                     *byte ^= index;
                 }
@@ -421,8 +419,8 @@ impl KeyManager {
     fn decrypt_share(&self, encrypted: &[u8], holder: &H160) -> Result<Vec<u8>> {
         // Simplified decryption
         let mut decrypted = encrypted.to_vec();
-        for (i, byte) in decrypted.iter_mut().enumerate() {
-            *byte ^= holder.as_bytes()[i % 20];
+        for (byte, key) in decrypted.iter_mut().zip(holder.as_bytes().iter().cycle()) {
+            *byte ^= key;
         }
         Ok(decrypted)
     }

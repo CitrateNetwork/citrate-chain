@@ -98,12 +98,12 @@ impl MetalRuntime {
         let capabilities = Self::detect_capabilities()?;
         
         // Calculate available memory for models
-        let available_memory_gb = capabilities.unified_memory_gb - 4; // Reserve 4GB for system
+        let available_memory_gb = capabilities.unified_memory_gb.saturating_sub(4); // Reserve 4GB for system
         
         Ok(Self {
             capabilities,
             loaded_models: HashMap::new(),
-            memory_pool: UnifiedMemoryPool::new(available_memory_gb * 1024), // Convert to MB
+            memory_pool: UnifiedMemoryPool::new(available_memory_gb.saturating_mul(1024)), // Convert to MB
         })
     }
 
@@ -337,11 +337,12 @@ impl UnifiedMemoryPool {
     }
 
     fn used_mb(&self) -> u32 {
-        self.allocations.values().sum()
+        // Saturating: an iterator `sum()` overflow panics under overflow-checks.
+        self.allocations.values().fold(0, |acc: u32, &v| acc.saturating_add(v))
     }
 
     fn available_mb(&self) -> u32 {
-        self.total_mb - self.used_mb()
+        self.total_mb.saturating_sub(self.used_mb())
     }
 }
 

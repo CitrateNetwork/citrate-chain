@@ -37,11 +37,10 @@ impl FieldElement {
     /// Create from bytes (little-endian)
     pub fn from_bytes(bytes: &[u8; 32]) -> Self {
         let mut limbs = [0u64; 4];
-        for (i, limb) in limbs.iter_mut().enumerate() {
-            let start = i * 8;
-            let mut limb_bytes = [0u8; 8];
-            limb_bytes.copy_from_slice(&bytes[start..start + 8]);
-            *limb = u64::from_le_bytes(limb_bytes);
+        for (limb, chunk) in limbs.iter_mut().zip(bytes.chunks_exact(8)) {
+            if let Ok(limb_bytes) = <[u8; 8]>::try_from(chunk) {
+                *limb = u64::from_le_bytes(limb_bytes);
+            }
         }
         Self { limbs }.reduce()
     }
@@ -49,9 +48,8 @@ impl FieldElement {
     /// Convert to bytes (little-endian)
     pub fn to_bytes(&self) -> [u8; 32] {
         let mut bytes = [0u8; 32];
-        for i in 0..4 {
-            let limb_bytes = self.limbs[i].to_le_bytes();
-            bytes[i * 8..(i + 1) * 8].copy_from_slice(&limb_bytes);
+        for (chunk, limb) in bytes.chunks_exact_mut(8).zip(self.limbs.iter()) {
+            chunk.copy_from_slice(&limb.to_le_bytes());
         }
         bytes
     }
@@ -70,11 +68,11 @@ impl FieldElement {
 
         // Check if greater than modulus
         let mut needs_reduction = false;
-        for i in (0..4).rev() {
-            if self.limbs[i] > FIELD_MODULUS[i] {
+        for (limb, modulus) in self.limbs.iter().zip(FIELD_MODULUS.iter()).rev() {
+            if limb > modulus {
                 needs_reduction = true;
                 break;
-            } else if self.limbs[i] < FIELD_MODULUS[i] {
+            } else if limb < modulus {
                 break;
             }
         }
@@ -99,7 +97,8 @@ impl FieldElement {
         let mut carry = 0u64;
 
         for ((r, &a), &b) in result.iter_mut().zip(self.limbs.iter()).zip(other.limbs.iter()) {
-            let sum = a as u128 + b as u128 + carry as u128;
+            // Three u64 values cannot overflow u128.
+            let sum = (a as u128).saturating_add(b as u128).saturating_add(carry as u128);
             *r = sum as u64;
             carry = (sum >> 64) as u64;
         }
@@ -123,7 +122,9 @@ impl FieldElement {
             // Add modulus if we underflowed
             let mut carry = 0u64;
             for (r, &modulus_limb) in result.iter_mut().zip(FIELD_MODULUS.iter()) {
-                let sum = *r as u128 + modulus_limb as u128 + carry as u128;
+                let sum = (*r as u128)
+                    .saturating_add(modulus_limb as u128)
+                    .saturating_add(carry as u128);
                 *r = sum as u64;
                 carry = (sum >> 64) as u64;
             }
@@ -140,7 +141,8 @@ impl FieldElement {
         let mut result = [0u64; 4];
 
         // Simple cross-multiplication of lowest limbs
-        let product = (self.limbs[0] as u128) * (other.limbs[0] as u128);
+        // u64 × u64 fits in u128.
+        let product = (self.limbs[0] as u128).saturating_mul(other.limbs[0] as u128);
         result[0] = product as u64;
         result[1] = (product >> 64) as u64;
 
@@ -249,7 +251,9 @@ impl ShamirSecretSharing {
         }
 
         // Use first `threshold` shares
-        let active_shares = &shares[..self.threshold];
+        let active_shares = shares
+            .get(..self.threshold)
+            .ok_or_else(|| anyhow!("Insufficient shares"))?;
 
         // Lagrange interpolation to find f(0)
         let mut result = FieldElement::zero();
@@ -308,7 +312,9 @@ impl ShamirSecretSharing {
 
         // Use Lagrange interpolation to evaluate polynomial at new point
         let mut result = FieldElement::zero();
-        let active_shares = &shares[..self.threshold];
+        let active_shares = shares
+            .get(..self.threshold)
+            .ok_or_else(|| anyhow!("Insufficient shares"))?;
 
         for (i, share_i) in active_shares.iter().enumerate() {
             let mut numerator = FieldElement::one();

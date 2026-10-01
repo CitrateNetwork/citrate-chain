@@ -39,7 +39,9 @@ fn generate_round_constants() -> Vec<Fr> {
         // Use first 31 bytes to avoid modular bias (BLS12-381 scalar field
         // is ~255 bits; 31 bytes = 248 bits < field modulus).
         let mut bytes = [0u8; 32];
-        bytes[..31].copy_from_slice(&hash[..31]);
+        for (dst, src) in bytes.iter_mut().zip(hash.iter()).take(31) {
+            *dst = *src;
+        }
         constants.push(Fr::from_le_bytes_mod_order(&bytes));
     }
     constants
@@ -79,8 +81,9 @@ pub fn fr_to_bytes_le(f: &Fr) -> [u8; 32] {
     let bigint = f.into_bigint();
     let limb_bytes = bigint.to_bytes_le();
     let mut out = [0u8; 32];
-    let len = limb_bytes.len().min(32);
-    out[..len].copy_from_slice(&limb_bytes[..len]);
+    for (dst, src) in out.iter_mut().zip(&limb_bytes) {
+        *dst = *src;
+    }
     out
 }
 
