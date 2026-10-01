@@ -300,4 +300,20 @@ mod tests {
         let root3 = state_manager.calculate_state_root().await.unwrap();
         assert_eq!(root2, root3);
     }
+
+    /// PANIC-S1 mutation: the storage root is a real digest (even when empty) and
+    /// changes when contract storage changes.
+    #[tokio::test]
+    async fn panic_s1_storage_root_commits_to_storage() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(RocksDB::open(temp_dir.path()).unwrap());
+        let sm = StateManager::new(db);
+
+        let empty = sm.calculate_storage_root().await.unwrap();
+        assert_ne!(empty, Hash::default());
+        sm.state_store
+            .put_storage(&Address([7; 20]), &[1u8; 32], &[2u8; 32])
+            .unwrap();
+        assert_ne!(sm.calculate_storage_root().await.unwrap(), empty);
+    }
 }

@@ -326,4 +326,72 @@ mod tests {
         let root = ai_state.calculate_lora_root().unwrap();
         assert_ne!(root, Hash::default());
     }
+
+    fn inference_at(seed: u8, timestamp: u64) -> InferenceResult {
+        InferenceResult {
+            model_id: ModelId(Hash::new([seed; 32])),
+            input_hash: Hash::new([seed.wrapping_add(1); 32]),
+            output: vec![seed],
+            gas_used: 1,
+            timestamp,
+            proof: None,
+        }
+    }
+
+    /// PANIC-S1: entries younger than `max_age` survive, entries exactly `max_age`
+    /// old or older go, and a future-dated entry no longer underflows (age 0, kept).
+    #[test]
+    fn panic_s1_prune_inference_cache_boundaries() {
+        let mut ai_state = AIStateTree::new();
+        ai_state.cache_inference(inference_at(1, 991)); // age 9: kept
+        ai_state.cache_inference(inference_at(2, 990)); // age 10: dropped
+        ai_state.cache_inference(inference_at(3, 500)); // age 500: dropped
+        ai_state.cache_inference(inference_at(4, 2_000)); // future: kept
+
+        ai_state.prune_inference_cache(10, 1_000);
+
+        let mut kept: Vec<u64> = ai_state
+            .inference_cache
+            .values()
+            .map(|r| r.timestamp)
+            .collect();
+        kept.sort_unstable();
+        assert_eq!(kept, vec![991, 2_000]);
+    }
+
+    /// PANIC-S1 mutation: a non-empty inference cache or job set commits to a
+    /// non-default root that changes with its contents.
+    #[test]
+    fn panic_s1_inference_and_training_roots_commit_to_contents() {
+        let mut ai_state = AIStateTree::new();
+        assert_eq!(
+            ai_state.calculate_inference_root().unwrap(),
+            Hash::default()
+        );
+        ai_state.cache_inference(inference_at(1, 1));
+        let r1 = ai_state.calculate_inference_root().unwrap();
+        assert_ne!(r1, Hash::default());
+        ai_state.cache_inference(inference_at(7, 1));
+        assert_ne!(ai_state.calculate_inference_root().unwrap(), r1);
+
+        assert_eq!(ai_state.calculate_training_root().unwrap(), Hash::default());
+        let job_id = JobId(Hash::new([9; 32]));
+        ai_state.training_jobs.insert(
+            job_id,
+            TrainingJob {
+                id: job_id,
+                owner: Address([1; 20]),
+                model_id: ModelId(Hash::new([2; 32])),
+                dataset_hash: Hash::new([3; 32]),
+                participants: vec![Address([4; 20])],
+                gradients_submitted: 0,
+                gradients_required: 3,
+                reward_pool: primitive_types::U256::zero(),
+                status: citrate_execution::JobStatus::Pending,
+                created_at: 0,
+                completed_at: None,
+            },
+        );
+        assert_ne!(ai_state.calculate_training_root().unwrap(), Hash::default());
+    }
 }

@@ -765,4 +765,80 @@ mod tests {
             "height must equal the max ingested"
         );
     }
+
+    /// PANIC-S1 mutation: per-epoch reward snapshots are keyed by height, so two
+    /// heights never overwrite each other or the latest-only snapshot.
+    #[test]
+    fn panic_s1_reward_snapshot_at_is_keyed_by_height() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(RocksDB::open(temp_dir.path()).unwrap());
+        let store = BlockStore::new(db);
+
+        store.put_reward_snapshot(b"latest").unwrap();
+        store.put_reward_snapshot_at(5, b"five").unwrap();
+        store.put_reward_snapshot_at(6, b"six").unwrap();
+
+        assert_eq!(
+            store.get_reward_snapshot_at(5).unwrap().as_deref(),
+            Some(&b"five"[..])
+        );
+        assert_eq!(
+            store.get_reward_snapshot_at(6).unwrap().as_deref(),
+            Some(&b"six"[..])
+        );
+        assert_eq!(
+            store.get_reward_snapshot().unwrap().as_deref(),
+            Some(&b"latest"[..])
+        );
+        assert!(store.get_reward_snapshot_at(7).unwrap().is_none());
+    }
+
+    /// PANIC-S1 mutation: only a 33-byte `c`-prefixed relation with a non-empty child
+    /// list removes a block from the tip set.
+    #[test]
+    fn panic_s1_get_tips_ignores_malformed_child_relations() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(RocksDB::open(temp_dir.path()).unwrap());
+        let store = BlockStore::new(db.clone());
+
+        let a = create_test_block(1, Hash::new([0xA0; 32]));
+        let b = create_test_block(2, Hash::new([0xB0; 32]));
+        store.put_block(&a).unwrap();
+        store.put_block(&b).unwrap();
+
+        let mut wrong_prefix = vec![b'x'];
+        wrong_prefix.extend_from_slice(a.header.block_hash.as_bytes());
+        db.put_cf(CF_DAG_RELATIONS, &wrong_prefix, b"nonempty")
+            .unwrap();
+        db.put_cf(
+            CF_DAG_RELATIONS,
+            &parent_children_key(&b.header.block_hash),
+            b"",
+        )
+        .unwrap();
+
+        let tips = store.get_tips().unwrap();
+        assert!(tips.contains(&a.header.block_hash));
+        assert!(tips.contains(&b.header.block_hash));
+    }
+
+    /// The applied-tip pointer written by the state store is the one the block store
+    /// reads back.
+    #[test]
+    fn panic_s1_applied_tip_round_trips_and_short_value_is_none() {
+        use citrate_execution::executor::StateStoreTrait;
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(RocksDB::open(temp_dir.path()).unwrap());
+        let store = BlockStore::new(db.clone());
+        let state = crate::state::StateStore::new(db.clone());
+
+        assert!(store.get_applied_tip().unwrap().is_none());
+        let tip = Hash::new([0x5A; 32]);
+        state.put_applied_tip_meta(&tip, 42).unwrap();
+        assert_eq!(store.get_applied_tip().unwrap(), Some((tip, 42)));
+
+        db.put_cf(CF_METADATA, APPLIED_TIP_KEY, &[0x5A; 39])
+            .unwrap();
+        assert!(store.get_applied_tip().unwrap().is_none());
+    }
 }

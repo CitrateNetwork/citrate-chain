@@ -814,4 +814,21 @@ mod tests {
             AtRestError::PlaintextDbWithEncryptionEnabled(_)
         ));
     }
+
+    /// PANIC-S1 mutation: the length check must hold on its own. A prefix that
+    /// carries the magic and version but is shorter than a sealed value is not sealed.
+    #[test]
+    fn panic_s1_looks_sealed_requires_minimum_length() {
+        let cipher = AtRestCipher::new(&test_key());
+        let sealed = cipher.seal("accounts", b"k", b"v").expect("seal");
+        assert!(AtRestCipher::looks_sealed(&sealed));
+        assert!(!AtRestCipher::looks_sealed(
+            sealed.get(..5).expect("prefix")
+        ));
+        let mut wrong_version = sealed.clone();
+        if let Some(b) = wrong_version.get_mut(4) {
+            *b = AT_REST_VALUE_VERSION.wrapping_add(1);
+        }
+        assert!(!AtRestCipher::looks_sealed(&wrong_version));
+    }
 }
