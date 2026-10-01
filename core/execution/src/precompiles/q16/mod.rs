@@ -93,7 +93,8 @@ impl Q16 {
     /// Use an i128 intermediate so the i64×i64 product cannot overflow
     /// before the right-shift; the post-shift down-cast saturates to i64.
     pub fn saturating_mul(self, other: Q16) -> Q16 {
-        let prod: i128 = (self.0 as i128) * (other.0 as i128);
+        // INVARIANT: i64 × i64 fits in i128, so this cannot saturate.
+        let prod: i128 = (self.0 as i128).saturating_mul(other.0 as i128);
         let shifted: i128 = prod >> SHIFT;
         if shifted > i64::MAX as i128 {
             Q16::MAX
@@ -113,7 +114,10 @@ impl Q16 {
         // (a / 2¹⁶) / (b / 2¹⁶) = a / b. To preserve the Q16 scale,
         // compute (a << 16) / b in i128 (a << 16 can exceed i64 now).
         let num: i128 = (self.0 as i128) << SHIFT;
-        let result: i128 = num / (other.0 as i128);
+        // `other != 0` (above) and `num` is far from i128::MIN, so this is always Some.
+        let Some(result) = num.checked_div(other.0 as i128) else {
+            return if self.0 >= 0 { Q16::MAX } else { Q16::MIN };
+        };
         if result > i64::MAX as i128 {
             Q16::MAX
         } else if result < i64::MIN as i128 {
@@ -125,11 +129,7 @@ impl Q16 {
 
     /// Saturating negation. -i64::MIN saturates to i64::MAX.
     pub fn saturating_neg(self) -> Q16 {
-        if self.0 == i64::MIN {
-            Q16::MAX
-        } else {
-            Q16(-self.0)
-        }
+        Q16(self.0.saturating_neg())
     }
 
     /// Convert to `f64` for diagnostics / external comparison.

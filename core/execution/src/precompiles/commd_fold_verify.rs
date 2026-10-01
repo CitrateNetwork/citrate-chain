@@ -54,10 +54,14 @@ fn word(input: &[u8], at: usize) -> Result<[u8; 32]> {
 
 /// A 32-byte big-endian word as a `usize`, rejecting values that don't fit (offsets/lengths only).
 fn word_as_usize(w: [u8; 32]) -> Result<usize> {
-    if w[..24].iter().any(|&b| b != 0) {
+    let (high, low) = w.split_at(24);
+    if high.iter().any(|&b| b != 0) {
         return Err(anyhow!("FOLD_COMMD_VERIFY: length/offset exceeds usize"));
     }
-    Ok(u64::from_be_bytes(w[24..32].try_into().expect("8B")) as usize)
+    let low: [u8; 8] = low
+        .try_into()
+        .map_err(|_| anyhow!("FOLD_COMMD_VERIFY: malformed word"))?;
+    Ok(u64::from_be_bytes(low) as usize)
 }
 
 /// Decode the standard Solidity ABI encoding of
@@ -71,7 +75,10 @@ pub fn decode_challenge_input(input: &[u8]) -> Result<ChallengeInput> {
             "FOLD_COMMD_VERIFY: input too short for the call head"
         ));
     }
-    let args = &input[4..]; // offsets in the ABI are relative to the start of the args
+    // Offsets in the ABI are relative to the start of the args.
+    let args = input
+        .get(4..)
+        .ok_or_else(|| anyhow!("FOLD_COMMD_VERIFY: input too short for the call head"))?;
 
     let off_proof = word_as_usize(word(args, 0)?)?;
     let num_steps = word_as_usize(word(args, 32)?)?;
