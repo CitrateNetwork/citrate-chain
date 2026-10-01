@@ -5,6 +5,9 @@
 # them keeps the lint meaningful (integer overflow) instead of drowning it in
 # false positives. Add a type here ONLY if its operators are total (never panic).
 arithmetic-side-effects-allowed = [
+    "ark_ec::models::short_weierstrass::Projective",
+    "ark_ec::short_weierstrass::Projective",
+    "ark_ec::models::short_weierstrass::affine::Affine",
     "p256::ProjectivePoint",
     "p256::Scalar",
     "p256::AffinePoint",
