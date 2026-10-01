@@ -21,9 +21,8 @@
    "arithmetic_side_effects": 135
   },
   "core/execution": {
-   "arithmetic_side_effects": 352,
-   "expect_used": 25,
-   "indexing_slicing": 448,
+   "arithmetic_side_effects": 171,
+   "indexing_slicing": 196,
    "panic": 3
   },
   "core/learning": {
@@ -105,5 +104,5 @@
   "arithmetic_side_effects",
   "string_slice"
  ],
- "total": 1939
+ "total": 1481
 }

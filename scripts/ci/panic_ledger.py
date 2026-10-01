@@ -29,11 +29,26 @@ NODE_T2 = re.compile(r"node/src/(rpc|p2p|network|mempool|gossip)")
 ECONOMICS_T1_FILES = {"core/economics/src/rewards.rs", "core/economics/src/genesis.rs",
                       "core/economics/src/lib.rs"}
 
+# core/execution is split by reachability (PANIC-S1 WP-2a triage). These have NO
+# production caller: the native PrecompileExecutor set (REVM supplies the standard
+# precompiles; execute_pure_at routes the Citrate ones), the hosted-inference
+# precompile (deliberately not bridged), the tensor engine, the legacy zkp
+# prover/verifier stack (0x0108 uses zkp::halo2 + poseidon_bn254 only), and crypto/*
+# (used only by the inert IPFS encrypted store). They are T2 and CLEAN-S1 candidates.
+EXECUTION_UNREACHABLE = re.compile(
+    r"core/execution/src/(precompiles/(mod|inference)\.rs|tensor/|crypto/"
+    r"|zkp/(verifier|circuits|mimc|prover|poseidon|ceremony)\.rs|inference/)"
+)
+
 
 def tier(s):
     c, f = s["crate"], s["file"]
     if c == "core/economics":
         return "T1" if f in ECONOMICS_T1_FILES else "T2"
+    if c == "core/execution":
+        if f == "core/execution/src/metrics.rs":
+            return "T3"
+        return "T2" if EXECUTION_UNREACHABLE.search(f) else "T1"
     if c == "node":
         if "/bin/" in f:
             return "T3"
