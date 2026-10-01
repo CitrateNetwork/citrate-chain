@@ -1,7 +1,20 @@
 // citrate/core/execution/src/tensor/ops.rs
 
 use super::types::{Tensor, TensorError};
-use ndarray::{ArrayD, Axis, IxDyn};
+use ndarray::{ArrayD, Axis, IxDyn, Zip};
+
+/// `f(a, b)` element-wise with `b` broadcast to `a`'s shape. ndarray's operators
+/// panic when broadcasting fails; this returns `IncompatibleShapes` instead.
+fn zip_with(
+    a: &ArrayD<f32>,
+    b: &ArrayD<f32>,
+    f: impl Fn(f32, f32) -> f32,
+) -> Result<ArrayD<f32>, TensorError> {
+    let b = b
+        .broadcast(a.raw_dim())
+        .ok_or(TensorError::IncompatibleShapes)?;
+    Ok(Zip::from(a).and(&b).map_collect(|&x, &y| f(x, y)))
+}
 
 /// Tensor operations implementation
 pub struct TensorOps;
@@ -13,7 +26,7 @@ impl TensorOps {
             return Err(TensorError::IncompatibleShapes);
         }
 
-        let result = &a.data + &b.data;
+        let result = zip_with(&a.data, &b.data, |x, y| x + y)?;
         Ok(Tensor {
             data: result,
             shape: a.shape.clone(),
@@ -28,7 +41,7 @@ impl TensorOps {
             return Err(TensorError::IncompatibleShapes);
         }
 
-        let result = &a.data - &b.data;
+        let result = zip_with(&a.data, &b.data, |x, y| x - y)?;
         Ok(Tensor {
             data: result,
             shape: a.shape.clone(),
@@ -43,7 +56,7 @@ impl TensorOps {
             return Err(TensorError::IncompatibleShapes);
         }
 
-        let result = &a.data * &b.data;
+        let result = zip_with(&a.data, &b.data, |x, y| x * y)?;
         Ok(Tensor {
             data: result,
             shape: a.shape.clone(),
@@ -63,7 +76,7 @@ impl TensorOps {
             return Err(TensorError::DivisionByZero);
         }
 
-        let result = &a.data / &b.data;
+        let result = zip_with(&a.data, &b.data, |x, y| x / y)?;
         Ok(Tensor {
             data: result,
             shape: a.shape.clone(),
@@ -84,8 +97,13 @@ impl TensorOps {
             ));
         }
 
-        let a_cols = a_shape[a_shape.len() - 1];
-        let b_rows = b_shape[b_shape.len() - 2];
+        // Both have >= 2 dimensions (checked above).
+        let (Some(&a_cols), Some(&b_rows)) = (
+            a_shape.last(),
+            b_shape.get(b_shape.len().saturating_sub(2)),
+        ) else {
+            return Err(TensorError::IncompatibleShapes);
+        };
 
         if a_cols != b_rows {
             return Err(TensorError::IncompatibleShapes);
@@ -105,7 +123,7 @@ impl TensorOps {
             .map_err(|_| TensorError::InvalidShape("Cannot convert to 2D".to_string()))?;
 
         let result_2d = a_2d.dot(&b_2d);
-        let result_shape = vec![a_shape[0], b_shape[1]];
+        let result_shape = vec![a_2d.nrows(), b_2d.ncols()];
         let result = ArrayD::from_shape_vec(IxDyn(&result_shape), result_2d.into_raw_vec())
             .map_err(|e| TensorError::InvalidShape(e.to_string()))?;
 
@@ -127,12 +145,12 @@ impl TensorOps {
         }
 
         let mut axes: Vec<usize> = (0..shape.len()).collect();
-        let n = axes.len();
-        axes.swap(n - 2, n - 1);
+        let n = axes.len(); // >= 2 (checked above)
+        axes.swap(n.saturating_sub(2), n.saturating_sub(1));
 
         let transposed = tensor.data.view().permuted_axes(axes);
         let mut new_shape = shape.clone();
-        new_shape.swap(n - 2, n - 1);
+        new_shape.swap(n.saturating_sub(2), n.saturating_sub(1));
 
         Ok(Tensor {
             data: transposed.to_owned(),
@@ -177,18 +195,24 @@ impl TensorOps {
 
     /// Apply Softmax activation along the last axis
     pub fn softmax(tensor: &Tensor) -> Result<Tensor, TensorError> {
-        let axis = tensor.shape.0.len() - 1;
+        // A 0-dimensional tensor has no last axis.
+        let axis = tensor
+            .shape
+            .0
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| TensorError::InvalidShape("softmax needs at least 1 dimension".to_string()))?;
 
         // Compute exp(x - max) for numerical stability
         let max = tensor
             .data
-            .fold_axis(Axis(axis), f32::NEG_INFINITY, |&a, &b| a.max(b));
-        let exp_values = &tensor.data - &max.insert_axis(Axis(axis));
-        let exp_values = exp_values.mapv(|x| x.exp());
+            .fold_axis(Axis(axis), f32::NEG_INFINITY, |&a, &b| a.max(b))
+            .insert_axis(Axis(axis));
+        let exp_values = zip_with(&tensor.data, &max, |x, m| (x - m).exp())?;
 
         // Sum along axis
         let sum = exp_values.sum_axis(Axis(axis)).insert_axis(Axis(axis));
-        let result = exp_values / sum;
+        let result = zip_with(&exp_values, &sum, |e, s| e / s)?;
 
         Ok(Tensor {
             data: result,
@@ -244,10 +268,28 @@ impl TensorOps {
         }
 
         // Calculate output dimensions
-        let out_h = (input_shape[2] + 2 * padding.0 - kernel_shape[2]) / stride.0 + 1;
-        let out_w = (input_shape[3] + 2 * padding.1 - kernel_shape[3]) / stride.1 + 1;
+        let &[batch, _, in_h, in_w] = input_shape.as_slice() else {
+            return Err(TensorError::IncompatibleShapes);
+        };
+        let &[out_c, _, k_h, k_w] = kernel_shape.as_slice() else {
+            return Err(TensorError::IncompatibleShapes);
+        };
+        // A kernel larger than the padded input, or a zero stride, has no output.
+        let out_dim = |input: usize, pad: usize, k: usize, stride: usize| {
+            input
+                .checked_add(pad.checked_mul(2)?)?
+                .checked_sub(k)?
+                .checked_div(stride)?
+                .checked_add(1)
+        };
+        let (Some(out_h), Some(out_w)) = (
+            out_dim(in_h, padding.0, k_h, stride.0),
+            out_dim(in_w, padding.1, k_w, stride.1),
+        ) else {
+            return Err(TensorError::IncompatibleShapes);
+        };
 
-        let output_shape = vec![input_shape[0], kernel_shape[0], out_h, out_w];
+        let output_shape = vec![batch, out_c, out_h, out_w];
 
         // Create output tensor (simplified - just zeros for now)
         // Full implementation would perform actual convolution
@@ -269,10 +311,21 @@ impl TensorOps {
         }
 
         // Calculate output dimensions
-        let out_h = (input_shape[2] - kernel_size.0) / stride.0 + 1;
-        let out_w = (input_shape[3] - kernel_size.1) / stride.1 + 1;
+        let &[batch, channels, in_h, in_w] = input_shape.as_slice() else {
+            return Err(TensorError::IncompatibleShapes);
+        };
+        // A window larger than the input, or a zero stride, has no output.
+        let out_dim = |input: usize, k: usize, stride: usize| {
+            input.checked_sub(k)?.checked_div(stride)?.checked_add(1)
+        };
+        let (Some(out_h), Some(out_w)) = (
+            out_dim(in_h, kernel_size.0, stride.0),
+            out_dim(in_w, kernel_size.1, stride.1),
+        ) else {
+            return Err(TensorError::IncompatibleShapes);
+        };
 
-        let output_shape = vec![input_shape[0], input_shape[1], out_h, out_w];
+        let output_shape = vec![batch, channels, out_h, out_w];
 
         // Create output tensor (simplified - just zeros for now)
         // Full implementation would perform actual max pooling
@@ -298,7 +351,18 @@ impl TensorOps {
         let normalized = input.data.mapv(|x| (x - mean) / (variance + eps).sqrt());
 
         // Scale and shift
-        let scaled = &normalized * &gamma.data + &beta.data;
+        let gamma_b = gamma
+            .data
+            .broadcast(normalized.raw_dim())
+            .ok_or(TensorError::IncompatibleShapes)?;
+        let beta_b = beta
+            .data
+            .broadcast(normalized.raw_dim())
+            .ok_or(TensorError::IncompatibleShapes)?;
+        let scaled = Zip::from(&normalized)
+            .and(&gamma_b)
+            .and(&beta_b)
+            .map_collect(|&n, &g, &b| n * g + b);
 
         Ok(Tensor {
             data: scaled,
@@ -320,11 +384,38 @@ impl TensorOps {
         let mask = ArrayD::random(tensor.data.raw_dim(), Uniform::new(0.0, 1.0));
         let mask = mask.mapv(|x| if x > p { 1.0 / (1.0 - p) } else { 0.0 });
 
+        // The mask is built with the tensor's own dimensions.
+        let data = Zip::from(&tensor.data)
+            .and(&mask)
+            .map_collect(|&x, &m| x * m);
         Tensor {
-            data: &tensor.data * &mask,
+            data,
             shape: tensor.shape.clone(),
             requires_grad: tensor.requires_grad,
             grad: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod panic_s1_tests {
+    use super::*;
+
+    /// PANIC-S1: shape errors that used to panic (subtraction underflow, zero
+    /// stride division, 0-d softmax, ndarray broadcast failure) are now errors.
+    #[test]
+    fn panic_s1_tensor_shape_errors_do_not_panic() {
+        let small = Tensor::zeros(vec![1, 1, 2, 2]);
+        let kernel = Tensor::zeros(vec![1, 1, 3, 3]);
+        assert!(TensorOps::maxpool2d(&small, (3, 3), (1, 1)).is_err(), "window > input");
+        assert!(TensorOps::maxpool2d(&small, (1, 1), (0, 1)).is_err(), "zero stride");
+        assert!(TensorOps::conv2d(&small, &kernel, (1, 1), (0, 0)).is_err(), "kernel > input");
+        assert!(TensorOps::conv2d(&small, &kernel, (1, 1), (1, 1)).is_ok(), "padding makes it fit");
+        assert!(TensorOps::softmax(&Tensor::zeros(vec![])).is_err(), "0-d softmax");
+        let a = Tensor::zeros(vec![2, 3]);
+        let b = Tensor::zeros(vec![3, 2]);
+        assert!(TensorOps::add(&a, &b).is_err());
+        let ok = TensorOps::add(&a, &Tensor::zeros(vec![2, 3])).expect("same shape");
+        assert_eq!(ok.data.shape(), &[2, 3]);
     }
 }
