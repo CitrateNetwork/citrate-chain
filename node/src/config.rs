@@ -214,6 +214,19 @@ pub struct ChainConfig {
     #[serde(default)]
     pub pba_hardening_height: Option<u64>,
 
+    /// HUP-S7.2 agent precompile fork activation height
+    /// (`citrate_execution::agent_fork`): from this height the REVM bridge
+    /// exposes 0x0112 LORA_APPLY, 0x0113 LORA_MERGE, 0x0121
+    /// MEMORY_ANCHOR_VERIFY and 0x0122 AGENT_OPS to contract code.
+    ///
+    /// A CONSENSUS PARAMETER. Absent (the default, and every shipped profile)
+    /// = not activated. On a release network (40204) only the release pin
+    /// sets it: a value here, or `CITRATE_AGENT_PRECOMPILES_HEIGHT`, refuses
+    /// to start unless it equals the pin. Local dev chains may set it.
+    /// Spec: `docs/precompiles/AGENT_PRECOMPILES.md`.
+    #[serde(default)]
+    pub agent_precompiles_height: Option<u64>,
+
     /// A local development chain. The activation height compiled into the
     /// release for this chain id (`citrate_consensus::hardening::
     /// PINNED_ACTIVATIONS`) is not applied, so dev profiles keep choosing
@@ -351,6 +364,7 @@ impl Default for NodeConfig {
                 ghostdag_k: 18,
                 genesis_profile: None,
                 pba_hardening_height: None,
+                agent_precompiles_height: None,
                 dev_profile: false,
             },
             network: NetworkConfig {
@@ -737,6 +751,112 @@ mod tests {
             !main.contains("activation::set_pba_hardening_height(config.chain"),
             "no second publication path that bypasses the env override"
         );
+    }
+
+    /// HUP-S7.2: the agent precompile fork height is published through its one
+    /// resolver before any execution or consensus component exists, there is
+    /// no second publication path, and no shipped profile schedules it.
+    #[test]
+    fn agent_fork_is_published_first_and_unset_in_every_shipped_profile() {
+        let main = include_str!("main.rs");
+        let start = main.find("async fn start_node(").expect("start_node");
+        let body = &main[start..];
+        let init = body
+            .find("citrate_execution::agent_fork::init_for_chain(")
+            .expect("start_node must publish the agent fork height");
+        for ctor in [
+            "GhostDag::new(",
+            "Executor::with_storage_and_chain_id(",
+            "ConsensusManifest::for_height(",
+        ] {
+            let at = body
+                .find(ctor)
+                .unwrap_or_else(|| panic!("{ctor} in start_node"));
+            assert!(
+                init < at,
+                "agent fork height must be published before {ctor}"
+            );
+        }
+        assert!(
+            !main.contains("set_agent_precompiles_height("),
+            "one publication path"
+        );
+        assert_eq!(NodeConfig::default().chain.agent_precompiles_height, None);
+        assert_eq!(NodeConfig::devnet().chain.agent_precompiles_height, None);
+        for (name, text) in [
+            (
+                "node/config/devnet.toml",
+                include_str!("../config/devnet.toml"),
+            ),
+            (
+                "node/config/mainnet.toml",
+                include_str!("../config/mainnet.toml"),
+            ),
+            (
+                "node/config/testnet.toml",
+                include_str!("../config/testnet.toml"),
+            ),
+            (
+                "node/config/testnet-beta.toml",
+                include_str!("../config/testnet-beta.toml"),
+            ),
+            (
+                "node/config/team-testnet.toml",
+                include_str!("../config/team-testnet.toml"),
+            ),
+            (
+                "node/config/testnet-validator.toml",
+                include_str!("../config/testnet-validator.toml"),
+            ),
+            (
+                "node/config/testnet-bootstrap.toml",
+                include_str!("../config/testnet-bootstrap.toml"),
+            ),
+            (
+                "node/config/testnet-1.toml",
+                include_str!("../config/testnet-1.toml"),
+            ),
+            (
+                "node/config/testnet-2.toml",
+                include_str!("../config/testnet-2.toml"),
+            ),
+            (
+                "node/config/testnet-boot-1.toml",
+                include_str!("../config/testnet-boot-1.toml"),
+            ),
+            (
+                "node/config/testnet-boot-2.toml",
+                include_str!("../config/testnet-boot-2.toml"),
+            ),
+            (
+                "node/config/testnet-boot-3.toml",
+                include_str!("../config/testnet-boot-3.toml"),
+            ),
+            (
+                "devnet-config.toml",
+                include_str!("../../devnet-config.toml"),
+            ),
+            (
+                "testnet-config.toml",
+                include_str!("../../testnet-config.toml"),
+            ),
+        ] {
+            assert!(
+                !text.contains("agent_precompiles_height"),
+                "{name} must not schedule the agent precompile fork"
+            );
+        }
+    }
+
+    /// The new key parses, and a TOML without it keeps the fork unset.
+    #[test]
+    fn agent_fork_key_parses() {
+        let base = include_str!("../config/devnet.toml");
+        let cfg: NodeConfig = toml::from_str(base).expect("devnet profile parses");
+        assert_eq!(cfg.chain.agent_precompiles_height, None);
+        let with = base.replacen("[chain]", "[chain]\nagent_precompiles_height = 12", 1);
+        let cfg: NodeConfig = toml::from_str(&with).expect("key parses");
+        assert_eq!(cfg.chain.agent_precompiles_height, Some(12));
     }
 }
 

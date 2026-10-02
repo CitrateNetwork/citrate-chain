@@ -434,9 +434,14 @@ async fn main() -> Result<()> {
             // env override and the config file's `[chain].pba_hardening_height`.
             let file_cfg = resolve_config_path(cli.config.clone())
                 .and_then(|p| NodeConfig::from_file(&p).ok());
-            let (cfg_chain_id, configured, dev_profile) = match &file_cfg {
-                Some(c) => (c.chain.chain_id, c.chain.pba_hardening_height, c.chain.dev_profile),
-                None => (40204, None, false),
+            let (cfg_chain_id, configured, dev_profile, agent_configured) = match &file_cfg {
+                Some(c) => (
+                    c.chain.chain_id,
+                    c.chain.pba_hardening_height,
+                    c.chain.dev_profile,
+                    c.chain.agent_precompiles_height,
+                ),
+                None => (40204, None, false, None),
             };
             let chain_id = cli.chain_id.unwrap_or(cfg_chain_id);
             let resolved = citrate_consensus::hardening::resolve_pba_hardening_for_chain(
@@ -445,7 +450,11 @@ async fn main() -> Result<()> {
                 dev_profile,
             )
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let manifest = consensus_manifest::ConsensusManifest::for_height(resolved.height);
+            let (agent_height, _) =
+                citrate_execution::agent_fork::resolve_for_chain(chain_id, agent_configured)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let manifest =
+                consensus_manifest::ConsensusManifest::for_heights(resolved.height, agent_height);
             // The activation heights compiled into this release (a node on a
             // pinned chain runs that height; see the start-up banner for the
             // height a configured node resolved).
@@ -1164,6 +1173,27 @@ fn at_rest_encryption_from_env() -> Result<Option<EncryptionAtRestConfig>> {
 
 async fn start_node(config: NodeConfig) -> Result<()> {
     info!("Starting Citrate node...");
+    // HUP-S7.2: the agent precompile fork height, published before any
+    // execution component is built. Default: not activated. On a release
+    // network only the release pin sets it; a disagreeing env or config value
+    // aborts start-up instead of forking this node at the height.
+    let (agent_fork_height, agent_fork_source) = citrate_execution::agent_fork::init_for_chain(
+        config.chain.chain_id,
+        config.chain.agent_precompiles_height,
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
+    match agent_fork_height {
+        Some(h) => info!(
+            "Agent precompile fork ACTIVE from height {} (source: {}): 0x0112 LORA_APPLY, \
+             0x0113 LORA_MERGE, 0x0121 MEMORY_ANCHOR_VERIFY, 0x0122 AGENT_OPS",
+            h, agent_fork_source
+        ),
+        None => info!(
+            "Agent precompile fork not scheduled (source: {}); precompile set unchanged",
+            agent_fork_source
+        ),
+    }
+
     {
         // Consensus-alignment stamp — logged at boot so field drift is diagnosable
         // from the journal (the app node and fleet MUST share this fingerprint).
@@ -1237,7 +1267,6 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         );
         pba
     };
-
     // Initialize metrics server
     let metrics_addr =
         std::env::var("CITRATE_METRICS_ADDR").unwrap_or_else(|_| "127.0.0.1:9090".to_string());
