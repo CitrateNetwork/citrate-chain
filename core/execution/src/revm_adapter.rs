@@ -573,6 +573,34 @@ struct CitratePurePrecompile {
     hardened: bool,
 }
 
+/// HUP-S7.2: REVM adapter for one agent precompile fork address (0x0112,
+/// 0x0113, 0x0121, 0x0122). Registered only for blocks at or after
+/// `crate::agent_fork` activation. Stateless, like [`CitratePurePrecompile`].
+struct CitrateAgentForkPrecompile {
+    addr: Address,
+}
+
+impl StatefulPrecompile for CitrateAgentForkPrecompile {
+    fn call(&self, bytes: &Bytes, gas_limit: u64, _env: &Env) -> RevmPrecompileResult {
+        match crate::precompiles::execute_agent_fork(&self.addr, bytes.as_ref(), gas_limit) {
+            Ok(res) if res.success => {
+                Ok(RevmPrecompileOutput::new(res.gas_used, res.output.into()))
+            }
+            Ok(_) => Err(RevmPrecompileErrors::Error(RevmPrecompileError::other(
+                "Citrate agent precompile reported failure",
+            ))),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("Insufficient gas") {
+                    Err(RevmPrecompileErrors::Error(RevmPrecompileError::OutOfGas))
+                } else {
+                    Err(RevmPrecompileErrors::Error(RevmPrecompileError::other(msg)))
+                }
+            }
+        }
+    }
+}
+
 /// PBA-L1a-022: a reserved-but-unbridged Citrate precompile address. Only
 /// registered once the hardening is active; every call fails the frame.
 struct CitrateReservedPrecompile;
@@ -627,9 +655,15 @@ impl StatefulPrecompile for CitratePurePrecompile {
 /// being executed: it selects the post-activation precompile semantics and
 /// registers the reserved addresses. Before activation the precompile SET is
 /// unchanged, so EIP-2929 warm/cold gas for those addresses is unchanged too.
+///
+/// `agent_fork` (HUP-S7.2) is `agent_fork::agent_precompiles_active(block_number)`:
+/// at and after the agent precompile fork the four fork addresses are bridged
+/// to their precompiles (and so are no longer reserved). Before it the set is
+/// exactly the pre-fork set.
 fn register_citrate_precompiles<EXT, DB: Database>(
     handler: &mut EvmHandler<'_, EXT, DB>,
     hardened: bool,
+    agent_fork: bool,
 ) {
     let prev = handler.pre_execution.load_precompiles.clone();
     handler.pre_execution.load_precompiles = Arc::new(move || {
@@ -646,16 +680,38 @@ fn register_citrate_precompiles<EXT, DB: Database>(
             )
         }));
         if hardened {
-            precompiles.extend(crate::precompiles::reserved_unbridged_addresses().into_iter().map(
-                |raw| {
-                    (
-                        RevmAddress::from_slice(&raw),
-                        ContextPrecompile::Ordinary(Precompile::Stateful(Arc::new(
-                            CitrateReservedPrecompile,
-                        ))),
-                    )
-                },
-            ));
+            precompiles.extend(
+                crate::precompiles::reserved_unbridged_addresses()
+                    .into_iter()
+                    .filter(|raw| {
+                        !(agent_fork
+                            && crate::precompiles::AGENT_FORK_PRECOMPILE_ADDRESSES.contains(raw))
+                    })
+                    .map(|raw| {
+                        (
+                            RevmAddress::from_slice(&raw),
+                            ContextPrecompile::Ordinary(Precompile::Stateful(Arc::new(
+                                CitrateReservedPrecompile,
+                            ))),
+                        )
+                    }),
+            );
+        }
+        if agent_fork {
+            precompiles.extend(
+                crate::precompiles::AGENT_FORK_PRECOMPILE_ADDRESSES
+                    .iter()
+                    .map(|raw| {
+                        (
+                            RevmAddress::from_slice(raw),
+                            ContextPrecompile::Ordinary(Precompile::Stateful(Arc::new(
+                                CitrateAgentForkPrecompile {
+                                    addr: Address(*raw),
+                                },
+                            ))),
+                        )
+                    }),
+            );
         }
         precompiles
     });
@@ -728,6 +784,8 @@ pub fn execute_contract_create_with_context(
     let prevrandao = block_ctx.prevrandao;
     // PBA-R2: consensus activation for the hardened precompile semantics.
     let pba_hardened = crate::activation::pba_hardening_active(block_number);
+    // HUP-S7.2: the agent precompile fork (default: not activated).
+    let agent_fork = crate::agent_fork::agent_precompiles_active(block_number);
     let mut evm = Evm::builder()
         .with_db(&mut db)
         // WP-B0 (TD-28): expose the pure Citrate precompile families
@@ -735,7 +793,7 @@ pub fn execute_contract_create_with_context(
         // STATICCALLs to e.g. 0x0108 hit an empty account and silently
         // return success with no data.
         .append_handler_register_box(Box::new(move |h| {
-            register_citrate_precompiles(h, pba_hardened)
+            register_citrate_precompiles(h, pba_hardened, agent_fork)
         }))
         .modify_cfg_env(|cfg| {
             cfg.chain_id = chain_id;
@@ -935,6 +993,8 @@ pub fn execute_contract_call_with_context(
     let prevrandao = block_ctx.prevrandao;
     // PBA-R2: consensus activation for the hardened precompile semantics.
     let pba_hardened = crate::activation::pba_hardening_active(block_number);
+    // HUP-S7.2: the agent precompile fork (default: not activated).
+    let agent_fork = crate::agent_fork::agent_precompiles_active(block_number);
     let mut evm = Evm::builder()
         .with_db(&mut db)
         // WP-B0 (TD-28): expose the pure Citrate precompile families
@@ -942,7 +1002,7 @@ pub fn execute_contract_call_with_context(
         // STATICCALLs to e.g. 0x0108 hit an empty account and silently
         // return success with no data.
         .append_handler_register_box(Box::new(move |h| {
-            register_citrate_precompiles(h, pba_hardened)
+            register_citrate_precompiles(h, pba_hardened, agent_fork)
         }))
         .modify_cfg_env(|cfg| {
             cfg.chain_id = chain_id;
