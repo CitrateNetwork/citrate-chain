@@ -30,6 +30,8 @@ members = [
     "faucet",
     "crates/citrate-hkdf-chain",
     "crates/citrate-commd",
+    # HUP-S9.2: independent replay of a federated LoRA round (docs/fl/FL_ROUND_V1.md).
+    "tools/fl-replay",
 ]
 # Default build targets: unified node binary (includes wallet + CLI).
 # Standalone wallet/cli/faucet can still be built with `cargo build -p citrate-wallet` etc.
