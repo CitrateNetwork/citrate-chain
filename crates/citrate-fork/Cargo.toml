@@ -1,0 +1,37 @@
+[package]
+name = "citrate-fork"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+description = "Citrate-aware dry-run fork: REVM with the chain's own Citrate precompiles over state read from a 40204 JSON-RPC (or an anvil fork of it). Read-only; never signs or sends."
+
+[[bin]]
+name = "citrate-fork"
+path = "src/main.rs"
+
+[lib]
+name = "citrate_fork"
+path = "src/lib.rs"
+
+[dependencies]
+# The chain's own execution crate: the Citrate precompile bridge, activation heights and
+# value semantics come from here, so the fork cannot drift from the node.
+citrate-execution = { path = "../../core/execution" }
+citrate-consensus = { path = "../../core/consensus" }
+# Same pin and features as citrate-execution (one revm in the build).
+revm = { version = "=10", default-features = false, features = ["std", "serde"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = "0.4"
+# Read-only JSON-RPC state reads (eth_getBalance / eth_getTransactionCount / eth_getCode /
+# eth_getStorageAt / eth_getBlockByNumber / eth_chainId / eth_blockNumber).
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+
+[features]
+default = []
+# Link the live 0x0130 recursive-fold CommD verifier, as the 40204 node build does. Off by
+# default (it pulls Nova); without it a hardened-height call into 0x0130 is reported as
+# unavailable in this fork rather than silently diverging.
+commd-fold-verify = ["citrate-execution/commd-fold-verify"]
