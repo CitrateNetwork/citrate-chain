@@ -7,6 +7,7 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Address.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import {CitratePrecompiles} from "./lib/CitratePrecompiles.sol";
 
 /**
  * @title ModelAccessControl
@@ -23,12 +24,9 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
 
     // ============ Constants ============
 
-    // Precompile addresses — canonical families from executor.rs
-    // State-changing model operations (registration, metadata)
-    address constant MODEL_PRECOMPILE = 0x0000000000000000000000000000000000001000;
-    // Runtime inference operations
-    address constant MODEL_INFERENCE = address(0x0101);
-    address constant MODEL_ENCRYPTION = address(0x0106);
+    // HUP-S7.2: inference (0x0101) and encrypted inference (0x0106) go through
+    // `CitratePrecompiles`, which uses each precompile's native layout and
+    // fails closed where no precompile serves contract code.
 
     // Access levels
     uint8 constant ACCESS_NONE = 0;
@@ -407,11 +405,8 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
         accessGrants[modelId][msg.sender].usageCount++;
         models[modelId].totalInferences++;
 
-        // Call inference precompile
-        (bool success, bytes memory result) = MODEL_INFERENCE.call(
-            abi.encodePacked(modelId, inputData)
-        );
-        require(success, "Inference failed");
+        // 0x0101 native layout: model_id || caller || input. Fails closed.
+        bytes memory result = CitratePrecompiles.modelInference(modelId, msg.sender, inputData);
 
         emit InferenceExecuted(
             modelId,
@@ -447,7 +442,7 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
         models[modelId].totalInferences++;
 
         // Interactions: Call encryption precompile for decryption and inference
-        (bool success, bytes memory result) = MODEL_ENCRYPTION.call(
+        bytes memory result = CitratePrecompiles.modelEncryption(
             abi.encodePacked(
                 uint8(1), // Decrypt operation
                 modelId,
@@ -456,7 +451,6 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
                 proofCommitment
             )
         );
-        require(success, "Encrypted inference failed");
 
         return result;
     }
