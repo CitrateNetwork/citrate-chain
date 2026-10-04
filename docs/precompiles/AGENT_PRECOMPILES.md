@@ -63,7 +63,7 @@ Formal model: `specs/tla/consensus/AgentPrecompileFork.tla` (invariants `AgreeOn
 2. Release PR: set `AGENT_PRECOMPILES_PINS` to `(40204, Some(H))`.
 3. Operator: roll the binary to every node before H; confirm `citrate consensus` shows
    the same fingerprint and `agent precompiles from height H` on each.
-4. After H: run the integration checks in section 6 against a node.
+4. After H: run the post-activation checks in section 7 against a node.
 
 No agent may set H, deploy, sign or send a transaction for this.
 
@@ -159,9 +159,14 @@ and 32 zero bytes when it is not. Valid means: `v == 1`, `count > 0`,
 `first_seq + leaf_index == seq`, and the RFC 9162 section 2.1.3.2 walk from `record_hash` at
 `leaf_index` in a tree of `count` leaves uses every path element and ends at `tree_root`.
 
-A caller then checks `AnchorRegistry.isAnchored(commitment)`
-(`AnchorProofs.isRecordAnchored` in `contracts/src/lib/CitratePrecompiles.sol`). Changing
-`day` yields a different day's commitment, never the anchored one.
+A caller then checks that the commitment is in `AnchorRegistry` as a nightly root
+anchored by the account it trusts (`AnchorProofs.isRecordAnchored(registry, committer,
+proof)` in `contracts/src/lib/CitratePrecompiles.sol`). The committer check is required:
+`AnchorRegistry.anchor` is open to every account, so a commitment being in the registry
+says nothing about whose log it came from (anyone can build a day tree over any record
+hash and anchor it). `isRecordAnchored` returns true only when the proof verifies, the
+commitment is anchored with kind `NightlyMerkle`, and its committer is the named account.
+Changing `day` yields a different day's commitment, never the anchored one.
 
 **Gas:** `1500 + 150 * path_len`.
 
@@ -222,7 +227,52 @@ On chain 40204 today no node serves 0x0101 or 0x0106 to contract code (non-deter
 inference is not a consensus operation, audit C-01), so those calls revert; payments in
 the same call revert with them. Registration, adapters, training and merge records work.
 
-## 7. Tests
+## 7. Post-activation checks (operator, after H)
+
+A top-level call or `eth_call` whose `to` is a precompile address returns `0x` on a
+Citrate node at every height: the executor hands a top-level call to REVM only when the
+target account has code. The precompiles are reached from contract code. So the checks
+need a calling contract:
+
+1. Before H, on a local devnet built from the release commit with
+   `CITRATE_AGENT_PRECOMPILES_HEIGHT` set low: deploy `PrecompileCaller` (the fixture in
+   `core/execution/tests/fixtures/agent_precompile_caller_runtime.hex`, compiled from
+   `contracts/test/precompiles/CitratePrecompilesFailClosed.t.sol`) and `eth_call`
+   `anchorCommitment(bytes)` with the shared vector of section 4. Expect the commitment
+   above the devnet height and `PrecompileUnavailable(0x0121)` below it.
+2. After H on 40204: the same `eth_call` against a probe contract the operator deploys
+   (owner sign-off; no agent deploys). Expect the commitment.
+3. `cargo test -p citrate-execution --test agent_precompiles_activation --test
+   agent_precompiles_solidity_e2e` on the release commit.
+4. The daily benchmark (Rule 6), because `citrate-execution` changed.
+
+## 8. Measured cost
+
+`cargo bench -p citrate-execution --bench agent_precompiles_bench` (criterion, release
+profile, rustc 1.96.0, Apple M2 Max, 2026-10-04, other builds running on the machine, so
+absolute times are high; compare the ratios within the run). Each case is a worst case at
+the caps. The reference is the chain's own `ecrecover` (0x01) as REVM runs it in this
+build, Ethereum-priced at 3000 gas.
+
+| Case | Gas | Time | ns per gas |
+|---|---:|---:|---:|
+| reference: `ecrecover` 0x01 | 3,000 | 277 us | 92 |
+| `DEVICE_REVOCATION_VERIFY` (1 recovery) | 4,042 | 260 us | 64 |
+| `DEVICE_LINK_VERIFY` (3 recoveries, 48-byte label) | 10,066 | 710 us | 71 |
+| `MEMORY_ANCHOR_VERIFY`, path of 64 | 11,100 | 35 us | 3.2 |
+| `LORA_APPLY` 256 x 64 x 256 | 16,976,824 | 14.3 ms | 0.84 |
+| `LORA_MERGE`, 16 adapters at the caps | 272,632,760 | 221 ms | 0.81 |
+
+Reading: no case buys more time per gas than the chain's `ecrecover`, so the schedule is
+conservative against the precompile the chain already prices. `AGENT_OPS` is closest
+(its signature recoveries dominate); LoRA and the anchor walk are one to two orders of
+magnitude cheaper per gas. One `LORA_APPLY` at the caps fits in a block (gas limit
+30,000,000); a merge of 16 adapters at the caps does not, so the practical merge size is
+bounded by the block gas limit. One machine, one run: evidence for the sign-off, not a
+schedule. A quieter first run gave the same ordering (`DEVICE_REVOCATION_VERIFY` 36 ns per gas,
+LoRA 0.39).
+
+## 9. Tests
 
 | Layer | Where | What |
 |---|---|---|
@@ -230,16 +280,16 @@ the same call revert with them. Registration, adapters, training and merge recor
 | REVM integration | `core/execution/tests/agent_precompiles_activation.rs` | both sides of both activations through `execute_contract_call_with_context` and the create path; exact gas; byte-identical to an unassigned address below the fork |
 | Solidity end to end | `core/execution/tests/agent_precompiles_solidity_e2e.rs` | forge-compiled `CitratePrecompiles` callers run in REVM: succeed after the fork, revert `PrecompileUnavailable` before it |
 | Property (fuzz) | `core/execution/tests/agent_precompiles_props.rs` | totality on arbitrary bytes, merge/apply equivalence, random day batches, label rule |
-| Foundry | `contracts/test/precompiles/{CitratePrecompilesFailClosed,ModelLoRAPrecompileWiring}.t.sol` | fail-closed helpers on a chain without the precompiles; model/LoRA contracts |
-| Node | `node/src/config.rs`, `node/src/consensus_manifest.rs` | height published first, unset in every shipped profile, fingerprint rule |
+| Foundry | `contracts/test/precompiles/{CitratePrecompilesFailClosed,ModelLoRAPrecompileWiring}.t.sol` | fail-closed helpers on a chain without the precompiles; anchor proofs bound to the committer and the nightly kind (against the real `AnchorRegistry`); model/LoRA contracts |
+| Node | `node/src/config.rs`, `node/src/consensus_manifest.rs`, `node-app/src/main.rs` | height published first (in the node and in the RPC-only `node-app`), unset in every shipped profile, fingerprint rule |
+| Benchmark | `core/execution/benches/agent_precompiles_bench.rs` | worst-case wall clock per gas (section 8) |
 | Formal | `specs/tla/consensus/AgentPrecompileFork*.cfg` | TLC: shipped and pinned configs pass; the mutation config fails `AgreeOnSet` |
 
-Not covered here: a run against a live multi-node devnet binary, and a wall-clock
-benchmark of the worst-case LoRA tile (the gas reuses the benchmarked RM-M2 matmul rate).
+Not covered here: a run against a live multi-node devnet binary.
 
-## 8. Pending owner sign-off
+## 10. Pending owner sign-off
 
-- The gas values in sections 2 to 5.
+- The gas values in sections 2 to 5 (measurements in section 8).
 - The 40204 activation height (section 1).
 - Whether `AGENT_OPS` should carry further operations (each is a new op byte and a new
   fork).
