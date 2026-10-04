@@ -7,7 +7,7 @@ status: active
 
 # Devnet round receipts
 
-Receipts written by `scripts/fl/devnet-round-e2e.sh` on 2026-10-01 (local paths removed). Both
+Receipts written by `scripts/fl/devnet-round-e2e.sh` (local paths removed). All
 ran on a throwaway local devnet (chain id 1337) with throwaway keys; the trainer was the fixture
 trainer, so no learning is represented.
 
@@ -17,3 +17,9 @@ trainer, so no learning is represented.
   through `0x0110`. The llama-server completion on the GPU ran out of Metal memory (the GPU was
   shared with other work); the receipt records the CPU recheck that loaded the merged adapter and
   completed. That run used the contract before an equivalent check was removed from `_verify`.
+- `2026-10-04-devnet-synthetic.json`: the same synthetic run repeated after the fan-out 6 review
+  fixes (the ledger's participant cap, roster-scoped leasing of round jobs, the coordinator's
+  per-request upload files, the trainer's environment scrub, the bounded return decoding). Same
+  shape and outcome: accepted after the window, record digest equal on chain, in the bundle and in
+  the replay, 4 settlement intents, the dishonest ordinal 1 rejected on chain and refused by
+  settlement.

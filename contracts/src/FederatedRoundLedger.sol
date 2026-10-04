@@ -184,7 +184,10 @@ contract FederatedRoundLedger {
         if (c.ordinal != cl.nextOrdinal) revert BadOrdinal();
         ClusterRules memory r = cl.rules;
         if (
-            c.participants < r.minParticipants || uint256(c.participants) * r.chunkDim > MAX_CHUNK_CELLS
+            // 0x0110 refuses more than MAX_PARTICIPANTS rows, so a larger round could never be
+            // recomputed by `challengeOutput`; the cell bound alone does not catch it for narrow chunks.
+            c.participants < r.minParticipants || c.participants > MAX_PARTICIPANTS
+                || uint256(c.participants) * r.chunkDim > MAX_CHUNK_CELLS
                 || c.nValues == 0 || uint256(c.chunks) != (uint256(c.nValues) + r.chunkDim - 1) / r.chunkDim
                 || c.configHash == bytes32(0) || c.participantsRoot == bytes32(0) || c.inputRoot == bytes32(0)
                 || c.outputRoot == bytes32(0) || c.adapterHash == bytes32(0)

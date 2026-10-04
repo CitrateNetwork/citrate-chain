@@ -313,6 +313,26 @@ contract FederatedRoundLedgerTest is Test {
         vm.stopPrank();
     }
 
+    /// A round with more participants than 0x0110 accepts could never be proven wrong: every
+    /// output challenge would revert in the precompile. Narrow chunks keep the cell bound from
+    /// catching it, so the participant cap has to hold on its own.
+    function test_a_round_the_precompile_cannot_recompute_is_refused() public {
+        FederatedRoundLedger.ClusterRules memory narrow = _rules();
+        narrow.chunkDim = 1;
+        vm.startPrank(coordinator);
+        bytes32 narrowId = ledger.registerCluster(keccak256("narrow"), narrow);
+        FederatedRoundLedger.RoundCommit memory rc = _validCommit();
+        rc.clusterId = narrowId;
+        rc.chunks = 9; // 9 values at chunkDim 1
+        rc.participants = 1025; // 1025 x 1 cells is within 4096, but 0x0110 takes at most 1024
+        vm.expectRevert(FederatedRoundLedger.BadShape.selector);
+        ledger.commitRound(rc);
+
+        rc.participants = 1024;
+        ledger.commitRound(rc);
+        vm.stopPrank();
+    }
+
     function test_record_digest_is_the_abi_encoding_settlement_anchors() public {
         Committed memory c = _honest();
         FederatedRoundLedger.Round memory r = ledger.getRound(c.roundId);

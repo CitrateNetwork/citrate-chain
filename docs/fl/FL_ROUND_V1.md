@@ -42,7 +42,9 @@ fixed for its life:
 | `challengeWindow` | 150 blocks suggested; 12 in the e2e | ≥ 1 |
 
 `participants × chunkDim ≤ 4096` so one chunk's whole precompile input fits a challenge
-transaction (≤ 65 KB of calldata at 16 participants).
+transaction (≤ 65 KB of calldata at 16 participants), and `participants ≤ 1024` (the round config's
+roster too), because `0x0110` refuses more rows and a round it cannot recompute could not be
+challenged.
 
 ## 2. The round config
 
@@ -64,7 +66,9 @@ replay checks this against `getCluster`.
 ## 3. A device's contribution
 
 The coordinator publishes one `lora_delta` job per roster device with payload
-`{task, ordinal, round_id, config}`. A device takes part only if its member set it up and
+`{task, ordinal, round_id, config}`, and leases each only to a device on the round's roster that
+holds or finished no other job of the same round (a job whose payload does not parse is leased to
+nobody). A device takes part only if its member set it up and
 consented to this round (`CITRATE_FL_CONSENT_FILE`, D-29), it is on the roster, it has not already
 contributed to the round, and a trainer is configured. The base model and start adapter must be
 staged and hash-verify; the dataset must be a verified trajectory export (S9.3 shape, every line
@@ -144,7 +148,8 @@ record_digest     = keccak(abi.encode(chainid, ledger, round_id, config_hash, pa
 The coordinator's tool emits an **unsigned** `commitRound((clusterId, ordinal, configHash,
 participantsRoot, participants, nValues, inputRoot, outputRoot, chunks, adapterHash))` intent; the
 operator's ceremony signs it. The ledger checks the coordinator, the ordinal and the shape
-(`participants ≥ minParticipants`, `chunks = ceil(nValues / chunkDim)`, non-zero roots) and
+(`minParticipants ≤ participants ≤ 1024`, the most rows `0x0110` takes, so every committed
+chunk can be recomputed by a challenge; `chunks = ceil(nValues / chunkDim)`; non-zero roots) and
 starts the window.
 
 ## 7. The challenge window

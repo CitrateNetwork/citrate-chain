@@ -32,7 +32,7 @@ Specification: [`FL_ROUND_V1.md`](FL_ROUND_V1.md).
   four on-chain fraud proofs (output recompute through 0x0110, row consistency, rules, participant
   order), finalize after the window, `recordDigest` for settlement, `belnapAggregate` view. Holds
   no value; fails closed without the precompile. Not deployed.
-- `contracts/test/FederatedRoundLedger.t.sol`: 27 tests (a test double etched at `0x0110` answers
+- `contracts/test/FederatedRoundLedger.t.sol`: 28 tests (27 from the build, 1 from the review) (a test double etched at `0x0110` answers
   only registered vectors; the golden vector is the live precompile's). 17/17 non-equivalent
   mutants killed; the one equivalent mutant (a redundant index-range check in `_verify`, already
   implied by the index inside the leaf preimage) led to removing that check.
@@ -80,3 +80,27 @@ operator's ceremony).
   devices and the coordinator configured (operator work, requested on #286).
 - The in-node checkpoint orchestrator (`enable_learning`): a consensus change needing its own
   design and owner decision.
+
+## Review (fan-out 6, 2026-10-04)
+
+A review of the three branches before they go to PRs tightened five things, each test first:
+
+- `FederatedRoundLedger.commitRound` also bounds `participants` by `0x0110`'s row cap (1,024), so
+  every committed chunk stays recomputable by a challenge whatever the chunk width; the round
+  config bounds its roster the same way.
+- compute-pool round jobs are leased only to devices on the round's roster, one job per device per
+  round.
+- compute-pool delta uploads stream into one temporary file per request.
+- No `CITRATE_TRAINING_*` variable reaches the trainer program.
+- `citrate-fl-round` decodes a node's ABI return with checked arithmetic.
+
+Re-run after the fixes: forge ledger 28 passed; replay crate 14; compute-pool workspace 512
+passed (main 429); settlement workspace 61 (main 41); TLC `FlChallengeWindow` clean (1,334
+distinct states) and its 4 mutant configs each violated; the devnet end to end PASS again
+(`receipts/2026-10-04-devnet-synthetic.json`). No node, consensus or precompile crate changed, so
+no Rule 6 benchmark is due.
+
+S9.1 reading: the planset says "enable the learning orchestrator path *where required*". The
+round path needs no in-node orchestrator (section 10 of the spec), so the node's
+`enable_learning` stays off; wiring it behind an activation height is an owner decision, not part
+of this branch.
