@@ -119,22 +119,44 @@ library CitratePrecompiles {
     }
 }
 
-/// The read side of `AnchorRegistry` used by `AnchorProofs`.
+/// The read side of `AnchorRegistry` used by `AnchorProofs`. `AnchorView`
+/// is ABI-identical to `AnchorRegistry.Anchor` (the enum `kind` is a uint8).
 interface IAnchorRegistryView {
+    struct AnchorView {
+        uint8 kind;
+        bytes32 root;
+        address committer;
+        uint256 blockNumber;
+        uint256 timestamp;
+    }
+
     function isAnchored(bytes32 root) external view returns (bool);
+    function getAnchor(bytes32 root) external view returns (AnchorView memory);
 }
 
-/// @title AnchorProofs: prove that one decision record was anchored
+/// @title AnchorProofs: prove that one decision record was anchored by its agent
 /// @notice US-7.2 AC3 on chain: a record is anchored iff its inclusion proof
 ///         verifies (0x0121) AND the day commitment it proves is recorded in
-///         `AnchorRegistry`.
+///         `AnchorRegistry` as a nightly root BY THE EXPECTED COMMITTER.
+/// @dev `AnchorRegistry.anchor` is open to every caller, so "this commitment is
+///      in the registry" alone says nothing about whose log it came from: any
+///      account can build a day tree over any record hash and anchor it. The
+///      caller therefore names the account whose nightly anchors it trusts
+///      (the agent's anchoring address), and only that account's nightly
+///      anchor counts.
 library AnchorProofs {
-    function isRecordAnchored(IAnchorRegistryView registry, bytes memory proofInput)
+    /// `AnchorRegistry.AnchorKind.NightlyMerkle`.
+    uint8 internal constant KIND_NIGHTLY_MERKLE = 2;
+
+    function isRecordAnchored(IAnchorRegistryView registry, address committer, bytes memory proofInput)
         internal
         view
         returns (bool)
     {
+        if (committer == address(0)) return false;
         bytes32 commitment = CitratePrecompiles.memoryAnchorCommitment(proofInput);
-        return commitment != bytes32(0) && registry.isAnchored(commitment);
+        if (commitment == bytes32(0) || !registry.isAnchored(commitment)) return false;
+        IAnchorRegistryView.AnchorView memory a = registry.getAnchor(commitment);
+        return a.kind == KIND_NIGHTLY_MERKLE && a.committer == committer && a.root == commitment;
     }
 }
