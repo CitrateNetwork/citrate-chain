@@ -54,11 +54,9 @@ fn tjson(shape: &[u32], raw: &[i64]) -> Value {
 fn out_json(bytes: &[u8]) -> Value {
     let view = tensor_format::decode_exact(bytes).expect("output tensor");
     assert_eq!(view.dtype, tensor_format::Dtype::Q16_16);
-    let raw: Vec<i64> = view
-        .data
-        .chunks_exact(8)
-        .map(|c| i64::from_le_bytes(c.try_into().expect("8 bytes")))
-        .collect();
+    let (chunks, rest) = view.data.as_chunks::<8>();
+    assert!(rest.is_empty(), "whole 8-byte elements");
+    let raw: Vec<i64> = chunks.iter().map(|c| i64::from_le_bytes(*c)).collect();
     json!({"shape": view.shape, "q16": raw})
 }
 
