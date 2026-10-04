@@ -660,7 +660,10 @@ impl StatefulPrecompile for CitratePurePrecompile {
 /// at and after the agent precompile fork the four fork addresses are bridged
 /// to their precompiles (and so are no longer reserved). Before it the set is
 /// exactly the pre-fork set.
-fn register_citrate_precompiles<EXT, DB: Database>(
+///
+/// Public so the dry-run fork (`crates/citrate-fork`, HUP-S6.10) runs exactly this
+/// registration instead of a copy; making it public changes no node behaviour.
+pub fn register_citrate_precompiles<EXT, DB: Database>(
     handler: &mut EvmHandler<'_, EXT, DB>,
     hardened: bool,
     agent_fork: bool,
