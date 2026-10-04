@@ -50,7 +50,16 @@ def _broadcast(names=None, **overrides):
         txs.append(t)
         rcs.append(r)
         addrs[n] = a
-    return {"chain": 40204, "transactions": txs, "receipts": rcs}, addrs
+    run = {"chain": 40204, "transactions": txs, "receipts": rcs, "returns": _returns(addrs)}
+    return run, addrs
+
+
+def _returns(addrs, admin=ADMIN, deployed_here=False):
+    """forge's `returns` entry for DeployHupRegistries.run(): the Deployed tuple."""
+    fields = [admin, "true" if deployed_here else "false"] + [
+        hbu.to_checksum(addrs.get(n) or "0x" + "00" * 20) for n in hbu.RETURN_ORDER
+    ]
+    return {"0": {"internal_type": "struct DeployHupRegistries.Deployed", "value": "(" + ", ".join(fields) + ")"}}
 
 
 def _book():
@@ -142,10 +151,54 @@ class Merge(unittest.TestCase):
         with self.assertRaisesRegex(hbu.BookError, "AgentSBT is not in the broadcast"):
             hbu.resolve_pins(_book(), hbu.parse_broadcast(run), keep_existing=False)
 
+    def test_keep_existing_must_equal_the_script_projection(self):
+        # A rerun skipped AgentSBT; the book still pins the OLD AgentSBT. The script's
+        # returned projection names a different address, so keeping the book entry
+        # would silently ship the old contract version.
+        run, addrs = _broadcast(names=[n for n in hbu.HUP_NAMES if n != "AgentSBT"])
+        run["returns"] = _returns({**addrs, "AgentSBT": "0x" + "a5" * 20})
+        projected = hbu.parse_returns(run)
+        with self.assertRaisesRegex(hbu.BookError, "AgentSBT: the book pins"):
+            hbu.resolve_pins(_book(), hbu.parse_broadcast(run), keep_existing=True, projected=projected)
+
+    def test_keep_existing_accepts_an_entry_on_the_projection(self):
+        run, addrs = _broadcast(names=[n for n in hbu.HUP_NAMES if n != "AgentSBT"])
+        run["returns"] = _returns({**addrs, "AgentSBT": _book()["contracts"]["AgentSBT"]})
+        pins = hbu.resolve_pins(
+            _book(), hbu.parse_broadcast(run), keep_existing=True, projected=hbu.parse_returns(run)
+        )
+        self.assertEqual(pins["AgentSBT"], _book()["contracts"]["AgentSBT"].lower())
+
+    def test_keep_existing_needs_the_script_returns(self):
+        run, _ = _broadcast(names=[n for n in hbu.HUP_NAMES if n != "AgentSBT"])
+        with self.assertRaisesRegex(hbu.BookError, "returns"):
+            hbu.resolve_pins(_book(), hbu.parse_broadcast(run), keep_existing=True, projected=None)
+
+    def test_deployed_pin_must_equal_the_script_projection(self):
+        run, addrs = _broadcast()
+        run["returns"] = _returns({**addrs, "SkillRegistry": "0x" + "5e" * 20})
+        with self.assertRaisesRegex(hbu.BookError, "SkillRegistry: the broadcast deployed"):
+            hbu.resolve_pins(_book(), hbu.parse_broadcast(run), keep_existing=False, projected=hbu.parse_returns(run))
+
+    def test_parse_returns_reads_admin_and_pins(self):
+        run, addrs = _broadcast()
+        got = hbu.parse_returns(run)
+        self.assertEqual(got["admin"], ADMIN)
+        for n in hbu.RETURN_ORDER:
+            self.assertEqual(got[n], addrs[n])
+
+    def test_parse_returns_refuses_a_malformed_tuple(self):
+        run, _ = _broadcast()
+        run["returns"]["0"]["value"] = "(0x" + "11" * 20 + ", true)"
+        with self.assertRaisesRegex(hbu.BookError, "returns"):
+            hbu.parse_returns(run)
+
     def test_keep_existing_needs_a_book_entry(self):
-        run, _ = _broadcast(names=["OrganizationSBT"])
+        run, addrs = _broadcast(names=["OrganizationSBT"])
+        # AgentSBT is kept from the book (on the projection); CapsuleRegistry has no entry.
+        run["returns"] = _returns({**addrs, "AgentSBT": _book()["contracts"]["AgentSBT"]})
         with self.assertRaisesRegex(hbu.BookError, "CapsuleRegistry is not in the broadcast"):
-            hbu.resolve_pins(_book(), hbu.parse_broadcast(run), keep_existing=True)
+            hbu.resolve_pins(_book(), hbu.parse_broadcast(run), keep_existing=True, projected=hbu.parse_returns(run))
 
     def test_merge_writes_checksummed_and_keeps_other_keys(self):
         run, addrs = _broadcast()
@@ -198,8 +251,11 @@ class _FakeChain(BaseHTTPRequestHandler):
             to, data = p[0]["to"].lower(), p[0]["data"]
             if data == hbu.SEL_OWNER:
                 res = "0x" + "00" * 12 + s["owners"].get(to, ADMIN)[2:]
-            else:
+            elif data == hbu.SEL_ORG_CONTRACT:
                 res = "0x" + "00" * 12 + s["org"][2:]
+            else:
+                # Record counters (nextTokenId / totalSkills / rootCountByKind(k)).
+                res = "0x" + s["counts"].get((to, data), 0).to_bytes(32, "big").hex()
         else:
             res = None
         body = json.dumps({"jsonrpc": "2.0", "id": req["id"], "result": res}).encode()
@@ -232,6 +288,7 @@ class VerifyLiveAndCli(unittest.TestCase):
             "no_code": set(),
             "owners": {},
             "org": self.addrs["OrganizationSBT"],
+            "counts": {},
         }
         self.tmp = tempfile.TemporaryDirectory()
         d = Path(self.tmp.name)
@@ -293,6 +350,53 @@ class VerifyLiveAndCli(unittest.TestCase):
     def test_rpc_requires_genesis(self):
         rc = hbu.main(["--broadcast", str(self.bpath), "--book", str(self.book), "--admin", ADMIN, "--rpc", self.url])
         self.assertEqual(rc, 1)
+
+    def test_write_without_rpc_refused_and_nothing_written(self):
+        before = self.book.read_text()
+        rc = hbu.main(["--broadcast", str(self.bpath), "--book", str(self.book), "--admin", ADMIN])
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.book.read_text(), before)
+
+    def test_check_without_rpc_is_allowed(self):
+        before = self.book.read_text()
+        rc = hbu.main(["--broadcast", str(self.bpath), "--book", str(self.book), "--admin", ADMIN, "--check"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.book.read_text(), before)
+
+    def test_admin_must_equal_the_script_admin(self):
+        self.run_json["returns"] = _returns(self.addrs, admin="0x" + "bd" * 20)
+        self.bpath.write_text(json.dumps(self.run_json))
+        self.assertEqual(self._cli("--check"), 1)
+
+    def test_retiring_a_populated_agent_sbt_refused(self):
+        old = _book()["contracts"]["AgentSBT"].lower()
+        _FakeChain.state["counts"] = {(old, hbu.SEL_NEXT_TOKEN_ID): 3}
+        before = self.book.read_text()
+        self.assertEqual(self._cli(), 1)
+        self.assertEqual(self.book.read_text(), before)
+
+    def test_retiring_a_populated_pin_with_explicit_flag(self):
+        old = _book()["contracts"]["AgentSBT"].lower()
+        _FakeChain.state["counts"] = {(old, hbu.SEL_NEXT_TOKEN_ID): 3}
+        self.assertEqual(self._cli("--retire-populated"), 0)
+        out = json.loads(self.book.read_text())
+        self.assertEqual(out["contracts"]["AgentSBT"], hbu.to_checksum(self.addrs["AgentSBT"]))
+
+    def test_retiring_a_populated_anchor_registry_refused(self):
+        book = _book()
+        old = "0x" + "a7" * 20
+        book["contracts"]["AnchorRegistry"] = hbu.to_checksum(old)
+        self.book.write_text(json.dumps(book, indent=2) + "\n")
+        _FakeChain.state["counts"] = {(old, hbu.root_count_call(2)): 1}
+        self.assertEqual(self._cli(), 1)
+
+    def test_retiring_a_populated_skill_registry_refused(self):
+        book = _book()
+        old = "0x" + "5c" * 20
+        book["contracts"]["SkillRegistry"] = hbu.to_checksum(old)
+        self.book.write_text(json.dumps(book, indent=2) + "\n")
+        _FakeChain.state["counts"] = {(old, hbu.SEL_TOTAL_SKILLS): 2}
+        self.assertEqual(self._cli(), 1)
 
     def test_broadcast_for_other_chain_refused(self):
         self.run_json["chain"] = 31337

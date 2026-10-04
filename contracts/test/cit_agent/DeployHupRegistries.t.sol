@@ -78,6 +78,25 @@ contract DeployHupRegistriesTest is Test {
         assertEq(again.skillRegistry, first.skillRegistry);
     }
 
+    /// A rerun over a registry members already use must stay cheap to simulate: verify()
+    /// reads the whole root list only while it is short.
+    function test_verify_staysBoundedOverABusyAnchorRegistry() public {
+        DeployHupRegistries.Deployed memory d = script.deployWith(_cfg(address(0)));
+        for (uint256 i = 0; i < 1000; i++) {
+            vm.prank(member);
+            AnchorRegistry(d.anchorRegistry).anchor(AnchorRegistry.AnchorKind.NightlyMerkle, keccak256(abi.encode(i)));
+        }
+        vm.cool(d.anchorRegistry); // price the reads as a fresh eth_call would (cold slots)
+        uint256 before = gasleft();
+        script.verify(d);
+        uint256 used = before - gasleft();
+        assertLt(used, 1_000_000, "verify reads the whole busy root list");
+        // And the rerun itself is still idempotent over the busy registry.
+        DeployHupRegistries.Deployed memory again = script.deployWith(_cfg(address(0)));
+        assertEq(again.anchorRegistry, d.anchorRegistry);
+        assertEq(AnchorRegistry(d.anchorRegistry).rootCountByKind(AnchorRegistry.AnchorKind.NightlyMerkle), 1000);
+    }
+
     function test_deploy_existingAdmin_used_as_owner() public {
         MultisigTimelock2of3 existing = new MultisigTimelock2of3([ownerA, ownerB, ownerC], 2 days);
         DeployHupRegistries.Deployed memory d = script.deployWith(_cfg(address(existing)));

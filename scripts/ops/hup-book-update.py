@@ -15,10 +15,15 @@ What it checks, all before anything is written (fail closed):
     address forge recorded;
   * every HUP name resolves to exactly one address (from the broadcast, or, for a
     registry the idempotent rerun skipped, from the book with --keep-existing);
+  * every pin equals the projection the script itself returned (forge records
+    run()'s return value in the broadcast), and --admin is the admin it used; a
+    kept book entry is accepted only on that projection;
   * no two book names share an address;
   * with --rpc: chain id 40204, block-0 hash == --genesis, every receipt status 1,
     code at every address, owner() of the admin-gated registries == --admin (which
-    must itself have code), and AgentSBT.orgContract() == OrganizationSBT.
+    must itself have code), AgentSBT.orgContract() == OrganizationSBT, and no
+    replaced pin already holds records (unless --retire-populated).
+Writing needs --rpc and --genesis; offline, only --check runs.
 
 Usage (the runbook has the full sequence):
   scripts/ops/hup-book-update.py \\
@@ -53,6 +58,10 @@ HUP_NAMES = {
 # Deployed by the script only when it had to create the admin timelock itself.
 OPTIONAL_NAMES = {"CitAgentTimelock": "MultisigTimelock2of3"}
 OWNED = ("OrganizationSBT", "AgentSBT", "CapsuleRegistry")
+# Field order of the script's `Deployed` struct after (admin, adminDeployedHere).
+RETURN_ORDER = (
+    "OrganizationSBT", "AgentSBT", "CapsuleRegistry", "AnchorRegistry", "BenchmarkRegistry", "SkillRegistry",
+)
 
 ADDR = re.compile(r"^0x[0-9a-fA-F]{40}$")
 HASH = re.compile(r"^0x[0-9a-fA-F]{64}$")
@@ -144,6 +153,24 @@ def _selector(sig: str) -> str:
 
 SEL_OWNER = _selector("owner()")  # 0x8da5cb5b
 SEL_ORG_CONTRACT = _selector("orgContract()")
+SEL_NEXT_TOKEN_ID = _selector("nextTokenId()")
+SEL_TOTAL_SKILLS = _selector("totalSkills()")
+ANCHOR_KINDS = 3  # AnchorRegistry.AnchorKind: PerCapsule, PerApproval, NightlyMerkle
+
+
+def root_count_call(kind: int) -> str:
+    """Calldata for AnchorRegistry.rootCountByKind(uint8 kind)."""
+    return _selector("rootCountByKind(uint8)") + kind.to_bytes(32, "big").hex()
+
+
+# Record counters read from a pin that is about to be replaced. A non-zero count
+# means members already hold records there, and moving the book strands them.
+RETIRE_PROBES = {
+    "OrganizationSBT": [("nextTokenId()", SEL_NEXT_TOKEN_ID)],
+    "AgentSBT": [("nextTokenId()", SEL_NEXT_TOKEN_ID)],
+    "SkillRegistry": [("totalSkills()", SEL_TOTAL_SKILLS)],
+    "AnchorRegistry": [(f"rootCountByKind({k})", root_count_call(k)) for k in range(ANCHOR_KINDS)],
+}
 
 
 # ── broadcast parsing ────────────────────────────────────────────────────────────
@@ -197,6 +224,34 @@ def parse_broadcast(run: dict) -> dict:
     return found
 
 
+def parse_returns(run: dict):
+    """The script's own `Deployed` return (admin + the six projections), or None.
+
+    forge writes run()'s return value into the broadcast as
+    returns["0"]["value"] = "(admin, adminDeployedHere, org, agent, capsule, anchor, bench, skill)".
+    These are the CREATE2 projections the script computed from the bytecode it was
+    built with, so they are the reference every pin is checked against.
+    """
+    ret = run.get("returns")
+    if not ret:
+        return None
+    entry = ret.get("0") if isinstance(ret, dict) else None
+    value = entry.get("value") if isinstance(entry, dict) else None
+    if not isinstance(value, str) or not (value.startswith("(") and value.endswith(")")):
+        raise BookError(f"broadcast returns is not the DeployHupRegistries.Deployed tuple: {ret!r}")
+    fields = [f.strip() for f in value[1:-1].split(",")]
+    if len(fields) != 2 + len(RETURN_ORDER) or fields[1] not in ("true", "false"):
+        raise BookError(f"broadcast returns has {len(fields)} fields, expected {2 + len(RETURN_ORDER)}")
+    addrs = [fields[0]] + fields[2:]
+    for a in addrs:
+        if not ADDR.match(a):
+            raise BookError(f"broadcast returns field is not an address: {a!r}")
+    out = {"admin": fields[0].lower()}
+    for name, a in zip(RETURN_ORDER, fields[2:]):
+        out[name] = a.lower()
+    return out
+
+
 # ── RPC ──────────────────────────────────────────────────────────────────────────
 
 def rpc(url: str, method: str, params: list):
@@ -243,16 +298,63 @@ def verify_live(url: str, genesis: str, admin: str, pins: dict, txs: dict) -> No
         raise BookError(f"AgentSBT.orgContract() is {org}, not OrganizationSBT {pins['OrganizationSBT']}")
 
 
+def _word_uint(word) -> int:
+    if not isinstance(word, str) or not word.startswith("0x") or len(word) < 3:
+        raise BookError(f"call returned no uint word: {word!r}")
+    return int(word, 16)
+
+
+def populated_retirements(url: str, book: dict, pins: dict) -> list:
+    """Book pins this run replaces whose old contract already holds records.
+
+    An old pin with no code (for example a book from before a reroll) holds nothing.
+    """
+    contracts = book.get("contracts") or {}
+    found = []
+    for name, probes in RETIRE_PROBES.items():
+        old = contracts.get(name)
+        if not (isinstance(old, str) and ADDR.match(old)) or name not in pins:
+            continue
+        if old.lower() == pins[name].lower():
+            continue
+        if rpc(url, "eth_getCode", [old, "latest"]) in (None, "0x", "0x0"):
+            continue
+        for label, data in probes:
+            n = _word_uint(rpc(url, "eth_call", [{"to": old, "data": data}, "latest"]))
+            if n:
+                found.append(f"{name} {old}: {label} = {n}")
+    return found
+
+
 # ── merge ────────────────────────────────────────────────────────────────────────
 
-def resolve_pins(book: dict, found: dict, keep_existing: bool) -> dict:
+def resolve_pins(book: dict, found: dict, keep_existing: bool, projected=None) -> dict:
+    """Pick one address per HUP name. `projected` is parse_returns() of the same run.
+
+    A pin from the broadcast must equal the script's projection. A pin kept from the
+    book (a registry the idempotent rerun skipped) is accepted only when it equals
+    the projection too, so an older contract version left in the book is never kept.
+    """
     pins = {}
     contracts = book.get("contracts") or {}
     for name in HUP_NAMES:
         if name in found:
             pins[name] = found[name]["address"]
+            if projected is not None and projected[name] != pins[name]:
+                raise BookError(
+                    f"{name}: the broadcast deployed {pins[name]} but the script projected {projected[name]}"
+                )
         elif keep_existing and isinstance(contracts.get(name), str) and ADDR.match(contracts[name]):
-            pins[name] = contracts[name].lower()
+            kept = contracts[name].lower()
+            if projected is None:
+                raise BookError(
+                    f"{name}: --keep-existing needs the script's returns in the broadcast to check the book entry"
+                )
+            if kept != projected[name]:
+                raise BookError(
+                    f"{name}: the book pins {kept}, not this build's projection {projected[name]} (an older version)"
+                )
+            pins[name] = kept
         else:
             raise BookError(
                 f"{name} is not in the broadcast"
@@ -291,22 +393,40 @@ def main(argv=None) -> int:
     ap.add_argument("--keep-existing", action="store_true",
                     help="accept a book entry for a registry the idempotent rerun skipped")
     ap.add_argument("--check", action="store_true", help="verify only; do not write")
+    ap.add_argument("--retire-populated", action="store_true",
+                    help="replace a book pin even though its old contract already holds records")
     a = ap.parse_args(argv)
     try:
         if not ADDR.match(a.admin):
             raise BookError(f"--admin must be a 0x address, got {a.admin!r}")
         if a.rpc and not (a.genesis and HASH.match(a.genesis)):
             raise BookError("--genesis 0x<64 hex> is required with --rpc")
+        if not a.rpc and not a.check:
+            raise BookError("writing the book needs --rpc and --genesis (on-chain checks); use --check to verify offline")
         run = json.loads(Path(a.broadcast).read_text())
         chain = run.get("chain")
         if chain is not None and int(chain) != CHAIN_ID:
             raise BookError(f"broadcast is for chain {chain}, not {CHAIN_ID}")
         book = json.loads(Path(a.book).read_text())
         found = parse_broadcast(run)
-        pins = resolve_pins(book, found, a.keep_existing)
+        projected = parse_returns(run)
+        if projected is None:
+            print("hup-book-update: WARNING: broadcast has no script returns; projection cross-check skipped",
+                  file=sys.stderr)
+        elif projected["admin"] != a.admin.lower():
+            raise BookError(f"--admin {a.admin} is not the admin the script used ({projected['admin']})")
+        pins = resolve_pins(book, found, a.keep_existing, projected)
         out = merged_book(book, pins)
         if a.rpc:
             verify_live(a.rpc, a.genesis, a.admin, pins, {n: f["tx"] for n, f in found.items() if f["tx"]})
+            stranded = populated_retirements(a.rpc, book, pins)
+            for line in stranded:
+                print(f"  populated pin replaced: {line}", file=sys.stderr)
+            if stranded and not a.retire_populated:
+                raise BookError(
+                    "an old pin already holds member records (listed above); moving the book strands them. "
+                    "Decide the migration with the owner, then rerun with --retire-populated"
+                )
         else:
             print("hup-book-update: WARNING: no --rpc, on-chain checks skipped", file=sys.stderr)
         changes = [

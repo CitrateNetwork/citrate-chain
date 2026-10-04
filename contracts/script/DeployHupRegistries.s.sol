@@ -50,6 +50,9 @@ contract DeployHupRegistries is ScriptEnv {
     /// Default minimum delay for a timelock this script deploys.
     uint256 public constant DEFAULT_TIMELOCK_DELAY = 2 days;
 
+    /// Longest root list `verify` reads in full (see `verify`).
+    uint256 public constant VERIFY_PAGE_MAX = 64;
+
     struct Config {
         address deployer;
         /// Existing admin. Zero means "deploy the CitAgentTimelock from timelockOwners".
@@ -244,8 +247,12 @@ contract DeployHupRegistries is ScriptEnv {
         OrganizationSBT(d.organizationSBT).nextTokenId();
         AgentSBT(d.agentSBT).nextTokenId();
         CapsuleRegistry(d.capsuleRegistry).isRevoked(0);
-        AnchorRegistry(d.anchorRegistry).rootCountByKind(AnchorRegistry.AnchorKind.NightlyMerkle);
-        AnchorRegistry(d.anchorRegistry).rootsByKind(AnchorRegistry.AnchorKind.NightlyMerkle, 0, type(uint256).max);
+        // The max-count page proves the overflow-safe clamp is deployed. It is only read
+        // while the list is short: on a rerun over a busy registry an unbounded page
+        // could exceed the RPC's eth_call gas cap during the simulate step.
+        uint256 nightly = AnchorRegistry(d.anchorRegistry).rootCountByKind(AnchorRegistry.AnchorKind.NightlyMerkle);
+        uint256 page = nightly <= VERIFY_PAGE_MAX ? type(uint256).max : 1;
+        AnchorRegistry(d.anchorRegistry).rootsByKind(AnchorRegistry.AnchorKind.NightlyMerkle, 0, page);
         BenchmarkRegistry(d.benchmarkRegistry).metricCount(address(0), 0, bytes32(0), bytes32(0));
         SkillRegistry(d.skillRegistry).totalSkills();
         require(

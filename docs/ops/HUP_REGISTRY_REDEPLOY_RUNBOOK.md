@@ -2,6 +2,7 @@
 title: "HUP registry redeploy (HUP-S7.1, federation F-4): operator runbook for chain 40204"
 created: 2026-10-01
 branch: hup/n5-chain-redeploy
+updated: 2026-10-04
 author: Larry Klosowski + Claude Opus 5.5
 status: READY FOR REHEARSAL. Nothing here has been broadcast. The chain operator runs the broadcast after the next reroll; the admin choice is pending owner sign-off.
 chain: 40204
@@ -10,8 +11,10 @@ chain: 40204
 # HUP registry redeploy: operator runbook
 
 This runbook deploys the on-chain registries that the Citrate Core "Hermes upskill"
-(HUP) features read, after the next 40204 reroll, and puts their addresses in the
-canonical book. Agents prepared and rehearsed it on a local anvil. **Only the chain
+(HUP) features read and puts their addresses in the canonical book. It is written for
+the run after the next 40204 reroll; the same steps also work on today's chain (the
+fork rehearsal proves that), and which of the two the operator uses is pending owner
+sign-off. Agents prepared and rehearsed it on a local anvil. **Only the chain
 operator broadcasts, with an operator-held key.** No agent signs, sends or deploys.
 
 Related: the reroll runbook (`scripts/ceremony/`), the address-book rules
@@ -144,10 +147,24 @@ scripts/ops/hup-book-update.py \
 ```
 
 Use `--keep-existing` only when a rerun skipped a registry that the book already
-pins at the same projection. The tool refuses to write if any CREATE2 address does
-not re-derive from the sent init code, a receipt failed, an address has no code, an
-owner is not the admin, the admin has no code, `AgentSBT.orgContract()` is not the
+pins at the same projection. The tool checks that: a kept book entry must equal the
+projection the script returned for this build (forge records `run()`'s return value
+in the broadcast), so an older contract version left in the book is never kept.
+
+The tool refuses to write if any CREATE2 address does not re-derive from the sent
+init code, a deployed address differs from the script's projection, `--admin` is not
+the admin the script used, a receipt failed, an address has no code, an owner is not
+the admin, the admin has no code, `AgentSBT.orgContract()` is not the
 OrganizationSBT, two names share an address, or the chain id / genesis differ.
+Writing always needs `--rpc` and `--genesis`; without them only `--check` runs.
+
+**Records at the old pins.** Before moving a pin, the tool reads the old contract's
+record counters (`nextTokenId()` on OrganizationSBT and AgentSBT, `totalSkills()` on
+SkillRegistry, `rootCountByKind(0..2)` on AnchorRegistry). If any is non-zero it
+lists them and refuses: moving the book would leave those members' records at an
+address the app no longer reads. A migration plan for those records is an owner
+decision; only after it is agreed, rerun with `--retire-populated`. On the
+2026-10-04 fork rehearsal every old pin read zero, so nothing would be stranded today.
 
 **Step 4.** Commit the book (one-file PR, squash). Regenerate the provenance ledger
 the same way as the reroll book (the deployer transactions now include these).
@@ -175,6 +192,8 @@ scripts/sync-addresses.py --book ../citrate-chain/contracts/addresses/40204.json
 - [ ] `python3 -m unittest discover -s scripts/ops/tests -p 'test_hup_*.py'` green.
 - [ ] Step 0 `dryrun: PASS` against the new chain.
 - [ ] Step 3 `--check` reports exactly the 6 (or 7) expected names.
+- [ ] Step 3 reports no "populated pin replaced" line (or the owner signed off a
+      migration and `--retire-populated` was used).
 - [ ] `cast call <AgentSBT> 'owner()(address)'` equals the admin, and the same for
       OrganizationSBT and CapsuleRegistry.
 - [ ] `cast call <SkillRegistry> 'skillHashOf(address,string,string)(bytes32)' …`
