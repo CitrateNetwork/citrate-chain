@@ -1,0 +1,446 @@
+{
+  "addresses": {
+    "AGENT_OPS": "0x0000000000000000000000000000000000000122",
+    "LORA_APPLY": "0x0000000000000000000000000000000000000112",
+    "LORA_MERGE": "0x0000000000000000000000000000000000000113",
+    "MEMORY_ANCHOR_VERIFY": "0x0000000000000000000000000000000000000121"
+  },
+  "device_link": [
+    {
+      "device": "f9ba981f03798e70e41bf2a88e0f03ea3cdc26d9",
+      "device_sig": "2ddfcaa3d28a06b8c64eae46c42e16f29167e59e10cd1b98348b62490377f24154f72bd4f3359cb7603bf97f4442fbb0f397a48e122851ffa47bb0fabdedbe571c",
+      "gas": 10054,
+      "index": 2,
+      "input": "01fd5af7e64c1fbe2561b930f9dbd193920becc07cf9ba981f03798e70e41bf2a88e0f03ea3cdc26d9a73ff43bd8c28a652b80c1d5b0cf784812ec7c6800000002000000006ab13b80094c696e757820626f78ce7847187e04acd95a9d52fca249d686f71800fb5032793964ba1d1fc52aacb7573fa08ace9de048c02eaf343d77d2612d87900f71f89c16722173cc44681c3c1c2ddfcaa3d28a06b8c64eae46c42e16f29167e59e10cd1b98348b62490377f24154f72bd4f3359cb7603bf97f4442fbb0f397a48e122851ffa47bb0fabdedbe571c8e49041d855e30b2df34c79acb4824add1b9f400f6464bc916326bd10b62c76420b9d90d2fc8dfbb84f74e255fdecca00fa227cd2ab6cc784056026030db96e11c",
+      "issued_at": 1790000000,
+      "label": "Linux box",
+      "member": "fd5af7e64c1fbe2561b930f9dbd193920becc07c",
+      "member_sig": "ce7847187e04acd95a9d52fca249d686f71800fb5032793964ba1d1fc52aacb7573fa08ace9de048c02eaf343d77d2612d87900f71f89c16722173cc44681c3c1c",
+      "message": "Citrate DeviceLink v1\nLink this device to my Citrate member identity.\nmember: 0xfd5af7e64c1fbe2561b930f9dbd193920becc07c\ndevice: 0xf9ba981f03798e70e41bf2a88e0f03ea3cdc26d9\nwallet: 0xa73ff43bd8c28a652b80c1d5b0cf784812ec7c68\nindex: 2\nlabel: Linux box\nissued_at: 1790000000",
+      "name": "valid link",
+      "output": "0000000000000000000000000000000000000000000000000000000000000001",
+      "valid": true,
+      "wallet": "a73ff43bd8c28a652b80c1d5b0cf784812ec7c68",
+      "wallet_sig": "8e49041d855e30b2df34c79acb4824add1b9f400f6464bc916326bd10b62c76420b9d90d2fc8dfbb84f74e255fdecca00fa227cd2ab6cc784056026030db96e11c"
+    },
+    {
+      "device": "f9ba981f03798e70e41bf2a88e0f03ea3cdc26d9",
+      "device_sig": "2ddfcaa3d28a06b8c64eae46c42e16f29167e59e10cd1b98348b62490377f24154f72bd4f3359cb7603bf97f4442fbb0f397a48e122851ffa47bb0fabdedbe571c",
+      "gas": 10054,
+      "index": 2,
+      "input": "01fd5af7e64c1fbe2561b930f9dbd193920becc07cf9ba981f03798e70e41bf2a88e0f03ea3cdc26d9a73ff43bd8c28a652b80c1d5b0cf784812ec7c6800000002000000006ab13b80094c696e757820426f78ce7847187e04acd95a9d52fca249d686f71800fb5032793964ba1d1fc52aacb7573fa08ace9de048c02eaf343d77d2612d87900f71f89c16722173cc44681c3c1c2ddfcaa3d28a06b8c64eae46c42e16f29167e59e10cd1b98348b62490377f24154f72bd4f3359cb7603bf97f4442fbb0f397a48e122851ffa47bb0fabdedbe571c8e49041d855e30b2df34c79acb4824add1b9f400f6464bc916326bd10b62c76420b9d90d2fc8dfbb84f74e255fdecca00fa227cd2ab6cc784056026030db96e11c",
+      "issued_at": 1790000000,
+      "label": "Linux Box",
+      "member": "fd5af7e64c1fbe2561b930f9dbd193920becc07c",
+      "member_sig": "ce7847187e04acd95a9d52fca249d686f71800fb5032793964ba1d1fc52aacb7573fa08ace9de048c02eaf343d77d2612d87900f71f89c16722173cc44681c3c1c",
+      "message": "Citrate DeviceLink v1\nLink this device to my Citrate member identity.\nmember: 0xfd5af7e64c1fbe2561b930f9dbd193920becc07c\ndevice: 0xf9ba981f03798e70e41bf2a88e0f03ea3cdc26d9\nwallet: 0xa73ff43bd8c28a652b80c1d5b0cf784812ec7c68\nindex: 2\nlabel: Linux Box\nissued_at: 1790000000",
+      "name": "label changed after signing",
+      "output": "0000000000000000000000000000000000000000000000000000000000000000",
+      "valid": false,
+      "wallet": "a73ff43bd8c28a652b80c1d5b0cf784812ec7c68",
+      "wallet_sig": "8e49041d855e30b2df34c79acb4824add1b9f400f6464bc916326bd10b62c76420b9d90d2fc8dfbb84f74e255fdecca00fa227cd2ab6cc784056026030db96e11c"
+    },
+    {
+      "device": "47817e81bdc4bfa4aa7aa188e719028386af4dba",
+      "device_sig": "8f2a9279b76c21bdc94e2a8f817ad7ae32208ca310737b400afc030aa7210cf94a80e72578c4cdbeff803d68b355a514ac59a03a25e85d224deba96825abeb771b",
+      "gas": 10054,
+      "index": 1023,
+      "input": "01dcd21d084680d310033123e0d36b674840c62c3547817e81bdc4bfa4aa7aa188e719028386af4dba128be2982fa3003f5df3eaee71bae4b3ee00abc5000003ff000000006b49d200104d61632773206c6170746f702d322e30170f6a2e13df5fdd6ec355fd465a8e633fe6cf003bd050f9031f84ae1df492a42c4d9bc7214ff0cc2ff881afc111df51f038f06ab5dc6aef059272ddd2e5736b1c8f2a9279b76c21bdc94e2a8f817ad7ae32208ca310737b400afc030aa7210cf94a80e72578c4cdbeff803d68b355a514ac59a03a25e85d224deba96825abeb771ba705a27c58f7c67904bd0222d619e7d95ad02e211e21acac075383066bc812cf0950900beed1f90a44db49722b8918b63f6092a5ba7cd5cf462e7417833bfb0e1b",
+      "issued_at": 1800000000,
+      "label": "Mac's laptop-2.0",
+      "member": "dcd21d084680d310033123e0d36b674840c62c35",
+      "member_sig": "170f6a2e13df5fdd6ec355fd465a8e633fe6cf003bd050f9031f84ae1df492a42c4d9bc7214ff0cc2ff881afc111df51f038f06ab5dc6aef059272ddd2e5736b1c",
+      "message": "Citrate DeviceLink v1\nLink this device to my Citrate member identity.\nmember: 0xdcd21d084680d310033123e0d36b674840c62c35\ndevice: 0x47817e81bdc4bfa4aa7aa188e719028386af4dba\nwallet: 0x128be2982fa3003f5df3eaee71bae4b3ee00abc5\nindex: 1023\nlabel: Mac's laptop-2.0\nissued_at: 1800000000",
+      "name": "valid link, top index",
+      "output": "0000000000000000000000000000000000000000000000000000000000000001",
+      "valid": true,
+      "wallet": "128be2982fa3003f5df3eaee71bae4b3ee00abc5",
+      "wallet_sig": "a705a27c58f7c67904bd0222d619e7d95ad02e211e21acac075383066bc812cf0950900beed1f90a44db49722b8918b63f6092a5ba7cd5cf462e7417833bfb0e1b"
+    }
+  ],
+  "device_revocation": [
+    {
+      "device": "54c86b9fe7b70c3fa5946f0ec197c2293b09e3e3",
+      "gas": 4042,
+      "input": "02cc11d1fc94bf7d55937074e0ebb0ba6ace628b9a54c86b9fe7b70c3fa5946f0ec197c2293b09e3e3000000006afd86c08de16c35a2418e0d661154fe74bb8b7b7a28071f4e830e8985b6dc8babc383f820e0cc2a11b6e58f8c765dd125b6fee4b61e0a09fe38fa56514ec1fb75e06cd31c",
+      "member": "cc11d1fc94bf7d55937074e0ebb0ba6ace628b9a",
+      "member_sig": "8de16c35a2418e0d661154fe74bb8b7b7a28071f4e830e8985b6dc8babc383f820e0cc2a11b6e58f8c765dd125b6fee4b61e0a09fe38fa56514ec1fb75e06cd31c",
+      "message": "Citrate DeviceRevocation v1\nRemove this device from my Citrate member identity.\nmember: 0xcc11d1fc94bf7d55937074e0ebb0ba6ace628b9a\ndevice: 0x54c86b9fe7b70c3fa5946f0ec197c2293b09e3e3\nrevoked_at: 1795000000",
+      "name": "valid revocation",
+      "output": "0000000000000000000000000000000000000000000000000000000000000001",
+      "revoked_at": 1795000000,
+      "valid": true
+    },
+    {
+      "device": "54c86b9fe7b70c3fa5946f0ec197c2293b09e3e3",
+      "gas": 4042,
+      "input": "02cc11d1fc94bf7d55937074e0ebb0ba6ace628b9a54c86b9fe7b70c3fa5946f0ec197c2293b09e3e3000000006afd86c18de16c35a2418e0d661154fe74bb8b7b7a28071f4e830e8985b6dc8babc383f820e0cc2a11b6e58f8c765dd125b6fee4b61e0a09fe38fa56514ec1fb75e06cd31c",
+      "member": "cc11d1fc94bf7d55937074e0ebb0ba6ace628b9a",
+      "member_sig": "8de16c35a2418e0d661154fe74bb8b7b7a28071f4e830e8985b6dc8babc383f820e0cc2a11b6e58f8c765dd125b6fee4b61e0a09fe38fa56514ec1fb75e06cd31c",
+      "message": "Citrate DeviceRevocation v1\nRemove this device from my Citrate member identity.\nmember: 0xcc11d1fc94bf7d55937074e0ebb0ba6ace628b9a\ndevice: 0x54c86b9fe7b70c3fa5946f0ec197c2293b09e3e3\nrevoked_at: 1795000001",
+      "name": "time changed after signing",
+      "output": "0000000000000000000000000000000000000000000000000000000000000000",
+      "revoked_at": 1795000001,
+      "valid": false
+    }
+  ],
+  "generator": "citrate-chain core/execution/tests/agent_precompile_vectors.rs",
+  "lora_apply": [
+    {
+      "a": {
+        "q16": [
+          196608,
+          262144
+        ],
+        "shape": [
+          1,
+          2
+        ]
+      },
+      "alpha": 131072,
+      "b": {
+        "q16": [
+          65536,
+          131072
+        ],
+        "shape": [
+          2,
+          1
+        ]
+      },
+      "gas": 3028,
+      "input": "0200000002000000020100000100000000000000010000000000000001000000000000000100000000000200000002000000010100000100000000000000020000000000020000000100000002010000030000000000000004000000000000010000020000000000",
+      "name": "integers 2x2 rank 1",
+      "out": {
+        "q16": [
+          458752,
+          589824,
+          851968,
+          1114112
+        ],
+        "shape": [
+          2,
+          2
+        ]
+      },
+      "output": "020000000200000002010000070000000000000009000000000000000d00000000000000110000000000",
+      "w": {
+        "q16": [
+          65536,
+          65536,
+          65536,
+          65536
+        ],
+        "shape": [
+          2,
+          2
+        ]
+      }
+    },
+    {
+      "a": {
+        "q16": [
+          -65536,
+          32768,
+          49152,
+          131072,
+          -16384,
+          65536
+        ],
+        "shape": [
+          2,
+          3
+        ]
+      },
+      "alpha": 262144,
+      "b": {
+        "q16": [
+          98304,
+          -32768,
+          16384,
+          131072
+        ],
+        "shape": [
+          2,
+          2
+        ]
+      },
+      "gas": 3066,
+      "input": "02000000020000000301008000000000000000c0feffffffffff0000000000000000000003000000000000400000000000000040ffffffffffff0200000002000000020100800100000000000080ffffffffffff00400000000000000000020000000000020000000200000003010000ffffffffffff008000000000000000c0000000000000000002000000000000c0ffffffffffff000001000000000000010000040000000000",
+      "name": "fractions and negatives 2x3 rank 2",
+      "out": {
+        "q16": [
+          -294912,
+          32768,
+          81920,
+          688128,
+          -32768,
+          237568
+        ],
+        "shape": [
+          2,
+          3
+        ]
+      },
+      "output": "020000000200000003010080fbffffffffff0080000000000000004001000000000000800a00000000000080ffffffffffff00a0030000000000",
+      "w": {
+        "q16": [
+          32768,
+          -81920,
+          0,
+          196608,
+          16384,
+          -49152
+        ],
+        "shape": [
+          2,
+          3
+        ]
+      }
+    },
+    {
+      "a": {
+        "q16": [
+          1048576
+        ],
+        "shape": [
+          1,
+          1
+        ]
+      },
+      "alpha": 524288,
+      "b": {
+        "q16": [
+          4611686018427387903
+        ],
+        "shape": [
+          1,
+          1
+        ]
+      },
+      "gas": 3007,
+      "input": "02000000010000000101f8ffffffffffff7f02000000010000000101ffffffffffffff3f02000000010000000101000010000000000000010000080000000000",
+      "name": "saturating 1x1 rank 1",
+      "out": {
+        "q16": [
+          9223372036854775807
+        ],
+        "shape": [
+          1,
+          1
+        ]
+      },
+      "output": "02000000010000000101ffffffffffffff7f",
+      "w": {
+        "q16": [
+          9223372036854775800
+        ],
+        "shape": [
+          1,
+          1
+        ]
+      }
+    }
+  ],
+  "lora_merge": [
+    {
+      "adapters": [
+        {
+          "a": {
+            "q16": [
+              196608,
+              65536
+            ],
+            "shape": [
+              1,
+              2
+            ]
+          },
+          "alpha": 65536,
+          "b": {
+            "q16": [
+              131072
+            ],
+            "shape": [
+              1,
+              1
+            ]
+          },
+          "weight": 65536
+        },
+        {
+          "a": {
+            "q16": [
+              65536,
+              0,
+              0,
+              65536
+            ],
+            "shape": [
+              2,
+              2
+            ]
+          },
+          "alpha": 262144,
+          "b": {
+            "q16": [
+              65536,
+              65536
+            ],
+            "shape": [
+              1,
+              2
+            ]
+          },
+          "weight": 32768
+        }
+      ],
+      "gas": 3040,
+      "input": "020200000001000000010100000200000000000200000001000000020100000300000000000000010000000000000100000100000000000001000001000000000002000000010000000201000001000000000000000100000000000200000002000000020100000100000000000000000000000000000000000000000000000100000000000001000004000000000000010080000000000000",
+      "name": "two adapters, mixed ranks 1x2",
+      "out": {
+        "q16": [
+          458752,
+          196608
+        ],
+        "shape": [
+          1,
+          2
+        ]
+      },
+      "output": "0200000001000000020100000700000000000000030000000000"
+    },
+    {
+      "adapters": [
+        {
+          "a": {
+            "q16": [
+              196608,
+              262144
+            ],
+            "shape": [
+              1,
+              2
+            ]
+          },
+          "alpha": 131072,
+          "b": {
+            "q16": [
+              65536,
+              131072
+            ],
+            "shape": [
+              2,
+              1
+            ]
+          },
+          "weight": 65536
+        }
+      ],
+      "gas": 3032,
+      "input": "01020000000200000001010000010000000000000002000000000002000000010000000201000003000000000000000400000000000001000002000000000000010000010000000000",
+      "name": "one adapter, weight 1, equals LORA_APPLY on a zero base",
+      "out": {
+        "q16": [
+          393216,
+          524288,
+          786432,
+          1048576
+        ],
+        "shape": [
+          2,
+          2
+        ]
+      },
+      "output": "020000000200000002010000060000000000000008000000000000000c00000000000000100000000000"
+    }
+  ],
+  "memory_anchor": [
+    {
+      "commitment": "26f10b854266080ba2d272d4042ef80c9a9eb85a90de744e71b4b10c7f9998e8",
+      "count": 5,
+      "day": 20362,
+      "first_seq": 40,
+      "gas": 1950,
+      "input": "000000010000000000004f8a0000000000000028000000000000002c0000000000000005e31cc748d04dce3c6ecfcb00dff52dd853d551e0f57bf3f2e516c2f65882a8e4000000000000002b000000000000000331741bc66a60b44cf2010cec0b4fd587b06583917bf0e4fa6d43168892eb838d03dd6b83ae1d8223d23ed4869464289c9952b6caf38b53cc4da7c87cc1f2462717196bea1e49292cc96d0437940e2437d904130a222cb6812e6bfa53aae78871da2fa07631df4d01d859eb3e78061cfb4b17ed553b410ce58c7d2b76a04d0c87cf",
+      "last_seq": 44,
+      "leaf_index": 3,
+      "name": "shared day, record 3",
+      "output": "26f10b854266080ba2d272d4042ef80c9a9eb85a90de744e71b4b10c7f9998e8",
+      "path": [
+        "dd6b83ae1d8223d23ed4869464289c9952b6caf38b53cc4da7c87cc1f2462717",
+        "196bea1e49292cc96d0437940e2437d904130a222cb6812e6bfa53aae78871da",
+        "2fa07631df4d01d859eb3e78061cfb4b17ed553b410ce58c7d2b76a04d0c87cf"
+      ],
+      "record_hash": "31741bc66a60b44cf2010cec0b4fd587b06583917bf0e4fa6d43168892eb838d",
+      "seq": 43,
+      "tree_root": "e31cc748d04dce3c6ecfcb00dff52dd853d551e0f57bf3f2e516c2f65882a8e4",
+      "v": 1,
+      "valid": true
+    },
+    {
+      "commitment": "26f10b854266080ba2d272d4042ef80c9a9eb85a90de744e71b4b10c7f9998e8",
+      "count": 5,
+      "day": 20362,
+      "first_seq": 40,
+      "gas": 1950,
+      "input": "000000010000000000004f8a0000000000000028000000000000002c0000000000000005e31cc748d04dce3c6ecfcb00dff52dd853d551e0f57bf3f2e516c2f65882a8e4000000000000002b00000000000000038a2e426205aca5ffe7b2fa9605da926de0600f6ed0d7beb72fc662ab7e0a5d4c03dd6b83ae1d8223d23ed4869464289c9952b6caf38b53cc4da7c87cc1f2462717196bea1e49292cc96d0437940e2437d904130a222cb6812e6bfa53aae78871da2fa07631df4d01d859eb3e78061cfb4b17ed553b410ce58c7d2b76a04d0c87cf",
+      "last_seq": 44,
+      "leaf_index": 3,
+      "name": "wrong record hash",
+      "output": "0000000000000000000000000000000000000000000000000000000000000000",
+      "path": [
+        "dd6b83ae1d8223d23ed4869464289c9952b6caf38b53cc4da7c87cc1f2462717",
+        "196bea1e49292cc96d0437940e2437d904130a222cb6812e6bfa53aae78871da",
+        "2fa07631df4d01d859eb3e78061cfb4b17ed553b410ce58c7d2b76a04d0c87cf"
+      ],
+      "record_hash": "8a2e426205aca5ffe7b2fa9605da926de0600f6ed0d7beb72fc662ab7e0a5d4c",
+      "seq": 43,
+      "tree_root": "e31cc748d04dce3c6ecfcb00dff52dd853d551e0f57bf3f2e516c2f65882a8e4",
+      "v": 1,
+      "valid": false
+    },
+    {
+      "commitment": "26f10b854266080ba2d272d4042ef80c9a9eb85a90de744e71b4b10c7f9998e8",
+      "count": 5,
+      "day": 20362,
+      "first_seq": 40,
+      "gas": 1950,
+      "input": "000000010000000000004f8a0000000000000028000000000000002c0000000000000005e31cc748d04dce3c6ecfcb00dff52dd853d551e0f57bf3f2e516c2f65882a8e4000000000000002c000000000000000331741bc66a60b44cf2010cec0b4fd587b06583917bf0e4fa6d43168892eb838d03dd6b83ae1d8223d23ed4869464289c9952b6caf38b53cc4da7c87cc1f2462717196bea1e49292cc96d0437940e2437d904130a222cb6812e6bfa53aae78871da2fa07631df4d01d859eb3e78061cfb4b17ed553b410ce58c7d2b76a04d0c87cf",
+      "last_seq": 44,
+      "leaf_index": 3,
+      "name": "sequence does not match the leaf",
+      "output": "0000000000000000000000000000000000000000000000000000000000000000",
+      "path": [
+        "dd6b83ae1d8223d23ed4869464289c9952b6caf38b53cc4da7c87cc1f2462717",
+        "196bea1e49292cc96d0437940e2437d904130a222cb6812e6bfa53aae78871da",
+        "2fa07631df4d01d859eb3e78061cfb4b17ed553b410ce58c7d2b76a04d0c87cf"
+      ],
+      "record_hash": "31741bc66a60b44cf2010cec0b4fd587b06583917bf0e4fa6d43168892eb838d",
+      "seq": 44,
+      "tree_root": "e31cc748d04dce3c6ecfcb00dff52dd853d551e0f57bf3f2e516c2f65882a8e4",
+      "v": 1,
+      "valid": false
+    },
+    {
+      "commitment": "1d33e242663ffcc26f2ed791f4a7d4d0337b647bf4981ace824b0778c2842eb0",
+      "count": 1,
+      "day": 20400,
+      "first_seq": 7,
+      "gas": 1500,
+      "input": "000000010000000000004fb0000000000000000700000000000000070000000000000001f43914aca3f6a649fc118fb346c5b21cd12cf8cba55d8a6c7413083d9dc1e2f000000000000000070000000000000000f905b19542ed08c9a9c26543cca32e5711d207dcffb81b4cdb44ce0b989431c900",
+      "last_seq": 7,
+      "leaf_index": 0,
+      "name": "single-record day",
+      "output": "1d33e242663ffcc26f2ed791f4a7d4d0337b647bf4981ace824b0778c2842eb0",
+      "path": [],
+      "record_hash": "f905b19542ed08c9a9c26543cca32e5711d207dcffb81b4cdb44ce0b989431c9",
+      "seq": 7,
+      "tree_root": "f43914aca3f6a649fc118fb346c5b21cd12cf8cba55d8a6c7413083d9dc1e2f0",
+      "v": 1,
+      "valid": true
+    }
+  ],
+  "spec": "citrate-chain docs/precompiles/AGENT_PRECOMPILES.md",
+  "version": 1
+}
