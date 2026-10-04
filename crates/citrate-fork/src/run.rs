@@ -260,8 +260,11 @@ pub fn run(plan: &Plan, state: ForkState, cfg: &ForkConfig) -> Result<Report, Fo
                     b.number = U256::from(height);
                     b.timestamp = U256::from(timestamp);
                     b.coinbase = cfg.block.coinbase;
-                    b.gas_limit = U256::from(crate::plan::DEFAULT_GAS_LIMIT);
-                    b.basefee = U256::ZERO;
+                    // The node never sets the block gas limit or base fee inside REVM (its
+                    // executor enforces the gas limit outside the EVM), so GASLIMIT reads
+                    // revm's default (U256::MAX) and BASEFEE reads 0 on 40204. Leave both at
+                    // revm's defaults so the fork reads the same (tests/node_parity.rs).
+                    // PREVRANDAO: the fork cannot know the simulated block's VRF output; 0.
                     b.prevrandao = Some(B256::ZERO);
                 })
                 .modify_tx_env(|tx| {

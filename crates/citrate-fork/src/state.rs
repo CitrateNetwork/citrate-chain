@@ -9,6 +9,7 @@
 //!
 //! Writes made by the dry run stay in revm's in-memory `CacheDB` on top of this and are
 //! dropped when the process exits.
+use std::io::Read as _;
 use std::time::Duration;
 
 use revm::primitives::{
@@ -158,8 +159,11 @@ impl RpcState {
             .send()
             .map_err(|e| err(format!("{method}: {e}")))?;
         let status = resp.status();
-        let bytes = resp
-            .bytes()
+        // Read at most one byte past the cap, so an oversized answer is refused without
+        // first being held in memory whole.
+        let mut bytes = Vec::new();
+        resp.take(MAX_RPC_BODY as u64 + 1)
+            .read_to_end(&mut bytes)
             .map_err(|e| err(format!("{method}: reading the response: {e}")))?;
         if bytes.len() > MAX_RPC_BODY {
             return Err(err(format!(

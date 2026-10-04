@@ -235,3 +235,31 @@ fn plans_are_checked() {
     let too_many = serde_json::json!({ "from": addr_hex(sender()), "steps": many });
     assert!(Plan::from_json(&too_many.to_string()).is_err());
 }
+
+#[test]
+fn a_top_level_call_into_a_precompile_is_traced_too() {
+    // A plan step that targets a Citrate precompile directly (not through a contract) must
+    // be recorded like a nested call: the tracer sees the transaction's own frame.
+    let plan = Plan::from_json(&plan_json(serde_json::json!([
+        { "kind": "create", "data": fixture("Payout") },
+        { "kind": "call", "to": addr_hex(revm::primitives::Address::from_slice(&precompile(0x0100))), "data": "0x00" },
+        { "kind": "call", "to": addr_hex(revm::primitives::Address::from_slice(&precompile(0x0110))),
+          "data": format!("0x{}", hex::encode(belnap_input())) },
+    ])))
+    .expect("plan");
+    let rep = run(&plan, ForkState::Empty, &config_at(TODAY)).expect("runs");
+    assert_eq!(
+        rep.precompiles.unavailable_touched,
+        vec!["0x0100".to_string()]
+    );
+    let real: Vec<_> = rep
+        .precompiles
+        .touched
+        .iter()
+        .filter(|t| t.coverage == Coverage::Real)
+        .map(|t| t.address.as_str())
+        .collect();
+    assert_eq!(real, vec!["0x0110"]);
+    assert_eq!(rep.steps[1].precompiles_touched.len(), 1);
+    assert_eq!(rep.steps[2].precompiles_touched.len(), 1);
+}

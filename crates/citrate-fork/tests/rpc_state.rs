@@ -309,3 +309,44 @@ fn anvil_fork_state_is_read_through_the_same_path() {
         "plain anvil cannot answer a Citrate precompile"
     );
 }
+
+#[test]
+fn an_oversized_rpc_answer_is_refused() {
+    // An endpoint that answers every request with a body over the 4 MiB cap.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            std::thread::spawn(move || {
+                let mut w = match stream.try_clone() {
+                    Ok(w) => w,
+                    Err(_) => return,
+                };
+                let mut r = BufReader::new(stream);
+                let mut line = String::new();
+                // Drain the request head; the body is not needed.
+                while r.read_line(&mut line).unwrap_or(0) > 0 {
+                    if line == "\r\n" {
+                        break;
+                    }
+                    line.clear();
+                }
+                let body = format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"0x{}\"}}",
+                    "0".repeat(5 * 1024 * 1024)
+                );
+                let out = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = w.write_all(out.as_bytes());
+                let _ = w.write_all(body.as_bytes());
+            });
+        }
+    });
+    let e = RpcState::connect(&url, Some(BLOCK))
+        .err()
+        .expect("an oversized answer must be refused");
+    assert!(e.0.contains("larger than"), "{e}");
+}

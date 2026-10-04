@@ -35,3 +35,7 @@ default = []
 # default (it pulls Nova); without it a hardened-height call into 0x0130 is reported as
 # unavailable in this fork rather than silently diverging.
 commd-fold-verify = ["citrate-execution/commd-fold-verify"]
+
+[dev-dependencies]
+# The node-parity test calls the node's own REVM entry points, which take these types.
+primitive-types = { version = "0.12", features = ["serde"] }

@@ -27,6 +27,7 @@ fork runs the same EVM configuration the node builds:
 | Value transfers made by contracts | `executor::value_semantics_at` (REVM-authoritative on 40204) |
 | Contract nonces (EIP-161) | `executor::persist_contract_nonces_at` |
 | EVM spec, chain id, GASPRICE | CANCUN, the endpoint's chain id, gas price 0 inside the EVM (the executor charges gas outside REVM) |
+| GASLIMIT, BASEFEE | revm's defaults, as the node leaves them (GASLIMIT reads U256::MAX, BASEFEE reads 0); `tests/node_parity.rs` compares every environment word with the node's own REVM entry points |
 
 A block where the legacy value rule or the legacy nonce rule still applies is refused, not
 simulated wrongly.

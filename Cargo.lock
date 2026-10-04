@@ -1396,6 +1396,7 @@ dependencies = [
  "citrate-consensus",
  "citrate-execution",
  "hex",
+ "primitive-types",
  "reqwest",
  "revm",
  "serde",
