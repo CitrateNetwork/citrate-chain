@@ -835,6 +835,18 @@ async fn request_tokens(
     // HUP-S6.5 (faucet ADR O-2, pending owner sign-off): membership check, when the operator
     // configured one. Fails closed: an RPC failure refuses the drip.
     if let Some(sbt) = state.member_sbt.as_deref() {
+        // A caller already inside a cooldown is answered from memory first, so a refused caller
+        // cannot make the faucet spend an eth_call per request. Read-only: the atomic
+        // reservation below still decides.
+        if let Err(denial) = state.cooldowns.check(&recipient_hex, &client_ip) {
+            let (limit, remaining) = denial_parts(&denial);
+            return Ok(Json(FaucetResponse::rate_limited(
+                limit,
+                format!("Rate limited: {}", denial),
+                remaining,
+                unix_now(),
+            )));
+        }
         match membership::holds_member_sbt(
             &state.http,
             &state.rpc_url,
@@ -1625,6 +1637,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn s65_a_caller_in_cooldown_costs_no_membership_rpc() {
+        // Membership on, RPC dead. A caller already inside the cooldown must be told when to
+        // come back without the faucet spending an eth_call on them (no RPC amplification).
+        let mut st = test_state("http://127.0.0.1:9");
+        st.member_sbt = Some(addr_of(0x71));
+        let cooldowns = st.cooldowns.clone();
+        let base = serve(st, None).await;
+        let a = addr_of(0x41);
+        cooldowns
+            .try_reserve(a.trim_start_matches("0x"), "127.0.0.1")
+            .expect("reserve");
+        let r = post_drip(&base, &a, None).await;
+        assert_eq!(r["code"], "rate_limited", "{r}");
+        assert!(r["next_eligible_at"].as_u64().is_some());
+        // A caller outside the cooldown still reaches the (dead) membership check: fail closed.
+        let fresh_state = {
+            let mut s = test_state("http://127.0.0.1:9");
+            s.member_sbt = Some(addr_of(0x71));
+            s
+        };
+        let fresh = serve(fresh_state, None).await;
+        let r = post_drip(&fresh, &addr_of(0x42), None).await;
+        assert_eq!(r["code"], "membership_unavailable", "{r}");
+    }
+
+    #[tokio::test]
     async fn s65_eligibility_is_read_only_and_reports_the_next_time() {
         let state = test_state("http://127.0.0.1:9");
         let cooldowns = state.cooldowns.clone();
@@ -1850,6 +1888,21 @@ mod tests {
         u128::from_str_radix(v.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16).unwrap_or(0)
     }
 
+    /// The balance once a sent drip is mined. eth_sendRawTransaction returns before anvil has
+    /// mined the block, so an immediate read can still see the old balance (a flake seen in
+    /// review); this waits up to 5 s for `want`, then returns what it sees.
+    async fn mined_balance(url: &str, addr: &str, want: u128) -> u128 {
+        let mut seen = balance(url, addr).await;
+        for _ in 0..50 {
+            if seen == want {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            seen = balance(url, addr).await;
+        }
+        seen
+    }
+
     #[tokio::test]
     async fn s65_anvil_drip_ready_cap_and_membership() {
         let Some(anvil) = start_anvil().await else {
@@ -1871,7 +1924,7 @@ mod tests {
         let ok = post_drip(&base, &a, Some("198.51.100.1")).await;
         assert_eq!(ok["success"], true, "{ok}");
         assert!(ok.get("code").is_none());
-        assert_eq!(balance(&anvil.url, &a).await, DRIP_AMOUNT);
+        assert_eq!(mined_balance(&anvil.url, &a, DRIP_AMOUNT).await, DRIP_AMOUNT);
 
         // 2. Same address again: refused with the next eligible time, nothing sent.
         let again = post_drip(&base, &a, Some("198.51.100.2")).await;
@@ -1902,7 +1955,7 @@ mod tests {
         let c = addr_of(0x63);
         let member = post_drip(&yes_base, &c, Some("198.51.100.4")).await;
         assert_eq!(member["success"], true, "{member}");
-        assert_eq!(balance(&anvil.url, &c).await, DRIP_AMOUNT);
+        assert_eq!(mined_balance(&anvil.url, &c, DRIP_AMOUNT).await, DRIP_AMOUNT);
 
         let mut no = funded_state(&anvil).await;
         no.member_sbt = Some(non_member_sbt);
