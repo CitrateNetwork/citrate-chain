@@ -52,6 +52,11 @@ pub struct ConsensusManifest {
     /// everywhere; set by start_node before the manifest is printed, or by
     /// `CITRATE_PBA_HARDENING_HEIGHT` for `citrate consensus`).
     pub pba_hardening_height: Option<u64>,
+    /// HUP-S7.2: the agent precompile fork height this process resolved
+    /// (`citrate_execution::agent_fork`; `None` = not activated). Part of the
+    /// fingerprint only when set, so an unscheduled fork leaves the pre-image
+    /// exactly as it was.
+    pub agent_precompiles_height: Option<u64>,
     /// Canonical EIP-1559 base fee committed into every block (reroll constant).
     pub canonical_base_fee_per_gas: u64,
     /// Validator-registry snapshot epoch length (blocks).
@@ -73,8 +78,20 @@ impl ConsensusManifest {
         Self::for_height(height)
     }
 
-    /// The manifest for this binary under a given activation height.
+    /// The manifest for this binary under a given activation height (the agent
+    /// precompile fork height is read from the process store).
     pub fn for_height(pba_hardening_height: Option<u64>) -> Self {
+        Self::for_heights(
+            pba_hardening_height,
+            citrate_execution::agent_fork::agent_precompiles_height(),
+        )
+    }
+
+    /// The manifest under explicit PBA and agent-fork activation heights.
+    pub fn for_heights(
+        pba_hardening_height: Option<u64>,
+        agent_precompiles_height: Option<u64>,
+    ) -> Self {
         let version = env!("CARGO_PKG_VERSION");
         let git_sha = env!("CITRATE_GIT_SHA");
         let git_dirty = env!("CITRATE_GIT_DIRTY") == "1";
@@ -110,6 +127,12 @@ impl ConsensusManifest {
                 .map(|h| h.to_string())
                 .unwrap_or_else(|| "unset".to_string()),
         );
+        // HUP-S7.2: appended only when scheduled, so an unset fork keeps the
+        // pre-image (and the fingerprint) byte-identical to the previous form.
+        let preimage = match agent_precompiles_height {
+            Some(h) => format!("{preimage}agent_precompiles_height={h}\n"),
+            None => preimage,
+        };
         let digest = Sha256::digest(preimage.as_bytes());
         let fingerprint = format!("0x{}", hex::encode(&digest[..16]));
 
@@ -122,6 +145,7 @@ impl ConsensusManifest {
             feat_commd_fold_verify,
             activation_gated,
             pba_hardening_height,
+            agent_precompiles_height,
             canonical_base_fee_per_gas: CANONICAL_BASE_FEE_PER_GAS,
             epoch: EPOCH,
             snapshot_lag: SNAPSHOT_LAG,
@@ -149,6 +173,12 @@ impl ConsensusManifest {
             self.pba_hardening_height
                 .map(|h| h.to_string())
                 .unwrap_or_else(|| "unset (legacy rules)".to_string())
+        );
+        println!(
+            "  agent precompiles  {}",
+            self.agent_precompiles_height
+                .map(|h| format!("from height {h} (0x0112 0x0113 0x0121 0x0122)"))
+                .unwrap_or_else(|| "not activated".to_string())
         );
         for r in &self.activation_gated {
             println!("  gated              {r}");
@@ -209,6 +239,22 @@ mod tests {
         assert_eq!(
             a.fingerprint,
             ConsensusManifest::for_height(Some(123_456)).fingerprint
+        );
+    }
+
+    /// HUP-S7.2: an unscheduled agent fork leaves the fingerprint exactly as
+    /// before; a scheduled one is part of it.
+    #[test]
+    fn agent_fork_height_enters_the_fingerprint_only_when_set() {
+        let unset = ConsensusManifest::for_heights(Some(10), None);
+        let a = ConsensusManifest::for_heights(Some(10), Some(500));
+        let b = ConsensusManifest::for_heights(Some(10), Some(501));
+        assert_eq!(a.agent_precompiles_height, Some(500));
+        assert_ne!(a.fingerprint, unset.fingerprint);
+        assert_ne!(a.fingerprint, b.fingerprint);
+        assert_eq!(
+            unset.fingerprint,
+            ConsensusManifest::for_heights(Some(10), None).fingerprint
         );
     }
 

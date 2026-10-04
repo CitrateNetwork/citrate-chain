@@ -120,6 +120,22 @@ async fn main() -> Result<()> {
     let pba = citrate_execution::activation::init_pba_hardening_for_chain(chain_id, None, false)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     info!("PBA hardening activation: {}", pba.describe());
+    // HUP-S7.2: the agent precompile fork height, through the node's resolver
+    // (release pin for 40204; CITRATE_AGENT_PRECOMPILES_HEIGHT on dev chains),
+    // so eth_call sees the same precompile set as the node at every height.
+    let (agent_fork_height, agent_fork_source) =
+        citrate_execution::agent_fork::init_for_chain(chain_id, None)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+    match agent_fork_height {
+        Some(h) => info!(
+            "Agent precompile fork active from height {} (source: {})",
+            h, agent_fork_source
+        ),
+        None => info!(
+            "Agent precompile fork not scheduled (source: {})",
+            agent_fork_source
+        ),
+    }
     let state_db = Arc::new(StateDB::new());
     let executor = Arc::new(Executor::with_chain_id_and_inference_mode(
         state_db,
@@ -180,4 +196,39 @@ async fn main() -> Result<()> {
         error!("API service exited with error: {e}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// HUP-S7.2: this RPC binary executes eth_call / eth_estimateGas with the
+    /// same execution crate as the node, so it must publish the agent
+    /// precompile fork height through the same resolver, before the executor
+    /// exists. Without it, once a release pins the fork for 40204, this binary
+    /// would keep answering with the pre-fork precompile set.
+    #[test]
+    fn agent_fork_height_is_published_before_the_executor() {
+        let main = include_str!("main.rs");
+        let body = &main[..main.find("#[cfg(test)]").unwrap_or(main.len())];
+        let init = body
+            .find("citrate_execution::agent_fork::init_for_chain(chain_id, None)")
+            .unwrap_or(usize::MAX);
+        let pba = body
+            .find("init_pba_hardening_for_chain(")
+            .unwrap_or(usize::MAX);
+        let exec = body
+            .find("Executor::with_chain_id_and_inference_mode(")
+            .unwrap_or(usize::MAX);
+        assert!(
+            init != usize::MAX,
+            "node-app must publish the agent fork height"
+        );
+        assert!(
+            pba < exec && init < exec,
+            "both heights published before the executor"
+        );
+        assert!(
+            !body.contains("set_agent_precompiles_height("),
+            "one publication path"
+        );
+    }
 }

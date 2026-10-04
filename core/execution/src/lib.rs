@@ -2,6 +2,7 @@
 
 // Re-export modules
 pub mod activation;
+pub mod agent_fork;
 
 /// PBA-L1a-003: consensus-affecting cargo features of THIS build of the
 /// execution crate. Dependent binaries assert on these at compile time (a
