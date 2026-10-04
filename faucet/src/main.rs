@@ -1205,6 +1205,21 @@ const DRIP_AMOUNT: u128 = 10_000_000_000_000_000_000;
 mod tests {
     use super::*;
 
+    /// A throwaway secp256k1 key made at run time, so no key material is a constant in the
+    /// source. Unique per call (clock + counter); nothing the tests assert depends on its value.
+    fn throwaway_key(label: &str) -> k256::ecdsa::SigningKey {
+        use sha3::{Digest, Keccak256};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(1);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let seed = Keccak256::digest(format!("{label}-{nanos}-{n}").as_bytes());
+        k256::ecdsa::SigningKey::from_slice(&seed).expect("scalar")
+    }
+
     // ── PBA-L8-017: CORS allowlist + security headers, over a real socket ──
     fn test_state(rpc_url: &str) -> FaucetState {
         FaucetState {
@@ -1212,9 +1227,7 @@ mod tests {
             api_key: None,
             chain_id: 40204,
             faucet_address: Address([0u8; 20]),
-            signing_key: Arc::new(
-                k256::ecdsa::SigningKey::from_slice(&[7u8; 32]).expect("test key"),
-            ),
+            signing_key: Arc::new(throwaway_key("faucet-test-state")),
             cooldowns: Arc::new(Cooldowns::in_memory(CooldownPolicy::default())),
             address_whitelist: Arc::new(HashSet::new()),
             turnstile: None,
@@ -1773,7 +1786,7 @@ mod tests {
 
     #[test]
     fn s65_drip_tx_is_a_legacy_eip155_transfer() {
-        let key = k256::ecdsa::SigningKey::from_slice(&[9u8; 32]).expect("key");
+        let key = throwaway_key("s65-drip-tx");
         let raw = sign_drip_tx(&key, 40204, 3, &[0x77; 20]).expect("sign");
         let bytes = hex::decode(raw.trim_start_matches("0x")).expect("hex");
         let rlp = rlp::Rlp::new(&bytes);
@@ -1862,13 +1875,7 @@ mod tests {
 
     /// A throwaway faucet key made at run time and funded on the local anvil only.
     async fn funded_state(anvil: &Anvil) -> FaucetState {
-        use sha3::{Digest, Keccak256};
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(1);
-        let seed = Keccak256::digest(format!("s65-anvil-faucet-{nanos}").as_bytes());
-        let key = k256::ecdsa::SigningKey::from_slice(&seed).expect("scalar");
+        let key = throwaway_key("s65-anvil-faucet");
         let mut st = test_state(&anvil.url);
         st.faucet_address = evm_address_of(&key);
         st.signing_key = Arc::new(key);
