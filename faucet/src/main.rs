@@ -1,5 +1,5 @@
 use axum::{
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode},
     response::Json,
     routing::{get, post},
@@ -19,6 +19,13 @@ use cooldowns::{CooldownPolicy, Cooldowns};
 
 mod turnstile;
 use turnstile::TurnstileVerifier;
+
+mod desktop;
+mod limits;
+mod liveness;
+mod membership;
+use limits::GlobalCap;
+use liveness::ReadinessCache;
 
 #[derive(Clone)]
 struct FaucetState {
@@ -46,6 +53,19 @@ struct FaucetState {
     /// trust no headers, use the socket peer (mirrors the RPC layer's
     /// WP-I.1 trust-boundary rule).
     trusted_proxies: Arc<HashSet<std::net::IpAddr>>,
+    /// One HTTP client for every RPC call (connection reuse).
+    http: reqwest::Client,
+    /// HUP-S6.5: optional faucet-wide hourly drip cap (`FAUCET_MAX_DRIPS_PER_HOUR`). `None` = off.
+    global_cap: Option<Arc<GlobalCap>>,
+    /// HUP-S6.5 (ADR O-2): optional membership SBT (`FAUCET_MEMBER_SBT`). `None` = no check.
+    member_sbt: Option<String>,
+    /// HUP-S6.5 (ADR O-3): public Turnstile site key (`FAUCET_TURNSTILE_SITE_KEY`). When set,
+    /// the page renders the challenge. `None` = the page is unchanged.
+    turnstile_site_key: Option<String>,
+    /// HUP-S6.5 (ADR O-3): exact desktop-app origins allowed by CORS (`FAUCET_DESKTOP_ORIGINS`).
+    desktop_origins: Arc<Vec<String>>,
+    /// HUP-S6.5: cached `/ready` probe.
+    readiness: Arc<ReadinessCache>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,7 +85,63 @@ struct FaucetResponse {
     tx_hash: Option<String>,
     message: String,
     amount: String,
+    /// HUP-S6.5: a stable machine-readable reason on a refusal (absent on success). The desktop
+    /// app keys its honest message on this, not on the text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
+    /// HUP-S6.5: which limit refused the request (`address`, `ip` or `global`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<&'static str>,
+    /// HUP-S6.5: seconds until a retry can succeed, on a rate-limit refusal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_after_secs: Option<u64>,
+    /// HUP-S6.5: Unix seconds when the next request can succeed, on a rate-limit refusal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_eligible_at: Option<u64>,
 }
+
+impl FaucetResponse {
+    /// A refusal with a stable `code`.
+    fn deny(code: &'static str, message: impl Into<String>) -> Self {
+        FaucetResponse {
+            success: false,
+            tx_hash: None,
+            message: message.into(),
+            amount: "0".to_string(),
+            code: Some(code),
+            limit: None,
+            retry_after_secs: None,
+            next_eligible_at: None,
+        }
+    }
+
+    /// A rate-limit refusal: which limit, and when the next request can succeed.
+    fn rate_limited(limit: &'static str, message: String, retry_after_secs: u64, now: u64) -> Self {
+        let mut r = Self::deny("rate_limited", message);
+        r.limit = Some(limit);
+        r.retry_after_secs = Some(retry_after_secs);
+        r.next_eligible_at = Some(now.saturating_add(retry_after_secs));
+        r
+    }
+}
+
+/// Map a cooldown denial to (limit, seconds remaining).
+fn denial_parts(d: &cooldowns::CooldownDenial) -> (&'static str, u64) {
+    match d {
+        cooldowns::CooldownDenial::AddressCooldown { remaining_secs } => ("address", *remaining_secs),
+        cooldowns::CooldownDenial::IpCooldown { remaining_secs } => ("ip", *remaining_secs),
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// One drip plus the gas of its own transfer (21,000 gas at the faucet's fixed 1 gwei).
+const MIN_READY_BALANCE_WEI: u128 = DRIP_AMOUNT + 21_000 * 1_000_000_000;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -145,15 +221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Derive the faucet's EVM address from the secp256k1 public key:
     // keccak256(uncompressed_pubkey[1..65])[12..32]. This is the standard
     // Ethereum address — and matches the genesis-funded faucet allocation.
-    let faucet_pubkey = signing_key.verifying_key();
-    let faucet_address = {
-        use sha3::{Digest, Keccak256};
-        let point = faucet_pubkey.to_encoded_point(false);
-        let hash = Keccak256::digest(&point.as_bytes()[1..]);
-        let mut addr = [0u8; 20];
-        addr.copy_from_slice(&hash[12..]);
-        Address(addr)
-    };
+    let faucet_address = evm_address_of(&signing_key);
 
     info!("Faucet address: 0x{}", hex::encode(faucet_address.0));
     info!("RPC endpoint: {}", rpc_url);
@@ -223,6 +291,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // HUP-S6.5 / F-5: opt-in limits and the desktop path. Every one is off unless the operator
+    // sets it; a malformed value stops the faucet at startup instead of being ignored.
+    let global_cap = GlobalCap::from_env(std::env::var("FAUCET_MAX_DRIPS_PER_HOUR").ok().as_deref())?;
+    match &global_cap {
+        Some(c) => info!("Global drip cap: {} per hour", c.max()),
+        None => info!("Global drip cap off (set FAUCET_MAX_DRIPS_PER_HOUR to enable)"),
+    }
+    let member_sbt = membership::parse_sbt_env(std::env::var("FAUCET_MEMBER_SBT").ok().as_deref())?;
+    match &member_sbt {
+        Some(a) => info!("Membership check on: recipients must hold a token of {}", a),
+        None => info!("Membership check off (set FAUCET_MEMBER_SBT to enable)"),
+    }
+    let turnstile_site_key =
+        desktop::parse_site_key(std::env::var("FAUCET_TURNSTILE_SITE_KEY").ok().as_deref())?;
+    if turnstile_site_key.is_some() && turnstile.is_none() {
+        return Err(
+            "FAUCET_TURNSTILE_SITE_KEY is set but FAUCET_TURNSTILE_SECRET is not: the page would \
+             show a challenge the server never checks. Set both or neither."
+                .into(),
+        );
+    }
+    let (desktop_origins, dropped_desktop) =
+        desktop::desktop_origins(std::env::var("FAUCET_DESKTOP_ORIGINS").ok().as_deref());
+    for d in &dropped_desktop {
+        warn!("FAUCET_DESKTOP_ORIGINS: ignoring {:?} (not a known desktop-app origin)", d);
+    }
+    if !desktop_origins.is_empty() {
+        info!("Desktop-app origins allowed: {}", desktop_origins.join(", "));
+    }
+
     let state = FaucetState {
         rpc_url,
         api_key,
@@ -233,6 +331,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         address_whitelist: Arc::new(address_whitelist),
         turnstile,
         trusted_proxies: Arc::new(trusted_proxies),
+        http: reqwest::Client::new(),
+        global_cap: global_cap.map(Arc::new),
+        member_sbt,
+        turnstile_site_key,
+        desktop_origins: Arc::new(desktop_origins),
+        readiness: Arc::new(ReadinessCache::default()),
     };
 
     // Build router
@@ -261,6 +365,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// The standard EVM address of a secp256k1 key: keccak256(uncompressed_pubkey[1..65])[12..32].
+fn evm_address_of(key: &k256::ecdsa::SigningKey) -> Address {
+    use sha3::{Digest, Keccak256};
+    let point = key.verifying_key().to_encoded_point(false);
+    let hash = Keccak256::digest(&point.as_bytes()[1..]);
+    let mut addr = [0u8; 20];
+    addr.copy_from_slice(&hash[12..]);
+    Address(addr)
 }
 
 /// PBA-L8-017: browser origins allowed to call the faucet cross-origin. The faucet's own page
@@ -304,9 +418,18 @@ fn is_local_dev_origin(o: &str) -> bool {
 }
 
 /// PBA-L8-017: replaces `CorsLayer::permissive()` (which sent `access-control-allow-origin: *`).
-fn cors_layer(raw: Option<&str>) -> CorsLayer {
+/// HUP-S6.5: plus the exact desktop-app origins the operator opted into (already filtered by
+/// `desktop::desktop_origins` to the known set).
+fn cors_layer(raw: Option<&str>, desktop: &[String]) -> CorsLayer {
+    let mut list = allowed_origins(raw);
+    list.extend(
+        desktop
+            .iter()
+            .filter(|o| desktop::KNOWN_DESKTOP_ORIGINS.contains(&o.as_str()))
+            .filter_map(|o| axum::http::HeaderValue::from_str(o).ok()),
+    );
     CorsLayer::new()
-        .allow_origin(AllowOrigin::list(allowed_origins(raw)))
+        .allow_origin(AllowOrigin::list(list))
         .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
         .allow_headers([axum::http::header::CONTENT_TYPE])
 }
@@ -317,13 +440,22 @@ fn cors_layer(raw: Option<&str>) -> CorsLayer {
 const FAUCET_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; \
 connect-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
-async fn security_headers(mut res: axum::response::Response) -> axum::response::Response {
+/// The CSP every response carries: [`FAUCET_CSP`], or, when the operator turned the CAPTCHA page
+/// on (HUP-S6.5), the same policy plus the CAPTCHA provider's script and frame.
+fn page_csp(turnstile_site_key: Option<&str>) -> String {
+    match turnstile_site_key {
+        Some(_) => desktop::csp_with_turnstile(FAUCET_CSP),
+        None => FAUCET_CSP.to_string(),
+    }
+}
+
+async fn security_headers(
+    State(csp): State<Arc<axum::http::HeaderValue>>,
+    mut res: axum::response::Response,
+) -> axum::response::Response {
     use axum::http::{header, HeaderValue};
     let h = res.headers_mut();
-    h.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(FAUCET_CSP),
-    );
+    h.insert(header::CONTENT_SECURITY_POLICY, (*csp).clone());
     h.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -341,20 +473,28 @@ async fn security_headers(mut res: axum::response::Response) -> axum::response::
 }
 
 fn build_router(state: FaucetState, allowed_origins_env: Option<&str>) -> Router {
+    let csp = axum::http::HeaderValue::from_str(&page_csp(state.turnstile_site_key.as_deref()))
+        .unwrap_or_else(|_| axum::http::HeaderValue::from_static(FAUCET_CSP));
+    let desktop = state.desktop_origins.clone();
     Router::new()
         .route("/", get(root))
         .route("/faucet.js", get(faucet_js))
         .route("/faucet", post(request_tokens))
         .route("/status", get(status))
         .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/eligibility", get(eligibility))
         .route("/logo.svg", get(logo))
         .route("/fonts/space-grotesk-600.woff2", get(font_grotesk_600))
         .route("/fonts/geist-mono-400.woff2", get(font_mono_400))
         .route("/fonts/geist-mono-500.woff2", get(font_mono_500))
         // CORS inside, security headers outermost: CORS preflight answers (which CorsLayer
         // produces itself) carry the same headers as every other response.
-        .layer(cors_layer(allowed_origins_env))
-        .layer(axum::middleware::map_response(security_headers))
+        .layer(cors_layer(allowed_origins_env, &desktop))
+        .layer(axum::middleware::map_response_with_state(
+            Arc::new(csp),
+            security_headers,
+        ))
         .with_state(state)
 }
 
@@ -367,15 +507,23 @@ const FAUCET_JS: &str = r#"async function claim(){
     msg.textContent='Please enter a valid 0x address (40 hex chars)';return;
   }
   btn.disabled=true;btn.textContent='Sending...';
+  const body={address:addr};
+  const tok=document.querySelector('[name="cf-turnstile-response"]');
+  if(tok&&tok.value){body.turnstile_token=tok.value;}
   try{
-    const r=await fetch('/faucet',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:addr})});
+    const r=await fetch('/faucet',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const d=await r.json();
     msg.style.display='block';
     if(d.success){msg.className='msg ok';msg.textContent='Sent 10 SALT! TX: '+d.tx_hash;}
     else{msg.className='msg err';msg.textContent=d.message;}
   }catch(e){msg.className='msg err';msg.style.display='block';msg.textContent='Error: '+e.message;}
   btn.disabled=false;btn.textContent='Request 10 SALT';
+  if(window.turnstile&&tok){window.turnstile.reset();}
 }
+(function(){
+  const q=new URLSearchParams(window.location.search).get('address');
+  if(q&&/^0x[0-9a-fA-F]{40}$/.test(q)){document.getElementById('addr').value=q;}
+})();
 document.getElementById('btn').addEventListener('click',claim);
 document.getElementById('addr').addEventListener('keydown',e=>{if(e.key==='Enter')claim()});
 "#;
@@ -390,7 +538,24 @@ async fn faucet_js() -> ([(axum::http::HeaderName, &'static str); 1], &'static s
     )
 }
 
-async fn root() -> axum::response::Html<&'static str> {
+/// HUP-S6.5: the page, with the CAPTCHA widget when the operator turned the CAPTCHA page on.
+/// Without a site key it is exactly [`PAGE_HTML`].
+fn render_page(turnstile_site_key: Option<&str>) -> String {
+    match turnstile_site_key {
+        Some(key) => PAGE_HTML.replacen(
+            "<button id=\"btn\">",
+            &format!("{}\n<button id=\"btn\">", desktop::turnstile_markup(key)),
+            1,
+        ),
+        None => PAGE_HTML.to_string(),
+    }
+}
+
+async fn root(State(state): State<FaucetState>) -> axum::response::Html<String> {
+    axum::response::Html(render_page(state.turnstile_site_key.as_deref()))
+}
+
+
     // Charter register of the citrate-core / app-layer design system
     // (src/styles/tokens.css + foundation.css): light, civic, document-like.
     // Tokens inlined with concrete values (no CSS build step). Display +
@@ -398,7 +563,7 @@ async fn root() -> axum::response::Html<&'static str> {
     // they are served same-origin from /fonts/* so the page matches the app
     // under the strict faucet CSP (font-src 'self'). Body sans falls back to
     // the system stack, exactly as citrate-core does (it self-hosts no sans).
-    axum::response::Html(r##"<!DOCTYPE html>
+const PAGE_HTML: &str = r##"<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -454,19 +619,102 @@ button:disabled{opacity:.45;cursor:not-allowed}
 <p class="info">10 SALT per request &middot; 24h cooldown &middot; Chain ID 40204</p>
 </div>
 <script src="/faucet.js"></script>
-</body></html>"##)
-}
+</body></html>"##;
 
-async fn status() -> Json<serde_json::Value> {
+async fn status(State(state): State<FaucetState>) -> Json<serde_json::Value> {
+    let policy = state.cooldowns.policy();
     Json(serde_json::json!({
         "status": "online",
         "network": "citrate-testnet-beta",
-        "amount_per_request": "10 SALT"
+        "amount_per_request": "10 SALT",
+        // HUP-S6.5: machine-readable limits, so a client can explain them without guessing.
+        "chain_id": state.chain_id,
+        "drip_wei": DRIP_AMOUNT.to_string(),
+        "address_cooldown_secs": policy.address_cooldown_secs,
+        "ip_cooldown_secs": policy.ip_cooldown_secs,
+        "global_cap_per_hour": state.global_cap.as_ref().map(|c| c.max()),
+        "global_cap_used": state.global_cap.as_ref().map(|c| c.in_window(unix_now())),
+        "captcha": state.turnstile.is_some(),
+        "turnstile_site_key": state.turnstile_site_key,
+        "membership_check": state.member_sbt.is_some(),
     }))
 }
 
+/// Liveness: the process is up and serving. Never touches the RPC.
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
+}
+
+/// HUP-S6.5 readiness: could a drip succeed now? 200 when ready, 503 when not, with the reason.
+/// Cached for [`liveness::CACHE_TTL`], so public callers cannot amplify RPC load.
+async fn ready(
+    State(state): State<FaucetState>,
+) -> (StatusCode, Json<liveness::Readiness>) {
+    let r = match state.readiness.fresh(liveness::CACHE_TTL) {
+        Some(r) => r,
+        None => {
+            let r = liveness::probe(
+                &state.http,
+                &state.rpc_url,
+                state.api_key.as_deref(),
+                state.chain_id,
+                &format!("0x{}", hex::encode(state.faucet_address.0)),
+                MIN_READY_BALANCE_WEI,
+                unix_now(),
+            )
+            .await;
+            state.readiness.store(r.clone());
+            r
+        }
+    };
+    let code = if r.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (code, Json(r))
+}
+
+#[derive(Debug, Deserialize)]
+struct EligibilityQuery {
+    address: String,
+}
+
+/// HUP-S6.5: would a request for `address` from this caller pass the cooldowns right now?
+/// Read-only: it reserves nothing. The desktop app uses it to show the next eligible time
+/// without spending a request, and to see a drip the member made in the in-app challenge window.
+async fn eligibility(
+    State(state): State<FaucetState>,
+    ConnectInfo(socket_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<EligibilityQuery>,
+) -> Json<serde_json::Value> {
+    let Ok((recipient_hex, _)) = validate_address(&q.address) else {
+        return Json(serde_json::json!({
+            "eligible": false,
+            "code": "invalid_address",
+            "message": "Invalid address format",
+        }));
+    };
+    let client_ip = extract_client_ip(&headers, socket_addr, &state.trusted_proxies);
+    let now = unix_now();
+    match state.cooldowns.check(&recipient_hex, &client_ip) {
+        Ok(()) => Json(serde_json::json!({
+            "address": format!("0x{recipient_hex}"),
+            "eligible": true,
+        })),
+        Err(d) => {
+            let (limit, remaining) = denial_parts(&d);
+            Json(serde_json::json!({
+                "address": format!("0x{recipient_hex}"),
+                "eligible": false,
+                "code": "rate_limited",
+                "limit": limit,
+                "retry_after_secs": remaining,
+                "next_eligible_at": now.saturating_add(remaining),
+            }))
+        }
+    }
 }
 
 // Brand assets, embedded at compile time so the faucet stays a single
@@ -509,6 +757,14 @@ async fn font_mono_500() -> impl axum::response::IntoResponse {
     woff2(FONT_MONO_500)
 }
 
+/// Return every slot a request reserved (the drip did not reach the chain).
+fn release_slots(state: &FaucetState, recipient_hex: &str, client_ip: &str, cap_taken_at: Option<u64>) {
+    state.cooldowns.release(recipient_hex, client_ip);
+    if let (Some(cap), Some(at)) = (state.global_cap.as_ref(), cap_taken_at) {
+        cap.give_back(at);
+    }
+}
+
 async fn request_tokens(
     State(state): State<FaucetState>,
     ConnectInfo(socket_addr): ConnectInfo<SocketAddr>,
@@ -520,24 +776,22 @@ async fn request_tokens(
     let recipient_bytes = match hex::decode(&recipient_hex) {
         Ok(b) if b.len() == 20 => b,
         _ => {
-            return Ok(Json(FaucetResponse {
-                success: false,
-                tx_hash: None,
-                message: "Invalid address format".to_string(),
-                amount: "0".to_string(),
-            }));
+            return Ok(Json(FaucetResponse::deny(
+                "invalid_address",
+                "Invalid address format",
+            )));
         }
     };
+    let mut recipient_addr = [0u8; 20];
+    recipient_addr.copy_from_slice(&recipient_bytes);
 
     // Address whitelist check
     if !state.address_whitelist.is_empty() && !state.address_whitelist.contains(&recipient_hex) {
         warn!("Faucet request rejected: address {} not in whitelist", recipient_hex);
-        return Ok(Json(FaucetResponse {
-            success: false,
-            tx_hash: None,
-            message: "Address not whitelisted for testnet beta".to_string(),
-            amount: "0".to_string(),
-        }));
+        return Ok(Json(FaucetResponse::deny(
+            "not_whitelisted",
+            "Address not whitelisted for testnet beta",
+        )));
     }
 
     // RM-B1 / WP-E6.3 (audit FAU-03): client IP (X-Forwarded-For
@@ -554,32 +808,67 @@ async fn request_tokens(
         let token = match payload.turnstile_token.as_deref() {
             Some(t) if !t.is_empty() => t,
             _ => {
-                return Ok(Json(FaucetResponse {
-                    success: false,
-                    tx_hash: None,
-                    message: "CAPTCHA required: turnstile_token missing".to_string(),
-                    amount: "0".to_string(),
-                }));
+                return Ok(Json(FaucetResponse::deny(
+                    "captcha_required",
+                    "CAPTCHA required: turnstile_token missing",
+                )));
             }
         };
         match verifier.verify(token, Some(&client_ip)).await {
             Ok(true) => {}
             Ok(false) => {
-                return Ok(Json(FaucetResponse {
-                    success: false,
-                    tx_hash: None,
-                    message: "CAPTCHA verification failed".to_string(),
-                    amount: "0".to_string(),
-                }));
+                return Ok(Json(FaucetResponse::deny(
+                    "captcha_failed",
+                    "CAPTCHA verification failed",
+                )));
             }
             Err(e) => {
                 error!("Turnstile verification error: {}", e);
-                return Ok(Json(FaucetResponse {
-                    success: false,
-                    tx_hash: None,
-                    message: "CAPTCHA service unavailable, try again later".to_string(),
-                    amount: "0".to_string(),
-                }));
+                return Ok(Json(FaucetResponse::deny(
+                    "captcha_unavailable",
+                    "CAPTCHA service unavailable, try again later",
+                )));
+            }
+        }
+    }
+
+    // HUP-S6.5 (faucet ADR O-2, pending owner sign-off): membership check, when the operator
+    // configured one. Fails closed: an RPC failure refuses the drip.
+    if let Some(sbt) = state.member_sbt.as_deref() {
+        // A caller already inside a cooldown is answered from memory first, so a refused caller
+        // cannot make the faucet spend an eth_call per request. Read-only: the atomic
+        // reservation below still decides.
+        if let Err(denial) = state.cooldowns.check(&recipient_hex, &client_ip) {
+            let (limit, remaining) = denial_parts(&denial);
+            return Ok(Json(FaucetResponse::rate_limited(
+                limit,
+                format!("Rate limited: {}", denial),
+                remaining,
+                unix_now(),
+            )));
+        }
+        match membership::holds_member_sbt(
+            &state.http,
+            &state.rpc_url,
+            state.api_key.as_deref(),
+            sbt,
+            &recipient_addr,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(Json(FaucetResponse::deny(
+                    "not_member",
+                    "This faucet drips only to Citrate members: the address holds no membership token",
+                )));
+            }
+            Err(e) => {
+                warn!("membership check failed: {}", e);
+                return Ok(Json(FaucetResponse::deny(
+                    "membership_unavailable",
+                    "The membership check is unavailable, try again later",
+                )));
             }
         }
     }
@@ -593,28 +882,47 @@ async fn request_tokens(
     // RPC round-trip between them, so N concurrent requests for one
     // address all passed and all dripped. Every failure path below must
     // `release()` the reservation so legitimate users can retry.
+    let now = unix_now();
     if let Err(denial) = state.cooldowns.try_reserve(&recipient_hex, &client_ip) {
-        return Ok(Json(FaucetResponse {
-            success: false,
-            tx_hash: None,
-            message: format!("Rate limited: {}", denial),
-            amount: "0".to_string(),
-        }));
+        let (limit, remaining) = denial_parts(&denial);
+        return Ok(Json(FaucetResponse::rate_limited(
+            limit,
+            format!("Rate limited: {}", denial),
+            remaining,
+            now,
+        )));
     }
 
-    let mut recipient_addr = [0u8; 20];
-    recipient_addr.copy_from_slice(&recipient_bytes);
+    // HUP-S6.5: the optional faucet-wide hourly cap, taken after the per-caller reservation
+    // (and that reservation returned when the cap refuses).
+    let cap_taken_at = match state.global_cap.as_ref() {
+        None => None,
+        Some(cap) => match cap.try_take(now) {
+            Ok(()) => Some(now),
+            Err(retry) => {
+                state.cooldowns.release(&recipient_hex, &client_ip);
+                return Ok(Json(FaucetResponse::rate_limited(
+                    "global",
+                    "Rate limited: the faucet's hourly limit is reached".to_string(),
+                    retry,
+                    now,
+                )));
+            }
+        },
+    };
+
     let recipient = Address(recipient_addr);
 
     info!("Faucet request for address: 0x{} (ip={})", hex::encode(recipient.0), client_ip);
 
-    // Build and sign a real transaction using the faucet's ed25519 key.
+    // Build and sign a real transaction using the faucet's secp256k1 key.
     // This uses eth_sendRawTransaction — no unsigned tx support needed on the node.
 
     let from_hex = format!("0x{}", hex::encode(state.faucet_address.0));
-    let client = reqwest::Client::new();
+    let client = &state.http;
 
-    // Query current nonce for the faucet account
+    // Query the current nonce for the faucet account. HUP-S6.5: an unreadable nonce refuses the
+    // drip (and returns the slots) instead of guessing nonce 0.
     let nonce: u64 = {
         let resp = client
             .post(&state.rpc_url)
@@ -626,15 +934,23 @@ async fn request_tokens(
             }))
             .send()
             .await;
-        match resp {
-            Ok(r) => {
-                let json: serde_json::Value = r.json().await.unwrap_or_default();
+        let parsed = match resp {
+            Ok(r) => r.json::<serde_json::Value>().await.ok().and_then(|json| {
                 json.get("result")
                     .and_then(|v| v.as_str())
                     .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-                    .unwrap_or(0)
+            }),
+            Err(_) => None,
+        };
+        match parsed {
+            Some(n) => n,
+            None => {
+                release_slots(&state, &recipient_hex, &client_ip, cap_taken_at);
+                return Ok(Json(FaucetResponse::deny(
+                    "node_unreachable",
+                    "Failed to connect to node",
+                )));
             }
-            Err(_) => 0,
         }
     };
 
@@ -642,63 +958,18 @@ async fn request_tokens(
     // faucet account is the genesis-funded EVM account, so it must submit an
     // ECDSA tx that the chain decodes via the eth_tx_decoder / ecrecover path
     // (the native ed25519 path lands on an unfundable 32-byte-pubkey account).
-    use sha3::{Digest, Keccak256};
-
-    // Append a uint as a minimal big-endian byte string (leading zeros stripped).
-    fn append_uint(s: &mut rlp::RlpStream, be: &[u8]) {
-        let i = be.iter().position(|&b| b != 0).unwrap_or(be.len());
-        s.append(&be[i..].to_vec());
-    }
-
-    let to_vec = recipient.0.to_vec(); // 20-byte EVM address
-    let value_be = (DRIP_AMOUNT).to_be_bytes();
-    let gas_price: u64 = 1_000_000_000;
-    let gas_limit: u64 = 21_000;
-    let chain_id = state.chain_id;
-
-    // Signing payload: rlp([nonce, gasPrice, gasLimit, to, value, data, chainId, 0, 0])
-    let mut sp = rlp::RlpStream::new_list(9);
-    sp.append(&nonce);
-    sp.append(&gas_price);
-    sp.append(&gas_limit);
-    sp.append(&to_vec);
-    append_uint(&mut sp, &value_be);
-    sp.append_empty_data();
-    sp.append(&chain_id);
-    sp.append(&0u8);
-    sp.append(&0u8);
-    let sighash = Keccak256::digest(sp.out());
-
-    let (sig, recid) = match state.signing_key.sign_prehash_recoverable(&sighash) {
-        Ok(v) => v,
+    let tx_hex = match sign_drip_tx(&state.signing_key, state.chain_id, nonce, &recipient.0) {
+        Ok(t) => t,
         Err(e) => {
             error!("Failed to sign faucet transaction: {}", e);
             // SECREM-01 FAUCET-1: failed before send — return the slot.
-            state.cooldowns.release(&recipient_hex, &client_ip);
-            return Ok(Json(FaucetResponse {
-                success: false,
-                tx_hash: None,
-                message: format!("Signing failed: {}", e),
-                amount: "0".to_string(),
-            }));
+            release_slots(&state, &recipient_hex, &client_ip, cap_taken_at);
+            return Ok(Json(FaucetResponse::deny(
+                "signing_failed",
+                format!("Signing failed: {}", e),
+            )));
         }
     };
-    let r = sig.r().to_bytes();
-    let s_ = sig.s().to_bytes();
-    let v = chain_id * 2 + 35 + recid.to_byte() as u64;
-
-    // Full tx: rlp([nonce, gasPrice, gasLimit, to, value, data, v, r, s])
-    let mut ft = rlp::RlpStream::new_list(9);
-    ft.append(&nonce);
-    ft.append(&gas_price);
-    ft.append(&gas_limit);
-    ft.append(&to_vec);
-    append_uint(&mut ft, &value_be);
-    ft.append_empty_data();
-    ft.append(&v);
-    append_uint(&mut ft, &r);
-    append_uint(&mut ft, &s_);
-    let tx_hex = format!("0x{}", hex::encode(ft.out()));
 
     let mut request = client
         .post(&state.rpc_url)
@@ -734,43 +1005,96 @@ async fn request_tokens(
                     tx_hash: Some(result.to_string()),
                     message: "Successfully sent 10 SALT".to_string(),
                     amount: "10000000000000000000".to_string(),
+                    code: None,
+                    limit: None,
+                    retry_after_secs: None,
+                    next_eligible_at: None,
                 }))
             } else if let Some(error) = json.get("error") {
                 error!("RPC error: {:?}", error);
                 // SECREM-01 FAUCET-1: drip failed — return the slot.
-                state.cooldowns.release(&recipient_hex, &client_ip);
-                Ok(Json(FaucetResponse {
-                    success: false,
-                    tx_hash: None,
-                    message: format!("Transaction failed: {:?}", error),
-                    amount: "0".to_string(),
-                }))
+                release_slots(&state, &recipient_hex, &client_ip, cap_taken_at);
+                Ok(Json(FaucetResponse::deny(
+                    "rpc_error",
+                    format!("Transaction failed: {:?}", error),
+                )))
             } else {
                 // SECREM-01 FAUCET-1: ambiguous RPC response — the tx may
                 // or may not have landed. Keep the reservation (do NOT
                 // release): the cost of a false hold is one cooldown
                 // window; the cost of a false release is a double drip.
-                Ok(Json(FaucetResponse {
-                    success: false,
-                    tx_hash: None,
-                    message: "Unknown RPC response".to_string(),
-                    amount: "0".to_string(),
-                }))
+                Ok(Json(FaucetResponse::deny(
+                    "unknown_rpc_response",
+                    "Unknown RPC response",
+                )))
             }
         }
         Err(e) => {
             error!("Failed to send transaction: {}", e);
             // SECREM-01 FAUCET-1: connection failure — the request never
             // reached the node; return the slot.
-            state.cooldowns.release(&recipient_hex, &client_ip);
-            Ok(Json(FaucetResponse {
-                success: false,
-                tx_hash: None,
-                message: "Failed to connect to node".to_string(),
-                amount: "0".to_string(),
-            }))
+            release_slots(&state, &recipient_hex, &client_ip, cap_taken_at);
+            Ok(Json(FaucetResponse::deny(
+                "node_unreachable",
+                "Failed to connect to node",
+            )))
         }
     }
+}
+
+/// Build and sign the drip: an EIP-155 legacy transfer of [`DRIP_AMOUNT`] at 1 gwei, 21,000 gas.
+/// Returns the raw transaction as `0x` hex.
+fn sign_drip_tx(
+    key: &k256::ecdsa::SigningKey,
+    chain_id: u64,
+    nonce: u64,
+    to: &[u8; 20],
+) -> Result<String, String> {
+    use sha3::{Digest, Keccak256};
+
+    // Append a uint as a minimal big-endian byte string (leading zeros stripped).
+    fn append_uint(s: &mut rlp::RlpStream, be: &[u8]) {
+        let i = be.iter().position(|&b| b != 0).unwrap_or(be.len());
+        s.append(&be[i..].to_vec());
+    }
+
+    let to_vec = to.to_vec(); // 20-byte EVM address
+    let value_be = (DRIP_AMOUNT).to_be_bytes();
+    let gas_price: u64 = 1_000_000_000;
+    let gas_limit: u64 = 21_000;
+
+    // Signing payload: rlp([nonce, gasPrice, gasLimit, to, value, data, chainId, 0, 0])
+    let mut sp = rlp::RlpStream::new_list(9);
+    sp.append(&nonce);
+    sp.append(&gas_price);
+    sp.append(&gas_limit);
+    sp.append(&to_vec);
+    append_uint(&mut sp, &value_be);
+    sp.append_empty_data();
+    sp.append(&chain_id);
+    sp.append(&0u8);
+    sp.append(&0u8);
+    let sighash = Keccak256::digest(sp.out());
+
+    let (sig, recid) = key
+        .sign_prehash_recoverable(&sighash)
+        .map_err(|e| e.to_string())?;
+    let r = sig.r().to_bytes();
+    let s_ = sig.s().to_bytes();
+    let v = chain_id * 2 + 35 + recid.to_byte() as u64;
+
+    // Full tx: rlp([nonce, gasPrice, gasLimit, to, value, data, v, r, s])
+    let mut ft = rlp::RlpStream::new_list(9);
+    ft.append(&nonce);
+    ft.append(&gas_price);
+    ft.append(&gas_limit);
+    ft.append(&to_vec);
+    append_uint(&mut ft, &value_be);
+    ft.append_empty_data();
+    ft.append(&v);
+    append_uint(&mut ft, &r);
+    append_uint(&mut ft, &s_);
+    Ok(format!("0x{}", hex::encode(ft.out())))
 }
 
 /// Validate a faucet request address string.
@@ -882,9 +1206,9 @@ mod tests {
     use super::*;
 
     // ── PBA-L8-017: CORS allowlist + security headers, over a real socket ──
-    async fn spawn_faucet(allowed: Option<&str>) -> String {
-        let state = FaucetState {
-            rpc_url: "http://127.0.0.1:9".into(),
+    fn test_state(rpc_url: &str) -> FaucetState {
+        FaucetState {
+            rpc_url: rpc_url.into(),
             api_key: None,
             chain_id: 40204,
             faucet_address: Address([0u8; 20]),
@@ -895,7 +1219,20 @@ mod tests {
             address_whitelist: Arc::new(HashSet::new()),
             turnstile: None,
             trusted_proxies: Arc::new(HashSet::new()),
-        };
+            http: reqwest::Client::new(),
+            global_cap: None,
+            member_sbt: None,
+            turnstile_site_key: None,
+            desktop_origins: Arc::new(Vec::new()),
+            readiness: Arc::new(ReadinessCache::default()),
+        }
+    }
+
+    async fn spawn_faucet(allowed: Option<&str>) -> String {
+        serve(test_state("http://127.0.0.1:9"), allowed).await
+    }
+
+    async fn serve(state: FaucetState, allowed: Option<&str>) -> String {
         let app = build_router(state, allowed);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1223,5 +1560,417 @@ mod tests {
         let hex_long = format!("{}aaaa", "11".repeat(32));
         let key = decode_faucet_key_hex(&hex_long).expect("decodes");
         assert!(key.iter().all(|b| *b == 0x11));
+    }
+
+    // ── HUP-S6.5 / F-5: liveness, structured refusals, opt-in limits, desktop path ──
+
+    async fn post_drip(
+        base: &str,
+        address: &str,
+        xff: Option<&str>,
+    ) -> serde_json::Value {
+        let mut req = reqwest::Client::new()
+            .post(format!("{base}/faucet"))
+            .json(&serde_json::json!({ "address": address }));
+        if let Some(ip) = xff {
+            req = req.header("x-forwarded-for", ip);
+        }
+        req.send()
+            .await
+            .expect("post")
+            .json()
+            .await
+            .expect("json")
+    }
+
+    fn addr_of(byte: u8) -> String {
+        format!("0x{}", hex::encode([byte; 20]))
+    }
+
+    #[tokio::test]
+    async fn s65_health_is_liveness_and_ready_reports_a_dead_rpc() {
+        let base = spawn_faucet(None).await;
+        let h = reqwest::get(format!("{base}/health")).await.expect("health");
+        assert_eq!(h.status(), 200);
+        let r = reqwest::get(format!("{base}/ready")).await.expect("ready");
+        assert_eq!(r.status(), 503);
+        let body: serde_json::Value = r.json().await.expect("json");
+        assert_eq!(body["ready"], false);
+        assert_eq!(body["rpc_reachable"], false);
+        assert!(body["reason"].as_str().unwrap_or("").contains("not answering"));
+    }
+
+    #[tokio::test]
+    async fn s65_status_keeps_old_keys_and_adds_limits() {
+        let base = spawn_faucet(None).await;
+        let s: serde_json::Value = reqwest::get(format!("{base}/status"))
+            .await
+            .expect("req")
+            .json()
+            .await
+            .expect("json");
+        assert_eq!(s["status"], "online");
+        assert_eq!(s["network"], "citrate-testnet-beta");
+        assert_eq!(s["amount_per_request"], "10 SALT");
+        assert_eq!(s["drip_wei"], "10000000000000000000");
+        assert_eq!(s["address_cooldown_secs"], 86_400);
+        assert_eq!(s["ip_cooldown_secs"], 3_600);
+        assert_eq!(s["chain_id"], 40204);
+        assert!(s["global_cap_per_hour"].is_null());
+        assert!(s["global_cap_used"].is_null());
+        assert_eq!(s["captcha"], false);
+        assert_eq!(s["membership_check"], false);
+    }
+
+    #[tokio::test]
+    async fn s65_refusals_carry_a_stable_code() {
+        let base = spawn_faucet(None).await;
+        let bad = post_drip(&base, "0x1234", None).await;
+        assert_eq!(bad["success"], false);
+        assert_eq!(bad["code"], "invalid_address");
+        assert!(bad.get("next_eligible_at").is_none());
+        // Dead RPC: the nonce cannot be read, so the drip is refused and the slot returned.
+        let down = post_drip(&base, &addr_of(0x31), None).await;
+        assert_eq!(down["code"], "node_unreachable");
+        let again = post_drip(&base, &addr_of(0x31), None).await;
+        assert_eq!(again["code"], "node_unreachable", "the slot was returned, not held");
+    }
+
+    #[tokio::test]
+    async fn s65_a_caller_in_cooldown_costs_no_membership_rpc() {
+        // Membership on, RPC dead. A caller already inside the cooldown must be told when to
+        // come back without the faucet spending an eth_call on them (no RPC amplification).
+        let mut st = test_state("http://127.0.0.1:9");
+        st.member_sbt = Some(addr_of(0x71));
+        let cooldowns = st.cooldowns.clone();
+        let base = serve(st, None).await;
+        let a = addr_of(0x41);
+        cooldowns
+            .try_reserve(a.trim_start_matches("0x"), "127.0.0.1")
+            .expect("reserve");
+        let r = post_drip(&base, &a, None).await;
+        assert_eq!(r["code"], "rate_limited", "{r}");
+        assert!(r["next_eligible_at"].as_u64().is_some());
+        // A caller outside the cooldown still reaches the (dead) membership check: fail closed.
+        let fresh_state = {
+            let mut s = test_state("http://127.0.0.1:9");
+            s.member_sbt = Some(addr_of(0x71));
+            s
+        };
+        let fresh = serve(fresh_state, None).await;
+        let r = post_drip(&fresh, &addr_of(0x42), None).await;
+        assert_eq!(r["code"], "membership_unavailable", "{r}");
+    }
+
+    #[tokio::test]
+    async fn s65_eligibility_is_read_only_and_reports_the_next_time() {
+        let state = test_state("http://127.0.0.1:9");
+        let cooldowns = state.cooldowns.clone();
+        let base = serve(state, None).await;
+        let a = addr_of(0x41);
+        let get = |q: String| {
+            let base = base.clone();
+            async move {
+                reqwest::get(format!("{base}/eligibility?address={q}"))
+                    .await
+                    .expect("req")
+                    .json::<serde_json::Value>()
+                    .await
+                    .expect("json")
+            }
+        };
+        let first = get(a.clone()).await;
+        assert_eq!(first["eligible"], true);
+        let second = get(a.clone()).await;
+        assert_eq!(second["eligible"], true, "asking reserves nothing");
+        cooldowns.record_success(&a[2..], "10.9.9.9");
+        let after = get(a.to_uppercase().replacen("0X", "0x", 1)).await;
+        assert_eq!(after["eligible"], false);
+        assert_eq!(after["code"], "rate_limited");
+        assert_eq!(after["limit"], "address");
+        let retry = after["retry_after_secs"].as_u64().expect("retry");
+        assert!(retry > 86_000 && retry <= 86_400);
+        let next = after["next_eligible_at"].as_u64().expect("next");
+        assert!(next >= unix_now() + 86_000);
+        let invalid = get("nope".into()).await;
+        assert_eq!(invalid["code"], "invalid_address");
+    }
+
+    #[tokio::test]
+    async fn s65_desktop_origins_are_opt_in_and_exact() {
+        let off = spawn_faucet(None).await;
+        let c = reqwest::Client::new();
+        let r = c
+            .get(format!("{off}/status"))
+            .header("origin", "tauri://localhost")
+            .send()
+            .await
+            .expect("req");
+        assert!(r.headers().get("access-control-allow-origin").is_none());
+
+        let mut st = test_state("http://127.0.0.1:9");
+        let (kept, _) = desktop::desktop_origins(Some("tauri://localhost,https://tauri.localhost.evil"));
+        st.desktop_origins = Arc::new(kept);
+        let on = serve(st, None).await;
+        for (origin, allowed) in [
+            ("tauri://localhost", true),
+            ("https://tauri.localhost.evil", false),
+            ("http://tauri.localhost", false),
+            ("https://docs.citrate.ai", true),
+        ] {
+            let r = c
+                .get(format!("{on}/status"))
+                .header("origin", origin)
+                .send()
+                .await
+                .expect("req");
+            assert_eq!(
+                r.headers()
+                    .get("access-control-allow-origin")
+                    .and_then(|v| v.to_str().ok()),
+                allowed.then_some(origin),
+                "{origin}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn s65_captcha_page_is_opt_in() {
+        let mut st = test_state("http://127.0.0.1:9");
+        st.turnstile_site_key = Some("site-key_123".into());
+        let base = serve(st, None).await;
+        let r = reqwest::get(format!("{base}/")).await.expect("req");
+        let csp = r
+            .headers()
+            .get("content-security-policy")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .expect("csp");
+        assert_eq!(csp, desktop::csp_with_turnstile(FAUCET_CSP));
+        let html = r.text().await.expect("body");
+        assert!(html.contains(r#"data-sitekey="site-key_123""#));
+        assert!(html.contains(desktop::TURNSTILE_ORIGIN));
+        assert_eq!(render_page(None), PAGE_HTML, "no site key: the page is unchanged");
+        let js = reqwest::get(format!("{base}/faucet.js"))
+            .await
+            .expect("req")
+            .text()
+            .await
+            .expect("js");
+        assert!(js.contains("cf-turnstile-response"));
+        assert!(js.contains("/^0x[0-9a-fA-F]{40}$/.test(q)"), "address prefill is validated");
+    }
+
+    #[tokio::test]
+    async fn s65_membership_check_fails_closed() {
+        let mut st = test_state("http://127.0.0.1:9");
+        st.member_sbt = Some(addr_of(0x51));
+        let base = serve(st, None).await;
+        let r = post_drip(&base, &addr_of(0x52), None).await;
+        assert_eq!(r["code"], "membership_unavailable");
+        assert_eq!(r["success"], false);
+    }
+
+    #[test]
+    fn s65_drip_tx_is_a_legacy_eip155_transfer() {
+        let key = k256::ecdsa::SigningKey::from_slice(&[9u8; 32]).expect("key");
+        let raw = sign_drip_tx(&key, 40204, 3, &[0x77; 20]).expect("sign");
+        let bytes = hex::decode(raw.trim_start_matches("0x")).expect("hex");
+        let rlp = rlp::Rlp::new(&bytes);
+        assert_eq!(rlp.item_count().expect("list"), 9);
+        assert_eq!(rlp.val_at::<u64>(0).expect("nonce"), 3);
+        assert_eq!(rlp.val_at::<u64>(1).expect("gas price"), 1_000_000_000);
+        assert_eq!(rlp.val_at::<u64>(2).expect("gas"), 21_000);
+        assert_eq!(rlp.val_at::<Vec<u8>>(3).expect("to"), vec![0x77; 20]);
+        let v = rlp.val_at::<u64>(6).expect("v");
+        assert!(v == 40204 * 2 + 35 || v == 40204 * 2 + 36);
+    }
+
+    // ── HUP-S6.5: the real drip path against a local anvil chain (40204 id, nothing public) ──
+
+    struct Anvil {
+        child: std::process::Child,
+        url: String,
+    }
+
+    impl Drop for Anvil {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    async fn rpc(url: &str, method: &str, params: serde_json::Value) -> serde_json::Value {
+        let v: serde_json::Value = reqwest::Client::new()
+            .post(url)
+            .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
+            .send()
+            .await
+            .expect("rpc send")
+            .json()
+            .await
+            .expect("rpc json");
+        v.get("result").cloned().unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Start anvil on a free loopback port with chain id 40204. `None` (and a note) when anvil is
+    /// not installed, so the suite still runs where Foundry is absent.
+    async fn start_anvil() -> Option<Anvil> {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .map(|a| a.port())
+            .ok()?;
+        let child = match std::process::Command::new("anvil")
+            .args([
+                "--port",
+                &port.to_string(),
+                "--chain-id",
+                "40204",
+                "--base-fee",
+                "0",
+                "--silent",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("anvil not installed: skipping the live drip test");
+                return None;
+            }
+        };
+        let anvil = Anvil {
+            child,
+            url: format!("http://127.0.0.1:{port}"),
+        };
+        for _ in 0..100 {
+            let ok = reqwest::Client::new()
+                .post(&anvil.url)
+                .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}))
+                .send()
+                .await
+                .is_ok();
+            if ok {
+                return Some(anvil);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        eprintln!("anvil did not start: skipping the live drip test");
+        None
+    }
+
+    /// A throwaway faucet key made at run time and funded on the local anvil only.
+    async fn funded_state(anvil: &Anvil) -> FaucetState {
+        use sha3::{Digest, Keccak256};
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(1);
+        let seed = Keccak256::digest(format!("s65-anvil-faucet-{nanos}").as_bytes());
+        let key = k256::ecdsa::SigningKey::from_slice(&seed).expect("scalar");
+        let mut st = test_state(&anvil.url);
+        st.faucet_address = evm_address_of(&key);
+        st.signing_key = Arc::new(key);
+        // Trust loopback as a proxy so each test request can present its own client IP.
+        st.trusted_proxies = Arc::new(["127.0.0.1".parse().expect("ip")].into_iter().collect());
+        rpc(
+            &anvil.url,
+            "anvil_setBalance",
+            serde_json::json!([format!("0x{}", hex::encode(st.faucet_address.0)), "0x3635c9adc5dea00000"]),
+        )
+        .await;
+        st
+    }
+
+    async fn balance(url: &str, addr: &str) -> u128 {
+        let v = rpc(url, "eth_getBalance", serde_json::json!([addr, "latest"])).await;
+        u128::from_str_radix(v.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16).unwrap_or(0)
+    }
+
+    /// The balance once a sent drip is mined. eth_sendRawTransaction returns before anvil has
+    /// mined the block, so an immediate read can still see the old balance (a flake seen in
+    /// review); this waits up to 5 s for `want`, then returns what it sees.
+    async fn mined_balance(url: &str, addr: &str, want: u128) -> u128 {
+        let mut seen = balance(url, addr).await;
+        for _ in 0..50 {
+            if seen == want {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            seen = balance(url, addr).await;
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn s65_anvil_drip_ready_cap_and_membership() {
+        let Some(anvil) = start_anvil().await else {
+            return;
+        };
+
+        // 1. A real drip: signed by the faucet's own key, mined by anvil, balance moves 10 SALT.
+        let mut st = funded_state(&anvil).await;
+        st.global_cap = Some(Arc::new(GlobalCap::new(1, limits::WINDOW_SECS)));
+        let base = serve(st, None).await;
+        let ready: serde_json::Value = reqwest::get(format!("{base}/ready"))
+            .await
+            .expect("ready")
+            .json()
+            .await
+            .expect("json");
+        assert_eq!(ready["ready"], true, "{ready}");
+        let a = addr_of(0x61);
+        let ok = post_drip(&base, &a, Some("198.51.100.1")).await;
+        assert_eq!(ok["success"], true, "{ok}");
+        assert!(ok.get("code").is_none());
+        assert_eq!(mined_balance(&anvil.url, &a, DRIP_AMOUNT).await, DRIP_AMOUNT);
+
+        // 2. Same address again: refused with the next eligible time, nothing sent.
+        let again = post_drip(&base, &a, Some("198.51.100.2")).await;
+        assert_eq!(again["code"], "rate_limited");
+        assert_eq!(again["limit"], "address");
+        assert!(again["next_eligible_at"].as_u64().is_some());
+        assert_eq!(balance(&anvil.url, &a).await, DRIP_AMOUNT);
+
+        // 3. A fresh address from a fresh IP: the global cap (1 per hour here) refuses it.
+        let b = addr_of(0x62);
+        let capped = post_drip(&base, &b, Some("198.51.100.3")).await;
+        assert_eq!(capped["code"], "rate_limited");
+        assert_eq!(capped["limit"], "global");
+        assert_eq!(balance(&anvil.url, &b).await, 0);
+
+        // 4. Membership on: a contract that answers balanceOf with 1 lets the drip through, one
+        //    that answers 0 refuses it.
+        let member_sbt = addr_of(0x71);
+        let non_member_sbt = addr_of(0x72);
+        // PUSH1 1 PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN  -> returns uint256(1)
+        rpc(&anvil.url, "anvil_setCode", serde_json::json!([member_sbt, "0x600160005260206000f3"])).await;
+        // PUSH1 32 PUSH1 0 RETURN -> returns uint256(0)
+        rpc(&anvil.url, "anvil_setCode", serde_json::json!([non_member_sbt, "0x60206000f3"])).await;
+
+        let mut yes = funded_state(&anvil).await;
+        yes.member_sbt = Some(member_sbt);
+        let yes_base = serve(yes, None).await;
+        let c = addr_of(0x63);
+        let member = post_drip(&yes_base, &c, Some("198.51.100.4")).await;
+        assert_eq!(member["success"], true, "{member}");
+        assert_eq!(mined_balance(&anvil.url, &c, DRIP_AMOUNT).await, DRIP_AMOUNT);
+
+        let mut no = funded_state(&anvil).await;
+        no.member_sbt = Some(non_member_sbt);
+        let no_base = serve(no, None).await;
+        let d = addr_of(0x64);
+        let refused = post_drip(&no_base, &d, Some("198.51.100.5")).await;
+        assert_eq!(refused["code"], "not_member");
+        assert_eq!(balance(&anvil.url, &d).await, 0);
+        // The refusal reserved nothing: the same address is still eligible.
+        let elig: serde_json::Value = reqwest::get(format!("{no_base}/eligibility?address={d}"))
+            .await
+            .expect("req")
+            .json()
+            .await
+            .expect("json");
+        assert_eq!(elig["eligible"], true);
     }
 }
