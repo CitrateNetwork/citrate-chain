@@ -263,3 +263,36 @@ fn a_top_level_call_into_a_precompile_is_traced_too() {
     assert_eq!(rep.steps[1].precompiles_touched.len(), 1);
     assert_eq!(rep.steps[2].precompiles_touched.len(), 1);
 }
+
+#[test]
+fn the_agent_precompile_fork_follows_the_configured_height() {
+    // HUP-S7.2 x S6.10: on a chain where the agent precompile fork is active, the fork runs the
+    // node's 0x0121 like the node does and marks it real; on 40204 (no height pinned) the
+    // same address is reserved and flagged unavailable.
+    let step = || {
+        Plan::from_json(&plan_json(serde_json::json!([
+            { "kind": "create", "data": fixture("Payout") },
+            { "kind": "call", "to": addr_hex(revm::primitives::Address::from_slice(&precompile(0x0121))), "data": "0x00" },
+        ])))
+        .expect("plan")
+    };
+    let mut devnet = config_at(TODAY);
+    devnet.chain_id = 31_337;
+    devnet.hardening_height = None;
+    devnet.agent_fork_height = Some(1);
+    let rep = run(&step(), ForkState::Empty, &devnet).expect("runs");
+    assert!(rep.semantics.agent_precompiles_active);
+    assert_eq!(rep.semantics.agent_precompiles_height, Some(1));
+    assert!(rep.precompiles.real.contains(&"0x0121".to_string()));
+    assert_eq!(rep.precompiles.touched[0].coverage, Coverage::Real);
+    assert!(rep.precompiles.unavailable_touched.is_empty());
+
+    let rep = run(&step(), ForkState::Empty, &config_at(TODAY)).expect("runs");
+    assert!(!rep.semantics.agent_precompiles_active);
+    assert_eq!(rep.semantics.agent_precompiles_height, None);
+    assert!(!rep.precompiles.real.contains(&"0x0121".to_string()));
+    assert_eq!(
+        rep.precompiles.unavailable_touched,
+        vec!["0x0121".to_string()]
+    );
+}

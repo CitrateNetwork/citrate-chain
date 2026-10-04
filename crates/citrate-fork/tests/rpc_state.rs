@@ -124,6 +124,8 @@ fn forked_state_is_read_at_the_pinned_block_with_read_methods_only() {
         block,
         hardening_height: pinned_hardening(chain_id),
         hardening_source: "release pin".into(),
+        agent_fork_height: citrate_execution::agent_fork::pinned_for(chain_id).flatten(),
+        agent_fork_source: "release pin".into(),
         source: StateSource::Rpc {
             origin: redacted_origin(&url),
         },
@@ -273,6 +275,8 @@ fn anvil_fork_state_is_read_through_the_same_path() {
         block,
         hardening_height: pinned_hardening(chain_id),
         hardening_source: "release pin".into(),
+        agent_fork_height: citrate_execution::agent_fork::pinned_for(chain_id).flatten(),
+        agent_fork_source: "release pin".into(),
         source: StateSource::Rpc {
             origin: redacted_origin(&url),
         },

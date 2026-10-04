@@ -24,6 +24,7 @@ fork runs the same EVM configuration the node builds:
 |---|---|
 | Citrate precompiles | `revm_adapter::register_citrate_precompiles` (the node's bridge, not a copy) |
 | PBA hardening flag | the release pin for the chain id (`citrate_consensus::hardening::PINNED_ACTIVATIONS`) |
+| Agent precompile fork flag (0x0112, 0x0113, 0x0121, 0x0122; HUP-S7.2) | the node's own rule (`agent_fork::resolve`): the release pin on 40204 (not scheduled, so off), otherwise `--agent-precompiles-height`, then `CITRATE_AGENT_PRECOMPILES_HEIGHT`, then off. The four addresses are Real only at or above the height |
 | Value transfers made by contracts | `executor::value_semantics_at` (REVM-authoritative on 40204) |
 | Contract nonces (EIP-161) | `executor::persist_contract_nonces_at` |
 | EVM spec, chain id, GASPRICE | CANCUN, the endpoint's chain id, gas price 0 inside the EVM (the executor charges gas outside REVM) |

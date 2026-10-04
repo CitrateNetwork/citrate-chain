@@ -56,6 +56,10 @@ pub struct ForkConfig {
     pub hardening_height: Option<u64>,
     /// Where it came from, for the report.
     pub hardening_source: String,
+    /// The agent precompile fork height for this chain (HUP-S7.2; None = not activated).
+    pub agent_fork_height: Option<u64>,
+    /// Where it came from, for the report.
+    pub agent_fork_source: String,
     pub source: StateSource,
 }
 
@@ -77,6 +81,9 @@ pub struct Semantics {
     pub pba_hardening_source: String,
     pub commd_fold_verify_linked: bool,
     pub halo2_verifier_linked: bool,
+    pub agent_precompiles_active: bool,
+    pub agent_precompiles_height: Option<u64>,
+    pub agent_precompiles_source: String,
 }
 
 /// One touched Citrate precompile.
@@ -171,11 +178,11 @@ impl<DB: Database> Inspector<DB> for PrecompileTracer {
     }
 }
 
-fn touches(hits: &BTreeMap<u16, (u64, u64)>, hardened: bool) -> Vec<Touch> {
+fn touches(hits: &BTreeMap<u16, (u64, u64)>, hardened: bool, agent_fork: bool) -> Vec<Touch> {
     hits.iter()
         .map(|(v, (calls, failed))| Touch {
             address: format!("0x{v:04x}"),
-            coverage: table::coverage(*v, hardened).0,
+            coverage: table::coverage(*v, hardened, agent_fork).0,
             calls: *calls,
             failed_calls: *failed,
         })
@@ -210,7 +217,7 @@ pub fn run(plan: &Plan, state: ForkState, cfg: &ForkConfig) -> Result<Report, Fo
         )));
     }
     let hardened = citrate_execution::activation::active_at(cfg.hardening_height, height);
-    let agent_fork = citrate_execution::agent_fork::agent_precompiles_active(height);
+    let agent_fork = citrate_execution::agent_fork::active_at(cfg.agent_fork_height, height);
     let timestamp = cfg.block.timestamp.saturating_add(2);
     let mut db = CacheDB::new(state);
 
@@ -336,11 +343,11 @@ pub fn run(plan: &Plan, state: ForkState, cfg: &ForkConfig) -> Result<Report, Fo
             output_truncated: truncated && !(kind == "create" && ok),
             error,
             logs,
-            precompiles_touched: touches(&tracer.hits, hardened),
+            precompiles_touched: touches(&tracer.hits, hardened, agent_fork),
         });
     }
 
-    let touched = touches(&all_hits, hardened);
+    let touched = touches(&all_hits, hardened, agent_fork);
     let unavailable_touched = touched
         .iter()
         .filter(|t| t.coverage == Coverage::Unavailable)
@@ -367,6 +374,9 @@ pub fn run(plan: &Plan, state: ForkState, cfg: &ForkConfig) -> Result<Report, Fo
             pba_hardening_source: cfg.hardening_source.clone(),
             commd_fold_verify_linked: citrate_execution::build_features::COMMD_FOLD_VERIFY,
             halo2_verifier_linked: citrate_execution::build_features::HALO2_SUBSTRATE,
+            agent_precompiles_active: agent_fork,
+            agent_precompiles_height: cfg.agent_fork_height,
+            agent_precompiles_source: cfg.agent_fork_source.clone(),
         },
         status: first.status.clone(),
         contract_address: first.contract_address.clone(),
@@ -374,8 +384,8 @@ pub fn run(plan: &Plan, state: ForkState, cfg: &ForkConfig) -> Result<Report, Fo
         all_steps_succeeded: steps.iter().all(|s| s.status == "0x1"),
         steps,
         precompiles: PrecompileReport {
-            real: table::real_addresses(hardened),
-            table: table::table(hardened),
+            real: table::real_addresses(hardened, agent_fork),
+            table: table::table(hardened, agent_fork),
             touched,
             unavailable_touched,
         },

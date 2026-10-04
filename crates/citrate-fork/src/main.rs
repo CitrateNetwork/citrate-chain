@@ -1,9 +1,9 @@
 //! `citrate-fork` — the Citrate-aware dry-run fork (HUP-S6.10). See the crate docs.
 //!
 //! ```text
-//! citrate-fork precompiles [--chain-id N] [--block N] [--pba-hardening-height N|off]
+//! citrate-fork precompiles [--chain-id N] [--block N] [--pba-hardening-height N|off] [--agent-precompiles-height N|off]
 //! citrate-fork run --plan FILE|- [--rpc URL] [--block N] [--chain-id N]
-//!                  [--pba-hardening-height N|off] [--timestamp SECS]
+//!                  [--pba-hardening-height N|off] [--agent-precompiles-height N|off] [--timestamp SECS]
 //! citrate-fork --version
 //! ```
 //!
@@ -19,8 +19,8 @@ use citrate_fork::state::redacted_origin;
 use citrate_fork::{ForkBlock, ForkError, ForkState, Plan, RpcState};
 
 const USAGE: &str = "usage:
-  citrate-fork precompiles [--chain-id N] [--block N] [--pba-hardening-height N|off]
-  citrate-fork run --plan FILE|- [--rpc URL] [--block N] [--chain-id N] [--pba-hardening-height N|off] [--timestamp SECS]
+  citrate-fork precompiles [--chain-id N] [--block N] [--pba-hardening-height N|off] [--agent-precompiles-height N|off]
+  citrate-fork run --plan FILE|- [--rpc URL] [--block N] [--chain-id N] [--pba-hardening-height N|off] [--agent-precompiles-height N|off] [--timestamp SECS]
   citrate-fork --version";
 
 /// Chain 40204 (the default when no endpoint says otherwise).
@@ -34,6 +34,8 @@ struct Args {
     chain_id: Option<u64>,
     /// Some(None) = explicitly off.
     hardening: Option<Option<u64>>,
+    /// Raw `--agent-precompiles-height` value (a height or `off`).
+    agent_fork: Option<String>,
     timestamp: Option<u64>,
 }
 
@@ -70,6 +72,12 @@ fn parse_args(rest: &[String]) -> Result<Args, ForkError> {
                     )
                 });
             }
+            "--agent-precompiles-height" => {
+                a.agent_fork = Some(
+                    it.next()
+                        .ok_or_else(|| e("--agent-precompiles-height needs a value"))?,
+                );
+            }
             other => return Err(e(format!("unknown argument: {other}"))),
         }
     }
@@ -91,6 +99,20 @@ fn hardening(chain_id: u64, over: Option<Option<u64>>) -> Result<(Option<u64>, S
     }
 }
 
+/// The agent precompile fork height (HUP-S7.2) and where it came from, resolved with the
+/// node's own rule (`agent_fork::resolve`): on a release network the release pin wins and a
+/// differing height is refused; elsewhere the flag, then `CITRATE_AGENT_PRECOMPILES_HEIGHT`,
+/// then unset.
+fn agent_fork(chain_id: u64, over: Option<&str>) -> Result<(Option<u64>, String), ForkError> {
+    use citrate_execution::agent_fork::{pinned_for, resolve, resolve_for_chain};
+    let r = match over {
+        Some(raw) => resolve(pinned_for(chain_id), Some(raw), None),
+        None => resolve_for_chain(chain_id, None),
+    };
+    let (h, source) = r.map_err(e)?;
+    Ok((h, source.to_string()))
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -105,6 +127,11 @@ fn cmd_precompiles(a: Args) -> Result<String, ForkError> {
         Some(b) => citrate_execution::activation::active_at(h, b),
         None => false,
     };
+    let (ah, asrc) = agent_fork(chain_id, a.agent_fork.as_deref())?;
+    let agent_active = match a.block {
+        Some(b) => citrate_execution::agent_fork::active_at(ah, b),
+        None => false,
+    };
     serde_json::to_string_pretty(&serde_json::json!({
         "engine": citrate_fork::ENGINE,
         "engineVersion": env!("CARGO_PKG_VERSION"),
@@ -113,7 +140,10 @@ fn cmd_precompiles(a: Args) -> Result<String, ForkError> {
         "pbaHardened": hardened,
         "pbaHardeningHeight": h,
         "pbaHardeningSource": source,
-        "precompiles": citrate_fork::table::table(hardened),
+        "agentPrecompilesActive": agent_active,
+        "agentPrecompilesHeight": ah,
+        "agentPrecompilesSource": asrc,
+        "precompiles": citrate_fork::table::table(hardened, agent_active),
     }))
     .map_err(|err| e(err.to_string()))
 }
@@ -172,11 +202,14 @@ fn cmd_run(a: Args) -> Result<String, ForkError> {
         block.timestamp = t;
     }
     let (h, hsrc) = hardening(chain_id, a.hardening)?;
+    let (ah, asrc) = agent_fork(chain_id, a.agent_fork.as_deref())?;
     let cfg = ForkConfig {
         chain_id,
         block,
         hardening_height: h,
         hardening_source: hsrc,
+        agent_fork_height: ah,
+        agent_fork_source: asrc,
         source,
     };
     let report = citrate_fork::run(&plan, state, &cfg)?;
