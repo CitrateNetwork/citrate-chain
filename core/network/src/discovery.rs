@@ -106,14 +106,15 @@ pub fn filter_by_subnet_cap(
 ) -> Vec<usize> {
     let mut counts: HashMap<[u8; 7], usize> = HashMap::new();
     for addr in existing {
-        *counts.entry(subnet_group(&addr.ip())).or_insert(0) += 1;
+        let c = counts.entry(subnet_group(&addr.ip())).or_insert(0);
+            *c = c.saturating_add(1);
     }
 
     let mut accepted = Vec::with_capacity(candidates.len());
     for (i, (addr, exempt)) in candidates.iter().enumerate() {
         let count = counts.entry(subnet_group(&addr.ip())).or_insert(0);
         if *exempt || *count < cap {
-            *count += 1;
+            *count = count.saturating_add(1);
             accepted.push(i);
         }
     }
@@ -168,7 +169,7 @@ impl Discovery {
         for node in &self.config.bootstrap_nodes {
             if let Some((_, addr)) = crate::bootnode::resolve_bootnode(node).await {
                 self.add_bootstrap_peer(format!("bootstrap_{}", node), addr).await;
-                added += 1;
+                added = added.saturating_add(1);
             } else {
                 warn!("Could not resolve bootstrap node: {}", node);
             }
@@ -178,7 +179,7 @@ impl Discovery {
             "Initialized discovery with {} bootstrap nodes ({} resolved as protected, {} unresolved)",
             self.config.bootstrap_nodes.len(),
             added,
-            self.config.bootstrap_nodes.len() - added,
+            self.config.bootstrap_nodes.len().saturating_sub(added),
         );
         Ok(())
     }
@@ -336,7 +337,7 @@ impl Discovery {
             .iter()
             .filter(|p| {
                 !connected.contains(&p.value().id)
-                    && (now - p.value().last_seen) < self.config.peer_expiry.as_secs()
+                    && now.saturating_sub(p.value().last_seen) < self.config.peer_expiry.as_secs()
             })
             .take(self.config.peer_exchange_size)
             .map(|p| PeerAddress {
@@ -414,7 +415,7 @@ impl Discovery {
             return Vec::new();
         }
 
-        let needed = self.config.max_peers - current_peers;
+        let needed = self.config.max_peers.saturating_sub(current_peers);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -438,7 +439,7 @@ impl Discovery {
                     return false;
                 }
                 peer.attempts < 3
-                    && (now - peer.last_seen) < self.config.peer_expiry.as_secs()
+                    && now.saturating_sub(peer.last_seen) < self.config.peer_expiry.as_secs()
             })
             .map(|p| p.value().clone())
             .collect();
@@ -461,7 +462,7 @@ impl Discovery {
         accepted
             .into_iter()
             .take(needed)
-            .map(|i| (candidates[i].id.clone(), candidates[i].addr))
+            .filter_map(|i| candidates.get(i).map(|c| (c.id.clone(), c.addr)))
             .collect()
     }
 
@@ -470,10 +471,10 @@ impl Discovery {
         if let Some(mut peer) = self.known_peers.get_mut(peer_id) {
             if success {
                 peer.attempts = 0;
-                peer.score = (peer.score + 10).min(100);
+                peer.score = peer.score.saturating_add(10).min(100);
             } else {
-                peer.attempts += 1;
-                peer.score = (peer.score - 5).max(-100);
+                peer.attempts = peer.attempts.saturating_add(1);
+                peer.score = peer.score.saturating_sub(5).max(-100);
             }
         }
     }
@@ -491,7 +492,7 @@ impl Discovery {
             .iter()
             .filter(|p| {
                 !p.value().is_bootstrap
-                    && (now - p.value().last_seen) > self.config.peer_expiry.as_secs()
+                    && now.saturating_sub(p.value().last_seen) > self.config.peer_expiry.as_secs()
             })
             .map(|p| p.key().clone())
             .collect();

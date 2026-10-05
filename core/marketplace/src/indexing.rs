@@ -270,7 +270,7 @@ impl IndexingService {
                     );
 
                     // Retry logic
-                    task.retry_count += 1;
+                    task.retry_count = task.retry_count.saturating_add(1);
                     if task.retry_count < 3 {
                         // Re-enqueue with lower priority
                         task.priority = task.priority.saturating_add(5);
@@ -280,7 +280,7 @@ impl IndexingService {
                     } else {
                         warn!(operation = ?task.operation, "Task failed after max retries");
                         let mut stats = stats.write().await;
-                        stats.failed_operations += 1;
+                        stats.failed_operations = stats.failed_operations.saturating_add(1);
                     }
                 }
             }
@@ -342,24 +342,24 @@ impl IndexingService {
         info!("Starting full reindex of all models");
 
         let models = storage.get_all_models().await?;
-        let mut indexed_count = 0;
-        let mut failed_count = 0;
+        let mut indexed_count = 0usize;
+        let mut failed_count = 0usize;
 
         for model in models {
             match search_engine.index_model(&model).await {
-                Ok(()) => indexed_count += 1,
+                Ok(()) => indexed_count = indexed_count.saturating_add(1),
                 Err(e) => {
                     error!(
                         model_id = ?model.model_id,
                         error = %e,
                         "Failed to index model during full reindex"
                     );
-                    failed_count += 1;
+                    failed_count = failed_count.saturating_add(1);
                 }
             }
 
             // Yield periodically to prevent blocking
-            if indexed_count % 100 == 0 {
+            if indexed_count.is_multiple_of(100) {
                 tokio::task::yield_now().await;
             }
         }
@@ -421,9 +421,9 @@ impl IndexingService {
         let mut stats = stats.write().await;
 
         match &task.operation {
-            IndexingOperation::AddModel(_) => stats.models_indexed += 1,
-            IndexingOperation::UpdateModel(_) => stats.models_updated += 1,
-            IndexingOperation::RemoveModel(_) => stats.models_removed += 1,
+            IndexingOperation::AddModel(_) => stats.models_indexed = stats.models_indexed.saturating_add(1),
+            IndexingOperation::UpdateModel(_) => stats.models_updated = stats.models_updated.saturating_add(1),
+            IndexingOperation::RemoveModel(_) => stats.models_removed = stats.models_removed.saturating_add(1),
             IndexingOperation::ReindexAll => {
                 stats.last_full_reindex = Some(chrono::Utc::now());
             }
@@ -496,9 +496,11 @@ impl BatchIndexer {
 
     /// Auto-flush when batch size is reached
     pub async fn maybe_flush(&mut self) -> Result<()> {
-        let total_pending = self.pending_adds.len()
-            + self.pending_updates.len()
-            + self.pending_removes.len();
+        let total_pending = self
+            .pending_adds
+            .len()
+            .saturating_add(self.pending_updates.len())
+            .saturating_add(self.pending_removes.len());
 
         if total_pending >= self.batch_size {
             self.flush().await?;

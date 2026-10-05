@@ -225,7 +225,10 @@ mod tests {
         rs.pin_at(ReadVersion::from_raw(3));
         rs.record_read(addr(1));
         t.bump(addr(2), ReadVersion::from_raw(99));
-        assert!(t.validate(&rs), "bumping disjoint account 2 must not invalidate read of account 1");
+        assert!(
+            t.validate(&rs),
+            "bumping disjoint account 2 must not invalidate read of account 1"
+        );
     }
 
     #[test]

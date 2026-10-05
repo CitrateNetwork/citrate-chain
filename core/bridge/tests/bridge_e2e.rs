@@ -10,6 +10,7 @@ use citrate_bridge::events::{
 use citrate_bridge::mint::{SnapMinter, SnapNftMetadata};
 use citrate_bridge::oracle::{compute_event_hash, OracleAttestation};
 use citrate_bridge::relay::{BridgeRelay, MockEventSource};
+use citrate_bridge::BridgeError;
 use citrate_bridge::state::RelayState;
 
 use ed25519_dalek::{Signer, SigningKey};
@@ -45,7 +46,7 @@ fn default_oracle_key() -> SigningKey {
 
 /// Set up a relay with threshold=1 and one registered oracle.
 fn setup_relay() -> BridgeRelay {
-    let relay = BridgeRelay::new(test_config());
+    let relay = BridgeRelay::new(test_config()).expect("relay");
     let sk = default_oracle_key();
     {
         let mut reg = relay.oracle_registry().write();
@@ -259,7 +260,7 @@ async fn test_relay_with_insufficient_attestations() {
         oracle_threshold: 3, // Require 3 attestations
         ..Default::default()
     };
-    let relay = BridgeRelay::new(config);
+    let relay = BridgeRelay::new(config).expect("relay");
     let source = MockEventSource::new();
 
     // Register only 2 oracles
@@ -361,15 +362,15 @@ async fn test_withdrawal_event_creation() {
 // ============================================================
 
 #[test]
-#[should_panic(expected = "oracle_threshold must be > 0")]
 fn test_relay_config_validation() {
-    // In integration tests, cfg!(test) is false for the bridge crate,
-    // so zero threshold should panic.
-    let _relay = BridgeRelay::new(BridgeConfig {
+    // In integration tests, cfg!(test) is false for the bridge crate, so a zero
+    // threshold (auto-attest without oracles) must be refused.
+    let relay = BridgeRelay::new(BridgeConfig {
         confirmation_depth: 0,
         oracle_threshold: 0,
         ..Default::default()
     });
+    assert!(matches!(relay, Err(BridgeError::InvalidThreshold { threshold: 0, .. })));
 }
 
 // ============================================================

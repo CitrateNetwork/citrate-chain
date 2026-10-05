@@ -69,7 +69,8 @@ pub fn sign_permit(signing_key: &[u8; 32], digest: H256) -> Result<[u8; 65], Per
     let (signature, recovery_id): (Signature, RecoveryId) = key.sign_prehash(eth_hash.as_bytes())?;
     let r = signature.r().to_bytes();
     let s = signature.s().to_bytes();
-    let v: u8 = 27u8 + Into::<u8>::into(recovery_id);
+    // Recovery ids are 0..=3, so this cannot wrap.
+    let v: u8 = Into::<u8>::into(recovery_id).saturating_add(27);
 
     let mut sig = [0u8; 65];
     sig[0..32].copy_from_slice(&r);
@@ -83,7 +84,7 @@ pub fn sign_permit(signing_key: &[u8; 32], digest: H256) -> Result<[u8; 65], Per
 /// produces.
 pub fn eth_signed_message_hash(digest: H256) -> H256 {
     let prefix = b"\x19Ethereum Signed Message:\n32";
-    let mut buf = Vec::with_capacity(prefix.len() + 32);
+    let mut buf = Vec::with_capacity(prefix.len().saturating_add(32));
     buf.extend_from_slice(prefix);
     buf.extend_from_slice(digest.as_bytes());
     H256::from_slice(&keccak256(&buf))

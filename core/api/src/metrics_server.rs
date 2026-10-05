@@ -10,129 +10,163 @@ use tracing::info;
 
 // RPC Metrics
 pub static RPC_REQUEST_DURATION: Lazy<prometheus::HistogramVec> = Lazy::new(|| {
-    register_histogram_vec!(
-        "citrate_rpc_request_duration_seconds",
-        "RPC request duration in seconds",
-        &["method"]
+    crate::metrics::must(
+        register_histogram_vec!(
+            "citrate_rpc_request_duration_seconds",
+            "RPC request duration in seconds",
+            &["method"]
+        ),
+        "Failed to register RPC request duration metric",
     )
-    .unwrap_or_else(|e| panic!("Failed to register RPC request duration metric: {e}"))
 });
 
 pub static RPC_REQUEST_COUNT: Lazy<prometheus::CounterVec> = Lazy::new(|| {
-    register_counter_vec!(
-        "citrate_rpc_requests_total",
-        "Total number of RPC requests",
-        &["method", "status"]
+    crate::metrics::must(
+        register_counter_vec!(
+            // Distinct from metrics::RPC_REQUESTS ("citrate_rpc_requests_total", label
+            // `method`): two collectors with one name panic on the second registration.
+            "citrate_rpc_requests_by_status_total",
+            "Total number of RPC requests by method and status",
+            &["method", "status"]
+        ),
+        "Failed to register RPC request count metric",
     )
-    .unwrap_or_else(|e| panic!("Failed to register RPC request count metric: {e}"))
 });
 
 // Mempool Metrics
 pub static MEMPOOL_SIZE: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
-    register_gauge_vec!("citrate_mempool_size", "Current mempool size", &["class"])
-        .unwrap_or_else(|e| panic!("Failed to register mempool size metric: {e}"))
+    crate::metrics::must(
+        register_gauge_vec!("citrate_mempool_size", "Current mempool size", &["class"]),
+        "Failed to register mempool size metric",
+    )
 });
 
 pub static MEMPOOL_BYTES: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
-    register_gauge_vec!(
-        "citrate_mempool_bytes",
-        "Current mempool size in bytes",
-        &["class"]
+    crate::metrics::must(
+        register_gauge_vec!(
+            "citrate_mempool_bytes",
+            "Current mempool size in bytes",
+            &["class"]
+        ),
+        "Failed to register mempool bytes metric",
     )
-    .unwrap_or_else(|e| panic!("Failed to register mempool bytes metric: {e}"))
 });
 
 // Storage Metrics
 pub static STORAGE_READ_DURATION: Lazy<prometheus::HistogramVec> = Lazy::new(|| {
-    register_histogram_vec!(
-        "citrate_storage_read_duration_seconds",
-        "Storage read duration in seconds",
-        &["cf"]
+    crate::metrics::must(
+        register_histogram_vec!(
+            "citrate_storage_read_duration_seconds",
+            "Storage read duration in seconds",
+            &["cf"]
+        ),
+        "Failed to register storage read duration metric",
     )
-    .unwrap_or_else(|e| panic!("Failed to register storage read duration metric: {e}"))
 });
 
 pub static STORAGE_WRITE_DURATION: Lazy<prometheus::HistogramVec> = Lazy::new(|| {
-    register_histogram_vec!(
-        "citrate_storage_write_duration_seconds",
-        "Storage write duration in seconds",
-        &["cf"]
+    crate::metrics::must(
+        register_histogram_vec!(
+            "citrate_storage_write_duration_seconds",
+            "Storage write duration in seconds",
+            &["cf"]
+        ),
+        "Failed to register storage write duration metric",
     )
-    .unwrap_or_else(|e| panic!("Failed to register storage write duration metric: {e}"))
 });
 
 // Cache Metrics
 pub static CACHE_HIT_RATE: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
-    register_gauge_vec!("citrate_cache_hit_rate", "Cache hit rate", &["cache_type"])
-        .unwrap_or_else(|e| panic!("Failed to register cache hit rate metric: {e}"))
+    crate::metrics::must(
+        register_gauge_vec!("citrate_cache_hit_rate", "Cache hit rate", &["cache_type"]),
+        "Failed to register cache hit rate metric",
+    )
 });
 
 pub static CACHE_SIZE: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
-    register_gauge_vec!("citrate_cache_size", "Current cache size", &["cache_type"])
-        .unwrap_or_else(|e| panic!("Failed to register cache size metric: {e}"))
+    crate::metrics::must(
+        register_gauge_vec!("citrate_cache_size", "Current cache size", &["cache_type"]),
+        "Failed to register cache size metric",
+    )
 });
 
 // DAG Metrics
 pub static DAG_HEIGHT: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
-    register_gauge_vec!("citrate_dag_height", "Current DAG height", &[])
-        .unwrap_or_else(|e| panic!("Failed to register DAG height metric: {e}"))
+    crate::metrics::must(
+        register_gauge_vec!("citrate_dag_height", "Current DAG height", &[]),
+        "Failed to register DAG height metric",
+    )
 });
 
 pub static DAG_TIPS_COUNT: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
-    register_gauge_vec!("citrate_dag_tips_count", "Number of current tips", &[])
-        .unwrap_or_else(|e| panic!("Failed to register DAG tips count metric: {e}"))
+    crate::metrics::must(
+        register_gauge_vec!("citrate_dag_tips_count", "Number of current tips", &[]),
+        "Failed to register DAG tips count metric",
+    )
 });
 
 pub static DAG_BLUE_SCORE: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
-    register_gauge_vec!("citrate_dag_blue_score", "Current blue score", &[])
-        .unwrap_or_else(|e| panic!("Failed to register DAG blue score metric: {e}"))
+    crate::metrics::must(
+        register_gauge_vec!("citrate_dag_blue_score", "Current blue score", &[]),
+        "Failed to register DAG blue score metric",
+    )
 });
 
 // Execution Metrics
 pub static EXECUTION_TIME: Lazy<prometheus::HistogramVec> = Lazy::new(|| {
-    register_histogram_vec!(
-        "citrate_execution_time_seconds",
-        "Transaction execution time",
-        &["tx_type"]
+    crate::metrics::must(
+        register_histogram_vec!(
+            "citrate_execution_time_seconds",
+            "Transaction execution time",
+            &["tx_type"]
+        ),
+        "Failed to register execution time metric",
     )
-    .unwrap_or_else(|e| panic!("Failed to register execution time metric: {e}"))
 });
 
 pub static PARALLEL_EXECUTION_GROUPS: Lazy<prometheus::HistogramVec> = Lazy::new(|| {
-    register_histogram_vec!(
-        "citrate_parallel_execution_groups",
-        "Number of parallel execution groups",
-        &[]
+    crate::metrics::must(
+        register_histogram_vec!(
+            "citrate_parallel_execution_groups",
+            "Number of parallel execution groups",
+            &[]
+        ),
+        "Failed to register parallel execution groups metric",
     )
-    .unwrap_or_else(|e| panic!("Failed to register parallel execution groups metric: {e}"))
 });
 
 // Network Metrics
 pub static PEER_COUNT: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
-    register_gauge_vec!(
-        "citrate_peer_count",
-        "Number of connected peers",
-        &["state"]
+    crate::metrics::must(
+        register_gauge_vec!(
+            "citrate_peer_count",
+            "Number of connected peers",
+            &["state"]
+        ),
+        "Failed to register peer count metric",
     )
-    .unwrap_or_else(|e| panic!("Failed to register peer count metric: {e}"))
 });
 
 pub static NETWORK_BYTES_RECEIVED: Lazy<prometheus::CounterVec> = Lazy::new(|| {
-    register_counter_vec!(
-        "citrate_network_bytes_received_total",
-        "Total bytes received",
-        &["protocol"]
+    crate::metrics::must(
+        register_counter_vec!(
+            "citrate_network_bytes_received_total",
+            "Total bytes received",
+            &["protocol"]
+        ),
+        "Failed to register network bytes received metric",
     )
-    .unwrap_or_else(|e| panic!("Failed to register network bytes received metric: {e}"))
 });
 
 pub static NETWORK_BYTES_SENT: Lazy<prometheus::CounterVec> = Lazy::new(|| {
-    register_counter_vec!(
-        "citrate_network_bytes_sent_total",
-        "Total bytes sent",
-        &["protocol"]
+    crate::metrics::must(
+        register_counter_vec!(
+            "citrate_network_bytes_sent_total",
+            "Total bytes sent",
+            &["protocol"]
+        ),
+        "Failed to register network bytes sent metric",
     )
-    .unwrap_or_else(|e| panic!("Failed to register network bytes sent metric: {e}"))
 });
 
 /// Metrics server configuration
@@ -171,15 +205,11 @@ async fn metrics_handler() -> Response<Body> {
             .status(StatusCode::OK)
             .header("Content-Type", encoder.format_type())
             .body(Body::from(buffer))
-            .unwrap_or_else(|e| {
-                Response::new(Body::from(format!("response builder error: {e}")))
-            }),
+            .unwrap_or_else(|e| Response::new(Body::from(format!("response builder error: {e}")))),
         Err(e) => Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
             .body(Body::from(format!("Error encoding metrics: {}", e)))
-            .unwrap_or_else(|e| {
-                Response::new(Body::from(format!("response builder error: {e}")))
-            }),
+            .unwrap_or_else(|e| Response::new(Body::from(format!("response builder error: {e}")))),
     }
 }
 
@@ -188,9 +218,7 @@ async fn health_handler() -> Response<Body> {
     Response::builder()
         .status(StatusCode::OK)
         .body(Body::from("{\"status\":\"healthy\"}"))
-        .unwrap_or_else(|e| {
-            Response::new(Body::from(format!("response builder error: {e}")))
-        })
+        .unwrap_or_else(|e| Response::new(Body::from(format!("response builder error: {e}"))))
 }
 
 /// Update mempool metrics

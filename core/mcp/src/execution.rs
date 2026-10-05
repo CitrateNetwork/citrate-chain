@@ -209,10 +209,9 @@ impl ModelExecutor {
         // Populate architecture from record metadata; fall back to GGUF magic header
         let architecture = if !record.metadata.architecture.is_empty() {
             record.metadata.architecture.clone()
-        } else if weights.len() >= 4 && &weights[0..4] == b"GGUF" {
+        } else if weights.starts_with(b"GGUF") {
             // Extract GGUF header as architecture descriptor (first 64 bytes or less)
-            let header_len = std::cmp::min(64, weights.len());
-            weights[..header_len].to_vec()
+            weights.get(..64).unwrap_or(&weights).to_vec()
         } else {
             warn!(
                 "Model {:?} has no architecture descriptor and no GGUF header",
@@ -379,9 +378,9 @@ impl ModelExecutor {
         let model_gas = (model.weights.len() / 1024) as u64;
 
         // Output size factor (10 gas per byte)
-        let output_gas = (output.len() * 10) as u64;
+        let output_gas = (output.len() as u64).saturating_mul(10);
 
-        base_gas + model_gas + output_gas
+        base_gas.saturating_add(model_gas).saturating_add(output_gas)
     }
 
     /// Execute training in VM
@@ -446,13 +445,15 @@ impl ModelExecutor {
             hasher.update(b"CITRATE_GRADIENT_V1");
             hasher.update((i as u64).to_le_bytes());
             hasher.update(training_data);
-            hasher.update(&current_weights[..std::cmp::min(256, current_weights.len())]);
+            hasher.update(current_weights.get(..256).unwrap_or(current_weights));
             let hash = hasher.finalize();
 
             // Use hash bytes as gradient values for this chunk
-            let remaining = current_weights.len().saturating_sub(i * chunk_size);
+            let remaining = current_weights
+                .len()
+                .saturating_sub(i.saturating_mul(chunk_size));
             let take = std::cmp::min(chunk_size, remaining);
-            gradient.extend_from_slice(&hash[..take]);
+            gradient.extend_from_slice(hash.get(..take).unwrap_or(&hash));
         }
 
         gradient.truncate(current_weights.len());
@@ -523,9 +524,9 @@ impl ModelExecutor {
     fn estimate_training_gas(&self, weights: &[u8], training_data: &[u8]) -> u64 {
         // Base cost + per-weight cost + per-training-byte cost
         let base_gas = 1_000_000u64;
-        let weight_gas = (weights.len() as u64) * 10;
-        let data_gas = (training_data.len() as u64) * 5;
-        base_gas + weight_gas + data_gas
+        let weight_gas = (weights.len() as u64).saturating_mul(10);
+        let data_gas = (training_data.len() as u64).saturating_mul(5);
+        base_gas.saturating_add(weight_gas).saturating_add(data_gas)
     }
 
     /// Generate execution proof
@@ -797,7 +798,7 @@ mod tests {
                 hasher.update(b"CITRATE_GRADIENT_V1");
                 hasher.update((i as u64).to_le_bytes());
                 hasher.update(training_data);
-                hasher.update(&current_weights[..std::cmp::min(256, current_weights.len())]);
+                hasher.update(current_weights.get(..256).unwrap_or(current_weights));
                 let hash = hasher.finalize();
 
                 let remaining = current_weights.len().saturating_sub(i * chunk_size);

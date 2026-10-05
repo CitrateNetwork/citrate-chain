@@ -160,7 +160,7 @@ fn verify_attestation_freshness(attestation: &OracleAttestation) -> Result<(), B
     }
 
     // Also reject attestations from the future (clock skew > 60s)
-    if attestation.timestamp > now + 60 {
+    if attestation.timestamp > now.saturating_add(60) {
         return Err(BridgeError::StaleAttestation {
             timestamp: attestation.timestamp,
         });
@@ -325,7 +325,7 @@ impl OracleRegistry {
 
         // Update oracle stats
         oracle.last_attestation = attestation.timestamp;
-        oracle.total_attestations += 1;
+        oracle.total_attestations = oracle.total_attestations.saturating_add(1);
 
         // Store attestation
         event_attestations.push(attestation);
@@ -389,7 +389,7 @@ impl OracleRegistry {
                 );
                 continue;
             }
-            matching += 1;
+            matching = matching.saturating_add(1);
         }
         matching
     }
@@ -427,10 +427,10 @@ impl OracleRegistry {
     /// Verify that all attestations for an event have matching event hashes.
     pub fn verify_attestation_consistency(&self, event_id: &EventId) -> bool {
         if let Some(attestations) = self.attestations.get(event_id) {
-            if attestations.is_empty() {
+            let Some(first) = attestations.first() else {
                 return true;
-            }
-            let first_hash = &attestations[0].event_hash;
+            };
+            let first_hash = &first.event_hash;
             attestations.iter().all(|a| &a.event_hash == first_hash)
         } else {
             true

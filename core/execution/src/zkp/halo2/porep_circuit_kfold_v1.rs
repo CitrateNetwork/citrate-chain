@@ -773,8 +773,14 @@ mod tests {
         // 22% < fraction < 26% (real and bounded; NOT ~50%, NOT ~0).
         let bound_26 = (two254_hi / 100) * 26;
         let bound_22 = (two254_hi / 100) * 22;
-        assert!(diff_hi < bound_26, "alternate-rep fraction must be ≲ 26% (got hi={diff_hi})");
-        assert!(diff_hi > bound_22, "alternate-rep fraction must be ≳ 22% — gap is real, see risk-acceptance");
+        assert!(
+            diff_hi < bound_26,
+            "alternate-rep fraction must be ≲ 26% (got hi={diff_hi})"
+        );
+        assert!(
+            diff_hi > bound_22,
+            "alternate-rep fraction must be ≳ 22% — gap is real, see risk-acceptance"
+        );
         let _ = diff_lo;
     }
 

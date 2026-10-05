@@ -42,7 +42,7 @@ fn setup_relay() -> BridgeRelay {
         oracle_threshold: 1,
         ..Default::default()
     };
-    let relay = BridgeRelay::new(config);
+    let relay = BridgeRelay::new(config).expect("relay");
     let sk = default_oracle_key();
     {
         let mut reg = relay.oracle_registry().write();
@@ -1061,7 +1061,7 @@ async fn test_relay_no_new_blocks_yields_empty() {
         oracle_threshold: 1,
         ..Default::default()
     };
-    let relay = BridgeRelay::new(config);
+    let relay = BridgeRelay::new(config).expect("relay");
     let sk = default_oracle_key();
     relay
         .oracle_registry()

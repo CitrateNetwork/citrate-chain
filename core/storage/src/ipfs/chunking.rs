@@ -86,7 +86,8 @@ pub fn chunk_for_metal(model_data: &[u8]) -> Result<Vec<Chunk>> {
 /// Align chunk size to Metal GPU buffer requirements
 fn align_to_metal_buffer_size(size: usize) -> usize {
     const METAL_BUFFER_ALIGNMENT: usize = 16384; // 16KB alignment for Metal
-    size.div_ceil(METAL_BUFFER_ALIGNMENT) * METAL_BUFFER_ALIGNMENT
+    size.div_ceil(METAL_BUFFER_ALIGNMENT)
+        .saturating_mul(METAL_BUFFER_ALIGNMENT)
 }
 
 #[cfg(test)]
