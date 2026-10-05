@@ -38,7 +38,7 @@ contract AgentSBTMemberMintTest is Test {
         members = new CitrateMemberSBT(admin);
         agent = new AgentSBT(admin, org, IERC721(address(members)));
 
-        memberOrg = org.mintOrg(admin, keccak256("did:citrate:org:members"), admin, new bytes32[](0));
+        memberOrg = org.mintOrg(makeAddr("org-holder"), keccak256("did:citrate:org:members"), admin, new bytes32[](0));
         agent.setMemberOrg(memberOrg);
 
         _makeMember(alice, "sub:alice");
@@ -164,7 +164,7 @@ contract AgentSBTMemberMintTest is Test {
     }
 
     function test_setMemberOrg_refusesInactiveOrg() public {
-        uint256 other = org.mintOrg(admin, keccak256("did:citrate:org:other"), admin, new bytes32[](0));
+        uint256 other = org.mintOrg(makeAddr("org-holder"), keccak256("did:citrate:org:other"), admin, new bytes32[](0));
         org.deactivate(other);
         vm.expectRevert(AgentSBT.OrgNotActive.selector);
         agent.setMemberOrg(other);
