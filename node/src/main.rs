@@ -1186,9 +1186,10 @@ fn at_rest_encryption_from_env() -> Result<Option<EncryptionAtRestConfig>> {
 async fn start_node(config: NodeConfig) -> Result<()> {
     info!("Starting Citrate node...");
     // HUP-S7.2: the agent precompile fork height, published before any
-    // execution component is built. Default: not activated. On a release
-    // network only the release pin sets it; a disagreeing env or config value
-    // aborts start-up instead of forking this node at the height.
+    // execution component is built. 40204 pins it at genesis (active from
+    // block 1); other chains are off unless env or config sets a height. On a
+    // release network only the release pin sets it; a disagreeing env or config
+    // value aborts start-up instead of forking this node at the height.
     let (agent_fork_height, agent_fork_source) = citrate_execution::agent_fork::init_for_chain(
         config.chain.chain_id,
         config.chain.agent_precompiles_height,

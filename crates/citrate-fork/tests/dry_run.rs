@@ -269,8 +269,8 @@ fn a_top_level_call_into_a_precompile_is_traced_too() {
 #[test]
 fn the_agent_precompile_fork_follows_the_configured_height() {
     // HUP-S7.2 x S6.10: on a chain where the agent precompile fork is active, the fork runs the
-    // node's 0x0121 like the node does and marks it real; on 40204 (no height pinned) the
-    // same address is reserved and flagged unavailable.
+    // node's 0x0121 like the node does and marks it real; with the fork off the same address
+    // is reserved and flagged unavailable. 40204 pins the fork at genesis, so it is real there.
     let step = || {
         Plan::from_json(&plan_json(serde_json::json!([
             { "kind": "create", "data": fixture("Payout") },
@@ -290,6 +290,15 @@ fn the_agent_precompile_fork_follows_the_configured_height() {
     assert!(rep.precompiles.unavailable_touched.is_empty());
 
     let rep = run(&step(), ForkState::Empty, &config_at(TODAY)).expect("runs");
+    assert!(rep.semantics.agent_precompiles_active, "40204: active from genesis");
+    assert_eq!(rep.semantics.agent_precompiles_height, Some(0));
+    assert!(rep.precompiles.real.contains(&"0x0121".to_string()));
+    assert_eq!(rep.precompiles.touched[0].coverage, Coverage::Real);
+
+    let mut off = config_at(TODAY);
+    off.chain_id = 31_337;
+    off.agent_fork_height = None;
+    let rep = run(&step(), ForkState::Empty, &off).expect("runs");
     assert!(!rep.semantics.agent_precompiles_active);
     assert_eq!(rep.semantics.agent_precompiles_height, None);
     assert!(!rep.precompiles.real.contains(&"0x0121".to_string()));
