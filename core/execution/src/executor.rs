@@ -2910,7 +2910,28 @@ impl Executor {
             }
         };
 
-        if let Some(code) = code_opt {
+        // D3 (reroll): a top-level call to a code-less address that REVM
+        // registers as a precompile takes the same REVM path as a
+        // contract-internal CALL to it. That set is the CANCUN standard
+        // 0x01–0x09 (0x0a KZG is not built without revm's `c-kzg` feature),
+        // the bridged Citrate families, the agent fork addresses and, once
+        // the hardening is active, the always-failing reserved addresses.
+        // Before this, such a call found no code and returned `0x` without
+        // running the precompile, so `eth_call` and transactions disagreed
+        // with contract code about what lives at those addresses. Gated on
+        // the hardening activation (40204 pins it at genesis on the reroll)
+        // so pre-activation history replays unchanged.
+        let code_len = match &code_opt {
+            Some(code) => Some(code.len()),
+            None if crate::activation::pba_hardening_active(context.block_number)
+                && crate::revm_adapter::is_revm_precompile_at(&to, context.block_number) =>
+            {
+                Some(0)
+            }
+            None => None,
+        };
+
+        if let Some(code_len) = code_len {
             // Route standard EVM calls through REVM for correct CALL/CREATE/DELEGATECALL.
             //
             // Gas and nonce are the executor's on both sides of the activation.
@@ -2921,8 +2942,7 @@ impl Executor {
             let value_semantics = crate::executor::value_semantics_at(context.block_number);
             debug!(
                 "Executing contract at {} with {} bytes of code via REVM",
-                to,
-                code.len()
+                to, code_len
             );
             let available_gas = context.gas_limit.saturating_sub(context.gas_used);
             // WP-Z.2: Pass block context so PREVRANDAO opcode returns real VRF output

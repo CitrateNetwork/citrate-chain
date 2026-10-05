@@ -736,6 +736,23 @@ pub fn register_citrate_precompiles<EXT, DB: Database>(
     });
 }
 
+/// D3 (reroll): whether REVM treats `addr` as a precompile for a block at
+/// `block_number`, from the exact registration every `Evm::builder()` here
+/// uses (the CANCUN spec set plus [`register_citrate_precompiles`] under the
+/// same activations). Building the set rather than listing it keeps the
+/// executor's top-level routing and contract-internal calls from ever
+/// disagreeing on which addresses are precompiles.
+pub fn is_revm_precompile_at(addr: &Address, block_number: u64) -> bool {
+    let hardened = crate::activation::pba_hardening_active(block_number);
+    let agent_fork = crate::agent_fork::agent_precompiles_active(block_number);
+    let mut handler = EvmHandler::<'_, (), revm::db::EmptyDB>::mainnet_with_spec(SpecId::CANCUN);
+    register_citrate_precompiles(&mut handler, hardened, agent_fork);
+    handler
+        .pre_execution
+        .load_precompiles()
+        .contains(&RevmAddress::from_slice(&addr.0))
+}
+
 /// Execute contract creation using revm
 #[allow(clippy::too_many_arguments)]
 pub fn execute_contract_create(
