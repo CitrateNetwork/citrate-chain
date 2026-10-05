@@ -235,9 +235,9 @@ pub fn integer_sqrt_u128(n: u128) -> u128 {
         return 0;
     }
     // Initial estimate: 2^(bits/2) where `bits` is ceil(log2(n)).
-    // n != 0, so `bits` is in 1..=128 and the shift in 1..=64: never overflows.
+    // n != 0, so `bits` is in 1..=128 and the exponent in 1..=64: never overflows.
     let bits = 128u32.saturating_sub(n.leading_zeros());
-    let mut x = 1u128.checked_shl(bits.div_ceil(2)).unwrap_or(u128::MAX);
+    let mut x = 2u128.checked_pow(bits.div_ceil(2)).unwrap_or(u128::MAX);
     // Newton iteration: x_{k+1} = (x_k + n / x_k) / 2.
     // Converges in O(log log n) iterations on this initial value.
     loop {
