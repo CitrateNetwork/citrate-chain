@@ -201,7 +201,7 @@ fn list_accounts(config: &Config) -> Result<()> {
 
     println!("{}", "Accounts:".bold());
 
-    let mut count = 0;
+    let mut count = 0usize;
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
@@ -209,7 +209,7 @@ fn list_accounts(config: &Config) -> Result<()> {
         if path.extension().and_then(|s| s.to_str()) == Some("json") {
             if let Some(filename) = path.file_stem().and_then(|s| s.to_str()) {
                 println!("  • 0x{}", filename);
-                count += 1;
+                count = count.saturating_add(1);
             }
         }
     }
@@ -244,14 +244,22 @@ async fn get_balance(config: &Config, address: &str) -> Result<()> {
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(balance_hex) = result["result"].as_str() {
+    if let Some(balance_hex) = result
+        .get("result")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_str()
+    {
         let balance = u128::from_str_radix(balance_hex.trim_start_matches("0x"), 16)
             .context("Failed to parse balance")?;
 
         println!("Address: {}", format!("0x{}", address).cyan());
         println!("Balance: {} wei", balance);
         println!("         {} ETH", balance as f64 / 1e18);
-    } else if let Some(error) = result["error"].as_object() {
+    } else if let Some(error) = result
+        .get("error")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_object()
+    {
         anyhow::bail!(
             "RPC error: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -272,7 +280,8 @@ fn import_account(config: &Config, private_key: &str, password: Zeroizing<String
         anyhow::bail!("Invalid private key length. Expected 32 bytes for ed25519.");
     }
 
-    let key_array: [u8; 32] = key_bytes.try_into()
+    let key_array: [u8; 32] = key_bytes
+        .try_into()
         .map_err(|_| anyhow::anyhow!("private key must be exactly 32 bytes"))?;
     let signing_key = SigningKey::from_bytes(&key_array);
 
@@ -394,12 +403,10 @@ fn read_import_key(
     let raw = match (key_stdin, key_file, insecure_key_from_arg) {
         (true, _, _) => rpassword::prompt_password("Paste 32-byte hex private key (no echo): ")
             .context("Failed to read private key from stdin")?,
-        (_, Some(path), _) => {
-            std::fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read key file {}", path.display()))?
-                .trim()
-                .to_string()
-        }
+        (_, Some(path), _) => std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read key file {}", path.display()))?
+            .trim()
+            .to_string(),
         (_, _, Some(hex_arg)) => {
             // Loud warning: argv is visible in the OS.
             eprintln!(
@@ -490,10 +497,7 @@ mod tests_k1_6 {
     #[test]
     fn test_k1_6_import_key_file_path() {
         // Write a hex key into a temp file and read it back.
-        let tmp = std::env::temp_dir().join(format!(
-            "k1_6_import_test_{}.key",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("k1_6_import_test_{}.key", std::process::id()));
         let hex_key = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
         std::fs::write(&tmp, format!("0x{}\n", hex_key)).expect("write test key file");
 
@@ -508,12 +512,7 @@ mod tests_k1_6 {
         // The new flags are `--key-stdin`, `--key-file`, and
         // `--insecure-key-from-arg`. Plain `--key` was the L-05
         // finding shape and should no longer be a recognized flag.
-        let result = TestCli::try_parse_from([
-            "test-cli",
-            "import",
-            "--key",
-            "abcd",
-        ]);
+        let result = TestCli::try_parse_from(["test-cli", "import", "--key", "abcd"]);
         assert!(
             result.is_err(),
             "K1.6: legacy `--key` flag must no longer parse. The shape \
@@ -532,12 +531,7 @@ mod tests_k1_6 {
 
     #[test]
     fn test_k1_6_argparse_accepts_key_file_flag() {
-        let result = TestCli::try_parse_from([
-            "test-cli",
-            "import",
-            "--key-file",
-            "/tmp/some.key",
-        ]);
+        let result = TestCli::try_parse_from(["test-cli", "import", "--key-file", "/tmp/some.key"]);
         assert!(result.is_ok(), "K1.6: --key-file must parse");
     }
 
@@ -560,38 +554,23 @@ mod tests_k1_6 {
 
     #[test]
     fn test_k1_6_export_argparse_accepts_out_flag() {
-        let result = TestCli::try_parse_from([
-            "test-cli",
-            "export",
-            "0x1234",
-            "--out",
-            "/tmp/key.txt",
-        ]);
+        let result =
+            TestCli::try_parse_from(["test-cli", "export", "0x1234", "--out", "/tmp/key.txt"]);
         assert!(result.is_ok(), "K1.6: export --out must parse");
     }
 
     #[test]
     fn test_k1_6_export_argparse_accepts_confirm_stdout_flag() {
-        let result = TestCli::try_parse_from([
-            "test-cli",
-            "export",
-            "0x1234",
-            "--confirm-stdout",
-        ]);
-        assert!(
-            result.is_ok(),
-            "K1.6: export --confirm-stdout must parse"
-        );
+        let result = TestCli::try_parse_from(["test-cli", "export", "0x1234", "--confirm-stdout"]);
+        assert!(result.is_ok(), "K1.6: export --confirm-stdout must parse");
     }
 
     #[test]
     #[cfg(unix)]
     fn test_k1_6_write_secret_file_is_0600() {
         use std::os::unix::fs::PermissionsExt;
-        let tmp = std::env::temp_dir().join(format!(
-            "k1_6_secret_perms_{}.key",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("k1_6_secret_perms_{}.key", std::process::id()));
         write_secret_file(&tmp, "deadbeef").expect("write secret file");
         let meta = std::fs::metadata(&tmp).expect("stat tmp file");
         let mode = meta.permissions().mode() & 0o777;
@@ -611,8 +590,8 @@ mod tests_k1_6 {
 /// 2. Otherwise, Keccak256 hash the full 32-byte pubkey, take last 20 bytes
 fn derive_address(pubkey: &[u8; 32]) -> [u8; 20] {
     // Check if embedded EVM address (20 bytes + 12 zeros)
-    let is_evm_address = pubkey[20..].iter().all(|&b| b == 0)
-        && !pubkey[..20].iter().all(|&b| b == 0);
+    let is_evm_address =
+        pubkey[20..].iter().all(|&b| b == 0) && !pubkey[..20].iter().all(|&b| b == 0);
 
     if is_evm_address {
         // Use first 20 bytes directly
@@ -624,10 +603,8 @@ fn derive_address(pubkey: &[u8; 32]) -> [u8; 20] {
     // Full pubkey: Keccak256 hash, take last 20 bytes
     let mut hasher = Keccak256::new();
     hasher.update(pubkey);
-    let hash = hasher.finalize();
-
-    let mut address = [0u8; 20];
-    address.copy_from_slice(&hash[12..]);
+    let hash: [u8; 32] = hasher.finalize().into();
+    let [_, _, _, _, _, _, _, _, _, _, _, _, address @ ..] = hash;
     address
 }
 

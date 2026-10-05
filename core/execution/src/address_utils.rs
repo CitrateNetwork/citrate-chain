@@ -10,7 +10,6 @@ pub fn normalize_address(input: &PublicKey) -> Address {
     Address::from_public_key(input)
 }
 
-
 /// Convert a hex string (with or without 0x prefix) to Address
 pub fn address_from_hex(hex: &str) -> Result<Address, String> {
     let hex = hex.trim_start_matches("0x").trim_start_matches("0X");

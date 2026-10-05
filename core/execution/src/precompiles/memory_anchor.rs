@@ -107,7 +107,8 @@ pub fn verify_path(
     if index >= size {
         return false;
     }
-    let (mut fnode, mut snode) = (index, size - 1);
+    // index < size, so size >= 1.
+    let (mut fnode, mut snode) = (index, size.saturating_sub(1));
     let mut r = leaf_hash(leaf);
     for p in path {
         if snode == 0 {
@@ -147,51 +148,59 @@ fn h32(b: &[u8]) -> Result<[u8; 32]> {
 /// 0x0121 MEMORY_ANCHOR_VERIFY. See the module docs for the input layout.
 /// **Gas:** `1500 + 150 * path_len`.
 pub fn execute(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
-    if input.len() < FIXED_LEN {
+    let Some((fixed, path_bytes)) = input.split_at_checked(FIXED_LEN) else {
         return Err(anyhow!(
             "MEMORY_ANCHOR_VERIFY: input {} bytes, need at least {FIXED_LEN}",
             input.len()
         ));
-    }
-    let path_len = usize::from(input[FIXED_LEN - 1]);
+    };
+    let path_len = usize::from(fixed.last().copied().unwrap_or_default());
     if path_len > MAX_PATH {
         return Err(anyhow!(
             "MEMORY_ANCHOR_VERIFY: path length {path_len} exceeds {MAX_PATH}"
         ));
     }
-    let expected = FIXED_LEN + 32 * path_len;
-    if input.len() != expected {
+    // path_len <= MAX_PATH, so these cannot saturate.
+    let path_bytes_len = path_len.saturating_mul(32);
+    let expected = FIXED_LEN.saturating_add(path_bytes_len);
+    if path_bytes.len() != path_bytes_len {
         return Err(anyhow!(
             "MEMORY_ANCHOR_VERIFY: input {} bytes, path length {path_len} needs exactly {expected}",
             input.len()
         ));
     }
-    let gas_used = gas_costs::BASE + gas_costs::PER_PATH_ELEMENT * path_len as u64;
+    let gas_used =
+        gas_costs::BASE.saturating_add(gas_costs::PER_PATH_ELEMENT.saturating_mul(path_len as u64));
     if gas_limit < gas_used {
         return Err(anyhow!(
             "Insufficient gas for MEMORY_ANCHOR_VERIFY: need {gas_used}, have {gas_limit}"
         ));
     }
 
-    let v = be_u32(&input[0..4])?;
-    let day = be_u64(&input[4..12])?;
-    let first_seq = be_u64(&input[12..20])?;
-    let last_seq = be_u64(&input[20..28])?;
-    let count = be_u64(&input[28..36])?;
-    let tree_root = h32(&input[36..68])?;
-    let seq = be_u64(&input[68..76])?;
-    let leaf_index = be_u64(&input[76..84])?;
-    let record_hash = h32(&input[84..116])?;
-    let mut path = Vec::with_capacity(path_len);
-    for i in 0..path_len {
-        let start = FIXED_LEN + 32 * i;
-        path.push(h32(&input[start..start + 32])?);
-    }
+    let field = |start: usize, len: usize| -> Result<&[u8]> {
+        start
+            .checked_add(len)
+            .and_then(|end| fixed.get(start..end))
+            .ok_or_else(|| anyhow!("MEMORY_ANCHOR_VERIFY: field at {start}"))
+    };
+    let v = be_u32(field(0, 4)?)?;
+    let day = be_u64(field(4, 8)?)?;
+    let first_seq = be_u64(field(12, 8)?)?;
+    let last_seq = be_u64(field(20, 8)?)?;
+    let count = be_u64(field(28, 8)?)?;
+    let tree_root = h32(field(36, 32)?)?;
+    let seq = be_u64(field(68, 8)?)?;
+    let leaf_index = be_u64(field(76, 8)?)?;
+    let record_hash = h32(field(84, 32)?)?;
+    let path = path_bytes
+        .chunks_exact(32)
+        .map(h32)
+        .collect::<Result<Vec<[u8; 32]>>>()?;
 
     let well_formed = v == BATCH_VERSION
         && count > 0
         && last_seq >= first_seq
-        && last_seq - first_seq == count - 1;
+        && last_seq.checked_sub(first_seq) == count.checked_sub(1);
     let valid = well_formed
         && leaf_index < count
         && first_seq.checked_add(leaf_index) == Some(seq)
@@ -227,7 +236,7 @@ pub fn encode_input(
         .ok()
         .filter(|n| usize::from(*n) <= MAX_PATH)
         .ok_or_else(|| anyhow!("path longer than {MAX_PATH}"))?;
-    let mut out = Vec::with_capacity(FIXED_LEN + 32 * path.len());
+    let mut out = Vec::with_capacity(FIXED_LEN.saturating_add(path.len().saturating_mul(32)));
     out.extend_from_slice(&v.to_be_bytes());
     out.extend_from_slice(&day.to_be_bytes());
     out.extend_from_slice(&first_seq.to_be_bytes());

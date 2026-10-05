@@ -21,8 +21,11 @@ What it checks, all before anything is written (fail closed):
   * no two book names share an address;
   * with --rpc: chain id 40204, block-0 hash == --genesis, every receipt status 1,
     code at every address, owner() of the admin-gated registries == --admin (which
-    must itself have code), AgentSBT.orgContract() == OrganizationSBT, and no
-    replaced pin already holds records (unless --retire-populated).
+    must itself have code), AgentSBT.orgContract() == OrganizationSBT,
+    AgentSBT.memberSbt() == the book's CitrateMemberSBT (which must have code), and
+    no replaced pin already holds records (unless --retire-populated).
+  * the member SBT the script wired into AgentSBT (last field of its returns) is
+    the book's CitrateMemberSBT.
 Writing needs --rpc and --genesis; offline, only --check runs.
 
 Usage (the runbook has the full sequence):
@@ -153,6 +156,7 @@ def _selector(sig: str) -> str:
 
 SEL_OWNER = _selector("owner()")  # 0x8da5cb5b
 SEL_ORG_CONTRACT = _selector("orgContract()")
+SEL_MEMBER_SBT = _selector("memberSbt()")
 SEL_NEXT_TOKEN_ID = _selector("nextTokenId()")
 SEL_TOTAL_SKILLS = _selector("totalSkills()")
 ANCHOR_KINDS = 3  # AnchorRegistry.AnchorKind: PerCapsule, PerApproval, NightlyMerkle
@@ -225,10 +229,11 @@ def parse_broadcast(run: dict) -> dict:
 
 
 def parse_returns(run: dict):
-    """The script's own `Deployed` return (admin + the six projections), or None.
+    """The script's own `Deployed` return (admin, the six projections, member SBT), or None.
 
     forge writes run()'s return value into the broadcast as
-    returns["0"]["value"] = "(admin, adminDeployedHere, org, agent, capsule, anchor, bench, skill)".
+    returns["0"]["value"] =
+      "(admin, adminDeployedHere, org, agent, capsule, anchor, bench, skill, memberSBT)".
     These are the CREATE2 projections the script computed from the bytecode it was
     built with, so they are the reference every pin is checked against.
     """
@@ -240,8 +245,9 @@ def parse_returns(run: dict):
     if not isinstance(value, str) or not (value.startswith("(") and value.endswith(")")):
         raise BookError(f"broadcast returns is not the DeployHupRegistries.Deployed tuple: {ret!r}")
     fields = [f.strip() for f in value[1:-1].split(",")]
-    if len(fields) != 2 + len(RETURN_ORDER) or fields[1] not in ("true", "false"):
-        raise BookError(f"broadcast returns has {len(fields)} fields, expected {2 + len(RETURN_ORDER)}")
+    expected = 2 + len(RETURN_ORDER) + 1
+    if len(fields) != expected or fields[1] not in ("true", "false"):
+        raise BookError(f"broadcast returns has {len(fields)} fields, expected {expected}")
     addrs = [fields[0]] + fields[2:]
     for a in addrs:
         if not ADDR.match(a):
@@ -249,7 +255,16 @@ def parse_returns(run: dict):
     out = {"admin": fields[0].lower()}
     for name, a in zip(RETURN_ORDER, fields[2:]):
         out[name] = a.lower()
+    out["memberSBT"] = fields[-1].lower()
     return out
+
+
+def book_member_sbt(book: dict) -> str:
+    """The book's CitrateMemberSBT: the membership SBT AgentSBT must be wired to."""
+    a = (book.get("contracts") or {}).get("CitrateMemberSBT")
+    if not isinstance(a, str) or not ADDR.match(a) or int(a, 16) == 0:
+        raise BookError("the book has no CitrateMemberSBT; deploy core membership and book it first")
+    return a.lower()
 
 
 # ── RPC ──────────────────────────────────────────────────────────────────────────
@@ -273,7 +288,7 @@ def _word_address(word: str) -> str:
     return "0x" + word[-40:].lower()
 
 
-def verify_live(url: str, genesis: str, admin: str, pins: dict, txs: dict) -> None:
+def verify_live(url: str, genesis: str, admin: str, pins: dict, txs: dict, member_sbt: str) -> None:
     cid = int(rpc(url, "eth_chainId", []), 16)
     if cid != CHAIN_ID:
         raise BookError(f"{url} is chain {cid}, not {CHAIN_ID}")
@@ -296,6 +311,11 @@ def verify_live(url: str, genesis: str, admin: str, pins: dict, txs: dict) -> No
     org = _word_address(rpc(url, "eth_call", [{"to": pins["AgentSBT"], "data": SEL_ORG_CONTRACT}, "latest"]))
     if org != pins["OrganizationSBT"].lower():
         raise BookError(f"AgentSBT.orgContract() is {org}, not OrganizationSBT {pins['OrganizationSBT']}")
+    if rpc(url, "eth_getCode", [member_sbt, "latest"]) in (None, "0x", "0x0"):
+        raise BookError(f"no code on chain at CitrateMemberSBT {member_sbt}")
+    msbt = _word_address(rpc(url, "eth_call", [{"to": pins["AgentSBT"], "data": SEL_MEMBER_SBT}, "latest"]))
+    if msbt != member_sbt.lower():
+        raise BookError(f"AgentSBT.memberSbt() is {msbt}, not the book's CitrateMemberSBT {member_sbt}")
 
 
 def _word_uint(word) -> int:
@@ -409,16 +429,23 @@ def main(argv=None) -> int:
             raise BookError(f"broadcast is for chain {chain}, not {CHAIN_ID}")
         book = json.loads(Path(a.book).read_text())
         found = parse_broadcast(run)
+        member_sbt = book_member_sbt(book)
         projected = parse_returns(run)
         if projected is None:
             print("hup-book-update: WARNING: broadcast has no script returns; projection cross-check skipped",
                   file=sys.stderr)
         elif projected["admin"] != a.admin.lower():
             raise BookError(f"--admin {a.admin} is not the admin the script used ({projected['admin']})")
+        elif projected["memberSBT"] != member_sbt:
+            raise BookError(
+                f"the script wired member SBT {projected['memberSBT']}, not the book's CitrateMemberSBT {member_sbt}"
+            )
         pins = resolve_pins(book, found, a.keep_existing, projected)
         out = merged_book(book, pins)
         if a.rpc:
-            verify_live(a.rpc, a.genesis, a.admin, pins, {n: f["tx"] for n, f in found.items() if f["tx"]})
+            verify_live(
+                a.rpc, a.genesis, a.admin, pins, {n: f["tx"] for n, f in found.items() if f["tx"]}, member_sbt
+            )
             stranded = populated_retirements(a.rpc, book, pins)
             for line in stranded:
                 print(f"  populated pin replaced: {line}", file=sys.stderr)

@@ -135,7 +135,7 @@ fn elements(view: &TensorView<'_>) -> Result<Vec<Q16>> {
 }
 
 fn encode_q16(shape: &[u32], data: &[Q16]) -> Result<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(data.len() * 8);
+    let mut bytes = Vec::with_capacity(data.len().saturating_mul(8));
     for q in data {
         bytes.extend_from_slice(&q.0.to_le_bytes());
     }
@@ -185,7 +185,10 @@ pub fn apply(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
     let a = next(input, &mut off, "LORA_APPLY A")?;
     let alpha_v = next(input, &mut off, "LORA_APPLY alpha")?;
     if off != input.len() {
-        return Err(anyhow!("LORA_APPLY: {} trailing bytes", input.len() - off));
+        return Err(anyhow!(
+            "LORA_APPLY: {} trailing bytes",
+            input.len().saturating_sub(off)
+        ));
     }
     let (d, k) = matrix(&w, "LORA_APPLY W")?;
     let (bd, r) = matrix(&b, "LORA_APPLY B")?;
@@ -201,9 +204,20 @@ pub fn apply(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
     let alpha = scalar(&alpha_v, "LORA_APPLY alpha")?;
 
     let (d64, r64, k64) = (u64::from(d), u64::from(r), u64::from(k));
+    // d, k <= DIM_MAX and r <= RANK_MAX (checked above), so the saturating
+    // forms equal the plain products and sum.
     let gas_used = gas_costs::APPLY_BASE
-        + gas_costs::APPLY_PER_MULADD * d64 * r64 * k64
-        + gas_costs::APPLY_PER_ELEMENT * d64 * k64;
+        .saturating_add(
+            gas_costs::APPLY_PER_MULADD
+                .saturating_mul(d64)
+                .saturating_mul(r64)
+                .saturating_mul(k64),
+        )
+        .saturating_add(
+            gas_costs::APPLY_PER_ELEMENT
+                .saturating_mul(d64)
+                .saturating_mul(k64),
+        );
     check_gas(gas_used, gas_limit, "LORA_APPLY")?;
 
     let w_e = elements(&w)?;
@@ -271,17 +285,31 @@ pub fn merge(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
         let alpha = scalar(&alpha_v, "LORA_MERGE alpha")?;
         let weight = scalar(&weight_v, "LORA_MERGE weight")?;
         let (d64, r64, k64) = (u64::from(d), u64::from(r), u64::from(k));
-        gas_used += gas_costs::MERGE_PER_MULADD * d64 * r64 * k64
-            + gas_costs::MERGE_PER_ELEMENT * d64 * k64;
+        // Bounded by the caps checked above; saturating equals the plain sum.
+        gas_used = gas_used
+            .saturating_add(
+                gas_costs::MERGE_PER_MULADD
+                    .saturating_mul(d64)
+                    .saturating_mul(r64)
+                    .saturating_mul(k64),
+            )
+            .saturating_add(
+                gas_costs::MERGE_PER_ELEMENT
+                    .saturating_mul(d64)
+                    .saturating_mul(k64),
+            );
         parts.push((b, a, r, alpha, weight));
     }
     if off != input.len() {
-        return Err(anyhow!("LORA_MERGE: {} trailing bytes", input.len() - off));
+        return Err(anyhow!(
+            "LORA_MERGE: {} trailing bytes",
+            input.len().saturating_sub(off)
+        ));
     }
     let (d, k) = tile.ok_or_else(|| anyhow!("LORA_MERGE: no adapters"))?;
     check_gas(gas_used, gas_limit, "LORA_MERGE")?;
 
-    let mut acc = vec![Q16::ZERO; d as usize * k as usize];
+    let mut acc = vec![Q16::ZERO; (d as usize).saturating_mul(k as usize)];
     for (b, a, r, alpha, weight) in &parts {
         let scaled = scaled_delta(&elements(b)?, &elements(a)?, d, *r, k, *alpha);
         for (slot, s) in acc.iter_mut().zip(scaled.iter()) {

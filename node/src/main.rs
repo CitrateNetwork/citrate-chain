@@ -1,3 +1,17 @@
+// PANIC-S1 G2: production code in this crate may not panic (tests excepted).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use anyhow::Result;
 use citrate_api::{EthSubscriptionServer, RpcConfig, RpcServer};
 use citrate_consensus::crypto;
@@ -66,7 +80,6 @@ mod network_inference;
 mod persistent_dag;
 mod producer;
 mod registry_sync;
-mod sync;
 mod sync_peer;
 
 use citrate_consensus::dag_store::DagStore;
@@ -811,7 +824,7 @@ async fn handle_model_command(command: ModelCommands, data_dir: Option<PathBuf>)
             let model = citrate_consensus::types::RequiredModel::new(
                 citrate_consensus::types::ModelId(format!(
                     "manual-pin-{}",
-                    &cid[..8.min(cid.len())]
+                    cid.get(..8).unwrap_or(&cid)
                 )),
                 cid.clone(),
                 citrate_consensus::types::Hash::new([0u8; 32]), // skip hash verification
@@ -1036,10 +1049,9 @@ fn generate_keypair(use_ed25519: bool) {
         // Ethereum address = last 20 bytes of Keccak256(pubkey_xy)
         // Skip the 0x04 prefix byte
         let mut hasher = Keccak256::new();
-        hasher.update(&pubkey_bytes.as_bytes()[1..]);
-        let hash = hasher.finalize();
-        let mut address = [0u8; 20];
-        address.copy_from_slice(&hash[12..32]);
+        hasher.update(pubkey_bytes.as_bytes().get(1..).unwrap_or_default());
+        let hash: [u8; 32] = hasher.finalize().into();
+        let [_, _, _, _, _, _, _, _, _, _, _, _, address @ ..] = hash;
 
         let private_key_hex = hex::encode(secret_key.to_bytes());
 
@@ -1083,7 +1095,7 @@ fn show_genesis_info() -> Result<()> {
     for model in &genesis.embedded_models {
         let size_bytes = model.size_bytes();
         let size_mb = size_bytes as f64 / (1024.0 * 1024.0);
-        total_embedded_size += size_bytes as u64;
+        total_embedded_size = total_embedded_size.saturating_add(size_bytes as u64);
         println!("  - Model ID: {}", model.model_id);
         println!("    Type: {:?}", model.model_type);
         println!("    Size: {:.2} MB ({} bytes)", size_mb, size_bytes);
@@ -1107,7 +1119,7 @@ fn show_genesis_info() -> Result<()> {
     for pin in &genesis.required_pins {
         let size_mb = pin.size_bytes as f64 / (1024.0 * 1024.0);
         let size_gb = size_mb / 1024.0;
-        total_ipfs_size += pin.size_bytes;
+        total_ipfs_size = total_ipfs_size.saturating_add(pin.size_bytes);
 
         println!("  - Model ID: {}", pin.model_id);
         println!("    IPFS CID: {}", pin.ipfs_cid);
@@ -1174,9 +1186,10 @@ fn at_rest_encryption_from_env() -> Result<Option<EncryptionAtRestConfig>> {
 async fn start_node(config: NodeConfig) -> Result<()> {
     info!("Starting Citrate node...");
     // HUP-S7.2: the agent precompile fork height, published before any
-    // execution component is built. Default: not activated. On a release
-    // network only the release pin sets it; a disagreeing env or config value
-    // aborts start-up instead of forking this node at the height.
+    // execution component is built. 40204 pins it at genesis (active from
+    // block 1); other chains are off unless env or config sets a height. On a
+    // release network only the release pin sets it; a disagreeing env or config
+    // value aborts start-up instead of forking this node at the height.
     let (agent_fork_height, agent_fork_source) = citrate_execution::agent_fork::init_for_chain(
         config.chain.chain_id,
         config.chain.agent_precompiles_height,
@@ -1509,8 +1522,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let mut a = [0u8; 20];
         let s = config.mining.coinbase.trim_start_matches("0x");
         if let Ok(bytes) = hex::decode(s) {
-            if bytes.len() >= 20 {
-                a.copy_from_slice(&bytes[..20]);
+            if let Some(first) = bytes.first_chunk::<20>() {
+                a = *first;
             }
         }
         citrate_execution::types::Address(a)
@@ -1579,15 +1592,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         .state_db()
         .get_storage(&governance_addr, b"PARAM:min_gas_price")
     {
-        if bytes.len() >= 8 {
-            let mut arr = [0u8; 8];
-            arr.copy_from_slice(&bytes[..8]);
-            min_gas_price_override = Some(u64::from_le_bytes(arr));
-        } else if bytes.len() >= 4 {
+        if let Some(arr) = bytes.first_chunk::<8>() {
+            min_gas_price_override = Some(u64::from_le_bytes(*arr));
+        } else if let Some(arr) = bytes.first_chunk::<4>() {
             // support 32-bit little endian as fallback
-            let mut arr = [0u8; 4];
-            arr.copy_from_slice(&bytes[..4]);
-            min_gas_price_override = Some(u32::from_le_bytes(arr) as u64);
+            min_gas_price_override = Some(u32::from_le_bytes(*arr) as u64);
         }
     }
 
@@ -2003,7 +2012,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     .await
                     .is_ok()
                 {
-                    readmitted += 1;
+                    readmitted = readmitted.saturating_add(1);
                 }
             }
             info!(
@@ -2165,7 +2174,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                 return;
                             }
                             Ok(false) => {
-                                aborted += 1;
+                                aborted = aborted.saturating_add(1);
                                 if aborted >= 5 {
                                     warn!(
                                         "canonical recovery: gave up after {} aborted attempts",
@@ -2238,7 +2247,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let local_peer_id = noise_keypair.derive_peer_id();
         info!(
             "Noise identity: {}... (peer_id={})",
-            &noise_keypair.public_key_hex()[..16],
+            noise_keypair.public_key_hex().get(..16).unwrap_or_default(),
             local_peer_id
         );
         // Shared LIVE head advertised in every handshake. Seeded with our current
@@ -2491,20 +2500,20 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     match (&chosen_id, &last_logged_choice) {
                         (Some(now), Some(before)) => tracing::info!(
                             "SYNCPEER switched {} -> {} (applied={} candidates={})",
-                            &before[..14.min(before.len())],
-                            &now[..14.min(now.len())],
+                            before.get(..14).unwrap_or(before),
+                            now.get(..14).unwrap_or(now),
                             applied_height,
                             candidates.len()
                         ),
                         (Some(now), None) => tracing::info!(
                             "SYNCPEER selected {} (applied={} candidates={})",
-                            &now[..14.min(now.len())],
+                            now.get(..14).unwrap_or(now),
                             applied_height,
                             candidates.len()
                         ),
                         (None, Some(before)) => tracing::info!(
                             "SYNCPEER lost source (was {}, applied={} candidates={})",
-                            &before[..14.min(before.len())],
+                            before.get(..14).unwrap_or(before),
                             applied_height,
                             candidates.len()
                         ),
@@ -2529,9 +2538,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         if connected_peers.is_empty() {
                             None
                         } else {
-                            let i = (rotate_idx as usize) % connected_peers.len();
+                            let i = (rotate_idx as usize)
+                                .checked_rem(connected_peers.len())
+                                .unwrap_or(0);
                             rotate_idx = rotate_idx.wrapping_add(1);
-                            Some(connected_peers[i].1.clone())
+                            connected_peers.get(i).map(|p| p.1.clone())
                         }
                     } else {
                         None
@@ -3194,7 +3205,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                         // counts — `AlreadyAdmitted` is a block we
                                         // already had, which is exactly what a peer
                                         // at our own height serves back forever.
-                                        newly_admitted += 1;
+                                        newly_admitted = newly_admitted.saturating_add(1);
                                         if block.header.height > highest_admitted {
                                             highest_admitted = block.header.height;
                                         }
@@ -3321,7 +3332,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                 // separate them.
                                 tracing::info!(
                                     "SYNCSCORE peer={} {:?} new={} anchor={} applied={} gap={} score={}",
-                                    &pid.0[..14.min(pid.0.len())],
+                                    pid.0.get(..14).unwrap_or(&pid.0),
                                     quality,
                                     newly_admitted,
                                     sync_for_rx.last_block_anchor_height(),
@@ -3523,7 +3534,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     stalled_samples = 0;
                     continue;
                 }
-                stalled_samples += 1;
+                stalled_samples = stalled_samples.saturating_add(1);
                 tracing::warn!(
                     "P2P message loop appears stalled: {} inbound messages shed since the last \
                      check while the loop processed none (sample {}/{})",
@@ -3538,7 +3549,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                          cannot serve peers or advance its applied tip. Exiting so the supervisor \
                          restarts it rather than running on as a node that looks healthy and \
                          syncs nothing.",
-                        CHECK_EVERY * STALLED_SAMPLES_BEFORE_FATAL
+                        CHECK_EVERY.saturating_mul(STALLED_SAMPLES_BEFORE_FATAL)
                     );
                     std::process::exit(1);
                 }
@@ -3555,8 +3566,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // Register initial stakeholders
     let coinbase_bytes = hex::decode(&config.mining.coinbase).unwrap_or_else(|_| vec![0; 20]);
     let mut coinbase = [0u8; 32];
-    let copy_len = coinbase_bytes.len().min(32);
-    coinbase[..copy_len].copy_from_slice(&coinbase_bytes[..copy_len]);
+    for (dst, src) in coinbase.iter_mut().zip(coinbase_bytes.iter()) {
+        *dst = *src;
+    }
     let validator_address =
         citrate_execution::types::Address(coinbase[0..20].try_into().unwrap_or([0; 20]));
     let _ =
@@ -3747,8 +3759,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // Parse coinbase address
         let coinbase_bytes = hex::decode(coinbase_str).unwrap_or_else(|_| vec![0; 20]);
         let mut coinbase = [0u8; 32];
-        let copy_len = coinbase_bytes.len().min(32);
-        coinbase[..copy_len].copy_from_slice(&coinbase_bytes[..copy_len]);
+        for (dst, src) in coinbase.iter_mut().zip(coinbase_bytes.iter()) {
+            *dst = *src;
+        }
 
         // WP-11: the block-signing key is a PERSISTED SECRET, not a derivation.
         //
@@ -3782,8 +3795,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             .state_db()
             .get_storage(&governance_addr, b"PARAM:treasury_percentage")
         {
-            if !bytes.is_empty() {
-                _treasury_percentage = bytes[0];
+            if let Some(&first) = bytes.first() {
+                _treasury_percentage = first;
             }
         }
 
@@ -3957,7 +3970,8 @@ fn load_or_generate_noise_keypair(
         citrate_network::NoiseKeypair::from_bytes(&key_bytes)
             .map_err(|e| anyhow::anyhow!("Failed to parse noise key: {}", e))
     } else {
-        let kp = citrate_network::NoiseKeypair::generate();
+        let kp = citrate_network::NoiseKeypair::generate()
+            .map_err(|e| anyhow::anyhow!("Failed to generate noise key: {}", e))?;
         let key_bytes = Zeroizing::new(kp.to_bytes());
         write_secret_file_0600(noise_key_path, &key_bytes)?;
         info!(

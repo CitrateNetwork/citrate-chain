@@ -1,3 +1,19 @@
+// PANIC-S1 G2: production code in this crate may not panic. Every panic class is
+// denied outside tests; a genuine invariant needs an item-level #[allow] with an
+// `// INVARIANT:` comment (enforced by scripts/ci/panic_invariant_tripwire.sh).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 //! `citrate-fork` — the Citrate-aware dry-run fork (HUP-S6.10). See the crate docs.
 //!
 //! ```text
@@ -222,11 +238,12 @@ fn main() -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
+    let rest = argv.get(1..).unwrap_or_default();
     let out = match cmd.as_str() {
         "--version" | "-V" => Ok(format!("citrate-fork {}", env!("CARGO_PKG_VERSION"))),
         "--help" | "-h" => Ok(USAGE.to_string()),
-        "precompiles" => parse_args(&argv[1..]).and_then(cmd_precompiles),
-        "run" => parse_args(&argv[1..]).and_then(cmd_run),
+        "precompiles" => parse_args(rest).and_then(cmd_precompiles),
+        "run" => parse_args(rest).and_then(cmd_run),
         other => Err(e(format!("unknown command: {other}\n{USAGE}"))),
     };
     match out {

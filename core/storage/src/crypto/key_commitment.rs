@@ -9,9 +9,10 @@
 // Innovation: Store key lifecycle events on-chain for verifiable
 // cryptographic audit trails, enabling compliance and forensics.
 
-use sha3::{Sha3_256, Sha3_512, Digest};
-use serde::{Deserialize, Serialize};
+use super::bytes::Reader;
 use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use sha3::{Digest, Sha3_256, Sha3_512};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // Helper for serializing [u8; 64]
@@ -77,12 +78,7 @@ pub struct KeyCommitment {
 
 impl KeyCommitment {
     /// Create a new key commitment
-    pub fn new(
-        key_bytes: &[u8; 32],
-        key_version: u32,
-        purpose: u8,
-        node_id: &[u8; 32],
-    ) -> Self {
+    pub fn new(key_bytes: &[u8; 32], key_version: u32, purpose: u8, node_id: &[u8; 32]) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -147,30 +143,19 @@ impl KeyCommitment {
             return Err(CommitmentError::InvalidFormat);
         }
 
-        let version = bytes[0];
-        let mut kv_buf = [0u8; 4];
-        kv_buf.copy_from_slice(&bytes[1..5]);
-        let key_version = u32::from_be_bytes(kv_buf);
-        let purpose = bytes[5];
-
-        let mut commitment = [0u8; 32];
-        commitment.copy_from_slice(&bytes[6..38]);
-
-        let mut ts_buf = [0u8; 8];
-        ts_buf.copy_from_slice(&bytes[38..46]);
-        let timestamp = u64::from_be_bytes(ts_buf);
-
-        let mut node_id = [0u8; 32];
-        node_id.copy_from_slice(&bytes[46..78]);
-
-        let mut sl_buf = [0u8; 2];
-        sl_buf.copy_from_slice(&bytes[78..80]);
-        let sig_len = u16::from_be_bytes(sl_buf) as usize;
-        let signature = if bytes.len() >= 80 + sig_len {
-            bytes[80..80 + sig_len].to_vec()
-        } else {
-            Vec::new()
-        };
+        // PANIC-S1: read through a bounds-checked cursor so the layout and the
+        // bound can never drift apart again (the bug described above).
+        let mut r = Reader::new(bytes);
+        let bad = || CommitmentError::InvalidFormat;
+        let version = r.u8().ok_or_else(bad)?;
+        let key_version = u32::from_be_bytes(r.array().ok_or_else(bad)?);
+        let purpose = r.u8().ok_or_else(bad)?;
+        let commitment: [u8; 32] = r.array().ok_or_else(bad)?;
+        let timestamp = u64::from_be_bytes(r.array().ok_or_else(bad)?);
+        let node_id: [u8; 32] = r.array().ok_or_else(bad)?;
+        let sig_len = u16::from_be_bytes(r.array().ok_or_else(bad)?) as usize;
+        // A signature shorter than declared is treated as absent (unchanged behavior).
+        let signature = r.slice(sig_len).map(<[u8]>::to_vec).unwrap_or_default();
 
         Ok(Self {
             version,
@@ -235,12 +220,8 @@ impl KeyRotationProof {
             .as_secs();
 
         // Create authorization proof (old key signs the rotation)
-        let authorization_proof = Self::create_authorization(
-            old_key,
-            &old_commitment,
-            &new_commitment,
-            rotated_at,
-        );
+        let authorization_proof =
+            Self::create_authorization(old_key, &old_commitment, &new_commitment, rotated_at);
 
         Self {
             previous_commitment: old_commitment,
@@ -386,7 +367,8 @@ impl KeyLifecycleManager {
         purpose: u8,
         reason: RotationReason,
     ) -> Result<(KeyCommitment, KeyRotationProof), CommitmentError> {
-        let old_commitment = self.current_commitment
+        let old_commitment = self
+            .current_commitment
             .as_ref()
             .ok_or(CommitmentError::NoCurrentKey)?
             .commitment;
@@ -417,17 +399,18 @@ impl KeyLifecycleManager {
         }
 
         // Verify each rotation links properly
-        for window in self.rotation_history.windows(2) {
-            if window[0].new_commitment != window[1].previous_commitment {
-                return false;
+        for pair in self.rotation_history.windows(2) {
+            if let [prev, next] = pair {
+                if prev.new_commitment != next.previous_commitment {
+                    return false;
+                }
             }
         }
 
         // Verify last rotation matches current commitment
-        if let (Some(last_rotation), Some(current)) = (
-            self.rotation_history.last(),
-            &self.current_commitment,
-        ) {
+        if let (Some(last_rotation), Some(current)) =
+            (self.rotation_history.last(), &self.current_commitment)
+        {
             if last_rotation.new_commitment != current.commitment {
                 return false;
             }
@@ -560,7 +543,9 @@ mod tests {
 
         // Rotate to second key
         let key2 = [2u8; 32];
-        let (_, proof) = manager.rotate_key(&key1, &key2, 2, 0x01, RotationReason::Scheduled).unwrap();
+        let (_, proof) = manager
+            .rotate_key(&key1, &key2, 2, 0x01, RotationReason::Scheduled)
+            .unwrap();
 
         assert!(proof.verify_authorization(&key1));
         assert_eq!(manager.get_rotation_history().len(), 1);
@@ -576,7 +561,9 @@ mod tests {
         manager.register_key(&key1, 1, 0x01);
 
         let key2 = [2u8; 32];
-        manager.rotate_key(&key1, &key2, 2, 0x01, RotationReason::PolicyChange).unwrap();
+        manager
+            .rotate_key(&key1, &key2, 2, 0x01, RotationReason::PolicyChange)
+            .unwrap();
 
         let trail = manager.export_audit_trail();
 

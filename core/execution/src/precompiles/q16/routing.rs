@@ -64,6 +64,19 @@
 // Changing it requires a hardfork. Verified by tripwire
 // `check_routing_arch_locked.py` (WP-2.4).
 
+// PANIC-S1 G2: precompile reachable from the REVM bridge; panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
 #![allow(dead_code)] // some helpers exposed for the RM-FL-3 daemon path
 
 use super::ops as q16_ops;
@@ -129,7 +142,12 @@ impl RoutingShape {
         let i = self.input_dim as u64;
         let h = self.hidden_dim as u64;
         let o = self.output_dim as u64;
-        h * i + h + h * h + h + o * h + o
+        h.saturating_mul(i)
+            .saturating_add(h)
+            .saturating_add(h.saturating_mul(h))
+            .saturating_add(h)
+            .saturating_add(o.saturating_mul(h))
+            .saturating_add(o)
     }
 }
 
@@ -184,10 +202,15 @@ impl std::fmt::Display for RoutingError {
         match self {
             RoutingError::InputTooShort => write!(f, "input shorter than 16-byte header"),
             RoutingError::InputTooLarge => write!(f, "input exceeds {MAX_INPUT_BYTES} bytes"),
-            RoutingError::ArchVersionUnregistered => write!(f, "arch_version unregistered (current: {ARCH_VERSION})"),
+            RoutingError::ArchVersionUnregistered => {
+                write!(f, "arch_version unregistered (current: {ARCH_VERSION})")
+            }
             RoutingError::ShapeMismatch => write!(f, "shape mismatch for declared arch_version"),
             RoutingError::DimZero => write!(f, "input/hidden/output dim must be > 0"),
-            RoutingError::LengthMismatch => write!(f, "input length does not match declared (arch_version, shape)"),
+            RoutingError::LengthMismatch => write!(
+                f,
+                "input length does not match declared (arch_version, shape)"
+            ),
         }
     }
 }
@@ -214,10 +237,8 @@ pub fn decode(input: &[u8]) -> Result<RoutingInput, RoutingError> {
         return Err(RoutingError::InputTooLarge);
     }
 
-    let arch_version = u32::from_be_bytes(input[0..4].try_into().expect("4 bytes"));
-    let input_dim = u32::from_be_bytes(input[4..8].try_into().expect("4 bytes"));
-    let hidden_dim = u32::from_be_bytes(input[8..12].try_into().expect("4 bytes"));
-    let output_dim = u32::from_be_bytes(input[12..16].try_into().expect("4 bytes"));
+    let [arch_version, input_dim, hidden_dim, output_dim] =
+        header_words(input).ok_or(RoutingError::InputTooShort)?;
 
     if input_dim == 0 || hidden_dim == 0 || output_dim == 0 {
         return Err(RoutingError::DimZero);
@@ -229,7 +250,11 @@ pub fn decode(input: &[u8]) -> Result<RoutingInput, RoutingError> {
         return Err(RoutingError::ArchVersionUnregistered);
     }
 
-    let shape = RoutingShape { input_dim, hidden_dim, output_dim };
+    let shape = RoutingShape {
+        input_dim,
+        hidden_dim,
+        output_dim,
+    };
 
     // Shape check for the declared version. The registered version
     // requires the canonical shape; future versions plug in here.
@@ -250,12 +275,18 @@ pub fn decode(input: &[u8]) -> Result<RoutingInput, RoutingError> {
     let w2_count = h.checked_mul(h).ok_or_else(lm)?;
     let w3_count = o.checked_mul(h).ok_or_else(lm)?;
     let body_q16_count = i
-        .checked_add(w1_count).ok_or_else(lm)?
-        .checked_add(h).ok_or_else(lm)?           // b1
-        .checked_add(w2_count).ok_or_else(lm)?
-        .checked_add(h).ok_or_else(lm)?           // b2
-        .checked_add(w3_count).ok_or_else(lm)?
-        .checked_add(o).ok_or_else(lm)?;          // b3
+        .checked_add(w1_count)
+        .ok_or_else(lm)?
+        .checked_add(h)
+        .ok_or_else(lm)? // b1
+        .checked_add(w2_count)
+        .ok_or_else(lm)?
+        .checked_add(h)
+        .ok_or_else(lm)? // b2
+        .checked_add(w3_count)
+        .ok_or_else(lm)?
+        .checked_add(o)
+        .ok_or_else(lm)?; // b3
 
     let body_bytes = body_q16_count
         .checked_mul(8)
@@ -270,33 +301,13 @@ pub fn decode(input: &[u8]) -> Result<RoutingInput, RoutingError> {
 
     let mut cursor = HEADER_LEN;
 
-    let input_vec = decode_q16_slice(&input[cursor..cursor + i * 8])
-        .ok_or(RoutingError::LengthMismatch)?;
-    cursor += i * 8;
-
-    let w1 = decode_q16_slice(&input[cursor..cursor + h * i * 8])
-        .ok_or(RoutingError::LengthMismatch)?;
-    cursor += h * i * 8;
-
-    let b1 = decode_q16_slice(&input[cursor..cursor + h * 8])
-        .ok_or(RoutingError::LengthMismatch)?;
-    cursor += h * 8;
-
-    let w2 = decode_q16_slice(&input[cursor..cursor + h * h * 8])
-        .ok_or(RoutingError::LengthMismatch)?;
-    cursor += h * h * 8;
-
-    let b2 = decode_q16_slice(&input[cursor..cursor + h * 8])
-        .ok_or(RoutingError::LengthMismatch)?;
-    cursor += h * 8;
-
-    let w3 = decode_q16_slice(&input[cursor..cursor + o * h * 8])
-        .ok_or(RoutingError::LengthMismatch)?;
-    cursor += o * h * 8;
-
-    let b3 = decode_q16_slice(&input[cursor..cursor + o * 8])
-        .ok_or(RoutingError::LengthMismatch)?;
-    cursor += o * 8;
+    let input_vec = take_q16(input, &mut cursor, i)?;
+    let w1 = take_q16(input, &mut cursor, w1_count)?;
+    let b1 = take_q16(input, &mut cursor, h)?;
+    let w2 = take_q16(input, &mut cursor, w2_count)?;
+    let b2 = take_q16(input, &mut cursor, h)?;
+    let w3 = take_q16(input, &mut cursor, w3_count)?;
+    let b3 = take_q16(input, &mut cursor, o)?;
 
     debug_assert_eq!(cursor, input.len());
 
@@ -313,15 +324,33 @@ pub fn decode(input: &[u8]) -> Result<RoutingInput, RoutingError> {
     })
 }
 
-fn decode_q16_slice(bytes: &[u8]) -> Option<Vec<Q16>> {
-    if !bytes.len().is_multiple_of(8) {
-        return None;
-    }
-    let mut out = Vec::with_capacity(bytes.len() / 8);
-    for chunk in bytes.chunks_exact(8) {
-        out.push(Q16::from_raw(i64::from_be_bytes(chunk.try_into().expect("8 bytes"))));
-    }
-    Some(out)
+/// The four big-endian u32 header words: arch_version, input/hidden/output dims.
+fn header_words(input: &[u8]) -> Option<[u32; 4]> {
+    let header: &[u8; 16] = input.first_chunk::<16>()?;
+    let [a0, a1, a2, a3, b0, b1, b2, b3, c0, c1, c2, c3, d0, d1, d2, d3] = *header;
+    Some([
+        u32::from_be_bytes([a0, a1, a2, a3]),
+        u32::from_be_bytes([b0, b1, b2, b3]),
+        u32::from_be_bytes([c0, c1, c2, c3]),
+        u32::from_be_bytes([d0, d1, d2, d3]),
+    ])
+}
+
+/// Decode the next `count` big-endian Q16 values at `*cursor` and advance it.
+fn take_q16(input: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<Q16>, RoutingError> {
+    let len = count.checked_mul(8).ok_or(RoutingError::LengthMismatch)?;
+    let end = cursor
+        .checked_add(len)
+        .ok_or(RoutingError::LengthMismatch)?;
+    let bytes = input
+        .get(*cursor..end)
+        .ok_or(RoutingError::LengthMismatch)?;
+    *cursor = end;
+    Ok(bytes
+        .chunks_exact(8)
+        .filter_map(|chunk| <[u8; 8]>::try_from(chunk).ok())
+        .map(|b| Q16::from_raw(i64::from_be_bytes(b)))
+        .collect())
 }
 
 /// Encode a `RoutingOutput` into wire-format bytes (16 bytes total).
@@ -340,10 +369,7 @@ pub fn validate(input: &RoutingInput) -> Result<(), RoutingError> {
     if input.arch_version != ARCH_VERSION {
         return Err(RoutingError::ArchVersionUnregistered);
     }
-    if input.shape.input_dim == 0
-        || input.shape.hidden_dim == 0
-        || input.shape.output_dim == 0
-    {
+    if input.shape.input_dim == 0 || input.shape.hidden_dim == 0 || input.shape.output_dim == 0 {
         return Err(RoutingError::DimZero);
     }
     if input.arch_version == ARCH_VERSION && input.shape != RoutingShape::V1 {
@@ -357,13 +383,13 @@ pub fn validate(input: &RoutingInput) -> Result<(), RoutingError> {
     if input.input.len() != i {
         return Err(RoutingError::LengthMismatch);
     }
-    if input.w1.len() != h * i || input.b1.len() != h {
+    if Some(input.w1.len()) != h.checked_mul(i) || input.b1.len() != h {
         return Err(RoutingError::LengthMismatch);
     }
-    if input.w2.len() != h * h || input.b2.len() != h {
+    if Some(input.w2.len()) != h.checked_mul(h) || input.b2.len() != h {
         return Err(RoutingError::LengthMismatch);
     }
-    if input.w3.len() != o * h || input.b3.len() != o {
+    if Some(input.w3.len()) != o.checked_mul(h) || input.b3.len() != o {
         return Err(RoutingError::LengthMismatch);
     }
     Ok(())
@@ -451,11 +477,11 @@ pub fn forward_decoded(input: &RoutingInput) -> RoutingOutput {
 /// guarantees output_dim > 0 via `validate()` so this is unreachable
 /// in production.
 fn argmax(values: &[Q16]) -> (usize, Q16) {
-    if values.is_empty() {
+    let Some(&first) = values.first() else {
         return (0, Q16::ZERO);
-    }
+    };
     let mut best_i = 0usize;
-    let mut best_v = values[0];
+    let mut best_v = first;
     for (i, v) in values.iter().enumerate().skip(1) {
         if v.0 > best_v.0 {
             best_i = i;
@@ -480,7 +506,10 @@ fn argmax(values: &[Q16]) -> (usize, Q16) {
 /// caller can't trick saturating-mul into asking for u64::MAX gas
 /// because the body length check rejects oversize inputs at the
 /// MAX_INPUT_BYTES boundary first.
-pub fn execute(input: &[u8], gas_limit: u64) -> Result<crate::precompiles::PrecompileResult, anyhow::Error> {
+pub fn execute(
+    input: &[u8],
+    gas_limit: u64,
+) -> Result<crate::precompiles::PrecompileResult, anyhow::Error> {
     use crate::precompiles::PrecompileResult;
 
     if gas_limit < GAS_BASE {
@@ -491,10 +520,8 @@ pub fn execute(input: &[u8], gas_limit: u64) -> Result<crate::precompiles::Preco
 
     // Compute params from the header so gas accounting is accurate
     // BEFORE doing the full decode + tensor allocation.
-    let params_hint = if input.len() >= HEADER_LEN {
-        let i = u32::from_be_bytes(input[4..8].try_into().expect("4 bytes")) as u64;
-        let h = u32::from_be_bytes(input[8..12].try_into().expect("4 bytes")) as u64;
-        let o = u32::from_be_bytes(input[12..16].try_into().expect("4 bytes")) as u64;
+    let params_hint = if let Some([_, i, h, o]) = header_words(input) {
+        let (i, h, o) = (i as u64, h as u64, o as u64);
         // Same formula as RoutingShape::params(), but in u64 with
         // saturating arithmetic so a malicious header can't overflow.
         h.saturating_mul(i)
@@ -549,13 +576,13 @@ mod tests {
                 bytes.extend_from_slice(&v.to_be_bytes());
             }
         };
-        push(&mut bytes, i, value);                 // input
-        push(&mut bytes, h * i, value);             // W1
-        push(&mut bytes, h, value);                 // b1
-        push(&mut bytes, h * h, value);             // W2
-        push(&mut bytes, h, value);                 // b2
-        push(&mut bytes, o * h, value);             // W3
-        push(&mut bytes, o, value);                 // b3
+        push(&mut bytes, i, value); // input
+        push(&mut bytes, h * i, value); // W1
+        push(&mut bytes, h, value); // b1
+        push(&mut bytes, h * h, value); // W2
+        push(&mut bytes, h, value); // b2
+        push(&mut bytes, o * h, value); // W3
+        push(&mut bytes, o, value); // b3
 
         bytes
     }
@@ -602,8 +629,16 @@ mod tests {
     fn shape_params_canonical_in_planset_window() {
         // Planset RM-FL-2 window: 100K–500K params.
         let p = RoutingShape::V1.params();
-        assert!(p >= 100_000, "params {} below planset window lower bound", p);
-        assert!(p <= 500_000, "params {} above planset window upper bound", p);
+        assert!(
+            p >= 100_000,
+            "params {} below planset window lower bound",
+            p
+        );
+        assert!(
+            p <= 500_000,
+            "params {} above planset window upper bound",
+            p
+        );
         // Exact: 128*768 + 128 + 128*128 + 128 + 3*128 + 3 = 115,331
         assert_eq!(p, 115_331);
     }
@@ -839,7 +874,11 @@ mod tests {
         let confidence = Q16::from_raw(i64::from_be_bytes(
             bytes[8..16].try_into().expect("8 bytes"),
         ));
-        RoutingOutput { mentor_id, adapter_id, confidence }
+        RoutingOutput {
+            mentor_id,
+            adapter_id,
+            confidence,
+        }
     }
 
     /// Build a canonical-shape input directly via `forward_decoded`
@@ -876,12 +915,14 @@ mod tests {
         assert!(
             out.mentor_id < input.shape.output_dim,
             "mentor_id {} must be < output_dim {}",
-            out.mentor_id, input.shape.output_dim
+            out.mentor_id,
+            input.shape.output_dim
         );
         assert!(
             out.adapter_id < input.shape.output_dim,
             "adapter_id {} must be < output_dim {}",
-            out.adapter_id, input.shape.output_dim
+            out.adapter_id,
+            input.shape.output_dim
         );
         // confidence is a Q16 value in roughly [0, ONE]; with uniform
         // softmax over 3 classes it should be ≈ Q16(0x5555) ≈ 0.333.
@@ -910,7 +951,9 @@ mod tests {
         let max = Q16::MAX;
         let min = Q16::MIN;
         let alternating = |n: usize| {
-            (0..n).map(|k| if k % 2 == 0 { max } else { min }).collect::<Vec<_>>()
+            (0..n)
+                .map(|k| if k % 2 == 0 { max } else { min })
+                .collect::<Vec<_>>()
         };
         let input = RoutingInput {
             arch_version: ARCH_VERSION,
@@ -950,10 +993,7 @@ mod tests {
         bytes[8..12].copy_from_slice(&128u32.to_be_bytes());
         bytes[12..16].copy_from_slice(&3u32.to_be_bytes());
         let result = execute(&bytes, 100_000);
-        assert!(
-            result.is_err(),
-            "execute must reject gas_limit below total"
-        );
+        assert!(result.is_err(), "execute must reject gas_limit below total");
     }
 
     #[test]
@@ -975,11 +1015,14 @@ mod tests {
         bytes[4..8].copy_from_slice(&u32::MAX.to_be_bytes()); // huge input_dim
         bytes[8..12].copy_from_slice(&u32::MAX.to_be_bytes()); // huge hidden_dim
         bytes[12..16].copy_from_slice(&u32::MAX.to_be_bytes()); // huge output_dim
-        // Even with u64::MAX gas_limit, the decode still has to fail
-        // (input.len() < expected_total). The gas pre-charge clamps to
-        // u64::MAX via saturating_mul; the decode then rejects.
+                                                                // Even with u64::MAX gas_limit, the decode still has to fail
+                                                                // (input.len() < expected_total). The gas pre-charge clamps to
+                                                                // u64::MAX via saturating_mul; the decode then rejects.
         let result = execute(&bytes, u64::MAX);
-        assert!(result.is_err(), "malformed-header overflow must error cleanly");
+        assert!(
+            result.is_err(),
+            "malformed-header overflow must error cleanly"
+        );
     }
 
     // ====================================================================
@@ -1025,7 +1068,10 @@ mod tests {
             b3,
         };
         let out = forward_decoded(&input);
-        assert_eq!(out.mentor_id, 1, "argmax should select the slot with the largest logit");
+        assert_eq!(
+            out.mentor_id, 1,
+            "argmax should select the slot with the largest logit"
+        );
         assert_eq!(out.adapter_id, 1, "v1: adapter_id == mentor_id");
     }
 
@@ -1063,7 +1109,9 @@ mod tests {
         // hex-clean approximation: 0xR0_07_1N_6 → 0x_07_F0_07_17).
         let mut state: u64 = 0x_07_F0_07_17_DE_AD_BE_EF_u64;
         let next = |s: &mut u64| -> u64 {
-            *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *s
         };
 
@@ -1133,6 +1181,42 @@ mod tests {
                 confidence: Q16::from_raw(conf_raw),
             };
             proptest::prop_assert_eq!(encode_output(&out).len(), 16);
+        }
+    }
+
+    /// PANIC-S1 G4: each of the six layer lengths is checked on its own.
+    #[test]
+    fn panic_s1_validate_checks_every_layer_length() {
+        let s = RoutingShape::V1;
+        let (i, h, o) = (
+            s.input_dim as usize,
+            s.hidden_dim as usize,
+            s.output_dim as usize,
+        );
+        let good = RoutingInput {
+            arch_version: ARCH_VERSION,
+            shape: s,
+            input: vec![Q16::ZERO; i],
+            w1: vec![Q16::ZERO; h * i],
+            b1: vec![Q16::ZERO; h],
+            w2: vec![Q16::ZERO; h * h],
+            b2: vec![Q16::ZERO; h],
+            w3: vec![Q16::ZERO; o * h],
+            b3: vec![Q16::ZERO; o],
+        };
+        assert_eq!(validate(&good), Ok(()));
+        let fields: [fn(&mut RoutingInput) -> &mut Vec<Q16>; 6] = [
+            |x| &mut x.w1,
+            |x| &mut x.b1,
+            |x| &mut x.w2,
+            |x| &mut x.b2,
+            |x| &mut x.w3,
+            |x| &mut x.b3,
+        ];
+        for field in fields {
+            let mut bad = good.clone();
+            field(&mut bad).pop();
+            assert_eq!(validate(&bad), Err(RoutingError::LengthMismatch));
         }
     }
 }

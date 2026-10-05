@@ -24,7 +24,7 @@ fork runs the same EVM configuration the node builds:
 |---|---|
 | Citrate precompiles | `revm_adapter::register_citrate_precompiles` (the node's bridge, not a copy) |
 | PBA hardening flag | the release pin for the chain id (`citrate_consensus::hardening::PINNED_ACTIVATIONS`) |
-| Agent precompile fork flag (0x0112, 0x0113, 0x0121, 0x0122; HUP-S7.2) | the node's own rule (`agent_fork::resolve`): the release pin on 40204 (not scheduled, so off), otherwise `--agent-precompiles-height`, then `CITRATE_AGENT_PRECOMPILES_HEIGHT`, then off. The four addresses are Real only at or above the height |
+| Agent precompile fork flag (0x0112, 0x0113, 0x0121, 0x0122; HUP-S7.2) | the node's own rule (`agent_fork::resolve`): the release pin on 40204 (height 0: active from genesis of the 2026-10-05 reroll), otherwise `--agent-precompiles-height`, then `CITRATE_AGENT_PRECOMPILES_HEIGHT`, then off. The four addresses are Real only at or above the height |
 | Value transfers made by contracts | `executor::value_semantics_at` (REVM-authoritative on 40204) |
 | Contract nonces (EIP-161) | `executor::persist_contract_nonces_at` |
 | EVM spec, chain id, GASPRICE | CANCUN, the endpoint's chain id, gas price 0 inside the EVM (the executor charges gas outside REVM) |
@@ -43,7 +43,8 @@ simulated wrongly.
 | 0x0108 | Real, and it fails closed like the default 40204 node build (no `halo2-verifier`) |
 | 0x0130 at or above the hardening height | Unavailable unless this crate is built with `--features commd-fold-verify` (the 40204 node links the live verifier) |
 | 0x0100-0x0106 inference family | Unavailable: it needs the hosted model runtime, which contract code cannot reach on 40204 either |
-| 0x0112-0x013F, 0x0203-0x0209 | Unavailable: reserved, unassigned |
+| 0x0112, 0x0113, 0x0121, 0x0122 at or above the agent precompile fork height (40204: from genesis) | Real: the node's own implementation |
+| The rest of 0x0112-0x013F, and 0x0203-0x0209 | Unavailable: reserved, unassigned |
 | 0x1000 model, 0x1002 artifact, 0x1003 governance | Unavailable: the node handles these only as the destination of a top-level transaction |
 
 Unavailable never means simulated as success. The fork executes what the node would execute

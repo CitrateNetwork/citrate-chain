@@ -1350,7 +1350,6 @@ dependencies = [
  "async-trait",
  "citrate-learning",
  "citrate-learning-daemon",
- "citrate-primitives",
  "csv",
  "futures",
  "proptest",
@@ -1616,10 +1615,6 @@ dependencies = [
  "tracing-subscriber 0.3.23",
  "zeroize",
 ]
-
-[[package]]
-name = "citrate-primitives"
-version = "0.4.0"
 
 [[package]]
 name = "citrate-security"

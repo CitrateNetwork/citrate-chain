@@ -5,15 +5,16 @@
 // without re-encrypting existing data. The envelope wraps encrypted data
 // with metadata about the encryption scheme used.
 
+use super::bytes::{Reader, Writer};
+use super::key_derivation::DerivedKey;
+use super::{QSSP_MAGIC, QSSP_VERSION};
 use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
-use sha3::{Sha3_256, Digest};
-use rand::{RngCore, rngs::OsRng};
+use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use super::key_derivation::DerivedKey;
-use super::{QSSP_MAGIC, QSSP_VERSION};
+use sha3::{Digest, Sha3_256};
 
 /// Envelope version for crypto-agility
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,6 +59,10 @@ pub struct EnvelopeHeader {
     pub key_commitment: [u8; 16],
 }
 
+// The header's field widths (magic, version, key_version, algorithm, kdf_method,
+// cf hash, encrypted_at, key commitment) must sum to SIZE: checked at compile time.
+const _: () = assert!(4 + 1 + 4 + 1 + 1 + 8 + 8 + 16 == EnvelopeHeader::SIZE);
+
 impl EnvelopeHeader {
     /// Size of the serialized header in bytes
     pub const SIZE: usize = 4 + 1 + 4 + 1 + 1 + 8 + 8 + 16; // 43 bytes
@@ -85,7 +90,7 @@ impl EnvelopeHeader {
             magic: QSSP_MAGIC,
             version: QSSP_VERSION,
             key_version: key.version,
-            algorithm: 0x01, // AES-256-GCM
+            algorithm: 0x01,  // AES-256-GCM
             kdf_method: 0x02, // HKDF-SHA3
             column_family_hash: cf_hash,
             encrypted_at: now,
@@ -96,31 +101,17 @@ impl EnvelopeHeader {
     /// Serialize header to bytes
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
         let mut bytes = [0u8; Self::SIZE];
-        let mut offset = 0;
-
-        bytes[offset..offset + 4].copy_from_slice(&self.magic);
-        offset += 4;
-
-        bytes[offset] = self.version;
-        offset += 1;
-
-        bytes[offset..offset + 4].copy_from_slice(&self.key_version.to_be_bytes());
-        offset += 4;
-
-        bytes[offset] = self.algorithm;
-        offset += 1;
-
-        bytes[offset] = self.kdf_method;
-        offset += 1;
-
-        bytes[offset..offset + 8].copy_from_slice(&self.column_family_hash);
-        offset += 8;
-
-        bytes[offset..offset + 8].copy_from_slice(&self.encrypted_at.to_be_bytes());
-        offset += 8;
-
-        bytes[offset..offset + 16].copy_from_slice(&self.key_commitment);
-
+        let mut w = Writer::new(&mut bytes);
+        w.put(&self.magic);
+        w.put(&[self.version]);
+        w.put(&self.key_version.to_be_bytes());
+        w.put(&[self.algorithm]);
+        w.put(&[self.kdf_method]);
+        w.put(&self.column_family_hash);
+        w.put(&self.encrypted_at.to_be_bytes());
+        w.put(&self.key_commitment);
+        // Field widths sum to SIZE (compile-time assertion above), so this holds.
+        debug_assert!(w.finish());
         bytes
     }
 
@@ -129,34 +120,25 @@ impl EnvelopeHeader {
         if bytes.len() < Self::SIZE {
             return Err(EnvelopeError::InvalidHeaderSize);
         }
+        let mut r = Reader::new(bytes);
+        let short = || EnvelopeError::InvalidHeaderSize;
 
-        let mut magic = [0u8; 4];
-        magic.copy_from_slice(&bytes[0..4]);
-
+        let magic: [u8; 4] = r.array().ok_or_else(short)?;
         if magic != QSSP_MAGIC {
             return Err(EnvelopeError::InvalidMagic);
         }
 
-        let version = bytes[4];
+        let version = r.u8().ok_or_else(short)?;
         if version != QSSP_VERSION {
             return Err(EnvelopeError::UnsupportedVersion(version));
         }
 
-        let mut kv_buf = [0u8; 4];
-        kv_buf.copy_from_slice(&bytes[5..9]);
-        let key_version = u32::from_be_bytes(kv_buf);
-        let algorithm = bytes[9];
-        let kdf_method = bytes[10];
-
-        let mut column_family_hash = [0u8; 8];
-        column_family_hash.copy_from_slice(&bytes[11..19]);
-
-        let mut ea_buf = [0u8; 8];
-        ea_buf.copy_from_slice(&bytes[19..27]);
-        let encrypted_at = u64::from_be_bytes(ea_buf);
-
-        let mut key_commitment = [0u8; 16];
-        key_commitment.copy_from_slice(&bytes[27..43]);
+        let key_version = u32::from_be_bytes(r.array().ok_or_else(short)?);
+        let algorithm = r.u8().ok_or_else(short)?;
+        let kdf_method = r.u8().ok_or_else(short)?;
+        let column_family_hash: [u8; 8] = r.array().ok_or_else(short)?;
+        let encrypted_at = u64::from_be_bytes(r.array().ok_or_else(short)?);
+        let key_commitment: [u8; 16] = r.array().ok_or_else(short)?;
 
         Ok(Self {
             magic,
@@ -255,7 +237,7 @@ impl EncryptionEnvelope {
     pub fn to_bytes(&self) -> Vec<u8> {
         let header_bytes = self.header.to_bytes();
         let mut result = Vec::with_capacity(
-            EnvelopeHeader::SIZE + 12 + 4 + self.ciphertext.len()
+            (EnvelopeHeader::SIZE + 12 + 4).saturating_add(self.ciphertext.len()),
         );
 
         result.extend_from_slice(&header_bytes);
@@ -268,26 +250,17 @@ impl EncryptionEnvelope {
 
     /// Parse envelope from bytes
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, EnvelopeError> {
+        let short = || EnvelopeError::InvalidEnvelopeSize;
         if bytes.len() < EnvelopeHeader::SIZE + 12 + 4 {
-            return Err(EnvelopeError::InvalidEnvelopeSize);
+            return Err(short());
         }
+        let mut r = Reader::new(bytes);
 
-        let header = EnvelopeHeader::from_bytes(&bytes[0..EnvelopeHeader::SIZE])?;
-
-        let mut nonce = [0u8; 12];
-        nonce.copy_from_slice(&bytes[EnvelopeHeader::SIZE..EnvelopeHeader::SIZE + 12]);
-
-        let ct_len_start = EnvelopeHeader::SIZE + 12;
-        let mut cl_buf = [0u8; 4];
-        cl_buf.copy_from_slice(&bytes[ct_len_start..ct_len_start + 4]);
-        let ct_len = u32::from_be_bytes(cl_buf) as usize;
-
-        let ct_start = ct_len_start + 4;
-        if bytes.len() < ct_start + ct_len {
-            return Err(EnvelopeError::InvalidEnvelopeSize);
-        }
-
-        let ciphertext = bytes[ct_start..ct_start + ct_len].to_vec();
+        let header = EnvelopeHeader::from_bytes(r.slice(EnvelopeHeader::SIZE).ok_or_else(short)?)?;
+        let nonce: [u8; 12] = r.array().ok_or_else(short)?;
+        let ct_len = u32::from_be_bytes(r.array().ok_or_else(short)?) as usize;
+        // A declared length longer than what is stored is a truncated/corrupt record.
+        let ciphertext = r.slice(ct_len).ok_or_else(short)?.to_vec();
 
         Ok(Self {
             header,
@@ -361,7 +334,11 @@ impl CryptoAgileEnvelope {
     }
 
     /// Re-encrypt with current key (for key rotation migration)
-    pub fn re_encrypt(&self, ciphertext: &[u8], column_family: &str) -> Result<Vec<u8>, EnvelopeError> {
+    pub fn re_encrypt(
+        &self,
+        ciphertext: &[u8],
+        column_family: &str,
+    ) -> Result<Vec<u8>, EnvelopeError> {
         let plaintext = self.decrypt(ciphertext)?;
         self.encrypt(&plaintext, column_family)
     }
@@ -410,14 +387,15 @@ impl std::error::Error for EnvelopeError {}
 
 #[cfg(test)]
 mod tests {
+    use super::super::key_derivation::{KeyDerivationParams, KeyPurpose, MasterKeyDerivation};
     use super::*;
-    use super::super::key_derivation::{KeyDerivationParams, MasterKeyDerivation, KeyPurpose};
 
     fn test_key() -> DerivedKey {
         let params = KeyDerivationParams::new(None);
         let kdf = MasterKeyDerivation::new(params);
         let master = kdf.derive_master_key(b"test-password").unwrap();
-        kdf.derive_purpose_key(&master, KeyPurpose::BlockEncryption).unwrap()
+        kdf.derive_purpose_key(&master, KeyPurpose::BlockEncryption)
+            .unwrap()
     }
 
     #[test]
@@ -462,7 +440,9 @@ mod tests {
         let kdf = MasterKeyDerivation::new(params);
         let master = kdf.derive_master_key(b"password").unwrap();
 
-        let key1 = kdf.derive_purpose_key(&master, KeyPurpose::BlockEncryption).unwrap();
+        let key1 = kdf
+            .derive_purpose_key(&master, KeyPurpose::BlockEncryption)
+            .unwrap();
         let mut agile = CryptoAgileEnvelope::new(key1);
 
         // Encrypt with first key
@@ -476,7 +456,9 @@ mod tests {
         };
         let new_kdf = MasterKeyDerivation::new(new_params);
         let new_master = new_kdf.derive_master_key(b"password").unwrap();
-        let key2 = new_kdf.derive_purpose_key(&new_master, KeyPurpose::BlockEncryption).unwrap();
+        let key2 = new_kdf
+            .derive_purpose_key(&new_master, KeyPurpose::BlockEncryption)
+            .unwrap();
         agile.rotate_key(key2);
 
         // Encrypt with second key

@@ -53,13 +53,13 @@ pub fn parse_nonzero_word(result_hex: &str) -> Result<bool, String> {
     let h = result_hex
         .strip_prefix("0x")
         .ok_or_else(|| "membership check: malformed eth_call result".to_string())?;
-    if h.len() < 64 {
+    let Some(first_word) = h.get(..64) else {
         return Err(
             "membership check: the membership contract returned no balance (is FAUCET_MEMBER_SBT right?)"
                 .to_string(),
         );
-    }
-    let word = U256::from_str_radix(&h[..64], 16)
+    };
+    let word = U256::from_str_radix(first_word, 16)
         .map_err(|_| "membership check: malformed eth_call result".to_string())?;
     Ok(!word.is_zero())
 }

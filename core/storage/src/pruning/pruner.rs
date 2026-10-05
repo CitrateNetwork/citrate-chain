@@ -100,12 +100,12 @@ impl Pruner {
         let current_height = self.block_store.get_latest_height()?;
 
         if current_height > self.config.keep_blocks {
-            let prune_height = current_height - self.config.keep_blocks;
+            let prune_height = current_height.saturating_sub(self.config.keep_blocks);
             stats.blocks_pruned = self.prune_blocks_before(prune_height).await?;
         }
 
         if current_height > self.config.keep_states {
-            let prune_state_height = current_height - self.config.keep_states;
+            let prune_state_height = current_height.saturating_sub(self.config.keep_states);
             stats.states_pruned = self.prune_states_before(prune_state_height).await?;
         }
 
@@ -117,14 +117,14 @@ impl Pruner {
 
     /// Prune blocks before specified height
     async fn prune_blocks_before(&self, height: u64) -> Result<usize> {
-        let mut pruned = 0;
-        let mut batch_count = 0;
+        let mut pruned: usize = 0;
+        let mut batch_count: usize = 0;
 
         for h in 0..height {
             if let Some(hash) = self.block_store.get_block_by_height(h)? {
                 self.block_store.delete_block(&hash)?;
-                pruned += 1;
-                batch_count += 1;
+                pruned = pruned.saturating_add(1);
+                batch_count = batch_count.saturating_add(1);
 
                 if batch_count >= self.config.batch_size {
                     // Yield to prevent blocking
@@ -146,22 +146,17 @@ impl Pruner {
 
         for (key, _value) in self.db.iter_cf(CF_STATE)? {
             let key_bytes = key.as_ref();
-            if key_bytes.is_empty() {
+            let Some((&prefix, rest)) = key_bytes.split_first() else {
                 continue;
-            }
-
-            let prefix = key_bytes[0];
+            };
             if prefix != b's' && prefix != b'r' {
                 continue;
             }
 
-            if key_bytes.len() < 33 {
+            let Some(hash_bytes) = rest.first_chunk::<32>() else {
                 continue;
-            }
-
-            let mut hash_bytes = [0u8; 32];
-            hash_bytes.copy_from_slice(&key_bytes[1..33]);
-            let block_hash = Hash::new(hash_bytes);
+            };
+            let block_hash = Hash::new(*hash_bytes);
 
             let should_prune = match self.block_store.get_header(&block_hash)? {
                 Some(header) => header.height < height,
@@ -169,10 +164,9 @@ impl Pruner {
             };
 
             if should_prune {
-                self.db
-                    .batch_delete_cf(&mut batch, CF_STATE, key_bytes)?;
-                pruned += 1;
-                batch_count += 1;
+                self.db.batch_delete_cf(&mut batch, CF_STATE, key_bytes)?;
+                pruned = pruned.saturating_add(1);
+                batch_count = batch_count.saturating_add(1);
 
                 if batch_count >= self.config.batch_size {
                     self.db.write_batch(batch)?;
@@ -270,9 +264,7 @@ mod tests {
         let state_store = Arc::new(StateStore::new(db.clone()));
 
         // Seed blocks at heights 0..=4
-        use citrate_consensus::types::{
-            BlockBuilder, Hash,
-        };
+        use citrate_consensus::types::{BlockBuilder, Hash};
         for h in 0..=4u64 {
             let block = BlockBuilder::new()
                 .hash(Hash::new([h as u8; 32]))
@@ -315,5 +307,90 @@ mod tests {
             .get_block(&Hash::new([0; 32]))
             .unwrap()
             .is_none());
+    }
+
+    fn state_key(prefix: u8, hash: &Hash) -> Vec<u8> {
+        let mut k = vec![prefix];
+        k.extend_from_slice(hash.as_bytes());
+        k
+    }
+
+    fn pruner_with_chain(
+        temp_dir: &TempDir,
+        heights: u64,
+        keep_states: u64,
+    ) -> (Arc<RocksDB>, Pruner) {
+        use citrate_consensus::types::{BlockBuilder, PublicKey};
+        let db = Arc::new(RocksDB::open(temp_dir.path()).unwrap());
+        let block_store = Arc::new(BlockStore::new(db.clone()));
+        let state_store = Arc::new(StateStore::new(db.clone()));
+        for h in 1..=heights {
+            let block = BlockBuilder::new()
+                .hash(Hash::new([h as u8; 32]))
+                .parent(Hash::new([0; 32]))
+                .height(h)
+                .timestamp(1_000_000 + h)
+                .blue_score(h)
+                .blue_work(h as u128)
+                .proposer(PublicKey::new([1; 32]))
+                .build_unhashed();
+            block_store.put_block(&block).unwrap();
+        }
+        let config = PruningConfig {
+            keep_blocks: 1_000,
+            keep_states,
+            interval: Duration::from_secs(60),
+            batch_size: 100,
+            auto_prune: false,
+        };
+        (
+            db.clone(),
+            Pruner::new(db, block_store, state_store, config),
+        )
+    }
+
+    /// PANIC-S1 mutation: state snapshots strictly below `tip - keep_states` are
+    /// pruned and counted; the rest survive.
+    #[tokio::test]
+    async fn panic_s1_prune_states_below_window_exactly() {
+        let temp_dir = TempDir::new().unwrap();
+        let (db, pruner) = pruner_with_chain(&temp_dir, 5, 2);
+        for h in 1..=5u8 {
+            db.put_cf(CF_STATE, &state_key(b's', &Hash::new([h; 32])), b"x")
+                .unwrap();
+        }
+
+        // Not a state row ('x' prefix): never touched, even for an old block.
+        let foreign = state_key(b'x', &Hash::new([1; 32]));
+        db.put_cf(CF_STATE, &foreign, b"x").unwrap();
+
+        let stats = pruner.prune().await.unwrap();
+        assert!(db.get_cf(CF_STATE, &foreign).unwrap().is_some());
+        assert_eq!(
+            stats.states_pruned, 2,
+            "heights 1 and 2 are below 5 - 2 = 3"
+        );
+        assert_eq!(stats.blocks_pruned, 0);
+        for h in 1..=5u8 {
+            let present = db
+                .get_cf(CF_STATE, &state_key(b's', &Hash::new([h; 32])))
+                .unwrap()
+                .is_some();
+            assert_eq!(present, h >= 3, "state at height {h}");
+        }
+    }
+
+    /// PANIC-S1 mutation: a chain no taller than the state window prunes nothing,
+    /// not even state rows whose block is unknown.
+    #[tokio::test]
+    async fn panic_s1_prune_skips_states_when_chain_fits_window() {
+        let temp_dir = TempDir::new().unwrap();
+        let (db, pruner) = pruner_with_chain(&temp_dir, 5, 5);
+        let orphan = state_key(b'r', &Hash::new([0xEE; 32]));
+        db.put_cf(CF_STATE, &orphan, b"x").unwrap();
+
+        let stats = pruner.prune().await.unwrap();
+        assert_eq!(stats.states_pruned, 0);
+        assert!(db.get_cf(CF_STATE, &orphan).unwrap().is_some());
     }
 }

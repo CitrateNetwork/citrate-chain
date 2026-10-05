@@ -131,7 +131,7 @@ impl BridgeMetrics {
         if last == 0 {
             return false;
         }
-        now - last < 60
+        now.saturating_sub(last) < 60
     }
 
     /// Generate a Prometheus-compatible metrics snapshot.

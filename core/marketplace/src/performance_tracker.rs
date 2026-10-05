@@ -221,7 +221,9 @@ impl PerformanceTracker {
         entry.push_back(data_point.clone());
 
         // Limit data retention
-        let cutoff_time = Utc::now() - Duration::days(self.config.metrics_retention_days as i64);
+        let cutoff_time = Utc::now()
+            .checked_sub_signed(Duration::days(self.config.metrics_retention_days as i64))
+            .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC);
         while let Some(front) = entry.front() {
             if front.timestamp < cutoff_time {
                 entry.pop_front();
@@ -252,7 +254,9 @@ impl PerformanceTracker {
         benchmarks.push(result.clone());
 
         // Keep only recent benchmarks
-        let cutoff_time = Utc::now() - Duration::days(self.config.metrics_retention_days as i64);
+        let cutoff_time = Utc::now()
+            .checked_sub_signed(Duration::days(self.config.metrics_retention_days as i64))
+            .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC);
         benchmarks.retain(|b| b.timestamp > cutoff_time);
 
         info!(
@@ -347,7 +351,9 @@ impl PerformanceTracker {
     ) -> Result<()> {
         let window_duration = Duration::seconds(config.sampling_interval_seconds as i64);
         let current_time = Utc::now();
-        let window_start = current_time - window_duration;
+        let window_start = current_time
+            .checked_sub_signed(window_duration)
+            .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC);
 
         for entry in real_time_data.iter() {
             let model_id = *entry.key();
@@ -366,7 +372,7 @@ impl PerformanceTracker {
             // Calculate aggregated metrics
             let total_requests = window_points.len() as u64;
             let successful_requests = window_points.iter().filter(|dp| dp.success).count() as u64;
-            let failed_requests = total_requests - successful_requests;
+            let failed_requests = total_requests.saturating_sub(successful_requests);
 
             let latencies: Vec<u64> = window_points.iter().map(|dp| dp.latency_ms).collect();
             let avg_latency_ms = latencies.iter().sum::<u64>() as f32 / latencies.len() as f32;
@@ -406,7 +412,9 @@ impl PerformanceTracker {
             windows.push_back(window.clone());
 
             // Limit window retention
-            let cutoff_time = current_time - Duration::days(config.metrics_retention_days as i64);
+            let cutoff_time = current_time
+            .checked_sub_signed(Duration::days(config.metrics_retention_days as i64))
+            .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC);
             while let Some(front) = windows.front() {
                 if front.start_time < cutoff_time {
                     windows.pop_front();
@@ -427,8 +435,8 @@ impl PerformanceTracker {
             return 0;
         }
 
-        let index = (percentile * (sorted_values.len() - 1) as f64) as usize;
-        sorted_values[index]
+        let index = (percentile * sorted_values.len().saturating_sub(1) as f64) as usize;
+        sorted_values.get(index).or(sorted_values.last()).copied().unwrap_or(0)
     }
 
     async fn update_model_health(
@@ -509,7 +517,7 @@ impl PerformanceTracker {
             alerts.push(PerformanceAlert {
                 model_id: *model_id,
                 alert_type: AlertType::HighLatency,
-                severity: if data_point.latency_ms > self.config.alert_thresholds.high_latency_ms * 2 {
+                severity: if data_point.latency_ms > self.config.alert_thresholds.high_latency_ms.saturating_mul(2) {
                     AlertSeverity::Critical
                 } else {
                     AlertSeverity::Warning
@@ -626,7 +634,7 @@ impl PerformanceTracker {
         let overall_rank = sorted_scores
             .iter()
             .position(|(id, _)| id == model_id)
-            .map(|pos| pos as u32 + 1)
+            .map(|pos| (pos as u32).saturating_add(1))
             .unwrap_or(total_models as u32);
 
         // Calculate market share from request volume
