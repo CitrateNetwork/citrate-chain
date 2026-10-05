@@ -150,12 +150,17 @@ pub const MERGE_DEPTH_ACTIVATION_HEIGHT: u64 = 0;
 /// devnet can activate at a low height; never set it on 40204.
 pub const MERGE_DEPTH_ACTIVATION_ENV: &str = "CITRATE_MERGE_DEPTH_ACTIVATION_HEIGHT";
 
+/// Resolve the MP-DEPTH activation height, honouring the devnet override.
+pub fn merge_depth_activation_height() -> u64 {
+    std::env::var(MERGE_DEPTH_ACTIVATION_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(MERGE_DEPTH_ACTIVATION_HEIGHT)
+}
+
 impl GhostDag {
     pub fn new(params: GhostDagParams, dag_store: Arc<DagStore>) -> Self {
-        let activation = std::env::var(MERGE_DEPTH_ACTIVATION_ENV)
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(MERGE_DEPTH_ACTIVATION_HEIGHT);
+        let activation = merge_depth_activation_height();
         Self {
             params,
             dag_store,

@@ -6,7 +6,7 @@ use citrate_fork::table::Coverage;
 use citrate_fork::{run, ForkState, Plan};
 use common::*;
 
-/// The block the dry runs sit on: above the CREATE-nonce activation (30,000). The 40204
+/// The block the dry runs sit on. The CREATE-nonce rule is active from genesis, and the 40204
 /// reroll pins the PBA hardening at genesis (0), so every 40204 block is hardened.
 const TODAY: u64 = 100_000;
 /// A later block, also hardened.
@@ -204,14 +204,17 @@ fn the_report_mirrors_the_first_step_as_a_receipt() {
         .is_some_and(|r| r.iter().any(|a| a == "0x0110")));
 }
 
+/// The 2026-10 reroll runs the CREATE-nonce rule from genesis, so a block just
+/// after genesis is modelled, not refused as pre-activation.
 #[test]
-fn a_block_below_the_create_nonce_activation_is_refused() {
+fn a_block_just_after_genesis_is_modelled() {
     let plan = Plan::from_json(&plan_json(
         serde_json::json!([{ "kind": "create", "data": fixture("Payout") }]),
     ))
     .expect("plan");
-    let e = run(&plan, ForkState::Empty, &config_at(10)).expect_err("refused");
-    assert!(e.0.contains("CREATE-nonce"), "{e}");
+    let out = run(&plan, ForkState::Empty, &config_at(10)).expect("modelled");
+    let v = serde_json::to_value(&out).expect("json");
+    assert_eq!(v["simulatedBlock"], 11);
 }
 
 #[test]

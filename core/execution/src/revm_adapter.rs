@@ -1269,21 +1269,22 @@ mod tests {
 
     #[test]
     fn create_nonce_fix_activation_boundary() {
-        use crate::executor::{create_nonce_fix_activation_height, persist_contract_nonces_at};
-        let h = create_nonce_fix_activation_height();
-        assert!(
-            h > 0,
-            "must ship as a FUTURE height on the live chain, not 0"
+        use crate::executor::{
+            persist_contract_nonces_at, CREATE_NONCE_FIX_ACTIVATION_ENV,
+            CREATE_NONCE_FIX_ACTIVATION_HEIGHT,
+        };
+        assert_eq!(
+            CREATE_NONCE_FIX_ACTIVATION_HEIGHT, 0,
+            "the 2026-10 reroll genesis runs the EIP-161 contract-nonce rule from block 0"
         );
-        assert!(
-            !persist_contract_nonces_at(h - 1),
-            "below activation → legacy drop"
-        );
-        assert!(persist_contract_nonces_at(h), "at activation → persist");
-        assert!(
-            persist_contract_nonces_at(h + 1),
-            "above activation → persist"
-        );
+        if std::env::var_os(CREATE_NONCE_FIX_ACTIVATION_ENV).is_none() {
+            assert!(persist_contract_nonces_at(0), "genesis → persist");
+            assert!(persist_contract_nonces_at(1), "above genesis → persist");
+            assert!(
+                persist_contract_nonces_at(u64::MAX),
+                "every height → persist"
+            );
+        }
     }
 
     #[test]
