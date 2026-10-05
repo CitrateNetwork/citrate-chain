@@ -1,5 +1,19 @@
 // citrate/core/execution/src/revm_adapter.rs
 
+// PANIC-S1 G2: consensus path (EVM state adapter); panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use crate::mvcc::{JournalHandle, WriteSet};
 use crate::state::StateDB;
 use crate::types::{Address, ExecutionError, Log as CitrateLog};
@@ -14,8 +28,8 @@ use revm::{
         PrecompileResult as RevmPrecompileResult, StatefulPrecompile,
     },
     primitives::{
-        AccountInfo, Address as RevmAddress, Bytecode, Bytes, Env, ExecutionResult,
-        Log as RevmLog, Output, TransactTo, B256, U256 as RevmU256, SpecId, KECCAK_EMPTY,
+        AccountInfo, Address as RevmAddress, Bytecode, Bytes, Env, ExecutionResult, Log as RevmLog,
+        Output, SpecId, TransactTo, B256, KECCAK_EMPTY, U256 as RevmU256,
     },
     ContextPrecompile, Database, DatabaseCommit, Evm,
 };
@@ -265,7 +279,7 @@ impl Database for StateDBAdapter {
         // Check if code_hash is default (all zeros) - if so, use KECCAK_EMPTY
         // This is critical for EIP-3607 check - revm rejects transactions from accounts with code
         let code_hash_b256 = if code_hash.as_bytes().iter().all(|&b| b == 0) {
-            KECCAK_EMPTY  // Proper empty code hash
+            KECCAK_EMPTY // Proper empty code hash
         } else {
             B256::from_slice(code_hash.as_bytes())
         };
@@ -333,10 +347,7 @@ impl Database for StateDBAdapter {
             let mut j = journal.lock();
             j.record_read(addr);
             if let Some(pending) = j.pending_storage(&addr, &key_bytes).map(|v| v.to_vec()) {
-                let mut padded = [0u8; 32];
-                let len = pending.len().min(32);
-                padded[32 - len..].copy_from_slice(&pending[pending.len() - len..]);
-                return Ok(RevmU256::from_be_bytes(padded));
+                return Ok(RevmU256::from_be_bytes(right_align_32(&pending)));
             }
         }
 
@@ -361,12 +372,7 @@ impl Database for StateDBAdapter {
             vec![0u8; 32]
         };
 
-        // Pad to 32 bytes if needed
-        let mut padded = [0u8; 32];
-        let len = value_bytes.len().min(32);
-        padded[32 - len..].copy_from_slice(&value_bytes[value_bytes.len() - len..]);
-
-        Ok(RevmU256::from_be_bytes(padded))
+        Ok(RevmU256::from_be_bytes(right_align_32(&value_bytes)))
     }
 
     fn block_hash(&mut self, number: RevmU256) -> Result<B256, Self::Error> {
@@ -381,7 +387,10 @@ impl Database for StateDBAdapter {
 }
 
 impl DatabaseCommit for StateDBAdapter {
-    fn commit(&mut self, changes: revm::primitives::HashMap<RevmAddress, revm::primitives::Account>) {
+    fn commit(
+        &mut self,
+        changes: revm::primitives::HashMap<RevmAddress, revm::primitives::Account>,
+    ) {
         for (address, account) in changes {
             let addr = Address(address.0 .0);
 
@@ -459,7 +468,8 @@ impl DatabaseCommit for StateDBAdapter {
                         value_bytes.to_vec(),
                     );
                 } else {
-                    self.state_db.set_storage(addr, key_bytes.to_vec(), value_bytes.to_vec());
+                    self.state_db
+                        .set_storage(addr, key_bytes.to_vec(), value_bytes.to_vec());
                 }
             }
 
@@ -516,7 +526,9 @@ impl DatabaseCommit for StateDBAdapter {
 
             debug!(
                 "REVM commit: addr={} storage_slots={} code_changed={}",
-                addr, account.storage.len(), has_code
+                addr,
+                account.storage.len(),
+                has_code
             );
         }
     }
@@ -736,8 +748,18 @@ pub fn execute_contract_create(
     // PIL-48 backward-compat wrapper: drop the logs Vec for the legacy
     // 3-tuple signature used by tests + bench paths.
     execute_contract_create_with_context(
-        state_db, deployer, init_code, value, gas_limit, gas_price,
-        chain_id, block_number, block_timestamp, BlockContext::default(), None, None,
+        state_db,
+        deployer,
+        init_code,
+        value,
+        gas_limit,
+        gas_price,
+        chain_id,
+        block_number,
+        block_timestamp,
+        BlockContext::default(),
+        None,
+        None,
         // Correct semantics by default: this wrapper serves tests and bench
         // paths, which should exercise the rule the chain runs under after
         // activation, not the bug it is leaving behind.
@@ -857,9 +879,9 @@ pub fn execute_contract_create_with_context(
         .build();
 
     // Execute transaction
-    let result = evm.transact_commit().map_err(|e| {
-        ExecutionError::Reverted(format!("revm execution failed: {:?}", e))
-    })?;
+    let result = evm
+        .transact_commit()
+        .map_err(|e| ExecutionError::Reverted(format!("revm execution failed: {:?}", e)))?;
 
     match result {
         ExecutionResult::Success {
@@ -886,11 +908,9 @@ pub fn execute_contract_create_with_context(
 
                     Ok((addr, code, gas_used, citrate_logs))
                 }
-                Output::Create(_, None) => {
-                    Err(ExecutionError::Reverted(
-                        "Contract creation failed: no address returned".to_string(),
-                    ))
-                }
+                Output::Create(_, None) => Err(ExecutionError::Reverted(
+                    "Contract creation failed: no address returned".to_string(),
+                )),
                 _ => Err(ExecutionError::Reverted(
                     "Unexpected output type for contract creation".to_string(),
                 )),
@@ -931,8 +951,19 @@ pub fn execute_contract_call(
     // PIL-48 backward-compat wrapper: drop the logs Vec for the legacy
     // 2-tuple signature used by tests + bench paths.
     execute_contract_call_with_context(
-        state_db, caller, contract, calldata, value, gas_limit, gas_price,
-        chain_id, block_number, block_timestamp, BlockContext::default(), None, None,
+        state_db,
+        caller,
+        contract,
+        calldata,
+        value,
+        gas_limit,
+        gas_price,
+        chain_id,
+        block_number,
+        block_timestamp,
+        BlockContext::default(),
+        None,
+        None,
         // PIL-13b: legacy convenience wrapper used by benches + tests
         // that don't wire a state store. Cold-cache loads are skipped;
         // the call falls back to the in-memory state_db only.
@@ -1066,13 +1097,16 @@ pub fn execute_contract_call_with_context(
         .build();
 
     // Execute transaction
-    let result = evm.transact_commit().map_err(|e| {
-        ExecutionError::Reverted(format!("revm execution failed: {:?}", e))
-    })?;
+    let result = evm
+        .transact_commit()
+        .map_err(|e| ExecutionError::Reverted(format!("revm execution failed: {:?}", e)))?;
 
     match result {
         ExecutionResult::Success {
-            output, gas_used, logs, ..
+            output,
+            gas_used,
+            logs,
+            ..
         } => {
             // PIL-48: forward REVM-emitted logs (correctly-hashed event topics)
             // up to the executor so they land in the receipt and become visible
@@ -1103,6 +1137,19 @@ pub fn execute_contract_call_with_context(
             reason, gas_used
         ))),
     }
+}
+
+/// A storage value as a 32-byte big-endian word: the last (up to) 32 bytes,
+/// right-aligned and zero-padded on the left.
+fn right_align_32(bytes: &[u8]) -> [u8; 32] {
+    let tail = bytes
+        .get(bytes.len().saturating_sub(32)..)
+        .unwrap_or_default();
+    let mut padded = [0u8; 32];
+    if let Some(dst) = padded.get_mut(32usize.saturating_sub(tail.len())..) {
+        dst.copy_from_slice(tail);
+    }
+    padded
 }
 
 #[cfg(test)]
@@ -1156,7 +1203,12 @@ mod tests {
         let code = Bytecode::new_raw(Bytes::from(vec![0x60u8, 0x00, 0x60, 0x00, 0xf3]));
         let code_hash = code.hash_slow();
         let mk = |nonce: u64, code: Option<Bytecode>, code_hash: B256| revm::primitives::Account {
-            info: AccountInfo { balance: RevmU256::ZERO, nonce, code_hash, code },
+            info: AccountInfo {
+                balance: RevmU256::ZERO,
+                nonce,
+                code_hash,
+                code,
+            },
             storage: Default::default(),
             status: revm::primitives::AccountStatus::Touched,
         };
@@ -1177,8 +1229,7 @@ mod tests {
         let state_db = Arc::new(StateDB::new());
         let contract = [0x11u8; 20];
         let eoa = [0x22u8; 20];
-        let mut adapter =
-            StateDBAdapter::new(state_db).with_contract_nonce_persistence(true);
+        let mut adapter = StateDBAdapter::new(state_db).with_contract_nonce_persistence(true);
         adapter.commit(nonce_commit_changes(contract, 2, eoa, 5));
 
         assert_eq!(
@@ -1201,8 +1252,7 @@ mod tests {
         let state_db = Arc::new(StateDB::new());
         let contract = [0x33u8; 20];
         let eoa = [0x44u8; 20];
-        let mut adapter =
-            StateDBAdapter::new(state_db).with_contract_nonce_persistence(false);
+        let mut adapter = StateDBAdapter::new(state_db).with_contract_nonce_persistence(false);
         adapter.commit(nonce_commit_changes(contract, 2, eoa, 5));
 
         assert_eq!(
@@ -1215,14 +1265,21 @@ mod tests {
 
     #[test]
     fn create_nonce_fix_activation_boundary() {
-        use crate::executor::{
-            create_nonce_fix_activation_height, persist_contract_nonces_at,
-        };
+        use crate::executor::{create_nonce_fix_activation_height, persist_contract_nonces_at};
         let h = create_nonce_fix_activation_height();
-        assert!(h > 0, "must ship as a FUTURE height on the live chain, not 0");
-        assert!(!persist_contract_nonces_at(h - 1), "below activation → legacy drop");
+        assert!(
+            h > 0,
+            "must ship as a FUTURE height on the live chain, not 0"
+        );
+        assert!(
+            !persist_contract_nonces_at(h - 1),
+            "below activation → legacy drop"
+        );
         assert!(persist_contract_nonces_at(h), "at activation → persist");
-        assert!(persist_contract_nonces_at(h + 1), "above activation → persist");
+        assert!(
+            persist_contract_nonces_at(h + 1),
+            "above activation → persist"
+        );
     }
 
     #[test]
@@ -1230,7 +1287,9 @@ mod tests {
         // Deploy a minimal contract and verify block context is threaded through.
         let state_db = Arc::new(StateDB::new());
         let deployer = Address([1u8; 20]);
-        state_db.accounts.set_balance(deployer, U256::from(10u64).pow(U256::from(18u64)));
+        state_db
+            .accounts
+            .set_balance(deployer, U256::from(10u64).pow(U256::from(18u64)));
         state_db.accounts.set_nonce(deployer, 0);
 
         let ctx = BlockContext {
@@ -1259,7 +1318,11 @@ mod tests {
         );
 
         // Should succeed (not panic) with custom coinbase/prevrandao
-        assert!(result.is_ok(), "Contract creation with custom block context should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Contract creation with custom block context should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -1267,7 +1330,9 @@ mod tests {
         let state_db = Arc::new(StateDB::new());
         let caller = Address([1u8; 20]);
         let contract = Address([2u8; 20]);
-        state_db.accounts.set_balance(caller, U256::from(10u64).pow(U256::from(18u64)));
+        state_db
+            .accounts
+            .set_balance(caller, U256::from(10u64).pow(U256::from(18u64)));
 
         // Deploy simple contract bytecode (PUSH1 0x42, PUSH1 0x00, MSTORE, PUSH1 0x20, PUSH1 0x00, RETURN)
         let runtime_code = vec![0x60, 0x42, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
@@ -1300,7 +1365,11 @@ mod tests {
             ValueSemantics::RevmAuthoritative,
         );
 
-        assert!(result.is_ok(), "Contract call with block context should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Contract call with block context should succeed: {:?}",
+            result.err()
+        );
     }
 
     /// PIN-P1(d): prove the EVM `block.prevrandao` opcode (0x44) returns the
@@ -1331,10 +1400,9 @@ mod tests {
 
         // A known, non-zero VRF output (stands in for header.vrf_reveal.output).
         let vrf_output: [u8; 32] = [
-            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
-            0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
-            0x0F, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78,
-            0x87, 0x96, 0xA5, 0xB4, 0xC3, 0xD2, 0xE1, 0xF0,
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+            0xFF, 0x00, 0x0F, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78, 0x87, 0x96, 0xA5, 0xB4,
+            0xC3, 0xD2, 0xE1, 0xF0,
         ];
 
         let ctx = BlockContext {
@@ -1369,7 +1437,11 @@ mod tests {
         );
         // Sanity: a real VRF output is non-zero, distinguishing it from the
         // pre-wiring default (all zeros).
-        assert_ne!(output.as_slice(), &[0u8; 32][..], "prevrandao should be non-zero");
+        assert_ne!(
+            output.as_slice(),
+            &[0u8; 32][..],
+            "prevrandao should be non-zero"
+        );
     }
 
     /// PIN-P1(d): a default/zero `BlockContext` (e.g. a header whose
@@ -1434,10 +1506,9 @@ mod tests {
         // path returns, neither this test's assertion nor a naive ASCII check
         // could pass.
         let expected_topic: [u8; 32] = [
-            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
-            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
-            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
-            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE,
+            0xBA, 0xBE, 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD, 0xBE, 0xEF,
+            0xCA, 0xFE, 0xBA, 0xBE,
         ];
 
         // Bytecode: PUSH32 <topic> + PUSH1 0 (length) + PUSH1 0 (offset) +
@@ -1448,8 +1519,8 @@ mod tests {
         runtime_code.extend_from_slice(&[
             0x60, 0x00, // PUSH1 0  (length)
             0x60, 0x00, // PUSH1 0  (offset)
-            0xa1,       // LOG1
-            0x00,       // STOP
+            0xa1, // LOG1
+            0x00, // STOP
         ]);
         state_db.set_code(contract, runtime_code);
 
@@ -1517,18 +1588,27 @@ mod tests {
             1,
             1_000_000,
         );
-        assert!(result1.is_ok(), "First REVM call (SSTORE) should succeed: {:?}", result1.err());
+        assert!(
+            result1.is_ok(),
+            "First REVM call (SSTORE) should succeed: {:?}",
+            result1.err()
+        );
 
         // Verify storage was written
         let slot_key = [0u8; 32];
         let stored = state_db.get_storage(&contract, &slot_key);
-        assert!(stored.is_some(), "Storage slot 0 should have a value after SSTORE");
+        assert!(
+            stored.is_some(),
+            "Storage slot 0 should have a value after SSTORE"
+        );
         let value_bytes = stored.unwrap();
         assert_eq!(value_bytes[31], 0x42, "Storage slot 0 should contain 0x42");
 
         // Second REVM invocation: read slot 0 via SLOAD → PUSH1 0x00 SLOAD → MSTORE → RETURN
         // PUSH1 0x00, SLOAD, PUSH1 0x00, MSTORE, PUSH1 0x20, PUSH1 0x00, RETURN
-        let read_code = vec![0x60, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let read_code = vec![
+            0x60, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+        ];
         state_db.set_code(contract, read_code);
 
         let result2 = execute_contract_call(
@@ -1543,11 +1623,18 @@ mod tests {
             2,
             2_000_000,
         );
-        assert!(result2.is_ok(), "Second REVM call (SLOAD) should succeed: {:?}", result2.err());
+        assert!(
+            result2.is_ok(),
+            "Second REVM call (SLOAD) should succeed: {:?}",
+            result2.err()
+        );
 
         let (output, _gas) = result2.unwrap();
         assert_eq!(output.len(), 32, "SLOAD return should be 32 bytes");
-        assert_eq!(output[31], 0x42, "SLOAD should return 0x42 from persisted storage");
+        assert_eq!(
+            output[31], 0x42,
+            "SLOAD should return 0x42 from persisted storage"
+        );
     }
 
     /// Sprint EL-1 regression: Simulate ReentrancyGuard lifecycle.
@@ -1579,7 +1666,11 @@ mod tests {
         // Verify final value is 1 (NOT_ENTERED)
         let stored = state_db.get_storage(&contract, &slot_key);
         assert!(stored.is_some(), "Storage should exist after commit");
-        assert_eq!(stored.unwrap()[31], 1, "ReentrancyGuard _status should be 1 after lifecycle");
+        assert_eq!(
+            stored.unwrap()[31],
+            1,
+            "ReentrancyGuard _status should be 1 after lifecycle"
+        );
     }
 
     /// Sprint EL-1 regression: Snapshot restore must clear dirty_storage
@@ -1602,7 +1693,10 @@ mod tests {
 
         // Dirty storage should have entries from the failed tx
         let dirty_before = state_db.take_dirty_storage();
-        assert!(!dirty_before.is_empty(), "Should have dirty entries before restore");
+        assert!(
+            !dirty_before.is_empty(),
+            "Should have dirty entries before restore"
+        );
 
         // Re-dirty for the restore test (take_dirty_storage already cleared)
         state_db.set_storage(addr, b"slot_a".to_vec(), b"bad_value2".to_vec());
@@ -1612,7 +1706,10 @@ mod tests {
 
         // After restore, dirty_storage should be empty
         let dirty_after = state_db.take_dirty_storage();
-        assert!(dirty_after.is_empty(), "dirty_storage must be empty after restore (Sprint EL-1 fix)");
+        assert!(
+            dirty_after.is_empty(),
+            "dirty_storage must be empty after restore (Sprint EL-1 fix)"
+        );
 
         // Verify state was restored
         assert_eq!(
@@ -1686,7 +1783,11 @@ mod tests {
             1,
             1_000_000,
         );
-        assert!(result.is_ok(), "CALL-with-value should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "CALL-with-value should succeed: {:?}",
+            result.err()
+        );
 
         assert_eq!(
             state_db.accounts.get_balance(&recipient),
@@ -1792,7 +1893,10 @@ mod tests {
             1,
             1_000_000,
         );
-        assert!(result.is_err(), "the call reverts, so it must report an error");
+        assert!(
+            result.is_err(),
+            "the call reverts, so it must report an error"
+        );
 
         assert_eq!(
             state_db.accounts.get_balance(&recipient),
@@ -1824,8 +1928,7 @@ mod tests {
         state_db.accounts.set_balance(contract, one_eth);
 
         let mut code: Vec<u8> = vec![
-            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00,
-            0x61, 0x03, 0xe8, // value = 1000
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x61, 0x03, 0xe8, // value = 1000
             0x73,
         ];
         code.extend_from_slice(&recipient.0);
@@ -1894,7 +1997,6 @@ mod tests {
         );
     }
 
-
     /// The activation height is a consensus constant: every node must use the
     /// same one or they disagree about state roots. Pinned so a future edit is
     /// a deliberate act with a failing test attached.
@@ -1958,7 +2060,11 @@ mod tests {
             1,
             1_000_000,
         );
-        assert!(result.is_ok(), "nested calls should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "nested calls should succeed: {:?}",
+            result.err()
+        );
 
         assert_eq!(
             state_db.accounts.get_balance(&a),
@@ -1980,5 +2086,18 @@ mod tests {
             one_eth - U256::from(2000u64),
             "caller is down exactly the top-level value"
         );
+    }
+
+    #[test]
+    fn panic_s1_right_align_32_matches_word_semantics() {
+        assert_eq!(right_align_32(&[]), [0u8; 32]);
+        let mut one = [0u8; 32];
+        one[31] = 7;
+        assert_eq!(right_align_32(&[7]), one);
+        let long: Vec<u8> = (0u8..40).collect();
+        let want: [u8; 32] = long[8..].try_into().unwrap();
+        assert_eq!(right_align_32(&long), want);
+        let exact: [u8; 32] = [9; 32];
+        assert_eq!(right_align_32(&exact), exact);
     }
 }

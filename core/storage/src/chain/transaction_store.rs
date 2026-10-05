@@ -148,8 +148,10 @@ impl TransactionStore {
         for (key, _) in self.db.prefix_iter_cf(CF_METADATA, &prefix)? {
             // Ensure the key actually starts with the expected prefix, since
             // RocksDB prefix iterator requires a configured prefix extractor.
-            if key.starts_with(&prefix) && key.len() > prefix.len() {
-                let tx_hash_bytes = &key[prefix.len()..];
+            if let Some(tx_hash_bytes) = key
+                .strip_prefix(prefix.as_slice())
+                .filter(|r| !r.is_empty())
+            {
                 if tx_hash_bytes.len() == 32 {
                     let mut hash_array = [0u8; 32];
                     hash_array.copy_from_slice(tx_hash_bytes);

@@ -90,7 +90,7 @@ pub fn check_method_budget(method_cost: u32) -> Result<(), jsonrpc_core::Error> 
         entry.window_start = now;
     }
 
-    entry.cost_used += method_cost;
+    entry.cost_used = entry.cost_used.saturating_add(method_cost);
     entry.last_access = now;
 
     if entry.cost_used > BUDGET_LIMIT {
@@ -340,7 +340,7 @@ impl RateLimiter {
                 .map(|e| (e.key().clone(), e.value().last_access))
                 .collect();
             entries.sort_by_key(|(_, ts)| *ts);
-            let to_remove = self.buckets.len() - MAX_BUCKETS;
+            let to_remove = self.buckets.len().saturating_sub(MAX_BUCKETS);
             for (key, _) in entries.iter().take(to_remove) {
                 self.buckets.remove(key);
             }
@@ -454,7 +454,7 @@ impl RequestMiddleware for RateLimiter {
         // WP-I.4: Method-based cost is deferred until we can read the body.
         // For middleware, we apply uniform cost=1 here. Method-level budgets
         // are enforced separately via the cost_map in the RPC handler layer.
-        entry.count += 1;
+        entry.count = entry.count.saturating_add(1);
 
         if entry.count > max {
             drop(entry);

@@ -1,3 +1,17 @@
+// PANIC-S1 G2: production code in this crate may not panic (tests excepted).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use axum::{
     extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode},
@@ -128,7 +142,9 @@ impl FaucetResponse {
 /// Map a cooldown denial to (limit, seconds remaining).
 fn denial_parts(d: &cooldowns::CooldownDenial) -> (&'static str, u64) {
     match d {
-        cooldowns::CooldownDenial::AddressCooldown { remaining_secs } => ("address", *remaining_secs),
+        cooldowns::CooldownDenial::AddressCooldown { remaining_secs } => {
+            ("address", *remaining_secs)
+        }
         cooldowns::CooldownDenial::IpCooldown { remaining_secs } => ("ip", *remaining_secs),
     }
 }
@@ -151,9 +167,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting Citrate Faucet Service");
 
     // Configuration from environment
-    let rpc_url = std::env::var("CITRATE_RPC_URL")
-        .unwrap_or_else(|_| "http://localhost:8545".to_string());
-    let api_key = std::env::var("CITRATE_API_KEY").ok().filter(|k| !k.is_empty());
+    let rpc_url =
+        std::env::var("CITRATE_RPC_URL").unwrap_or_else(|_| "http://localhost:8545".to_string());
+    let api_key = std::env::var("CITRATE_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty());
     let chain_id = std::env::var("CITRATE_CHAIN_ID")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -238,7 +256,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|s| !s.is_empty())
         .collect();
     if !address_whitelist.is_empty() {
-        info!("Address whitelist enabled: {} addresses", address_whitelist.len());
+        info!(
+            "Address whitelist enabled: {} addresses",
+            address_whitelist.len()
+        );
     }
 
     // RM-B1 / WP-E6.3 (audit FAU-04): persistent cooldowns. When
@@ -252,9 +273,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::new(Cooldowns::with_file(p, cooldown_policy))
         }
         _ => {
-            info!(
-                "Cooldowns in memory only (set FAUCET_COOLDOWN_FILE=<path> for persistence)"
-            );
+            info!("Cooldowns in memory only (set FAUCET_COOLDOWN_FILE=<path> for persistence)");
             Arc::new(Cooldowns::in_memory(cooldown_policy))
         }
     };
@@ -268,9 +287,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(Arc::new(TurnstileVerifier::new(secret)))
         }
         _ => {
-            warn!(
-                "FAUCET_TURNSTILE_SECRET not set — CAPTCHA verification disabled (DEV ONLY)"
-            );
+            warn!("FAUCET_TURNSTILE_SECRET not set — CAPTCHA verification disabled (DEV ONLY)");
             None
         }
     };
@@ -278,11 +295,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // SECREM-01 FAUCET-2: trusted reverse proxies for forwarding headers.
     let trusted_proxies: HashSet<std::net::IpAddr> = std::env::var("FAUCET_TRUSTED_PROXIES")
         .ok()
-        .map(|s| {
-            s.split(',')
-                .filter_map(|p| p.trim().parse().ok())
-                .collect()
-        })
+        .map(|s| s.split(',').filter_map(|p| p.trim().parse().ok()).collect())
         .unwrap_or_default();
     if trusted_proxies.is_empty() {
         info!(
@@ -293,7 +306,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // HUP-S6.5 / F-5: opt-in limits and the desktop path. Every one is off unless the operator
     // sets it; a malformed value stops the faucet at startup instead of being ignored.
-    let global_cap = GlobalCap::from_env(std::env::var("FAUCET_MAX_DRIPS_PER_HOUR").ok().as_deref())?;
+    let global_cap =
+        GlobalCap::from_env(std::env::var("FAUCET_MAX_DRIPS_PER_HOUR").ok().as_deref())?;
     match &global_cap {
         Some(c) => info!("Global drip cap: {} per hour", c.max()),
         None => info!("Global drip cap off (set FAUCET_MAX_DRIPS_PER_HOUR to enable)"),
@@ -315,10 +329,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (desktop_origins, dropped_desktop) =
         desktop::desktop_origins(std::env::var("FAUCET_DESKTOP_ORIGINS").ok().as_deref());
     for d in &dropped_desktop {
-        warn!("FAUCET_DESKTOP_ORIGINS: ignoring {:?} (not a known desktop-app origin)", d);
+        warn!(
+            "FAUCET_DESKTOP_ORIGINS: ignoring {:?} (not a known desktop-app origin)",
+            d
+        );
     }
     if !desktop_origins.is_empty() {
-        info!("Desktop-app origins allowed: {}", desktop_origins.join(", "));
+        info!(
+            "Desktop-app origins allowed: {}",
+            desktop_origins.join(", ")
+        );
     }
 
     let state = FaucetState {
@@ -340,13 +360,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Build router
-    let app = build_router(state, std::env::var("FAUCET_ALLOWED_ORIGINS").ok().as_deref());
+    let app = build_router(
+        state,
+        std::env::var("FAUCET_ALLOWED_ORIGINS").ok().as_deref(),
+    );
 
     let faucet_port = std::env::var("FAUCET_PORT")
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(3002);
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", faucet_port)).await
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", faucet_port))
+        .await
         .map_err(|e| format!("cannot bind faucet to port {}: {e}", faucet_port))?;
 
     info!("Faucet listening on http://0.0.0.0:{}", faucet_port);
@@ -371,9 +395,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn evm_address_of(key: &k256::ecdsa::SigningKey) -> Address {
     use sha3::{Digest, Keccak256};
     let point = key.verifying_key().to_encoded_point(false);
-    let hash = Keccak256::digest(&point.as_bytes()[1..]);
-    let mut addr = [0u8; 20];
-    addr.copy_from_slice(&hash[12..]);
+    let hash: [u8; 32] = Keccak256::digest(point.as_bytes().get(1..).unwrap_or_default()).into();
+    let [_, _, _, _, _, _, _, _, _, _, _, _, addr @ ..] = hash;
     Address(addr)
 }
 
@@ -410,9 +433,9 @@ fn allowed_origins(raw: Option<&str>) -> Vec<axum::http::HeaderValue> {
 fn is_local_dev_origin(o: &str) -> bool {
     match o.strip_prefix("http://localhost") {
         Some("") => true,
-        Some(rest) => rest
-            .strip_prefix(':')
-            .is_some_and(|port| !port.is_empty() && port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit())),
+        Some(rest) => rest.strip_prefix(':').is_some_and(|port| {
+            !port.is_empty() && port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit())
+        }),
         None => false,
     }
 }
@@ -555,14 +578,13 @@ async fn root(State(state): State<FaucetState>) -> axum::response::Html<String> 
     axum::response::Html(render_page(state.turnstile_site_key.as_deref()))
 }
 
-
-    // Charter register of the citrate-core / app-layer design system
-    // (src/styles/tokens.css + foundation.css): light, civic, document-like.
-    // Tokens inlined with concrete values (no CSS build step). Display +
-    // mono faces (Space Grotesk, Geist Mono) are the two the app self-hosts;
-    // they are served same-origin from /fonts/* so the page matches the app
-    // under the strict faucet CSP (font-src 'self'). Body sans falls back to
-    // the system stack, exactly as citrate-core does (it self-hosts no sans).
+// Charter register of the citrate-core / app-layer design system
+// (src/styles/tokens.css + foundation.css): light, civic, document-like.
+// Tokens inlined with concrete values (no CSS build step). Display +
+// mono faces (Space Grotesk, Geist Mono) are the two the app self-hosts;
+// they are served same-origin from /fonts/* so the page matches the app
+// under the strict faucet CSP (font-src 'self'). Body sans falls back to
+// the system stack, exactly as citrate-core does (it self-hosts no sans).
 const PAGE_HTML: &str = r##"<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -647,9 +669,7 @@ async fn health() -> Json<serde_json::Value> {
 
 /// HUP-S6.5 readiness: could a drip succeed now? 200 when ready, 503 when not, with the reason.
 /// Cached for [`liveness::CACHE_TTL`], so public callers cannot amplify RPC load.
-async fn ready(
-    State(state): State<FaucetState>,
-) -> (StatusCode, Json<liveness::Readiness>) {
+async fn ready(State(state): State<FaucetState>) -> (StatusCode, Json<liveness::Readiness>) {
     let r = match state.readiness.fresh(liveness::CACHE_TTL) {
         Some(r) => r,
         None => {
@@ -758,7 +778,12 @@ async fn font_mono_500() -> impl axum::response::IntoResponse {
 }
 
 /// Return every slot a request reserved (the drip did not reach the chain).
-fn release_slots(state: &FaucetState, recipient_hex: &str, client_ip: &str, cap_taken_at: Option<u64>) {
+fn release_slots(
+    state: &FaucetState,
+    recipient_hex: &str,
+    client_ip: &str,
+    cap_taken_at: Option<u64>,
+) {
     state.cooldowns.release(recipient_hex, client_ip);
     if let (Some(cap), Some(at)) = (state.global_cap.as_ref(), cap_taken_at) {
         cap.give_back(at);
@@ -787,7 +812,10 @@ async fn request_tokens(
 
     // Address whitelist check
     if !state.address_whitelist.is_empty() && !state.address_whitelist.contains(&recipient_hex) {
-        warn!("Faucet request rejected: address {} not in whitelist", recipient_hex);
+        warn!(
+            "Faucet request rejected: address {} not in whitelist",
+            recipient_hex
+        );
         return Ok(Json(FaucetResponse::deny(
             "not_whitelisted",
             "Address not whitelisted for testnet beta",
@@ -913,7 +941,11 @@ async fn request_tokens(
 
     let recipient = Address(recipient_addr);
 
-    info!("Faucet request for address: 0x{} (ip={})", hex::encode(recipient.0), client_ip);
+    info!(
+        "Faucet request for address: 0x{} (ip={})",
+        hex::encode(recipient.0),
+        client_ip
+    );
 
     // Build and sign a real transaction using the faucet's secp256k1 key.
     // This uses eth_sendRawTransaction — no unsigned tx support needed on the node.
@@ -971,14 +1003,12 @@ async fn request_tokens(
         }
     };
 
-    let mut request = client
-        .post(&state.rpc_url)
-        .json(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "eth_sendRawTransaction",
-            "params": [tx_hex],
-            "id": 1
-        }));
+    let mut request = client.post(&state.rpc_url).json(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "eth_sendRawTransaction",
+        "params": [tx_hex],
+        "id": 1
+    }));
 
     if let Some(ref key) = state.api_key {
         request = request.header("X-API-Key", key.as_str());
@@ -1055,7 +1085,7 @@ fn sign_drip_tx(
     // Append a uint as a minimal big-endian byte string (leading zeros stripped).
     fn append_uint(s: &mut rlp::RlpStream, be: &[u8]) {
         let i = be.iter().position(|&b| b != 0).unwrap_or(be.len());
-        s.append(&be[i..].to_vec());
+        s.append(&be.get(i..).unwrap_or_default().to_vec());
     }
 
     let to_vec = to.to_vec(); // 20-byte EVM address
@@ -1081,7 +1111,11 @@ fn sign_drip_tx(
         .map_err(|e| e.to_string())?;
     let r = sig.r().to_bytes();
     let s_ = sig.s().to_bytes();
-    let v = chain_id * 2 + 35 + recid.to_byte() as u64;
+    // chain_id is the faucet's own configured chain; saturation is unreachable for it.
+    let v = chain_id
+        .saturating_mul(2)
+        .saturating_add(35)
+        .saturating_add(u64::from(recid.to_byte()));
 
     // Full tx: rlp([nonce, gasPrice, gasLimit, to, value, data, v, r, s])
     let mut ft = rlp::RlpStream::new_list(9);
@@ -1173,9 +1207,7 @@ fn decode_faucet_key_hex(hex_str: &str) -> Result<[u8; 32], String> {
     let key_array: [u8; 32] = bytes
         .as_slice()
         .get(..32)
-        .ok_or_else(|| {
-            "FAUCET_PRIVATE_KEY must be at least 32 bytes (64 hex chars)".to_string()
-        })?
+        .ok_or_else(|| "FAUCET_PRIVATE_KEY must be at least 32 bytes (64 hex chars)".to_string())?
         .try_into()
         .map_err(|_| "FAUCET_PRIVATE_KEY length conversion failed".to_string())?;
     Ok(key_array)
@@ -1184,13 +1216,19 @@ fn decode_faucet_key_hex(hex_str: &str) -> Result<[u8; 32], String> {
 /// Check cooldown status. Returns Ok(()) if no cooldown active, or Err with
 /// a message containing hours/minutes remaining.
 #[allow(dead_code)]
-fn check_cooldown(last_request_elapsed_secs: Option<u64>, cooldown_secs: u64) -> Result<(), String> {
+fn check_cooldown(
+    last_request_elapsed_secs: Option<u64>,
+    cooldown_secs: u64,
+) -> Result<(), String> {
     if let Some(elapsed) = last_request_elapsed_secs {
         if elapsed < cooldown_secs {
-            let remaining = cooldown_secs - elapsed;
+            let remaining = cooldown_secs.saturating_sub(elapsed);
             let hours = remaining / 3600;
             let minutes = (remaining % 3600) / 60;
-            return Err(format!("Rate limited: {}h {}m remaining before next claim", hours, minutes));
+            return Err(format!(
+                "Rate limited: {}h {}m remaining before next claim",
+                hours, minutes
+            ));
         }
     }
     Ok(())
@@ -1372,10 +1410,22 @@ mod tests {
 
     fn assert_security_headers(h: &reqwest::header::HeaderMap, what: &str) {
         let get = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).map(str::to_string);
-        assert_eq!(get("content-security-policy").as_deref(), Some(FAUCET_CSP), "{what}");
-        assert_eq!(get("x-content-type-options").as_deref(), Some("nosniff"), "{what}");
+        assert_eq!(
+            get("content-security-policy").as_deref(),
+            Some(FAUCET_CSP),
+            "{what}"
+        );
+        assert_eq!(
+            get("x-content-type-options").as_deref(),
+            Some("nosniff"),
+            "{what}"
+        );
         assert_eq!(get("x-frame-options").as_deref(), Some("DENY"), "{what}");
-        assert_eq!(get("referrer-policy").as_deref(), Some("no-referrer"), "{what}");
+        assert_eq!(
+            get("referrer-policy").as_deref(),
+            Some("no-referrer"),
+            "{what}"
+        );
         assert!(get("strict-transport-security").is_some(), "{what}");
     }
 
@@ -1433,7 +1483,10 @@ mod tests {
     #[test]
     fn test_faucet2_xff_honored_from_trusted_proxy() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "198.51.100.7, 10.0.0.1".parse().expect("hv"));
+        headers.insert(
+            "x-forwarded-for",
+            "198.51.100.7, 10.0.0.1".parse().expect("hv"),
+        );
         let peer: SocketAddr = "10.0.0.1:443".parse().expect("addr");
         let trusted: HashSet<std::net::IpAddr> =
             ["10.0.0.1".parse().expect("ip")].into_iter().collect();
@@ -1577,23 +1630,14 @@ mod tests {
 
     // ── HUP-S6.5 / F-5: liveness, structured refusals, opt-in limits, desktop path ──
 
-    async fn post_drip(
-        base: &str,
-        address: &str,
-        xff: Option<&str>,
-    ) -> serde_json::Value {
+    async fn post_drip(base: &str, address: &str, xff: Option<&str>) -> serde_json::Value {
         let mut req = reqwest::Client::new()
             .post(format!("{base}/faucet"))
             .json(&serde_json::json!({ "address": address }));
         if let Some(ip) = xff {
             req = req.header("x-forwarded-for", ip);
         }
-        req.send()
-            .await
-            .expect("post")
-            .json()
-            .await
-            .expect("json")
+        req.send().await.expect("post").json().await.expect("json")
     }
 
     fn addr_of(byte: u8) -> String {
@@ -1603,14 +1647,19 @@ mod tests {
     #[tokio::test]
     async fn s65_health_is_liveness_and_ready_reports_a_dead_rpc() {
         let base = spawn_faucet(None).await;
-        let h = reqwest::get(format!("{base}/health")).await.expect("health");
+        let h = reqwest::get(format!("{base}/health"))
+            .await
+            .expect("health");
         assert_eq!(h.status(), 200);
         let r = reqwest::get(format!("{base}/ready")).await.expect("ready");
         assert_eq!(r.status(), 503);
         let body: serde_json::Value = r.json().await.expect("json");
         assert_eq!(body["ready"], false);
         assert_eq!(body["rpc_reachable"], false);
-        assert!(body["reason"].as_str().unwrap_or("").contains("not answering"));
+        assert!(body["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not answering"));
     }
 
     #[tokio::test]
@@ -1646,7 +1695,10 @@ mod tests {
         let down = post_drip(&base, &addr_of(0x31), None).await;
         assert_eq!(down["code"], "node_unreachable");
         let again = post_drip(&base, &addr_of(0x31), None).await;
-        assert_eq!(again["code"], "node_unreachable", "the slot was returned, not held");
+        assert_eq!(
+            again["code"], "node_unreachable",
+            "the slot was returned, not held"
+        );
     }
 
     #[tokio::test]
@@ -1722,7 +1774,8 @@ mod tests {
         assert!(r.headers().get("access-control-allow-origin").is_none());
 
         let mut st = test_state("http://127.0.0.1:9");
-        let (kept, _) = desktop::desktop_origins(Some("tauri://localhost,https://tauri.localhost.evil"));
+        let (kept, _) =
+            desktop::desktop_origins(Some("tauri://localhost,https://tauri.localhost.evil"));
         st.desktop_origins = Arc::new(kept);
         let on = serve(st, None).await;
         for (origin, allowed) in [
@@ -1763,7 +1816,11 @@ mod tests {
         let html = r.text().await.expect("body");
         assert!(html.contains(r#"data-sitekey="site-key_123""#));
         assert!(html.contains(desktop::TURNSTILE_ORIGIN));
-        assert_eq!(render_page(None), PAGE_HTML, "no site key: the page is unchanged");
+        assert_eq!(
+            render_page(None),
+            PAGE_HTML,
+            "no site key: the page is unchanged"
+        );
         let js = reqwest::get(format!("{base}/faucet.js"))
             .await
             .expect("req")
@@ -1771,7 +1828,10 @@ mod tests {
             .await
             .expect("js");
         assert!(js.contains("cf-turnstile-response"));
-        assert!(js.contains("/^0x[0-9a-fA-F]{40}$/.test(q)"), "address prefill is validated");
+        assert!(
+            js.contains("/^0x[0-9a-fA-F]{40}$/.test(q)"),
+            "address prefill is validated"
+        );
     }
 
     #[tokio::test]
@@ -1860,7 +1920,9 @@ mod tests {
         for _ in 0..100 {
             let ok = reqwest::Client::new()
                 .post(&anvil.url)
-                .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}))
+                .json(
+                    &serde_json::json!({"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}),
+                )
                 .send()
                 .await
                 .is_ok();
@@ -1884,7 +1946,10 @@ mod tests {
         rpc(
             &anvil.url,
             "anvil_setBalance",
-            serde_json::json!([format!("0x{}", hex::encode(st.faucet_address.0)), "0x3635c9adc5dea00000"]),
+            serde_json::json!([
+                format!("0x{}", hex::encode(st.faucet_address.0)),
+                "0x3635c9adc5dea00000"
+            ]),
         )
         .await;
         st
@@ -1931,7 +1996,10 @@ mod tests {
         let ok = post_drip(&base, &a, Some("198.51.100.1")).await;
         assert_eq!(ok["success"], true, "{ok}");
         assert!(ok.get("code").is_none());
-        assert_eq!(mined_balance(&anvil.url, &a, DRIP_AMOUNT).await, DRIP_AMOUNT);
+        assert_eq!(
+            mined_balance(&anvil.url, &a, DRIP_AMOUNT).await,
+            DRIP_AMOUNT
+        );
 
         // 2. Same address again: refused with the next eligible time, nothing sent.
         let again = post_drip(&base, &a, Some("198.51.100.2")).await;
@@ -1952,9 +2020,19 @@ mod tests {
         let member_sbt = addr_of(0x71);
         let non_member_sbt = addr_of(0x72);
         // PUSH1 1 PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN  -> returns uint256(1)
-        rpc(&anvil.url, "anvil_setCode", serde_json::json!([member_sbt, "0x600160005260206000f3"])).await;
+        rpc(
+            &anvil.url,
+            "anvil_setCode",
+            serde_json::json!([member_sbt, "0x600160005260206000f3"]),
+        )
+        .await;
         // PUSH1 32 PUSH1 0 RETURN -> returns uint256(0)
-        rpc(&anvil.url, "anvil_setCode", serde_json::json!([non_member_sbt, "0x60206000f3"])).await;
+        rpc(
+            &anvil.url,
+            "anvil_setCode",
+            serde_json::json!([non_member_sbt, "0x60206000f3"]),
+        )
+        .await;
 
         let mut yes = funded_state(&anvil).await;
         yes.member_sbt = Some(member_sbt);
@@ -1962,7 +2040,10 @@ mod tests {
         let c = addr_of(0x63);
         let member = post_drip(&yes_base, &c, Some("198.51.100.4")).await;
         assert_eq!(member["success"], true, "{member}");
-        assert_eq!(mined_balance(&anvil.url, &c, DRIP_AMOUNT).await, DRIP_AMOUNT);
+        assert_eq!(
+            mined_balance(&anvil.url, &c, DRIP_AMOUNT).await,
+            DRIP_AMOUNT
+        );
 
         let mut no = funded_state(&anvil).await;
         no.member_sbt = Some(non_member_sbt);

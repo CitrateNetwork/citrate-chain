@@ -62,7 +62,9 @@ use halo2curves::ff::Field as _;
 
 use super::chips::{PoseidonChip, PoseidonChipConfig};
 // Reuse the PoRep topology + native sealing + the index-agnostic gadget.
-use super::porep::{drg_parent, merkle_siblings_4, SealedReplica, SwapMerkleConfig, MERKLE_DEPTH, N};
+use super::porep::{
+    drg_parent, merkle_siblings_4, SealedReplica, SwapMerkleConfig, MERKLE_DEPTH, N,
+};
 
 // ---------------------------------------------------------------------------
 // Public-input slot indices — the documented 7-slot PoSt layout (NO CommD).
@@ -294,8 +296,7 @@ impl Circuit<Halo2Fr> for PoStCircuit {
         let layer2_cell = swap.assign_const(&mut layouter, Halo2Fr::from(2u64), "layer=2")?;
 
         // ---- Step 3: layer-L labeling relation (the finding-1.1 core). ----
-        let prev_same1_cell =
-            swap.mux(&mut layouter, &replica_id_cell, &drg1_cell, &has_drg)?;
+        let prev_same1_cell = swap.mux(&mut layouter, &replica_id_cell, &drg1_cell, &has_drg)?;
         let label1_cell = PoseidonChip::hash_n_from_cells(
             &config.poseidon,
             &mut layouter,
@@ -307,8 +308,7 @@ impl Circuit<Halo2Fr> for PoStCircuit {
             ],
         )?;
 
-        let prev_same2_cell =
-            swap.mux(&mut layouter, &replica_id_cell, &drg2_cell, &has_drg)?;
+        let prev_same2_cell = swap.mux(&mut layouter, &replica_id_cell, &drg2_cell, &has_drg)?;
         let label2_cell = PoseidonChip::hash_n_from_cells(
             &config.poseidon,
             &mut layouter,
@@ -330,11 +330,13 @@ impl Circuit<Halo2Fr> for PoStCircuit {
 
         // ---- Step 5: index-agnostic Merkle inclusions R[v*]∈CommR, col∈CommC. ----
         let sib_r = self.assign_siblings(swap, &mut layouter, &self.sib_r, "sib_r")?;
-        let root_r = swap.merkle_root(&config.poseidon, &mut layouter, replica_cell, &bits, &sib_r)?;
+        let root_r =
+            swap.merkle_root(&config.poseidon, &mut layouter, replica_cell, &bits, &sib_r)?;
         layouter.constrain_instance(root_r.cell(), config.instance, pi::COMM_R)?;
 
         let sib_c = self.assign_siblings(swap, &mut layouter, &self.sib_c, "sib_c")?;
-        let root_c = swap.merkle_root(&config.poseidon, &mut layouter, column_cell, &bits, &sib_c)?;
+        let root_c =
+            swap.merkle_root(&config.poseidon, &mut layouter, column_cell, &bits, &sib_c)?;
         layouter.constrain_instance(root_c.cell(), config.instance, pi::COMM_C)?;
 
         // ---- Step 6: PARENT SOUNDNESS — parent column ∈ CommC at v*-1. ----
@@ -606,13 +608,8 @@ mod tests {
         let forged_p2 = sealed.labels[1][0] + Halo2Fr::from(888u64);
 
         // Recompute v*'s labels/column/replica from the forged parents.
-        let l1 = crate::zkp::halo2::porep::label_hash_for_test(
-            sealed.replica_id,
-            1,
-            v,
-            forged_p1,
-            None,
-        );
+        let l1 =
+            crate::zkp::halo2::porep::label_hash_for_test(sealed.replica_id, 1, v, forged_p1, None);
         let l2 = crate::zkp::halo2::porep::label_hash_for_test(
             sealed.replica_id,
             2,

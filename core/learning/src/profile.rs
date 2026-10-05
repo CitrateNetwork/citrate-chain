@@ -122,18 +122,18 @@ impl ProfileComputer {
 
     /// Record that this node observed (produced or validated) a block.
     pub fn record_block(&mut self) {
-        self.blocks_seen += 1;
-        self.blocks_total += 1;
+        self.blocks_seen = self.blocks_seen.saturating_add(1);
+        self.blocks_total = self.blocks_total.saturating_add(1);
     }
 
     /// Record that this node missed a block (was offline or slow).
     pub fn record_missed_block(&mut self) {
-        self.blocks_total += 1;
+        self.blocks_total = self.blocks_total.saturating_add(1);
     }
 
     /// Record that this node created and shared an adapter.
     pub fn record_adapter_created(&mut self) {
-        self.adapters_created += 1;
+        self.adapters_created = self.adapters_created.saturating_add(1);
     }
 
     /// Add a domain to the active set without recording an inference.
@@ -163,7 +163,12 @@ impl ProfileComputer {
         let latency_ms = if self.latencies.is_empty() {
             0
         } else {
-            self.latencies.iter().sum::<u64>() / self.latencies.len() as u64
+            // Saturating sum: an iterator `sum()` overflow panics under overflow-checks.
+            self.latencies
+                .iter()
+                .fold(0u64, |acc, &l| acc.saturating_add(l))
+                .checked_div(self.latencies.len() as u64)
+                .unwrap_or(0)
         };
 
         let uptime = if self.blocks_total == 0 {
@@ -234,7 +239,11 @@ mod tests {
 
         let profile = pc.compute_profile();
         let diff = (profile.accuracy - 0.7).abs();
-        assert!(diff < 1e-9, "Expected accuracy ~0.7, got {}", profile.accuracy);
+        assert!(
+            diff < 1e-9,
+            "Expected accuracy ~0.7, got {}",
+            profile.accuracy
+        );
     }
 
     #[test]
@@ -249,7 +258,11 @@ mod tests {
         pc.record_inference(true, 50, "nlp");
 
         let profile = pc.compute_profile();
-        assert_eq!(profile.latency_ms, 30, "Expected avg latency 30, got {}", profile.latency_ms);
+        assert_eq!(
+            profile.latency_ms, 30,
+            "Expected avg latency 30, got {}",
+            profile.latency_ms
+        );
     }
 
     #[test]
@@ -276,7 +289,10 @@ mod tests {
 
         assert_eq!(profile.accuracy, 0.0, "Empty window should have 0 accuracy");
         assert_eq!(profile.latency_ms, 0, "Empty window should have 0 latency");
-        assert_eq!(profile.uptime, 1.0, "Empty window should default to 1.0 uptime");
+        assert_eq!(
+            profile.uptime, 1.0,
+            "Empty window should default to 1.0 uptime"
+        );
         assert_eq!(profile.adapter_count, 0);
         assert!(profile.domains.is_empty());
     }
@@ -298,8 +314,14 @@ mod tests {
         }
 
         let profile = pc.compute_profile();
-        assert_eq!(profile.accuracy, 1.0, "After eviction, all entries should be correct");
-        assert_eq!(profile.latency_ms, 10, "After eviction, avg latency should be 10");
+        assert_eq!(
+            profile.accuracy, 1.0,
+            "After eviction, all entries should be correct"
+        );
+        assert_eq!(
+            profile.latency_ms, 10,
+            "After eviction, avg latency should be 10"
+        );
         assert_eq!(pc.inference_count(), 5, "Window should be at capacity");
     }
 

@@ -9,26 +9,11 @@ pub mod secure_enclave;
 pub mod shamir;
 
 pub use encryption::{
-    EncryptedModel,
-    ModelEncryption,
-    EncryptionConfig,
-    EncryptionMetadata,
-    EncryptedKey,
-    RecipientPublicKeys,
-    decrypt_model,
-    encrypt_model,
+    decrypt_model, encrypt_model, EncryptedKey, EncryptedModel, EncryptionConfig,
+    EncryptionMetadata, ModelEncryption, RecipientPublicKeys,
 };
 
-pub use key_manager::{
-    KeyManager,
-    DerivedKey,
-    AccessPolicy,
-    KeyPurpose,
-};
+pub use key_manager::{AccessPolicy, DerivedKey, KeyManager, KeyPurpose};
 
 #[cfg(target_os = "macos")]
-pub use secure_enclave::{
-    AppleSecureEnclave,
-    SecureEnclaveInterface,
-    Attestation,
-};
+pub use secure_enclave::{AppleSecureEnclave, Attestation, SecureEnclaveInterface};

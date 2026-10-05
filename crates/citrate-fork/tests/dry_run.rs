@@ -6,10 +6,10 @@ use citrate_fork::table::Coverage;
 use citrate_fork::{run, ForkState, Plan};
 use common::*;
 
-/// The block the dry runs sit on: above the CREATE-nonce activation (30,000), below the
-/// 40204 PBA hardening pin (247,436), like 40204 today.
+/// The block the dry runs sit on: above the CREATE-nonce activation (30,000). The 40204
+/// reroll pins the PBA hardening at genesis (0), so every 40204 block is hardened.
 const TODAY: u64 = 100_000;
-/// A block above the hardening pin.
+/// A later block, also hardened.
 const HARDENED: u64 = 300_000;
 
 fn plan_json(steps: serde_json::Value) -> String {
@@ -76,8 +76,8 @@ fn belnap_runs_the_node_implementation_with_40204_evm_settings() {
         1,
         "touched in the constructor"
     );
-    assert!(!rep.semantics.pba_hardened);
-    assert_eq!(rep.semantics.pba_hardening_height, Some(247_436));
+    assert!(rep.semantics.pba_hardened);
+    assert_eq!(rep.semantics.pba_hardening_height, Some(0));
 }
 
 #[test]
@@ -102,14 +102,14 @@ fn a_bad_precompile_input_fails_the_frame_like_the_node() {
 }
 
 #[test]
-fn an_inference_precompile_is_flagged_unavailable_and_is_silent_below_hardening() {
-    let rep = run(
-        &probe_plan(0x0100, b"hello"),
-        ForkState::Empty,
-        &config_at(TODAY),
-    )
-    .expect("runs");
-    // Below the hardening height 40204 itself answers success with no data here.
+fn an_inference_precompile_is_flagged_unavailable_and_is_silent_without_hardening() {
+    // A chain without the hardening pin (`--pba-hardening-height off`, e.g. a devnet) answers
+    // success with no data here. 40204 is hardened from its genesis (see the next test).
+    let mut cfg = config_at(TODAY);
+    cfg.hardening_height = None;
+    cfg.hardening_source = "off".into();
+    let rep = run(&probe_plan(0x0100, b"hello"), ForkState::Empty, &cfg).expect("runs");
+    assert!(!rep.semantics.pba_hardened);
     assert_eq!(
         abi_u256(&rep.steps[1].output),
         revm::primitives::U256::from(1)
@@ -124,22 +124,24 @@ fn an_inference_precompile_is_flagged_unavailable_and_is_silent_below_hardening(
 
 #[test]
 fn an_inference_precompile_fails_at_a_hardened_height() {
-    let rep = run(
-        &probe_plan(0x0100, b"hello"),
-        ForkState::Empty,
-        &config_at(HARDENED),
-    )
-    .expect("runs");
-    assert!(rep.semantics.pba_hardened);
-    assert_eq!(
-        abi_u256(&rep.steps[1].output),
-        revm::primitives::U256::ZERO,
-        "ok() == false"
-    );
-    assert_eq!(
-        rep.precompiles.unavailable_touched,
-        vec!["0x0100".to_string()]
-    );
+    for block in [30_000, TODAY, HARDENED] {
+        let rep = run(
+            &probe_plan(0x0100, b"hello"),
+            ForkState::Empty,
+            &config_at(block),
+        )
+        .expect("runs");
+        assert!(rep.semantics.pba_hardened, "block {block}");
+        assert_eq!(
+            abi_u256(&rep.steps[1].output),
+            revm::primitives::U256::ZERO,
+            "ok() == false at block {block}"
+        );
+        assert_eq!(
+            rep.precompiles.unavailable_touched,
+            vec!["0x0100".to_string()]
+        );
+    }
 }
 
 #[test]

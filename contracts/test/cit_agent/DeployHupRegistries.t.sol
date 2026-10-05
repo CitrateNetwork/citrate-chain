@@ -5,6 +5,7 @@ import "forge-std/Test.sol";
 
 import "../../script/DeployHupRegistries.s.sol";
 import "../../script/Salts.sol";
+import "../../src/core_membership/CitrateMemberSBT.sol";
 
 /// HUP-S7.1: in-process rehearsal of the registry redeploy script. Calls the env-free
 /// `deployWith` (vm.setEnv is process-wide, so env-driven runs race across tests) and
@@ -17,6 +18,7 @@ contract DeployHupRegistriesTest is Test {
     address internal ownerB;
     address internal ownerC;
     address internal member;
+    CitrateMemberSBT internal memberSbt;
 
     function setUp() public {
         script = new DeployHupRegistries();
@@ -25,6 +27,7 @@ contract DeployHupRegistriesTest is Test {
         ownerB = makeAddr("timelock-owner-b");
         ownerC = makeAddr("timelock-owner-c");
         member = makeAddr("member");
+        memberSbt = new CitrateMemberSBT(address(this));
     }
 
     function _cfg(address admin) internal view returns (DeployHupRegistries.Config memory c) {
@@ -33,16 +36,25 @@ contract DeployHupRegistriesTest is Test {
         c.timelockOwners = [ownerA, ownerB, ownerC];
         c.timelockDelay = 2 days;
         c.bookPath = "";
+        c.memberSBT = address(memberSbt);
+    }
+
+    /// The live (40204) config: the member SBT is the book's pin.
+    function _liveCfg(address admin) internal view returns (DeployHupRegistries.Config memory c) {
+        c = _cfg(admin);
+        c.bookPath = "addresses/40204.json";
+        c.memberSBT = vm.parseJsonAddress(vm.readFile(c.bookPath), ".contracts.CitrateMemberSBT");
     }
 
     function _assertProjected(DeployHupRegistries.Deployed memory d) internal view {
-        DeployHupRegistries.Deployed memory p = script.projectAll(d.admin);
+        DeployHupRegistries.Deployed memory p = script.projectAll(d.admin, d.memberSBT);
         assertEq(d.organizationSBT, p.organizationSBT, "OrganizationSBT off projection");
         assertEq(d.agentSBT, p.agentSBT, "AgentSBT off projection");
         assertEq(d.capsuleRegistry, p.capsuleRegistry, "CapsuleRegistry off projection");
         assertEq(d.anchorRegistry, p.anchorRegistry, "AnchorRegistry off projection");
         assertEq(d.benchmarkRegistry, p.benchmarkRegistry, "BenchmarkRegistry off projection");
         assertEq(d.skillRegistry, p.skillRegistry, "SkillRegistry off projection");
+        assertEq(address(AgentSBT(d.agentSBT).memberSbt()), d.memberSBT, "AgentSBT.memberSbt");
         // Independent recomputation with the cheatcode, through the Arachnid factory.
         assertEq(
             d.anchorRegistry,
@@ -114,8 +126,7 @@ contract DeployHupRegistriesTest is Test {
 
     function test_deploy_onLiveChainId_refusesDeployerAsAdmin() public {
         vm.chainId(40204);
-        DeployHupRegistries.Config memory c = _cfg(deployer);
-        c.bookPath = "addresses/40204.json";
+        DeployHupRegistries.Config memory c = _liveCfg(deployer);
         _plantCeremonySet();
         vm.expectRevert(bytes("admin must not be the deployer on 40204"));
         script.deployWith(c);
@@ -123,8 +134,7 @@ contract DeployHupRegistriesTest is Test {
 
     function test_deploy_onLiveChainId_refusesEoaAdmin() public {
         vm.chainId(40204);
-        DeployHupRegistries.Config memory c = _cfg(makeAddr("some-eoa"));
-        c.bookPath = "addresses/40204.json";
+        DeployHupRegistries.Config memory c = _liveCfg(makeAddr("some-eoa"));
         _plantCeremonySet();
         vm.expectRevert(bytes("admin must be a deployed multisig on 40204"));
         script.deployWith(c);
@@ -132,8 +142,7 @@ contract DeployHupRegistriesTest is Test {
 
     function test_deploy_onLiveChainId_requiresCeremonySet() public {
         vm.chainId(40204);
-        DeployHupRegistries.Config memory c = _cfg(address(0));
-        c.bookPath = "addresses/40204.json";
+        DeployHupRegistries.Config memory c = _liveCfg(address(0));
         // No code planted at the book's ceremony-owned addresses.
         vm.expectRevert();
         script.deployWith(c);
@@ -141,11 +150,41 @@ contract DeployHupRegistriesTest is Test {
 
     function test_deploy_onLiveChainId_withCeremonySet_succeeds() public {
         vm.chainId(40204);
-        DeployHupRegistries.Config memory c = _cfg(address(0));
-        c.bookPath = "addresses/40204.json";
+        DeployHupRegistries.Config memory c = _liveCfg(address(0));
         _plantCeremonySet();
         DeployHupRegistries.Deployed memory d = script.deployWith(c);
         _assertProjected(d);
+    }
+
+    function test_deploy_refusesMissingMemberSbt() public {
+        DeployHupRegistries.Config memory c = _cfg(address(0));
+        c.memberSBT = address(0);
+        vm.expectRevert(bytes("set HUP_MEMBER_SBT (the CitrateMemberSBT address)"));
+        script.deployWith(c);
+    }
+
+    function test_deploy_refusesMemberSbtWithoutCode() public {
+        DeployHupRegistries.Config memory c = _cfg(address(0));
+        c.memberSBT = makeAddr("no-code");
+        vm.expectRevert(bytes("member SBT has no code: run DeployCoreMembership first"));
+        script.deployWith(c);
+    }
+
+    function test_deploy_onLiveChainId_refusesMemberSbtOffTheBook() public {
+        vm.chainId(40204);
+        DeployHupRegistries.Config memory c = _liveCfg(address(0));
+        _plantCeremonySet();
+        c.memberSBT = address(memberSbt); // has code, but is not the book's pin
+        vm.expectRevert(bytes("member SBT must be the book's CitrateMemberSBT on 40204"));
+        script.deployWith(c);
+    }
+
+    function test_memberSbt_movesTheAgentProjection() public {
+        address admin = makeAddr("admin");
+        DeployHupRegistries.Deployed memory a = script.projectAll(admin, address(0xA));
+        DeployHupRegistries.Deployed memory b = script.projectAll(admin, address(0xB));
+        assertTrue(a.agentSBT != b.agentSBT, "the member SBT is part of AgentSBT's init code");
+        assertEq(a.organizationSBT, b.organizationSBT);
     }
 
     /// Plants code at the book's ceremony-owned addresses (the check is "has code"; the test
@@ -156,6 +195,7 @@ contract DeployHupRegistriesTest is Test {
         for (uint256 i = 0; i < names.length; i++) {
             vm.etch(vm.parseJsonAddress(json, string.concat(".contracts.", names[i])), hex"00");
         }
+        vm.etch(vm.parseJsonAddress(json, ".contracts.CitrateMemberSBT"), hex"00");
     }
 
     // ── one state-changing smoke call per contract ───────────────────────────
@@ -178,6 +218,16 @@ contract DeployHupRegistriesTest is Test {
         vm.prank(member);
         vm.expectRevert();
         AgentSBT(d.agentSBT).mintAgent(member, orgId, keccak256("x"), keccak256("y"));
+
+        // AgentSBT member mint: the admin names the member org, a membership holder mints.
+        vm.prank(d.admin);
+        AgentSBT(d.agentSBT).setMemberOrg(orgId);
+        memberSbt.mintMember(member, keccak256("sub:smoke"), uint64(block.timestamp), uint64(block.timestamp + 365 days));
+        vm.prank(member);
+        uint256 memberAgentId =
+            AgentSBT(d.agentSBT).mintAgentAsMember(keccak256("did:citrate:agent:member-smoke"), keccak256("fp-2"));
+        assertEq(AgentSBT(d.agentSBT).ownerOf(memberAgentId), member);
+        assertEq(AgentSBT(d.agentSBT).getAgent(memberAgentId).parent_org_id, orgId);
 
         // CapsuleRegistry: Workspace tier is open; Bundled needs the admin.
         vm.prank(member);

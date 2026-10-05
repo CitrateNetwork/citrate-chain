@@ -47,9 +47,7 @@ impl StateManager {
         hasher.update(storage_root.as_bytes());
         hasher.update(ai_root.as_bytes());
 
-        let hash_bytes = hasher.finalize();
-        let mut hash_array = [0u8; 32];
-        hash_array.copy_from_slice(&hash_bytes[..32]);
+        let hash_array: [u8; 32] = hasher.finalize().into();
 
         let unified_root = Hash::new(hash_array);
 
@@ -83,9 +81,7 @@ impl StateManager {
             hasher.update(account.code_hash.as_bytes());
         }
 
-        let hash_bytes = hasher.finalize();
-        let mut hash_array = [0u8; 32];
-        hash_array.copy_from_slice(&hash_bytes[..32]);
+        let hash_array: [u8; 32] = hasher.finalize().into();
         Ok(Hash::new(hash_array))
     }
 
@@ -113,9 +109,7 @@ impl StateManager {
             hasher.update(value.as_bytes());
         }
 
-        let hash_bytes = hasher.finalize();
-        let mut hash_array = [0u8; 32];
-        hash_array.copy_from_slice(&hash_bytes[..32]);
+        let hash_array: [u8; 32] = hasher.finalize().into();
         Ok(Hash::new(hash_array))
     }
 
@@ -305,5 +299,41 @@ mod tests {
         // Root should be deterministic
         let root3 = state_manager.calculate_state_root().await.unwrap();
         assert_eq!(root2, root3);
+    }
+
+    /// PANIC-S1 mutation: the storage root is a real digest (even when empty) and
+    /// changes when contract storage changes.
+    #[tokio::test]
+    async fn panic_s1_storage_root_commits_to_storage() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(RocksDB::open(temp_dir.path()).unwrap());
+        let sm = StateManager::new(db);
+
+        let empty = sm.calculate_storage_root().await.unwrap();
+        assert_ne!(empty, Hash::default());
+        sm.state_store
+            .put_storage(&Address([7; 20]), &[1u8; 32], &[2u8; 32])
+            .unwrap();
+        assert_ne!(sm.calculate_storage_root().await.unwrap(), empty);
+    }
+
+    /// PANIC-S1 mutation: the manager-level prune reaches the AI cache.
+    #[test]
+    fn panic_s1_manager_prunes_stale_inference_cache() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(RocksDB::open(temp_dir.path()).unwrap());
+        let sm = StateManager::new(db);
+        sm.ai_state
+            .write()
+            .cache_inference(crate::state::ai_state::InferenceResult {
+                model_id: ModelId(Hash::new([1; 32])),
+                input_hash: Hash::new([2; 32]),
+                output: vec![],
+                gas_used: 0,
+                timestamp: 0,
+                proof: None,
+            });
+        sm.prune_inference_cache(60);
+        assert!(sm.ai_state.read().inference_cache.is_empty());
     }
 }

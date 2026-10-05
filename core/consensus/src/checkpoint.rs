@@ -58,7 +58,7 @@ pub const MIN_FINALITY_COMMITTEE: usize = 4;
 /// could never be met below 100 validators. Callers gate on
 /// [`MIN_FINALITY_COMMITTEE`] before using this value.
 pub fn derived_quorum(n: usize) -> usize {
-    2 * n / 3 + 1
+    (n.saturating_mul(2) / 3).saturating_add(1)
 }
 
 /// Domain separator prefix for checkpoint vote canonical messages.
@@ -86,7 +86,9 @@ pub const CITRATE_VOTE_DOMAIN_SEPARATOR: &[u8] = b"CITRATE-CHECKPOINT-V1";
 /// — these MUST agree byte-for-byte.
 pub fn canonical_vote_message(chain_id: u64, height: u64, block_hash: &Hash) -> Vec<u8> {
     let mut msg = Vec::with_capacity(
-        CITRATE_VOTE_DOMAIN_SEPARATOR.len() + 8 + 8 + 32,
+        CITRATE_VOTE_DOMAIN_SEPARATOR
+            .len()
+            .saturating_add(8 + 8 + 32),
     );
     msg.extend_from_slice(CITRATE_VOTE_DOMAIN_SEPARATOR);
     msg.extend_from_slice(&chain_id.to_le_bytes());
@@ -233,11 +235,14 @@ pub fn integer_sqrt_u128(n: u128) -> u128 {
         return 0;
     }
     // Initial estimate: 2^(bits/2) where `bits` is ceil(log2(n)).
-    let mut x = 1u128 << ((128 - n.leading_zeros()).div_ceil(2));
+    // n != 0, so `bits` is in 1..=128 and the shift in 1..=64: never overflows.
+    let bits = 128u32.saturating_sub(n.leading_zeros());
+    let mut x = 1u128.checked_shl(bits.div_ceil(2)).unwrap_or(u128::MAX);
     // Newton iteration: x_{k+1} = (x_k + n / x_k) / 2.
     // Converges in O(log log n) iterations on this initial value.
     loop {
-        let next = (x + n / x) / 2;
+        // x >= 1 throughout (starts >= 2, and Newton never undershoots isqrt(n) >= 1).
+        let next = x.saturating_add(n.checked_div(x).unwrap_or(0)) / 2;
         if next >= x {
             // Converged (or oscillating between adjacent values).
             return x;
@@ -279,8 +284,7 @@ impl CommitteeSelector {
                 let hash = hasher.finalize();
 
                 // Score = hash_value weighted by stake.
-                let mut hash_prefix = [0u8; 8];
-                hash_prefix.copy_from_slice(&hash[0..8]);
+                let hash_prefix: [u8; 8] = hash.first_chunk::<8>().copied().unwrap_or_default();
                 let hash_val = u64::from_be_bytes(hash_prefix);
                 // Weight by sqrt(stake). RM-B1 / WP-B4.2 (audit M-04):
                 // pre-fix used `(*stake as f64).sqrt() as u64` which
@@ -305,7 +309,11 @@ impl CommitteeSelector {
         });
 
         // Take the top committee_size validators
-        scored.into_iter().take(actual_size).map(|(pk, _)| pk).collect()
+        scored
+            .into_iter()
+            .take(actual_size)
+            .map(|(pk, _)| pk)
+            .collect()
     }
 }
 
@@ -316,10 +324,7 @@ impl CommitteeSelector {
 /// = 69 bytes — see [`canonical_vote_message`]. Cross-chain replay
 /// is structurally impossible because chain_id is bound into the
 /// signed bytes.
-fn verify_vote_signature(
-    vote: &CheckpointVote,
-    chain_id: u64,
-) -> Result<(), CheckpointError> {
+fn verify_vote_signature(vote: &CheckpointVote, chain_id: u64) -> Result<(), CheckpointError> {
     let message = canonical_vote_message(chain_id, vote.height, &vote.block_hash);
 
     let pubkey = VerifyingKey::from_bytes(vote.voter.as_bytes())
@@ -455,7 +460,10 @@ impl CheckpointManager {
             status: CheckpointStatus::Pending,
         };
 
-        info!("Proposed checkpoint at height {} for block {}", height, block_hash);
+        info!(
+            "Proposed checkpoint at height {} for block {}",
+            height, block_hash
+        );
         pending.insert(height, checkpoint);
         Ok(())
     }
@@ -520,7 +528,7 @@ impl CheckpointManager {
             "Vote from {:?} for checkpoint at height {} ({}/{})",
             &vote.voter.as_bytes()[..4],
             vote.height,
-            checkpoint.votes.len() + 1,
+            checkpoint.votes.len().saturating_add(1),
             checkpoint
                 .effective_quorum()
                 .map(|q| q.to_string())
@@ -557,7 +565,10 @@ impl CheckpointManager {
             None => {
                 let n = checkpoint.committee.len();
                 pending.insert(height, checkpoint);
-                return Err(CheckpointError::CommitteeTooSmall(n, MIN_FINALITY_COMMITTEE));
+                return Err(CheckpointError::CommitteeTooSmall(
+                    n,
+                    MIN_FINALITY_COMMITTEE,
+                ));
             }
         };
 
@@ -590,7 +601,8 @@ impl CheckpointManager {
                 Err(e) => {
                     tracing::error!(
                         "M-06: serialize checkpoint at height {} failed: {} — skipping persistence",
-                        height, e
+                        height,
+                        e
                     );
                 }
             }
@@ -628,13 +640,38 @@ impl CheckpointManager {
 
     /// Get pending vote count for a checkpoint.
     pub async fn pending_vote_count(&self, height: u64) -> Option<usize> {
-        self.pending.read().await.get(&height).map(|cp| cp.vote_count())
+        self.pending
+            .read()
+            .await
+            .get(&height)
+            .map(|cp| cp.vote_count())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panic_s1_quorum_and_isqrt_are_total() {
+        assert_eq!(derived_quorum(0), 1);
+        assert_eq!(derived_quorum(4), 3);
+        assert_eq!(derived_quorum(100), 67);
+        let _ = derived_quorum(usize::MAX); // must not panic
+        for (n, r) in [
+            (0u128, 0u128),
+            (1, 1),
+            (2, 1),
+            (3, 1),
+            (4, 2),
+            (15, 3),
+            (16, 4),
+            (1 << 64, 1 << 32),
+        ] {
+            assert_eq!(integer_sqrt_u128(n), r, "isqrt({n})");
+        }
+        assert_eq!(integer_sqrt_u128(u128::MAX), u128::from(u64::MAX));
+    }
     use ed25519_dalek::{Signer, SigningKey};
 
     /// Generate a deterministic ed25519 signing key from a seed byte.
@@ -709,9 +746,7 @@ mod tests {
     /// Different seeds produce different committees.
     #[test]
     fn test_committee_different_seeds() {
-        let validators: Vec<(PublicKey, u128)> = (0..20)
-            .map(|i| (make_pubkey(i), 1000))
-            .collect();
+        let validators: Vec<(PublicKey, u128)> = (0..20).map(|i| (make_pubkey(i), 1000)).collect();
 
         let c1 = CommitteeSelector::select(&validators, 50, &Hash::new([1; 32]), 5);
         let c2 = CommitteeSelector::select(&validators, 50, &Hash::new([2; 32]), 5);
@@ -739,7 +774,11 @@ mod tests {
         for i in 0..3u8 {
             let vote = make_signed_vote(i, 5, &checkpoint_block.hash());
             let quorum_reached = mgr.submit_vote(vote).await.unwrap();
-            assert!(!quorum_reached, "Quorum should not be reached with {} votes", i + 1);
+            assert!(
+                !quorum_reached,
+                "Quorum should not be reached with {} votes",
+                i + 1
+            );
         }
 
         // 4th vote reaches quorum

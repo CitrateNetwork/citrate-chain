@@ -40,6 +40,12 @@ import "../src/SkillRegistry.sol";
 ///     `Salts.salt("CitAgentTimelock")` from `HUP_TIMELOCK_OWNER_{0,1,2}` and
 ///     `HUP_TIMELOCK_DELAY` (default 2 days).
 ///
+/// MEMBER SBT. AgentSBT takes the CitrateMemberSBT address as a constructor argument
+/// (member-callable mint, owner decision 2026-10-04): `HUP_MEMBER_SBT`, else the book's
+/// `CitrateMemberSBT`. It must have code; on 40204 it must equal the book's pin, so the
+/// core-membership ceremony (DeployCoreMembership) runs before this script. The address
+/// is part of AgentSBT's init code, so it moves AgentSBT's CREATE2 projection.
+///
 /// Signing comes from the forge CLI only (ScriptEnv). Operator usage is in
 /// docs/ops/HUP_REGISTRY_REDEPLOY_RUNBOOK.md. The anvil rehearsal is
 /// scripts/ops/hup-redeploy-dryrun.sh.
@@ -61,6 +67,8 @@ contract DeployHupRegistries is ScriptEnv {
         uint256 timelockDelay;
         /// Book consulted for the ceremony-owned registries ("" skips the check off 40204).
         string bookPath;
+        /// CitrateMemberSBT whose holders may mint agents (AgentSBT constructor argument).
+        address memberSBT;
     }
 
     struct Deployed {
@@ -72,6 +80,8 @@ contract DeployHupRegistries is ScriptEnv {
         address anchorRegistry;
         address benchmarkRegistry;
         address skillRegistry;
+        /// The CitrateMemberSBT wired into AgentSBT (read, never deployed here).
+        address memberSBT;
     }
 
     /// Registries the HUP features read that the main ceremony deploys.
@@ -96,8 +106,8 @@ contract DeployHupRegistries is ScriptEnv {
         return abi.encodePacked(type(OrganizationSBT).creationCode, abi.encode(admin));
     }
 
-    function agentInitCode(address admin, address org) public pure returns (bytes memory) {
-        return abi.encodePacked(type(AgentSBT).creationCode, abi.encode(admin, org));
+    function agentInitCode(address admin, address org, address memberSBT) public pure returns (bytes memory) {
+        return abi.encodePacked(type(AgentSBT).creationCode, abi.encode(admin, org, memberSBT));
     }
 
     function capsuleInitCode(address admin) public pure returns (bytes memory) {
@@ -129,11 +139,13 @@ contract DeployHupRegistries is ScriptEnv {
         );
     }
 
-    /// Projections for a given admin (the CitAgentTimelock projection needs the owners).
-    function projectAll(address admin) public pure returns (Deployed memory p) {
+    /// Projections for a given admin and member SBT (the CitAgentTimelock projection needs
+    /// the owners).
+    function projectAll(address admin, address memberSBT) public pure returns (Deployed memory p) {
         p.admin = admin;
+        p.memberSBT = memberSBT;
         p.organizationSBT = project("OrganizationSBT", organizationInitCode(admin));
-        p.agentSBT = project("AgentSBT", agentInitCode(admin, p.organizationSBT));
+        p.agentSBT = project("AgentSBT", agentInitCode(admin, p.organizationSBT, memberSBT));
         p.capsuleRegistry = project("CapsuleRegistry", capsuleInitCode(admin));
         p.anchorRegistry = project("AnchorRegistry", anchorInitCode());
         p.benchmarkRegistry = project("BenchmarkRegistry", benchmarkInitCode());
@@ -153,6 +165,7 @@ contract DeployHupRegistries is ScriptEnv {
         ];
         cfg.timelockDelay = envUintOr("HUP_TIMELOCK_DELAY", DEFAULT_TIMELOCK_DELAY);
         cfg.bookPath = vm.envOr("HUP_BOOK_PATH", string("addresses/40204.json"));
+        cfg.memberSBT = envAddressOr("HUP_MEMBER_SBT", _bookMemberSBT(cfg.bookPath));
         return deployWith(cfg);
     }
 
@@ -168,6 +181,13 @@ contract DeployHupRegistries is ScriptEnv {
 
         if (live) _requireCeremonySet(cfg.bookPath);
         else if (bytes(cfg.bookPath).length != 0) _reportCeremonySet(cfg.bookPath);
+
+        require(cfg.memberSBT != address(0), "set HUP_MEMBER_SBT (the CitrateMemberSBT address)");
+        require(cfg.memberSBT.code.length != 0, "member SBT has no code: run DeployCoreMembership first");
+        require(
+            !live || cfg.memberSBT == _bookMemberSBT(cfg.bookPath), "member SBT must be the book's CitrateMemberSBT on 40204"
+        );
+        console.log("member SBT      :", cfg.memberSBT);
 
         vm.startBroadcast(cfg.deployer);
 
@@ -193,14 +213,16 @@ contract DeployHupRegistries is ScriptEnv {
         require(!live || d.admin != cfg.deployer, "admin must not be the deployer on 40204");
         require(!live || d.admin.code.length != 0, "admin must be a deployed multisig on 40204");
 
-        Deployed memory p = projectAll(d.admin);
+        Deployed memory p = projectAll(d.admin, cfg.memberSBT);
 
         // 2. Admin-gated registries, born owned by the admin.
         if (p.organizationSBT.code.length == 0) {
             new OrganizationSBT{salt: Salts.salt("OrganizationSBT")}(d.admin);
         }
         if (p.agentSBT.code.length == 0) {
-            new AgentSBT{salt: Salts.salt("AgentSBT")}(d.admin, OrganizationSBT(p.organizationSBT));
+            new AgentSBT{salt: Salts.salt("AgentSBT")}(
+                d.admin, OrganizationSBT(p.organizationSBT), IERC721(cfg.memberSBT)
+            );
         }
         if (p.capsuleRegistry.code.length == 0) {
             new CapsuleRegistry{salt: Salts.salt("CapsuleRegistry")}(d.admin);
@@ -224,6 +246,7 @@ contract DeployHupRegistries is ScriptEnv {
         d.anchorRegistry = p.anchorRegistry;
         d.benchmarkRegistry = p.benchmarkRegistry;
         d.skillRegistry = p.skillRegistry;
+        d.memberSBT = cfg.memberSBT;
 
         verify(d);
         _printBook(d);
@@ -242,6 +265,7 @@ contract DeployHupRegistries is ScriptEnv {
         require(AgentSBT(d.agentSBT).owner() == d.admin, "AgentSBT owner != admin");
         require(CapsuleRegistry(d.capsuleRegistry).owner() == d.admin, "CapsuleRegistry owner != admin");
         require(address(AgentSBT(d.agentSBT).orgContract()) == d.organizationSBT, "AgentSBT.orgContract mismatch");
+        require(address(AgentSBT(d.agentSBT).memberSbt()) == d.memberSBT, "AgentSBT.memberSbt mismatch");
 
         // Smoke reads: each call must decode (a wrong contract at the address reverts here).
         OrganizationSBT(d.organizationSBT).nextTokenId();
@@ -268,6 +292,16 @@ contract DeployHupRegistries is ScriptEnv {
         string memory key = string.concat(".contracts.", name);
         if (!vm.keyExistsJson(json, key)) return address(0);
         return vm.parseJsonAddress(json, key);
+    }
+
+    /// The book's CitrateMemberSBT, or zero when the book or the key is absent.
+    function _bookMemberSBT(string memory bookPath) internal view returns (address) {
+        if (bytes(bookPath).length == 0) return address(0);
+        try vm.readFile(bookPath) returns (string memory json) {
+            return _bookAddress(json, "CitrateMemberSBT");
+        } catch {
+            return address(0);
+        }
     }
 
     function _requireCeremonySet(string memory bookPath) internal view {
@@ -311,6 +345,7 @@ contract DeployHupRegistries is ScriptEnv {
         console.log("AnchorRegistry    :", d.anchorRegistry);
         console.log("BenchmarkRegistry :", d.benchmarkRegistry);
         console.log("SkillRegistry     :", d.skillRegistry);
+        console.log("member SBT (read) :", d.memberSBT);
         console.log("Next: scripts/ops/hup-book-update.py (see the runbook).");
     }
 }

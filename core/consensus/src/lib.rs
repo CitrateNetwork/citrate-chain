@@ -1,3 +1,18 @@
+// PANIC-S1 G2: production code in this crate may not panic. Every panic class is
+// denied outside tests; a genuine invariant needs an item-level #[allow] with an
+// `// INVARIANT:` comment (enforced by scripts/ci/panic_invariant_tripwire.sh).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
 // citrate/core/consensus/src/lib.rs
 
 pub mod block_sidecars;

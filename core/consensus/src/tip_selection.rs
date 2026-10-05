@@ -89,12 +89,15 @@ impl TipSelector {
         }
 
         // If only one tip, return it
+        let Some(&first_tip) = tip_hashes.first() else {
+            return Err(TipSelectionError::NoTips);
+        };
         if tip_hashes.len() == 1 {
-            return Ok(tip_hashes[0]);
+            return Ok(first_tip);
         }
 
         // Get blue scores for each tip
-        let mut best_tip = tip_hashes[0];
+        let mut best_tip = first_tip;
         let mut best_score = 0u64;
 
         for &hash in tip_hashes {
@@ -264,7 +267,7 @@ impl TipSelector {
         for (i, weight) in weights.iter().enumerate() {
             cumulative += weight;
             if cumulative >= random_value {
-                return Ok(tip_hashes[i]);
+                return tip_hashes.get(i).copied().ok_or(TipSelectionError::NoTips);
             }
         }
 
@@ -341,17 +344,19 @@ impl ParentSelector {
         }
 
         // First parent becomes selected parent
-        let selected_parent = all_parents[0];
+        let Some(&selected_parent) = all_parents.first() else {
+            return Err(TipSelectionError::NoTips);
+        };
 
         // Rest become merge parents (up to max_parents - 1)
         let merge_parents: Vec<Hash> = all_parents
             .into_iter()
             .skip(1)
-            .take(self.max_parents - 1)
+            .take(self.max_parents.saturating_sub(1))
             .collect();
 
         // Enforce minimum number of parents (selected + merge)
-        let total_parents = 1 + merge_parents.len();
+        let total_parents = merge_parents.len().saturating_add(1);
         if total_parents < self.min_parents {
             return Err(TipSelectionError::NoTips);
         }

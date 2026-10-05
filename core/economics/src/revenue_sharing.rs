@@ -75,7 +75,7 @@ impl Default for RevenueShareConfig {
             facilitator_share_bps: 500,     // 5%
             market_maker_gas_bps: 1000,     // 10% of gas fees (pre-split to MarketMakerAllocation contract)
             market_maker_address: None,     // Set after contract deployment
-            min_distribution_threshold: U256::from(1000) * U256::from(10).pow(U256::from(18)), // 1000 SALT
+            min_distribution_threshold: crate::salt(1000), // 1000 SALT
             distribution_frequency: 7200,   // ~1 day at 2s blocks
             performance_bonus_bps: 500,     // 5% max bonus
         }
@@ -235,7 +235,7 @@ impl RevenueShareManager {
         source: Address,
     ) -> Result<()> {
         let current_pool = self.revenue_pools.entry(pool.clone()).or_insert(U256::zero());
-        *current_pool += amount;
+        { let v = &mut *current_pool; *v = v.saturating_add(amount); }
 
         self.events.push(RevenueEvent::FeeCollected {
             pool,
@@ -313,7 +313,7 @@ impl RevenueShareManager {
         // nothing to `distributions`, so the sum can be less than `pool_balance`.
         // Carry that undistributed remainder forward instead of destroying it by
         // unconditionally zeroing the pool.
-        let distributed: U256 = distributions.values().copied().fold(U256::zero(), |a, b| a + b);
+        let distributed: U256 = distributions.values().copied().fold(U256::zero(), |a, b| a.saturating_add(b));
         let remainder = pool_balance.saturating_sub(distributed);
 
         let distribution = RevenueDistribution {
@@ -353,15 +353,15 @@ impl RevenueShareManager {
                 // The market maker address and rate are DAO-configurable via MarketMakerAllocation contract.
                 let mut distributable = total_amount;
                 if let Some(mm_addr) = self.config.market_maker_address {
-                    let mm_amount = total_amount * U256::from(self.config.market_maker_gas_bps) / U256::from(10000);
+                    let mm_amount = crate::mul_div(total_amount, U256::from(self.config.market_maker_gas_bps), U256::from(10000));
                     distributions.insert(mm_addr, mm_amount);
-                    distributable = total_amount - mm_amount;
+                    distributable = total_amount.saturating_sub(mm_amount);
                 }
 
                 // Distribute remaining gas fees to validators, stakers, and treasury
-                let validator_amount = distributable * U256::from(self.config.validator_share_bps) / U256::from(10000);
-                let staker_amount = distributable * U256::from(self.config.staker_share_bps) / U256::from(10000);
-                let treasury_amount = distributable - validator_amount - staker_amount;
+                let validator_amount = crate::mul_div(distributable, U256::from(self.config.validator_share_bps), U256::from(10000));
+                let staker_amount = crate::mul_div(distributable, U256::from(self.config.staker_share_bps), U256::from(10000));
+                let treasury_amount = distributable.saturating_sub(validator_amount).saturating_sub(staker_amount);
 
                 self.distribute_to_stakeholder_type(StakeholderType::Validator, validator_amount, &mut distributions);
                 self.distribute_to_stakeholder_type(StakeholderType::Staker, staker_amount, &mut distributions);
@@ -369,10 +369,10 @@ impl RevenueShareManager {
             },
             RevenuePool::AIInference => {
                 // Distribute AI inference fees to model creators, validators, and infrastructure
-                let model_creator_amount = total_amount * U256::from(self.config.model_creator_share_bps) / U256::from(10000);
-                let validator_amount = total_amount * U256::from(self.config.validator_share_bps) / U256::from(10000);
-                let infrastructure_amount = total_amount * U256::from(self.config.infrastructure_share_bps) / U256::from(10000);
-                let treasury_amount = total_amount - model_creator_amount - validator_amount - infrastructure_amount;
+                let model_creator_amount = crate::mul_div(total_amount, U256::from(self.config.model_creator_share_bps), U256::from(10000));
+                let validator_amount = crate::mul_div(total_amount, U256::from(self.config.validator_share_bps), U256::from(10000));
+                let infrastructure_amount = crate::mul_div(total_amount, U256::from(self.config.infrastructure_share_bps), U256::from(10000));
+                let treasury_amount = total_amount.saturating_sub(model_creator_amount).saturating_sub(validator_amount).saturating_sub(infrastructure_amount);
 
                 self.distribute_to_stakeholder_type(StakeholderType::ModelCreator, model_creator_amount, &mut distributions);
                 self.distribute_to_stakeholder_type(StakeholderType::Validator, validator_amount, &mut distributions);
@@ -381,10 +381,10 @@ impl RevenueShareManager {
             },
             RevenuePool::ModelDeployment | RevenuePool::ModelTraining => {
                 // Similar to AI inference but with different weights
-                let model_creator_amount = total_amount * U256::from(4000) / U256::from(10000); // 40% for model creators
-                let infrastructure_amount = total_amount * U256::from(3000) / U256::from(10000); // 30% for infrastructure
-                let validator_amount = total_amount * U256::from(2000) / U256::from(10000); // 20% for validators
-                let treasury_amount = total_amount - model_creator_amount - infrastructure_amount - validator_amount;
+                let model_creator_amount = crate::mul_div(total_amount, U256::from(4000), U256::from(10000)); // 40% for model creators
+                let infrastructure_amount = crate::mul_div(total_amount, U256::from(3000), U256::from(10000)); // 30% for infrastructure
+                let validator_amount = crate::mul_div(total_amount, U256::from(2000), U256::from(10000)); // 20% for validators
+                let treasury_amount = total_amount.saturating_sub(model_creator_amount).saturating_sub(infrastructure_amount).saturating_sub(validator_amount);
 
                 self.distribute_to_stakeholder_type(StakeholderType::ModelCreator, model_creator_amount, &mut distributions);
                 self.distribute_to_stakeholder_type(StakeholderType::Infrastructure, infrastructure_amount, &mut distributions);
@@ -393,9 +393,9 @@ impl RevenueShareManager {
             },
             RevenuePool::MarketplaceFees => {
                 // Distribute marketplace fees evenly with small treasury cut
-                let treasury_amount = total_amount * U256::from(1000) / U256::from(10000); // 10%
-                let remaining = total_amount - treasury_amount;
-                let equal_share = remaining / U256::from(4); // Split between 4 stakeholder types
+                let treasury_amount = crate::mul_div(total_amount, U256::from(1000), U256::from(10000)); // 10%
+                let remaining = total_amount.saturating_sub(treasury_amount);
+                let equal_share = remaining.checked_div(U256::from(4)).unwrap_or_default(); // Split between 4 stakeholder types
 
                 self.distribute_to_stakeholder_type(StakeholderType::ModelCreator, equal_share, &mut distributions);
                 self.distribute_to_stakeholder_type(StakeholderType::Validator, equal_share, &mut distributions);
@@ -405,9 +405,9 @@ impl RevenueShareManager {
             },
             RevenuePool::SlashingRedistribution => {
                 // Redistribute slashing penalties to good actors
-                let validator_amount = total_amount * U256::from(4000) / U256::from(10000); // 40%
-                let staker_amount = total_amount * U256::from(4000) / U256::from(10000); // 40%
-                let treasury_amount = total_amount - validator_amount - staker_amount; // 20%
+                let validator_amount = crate::mul_div(total_amount, U256::from(4000), U256::from(10000)); // 40%
+                let staker_amount = crate::mul_div(total_amount, U256::from(4000), U256::from(10000)); // 40%
+                let treasury_amount = total_amount.saturating_sub(validator_amount).saturating_sub(staker_amount); // 20%
 
                 self.distribute_to_stakeholder_type(StakeholderType::Validator, validator_amount, &mut distributions);
                 self.distribute_to_stakeholder_type(StakeholderType::Staker, staker_amount, &mut distributions);
@@ -416,9 +416,9 @@ impl RevenueShareManager {
             RevenuePool::FacilitatorFees => {
                 // x402 settlement fees: facilitator gets configured share, remainder split between
                 // validators (for settlement finality) and treasury
-                let facilitator_amount = total_amount * U256::from(self.config.facilitator_share_bps) / U256::from(10000);
-                let validator_amount = total_amount * U256::from(self.config.validator_share_bps) / U256::from(10000);
-                let treasury_amount = total_amount - facilitator_amount - validator_amount;
+                let facilitator_amount = crate::mul_div(total_amount, U256::from(self.config.facilitator_share_bps), U256::from(10000));
+                let validator_amount = crate::mul_div(total_amount, U256::from(self.config.validator_share_bps), U256::from(10000));
+                let treasury_amount = total_amount.saturating_sub(facilitator_amount).saturating_sub(validator_amount);
 
                 self.distribute_to_stakeholder_type(StakeholderType::Facilitator, facilitator_amount, &mut distributions);
                 self.distribute_to_stakeholder_type(StakeholderType::Validator, validator_amount, &mut distributions);
@@ -463,29 +463,35 @@ impl RevenueShareManager {
 
         if total_weight == 0 {
             // Equal distribution if no contributions recorded.
-            let equal_share = total_amount / U256::from(weights.len());
+            let equal_share = total_amount.checked_div(U256::from(weights.len())).unwrap_or_default();
             let mut handed_out = U256::zero();
             for (i, (address, _)) in weights.iter().enumerate() {
-                let amount = if i + 1 == weights.len() {
-                    total_amount - handed_out
+                let amount = if i.saturating_add(1) == weights.len() {
+                    total_amount.saturating_sub(handed_out)
                 } else {
-                    handed_out += equal_share;
+                    handed_out = handed_out.saturating_add(equal_share);
                     equal_share
                 };
-                *distributions.entry(*address).or_insert(U256::zero()) += amount;
+                {
+                    let d = distributions.entry(*address).or_insert(U256::zero());
+                    *d = d.saturating_add(amount);
+                }
             }
         } else {
             let total_weight_u = U256::from(total_weight);
             let mut handed_out = U256::zero();
             for (i, (address, weight)) in weights.iter().enumerate() {
-                let amount = if i + 1 == weights.len() {
-                    total_amount - handed_out
+                let amount = if i.saturating_add(1) == weights.len() {
+                    total_amount.saturating_sub(handed_out)
                 } else {
-                    let a = total_amount * U256::from(*weight) / total_weight_u;
-                    handed_out += a;
+                    let a = crate::mul_div(total_amount, U256::from(*weight), total_weight_u);
+                    handed_out = handed_out.saturating_add(a);
                     a
                 };
-                *distributions.entry(*address).or_insert(U256::zero()) += amount;
+                {
+                    let d = distributions.entry(*address).or_insert(U256::zero());
+                    *d = d.saturating_add(amount);
+                }
             }
         }
     }
@@ -510,8 +516,8 @@ impl RevenueShareManager {
         blocks_active_delta: u64,
     ) -> Result<()> {
         if let Some(contrib) = self.stakeholder_contributions.get_mut(&address) {
-            contrib.total_contribution += contribution_delta;
-            contrib.blocks_active += blocks_active_delta;
+            contrib.total_contribution = contrib.total_contribution.saturating_add(contribution_delta);
+            contrib.blocks_active = contrib.blocks_active.saturating_add(blocks_active_delta);
 
             // Recalculate contribution score (weighted by recency)
             let recent_weight = 0.7;
@@ -581,12 +587,17 @@ impl RevenueShareManager {
     /// Update configuration via governance
     pub fn update_config(&mut self, new_config: RevenueShareConfig) -> Result<()> {
         // Validate configuration
-        let total_bps = new_config.validator_share_bps as u32 +
-                       new_config.model_creator_share_bps as u32 +
-                       new_config.infrastructure_share_bps as u32 +
-                       new_config.treasury_share_bps as u32 +
-                       new_config.staker_share_bps as u32 +
-                       new_config.facilitator_share_bps as u32;
+        let total_bps: u32 = [
+            new_config.validator_share_bps,
+            new_config.model_creator_share_bps,
+            new_config.infrastructure_share_bps,
+            new_config.treasury_share_bps,
+            new_config.staker_share_bps,
+            new_config.facilitator_share_bps,
+        ]
+        .into_iter()
+        .map(u32::from)
+        .fold(0, u32::saturating_add);
 
         if total_bps > 10000 {
             return Err(anyhow::anyhow!("Total revenue shares exceed 100%"));
@@ -630,7 +641,7 @@ mod tests {
         manager.register_stakeholder(model_creator, StakeholderType::ModelCreator).unwrap();
 
         // Collect revenue
-        let fee_amount = U256::from(2000) * U256::from(10).pow(U256::from(18)); // 2000 SALT
+        let fee_amount = crate::salt(2000); // 2000 SALT
         manager.collect_revenue(RevenuePool::AIInference, fee_amount, validator).unwrap();
 
         // Update contributions
@@ -690,7 +701,7 @@ mod tests {
         manager.register_stakeholder(treasury_addr, StakeholderType::Treasury).unwrap();
 
         // Collect facilitator fees
-        let fee_amount = U256::from(2000) * U256::from(10).pow(U256::from(18)); // 2000 SALT
+        let fee_amount = crate::salt(2000); // 2000 SALT
         manager.collect_revenue(RevenuePool::FacilitatorFees, fee_amount, facilitator_addr).unwrap();
 
         // Update contributions so they have nonzero scores
@@ -706,12 +717,12 @@ mod tests {
         assert_eq!(dist.total_revenue, fee_amount);
 
         // Facilitator should receive its share (5% = 500 bps)
-        let facilitator_expected = fee_amount * U256::from(500) / U256::from(10000);
+        let facilitator_expected = crate::mul_div(fee_amount, U256::from(500), U256::from(10000));
         assert!(dist.distributions.contains_key(&facilitator_addr));
         assert_eq!(dist.distributions[&facilitator_addr], facilitator_expected);
 
         // Validator should receive its share (23% = 2300 bps)
-        let validator_expected = fee_amount * U256::from(2300) / U256::from(10000);
+        let validator_expected = crate::mul_div(fee_amount, U256::from(2300), U256::from(10000));
         assert!(dist.distributions.contains_key(&validator_addr));
         assert_eq!(dist.distributions[&validator_addr], validator_expected);
 

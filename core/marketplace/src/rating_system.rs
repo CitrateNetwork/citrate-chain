@@ -203,9 +203,9 @@ impl RatingSystem {
         let key = (*model_id, *reviewer);
         if let Some(mut review_entry) = self.enhanced_reviews.get_mut(&key) {
             if helpful {
-                review_entry.helpful_votes += 1;
+                review_entry.helpful_votes = review_entry.helpful_votes.saturating_add(1);
             }
-            review_entry.total_votes += 1;
+            review_entry.total_votes = review_entry.total_votes.saturating_add(1);
 
             // Update quality score based on new votes
             review_entry.quality.helpfulness_score =
@@ -226,13 +226,16 @@ impl RatingSystem {
     pub async fn report_review(&self, model_id: &ModelId, reviewer: &Address) -> Result<()> {
         let key = (*model_id, *reviewer);
         if let Some(mut review_entry) = self.enhanced_reviews.get_mut(&key) {
-            review_entry.reported_count += 1;
+            review_entry.reported_count = review_entry.reported_count.saturating_add(1);
 
             // Update spam probability against the total ENGAGEMENT (votes plus
             // reports), not just votes. Dividing by `total_votes.max(1)` made the
             // first report of a review with no votes yield spam_probability = 1.0,
             // zeroing its weight — free, repeatable, unauthenticated censorship.
-            let engagement = (review_entry.total_votes + review_entry.reported_count).max(1);
+            let engagement = review_entry
+            .total_votes
+            .saturating_add(review_entry.reported_count)
+            .max(1);
             review_entry.quality.spam_probability =
                 (review_entry.reported_count as f32 / engagement as f32).min(1.0);
 
@@ -460,11 +463,11 @@ impl RatingSystem {
                 last_active: Utc::now(),
             });
 
-        profile.total_reviews += 1;
+        profile.total_reviews = profile.total_reviews.saturating_add(1);
         profile.last_active = Utc::now();
 
         if verified_purchase {
-            profile.verified_purchases += 1;
+            profile.verified_purchases = profile.verified_purchases.saturating_add(1);
         }
 
         // Update expertise areas based on review tags
@@ -538,7 +541,10 @@ impl RatingSystem {
             // Clamp age to >= 0: a future-dated `created_at` otherwise makes the
             // exponent positive and the weight grow without bound (and go NaN),
             // letting a review buy unbounded influence by lying about its date.
-            let age_days = (Utc::now() - review.review.created_at).num_days().max(0) as f32;
+            let age_days = Utc::now()
+                .signed_duration_since(review.review.created_at)
+                .num_days()
+                .max(0) as f32;
             let age_weight = (-age_days / self.config.review_weight_decay_days as f32).exp();
 
             let quality_weight = (review.quality.helpfulness_score * 0.3) +
@@ -562,8 +568,11 @@ impl RatingSystem {
         // Calculate rating distribution
         let mut distribution = [0u64; 5];
         for review in &reviews {
-            let rating_index = (review.review.rating.round() as usize - 1).min(4);
-            distribution[rating_index] += 1;
+            // Ratings are 1..=5; a 0 (or out-of-range) rating lands in the nearest bucket.
+            let rating_index = (review.review.rating.round() as usize).saturating_sub(1).min(4);
+            if let Some(bucket) = distribution.get_mut(rating_index) {
+                *bucket = bucket.saturating_add(1);
+            }
         }
 
         // Calculate confidence score
@@ -630,8 +639,8 @@ fn calculate_review_quality(review: &UserReview) -> f32 {
     // Pros/cons factor: reviews with specific pros/cons are more helpful
     let pros_cons_factor = match (review.pros.len(), review.cons.len()) {
         (0, 0) => 0.0,        // No specific details
-        (p, c) if p + c <= 3 => 0.2,  // Some specific points
-        (p, c) if p + c <= 6 => 0.3,  // Good balance of details
+        (p, c) if p.saturating_add(c) <= 3 => 0.2,  // Some specific points
+        (p, c) if p.saturating_add(c) <= 6 => 0.3,  // Good balance of details
         _ => 0.1,             // Potentially too verbose
     };
 
