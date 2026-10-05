@@ -290,7 +290,10 @@ fn the_agent_precompile_fork_follows_the_configured_height() {
     assert!(rep.precompiles.unavailable_touched.is_empty());
 
     let rep = run(&step(), ForkState::Empty, &config_at(TODAY)).expect("runs");
-    assert!(rep.semantics.agent_precompiles_active, "40204: active from genesis");
+    assert!(
+        rep.semantics.agent_precompiles_active,
+        "40204: active from genesis"
+    );
     assert_eq!(rep.semantics.agent_precompiles_height, Some(0));
     assert!(rep.precompiles.real.contains(&"0x0121".to_string()));
     assert_eq!(rep.precompiles.touched[0].coverage, Coverage::Real);
