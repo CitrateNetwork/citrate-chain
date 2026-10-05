@@ -23,7 +23,7 @@ run, on the stack head, before the stack merges to `main`.
 - Signers: 64 throwaway keys made at run time and funded on the devnet from the prefunded test
   account; the key file was deleted after the run.
 - Load: simple transfers, target 300 tx/s for 60 s, at most 16 in flight per signer (the node
-  refuses a nonce more than 16 ahead of the committed one, PBA-L1a-001).
+  refuses a nonce more than 16 ahead of the committed one).
 - Machine: Apple M2 Max, 32 GiB, rustc 1.96.0, with other builds running at the same time.
 
 ## Result
