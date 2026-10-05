@@ -18,6 +18,8 @@
 #   HUP_REGISTRY_ADMIN   admin multisig (fork default: the book's CitAgentTimelock)
 #   DEPLOYER_ADDRESS     impersonated deployer (fork default: the book's deployer)
 #   HUP_DRYRUN_KEEP=1    keep the temp dir (broadcast + book copy) for inspection
+#   HUP_DRYRUN_POST_HOOK executable run (fork mode) after the book and provenance tools, with
+#                        HUP_DRYRUN_RPC / _BOOK / _GENESIS / _PROVENANCE set; its failure fails the run
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -25,7 +27,7 @@ CONTRACTS="$ROOT/contracts"
 BOOK="$CONTRACTS/addresses/40204.json"
 MODE=fork
 [[ "${1:-}" == "--fresh" ]] && MODE=fresh
-[[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { sed -n '2,22p' "$0"; exit 0; }
+[[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { sed -n '2,24p' "$0"; exit 0; }
 
 for bin in anvil forge cast python3; do
   command -v "$bin" >/dev/null || { echo "dryrun: $bin not found" >&2; exit 2; }
@@ -132,6 +134,19 @@ if [[ "$CHAIN" == 40204 ]]; then
   python3 "$ROOT/scripts/ops/hup-book-update.py" \
     --broadcast "$TMP/broadcast/DeployHupRegistries.s.sol/40204/run-latest.json" \
     --book "$TMP/40204.json" --admin "$ADMIN" --rpc "$RPC" --genesis "$GEN"
+  echo "dryrun: provenance ledger (temp copy) from the same broadcast"
+  cp "$CONTRACTS/addresses/40204.provenance.json" "$TMP/40204.provenance.json"
+  python3 "$ROOT/scripts/ops/hup-provenance-update.py" \
+    --broadcast "$TMP/broadcast/DeployHupRegistries.s.sol/40204/run-latest.json" \
+    --book "$TMP/40204.json" --provenance "$TMP/40204.provenance.json" --rpc "$RPC" --genesis "$GEN" \
+    --backfill --scan-rpc "$FORK"
+  if [[ -n "${HUP_DRYRUN_POST_HOOK:-}" ]]; then
+    # A consumer's rehearsal (for example citrate-core scripts/anvil-sync-addresses.sh) runs
+    # here, while the fork is still up, against the temp book.
+    echo "dryrun: post hook $HUP_DRYRUN_POST_HOOK"
+    HUP_DRYRUN_RPC="$RPC" HUP_DRYRUN_BOOK="$TMP/40204.json" HUP_DRYRUN_GENESIS="$GEN" \
+      HUP_DRYRUN_PROVENANCE="$TMP/40204.provenance.json" "$HUP_DRYRUN_POST_HOOK"
+  fi
 else
   echo "dryrun: book tool skipped (it accepts chain 40204 only; use fork mode)"
 fi
