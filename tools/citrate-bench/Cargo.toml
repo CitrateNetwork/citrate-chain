@@ -46,7 +46,7 @@ rpassword = "7"
 
 [dev-dependencies]
 tempfile = "3"
-rand = { workspace = true }
+rand = "0.8"  # standalone workspace (see [workspace] below), so no `workspace = true`; 0.8 matches k256's rand_core
 mockito = "1"
 
 [workspace]

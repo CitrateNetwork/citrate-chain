@@ -8,6 +8,7 @@
 //! | the pure families the node bridges into REVM (`PURE_PRECOMPILE_ADDRESSES`: 0x0107–0x0109, 0x010A–0x010F, 0x0110–0x0111, 0x0120, 0x0130, 0x0200–0x0202) | **real**: the same function the node calls, with the same activation flag |
 //! | 0x0130 at a hardened height when this build lacks `commd-fold-verify` | **unavailable**: the 40204 node links the live verifier there, this build does not |
 //! | the inference family 0x0100–0x0106 | **unavailable**: it needs the hosted model runtime, which the node does not expose to contract code either |
+//! | the agent precompile fork 0x0112, 0x0113, 0x0121, 0x0122 (`AGENT_FORK_PRECOMPILE_ADDRESSES`) | **real** once the fork is active at the simulated block (HUP-S7.2), otherwise reserved like the slots below |
 //! | the other reserved slots 0x0112–0x013F, 0x0203–0x0209 | **unavailable**: unassigned |
 //! | 0x1000 model, 0x1002 artifact, 0x1003 governance | **unavailable**: the node handles these only as the destination of a top-level transaction, never from contract code |
 //!
@@ -67,8 +68,19 @@ fn to_short(raw: &[u8; 20]) -> u16 {
     (u16::from(raw[18]) << 8) | u16::from(raw[19])
 }
 
-/// The coverage of address `v` at a block where the PBA hardening is (or is not) active.
-pub fn coverage(v: u16, hardened: bool) -> (Coverage, String) {
+/// The coverage of address `v` at a block where the PBA hardening and the agent precompile
+/// fork (HUP-S7.2) are (or are not) active.
+pub fn coverage(v: u16, hardened: bool, agent_fork: bool) -> (Coverage, String) {
+    if agent_fork
+        && citrate_execution::precompiles::AGENT_FORK_PRECOMPILE_ADDRESSES
+            .iter()
+            .any(|raw| to_short(raw) == v)
+    {
+        return (
+            Coverage::Real,
+            "node implementation (agent precompile fork, active at this height)".into(),
+        );
+    }
     let bridged = citrate_execution::precompiles::PURE_PRECOMPILE_ADDRESSES
         .iter()
         .any(|raw| to_short(raw) == v);
@@ -113,12 +125,12 @@ pub fn coverage(v: u16, hardened: bool) -> (Coverage, String) {
 }
 
 /// Every Citrate precompile address with its coverage, ascending.
-pub fn table(hardened: bool) -> Vec<PrecompileRow> {
+pub fn table(hardened: bool, agent_fork: bool) -> Vec<PrecompileRow> {
     let mut all: Vec<u16> = (0x0100..=0x013F).chain(0x0200..=0x0209).collect();
     all.extend(TX_LEVEL_PRECOMPILES.iter().map(|(a, _)| *a));
     all.into_iter()
         .map(|v| {
-            let (coverage, note) = coverage(v, hardened);
+            let (coverage, note) = coverage(v, hardened, agent_fork);
             PrecompileRow {
                 address: format!("0x{v:04x}"),
                 coverage,
@@ -129,8 +141,8 @@ pub fn table(hardened: bool) -> Vec<PrecompileRow> {
 }
 
 /// The addresses this fork runs with real code, as `0x%04x` strings.
-pub fn real_addresses(hardened: bool) -> Vec<String> {
-    table(hardened)
+pub fn real_addresses(hardened: bool, agent_fork: bool) -> Vec<String> {
+    table(hardened, agent_fork)
         .into_iter()
         .filter(|r| r.coverage == Coverage::Real)
         .map(|r| r.address)

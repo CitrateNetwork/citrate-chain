@@ -105,3 +105,47 @@ fn bad_invocations_exit_non_zero_with_a_reason() {
         assert!(!out.stderr.is_empty(), "{args:?}");
     }
 }
+
+#[test]
+fn the_agent_precompile_height_follows_the_node_rule() {
+    // A devnet may set the height; the fork addresses are then real at and above it.
+    let out = bin()
+        .env_remove("CITRATE_AGENT_PRECOMPILES_HEIGHT")
+        .args([
+            "precompiles",
+            "--chain-id",
+            "31337",
+            "--block",
+            "10",
+            "--agent-precompiles-height",
+            "5",
+        ])
+        .output()
+        .expect("runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["agentPrecompilesActive"], true);
+    assert_eq!(v["agentPrecompilesHeight"], 5);
+    let rows = v["precompiles"].as_array().expect("rows");
+    let r = rows.iter().find(|r| r["address"] == "0x0121").expect("row");
+    assert_eq!(r["coverage"], "real");
+
+    // 40204 pins the fork at genesis: a different per-run height is refused, as the node refuses it.
+    let out = bin()
+        .env_remove("CITRATE_AGENT_PRECOMPILES_HEIGHT")
+        .args([
+            "precompiles",
+            "--block",
+            "10",
+            "--agent-precompiles-height",
+            "5",
+        ])
+        .output()
+        .expect("runs");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("conflicts"));
+}

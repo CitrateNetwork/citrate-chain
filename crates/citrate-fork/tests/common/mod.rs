@@ -89,6 +89,8 @@ pub fn config_at(block: u64) -> ForkConfig {
         },
         hardening_height: pinned_hardening(40204),
         hardening_source: "release pin".into(),
+        agent_fork_height: citrate_execution::agent_fork::pinned_for(40204).flatten(),
+        agent_fork_source: "release pin".into(),
         source: StateSource::Empty,
     }
 }
