@@ -319,7 +319,12 @@ impl GhostDag {
         // `count_blue_anticone` docs.
         let k = self.params.k as usize;
         let anticone_size = self
-            .count_blue_anticone(candidate, selected_parent_blue, current_blue_parents, k + 1)
+            .count_blue_anticone(
+                candidate,
+                selected_parent_blue,
+                current_blue_parents,
+                k.saturating_add(1),
+            )
             .await?;
 
         Ok(anticone_size <= k)
@@ -393,7 +398,7 @@ impl GhostDag {
                 return Ok(count);
             }
             if !self.is_ancestor_of(block, blue_block).await? && !is_ancestor_of_block(blue_block) {
-                count += 1;
+                count = count.saturating_add(1);
             }
         }
 
@@ -403,7 +408,7 @@ impl GhostDag {
                 return Ok(count);
             }
             if !self.is_ancestor_of(block, blue_block).await? && !is_ancestor_of_block(blue_block) {
-                count += 1;
+                count = count.saturating_add(1);
             }
         }
 
@@ -1004,7 +1009,7 @@ impl GhostDag {
         if merge_parents.len() >= self.params.max_parents {
             return Err(GhostDagError::InvalidLinkage(format!(
                 "{} total parents (1 selected + {} merges) exceeds max_parents {}",
-                merge_parents.len() + 1,
+                merge_parents.len().saturating_add(1),
                 merge_parents.len(),
                 self.params.max_parents
             )));
@@ -1191,7 +1196,7 @@ impl GhostDag {
                 .get(&block.selected_parent())
                 .map(|r| r.blue_set.score);
             if let Some(sp_score) = sp_score {
-                return Ok(lightweight(sp_score + 1));
+                return Ok(lightweight(score_add(sp_score, 1)?));
             }
 
             // SYNC-S1 D3 — durable anchor. `relations` is in-memory, so after a
@@ -1203,7 +1208,7 @@ impl GhostDag {
                 .dag_store
                 .get_derived_blue_score(&block.selected_parent())
             {
-                return Ok(lightweight(sp_score + 1));
+                return Ok(lightweight(score_add(sp_score, 1)?));
             }
 
             // COLD PATH — the selected parent is not in `relations`.
@@ -1238,7 +1243,7 @@ impl GhostDag {
                     .get(&cursor)
                     .map(|r| r.blue_set.score)
                 {
-                    return Ok(lightweight(score + hops));
+                    return Ok(lightweight(score_add(score, hops)?));
                 }
                 let ancestor = self
                     .dag_store
@@ -1246,17 +1251,17 @@ impl GhostDag {
                     .await
                     .map_err(|_| GhostDagError::BlockNotFound(cursor))?;
                 if ancestor.is_genesis() {
-                    return Ok(lightweight(1 + hops));
+                    return Ok(lightweight(score_add(1, hops)?));
                 }
                 if !ancestor.header.merge_parent_hashes.is_empty() {
                     // A merge block on the path: its own score needs a real
                     // union, so compute that ONE block authoritatively and add
                     // the remaining edges.
                     let full = self.calculate_blue_set(&ancestor).await?;
-                    return Ok(lightweight(full.score + hops));
+                    return Ok(lightweight(score_add(full.score, hops)?));
                 }
                 cursor = ancestor.selected_parent();
-                hops += 1;
+                hops = hops.saturating_add(1);
             }
         }
 
@@ -1294,7 +1299,7 @@ impl GhostDag {
         // block. Anything else is a genuine inconsistency worth a warning.
         if !block.is_genesis()
             && block.header.merge_parent_hashes.is_empty()
-            && blue_set.score != block.header.blue_score + 1
+            && block.header.blue_score.checked_add(1) != Some(blue_set.score)
         {
             warn!(
                 "blue_score inconsistency on {}: recomputed {} but header claims {} \
@@ -1448,13 +1453,35 @@ impl GhostDag {
         drop(relations);
         let cache = self.blue_cache.read().await;
         let from_cache: usize = cache.values().map(|b| b.blocks.len()).sum();
-        from_relations + from_cache
+        from_relations.saturating_add(from_cache)
     }
+}
+
+/// PANIC-S1: a blue score is bounded by chain height, so these sums cannot
+/// overflow on an honest chain. If one ever did, reject (Err), never saturate:
+/// a wrong score is a consensus fork, a rejected block is not.
+fn score_add(a: u64, b: u64) -> Result<u64, GhostDagError> {
+    a.checked_add(b)
+        .ok_or_else(|| GhostDagError::InvalidLinkage("blue score overflow".to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panic_s1_score_add_rejects_overflow_instead_of_panicking() {
+        assert_eq!(score_add(1, 2).ok(), Some(3));
+        assert_eq!(score_add(u64::MAX - 1, 1).ok(), Some(u64::MAX));
+        assert!(matches!(
+            score_add(u64::MAX, 1),
+            Err(GhostDagError::InvalidLinkage(_))
+        ));
+        assert!(matches!(
+            score_add(1, u64::MAX),
+            Err(GhostDagError::InvalidLinkage(_))
+        ));
+    }
     use crate::types::*;
 
     fn create_test_block_with_parents(
@@ -1477,7 +1504,6 @@ mod tests {
             .build_unhashed()
     }
 
-
     /// Mutation-survivor kills inside validate_block_consistency (the
     /// function PBA-L1b-003 changed): the blue-score band edges and the
     /// MP-DEPTH boundary are pinned exactly.
@@ -1493,13 +1519,20 @@ mod tests {
             b.header.blue_work = crate::types::blue_work_for_score(score);
             b
         };
-        assert!(gd.validate_block_consistency(&with_score(1, 0x22)).await.is_ok());
+        assert!(gd
+            .validate_block_consistency(&with_score(1, 0x22))
+            .await
+            .is_ok());
         assert!(
-            gd.validate_block_consistency(&with_score(0, 0x23)).await.is_err(),
+            gd.validate_block_consistency(&with_score(0, 0x23))
+                .await
+                .is_err(),
             "below the band"
         );
         assert!(
-            gd.validate_block_consistency(&with_score(2, 0x24)).await.is_err(),
+            gd.validate_block_consistency(&with_score(2, 0x24))
+                .await
+                .is_err(),
             "above the band (no merge parents)"
         );
     }
@@ -1515,7 +1548,12 @@ mod tests {
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let gd = GhostDag::new(GhostDagParams::default(), dag_store.clone())
             .with_merge_depth_activation_height(0);
-        let mut chain = vec![create_test_block_with_parents(h(0), Hash::default(), vec![], 0)];
+        let mut chain = vec![create_test_block_with_parents(
+            h(0),
+            Hash::default(),
+            vec![],
+            0,
+        )];
         dag_store.store_block(chain[0].clone()).await.unwrap();
         let top = MERGE_PARENT_MAX_DEPTH + 1;
         for i in 1..top {
@@ -1534,10 +1572,16 @@ mod tests {
             b
         };
         // depth = top - 1 = MERGE_PARENT_MAX_DEPTH: allowed.
-        assert!(gd.validate_block_consistency(&merging(side1.hash(), 0xB1)).await.is_ok());
+        assert!(gd
+            .validate_block_consistency(&merging(side1.hash(), 0xB1))
+            .await
+            .is_ok());
         // depth = top - 0 = MERGE_PARENT_MAX_DEPTH + 1: rejected.
         let side0 = chain[0].hash();
-        assert!(gd.validate_block_consistency(&merging(side0, 0xB2)).await.is_err());
+        assert!(gd
+            .validate_block_consistency(&merging(side0, 0xB2))
+            .await
+            .is_err());
     }
 
     /// PBA-L1b-003: the parent-relative timestamp bound, both sides of the
@@ -1550,24 +1594,41 @@ mod tests {
         genesis.header.timestamp = 1_000;
         dag_store.store_block(genesis.clone()).await.unwrap();
         let child = |ts: u64, h: u8| {
-            let mut b =
-                create_test_block_with_parents([h; 32], genesis.hash(), vec![], 1);
+            let mut b = create_test_block_with_parents([h; 32], genesis.hash(), vec![], 1);
             b.header.timestamp = ts;
             b
         };
         let on = GhostDag::new(GhostDagParams::default(), dag_store.clone())
             .with_pba_hardening(PbaHardening::at(1));
-        assert!(on.validate_block_consistency(&child(1_000 + MAX, 2)).await.is_ok());
-        assert!(on.validate_block_consistency(&child(1_000 + MAX + 1, 3)).await.is_err());
-        assert!(on.validate_block_consistency(&child(u64::MAX, 4)).await.is_err());
-        assert!(on.validate_block_consistency(&child(999, 5)).await.is_err(), "monotonic");
+        assert!(on
+            .validate_block_consistency(&child(1_000 + MAX, 2))
+            .await
+            .is_ok());
+        assert!(on
+            .validate_block_consistency(&child(1_000 + MAX + 1, 3))
+            .await
+            .is_err());
+        assert!(on
+            .validate_block_consistency(&child(u64::MAX, 4))
+            .await
+            .is_err());
+        assert!(
+            on.validate_block_consistency(&child(999, 5)).await.is_err(),
+            "monotonic"
+        );
         // Activation above this height: legacy rule (no upper bound).
         let later = GhostDag::new(GhostDagParams::default(), dag_store.clone())
             .with_pba_hardening(PbaHardening::at(2));
-        assert!(later.validate_block_consistency(&child(u64::MAX, 6)).await.is_ok());
+        assert!(later
+            .validate_block_consistency(&child(u64::MAX, 6))
+            .await
+            .is_ok());
         let off = GhostDag::new(GhostDagParams::default(), dag_store.clone())
             .with_pba_hardening(PbaHardening::off());
-        assert!(off.validate_block_consistency(&child(u64::MAX, 7)).await.is_ok());
+        assert!(off
+            .validate_block_consistency(&child(u64::MAX, 7))
+            .await
+            .is_ok());
         // A u64::MAX parent: the bound saturates, never panics.
         let mut far = create_test_block_with_parents([0x08; 32], genesis.hash(), vec![], 1);
         far.header.timestamp = u64::MAX;
@@ -1952,6 +2013,152 @@ mod tests {
                 "higher blue_score must win regardless of hash ordering"
             );
         }
+    }
+
+    #[tokio::test]
+    /// PANIC-S1 G4: an ANCESTOR among the merge parents is not in the anticone.
+    /// Merge parents c and e with e a child of c: when the k-cluster check reaches
+    /// the second of them, the first is already in `additional_blues` and is an
+    /// ancestor (in one direction), so it must NOT count. With k = 2 both then fit.
+    /// Counting it (the `&&` -> `||` mutant at count_blue_anticone's merge loop)
+    /// wrongly colours one red.
+    async fn panic_s1_merge_parent_ancestor_is_not_counted_in_anticone() {
+        let params = GhostDagParams {
+            k: 2,
+            ..GhostDagParams::default()
+        };
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = GhostDag::new(params, dag_store.clone());
+
+        let genesis = create_test_block_with_parents([0xAA; 32], Hash::default(), vec![], 0);
+        dag_store.store_block(genesis.clone()).await.unwrap();
+        let mut gset = BlueSet::new();
+        gset.insert(genesis.hash());
+        ghostdag
+            .blue_cache
+            .write()
+            .await
+            .insert(genesis.hash(), gset.clone());
+        ghostdag.relations.write().await.insert(
+            genesis.hash(),
+            DagRelation {
+                block: genesis.hash(),
+                selected_parent: Hash::default(),
+                merge_parents: vec![],
+                children: vec![],
+                blue_set: gset,
+                is_chain_block: true,
+                height: 0,
+            },
+        );
+        ghostdag.tips.write().await.insert(genesis.hash());
+
+        let b1 = create_test_block_with_parents([0xB1; 32], genesis.hash(), vec![], 1);
+        let b2 = create_test_block_with_parents([0xB2; 32], b1.hash(), vec![], 2);
+        let c = create_test_block_with_parents([0xC1; 32], genesis.hash(), vec![], 1);
+        let e = create_test_block_with_parents([0xE2; 32], c.hash(), vec![], 2);
+        for blk in [&b1, &b2, &c, &e] {
+            dag_store.store_block(blk.clone()).await.unwrap();
+            ghostdag.add_block(blk).await.unwrap();
+        }
+
+        let d = create_test_block_with_parents([0xD3; 32], b2.hash(), vec![c.hash(), e.hash()], 3);
+        dag_store.store_block(d.clone()).await.unwrap();
+        ghostdag.add_block(&d).await.unwrap();
+
+        let blue = ghostdag.calculate_blue_set(&d).await.unwrap();
+        assert!(blue.contains(&c.hash()), "c: anticone {{b1, b2}} = 2 <= k");
+        assert!(
+            blue.contains(&e.hash()),
+            "e: anticone {{b1, b2}}; c is its ancestor, not anticone"
+        );
+        assert_eq!(blue.score, 6, "blue = {{genesis, b1, b2, c, e, d}}");
+    }
+
+    #[tokio::test]
+    /// PANIC-S1 G4: the k-cluster rule must actually colour blocks RED. Every other
+    /// fixture merges at most one block into a k=18 DAG, so nothing is ever red and a
+    /// mutated `is_blue_candidate` (always `Ok(true)`) or a flipped anticone test in
+    /// `count_blue_anticone` survived. With k = 1 and three genesis siblings merged
+    /// into one block, the second merge parent's blue anticone is {b, c} (size 2 > k)
+    /// so exactly one merge parent must be red.
+    async fn panic_s1_k_cluster_colours_an_over_wide_anticone_red() {
+        let params = GhostDagParams {
+            k: 1,
+            ..GhostDagParams::default()
+        };
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = GhostDag::new(params, dag_store.clone());
+
+        let genesis = create_test_block_with_parents([0xAA; 32], Hash::default(), vec![], 0);
+        dag_store.store_block(genesis.clone()).await.unwrap();
+        let mut gset = BlueSet::new();
+        gset.insert(genesis.hash());
+        ghostdag
+            .blue_cache
+            .write()
+            .await
+            .insert(genesis.hash(), gset.clone());
+        ghostdag.relations.write().await.insert(
+            genesis.hash(),
+            DagRelation {
+                block: genesis.hash(),
+                selected_parent: Hash::default(),
+                merge_parents: vec![],
+                children: vec![],
+                blue_set: gset,
+                is_chain_block: true,
+                height: 0,
+            },
+        );
+        ghostdag.tips.write().await.insert(genesis.hash());
+
+        let b = create_test_block_with_parents([0xB1; 32], genesis.hash(), vec![], 1);
+        let c = create_test_block_with_parents([0xC1; 32], genesis.hash(), vec![], 1);
+        let e = create_test_block_with_parents([0xE1; 32], genesis.hash(), vec![], 1);
+        for blk in [&b, &c, &e] {
+            dag_store.store_block(blk.clone()).await.unwrap();
+            ghostdag.add_block(blk).await.unwrap();
+        }
+
+        let d = create_test_block_with_parents([0xD1; 32], b.hash(), vec![c.hash(), e.hash()], 2);
+        dag_store.store_block(d.clone()).await.unwrap();
+        ghostdag.add_block(&d).await.unwrap();
+
+        let blue = ghostdag.calculate_blue_set(&d).await.unwrap();
+        assert!(
+            blue.contains(&genesis.hash()) && blue.contains(&b.hash()) && blue.contains(&d.hash())
+        );
+        let blue_merges = [c.hash(), e.hash()]
+            .iter()
+            .filter(|h| blue.contains(h))
+            .count();
+        assert_eq!(
+            blue_merges, 1,
+            "k=1: exactly one of the two merge parents fits the k-cluster"
+        );
+        assert_eq!(blue.score, 4, "blue = {{genesis, b, one merge parent, d}}");
+
+        // The materialised-ancestry metric is the exact sum over relations + cache.
+        let expected: usize = ghostdag
+            .relations
+            .read()
+            .await
+            .values()
+            .map(|r| r.blue_set.blocks.len())
+            .sum::<usize>()
+            + ghostdag
+                .blue_cache
+                .read()
+                .await
+                .values()
+                .map(|b| b.blocks.len())
+                .sum::<usize>();
+        assert!(expected > 0);
+        assert_eq!(
+            ghostdag.materialised_blue_ancestry_entries().await,
+            expected
+        );
     }
 
     #[tokio::test]

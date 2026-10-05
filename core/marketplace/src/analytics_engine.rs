@@ -543,7 +543,10 @@ impl AnalyticsEngine {
 
         let positive_count = sentiments.iter().filter(|&&s| s > 0.1).count();
         let negative_count = sentiments.iter().filter(|&&s| s < -0.1).count();
-        let neutral_count = sentiments.len() - positive_count - negative_count;
+        let neutral_count = sentiments
+            .len()
+            .saturating_sub(positive_count)
+            .saturating_sub(negative_count);
 
         let total = sentiments.len() as f32;
         let positive_percentage = if total > 0.0 { positive_count as f32 / total * 100.0 } else { 0.0 };

@@ -36,7 +36,7 @@ fn hash_pair_field(left: &FpVar<Fr>, right: &FpVar<Fr>) -> Result<FpVar<Fr>, Syn
 /// Convert a byte slice (hash) into a field element by interpreting first 16 bytes as u128.
 /// This matches the encoding used for public inputs throughout the circuit.
 fn bytes_to_field(bytes: &[u8]) -> Fr {
-    let val = bytes.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128);
+    let val = super::be_u128_prefix(bytes);
     Fr::from(val)
 }
 
@@ -66,9 +66,9 @@ impl ConstraintSynthesizer<Fr> for ModelExecutionCircuit {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
         // Public inputs: model_hash, input_hash, output_hash
         // These are what the verifier checks — "this proof is about THIS model+input+output"
-        let model_hash_field = self.model_hash.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128);
-        let input_hash_field = self.input_hash.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128);
-        let output_hash_field = self.output_hash.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128);
+        let model_hash_field = super::be_u128_prefix(&self.model_hash);
+        let input_hash_field = super::be_u128_prefix(&self.input_hash);
+        let output_hash_field = super::be_u128_prefix(&self.output_hash);
 
         let _model_pub = FpVar::new_input(cs.clone(), || Ok(Fr::from(model_hash_field)))?;
         let _input_pub = FpVar::new_input(cs.clone(), || Ok(Fr::from(input_hash_field)))?;
@@ -163,22 +163,28 @@ pub struct StateTransitionCircuit {
 impl ConstraintSynthesizer<Fr> for StateTransitionCircuit {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
         // Public inputs: old_state_root, new_state_root, transaction_hash
-        let old_field = self.old_state_root.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128);
-        let new_field = self.new_state_root.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128);
-        let tx_field = self.transaction_hash.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128);
+        let old_field = super::be_u128_prefix(&self.old_state_root);
+        let new_field = super::be_u128_prefix(&self.new_state_root);
+        let tx_field = super::be_u128_prefix(&self.transaction_hash);
 
         let old_pub = FpVar::new_input(cs.clone(), || Ok(Fr::from(old_field)))?;
         let new_pub = FpVar::new_input(cs.clone(), || Ok(Fr::from(new_field)))?;
         let tx_pub = FpVar::new_input(cs.clone(), || Ok(Fr::from(tx_field)))?;
 
         // Private witnesses
-        let _old_state_vars: Vec<_> = self.old_state_root.iter()
+        let _old_state_vars: Vec<_> = self
+            .old_state_root
+            .iter()
             .map(|byte| UInt8::new_witness(cs.clone(), || Ok(*byte)))
             .collect::<Result<_, _>>()?;
-        let _new_state_vars: Vec<_> = self.new_state_root.iter()
+        let _new_state_vars: Vec<_> = self
+            .new_state_root
+            .iter()
             .map(|byte| UInt8::new_witness(cs.clone(), || Ok(*byte)))
             .collect::<Result<_, _>>()?;
-        let _tx_hash_vars: Vec<_> = self.transaction_hash.iter()
+        let _tx_hash_vars: Vec<_> = self
+            .transaction_hash
+            .iter()
             .map(|byte| UInt8::new_witness(cs.clone(), || Ok(*byte)))
             .collect::<Result<_, _>>()?;
 

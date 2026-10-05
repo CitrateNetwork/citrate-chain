@@ -280,12 +280,9 @@ mod tests {
         let output_commit = ark_fr_to_halo2_fr(&output_commit_ark);
 
         // 3. Build the circuit witness in halo2 Fr.
-        let weights_fr: Vec<Halo2Fr> =
-            weights.iter().copied().map(q16_to_halo2_fr).collect();
-        let inputs_fr: Vec<Halo2Fr> =
-            inputs.iter().copied().map(q16_to_halo2_fr).collect();
-        let biases_fr: Vec<Halo2Fr> =
-            biases.iter().copied().map(q16_to_halo2_fr).collect();
+        let weights_fr: Vec<Halo2Fr> = weights.iter().copied().map(q16_to_halo2_fr).collect();
+        let inputs_fr: Vec<Halo2Fr> = inputs.iter().copied().map(q16_to_halo2_fr).collect();
+        let biases_fr: Vec<Halo2Fr> = biases.iter().copied().map(q16_to_halo2_fr).collect();
 
         let circuit = InferenceCircuit {
             weights: weights_fr.iter().map(|v| Value::known(*v)).collect(),
@@ -302,8 +299,7 @@ mod tests {
         // 2x2 cases). Halo2 v0.4 needs k high enough for blinding +
         // permutation overhead too.
         let k = 12;
-        let prover = MockProver::run(k, &circuit, public_inputs)
-            .expect("MockProver setup");
+        let prover = MockProver::run(k, &circuit, public_inputs).expect("MockProver setup");
         let r = prover.verify();
         assert_eq!(
             r,
@@ -385,8 +381,7 @@ mod tests {
         use halo2_proofs::poly::kzg::multiopen::{ProverSHPLONK, VerifierSHPLONK};
         use halo2_proofs::poly::kzg::strategy::SingleStrategy;
         use halo2_proofs::transcript::{
-            Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer,
-            TranscriptWriterBuffer,
+            Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer, TranscriptWriterBuffer,
         };
         use halo2curves::bn256::{Bn256, G1Affine};
         use rand::rngs::OsRng;
@@ -431,8 +426,7 @@ mod tests {
 
         // 5. Keygen: VK and PK from circuit topology.
         let vk = keygen_vk(&params, &circuit.without_witnesses()).expect("keygen_vk");
-        let pk = keygen_pk(&params, vk.clone(), &circuit.without_witnesses())
-            .expect("keygen_pk");
+        let pk = keygen_pk(&params, vk.clone(), &circuit.without_witnesses()).expect("keygen_pk");
 
         // 6. Prove.
         let public_inputs: Vec<Vec<Halo2Fr>> =
@@ -485,8 +479,7 @@ mod tests {
         use halo2_proofs::poly::kzg::multiopen::{ProverSHPLONK, VerifierSHPLONK};
         use halo2_proofs::poly::kzg::strategy::SingleStrategy;
         use halo2_proofs::transcript::{
-            Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer,
-            TranscriptWriterBuffer,
+            Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer, TranscriptWriterBuffer,
         };
         use halo2curves::bn256::{Bn256, G1Affine};
         use rand::rngs::OsRng;
@@ -541,8 +534,11 @@ mod tests {
         let proof_bytes = transcript.finalize();
 
         // Tamper: swap input_commit to a bogus value.
-        let tampered: Vec<Vec<Halo2Fr>> =
-            vec![vec![Halo2Fr::from(0xDEADBEEFu64), model_commit, output_commit]];
+        let tampered: Vec<Vec<Halo2Fr>> = vec![vec![
+            Halo2Fr::from(0xDEADBEEFu64),
+            model_commit,
+            output_commit,
+        ]];
 
         let verifier_params = params.verifier_params();
         let mut verifier_transcript =
@@ -553,12 +549,7 @@ mod tests {
             _,
             _,
             SingleStrategy<_>,
-        >(
-            &verifier_params,
-            &vk,
-            &[tampered],
-            &mut verifier_transcript,
-        );
+        >(&verifier_params, &vk, &[tampered], &mut verifier_transcript);
         assert!(
             !verified,
             "tampered public input MUST fail KZG verification"

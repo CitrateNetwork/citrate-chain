@@ -46,6 +46,10 @@ impl TurnstileVerifier {
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| DEFAULT_VERIFY_URL.to_string());
+        // INVARIANT: with this static configuration `build()` fails only if the TLS
+        // backend cannot initialize at all; the faucet cannot verify captchas without
+        // a client, so failing at startup is correct (PANIC-S1 PROVE+KEEP).
+        #[allow(clippy::expect_used)]
         let client = reqwest::Client::builder()
             .timeout(VERIFY_TIMEOUT)
             .build()

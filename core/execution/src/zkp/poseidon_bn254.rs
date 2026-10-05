@@ -30,9 +30,7 @@
 use ark_bn254::Fr;
 use ark_crypto_primitives::sponge::poseidon::traits::find_poseidon_ark_and_mds;
 use ark_crypto_primitives::sponge::poseidon::{PoseidonConfig, PoseidonSponge};
-use ark_crypto_primitives::sponge::{
-    CryptographicSponge, FieldBasedCryptographicSponge,
-};
+use ark_crypto_primitives::sponge::{CryptographicSponge, FieldBasedCryptographicSponge};
 use ark_ff::PrimeField;
 use once_cell::sync::Lazy;
 
@@ -58,15 +56,7 @@ static POSEIDON_CONFIG_BN254: Lazy<PoseidonConfig<Fr>> = Lazy::new(|| {
         skip_matrices,
     );
 
-    PoseidonConfig::new(
-        full_rounds,
-        partial_rounds,
-        alpha,
-        mds,
-        ark,
-        rate,
-        capacity,
-    )
+    PoseidonConfig::new(full_rounds, partial_rounds, alpha, mds, ark, rate, capacity)
 });
 
 /// Native Poseidon hash over a slice of BN254 field elements.
@@ -83,8 +73,12 @@ pub fn poseidon_hash(inputs: &[Fr]) -> Fr {
     let config = &*POSEIDON_CONFIG_BN254;
     let mut sponge = PoseidonSponge::<Fr>::new(config);
     sponge.absorb(&inputs.to_vec());
-    let result = sponge.squeeze_native_field_elements(1);
-    result[0]
+    // Squeezing 1 element always yields exactly one.
+    sponge
+        .squeeze_native_field_elements(1)
+        .first()
+        .copied()
+        .unwrap_or_else(|| Fr::from(0u64))
 }
 
 /// Get a reference to the Poseidon configuration. Used by the

@@ -67,6 +67,7 @@ fn test_relay(threshold: usize) -> BridgeRelay {
         oracle_threshold: threshold,
         ..Default::default()
     })
+    .expect("relay")
 }
 
 fn honest_deposit(seed: u8) -> DepositEvent {

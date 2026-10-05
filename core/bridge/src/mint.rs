@@ -193,7 +193,7 @@ impl SnapMinter {
 
         // Generate NFT metadata
         let nft_metadata = SnapNftMetadata {
-            name: format!("SNAP #{}", self.total_deposits + 1),
+            name: format!("SNAP #{}", self.total_deposits.saturating_add(1)),
             description: format!(
                 "Citrate Bridge Deposit — {:.4} ETH → {} SALT",
                 deposit.amount_eth, salt_amount
@@ -218,8 +218,8 @@ impl SnapMinter {
         // Update running totals
         self.total_deposited_eth += deposit.amount_eth;
         self.total_deposited_wei = new_total_wei;
-        self.total_salt_minted += salt_amount;
-        self.total_deposits += 1;
+        self.total_salt_minted = self.total_salt_minted.saturating_add(salt_amount);
+        self.total_deposits = self.total_deposits.saturating_add(1);
 
         Ok(MintReceipt {
             event_id: deposit.event_id,

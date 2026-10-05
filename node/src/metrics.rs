@@ -295,7 +295,7 @@ pub fn process_rss_bytes() -> Option<u64> {
         let resident_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
         // Page size is 4096 on every platform the node ships to; sysconf
         // would need libc for no practical gain here.
-        Some(resident_pages * 4096)
+        Some(resident_pages.saturating_mul(4096))
     }
     #[cfg(not(target_os = "linux"))]
     {

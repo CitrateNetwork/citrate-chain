@@ -124,7 +124,7 @@ impl DiscoveryEngine {
         // Update stats
         {
             let mut stats = self.stats.write().await;
-            stats.total_models_indexed += 1;
+            stats.total_models_indexed = stats.total_models_indexed.saturating_add(1);
             stats.last_updated = chrono::Utc::now();
         }
 
@@ -174,7 +174,7 @@ impl DiscoveryEngine {
         // Update stats
         {
             let mut stats = self.stats.write().await;
-            stats.total_searches += 1;
+            stats.total_searches = stats.total_searches.saturating_add(1);
         }
 
         // Perform search
@@ -223,10 +223,10 @@ impl DiscoveryEngine {
         {
             let mut stats = self.stats.write().await;
             match &result {
-                Ok(_) => stats.cache_hits += 1,
-                Err(_) => stats.cache_misses += 1,
+                Ok(_) => stats.cache_hits = stats.cache_hits.saturating_add(1),
+                Err(_) => stats.cache_misses = stats.cache_misses.saturating_add(1),
             }
-            stats.ipfs_fetches += 1;
+            stats.ipfs_fetches = stats.ipfs_fetches.saturating_add(1);
         }
 
         result
@@ -250,7 +250,7 @@ impl DiscoveryEngine {
             // Update stats
             {
                 let mut stats = self.stats.write().await;
-                stats.recommendation_requests += 1;
+                stats.recommendation_requests = stats.recommendation_requests.saturating_add(1);
             }
 
             let model_ids = rec_engine.get_recommendations(user_address, limit).await?;

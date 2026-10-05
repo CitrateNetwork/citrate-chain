@@ -135,7 +135,11 @@ pub fn softmax_weights(blue_scores: &[f32], temperature: f32) -> Vec<f32> {
     if blue_scores.is_empty() {
         return vec![];
     }
-    let tau = if temperature <= f32::EPSILON { 1.0 } else { temperature };
+    let tau = if temperature <= f32::EPSILON {
+        1.0
+    } else {
+        temperature
+    };
     let scaled: Vec<f32> = blue_scores.iter().map(|&b| b / tau).collect();
     let max_val = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let exps: Vec<f32> = scaled.iter().map(|&s| (s - max_val).exp()).collect();
@@ -165,6 +169,11 @@ pub fn softmax_weights(blue_scores: &[f32], temperature: f32) -> Vec<f32> {
 /// Panics if embeddings/confidences/blue_scores lengths don't match, or if any
 /// confidence slice length doesn't match the embedding dimension.
 #[allow(clippy::needless_range_loop)]
+// The asserts at the top of this function establish n == confidences.len() ==
+// blue_scores.len() (== weights.len()) and that every embedding and confidence row
+// has `dim` entries, so every `[i]`, `[k]` (< n) and `[j]` (< dim) index is in range.
+// INVARIANT: shapes asserted on entry (test: panic_s1_aggregation_bit_exact)
+#[allow(clippy::indexing_slicing)]
 pub fn classify_belnap(
     embeddings: &[&EmbeddingVector],
     confidences: &[&[f32]],
@@ -177,13 +186,26 @@ pub fn classify_belnap(
     if n == 0 {
         return vec![];
     }
-    assert_eq!(n, confidences.len(), "embeddings and confidences length mismatch");
-    assert_eq!(n, blue_scores.len(), "embeddings and blue_scores length mismatch");
+    assert_eq!(
+        n,
+        confidences.len(),
+        "embeddings and confidences length mismatch"
+    );
+    assert_eq!(
+        n,
+        blue_scores.len(),
+        "embeddings and blue_scores length mismatch"
+    );
 
     let dim = embeddings[0].dim();
     for (i, emb) in embeddings.iter().enumerate() {
         assert_eq!(emb.dim(), dim, "embedding {} has wrong dimension", i);
-        assert_eq!(confidences[i].len(), dim, "confidence {} has wrong dimension", i);
+        assert_eq!(
+            confidences[i].len(),
+            dim,
+            "confidence {} has wrong dimension",
+            i
+        );
     }
 
     // Step 1: Compute trust weights via softmax(blue_scores / τ)
@@ -338,10 +360,10 @@ pub fn blue_scores_to_trust_weights(blue_scores: &[u64], temperature: f32) -> Ve
 ///
 /// Panics (debug only) if participant rows have inconsistent lengths.
 pub fn reduce_belnap_states(classifications: &[Vec<BelnapValue>]) -> Vec<BelnapValue> {
-    if classifications.is_empty() {
+    let Some(first) = classifications.first() else {
         return vec![];
-    }
-    let dim = classifications[0].len();
+    };
+    let dim = first.len();
     debug_assert!(
         classifications.iter().all(|row| row.len() == dim),
         "all participant classification rows must have equal length"
@@ -349,8 +371,8 @@ pub fn reduce_belnap_states(classifications: &[Vec<BelnapValue>]) -> Vec<BelnapV
 
     let mut state = vec![BelnapValue::Neither; dim];
     for row in classifications {
-        for j in 0..dim {
-            state[j] = state[j].join(row[j]);
+        for (s, &v) in state.iter_mut().zip(row) {
+            *s = s.join(v);
         }
     }
     state
@@ -545,7 +567,9 @@ mod tests {
             &[&e1, &e2, &e3],
             &[&conf[..], &conf[..], &conf[..]],
             &blue,
-            1.0, 0.8, 0.3,
+            1.0,
+            0.8,
+            0.3,
         );
 
         assert_eq!(result.len(), 3);
@@ -571,7 +595,9 @@ mod tests {
             &[&e1, &e2, &e3],
             &[&conf[..], &conf[..], &conf[..]],
             &blue,
-            1.0, 0.8, 0.3,
+            1.0,
+            0.8,
+            0.3,
         );
 
         // Majority (e1, e2) should be True
@@ -592,18 +618,21 @@ mod tests {
         let conf2 = [0.95];
         let blue = vec![10.0, 10.0]; // equal trust
 
-        let result = classify_belnap(
-            &[&e1, &e2],
-            &[&conf1[..], &conf2[..]],
-            &blue,
-            1.0, 0.8, 0.3,
-        );
+        let result = classify_belnap(&[&e1, &e2], &[&conf1[..], &conf2[..]], &blue, 1.0, 0.8, 0.3);
 
         // Both nodes have comparable trust and disagree → Both for each
-        assert_eq!(result[0][0], BelnapValue::Both,
-            "comparable disagreement should yield Both, got {:?}", result[0][0]);
-        assert_eq!(result[1][0], BelnapValue::Both,
-            "comparable disagreement should yield Both, got {:?}", result[1][0]);
+        assert_eq!(
+            result[0][0],
+            BelnapValue::Both,
+            "comparable disagreement should yield Both, got {:?}",
+            result[0][0]
+        );
+        assert_eq!(
+            result[1][0],
+            BelnapValue::Both,
+            "comparable disagreement should yield Both, got {:?}",
+            result[1][0]
+        );
     }
 
     // PC-T12d: Low confidence → Neither regardless of direction
@@ -615,17 +644,15 @@ mod tests {
         let conf2 = [0.15, 0.25];
         let blue = vec![10.0, 10.0];
 
-        let result = classify_belnap(
-            &[&e1, &e2],
-            &[&conf1[..], &conf2[..]],
-            &blue,
-            1.0, 0.8, 0.3,
-        );
+        let result = classify_belnap(&[&e1, &e2], &[&conf1[..], &conf2[..]], &blue, 1.0, 0.8, 0.3);
 
         for participant in &result {
             for &val in participant {
-                assert_eq!(val, BelnapValue::Neither,
-                    "low confidence should always be Neither");
+                assert_eq!(
+                    val,
+                    BelnapValue::Neither,
+                    "low confidence should always be Neither"
+                );
             }
         }
     }
@@ -641,12 +668,7 @@ mod tests {
         let conf2 = [0.9, 0.1]; // high in dim 0, low in dim 1
         let blue = vec![10.0, 10.0];
 
-        let result = classify_belnap(
-            &[&e1, &e2],
-            &[&conf1[..], &conf2[..]],
-            &blue,
-            1.0, 0.8, 0.3,
-        );
+        let result = classify_belnap(&[&e1, &e2], &[&conf1[..], &conf2[..]], &blue, 1.0, 0.8, 0.3);
 
         // dim 0: both agree → True
         assert_eq!(result[0][0], BelnapValue::True);
@@ -665,17 +687,15 @@ mod tests {
         let conf = [0.9, 0.9, 0.9];
         let blue = vec![10.0];
 
-        let result = classify_belnap(
-            &[&e],
-            &[&conf[..]],
-            &blue,
-            1.0, 0.8, 0.3,
-        );
+        let result = classify_belnap(&[&e], &[&conf[..]], &blue, 1.0, 0.8, 0.3);
 
         assert_eq!(result.len(), 1);
         for &val in &result[0] {
-            assert_eq!(val, BelnapValue::True,
-                "single participant is trivially consistent");
+            assert_eq!(
+                val,
+                BelnapValue::True,
+                "single participant is trivially consistent"
+            );
         }
     }
 
@@ -695,16 +715,20 @@ mod tests {
     #[test]
     fn test_blue_scores_to_trust_weights_monotone() {
         let weights = blue_scores_to_trust_weights(&[100, 10], 1.0);
-        assert!(weights[0] > weights[1],
-            "higher blue score should yield higher trust weight");
+        assert!(
+            weights[0] > weights[1],
+            "higher blue score should yield higher trust weight"
+        );
     }
 
     #[test]
     fn test_blue_scores_to_trust_weights_zero_total() {
         let weights = blue_scores_to_trust_weights(&[0, 0, 0], 1.0);
         for &w in &weights {
-            assert!((w - 1.0 / 3.0).abs() < 1e-5,
-                "all-zero blue scores should yield uniform weights");
+            assert!(
+                (w - 1.0 / 3.0).abs() < 1e-5,
+                "all-zero blue scores should yield uniform weights"
+            );
         }
     }
 
@@ -721,10 +745,7 @@ mod tests {
     #[test]
     fn test_reduce_unanimous_true() {
         use BelnapValue::*;
-        let classifications = vec![
-            vec![True, True],
-            vec![True, True],
-        ];
+        let classifications = vec![vec![True, True], vec![True, True]];
         let s = reduce_belnap_states(&classifications);
         assert_eq!(s, vec![True, True]);
     }
@@ -732,10 +753,7 @@ mod tests {
     #[test]
     fn test_reduce_true_false_yields_both() {
         use BelnapValue::*;
-        let classifications = vec![
-            vec![True, False],
-            vec![False, True],
-        ];
+        let classifications = vec![vec![True, False], vec![False, True]];
         let s = reduce_belnap_states(&classifications);
         assert_eq!(s[0], Both);
         assert_eq!(s[1], Both);
@@ -744,10 +762,7 @@ mod tests {
     #[test]
     fn test_reduce_neither_absorbed() {
         use BelnapValue::*;
-        let classifications = vec![
-            vec![Neither, True],
-            vec![True, Neither],
-        ];
+        let classifications = vec![vec![Neither, True], vec![True, Neither]];
         let s = reduce_belnap_states(&classifications);
         assert_eq!(s, vec![True, True]);
     }

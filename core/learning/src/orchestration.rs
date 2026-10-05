@@ -269,15 +269,15 @@ impl LearningOrchestrator {
         // Convert PeerEmbedding slice to AggregationInput format
         let embedding_vecs: Vec<EmbeddingVector> = embeddings
             .iter()
-            .map(|e| EmbeddingVector { data: e.embedding.clone() })
+            .map(|e| EmbeddingVector {
+                data: e.embedding.clone(),
+            })
             .collect();
 
         let embedding_refs: Vec<&EmbeddingVector> = embedding_vecs.iter().collect();
 
-        let confidence_slices: Vec<&[f32]> = embeddings
-            .iter()
-            .map(|e| e.confidence.as_slice())
-            .collect();
+        let confidence_slices: Vec<&[f32]> =
+            embeddings.iter().map(|e| e.confidence.as_slice()).collect();
 
         let blue_scores: Vec<f32> = embeddings.iter().map(|e| e.blue_score).collect();
 
@@ -383,10 +383,7 @@ pub fn compute_learning_root(
     // Domain separation: checkpoint height
     hasher.update(checkpoint_height.to_le_bytes());
 
-    let hash_bytes = hasher.finalize();
-    let mut result = [0u8; 32];
-    result.copy_from_slice(&hash_bytes[..32]);
-    result
+    hasher.finalize().into()
 }
 
 // ---------------------------------------------------------------------------
@@ -455,9 +452,11 @@ impl PeerProfileStore {
 
         // Prune old checkpoints if limit exceeded
         if self.max_checkpoints > 0 && self.known_heights.len() > self.max_checkpoints {
-            let prune_count = self.known_heights.len() - self.max_checkpoints;
-            let heights_to_remove: Vec<u64> =
-                self.known_heights.drain(..prune_count).collect();
+            let prune_count = self
+                .known_heights
+                .len()
+                .saturating_sub(self.max_checkpoints);
+            let heights_to_remove: Vec<u64> = self.known_heights.drain(..prune_count).collect();
             for h in &heights_to_remove {
                 self.profiles.retain(|k, _| k.checkpoint_height != *h);
             }
@@ -509,8 +508,7 @@ impl PeerProfileStore {
     pub fn prune_below(&mut self, finalized_height: u64) {
         self.profiles
             .retain(|k, _| k.checkpoint_height > finalized_height);
-        self.known_heights
-            .retain(|&h| h > finalized_height);
+        self.known_heights.retain(|&h| h > finalized_height);
     }
 }
 
@@ -524,7 +522,11 @@ impl Default for PeerProfileStore {
 mod tests {
     use super::*;
 
-    fn make_peer_embedding(values: Vec<f32>, confidence: Vec<f32>, blue_score: f32) -> PeerEmbedding {
+    fn make_peer_embedding(
+        values: Vec<f32>,
+        confidence: Vec<f32>,
+        blue_score: f32,
+    ) -> PeerEmbedding {
         PeerEmbedding {
             embedding: values,
             confidence,
@@ -647,16 +649,8 @@ mod tests {
         use crate::belnap::BelnapValue;
 
         // Create two different learning roots
-        let root_a = compute_learning_root(
-            &[0.1, 0.2, 0.3, 0.4],
-            &[BelnapValue::True; 4],
-            100,
-        );
-        let root_b = compute_learning_root(
-            &[0.9, 0.8, 0.7, 0.6],
-            &[BelnapValue::Both; 4],
-            100,
-        );
+        let root_a = compute_learning_root(&[0.1, 0.2, 0.3, 0.4], &[BelnapValue::True; 4], 100);
+        let root_b = compute_learning_root(&[0.9, 0.8, 0.7, 0.6], &[BelnapValue::Both; 4], 100);
 
         // They are different learning roots
         assert_ne!(root_a, root_b);
@@ -787,9 +781,7 @@ mod tests {
     fn test_checkpoint_aggregation_no_embeddings() {
         let orch = make_orchestrator(4, 1);
 
-        let result = orch
-            .run_checkpoint_aggregation(100, None, vec![])
-            .unwrap();
+        let result = orch.run_checkpoint_aggregation(100, None, vec![]).unwrap();
 
         assert_eq!(result.learning_root, [0u8; 32]);
         assert_eq!(result.participant_count, 0);

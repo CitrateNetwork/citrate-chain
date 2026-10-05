@@ -21,7 +21,7 @@ pub struct CacheStats {
 
 impl CacheStats {
     pub fn account_hit_rate(&self) -> f64 {
-        let total = self.account_hits + self.account_misses;
+        let total = self.account_hits.saturating_add(self.account_misses);
         if total == 0 {
             0.0
         } else {
@@ -30,7 +30,7 @@ impl CacheStats {
     }
 
     pub fn storage_hit_rate(&self) -> f64 {
-        let total = self.storage_hits + self.storage_misses;
+        let total = self.storage_hits.saturating_add(self.storage_misses);
         if total == 0 {
             0.0
         } else {
@@ -39,7 +39,7 @@ impl CacheStats {
     }
 
     pub fn code_hit_rate(&self) -> f64 {
-        let total = self.code_hits + self.code_misses;
+        let total = self.code_hits.saturating_add(self.code_misses);
         if total == 0 {
             0.0
         } else {
@@ -100,10 +100,10 @@ impl StateCache {
         let mut stats = self.stats.write();
 
         if let Some(account) = cache.get(address) {
-            stats.account_hits += 1;
+            stats.account_hits = stats.account_hits.saturating_add(1);
             Some(account.clone())
         } else {
-            stats.account_misses += 1;
+            stats.account_misses = stats.account_misses.saturating_add(1);
             None
         }
     }
@@ -125,10 +125,10 @@ impl StateCache {
         let mut stats = self.stats.write();
 
         if let Some(value) = cache.get(&storage_key) {
-            stats.storage_hits += 1;
+            stats.storage_hits = stats.storage_hits.saturating_add(1);
             Some(*value)
         } else {
-            stats.storage_misses += 1;
+            stats.storage_misses = stats.storage_misses.saturating_add(1);
             None
         }
     }
@@ -168,10 +168,10 @@ impl StateCache {
         let mut stats = self.stats.write();
 
         if let Some(code) = cache.get(address) {
-            stats.code_hits += 1;
+            stats.code_hits = stats.code_hits.saturating_add(1);
             Some(code.clone())
         } else {
-            stats.code_misses += 1;
+            stats.code_misses = stats.code_misses.saturating_add(1);
             None
         }
     }

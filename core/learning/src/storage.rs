@@ -22,13 +22,7 @@ impl EmbeddingIndex {
     }
 
     /// Insert or update an embedding for a participant (no confidence data).
-    pub fn insert(
-        &self,
-        key: PublicKey,
-        embedding: EmbeddingVector,
-        round: u64,
-        timestamp: u64,
-    ) {
+    pub fn insert(&self, key: PublicKey, embedding: EmbeddingVector, round: u64, timestamp: u64) {
         self.inner.insert(
             key,
             TimestampedEmbedding {
@@ -150,7 +144,8 @@ impl PhaseStore {
     /// On recovery, if the persisted phase is not `Observe`, the phase
     /// is considered interrupted and should be reset.
     pub fn save_phase_state(&self, state: &PhaseState) -> LearningResult<()> {
-        let json = serde_json::to_string(state).map_err(|e| LearningError::Storage(e.to_string()))?;
+        let json =
+            serde_json::to_string(state).map_err(|e| LearningError::Storage(e.to_string()))?;
         self.inner.insert("ooda_phase_state".to_string(), json);
         Ok(())
     }
@@ -195,8 +190,8 @@ impl PhaseStore {
 
     /// Save the macro-phase.
     pub fn save_macro_phase(&self, phase: NetworkLearningPhase) -> LearningResult<()> {
-        let json = serde_json::to_string(&phase)
-            .map_err(|e| LearningError::Storage(e.to_string()))?;
+        let json =
+            serde_json::to_string(&phase).map_err(|e| LearningError::Storage(e.to_string()))?;
         self.inner.insert("macro_phase".to_string(), json);
         Ok(())
     }
@@ -350,12 +345,16 @@ mod tests {
 
         assert!(store.load_macro_phase().unwrap().is_none());
 
-        store.save_macro_phase(NetworkLearningPhase::RoutingActive).unwrap();
+        store
+            .save_macro_phase(NetworkLearningPhase::RoutingActive)
+            .unwrap();
         let loaded = store.load_macro_phase().unwrap().unwrap();
         assert_eq!(loaded, NetworkLearningPhase::RoutingActive);
 
         // Overwrite
-        store.save_macro_phase(NetworkLearningPhase::FullSystem).unwrap();
+        store
+            .save_macro_phase(NetworkLearningPhase::FullSystem)
+            .unwrap();
         let loaded = store.load_macro_phase().unwrap().unwrap();
         assert_eq!(loaded, NetworkLearningPhase::FullSystem);
     }

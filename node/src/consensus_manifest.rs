@@ -111,7 +111,7 @@ impl ConsensusManifest {
                 .unwrap_or_else(|| "unset".to_string()),
         );
         let digest = Sha256::digest(preimage.as_bytes());
-        let fingerprint = format!("0x{}", hex::encode(&digest[..16]));
+        let fingerprint = format!("0x{}", hex::encode(digest.get(..16).unwrap_or(&digest)));
 
         Self {
             version,

@@ -60,7 +60,10 @@ mod tests {
                     );
                 }
                 AttestationDecision::Allow { .. } => {
-                    panic!("AlwaysReject must NEVER allow; got Allow for input {:?}", input);
+                    panic!(
+                        "AlwaysReject must NEVER allow; got Allow for input {:?}",
+                        input
+                    );
                 }
             }
         }
