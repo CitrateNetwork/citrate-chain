@@ -2988,7 +2988,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                             block.header.height,
                                         );
                                         if completed_partial {
-                                            tracing::warn!(
+                                            // D4a: admission.rs already warns (budgeted); a
+                                            // per-block warn here doubled the storm.
+                                            tracing::debug!(
                                                 "Completed a partial admission of gossiped block {} @ {}",
                                                 hex::encode(&block.header.block_hash.as_bytes()[..8]),
                                                 block.header.height
@@ -3210,7 +3212,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                             highest_admitted = block.header.height;
                                         }
                                         if completed_partial {
-                                            tracing::warn!(
+                                            // D4a: admission.rs already warns (budgeted); a
+                                            // per-block warn here doubled the storm.
+                                            tracing::debug!(
                                                 "Completed a partial admission of synced block {} @ {}",
                                                 hex::encode(&block.header.block_hash.as_bytes()[..8]),
                                                 block.header.height

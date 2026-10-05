@@ -64,7 +64,9 @@
 // surface. With D2.2 a partial admission becomes impossible; with D2.3 alone
 // it becomes self-healing. Self-healing first, impossible second.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use citrate_consensus::dag_store::{DagStore, DagStoreError};
 use citrate_consensus::ghostdag::{GhostDag, GhostDagError};
@@ -136,6 +138,84 @@ pub(crate) fn sidecar_ingest(
     Ok(Some(b))
 }
 
+/// D4a (fed#305): a per-window budget for a log line that can repeat in a
+/// storm. The first `per_window` events in each window are logged; the rest
+/// are counted, and the count is reported once with the first event of the
+/// next window. Lock-free and approximate under contention (a racing event
+/// may land in either window), which is fine for a log budget.
+///
+/// Why it exists: on 2026-10-04/05 `REPAIRING partial admission` was logged
+/// once per block, ~20k lines/min on rpc-1 and boot-3, which tripped
+/// journald's rate limiter and suppressed the very lines needed to read the
+/// incident.
+pub(crate) struct LogBudget {
+    per_window: u64,
+    window_secs: u64,
+    epoch: Instant,
+    window: AtomicU64,
+    used: AtomicU64,
+    suppressed: AtomicU64,
+}
+
+/// What [`LogBudget::check_at`] tells the caller to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LogDecision {
+    /// Log this event.
+    pub emit: bool,
+    /// Events suppressed in the window that just ended (0 = none, or the
+    /// window has not rolled). Report it before this event's own line.
+    pub suppressed_in_previous_window: u64,
+}
+
+impl LogBudget {
+    pub(crate) fn new(per_window: u64, window_secs: u64) -> Self {
+        Self {
+            per_window,
+            window_secs: window_secs.max(1),
+            epoch: Instant::now(),
+            window: AtomicU64::new(0),
+            used: AtomicU64::new(0),
+            suppressed: AtomicU64::new(0),
+        }
+    }
+
+    /// Account one event at the current time.
+    pub(crate) fn check(&self) -> LogDecision {
+        self.check_at(self.epoch.elapsed().as_secs())
+    }
+
+    /// Account one event at `now_secs` (seconds since this budget was made).
+    pub(crate) fn check_at(&self, now_secs: u64) -> LogDecision {
+        let w = now_secs.checked_div(self.window_secs).unwrap_or(0);
+        let cur = self.window.load(Ordering::Relaxed);
+        let mut suppressed_in_previous_window = 0;
+        if w != cur
+            && self
+                .window
+                .compare_exchange(cur, w, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.used.store(0, Ordering::Relaxed);
+            suppressed_in_previous_window = self.suppressed.swap(0, Ordering::Relaxed);
+        }
+        let n = self.used.fetch_add(1, Ordering::Relaxed);
+        let emit = n < self.per_window;
+        if !emit {
+            self.suppressed.fetch_add(1, Ordering::Relaxed);
+        }
+        LogDecision {
+            emit,
+            suppressed_in_previous_window,
+        }
+    }
+}
+
+/// Logged `REPAIRING` lines per window before the rest are only counted.
+const REPAIR_LOG_PER_WINDOW: u64 = 20;
+/// Pruned re-deliveries are expected traffic: one line per window is enough.
+const PRUNED_LOG_PER_WINDOW: u64 = 1;
+const LOG_WINDOW_SECS: u64 = 60;
+
 /// Result of an admission attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdmitOutcome {
@@ -190,6 +270,10 @@ pub struct BlockAdmission {
     /// Execute-on-receive driver. `None` under v1 headers (pre-reroll), where
     /// received blocks are stored but never executed.
     applicator: Option<Arc<CanonicalApplicator>>,
+    /// D4a: budget for the `REPAIRING partial admission` warning.
+    repair_log: LogBudget,
+    /// D4a: budget for the "re-delivered block below the pruning point" line.
+    pruned_log: LogBudget,
 }
 
 impl BlockAdmission {
@@ -204,6 +288,24 @@ impl BlockAdmission {
             dag_store,
             ghostdag,
             applicator,
+            repair_log: LogBudget::new(REPAIR_LOG_PER_WINDOW, LOG_WINDOW_SECS),
+            pruned_log: LogBudget::new(PRUNED_LOG_PER_WINDOW, LOG_WINDOW_SECS),
+        }
+    }
+
+    /// D4a: the height below which DAG pruning has deliberately dropped
+    /// blocks from the DAG store (`DagStore::prune` removes everything
+    /// strictly below the pruning point's height). 0 when pruning has never
+    /// run, or the pruning point block cannot be read, which keeps the
+    /// pre-D4a behaviour (repair) as the fallback.
+    async fn dag_pruned_below(&self) -> u64 {
+        let point = self.dag_store.get_pruning_point().await;
+        if point == Hash::default() {
+            return 0;
+        }
+        match self.dag_store.get_block(&point).await {
+            Ok(b) => b.header.height,
+            Err(_) => 0,
         }
     }
 
@@ -244,16 +346,67 @@ impl BlockAdmission {
             return AdmitOutcome::AlreadyAdmitted;
         }
 
+        // D4a (fed#305): chain store yes, DAG store no, and below the DAG
+        // pruning point. That is not a half-written admission, it is DAG
+        // pruning doing its job: `DagStore::prune` drops old blocks from the
+        // DAG store (fork-choice working state) and leaves the chain store
+        // (the archive) alone. The block is already fully part of this node,
+        // so there is nothing to write and nothing to apply.
+        //
+        // Before this, a peer re-delivering old blocks made each one look
+        // like a crash artefact: it was re-inserted into the DAG (re-growing
+        // exactly what pruning bounds), logged as `REPAIRING` (~20k lines/min
+        // on 2026-10-04/05, all `chain_store=true, dag_store=false`), and
+        // reported `Admitted`, which the sync handler counts as progress.
+        //
+        // Node-local only: no consensus rule reads this path. The block's
+        // validity was settled when it was first admitted, and anything below
+        // the pruning point is far outside the reorg window (`dag_prune`
+        // keeps >= 10x `MAX_REORG_DEPTH`).
+        if in_chain && !in_dag {
+            let pruned_below = self.dag_pruned_below().await;
+            if block.header.height < pruned_below {
+                let d = self.pruned_log.check();
+                if d.suppressed_in_previous_window > 0 {
+                    info!(
+                        "admission: ignored {} more re-delivered block(s) below the DAG pruning \
+                         point in the previous {}s",
+                        d.suppressed_in_previous_window, LOG_WINDOW_SECS
+                    );
+                }
+                if d.emit {
+                    info!(
+                        "admission: ignoring re-delivered block {} @ {} — below the DAG pruning \
+                         point (height {}) and already in the chain store; not a partial \
+                         admission (repeats are counted, not logged)",
+                        hash, block.header.height, pruned_below
+                    );
+                }
+                return AdmitOutcome::AlreadyAdmitted;
+            }
+        }
+
         // A partial admission is a crash artefact, not a normal event. Say so
         // loudly and name which half is missing — this is the log line whose
-        // absence made the live wedge unreadable for several sessions.
+        // absence made the live wedge unreadable for several sessions. The
+        // line is budgeted (D4a) so a storm cannot swamp journald.
         let completed_partial = in_chain != in_dag;
         if completed_partial {
-            warn!(
-                "admission: REPAIRING partial admission of {} @ {} (chain_store={}, dag_store={}) \
-                 — a previous attempt was interrupted between the two writes",
-                hash, block.header.height, in_chain, in_dag
-            );
+            let d = self.repair_log.check();
+            if d.suppressed_in_previous_window > 0 {
+                warn!(
+                    "admission: {} more partial admission(s) were repaired in the previous {}s \
+                     (lines suppressed)",
+                    d.suppressed_in_previous_window, LOG_WINDOW_SECS
+                );
+            }
+            if d.emit {
+                warn!(
+                    "admission: REPAIRING partial admission of {} @ {} (chain_store={}, \
+                     dag_store={}) — a previous attempt was interrupted between the two writes",
+                    hash, block.header.height, in_chain, in_dag
+                );
+            }
         }
 
         // The consistency gate runs before ANY write, on every path. Sync is
@@ -744,6 +897,127 @@ mod tests {
                 completed_partial: false
             }
         );
+    }
+
+    /// Admit a linear chain root..=top and return it (index = height).
+    async fn linear_chain(adm: &BlockAdmission, top: u64) -> Vec<Block> {
+        let mut chain = vec![root()];
+        adm.admit(&chain[0]).await;
+        for h in 1..=top {
+            let b = mk(h, chain[(h - 1) as usize].header.block_hash, h, [0x5A; 32]);
+            assert_eq!(
+                adm.admit(&b).await,
+                AdmitOutcome::Admitted {
+                    completed_partial: false
+                }
+            );
+            chain.push(b);
+        }
+        chain
+    }
+
+    /// D4a (fed#305): a block DAG pruning dropped is still in the chain
+    /// store. Re-delivering it is not a partial admission: it must not be
+    /// re-inserted into the DAG store, and must not report `Admitted` (the
+    /// sync handler counts that as progress).
+    #[tokio::test]
+    async fn redelivered_block_below_the_pruning_point_is_not_repaired() {
+        let (adm, storage, dag, _d) = harness();
+        let chain = linear_chain(&adm, 5).await;
+
+        dag.update_pruning_point(chain[3].header.block_hash)
+            .await
+            .expect("pruning point");
+        assert!(dag.prune().await.expect("prune") > 0);
+        let old = &chain[1];
+        assert!(
+            !dag.has_block(&old.header.block_hash).await,
+            "pruned from the DAG"
+        );
+        assert!(
+            storage.blocks.has_block(&old.header.block_hash).unwrap(),
+            "kept in the archive"
+        );
+        assert_eq!(adm.dag_pruned_below().await, 3);
+
+        for _ in 0..3 {
+            assert_eq!(adm.admit(old).await, AdmitOutcome::AlreadyAdmitted);
+        }
+        assert!(
+            !dag.has_block(&old.header.block_hash).await,
+            "re-delivery must not re-grow the pruned DAG"
+        );
+        // The pruning point itself is retained, so it is simply fully admitted.
+        assert_eq!(adm.admit(&chain[3]).await, AdmitOutcome::AlreadyAdmitted);
+    }
+
+    /// D4a: with pruning active, a genuine half-written admission ABOVE the
+    /// pruning point is still repaired, exactly as before.
+    #[tokio::test]
+    async fn partial_admission_above_the_pruning_point_is_still_repaired() {
+        let (adm, storage, dag, _d) = harness();
+        let chain = linear_chain(&adm, 5).await;
+        dag.update_pruning_point(chain[3].header.block_hash)
+            .await
+            .expect("pruning point");
+        dag.prune().await.expect("prune");
+
+        // Chain write landed, process died before the DAG write.
+        let b6 = mk(6, chain[5].header.block_hash, 6, [0x5A; 32]);
+        storage.blocks.put_block(&b6).expect("chain write");
+        assert_eq!(
+            adm.admit(&b6).await,
+            AdmitOutcome::Admitted {
+                completed_partial: true
+            }
+        );
+        assert!(dag.has_block(&b6.header.block_hash).await);
+    }
+
+    /// D4a: without any pruning the old repair path is unchanged (pruning
+    /// point unset => floor 0).
+    #[tokio::test]
+    async fn no_pruning_point_means_no_pruned_floor() {
+        let (adm, _storage, _dag, _d) = harness();
+        linear_chain(&adm, 2).await;
+        assert_eq!(adm.dag_pruned_below().await, 0);
+    }
+
+    /// D4a: the log budget emits the first N per window, counts the rest,
+    /// and reports the count once when the next window starts.
+    #[test]
+    fn log_budget_aggregates_a_storm() {
+        let b = LogBudget::new(3, 60);
+        let mut emitted = 0;
+        for _ in 0..20_000 {
+            let d = b.check_at(10);
+            assert_eq!(d.suppressed_in_previous_window, 0);
+            if d.emit {
+                emitted += 1;
+            }
+        }
+        assert_eq!(emitted, 3, "only the budget is logged inside one window");
+
+        let d = b.check_at(61);
+        assert!(d.emit, "a new window starts a new budget");
+        assert_eq!(d.suppressed_in_previous_window, 19_997);
+
+        // Reported once, not again.
+        let d = b.check_at(62);
+        assert_eq!(d.suppressed_in_previous_window, 0);
+
+        // A quiet window reports nothing.
+        let d = b.check_at(600);
+        assert!(d.emit);
+        assert_eq!(d.suppressed_in_previous_window, 0);
+    }
+
+    #[test]
+    fn log_budget_zero_window_is_clamped() {
+        let b = LogBudget::new(1, 0);
+        assert!(b.check_at(5).emit);
+        assert!(!b.check_at(5).emit);
+        assert_eq!(b.check_at(6).suppressed_in_previous_window, 1);
     }
 
     /// MUTATION / FAULT-POINT ENUMERATION (planset §3.2). The live bug is
