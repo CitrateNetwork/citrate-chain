@@ -63,6 +63,8 @@ pub mod gas_costs {
 }
 
 const SIG_LEN: usize = 65;
+/// The three signatures (member, device, wallet) of a DEVICE_LINK_VERIFY body.
+const LINK_SIGS_LEN: usize = 3 * SIG_LEN;
 
 /// The exact DeviceLink text (cluster-core `DeviceLink::signing_message`).
 pub fn device_link_message(
@@ -127,14 +129,15 @@ pub fn eip191_digest(message: &[u8]) -> [u8; 32] {
 /// The address that signed `digest`, or `None` (malformed, high-s, bad v, no
 /// recovery).
 fn recover(digest: &[u8; 32], sig: &[u8]) -> Option<[u8; 20]> {
-    if sig.len() != SIG_LEN {
-        return None;
-    }
-    let signature = Signature::from_slice(&sig[..64]).ok()?;
+    let (rs, v) = match sig {
+        [rs @ .., v] if sig.len() == SIG_LEN => (rs, *v),
+        _ => return None,
+    };
+    let signature = Signature::from_slice(rs).ok()?;
     if signature.normalize_s().is_some() {
         return None;
     }
-    let v = match sig[64] {
+    let v = match v {
         0 | 27 => 0u8,
         1 | 28 => 1u8,
         _ => return None,
@@ -142,16 +145,37 @@ fn recover(digest: &[u8; 32], sig: &[u8]) -> Option<[u8; 20]> {
     let recid = RecoveryId::from_byte(v)?;
     let key = VerifyingKey::recover_from_prehash(digest, &signature, recid).ok()?;
     let point = key.to_encoded_point(false);
-    let hash = Keccak256::digest(&point.as_bytes()[1..]);
-    let mut out = [0u8; 20];
-    out.copy_from_slice(&hash[12..]);
+    let hash: [u8; 32] = Keccak256::digest(point.as_bytes().get(1..)?).into();
+    let [_, _, _, _, _, _, _, _, _, _, _, _, out @ ..] = hash;
     Some(out)
 }
 
 fn word(ok: bool) -> Vec<u8> {
-    let mut w = vec![0u8; 32];
-    w[31] = u8::from(ok);
-    w
+    let mut w = [0u8; 32];
+    if let Some(last) = w.last_mut() {
+        *last = u8::from(ok);
+    }
+    w.to_vec()
+}
+
+/// `len` bytes of `body` from `start`, or an error naming the field.
+fn field<'a>(body: &'a [u8], start: usize, len: usize, name: &'static str) -> Result<&'a [u8]> {
+    start
+        .checked_add(len)
+        .and_then(|end| body.get(start..end))
+        .ok_or_else(|| anyhow!("{name} field"))
+}
+
+fn be_u32(b: &[u8], name: &'static str) -> Result<u32> {
+    Ok(u32::from_be_bytes(
+        b.try_into().map_err(|_| anyhow!("{name}"))?,
+    ))
+}
+
+fn be_u64(b: &[u8], name: &'static str) -> Result<u64> {
+    Ok(u64::from_be_bytes(
+        b.try_into().map_err(|_| anyhow!("{name}"))?,
+    ))
 }
 
 fn addr(b: &[u8]) -> Result<[u8; 20]> {
@@ -159,8 +183,12 @@ fn addr(b: &[u8]) -> Result<[u8; 20]> {
 }
 
 fn message_gas(signatures: u64, message_len: usize) -> u64 {
+    // Saturating: the inputs are bounded (at most 3 signatures, a message under
+    // 1 KiB), so this equals the plain sum; saturation only refuses absurd gas.
     let words = (message_len as u64).div_ceil(32);
-    gas_costs::BASE + gas_costs::PER_SIGNATURE * signatures + gas_costs::PER_MESSAGE_WORD * words
+    gas_costs::BASE
+        .saturating_add(gas_costs::PER_SIGNATURE.saturating_mul(signatures))
+        .saturating_add(gas_costs::PER_MESSAGE_WORD.saturating_mul(words))
 }
 
 fn check_gas(needed: u64, have: u64, op: &'static str) -> Result<()> {
@@ -177,24 +205,26 @@ fn check_gas(needed: u64, have: u64, op: &'static str) -> Result<()> {
 const LINK_FIXED: usize = 20 * 3 + 4 + 8 + 1;
 
 fn device_link_verify(body: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
-    if body.len() < LINK_FIXED {
+    let Some((fixed, rest)) = body.split_at_checked(LINK_FIXED) else {
         return Err(anyhow!("DEVICE_LINK_VERIFY: body too short"));
-    }
-    let label_len = usize::from(body[LINK_FIXED - 1]);
-    let expected = LINK_FIXED + label_len + 3 * SIG_LEN;
-    if body.len() != expected {
-        return Err(anyhow!(
+    };
+    let label_len = usize::from(fixed.last().copied().unwrap_or_default());
+    // label_len <= 255, so neither sum can overflow.
+    let expected = LINK_FIXED
+        .saturating_add(label_len)
+        .saturating_add(LINK_SIGS_LEN);
+    let (label, sigs) = match rest.split_at_checked(label_len) {
+        Some((label, sigs)) if sigs.len() == LINK_SIGS_LEN => (label, sigs),
+        _ => return Err(anyhow!(
             "DEVICE_LINK_VERIFY: body {} bytes, label length {label_len} needs exactly {expected}",
             body.len()
-        ));
-    }
-    let member = addr(&body[0..20])?;
-    let device = addr(&body[20..40])?;
-    let wallet = addr(&body[40..60])?;
-    let index = u32::from_be_bytes(body[60..64].try_into().map_err(|_| anyhow!("index"))?);
-    let issued_at = u64::from_be_bytes(body[64..72].try_into().map_err(|_| anyhow!("issued_at"))?);
-    let label = &body[LINK_FIXED..LINK_FIXED + label_len];
-    let sigs = &body[LINK_FIXED + label_len..];
+        )),
+    };
+    let member = addr(field(fixed, 0, 20, "member")?)?;
+    let device = addr(field(fixed, 20, 20, "device")?)?;
+    let wallet = addr(field(fixed, 40, 20, "wallet")?)?;
+    let index = be_u32(field(fixed, 60, 4, "index")?, "index")?;
+    let issued_at = be_u64(field(fixed, 64, 8, "issued_at")?, "issued_at")?;
 
     // The label alphabet is ASCII, so a valid label is valid UTF-8; an invalid
     // one fails below without building a message.
@@ -212,9 +242,10 @@ fn device_link_verify(body: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
         });
     }
     let digest = eip191_digest(message.as_bytes());
-    let ok = recover(&digest, &sigs[0..SIG_LEN]) == Some(member)
-        && recover(&digest, &sigs[SIG_LEN..2 * SIG_LEN]) == Some(device)
-        && recover(&digest, &sigs[2 * SIG_LEN..3 * SIG_LEN]) == Some(wallet);
+    let mut chunks = sigs.chunks_exact(SIG_LEN);
+    let ok = [member, device, wallet]
+        .iter()
+        .all(|signer| chunks.next().and_then(|sig| recover(&digest, sig)) == Some(*signer));
     Ok(PrecompileResult {
         output: word(ok),
         gas_used,
@@ -232,14 +263,14 @@ fn device_revocation_verify(body: &[u8], gas_limit: u64) -> Result<PrecompileRes
             body.len()
         ));
     }
-    let member = addr(&body[0..20])?;
-    let device = addr(&body[20..40])?;
-    let revoked_at =
-        u64::from_be_bytes(body[40..48].try_into().map_err(|_| anyhow!("revoked_at"))?);
+    let member = addr(field(body, 0, 20, "member")?)?;
+    let device = addr(field(body, 20, 20, "device")?)?;
+    let revoked_at = be_u64(field(body, 40, 8, "revoked_at")?, "revoked_at")?;
     let message = device_revocation_message(&member, &device, revoked_at);
     let gas_used = message_gas(1, message.len());
     check_gas(gas_used, gas_limit, "DEVICE_REVOCATION_VERIFY")?;
-    let ok = recover(&eip191_digest(message.as_bytes()), &body[48..]) == Some(member);
+    let member_sig = body.get(48..).unwrap_or_default();
+    let ok = recover(&eip191_digest(message.as_bytes()), member_sig) == Some(member);
     Ok(PrecompileResult {
         output: word(ok),
         gas_used,

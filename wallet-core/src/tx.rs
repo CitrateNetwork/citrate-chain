@@ -133,10 +133,11 @@ pub fn sign_recoverable(
         .map_err(|e| WalletError::SigningFailed(format!("secp256k1 sign failed: {}", e)))?;
 
     let sig_bytes = signature.to_bytes();
-    let mut r = [0u8; 32];
-    let mut s = [0u8; 32];
-    r.copy_from_slice(&sig_bytes[..32]);
-    s.copy_from_slice(&sig_bytes[32..]);
+    // A compact secp256k1 signature is exactly r(32) ‖ s(32).
+    let (r, s) = sig_bytes
+        .split_first_chunk::<32>()
+        .and_then(|(r, rest)| Some((*r, *rest.first_chunk::<32>()?)))
+        .ok_or_else(|| WalletError::SigningFailed("malformed secp256k1 signature".into()))?;
     Ok((r, s, recovery_id.to_byte()))
 }
 
@@ -170,7 +171,11 @@ pub fn sign_eip155_legacy_tx(
     signing_hash.zeroize();
 
     // EIP-155: v = recovery_id + chain_id * 2 + 35.
-    let v = recovery_id as u64 + chain_id * 2 + 35;
+    let v = chain_id
+        .checked_mul(2)
+        .and_then(|c| c.checked_add(35))
+        .and_then(|c| c.checked_add(recovery_id as u64))
+        .ok_or_else(|| WalletError::SigningFailed(format!("chain id {chain_id} too large for EIP-155")))?;
 
     let raw = serialize_rlp_signed(tx, v, &r, &s);
     let hash = keccak256(&raw);
@@ -203,7 +208,7 @@ fn serialize_rlp_signed(tx: &LegacyTxFields, v: u64, r: &[u8; 32], s: &[u8; 32])
 /// integers as minimal-length big-endian byte strings.
 fn trim_leading_zeros(bytes: &[u8]) -> &[u8] {
     let first_nonzero = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
-    &bytes[first_nonzero..]
+    bytes.get(first_nonzero..).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -531,5 +536,17 @@ mod tests {
             found,
             "expected a leading-zero r or s within 2000 nonces (~certain at p=1/256)"
         );
+    }
+
+    /// PANIC-S1: a chain id too large for EIP-155 `v` is a signing error, not a
+    /// crash; the largest representable one still signs.
+    #[test]
+    fn panic_s1_eip155_v_overflow_is_an_error() {
+        let key = SigningKey::from_bytes((&unhex(EIP155_PRIV)[..]).into()).expect("valid key");
+        let tx = eip155_example_tx();
+        assert!(sign_eip155_legacy_tx(&key, &tx, u64::MAX).is_err());
+        assert!(sign_eip155_legacy_tx(&key, &tx, (u64::MAX - 36) / 2).is_ok());
+        let signed = sign_eip155_legacy_tx(&key, &tx, 40204).expect("sign");
+        assert!(signed.v == 40204 * 2 + 35 || signed.v == 40204 * 2 + 36);
     }
 }

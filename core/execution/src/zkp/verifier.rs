@@ -122,18 +122,13 @@ impl Verifier {
         }
 
         // Verify public inputs match expected values
-        if proof.public_inputs.len() < 3 {
+        let [model_hash_str, input_hash_str, output_hash_str, ..] = proof.public_inputs.as_slice()
+        else {
             return Err(ZKPError::InvalidPublicInputs);
-        }
-
-        let model_hash_str = &proof.public_inputs[0];
-        let input_hash_str = &proof.public_inputs[1];
-        let output_hash_str = &proof.public_inputs[2];
+        };
 
         // Verify hashes match — public inputs are decimal u128 strings (first 16 bytes)
-        let to_field_str = |hash: &[u8]| -> String {
-            hash.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128).to_string()
-        };
+        let to_field_str = |hash: &[u8]| -> String { super::be_u128_prefix(hash).to_string() };
 
         if to_field_str(expected_model_hash) != *model_hash_str
             || to_field_str(expected_input_hash) != *input_hash_str
@@ -162,19 +157,14 @@ impl Verifier {
         }
 
         // Verify public inputs
-        if proof.public_inputs.len() < 5 {
+        let [model_hash_str, dataset_hash_str, _, loss_str, samples_str, ..] =
+            proof.public_inputs.as_slice()
+        else {
             return Err(ZKPError::InvalidPublicInputs);
-        }
-
-        let model_hash_str = &proof.public_inputs[0];
-        let dataset_hash_str = &proof.public_inputs[1];
-        let loss_str = &proof.public_inputs[3];
-        let samples_str = &proof.public_inputs[4];
+        };
 
         // Verify hashes match — public inputs are decimal u128 strings (first 16 bytes)
-        let to_field_str = |hash: &[u8]| -> String {
-            hash.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128).to_string()
-        };
+        let to_field_str = |hash: &[u8]| -> String { super::be_u128_prefix(hash).to_string() };
 
         if to_field_str(expected_model_hash) != *model_hash_str
             || to_field_str(expected_dataset_hash) != *dataset_hash_str
@@ -216,13 +206,12 @@ impl Verifier {
                     .map_err(|_| ZKPError::InvalidPublicInputs)?;
 
                 // Convert first 16 bytes to field element for 128-bit collision resistance
-                let val = bytes.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128);
+                let val = super::be_u128_prefix(&bytes);
                 let value = Fr::from(val);
                 field_elements.push(value);
             } else {
                 // Try to parse as number (u128 to support 128-bit hash truncations)
-                let num: u128 = input.parse()
-                    .map_err(|_| ZKPError::InvalidPublicInputs)?;
+                let num: u128 = input.parse().map_err(|_| ZKPError::InvalidPublicInputs)?;
                 field_elements.push(Fr::from(num));
             }
         }

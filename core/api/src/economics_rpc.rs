@@ -69,7 +69,7 @@ pub fn register_economics_methods(
                 return Err(jsonrpc_core::Error::invalid_params("Missing address parameter"));
             }
 
-            let address_str = match params[0].as_str() {
+            let address_str = match crate::eth_rpc::arg(&params, 0).as_str() {
                 Some(s) => s,
                 None => return Err(jsonrpc_core::Error::invalid_params("Invalid address format")),
             };
@@ -119,7 +119,7 @@ pub fn register_economics_methods(
                 return Err(jsonrpc_core::Error::invalid_params("Missing address parameter"));
             }
 
-            let address_str = match params[0].as_str() {
+            let address_str = match crate::eth_rpc::arg(&params, 0).as_str() {
                 Some(s) => s,
                 None => return Err(jsonrpc_core::Error::invalid_params("Invalid address format")),
             };
@@ -201,20 +201,20 @@ pub fn register_economics_methods(
 
                     // Calculate total fees and identify AI operations
                     for tx in &pending_txs {
-                        total_gas_used += tx.gas_limit;
+                        total_gas_used = total_gas_used.saturating_add(tx.gas_limit);
 
                         // Calculate fee (gas_limit * gas_price)
-                        let fee = primitive_types::U256::from(tx.gas_limit) * primitive_types::U256::from(tx.gas_price);
-                        total_gas_fees += fee;
+                        let fee = primitive_types::U256::from(tx.gas_limit).saturating_mul(primitive_types::U256::from(tx.gas_price));
+                        total_gas_fees = total_gas_fees.saturating_add(fee);
 
                         // Check if this is an AI operation (simplified heuristic)
                         if tx.gas_limit > 500_000 {  // AI operations typically use more gas
-                            ai_operations += 1;
+                            ai_operations = ai_operations.saturating_add(1);
                         }
                     }
 
                     let avg_gas_price = if tx_count > 0 {
-                        total_gas_used / tx_count as u64
+                        total_gas_used.checked_div(tx_count as u64).unwrap_or(0)
                     } else {
                         1_000_000_000 // 1 Gwei default
                     };
@@ -277,7 +277,7 @@ pub fn register_economics_methods(
                 return Err(jsonrpc_core::Error::invalid_params("Missing address parameter"));
             }
 
-            let address_str = match params[0].as_str() {
+            let address_str = match crate::eth_rpc::arg(&params, 0).as_str() {
                 Some(s) => s,
                 None => return Err(jsonrpc_core::Error::invalid_params("Invalid address format")),
             };
@@ -317,7 +317,7 @@ pub fn register_economics_methods(
                 return Err(jsonrpc_core::Error::invalid_params("Missing address parameter"));
             }
 
-            let address_str = match params[0].as_str() {
+            let address_str = match crate::eth_rpc::arg(&params, 0).as_str() {
                 Some(s) => s,
                 None => return Err(jsonrpc_core::Error::invalid_params("Invalid address format")),
             };

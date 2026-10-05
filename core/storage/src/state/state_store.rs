@@ -218,18 +218,18 @@ impl StateStoreTrait for StateStore {
         let mut buf = [0u8; 40];
         buf[..32].copy_from_slice(hash.as_bytes());
         buf[32..].copy_from_slice(&height.to_be_bytes());
-        self.db
-            .put_cf(CF_METADATA, crate::chain::block_store::APPLIED_TIP_KEY, &buf)
+        self.db.put_cf(
+            CF_METADATA,
+            crate::chain::block_store::APPLIED_TIP_KEY,
+            &buf,
+        )
     }
 
     // Sprint P950-A-4 WP-A.4.3: persist MVCC per-account versions.
 
     fn put_account_version(&self, address: &Address, version: u64) -> Result<()> {
-        self.db.put_cf(
-            CF_ACCOUNT_VERSIONS,
-            &address.0,
-            &version.to_be_bytes(),
-        )?;
+        self.db
+            .put_cf(CF_ACCOUNT_VERSIONS, &address.0, &version.to_be_bytes())?;
         Ok(())
     }
 
@@ -239,12 +239,8 @@ impl StateStoreTrait for StateStore {
         }
         let mut batch = self.db.batch();
         for (addr, ver) in entries {
-            self.db.batch_put_cf(
-                &mut batch,
-                CF_ACCOUNT_VERSIONS,
-                &addr.0,
-                &ver.to_be_bytes(),
-            )?;
+            self.db
+                .batch_put_cf(&mut batch, CF_ACCOUNT_VERSIONS, &addr.0, &ver.to_be_bytes())?;
         }
         self.db.write_batch(batch)?;
         Ok(())
@@ -275,11 +271,8 @@ impl StateStoreTrait for StateStore {
     }
 
     fn put_global_version(&self, version: u64) -> Result<()> {
-        self.db.put_cf(
-            CF_ACCOUNT_VERSIONS,
-            &[0xFFu8; 20],
-            &version.to_be_bytes(),
-        )?;
+        self.db
+            .put_cf(CF_ACCOUNT_VERSIONS, &[0xFFu8; 20], &version.to_be_bytes())?;
         Ok(())
     }
 
@@ -342,16 +335,18 @@ impl StateStore {
         for (key, value) in iter {
             // Key format: address(20) + storage_key(32) = 52 bytes
             if key.len() == 52 {
-                let mut addr_bytes = [0u8; 20];
-                addr_bytes.copy_from_slice(&key[..20]);
+                let (addr_part, key_part) = key.split_at(20);
+                let (Ok(addr_bytes), Ok(storage_key)) = (
+                    <[u8; 20]>::try_from(addr_part),
+                    <[u8; 32]>::try_from(key_part),
+                ) else {
+                    continue;
+                };
                 let address = Address(addr_bytes);
 
-                let mut storage_key = [0u8; 32];
-                storage_key.copy_from_slice(&key[20..52]);
-
                 let mut storage_value = [0u8; 32];
-                if value.len() >= 32 {
-                    storage_value.copy_from_slice(&value[..32]);
+                if let Some(head) = value.first_chunk::<32>() {
+                    storage_value = *head;
                 }
 
                 storage.push(((address, Hash::new(storage_key)), Hash::new(storage_value)));
@@ -427,8 +422,7 @@ impl StateStore {
         let mut model_ids = Vec::new();
 
         for (key, _) in self.db.prefix_iter_cf(CF_METADATA, &prefix)? {
-            if key.len() > prefix.len() {
-                let model_hash_bytes = &key[prefix.len()..];
+            if let Some(model_hash_bytes) = key.get(prefix.len()..).filter(|r| !r.is_empty()) {
                 if model_hash_bytes.len() == 32 {
                     let mut hash_array = [0u8; 32];
                     hash_array.copy_from_slice(model_hash_bytes);
@@ -527,7 +521,7 @@ impl StateStore {
 
 // Key generation helpers
 fn storage_key(address: &Address, key: &[u8]) -> Vec<u8> {
-    let mut storage_key = Vec::with_capacity(20 + key.len());
+    let mut storage_key = Vec::with_capacity(key.len().saturating_add(20));
     storage_key.extend_from_slice(&address.0);
     storage_key.extend_from_slice(key);
     storage_key

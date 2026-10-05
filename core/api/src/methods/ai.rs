@@ -218,9 +218,7 @@ impl AiApi {
         // Calculate model hash
         let mut hasher = Sha3_256::new();
         hasher.update(&request.model_data);
-        let model_hash_bytes = hasher.finalize();
-        let mut model_hash_array = [0u8; 32];
-        model_hash_array.copy_from_slice(&model_hash_bytes[..32]);
+        let model_hash_array: [u8; 32] = hasher.finalize().into();
         let _model_hash = Hash::new(model_hash_array);
 
         // We'll encode the model registration data in the transaction data field
@@ -536,9 +534,7 @@ impl AiApi {
         hasher.update(from.0);
         hasher.update(chrono::Utc::now().timestamp().to_le_bytes());
 
-        let job_id_bytes = hasher.finalize();
-        let mut job_id_array = [0u8; 32];
-        job_id_array.copy_from_slice(&job_id_bytes[..32]);
+        let job_id_array: [u8; 32] = hasher.finalize().into();
         let job_id = JobId(Hash::new(job_id_array));
 
         // Create training job
@@ -659,9 +655,7 @@ impl AiApi {
         hasher.update(&request.adapter_data);
         hasher.update(chrono::Utc::now().timestamp().to_le_bytes());
 
-        let adapter_id_bytes = hasher.finalize();
-        let mut adapter_id_array = [0u8; 32];
-        adapter_id_array.copy_from_slice(&adapter_id_bytes[..32]);
+        let adapter_id_array: [u8; 32] = hasher.finalize().into();
         let adapter_id = Hash::new(adapter_id_array);
 
         // Create LoRA adapter record
@@ -883,7 +877,7 @@ impl AiApi {
             usage: TokenUsage {
                 prompt_tokens,
                 completion_tokens,
-                total_tokens: prompt_tokens + completion_tokens,
+                total_tokens: prompt_tokens.saturating_add(completion_tokens),
             },
         })
     }
@@ -934,8 +928,7 @@ impl AiApi {
                     // Convert hash to normalized embedding vector
                     (0..embedding_dim)
                         .map(|i| {
-                            let byte_idx = i % hash.len();
-                            let value = hash[byte_idx] as f32 / 255.0;
+                            let value = hash.iter().cycle().nth(i).copied().unwrap_or(0) as f32 / 255.0;
                             (value - 0.5) * 2.0 // Normalize to [-1, 1]
                         })
                         .collect()

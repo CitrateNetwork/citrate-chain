@@ -4,16 +4,12 @@
 // unified_economics, dynamic_pricing, governance, revenue_sharing,
 // enhanced_rewards, rewards, token, slashing, genesis, institutional, estimator.
 
-use citrate_economics::*;
 use citrate_economics::dynamic_pricing::DynamicPricingManager;
-use citrate_economics::enhanced_rewards::{
-    EnhancedRewardCalculator, EnhancedRewardConfig,
-};
+use citrate_economics::enhanced_rewards::{EnhancedRewardCalculator, EnhancedRewardConfig};
 use citrate_economics::governance::{GovernanceManager, ProposalStatus};
-use citrate_economics::revenue_sharing::{
-    PerformanceMetrics, RevenueShareManager,
-};
+use citrate_economics::revenue_sharing::{PerformanceMetrics, RevenueShareManager};
 use citrate_economics::unified_economics::UnifiedEconomicsManager;
+use citrate_economics::*;
 use citrate_execution::types::Address;
 use primitive_types::U256;
 use std::collections::HashMap;
@@ -108,7 +104,10 @@ fn test_ai_contribution(a: Address) -> AIContribution {
     }
 }
 
-fn make_block(height: u64, txs: Vec<citrate_consensus::types::Transaction>) -> citrate_consensus::types::Block {
+fn make_block(
+    height: u64,
+    txs: Vec<citrate_consensus::types::Transaction>,
+) -> citrate_consensus::types::Block {
     use citrate_consensus::types::*;
     BlockBuilder::new()
         .height(height)
@@ -183,7 +182,9 @@ fn test_unified_get_operation_cost_all_types() {
     let contract = mgr.get_operation_cost(OperationType::ContractCall);
     let ai = mgr.get_operation_cost(OperationType::AIInference { compute_units: 100 });
     let deploy = mgr.get_operation_cost(OperationType::ModelDeployment { model_size_mb: 500 });
-    let train = mgr.get_operation_cost(OperationType::ModelTraining { dataset_size_gb: 10 });
+    let train = mgr.get_operation_cost(OperationType::ModelTraining {
+        dataset_size_gb: 10,
+    });
 
     assert!(standard > U256::zero());
     assert!(contract > standard);
@@ -255,9 +256,14 @@ fn test_unified_register_stakeholder_and_collect_fee() {
     let config = UnifiedEconomicsConfig::default();
     let mut mgr = UnifiedEconomicsManager::new(config);
 
-    mgr.register_stakeholder(addr(1), StakeholderType::Validator).unwrap();
-    mgr.collect_fee(RevenuePool::GasFees, salt(500), addr(99)).unwrap();
-    assert_eq!(mgr.get_revenue_pool_balance(&RevenuePool::GasFees), salt(500));
+    mgr.register_stakeholder(addr(1), StakeholderType::Validator)
+        .unwrap();
+    mgr.collect_fee(RevenuePool::GasFees, salt(500), addr(99))
+        .unwrap();
+    assert_eq!(
+        mgr.get_revenue_pool_balance(&RevenuePool::GasFees),
+        salt(500)
+    );
 }
 
 #[test]
@@ -268,7 +274,14 @@ fn test_unified_get_economic_state_none_then_some() {
     assert!(mgr.get_economic_state().is_none());
 
     let utilization = default_utilization(1, 5_000_000, 10_000_000);
-    let _ = mgr.process_block(1, utilization, vec![test_validator(addr(1), salt(50_000))], vec![], good_health(), HashMap::new());
+    let _ = mgr.process_block(
+        1,
+        utilization,
+        vec![test_validator(addr(1), salt(50_000))],
+        vec![],
+        good_health(),
+        HashMap::new(),
+    );
 
     assert!(mgr.get_economic_state().is_some());
 }
@@ -279,7 +292,9 @@ fn test_unified_revenue_distribution_history_empty() {
     let mgr = UnifiedEconomicsManager::new(config);
 
     assert!(mgr.get_revenue_distribution_history(None).is_empty());
-    assert!(mgr.get_revenue_distribution_history(Some(RevenuePool::GasFees)).is_empty());
+    assert!(mgr
+        .get_revenue_distribution_history(Some(RevenuePool::GasFees))
+        .is_empty());
 }
 
 #[test]
@@ -343,7 +358,8 @@ fn test_unified_stakeholder_revenue_info() {
 
     assert!(mgr.get_stakeholder_revenue_info(&addr(1)).is_none());
 
-    mgr.register_stakeholder(addr(1), StakeholderType::Validator).unwrap();
+    mgr.register_stakeholder(addr(1), StakeholderType::Validator)
+        .unwrap();
     assert!(mgr.get_stakeholder_revenue_info(&addr(1)).is_some());
 }
 
@@ -374,7 +390,9 @@ fn test_pricing_model_deployment_scales_with_size() {
     let pricing = DynamicPricingManager::new(DynamicPricingConfig::default());
 
     let small = pricing.get_operation_price(OperationType::ModelDeployment { model_size_mb: 10 });
-    let large = pricing.get_operation_price(OperationType::ModelDeployment { model_size_mb: 1000 });
+    let large = pricing.get_operation_price(OperationType::ModelDeployment {
+        model_size_mb: 1000,
+    });
     assert!(large > small);
 }
 
@@ -383,7 +401,9 @@ fn test_pricing_model_training_scales_with_dataset() {
     let pricing = DynamicPricingManager::new(DynamicPricingConfig::default());
 
     let small = pricing.get_operation_price(OperationType::ModelTraining { dataset_size_gb: 1 });
-    let large = pricing.get_operation_price(OperationType::ModelTraining { dataset_size_gb: 100 });
+    let large = pricing.get_operation_price(OperationType::ModelTraining {
+        dataset_size_gb: 100,
+    });
     assert!(large > small);
 }
 
@@ -392,7 +412,10 @@ fn test_pricing_history_and_trends() {
     let mut pricing = DynamicPricingManager::new(DynamicPricingConfig::default());
 
     assert!(pricing.get_price_history(10).is_empty());
-    assert!(matches!(pricing.predict_price_trend(10), PriceTrend::Stable));
+    assert!(matches!(
+        pricing.predict_price_trend(10),
+        PriceTrend::Stable
+    ));
 
     for i in 1..=15 {
         let metrics = UtilizationMetrics {
@@ -467,7 +490,9 @@ fn test_pricing_ai_inference_compute_units_scaling() {
     let pricing = DynamicPricingManager::new(DynamicPricingConfig::default());
 
     let low = pricing.get_operation_price(OperationType::AIInference { compute_units: 1 });
-    let high = pricing.get_operation_price(OperationType::AIInference { compute_units: 1000 });
+    let high = pricing.get_operation_price(OperationType::AIInference {
+        compute_units: 1000,
+    });
     assert!(high > low);
 }
 
@@ -481,13 +506,22 @@ fn test_governance_delegate_vote() {
     let mut gov = GovernanceManager::new(config.clone());
     let total_supply = salt(1_000_000_000);
 
-    gov.delegate_vote(addr(1), addr(2), salt(1000), 100).unwrap();
+    gov.delegate_vote(addr(1), addr(2), salt(1000), 100)
+        .unwrap();
 
-    let pid = gov.create_proposal(
-        addr(3),
-        ProposalType::ParameterChange { parameter: "block_reward".into(), new_value: U256::from(20) },
-        "Test".into(), "Desc".into(), 100, config.proposal_threshold,
-    ).unwrap();
+    let pid = gov
+        .create_proposal(
+            addr(3),
+            ProposalType::ParameterChange {
+                parameter: "block_reward".into(),
+                new_value: U256::from(20),
+            },
+            "Test".into(),
+            "Desc".into(),
+            100,
+            config.proposal_threshold,
+        )
+        .unwrap();
 
     let result = gov.vote(pid, addr(2), VoteType::For, 102, total_supply);
     assert!(result.is_ok());
@@ -499,26 +533,42 @@ fn test_governance_delegate_vote() {
 #[test]
 fn test_governance_execute_proposal() {
     let config = GovernanceConfig {
-        voting_period: 10, execution_delay: 5, quorum_percentage: 0,
-        approval_threshold: 50, grace_period: 100,
+        voting_period: 10,
+        execution_delay: 5,
+        quorum_percentage: 0,
+        approval_threshold: 50,
+        grace_period: 100,
         ..GovernanceConfig::default()
     };
     let mut gov = GovernanceManager::new(config.clone());
     let total_supply = salt(1_000_000_000);
 
-    let pid = gov.create_proposal(
-        addr(1),
-        ProposalType::TreasurySpend { recipient: addr(10), amount: salt(1000), description: "x".into() },
-        "Treasury".into(), "Desc".into(), 100, config.proposal_threshold,
-    ).unwrap();
+    let pid = gov
+        .create_proposal(
+            addr(1),
+            ProposalType::TreasurySpend {
+                recipient: addr(10),
+                amount: salt(1000),
+                description: "x".into(),
+            },
+            "Treasury".into(),
+            "Desc".into(),
+            100,
+            config.proposal_threshold,
+        )
+        .unwrap();
 
-    gov.vote(pid, addr(2), VoteType::For, 102, total_supply).unwrap();
+    gov.vote(pid, addr(2), VoteType::For, 102, total_supply)
+        .unwrap();
     gov.process_proposals(112, total_supply); // Voting ends → Succeeded
     gov.process_proposals(118, total_supply); // Execution delay → Queued
 
     let result = gov.execute_proposal(pid);
     assert!(result.is_ok());
-    assert_eq!(gov.get_proposal(pid).unwrap().status, ProposalStatus::Executed);
+    assert_eq!(
+        gov.get_proposal(pid).unwrap().status,
+        ProposalStatus::Executed
+    );
 }
 
 #[test]
@@ -526,51 +576,91 @@ fn test_governance_execute_non_queued_fails() {
     let config = GovernanceConfig::default();
     let mut gov = GovernanceManager::new(config.clone());
 
-    let pid = gov.create_proposal(
-        addr(1), ProposalType::ParameterChange { parameter: "x".into(), new_value: U256::from(1) },
-        "Test".into(), "Desc".into(), 100, config.proposal_threshold,
-    ).unwrap();
+    let pid = gov
+        .create_proposal(
+            addr(1),
+            ProposalType::ParameterChange {
+                parameter: "x".into(),
+                new_value: U256::from(1),
+            },
+            "Test".into(),
+            "Desc".into(),
+            100,
+            config.proposal_threshold,
+        )
+        .unwrap();
 
     assert!(gov.execute_proposal(pid).is_err());
 }
 
 #[test]
 fn test_governance_failed_proposal() {
-    let config = GovernanceConfig { voting_period: 10, quorum_percentage: 50, ..GovernanceConfig::default() };
-    let mut gov = GovernanceManager::new(config.clone());
-    let total_supply = salt(1_000_000_000);
-
-    let pid = gov.create_proposal(
-        addr(1), ProposalType::ParameterChange { parameter: "x".into(), new_value: U256::from(1) },
-        "Test".into(), "Desc".into(), 100, config.proposal_threshold,
-    ).unwrap();
-
-    gov.vote(pid, addr(2), VoteType::For, 102, total_supply).unwrap();
-
-    let updates = gov.process_proposals(112, total_supply);
-    assert!(updates.iter().any(|u| matches!(u, ProposalUpdate::Failed(_))));
-}
-
-#[test]
-fn test_governance_expired_proposal() {
     let config = GovernanceConfig {
-        voting_period: 10, execution_delay: 5, grace_period: 5,
-        quorum_percentage: 0, approval_threshold: 50,
+        voting_period: 10,
+        quorum_percentage: 50,
         ..GovernanceConfig::default()
     };
     let mut gov = GovernanceManager::new(config.clone());
     let total_supply = salt(1_000_000_000);
 
-    let pid = gov.create_proposal(
-        addr(1), ProposalType::ParameterChange { parameter: "x".into(), new_value: U256::from(1) },
-        "Test".into(), "Desc".into(), 100, config.proposal_threshold,
-    ).unwrap();
+    let pid = gov
+        .create_proposal(
+            addr(1),
+            ProposalType::ParameterChange {
+                parameter: "x".into(),
+                new_value: U256::from(1),
+            },
+            "Test".into(),
+            "Desc".into(),
+            100,
+            config.proposal_threshold,
+        )
+        .unwrap();
 
-    gov.vote(pid, addr(2), VoteType::For, 102, total_supply).unwrap();
+    gov.vote(pid, addr(2), VoteType::For, 102, total_supply)
+        .unwrap();
+
+    let updates = gov.process_proposals(112, total_supply);
+    assert!(updates
+        .iter()
+        .any(|u| matches!(u, ProposalUpdate::Failed(_))));
+}
+
+#[test]
+fn test_governance_expired_proposal() {
+    let config = GovernanceConfig {
+        voting_period: 10,
+        execution_delay: 5,
+        grace_period: 5,
+        quorum_percentage: 0,
+        approval_threshold: 50,
+        ..GovernanceConfig::default()
+    };
+    let mut gov = GovernanceManager::new(config.clone());
+    let total_supply = salt(1_000_000_000);
+
+    let pid = gov
+        .create_proposal(
+            addr(1),
+            ProposalType::ParameterChange {
+                parameter: "x".into(),
+                new_value: U256::from(1),
+            },
+            "Test".into(),
+            "Desc".into(),
+            100,
+            config.proposal_threshold,
+        )
+        .unwrap();
+
+    gov.vote(pid, addr(2), VoteType::For, 102, total_supply)
+        .unwrap();
     gov.process_proposals(112, total_supply); // Succeeded
     gov.process_proposals(118, total_supply); // Queued
     let updates = gov.process_proposals(130, total_supply); // Expired
-    assert!(updates.iter().any(|u| matches!(u, ProposalUpdate::Expired(_))));
+    assert!(updates
+        .iter()
+        .any(|u| matches!(u, ProposalUpdate::Expired(_))));
 }
 
 #[test]
@@ -581,10 +671,19 @@ fn test_governance_get_active_proposals() {
 
     assert!(gov.get_active_proposals().is_empty());
 
-    let _pid = gov.create_proposal(
-        addr(1), ProposalType::ParameterChange { parameter: "x".into(), new_value: U256::from(1) },
-        "Test".into(), "Desc".into(), 100, config.proposal_threshold,
-    ).unwrap();
+    let _pid = gov
+        .create_proposal(
+            addr(1),
+            ProposalType::ParameterChange {
+                parameter: "x".into(),
+                new_value: U256::from(1),
+            },
+            "Test".into(),
+            "Desc".into(),
+            100,
+            config.proposal_threshold,
+        )
+        .unwrap();
 
     gov.process_proposals(102, total_supply); // Pending → Active
     assert_eq!(gov.get_active_proposals().len(), 1);
@@ -596,11 +695,16 @@ fn test_governance_update_config() {
 
     gov.update_config("proposal_threshold", salt(5000)).unwrap();
     gov.update_config("vote_threshold", salt(10)).unwrap();
-    gov.update_config("voting_period", U256::from(100_000)).unwrap();
-    gov.update_config("execution_delay", U256::from(500)).unwrap();
-    gov.update_config("quorum_percentage", U256::from(20)).unwrap();
-    gov.update_config("approval_threshold", U256::from(55)).unwrap();
-    gov.update_config("grace_period", U256::from(10_000)).unwrap();
+    gov.update_config("voting_period", U256::from(100_000))
+        .unwrap();
+    gov.update_config("execution_delay", U256::from(500))
+        .unwrap();
+    gov.update_config("quorum_percentage", U256::from(20))
+        .unwrap();
+    gov.update_config("approval_threshold", U256::from(55))
+        .unwrap();
+    gov.update_config("grace_period", U256::from(10_000))
+        .unwrap();
 
     assert!(gov.update_config("nonexistent", U256::from(1)).is_err());
 }
@@ -611,26 +715,51 @@ fn test_governance_vote_before_start_rejected() {
     let mut gov = GovernanceManager::new(config.clone());
     let total_supply = salt(1_000_000_000);
 
-    let pid = gov.create_proposal(
-        addr(1), ProposalType::ParameterChange { parameter: "x".into(), new_value: U256::from(1) },
-        "Test".into(), "Desc".into(), 100, config.proposal_threshold,
-    ).unwrap();
+    let pid = gov
+        .create_proposal(
+            addr(1),
+            ProposalType::ParameterChange {
+                parameter: "x".into(),
+                new_value: U256::from(1),
+            },
+            "Test".into(),
+            "Desc".into(),
+            100,
+            config.proposal_threshold,
+        )
+        .unwrap();
 
-    assert!(gov.vote(pid, addr(2), VoteType::For, 100, total_supply).is_err());
+    assert!(gov
+        .vote(pid, addr(2), VoteType::For, 100, total_supply)
+        .is_err());
 }
 
 #[test]
 fn test_governance_vote_after_end_rejected() {
-    let config = GovernanceConfig { voting_period: 10, ..GovernanceConfig::default() };
+    let config = GovernanceConfig {
+        voting_period: 10,
+        ..GovernanceConfig::default()
+    };
     let mut gov = GovernanceManager::new(config.clone());
     let total_supply = salt(1_000_000_000);
 
-    let pid = gov.create_proposal(
-        addr(1), ProposalType::ParameterChange { parameter: "x".into(), new_value: U256::from(1) },
-        "Test".into(), "Desc".into(), 100, config.proposal_threshold,
-    ).unwrap();
+    let pid = gov
+        .create_proposal(
+            addr(1),
+            ProposalType::ParameterChange {
+                parameter: "x".into(),
+                new_value: U256::from(1),
+            },
+            "Test".into(),
+            "Desc".into(),
+            100,
+            config.proposal_threshold,
+        )
+        .unwrap();
 
-    assert!(gov.vote(pid, addr(2), VoteType::For, 112, total_supply).is_err());
+    assert!(gov
+        .vote(pid, addr(2), VoteType::For, 112, total_supply)
+        .is_err());
 }
 
 #[test]
@@ -639,13 +768,24 @@ fn test_governance_abstain_and_against_votes() {
     let mut gov = GovernanceManager::new(config.clone());
     let total_supply = salt(1_000_000_000);
 
-    let pid = gov.create_proposal(
-        addr(1), ProposalType::ParameterChange { parameter: "x".into(), new_value: U256::from(1) },
-        "Test".into(), "Desc".into(), 100, config.proposal_threshold,
-    ).unwrap();
+    let pid = gov
+        .create_proposal(
+            addr(1),
+            ProposalType::ParameterChange {
+                parameter: "x".into(),
+                new_value: U256::from(1),
+            },
+            "Test".into(),
+            "Desc".into(),
+            100,
+            config.proposal_threshold,
+        )
+        .unwrap();
 
-    gov.vote(pid, addr(2), VoteType::Abstain, 102, total_supply).unwrap();
-    gov.vote(pid, addr(3), VoteType::Against, 102, total_supply).unwrap();
+    gov.vote(pid, addr(2), VoteType::Abstain, 102, total_supply)
+        .unwrap();
+    gov.vote(pid, addr(3), VoteType::Against, 102, total_supply)
+        .unwrap();
 
     let p = gov.get_proposal(pid).unwrap();
     assert!(p.abstain_votes > U256::zero());
@@ -665,22 +805,44 @@ fn test_governance_proposal_types() {
 
     // NetworkUpgrade
     gov.create_proposal(
-        addr(1), ProposalType::NetworkUpgrade { version: "2.0".into(), upgrade_block: 100_000 },
-        "Upgrade".into(), "Desc".into(), 100, config.proposal_threshold,
-    ).unwrap();
+        addr(1),
+        ProposalType::NetworkUpgrade {
+            version: "2.0".into(),
+            upgrade_block: 100_000,
+        },
+        "Upgrade".into(),
+        "Desc".into(),
+        100,
+        config.proposal_threshold,
+    )
+    .unwrap();
 
     // Emergency
     gov.create_proposal(
-        addr(1), ProposalType::Emergency { action: "halt".into(), reason: "bug".into() },
-        "Emergency".into(), "Desc".into(), 100, config.proposal_threshold,
-    ).unwrap();
+        addr(1),
+        ProposalType::Emergency {
+            action: "halt".into(),
+            reason: "bug".into(),
+        },
+        "Emergency".into(),
+        "Desc".into(),
+        100,
+        config.proposal_threshold,
+    )
+    .unwrap();
 
     // MarketplaceGovernance
     gov.create_proposal(
         addr(1),
-        ProposalType::MarketplaceGovernance { action: MarketplaceAction::SetMinModelStake(salt(100)) },
-        "MP".into(), "Desc".into(), 100, config.proposal_threshold,
-    ).unwrap();
+        ProposalType::MarketplaceGovernance {
+            action: MarketplaceAction::SetMinModelStake(salt(100)),
+        },
+        "MP".into(),
+        "Desc".into(),
+        100,
+        config.proposal_threshold,
+    )
+    .unwrap();
 }
 
 // ===========================================================================
@@ -691,18 +853,28 @@ fn test_governance_proposal_types() {
 fn test_revenue_all_pool_types_distribution() {
     let mut mgr = RevenueShareManager::new(RevenueShareConfig::default());
 
-    mgr.register_stakeholder(addr(1), StakeholderType::Validator).unwrap();
-    mgr.register_stakeholder(addr(2), StakeholderType::ModelCreator).unwrap();
-    mgr.register_stakeholder(addr(3), StakeholderType::Infrastructure).unwrap();
-    mgr.register_stakeholder(addr(4), StakeholderType::Staker).unwrap();
-    mgr.register_stakeholder(addr(5), StakeholderType::Treasury).unwrap();
-    mgr.register_stakeholder(addr(6), StakeholderType::Facilitator).unwrap();
+    mgr.register_stakeholder(addr(1), StakeholderType::Validator)
+        .unwrap();
+    mgr.register_stakeholder(addr(2), StakeholderType::ModelCreator)
+        .unwrap();
+    mgr.register_stakeholder(addr(3), StakeholderType::Infrastructure)
+        .unwrap();
+    mgr.register_stakeholder(addr(4), StakeholderType::Staker)
+        .unwrap();
+    mgr.register_stakeholder(addr(5), StakeholderType::Treasury)
+        .unwrap();
+    mgr.register_stakeholder(addr(6), StakeholderType::Facilitator)
+        .unwrap();
 
     let amount = salt(5000);
     let pools = [
-        RevenuePool::GasFees, RevenuePool::AIInference, RevenuePool::ModelDeployment,
-        RevenuePool::ModelTraining, RevenuePool::MarketplaceFees,
-        RevenuePool::SlashingRedistribution, RevenuePool::FacilitatorFees,
+        RevenuePool::GasFees,
+        RevenuePool::AIInference,
+        RevenuePool::ModelDeployment,
+        RevenuePool::ModelTraining,
+        RevenuePool::MarketplaceFees,
+        RevenuePool::SlashingRedistribution,
+        RevenuePool::FacilitatorFees,
     ];
 
     for pool in &pools {
@@ -721,22 +893,36 @@ fn test_revenue_all_pool_types_distribution() {
 #[test]
 fn test_revenue_below_threshold_no_distribution() {
     let mut mgr = RevenueShareManager::new(RevenueShareConfig::default());
-    mgr.register_stakeholder(addr(1), StakeholderType::Validator).unwrap();
-    mgr.collect_revenue(RevenuePool::GasFees, salt(500), addr(99)).unwrap();
+    mgr.register_stakeholder(addr(1), StakeholderType::Validator)
+        .unwrap();
+    mgr.collect_revenue(RevenuePool::GasFees, salt(500), addr(99))
+        .unwrap();
 
-    assert!(mgr.distribute_revenue(RevenuePool::GasFees, 10_000).unwrap().is_none());
+    assert!(mgr
+        .distribute_revenue(RevenuePool::GasFees, 10_000)
+        .unwrap()
+        .is_none());
 }
 
 #[test]
 fn test_revenue_too_frequent_no_distribution() {
     let mut mgr = RevenueShareManager::new(RevenueShareConfig::default());
-    mgr.register_stakeholder(addr(1), StakeholderType::Validator).unwrap();
-    mgr.collect_revenue(RevenuePool::GasFees, salt(5000), addr(99)).unwrap();
+    mgr.register_stakeholder(addr(1), StakeholderType::Validator)
+        .unwrap();
+    mgr.collect_revenue(RevenuePool::GasFees, salt(5000), addr(99))
+        .unwrap();
 
-    assert!(mgr.distribute_revenue(RevenuePool::GasFees, 7200).unwrap().is_some());
+    assert!(mgr
+        .distribute_revenue(RevenuePool::GasFees, 7200)
+        .unwrap()
+        .is_some());
 
-    mgr.collect_revenue(RevenuePool::GasFees, salt(5000), addr(99)).unwrap();
-    assert!(mgr.distribute_revenue(RevenuePool::GasFees, 7201).unwrap().is_none());
+    mgr.collect_revenue(RevenuePool::GasFees, salt(5000), addr(99))
+        .unwrap();
+    assert!(mgr
+        .distribute_revenue(RevenuePool::GasFees, 7201)
+        .unwrap()
+        .is_none());
 }
 
 #[test]
@@ -746,8 +932,10 @@ fn test_revenue_pool_balance_and_stakeholder_contribution() {
     assert_eq!(mgr.get_pool_balance(&RevenuePool::GasFees), U256::zero());
     assert!(mgr.get_stakeholder_contribution(&addr(1)).is_none());
 
-    mgr.register_stakeholder(addr(1), StakeholderType::Validator).unwrap();
-    mgr.collect_revenue(RevenuePool::GasFees, salt(100), addr(1)).unwrap();
+    mgr.register_stakeholder(addr(1), StakeholderType::Validator)
+        .unwrap();
+    mgr.collect_revenue(RevenuePool::GasFees, salt(100), addr(1))
+        .unwrap();
 
     assert_eq!(mgr.get_pool_balance(&RevenuePool::GasFees), salt(100));
     assert!(mgr.get_stakeholder_contribution(&addr(1)).is_some());
@@ -756,26 +944,40 @@ fn test_revenue_pool_balance_and_stakeholder_contribution() {
 #[test]
 fn test_revenue_distribution_history_filter() {
     let mut mgr = RevenueShareManager::new(RevenueShareConfig::default());
-    mgr.register_stakeholder(addr(1), StakeholderType::Validator).unwrap();
-    mgr.register_stakeholder(addr(2), StakeholderType::ModelCreator).unwrap();
+    mgr.register_stakeholder(addr(1), StakeholderType::Validator)
+        .unwrap();
+    mgr.register_stakeholder(addr(2), StakeholderType::ModelCreator)
+        .unwrap();
 
-    mgr.collect_revenue(RevenuePool::GasFees, salt(5000), addr(99)).unwrap();
-    mgr.collect_revenue(RevenuePool::AIInference, salt(5000), addr(99)).unwrap();
+    mgr.collect_revenue(RevenuePool::GasFees, salt(5000), addr(99))
+        .unwrap();
+    mgr.collect_revenue(RevenuePool::AIInference, salt(5000), addr(99))
+        .unwrap();
 
     mgr.distribute_revenue(RevenuePool::GasFees, 8000).unwrap();
-    mgr.distribute_revenue(RevenuePool::AIInference, 8000).unwrap();
+    mgr.distribute_revenue(RevenuePool::AIInference, 8000)
+        .unwrap();
 
     assert_eq!(mgr.get_distribution_history(None).len(), 2);
-    assert_eq!(mgr.get_distribution_history(Some(RevenuePool::GasFees)).len(), 1);
-    assert!(mgr.get_distribution_history(Some(RevenuePool::MarketplaceFees)).is_empty());
+    assert_eq!(
+        mgr.get_distribution_history(Some(RevenuePool::GasFees))
+            .len(),
+        1
+    );
+    assert!(mgr
+        .get_distribution_history(Some(RevenuePool::MarketplaceFees))
+        .is_empty());
 }
 
 #[test]
 fn test_revenue_get_recent_events() {
     let mut mgr = RevenueShareManager::new(RevenueShareConfig::default());
-    mgr.register_stakeholder(addr(1), StakeholderType::Validator).unwrap();
-    mgr.collect_revenue(RevenuePool::GasFees, salt(100), addr(99)).unwrap();
-    mgr.collect_revenue(RevenuePool::GasFees, salt(200), addr(99)).unwrap();
+    mgr.register_stakeholder(addr(1), StakeholderType::Validator)
+        .unwrap();
+    mgr.collect_revenue(RevenuePool::GasFees, salt(100), addr(99))
+        .unwrap();
+    mgr.collect_revenue(RevenuePool::GasFees, salt(200), addr(99))
+        .unwrap();
 
     assert_eq!(mgr.get_recent_events(2).len(), 2);
     assert_eq!(mgr.get_recent_events(100).len(), 3); // 1 register + 2 collects
@@ -784,24 +986,32 @@ fn test_revenue_get_recent_events() {
 #[test]
 fn test_revenue_update_performance() {
     let mut mgr = RevenueShareManager::new(RevenueShareConfig::default());
-    mgr.register_stakeholder(addr(1), StakeholderType::Validator).unwrap();
+    mgr.register_stakeholder(addr(1), StakeholderType::Validator)
+        .unwrap();
 
     let perf = PerformanceMetrics {
-        uptime_percentage: 99.5, response_time_ms: 50.0,
-        success_rate: 0.99, user_satisfaction: 0.95, network_contribution: 0.8,
+        uptime_percentage: 99.5,
+        response_time_ms: 50.0,
+        success_rate: 0.99,
+        user_satisfaction: 0.95,
+        network_contribution: 0.8,
     };
     mgr.update_performance(addr(1), perf).unwrap();
     // Unregistered — no-op
-    mgr.update_performance(addr(99), PerformanceMetrics::default()).unwrap();
+    mgr.update_performance(addr(99), PerformanceMetrics::default())
+        .unwrap();
 }
 
 #[test]
 fn test_revenue_config_exactly_100_percent() {
     let mut mgr = RevenueShareManager::new(RevenueShareConfig::default());
     let config = RevenueShareConfig {
-        validator_share_bps: 2000, model_creator_share_bps: 2000,
-        infrastructure_share_bps: 2000, treasury_share_bps: 2000,
-        staker_share_bps: 1500, facilitator_share_bps: 500,
+        validator_share_bps: 2000,
+        model_creator_share_bps: 2000,
+        infrastructure_share_bps: 2000,
+        treasury_share_bps: 2000,
+        staker_share_bps: 1500,
+        facilitator_share_bps: 500,
         ..RevenueShareConfig::default()
     };
     assert!(mgr.update_config(config).is_ok());
@@ -810,16 +1020,32 @@ fn test_revenue_config_exactly_100_percent() {
 #[test]
 fn test_revenue_equal_distribution_no_contributions() {
     let mut mgr = RevenueShareManager::new(RevenueShareConfig::default());
-    mgr.register_stakeholder(addr(1), StakeholderType::Validator).unwrap();
-    mgr.register_stakeholder(addr(2), StakeholderType::Validator).unwrap();
-    mgr.register_stakeholder(addr(3), StakeholderType::Treasury).unwrap();
-    mgr.register_stakeholder(addr(4), StakeholderType::Staker).unwrap();
+    mgr.register_stakeholder(addr(1), StakeholderType::Validator)
+        .unwrap();
+    mgr.register_stakeholder(addr(2), StakeholderType::Validator)
+        .unwrap();
+    mgr.register_stakeholder(addr(3), StakeholderType::Treasury)
+        .unwrap();
+    mgr.register_stakeholder(addr(4), StakeholderType::Staker)
+        .unwrap();
 
-    mgr.collect_revenue(RevenuePool::GasFees, salt(10_000), addr(99)).unwrap();
-    let dist = mgr.distribute_revenue(RevenuePool::GasFees, 8000).unwrap().unwrap();
+    mgr.collect_revenue(RevenuePool::GasFees, salt(10_000), addr(99))
+        .unwrap();
+    let dist = mgr
+        .distribute_revenue(RevenuePool::GasFees, 8000)
+        .unwrap()
+        .unwrap();
 
-    let v1 = dist.distributions.get(&addr(1)).copied().unwrap_or(U256::zero());
-    let v2 = dist.distributions.get(&addr(2)).copied().unwrap_or(U256::zero());
+    let v1 = dist
+        .distributions
+        .get(&addr(1))
+        .copied()
+        .unwrap_or(U256::zero());
+    let v2 = dist
+        .distributions
+        .get(&addr(2))
+        .copied()
+        .unwrap_or(U256::zero());
     assert_eq!(v1, v2, "Equal distribution when no contribution scores");
 }
 
@@ -831,7 +1057,9 @@ fn test_revenue_equal_distribution_no_contributions() {
 fn test_enhanced_empty_validators_and_ai() {
     let mut calc = EnhancedRewardCalculator::new(EnhancedRewardConfig::default());
     let metrics = default_utilization(1, 5_000_000, 10_000_000);
-    let result = calc.calculate_rewards(1, &metrics, vec![], vec![], good_health()).unwrap();
+    let result = calc
+        .calculate_rewards(1, &metrics, vec![], vec![], good_health())
+        .unwrap();
 
     assert!(result.total_rewards > U256::zero());
     assert!(result.validator_rewards.is_empty());
@@ -848,7 +1076,9 @@ fn test_enhanced_multiple_validators() {
         test_validator(addr(1), salt(50_000)),
         test_validator(addr(2), salt(100_000)),
     ];
-    let result = calc.calculate_rewards(1, &metrics, validators, vec![], good_health()).unwrap();
+    let result = calc
+        .calculate_rewards(1, &metrics, validators, vec![], good_health())
+        .unwrap();
 
     assert_eq!(result.validator_rewards.len(), 2);
     let r1 = result.validator_rewards.get(&addr(1)).unwrap();
@@ -862,7 +1092,9 @@ fn test_enhanced_validator_below_min_stake_skipped() {
     let metrics = default_utilization(1, 5_000_000, 10_000_000);
     let validators = vec![test_validator(addr(1), salt(1000))]; // Below 32k min
 
-    let result = calc.calculate_rewards(1, &metrics, validators, vec![], good_health()).unwrap();
+    let result = calc
+        .calculate_rewards(1, &metrics, validators, vec![], good_health())
+        .unwrap();
     assert!(result.validator_rewards.is_empty());
 }
 
@@ -873,7 +1105,9 @@ fn test_enhanced_validator_with_slashes() {
     let mut validator = test_validator(addr(1), salt(50_000));
     validator.slash_count = 3;
 
-    let result = calc.calculate_rewards(1, &metrics, vec![validator], vec![], good_health()).unwrap();
+    let result = calc
+        .calculate_rewards(1, &metrics, vec![validator], vec![], good_health())
+        .unwrap();
     let reward = result.validator_rewards.get(&addr(1)).unwrap();
     assert!(reward.penalty > U256::zero());
 }
@@ -885,7 +1119,9 @@ fn test_enhanced_validator_low_uptime_no_performance_bonus() {
     let mut validator = test_validator(addr(1), salt(50_000));
     validator.uptime_percentage = 0.80;
 
-    let result = calc.calculate_rewards(1, &metrics, vec![validator], vec![], good_health()).unwrap();
+    let result = calc
+        .calculate_rewards(1, &metrics, vec![validator], vec![], good_health())
+        .unwrap();
     let reward = result.validator_rewards.get(&addr(1)).unwrap();
     assert_eq!(reward.performance_bonus, U256::zero());
 }
@@ -897,7 +1133,9 @@ fn test_enhanced_validator_high_uptime_gets_uptime_bonus() {
     let mut validator = test_validator(addr(1), salt(50_000));
     validator.uptime_percentage = 0.995;
 
-    let result = calc.calculate_rewards(1, &metrics, vec![validator], vec![], good_health()).unwrap();
+    let result = calc
+        .calculate_rewards(1, &metrics, vec![validator], vec![], good_health())
+        .unwrap();
     let reward = result.validator_rewards.get(&addr(1)).unwrap();
     assert!(reward.uptime_bonus > U256::zero());
 }
@@ -909,7 +1147,9 @@ fn test_enhanced_ai_quality_below_threshold() {
     let mut ai = test_ai_contribution(addr(2));
     ai.quality_ratings = vec![0.5, 0.6, 0.7];
 
-    let result = calc.calculate_rewards(1, &metrics, vec![], vec![ai], good_health()).unwrap();
+    let result = calc
+        .calculate_rewards(1, &metrics, vec![], vec![ai], good_health())
+        .unwrap();
     let reward = result.ai_contributor_rewards.get(&addr(2)).unwrap();
     assert_eq!(reward.quality_bonus, U256::zero());
 }
@@ -921,14 +1161,26 @@ fn test_enhanced_ai_compute_tiers() {
 
     let mut ai_low = test_ai_contribution(addr(2));
     ai_low.compute_provided = 500;
-    let r_low = calc.calculate_rewards(1, &metrics, vec![], vec![ai_low], good_health()).unwrap();
+    let r_low = calc
+        .calculate_rewards(1, &metrics, vec![], vec![ai_low], good_health())
+        .unwrap();
 
     let mut ai_high = test_ai_contribution(addr(3));
     ai_high.compute_provided = 200_000;
-    let r_high = calc.calculate_rewards(2, &metrics, vec![], vec![ai_high], good_health()).unwrap();
+    let r_high = calc
+        .calculate_rewards(2, &metrics, vec![], vec![ai_high], good_health())
+        .unwrap();
 
-    let low_bonus = r_low.ai_contributor_rewards.get(&addr(2)).unwrap().compute_bonus;
-    let high_bonus = r_high.ai_contributor_rewards.get(&addr(3)).unwrap().compute_bonus;
+    let low_bonus = r_low
+        .ai_contributor_rewards
+        .get(&addr(2))
+        .unwrap()
+        .compute_bonus;
+    let high_bonus = r_high
+        .ai_contributor_rewards
+        .get(&addr(3))
+        .unwrap()
+        .compute_bonus;
     assert!(high_bonus > low_bonus);
 }
 
@@ -940,14 +1192,30 @@ fn test_enhanced_ai_community_bonus() {
     let mut ai = test_ai_contribution(addr(2));
     ai.community_reputation = 0.9;
     ai.peer_reviews_given = 20;
-    let r = calc.calculate_rewards(1, &metrics, vec![], vec![ai], good_health()).unwrap();
-    assert!(r.ai_contributor_rewards.get(&addr(2)).unwrap().community_bonus > U256::zero());
+    let r = calc
+        .calculate_rewards(1, &metrics, vec![], vec![ai], good_health())
+        .unwrap();
+    assert!(
+        r.ai_contributor_rewards
+            .get(&addr(2))
+            .unwrap()
+            .community_bonus
+            > U256::zero()
+    );
 
     let mut ai_low = test_ai_contribution(addr(3));
     ai_low.community_reputation = 0.5;
     ai_low.peer_reviews_given = 2;
-    let r2 = calc.calculate_rewards(2, &metrics, vec![], vec![ai_low], good_health()).unwrap();
-    assert_eq!(r2.ai_contributor_rewards.get(&addr(3)).unwrap().community_bonus, U256::zero());
+    let r2 = calc
+        .calculate_rewards(2, &metrics, vec![], vec![ai_low], good_health())
+        .unwrap();
+    assert_eq!(
+        r2.ai_contributor_rewards
+            .get(&addr(3))
+            .unwrap()
+            .community_bonus,
+        U256::zero()
+    );
 }
 
 #[test]
@@ -955,8 +1223,12 @@ fn test_enhanced_burn_rate_healthy_vs_poor() {
     let mut calc = EnhancedRewardCalculator::new(EnhancedRewardConfig::default());
     let metrics = default_utilization(1, 5_000_000, 10_000_000);
 
-    let r_healthy = calc.calculate_rewards(1, &metrics, vec![], vec![], good_health()).unwrap();
-    let r_poor = calc.calculate_rewards(2, &metrics, vec![], vec![], poor_health()).unwrap();
+    let r_healthy = calc
+        .calculate_rewards(1, &metrics, vec![], vec![], good_health())
+        .unwrap();
+    let r_poor = calc
+        .calculate_rewards(2, &metrics, vec![], vec![], poor_health())
+        .unwrap();
     assert!(r_healthy.burn_amount > r_poor.burn_amount);
 }
 
@@ -964,8 +1236,24 @@ fn test_enhanced_burn_rate_healthy_vs_poor() {
 fn test_enhanced_halving_reduces_pool() {
     let mut calc = EnhancedRewardCalculator::new(EnhancedRewardConfig::default());
 
-    let r_early = calc.calculate_rewards(1, &default_utilization(1, 5_000_000, 10_000_000), vec![], vec![], good_health()).unwrap();
-    let r_late = calc.calculate_rewards(2_200_000, &default_utilization(2_200_000, 5_000_000, 10_000_000), vec![], vec![], good_health()).unwrap();
+    let r_early = calc
+        .calculate_rewards(
+            1,
+            &default_utilization(1, 5_000_000, 10_000_000),
+            vec![],
+            vec![],
+            good_health(),
+        )
+        .unwrap();
+    let r_late = calc
+        .calculate_rewards(
+            2_200_000,
+            &default_utilization(2_200_000, 5_000_000, 10_000_000),
+            vec![],
+            vec![],
+            good_health(),
+        )
+        .unwrap();
     assert!(r_late.total_rewards < r_early.total_rewards);
 }
 
@@ -973,11 +1261,29 @@ fn test_enhanced_halving_reduces_pool() {
 fn test_enhanced_high_vs_low_utilization() {
     let mut calc = EnhancedRewardCalculator::new(EnhancedRewardConfig::default());
 
-    let low = UtilizationMetrics { block_height: 1, gas_used: 1_000_000, gas_limit: 10_000_000, transaction_count: 10, ai_operations: 0, compute_intensity: 0.0 };
-    let high = UtilizationMetrics { block_height: 2, gas_used: 9_000_000, gas_limit: 10_000_000, transaction_count: 200, ai_operations: 20, compute_intensity: 0.8 };
+    let low = UtilizationMetrics {
+        block_height: 1,
+        gas_used: 1_000_000,
+        gas_limit: 10_000_000,
+        transaction_count: 10,
+        ai_operations: 0,
+        compute_intensity: 0.0,
+    };
+    let high = UtilizationMetrics {
+        block_height: 2,
+        gas_used: 9_000_000,
+        gas_limit: 10_000_000,
+        transaction_count: 200,
+        ai_operations: 20,
+        compute_intensity: 0.8,
+    };
 
-    let r_low = calc.calculate_rewards(1, &low, vec![], vec![], good_health()).unwrap();
-    let r_high = calc.calculate_rewards(2, &high, vec![], vec![], good_health()).unwrap();
+    let r_low = calc
+        .calculate_rewards(1, &low, vec![], vec![], good_health())
+        .unwrap();
+    let r_high = calc
+        .calculate_rewards(2, &high, vec![], vec![], good_health())
+        .unwrap();
     assert!(r_high.total_rewards > r_low.total_rewards);
 }
 
@@ -989,7 +1295,10 @@ fn test_enhanced_high_vs_low_utilization() {
 fn test_rewards_with_inferences() {
     use citrate_consensus::types::*;
 
-    let config = RewardConfig { inference_bonus: 1, ..RewardConfig::default() };
+    let config = RewardConfig {
+        inference_bonus: 1,
+        ..RewardConfig::default()
+    };
     let calc = RewardCalculator::new(config);
 
     let tx = Transaction {
@@ -997,7 +1306,7 @@ fn test_rewards_with_inferences() {
         ..Transaction::default()
     };
     let block = make_block(0, vec![tx.clone(), tx]);
-    let reward = calc.calculate_reward(&block);
+    let reward = calc.calculate_reward(&block).expect("valid config");
 
     assert!(reward.total_reward > salt(10)); // 10 SALT base + inference bonuses
 }
@@ -1007,9 +1316,13 @@ fn test_rewards_with_model_deployment() {
     use citrate_consensus::types::*;
 
     let calc = RewardCalculator::new(RewardConfig::default());
-    let tx = Transaction { to: None, data: vec![0x60, 0x80], ..Transaction::default() };
+    let tx = Transaction {
+        to: None,
+        data: vec![0x60, 0x80],
+        ..Transaction::default()
+    };
     let block = make_block(0, vec![tx]);
-    let reward = calc.calculate_reward(&block);
+    let reward = calc.calculate_reward(&block).expect("valid config");
 
     assert_eq!(reward.total_reward, salt(11)); // 10 base + 1 deployment
 }
@@ -1025,7 +1338,7 @@ fn test_rewards_with_model_registration_call() {
         ..Transaction::default()
     };
     let block = make_block(0, vec![tx]);
-    let reward = calc.calculate_reward(&block);
+    let reward = calc.calculate_reward(&block).expect("valid config");
 
     assert_eq!(reward.total_reward, salt(11)); // 10 base + 1 model bonus
 }
@@ -1041,7 +1354,12 @@ fn test_rewards_no_bonuses_with_regular_tx() {
         ..Transaction::default()
     };
     let block = make_block(0, vec![tx]);
-    assert_eq!(calc.calculate_reward(&block).total_reward, salt(10));
+    assert_eq!(
+        calc.calculate_reward(&block)
+            .expect("valid config")
+            .total_reward,
+        salt(10)
+    );
 }
 
 #[test]
@@ -1049,7 +1367,12 @@ fn test_rewards_beyond_64_halvings() {
     let config = RewardConfig::default();
     let calc = RewardCalculator::new(config.clone());
     let block = make_block(config.halving_interval * 65, vec![]);
-    assert_eq!(calc.calculate_reward(&block).total_reward, U256::zero());
+    assert_eq!(
+        calc.calculate_reward(&block)
+            .expect("valid config")
+            .total_reward,
+        U256::zero()
+    );
 }
 
 #[test]
@@ -1057,14 +1380,30 @@ fn test_total_supply_at_height_across_halvings() {
     let config = RewardConfig::default();
     let calc = RewardCalculator::new(config.clone());
 
-    assert_eq!(calc.total_supply_at_height(0), U256::zero());
-    assert_eq!(calc.total_supply_at_height(1), salt(10));
-    assert_eq!(calc.total_supply_at_height(100), salt(1000));
+    assert_eq!(
+        calc.total_supply_at_height(0).expect("valid config"),
+        U256::zero()
+    );
+    assert_eq!(
+        calc.total_supply_at_height(1).expect("valid config"),
+        salt(10)
+    );
+    assert_eq!(
+        calc.total_supply_at_height(100).expect("valid config"),
+        salt(1000)
+    );
 
-    let at_halving = calc.total_supply_at_height(config.halving_interval);
-    assert_eq!(at_halving, salt(config.block_reward * config.halving_interval));
+    let at_halving = calc
+        .total_supply_at_height(config.halving_interval)
+        .expect("valid config");
+    assert_eq!(
+        at_halving,
+        salt(config.block_reward * config.halving_interval)
+    );
 
-    let past_halving = calc.total_supply_at_height(config.halving_interval + 10);
+    let past_halving = calc
+        .total_supply_at_height(config.halving_interval + 10)
+        .expect("valid config");
     assert!(past_halving > at_halving);
 }
 
@@ -1078,7 +1417,10 @@ fn test_token_initial_distribution() {
     initial.insert(addr(1), salt(100));
     initial.insert(addr(2), salt(200));
 
-    let config = TokenConfig { initial_distribution: initial, ..TokenConfig::default() };
+    let config = TokenConfig {
+        initial_distribution: initial,
+        ..TokenConfig::default()
+    };
     let token = Token::new(config);
 
     assert_eq!(token.balance_of(&addr(1)), salt(100));
@@ -1103,8 +1445,17 @@ fn test_slashing_censorship_penalty() {
     let mgr = InstitutionalSlashingManager::new(InstitutionalSlashingConfig::default());
     let mut state = OperatorSlashingState::new(addr(1));
 
-    let record = mgr.process_offense(&mut state, SlashingOffense::TransactionCensorship, salt(10_000), 10, [0xAA; 32]);
-    assert_eq!(record.penalty_wei, salt(10_000) * U256::from(5) / U256::from(100));
+    let record = mgr.process_offense(
+        &mut state,
+        SlashingOffense::TransactionCensorship,
+        salt(10_000),
+        10,
+        [0xAA; 32],
+    );
+    assert_eq!(
+        record.penalty_wei,
+        salt(10_000) * U256::from(5) / U256::from(100)
+    );
 }
 
 #[test]
@@ -1113,7 +1464,13 @@ fn test_slashing_cumulative_under_threshold() {
     let mut state = OperatorSlashingState::new(addr(1));
 
     for i in 0..3 {
-        mgr.process_offense(&mut state, SlashingOffense::Equivocation, salt(10_000), 10 + i * 2, [i as u8; 32]);
+        mgr.process_offense(
+            &mut state,
+            SlashingOffense::Equivocation,
+            salt(10_000),
+            10 + i * 2,
+            [i as u8; 32],
+        );
         state.in_cooldown = false;
     }
     assert!(!state.is_deactivated);
@@ -1136,12 +1493,18 @@ fn test_slashing_downtime_configurable() {
 #[test]
 fn test_genesis_empty_accounts_valid() {
     let config = GenesisConfig {
-        chain_id: 40204, accounts: vec![],
-        treasury_address: addr(0x11), team_allocations: HashMap::new(),
-        ecosystem_fund: addr(0x22), mining_pool_max: salt(500_000_000),
+        chain_id: 40204,
+        accounts: vec![],
+        treasury_address: addr(0x11),
+        team_allocations: HashMap::new(),
+        ecosystem_fund: addr(0x22),
+        mining_pool_max: salt(500_000_000),
     };
     assert!(config.validate().is_ok());
-    assert_eq!(config.total_preallocation(), U256::zero());
+    assert_eq!(
+        config.total_preallocation().expect("no overflow"),
+        U256::zero()
+    );
 }
 
 // ===========================================================================
@@ -1151,7 +1514,10 @@ fn test_genesis_empty_accounts_valid() {
 #[test]
 fn test_estimator_zero_months() {
     let est = InstitutionalRewardEstimator::new(InstitutionalRewardConfig::default());
-    let result = est.estimate(&EstimationParams { projection_months: 0, ..Default::default() });
+    let result = est.estimate(&EstimationParams {
+        projection_months: 0,
+        ..Default::default()
+    });
     assert!(result.monthly_projections.is_empty());
     assert_eq!(result.total_projected_salt, 0.0);
     assert_eq!(result.average_monthly_salt, 0.0);
@@ -1161,7 +1527,10 @@ fn test_estimator_zero_months() {
 #[test]
 fn test_estimator_single_month() {
     let est = InstitutionalRewardEstimator::new(InstitutionalRewardConfig::default());
-    let result = est.estimate(&EstimationParams { projection_months: 1, ..Default::default() });
+    let result = est.estimate(&EstimationParams {
+        projection_months: 1,
+        ..Default::default()
+    });
     assert_eq!(result.monthly_projections.len(), 1);
     assert_eq!(result.min_monthly_salt, result.max_monthly_salt);
 }
@@ -1175,7 +1544,8 @@ fn test_institutional_adapter_cap() {
     let config = InstitutionalRewardConfig::default();
     let calc = InstitutionalRewardCalculator::new(config);
 
-    let mut profile = InstitutionalOperatorProfile::new(addr(1), "Test".into(), "t@t.com".into(), 0);
+    let mut profile =
+        InstitutionalOperatorProfile::new(addr(1), "Test".into(), "t@t.com".into(), 0);
     profile.uptime_ratio = 0.995;
     profile.adapters_created = 100; // Cap = 20
 
@@ -1189,7 +1559,8 @@ fn test_institutional_dataset_cap() {
     let config = InstitutionalRewardConfig::default();
     let calc = InstitutionalRewardCalculator::new(config);
 
-    let mut profile = InstitutionalOperatorProfile::new(addr(1), "Test".into(), "t@t.com".into(), 0);
+    let mut profile =
+        InstitutionalOperatorProfile::new(addr(1), "Test".into(), "t@t.com".into(), 0);
     profile.uptime_ratio = 0.995;
     profile.datasets_contributed = 200; // Cap = 50
 
@@ -1202,7 +1573,8 @@ fn test_institutional_dataset_cap() {
 fn test_institutional_proportional_uptime_bonus() {
     let calc = InstitutionalRewardCalculator::new(InstitutionalRewardConfig::default());
 
-    let mut profile = InstitutionalOperatorProfile::new(addr(1), "Test".into(), "t@t.com".into(), 0);
+    let mut profile =
+        InstitutionalOperatorProfile::new(addr(1), "Test".into(), "t@t.com".into(), 0);
     profile.uptime_ratio = 0.95;
     profile.is_active = true;
     profile.current_epoch = 1;
@@ -1218,7 +1590,10 @@ fn test_institutional_proportional_uptime_bonus() {
 #[test]
 fn test_latt_wei_conversion_roundtrip() {
     let original = 12345u64;
-    assert_eq!(wei_to_latt(latt_to_wei(original)), original);
+    assert_eq!(
+        wei_to_latt(latt_to_wei(original)).expect("fits u64"),
+        original
+    );
 }
 
 #[test]
@@ -1229,5 +1604,5 @@ fn test_latt_to_wei_zero() {
 #[test]
 fn test_wei_to_latt_truncates() {
     let wei = latt_to_wei(100) + U256::from(999);
-    assert_eq!(wei_to_latt(wei), 100);
+    assert_eq!(wei_to_latt(wei).expect("fits u64"), 100);
 }

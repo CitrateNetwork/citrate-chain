@@ -17,6 +17,8 @@
 #   HUP_FORK_RPC         read-only RPC to fork (default https://rpc.citrate.ai)
 #   HUP_REGISTRY_ADMIN   admin multisig (fork default: the book's CitAgentTimelock)
 #   DEPLOYER_ADDRESS     impersonated deployer (fork default: the book's deployer)
+#   HUP_MEMBER_SBT       CitrateMemberSBT wired into AgentSBT (fork default: the book's
+#                        CitrateMemberSBT; fresh default: one deployed here first)
 #   HUP_DRYRUN_KEEP=1    keep the temp dir (broadcast + book copy) for inspection
 #   HUP_DRYRUN_POST_HOOK executable run (fork mode) after the book and provenance tools, with
 #                        HUP_DRYRUN_RPC / _BOOK / _GENESIS / _PROVENANCE set; its failure fails the run
@@ -75,6 +77,8 @@ if [[ "$MODE" == fork ]]; then
   export DEPLOYER_ADDRESS="${DEPLOYER_ADDRESS:-$(book_get deployer)}"
   export HUP_REGISTRY_ADMIN="${HUP_REGISTRY_ADMIN:-$(book_get CitAgentTimelock)}"
   [[ -n "$HUP_REGISTRY_ADMIN" ]] || { echo "dryrun: no admin (set HUP_REGISTRY_ADMIN)" >&2; exit 4; }
+  export HUP_MEMBER_SBT="${HUP_MEMBER_SBT:-$(book_get CitrateMemberSBT)}"
+  [[ -n "$HUP_MEMBER_SBT" ]] || { echo "dryrun: no member SBT (set HUP_MEMBER_SBT)" >&2; exit 4; }
 else
   export DEPLOYER_ADDRESS="${DEPLOYER_ADDRESS:-0x00000000000000000000000000000000000d3901}"
   export HUP_TIMELOCK_OWNER_0=0x00000000000000000000000000000000000a0001
@@ -83,6 +87,15 @@ else
   unset HUP_REGISTRY_ADMIN
 fi
 unlock "$DEPLOYER_ADDRESS"
+
+if [[ "$MODE" == fresh && -z "${HUP_MEMBER_SBT:-}" ]]; then
+  echo "dryrun: deploying a CitrateMemberSBT for AgentSBT's member mint (fresh mode)"
+  HUP_MEMBER_SBT="$( cd "$CONTRACTS" && forge create src/core_membership/CitrateMemberSBT.sol:CitrateMemberSBT \
+      --rpc-url "$RPC" --unlocked --from "$DEPLOYER_ADDRESS" --broadcast \
+      --constructor-args "$DEPLOYER_ADDRESS" | awk '/Deployed to:/ {print $3}' )"
+  [[ "$HUP_MEMBER_SBT" =~ ^0x[0-9a-fA-F]{40}$ ]] || { echo "dryrun: CitrateMemberSBT deploy failed" >&2; exit 5; }
+  export HUP_MEMBER_SBT
+fi
 
 echo "dryrun: deploying (sender $DEPLOYER_ADDRESS)"
 ( cd "$CONTRACTS" && forge script script/DeployHupRegistries.s.sol \
@@ -112,6 +125,20 @@ if cast send --rpc-url "$RPC" --unlocked --from "$MEMBER" "$AGENT" 'mintAgent(ad
   echo "dryrun: SMOKE FAIL AgentSBT.mintAgent accepted a non-admin" >&2; exit 6
 fi
 echo "  ok  AgentSBT.mintAgent refuses a non-admin"
+expect "AgentSBT.memberSbt is the member SBT" "$(call "$AGENT" 'memberSbt()(address)' | tr 'A-F' 'a-f')" "$(echo "$HUP_MEMBER_SBT" | tr 'A-F' 'a-f')"
+MSBT_OWNER="$(call "$HUP_MEMBER_SBT" 'owner()(address)')"
+unlock "$MSBT_OWNER"
+send "$MSBT_OWNER" "$HUP_MEMBER_SBT" 'mintMember(address,bytes32,uint64,uint64)' "$MEMBER" "$(cast keccak dryrun-sub)" 1 4102444800
+send "$ADMIN" "$AGENT" 'setMemberOrg(uint256)' "$ORG_ID"
+MEMBER_AGENT_ID="$(call "$AGENT" 'nextTokenId()(uint256)')"
+send "$MEMBER" "$AGENT" 'mintAgentAsMember(bytes32,bytes32)' "$(cast keccak dryrun-member-agent)" "$(cast keccak dryrun-member-fp)"
+expect "AgentSBT.mintAgentAsMember by a member" "$(call "$AGENT" 'ownerOf(uint256)(address)' "$MEMBER_AGENT_ID" | tr 'A-F' 'a-f')" "$(echo "$MEMBER" | tr 'A-F' 'a-f')"
+NON_MEMBER=0x00000000000000000000000000000000000b0002
+unlock "$NON_MEMBER"
+if cast send --rpc-url "$RPC" --unlocked --from "$NON_MEMBER" "$AGENT" 'mintAgentAsMember(bytes32,bytes32)' "$(cast keccak nm-did)" "$(cast keccak nm-fp)" >/dev/null 2>&1; then
+  echo "dryrun: SMOKE FAIL AgentSBT.mintAgentAsMember accepted a non-member" >&2; exit 6
+fi
+echo "  ok  AgentSBT.mintAgentAsMember refuses a non-member"
 CAP_ID="$(cast to-dec "$(cast keccak dryrun-capsule)")"
 send "$MEMBER" "$CAPS" 'registerCapsule(uint256,bytes32,bytes32,uint8)' "$CAP_ID" "$(cast keccak manifest)" "$(cast keccak did)" 2
 expect "CapsuleRegistry.registerCapsule (workspace)" "$(call "$CAPS" 'isRevoked(uint256)(bool)' "$CAP_ID")" false

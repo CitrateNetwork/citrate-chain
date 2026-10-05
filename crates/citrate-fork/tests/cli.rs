@@ -134,7 +134,7 @@ fn the_agent_precompile_height_follows_the_node_rule() {
     let r = rows.iter().find(|r| r["address"] == "0x0121").expect("row");
     assert_eq!(r["coverage"], "real");
 
-    // 40204 has no height pinned: a per-run height is refused, as the node refuses it.
+    // 40204 pins the fork at genesis: a different per-run height is refused, as the node refuses it.
     let out = bin()
         .env_remove("CITRATE_AGENT_PRECOMPILES_HEIGHT")
         .args([
@@ -147,5 +147,5 @@ fn the_agent_precompile_height_follows_the_node_rule() {
         .output()
         .expect("runs");
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("not scheduled"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("conflicts"));
 }

@@ -248,7 +248,7 @@ impl ModelManager {
                 .await
                 .map_err(|e| format!("Failed to write chunk: {}", e))?;
             hasher.update(&chunk);
-            downloaded += chunk.len() as u64;
+            downloaded = downloaded.saturating_add(chunk.len() as u64);
 
             // Log progress every 5 seconds
             if last_log.elapsed() > std::time::Duration::from_secs(5) {

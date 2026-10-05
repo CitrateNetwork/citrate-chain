@@ -374,11 +374,15 @@ impl TotalOrdering {
                 .iter()
                 .position(|h| *h == from)
                 .ok_or(OrderingError::BlockNotFound(from))?
-                + 1 // Exclusive of 'from'
+                .saturating_add(1) // Exclusive of 'from'
         };
 
         // Slice the relevant portion
-        let blocks: Vec<Hash> = full_order[from_idx..].to_vec();
+        // from_idx <= len (position < len, plus one), so this is never None.
+        let blocks: Vec<Hash> = full_order
+            .get(from_idx..)
+            .map(<[Hash]>::to_vec)
+            .unwrap_or_default();
 
         // Build transaction order
         let mut transaction_order = Vec::new();
@@ -471,10 +475,7 @@ mod tests {
     #[tokio::test]
     async fn test_linear_chain_ordering() {
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
-        let ghostdag = Arc::new(GhostDag::new(
-            GhostDagParams::default(),
-            dag_store.clone(),
-        ));
+        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
 
         // Create linear chain: G -> A -> B -> C
         // Use non-zero hash for genesis to avoid confusion with Hash::default()
@@ -501,10 +502,7 @@ mod tests {
     #[tokio::test]
     async fn test_simple_fork_ordering() {
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
-        let ghostdag = Arc::new(GhostDag::new(
-            GhostDagParams::default(),
-            dag_store.clone(),
-        ));
+        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
 
         // Create fork:
         //     G
@@ -516,8 +514,7 @@ mod tests {
         let genesis = create_test_block([0xFF; 32], Hash::default(), vec![], 0, 1);
         let block_a = create_test_block([1; 32], genesis.hash(), vec![], 1, 2);
         let block_b = create_test_block([2; 32], genesis.hash(), vec![], 1, 2);
-        let block_c =
-            create_test_block([3; 32], block_a.hash(), vec![block_b.hash()], 2, 4);
+        let block_c = create_test_block([3; 32], block_a.hash(), vec![block_b.hash()], 2, 4);
 
         dag_store.store_block(genesis.clone()).await.unwrap();
         dag_store.store_block(block_a.clone()).await.unwrap();
@@ -532,7 +529,7 @@ mod tests {
         assert_eq!(order.len(), 4);
         assert_eq!(order[0], genesis.hash()); // Genesis first
         assert_eq!(order[1], block_a.hash()); // Selected parent chain
-        // B should appear before or at C since it's in C's mergeset
+                                              // B should appear before or at C since it's in C's mergeset
         assert!(order.contains(&block_b.hash()));
         assert!(order.contains(&block_c.hash()));
 
@@ -545,18 +542,14 @@ mod tests {
     #[tokio::test]
     async fn test_ordering_determinism() {
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
-        let ghostdag = Arc::new(GhostDag::new(
-            GhostDagParams::default(),
-            dag_store.clone(),
-        ));
+        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
 
         // Create a more complex DAG
         let genesis = create_test_block([0xFF; 32], Hash::default(), vec![], 0, 1);
         let block_a = create_test_block([1; 32], genesis.hash(), vec![], 1, 2);
         let block_b = create_test_block([2; 32], genesis.hash(), vec![], 1, 2);
         let block_c = create_test_block([3; 32], block_a.hash(), vec![], 2, 3);
-        let block_d =
-            create_test_block([4; 32], block_c.hash(), vec![block_b.hash()], 3, 5);
+        let block_d = create_test_block([4; 32], block_c.hash(), vec![block_b.hash()], 3, 5);
 
         dag_store.store_block(genesis.clone()).await.unwrap();
         dag_store.store_block(block_a.clone()).await.unwrap();
@@ -579,10 +572,7 @@ mod tests {
     #[tokio::test]
     async fn test_ordered_blocks_range() {
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
-        let ghostdag = Arc::new(GhostDag::new(
-            GhostDagParams::default(),
-            dag_store.clone(),
-        ));
+        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
 
         // Linear chain
         let genesis = create_test_block([0xFF; 32], Hash::default(), vec![], 0, 1);
@@ -611,10 +601,7 @@ mod tests {
     #[tokio::test]
     async fn test_transaction_ordering() {
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
-        let ghostdag = Arc::new(GhostDag::new(
-            GhostDagParams::default(),
-            dag_store.clone(),
-        ));
+        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
 
         // Create blocks with transactions
         let tx1 = Transaction {

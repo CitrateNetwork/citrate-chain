@@ -149,7 +149,7 @@ impl RelayState {
     /// Increment attestation count for an event.
     pub fn add_attestation(&mut self, event_id: &EventId) -> Option<usize> {
         if let Some(tracked) = self.events.get_mut(event_id) {
-            tracked.attestation_count += 1;
+            tracked.attestation_count = tracked.attestation_count.saturating_add(1);
             Some(tracked.attestation_count)
         } else {
             None
@@ -158,14 +158,14 @@ impl RelayState {
 
     /// Record a successful deposit.
     pub fn record_deposit(&mut self, salt_amount: u64) {
-        self.total_deposits += 1;
-        self.total_salt_credited += salt_amount;
+        self.total_deposits = self.total_deposits.saturating_add(1);
+        self.total_salt_credited = self.total_salt_credited.saturating_add(salt_amount);
     }
 
     /// Record a successful withdrawal.
     pub fn record_withdrawal(&mut self, salt_amount: u64) {
-        self.total_withdrawals += 1;
-        self.total_salt_burned += salt_amount;
+        self.total_withdrawals = self.total_withdrawals.saturating_add(1);
+        self.total_salt_burned = self.total_salt_burned.saturating_add(salt_amount);
     }
 
     /// Update the heartbeat timestamp.

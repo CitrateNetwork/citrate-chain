@@ -1,3 +1,19 @@
+// PANIC-S1 G2: production code in this crate may not panic. Every panic class is
+// denied outside tests; a genuine invariant needs an item-level #[allow] with an
+// `// INVARIANT:` comment (enforced by scripts/ci/panic_invariant_tripwire.sh).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 //! Independent replay of a federated LoRA round (HUP-S9.2).
 //!
 //! The coordinator (citrate-compute-pool `citrate-fl-round`) aggregates a round
@@ -69,13 +85,16 @@ pub fn root(payloads: &[B32]) -> B32 {
         .map(|(i, p)| leaf(i as u32, p))
         .collect();
     level.resize(payloads.len().next_power_of_two(), [0u8; 32]);
+    // The level length is a power of two, so it splits into whole pairs.
     while level.len() > 1 {
         level = level
-            .chunks(2)
-            .map(|p| keccak(&[&[0x01], &p[0], &p[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|[l, r]| keccak(&[&[0x01], l, r]))
             .collect();
     }
-    level[0]
+    level.first().copied().unwrap_or([0u8; 32])
 }
 
 // ── the bundle, as published ────────────────────────────────────────
@@ -211,18 +230,20 @@ pub fn delta_digest(
 /// Recover the address behind a 65-byte `r ‖ s ‖ v` signature over a digest.
 pub fn recover(digest: &B32, sig: &[u8]) -> anyhow::Result<Addr> {
     use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
-    anyhow::ensure!(sig.len() == 65, "signature is {} bytes", sig.len());
-    let s = Signature::from_slice(&sig[..64])?;
-    let v = match sig[64] {
-        27 | 28 => sig[64] - 27,
+    let (rs, v) = match sig {
+        [rs @ .., v] if sig.len() == 65 => (rs, *v),
+        _ => anyhow::bail!("signature is {} bytes", sig.len()),
+    };
+    let s = Signature::from_slice(rs)?;
+    let v = match v {
+        27 | 28 => v.saturating_sub(27),
         v => v,
     };
     let id = RecoveryId::from_byte(v).ok_or_else(|| anyhow::anyhow!("bad recovery id {v}"))?;
     let vk = VerifyingKey::recover_from_prehash(digest, &s, id)?;
     let point = vk.to_encoded_point(false);
-    let h = keccak(&[&point.as_bytes()[1..]]);
-    let mut a = [0u8; 20];
-    a.copy_from_slice(&h[12..]);
+    let h = keccak(&[point.as_bytes().get(1..).unwrap_or_default()]);
+    let [_, _, _, _, _, _, _, _, _, _, _, _, a @ ..] = h;
     Ok(a)
 }
 
@@ -239,21 +260,31 @@ pub struct Delta {
 
 pub fn parse_delta(b: &[u8], max_values: u64) -> anyhow::Result<Delta> {
     const H: usize = 168;
-    anyhow::ensure!(b.len() >= H && &b[0..4] == b"FLD1", "not an FLD1 artifact");
-    anyhow::ensure!(b[4..6] == [0, 1] && b[7] == 0, "unsupported FLD1 version");
-    let n = u64::from_be_bytes(b[160..168].try_into()?);
+    let (hdr, body) = b
+        .split_at_checked(H)
+        .ok_or_else(|| anyhow::anyhow!("not an FLD1 artifact"))?;
+    let seg = |start: usize, len: usize| -> anyhow::Result<&[u8]> {
+        start
+            .checked_add(len)
+            .and_then(|end| hdr.get(start..end))
+            .ok_or_else(|| anyhow::anyhow!("FLD1 header field at {start}"))
+    };
+    anyhow::ensure!(seg(0, 4)? == b"FLD1", "not an FLD1 artifact");
+    let [v0, v1, scale, v3] = <[u8; 4]>::try_from(seg(4, 4)?)?;
+    anyhow::ensure!([v0, v1] == [0, 1] && v3 == 0, "unsupported FLD1 version");
+    let n = u64::from_be_bytes(seg(160, 8)?.try_into()?);
     anyhow::ensure!(n <= max_values, "{n} values over the round limit");
     anyhow::ensure!(
-        b.len() as u64 == H as u64 + 8 * n,
+        n.checked_mul(8) == Some(body.len() as u64),
         "length does not match its count"
     );
     Ok(Delta {
-        scale: b[6],
-        round: b[8..40].try_into()?,
-        worker: b[40..60].try_into()?,
-        start: b[60..92].try_into()?,
-        chunk_dim: u32::from_be_bytes(b[156..160].try_into()?),
-        values: b[H..]
+        scale,
+        round: seg(8, 32)?.try_into()?,
+        worker: seg(40, 20)?.try_into()?,
+        start: seg(60, 32)?.try_into()?,
+        chunk_dim: u32::from_be_bytes(seg(156, 4)?.try_into()?),
+        values: body
             .as_chunks::<8>()
             .0
             .iter()
@@ -263,8 +294,9 @@ pub fn parse_delta(b: &[u8], max_values: u64) -> anyhow::Result<Delta> {
 }
 
 fn row(v: &[i64], dim: usize, c: usize) -> &[i64] {
-    let lo = (c * dim).min(v.len());
-    &v[lo..(lo + dim).min(v.len())]
+    let lo = c.saturating_mul(dim).min(v.len());
+    let hi = lo.saturating_add(dim).min(v.len());
+    v.get(lo..hi).unwrap_or_default()
 }
 
 fn be(v: &[i64]) -> Vec<u8> {
@@ -288,7 +320,8 @@ pub fn chunk_input(rows: &[&[i64]], tpos: i64, tneg: i64) -> Vec<u8> {
             b.extend_from_slice(&c.to_be_bytes());
         }
     }
-    let w = 65536 / n.max(1) as i64;
+    // n.max(1) >= 1, so the division is defined.
+    let w = 65536i64.checked_div(n.max(1) as i64).unwrap_or(0);
     for _ in 0..n {
         b.extend_from_slice(&w.to_be_bytes());
     }
@@ -353,9 +386,16 @@ pub fn gguf_tensors(b: &[u8]) -> anyhow::Result<Vec<Tensor>> {
     }
     impl R<'_> {
         fn take(&mut self, n: usize) -> anyhow::Result<&[u8]> {
-            anyhow::ensure!(self.p + n <= self.b.len(), "gguf truncated");
-            let s = &self.b[self.p..self.p + n];
-            self.p += n;
+            let end = self
+                .p
+                .checked_add(n)
+                .filter(|end| *end <= self.b.len())
+                .ok_or_else(|| anyhow::anyhow!("gguf truncated"))?;
+            let s = self
+                .b
+                .get(self.p..end)
+                .ok_or_else(|| anyhow::anyhow!("gguf truncated"))?;
+            self.p = end;
             Ok(s)
         }
         fn u32(&mut self) -> anyhow::Result<u32> {
@@ -389,7 +429,11 @@ pub fn gguf_tensors(b: &[u8]) -> anyhow::Result<Vec<Tensor>> {
                 t => anyhow::bail!("gguf value type {t}"),
             };
             let v = self.take(fixed)?;
-            Ok((ty == 4).then(|| u32::from_le_bytes([v[0], v[1], v[2], v[3]])))
+            if ty == 4 {
+                Ok(Some(u32::from_le_bytes(v.try_into()?)))
+            } else {
+                Ok(None)
+            }
         }
     }
     let mut r = R { b, p: 0 };
@@ -418,14 +462,25 @@ pub fn gguf_tensors(b: &[u8]) -> anyhow::Result<Vec<Tensor>> {
         let off = r.u64()?;
         infos.push((name, dims, ty, off));
     }
-    let data = (r.p as u64).div_ceil(align) * align;
+    anyhow::ensure!(align > 0, "gguf alignment is zero");
+    let data = (r.p as u64)
+        .div_ceil(align)
+        .checked_mul(align)
+        .ok_or_else(|| anyhow::anyhow!("gguf data offset overflows"))?;
     let mut out = Vec::new();
     for (name, dims, ty, off) in infos {
         let n = usize::try_from(dims.iter().product::<u64>())?;
-        let start = usize::try_from(data + off)?;
+        let start = usize::try_from(
+            data.checked_add(off)
+                .ok_or_else(|| anyhow::anyhow!("tensor {name} offset overflows"))?,
+        )?;
+        let end = n
+            .checked_mul(4)
+            .and_then(|len| start.checked_add(len))
+            .ok_or_else(|| anyhow::anyhow!("tensor {name} out of range"))?;
         let vals = match ty {
             0 => b
-                .get(start..start + 4 * n)
+                .get(start..end)
                 .ok_or_else(|| anyhow::anyhow!("tensor {name} out of range"))?
                 .as_chunks::<4>()
                 .0
@@ -604,7 +659,7 @@ pub fn replay(inp: &Inputs<'_>) -> anyhow::Result<Report> {
         let w = rows.first().map_or(0, |r| r.len());
         agg.extend(
             output
-                .get(..8 * w)
+                .get(..w.saturating_mul(8))
                 .ok_or_else(|| anyhow::anyhow!("chunk {k}: kernel output too short"))?
                 .as_chunks::<8>()
                 .0
@@ -651,17 +706,24 @@ pub fn replay(inp: &Inputs<'_>) -> anyhow::Result<Report> {
         }
         let s = gguf_tensors(start)?;
         let m = gguf_tensors(merged)?;
-        let mut order: Vec<usize> = (0..s.len()).collect();
-        order.sort_by(|a, b| s[*a].0.cmp(&s[*b].0));
+        // Stable sort by tensor name; ties keep file order.
+        let mut order: Vec<(&str, usize)> = s
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.0.as_str(), i))
+            .collect();
+        order.sort_by(|a, b| a.0.cmp(b.0));
         let denom = 65536.0f64 * 2f64.powi(i32::from(c.value_scale_log2));
         let mut k = 0usize;
         let mut ok = s.len() == m.len();
-        for fi in order {
+        for (_, fi) in order {
             if !ok {
                 break;
             }
-            let (sn, sd, sv) = &s[fi];
-            let (mn, md, mv) = &m[fi];
+            let (Some((sn, sd, sv)), Some((mn, md, mv))) = (s.get(fi), m.get(fi)) else {
+                ok = false;
+                break;
+            };
             if sn != mn || sd != md || sv.len() != mv.len() {
                 ok = false;
                 break;
@@ -672,7 +734,7 @@ pub fn replay(inp: &Inputs<'_>) -> anyhow::Result<Report> {
                     ok = false;
                     break;
                 }
-                k += 1;
+                k = k.saturating_add(1);
             }
         }
         if !ok || k != agg.len() {

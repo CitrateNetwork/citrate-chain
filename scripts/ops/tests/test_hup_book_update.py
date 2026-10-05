@@ -17,6 +17,7 @@ hbu = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(hbu)
 
 ADMIN = "0x" + "ad" * 20
+MEMBER_SBT = "0x" + "3e" * 20
 GENESIS = "0x" + "9e" * 32
 FACTORY = hbu.ARACHNID_FACTORY
 
@@ -54,11 +55,11 @@ def _broadcast(names=None, **overrides):
     return run, addrs
 
 
-def _returns(addrs, admin=ADMIN, deployed_here=False):
+def _returns(addrs, admin=ADMIN, deployed_here=False, member_sbt=MEMBER_SBT):
     """forge's `returns` entry for DeployHupRegistries.run(): the Deployed tuple."""
     fields = [admin, "true" if deployed_here else "false"] + [
         hbu.to_checksum(addrs.get(n) or "0x" + "00" * 20) for n in hbu.RETURN_ORDER
-    ]
+    ] + [hbu.to_checksum(member_sbt)]
     return {"0": {"internal_type": "struct DeployHupRegistries.Deployed", "value": "(" + ", ".join(fields) + ")"}}
 
 
@@ -68,6 +69,7 @@ def _book():
         "contracts": {
             "ModelRegistry": "0x807cB7eE477Ae58C321cAEd980CEB11D78048e84",
             "AgentSBT": "0xd16b1ad6e744F3E92223C65F492c35D36ae07c7b",
+            "CitrateMemberSBT": hbu.to_checksum(MEMBER_SBT),
         },
         "aaStack": {"EntryPoint": "0x97d5391a647429233E202f99231743C53a648f3c"},
     }
@@ -186,6 +188,7 @@ class Merge(unittest.TestCase):
         self.assertEqual(got["admin"], ADMIN)
         for n in hbu.RETURN_ORDER:
             self.assertEqual(got[n], addrs[n])
+        self.assertEqual(got["memberSBT"], MEMBER_SBT)
 
     def test_parse_returns_refuses_a_malformed_tuple(self):
         run, _ = _broadcast()
@@ -253,6 +256,8 @@ class _FakeChain(BaseHTTPRequestHandler):
                 res = "0x" + "00" * 12 + s["owners"].get(to, ADMIN)[2:]
             elif data == hbu.SEL_ORG_CONTRACT:
                 res = "0x" + "00" * 12 + s["org"][2:]
+            elif data == hbu.SEL_MEMBER_SBT:
+                res = "0x" + "00" * 12 + s["member_sbt"][2:]
             else:
                 # Record counters (nextTokenId / totalSkills / rootCountByKind(k)).
                 res = "0x" + s["counts"].get((to, data), 0).to_bytes(32, "big").hex()
@@ -288,6 +293,7 @@ class VerifyLiveAndCli(unittest.TestCase):
             "no_code": set(),
             "owners": {},
             "org": self.addrs["OrganizationSBT"],
+            "member_sbt": MEMBER_SBT,
             "counts": {},
         }
         self.tmp = tempfile.TemporaryDirectory()
@@ -342,6 +348,25 @@ class VerifyLiveAndCli(unittest.TestCase):
     def test_wrong_org_link_refused(self):
         _FakeChain.state["org"] = "0x" + "ab" * 20
         self.assertEqual(self._cli(), 1)
+
+    def test_wrong_member_sbt_link_refused(self):
+        _FakeChain.state["member_sbt"] = "0x" + "ab" * 20
+        self.assertEqual(self._cli(), 1)
+
+    def test_member_sbt_without_code_refused(self):
+        _FakeChain.state["no_code"] = {MEMBER_SBT}
+        self.assertEqual(self._cli(), 1)
+
+    def test_script_member_sbt_must_be_the_books(self):
+        self.run_json["returns"] = _returns(self.addrs, member_sbt="0x" + "4f" * 20)
+        self.bpath.write_text(json.dumps(self.run_json))
+        self.assertEqual(self._cli("--check"), 1)
+
+    def test_book_without_member_sbt_refused(self):
+        b = _book()
+        del b["contracts"]["CitrateMemberSBT"]
+        self.book.write_text(json.dumps(b, indent=2) + "\n")
+        self.assertEqual(self._cli("--check"), 1)
 
     def test_failed_receipt_on_chain_refused(self):
         _FakeChain.state["receipt_status"] = "0x0"

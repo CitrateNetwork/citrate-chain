@@ -34,6 +34,7 @@ contract DeployCitAgentTest is Test {
         vm.setEnv("CIT_AGENT_TIMELOCK_OWNER_1", vm.toString(bob));
         vm.setEnv("CIT_AGENT_TIMELOCK_OWNER_2", vm.toString(carol));
         vm.setEnv("CIT_AGENT_TIMELOCK_DELAY", "172800"); // 2 days
+        vm.setEnv("CIT_AGENT_MEMBER_SBT", vm.toString(makeAddr("memberSbt")));
 
         DeployCitAgent script = new DeployCitAgent();
         // The script's `startBroadcast` runs as the test contract;
@@ -88,6 +89,7 @@ contract DeployCitAgentTest is Test {
         vm.setEnv("CIT_AGENT_TIMELOCK_OWNER_1", vm.toString(bob));
         vm.setEnv("CIT_AGENT_TIMELOCK_OWNER_2", vm.toString(carol));
         vm.setEnv("CIT_AGENT_TIMELOCK_DELAY", "172800");
+        vm.setEnv("CIT_AGENT_MEMBER_SBT", vm.toString(makeAddr("memberSbt")));
 
         DeployCitAgent script = new DeployCitAgent();
         DeployCitAgent.Deployment memory d = script.run();

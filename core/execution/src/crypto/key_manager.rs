@@ -3,14 +3,14 @@
 // Hierarchical Deterministic (HD) Key Management System
 // Manages encryption keys for models with support for key derivation and rotation
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
+use hmac::{Hmac, Mac};
+use parking_lot::RwLock;
+use primitive_types::{H160, H256};
 use serde::{Deserialize, Serialize};
-use sha3::{Sha3_256, Sha3_512, Digest};
-use primitive_types::{H256, H160};
+use sha3::{Digest, Sha3_256, Sha3_512};
 use std::collections::HashMap;
 use std::sync::Arc;
-use parking_lot::RwLock;
-use hmac::{Hmac, Mac};
 
 type HmacSha512 = Hmac<Sha3_512>;
 
@@ -161,11 +161,11 @@ impl KeyManager {
         let result = mac.finalize();
         let bytes = result.into_bytes();
 
-        let mut master_key = [0u8; 32];
-        let mut chain_code = [0u8; 32];
-
-        master_key.copy_from_slice(&bytes[..32]);
-        chain_code.copy_from_slice(&bytes[32..64]);
+        // HMAC-SHA512 output is 64 bytes: key ‖ chain code.
+        let (master_key, chain_code): ([u8; 32], [u8; 32]) = bytes
+            .split_first_chunk::<32>()
+            .and_then(|(k, rest)| Some((*k, *rest.first_chunk::<32>()?)))
+            .ok_or_else(|| anyhow!("HMAC output shorter than 64 bytes"))?;
 
         let mut manager = Self::new();
         manager.master_key = Some(master_key);
@@ -175,19 +175,17 @@ impl KeyManager {
     }
 
     /// Derive key for a specific path
-    pub fn derive_key(
-        &self,
-        path: &str,
-        purpose: KeyPurpose,
-    ) -> Result<DerivedKey> {
-        let master_key = self.master_key
+    pub fn derive_key(&self, path: &str, purpose: KeyPurpose) -> Result<DerivedKey> {
+        let master_key = self
+            .master_key
             .ok_or_else(|| anyhow!("Master key not initialized"))?;
-        let chain_code = self.chain_code
+        let chain_code = self
+            .chain_code
             .ok_or_else(|| anyhow!("Chain code not initialized"))?;
 
         // Parse path (e.g., "m/44'/60'/0'/0/0")
         let components: Vec<&str> = path.split('/').collect();
-        if components.is_empty() || components[0] != "m" {
+        if components.first() != Some(&"m") {
             return Err(anyhow!("Invalid derivation path"));
         }
 
@@ -197,25 +195,24 @@ impl KeyManager {
         // Derive for each path component
         for component in components.iter().skip(1) {
             let (index, _hardened) = if let Some(idx_str) = component.strip_suffix('\'') {
-                let idx = idx_str.parse::<u32>()
+                let idx = idx_str
+                    .parse::<u32>()
                     .map_err(|_| anyhow!("Invalid path component"))?;
                 // Check for overflow before adding
                 if idx > 0x7FFFFFFF {
                     return Err(anyhow!("Path component too large for hardened derivation"));
                 }
-                (idx + 0x80000000, true) // Hardened derivation
+                (idx | 0x8000_0000, true) // Hardened derivation (idx <= 0x7FFF_FFFF)
             } else {
-                let idx = component.parse::<u32>()
+                let idx = component
+                    .parse::<u32>()
                     .map_err(|_| anyhow!("Invalid path component"))?;
                 (idx, false)
             };
 
             // Perform child key derivation
-            let (child_key, child_chain) = self.derive_child_key(
-                &current_key,
-                &current_chain,
-                index,
-            )?;
+            let (child_key, child_chain) =
+                self.derive_child_key(&current_key, &current_chain, index)?;
 
             current_key = child_key;
             current_chain = child_chain;
@@ -239,12 +236,14 @@ impl KeyManager {
             key: current_key,
             path: path.to_string(),
             created_at: now,
-            expires_at: now + 30 * 24 * 3600, // 30 days default
+            expires_at: now.saturating_add(30 * 24 * 3600), // 30 days default
             purpose,
         };
 
         // Cache the derived key
-        self.derived_keys.write().insert(key_id, derived_key.clone());
+        self.derived_keys
+            .write()
+            .insert(key_id, derived_key.clone());
 
         Ok(derived_key)
     }
@@ -272,11 +271,11 @@ impl KeyManager {
         let result = mac.finalize();
         let bytes = result.into_bytes();
 
-        let mut child_key = [0u8; 32];
-        let mut child_chain = [0u8; 32];
-
-        child_key.copy_from_slice(&bytes[..32]);
-        child_chain.copy_from_slice(&bytes[32..64]);
+        // HMAC-SHA512 output is 64 bytes: key ‖ chain code.
+        let (child_key, child_chain): ([u8; 32], [u8; 32]) = bytes
+            .split_first_chunk::<32>()
+            .and_then(|(k, rest)| Some((*k, *rest.first_chunk::<32>()?)))
+            .ok_or_else(|| anyhow!("HMAC output shorter than 64 bytes"))?;
 
         Ok((child_key, child_chain))
     }
@@ -303,9 +302,9 @@ impl KeyManager {
         let model_hash = {
             let mut hasher = sha3::Sha3_256::new();
             hasher.update(model_id.as_bytes());
-            let result = hasher.finalize();
+            let [a, b, c, d, ..]: [u8; 32] = hasher.finalize().into();
             // Use a smaller value to avoid overflow in hardened derivation
-            u32::from_be_bytes([result[0], result[1], result[2], result[3]]) % 1000000 // Limit to 6 digits
+            u32::from_be_bytes([a, b, c, d]) % 1_000_000 // Limit to 6 digits
         };
         let secret = self.derive_key(
             &format!("m/44'/1337'/{}'", model_hash),
@@ -317,9 +316,9 @@ impl KeyManager {
 
         // Encrypt each share for its holder
         let mut encrypted_shares = HashMap::new();
-        for (i, holder) in share_holders.iter().enumerate() {
+        for (holder, share) in share_holders.iter().zip(&shares) {
             // In production, encrypt with holder's public key
-            let encrypted_share = self.encrypt_share(&shares[i], holder)?;
+            let encrypted_share = self.encrypt_share(share, holder)?;
             encrypted_shares.insert(*holder, encrypted_share);
         }
 
@@ -331,18 +330,15 @@ impl KeyManager {
             encrypted_shares,
         };
 
-        self.threshold_keys.write().insert(model_id, threshold_key.clone());
+        self.threshold_keys
+            .write()
+            .insert(model_id, threshold_key.clone());
 
         Ok(threshold_key)
     }
 
     /// Split secret using Shamir's Secret Sharing (simplified)
-    fn split_secret(
-        &self,
-        secret: &[u8; 32],
-        threshold: u32,
-        total: u32,
-    ) -> Result<Vec<Vec<u8>>> {
+    fn split_secret(&self, secret: &[u8; 32], threshold: u32, total: u32) -> Result<Vec<Vec<u8>>> {
         // Simplified implementation
         // In production, use proper Shamir's Secret Sharing
 
@@ -369,8 +365,8 @@ impl KeyManager {
         // In production, use holder's public key for encryption
         // Simplified version for demonstration
         let mut encrypted = share.to_vec();
-        for (i, byte) in encrypted.iter_mut().enumerate() {
-            *byte ^= holder.as_bytes()[i % 20];
+        for (byte, key) in encrypted.iter_mut().zip(holder.as_bytes().iter().cycle()) {
+            *byte ^= key;
         }
         Ok(encrypted)
     }
@@ -402,12 +398,10 @@ impl KeyManager {
         // Reconstruct secret (simplified)
         // In production, use proper Shamir's reconstruction
         let mut secret = [0u8; 32];
-        if !decrypted_shares.is_empty() {
-            let first_share = &decrypted_shares[0];
-            if first_share.len() >= 34 {
-                secret.copy_from_slice(&first_share[2..34]);
+        if let Some(first_share) = decrypted_shares.first() {
+            if let (Some(body), Some(&index)) = (first_share.get(2..34), first_share.first()) {
+                secret.copy_from_slice(body);
                 // XOR back to get original
-                let index = first_share[0];
                 for byte in secret.iter_mut() {
                     *byte ^= index;
                 }
@@ -421,18 +415,14 @@ impl KeyManager {
     fn decrypt_share(&self, encrypted: &[u8], holder: &H160) -> Result<Vec<u8>> {
         // Simplified decryption
         let mut decrypted = encrypted.to_vec();
-        for (i, byte) in decrypted.iter_mut().enumerate() {
-            *byte ^= holder.as_bytes()[i % 20];
+        for (byte, key) in decrypted.iter_mut().zip(holder.as_bytes().iter().cycle()) {
+            *byte ^= key;
         }
         Ok(decrypted)
     }
 
     /// Set access policy for a model
-    pub fn set_access_policy(
-        &self,
-        model_id: H256,
-        policy: AccessPolicy,
-    ) -> Result<()> {
+    pub fn set_access_policy(&self, model_id: H256, policy: AccessPolicy) -> Result<()> {
         self.access_policies.write().insert(model_id, policy);
         Ok(())
     }
@@ -445,7 +435,8 @@ impl KeyManager {
         access_type: AccessType,
     ) -> Result<bool> {
         let policies = self.access_policies.read();
-        let policy = policies.get(&model_id)
+        let policy = policies
+            .get(&model_id)
             .ok_or_else(|| anyhow!("No policy found for model"))?;
 
         // Owner always has access
@@ -535,8 +526,12 @@ mod tests {
         let seed = [0u8; 64];
         let manager = KeyManager::from_seed(&seed).unwrap();
 
-        let key1 = manager.derive_key("m/44'/60'/0'/0/0", KeyPurpose::ModelEncryption).unwrap();
-        let key2 = manager.derive_key("m/44'/60'/0'/0/1", KeyPurpose::ModelEncryption).unwrap();
+        let key1 = manager
+            .derive_key("m/44'/60'/0'/0/0", KeyPurpose::ModelEncryption)
+            .unwrap();
+        let key2 = manager
+            .derive_key("m/44'/60'/0'/0/1", KeyPurpose::ModelEncryption)
+            .unwrap();
 
         assert_ne!(key1.key, key2.key);
         assert_ne!(key1.key_id, key2.key_id);
@@ -550,11 +545,13 @@ mod tests {
         let model_id = H256::random();
         let holders = vec![H160::random(), H160::random(), H160::random()];
 
-        let threshold_key = manager.create_threshold_key(
-            model_id,
-            2, // 2 of 3
-            holders.clone(),
-        ).unwrap();
+        let threshold_key = manager
+            .create_threshold_key(
+                model_id,
+                2, // 2 of 3
+                holders.clone(),
+            )
+            .unwrap();
 
         assert_eq!(threshold_key.threshold, 2);
         assert_eq!(threshold_key.total_shares, 3);
@@ -580,10 +577,16 @@ mod tests {
         manager.set_access_policy(model_id, policy).unwrap();
 
         // Owner should have full access
-        assert!(manager.check_access(model_id, owner, AccessType::Full).unwrap());
+        assert!(manager
+            .check_access(model_id, owner, AccessType::Full)
+            .unwrap());
 
         // User should have inference access only
-        assert!(manager.check_access(model_id, user, AccessType::Inference).unwrap());
-        assert!(!manager.check_access(model_id, user, AccessType::Full).unwrap());
+        assert!(manager
+            .check_access(model_id, user, AccessType::Inference)
+            .unwrap());
+        assert!(!manager
+            .check_access(model_id, user, AccessType::Full)
+            .unwrap());
     }
 }

@@ -112,15 +112,16 @@ pub fn resolve_identity(
 
     let sig_bytes = hex::decode(sig_hex.trim_start_matches("0x"))
         .map_err(|_| InferenceAuthError::MalformedSignature)?;
-    if sig_bytes.len() != 65 {
-        return Err(InferenceAuthError::MalformedSignature);
-    }
-    let r = &sig_bytes[0..32];
-    let s = &sig_bytes[32..64];
+    let sig: &[u8; 65] = sig_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| InferenceAuthError::MalformedSignature)?;
+    let (r, rest) = sig.split_at(32);
+    let (s, v) = rest.split_at(32);
     // Accept both raw recovery ids {0,1} and Ethereum-style {27,28}.
-    let v = match sig_bytes[64] {
-        v @ 0..=1 => v,
-        v @ 27..=28 => v - 27,
+    let v = match v {
+        [v @ 0..=1] => *v,
+        [v @ 27..=28] => v.saturating_sub(27),
         _ => return Err(InferenceAuthError::MalformedSignature),
     };
 

@@ -32,6 +32,7 @@ import "./LegacyDeployGuard.sol";
 ///        CIT_AGENT_TIMELOCK_OWNER_1  — second timelock owner (required)
 ///        CIT_AGENT_TIMELOCK_OWNER_2  — third timelock owner (required)
 ///        CIT_AGENT_TIMELOCK_DELAY    — min delay in seconds (default: 2 days)
+///        CIT_AGENT_MEMBER_SBT        — CitrateMemberSBT whose holders may mint agents (required)
 ///
 ///      RETIRED on chain 40204 (HUP-S7.1): `script/DeployHupRegistries.s.sol` deploys
 ///      the replacement set by CREATE2 with the admin as constructor argument.
@@ -67,6 +68,8 @@ contract DeployCitAgent is ScriptEnv {
             "set CIT_AGENT_TIMELOCK_OWNER_{0,1,2}"
         );
         uint256 minDelay = envUintOr("CIT_AGENT_TIMELOCK_DELAY", 2 days);
+        address memberSbt = envAddressOr("CIT_AGENT_MEMBER_SBT", address(0));
+        require(memberSbt != address(0), "set CIT_AGENT_MEMBER_SBT");
 
         console.log("=== CIT-AGENT-6c deployment ===");
         console.log("Deployer:               ", deployer);
@@ -88,7 +91,7 @@ contract DeployCitAgent is ScriptEnv {
         console.log("OrganizationSBT:        ", address(org));
 
         // 3. AgentSBT — references OrganizationSBT.
-        AgentSBT agent = new AgentSBT(deployer, org);
+        AgentSBT agent = new AgentSBT(deployer, org, IERC721(memberSbt));
         console.log("AgentSBT:               ", address(agent));
 
         // 4. CapsuleRegistry.

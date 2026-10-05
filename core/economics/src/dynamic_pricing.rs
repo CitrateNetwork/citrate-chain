@@ -46,7 +46,7 @@ impl Default for DynamicPricingConfig {
             adjustment_factor: 125, // 1.25% per block
             utilization_window: 20, // 20 blocks
             ai_inference_multiplier: 200, // 2x for AI ops
-            model_deployment_base: U256::from(100) * U256::from(10).pow(U256::from(18)), // 100 SALT
+            model_deployment_base: crate::salt(100), // 100 SALT
             compute_scaling_factor: 150, // 1.5x scaling per compute unit
         }
     }
@@ -182,11 +182,15 @@ impl DynamicPricingManager {
 
     /// Calculate cost for AI operations
     fn calculate_ai_operation_cost(&self, metrics: &UtilizationMetrics) -> U256 {
-        let base_cost = self.current_gas_price * U256::from(21_000); // Base transaction cost
+        let base_cost = self.current_gas_price.saturating_mul(U256::from(21_000)); // Base transaction cost
         let ai_multiplier = U256::from(self.config.ai_inference_multiplier);
         let compute_scaling = U256::from((100.0 + metrics.compute_intensity * 100.0) as u64);
 
-        base_cost * ai_multiplier * compute_scaling / U256::from(10_000)
+        crate::mul_div(
+            base_cost.saturating_mul(ai_multiplier),
+            compute_scaling,
+            U256::from(10_000),
+        )
     }
 
     /// Calculate cost for model deployment
@@ -194,7 +198,7 @@ impl DynamicPricingManager {
         let base_deployment = self.config.model_deployment_base;
         let network_factor = U256::from((100.0 + metrics.compute_intensity * 50.0) as u64);
 
-        base_deployment * network_factor / U256::from(100)
+        crate::mul_div(base_deployment, network_factor, U256::from(100))
     }
 
     /// Calculate price change factor
@@ -214,22 +218,26 @@ impl DynamicPricingManager {
     /// Get price for specific operation type
     pub fn get_operation_price(&self, operation: OperationType) -> U256 {
         match operation {
-            OperationType::StandardTransaction => self.current_gas_price * U256::from(21_000),
-            OperationType::ContractCall => self.current_gas_price * U256::from(50_000),
+            OperationType::StandardTransaction => self.current_gas_price.saturating_mul(U256::from(21_000)),
+            OperationType::ContractCall => self.current_gas_price.saturating_mul(U256::from(50_000)),
             OperationType::AIInference { compute_units } => {
-                let base = self.current_gas_price * U256::from(100_000);
-                let scaling = U256::from(compute_units) * U256::from(self.config.compute_scaling_factor) / U256::from(100);
-                base + (base * scaling / U256::from(100))
+                let base = self.current_gas_price.saturating_mul(U256::from(100_000));
+                let scaling = crate::mul_div(
+                    U256::from(compute_units),
+                    U256::from(self.config.compute_scaling_factor),
+                    U256::from(100),
+                );
+                base.saturating_add(crate::mul_div(base, scaling, U256::from(100)))
             },
             OperationType::ModelDeployment { model_size_mb } => {
                 let base = self.config.model_deployment_base;
-                let size_scaling = U256::from(model_size_mb) * U256::from(10).pow(U256::from(16)); // 0.01 SALT per MB
-                base + size_scaling
+                let size_scaling = U256::from(model_size_mb).saturating_mul(U256::exp10(16)); // 0.01 SALT per MB
+                base.saturating_add(size_scaling)
             },
             OperationType::ModelTraining { dataset_size_gb } => {
-                let base = self.current_gas_price * U256::from(1_000_000);
-                let data_scaling = U256::from(dataset_size_gb) * U256::from(10).pow(U256::from(17)); // 0.1 SALT per GB
-                base + data_scaling
+                let base = self.current_gas_price.saturating_mul(U256::from(1_000_000));
+                let data_scaling = U256::from(dataset_size_gb).saturating_mul(U256::exp10(17)); // 0.1 SALT per GB
+                base.saturating_add(data_scaling)
             },
         }
     }

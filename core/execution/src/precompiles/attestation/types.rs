@@ -12,16 +12,12 @@ pub enum AttestationDecision {
     /// inference origin (Phase 2 sets this from MAA's
     /// `provider_address` claim; Phase 1 always uses None
     /// because there's no live verification yet).
-    Allow {
-        attested_provider: Option<Address>,
-    },
+    Allow { attested_provider: Option<Address> },
 
     /// Inference is denied. The `reason` string surfaces in
     /// the precompile's error and is visible to the calling
     /// contract via `staticcall` revert data.
-    Reject {
-        reason: String,
-    },
+    Reject { reason: String },
 }
 
 /// Trait that the inference precompile consults to decide

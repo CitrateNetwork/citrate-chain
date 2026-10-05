@@ -2,15 +2,19 @@
 created: 2026-10-01
 branch: hup/n5-chain-precompiles
 author: Larry Klosowski + Claude Opus 5.5
-status: proposed (gas schedule and the 40204 height pending owner sign-off)
+updated: 2026-10-04
+status: accepted (active at genesis of the 2026-10-05 40204 reroll; placeholder gas schedule owner-signed)
 ---
 
 # ADR-2026-10-01: Precompile integration and the agent precompile fork
 
 ## Status
 
-Proposed. Implemented on `hup/n5-chain-precompiles` with tests; not activated on any
-network. Spec: `docs/precompiles/AGENT_PRECOMPILES.md`.
+Accepted 2026-10-04 (owner decision). Active at genesis of the 2026-10-05 40204 reroll:
+the release pin is `(40204, Some(0))`, so the four precompiles are live from block 1 and
+no mid-chain activation is scheduled. The placeholder gas schedule is owner-signed as is.
+Implemented on `hup/n5-chain-precompiles`, carried onto `reroll/panic-s1`. Spec:
+`docs/precompiles/AGENT_PRECOMPILES.md`.
 
 ## Context
 
@@ -72,8 +76,9 @@ record-hash op (a domain-prefixed SHA-256 is cheap in Solidity via 0x02).
 
 `core/execution/src/agent_fork.rs` holds one store and one resolver. On a release
 network the release pin is the only source: a per-node env or config height refuses to
-start, including while nothing is pinned. 40204 ships unpinned (not activated). Dev
-chains may set it by config or env. The PBA hardening height is independent.
+start, including while nothing is pinned. 40204 ships pinned at genesis (`Some(0)`,
+accepted 2026-10-04). Dev chains may set it by config or env. The PBA hardening height
+is independent (the reroll also pins it at genesis).
 
 The REVM bridge registers the four precompiles only at and after the height (call and
 create paths). The TLA+ model `specs/tla/consensus/AgentPrecompileFork.tla` checks that
@@ -87,9 +92,11 @@ breaks agreement.
   path exists (CM-08). The contracts will work unchanged if a later fork serves 0x0101 to
   contract code with the native layout.
 - Gas values are conservative placeholders (RM-M2 matmul rate for LoRA; SHA-256 and
-  ecrecover rates for the others). They need owner sign-off before the height is pinned.
-- Scheduling the fork is an owner decision (the pin) and an operator action (roll the
-  binary before the height). No agent sets the height, deploys, signs or sends.
+  ecrecover rates for the others), owner-signed as the genesis schedule. Changing them
+  later is a new fork.
+- The height is an owner decision (the pin: genesis of the reroll) and an operator action
+  (build every node of the new genesis from the release commit). No agent sets the
+  height, deploys, signs or sends.
 - The model and LoRA contracts change bytecode; they are part of the post-reroll
   redeploy set (federation F-4) and are not deployed on 40204 today.
 - Rule 6: this changes `citrate-execution` (a core crate); the daily benchmark must be
