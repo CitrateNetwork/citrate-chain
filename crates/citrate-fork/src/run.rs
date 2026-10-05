@@ -162,9 +162,9 @@ impl<DB: Database> Inspector<DB> for PrecompileTracer {
     ) -> CallOutcome {
         if let Some(v) = table::short_address(&inputs.bytecode_address.0 .0) {
             let e = self.hits.entry(v).or_insert((0, 0));
-            e.0 += 1;
+            e.0 = e.0.saturating_add(1);
             if !outcome.result.result.is_ok() {
-                e.1 += 1;
+                e.1 = e.1.saturating_add(1);
             }
         }
         outcome
@@ -283,8 +283,8 @@ pub fn run(plan: &Plan, state: ForkState, cfg: &ForkConfig) -> Result<Report, Fo
         let result = result.map_err(|e| err(format!("step {i}: {e:?}")))?;
         for (v, (c, f)) in &tracer.hits {
             let e = all_hits.entry(*v).or_insert((0, 0));
-            e.0 += c;
-            e.1 += f;
+            e.0 = e.0.saturating_add(*c);
+            e.1 = e.1.saturating_add(*f);
         }
         let (ok, gas, out, addr, error, logs) = match result {
             ExecutionResult::Success {
@@ -317,7 +317,7 @@ pub fn run(plan: &Plan, state: ForkState, cfg: &ForkConfig) -> Result<Report, Fo
             created.insert(i, a);
         }
         let truncated = out.len() > MAX_OUTPUT_BYTES;
-        let shown = &out[..out.len().min(MAX_OUTPUT_BYTES)];
+        let shown = out.get(..MAX_OUTPUT_BYTES).unwrap_or(out.as_slice());
         steps.push(StepReport {
             kind: kind.to_string(),
             status: if ok { "0x1" } else { "0x0" }.to_string(),
