@@ -683,17 +683,21 @@ pub fn register_citrate_precompiles<EXT, DB: Database>(
     let prev = handler.pre_execution.load_precompiles.clone();
     handler.pre_execution.load_precompiles = Arc::new(move || {
         let mut precompiles = prev();
-        precompiles.extend(crate::precompiles::PURE_PRECOMPILE_ADDRESSES.iter().map(|raw| {
-            (
-                RevmAddress::from_slice(raw),
-                ContextPrecompile::Ordinary(Precompile::Stateful(Arc::new(
-                    CitratePurePrecompile {
-                        addr: Address(*raw),
-                        hardened,
-                    },
-                ))),
-            )
-        }));
+        precompiles.extend(
+            crate::precompiles::PURE_PRECOMPILE_ADDRESSES
+                .iter()
+                .map(|raw| {
+                    (
+                        RevmAddress::from_slice(raw),
+                        ContextPrecompile::Ordinary(Precompile::Stateful(Arc::new(
+                            CitratePurePrecompile {
+                                addr: Address(*raw),
+                                hardened,
+                            },
+                        ))),
+                    )
+                }),
+        );
         if hardened {
             precompiles.extend(
                 crate::precompiles::reserved_unbridged_addresses()
