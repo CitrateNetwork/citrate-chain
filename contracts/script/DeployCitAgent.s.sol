@@ -10,6 +10,7 @@ import "../src/cit_agent/AgentSBT.sol";
 import "../src/cit_agent/CapsuleRegistry.sol";
 import "../src/cit_agent/AnchorRegistry.sol";
 import "../src/cit_agent/BenchmarkRegistry.sol";
+import "./LegacyDeployGuard.sol";
 
 /// @title DeployCitAgent — CIT-AGENT-6c
 /// @notice Deploys the 5 cit-agent contracts + the 2-of-3 multisig
@@ -32,6 +33,10 @@ import "../src/cit_agent/BenchmarkRegistry.sol";
 ///        CIT_AGENT_TIMELOCK_OWNER_2  — third timelock owner (required)
 ///        CIT_AGENT_TIMELOCK_DELAY    — min delay in seconds (default: 2 days)
 ///        CIT_AGENT_MEMBER_SBT        — CitrateMemberSBT whose holders may mint agents (required)
+///
+///      RETIRED on chain 40204 (HUP-S7.1): `script/DeployHupRegistries.s.sol` deploys
+///      the replacement set by CREATE2 with the admin as constructor argument.
+///      `run()` reverts on 40204 and still deploys on a local chain.
 contract DeployCitAgent is ScriptEnv {
     struct Deployment {
         address timelock;
@@ -43,6 +48,7 @@ contract DeployCitAgent is ScriptEnv {
     }
 
     function run() external returns (Deployment memory d) {
+        LegacyDeployGuard.refuseOnCitrate("DeployCitAgent");
         // DEPLOYER_ADDRESS must equal the broadcaster identity (the
         // forge-CLI signer in live deploys, the configured broadcast
         // sender in tests). The contracts are constructed with this

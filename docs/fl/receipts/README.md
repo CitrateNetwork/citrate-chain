@@ -23,3 +23,13 @@ trainer, so no learning is represented.
   shape and outcome: accepted after the window, record digest equal on chain, in the bundle and in
   the replay, 4 settlement intents, the dishonest ordinal 1 rejected on chain and refused by
   settlement.
+- `2026-10-04-devnet-gemma-4-e4b.json`: the Gemma 4 E4B run repeated on the current stack (fan-out
+  7, after the fan-out 6 fixes), with release builds of the compute-pool and settlement tools.
+  Same shape and outcome as the 2026-10-01 Gemma run: 2,269,184 values, 2,216 chunks through
+  `0x0110`, 0 replay mismatches, record digest equal on chain, in the bundle and in the replay,
+  accepted after the window, 4 settlement intents, the dishonest ordinal 1 rejected on chain
+  (chunk 1108) and refused by settlement, and the merged adapter loads in the app's
+  llama-server on CPU and completes. The `run` section names the commits and two findings: the
+  aggregator now retries a node's rate-limit answer (it failed without that at release speed),
+  and a probe measured under heavy load is correctly refused federated work. The trainer is
+  still the fixture trainer: no learning ran.
