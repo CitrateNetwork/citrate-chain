@@ -2,7 +2,7 @@
 title: "HUP registry redeploy (HUP-S7.1, federation F-4): operator runbook for chain 40204"
 created: 2026-10-01
 branch: hup/n5-chain-redeploy
-updated: 2026-10-04
+updated: 2026-10-04 (hup/n7-registry-redeploy-prep: retired scripts, provenance step, RPC check)
 author: Larry Klosowski + Claude Opus 5.5
 status: READY FOR REHEARSAL. Nothing here has been broadcast. The chain operator runs the broadcast after the next reroll; the admin choice is pending owner sign-off.
 chain: 40204
@@ -59,6 +59,11 @@ Properties the script and its tests (`test/cit_agent/DeployHupRegistries.t.sol`)
   `AgentSBT.memberSbt()`, and one view per contract, and confirms `SkillRegistry` is
   the `abi.encode` version.
 
+**Retired scripts.** `DeployCitAgent.s.sol`, `DeployAnchorRegistry.s.sol` and
+`DeploySkillRegistry.s.sol` deploy the versions this redeploy replaces. Each now reverts
+on chain id 40204 before it broadcasts anything (`script/LegacyDeployGuard.sol`, tested in
+`test/cit_agent/LegacyDeployScripts.t.sol`); they still run on a local chain.
+
 ## 2. Contract versions in this redeploy
 
 These ship with the redeploy. The registries live on today's chain keep their old
@@ -78,6 +83,14 @@ bytecode until the reroll replaces the chain.
   still not authoritative: resolve skills by `skillHash` against a pinned owner list.
 
 **Consumer follow-ups (other repos, before members rely on the new registries):**
+
+Status 2026-10-04 (branch `hup/n7-registry-redeploy-prep` in each repo): item 2 is done
+in citrate-agent-runtime (`citrate_agent_anchor::OwnAnchorCheck`, used by
+`AnchorRegistryClient::is_anchored_by_self`, anvil-tested on both registry versions by
+`scripts/anvil-anchor-registry-versions.sh`); citrate-core's proof check already asks
+`getAnchorBy(self, root)` first. Item 3 is done in citrate-core `scripts/sync-addresses.py`
+(rehearsed against this fork by its `scripts/anvil-sync-addresses.sh`). Item 1 is owned by
+the skill-publish lane.
 
 1. citrate-agent-runtime `agent-learn/src/registry.rs::skill_hash` must switch to
    `abi.encode` layout (or call `skillHashOf`). Until then the publish payload's
@@ -180,8 +193,33 @@ address the app no longer reads. A migration plan for those records is an owner
 decision; only after it is agreed, rerun with `--retire-populated`. On the
 2026-10-04 fork rehearsal every old pin read zero, so nothing would be stranded today.
 
-**Step 4.** Commit the book (one-file PR, squash). Regenerate the provenance ledger
-the same way as the reroll book (the deployer transactions now include these).
+**Step 4. Provenance ledger** (reads the same broadcast and the book step 3 wrote):
+
+```bash
+scripts/ops/hup-provenance-update.py \
+  --broadcast contracts/broadcast/DeployHupRegistries.s.sol/40204/run-latest.json \
+  --book contracts/addresses/40204.json --provenance contracts/addresses/40204.provenance.json \
+  --genesis 0x<new block-0 hash> --rpc https://rpc.citrate.ai --backfill --check
+# then the same command without --check
+```
+
+It appends one row per redeploy transaction and marks the rows the book no longer pins
+`superseded`. It refuses when the book does not already pin the broadcast's addresses,
+when a deployer nonce would leave a gap, or when the ledger was built for another
+genesis (after a reroll the ledger is regenerated, not appended to). `--backfill` first
+records deployer transactions the ledger is missing, but only plain transfers and calls;
+anything that created a contract needs a person to classify it. On today's chain the
+deployer sent two plain transfers after the ledger was built (nonces 116 and 117, blocks
+11845 and 11847); the 2026-10-04 fork rehearsal backfilled them and appended the six
+registries at nonces 118 to 123. Then commit the book and the ledger together (one PR,
+squash).
+
+**RPC check before step 2.** On 2026-10-04 `rpc.citrate.ai` returned `null` for
+`eth_getTransactionByHash` and `eth_getTransactionReceipt` of transactions that are in
+its blocks (for example `0x23c717a1…` in block 130856, and the ledger's own nonce-115
+transaction). forge waits for receipts after `--broadcast`, and steps 3 and 4 read
+receipts, so confirm `cast receipt <a recent tx> --rpc-url https://rpc.citrate.ai`
+returns a receipt before broadcasting.
 
 **Step 5. Consumers.** In citrate-core (after follow-up 3):
 
@@ -189,6 +227,11 @@ the same way as the reroll book (the deployer transactions now include these).
 scripts/sync-addresses.py --book ../citrate-chain/contracts/addresses/40204.json \
   --genesis 0x<new block-0 hash> --rpc https://rpc.citrate.ai
 ```
+
+The book's `InferenceRouter` is the one already on the chain; this redeploy does not
+replace it. A pinned router turns on the app's HIC-1 registry escalation route (US-1.5),
+so the sync checks that pin but writes it only with `--with-inference-router`. Leave the
+flag off until the owner signs off US-1.5.
 
 **Step 6. After deploy (owner decisions, not part of this script):**
 
@@ -208,6 +251,8 @@ scripts/sync-addresses.py --book ../citrate-chain/contracts/addresses/40204.json
 
 - [ ] `forge test --match-path 'test/cit_agent/*'` green on the commit that was deployed.
 - [ ] `python3 -m unittest discover -s scripts/ops/tests -p 'test_hup_*.py'` green.
+- [ ] Step 4 `--check` lists the six (or seven) registry rows and supersedes exactly the
+      old rows of those names.
 - [ ] Step 0 `dryrun: PASS` against the new chain.
 - [ ] Step 3 `--check` reports exactly the 6 (or 7) expected names.
 - [ ] Step 3 reports no "populated pin replaced" line (or the owner signed off a

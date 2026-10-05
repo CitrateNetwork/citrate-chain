@@ -10,10 +10,10 @@ fn short(raw: &[u8; 20]) -> u16 {
 fn every_address_the_node_bridges_is_real_below_hardening() {
     for raw in citrate_execution::precompiles::PURE_PRECOMPILE_ADDRESSES.iter() {
         let v = short(raw);
-        assert_eq!(coverage(v, false).0, Coverage::Real, "0x{v:04x}");
+        assert_eq!(coverage(v, false, false).0, Coverage::Real, "0x{v:04x}");
     }
     assert_eq!(
-        real_addresses(false).len(),
+        real_addresses(false, false).len(),
         citrate_execution::precompiles::PURE_PRECOMPILE_ADDRESSES.len()
     );
 }
@@ -21,15 +21,19 @@ fn every_address_the_node_bridges_is_real_below_hardening() {
 #[test]
 fn inference_reserved_and_tx_level_precompiles_are_unavailable() {
     for v in 0x0100..=0x0106u16 {
-        let (c, note) = coverage(v, false);
+        let (c, note) = coverage(v, false, false);
         assert_eq!(c, Coverage::Unavailable, "0x{v:04x}");
         assert!(note.contains("inference"), "{note}");
     }
     for v in [0x0112u16, 0x013F, 0x0203, 0x0209] {
-        assert_eq!(coverage(v, true).0, Coverage::Unavailable, "0x{v:04x}");
+        assert_eq!(
+            coverage(v, true, false).0,
+            Coverage::Unavailable,
+            "0x{v:04x}"
+        );
     }
     for v in [0x1000u16, 0x1002, 0x1003] {
-        let (c, note) = coverage(v, false);
+        let (c, note) = coverage(v, false, false);
         assert_eq!(c, Coverage::Unavailable);
         assert!(note.contains("top-level transaction"), "{note}");
     }
@@ -37,7 +41,7 @@ fn inference_reserved_and_tx_level_precompiles_are_unavailable() {
 
 #[test]
 fn fold_verify_at_a_hardened_height_matches_the_build() {
-    let (c, _) = coverage(0x0130, true);
+    let (c, _) = coverage(0x0130, true, false);
     let expected = if citrate_execution::build_features::COMMD_FOLD_VERIFY {
         Coverage::Real
     } else {
@@ -45,7 +49,7 @@ fn fold_verify_at_a_hardened_height_matches_the_build() {
     };
     assert_eq!(c, expected);
     assert_eq!(
-        coverage(0x0130, false).0,
+        coverage(0x0130, false, false).0,
         Coverage::Real,
         "below hardening it fails on chain too"
     );
@@ -53,7 +57,7 @@ fn fold_verify_at_a_hardened_height_matches_the_build() {
 
 #[test]
 fn the_table_covers_every_citrate_address_once() {
-    let t = table(false);
+    let t = table(false, false);
     assert_eq!(t.len(), 0x40 + 10 + 3);
     let mut seen = std::collections::BTreeSet::new();
     for r in &t {
@@ -82,4 +86,29 @@ fn short_address_only_matches_citrate_precompiles() {
     far[18] = 0x01;
     far[19] = 0x10;
     assert_eq!(short_address(&far), None);
+}
+
+#[test]
+fn the_agent_fork_addresses_are_real_only_once_the_fork_is_active() {
+    for raw in citrate_execution::precompiles::AGENT_FORK_PRECOMPILE_ADDRESSES.iter() {
+        let v = short(raw);
+        assert_eq!(
+            coverage(v, false, false).0,
+            Coverage::Unavailable,
+            "0x{v:04x}"
+        );
+        assert_eq!(
+            coverage(v, true, false).0,
+            Coverage::Unavailable,
+            "0x{v:04x}"
+        );
+        let (c, note) = coverage(v, false, true);
+        assert_eq!(c, Coverage::Real, "0x{v:04x}");
+        assert!(note.contains("agent precompile fork"), "{note}");
+    }
+    assert_eq!(
+        real_addresses(false, true).len(),
+        citrate_execution::precompiles::PURE_PRECOMPILE_ADDRESSES.len()
+            + citrate_execution::precompiles::AGENT_FORK_PRECOMPILE_ADDRESSES.len()
+    );
 }
