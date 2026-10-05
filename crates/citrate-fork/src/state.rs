@@ -162,7 +162,7 @@ impl RpcState {
         // Read at most one byte past the cap, so an oversized answer is refused without
         // first being held in memory whole.
         let mut bytes = Vec::new();
-        resp.take(MAX_RPC_BODY as u64 + 1)
+        resp.take((MAX_RPC_BODY as u64).saturating_add(1))
             .read_to_end(&mut bytes)
             .map_err(|e| err(format!("{method}: reading the response: {e}")))?;
         if bytes.len() > MAX_RPC_BODY {

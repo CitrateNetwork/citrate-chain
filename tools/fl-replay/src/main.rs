@@ -1,3 +1,19 @@
+// PANIC-S1 G2: production code in this crate may not panic. Every panic class is
+// denied outside tests; a genuine invariant needs an item-level #[allow] with an
+// `// INVARIANT:` comment (enforced by scripts/ci/panic_invariant_tripwire.sh).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 //! `citrate-fl-replay`: replay a federated LoRA round from its bundle.
 //!
 //! ```text
@@ -42,13 +58,15 @@ fn main() -> anyhow::Result<()> {
         None => None,
         Some(s) => {
             let p: Vec<&str> = s.split(',').map(str::trim).collect();
-            anyhow::ensure!(p.len() == 5, "--rules is MIN,CHUNK_DIM,SCALE,TPOS,TNEG");
+            let [min, dim, scale, tpos, tneg] = p.as_slice() else {
+                anyhow::bail!("--rules is MIN,CHUNK_DIM,SCALE,TPOS,TNEG");
+            };
             Some(ChainRules {
-                min_participants: p[0].parse()?,
-                chunk_dim: p[1].parse()?,
-                value_scale_log2: p[2].parse()?,
-                threshold_pos: p[3].parse()?,
-                threshold_neg: p[4].parse()?,
+                min_participants: min.parse()?,
+                chunk_dim: dim.parse()?,
+                value_scale_log2: scale.parse()?,
+                threshold_pos: tpos.parse()?,
+                threshold_neg: tneg.parse()?,
             })
         }
     };

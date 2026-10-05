@@ -59,7 +59,6 @@
 //! - **prev-layer domain**: parents are layer-(l−1) indices in `[0, N)`.
 //! - **degree** independent of `v`.
 
-use core::convert::TryInto;
 use sha2::{Digest, Sha256};
 
 /// Filecoin SDR analysed value: same-layer (DRG) parents per node.
@@ -107,9 +106,9 @@ fn draw_u64(tag: &[u8], seed: &[u8; 32], v: u64, k: u64) -> u64 {
     h.update(seed);
     h.update(v.to_be_bytes());
     h.update(k.to_be_bytes());
-    let out = h.finalize();
-    let bytes: [u8; 8] = out[0..8].try_into().expect("sha256 output ≥ 8 bytes");
-    u64::from_be_bytes(bytes)
+    let digest: [u8; 32] = h.finalize().into();
+    let [b0, b1, b2, b3, b4, b5, b6, b7, ..] = digest;
+    u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7])
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -164,7 +163,10 @@ pub fn drg_parents(
     let v_u64 = v as u64;
     while parents.len() < degree {
         let r = draw_u64(TAG_DRG, seed, v_u64, counter);
-        let candidate = (r as usize) % v;
+        // v >= 1 here (v == 0 returned above), so this is always Some.
+        let candidate = (r as usize)
+            .checked_rem(v)
+            .ok_or(SamplerError::EmptyGraph)?;
         if !parents.contains(&candidate) {
             parents.push(candidate);
         }
@@ -227,7 +229,10 @@ pub fn expander_parents(
     let v_u64 = v as u64;
     while parents.len() < degree {
         let r = draw_u64(TAG_EXP, seed, v_u64, counter);
-        let candidate = (r as usize) % n;
+        // n >= 1 here (checked above), so this is always Some.
+        let candidate = (r as usize)
+            .checked_rem(n)
+            .ok_or(SamplerError::EmptyGraph)?;
         if !parents.contains(&candidate) {
             parents.push(candidate);
         }
@@ -252,7 +257,7 @@ pub fn drg_parents_toy_pathgraph(v: usize) -> Vec<usize> {
     if v == 0 {
         Vec::new()
     } else {
-        vec![v - 1]
+        vec![v.saturating_sub(1)]
     }
 }
 

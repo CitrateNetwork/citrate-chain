@@ -108,6 +108,10 @@ impl DocusignProvider {
     pub fn new(config: DocusignConfig) -> Self {
         // 30s default timeout; Docusign envelope-create can take up to ~10s on first call
         // when their template engine warms up.
+        // INVARIANT: with this static configuration `build()` fails only if the TLS
+        // backend cannot initialize at all, in which case no client of this kind can
+        // exist; there is no degraded mode to fall back to (PANIC-S1 PROVE+KEEP).
+        #[allow(clippy::expect_used)]
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()

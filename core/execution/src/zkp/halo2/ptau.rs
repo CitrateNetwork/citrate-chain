@@ -98,8 +98,10 @@ pub enum PtauError {
     #[error("unsupported .ptau version {version} (expected 1)")]
     UnsupportedVersion { version: u32 },
 
-    #[error("section type {section_type} appears multiple times — \
-             not supported by this parser")]
+    #[error(
+        "section type {section_type} appears multiple times — \
+             not supported by this parser"
+    )]
     DuplicateSection { section_type: u32 },
 
     #[error("section type {section_type} not found in .ptau")]
@@ -322,7 +324,8 @@ fn bn256_fq2(c0: Fq, c1: Fq) -> Fq2 {
 
 /// Validate the .ptau header (section 1). Returns `power`.
 fn validate_header(bytes: &[u8], section: SectionRange, want_k: u32) -> Result<u32, PtauError> {
-    let mut cursor = Cursor::new(&bytes[section.start as usize..(section.start + section.size) as usize]);
+    let mut cursor =
+        Cursor::new(&bytes[section.start as usize..(section.start + section.size) as usize]);
     let n8q = read_u32_le(&mut cursor)?;
     if n8q != N8Q as u32 {
         return Err(PtauError::UnexpectedN8q { n8q });
@@ -418,7 +421,10 @@ pub fn construct_params_kzg(raw: &PtauKzgRaw, k: u32) -> Result<ParamsKZG<Bn256>
     // g.len() must equal 2^k + 1 (exactly the slice
     // parse_ptau_for_kzg produces).
     if raw.g.len() != (1usize << k) + 1 {
-        return Err(PtauError::PowerTooSmall { want: k, got: raw.power });
+        return Err(PtauError::PowerTooSmall {
+            want: k,
+            got: raw.power,
+        });
     }
 
     // Halo2's `from_parts` expects `g` of length `n = 2^k`, not
@@ -439,10 +445,8 @@ pub fn load_ptau_into_params_kzg<P: AsRef<std::path::Path>>(
 ) -> Result<ParamsKZG<Bn256>, super::srs::SrsLoadError> {
     use super::srs::{load_and_verify_ptau, SrsLoadError};
     let bytes = load_and_verify_ptau(path, k)?;
-    let raw = parse_ptau_for_kzg(&bytes, k)
-        .map_err(|e| SrsLoadError::Parse(format!("{e}")))?;
-    construct_params_kzg(&raw, k)
-        .map_err(|e| SrsLoadError::Parse(format!("{e}")))
+    let raw = parse_ptau_for_kzg(&bytes, k).map_err(|e| SrsLoadError::Parse(format!("{e}")))?;
+    construct_params_kzg(&raw, k).map_err(|e| SrsLoadError::Parse(format!("{e}")))
 }
 
 #[cfg(test)]
@@ -459,7 +463,7 @@ mod tests {
         bytes.extend_from_slice(b"ptau");
         bytes.extend_from_slice(&1u32.to_le_bytes()); // version
         bytes.extend_from_slice(&1u32.to_le_bytes()); // num_sections = 1
-        // Section 1 (header): n8=32, prime=BN254 Fq, power, ceremony_power
+                                                      // Section 1 (header): n8=32, prime=BN254 Fq, power, ceremony_power
         let header_payload = {
             let mut h = Vec::new();
             h.extend_from_slice(&32u32.to_le_bytes());
@@ -487,7 +491,10 @@ mod tests {
         let mut bad = synthetic_header_only_ptau(18);
         bad[4..8].copy_from_slice(&2u32.to_le_bytes()); // wrong version
         let r = parse_section_table(&bad);
-        assert!(matches!(r, Err(PtauError::UnsupportedVersion { version: 2 })));
+        assert!(matches!(
+            r,
+            Err(PtauError::UnsupportedVersion { version: 2 })
+        ));
     }
 
     #[test]
@@ -510,7 +517,10 @@ mod tests {
         assert_eq!(power, 20);
         // Asking for k=22 against a power-20 file → fail.
         let r = validate_header(&bytes, s1, 22);
-        assert!(matches!(r, Err(PtauError::PowerTooSmall { want: 22, got: 20 })));
+        assert!(matches!(
+            r,
+            Err(PtauError::PowerTooSmall { want: 22, got: 20 })
+        ));
     }
 
     #[test]
@@ -549,8 +559,7 @@ mod tests {
     #[ignore]
     fn ptau_to_params_kzg_k18() {
         let path = "/tmp/ppot/ppot_0080_18.ptau";
-        let params = load_ptau_into_params_kzg(path, 18)
-            .expect("load_ptau_into_params_kzg");
+        let params = load_ptau_into_params_kzg(path, 18).expect("load_ptau_into_params_kzg");
         // Sanity: the params accept queries via the public
         // ParamsProver/ParamsVerifier traits.
         use halo2_proofs::poly::commitment::Params;
@@ -582,8 +591,7 @@ mod tests {
     #[ignore]
     fn ptau_to_params_kzg_k22() {
         let path = "/tmp/ppot-downloads/ppot_0080_22.ptau";
-        let params = load_ptau_into_params_kzg(path, 22)
-            .expect("load_ptau_into_params_kzg");
+        let params = load_ptau_into_params_kzg(path, 22).expect("load_ptau_into_params_kzg");
         use halo2_proofs::poly::commitment::Params;
         assert_eq!(params.k(), 22);
         assert_eq!(params.n(), 1u64 << 22);
@@ -609,8 +617,7 @@ mod tests {
     #[ignore]
     fn ptau_to_params_kzg_k24() {
         let path = "/tmp/ppot-downloads/ppot_0080_24.ptau";
-        let params = load_ptau_into_params_kzg(path, 24)
-            .expect("load_ptau_into_params_kzg");
+        let params = load_ptau_into_params_kzg(path, 24).expect("load_ptau_into_params_kzg");
         use halo2_proofs::poly::commitment::Params;
         assert_eq!(params.k(), 24);
         assert_eq!(params.n(), 1u64 << 24);
@@ -635,8 +642,7 @@ mod tests {
     #[ignore]
     fn ptau_to_params_kzg_k25() {
         let path = "/tmp/ppot-downloads/ppot_0080_25.ptau";
-        let params = load_ptau_into_params_kzg(path, 25)
-            .expect("load_ptau_into_params_kzg");
+        let params = load_ptau_into_params_kzg(path, 25).expect("load_ptau_into_params_kzg");
         use halo2_proofs::poly::commitment::Params;
         assert_eq!(params.k(), 25);
         assert_eq!(params.n(), 1u64 << 25);

@@ -94,7 +94,7 @@ impl Cooldowns {
     /// now goes through `try_reserve`.
     #[allow(dead_code)]
     pub fn check(&self, address: &str, ip: &str) -> Result<(), CooldownDenial> {
-        let state = self.state.read().expect("cooldown lock poisoned");
+        let state = self.state.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         check_in_state(&state, &self.policy, address, ip, unix_seconds())
     }
 
@@ -110,7 +110,7 @@ impl Cooldowns {
     /// matches the pre-fix exposure and only risks one extra drip.
     pub fn try_reserve(&self, address: &str, ip: &str) -> Result<(), CooldownDenial> {
         let now = unix_seconds();
-        let mut state = self.state.write().expect("cooldown lock poisoned");
+        let mut state = self.state.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         check_in_state(&state, &self.policy, address, ip, now)?;
         state.address_last.insert(address_key(address), now);
         state.ip_last.insert(ip.to_string(), now);
@@ -122,7 +122,7 @@ impl Cooldowns {
     /// this (address, ip); safe because while the reservation is
     /// held no other request can have claimed the same keys.
     pub fn release(&self, address: &str, ip: &str) {
-        let mut state = self.state.write().expect("cooldown lock poisoned");
+        let mut state = self.state.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         state.address_last.remove(&address_key(address));
         state.ip_last.remove(ip);
     }
@@ -132,7 +132,7 @@ impl Cooldowns {
     pub fn record_success(&self, address: &str, ip: &str) {
         let now = unix_seconds();
         let snapshot = {
-            let mut state = self.state.write().expect("cooldown lock poisoned");
+            let mut state = self.state.write().unwrap_or_else(std::sync::PoisonError::into_inner);
             state.address_last.insert(address_key(address), now);
             state.ip_last.insert(ip.to_string(), now);
             state.clone()
@@ -166,7 +166,7 @@ fn check_in_state(
         let elapsed = now.saturating_sub(last);
         if elapsed < policy.address_cooldown_secs {
             return Err(CooldownDenial::AddressCooldown {
-                remaining_secs: policy.address_cooldown_secs - elapsed,
+                remaining_secs: policy.address_cooldown_secs.saturating_sub(elapsed),
             });
         }
     }
@@ -174,7 +174,7 @@ fn check_in_state(
         let elapsed = now.saturating_sub(last);
         if elapsed < policy.ip_cooldown_secs {
             return Err(CooldownDenial::IpCooldown {
-                remaining_secs: policy.ip_cooldown_secs - elapsed,
+                remaining_secs: policy.ip_cooldown_secs.saturating_sub(elapsed),
             });
         }
     }

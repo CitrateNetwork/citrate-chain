@@ -88,42 +88,37 @@ fn build_stun_request(transaction_id: &[u8; 12]) -> Vec<u8> {
 
 /// Parse a STUN Binding Response to extract the mapped address.
 fn parse_stun_response(data: &[u8], transaction_id: &[u8; 12]) -> Option<SocketAddr> {
-    if data.len() < 20 {
-        return None;
-    }
+    // 20-byte header: type(2) ‖ length(2) ‖ magic cookie(4) ‖ transaction id(12).
+    let (header, body) = data.split_first_chunk::<20>()?;
+    let [t0, t1, l0, l1, c0, c1, c2, c3, txn @ ..] = *header;
 
     // Verify it's a binding success response (0x0101)
-    let msg_type = u16::from_be_bytes([data[0], data[1]]);
-    if msg_type != 0x0101 {
+    if u16::from_be_bytes([t0, t1]) != 0x0101 {
         return None;
     }
 
     // Verify magic cookie
-    let cookie = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-    if cookie != STUN_MAGIC_COOKIE {
+    if u32::from_be_bytes([c0, c1, c2, c3]) != STUN_MAGIC_COOKIE {
         return None;
     }
 
     // Verify transaction ID
-    if &data[8..20] != transaction_id {
+    if &txn != transaction_id {
         return None;
     }
 
-    let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
-    let attr_data = &data[20..20 + msg_len.min(data.len() - 20)];
+    let msg_len = u16::from_be_bytes([l0, l1]) as usize;
+    let mut attrs = body.get(..msg_len.min(body.len())).unwrap_or_default();
 
-    // Parse attributes
-    let mut offset = 0;
-    while offset + 4 <= attr_data.len() {
-        let attr_type = u16::from_be_bytes([attr_data[offset], attr_data[offset + 1]]);
-        let attr_len = u16::from_be_bytes([attr_data[offset + 2], attr_data[offset + 3]]) as usize;
-        offset += 4;
+    // Parse attributes: type(2) ‖ length(2) ‖ value, padded to 4 bytes.
+    while let Some((attr_header, rest)) = attrs.split_first_chunk::<4>() {
+        let [a0, a1, n0, n1] = *attr_header;
+        let attr_type = u16::from_be_bytes([a0, a1]);
+        let attr_len = u16::from_be_bytes([n0, n1]) as usize;
 
-        if offset + attr_len > attr_data.len() {
+        let Some(value) = rest.get(..attr_len) else {
             break;
-        }
-
-        let value = &attr_data[offset..offset + attr_len];
+        };
 
         match attr_type {
             ATTR_XOR_MAPPED_ADDRESS => {
@@ -136,7 +131,9 @@ fn parse_stun_response(data: &[u8], transaction_id: &[u8; 12]) -> Option<SocketA
         }
 
         // Pad to 4-byte boundary
-        offset += (attr_len + 3) & !3;
+        attrs = rest
+            .get(attr_len.saturating_add(3) & !3..)
+            .unwrap_or_default();
     }
 
     None
@@ -144,18 +141,13 @@ fn parse_stun_response(data: &[u8], transaction_id: &[u8; 12]) -> Option<SocketA
 
 /// Parse XOR-MAPPED-ADDRESS attribute (RFC 5389 Section 15.2).
 fn parse_xor_mapped_address(value: &[u8]) -> Option<SocketAddr> {
-    if value.len() < 8 {
-        return None;
-    }
-
-    let family = value[1];
-    let port = u16::from_be_bytes([value[2], value[3]]) ^ (STUN_MAGIC_COOKIE >> 16) as u16;
+    let [_, family, p0, p1, i0, i1, i2, i3] = *value.first_chunk::<8>()?;
+    let port = u16::from_be_bytes([p0, p1]) ^ (STUN_MAGIC_COOKIE >> 16) as u16;
 
     match family {
         0x01 => {
             // IPv4
-            let ip_bytes = u32::from_be_bytes([value[4], value[5], value[6], value[7]]);
-            let ip = ip_bytes ^ STUN_MAGIC_COOKIE;
+            let ip = u32::from_be_bytes([i0, i1, i2, i3]) ^ STUN_MAGIC_COOKIE;
             let addr = std::net::Ipv4Addr::from(ip);
             Some(SocketAddr::new(addr.into(), port))
         }
@@ -165,16 +157,12 @@ fn parse_xor_mapped_address(value: &[u8]) -> Option<SocketAddr> {
 
 /// Parse MAPPED-ADDRESS attribute (RFC 5389 Section 15.1).
 fn parse_mapped_address(value: &[u8]) -> Option<SocketAddr> {
-    if value.len() < 8 {
-        return None;
-    }
-
-    let family = value[1];
-    let port = u16::from_be_bytes([value[2], value[3]]);
+    let [_, family, p0, p1, i0, i1, i2, i3] = *value.first_chunk::<8>()?;
+    let port = u16::from_be_bytes([p0, p1]);
 
     match family {
         0x01 => {
-            let addr = std::net::Ipv4Addr::new(value[4], value[5], value[6], value[7]);
+            let addr = std::net::Ipv4Addr::new(i0, i1, i2, i3);
             Some(SocketAddr::new(addr.into(), port))
         }
         _ => None,
@@ -183,7 +171,7 @@ fn parse_mapped_address(value: &[u8]) -> Option<SocketAddr> {
 
 /// Detect NAT type and external address using STUN.
 pub async fn detect_nat(local_bind: Option<SocketAddr>) -> NatInfo {
-    let bind_addr = local_bind.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap_or_else(|e| panic!("valid hardcoded address: {e}")));
+    let bind_addr = local_bind.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
 
     let socket = match UdpSocket::bind(bind_addr).await {
         Ok(s) => s,
@@ -227,7 +215,7 @@ pub async fn detect_nat(local_bind: Option<SocketAddr>) -> NatInfo {
 
         match result {
             Ok(Ok((len, _from))) => {
-                if let Some(external) = parse_stun_response(&buf[..len], &txn_id) {
+                if let Some(external) = parse_stun_response(buf.get(..len).unwrap_or_default(), &txn_id) {
                     let nat_type = if external.ip() == local_addr.ip() {
                         NatType::None
                     } else {
@@ -309,5 +297,45 @@ mod tests {
         assert!(!NatType::Symmetric.supports_hole_punch());
         assert!(NatType::Symmetric.needs_relay());
         assert!(!NatType::None.needs_relay());
+    }
+
+    fn stun_response(txn: &[u8; 12], attrs: &[u8]) -> Vec<u8> {
+        let mut r = vec![0x01, 0x01];
+        r.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
+        r.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        r.extend_from_slice(txn);
+        r.extend_from_slice(attrs);
+        r
+    }
+
+    /// PANIC-S1: a well-formed response (an unknown attribute, then MAPPED-ADDRESS)
+    /// parses; every truncation, and every single-byte corruption, of it returns a
+    /// value or None without panicking.
+    #[test]
+    fn panic_s1_stun_parser_total_on_hostile_input() {
+        let txn = [7u8; 12];
+        let mut attrs = vec![0x80, 0x22, 0x00, 0x03, b'a', b'b', b'c', 0x00]; // padded
+        attrs.extend_from_slice(&[0x00, 0x01, 0x00, 0x08, 0x00, 0x01, 0x1F, 0x90, 10, 0, 0, 7]);
+        let good = stun_response(&txn, &attrs);
+        assert_eq!(
+            parse_stun_response(&good, &txn),
+            Some("10.0.0.7:8080".parse().unwrap())
+        );
+        for cut in 0..good.len() {
+            let _ = parse_stun_response(&good[..cut], &txn);
+        }
+        for i in 0..good.len() {
+            for b in [0x00, 0xFF, 0x7F] {
+                let mut bad = good.clone();
+                bad[i] = b;
+                let _ = parse_stun_response(&bad, &txn);
+            }
+        }
+        // Declared lengths far beyond the packet.
+        let mut huge = good.clone();
+        huge[2] = 0xFF;
+        huge[3] = 0xFF;
+        assert!(parse_stun_response(&huge, &txn).is_some());
+        assert_eq!(parse_stun_response(&good, &[8u8; 12]), None, "wrong txn id");
     }
 }

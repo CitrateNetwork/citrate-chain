@@ -106,7 +106,7 @@ fn main() -> ExitCode {
     println!("bootstrap_nodes = [");
 
     for i in 1..=args.count {
-        let kp = NoiseKeypair::generate();
+        let kp = NoiseKeypair::generate().expect("keygen");
         let peer_id = kp.derive_peer_id();
         let host = args.host_template.replace("{i}", &i.to_string());
         let key_path = args.out_dir.join(format!("boot{i}.noise.key"));

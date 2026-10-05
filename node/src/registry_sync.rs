@@ -12,6 +12,20 @@
 // This is the piece that POPULATES membership; the eligibility gate, activation-height
 // gate, and vote signing are dormant until this feeds the selector.
 
+// PANIC-S1 G2: block production / apply / sync path (T1); panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use std::sync::Arc;
 
 use citrate_consensus::types::{BlockBuilder, PublicKey, Signature, Transaction};
@@ -71,8 +85,8 @@ pub fn min_stake_selector() -> [u8; 4] {
 fn selector(sig: &str) -> [u8; 4] {
     let mut h = Keccak256::new();
     h.update(sig.as_bytes());
-    let out = h.finalize();
-    [out[0], out[1], out[2], out[3]]
+    let [a, b, c, d, ..]: [u8; 32] = h.finalize().into();
+    [a, b, c, d]
 }
 
 /// Decode the ABI return of `activeSet() returns (bytes32[] pubkeys, uint256[] effStakes)`
@@ -118,13 +132,10 @@ pub fn decode_min_stake(ret: &[u8]) -> Result<u128, String> {
 }
 
 fn read_word(buf: &[u8], off: usize) -> Result<[u8; 32], String> {
-    let end = off.checked_add(32).ok_or("offset overflow")?;
-    if end > buf.len() {
-        return Err(format!("word out of bounds at {off} (len {})", buf.len()));
-    }
-    let mut w = [0u8; 32];
-    w.copy_from_slice(&buf[off..end]);
-    Ok(w)
+    buf.get(off..)
+        .and_then(|rest| rest.first_chunk::<32>())
+        .copied()
+        .ok_or_else(|| format!("word out of bounds at {off} (len {})", buf.len()))
 }
 
 fn read_usize(buf: &[u8], off: usize) -> Result<usize, String> {
@@ -577,7 +588,12 @@ pub(crate) fn encode_reward_snapshot(
     entries: &[([u8; 32], u128)],
     min_stake: u128,
 ) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(REWARD_SNAPSHOT_HEADER_LEN + entries.len() * 68);
+    let mut buf = Vec::with_capacity(
+        entries
+            .len()
+            .saturating_mul(68)
+            .saturating_add(REWARD_SNAPSHOT_HEADER_LEN),
+    );
     buf.push(REWARD_SNAPSHOT_VERSION);
     buf.extend_from_slice(&policy.epoch.to_be_bytes());
     buf.extend_from_slice(&policy.snapshot_height.to_be_bytes());
@@ -601,6 +617,22 @@ pub(crate) fn encode_reward_snapshot(
     buf
 }
 
+/// Bounds-checked forward reader over a reward-snapshot blob.
+struct SnapshotReader<'a> {
+    rest: &'a [u8],
+}
+
+impl SnapshotReader<'_> {
+    fn take<const N: usize>(&mut self) -> Result<[u8; N], String> {
+        let (head, rest) = self
+            .rest
+            .split_first_chunk::<N>()
+            .ok_or_else(|| format!("reward snapshot truncated reading {N} bytes"))?;
+        self.rest = rest;
+        Ok(*head)
+    }
+}
+
 /// Inverse of [`encode_reward_snapshot`]. Fully bounds-checked — a truncated or
 /// unknown-version blob returns `Err` (so the boot path falls back to a recompute)
 /// rather than panicking or silently loading a partial snapshot.
@@ -618,36 +650,22 @@ fn decode_reward_snapshot(
     if buf.len() < REWARD_SNAPSHOT_HEADER_LEN {
         return Err(format!("reward snapshot too short ({} bytes)", buf.len()));
     }
-    if buf[0] != REWARD_SNAPSHOT_VERSION {
-        return Err(format!("unknown reward snapshot version {}", buf[0]));
+    let mut r = SnapshotReader { rest: buf };
+    let [version] = r.take::<1>()?;
+    if version != REWARD_SNAPSHOT_VERSION {
+        return Err(format!("unknown reward snapshot version {version}"));
     }
-    let u64_at = |o: usize| -> u64 {
-        let mut b = [0u8; 8];
-        b.copy_from_slice(&buf[o..o + 8]);
-        u64::from_be_bytes(b)
-    };
-    let u128_at = |o: usize| -> u128 {
-        let mut b = [0u8; 16];
-        b.copy_from_slice(&buf[o..o + 16]);
-        u128::from_be_bytes(b)
-    };
-    let epoch = u64_at(1);
-    let snapshot_height = u64_at(9);
-    let activation_height = u64_at(17);
-    let mut registry = [0u8; 20];
-    registry.copy_from_slice(&buf[25..45]);
-    let mut reward_minter = [0u8; 20];
-    reward_minter.copy_from_slice(&buf[45..65]);
-    let priority_fee_share_bps = u64_at(65);
+    let epoch = u64::from_be_bytes(r.take()?);
+    let snapshot_height = u64::from_be_bytes(r.take()?);
+    let activation_height = u64::from_be_bytes(r.take()?);
+    let registry: [u8; 20] = r.take()?;
+    let reward_minter: [u8; 20] = r.take()?;
+    let priority_fee_share_bps = u64::from_be_bytes(r.take()?);
     // v2 (CBF-S1): full-width subsidy word — the contract ceiling is 1e21, far
     // above u64, so this must not be narrowed.
-    let block_subsidy = primitive_types::U256::from_big_endian(&buf[73..105]);
-    let min_stake = u128_at(105);
-    let count = {
-        let mut b = [0u8; 4];
-        b.copy_from_slice(&buf[121..REWARD_SNAPSHOT_HEADER_LEN]);
-        u32::from_be_bytes(b) as usize
-    };
+    let block_subsidy = primitive_types::U256::from_big_endian(&r.take::<32>()?);
+    let min_stake = u128::from_be_bytes(r.take()?);
+    let count = u32::from_be_bytes(r.take()?) as usize;
     let need = REWARD_SNAPSHOT_HEADER_LEN
         .checked_add(count.checked_mul(68).ok_or("validator count overflow")?)
         .ok_or("snapshot size overflow")?;
@@ -659,18 +677,12 @@ fn decode_reward_snapshot(
     }
     let mut entries = Vec::with_capacity(count);
     let mut staker_of = std::collections::HashMap::with_capacity(count);
-    let mut off = REWARD_SNAPSHOT_HEADER_LEN;
     for _ in 0..count {
-        let mut pubkey = [0u8; 32];
-        pubkey.copy_from_slice(&buf[off..off + 32]);
-        let mut sb = [0u8; 16];
-        sb.copy_from_slice(&buf[off + 32..off + 48]);
-        let stake = u128::from_be_bytes(sb);
-        let mut staker = [0u8; 20];
-        staker.copy_from_slice(&buf[off + 48..off + 68]);
+        let pubkey: [u8; 32] = r.take()?;
+        let stake = u128::from_be_bytes(r.take()?);
+        let staker: [u8; 20] = r.take()?;
         entries.push((pubkey, stake));
         staker_of.insert(pubkey, staker);
-        off += 68;
     }
     let policy = citrate_execution::block_rewards::EpochRewardPolicy {
         epoch,

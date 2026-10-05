@@ -72,7 +72,9 @@ impl WriteSet {
     where
         I: IntoIterator<Item = &'a Address>,
     {
-        read_set_accounts.into_iter().any(|a| self.accounts.contains(a))
+        read_set_accounts
+            .into_iter()
+            .any(|a| self.accounts.contains(a))
     }
 
     /// Reset the set to empty. Called on commit or abort.

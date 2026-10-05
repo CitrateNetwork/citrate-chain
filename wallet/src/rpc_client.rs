@@ -228,11 +228,15 @@ impl RpcClient {
         });
 
         if let Some(to_addr) = to {
-            tx_object["to"] = json!(format!("0x{}", hex::encode(to_addr.0)));
+            if let Some(obj) = tx_object.as_object_mut() {
+                obj.insert("to".into(), json!(format!("0x{}", hex::encode(to_addr.0))));
+            }
         }
 
         if !data.is_empty() {
-            tx_object["data"] = json!(format!("0x{}", hex::encode(&data)));
+            if let Some(obj) = tx_object.as_object_mut() {
+                obj.insert("data".into(), json!(format!("0x{}", hex::encode(&data))));
+            }
         }
 
         let params = json!([tx_object]);

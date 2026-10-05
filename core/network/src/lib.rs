@@ -54,6 +54,20 @@
 //     simultaneously — safe because no reverse ordering exists.
 //   - discovery.rs find_peers holds connected_peers.read() while calling
 //     peer_manager.get_peer_counts() which acquires stats.read() — safe (Level 1 read-read).
+
+// PANIC-S1 G2: peer- and network-reachable code; panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
 pub mod ai_handler;
 pub mod block_propagation;
 pub mod bootnode;

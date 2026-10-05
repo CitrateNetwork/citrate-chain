@@ -31,7 +31,6 @@ pub struct LearningCheckpoint {
     pub learning_round: u64,
 
     // --- Sprint M: Learning extension fields (Paper II §4.1, GAP-7) ---
-
     /// Merkle root of routing model weights at this checkpoint.
     /// None until routing model is trained (Sprint N+).
     #[serde(default)]

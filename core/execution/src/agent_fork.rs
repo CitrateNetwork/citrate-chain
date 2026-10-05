@@ -28,13 +28,15 @@
 // keep a second copy (two stores can disagree, and a node whose stores
 // disagree forks at the height).
 //
-// DEFAULT: NOT ACTIVATED
+// RELEASE DEFAULT: ACTIVE FROM GENESIS ON 40204
 //
-//   * Chain 40204: the release pin is `None`. An env or config height is
-//     REFUSED on 40204 until a release pins one, because a per-node height on a
-//     release network would fork that node at the height. Scheduling the fork
-//     is an owner step (release PR that sets the pin) and an operator step
-//     (roll the binary fleet-wide before the height).
+//   * Chain 40204: the release pin is `Some(0)` (owner decision 2026-10-04,
+//     for the 2026-10-05 reroll): the four precompiles are live from block 1
+//     of the new genesis, so no mid-chain activation is ever scheduled. An env
+//     or config height that disagrees with the pin is REFUSED (the node stops
+//     at start-up), because a per-node height on a release network would fork
+//     that node. This binary is for the new genesis only: it must not replay a
+//     chain produced without the fork.
 //   * Any other chain (local devnets, anvil-like test chains): unset unless
 //     `[chain] agent_precompiles_height` or `CITRATE_AGENT_PRECOMPILES_HEIGHT`
 //     sets it. Nothing in the shipped configs sets it.
@@ -51,10 +53,11 @@ pub const AGENT_PRECOMPILES_ENV: &str = "CITRATE_AGENT_PRECOMPILES_HEIGHT";
 
 /// Activation heights compiled into this release, per release chain id.
 ///
-/// OWNER STEP (hard-fork release PR, pending owner sign-off): replace `None`
-/// with `Some(H)` for 40204, where H is safely above the tip at rollout so the
-/// whole fleet runs the new binary before it.
-pub const AGENT_PRECOMPILES_PINS: &[(u64, Option<u64>)] = &[(40204, None)];
+/// 40204: `Some(0)`, active from genesis of the 2026-10-05 reroll (owner
+/// decision 2026-10-04; the placeholder gas schedule in
+/// `docs/precompiles/AGENT_PRECOMPILES.md` is owner-signed). A pin of `None`
+/// would mean "release network, not scheduled".
+pub const AGENT_PRECOMPILES_PINS: &[(u64, Option<u64>)] = &[(40204, Some(0))];
 
 const UNSET: u64 = u64::MAX;
 
@@ -238,17 +241,30 @@ mod tests {
     }
 
     #[test]
-    fn chain_40204_ships_not_activated() {
+    fn chain_40204_ships_active_from_genesis() {
         assert_eq!(
             pinned_for(40204),
-            Some(None),
-            "40204 is a release network, no height"
+            Some(Some(0)),
+            "40204 is a release network, active from genesis"
         );
         assert_eq!(pinned_for(1337), None, "devnet is not a release network");
         assert_eq!(
             resolve(pinned_for(40204), None, None),
-            Ok((None, AgentForkSource::Unset))
+            Ok((Some(0), AgentForkSource::ReleasePin))
         );
+        let (h, _) =
+            resolve(pinned_for(40204), None, None).unwrap_or((None, AgentForkSource::Unset));
+        assert!(!active_at(h, 0), "genesis is never re-judged");
+        assert!(active_at(h, 1), "live from the first block");
+        assert!(active_at(h, u64::MAX));
+        // A matching override is accepted; any other value, or `off`, stops the node.
+        assert_eq!(
+            resolve(pinned_for(40204), Some("0"), Some(0)),
+            Ok((Some(0), AgentForkSource::ReleasePin))
+        );
+        assert!(resolve(pinned_for(40204), Some("100"), None).is_err());
+        assert!(resolve(pinned_for(40204), Some("off"), None).is_err());
+        assert!(resolve(pinned_for(40204), None, Some(1)).is_err());
     }
 
     #[test]
