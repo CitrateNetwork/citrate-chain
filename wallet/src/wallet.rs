@@ -143,8 +143,11 @@ impl Wallet {
         self.accounts.clear();
 
         for (index, public_key_bytes, alias) in self.keystore.list_accounts() {
+            // Left-align up to 32 key bytes (a shorter stored key zero-pads).
             let mut pk_array = [0u8; 32];
-            pk_array.copy_from_slice(&public_key_bytes[..32.min(public_key_bytes.len())]);
+            for (dst, src) in pk_array.iter_mut().zip(public_key_bytes.iter()) {
+                *dst = *src;
+            }
             let public_key = PublicKey::new(pk_array);
             let address = Address::from_public_key(&public_key);
 
@@ -207,8 +210,8 @@ impl Wallet {
         // Check balance
         let gas_price = gas_price.unwrap_or(self.config.default_gas_price);
         let gas_limit = gas_limit.unwrap_or(self.config.default_gas_limit);
-        let gas_cost = U256::from(gas_price) * U256::from(gas_limit);
-        let total_cost = value + gas_cost;
+        let gas_cost = U256::from(gas_price).saturating_mul(U256::from(gas_limit));
+        let total_cost = value.saturating_add(gas_cost);
 
         if account.balance < total_cost {
             return Err(WalletError::InsufficientBalance {
@@ -275,14 +278,14 @@ impl Wallet {
 
 /// Format U256 as SALT with decimals (public for testing)
 pub(crate) fn format_latt(value: U256) -> String {
-    let decimals = U256::from(10).pow(U256::from(18));
-    let whole = value / decimals;
-    let fraction = value % decimals;
+    let decimals = U256::exp10(18);
+    let whole = value.checked_div(decimals).unwrap_or_default();
+    let fraction = value.checked_rem(decimals).unwrap_or_default();
 
     // Format with up to 6 decimal places
     let fraction_str = format!("{:018}", fraction);
     let end = fraction_str.len().min(6);
-    let fraction_trimmed = fraction_str[..end].trim_end_matches('0');
+    let fraction_trimmed = fraction_str.get(..end).unwrap_or(&fraction_str).trim_end_matches('0');
 
     if fraction_trimmed.is_empty() {
         format!("{}", whole)

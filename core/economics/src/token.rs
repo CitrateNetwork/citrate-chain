@@ -24,7 +24,7 @@ impl Default for TokenConfig {
             name: "Citrate".to_string(),
             symbol: "SALT".to_string(),
             decimals: DECIMALS,
-            total_supply: U256::from(crate::TOTAL_SUPPLY) * U256::from(10).pow(U256::from(DECIMALS)),
+            total_supply: U256::from(crate::TOTAL_SUPPLY).saturating_mul(U256::exp10(DECIMALS as usize)),
             initial_distribution: HashMap::new(),
         }
     }
@@ -48,7 +48,7 @@ impl Token {
         // Distribute initial tokens
         for (address, amount) in &config.initial_distribution {
             balances.insert(*address, *amount);
-            total_minted += *amount;
+            total_minted = total_minted.saturating_add(*amount);
         }
 
         Self {
@@ -78,9 +78,9 @@ impl Token {
         }
 
         // Update balances
-        self.balances.insert(*from, from_balance - amount);
+        self.balances.insert(*from, from_balance.saturating_sub(amount));
         let to_balance = self.balance_of(to);
-        self.balances.insert(*to, to_balance + amount);
+        self.balances.insert(*to, to_balance.saturating_add(amount));
 
         Ok(())
     }
@@ -93,14 +93,14 @@ impl Token {
         // trip (stake→unstake) otherwise walks total_minted toward total_supply
         // and eventually makes every mint — including unstaking — fail, freezing
         // staked funds. Circulating supply is unchanged by a stake/unstake cycle.
-        let new_circulating = self.circulating_supply() + amount;
+        let new_circulating = self.circulating_supply().saturating_add(amount);
         if new_circulating > self.config.total_supply {
             return Err(TokenError::ExceedsSupply);
         }
 
         let balance = self.balance_of(to);
-        self.balances.insert(*to, balance + amount);
-        self.total_minted += amount;
+        self.balances.insert(*to, balance.saturating_add(amount));
+        self.total_minted = self.total_minted.saturating_add(amount);
 
         Ok(())
     }
@@ -113,15 +113,15 @@ impl Token {
             return Err(TokenError::InsufficientBalance);
         }
 
-        self.balances.insert(*from, balance - amount);
-        self.total_burned += amount;
+        self.balances.insert(*from, balance.saturating_sub(amount));
+        self.total_burned = self.total_burned.saturating_add(amount);
 
         Ok(())
     }
 
     /// Get circulating supply (minted - burned)
     pub fn circulating_supply(&self) -> U256 {
-        self.total_minted - self.total_burned
+        self.total_minted.saturating_sub(self.total_burned)
     }
 }
 
@@ -348,7 +348,7 @@ mod proptests {
             let mint_amount = U256::from(initial);
             token.mint(&alice, mint_amount).unwrap();
 
-            let transfer_amount = mint_amount * U256::from(transfer_pct) / U256::from(100);
+            let transfer_amount = crate::mul_div(mint_amount, U256::from(transfer_pct), U256::from(100));
             token.transfer(&alice, &bob, transfer_amount).unwrap();
 
             let sum = token.balance_of(&alice) + token.balance_of(&bob);
@@ -368,7 +368,7 @@ mod proptests {
             let mint_amount = U256::from(mint_val);
             token.mint(&alice, mint_amount).unwrap();
 
-            let burn_amount = mint_amount * U256::from(burn_pct) / U256::from(100);
+            let burn_amount = crate::mul_div(mint_amount, U256::from(burn_pct), U256::from(100));
             token.burn(&alice, burn_amount).unwrap();
 
             let expected_circulating = mint_amount - burn_amount;
@@ -392,8 +392,8 @@ mod proptests {
             let mint_amount = U256::from(initial);
             token.mint(&alice, mint_amount).unwrap();
 
-            let to_bob = mint_amount * U256::from(split1_pct) / U256::from(100);
-            let to_carol = mint_amount * U256::from(split2_pct) / U256::from(100);
+            let to_bob = crate::mul_div(mint_amount, U256::from(split1_pct), U256::from(100));
+            let to_carol = crate::mul_div(mint_amount, U256::from(split2_pct), U256::from(100));
 
             token.transfer(&alice, &bob, to_bob).unwrap();
             token.transfer(&alice, &carol, to_carol).unwrap();

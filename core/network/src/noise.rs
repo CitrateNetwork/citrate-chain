@@ -29,19 +29,17 @@ pub struct NoiseKeypair {
 
 impl NoiseKeypair {
     /// Generate a new random X25519 keypair.
-    pub fn generate() -> Self {
-        let builder = Builder::new(
-            NOISE_PATTERN
-                .parse()
-                .unwrap_or_else(|e| panic!("valid noise pattern: {e}")),
-        );
-        let kp = builder
+    pub fn generate() -> Result<Self, NetworkError> {
+        let pattern = NOISE_PATTERN
+            .parse()
+            .map_err(|e| NetworkError::TransportError(format!("noise pattern: {e}")))?;
+        let kp = Builder::new(pattern)
             .generate_keypair()
-            .unwrap_or_else(|e| panic!("keypair generation: {e}"));
-        Self {
+            .map_err(|e| NetworkError::TransportError(format!("noise keypair generation: {e}")))?;
+        Ok(Self {
             private: Zeroizing::new(kp.private.clone()),
             public: kp.public.clone(),
-        }
+        })
     }
 
     /// Hex-encoded public key (for logging / peer ID derivation).
@@ -68,15 +66,17 @@ impl NoiseKeypair {
 
     /// Deserialize keypair from bytes (private || public, 64 bytes).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, crate::NetworkError> {
-        if bytes.len() != 64 {
-            return Err(crate::NetworkError::TransportError(format!(
+        let invalid = || {
+            crate::NetworkError::TransportError(format!(
                 "invalid noise key length: expected 64, got {}",
                 bytes.len()
-            )));
-        }
+            ))
+        };
+        let key: &[u8; 64] = bytes.try_into().map_err(|_| invalid())?;
+        let (private, public) = key.split_at(32);
         Ok(Self {
-            private: Zeroizing::new(bytes[..32].to_vec()),
-            public: bytes[32..].to_vec(),
+            private: Zeroizing::new(private.to_vec()),
+            public: public.to_vec(),
         })
     }
 }
@@ -94,7 +94,7 @@ pub struct NoiseSession {
 impl NoiseSession {
     /// Encrypt plaintext into ciphertext (16-byte AEAD tag appended).
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, NetworkError> {
-        let mut buf = vec![0u8; plaintext.len() + 64];
+        let mut buf = vec![0u8; plaintext.len().saturating_add(64)];
         let mut ts = self.transport.lock();
         let len = ts
             .write_message(plaintext, &mut buf)
@@ -154,7 +154,7 @@ pub async fn handshake_initiator<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     let len = hs
         .write_message(&[], &mut buf)
         .map_err(|e| NetworkError::TransportError(format!("noise msg1: {}", e)))?;
-    send_frame(stream, &buf[..len]).await?;
+    send_frame(stream, buf.get(..len).unwrap_or_default()).await?;
 
     // ← e, ee, s, es
     let msg2 = recv_frame(stream).await?;
@@ -165,7 +165,7 @@ pub async fn handshake_initiator<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     let len = hs
         .write_message(&[], &mut buf)
         .map_err(|e| NetworkError::TransportError(format!("noise msg3: {}", e)))?;
-    send_frame(stream, &buf[..len]).await?;
+    send_frame(stream, buf.get(..len).unwrap_or_default()).await?;
 
     let remote_static = hs
         .get_remote_static()
@@ -178,7 +178,7 @@ pub async fn handshake_initiator<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 
     debug!(
         "Noise initiator handshake complete (remote={})",
-        hex::encode(&remote_static[..8])
+        hex::encode(remote_static.get(..8).unwrap_or(&remote_static))
     );
 
     Ok(NoiseSession {
@@ -212,7 +212,7 @@ pub async fn handshake_responder<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     let len = hs
         .write_message(&[], &mut buf)
         .map_err(|e| NetworkError::TransportError(format!("noise msg2: {}", e)))?;
-    send_frame(stream, &buf[..len]).await?;
+    send_frame(stream, buf.get(..len).unwrap_or_default()).await?;
 
     // ← s, se
     let msg3 = recv_frame(stream).await?;
@@ -230,7 +230,7 @@ pub async fn handshake_responder<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 
     debug!(
         "Noise responder handshake complete (remote={})",
-        hex::encode(&remote_static[..8])
+        hex::encode(remote_static.get(..8).unwrap_or(&remote_static))
     );
 
     Ok(NoiseSession {
@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn test_keypair_generation() {
-        let kp = NoiseKeypair::generate();
+        let kp = NoiseKeypair::generate().expect("keygen");
         assert_eq!(kp.private.len(), 32);
         assert_eq!(kp.public.len(), 32);
         assert_ne!(kp.private.as_slice(), kp.public.as_slice());
@@ -303,14 +303,14 @@ mod tests {
 
     #[test]
     fn test_different_keypairs() {
-        let kp1 = NoiseKeypair::generate();
-        let kp2 = NoiseKeypair::generate();
+        let kp1 = NoiseKeypair::generate().expect("keygen");
+        let kp2 = NoiseKeypair::generate().expect("keygen");
         assert_ne!(kp1.public, kp2.public);
     }
 
     #[test]
     fn test_keypair_persistence_roundtrip() {
-        let kp = NoiseKeypair::generate();
+        let kp = NoiseKeypair::generate().expect("keygen");
         let bytes = kp.to_bytes();
         assert_eq!(bytes.len(), 64);
         let restored = NoiseKeypair::from_bytes(&bytes).expect("roundtrip from_bytes");
@@ -325,7 +325,7 @@ mod tests {
     /// plain `Vec<u8>` breaks the build.
     #[test]
     fn test_cry_m1_private_key_is_zeroizing() {
-        let kp = NoiseKeypair::generate();
+        let kp = NoiseKeypair::generate().expect("keygen");
         let _assert_type: &zeroize::Zeroizing<Vec<u8>> = &kp.private;
         assert_eq!(
             kp.private.len(),
@@ -346,8 +346,8 @@ mod tests {
 
     /// Helper: perform a full Noise_XX handshake over an in-memory duplex channel.
     async fn duplex_handshake() -> (NoiseSession, NoiseSession, NoiseKeypair, NoiseKeypair) {
-        let server_kp = NoiseKeypair::generate();
-        let client_kp = NoiseKeypair::generate();
+        let server_kp = NoiseKeypair::generate().expect("keygen");
+        let client_kp = NoiseKeypair::generate().expect("keygen");
 
         let (mut client_stream, mut server_stream) = tokio::io::duplex(8192);
 

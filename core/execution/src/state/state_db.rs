@@ -3,8 +3,8 @@
 // State database managing all state
 use crate::state::{AccountManager, Trie};
 use crate::types::{Address, ExecutionError, JobId, ModelId, ModelState, TrainingJob};
-use dashmap::{DashMap, DashSet};
 use citrate_consensus::types::Hash;
+use dashmap::{DashMap, DashSet};
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -644,12 +644,15 @@ mod idempotency_probe {
     fn calculate_state_root_is_idempotent() {
         let db = StateDB::new();
         let addr = Address([0x11u8; 20]);
-        db.set_code(addr, vec![1, 2, 3, 4]);              // marks account dirty
+        db.set_code(addr, vec![1, 2, 3, 4]); // marks account dirty
         db.set_storage(addr, vec![7u8; 32], vec![9u8; 32]); // gives it a storage trie
         let r1 = db.calculate_state_root();
         let r2 = db.calculate_state_root();
         let r3 = db.calculate_state_root();
-        assert_eq!(r1, r2, "NON-IDEMPOTENT state root: r1 != r2 (storage_root side-effect)");
+        assert_eq!(
+            r1, r2,
+            "NON-IDEMPOTENT state root: r1 != r2 (storage_root side-effect)"
+        );
         assert_eq!(r2, r3, "NON-IDEMPOTENT state root: r2 != r3");
     }
 
@@ -708,7 +711,9 @@ mod idempotency_probe {
         };
         let fwd: Vec<u8> = (0u8..48).collect();
         let rev: Vec<u8> = (0u8..48).rev().collect();
-        let shuf: Vec<u8> = (0u8..48).map(|i| ((i as usize * 37 + 5) % 48) as u8).collect();
+        let shuf: Vec<u8> = (0u8..48)
+            .map(|i| ((i as usize * 37 + 5) % 48) as u8)
+            .collect();
 
         let db1 = StateDB::new();
         apply(&db1, &fwd);
@@ -722,8 +727,14 @@ mod idempotency_probe {
         apply(&db3, &shuf);
         let root3 = db3.calculate_state_root();
 
-        assert_eq!(root1, root2, "state root must not depend on operation order (reversed)");
-        assert_eq!(root1, root3, "state root must not depend on operation order (shuffled)");
+        assert_eq!(
+            root1, root2,
+            "state root must not depend on operation order (reversed)"
+        );
+        assert_eq!(
+            root1, root3,
+            "state root must not depend on operation order (shuffled)"
+        );
     }
 }
 
@@ -818,7 +829,7 @@ mod srp_purity_red {
     // one and MUST NOT be folded. This test FAILS on `main`, PASSES after the fix.
     #[test]
     fn srp_s3_resident_empty_account_must_not_change_root() {
-        use crate::types::{Address, AccountState};
+        use crate::types::{AccountState, Address};
         use primitive_types::U256;
 
         // Two DBs reach byte-identical COMMITTED state (one non-empty account).
@@ -845,5 +856,3 @@ mod srp_purity_red {
         );
     }
 }
-
-

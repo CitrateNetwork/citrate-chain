@@ -4,8 +4,8 @@
 // Provides verifiable random function using NIST P-256 curve.
 
 use hmac::{Hmac, Mac};
-use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
 use p256::elliptic_curve::ops::ReduceNonZero;
+use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
 use p256::elliptic_curve::PrimeField;
 use p256::{AffinePoint, EncodedPoint, ProjectivePoint, Scalar};
 use sha2::{Digest, Sha256};
@@ -19,6 +19,9 @@ type HmacSha256 = Hmac<Sha256>;
 /// a well-formed byte slice.  We surface this as a helper to avoid `.expect()`
 /// in hot paths while keeping the code readable.
 #[inline]
+// INVARIANT: HMAC (RFC 2104) accepts a key of any length; `new_from_slice` only
+// errors for fixed-key-length MACs. Pinned by test_ecvrf_prove_verify.
+#[allow(clippy::unreachable)]
 fn hmac_sha256(key: &[u8]) -> HmacSha256 {
     HmacSha256::new_from_slice(key)
         .unwrap_or_else(|_| unreachable!("HMAC-SHA256 accepts any key length"))
@@ -63,13 +66,16 @@ impl EcvrfProof {
             return Err(EcvrfError::InvalidProofLength(bytes.len()));
         }
 
-        let pk_p256 = bytes[0..33].to_vec();
-        let gamma_bytes = &bytes[33..66];
-        let c_bytes = &bytes[66..82];
-        let s_bytes = &bytes[82..114];
+        // Length is exactly PROOF_LEN (checked above), so each split succeeds;
+        // split_at_checked keeps that proof in the types instead of in indexing.
+        let bad_len = || EcvrfError::InvalidProofLength(bytes.len());
+        let (pk_part, rest) = bytes.split_at_checked(33).ok_or_else(bad_len)?;
+        let (gamma_bytes, rest) = rest.split_at_checked(33).ok_or_else(bad_len)?;
+        let (c_bytes, s_bytes) = rest.split_at_checked(16).ok_or_else(bad_len)?;
+        let pk_p256 = pk_part.to_vec();
 
-        let encoded_point = EncodedPoint::from_bytes(gamma_bytes)
-            .map_err(|_| EcvrfError::InvalidPoint)?;
+        let encoded_point =
+            EncodedPoint::from_bytes(gamma_bytes).map_err(|_| EcvrfError::InvalidPoint)?;
         let gamma_opt: Option<AffinePoint> = AffinePoint::from_encoded_point(&encoded_point).into();
         let gamma = gamma_opt.ok_or(EcvrfError::InvalidPoint)?;
 
@@ -80,7 +86,12 @@ impl EcvrfProof {
         let s_opt: Option<Scalar> = Scalar::from_repr(*s_field).into();
         let s = s_opt.ok_or(EcvrfError::InvalidScalar)?;
 
-        Ok(Self { pk_p256, gamma, c, s })
+        Ok(Self {
+            pk_p256,
+            gamma,
+            c,
+            s,
+        })
     }
 }
 
@@ -123,10 +134,7 @@ fn scalar_to_pubkey_point(sk: &Scalar) -> ProjectivePoint {
 
 /// RFC 9381 Section 5.4.1.1: ECVRF_hash_to_try_and_increment.
 /// Hash alpha to a curve point using try-and-increment.
-fn hash_to_try_and_increment(
-    pk_bytes: &[u8],
-    alpha: &[u8],
-) -> Result<ProjectivePoint, EcvrfError> {
+fn hash_to_try_and_increment(pk_bytes: &[u8], alpha: &[u8]) -> Result<ProjectivePoint, EcvrfError> {
     for ctr in 0u8..=255 {
         let mut hasher = Sha256::new();
         hasher.update([SUITE_STRING]);
@@ -170,9 +178,8 @@ fn hash_points(points: &[ProjectivePoint]) -> [u8; C_LEN] {
     hasher.update([0x00]); // trailing zero per RFC
     let hash = hasher.finalize();
 
-    let mut c = [0u8; C_LEN];
-    c.copy_from_slice(&hash[..C_LEN]);
-    c
+    // SHA-256 output is 32 bytes >= C_LEN (16).
+    hash.first_chunk::<C_LEN>().copied().unwrap_or([0u8; C_LEN])
 }
 
 /// Convert a C_LEN-byte challenge to a Scalar.
@@ -189,7 +196,12 @@ fn challenge_to_scalar(c: &[u8; C_LEN]) -> Scalar {
     // order (P-256 order is ~256 bits), so `from_repr` ALWAYS
     // succeeds. `.expect()` documents the invariant and panics
     // loudly if a future C_LEN bump invalidates it.
-    opt.expect("c is C_LEN bytes (≤ 16); always fits in P-256 scalar field")
+    // INVARIANT: c is C_LEN = 16 bytes < the P-256 group order, so from_repr always
+    // succeeds; a zero-scalar fallback would be a forger-passes bug, so fail loud.
+    // Pinned by test_ecvrf_prove_verify and test_ecvrf_tampered_proof_fails.
+    #[allow(clippy::expect_used)]
+    let c = opt.expect("c is C_LEN bytes (≤ 16); always fits in P-256 scalar field");
+    c
 }
 
 /// RFC 6979-style deterministic nonce generation using HMAC-DRBG.
@@ -322,22 +334,27 @@ pub fn prove(secret: &[u8; 32], alpha: &[u8]) -> Result<(EcvrfProof, [u8; 32]), 
     // Step 8: beta = proof_to_hash(Gamma)
     let beta = proof_to_hash(&gamma);
 
-    Ok((EcvrfProof { pk_p256: pk_bytes.to_vec(), gamma, c, s }, beta))
+    Ok((
+        EcvrfProof {
+            pk_p256: pk_bytes.to_vec(),
+            gamma,
+            c,
+            s,
+        },
+        beta,
+    ))
 }
 
 /// RFC 9381 Section 5.3: ECVRF_verify.
 ///
 /// Verifies an ECVRF proof and returns the VRF output (beta) if valid.
 /// Uses the P-256 public key embedded in the proof.
-pub fn verify(
-    alpha: &[u8],
-    proof: &EcvrfProof,
-) -> Result<[u8; 32], EcvrfError> {
+pub fn verify(alpha: &[u8], proof: &EcvrfProof) -> Result<[u8; 32], EcvrfError> {
     let pk_bytes_33 = &proof.pk_p256;
 
     // Decode public key
-    let encoded_point = EncodedPoint::from_bytes(pk_bytes_33)
-        .map_err(|_| EcvrfError::InvalidPoint)?;
+    let encoded_point =
+        EncodedPoint::from_bytes(pk_bytes_33).map_err(|_| EcvrfError::InvalidPoint)?;
     let pk_opt: Option<AffinePoint> = AffinePoint::from_encoded_point(&encoded_point).into();
     let pk_affine = pk_opt.ok_or(EcvrfError::InvalidPoint)?;
     let pk_proj = ProjectivePoint::from(pk_affine);
@@ -349,10 +366,14 @@ pub fn verify(
     let c_scalar = challenge_to_scalar(&proof.c);
 
     // Step 2: U = s * B - c * Y (where Y = pk)
-    let u = ProjectivePoint::GENERATOR * proof.s - pk_proj * c_scalar;
+    let s_b: ProjectivePoint = ProjectivePoint::GENERATOR * proof.s;
+    let c_y: ProjectivePoint = pk_proj * c_scalar;
+    let u = s_b - c_y;
 
     // Step 3: V = s * H - c * Gamma
-    let v = h * proof.s - gamma_proj * c_scalar;
+    let s_h: ProjectivePoint = h * proof.s;
+    let c_gamma: ProjectivePoint = gamma_proj * c_scalar;
+    let v = s_h - c_gamma;
 
     // Step 4: c' = hash_points(H, Gamma, U, V)
     let c_prime = hash_points(&[h, gamma_proj, u, v]);
@@ -377,6 +398,54 @@ pub fn derive_public_key(secret: &[u8; 32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Soundness: a proof for a key must be impossible to build WITHOUT its secret.
+    ///
+    /// Forgery attempt: take a victim's public key, pick an arbitrary Gamma (which
+    /// fixes the VRF output), a random nonce k, and set s = k, U = k*B, V = k*H,
+    /// c = H(H, Gamma, U, V). Verification computes U' = s*B - c*Y and
+    /// V' = s*H - c*Gamma, which differ from U, V for any non-zero c, so the
+    /// recomputed challenge mismatches and the proof is rejected. If the challenge
+    /// scalar ever collapsed to zero (a `from_repr` fallback, a truncation bug),
+    /// the c*Y / c*Gamma terms would vanish and this forgery would VERIFY: anyone
+    /// could claim any VRF output for any validator. This test pins that.
+    #[test]
+    fn panic_s1_forged_proof_without_secret_is_rejected() {
+        let victim_pk = derive_public_key(&[42u8; 32]);
+        let alpha = b"slot 1234";
+        let h = hash_to_try_and_increment(&victim_pk, alpha).expect("hash to curve");
+        let k = secret_to_scalar(&[7u8; 32]); // attacker-chosen nonce
+        let gamma = scalar_to_pubkey_point(&secret_to_scalar(&[9u8; 32])); // attacker-chosen output
+        let u = ProjectivePoint::GENERATOR * k;
+        let v = h * k;
+        let c = hash_points(&[h, gamma, u, v]);
+        let forged = EcvrfProof {
+            pk_p256: victim_pk,
+            gamma: gamma.to_affine(),
+            c,
+            s: k,
+        };
+        assert!(
+            verify(alpha, &forged).is_err(),
+            "a proof built without the secret key must not verify"
+        );
+    }
+
+    #[test]
+    fn panic_s1_challenge_scalar_is_never_zero_for_a_real_proof() {
+        let (proof, _) = prove(&[42u8; 32], b"alpha").expect("prove");
+        assert_ne!(challenge_to_scalar(&proof.c), Scalar::ZERO);
+    }
+
+    #[test]
+    fn panic_s1_proof_decode_rejects_every_wrong_length() {
+        for len in [0usize, 1, 32, 33, 66, 82, 113, 115, 228] {
+            assert!(
+                matches!(EcvrfProof::from_bytes(&vec![0u8; len]), Err(EcvrfError::InvalidProofLength(l)) if l == len),
+                "len {len}"
+            );
+        }
+    }
 
     /// Generate proof, verify succeeds.
     #[test]

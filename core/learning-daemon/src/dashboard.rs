@@ -193,9 +193,7 @@ async fn get_mentors(State(_): State<DashboardState>) -> impl IntoResponse {
         StatusCode::OK,
         Json(MentorsResponse {
             available: false,
-            reason: Some(
-                "mentor matching ships at RM-FL-4".to_string(),
-            ),
+            reason: Some("mentor matching ships at RM-FL-4".to_string()),
         }),
     )
 }
@@ -213,10 +211,8 @@ mod tests {
 
     fn fixture() -> (DashboardState, TempDir) {
         let dir = TempDir::new().expect("tempdir");
-        let state =
-            Arc::new(DaemonState::open(dir.path()).expect("state open"));
-        let cache: Arc<dyn EmbeddingCache> =
-            Arc::new(MemoryEmbeddingCache::new());
+        let state = Arc::new(DaemonState::open(dir.path()).expect("state open"));
+        let cache: Arc<dyn EmbeddingCache> = Arc::new(MemoryEmbeddingCache::new());
         (
             DashboardState {
                 state,
@@ -227,9 +223,7 @@ mod tests {
         )
     }
 
-    async fn body_json(
-        resp: axum::response::Response,
-    ) -> serde_json::Value {
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         let bytes = resp
             .into_body()
             .collect()
@@ -244,12 +238,22 @@ mod tests {
         let (s, _dir) = fixture();
         // Promote cycle 3 + 7 to Committed; cycle 5 only to
         // Computed; the rest are untouched.
-        s.state.set_cycle_status(3, CycleStatus::Computed).expect("ok");
-        s.state.set_cycle_status(3, CycleStatus::Committed).expect("ok");
+        s.state
+            .set_cycle_status(3, CycleStatus::Computed)
+            .expect("ok");
+        s.state
+            .set_cycle_status(3, CycleStatus::Committed)
+            .expect("ok");
         s.state.mark_finalized(3).expect("ok");
-        s.state.set_cycle_status(5, CycleStatus::Computed).expect("ok");
-        s.state.set_cycle_status(7, CycleStatus::Computed).expect("ok");
-        s.state.set_cycle_status(7, CycleStatus::Committed).expect("ok");
+        s.state
+            .set_cycle_status(5, CycleStatus::Computed)
+            .expect("ok");
+        s.state
+            .set_cycle_status(7, CycleStatus::Computed)
+            .expect("ok");
+        s.state
+            .set_cycle_status(7, CycleStatus::Committed)
+            .expect("ok");
 
         let app = router(s.clone());
         let req = Request::builder()
@@ -276,7 +280,9 @@ mod tests {
     #[tokio::test]
     async fn cycles_endpoint_defaults_to_first_50() {
         let (s, _dir) = fixture();
-        s.state.set_cycle_status(2, CycleStatus::Computed).expect("ok");
+        s.state
+            .set_cycle_status(2, CycleStatus::Computed)
+            .expect("ok");
         let app = router(s);
         let req = Request::builder()
             .uri("/api/cycles")
@@ -292,8 +298,7 @@ mod tests {
     async fn embeddings_endpoint_returns_submitter_count() {
         let (s, _dir) = fixture();
         // Pre-populate the cache for cycle 11.
-        let cache: Arc<MemoryEmbeddingCache> =
-            Arc::new(MemoryEmbeddingCache::new());
+        let cache: Arc<MemoryEmbeddingCache> = Arc::new(MemoryEmbeddingCache::new());
         cache.insert(
             11,
             EmbeddingEntry {
@@ -359,12 +364,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
         assert_eq!(body["available"], false);
-        assert!(
-            body["reason"]
-                .as_str()
-                .expect("reason")
-                .contains("RM-FL-4")
-        );
+        assert!(body["reason"].as_str().expect("reason").contains("RM-FL-4"));
     }
 
     #[tokio::test]

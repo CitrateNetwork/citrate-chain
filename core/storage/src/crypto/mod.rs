@@ -6,38 +6,30 @@
 // hybrid classical + post-quantum encryption schemes.
 
 pub mod at_rest;
-pub mod quantum_safe;
+mod bytes;
 pub mod database_encryption;
-pub mod key_derivation;
 pub mod envelope;
 pub mod key_commitment;
+pub mod key_derivation;
+pub mod quantum_safe;
 
 #[cfg(test)]
 mod benchmarks;
 
 pub use at_rest::{
-    AtRestCipher, AtRestError, AtRestStats, EncryptionAtRestConfig, EncryptionKey,
-    EncryptionMeta, KdfMeta, KeySource, PasswordKdf, ENCRYPTION_META_FILE,
-};
-pub use quantum_safe::{
-    HybridKEM, HybridEncapsulation, QuantumSafeConfig,
-    KeyEncapsulationMechanism, SecurityLevel,
+    AtRestCipher, AtRestError, AtRestStats, EncryptionAtRestConfig, EncryptionKey, EncryptionMeta,
+    KdfMeta, KeySource, PasswordKdf, ENCRYPTION_META_FILE,
 };
 pub use database_encryption::{
-    EncryptedDatabase, DatabaseEncryptionConfig, ColumnFamilyKey,
-    EncryptedValue, DecryptedValue,
+    ColumnFamilyKey, DatabaseEncryptionConfig, DecryptedValue, EncryptedDatabase, EncryptedValue,
 };
+pub use envelope::{CryptoAgileEnvelope, EncryptionEnvelope, EnvelopeHeader, EnvelopeVersion};
+pub use key_commitment::{KeyCommitment, KeyLifecycleEvent, KeyRotationProof, OnChainKeyAnchor};
 pub use key_derivation::{
-    MasterKeyDerivation, DerivedKey, KeyDerivationParams,
-    Argon2Params, KeyPurpose,
+    Argon2Params, DerivedKey, KeyDerivationParams, KeyPurpose, MasterKeyDerivation,
 };
-pub use envelope::{
-    EncryptionEnvelope, EnvelopeVersion, EnvelopeHeader,
-    CryptoAgileEnvelope,
-};
-pub use key_commitment::{
-    KeyCommitment, KeyRotationProof, OnChainKeyAnchor,
-    KeyLifecycleEvent,
+pub use quantum_safe::{
+    HybridEncapsulation, HybridKEM, KeyEncapsulationMechanism, QuantumSafeConfig, SecurityLevel,
 };
 
 /// QSSP Protocol Version

@@ -182,7 +182,7 @@ impl MarketplaceStorage {
             let count = interactions.len() as u64;
             let mut counts: HashMap<ModelId, u64> = HashMap::new();
             for interaction in interactions.iter() {
-                *counts.entry(interaction.model_id).or_insert(0) += 1;
+                { let n = counts.entry(interaction.model_id).or_insert(0); *n = n.saturating_add(1); }
             }
             (count, counts)
         };
@@ -201,7 +201,7 @@ impl MarketplaceStorage {
         // Calculate category distribution
         let mut category_counts: HashMap<ModelCategory, u64> = HashMap::new();
         for model in self.models.iter() {
-            *category_counts.entry(model.value().category).or_insert(0) += 1;
+            { let n = category_counts.entry(model.value().category).or_insert(0); *n = n.saturating_add(1); }
         }
         stats.category_distribution = category_counts;
 

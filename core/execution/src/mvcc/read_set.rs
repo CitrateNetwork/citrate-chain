@@ -79,17 +79,17 @@ impl ReadSet {
     /// account in the set has an account-version not exceeding the pinned
     /// version.
     ///
-    /// Panics if the set was never pinned — callers must always pin before
-    /// validating (see the `PickUpTx` → `LocalExecute` → `TryCommit` flow).
+    /// Returns `false` if the set was never pinned — callers must always pin
+    /// before validating (see the `PickUpTx` → `LocalExecute` → `TryCommit` flow).
     pub fn is_valid_at<F>(&self, mut account_version: F) -> bool
     where
         F: FnMut(&Address) -> ReadVersion,
     {
-        let pinned = self.pinned_version.expect(
-            "ReadSet::is_valid_at called on unpinned set — this indicates a \
-             missing pin_at() call in the worker lifecycle; see TLA+ invariant \
-             IdleWorkerHasNoTx",
-        );
+        // An unpinned set is a worker-lifecycle bug (TLA+ IdleWorkerHasNoTx): treat
+        // it as invalid so the caller aborts and retries instead of panicking.
+        let Some(pinned) = self.pinned_version else {
+            return false;
+        };
         self.accounts.iter().all(|a| account_version(a) <= pinned)
     }
 
@@ -181,11 +181,11 @@ mod tests {
         }));
     }
 
+    /// PANIC-S1: an unpinned set is invalid (abort + retry), not a panic.
     #[test]
-    #[should_panic(expected = "ReadSet::is_valid_at called on unpinned set")]
-    fn is_valid_at_unpinned_panics() {
+    fn is_valid_at_unpinned_is_invalid() {
         let rs = ReadSet::new();
-        let _ = rs.is_valid_at(|_| ReadVersion::from_raw(0));
+        assert!(!rs.is_valid_at(|_| ReadVersion::from_raw(0)));
     }
 
     #[test]

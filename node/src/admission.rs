@@ -440,7 +440,7 @@ impl BlockAdmission {
             return report;
         }
 
-        for height in (applied_height + 1)..=latest {
+        for height in applied_height.saturating_add(1)..=latest {
             let in_chain = self
                 .storage
                 .blocks
@@ -488,7 +488,7 @@ impl BlockAdmission {
 
         // Mirror direction: present in the chain store, absent from the DAG.
         // Left inadmissible, every descendant fails the consistency gate.
-        for height in (applied_height + 1)..=latest {
+        for height in applied_height.saturating_add(1)..=latest {
             let Some(hash) = self
                 .storage
                 .blocks
@@ -579,7 +579,7 @@ pub fn bound_orphan_buffer(blocks: Vec<Block>) -> Vec<Block> {
         if total_bytes.saturating_add(sz) > MAX_ORPHAN_BYTES {
             break;
         }
-        total_bytes += sz;
+        total_bytes = total_bytes.saturating_add(sz);
         out.push(b);
     }
     out

@@ -34,7 +34,10 @@ pub struct ChainFinalizer<C: ChainAdapter> {
 impl<C: ChainAdapter> ChainFinalizer<C> {
     /// Construct a new finalizer.
     pub fn new(chain: Arc<C>, state: Arc<DaemonState>) -> Self {
-        Self { chain, _state: state }
+        Self {
+            chain,
+            _state: state,
+        }
     }
 }
 
@@ -132,8 +135,12 @@ mod tests {
     }
 
     fn fast_forward_to_committed(state: &DaemonState, cycle_id: CycleId) {
-        state.set_cycle_status(cycle_id, CycleStatus::Computed).expect("ok");
-        state.set_cycle_status(cycle_id, CycleStatus::Committed).expect("ok");
+        state
+            .set_cycle_status(cycle_id, CycleStatus::Computed)
+            .expect("ok");
+        state
+            .set_cycle_status(cycle_id, CycleStatus::Committed)
+            .expect("ok");
     }
 
     #[tokio::test]
@@ -151,9 +158,13 @@ mod tests {
     async fn finalize_idempotent_locally() {
         let (chain, state, _dir) = fixture();
         fast_forward_to_committed(&state, 1);
-        try_finalize_cycle(chain.clone(), state.clone(), 1).await.expect("first");
+        try_finalize_cycle(chain.clone(), state.clone(), 1)
+            .await
+            .expect("first");
         // Second call: local guard skips before talking to chain.
-        try_finalize_cycle(chain.clone(), state.clone(), 1).await.expect("second is no-op");
+        try_finalize_cycle(chain.clone(), state.clone(), 1)
+            .await
+            .expect("second is no-op");
         // Only one chain submission happened.
         assert_eq!(chain.submitted_finalizes().len(), 1);
     }
@@ -162,7 +173,9 @@ mod tests {
     async fn finalize_requires_commit() {
         let (chain, state, _dir) = fixture();
         // Cycle still pending; finalize must reject.
-        let err = try_finalize_cycle(chain, state, 1).await.expect_err("rejects");
+        let err = try_finalize_cycle(chain, state, 1)
+            .await
+            .expect_err("rejects");
         assert!(format!("{err}").contains("FinalizeRequiresCommit"));
     }
 

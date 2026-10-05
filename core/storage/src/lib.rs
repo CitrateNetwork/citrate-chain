@@ -12,6 +12,20 @@
 // - QSSP crypto library (envelope encryption, hybrid PQ KEM, key
 //   commitment anchoring) under `crypto`.
 
+// PANIC-S1 G2: production code in this crate may not panic (tests excepted).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 pub mod cache;
 pub mod chain;
 pub mod crypto;

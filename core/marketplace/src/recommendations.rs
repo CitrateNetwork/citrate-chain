@@ -225,8 +225,8 @@ impl RecommendationEngine {
 
                     // Count category preferences
                     if let Some(model) = model_map.get(&interaction.model_id) {
-                        *framework_prefs.entry(model.framework.clone()).or_insert(0) += 1;
-                        *category_counts.entry(model.category).or_insert(0) += 1;
+                        { let n = framework_prefs.entry(model.framework.clone()).or_insert(0u32); *n = n.saturating_add(1); }
+                        { let n = category_counts.entry(model.category).or_insert(0u32); *n = n.saturating_add(1); }
                     }
                 }
 

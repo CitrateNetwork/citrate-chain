@@ -3,7 +3,8 @@ title: "Agent precompile fork: LoRA, memory-anchor and agent-ops precompiles"
 created: 2026-10-01
 branch: hup/n5-chain-precompiles
 author: Larry Klosowski + Claude Opus 5.5
-status: DRAFT for review. Built and tested; NOT activated on any network. Gas values and the 40204 height are pending owner sign-off.
+updated: 2026-10-04
+status: ACCEPTED. Active at genesis of the 2026-10-05 40204 reroll (release pin height 0). The placeholder gas schedule is owner-signed (2026-10-04).
 chain: 40204
 ---
 
@@ -41,7 +42,9 @@ paths.
 
 ### How the height is set (`core/execution/src/agent_fork.rs`)
 
-- Release pin: `AGENT_PRECOMPILES_PINS`. 40204 ships `None`: **not activated**.
+- Release pin: `AGENT_PRECOMPILES_PINS`. 40204 ships `Some(0)`: **active from block 1
+  of the 2026-10-05 reroll genesis** (owner decision 2026-10-04). This binary is for that
+  genesis only; it must not replay a chain produced without the fork.
 - On a release network (any chain id in the pin table) only the pin sets the height.
   A config value (`[chain] agent_precompiles_height`) or env value
   (`CITRATE_AGENT_PRECOMPILES_HEIGHT`) that disagrees with the pin, or any height while
@@ -56,16 +59,20 @@ paths.
 Formal model: `specs/tla/consensus/AgentPrecompileFork.tla` (invariants `AgreeOnSet`,
 `LegacyBelow`, `GenesisUntouched`, `ForkAddrsLive`, `Disjoint`).
 
-### Scheduling the fork on 40204 (owner + operator; not done)
+### The fork on 40204: active at genesis (owner decision 2026-10-04)
 
-1. Owner: choose a height H safely above the tip at rollout (the create-nonce fix used
-   about 13 hours of runway) and sign off the gas schedule below.
-2. Release PR: set `AGENT_PRECOMPILES_PINS` to `(40204, Some(H))`.
-3. Operator: roll the binary to every node before H; confirm `citrate consensus` shows
-   the same fingerprint and `agent precompiles from height H` on each.
-4. After H: run the post-activation checks in section 7 against a node.
+1. Owner: the fork rides the 2026-10-05 reroll genesis (H = 0, so no mid-chain
+   activation is scheduled) with the placeholder gas schedule below, signed as is.
+2. Release: `AGENT_PRECOMPILES_PINS` is `(40204, Some(0))` on the genesis commit.
+3. Operator: build every node of the new genesis from that commit; confirm
+   `citrate consensus` shows the same fingerprint (its pre-image now carries
+   `agent_precompiles_height=0`) and each node logs
+   `Agent precompile fork ACTIVE from height 0 (source: release pin)`. Leave
+   `CITRATE_AGENT_PRECOMPILES_HEIGHT` and `[chain] agent_precompiles_height` unset (or
+   `0`): any other value stops the node at start-up.
+4. After genesis: run the post-activation checks in section 7 against a node.
 
-No agent may set H, deploy, sign or send a transaction for this.
+No agent may deploy, sign or send a transaction for this.
 
 ## 2. `0x0112 LORA_APPLY`
 
@@ -227,7 +234,7 @@ On chain 40204 today no node serves 0x0101 or 0x0106 to contract code (non-deter
 inference is not a consensus operation, audit C-01), so those calls revert; payments in
 the same call revert with them. Registration, adapters, training and merge records work.
 
-## 7. Post-activation checks (operator, after H)
+## 7. Post-activation checks (operator, after genesis on 40204)
 
 A top-level call or `eth_call` whose `to` is a precompile address returns `0x` on a
 Citrate node at every height: the executor hands a top-level call to REVM only when the
@@ -247,8 +254,8 @@ need a calling contract:
    output, and on a multi-node devnet (`RPC_URLS`) every node must return the same bytes.
    The script refuses chain 40204. Local mode starts a single node itself; the header of
    the script has both invocations.
-2. After H on 40204: the same `eth_call` against a probe contract the operator deploys
-   (owner sign-off; no agent deploys). Expect the commitment.
+2. After genesis on 40204: the same `eth_call` against a probe contract the operator
+   deploys (owner sign-off; no agent deploys). Expect the commitment.
 3. `cargo test -p citrate-execution --test agent_precompiles_activation --test
    agent_precompiles_solidity_e2e` on the release commit.
 4. The daily benchmark (Rule 6), because `citrate-execution` changed.
@@ -290,13 +297,19 @@ LoRA 0.39).
 | Foundry | `contracts/test/precompiles/{CitratePrecompilesFailClosed,ModelLoRAPrecompileWiring}.t.sol` | fail-closed helpers on a chain without the precompiles; anchor proofs bound to the committer and the nightly kind (against the real `AnchorRegistry`); model/LoRA contracts |
 | Node | `node/src/config.rs`, `node/src/consensus_manifest.rs`, `node-app/src/main.rs` | height published first (in the node and in the RPC-only `node-app`), unset in every shipped profile, fingerprint rule |
 | Benchmark | `core/execution/benches/agent_precompiles_bench.rs` | worst-case wall clock per gas (section 8) |
-| Formal | `specs/tla/consensus/AgentPrecompileFork*.cfg` | TLC: shipped and pinned configs pass; the mutation config fails `AgreeOnSet` |
+| Formal | `specs/tla/consensus/AgentPrecompileFork*.cfg` | TLC: shipped, pinned and genesis (`_genesis.cfg`, the 40204 pin) configs pass; the mutation config fails `AgreeOnSet` |
 | Cross-repo vectors | `core/execution/tests/agent_precompile_vectors.rs` | the encoders and precompiles reproduce `tests/fixtures/agent_precompile_vectors.json`, which citrate-core's typed encoders and the devnet check consume |
 | Devnet | `scripts/devnet-precompile-check.sh` | a node binary on a devnet, both sides of the fork height (run on one local node on 2026-10-04; a multi-node devnet run is the operator's) |
 
-## 10. Pending owner sign-off
+## 10. Owner sign-off
 
-- The gas values in sections 2 to 5 (measurements in section 8).
-- The 40204 activation height (section 1).
+Signed 2026-10-04:
+
+- The gas values in sections 2 to 5 ship as the placeholder schedule (measurements in
+  section 8).
+- The 40204 activation height is genesis of the 2026-10-05 reroll (section 1).
+
+Still open:
+
 - Whether `AGENT_OPS` should carry further operations (each is a new op byte and a new
   fork).

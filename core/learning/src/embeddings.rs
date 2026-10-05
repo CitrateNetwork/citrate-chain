@@ -187,7 +187,11 @@ mod tests {
         let v = EmbeddingVector::new(vec![3.0, 4.0]).unwrap();
         let n = v.normalize();
         let norm = n.l2_norm();
-        assert!((norm - 1.0).abs() < 1e-6, "norm should be 1.0, got {}", norm);
+        assert!(
+            (norm - 1.0).abs() < 1e-6,
+            "norm should be 1.0, got {}",
+            norm
+        );
         // Direction preserved: ratio should be 3:4
         assert!((n.data[0] / n.data[1] - 0.75).abs() < 1e-6);
     }

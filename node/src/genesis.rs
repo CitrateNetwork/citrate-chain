@@ -140,7 +140,8 @@ pub async fn initialize_genesis_state_with_profile(
     // the same function to ensure identical state roots and genesis hashes.
     // Invariant: DeterministicGenesis (from GenesisSafetyAcrossNodes.tla)
     let state_root_bytes =
-        citrate_economics::genesis::initialize_shared_genesis_state(&executor, &economics_config);
+        citrate_economics::genesis::initialize_shared_genesis_state(&executor, &economics_config)
+            .map_err(|e| anyhow::anyhow!("invalid shared genesis configuration: {e}"))?;
 
     // The shared genesis function initializes the configured account set.
     // Legacy initial_accounts are NOT applied because they would produce a

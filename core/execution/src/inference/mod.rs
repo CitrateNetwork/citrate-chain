@@ -8,16 +8,8 @@ pub mod metal_runtime;
 pub mod coreml_bridge;
 
 pub use metal_runtime::{
-    MetalRuntime,
-    MetalCapabilities,
-    MetalModel,
-    MetalModelFormat,
-    AppleSiliconChip,
+    AppleSiliconChip, MetalCapabilities, MetalModel, MetalModelFormat, MetalRuntime,
 };
 
 #[cfg(target_os = "macos")]
-pub use coreml_bridge::{
-    CoreMLModel,
-    CoreMLInference,
-    ModelMetadata,
-};
+pub use coreml_bridge::{CoreMLInference, CoreMLModel, ModelMetadata};
