@@ -14,8 +14,10 @@
 #                             and every node of the devnet answers the same bytes.
 #
 # The calls are eth_calls through PrecompileCaller (the runtime fixture
-# core/execution/tests/fixtures/agent_precompile_caller_runtime.hex), because a top-level
-# call whose `to` is a precompile address returns 0x on a Citrate node at every height.
+# core/execution/tests/fixtures/agent_precompile_caller_runtime.hex). Since D3 a top-level
+# call whose `to` is a precompile address runs the precompile once PBA hardening is active
+# (genesis on 40204), but before that height it returns 0x; going through the caller keeps
+# the check valid at every height.
 # The only transaction is the PrecompileCaller deployment, signed with a throwaway key on
 # the devnet.
 #
