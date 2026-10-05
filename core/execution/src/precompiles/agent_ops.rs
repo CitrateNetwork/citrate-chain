@@ -213,12 +213,14 @@ fn device_link_verify(body: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
     let expected = LINK_FIXED
         .saturating_add(label_len)
         .saturating_add(LINK_SIGS_LEN);
-    let (label, sigs) = match rest.split_at_checked(label_len) {
-        Some((label, sigs)) if sigs.len() == LINK_SIGS_LEN => (label, sigs),
-        _ => return Err(anyhow!(
+    let Some((label, sigs)) = rest
+        .split_at_checked(label_len)
+        .filter(|(_, sigs)| sigs.len() == LINK_SIGS_LEN)
+    else {
+        return Err(anyhow!(
             "DEVICE_LINK_VERIFY: body {} bytes, label length {label_len} needs exactly {expected}",
             body.len()
-        )),
+        ));
     };
     let member = addr(field(fixed, 0, 20, "member")?)?;
     let device = addr(field(fixed, 20, 20, "device")?)?;
