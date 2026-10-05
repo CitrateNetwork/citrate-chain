@@ -116,6 +116,9 @@ coop block are absent because coop is not deployed on this chain yet.
 book by `scripts/ops/hup-book-update.py`, which re-derives each CREATE2 address
 from the broadcast and checks it on chain before writing. Procedure:
 [`docs/ops/HUP_REGISTRY_REDEPLOY_RUNBOOK.md`](../../docs/ops/HUP_REGISTRY_REDEPLOY_RUNBOOK.md).
+`scripts/ops/hup-provenance-update.py` then appends the same broadcast to
+`40204.provenance.json` (rows the book no longer pins become `superseded`), so the
+ledger and the book stay in step.
 
 ## Adding a new contract
 

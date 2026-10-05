@@ -234,12 +234,19 @@ Citrate node at every height: the executor hands a top-level call to REVM only w
 target account has code. The precompiles are reached from contract code. So the checks
 need a calling contract:
 
-1. Before H, on a local devnet built from the release commit with
-   `CITRATE_AGENT_PRECOMPILES_HEIGHT` set low: deploy `PrecompileCaller` (the fixture in
+1. Before H, on a devnet built from the release commit with
+   `CITRATE_AGENT_PRECOMPILES_HEIGHT` set low: run `scripts/devnet-precompile-check.sh`.
+   It deploys `PrecompileCaller` (the fixture in
    `core/execution/tests/fixtures/agent_precompile_caller_runtime.hex`, compiled from
-   `contracts/test/precompiles/CitratePrecompilesFailClosed.t.sol`) and `eth_call`
-   `anchorCommitment(bytes)` with the shared vector of section 4. Expect the commitment
-   above the devnet height and `PrecompileUnavailable(0x0121)` below it.
+   `contracts/test/precompiles/CitratePrecompilesFailClosed.t.sol`) with a throwaway
+   devnet key, then `eth_call`s every helper with the pinned vectors in
+   `core/execution/tests/fixtures/agent_precompile_vectors.json` (LoRA apply and merge,
+   the section 4 anchor vector and three more, device links and revocations, each valid
+   and invalid). Below the devnet height every call must revert with
+   `PrecompileUnavailable(<address>)`; at and after it every call must return the pinned
+   output, and on a multi-node devnet (`RPC_URLS`) every node must return the same bytes.
+   The script refuses chain 40204. Local mode starts a single node itself; the header of
+   the script has both invocations.
 2. After H on 40204: the same `eth_call` against a probe contract the operator deploys
    (owner sign-off; no agent deploys). Expect the commitment.
 3. `cargo test -p citrate-execution --test agent_precompiles_activation --test
@@ -284,8 +291,8 @@ LoRA 0.39).
 | Node | `node/src/config.rs`, `node/src/consensus_manifest.rs`, `node-app/src/main.rs` | height published first (in the node and in the RPC-only `node-app`), unset in every shipped profile, fingerprint rule |
 | Benchmark | `core/execution/benches/agent_precompiles_bench.rs` | worst-case wall clock per gas (section 8) |
 | Formal | `specs/tla/consensus/AgentPrecompileFork*.cfg` | TLC: shipped and pinned configs pass; the mutation config fails `AgreeOnSet` |
-
-Not covered here: a run against a live multi-node devnet binary.
+| Cross-repo vectors | `core/execution/tests/agent_precompile_vectors.rs` | the encoders and precompiles reproduce `tests/fixtures/agent_precompile_vectors.json`, which citrate-core's typed encoders and the devnet check consume |
+| Devnet | `scripts/devnet-precompile-check.sh` | a node binary on a devnet, both sides of the fork height (run on one local node on 2026-10-04; a multi-node devnet run is the operator's) |
 
 ## 10. Pending owner sign-off
 
