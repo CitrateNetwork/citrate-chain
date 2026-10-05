@@ -182,6 +182,16 @@ class Merge(unittest.TestCase):
         with self.assertRaisesRegex(hbu.BookError, "different fields"):
             hpu.merge(once, rows)
 
+    def test_two_canonical_rows_of_one_name_refused(self):
+        # A ledger whose canonical rows already disagree about a name is not appended to.
+        run, _ = _broadcast()
+        prov = _ledger()
+        # Sent by another account, so the deployer's nonce sequence stays continuous.
+        dup = dict(prov["ledger"][0], tx="0x" + "09" * 32, **{"from": hbu.to_checksum(OTHER)})
+        prov["ledger"].insert(1, dup)
+        with self.assertRaisesRegex(hbu.BookError, "two canonical ledger rows name GOVERNANCE"):
+            hpu.merge(prov, hpu.broadcast_rows(run, DEPLOYER))
+
     def test_wrong_chain_ledger_refused(self):
         run, _ = _broadcast()
         prov = _ledger()

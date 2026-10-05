@@ -214,6 +214,11 @@ scripts/sync-addresses.py --book ../citrate-chain/contracts/addresses/40204.json
   --genesis 0x<new block-0 hash> --rpc https://rpc.citrate.ai
 ```
 
+The book's `InferenceRouter` is the one already on the chain; this redeploy does not
+replace it. A pinned router turns on the app's HIC-1 registry escalation route (US-1.5),
+so the sync checks that pin but writes it only with `--with-inference-router`. Leave the
+flag off until the owner signs off US-1.5.
+
 **Step 6. After deploy (owner decisions, not part of this script):**
 
 - Mint the parent organization and set the AgentSBT issuance path through the admin
