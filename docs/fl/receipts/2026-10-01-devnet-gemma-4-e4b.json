@@ -1,0 +1,72 @@
+{
+  "chain_id": 1337,
+  "ledger": "0x768cced6b5d55bca63e76ef806f1eef06ef68bba",
+  "golden_vector_on_node": true,
+  "cluster_id": "0x09d459ecdafc21b1cca98ae835d1b8c45d368fa23cd40a0eddfc52318b22255a",
+  "start_adapter": {
+    "sha256": "5545c162bffe5b314787a2a17ab78803b020558c6eac0c982edff02df72fc995",
+    "tensors": 132,
+    "values": 2269184
+  },
+  "round_id": "0x29a0bbad3829ef8c62a4ba4b8c6bb61f0e893db107b033a80e55171f159a3dfe",
+  "workers_done": 3,
+  "aggregate": {
+    "adapter_sha256": "ae4ed1b17bac676a1890f3b55e3f62a6a094517dfc3df318523507b279b766bd",
+    "chunks": 2216,
+    "excluded": 0,
+    "input_root": "0x0632e1a266a0f3a6a4c46ffdba3c726a5cfd9049f00f8651f16cb7df2162c523",
+    "n_values": 2269184,
+    "output_root": "0x5efea2eccfbc2b2b834f34b373029ad2ff03076990fc9c3a48fb456cda1eed40",
+    "participants": 3,
+    "participants_root": "0x6472a243685929bfd3b8f9f5df2b46c67003ed5cacf3cbfe5768619009b576bb",
+    "record_digest": "0x693073fe0498b87124bfa8b7629c6e6ef7c628de047e1fe81651815255bc9ecf",
+    "round_id": "0x29a0bbad3829ef8c62a4ba4b8c6bb61f0e893db107b033a80e55171f159a3dfe",
+    "state_counts": [
+      1351680,
+      172032,
+      0,
+      745472
+    ]
+  },
+  "replay": {
+    "participants": 3,
+    "chunks": 2216,
+    "config_hash": "0x9b87e2fcb40001db355db71366de45994e159c22ce2a84cd62c19082f390c49e",
+    "round_id": "0x29a0bbad3829ef8c62a4ba4b8c6bb61f0e893db107b033a80e55171f159a3dfe",
+    "participants_root": "0x6472a243685929bfd3b8f9f5df2b46c67003ed5cacf3cbfe5768619009b576bb",
+    "input_root": "0x0632e1a266a0f3a6a4c46ffdba3c726a5cfd9049f00f8651f16cb7df2162c523",
+    "output_root": "0x5efea2eccfbc2b2b834f34b373029ad2ff03076990fc9c3a48fb456cda1eed40",
+    "record_digest": "0x693073fe0498b87124bfa8b7629c6e6ef7c628de047e1fe81651815255bc9ecf",
+    "merged_adapter_checked": true,
+    "mismatches": []
+  },
+  "record_digest": {
+    "chain": "0x693073fe0498b87124bfa8b7629c6e6ef7c628de047e1fe81651815255bc9ecf",
+    "bundle": "0x693073fe0498b87124bfa8b7629c6e6ef7c628de047e1fe81651815255bc9ecf",
+    "replay": "0x693073fe0498b87124bfa8b7629c6e6ef7c628de047e1fe81651815255bc9ecf"
+  },
+  "honest_challenge_reverts": true,
+  "round0_status": "Accepted",
+  "patronage_ledger": "0xc9e50c8e7f7758b84ae01f645ec91b93925f198e",
+  "settlement": {
+    "intents": 4,
+    "anchor": "0x693073fe0498b87124bfa8b7629c6e6ef7c628de047e1fe81651815255bc9ecf"
+  },
+  "round1": {
+    "status": "Rejected",
+    "chunk": 1108,
+    "challenge_tx": "0x318b8a413e89855a81fb05239eb3b8659576af50b98b2b0cd967bfa478f798d1"
+  },
+  "replay_flags_dishonest": 12,
+  "settlement_refuses_rejected": true,
+  "merged_adapter_loads": {
+    "gpu_attempt": "adapter loaded; completion failed: Metal out of memory (GPU shared with other work)",
+    "cpu_recheck": {
+      "loaded": true,
+      "adapter_sha256": "ae4ed1b17bac676a1890f3b55e3f62a6a094517dfc3df318523507b279b766bd",
+      "completion": " a metabolite, which means it is a",
+      "tokens": 8
+    }
+  },
+  "training": "fixture trainer: no learning ran; this run proves the round protocol only"
+}
