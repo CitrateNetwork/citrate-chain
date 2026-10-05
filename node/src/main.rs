@@ -66,7 +66,6 @@ compile_error!(
      network. Enabling it requires a scheduled fleet-wide activation, not a build flag \
      (PBA-L1a-003)."
 );
-mod startup_guards;
 mod contribution_recorder;
 mod dag_prune;
 mod genesis;
@@ -80,6 +79,7 @@ mod network_inference;
 mod persistent_dag;
 mod producer;
 mod registry_sync;
+mod startup_guards;
 mod sync_peer;
 
 use citrate_consensus::dag_store::DagStore;
@@ -1604,7 +1604,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // PBA-L1a-007: a production (non-devnet) build refuses to MINE with
     // signature verification disabled; unrecognised values fail closed.
     let require_valid_signature = startup_guards::resolve_require_valid_signature(
-        std::env::var("CITRATE_REQUIRE_VALID_SIGNATURE").ok().as_deref(),
+        std::env::var("CITRATE_REQUIRE_VALID_SIGNATURE")
+            .ok()
+            .as_deref(),
         config.mining.enabled,
         cfg!(feature = "devnet"),
     )
@@ -1636,44 +1638,50 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             mempool_max_per_sender
         );
     }
-    let mempool = Arc::new(Mempool::new(MempoolConfig {
-        max_size: mempool_max_size,
-        max_per_sender: mempool_max_per_sender,
-        min_gas_price: min_gas_price_override.unwrap_or(config.mining.min_gas_price),
-        tx_expiry_secs: 3600,
-        allow_replacement: true,
-        replacement_factor: 110,
-        require_valid_signature,
-        chain_id: config.chain.chain_id,
-        max_nonce_gap: 16, // RM-B1 / WP-C4.1 (audit M-SEQ-01): Geth default
-    })
-    // PBA-L1a-001: bound admitted nonces against the sender's COMMITTED nonce
-    // (stale and far-future nonces rejected on every ingress, new senders too).
-    .with_state_nonce_reader({
-        let exec = executor.clone();
-        Arc::new(move |pk: &citrate_consensus::types::PublicKey| {
-            exec.get_nonce(&citrate_execution::address_utils::normalize_address(pk))
+    let mempool = Arc::new(
+        Mempool::new(MempoolConfig {
+            max_size: mempool_max_size,
+            max_per_sender: mempool_max_per_sender,
+            min_gas_price: min_gas_price_override.unwrap_or(config.mining.min_gas_price),
+            tx_expiry_secs: 3600,
+            allow_replacement: true,
+            replacement_factor: 110,
+            require_valid_signature,
+            chain_id: config.chain.chain_id,
+            max_nonce_gap: 16, // RM-B1 / WP-C4.1 (audit M-SEQ-01): Geth default
         })
-    })
-    // PBA-N9 (security#134): reject a transaction on every ingress path when the
-    // sender's committed balance cannot cover it together with its already-pooled
-    // transactions. Without this the pool admits unfunded floods that evict honest
-    // txs and yield empty blocks at zero cost. Balances are far below u128::MAX
-    // (supply is 1e30 wei), so the U256->u128 saturation never loses precision.
-    .with_state_balance_reader({
-        let exec = executor.clone();
-        Arc::new(move |pk: &citrate_consensus::types::PublicKey| {
-            let bal = exec.get_balance(&citrate_execution::address_utils::normalize_address(pk));
-            let cap = primitive_types::U256::from(u128::MAX);
-            (if bal > cap { cap } else { bal }).low_u128()
+        // PBA-L1a-001: bound admitted nonces against the sender's COMMITTED nonce
+        // (stale and far-future nonces rejected on every ingress, new senders too).
+        .with_state_nonce_reader({
+            let exec = executor.clone();
+            Arc::new(move |pk: &citrate_consensus::types::PublicKey| {
+                exec.get_nonce(&citrate_execution::address_utils::normalize_address(pk))
+            })
         })
-    })
-    // Native signatures: from tip H - 1 the pool admits only the chain-bound
-    // (v2) digest and evicts legacy ones (`citrate_consensus::native_sig`).
-    .with_native_sig_policy(citrate_consensus::hardening::PbaHardening::from_process(), {
-        let st = storage.clone();
-        Arc::new(move || st.blocks.get_latest_height().ok())
-    }));
+        // PBA-N9 (security#134): reject a transaction on every ingress path when the
+        // sender's committed balance cannot cover it together with its already-pooled
+        // transactions. Without this the pool admits unfunded floods that evict honest
+        // txs and yield empty blocks at zero cost. Balances are far below u128::MAX
+        // (supply is 1e30 wei), so the U256->u128 saturation never loses precision.
+        .with_state_balance_reader({
+            let exec = executor.clone();
+            Arc::new(move |pk: &citrate_consensus::types::PublicKey| {
+                let bal =
+                    exec.get_balance(&citrate_execution::address_utils::normalize_address(pk));
+                let cap = primitive_types::U256::from(u128::MAX);
+                (if bal > cap { cap } else { bal }).low_u128()
+            })
+        })
+        // Native signatures: from tip H - 1 the pool admits only the chain-bound
+        // (v2) digest and evicts legacy ones (`citrate_consensus::native_sig`).
+        .with_native_sig_policy(
+            citrate_consensus::hardening::PbaHardening::from_process(),
+            {
+                let st = storage.clone();
+                Arc::new(move || st.blocks.get_latest_height().ok())
+            },
+        ),
+    );
 
     // PBA-L1a-017: apply `tx_expiry_secs` with a periodic
     // `Mempool::clear_expired` sweep (once a minute).
@@ -2982,102 +2990,102 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                     // (linkage verified from genesis), or clamped
                                     // when deferred (below).
                                     match admission_for_net.admit(&block).await {
-                                    admission::AdmitOutcome::Admitted { completed_partial } => {
-                                        sync_peer::record_verified_height(
-                                            &max_seen_for_rx,
-                                            block.header.height,
-                                        );
-                                        if completed_partial {
-                                            // D4a: admission.rs already warns (budgeted); a
-                                            // per-block warn here doubled the storm.
-                                            tracing::debug!(
+                                        admission::AdmitOutcome::Admitted { completed_partial } => {
+                                            sync_peer::record_verified_height(
+                                                &max_seen_for_rx,
+                                                block.header.height,
+                                            );
+                                            if completed_partial {
+                                                // D4a: admission.rs already warns (budgeted); a
+                                                // per-block warn here doubled the storm.
+                                                tracing::debug!(
                                                 "Completed a partial admission of gossiped block {} @ {}",
                                                 hex::encode(&block.header.block_hash.as_bytes()[..8]),
                                                 block.header.height
                                             );
+                                            }
                                         }
-                                    }
-                                    admission::AdmitOutcome::AlreadyAdmitted => {}
-                                    admission::AdmitOutcome::Deferred { missing_parent } => {
-                                        // A block we can't admit because its parent is
-                                        // missing is still PROOF the network is at least
-                                        // at block.height. Rejecting it is correct, but
-                                        // dropping that height signal is what stalled a
-                                        // far-behind follower — record it so the sync tick
-                                        // pulls the gap forward instead of parking.
-                                        sync_peer::record_unverified_height(
-                                            &max_seen_for_rx,
-                                            block.header.height,
-                                            storage_for_handler
-                                                .blocks
-                                                .get_applied_tip()
-                                                .ok()
-                                                .flatten()
-                                                .map(|(_, h)| h)
-                                                .unwrap_or(0),
-                                        );
-                                        tracing::debug!(
+                                        admission::AdmitOutcome::AlreadyAdmitted => {}
+                                        admission::AdmitOutcome::Deferred { missing_parent } => {
+                                            // A block we can't admit because its parent is
+                                            // missing is still PROOF the network is at least
+                                            // at block.height. Rejecting it is correct, but
+                                            // dropping that height signal is what stalled a
+                                            // far-behind follower — record it so the sync tick
+                                            // pulls the gap forward instead of parking.
+                                            sync_peer::record_unverified_height(
+                                                &max_seen_for_rx,
+                                                block.header.height,
+                                                storage_for_handler
+                                                    .blocks
+                                                    .get_applied_tip()
+                                                    .ok()
+                                                    .flatten()
+                                                    .map(|(_, h)| h)
+                                                    .unwrap_or(0),
+                                            );
+                                            tracing::debug!(
                                             "Deferred gossiped block {} @ {} from {}: missing parent {}",
                                             hex::encode(&block.header.block_hash.as_bytes()[..8]),
                                             block.header.height,
                                             pid,
                                             hex::encode(&missing_parent.as_bytes()[..8])
                                         );
-                                        // SYNC-S3 — ANCESTRY RECOVERY (the 2026-07-27 silent
-                                        // partition). Recording the height signal is NOT enough.
-                                        // The 2s sync tick only pulls when `applied_height <
-                                        // target`, and it anchors every request at OUR OWN
-                                        // applied tip — which a peer on a different branch does
-                                        // not have, so it resolves the anchor to nothing and
-                                        // replies "Sending 0 blocks". Live reproduction: two
-                                        // producers, one dropped gossip message (B's first block,
-                                        // broadcast before its peer link was up), and from then on
-                                        // EVERY later block deferred on the previous undelivered
-                                        // one. A issued 236 GetBlocks; B answered "Sending 0
-                                        // blocks" 76/76 times, and vice versa. Both nodes stayed
-                                        // "healthy" — no errors, no root mismatches — while
-                                        // building permanently divergent chains.
-                                        //
-                                        // Fix: ask THIS peer for the missing parent directly. That
-                                        // anchor is one the peer provably holds (it just sent us
-                                        // its child), so the request is answerable, and
-                                        // `serve_blocks` returns the anchor's whole height-group
-                                        // plus everything above it — the ancestry we lack. Self-
-                                        // heals at depth 1, before a deep fork can form.
-                                        // `request_blocks` de-duplicates on the anchor while a
-                                        // request is in flight and honours the concurrency cap, so
-                                        // a run of deferrals cannot storm a peer.
-                                        //
-                                        // #150 — BOUNDED BY DISTANCE. This recovers a fork we
-                                        // NARROWLY missed. It is not a catch-up mechanism, and
-                                        // firing it while far behind actively prevents catch-up:
-                                        // when the gap is large, EVERY gossiped tip block is
-                                        // "missing its parent", so every one queued a request for a
-                                        // parent that is itself tens of thousands of blocks deep.
-                                        // Measured on boot1 at a 33k gap: 125 of 159 batches (79%)
-                                        // landed at the network tip and could never be applied,
-                                        // while those requests consumed the in-flight budget the
-                                        // ONE useful forward request needs.
-                                        //
-                                        // The window is derived, not picked: `block_batch_size` (32)
-                                        // x `max_concurrent_downloads` (16) is the most a node with
-                                        // a full in-flight window can legitimately be behind. Past
-                                        // that, the "missing parent" is not a fork, it is the gap —
-                                        // and the 2s forward driver already owns the gap.
-                                        let applied_now = storage_for_handler
-                                            .blocks
-                                            .get_applied_tip()
-                                            .ok()
-                                            .flatten()
-                                            .map(|(_, h)| h)
-                                            .unwrap_or(0);
-                                        let within_reach =
-                                            sync_peer::should_attempt_ancestry_recovery(
-                                                block.header.height,
-                                                applied_now,
-                                            );
-                                        if !within_reach {
-                                            tracing::debug!(
+                                            // SYNC-S3 — ANCESTRY RECOVERY (the 2026-07-27 silent
+                                            // partition). Recording the height signal is NOT enough.
+                                            // The 2s sync tick only pulls when `applied_height <
+                                            // target`, and it anchors every request at OUR OWN
+                                            // applied tip — which a peer on a different branch does
+                                            // not have, so it resolves the anchor to nothing and
+                                            // replies "Sending 0 blocks". Live reproduction: two
+                                            // producers, one dropped gossip message (B's first block,
+                                            // broadcast before its peer link was up), and from then on
+                                            // EVERY later block deferred on the previous undelivered
+                                            // one. A issued 236 GetBlocks; B answered "Sending 0
+                                            // blocks" 76/76 times, and vice versa. Both nodes stayed
+                                            // "healthy" — no errors, no root mismatches — while
+                                            // building permanently divergent chains.
+                                            //
+                                            // Fix: ask THIS peer for the missing parent directly. That
+                                            // anchor is one the peer provably holds (it just sent us
+                                            // its child), so the request is answerable, and
+                                            // `serve_blocks` returns the anchor's whole height-group
+                                            // plus everything above it — the ancestry we lack. Self-
+                                            // heals at depth 1, before a deep fork can form.
+                                            // `request_blocks` de-duplicates on the anchor while a
+                                            // request is in flight and honours the concurrency cap, so
+                                            // a run of deferrals cannot storm a peer.
+                                            //
+                                            // #150 — BOUNDED BY DISTANCE. This recovers a fork we
+                                            // NARROWLY missed. It is not a catch-up mechanism, and
+                                            // firing it while far behind actively prevents catch-up:
+                                            // when the gap is large, EVERY gossiped tip block is
+                                            // "missing its parent", so every one queued a request for a
+                                            // parent that is itself tens of thousands of blocks deep.
+                                            // Measured on boot1 at a 33k gap: 125 of 159 batches (79%)
+                                            // landed at the network tip and could never be applied,
+                                            // while those requests consumed the in-flight budget the
+                                            // ONE useful forward request needs.
+                                            //
+                                            // The window is derived, not picked: `block_batch_size` (32)
+                                            // x `max_concurrent_downloads` (16) is the most a node with
+                                            // a full in-flight window can legitimately be behind. Past
+                                            // that, the "missing parent" is not a fork, it is the gap —
+                                            // and the 2s forward driver already owns the gap.
+                                            let applied_now = storage_for_handler
+                                                .blocks
+                                                .get_applied_tip()
+                                                .ok()
+                                                .flatten()
+                                                .map(|(_, h)| h)
+                                                .unwrap_or(0);
+                                            let within_reach =
+                                                sync_peer::should_attempt_ancestry_recovery(
+                                                    block.header.height,
+                                                    applied_now,
+                                                );
+                                            if !within_reach {
+                                                tracing::debug!(
                                                 "SYNC-S3: skipping ancestry recovery for block @ {} \
                                                  — {} blocks above our applied tip {}; the forward \
                                                  sync driver owns this gap",
@@ -3085,34 +3093,36 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                                 block.header.height.saturating_sub(applied_now),
                                                 applied_now
                                             );
-                                        } else if let Some(peer) = pm_for_rx.get_peer(&pid) {
-                                            if let Err(e) = sync_for_rx
-                                                .request_blocks(
-                                                    &peer,
-                                                    missing_parent,
-                                                    // The selected parent sits exactly one
-                                                    // height below the block that deferred.
-                                                    block.header.height.saturating_sub(1),
-                                                )
-                                                .await
-                                            {
-                                                tracing::debug!(
+                                            } else if let Some(peer) = pm_for_rx.get_peer(&pid) {
+                                                if let Err(e) = sync_for_rx
+                                                    .request_blocks(
+                                                        &peer,
+                                                        missing_parent,
+                                                        // The selected parent sits exactly one
+                                                        // height below the block that deferred.
+                                                        block.header.height.saturating_sub(1),
+                                                    )
+                                                    .await
+                                                {
+                                                    tracing::debug!(
                                                     "SYNC-S3: ancestry request to {} for {} failed: {}",
                                                     pid,
                                                     hex::encode(&missing_parent.as_bytes()[..8]),
                                                     e
                                                 );
+                                                }
                                             }
                                         }
-                                    }
-                                    admission::AdmitOutcome::Rejected(why) => {
-                                        tracing::warn!(
-                                            "Rejected inconsistent block {} from {}: {}",
-                                            hex::encode(&block.header.block_hash.as_bytes()[..8]),
-                                            pid,
-                                            why
-                                        );
-                                    }
+                                        admission::AdmitOutcome::Rejected(why) => {
+                                            tracing::warn!(
+                                                "Rejected inconsistent block {} from {}: {}",
+                                                hex::encode(
+                                                    &block.header.block_hash.as_bytes()[..8]
+                                                ),
+                                                pid,
+                                                why
+                                            );
+                                        }
                                     }
                                 }
                                 Err(e) => {

@@ -91,11 +91,8 @@ pub(crate) fn verify_block_body(
         return Err(format!("body: block hash mismatch @ {height}"));
     }
     // PBA-L1b-002: the root must commit to the transactions' full contents.
-    let expected = citrate_consensus::tx_auth::tx_root_for_height(
-        hardening,
-        height,
-        &block.transactions,
-    );
+    let expected =
+        citrate_consensus::tx_auth::tx_root_for_height(hardening, height, &block.transactions);
     if block.tx_root != expected {
         return Err(format!(
             "body: tx_root {} does not commit to the block's transactions (expected {}) \
@@ -1270,7 +1267,9 @@ mod pba_r2_admission {
     use citrate_consensus::crypto;
     use citrate_consensus::hardening::PbaHardening;
     use citrate_consensus::tx_auth::{native_tx_id, tx_root_for_height};
-    use citrate_consensus::types::{BlockBuilder, GhostDagParams, PublicKey, Transaction, VrfProof};
+    use citrate_consensus::types::{
+        BlockBuilder, GhostDagParams, PublicKey, Transaction, VrfProof,
+    };
     use citrate_storage::pruning::PruningConfig;
 
     fn harness(
@@ -1283,7 +1282,11 @@ mod pba_r2_admission {
         let ghostdag = Arc::new(
             GhostDag::new(GhostDagParams::default(), dag.clone()).with_pba_hardening(hardening),
         );
-        (BlockAdmission::new(storage.clone(), dag, ghostdag, None), storage, dir)
+        (
+            BlockAdmission::new(storage.clone(), dag, ghostdag, None),
+            storage,
+            dir,
+        )
     }
 
     fn signed_native(seed: u8, nonce: u64, value: u128) -> Transaction {
@@ -1302,12 +1305,7 @@ mod pba_r2_admission {
         tx
     }
 
-    fn block(
-        hardening: PbaHardening,
-        height: u64,
-        parent: Hash,
-        txs: Vec<Transaction>,
-    ) -> Block {
+    fn block(hardening: PbaHardening, height: u64, parent: Hash, txs: Vec<Transaction>) -> Block {
         let mut b = BlockBuilder::new()
             .version(2)
             .height(height)
@@ -1335,7 +1333,12 @@ mod pba_r2_admission {
         let g = block(pba, 0, Hash::default(), vec![]);
         assert!(matches!(adm.admit(&g).await, AdmitOutcome::Admitted { .. }));
 
-        let honest = block(pba, 1, g.header.block_hash, vec![signed_native(1, 0, 1_000)]);
+        let honest = block(
+            pba,
+            1,
+            g.header.block_hash,
+            vec![signed_native(1, 0, 1_000)],
+        );
         let mut forged = honest.clone();
         forged.transactions[0].value = 2_000; // body rewritten, tx.hash untouched
         assert_eq!(forged.header.block_hash, honest.header.block_hash);
@@ -1353,8 +1356,15 @@ mod pba_r2_admission {
             matches!(adm.admit(&honest).await, AdmitOutcome::Admitted { .. }),
             "the honest copy is admitted after the tampered one was seen"
         );
-        let stored = storage.blocks.get_block(&honest.header.block_hash).unwrap().unwrap();
-        assert_eq!(stored.transactions[0].value, 1_000, "the honest body is what is stored");
+        let stored = storage
+            .blocks
+            .get_block(&honest.header.block_hash)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.transactions[0].value, 1_000,
+            "the honest body is what is stored"
+        );
     }
 
     /// PBA-L1b-001: a forged-sender tx (EVM-shaped victim, no signature, the
@@ -1381,7 +1391,10 @@ mod pba_r2_admission {
         };
         let b = block(pba, 1, g.header.block_hash, vec![forged]);
         let r = adm.admit(&b).await;
-        assert!(matches!(r, AdmitOutcome::Rejected(ref why) if why.contains("PBA-L1b-001")), "{r:?}");
+        assert!(
+            matches!(r, AdmitOutcome::Rejected(ref why) if why.contains("PBA-L1b-001")),
+            "{r:?}"
+        );
         assert!(!storage.blocks.has_block(&b.header.block_hash).unwrap());
     }
 
@@ -1389,13 +1402,19 @@ mod pba_r2_admission {
     #[test]
     fn pba_r2_tripwire_body_gate_precedes_every_write() {
         let src = include_str!("admission.rs");
-        let admit = src.find("pub async fn admit(&self, block: &Block)").expect("admit");
+        let admit = src
+            .find("pub async fn admit(&self, block: &Block)")
+            .expect("admit");
         let body = &src[admit..];
-        let gate = body.find("verify_block_body(self.ghostdag.pba_hardening(), block)").expect(
-            "PBA-R2: admit must run verify_block_body",
-        );
+        let gate = body
+            .find("verify_block_body(self.ghostdag.pba_hardening(), block)")
+            .expect("PBA-R2: admit must run verify_block_body");
         assert!(gate < body.find("self.dag_store.store_block(").expect("dag write"));
-        assert!(gate < body.find("self.storage.blocks.put_block(").expect("chain write"));
+        assert!(
+            gate < body
+                .find("self.storage.blocks.put_block(")
+                .expect("chain write")
+        );
     }
 
     #[tokio::test]
@@ -1404,11 +1423,19 @@ mod pba_r2_admission {
         let (adm, _storage, _d) = harness(pba);
         let g = block(pba, 0, Hash::default(), vec![]);
         adm.admit(&g).await;
-        let honest = block(pba, 1, g.header.block_hash, vec![signed_native(1, 0, 1_000)]);
+        let honest = block(
+            pba,
+            1,
+            g.header.block_hash,
+            vec![signed_native(1, 0, 1_000)],
+        );
         let mut forged = honest.clone();
         forged.transactions[0].value = 2_000;
         // Legacy validity (documented residual until activation).
-        assert!(matches!(adm.admit(&forged).await, AdmitOutcome::Admitted { .. }));
+        assert!(matches!(
+            adm.admit(&forged).await,
+            AdmitOutcome::Admitted { .. }
+        ));
     }
 }
 
