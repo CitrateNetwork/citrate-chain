@@ -304,7 +304,7 @@ pub fn process_rss_bytes() -> Option<u64> {
             .output()
             .ok()?;
         let kib: u64 = String::from_utf8(out.stdout).ok()?.trim().parse().ok()?;
-        Some(kib * 1024)
+        Some(kib.saturating_mul(1024))
     }
 }
 
