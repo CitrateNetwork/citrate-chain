@@ -226,7 +226,12 @@ impl CoreMLModel {
         }
 
         // Set input
-        let input_name = CString::new(self.input_names[0].as_str())?;
+        let input_name = CString::new(
+            self.input_names
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("model declares no input"))?
+                .as_str(),
+        )?;
         // SAFETY: `provider` and `input_array` are verified non-null. `input_name` is a
         // valid null-terminated CString kept alive for the call. The provider takes
         // ownership of a reference to the array.
@@ -270,7 +275,12 @@ impl CoreMLModel {
         }
 
         // Extract output
-        let output_name = CString::new(self.output_names[0].as_str())?;
+        let output_name = CString::new(
+            self.output_names
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("model declares no output"))?
+                .as_str(),
+        )?;
         // SAFETY: `output_provider` is verified non-null above. `output_name` is a valid
         // null-terminated CString kept alive for the call. Returns null if the named
         // feature is not found, checked below.

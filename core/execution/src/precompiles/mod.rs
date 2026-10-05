@@ -3,11 +3,14 @@
 // EVM Precompiles Module
 // Standard Ethereum precompiles + Citrate AI extensions
 
+pub mod agent_ops;
 pub mod attestation;
 pub mod commd_fold_verify;
 pub mod compute;
 pub mod ed25519;
 pub mod inference;
+pub mod lora;
+pub mod memory_anchor;
 pub mod q16;
 pub mod tensor_format;
 pub mod verify;
@@ -166,6 +169,42 @@ pub const PURE_PRECOMPILE_ADDRESSES: [[u8; 20]; 16] = [
     x402::addresses::TRANSFER_AUTH_VERIFY,     // 0x0201
     x402::addresses::BATCH_PAYMENT_VERIFY,     // 0x0202
 ];
+
+/// HUP-S7.2: the addresses the agent precompile fork bridges into REVM at and
+/// after `crate::agent_fork` activation (spec:
+/// `docs/precompiles/AGENT_PRECOMPILES.md`). Below the fork they are not in the
+/// bridged set, so they behave exactly as before (an empty account, or a
+/// reserved always-failing address once `pba_hardening_height` is active).
+/// Every address here MUST route in [`execute_agent_fork`] and MUST lie inside
+/// the reserved ranges (`agent_fork_table_routes` enforces both).
+pub const AGENT_FORK_PRECOMPILE_ADDRESSES: [[u8; 20]; 4] = [
+    lora::LORA_APPLY,                    // 0x0112
+    lora::LORA_MERGE,                    // 0x0113
+    memory_anchor::MEMORY_ANCHOR_VERIFY, // 0x0121
+    agent_ops::AGENT_OPS,                // 0x0122
+];
+
+/// Route an agent precompile fork address. Pure and stateless, like
+/// [`execute_pure`]; the REVM bridge calls it only for blocks at or after the
+/// fork height.
+pub fn execute_agent_fork(
+    address: &Address,
+    input: &[u8],
+    gas_limit: u64,
+) -> Result<PrecompileResult> {
+    let a = *address.as_bytes();
+    if a == lora::LORA_APPLY {
+        lora::apply(input, gas_limit)
+    } else if a == lora::LORA_MERGE {
+        lora::merge(input, gas_limit)
+    } else if a == memory_anchor::MEMORY_ANCHOR_VERIFY {
+        memory_anchor::execute(input, gas_limit)
+    } else if a == agent_ops::AGENT_OPS {
+        agent_ops::execute(input, gas_limit)
+    } else {
+        Err(anyhow::anyhow!("Not an agent precompile fork address"))
+    }
+}
 
 /// Addresses inside the Citrate precompile ranges
 /// (`PrecompileExecutor::is_precompile`) that are not bridged into REVM (the
@@ -1869,6 +1908,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// HUP-S7.2: every agent precompile fork address (a) routes in
+    /// `execute_agent_fork`, (b) is NOT in the pre-fork bridged set (so below
+    /// the fork nothing changes), (c) lies inside the reserved ranges that
+    /// `is_precompile` and `reserved_unbridged_addresses` already cover, and
+    /// (d) does not collide with the inference family.
+    #[test]
+    fn agent_fork_table_routes() {
+        let executor = PrecompileExecutor::new();
+        let reserved = reserved_unbridged_addresses();
+        for raw in AGENT_FORK_PRECOMPILE_ADDRESSES {
+            let addr = Address(raw);
+            assert!(
+                executor.is_precompile(&addr),
+                "{addr:?} inside the Citrate ranges"
+            );
+            assert!(
+                !PURE_PRECOMPILE_ADDRESSES.contains(&raw),
+                "{addr:?} not bridged pre-fork"
+            );
+            assert!(reserved.contains(&raw), "{addr:?} reserved pre-fork");
+            assert!(
+                !(raw[18] == 1 && raw[19] <= 0x06),
+                "{addr:?} not in the inference family"
+            );
+            if let Err(e) = execute_agent_fork(&addr, &[0xde, 0xad], 10_000_000) {
+                assert!(
+                    !e.to_string()
+                        .contains("Not an agent precompile fork address"),
+                    "{addr:?} listed but not routed"
+                );
+            }
+            // The pre-fork pure router never claims a fork address.
+            assert!(execute_pure(&addr, &[0xde, 0xad], 10_000_000).is_err());
+        }
+        assert!(execute_agent_fork(&Address(PURE_PRECOMPILE_ADDRESSES[0]), &[], 1).is_err());
     }
 
     /// The inference family needs the hosted runtime and must NOT be

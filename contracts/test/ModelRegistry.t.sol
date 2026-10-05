@@ -11,8 +11,9 @@ contract ModelRegistryTest is Test {
     address internal owner = address(0xAA11);
     address internal user = address(0xBB22);
 
-    // Citrate precompile address used by ModelRegistry
-    address constant MODEL_PRECOMPILE = 0x0000000000000000000000000000000000001000;
+    // 0x0101 MODEL_INFERENCE: ModelRegistry calls it in its native layout via
+    // CitratePrecompiles. The mock stands in for a node that serves it.
+    address constant MODEL_PRECOMPILE = address(0x0101);
 
     function setUp() public {
         registry = new ModelRegistry(address(this));
@@ -194,8 +195,8 @@ contract ModelRegistryTest is Test {
         vm.prank(user);
         bytes memory out = registry.requestInference{value:1 ether}(h, hex"AABB");
         assertGt(owner.balance, balBefore);
-        // Output is prefixed by mock and ABI-encoded
-        assertEq(out, abi.encode(bytes.concat(bytes("out:"), hex"AABB")));
+        // Raw precompile output (the mock prefixes "out:")
+        assertEq(out, bytes.concat(bytes("out:"), hex"AABB"));
         assertEq(registry.getModelRevenue(h), 1 ether);
     }
 
@@ -204,7 +205,7 @@ contract ModelRegistryTest is Test {
         bytes32 h = registry.registerModel{value:0.1 ether}("Free","Fw","1","cidA",123, 0,_meta());
         vm.prank(user);
         bytes memory out = registry.requestInference{value:0}(h, hex"00");
-        assertEq(out, abi.encode(bytes("out:\x00")));
+        assertEq(out, bytes("out:\x00"));
     }
 
     function test_activate_deactivate_authorization() public {

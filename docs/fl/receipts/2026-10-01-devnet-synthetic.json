@@ -1,0 +1,64 @@
+{
+  "chain_id": 1337,
+  "ledger": "0xbb82df9f8fa6a43607ab4db3f72ad49a02c729ec",
+  "golden_vector_on_node": true,
+  "cluster_id": "0xdabda45d59d60ba6ae011fa6ce568686922c32ba527f18fe1faaa638826edb8b",
+  "start_adapter": {
+    "sha256": "91c2132dbdc18339f56aa7fb3a044fb431e59d880e3821d03c61bc9e61e90160",
+    "tensors": 8,
+    "values": 1152
+  },
+  "round_id": "0x86a9ab00dadc718398e36cf766b98393cb07f1c4465c94c9a38c2bf6248a6fca",
+  "workers_done": 3,
+  "aggregate": {
+    "adapter_sha256": "db03657eecc933f8d6830807b8f7966823971fd88e93fd24946fc9b5dd7ba650",
+    "chunks": 72,
+    "excluded": 0,
+    "input_root": "0x9f3d95f9bac38e2c2ef60d3811fcdb4e52bb866763a307e4ed510c628da209c5",
+    "n_values": 1152,
+    "output_root": "0x8cbeafccc5eac8f22ecbb97f1dd38e8a09daa2e1869adb0fd68e8142551f60a1",
+    "participants": 3,
+    "participants_root": "0xd381c668ce1f0898aadfd00ed11ff8dcf010816aae4d9b41f6a27f1fbd3416f5",
+    "record_digest": "0x2ad311631568ce2bd9ca56181b573ecb3bf362d6b1ee5162b4b7183f7a06977e",
+    "round_id": "0x86a9ab00dadc718398e36cf766b98393cb07f1c4465c94c9a38c2bf6248a6fca",
+    "state_counts": [
+      768,
+      108,
+      0,
+      276
+    ]
+  },
+  "replay": {
+    "participants": 3,
+    "chunks": 72,
+    "config_hash": "0x78e97b2b31c5a256048f032a4d5d9bada62a150fbfba0602641a8e07360c090c",
+    "round_id": "0x86a9ab00dadc718398e36cf766b98393cb07f1c4465c94c9a38c2bf6248a6fca",
+    "participants_root": "0xd381c668ce1f0898aadfd00ed11ff8dcf010816aae4d9b41f6a27f1fbd3416f5",
+    "input_root": "0x9f3d95f9bac38e2c2ef60d3811fcdb4e52bb866763a307e4ed510c628da209c5",
+    "output_root": "0x8cbeafccc5eac8f22ecbb97f1dd38e8a09daa2e1869adb0fd68e8142551f60a1",
+    "record_digest": "0x2ad311631568ce2bd9ca56181b573ecb3bf362d6b1ee5162b4b7183f7a06977e",
+    "merged_adapter_checked": true,
+    "mismatches": []
+  },
+  "record_digest": {
+    "chain": "0x2ad311631568ce2bd9ca56181b573ecb3bf362d6b1ee5162b4b7183f7a06977e",
+    "bundle": "0x2ad311631568ce2bd9ca56181b573ecb3bf362d6b1ee5162b4b7183f7a06977e",
+    "replay": "0x2ad311631568ce2bd9ca56181b573ecb3bf362d6b1ee5162b4b7183f7a06977e"
+  },
+  "honest_challenge_reverts": true,
+  "round0_status": "Accepted",
+  "patronage_ledger": "0xa9bdaa186f30401d34c1ba36584b8d7eb8780eff",
+  "settlement": {
+    "intents": 4,
+    "anchor": "0x2ad311631568ce2bd9ca56181b573ecb3bf362d6b1ee5162b4b7183f7a06977e"
+  },
+  "round1": {
+    "status": "Rejected",
+    "chunk": 36,
+    "challenge_tx": "0xaf3a0ba2225cc5b4fee14f86ca89976d8a965409607882f229f3d1fe1c752f1b"
+  },
+  "replay_flags_dishonest": 12,
+  "settlement_refuses_rejected": true,
+  "merged_adapter_loads": "skipped (synthetic base or no LLAMA_SERVER)",
+  "training": "fixture trainer: no learning ran; this run proves the round protocol only"
+}

@@ -108,6 +108,18 @@ citrate-quorum's book test requires, and the others are
 2-of-3 timelock is `CitAgentTimelock`. The coop pair and the `planned`
 coop block are absent because coop is not deployed on this chain yet.
 
+### HUP registry set (HUP-S7.1)
+
+`OrganizationSBT`, `AgentSBT`, `CapsuleRegistry`, `AnchorRegistry`,
+`BenchmarkRegistry` and `SkillRegistry` are deployed by
+`script/DeployHupRegistries.s.sol` after the main ceremony, and merged into this
+book by `scripts/ops/hup-book-update.py`, which re-derives each CREATE2 address
+from the broadcast and checks it on chain before writing. Procedure:
+[`docs/ops/HUP_REGISTRY_REDEPLOY_RUNBOOK.md`](../../docs/ops/HUP_REGISTRY_REDEPLOY_RUNBOOK.md).
+`scripts/ops/hup-provenance-update.py` then appends the same broadcast to
+`40204.provenance.json` (rows the book no longer pins become `superseded`), so the
+ledger and the book stay in step.
+
 ## Adding a new contract
 
 When a new ceremony script adds a contract to chain 40204:

@@ -201,10 +201,9 @@ impl AppleSecureEnclave {
             }
             "unseal" => {
                 // Simulate unsealing
-                if data.starts_with(b"SEALED:") {
-                    Ok(data[7..].to_vec())
-                } else {
-                    Err(anyhow!("Invalid sealed data"))
+                match data.strip_prefix(b"SEALED:") {
+                    Some(rest) => Ok(rest.to_vec()),
+                    None => Err(anyhow!("Invalid sealed data")),
                 }
             }
             "sign" => {
@@ -316,7 +315,7 @@ impl SecureEnclaveInterface for AppleSecureEnclave {
             .as_secs();
 
         // Reject attestations with future timestamps (60s clock tolerance)
-        if attestation.timestamp > now + 60 {
+        if attestation.timestamp > now.saturating_add(60) {
             warn!(
                 "Attestation rejected: timestamp in the future (ts={}, now={})",
                 attestation.timestamp, now
@@ -375,13 +374,16 @@ impl SecureEnclaveInterface for AppleSecureEnclave {
                 Ok(hasher.finalize().to_vec())
             }
             "encrypt" => {
-                if inputs.len() != 2 {
+                let [data, key] = inputs.as_slice() else {
                     return Err(anyhow!("Encrypt requires 2 inputs"));
+                };
+                if key.is_empty() {
+                    return Err(anyhow!("Encrypt requires a non-empty key"));
                 }
                 // Simulate encryption
-                let mut result = inputs[0].clone();
-                for (i, byte) in result.iter_mut().enumerate() {
-                    *byte ^= inputs[1][i % inputs[1].len()];
+                let mut result = data.clone();
+                for (byte, k) in result.iter_mut().zip(key.iter().cycle()) {
+                    *byte ^= *k;
                 }
                 Ok(result)
             }

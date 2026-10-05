@@ -1389,6 +1389,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-fl-replay"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "citrate-execution",
+ "hex",
+ "k256",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sha3 0.10.9",
+]
+
+[[package]]
+name = "citrate-fork"
+version = "0.4.0"
+dependencies = [
+ "citrate-consensus",
+ "citrate-execution",
+ "hex",
+ "primitive-types",
+ "reqwest",
+ "revm",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "citrate-hkdf-chain"
 version = "0.1.0"
 dependencies = [
@@ -5485,6 +5513,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes 1.11.1",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
