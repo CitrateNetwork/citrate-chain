@@ -28,7 +28,7 @@ genesis Arachnid factory `0x4e59…4956C` at `Salts.salt(<book name>)`:
 | Book name | Contract | Admin |
 |---|---|---|
 | `OrganizationSBT` | `src/cit_agent/OrganizationSBT.sol` | born owned by ADMIN |
-| `AgentSBT` | `src/cit_agent/AgentSBT.sol` (points at the OrganizationSBT above) | born owned by ADMIN |
+| `AgentSBT` | `src/cit_agent/AgentSBT.sol` (points at the OrganizationSBT above and at the book's `CitrateMemberSBT`) | born owned by ADMIN |
 | `CapsuleRegistry` | `src/cit_agent/CapsuleRegistry.sol` | born owned by ADMIN |
 | `AnchorRegistry` | `src/cit_agent/AnchorRegistry.sol` | none (append-anyone) |
 | `BenchmarkRegistry` | `src/cit_agent/BenchmarkRegistry.sol` | none (append-anyone) |
@@ -50,8 +50,14 @@ Properties the script and its tests (`test/cit_agent/DeployHupRegistries.t.sol`)
 - On chain id 40204 the admin must have code (a deployed multisig) and must not be
   the deployer.
 - A rerun skips any registry that already has code at its projection (idempotent).
-- After deploying, it reads back `owner()`, `AgentSBT.orgContract()`, and one view
-  per contract, and confirms `SkillRegistry` is the `abi.encode` version.
+- AgentSBT takes the membership SBT as a constructor argument (member-callable mint,
+  owner decision 2026-10-04): `HUP_MEMBER_SBT`, else the book's `CitrateMemberSBT`.
+  It must have code, and on 40204 it must equal the book's pin. Because it is part of
+  AgentSBT's init code, it moves AgentSBT's CREATE2 projection: run the core
+  membership ceremony (`DeployCoreMembership`) and book its `CitrateMemberSBT` first.
+- After deploying, it reads back `owner()`, `AgentSBT.orgContract()`,
+  `AgentSBT.memberSbt()`, and one view per contract, and confirms `SkillRegistry` is
+  the `abi.encode` version.
 
 ## 2. Contract versions in this redeploy
 
@@ -90,6 +96,8 @@ bytecode until the reroll replaces the chain.
 - [ ] The reroll has landed and the new genesis block-0 hash is recorded.
 - [ ] The main ceremony has run, and `contracts/addresses/40204.json` has been
       regenerated from it, with code at every ceremony-owned name in section 1.
+- [ ] The core membership ceremony has run and the book pins `CitrateMemberSBT`
+      with code on chain (AgentSBT is wired to it at construction).
 - [ ] **ADMIN decided (owner sign-off).** Placeholder: the cit-agent 2-of-3 timelock
       (`CitAgentTimelock`, the holder of these registries on today's chain), either
       redeployed by this script from `HUP_TIMELOCK_OWNER_{0,1,2}` or passed in as
@@ -110,7 +118,9 @@ scripts/ops/hup-redeploy-dryrun.sh --fresh   # empty chain, script-deployed time
 ```
 
 The fork run deploys with an impersonated sender, mints an org and an agent through
-the impersonated admin, registers a workspace capsule, anchors one root from two
+the impersonated admin, mints a membership SBT to a test member through the
+impersonated membership owner, sets the member org and mints an agent as that
+member (a non-member is refused), registers a workspace capsule, anchors one root from two
 committers, records a benchmark, registers a skill, checks each read-back, and runs
 the book tool against a temporary copy of the book. It must end with `dryrun: PASS`.
 
@@ -123,8 +133,10 @@ HUP_TIMELOCK_OWNER_0=0x<owner0> HUP_TIMELOCK_OWNER_1=0x<owner1> HUP_TIMELOCK_OWN
 forge script script/DeployHupRegistries.s.sol --rpc-url https://rpc.citrate.ai --sender 0x<deployer>
 ```
 
-(Or `HUP_REGISTRY_ADMIN=0x<multisig>` instead of the three owners.) Record the
-`BOOK PINS` block it prints.
+(Or `HUP_REGISTRY_ADMIN=0x<multisig>` instead of the three owners.) The member SBT
+defaults to the book's `CitrateMemberSBT`; `HUP_MEMBER_SBT=0x<CitrateMemberSBT>`
+overrides it, and on 40204 the two must agree. Record the `BOOK PINS` block it
+prints, including the `member SBT (read)` line.
 
 **Step 2. Broadcast** (operator only, operator-held key):
 
@@ -155,7 +167,9 @@ The tool refuses to write if any CREATE2 address does not re-derive from the sen
 init code, a deployed address differs from the script's projection, `--admin` is not
 the admin the script used, a receipt failed, an address has no code, an owner is not
 the admin, the admin has no code, `AgentSBT.orgContract()` is not the
-OrganizationSBT, two names share an address, or the chain id / genesis differ.
+OrganizationSBT, `AgentSBT.memberSbt()` is not the book's `CitrateMemberSBT` (or that
+has no code, or the book has none, or the script returned a different one), two
+names share an address, or the chain id / genesis differ.
 Writing always needs `--rpc` and `--genesis`; without them only `--check` runs.
 
 **Records at the old pins.** Before moving a pin, the tool reads the old contract's
@@ -178,9 +192,13 @@ scripts/sync-addresses.py --book ../citrate-chain/contracts/addresses/40204.json
 
 **Step 6. After deploy (owner decisions, not part of this script):**
 
-- Mint the parent organization and set the AgentSBT issuance path through the admin
-  timelock (propose, second approval, wait `minDelay`, execute). `mintAgent` is
-  admin-only today.
+- Mint the parent organization for member agents, then `AgentSBT.setMemberOrg(<org id>)`
+  through the admin timelock (propose, second approval, wait `minDelay`, execute).
+  Until it is set, `mintAgentAsMember` reverts `MemberOrgNotSet`. After it is set,
+  any holder of the membership SBT mints its own agents
+  (`mintAgentAsMember(bytes32 did, bytes32 pubkey_fingerprint)`), up to
+  `maxAgentsPerMember` (default 5, `setMaxAgentsPerMember` through the timelock; 0
+  pauses member minting). `mintAgent` stays admin-only for any org.
 - Keep the anchor key unfunded until the core app's anchor follow-ups tracked for
   HUP-S7.3 are settled.
 - Then flip the HUP features from "not deployed" to available by shipping the
@@ -196,6 +214,7 @@ scripts/sync-addresses.py --book ../citrate-chain/contracts/addresses/40204.json
       migration and `--retire-populated` was used).
 - [ ] `cast call <AgentSBT> 'owner()(address)'` equals the admin, and the same for
       OrganizationSBT and CapsuleRegistry.
+- [ ] `cast call <AgentSBT> 'memberSbt()(address)'` equals the book's `CitrateMemberSBT`.
 - [ ] `cast call <SkillRegistry> 'skillHashOf(address,string,string)(bytes32)' …`
       returns the `abi.encode` hash.
 
