@@ -116,7 +116,7 @@ impl SessionManager {
             }
         }
 
-        entry.0 += 1;
+        entry.0 = entry.0.saturating_add(1);
         if entry.0 >= self.max_failed_attempts {
             entry.1 = Some(Instant::now());
             return Err(WalletError::RateLimited(format!(
@@ -276,7 +276,7 @@ impl SessionManager {
                         // Lockout expired during the gap — reset counter.
                         continue;
                     }
-                    Some(now - Duration::from_secs(elapsed_secs))
+                    now.checked_sub(Duration::from_secs(elapsed_secs))
                 }
                 None => None,
             };

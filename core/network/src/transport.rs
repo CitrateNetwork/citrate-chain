@@ -67,7 +67,7 @@ fn inbound_accept_permitted(
                 *count = 1;
                 true
             } else if *count < MAX_INBOUND_ACCEPTS_PER_IP {
-                *count += 1;
+                *count = count.saturating_add(1);
                 true
             } else {
                 false
@@ -155,7 +155,7 @@ impl NetworkTransport {
     pub fn with_noise(mut self, keypair: NoiseKeypair) -> Self {
         info!(
             "Noise encryption enabled (pubkey={}...)",
-            &keypair.public_key_hex()[..16]
+            short_hex(&keypair.public_key_hex())
         );
         self.noise_keypair = Some(Arc::new(keypair));
         self
@@ -296,13 +296,13 @@ async fn handle_inbound(
             if !allowed_peers.contains(&remote_hex) {
                 warn!(
                     "PEER_WHITELIST_REJECTED inbound from {} (noise_key={}...)",
-                    addr, &remote_hex[..16]
+                    addr, remote_hex.get(..16).unwrap_or(&remote_hex)
                 );
                 return Err(NetworkError::ProtocolError(
                     "peer not in allowed_peers whitelist".into(),
                 ));
             }
-            debug!("Peer whitelist check passed for {}", &remote_hex[..16]);
+            debug!("Peer whitelist check passed for {}", remote_hex.get(..16).unwrap_or(&remote_hex));
         } else {
             warn!("Peer whitelist configured but Noise is disabled — rejecting {}", addr);
             return Err(NetworkError::ProtocolError(
@@ -541,7 +541,7 @@ async fn handle_inbound(
             window_start = std::time::Instant::now();
             msg_count = 0;
         }
-        msg_count += 1;
+        msg_count = msg_count.saturating_add(1);
         if msg_count > MAX_MSGS_PER_SEC {
             warn!("rate limit exceeded from {} — closing", addr);
             peer_manager.remove_peer_if_current(&remote_id, &peer).await;
@@ -620,7 +620,7 @@ async fn handle_outbound(
             if !allowed_peers.contains(&remote_hex) {
                 warn!(
                     "PEER_WHITELIST_REJECTED outbound to {} (noise_key={}...)",
-                    addr, &remote_hex[..16]
+                    addr, remote_hex.get(..16).unwrap_or(&remote_hex)
                 );
                 return Err(NetworkError::ProtocolError(
                     "peer not in allowed_peers whitelist".into(),
@@ -840,7 +840,7 @@ async fn handle_outbound(
                 window_start = std::time::Instant::now();
                 msg_count = 0;
             }
-            msg_count += 1;
+            msg_count = msg_count.saturating_add(1);
             if msg_count > MAX_MSGS_PER_SEC {
                 warn!("rate limit exceeded from {} — closing", addr);
                 peer_manager.remove_peer_if_current(&remote_id, &peer).await;
@@ -890,3 +890,8 @@ async fn handle_outbound(
 }
 
 // helper functions removed in favor of split-based loops
+
+/// First 16 hex chars of a key, for logs.
+fn short_hex(hex: &str) -> String {
+    hex.get(..16).unwrap_or(hex).to_string()
+}

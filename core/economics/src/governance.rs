@@ -34,8 +34,8 @@ pub struct GovernanceConfig {
 impl Default for GovernanceConfig {
     fn default() -> Self {
         Self {
-            proposal_threshold: U256::from(10_000) * U256::from(10).pow(U256::from(18)), // 10,000 SALT
-            vote_threshold: U256::from(1) * U256::from(10).pow(U256::from(18)), // 1 SALT
+            proposal_threshold: crate::salt(10_000), // 10,000 SALT
+            vote_threshold: crate::salt(1), // 1 SALT
             voting_period: 50_400, // ~7 days at 2s blocks
             execution_delay: 7_200, // ~1 day delay
             quorum_percentage: 10, // 10% of total supply must vote
@@ -174,10 +174,10 @@ impl GovernanceManager {
         }
 
         let proposal_id = self.next_proposal_id;
-        self.next_proposal_id += 1;
+        self.next_proposal_id = self.next_proposal_id.saturating_add(1);
 
-        let voting_starts = current_block + 1; // Starts next block
-        let voting_ends = voting_starts + self.config.voting_period;
+        let voting_starts = current_block.saturating_add(1); // Starts next block
+        let voting_ends = voting_starts.saturating_add(self.config.voting_period);
 
         let proposal = Proposal {
             id: proposal_id,
@@ -252,9 +252,9 @@ impl GovernanceManager {
 
         // Update vote counts
         match support {
-            VoteType::For => proposal.for_votes += voting_power,
-            VoteType::Against => proposal.against_votes += voting_power,
-            VoteType::Abstain => proposal.abstain_votes += voting_power,
+            VoteType::For => proposal.for_votes = proposal.for_votes.saturating_add(voting_power),
+            VoteType::Against => proposal.against_votes = proposal.against_votes.saturating_add(voting_power),
+            VoteType::Abstain => proposal.abstain_votes = proposal.abstain_votes.saturating_add(voting_power),
         }
 
         proposal.voters.insert(voter, vote);
@@ -294,13 +294,13 @@ impl GovernanceManager {
                 }
                 ProposalStatus::Active if current_block > proposal.voting_ends => {
                     // Check if proposal passed
-                    let total_votes = proposal.for_votes + proposal.against_votes + proposal.abstain_votes;
-                    let quorum_required = total_supply * U256::from(self.config.quorum_percentage) / U256::from(100);
-                    let approval_required = total_votes * U256::from(self.config.approval_threshold) / U256::from(100);
+                    let total_votes = proposal.for_votes.saturating_add(proposal.against_votes).saturating_add(proposal.abstain_votes);
+                    let quorum_required = crate::mul_div(total_supply, U256::from(self.config.quorum_percentage), U256::from(100));
+                    let approval_required = crate::mul_div(total_votes, U256::from(self.config.approval_threshold), U256::from(100));
 
                     if total_votes >= quorum_required && proposal.for_votes >= approval_required {
                         proposal.status = ProposalStatus::Succeeded;
-                        proposal.execution_eta = Some(current_block + self.config.execution_delay);
+                        proposal.execution_eta = Some(current_block.saturating_add(self.config.execution_delay));
                         updates.push(ProposalUpdate::Passed(proposal.id));
                     } else {
                         proposal.status = ProposalStatus::Failed;
@@ -311,7 +311,7 @@ impl GovernanceManager {
                     proposal.status = ProposalStatus::Queued;
                     updates.push(ProposalUpdate::ReadyForExecution(proposal.id));
                 }
-                ProposalStatus::Queued if proposal.execution_eta.is_some_and(|eta| current_block > eta + self.config.grace_period) => {
+                ProposalStatus::Queued if proposal.execution_eta.is_some_and(|eta| current_block > eta.saturating_add(self.config.grace_period)) => {
                     proposal.status = ProposalStatus::Expired;
                     updates.push(ProposalUpdate::Expired(proposal.id));
                 }
@@ -344,7 +344,7 @@ impl GovernanceManager {
 
         // Base voting power (token balance at snapshot)
         // In a real implementation, this would query the token balance at specific block
-        let base_power = total_supply / U256::from(1000); // Placeholder
+        let base_power = total_supply.checked_div(U256::from(1000)).unwrap_or_default(); // Placeholder
 
         // Add delegated power
         let delegated_power = self.delegations.get(&address)
@@ -352,11 +352,11 @@ impl GovernanceManager {
                 delegations.iter()
                     .filter(|d| d.valid_from <= block_height)
                     .map(|d| d.delegated_amount)
-                    .fold(U256::zero(), |acc, amount| acc + amount)
+                    .fold(U256::zero(), |acc, amount| acc.saturating_add(amount))
             })
             .unwrap_or(U256::zero());
 
-        let total_power = base_power + delegated_power;
+        let total_power = base_power.saturating_add(delegated_power);
         self.voting_power_cache.insert((address, block_height), total_power);
 
         Ok(total_power)
@@ -452,7 +452,7 @@ mod tests {
 
         let proposer = Address([1; 20]);
         let voter = Address([2; 20]);
-        let total_supply = U256::from(1_000_000_000) * U256::from(10).pow(U256::from(18));
+        let total_supply = crate::salt(1_000_000_000);
 
         // Create proposal
         let proposal_id = gov.create_proposal(
@@ -480,7 +480,7 @@ mod tests {
         let config = GovernanceConfig::default();
         let mut gov = GovernanceManager::new(config);
         let voter = Address([2; 20]);
-        let total_supply = U256::from(1_000_000_000) * U256::from(10).pow(U256::from(18));
+        let total_supply = crate::salt(1_000_000_000);
 
         let result = gov.vote(999, voter, VoteType::For, 102, total_supply);
         assert!(result.is_err());
@@ -557,7 +557,7 @@ mod tests {
         let mut gov = GovernanceManager::new(config.clone());
         let proposer = Address([1; 20]);
         let voter = Address([2; 20]);
-        let total_supply = U256::from(1_000_000_000) * U256::from(10).pow(U256::from(18));
+        let total_supply = crate::salt(1_000_000_000);
 
         let proposal_id = gov.create_proposal(
             proposer,

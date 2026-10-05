@@ -6,6 +6,20 @@
 //! This crate imports chain types (PublicKey, Hash, Transaction) from citrate-consensus
 //! and citrate-execution as READ-ONLY dependencies. It does NOT modify chain crates.
 
+// PANIC-S1 G2: production code in this crate may not panic (tests excepted).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 pub mod address;
 pub mod error;
 pub mod format;

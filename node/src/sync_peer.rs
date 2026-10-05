@@ -111,6 +111,20 @@
 // count below that threshold forever and silently disable that recovery — the
 // same class of bug as the dead band, just relocated.
 
+// PANIC-S1 G2: block production / apply / sync path (T1); panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use std::collections::HashMap;
 
 /// How far above our applied tip a gossiped block may be and still trigger
@@ -404,7 +418,7 @@ impl SyncPeerSelector {
             }
         };
         let e = self.score.entry(id.to_string()).or_insert(0);
-        *e = (*e + delta).clamp(SCORE_MIN, SCORE_MAX);
+        *e = e.saturating_add(delta).clamp(SCORE_MIN, SCORE_MAX);
 
         if new_blocks > 0 {
             let w = self.served.entry(id.to_string()).or_insert(0);

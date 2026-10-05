@@ -140,7 +140,13 @@ pub fn init_pba_hardening_height(config_value: Option<u64>) -> Result<Option<u64
 ///
 /// OWNER STEP (release PR): replace `None` with `Some(H)` for 40204, where H is
 /// the height agreed for the fleet.
-pub const PINNED_ACTIVATIONS: &[(u64, Option<u64>)] = &[(40204, Some(247_436))];
+///
+/// 40204 is `Some(0)`: the rules are active from the first block after genesis
+/// of the chain this release starts (the PANIC-S1 reroll). A reroll resets the
+/// height but not this table, so every reroll must re-check it. This release
+/// must never run on a data directory from the previous 40204 genesis: it
+/// would re-judge that chain's history from block 1 and fork off.
+pub const PINNED_ACTIVATIONS: &[(u64, Option<u64>)] = &[(40204, Some(0))];
 
 /// The activation height this release pins for `chain_id`, if any.
 pub fn pinned_activation(chain_id: u64) -> Option<u64> {
@@ -179,6 +185,14 @@ pub const RELEASE_GENESIS: &[(u64, [u8; 32])] = &[
     ),
 ];
 
+// INVARIANT: compile-time only. Every call is inside a `const` item, so a bad
+// literal is a BUILD error, never a runtime panic. Pinned by the build itself and
+// by the release-genesis constants test in this module.
+#[allow(
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
 const fn hex32(s: &str) -> [u8; 32] {
     const fn nib(c: u8) -> u8 {
         match c {
@@ -283,7 +297,10 @@ impl ResolvedActivation {
             self.chain_id
         );
         let d = Sha3_256::digest(pre.as_bytes());
-        format!("0x{}", hex::encode(&d[..16]))
+        format!(
+            "0x{}",
+            d.first_chunk::<16>().map(hex::encode).unwrap_or_default()
+        )
     }
 }
 
@@ -671,6 +688,24 @@ mod tests {
         assert_eq!(pinned_activation(1), None);
         assert_eq!(pinned_activation(1337), None);
         assert!(PINNED_ACTIVATIONS.iter().any(|(id, _)| *id == 40204));
+    }
+
+    /// The reroll starts 40204 with the hardening on: every block after genesis
+    /// is judged by the hardened rules, and genesis itself never is.
+    #[test]
+    fn chain_40204_hardening_active_from_genesis() {
+        assert_eq!(pinned_activation(40204), Some(0));
+        let (height, source) = resolve_activation(pinned_activation(40204), None, None, false)
+            .expect("pinned chain resolves");
+        assert_eq!((height, source), (Some(0), ActivationSource::ReleasePin));
+        let h = PbaHardening::at(0);
+        assert!(!h.active_at(0), "genesis is never re-judged");
+        assert!(h.active_at(1));
+        assert!(h.active_at(u64::MAX));
+        // A host value that disagrees with the pin still refuses to start.
+        assert!(resolve_activation(Some(0), Some("247436"), None, false).is_err());
+        assert!(resolve_activation(Some(0), Some("off"), None, false).is_err());
+        assert!(resolve_activation(Some(0), None, Some(247_436), false).is_err());
     }
 
     #[test]

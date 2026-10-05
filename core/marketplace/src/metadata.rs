@@ -224,14 +224,14 @@ impl MetadataCache {
 
         // Enforce max cache size
         if self.cache.len() > self.max_cache_size {
-            let excess = self.cache.len() - self.max_cache_size;
-            let mut removed = 0;
+            let excess = self.cache.len().saturating_sub(self.max_cache_size);
+            let mut removed = 0usize;
 
             // Remove oldest entries (this is not perfect LRU but good enough)
             let mut to_remove = Vec::new();
             for entry in self.cache.iter() {
                 to_remove.push(entry.key().clone());
-                removed += 1;
+                removed = removed.saturating_add(1);
                 if removed >= excess {
                     break;
                 }

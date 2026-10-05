@@ -328,13 +328,6 @@ pub struct MiningConfig {
 /// `devnet-config.toml`, the Docker devnet). Never a release network's id.
 pub const DEV_CHAIN_ID: u64 = 1337;
 
-/// Parse a hardcoded socket address literal. Infallible for valid literals;
-/// uses `unreachable!` instead of `unwrap`/`expect` for the zero-panic vanity goal.
-fn hardcoded_addr(s: &str) -> SocketAddr {
-    s.parse()
-        .unwrap_or_else(|_| unreachable!("BUG: invalid hardcoded address literal: {}", s))
-}
-
 impl Default for NodeConfig {
     fn default() -> Self {
         // Check for chain ID from environment variable, default to 40204
@@ -354,15 +347,15 @@ impl Default for NodeConfig {
                 dev_profile: false,
             },
             network: NetworkConfig {
-                listen_addr: hardcoded_addr("127.0.0.1:30303"),
+                listen_addr: SocketAddr::from(([127, 0, 0, 1], 30303)),
                 bootstrap_nodes: vec![],
                 max_peers: 50,
                 allowed_peers: vec![],
             },
             rpc: RpcConfig {
                 enabled: true,
-                listen_addr: hardcoded_addr("127.0.0.1:8545"),
-                ws_addr: hardcoded_addr("127.0.0.1:8546"),
+                listen_addr: SocketAddr::from(([127, 0, 0, 1], 8545)),
+                ws_addr: SocketAddr::from(([127, 0, 0, 1], 8546)),
                 allow_eth_send_transaction: false, // Secure default
                 api_key: None,
                 cors_origins: vec![], // Secure default: no CORS headers
@@ -426,7 +419,7 @@ impl NodeConfig {
         // WP-X.1: Permissive CORS in devnet
         config.rpc.cors_origins = vec!["*".to_string()];
         // Bind RPC to all interfaces so Tailscale/LAN peers can reach it
-        config.rpc.listen_addr = hardcoded_addr("0.0.0.0:8545");
+        config.rpc.listen_addr = SocketAddr::from(([0, 0, 0, 0], 8545));
         // WP-W.2: Permissive VRF in devnet (no strict verification)
         config.vrf.strict_vrf = false;
         config

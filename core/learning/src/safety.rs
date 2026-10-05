@@ -133,13 +133,13 @@ impl SafetyGuard {
         let restored = remove_lora(&modified, base, adapter)?;
 
         let tolerance = 1e-5;
-        for i in 0..base.dim() {
-            let diff = (restored.data[i] - base.data[i]).abs();
+        for (i, (&r, &b)) in restored.data.iter().zip(&base.data).enumerate() {
+            let diff = (r - b).abs();
             if diff > tolerance {
                 return Err(LearningError::SafetyViolation {
                     details: format!(
                         "adapter apply+remove not identity at dim {}: base={}, restored={}, diff={}",
-                        i, base.data[i], restored.data[i], diff
+                        i, b, r, diff
                     ),
                 });
             }

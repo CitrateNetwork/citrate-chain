@@ -73,7 +73,7 @@ impl ByzantineDetector {
             });
         }
 
-        let dim = embeddings[0].dim();
+        let dim = embeddings.first().map_or(0, |e| e.dim());
         let mut sum = EmbeddingVector::zeros(dim);
         for e in embeddings {
             sum = sum.add(e)?;
@@ -173,7 +173,7 @@ impl ByzantineDetector {
             .iter()
             .map(|d| (d - mean_dist) * (d - mean_dist))
             .sum::<f32>()
-            / (distances.len() - 1) as f32;
+            / distances.len().saturating_sub(1) as f32;
 
         Ok(variance.sqrt())
     }
@@ -311,7 +311,10 @@ mod tests {
         let reasons = detector
             .check_and_flag(pk, 1, &normal, &mean, 1.0, &partial_both)
             .unwrap();
-        assert!(reasons.is_empty(), "25% Both below 50% threshold should not flag");
+        assert!(
+            reasons.is_empty(),
+            "25% Both below 50% threshold should not flag"
+        );
     }
 
     #[test]
@@ -342,7 +345,12 @@ mod tests {
 
         // Valid adapter passes verification
         let adapter = AdapterFactory::create_lora(
-            &embedding, 2, metadata.clone(), [1u8; 32], 100, vec![0u8; 64],
+            &embedding,
+            2,
+            metadata.clone(),
+            [1u8; 32],
+            100,
+            vec![0u8; 64],
         )
         .unwrap();
         assert!(detector.verify_adapter_provenance(&adapter).is_ok());

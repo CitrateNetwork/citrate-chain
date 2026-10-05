@@ -25,7 +25,7 @@ fn require_canonical_list(
     let info = rlp
         .payload_info()
         .map_err(|e| format!("{what}: bad RLP header: {e:?}"))?;
-    if info.header_len + info.value_len != whole.len() {
+    if info.header_len.checked_add(info.value_len) != Some(whole.len()) {
         return Err(format!("{what}: trailing bytes after the RLP list"));
     }
     Ok(())
@@ -41,8 +41,11 @@ fn canonical_sig_word(bytes: &[u8], what: &str) -> Result<H256, String> {
     if bytes.first() == Some(&0) {
         return Err(format!("{what}: signature value has a leading zero byte"));
     }
+    // bytes.len() <= 32 (checked above): left-pad to a 32-byte word.
     let mut padded = [0u8; 32];
-    padded[32 - bytes.len()..].copy_from_slice(bytes);
+    if let Some(dst) = padded.get_mut(32usize.saturating_sub(bytes.len())..) {
+        dst.copy_from_slice(bytes);
+    }
     Ok(H256::from(padded))
 }
 
@@ -118,7 +121,7 @@ pub fn decode_eth_transaction(tx_bytes: &[u8]) -> Result<Transaction, String> {
 
 fn decode_eth_transaction_inner(tx_bytes: &[u8]) -> Result<Transaction, String> {
     debug!("Decoding {} bytes of transaction data", tx_bytes.len());
-    debug!("First 20 bytes: {:?}", &tx_bytes[..tx_bytes.len().min(20)]);
+    debug!("First 20 bytes: {:?}", tx_bytes.get(..20).unwrap_or(tx_bytes));
 
     // Check if this might be an Ethereum transaction (starts with certain patterns)
     if tx_bytes.is_empty() {
@@ -137,11 +140,10 @@ fn decode_eth_transaction_inner(tx_bytes: &[u8]) -> Result<Transaction, String> 
     // Handle typed transactions (EIP-2718). 0x02 = EIP-1559, 0x01 = EIP-2930
     // Try these BEFORE bincode to prevent RLP bytes from accidentally
     // passing bincode::deserialize (which would bypass chain ID validation).
-    if tx_bytes[0] == 0x02 {
-        return decode_eip1559_transaction(&tx_bytes[1..]);
-    }
-    if tx_bytes[0] == 0x01 {
-        return decode_eip2930_transaction(&tx_bytes[1..]);
+    match tx_bytes.split_first() {
+        Some((0x02, rest)) => return decode_eip1559_transaction(rest),
+        Some((0x01, rest)) => return decode_eip2930_transaction(rest),
+        _ => {}
     }
 
     // Try to decode as legacy RLP (before bincode, same reason)
@@ -165,8 +167,10 @@ fn decode_eth_transaction_inner(tx_bytes: &[u8]) -> Result<Transaction, String> 
                 // Pre-EIP-155: v = 27 + {0,1}
                 let (recovery_id, chain_id_opt) = if legacy_tx.v >= 35 {
                     // EIP-155 transaction
-                    let chain_id = (legacy_tx.v - 35) / 2;
-                    let recovery_id = ((legacy_tx.v - 35) % 2) as i32;
+                    // v >= 35 here: v - 35 = 2 * chain_id + recovery_id.
+                    let base = legacy_tx.v.saturating_sub(35);
+                    let chain_id = base >> 1;
+                    let recovery_id = (base & 1) as i32;
                     debug!(
                         "  EIP-155 transaction: chain_id={}, recovery_id={}",
                         chain_id, recovery_id
@@ -174,7 +178,7 @@ fn decode_eth_transaction_inner(tx_bytes: &[u8]) -> Result<Transaction, String> 
                     (recovery_id, Some(chain_id))
                 } else if legacy_tx.v == 27 || legacy_tx.v == 28 {
                     // Pre-EIP-155 transaction
-                    let recovery_id = (legacy_tx.v - 27) as i32;
+                    let recovery_id = legacy_tx.v.saturating_sub(27) as i32;
                     debug!("  Pre-EIP-155 transaction: recovery_id={}", recovery_id);
                     (recovery_id, None)
                 } else {
@@ -259,11 +263,11 @@ fn decode_eth_transaction_inner(tx_bytes: &[u8]) -> Result<Transaction, String> 
                 // Hash the public key (excluding the 0x04 prefix)
                 let mut hasher = Keccak256::new();
                 hasher.update(&uncompressed[1..]);
-                let hash = hasher.finalize();
+                let hash: [u8; 32] = hasher.finalize().into();
 
-                // Take the last 20 bytes as the address
-                let mut addr_bytes = [0u8; 20];
-                addr_bytes.copy_from_slice(&hash[12..]);
+                // The address is the last 20 bytes of the hash.
+
+                let [_, _, _, _, _, _, _, _, _, _, _, _, addr_bytes @ ..] = hash;
                 let from_addr = H160::from_slice(&addr_bytes);
                 debug!(
                     "  Recovered address: 0x{}",
@@ -463,9 +467,9 @@ fn decode_eip1559_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
         let uncompressed = pubkey.serialize_uncompressed();
         let mut hasher = Keccak256::new();
         hasher.update(&uncompressed[1..]);
-        let h = hasher.finalize();
-        let mut a = [0u8; 20];
-        a.copy_from_slice(&h[12..]);
+        let h: [u8; 32] = hasher.finalize().into();
+        // The address is the last 20 bytes of the hash.
+        let [_, _, _, _, _, _, _, _, _, _, _, _, a @ ..] = h;
         H160::from_slice(&a)
     };
 
@@ -733,9 +737,9 @@ fn decode_eip2930_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
         let uncompressed = pubkey.serialize_uncompressed();
         let mut hasher = Keccak256::new();
         hasher.update(&uncompressed[1..]);
-        let h = hasher.finalize();
-        let mut a = [0u8; 20];
-        a.copy_from_slice(&h[12..]);
+        let h: [u8; 32] = hasher.finalize().into();
+        // The address is the last 20 bytes of the hash.
+        let [_, _, _, _, _, _, _, _, _, _, _, _, a @ ..] = h;
         H160::from_slice(&a)
     };
 

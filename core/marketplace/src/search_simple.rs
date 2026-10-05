@@ -214,7 +214,7 @@ impl SearchEngine {
         let start = query.offset.min(results.len());
         let end = start.saturating_add(query.limit).min(results.len());
 
-        Ok(results[start..end].to_vec())
+        Ok(results.get(start..end).unwrap_or_default().to_vec())
     }
 
     /// Get trending models (most interacted with)
@@ -390,10 +390,10 @@ impl SearchEngine {
                     i = text.len();
                 }
                 while i < text.len() && !text.is_char_boundary(i) {
-                    i += 1;
+                    i = i.saturating_add(1);
                 }
                 while i > 0 && !text.is_char_boundary(i) {
-                    i -= 1;
+                    i = i.saturating_sub(1);
                 }
                 i
             };
@@ -401,7 +401,7 @@ impl SearchEngine {
             let start = clamp_boundary(pos.saturating_sub(50));
             let end = clamp_boundary(pos.saturating_add(query.len()).saturating_add(50).min(text.len()));
 
-            let mut snippet = text[start..end].to_string();
+            let mut snippet = text.get(start..end).unwrap_or_default().to_string();
             if start > 0 {
                 snippet = format!("...{}", snippet);
             }

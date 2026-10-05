@@ -215,7 +215,7 @@ impl DerivedKey {
         if now > self.expires_at {
             Some(0)
         } else {
-            Some(self.expires_at - now)
+            Some(self.expires_at.saturating_sub(now))
         }
     }
 }
@@ -262,7 +262,7 @@ impl MasterKeyDerivation {
             .unwrap_or_default()
             .as_secs();
 
-        let expires_at = now + KeyPurpose::MasterKEK.rotation_interval();
+        let expires_at = now.saturating_add(KeyPurpose::MasterKEK.rotation_interval());
 
         // Compute commitment
         let commitment = self.compute_commitment(&key, KeyPurpose::MasterKEK);
@@ -301,14 +301,16 @@ impl MasterKeyDerivation {
         let digest = hasher.finalize();
         // CRY-H1: Zeroizing wipes this intermediate secret on scope exit.
         let mut key = zeroize::Zeroizing::new([0u8; 32]);
-        key.copy_from_slice(&digest[..32]);
+        if let Some(head) = digest.first_chunk::<32>() {
+            key.copy_from_slice(head);
+        }
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        let expires_at = now + purpose.rotation_interval();
+        let expires_at = now.saturating_add(purpose.rotation_interval());
         let commitment = self.compute_commitment(&key, purpose);
 
         Ok(DerivedKey {

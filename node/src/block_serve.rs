@@ -16,6 +16,20 @@
 //!    (`MAX_FRAME_LEN` in citrate-network), so we never spend CPU building
 //!    a response the framing layer is guaranteed to reject.
 
+// PANIC-S1 G2: block production / apply / sync path (T1); panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use citrate_consensus::types::{Block, BlockHeader, Hash};
 use citrate_storage::StorageManager;
 use tracing::warn;
@@ -117,7 +131,7 @@ fn collect_bounded<T: serde::Serialize>(
         let item = map(block);
         match bincode::serialized_size(&item) {
             Ok(size) if size <= budget => {
-                budget -= size;
+                budget = budget.saturating_sub(size);
                 out.push(item);
             }
             // Over budget (or unsizeable): the response is full.
@@ -218,8 +232,7 @@ pub fn serve_blocks(storage: &StorageManager, from: &Hash, count: u32) -> Vec<Bl
     // Has any height-group ABOVE the anchor been emitted yet? The forward-
     // progress guarantee keys on this (see SYNC-S2 in the fn docs).
     let mut progressed = false;
-    while i < rows.len() {
-        let h = rows[i].0;
+    while let Some(&(h, _)) = rows.get(i) {
         // Heights must be contiguous from `start`: a gap means nothing further
         // is admissible in order, so stop rather than serve a disconnected tail.
         if h != expected {
@@ -229,9 +242,11 @@ pub fn serve_blocks(storage: &StorageManager, from: &Hash, count: u32) -> Vec<Bl
         let mut group: Vec<Block> = Vec::new();
         let mut group_bytes = 0u64;
         let mut unreadable = false;
-        while i < rows.len() && rows[i].0 == h {
-            let hash = rows[i].1;
-            i += 1;
+        while let Some(&(row_h, hash)) = rows.get(i) {
+            if row_h != h {
+                break;
+            }
+            i = i.saturating_add(1);
             // The anchor's own block IS included. It is tempting to strip it —
             // "they anchored on it, so they have it" — but that assumption is
             // false for the SYNC-S3 recovery request, which anchors at a MISSING
@@ -265,7 +280,8 @@ pub fn serve_blocks(storage: &StorageManager, from: &Hash, count: u32) -> Vec<Bl
             let first_progress = h > start && !progressed;
             if !first_progress
                 && !out.is_empty()
-                && ((out.len() + group.len()) as u32 > max_items || group_bytes > budget)
+                && (out.len().saturating_add(group.len()) as u32 > max_items
+                    || group_bytes > budget)
             {
                 break;
             }

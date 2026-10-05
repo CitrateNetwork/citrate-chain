@@ -56,6 +56,20 @@
 // with a new format — not a v2 of this one. This avoids the v1/v2
 // branching that compounds across every dispatcher.
 
+// PANIC-S1 G2: precompile reachable from the REVM bridge; panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use thiserror::Error;
 
 /// Hard caps for the format. These are the absolute upper bounds at
@@ -150,12 +164,15 @@ impl TensorView<'_> {
     /// Total element count. Always ≤ `MAX_ELEMENTS` because `decode`
     /// validates this.
     pub fn element_count(&self) -> usize {
-        self.shape.iter().fold(1usize, |acc, &dim| acc * dim as usize)
+        // `decode` bounds this by MAX_ELEMENTS; a hand-built view saturates.
+        self.shape
+            .iter()
+            .fold(1usize, |acc, &dim| acc.saturating_mul(dim as usize))
     }
 
     /// Total data bytes = element_count × dtype.byte_size.
     pub fn data_byte_count(&self) -> usize {
-        self.element_count() * self.dtype.byte_size()
+        self.element_count().saturating_mul(self.dtype.byte_size())
     }
 }
 
@@ -188,7 +205,9 @@ pub enum TensorFormatError {
     #[error("trailing bytes: input had {extra} bytes beyond the encoded tensor")]
     TrailingBytes { extra: usize },
 
-    #[error("data length {got} does not match expected {expected} (element_count × dtype.byte_size)")]
+    #[error(
+        "data length {got} does not match expected {expected} (element_count × dtype.byte_size)"
+    )]
     DataLengthMismatch { expected: usize, got: usize },
 }
 
@@ -196,32 +215,42 @@ pub enum TensorFormatError {
 /// decoded view AND the number of bytes consumed (so callers can decode
 /// concatenated tensors — e.g. matmul takes two).
 pub fn decode_one<'a>(input: &'a [u8]) -> Result<(TensorView<'a>, usize), TensorFormatError> {
-    if input.is_empty() {
-        return Err(TensorFormatError::Truncated { expected: 1, got: 0 });
-    }
-    let rank = input[0] as usize;
+    let Some((&rank_byte, after_rank)) = input.split_first() else {
+        return Err(TensorFormatError::Truncated {
+            expected: 1,
+            got: 0,
+        });
+    };
+    let rank = rank_byte as usize;
     if rank > MAX_RANK {
-        return Err(TensorFormatError::RankTooLarge(input[0]));
+        return Err(TensorFormatError::RankTooLarge(rank_byte));
     }
 
-    // Header bytes: 1 (rank) + rank × 4 (shape) + 1 (dtype)
-    let header_len = 1 + rank * 4 + 1;
-    if input.len() < header_len {
+    // Header bytes: 1 (rank) + rank × 4 (shape) + 1 (dtype). rank <= MAX_RANK.
+    let shape_len = rank.saturating_mul(4);
+    let header_len = shape_len.saturating_add(2);
+    let (Some(shape_bytes), Some(&dtype_byte)) =
+        (after_rank.get(..shape_len), after_rank.get(shape_len))
+    else {
         return Err(TensorFormatError::Truncated {
             expected: header_len,
             got: input.len(),
         });
-    }
+    };
 
     // Shape: rank × u32 BE.
     let mut shape = Vec::with_capacity(rank);
     let mut element_count: usize = 1;
-    for axis in 0..rank {
-        let off = 1 + axis * 4;
-        let dim_bytes: [u8; 4] = input[off..off + 4]
-            .try_into()
-            .expect("4 bytes by construction");
-        let dim = u32::from_be_bytes(dim_bytes);
+    for (axis, dim_bytes) in shape_bytes.chunks_exact(4).enumerate() {
+        let dim =
+            u32::from_be_bytes(
+                dim_bytes
+                    .try_into()
+                    .map_err(|_| TensorFormatError::Truncated {
+                        expected: header_len,
+                        got: input.len(),
+                    })?,
+            );
         if dim == 0 {
             return Err(TensorFormatError::ZeroDimension { axis });
         }
@@ -234,8 +263,7 @@ pub fn decode_one<'a>(input: &'a [u8]) -> Result<(TensorView<'a>, usize), Tensor
         }
     }
 
-    let dtype_off = 1 + rank * 4;
-    let dtype = Dtype::from_byte(input[dtype_off])?;
+    let dtype = Dtype::from_byte(dtype_byte)?;
 
     let data_byte_count = element_count
         .checked_mul(dtype.byte_size())
@@ -250,18 +278,14 @@ pub fn decode_one<'a>(input: &'a [u8]) -> Result<(TensorView<'a>, usize), Tensor
     let data_end = data_start
         .checked_add(data_byte_count)
         .ok_or(TensorFormatError::ElementCountOverflow)?;
-    if input.len() < data_end {
+    let Some(data) = input.get(data_start..data_end) else {
         return Err(TensorFormatError::Truncated {
             expected: data_end,
             got: input.len(),
         });
-    }
-
-    let view = TensorView {
-        shape,
-        dtype,
-        data: &input[data_start..data_end],
     };
+
+    let view = TensorView { shape, dtype, data };
 
     Ok((view, data_end))
 }
@@ -274,7 +298,7 @@ pub fn decode_exact(input: &[u8]) -> Result<TensorView<'_>, TensorFormatError> {
     let (view, consumed) = decode_one(input)?;
     if consumed != input.len() {
         return Err(TensorFormatError::TrailingBytes {
-            extra: input.len() - consumed,
+            extra: input.len().saturating_sub(consumed),
         });
     }
     Ok(view)
@@ -312,7 +336,14 @@ pub fn encode(shape: &[u32], dtype: Dtype, data: &[u8]) -> Result<Vec<u8>, Tenso
         });
     }
 
-    let mut out = Vec::with_capacity(1 + shape.len() * 4 + 1 + data.len());
+    // Capacity hint only: shape.len() <= MAX_RANK and data.len() <= MAX_DATA_BYTES.
+    let mut out = Vec::with_capacity(
+        shape
+            .len()
+            .saturating_mul(4)
+            .saturating_add(2)
+            .saturating_add(data.len()),
+    );
     out.push(shape.len() as u8);
     for &dim in shape {
         out.extend_from_slice(&dim.to_be_bytes());
@@ -517,7 +548,13 @@ mod tests {
         // shape=[2,3] = 6 elements; q16 expects 48 bytes but we pass 8.
         let bad = vec![0u8; 8];
         let err = encode(&[2, 3], Dtype::Q16_16, &bad).unwrap_err();
-        assert!(matches!(err, TensorFormatError::DataLengthMismatch { expected: 48, got: 8 }));
+        assert!(matches!(
+            err,
+            TensorFormatError::DataLengthMismatch {
+                expected: 48,
+                got: 8
+            }
+        ));
     }
 
     // ----- Property-based: roundtrip ALWAYS holds. -----

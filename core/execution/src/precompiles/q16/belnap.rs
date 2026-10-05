@@ -57,6 +57,19 @@
 //   - All arithmetic uses Q16 (i32/i64 only). No floats. No platform
 //     intrinsics. Verified by tripwire `check_belnap_no_float.py`.
 
+// PANIC-S1 G2: precompile reachable from the REVM bridge; panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
 #![allow(dead_code)] // some helpers used only by tests until WP-1.5
 
 use super::Q16;
@@ -146,7 +159,9 @@ impl std::fmt::Display for BelnapError {
             BelnapError::NZero => write!(f, "n must be > 0"),
             BelnapError::DimTooLarge => write!(f, "dim exceeds cap of {MAX_DIM}"),
             BelnapError::NTooLarge => write!(f, "n exceeds cap of {MAX_N}"),
-            BelnapError::LengthMismatch => write!(f, "input length does not match declared (dim, n)"),
+            BelnapError::LengthMismatch => {
+                write!(f, "input length does not match declared (dim, n)")
+            }
         }
     }
 }
@@ -179,8 +194,10 @@ pub fn decode(input: &[u8]) -> Result<BelnapInput, BelnapError> {
         return Err(BelnapError::InputTooShort);
     }
 
-    let dim = u32::from_be_bytes(input[0..4].try_into().expect("4 bytes")) as usize;
-    let n = u32::from_be_bytes(input[4..8].try_into().expect("4 bytes")) as usize;
+    let (Some(dim), Some(n)) = (be_u32_at(input, 0), be_u32_at(input, 4)) else {
+        return Err(BelnapError::InputTooShort);
+    };
+    let (dim, n) = (dim as usize, n as usize);
 
     if dim == 0 {
         return Err(BelnapError::DimZero);
@@ -203,7 +220,9 @@ pub fn decode(input: &[u8]) -> Result<BelnapInput, BelnapError> {
         .and_then(|nd| nd.checked_mul(16)) // embeddings + confidences = 2 * 8 bytes
         .and_then(|nd16| nd16.checked_add(n.checked_mul(8)?)) // + weights
         .ok_or(BelnapError::LengthMismatch)?;
-    let expected_total = HEADER_LEN.checked_add(body_len).ok_or(BelnapError::LengthMismatch)?;
+    let expected_total = HEADER_LEN
+        .checked_add(body_len)
+        .ok_or(BelnapError::LengthMismatch)?;
 
     if input.len() != expected_total {
         return Err(BelnapError::LengthMismatch);
@@ -221,22 +240,15 @@ pub fn decode(input: &[u8]) -> Result<BelnapInput, BelnapError> {
     // HEADER_LEN = 24 (dim+n+two thresholds). Recompute body_len:
 
     // Section 1: embeddings (n*dim*i64)
-    let emb_bytes = n * dim * 8;
-    let embeddings = decode_q16_slice(&input[cursor..cursor + emb_bytes])
-        .ok_or(BelnapError::LengthMismatch)?;
-    cursor += emb_bytes;
+    // n * dim was checked above (body_len), so these counts cannot overflow.
+    let nd = n.saturating_mul(dim);
+    let embeddings = take_q16(input, &mut cursor, nd)?;
 
     // Section 2: confidences (n*dim*i64)
-    let conf_bytes = n * dim * 8;
-    let confidences = decode_q16_slice(&input[cursor..cursor + conf_bytes])
-        .ok_or(BelnapError::LengthMismatch)?;
-    cursor += conf_bytes;
+    let confidences = take_q16(input, &mut cursor, nd)?;
 
     // Section 3: weights (n*i64)
-    let w_bytes = n * 8;
-    let weights = decode_q16_slice(&input[cursor..cursor + w_bytes])
-        .ok_or(BelnapError::LengthMismatch)?;
-    cursor += w_bytes;
+    let weights = take_q16(input, &mut cursor, n)?;
 
     // Sanity: cursor should now equal input.len() (thresholds are part
     // of HEADER_LEN, not body_len). But our HEADER_LEN includes them at
@@ -256,16 +268,13 @@ pub fn decode(input: &[u8]) -> Result<BelnapInput, BelnapError> {
     // = 24 + 16*n*dim + 8*n
     // which matches our body_len + HEADER_LEN = 8 + (16*n*dim + 8*n) + 16.
 
-    if cursor + 16 != input.len() {
+    // The total-length check above leaves exactly the two 8-byte thresholds here.
+    let mut threshold_words = take_q16(input, &mut cursor, 2)?.into_iter();
+    let (Some(threshold_pos), Some(threshold_neg)) =
+        (threshold_words.next(), threshold_words.next())
+    else {
         return Err(BelnapError::LengthMismatch);
-    }
-
-    let threshold_pos = Q16::from_raw(i64::from_be_bytes(
-        input[cursor..cursor + 8].try_into().expect("8 bytes"),
-    ));
-    let threshold_neg = Q16::from_raw(i64::from_be_bytes(
-        input[cursor + 8..cursor + 16].try_into().expect("8 bytes"),
-    ));
+    };
 
     Ok(BelnapInput {
         dim,
@@ -278,18 +287,35 @@ pub fn decode(input: &[u8]) -> Result<BelnapInput, BelnapError> {
     })
 }
 
-/// Decode a contiguous run of big-endian Q16 values. Returns `None` if
-/// the slice length is not a multiple of 8.
-fn decode_q16_slice(bytes: &[u8]) -> Option<Vec<Q16>> {
-    if !bytes.len().is_multiple_of(8) {
-        return None;
-    }
-    let mut out = Vec::with_capacity(bytes.len() / 8);
-    for chunk in bytes.chunks_exact(8) {
-        let raw = i64::from_be_bytes(chunk.try_into().expect("8 bytes"));
-        out.push(Q16::from_raw(raw));
-    }
-    Some(out)
+/// Big-endian u32 at byte offset `at`.
+fn be_u32_at(input: &[u8], at: usize) -> Option<u32> {
+    input
+        .get(at..)
+        .and_then(|rest| rest.first_chunk::<4>())
+        .map(|b| u32::from_be_bytes(*b))
+}
+
+/// Decode the next `count` big-endian Q16 values at `*cursor` and advance it.
+fn take_q16(input: &[u8], cursor: &mut usize, count: usize) -> Result<Vec<Q16>, BelnapError> {
+    let len = count.checked_mul(8).ok_or(BelnapError::LengthMismatch)?;
+    let end = cursor.checked_add(len).ok_or(BelnapError::LengthMismatch)?;
+    let bytes = input.get(*cursor..end).ok_or(BelnapError::LengthMismatch)?;
+    *cursor = end;
+    Ok(bytes
+        .chunks_exact(8)
+        .filter_map(|chunk| <[u8; 8]>::try_from(chunk).ok())
+        .map(|b| Q16::from_raw(i64::from_be_bytes(b)))
+        .collect())
+}
+
+/// Element `(i, d)` of a row-major `n × dim` matrix; validated inputs are always
+/// in range, an unvalidated one reads zero instead of panicking.
+fn at(m: &[Q16], i: usize, dim: usize, d: usize) -> Q16 {
+    i.checked_mul(dim)
+        .and_then(|r| r.checked_add(d))
+        .and_then(|idx| m.get(idx))
+        .copied()
+        .unwrap_or(Q16::ZERO)
 }
 
 /// Encode a `BelnapOutput` into wire-format bytes. Counterpart of `decode`
@@ -302,7 +328,7 @@ pub fn encode_output(output: &BelnapOutput) -> Vec<u8> {
         "BelnapOutput: aggregated_values and states length mismatch"
     );
     let dim = output.aggregated_values.len();
-    let mut bytes = Vec::with_capacity(9 * dim);
+    let mut bytes = Vec::with_capacity(dim.saturating_mul(9));
     for v in &output.aggregated_values {
         bytes.extend_from_slice(&v.0.to_be_bytes());
     }
@@ -328,11 +354,7 @@ pub fn encode_output(output: &BelnapOutput) -> Vec<u8> {
 /// thresholds for unbalanced data); the WP-1.3 helper uses only `threshold_pos`.
 ///
 /// Pure / deterministic / Q16-only.
-pub fn classify_dim_threshold(
-    embedding: Q16,
-    confidence: Q16,
-    threshold_pos: Q16,
-) -> Option<bool> {
+pub fn classify_dim_threshold(embedding: Q16, confidence: Q16, threshold_pos: Q16) -> Option<bool> {
     if confidence.0 < threshold_pos.0 {
         return None;
     }
@@ -356,10 +378,11 @@ pub fn validate(input: &BelnapInput) -> Result<(), BelnapError> {
     if input.n > MAX_N {
         return Err(BelnapError::NTooLarge);
     }
-    if input.embeddings.len() != input.n * input.dim {
+    let nd = input.n.checked_mul(input.dim);
+    if Some(input.embeddings.len()) != nd {
         return Err(BelnapError::LengthMismatch);
     }
-    if input.confidences.len() != input.n * input.dim {
+    if Some(input.confidences.len()) != nd {
         return Err(BelnapError::LengthMismatch);
     }
     if input.weights.len() != input.n {
@@ -467,8 +490,8 @@ impl BelnapStateMachine for StandardBelnap {
             // ---- Step 1: weighted sum over participants ----
             let mut acc = Q16::ZERO;
             for i in 0..n {
-                let w = input.weights[i];
-                let e = input.embeddings[i * dim + d];
+                let w = input.weights.get(i).copied().unwrap_or(Q16::ZERO);
+                let e = at(&input.embeddings, i, dim, d);
                 acc = acc.saturating_add(w.saturating_mul(e));
             }
             aggregated_values.push(acc);
@@ -480,11 +503,11 @@ impl BelnapStateMachine for StandardBelnap {
                 // Filter zero-weight participants
                 // (BelnapAdversarial.tla::WeightZeroIgnored).
                 // Negative weights are wire-format bugs; treat as zero.
-                if input.weights[i].0 <= 0 {
+                if input.weights.get(i).is_none_or(|w| w.0 <= 0) {
                     continue;
                 }
-                let e = input.embeddings[i * dim + d];
-                let c = input.confidences[i * dim + d];
+                let e = at(&input.embeddings, i, dim, d);
+                let c = at(&input.confidences, i, dim, d);
                 match classify_dim_threshold(e, c, input.threshold_pos) {
                     Some(true) => has_agree = true,
                     Some(false) => has_oppose = true,
@@ -530,33 +553,24 @@ pub fn aggregate_decoded(input: &BelnapInput) -> BelnapOutput {
 /// Gas: `GAS_BASE + GAS_PER_DIM * dim` = `2000 + 50 * dim`.
 /// Decode failures (`InputTooShort`, malformed bytes) charge `GAS_BASE`
 /// so a malformed-input griefer still pays for the parse work.
-pub fn execute(input: &[u8], gas_limit: u64) -> Result<crate::precompiles::PrecompileResult, anyhow::Error> {
+pub fn execute(
+    input: &[u8],
+    gas_limit: u64,
+) -> Result<crate::precompiles::PrecompileResult, anyhow::Error> {
     execute_at(input, gas_limit, false)
 }
 
 /// Gas for 0x0110. At/after `pba_hardening_height` (`hardened`) the charge is
 /// `2000 + 50 * dim * max(n, 1)`; before it, `2000 + 50 * dim`.
 pub fn gas_for(input: &[u8], hardened: bool) -> u64 {
-    let dim_hint = if input.len() >= 4 {
-        u32::from_be_bytes([input[0], input[1], input[2], input[3]]) as u64
-    } else {
-        0
-    };
+    let dim_hint = be_u32_at(input, 0).map_or(0, u64::from);
     let dim_hint = dim_hint.min(MAX_DIM as u64);
     if !hardened {
         return GAS_BASE.saturating_add(GAS_PER_DIM.saturating_mul(dim_hint));
     }
-    let n_hint = if input.len() >= 8 {
-        u32::from_be_bytes([input[4], input[5], input[6], input[7]]) as u64
-    } else {
-        0
-    };
+    let n_hint = be_u32_at(input, 4).map_or(0, u64::from);
     let n_hint = n_hint.clamp(1, MAX_N as u64);
-    GAS_BASE.saturating_add(
-        GAS_PER_DIM
-            .saturating_mul(dim_hint)
-            .saturating_mul(n_hint),
-    )
+    GAS_BASE.saturating_add(GAS_PER_DIM.saturating_mul(dim_hint).saturating_mul(n_hint))
 }
 
 /// Precompile entry with the consensus activation flag (see [`gas_for`]).
@@ -631,9 +645,7 @@ mod tests {
         assert_eq!(bytes.len(), 9 * dim, "output bytes length must be 9 * dim");
         let mut aggregated_values = Vec::with_capacity(dim);
         for d in 0..dim {
-            let raw = i64::from_be_bytes(
-                bytes[d * 8..(d + 1) * 8].try_into().expect("8 bytes"),
-            );
+            let raw = i64::from_be_bytes(bytes[d * 8..(d + 1) * 8].try_into().expect("8 bytes"));
             aggregated_values.push(Q16::from_raw(raw));
         }
         let states_off = 8 * dim;
@@ -852,10 +864,7 @@ mod tests {
     fn classify_below_threshold_neither() {
         let conf = Q16::from_f64(0.5);
         let thr = Q16::from_f64(0.8);
-        assert_eq!(
-            classify_dim_threshold(Q16::from_f64(1.0), conf, thr),
-            None
-        );
+        assert_eq!(classify_dim_threshold(Q16::from_f64(1.0), conf, thr), None);
     }
 
     #[test]
@@ -894,10 +903,7 @@ mod tests {
         // (`>= 0` rule). Documented in fn docs.
         let conf = Q16::from_f64(0.9);
         let thr = Q16::from_f64(0.8);
-        assert_eq!(
-            classify_dim_threshold(Q16::ZERO, conf, thr),
-            Some(true)
-        );
+        assert_eq!(classify_dim_threshold(Q16::ZERO, conf, thr), Some(true));
     }
 
     #[test]
@@ -1076,7 +1082,10 @@ mod tests {
             threshold_neg: Q16::from_f64(-0.8),
         };
         let bytes = encode_input(&input);
-        let out = parse_output(&aggregate(&bytes).expect("aggregates without panic"), input.dim);
+        let out = parse_output(
+            &aggregate(&bytes).expect("aggregates without panic"),
+            input.dim,
+        );
         // Two high-conf positive-weight participants on opposing sides
         // → state=Both. Aggregated value is well-defined Q16 (no panic,
         // no wrap — saturating throughout).
@@ -1178,9 +1187,9 @@ mod tests {
         let mut bytes = vec![0u8; 16];
         bytes[0..4].copy_from_slice(&u32::MAX.to_be_bytes()); // huge dim
         bytes[4..8].copy_from_slice(&1u32.to_be_bytes()); // n=1
-        // input is too short for the actual decode; the gas pre-charge
-        // path will compute total_gas = GAS_BASE + GAS_PER_DIM * MAX_DIM
-        // = 2000 + 50*1024 = 53200. Pass 100_000.
+                                                          // input is too short for the actual decode; the gas pre-charge
+                                                          // path will compute total_gas = GAS_BASE + GAS_PER_DIM * MAX_DIM
+                                                          // = 2000 + 50*1024 = 53200. Pass 100_000.
         let result = execute(&bytes, 100_000);
         // Decode fails (length mismatch); execute surfaces it as anyhow.
         assert!(result.is_err());
@@ -1249,7 +1258,9 @@ mod tests {
         // than the 100k iterations we run.
         let mut state: u64 = 0xBE_1A_AF_DE_AD_BE_EF_42;
         let next = |s: &mut u64| -> u64 {
-            *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *s
         };
 

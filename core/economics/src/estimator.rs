@@ -121,8 +121,9 @@ impl InstitutionalRewardEstimator {
                 if wei_per_salt.is_zero() {
                     return 0.0;
                 }
-                let whole = wei_val / wei_per_salt;
-                let frac = wei_val % wei_per_salt;
+                // wei_per_salt is non-zero (checked above).
+                let whole = wei_val.checked_div(wei_per_salt).unwrap_or_default();
+                let frac = wei_val.checked_rem(wei_per_salt).unwrap_or_default();
                 whole.as_u64() as f64 + (frac.as_u64() as f64 / wei_per_salt.as_u64() as f64)
             };
 

@@ -102,7 +102,7 @@ where
                     backoff_ms, e
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                backoff_ms = (backoff_ms * 2).min(WS_ACCEPT_BACKOFF_MAX_MS);
+                backoff_ms = backoff_ms.saturating_mul(2).min(WS_ACCEPT_BACKOFF_MAX_MS);
             }
         }
     }
@@ -318,7 +318,7 @@ impl ConnectionState {
 
     fn next_subscription_id(&mut self) -> String {
         let id = format!("0x{:x}", self.next_sub_id);
-        self.next_sub_id += 1;
+        self.next_sub_id = self.next_sub_id.saturating_add(1);
         id
     }
 }
@@ -364,7 +364,7 @@ impl EthSubscriptionServer {
             if *n >= self.limits.max_per_ip {
                 return None;
             }
-            *n += 1;
+            *n = n.saturating_add(1);
         }
         Some(SocketSlot {
             _permit: permit,
@@ -621,7 +621,7 @@ impl EthSubscriptionServer {
             })).unwrap_or_default());
         }
 
-        let sub_type_str = request.params[0].as_str().unwrap_or("");
+        let sub_type_str = request.params.first().and_then(|p| p.as_str()).unwrap_or("");
         let sub_type = match sub_type_str {
             "newHeads" => EthSubscriptionType::NewHeads,
             "logs" => EthSubscriptionType::Logs,
@@ -642,7 +642,7 @@ impl EthSubscriptionServer {
         // PBA-L1a-010 (variant): the logs-subscription filter is retained for
         // the connection's lifetime, so bound it exactly like eth_newFilter.
         if sub_type == EthSubscriptionType::Logs && request.params.len() > 1 {
-            if let Err(msg) = crate::filter::validate_log_filter_criteria(&request.params[1]) {
+            if let Err(msg) = crate::filter::validate_log_filter_criteria(crate::eth_rpc::arg(&request.params, 1)) {
                 return Some(serde_json::to_string(&serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": request.id,
@@ -653,7 +653,7 @@ impl EthSubscriptionServer {
 
         // Parse filter for logs subscription
         let filter = if sub_type == EthSubscriptionType::Logs && request.params.len() > 1 {
-            serde_json::from_value(request.params[1].clone()).ok()
+            serde_json::from_value(crate::eth_rpc::arg(&request.params, 1).clone()).ok()
         } else {
             None
         };
@@ -713,7 +713,7 @@ impl EthSubscriptionServer {
             })).unwrap_or_default());
         }
 
-        let sub_id = request.params[0].as_str().unwrap_or("");
+        let sub_id = request.params.first().and_then(|p| p.as_str()).unwrap_or("");
         let mut state = conn_state.write().await;
         let removed = state.subscriptions.remove(sub_id).is_some();
 
