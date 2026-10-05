@@ -639,7 +639,10 @@ impl StatefulPrecompile for CitratePurePrecompile {
 /// being executed: it selects the post-activation precompile semantics and
 /// registers the reserved addresses. Before activation the precompile SET is
 /// unchanged, so EIP-2929 warm/cold gas for those addresses is unchanged too.
-fn register_citrate_precompiles<EXT, DB: Database>(
+///
+/// Public so the dry-run fork (`crates/citrate-fork`, HUP-S6.10) runs exactly this
+/// registration instead of a copy; making it public changes no node behaviour.
+pub fn register_citrate_precompiles<EXT, DB: Database>(
     handler: &mut EvmHandler<'_, EXT, DB>,
     hardened: bool,
 ) {
