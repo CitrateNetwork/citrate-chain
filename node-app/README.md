@@ -20,7 +20,7 @@ This is a binary crate with no library API. The following environment variables 
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `CITRATE_DATA_DIR` | `/data` | RocksDB storage directory |
+| `CITRATE_DATA_DIR` | Windows: `%USERPROFILE%\.citrate\node-app` (or `.\.citrate\node-app` if no home directory is available); non-Windows: `/data` | RocksDB storage directory; an explicit value always takes precedence |
 | `CITRATE_RPC_ADDR` | `127.0.0.1:8545` | JSON-RPC listen address |
 | `CITRATE_METRICS_ADDR` | `0.0.0.0:9100` | Prometheus metrics endpoint |
 | `RUST_LOG` | `info,citrate=info` | Log level filter |
@@ -38,7 +38,7 @@ This is a binary crate with no library API. The following environment variables 
 cargo test -p node-app
 ```
 
-0 tests (binary crate with no unit tests; integration tested via workspace-level E2E tests).
+6 deterministic unit tests cover fork-height publication, data-directory override precedence, and the Windows and non-Windows defaults without mutating process environment variables. The binary is also integration tested via workspace-level E2E tests.
 
 ## Dependencies
 
@@ -51,5 +51,6 @@ cargo test -p node-app
 | `citrate-network` | `PeerManager`, `PeerManagerConfig` -- P2P peer management |
 | `axum` | Prometheus metrics HTTP server |
 | `prometheus` | Metrics collection and text encoding |
+| `dirs` | Platform-specific home-directory resolution for the Windows data default |
 | `tracing`, `tracing-subscriber` | Structured logging with env filter |
 | `tokio` | Multi-threaded async runtime |
