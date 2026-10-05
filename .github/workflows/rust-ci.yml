@@ -5,14 +5,14 @@ on:
   push:
     paths:
       - '**/Cargo.toml'
-      - 'Cargo.lock'
+      - '**/Cargo.lock'
       - '**/*.rs'
       - '**/build.rs'
       - '.github/workflows/rust-ci.yml'
   pull_request:
     paths:
       - '**/Cargo.toml'
-      - 'Cargo.lock'
+      - '**/Cargo.lock'
       - '**/*.rs'
       - '**/build.rs'
       - '.github/workflows/rust-ci.yml'
@@ -116,3 +116,26 @@ jobs:
         run: cargo build --locked -p citrate-api
       - name: Run citrate-api tests (default features)
         run: cargo test --locked -p citrate-api -- --nocapture
+
+  standalone-benchmarks:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - name: Cache cargo registry
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: standalone-benchmarks-${{ runner.os }}-${{ hashFiles('tests/load/Cargo.lock', 'tools/citrate-bench/Cargo.lock') }}
+          restore-keys: standalone-benchmarks-${{ runner.os }}-
+      - name: Test historical load workspace
+        run: cargo test --manifest-path tests/load/Cargo.toml --all-targets --locked
+      - name: Test canonical benchmark workspace
+        run: cargo test --manifest-path tools/citrate-bench/Cargo.toml --all-targets --locked
