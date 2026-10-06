@@ -3,11 +3,11 @@
 // Secure Enclave support for Apple Silicon (M-series chips)
 // Provides hardware-based security for model encryption keys
 
-use anyhow::{Result, anyhow};
-use serde::{Deserialize, Serialize};
+use anyhow::{anyhow, Result};
 use primitive_types::H256;
+use serde::{Deserialize, Serialize};
 #[allow(unused_imports)]
-use sha3::{Sha3_256, Digest};
+use sha3::{Digest, Sha3_256};
 #[allow(unused_imports)]
 use std::collections::HashMap;
 #[allow(unused_imports)]
@@ -145,7 +145,11 @@ impl AppleSecureEnclave {
 
         Ok(PlatformInfo {
             chip_type,
-            secure_enclave_version: if is_apple_silicon { "2.0".to_string() } else { "0.0".to_string() },
+            secure_enclave_version: if is_apple_silicon {
+                "2.0".to_string()
+            } else {
+                "0.0".to_string()
+            },
             supports_attestation: is_apple_silicon,
         })
     }
@@ -197,10 +201,9 @@ impl AppleSecureEnclave {
             }
             "unseal" => {
                 // Simulate unsealing
-                if data.starts_with(b"SEALED:") {
-                    Ok(data[7..].to_vec())
-                } else {
-                    Err(anyhow!("Invalid sealed data"))
+                match data.strip_prefix(b"SEALED:") {
+                    Some(rest) => Ok(rest.to_vec()),
+                    None => Err(anyhow!("Invalid sealed data")),
                 }
             }
             "sign" => {
@@ -312,14 +315,20 @@ impl SecureEnclaveInterface for AppleSecureEnclave {
             .as_secs();
 
         // Reject attestations with future timestamps (60s clock tolerance)
-        if attestation.timestamp > now + 60 {
-            warn!("Attestation rejected: timestamp in the future (ts={}, now={})", attestation.timestamp, now);
+        if attestation.timestamp > now.saturating_add(60) {
+            warn!(
+                "Attestation rejected: timestamp in the future (ts={}, now={})",
+                attestation.timestamp, now
+            );
             return Ok(false);
         }
 
         // Reject attestations older than 5 minutes
         if now.saturating_sub(attestation.timestamp) > 300 {
-            warn!("Attestation rejected: too old (ts={}, now={})", attestation.timestamp, now);
+            warn!(
+                "Attestation rejected: too old (ts={}, now={})",
+                attestation.timestamp, now
+            );
             return Ok(false);
         }
 
@@ -365,13 +374,16 @@ impl SecureEnclaveInterface for AppleSecureEnclave {
                 Ok(hasher.finalize().to_vec())
             }
             "encrypt" => {
-                if inputs.len() != 2 {
+                let [data, key] = inputs.as_slice() else {
                     return Err(anyhow!("Encrypt requires 2 inputs"));
+                };
+                if key.is_empty() {
+                    return Err(anyhow!("Encrypt requires a non-empty key"));
                 }
                 // Simulate encryption
-                let mut result = inputs[0].clone();
-                for (i, byte) in result.iter_mut().enumerate() {
-                    *byte ^= inputs[1][i % inputs[1].len()];
+                let mut result = data.clone();
+                for (byte, k) in result.iter_mut().zip(key.iter().cycle()) {
+                    *byte ^= *k;
                 }
                 Ok(result)
             }
@@ -398,7 +410,11 @@ impl AppleSecureEnclave {
             SealingPolicy::PlatformIdentity => {
                 hasher.update(b"PLATFORM");
             }
-            SealingPolicy::Custom { measurement_mask, signer_id, min_version } => {
+            SealingPolicy::Custom {
+                measurement_mask,
+                signer_id,
+                min_version,
+            } => {
                 hasher.update(b"CUSTOM");
                 if let Some(mask) = measurement_mask {
                     hasher.update(mask.as_bytes());
@@ -480,7 +496,9 @@ mod tests {
         let data = b"sensitive model weights";
 
         // Seal data
-        let sealed = enclave.seal_data(data, SealingPolicy::ExactMeasurement).unwrap();
+        let sealed = enclave
+            .seal_data(data, SealingPolicy::ExactMeasurement)
+            .unwrap();
         assert!(!sealed.ciphertext.is_empty());
 
         // Unseal data
@@ -562,7 +580,8 @@ mod tests {
         let future_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_secs() + 300; // 5 min in the future (beyond 60s tolerance)
+            .as_secs()
+            + 300; // 5 min in the future (beyond 60s tolerance)
 
         let attestation = Attestation {
             measurement: H256::from_slice(&[1u8; 32]),

@@ -121,9 +121,9 @@ impl BondingCurveConfig {
     ///
     /// Returns the SALT amount (in base units, no decimals).
     pub fn calculate_salt_amount(&self, deposit_eth: f64, total_deposited_eth: f64) -> u64 {
-        let multiplier =
-            (self.base_multiplier + self.slope * total_deposited_eth / self.scale_factor)
-                .min(self.max_multiplier);
+        let multiplier = (self.base_multiplier
+            + self.slope * total_deposited_eth / self.scale_factor)
+            .min(self.max_multiplier);
         let salt = deposit_eth * self.salt_per_eth as f64 / multiplier;
         salt as u64
     }

@@ -4,8 +4,8 @@
 
 use proptest::prelude::*;
 
-use citrate_sequencer::{Mempool, MempoolConfig, TxClass};
 use citrate_sequencer::mempool::TxPriority;
+use citrate_sequencer::{Mempool, MempoolConfig, TxClass};
 
 proptest! {
     // -----------------------------------------------------------------------

@@ -64,13 +64,19 @@ async fn dag_with_chain(n: u64) -> (Arc<DagStore>, GhostDag, Block) {
     let ghostdag = GhostDag::new(GhostDagParams::default(), dag_store.clone());
 
     let g = genesis();
-    dag_store.store_block(g.clone()).await.expect("store genesis");
+    dag_store
+        .store_block(g.clone())
+        .await
+        .expect("store genesis");
     ghostdag.add_block(&g).await.expect("admit genesis");
 
     let mut tip = g;
     for i in 0..n {
         let b = honest_block(0x10 + i as u8, &tip);
-        dag_store.store_block(b.clone()).await.expect("store honest block");
+        dag_store
+            .store_block(b.clone())
+            .await
+            .expect("store honest block");
         ghostdag.add_block(&b).await.expect("admit honest block");
         tip = b;
     }
@@ -99,11 +105,18 @@ async fn cons1_forged_height_rejected_at_admission() {
         .proposer(PublicKey::new([2; 32]))
         .build_unhashed();
 
-    let err = ghostdag.add_block(&forged).await.expect_err(
-        "CONS-1 regression: forged-height block was admitted to the DAG",
-    );
+    let err = ghostdag
+        .add_block(&forged)
+        .await
+        .expect_err("CONS-1 regression: forged-height block was admitted to the DAG");
     assert!(
-        matches!(err, GhostDagError::HeightMismatch { claimed: 10_000_000, expected: 6 }),
+        matches!(
+            err,
+            GhostDagError::HeightMismatch {
+                claimed: 10_000_000,
+                expected: 6
+            }
+        ),
         "wrong rejection reason: {err:?}"
     );
 }
@@ -152,11 +165,18 @@ async fn cons2_u64max_blue_score_rejected_at_admission() {
         .proposer(PublicKey::new([2; 32]))
         .build_unhashed();
 
-    let err = ghostdag.add_block(&forged).await.expect_err(
-        "CONS-2 regression: u64::MAX blue_score block was admitted",
-    );
+    let err = ghostdag
+        .add_block(&forged)
+        .await
+        .expect_err("CONS-2 regression: u64::MAX blue_score block was admitted");
     assert!(
-        matches!(err, GhostDagError::BlueScoreOutOfRange { claimed: u64::MAX, .. }),
+        matches!(
+            err,
+            GhostDagError::BlueScoreOutOfRange {
+                claimed: u64::MAX,
+                ..
+            }
+        ),
         "wrong rejection reason: {err:?}"
     );
 }
@@ -295,7 +315,10 @@ async fn cons3_duplicate_and_aliased_merge_parents_rejected() {
             .blue_work(blue_work_for_score(score))
             .proposer(PublicKey::new([3; 32]))
             .build_unhashed();
-        dag_store.store_block(b.clone()).await.expect("store sibling");
+        dag_store
+            .store_block(b.clone())
+            .await
+            .expect("store sibling");
         ghostdag.add_block(&b).await.expect("admit sibling");
         b
     };
@@ -360,7 +383,10 @@ async fn cons3_merge_parent_count_capped() {
             .blue_work(blue_work_for_score(score))
             .proposer(PublicKey::new([4; 32]))
             .build_unhashed();
-        dag_store.store_block(b.clone()).await.expect("store sibling");
+        dag_store
+            .store_block(b.clone())
+            .await
+            .expect("store sibling");
         ghostdag.add_block(&b).await.expect("admit sibling");
         merges.push(b.hash());
     }
@@ -411,7 +437,10 @@ async fn cons3_selected_parent_must_be_heaviest() {
         .blue_work(blue_work_for_score(1))
         .proposer(PublicKey::new([5; 32]))
         .build_unhashed();
-    dag_store.store_block(light.clone()).await.expect("store light");
+    dag_store
+        .store_block(light.clone())
+        .await
+        .expect("store light");
     ghostdag.add_block(&light).await.expect("admit light");
 
     // Attacker extends the LIGHT branch while merging the heavy tip.
@@ -452,15 +481,13 @@ async fn cons2_fork_choice_baseline_cannot_be_poisoned() {
         ghostdag.clone(),
         citrate_consensus::tip_selection::SelectionStrategy::HighestBlueScoreWithTieBreak,
     ));
-    let selector = ChainSelector::new(
-        dag_store.clone(),
-        ghostdag.clone(),
-        tip_selector,
-        100,
-    );
+    let selector = ChainSelector::new(dag_store.clone(), ghostdag.clone(), tip_selector, 100);
 
     let g = genesis();
-    dag_store.store_block(g.clone()).await.expect("store genesis");
+    dag_store
+        .store_block(g.clone())
+        .await
+        .expect("store genesis");
     ghostdag.add_block(&g).await.expect("admit genesis");
     selector.on_new_block(&g).await.expect("select genesis");
 

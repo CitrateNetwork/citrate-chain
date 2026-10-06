@@ -152,10 +152,7 @@ fn test_full_ooda_learning_cycle() {
     // OBSERVE: Each node produces a local embedding
     // (simulated — in production these come from inference results)
     // -----------------------------------------------------------------------
-    let peer_embeddings: Vec<PeerEmbedding> = nodes
-        .iter()
-        .map(peer_embedding_from_node)
-        .collect();
+    let peer_embeddings: Vec<PeerEmbedding> = nodes.iter().map(peer_embedding_from_node).collect();
 
     // -----------------------------------------------------------------------
     // ORIENT: Run paraconsensus aggregation
@@ -181,8 +178,7 @@ fn test_full_ooda_learning_cycle() {
         "All 5 nodes should participate"
     );
     assert_ne!(
-        result.learning_root,
-        [0u8; 32],
+        result.learning_root, [0u8; 32],
         "learning_root must be non-zero when quorum is met"
     );
     assert_eq!(
@@ -218,11 +214,7 @@ fn test_full_ooda_learning_cycle() {
     // -----------------------------------------------------------------------
     let mut profile_store = PeerProfileStore::new(10);
     for node in &nodes {
-        profile_store.store_profile(
-            checkpoint_height,
-            node.pubkey,
-            profile_from_node(node),
-        );
+        profile_store.store_profile(checkpoint_height, node.pubkey, profile_from_node(node));
     }
 
     let pairings = orchestrator.run_mentor_selection(&profile_store, checkpoint_height);
@@ -379,8 +371,7 @@ fn test_learning_root_deterministic_across_runs() {
         "State vectors must be identical"
     );
     assert_ne!(
-        result_1.learning_root,
-        [0u8; 32],
+        result_1.learning_root, [0u8; 32],
         "learning_root must be non-zero"
     );
 }
@@ -486,9 +477,9 @@ fn test_belnap_state_vector_captures_disagreement() {
         &[&e_a, &e_b],
         &[conf_high.as_slice(), conf_high.as_slice()],
         &blue_scores,
-        1.0,  // temperature
-        0.8,  // theta_high
-        0.3,  // theta_low
+        1.0, // temperature
+        0.8, // theta_high
+        0.3, // theta_low
     );
 
     // Reduce to consensus state vector
@@ -532,8 +523,7 @@ fn test_cycle_below_quorum_produces_zero_root() {
         .expect("Below-quorum should not error (returns zero root per INV-5)");
 
     assert_eq!(
-        result.learning_root,
-        [0u8; 32],
+        result.learning_root, [0u8; 32],
         "Below quorum must produce zero learning_root"
     );
     assert_eq!(result.participant_count, 1);
@@ -825,8 +815,7 @@ fn test_domain_specific_mentor_pairing() {
     let d_pairing = d_pairing.unwrap();
     // Node A (NLP Expert, [1u8;32]) should mentor Node D (shared domain "nlp")
     assert_eq!(
-        d_pairing.mentor,
-        [1u8; 32],
+        d_pairing.mentor, [1u8; 32],
         "Node A should mentor Node D (shared NLP domain, highest accuracy)"
     );
     assert!(
@@ -968,10 +957,8 @@ fn test_byzantine_node_filtered_from_aggregation() {
     });
 
     // Create normal embeddings from 4 nodes
-    let valid_peers: Vec<PeerEmbedding> = nodes[0..4]
-        .iter()
-        .map(peer_embedding_from_node)
-        .collect();
+    let valid_peers: Vec<PeerEmbedding> =
+        nodes[0..4].iter().map(peer_embedding_from_node).collect();
 
     // Create a byzantine embedding with NaN
     let byzantine = PeerEmbedding {

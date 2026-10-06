@@ -414,7 +414,7 @@ impl Mempool {
                     b.remove(&oldest);
                 }
             }
-            b.insert(*sender, now + duration);
+            b.insert(*sender, now.checked_add(duration).unwrap_or(now));
         }
         let hashes: Vec<Hash> = self
             .by_sender
@@ -732,7 +732,7 @@ impl Mempool {
         // until the new transaction fits; `Full` if nothing is left to evict).
         // PBA-N9: same priority guard — never displace a better tx.
         let incoming_size = tx_size;
-        while *self.total_size.read().await + incoming_size > MAX_POOL_BYTES {
+        while self.total_size.read().await.saturating_add(incoming_size) > MAX_POOL_BYTES {
             self.evict_lower_priority_than(priority).await?;
         }
 
@@ -771,7 +771,10 @@ impl Mempool {
             .insert(tx.nonce);
 
         // Update total size
-        *self.total_size.write().await += tx_size;
+        {
+            let mut total = self.total_size.write().await;
+            *total = total.saturating_add(tx_size);
+        }
 
         info!(
             "Added transaction {} from {:?} with priority {} to mempool",
@@ -820,7 +823,8 @@ impl Mempool {
                     got: tx.nonce,
                 });
             }
-            if tx.nonce - state_nonce > self.config.max_nonce_gap {
+            // tx.nonce >= state_nonce (NonceTooLow returned above).
+            if tx.nonce.saturating_sub(state_nonce) > self.config.max_nonce_gap {
                 return Err(MempoolError::InvalidTransaction(format!(
                     "nonce {} is more than {} ahead of the sender's committed nonce {} \
                      (PBA-L1a-001)",
@@ -1043,7 +1047,10 @@ impl Mempool {
         }
 
         // Update total size
-        *self.total_size.write().await -= mempool_tx.size;
+        {
+            let mut total = self.total_size.write().await;
+            *total = total.saturating_sub(mempool_tx.size);
+        }
 
         // Remove this tx's nonce from the per-sender set and prune
         // the entry entirely if no nonces remain. This replaces the
@@ -1188,7 +1195,7 @@ impl Mempool {
     ) -> Vec<Transaction> {
         self.sweep_if_v1_window_closed().await;
         let mut selected: Vec<Transaction> = Vec::new();
-        let mut total_size = 0;
+        let mut total_size: usize = 0;
         let mut next_nonce: HashMap<PublicKey, u64> = HashMap::new();
         let mut picked: HashSet<Hash> = HashSet::new();
 
@@ -1211,7 +1218,7 @@ impl Mempool {
                     if picked.contains(hash) {
                         continue;
                     }
-                    if total_size + mtx.size > max_size {
+                    if total_size.saturating_add(mtx.size) > max_size {
                         continue;
                     }
 
@@ -1235,7 +1242,7 @@ impl Mempool {
                         let Some(successor) = mtx.tx.nonce.checked_add(1) else {
                             continue;
                         };
-                        total_size += mtx.size;
+                        total_size = total_size.saturating_add(mtx.size);
                         next_nonce.insert(sender, successor);
                         picked.insert(*hash);
                         selected.push(mtx.tx.clone());
@@ -1284,17 +1291,15 @@ impl Mempool {
                 None => {
                     // No txs from this sender included yet, allow contiguous sequence starting at the minimal nonce
                     let txs_guard = self.transactions.read().await;
-                    let mut nonces: Vec<u64> = sender_txs
+                    let nonces: Vec<u64> = sender_txs
                         .iter()
                         .filter_map(|h| txs_guard.get(h).map(|t| t.tx.nonce))
                         .collect();
                     if nonces.is_empty() {
                         return true;
                     }
-                    nonces.sort_unstable();
                     // If the minimal nonce is n0, allow n0, n0+1, n0+2,... as we include them in one selection pass
-                    let min = nonces[0];
-                    tx.nonce >= min
+                    nonces.iter().min().is_none_or(|&min| tx.nonce >= min)
                 }
             }
         } else {
@@ -1317,10 +1322,7 @@ impl Mempool {
     /// Equal-priority eviction is allowed on purpose: tied transactions are
     /// interchangeable in value, and allowing the tie keeps the count / byte-budget
     /// caps enforceable (a pool full of equal-fee txs must still make room).
-    async fn evict_lower_priority_than(
-        &self,
-        incoming: TxPriority,
-    ) -> Result<(), MempoolError> {
+    async fn evict_lower_priority_than(&self, incoming: TxPriority) -> Result<(), MempoolError> {
         let priority_queue = self.priority_queue.read().await;
 
         let lowest = priority_queue
@@ -1349,15 +1351,11 @@ impl Mempool {
     /// transaction.
     pub fn tx_size(tx: &Transaction) -> usize {
         // Approximate size calculation
-        32 + // hash
-        8 + // nonce  
-        32 + // from
-        32 + // to (optional)
-        16 + // value
-        8 + // gas_limit
-        8 + // gas_price
-        tx.data.len() + // data
-        64 // signature
+        // hash 32 + nonce 8 + from 32 + to 32 + value 16 + gas_limit 8 + gas_price 8
+        // + data + signature 64
+        tx.data
+            .len()
+            .saturating_add(32 + 8 + 32 + 32 + 16 + 8 + 8 + 64)
     }
 
     /// Clear expired transactions
@@ -1392,7 +1390,8 @@ impl Mempool {
         let mut by_class = HashMap::new();
 
         for mempool_tx in txs.values() {
-            *by_class.entry(mempool_tx.class).or_insert(0) += 1;
+            let n = by_class.entry(mempool_tx.class).or_insert(0usize);
+            *n = n.saturating_add(1);
         }
 
         MempoolStats {

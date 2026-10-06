@@ -4,8 +4,8 @@
 //! config propagation, error handling, and cross-module interactions.
 //! These tests verify properties that wallet-core alone does not cover.
 
-use citrate_wallet_sdk::{Wallet, SdkConfig};
 use citrate_wallet_core::error::WalletError;
+use citrate_wallet_sdk::{SdkConfig, Wallet};
 
 fn test_wallet() -> Wallet {
     let path = std::env::temp_dir().join(format!("citrate_adv_sdk_{}", uuid::Uuid::new_v4()));
@@ -26,7 +26,10 @@ fn test_wallet() -> Wallet {
 #[tokio::test]
 async fn test_lockout_blocks_even_correct_password() {
     let wallet = test_wallet();
-    wallet.create_account("strongpassword1", "Primary").await.expect("create");
+    wallet
+        .create_account("strongpassword1", "Primary")
+        .await
+        .expect("create");
 
     // Trigger lockout with wrong passwords
     for _ in 0..3 {
@@ -35,7 +38,10 @@ async fn test_lockout_blocks_even_correct_password() {
 
     // Correct password should be blocked by rate limiter
     let result = wallet.unlock("strongpassword1").await;
-    assert!(result.is_err(), "Rate limiter should block even correct password during lockout");
+    assert!(
+        result.is_err(),
+        "Rate limiter should block even correct password during lockout"
+    );
     match result {
         Err(WalletError::RateLimited(_)) => {} // expected
         Err(other) => panic!("Expected RateLimited, got: {}", other),
@@ -46,7 +52,10 @@ async fn test_lockout_blocks_even_correct_password() {
 #[tokio::test]
 async fn test_lockout_expires_after_duration() {
     let wallet = test_wallet(); // 2 second lockout
-    wallet.create_account("strongpassword1", "Primary").await.expect("create");
+    wallet
+        .create_account("strongpassword1", "Primary")
+        .await
+        .expect("create");
 
     // Trigger lockout
     for _ in 0..3 {
@@ -64,14 +73,20 @@ async fn test_lockout_expires_after_duration() {
 #[tokio::test]
 async fn test_successful_unlock_resets_failure_count() {
     let wallet = test_wallet();
-    wallet.create_account("strongpassword1", "Primary").await.expect("create");
+    wallet
+        .create_account("strongpassword1", "Primary")
+        .await
+        .expect("create");
 
     // 2 failures (below threshold of 3)
     let _ = wallet.unlock("wrongpassword!").await;
     let _ = wallet.unlock("wrongpassword!").await;
 
     // Successful unlock should reset counter
-    wallet.unlock("strongpassword1").await.expect("unlock should succeed");
+    wallet
+        .unlock("strongpassword1")
+        .await
+        .expect("unlock should succeed");
     wallet.lock().await;
 
     // 2 more failures should NOT trigger lockout (counter was reset)
@@ -91,7 +106,10 @@ async fn test_successful_unlock_resets_failure_count() {
 #[tokio::test]
 async fn test_lock_clears_both_session_and_keys() {
     let wallet = test_wallet();
-    let account = wallet.create_account("strongpassword1", "Primary").await.expect("create");
+    let account = wallet
+        .create_account("strongpassword1", "Primary")
+        .await
+        .expect("create");
     wallet.unlock("strongpassword1").await.expect("unlock");
     assert!(wallet.is_unlocked().await);
 
@@ -106,7 +124,10 @@ async fn test_lock_clears_both_session_and_keys() {
 #[tokio::test]
 async fn test_lock_unlock_rapid_cycling() {
     let wallet = test_wallet();
-    wallet.create_account("strongpassword1", "Primary").await.expect("create");
+    wallet
+        .create_account("strongpassword1", "Primary")
+        .await
+        .expect("create");
 
     for _ in 0..50 {
         wallet.unlock("strongpassword1").await.expect("unlock");
@@ -119,7 +140,10 @@ async fn test_lock_unlock_rapid_cycling() {
 #[tokio::test]
 async fn test_double_lock_is_safe() {
     let wallet = test_wallet();
-    wallet.create_account("strongpassword1", "Primary").await.expect("create");
+    wallet
+        .create_account("strongpassword1", "Primary")
+        .await
+        .expect("create");
     wallet.unlock("strongpassword1").await.expect("unlock");
     wallet.lock().await;
     wallet.lock().await; // second lock should not panic
@@ -129,7 +153,10 @@ async fn test_double_lock_is_safe() {
 #[tokio::test]
 async fn test_lock_without_unlock_is_safe() {
     let wallet = test_wallet();
-    wallet.create_account("strongpassword1", "Primary").await.expect("create");
+    wallet
+        .create_account("strongpassword1", "Primary")
+        .await
+        .expect("create");
     wallet.lock().await; // never unlocked
     assert!(!wallet.is_unlocked().await);
 }
@@ -144,7 +171,8 @@ async fn test_config_chain_id_propagates() {
         chain_id: 12345,
         keystore_path: std::env::temp_dir()
             .join(format!("citrate_cfg_{}", uuid::Uuid::new_v4()))
-            .to_string_lossy().to_string(),
+            .to_string_lossy()
+            .to_string(),
         rpc_url: "http://localhost:19999".to_string(),
         ..SdkConfig::default()
     });
@@ -157,7 +185,8 @@ async fn test_config_rpc_url_propagates() {
         rpc_url: "https://custom.rpc.endpoint:8888".to_string(),
         keystore_path: std::env::temp_dir()
             .join(format!("citrate_cfg_{}", uuid::Uuid::new_v4()))
-            .to_string_lossy().to_string(),
+            .to_string_lossy()
+            .to_string(),
         ..SdkConfig::default()
     });
     assert_eq!(wallet.config().rpc_url, "https://custom.rpc.endpoint:8888");
@@ -193,7 +222,10 @@ async fn test_create_with_short_password_returns_error() {
 #[tokio::test]
 async fn test_sign_with_nonexistent_address() {
     let wallet = test_wallet();
-    wallet.create_account("strongpassword1", "Primary").await.expect("create");
+    wallet
+        .create_account("strongpassword1", "Primary")
+        .await
+        .expect("create");
     wallet.unlock("strongpassword1").await.expect("unlock");
 
     let result = wallet.sign_message("0xnonexistent", b"test").await;
@@ -203,23 +235,35 @@ async fn test_sign_with_nonexistent_address() {
 #[tokio::test]
 async fn test_delete_nonexistent_address() {
     let wallet = test_wallet();
-    wallet.create_account("strongpassword1", "Primary").await.expect("create");
-    let result = wallet.delete_account("0xnonexistent", "strongpassword1").await;
+    wallet
+        .create_account("strongpassword1", "Primary")
+        .await
+        .expect("create");
+    let result = wallet
+        .delete_account("0xnonexistent", "strongpassword1")
+        .await;
     assert!(result.is_err());
 }
 
 #[tokio::test]
 async fn test_export_nonexistent_address() {
     let wallet = test_wallet();
-    wallet.create_account("strongpassword1", "Primary").await.expect("create");
-    let result = wallet.export_private_key("0xnonexistent", "strongpassword1").await;
+    wallet
+        .create_account("strongpassword1", "Primary")
+        .await
+        .expect("create");
+    let result = wallet
+        .export_private_key("0xnonexistent", "strongpassword1")
+        .await;
     assert!(result.is_err());
 }
 
 #[tokio::test]
 async fn test_recover_with_invalid_mnemonic() {
     let wallet = test_wallet();
-    let result = wallet.recover_account("not a valid mnemonic phrase", "strongpassword1", "Bad").await;
+    let result = wallet
+        .recover_account("not a valid mnemonic phrase", "strongpassword1", "Bad")
+        .await;
     assert!(result.is_err());
 }
 
@@ -230,8 +274,14 @@ async fn test_recover_with_invalid_mnemonic() {
 #[tokio::test]
 async fn test_mixed_account_types() {
     let wallet = test_wallet();
-    let ed = wallet.create_account("strongpassword1", "Ed25519").await.expect("create ed");
-    let evm = wallet.create_evm_account("strongpassword1", "EVM").await.expect("create evm");
+    let ed = wallet
+        .create_account("strongpassword1", "Ed25519")
+        .await
+        .expect("create ed");
+    let evm = wallet
+        .create_evm_account("strongpassword1", "EVM")
+        .await
+        .expect("create evm");
 
     assert_ne!(ed.address, evm.address);
 
@@ -244,26 +294,50 @@ async fn test_mixed_account_types() {
 #[tokio::test]
 async fn test_sign_with_each_account_type() {
     let wallet = test_wallet();
-    let ed = wallet.create_account("strongpassword1", "Ed25519").await.expect("create ed");
-    let evm = wallet.create_evm_account("strongpassword1", "EVM").await.expect("create evm");
+    let ed = wallet
+        .create_account("strongpassword1", "Ed25519")
+        .await
+        .expect("create ed");
+    let evm = wallet
+        .create_evm_account("strongpassword1", "EVM")
+        .await
+        .expect("create evm");
     wallet.unlock("strongpassword1").await.expect("unlock");
 
-    let ed_sig = wallet.sign_message(&ed.address, b"test").await.expect("sign ed");
-    let evm_sig = wallet.sign_message(&evm.address, b"test").await.expect("sign evm");
+    let ed_sig = wallet
+        .sign_message(&ed.address, b"test")
+        .await
+        .expect("sign ed");
+    let evm_sig = wallet
+        .sign_message(&evm.address, b"test")
+        .await
+        .expect("sign evm");
 
     assert_eq!(ed_sig.len(), 64);
     assert_eq!(evm_sig.len(), 64);
-    assert_ne!(ed_sig, evm_sig, "Different key types must produce different signatures");
+    assert_ne!(
+        ed_sig, evm_sig,
+        "Different key types must produce different signatures"
+    );
 }
 
 #[tokio::test]
 async fn test_delete_one_account_keeps_others() {
     let wallet = test_wallet();
-    let a1 = wallet.create_account("strongpassword1", "A1").await.expect("create 1");
-    let a2 = wallet.create_account("strongpassword1", "A2").await.expect("create 2");
+    let a1 = wallet
+        .create_account("strongpassword1", "A1")
+        .await
+        .expect("create 1");
+    let a2 = wallet
+        .create_account("strongpassword1", "A2")
+        .await
+        .expect("create 2");
     assert_eq!(wallet.list_accounts().await.len(), 2);
 
-    wallet.delete_account(&a1.address, "strongpassword1").await.expect("delete a1");
+    wallet
+        .delete_account(&a1.address, "strongpassword1")
+        .await
+        .expect("delete a1");
     assert_eq!(wallet.list_accounts().await.len(), 1);
     assert_eq!(wallet.list_accounts().await[0].address, a2.address);
 }
@@ -275,7 +349,10 @@ async fn test_delete_one_account_keeps_others() {
 #[tokio::test]
 async fn test_concurrent_sign_operations() {
     let wallet = std::sync::Arc::new(test_wallet());
-    let account = wallet.create_account("strongpassword1", "Primary").await.expect("create");
+    let account = wallet
+        .create_account("strongpassword1", "Primary")
+        .await
+        .expect("create");
     wallet.unlock("strongpassword1").await.expect("unlock");
 
     let mut handles = vec![];
@@ -283,7 +360,8 @@ async fn test_concurrent_sign_operations() {
         let w = wallet.clone();
         let addr = account.address.clone();
         handles.push(tokio::spawn(async move {
-            w.sign_message(&addr, format!("message {}", i).as_bytes()).await
+            w.sign_message(&addr, format!("message {}", i).as_bytes())
+                .await
         }));
     }
 
@@ -326,7 +404,10 @@ async fn test_sdk_account_json_doesnt_leak_mnemonic_in_display() {
     // logging or transmission, it WILL be visible. This is by design for
     // the initial creation response. But callers should clear it after display.
     let wallet = test_wallet();
-    let account = wallet.create_account("strongpassword1", "Primary").await.expect("create");
+    let account = wallet
+        .create_account("strongpassword1", "Primary")
+        .await
+        .expect("create");
     let json = serde_json::to_string(&account).expect("serialize");
     // Verify the mnemonic IS in the JSON (it's supposed to be — for backup)
     assert!(json.contains(account.mnemonic.split_whitespace().next().unwrap_or("")));

@@ -125,11 +125,11 @@ impl InstitutionalSlashingManager {
             return record;
         }
 
-        state.offense_count += 1;
+        state.offense_count = state.offense_count.saturating_add(1);
 
         // Grace period for first offense
-        let is_grace = state.offense_count <= 1
-            && current_epoch < self.config.first_offense_grace_epochs;
+        let is_grace =
+            state.offense_count <= 1 && current_epoch < self.config.first_offense_grace_epochs;
 
         let penalty_pct = if is_grace {
             0
@@ -141,14 +141,18 @@ impl InstitutionalSlashingManager {
             }
         };
 
-        let penalty_wei = stake_wei * U256::from(penalty_pct) / U256::from(100);
+        let penalty_wei = crate::mul_div(stake_wei, U256::from(penalty_pct), U256::from(100));
 
-        state.cumulative_slashed_wei += penalty_wei;
+        state.cumulative_slashed_wei = state.cumulative_slashed_wei.saturating_add(penalty_wei);
         state.in_cooldown = true;
-        state.cooldown_until_epoch = current_epoch + self.config.cooldown_epochs;
+        state.cooldown_until_epoch = current_epoch.saturating_add(self.config.cooldown_epochs);
 
         // Check for forced deactivation
-        let max_slash = stake_wei * U256::from(self.config.max_cumulative_slash_pct) / U256::from(100);
+        let max_slash = crate::mul_div(
+            stake_wei,
+            U256::from(self.config.max_cumulative_slash_pct),
+            U256::from(100),
+        );
         if state.cumulative_slashed_wei >= max_slash {
             state.is_deactivated = true;
         }
@@ -199,7 +203,7 @@ mod tests {
             [0xAA; 32],
         );
 
-        let expected = stake() * U256::from(10u64) / U256::from(100u64);
+        let expected = crate::mul_div(stake(), U256::from(10u64), U256::from(100u64));
         assert_eq!(record.penalty_wei, expected);
         assert!(!record.is_grace_period);
     }
@@ -293,7 +297,7 @@ mod tests {
             [0xEE; 32],
         );
 
-        let expected = stake() * U256::from(15u64) / U256::from(100u64);
+        let expected = crate::mul_div(stake(), U256::from(15u64), U256::from(100u64));
         assert_eq!(record.penalty_wei, expected);
     }
 }

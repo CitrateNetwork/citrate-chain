@@ -45,7 +45,10 @@ fn test_signing_key() -> (SigningKey, PublicKey) {
 
 #[test]
 fn test_error_display_io() {
-    let err = WalletError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "not found"));
+    let err = WalletError::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "not found",
+    ));
     let msg = format!("{}", err);
     assert!(msg.contains("not found"), "Got: {}", msg);
 }
@@ -209,7 +212,9 @@ fn test_wallet_get_account_none_when_empty() {
 #[test]
 fn test_wallet_get_account_by_address_none() {
     let (_dir, wallet) = temp_wallet();
-    assert!(wallet.get_account_by_address(&Address([0xFF; 20])).is_none());
+    assert!(wallet
+        .get_account_by_address(&Address([0xFF; 20]))
+        .is_none());
 }
 
 #[test]
@@ -812,7 +817,12 @@ async fn test_rpc_client_get_gas_price_connection_refused() {
 async fn test_rpc_client_estimate_gas_connection_refused() {
     let client = RpcClient::new("http://127.0.0.1:19999");
     let result = client
-        .estimate_gas(&Address([0x11; 20]), Some(&Address([0x22; 20])), U256::from(100), vec![])
+        .estimate_gas(
+            &Address([0x11; 20]),
+            Some(&Address([0x22; 20])),
+            U256::from(100),
+            vec![],
+        )
         .await;
     assert!(result.is_err());
 }
@@ -916,14 +926,7 @@ async fn test_wallet_send_transaction_insufficient_balance() {
 
     // Account has zero balance, sending any value should fail
     let result = wallet
-        .send_transaction(
-            0,
-            Address([0x11; 20]),
-            U256::from(1),
-            vec![],
-            None,
-            None,
-        )
+        .send_transaction(0, Address([0x11; 20]), U256::from(1), vec![], None, None)
         .await;
     assert!(result.is_err());
     match result.unwrap_err() {

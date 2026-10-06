@@ -45,7 +45,10 @@ async fn build_chain(length: u64) -> (Arc<DagStore>, Arc<GhostDag>, Vec<Hash>) {
     let genesis = block(0xAA, 0, Hash::default());
     hashes.push(genesis.hash());
     dag.store_block(genesis.clone()).await.expect("genesis");
-    ghostdag.add_block(&genesis).await.expect("genesis ghostdag");
+    ghostdag
+        .add_block(&genesis)
+        .await
+        .expect("genesis ghostdag");
 
     for h in 1..=length {
         let parent = hashes[(h - 1) as usize];

@@ -32,7 +32,8 @@ fn tx(n: u64) -> Transaction {
 
 fn chain(n: u64) -> (Arc<StorageManager>, TempDir, Vec<Hash>) {
     let tmp = TempDir::new().expect("tempdir");
-    let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).expect("storage"));
+    let storage =
+        Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).expect("storage"));
     let genesis = BlockBuilder::new()
         .hash(Hash::new([0xEE; 32]))
         .parent(Hash::default())
@@ -80,7 +81,8 @@ fn io(storage: Arc<StorageManager>, fin: Arc<AtomicU64>) -> jsonrpc_core::IoHand
 }
 
 fn call(io: &jsonrpc_core::IoHandler, method: &str, params: Value) -> Value {
-    let req = serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}).to_string();
+    let req =
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}).to_string();
     let resp = io.handle_request_sync(&req).expect("response");
     serde_json::from_str(&resp).expect("json")
 }
@@ -121,14 +123,36 @@ fn v250_nothing_final_resolves_to_genesis_everywhere() {
     for tag in ["finalized", "safe"] {
         let b = call(&io, "eth_getBlockByNumber", serde_json::json!([tag, false]));
         assert_eq!(block_number(&b), Some(0), "{tag}: {b}");
-        assert_eq!(b["result"]["hash"].as_str().unwrap(), format!("0x{}", hex::encode(hashes[0].as_bytes())));
-        let c = call(&io, "eth_getBlockTransactionCountByNumber", serde_json::json!([tag]));
+        assert_eq!(
+            b["result"]["hash"].as_str().unwrap(),
+            format!("0x{}", hex::encode(hashes[0].as_bytes()))
+        );
+        let c = call(
+            &io,
+            "eth_getBlockTransactionCountByNumber",
+            serde_json::json!([tag]),
+        );
         assert_eq!(c["result"], "0x0", "{tag}: {c}");
-        let t = call(&io, "eth_getTransactionByBlockNumberAndIndex", serde_json::json!([tag, "0x0"]));
-        assert!(t.get("error").is_none() && t["result"].is_null(), "{tag}: {t}");
-        let l = call(&io, "eth_getLogs", serde_json::json!([{"fromBlock": tag, "toBlock": tag}]));
+        let t = call(
+            &io,
+            "eth_getTransactionByBlockNumberAndIndex",
+            serde_json::json!([tag, "0x0"]),
+        );
+        assert!(
+            t.get("error").is_none() && t["result"].is_null(),
+            "{tag}: {t}"
+        );
+        let l = call(
+            &io,
+            "eth_getLogs",
+            serde_json::json!([{"fromBlock": tag, "toBlock": tag}]),
+        );
         assert!(l.get("error").is_none(), "{tag}: {l}");
-        let f = call(&io, "eth_newFilter", serde_json::json!([{"fromBlock": tag, "toBlock": tag}]));
+        let f = call(
+            &io,
+            "eth_newFilter",
+            serde_json::json!([{"fromBlock": tag, "toBlock": tag}]),
+        );
         assert!(f.get("error").is_none(), "{tag}: {f}");
     }
 }
@@ -149,10 +173,18 @@ fn v250_tags_follow_the_finalized_handle() {
                 b["result"]["hash"].as_str().unwrap(),
                 format!("0x{}", hex::encode(hashes[h as usize].as_bytes()))
             );
-            let c = call(&io, "eth_getBlockTransactionCountByNumber", serde_json::json!([tag]));
+            let c = call(
+                &io,
+                "eth_getBlockTransactionCountByNumber",
+                serde_json::json!([tag]),
+            );
             assert_eq!(c["result"], if h == 0 { "0x0" } else { "0x1" });
         }
-        let latest = call(&io, "eth_getBlockByNumber", serde_json::json!(["latest", false]));
+        let latest = call(
+            &io,
+            "eth_getBlockByNumber",
+            serde_json::json!(["latest", false]),
+        );
         assert!(block_number(&latest).unwrap() >= h);
     }
 }
@@ -166,10 +198,16 @@ fn v250_state_methods_with_finalized_tag_are_recorded() {
     let io = io(storage, Arc::new(AtomicU64::new(0)));
     let addr = "0x0101010101010101010101010101010101010101";
     for (m, p) in [
-        ("eth_getTransactionCount", serde_json::json!([addr, "finalized"])),
+        (
+            "eth_getTransactionCount",
+            serde_json::json!([addr, "finalized"]),
+        ),
         ("eth_getBalance", serde_json::json!([addr, "finalized"])),
         ("eth_getCode", serde_json::json!([addr, "finalized"])),
-        ("eth_getStorageAt", serde_json::json!([addr, "0x0", "finalized"])),
+        (
+            "eth_getStorageAt",
+            serde_json::json!([addr, "0x0", "finalized"]),
+        ),
         ("eth_getBalance", serde_json::json!([addr, "0x0"])),
         ("eth_getBalance", serde_json::json!([addr, "bogus-tag"])),
     ] {
@@ -207,7 +245,11 @@ fn v250_state_read_at_finalized_must_not_return_latest_state() {
     let mut leaks = Vec::new();
     for tag in ["finalized", "safe"] {
         let b = call(&io, "eth_getBalance", serde_json::json!([addr, tag]));
-        let n = call(&io, "eth_getTransactionCount", serde_json::json!([addr, tag]));
+        let n = call(
+            &io,
+            "eth_getTransactionCount",
+            serde_json::json!([addr, tag]),
+        );
         println!("V250 {tag}: balance={b} nonce={n}");
         if b.get("result") == Some(&Value::String("0x5".into())) {
             leaks.push(format!("eth_getBalance({tag}) = latest 0x5"));
@@ -216,5 +258,8 @@ fn v250_state_read_at_finalized_must_not_return_latest_state() {
             leaks.push(format!("eth_getTransactionCount({tag}) = latest 0x3"));
         }
     }
-    assert!(leaks.is_empty(), "un-finalized state served under a finality tag: {leaks:?}");
+    assert!(
+        leaks.is_empty(),
+        "un-finalized state served under a finality tag: {leaks:?}"
+    );
 }

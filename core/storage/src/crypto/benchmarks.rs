@@ -5,8 +5,8 @@
 
 #[cfg(test)]
 mod bench_tests {
-    use crate::crypto::quantum_safe::{HybridKEM, QuantumSafeConfig, SecurityLevel};
     use crate::crypto::database_encryption::{DatabaseEncryptionConfig, EncryptedDatabase};
+    use crate::crypto::quantum_safe::{HybridKEM, QuantumSafeConfig, SecurityLevel};
     use std::time::Instant;
 
     /// Benchmark key generation
@@ -89,7 +89,10 @@ mod bench_tests {
         let sizes = [64, 1024, 16384, 65536, 1048576]; // 64B to 1MB
 
         println!("\n=== Encrypt/Decrypt Benchmark by Data Size ===");
-        println!("{:>12} {:>15} {:>15} {:>15}", "Size", "Encrypt", "Decrypt", "Throughput");
+        println!(
+            "{:>12} {:>15} {:>15} {:>15}",
+            "Size", "Encrypt", "Decrypt", "Throughput"
+        );
 
         for size in sizes {
             let data: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
@@ -176,9 +179,16 @@ mod bench_tests {
     #[test]
     fn bench_security_levels() {
         println!("\n=== Security Level Comparison ===");
-        println!("{:>10} {:>15} {:>15} {:>15}", "Level", "KeyGen", "Encap", "Decap");
+        println!(
+            "{:>10} {:>15} {:>15} {:>15}",
+            "Level", "KeyGen", "Encap", "Decap"
+        );
 
-        for level in [SecurityLevel::Standard, SecurityLevel::High, SecurityLevel::Maximum] {
+        for level in [
+            SecurityLevel::Standard,
+            SecurityLevel::High,
+            SecurityLevel::Maximum,
+        ] {
             let config = QuantumSafeConfig {
                 security_level: level,
                 ..Default::default()

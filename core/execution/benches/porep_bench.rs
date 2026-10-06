@@ -101,7 +101,9 @@ fn bench_seal_native(c: &mut Criterion) {
     let mut group = c.benchmark_group("pin/seal_native");
     // Long-running; reduce sample count to keep the run < 2 minutes
     // even at the larger sizes.
-    group.sample_size(10).measurement_time(std::time::Duration::from_secs(20));
+    group
+        .sample_size(10)
+        .measurement_time(std::time::Duration::from_secs(20));
 
     for &n in N_SWEEP {
         for &l in L_SWEEP {
@@ -132,7 +134,9 @@ fn bench_seal_native(c: &mut Criterion) {
 
 fn bench_witness_build(c: &mut Criterion) {
     let mut group = c.benchmark_group("pin/witness_build");
-    group.sample_size(20).measurement_time(std::time::Duration::from_secs(15));
+    group
+        .sample_size(20)
+        .measurement_time(std::time::Duration::from_secs(15));
 
     // Fix N=1024 (small enough to seal quickly) and sweep K.
     for &k in &[3usize, 11, 22] {
@@ -164,7 +168,9 @@ fn bench_witness_build(c: &mut Criterion) {
 
 fn bench_mockprover_k1(c: &mut Criterion) {
     let mut group = c.benchmark_group("pin/mockprover_k1");
-    group.sample_size(10).measurement_time(std::time::Duration::from_secs(30));
+    group
+        .sample_size(10)
+        .measurement_time(std::time::Duration::from_secs(30));
 
     let params = params_for(1024, 3, 1);
     let sealed = seal_generic(
@@ -180,14 +186,13 @@ fn bench_mockprover_k1(c: &mut Criterion) {
     // Pick an interior v* so all parents are full-degree.
     let v = 500usize;
     let challenge = build_challenge(&sealed, v).expect("challenge");
-    let circuit =
-        PoRepCircuitGeneric::from_sealed(&sealed, Halo2Fr::from(0xA1u64), &challenge);
+    let circuit = PoRepCircuitGeneric::from_sealed(&sealed, Halo2Fr::from(0xA1u64), &challenge);
     let pis = PoRepCircuitGeneric::public_inputs(&sealed, v);
 
     group.bench_function("N=1024_L=3_K=1", |b| {
         b.iter(|| {
-            let prover = MockProver::run(K_DEG_SINGLE_N1024, &circuit, vec![pis.clone()])
-                .expect("setup");
+            let prover =
+                MockProver::run(K_DEG_SINGLE_N1024, &circuit, vec![pis.clone()]).expect("setup");
             let ok = prover.verify();
             assert!(ok.is_ok(), "honest proof must verify");
         });
@@ -197,7 +202,9 @@ fn bench_mockprover_k1(c: &mut Criterion) {
 
 fn bench_mockprover_kfold_k3(c: &mut Criterion) {
     let mut group = c.benchmark_group("pin/mockprover_kfold_k3");
-    group.sample_size(10).measurement_time(std::time::Duration::from_secs(60));
+    group
+        .sample_size(10)
+        .measurement_time(std::time::Duration::from_secs(60));
 
     let params = params_for(1024, 3, 3);
     let sealed = seal_generic(
@@ -228,8 +235,8 @@ fn bench_mockprover_kfold_k3(c: &mut Criterion) {
 
     group.bench_function("N=1024_L=3_K=3", |b| {
         b.iter(|| {
-            let prover = MockProver::run(K_DEG_KFOLD_K3_N1024, &circuit, vec![pis.clone()])
-                .expect("setup");
+            let prover =
+                MockProver::run(K_DEG_KFOLD_K3_N1024, &circuit, vec![pis.clone()]).expect("setup");
             let ok = prover.verify();
             assert!(ok.is_ok(), "honest K=3 proof must verify");
         });

@@ -175,9 +175,9 @@ impl BlockBuilder {
             selected_parent_hash: selected_parent,
             merge_parent_hashes: merge_parents.clone(),
             timestamp,
-            height: parent_height + 1,
-            blue_score: parent_blue_score + 1, // Will be properly calculated by consensus
-            blue_work: 0,                      // Will be calculated by consensus
+            height: parent_height.saturating_add(1),
+            blue_score: parent_blue_score.saturating_add(1), // Will be properly calculated by consensus
+            blue_work: 0,                                    // Will be calculated by consensus
             pruning_point: Hash::default(),
             proposer_pubkey: self.proposer_key,
             vrf_reveal: vrf_proof,
@@ -403,15 +403,23 @@ impl BlockBuilder {
 
         if gas_used > gas_target {
             // Above target, increase base fee
-            let gas_delta = gas_used - gas_target;
-            // Increase = parent_base_fee * gas_delta / gas_target / 8
-            let increase = parent_base_fee.saturating_mul(gas_delta) / gas_target / 8;
+            let gas_delta = gas_used.saturating_sub(gas_target);
+            // Increase = parent_base_fee * gas_delta / gas_target / 8 (0 for a zero target)
+            let increase = parent_base_fee
+                .saturating_mul(gas_delta)
+                .checked_div(gas_target)
+                .unwrap_or(0)
+                >> 3;
             parent_base_fee.saturating_add(increase.max(1))
         } else {
             // Below target, decrease base fee
-            let gas_delta = gas_target - gas_used;
-            // Decrease = parent_base_fee * gas_delta / gas_target / 8
-            let decrease = parent_base_fee.saturating_mul(gas_delta) / gas_target / 8;
+            let gas_delta = gas_target.saturating_sub(gas_used);
+            // Decrease = parent_base_fee * gas_delta / gas_target / 8 (0 for a zero target)
+            let decrease = parent_base_fee
+                .saturating_mul(gas_delta)
+                .checked_div(gas_target)
+                .unwrap_or(0)
+                >> 3;
             parent_base_fee.saturating_sub(decrease).max(MIN_BASE_FEE)
         }
     }
@@ -490,7 +498,7 @@ impl BlockBuilder {
         let mut cumulative_gas: u64 = 0;
 
         for receipt in receipts {
-            cumulative_gas += receipt.gas_used;
+            cumulative_gas = cumulative_gas.saturating_add(receipt.gas_used);
 
             // Receipt fields that affect consensus:
             // - tx_hash: identifies the transaction
@@ -556,8 +564,8 @@ impl BlockBuilder {
             selected_parent_hash: selected_parent,
             merge_parent_hashes: merge_parents,
             timestamp,
-            height: parent_height + 1,
-            blue_score: parent_blue_score + 1,
+            height: parent_height.saturating_add(1),
+            blue_score: parent_blue_score.saturating_add(1),
             blue_work: 0,
             pruning_point: Hash::default(),
             proposer_pubkey: self.proposer_key,
@@ -675,11 +683,11 @@ impl BlockBuilder {
     /// Estimate block size in bytes
     fn estimate_block_size(&self, block: &Block) -> usize {
         // Header size estimate
-        let mut size = 200; // Approximate header size
+        let mut size: usize = 200; // Approximate header size
 
         // Add transaction sizes
         for tx in &block.transactions {
-            size += 32 + 8 + 32 + 32 + 16 + 8 + 8 + tx.data.len() + 64;
+            size = size.saturating_add(crate::mempool::Mempool::tx_size(tx));
         }
 
         size

@@ -48,6 +48,10 @@ use tokio::runtime::Runtime;
 ///
 /// Lazily initialised so unit tests in other crates that depend on us don't
 /// pay the cost unless they actually use it.
+// INVARIANT: building fails only when the OS refuses threads or file descriptors at
+// startup. Every RPC handler runs on this runtime, so there is no degraded mode to
+// fall back to; failing loudly at first use is the intended behavior.
+#[allow(clippy::expect_used)]
 static RPC_RT: Lazy<Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(16)

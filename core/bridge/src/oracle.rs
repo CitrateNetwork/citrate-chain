@@ -138,11 +138,11 @@ fn verify_attestation_signature(
         }
     })?;
 
-    pubkey.verify(&message, &sig).map_err(|_| {
-        BridgeError::InvalidSignature {
+    pubkey
+        .verify(&message, &sig)
+        .map_err(|_| BridgeError::InvalidSignature {
             oracle_id: hex::encode(attestation.oracle_id),
-        }
-    })
+        })
 }
 
 /// Check if an attestation timestamp is within the acceptable freshness window.
@@ -160,7 +160,7 @@ fn verify_attestation_freshness(attestation: &OracleAttestation) -> Result<(), B
     }
 
     // Also reject attestations from the future (clock skew > 60s)
-    if attestation.timestamp > now + 60 {
+    if attestation.timestamp > now.saturating_add(60) {
         return Err(BridgeError::StaleAttestation {
             timestamp: attestation.timestamp,
         });
@@ -200,11 +200,7 @@ impl OracleRegistry {
     }
 
     /// Register a new oracle.
-    pub fn register_oracle(
-        &mut self,
-        id: OracleId,
-        name: String,
-    ) -> Result<(), BridgeError> {
+    pub fn register_oracle(&mut self, id: OracleId, name: String) -> Result<(), BridgeError> {
         if self.oracles.contains_key(&id) {
             return Err(BridgeError::OracleAlreadyRegistered {
                 oracle_id: hex::encode(id),
@@ -302,10 +298,7 @@ impl OracleRegistry {
         }
 
         // Check for duplicate attestation from same oracle
-        let event_attestations = self
-            .attestations
-            .entry(attestation.event_id)
-            .or_default();
+        let event_attestations = self.attestations.entry(attestation.event_id).or_default();
 
         if event_attestations
             .iter()
@@ -325,7 +318,7 @@ impl OracleRegistry {
 
         // Update oracle stats
         oracle.last_attestation = attestation.timestamp;
-        oracle.total_attestations += 1;
+        oracle.total_attestations = oracle.total_attestations.saturating_add(1);
 
         // Store attestation
         event_attestations.push(attestation);
@@ -389,7 +382,7 @@ impl OracleRegistry {
                 );
                 continue;
             }
-            matching += 1;
+            matching = matching.saturating_add(1);
         }
         matching
     }
@@ -427,10 +420,10 @@ impl OracleRegistry {
     /// Verify that all attestations for an event have matching event hashes.
     pub fn verify_attestation_consistency(&self, event_id: &EventId) -> bool {
         if let Some(attestations) = self.attestations.get(event_id) {
-            if attestations.is_empty() {
+            let Some(first) = attestations.first() else {
                 return true;
-            }
-            let first_hash = &attestations[0].event_hash;
+            };
+            let first_hash = &first.event_hash;
             attestations.iter().all(|a| &a.event_hash == first_hash)
         } else {
             true
@@ -710,8 +703,7 @@ mod tests {
             .as_secs()
             - 600; // 10 minutes ago
 
-        let message =
-            attestation_message(0, &[0u8; 32], &event_id, &event_hash, old_timestamp);
+        let message = attestation_message(0, &[0u8; 32], &event_id, &event_hash, old_timestamp);
         let sig = sk.sign(&message);
 
         let att = OracleAttestation {

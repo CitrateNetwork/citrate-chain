@@ -36,6 +36,20 @@
 // See docs/consensus/REROLL_ADDENDUM_execute_on_receive_and_validator_s1.md (§C/§R')
 // and contracts/src/ValidatorRegistry.sol (creditReward / rewardMinter / priorityFeeShareBps).
 
+// PANIC-S1 G2: consensus path (block reward settlement); panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -166,10 +180,8 @@ pub fn new_shared_reward_policy() -> SharedRewardPolicy {
 ///   * type-2 (`eth_tx_type` 2): tip = `min(max_priority_fee, gas_price - base_fee)`
 ///     (with `gas_price == max_fee_per_gas`) — the canonical EIP-1559 effective tip.
 pub fn true_priority_per_gas(tx: &Transaction, base_fee: u64) -> Option<u64> {
-    if tx.gas_price < base_fee {
-        return None; // §R' reject rule: cannot cover the base fee.
-    }
-    let over_base = tx.gas_price - base_fee; // >= 0, checked above.
+    // §R' reject rule: `None` when the price cannot cover the base fee.
+    let over_base = tx.gas_price.checked_sub(base_fee)?;
     let tip = if tx.eth_tx_type == 2 {
         // gas_price == max_fee_per_gas for type-2; clamp by the explicit tip cap.
         let cap = tx.max_priority_fee_per_gas.unwrap_or(over_base);
@@ -227,7 +239,8 @@ pub fn compute_priority_pool(
             continue;
         }
         let charged = gas_charged(receipt, tx.gas_limit);
-        pool = pool.saturating_add(U256::from(tip) * U256::from(charged));
+        // INVARIANT: u64 × u64 < 2^128, so the product cannot saturate.
+        pool = pool.saturating_add(U256::from(tip).saturating_mul(U256::from(charged)));
     }
     Ok(pool)
 }
@@ -242,7 +255,9 @@ pub fn vested_share(pool: U256, share_bps: u64) -> U256 {
     // `saturating_add`: a u256 pool * a <=10000 bps cannot realistically
     // overflow, but we never panic on the arithmetic (a panic mid-settle would
     // be a fleet-wide liveness fault). Saturation is deterministic on every node.
-    pool.saturating_mul(U256::from(bps)) / U256::from(10_000u64)
+    pool.saturating_mul(U256::from(bps))
+        .checked_div(U256::from(10_000u64))
+        .unwrap_or_default()
 }
 
 /// The TOTAL amount vested to the proposer for one block (CBF-S1 / ADR-4):
@@ -281,17 +296,21 @@ pub fn encode_credit_reward(pubkey: &[u8; 32], amount: U256) -> Vec<u8> {
 /// Decode a `uint256` return word into `u64`, saturating on the impossible
 /// (for a bps / share) >u64 case — deterministically on every node.
 pub fn decode_u64_word(ret: &[u8]) -> Result<u64, String> {
-    if ret.len() < 32 {
-        return Err(format!("uint256 return too short ({} bytes)", ret.len()));
-    }
+    let w = abi_word(ret, "uint256")?;
     // Low 8 bytes hold the value for any in-range quantity; require the high 24
     // bytes are zero, else saturate to u64::MAX (never silently truncate).
-    if ret[..24].iter().any(|&b| b != 0) {
+    let (high, low) = w.split_at(24);
+    if high.iter().any(|&b| b != 0) {
         return Ok(u64::MAX);
     }
-    let mut b8 = [0u8; 8];
-    b8.copy_from_slice(&ret[24..32]);
-    Ok(u64::from_be_bytes(b8))
+    let low: [u8; 8] = low.try_into().map_err(|_| "uint256 low word".to_string())?;
+    Ok(u64::from_be_bytes(low))
+}
+
+/// The first 32-byte ABI word of a return buffer.
+fn abi_word<'a>(ret: &'a [u8], kind: &str) -> Result<&'a [u8; 32], String> {
+    ret.first_chunk::<32>()
+        .ok_or_else(|| format!("{kind} return too short ({} bytes)", ret.len()))
 }
 
 /// Decode a full-width `uint256` from a 32-byte ABI word.
@@ -301,21 +320,14 @@ pub fn decode_u64_word(ret: &[u8]) -> Result<u64, String> {
 /// wei) is two orders of magnitude above `u64::MAX`, so a u64 decode would clamp
 /// every realistic subsidy to a wrong value and vest the wrong amount.
 pub fn decode_u256_word(ret: &[u8]) -> Result<U256, String> {
-    if ret.len() < 32 {
-        return Err(format!("uint256 return too short ({} bytes)", ret.len()));
-    }
-    Ok(U256::from_big_endian(&ret[..32]))
+    Ok(U256::from_big_endian(abi_word(ret, "uint256")?))
 }
 
 /// Decode a right-aligned 20-byte address from a 32-byte ABI word (`address` or
 /// the first field of a struct return, e.g. `validatorInfo(...).staker`).
 pub fn decode_address_word(ret: &[u8]) -> Result<[u8; 20], String> {
-    if ret.len() < 32 {
-        return Err(format!("address return too short ({} bytes)", ret.len()));
-    }
-    let mut addr = [0u8; 20];
-    addr.copy_from_slice(&ret[12..32]);
-    Ok(addr)
+    let (_, addr) = abi_word(ret, "address")?.split_at(12);
+    addr.try_into().map_err(|_| "address word".to_string())
 }
 
 #[cfg(test)]
@@ -323,7 +335,12 @@ mod tests {
     use super::*;
     use citrate_consensus::types::{Hash, PublicKey, Signature};
 
-    fn mk_tx(eth_tx_type: u8, gas_price: u64, max_prio: Option<u64>, gas_limit: u64) -> Transaction {
+    fn mk_tx(
+        eth_tx_type: u8,
+        gas_price: u64,
+        max_prio: Option<u64>,
+        gas_limit: u64,
+    ) -> Transaction {
         Transaction {
             hash: Hash::default(),
             nonce: 0,
@@ -336,7 +353,11 @@ mod tests {
             signature: Signature::new([0u8; 64]),
             tx_type: None,
             eth_tx_type,
-            max_fee_per_gas: if eth_tx_type == 2 { Some(gas_price) } else { None },
+            max_fee_per_gas: if eth_tx_type == 2 {
+                Some(gas_price)
+            } else {
+                None
+            },
             max_priority_fee_per_gas: max_prio,
             access_list: None,
             chain_id: None,
@@ -429,7 +450,7 @@ mod tests {
     #[test]
     fn subsidy_vests_on_an_idle_chain() {
         let ten_salt = U256::from(10_000_000_000_000_000_000u128); // 10 SALT
-        // No fees whatsoever — the exact condition that paid zero before.
+                                                                   // No fees whatsoever — the exact condition that paid zero before.
         assert_eq!(vested_share(U256::zero(), 10_000), U256::zero());
         assert_eq!(total_vested(U256::zero(), 10_000, ten_salt), ten_salt);
         // And the zero short-circuit in `settle_block_rewards` is no longer taken.
@@ -475,7 +496,10 @@ mod tests {
         assert_eq!(decode_u256_word(&word).expect("decode"), ceil);
         // The narrow decoder saturates — proving why it must not be used here.
         assert_eq!(decode_u64_word(&word).expect("decode"), u64::MAX);
-        assert!(decode_u256_word(&word[..31]).is_err(), "short word must error");
+        assert!(
+            decode_u256_word(&word[..31]).is_err(),
+            "short word must error"
+        );
     }
 
     #[test]
@@ -542,7 +566,12 @@ mod proptests {
     use proptest::prelude::*;
 
     /// EIP-1559 tip oracle, written independently of the implementation.
-    fn expected_tip(eth_tx_type: u8, gas_price: u64, max_prio: Option<u64>, base_fee: u64) -> Option<u64> {
+    fn expected_tip(
+        eth_tx_type: u8,
+        gas_price: u64,
+        max_prio: Option<u64>,
+        base_fee: u64,
+    ) -> Option<u64> {
         if gas_price < base_fee {
             return None;
         }
@@ -807,7 +836,16 @@ mod proptests {
     /// — the same on every node, so producer and receiver never split a wei.
     #[test]
     fn vested_share_rounding_property() {
-        let pools: [u128; 8] = [0, 1, 7, 9_999, 10_000, 10_001, 123_456_789, u64::MAX as u128];
+        let pools: [u128; 8] = [
+            0,
+            1,
+            7,
+            9_999,
+            10_000,
+            10_001,
+            123_456_789,
+            u64::MAX as u128,
+        ];
         let bpss: [u64; 7] = [0, 1, 2500, 3333, 5000, 9999, 10000];
         for &p in &pools {
             for &bps in &bpss {

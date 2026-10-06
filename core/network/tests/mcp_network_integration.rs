@@ -60,15 +60,15 @@ impl NetworkInferenceExecutor for MockMCPExecutor {
 }
 
 /// Build a minimal handler backed by temp storage + a mock executor.
-fn build_handler(executor: Arc<dyn NetworkInferenceExecutor>) -> (AINetworkHandler, Arc<StateManager>) {
+fn build_handler(
+    executor: Arc<dyn NetworkInferenceExecutor>,
+) -> (AINetworkHandler, Arc<StateManager>) {
     let temp_dir = TempDir::new().unwrap();
     // Leak TempDir so it lives for the test duration (we don't care about cleanup in tests)
     let temp_path = temp_dir.path().to_path_buf();
     std::mem::forget(temp_dir);
 
-    let storage = Arc::new(
-        StorageManager::new(&temp_path, PruningConfig::default()).unwrap(),
-    );
+    let storage = Arc::new(StorageManager::new(&temp_path, PruningConfig::default()).unwrap());
     let state_manager = Arc::new(StateManager::new(storage.db.clone()));
     let peer_manager = Arc::new(PeerManager::new(PeerManagerConfig::default()));
 
@@ -137,7 +137,10 @@ mod mcp_network_integration {
             .expect("handle_message should not return Err");
 
         // 4. Should produce an InferenceResponse
-        assert!(response.is_some(), "Executor is configured — must get a response");
+        assert!(
+            response.is_some(),
+            "Executor is configured — must get a response"
+        );
         let response = response.unwrap();
 
         match response {

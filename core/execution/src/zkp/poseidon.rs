@@ -17,11 +17,9 @@
 // implementation, providing simple hash interfaces that mirror mimc.rs.
 
 use ark_bls12_381::Fr;
-use ark_crypto_primitives::sponge::poseidon::{PoseidonConfig, PoseidonSponge};
 use ark_crypto_primitives::sponge::poseidon::traits::find_poseidon_ark_and_mds;
-use ark_crypto_primitives::sponge::{
-    CryptographicSponge, FieldBasedCryptographicSponge,
-};
+use ark_crypto_primitives::sponge::poseidon::{PoseidonConfig, PoseidonSponge};
+use ark_crypto_primitives::sponge::{CryptographicSponge, FieldBasedCryptographicSponge};
 use ark_ff::PrimeField;
 use ark_r1cs_std::fields::fp::FpVar;
 use ark_r1cs_std::prelude::*;
@@ -58,15 +56,7 @@ static POSEIDON_CONFIG: Lazy<PoseidonConfig<Fr>> = Lazy::new(|| {
         skip_matrices,
     );
 
-    PoseidonConfig::new(
-        full_rounds,
-        partial_rounds,
-        alpha,
-        mds,
-        ark,
-        rate,
-        capacity,
-    )
+    PoseidonConfig::new(full_rounds, partial_rounds, alpha, mds, ark, rate, capacity)
 });
 
 // ---------------------------------------------------------------------------
@@ -84,8 +74,12 @@ pub fn poseidon_hash(inputs: &[Fr]) -> Fr {
     let config = &*POSEIDON_CONFIG;
     let mut sponge = PoseidonSponge::<Fr>::new(config);
     sponge.absorb(&inputs.to_vec());
-    let result = sponge.squeeze_native_field_elements(1);
-    result[0]
+    // Squeezing 1 element always yields exactly one.
+    sponge
+        .squeeze_native_field_elements(1)
+        .first()
+        .copied()
+        .unwrap_or_else(|| Fr::from(0u64))
 }
 
 // ---------------------------------------------------------------------------
@@ -107,7 +101,7 @@ pub fn poseidon_hash_circuit(
     let mut sponge = PoseidonSpongeVar::<Fr>::new(cs, config);
     sponge.absorb(&inputs.to_vec())?;
     let result = sponge.squeeze_field_elements(1)?;
-    Ok(result[0].clone())
+    result.first().cloned().ok_or(SynthesisError::Unsatisfiable)
 }
 
 /// Get a reference to the Poseidon configuration (for testing / external use).
@@ -225,7 +219,11 @@ mod tests {
         let cs = ConstraintSystem::<Fr>::new_ref();
         let circuit_hash = poseidon_hash_circuit(cs.clone(), &[]).unwrap();
         let circuit_val = circuit_hash.value().unwrap();
-        assert_eq!(circuit_val, Fr::from(0u64), "Empty circuit hash must be zero");
+        assert_eq!(
+            circuit_val,
+            Fr::from(0u64),
+            "Empty circuit hash must be zero"
+        );
         assert!(cs.is_satisfied().unwrap());
     }
 

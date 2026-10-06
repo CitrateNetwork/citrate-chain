@@ -81,9 +81,11 @@ impl ProvenanceChain {
 
     /// Validate the chain: each entry must link to the previous.
     pub fn validate(&self) -> LearningResult<()> {
-        for i in 1..self.entries.len() {
-            let prev_hash = compute_entry_hash(&self.entries[i - 1]);
-            match &self.entries[i].parent_adapter_hash {
+        for (k, pair) in self.entries.windows(2).enumerate() {
+            let [prev, cur] = pair else { continue };
+            let i = k.saturating_add(1); // index of `cur`, for messages
+            let prev_hash = compute_entry_hash(prev);
+            match &cur.parent_adapter_hash {
                 Some(h) if *h == prev_hash => {}
                 Some(_) => {
                     return Err(LearningError::AdapterError {
@@ -261,24 +263,26 @@ impl AdapterFactory {
         // Initialize A: d × r matrix
         // Each column is a scaled version of the embedding
         let scale = 1.0 / (rank as f32).sqrt();
-        let mut matrix_a = vec![vec![0.0f32; rank]; dim];
-        for i in 0..dim {
-            for j in 0..rank {
-                matrix_a[i][j] = embedding.data[i] * scale * ((j + 1) as f32 / rank as f32);
-            }
-        }
+        // (j + 1) as f32 == j as f32 + 1.0 exactly for any realistic rank (< 2^24).
+        let matrix_a: Vec<Vec<f32>> = embedding
+            .data
+            .iter()
+            .map(|&e| {
+                (0..rank)
+                    .map(|j| e * scale * ((j as f32 + 1.0) / rank as f32))
+                    .collect()
+            })
+            .collect();
 
         // Initialize B: r × d matrix
         // Each row is uniform 1/d to start (low-magnitude)
         let b_val = 1.0 / dim as f32;
-        let mut matrix_b = vec![vec![0.0f32; dim]; rank];
-        for j in 0..rank {
-            for i in 0..dim {
-                matrix_b[j][i] = b_val * ((j + 1) as f32 / rank as f32);
-            }
-        }
+        let matrix_b: Vec<Vec<f32>> = (0..rank)
+            .map(|j| vec![b_val * ((j as f32 + 1.0) / rank as f32); dim])
+            .collect();
 
-        let id = Self::compute_lora_id(&matrix_a, &matrix_b, &metadata, &creator, checkpoint_height);
+        let id =
+            Self::compute_lora_id(&matrix_a, &matrix_b, &metadata, &creator, checkpoint_height);
 
         let provenance = ProvenanceChain::new(ProvenanceEntry {
             creator,
@@ -336,7 +340,13 @@ impl AdapterFactory {
 
     /// Verify a LoRA adapter's hash matches its content.
     pub fn verify_lora_hash(adapter: &LoraAdapter) -> bool {
-        let expected = Self::compute_lora_id(&adapter.matrix_a, &adapter.matrix_b, &adapter.metadata, &adapter.creator, adapter.checkpoint_height);
+        let expected = Self::compute_lora_id(
+            &adapter.matrix_a,
+            &adapter.matrix_b,
+            &adapter.metadata,
+            &adapter.creator,
+            adapter.checkpoint_height,
+        );
         adapter.id == expected
     }
 }
@@ -344,29 +354,27 @@ impl AdapterFactory {
 /// Compute (A × B) · v efficiently as A · (B · v).
 ///
 /// A: d×r, B: r×d, v: d-dimensional → result: d-dimensional
-#[allow(clippy::needless_range_loop)]
 fn matmul_ab_vector(a: &[Vec<f32>], b: &[Vec<f32>], v: &[f32]) -> Vec<f32> {
-    let rank = b.len();
-    let dim = v.len();
+    // Step 1: Bv = B · v (r-dimensional); each B row has d entries.
+    let bv: Vec<f32> = b
+        .iter()
+        .map(|row| {
+            let mut sum = 0.0f32;
+            for (&w, &x) in row.iter().zip(v) {
+                sum += w * x;
+            }
+            sum
+        })
+        .collect();
 
-    // Step 1: Bv = B · v (r-dimensional)
-    let mut bv = vec![0.0f32; rank];
-    for j in 0..rank {
+    // Step 2: A · Bv (d-dimensional); A has d rows of r entries.
+    let mut result = vec![0.0f32; v.len()];
+    for (r, row) in result.iter_mut().zip(a) {
         let mut sum = 0.0f32;
-        for i in 0..dim {
-            sum += b[j][i] * v[i];
+        for (&w, &x) in row.iter().zip(&bv) {
+            sum += w * x;
         }
-        bv[j] = sum;
-    }
-
-    // Step 2: A · Bv (d-dimensional)
-    let mut result = vec![0.0f32; dim];
-    for i in 0..dim {
-        let mut sum = 0.0f32;
-        for j in 0..rank {
-            sum += a[i][j] * bv[j];
-        }
-        result[i] = sum;
+        *r = sum;
     }
 
     result
@@ -389,8 +397,8 @@ pub fn apply_lora(
 
     let delta = matmul_ab_vector(&adapter.matrix_a, &adapter.matrix_b, &base.data);
     let mut result = base.data.clone();
-    for i in 0..result.len() {
-        result[i] += delta[i];
+    for (r, d) in result.iter_mut().zip(&delta) {
+        *r += d;
     }
 
     EmbeddingVector::new(result)
@@ -413,8 +421,8 @@ pub fn remove_lora(
 
     let delta = matmul_ab_vector(&adapter.matrix_a, &adapter.matrix_b, &base.data);
     let mut result = modified.data.clone();
-    for i in 0..result.len() {
-        result[i] -= delta[i];
+    for (r, d) in result.iter_mut().zip(&delta) {
+        *r -= d;
     }
 
     EmbeddingVector::new(result)
@@ -445,9 +453,9 @@ pub fn apply_lora_confidence_gated(
 
     let delta = matmul_ab_vector(&adapter.matrix_a, &adapter.matrix_b, &base.data);
     let mut result = base.data.clone();
-    for i in 0..result.len() {
-        if confidence[i] > threshold {
-            result[i] += delta[i];
+    for ((r, d), &c) in result.iter_mut().zip(&delta).zip(confidence) {
+        if c > threshold {
+            *r += d;
         }
     }
 
@@ -460,18 +468,17 @@ pub fn apply_lora_confidence_gated(
 ///
 /// This is an upper bound on the spectral norm ‖A×B‖_s, which is
 /// sufficient for Theorem 2 bound checking.
-#[allow(clippy::needless_range_loop)]
 pub fn spectral_norm_bound(adapter: &LoraAdapter) -> f32 {
     let dim = adapter.dim;
     let rank = adapter.rank;
 
-    // Compute (A×B) explicitly and accumulate Frobenius norm
+    // Compute (A×B) explicitly and accumulate Frobenius norm (same i, k, j order).
     let mut frobenius_sq = 0.0f32;
-    for i in 0..dim {
+    for row_a in adapter.matrix_a.iter().take(dim) {
         for k in 0..dim {
             let mut val = 0.0f32;
-            for j in 0..rank {
-                val += adapter.matrix_a[i][j] * adapter.matrix_b[j][k];
+            for (&a_ij, row_b) in row_a.iter().zip(&adapter.matrix_b).take(rank) {
+                val += a_ij * row_b.get(k).copied().unwrap_or(0.0);
             }
             frobenius_sq += val * val;
         }
@@ -504,33 +511,39 @@ pub fn compose_lora(
     }
 
     let dim = first.dim;
-    let new_rank = first.rank + second.rank;
+    let new_rank = first.rank.saturating_add(second.rank);
 
     // A_new = [A1 | A2]: d × (r1+r2)
-    let mut matrix_a = vec![vec![0.0f32; new_rank]; dim];
-    for i in 0..dim {
-        for j in 0..first.rank {
-            matrix_a[i][j] = first.matrix_a[i][j];
-        }
-        for j in 0..second.rank {
-            matrix_a[i][first.rank + j] = second.matrix_a[i][j];
-        }
-    }
+    let matrix_a: Vec<Vec<f32>> = first
+        .matrix_a
+        .iter()
+        .zip(&second.matrix_a)
+        .take(dim)
+        .map(|(r1, r2)| {
+            r1.iter()
+                .take(first.rank)
+                .chain(r2.iter().take(second.rank))
+                .copied()
+                .collect()
+        })
+        .collect();
 
     // B_new = [B1; B2]: (r1+r2) × d
-    let mut matrix_b = vec![vec![0.0f32; dim]; new_rank];
-    for j in 0..first.rank {
-        for i in 0..dim {
-            matrix_b[j][i] = first.matrix_b[j][i];
-        }
-    }
-    for j in 0..second.rank {
-        for i in 0..dim {
-            matrix_b[first.rank + j][i] = second.matrix_b[j][i];
-        }
-    }
+    let matrix_b: Vec<Vec<f32>> = first
+        .matrix_b
+        .iter()
+        .take(first.rank)
+        .chain(second.matrix_b.iter().take(second.rank))
+        .map(|row| row.iter().take(dim).copied().collect())
+        .collect();
 
-    let id = AdapterFactory::compute_lora_id(&matrix_a, &matrix_b, &metadata, &creator, checkpoint_height);
+    let id = AdapterFactory::compute_lora_id(
+        &matrix_a,
+        &matrix_b,
+        &metadata,
+        &creator,
+        checkpoint_height,
+    );
 
     let mut provenance = first.provenance.clone();
     for entry in &second.provenance.entries {
@@ -558,25 +571,26 @@ pub fn compose_lora_chain(
     checkpoint_height: u64,
     signature: Signature,
 ) -> LearningResult<LoraAdapter> {
-    if adapters.is_empty() {
-        return Err(LearningError::AdapterError {
-            reason: "empty adapter chain".to_string(),
-        });
-    }
-    if adapters.len() == 1 {
-        return Ok(adapters[0].clone());
-    }
+    let (first, second, rest) = match adapters {
+        [] => {
+            return Err(LearningError::AdapterError {
+                reason: "empty adapter chain".to_string(),
+            })
+        }
+        [only] => return Ok((*only).clone()),
+        [first, second, rest @ ..] => (*first, *second, rest),
+    };
 
     let mut result = compose_lora(
-        adapters[0],
-        adapters[1],
+        first,
+        second,
         metadata.clone(),
         creator,
         checkpoint_height,
         signature,
     )?;
 
-    for adapter in &adapters[2..] {
+    for adapter in rest {
         result = compose_lora(
             &result,
             adapter,
@@ -616,7 +630,13 @@ impl AdapterRegistry {
         // `adapter.id`. Keying on an unverified id let an attacker register under
         // a legitimate adapter's hash (and `insert` silently overwrote it),
         // stealing and replacing attribution for a paid contribution type.
-        let expected = AdapterFactory::compute_lora_id(&adapter.matrix_a, &adapter.matrix_b, &adapter.metadata, &adapter.creator, adapter.checkpoint_height);
+        let expected = AdapterFactory::compute_lora_id(
+            &adapter.matrix_a,
+            &adapter.matrix_b,
+            &adapter.metadata,
+            &adapter.creator,
+            adapter.checkpoint_height,
+        );
         if adapter.id != expected {
             return Err(LearningError::AdapterError {
                 reason: "adapter id does not match its content hash".to_string(),
@@ -694,14 +714,8 @@ mod tests {
     fn test_adapter_application() {
         let base = EmbeddingVector::new(vec![1.0, 2.0, 3.0]).unwrap();
         let delta = EmbeddingVector::new(vec![0.1, -0.2, 0.3]).unwrap();
-        let adapter = AdapterFactory::create(
-            delta,
-            test_metadata(1),
-            [1u8; 32],
-            100,
-            vec![0u8; 64],
-        )
-        .unwrap();
+        let adapter =
+            AdapterFactory::create(delta, test_metadata(1), [1u8; 32], 100, vec![0u8; 64]).unwrap();
 
         let result = apply_adapter(&base, &adapter).unwrap();
         assert!((result.data[0] - 1.1).abs() < 1e-6);
@@ -713,14 +727,8 @@ mod tests {
     #[test]
     fn test_hash_verification() {
         let delta = EmbeddingVector::new(vec![0.1, -0.2, 0.3]).unwrap();
-        let adapter = AdapterFactory::create(
-            delta,
-            test_metadata(1),
-            [1u8; 32],
-            100,
-            vec![0u8; 64],
-        )
-        .unwrap();
+        let adapter =
+            AdapterFactory::create(delta, test_metadata(1), [1u8; 32], 100, vec![0u8; 64]).unwrap();
 
         assert!(AdapterFactory::verify_hash(&adapter));
 
@@ -736,8 +744,10 @@ mod tests {
         let delta1 = EmbeddingVector::new(vec![0.1, 0.2]).unwrap();
         let delta2 = EmbeddingVector::new(vec![0.3, -0.1]).unwrap();
 
-        let a1 = AdapterFactory::create(delta1, test_metadata(1), [1u8; 32], 100, vec![0u8; 64]).unwrap();
-        let a2 = AdapterFactory::create(delta2, test_metadata(2), [2u8; 32], 200, vec![0u8; 64]).unwrap();
+        let a1 = AdapterFactory::create(delta1, test_metadata(1), [1u8; 32], 100, vec![0u8; 64])
+            .unwrap();
+        let a2 = AdapterFactory::create(delta2, test_metadata(2), [2u8; 32], 200, vec![0u8; 64])
+            .unwrap();
 
         let composed = compose_adapters(&a1, &a2).unwrap();
         assert!((composed.data[0] - 0.4).abs() < 1e-6);
@@ -926,10 +936,8 @@ mod tests {
         let a2 = create_test_lora(4, 2, 2);
 
         // Compose
-        let composed = compose_lora(
-            &a1, &a2, test_metadata(3), [3u8; 32], 300, vec![0u8; 64],
-        )
-        .unwrap();
+        let composed =
+            compose_lora(&a1, &a2, test_metadata(3), [3u8; 32], 300, vec![0u8; 64]).unwrap();
 
         assert_eq!(composed.rank, 4); // r1 + r2
         assert_eq!(composed.dim, 4);
@@ -973,9 +981,15 @@ mod tests {
         let e2 = EmbeddingVector::new(vec![0.0, 1.0, 0.0]).unwrap();
         let e3 = EmbeddingVector::new(vec![0.0, 0.0, 1.0]).unwrap();
 
-        let a = AdapterFactory::create_lora(&e1, 2, test_metadata(1), [1u8; 32], 100, vec![0u8; 64]).unwrap();
-        let b = AdapterFactory::create_lora(&e2, 2, test_metadata(2), [2u8; 32], 200, vec![0u8; 64]).unwrap();
-        let c = AdapterFactory::create_lora(&e3, 2, test_metadata(3), [3u8; 32], 300, vec![0u8; 64]).unwrap();
+        let a =
+            AdapterFactory::create_lora(&e1, 2, test_metadata(1), [1u8; 32], 100, vec![0u8; 64])
+                .unwrap();
+        let b =
+            AdapterFactory::create_lora(&e2, 2, test_metadata(2), [2u8; 32], 200, vec![0u8; 64])
+                .unwrap();
+        let c =
+            AdapterFactory::create_lora(&e3, 2, test_metadata(3), [3u8; 32], 300, vec![0u8; 64])
+                .unwrap();
 
         // compose(a, compose(b, c))
         let bc = compose_lora(&b, &c, test_metadata(4), [4u8; 32], 400, vec![0u8; 64]).unwrap();
@@ -1008,11 +1022,15 @@ mod tests {
         let creator2 = [2u8; 32];
 
         let e1 = EmbeddingVector::new(vec![1.0, 2.0]).unwrap();
-        let a1 = AdapterFactory::create_lora(&e1, 1, test_metadata(1), creator1, 100, vec![0u8; 64]).unwrap();
+        let a1 =
+            AdapterFactory::create_lora(&e1, 1, test_metadata(1), creator1, 100, vec![0u8; 64])
+                .unwrap();
         let a1_id = a1.id;
 
         let e2 = EmbeddingVector::new(vec![3.0, 4.0]).unwrap();
-        let a2 = AdapterFactory::create_lora(&e2, 1, test_metadata(2), creator2, 200, vec![0u8; 64]).unwrap();
+        let a2 =
+            AdapterFactory::create_lora(&e2, 1, test_metadata(2), creator2, 200, vec![0u8; 64])
+                .unwrap();
 
         // Register
         let hash1 = registry.register(a1).unwrap();
@@ -1044,7 +1062,9 @@ mod tests {
     fn test_adapter_registry_duplicate() {
         let registry = AdapterRegistry::new();
         let e = EmbeddingVector::new(vec![1.0, 2.0]).unwrap();
-        let adapter = AdapterFactory::create_lora(&e, 1, test_metadata(1), [1u8; 32], 100, vec![0u8; 64]).unwrap();
+        let adapter =
+            AdapterFactory::create_lora(&e, 1, test_metadata(1), [1u8; 32], 100, vec![0u8; 64])
+                .unwrap();
 
         let _hash1 = registry.register(adapter.clone()).unwrap();
         // Second registration of an already-present id is refused.
@@ -1059,9 +1079,11 @@ mod tests {
     fn test_creator_bound_into_id_and_register_rejects_forgery() {
         let e = EmbeddingVector::new(vec![1.0, 2.0]).unwrap();
         let honest =
-            AdapterFactory::create_lora(&e, 1, test_metadata(1), [1u8; 32], 100, vec![0u8; 64]).unwrap();
+            AdapterFactory::create_lora(&e, 1, test_metadata(1), [1u8; 32], 100, vec![0u8; 64])
+                .unwrap();
         let other_creator =
-            AdapterFactory::create_lora(&e, 1, test_metadata(1), [2u8; 32], 100, vec![0u8; 64]).unwrap();
+            AdapterFactory::create_lora(&e, 1, test_metadata(1), [2u8; 32], 100, vec![0u8; 64])
+                .unwrap();
 
         // Same matrices/metadata, different creator ⇒ different id.
         assert_ne!(honest.id, other_creator.id);
@@ -1074,5 +1096,90 @@ mod tests {
         let registry = AdapterRegistry::new();
         assert!(registry.register(forged).is_err());
         assert_eq!(registry.count(), 0);
+    }
+
+    /// PANIC-S1: bit-exact fingerprint over LoRA create / apply / remove / gated
+    /// apply / compose / chain / spectral norm / provenance validation. Recorded
+    /// on the pre-conversion (indexed-loop) code.
+    fn lora_fingerprint() -> String {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut feed = |x: f32| {
+            for b in x.to_bits().to_le_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        let dim = 7;
+        let mk = |s: f32| {
+            EmbeddingVector::new((0..dim).map(|i| (i as f32 * 0.37 + s).sin()).collect()).unwrap()
+        };
+        let a1 = AdapterFactory::create_lora(
+            &mk(0.1),
+            3,
+            test_metadata(1),
+            [1u8; 32],
+            10,
+            vec![0u8; 64],
+        )
+        .unwrap();
+        let a2 = AdapterFactory::create_lora(
+            &mk(0.9),
+            2,
+            test_metadata(2),
+            [2u8; 32],
+            11,
+            vec![0u8; 64],
+        )
+        .unwrap();
+        let a3 = AdapterFactory::create_lora(
+            &mk(1.7),
+            4,
+            test_metadata(3),
+            [3u8; 32],
+            12,
+            vec![0u8; 64],
+        )
+        .unwrap();
+        let base = mk(2.3);
+        for v in apply_lora(&base, &a1).unwrap().data {
+            feed(v);
+        }
+        let applied = apply_lora(&base, &a2).unwrap();
+        for v in remove_lora(&applied, &base, &a2).unwrap().data {
+            feed(v);
+        }
+        let conf: Vec<f32> = (0..dim).map(|i| i as f32 / dim as f32).collect();
+        for v in apply_lora_confidence_gated(&base, &a3, &conf, 0.4)
+            .unwrap()
+            .data
+        {
+            feed(v);
+        }
+        let c = compose_lora(&a1, &a2, test_metadata(4), [4u8; 32], 13, vec![0u8; 64]).unwrap();
+        feed(spectral_norm_bound(&c));
+        let chain = compose_lora_chain(
+            &[&a1, &a2, &a3],
+            test_metadata(5),
+            [5u8; 32],
+            14,
+            vec![0u8; 64],
+        )
+        .unwrap();
+        feed(spectral_norm_bound(&chain));
+        for v in apply_lora(&base, &chain).unwrap().data {
+            feed(v);
+        }
+        feed(chain.rank as f32);
+        feed(if chain.provenance.validate().is_ok() {
+            1.0
+        } else {
+            0.0
+        });
+        format!("{h:016x}")
+    }
+
+    #[test]
+    fn panic_s1_lora_bit_exact() {
+        assert_eq!(lora_fingerprint(), "a2edcc227773c4f8");
     }
 }

@@ -15,17 +15,18 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use pqcrypto_kyber::kyber768;
-use pqcrypto_traits::kem::{PublicKey as KemPublicKey, SecretKey as KemSecretKey, SharedSecret, Ciphertext};
-use sha3::{Sha3_256, Sha3_512, Digest};
+use pqcrypto_traits::kem::{
+    Ciphertext, PublicKey as KemPublicKey, SecretKey as KemSecretKey, SharedSecret,
+};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+use sha3::{Digest, Sha3_256, Sha3_512};
+use std::fmt;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroize;
-use std::fmt;
 
 /// Security level for encryption operations
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SecurityLevel {
     /// 128-bit classical / 64-bit quantum security (Kyber-512 equivalent)
     /// Suitable for short-term data
@@ -38,7 +39,6 @@ pub enum SecurityLevel {
     /// For long-term secrets (AI models, master keys)
     Maximum,
 }
-
 
 /// Configuration for quantum-safe encryption
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,7 +142,10 @@ impl HybridKEM {
     }
 
     /// Encapsulate a shared secret using hybrid encryption
-    pub fn encapsulate(&self, public_key: &HybridPublicKey) -> Result<(HybridEncapsulation, [u8; 32]), CryptoError> {
+    pub fn encapsulate(
+        &self,
+        public_key: &HybridPublicKey,
+    ) -> Result<(HybridEncapsulation, [u8; 32]), CryptoError> {
         // Parse Kyber public key
         let pq_pk = kyber768::PublicKey::from_bytes(&public_key.pq_public)
             .map_err(|_| CryptoError::InvalidKeySize)?;
@@ -151,7 +154,8 @@ impl HybridKEM {
         let (pq_ss, pq_ct) = kyber768::encapsulate(&pq_pk);
 
         // Parse X25519 public key
-        let classical_pk_bytes: [u8; 32] = public_key.classical_public
+        let classical_pk_bytes: [u8; 32] = public_key
+            .classical_public
             .as_slice()
             .try_into()
             .map_err(|_| CryptoError::InvalidKeySize)?;
@@ -163,24 +167,18 @@ impl HybridKEM {
         let classical_ss = eph_secret.diffie_hellman(&classical_pk);
 
         // Combine shared secrets using domain-separated KDF
-        let combined_ss = self.combine_shared_secrets(
-            pq_ss.as_bytes(),
-            classical_ss.as_bytes(),
-        )?;
+        let combined_ss = self.combine_shared_secrets(pq_ss.as_bytes(), classical_ss.as_bytes())?;
 
         // Compute key commitment for integrity
-        let commitment = self.compute_key_commitment(
-            &combined_ss,
-            pq_ct.as_bytes(),
-            eph_public.as_bytes(),
-        );
+        let commitment =
+            self.compute_key_commitment(&combined_ss, pq_ct.as_bytes(), eph_public.as_bytes());
 
         let encap = HybridEncapsulation {
             version: 1,
             pq_ciphertext: pq_ct.as_bytes().to_vec(),
             classical_public: eph_public.as_bytes().to_vec(),
             key_commitment: commitment,
-            pq_algorithm: 0x02, // Kyber-768
+            pq_algorithm: 0x02,        // Kyber-768
             classical_algorithm: 0x01, // X25519
         };
 
@@ -208,13 +206,15 @@ impl HybridKEM {
         let pq_ss = kyber768::decapsulate(&pq_ct, &pq_sk);
 
         // Parse X25519 keys
-        let classical_sk_bytes: [u8; 32] = secret_key.classical_secret
+        let classical_sk_bytes: [u8; 32] = secret_key
+            .classical_secret
             .as_slice()
             .try_into()
             .map_err(|_| CryptoError::InvalidKeySize)?;
         let classical_sk = StaticSecret::from(classical_sk_bytes);
 
-        let eph_pk_bytes: [u8; 32] = encapsulation.classical_public
+        let eph_pk_bytes: [u8; 32] = encapsulation
+            .classical_public
             .as_slice()
             .try_into()
             .map_err(|_| CryptoError::InvalidKeySize)?;
@@ -224,10 +224,7 @@ impl HybridKEM {
         let classical_ss = classical_sk.diffie_hellman(&eph_pk);
 
         // Combine shared secrets
-        let combined_ss = self.combine_shared_secrets(
-            pq_ss.as_bytes(),
-            classical_ss.as_bytes(),
-        )?;
+        let combined_ss = self.combine_shared_secrets(pq_ss.as_bytes(), classical_ss.as_bytes())?;
 
         // Verify key commitment
         let expected_commitment = self.compute_key_commitment(
@@ -244,7 +241,12 @@ impl HybridKEM {
     }
 
     /// Encrypt data using the hybrid KEM
-    pub fn encrypt(&self, public_key: &HybridPublicKey, plaintext: &[u8], aad: &[u8]) -> Result<EncryptedData, CryptoError> {
+    pub fn encrypt(
+        &self,
+        public_key: &HybridPublicKey,
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> Result<EncryptedData, CryptoError> {
         // Encapsulate to get shared secret
         let (encapsulation, shared_secret) = self.encapsulate(public_key)?;
 
@@ -261,15 +263,18 @@ impl HybridKEM {
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         // Include encapsulation commitment in AAD for binding
-        let mut full_aad = Vec::with_capacity(aad.len() + 32);
+        let mut full_aad = Vec::with_capacity(aad.len().saturating_add(32));
         full_aad.extend_from_slice(aad);
         full_aad.extend_from_slice(&encapsulation.key_commitment);
 
         let ciphertext = cipher
-            .encrypt(nonce, aes_gcm::aead::Payload {
-                msg: plaintext,
-                aad: &full_aad,
-            })
+            .encrypt(
+                nonce,
+                aes_gcm::aead::Payload {
+                    msg: plaintext,
+                    aad: &full_aad,
+                },
+            )
             .map_err(|_| CryptoError::EncryptionFailed)?;
 
         Ok(EncryptedData {
@@ -281,7 +286,12 @@ impl HybridKEM {
     }
 
     /// Decrypt data using the hybrid KEM
-    pub fn decrypt(&self, secret_key: &HybridSecretKey, encrypted: &EncryptedData, aad: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    pub fn decrypt(
+        &self,
+        secret_key: &HybridSecretKey,
+        encrypted: &EncryptedData,
+        aad: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
         // Decapsulate to recover shared secret
         let shared_secret = self.decapsulate(secret_key, &encrypted.encapsulation)?;
 
@@ -289,7 +299,7 @@ impl HybridKEM {
         let encryption_key = self.derive_encryption_key(&shared_secret, b"QSSP-v1-encrypt")?;
 
         // Verify AAD binding
-        let mut full_aad = Vec::with_capacity(aad.len() + 32);
+        let mut full_aad = Vec::with_capacity(aad.len().saturating_add(32));
         full_aad.extend_from_slice(aad);
         full_aad.extend_from_slice(&encrypted.encapsulation.key_commitment);
 
@@ -304,17 +314,24 @@ impl HybridKEM {
         let nonce = Nonce::from_slice(&encrypted.nonce);
 
         cipher
-            .decrypt(nonce, aes_gcm::aead::Payload {
-                msg: &encrypted.ciphertext,
-                aad: &full_aad,
-            })
+            .decrypt(
+                nonce,
+                aes_gcm::aead::Payload {
+                    msg: &encrypted.ciphertext,
+                    aad: &full_aad,
+                },
+            )
             .map_err(|_| CryptoError::DecryptionFailed)
     }
 
     // ==================== Internal Methods ====================
 
     /// Combine shared secrets using domain-separated KDF
-    fn combine_shared_secrets(&self, pq_ss: &[u8], classical_ss: &[u8]) -> Result<[u8; 32], CryptoError> {
+    fn combine_shared_secrets(
+        &self,
+        pq_ss: &[u8],
+        classical_ss: &[u8],
+    ) -> Result<[u8; 32], CryptoError> {
         // Use HKDF-like construction with SHA3-512
         let mut hasher = Sha3_512::new();
 
@@ -338,13 +355,20 @@ impl HybridKEM {
 
         let digest = hasher.finalize();
         let mut result = [0u8; 32];
-        result.copy_from_slice(&digest[..32]);
+        if let Some(head) = digest.first_chunk::<32>() {
+            result.copy_from_slice(head);
+        }
 
         Ok(result)
     }
 
     /// Compute key commitment for integrity verification
-    fn compute_key_commitment(&self, shared_secret: &[u8; 32], pq_ct: &[u8], classical_pk: &[u8]) -> [u8; 32] {
+    fn compute_key_commitment(
+        &self,
+        shared_secret: &[u8; 32],
+        pq_ct: &[u8],
+        classical_pk: &[u8],
+    ) -> [u8; 32] {
         let mut hasher = Sha3_256::new();
         hasher.update(b"QSSP-v1-key-commit");
         hasher.update(shared_secret);
@@ -356,7 +380,11 @@ impl HybridKEM {
     }
 
     /// Derive encryption key from shared secret
-    fn derive_encryption_key(&self, shared_secret: &[u8; 32], info: &[u8]) -> Result<[u8; 32], CryptoError> {
+    fn derive_encryption_key(
+        &self,
+        shared_secret: &[u8; 32],
+        info: &[u8],
+    ) -> Result<[u8; 32], CryptoError> {
         let mut hasher = Sha3_256::new();
         hasher.update(b"QSSP-v1-derive-");
         hasher.update(info);
@@ -476,17 +504,25 @@ mod tests {
         let keypair = kem.generate_keypair().unwrap();
 
         // Verify key sizes
-        assert_eq!(keypair.public_key.pq_public.len(), kyber768::public_key_bytes());
+        assert_eq!(
+            keypair.public_key.pq_public.len(),
+            kyber768::public_key_bytes()
+        );
         assert_eq!(keypair.public_key.classical_public.len(), 32);
 
         // Encapsulate
         let (encapsulation, shared_secret1) = kem.encapsulate(&keypair.public_key).unwrap();
 
         // Verify ciphertext size
-        assert_eq!(encapsulation.pq_ciphertext.len(), kyber768::ciphertext_bytes());
+        assert_eq!(
+            encapsulation.pq_ciphertext.len(),
+            kyber768::ciphertext_bytes()
+        );
 
         // Decapsulate
-        let shared_secret2 = kem.decapsulate(&keypair.secret_key, &encapsulation).unwrap();
+        let shared_secret2 = kem
+            .decapsulate(&keypair.secret_key, &encapsulation)
+            .unwrap();
 
         // Shared secrets must match
         assert_eq!(shared_secret1, shared_secret2);
@@ -527,7 +563,11 @@ mod tests {
 
     #[test]
     fn test_security_levels() {
-        for level in [SecurityLevel::Standard, SecurityLevel::High, SecurityLevel::Maximum] {
+        for level in [
+            SecurityLevel::Standard,
+            SecurityLevel::High,
+            SecurityLevel::Maximum,
+        ] {
             let config = QuantumSafeConfig {
                 security_level: level,
                 ..Default::default()

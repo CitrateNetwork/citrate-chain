@@ -11,8 +11,8 @@
 //! the router; the binary supplies only the side-effect closure.
 
 use crate::error::SigningError;
-use crate::providers::DocusignProvider;
 use crate::provider::SigningProvider;
+use crate::providers::DocusignProvider;
 use crate::webhook::{parse_docusign_event, DocusignEvent};
 use axum::{
     body::Bytes,

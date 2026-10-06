@@ -1,0 +1,275 @@
+---
+title: "HUP registry redeploy (HUP-S7.1, federation F-4): operator runbook for chain 40204"
+created: 2026-10-01
+branch: hup/n5-chain-redeploy
+updated: 2026-10-04 (hup/n7-registry-redeploy-prep: retired scripts, provenance step, RPC check)
+author: Larry Klosowski + Claude Opus 5.5
+status: READY FOR REHEARSAL. Nothing here has been broadcast. The chain operator runs the broadcast after the next reroll; the admin choice is pending owner sign-off.
+chain: 40204
+---
+
+# HUP registry redeploy: operator runbook
+
+This runbook deploys the on-chain registries that the Citrate Core "Hermes upskill"
+(HUP) features read and puts their addresses in the canonical book. It is written for
+the run after the next 40204 reroll; the same steps also work on today's chain (the
+fork rehearsal proves that), and which of the two the operator uses is pending owner
+sign-off. Agents prepared and rehearsed it on a local anvil. **Only the chain
+operator broadcasts, with an operator-held key.** No agent signs, sends or deploys.
+
+Related: the reroll runbook (`scripts/ceremony/`), the address-book rules
+(`contracts/addresses/README.md`), and citrate-core's `scripts/sync-addresses.py`.
+
+## 1. What is deployed, and what is only checked
+
+`contracts/script/DeployHupRegistries.s.sol` deploys, each by CREATE2 through the
+genesis Arachnid factory `0x4e59…4956C` at `Salts.salt(<book name>)`:
+
+| Book name | Contract | Admin |
+|---|---|---|
+| `OrganizationSBT` | `src/cit_agent/OrganizationSBT.sol` | born owned by ADMIN |
+| `AgentSBT` | `src/cit_agent/AgentSBT.sol` (points at the OrganizationSBT above and at the book's `CitrateMemberSBT`) | born owned by ADMIN |
+| `CapsuleRegistry` | `src/cit_agent/CapsuleRegistry.sol` | born owned by ADMIN |
+| `AnchorRegistry` | `src/cit_agent/AnchorRegistry.sol` | none (append-anyone) |
+| `BenchmarkRegistry` | `src/cit_agent/BenchmarkRegistry.sol` | none (append-anyone) |
+| `SkillRegistry` | `src/SkillRegistry.sol` | none (owner-per-skill) |
+| `CitAgentTimelock` (only if no ADMIN is given) | `src/cit_agent/MultisigTimelock2of3.sol` | 2-of-3 owners |
+
+It **does not deploy** the registries owned by the main ceremony, and on 40204 it
+refuses to run until the book lists each of them with code on chain:
+`ModelRegistry`, `InferenceRouter`, `LoRAFactory`, `X402Facilitator`,
+`IPFSIncentivesV3`, `AgentDecisionRegistryV2` (`DeployAll`, `DeployDpf02Rbac`,
+`RedeployIPFSIncentivesV3`).
+
+Properties the script and its tests (`test/cit_agent/DeployHupRegistries.t.sol`) pin:
+
+- Every address equals `keccak256(0xff ++ 0x4e59… ++ salt ++ keccak256(init_code))[12:]`.
+- Admin-gated contracts take the admin as a constructor argument, so the deployer
+  never holds admin and no ownership transfer happens. `InitialAdmin.check` refuses
+  the zero address and the CREATE2 factory.
+- On chain id 40204 the admin must have code (a deployed multisig) and must not be
+  the deployer.
+- A rerun skips any registry that already has code at its projection (idempotent).
+- AgentSBT takes the membership SBT as a constructor argument (member-callable mint,
+  owner decision 2026-10-04): `HUP_MEMBER_SBT`, else the book's `CitrateMemberSBT`.
+  It must have code, and on 40204 it must equal the book's pin. Because it is part of
+  AgentSBT's init code, it moves AgentSBT's CREATE2 projection: run the core
+  membership ceremony (`DeployCoreMembership`) and book its `CitrateMemberSBT` first.
+- After deploying, it reads back `owner()`, `AgentSBT.orgContract()`,
+  `AgentSBT.memberSbt()`, and one view per contract, and confirms `SkillRegistry` is
+  the `abi.encode` version.
+
+**Retired scripts.** `DeployCitAgent.s.sol`, `DeployAnchorRegistry.s.sol` and
+`DeploySkillRegistry.s.sol` deploy the versions this redeploy replaces. Each now reverts
+on chain id 40204 before it broadcasts anything (`script/LegacyDeployGuard.sol`, tested in
+`test/cit_agent/LegacyDeployScripts.t.sol`); they still run on a local chain.
+
+## 2. Contract versions in this redeploy
+
+These ship with the redeploy. The registries live on today's chain keep their old
+bytecode until the reroll replaces the chain.
+
+- **AnchorRegistry** records one anchor per `(committer, root)`. A second committer
+  of the same root is recorded under its own address instead of being refused, so
+  the committer a reader sees is always the sender of that committer's own
+  transaction. New reads: `getAnchorBy(committer, root)`, `isAnchoredBy(committer,
+  root)`, `rootCountByCommitter`, `rootsByCommitter`. `getAnchor(root)` and
+  `isAnchored(root)` keep their meaning (the first record of a root). The
+  `anchor(uint8,bytes32)` selector is unchanged. Paginated reads clamp the page
+  without computing `start + count`.
+- **BenchmarkRegistry**: `getMetric` clamps the page the same way.
+- **SkillRegistry**: `skillHash = keccak256(abi.encode(owner, name, version))`, plus a
+  pure `skillHashOf(owner, name, version)` so clients can ask the contract. Names are
+  still not authoritative: resolve skills by `skillHash` against a pinned owner list.
+
+**Consumer follow-ups (other repos, before members rely on the new registries):**
+
+Status 2026-10-04 (branch `hup/n7-registry-redeploy-prep` in each repo): item 2 is done
+in citrate-agent-runtime (`citrate_agent_anchor::OwnAnchorCheck`, used by
+`AnchorRegistryClient::is_anchored_by_self`, anvil-tested on both registry versions by
+`scripts/anvil-anchor-registry-versions.sh`); citrate-core's proof check already asks
+`getAnchorBy(self, root)` first. Item 3 is done in citrate-core `scripts/sync-addresses.py`
+(rehearsed against this fork by its `scripts/anvil-sync-addresses.sh`). Item 1 is owned by
+the skill-publish lane.
+
+1. citrate-agent-runtime `agent-learn/src/registry.rs::skill_hash` must switch to
+   `abi.encode` layout (or call `skillHashOf`). Until then the publish payload's
+   `expected_skill_hash` will not match what the new registry returns. Publishing is
+   off by default.
+2. citrate-core and citrate-agent-runtime (`agent/core/src/chain/anchor.rs`) should
+   confirm their own anchors with `isAnchoredBy(self, root)` / `getAnchorBy`, and
+   treat their own transaction receipt as the confirmation.
+3. citrate-core `scripts/sync-addresses.py` lists only `AgentSBT` and
+   `OrganizationSBT` of this set as optional pins (plus `SkillRegistry` as required).
+   Add `AnchorRegistry`, `BenchmarkRegistry`, `CapsuleRegistry` and `InferenceRouter`
+   to its optional list so the app picks them up.
+
+## 3. Preconditions (all must hold)
+
+- [ ] The reroll has landed and the new genesis block-0 hash is recorded.
+- [ ] The main ceremony has run, and `contracts/addresses/40204.json` has been
+      regenerated from it, with code at every ceremony-owned name in section 1.
+- [ ] The core membership ceremony has run and the book pins `CitrateMemberSBT`
+      with code on chain (AgentSBT is wired to it at construction).
+- [ ] **ADMIN decided (owner sign-off).** Placeholder: the cit-agent 2-of-3 timelock
+      (`CitAgentTimelock`, the holder of these registries on today's chain), either
+      redeployed by this script from `HUP_TIMELOCK_OWNER_{0,1,2}` or passed in as
+      `HUP_REGISTRY_ADMIN` if the ceremony already created it. `GOVERNANCE` is the
+      alternative. Do not use an EOA.
+- [ ] Deployer funded for 6 or 7 contract creations.
+- [ ] Rehearsal (step 0) passes against the new chain.
+
+## 4. Steps
+
+All commands run from the citrate-chain root unless noted.
+
+**Step 0. Rehearse on a local fork** (no transaction reaches 40204):
+
+```bash
+HUP_FORK_RPC=https://rpc.citrate.ai scripts/ops/hup-redeploy-dryrun.sh
+scripts/ops/hup-redeploy-dryrun.sh --fresh   # empty chain, script-deployed timelock
+```
+
+The fork run deploys with an impersonated sender, mints an org and an agent through
+the impersonated admin, mints a membership SBT to a test member through the
+impersonated membership owner, sets the member org and mints an agent as that
+member (a non-member is refused), registers a workspace capsule, anchors one root from two
+committers, records a benchmark, registers a skill, checks each read-back, and runs
+the book tool against a temporary copy of the book. It must end with `dryrun: PASS`.
+
+**Step 1. Simulate against 40204** (no `--broadcast`):
+
+```bash
+cd contracts
+DEPLOYER_ADDRESS=0x<deployer> \
+HUP_TIMELOCK_OWNER_0=0x<owner0> HUP_TIMELOCK_OWNER_1=0x<owner1> HUP_TIMELOCK_OWNER_2=0x<owner2> \
+forge script script/DeployHupRegistries.s.sol --rpc-url https://rpc.citrate.ai --sender 0x<deployer>
+```
+
+(Or `HUP_REGISTRY_ADMIN=0x<multisig>` instead of the three owners.) The member SBT
+defaults to the book's `CitrateMemberSBT`; `HUP_MEMBER_SBT=0x<CitrateMemberSBT>`
+overrides it, and on 40204 the two must agree. Record the `BOOK PINS` block it
+prints, including the `member SBT (read)` line.
+
+**Step 2. Broadcast** (operator only, operator-held key):
+
+```bash
+forge script script/DeployHupRegistries.s.sol --rpc-url https://rpc.citrate.ai \
+  --broadcast --slow --sender 0x<deployer> <your forge signer flags>
+```
+
+The pins must equal step 1's. If the run stops part-way, rerun the same command: it
+skips what already has code.
+
+**Step 3. Update the book** (reads the broadcast, verifies on chain, then writes):
+
+```bash
+scripts/ops/hup-book-update.py \
+  --broadcast contracts/broadcast/DeployHupRegistries.s.sol/40204/run-latest.json \
+  --book contracts/addresses/40204.json \
+  --admin 0x<admin> --genesis 0x<new block-0 hash> --rpc https://rpc.citrate.ai --check
+# then the same command without --check
+```
+
+Use `--keep-existing` only when a rerun skipped a registry that the book already
+pins at the same projection. The tool checks that: a kept book entry must equal the
+projection the script returned for this build (forge records `run()`'s return value
+in the broadcast), so an older contract version left in the book is never kept.
+
+The tool refuses to write if any CREATE2 address does not re-derive from the sent
+init code, a deployed address differs from the script's projection, `--admin` is not
+the admin the script used, a receipt failed, an address has no code, an owner is not
+the admin, the admin has no code, `AgentSBT.orgContract()` is not the
+OrganizationSBT, `AgentSBT.memberSbt()` is not the book's `CitrateMemberSBT` (or that
+has no code, or the book has none, or the script returned a different one), two
+names share an address, or the chain id / genesis differ.
+Writing always needs `--rpc` and `--genesis`; without them only `--check` runs.
+
+**Records at the old pins.** Before moving a pin, the tool reads the old contract's
+record counters (`nextTokenId()` on OrganizationSBT and AgentSBT, `totalSkills()` on
+SkillRegistry, `rootCountByKind(0..2)` on AnchorRegistry). If any is non-zero it
+lists them and refuses: moving the book would leave those members' records at an
+address the app no longer reads. A migration plan for those records is an owner
+decision; only after it is agreed, rerun with `--retire-populated`. On the
+2026-10-04 fork rehearsal every old pin read zero, so nothing would be stranded today.
+
+**Step 4. Provenance ledger** (reads the same broadcast and the book step 3 wrote):
+
+```bash
+scripts/ops/hup-provenance-update.py \
+  --broadcast contracts/broadcast/DeployHupRegistries.s.sol/40204/run-latest.json \
+  --book contracts/addresses/40204.json --provenance contracts/addresses/40204.provenance.json \
+  --genesis 0x<new block-0 hash> --rpc https://rpc.citrate.ai --backfill --check
+# then the same command without --check
+```
+
+It appends one row per redeploy transaction and marks the rows the book no longer pins
+`superseded`. It refuses when the book does not already pin the broadcast's addresses,
+when a deployer nonce would leave a gap, or when the ledger was built for another
+genesis (after a reroll the ledger is regenerated, not appended to). `--backfill` first
+records deployer transactions the ledger is missing, but only plain transfers and calls;
+anything that created a contract needs a person to classify it. On today's chain the
+deployer sent two plain transfers after the ledger was built (nonces 116 and 117, blocks
+11845 and 11847); the 2026-10-04 fork rehearsal backfilled them and appended the six
+registries at nonces 118 to 123. Then commit the book and the ledger together (one PR,
+squash).
+
+**RPC check before step 2.** On 2026-10-04 `rpc.citrate.ai` returned `null` for
+`eth_getTransactionByHash` and `eth_getTransactionReceipt` of transactions that are in
+its blocks (for example `0x23c717a1…` in block 130856, and the ledger's own nonce-115
+transaction). forge waits for receipts after `--broadcast`, and steps 3 and 4 read
+receipts, so confirm `cast receipt <a recent tx> --rpc-url https://rpc.citrate.ai`
+returns a receipt before broadcasting.
+
+**Step 5. Consumers.** In citrate-core (after follow-up 3):
+
+```bash
+scripts/sync-addresses.py --book ../citrate-chain/contracts/addresses/40204.json \
+  --genesis 0x<new block-0 hash> --rpc https://rpc.citrate.ai
+```
+
+The book's `InferenceRouter` is the one already on the chain; this redeploy does not
+replace it. A pinned router turns on the app's HIC-1 registry escalation route (US-1.5),
+so the sync checks that pin but writes it only with `--with-inference-router`. Leave the
+flag off until the owner signs off US-1.5.
+
+**Step 6. After deploy (owner decisions, not part of this script):**
+
+- Mint the parent organization for member agents, then `AgentSBT.setMemberOrg(<org id>)`
+  through the admin timelock (propose, second approval, wait `minDelay`, execute).
+  Until it is set, `mintAgentAsMember` reverts `MemberOrgNotSet`. After it is set,
+  any holder of the membership SBT mints its own agents
+  (`mintAgentAsMember(bytes32 did, bytes32 pubkey_fingerprint)`), up to
+  `maxAgentsPerMember` (default 5, `setMaxAgentsPerMember` through the timelock; 0
+  pauses member minting). `mintAgent` stays admin-only for any org.
+- Keep the anchor key unfunded until the core app's anchor follow-ups tracked for
+  HUP-S7.3 are settled.
+- Then flip the HUP features from "not deployed" to available by shipping the
+  regenerated core book.
+
+## 5. Verification checklist
+
+- [ ] `forge test --match-path 'test/cit_agent/*'` green on the commit that was deployed.
+- [ ] `python3 -m unittest discover -s scripts/ops/tests -p 'test_hup_*.py'` green.
+- [ ] Step 4 `--check` lists the six (or seven) registry rows and supersedes exactly the
+      old rows of those names.
+- [ ] Step 0 `dryrun: PASS` against the new chain.
+- [ ] Step 3 `--check` reports exactly the 6 (or 7) expected names.
+- [ ] Step 3 reports no "populated pin replaced" line (or the owner signed off a
+      migration and `--retire-populated` was used).
+- [ ] `cast call <AgentSBT> 'owner()(address)'` equals the admin, and the same for
+      OrganizationSBT and CapsuleRegistry.
+- [ ] `cast call <AgentSBT> 'memberSbt()(address)'` equals the book's `CitrateMemberSBT`.
+- [ ] `cast call <SkillRegistry> 'skillHashOf(address,string,string)(bytes32)' …`
+      returns the `abi.encode` hash.
+
+## 6. Abort
+
+Abort and change nothing in the book if: the simulate and broadcast pins differ, the
+ceremony-owned check fails, any owner is not the admin, or the book tool refuses.
+The deployed contracts are inert until the book points at them.
+
+## 7. Rule 6
+
+No core crate (consensus, execution, storage, api, sequencer, network) changes in
+this work, so the daily chain benchmark is not triggered by it.

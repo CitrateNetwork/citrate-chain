@@ -22,10 +22,7 @@
 use halo2_proofs::{
     arithmetic::Field,
     circuit::{AssignedCell, Layouter, SimpleFloorPlanner, Value},
-    plonk::{
-        Advice, Circuit, Column, ConstraintSystem, ErrorFront, Fixed,
-        Instance, Selector,
-    },
+    plonk::{Advice, Circuit, Column, ConstraintSystem, ErrorFront, Fixed, Instance, Selector},
     poly::Rotation,
 };
 use halo2curves::bn256::Fr;
@@ -100,33 +97,22 @@ impl Circuit<Fr> for DoublingCircuit {
         // Single region: assign `a` and `out` on row 0, enable
         // the doubling selector. Then expose both as public
         // instances for the verifier to constrain.
-        let (a_cell, out_cell): (
-            AssignedCell<Fr, Fr>,
-            AssignedCell<Fr, Fr>,
-        ) = layouter.assign_region(
-            || "double",
-            |mut region| {
-                config.s_double.enable(&mut region, 0)?;
+        let (a_cell, out_cell): (AssignedCell<Fr, Fr>, AssignedCell<Fr, Fr>) = layouter
+            .assign_region(
+                || "double",
+                |mut region| {
+                    config.s_double.enable(&mut region, 0)?;
 
-                let a_cell = region.assign_advice(
-                    || "a",
-                    config.advice[0],
-                    0,
-                    || self.a,
-                )?;
+                    let a_cell = region.assign_advice(|| "a", config.advice[0], 0, || self.a)?;
 
-                let two = Fr::from(2u64);
-                let out_value = self.a.map(|v| v * two);
-                let out_cell = region.assign_advice(
-                    || "out = 2a",
-                    config.advice[1],
-                    0,
-                    || out_value,
-                )?;
+                    let two = Fr::from(2u64);
+                    let out_value = self.a.map(|v| v * two);
+                    let out_cell =
+                        region.assign_advice(|| "out = 2a", config.advice[1], 0, || out_value)?;
 
-                Ok((a_cell, out_cell))
-            },
-        )?;
+                    Ok((a_cell, out_cell))
+                },
+            )?;
 
         // Public-input slot 0 = `a`; slot 1 = `out`.
         layouter.constrain_instance(a_cell.cell(), config.instance, 0)?;
@@ -176,11 +162,7 @@ mod tests {
 
         let prover = MockProver::run(K, &circuit, public_inputs).unwrap();
         let r = prover.verify();
-        assert!(
-            r.is_err(),
-            "tampered public input must reject; got {:?}",
-            r
-        );
+        assert!(r.is_err(), "tampered public input must reject; got {:?}", r);
     }
 
     #[test]

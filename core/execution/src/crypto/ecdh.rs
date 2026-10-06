@@ -16,11 +16,8 @@ use aes_gcm::{
 };
 use anyhow::{anyhow, Result};
 use hmac::Mac;
-use k256::{
-    elliptic_curve::sec1::ToEncodedPoint,
-    PublicKey, SecretKey,
-};
 use k256::elliptic_curve::zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use k256::{elliptic_curve::sec1::ToEncodedPoint, PublicKey, SecretKey};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::Sha256;
@@ -136,13 +133,10 @@ impl ECIES {
             .map_err(|e| anyhow!("AES encryption failed: {:?}", e))?;
 
         // Split ciphertext and auth tag
-        if encrypted_data.len() < 16 {
+        let Some((ciphertext, auth_tag)) = encrypted_data.split_last_chunk::<16>() else {
             return Err(anyhow!("Invalid encrypted data length"));
-        }
-
-        let (ciphertext, tag_bytes) = encrypted_data.split_at(encrypted_data.len() - 16);
-        let mut auth_tag = [0u8; 16];
-        auth_tag.copy_from_slice(tag_bytes);
+        };
+        let auth_tag = *auth_tag;
 
         Ok(ECIESMessage {
             ephemeral_pubkey: ephemeral.public_key,
@@ -201,9 +195,7 @@ impl ECIES {
 
     /// Derive encryption and MAC keys from shared secret using HKDF-SHA256
     #[allow(clippy::type_complexity)]
-    fn derive_keys(
-        shared_secret: &[u8; 32],
-    ) -> Result<(Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>)> {
+    fn derive_keys(shared_secret: &[u8; 32]) -> Result<(Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>)> {
         // HKDF-Extract
         let mut mac = <HmacSha256 as Mac>::new_from_slice(b"CITRATE_ECIES_SALT")
             .map_err(|e| anyhow!("HMAC init failed: {}", e))?;
@@ -311,7 +303,10 @@ mod tests {
             ManuallyDrop::drop(&mut e);
             std::ptr::read_volatile(key_ptr)
         };
-        assert_eq!(after, [0u8; 32], "private key must be wiped when ECIES drops");
+        assert_eq!(
+            after, [0u8; 32],
+            "private key must be wiped when ECIES drops"
+        );
     }
 
     /// PBA-L4-006: ECDH / HKDF intermediates are `Zeroizing` buffers, and the

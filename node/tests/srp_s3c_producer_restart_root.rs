@@ -6,11 +6,11 @@
 // the executor level, with a "restart" (fresh StateDB bulk-loaded from the store) in the middle, and
 // asserts every block's committed root is DISTINCT (each 9/1-SALT reward changes the root).
 
+use citrate_consensus::types::Hash;
 use citrate_execution::types::Address;
 use citrate_execution::{Executor, StateDB};
 use citrate_storage::pruning::PruningConfig;
 use citrate_storage::StorageManager;
-use citrate_consensus::types::Hash;
 use primitive_types::U256;
 use std::collections::HashSet;
 use std::sync::Arc;

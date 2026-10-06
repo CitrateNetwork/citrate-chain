@@ -14,14 +14,18 @@ pragma solidity 0.8.36;
  *
  *         SECURITY / CONSUMER CONTRACT (PBA-L2-045, pre-bounty audit 2026-09-24):
  *           - Names are NOT unique and NOT authoritative: any address can register any
- *             `name`. Resolve a skill ONLY by `keccak256(abi.encodePacked(trustedOwner,
- *             name, version))` against an owner allowlist the consumer pins — never by
- *             name alone, and never by trusting every entry of `getAllSkillHashes()`.
+ *             `name`. Resolve a skill ONLY by `skillHashOf(trustedOwner, name, version)`
+ *             (= `keccak256(abi.encode(trustedOwner, name, version))`) against an owner
+ *             allowlist the consumer pins, never by name alone, and never by trusting
+ *             every entry of `getAllSkillHashes()`.
  *           - Enumeration is unbounded and permissionless (spam can push
  *             `getAllSkillHashes()` past an RPC eth_call gas cap). Page with
  *             `totalSkills()` + the public index getter `allSkillHashes(i)`.
- *         (Documented rather than changed in code: this contract is live at a CREATE2
- *         address that any bytecode change would move, and the fix is consumer-side.)
+ *
+ *         HUP-S7.1 redeploy version: `skillHash` uses `abi.encode` (each string is
+ *         length-prefixed), so two (name, version) pairs that concatenate to the same
+ *         bytes, e.g. ("skill1", ".0") and ("skill", "1.0"), get distinct ids. The
+ *         earlier version used `abi.encodePacked`; this one ships with the redeploy.
  *
  *         A "skill" is one Hermes capsule: a canonical name + semver + the IPFS CID of the
  *         capsule bundle/manifest + human metadata. The capsule bytes themselves live on
@@ -29,7 +33,7 @@ pragma solidity 0.8.36;
  */
 contract SkillRegistry {
     struct Skill {
-        bytes32 skillHash;    // keccak256(owner, name, version) — the stable id
+        bytes32 skillHash;    // keccak256(abi.encode(owner, name, version)), the stable id
         address owner;        // registrant; the only address that can update/deactivate
         string name;          // canonical skill id, e.g. "hf-model-register"
         string version;       // semver, e.g. "1.0.0"
@@ -49,8 +53,18 @@ contract SkillRegistry {
     event SkillUpdated(bytes32 indexed skillHash, string manifestCID);
     event SkillActiveSet(bytes32 indexed skillHash, bool isActive);
 
+    /// @notice The stable id of (owner, name, version): `keccak256(abi.encode(owner, name, version))`.
+    ///         Clients compute or fetch the expected id here instead of re-deriving the layout.
+    function skillHashOf(address owner, string calldata name, string calldata version)
+        public
+        pure
+        returns (bytes32)
+    {
+        return keccak256(abi.encode(owner, name, version));
+    }
+
     /// @notice Register a new skill. Reverts if (msg.sender, name, version) already exists.
-    /// @return skillHash the stable id = keccak256(msg.sender, name, version).
+    /// @return skillHash the stable id = skillHashOf(msg.sender, name, version).
     function registerSkill(
         string calldata name,
         string calldata version,
@@ -59,7 +73,7 @@ contract SkillRegistry {
         string[] calldata tags
     ) external returns (bytes32 skillHash) {
         require(bytes(name).length != 0, "name required");
-        skillHash = keccak256(abi.encodePacked(msg.sender, name, version));
+        skillHash = skillHashOf(msg.sender, name, version);
         require(skills[skillHash].createdAt == 0, "skill exists");
 
         Skill storage s = skills[skillHash];

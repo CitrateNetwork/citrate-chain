@@ -34,10 +34,9 @@ fn fresh_keystore() -> PathBuf {
 
 fn read_keystore_json(keystore_path: &std::path::Path) -> Vec<Value> {
     let path = keystore_path.join("keys.json");
-    let content = std::fs::read_to_string(&path)
-        .expect("keystore JSON should exist after create_account");
-    serde_json::from_str(&content)
-        .expect("keystore JSON should parse as a JSON array")
+    let content =
+        std::fs::read_to_string(&path).expect("keystore JSON should exist after create_account");
+    serde_json::from_str(&content).expect("keystore JSON should parse as a JSON array")
 }
 
 // =========================================================================
@@ -59,12 +58,14 @@ fn test_wal01_create_account_writes_kdf_version_v2() {
     let kdf_version = entry
         .get("kdf_version")
         .and_then(|v| v.as_u64())
-        .unwrap_or_else(|| panic!(
-            "WAL-01: keystore entry missing required `kdf_version` field. \
+        .unwrap_or_else(|| {
+            panic!(
+                "WAL-01: keystore entry missing required `kdf_version` field. \
              Entry: {}. Per docs/security/KDF_POLICY.md, every freshly \
              written entry must declare its KDF version (>= 2 in production).",
-            serde_json::to_string_pretty(entry).unwrap_or_default(),
-        ));
+                serde_json::to_string_pretty(entry).unwrap_or_default(),
+            )
+        });
 
     assert!(
         kdf_version >= MIN_KDF_VERSION_FOR_NEW_ENTRY,
@@ -89,13 +90,10 @@ fn test_wal01_import_account_writes_kdf_version_v2() {
 
     let entries = read_keystore_json(&path);
     let entry = &entries[0];
-    let kdf_version = entry
-        .get("kdf_version")
-        .and_then(|v| v.as_u64())
-        .expect(
-            "WAL-01: imported entry missing required `kdf_version` field. \
+    let kdf_version = entry.get("kdf_version").and_then(|v| v.as_u64()).expect(
+        "WAL-01: imported entry missing required `kdf_version` field. \
              import_account must mirror create_account's KDF policy.",
-        );
+    );
     assert!(
         kdf_version >= MIN_KDF_VERSION_FOR_NEW_ENTRY,
         "WAL-01 (import path): kdf_version is {}, expected >= {}",
@@ -114,13 +112,10 @@ fn test_wal01_secp256k1_account_writes_kdf_version_v2() {
 
     let entries = read_keystore_json(&path);
     let entry = &entries[0];
-    let kdf_version = entry
-        .get("kdf_version")
-        .and_then(|v| v.as_u64())
-        .expect(
-            "WAL-01: secp256k1 entry missing required `kdf_version` field. \
+    let kdf_version = entry.get("kdf_version").and_then(|v| v.as_u64()).expect(
+        "WAL-01: secp256k1 entry missing required `kdf_version` field. \
              create_secp256k1_account must use v2 KDF params.",
-        );
+    );
     assert!(
         kdf_version >= MIN_KDF_VERSION_FOR_NEW_ENTRY,
         "WAL-01 (secp256k1 path): kdf_version is {}, expected >= {}",
@@ -143,13 +138,10 @@ fn test_wal01_recover_from_mnemonic_writes_kdf_version_v2() {
 
     let entries = read_keystore_json(&path);
     let entry = &entries[0];
-    let kdf_version = entry
-        .get("kdf_version")
-        .and_then(|v| v.as_u64())
-        .expect(
-            "WAL-01: recovered entry missing required `kdf_version` field. \
+    let kdf_version = entry.get("kdf_version").and_then(|v| v.as_u64()).expect(
+        "WAL-01: recovered entry missing required `kdf_version` field. \
              recover_from_mnemonic must use v2 KDF params.",
-        );
+    );
     assert!(
         kdf_version >= MIN_KDF_VERSION_FOR_NEW_ENTRY,
         "WAL-01 (mnemonic recovery path): kdf_version is {}, expected >= {}",

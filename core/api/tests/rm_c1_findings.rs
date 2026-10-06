@@ -123,7 +123,8 @@ fn malformed_eip1559_huge_access_list() -> Vec<u8> {
 #[test]
 fn h_api_02_short_address_returns_err_not_panic() {
     let bytes = malformed_eip1559_with_short_address();
-    let result = std::panic::catch_unwind(|| citrate_api::eth_tx_decoder::decode_eth_transaction(&bytes));
+    let result =
+        std::panic::catch_unwind(|| citrate_api::eth_tx_decoder::decode_eth_transaction(&bytes));
     assert!(
         result.is_ok(),
         "H-API-02: decoder must NOT panic on short address"
@@ -145,7 +146,8 @@ fn h_api_02_short_address_returns_err_not_panic() {
 #[test]
 fn h_api_02_short_storage_key_returns_err_not_panic() {
     let bytes = malformed_eip1559_with_short_storage_key();
-    let result = std::panic::catch_unwind(|| citrate_api::eth_tx_decoder::decode_eth_transaction(&bytes));
+    let result =
+        std::panic::catch_unwind(|| citrate_api::eth_tx_decoder::decode_eth_transaction(&bytes));
     assert!(
         result.is_ok(),
         "H-API-02: decoder must NOT panic on short storage key"
@@ -161,8 +163,12 @@ fn h_api_02_short_storage_key_returns_err_not_panic() {
 #[test]
 fn h_api_02_huge_access_list_rejected() {
     let bytes = malformed_eip1559_huge_access_list();
-    let result = std::panic::catch_unwind(|| citrate_api::eth_tx_decoder::decode_eth_transaction(&bytes));
-    assert!(result.is_ok(), "H-API-02: decoder must NOT panic on huge list");
+    let result =
+        std::panic::catch_unwind(|| citrate_api::eth_tx_decoder::decode_eth_transaction(&bytes));
+    assert!(
+        result.is_ok(),
+        "H-API-02: decoder must NOT panic on huge list"
+    );
     let inner = result.expect("no panic");
     assert!(
         inner.is_err(),

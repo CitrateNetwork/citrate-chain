@@ -253,19 +253,21 @@ impl ZKPBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::circuits::{DataIntegrityCircuit, StateTransitionCircuit};
     use super::super::types::{
-        ModelExecutionCircuit, GradientProofCircuit,
-        ProofRequest, ProofType, SerializableProof, ZKPError,
+        GradientProofCircuit, ModelExecutionCircuit, ProofRequest, ProofType, SerializableProof,
+        ZKPError,
     };
-    use super::super::circuits::{StateTransitionCircuit, DataIntegrityCircuit};
+    use super::*;
 
     // ---------------------------------------------------------------
     // Helper: build a fully-initialized backend (setup all 4 key pairs)
     // ---------------------------------------------------------------
     fn initialized_backend() -> ZKPBackend {
         let backend = ZKPBackend::new();
-        backend.initialize().expect("Backend initialization must succeed");
+        backend
+            .initialize()
+            .expect("Backend initialization must succeed");
         backend
     }
 
@@ -375,8 +377,12 @@ mod tests {
         let resp2 = backend.generate_proof(req2).unwrap();
 
         // Both must verify
-        assert!(backend.verify_proof(ProofType::ModelExecution, &resp1.proof).unwrap());
-        assert!(backend.verify_proof(ProofType::ModelExecution, &resp2.proof).unwrap());
+        assert!(backend
+            .verify_proof(ProofType::ModelExecution, &resp1.proof)
+            .unwrap());
+        assert!(backend
+            .verify_proof(ProofType::ModelExecution, &resp2.proof)
+            .unwrap());
 
         // Public inputs must be identical (same circuit data)
         assert_eq!(resp1.proof.public_inputs, resp2.proof.public_inputs);
@@ -458,7 +464,10 @@ mod tests {
         };
 
         let result = backend.generate_proof(request);
-        assert!(result.is_err(), "generate_proof before initialize must fail");
+        assert!(
+            result.is_err(),
+            "generate_proof before initialize must fail"
+        );
 
         let err = result.unwrap_err();
         assert!(
@@ -582,7 +591,9 @@ mod tests {
         }
 
         // Verify succeeds with these decimal public inputs
-        assert!(backend.verify_proof(ProofType::ModelExecution, &response.proof).unwrap());
+        assert!(backend
+            .verify_proof(ProofType::ModelExecution, &response.proof)
+            .unwrap());
     }
 
     #[test]

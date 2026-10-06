@@ -117,6 +117,12 @@ harness = false
 name = "tps_parallel"
 harness = false
 
+# HUP-S7.2: worst-case wall clock of the agent precompile fork next to the
+# ecrecover-priced reference (evidence for the gas schedule sign-off).
+[[bench]]
+name = "agent_precompiles_bench"
+harness = false
+
 # PIN-P1 (f.5) — DGX benchmark suite.
 # Measures the per-stage costs that drive the feasibility inequalities
 # from `design/PIN-P1-feasibility-latency-budget.md`:

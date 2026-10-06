@@ -135,17 +135,43 @@ fn fund_senders(executor: &Executor) -> (PublicKey, PublicKey, PublicKey, Public
     (alice, alice_to, bob, bob_to)
 }
 
-fn block_txs(alice: PublicKey, alice_to: PublicKey, bob: PublicKey, bob_to: PublicKey) -> Vec<ConsensusTransaction> {
+fn block_txs(
+    alice: PublicKey,
+    alice_to: PublicKey,
+    bob: PublicKey,
+    bob_to: PublicKey,
+) -> Vec<ConsensusTransaction> {
     // Two tips: 100 and 250 wei/gas, both well above base fee.
     vec![
-        priority_tx(alice, alice_to, 500, 0, CANONICAL_BASE_FEE_PER_GAS + 100, 100, 0xA1),
-        priority_tx(bob, bob_to, 700, 0, CANONICAL_BASE_FEE_PER_GAS + 900, 250, 0xB2),
+        priority_tx(
+            alice,
+            alice_to,
+            500,
+            0,
+            CANONICAL_BASE_FEE_PER_GAS + 100,
+            100,
+            0xA1,
+        ),
+        priority_tx(
+            bob,
+            bob_to,
+            700,
+            0,
+            CANONICAL_BASE_FEE_PER_GAS + 900,
+            250,
+            0xB2,
+        ),
     ]
 }
 
 /// Build a v2 block committing the proposer + coinbase + base fee, at an explicit
 /// height, with the given transactions and claimed state root.
-fn build_block_h(height: u64, base_fee: u64, txs: Vec<ConsensusTransaction>, state_root: Hash) -> Block {
+fn build_block_h(
+    height: u64,
+    base_fee: u64,
+    txs: Vec<ConsensusTransaction>,
+    state_root: Hash,
+) -> Block {
     let mut b = BlockBuilder::new()
         .version(2)
         .height(height)
@@ -154,7 +180,10 @@ fn build_block_h(height: u64, base_fee: u64, txs: Vec<ConsensusTransaction>, sta
         .proposer(PublicKey::new(proposer_pubkey()))
         .timestamp(1_700_000_000)
         .base_fee_per_gas(base_fee)
-        .vrf_reveal(VrfProof { proof: vec![], output: Hash::new([0x5A; 32]) })
+        .vrf_reveal(VrfProof {
+            proof: vec![],
+            output: Hash::new([0x5A; 32]),
+        })
         .transactions(txs)
         .state_root(state_root)
         .build_unhashed();
@@ -173,7 +202,10 @@ fn build_block(base_fee: u64, txs: Vec<ConsensusTransaction>, state_root: Hash) 
         .proposer(PublicKey::new(proposer_pubkey()))
         .timestamp(1_700_000_000)
         .base_fee_per_gas(base_fee)
-        .vrf_reveal(VrfProof { proof: vec![], output: Hash::new([0x5A; 32]) })
+        .vrf_reveal(VrfProof {
+            proof: vec![],
+            output: Hash::new([0x5A; 32]),
+        })
         .transactions(txs)
         .state_root(state_root)
         .build_unhashed();
@@ -276,7 +308,10 @@ async fn reorg_reapply_state_root_parity() {
         .await
         .expect("reorg re-apply succeeds");
 
-    assert_eq!(root1, root2, "reorg re-apply must reproduce the identical state root");
+    assert_eq!(
+        root1, root2,
+        "reorg re-apply must reproduce the identical state root"
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -304,7 +339,10 @@ async fn tampered_base_fee_is_rejected_on_import() {
         .expect_err("a tampered base fee must be rejected");
     match err {
         ExecutionError::RewardSettlement(msg) => {
-            assert!(msg.contains("base_fee"), "reject reason should name base_fee: {msg}");
+            assert!(
+                msg.contains("base_fee"),
+                "reject reason should name base_fee: {msg}"
+            );
         }
         other => panic!("expected RewardSettlement, got {other:?}"),
     }
@@ -359,7 +397,12 @@ async fn none_policy_at_or_above_activation_is_rejected() {
     let (a, at, b, bt) = fund_senders(&er);
     let txs = block_txs(a, at, b, bt);
     // A block AT the activation height with a None policy → HARD REJECT.
-    let block = build_block_h(800, CANONICAL_BASE_FEE_PER_GAS, txs.clone(), Hash::new([0xAB; 32]));
+    let block = build_block_h(
+        800,
+        CANONICAL_BASE_FEE_PER_GAS,
+        txs.clone(),
+        Hash::new([0xAB; 32]),
+    );
     let err = er
         .apply_block(&block, block.header.coinbase, &basic_credits())
         .await
@@ -392,7 +435,11 @@ async fn none_policy_below_activation_is_accepted() {
     });
     let mut receipts = Vec::new();
     for tx in &template.transactions {
-        receipts.push(ep.execute_transaction(&template, tx).await.expect("tx executes"));
+        receipts.push(
+            ep.execute_transaction(&template, tx)
+                .await
+                .expect("tx executes"),
+        );
     }
     ep.settle_block_rewards(
         1,
@@ -415,7 +462,10 @@ async fn none_policy_below_activation_is_accepted() {
         .apply_block(&sealed, sealed.header.coinbase, &basic_credits())
         .await
         .expect("accepted below activation with a None policy");
-    assert_eq!(got, root, "parity holds below activation with a None policy");
+    assert_eq!(
+        got, root,
+        "parity holds below activation with a None policy"
+    );
     assert_eq!(
         er.get_balance(&Address(REGISTRY)),
         U256::zero(),
@@ -459,9 +509,21 @@ async fn guarded_settle_reverts_all_credits_on_error() {
     assert!(matches!(err, ExecutionError::RewardSettlement(_)));
 
     // No stray credits leaked: coinbase + treasury balances untouched, root identical.
-    assert_eq!(e.get_balance(&Address(COINBASE)), U256::zero(), "no basic validator credit leaked");
-    assert_eq!(e.get_balance(&Address(TREASURY)), U256::zero(), "no treasury credit leaked");
-    assert_eq!(e.calculate_state_root(), root_before, "state byte-identical after guarded reject");
+    assert_eq!(
+        e.get_balance(&Address(COINBASE)),
+        U256::zero(),
+        "no basic validator credit leaked"
+    );
+    assert_eq!(
+        e.get_balance(&Address(TREASURY)),
+        U256::zero(),
+        "no treasury credit leaked"
+    );
+    assert_eq!(
+        e.calculate_state_root(),
+        root_before,
+        "state byte-identical after guarded reject"
+    );
 }
 
 // Pre-activation (height < activation): §R' is inert — the block is accepted and

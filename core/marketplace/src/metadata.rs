@@ -175,13 +175,17 @@ impl MetadataCache {
         let metadata = self.fetch_from_ipfs(ipfs_cid).await?;
 
         // Store in cache
-        self.cache_metadata(ipfs_cid.to_string(), metadata.clone()).await;
+        self.cache_metadata(ipfs_cid.to_string(), metadata.clone())
+            .await;
 
         Ok(metadata)
     }
 
     /// Prefetch metadata for multiple models
-    pub async fn prefetch_metadata(&self, cids: Vec<String>) -> Result<Vec<(String, Result<ModelMetadata>)>> {
+    pub async fn prefetch_metadata(
+        &self,
+        cids: Vec<String>,
+    ) -> Result<Vec<(String, Result<ModelMetadata>)>> {
         let mut handles = Vec::new();
 
         for cid in cids {
@@ -224,14 +228,14 @@ impl MetadataCache {
 
         // Enforce max cache size
         if self.cache.len() > self.max_cache_size {
-            let excess = self.cache.len() - self.max_cache_size;
-            let mut removed = 0;
+            let excess = self.cache.len().saturating_sub(self.max_cache_size);
+            let mut removed = 0usize;
 
             // Remove oldest entries (this is not perfect LRU but good enough)
             let mut to_remove = Vec::new();
             for entry in self.cache.iter() {
                 to_remove.push(entry.key().clone());
-                removed += 1;
+                removed = removed.saturating_add(1);
                 if removed >= excess {
                     break;
                 }
@@ -264,7 +268,9 @@ impl MetadataCache {
     /// Get cache statistics
     pub fn get_cache_stats(&self) -> (usize, usize) {
         let total_entries = self.cache.len();
-        let expired_entries = self.cache.iter()
+        let expired_entries = self
+            .cache
+            .iter()
             .filter(|entry| entry.value().is_expired())
             .count();
 
@@ -283,9 +289,7 @@ impl MetadataCache {
         // scheme to redirect the fetch off the intended gateway.
         // OWNER: additionally verify the fetched bytes hash to `cid`
         // (content-addressing) before trusting the metadata.
-        if cid.is_empty()
-            || !cid.chars().all(|c| c.is_ascii_alphanumeric())
-        {
+        if cid.is_empty() || !cid.chars().all(|c| c.is_ascii_alphanumeric()) {
             return Err(anyhow::anyhow!("invalid CID: {cid:?}"));
         }
 
@@ -353,9 +357,8 @@ impl MetadataCache {
         }
 
         // If all gateways failed, return the last error
-        Err(last_error.unwrap_or_else(|| {
-            anyhow::anyhow!("All IPFS gateways failed for CID: {}", cid)
-        }))
+        Err(last_error
+            .unwrap_or_else(|| anyhow::anyhow!("All IPFS gateways failed for CID: {}", cid)))
     }
 
     async fn cache_metadata(&self, cid: String, metadata: ModelMetadata) {
@@ -415,11 +418,17 @@ pub fn validate_metadata(metadata: &ModelMetadata) -> Result<()> {
 
     // Validate hardware requirements
     if metadata.hardware_requirements.min_memory_gb <= 0.0 {
-        return Err(anyhow::anyhow!("Minimum memory requirement must be positive"));
+        return Err(anyhow::anyhow!(
+            "Minimum memory requirement must be positive"
+        ));
     }
 
-    if metadata.hardware_requirements.recommended_memory_gb < metadata.hardware_requirements.min_memory_gb {
-        return Err(anyhow::anyhow!("Recommended memory must be >= minimum memory"));
+    if metadata.hardware_requirements.recommended_memory_gb
+        < metadata.hardware_requirements.min_memory_gb
+    {
+        return Err(anyhow::anyhow!(
+            "Recommended memory must be >= minimum memory"
+        ));
     }
 
     Ok(())
@@ -457,37 +466,30 @@ pub fn create_example_metadata(model_name: &str, framework: &str) -> ModelMetada
             example: Some(serde_json::json!("Hello! How can I help you today?")),
         },
 
-        benchmarks: vec![
-            Benchmark {
-                name: "MMLU".to_string(),
-                dataset: "Massive Multitask Language Understanding".to_string(),
-                metric: "accuracy".to_string(),
-                value: 0.85,
-                units: "score".to_string(),
-                hardware: "A100 GPU".to_string(),
-            }
-        ],
+        benchmarks: vec![Benchmark {
+            name: "MMLU".to_string(),
+            dataset: "Massive Multitask Language Understanding".to_string(),
+            metric: "accuracy".to_string(),
+            value: 0.85,
+            units: "score".to_string(),
+            hardware: "A100 GPU".to_string(),
+        }],
 
         hardware_requirements: HardwareRequirements {
             min_memory_gb: 16.0,
             recommended_memory_gb: 32.0,
             gpu_required: true,
             min_gpu_memory_gb: Some(8.0),
-            supported_platforms: vec![
-                "linux-x86_64".to_string(),
-                "macos-arm64".to_string(),
-            ],
+            supported_platforms: vec!["linux-x86_64".to_string(), "macos-arm64".to_string()],
         },
 
-        examples: vec![
-            UsageExample {
-                title: "Basic Chat".to_string(),
-                description: "Simple conversational interaction".to_string(),
-                input: serde_json::json!({"text": "What is AI?"}),
-                output: serde_json::json!({"text": "AI stands for Artificial Intelligence..."}),
-                code: Some("model.predict(\"What is AI?\")".to_string()),
-            }
-        ],
+        examples: vec![UsageExample {
+            title: "Basic Chat".to_string(),
+            description: "Simple conversational interaction".to_string(),
+            input: serde_json::json!({"text": "What is AI?"}),
+            output: serde_json::json!({"text": "AI stands for Artificial Intelligence..."}),
+            code: Some("model.predict(\"What is AI?\")".to_string()),
+        }],
 
         documentation_url: Some("https://docs.citrate.ai/models".to_string()),
         paper_url: None,

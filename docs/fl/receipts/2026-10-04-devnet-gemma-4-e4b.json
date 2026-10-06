@@ -1,0 +1,87 @@
+{
+  "chain_id": 1337,
+  "ledger": "0x076916470cd2cd26a34aa30680d973495c6484e6",
+  "golden_vector_on_node": true,
+  "cluster_id": "0x8cc62c1d3bdd56085e59b6aace011d02c07e500c6f5695cc5e859c16426f19eb",
+  "start_adapter": {
+    "sha256": "5545c162bffe5b314787a2a17ab78803b020558c6eac0c982edff02df72fc995",
+    "tensors": 132,
+    "values": 2269184
+  },
+  "round_id": "0xc74e162c817c1235394a488c2a3133c4a165ad69f042c2adaba499e46978702b",
+  "workers_done": 3,
+  "aggregate": {
+    "adapter_sha256": "843a0533de68209fed29d6937217aa9c486758b546004f5fac1f6e0edff0cb15",
+    "chunks": 2216,
+    "excluded": 0,
+    "input_root": "0x060d9a9c913cd37f60d896800f213869bfdffd59a85434fead80fa6bc9aaec2f",
+    "n_values": 2269184,
+    "output_root": "0x104e7503fdbbc2f887bfca32e8e4ef64154cd81983d1a74a21ee366646860bfa",
+    "participants": 3,
+    "participants_root": "0x639d78ada518cd667a03e99565af819edf083e074c44cf0e9d67822d8df1ab3b",
+    "record_digest": "0x2e407e64ab42cbf5e7a1b93595b3803536ed7f0914ac24ad17fadb53a18277b4",
+    "round_id": "0xc74e162c817c1235394a488c2a3133c4a165ad69f042c2adaba499e46978702b",
+    "state_counts": [
+      1351680,
+      286720,
+      0,
+      630784
+    ]
+  },
+  "replay": {
+    "participants": 3,
+    "chunks": 2216,
+    "config_hash": "0x307fe5d21d9941bc6159139888b7700082bf14d8592c2510e3b0cc4ceeae2f60",
+    "round_id": "0xc74e162c817c1235394a488c2a3133c4a165ad69f042c2adaba499e46978702b",
+    "participants_root": "0x639d78ada518cd667a03e99565af819edf083e074c44cf0e9d67822d8df1ab3b",
+    "input_root": "0x060d9a9c913cd37f60d896800f213869bfdffd59a85434fead80fa6bc9aaec2f",
+    "output_root": "0x104e7503fdbbc2f887bfca32e8e4ef64154cd81983d1a74a21ee366646860bfa",
+    "record_digest": "0x2e407e64ab42cbf5e7a1b93595b3803536ed7f0914ac24ad17fadb53a18277b4",
+    "merged_adapter_checked": true,
+    "mismatches": []
+  },
+  "record_digest": {
+    "chain": "0x2e407e64ab42cbf5e7a1b93595b3803536ed7f0914ac24ad17fadb53a18277b4",
+    "bundle": "0x2e407e64ab42cbf5e7a1b93595b3803536ed7f0914ac24ad17fadb53a18277b4",
+    "replay": "0x2e407e64ab42cbf5e7a1b93595b3803536ed7f0914ac24ad17fadb53a18277b4"
+  },
+  "honest_challenge_reverts": true,
+  "round0_status": "Accepted",
+  "patronage_ledger": "0x9aea5cbbf45b0aa02ce17af418fc123ddabb428d",
+  "settlement": {
+    "intents": 4,
+    "anchor": "0x2e407e64ab42cbf5e7a1b93595b3803536ed7f0914ac24ad17fadb53a18277b4"
+  },
+  "round1": {
+    "status": "Rejected",
+    "chunk": 1108,
+    "challenge_tx": "0x27fa691f8786e979980dde674c396691e4b7b767f2348bca86ce5cf546046cd3"
+  },
+  "replay_flags_dishonest": 12,
+  "settlement_refuses_rejected": true,
+  "merged_adapter_loads": true,
+  "training": "fixture trainer: no learning ran; this run proves the round protocol only",
+  "run": {
+    "date": "2026-10-04",
+    "why": "Rerun at Gemma 4 E4B scale on the current stack: the 2026-10-01 Gemma receipt predates the fan-out 6 review fixes.",
+    "stack": {
+      "citrate-chain": "fa7c913dbb (hup/n5-chain-fl: ledger, replay tool, this script)",
+      "citrate-compute-pool": "ea86ac7846 (hup/n7-fl-learn-prep = pool #27 branch plus the rate-limit retry and the trainer-row converter; release build)",
+      "citrate-settlement": "3f90f0a35e (hup/n5-chain-fl, release build)",
+      "node": "citrate 0.4.0 (consensus features: commd-fold-verify) (Citrate Core app binary, sha256 prefix c80e064c35c91a99)",
+      "llama_server": "the Citrate Core app's bundled llama-server (Homebrew's build 8640 cannot load Gemma 4 E4B: missing tensor blk.24.attn_k.weight)",
+      "base_model": "gemma-4-E4B-it-Q4_0.gguf"
+    },
+    "probe": {
+      "backend": "candle-metal",
+      "dtype": "f32",
+      "tokens_per_second": 11085,
+      "self_repeat_identical": true
+    },
+    "findings": [
+      "With release binaries the aggregator's 2,216 eth_calls exceeded the node's per-client method budget (-32005) and the round failed; fixed in compute-pool by retrying rate-limited calls with backoff (commit ea86ac7), then this run passed.",
+      "A divergence probe measured while the machine was under heavy build load came in under the 10,000 tok/s accelerator bar (7,434 tok/s), so the coordinator correctly leased no federated job; the probe used here was measured on the same machine under lighter load.",
+      "The merged adapter loads in llama-server on CPU and completes."
+    ]
+  }
+}
