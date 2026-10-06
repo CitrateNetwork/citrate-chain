@@ -201,11 +201,28 @@ try {
     $NodeDirectory = Join-Path $TestRoot "Application Files"
     $NodeBin = Join-Path $NodeDirectory "citrate-node.exe"
     $ConfigPath = Join-Path $DataDir "node.toml"
+    $ArgumentProbe = Join-Path $TestRoot "argument-probe.exe"
 
     $null = New-Item -ItemType Directory -Path $DatabasePath -Force
     $null = New-Item -ItemType Directory -Path $NodeDirectory -Force
     [System.IO.File]::WriteAllText($NodeBin, "test executable")
     [System.IO.File]::WriteAllText($ConfigPath, "network = 'test'")
+    Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+
+public static class ArgumentProbe
+{
+    public static int Main(string[] arguments)
+    {
+        foreach (string argument in arguments)
+        {
+            Console.WriteLine(Convert.ToBase64String(Encoding.UTF8.GetBytes(argument)));
+        }
+        return 0;
+    }
+}
+'@ -Language CSharp -OutputAssembly $ArgumentProbe -OutputType ConsoleApplication
 
     foreach ($path in @($TestRoot, $DataDir, $DatabasePath, $NodeDirectory, $NodeBin, $ConfigPath)) {
         Grant-NetworkServiceFullControl -Path $path
@@ -290,6 +307,23 @@ try {
     Assert-Throws -Operation { Invoke-Validation -NodeBin ($NodeBin + '"') -DataDir $DataDir -ConfigPath $ConfigPath } -MessagePattern "must not contain a quote" -Message "Quoted path was accepted."
     Assert-Throws -Operation { Invoke-Validation -NodeBin ($NodeBin + [char]1) -DataDir $DataDir -ConfigPath $ConfigPath } -MessagePattern "control characters" -Message "Control character was accepted."
 
+    $temporaryDriveName = @("Z", "Y", "X", "W", "V", "U", "T") | Where-Object {
+        -not (Get-PSDrive -Name $_ -ErrorAction SilentlyContinue)
+    } | Select-Object -First 1
+    if (-not $temporaryDriveName) {
+        throw "No unused drive letter was available for the mapped-drive validation test."
+    }
+    $null = New-PSDrive -Name $temporaryDriveName -PSProvider FileSystem -Root $TestRoot
+    try {
+        $mappedDataDir = $temporaryDriveName + ":\Program Data"
+        $mappedConfigPath = Join-Path $mappedDataDir "node.toml"
+        Assert-Throws -Operation {
+            Invoke-Validation -NodeBin $NodeBin -DataDir $mappedDataDir -ConfigPath $mappedConfigPath
+        } -MessagePattern "local fixed drive" -Message "A per-session mapped drive was accepted."
+    } finally {
+        Remove-PSDrive -Name $temporaryDriveName
+    }
+
     Assert-NetworkServiceAccessRejected -Path $NodeDirectory -Operation {
         Invoke-Validation -NodeBin $NodeBin -DataDir $DataDir -ConfigPath $ConfigPath
     } -MessagePattern "lacks required executable traversal access" -Message "Missing executable traversal access was accepted."
@@ -305,6 +339,11 @@ try {
 
     $loadedPlan = . $ServiceScript -ValidateOnly -NodeBin $NodeBin -DataDir $DataDir -ConfigPath $ConfigPath
     Assert-Equal -Actual $loadedPlan.ImagePath -Expected $expectedImagePath -Message "Dot-sourced validation plan differs."
+    $encodedNativeArguments = @(Invoke-Sc -Executable $ArgumentProbe -Arguments $plan.ScArguments)
+    $nativeArguments = @($encodedNativeArguments | ForEach-Object {
+        [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($_))
+    })
+    Assert-SequenceEqual -Actual $nativeArguments -Expected $expectedScArguments -Message "Native sc.exe argument marshalling differs."
     $knownService = Get-Service | Select-Object -First 1
     if (-not $knownService) {
         throw "No Windows service was available to test existing-service rejection."

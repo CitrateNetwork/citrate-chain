@@ -88,6 +88,16 @@ function Assert-SafePathText {
     if ($Path.Substring(2).Contains(":")) {
         throw "$Description path must not use an alternate data stream."
     }
+
+    $root = [System.IO.Path]::GetPathRoot($Path)
+    try {
+        $drive = New-Object System.IO.DriveInfo($root)
+    } catch {
+        throw "$Description path must use a local fixed drive."
+    }
+    if ($drive.DriveType -ne [System.IO.DriveType]::Fixed) {
+        throw "$Description path must use a local fixed drive."
+    }
 }
 
 function Assert-NoReparsePoint {
@@ -285,7 +295,10 @@ function Invoke-Sc {
     )
 
     try {
-        $output = & $Executable @Arguments 2>&1
+        # Windows PowerShell 5.1 removes embedded quotes when constructing a native
+        # command line unless they are escaped for CommandLineToArgvW.
+        $nativeArguments = @($Arguments | ForEach-Object { $_.Replace('"', '\"') })
+        $output = & $Executable @nativeArguments 2>&1
     } catch {
         throw "Unable to run sc.exe at '$Executable': $($_.Exception.Message)"
     }
