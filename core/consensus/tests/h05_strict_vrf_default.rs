@@ -59,8 +59,7 @@ async fn h05_strict_default_rejects_garbage_vrf_block() {
         .expect_err("garbage VRF block must be rejected by strict default");
     let msg = format!("{}", err);
     assert!(
-        msg.to_ascii_lowercase().contains("vrf")
-            || msg.to_ascii_lowercase().contains("invalid"),
+        msg.to_ascii_lowercase().contains("vrf") || msg.to_ascii_lowercase().contains("invalid"),
         "rejection error should mention VRF / invalid: {}",
         msg
     );

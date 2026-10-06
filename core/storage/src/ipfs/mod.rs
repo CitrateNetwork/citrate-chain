@@ -13,10 +13,10 @@ use std::collections::HashMap;
 
 pub mod chunking;
 pub mod daemon;
-pub mod pinning;
 pub mod encrypted_store;
+pub mod pinning;
 
-pub use daemon::{IpfsDaemon, DaemonConfig, DaemonStatus, HealthStatus, NodeInfo};
+pub use daemon::{DaemonConfig, DaemonStatus, HealthStatus, IpfsDaemon, NodeInfo};
 
 /// IPFS Content Identifier
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
@@ -70,6 +70,10 @@ pub struct IPFSService {
 impl IPFSService {
     /// Create a new IPFS service instance
     pub fn new(api_endpoint: String) -> Self {
+        // INVARIANT: with this static configuration `build()` fails only if the TLS
+        // backend cannot initialize at all, in which case no client of this kind can
+        // exist; there is no degraded mode to fall back to (PANIC-S1 PROVE+KEEP).
+        #[allow(clippy::panic)]
         let client = Client::builder()
             .use_rustls_tls()
             .no_proxy()

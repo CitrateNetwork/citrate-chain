@@ -3,14 +3,14 @@
 // Tests checkpoint quorum enforcement, duplicate vote rejection,
 // non-committee vote rejection, and total ordering on non-trivial DAGs.
 
-use std::sync::Arc;
 use citrate_consensus::checkpoint::{CheckpointConfig, CheckpointManager, CheckpointVote};
 use citrate_consensus::dag_store::DagStore;
 use citrate_consensus::ghostdag::GhostDag;
 use citrate_consensus::ordering::TotalOrdering;
 use citrate_consensus::types::*;
-use ed25519_dalek::SigningKey;
 use ed25519_dalek::Signer;
+use ed25519_dalek::SigningKey;
+use std::sync::Arc;
 
 fn test_key(seed: u8) -> SigningKey {
     let mut bytes = [0u8; 32];
@@ -33,9 +33,8 @@ fn make_signed_vote_for_chain(
 
     // RM-B1 / WP-B2.2 (H-02): use the canonical helper so tests
     // sign exactly the bytes the verifier checks.
-    let message = citrate_consensus::checkpoint::canonical_vote_message(
-        chain_id, height, &block_hash,
-    );
+    let message =
+        citrate_consensus::checkpoint::canonical_vote_message(chain_id, height, &block_hash);
 
     let sig = signing_key.sign(&message);
 
@@ -83,7 +82,8 @@ async fn test_checkpoint_quorum_requires_threshold() {
 
     // Testing config: committee=5, quorum=4, interval=5
     let keys: Vec<SigningKey> = (0..5).map(test_key).collect();
-    let committee: Vec<PublicKey> = keys.iter()
+    let committee: Vec<PublicKey> = keys
+        .iter()
         .map(|k| PublicKey::new(k.verifying_key().to_bytes()))
         .collect();
 
@@ -94,7 +94,11 @@ async fn test_checkpoint_quorum_requires_threshold() {
     for (i, key) in keys.iter().enumerate().take(3) {
         let vote = make_signed_vote(key, 50, hash_for(50));
         let reached = mgr.submit_vote(vote).await.unwrap();
-        assert!(!reached, "Vote {} of 4 quorum — should not be reached yet", i + 1);
+        assert!(
+            !reached,
+            "Vote {} of 4 quorum — should not be reached yet",
+            i + 1
+        );
     }
 
     // Verify can't finalize yet
@@ -113,7 +117,8 @@ async fn test_checkpoint_quorum_reached_with_enough_votes() {
 
     // Testing config: committee=5, quorum=4
     let keys: Vec<SigningKey> = (0..5).map(|i| test_key(i + 10)).collect();
-    let committee: Vec<PublicKey> = keys.iter()
+    let committee: Vec<PublicKey> = keys
+        .iter()
         .map(|k| PublicKey::new(k.verifying_key().to_bytes()))
         .collect();
 
@@ -170,7 +175,10 @@ async fn test_checkpoint_non_committee_vote_rejected() {
     // Outsider tries to vote
     let vote = make_signed_vote(&outsider_key, 50, hash_for(50));
     let result = mgr.submit_vote(vote).await;
-    assert!(result.is_err(), "Non-committee member vote must be rejected");
+    assert!(
+        result.is_err(),
+        "Non-committee member vote must be rejected"
+    );
 }
 
 // ============================================================
@@ -203,7 +211,10 @@ async fn test_total_ordering_linear_chain() {
     let order = ordering.get_total_order(prev).await.unwrap();
 
     // Linear chain: total order should be genesis → b1 → b2 → b3
-    assert!(order.len() >= 3, "Total order must include at least the chain blocks");
+    assert!(
+        order.len() >= 3,
+        "Total order must include at least the chain blocks"
+    );
 }
 
 #[tokio::test]

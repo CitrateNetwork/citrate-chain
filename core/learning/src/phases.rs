@@ -112,7 +112,7 @@ impl PhaseManager {
 
     /// Record a submission in the current phase.
     pub fn record_submission(&mut self) {
-        self.state.submissions += 1;
+        self.state.submissions = self.state.submissions.saturating_add(1);
     }
 
     /// Mark the current phase's condition as met.
@@ -134,12 +134,8 @@ impl PhaseManager {
 
         // Phase-specific conditions
         match self.state.phase {
-            OodaPhase::Observe => {
-                self.state.submissions >= self.config.min_participants
-            }
-            OodaPhase::Orient | OodaPhase::Decide | OodaPhase::Act => {
-                self.state.condition_met
-            }
+            OodaPhase::Observe => self.state.submissions >= self.config.min_participants,
+            OodaPhase::Orient | OodaPhase::Decide | OodaPhase::Act => self.state.condition_met,
         }
     }
 
@@ -166,7 +162,7 @@ impl PhaseManager {
 
         // If completing Act → Observe, increment round
         if old_phase == OodaPhase::Act {
-            self.state.round += 1;
+            self.state.round = self.state.round.saturating_add(1);
         }
 
         self.state.phase = new_phase;
@@ -282,7 +278,7 @@ impl MacroPhaseManager {
         match self.phase {
             NetworkLearningPhase::Collection => {
                 if confidence_mean >= self.config.macro_confidence_threshold {
-                    self.consecutive_above += 1;
+                    self.consecutive_above = self.consecutive_above.saturating_add(1);
                 } else {
                     self.consecutive_above = 0;
                 }
@@ -303,7 +299,7 @@ impl MacroPhaseManager {
             NetworkLearningPhase::RoutingActive => {
                 if let Some(loss) = router_loss {
                     if loss < self.config.macro_loss_threshold {
-                        self.consecutive_above += 1;
+                        self.consecutive_above = self.consecutive_above.saturating_add(1);
                     } else {
                         self.consecutive_above = 0;
                     }
@@ -411,13 +407,16 @@ impl LearningPipeline {
         creator: [u8; 32],
         checkpoint_height: u64,
     ) -> LearningResult<LoraAdapter> {
-        self.round += 1;
+        self.round = self.round.saturating_add(1);
 
         let metadata = AdapterMetadata {
             name: format!("pipeline-round-{}", self.round),
-            description: format!("Auto-generated LoRA adapter from routing decision {}", decision.selected),
+            description: format!(
+                "Auto-generated LoRA adapter from routing decision {}",
+                decision.selected
+            ),
             round: self.round,
-            participant_count: 0, // Filled by caller if needed
+            participant_count: 0,          // Filled by caller if needed
             created_at: checkpoint_height, // Use checkpoint as timestamp proxy
         };
 
@@ -675,7 +674,15 @@ mod tests {
 
     // WP-N.5 / WP-O.5: Pipeline tests
 
-    fn make_pipeline_input(dim: usize) -> (LearningConfig, EmbeddingVector, EmbeddingVector, EmbeddingVector, Vec<f32>) {
+    fn make_pipeline_input(
+        dim: usize,
+    ) -> (
+        LearningConfig,
+        EmbeddingVector,
+        EmbeddingVector,
+        EmbeddingVector,
+        Vec<f32>,
+    ) {
         let config = LearningConfig {
             embedding_dimensions: dim,
             lora_rank: 2,
@@ -729,7 +736,9 @@ mod tests {
         };
 
         // Without adapter production
-        let result = pipeline.execute_cycle(&query, &input, false, [1u8; 32], 100).unwrap();
+        let result = pipeline
+            .execute_cycle(&query, &input, false, [1u8; 32], 100)
+            .unwrap();
         assert_eq!(result.aggregation.embedding.dim(), dim);
         assert!(result.routing.selected < config.router_num_destinations);
         assert!(result.adapter.is_none());
@@ -751,7 +760,9 @@ mod tests {
             theta_low: 0.3,
         };
 
-        let result = pipeline.execute_cycle(&query, &input, true, [1u8; 32], 100).unwrap();
+        let result = pipeline
+            .execute_cycle(&query, &input, true, [1u8; 32], 100)
+            .unwrap();
         assert!(result.adapter.is_some());
 
         let adapter = result.adapter.unwrap();
@@ -795,7 +806,9 @@ mod tests {
         };
 
         let start = std::time::Instant::now();
-        let result = pipeline.execute_cycle(&query, &input, true, [1u8; 32], 100).unwrap();
+        let result = pipeline
+            .execute_cycle(&query, &input, true, [1u8; 32], 100)
+            .unwrap();
         let elapsed = start.elapsed();
 
         assert!(result.adapter.is_some());
@@ -836,24 +849,42 @@ mod tests {
 
         // Phase 1: Collection — no adapter
         assert_eq!(macro_mgr.current_phase(), NetworkLearningPhase::Collection);
-        let result = pipeline.execute_cycle(&query, &input, macro_mgr.can_adapt(), [1u8; 32], 100).unwrap();
-        assert!(result.adapter.is_none(), "Collection phase should not produce adapter");
+        let result = pipeline
+            .execute_cycle(&query, &input, macro_mgr.can_adapt(), [1u8; 32], 100)
+            .unwrap();
+        assert!(
+            result.adapter.is_none(),
+            "Collection phase should not produce adapter"
+        );
 
         // Transition to RoutingActive
         macro_mgr.evaluate_checkpoint(0.8, None);
-        assert_eq!(macro_mgr.current_phase(), NetworkLearningPhase::RoutingActive);
+        assert_eq!(
+            macro_mgr.current_phase(),
+            NetworkLearningPhase::RoutingActive
+        );
 
         // Phase 2: RoutingActive — no adapter
-        let result = pipeline.execute_cycle(&query, &input, macro_mgr.can_adapt(), [1u8; 32], 200).unwrap();
-        assert!(result.adapter.is_none(), "RoutingActive phase should not produce adapter");
+        let result = pipeline
+            .execute_cycle(&query, &input, macro_mgr.can_adapt(), [1u8; 32], 200)
+            .unwrap();
+        assert!(
+            result.adapter.is_none(),
+            "RoutingActive phase should not produce adapter"
+        );
 
         // Transition to FullSystem
         macro_mgr.evaluate_checkpoint(0.8, Some(0.2));
         assert_eq!(macro_mgr.current_phase(), NetworkLearningPhase::FullSystem);
 
         // Phase 3: FullSystem — adapter produced!
-        let result = pipeline.execute_cycle(&query, &input, macro_mgr.can_adapt(), [1u8; 32], 300).unwrap();
-        assert!(result.adapter.is_some(), "FullSystem phase should produce adapter");
+        let result = pipeline
+            .execute_cycle(&query, &input, macro_mgr.can_adapt(), [1u8; 32], 300)
+            .unwrap();
+        assert!(
+            result.adapter.is_some(),
+            "FullSystem phase should produce adapter"
+        );
         let adapter = result.adapter.unwrap();
         assert_eq!(adapter.dim, dim);
     }

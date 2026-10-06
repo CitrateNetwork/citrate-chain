@@ -35,6 +35,20 @@
 //     Fixed: get_marketplace_stats now snapshots interactions first, drops the lock,
 //     then acquires stats (write). Both paths now follow interactions-before-stats.
 
+// PANIC-S1 G2: production code in this crate may not panic (tests excepted).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use std::sync::Arc;
 
 pub mod analytics_engine;
@@ -59,10 +73,10 @@ pub use types::*;
 pub use crate::{
     analytics_engine::{AnalyticsEngine, ModelAnalyticsReport},
     discovery::DiscoveryConfig,
-    indexing::{IndexingService, BatchIndexer},
-    metadata::{ModelMetadata, MetadataCache},
-    performance_tracker::{PerformanceTracker, PerformanceConfig, ModelHealthStatus},
-    rating_system::{RatingSystem, RatingConfig, ModelRating, EnhancedUserReview},
+    indexing::{BatchIndexer, IndexingService},
+    metadata::{MetadataCache, ModelMetadata},
+    performance_tracker::{ModelHealthStatus, PerformanceConfig, PerformanceTracker},
+    rating_system::{EnhancedUserReview, ModelRating, RatingConfig, RatingSystem},
     recommendations::RecommendationEngine,
     search::{SearchEngine, SearchQuery, SearchResult},
     storage::MarketplaceStorage,

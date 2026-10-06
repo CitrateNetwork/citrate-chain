@@ -94,7 +94,10 @@ impl Cooldowns {
     /// now goes through `try_reserve`.
     #[allow(dead_code)]
     pub fn check(&self, address: &str, ip: &str) -> Result<(), CooldownDenial> {
-        let state = self.state.read().expect("cooldown lock poisoned");
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         check_in_state(&state, &self.policy, address, ip, unix_seconds())
     }
 
@@ -110,7 +113,10 @@ impl Cooldowns {
     /// matches the pre-fix exposure and only risks one extra drip.
     pub fn try_reserve(&self, address: &str, ip: &str) -> Result<(), CooldownDenial> {
         let now = unix_seconds();
-        let mut state = self.state.write().expect("cooldown lock poisoned");
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         check_in_state(&state, &self.policy, address, ip, now)?;
         state.address_last.insert(address_key(address), now);
         state.ip_last.insert(ip.to_string(), now);
@@ -122,7 +128,10 @@ impl Cooldowns {
     /// this (address, ip); safe because while the reservation is
     /// held no other request can have claimed the same keys.
     pub fn release(&self, address: &str, ip: &str) {
-        let mut state = self.state.write().expect("cooldown lock poisoned");
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.address_last.remove(&address_key(address));
         state.ip_last.remove(ip);
     }
@@ -132,7 +141,10 @@ impl Cooldowns {
     pub fn record_success(&self, address: &str, ip: &str) {
         let now = unix_seconds();
         let snapshot = {
-            let mut state = self.state.write().expect("cooldown lock poisoned");
+            let mut state = self
+                .state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.address_last.insert(address_key(address), now);
             state.ip_last.insert(ip.to_string(), now);
             state.clone()
@@ -150,7 +162,6 @@ impl Cooldowns {
     pub fn policy(&self) -> &CooldownPolicy {
         &self.policy
     }
-
 }
 
 /// Shared cooldown evaluation used by both the read-only `check` and
@@ -166,7 +177,7 @@ fn check_in_state(
         let elapsed = now.saturating_sub(last);
         if elapsed < policy.address_cooldown_secs {
             return Err(CooldownDenial::AddressCooldown {
-                remaining_secs: policy.address_cooldown_secs - elapsed,
+                remaining_secs: policy.address_cooldown_secs.saturating_sub(elapsed),
             });
         }
     }
@@ -174,7 +185,7 @@ fn check_in_state(
         let elapsed = now.saturating_sub(last);
         if elapsed < policy.ip_cooldown_secs {
             return Err(CooldownDenial::IpCooldown {
-                remaining_secs: policy.ip_cooldown_secs - elapsed,
+                remaining_secs: policy.ip_cooldown_secs.saturating_sub(elapsed),
             });
         }
     }
@@ -182,9 +193,7 @@ fn check_in_state(
 }
 
 fn address_key(addr: &str) -> String {
-    addr.to_lowercase()
-        .trim_start_matches("0x")
-        .to_string()
+    addr.to_lowercase().trim_start_matches("0x").to_string()
 }
 
 fn unix_seconds() -> u64 {
@@ -307,7 +316,8 @@ mod tests {
         let cd = Cooldowns::in_memory(CooldownPolicy::default());
         cd.record_success("0xABCDEF", "1.2.3.4");
         // Same address, different casing + missing 0x prefix.
-        cd.check("abcdef", "5.6.7.8").expect_err("same address rejects");
+        cd.check("abcdef", "5.6.7.8")
+            .expect_err("same address rejects");
     }
 
     /// FAU-04 core: persistence survives "process restart".
@@ -320,7 +330,10 @@ mod tests {
         cd1.record_success("0xabc", "1.2.3.4");
         // Fresh tracker pointing at the same file.
         let cd2 = Cooldowns::with_file(path.clone(), CooldownPolicy::default());
-        match cd2.check("0xabc", "5.6.7.8").expect_err("blocked after restart") {
+        match cd2
+            .check("0xabc", "5.6.7.8")
+            .expect_err("blocked after restart")
+        {
             CooldownDenial::AddressCooldown { .. } => {}
             other => panic!("expected AddressCooldown, got {:?}", other),
         }
@@ -332,7 +345,8 @@ mod tests {
         let path = tmp.path().join("cooldowns.json");
         std::fs::write(&path, b"not-json").expect("write garbage");
         let cd = Cooldowns::with_file(path, CooldownPolicy::default());
-        cd.check("0xabc", "1.2.3.4").expect("starts empty after corruption");
+        cd.check("0xabc", "1.2.3.4")
+            .expect("starts empty after corruption");
     }
 
     #[cfg(unix)]
@@ -383,11 +397,14 @@ mod tests {
     fn test_faucet1_release_returns_slot_success_keeps_it() {
         let cd = Cooldowns::in_memory(CooldownPolicy::default());
         cd.try_reserve("0xabc", "1.2.3.4").expect("first reserve");
-        cd.check("0xabc", "1.2.3.4").expect_err("slot held while reserved");
+        cd.check("0xabc", "1.2.3.4")
+            .expect_err("slot held while reserved");
         cd.release("0xabc", "1.2.3.4");
-        cd.try_reserve("0xabc", "1.2.3.4").expect("reserve again after release");
+        cd.try_reserve("0xabc", "1.2.3.4")
+            .expect("reserve again after release");
         cd.record_success("0xabc", "1.2.3.4");
-        cd.check("0xabc", "5.6.7.8").expect_err("claimed after success");
+        cd.check("0xabc", "5.6.7.8")
+            .expect_err("claimed after success");
     }
 
     /// Tight policy: zero cooldown means every request passes.
@@ -399,6 +416,7 @@ mod tests {
             ip_cooldown_secs: 0,
         });
         cd.record_success("0xabc", "1.2.3.4");
-        cd.check("0xabc", "1.2.3.4").expect("zero policy = no cooldown");
+        cd.check("0xabc", "1.2.3.4")
+            .expect("zero policy = no cooldown");
     }
 }

@@ -15,6 +15,20 @@
 //! - [`metrics`] — Prometheus-compatible bridge health metrics
 //! - [`errors`] — Bridge error types
 
+// PANIC-S1 G2: production code in this crate may not panic (tests excepted).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 pub mod config;
 pub mod errors;
 pub mod events;

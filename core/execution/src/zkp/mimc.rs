@@ -39,7 +39,9 @@ fn generate_round_constants() -> Vec<Fr> {
         // Use first 31 bytes to avoid modular bias (BLS12-381 scalar field
         // is ~255 bits; 31 bytes = 248 bits < field modulus).
         let mut bytes = [0u8; 32];
-        bytes[..31].copy_from_slice(&hash[..31]);
+        for (dst, src) in bytes.iter_mut().zip(hash.iter()).take(31) {
+            *dst = *src;
+        }
         constants.push(Fr::from_le_bytes_mod_order(&bytes));
     }
     constants
@@ -79,8 +81,9 @@ pub fn fr_to_bytes_le(f: &Fr) -> [u8; 32] {
     let bigint = f.into_bigint();
     let limb_bytes = bigint.to_bytes_le();
     let mut out = [0u8; 32];
-    let len = limb_bytes.len().min(32);
-    out[..len].copy_from_slice(&limb_bytes[..len]);
+    for (dst, src) in out.iter_mut().zip(&limb_bytes) {
+        *dst = *src;
+    }
     out
 }
 
@@ -160,7 +163,11 @@ mod tests {
     #[test]
     fn test_mimc_hash_empty() {
         let h = mimc_hash(&[]);
-        assert_eq!(h, Fr::from(0u64), "Hash of empty input should be zero state");
+        assert_eq!(
+            h,
+            Fr::from(0u64),
+            "Hash of empty input should be zero state"
+        );
     }
 
     #[test]
@@ -188,7 +195,10 @@ mod tests {
         let circuit_hash = mimc_hash_circuit(cs.clone(), &data_vars).unwrap();
         let circuit_val = circuit_hash.value().unwrap();
 
-        assert_eq!(native_hash, circuit_val, "Circuit hash must match native hash");
+        assert_eq!(
+            native_hash, circuit_val,
+            "Circuit hash must match native hash"
+        );
         assert!(cs.is_satisfied().unwrap(), "Constraints must be satisfied");
     }
 
@@ -220,7 +230,11 @@ mod tests {
     fn test_mimc_hash_order_matters() {
         let a = vec![Fr::from(1u64), Fr::from(2u64)];
         let b = vec![Fr::from(2u64), Fr::from(1u64)];
-        assert_ne!(mimc_hash(&a), mimc_hash(&b), "[1,2] and [2,1] must hash differently");
+        assert_ne!(
+            mimc_hash(&a),
+            mimc_hash(&b),
+            "[1,2] and [2,1] must hash differently"
+        );
     }
 
     #[test]

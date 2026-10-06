@@ -8,16 +8,19 @@ import {InitialAdmin} from "./lib/InitialAdmin.sol";
 import "./interfaces/IModelRegistry.sol";
 import "./lib/AccessControl.sol";
 import "./lib/ReentrancyGuard.sol";
+import {CitratePrecompiles} from "./lib/CitratePrecompiles.sol";
 
 /**
  * @title ModelRegistry
  * @notice Registry for AI models on Citrate blockchain
- * @dev Integrates with Citrate precompiles for model operations
+ * @dev HUP-S7.2: registration is an on-chain record only (the weights live at
+ *      `ipfsCID`; a node's inference runtime loads them off chain). Inference
+ *      goes to 0x0101 MODEL_INFERENCE in its native packed layout through
+ *      `CitratePrecompiles`, which fails closed: where no precompile serves
+ *      inference to contract code, the call reverts with
+ *      `PrecompileUnavailable`. See docs/precompiles/AGENT_PRECOMPILES.md.
  */
 contract ModelRegistry is IModelRegistry, AccessControl, ReentrancyGuard {
-    // Citrate precompile addresses
-    address constant MODEL_PRECOMPILE = 0x0000000000000000000000000000000000001000;
-    address constant ARTIFACT_PRECOMPILE = 0x0000000000000000000000000000000000001002;
     
     // Model information
     struct Model {
@@ -142,9 +145,6 @@ contract ModelRegistry is IModelRegistry, AccessControl, ReentrancyGuard {
         allModelHashes.push(modelHash);
         totalModels++;
         
-        // Call Citrate precompile to register model on-chain
-        _registerWithPrecompile(modelHash, ipfsCID);
-        
         emit ModelRegistered(modelHash, msg.sender, name, ipfsCID);
         
         return modelHash;
@@ -168,9 +168,6 @@ contract ModelRegistry is IModelRegistry, AccessControl, ReentrancyGuard {
         model.version = newVersion;
         model.ipfsCID = newIpfsCID;
         model.updatedAt = block.timestamp;
-        
-        // Update precompile registration
-        _registerWithPrecompile(modelHash, newIpfsCID);
         
         emit ModelUpdated(modelHash, newVersion, newIpfsCID);
     }
@@ -247,8 +244,9 @@ contract ModelRegistry is IModelRegistry, AccessControl, ReentrancyGuard {
         
         emit InferenceRequested(modelHash, msg.sender, msg.value);
         
-        // Call precompile for actual inference
-        return _executeInference(modelHash, inputData);
+        // 0x0101 in its native layout; fails closed (the whole call, payment
+        // included, reverts) where no node serves inference to contracts.
+        return CitratePrecompiles.modelInference(modelHash, msg.sender, inputData);
     }
     
     /**
@@ -373,36 +371,6 @@ contract ModelRegistry is IModelRegistry, AccessControl, ReentrancyGuard {
         return (names, frameworks, prices, activeStates);
     }
 
-    // Internal functions for precompile interaction
-    
-    function _registerWithPrecompile(bytes32 modelHash, string memory ipfsCID) internal {
-        // Call Citrate MODEL_PRECOMPILE to register model
-        (bool success, ) = MODEL_PRECOMPILE.call(
-            abi.encodeWithSignature(
-                "registerModel(bytes32,string)",
-                modelHash,
-                ipfsCID
-            )
-        );
-        require(success, "Precompile registration failed");
-    }
-    
-    function _executeInference(
-        bytes32 modelHash,
-        bytes calldata inputData
-    ) internal returns (bytes memory) {
-        // Call Citrate MODEL_PRECOMPILE for inference
-        (bool success, bytes memory result) = MODEL_PRECOMPILE.call(
-            abi.encodeWithSignature(
-                "executeInference(bytes32,bytes)",
-                modelHash,
-                inputData
-            )
-        );
-        require(success, "Inference execution failed");
-        return abi.decode(result, (bytes));
-    }
-    
     // Admin functions
     
     function withdrawFees() external nonReentrant onlyRole(DEFAULT_ADMIN_ROLE) {

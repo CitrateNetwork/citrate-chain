@@ -29,6 +29,20 @@
 // reward path, which is a pure function of `header.height` + `transactions`.
 // This module recomputes that same basic reward to build the credit list.
 
+// PANIC-S1 G2: block production / apply / sync path (T1); panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use std::sync::Arc;
 
 use std::collections::BTreeMap;
@@ -494,9 +508,21 @@ impl CanonicalApplicator {
     /// applied on the basic reward path: `[(coinbase, validator_reward),
     /// (treasury, treasury_reward)]`. `coinbase` comes from the committed v2
     /// header field (`block.header.coinbase`).
-    fn reward_credits(&self, block: &Block) -> Vec<(citrate_execution::types::Address, U256)> {
-        let reward = self.reward_calculator.calculate_reward(block);
-        vec![
+    ///
+    /// PANIC-S1 D3: a reward that cannot be computed (overflow / invalid config) is
+    /// an ERROR, never a panic or a saturated amount. Callers fold it into their
+    /// existing reject path via `ExecutionError::RewardSettlement`, so the block is
+    /// rejected (or the reorg aborted and rolled back) exactly like any other
+    /// execution failure.
+    fn reward_credits(
+        &self,
+        block: &Block,
+    ) -> Result<
+        Vec<(citrate_execution::types::Address, U256)>,
+        citrate_economics::rewards::RewardError,
+    > {
+        let reward = self.reward_calculator.calculate_reward(block)?;
+        Ok(vec![
             (
                 citrate_execution::types::Address(block.header.coinbase),
                 reward.validator_reward,
@@ -505,7 +531,7 @@ impl CanonicalApplicator {
                 citrate_execution::types::Address(TREASURY_ADDR),
                 reward.treasury_reward,
             ),
-        ]
+        ])
     }
 
     /// Persist the applied-tip pointer + this block's verified state root (crash
@@ -556,11 +582,14 @@ impl CanonicalApplicator {
         let mut extensions: Vec<Block> = children
             .into_iter()
             .filter_map(|h| self.storage.blocks.get_block(&h).ok().flatten())
-            .filter(|b| b.selected_parent() == tip.hash && b.header.height == tip.height + 1)
+            .filter(|b| {
+                b.selected_parent() == tip.hash
+                    && Some(b.header.height) == tip.height.checked_add(1)
+            })
             .collect();
         match extensions.len() {
             0 => Ok(None),
-            1 => Ok(Some(extensions.pop().expect("len == 1"))),
+            1 => Ok(extensions.pop()),
             _ => Err(()),
         }
     }
@@ -592,12 +621,15 @@ impl CanonicalApplicator {
             };
             let block_hash = block.header.block_hash;
             let height = block.header.height;
-            let credits = self.reward_credits(&block);
-            match self
-                .executor
-                .apply_block(&block, block.header.coinbase, &credits)
-                .await
-            {
+            let apply_result = match self.reward_credits(&block) {
+                Ok(credits) => {
+                    self.executor
+                        .apply_block(&block, block.header.coinbase, &credits)
+                        .await
+                }
+                Err(e) => Err(ExecutionError::RewardSettlement(e.to_string())),
+            };
+            match apply_result {
                 Ok(_root) => {
                     state.record(block_hash, height, self.executor.state_snapshot());
                     self.persist_applied(&block_hash, height, &block.state_root);
@@ -926,12 +958,15 @@ impl CanonicalApplicator {
         }
 
         for block in &branch {
-            let credits = self.reward_credits(block);
-            match self
-                .executor
-                .apply_block_no_persist(block, block.header.coinbase, &credits)
-                .await
-            {
+            let apply_result = match self.reward_credits(block) {
+                Ok(credits) => {
+                    self.executor
+                        .apply_block_no_persist(block, block.header.coinbase, &credits)
+                        .await
+                }
+                Err(e) => Err(ExecutionError::RewardSettlement(e.to_string())),
+            };
+            match apply_result {
                 Ok(_) => {
                     let h = block.header.height;
                     let hh = block.header.block_hash;
@@ -1484,15 +1519,18 @@ impl CanonicalApplicator {
                 Some(b) => b,
                 None => break, // missing block — reach check below rolls back
             };
-            let credits = self.reward_credits(&block);
             // TRUSTED replay: skip the per-block full-trie root recompute (the ~O(N^2)
             // wall that made a from-genesis rebuild take hours). Correctness is
             // recovered by verifying the FINAL head root once, below.
-            match self
-                .executor
-                .apply_block_trusted(&block, block.header.coinbase, &credits)
-                .await
-            {
+            let apply_result = match self.reward_credits(&block) {
+                Ok(credits) => {
+                    self.executor
+                        .apply_block_trusted(&block, block.header.coinbase, &credits)
+                        .await
+                }
+                Err(e) => Err(ExecutionError::RewardSettlement(e.to_string())),
+            };
+            match apply_result {
                 Ok(_) => {
                     // Record the block's CLAIMED root (trusted) in the ring; the ring
                     // snapshot is the executor state, which is correct regardless.
@@ -1661,7 +1699,9 @@ mod tests {
 
     /// Reward credits the driver applies, computed the same way it does internally.
     fn reward_for(block: &Block) -> (U256, U256) {
-        let r = RewardCalculator::new(canonical_reward_config()).calculate_reward(block);
+        let r = RewardCalculator::new(canonical_reward_config())
+            .calculate_reward(block)
+            .expect("canonical reward");
         (r.validator_reward, r.treasury_reward)
     }
 
@@ -3636,8 +3676,9 @@ mod tests {
                 .await
                 .expect("producer tx must execute");
         }
-        let reward =
-            RewardCalculator::new(canonical_reward_config()).calculate_reward(&provisional);
+        let reward = RewardCalculator::new(canonical_reward_config())
+            .calculate_reward(&provisional)
+            .expect("canonical reward");
         for (addr, amt) in [
             (Address(CB), reward.validator_reward),
             (Address(TREASURY_ADDR), reward.treasury_reward),
@@ -3954,8 +3995,9 @@ mod tests {
                     .expect("producer tx executes"),
             );
         }
-        let reward =
-            RewardCalculator::new(canonical_reward_config()).calculate_reward(&provisional);
+        let reward = RewardCalculator::new(canonical_reward_config())
+            .calculate_reward(&provisional)
+            .expect("canonical reward");
         let basic = [
             (Address(CB), reward.validator_reward),
             (Address(TREASURY_ADDR), reward.treasury_reward),
@@ -5296,8 +5338,9 @@ mod tests {
             block_hashes: std::collections::HashMap::new(),
         });
         let provisional = mk_block_cb(height, parent, Hash::default(), vrf, coinbase);
-        let reward =
-            RewardCalculator::new(canonical_reward_config()).calculate_reward(&provisional);
+        let reward = RewardCalculator::new(canonical_reward_config())
+            .calculate_reward(&provisional)
+            .expect("canonical reward");
         for (addr, amt) in [
             (Address(coinbase), reward.validator_reward),
             (Address(TREASURY_ADDR), reward.treasury_reward),
@@ -6333,8 +6376,9 @@ mod tests {
                     .expect("producer tx executes"),
             );
         }
-        let reward =
-            RewardCalculator::new(canonical_reward_config()).calculate_reward(&provisional);
+        let reward = RewardCalculator::new(canonical_reward_config())
+            .calculate_reward(&provisional)
+            .expect("canonical reward");
         let basic = [
             (Address(coinbase), reward.validator_reward),
             (Address(TREASURY_ADDR), reward.treasury_reward),

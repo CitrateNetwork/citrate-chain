@@ -126,7 +126,10 @@ async fn eager_load_of_200_blocks_keeps_memory_flat() {
     //    safety claim: select_tip only reads .score, never .blocks).
     let tip = ghostdag.select_tip().await.expect("a tip exists");
     assert_eq!(tip, parent, "the chain head is the selected tip");
-    let score = ghostdag.get_blue_score(&tip).await.expect("tip has a score");
+    let score = ghostdag
+        .get_blue_score(&tip)
+        .await
+        .expect("tip has a score");
     // SYNC-S1 D1: `register_existing_block` no longer copies the score out of
     // the header. It derives it locally and inductively — genesis is 1 and each
     // linear step adds 1 — so the tip of a CHAIN_LEN-block chain (heights

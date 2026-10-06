@@ -60,10 +60,7 @@ pub trait Rig: Send + Sync {
     /// rows. The rig MUST be deterministic given (dataset, seed) —
     /// the reproducibility scenarios in `hypothesis_h{N}.feature`
     /// depend on this.
-    async fn run_trial(
-        &mut self,
-        seed: ExperimentSeed,
-    ) -> Result<TrialResult, RigError>;
+    async fn run_trial(&mut self, seed: ExperimentSeed) -> Result<TrialResult, RigError>;
 
     /// Final cleanup. Releases any held resources; the rig is
     /// allowed to be reused across experiment runs after this
@@ -93,10 +90,7 @@ mod tests {
                 example_count: 0,
             })
         }
-        async fn run_trial(
-            &mut self,
-            _seed: ExperimentSeed,
-        ) -> Result<TrialResult, RigError> {
+        async fn run_trial(&mut self, _seed: ExperimentSeed) -> Result<TrialResult, RigError> {
             Ok(TrialResult { rows: vec![] })
         }
         async fn finalize(&mut self) -> Result<(), RigError> {

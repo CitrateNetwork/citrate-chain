@@ -61,10 +61,7 @@ async fn srp_s3b_bulk_reload_reproduces_live_root() {
 
     // ── Bulk-reload into a FRESH StateDB, byte-for-byte as node/src/main.rs:1020-1046 does. ──
     let reloaded = StateDB::new();
-    let accts = storage
-        .state
-        .get_all_accounts()
-        .expect("get_all_accounts");
+    let accts = storage.state.get_all_accounts().expect("get_all_accounts");
     for (address, account) in accts {
         reloaded.accounts.load_account(address, account);
     }
@@ -140,8 +137,11 @@ async fn srp_s3b_state_and_applied_tip_advance_atomically() {
     }
     let _ = reloaded.take_dirty_storage();
     let reloaded_root = reloaded.calculate_state_root();
-    let (durable_tip_hash, durable_tip_height) =
-        storage.blocks.get_applied_tip().expect("tip").expect("some");
+    let (durable_tip_hash, durable_tip_height) = storage
+        .blocks
+        .get_applied_tip()
+        .expect("tip")
+        .expect("some");
 
     // The durable state was NOT advanced to N (block N never committed), so the reloaded
     // root must equal the committed N-1 root, and the durable tip is still N-1 — they AGREE.

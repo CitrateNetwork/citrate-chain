@@ -124,7 +124,9 @@ impl CeremonyState {
                 };
                 Ok(())
             }
-            Self::Accepting { .. } => Err("Ceremony is already accepting contributions".to_string()),
+            Self::Accepting { .. } => {
+                Err("Ceremony is already accepting contributions".to_string())
+            }
             Self::Finalized { .. } => Err("Ceremony is already finalized".to_string()),
         }
     }
@@ -289,7 +291,7 @@ pub fn verify_contribution(
 pub fn verify_contribution_chain(contributions: &[CeremonyContribution]) -> Result<usize, String> {
     for (i, contribution) in contributions.iter().enumerate() {
         let previous = if i > 0 {
-            Some(&contributions[i - 1])
+            i.checked_sub(1).and_then(|j| contributions.get(j))
         } else {
             None
         };

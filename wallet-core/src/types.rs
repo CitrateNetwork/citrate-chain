@@ -43,7 +43,12 @@ impl Default for WalletConfig {
 #[cfg(feature = "native")]
 fn default_keystore_path() -> String {
     dirs::data_local_dir()
-        .map(|d| d.join("citrate-wallet").join("keystore").to_string_lossy().to_string())
+        .map(|d| {
+            d.join("citrate-wallet")
+                .join("keystore")
+                .to_string_lossy()
+                .to_string()
+        })
         .unwrap_or_else(|| ".citrate-wallet/keystore".to_string())
 }
 
@@ -88,9 +93,9 @@ pub struct EncryptedKeyEntry {
     pub address: String,
     pub label: String,
     pub key_type: KeyType,
-    pub ciphertext: String,    // base64-encoded AES-256-GCM ciphertext
-    pub salt: String,          // base64-encoded Argon2 salt
-    pub nonce: String,         // base64-encoded 12-byte AES nonce
+    pub ciphertext: String, // base64-encoded AES-256-GCM ciphertext
+    pub salt: String,       // base64-encoded Argon2 salt
+    pub nonce: String,      // base64-encoded 12-byte AES nonce
     pub created_at: u64,
     /// KDF parameter version. Per `docs/security/KDF_POLICY.md`:
     ///   1 = legacy (Argon2::default(): m=19456, t=2, p=1)
@@ -258,8 +263,7 @@ mod tests {
             "WAL-01: serialized JSON must include kdf_version=2; got: {}",
             json
         );
-        let deser: EncryptedKeyEntry =
-            serde_json::from_str(&json).expect("deserialize v2 entry");
+        let deser: EncryptedKeyEntry = serde_json::from_str(&json).expect("deserialize v2 entry");
         assert_eq!(deser.kdf_version, 2);
     }
 }

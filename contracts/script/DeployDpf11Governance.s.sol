@@ -24,7 +24,7 @@ import "../src/defense_prime/RoleGrantTenantIndex.sol";
 contract DeployDpf11Governance is ScriptEnv, GovernanceOps {
     function run() external returns (address compliance, address roleIdx) {
         address deployer = deployerAddress();
-        address governance = envAddressOr("GOVERNANCE", deployer);
+        address governance = requiredGovernance("GOVERNANCE", deployer);
 
         console.log("=== DPF-11 Governance deployment (Stage 9) ===");
         console.log("Deployer:        ", deployer);

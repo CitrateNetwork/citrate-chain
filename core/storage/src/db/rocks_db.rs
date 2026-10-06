@@ -48,7 +48,9 @@ impl RocksDB {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if EncryptionMeta::load(path)?.is_some() {
-            return Err(AtRestError::EncryptedDbWithoutEncryption(path.display().to_string()).into());
+            return Err(
+                AtRestError::EncryptedDbWithoutEncryption(path.display().to_string()).into(),
+            );
         }
 
         let db = Self::open_inner(path, None)?;
@@ -132,9 +134,9 @@ impl RocksDB {
                     .iterator_cf(&cf_handle, rocksdb::IteratorMode::Start)
                     .next()
                 {
-                    sampled += 1;
+                    sampled = sampled.saturating_add(1);
                     if AtRestCipher::looks_sealed(&value) {
-                        sealed += 1;
+                        sealed = sealed.saturating_add(1);
                     }
                 }
             }
@@ -275,11 +277,7 @@ impl RocksDB {
     /// storage-level errors: an undecryptable value is logged and skipped
     /// (a wrong key can never reach here — it is rejected at open time by
     /// the encryption.meta key commitment).
-    fn map_iter_item(
-        cipher: &Option<Arc<AtRestCipher>>,
-        cf: &str,
-        item: KvItem,
-    ) -> Option<KvItem> {
+    fn map_iter_item(cipher: &Option<Arc<AtRestCipher>>, cf: &str, item: KvItem) -> Option<KvItem> {
         match cipher {
             None => Some(item),
             Some(cipher) => {
@@ -290,7 +288,7 @@ impl RocksDB {
                         error!(
                             "skipping undecryptable value in cf '{}' (key {}): {}",
                             cf,
-                            hex::encode(&key[..key.len().min(16)]),
+                            hex::encode(key.get(..16).unwrap_or(&key)),
                             e
                         );
                         None

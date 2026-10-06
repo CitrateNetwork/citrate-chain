@@ -12,9 +12,7 @@
 
 use citrate_api::FilterRegistry;
 use citrate_consensus::crypto::verify_transaction;
-use citrate_consensus::types::{
-    Block, BlockBuilder, Hash, PublicKey, Signature, Transaction,
-};
+use citrate_consensus::types::{Block, BlockBuilder, Hash, PublicKey, Signature, Transaction};
 use citrate_execution::executor::Executor;
 use citrate_execution::types::Address;
 use citrate_execution::StateDB;
@@ -52,9 +50,7 @@ fn test_mempool_no_sig() -> Arc<Mempool> {
 }
 
 fn make_genesis_block() -> Block {
-    BlockBuilder::new()
-        .timestamp(1_000_000)
-        .build_unhashed()
+    BlockBuilder::new().timestamp(1_000_000).build_unhashed()
 }
 
 // ===========================================================================
@@ -65,9 +61,10 @@ fn make_genesis_block() -> Block {
 /// but without cryptographic ECDSA verification. The verifier must reject it.
 #[test]
 fn c01_forged_embedded_address_without_ecdsa_verified_is_rejected() {
-    let victim_addr = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04,
-                       0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
-                       0x0D, 0x0E, 0x0F, 0x10];
+    let victim_addr = [
+        0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B,
+        0x0C, 0x0D, 0x0E, 0x0F, 0x10,
+    ];
     let tx = Transaction {
         hash: Hash::new([1; 32]),
         nonce: 0,
@@ -86,7 +83,10 @@ fn c01_forged_embedded_address_without_ecdsa_verified_is_rejected() {
 
     // verify_transaction must return Ok(false) — NOT Ok(true)
     let result = verify_transaction(&tx).expect("should not error");
-    assert!(!result, "C-01 regression: forged embedded address must be rejected");
+    assert!(
+        !result,
+        "C-01 regression: forged embedded address must be rejected"
+    );
 }
 
 /// Verify that only decoder-verified transactions pass
@@ -134,7 +134,10 @@ async fn c01_mempool_rejects_forged_ecdsa_transaction() {
     };
 
     let result = mempool.add_transaction(tx, TxClass::Standard).await;
-    assert!(result.is_err(), "C-01: forged ECDSA tx must be rejected by mempool");
+    assert!(
+        result.is_err(),
+        "C-01: forged ECDSA tx must be rejected by mempool"
+    );
     let err_msg = format!("{:?}", result.unwrap_err());
     assert!(
         err_msg.contains("signature") || err_msg.contains("Invalid"),
@@ -186,7 +189,8 @@ async fn c02_eth_send_transaction_rejected_in_production_mode() {
             "to": "0x1111111111111111111111111111111111111111",
             "value": "0x1000"
         }]
-    }).to_string();
+    })
+    .to_string();
 
     let resp = io.handle_request(&req).await.unwrap();
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
@@ -216,15 +220,15 @@ fn c03_corrupted_legacy_rlp_returns_error_not_fallback() {
     use rlp::RlpStream;
 
     let mut stream = RlpStream::new_list(9);
-    stream.append(&0u64);          // nonce
+    stream.append(&0u64); // nonce
     stream.append(&1_000_000_000u64); // gas_price
-    stream.append(&21000u64);      // gas_limit
-    // to address (20 bytes)
+    stream.append(&21000u64); // gas_limit
+                              // to address (20 bytes)
     stream.append(&vec![0x11u8; 20].as_slice());
-    stream.append(&1000u64);       // value
+    stream.append(&1000u64); // value
     stream.append(&Vec::<u8>::new().as_slice()); // data
-    // v, r, s — garbage values that will fail ECDSA recovery
-    stream.append(&28u64);         // v = 28 (pre-EIP-155, recovery_id=1)
+                                                 // v, r, s — garbage values that will fail ECDSA recovery
+    stream.append(&28u64); // v = 28 (pre-EIP-155, recovery_id=1)
     stream.append(&vec![0xFFu8; 32].as_slice()); // r (invalid: all 0xFF)
     stream.append(&vec![0xFFu8; 32].as_slice()); // s (invalid: all 0xFF)
 
@@ -244,13 +248,13 @@ fn c03_zero_signature_returns_error() {
     use rlp::RlpStream;
 
     let mut stream = RlpStream::new_list(9);
-    stream.append(&0u64);          // nonce
+    stream.append(&0u64); // nonce
     stream.append(&1_000_000_000u64); // gas_price
-    stream.append(&21000u64);      // gas_limit
+    stream.append(&21000u64); // gas_limit
     stream.append(&vec![0x22u8; 20].as_slice()); // to
-    stream.append(&500u64);        // value
+    stream.append(&500u64); // value
     stream.append(&Vec::<u8>::new().as_slice()); // data
-    stream.append(&27u64);         // v = 27 (pre-EIP-155, recovery_id=0)
+    stream.append(&27u64); // v = 27 (pre-EIP-155, recovery_id=0)
     stream.append(&vec![0x00u8; 32].as_slice()); // r = 0 (invalid for secp256k1)
     stream.append(&vec![0x00u8; 32].as_slice()); // s = 0 (invalid for secp256k1)
 
@@ -340,14 +344,16 @@ async fn c04_nonce_replay_rejected_by_executor() {
         ..Default::default()
     };
 
-    let receipt = executor.execute_transaction(&block, &tx1).await
+    let receipt = executor
+        .execute_transaction(&block, &tx1)
+        .await
         .expect("First tx with nonce=0 should succeed");
     assert!(receipt.status, "First tx should succeed");
 
     // Replay: same nonce=0 again
     let tx_replay = Transaction {
         hash: Hash::new([21; 32]), // Different hash, same nonce
-        nonce: 0, // REPLAY: nonce already consumed
+        nonce: 0,                  // REPLAY: nonce already consumed
         from: sender_pk,
         to: Some(PublicKey::new([3; 32])),
         value: 200,
@@ -397,7 +403,9 @@ async fn c04_sequential_nonces_succeed() {
             ..Default::default()
         };
 
-        let receipt = executor.execute_transaction(&block, &tx).await
+        let receipt = executor
+            .execute_transaction(&block, &tx)
+            .await
             .unwrap_or_else(|e| panic!("Nonce {} should succeed: {:?}", nonce, e));
         assert!(receipt.status, "Nonce {} tx should succeed", nonce);
     }

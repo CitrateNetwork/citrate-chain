@@ -33,3 +33,14 @@ pub use backend::ZKPBackend;
 pub use prover::Prover;
 pub use types::{Proof, ProofType, ProvingKey, VerifyingKey, ZKPError};
 pub use verifier::Verifier;
+
+/// The first (up to) 16 bytes as a big-endian u128 — the field encoding used for
+/// public inputs throughout these circuits. 16 bytes always fit, so this equals
+/// the former `fold(0, |acc, b| acc * 256 + b)` without any overflowing step
+/// (`acc < 2^120` before every multiply, so `wrapping_mul` never wraps).
+pub(crate) fn be_u128_prefix(bytes: &[u8]) -> u128 {
+    bytes
+        .iter()
+        .take(16)
+        .fold(0u128, |acc, &b| acc.wrapping_mul(256) | u128::from(b))
+}

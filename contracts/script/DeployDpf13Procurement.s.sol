@@ -12,7 +12,7 @@ import "../src/defense_prime/TinaWorkpaperRegistry.sol";
 contract DeployDpf13Procurement is ScriptEnv, GovernanceOps {
     function run() external returns (address tina) {
         address deployer = deployerAddress();
-        address governance = envAddressOr("GOVERNANCE", deployer);
+        address governance = requiredGovernance("GOVERNANCE", deployer);
 
         console.log("=== DPF-13 Procurement deployment (Stage 11) ===");
         console.log("Deployer:        ", deployer);

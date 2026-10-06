@@ -1,0 +1,26 @@
+[package]
+name = "citrate-fl-replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Independent replay of a federated LoRA round (HUP-S9.2, docs/fl/FL_ROUND_V1.md): re-verifies every participant's signed delta, rebuilds each chunk's 0x0110 input, runs the precompile's own kernel in process and recomputes the roots and record digest a FederatedRoundLedger commit carries. A second implementation of the round format, separate from the coordinator's (citrate-compute-pool)."
+
+[[bin]]
+name = "citrate-fl-replay"
+path = "src/main.rs"
+
+[lib]
+name = "citrate_fl_replay"
+path = "src/lib.rs"
+
+[dependencies]
+# The 0x0110 kernel itself: the replay runs exactly the code the precompile runs.
+citrate-execution = { path = "../../core/execution" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+sha3 = { workspace = true }
+hex = "0.4"
+k256 = { version = "0.13", features = ["ecdsa"] }
+anyhow = { workspace = true }

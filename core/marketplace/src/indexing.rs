@@ -1,11 +1,6 @@
 // citrate/core/marketplace/src/indexing.rs
 
-use crate::{
-    metadata::MetadataCache,
-    search::SearchEngine,
-    storage::MarketplaceStorage,
-    types::*,
-};
+use crate::{metadata::MetadataCache, search::SearchEngine, storage::MarketplaceStorage, types::*};
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -254,7 +249,8 @@ impl IndexingService {
                 Arc::clone(&search_engine),
                 Arc::clone(&storage),
                 Arc::clone(&metadata_cache),
-            ).await;
+            )
+            .await;
 
             match result {
                 Ok(()) => {
@@ -270,7 +266,7 @@ impl IndexingService {
                     );
 
                     // Retry logic
-                    task.retry_count += 1;
+                    task.retry_count = task.retry_count.saturating_add(1);
                     if task.retry_count < 3 {
                         // Re-enqueue with lower priority
                         task.priority = task.priority.saturating_add(5);
@@ -280,7 +276,7 @@ impl IndexingService {
                     } else {
                         warn!(operation = ?task.operation, "Task failed after max retries");
                         let mut stats = stats.write().await;
-                        stats.failed_operations += 1;
+                        stats.failed_operations = stats.failed_operations.saturating_add(1);
                     }
                 }
             }
@@ -342,24 +338,24 @@ impl IndexingService {
         info!("Starting full reindex of all models");
 
         let models = storage.get_all_models().await?;
-        let mut indexed_count = 0;
-        let mut failed_count = 0;
+        let mut indexed_count = 0usize;
+        let mut failed_count = 0usize;
 
         for model in models {
             match search_engine.index_model(&model).await {
-                Ok(()) => indexed_count += 1,
+                Ok(()) => indexed_count = indexed_count.saturating_add(1),
                 Err(e) => {
                     error!(
                         model_id = ?model.model_id,
                         error = %e,
                         "Failed to index model during full reindex"
                     );
-                    failed_count += 1;
+                    failed_count = failed_count.saturating_add(1);
                 }
             }
 
             // Yield periodically to prevent blocking
-            if indexed_count % 100 == 0 {
+            if indexed_count.is_multiple_of(100) {
                 tokio::task::yield_now().await;
             }
         }
@@ -389,9 +385,7 @@ impl IndexingService {
         Ok(())
     }
 
-    async fn schedule_full_reindex(
-        task_queue: Arc<RwLock<Vec<IndexingTask>>>,
-    ) -> Result<()> {
+    async fn schedule_full_reindex(task_queue: Arc<RwLock<Vec<IndexingTask>>>) -> Result<()> {
         let task = IndexingTask {
             operation: IndexingOperation::ReindexAll,
             priority: 20, // Low priority for scheduled reindex
@@ -401,9 +395,9 @@ impl IndexingService {
         let mut queue = task_queue.write().await;
 
         // Check if full reindex is already queued
-        let has_reindex = queue.iter().any(|t| {
-            matches!(t.operation, IndexingOperation::ReindexAll)
-        });
+        let has_reindex = queue
+            .iter()
+            .any(|t| matches!(t.operation, IndexingOperation::ReindexAll));
 
         if !has_reindex {
             queue.push(task);
@@ -414,16 +408,19 @@ impl IndexingService {
         Ok(())
     }
 
-    async fn update_stats_for_success(
-        task: &IndexingTask,
-        stats: Arc<RwLock<IndexingStats>>,
-    ) {
+    async fn update_stats_for_success(task: &IndexingTask, stats: Arc<RwLock<IndexingStats>>) {
         let mut stats = stats.write().await;
 
         match &task.operation {
-            IndexingOperation::AddModel(_) => stats.models_indexed += 1,
-            IndexingOperation::UpdateModel(_) => stats.models_updated += 1,
-            IndexingOperation::RemoveModel(_) => stats.models_removed += 1,
+            IndexingOperation::AddModel(_) => {
+                stats.models_indexed = stats.models_indexed.saturating_add(1)
+            }
+            IndexingOperation::UpdateModel(_) => {
+                stats.models_updated = stats.models_updated.saturating_add(1)
+            }
+            IndexingOperation::RemoveModel(_) => {
+                stats.models_removed = stats.models_removed.saturating_add(1)
+            }
             IndexingOperation::ReindexAll => {
                 stats.last_full_reindex = Some(chrono::Utc::now());
             }
@@ -496,9 +493,11 @@ impl BatchIndexer {
 
     /// Auto-flush when batch size is reached
     pub async fn maybe_flush(&mut self) -> Result<()> {
-        let total_pending = self.pending_adds.len()
-            + self.pending_updates.len()
-            + self.pending_removes.len();
+        let total_pending = self
+            .pending_adds
+            .len()
+            .saturating_add(self.pending_updates.len())
+            .saturating_add(self.pending_removes.len());
 
         if total_pending >= self.batch_size {
             self.flush().await?;
@@ -512,7 +511,8 @@ impl Drop for BatchIndexer {
     fn drop(&mut self) {
         if !self.pending_adds.is_empty()
             || !self.pending_updates.is_empty()
-            || !self.pending_removes.is_empty() {
+            || !self.pending_removes.is_empty()
+        {
             warn!("BatchIndexer dropped with pending operations - data may be lost");
         }
     }

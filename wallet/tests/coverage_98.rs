@@ -398,12 +398,7 @@ async fn test_rpc_estimate_gas_without_to() {
     let url = mock_rpc_server(&jsonrpc_ok_str("0xf4240")).await; // 1000000
     let client = RpcClient::new(&url);
     let gas = client
-        .estimate_gas(
-            &Address([0x11; 20]),
-            None,
-            U256::from(0),
-            vec![0x60, 0x80],
-        )
+        .estimate_gas(&Address([0x11; 20]), None, U256::from(0), vec![0x60, 0x80])
         .await
         .unwrap();
     assert_eq!(gas, 1_000_000);
@@ -724,7 +719,7 @@ async fn test_wallet_update_balances_from_rpc() {
     // Server needs to respond to get_balance and get_nonce for one account
     let responses = vec![
         jsonrpc_ok_str("0xde0b6b3a7640000"), // balance = 1 ETH
-        jsonrpc_ok_str("0x5"),                // nonce = 5
+        jsonrpc_ok_str("0x5"),               // nonce = 5
     ];
     let url = mock_rpc_server_multi(responses).await;
     let (_dir, mut wallet) = temp_wallet_at(&url);
@@ -779,7 +774,10 @@ fn test_wallet_config_fields_accessible() {
     assert_eq!(cfg.chain_id, 40204);
     assert_eq!(cfg.default_gas_price, 1_000_000_000);
     assert_eq!(cfg.default_gas_limit, 21_000);
-    assert!(cfg.keystore_path.to_string_lossy().contains("keystore.json"));
+    assert!(cfg
+        .keystore_path
+        .to_string_lossy()
+        .contains("keystore.json"));
 }
 
 #[test]
@@ -839,8 +837,7 @@ async fn test_wallet_get_receipt_delegates() {
 
 #[tokio::test]
 async fn test_wallet_get_receipt_with_data() {
-    let url =
-        mock_rpc_server(&jsonrpc_ok(r#"{"status":"0x1","gasUsed":"0x5208"}"#)).await;
+    let url = mock_rpc_server(&jsonrpc_ok(r#"{"status":"0x1","gasUsed":"0x5208"}"#)).await;
     let (_dir, wallet) = temp_wallet_at(&url);
     let result = wallet
         .get_transaction_receipt(&Hash::new([0xBB; 32]))
@@ -947,10 +944,7 @@ fn test_wallet_config_clone() {
 #[tokio::test]
 async fn test_rpc_client_request_id_increments() {
     // Two sequential requests should work (internally incrementing request id)
-    let responses = vec![
-        jsonrpc_ok_str("0x1"),
-        jsonrpc_ok_str("0x2"),
-    ];
+    let responses = vec![jsonrpc_ok_str("0x1"), jsonrpc_ok_str("0x2")];
     let url = mock_rpc_server_multi(responses).await;
     let client = RpcClient::new(&url);
 

@@ -184,11 +184,7 @@ async fn h04_store_block_uses_single_atomic_batch() {
     );
     // Genesis writes: block bytes + self-children + tip add + height index = 4 ops.
     let bs = kv.last_batch_size.load(Ordering::SeqCst);
-    assert!(
-        bs >= 4,
-        "H-04: genesis batch must group ≥4 ops; got {}",
-        bs
-    );
+    assert!(bs >= 4, "H-04: genesis batch must group ≥4 ops; got {}", bs);
 }
 
 /// H-04.2: a child block's batch contains both the new tip add AND

@@ -122,7 +122,10 @@ async fn m06_persist_block_round_trips_non_empty() {
         .kv_get("dag_blocks", g_hash.as_bytes())
         .expect("kv_get must succeed")
         .expect("genesis must be persisted");
-    assert!(!stored.is_empty(), "M-06: persisted block bytes must not be empty");
+    assert!(
+        !stored.is_empty(),
+        "M-06: persisted block bytes must not be empty"
+    );
     let _: Block = bincode::deserialize(&stored).expect("M-06: persisted bytes must deserialize");
 }
 
@@ -146,10 +149,13 @@ async fn m06_persist_then_reload_round_trip() {
     }
 
     // Second boot: reload from the same backend, expect both blocks visible.
-    let store2 = DagStore::persistent_with_strict_vrf(kv, false)
-        .expect("second persistent dag store");
+    let store2 =
+        DagStore::persistent_with_strict_vrf(kv, false).expect("second persistent dag store");
     let stats = store2.get_stats().await;
-    assert_eq!(stats.total_blocks, 2, "M-06: reload must recover all blocks");
+    assert_eq!(
+        stats.total_blocks, 2,
+        "M-06: reload must recover all blocks"
+    );
 }
 
 /// M-06.3: round-trip a checkpoint serialization manually to assert

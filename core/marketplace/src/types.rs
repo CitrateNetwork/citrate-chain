@@ -172,7 +172,7 @@ pub struct ModelMetrics {
     pub model_id: ModelId,
     pub average_latency_ms: f32,
     pub success_rate: f32,
-    pub quality_score: f32, // Computed from reviews and usage
+    pub quality_score: f32,    // Computed from reviews and usage
     pub popularity_score: f32, // Based on views, purchases, etc.
     pub updated_at: DateTime<Utc>,
 }
@@ -387,7 +387,10 @@ mod tests {
         let json_err: Result<ModelCategory, _> = serde_json::from_str("invalid");
         if let Err(e) = json_err {
             let marketplace_err: MarketplaceError = e.into();
-            assert!(matches!(marketplace_err, MarketplaceError::SerializationError(_)));
+            assert!(matches!(
+                marketplace_err,
+                MarketplaceError::SerializationError(_)
+            ));
         }
     }
 
@@ -401,13 +404,15 @@ mod tests {
 
     #[test]
     fn test_sort_by_variants() {
-        let variants = [SortBy::Relevance,
+        let variants = [
+            SortBy::Relevance,
             SortBy::Rating,
             SortBy::Price,
             SortBy::Sales,
             SortBy::Newest,
             SortBy::MostReviewed,
-            SortBy::Popularity];
+            SortBy::Popularity,
+        ];
         assert_eq!(variants.len(), 7);
     }
 

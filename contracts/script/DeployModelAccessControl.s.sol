@@ -13,7 +13,7 @@ contract DeployModelAccessControl is ScriptEnv, AdminChecks {
     function run() external {
         address deployer = deployerAddress();
         // PBA-L2-002: explicit owner; msg.sender in a salted ctor is the CREATE2 factory.
-        address owner_ = envAddressOr("GOVERNANCE", deployer);
+        address owner_ = requiredGovernance("GOVERNANCE", deployer);
 
         console.log("=== Deploying ModelAccessControl ===");
         console.log("Deployer:", deployer);

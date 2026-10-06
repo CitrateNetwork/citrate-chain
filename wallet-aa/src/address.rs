@@ -73,30 +73,28 @@ pub fn predict_address(
 /// Length is `keccak256(0x21, 0x5f)` per Solady: 0x5f = 95 bytes from
 /// offset 0x21. We replicate exactly those 95 bytes.
 fn erc1967_minimal_init_code_hash(implementation: Address) -> [u8; 32] {
-    let mut buf = [0u8; 95];
+    // prefix `0x603d3d8160223d3973` ‖ implementation(20) ‖ separator `0x6009` ‖
+    // body (32 bytes mstore'd at 0x40) ‖ tail (32 bytes mstore'd at 0x60) = 95 bytes.
+    const PREFIX: [u8; 9] = [0x60, 0x3d, 0x3d, 0x81, 0x60, 0x22, 0x3d, 0x39, 0x73];
+    const SEPARATOR: [u8; 2] = [0x60, 0x09];
+    const BODY: [u8; 32] = [
+        0x51, 0x55, 0xf3, 0x36, 0x3d, 0x3d, 0x37, 0x3d, 0x3d, 0x36, 0x3d, 0x7f, 0x36, 0x08, 0x94,
+        0xa1, 0x3b, 0xa1, 0xa3, 0x21, 0x06, 0x67, 0xc8, 0x28, 0x49, 0x2d, 0xb9, 0x8d, 0xca, 0x3e,
+        0x20, 0x76,
+    ];
+    const TAIL: [u8; 32] = [
+        0xcc, 0x37, 0x35, 0xa9, 0x20, 0xa3, 0xca, 0x50, 0x5d, 0x38, 0x2b, 0xbc, 0x54, 0x5a, 0xf4,
+        0x3d, 0x60, 0x00, 0x80, 0x3e, 0x60, 0x38, 0x57, 0x3d, 0x60, 0x00, 0xfd, 0x5b, 0x3d, 0x60,
+        0x00, 0xf3,
+    ];
 
-    // bytes 0..9: prefix `0x603d3d8160223d3973`
-    buf[0..9].copy_from_slice(&hex::decode("603d3d8160223d3973").expect("static hex"));
-
-    // bytes 9..29: implementation address
-    buf[9..29].copy_from_slice(implementation.as_bytes());
-
-    // bytes 29..31: separator `0x6009`
-    buf[29..31].copy_from_slice(&[0x60, 0x09]);
-
-    // bytes 31..63: body `0x5155f3363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076`
-    // (32 bytes mstore'd at 0x40 -> spans 0x40..0x60)
-    buf[31..63].copy_from_slice(
-        &hex::decode("5155f3363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076")
-            .expect("static hex"),
-    );
-
-    // bytes 63..95: tail `0xcc3735a920a3ca505d382bbc545af43d6000803e6038573d6000fd5b3d6000f3`
-    // (32 bytes mstore'd at 0x60 -> spans 0x60..0x80)
-    buf[63..95].copy_from_slice(
-        &hex::decode("cc3735a920a3ca505d382bbc545af43d6000803e6038573d6000fd5b3d6000f3")
-            .expect("static hex"),
-    );
+    let mut buf = Vec::with_capacity(95);
+    buf.extend_from_slice(&PREFIX);
+    buf.extend_from_slice(implementation.as_bytes());
+    buf.extend_from_slice(&SEPARATOR);
+    buf.extend_from_slice(&BODY);
+    buf.extend_from_slice(&TAIL);
+    debug_assert_eq!(buf.len(), 95);
 
     keccak256(&buf)
 }
@@ -129,16 +127,24 @@ mod tests {
     #[test]
     fn predict_address_rejects_zero_factory() {
         let user_id = [1u8; 32];
-        let err = predict_address(Address::zero(), addr("0x000000000000000000000000000000000000beef"), &user_id)
-            .expect_err("expected zero rejection");
+        let err = predict_address(
+            Address::zero(),
+            addr("0x000000000000000000000000000000000000beef"),
+            &user_id,
+        )
+        .expect_err("expected zero rejection");
         assert!(matches!(err, AddressError::ZeroAddress));
     }
 
     #[test]
     fn predict_address_rejects_zero_impl() {
         let user_id = [1u8; 32];
-        let err = predict_address(addr("0x000000000000000000000000000000000000beef"), Address::zero(), &user_id)
-            .expect_err("expected zero rejection");
+        let err = predict_address(
+            addr("0x000000000000000000000000000000000000beef"),
+            Address::zero(),
+            &user_id,
+        )
+        .expect_err("expected zero rejection");
         assert!(matches!(err, AddressError::ZeroAddress));
     }
 

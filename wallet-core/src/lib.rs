@@ -6,6 +6,20 @@
 //! This crate imports chain types (PublicKey, Hash, Transaction) from citrate-consensus
 //! and citrate-execution as READ-ONLY dependencies. It does NOT modify chain crates.
 
+// PANIC-S1 G2: production code in this crate may not panic (tests excepted).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 pub mod address;
 pub mod error;
 pub mod format;
@@ -38,8 +52,8 @@ pub use keys::{secp256k1_from_mnemonic, secp256k1_from_seed, UnifiedKey};
 // Lean EIP-155 signing primitives (B1.4.0). Exported in BOTH `crypto`
 // and `native` so citrate-core's lean build and desktop/CLI both consume
 // the same signer.
-pub use tx::{sign_eip155_legacy_tx, sign_recoverable, LegacyTxFields, SignedTx};
 pub use session::{PersistedFailure, SessionManager, SessionStatus};
+pub use tx::{sign_eip155_legacy_tx, sign_recoverable, LegacyTxFields, SignedTx};
 pub use types::WalletAccount;
 // `WalletConfig::default()` calls `default_keystore_path()` (needs
 // `dirs`), so the config type is native-only. `NetworkConfig` and the
@@ -48,4 +62,4 @@ pub use types::WalletAccount;
 pub use types::WalletConfig;
 
 #[cfg(feature = "native")]
-pub use chain::{TransactionBuilder, RpcClient, SignedTransaction};
+pub use chain::{RpcClient, SignedTransaction, TransactionBuilder};

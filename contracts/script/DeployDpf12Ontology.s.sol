@@ -13,7 +13,7 @@ import "../src/defense_prime/EntityRegistry.sol";
 contract DeployDpf12Ontology is ScriptEnv, GovernanceOps {
     function run() external returns (address entityRegistry) {
         address deployer = deployerAddress();
-        address governance = envAddressOr("GOVERNANCE", deployer);
+        address governance = requiredGovernance("GOVERNANCE", deployer);
 
         console.log("=== DPF-12 Ontology deployment (Stage 10) ===");
         console.log("Deployer:        ", deployer);

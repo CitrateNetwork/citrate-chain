@@ -127,7 +127,7 @@ impl TransactionGossip {
                 return Ok(false);
             }
             info.peers.insert(peer_id.clone());
-            info.broadcast_count += 1;
+            info.broadcast_count = info.broadcast_count.saturating_add(1);
             let broadcast_count = info.broadcast_count;
             drop(seen);
 
@@ -433,7 +433,7 @@ impl TransactionGossip {
 
         // Limit cache size
         if seen.len() > self.config.max_seen_txs {
-            let to_remove = seen.len() - self.config.max_seen_txs;
+            let to_remove = seen.len().saturating_sub(self.config.max_seen_txs);
             let mut oldest: Vec<(Hash, Instant)> =
                 seen.iter().map(|(h, i)| (*h, i.first_seen)).collect();
             oldest.sort_by_key(|(_h, t)| *t);
@@ -467,7 +467,7 @@ impl TransactionGossip {
         {
             let mut pending = self.pending_ai_txs.write().await;
             if pending.len() > self.config.max_pending_ai_txs {
-                let overflow = pending.len() - self.config.max_pending_ai_txs;
+                let overflow = pending.len().saturating_sub(self.config.max_pending_ai_txs);
                 pending.drain(0..overflow);
             }
         }

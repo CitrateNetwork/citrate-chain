@@ -91,7 +91,7 @@ contract DeployFederatedLearning is ScriptEnv, AdminChecks, Create2Deploy {
 
     function run() external {
         address deployer = deployerAddress();
-        address governance = envAddressOr("GOVERNANCE", deployer);
+        address governance = requiredGovernance("GOVERNANCE", deployer);
         address teeRegistry = envAddressOr("TEE_REGISTRY", address(0));
 
         console.log("=== I64-S1 WP-B1: federated-learning contract deploy ===");

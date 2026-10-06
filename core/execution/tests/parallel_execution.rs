@@ -17,8 +17,7 @@
 //   - Progress: no deadlock; every tx eventually commits
 
 use citrate_consensus::types::{
-    Block, BlockBuilder, Hash, PublicKey, Signature,
-    Transaction as ConsensusTransaction, VrfProof,
+    Block, BlockBuilder, Hash, PublicKey, Signature, Transaction as ConsensusTransaction, VrfProof,
 };
 use citrate_execution::{address_utils, types::Address, Executor, StateDB};
 use primitive_types::U256;
@@ -215,9 +214,9 @@ async fn stress_eight_disjoint_workers_all_commit() {
         let tx = transfer_tx(sender, recipient, (i as u128) * 10, 0, 0xF0 + i);
         let executor = Arc::clone(&executor);
         let block = block.clone();
-        handles.push(tokio::spawn(
-            async move { executor.execute_transaction(&block, &tx).await },
-        ));
+        handles.push(tokio::spawn(async move {
+            executor.execute_transaction(&block, &tx).await
+        }));
     }
 
     for (i, h) in handles.into_iter().enumerate() {

@@ -77,10 +77,13 @@ contract BenchmarkRegistry {
         BenchmarkRecord[] storage all = _records[_keyFor(committer, agent_id, capsule_id, metric_name)];
         uint256 n = all.length;
         if (offset >= n) return new BenchmarkRecord[](0);
-        uint256 end = offset + limit > n ? n : offset + limit;
-        page = new BenchmarkRecord[](end - offset);
-        for (uint256 i = offset; i < end; i++) {
-            page[i - offset] = all[i];
+        // Clamp without computing `offset + limit`, so a large `limit` returns
+        // the tail instead of reverting (HUP-S7.1 redeploy version).
+        uint256 avail = n - offset;
+        uint256 len = limit < avail ? limit : avail;
+        page = new BenchmarkRecord[](len);
+        for (uint256 i = 0; i < len; i++) {
+            page[i] = all[offset + i];
         }
     }
 

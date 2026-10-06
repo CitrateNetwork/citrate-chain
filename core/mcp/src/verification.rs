@@ -6,9 +6,9 @@ use crate::types::ExecutionProof;
 use anyhow::Result;
 use citrate_execution::Hash;
 use sha3::{Digest, Sha3_256};
-use tracing::{debug, warn};
 #[cfg(test)]
 use tracing::info;
+use tracing::{debug, warn};
 
 /// Execution verifier for validating model execution proofs
 pub struct ExecutionVerifier {
@@ -199,7 +199,8 @@ impl ExecutionVerifier {
 
         // Initialize backend with proving/verifying keys
         let backend = ZKPBackend::new();
-        backend.initialize()
+        backend
+            .initialize()
             .map_err(|e| anyhow::anyhow!("ZKP backend initialization failed: {}", e))?;
 
         // Determine proof type from statement prefix (first byte)
@@ -216,7 +217,8 @@ impl ExecutionVerifier {
         };
 
         // Verify via the execution crate's Groth16 verifier
-        let result = backend.verify_proof(proof_type, &proof)
+        let result = backend
+            .verify_proof(proof_type, &proof)
             .map_err(|e| anyhow::anyhow!("Groth16 verification failed: {}", e))?;
 
         Ok(result)
@@ -250,7 +252,10 @@ impl ExecutionVerifier {
 
         // Minimum proof size: 32 bytes for commitment + 32 bytes for response
         if proof_data.len() < 64 {
-            warn!("ZK verification failed: proof too short ({} bytes)", proof_data.len());
+            warn!(
+                "ZK verification failed: proof too short ({} bytes)",
+                proof_data.len()
+            );
             return Ok(false);
         }
 
@@ -270,11 +275,17 @@ impl ExecutionVerifier {
             let clock_tolerance_secs = 60; // 1 minute forward tolerance
 
             if nonce_ts + max_age_secs < now {
-                warn!("ZK verification failed: nonce expired (ts={}, now={})", nonce_ts, now);
+                warn!(
+                    "ZK verification failed: nonce expired (ts={}, now={})",
+                    nonce_ts, now
+                );
                 return Ok(false);
             }
             if nonce_ts > now + clock_tolerance_secs {
-                warn!("ZK verification failed: nonce in future (ts={}, now={})", nonce_ts, now);
+                warn!(
+                    "ZK verification failed: nonce in future (ts={}, now={})",
+                    nonce_ts, now
+                );
                 return Ok(false);
             }
 
@@ -290,7 +301,10 @@ impl ExecutionVerifier {
                 return Ok(false);
             }
 
-            info!("ZK proof verified successfully (nonce-enhanced, ts={})", nonce_ts);
+            info!(
+                "ZK proof verified successfully (nonce-enhanced, ts={})",
+                nonce_ts
+            );
             return Ok(true);
         }
 
@@ -1022,7 +1036,7 @@ mod tests {
 
         let mut proof = Vec::with_capacity(72);
         proof.extend_from_slice(&commitment); // 32
-        proof.extend_from_slice(response);     // 32
+        proof.extend_from_slice(response); // 32
         proof.extend_from_slice(&nonce_bytes); // 8
         proof
     }

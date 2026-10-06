@@ -24,7 +24,7 @@ import "../src/defense_prime/AuditBundleRegistry.sol";
 contract DeployDpf10Assistant is ScriptEnv, GovernanceOps {
     function run() external returns (address auditBundleRegistry) {
         address deployer = deployerAddress();
-        address governance = envAddressOr("GOVERNANCE", deployer);
+        address governance = requiredGovernance("GOVERNANCE", deployer);
 
         console.log("=== DPF-10 Assistant deployment (Stage 8) ===");
         console.log("Deployer:        ", deployer);

@@ -44,11 +44,13 @@ fn test_blake2f_zero_rounds_eip152_tv4() {
         "0000000048c9bdf267e6096a3ba7ca8485ae67bb2bf894fe72f36e3cf1361d5f3af54fa5d182e6ad7f520e511f6c3e2b8c68059b6bbd41fbabd9831f79217e1319cde05b61626300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000300000000000000000000000000000001"
     ).unwrap();
 
-    let result = executor.execute(
-        &citrate_execution::precompiles::standard::BLAKE2F,
-        &input,
-        HIGH_GAS,
-    ).unwrap();
+    let result = executor
+        .execute(
+            &citrate_execution::precompiles::standard::BLAKE2F,
+            &input,
+            HIGH_GAS,
+        )
+        .unwrap();
 
     assert!(result.success);
     assert_eq!(result.gas_used, 0); // 0 rounds = 0 gas
@@ -70,11 +72,13 @@ fn test_blake2f_12_rounds_abc_eip152_tv5() {
         "0000000c48c9bdf267e6096a3ba7ca8485ae67bb2bf894fe72f36e3cf1361d5f3af54fa5d182e6ad7f520e511f6c3e2b8c68059b6bbd41fbabd9831f79217e1319cde05b61626300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000300000000000000000000000000000001"
     ).unwrap();
 
-    let result = executor.execute(
-        &citrate_execution::precompiles::standard::BLAKE2F,
-        &input,
-        HIGH_GAS,
-    ).unwrap();
+    let result = executor
+        .execute(
+            &citrate_execution::precompiles::standard::BLAKE2F,
+            &input,
+            HIGH_GAS,
+        )
+        .unwrap();
 
     assert!(result.success);
     assert_eq!(result.gas_used, 12);
@@ -84,7 +88,10 @@ fn test_blake2f_12_rounds_abc_eip152_tv5() {
     let expected = hex::decode(
         "ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d17d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923"
     ).unwrap();
-    assert_eq!(result.output, expected, "EIP-152 test vector 5 (BLAKE2b 'abc') mismatch");
+    assert_eq!(
+        result.output, expected,
+        "EIP-152 test vector 5 (BLAKE2b 'abc') mismatch"
+    );
 }
 
 /// EIP-152 Test Vector 6: 12 rounds, same as TV5 but f=false (not final block)
@@ -96,11 +103,13 @@ fn test_blake2f_12_rounds_abc_not_final_eip152_tv6() {
         "0000000c48c9bdf267e6096a3ba7ca8485ae67bb2bf894fe72f36e3cf1361d5f3af54fa5d182e6ad7f520e511f6c3e2b8c68059b6bbd41fbabd9831f79217e1319cde05b61626300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000300000000000000000000000000000000"
     ).unwrap();
 
-    let result = executor.execute(
-        &citrate_execution::precompiles::standard::BLAKE2F,
-        &input,
-        HIGH_GAS,
-    ).unwrap();
+    let result = executor
+        .execute(
+            &citrate_execution::precompiles::standard::BLAKE2F,
+            &input,
+            HIGH_GAS,
+        )
+        .unwrap();
 
     assert!(result.success);
     assert_eq!(result.gas_used, 12);
@@ -109,7 +118,10 @@ fn test_blake2f_12_rounds_abc_not_final_eip152_tv6() {
     let expected = hex::decode(
         "75ab69d3190a562c51aef8d88f1c2775876944407270c42c9844252c26d2875298743e7f6d5ea2f2d3e8d226039cd31b4e426ac4f2d3d666a610c2116fde4735"
     ).unwrap();
-    assert_eq!(result.output, expected, "EIP-152 test vector 6 (f=false) mismatch");
+    assert_eq!(
+        result.output, expected,
+        "EIP-152 test vector 6 (f=false) mismatch"
+    );
 }
 
 /// EIP-152 Test Vector 7: 1 round only
@@ -121,11 +133,13 @@ fn test_blake2f_1_round_eip152_tv7() {
         "0000000148c9bdf267e6096a3ba7ca8485ae67bb2bf894fe72f36e3cf1361d5f3af54fa5d182e6ad7f520e511f6c3e2b8c68059b6bbd41fbabd9831f79217e1319cde05b61626300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000300000000000000000000000000000001"
     ).unwrap();
 
-    let result = executor.execute(
-        &citrate_execution::precompiles::standard::BLAKE2F,
-        &input,
-        HIGH_GAS,
-    ).unwrap();
+    let result = executor
+        .execute(
+            &citrate_execution::precompiles::standard::BLAKE2F,
+            &input,
+            HIGH_GAS,
+        )
+        .unwrap();
 
     assert!(result.success);
     assert_eq!(result.gas_used, 1);
@@ -133,7 +147,10 @@ fn test_blake2f_1_round_eip152_tv7() {
     let expected = hex::decode(
         "b63a380cb2897d521994a85234ee2c181b5f844d2c624c002677e9703449d2fba551b3a8333bcdf5f2f7e08993d53923de3d64fcc68c034e717b9293fed7a421"
     ).unwrap();
-    assert_eq!(result.output, expected, "EIP-152 test vector 7 (1 round) mismatch");
+    assert_eq!(
+        result.output, expected,
+        "EIP-152 test vector 7 (1 round) mismatch"
+    );
 }
 
 /// EIP-152: Invalid input length should fail
@@ -148,7 +165,10 @@ fn test_blake2f_invalid_input_length() {
         &input,
         HIGH_GAS,
     );
-    assert!(result.is_err(), "BLAKE2F with wrong input length should error");
+    assert!(
+        result.is_err(),
+        "BLAKE2F with wrong input length should error"
+    );
 }
 
 /// EIP-152: Invalid final block flag (must be 0 or 1)
@@ -167,7 +187,10 @@ fn test_blake2f_invalid_final_flag() {
         &input,
         HIGH_GAS,
     );
-    assert!(result.is_err(), "BLAKE2F with invalid final flag should error");
+    assert!(
+        result.is_err(),
+        "BLAKE2F with invalid final flag should error"
+    );
 }
 
 /// EIP-152: Insufficient gas
@@ -225,11 +248,13 @@ fn test_ecadd_point_plus_identity() {
     let zero = [0u8; 32];
 
     let input = build_ecadd_input(&p1_x, &p1_y, &zero, &zero);
-    let result = executor.execute(
-        &citrate_execution::precompiles::standard::ECADD,
-        &input,
-        HIGH_GAS,
-    ).unwrap();
+    let result = executor
+        .execute(
+            &citrate_execution::precompiles::standard::ECADD,
+            &input,
+            HIGH_GAS,
+        )
+        .unwrap();
 
     assert!(result.success);
     assert_eq!(result.gas_used, 150);
@@ -247,11 +272,13 @@ fn test_ecadd_identity_plus_identity() {
 
     let zero = [0u8; 32];
     let input = build_ecadd_input(&zero, &zero, &zero, &zero);
-    let result = executor.execute(
-        &citrate_execution::precompiles::standard::ECADD,
-        &input,
-        HIGH_GAS,
-    ).unwrap();
+    let result = executor
+        .execute(
+            &citrate_execution::precompiles::standard::ECADD,
+            &input,
+            HIGH_GAS,
+        )
+        .unwrap();
 
     assert!(result.success);
     assert_eq!(result.output.len(), 64);
@@ -270,11 +297,13 @@ fn test_ecadd_point_doubling() {
     let p1_y = hex_to_32("0000000000000000000000000000000000000000000000000000000000000002");
 
     let input = build_ecadd_input(&p1_x, &p1_y, &p1_x, &p1_y);
-    let result = executor.execute(
-        &citrate_execution::precompiles::standard::ECADD,
-        &input,
-        HIGH_GAS,
-    ).unwrap();
+    let result = executor
+        .execute(
+            &citrate_execution::precompiles::standard::ECADD,
+            &input,
+            HIGH_GAS,
+        )
+        .unwrap();
 
     assert!(result.success);
     assert_eq!(result.output.len(), 64);
@@ -307,11 +336,13 @@ fn test_ecadd_short_input_padded() {
     let mut executor = PrecompileExecutor::new();
 
     // Empty input => all zeros => O + O = O
-    let result = executor.execute(
-        &citrate_execution::precompiles::standard::ECADD,
-        &[],
-        HIGH_GAS,
-    ).unwrap();
+    let result = executor
+        .execute(
+            &citrate_execution::precompiles::standard::ECADD,
+            &[],
+            HIGH_GAS,
+        )
+        .unwrap();
 
     assert!(result.success);
     assert_eq!(&result.output, &[0u8; 64]);
@@ -341,15 +372,20 @@ fn test_ecmul_zero_scalar() {
     let zero = [0u8; 32];
 
     let input = build_ecmul_input(&p1_x, &p1_y, &zero);
-    let result = executor.execute(
-        &citrate_execution::precompiles::standard::ECMUL,
-        &input,
-        HIGH_GAS,
-    ).unwrap();
+    let result = executor
+        .execute(
+            &citrate_execution::precompiles::standard::ECMUL,
+            &input,
+            HIGH_GAS,
+        )
+        .unwrap();
 
     assert!(result.success);
     assert_eq!(result.gas_used, 6000);
-    assert_eq!(&result.output, &[0u8; 64], "0 * P should be point at infinity");
+    assert_eq!(
+        &result.output, &[0u8; 64],
+        "0 * P should be point at infinity"
+    );
 }
 
 /// EIP-197 Test: 1 * P = P (scalar one)
@@ -362,11 +398,13 @@ fn test_ecmul_identity_scalar() {
     let one = hex_to_32("0000000000000000000000000000000000000000000000000000000000000001");
 
     let input = build_ecmul_input(&p1_x, &p1_y, &one);
-    let result = executor.execute(
-        &citrate_execution::precompiles::standard::ECMUL,
-        &input,
-        HIGH_GAS,
-    ).unwrap();
+    let result = executor
+        .execute(
+            &citrate_execution::precompiles::standard::ECMUL,
+            &input,
+            HIGH_GAS,
+        )
+        .unwrap();
 
     assert!(result.success);
     assert_eq!(&result.output[0..32], &p1_x, "1 * P x should equal P x");
@@ -383,11 +421,13 @@ fn test_ecmul_scalar_two() {
     let two = hex_to_32("0000000000000000000000000000000000000000000000000000000000000002");
 
     let input = build_ecmul_input(&p1_x, &p1_y, &two);
-    let result = executor.execute(
-        &citrate_execution::precompiles::standard::ECMUL,
-        &input,
-        HIGH_GAS,
-    ).unwrap();
+    let result = executor
+        .execute(
+            &citrate_execution::precompiles::standard::ECMUL,
+            &input,
+            HIGH_GAS,
+        )
+        .unwrap();
 
     assert!(result.success);
 
@@ -407,11 +447,13 @@ fn test_ecmul_identity_point() {
     let scalar = hex_to_32("0000000000000000000000000000000000000000000000000000000000000007");
 
     let input = build_ecmul_input(&zero, &zero, &scalar);
-    let result = executor.execute(
-        &citrate_execution::precompiles::standard::ECMUL,
-        &input,
-        HIGH_GAS,
-    ).unwrap();
+    let result = executor
+        .execute(
+            &citrate_execution::precompiles::standard::ECMUL,
+            &input,
+            HIGH_GAS,
+        )
+        .unwrap();
 
     assert!(result.success);
     assert_eq!(&result.output, &[0u8; 64], "Any scalar * O should be O");
@@ -447,11 +489,13 @@ fn test_ecmul_large_scalar() {
     let r_minus_1 = hex_to_32("30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000000");
 
     let input = build_ecmul_input(&p1_x, &p1_y, &r_minus_1);
-    let result = executor.execute(
-        &citrate_execution::precompiles::standard::ECMUL,
-        &input,
-        HIGH_GAS,
-    ).unwrap();
+    let result = executor
+        .execute(
+            &citrate_execution::precompiles::standard::ECMUL,
+            &input,
+            HIGH_GAS,
+        )
+        .unwrap();
 
     assert!(result.success);
     // (r-1)*G = -G, so y-coordinate is negated (p - y)
@@ -467,11 +511,13 @@ fn test_ecmul_short_input() {
     let mut executor = PrecompileExecutor::new();
 
     // Empty input => all zeros => 0 * O = O
-    let result = executor.execute(
-        &citrate_execution::precompiles::standard::ECMUL,
-        &[],
-        HIGH_GAS,
-    ).unwrap();
+    let result = executor
+        .execute(
+            &citrate_execution::precompiles::standard::ECMUL,
+            &[],
+            HIGH_GAS,
+        )
+        .unwrap();
 
     assert!(result.success);
     assert_eq!(&result.output, &[0u8; 64]);
@@ -519,15 +565,17 @@ fn test_modexp_simple() {
     let modulus = vec![0x03, 0xE8]; // 1000
 
     let input = build_modexp_input(&base, &exp, &modulus);
-    let result = executor.execute(
-        &citrate_execution::precompiles::standard::MODEXP,
-        &input,
-        HIGH_GAS,
-    ).unwrap();
+    let result = executor
+        .execute(
+            &citrate_execution::precompiles::standard::MODEXP,
+            &input,
+            HIGH_GAS,
+        )
+        .unwrap();
 
     assert!(result.success);
     assert_eq!(result.output.len(), 2); // padded to modulus length
-    // 2^10 = 1024, 1024 mod 1000 = 24 = 0x18
+                                        // 2^10 = 1024, 1024 mod 1000 = 24 = 0x18
     assert_eq!(result.output, vec![0x00, 0x18]);
 }
 
@@ -541,11 +589,13 @@ fn test_modexp_zero_base_zero_exp() {
     let modulus = vec![1u8];
 
     let input = build_modexp_input(&base, &exp, &modulus);
-    let result = executor.execute(
-        &citrate_execution::precompiles::standard::MODEXP,
-        &input,
-        HIGH_GAS,
-    ).unwrap();
+    let result = executor
+        .execute(
+            &citrate_execution::precompiles::standard::MODEXP,
+            &input,
+            HIGH_GAS,
+        )
+        .unwrap();
 
     assert!(result.success);
     // 0^0 = 1 by convention, 1 mod 1 = 0
@@ -563,11 +613,13 @@ fn test_modexp_big_exponent() {
     let modulus = vec![97u8];
 
     let input = build_modexp_input(&base, &exp, &modulus);
-    let result = executor.execute(
-        &citrate_execution::precompiles::standard::MODEXP,
-        &input,
-        HIGH_GAS,
-    ).unwrap();
+    let result = executor
+        .execute(
+            &citrate_execution::precompiles::standard::MODEXP,
+            &input,
+            HIGH_GAS,
+        )
+        .unwrap();
 
     assert!(result.success);
     assert_eq!(result.output.len(), 1);
@@ -585,14 +637,19 @@ fn test_modexp_zero_modulus_length() {
     let mut executor = PrecompileExecutor::new();
 
     let input = build_modexp_input(&[2], &[3], &[]);
-    let result = executor.execute(
-        &citrate_execution::precompiles::standard::MODEXP,
-        &input,
-        HIGH_GAS,
-    ).unwrap();
+    let result = executor
+        .execute(
+            &citrate_execution::precompiles::standard::MODEXP,
+            &input,
+            HIGH_GAS,
+        )
+        .unwrap();
 
     assert!(result.success);
-    assert!(result.output.is_empty(), "Zero-length modulus should return empty output");
+    assert!(
+        result.output.is_empty(),
+        "Zero-length modulus should return empty output"
+    );
 }
 
 /// EIP-198 Test: Modulus of 1 should always return 0
@@ -605,11 +662,13 @@ fn test_modexp_modulus_one() {
     let modulus = vec![1u8];
 
     let input = build_modexp_input(&base, &exp, &modulus);
-    let result = executor.execute(
-        &citrate_execution::precompiles::standard::MODEXP,
-        &input,
-        HIGH_GAS,
-    ).unwrap();
+    let result = executor
+        .execute(
+            &citrate_execution::precompiles::standard::MODEXP,
+            &input,
+            HIGH_GAS,
+        )
+        .unwrap();
 
     assert!(result.success);
     // Anything mod 1 = 0
@@ -630,11 +689,13 @@ fn test_modexp_large_base_and_modulus() {
     let modulus = vec![0xFF; 32]; // 2^256 - 1
 
     let input = build_modexp_input(&base, &exp, &modulus);
-    let result = executor.execute(
-        &citrate_execution::precompiles::standard::MODEXP,
-        &input,
-        HIGH_GAS,
-    ).unwrap();
+    let result = executor
+        .execute(
+            &citrate_execution::precompiles::standard::MODEXP,
+            &input,
+            HIGH_GAS,
+        )
+        .unwrap();
 
     assert!(result.success);
     assert_eq!(result.output.len(), 32);
@@ -643,7 +704,10 @@ fn test_modexp_large_base_and_modulus() {
     // 2^254 in big-endian 32 bytes: byte[0] = 0x40 (since 2^254 = 0x40 << 248 bits)
     let mut expected = vec![0u8; 32];
     expected[0] = 0x40; // 2^254 = 0x40 at the most significant byte position
-    assert_eq!(result.output, expected, "(2^255)^2 mod (2^256-1) should equal 2^254");
+    assert_eq!(
+        result.output, expected,
+        "(2^255)^2 mod (2^256-1) should equal 2^254"
+    );
 }
 
 /// EIP-198 Test: Base larger than modulus
@@ -652,15 +716,17 @@ fn test_modexp_base_larger_than_modulus() {
     let mut executor = PrecompileExecutor::new();
 
     let base = vec![0xFF]; // 255
-    let exp = vec![1u8];   // ^1
+    let exp = vec![1u8]; // ^1
     let modulus = vec![100u8]; // mod 100
 
     let input = build_modexp_input(&base, &exp, &modulus);
-    let result = executor.execute(
-        &citrate_execution::precompiles::standard::MODEXP,
-        &input,
-        HIGH_GAS,
-    ).unwrap();
+    let result = executor
+        .execute(
+            &citrate_execution::precompiles::standard::MODEXP,
+            &input,
+            HIGH_GAS,
+        )
+        .unwrap();
 
     assert!(result.success);
     // 255 mod 100 = 55
@@ -677,11 +743,13 @@ fn test_modexp_zero_exponent() {
     let modulus = vec![13u8];
 
     let input = build_modexp_input(&base, &exp, &modulus);
-    let result = executor.execute(
-        &citrate_execution::precompiles::standard::MODEXP,
-        &input,
-        HIGH_GAS,
-    ).unwrap();
+    let result = executor
+        .execute(
+            &citrate_execution::precompiles::standard::MODEXP,
+            &input,
+            HIGH_GAS,
+        )
+        .unwrap();
 
     assert!(result.success);
     // 7^0 mod 13 = 1
@@ -713,11 +781,13 @@ fn test_modexp_empty_input() {
 
     // All zeros => blen=0, elen=0, mlen=0 => empty modulus => empty output
     let input = vec![0u8; 96];
-    let result = executor.execute(
-        &citrate_execution::precompiles::standard::MODEXP,
-        &input,
-        HIGH_GAS,
-    ).unwrap();
+    let result = executor
+        .execute(
+            &citrate_execution::precompiles::standard::MODEXP,
+            &input,
+            HIGH_GAS,
+        )
+        .unwrap();
 
     assert!(result.success);
     assert!(result.output.is_empty());

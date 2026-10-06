@@ -263,14 +263,13 @@ impl FilterRegistry {
     pub fn spawn_cleanup(
         self: std::sync::Arc<Self>,
         interval: Duration,
-    ) -> std::thread::JoinHandle<()> {
+    ) -> std::io::Result<std::thread::JoinHandle<()>> {
         std::thread::Builder::new()
             .name("citrate-filter-gc".to_string())
             .spawn(move || loop {
                 std::thread::sleep(interval);
                 self.cleanup_stale_filters();
             })
-            .expect("filter-gc thread should spawn")
     }
 }
 

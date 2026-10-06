@@ -54,8 +54,17 @@ contract DeployDpf08Refresh is ScriptEnv {
 
     function run() external returns (DeployedAddresses memory addrs) {
         address deployer = deployerAddress();
-        address governance = envAddressOr("GOVERNANCE", deployer);
+        address governance = requiredGovernance("GOVERNANCE", deployer);
         address treasury = envAddressOr("TREASURY", deployer);
+
+        // G2: this is a drift-REFRESH maintenance script — it redeploys
+        // ComputeVerifier/ComputeMarketplace/TEEAttestationRegistry deployer-governed
+        // and hands over via a two-step transfer (which leaves the deployer as live
+        // governance until the multisig accepts). On the fresh reroll those three are
+        // already deployed governance-owned by DeployAll/DeployTEEAttestationRegistry,
+        // so running this on 40204 would only re-introduce deployer-held contracts.
+        // Refuse it on the production chain.
+        require(block.chainid != 40204, "DeployDpf08Refresh is a drift-refresh; on 40204 DeployAll already deploys these governance-owned");
 
         console.log("=== DPF-08 read-path contract refresh ===");
         console.log("Deployer:  ", deployer);

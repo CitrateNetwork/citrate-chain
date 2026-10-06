@@ -20,4 +20,4 @@ pub mod wallet;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
-pub use wallet::{Wallet, SdkAccount, SdkTransaction, SdkConfig};
+pub use wallet::{SdkAccount, SdkConfig, SdkTransaction, Wallet};

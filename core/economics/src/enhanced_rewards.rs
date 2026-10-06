@@ -1,11 +1,11 @@
 // citrate/core/economics/src/enhanced_rewards.rs
 
 use crate::dynamic_pricing::UtilizationMetrics;
+use anyhow::Result;
 use citrate_execution::types::Address;
 use primitive_types::U256;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use anyhow::Result;
 
 /// Enhanced reward configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,14 +42,14 @@ impl Default for EnhancedRewardConfig {
     fn default() -> Self {
         Self {
             base_block_reward: U256::from(10_000_000_000_000_000u64), // 0.01 SALT
-            performance_bonus_pool: 30, // 30% for performance
-            ai_contribution_pool: 25,   // 25% for AI contributions
-            network_health_pool: 20,    // 20% for network health
-            staking_bonus_pool: 25,     // 25% for long-term staking
-            min_validator_stake: U256::from(32_000) * U256::from(10).pow(U256::from(18)), // 32k SALT
-            performance_window: 100,    // 100 blocks
-            ai_quality_threshold: 0.85, // 85% quality threshold
-            participation_threshold: 0.9, // 90% participation
+            performance_bonus_pool: 30,                               // 30% for performance
+            ai_contribution_pool: 25,                                 // 25% for AI contributions
+            network_health_pool: 20,                                  // 20% for network health
+            staking_bonus_pool: 25,                                   // 25% for long-term staking
+            min_validator_stake: crate::salt(32_000),                 // 32k SALT
+            performance_window: 100,                                  // 100 blocks
+            ai_quality_threshold: 0.85,                               // 85% quality threshold
+            participation_threshold: 0.9,                             // 90% participation
         }
     }
 }
@@ -77,7 +77,7 @@ pub struct AIContribution {
     pub models_deployed: u64,
     pub inferences_served: u64,
     pub quality_ratings: Vec<f64>,
-    pub compute_provided: u64, // compute units
+    pub compute_provided: u64,   // compute units
     pub data_contributions: u64, // datasets shared
     pub successful_trainings: u64,
     pub peer_reviews_given: u64,
@@ -156,27 +156,35 @@ impl EnhancedRewardCalculator {
         network_health: NetworkHealth,
     ) -> Result<EnhancedRewardDistribution> {
         // Update historical data
-        self.update_histories(&validator_performances, &ai_contributions, network_health.clone());
+        self.update_histories(
+            &validator_performances,
+            &ai_contributions,
+            network_health.clone(),
+        );
 
         // Calculate total reward pool
         let total_reward_pool = self.calculate_total_reward_pool(block_height, utilization)?;
 
         // Distribute rewards
-        let validator_rewards = self.calculate_validator_rewards(&validator_performances, &total_reward_pool)?;
+        let validator_rewards =
+            self.calculate_validator_rewards(&validator_performances, &total_reward_pool)?;
         let ai_rewards = self.calculate_ai_rewards(&ai_contributions, &total_reward_pool)?;
-        let network_bonus = self.calculate_network_health_bonus(&network_health, &total_reward_pool)?;
+        let network_bonus =
+            self.calculate_network_health_bonus(&network_health, &total_reward_pool)?;
 
         // Calculate burn amount for deflationary pressure
         let burn_amount = self.calculate_burn_amount(&total_reward_pool, &network_health)?;
 
         // Treasury allocation (remaining after all distributions)
-        let distributed = validator_rewards.values().map(|r| r.total_reward).fold(U256::zero(), |acc, x| acc + x)
-            + ai_rewards.values().map(|r| r.total_reward).fold(U256::zero(), |acc, x| acc + x)
-            + network_bonus
-            + burn_amount;
+        let distributed = validator_rewards
+            .values()
+            .map(|r| r.total_reward)
+            .chain(ai_rewards.values().map(|r| r.total_reward))
+            .chain([network_bonus, burn_amount])
+            .fold(U256::zero(), |acc, x| acc.saturating_add(x));
 
         let treasury_allocation = if total_reward_pool > distributed {
-            total_reward_pool - distributed
+            total_reward_pool.saturating_sub(distributed)
         } else {
             U256::zero()
         };
@@ -193,14 +201,22 @@ impl EnhancedRewardCalculator {
     }
 
     /// Calculate total reward pool based on network conditions
-    fn calculate_total_reward_pool(&self, block_height: u64, utilization: &UtilizationMetrics) -> Result<U256> {
+    fn calculate_total_reward_pool(
+        &self,
+        block_height: u64,
+        utilization: &UtilizationMetrics,
+    ) -> Result<U256> {
         let mut base_pool = self.config.base_block_reward;
 
         // Apply halving (every ~4 years assuming 2s blocks)
         let halving_interval = 2_100_000u64;
         let halvings = block_height / halving_interval;
         if halvings > 0 && halvings < 64 {
-            base_pool /= U256::from(2u64.pow(halvings as u32));
+            // halvings < 64, so 2^halvings fits in u64.
+            base_pool = 2u64
+                .checked_pow(halvings as u32)
+                .and_then(|d| base_pool.checked_div(U256::from(d)))
+                .unwrap_or_default();
         }
 
         // Network activity bonus
@@ -208,17 +224,18 @@ impl EnhancedRewardCalculator {
         let activity_multiplier = if utilization_rate > 0.8 {
             110 // 10% bonus for high activity
         } else if utilization_rate < 0.3 {
-            95  // 5% reduction for low activity
+            95 // 5% reduction for low activity
         } else {
             100
         };
 
-        let adjusted_pool = base_pool * U256::from(activity_multiplier) / U256::from(100);
+        let adjusted_pool =
+            crate::mul_div(base_pool, U256::from(activity_multiplier), U256::from(100));
 
         // AI operations bonus
         let ai_bonus = if utilization.ai_operations > 0 {
-            let ai_multiplier = (100 + utilization.ai_operations.min(50)) as u64; // Up to 50% bonus
-            adjusted_pool * U256::from(ai_multiplier) / U256::from(100)
+            let ai_multiplier = utilization.ai_operations.min(50).saturating_add(100) as u64; // Up to 50% bonus
+            crate::mul_div(adjusted_pool, U256::from(ai_multiplier), U256::from(100))
         } else {
             adjusted_pool
         };
@@ -240,11 +257,13 @@ impl EnhancedRewardCalculator {
 
         // Widen to u16 before summing: `u8 + u8` panics under overflow-checks
         // when the two configured percentages sum above 255.
-        let pool_pct = self.config.performance_bonus_pool as u16 + self.config.staking_bonus_pool as u16;
-        let validator_pool = *total_pool * U256::from(pool_pct) / U256::from(100);
+        let pool_pct = (self.config.performance_bonus_pool as u16)
+            .saturating_add(self.config.staking_bonus_pool as u16);
+        let validator_pool = crate::mul_div(*total_pool, U256::from(pool_pct), U256::from(100));
 
         // Calculate total performance score
-        let total_score: f64 = performances.iter()
+        let total_score: f64 = performances
+            .iter()
             .map(|p| self.calculate_validator_score(p))
             .sum();
 
@@ -260,7 +279,11 @@ impl EnhancedRewardCalculator {
             let score = self.calculate_validator_score(performance);
             let reward_share = score / total_score;
 
-            let base_reward = validator_pool * U256::from((reward_share * 1000.0) as u64) / U256::from(1000);
+            let base_reward = crate::mul_div(
+                validator_pool,
+                U256::from((reward_share * 1000.0) as u64),
+                U256::from(1000),
+            );
 
             let performance_bonus = self.calculate_performance_bonus(performance, &base_reward);
             let staking_bonus = self.calculate_staking_bonus(performance, &base_reward);
@@ -269,17 +292,23 @@ impl EnhancedRewardCalculator {
 
             // saturating_sub: the penalty can exceed the gross reward (≥10 slashes
             // at 10%/slash), and a plain U256 subtraction panics on underflow.
-            let gross = base_reward + performance_bonus + staking_bonus + uptime_bonus;
+            let gross = base_reward
+                .saturating_add(performance_bonus)
+                .saturating_add(staking_bonus)
+                .saturating_add(uptime_bonus);
             let total_reward = gross.saturating_sub(penalty);
 
-            rewards.insert(performance.address, ValidatorReward {
-                base_reward,
-                performance_bonus,
-                staking_bonus,
-                uptime_bonus,
-                total_reward,
-                penalty,
-            });
+            rewards.insert(
+                performance.address,
+                ValidatorReward {
+                    base_reward,
+                    performance_bonus,
+                    staking_bonus,
+                    uptime_bonus,
+                    total_reward,
+                    penalty,
+                },
+            );
         }
 
         Ok(rewards)
@@ -297,10 +326,15 @@ impl EnhancedRewardCalculator {
             return Ok(rewards);
         }
 
-        let ai_pool = *total_pool * U256::from(self.config.ai_contribution_pool) / U256::from(100);
+        let ai_pool = crate::mul_div(
+            *total_pool,
+            U256::from(self.config.ai_contribution_pool),
+            U256::from(100),
+        );
 
         // Calculate total AI contribution score
-        let total_score: f64 = contributions.iter()
+        let total_score: f64 = contributions
+            .iter()
             .map(|c| self.calculate_ai_contribution_score(c))
             .sum();
 
@@ -312,41 +346,64 @@ impl EnhancedRewardCalculator {
             let score = self.calculate_ai_contribution_score(contribution);
             let reward_share = score / total_score;
 
-            let base_ai_reward = ai_pool * U256::from((reward_share * 1000.0) as u64) / U256::from(1000);
+            let base_ai_reward = crate::mul_div(
+                ai_pool,
+                U256::from((reward_share * 1000.0) as u64),
+                U256::from(1000),
+            );
 
             let quality_bonus = self.calculate_quality_bonus(contribution, &base_ai_reward);
             let compute_bonus = self.calculate_compute_bonus(contribution, &base_ai_reward);
             let innovation_bonus = self.calculate_innovation_bonus(contribution, &base_ai_reward);
             let community_bonus = self.calculate_community_bonus(contribution, &base_ai_reward);
 
-            let total_ai_reward = base_ai_reward + quality_bonus + compute_bonus + innovation_bonus + community_bonus;
+            let total_ai_reward = base_ai_reward
+                .saturating_add(quality_bonus)
+                .saturating_add(compute_bonus)
+                .saturating_add(innovation_bonus)
+                .saturating_add(community_bonus);
 
-            rewards.insert(contribution.contributor, AIReward {
-                quality_bonus,
-                compute_bonus,
-                innovation_bonus,
-                community_bonus,
-                total_reward: total_ai_reward,
-            });
+            rewards.insert(
+                contribution.contributor,
+                AIReward {
+                    quality_bonus,
+                    compute_bonus,
+                    innovation_bonus,
+                    community_bonus,
+                    total_reward: total_ai_reward,
+                },
+            );
         }
 
         Ok(rewards)
     }
 
     /// Calculate network health bonus
-    fn calculate_network_health_bonus(&self, health: &NetworkHealth, total_pool: &U256) -> Result<U256> {
-        let health_pool = *total_pool * U256::from(self.config.network_health_pool) / U256::from(100);
+    fn calculate_network_health_bonus(
+        &self,
+        health: &NetworkHealth,
+        total_pool: &U256,
+    ) -> Result<U256> {
+        let health_pool = crate::mul_div(
+            *total_pool,
+            U256::from(self.config.network_health_pool),
+            U256::from(100),
+        );
 
         // Network health score (0.0 to 1.0). The component weights already sum
         // to 1.0, so the result is a weighted mean — dividing by 5.0 again capped
         // the score at 0.2 and under-paid the health bonus 5×.
-        let health_score = health.average_uptime * 0.3 +
-                           health.consensus_efficiency * 0.25 +
-                           health.transaction_success_rate * 0.2 +
-                           health.ai_operation_success_rate * 0.15 +
-                           health.network_decentralization * 0.1;
+        let health_score = health.average_uptime * 0.3
+            + health.consensus_efficiency * 0.25
+            + health.transaction_success_rate * 0.2
+            + health.ai_operation_success_rate * 0.15
+            + health.network_decentralization * 0.1;
 
-        let bonus = health_pool * U256::from((health_score * 100.0) as u64) / U256::from(100);
+        let bonus = crate::mul_div(
+            health_pool,
+            U256::from((health_score * 100.0) as u64),
+            U256::from(100),
+        );
         Ok(bonus)
     }
 
@@ -355,15 +412,16 @@ impl EnhancedRewardCalculator {
         // Burn more when network is congested (deflationary pressure)
         // Burn less when network needs growth incentives
 
-        let base_burn_rate = if health.transaction_success_rate > 0.95 && health.average_uptime > 0.95 {
-            5 // 5% burn rate when network is healthy
-        } else if health.transaction_success_rate < 0.85 || health.average_uptime < 0.85 {
-            1 // 1% burn rate when network needs support
-        } else {
-            3 // 3% default burn rate
-        };
+        let base_burn_rate =
+            if health.transaction_success_rate > 0.95 && health.average_uptime > 0.95 {
+                5 // 5% burn rate when network is healthy
+            } else if health.transaction_success_rate < 0.85 || health.average_uptime < 0.85 {
+                1 // 1% burn rate when network needs support
+            } else {
+                3 // 3% default burn rate
+            };
 
-        let burn_amount = *total_pool * U256::from(base_burn_rate) / U256::from(100);
+        let burn_amount = crate::mul_div(*total_pool, U256::from(base_burn_rate), U256::from(100));
         Ok(burn_amount)
     }
 
@@ -379,41 +437,58 @@ impl EnhancedRewardCalculator {
         let quality_score = performance.quality_score;
         let penalty_score = 1.0 - (performance.slash_count as f64 * 0.1).min(0.5);
 
-        (uptime_score * 0.25 + participation_score * 0.25 + efficiency_score * 0.2 +
-         quality_score * 0.2 + penalty_score * 0.1).max(0.0)
+        (uptime_score * 0.25
+            + participation_score * 0.25
+            + efficiency_score * 0.2
+            + quality_score * 0.2
+            + penalty_score * 0.1)
+            .max(0.0)
     }
 
     /// Calculate AI contribution score
     fn calculate_ai_contribution_score(&self, contribution: &AIContribution) -> f64 {
-        let quality_score = contribution.quality_ratings.iter().sum::<f64>() / contribution.quality_ratings.len().max(1) as f64;
+        let quality_score = contribution.quality_ratings.iter().sum::<f64>()
+            / contribution.quality_ratings.len().max(1) as f64;
         let compute_score = (contribution.compute_provided as f64).log10().max(0.0) / 6.0; // Log scale, max at 1M units
-        let innovation_score = (contribution.models_deployed as f64 * 0.3 +
-                               contribution.successful_trainings as f64 * 0.7).min(100.0) / 100.0;
+        let innovation_score = (contribution.models_deployed as f64 * 0.3
+            + contribution.successful_trainings as f64 * 0.7)
+            .min(100.0)
+            / 100.0;
         let community_score = contribution.community_reputation;
 
-        (quality_score * 0.4 + compute_score * 0.25 + innovation_score * 0.25 + community_score * 0.1).max(0.0)
+        (quality_score * 0.4
+            + compute_score * 0.25
+            + innovation_score * 0.25
+            + community_score * 0.1)
+            .max(0.0)
     }
 
     /// Helper methods for bonus calculations
     fn calculate_performance_bonus(&self, performance: &ValidatorPerformance, base: &U256) -> U256 {
         if performance.uptime_percentage > self.config.participation_threshold {
-            *base * U256::from(20) / U256::from(100) // 20% bonus
+            crate::mul_div(*base, U256::from(20), U256::from(100)) // 20% bonus
         } else {
             U256::zero()
         }
     }
 
     fn calculate_staking_bonus(&self, performance: &ValidatorPerformance, base: &U256) -> U256 {
-        let stake_ratio = performance.stake_amount.as_u128() as f64 / self.config.min_validator_stake.as_u128() as f64;
-        let duration_bonus = (performance.stake_duration as f64 / self.config.performance_window as f64).min(2.0);
+        let stake_ratio = performance.stake_amount.as_u128() as f64
+            / self.config.min_validator_stake.as_u128() as f64;
+        let duration_bonus =
+            (performance.stake_duration as f64 / self.config.performance_window as f64).min(2.0);
         let bonus_rate = (stake_ratio.log2() * duration_bonus * 0.1).min(0.3); // Max 30% bonus
 
-        *base * U256::from((bonus_rate * 100.0) as u64) / U256::from(100)
+        crate::mul_div(
+            *base,
+            U256::from((bonus_rate * 100.0) as u64),
+            U256::from(100),
+        )
     }
 
     fn calculate_uptime_bonus(&self, performance: &ValidatorPerformance, base: &U256) -> U256 {
         if performance.uptime_percentage > 0.99 {
-            *base * U256::from(10) / U256::from(100) // 10% bonus for 99%+ uptime
+            crate::mul_div(*base, U256::from(10), U256::from(100)) // 10% bonus for 99%+ uptime
         } else {
             U256::zero()
         }
@@ -425,17 +500,22 @@ impl EnhancedRewardCalculator {
             // for very large counts, and an uncapped percentage would exceed the
             // gross reward and (before the saturating_sub above) panic.
             let pct = (performance.slash_count.saturating_mul(10)).min(100);
-            *base * U256::from(pct) / U256::from(100)
+            crate::mul_div(*base, U256::from(pct), U256::from(100))
         } else {
             U256::zero()
         }
     }
 
     fn calculate_quality_bonus(&self, contribution: &AIContribution, base: &U256) -> U256 {
-        let avg_quality = contribution.quality_ratings.iter().sum::<f64>() / contribution.quality_ratings.len().max(1) as f64;
+        let avg_quality = contribution.quality_ratings.iter().sum::<f64>()
+            / contribution.quality_ratings.len().max(1) as f64;
         if avg_quality > self.config.ai_quality_threshold {
             let bonus_rate = ((avg_quality - self.config.ai_quality_threshold) * 0.5).min(0.25); // Max 25% bonus
-            *base * U256::from((bonus_rate * 100.0) as u64) / U256::from(100)
+            crate::mul_div(
+                *base,
+                U256::from((bonus_rate * 100.0) as u64),
+                U256::from(100),
+            )
         } else {
             U256::zero()
         }
@@ -448,18 +528,24 @@ impl EnhancedRewardCalculator {
             10001..=100000 => 10,
             _ => 15,
         };
-        *base * U256::from(compute_tier) / U256::from(100)
+        crate::mul_div(*base, U256::from(compute_tier), U256::from(100))
     }
 
     fn calculate_innovation_bonus(&self, contribution: &AIContribution, base: &U256) -> U256 {
-        let innovation_score = contribution.models_deployed + contribution.successful_trainings * 2;
+        let innovation_score = contribution
+            .models_deployed
+            .saturating_add(contribution.successful_trainings.saturating_mul(2));
         let bonus_rate = (innovation_score as f64 * 0.01).min(0.2); // Max 20% bonus
-        *base * U256::from((bonus_rate * 100.0) as u64) / U256::from(100)
+        crate::mul_div(
+            *base,
+            U256::from((bonus_rate * 100.0) as u64),
+            U256::from(100),
+        )
     }
 
     fn calculate_community_bonus(&self, contribution: &AIContribution, base: &U256) -> U256 {
         if contribution.community_reputation > 0.8 && contribution.peer_reviews_given > 10 {
-            *base * U256::from(15) / U256::from(100) // 15% bonus for active community members
+            crate::mul_div(*base, U256::from(15), U256::from(100)) // 15% bonus for active community members
         } else {
             U256::zero()
         }
@@ -474,7 +560,10 @@ impl EnhancedRewardCalculator {
     ) {
         // Update validator history
         for performance in validator_performances {
-            let history = self.validator_history.entry(performance.address).or_default();
+            let history = self
+                .validator_history
+                .entry(performance.address)
+                .or_default();
             history.push(performance.clone());
             if history.len() > self.config.performance_window as usize {
                 history.remove(0);
@@ -483,7 +572,10 @@ impl EnhancedRewardCalculator {
 
         // Update AI contribution history
         for contribution in ai_contributions {
-            let history = self.ai_contribution_history.entry(contribution.contributor).or_default();
+            let history = self
+                .ai_contribution_history
+                .entry(contribution.contributor)
+                .or_default();
             history.push(contribution.clone());
             if history.len() > self.config.performance_window as usize {
                 history.remove(0);
@@ -524,7 +616,7 @@ mod tests {
             transaction_throughput: 1000,
             ai_operations_processed: 5,
             consensus_participation: 0.95,
-            stake_amount: U256::from(50_000) * U256::from(10).pow(U256::from(18)),
+            stake_amount: crate::salt(50_000),
             stake_duration: 1000,
             slash_count: 0,
             quality_score: 0.9,
@@ -553,13 +645,15 @@ mod tests {
             security_incidents: 0,
         };
 
-        let result = calculator.calculate_rewards(
-            1,
-            &metrics,
-            vec![validator_performance],
-            vec![ai_contribution],
-            network_health,
-        ).unwrap();
+        let result = calculator
+            .calculate_rewards(
+                1,
+                &metrics,
+                vec![validator_performance],
+                vec![ai_contribution],
+                network_health,
+            )
+            .unwrap();
 
         assert!(result.total_rewards > U256::zero());
         assert!(!result.validator_rewards.is_empty());

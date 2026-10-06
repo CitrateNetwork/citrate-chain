@@ -45,7 +45,10 @@ fn wasm_recipe_sign(private_key: &[u8], msg_hash: &[u8]) -> Vec<u8> {
 fn test_rm_g1_5_signature_is_deterministic_rfc6979() {
     let s1 = wasm_recipe_sign(&TEST_PRIVKEY, &TEST_MSG_HASH);
     let s2 = wasm_recipe_sign(&TEST_PRIVKEY, &TEST_MSG_HASH);
-    assert_eq!(s1, s2, "RFC 6979: signing the same (key, hash) twice must give the same output");
+    assert_eq!(
+        s1, s2,
+        "RFC 6979: signing the same (key, hash) twice must give the same output"
+    );
     assert_eq!(s1.len(), 65, "WASM sign output must be 65 bytes (r||s||v)");
 }
 
