@@ -184,16 +184,16 @@
     "deployed_contracts": {
       "scope": "citrate-chain",
       "value": {
-        "contracts": 92,
+        "contracts": 91,
         "aa_stack": 7,
-        "book_entries_contracts_plus_aa": 99,
-        "with_code_on_chain": 99,
+        "book_entries_contracts_plus_aa": 98,
+        "with_code_on_chain": 98,
         "codeless_in_book": 0,
         "genesis_deployers": 2,
         "top_level_extra": 2,
         "precompile_addresses_listed": 21,
         "planned_codeless": 0,
-        "snapshot_with_code_total": 103
+        "snapshot_with_code_total": 102
       },
       "source_files": [
         "contracts/addresses/40204.json"
@@ -203,10 +203,10 @@
         "verification/check_address_code.py"
       ],
       "reproduction_command": "python3 verification/check_address_code.py --check  # read-only eth_getCode on every book entry; --offline validates the committed snapshot without network",
-      "count_method": "contracts (92) + aaStack (7) = 99 gated book entries; eth_getCode at the probed block shows all 99 have code and 0 are codeless (this is the figure check_address_code.py --check gates on: with_code_on_chain == 99, codeless_in_book == 0). The address-code snapshot's with_code_count of 103 = these 99 + 2 genesis entries (ArachnidDeterministicDeployer, P256Verifier) + 2 top-level entries (CitrateMemberSBT, MembershipStakeVault — same names/addresses as in contracts), all of which have code. The governance section (GOVERNANCE + GUARDIAN, each a 2-of-3 MultisigTimelock2of3) is verified by the deploy-admin gate, not counted here. Codeless by design: 21 precompile addresses (VM precompiles, no bytecode). The planned.* coop block was removed (coop not deployed on the fresh-keys chain).",
+      "count_method": "contracts (91) + aaStack (7) = 98 gated book entries; eth_getCode at the probed block shows all 98 have code and 0 are codeless (this is the figure check_address_code.py --check gates on: with_code_on_chain == 98, codeless_in_book == 0). The address-code snapshot's with_code_count of 102 = these 98 + 2 genesis entries (ArachnidDeterministicDeployer, P256Verifier) + 2 top-level entries (CitrateMemberSBT, MembershipStakeVault — same names/addresses as in contracts), all of which have code. The governance section (GOVERNANCE + GUARDIAN, each a 2-of-3 MultisigTimelock2of3) is verified by the deploy-admin gate, not counted here. Codeless by design: 21 precompile addresses (VM precompiles, no bytecode). The planned.* coop block was removed (coop not deployed on the fresh-keys chain).",
       "last_verified_at": "2026-09-30T02:15:56Z",
       "verification_status": "verified",
-      "notes": "Regenerated for the 2026-09-29 fresh-keys reroll (genesis state root 0f2b567f…) from the on-chain deployer-tx ledger (contracts/addresses/40204.provenance.json). Probe at chain block 6929: python3 verification/check_address_code.py --probe --rpc https://rpc.citrate.ai."
+      "notes": "Regenerated for the 2026-10-05 r1005 fresh-keys reroll (genesis block 1dcfc490…, G = bf551422) from the on-chain deployer-tx ledger (contracts/addresses/40204.provenance.json). Probe at chain block 750: python3 verification/check_address_code.py --probe --rpc https://rpc.citrate.ai."
     },
     "precompiles": {
       "scope": "citrate-chain",
