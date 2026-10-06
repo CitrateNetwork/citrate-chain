@@ -6,8 +6,8 @@ use crate::{
     peer::{Peer, PeerId, PeerManager},
     NetworkError, NetworkMessage,
 };
-use dashmap::DashMap;
 use citrate_consensus::types::{Block, Hash, PublicKey, Transaction};
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -185,7 +185,10 @@ impl GossipProtocol {
         // Check if already seen
         if let Some(seen) = self.seen_blocks.get(&hash) {
             if seen.propagated {
-                self.stats.write().await.duplicates_filtered += 1;
+                {
+                    let mut stats = self.stats.write().await;
+                    stats.duplicates_filtered = stats.duplicates_filtered.saturating_add(1);
+                }
                 return Ok(());
             }
         }
@@ -200,7 +203,10 @@ impl GossipProtocol {
             },
         );
 
-        self.stats.write().await.blocks_received += 1;
+        {
+            let mut stats = self.stats.write().await;
+            stats.blocks_received = stats.blocks_received.saturating_add(1);
+        }
 
         // Validate block (full integrity checks — WP-G.3)
         if !self.validate_block(&block).await {
@@ -209,9 +215,10 @@ impl GossipProtocol {
             self.peer_manager
                 .update_peer_score(from_peer, SCORE_INVALID_BLOCK)
                 .await;
-            return Err(NetworkError::InvalidMessage(
-                format!("Block {} failed validation", hash)
-            ));
+            return Err(NetworkError::InvalidMessage(format!(
+                "Block {} failed validation",
+                hash
+            )));
         }
 
         // Reward peer for valid block relay
@@ -244,7 +251,10 @@ impl GossipProtocol {
         // Check if already seen
         if let Some(seen) = self.seen_transactions.get(&hash) {
             if seen.propagated {
-                self.stats.write().await.duplicates_filtered += 1;
+                {
+                    let mut stats = self.stats.write().await;
+                    stats.duplicates_filtered = stats.duplicates_filtered.saturating_add(1);
+                }
                 return Ok(());
             }
         }
@@ -259,7 +269,10 @@ impl GossipProtocol {
             },
         );
 
-        self.stats.write().await.transactions_received += 1;
+        {
+            let mut stats = self.stats.write().await;
+            stats.transactions_received = stats.transactions_received.saturating_add(1);
+        }
 
         // Validate transaction (basic checks)
         if !self.validate_transaction(&tx).await {
@@ -297,7 +310,9 @@ impl GossipProtocol {
             self.peer_manager
                 .update_peer_score(from_peer, SCORE_INVALID_TX)
                 .await;
-            return Err(NetworkError::InvalidMessage("Invalid transaction".to_string()));
+            return Err(NetworkError::InvalidMessage(
+                "Invalid transaction".to_string(),
+            ));
         }
         self.authenticate_transaction(tx, from_peer).await
     }
@@ -362,7 +377,10 @@ impl GossipProtocol {
             }
         }
 
-        self.stats.write().await.blocks_propagated += 1;
+        {
+            let mut stats = self.stats.write().await;
+            stats.blocks_propagated = stats.blocks_propagated.saturating_add(1);
+        }
 
         Ok(())
     }
@@ -395,7 +413,10 @@ impl GossipProtocol {
             }
         }
 
-        self.stats.write().await.transactions_propagated += 1;
+        {
+            let mut stats = self.stats.write().await;
+            stats.transactions_propagated = stats.transactions_propagated.saturating_add(1);
+        }
 
         Ok(())
     }
@@ -416,10 +437,7 @@ impl GossipProtocol {
     ) -> Result<(), NetworkError> {
         // 1. Structural validation
         if let Err(e) = msg.validate() {
-            warn!(
-                "[INVALID_LEARNING] from={} error={}",
-                from_peer.0, e
-            );
+            warn!("[INVALID_LEARNING] from={} error={}", from_peer.0, e);
             self.peer_manager
                 .update_peer_score(from_peer, SCORE_INVALID_LEARNING)
                 .await;
@@ -434,10 +452,7 @@ impl GossipProtocol {
         // dedup keys on the attacker-chosen participant — censor the
         // victim's genuine entry at that height. Fail closed + penalize.
         if let Err(e) = msg.verify_signature(self.config.chain_id) {
-            warn!(
-                "[INVALID_LEARNING_SIG] from={} error={}",
-                from_peer.0, e
-            );
+            warn!("[INVALID_LEARNING_SIG] from={} error={}", from_peer.0, e);
             self.peer_manager
                 .update_peer_score(from_peer, SCORE_INVALID_LEARNING)
                 .await;
@@ -458,13 +473,20 @@ impl GossipProtocol {
 
         // 3. Check dedup cache
         if self.seen_learning.contains_key(&dedup_key) {
-            self.stats.write().await.learning_duplicates_filtered += 1;
+            {
+                let mut stats = self.stats.write().await;
+                stats.learning_duplicates_filtered =
+                    stats.learning_duplicates_filtered.saturating_add(1);
+            }
             return Ok(());
         }
 
         // 4. Mark as seen
         self.seen_learning.insert(dedup_key, Instant::now());
-        self.stats.write().await.learning_received += 1;
+        {
+            let mut stats = self.stats.write().await;
+            stats.learning_received = stats.learning_received.saturating_add(1);
+        }
 
         info!(
             "[LEARNING] checkpoint={} type={} from={}",
@@ -479,9 +501,7 @@ impl GossipProtocol {
         // 5. Store in per-checkpoint collection
         {
             let mut data = self.learning_data.write().await;
-            let entry = data
-                .entry(msg.checkpoint_height())
-                .or_default();
+            let entry = data.entry(msg.checkpoint_height()).or_default();
             match &msg {
                 LearningMessage::Embedding(_) => entry.embeddings.push(msg.clone()),
                 LearningMessage::Adapter(_) => entry.adapters.push(msg.clone()),
@@ -519,7 +539,10 @@ impl GossipProtocol {
             }
         }
 
-        self.stats.write().await.learning_propagated += 1;
+        {
+            let mut stats = self.stats.write().await;
+            stats.learning_propagated = stats.learning_propagated.saturating_add(1);
+        }
 
         Ok(())
     }
@@ -527,12 +550,16 @@ impl GossipProtocol {
     /// Retrieve the collected learning data for a given checkpoint height.
     ///
     /// Returns `None` if no data has been collected for that checkpoint.
-    pub async fn get_learning_data(&self, checkpoint_height: u64) -> Option<CheckpointLearningData> {
+    pub async fn get_learning_data(
+        &self,
+        checkpoint_height: u64,
+    ) -> Option<CheckpointLearningData> {
         let data = self.learning_data.read().await;
-        data.get(&checkpoint_height).map(|d| CheckpointLearningData {
-            embeddings: d.embeddings.clone(),
-            adapters: d.adapters.clone(),
-        })
+        data.get(&checkpoint_height)
+            .map(|d| CheckpointLearningData {
+                embeddings: d.embeddings.clone(),
+                adapters: d.adapters.clone(),
+            })
     }
 
     /// Remove learning data for checkpoints at or below `finalized_height`.
@@ -604,7 +631,10 @@ impl GossipProtocol {
             }
         };
         if size > self.config.max_message_size {
-            warn!("[BLOCK_OVERSIZED] block={} size={}", block.header.block_hash, size);
+            warn!(
+                "[BLOCK_OVERSIZED] block={} size={}",
+                block.header.block_hash, size
+            );
             return false;
         }
 
@@ -621,7 +651,10 @@ impl GossipProtocol {
             .as_secs();
         // Shared with the sync ingress (PBA-L1b-003); saturating.
         if !citrate_consensus::hardening::within_future_drift(block.header.timestamp, now) {
-            warn!("[TIMESTAMP_FUTURE] block={} ts={} now={}", block.header.block_hash, block.header.timestamp, now);
+            warn!(
+                "[TIMESTAMP_FUTURE] block={} ts={} now={}",
+                block.header.block_hash, block.header.timestamp, now
+            );
             return false;
         }
 
@@ -787,7 +820,7 @@ impl GossipProtocol {
 
             items.sort_by_key(|&(_, time)| time);
 
-            let to_remove = items.len() - self.config.max_seen_cache;
+            let to_remove = items.len().saturating_sub(self.config.max_seen_cache);
             for (hash, _) in items.into_iter().take(to_remove) {
                 self.seen_blocks.remove(&hash);
             }
@@ -802,7 +835,7 @@ impl GossipProtocol {
 
             items.sort_by_key(|&(_, time)| time);
 
-            let to_remove = items.len() - self.config.max_seen_cache;
+            let to_remove = items.len().saturating_sub(self.config.max_seen_cache);
             for (hash, _) in items.into_iter().take(to_remove) {
                 self.seen_transactions.remove(&hash);
             }
@@ -823,7 +856,7 @@ impl GossipProtocol {
 
             items.sort_by_key(|&(_, time)| time);
 
-            let to_remove = items.len() - self.config.max_seen_cache;
+            let to_remove = items.len().saturating_sub(self.config.max_seen_cache);
             for (key, _) in items.into_iter().take(to_remove) {
                 self.seen_learning.remove(&key);
             }

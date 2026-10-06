@@ -110,13 +110,7 @@ mod blue_set_determinism {
         dag_store.store_block(block_b.clone()).await.unwrap();
 
         // C references both A and B
-        let block_c = create_block_with_params(
-            3,
-            2,
-            Some(block_a.hash()),
-            vec![block_b.hash()],
-            2,
-        );
+        let block_c = create_block_with_params(3, 2, Some(block_a.hash()), vec![block_b.hash()], 2);
         dag_store.store_block(block_c.clone()).await.unwrap();
 
         // Calculate blue set multiple times - should be identical
@@ -409,13 +403,7 @@ mod blue_score_monotonicity {
         assert!(score_b >= genesis_score);
 
         // Merge block should have at least as high a score
-        let merge = create_block_with_params(
-            3,
-            2,
-            Some(branch_a.hash()),
-            vec![branch_b.hash()],
-            2,
-        );
+        let merge = create_block_with_params(3, 2, Some(branch_a.hash()), vec![branch_b.hash()], 2);
         dag_store.store_block(merge.clone()).await.unwrap();
 
         let merge_score = ghostdag.calculate_blue_set(&merge).await.unwrap().score;
@@ -479,10 +467,7 @@ mod edge_cases {
         dag_store.store_block(merge.clone()).await.unwrap();
 
         // Should work without error
-        assert_eq!(
-            merge.header.merge_parent_hashes.len(),
-            max_parents - 1
-        );
+        assert_eq!(merge.header.merge_parent_hashes.len(), max_parents - 1);
     }
 
     /// Test conflicting tips with same hash prefix
@@ -610,7 +595,11 @@ mod stress_tests {
         let tips = dag_store.get_tips().await;
         // Allow for implementation variation in tip counting
         // (genesis might or might not be counted depending on implementation)
-        assert!(tips.len() >= num_tips as usize, "Should have at least {} tips", num_tips);
+        assert!(
+            tips.len() >= num_tips as usize,
+            "Should have at least {} tips",
+            num_tips
+        );
 
         // Tip selection should still work
         let tip_hashes: Vec<Hash> = tips.iter().map(|t| t.hash).collect();
@@ -669,11 +658,8 @@ mod stress_tests {
             for _ in 0..width {
                 // Each block picks a random parent from previous layer
                 let parent_idx = (block_id as usize) % prev_layer.len();
-                let block = create_simple_block(
-                    block_id,
-                    height as u64,
-                    Some(prev_layer[parent_idx]),
-                );
+                let block =
+                    create_simple_block(block_id, height as u64, Some(prev_layer[parent_idx]));
                 dag_store.store_block(block.clone()).await.unwrap();
                 current_layer.push(block.hash());
                 block_id = block_id.wrapping_add(1);

@@ -47,7 +47,7 @@ impl ModelCache {
             match cache.get_mut(model_id) {
                 Some(cached) => {
                     cached.last_accessed = chrono::Utc::now().timestamp() as u64;
-                    cached.access_count += 1;
+                    cached.access_count = cached.access_count.saturating_add(1);
                     Some(cached.model.clone())
                 }
                 None => None,
@@ -80,14 +80,17 @@ impl ModelCache {
         {
             let existing = self.cache.write().await.remove(&model_id);
             if let Some(old) = existing {
-                *self.current_size.write().await -= old.size;
+                {
+                    let mut size = self.current_size.write().await;
+                    *size = size.saturating_sub(old.size);
+                }
                 self.lru_queue.write().await.retain(|id| id != &model_id);
             }
         }
 
         // Evict models if necessary. `evict_lru` now reports whether it actually
         // evicted anything; if the queue is empty we stop rather than spin.
-        while *self.current_size.read().await + model_size > self.max_size {
+        while self.current_size.read().await.saturating_add(model_size) > self.max_size {
             if !self.evict_lru().await? {
                 break;
             }
@@ -103,7 +106,10 @@ impl ModelCache {
 
         self.cache.write().await.insert(model_id, cached);
         self.lru_queue.write().await.push_front(model_id);
-        *self.current_size.write().await += model_size;
+        {
+            let mut size = self.current_size.write().await;
+            *size = size.saturating_add(model_size);
+        }
 
         debug!(
             "Cached model {:?} (size: {} bytes)",
@@ -119,7 +125,10 @@ impl ModelCache {
         let mut cache = self.cache.write().await;
 
         if let Some(cached) = cache.remove(model_id) {
-            *self.current_size.write().await -= cached.size;
+            {
+                let mut size = self.current_size.write().await;
+                *size = size.saturating_sub(cached.size);
+            }
 
             // Remove from LRU queue
             let mut queue = self.lru_queue.write().await;
@@ -195,7 +204,10 @@ impl ModelCache {
 
         if let Some(model_id) = queue.pop_back() {
             if let Some(cached) = self.cache.write().await.remove(&model_id) {
-                *self.current_size.write().await -= cached.size;
+                {
+                    let mut size = self.current_size.write().await;
+                    *size = size.saturating_sub(cached.size);
+                }
 
                 debug!(
                     "Evicted model {:?} from cache (LRU)",
@@ -211,10 +223,10 @@ impl ModelCache {
     /// Calculate model size
     fn calculate_model_size(&self, model: &Model) -> u64 {
         let mut size = 0u64;
-        size += model.architecture.len() as u64;
-        size += model.weights.len() as u64;
-        size += model.metadata.len() as u64;
-        size += 32; // ModelId size
+        size = size.saturating_add(model.architecture.len() as u64);
+        size = size.saturating_add(model.weights.len() as u64);
+        size = size.saturating_add(model.metadata.len() as u64);
+        size = size.saturating_add(32); // ModelId size
         size
     }
 }
@@ -451,6 +463,9 @@ mod tests {
             stats.current_size, size_after_first,
             "re-inserting the same key must not drift current_size"
         );
-        assert_eq!(stats.total_models, 1, "re-insert must not duplicate the entry");
+        assert_eq!(
+            stats.total_models, 1,
+            "re-insert must not duplicate the entry"
+        );
     }
 }

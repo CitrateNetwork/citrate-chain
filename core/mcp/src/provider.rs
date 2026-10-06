@@ -142,7 +142,10 @@ impl ProviderRegistry {
         // Sort by score and select best
         candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        Ok(candidates[0].0)
+        candidates
+            .first()
+            .map(|c| c.0)
+            .ok_or_else(|| anyhow::anyhow!("No suitable providers available"))
     }
 
     /// Update provider reputation
@@ -157,25 +160,33 @@ impl ProviderRegistry {
             .get_mut(&provider)
             .ok_or_else(|| anyhow::anyhow!("Provider not found"))?;
 
-        score.total_jobs += 1;
+        score.total_jobs = score.total_jobs.saturating_add(1);
         if success {
-            score.successful_jobs += 1;
+            score.successful_jobs = score.successful_jobs.saturating_add(1);
         } else {
-            score.failed_jobs += 1;
+            score.failed_jobs = score.failed_jobs.saturating_add(1);
         }
 
         // Update average latency.
         // CHAIN-B-D017: compute in u128 to avoid the multiply overflowing (the
         // crate builds release with `overflow-checks = true`, so an
         // attacker-influenced `latency` would panic the node).
-        score.average_latency = ((score.average_latency as u128 * (score.total_jobs as u128 - 1)
-            + latency as u128)
-            / score.total_jobs as u128) as u64;
+        // total_jobs >= 1 here; u64 × u64 fits u128, so only the division can fail.
+        let jobs = score.total_jobs as u128;
+        score.average_latency = (score.average_latency as u128)
+            .saturating_mul(jobs.saturating_sub(1))
+            .saturating_add(latency as u128)
+            .checked_div(jobs)
+            .unwrap_or(latency as u128) as u64;
         score.last_active = chrono::Utc::now().timestamp() as u64;
 
         // Update provider info reputation
         if let Some(info) = self.providers.write().await.get_mut(&provider) {
-            info.reputation = score.successful_jobs * 100 / score.total_jobs;
+            info.reputation = score
+                .successful_jobs
+                .saturating_mul(100)
+                .checked_div(score.total_jobs)
+                .unwrap_or(0);
             info.total_executions = score.total_jobs;
         }
 
@@ -453,7 +464,10 @@ mod tests {
 
         // Register CPU-only provider
         let cpu_provider = create_test_provider(1, 32, 200);
-        registry.register_provider(cpu_provider.clone()).await.unwrap();
+        registry
+            .register_provider(cpu_provider.clone())
+            .await
+            .unwrap();
         registry
             .register_model_provider(cpu_provider.address, model_id)
             .await
@@ -473,7 +487,10 @@ mod tests {
 
         // Now register a GPU provider
         let gpu_provider = create_test_provider_with_gpu(2, 32, 200);
-        registry.register_provider(gpu_provider.clone()).await.unwrap();
+        registry
+            .register_provider(gpu_provider.clone())
+            .await
+            .unwrap();
         registry
             .register_model_provider(gpu_provider.address, model_id)
             .await
@@ -519,7 +536,10 @@ mod tests {
         registry.register_provider(provider).await.unwrap();
 
         // Successful job with 100ms latency
-        registry.update_reputation(address, true, 100).await.unwrap();
+        registry
+            .update_reputation(address, true, 100)
+            .await
+            .unwrap();
 
         let info = registry.get_provider(&address).await.unwrap();
         assert_eq!(info.total_executions, 1);
@@ -535,8 +555,14 @@ mod tests {
         registry.register_provider(provider).await.unwrap();
 
         // One success, one failure
-        registry.update_reputation(address, true, 100).await.unwrap();
-        registry.update_reputation(address, false, 200).await.unwrap();
+        registry
+            .update_reputation(address, true, 100)
+            .await
+            .unwrap();
+        registry
+            .update_reputation(address, false, 200)
+            .await
+            .unwrap();
 
         let info = registry.get_provider(&address).await.unwrap();
         assert_eq!(info.total_executions, 2);
@@ -574,8 +600,14 @@ mod tests {
             .unwrap();
 
         // Give provider2 good reputation
-        registry.update_reputation(provider2.address, true, 50).await.unwrap();
-        registry.update_reputation(provider2.address, true, 50).await.unwrap();
+        registry
+            .update_reputation(provider2.address, true, 50)
+            .await
+            .unwrap();
+        registry
+            .update_reputation(provider2.address, true, 50)
+            .await
+            .unwrap();
 
         let requirements = ComputeRequirements {
             min_memory: 1000,
@@ -585,7 +617,10 @@ mod tests {
         };
 
         // Should select provider with better score
-        let selected = registry.select_provider(&model_id, &requirements).await.unwrap();
+        let selected = registry
+            .select_provider(&model_id, &requirements)
+            .await
+            .unwrap();
         // Provider 2 should have higher score due to more capacity and good reputation
         assert_eq!(selected, provider2.address);
     }

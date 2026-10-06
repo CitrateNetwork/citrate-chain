@@ -6,10 +6,10 @@
 // family level with support for key rotation.
 
 use super::envelope::CryptoAgileEnvelope;
-use super::key_derivation::{DerivedKey, KeyDerivationParams, KeyPurpose, MasterKeyDerivation};
 use super::key_commitment::{KeyCommitment, KeyLifecycleManager, KeyRotationProof, RotationReason};
-use sha3::{Sha3_256, Digest};
+use super::key_derivation::{DerivedKey, KeyDerivationParams, KeyPurpose, MasterKeyDerivation};
 use serde::{Deserialize, Serialize};
+use sha3::{Digest, Sha3_256};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -124,7 +124,7 @@ pub struct EncryptedValue {
 impl EncryptedValue {
     /// Check if this value is encrypted (has QSSP header)
     pub fn is_encrypted(data: &[u8]) -> bool {
-        data.len() >= 4 && &data[0..4] == b"QSSP"
+        data.starts_with(b"QSSP")
     }
 
     /// Get the key version used for encryption
@@ -132,11 +132,7 @@ impl EncryptedValue {
         if !Self::is_encrypted(&self.data) {
             return None;
         }
-        if self.data.len() < 9 {
-            return None;
-        }
-        let mut buf = [0u8; 4];
-        buf.copy_from_slice(&self.data[5..9]);
+        let buf: [u8; 4] = self.data.get(5..9)?.try_into().ok()?;
         Some(u32::from_be_bytes(buf))
     }
 }
@@ -199,22 +195,33 @@ impl EncryptedDatabase {
         }
 
         // Derive master key
-        let master = self.kdf.derive_master_key(password)
+        let master = self
+            .kdf
+            .derive_master_key(password)
             .map_err(|_| DatabaseEncryptionError::KeyDerivationFailed)?;
 
         // Register with lifecycle manager
         {
             let mut lifecycle = self.lifecycle.write().unwrap_or_else(|e| e.into_inner());
-            lifecycle.register_key(master.key_bytes(), master.version, KeyPurpose::MasterKEK as u8);
+            lifecycle.register_key(
+                master.key_bytes(),
+                master.version,
+                KeyPurpose::MasterKEK as u8,
+            );
         }
 
         // Derive column family keys
         let mut column_keys = self.column_keys.write().unwrap_or_else(|e| e.into_inner());
         for (cf_name, enabled) in &self.config.encrypt_column_families {
             if *enabled {
-                let cf_key = self.kdf.derive_column_key(&master, cf_name)
+                let cf_key = self
+                    .kdf
+                    .derive_column_key(&master, cf_name)
                     .map_err(|_| DatabaseEncryptionError::KeyDerivationFailed)?;
-                column_keys.insert(cf_name.clone(), ColumnFamilyKey::new(cf_key, cf_name.clone()));
+                column_keys.insert(
+                    cf_name.clone(),
+                    ColumnFamilyKey::new(cf_key, cf_name.clone()),
+                );
             }
         }
 
@@ -232,22 +239,34 @@ impl EncryptedDatabase {
         if !self.is_enabled() {
             return false;
         }
-        self.config.encrypt_column_families
+        self.config
+            .encrypt_column_families
             .get(column_family)
             .copied()
             .unwrap_or(false)
     }
 
     /// Encrypt a value for storage
-    pub fn encrypt(&self, column_family: &str, key: &[u8], value: &[u8]) -> Result<EncryptedValue, DatabaseEncryptionError> {
+    pub fn encrypt(
+        &self,
+        column_family: &str,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<EncryptedValue, DatabaseEncryptionError> {
         if !self.should_encrypt(column_family) {
             // Return value as-is if encryption disabled for this CF
-            return Ok(EncryptedValue { data: value.to_vec() });
+            return Ok(EncryptedValue {
+                data: value.to_vec(),
+            });
         }
 
         let column_keys = self.column_keys.read().unwrap_or_else(|e| e.into_inner());
-        let cf_key = column_keys.get(column_family)
-            .ok_or(DatabaseEncryptionError::ColumnFamilyNotFound(column_family.to_string()))?;
+        let cf_key =
+            column_keys
+                .get(column_family)
+                .ok_or(DatabaseEncryptionError::ColumnFamilyNotFound(
+                    column_family.to_string(),
+                ))?;
 
         // Optionally compress before encryption
         let data_to_encrypt = if self.config.compress_before_encrypt {
@@ -261,38 +280,53 @@ impl EncryptedDatabase {
 
         // Encrypt using envelope
         let envelope = cf_key.envelope.read().unwrap_or_else(|e| e.into_inner());
-        let encrypted = envelope.encrypt(&data_to_encrypt, column_family)
+        let encrypted = envelope
+            .encrypt(&data_to_encrypt, column_family)
             .map_err(|e| DatabaseEncryptionError::EncryptionFailed(e.to_string()))?;
 
         // Update stats
         {
             let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
-            stats.total_encryptions += 1;
-            stats.bytes_encrypted += value.len() as u64;
+            stats.total_encryptions = stats.total_encryptions.saturating_add(1);
+            stats.bytes_encrypted = stats.bytes_encrypted.saturating_add(value.len() as u64);
         }
 
         Ok(EncryptedValue { data: encrypted })
     }
 
     /// Decrypt a value from storage
-    pub fn decrypt(&self, column_family: &str, _key: &[u8], encrypted: &[u8]) -> Result<DecryptedValue, DatabaseEncryptionError> {
+    pub fn decrypt(
+        &self,
+        column_family: &str,
+        _key: &[u8],
+        encrypted: &[u8],
+    ) -> Result<DecryptedValue, DatabaseEncryptionError> {
         // Check if this is actually encrypted
         if !EncryptedValue::is_encrypted(encrypted) {
             // Not encrypted, return as-is
-            return Ok(DecryptedValue { data: encrypted.to_vec() });
+            return Ok(DecryptedValue {
+                data: encrypted.to_vec(),
+            });
         }
 
         if !self.should_encrypt(column_family) {
-            return Ok(DecryptedValue { data: encrypted.to_vec() });
+            return Ok(DecryptedValue {
+                data: encrypted.to_vec(),
+            });
         }
 
         let column_keys = self.column_keys.read().unwrap_or_else(|e| e.into_inner());
-        let cf_key = column_keys.get(column_family)
-            .ok_or(DatabaseEncryptionError::ColumnFamilyNotFound(column_family.to_string()))?;
+        let cf_key =
+            column_keys
+                .get(column_family)
+                .ok_or(DatabaseEncryptionError::ColumnFamilyNotFound(
+                    column_family.to_string(),
+                ))?;
 
         // Decrypt using envelope
         let envelope = cf_key.envelope.read().unwrap_or_else(|e| e.into_inner());
-        let decrypted = envelope.decrypt(encrypted)
+        let decrypted = envelope
+            .decrypt(encrypted)
             .map_err(|e| DatabaseEncryptionError::DecryptionFailed(e.to_string()))?;
 
         // Decompress if needed
@@ -305,42 +339,57 @@ impl EncryptedDatabase {
         // Update stats
         {
             let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
-            stats.total_decryptions += 1;
-            stats.bytes_decrypted += data.len() as u64;
+            stats.total_decryptions = stats.total_decryptions.saturating_add(1);
+            stats.bytes_decrypted = stats.bytes_decrypted.saturating_add(data.len() as u64);
         }
 
         Ok(DecryptedValue { data })
     }
 
     /// Rotate keys for a column family
-    pub fn rotate_column_key(&self, column_family: &str, new_password: &[u8]) -> Result<KeyRotationProof, DatabaseEncryptionError> {
-        let master = self.master_key.as_ref()
+    pub fn rotate_column_key(
+        &self,
+        column_family: &str,
+        new_password: &[u8],
+    ) -> Result<KeyRotationProof, DatabaseEncryptionError> {
+        let master = self
+            .master_key
+            .as_ref()
             .ok_or(DatabaseEncryptionError::NotInitialized)?;
 
         // Derive new master key
-        let new_master = self.kdf.derive_master_key(new_password)
+        let new_master = self
+            .kdf
+            .derive_master_key(new_password)
             .map_err(|_| DatabaseEncryptionError::KeyDerivationFailed)?;
 
         // Derive new column key
-        let new_cf_key = self.kdf.derive_column_key(&new_master, column_family)
+        let new_cf_key = self
+            .kdf
+            .derive_column_key(&new_master, column_family)
             .map_err(|_| DatabaseEncryptionError::KeyDerivationFailed)?;
 
         // Create rotation proof
         let mut lifecycle = self.lifecycle.write().unwrap_or_else(|e| e.into_inner());
-        let (_, proof) = lifecycle.rotate_key(
-            master.key_bytes(),
-            new_cf_key.key_bytes(),
-            new_cf_key.version,
-            KeyPurpose::StateEncryption as u8,
-            RotationReason::Scheduled,
-        ).map_err(|_| DatabaseEncryptionError::RotationFailed)?;
+        let (_, proof) = lifecycle
+            .rotate_key(
+                master.key_bytes(),
+                new_cf_key.key_bytes(),
+                new_cf_key.version,
+                KeyPurpose::StateEncryption as u8,
+                RotationReason::Scheduled,
+            )
+            .map_err(|_| DatabaseEncryptionError::RotationFailed)?;
 
         // Update column key
         let mut column_keys = self.column_keys.write().unwrap_or_else(|e| e.into_inner());
         if let Some(cf_key) = column_keys.get(column_family) {
             cf_key.rotate(new_cf_key.clone());
         } else {
-            column_keys.insert(column_family.to_string(), ColumnFamilyKey::new(new_cf_key, column_family.to_string()));
+            column_keys.insert(
+                column_family.to_string(),
+                ColumnFamilyKey::new(new_cf_key, column_family.to_string()),
+            );
         }
 
         Ok(proof)
@@ -362,13 +411,18 @@ impl EncryptedDatabase {
     }
 
     /// Re-encrypt data with current key
-    pub fn reencrypt(&self, column_family: &str, key: &[u8], encrypted: &[u8]) -> Result<EncryptedValue, DatabaseEncryptionError> {
+    pub fn reencrypt(
+        &self,
+        column_family: &str,
+        key: &[u8],
+        encrypted: &[u8],
+    ) -> Result<EncryptedValue, DatabaseEncryptionError> {
         let decrypted = self.decrypt(column_family, key, encrypted)?;
         let reencrypted = self.encrypt(column_family, key, &decrypted.data)?;
 
         {
             let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
-            stats.reencryptions += 1;
+            stats.reencryptions = stats.reencryptions.saturating_add(1);
         }
 
         Ok(reencrypted)
@@ -400,7 +454,12 @@ impl EncryptedDatabase {
     // ==================== Internal Methods ====================
 
     fn build_aad(&self, column_family: &str, key: &[u8]) -> Vec<u8> {
-        let mut aad = Vec::with_capacity(column_family.len() + key.len() + 8);
+        let mut aad = Vec::with_capacity(
+            column_family
+                .len()
+                .saturating_add(key.len())
+                .saturating_add(8),
+        );
         aad.extend_from_slice(column_family.as_bytes());
         aad.push(0x00); // Separator
         aad.extend_from_slice(key);
@@ -419,12 +478,12 @@ impl EncryptedDatabase {
             .map_err(|e| DatabaseEncryptionError::CompressionFailed(e.to_string()))?;
 
         if compressed.len() < data.len() {
-            let mut result = Vec::with_capacity(compressed.len() + 1);
+            let mut result = Vec::with_capacity(compressed.len().saturating_add(1));
             result.push(0x02); // 0 = not compressed, 1 = LZ4 (unused), 2 = zstd
             result.extend_from_slice(&compressed);
             Ok(result)
         } else {
-            let mut result = Vec::with_capacity(data.len() + 1);
+            let mut result = Vec::with_capacity(data.len().saturating_add(1));
             result.push(0x00);
             result.extend_from_slice(data);
             Ok(result)
@@ -432,14 +491,12 @@ impl EncryptedDatabase {
     }
 
     fn decompress(&self, data: &[u8]) -> Result<Vec<u8>, DatabaseEncryptionError> {
-        if data.is_empty() {
+        let Some((&compression_type, body)) = data.split_first() else {
             return Ok(Vec::new());
-        }
-
-        let compression_type = data[0];
+        };
         match compression_type {
-            0x00 => Ok(data[1..].to_vec()), // Not compressed
-            0x02 => zstd::stream::decode_all(&data[1..])
+            0x00 => Ok(body.to_vec()), // Not compressed
+            0x02 => zstd::stream::decode_all(body)
                 .map_err(|e| DatabaseEncryptionError::CompressionFailed(e.to_string())),
             0x01 => Err(DatabaseEncryptionError::CompressionNotSupported(
                 "LZ4".to_string(),
@@ -510,7 +567,9 @@ mod tests {
     #[test]
     fn test_unencrypted_column_family() {
         let mut config = DatabaseEncryptionConfig::default();
-        config.encrypt_column_families.insert("dag_relations".to_string(), false);
+        config
+            .encrypt_column_families
+            .insert("dag_relations".to_string(), false);
 
         let mut db = EncryptedDatabase::new(config);
         db.initialize(b"password").unwrap();
@@ -562,11 +621,15 @@ mod tests {
         assert!(db.should_encrypt("models"));
 
         let model_weights = vec![0u8; 1024]; // Simulated model weights
-        let encrypted = db.encrypt("models", b"model:gpt-4", &model_weights).unwrap();
+        let encrypted = db
+            .encrypt("models", b"model:gpt-4", &model_weights)
+            .unwrap();
 
         assert!(EncryptedValue::is_encrypted(&encrypted.data));
 
-        let decrypted = db.decrypt("models", b"model:gpt-4", &encrypted.data).unwrap();
+        let decrypted = db
+            .decrypt("models", b"model:gpt-4", &encrypted.data)
+            .unwrap();
         assert_eq!(decrypted.data, model_weights);
     }
 }

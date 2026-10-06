@@ -98,9 +98,12 @@ impl<C: ChainAdapter> BlockWatcher<C> {
             }
         }
 
-        let from = hwm + 1;
+        let from = hwm.saturating_add(1);
         let to = chain_head;
-        debug!(from, to, "fetching learning events + new HWM hash in parallel");
+        debug!(
+            from,
+            to, "fetching learning events + new HWM hash in parallel"
+        );
 
         // WP-3.10: parallelize the two independent RPCs that the
         // watcher needs after the reorg check passes — fetching the
@@ -120,16 +123,14 @@ impl<C: ChainAdapter> BlockWatcher<C> {
         // Advance HWM atomically.
         self.state.set_last_processed_block(to)?;
         {
-            let mut cache = self.last_block_hash.lock().expect("lock");
+            let mut cache = self
+                .last_block_hash
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             *cache = Some((to, new_head_hash));
         }
 
-        info!(
-            from,
-            to,
-            event_count = events.len(),
-            "watcher advanced"
-        );
+        info!(from, to, event_count = events.len(), "watcher advanced");
 
         Ok(WatcherStep::Advanced {
             new_hwm: to,
@@ -140,13 +141,13 @@ impl<C: ChainAdapter> BlockWatcher<C> {
     /// Check whether the cached hash for `block_number` matches
     /// what the chain currently reports. Returns `Some(ReorgDetected)`
     /// if mismatched.
-    async fn detect_reorg(
-        &self,
-        block_number: BlockNumber,
-    ) -> DaemonResult<Option<WatcherStep>> {
+    async fn detect_reorg(&self, block_number: BlockNumber) -> DaemonResult<Option<WatcherStep>> {
         let chain_hash = self.chain.block_hash(block_number).await?;
         let cached = {
-            let cache = self.last_block_hash.lock().expect("lock");
+            let cache = self
+                .last_block_hash
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             *cache
         };
         if let Some((cached_n, cached_hash)) = cached {
@@ -177,7 +178,10 @@ impl<C: ChainAdapter> BlockWatcher<C> {
             return Ok(());
         }
         let hash = self.chain.block_hash(hwm).await?;
-        let mut cache = self.last_block_hash.lock().expect("lock");
+        let mut cache = self
+            .last_block_hash
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *cache = Some((hwm, hash));
         Ok(())
     }

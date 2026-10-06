@@ -51,22 +51,18 @@ fn bench_commit_throughput(c: &mut Criterion) {
 fn bench_sustained_commit(c: &mut Criterion) {
     let mut group = c.benchmark_group("sustained_commit");
     for &ntxs in &[100usize, 1000, 10_000] {
-        group.bench_with_input(
-            BenchmarkId::from_parameter(ntxs),
-            &ntxs,
-            |b, &ntxs| {
-                b.iter(|| {
-                    let coord = CommitCoordinator::new();
-                    let mut ws = WriteSet::new();
-                    ws.record_write(addr(1));
-                    ws.record_write(addr(2));
-                    for _ in 0..ntxs {
-                        let v = coord.commit_writes_serialized(black_box(&ws));
-                        black_box(v);
-                    }
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(ntxs), &ntxs, |b, &ntxs| {
+            b.iter(|| {
+                let coord = CommitCoordinator::new();
+                let mut ws = WriteSet::new();
+                ws.record_write(addr(1));
+                ws.record_write(addr(2));
+                for _ in 0..ntxs {
+                    let v = coord.commit_writes_serialized(black_box(&ws));
+                    black_box(v);
+                }
+            });
+        });
     }
     group.finish();
 }

@@ -4,7 +4,7 @@
 // The genesis block creation uses feature-gated model embedding (embed-genesis-model).
 // When the feature is disabled, embedded models will be empty (contributor builds).
 
-use citrate_consensus::types::{Block, BlockBuilder, GhostDagParams, Hash, PublicKey,  VrfProof};
+use citrate_consensus::types::{Block, BlockBuilder, GhostDagParams, Hash, PublicKey, VrfProof};
 
 /// Create a minimal test genesis block for unit tests
 /// This doesn't include embedded models - those are feature-gated in production code
@@ -32,9 +32,7 @@ fn create_test_genesis_block() -> Block {
         coinbase: [0u8; 20],
     };
 
-    BlockBuilder::new()
-        .header(header)
-        .build_unhashed()
+    BlockBuilder::new().header(header).build_unhashed()
 }
 
 #[test]
@@ -128,12 +126,15 @@ fn test_genesis_required_pins_format() {
     );
 
     // Verify must_pin flag defaults correctly
-    assert!(required_model.must_pin, "Required models should have must_pin = true");
+    assert!(
+        required_model.must_pin,
+        "Required models should have must_pin = true"
+    );
 }
 
 #[test]
 fn test_embedded_model_structure() {
-    use citrate_consensus::types::{EmbeddedModel, Hash, ModelMetadata, ModelType, ModelId};
+    use citrate_consensus::types::{EmbeddedModel, Hash, ModelId, ModelMetadata, ModelType};
 
     // Post-WP-B (2026-04-21): EmbeddedModel carries a 32-byte sha256
     // commitment (`weights_sha256`), not raw `Vec<u8>` weights. See

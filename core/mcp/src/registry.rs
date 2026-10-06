@@ -155,11 +155,9 @@ impl ModelRegistry {
 
         // Select provider (simple round-robin for now)
         let providers = self.get_providers(&model_id).await?;
-        if providers.is_empty() {
+        let Some(&provider) = providers.first() else {
             return Err(anyhow::anyhow!("No providers available"));
-        }
-
-        let provider = providers[0]; // Simple selection
+        }; // Simple selection
 
         // Generate request ID
         let request_id = self.generate_request_id(&model_id, &input_hash);
@@ -203,7 +201,7 @@ impl ModelRegistry {
         // Update model statistics if completed
         if let RequestStatus::Completed(_) = request.status {
             if let Some(record) = self.models.write().await.get_mut(&request.model_id) {
-                record.total_executions += 1;
+                record.total_executions = record.total_executions.saturating_add(1);
             }
         }
 
@@ -244,9 +242,7 @@ impl ModelRegistry {
         hasher.update(input_hash.as_bytes());
         hasher.update(chrono::Utc::now().timestamp().to_le_bytes());
 
-        let hash = hasher.finalize();
-        let mut id = [0u8; 32];
-        id.copy_from_slice(&hash[..32]);
+        let id: [u8; 32] = hasher.finalize().into();
 
         RequestId(id)
     }

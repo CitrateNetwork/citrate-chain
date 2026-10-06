@@ -499,7 +499,8 @@ mod tests {
         let code = vec![0x60, 0x00, 0x60, 0x00];
         j.record_code(addr(1), code.clone());
         assert_eq!(
-            j.pending_write(&addr(1)).and_then(|pw| pw.new_code.as_ref()),
+            j.pending_write(&addr(1))
+                .and_then(|pw| pw.new_code.as_ref()),
             Some(&code)
         );
     }

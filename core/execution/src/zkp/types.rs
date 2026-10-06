@@ -71,7 +71,6 @@ impl PublicInputsProducer for GradientProofCircuit {
     }
 }
 
-
 /// Serializable proof wrapper
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SerializableProof {

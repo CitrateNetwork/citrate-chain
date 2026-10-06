@@ -207,10 +207,8 @@ impl ContributionRecorder {
 
 /// Compute the 4-byte function selector (keccak256 of canonical signature).
 fn function_selector(sig: &str) -> [u8; 4] {
-    let hash = Keccak256::digest(sig.as_bytes());
-    let mut sel = [0u8; 4];
-    sel.copy_from_slice(&hash[..4]);
-    sel
+    let [a, b, c, d, ..]: [u8; 32] = Keccak256::digest(sig.as_bytes()).into();
+    [a, b, c, d]
 }
 
 #[cfg(test)]

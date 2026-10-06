@@ -70,11 +70,8 @@ fn bench_argon2_within_envelope() {
             let path = fresh_keystore();
             let km = KeyManager::new(&path);
             let start = Instant::now();
-            km.create_account(
-                "envelope-test-password-12345",
-                &format!("sample{}", i),
-            )
-            .expect("envelope create_account");
+            km.create_account("envelope-test-password-12345", &format!("sample{}", i))
+                .expect("envelope create_account");
             start.elapsed().as_millis()
         })
         .collect();

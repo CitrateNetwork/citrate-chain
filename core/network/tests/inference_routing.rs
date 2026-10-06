@@ -6,12 +6,14 @@
 
 use async_trait::async_trait;
 use citrate_consensus::types::Hash;
-use citrate_network::ai_handler::{AINetworkHandler, NetworkInferenceExecutor, NetworkInferenceResult};
+use citrate_network::ai_handler::{
+    AINetworkHandler, NetworkInferenceExecutor, NetworkInferenceResult,
+};
 use citrate_network::peer::{PeerId, PeerManager, PeerManagerConfig};
 use citrate_network::protocol::{ModelMetadata, NetworkMessage};
+use citrate_storage::pruning::PruningConfig;
 use citrate_storage::state_manager::StateManager;
 use citrate_storage::StorageManager;
-use citrate_storage::pruning::PruningConfig;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -68,9 +70,7 @@ impl NetworkInferenceExecutor for MockExecutor {
 /// Build an AINetworkHandler backed by in-memory storage.
 fn make_handler(executor: Option<Arc<dyn NetworkInferenceExecutor>>) -> AINetworkHandler {
     let temp_dir = tempfile::TempDir::new().unwrap();
-    let storage = Arc::new(
-        StorageManager::new(temp_dir.path(), PruningConfig::default()).unwrap(),
-    );
+    let storage = Arc::new(StorageManager::new(temp_dir.path(), PruningConfig::default()).unwrap());
     let state_manager = Arc::new(StateManager::new(storage.db.clone()));
     let peer_manager = Arc::new(PeerManager::new(PeerManagerConfig::default()));
     let mut handler = AINetworkHandler::new(state_manager, peer_manager);
@@ -184,10 +184,7 @@ async fn test_inference_routes_to_correct_model() {
     };
 
     let resp = handler.handle_message(&peer, &request_a).await.unwrap();
-    assert!(
-        resp.is_some(),
-        "Should route inference to model A"
-    );
+    assert!(resp.is_some(), "Should route inference to model A");
     match resp.unwrap() {
         NetworkMessage::InferenceResponse { request_id, .. } => {
             assert_eq!(request_id, Hash::new([100u8; 32]));
@@ -205,10 +202,7 @@ async fn test_inference_routes_to_correct_model() {
     };
 
     let resp = handler.handle_message(&peer, &request_b).await.unwrap();
-    assert!(
-        resp.is_some(),
-        "Should route inference to model B"
-    );
+    assert!(resp.is_some(), "Should route inference to model B");
     match resp.unwrap() {
         NetworkMessage::InferenceResponse { request_id, .. } => {
             assert_eq!(request_id, Hash::new([101u8; 32]));
@@ -337,10 +331,7 @@ async fn test_response_includes_proof_of_computation() {
                 "Output hash should be non-default"
             );
             // Provider should be non-empty
-            assert!(
-                !provider.is_empty(),
-                "Provider field should be populated"
-            );
+            assert!(!provider.is_empty(), "Provider field should be populated");
         }
         other => panic!("Expected InferenceResponse, got {:?}", other),
     }
@@ -378,10 +369,7 @@ async fn test_no_executor_returns_none() {
     };
 
     let response = handler.handle_message(&peer, &request).await.unwrap();
-    assert!(
-        response.is_none(),
-        "Without executor, should return None"
-    );
+    assert!(response.is_none(), "Without executor, should return None");
 }
 
 // ---------------------------------------------------------------------------

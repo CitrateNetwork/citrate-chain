@@ -15,7 +15,7 @@
 #
 # Usage:
 #   scripts/ci/local-ci.sh              # everything (default)
-#   scripts/ci/local-ci.sh --fast       # fmt + clippy + unwrap ratchet only
+#   scripts/ci/local-ci.sh --fast       # fmt + clippy + panic ratchet + tripwires
 #   scripts/ci/local-ci.sh --no-forge   # skip solidity (no forge installed)
 #   scripts/ci/local-ci.sh --list       # show the gates and exit
 #
@@ -34,7 +34,7 @@ while [ $# -gt 0 ]; do
     --fast) FAST=1; shift ;;
     --no-forge) NO_FORGE=1; shift ;;
     --list)
-      echo "gates: fmt-changed, clippy, unwrap-ratchet, consensus-tripwires, test-workspace, forge-build, forge-test"
+      echo "gates: fmt-changed, clippy, panic-ratchet, consensus-tripwires, test-workspace, forge-build, forge-test"
       exit 0 ;;
     -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 1 ;;
@@ -119,34 +119,26 @@ gate "clippy" cargo clippy --workspace --all-targets -- -D warnings
 # gate does not re-pay a 5-minute build only to report the same breakage.
 [ "${RESULTS[-1]}" = "FAIL" ] && COMPILE_BROKEN=1
 
-# ── gate: .unwrap() ratchet ─────────────────────────────────────────────────
-# CLAUDE.md: "Zero .unwrap() in production AND test code". The tree is not at
-# zero today, so a hard gate would fail every run and be ignored within a day.
-# Ratchet instead: the count may never INCREASE. The baseline is committed, so
-# tightening it is a deliberate act.
-unwrap_ratchet() {
-  local baseline_file="scripts/ci/unwrap-baseline.txt"
-  local count
-  count=$(grep -rn '\.unwrap()' --include='*.rs' core node cli 2>/dev/null \
-            | grep -v 'unwrap_or' | wc -l | tr -d ' ')
-  if [ ! -f "$baseline_file" ]; then
-    echo "$count" > "$baseline_file"
-    echo "baseline created: $count"
-    return 0
-  fi
-  local baseline; baseline=$(tr -d ' \n' < "$baseline_file")
-  echo "current=$count baseline=$baseline"
-  if [ "$count" -gt "$baseline" ]; then
-    echo "error: .unwrap() count rose $baseline -> $count. Use ? or .expect(\"context\")."
-    return 1
-  fi
-  if [ "$count" -lt "$baseline" ]; then
-    echo "$count" > "$baseline_file"
-    echo "ratchet tightened to $count — commit scripts/ci/unwrap-baseline.txt"
-  fi
-  return 0
+# ── gate: production panic ratchet (PANIC-S1 G1) ────────────────────────────
+# Replaces the old `.unwrap()` grep ratchet. That one counted test code (3,803
+# of its 3,804 hits were in #[cfg(test)] / tests/), so it blocked pushes over test
+# hygiene while measuring none of the real risk: production had ZERO unwraps, but
+# 2,293 other ways to panic. This gate counts what can actually take a node down:
+# clippy's panic lints over production targets only (--lib --bins), including
+# unchecked indexing and arithmetic (release has overflow-checks = true). No
+# (crate, lint) count may rise above scripts/ci/panic-baseline.json; decreases
+# tighten the baseline. See citrate-federation PANIC-S1 sprint.
+panic_ratchet() {
+  local cur; cur="$(mktemp)"
+  scripts/ci/panic-inventory.sh --summary "$cur" || { rm -f "$cur"; return 1; }
+  python3 scripts/ci/panic_ratchet.py scripts/ci/panic-baseline.json "$cur"
+  local rc=$?; rm -f "$cur"; return $rc
 }
-gate "unwrap-ratchet" unwrap_ratchet
+if [ "$COMPILE_BROKEN" -eq 1 ]; then
+  skip "panic-ratchet" "clippy failed to compile — fix that first"
+else
+  gate "panic-ratchet" panic_ratchet
+fi
 
 # ── gate: consensus tripwires (source-level regression fences) ──────────────
 # Each tripwire is a cheap source scan that fences a specific consensus bug CLASS
@@ -158,6 +150,9 @@ consensus_tripwires() {
   for t in \
     "scripts/ci/fork_choice_add_block_parity_tripwire.sh" \
     "scripts/ci/check_pba_exec_tripwires.sh" \
+    "scripts/ci/panic_invariant_tripwire.sh" \
+    "scripts/ci/double_lock_tripwire.sh" \
+    "scripts/ci/prod_assert_ratchet.sh" \
   ; do
     if [ ! -x "$t" ]; then
       echo "missing/!executable tripwire: $t"; rc=1; continue

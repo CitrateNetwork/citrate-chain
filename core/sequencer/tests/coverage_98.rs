@@ -6,11 +6,11 @@
 // validate_state combined, rate limit boundaries, block_builder classify.
 
 use citrate_consensus::types::{Hash, PublicKey, Signature, Transaction};
-use citrate_sequencer::{Mempool, MempoolConfig, TxClass};
 use citrate_sequencer::validator::{
     AccountState, MockStateProvider, StateProvider, TxValidator, ValidationError,
     ValidationPipeline, ValidationRules,
 };
+use citrate_sequencer::{Mempool, MempoolConfig, TxClass};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -76,8 +76,13 @@ fn test_txclass_priority_multipliers() {
 #[test]
 fn test_txclass_system_highest_priority() {
     let classes = [
-        TxClass::Standard, TxClass::Storage, TxClass::Inference,
-        TxClass::Training, TxClass::Compute, TxClass::ModelUpdate, TxClass::System,
+        TxClass::Standard,
+        TxClass::Storage,
+        TxClass::Inference,
+        TxClass::Training,
+        TxClass::Compute,
+        TxClass::ModelUpdate,
+        TxClass::System,
     ];
     for &class in &classes[..6] {
         assert!(TxClass::System.priority_multiplier() > class.priority_multiplier());
@@ -95,7 +100,10 @@ async fn test_reconcile_nonces_after_removal() {
     // Add transactions from same sender at nonces 0, 1, 2
     for i in 0..3 {
         let tx = test_tx(i, 2_000_000_000, 10);
-        mempool.add_transaction(tx, TxClass::Standard).await.unwrap();
+        mempool
+            .add_transaction(tx, TxClass::Standard)
+            .await
+            .unwrap();
     }
 
     // Remove the middle transaction (nonce 1)
@@ -116,7 +124,10 @@ async fn test_reconcile_nonces_removes_stale_senders() {
 
     // Add 1 tx from sender 10
     let tx = test_tx(0, 2_000_000_000, 10);
-    mempool.add_transaction(tx.clone(), TxClass::Standard).await.unwrap();
+    mempool
+        .add_transaction(tx.clone(), TxClass::Standard)
+        .await
+        .unwrap();
 
     // Remove it
     mempool.remove_transaction(&tx.hash).await;
@@ -135,8 +146,14 @@ async fn test_rollback_nonce_tip_removal() {
     // Add nonces 0, 1
     let tx0 = test_tx(0, 2_000_000_000, 10);
     let tx1 = test_tx(1, 2_000_000_000, 10);
-    mempool.add_transaction(tx0, TxClass::Standard).await.unwrap();
-    mempool.add_transaction(tx1.clone(), TxClass::Standard).await.unwrap();
+    mempool
+        .add_transaction(tx0, TxClass::Standard)
+        .await
+        .unwrap();
+    mempool
+        .add_transaction(tx1.clone(), TxClass::Standard)
+        .await
+        .unwrap();
 
     // Remove tip (nonce 1) — nonce should roll back to 1
     mempool.remove_transaction(&tx1.hash).await;
@@ -159,8 +176,14 @@ async fn test_evict_lowest_priority() {
     // Add 2 txs (fills up)
     let tx_low = test_tx(0, 1_000_000_000, 10);
     let tx_high = test_tx(0, 5_000_000_000, 20);
-    mempool.add_transaction(tx_low.clone(), TxClass::Standard).await.unwrap();
-    mempool.add_transaction(tx_high.clone(), TxClass::Standard).await.unwrap();
+    mempool
+        .add_transaction(tx_low.clone(), TxClass::Standard)
+        .await
+        .unwrap();
+    mempool
+        .add_transaction(tx_high.clone(), TxClass::Standard)
+        .await
+        .unwrap();
 
     // Add a 3rd → should evict the lowest priority
     let tx_new = test_tx(0, 3_000_000_000, 30);
@@ -183,9 +206,18 @@ async fn test_get_best_transactions_multi_sender() {
     // Sender B: nonce 0 (higher gas price)
     let tx_b0 = test_tx(0, 5_000_000_000, 20);
 
-    mempool.add_transaction(tx_a0, TxClass::Standard).await.unwrap();
-    mempool.add_transaction(tx_a1, TxClass::Standard).await.unwrap();
-    mempool.add_transaction(tx_b0, TxClass::Standard).await.unwrap();
+    mempool
+        .add_transaction(tx_a0, TxClass::Standard)
+        .await
+        .unwrap();
+    mempool
+        .add_transaction(tx_a1, TxClass::Standard)
+        .await
+        .unwrap();
+    mempool
+        .add_transaction(tx_b0, TxClass::Standard)
+        .await
+        .unwrap();
 
     let best = mempool.get_best_transactions(10, 1_000_000).await;
     assert_eq!(best.len(), 3);
@@ -197,7 +229,10 @@ async fn test_get_best_transactions_respects_max_count() {
 
     for i in 0..5 {
         let tx = test_tx(i, 2_000_000_000, 10);
-        mempool.add_transaction(tx, TxClass::Standard).await.unwrap();
+        mempool
+            .add_transaction(tx, TxClass::Standard)
+            .await
+            .unwrap();
     }
 
     let best = mempool.get_best_transactions(2, 1_000_000).await;
@@ -210,7 +245,10 @@ async fn test_get_best_transactions_respects_max_size() {
 
     // Add a tx
     let tx = test_tx(0, 2_000_000_000, 10);
-    mempool.add_transaction(tx, TxClass::Standard).await.unwrap();
+    mempool
+        .add_transaction(tx, TxClass::Standard)
+        .await
+        .unwrap();
 
     // Very small max_size → should get 0 or limited txs
     let best = mempool.get_best_transactions(10, 1).await;
@@ -222,7 +260,10 @@ async fn test_mempool_duplicate_rejected() {
     let mempool = Mempool::new(relaxed_config());
 
     let tx = test_tx(0, 2_000_000_000, 10);
-    mempool.add_transaction(tx.clone(), TxClass::Standard).await.unwrap();
+    mempool
+        .add_transaction(tx.clone(), TxClass::Standard)
+        .await
+        .unwrap();
 
     let result = mempool.add_transaction(tx, TxClass::Standard).await;
     assert!(result.is_err());
@@ -241,8 +282,14 @@ async fn test_mempool_sender_limit() {
     let tx1 = test_tx(1, 2_000_000_000, 10);
     let tx2 = test_tx(2, 2_000_000_000, 10);
 
-    mempool.add_transaction(tx0, TxClass::Standard).await.unwrap();
-    mempool.add_transaction(tx1, TxClass::Standard).await.unwrap();
+    mempool
+        .add_transaction(tx0, TxClass::Standard)
+        .await
+        .unwrap();
+    mempool
+        .add_transaction(tx1, TxClass::Standard)
+        .await
+        .unwrap();
 
     let result = mempool.add_transaction(tx2, TxClass::Standard).await;
     assert!(result.is_err());
@@ -285,7 +332,10 @@ async fn test_mempool_nonce_too_low() {
 
     // Add nonce 0 first
     let tx0 = test_tx(0, 2_000_000_000, 10);
-    mempool.add_transaction(tx0, TxClass::Standard).await.unwrap();
+    mempool
+        .add_transaction(tx0, TxClass::Standard)
+        .await
+        .unwrap();
 
     // Try adding nonce 0 again (different hash but same sender+nonce)
     let mut tx0_dup = test_tx(0, 3_000_000_000, 10);
@@ -301,10 +351,16 @@ async fn test_mempool_get_transaction() {
 
     let tx = test_tx(0, 2_000_000_000, 10);
     let hash = tx.hash;
-    mempool.add_transaction(tx, TxClass::Standard).await.unwrap();
+    mempool
+        .add_transaction(tx, TxClass::Standard)
+        .await
+        .unwrap();
 
     assert!(mempool.get_transaction(&hash).await.is_some());
-    assert!(mempool.get_transaction(&Hash::new([99; 32])).await.is_none());
+    assert!(mempool
+        .get_transaction(&Hash::new([99; 32]))
+        .await
+        .is_none());
 }
 
 #[tokio::test]
@@ -313,7 +369,10 @@ async fn test_mempool_contains() {
 
     let tx = test_tx(0, 2_000_000_000, 10);
     let hash = tx.hash;
-    mempool.add_transaction(tx, TxClass::Standard).await.unwrap();
+    mempool
+        .add_transaction(tx, TxClass::Standard)
+        .await
+        .unwrap();
 
     assert!(mempool.contains(&hash).await);
     assert!(!mempool.contains(&Hash::new([99; 32])).await);
@@ -336,8 +395,14 @@ async fn test_mempool_stats_by_class() {
 
     let tx1 = test_tx(0, 2_000_000_000, 10);
     let tx2 = test_tx(0, 3_000_000_000, 20);
-    mempool.add_transaction(tx1, TxClass::Standard).await.unwrap();
-    mempool.add_transaction(tx2, TxClass::Compute).await.unwrap();
+    mempool
+        .add_transaction(tx1, TxClass::Standard)
+        .await
+        .unwrap();
+    mempool
+        .add_transaction(tx2, TxClass::Compute)
+        .await
+        .unwrap();
 
     let stats = mempool.stats().await;
     assert_eq!(stats.unique_senders, 2);
@@ -350,7 +415,10 @@ async fn test_mempool_ai_transactions() {
 
     // Regular tx
     let tx1 = test_tx(0, 2_000_000_000, 10);
-    mempool.add_transaction(tx1, TxClass::Standard).await.unwrap();
+    mempool
+        .add_transaction(tx1, TxClass::Standard)
+        .await
+        .unwrap();
 
     // No AI transactions initially
     let ai_txs = mempool.get_ai_transactions(10).await;
@@ -370,13 +438,19 @@ async fn test_validator_unblacklist() {
     validator.blacklist_address(addr).await;
 
     let tx = Transaction {
-        from: addr, gas_price: 1_000_000_000, gas_limit: 21000,
-        signature: Signature::new([1; 64]), ..Default::default()
+        from: addr,
+        gas_price: 1_000_000_000,
+        gas_limit: 21000,
+        signature: Signature::new([1; 64]),
+        ..Default::default()
     };
 
     // Should be rejected while blacklisted
     let result = validator.validate(&tx).await;
-    assert!(matches!(result, Err(ValidationError::BlacklistedAddress(_))));
+    assert!(matches!(
+        result,
+        Err(ValidationError::BlacklistedAddress(_))
+    ));
 
     // Unblacklist
     validator.unblacklist_address(&addr).await;
@@ -392,7 +466,9 @@ async fn test_validator_state_both_balance_and_nonce() {
     let addr = PublicKey::new([1; 32]);
     // gas cost = 21000 * 1_000_000_000 = 21_000_000_000_000
     let gas_cost: u128 = 21_000 * 1_000_000_000;
-    state.set_account(addr, AccountState::new(gas_cost + 1000, 5)).await;
+    state
+        .set_account(addr, AccountState::new(gas_cost + 1000, 5))
+        .await;
 
     let rules = ValidationRules {
         verify_signatures: false,
@@ -404,15 +480,25 @@ async fn test_validator_state_both_balance_and_nonce() {
 
     // Correct nonce, sufficient balance
     let tx_ok = Transaction {
-        from: addr, nonce: 5, gas_price: 1_000_000_000, gas_limit: 21000,
-        value: 100, signature: Signature::new([1; 64]), ..Default::default()
+        from: addr,
+        nonce: 5,
+        gas_price: 1_000_000_000,
+        gas_limit: 21000,
+        value: 100,
+        signature: Signature::new([1; 64]),
+        ..Default::default()
     };
     assert!(validator.validate(&tx_ok).await.is_ok());
 
     // Wrong nonce
     let tx_bad_nonce = Transaction {
-        from: addr, nonce: 3, gas_price: 1_000_000_000, gas_limit: 21000,
-        value: 100, signature: Signature::new([1; 64]), ..Default::default()
+        from: addr,
+        nonce: 3,
+        gas_price: 1_000_000_000,
+        gas_limit: 21000,
+        value: 100,
+        signature: Signature::new([1; 64]),
+        ..Default::default()
     };
     assert!(matches!(
         validator.validate(&tx_bad_nonce).await,
@@ -421,8 +507,13 @@ async fn test_validator_state_both_balance_and_nonce() {
 
     // Insufficient balance (huge value)
     let tx_bad_bal = Transaction {
-        from: addr, nonce: 5, gas_price: 1_000_000_000, gas_limit: 21000,
-        value: gas_cost + 999_999, signature: Signature::new([1; 64]), ..Default::default()
+        from: addr,
+        nonce: 5,
+        gas_price: 1_000_000_000,
+        gas_limit: 21000,
+        value: gas_cost + 999_999,
+        signature: Signature::new([1; 64]),
+        ..Default::default()
     };
     assert!(matches!(
         validator.validate(&tx_bad_bal).await,
@@ -445,8 +536,12 @@ async fn test_validator_new_account_zero_state() {
 
     // Nonce 0, zero value, should still fail due to gas cost > 0
     let tx = Transaction {
-        from: PublicKey::new([1; 32]), nonce: 0, gas_price: 1_000_000_000,
-        gas_limit: 21000, value: 0, signature: Signature::new([1; 64]),
+        from: PublicKey::new([1; 32]),
+        nonce: 0,
+        gas_price: 1_000_000_000,
+        gas_limit: 21000,
+        value: 0,
+        signature: Signature::new([1; 64]),
         ..Default::default()
     };
     assert!(matches!(
@@ -461,9 +556,11 @@ async fn test_validator_gas_limit_too_high() {
     let validator = TxValidator::new(relaxed_rules(), state);
 
     let tx = Transaction {
-        from: PublicKey::new([1; 32]), gas_price: 1_000_000_000,
+        from: PublicKey::new([1; 32]),
+        gas_price: 1_000_000_000,
         gas_limit: 100_000_000, // Way above max 10M
-        signature: Signature::new([1; 64]), ..Default::default()
+        signature: Signature::new([1; 64]),
+        ..Default::default()
     };
     assert!(matches!(
         validator.validate(&tx).await,
@@ -477,9 +574,12 @@ async fn test_validator_data_too_large() {
     let validator = TxValidator::new(relaxed_rules(), state);
 
     let tx = Transaction {
-        from: PublicKey::new([1; 32]), gas_price: 1_000_000_000,
-        gas_limit: 21000, data: vec![0u8; 256 * 1024], // 256KB > 128KB max
-        signature: Signature::new([1; 64]), ..Default::default()
+        from: PublicKey::new([1; 32]),
+        gas_price: 1_000_000_000,
+        gas_limit: 21000,
+        data: vec![0u8; 256 * 1024], // 256KB > 128KB max
+        signature: Signature::new([1; 64]),
+        ..Default::default()
     };
     assert!(matches!(
         validator.validate(&tx).await,
@@ -493,8 +593,10 @@ async fn test_validator_gas_price_too_low() {
     let validator = TxValidator::new(relaxed_rules(), state);
 
     let tx = Transaction {
-        from: PublicKey::new([1; 32]), gas_price: 100, // Way below 1 gwei
-        gas_limit: 21000, signature: Signature::new([1; 64]),
+        from: PublicKey::new([1; 32]),
+        gas_price: 100, // Way below 1 gwei
+        gas_limit: 21000,
+        signature: Signature::new([1; 64]),
         ..Default::default()
     };
     assert!(matches!(
@@ -521,8 +623,11 @@ async fn test_validator_rate_limit_exceeded() {
     for i in 0..2 {
         let tx = Transaction {
             hash: Hash::new([i as u8; 32]),
-            from: addr, gas_price: 1_000_000_000, gas_limit: 21000,
-            signature: Signature::new([1; 64]), ..Default::default()
+            from: addr,
+            gas_price: 1_000_000_000,
+            gas_limit: 21000,
+            signature: Signature::new([1; 64]),
+            ..Default::default()
         };
         assert!(validator.validate(&tx).await.is_ok());
     }
@@ -530,8 +635,11 @@ async fn test_validator_rate_limit_exceeded() {
     // 3rd should be rate limited
     let tx3 = Transaction {
         hash: Hash::new([99; 32]),
-        from: addr, gas_price: 1_000_000_000, gas_limit: 21000,
-        signature: Signature::new([1; 64]), ..Default::default()
+        from: addr,
+        gas_price: 1_000_000_000,
+        gas_limit: 21000,
+        signature: Signature::new([1; 64]),
+        ..Default::default()
     };
     assert!(matches!(
         validator.validate(&tx3).await,
@@ -547,14 +655,18 @@ async fn test_validator_batch_validation() {
     let txs = vec![
         Transaction {
             hash: Hash::new([1; 32]),
-            from: PublicKey::new([1; 32]), gas_price: 1_000_000_000,
-            gas_limit: 21000, signature: Signature::new([1; 64]),
+            from: PublicKey::new([1; 32]),
+            gas_price: 1_000_000_000,
+            gas_limit: 21000,
+            signature: Signature::new([1; 64]),
             ..Default::default()
         },
         Transaction {
             hash: Hash::new([2; 32]),
-            from: PublicKey::new([2; 32]), gas_price: 100, // Too low
-            gas_limit: 21000, signature: Signature::new([1; 64]),
+            from: PublicKey::new([2; 32]),
+            gas_price: 100, // Too low
+            gas_limit: 21000,
+            signature: Signature::new([1; 64]),
             ..Default::default()
         },
     ];
@@ -574,20 +686,26 @@ async fn test_validation_pipeline_parallel() {
     let txs = vec![
         Transaction {
             hash: Hash::new([1; 32]),
-            from: PublicKey::new([1; 32]), gas_price: 1_000_000_000,
-            gas_limit: 21000, signature: Signature::new([1; 64]),
+            from: PublicKey::new([1; 32]),
+            gas_price: 1_000_000_000,
+            gas_limit: 21000,
+            signature: Signature::new([1; 64]),
             ..Default::default()
         },
         Transaction {
             hash: Hash::new([2; 32]),
-            from: PublicKey::new([2; 32]), gas_price: 100, // Invalid
-            gas_limit: 21000, signature: Signature::new([1; 64]),
+            from: PublicKey::new([2; 32]),
+            gas_price: 100, // Invalid
+            gas_limit: 21000,
+            signature: Signature::new([1; 64]),
             ..Default::default()
         },
         Transaction {
             hash: Hash::new([3; 32]),
-            from: PublicKey::new([3; 32]), gas_price: 2_000_000_000,
-            gas_limit: 21000, signature: Signature::new([1; 64]),
+            from: PublicKey::new([3; 32]),
+            gas_price: 2_000_000_000,
+            gas_limit: 21000,
+            signature: Signature::new([1; 64]),
             ..Default::default()
         },
     ];
@@ -601,7 +719,9 @@ async fn test_validation_pipeline_parallel() {
 async fn test_validator_exact_boundary_gas_limit() {
     let state = Arc::new(MockStateProvider::new());
     let rules = ValidationRules {
-        verify_signatures: false, check_balance: false, check_nonce: false,
+        verify_signatures: false,
+        check_balance: false,
+        check_nonce: false,
         max_gas_limit: 10_000_000,
         ..Default::default()
     };
@@ -609,16 +729,20 @@ async fn test_validator_exact_boundary_gas_limit() {
 
     // Exactly at limit → ok
     let tx_exact = Transaction {
-        from: PublicKey::new([1; 32]), gas_price: 1_000_000_000,
-        gas_limit: 10_000_000, signature: Signature::new([1; 64]),
+        from: PublicKey::new([1; 32]),
+        gas_price: 1_000_000_000,
+        gas_limit: 10_000_000,
+        signature: Signature::new([1; 64]),
         ..Default::default()
     };
     assert!(validator.validate(&tx_exact).await.is_ok());
 
     // One over → fail
     let tx_over = Transaction {
-        from: PublicKey::new([1; 32]), gas_price: 1_000_000_000,
-        gas_limit: 10_000_001, signature: Signature::new([1; 64]),
+        from: PublicKey::new([1; 32]),
+        gas_price: 1_000_000_000,
+        gas_limit: 10_000_001,
+        signature: Signature::new([1; 64]),
         ..Default::default()
     };
     assert!(matches!(
@@ -631,7 +755,9 @@ async fn test_validator_exact_boundary_gas_limit() {
 async fn test_validator_exact_boundary_data_size() {
     let state = Arc::new(MockStateProvider::new());
     let rules = ValidationRules {
-        verify_signatures: false, check_balance: false, check_nonce: false,
+        verify_signatures: false,
+        check_balance: false,
+        check_nonce: false,
         max_data_size: 128 * 1024,
         ..Default::default()
     };
@@ -639,17 +765,23 @@ async fn test_validator_exact_boundary_data_size() {
 
     // Exactly at limit → ok
     let tx_exact = Transaction {
-        from: PublicKey::new([1; 32]), gas_price: 1_000_000_000,
-        gas_limit: 21000, data: vec![0u8; 128 * 1024],
-        signature: Signature::new([1; 64]), ..Default::default()
+        from: PublicKey::new([1; 32]),
+        gas_price: 1_000_000_000,
+        gas_limit: 21000,
+        data: vec![0u8; 128 * 1024],
+        signature: Signature::new([1; 64]),
+        ..Default::default()
     };
     assert!(validator.validate(&tx_exact).await.is_ok());
 
     // One byte over → fail
     let tx_over = Transaction {
-        from: PublicKey::new([1; 32]), gas_price: 1_000_000_000,
-        gas_limit: 21000, data: vec![0u8; 128 * 1024 + 1],
-        signature: Signature::new([1; 64]), ..Default::default()
+        from: PublicKey::new([1; 32]),
+        gas_price: 1_000_000_000,
+        gas_limit: 21000,
+        data: vec![0u8; 128 * 1024 + 1],
+        signature: Signature::new([1; 64]),
+        ..Default::default()
     };
     assert!(matches!(
         validator.validate(&tx_over).await,
@@ -667,23 +799,33 @@ async fn test_validator_exact_balance_boundary() {
     let total_cost: u128 = 100 + gas_cost;
 
     // Exact balance = total cost
-    state.set_account(addr, AccountState::new(total_cost, 0)).await;
+    state
+        .set_account(addr, AccountState::new(total_cost, 0))
+        .await;
 
     let rules = ValidationRules {
-        verify_signatures: false, check_balance: true, check_nonce: true,
+        verify_signatures: false,
+        check_balance: true,
+        check_nonce: true,
         ..Default::default()
     };
     let validator = TxValidator::new(rules, state.clone());
 
     let tx = Transaction {
-        from: addr, nonce: 0, gas_price: 1_000_000_000,
-        gas_limit: 21000, value: 100, signature: Signature::new([1; 64]),
+        from: addr,
+        nonce: 0,
+        gas_price: 1_000_000_000,
+        gas_limit: 21000,
+        value: 100,
+        signature: Signature::new([1; 64]),
         ..Default::default()
     };
     assert!(validator.validate(&tx).await.is_ok());
 
     // One less → fail
-    state.set_account(addr, AccountState::new(total_cost - 1, 0)).await;
+    state
+        .set_account(addr, AccountState::new(total_cost - 1, 0))
+        .await;
     assert!(matches!(
         validator.validate(&tx).await,
         Err(ValidationError::InsufficientBalance { .. })

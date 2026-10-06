@@ -29,7 +29,10 @@ pub(crate) const MAX_DOWNLOADED_HEADERS_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) fn estimated_header_bytes(h: &BlockHeader) -> usize {
     // Measured ~485 B/header retained (CHAIN-B-A004 PoC); use 384 B fixed floor
     // plus the merge-parent vector so a fat header counts for more, not less.
-    384 + h.merge_parent_hashes.len() * std::mem::size_of::<Hash>()
+    h.merge_parent_hashes
+        .len()
+        .saturating_mul(std::mem::size_of::<Hash>())
+        .saturating_add(384)
 }
 
 /// Synchronization state
@@ -282,7 +285,7 @@ impl SyncManager {
         info!("Starting sync from height {} to {}", current, target);
 
         // Queue initial header requests
-        self.queue_header_downloads(peer_hash, target - current)
+        self.queue_header_downloads(peer_hash, target.saturating_sub(current))
             .await;
 
         Ok(())
@@ -448,10 +451,11 @@ impl SyncManager {
 
         // Validate header height monotonicity
         for window in headers.windows(2) {
-            if window[1].height <= window[0].height {
+            let [prev, next] = window else { continue };
+            if next.height <= prev.height {
                 warn!(
                     "SYNC_REJECT: non-monotonic header heights ({} -> {})",
-                    window[0].height, window[1].height
+                    prev.height, next.height
                 );
                 return Err(NetworkError::ProtocolError(
                     "non-monotonic header heights in sync response".into(),
@@ -489,8 +493,8 @@ impl SyncManager {
                     if total <= MAX_DOWNLOADED_HEADERS_BYTES {
                         break;
                     }
-                    total -= estimated_header_bytes(h);
-                    drop_count += 1;
+                    total = total.saturating_sub(estimated_header_bytes(h));
+                    drop_count = drop_count.saturating_add(1);
                 }
                 if drop_count > 0 {
                     warn!(
@@ -604,7 +608,7 @@ impl SyncManager {
                     block.header.timestamp,
                     citrate_consensus::hardening::MAX_FUTURE_BLOCK_DRIFT_SECS
                 );
-                rejected += 1;
+                rejected = rejected.saturating_add(1);
                 continue;
             }
 
@@ -614,7 +618,7 @@ impl SyncManager {
                     "SYNC_REJECT: block height={} hash mismatch (tampered commitment roots)",
                     block.header.height
                 );
-                rejected += 1;
+                rejected = rejected.saturating_add(1);
                 continue;
             }
 
@@ -626,7 +630,7 @@ impl SyncManager {
                         "SYNC_REJECT: block height={} invalid signature",
                         block.header.height
                     );
-                    rejected += 1;
+                    rejected = rejected.saturating_add(1);
                     continue;
                 }
                 Err(e) => {
@@ -634,7 +638,7 @@ impl SyncManager {
                         "SYNC_REJECT: block height={} signature error: {}",
                         block.header.height, e
                     );
-                    rejected += 1;
+                    rejected = rejected.saturating_add(1);
                     continue;
                 }
             }
@@ -652,7 +656,7 @@ impl SyncManager {
                     "SYNC_REJECT: block height={} tx_root mismatch",
                     block.header.height
                 );
-                rejected += 1;
+                rejected = rejected.saturating_add(1);
                 continue;
             }
 

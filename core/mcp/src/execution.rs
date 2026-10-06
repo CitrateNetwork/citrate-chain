@@ -7,9 +7,9 @@ use crate::registry::ModelRegistry;
 use crate::types::{ExecutionProof, ModelId};
 use crate::verification::ExecutionVerifier;
 use anyhow::{anyhow, Result};
-use hex;
 use citrate_execution::{Address, Hash};
 use citrate_storage::ipfs::{chunking, Cid, IPFSService};
+use hex;
 use serde_json;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -209,10 +209,9 @@ impl ModelExecutor {
         // Populate architecture from record metadata; fall back to GGUF magic header
         let architecture = if !record.metadata.architecture.is_empty() {
             record.metadata.architecture.clone()
-        } else if weights.len() >= 4 && &weights[0..4] == b"GGUF" {
+        } else if weights.starts_with(b"GGUF") {
             // Extract GGUF header as architecture descriptor (first 64 bytes or less)
-            let header_len = std::cmp::min(64, weights.len());
-            weights[..header_len].to_vec()
+            weights.get(..64).unwrap_or(&weights).to_vec()
         } else {
             warn!(
                 "Model {:?} has no architecture descriptor and no GGUF header",
@@ -265,9 +264,10 @@ impl ModelExecutor {
     /// Execute in VM (now using GGUF engine)
     async fn execute_in_vm(&self, context: &ExecutionContext) -> Result<(Vec<u8>, u64)> {
         // Check if GGUF engine is available
-        let gguf_engine = self.gguf_engine.as_ref().ok_or_else(|| {
-            anyhow!("AI features unavailable: GGUF engine not initialized")
-        })?;
+        let gguf_engine = self
+            .gguf_engine
+            .as_ref()
+            .ok_or_else(|| anyhow!("AI features unavailable: GGUF engine not initialized"))?;
 
         // Load the model
         let model = self.load_model(context.model_id).await?;
@@ -277,15 +277,12 @@ impl ModelExecutor {
 
         // Get or create model path on disk
         let model_path = gguf_engine
-            .load_model_from_bytes(
-                &hex::encode(&context.model_id.0[..8]),
-                &model.weights,
-            )
+            .load_model_from_bytes(&hex::encode(&context.model_id.0[..8]), &model.weights)
             .await?;
 
         // Parse input data
-        let input_json: serde_json::Value = serde_json::from_slice(&context.input)
-            .unwrap_or_else(|_| {
+        let input_json: serde_json::Value =
+            serde_json::from_slice(&context.input).unwrap_or_else(|_| {
                 // Fallback: try to interpret as string
                 serde_json::json!({
                     "prompt": String::from_utf8_lossy(&context.input)
@@ -379,9 +376,11 @@ impl ModelExecutor {
         let model_gas = (model.weights.len() / 1024) as u64;
 
         // Output size factor (10 gas per byte)
-        let output_gas = (output.len() * 10) as u64;
+        let output_gas = (output.len() as u64).saturating_mul(10);
 
-        base_gas + model_gas + output_gas
+        base_gas
+            .saturating_add(model_gas)
+            .saturating_add(output_gas)
     }
 
     /// Execute training in VM
@@ -411,10 +410,12 @@ impl ModelExecutor {
 
         // Apply gradient update with learning rate
         let learning_rate = 0.01f32;
-        let updated_weights = self.apply_gradient_update(&current_weights, &gradient, learning_rate);
+        let updated_weights =
+            self.apply_gradient_update(&current_weights, &gradient, learning_rate);
 
         // Compute training metrics
-        let metrics = self.compute_training_metrics(training_data, &current_weights, &updated_weights);
+        let metrics =
+            self.compute_training_metrics(training_data, &current_weights, &updated_weights);
 
         // Estimate gas based on computation
         let gas_used = self.estimate_training_gas(&current_weights, training_data);
@@ -446,13 +447,15 @@ impl ModelExecutor {
             hasher.update(b"CITRATE_GRADIENT_V1");
             hasher.update((i as u64).to_le_bytes());
             hasher.update(training_data);
-            hasher.update(&current_weights[..std::cmp::min(256, current_weights.len())]);
+            hasher.update(current_weights.get(..256).unwrap_or(current_weights));
             let hash = hasher.finalize();
 
             // Use hash bytes as gradient values for this chunk
-            let remaining = current_weights.len().saturating_sub(i * chunk_size);
+            let remaining = current_weights
+                .len()
+                .saturating_sub(i.saturating_mul(chunk_size));
             let take = std::cmp::min(chunk_size, remaining);
-            gradient.extend_from_slice(&hash[..take]);
+            gradient.extend_from_slice(hash.get(..take).unwrap_or(&hash));
         }
 
         gradient.truncate(current_weights.len());
@@ -523,9 +526,9 @@ impl ModelExecutor {
     fn estimate_training_gas(&self, weights: &[u8], training_data: &[u8]) -> u64 {
         // Base cost + per-weight cost + per-training-byte cost
         let base_gas = 1_000_000u64;
-        let weight_gas = (weights.len() as u64) * 10;
-        let data_gas = (training_data.len() as u64) * 5;
-        base_gas + weight_gas + data_gas
+        let weight_gas = (weights.len() as u64).saturating_mul(10);
+        let data_gas = (training_data.len() as u64).saturating_mul(5);
+        base_gas.saturating_add(weight_gas).saturating_add(data_gas)
     }
 
     /// Generate execution proof
@@ -797,7 +800,7 @@ mod tests {
                 hasher.update(b"CITRATE_GRADIENT_V1");
                 hasher.update((i as u64).to_le_bytes());
                 hasher.update(training_data);
-                hasher.update(&current_weights[..std::cmp::min(256, current_weights.len())]);
+                hasher.update(current_weights.get(..256).unwrap_or(current_weights));
                 let hash = hasher.finalize();
 
                 let remaining = current_weights.len().saturating_sub(i * chunk_size);

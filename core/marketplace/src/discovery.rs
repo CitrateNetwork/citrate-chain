@@ -124,7 +124,7 @@ impl DiscoveryEngine {
         // Update stats
         {
             let mut stats = self.stats.write().await;
-            stats.total_models_indexed += 1;
+            stats.total_models_indexed = stats.total_models_indexed.saturating_add(1);
             stats.last_updated = chrono::Utc::now();
         }
 
@@ -174,7 +174,7 @@ impl DiscoveryEngine {
         // Update stats
         {
             let mut stats = self.stats.write().await;
-            stats.total_searches += 1;
+            stats.total_searches = stats.total_searches.saturating_add(1);
         }
 
         // Perform search
@@ -187,7 +187,10 @@ impl DiscoveryEngine {
     }
 
     /// Get model details with full metadata
-    pub async fn get_model_details(&self, model_id: &ModelId) -> Result<Option<(MarketplaceModel, Option<crate::metadata::ModelMetadata>)>> {
+    pub async fn get_model_details(
+        &self,
+        model_id: &ModelId,
+    ) -> Result<Option<(MarketplaceModel, Option<crate::metadata::ModelMetadata>)>> {
         // Get basic model info from storage
         let model = match self.storage.get_model(model_id).await? {
             Some(model) => model,
@@ -223,10 +226,10 @@ impl DiscoveryEngine {
         {
             let mut stats = self.stats.write().await;
             match &result {
-                Ok(_) => stats.cache_hits += 1,
-                Err(_) => stats.cache_misses += 1,
+                Ok(_) => stats.cache_hits = stats.cache_hits.saturating_add(1),
+                Err(_) => stats.cache_misses = stats.cache_misses.saturating_add(1),
             }
-            stats.ipfs_fetches += 1;
+            stats.ipfs_fetches = stats.ipfs_fetches.saturating_add(1);
         }
 
         result
@@ -239,18 +242,29 @@ impl DiscoveryEngine {
     }
 
     /// Get similar models based on a given model
-    pub async fn get_similar_models(&self, model_id: &ModelId, limit: usize) -> Result<Vec<MarketplaceModel>> {
-        let models = self.search_engine.get_similar_models(model_id, limit).await?;
+    pub async fn get_similar_models(
+        &self,
+        model_id: &ModelId,
+        limit: usize,
+    ) -> Result<Vec<MarketplaceModel>> {
+        let models = self
+            .search_engine
+            .get_similar_models(model_id, limit)
+            .await?;
         self.enrich_models_with_storage(models).await
     }
 
     /// Get personalized recommendations for a user
-    pub async fn get_recommendations(&self, user_address: &Address, limit: usize) -> Result<Vec<MarketplaceModel>> {
+    pub async fn get_recommendations(
+        &self,
+        user_address: &Address,
+        limit: usize,
+    ) -> Result<Vec<MarketplaceModel>> {
         if let Some(rec_engine) = &self.recommendation_engine {
             // Update stats
             {
                 let mut stats = self.stats.write().await;
-                stats.recommendation_requests += 1;
+                stats.recommendation_requests = stats.recommendation_requests.saturating_add(1);
             }
 
             let model_ids = rec_engine.get_recommendations(user_address, limit).await?;
@@ -362,9 +376,8 @@ impl DiscoveryEngine {
         status.recommendations_healthy = self.recommendation_engine.is_some();
 
         // Overall health
-        status.overall_healthy = status.search_engine_healthy
-            && status.metadata_cache_healthy
-            && status.storage_healthy;
+        status.overall_healthy =
+            status.search_engine_healthy && status.metadata_cache_healthy && status.storage_healthy;
 
         Ok(status)
     }
@@ -385,7 +398,10 @@ impl DiscoveryEngine {
         Ok(enriched)
     }
 
-    async fn enrich_models_with_storage(&self, models: Vec<MarketplaceModel>) -> Result<Vec<MarketplaceModel>> {
+    async fn enrich_models_with_storage(
+        &self,
+        models: Vec<MarketplaceModel>,
+    ) -> Result<Vec<MarketplaceModel>> {
         let mut enriched = Vec::new();
 
         for model in models {

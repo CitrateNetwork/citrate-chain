@@ -5,9 +5,7 @@
 // (GPU hardware) and are covered in the inline module tests.
 #![allow(clippy::assertions_on_constants)]
 
-use citrate_execution::precompiles::inference::{
-    addresses, gas_costs, verify_commitment_proof,
-};
+use citrate_execution::precompiles::inference::{addresses, gas_costs, verify_commitment_proof};
 
 // ─────────────────────────────────────────────────────────────────────
 // 1. Address Validation — all 7 addresses are correct and distinct
@@ -26,7 +24,11 @@ fn test_all_precompile_addresses_are_distinct() {
     ];
     for i in 0..addrs.len() {
         for j in (i + 1)..addrs.len() {
-            assert_ne!(addrs[i], addrs[j], "Addresses {} and {} must be distinct", i, j);
+            assert_ne!(
+                addrs[i], addrs[j],
+                "Addresses {} and {} must be distinct",
+                i, j
+            );
         }
     }
 }
@@ -45,8 +47,16 @@ fn test_precompile_address_namespace() {
         addresses::MODEL_ENCRYPTION,
     ];
     for (i, addr) in addrs.iter().enumerate() {
-        assert!(addr[..18].iter().all(|&b| b == 0), "Precompile {} high bytes must be zero", i);
-        assert_eq!(addr[18], 1, "Precompile {} should be in the 0x01xx namespace", i);
+        assert!(
+            addr[..18].iter().all(|&b| b == 0),
+            "Precompile {} high bytes must be zero",
+            i
+        );
+        assert_eq!(
+            addr[18], 1,
+            "Precompile {} should be in the 0x01xx namespace",
+            i
+        );
     }
 }
 
@@ -83,7 +93,10 @@ fn test_gas_cost_ordering() {
 #[test]
 fn test_gas_cost_batch_discount_valid() {
     assert!(gas_costs::BATCH_DISCOUNT > 0, "Discount must be positive");
-    assert!(gas_costs::BATCH_DISCOUNT < 100, "Discount must be less than 100%");
+    assert!(
+        gas_costs::BATCH_DISCOUNT < 100,
+        "Discount must be less than 100%"
+    );
 }
 
 #[test]
@@ -115,7 +128,10 @@ fn test_gas_cost_model_deploy_calculation() {
     let expected_cost = gas_costs::BASE_COST + model_size_kb * gas_costs::MODEL_DEPLOY_PER_KB;
 
     assert!(expected_cost > gas_costs::BASE_COST);
-    assert!(expected_cost < 10_000_000, "1MB model deploy should cost < 10M gas");
+    assert!(
+        expected_cost < 10_000_000,
+        "1MB model deploy should cost < 10M gas"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -150,7 +166,10 @@ fn test_commitment_proof_invalid_commitment() {
     let response = &[0xCD; 32];
     let mut proof = build_commitment_proof(statement, response);
     proof[0] ^= 0xFF; // Corrupt commitment
-    assert!(!verify_commitment_proof(&proof), "Corrupted commitment should fail");
+    assert!(
+        !verify_commitment_proof(&proof),
+        "Corrupted commitment should fail"
+    );
 }
 
 #[test]
@@ -159,7 +178,10 @@ fn test_commitment_proof_invalid_response() {
     let response = &[0xEF; 32];
     let mut proof = build_commitment_proof(statement, response);
     proof[32] ^= 0xFF; // Corrupt response
-    assert!(!verify_commitment_proof(&proof), "Corrupted response should fail");
+    assert!(
+        !verify_commitment_proof(&proof),
+        "Corrupted response should fail"
+    );
 }
 
 #[test]
@@ -170,7 +192,10 @@ fn test_commitment_proof_invalid_statement() {
     if proof.len() > 64 {
         proof[64] ^= 0xFF; // Corrupt statement
     }
-    assert!(!verify_commitment_proof(&proof), "Corrupted statement should fail");
+    assert!(
+        !verify_commitment_proof(&proof),
+        "Corrupted statement should fail"
+    );
 }
 
 #[test]
@@ -191,7 +216,10 @@ fn test_commitment_proof_exact_64_bytes() {
     let response = &[0x22; 32];
     let proof = build_commitment_proof(statement, response);
     assert_eq!(proof.len(), 64);
-    assert!(verify_commitment_proof(&proof), "64-byte proof with empty statement should verify");
+    assert!(
+        verify_commitment_proof(&proof),
+        "64-byte proof with empty statement should verify"
+    );
 }
 
 #[test]
@@ -216,7 +244,11 @@ fn test_commitment_proof_different_statements_different_proofs() {
     let response = &[0x66; 32];
     let proof1 = build_commitment_proof(b"statement A", response);
     let proof2 = build_commitment_proof(b"statement B", response);
-    assert_ne!(proof1[..32], proof2[..32], "Different statements must produce different commitments");
+    assert_ne!(
+        proof1[..32],
+        proof2[..32],
+        "Different statements must produce different commitments"
+    );
 }
 
 #[test]
@@ -224,5 +256,9 @@ fn test_commitment_proof_different_responses_different_proofs() {
     let statement = b"same statement";
     let proof1 = build_commitment_proof(statement, &[0x77; 32]);
     let proof2 = build_commitment_proof(statement, &[0x88; 32]);
-    assert_ne!(proof1[..32], proof2[..32], "Different responses must produce different commitments");
+    assert_ne!(
+        proof1[..32],
+        proof2[..32],
+        "Different responses must produce different commitments"
+    );
 }

@@ -23,8 +23,8 @@
 
 #![cfg(feature = "halo2-substrate")]
 
-use citrate_execution::precompiles::verify::{addresses, execute, gas_costs};
 use citrate_execution::precompiles::q16::{ops as q16_ops, Q16};
+use citrate_execution::precompiles::verify::{addresses, execute, gas_costs};
 use citrate_execution::types::Address;
 use citrate_execution::zkp::halo2::circuits::InferenceCircuit;
 use citrate_execution::zkp::halo2::CIRCUIT_VERSION_LINEAR_Q16;
@@ -141,12 +141,10 @@ fn generate_inference_proof(
 
     // 4. Keygen: VK and PK.
     let vk = keygen_vk(&params, &circuit.without_witnesses()).expect("keygen_vk");
-    let pk = keygen_pk(&params, vk.clone(), &circuit.without_witnesses())
-        .expect("keygen_pk");
+    let pk = keygen_pk(&params, vk.clone(), &circuit.without_witnesses()).expect("keygen_pk");
 
     // 5. Prove.
-    let public_inputs: Vec<Vec<Halo2Fr>> =
-        vec![vec![input_commit, model_commit, output_commit]];
+    let public_inputs: Vec<Vec<Halo2Fr>> = vec![vec![input_commit, model_commit, output_commit]];
     let mut transcript = Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(vec![]);
     let prover_rng = StdRng::from_seed([0xAB; 32]);
     create_proof::<KZGCommitmentScheme<Bn256>, ProverSHPLONK<'_, Bn256>, _, _, _, _>(
@@ -256,13 +254,9 @@ fn precompile_0x0108_rejects_wrong_commitment() {
     );
 
     let addr = Address(addresses::INFERENCE_PROOF_VERIFY);
-    let result = execute(&addr, &wire, 100_000_000)
-        .expect("precompile must run");
+    let result = execute(&addr, &wire, 100_000_000).expect("precompile must run");
 
-    assert_eq!(
-        result.output[31], 0,
-        "wrong input_commit must be rejected"
-    );
+    assert_eq!(result.output[31], 0, "wrong input_commit must be rejected");
 }
 
 #[test]

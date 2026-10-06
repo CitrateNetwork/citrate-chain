@@ -1,8 +1,8 @@
 //! Integration-level smoke for `citrate-signing`. Webhook signature verification
 //! end-to-end across the trait surface, plus payload-parser regression coverage.
 
-use citrate_signing::providers::DocusignProvider;
 use citrate_signing::providers::docusign::DocusignConfig;
+use citrate_signing::providers::DocusignProvider;
 use citrate_signing::webhook::parse_docusign_event;
 use citrate_signing::{EnvelopeStatus, SigningError, SigningProvider};
 use hmac::{Hmac, Mac};
@@ -29,7 +29,10 @@ fn d022_debug_redacts_secrets() {
     let dbg = format!("{cfg:?}");
     // The secret VALUES (quoted) must not appear — the field NAME `access_token`
     // legitimately contains "token", so assert on the quoted value.
-    assert!(!dbg.contains("\"token\""), "access_token value leaked in Debug: {dbg}");
+    assert!(
+        !dbg.contains("\"token\""),
+        "access_token value leaked in Debug: {dbg}"
+    );
     assert!(
         !dbg.contains("shhhhhhhhhhhh-this-is-a-test-secret"),
         "webhook_secret leaked in Debug: {dbg}"

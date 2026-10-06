@@ -56,7 +56,10 @@ pub struct RelayState {
     pub last_citrate_height: u64,
 
     /// Map of event ID → tracked event for deduplication and status tracking.
-    #[serde(serialize_with = "serialize_event_map", deserialize_with = "deserialize_event_map")]
+    #[serde(
+        serialize_with = "serialize_event_map",
+        deserialize_with = "deserialize_event_map"
+    )]
     pub events: HashMap<EventId, TrackedEvent>,
 
     /// Total deposits processed since relay start.
@@ -149,7 +152,7 @@ impl RelayState {
     /// Increment attestation count for an event.
     pub fn add_attestation(&mut self, event_id: &EventId) -> Option<usize> {
         if let Some(tracked) = self.events.get_mut(event_id) {
-            tracked.attestation_count += 1;
+            tracked.attestation_count = tracked.attestation_count.saturating_add(1);
             Some(tracked.attestation_count)
         } else {
             None
@@ -158,14 +161,14 @@ impl RelayState {
 
     /// Record a successful deposit.
     pub fn record_deposit(&mut self, salt_amount: u64) {
-        self.total_deposits += 1;
-        self.total_salt_credited += salt_amount;
+        self.total_deposits = self.total_deposits.saturating_add(1);
+        self.total_salt_credited = self.total_salt_credited.saturating_add(salt_amount);
     }
 
     /// Record a successful withdrawal.
     pub fn record_withdrawal(&mut self, salt_amount: u64) {
-        self.total_withdrawals += 1;
-        self.total_salt_burned += salt_amount;
+        self.total_withdrawals = self.total_withdrawals.saturating_add(1);
+        self.total_salt_burned = self.total_salt_burned.saturating_add(salt_amount);
     }
 
     /// Update the heartbeat timestamp.
@@ -245,11 +248,7 @@ mod tests {
         let event_id = [43u8; 32];
         state.track_event(make_deposit(event_id));
 
-        assert!(state.update_event_status(
-            &event_id,
-            EventStatus::AwaitingAttestations,
-            None
-        ));
+        assert!(state.update_event_status(&event_id, EventStatus::AwaitingAttestations, None));
 
         let tracked = state.events.get(&event_id).unwrap();
         assert_eq!(tracked.status, EventStatus::AwaitingAttestations);

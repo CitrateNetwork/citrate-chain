@@ -281,7 +281,8 @@ fn statedb_snapshot_restore_full() {
     db.accounts.set_balance(a, U256::from(500));
     db.set_storage(a, b"slot".to_vec(), b"before".to_vec());
     db.register_model(mid, make_model(a)).unwrap();
-    db.create_training_job(make_training_job(jid, a, mid)).unwrap();
+    db.create_training_job(make_training_job(jid, a, mid))
+        .unwrap();
 
     // Drain dirty_storage before snapshot so the snapshot captures an empty
     // tracker. The post-restore assertion below then checks that restore
@@ -451,7 +452,10 @@ fn trie_extension_split_coverage() {
     trie.insert(vec![0x01, 0x02, 0x04, 0x00], b"split".to_vec());
 
     assert_eq!(trie.get(&[0x01, 0x02, 0x03, 0x04]), Some(b"deep".to_vec()));
-    assert_eq!(trie.get(&[0x01, 0x02, 0x03, 0x05]), Some(b"sibling".to_vec()));
+    assert_eq!(
+        trie.get(&[0x01, 0x02, 0x03, 0x05]),
+        Some(b"sibling".to_vec())
+    );
     assert_eq!(trie.get(&[0x01, 0x02, 0x04, 0x00]), Some(b"split".to_vec()));
 }
 
@@ -621,14 +625,26 @@ fn cache_set_prefetch() {
     cache.set_prefetch(false);
     // Still works — just doesn't prefetch adjacent keys
     cache.put_storage(addr(1), U256::from(1), U256::from(10));
-    assert_eq!(cache.get_storage(&addr(1), &U256::from(1)), Some(U256::from(10)));
+    assert_eq!(
+        cache.get_storage(&addr(1), &U256::from(1)),
+        Some(U256::from(10))
+    );
 }
 
 #[test]
 fn cache_storage_key_equality() {
-    let k1 = StorageKey { address: addr(1), key: U256::from(42) };
-    let k2 = StorageKey { address: addr(1), key: U256::from(42) };
-    let k3 = StorageKey { address: addr(2), key: U256::from(42) };
+    let k1 = StorageKey {
+        address: addr(1),
+        key: U256::from(42),
+    };
+    let k2 = StorageKey {
+        address: addr(1),
+        key: U256::from(42),
+    };
+    let k3 = StorageKey {
+        address: addr(2),
+        key: U256::from(42),
+    };
 
     assert_eq!(k1, k2);
     assert_ne!(k1, k3);
@@ -638,10 +654,10 @@ fn cache_storage_key_equality() {
 // 4. ENCRYPTION TESTS
 // ===================================================================
 
+use citrate_execution::crypto::ecdh::ECIES;
 use citrate_execution::crypto::encryption::{
     EncryptionConfig, ModelEncryption, RecipientPublicKeys,
 };
-use citrate_execution::crypto::ecdh::ECIES;
 use primitive_types::{H160, H256};
 use std::collections::HashMap;
 
@@ -673,7 +689,10 @@ fn encrypt_test_model(
     data: &[u8],
     owner: H160,
     access_list: Vec<H160>,
-) -> (citrate_execution::crypto::encryption::EncryptedModel, HashMap<H160, [u8; 32]>) {
+) -> (
+    citrate_execution::crypto::encryption::EncryptedModel,
+    HashMap<H160, [u8; 32]>,
+) {
     let (public_keys, private_keys) = encryption_test_material(owner, &access_list);
     let encrypted = enc
         .encrypt_model_with_keys(model_id, data, owner, access_list, &public_keys)
@@ -740,13 +759,8 @@ fn encryption_multiple_authorized_users() {
     let user2 = H160::random();
     let data = b"shared model weights";
 
-    let (encrypted, keys) = encrypt_test_model(
-        &enc,
-        H256::random(),
-        data,
-        owner,
-        vec![user1, user2],
-    );
+    let (encrypted, keys) =
+        encrypt_test_model(&enc, H256::random(), data, owner, vec![user1, user2]);
 
     assert_eq!(encrypted.access_list.len(), 3); // owner + user1 + user2
     assert!(encrypted.access_list.contains(&owner));
@@ -765,16 +779,15 @@ fn encryption_owner_auto_added_to_access_list() {
     let owner = H160::random();
     let user = H160::random();
 
-    let (encrypted, _keys) = encrypt_test_model(
-        &enc,
-        H256::random(),
-        b"data",
-        owner,
-        vec![user, owner],
-    );
+    let (encrypted, _keys) =
+        encrypt_test_model(&enc, H256::random(), b"data", owner, vec![user, owner]);
 
     // Owner should appear exactly once (not duplicated)
-    let owner_count = encrypted.access_list.iter().filter(|&&a| a == owner).count();
+    let owner_count = encrypted
+        .access_list
+        .iter()
+        .filter(|&&a| a == owner)
+        .count();
     assert_eq!(owner_count, 1);
 }
 
@@ -812,7 +825,12 @@ fn encryption_chunk_wrong_key_fails() {
     let chunk = b"secret chunk";
 
     let encrypted = enc.encrypt_chunk(chunk, &key, 0).unwrap();
-    let result = enc.decrypt_chunk(&encrypted.data, &wrong_key, &encrypted.nonce, &encrypted.auth_tag);
+    let result = enc.decrypt_chunk(
+        &encrypted.data,
+        &wrong_key,
+        &encrypted.nonce,
+        &encrypted.auth_tag,
+    );
     assert!(result.is_err());
 }
 
@@ -838,7 +856,12 @@ fn encryption_key_rotation() {
 
     let old_key = keys[&owner];
     let rotated = enc
-        .rotate_key_with_keys(&encrypted, &old_key, owner, &encryption_test_material(owner, &[]).0)
+        .rotate_key_with_keys(
+            &encrypted,
+            &old_key,
+            owner,
+            &encryption_test_material(owner, &[]).0,
+        )
         .unwrap();
 
     // Re-encrypted model should still be decryptable
@@ -865,7 +888,8 @@ fn encryption_grant_access() {
         &new_user_pubkey,
         &keys[&owner],
         owner,
-    ).unwrap();
+    )
+    .unwrap();
     assert!(encrypted.access_list.contains(&new_user));
 
     // Granting again is idempotent
@@ -875,8 +899,13 @@ fn encryption_grant_access() {
         &new_user_pubkey,
         &keys[&owner],
         owner,
-    ).unwrap();
-    let count = encrypted.access_list.iter().filter(|&&a| a == new_user).count();
+    )
+    .unwrap();
+    let count = encrypted
+        .access_list
+        .iter()
+        .filter(|&&a| a == new_user)
+        .count();
     assert_eq!(count, 1);
 }
 
@@ -937,7 +966,10 @@ fn encryption_revoke_owner_rejected() {
         &encryption_test_material(owner, &[]).0,
     );
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Cannot revoke owner"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Cannot revoke owner"));
 }
 
 #[test]
@@ -1113,9 +1145,15 @@ fn prover_setup_data_integrity_and_prove() {
 #[test]
 fn prover_prove_without_setup_fails() {
     let p = Prover::new();
-    assert!(p.prove_state_transition(vec![0; 32], vec![0; 32], vec![0; 32]).is_err());
-    assert!(p.prove_data_integrity(vec![0; 32], vec![], vec![0; 32], 0).is_err());
-    assert!(p.prove_gradient_submission(vec![0; 32], vec![0; 32], vec![0; 32], 0.1, 10).is_err());
+    assert!(p
+        .prove_state_transition(vec![0; 32], vec![0; 32], vec![0; 32])
+        .is_err());
+    assert!(p
+        .prove_data_integrity(vec![0; 32], vec![], vec![0; 32], 0)
+        .is_err());
+    assert!(p
+        .prove_gradient_submission(vec![0; 32], vec![0; 32], vec![0; 32], 0.1, 10)
+        .is_err());
 }
 
 // ===================================================================
@@ -1494,13 +1532,7 @@ fn backend_prove_tensor_computation() {
 fn backend_prove_training_round() {
     let backend = initialized_backend();
     let proof = backend
-        .prove_training_round(
-            &[1u8; 32],
-            &[2u8; 32],
-            vec![3u8; 64],
-            0.01,
-            256,
-        )
+        .prove_training_round(&[1u8; 32], &[2u8; 32], vec![3u8; 64], 0.01, 256)
         .unwrap();
     assert!(!proof.proof_bytes.is_empty());
 }
@@ -1524,7 +1556,11 @@ fn account_manager_model_permissions() {
     db.accounts.add_model_permission(a, mid);
     let account = db.accounts.get_account(&a);
     assert_eq!(
-        account.model_permissions.iter().filter(|&&m| m == mid).count(),
+        account
+            .model_permissions
+            .iter()
+            .filter(|&&m| m == mid)
+            .count(),
         1
     );
 }
@@ -1616,7 +1652,9 @@ fn key_manager_threshold_validation() {
 fn key_manager_reconstruct_insufficient_shares() {
     let km = KeyManager::from_seed(&[1u8; 64]).unwrap();
     let holders = vec![H160::random(), H160::random(), H160::random()];
-    let tk = km.create_threshold_key(H256::random(), 2, holders.clone()).unwrap();
+    let tk = km
+        .create_threshold_key(H256::random(), 2, holders.clone())
+        .unwrap();
 
     // Only 1 share, need 2
     let result = km.reconstruct_secret(vec![(holders[0], vec![0u8; 34])], &tk);
@@ -1652,7 +1690,9 @@ fn key_manager_access_policy_full() {
 
     km.set_access_policy(model, policy).unwrap();
     assert!(km.check_access(model, full_user, AccessType::Full).unwrap());
-    assert!(km.check_access(model, full_user, AccessType::Inference).unwrap());
+    assert!(km
+        .check_access(model, full_user, AccessType::Inference)
+        .unwrap());
 }
 
 #[test]
@@ -1672,7 +1712,9 @@ fn key_manager_schedule_rotation() {
 fn key_manager_cleanup_expired() {
     let km = KeyManager::from_seed(&[42u8; 64]).unwrap();
     // Derive a key — it has a 30-day expiry set in the future, so won't be expired
-    let _key = km.derive_key("m/44'/60'/0'", KeyPurpose::AccessToken).unwrap();
+    let _key = km
+        .derive_key("m/44'/60'/0'", KeyPurpose::AccessToken)
+        .unwrap();
     let expired = km.get_expired_keys();
     assert!(expired.is_empty());
     km.cleanup_expired(); // no-op but exercises the code path
@@ -1683,7 +1725,7 @@ fn key_manager_cleanup_expired() {
 // ===================================================================
 
 use citrate_execution::crypto::shamir::{
-    FieldElement, ShamirSecretSharing, split_model_key, reconstruct_model_key,
+    reconstruct_model_key, split_model_key, FieldElement, ShamirSecretSharing,
 };
 
 #[test]
@@ -1903,7 +1945,9 @@ fn model_key_exchange_roundtrip() {
     let bob = ModelKeyExchange::new().unwrap();
 
     let key = [0xDE; 32];
-    let encrypted = alice.encrypt_key_for_recipient(&key, &bob.public_key()).unwrap();
+    let encrypted = alice
+        .encrypt_key_for_recipient(&key, &bob.public_key())
+        .unwrap();
     let decrypted = bob.decrypt_key_from_sender(&encrypted).unwrap();
     assert_eq!(key, decrypted);
 }
@@ -1920,7 +1964,10 @@ fn execution_error_display() {
     };
     assert!(e1.to_string().contains("Insufficient balance"));
 
-    let e2 = ExecutionError::InvalidNonce { expected: 5, got: 3 };
+    let e2 = ExecutionError::InvalidNonce {
+        expected: 5,
+        got: 3,
+    };
     assert!(e2.to_string().contains("Invalid nonce"));
 
     let e3 = ExecutionError::OutOfGas;

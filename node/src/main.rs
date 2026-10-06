@@ -1,3 +1,17 @@
+// PANIC-S1 G2: production code in this crate may not panic (tests excepted).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use anyhow::Result;
 use citrate_api::{EthSubscriptionServer, RpcConfig, RpcServer};
 use citrate_consensus::crypto;
@@ -52,7 +66,6 @@ compile_error!(
      network. Enabling it requires a scheduled fleet-wide activation, not a build flag \
      (PBA-L1a-003)."
 );
-mod startup_guards;
 mod contribution_recorder;
 mod dag_prune;
 mod genesis;
@@ -66,7 +79,7 @@ mod network_inference;
 mod persistent_dag;
 mod producer;
 mod registry_sync;
-mod sync;
+mod startup_guards;
 mod sync_peer;
 
 use citrate_consensus::dag_store::DagStore;
@@ -434,9 +447,14 @@ async fn main() -> Result<()> {
             // env override and the config file's `[chain].pba_hardening_height`.
             let file_cfg = resolve_config_path(cli.config.clone())
                 .and_then(|p| NodeConfig::from_file(&p).ok());
-            let (cfg_chain_id, configured, dev_profile) = match &file_cfg {
-                Some(c) => (c.chain.chain_id, c.chain.pba_hardening_height, c.chain.dev_profile),
-                None => (40204, None, false),
+            let (cfg_chain_id, configured, dev_profile, agent_configured) = match &file_cfg {
+                Some(c) => (
+                    c.chain.chain_id,
+                    c.chain.pba_hardening_height,
+                    c.chain.dev_profile,
+                    c.chain.agent_precompiles_height,
+                ),
+                None => (40204, None, false, None),
             };
             let chain_id = cli.chain_id.unwrap_or(cfg_chain_id);
             let resolved = citrate_consensus::hardening::resolve_pba_hardening_for_chain(
@@ -445,7 +463,11 @@ async fn main() -> Result<()> {
                 dev_profile,
             )
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let manifest = consensus_manifest::ConsensusManifest::for_height(resolved.height);
+            let (agent_height, _) =
+                citrate_execution::agent_fork::resolve_for_chain(chain_id, agent_configured)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let manifest =
+                consensus_manifest::ConsensusManifest::for_heights(resolved.height, agent_height);
             // The activation heights compiled into this release (a node on a
             // pinned chain runs that height; see the start-up banner for the
             // height a configured node resolved).
@@ -802,7 +824,7 @@ async fn handle_model_command(command: ModelCommands, data_dir: Option<PathBuf>)
             let model = citrate_consensus::types::RequiredModel::new(
                 citrate_consensus::types::ModelId(format!(
                     "manual-pin-{}",
-                    &cid[..8.min(cid.len())]
+                    cid.get(..8).unwrap_or(&cid)
                 )),
                 cid.clone(),
                 citrate_consensus::types::Hash::new([0u8; 32]), // skip hash verification
@@ -1027,10 +1049,9 @@ fn generate_keypair(use_ed25519: bool) {
         // Ethereum address = last 20 bytes of Keccak256(pubkey_xy)
         // Skip the 0x04 prefix byte
         let mut hasher = Keccak256::new();
-        hasher.update(&pubkey_bytes.as_bytes()[1..]);
-        let hash = hasher.finalize();
-        let mut address = [0u8; 20];
-        address.copy_from_slice(&hash[12..32]);
+        hasher.update(pubkey_bytes.as_bytes().get(1..).unwrap_or_default());
+        let hash: [u8; 32] = hasher.finalize().into();
+        let [_, _, _, _, _, _, _, _, _, _, _, _, address @ ..] = hash;
 
         let private_key_hex = hex::encode(secret_key.to_bytes());
 
@@ -1074,7 +1095,7 @@ fn show_genesis_info() -> Result<()> {
     for model in &genesis.embedded_models {
         let size_bytes = model.size_bytes();
         let size_mb = size_bytes as f64 / (1024.0 * 1024.0);
-        total_embedded_size += size_bytes as u64;
+        total_embedded_size = total_embedded_size.saturating_add(size_bytes as u64);
         println!("  - Model ID: {}", model.model_id);
         println!("    Type: {:?}", model.model_type);
         println!("    Size: {:.2} MB ({} bytes)", size_mb, size_bytes);
@@ -1098,7 +1119,7 @@ fn show_genesis_info() -> Result<()> {
     for pin in &genesis.required_pins {
         let size_mb = pin.size_bytes as f64 / (1024.0 * 1024.0);
         let size_gb = size_mb / 1024.0;
-        total_ipfs_size += pin.size_bytes;
+        total_ipfs_size = total_ipfs_size.saturating_add(pin.size_bytes);
 
         println!("  - Model ID: {}", pin.model_id);
         println!("    IPFS CID: {}", pin.ipfs_cid);
@@ -1164,6 +1185,28 @@ fn at_rest_encryption_from_env() -> Result<Option<EncryptionAtRestConfig>> {
 
 async fn start_node(config: NodeConfig) -> Result<()> {
     info!("Starting Citrate node...");
+    // HUP-S7.2: the agent precompile fork height, published before any
+    // execution component is built. 40204 pins it at genesis (active from
+    // block 1); other chains are off unless env or config sets a height. On a
+    // release network only the release pin sets it; a disagreeing env or config
+    // value aborts start-up instead of forking this node at the height.
+    let (agent_fork_height, agent_fork_source) = citrate_execution::agent_fork::init_for_chain(
+        config.chain.chain_id,
+        config.chain.agent_precompiles_height,
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
+    match agent_fork_height {
+        Some(h) => info!(
+            "Agent precompile fork ACTIVE from height {} (source: {}): 0x0112 LORA_APPLY, \
+             0x0113 LORA_MERGE, 0x0121 MEMORY_ANCHOR_VERIFY, 0x0122 AGENT_OPS",
+            h, agent_fork_source
+        ),
+        None => info!(
+            "Agent precompile fork not scheduled (source: {}); precompile set unchanged",
+            agent_fork_source
+        ),
+    }
+
     {
         // Consensus-alignment stamp — logged at boot so field drift is diagnosable
         // from the journal (the app node and fleet MUST share this fingerprint).
@@ -1237,7 +1280,6 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         );
         pba
     };
-
     // Initialize metrics server
     let metrics_addr =
         std::env::var("CITRATE_METRICS_ADDR").unwrap_or_else(|_| "127.0.0.1:9090".to_string());
@@ -1480,8 +1522,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let mut a = [0u8; 20];
         let s = config.mining.coinbase.trim_start_matches("0x");
         if let Ok(bytes) = hex::decode(s) {
-            if bytes.len() >= 20 {
-                a.copy_from_slice(&bytes[..20]);
+            if let Some(first) = bytes.first_chunk::<20>() {
+                a = *first;
             }
         }
         citrate_execution::types::Address(a)
@@ -1550,15 +1592,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         .state_db()
         .get_storage(&governance_addr, b"PARAM:min_gas_price")
     {
-        if bytes.len() >= 8 {
-            let mut arr = [0u8; 8];
-            arr.copy_from_slice(&bytes[..8]);
-            min_gas_price_override = Some(u64::from_le_bytes(arr));
-        } else if bytes.len() >= 4 {
+        if let Some(arr) = bytes.first_chunk::<8>() {
+            min_gas_price_override = Some(u64::from_le_bytes(*arr));
+        } else if let Some(arr) = bytes.first_chunk::<4>() {
             // support 32-bit little endian as fallback
-            let mut arr = [0u8; 4];
-            arr.copy_from_slice(&bytes[..4]);
-            min_gas_price_override = Some(u32::from_le_bytes(arr) as u64);
+            min_gas_price_override = Some(u32::from_le_bytes(*arr) as u64);
         }
     }
 
@@ -1566,7 +1604,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // PBA-L1a-007: a production (non-devnet) build refuses to MINE with
     // signature verification disabled; unrecognised values fail closed.
     let require_valid_signature = startup_guards::resolve_require_valid_signature(
-        std::env::var("CITRATE_REQUIRE_VALID_SIGNATURE").ok().as_deref(),
+        std::env::var("CITRATE_REQUIRE_VALID_SIGNATURE")
+            .ok()
+            .as_deref(),
         config.mining.enabled,
         cfg!(feature = "devnet"),
     )
@@ -1598,44 +1638,50 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             mempool_max_per_sender
         );
     }
-    let mempool = Arc::new(Mempool::new(MempoolConfig {
-        max_size: mempool_max_size,
-        max_per_sender: mempool_max_per_sender,
-        min_gas_price: min_gas_price_override.unwrap_or(config.mining.min_gas_price),
-        tx_expiry_secs: 3600,
-        allow_replacement: true,
-        replacement_factor: 110,
-        require_valid_signature,
-        chain_id: config.chain.chain_id,
-        max_nonce_gap: 16, // RM-B1 / WP-C4.1 (audit M-SEQ-01): Geth default
-    })
-    // PBA-L1a-001: bound admitted nonces against the sender's COMMITTED nonce
-    // (stale and far-future nonces rejected on every ingress, new senders too).
-    .with_state_nonce_reader({
-        let exec = executor.clone();
-        Arc::new(move |pk: &citrate_consensus::types::PublicKey| {
-            exec.get_nonce(&citrate_execution::address_utils::normalize_address(pk))
+    let mempool = Arc::new(
+        Mempool::new(MempoolConfig {
+            max_size: mempool_max_size,
+            max_per_sender: mempool_max_per_sender,
+            min_gas_price: min_gas_price_override.unwrap_or(config.mining.min_gas_price),
+            tx_expiry_secs: 3600,
+            allow_replacement: true,
+            replacement_factor: 110,
+            require_valid_signature,
+            chain_id: config.chain.chain_id,
+            max_nonce_gap: 16, // RM-B1 / WP-C4.1 (audit M-SEQ-01): Geth default
         })
-    })
-    // PBA-N9 (security#134): reject a transaction on every ingress path when the
-    // sender's committed balance cannot cover it together with its already-pooled
-    // transactions. Without this the pool admits unfunded floods that evict honest
-    // txs and yield empty blocks at zero cost. Balances are far below u128::MAX
-    // (supply is 1e30 wei), so the U256->u128 saturation never loses precision.
-    .with_state_balance_reader({
-        let exec = executor.clone();
-        Arc::new(move |pk: &citrate_consensus::types::PublicKey| {
-            let bal = exec.get_balance(&citrate_execution::address_utils::normalize_address(pk));
-            let cap = primitive_types::U256::from(u128::MAX);
-            (if bal > cap { cap } else { bal }).low_u128()
+        // PBA-L1a-001: bound admitted nonces against the sender's COMMITTED nonce
+        // (stale and far-future nonces rejected on every ingress, new senders too).
+        .with_state_nonce_reader({
+            let exec = executor.clone();
+            Arc::new(move |pk: &citrate_consensus::types::PublicKey| {
+                exec.get_nonce(&citrate_execution::address_utils::normalize_address(pk))
+            })
         })
-    })
-    // Native signatures: from tip H - 1 the pool admits only the chain-bound
-    // (v2) digest and evicts legacy ones (`citrate_consensus::native_sig`).
-    .with_native_sig_policy(citrate_consensus::hardening::PbaHardening::from_process(), {
-        let st = storage.clone();
-        Arc::new(move || st.blocks.get_latest_height().ok())
-    }));
+        // PBA-N9 (security#134): reject a transaction on every ingress path when the
+        // sender's committed balance cannot cover it together with its already-pooled
+        // transactions. Without this the pool admits unfunded floods that evict honest
+        // txs and yield empty blocks at zero cost. Balances are far below u128::MAX
+        // (supply is 1e30 wei), so the U256->u128 saturation never loses precision.
+        .with_state_balance_reader({
+            let exec = executor.clone();
+            Arc::new(move |pk: &citrate_consensus::types::PublicKey| {
+                let bal =
+                    exec.get_balance(&citrate_execution::address_utils::normalize_address(pk));
+                let cap = primitive_types::U256::from(u128::MAX);
+                (if bal > cap { cap } else { bal }).low_u128()
+            })
+        })
+        // Native signatures: from tip H - 1 the pool admits only the chain-bound
+        // (v2) digest and evicts legacy ones (`citrate_consensus::native_sig`).
+        .with_native_sig_policy(
+            citrate_consensus::hardening::PbaHardening::from_process(),
+            {
+                let st = storage.clone();
+                Arc::new(move || st.blocks.get_latest_height().ok())
+            },
+        ),
+    );
 
     // PBA-L1a-017: apply `tx_expiry_secs` with a periodic
     // `Mempool::clear_expired` sweep (once a minute).
@@ -1974,7 +2020,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     .await
                     .is_ok()
                 {
-                    readmitted += 1;
+                    readmitted = readmitted.saturating_add(1);
                 }
             }
             info!(
@@ -2136,7 +2182,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                 return;
                             }
                             Ok(false) => {
-                                aborted += 1;
+                                aborted = aborted.saturating_add(1);
                                 if aborted >= 5 {
                                     warn!(
                                         "canonical recovery: gave up after {} aborted attempts",
@@ -2209,7 +2255,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let local_peer_id = noise_keypair.derive_peer_id();
         info!(
             "Noise identity: {}... (peer_id={})",
-            &noise_keypair.public_key_hex()[..16],
+            noise_keypair.public_key_hex().get(..16).unwrap_or_default(),
             local_peer_id
         );
         // Shared LIVE head advertised in every handshake. Seeded with our current
@@ -2462,20 +2508,20 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     match (&chosen_id, &last_logged_choice) {
                         (Some(now), Some(before)) => tracing::info!(
                             "SYNCPEER switched {} -> {} (applied={} candidates={})",
-                            &before[..14.min(before.len())],
-                            &now[..14.min(now.len())],
+                            before.get(..14).unwrap_or(before),
+                            now.get(..14).unwrap_or(now),
                             applied_height,
                             candidates.len()
                         ),
                         (Some(now), None) => tracing::info!(
                             "SYNCPEER selected {} (applied={} candidates={})",
-                            &now[..14.min(now.len())],
+                            now.get(..14).unwrap_or(now),
                             applied_height,
                             candidates.len()
                         ),
                         (None, Some(before)) => tracing::info!(
                             "SYNCPEER lost source (was {}, applied={} candidates={})",
-                            &before[..14.min(before.len())],
+                            before.get(..14).unwrap_or(before),
                             applied_height,
                             candidates.len()
                         ),
@@ -2500,9 +2546,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         if connected_peers.is_empty() {
                             None
                         } else {
-                            let i = (rotate_idx as usize) % connected_peers.len();
+                            let i = (rotate_idx as usize)
+                                .checked_rem(connected_peers.len())
+                                .unwrap_or(0);
                             rotate_idx = rotate_idx.wrapping_add(1);
-                            Some(connected_peers[i].1.clone())
+                            connected_peers.get(i).map(|p| p.1.clone())
                         }
                     } else {
                         None
@@ -2942,100 +2990,102 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                     // (linkage verified from genesis), or clamped
                                     // when deferred (below).
                                     match admission_for_net.admit(&block).await {
-                                    admission::AdmitOutcome::Admitted { completed_partial } => {
-                                        sync_peer::record_verified_height(
-                                            &max_seen_for_rx,
-                                            block.header.height,
-                                        );
-                                        if completed_partial {
-                                            tracing::warn!(
+                                        admission::AdmitOutcome::Admitted { completed_partial } => {
+                                            sync_peer::record_verified_height(
+                                                &max_seen_for_rx,
+                                                block.header.height,
+                                            );
+                                            if completed_partial {
+                                                // D4a: admission.rs already warns (budgeted); a
+                                                // per-block warn here doubled the storm.
+                                                tracing::debug!(
                                                 "Completed a partial admission of gossiped block {} @ {}",
                                                 hex::encode(&block.header.block_hash.as_bytes()[..8]),
                                                 block.header.height
                                             );
+                                            }
                                         }
-                                    }
-                                    admission::AdmitOutcome::AlreadyAdmitted => {}
-                                    admission::AdmitOutcome::Deferred { missing_parent } => {
-                                        // A block we can't admit because its parent is
-                                        // missing is still PROOF the network is at least
-                                        // at block.height. Rejecting it is correct, but
-                                        // dropping that height signal is what stalled a
-                                        // far-behind follower — record it so the sync tick
-                                        // pulls the gap forward instead of parking.
-                                        sync_peer::record_unverified_height(
-                                            &max_seen_for_rx,
-                                            block.header.height,
-                                            storage_for_handler
-                                                .blocks
-                                                .get_applied_tip()
-                                                .ok()
-                                                .flatten()
-                                                .map(|(_, h)| h)
-                                                .unwrap_or(0),
-                                        );
-                                        tracing::debug!(
+                                        admission::AdmitOutcome::AlreadyAdmitted => {}
+                                        admission::AdmitOutcome::Deferred { missing_parent } => {
+                                            // A block we can't admit because its parent is
+                                            // missing is still PROOF the network is at least
+                                            // at block.height. Rejecting it is correct, but
+                                            // dropping that height signal is what stalled a
+                                            // far-behind follower — record it so the sync tick
+                                            // pulls the gap forward instead of parking.
+                                            sync_peer::record_unverified_height(
+                                                &max_seen_for_rx,
+                                                block.header.height,
+                                                storage_for_handler
+                                                    .blocks
+                                                    .get_applied_tip()
+                                                    .ok()
+                                                    .flatten()
+                                                    .map(|(_, h)| h)
+                                                    .unwrap_or(0),
+                                            );
+                                            tracing::debug!(
                                             "Deferred gossiped block {} @ {} from {}: missing parent {}",
                                             hex::encode(&block.header.block_hash.as_bytes()[..8]),
                                             block.header.height,
                                             pid,
                                             hex::encode(&missing_parent.as_bytes()[..8])
                                         );
-                                        // SYNC-S3 — ANCESTRY RECOVERY (the 2026-07-27 silent
-                                        // partition). Recording the height signal is NOT enough.
-                                        // The 2s sync tick only pulls when `applied_height <
-                                        // target`, and it anchors every request at OUR OWN
-                                        // applied tip — which a peer on a different branch does
-                                        // not have, so it resolves the anchor to nothing and
-                                        // replies "Sending 0 blocks". Live reproduction: two
-                                        // producers, one dropped gossip message (B's first block,
-                                        // broadcast before its peer link was up), and from then on
-                                        // EVERY later block deferred on the previous undelivered
-                                        // one. A issued 236 GetBlocks; B answered "Sending 0
-                                        // blocks" 76/76 times, and vice versa. Both nodes stayed
-                                        // "healthy" — no errors, no root mismatches — while
-                                        // building permanently divergent chains.
-                                        //
-                                        // Fix: ask THIS peer for the missing parent directly. That
-                                        // anchor is one the peer provably holds (it just sent us
-                                        // its child), so the request is answerable, and
-                                        // `serve_blocks` returns the anchor's whole height-group
-                                        // plus everything above it — the ancestry we lack. Self-
-                                        // heals at depth 1, before a deep fork can form.
-                                        // `request_blocks` de-duplicates on the anchor while a
-                                        // request is in flight and honours the concurrency cap, so
-                                        // a run of deferrals cannot storm a peer.
-                                        //
-                                        // #150 — BOUNDED BY DISTANCE. This recovers a fork we
-                                        // NARROWLY missed. It is not a catch-up mechanism, and
-                                        // firing it while far behind actively prevents catch-up:
-                                        // when the gap is large, EVERY gossiped tip block is
-                                        // "missing its parent", so every one queued a request for a
-                                        // parent that is itself tens of thousands of blocks deep.
-                                        // Measured on boot1 at a 33k gap: 125 of 159 batches (79%)
-                                        // landed at the network tip and could never be applied,
-                                        // while those requests consumed the in-flight budget the
-                                        // ONE useful forward request needs.
-                                        //
-                                        // The window is derived, not picked: `block_batch_size` (32)
-                                        // x `max_concurrent_downloads` (16) is the most a node with
-                                        // a full in-flight window can legitimately be behind. Past
-                                        // that, the "missing parent" is not a fork, it is the gap —
-                                        // and the 2s forward driver already owns the gap.
-                                        let applied_now = storage_for_handler
-                                            .blocks
-                                            .get_applied_tip()
-                                            .ok()
-                                            .flatten()
-                                            .map(|(_, h)| h)
-                                            .unwrap_or(0);
-                                        let within_reach =
-                                            sync_peer::should_attempt_ancestry_recovery(
-                                                block.header.height,
-                                                applied_now,
-                                            );
-                                        if !within_reach {
-                                            tracing::debug!(
+                                            // SYNC-S3 — ANCESTRY RECOVERY (the 2026-07-27 silent
+                                            // partition). Recording the height signal is NOT enough.
+                                            // The 2s sync tick only pulls when `applied_height <
+                                            // target`, and it anchors every request at OUR OWN
+                                            // applied tip — which a peer on a different branch does
+                                            // not have, so it resolves the anchor to nothing and
+                                            // replies "Sending 0 blocks". Live reproduction: two
+                                            // producers, one dropped gossip message (B's first block,
+                                            // broadcast before its peer link was up), and from then on
+                                            // EVERY later block deferred on the previous undelivered
+                                            // one. A issued 236 GetBlocks; B answered "Sending 0
+                                            // blocks" 76/76 times, and vice versa. Both nodes stayed
+                                            // "healthy" — no errors, no root mismatches — while
+                                            // building permanently divergent chains.
+                                            //
+                                            // Fix: ask THIS peer for the missing parent directly. That
+                                            // anchor is one the peer provably holds (it just sent us
+                                            // its child), so the request is answerable, and
+                                            // `serve_blocks` returns the anchor's whole height-group
+                                            // plus everything above it — the ancestry we lack. Self-
+                                            // heals at depth 1, before a deep fork can form.
+                                            // `request_blocks` de-duplicates on the anchor while a
+                                            // request is in flight and honours the concurrency cap, so
+                                            // a run of deferrals cannot storm a peer.
+                                            //
+                                            // #150 — BOUNDED BY DISTANCE. This recovers a fork we
+                                            // NARROWLY missed. It is not a catch-up mechanism, and
+                                            // firing it while far behind actively prevents catch-up:
+                                            // when the gap is large, EVERY gossiped tip block is
+                                            // "missing its parent", so every one queued a request for a
+                                            // parent that is itself tens of thousands of blocks deep.
+                                            // Measured on boot1 at a 33k gap: 125 of 159 batches (79%)
+                                            // landed at the network tip and could never be applied,
+                                            // while those requests consumed the in-flight budget the
+                                            // ONE useful forward request needs.
+                                            //
+                                            // The window is derived, not picked: `block_batch_size` (32)
+                                            // x `max_concurrent_downloads` (16) is the most a node with
+                                            // a full in-flight window can legitimately be behind. Past
+                                            // that, the "missing parent" is not a fork, it is the gap —
+                                            // and the 2s forward driver already owns the gap.
+                                            let applied_now = storage_for_handler
+                                                .blocks
+                                                .get_applied_tip()
+                                                .ok()
+                                                .flatten()
+                                                .map(|(_, h)| h)
+                                                .unwrap_or(0);
+                                            let within_reach =
+                                                sync_peer::should_attempt_ancestry_recovery(
+                                                    block.header.height,
+                                                    applied_now,
+                                                );
+                                            if !within_reach {
+                                                tracing::debug!(
                                                 "SYNC-S3: skipping ancestry recovery for block @ {} \
                                                  — {} blocks above our applied tip {}; the forward \
                                                  sync driver owns this gap",
@@ -3043,34 +3093,36 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                                 block.header.height.saturating_sub(applied_now),
                                                 applied_now
                                             );
-                                        } else if let Some(peer) = pm_for_rx.get_peer(&pid) {
-                                            if let Err(e) = sync_for_rx
-                                                .request_blocks(
-                                                    &peer,
-                                                    missing_parent,
-                                                    // The selected parent sits exactly one
-                                                    // height below the block that deferred.
-                                                    block.header.height.saturating_sub(1),
-                                                )
-                                                .await
-                                            {
-                                                tracing::debug!(
+                                            } else if let Some(peer) = pm_for_rx.get_peer(&pid) {
+                                                if let Err(e) = sync_for_rx
+                                                    .request_blocks(
+                                                        &peer,
+                                                        missing_parent,
+                                                        // The selected parent sits exactly one
+                                                        // height below the block that deferred.
+                                                        block.header.height.saturating_sub(1),
+                                                    )
+                                                    .await
+                                                {
+                                                    tracing::debug!(
                                                     "SYNC-S3: ancestry request to {} for {} failed: {}",
                                                     pid,
                                                     hex::encode(&missing_parent.as_bytes()[..8]),
                                                     e
                                                 );
+                                                }
                                             }
                                         }
-                                    }
-                                    admission::AdmitOutcome::Rejected(why) => {
-                                        tracing::warn!(
-                                            "Rejected inconsistent block {} from {}: {}",
-                                            hex::encode(&block.header.block_hash.as_bytes()[..8]),
-                                            pid,
-                                            why
-                                        );
-                                    }
+                                        admission::AdmitOutcome::Rejected(why) => {
+                                            tracing::warn!(
+                                                "Rejected inconsistent block {} from {}: {}",
+                                                hex::encode(
+                                                    &block.header.block_hash.as_bytes()[..8]
+                                                ),
+                                                pid,
+                                                why
+                                            );
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -3165,12 +3217,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                         // counts — `AlreadyAdmitted` is a block we
                                         // already had, which is exactly what a peer
                                         // at our own height serves back forever.
-                                        newly_admitted += 1;
+                                        newly_admitted = newly_admitted.saturating_add(1);
                                         if block.header.height > highest_admitted {
                                             highest_admitted = block.header.height;
                                         }
                                         if completed_partial {
-                                            tracing::warn!(
+                                            // D4a: admission.rs already warns (budgeted); a
+                                            // per-block warn here doubled the storm.
+                                            tracing::debug!(
                                                 "Completed a partial admission of synced block {} @ {}",
                                                 hex::encode(&block.header.block_hash.as_bytes()[..8]),
                                                 block.header.height
@@ -3292,7 +3346,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                 // separate them.
                                 tracing::info!(
                                     "SYNCSCORE peer={} {:?} new={} anchor={} applied={} gap={} score={}",
-                                    &pid.0[..14.min(pid.0.len())],
+                                    pid.0.get(..14).unwrap_or(&pid.0),
                                     quality,
                                     newly_admitted,
                                     sync_for_rx.last_block_anchor_height(),
@@ -3494,7 +3548,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     stalled_samples = 0;
                     continue;
                 }
-                stalled_samples += 1;
+                stalled_samples = stalled_samples.saturating_add(1);
                 tracing::warn!(
                     "P2P message loop appears stalled: {} inbound messages shed since the last \
                      check while the loop processed none (sample {}/{})",
@@ -3509,7 +3563,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                          cannot serve peers or advance its applied tip. Exiting so the supervisor \
                          restarts it rather than running on as a node that looks healthy and \
                          syncs nothing.",
-                        CHECK_EVERY * STALLED_SAMPLES_BEFORE_FATAL
+                        CHECK_EVERY.saturating_mul(STALLED_SAMPLES_BEFORE_FATAL)
                     );
                     std::process::exit(1);
                 }
@@ -3526,8 +3580,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // Register initial stakeholders
     let coinbase_bytes = hex::decode(&config.mining.coinbase).unwrap_or_else(|_| vec![0; 20]);
     let mut coinbase = [0u8; 32];
-    let copy_len = coinbase_bytes.len().min(32);
-    coinbase[..copy_len].copy_from_slice(&coinbase_bytes[..copy_len]);
+    for (dst, src) in coinbase.iter_mut().zip(coinbase_bytes.iter()) {
+        *dst = *src;
+    }
     let validator_address =
         citrate_execution::types::Address(coinbase[0..20].try_into().unwrap_or([0; 20]));
     let _ =
@@ -3718,8 +3773,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // Parse coinbase address
         let coinbase_bytes = hex::decode(coinbase_str).unwrap_or_else(|_| vec![0; 20]);
         let mut coinbase = [0u8; 32];
-        let copy_len = coinbase_bytes.len().min(32);
-        coinbase[..copy_len].copy_from_slice(&coinbase_bytes[..copy_len]);
+        for (dst, src) in coinbase.iter_mut().zip(coinbase_bytes.iter()) {
+            *dst = *src;
+        }
 
         // WP-11: the block-signing key is a PERSISTED SECRET, not a derivation.
         //
@@ -3753,8 +3809,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             .state_db()
             .get_storage(&governance_addr, b"PARAM:treasury_percentage")
         {
-            if !bytes.is_empty() {
-                _treasury_percentage = bytes[0];
+            if let Some(&first) = bytes.first() {
+                _treasury_percentage = first;
             }
         }
 
@@ -3928,7 +3984,8 @@ fn load_or_generate_noise_keypair(
         citrate_network::NoiseKeypair::from_bytes(&key_bytes)
             .map_err(|e| anyhow::anyhow!("Failed to parse noise key: {}", e))
     } else {
-        let kp = citrate_network::NoiseKeypair::generate();
+        let kp = citrate_network::NoiseKeypair::generate()
+            .map_err(|e| anyhow::anyhow!("Failed to generate noise key: {}", e))?;
         let key_bytes = Zeroizing::new(kp.to_bytes());
         write_secret_file_0600(noise_key_path, &key_bytes)?;
         info!(

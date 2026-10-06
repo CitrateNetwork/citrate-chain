@@ -54,8 +54,8 @@ fn build_commitment_proof(statement: &[u8], response: &[u8; 32]) -> Vec<u8> {
 
     let mut proof = Vec::with_capacity(64 + statement.len());
     proof.extend_from_slice(&commitment); // 32 bytes
-    proof.extend_from_slice(response);     // 32 bytes
-    proof.extend_from_slice(statement);    // variable
+    proof.extend_from_slice(response); // 32 bytes
+    proof.extend_from_slice(statement); // variable
     proof
 }
 
@@ -100,7 +100,12 @@ fn build_proof_verify_input(model_id: &[u8; 32], proof_data: &[u8]) -> Vec<u8> {
 
 /// Build an encryption input.
 /// Format: operation (1) || model_id (32) || address (20) || extra_data
-fn build_encryption_input(operation: u8, model_id: &[u8; 32], addr: &[u8; 20], extra: &[u8]) -> Vec<u8> {
+fn build_encryption_input(
+    operation: u8,
+    model_id: &[u8; 32],
+    addr: &[u8; 20],
+    extra: &[u8],
+) -> Vec<u8> {
     let mut input = Vec::with_capacity(53 + extra.len());
     input.push(operation);
     input.extend_from_slice(model_id);
@@ -285,7 +290,8 @@ fn test_gas_cost_batch_discount_range() {
 fn test_gas_cost_per_element_scaling() {
     let base = gas_costs::INFERENCE_BASE;
     let cost_10 = base + 10 * gas_costs::INFERENCE_PER_INPUT + 2 * gas_costs::INFERENCE_PER_OUTPUT;
-    let cost_100 = base + 100 * gas_costs::INFERENCE_PER_INPUT + 2 * gas_costs::INFERENCE_PER_OUTPUT;
+    let cost_100 =
+        base + 100 * gas_costs::INFERENCE_PER_INPUT + 2 * gas_costs::INFERENCE_PER_OUTPUT;
     assert!(cost_100 > cost_10);
     let delta_10 = cost_10 - base;
     let delta_100 = cost_100 - base;
@@ -317,7 +323,11 @@ fn test_all_seven_ai_precompile_addresses_distinct() {
     ];
     for i in 0..addrs.len() {
         for j in (i + 1)..addrs.len() {
-            assert_ne!(addrs[i], addrs[j], "Addresses {} and {} must be distinct", i, j);
+            assert_ne!(
+                addrs[i], addrs[j],
+                "Addresses {} and {} must be distinct",
+                i, j
+            );
         }
     }
 }
@@ -336,9 +346,18 @@ fn test_ai_precompile_addresses_in_correct_namespace() {
     // AI precompiles live in the 0x0100–0x0106 page: bytes 0..18 are zero, byte 18
     // is the namespace high byte (0x01), byte 19 is the operation id.
     for (addr, expected_id) in &addrs {
-        assert!(addr[..18].iter().all(|&b| b == 0), "AI precompile high bytes must be zero");
-        assert_eq!(addr[18], 1, "AI precompile namespace byte (0x01__) must be 1");
-        assert_eq!(addr[19], *expected_id, "AI precompile op id (byte 19) must match");
+        assert!(
+            addr[..18].iter().all(|&b| b == 0),
+            "AI precompile high bytes must be zero"
+        );
+        assert_eq!(
+            addr[18], 1,
+            "AI precompile namespace byte (0x01__) must be 1"
+        );
+        assert_eq!(
+            addr[19], *expected_id,
+            "AI precompile op id (byte 19) must match"
+        );
     }
 }
 
@@ -354,8 +373,14 @@ fn test_x402_precompile_addresses_separate_namespace() {
     // x402 precompiles live in the 0x0200–0x0202 page: namespace high byte (0x02)
     // is byte 18, distinct from the AI page (0x01__).
     for addr in &x402_list {
-        assert!(addr[..18].iter().all(|&b| b == 0), "x402 precompile high bytes must be zero");
-        assert_eq!(addr[18], 2, "x402 precompile namespace byte (0x02__) must be 2");
+        assert!(
+            addr[..18].iter().all(|&b| b == 0),
+            "x402 precompile high bytes must be zero"
+        );
+        assert_eq!(
+            addr[18], 2,
+            "x402 precompile namespace byte (0x02__) must be 2"
+        );
     }
 
     let ai_list = [
@@ -435,7 +460,9 @@ fn test_access_control_private_model_blocks_stranger() {
     // Deploy a model
     let addr_deploy = precompile_addr(addresses::MODEL_DEPLOY);
     let deploy_input = build_deploy_input(&[0x01; 100], &[0x02; 200]);
-    let deploy_result = precompile.execute(&addr_deploy, &deploy_input, 1_000_000).unwrap();
+    let deploy_result = precompile
+        .execute(&addr_deploy, &deploy_input, 1_000_000)
+        .unwrap();
     let model_id_bytes: [u8; 32] = deploy_result.output.try_into().unwrap();
 
     // Register as private
@@ -454,7 +481,11 @@ fn test_access_control_private_model_blocks_stranger() {
     let result = precompile.execute(&addr_infer, &inference_input, 1_000_000);
     assert!(result.is_err());
     let msg = err_msg(result);
-    assert!(msg.contains("Access denied"), "Expected access denied: {}", msg);
+    assert!(
+        msg.contains("Access denied"),
+        "Expected access denied: {}",
+        msg
+    );
 }
 
 #[test]
@@ -467,7 +498,9 @@ fn test_access_control_public_model_allows_anyone() {
     // Deploy a model
     let addr_deploy = precompile_addr(addresses::MODEL_DEPLOY);
     let deploy_input = build_deploy_input(&[0x01; 100], &[0x02; 200]);
-    let deploy_result = precompile.execute(&addr_deploy, &deploy_input, 1_000_000).unwrap();
+    let deploy_result = precompile
+        .execute(&addr_deploy, &deploy_input, 1_000_000)
+        .unwrap();
     let model_id_bytes: [u8; 32] = deploy_result.output.try_into().unwrap();
 
     // Register as public
@@ -515,7 +548,9 @@ fn test_access_control_restricted_model_allows_allowlisted() {
     // Deploy a model
     let addr_deploy = precompile_addr(addresses::MODEL_DEPLOY);
     let deploy_input = build_deploy_input(&[0x01; 100], &[0x02; 200]);
-    let deploy_result = precompile.execute(&addr_deploy, &deploy_input, 1_000_000).unwrap();
+    let deploy_result = precompile
+        .execute(&addr_deploy, &deploy_input, 1_000_000)
+        .unwrap();
     let model_id_bytes: [u8; 32] = deploy_result.output.try_into().unwrap();
 
     let owner = Address([0xAA; 20]);
@@ -534,7 +569,11 @@ fn test_access_control_restricted_model_allows_allowlisted() {
     let denied_result = precompile.execute(&addr_infer, &denied_input, 1_000_000);
     assert!(denied_result.is_err());
     let msg = err_msg(denied_result);
-    assert!(msg.contains("Access denied"), "Restricted model should deny: {}", msg);
+    assert!(
+        msg.contains("Access denied"),
+        "Restricted model should deny: {}",
+        msg
+    );
 
     // Allowed caller — passes access check, reaches Metal runtime
     let allowed_input = build_inference_input(&model_id_bytes, &allowed.0, &[0u8; 8]);
@@ -566,7 +605,9 @@ fn test_access_control_unregistered_model_defaults_to_public() {
     // Deploy but do NOT register access control
     let addr_deploy = precompile_addr(addresses::MODEL_DEPLOY);
     let deploy_input = build_deploy_input(&[0x01; 100], &[0x02; 200]);
-    let deploy_result = precompile.execute(&addr_deploy, &deploy_input, 1_000_000).unwrap();
+    let deploy_result = precompile
+        .execute(&addr_deploy, &deploy_input, 1_000_000)
+        .unwrap();
     let model_id_bytes: [u8; 32] = deploy_result.output.try_into().unwrap();
 
     // Any caller should pass access check (no policy = public)
@@ -820,7 +861,9 @@ fn test_deploy_then_query_metadata() {
 
     let addr_deploy = precompile_addr(addresses::MODEL_DEPLOY);
     let deploy_input = build_deploy_input(&[0x01; 100], &[0x02; 200]);
-    let deploy_result = precompile.execute(&addr_deploy, &deploy_input, 1_000_000).unwrap();
+    let deploy_result = precompile
+        .execute(&addr_deploy, &deploy_input, 1_000_000)
+        .unwrap();
     let model_id = deploy_result.output;
 
     let addr_metadata = precompile_addr(addresses::MODEL_METADATA);
@@ -849,7 +892,9 @@ fn test_deploy_then_benchmark() {
 
     let addr_deploy = precompile_addr(addresses::MODEL_DEPLOY);
     let deploy_input = build_deploy_input(&[0x01; 100], &[0x02; 200]);
-    let deploy_result = precompile.execute(&addr_deploy, &deploy_input, 1_000_000).unwrap();
+    let deploy_result = precompile
+        .execute(&addr_deploy, &deploy_input, 1_000_000)
+        .unwrap();
     let model_id = deploy_result.output;
 
     let addr_bench = precompile_addr(addresses::MODEL_BENCHMARK);
@@ -919,7 +964,10 @@ fn test_deploy_same_input_same_model_id() {
     let mut p2 = InferencePrecompile::new(runtime);
     let r2 = p2.execute(&addr, &deploy_input, 1_000_000).unwrap();
 
-    assert_eq!(r1.output, r2.output, "Same input must produce same model ID");
+    assert_eq!(
+        r1.output, r2.output,
+        "Same input must produce same model ID"
+    );
 }
 
 #[test]

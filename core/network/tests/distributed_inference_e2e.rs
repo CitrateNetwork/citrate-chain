@@ -125,10 +125,7 @@ mod distributed_inference {
             },
             weight_cid: "QmInferenceModelCID".to_string(),
         };
-        handler_a
-            .handle_message(&peer_b, &announce)
-            .await
-            .unwrap();
+        handler_a.handle_message(&peer_b, &announce).await.unwrap();
 
         // Now send an inference request
         let request_id = Hash::new([20u8; 32]);

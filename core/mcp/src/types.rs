@@ -68,9 +68,9 @@ pub struct PricingModel {
 /// Supported currencies
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Currency {
-    SALT,  // Native Citrate token
-    ETH,   // Ethereum
-    USDC,  // USD Coin
+    SALT, // Native Citrate token
+    ETH,  // Ethereum
+    USDC, // USD Coin
 }
 
 /// Provider information

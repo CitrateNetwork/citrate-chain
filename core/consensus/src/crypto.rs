@@ -28,8 +28,8 @@ fn is_ecdsa_transaction(tx: &Transaction) -> bool {
 
     // ECDSA transactions have a 20-byte Ethereum address embedded in the first 20 bytes
     // with the remaining 12 bytes as zeros
-    let is_evm_address = from_bytes[20..].iter().all(|&b| b == 0)
-        && !from_bytes[..20].iter().all(|&b| b == 0);
+    let is_evm_address =
+        from_bytes[20..].iter().all(|&b| b == 0) && !from_bytes[..20].iter().all(|&b| b == 0);
 
     is_evm_address
 }
@@ -159,7 +159,7 @@ pub fn canonical_tx_bytes_v2(tx: &Transaction) -> Vec<u8> {
             None => out.push(0),
         }
     }
-    let mut data = Vec::with_capacity(160 + tx.data.len());
+    let mut data = Vec::with_capacity(tx.data.len().saturating_add(160));
     data.extend_from_slice(NATIVE_TX_V2_DOMAIN);
     opt_u64(&mut data, tx.chain_id);
     data.extend_from_slice(&tx.nonce.to_le_bytes());
@@ -470,8 +470,14 @@ mod tests {
         let key = SigningKey::from_bytes(&[0x42; 32]);
         let mut tx = pba_native_tx();
         sign_transaction_v2(&mut tx, &key).expect("sign v2");
-        assert!(verify_transaction(&tx).expect("verify"), "V2 signature verifies");
-        assert!(verify_transaction_with_policy(&tx, false).expect("verify"), "V2 passes strict policy");
+        assert!(
+            verify_transaction(&tx).expect("verify"),
+            "V2 signature verifies"
+        );
+        assert!(
+            verify_transaction_with_policy(&tx, false).expect("verify"),
+            "V2 passes strict policy"
+        );
 
         type Mutation = fn(&mut Transaction);
         let mutations: [(&str, Mutation); 13] = [
@@ -643,7 +649,13 @@ mod tests {
 
     #[test]
     fn test_registration_digest_matches_solidity() {
-        let d = registration_digest(V_CHAIN_ID, &V_REGISTRY, &V_STAKER, &vector_pubkey(), V_NONCE);
+        let d = registration_digest(
+            V_CHAIN_ID,
+            &V_REGISTRY,
+            &V_STAKER,
+            &vector_pubkey(),
+            V_NONCE,
+        );
         assert_eq!(
             hex::encode(d),
             "43e3b0efc79703bd0e9327f6c6e6fcd080b6b69bf6096b2add28ed273afdd953",
@@ -667,7 +679,8 @@ mod tests {
         // which uses ed25519_dalek::verify_strict (canonical S + non-small-order R).
         let signing_key = generate_keypair();
         let vk = signing_key.verifying_key();
-        let digest = equivocation_vote_digest(V_CHAIN_ID, &V_REGISTRY, V_HEIGHT, &vector_block_hash());
+        let digest =
+            equivocation_vote_digest(V_CHAIN_ID, &V_REGISTRY, V_HEIGHT, &vector_block_hash());
         let sig = sign_equivocation_vote(
             V_CHAIN_ID,
             &V_REGISTRY,
@@ -690,7 +703,14 @@ mod tests {
         let vk = signing_key.verifying_key();
         let pk = vk.to_bytes();
         let digest = registration_digest(V_CHAIN_ID, &V_REGISTRY, &V_STAKER, &pk, V_NONCE);
-        let sig = sign_registration(V_CHAIN_ID, &V_REGISTRY, &V_STAKER, &pk, V_NONCE, &signing_key);
+        let sig = sign_registration(
+            V_CHAIN_ID,
+            &V_REGISTRY,
+            &V_STAKER,
+            &pk,
+            V_NONCE,
+            &signing_key,
+        );
         let dalek_sig = DalekSignature::from_bytes(sig.as_bytes());
         assert!(vk.verify_strict(&digest, &dalek_sig).is_ok());
     }

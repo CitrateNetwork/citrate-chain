@@ -45,5 +45,9 @@ pub trait SigningProvider: Send + Sync {
     /// Verify a webhook signature (Docusign Connect HMAC-SHA-256). Returns Ok if the
     /// signature is valid for the supplied raw payload bytes; SigningError::WebhookSignatureInvalid
     /// otherwise. Webhook handler MUST call this before trusting any payload field.
-    fn verify_webhook_signature(&self, payload: &[u8], signature_header: &str) -> Result<(), SigningError>;
+    fn verify_webhook_signature(
+        &self,
+        payload: &[u8],
+        signature_header: &str,
+    ) -> Result<(), SigningError>;
 }

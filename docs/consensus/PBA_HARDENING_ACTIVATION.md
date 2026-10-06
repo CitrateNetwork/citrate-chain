@@ -3,7 +3,8 @@ title: "R2 block-validity hardening: activation runbook for chain 40204"
 created: 2026-09-25
 branch: fix/pba-r2-chain-consensus
 author: Larry Klosowski + Claude Opus 5.5
-status: READY. Rules ship OFF on 40204; the owner schedules the height.
+status: READY. 40204 pinned to genesis (`Some(0)`) for the PANIC-S1 reroll (owner, 2026-10-01).
+updated: 2026-10-01
 chain: 40204
 ---
 
@@ -48,6 +49,16 @@ This is a consensus parameter. Two nodes with different values disagree about bl
 **Rollback before `H`:** unset the height (or set `off`) on every node and restart.
 
 **After `H`:** don't unset it. A node without the setting forks off. Don't downgrade a node past `H` either; if one was run on an older release after `H`, move its data directory aside before starting the new release again, so it resyncs from peers.
+
+## Rerolls (a new 40204 genesis)
+
+A reroll resets the chain height to 0. It does not reset `PINNED_ACTIVATIONS`: a pin chosen for the old chain's tip carries into the new chain as a height far in the future. The rules then stay off until that height and switch on mid-chain with no one having scheduled it.
+
+The PANIC-S1 reroll pins 40204 to `Some(0)`. The rules apply to every block after the new genesis, and genesis itself is never re-judged (`chain_40204_hardening_active_from_genesis`).
+
+- **At every reroll, re-check the pin:** `Some(0)` to start hardened, or a height chosen for the new chain.
+- **A genesis-pinned release runs only on the new genesis.** On a data directory from the previous 40204 genesis it judges that chain's history from block 1 under the new rules and forks off. Ship it only together with the reroll's genesis and wiped data directories (producers, bootnodes, RPC nodes, and the citrate-core bundled node).
+- After the reroll, confirm every node logs `chain 40204 pba_hardening_height 0 (source: release pin)` and the same activation fingerprint.
 
 ## Nodes that upgrade late
 

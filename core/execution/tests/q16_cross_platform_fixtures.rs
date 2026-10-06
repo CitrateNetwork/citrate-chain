@@ -33,20 +33,20 @@ use citrate_execution::precompiles::q16::{ops as q16_ops, q16_exp, Q16};
 /// linux-aarch64 (DGX Spark). Any divergence on another platform
 /// is a CROSS-PLATFORM DETERMINISM BUG — surface it loudly.
 const EXP_FIXTURES: &[(i64, i64)] = &[
-    (0, 65_536),                    // exp(0) = 1.0 in Q16
-    (65_536, 178_146),              // exp(1)  ≈ 2.71828
-    (-65_536, 24_110),              // exp(-1) ≈ 0.36788
-    (32_768, 108_050),              // exp(0.5) ≈ 1.64872
-    (-32_768, 39_750),              // exp(-0.5) ≈ 0.60653
-    (327_680, 9_726_336),           // exp(5)  ≈ 148.413
-    (-327_680, 442),                // exp(-5) ≈ 0.00674 → 442/65536
-    (655_360, 1_443_528_704),       // exp(10) ≈ 22026.4 in Q16
+    (0, 65_536),              // exp(0) = 1.0 in Q16
+    (65_536, 178_146),        // exp(1)  ≈ 2.71828
+    (-65_536, 24_110),        // exp(-1) ≈ 0.36788
+    (32_768, 108_050),        // exp(0.5) ≈ 1.64872
+    (-32_768, 39_750),        // exp(-0.5) ≈ 0.60653
+    (327_680, 9_726_336),     // exp(5)  ≈ 148.413
+    (-327_680, 442),          // exp(-5) ≈ 0.00674 → 442/65536
+    (655_360, 1_443_528_704), // exp(10) ≈ 22026.4 in Q16
     // exp(11) ≈ 59874.14 — now representable under i64 (was i32::MAX).
-    (720_896, 3_923_968_000),       // 3923968000/65536 = 59874.02
+    (720_896, 3_923_968_000), // 3923968000/65536 = 59874.02
     // exp(16) ≈ 8.886e6 — now representable under i64 (was i32::MAX);
     // raw 5.82e11 > i32::MAX, so this value genuinely requires i64.
-    (1_048_576, 582_362_333_184),   // 582362333184/65536 = 8886261
-    (-1_048_576, 0),                // exp(-16) underflows to 0
+    (1_048_576, 582_362_333_184), // 582362333184/65536 = 8886261
+    (-1_048_576, 0),              // exp(-16) underflows to 0
 ];
 
 #[test]
@@ -127,9 +127,15 @@ fn q16_softmax_uniform_fixture() {
 
 #[test]
 fn q16_relu_fixtures() {
-    let v: Vec<Q16> = [-2, -1, 0, 1, 2].iter().map(|&n| Q16::from_int(n)).collect();
+    let v: Vec<Q16> = [-2, -1, 0, 1, 2]
+        .iter()
+        .map(|&n| Q16::from_int(n))
+        .collect();
     let out = q16_ops::relu(&v);
-    let expected: Vec<i64> = vec![0i64, 0, 0, 1, 2].into_iter().map(|n| n << 16).collect();
+    let expected: Vec<i64> = vec![0i64, 0, 0, 1, 2]
+        .into_iter()
+        .map(|n| n << 16)
+        .collect();
     let actual: Vec<i64> = out.iter().map(|q| q.0).collect();
     assert_eq!(actual, expected);
 }
@@ -149,9 +155,15 @@ fn q16_linear_fixtures() {
 #[test]
 fn q16_transpose_fixtures() {
     // [[1,2,3],[4,5,6]] → [[1,4],[2,5],[3,6]]
-    let m: Vec<Q16> = [1, 2, 3, 4, 5, 6].iter().map(|&n| Q16::from_int(n)).collect();
+    let m: Vec<Q16> = [1, 2, 3, 4, 5, 6]
+        .iter()
+        .map(|&n| Q16::from_int(n))
+        .collect();
     let out = q16_ops::transpose(&m, 2, 3);
-    let expected: Vec<i64> = vec![1i64, 4, 2, 5, 3, 6].into_iter().map(|n| n << 16).collect();
+    let expected: Vec<i64> = vec![1i64, 4, 2, 5, 3, 6]
+        .into_iter()
+        .map(|n| n << 16)
+        .collect();
     let actual: Vec<i64> = out.iter().map(|q| q.0).collect();
     assert_eq!(actual, expected);
 }

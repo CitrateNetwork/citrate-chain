@@ -166,7 +166,8 @@ fn test_large_state_rollback() {
         assert_eq!(
             db.accounts.get_balance(&addr),
             U256::from(i as u64 * 100),
-            "Account {} balance wrong after rollback", i
+            "Account {} balance wrong after rollback",
+            i
         );
     }
 }
@@ -216,9 +217,18 @@ fn test_multiple_storage_slots_rollback() {
 
     db.restore(snap);
 
-    assert_eq!(db.get_storage(&contract, b"slot_0"), Some(b"val_0".to_vec()));
-    assert_eq!(db.get_storage(&contract, b"slot_1"), Some(b"val_1".to_vec()));
-    assert_eq!(db.get_storage(&contract, b"slot_2"), Some(b"val_2".to_vec()));
+    assert_eq!(
+        db.get_storage(&contract, b"slot_0"),
+        Some(b"val_0".to_vec())
+    );
+    assert_eq!(
+        db.get_storage(&contract, b"slot_1"),
+        Some(b"val_1".to_vec())
+    );
+    assert_eq!(
+        db.get_storage(&contract, b"slot_2"),
+        Some(b"val_2".to_vec())
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -242,5 +252,8 @@ fn test_mixed_account_and_storage_rollback() {
     db.restore(snap);
 
     assert_eq!(db.accounts.get_balance(&alice), U256::from(1000));
-    assert_eq!(db.get_storage(&contract, b"key"), Some(b"original".to_vec()));
+    assert_eq!(
+        db.get_storage(&contract, b"key"),
+        Some(b"original".to_vec())
+    );
 }

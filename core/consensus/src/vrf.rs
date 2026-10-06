@@ -99,7 +99,14 @@ impl VrfProposerSelector {
         validators.clear();
         let mut sum: u128 = 0;
         for (pubkey, stake) in entries {
-            validators.insert(pubkey, Validator { pubkey, stake, is_active: true });
+            validators.insert(
+                pubkey,
+                Validator {
+                    pubkey,
+                    stake,
+                    is_active: true,
+                },
+            );
             sum = sum.saturating_add(stake);
         }
         *total = sum;
@@ -131,7 +138,8 @@ impl VrfProposerSelector {
         let mut total_stake = self.total_stake.write().await;
 
         if validator.is_active {
-            *total_stake += validator.stake;
+            // u128 sum of stakes is bounded by total supply (~1e30 wei) << u128::MAX.
+            *total_stake = total_stake.saturating_add(validator.stake);
         }
 
         validators.insert(validator.pubkey, validator.clone());
@@ -225,7 +233,8 @@ impl VrfProposerSelector {
             if slot >= self.legacy_vrf_cutoff_height {
                 tracing::warn!(
                     "H-06: rejecting legacy 32-byte VRF proof at slot {} (cutoff {})",
-                    slot, self.legacy_vrf_cutoff_height
+                    slot,
+                    self.legacy_vrf_cutoff_height
                 );
                 return Ok(false);
             }
@@ -443,7 +452,7 @@ impl VrfProposerSelector {
         if let Some(validator) = validators.get_mut(pubkey) {
             if validator.is_active {
                 *total_stake = total_stake.saturating_sub(validator.stake);
-                *total_stake += new_stake;
+                *total_stake = total_stake.saturating_add(new_stake);
             }
             validator.stake = new_stake;
             Ok(())
@@ -492,12 +501,12 @@ impl LeaderElection {
 
     /// Get current epoch from slot
     pub fn get_epoch(&self, slot: u64) -> u64 {
-        slot / self.slots_per_epoch
+        slot.checked_div(self.slots_per_epoch).unwrap_or(0)
     }
 
     /// Get slot within epoch
     pub fn get_slot_in_epoch(&self, slot: u64) -> u64 {
-        slot % self.slots_per_epoch
+        slot.checked_rem(self.slots_per_epoch).unwrap_or(0)
     }
 
     /// Elect leader for a slot
@@ -537,6 +546,58 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn panic_s1_update_stake_moves_the_total_exactly() {
+        let sel = VrfProposerSelector::new();
+        let active = PublicKey::new([1; 32]);
+        let idle = PublicKey::new([2; 32]);
+        sel.register_validator(Validator {
+            pubkey: active,
+            stake: 100,
+            is_active: true,
+        })
+        .await;
+        sel.register_validator(Validator {
+            pubkey: idle,
+            stake: 40,
+            is_active: false,
+        })
+        .await;
+        assert_eq!(sel.total_stake().await, 100);
+
+        sel.update_stake(&active, 250)
+            .await
+            .expect("known validator");
+        assert_eq!(
+            sel.total_stake().await,
+            250,
+            "active stake change moves the total"
+        );
+
+        sel.update_stake(&idle, 999).await.expect("known validator");
+        assert_eq!(
+            sel.total_stake().await,
+            250,
+            "inactive stake is not in the total"
+        );
+
+        assert!(matches!(
+            sel.update_stake(&PublicKey::new([3; 32]), 1).await,
+            Err(VrfError::ValidatorNotFound)
+        ));
+    }
+
+    #[test]
+    fn panic_s1_epoch_math_never_divides_by_zero() {
+        let sel = Arc::new(VrfProposerSelector::new());
+        let le = LeaderElection::new(sel.clone(), 10);
+        assert_eq!(le.get_epoch(25), 2);
+        assert_eq!(le.get_slot_in_epoch(25), 5);
+        let zero = LeaderElection::new(sel, 0);
+        assert_eq!(zero.get_epoch(25), 0);
+        assert_eq!(zero.get_slot_in_epoch(25), 0);
+    }
+
+    #[tokio::test]
     async fn test_validator_registration() {
         let selector = VrfProposerSelector::new();
 
@@ -563,7 +624,11 @@ mod tests {
         let selector = VrfProposerSelector::new().with_min_stake(32_000);
         let pk = PublicKey::new([7; 32]);
         selector
-            .register_validator(Validator { pubkey: pk, stake: 32_000, is_active: true })
+            .register_validator(Validator {
+                pubkey: pk,
+                stake: 32_000,
+                is_active: true,
+            })
             .await;
         // exactly at the floor → eligible; verdict is independent of vrf_output/slot
         assert!(selector
@@ -581,7 +646,11 @@ mod tests {
         let selector = VrfProposerSelector::new().with_min_stake(32_000);
         let pk = PublicKey::new([8; 32]);
         selector
-            .register_validator(Validator { pubkey: pk, stake: 31_999, is_active: true })
+            .register_validator(Validator {
+                pubkey: pk,
+                stake: 31_999,
+                is_active: true,
+            })
             .await;
         assert!(!selector
             .is_eligible_proposer(&pk, &Hash::new([1; 32]), 1)
@@ -594,7 +663,11 @@ mod tests {
         let selector = VrfProposerSelector::new().with_min_stake(0);
         let pk = PublicKey::new([9; 32]);
         selector
-            .register_validator(Validator { pubkey: pk, stake: 1_000_000, is_active: false })
+            .register_validator(Validator {
+                pubkey: pk,
+                stake: 1_000_000,
+                is_active: false,
+            })
             .await;
         assert!(!selector
             .is_eligible_proposer(&pk, &Hash::new([1; 32]), 1)
@@ -607,7 +680,11 @@ mod tests {
         let selector = VrfProposerSelector::new().with_min_stake(1_000);
         let stale = PublicKey::new([0xEE; 32]);
         selector
-            .register_validator(Validator { pubkey: stale, stake: 5_000, is_active: true })
+            .register_validator(Validator {
+                pubkey: stale,
+                stake: 5_000,
+                is_active: true,
+            })
             .await;
 
         // Snapshot from S(E): a fresh set + new minStake, replacing everything.
@@ -622,12 +699,20 @@ mod tests {
         assert_eq!(selector.active_validator_count().await, 2);
         // stale validator is gone (not in the snapshot)
         assert!(matches!(
-            selector.is_eligible_proposer(&stale, &Hash::new([0; 32]), 1).await,
+            selector
+                .is_eligible_proposer(&stale, &Hash::new([0; 32]), 1)
+                .await,
             Err(VrfError::ValidatorNotFound)
         ));
         // new members eligible at/above the new minStake
-        assert!(selector.is_eligible_proposer(&a, &Hash::new([0; 32]), 1).await.unwrap());
-        assert!(selector.is_eligible_proposer(&b, &Hash::new([0; 32]), 1).await.unwrap());
+        assert!(selector
+            .is_eligible_proposer(&a, &Hash::new([0; 32]), 1)
+            .await
+            .unwrap());
+        assert!(selector
+            .is_eligible_proposer(&b, &Hash::new([0; 32]), 1)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -635,7 +720,9 @@ mod tests {
         let selector = VrfProposerSelector::new();
         let pk = PublicKey::new([10; 32]);
         assert!(matches!(
-            selector.is_eligible_proposer(&pk, &Hash::new([1; 32]), 1).await,
+            selector
+                .is_eligible_proposer(&pk, &Hash::new([1; 32]), 1)
+                .await,
             Err(VrfError::ValidatorNotFound)
         ));
     }
@@ -647,7 +734,11 @@ mod tests {
         let selector = VrfProposerSelector::new().with_min_stake(32_000);
         let pk = PublicKey::new([11; 32]);
         selector
-            .register_validator(Validator { pubkey: pk, stake: 32_000, is_active: true })
+            .register_validator(Validator {
+                pubkey: pk,
+                stake: 32_000,
+                is_active: true,
+            })
             .await;
         for slot in 0..200u64 {
             assert!(
@@ -780,10 +871,7 @@ mod tests {
                 &block_sig,
             )
             .expect("verify");
-        assert!(
-            r,
-            "REM-N-01: legitimate proposer + signature must verify"
-        );
+        assert!(r, "REM-N-01: legitimate proposer + signature must verify");
     }
 
     #[tokio::test]
