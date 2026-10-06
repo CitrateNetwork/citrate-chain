@@ -3,7 +3,9 @@ $ErrorActionPreference = "Stop"
 $ServiceScript = Join-Path $PSScriptRoot "citrate-node.service.ps1"
 $TestNetworkServiceSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-20")
 $TestAuthenticatedUsersSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-11")
-$TestRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("Citrate service test " + [guid]::NewGuid().ToString("N"))
+$TestSystemSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18")
+$TestAdministratorsSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
+$TestRoot = Join-Path ([Environment]::GetFolderPath("CommonApplicationData")) ("Citrate service test " + [guid]::NewGuid().ToString("N"))
 
 function Assert-Equal {
     param(
@@ -64,10 +66,13 @@ function Assert-Throws {
     throw "$Message Expected an error matching '$MessagePattern'."
 }
 
-function Grant-NetworkServiceFullControl {
+function Grant-NetworkServiceAccess {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Path
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [System.Security.AccessControl.FileSystemRights]$Rights
     )
 
     $acl = Get-Acl -LiteralPath $Path
@@ -78,7 +83,7 @@ function Grant-NetworkServiceFullControl {
     }
     $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
         $TestNetworkServiceSid,
-        [System.Security.AccessControl.FileSystemRights]::FullControl,
+        $Rights,
         $inheritance,
         [System.Security.AccessControl.PropagationFlags]::None,
         [System.Security.AccessControl.AccessControlType]::Allow
@@ -203,6 +208,22 @@ try {
     $ConfigPath = Join-Path $DataDir "node.toml"
     $ArgumentProbe = Join-Path $TestRoot "argument-probe.exe"
 
+    $null = New-Item -ItemType Directory -Path $TestRoot
+    $testRootAcl = Get-Acl -LiteralPath $TestRoot
+    $testRootAcl.SetAccessRuleProtection($true, $false)
+    $testRootInheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+    foreach ($sid in @(
+        [System.Security.Principal.WindowsIdentity]::GetCurrent().User,
+        $TestSystemSid,
+        $TestAdministratorsSid
+    )) {
+        $null = $testRootAcl.AddAccessRule((New-TestAccessRule `
+            -Sid $sid `
+            -Rights ([System.Security.AccessControl.FileSystemRights]::FullControl) `
+            -InheritanceFlags $testRootInheritance))
+    }
+    Set-Acl -LiteralPath $TestRoot -AclObject $testRootAcl
+
     $null = New-Item -ItemType Directory -Path $DatabasePath -Force
     $null = New-Item -ItemType Directory -Path $NodeDirectory -Force
     [System.IO.File]::WriteAllText($NodeBin, "test executable")
@@ -224,9 +245,8 @@ public static class ArgumentProbe
 }
 '@ -Language CSharp -OutputAssembly $ArgumentProbe -OutputType ConsoleApplication
 
-    foreach ($path in @($TestRoot, $DataDir, $DatabasePath, $NodeDirectory, $NodeBin, $ConfigPath)) {
-        Grant-NetworkServiceFullControl -Path $path
-    }
+    Grant-NetworkServiceAccess -Path $TestRoot -Rights ([System.Security.AccessControl.FileSystemRights]::ReadAndExecute)
+    Grant-NetworkServiceAccess -Path $DatabasePath -Rights ([System.Security.AccessControl.FileSystemRights]::Modify)
 
     $beforeSnapshot = Get-TestTreeSnapshot -Path $TestRoot
     $plan = Invoke-Validation -NodeBin $NodeBin -DataDir $DataDir -ConfigPath $ConfigPath
@@ -260,7 +280,8 @@ public static class ArgumentProbe
     Assert-Equal -Actual $plan.ConfigPath -Expected $expectedConfigPath -Message "Normalized config path differs."
     Assert-Equal -Actual $defaultConfigPlan.ConfigPath -Expected $expectedConfigPath -Message "Default ConfigPath is not DataDir\node.toml."
     Assert-Equal -Actual $plan.ImagePath -Expected $expectedImagePath -Message "ImagePath quoting differs."
-    Assert-Equal -Actual $plan.ScExecutable -Expected (Join-Path $env:SystemRoot "System32\sc.exe") -Message "sc.exe path differs."
+    $expectedWindowsDirectory = Split-Path -Parent ([Environment]::SystemDirectory)
+    Assert-Equal -Actual $plan.ScExecutable -Expected (Join-Path $expectedWindowsDirectory "System32\sc.exe") -Message "sc.exe path differs."
     if (-not [System.IO.Path]::IsPathRooted($plan.ScExecutable)) {
         throw "sc.exe path is not absolute."
     }
@@ -282,15 +303,15 @@ public static class ArgumentProbe
 
     $wrongConfig = Join-Path $DataDir "config.toml"
     [System.IO.File]::WriteAllText($wrongConfig, "network = 'test'")
-    Grant-NetworkServiceFullControl -Path $wrongConfig
+    Grant-NetworkServiceAccess -Path $wrongConfig -Rights ([System.Security.AccessControl.FileSystemRights]::Read)
     Assert-Throws -Operation { Invoke-Validation -NodeBin $NodeBin -DataDir $DataDir -ConfigPath $wrongConfig } -MessagePattern "canonical node.toml" -Message "Noncanonical config filename was accepted."
 
     $missingDatabaseDataDir = Join-Path $TestRoot "Missing Database"
     $null = New-Item -ItemType Directory -Path $missingDatabaseDataDir
     $missingDatabaseConfig = Join-Path $missingDatabaseDataDir "node.toml"
     [System.IO.File]::WriteAllText($missingDatabaseConfig, "network = 'test'")
-    Grant-NetworkServiceFullControl -Path $missingDatabaseDataDir
-    Grant-NetworkServiceFullControl -Path $missingDatabaseConfig
+    Grant-NetworkServiceAccess -Path $missingDatabaseDataDir -Rights ([System.Security.AccessControl.FileSystemRights]::ReadAndExecute)
+    Grant-NetworkServiceAccess -Path $missingDatabaseConfig -Rights ([System.Security.AccessControl.FileSystemRights]::Read)
     Assert-Throws -Operation { Invoke-Validation -NodeBin $NodeBin -DataDir $missingDatabaseDataDir -ConfigPath $missingDatabaseConfig } -MessagePattern "Database directory does not exist" -Message "Missing database directory was accepted."
 
     $missingNodeBin = Join-Path $NodeDirectory "missing-citrate-node.exe"
@@ -298,7 +319,7 @@ public static class ArgumentProbe
     Assert-Throws -Operation { Invoke-Validation -NodeBin $NodeDirectory -DataDir $DataDir -ConfigPath $ConfigPath } -MessagePattern "must be a file" -Message "Executable directory was accepted as a file."
     $nonExecutableNodeBin = Join-Path $NodeDirectory "citrate-node.bin"
     [System.IO.File]::WriteAllText($nonExecutableNodeBin, "test executable")
-    Grant-NetworkServiceFullControl -Path $nonExecutableNodeBin
+    Grant-NetworkServiceAccess -Path $nonExecutableNodeBin -Rights ([System.Security.AccessControl.FileSystemRights]::ReadAndExecute)
     Assert-Throws -Operation { Invoke-Validation -NodeBin $nonExecutableNodeBin -DataDir $DataDir -ConfigPath $ConfigPath } -MessagePattern "must be a .exe file" -Message "Non-.exe NodeBin was accepted."
     Assert-Throws -Operation { Invoke-Validation -NodeBin ".\citrate-node.exe" -DataDir $DataDir -ConfigPath $ConfigPath } -MessagePattern "must be absolute" -Message "Relative path was accepted."
     Assert-Throws -Operation { Invoke-Validation -NodeBin "\\server\share\citrate-node.exe" -DataDir $DataDir -ConfigPath $ConfigPath } -MessagePattern "UNC or device path" -Message "UNC path was accepted."
@@ -313,15 +334,33 @@ public static class ArgumentProbe
     if (-not $temporaryDriveName) {
         throw "No unused drive letter was available for the mapped-drive validation test."
     }
-    $null = New-PSDrive -Name $temporaryDriveName -PSProvider FileSystem -Root $TestRoot
+    $substExe = Join-Path (Split-Path -Parent ([Environment]::SystemDirectory)) "System32\subst.exe"
+    & $substExe ($temporaryDriveName + ":") $TestRoot
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to create the substituted-drive validation fixture."
+    }
     try {
         $mappedDataDir = $temporaryDriveName + ":\Program Data"
         $mappedConfigPath = Join-Path $mappedDataDir "node.toml"
         Assert-Throws -Operation {
             Invoke-Validation -NodeBin $NodeBin -DataDir $mappedDataDir -ConfigPath $mappedConfigPath
-        } -MessagePattern "local fixed drive" -Message "A per-session mapped drive was accepted."
+        } -MessagePattern "stable mounted local volume" -Message "A substituted drive was accepted."
     } finally {
-        Remove-PSDrive -Name $temporaryDriveName
+        & $substExe ($temporaryDriveName + ":") "/d"
+    }
+
+    $originalNodeDirectoryAcl = Get-Acl -LiteralPath $NodeDirectory
+    try {
+        $writableNodeDirectoryAcl = Get-Acl -LiteralPath $NodeDirectory
+        $null = $writableNodeDirectoryAcl.AddAccessRule((New-TestAccessRule `
+            -Sid $TestAuthenticatedUsersSid `
+            -Rights ([System.Security.AccessControl.FileSystemRights]::Modify)))
+        Set-Acl -LiteralPath $NodeDirectory -AclObject $writableNodeDirectoryAcl
+        Assert-Throws -Operation {
+            Invoke-Validation -NodeBin $NodeBin -DataDir $DataDir -ConfigPath $ConfigPath
+        } -MessagePattern "grants untrusted write access" -Message "A user-writable executable directory was accepted."
+    } finally {
+        Set-Acl -LiteralPath $NodeDirectory -AclObject $originalNodeDirectoryAcl
     }
 
     Assert-NetworkServiceAccessRejected -Path $NodeDirectory -Operation {
@@ -367,7 +406,9 @@ public static class ArgumentProbe
         $null = $combinedAcl.AddAccessRule((New-TestAccessRule -Sid $TestNetworkServiceSid -Rights $readAndExecute))
         $null = $combinedAcl.AddAccessRule((New-TestAccessRule -Sid $TestAuthenticatedUsersSid -Rights $remainingModifyRights))
         Set-Acl -LiteralPath $DatabasePath -AclObject $combinedAcl
-        $null = Invoke-Validation -NodeBin $NodeBin -DataDir $DataDir -ConfigPath $ConfigPath
+        Assert-Throws -Operation {
+            Invoke-Validation -NodeBin $NodeBin -DataDir $DataDir -ConfigPath $ConfigPath
+        } -MessagePattern "grants untrusted write access" -Message "Database write access for Authenticated Users was accepted."
     } finally {
         Set-Acl -LiteralPath $DatabasePath -AclObject $originalCombinedAcl
     }
@@ -384,7 +425,10 @@ public static class ArgumentProbe
         $orderedDataAcl = Get-Acl -LiteralPath $DataDir
         $null = $orderedDataAcl.AddAccessRule($inheritOnlyDeny)
         Set-Acl -LiteralPath $DataDir -AclObject $orderedDataAcl
-        $null = Invoke-Validation -NodeBin $NodeBin -DataDir $DataDir -ConfigPath $ConfigPath
+        Assert-NetworkServiceAccess `
+            -Path $DatabasePath `
+            -RequiredRights ([System.Security.AccessControl.FileSystemRights]::Modify) `
+            -Description "database modify"
     } finally {
         Set-Acl -LiteralPath $DataDir -AclObject $originalDataAcl
         Set-Acl -LiteralPath $DatabasePath -AclObject $originalOrderedDatabaseAcl
@@ -411,7 +455,10 @@ public static class ArgumentProbe
         if ($applicableInheritedDeny.Count -eq 0) {
             throw "The ACL ordering test did not create an applicable inherited deny ACE."
         }
-        $null = Invoke-Validation -NodeBin $NodeBin -DataDir $DataDir -ConfigPath $ConfigPath
+        Assert-NetworkServiceAccess `
+            -Path $DatabasePath `
+            -RequiredRights ([System.Security.AccessControl.FileSystemRights]::Modify) `
+            -Description "database modify"
     } finally {
         Set-Acl -LiteralPath $TestRoot -AclObject $originalRootAcl
     }

@@ -24,7 +24,8 @@ $DisplayName = "Citrate Blockchain Node"
 $Description = "Citrate AI-native Layer-1 blockchain node with GhostDAG consensus"
 $NetworkServiceSid = "S-1-5-20"
 $NetworkServiceAccount = "NT AUTHORITY\NetworkService"
-$ScExe = Join-Path $env:SystemRoot "System32\sc.exe"
+$WindowsDirectory = Split-Path -Parent ([Environment]::SystemDirectory)
+$ScExe = Join-Path $WindowsDirectory "System32\sc.exe"
 $NodeBinWasSpecified = $PSBoundParameters.ContainsKey("NodeBin")
 $ConfigPathWasSpecified = $PSBoundParameters.ContainsKey("ConfigPath")
 
@@ -97,6 +98,12 @@ function Assert-SafePathText {
     }
     if ($drive.DriveType -ne [System.IO.DriveType]::Fixed) {
         throw "$Description path must use a local fixed drive."
+    }
+
+    $mountvolExe = Join-Path $WindowsDirectory "System32\mountvol.exe"
+    $volumeName = @(& $mountvolExe $root "/L" 2>&1)
+    if ($LASTEXITCODE -ne 0 -or $volumeName.Count -eq 0) {
+        throw "$Description path must use a stable mounted local volume."
     }
 }
 
@@ -213,6 +220,88 @@ function Assert-NetworkServiceAccess {
     throw "NetworkService lacks required $Description access to: $Path"
 }
 
+function Assert-TrustedPathIntegrity {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Description,
+
+        [string[]]$AdditionalTrustedWriterSids = @(),
+
+        [switch]$Ancestor
+    )
+
+    $trustedWriterSids = @(
+        "S-1-5-18", # LocalSystem
+        "S-1-5-32-544", # Builtin Administrators
+        # NT SERVICE\TrustedInstaller
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
+        [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    ) + $AdditionalTrustedWriterSids
+    $mutationRights = [int64](
+        [System.Security.AccessControl.FileSystemRights]::Delete -bor
+        [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+        [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+        [System.Security.AccessControl.FileSystemRights]::TakeOwnership
+    )
+    if (-not $Ancestor) {
+        $mutationRights = $mutationRights -bor [int64][System.Security.AccessControl.FileSystemRights]::Write
+    }
+    $acl = Get-Acl -LiteralPath $Path
+    try {
+        $ownerSid = (New-Object System.Security.Principal.NTAccount($acl.Owner)).Translate(
+            [System.Security.Principal.SecurityIdentifier]
+        ).Value
+    } catch {
+        throw "$Description owner could not be validated: $Path"
+    }
+    if ($trustedWriterSids -notcontains $ownerSid) {
+        throw "$Description has an untrusted owner: $Path"
+    }
+
+    $rules = $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
+    foreach ($rule in $rules) {
+        if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) {
+            continue
+        }
+        if (($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) {
+            continue
+        }
+        if (([int64]$rule.FileSystemRights -band $mutationRights) -eq 0) {
+            continue
+        }
+        if ($trustedWriterSids -notcontains $rule.IdentityReference.Value) {
+            throw "$Description grants untrusted write access to $($rule.IdentityReference.Value): $Path"
+        }
+    }
+}
+
+function Assert-TrustedPathChain {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Description
+    )
+
+    $current = $Path
+    $initialItem = Get-Item -LiteralPath $Path -Force
+    $strictThroughLevel = if ($initialItem.PSIsContainer) { 0 } else { 1 }
+    $level = 0
+    while ($current) {
+        Assert-TrustedPathIntegrity -Path $current -Description $Description -Ancestor:($level -gt $strictThroughLevel)
+        $parent = Split-Path -Parent $current
+        if (-not $parent -or [string]::Equals($parent, $current, [StringComparison]::OrdinalIgnoreCase)) {
+            break
+        }
+        $current = $parent
+        $level++
+    }
+}
+
 function New-ServicePlan {
     $resolvedScExe = Resolve-SafeExistingPath -Path $ScExe -PathType File -Description "sc.exe" -RequireNonEmpty
     $resolvedNodeBin = Resolve-SafeExistingPath -Path (Resolve-NodeBinary) -PathType File -Description "NodeBin" -RequireNonEmpty
@@ -247,6 +336,10 @@ function New-ServicePlan {
     }
     Assert-NetworkServiceAccess -Path $resolvedConfigPath -RequiredRights Read -Description "config read"
     Assert-NetworkServiceAccess -Path $databasePath -RequiredRights Modify -Description "database modify"
+    Assert-TrustedPathChain -Path $resolvedNodeBin -Description "NodeBin path"
+    Assert-TrustedPathChain -Path $resolvedDataDir -Description "DataDir path"
+    Assert-TrustedPathChain -Path $resolvedConfigPath -Description "ConfigPath"
+    Assert-TrustedPathIntegrity -Path $databasePath -Description "Database directory" -AdditionalTrustedWriterSids @($NetworkServiceSid)
 
     $imagePath = '"' + $resolvedNodeBin + '" --data-dir "' + $databasePath + '" --config "' + $resolvedConfigPath + '"'
     $scArguments = @(
@@ -418,6 +511,7 @@ switch ($Action) {
         $plan = New-ServicePlan
         Assert-CitrateServiceAbsent
         Assert-Administrator
+        $plan = New-ServicePlan
         Install-CitrateService -Plan $plan
         Set-FirewallRules
     }
