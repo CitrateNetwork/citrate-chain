@@ -167,10 +167,13 @@ mod pba_l1b_005_dispatcher {
             )
             .unwrap(),
         );
-        let sm = Arc::new(citrate_storage::state_manager::StateManager::new(storage.db.clone()));
+        let sm = Arc::new(citrate_storage::state_manager::StateManager::new(
+            storage.db.clone(),
+        ));
         let pm = Arc::new(PeerManager::new(PeerManagerConfig::default()));
         let model = Hash::new([7; 32]);
-        let ai = Arc::new(AINetworkHandler::new(sm, pm.clone()).with_inference_executor(Arc::new(Slow)));
+        let ai =
+            Arc::new(AINetworkHandler::new(sm, pm.clone()).with_inference_executor(Arc::new(Slow)));
         // Make the model servable (a peer announcement, as in discovery).
         ai.handle_message(
             &PeerId("provider".into()),
@@ -206,7 +209,10 @@ mod pba_l1b_005_dispatcher {
             t0.elapsed() < std::time::Duration::from_millis(500),
             "PBA-L1b-005: dispatch must not wait for the inference to run"
         );
-        assert_eq!(accepted, MAX_CONCURRENT_PEER_INFERENCES, "concurrency is bounded");
+        assert_eq!(
+            accepted, MAX_CONCURRENT_PEER_INFERENCES,
+            "concurrency is bounded"
+        );
     }
 
     /// Tripwire: the inbound loop routes InferenceRequest through the
@@ -218,7 +224,9 @@ mod pba_l1b_005_dispatcher {
             .find("NetworkMessage::InferenceRequest { .. } =>")
             .expect("PBA-L1b-005: main loop needs a dedicated InferenceRequest arm");
         assert!(src[arm..arm + 600].contains("inference_dispatcher.dispatch("));
-        let ai_arm = src.find("NetworkMessage::ModelAnnounce { .. }").expect("AI arm");
+        let ai_arm = src
+            .find("NetworkMessage::ModelAnnounce { .. }")
+            .expect("AI arm");
         let ai_arm_head = &src[ai_arm..ai_arm + 400];
         assert!(
             !ai_arm_head.contains("NetworkMessage::InferenceRequest"),

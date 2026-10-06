@@ -373,7 +373,9 @@ async fn test_126_reorg_reconcile_commits_state_and_tip_in_one_sync_batch() {
         // contract C with one storage slot and code.
         state_db.restore(snap_only_a);
         state_db.accounts.set_balance(account_a, U256::from(150u64));
-        state_db.accounts.set_balance(contract_c, U256::from(300u64));
+        state_db
+            .accounts
+            .set_balance(contract_c, U256::from(300u64));
         let code_hash = state_db.set_code(contract_c, code.clone());
         state_db.set_storage(contract_c, slot_key.clone(), slot_val.clone());
 
@@ -409,7 +411,11 @@ async fn test_126_reorg_reconcile_commits_state_and_tip_in_one_sync_batch() {
     let blocks2 = BlockStore::new(db2.clone());
 
     assert_eq!(
-        store2.get_account(&account_a).expect("get A").expect("A present").balance,
+        store2
+            .get_account(&account_a)
+            .expect("get A")
+            .expect("A present")
+            .balance,
         U256::from(150u64),
         "#126: winning-branch account update is durable"
     );
@@ -418,12 +424,18 @@ async fn test_126_reorg_reconcile_commits_state_and_tip_in_one_sync_batch() {
         "#126: abandoned-branch account was deleted in the same atomic batch"
     );
     assert_eq!(
-        store2.get_account(&contract_c).expect("get C").expect("C present").balance,
+        store2
+            .get_account(&contract_c)
+            .expect("get C")
+            .expect("C present")
+            .balance,
         U256::from(300u64),
         "#126: new contract account is durable"
     );
     assert_eq!(
-        store2.get_storage(&contract_c, &slot_key).expect("get C storage"),
+        store2
+            .get_storage(&contract_c, &slot_key)
+            .expect("get C storage"),
         Some(slot_val),
         "#126: new contract storage slot is durable"
     );

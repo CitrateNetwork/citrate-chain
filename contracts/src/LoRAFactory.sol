@@ -7,15 +7,22 @@ import {InitialAdmin} from "./lib/InitialAdmin.sol";
 
 import "./interfaces/IModelRegistry.sol";
 import "./lib/AccessControl.sol";
+import {CitratePrecompiles} from "./lib/CitratePrecompiles.sol";
 
 /**
  * @title LoRAFactory
  * @notice Factory for creating and managing LoRA (Low-Rank Adaptation) fine-tunes
- * @dev Integrates with Citrate LoRA precompile for efficient adaptation
+ * @dev HUP-S7.2: training and merging run off chain (the compute pool / an
+ *      operator) and are recorded here (`completeTraining`, `completeMerge`);
+ *      requests are announced by events. Adapter inference goes to 0x0101
+ *      MODEL_INFERENCE (model id = the adapter's id) through
+ *      `CitratePrecompiles`, which fails closed where no precompile serves
+ *      inference to contract code. On-chain LoRA arithmetic (one tile of an
+ *      applied or merged adapter) is 0x0112 LORA_APPLY / 0x0113 LORA_MERGE,
+ *      available from the agent precompile fork height
+ *      (docs/precompiles/AGENT_PRECOMPILES.md).
  */
 contract LoRAFactory is AccessControl {
-    // Citrate precompile address
-    address constant LORA_PRECOMPILE = 0x0000000000000000000000000000000000001001;
 
     /// 0x0108 — INFERENCE_PROOF_VERIFY (Halo2-KZG verifier).
     /// RM-FL-4 / WP-4.7: adapter quality is cryptographically backed
@@ -103,6 +110,16 @@ contract LoRAFactory is AccessControl {
         bytes32 indexed requestHash,
         bytes32[] loraHashes,
         bytes32 resultHash
+    );
+
+    /// A merge was requested; the operator performs it off chain and records
+    /// the result with `completeMerge`.
+    event MergeRequested(
+        bytes32 indexed requestHash,
+        bytes32[] loraHashes,
+        uint256[] weights,
+        uint256 mergeType,
+        address indexed requester
     );
     
     event TrainingStarted(
@@ -234,9 +251,8 @@ contract LoRAFactory is AccessControl {
         allAdapterHashes.push(loraHash);
         totalAdapters++;
         
-        // Start training via precompile
-        _startTraining(loraHash, config);
-        
+        // Training runs off chain; the operator records the weights with
+        // `completeTraining`. `TrainingStarted` announces the request.
         emit LoRACreated(loraHash, baseModelHash, msg.sender, name);
         emit TrainingStarted(loraHash, config.epochs, trainingCost);
         
@@ -422,10 +438,10 @@ contract LoRAFactory is AccessControl {
         request.requester = msg.sender;
         request.mergeType = mergeType;
         request.completed = false;
-        
-        // Execute merge via precompile
-        _executeMerge(requestHash, loraHashes, weights, mergeType);
-        
+
+        // The merge runs off chain; the operator records it with `completeMerge`.
+        emit MergeRequested(requestHash, loraHashes, weights, mergeType, msg.sender);
+
         return requestHash;
     }
     
@@ -500,8 +516,10 @@ contract LoRAFactory is AccessControl {
             require(modelRegistry.hasPermission(baseModelHash, msg.sender), "No base model permission");
         }
 
-        // Apply LoRA and execute inference via precompile
-        bytes memory result = _applyLoRAAndInfer(baseModelHash, loraHash, inputData);
+        // 0x0101 in its native layout, addressed by the adapter's id. Fails
+        // closed (nothing below runs, nobody is paid) where no node serves
+        // inference to contract code.
+        bytes memory result = CitratePrecompiles.modelInference(loraHash, msg.sender, inputData);
 
         if (inferencePrice > 0) {
             uint256 loraShare = (inferencePrice * 20) / 100;
@@ -601,57 +619,6 @@ contract LoRAFactory is AccessControl {
             request.completed,
             request.resultCID
         );
-    }
-    
-    // Internal precompile interactions
-    
-    function _startTraining(bytes32 loraHash, TrainingConfig memory config) internal {
-        (bool success, ) = LORA_PRECOMPILE.call(
-            abi.encodeWithSignature(
-                "startTraining(bytes32,uint256,uint256,uint256,string)",
-                loraHash,
-                config.epochs,
-                config.batchSize,
-                config.learningRate,
-                config.datasetCID
-            )
-        );
-        require(success, "Training start failed");
-    }
-    
-    function _executeMerge(
-        bytes32 requestHash,
-        bytes32[] memory loraHashes,
-        uint256[] memory weights,
-        uint256 mergeType
-    ) internal {
-        (bool success, ) = LORA_PRECOMPILE.call(
-            abi.encodeWithSignature(
-                "mergeLoras(bytes32,bytes32[],uint256[],uint256)",
-                requestHash,
-                loraHashes,
-                weights,
-                mergeType
-            )
-        );
-        require(success, "Merge execution failed");
-    }
-    
-    function _applyLoRAAndInfer(
-        bytes32 baseModelHash,
-        bytes32 loraHash,
-        bytes calldata inputData
-    ) internal returns (bytes memory) {
-        (bool success, bytes memory result) = LORA_PRECOMPILE.call(
-            abi.encodeWithSignature(
-                "applyAndInfer(bytes32,bytes32,bytes)",
-                baseModelHash,
-                loraHash,
-                inputData
-            )
-        );
-        require(success, "LoRA inference failed");
-        return result;
     }
     
     // Admin functions

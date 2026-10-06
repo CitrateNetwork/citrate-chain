@@ -12,9 +12,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::BridgeConfig;
 use crate::errors::{BridgeError, BridgeResult};
-use crate::events::{
-    BridgeEvent, DepositEvent, EventStatus, TrackedEvent, WithdrawalEvent,
-};
+use crate::events::{BridgeEvent, DepositEvent, EventStatus, TrackedEvent, WithdrawalEvent};
 use crate::metrics::BridgeMetrics;
 use crate::mint::SnapMinter;
 use crate::oracle::OracleRegistry;
@@ -27,11 +25,7 @@ use crate::state::RelayState;
 #[async_trait]
 pub trait BridgeEventSource: Send + Sync {
     /// Fetch new events since the given block number.
-    async fn fetch_events(
-        &self,
-        from_block: u64,
-        to_block: u64,
-    ) -> BridgeResult<Vec<BridgeEvent>>;
+    async fn fetch_events(&self, from_block: u64, to_block: u64) -> BridgeResult<Vec<BridgeEvent>>;
 
     /// Get the current head block number of the source chain.
     async fn current_block(&self) -> BridgeResult<u64>;
@@ -100,16 +94,17 @@ pub struct BridgeRelay {
 impl BridgeRelay {
     /// Create a new bridge relay.
     ///
-    /// # Panics
-    /// Panics if `oracle_threshold` is 0 in non-test builds.
+    /// # Errors
+    /// [`BridgeError::InvalidThreshold`] if `oracle_threshold` is 0 in non-test
+    /// builds.
     /// Zero-threshold mode allows auto-attesting events without any oracle
     /// verification, which is a critical security risk.
-    pub fn new(config: BridgeConfig) -> Self {
+    pub fn new(config: BridgeConfig) -> Result<Self, BridgeError> {
         if config.oracle_threshold == 0 && !cfg!(test) {
-            panic!(
-                "oracle_threshold must be > 0 in production. \
-                 Zero-threshold mode auto-attests events without oracle verification."
-            );
+            return Err(BridgeError::InvalidThreshold {
+                threshold: 0,
+                active: 0,
+            });
         }
         let oracle_threshold = config.oracle_threshold;
         // SECREM-01 BRG-3: bind the attestation signing domain to this
@@ -118,10 +113,8 @@ impl BridgeRelay {
         // Attestations for any other deployment fail signature
         // verification here.
         let (domain_chain_id, bridge_instance) = config.attestation_domain();
-        Self {
-            minter: Arc::new(RwLock::new(SnapMinter::new(
-                config.bonding_curve.clone(),
-            ))),
+        Ok(Self {
+            minter: Arc::new(RwLock::new(SnapMinter::new(config.bonding_curve.clone()))),
             state: Arc::new(RwLock::new(RelayState::default())),
             oracle_registry: Arc::new(RwLock::new(OracleRegistry::with_domain(
                 oracle_threshold,
@@ -131,7 +124,7 @@ impl BridgeRelay {
             metrics: Arc::new(BridgeMetrics::new()),
             paused: false,
             config,
-        }
+        })
     }
 
     /// Get a reference to the relay state.
@@ -197,10 +190,12 @@ impl BridgeRelay {
         }
 
         // Fetch events in the confirmed range
-        let events = source.fetch_events(last_processed + 1, safe_block).await?;
+        let events = source
+            .fetch_events(last_processed.saturating_add(1), safe_block)
+            .await?;
         info!(
             event_count = events.len(),
-            from = last_processed + 1,
+            from = last_processed.saturating_add(1),
             to = safe_block,
             "Fetched bridge events"
         );
@@ -327,20 +322,16 @@ impl BridgeRelay {
         // Process based on event type
         match event {
             BridgeEvent::Deposit(deposit) => self.process_deposit(deposit).await,
-            BridgeEvent::Withdrawal(withdrawal) => {
-                self.process_withdrawal(withdrawal).await
-            }
+            BridgeEvent::Withdrawal(withdrawal) => self.process_withdrawal(withdrawal).await,
             BridgeEvent::OracleUpdate(update) => {
                 info!(
                     oracle = hex::encode(update.oracle_pubkey),
                     is_addition = update.is_addition,
                     "Oracle update processed"
                 );
-                self.state.write().update_event_status(
-                    &event_id,
-                    EventStatus::Processed,
-                    None,
-                );
+                self.state
+                    .write()
+                    .update_event_status(&event_id, EventStatus::Processed, None);
                 ProcessingResult {
                     event_id,
                     status: EventStatus::Processed,
@@ -526,10 +517,7 @@ impl BridgeRelay {
 
         if tracked.status != EventStatus::Failed {
             return Err(BridgeError::InvalidEventData {
-                reason: format!(
-                    "Cannot retry event in {:?} status",
-                    tracked.status
-                ),
+                reason: format!("Cannot retry event in {:?} status", tracked.status),
             });
         }
 
@@ -542,7 +530,7 @@ impl BridgeRelay {
 
         // Increment retry count
         if let Some(t) = self.state.write().events.get_mut(event_id) {
-            t.retry_count += 1;
+            t.retry_count = t.retry_count.saturating_add(1);
             t.status = EventStatus::Pending;
         }
 
@@ -613,7 +601,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_deposit_flow_e2e() {
-        let relay = BridgeRelay::new(test_config());
+        let relay = BridgeRelay::new(test_config()).expect("relay");
         let source = MockEventSource::new();
         source.add_event(make_deposit_event(1, 1.0));
 
@@ -630,7 +618,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_deduplication_prevents_double_deposit() {
-        let relay = BridgeRelay::new(test_config());
+        let relay = BridgeRelay::new(test_config()).expect("relay");
         let source = MockEventSource::new();
 
         let event = make_deposit_event(1, 1.0);
@@ -656,7 +644,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_withdrawal_flow() {
-        let relay = BridgeRelay::new(test_config());
+        let relay = BridgeRelay::new(test_config()).expect("relay");
         let source = MockEventSource::new();
         source.add_event(make_withdrawal_event(1, 5_000));
 
@@ -672,7 +660,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_insufficient_deposit_rejected() {
-        let relay = BridgeRelay::new(test_config());
+        let relay = BridgeRelay::new(test_config()).expect("relay");
         let source = MockEventSource::new();
 
         // 0.01 ETH < 0.02 ETH minimum
@@ -712,7 +700,7 @@ mod tests {
             oracle_threshold: 2, // Require 2 attestations
             ..Default::default()
         };
-        let relay = BridgeRelay::new(config);
+        let relay = BridgeRelay::new(config).expect("relay");
         let source = MockEventSource::new();
 
         // Register 2 oracles with real ed25519 public keys
@@ -747,8 +735,7 @@ mod tests {
 
             // Sign attestation 1 (v2 message, bound to the relay's domain)
             let (cid, inst) = reg.domain();
-            let msg1 =
-                crate::oracle::attestation_message(cid, &inst, &event_id, &event_hash, now);
+            let msg1 = crate::oracle::attestation_message(cid, &inst, &event_id, &event_hash, now);
             let sig1 = sk1.sign(&msg1);
 
             reg.submit_attestation(OracleAttestation {
@@ -762,8 +749,7 @@ mod tests {
 
             // Sign attestation 2
             let now2 = now + 1;
-            let msg2 =
-                crate::oracle::attestation_message(cid, &inst, &event_id, &event_hash, now2);
+            let msg2 = crate::oracle::attestation_message(cid, &inst, &event_id, &event_hash, now2);
             let sig2 = sk2.sign(&msg2);
 
             reg.submit_attestation(OracleAttestation {
@@ -789,8 +775,10 @@ mod tests {
         let o1 = sk1.verifying_key().to_bytes();
         let o2 = sk2.verifying_key().to_bytes();
         let mut reg = relay.oracle_registry().write();
-        reg.register_oracle(o1, "O1".to_string()).expect("register o1");
-        reg.register_oracle(o2, "O2".to_string()).expect("register o2");
+        reg.register_oracle(o1, "O1".to_string())
+            .expect("register o1");
+        reg.register_oracle(o2, "O2".to_string())
+            .expect("register o2");
         (o1, o2)
     }
 
@@ -809,8 +797,7 @@ mod tests {
         let (cid, inst) = relay.oracle_registry().read().domain();
         for (i, (sk, oid)) in keys.iter().enumerate() {
             let ts = base + i as u64;
-            let msg =
-                crate::oracle::attestation_message(cid, &inst, event_id, &bound_hash, ts);
+            let msg = crate::oracle::attestation_message(cid, &inst, event_id, &bound_hash, ts);
             let sig = sk.sign(&msg);
             relay
                 .oracle_registry()
@@ -834,7 +821,7 @@ mod tests {
             oracle_threshold: 2,
             ..Default::default()
         };
-        let relay = BridgeRelay::new(config);
+        let relay = BridgeRelay::new(config).expect("relay");
         let sk1 = SigningKey::from_bytes(&[11u8; 32]);
         let sk2 = SigningKey::from_bytes(&[12u8; 32]);
         let (o1, o2) = rm_a_register_oracles(&relay, &sk1, &sk2);
@@ -853,7 +840,12 @@ mod tests {
             timestamp: 1000,
         };
         // Oracles attest to the HONEST deposit's canonical hash.
-        rm_a_attest_hash(&relay, &event_id, honest.canonical_hash(), &[(&sk1, o1), (&sk2, o2)]);
+        rm_a_attest_hash(
+            &relay,
+            &event_id,
+            honest.canonical_hash(),
+            &[(&sk1, o1), (&sk2, o2)],
+        );
         assert!(relay.oracle_registry().read().is_threshold_met(&event_id));
 
         // Attacker presents a TAMPERED deposit under the same event_id.
@@ -892,7 +884,7 @@ mod tests {
             oracle_threshold: 2,
             ..Default::default()
         };
-        let relay = BridgeRelay::new(config);
+        let relay = BridgeRelay::new(config).expect("relay");
         let sk1 = SigningKey::from_bytes(&[21u8; 32]);
         let sk2 = SigningKey::from_bytes(&[22u8; 32]);
         let (o1, o2) = rm_a_register_oracles(&relay, &sk1, &sk2);
@@ -910,7 +902,12 @@ mod tests {
             amount_eth: 1.0,
             timestamp: 1000,
         };
-        rm_a_attest_hash(&relay, &event_id, honest.canonical_hash(), &[(&sk1, o1), (&sk2, o2)]);
+        rm_a_attest_hash(
+            &relay,
+            &event_id,
+            honest.canonical_hash(),
+            &[(&sk1, o1), (&sk2, o2)],
+        );
 
         let ok = relay.process_event(BridgeEvent::Deposit(honest)).await;
         assert_eq!(
@@ -928,7 +925,7 @@ mod tests {
             oracle_threshold: 0,
             ..Default::default()
         };
-        let relay = BridgeRelay::new(config);
+        let relay = BridgeRelay::new(config).expect("relay");
         let source = MockEventSource::new();
 
         // Source is at block 100, confirmation depth = 12, safe = 88
@@ -947,7 +944,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bridge_pause_and_resume() {
-        let mut relay = BridgeRelay::new(test_config());
+        let mut relay = BridgeRelay::new(test_config()).expect("relay");
         let source = MockEventSource::new();
         source.add_event(make_deposit_event(1, 1.0));
 
@@ -970,7 +967,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_metrics_updated_on_deposit() {
-        let relay = BridgeRelay::new(test_config());
+        let relay = BridgeRelay::new(test_config()).expect("relay");
         let source = MockEventSource::new();
         source.add_event(make_deposit_event(1, 1.0));
 
@@ -993,7 +990,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_deposits_in_one_cycle() {
-        let relay = BridgeRelay::new(test_config());
+        let relay = BridgeRelay::new(test_config()).expect("relay");
         let source = MockEventSource::new();
         source.add_event(make_deposit_event(1, 1.0));
         source.add_event(make_deposit_event(2, 2.0));
@@ -1009,7 +1006,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_relay_state_persistence() {
-        let relay = BridgeRelay::new(test_config());
+        let relay = BridgeRelay::new(test_config()).expect("relay");
         let source = MockEventSource::new();
         source.add_event(make_deposit_event(1, 1.0));
 

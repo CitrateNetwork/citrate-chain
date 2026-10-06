@@ -15,11 +15,7 @@ use tokio::sync::mpsc;
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn make_peer_simple(
-    id: PeerId,
-    addr: SocketAddr,
-    direction: Direction,
-) -> Arc<Peer> {
+fn make_peer_simple(id: PeerId, addr: SocketAddr, direction: Direction) -> Arc<Peer> {
     let (send_tx, recv_rx) = mpsc::channel(100);
     let info = PeerInfo::new(id, addr, direction);
     Arc::new(Peer::new(info, send_tx, recv_rx))
@@ -49,17 +45,28 @@ async fn test_rapid_peer_connect_disconnect_100_cycles() {
         let peer = make_peer_simple(peer_id.clone(), addr, Direction::Outbound);
 
         let add_result = pm.add_peer(peer).await;
-        assert!(add_result.is_ok(), "Cycle {}: add_peer should succeed", cycle);
+        assert!(
+            add_result.is_ok(),
+            "Cycle {}: add_peer should succeed",
+            cycle
+        );
 
         pm.remove_peer(&peer_id).await;
 
         let (total, _, _) = pm.get_peer_counts().await;
-        assert_eq!(total, 0, "Cycle {}: peer count should be 0 after removal", cycle);
+        assert_eq!(
+            total, 0,
+            "Cycle {}: peer count should be 0 after removal",
+            cycle
+        );
     }
 
     // Final sanity check
     let peers = pm.get_all_peers();
-    assert!(peers.is_empty(), "No peers should remain after 100 connect/disconnect cycles");
+    assert!(
+        peers.is_empty(),
+        "No peers should remain after 100 connect/disconnect cycles"
+    );
 }
 
 #[tokio::test]

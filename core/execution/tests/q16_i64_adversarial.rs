@@ -84,7 +84,10 @@ fn belnap_valid_input_executes() {
     let r = belnap::execute(&belnap_valid(4, 3, Q16::from_int(1).0), GAS)
         .expect("valid belnap input should decode + execute");
     assert!(r.success, "valid belnap execution should report success");
-    assert!(!r.output.is_empty(), "valid belnap execution should produce output");
+    assert!(
+        !r.output.is_empty(),
+        "valid belnap execution should produce output"
+    );
 }
 
 #[test]
@@ -92,7 +95,10 @@ fn routing_valid_input_executes() {
     let r = routing::execute(&routing_valid(), GAS)
         .expect("valid routing input should decode + execute");
     assert!(r.success, "valid routing execution should report success");
-    assert!(!r.output.is_empty(), "valid routing execution should produce output");
+    assert!(
+        !r.output.is_empty(),
+        "valid routing execution should produce output"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -113,7 +119,10 @@ fn belnap_rejects_old_i32_width_buffer() {
     old[0..4].copy_from_slice(&(dim as u32).to_be_bytes());
     old[4..8].copy_from_slice(&(n as u32).to_be_bytes());
 
-    assert!(belnap::decode(&old).is_err(), "old i32-width belnap buffer must be rejected by decode");
+    assert!(
+        belnap::decode(&old).is_err(),
+        "old i32-width belnap buffer must be rejected by decode"
+    );
     let r = belnap::execute(&old, GAS);
     assert!(
         r.is_err() || !r.expect("checked").success,
@@ -167,11 +176,17 @@ fn belnap_misaligned_by_widening_delta_rejected() {
 
     let mut plus4 = base.clone();
     plus4.extend_from_slice(&[0u8; 4]); // body no longer matches expected_total
-    assert!(belnap::decode(&plus4).is_err(), "+4 misaligned belnap must be rejected");
+    assert!(
+        belnap::decode(&plus4).is_err(),
+        "+4 misaligned belnap must be rejected"
+    );
 
     let mut minus4 = base.clone();
     minus4.truncate(minus4.len() - 4);
-    assert!(belnap::decode(&minus4).is_err(), "-4 misaligned belnap must be rejected");
+    assert!(
+        belnap::decode(&minus4).is_err(),
+        "-4 misaligned belnap must be rejected"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -218,7 +233,10 @@ fn belnap_truncation_sweep_never_panics() {
         let _ = belnap::execute(&full[..k], GAS);
     }
     // Sub-header prefixes specifically reject.
-    assert!(belnap::decode(&full[..23]).is_err(), "sub-24-byte belnap must be InputTooShort");
+    assert!(
+        belnap::decode(&full[..23]).is_err(),
+        "sub-24-byte belnap must be InputTooShort"
+    );
 }
 
 // ---------------------------------------------------------------------------

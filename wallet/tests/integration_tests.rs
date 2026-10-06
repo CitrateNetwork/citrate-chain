@@ -13,8 +13,8 @@
 //! - CITRATE_CHAIN_ID: Chain ID (default: 40204 — testnet beta)
 //! - SKIP_INTEGRATION_TESTS: Set to "true" to skip these tests
 
-use citrate_wallet::{Wallet, WalletConfig};
 use citrate_execution::types::Address;
+use citrate_wallet::{Wallet, WalletConfig};
 use primitive_types::U256;
 use std::env;
 use tempfile::TempDir;
@@ -35,7 +35,9 @@ fn get_chain_id() -> u64 {
 }
 
 fn should_skip_tests() -> bool {
-    env::var("SKIP_INTEGRATION_TESTS").map(|v| v == "true").unwrap_or(false)
+    env::var("SKIP_INTEGRATION_TESTS")
+        .map(|v| v == "true")
+        .unwrap_or(false)
 }
 
 /// Well-known test accounts (from Hardhat/Anvil)
@@ -110,7 +112,10 @@ fn test_create_account() {
 
     // Verify account properties
     assert_eq!(account.index, 0);
-    assert!(!account.address.0.iter().all(|&b| b == 0), "Address should not be zero");
+    assert!(
+        !account.address.0.iter().all(|&b| b == 0),
+        "Address should not be zero"
+    );
     assert_eq!(account.alias, Some("test_account".to_string()));
 }
 
@@ -125,9 +130,15 @@ fn test_create_multiple_accounts() {
     let password = "test_password_123";
 
     // Create multiple accounts
-    let account1 = wallet.create_account(password, Some("account1".to_string())).unwrap();
-    let account2 = wallet.create_account(password, Some("account2".to_string())).unwrap();
-    let account3 = wallet.create_account(password, Some("account3".to_string())).unwrap();
+    let account1 = wallet
+        .create_account(password, Some("account1".to_string()))
+        .unwrap();
+    let account2 = wallet
+        .create_account(password, Some("account2".to_string()))
+        .unwrap();
+    let account3 = wallet
+        .create_account(password, Some("account3".to_string()))
+        .unwrap();
 
     // Verify unique indices
     assert_eq!(account1.index, 0);
@@ -157,17 +168,29 @@ fn test_import_account() {
     // Import known test account
     let account = wallet.import_account(TEST_PRIVATE_KEY, password, Some("imported".to_string()));
 
-    assert!(account.is_ok(), "Account import failed: {:?}", account.err());
+    assert!(
+        account.is_ok(),
+        "Account import failed: {:?}",
+        account.err()
+    );
     let account = account.unwrap();
 
     // Verify address is a valid 20-byte address derived from the ed25519 pubkey
-    assert_ne!(account.address.0, [0u8; 20], "Address should not be all zeros");
+    assert_ne!(
+        account.address.0, [0u8; 20],
+        "Address should not be all zeros"
+    );
 
     // Import same key again should produce same address
     let temp_dir2 = TempDir::new().unwrap();
     let mut wallet2 = create_test_wallet(&temp_dir2);
-    let account2 = wallet2.import_account(TEST_PRIVATE_KEY, password, None).unwrap();
-    assert_eq!(account.address.0, account2.address.0, "Same key should produce same address");
+    let account2 = wallet2
+        .import_account(TEST_PRIVATE_KEY, password, None)
+        .unwrap();
+    assert_eq!(
+        account.address.0, account2.address.0,
+        "Same key should produce same address"
+    );
 }
 
 #[test]
@@ -190,8 +213,13 @@ fn test_import_with_0x_prefix() {
     // Import without prefix should produce same address
     let temp_dir2 = TempDir::new().unwrap();
     let mut wallet2 = create_test_wallet(&temp_dir2);
-    let account2 = wallet2.import_account(TEST_PRIVATE_KEY, password, None).unwrap();
-    assert_eq!(account.address.0, account2.address.0, "0x prefix should not affect address");
+    let account2 = wallet2
+        .import_account(TEST_PRIVATE_KEY, password, None)
+        .unwrap();
+    assert_eq!(
+        account.address.0, account2.address.0,
+        "0x prefix should not affect address"
+    );
 }
 
 #[test]
@@ -230,8 +258,12 @@ fn test_list_accounts() {
     assert!(accounts.is_empty(), "Should have no accounts initially");
 
     // Create accounts
-    wallet.create_account(password, Some("acc1".to_string())).unwrap();
-    wallet.create_account(password, Some("acc2".to_string())).unwrap();
+    wallet
+        .create_account(password, Some("acc1".to_string()))
+        .unwrap();
+    wallet
+        .create_account(password, Some("acc2".to_string()))
+        .unwrap();
 
     // Refresh and list
     wallet.refresh_accounts().unwrap();
@@ -281,7 +313,9 @@ fn test_export_private_key() {
     let password = "test_password_123";
 
     // Import known account
-    wallet.import_account(TEST_PRIVATE_KEY, password, None).unwrap();
+    wallet
+        .import_account(TEST_PRIVATE_KEY, password, None)
+        .unwrap();
 
     // Unlock wallet
     wallet.unlock(password).unwrap();
@@ -296,8 +330,7 @@ fn test_export_private_key() {
     let expected_normalized = TEST_PRIVATE_KEY.to_lowercase();
 
     assert_eq!(
-        exported_normalized,
-        expected_normalized,
+        exported_normalized, expected_normalized,
         "Exported key should match original"
     );
 }
@@ -338,7 +371,10 @@ async fn test_get_balance_integration() {
     }
 
     // Configured integration account should have a non-zero balance when funded.
-    assert!(balance > U256::zero(), "Genesis account should have balance");
+    assert!(
+        balance > U256::zero(),
+        "Genesis account should have balance"
+    );
 }
 
 #[tokio::test]
@@ -419,11 +455,15 @@ fn test_address_derivation_consistency() {
     let password = "test_password_123";
 
     // Import same key multiple times (different wallets)
-    wallet.import_account(TEST_PRIVATE_KEY, password, None).unwrap();
+    wallet
+        .import_account(TEST_PRIVATE_KEY, password, None)
+        .unwrap();
 
     let temp_dir2 = TempDir::new().unwrap();
     let mut wallet2 = create_test_wallet(&temp_dir2);
-    wallet2.import_account(TEST_PRIVATE_KEY, password, None).unwrap();
+    wallet2
+        .import_account(TEST_PRIVATE_KEY, password, None)
+        .unwrap();
 
     // Refresh and compare
     wallet.refresh_accounts().unwrap();
@@ -450,8 +490,12 @@ fn test_different_keys_different_addresses() {
     let password = "test_password_123";
 
     // Import two different keys
-    wallet.import_account(TEST_PRIVATE_KEY, password, None).unwrap();
-    wallet.import_account(TEST_PRIVATE_KEY_2, password, None).unwrap();
+    wallet
+        .import_account(TEST_PRIVATE_KEY, password, None)
+        .unwrap();
+    wallet
+        .import_account(TEST_PRIVATE_KEY_2, password, None)
+        .unwrap();
 
     wallet.refresh_accounts().unwrap();
 
@@ -499,7 +543,10 @@ fn test_get_nonexistent_account() {
 
     // Try to get account that doesn't exist
     let account = wallet.get_account(999);
-    assert!(account.is_none(), "Should return None for nonexistent account");
+    assert!(
+        account.is_none(),
+        "Should return None for nonexistent account"
+    );
 }
 
 #[test]

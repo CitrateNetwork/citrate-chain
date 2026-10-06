@@ -16,8 +16,7 @@
 // this bench gives the executor-internal ceiling.
 
 use citrate_consensus::types::{
-    Block, BlockBuilder, Hash, PublicKey, Signature,
-    Transaction as ConsensusTransaction, VrfProof,
+    Block, BlockBuilder, Hash, PublicKey, Signature, Transaction as ConsensusTransaction, VrfProof,
 };
 use citrate_execution::{address_utils, types::Address, Executor, StateDB};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -49,11 +48,7 @@ fn test_block() -> Block {
         .build_unhashed()
 }
 
-fn transfer_tx(
-    sender_seed: u32,
-    recipient_seed: u32,
-    nonce: u64,
-) -> ConsensusTransaction {
+fn transfer_tx(sender_seed: u32, recipient_seed: u32, nonce: u64) -> ConsensusTransaction {
     let mut h = [0u8; 32];
     h[0..4].copy_from_slice(&sender_seed.to_le_bytes());
     h[4..12].copy_from_slice(&nonce.to_le_bytes());
@@ -177,11 +172,8 @@ fn bench_serialized_emulated(c: &mut Criterion) {
                         let outer = Arc::clone(&outer);
                         handles.push(tokio::spawn(async move {
                             for nonce in 0..TXS_PER_WORKER {
-                                let tx = transfer_tx(
-                                    sender,
-                                    RECIPIENT_OFFSET + sender,
-                                    nonce as u64,
-                                );
+                                let tx =
+                                    transfer_tx(sender, RECIPIENT_OFFSET + sender, nonce as u64);
                                 // Emulate exec_lock: serialize every call
                                 let _g = outer.lock().await;
                                 let _ = exec.execute_transaction(&block, &tx).await;
@@ -214,11 +206,8 @@ fn bench_serialized_emulated(c: &mut Criterion) {
                         let block = block.clone();
                         handles.push(tokio::spawn(async move {
                             for nonce in 0..TXS_PER_WORKER {
-                                let tx = transfer_tx(
-                                    sender,
-                                    RECIPIENT_OFFSET + sender,
-                                    nonce as u64,
-                                );
+                                let tx =
+                                    transfer_tx(sender, RECIPIENT_OFFSET + sender, nonce as u64);
                                 let _ = exec.execute_transaction(&block, &tx).await;
                             }
                         }));
@@ -262,8 +251,8 @@ fn bench_contract_calls(c: &mut Criterion) {
     // STOP
     let runtime_code = vec![
         0x7f, // PUSH32
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0xde, 0xad, 0xbe, 0xef, // 32-byte literal
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xde,
+        0xad, 0xbe, 0xef, // 32-byte literal
         0x60, 0x00, // PUSH1 0
         0x55, // SSTORE
         0x00, // STOP
@@ -299,8 +288,7 @@ fn bench_contract_calls(c: &mut Criterion) {
                                         let mut h = [0u8; 32];
                                         h[0] = 0xC;
                                         h[1..5].copy_from_slice(&sender.to_le_bytes());
-                                        h[5..13]
-                                            .copy_from_slice(&(nonce as u64).to_le_bytes());
+                                        h[5..13].copy_from_slice(&(nonce as u64).to_le_bytes());
                                         // Non-empty data + non-precompile recipient
                                         // → executor parses as Call
                                         let tx = ConsensusTransaction {

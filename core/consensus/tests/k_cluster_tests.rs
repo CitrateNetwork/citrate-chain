@@ -165,8 +165,8 @@ async fn test_wide_dag_at_k_limit() {
     // Create a merge block that references some of these parallel blocks.
     // selected parent = parallel_hashes[0], merge parents = next batch
     // (up to max_parents - 1).
-    let merge_parents: Vec<Hash> = parallel_hashes[1..std::cmp::min(10, parallel_hashes.len())]
-        .to_vec();
+    let merge_parents: Vec<Hash> =
+        parallel_hashes[1..std::cmp::min(10, parallel_hashes.len())].to_vec();
     let merge_block = make_block(hash_for(100), parallel_hashes[0], merge_parents, 2, 2);
     dag_store.store_block(merge_block.clone()).await.unwrap();
     ghostdag.add_block(&merge_block).await.unwrap();

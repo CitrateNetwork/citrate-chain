@@ -10,8 +10,8 @@ use crate::protocol::{NetworkMessage, ProtocolVersion};
 use crate::NetworkError;
 use bincode;
 use bytes::BytesMut;
-use futures::{SinkExt, StreamExt};
 use citrate_consensus::types::Hash;
+use futures::{SinkExt, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
@@ -38,10 +38,7 @@ const MAX_ACCEPT_RL_ENTRIES: usize = 16_384;
 /// NET-M7: returns `true` if an inbound connection from `ip` may proceed to the
 /// Noise handshake, `false` if it has exceeded the per-IP accept rate in the
 /// current window. Prunes expired windows opportunistically.
-fn inbound_accept_permitted(
-    rl: &Mutex<HashMap<IpAddr, (Instant, u32)>>,
-    ip: IpAddr,
-) -> bool {
+fn inbound_accept_permitted(rl: &Mutex<HashMap<IpAddr, (Instant, u32)>>, ip: IpAddr) -> bool {
     let now = Instant::now();
     let mut map = match rl.lock() {
         Ok(m) => m,
@@ -67,7 +64,7 @@ fn inbound_accept_permitted(
                 *count = 1;
                 true
             } else if *count < MAX_INBOUND_ACCEPTS_PER_IP {
-                *count += 1;
+                *count = count.saturating_add(1);
                 true
             } else {
                 false
@@ -155,7 +152,7 @@ impl NetworkTransport {
     pub fn with_noise(mut self, keypair: NoiseKeypair) -> Self {
         info!(
             "Noise encryption enabled (pubkey={}...)",
-            &keypair.public_key_hex()[..16]
+            short_hex(&keypair.public_key_hex())
         );
         self.noise_keypair = Some(Arc::new(keypair));
         self
@@ -204,8 +201,12 @@ impl NetworkTransport {
                         // when at capacity, preventing CPU-expensive handshake flooding
                         let (total, _inbound, _outbound) = pm.get_peer_counts().await;
                         if total >= pm.max_peers() {
-                            debug!("Rejecting inbound from {} — at capacity ({}/{})",
-                                   remote, total, pm.max_peers());
+                            debug!(
+                                "Rejecting inbound from {} — at capacity ({}/{})",
+                                remote,
+                                total,
+                                pm.max_peers()
+                            );
                             drop(stream);
                             continue;
                         }
@@ -216,9 +217,10 @@ impl NetworkTransport {
                         let noise_kp = noise_kp.clone();
                         let allowed = allowed.clone();
                         tokio::spawn(async move {
-                            if let Err(e) =
-                                handle_inbound(stream, remote, pm, local_id, params, noise_kp, allowed)
-                                    .await
+                            if let Err(e) = handle_inbound(
+                                stream, remote, pm, local_id, params, noise_kp, allowed,
+                            )
+                            .await
                             {
                                 warn!("inbound error from {}: {}", remote, e);
                             }
@@ -245,11 +247,19 @@ impl NetworkTransport {
     /// Noise public key (e.g. `noise_<hex>@ip:port`), we verify the remote's
     /// Noise static key produces the expected PeerId. This prevents DNS/IP
     /// hijack attacks from impersonating trusted bootnodes.
-    pub async fn connect_to_trusted(&self, addr: SocketAddr, expected_id: PeerId) -> Result<(), NetworkError> {
+    pub async fn connect_to_trusted(
+        &self,
+        addr: SocketAddr,
+        expected_id: PeerId,
+    ) -> Result<(), NetworkError> {
         self.connect_to_inner(addr, Some(expected_id)).await
     }
 
-    async fn connect_to_inner(&self, addr: SocketAddr, expected_id: Option<PeerId>) -> Result<(), NetworkError> {
+    async fn connect_to_inner(
+        &self,
+        addr: SocketAddr,
+        expected_id: Option<PeerId>,
+    ) -> Result<(), NetworkError> {
         let stream = TcpStream::connect(addr)
             .await
             .map_err(|e| NetworkError::TransportError(format!("connect {}: {}", addr, e)))?;
@@ -259,8 +269,17 @@ impl NetworkTransport {
         let noise_kp = self.noise_keypair.clone();
         let allowed = self.allowed_peers.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_outbound(stream, addr, pm, local_id, params, noise_kp, expected_id, allowed).await
+            if let Err(e) = handle_outbound(
+                stream,
+                addr,
+                pm,
+                local_id,
+                params,
+                noise_kp,
+                expected_id,
+                allowed,
+            )
+            .await
             {
                 warn!("outbound error to {}: {}", addr, e);
             }
@@ -296,15 +315,22 @@ async fn handle_inbound(
             if !allowed_peers.contains(&remote_hex) {
                 warn!(
                     "PEER_WHITELIST_REJECTED inbound from {} (noise_key={}...)",
-                    addr, &remote_hex[..16]
+                    addr,
+                    remote_hex.get(..16).unwrap_or(&remote_hex)
                 );
                 return Err(NetworkError::ProtocolError(
                     "peer not in allowed_peers whitelist".into(),
                 ));
             }
-            debug!("Peer whitelist check passed for {}", &remote_hex[..16]);
+            debug!(
+                "Peer whitelist check passed for {}",
+                remote_hex.get(..16).unwrap_or(&remote_hex)
+            );
         } else {
-            warn!("Peer whitelist configured but Noise is disabled — rejecting {}", addr);
+            warn!(
+                "Peer whitelist configured but Noise is disabled — rejecting {}",
+                addr
+            );
             return Err(NetworkError::ProtocolError(
                 "peer whitelist requires Noise encryption".into(),
             ));
@@ -541,7 +567,7 @@ async fn handle_inbound(
             window_start = std::time::Instant::now();
             msg_count = 0;
         }
-        msg_count += 1;
+        msg_count = msg_count.saturating_add(1);
         if msg_count > MAX_MSGS_PER_SEC {
             warn!("rate limit exceeded from {} — closing", addr);
             peer_manager.remove_peer_if_current(&remote_id, &peer).await;
@@ -567,9 +593,7 @@ async fn handle_inbound(
                 // this node did not perform.
                 match NetworkMessage::decode_inbound(&plaintext) {
                     Ok(msg) => {
-                        peer_manager
-                            .forward_incoming(remote_id.clone(), msg)
-                            .await;
+                        peer_manager.forward_incoming(remote_id.clone(), msg).await;
                     }
                     Err(e) => {
                         // Was: break WITHOUT remove_peer — the peer stayed registered
@@ -620,7 +644,8 @@ async fn handle_outbound(
             if !allowed_peers.contains(&remote_hex) {
                 warn!(
                     "PEER_WHITELIST_REJECTED outbound to {} (noise_key={}...)",
-                    addr, &remote_hex[..16]
+                    addr,
+                    remote_hex.get(..16).unwrap_or(&remote_hex)
                 );
                 return Err(NetworkError::ProtocolError(
                     "peer not in allowed_peers whitelist".into(),
@@ -840,7 +865,7 @@ async fn handle_outbound(
                 window_start = std::time::Instant::now();
                 msg_count = 0;
             }
-            msg_count += 1;
+            msg_count = msg_count.saturating_add(1);
             if msg_count > MAX_MSGS_PER_SEC {
                 warn!("rate limit exceeded from {} — closing", addr);
                 peer_manager.remove_peer_if_current(&remote_id, &peer).await;
@@ -863,9 +888,7 @@ async fn handle_outbound(
                     // SECURITY (C-01 network variant): sanitize at decode.
                     match NetworkMessage::decode_inbound(&plaintext) {
                         Ok(msg) => {
-                            peer_manager
-                                .forward_incoming(remote_id.clone(), msg)
-                                .await;
+                            peer_manager.forward_incoming(remote_id.clone(), msg).await;
                         }
                         Err(e) => {
                             // de-register on decode failure (was a bare break →
@@ -890,3 +913,8 @@ async fn handle_outbound(
 }
 
 // helper functions removed in favor of split-based loops
+
+/// First 16 hex chars of a key, for logs.
+fn short_hex(hex: &str) -> String {
+    hex.get(..16).unwrap_or(hex).to_string()
+}

@@ -116,7 +116,11 @@ fn merkle_verify_frozen_4_leaf_tree_v1() {
     // Invalid: leaf 0 value with leaf 1 path → must produce frozen 0x...00.
     let bad = merkle_input_hex(root, 0, &leaf_values[0], &paths[1]);
     let r_bad = merkle_verify_tensor(&bad, 1_000_000).unwrap();
-    assert_eq!(r_bad.output, vec![0u8; 32], "invalid path must produce frozen all-zero output");
+    assert_eq!(
+        r_bad.output,
+        vec![0u8; 32],
+        "invalid path must produce frozen all-zero output"
+    );
 
     // Invalid: tampered root → must produce frozen 0x...00.
     let tampered_root = "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";

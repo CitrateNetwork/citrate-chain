@@ -97,10 +97,7 @@ mod tests {
     #[test]
     fn parse_accepts_positive_integers_only() {
         assert_eq!(ExperimentSeed::parse("42").unwrap(), ExperimentSeed(42));
-        assert!(matches!(
-            ExperimentSeed::parse("0"),
-            Err(SeedError::Zero)
-        ));
+        assert!(matches!(ExperimentSeed::parse("0"), Err(SeedError::Zero)));
         assert!(matches!(
             ExperimentSeed::parse("not-a-number"),
             Err(SeedError::NotPositiveInteger(_))

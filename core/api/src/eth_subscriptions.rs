@@ -102,7 +102,7 @@ where
                     backoff_ms, e
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                backoff_ms = (backoff_ms * 2).min(WS_ACCEPT_BACKOFF_MAX_MS);
+                backoff_ms = backoff_ms.saturating_mul(2).min(WS_ACCEPT_BACKOFF_MAX_MS);
             }
         }
     }
@@ -239,9 +239,13 @@ impl From<&Block> for BlockHeader {
         Self {
             number: format!("0x{:x}", block.header.height),
             hash: format!("0x{}", hex::encode(block.header.block_hash.as_bytes())),
-            parent_hash: format!("0x{}", hex::encode(block.header.selected_parent_hash.as_bytes())),
+            parent_hash: format!(
+                "0x{}",
+                hex::encode(block.header.selected_parent_hash.as_bytes())
+            ),
             nonce: "0x0000000000000000".to_string(),
-            sha3_uncles: "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347".to_string(),
+            sha3_uncles: "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"
+                .to_string(),
             logs_bloom: "0x".to_string() + &"00".repeat(256),
             transactions_root: format!("0x{}", hex::encode(block.tx_root.as_bytes())),
             state_root: format!("0x{}", hex::encode(block.state_root.as_bytes())),
@@ -318,18 +322,14 @@ impl ConnectionState {
 
     fn next_subscription_id(&mut self) -> String {
         let id = format!("0x{:x}", self.next_sub_id);
-        self.next_sub_id += 1;
+        self.next_sub_id = self.next_sub_id.saturating_add(1);
         id
     }
 }
 
 impl EthSubscriptionServer {
     /// Create a new subscription server
-    pub fn new(
-        addr: SocketAddr,
-        storage: Arc<StorageManager>,
-        mempool: Arc<Mempool>,
-    ) -> Self {
+    pub fn new(addr: SocketAddr, storage: Arc<StorageManager>, mempool: Arc<Mempool>) -> Self {
         let (new_heads_tx, _) = broadcast::channel(100);
         let (pending_tx_tx, _) = broadcast::channel(1000);
 
@@ -364,7 +364,7 @@ impl EthSubscriptionServer {
             if *n >= self.limits.max_per_ip {
                 return None;
             }
-            *n += 1;
+            *n = n.saturating_add(1);
         }
         Some(SocketSlot {
             _permit: permit,
@@ -396,7 +396,10 @@ impl EthSubscriptionServer {
     /// Start the WebSocket server
     pub async fn start(self: Arc<Self>) -> anyhow::Result<()> {
         let listener = TcpListener::bind(self.addr).await?;
-        info!("Ethereum subscription WebSocket server listening on ws://{}", self.addr);
+        info!(
+            "Ethereum subscription WebSocket server listening on ws://{}",
+            self.addr
+        );
 
         // PBA-L1a-005: never exits on an accept error (backoff + retry), and
         // every accepted socket must claim a global + per-IP slot BEFORE the
@@ -406,7 +409,10 @@ impl EthSubscriptionServer {
             || listener.accept(),
             move |stream, peer_addr| {
                 let Some(slot) = server.try_claim_slot(peer_addr.ip()) else {
-                    debug!("Refusing WebSocket socket from {}: socket limit reached", peer_addr);
+                    debug!(
+                        "Refusing WebSocket socket from {}: socket limit reached",
+                        peer_addr
+                    );
                     drop(stream);
                     return;
                 };
@@ -574,34 +580,34 @@ impl EthSubscriptionServer {
         let request: SubscriptionRequest = match serde_json::from_str(text) {
             Ok(r) => r,
             Err(e) => {
-                return Some(serde_json::to_string(&serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": null,
-                    "error": {
-                        "code": -32700,
-                        "message": format!("Parse error: {}", e)
-                    }
-                })).unwrap_or_default());
+                return Some(
+                    serde_json::to_string(&serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": null,
+                        "error": {
+                            "code": -32700,
+                            "message": format!("Parse error: {}", e)
+                        }
+                    }))
+                    .unwrap_or_default(),
+                );
             }
         };
 
         match request.method.as_str() {
-            "eth_subscribe" => {
-                self.handle_subscribe(conn_state, request).await
-            }
-            "eth_unsubscribe" => {
-                self.handle_unsubscribe(conn_state, request).await
-            }
-            _ => {
-                Some(serde_json::to_string(&serde_json::json!({
+            "eth_subscribe" => self.handle_subscribe(conn_state, request).await,
+            "eth_unsubscribe" => self.handle_unsubscribe(conn_state, request).await,
+            _ => Some(
+                serde_json::to_string(&serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": request.id,
                     "error": {
                         "code": -32601,
                         "message": format!("Method not found: {}", request.method)
                     }
-                })).unwrap_or_default())
-            }
+                }))
+                .unwrap_or_default(),
+            ),
         }
     }
 
@@ -611,49 +617,64 @@ impl EthSubscriptionServer {
         request: SubscriptionRequest,
     ) -> Option<String> {
         if request.params.is_empty() {
-            return Some(serde_json::to_string(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": request.id,
-                "error": {
-                    "code": -32602,
-                    "message": "Missing subscription type"
-                }
-            })).unwrap_or_default());
+            return Some(
+                serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request.id,
+                    "error": {
+                        "code": -32602,
+                        "message": "Missing subscription type"
+                    }
+                }))
+                .unwrap_or_default(),
+            );
         }
 
-        let sub_type_str = request.params[0].as_str().unwrap_or("");
+        let sub_type_str = request
+            .params
+            .first()
+            .and_then(|p| p.as_str())
+            .unwrap_or("");
         let sub_type = match sub_type_str {
             "newHeads" => EthSubscriptionType::NewHeads,
             "logs" => EthSubscriptionType::Logs,
             "newPendingTransactions" => EthSubscriptionType::NewPendingTransactions,
             "syncing" => EthSubscriptionType::Syncing,
             _ => {
-                return Some(serde_json::to_string(&serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": request.id,
-                    "error": {
-                        "code": -32602,
-                        "message": format!("Unknown subscription type: {}", sub_type_str)
-                    }
-                })).unwrap_or_default());
+                return Some(
+                    serde_json::to_string(&serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request.id,
+                        "error": {
+                            "code": -32602,
+                            "message": format!("Unknown subscription type: {}", sub_type_str)
+                        }
+                    }))
+                    .unwrap_or_default(),
+                );
             }
         };
 
         // PBA-L1a-010 (variant): the logs-subscription filter is retained for
         // the connection's lifetime, so bound it exactly like eth_newFilter.
         if sub_type == EthSubscriptionType::Logs && request.params.len() > 1 {
-            if let Err(msg) = crate::filter::validate_log_filter_criteria(&request.params[1]) {
-                return Some(serde_json::to_string(&serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": request.id,
-                    "error": { "code": -32602, "message": msg }
-                })).unwrap_or_default());
+            if let Err(msg) =
+                crate::filter::validate_log_filter_criteria(crate::eth_rpc::arg(&request.params, 1))
+            {
+                return Some(
+                    serde_json::to_string(&serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request.id,
+                        "error": { "code": -32602, "message": msg }
+                    }))
+                    .unwrap_or_default(),
+                );
             }
         }
 
         // Parse filter for logs subscription
         let filter = if sub_type == EthSubscriptionType::Logs && request.params.len() > 1 {
-            serde_json::from_value(request.params[1].clone()).ok()
+            serde_json::from_value(crate::eth_rpc::arg(&request.params, 1).clone()).ok()
         } else {
             None
         };
@@ -690,11 +711,14 @@ impl EthSubscriptionServer {
 
         debug!("Created subscription {} for {:?}", sub_id, sub_type_str);
 
-        Some(serde_json::to_string(&SubscriptionResponse {
-            jsonrpc: "2.0".to_string(),
-            id: request.id,
-            result: serde_json::Value::String(sub_id),
-        }).unwrap_or_default())
+        Some(
+            serde_json::to_string(&SubscriptionResponse {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: serde_json::Value::String(sub_id),
+            })
+            .unwrap_or_default(),
+        )
     }
 
     async fn handle_unsubscribe(
@@ -703,27 +727,37 @@ impl EthSubscriptionServer {
         request: SubscriptionRequest,
     ) -> Option<String> {
         if request.params.is_empty() {
-            return Some(serde_json::to_string(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": request.id,
-                "error": {
-                    "code": -32602,
-                    "message": "Missing subscription ID"
-                }
-            })).unwrap_or_default());
+            return Some(
+                serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request.id,
+                    "error": {
+                        "code": -32602,
+                        "message": "Missing subscription ID"
+                    }
+                }))
+                .unwrap_or_default(),
+            );
         }
 
-        let sub_id = request.params[0].as_str().unwrap_or("");
+        let sub_id = request
+            .params
+            .first()
+            .and_then(|p| p.as_str())
+            .unwrap_or("");
         let mut state = conn_state.write().await;
         let removed = state.subscriptions.remove(sub_id).is_some();
 
         debug!("Removed subscription {}: {}", sub_id, removed);
 
-        Some(serde_json::to_string(&SubscriptionResponse {
-            jsonrpc: "2.0".to_string(),
-            id: request.id,
-            result: serde_json::Value::Bool(removed),
-        }).unwrap_or_default())
+        Some(
+            serde_json::to_string(&SubscriptionResponse {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: serde_json::Value::Bool(removed),
+            })
+            .unwrap_or_default(),
+        )
     }
 }
 

@@ -5,6 +5,7 @@ import "forge-std/Script.sol";
 import "./ScriptEnv.sol";
 import "./Salts.sol";
 import "../src/SkillRegistry.sol";
+import "./LegacyDeployGuard.sol";
 
 /// @title DeploySkillRegistry — reroll-stable CREATE2 deploy for chain 40204
 /// @notice Deploys `SkillRegistry` via the genesis Arachnid CREATE2 factory
@@ -19,6 +20,10 @@ import "../src/SkillRegistry.sol";
 ///       constructor, so the init_code is just its creationCode — nothing here
 ///       fixes the address except the salt + the compiled bytecode
 ///       (solc 0.8.36 + optimizer(200) + bytecode_hash=none, per foundry.toml).
+///
+/// RETIRED on chain 40204 (HUP-S7.1): `script/DeployHupRegistries.s.sol` deploys the
+/// next SkillRegistry version (abi.encode skill hash) in the same CREATE2 slot. `run()`
+/// reverts on 40204 and still deploys on a local chain.
 ///
 /// Usage (dry-run / simulate):
 ///   forge script script/DeploySkillRegistry.s.sol \
@@ -53,6 +58,7 @@ contract DeploySkillRegistry is ScriptEnv {
     }
 
     function run() external {
+        LegacyDeployGuard.refuseOnCitrate("DeploySkillRegistry");
         address deployer = deployerAddress();
         address projected = projectedAddress(ARACHNID_FACTORY);
 

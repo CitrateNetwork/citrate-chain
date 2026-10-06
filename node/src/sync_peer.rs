@@ -111,6 +111,20 @@
 // count below that threshold forever and silently disable that recovery — the
 // same class of bug as the dead band, just relocated.
 
+// PANIC-S1 G2: block production / apply / sync path (T1); panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use std::collections::HashMap;
 
 /// How far above our applied tip a gossiped block may be and still trigger
@@ -169,11 +183,7 @@ pub fn record_verified_height(seen: &std::sync::atomic::AtomicU64, height: u64) 
 /// parent we lack), clamped to `applied + MAX_UNVERIFIED_HEIGHT_LEAD`.
 /// Handshake (`Hello`/`HelloAck`) heights are NOT recorded at all: they only
 /// seed the peer's advertised head, which the sync tick clamps separately.
-pub fn record_unverified_height(
-    seen: &std::sync::atomic::AtomicU64,
-    claimed: u64,
-    applied: u64,
-) {
+pub fn record_unverified_height(seen: &std::sync::atomic::AtomicU64, claimed: u64, applied: u64) {
     let bounded = claimed.min(applied.saturating_add(MAX_UNVERIFIED_HEIGHT_LEAD));
     seen.fetch_max(bounded, std::sync::atomic::Ordering::Relaxed);
 }
@@ -404,7 +414,7 @@ impl SyncPeerSelector {
             }
         };
         let e = self.score.entry(id.to_string()).or_insert(0);
-        *e = (*e + delta).clamp(SCORE_MIN, SCORE_MAX);
+        *e = e.saturating_add(delta).clamp(SCORE_MIN, SCORE_MAX);
 
         if new_blocks > 0 {
             let w = self.served.entry(id.to_string()).or_insert(0);
@@ -974,14 +984,24 @@ mod pba_l1b_006_network_height {
     fn unverified_claims_are_clamped_verified_are_not() {
         let seen = AtomicU64::new(100);
         record_unverified_height(&seen, u64::MAX, 100);
-        assert_eq!(seen.load(Ordering::Relaxed), 100 + MAX_UNVERIFIED_HEIGHT_LEAD);
+        assert_eq!(
+            seen.load(Ordering::Relaxed),
+            100 + MAX_UNVERIFIED_HEIGHT_LEAD
+        );
         record_unverified_height(&seen, 150, 100);
-        assert_eq!(seen.load(Ordering::Relaxed), 100 + MAX_UNVERIFIED_HEIGHT_LEAD);
+        assert_eq!(
+            seen.load(Ordering::Relaxed),
+            100 + MAX_UNVERIFIED_HEIGHT_LEAD
+        );
         let seen = AtomicU64::new(0);
         record_unverified_height(&seen, 5_000, 10);
         assert_eq!(seen.load(Ordering::Relaxed), 5_000, "honest lead is kept");
         record_unverified_height(&seen, u64::MAX, u64::MAX);
-        assert_eq!(seen.load(Ordering::Relaxed), u64::MAX, "saturating, no panic");
+        assert_eq!(
+            seen.load(Ordering::Relaxed),
+            u64::MAX,
+            "saturating, no panic"
+        );
         let seen = AtomicU64::new(7);
         record_verified_height(&seen, 42);
         assert_eq!(seen.load(Ordering::Relaxed), 42);

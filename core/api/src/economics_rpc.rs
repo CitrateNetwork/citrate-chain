@@ -2,9 +2,9 @@
 
 // PIL-49: shared Tokio runtime so block_on can drive tokio::sync::* wakers.
 use crate::rpc_runtime::block_on;
-use jsonrpc_core::{IoHandler, Params, Value};
 use citrate_economics::UnifiedEconomicsManager;
 use citrate_sequencer::mempool::Mempool;
+use jsonrpc_core::{IoHandler, Params, Value};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -66,12 +66,18 @@ pub fn register_economics_methods(
             };
 
             if params.is_empty() {
-                return Err(jsonrpc_core::Error::invalid_params("Missing address parameter"));
+                return Err(jsonrpc_core::Error::invalid_params(
+                    "Missing address parameter",
+                ));
             }
 
-            let address_str = match params[0].as_str() {
+            let address_str = match crate::eth_rpc::arg(&params, 0).as_str() {
                 Some(s) => s,
-                None => return Err(jsonrpc_core::Error::invalid_params("Invalid address format")),
+                None => {
+                    return Err(jsonrpc_core::Error::invalid_params(
+                        "Invalid address format",
+                    ))
+                }
             };
 
             // Parse hex address
@@ -81,7 +87,9 @@ pub fn register_economics_methods(
             };
 
             if address_bytes.len() != 20 {
-                return Err(jsonrpc_core::Error::invalid_params("Address must be 20 bytes"));
+                return Err(jsonrpc_core::Error::invalid_params(
+                    "Address must be 20 bytes",
+                ));
             }
 
             let mut addr_array = [0u8; 20];
@@ -116,12 +124,18 @@ pub fn register_economics_methods(
             };
 
             if params.is_empty() {
-                return Err(jsonrpc_core::Error::invalid_params("Missing address parameter"));
+                return Err(jsonrpc_core::Error::invalid_params(
+                    "Missing address parameter",
+                ));
             }
 
-            let address_str = match params[0].as_str() {
+            let address_str = match crate::eth_rpc::arg(&params, 0).as_str() {
                 Some(s) => s,
-                None => return Err(jsonrpc_core::Error::invalid_params("Invalid address format")),
+                None => {
+                    return Err(jsonrpc_core::Error::invalid_params(
+                        "Invalid address format",
+                    ))
+                }
             };
 
             // Parse hex address
@@ -131,7 +145,9 @@ pub fn register_economics_methods(
             };
 
             if address_bytes.len() != 20 {
-                return Err(jsonrpc_core::Error::invalid_params("Address must be 20 bytes"));
+                return Err(jsonrpc_core::Error::invalid_params(
+                    "Address must be 20 bytes",
+                ));
             }
 
             let mut addr_array = [0u8; 20];
@@ -161,15 +177,18 @@ pub fn register_economics_methods(
     io_handler.add_sync_method("citrate_getRevenueHistory", move |_params: Params| {
         if let Some(economics) = &economics_rh {
             let distributions = economics.get_revenue_distribution_history(None);
-            let history_json: Vec<_> = distributions.iter().map(|dist| {
-                json!({
-                    "blockHeight": dist.block_height,
-                    "totalRevenue": format!("0x{:x}", dist.total_revenue),
-                    "poolType": format!("{:?}", dist.pool_type),
-                    "distributionCount": dist.distributions.len(),
-                    "timestamp": dist.timestamp,
+            let history_json: Vec<_> = distributions
+                .iter()
+                .map(|dist| {
+                    json!({
+                        "blockHeight": dist.block_height,
+                        "totalRevenue": format!("0x{:x}", dist.total_revenue),
+                        "poolType": format!("{:?}", dist.pool_type),
+                        "distributionCount": dist.distributions.len(),
+                        "timestamp": dist.timestamp,
+                    })
                 })
-            }).collect();
+                .collect();
 
             Ok(json!(history_json))
         } else {
@@ -193,41 +212,43 @@ pub fn register_economics_methods(
     io_handler.add_sync_method("citrate_getMempoolStats", move |_params: Params| {
         if let Some(mempool) = &mempool_snap {
             let stats = block_on(mempool.stats());
-                    let pending_txs = block_on(mempool.get_transactions(1000)); // Get up to 1000 transactions
-                    let mut total_gas_fees = primitive_types::U256::zero();
-                    let mut ai_operations = 0u32;
-                    let mut total_gas_used = 0u64;
-                    let tx_count = pending_txs.len() as u32;
+            let pending_txs = block_on(mempool.get_transactions(1000)); // Get up to 1000 transactions
+            let mut total_gas_fees = primitive_types::U256::zero();
+            let mut ai_operations = 0u32;
+            let mut total_gas_used = 0u64;
+            let tx_count = pending_txs.len() as u32;
 
-                    // Calculate total fees and identify AI operations
-                    for tx in &pending_txs {
-                        total_gas_used += tx.gas_limit;
+            // Calculate total fees and identify AI operations
+            for tx in &pending_txs {
+                total_gas_used = total_gas_used.saturating_add(tx.gas_limit);
 
-                        // Calculate fee (gas_limit * gas_price)
-                        let fee = primitive_types::U256::from(tx.gas_limit) * primitive_types::U256::from(tx.gas_price);
-                        total_gas_fees += fee;
+                // Calculate fee (gas_limit * gas_price)
+                let fee = primitive_types::U256::from(tx.gas_limit)
+                    .saturating_mul(primitive_types::U256::from(tx.gas_price));
+                total_gas_fees = total_gas_fees.saturating_add(fee);
 
-                        // Check if this is an AI operation (simplified heuristic)
-                        if tx.gas_limit > 500_000 {  // AI operations typically use more gas
-                            ai_operations += 1;
-                        }
-                    }
+                // Check if this is an AI operation (simplified heuristic)
+                if tx.gas_limit > 500_000 {
+                    // AI operations typically use more gas
+                    ai_operations = ai_operations.saturating_add(1);
+                }
+            }
 
-                    let avg_gas_price = if tx_count > 0 {
-                        total_gas_used / tx_count as u64
-                    } else {
-                        1_000_000_000 // 1 Gwei default
-                    };
+            let avg_gas_price = if tx_count > 0 {
+                total_gas_used.checked_div(tx_count as u64).unwrap_or(0)
+            } else {
+                1_000_000_000 // 1 Gwei default
+            };
 
-                    Ok(json!({
-                        "pendingTransactions": tx_count,
-                        "totalGasFees": format!("0x{:x}", total_gas_fees),
-                        "avgGasPrice": format!("0x{:x}", avg_gas_price),
-                        "aiOperations": ai_operations,
-                        "queuedForExecution": tx_count,
-                        "mempoolSize": stats.total_size,
-                        "byClass": stats.by_class,
-                    }))
+            Ok(json!({
+                "pendingTransactions": tx_count,
+                "totalGasFees": format!("0x{:x}", total_gas_fees),
+                "avgGasPrice": format!("0x{:x}", avg_gas_price),
+                "aiOperations": ai_operations,
+                "queuedForExecution": tx_count,
+                "mempoolSize": stats.total_size,
+                "byClass": stats.by_class,
+            }))
         } else {
             // Fallback when no mempool available
             Ok(json!({
@@ -274,12 +295,18 @@ pub fn register_economics_methods(
             };
 
             if params.is_empty() {
-                return Err(jsonrpc_core::Error::invalid_params("Missing address parameter"));
+                return Err(jsonrpc_core::Error::invalid_params(
+                    "Missing address parameter",
+                ));
             }
 
-            let address_str = match params[0].as_str() {
+            let address_str = match crate::eth_rpc::arg(&params, 0).as_str() {
                 Some(s) => s,
-                None => return Err(jsonrpc_core::Error::invalid_params("Invalid address format")),
+                None => {
+                    return Err(jsonrpc_core::Error::invalid_params(
+                        "Invalid address format",
+                    ))
+                }
             };
 
             // Parse hex address
@@ -289,7 +316,9 @@ pub fn register_economics_methods(
             };
 
             if address_bytes.len() != 20 {
-                return Err(jsonrpc_core::Error::invalid_params("Address must be 20 bytes"));
+                return Err(jsonrpc_core::Error::invalid_params(
+                    "Address must be 20 bytes",
+                ));
             }
 
             let mut addr_array = [0u8; 20];
@@ -314,12 +343,18 @@ pub fn register_economics_methods(
             };
 
             if params.is_empty() {
-                return Err(jsonrpc_core::Error::invalid_params("Missing address parameter"));
+                return Err(jsonrpc_core::Error::invalid_params(
+                    "Missing address parameter",
+                ));
             }
 
-            let address_str = match params[0].as_str() {
+            let address_str = match crate::eth_rpc::arg(&params, 0).as_str() {
                 Some(s) => s,
-                None => return Err(jsonrpc_core::Error::invalid_params("Invalid address format")),
+                None => {
+                    return Err(jsonrpc_core::Error::invalid_params(
+                        "Invalid address format",
+                    ))
+                }
             };
 
             // Parse hex address
@@ -329,7 +364,9 @@ pub fn register_economics_methods(
             };
 
             if address_bytes.len() != 20 {
-                return Err(jsonrpc_core::Error::invalid_params("Address must be 20 bytes"));
+                return Err(jsonrpc_core::Error::invalid_params(
+                    "Address must be 20 bytes",
+                ));
             }
 
             let mut addr_array = [0u8; 20];
@@ -337,9 +374,14 @@ pub fn register_economics_methods(
             let address = citrate_execution::types::Address(addr_array);
 
             let reputation_score = economics.get_reputation_score(&address);
-            Ok(Value::Number(serde_json::Number::from_f64(reputation_score).unwrap_or(serde_json::Number::from(0))))
+            Ok(Value::Number(
+                serde_json::Number::from_f64(reputation_score)
+                    .unwrap_or(serde_json::Number::from(0)),
+            ))
         } else {
-            Ok(Value::Number(serde_json::Number::from_f64(0.5).unwrap_or_else(|| serde_json::Number::from(0))))
+            Ok(Value::Number(
+                serde_json::Number::from_f64(0.5).unwrap_or_else(|| serde_json::Number::from(0)),
+            ))
         }
     });
 }

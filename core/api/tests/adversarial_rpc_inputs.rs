@@ -38,12 +38,10 @@ fn build_test_handler() -> IoHandler {
     // Returns the decoded byte length on success, or a JSON-RPC error on
     // invalid input.
     handler.add_sync_method("test_echo", |params: Params| {
-        let values: Vec<Value> = params.parse().map_err(|_| {
-            jsonrpc_core::Error {
-                code: jsonrpc_core::ErrorCode::InvalidParams,
-                message: "Expected array of params".into(),
-                data: None,
-            }
+        let values: Vec<Value> = params.parse().map_err(|_| jsonrpc_core::Error {
+            code: jsonrpc_core::ErrorCode::InvalidParams,
+            message: "Expected array of params".into(),
+            data: None,
         })?;
 
         if values.is_empty() {
@@ -57,11 +55,13 @@ fn build_test_handler() -> IoHandler {
         })?;
 
         // Require 0x prefix
-        let stripped = hex_str.strip_prefix("0x").ok_or_else(|| jsonrpc_core::Error {
-            code: jsonrpc_core::ErrorCode::InvalidParams,
-            message: "Hex param must start with 0x".into(),
-            data: None,
-        })?;
+        let stripped = hex_str
+            .strip_prefix("0x")
+            .ok_or_else(|| jsonrpc_core::Error {
+                code: jsonrpc_core::ErrorCode::InvalidParams,
+                message: "Hex param must start with 0x".into(),
+                data: None,
+            })?;
 
         // Reject odd-length hex
         if stripped.len() % 2 != 0 {
@@ -105,7 +105,10 @@ fn test_malformed_jsonrpc_missing_method() {
 
     let error = resp.get("error").expect("response should contain error");
     let code = error.get("code").and_then(|c| c.as_i64()).unwrap();
-    assert_eq!(code, -32600, "Missing method should produce Invalid Request (-32600)");
+    assert_eq!(
+        code, -32600,
+        "Missing method should produce Invalid Request (-32600)"
+    );
 }
 
 // ===========================================================================
@@ -152,7 +155,11 @@ fn test_malformed_jsonrpc_null_id() {
 
     // The response id should be null to match the request
     let resp_id = resp.get("id").expect("response should have id field");
-    assert!(resp_id.is_null(), "Response id should be null, got: {:?}", resp_id);
+    assert!(
+        resp_id.is_null(),
+        "Response id should be null, got: {:?}",
+        resp_id
+    );
 }
 
 // ===========================================================================
@@ -172,9 +179,14 @@ fn test_invalid_hex_odd_length() {
     .to_string();
 
     let resp = send_raw(&handler, &request).expect("should return a response");
-    let error = resp.get("error").expect("should return an error for odd-length hex");
+    let error = resp
+        .get("error")
+        .expect("should return an error for odd-length hex");
     let code = error.get("code").and_then(|c| c.as_i64()).unwrap();
-    assert_eq!(code, -32602, "Odd-length hex should produce Invalid Params (-32602)");
+    assert_eq!(
+        code, -32602,
+        "Odd-length hex should produce Invalid Params (-32602)"
+    );
 
     let message = error.get("message").and_then(|m| m.as_str()).unwrap();
     assert!(
@@ -201,9 +213,14 @@ fn test_invalid_hex_non_hex_chars() {
     .to_string();
 
     let resp = send_raw(&handler, &request).expect("should return a response");
-    let error = resp.get("error").expect("should return an error for non-hex chars");
+    let error = resp
+        .get("error")
+        .expect("should return an error for non-hex chars");
     let code = error.get("code").and_then(|c| c.as_i64()).unwrap();
-    assert_eq!(code, -32602, "Non-hex chars should produce Invalid Params (-32602)");
+    assert_eq!(
+        code, -32602,
+        "Non-hex chars should produce Invalid Params (-32602)"
+    );
 
     let message = error.get("message").and_then(|m| m.as_str()).unwrap();
     assert!(
@@ -230,9 +247,14 @@ fn test_invalid_hex_missing_prefix() {
     .to_string();
 
     let resp = send_raw(&handler, &request).expect("should return a response");
-    let error = resp.get("error").expect("should return an error for missing 0x prefix");
+    let error = resp
+        .get("error")
+        .expect("should return an error for missing 0x prefix");
     let code = error.get("code").and_then(|c| c.as_i64()).unwrap();
-    assert_eq!(code, -32602, "Missing 0x prefix should produce Invalid Params (-32602)");
+    assert_eq!(
+        code, -32602,
+        "Missing 0x prefix should produce Invalid Params (-32602)"
+    );
 
     let message = error.get("message").and_then(|m| m.as_str()).unwrap();
     assert!(
@@ -262,7 +284,9 @@ fn test_empty_params() {
     let resp = send_raw(&handler, &request).expect("should return a response");
 
     // Our test_echo handler returns "no params" for empty arrays.
-    let result = resp.get("result").expect("empty params should produce a result, not an error");
+    let result = resp
+        .get("result")
+        .expect("empty params should produce a result, not an error");
     assert_eq!(
         result.as_str().unwrap(),
         "no params",
@@ -288,7 +312,12 @@ fn test_unknown_method() {
     .to_string();
 
     let resp = send_raw(&handler, &request).expect("should return a response");
-    let error = resp.get("error").expect("unknown method should return an error");
+    let error = resp
+        .get("error")
+        .expect("unknown method should return an error");
     let code = error.get("code").and_then(|c| c.as_i64()).unwrap();
-    assert_eq!(code, -32601, "Unknown method should produce Method Not Found (-32601)");
+    assert_eq!(
+        code, -32601,
+        "Unknown method should produce Method Not Found (-32601)"
+    );
 }

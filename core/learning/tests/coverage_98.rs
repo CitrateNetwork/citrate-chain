@@ -592,14 +592,8 @@ fn test_byzantine_can_readmit_saturating_sub() {
 #[test]
 fn test_lora_create_rank_zero() {
     let emb = EmbeddingVector::new(vec![1.0, 2.0, 3.0]).unwrap();
-    let result = AdapterFactory::create_lora(
-        &emb,
-        0,
-        test_metadata(1),
-        [1u8; 32],
-        100,
-        vec![0u8; 64],
-    );
+    let result =
+        AdapterFactory::create_lora(&emb, 0, test_metadata(1), [1u8; 32], 100, vec![0u8; 64]);
     assert!(result.is_err());
 }
 
@@ -767,9 +761,7 @@ fn test_provenance_chain_missing_parent_at_entry_1() {
 
 #[test]
 fn test_provenance_chain_empty() {
-    let chain = ProvenanceChain {
-        entries: vec![],
-    };
+    let chain = ProvenanceChain { entries: vec![] };
     assert!(chain.is_empty());
     assert_eq!(chain.len(), 0);
     // Empty chain validates ok (no links to check)
@@ -817,14 +809,8 @@ fn test_adapter_registry_query_nonexistent() {
 #[test]
 fn test_apply_adapter_dimension_mismatch() {
     let delta = EmbeddingVector::new(vec![0.1, 0.2, 0.3]).unwrap();
-    let adapter = AdapterFactory::create(
-        delta,
-        test_metadata(1),
-        [1u8; 32],
-        100,
-        vec![0u8; 64],
-    )
-    .unwrap();
+    let adapter =
+        AdapterFactory::create(delta, test_metadata(1), [1u8; 32], 100, vec![0u8; 64]).unwrap();
     let bad_base = EmbeddingVector::new(vec![1.0, 2.0]).unwrap();
     assert!(apply_adapter(&bad_base, &adapter).is_err());
 }
@@ -1341,14 +1327,8 @@ fn test_checkpoint_full_serialization_roundtrip() {
     assert_eq!(deser.performance_profile_hash, Some([0xCC; 32]));
     assert!(deser.aggregated_result.is_some()); // Backward compat
     assert!(deser.aggregation_result.is_some());
-    assert_eq!(
-        deser.macro_phase,
-        Some(NetworkLearningPhase::FullSystem)
-    );
-    assert_eq!(
-        deser.state_vector.as_ref().unwrap()[0],
-        BelnapValue::True
-    );
+    assert_eq!(deser.macro_phase, Some(NetworkLearningPhase::FullSystem));
+    assert_eq!(deser.state_vector.as_ref().unwrap()[0], BelnapValue::True);
 }
 
 // ============================================================================
@@ -1549,7 +1529,10 @@ fn test_full_round_with_byzantine_check() {
     let reasons = detector
         .check_and_flag([1u8; 32], 1, &e_honest1, &mean, std_dev, &clean_state)
         .unwrap();
-    assert!(reasons.is_empty(), "honest participant should not be flagged");
+    assert!(
+        reasons.is_empty(),
+        "honest participant should not be flagged"
+    );
 
     // Check byzantine participant
     let bad_state = vec![BelnapValue::Both; 3]; // 100% Both

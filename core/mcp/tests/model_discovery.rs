@@ -65,7 +65,11 @@ async fn test_register_model_appears_in_listing() {
     let metadata = make_model_metadata("discovery-model-1", owner, 1);
 
     let model_id = registry
-        .register(metadata.clone(), vec![provider], Some("QmDiscovery1".to_string()))
+        .register(
+            metadata.clone(),
+            vec![provider],
+            Some("QmDiscovery1".to_string()),
+        )
         .await
         .unwrap();
 

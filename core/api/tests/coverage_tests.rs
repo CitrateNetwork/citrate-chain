@@ -33,7 +33,10 @@ fn test_decode_255_byte_random_data() {
     // Exactly 255 bytes of non-RLP data
     let data: Vec<u8> = (0..255).map(|i| i as u8).collect();
     let result = decode_eth_transaction(&data);
-    assert!(result.is_err(), "Random 255 bytes must not decode as valid tx");
+    assert!(
+        result.is_err(),
+        "Random 255 bytes must not decode as valid tx"
+    );
 }
 
 #[test]
@@ -175,7 +178,8 @@ fn test_decode_bincode_one_byte_over_limit() {
     let err = result.unwrap_err();
     assert!(
         err.contains("large") || err.contains("256KB") || err.contains("too"),
-        "Error should mention size limit, got: {}", err
+        "Error should mention size limit, got: {}",
+        err
     );
 }
 

@@ -40,7 +40,11 @@ impl RecommendationEngine {
     }
 
     /// Get personalized recommendations for a user
-    pub async fn get_recommendations(&self, user_address: &Address, limit: usize) -> Result<Vec<ModelId>> {
+    pub async fn get_recommendations(
+        &self,
+        user_address: &Address,
+        limit: usize,
+    ) -> Result<Vec<ModelId>> {
         // Get user profile
         let recommendations = if let Some(profile) = self.user_profiles.get(user_address) {
             // Collaborative filtering: find similar users
@@ -52,7 +56,8 @@ impl RecommendationEngine {
                 if let Some(similar_profile) = self.user_profiles.get(&similar_user) {
                     for model_id in &similar_profile.purchased_models {
                         if !profile.purchased_models.contains(model_id)
-                            && !profile.viewed_models.contains(model_id) {
+                            && !profile.viewed_models.contains(model_id)
+                        {
                             *candidate_models.entry(*model_id).or_insert(0.0) += similarity;
                         }
                     }
@@ -64,8 +69,10 @@ impl RecommendationEngine {
                 if let Some(similar_models) = self.model_similarities.get(purchased_model) {
                     for (model_id, similarity) in similar_models {
                         if !profile.purchased_models.contains(model_id)
-                            && !profile.viewed_models.contains(model_id) {
-                            *candidate_models.entry(*model_id).or_insert(0.0) += similarity * 0.7; // Weight content-based lower
+                            && !profile.viewed_models.contains(model_id)
+                        {
+                            *candidate_models.entry(*model_id).or_insert(0.0) += similarity * 0.7;
+                            // Weight content-based lower
                         }
                     }
                 }
@@ -77,14 +84,16 @@ impl RecommendationEngine {
                 if model.category == profile.preferences
                     && !profile.purchased_models.contains(&model.model_id)
                     && !profile.viewed_models.contains(&model.model_id)
-                    && model.active {
+                    && model.active
+                {
                     *candidate_models.entry(model.model_id).or_insert(0.0) += 0.3;
                 }
             }
 
             // Sort by score and return top recommendations
             let mut scored_models: Vec<(ModelId, f32)> = candidate_models.into_iter().collect();
-            scored_models.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored_models
+                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
             scored_models
                 .into_iter()
@@ -119,7 +128,11 @@ impl RecommendationEngine {
     }
 
     /// Find users with similar preferences
-    async fn find_similar_users(&self, user_address: &Address, limit: usize) -> Result<Vec<(Address, f32)>> {
+    async fn find_similar_users(
+        &self,
+        user_address: &Address,
+        limit: usize,
+    ) -> Result<Vec<(Address, f32)>> {
         let target_profile = match self.user_profiles.get(user_address) {
             Some(profile) => profile,
             None => return Ok(Vec::new()),
@@ -130,7 +143,8 @@ impl RecommendationEngine {
         for (other_user, other_profile) in &self.user_profiles {
             if other_user != user_address {
                 let similarity = self.calculate_user_similarity(target_profile, other_profile);
-                if similarity > 0.1 { // Minimum similarity threshold
+                if similarity > 0.1 {
+                    // Minimum similarity threshold
                     similarities.push((*other_user, similarity));
                 }
             }
@@ -153,10 +167,12 @@ impl RecommendationEngine {
         }
 
         // Jaccard similarity for purchased models
-        let intersection: HashSet<_> = profile1.purchased_models
+        let intersection: HashSet<_> = profile1
+            .purchased_models
             .intersection(&profile2.purchased_models)
             .collect();
-        let union: HashSet<_> = profile1.purchased_models
+        let union: HashSet<_> = profile1
+            .purchased_models
             .union(&profile2.purchased_models)
             .collect();
 
@@ -166,7 +182,8 @@ impl RecommendationEngine {
         }
 
         // Framework preference similarity
-        let common_frameworks: f32 = profile1.preferred_frameworks
+        let common_frameworks: f32 = profile1
+            .preferred_frameworks
             .iter()
             .map(|(framework, count1)| {
                 let count2 = profile2.preferred_frameworks.get(framework).unwrap_or(&0);
@@ -197,15 +214,16 @@ impl RecommendationEngine {
         let models = self.storage.get_all_models().await?;
 
         // Create a map for quick model lookup
-        let model_map: HashMap<ModelId, &MarketplaceModel> = models
-            .iter()
-            .map(|m| (m.model_id, m))
-            .collect();
+        let model_map: HashMap<ModelId, &MarketplaceModel> =
+            models.iter().map(|m| (m.model_id, m)).collect();
 
         // For each model owner, create a basic profile
         for model in &models {
             if !self.user_profiles.contains_key(&model.owner) {
-                let interactions = self.storage.get_user_interactions(&model.owner, 100).await?;
+                let interactions = self
+                    .storage
+                    .get_user_interactions(&model.owner, 100)
+                    .await?;
 
                 let mut purchased_models = HashSet::new();
                 let mut viewed_models = HashSet::new();
@@ -225,8 +243,16 @@ impl RecommendationEngine {
 
                     // Count category preferences
                     if let Some(model) = model_map.get(&interaction.model_id) {
-                        *framework_prefs.entry(model.framework.clone()).or_insert(0) += 1;
-                        *category_counts.entry(model.category).or_insert(0) += 1;
+                        {
+                            let n = framework_prefs
+                                .entry(model.framework.clone())
+                                .or_insert(0u32);
+                            *n = n.saturating_add(1);
+                        }
+                        {
+                            let n = category_counts.entry(model.category).or_insert(0u32);
+                            *n = n.saturating_add(1);
+                        }
                     }
                 }
 
@@ -273,7 +299,8 @@ impl RecommendationEngine {
             similarities.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             similarities.truncate(20);
 
-            self.model_similarities.insert(model1.model_id, similarities);
+            self.model_similarities
+                .insert(model1.model_id, similarities);
         }
 
         info!("Computed similarities for {} models", models.len());
@@ -281,7 +308,11 @@ impl RecommendationEngine {
     }
 
     /// Calculate similarity between two models
-    fn calculate_model_similarity(&self, model1: &MarketplaceModel, model2: &MarketplaceModel) -> f32 {
+    fn calculate_model_similarity(
+        &self,
+        model1: &MarketplaceModel,
+        model2: &MarketplaceModel,
+    ) -> f32 {
         let mut similarity = 0.0;
 
         // Category similarity

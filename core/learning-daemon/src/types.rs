@@ -89,8 +89,7 @@ mod tests {
             log_index: 7,
         };
         let bytes = bincode::serialize(&original).expect("serializes");
-        let decoded: EmbeddingSubmission =
-            bincode::deserialize(&bytes).expect("decodes");
+        let decoded: EmbeddingSubmission = bincode::deserialize(&bytes).expect("decodes");
         assert_eq!(original, decoded);
     }
 

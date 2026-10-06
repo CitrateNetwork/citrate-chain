@@ -49,7 +49,17 @@ fn m04_integer_sqrt_exact_above_f64_precision() {
 #[test]
 fn m04_integer_sqrt_monotonic() {
     let inputs: Vec<u128> = (0..100u128)
-        .chain([1u128 << 50, 1u128 << 60, 1u128 << 70, 1u128 << 100, u128::MAX].iter().copied())
+        .chain(
+            [
+                1u128 << 50,
+                1u128 << 60,
+                1u128 << 70,
+                1u128 << 100,
+                u128::MAX,
+            ]
+            .iter()
+            .copied(),
+        )
         .collect();
     let mut sorted = inputs.clone();
     sorted.sort();

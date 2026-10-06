@@ -91,8 +91,9 @@ simulation now prints *next-nonce* addresses that have no code.
 
 Instead, the book is derived from the chain itself.
 `40204.provenance.json` records every transaction the deployer
-(`0xa3512bE8…`) sent on the fresh chain: nonces 0–115, contiguous, all
-with `status=1`. For each transaction it records the tx hash, block, the
+(`0x7DAbC319…Acdf`, r1005 reroll 2026-10-06, genesis `1dcfc490…`) sent on
+the fresh chain: nonces 0–102, contiguous, all with `status=1` (no orphans
+this time; the 2026-09-29 chain had nonces 0–115 under `0xa3512bE8…`). For each transaction it records the tx hash, block, the
 created address, and the forge artifact whose creation code prefixes the
 init code. It also marks each entry `canonical` or `orphan`, where an
 orphan is the leftover of a partial first run that a complete rerun
@@ -107,6 +108,18 @@ citrate-quorum's book test requires, and the others are
 `QuorumAnchorRegistry` and `CitAgentAnchorRegistry`. The cit_agent
 2-of-3 timelock is `CitAgentTimelock`. The coop pair and the `planned`
 coop block are absent because coop is not deployed on this chain yet.
+
+### HUP registry set (HUP-S7.1)
+
+`OrganizationSBT`, `AgentSBT`, `CapsuleRegistry`, `AnchorRegistry`,
+`BenchmarkRegistry` and `SkillRegistry` are deployed by
+`script/DeployHupRegistries.s.sol` after the main ceremony, and merged into this
+book by `scripts/ops/hup-book-update.py`, which re-derives each CREATE2 address
+from the broadcast and checks it on chain before writing. Procedure:
+[`docs/ops/HUP_REGISTRY_REDEPLOY_RUNBOOK.md`](../../docs/ops/HUP_REGISTRY_REDEPLOY_RUNBOOK.md).
+`scripts/ops/hup-provenance-update.py` then appends the same broadcast to
+`40204.provenance.json` (rows the book no longer pins become `superseded`), so the
+ledger and the book stay in step.
 
 ## Adding a new contract
 

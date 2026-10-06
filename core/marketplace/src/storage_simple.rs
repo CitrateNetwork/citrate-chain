@@ -58,12 +58,20 @@ impl MarketplaceStorage {
 
     /// Get all models
     pub async fn get_all_models(&self) -> Result<Vec<MarketplaceModel>> {
-        Ok(self.models.iter().map(|entry| entry.value().clone()).collect())
+        Ok(self
+            .models
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect())
     }
 
     /// Get models by category
-    pub async fn get_models_by_category(&self, category: ModelCategory) -> Result<Vec<MarketplaceModel>> {
-        Ok(self.models
+    pub async fn get_models_by_category(
+        &self,
+        category: ModelCategory,
+    ) -> Result<Vec<MarketplaceModel>> {
+        Ok(self
+            .models
             .iter()
             .filter(|entry| entry.value().category == category)
             .map(|entry| entry.value().clone())
@@ -72,7 +80,8 @@ impl MarketplaceStorage {
 
     /// Get models by owner
     pub async fn get_models_by_owner(&self, owner: &Address) -> Result<Vec<MarketplaceModel>> {
-        Ok(self.models
+        Ok(self
+            .models
             .iter()
             .filter(|entry| entry.value().owner == *owner)
             .map(|entry| entry.value().clone())
@@ -82,7 +91,8 @@ impl MarketplaceStorage {
     /// Search models by name or description
     pub async fn search_models(&self, query: &str) -> Result<Vec<MarketplaceModel>> {
         let query_lower = query.to_lowercase();
-        Ok(self.models
+        Ok(self
+            .models
             .iter()
             .filter(|entry| {
                 let model = entry.value();
@@ -107,7 +117,11 @@ impl MarketplaceStorage {
     }
 
     /// Get user interactions
-    pub async fn get_user_interactions(&self, user: &Address, limit: usize) -> Result<Vec<UserInteraction>> {
+    pub async fn get_user_interactions(
+        &self,
+        user: &Address,
+        limit: usize,
+    ) -> Result<Vec<UserInteraction>> {
         let interactions = self.interactions.read().await;
         Ok(interactions
             .iter()
@@ -118,7 +132,11 @@ impl MarketplaceStorage {
     }
 
     /// Get model interactions
-    pub async fn get_model_interactions(&self, model_id: &ModelId, limit: usize) -> Result<Vec<UserInteraction>> {
+    pub async fn get_model_interactions(
+        &self,
+        model_id: &ModelId,
+        limit: usize,
+    ) -> Result<Vec<UserInteraction>> {
         let interactions = self.interactions.read().await;
         Ok(interactions
             .iter()
@@ -137,8 +155,13 @@ impl MarketplaceStorage {
     }
 
     /// Get reviews for a model
-    pub async fn get_model_reviews(&self, model_id: &ModelId, limit: usize) -> Result<Vec<UserReview>> {
-        Ok(self.reviews
+    pub async fn get_model_reviews(
+        &self,
+        model_id: &ModelId,
+        limit: usize,
+    ) -> Result<Vec<UserReview>> {
+        Ok(self
+            .reviews
             .iter()
             .filter(|entry| entry.key().0 == *model_id)
             .take(limit)
@@ -148,7 +171,8 @@ impl MarketplaceStorage {
 
     /// Get reviews by user
     pub async fn get_user_reviews(&self, user: &Address, limit: usize) -> Result<Vec<UserReview>> {
-        Ok(self.reviews
+        Ok(self
+            .reviews
             .iter()
             .filter(|entry| entry.key().1 == *user)
             .take(limit)
@@ -158,7 +182,8 @@ impl MarketplaceStorage {
 
     /// Calculate average rating for a model
     pub async fn get_model_rating(&self, model_id: &ModelId) -> Result<Option<f32>> {
-        let reviews: Vec<f32> = self.reviews
+        let reviews: Vec<f32> = self
+            .reviews
             .iter()
             .filter(|entry| entry.key().0 == *model_id)
             .map(|entry| entry.value().rating)
@@ -182,7 +207,10 @@ impl MarketplaceStorage {
             let count = interactions.len() as u64;
             let mut counts: HashMap<ModelId, u64> = HashMap::new();
             for interaction in interactions.iter() {
-                *counts.entry(interaction.model_id).or_insert(0) += 1;
+                {
+                    let n = counts.entry(interaction.model_id).or_insert(0);
+                    *n = n.saturating_add(1);
+                }
             }
             (count, counts)
         };
@@ -201,7 +229,10 @@ impl MarketplaceStorage {
         // Calculate category distribution
         let mut category_counts: HashMap<ModelCategory, u64> = HashMap::new();
         for model in self.models.iter() {
-            *category_counts.entry(model.value().category).or_insert(0) += 1;
+            {
+                let n = category_counts.entry(model.value().category).or_insert(0);
+                *n = n.saturating_add(1);
+            }
         }
         stats.category_distribution = category_counts;
 

@@ -62,7 +62,7 @@ pub struct Q16Weights {
 impl Q16Weights {
     /// Encode as big-endian bytes (i64 each, total = 8 * values.len()).
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(8 * self.values.len());
+        let mut bytes = Vec::with_capacity(self.values.len().saturating_mul(8));
         for v in &self.values {
             bytes.extend_from_slice(&v.to_be_bytes());
         }
@@ -129,7 +129,11 @@ impl TrainingBackend for StubTrainingBackend {
         // same chain commit. That's the idempotency property the
         // trainer relies on.
         let values = (0..self.n_weights)
-            .map(|i| (cycle_id as i64).saturating_mul(1000).saturating_add(i as i64))
+            .map(|i| {
+                (cycle_id as i64)
+                    .saturating_mul(1000)
+                    .saturating_add(i as i64)
+            })
             .collect();
         Ok(Q16Weights { values })
     }
@@ -160,12 +164,18 @@ impl MemoryIpfsClient {
 
     /// Test helper: how many distinct objects have been pinned.
     pub fn pin_count(&self) -> usize {
-        self.pinned.lock().expect("lock").len()
+        self.pinned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// Test helper: retrieve pinned bytes by CID.
     pub fn fetch(&self, cid: &str) -> Option<Vec<u8>> {
-        let pinned = self.pinned.lock().expect("lock");
+        let pinned = self
+            .pinned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         pinned
             .iter()
             .find(|(c, _)| c == cid)
@@ -186,8 +196,12 @@ impl IpfsClient for MemoryIpfsClient {
         // Real Kubo CIDs are base-CID-encoded multihashes; this stub
         // is just unique-and-deterministic enough for tests.
         let hash = Keccak256::digest(bytes);
-        let cid = format!("cid-{}", hex::encode(&hash[..8]));
-        let mut pinned = self.pinned.lock().expect("lock");
+        let [h0, h1, h2, h3, h4, h5, h6, h7, ..]: [u8; 32] = hash.into();
+        let cid = format!("cid-{}", hex::encode([h0, h1, h2, h3, h4, h5, h6, h7]));
+        let mut pinned = self
+            .pinned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Idempotent: if already pinned, don't duplicate.
         if !pinned.iter().any(|(c, _)| c == &cid) {
             pinned.push((cid.clone(), bytes.to_vec()));
@@ -232,7 +246,10 @@ impl<C: ChainAdapter, I: IpfsClient, T: TrainingBackend> RoutingTrainer<C, I, T>
     /// Test/operator helper: seed the trainer with weights from a
     /// previous cycle (or genesis weights at startup).
     pub fn seed_previous_weights(&self, w: Q16Weights) {
-        let mut prev = self.previous_weights.lock().expect("lock");
+        let mut prev = self
+            .previous_weights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *prev = Some(w);
     }
 
@@ -272,7 +289,10 @@ where
 
         debug!(cycle_id, "running training backend");
         let prev = {
-            let lock = self.previous_weights.lock().expect("lock");
+            let lock = self
+                .previous_weights
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             lock.clone()
         };
         let new_weights = self
@@ -296,7 +316,10 @@ where
 
         // Cache as previous_weights for the next cycle's SGD init.
         {
-            let mut prev = self.previous_weights.lock().expect("lock");
+            let mut prev = self
+                .previous_weights
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             *prev = Some(new_weights);
         }
 
@@ -307,11 +330,7 @@ where
 /// Public utility: build a `RoutingWeights` record (the type used in
 /// `LearningEvent::AggregationCommitted`-style events) from the
 /// trainer's outputs. Wraps cycle_id + ipfs_cid + content_sha256.
-pub fn weights_record(
-    cycle_id: CycleId,
-    cid: &str,
-    weights: &Q16Weights,
-) -> RoutingWeights {
+pub fn weights_record(cycle_id: CycleId, cid: &str, weights: &Q16Weights) -> RoutingWeights {
     RoutingWeights {
         cycle_id,
         ipfs_cid: cid.to_string(),
@@ -347,12 +366,16 @@ mod tests {
 
     #[test]
     fn q16_weights_content_hash_is_deterministic() {
-        let w = Q16Weights { values: vec![1, 2, 3] };
+        let w = Q16Weights {
+            values: vec![1, 2, 3],
+        };
         let h1 = w.content_hash();
         let h2 = w.content_hash();
         assert_eq!(h1, h2);
         // Different values → different hash.
-        let w2 = Q16Weights { values: vec![1, 2, 4] };
+        let w2 = Q16Weights {
+            values: vec![1, 2, 4],
+        };
         assert_ne!(w.content_hash(), w2.content_hash());
     }
 
@@ -414,16 +437,15 @@ mod tests {
         let backend = Arc::new(StubTrainingBackend::default());
 
         // Fast-forward state: aggregator already committed cycle 1.
-        state.set_cycle_status(1, CycleStatus::Computed).expect("ok");
-        state.set_cycle_status(1, CycleStatus::Committed).expect("ok");
+        state
+            .set_cycle_status(1, CycleStatus::Computed)
+            .expect("ok");
+        state
+            .set_cycle_status(1, CycleStatus::Committed)
+            .expect("ok");
 
-        let trainer = RoutingTrainer::new(
-            chain.clone(),
-            state.clone(),
-            cache,
-            ipfs.clone(),
-            backend,
-        );
+        let trainer =
+            RoutingTrainer::new(chain.clone(), state.clone(), cache, ipfs.clone(), backend);
         trainer.train(1).await.expect("ok");
 
         // IPFS pinned exactly one weights bundle.
@@ -441,16 +463,15 @@ mod tests {
         let ipfs = Arc::new(MemoryIpfsClient::new());
         let backend = Arc::new(StubTrainingBackend::default());
 
-        state.set_cycle_status(1, CycleStatus::Computed).expect("ok");
-        state.set_cycle_status(1, CycleStatus::Committed).expect("ok");
+        state
+            .set_cycle_status(1, CycleStatus::Computed)
+            .expect("ok");
+        state
+            .set_cycle_status(1, CycleStatus::Committed)
+            .expect("ok");
 
-        let trainer = RoutingTrainer::new(
-            chain.clone(),
-            state.clone(),
-            cache,
-            ipfs.clone(),
-            backend,
-        );
+        let trainer =
+            RoutingTrainer::new(chain.clone(), state.clone(), cache, ipfs.clone(), backend);
         trainer.train(1).await.expect("first ok");
         trainer.train(1).await.expect("second is idempotent");
 
@@ -474,29 +495,38 @@ mod tests {
         let ipfs = Arc::new(MemoryIpfsClient::new());
         let backend = Arc::new(StubTrainingBackend::default());
 
-        state.set_cycle_status(1, CycleStatus::Computed).expect("ok");
-        state.set_cycle_status(1, CycleStatus::Committed).expect("ok");
+        state
+            .set_cycle_status(1, CycleStatus::Computed)
+            .expect("ok");
+        state
+            .set_cycle_status(1, CycleStatus::Committed)
+            .expect("ok");
 
-        let trainer = RoutingTrainer::new(
-            chain.clone(),
-            state.clone(),
-            cache,
-            ipfs.clone(),
-            backend,
-        );
+        let trainer =
+            RoutingTrainer::new(chain.clone(), state.clone(), cache, ipfs.clone(), backend);
 
         // No previous weights initially.
-        assert!(trainer.previous_weights.lock().expect("lock").is_none());
+        assert!(trainer
+            .previous_weights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none());
 
         trainer.train(1).await.expect("ok");
 
         // Now previous_weights is populated for the next cycle.
-        assert!(trainer.previous_weights.lock().expect("lock").is_some());
+        assert!(trainer
+            .previous_weights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some());
     }
 
     #[test]
     fn weights_record_helper_composes_correctly() {
-        let w = Q16Weights { values: vec![1, 2, 3] };
+        let w = Q16Weights {
+            values: vec![1, 2, 3],
+        };
         let r = weights_record(7, "cid-deadbeef", &w);
         assert_eq!(r.cycle_id, 7);
         assert_eq!(r.ipfs_cid, "cid-deadbeef");

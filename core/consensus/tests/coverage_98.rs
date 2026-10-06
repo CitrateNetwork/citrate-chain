@@ -48,8 +48,12 @@ fn genesis_block() -> Block {
     make_block(0xFF, 0, 1, Hash::default())
 }
 
-async fn setup_chain_selector() -> (Arc<DagStore>, Arc<GhostDag>, Arc<TipSelector>, ChainSelector)
-{
+async fn setup_chain_selector() -> (
+    Arc<DagStore>,
+    Arc<GhostDag>,
+    Arc<TipSelector>,
+    ChainSelector,
+) {
     let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
     let tip_selector = Arc::new(TipSelector::new(
@@ -113,9 +117,7 @@ fn make_pubkey(id: u8) -> PublicKey {
 /// match the verifier's expectation byte-for-byte.
 fn sign_vote(height: u64, block_hash: &Hash, signing_key: &ed25519_dalek::SigningKey) -> Signature {
     use ed25519_dalek::Signer;
-    let message = citrate_consensus::checkpoint::canonical_vote_message(
-        40204, height, block_hash,
-    );
+    let message = citrate_consensus::checkpoint::canonical_vote_message(40204, height, block_hash);
     let sig = signing_key.sign(&message);
     Signature::new(sig.to_bytes())
 }
@@ -298,8 +300,8 @@ async fn test_extends_current_chain_via_merge_parent() {
         0x50,
         3,
         4,
-        b2.hash(),           // selected parent is fork tip B2
-        vec![current_tip],   // merge parent is current tip A2
+        b2.hash(),         // selected parent is fork tip B2
+        vec![current_tip], // merge parent is current tip A2
     );
     dag_store.store_block(merge_block.clone()).await.unwrap();
     ghostdag.add_block(&merge_block).await.unwrap();
@@ -438,10 +440,16 @@ async fn test_attempt_reorganization_finality_blocks_reorg() {
     // Manually finalize blocks via the finality tracker. With depth=2, tip at height 5,
     // blocks 0..3 (heights 0-3) should be finalized.
     let tip = chain.last().unwrap();
-    ft.update_finality(&tip.hash(), tip.header.height).await.unwrap();
+    ft.update_finality(&tip.hash(), tip.header.height)
+        .await
+        .unwrap();
 
     let finalized_height = ft.get_finalized_height();
-    assert!(finalized_height >= 2, "Some blocks should be finalized, got {}", finalized_height);
+    assert!(
+        finalized_height >= 2,
+        "Some blocks should be finalized, got {}",
+        finalized_height
+    );
 
     // Build a longer fork from genesis to get higher score (must be > 6)
     let mut parent = chain[0].hash(); // genesis
@@ -941,7 +949,10 @@ async fn test_checkpoint_status_finalized() {
     }
 
     mgr.finalize_checkpoint(5).await.unwrap();
-    assert_eq!(mgr.checkpoint_status(5).await, Some(CheckpointStatus::Finalized));
+    assert_eq!(
+        mgr.checkpoint_status(5).await,
+        Some(CheckpointStatus::Finalized)
+    );
 }
 
 #[tokio::test]
@@ -954,7 +965,10 @@ async fn test_checkpoint_status_pending() {
     let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
     mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
 
-    assert_eq!(mgr.checkpoint_status(5).await, Some(CheckpointStatus::Pending));
+    assert_eq!(
+        mgr.checkpoint_status(5).await,
+        Some(CheckpointStatus::Pending)
+    );
 }
 
 #[tokio::test]
@@ -1020,9 +1034,7 @@ fn test_committee_selector_empty_validators() {
 
 #[test]
 fn test_committee_selector_committee_size_larger_than_validators() {
-    let validators: Vec<(PublicKey, u128)> = (0..3)
-        .map(|i| (make_pubkey(i), 1000))
-        .collect();
+    let validators: Vec<(PublicKey, u128)> = (0..3).map(|i| (make_pubkey(i), 1000)).collect();
     let seed = Hash::new([42; 32]);
     let committee = CommitteeSelector::select(&validators, 50, &seed, 10);
     assert_eq!(committee.len(), 3);
@@ -1039,9 +1051,7 @@ fn test_committee_selector_single_validator() {
 
 #[test]
 fn test_committee_selector_zero_stake_validators() {
-    let validators: Vec<(PublicKey, u128)> = (0..5)
-        .map(|i| (make_pubkey(i), 0))
-        .collect();
+    let validators: Vec<(PublicKey, u128)> = (0..5).map(|i| (make_pubkey(i), 0)).collect();
     let seed = Hash::new([7; 32]);
     let committee = CommitteeSelector::select(&validators, 50, &seed, 3);
     assert_eq!(committee.len(), 3);
@@ -1049,9 +1059,7 @@ fn test_committee_selector_zero_stake_validators() {
 
 #[test]
 fn test_committee_selector_different_heights() {
-    let validators: Vec<(PublicKey, u128)> = (0..10)
-        .map(|i| (make_pubkey(i), 1000))
-        .collect();
+    let validators: Vec<(PublicKey, u128)> = (0..10).map(|i| (make_pubkey(i), 1000)).collect();
     let seed = Hash::new([42; 32]);
     let c1 = CommitteeSelector::select(&validators, 50, &seed, 5);
     let c2 = CommitteeSelector::select(&validators, 100, &seed, 5);
@@ -1137,7 +1145,10 @@ async fn test_propose_not_checkpoint_boundary() {
     let mgr = CheckpointManager::new(config, dag);
 
     let result = mgr.propose(3, blocks[3].hash(), vec![]).await;
-    assert!(matches!(result, Err(CheckpointError::NotCheckpointBoundary)));
+    assert!(matches!(
+        result,
+        Err(CheckpointError::NotCheckpointBoundary)
+    ));
 }
 
 #[tokio::test]
@@ -1158,7 +1169,9 @@ async fn test_propose_already_exists() {
     let mgr = CheckpointManager::new(config, dag);
 
     let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
-    mgr.propose(5, blocks[5].hash(), committee.clone()).await.unwrap();
+    mgr.propose(5, blocks[5].hash(), committee.clone())
+        .await
+        .unwrap();
 
     let result = mgr.propose(5, blocks[5].hash(), committee).await;
     assert!(matches!(result, Err(CheckpointError::AlreadyExists(5))));
@@ -1182,10 +1195,16 @@ async fn test_finalize_checkpoint_without_quorum_rejected() {
     }
 
     let result = mgr.finalize_checkpoint(5).await;
-    assert!(matches!(result, Err(CheckpointError::QuorumNotReached(_, _))));
+    assert!(matches!(
+        result,
+        Err(CheckpointError::QuorumNotReached(_, _))
+    ));
 
     // Checkpoint should still be pending (put back)
-    assert_eq!(mgr.checkpoint_status(5).await, Some(CheckpointStatus::Pending));
+    assert_eq!(
+        mgr.checkpoint_status(5).await,
+        Some(CheckpointStatus::Pending)
+    );
 }
 
 // --- Submit vote for wrong block hash ---

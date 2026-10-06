@@ -93,10 +93,10 @@ pub fn plan_round_robin(groups: &[Vec<Transaction>]) -> Vec<Transaction> {
 
     loop {
         let mut added = false;
-        for (i, group) in groups.iter().enumerate() {
-            if indices[i] < group.len() {
-                result.push(group[indices[i]].clone());
-                indices[i] += 1;
+        for (next, group) in indices.iter_mut().zip(groups) {
+            if let Some(tx) = group.get(*next) {
+                result.push(tx.clone());
+                *next = next.saturating_add(1);
                 added = true;
             }
         }

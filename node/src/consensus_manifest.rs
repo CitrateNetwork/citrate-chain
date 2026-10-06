@@ -52,6 +52,18 @@ pub struct ConsensusManifest {
     /// everywhere; set by start_node before the manifest is printed, or by
     /// `CITRATE_PBA_HARDENING_HEIGHT` for `citrate consensus`).
     pub pba_hardening_height: Option<u64>,
+    /// HUP-S7.2: the agent precompile fork height this process resolved
+    /// (`citrate_execution::agent_fork`; `None` = not activated). Part of the
+    /// fingerprint only when set, so an unscheduled fork leaves the pre-image
+    /// exactly as it was.
+    pub agent_precompiles_height: Option<u64>,
+    /// Execution/consensus rules that switch on by height, as this process
+    /// resolved them (compiled default or devnet env override). A node whose
+    /// env overrides one of these computes different roots, so they are in the
+    /// fingerprint.
+    pub value_transfer_activation_height: u64,
+    pub create_nonce_fix_activation_height: u64,
+    pub merge_depth_activation_height: u64,
     /// Canonical EIP-1559 base fee committed into every block (reroll constant).
     pub canonical_base_fee_per_gas: u64,
     /// Validator-registry snapshot epoch length (blocks).
@@ -73,8 +85,20 @@ impl ConsensusManifest {
         Self::for_height(height)
     }
 
-    /// The manifest for this binary under a given activation height.
+    /// The manifest for this binary under a given activation height (the agent
+    /// precompile fork height is read from the process store).
     pub fn for_height(pba_hardening_height: Option<u64>) -> Self {
+        Self::for_heights(
+            pba_hardening_height,
+            citrate_execution::agent_fork::agent_precompiles_height(),
+        )
+    }
+
+    /// The manifest under explicit PBA and agent-fork activation heights.
+    pub fn for_heights(
+        pba_hardening_height: Option<u64>,
+        agent_precompiles_height: Option<u64>,
+    ) -> Self {
         let version = env!("CARGO_PKG_VERSION");
         let git_sha = env!("CITRATE_GIT_SHA");
         let git_dirty = env!("CITRATE_GIT_DIRTY") == "1";
@@ -95,23 +119,38 @@ impl ConsensusManifest {
         // v2 pre-image: v1's fields, with 0x0130 reported as activation-gated
         // and the gated rule set listed, so a diff against a v1 (fleet)
         // manifest shows exactly which differences wait for the height.
+        let value_transfer_activation_height =
+            citrate_execution::executor::value_transfer_activation_height();
+        let create_nonce_fix_activation_height =
+            citrate_execution::executor::create_nonce_fix_activation_height();
+        let merge_depth_activation_height =
+            citrate_consensus::ghostdag::merge_depth_activation_height();
         let commd_mode = if feat_commd_fold_verify {
             "gated"
         } else {
             "absent"
         };
         let preimage = format!(
-            "citrate-consensus-v2\ngit_sha={git_sha}\nhalo2_verifier={feat_halo2_verifier}\n\
+            "citrate-consensus-v3\ngit_sha={git_sha}\nhalo2_verifier={feat_halo2_verifier}\n\
              commd_fold_verify={commd_mode}\nactivation_gated={}\n\
              pba_hardening_height={}\n\
+             value_transfer_height={value_transfer_activation_height}\n\
+             create_nonce_fix_height={create_nonce_fix_activation_height}\n\
+             merge_depth_height={merge_depth_activation_height}\n\
              base_fee={CANONICAL_BASE_FEE_PER_GAS}\nepoch={EPOCH}\nsnapshot_lag={SNAPSHOT_LAG}\n",
             activation_gated.join("|"),
             pba_hardening_height
                 .map(|h| h.to_string())
                 .unwrap_or_else(|| "unset".to_string()),
         );
+        // HUP-S7.2: appended only when scheduled, so an unset fork keeps the
+        // pre-image (and the fingerprint) byte-identical to the previous form.
+        let preimage = match agent_precompiles_height {
+            Some(h) => format!("{preimage}agent_precompiles_height={h}\n"),
+            None => preimage,
+        };
         let digest = Sha256::digest(preimage.as_bytes());
-        let fingerprint = format!("0x{}", hex::encode(&digest[..16]));
+        let fingerprint = format!("0x{}", hex::encode(digest.get(..16).unwrap_or(&digest)));
 
         Self {
             version,
@@ -122,6 +161,10 @@ impl ConsensusManifest {
             feat_commd_fold_verify,
             activation_gated,
             pba_hardening_height,
+            agent_precompiles_height,
+            value_transfer_activation_height,
+            create_nonce_fix_activation_height,
+            merge_depth_activation_height,
             canonical_base_fee_per_gas: CANONICAL_BASE_FEE_PER_GAS,
             epoch: EPOCH,
             snapshot_lag: SNAPSHOT_LAG,
@@ -149,6 +192,24 @@ impl ConsensusManifest {
             self.pba_hardening_height
                 .map(|h| h.to_string())
                 .unwrap_or_else(|| "unset (legacy rules)".to_string())
+        );
+        println!(
+            "  agent precompiles  {}",
+            self.agent_precompiles_height
+                .map(|h| format!("from height {h} (0x0112 0x0113 0x0121 0x0122)"))
+                .unwrap_or_else(|| "not activated".to_string())
+        );
+        println!(
+            "  value transfer     from height {}",
+            self.value_transfer_activation_height
+        );
+        println!(
+            "  create-nonce fix   from height {}",
+            self.create_nonce_fix_activation_height
+        );
+        println!(
+            "  merge depth        from height {}",
+            self.merge_depth_activation_height
         );
         for r in &self.activation_gated {
             println!("  gated              {r}");
@@ -212,6 +273,22 @@ mod tests {
         );
     }
 
+    /// HUP-S7.2: an unscheduled agent fork leaves the fingerprint exactly as
+    /// before; a scheduled one is part of it.
+    #[test]
+    fn agent_fork_height_enters_the_fingerprint_only_when_set() {
+        let unset = ConsensusManifest::for_heights(Some(10), None);
+        let a = ConsensusManifest::for_heights(Some(10), Some(500));
+        let b = ConsensusManifest::for_heights(Some(10), Some(501));
+        assert_eq!(a.agent_precompiles_height, Some(500));
+        assert_ne!(a.fingerprint, unset.fingerprint);
+        assert_ne!(a.fingerprint, b.fingerprint);
+        assert_eq!(
+            unset.fingerprint,
+            ConsensusManifest::for_heights(Some(10), None).fingerprint
+        );
+    }
+
     #[test]
     fn json_roundtrips_key_fields() {
         let m = ConsensusManifest::current();
@@ -222,6 +299,23 @@ mod tests {
         assert!(j.contains("\"activation_gated\""));
         assert!(j.contains("0x0130 fold-verify"));
         assert!(j.contains("\"canonical_base_fee_per_gas\""));
+        assert!(j.contains("\"create_nonce_fix_activation_height\""));
+    }
+
+    /// The 2026-10 reroll runs every height-gated execution rule from genesis.
+    #[test]
+    fn reroll_execution_rules_are_active_from_genesis() {
+        let m = ConsensusManifest::for_height(Some(0));
+        if std::env::var_os(citrate_execution::executor::VALUE_TRANSFER_ACTIVATION_ENV).is_none() {
+            assert_eq!(m.value_transfer_activation_height, 0);
+        }
+        if std::env::var_os(citrate_execution::executor::CREATE_NONCE_FIX_ACTIVATION_ENV).is_none()
+        {
+            assert_eq!(m.create_nonce_fix_activation_height, 0);
+        }
+        if std::env::var_os(citrate_consensus::ghostdag::MERGE_DEPTH_ACTIVATION_ENV).is_none() {
+            assert_eq!(m.merge_depth_activation_height, 0);
+        }
     }
 
     /// PBA-L1a-003 tripwire: the node's consensus feature set is fixed. Every

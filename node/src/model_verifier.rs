@@ -409,8 +409,8 @@ impl ModelVerifier {
         for ((validator, model_cid), check) in checks.iter() {
             // Check if validator is unpinned and grace period has expired
             if check.status == PinStatus::Unpinned {
-                let grace_period_secs = self.config.grace_period_hours * 3600;
-                if now - check.last_check > grace_period_secs {
+                let grace_period_secs = self.config.grace_period_hours.saturating_mul(3600);
+                if now.saturating_sub(check.last_check) > grace_period_secs {
                     // Find the model to get the slash penalty
                     if let Some(model) = self
                         .required_models

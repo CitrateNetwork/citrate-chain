@@ -255,7 +255,11 @@ async fn test_finality_at_depth() {
         .unwrap();
 
     // With depth=10 and tip at height 24, blocks 0..14 should be finalized
-    assert_eq!(finalized.len(), 15, "15 blocks (height 0-14) should be finalized");
+    assert_eq!(
+        finalized.len(),
+        15,
+        "15 blocks (height 0-14) should be finalized"
+    );
     assert_eq!(tracker.get_finalized_height(), 14);
 
     for block in &blocks[..15] {
@@ -311,7 +315,10 @@ async fn test_blue_score_monotonicity() {
     }
 
     // The final block's blue score should be the total chain length
-    let final_score = ghostdag.get_blue_score(block_hashes.last().unwrap()).await.unwrap();
+    let final_score = ghostdag
+        .get_blue_score(block_hashes.last().unwrap())
+        .await
+        .unwrap();
     assert!(
         final_score >= 51,
         "Final block in a 51-block chain should have blue score >= 51, got {}",

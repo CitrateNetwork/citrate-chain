@@ -9,9 +9,9 @@
 //! 2. The user can deploy without needing a JSON-RPC mediator —
 //!    they ship the raw bytes to the bundler.
 
-use ethabi::Token;
 #[cfg(test)]
 use ethabi::ParamType;
+use ethabi::Token;
 use ethereum_types::Address;
 use serde::{Deserialize, Serialize};
 
@@ -81,7 +81,7 @@ pub fn kernel_initialize_calldata(cfg: &KernelInitConfig) -> Vec<u8> {
         Token::Array(init_config_tokens),
     ]);
 
-    let mut call = Vec::with_capacity(4 + encoded.len());
+    let mut call = Vec::with_capacity(encoded.len().saturating_add(4));
     call.extend_from_slice(&selector);
     call.extend_from_slice(&encoded);
     call
@@ -123,7 +123,7 @@ pub fn ecdsa_validator_install_data(owner: Address, source: u8) -> Vec<u8> {
 /// `uint8 threshold | uint8 count | address[count] guardians`
 /// (2 + 20*count bytes)
 pub fn guardian_install_data(threshold: u8, guardians: &[Address]) -> Vec<u8> {
-    let mut data = Vec::with_capacity(2 + guardians.len() * 20);
+    let mut data = Vec::with_capacity(guardians.len().saturating_mul(20).saturating_add(2));
     data.push(threshold);
     data.push(guardians.len() as u8);
     for g in guardians {
@@ -178,7 +178,10 @@ mod tests {
 
     #[test]
     fn guardian_install_data_layout_matches_onchain() {
-        let g = vec![Address::from_slice(&[0x01u8; 20]), Address::from_slice(&[0x02u8; 20])];
+        let g = vec![
+            Address::from_slice(&[0x01u8; 20]),
+            Address::from_slice(&[0x02u8; 20]),
+        ];
         let bytes = guardian_install_data(1, &g);
         assert_eq!(bytes.len(), 2 + 2 * 20);
         assert_eq!(bytes[0], 1);

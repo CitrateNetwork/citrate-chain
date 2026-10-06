@@ -54,14 +54,14 @@ fn precompile_address() -> String {
 
 fn selector(sig: &str) -> [u8; 4] {
     use sha3::{Digest, Keccak256};
-    let d = Keccak256::digest(sig.as_bytes());
-    [d[0], d[1], d[2], d[3]]
+    let [a, b, c, d, ..]: [u8; 32] = Keccak256::digest(sig.as_bytes()).into();
+    [a, b, c, d]
 }
 
 fn pad32(mut v: Vec<u8>) -> Vec<u8> {
     let rem = v.len() % 32;
     if rem != 0 {
-        v.extend(vec![0u8; 32 - rem]);
+        v.extend(vec![0u8; 32usize.saturating_sub(rem)]);
     }
     v
 }
@@ -70,10 +70,11 @@ fn encode_address(addr_hex: &str) -> Result<[u8; 32]> {
     let s = addr_hex.trim_start_matches("0x");
     let bytes = hex::decode(s).context("Invalid address hex")?;
     let mut out = [0u8; 32];
-    if bytes.len() == 20 {
-        out[12..32].copy_from_slice(&bytes[..20]);
-    } else if bytes.len() == 32 {
-        out.copy_from_slice(&bytes[..32]);
+    if let Ok(addr) = <[u8; 20]>::try_from(bytes.as_slice()) {
+        let (_, tail) = out.split_at_mut(12);
+        tail.copy_from_slice(&addr);
+    } else if let Ok(word) = <[u8; 32]>::try_from(bytes.as_slice()) {
+        out = word;
     } else {
         anyhow::bail!("Address must be 20 or 32 bytes");
     }
@@ -102,8 +103,9 @@ fn encode_queue_param(key: &str, value: &str, eta: u64) -> Result<String> {
     // key as bytes32 (UTF-8 padded/truncated)
     let mut key32 = [0u8; 32];
     let kb = key.as_bytes();
-    let n = kb.len().min(32);
-    key32[..n].copy_from_slice(&kb[..n]);
+    for (dst, src) in key32.iter_mut().zip(kb) {
+        *dst = *src;
+    }
 
     // ABI: selector | key32 | offset(bytes) | eta(32) | dynamic bytes
     let mut data = Vec::new();
@@ -127,8 +129,9 @@ fn encode_queue_param(key: &str, value: &str, eta: u64) -> Result<String> {
 fn encode_execute_param(key: &str) -> Result<String> {
     let mut key32 = [0u8; 32];
     let kb = key.as_bytes();
-    let n = kb.len().min(32);
-    key32[..n].copy_from_slice(&kb[..n]);
+    for (dst, src) in key32.iter_mut().zip(kb) {
+        *dst = *src;
+    }
     let mut data = Vec::new();
     data.extend_from_slice(&selector("executeSetParam(bytes32)"));
     data.extend_from_slice(&key32);
@@ -138,8 +141,9 @@ fn encode_execute_param(key: &str) -> Result<String> {
 fn encode_get_param(key: &str) -> Result<String> {
     let mut key32 = [0u8; 32];
     let kb = key.as_bytes();
-    let n = kb.len().min(32);
-    key32[..n].copy_from_slice(&kb[..n]);
+    for (dst, src) in key32.iter_mut().zip(kb) {
+        *dst = *src;
+    }
     let mut data = Vec::new();
     data.extend_from_slice(&selector("getParam(bytes32)"));
     data.extend_from_slice(&key32);
@@ -191,7 +195,11 @@ async fn eth_call_precompile(config: &Config, data_hex: String) -> Result<String
     if let Some(err) = v.get("error") {
         anyhow::bail!(err.to_string());
     }
-    Ok(v["result"].as_str().unwrap_or("").to_string())
+    Ok(v.get("result")
+        .unwrap_or(&serde_json::Value::Null)
+        .as_str()
+        .unwrap_or("")
+        .to_string())
 }
 
 #[cfg(test)]
@@ -265,8 +273,8 @@ mod tests {
 
     #[test]
     fn test_encode_set_admin_format() {
-        let result = encode_set_admin("0x1111111111111111111111111111111111111111")
-            .expect("encode");
+        let result =
+            encode_set_admin("0x1111111111111111111111111111111111111111").expect("encode");
         assert!(result.starts_with("0x"));
         // selector (4 bytes = 8 hex) + address word (32 bytes = 64 hex) + "0x" prefix
         assert_eq!(result.len(), 2 + (4 + 32) * 2);

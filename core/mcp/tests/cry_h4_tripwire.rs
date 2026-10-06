@@ -53,7 +53,9 @@ fn cry_h4_forgeable_commitment_is_not_an_execution_proof() {
     };
 
     assert!(
-        !verifier.verify_execution(&model, input, output, &proof).unwrap(),
+        !verifier
+            .verify_execution(&model, input, output, &proof)
+            .unwrap(),
         "a caller-computed SHA3 commitment must not satisfy execution-proof verification"
     );
 }

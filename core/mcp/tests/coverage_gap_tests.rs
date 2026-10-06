@@ -6,8 +6,8 @@
 use citrate_mcp::execution::Model;
 use citrate_mcp::provider::ProviderRegistry;
 use citrate_mcp::types::{
-    ComputeCapacity, ComputeRequirements, Currency, ExecutionProof, ExecutionRequest,
-    HardwareType, ModelId, ModelMetadata, PricingModel, ProviderInfo, RequestId, RequestStatus,
+    ComputeCapacity, ComputeRequirements, Currency, ExecutionProof, ExecutionRequest, HardwareType,
+    ModelId, ModelMetadata, PricingModel, ProviderInfo, RequestId, RequestStatus,
 };
 use citrate_mcp::verification::ExecutionVerifier;
 
@@ -131,7 +131,10 @@ async fn test_provider_selection_by_score() {
 
     // Give p2 successful jobs (improves reputation score)
     for _ in 0..5 {
-        registry.update_reputation(p2.address, true, 50).await.unwrap();
+        registry
+            .update_reputation(p2.address, true, 50)
+            .await
+            .unwrap();
     }
 
     let requirements = ComputeRequirements {
@@ -141,7 +144,10 @@ async fn test_provider_selection_by_score() {
         supported_hardware: vec![HardwareType::CPU],
     };
 
-    let selected = registry.select_provider(&model_id, &requirements).await.unwrap();
+    let selected = registry
+        .select_provider(&model_id, &requirements)
+        .await
+        .unwrap();
     // Provider 2 should win due to higher capacity and better reputation
     assert_eq!(selected, p2.address);
 }
@@ -173,7 +179,10 @@ async fn test_provider_deactivation_via_requirements() {
 
     let result = registry.select_provider(&model_id, &requirements).await;
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("No suitable providers"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("No suitable providers"));
 }
 
 // ---------------------------------------------------------------------------
@@ -257,7 +266,9 @@ fn test_execution_proof_generation_and_verification() {
     };
 
     // A hash commitment is not a real execution proof; verification fails closed.
-    let result = verifier.verify_execution(&model, input, output, &proof).unwrap();
+    let result = verifier
+        .verify_execution(&model, input, output, &proof)
+        .unwrap();
     assert!(!result, "legacy commitment must not verify as a real proof");
 }
 
@@ -357,7 +368,10 @@ fn test_model_with_empty_weights_rejected() {
 
     let result = verifier.verify_model(&model);
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("weights are empty"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("weights are empty"));
 }
 
 // ---------------------------------------------------------------------------
@@ -376,7 +390,10 @@ fn test_model_with_empty_metadata_rejected() {
 
     let result = verifier.verify_model(&model);
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("metadata is empty"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("metadata is empty"));
 }
 
 // ---------------------------------------------------------------------------
@@ -502,10 +519,22 @@ async fn test_provider_reputation_multiple_jobs() {
     registry.register_provider(provider).await.unwrap();
 
     // 3 successes, 1 failure
-    registry.update_reputation(address, true, 100).await.unwrap();
-    registry.update_reputation(address, true, 200).await.unwrap();
-    registry.update_reputation(address, true, 150).await.unwrap();
-    registry.update_reputation(address, false, 500).await.unwrap();
+    registry
+        .update_reputation(address, true, 100)
+        .await
+        .unwrap();
+    registry
+        .update_reputation(address, true, 200)
+        .await
+        .unwrap();
+    registry
+        .update_reputation(address, true, 150)
+        .await
+        .unwrap();
+    registry
+        .update_reputation(address, false, 500)
+        .await
+        .unwrap();
 
     let info = registry.get_provider(&address).await.unwrap();
     assert_eq!(info.total_executions, 4);
@@ -614,7 +643,10 @@ async fn test_gpu_requirement_selects_gpu_provider() {
         supported_hardware: vec![HardwareType::GPU("any".to_string())],
     };
 
-    let selected = registry.select_provider(&model_id, &requirements).await.unwrap();
+    let selected = registry
+        .select_provider(&model_id, &requirements)
+        .await
+        .unwrap();
     assert_eq!(selected, p2.address);
 }
 
@@ -727,7 +759,9 @@ fn test_verify_execution_empty_statement_proof() {
         provider: Address([0u8; 20]),
     };
 
-    let result = verifier.verify_execution(&model, input, output, &proof).unwrap();
+    let result = verifier
+        .verify_execution(&model, input, output, &proof)
+        .unwrap();
     // Should fail because empty statement fails ZK verification
     assert!(!result);
 }
@@ -777,7 +811,9 @@ fn test_verify_execution_proof_too_short() {
         provider: Address([0u8; 20]),
     };
 
-    let result = verifier.verify_execution(&model, input, output, &proof).unwrap();
+    let result = verifier
+        .verify_execution(&model, input, output, &proof)
+        .unwrap();
     assert!(!result, "Short proof_data should fail verification");
 }
 
@@ -804,7 +840,9 @@ fn test_verify_execution_model_hash_mismatch() {
         provider: Address([0u8; 20]),
     };
 
-    let result = verifier.verify_execution(&model, input, output, &proof).unwrap();
+    let result = verifier
+        .verify_execution(&model, input, output, &proof)
+        .unwrap();
     assert!(!result, "Model hash mismatch should fail verification");
 }
 
