@@ -214,7 +214,10 @@ function Assert-NetworkServiceAccess {
             if (($rule.InheritanceFlags -band $RequiredInheritance) -eq 0) {
                 continue
             }
-            if (($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::NoPropagateInherit) -ne 0) {
+            if (
+                $rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+                ($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::NoPropagateInherit) -ne 0
+            ) {
                 continue
             }
         }

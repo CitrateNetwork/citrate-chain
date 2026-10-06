@@ -3,6 +3,7 @@ $ErrorActionPreference = "Stop"
 $ServiceScript = Join-Path $PSScriptRoot "citrate-node.service.ps1"
 $TestNetworkServiceSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-20")
 $TestAuthenticatedUsersSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-11")
+$TestEveryoneSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-1-0")
 $TestSystemSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18")
 $TestAdministratorsSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
 $TestRoot = Join-Path ([Environment]::GetFolderPath("CommonApplicationData")) ("Citrate service test " + [guid]::NewGuid().ToString("N"))
@@ -431,6 +432,35 @@ public static class ArgumentProbe
         } -MessagePattern "grants untrusted write access" -Message "Inheritable database write access for Authenticated Users was accepted."
     } finally {
         Set-Acl -LiteralPath $DatabasePath -AclObject $originalInheritableDatabaseAcl
+    }
+
+    $originalNoPropagateDatabaseAcl = Get-Acl -LiteralPath $DatabasePath
+    try {
+        $noPropagateDatabaseAcl = Get-Acl -LiteralPath $DatabasePath
+        $noPropagateDenyRule = New-TestAccessRule `
+            -Sid $TestEveryoneSid `
+            -Rights ([System.Security.AccessControl.FileSystemRights]::Modify) `
+            -InheritanceFlags ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit) `
+            -PropagationFlags ([System.Security.AccessControl.PropagationFlags]::InheritOnly -bor [System.Security.AccessControl.PropagationFlags]::NoPropagateInherit) `
+            -AccessControlType ([System.Security.AccessControl.AccessControlType]::Deny)
+        $null = $noPropagateDatabaseAcl.AddAccessRule($noPropagateDenyRule)
+        Set-Acl -LiteralPath $DatabasePath -AclObject $noPropagateDatabaseAcl
+        Assert-Throws -Operation {
+            Assert-NetworkServiceAccess `
+                -Path $DatabasePath `
+                -RequiredRights ([System.Security.AccessControl.FileSystemRights]::Modify) `
+                -Description "future database file modify" `
+                -RequiredInheritance ([System.Security.AccessControl.InheritanceFlags]::ObjectInherit)
+        } -MessagePattern "denied required future database file modify access" -Message "A no-propagate deny for future database files was ignored."
+        Assert-Throws -Operation {
+            Assert-NetworkServiceAccess `
+                -Path $DatabasePath `
+                -RequiredRights ([System.Security.AccessControl.FileSystemRights]::Modify) `
+                -Description "future database directory modify" `
+                -RequiredInheritance ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit)
+        } -MessagePattern "denied required future database directory modify access" -Message "A no-propagate deny for future database directories was ignored."
+    } finally {
+        Set-Acl -LiteralPath $DatabasePath -AclObject $originalNoPropagateDatabaseAcl
     }
 
     $nestedDatabaseDirectory = Join-Path $DatabasePath "nested"
