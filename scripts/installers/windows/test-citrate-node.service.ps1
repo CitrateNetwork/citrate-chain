@@ -347,6 +347,9 @@ public static class ArgumentProbe
         } -MessagePattern "stable mounted local volume" -Message "A substituted drive was accepted."
     } finally {
         & $substExe ($temporaryDriveName + ":") "/d"
+        if ($LASTEXITCODE -ne 0) {
+            throw "Unable to remove the substituted-drive validation fixture."
+        }
     }
 
     $originalNodeDirectoryAcl = Get-Acl -LiteralPath $NodeDirectory
@@ -411,6 +414,57 @@ public static class ArgumentProbe
         } -MessagePattern "grants untrusted write access" -Message "Database write access for Authenticated Users was accepted."
     } finally {
         Set-Acl -LiteralPath $DatabasePath -AclObject $originalCombinedAcl
+    }
+
+    $originalInheritableDatabaseAcl = Get-Acl -LiteralPath $DatabasePath
+    try {
+        $inheritableDatabaseAcl = Get-Acl -LiteralPath $DatabasePath
+        $inheritableWriteRule = New-TestAccessRule `
+            -Sid $TestAuthenticatedUsersSid `
+            -Rights ([System.Security.AccessControl.FileSystemRights]::Modify) `
+            -InheritanceFlags ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit) `
+            -PropagationFlags ([System.Security.AccessControl.PropagationFlags]::InheritOnly)
+        $null = $inheritableDatabaseAcl.AddAccessRule($inheritableWriteRule)
+        Set-Acl -LiteralPath $DatabasePath -AclObject $inheritableDatabaseAcl
+        Assert-Throws -Operation {
+            Invoke-Validation -NodeBin $NodeBin -DataDir $DataDir -ConfigPath $ConfigPath
+        } -MessagePattern "grants untrusted write access" -Message "Inheritable database write access for Authenticated Users was accepted."
+    } finally {
+        Set-Acl -LiteralPath $DatabasePath -AclObject $originalInheritableDatabaseAcl
+    }
+
+    $unsafeDatabaseFile = Join-Path $DatabasePath "unsafe-child.dat"
+    [System.IO.File]::WriteAllText($unsafeDatabaseFile, "test")
+    try {
+        $unsafeDatabaseFileAcl = Get-Acl -LiteralPath $unsafeDatabaseFile
+        $null = $unsafeDatabaseFileAcl.AddAccessRule((New-TestAccessRule `
+            -Sid $TestAuthenticatedUsersSid `
+            -Rights ([System.Security.AccessControl.FileSystemRights]::Modify)))
+        Set-Acl -LiteralPath $unsafeDatabaseFile -AclObject $unsafeDatabaseFileAcl
+        Assert-Throws -Operation {
+            Invoke-Validation -NodeBin $NodeBin -DataDir $DataDir -ConfigPath $ConfigPath
+        } -MessagePattern "grants untrusted write access" -Message "An unsafe existing database child was accepted."
+    } finally {
+        Remove-Item -LiteralPath $unsafeDatabaseFile -Force
+    }
+
+    $databaseJunctionPath = Join-Path $DatabasePath "unsafe-link"
+    $databaseJunctionCreated = $false
+    try {
+        $null = New-Item -ItemType Junction -Path $databaseJunctionPath -Target $NodeDirectory
+        $databaseJunctionCreated = $true
+        Assert-Throws -Operation {
+            Invoke-Validation -NodeBin $NodeBin -DataDir $DataDir -ConfigPath $ConfigPath
+        } -MessagePattern "Database directory must not contain a reparse point" -Message "A database-child reparse point was accepted."
+    } catch {
+        if ($databaseJunctionCreated) {
+            throw
+        }
+        Write-Host "SKIP: Junction creation is unavailable; database-child reparse validation was not exercised."
+    } finally {
+        if ($databaseJunctionCreated -and [System.IO.Directory]::Exists($databaseJunctionPath)) {
+            [System.IO.Directory]::Delete($databaseJunctionPath)
+        }
     }
 
     $originalDataAcl = Get-Acl -LiteralPath $DataDir

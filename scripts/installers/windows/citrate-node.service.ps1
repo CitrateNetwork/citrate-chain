@@ -230,12 +230,15 @@ function Assert-TrustedPathIntegrity {
 
         [string[]]$AdditionalTrustedWriterSids = @(),
 
-        [switch]$Ancestor
+        [switch]$Ancestor,
+
+        [switch]$CheckChildInheritance
     )
 
     $trustedWriterSids = @(
         "S-1-5-18", # LocalSystem
         "S-1-5-32-544", # Builtin Administrators
+        "S-1-3-0", # Creator Owner; resolves to the already validated owner on children
         # NT SERVICE\TrustedInstaller
         "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
         [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
@@ -266,7 +269,9 @@ function Assert-TrustedPathIntegrity {
         if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) {
             continue
         }
-        if (($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) {
+        $appliesDirectly = ($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) -eq 0
+        $appliesToChildren = $CheckChildInheritance -and $rule.InheritanceFlags -ne [System.Security.AccessControl.InheritanceFlags]::None
+        if (-not $appliesDirectly -and -not $appliesToChildren) {
             continue
         }
         if (([int64]$rule.FileSystemRights -band $mutationRights) -eq 0) {
@@ -299,6 +304,39 @@ function Assert-TrustedPathChain {
         }
         $current = $parent
         $level++
+    }
+}
+
+function Assert-TrustedDatabaseTree {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    Assert-TrustedPathIntegrity `
+        -Path $Path `
+        -Description "Database directory" `
+        -AdditionalTrustedWriterSids @($NetworkServiceSid) `
+        -CheckChildInheritance
+
+    $pendingDirectories = New-Object "System.Collections.Generic.Queue[string]"
+    $pendingDirectories.Enqueue($Path)
+    while ($pendingDirectories.Count -gt 0) {
+        $directory = $pendingDirectories.Dequeue()
+        foreach ($child in @(Get-ChildItem -LiteralPath $directory -Force)) {
+            if (($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Database directory must not contain a reparse point: $($child.FullName)"
+            }
+
+            Assert-TrustedPathIntegrity `
+                -Path $child.FullName `
+                -Description "Database content" `
+                -AdditionalTrustedWriterSids @($NetworkServiceSid) `
+                -CheckChildInheritance:$child.PSIsContainer
+            if ($child.PSIsContainer) {
+                $pendingDirectories.Enqueue($child.FullName)
+            }
+        }
     }
 }
 
@@ -339,7 +377,7 @@ function New-ServicePlan {
     Assert-TrustedPathChain -Path $resolvedNodeBin -Description "NodeBin path"
     Assert-TrustedPathChain -Path $resolvedDataDir -Description "DataDir path"
     Assert-TrustedPathChain -Path $resolvedConfigPath -Description "ConfigPath"
-    Assert-TrustedPathIntegrity -Path $databasePath -Description "Database directory" -AdditionalTrustedWriterSids @($NetworkServiceSid)
+    Assert-TrustedDatabaseTree -Path $databasePath
 
     $imagePath = '"' + $resolvedNodeBin + '" --data-dir "' + $databasePath + '" --config "' + $resolvedConfigPath + '"'
     $scArguments = @(
