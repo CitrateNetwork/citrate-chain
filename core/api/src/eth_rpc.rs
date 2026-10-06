@@ -619,12 +619,27 @@ pub fn register_eth_methods_with_finality(
                     json!(format!("0x{}", hex::encode(tx.hash.as_bytes()))),
                 );
                 obj.insert("nonce".into(), json!(format!("0x{:x}", tx.nonce)));
-                obj.insert(
-                    "blockHash".into(),
-                    json!("0x0000000000000000000000000000000000000000000000000000000000000000"),
-                );
-                obj.insert("blockNumber".into(), json!("0x0"));
-                obj.insert("transactionIndex".into(), json!("0x0"));
+                // The block this tx was mined in, from its receipt. These were
+                // hard-coded to block 0 / zero hash, which made every mined tx look
+                // like it sat in genesis to explorers, wallets and audit tooling.
+                match mined_tx_location(&api, h) {
+                    Some((block_hash, block_number, index)) => {
+                        obj.insert(
+                            "blockHash".into(),
+                            json!(format!("0x{}", hex::encode(block_hash.as_bytes()))),
+                        );
+                        obj.insert("blockNumber".into(), json!(format!("0x{:x}", block_number)));
+                        obj.insert(
+                            "transactionIndex".into(),
+                            index.map_or(Value::Null, |i| json!(format!("0x{:x}", i))),
+                        );
+                    }
+                    None => {
+                        obj.insert("blockHash".into(), Value::Null);
+                        obj.insert("blockNumber".into(), Value::Null);
+                        obj.insert("transactionIndex".into(), Value::Null);
+                    }
+                }
                 obj.insert("from".into(), json!(from_hex));
                 obj.insert("to".into(), json!(to_hex_opt));
                 obj.insert("value".into(), json!(format!("0x{:x}", tx.value)));
@@ -743,6 +758,9 @@ pub fn register_eth_methods_with_finality(
 
         match block_on(api.get_receipt(Hash::new(hash_bytes))) {
             Ok(receipt) => {
+                let tx_index = mined_tx_location(&api, receipt.tx_hash)
+                    .and_then(|(_, _, i)| i)
+                    .map_or(Value::Null, |i| json!(format!("0x{:x}", i)));
                 // Derive contractAddress if deployment output encodes address
                 let contract_address = if receipt.to.is_none() && receipt.output.len() == 20 {
                     Some(format!("0x{}", hex::encode(&receipt.output)))
@@ -752,7 +770,7 @@ pub fn register_eth_methods_with_finality(
 
                 Ok(json!({
                     "transactionHash": format!("0x{}", hex::encode(receipt.tx_hash.as_bytes())),
-                    "transactionIndex": "0x0",
+                    "transactionIndex": tx_index.clone(),
                     "blockHash": format!("0x{}", hex::encode(receipt.block_hash.as_bytes())),
                     "blockNumber": format!("0x{:x}", receipt.block_number),
                     "from": format!("0x{}", hex::encode(receipt.from.0)),
@@ -767,7 +785,7 @@ pub fn register_eth_methods_with_finality(
                             .collect::<Vec<_>>(),
                         "data": format!("0x{}", hex::encode(&log.data)),
                         "logIndex": "0x0",
-                        "transactionIndex": "0x0",
+                        "transactionIndex": tx_index.clone(),
                         "transactionHash": format!("0x{}", hex::encode(receipt.tx_hash.as_bytes())),
                         "blockHash": format!("0x{}", hex::encode(receipt.block_hash.as_bytes())),
                         "blockNumber": format!("0x{:x}", receipt.block_number),
@@ -3236,6 +3254,19 @@ pub fn register_eth_methods_with_finality(
 pub(crate) fn arg(params: &[Value], i: usize) -> &Value {
     static NULL: Value = Value::Null;
     params.get(i).unwrap_or(&NULL)
+}
+
+/// Where a mined transaction landed: its block hash, block number and index in
+/// that block. The block comes from the stored receipt (the same source
+/// `eth_getTransactionReceipt` uses) and the index from the block body. `None`
+/// when no receipt is stored (not mined, or not indexed by this node).
+fn mined_tx_location(api: &ChainApi, h: Hash) -> Option<(Hash, u64, Option<u64>)> {
+    let receipt = block_on(api.get_receipt(h)).ok()?;
+    let index = block_on(api.get_block(crate::types::request::BlockId::Hash(receipt.block_hash)))
+        .ok()
+        .and_then(|b| b.transactions.iter().position(|t| t.hash == h))
+        .and_then(|i| u64::try_from(i).ok());
+    Some((receipt.block_hash, receipt.block_number, index))
 }
 
 #[cfg(test)]
