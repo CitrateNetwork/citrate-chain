@@ -2,6 +2,12 @@
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File citrate-node.service.ps1 [install|uninstall|start|stop|status]
+#   Add -NodeBin, -DataDir, or -ConfigPath to override install inputs; add -ValidateOnly
+#   to return the exact service plan without service, firewall, directory, or ACL mutation.
+#
+# Install requires an existing executable, canonical node.toml, and db directory on a
+# stable local volume. Their ACLs must allow NetworkService's required access while
+# preventing untrusted identities from replacing executable, configuration, or database content.
 
 param(
     [Parameter(Position = 0)]
@@ -176,7 +182,9 @@ function Assert-NetworkServiceAccess {
         [System.Security.AccessControl.FileSystemRights]$RequiredRights,
 
         [Parameter(Mandatory = $true)]
-        [string]$Description
+        [string]$Description,
+
+        [System.Security.AccessControl.InheritanceFlags]$RequiredInheritance = [System.Security.AccessControl.InheritanceFlags]::None
     )
 
     # NetworkService receives these well-known groups in its service token. Evaluating
@@ -198,8 +206,17 @@ function Assert-NetworkServiceAccess {
         if ($applicableSids -notcontains $rule.IdentityReference.Value) {
             continue
         }
-        if (($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) {
-            continue
+        if ($RequiredInheritance -eq [System.Security.AccessControl.InheritanceFlags]::None) {
+            if (($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) {
+                continue
+            }
+        } else {
+            if (($rule.InheritanceFlags -band $RequiredInheritance) -eq 0) {
+                continue
+            }
+            if (($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::NoPropagateInherit) -ne 0) {
+                continue
+            }
         }
 
         $applicable = ([int64]$rule.FileSystemRights) -band $remaining
@@ -318,6 +335,16 @@ function Assert-TrustedDatabaseTree {
         -Description "Database directory" `
         -AdditionalTrustedWriterSids @($NetworkServiceSid) `
         -CheckChildInheritance
+    Assert-NetworkServiceAccess `
+        -Path $Path `
+        -RequiredRights ([System.Security.AccessControl.FileSystemRights]::Modify) `
+        -Description "future database file modify" `
+        -RequiredInheritance ([System.Security.AccessControl.InheritanceFlags]::ObjectInherit)
+    Assert-NetworkServiceAccess `
+        -Path $Path `
+        -RequiredRights ([System.Security.AccessControl.FileSystemRights]::Modify) `
+        -Description "future database directory modify" `
+        -RequiredInheritance ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit)
 
     $pendingDirectories = New-Object "System.Collections.Generic.Queue[string]"
     $pendingDirectories.Enqueue($Path)
@@ -333,7 +360,21 @@ function Assert-TrustedDatabaseTree {
                 -Description "Database content" `
                 -AdditionalTrustedWriterSids @($NetworkServiceSid) `
                 -CheckChildInheritance:$child.PSIsContainer
+            Assert-NetworkServiceAccess `
+                -Path $child.FullName `
+                -RequiredRights ([System.Security.AccessControl.FileSystemRights]::Modify) `
+                -Description "database content modify"
             if ($child.PSIsContainer) {
+                Assert-NetworkServiceAccess `
+                    -Path $child.FullName `
+                    -RequiredRights ([System.Security.AccessControl.FileSystemRights]::Modify) `
+                    -Description "future database file modify" `
+                    -RequiredInheritance ([System.Security.AccessControl.InheritanceFlags]::ObjectInherit)
+                Assert-NetworkServiceAccess `
+                    -Path $child.FullName `
+                    -RequiredRights ([System.Security.AccessControl.FileSystemRights]::Modify) `
+                    -Description "future database directory modify" `
+                    -RequiredInheritance ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit)
                 $pendingDirectories.Enqueue($child.FullName)
             }
         }

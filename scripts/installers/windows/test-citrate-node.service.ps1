@@ -433,7 +433,9 @@ public static class ArgumentProbe
         Set-Acl -LiteralPath $DatabasePath -AclObject $originalInheritableDatabaseAcl
     }
 
-    $unsafeDatabaseFile = Join-Path $DatabasePath "unsafe-child.dat"
+    $nestedDatabaseDirectory = Join-Path $DatabasePath "nested"
+    $null = New-Item -ItemType Directory -Path $nestedDatabaseDirectory
+    $unsafeDatabaseFile = Join-Path $nestedDatabaseDirectory "unsafe-child.dat"
     [System.IO.File]::WriteAllText($unsafeDatabaseFile, "test")
     try {
         $unsafeDatabaseFileAcl = Get-Acl -LiteralPath $unsafeDatabaseFile
@@ -445,7 +447,29 @@ public static class ArgumentProbe
             Invoke-Validation -NodeBin $NodeBin -DataDir $DataDir -ConfigPath $ConfigPath
         } -MessagePattern "grants untrusted write access" -Message "An unsafe existing database child was accepted."
     } finally {
-        Remove-Item -LiteralPath $unsafeDatabaseFile -Force
+        Remove-Item -LiteralPath $nestedDatabaseDirectory -Recurse -Force
+    }
+
+    $inaccessibleDatabaseFile = Join-Path $DatabasePath "inaccessible-child.dat"
+    [System.IO.File]::WriteAllText($inaccessibleDatabaseFile, "test")
+    try {
+        $inaccessibleDatabaseFileAcl = Get-Acl -LiteralPath $inaccessibleDatabaseFile
+        $inaccessibleDatabaseFileAcl.SetAccessRuleProtection($true, $false)
+        foreach ($sid in @(
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().User,
+            $TestSystemSid,
+            $TestAdministratorsSid
+        )) {
+            $null = $inaccessibleDatabaseFileAcl.AddAccessRule((New-TestAccessRule `
+                -Sid $sid `
+                -Rights ([System.Security.AccessControl.FileSystemRights]::FullControl)))
+        }
+        Set-Acl -LiteralPath $inaccessibleDatabaseFile -AclObject $inaccessibleDatabaseFileAcl
+        Assert-Throws -Operation {
+            Invoke-Validation -NodeBin $NodeBin -DataDir $DataDir -ConfigPath $ConfigPath
+        } -MessagePattern "lacks required database content modify access" -Message "A database child inaccessible to NetworkService was accepted."
+    } finally {
+        Remove-Item -LiteralPath $inaccessibleDatabaseFile -Force
     }
 
     $databaseJunctionPath = Join-Path $DatabasePath "unsafe-link"
