@@ -167,16 +167,16 @@ fn pinned_in(table: &[(u64, Option<u64>)], chain_id: u64) -> Option<u64> {
 /// that chain's pin while still passing the handshake's genesis check.
 pub const RELEASE_GENESIS: &[(u64, [u8; 32])] = &[
     // testnet_beta (also the profile a 40204 config with no profile uses)
-    // Re-pinned 2026-09-29 for the fresh-keys reroll (new genesis role addresses
+    // Re-pinned 2026-10-05 for the r1005 fresh-keys reroll (new genesis role addresses
     // move the genesis state root).
     (
         40204,
-        hex32("0f2b567fad0a376f11d1d1d58511c089b40cceb4810f77eb7eed1e22558ebf72"),
+        hex32("1dcfc4909dd9fdcb0f03c823d627e4b2032cc86bef5fc4561030d6c64b9775f1"),
     ),
-    // team_testnet (re-pinned 2026-09-29 for the fresh-keys reroll)
+    // team_testnet (re-pinned 2026-10-05 for the r1005 fresh-keys reroll)
     (
         40204,
-        hex32("fe64ce75be7bb924fba0f56dea0a0f1a1987c49ce15c58014898979691d22e50"),
+        hex32("90044175c36a6491309d769bd0fa684afbf7b90b64136446db8e2e6ff0927553"),
     ),
     // mainnet
     (
@@ -655,8 +655,8 @@ mod tests {
             hex32("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")[..8],
             [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]
         );
-        assert_eq!(RELEASE_GENESIS[0].1[..4], [0x0f, 0x2b, 0x56, 0x7f]);
-        assert_eq!(RELEASE_GENESIS[0].1[31], 0x72);
+        assert_eq!(RELEASE_GENESIS[0].1[..4], [0x1d, 0xcf, 0xc4, 0x90]);
+        assert_eq!(RELEASE_GENESIS[0].1[31], 0xf1);
     }
 
     #[test]
