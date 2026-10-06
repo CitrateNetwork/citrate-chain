@@ -311,18 +311,21 @@ pub fn value_semantics_at(height: u64) -> crate::revm_adapter::ValueSemantics {
 /// (never the EOA sender), matching EIP-161.
 ///
 /// This is a **consensus rule**: it changes the state root of any block that
-/// deploys a contract, so it is gated by height. Unlike
-/// [`VALUE_TRANSFER_ACTIVATION_HEIGHT`] (which ships at 0 because the 2026-09-07
-/// re-roll gave a clean genesis), this fix lands on an ALREADY-RUNNING chain
-/// whose history was produced with the bug — so it MUST activate at a height
-/// safely ABOVE the tip at rollout. Below it the legacy nonce-drop is reproduced
-/// byte-for-byte, so blocks already on the chain (and a cold sync from genesis)
-/// replay to the roots they were produced with; the new binary is therefore
-/// safe to deploy fleet-wide before the height is reached.
+/// deploys a contract. It first shipped (2026-09-07) onto an already-running
+/// chain at height 30,000, so that chain's history replayed with the legacy
+/// nonce-drop below it.
 ///
-/// Chosen 2026-09-07 with the tip at ~5,506 (~1 block / 2 s): 30,000 gives ~13 h
-/// of runway to roll the binary to all four nodes and verify before activation.
-pub const CREATE_NONCE_FIX_ACTIVATION_HEIGHT: u64 = 30_000;
+/// The 2026-10 reroll starts 40204 from a new genesis on this binary, so there
+/// is no legacy segment to stay compatible with. A non-zero height would make
+/// the new chain reproduce the `CreateCollision` bug for its first 30,000
+/// blocks, during which the whole contract book is deployed (the cooperative
+/// factory's `createCooperative` reverts below it). Like
+/// [`VALUE_TRANSFER_ACTIVATION_HEIGHT`], it is active from genesis: one rule
+/// for the whole chain, and a cold sync from block 0 never straddles a change.
+///
+/// A binary with this value must never run against a pre-reroll 40204 data
+/// directory: it would recompute blocks 1..30,000 with the fix and fork off.
+pub const CREATE_NONCE_FIX_ACTIVATION_HEIGHT: u64 = 0;
 
 /// Devnet-only override for [`CREATE_NONCE_FIX_ACTIVATION_HEIGHT`], mirroring the
 /// MP-DEPTH / value-transfer pattern. Never set this on a node that talks to

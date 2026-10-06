@@ -546,10 +546,9 @@ mod tests {
         assert!(router.route(&query, &e_agg, &bad_state).is_err());
     }
 
-    /// PANIC-S1: bit-exact fingerprint of 50 fixed-seed training steps plus a
-    /// forward pass. Recorded on the pre-conversion (indexed-loop) code; the
-    /// iterator rewrite must reproduce it exactly.
-    fn mlp_fingerprint() -> String {
+    /// 50 fixed-seed training steps, each followed by a forward pass. Calls
+    /// `visit` with every loss and every routing probability, in order.
+    fn mlp_run(mut visit: impl FnMut(f32)) {
         let dim = 6;
         let mut r = MlpRouter::new(dim, 5, 4, 42);
         let states = [
@@ -558,14 +557,6 @@ mod tests {
             BelnapValue::Both,
             BelnapValue::Neither,
         ];
-        // FNV-1a over the raw f32 bits (dependency-free, stable across builds).
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        let mut feed = |bytes: [u8; 4]| {
-            for b in bytes {
-                h ^= u64::from(b);
-                h = h.wrapping_mul(0x0100_0000_01b3);
-            }
-        };
         for step in 0..50usize {
             let q = EmbeddingVector::new(
                 (0..dim)
@@ -580,18 +571,90 @@ mod tests {
             )
             .unwrap();
             let sv: Vec<BelnapValue> = (0..dim).map(|i| states[(step + i) % 4]).collect();
-            let loss = r.train_step(&q, &e, &sv, step % 4, 0.05).unwrap();
-            feed(loss.to_bits().to_le_bytes());
+            visit(r.train_step(&q, &e, &sv, step % 4, 0.05).unwrap());
             let d = r.route(&q, &e, &sv).unwrap();
             for p in &d.probabilities {
-                feed(p.to_bits().to_le_bytes());
+                visit(*p);
             }
         }
+    }
+
+    /// PANIC-S1: bit-exact fingerprint of [`mlp_run`]. Recorded on the
+    /// pre-conversion (indexed-loop) code; the iterator rewrite must reproduce
+    /// it exactly.
+    #[cfg(target_os = "linux")]
+    fn mlp_fingerprint() -> String {
+        // FNV-1a over the raw f32 bits (dependency-free, stable across builds).
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        mlp_run(|v| {
+            for b in v.to_bits().to_le_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        });
         format!("{h:016x}")
     }
 
+    /// The bit-exact pin holds on Linux only. The router calls `f32::exp` and
+    /// `f32::ln`, which come from the platform libm, and macOS's differ from
+    /// glibc's in the last bit. The router is off-chain learning code: nothing
+    /// in consensus or execution runs it (the 0x0111 precompile is the integer
+    /// `q16::routing`), so cross-platform last-bit agreement is not required.
+    #[cfg(target_os = "linux")]
     #[test]
     fn panic_s1_mlp_router_bit_exact() {
         assert_eq!(mlp_fingerprint(), "9db6bffba6e4e177");
+    }
+
+    /// [`mlp_run`] output on Linux (glibc), at the positions checked by
+    /// [`panic_s1_mlp_router_matches_reference`]: losses at multiples of 5,
+    /// routing probabilities in between.
+    const MLP_REFERENCE_LEN: usize = 250;
+    #[rustfmt::skip]
+    const MLP_REFERENCE: &[(usize, f32)] = &[
+        (0, 1.4446752),
+        (13, 0.2527151),
+        (20, 1.3619591),
+        (33, 0.2625664),
+        (40, 1.5095048),
+        (53, 0.28422207),
+        (60, 1.4146116),
+        (73, 0.32736364),
+        (80, 1.334213),
+        (93, 0.29538903),
+        (100, 1.3629642),
+        (113, 0.30316153),
+        (120, 1.3539658),
+        (133, 0.3544861),
+        (140, 1.5318019),
+        (153, 0.36380062),
+        (160, 1.2844415),
+        (173, 0.3539925),
+        (180, 1.376226),
+        (193, 0.35726094),
+        (200, 1.2909954),
+        (213, 0.39607573),
+        (220, 1.4909974),
+        (233, 0.44034207),
+        (240, 1.327331),
+        (249, 0.21039237),
+    ];
+
+    /// Every platform: [`mlp_run`] matches the Linux reference within a small
+    /// tolerance. This still catches a logic change in the iterator rewrite,
+    /// which moves values far more than a libm last-bit difference does.
+    #[test]
+    fn panic_s1_mlp_router_matches_reference() {
+        let mut got = Vec::new();
+        mlp_run(|v| got.push(v));
+        assert_eq!(got.len(), MLP_REFERENCE_LEN);
+        // Spot-check a spread of positions: losses and probabilities, early and late.
+        for &(i, want) in MLP_REFERENCE {
+            let v = got.get(i).copied().unwrap_or(f32::NAN);
+            assert!(
+                (v - want).abs() <= 1e-4,
+                "position {i}: got {v}, reference {want}"
+            );
+        }
     }
 }
