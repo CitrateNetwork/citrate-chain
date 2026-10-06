@@ -189,7 +189,11 @@ mod tests {
         // Bytewise distinct with no shared prefix > 1 byte
         // (probabilistic check; under HKDF-SHA-256 the probability of
         // any prefix > 16 bytes is vanishingly small).
-        let shared_prefix = bca.iter().zip(bds.iter()).take_while(|(a, b)| a == b).count();
+        let shared_prefix = bca
+            .iter()
+            .zip(bds.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
         assert!(shared_prefix < 16, "shared_prefix={shared_prefix}");
     }
 

@@ -244,7 +244,10 @@ async fn require_rest_api_key(
     } else {
         // S-02 FIX: No key configured — reject mutating operations (fail-closed).
         // GET requests are allowed for read-only access; POST/PUT/DELETE are blocked.
-        if req.method() == Method::GET || req.method() == Method::OPTIONS || req.method() == Method::HEAD {
+        if req.method() == Method::GET
+            || req.method() == Method::OPTIONS
+            || req.method() == Method::HEAD
+        {
             Ok(next.run(req).await)
         } else {
             warn!(
@@ -262,7 +265,9 @@ async fn require_rest_api_key(
             let response = axum::response::Response::builder()
                 .status(StatusCode::FORBIDDEN)
                 .header("content-type", "application/json")
-                .body(axum::body::Body::from(serde_json::to_string(&body).unwrap_or_default()))
+                .body(axum::body::Body::from(
+                    serde_json::to_string(&body).unwrap_or_default(),
+                ))
                 .unwrap_or_else(|_| {
                     let mut response = axum::response::Response::new(axum::body::Body::empty());
                     *response.status_mut() = StatusCode::FORBIDDEN;
@@ -582,7 +587,10 @@ async fn citrate_get_model(
             ));
 
             match state.ai_api.get_model(model_id).await {
-                Ok(model) => Ok(Json(serde_json::to_value(model).unwrap_or_else(|e| serde_json::json!({"error": e.to_string()})))),
+                Ok(model) => Ok(Json(
+                    serde_json::to_value(model)
+                        .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()})),
+                )),
                 Err(e) => {
                     error!("Failed to get model: {}", e);
                     Err(StatusCode::NOT_FOUND)
@@ -607,7 +615,10 @@ async fn citrate_model_stats(
             ));
 
             match state.ai_api.get_model_stats(model_id).await {
-                Ok(stats) => Ok(Json(serde_json::to_value(stats).unwrap_or_else(|e| serde_json::json!({"error": e.to_string()})))),
+                Ok(stats) => Ok(Json(
+                    serde_json::to_value(stats)
+                        .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()})),
+                )),
                 Err(e) => {
                     error!("Failed to get model stats: {}", e);
                     Err(StatusCode::NOT_FOUND)
@@ -655,7 +666,10 @@ async fn citrate_get_inference(
             let request_hash = citrate_consensus::types::Hash::new(hash_array);
 
             match state.ai_api.get_inference_result(request_hash).await {
-                Ok(result) => Ok(Json(serde_json::to_value(result).unwrap_or_else(|e| serde_json::json!({"error": e.to_string()})))),
+                Ok(result) => Ok(Json(
+                    serde_json::to_value(result)
+                        .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()})),
+                )),
                 Err(e) => {
                     error!("Failed to get inference result: {}", e);
                     Err(StatusCode::NOT_FOUND)
@@ -705,7 +719,10 @@ async fn citrate_get_training_job(
                 citrate_execution::types::JobId(citrate_consensus::types::Hash::new(job_id_array));
 
             match state.ai_api.get_training_job(job_id).await {
-                Ok(job) => Ok(Json(serde_json::to_value(job).unwrap_or_else(|e| serde_json::json!({"error": e.to_string()})))),
+                Ok(job) => Ok(Json(
+                    serde_json::to_value(job)
+                        .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()})),
+                )),
                 Err(e) => {
                     error!("Failed to get training job: {}", e);
                     Err(StatusCode::NOT_FOUND)
@@ -748,7 +765,10 @@ async fn citrate_get_lora(
             let adapter_hash = citrate_consensus::types::Hash::new(adapter_id_array);
 
             match state.ai_api.get_lora(adapter_hash).await {
-                Ok(adapter) => Ok(Json(serde_json::to_value(adapter).unwrap_or_else(|e| serde_json::json!({"error": e.to_string()})))),
+                Ok(adapter) => Ok(Json(
+                    serde_json::to_value(adapter)
+                        .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()})),
+                )),
                 Err(e) => {
                     error!("Failed to get LoRA adapter: {}", e);
                     Err(StatusCode::NOT_FOUND)
@@ -820,10 +840,7 @@ mod tests {
 
     // WP-X.1: CORS and auth tests
 
-    fn make_test_server(
-        cors_origins: Vec<String>,
-        rest_api_key: Option<String>,
-    ) -> Router {
+    fn make_test_server(cors_origins: Vec<String>, rest_api_key: Option<String>) -> Router {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let storage = Arc::new(
             StorageManager::new(
@@ -886,10 +903,7 @@ mod tests {
             .headers()
             .get("access-control-allow-origin")
             .map(|v| v.to_str().unwrap().to_string());
-        assert_eq!(
-            cors_header.as_deref(),
-            Some("https://app.citrate.ai")
-        );
+        assert_eq!(cors_header.as_deref(), Some("https://app.citrate.ai"));
     }
 
     #[tokio::test]

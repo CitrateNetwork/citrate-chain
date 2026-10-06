@@ -38,9 +38,7 @@ fn test_config(dim: usize) -> LearningConfig {
 }
 
 fn make_embedding(dim: usize, seed: f32) -> EmbeddingVector {
-    let data: Vec<f32> = (0..dim)
-        .map(|i| (seed + i as f32 * 0.1).sin())
-        .collect();
+    let data: Vec<f32> = (0..dim).map(|i| (seed + i as f32 * 0.1).sin()).collect();
     EmbeddingVector::new(data).unwrap()
 }
 
@@ -357,7 +355,9 @@ fn test_byzantine_participant_excluded_by_blue_score() {
     let honest = make_embedding(dim, 1.0);
 
     // 1 Byzantine with random/divergent embedding
-    let byzantine_data: Vec<f32> = (0..dim).map(|i| ((i * 7 + 3) as f32).sin() * 100.0).collect();
+    let byzantine_data: Vec<f32> = (0..dim)
+        .map(|i| ((i * 7 + 3) as f32).sin() * 100.0)
+        .collect();
     let byzantine = EmbeddingVector::new(byzantine_data).unwrap();
 
     let conf = make_confidence(dim, 0.9);
@@ -377,7 +377,10 @@ fn test_byzantine_participant_excluded_by_blue_score() {
     // The aggregated embedding should be close to the honest embedding
     // (Byzantine's contribution is suppressed by low blue score)
     let honest_normalized = honest.normalize();
-    let sim = result.embedding.cosine_similarity(&honest_normalized).unwrap();
+    let sim = result
+        .embedding
+        .cosine_similarity(&honest_normalized)
+        .unwrap();
     assert!(
         sim > 0.8,
         "aggregated result should be dominated by honest participants, cosine sim = {}",
@@ -608,10 +611,7 @@ fn test_execute_cycle_end_to_end() {
 
     // Transition to FullSystem
     macro_mgr.evaluate_checkpoint(0.8, Some(0.2));
-    assert_eq!(
-        macro_mgr.current_phase(),
-        NetworkLearningPhase::FullSystem
-    );
+    assert_eq!(macro_mgr.current_phase(), NetworkLearningPhase::FullSystem);
 
     // Phase 3: FullSystem — adapter produced
     let result = pipeline

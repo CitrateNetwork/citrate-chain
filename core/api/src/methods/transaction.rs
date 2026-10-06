@@ -17,7 +17,11 @@ pub struct TransactionApi {
 
 impl TransactionApi {
     pub fn new(mempool: Arc<Mempool>, executor: Arc<Executor>, chain_id: u64) -> Self {
-        Self { mempool, executor, chain_id }
+        Self {
+            mempool,
+            executor,
+            chain_id,
+        }
     }
 
     /// Send raw transaction

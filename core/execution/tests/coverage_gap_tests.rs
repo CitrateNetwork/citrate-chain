@@ -2,9 +2,9 @@
 // Targets specific uncovered lines identified by cargo-llvm-cov.
 // Focus: error branches, edge cases, and unhappy paths.
 
-use citrate_execution::types::Address;
 use citrate_execution::executor::Executor;
 use citrate_execution::state::StateDB;
+use citrate_execution::types::Address;
 use primitive_types::U256;
 use std::sync::Arc;
 
@@ -106,7 +106,11 @@ fn test_executor_set_code() {
     executor.set_code(&addr, code);
     // Verify code was set by checking code_hash changed
     let hash = executor.get_code_hash(&addr);
-    assert_ne!(hash, citrate_consensus::types::Hash::default(), "Code hash should be non-default after setting code");
+    assert_ne!(
+        hash,
+        citrate_consensus::types::Hash::default(),
+        "Code hash should be non-default after setting code"
+    );
 }
 
 #[test]
@@ -116,7 +120,10 @@ fn test_executor_set_code_changes_hash() {
     let hash_before = executor.get_code_hash(&addr);
     executor.set_code(&addr, vec![0x60, 0x00]);
     let hash_after = executor.get_code_hash(&addr);
-    assert_ne!(hash_before, hash_after, "Code hash must change after set_code");
+    assert_ne!(
+        hash_before, hash_after,
+        "Code hash must change after set_code"
+    );
 }
 
 #[test]
@@ -174,8 +181,8 @@ fn test_key_manager_from_short_seed() {
 #[test]
 fn test_address_normalize_with_evm_address() {
     // Test the normalize_address function with a 20-byte embedded EVM address
-    use citrate_execution::address_utils::normalize_address;
     use citrate_consensus::types::PublicKey;
+    use citrate_execution::address_utils::normalize_address;
 
     // Create a pubkey with 20 non-zero bytes + 12 zero bytes (EVM address format)
     let mut pk_bytes = [0u8; 32];
@@ -189,11 +196,14 @@ fn test_address_normalize_with_evm_address() {
 #[test]
 fn test_address_normalize_with_full_pubkey() {
     // Test normalize_address with a full 32-byte public key (non-EVM)
-    use citrate_execution::address_utils::normalize_address;
     use citrate_consensus::types::PublicKey;
+    use citrate_execution::address_utils::normalize_address;
 
     let pk = PublicKey::new([0xFF; 32]); // All non-zero — not EVM format
     let addr = normalize_address(&pk);
     // Should be Keccak256 of the full key, last 20 bytes
-    assert_ne!(addr.0, [0xFF; 20], "Full pubkey should be hashed, not truncated");
+    assert_ne!(
+        addr.0, [0xFF; 20],
+        "Full pubkey should be hashed, not truncated"
+    );
 }

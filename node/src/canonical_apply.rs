@@ -583,7 +583,8 @@ impl CanonicalApplicator {
             .into_iter()
             .filter_map(|h| self.storage.blocks.get_block(&h).ok().flatten())
             .filter(|b| {
-                b.selected_parent() == tip.hash && Some(b.header.height) == tip.height.checked_add(1)
+                b.selected_parent() == tip.hash
+                    && Some(b.header.height) == tip.height.checked_add(1)
             })
             .collect();
         match extensions.len() {

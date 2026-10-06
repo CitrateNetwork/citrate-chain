@@ -10,10 +10,10 @@
 //   4. Commitment across checkpoint boundary -> correct
 //   5. Commitment generation is < 1ms (benchmark assertion)
 
-use citrate_mcp::verification::ExecutionVerifier;
+use citrate_execution::{Address, Hash};
 use citrate_mcp::execution::Model;
 use citrate_mcp::types::{ExecutionProof, ModelId};
-use citrate_execution::{Address, Hash};
+use citrate_mcp::verification::ExecutionVerifier;
 use sha3::{Digest, Sha3_256};
 
 // =============================================================================
@@ -42,8 +42,8 @@ fn build_nonce_proof(statement: &[u8], response: &[u8; 32], nonce_ts: u64) -> Ve
     let commitment = hasher.finalize();
 
     let mut proof_data = commitment.to_vec(); // 32 bytes
-    proof_data.extend_from_slice(response);   // 32 bytes
-    proof_data.extend_from_slice(&nonce_bytes);// 8 bytes = 72 total
+    proof_data.extend_from_slice(response); // 32 bytes
+    proof_data.extend_from_slice(&nonce_bytes); // 8 bytes = 72 total
     proof_data
 }
 
@@ -63,7 +63,13 @@ fn build_legacy_proof(statement: &[u8], response: &[u8; 32]) -> Vec<u8> {
 }
 
 /// Build a full ExecutionProof with a valid commitment.
-fn build_execution_proof(model: &Model, input: &[u8], output: &[u8], proof_data: Vec<u8>, statement: Vec<u8>) -> ExecutionProof {
+fn build_execution_proof(
+    model: &Model,
+    input: &[u8],
+    output: &[u8],
+    proof_data: Vec<u8>,
+    statement: Vec<u8>,
+) -> ExecutionProof {
     let model_hash = {
         let mut h = Sha3_256::new();
         h.update(&model.architecture);
@@ -167,7 +173,10 @@ fn test_tampered_response_fails() {
     let proof = build_execution_proof(&model, input, output, proof_data, statement);
     let result = verifier.verify_execution(&model, input, output, &proof);
     assert!(result.is_ok());
-    assert!(!result.unwrap(), "Tampered response should fail verification");
+    assert!(
+        !result.unwrap(),
+        "Tampered response should fail verification"
+    );
 }
 
 #[test]
@@ -188,7 +197,10 @@ fn test_tampered_commitment_fails() {
     let proof = build_execution_proof(&model, input, output, proof_data, statement);
     let result = verifier.verify_execution(&model, input, output, &proof);
     assert!(result.is_ok());
-    assert!(!result.unwrap(), "Tampered commitment should fail verification");
+    assert!(
+        !result.unwrap(),
+        "Tampered commitment should fail verification"
+    );
 }
 
 #[test]
@@ -232,7 +244,10 @@ fn test_tampered_statement_fails() {
 
     let result = verifier.verify_execution(&model, input, output, &proof);
     assert!(result.is_ok());
-    assert!(!result.unwrap(), "Tampered statement should fail verification");
+    assert!(
+        !result.unwrap(),
+        "Tampered statement should fail verification"
+    );
 }
 
 // =============================================================================
@@ -316,7 +331,10 @@ fn test_nonce_just_expired_rejected() {
 
     let result = verifier.verify_execution(&model, input, output, &proof);
     assert!(result.is_ok());
-    assert!(!result.unwrap(), "Nonce just past 5-min boundary should fail");
+    assert!(
+        !result.unwrap(),
+        "Nonce just past 5-min boundary should fail"
+    );
 }
 
 // =============================================================================
@@ -336,7 +354,13 @@ fn test_commitment_across_checkpoint_boundary() {
     // First checkpoint window (current)
     let ts_window_1 = current_ts();
     let proof_data_1 = build_nonce_proof(&statement, &response, ts_window_1);
-    let proof_1 = build_execution_proof(&model, b"input1", b"output1", proof_data_1, statement.clone());
+    let proof_1 = build_execution_proof(
+        &model,
+        b"input1",
+        b"output1",
+        proof_data_1,
+        statement.clone(),
+    );
 
     let result_1 = verifier.verify_execution(&model, b"input1", b"output1", &proof_1);
     assert!(result_1.is_ok());
@@ -370,7 +394,8 @@ fn test_same_nonce_different_statements_produce_different_commitments() {
 
     // Commitments (first 32 bytes) must differ
     assert_ne!(
-        &proof_a[..32], &proof_b[..32],
+        &proof_a[..32],
+        &proof_b[..32],
         "Different statements should produce different commitments"
     );
 }
@@ -384,7 +409,10 @@ fn test_commitment_deterministic_across_calls() {
     let proof_1 = build_nonce_proof(statement, &response, nonce_ts);
     let proof_2 = build_nonce_proof(statement, &response, nonce_ts);
 
-    assert_eq!(proof_1, proof_2, "Same inputs should produce identical proofs");
+    assert_eq!(
+        proof_1, proof_2,
+        "Same inputs should produce identical proofs"
+    );
 }
 
 // =============================================================================

@@ -128,8 +128,8 @@ impl InstitutionalSlashingManager {
         state.offense_count = state.offense_count.saturating_add(1);
 
         // Grace period for first offense
-        let is_grace = state.offense_count <= 1
-            && current_epoch < self.config.first_offense_grace_epochs;
+        let is_grace =
+            state.offense_count <= 1 && current_epoch < self.config.first_offense_grace_epochs;
 
         let penalty_pct = if is_grace {
             0
@@ -148,7 +148,11 @@ impl InstitutionalSlashingManager {
         state.cooldown_until_epoch = current_epoch.saturating_add(self.config.cooldown_epochs);
 
         // Check for forced deactivation
-        let max_slash = crate::mul_div(stake_wei, U256::from(self.config.max_cumulative_slash_pct), U256::from(100));
+        let max_slash = crate::mul_div(
+            stake_wei,
+            U256::from(self.config.max_cumulative_slash_pct),
+            U256::from(100),
+        );
         if state.cumulative_slashed_wei >= max_slash {
             state.is_deactivated = true;
         }

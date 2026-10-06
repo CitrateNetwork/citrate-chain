@@ -163,7 +163,11 @@ fn ipfs_add_blocking(data: Vec<u8>) -> Result<String, String> {
             .json()
             .await
             .map_err(|e| format!("IPFS parse error: {}", e))?;
-        let cid = json.get("Hash").and_then(|h| h.as_str()).unwrap_or("").to_string();
+        let cid = json
+            .get("Hash")
+            .and_then(|h| h.as_str())
+            .unwrap_or("")
+            .to_string();
         if cid.is_empty() {
             return Err("IPFS returned empty CID".to_string());
         }
@@ -1196,7 +1200,7 @@ impl RpcServer {
             // Check sender balance covers value + gas
             let sender_addr = citrate_execution::address_utils::normalize_address(&tx.from);
             let balance = exec.get_canonical_account(&sender_addr).balance; // SRP-S4 WP-2.2: non-warming committed read
-            // u64 × u64 < 2^128 and + u128 stays far below 2^256: neither saturates.
+                                                                            // u64 × u64 < 2^128 and + u128 stays far below 2^256: neither saturates.
             let gas_cost = primitive_types::U256::from(tx.gas_limit)
                 .saturating_mul(primitive_types::U256::from(tx.gas_price));
             let total_cost = gas_cost.saturating_add(primitive_types::U256::from(tx.value));
@@ -2304,7 +2308,9 @@ impl RpcServer {
             };
             // Accept both {model_id: ...} and [{model_id: ...}]
             let obj_value = match &value {
-                serde_json::Value::Array(arr) if !arr.is_empty() => arr.first().cloned().unwrap_or_default(),
+                serde_json::Value::Array(arr) if !arr.is_empty() => {
+                    arr.first().cloned().unwrap_or_default()
+                }
                 _ => value.clone(),
             };
             let obj = match obj_value.as_object() {
@@ -2462,7 +2468,9 @@ impl RpcServer {
             };
             // Accept both {model_id: ...} and [{model_id: ...}]
             let obj_value = match &value {
-                serde_json::Value::Array(arr) if !arr.is_empty() => arr.first().cloned().unwrap_or_default(),
+                serde_json::Value::Array(arr) if !arr.is_empty() => {
+                    arr.first().cloned().unwrap_or_default()
+                }
                 _ => value.clone(),
             };
             let obj = match obj_value.as_object() {

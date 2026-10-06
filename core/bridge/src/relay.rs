@@ -12,9 +12,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::BridgeConfig;
 use crate::errors::{BridgeError, BridgeResult};
-use crate::events::{
-    BridgeEvent, DepositEvent, EventStatus, TrackedEvent, WithdrawalEvent,
-};
+use crate::events::{BridgeEvent, DepositEvent, EventStatus, TrackedEvent, WithdrawalEvent};
 use crate::metrics::BridgeMetrics;
 use crate::mint::SnapMinter;
 use crate::oracle::OracleRegistry;
@@ -27,11 +25,7 @@ use crate::state::RelayState;
 #[async_trait]
 pub trait BridgeEventSource: Send + Sync {
     /// Fetch new events since the given block number.
-    async fn fetch_events(
-        &self,
-        from_block: u64,
-        to_block: u64,
-    ) -> BridgeResult<Vec<BridgeEvent>>;
+    async fn fetch_events(&self, from_block: u64, to_block: u64) -> BridgeResult<Vec<BridgeEvent>>;
 
     /// Get the current head block number of the source chain.
     async fn current_block(&self) -> BridgeResult<u64>;
@@ -120,9 +114,7 @@ impl BridgeRelay {
         // verification here.
         let (domain_chain_id, bridge_instance) = config.attestation_domain();
         Ok(Self {
-            minter: Arc::new(RwLock::new(SnapMinter::new(
-                config.bonding_curve.clone(),
-            ))),
+            minter: Arc::new(RwLock::new(SnapMinter::new(config.bonding_curve.clone()))),
             state: Arc::new(RwLock::new(RelayState::default())),
             oracle_registry: Arc::new(RwLock::new(OracleRegistry::with_domain(
                 oracle_threshold,
@@ -198,7 +190,9 @@ impl BridgeRelay {
         }
 
         // Fetch events in the confirmed range
-        let events = source.fetch_events(last_processed.saturating_add(1), safe_block).await?;
+        let events = source
+            .fetch_events(last_processed.saturating_add(1), safe_block)
+            .await?;
         info!(
             event_count = events.len(),
             from = last_processed.saturating_add(1),
@@ -328,20 +322,16 @@ impl BridgeRelay {
         // Process based on event type
         match event {
             BridgeEvent::Deposit(deposit) => self.process_deposit(deposit).await,
-            BridgeEvent::Withdrawal(withdrawal) => {
-                self.process_withdrawal(withdrawal).await
-            }
+            BridgeEvent::Withdrawal(withdrawal) => self.process_withdrawal(withdrawal).await,
             BridgeEvent::OracleUpdate(update) => {
                 info!(
                     oracle = hex::encode(update.oracle_pubkey),
                     is_addition = update.is_addition,
                     "Oracle update processed"
                 );
-                self.state.write().update_event_status(
-                    &event_id,
-                    EventStatus::Processed,
-                    None,
-                );
+                self.state
+                    .write()
+                    .update_event_status(&event_id, EventStatus::Processed, None);
                 ProcessingResult {
                     event_id,
                     status: EventStatus::Processed,
@@ -527,10 +517,7 @@ impl BridgeRelay {
 
         if tracked.status != EventStatus::Failed {
             return Err(BridgeError::InvalidEventData {
-                reason: format!(
-                    "Cannot retry event in {:?} status",
-                    tracked.status
-                ),
+                reason: format!("Cannot retry event in {:?} status", tracked.status),
             });
         }
 
@@ -748,8 +735,7 @@ mod tests {
 
             // Sign attestation 1 (v2 message, bound to the relay's domain)
             let (cid, inst) = reg.domain();
-            let msg1 =
-                crate::oracle::attestation_message(cid, &inst, &event_id, &event_hash, now);
+            let msg1 = crate::oracle::attestation_message(cid, &inst, &event_id, &event_hash, now);
             let sig1 = sk1.sign(&msg1);
 
             reg.submit_attestation(OracleAttestation {
@@ -763,8 +749,7 @@ mod tests {
 
             // Sign attestation 2
             let now2 = now + 1;
-            let msg2 =
-                crate::oracle::attestation_message(cid, &inst, &event_id, &event_hash, now2);
+            let msg2 = crate::oracle::attestation_message(cid, &inst, &event_id, &event_hash, now2);
             let sig2 = sk2.sign(&msg2);
 
             reg.submit_attestation(OracleAttestation {
@@ -790,8 +775,10 @@ mod tests {
         let o1 = sk1.verifying_key().to_bytes();
         let o2 = sk2.verifying_key().to_bytes();
         let mut reg = relay.oracle_registry().write();
-        reg.register_oracle(o1, "O1".to_string()).expect("register o1");
-        reg.register_oracle(o2, "O2".to_string()).expect("register o2");
+        reg.register_oracle(o1, "O1".to_string())
+            .expect("register o1");
+        reg.register_oracle(o2, "O2".to_string())
+            .expect("register o2");
         (o1, o2)
     }
 
@@ -810,8 +797,7 @@ mod tests {
         let (cid, inst) = relay.oracle_registry().read().domain();
         for (i, (sk, oid)) in keys.iter().enumerate() {
             let ts = base + i as u64;
-            let msg =
-                crate::oracle::attestation_message(cid, &inst, event_id, &bound_hash, ts);
+            let msg = crate::oracle::attestation_message(cid, &inst, event_id, &bound_hash, ts);
             let sig = sk.sign(&msg);
             relay
                 .oracle_registry()
@@ -854,7 +840,12 @@ mod tests {
             timestamp: 1000,
         };
         // Oracles attest to the HONEST deposit's canonical hash.
-        rm_a_attest_hash(&relay, &event_id, honest.canonical_hash(), &[(&sk1, o1), (&sk2, o2)]);
+        rm_a_attest_hash(
+            &relay,
+            &event_id,
+            honest.canonical_hash(),
+            &[(&sk1, o1), (&sk2, o2)],
+        );
         assert!(relay.oracle_registry().read().is_threshold_met(&event_id));
 
         // Attacker presents a TAMPERED deposit under the same event_id.
@@ -911,7 +902,12 @@ mod tests {
             amount_eth: 1.0,
             timestamp: 1000,
         };
-        rm_a_attest_hash(&relay, &event_id, honest.canonical_hash(), &[(&sk1, o1), (&sk2, o2)]);
+        rm_a_attest_hash(
+            &relay,
+            &event_id,
+            honest.canonical_hash(),
+            &[(&sk1, o1), (&sk2, o2)],
+        );
 
         let ok = relay.process_event(BridgeEvent::Deposit(honest)).await;
         assert_eq!(

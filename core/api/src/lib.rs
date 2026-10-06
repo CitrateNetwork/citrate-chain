@@ -1,4 +1,3 @@
-
 // citrate/core/api/src/lib.rs
 
 // PANIC-S1 G2: production code in this crate may not panic (tests excepted).
@@ -18,10 +17,10 @@
 pub mod ai_rpc;
 pub mod economics_rpc;
 pub mod eth_rpc;
-pub mod inference_auth;
 pub mod eth_subscriptions;
 pub mod eth_tx_decoder;
 pub mod filter;
+pub mod inference_auth;
 pub mod methods;
 pub mod metrics;
 pub mod metrics_server;
@@ -35,9 +34,9 @@ pub mod websocket;
 
 pub use eth_subscriptions::EthSubscriptionServer;
 pub use filter::FilterRegistry;
+pub use jsonrpc_http_server::CloseHandle as RpcCloseHandle;
 pub use openai_api::OpenAiRestServer;
 pub use server::{RpcConfig, RpcServer};
-pub use jsonrpc_http_server::CloseHandle as RpcCloseHandle;
 pub use types::{ApiError, BlockId, BlockTag};
 pub use websocket::WebSocketServer;
 
@@ -83,7 +82,9 @@ impl ApiService {
 
         let ws_server = WebSocketServer::new(ws_addr);
         // C-02 FIX: Thread rest_api_key from environment — fail closed on mutating routes when absent
-        let rest_api_key = std::env::var("CITRATE_REST_API_KEY").ok().filter(|k| !k.is_empty());
+        let rest_api_key = std::env::var("CITRATE_REST_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty());
         let rest_server =
             OpenAiRestServer::with_config(storage, mempool, executor, cors_origins, rest_api_key);
 

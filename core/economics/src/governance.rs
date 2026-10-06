@@ -1,10 +1,10 @@
 // citrate/core/economics/src/governance.rs
 
+use anyhow::{anyhow, Result};
 use citrate_execution::types::Address;
 use primitive_types::U256;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use anyhow::{Result, anyhow};
 
 /// Governance configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,12 +35,12 @@ impl Default for GovernanceConfig {
     fn default() -> Self {
         Self {
             proposal_threshold: crate::salt(10_000), // 10,000 SALT
-            vote_threshold: crate::salt(1), // 1 SALT
-            voting_period: 50_400, // ~7 days at 2s blocks
-            execution_delay: 7_200, // ~1 day delay
-            quorum_percentage: 10, // 10% of total supply must vote
-            approval_threshold: 60, // 60% approval needed
-            grace_period: 50_400, // 7 days to execute
+            vote_threshold: crate::salt(1),          // 1 SALT
+            voting_period: 50_400,                   // ~7 days at 2s blocks
+            execution_delay: 7_200,                  // ~1 day delay
+            quorum_percentage: 10,                   // 10% of total supply must vote
+            approval_threshold: 60,                  // 60% approval needed
+            grace_period: 50_400,                    // 7 days to execute
         }
     }
 }
@@ -49,15 +49,9 @@ impl Default for GovernanceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProposalType {
     /// Parameter change (gas prices, reward rates, etc.)
-    ParameterChange {
-        parameter: String,
-        new_value: U256,
-    },
+    ParameterChange { parameter: String, new_value: U256 },
     /// Network upgrade
-    NetworkUpgrade {
-        version: String,
-        upgrade_block: u64,
-    },
+    NetworkUpgrade { version: String, upgrade_block: u64 },
     /// Treasury spending
     TreasurySpend {
         recipient: Address,
@@ -65,21 +59,16 @@ pub enum ProposalType {
         description: String,
     },
     /// Emergency action (fast track with higher threshold)
-    Emergency {
-        action: String,
-        reason: String,
-    },
+    Emergency { action: String, reason: String },
     /// Model marketplace governance
-    MarketplaceGovernance {
-        action: MarketplaceAction,
-    },
+    MarketplaceGovernance { action: MarketplaceAction },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MarketplaceAction {
     SetMinModelStake(U256),
     SetMarketplaceFee(u8), // Percentage
-    BanModel(String), // Model ID
+    BanModel(String),      // Model ID
     UpdateQualityThreshold(f32),
 }
 
@@ -104,14 +93,14 @@ pub struct Proposal {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ProposalStatus {
-    Pending,     // Before voting starts
-    Active,      // Currently voting
-    Succeeded,   // Passed and waiting for execution
-    Queued,      // In execution delay period
-    Executed,    // Successfully executed
-    Failed,      // Did not meet requirements
-    Canceled,    // Canceled by proposer
-    Expired,     // Passed grace period without execution
+    Pending,   // Before voting starts
+    Active,    // Currently voting
+    Succeeded, // Passed and waiting for execution
+    Queued,    // In execution delay period
+    Executed,  // Successfully executed
+    Failed,    // Did not meet requirements
+    Canceled,  // Canceled by proposer
+    Expired,   // Passed grace period without execution
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,7 +200,9 @@ impl GovernanceManager {
     ) -> Result<()> {
         // First, get voting_starts and do validation without mutable borrow
         let (voting_starts, _voting_ends) = {
-            let proposal = self.proposals.get(&proposal_id)
+            let proposal = self
+                .proposals
+                .get(&proposal_id)
                 .ok_or_else(|| anyhow!("Proposal not found"))?;
 
             // Check voting period
@@ -247,14 +238,20 @@ impl GovernanceManager {
 
         // Re-lookup mutably — proposal is guaranteed to exist since we validated above
         // and no removal occurs between the check and this point.
-        let proposal = self.proposals.get_mut(&proposal_id)
+        let proposal = self
+            .proposals
+            .get_mut(&proposal_id)
             .ok_or_else(|| anyhow!("Proposal unexpectedly removed during vote"))?;
 
         // Update vote counts
         match support {
             VoteType::For => proposal.for_votes = proposal.for_votes.saturating_add(voting_power),
-            VoteType::Against => proposal.against_votes = proposal.against_votes.saturating_add(voting_power),
-            VoteType::Abstain => proposal.abstain_votes = proposal.abstain_votes.saturating_add(voting_power),
+            VoteType::Against => {
+                proposal.against_votes = proposal.against_votes.saturating_add(voting_power)
+            }
+            VoteType::Abstain => {
+                proposal.abstain_votes = proposal.abstain_votes.saturating_add(voting_power)
+            }
         }
 
         proposal.voters.insert(voter, vote);
@@ -278,12 +275,19 @@ impl GovernanceManager {
             valid_from: current_block,
         };
 
-        self.delegations.entry(delegate).or_default().push(delegation);
+        self.delegations
+            .entry(delegate)
+            .or_default()
+            .push(delegation);
         Ok(())
     }
 
     /// Process proposals at current block
-    pub fn process_proposals(&mut self, current_block: u64, total_supply: U256) -> Vec<ProposalUpdate> {
+    pub fn process_proposals(
+        &mut self,
+        current_block: u64,
+        total_supply: U256,
+    ) -> Vec<ProposalUpdate> {
         let mut updates = Vec::new();
 
         for proposal in self.proposals.values_mut() {
@@ -294,24 +298,44 @@ impl GovernanceManager {
                 }
                 ProposalStatus::Active if current_block > proposal.voting_ends => {
                     // Check if proposal passed
-                    let total_votes = proposal.for_votes.saturating_add(proposal.against_votes).saturating_add(proposal.abstain_votes);
-                    let quorum_required = crate::mul_div(total_supply, U256::from(self.config.quorum_percentage), U256::from(100));
-                    let approval_required = crate::mul_div(total_votes, U256::from(self.config.approval_threshold), U256::from(100));
+                    let total_votes = proposal
+                        .for_votes
+                        .saturating_add(proposal.against_votes)
+                        .saturating_add(proposal.abstain_votes);
+                    let quorum_required = crate::mul_div(
+                        total_supply,
+                        U256::from(self.config.quorum_percentage),
+                        U256::from(100),
+                    );
+                    let approval_required = crate::mul_div(
+                        total_votes,
+                        U256::from(self.config.approval_threshold),
+                        U256::from(100),
+                    );
 
                     if total_votes >= quorum_required && proposal.for_votes >= approval_required {
                         proposal.status = ProposalStatus::Succeeded;
-                        proposal.execution_eta = Some(current_block.saturating_add(self.config.execution_delay));
+                        proposal.execution_eta =
+                            Some(current_block.saturating_add(self.config.execution_delay));
                         updates.push(ProposalUpdate::Passed(proposal.id));
                     } else {
                         proposal.status = ProposalStatus::Failed;
                         updates.push(ProposalUpdate::Failed(proposal.id));
                     }
                 }
-                ProposalStatus::Succeeded if proposal.execution_eta.is_some_and(|eta| current_block >= eta) => {
+                ProposalStatus::Succeeded
+                    if proposal
+                        .execution_eta
+                        .is_some_and(|eta| current_block >= eta) =>
+                {
                     proposal.status = ProposalStatus::Queued;
                     updates.push(ProposalUpdate::ReadyForExecution(proposal.id));
                 }
-                ProposalStatus::Queued if proposal.execution_eta.is_some_and(|eta| current_block > eta.saturating_add(self.config.grace_period)) => {
+                ProposalStatus::Queued
+                    if proposal.execution_eta.is_some_and(|eta| {
+                        current_block > eta.saturating_add(self.config.grace_period)
+                    }) =>
+                {
                     proposal.status = ProposalStatus::Expired;
                     updates.push(ProposalUpdate::Expired(proposal.id));
                 }
@@ -324,7 +348,9 @@ impl GovernanceManager {
 
     /// Execute a queued proposal
     pub fn execute_proposal(&mut self, proposal_id: u64) -> Result<ProposalType> {
-        let proposal = self.proposals.get_mut(&proposal_id)
+        let proposal = self
+            .proposals
+            .get_mut(&proposal_id)
             .ok_or_else(|| anyhow!("Proposal not found"))?;
 
         if proposal.status != ProposalStatus::Queued {
@@ -336,7 +362,12 @@ impl GovernanceManager {
     }
 
     /// Calculate voting power including delegations
-    fn calculate_voting_power(&mut self, address: Address, block_height: u64, total_supply: U256) -> Result<U256> {
+    fn calculate_voting_power(
+        &mut self,
+        address: Address,
+        block_height: u64,
+        total_supply: U256,
+    ) -> Result<U256> {
         // Check cache first
         if let Some(&cached_power) = self.voting_power_cache.get(&(address, block_height)) {
             return Ok(cached_power);
@@ -344,12 +375,17 @@ impl GovernanceManager {
 
         // Base voting power (token balance at snapshot)
         // In a real implementation, this would query the token balance at specific block
-        let base_power = total_supply.checked_div(U256::from(1000)).unwrap_or_default(); // Placeholder
+        let base_power = total_supply
+            .checked_div(U256::from(1000))
+            .unwrap_or_default(); // Placeholder
 
         // Add delegated power
-        let delegated_power = self.delegations.get(&address)
+        let delegated_power = self
+            .delegations
+            .get(&address)
             .map(|delegations| {
-                delegations.iter()
+                delegations
+                    .iter()
                     .filter(|d| d.valid_from <= block_height)
                     .map(|d| d.delegated_amount)
                     .fold(U256::zero(), |acc, amount| acc.saturating_add(amount))
@@ -357,7 +393,8 @@ impl GovernanceManager {
             .unwrap_or(U256::zero());
 
         let total_power = base_power.saturating_add(delegated_power);
-        self.voting_power_cache.insert((address, block_height), total_power);
+        self.voting_power_cache
+            .insert((address, block_height), total_power);
 
         Ok(total_power)
     }
@@ -369,7 +406,8 @@ impl GovernanceManager {
 
     /// Get all active proposals
     pub fn get_active_proposals(&self) -> Vec<&Proposal> {
-        self.proposals.values()
+        self.proposals
+            .values()
             .filter(|p| matches!(p.status, ProposalStatus::Active))
             .collect()
     }
@@ -389,7 +427,11 @@ impl GovernanceManager {
         let as_percentage = |v: U256| -> Result<u8> {
             let n = as_u64(v)?;
             if !(1..=100).contains(&n) {
-                return Err(anyhow!("percentage {} out of range 1..=100 for '{}'", n, parameter));
+                return Err(anyhow!(
+                    "percentage {} out of range 1..=100 for '{}'",
+                    n,
+                    parameter
+                ));
             }
             Ok(n as u8)
         };
@@ -428,17 +470,19 @@ mod tests {
         let proposer = Address([1; 20]);
         let balance = config.proposal_threshold;
 
-        let proposal_id = gov.create_proposal(
-            proposer,
-            ProposalType::ParameterChange {
-                parameter: "block_reward".to_string(),
-                new_value: U256::from(15),
-            },
-            "Increase block reward".to_string(),
-            "Proposal to increase block reward to 15 SALT".to_string(),
-            100,
-            balance,
-        ).unwrap();
+        let proposal_id = gov
+            .create_proposal(
+                proposer,
+                ProposalType::ParameterChange {
+                    parameter: "block_reward".to_string(),
+                    new_value: U256::from(15),
+                },
+                "Increase block reward".to_string(),
+                "Proposal to increase block reward to 15 SALT".to_string(),
+                100,
+                balance,
+            )
+            .unwrap();
 
         assert_eq!(proposal_id, 1);
         let proposal = gov.get_proposal(1).unwrap();
@@ -455,17 +499,19 @@ mod tests {
         let total_supply = crate::salt(1_000_000_000);
 
         // Create proposal
-        let proposal_id = gov.create_proposal(
-            proposer,
-            ProposalType::ParameterChange {
-                parameter: "block_reward".to_string(),
-                new_value: U256::from(15),
-            },
-            "Test proposal".to_string(),
-            "Test description".to_string(),
-            100,
-            config.proposal_threshold,
-        ).unwrap();
+        let proposal_id = gov
+            .create_proposal(
+                proposer,
+                ProposalType::ParameterChange {
+                    parameter: "block_reward".to_string(),
+                    new_value: U256::from(15),
+                },
+                "Test proposal".to_string(),
+                "Test description".to_string(),
+                100,
+                config.proposal_threshold,
+            )
+            .unwrap();
 
         // Vote on proposal
         let result = gov.vote(proposal_id, voter, VoteType::For, 102, total_supply);
@@ -521,17 +567,19 @@ mod tests {
         let mut gov = GovernanceManager::new(config.clone());
         let proposer = Address([1; 20]);
 
-        let proposal_id = gov.create_proposal(
-            proposer,
-            ProposalType::ParameterChange {
-                parameter: "block_reward".to_string(),
-                new_value: U256::from(15),
-            },
-            "Test".to_string(),
-            "Test".to_string(),
-            100,
-            config.proposal_threshold,
-        ).unwrap();
+        let proposal_id = gov
+            .create_proposal(
+                proposer,
+                ProposalType::ParameterChange {
+                    parameter: "block_reward".to_string(),
+                    new_value: U256::from(15),
+                },
+                "Test".to_string(),
+                "Test".to_string(),
+                100,
+                config.proposal_threshold,
+            )
+            .unwrap();
 
         // Manually set large vote counts to test overflow safety in process_proposals
         {
@@ -559,20 +607,23 @@ mod tests {
         let voter = Address([2; 20]);
         let total_supply = crate::salt(1_000_000_000);
 
-        let proposal_id = gov.create_proposal(
-            proposer,
-            ProposalType::ParameterChange {
-                parameter: "block_reward".to_string(),
-                new_value: U256::from(15),
-            },
-            "Test".to_string(),
-            "Test".to_string(),
-            100,
-            config.proposal_threshold,
-        ).unwrap();
+        let proposal_id = gov
+            .create_proposal(
+                proposer,
+                ProposalType::ParameterChange {
+                    parameter: "block_reward".to_string(),
+                    new_value: U256::from(15),
+                },
+                "Test".to_string(),
+                "Test".to_string(),
+                100,
+                config.proposal_threshold,
+            )
+            .unwrap();
 
         // First vote succeeds
-        gov.vote(proposal_id, voter, VoteType::For, 102, total_supply).unwrap();
+        gov.vote(proposal_id, voter, VoteType::For, 102, total_supply)
+            .unwrap();
 
         // Second vote from same voter rejected
         let result = gov.vote(proposal_id, voter, VoteType::Against, 103, total_supply);

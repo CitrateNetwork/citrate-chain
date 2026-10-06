@@ -285,7 +285,10 @@ pub(crate) fn format_latt(value: U256) -> String {
     // Format with up to 6 decimal places
     let fraction_str = format!("{:018}", fraction);
     let end = fraction_str.len().min(6);
-    let fraction_trimmed = fraction_str.get(..end).unwrap_or(&fraction_str).trim_end_matches('0');
+    let fraction_trimmed = fraction_str
+        .get(..end)
+        .unwrap_or(&fraction_str)
+        .trim_end_matches('0');
 
     if fraction_trimmed.is_empty() {
         format!("{}", whole)
@@ -328,7 +331,9 @@ mod tests {
     #[test]
     fn test_create_account_returns_valid_account() {
         let (_dir, mut wallet) = test_wallet();
-        let account = wallet.create_account("pw", Some("alice".to_string())).unwrap();
+        let account = wallet
+            .create_account("pw", Some("alice".to_string()))
+            .unwrap();
         assert_eq!(account.index, 0);
         assert_eq!(account.alias, Some("alice".to_string()));
         assert_eq!(account.balance, U256::zero());
@@ -386,7 +391,9 @@ mod tests {
     #[test]
     fn test_import_invalid_hex_fails() {
         let (_dir, mut wallet) = test_wallet();
-        let err = wallet.import_account("not_valid_hex", "pw", None).unwrap_err();
+        let err = wallet
+            .import_account("not_valid_hex", "pw", None)
+            .unwrap_err();
         match err {
             WalletError::HexDecode(_) => {}
             _ => panic!("Expected HexDecode error, got {:?}", err),
@@ -438,7 +445,9 @@ mod tests {
         let (_dir, mut wallet) = test_wallet();
         let account = wallet.create_account("pw", None).unwrap();
         assert!(wallet.get_account_by_address(&account.address).is_some());
-        assert!(wallet.get_account_by_address(&Address([0xFF; 20])).is_none());
+        assert!(wallet
+            .get_account_by_address(&Address([0xFF; 20]))
+            .is_none());
     }
 
     // ── Refresh accounts ──
@@ -460,7 +469,9 @@ mod tests {
     fn test_export_private_key_roundtrip() {
         let (_dir, mut wallet) = test_wallet();
         let secret = [99u8; 32];
-        wallet.import_account(&hex::encode(secret), "pw", None).unwrap();
+        wallet
+            .import_account(&hex::encode(secret), "pw", None)
+            .unwrap();
         wallet.unlock("pw").unwrap();
 
         let exported = wallet.export_private_key(0).unwrap();

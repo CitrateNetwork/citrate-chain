@@ -91,7 +91,12 @@ pub struct InstitutionalOperatorProfile {
 }
 
 impl InstitutionalOperatorProfile {
-    pub fn new(address: Address, institution_name: String, contact_email: String, registered_at: u64) -> Self {
+    pub fn new(
+        address: Address,
+        institution_name: String,
+        contact_email: String,
+        registered_at: u64,
+    ) -> Self {
         Self {
             address,
             institution_name,
@@ -140,7 +145,10 @@ impl InstitutionalRewardCalculator {
     }
 
     /// Calculate rewards for an operator for the current epoch
-    pub fn calculate_epoch_rewards(&self, profile: &InstitutionalOperatorProfile) -> InstitutionalRewardBreakdown {
+    pub fn calculate_epoch_rewards(
+        &self,
+        profile: &InstitutionalOperatorProfile,
+    ) -> InstitutionalRewardBreakdown {
         let wei_per_salt = U256::from(10).pow(U256::from(DECIMALS));
 
         // Check minimum uptime threshold
@@ -156,7 +164,8 @@ impl InstitutionalRewardCalculator {
         }
 
         // 1. Block validation reward (base + uptime bonus)
-        let base_validation = U256::from(self.config.block_validation_monthly_salt).saturating_mul(wei_per_salt);
+        let base_validation =
+            U256::from(self.config.block_validation_monthly_salt).saturating_mul(wei_per_salt);
         let uptime_bonus = if profile.uptime_ratio >= 0.99 {
             // Full uptime bonus for 99%+ uptime
             let bonus_bps = ((self.config.uptime_bonus_multiplier - 1.0) * 10000.0).round() as u64;
@@ -164,8 +173,12 @@ impl InstitutionalRewardCalculator {
         } else {
             // Proportional bonus scaled by uptime
             let uptime_bps = (profile.uptime_ratio * 10000.0).round() as u64;
-            let max_bonus_bps = ((self.config.uptime_bonus_multiplier - 1.0) * 10000.0).round() as u64;
-            let scaled_bps = max_bonus_bps.saturating_mul(uptime_bps).checked_div(10000).unwrap_or(0);
+            let max_bonus_bps =
+                ((self.config.uptime_bonus_multiplier - 1.0) * 10000.0).round() as u64;
+            let scaled_bps = max_bonus_bps
+                .saturating_mul(uptime_bps)
+                .checked_div(10000)
+                .unwrap_or(0);
             crate::mul_div(base_validation, U256::from(scaled_bps), U256::from(10000))
         };
         let block_validation_wei = base_validation.saturating_add(uptime_bonus);
@@ -177,18 +190,25 @@ impl InstitutionalRewardCalculator {
             .saturating_mul(wei_per_salt);
 
         // 3. Adapter creation reward (capped)
-        let rewarded_adapters = profile.adapters_created.min(self.config.max_rewarded_adapters_per_epoch);
+        let rewarded_adapters = profile
+            .adapters_created
+            .min(self.config.max_rewarded_adapters_per_epoch);
         let adapter_creation_wei = U256::from(self.config.adapter_creation_salt)
             .saturating_mul(U256::from(rewarded_adapters))
             .saturating_mul(wei_per_salt);
 
         // 4. Data provision reward (capped)
-        let rewarded_datasets = profile.datasets_contributed.min(self.config.max_rewarded_datasets_per_epoch);
+        let rewarded_datasets = profile
+            .datasets_contributed
+            .min(self.config.max_rewarded_datasets_per_epoch);
         let data_provision_wei = U256::from(self.config.data_provision_per_dataset_salt)
             .saturating_mul(U256::from(rewarded_datasets))
             .saturating_mul(wei_per_salt);
 
-        let total_wei = block_validation_wei.saturating_add(model_hosting_wei).saturating_add(adapter_creation_wei).saturating_add(data_provision_wei);
+        let total_wei = block_validation_wei
+            .saturating_add(model_hosting_wei)
+            .saturating_add(adapter_creation_wei)
+            .saturating_add(data_provision_wei);
 
         InstitutionalRewardBreakdown {
             block_validation_wei,
@@ -245,7 +265,8 @@ mod tests {
 
         // Base: 150 SALT + 20% bonus (99%+ uptime) = 180 SALT
         let expected_base = U256::from(150u64) * wei;
-        let expected_bonus = crate::mul_div(expected_base, U256::from(2000u64), U256::from(10000u64)); // 20%
+        let expected_bonus =
+            crate::mul_div(expected_base, U256::from(2000u64), U256::from(10000u64)); // 20%
         let expected = expected_base + expected_bonus;
         assert_eq!(breakdown.block_validation_wei, expected);
     }

@@ -105,9 +105,7 @@ impl SessionManager {
     /// Record a failed password attempt. Returns error if now locked out.
     pub fn record_failure(&mut self, address: &str) -> Result<(), WalletError> {
         let key = session_key(address);
-        let entry = self.failed_attempts
-            .entry(key)
-            .or_insert((0, None));
+        let entry = self.failed_attempts.entry(key).or_insert((0, None));
 
         // Check if existing lockout has expired
         if let Some(start) = entry.1 {
@@ -131,10 +129,13 @@ impl SessionManager {
     pub fn record_success(&mut self, address: &str) {
         let key = session_key(address);
         self.failed_attempts.remove(&key);
-        self.sessions.insert(key, SessionState {
-            unlocked_at: Instant::now(),
-            last_activity: Instant::now(),
-        });
+        self.sessions.insert(
+            key,
+            SessionState {
+                unlocked_at: Instant::now(),
+                last_activity: Instant::now(),
+            },
+        );
     }
 
     /// Refresh the password-verification timestamp without resetting
@@ -205,7 +206,9 @@ impl SessionManager {
         let remaining_secs = if is_active {
             self.sessions.get(&key).map(|s| {
                 let elapsed = s.last_activity.elapsed();
-                self.session_timeout.as_secs().saturating_sub(elapsed.as_secs())
+                self.session_timeout
+                    .as_secs()
+                    .saturating_sub(elapsed.as_secs())
             })
         } else {
             None
@@ -215,7 +218,9 @@ impl SessionManager {
         let lockout_remaining_secs = if is_locked_out {
             self.failed_attempts.get(&key).and_then(|(_, start)| {
                 start.map(|s| {
-                    self.lockout_duration.as_secs().saturating_sub(s.elapsed().as_secs())
+                    self.lockout_duration
+                        .as_secs()
+                        .saturating_sub(s.elapsed().as_secs())
                 })
             })
         } else {
@@ -284,14 +289,14 @@ impl SessionManager {
             // match runtime lookups regardless of which case form the
             // exporter produced.
             let key = session_key(&item.address);
-            self.failed_attempts
-                .insert(key, (item.count, started_inst));
+            self.failed_attempts.insert(key, (item.count, started_inst));
         }
     }
 
     /// Expire timed-out sessions. Returns list of expired addresses.
     pub fn expire_sessions(&mut self) -> Vec<String> {
-        let expired: Vec<String> = self.sessions
+        let expired: Vec<String> = self
+            .sessions
             .iter()
             .filter(|(_, s)| s.last_activity.elapsed() >= self.session_timeout)
             .map(|(addr, _)| addr.clone())
@@ -470,7 +475,9 @@ mod tests {
         let mut mgr = test_manager();
         let _ = mgr.record_failure("0xabc");
         let _ = mgr.record_failure("0xabc");
-        let err = mgr.record_failure("0xabc").expect_err("should be locked out");
+        let err = mgr
+            .record_failure("0xabc")
+            .expect_err("should be locked out");
         match err {
             WalletError::RateLimited(msg) => {
                 assert!(msg.contains("Locked out"));

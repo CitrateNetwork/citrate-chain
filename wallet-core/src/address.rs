@@ -139,7 +139,11 @@ pub fn to_eip55_checksum(canonical: &str) -> String {
 /// EIP-55 checksum encoding of a 40-char lowercase hex body.
 /// Returns the 40-char mixed-case body (no `0x` prefix).
 fn eip55_checksum_body(lowercase_body: &str) -> String {
-    debug_assert_eq!(lowercase_body.len(), 40, "EIP-55 input must be 40 hex chars");
+    debug_assert_eq!(
+        lowercase_body.len(),
+        40,
+        "EIP-55 input must be 40 hex chars"
+    );
     let hash = Keccak256::digest(lowercase_body.as_bytes());
     let mut out = String::with_capacity(40);
     for (i, ch) in lowercase_body.chars().enumerate() {
@@ -218,8 +222,7 @@ mod tests {
 
     #[test]
     fn test_k1_5_rejects_short_address() {
-        let err =
-            canonicalize("0xabc").expect_err("too-short address must be rejected");
+        let err = canonicalize("0xabc").expect_err("too-short address must be rejected");
         assert!(matches!(err, AddressError::InvalidLength { .. }));
     }
 

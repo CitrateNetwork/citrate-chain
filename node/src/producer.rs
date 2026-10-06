@@ -1387,9 +1387,9 @@ impl BlockProducer {
         let next_height = last_height
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("parent height {last_height} cannot be extended"))?;
-        let blue_score = parent_blue_score
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("parent blue score {parent_blue_score} cannot be extended"))?;
+        let blue_score = parent_blue_score.checked_add(1).ok_or_else(|| {
+            anyhow::anyhow!("parent blue score {parent_blue_score} cannot be extended")
+        })?;
         blue_set.score = blue_score;
         blue_set.work = parent_blue_work; // base; calculate_blue_work below recomputes
 

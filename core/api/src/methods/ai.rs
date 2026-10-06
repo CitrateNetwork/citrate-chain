@@ -755,7 +755,9 @@ impl AiApi {
         // In production, this would need rate limiting and access control
 
         // Estimate token counts from messages
-        let prompt_tokens: u32 = request.messages.iter()
+        let prompt_tokens: u32 = request
+            .messages
+            .iter()
             .map(|m| (m.content.len() / 4) as u32)
             .sum();
 
@@ -778,9 +780,7 @@ impl AiApi {
             "bge-m3" => "bge-m3-fp16.gguf",
             "qwen2-0.5b" | "qwen" | "qwen2.5" | "qwen2.5-1.5b" => "qwen2.5-1.5b-instruct-q4_0.gguf",
             other => {
-                return Err(ApiError::InvalidParams(format!(
-                    "unknown model: {other:?}"
-                )));
+                return Err(ApiError::InvalidParams(format!("unknown model: {other:?}")));
             }
         };
 
@@ -796,7 +796,8 @@ impl AiApi {
         ];
 
         // First try exact filename match
-        let mut model_path: Option<PathBuf> = model_dirs.iter()
+        let mut model_path: Option<PathBuf> = model_dirs
+            .iter()
             .map(|dir| dir.join(model_filename))
             .find(|p| p.exists());
 
@@ -812,7 +813,9 @@ impl AiApi {
                             break;
                         }
                     }
-                    if model_path.is_some() { break; }
+                    if model_path.is_some() {
+                        break;
+                    }
                 }
             }
         }
@@ -830,22 +833,20 @@ impl AiApi {
 
         // Create GGUF engine for inference
         let gguf_config = GGUFEngineConfig {
-            llama_cpp_path: PathBuf::from(
-                std::env::var("LLAMA_CPP_PATH")
-                    .unwrap_or_else(|_| {
-                        dirs::home_dir()
-                            .unwrap_or_else(|| PathBuf::from("."))
-                            .join("llama.cpp")
-                            .to_string_lossy()
-                            .to_string()
-                    })
-            ),
+            llama_cpp_path: PathBuf::from(std::env::var("LLAMA_CPP_PATH").unwrap_or_else(|_| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("llama.cpp")
+                    .to_string_lossy()
+                    .to_string()
+            })),
             models_dir: PathBuf::from(".citrate/models"),
             context_size: 4096,
             threads: 4,
         };
-        let gguf_engine = GGUFEngine::new(gguf_config)
-            .map_err(|e| ApiError::InternalError(format!("Failed to initialize GGUF engine: {}", e)))?;
+        let gguf_engine = GGUFEngine::new(gguf_config).map_err(|e| {
+            ApiError::InternalError(format!("Failed to initialize GGUF engine: {}", e))
+        })?;
 
         // Generate text using llama.cpp
         let generated_text = gguf_engine
@@ -928,7 +929,8 @@ impl AiApi {
                     // Convert hash to normalized embedding vector
                     (0..embedding_dim)
                         .map(|i| {
-                            let value = hash.iter().cycle().nth(i).copied().unwrap_or(0) as f32 / 255.0;
+                            let value =
+                                hash.iter().cycle().nth(i).copied().unwrap_or(0) as f32 / 255.0;
                             (value - 0.5) * 2.0 // Normalize to [-1, 1]
                         })
                         .collect()
@@ -1037,7 +1039,10 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 100);
         assert_eq!(usage.completion_tokens, 50);
         assert_eq!(usage.total_tokens, 150);
-        assert_eq!(usage.total_tokens, usage.prompt_tokens + usage.completion_tokens);
+        assert_eq!(
+            usage.total_tokens,
+            usage.prompt_tokens + usage.completion_tokens
+        );
     }
 
     #[test]

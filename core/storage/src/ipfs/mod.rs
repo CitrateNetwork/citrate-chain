@@ -13,10 +13,10 @@ use std::collections::HashMap;
 
 pub mod chunking;
 pub mod daemon;
-pub mod pinning;
 pub mod encrypted_store;
+pub mod pinning;
 
-pub use daemon::{IpfsDaemon, DaemonConfig, DaemonStatus, HealthStatus, NodeInfo};
+pub use daemon::{DaemonConfig, DaemonStatus, HealthStatus, IpfsDaemon, NodeInfo};
 
 /// IPFS Content Identifier
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]

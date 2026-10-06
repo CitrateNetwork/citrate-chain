@@ -209,11 +209,8 @@ impl SnapMinter {
         };
 
         // Compute receipt hash
-        let receipt_hash = self.compute_receipt_hash(
-            &deposit.event_id,
-            &deposit.recipient,
-            salt_amount,
-        );
+        let receipt_hash =
+            self.compute_receipt_hash(&deposit.event_id, &deposit.recipient, salt_amount);
 
         // Update running totals
         self.total_deposited_eth += deposit.amount_eth;

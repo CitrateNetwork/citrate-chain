@@ -220,7 +220,8 @@ impl SearchEngine {
     /// Get trending models (most interacted with)
     pub async fn get_trending_models(&self, limit: usize) -> Result<Vec<MarketplaceModel>> {
         // For simplicity, just return models sorted by name for now
-        let mut models: Vec<MarketplaceModel> = self.models
+        let mut models: Vec<MarketplaceModel> = self
+            .models
             .iter()
             .map(|entry| entry.value().clone())
             .collect();
@@ -232,7 +233,11 @@ impl SearchEngine {
     }
 
     /// Get similar models based on tags and category
-    pub async fn get_similar_models(&self, model_id: &ModelId, limit: usize) -> Result<Vec<MarketplaceModel>> {
+    pub async fn get_similar_models(
+        &self,
+        model_id: &ModelId,
+        limit: usize,
+    ) -> Result<Vec<MarketplaceModel>> {
         let target_model = match self.models.get(model_id) {
             Some(model) => model.value().clone(),
             None => return Ok(Vec::new()),
@@ -286,7 +291,8 @@ impl SearchEngine {
             .filter(|token| token.len() > 2)
             .map(|token| {
                 // Remove punctuation
-                token.chars()
+                token
+                    .chars()
                     .filter(|c| c.is_alphanumeric())
                     .collect::<String>()
             })
@@ -301,18 +307,28 @@ impl SearchEngine {
             let query_tokens = self.tokenize(&query.text);
             let model_text = format!(
                 "{} {} {} {}",
-                model.name, model.description, model.framework, model.tags.join(" ")
+                model.name,
+                model.description,
+                model.framework,
+                model.tags.join(" ")
             );
             let model_tokens = self.tokenize(&model_text);
 
             // Simple TF scoring
             for query_token in &query_tokens {
-                let count = model_tokens.iter().filter(|&token| token == query_token).count();
+                let count = model_tokens
+                    .iter()
+                    .filter(|&token| token == query_token)
+                    .count();
                 score += count as f32;
             }
 
             // Boost for exact name matches
-            if model.name.to_lowercase().contains(&query.text.to_lowercase()) {
+            if model
+                .name
+                .to_lowercase()
+                .contains(&query.text.to_lowercase())
+            {
                 score += 10.0;
             }
         } else {
@@ -399,7 +415,11 @@ impl SearchEngine {
             };
             let pos = clamp_boundary(pos);
             let start = clamp_boundary(pos.saturating_sub(50));
-            let end = clamp_boundary(pos.saturating_add(query.len()).saturating_add(50).min(text.len()));
+            let end = clamp_boundary(
+                pos.saturating_add(query.len())
+                    .saturating_add(50)
+                    .min(text.len()),
+            );
 
             let mut snippet = text.get(start..end).unwrap_or_default().to_string();
             if start > 0 {
@@ -418,7 +438,11 @@ impl SearchEngine {
     fn sort_results(&self, results: &mut [SearchResult], query: &SearchQuery) {
         match query.sort_by.as_ref().unwrap_or(&SortOrder::Relevance) {
             SortOrder::Relevance => {
-                results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+                results.sort_by(|a, b| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
             }
             SortOrder::Price => {
                 results.sort_by_key(|a| a.model.base_price);
@@ -443,7 +467,13 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
-    fn create_test_model(id: u8, name: &str, category: ModelCategory, framework: &str, tags: Vec<&str>) -> MarketplaceModel {
+    fn create_test_model(
+        id: u8,
+        name: &str,
+        category: ModelCategory,
+        framework: &str,
+        tags: Vec<&str>,
+    ) -> MarketplaceModel {
         let mut model_id = [0u8; 32];
         model_id[0] = id;
 
@@ -496,7 +526,13 @@ mod tests {
     #[tokio::test]
     async fn test_index_and_search_model() {
         let engine = SearchEngine::new("/tmp/test_index").await.unwrap();
-        let model = create_test_model(1, "Language Model Clone", ModelCategory::LanguageModel, "PyTorch", vec!["nlp", "llm"]);
+        let model = create_test_model(
+            1,
+            "Language Model Clone",
+            ModelCategory::LanguageModel,
+            "PyTorch",
+            vec!["nlp", "llm"],
+        );
 
         engine.index_model(&model).await.unwrap();
 
@@ -514,8 +550,20 @@ mod tests {
     async fn test_search_by_category() {
         let engine = SearchEngine::new("/tmp/test_index").await.unwrap();
 
-        let model1 = create_test_model(1, "LLM Model", ModelCategory::LanguageModel, "PyTorch", vec!["nlp"]);
-        let model2 = create_test_model(2, "Image Model", ModelCategory::ImageGeneration, "TensorFlow", vec!["vision"]);
+        let model1 = create_test_model(
+            1,
+            "LLM Model",
+            ModelCategory::LanguageModel,
+            "PyTorch",
+            vec!["nlp"],
+        );
+        let model2 = create_test_model(
+            2,
+            "Image Model",
+            ModelCategory::ImageGeneration,
+            "TensorFlow",
+            vec!["vision"],
+        );
 
         engine.index_model(&model1).await.unwrap();
         engine.index_model(&model2).await.unwrap();
@@ -534,8 +582,20 @@ mod tests {
     async fn test_search_by_price_range() {
         let engine = SearchEngine::new("/tmp/test_index").await.unwrap();
 
-        let model1 = create_test_model(1, "Cheap Model", ModelCategory::Embedding, "PyTorch", vec![]);
-        let model2 = create_test_model(5, "Expensive Model", ModelCategory::Embedding, "PyTorch", vec![]);
+        let model1 = create_test_model(
+            1,
+            "Cheap Model",
+            ModelCategory::Embedding,
+            "PyTorch",
+            vec![],
+        );
+        let model2 = create_test_model(
+            5,
+            "Expensive Model",
+            ModelCategory::Embedding,
+            "PyTorch",
+            vec![],
+        );
 
         engine.index_model(&model1).await.unwrap();
         engine.index_model(&model2).await.unwrap();
@@ -554,8 +614,20 @@ mod tests {
     async fn test_search_by_tags() {
         let engine = SearchEngine::new("/tmp/test_index").await.unwrap();
 
-        let model1 = create_test_model(1, "NLP Model", ModelCategory::LanguageModel, "PyTorch", vec!["nlp", "transformer"]);
-        let model2 = create_test_model(2, "Vision Model", ModelCategory::ImageClassification, "TensorFlow", vec!["cnn", "vision"]);
+        let model1 = create_test_model(
+            1,
+            "NLP Model",
+            ModelCategory::LanguageModel,
+            "PyTorch",
+            vec!["nlp", "transformer"],
+        );
+        let model2 = create_test_model(
+            2,
+            "Vision Model",
+            ModelCategory::ImageClassification,
+            "TensorFlow",
+            vec!["cnn", "vision"],
+        );
 
         engine.index_model(&model1).await.unwrap();
         engine.index_model(&model2).await.unwrap();
@@ -593,15 +665,36 @@ mod tests {
     async fn test_get_similar_models() {
         let engine = SearchEngine::new("/tmp/test_index").await.unwrap();
 
-        let model1 = create_test_model(1, "PyTorch LLM", ModelCategory::LanguageModel, "PyTorch", vec!["nlp", "llm"]);
-        let model2 = create_test_model(2, "Another PyTorch LLM", ModelCategory::LanguageModel, "PyTorch", vec!["nlp", "transformer"]);
-        let model3 = create_test_model(3, "TensorFlow Vision", ModelCategory::ImageGeneration, "TensorFlow", vec!["vision"]);
+        let model1 = create_test_model(
+            1,
+            "PyTorch LLM",
+            ModelCategory::LanguageModel,
+            "PyTorch",
+            vec!["nlp", "llm"],
+        );
+        let model2 = create_test_model(
+            2,
+            "Another PyTorch LLM",
+            ModelCategory::LanguageModel,
+            "PyTorch",
+            vec!["nlp", "transformer"],
+        );
+        let model3 = create_test_model(
+            3,
+            "TensorFlow Vision",
+            ModelCategory::ImageGeneration,
+            "TensorFlow",
+            vec!["vision"],
+        );
 
         engine.index_model(&model1).await.unwrap();
         engine.index_model(&model2).await.unwrap();
         engine.index_model(&model3).await.unwrap();
 
-        let similar = engine.get_similar_models(&model1.model_id, 5).await.unwrap();
+        let similar = engine
+            .get_similar_models(&model1.model_id, 5)
+            .await
+            .unwrap();
 
         // Model 2 should be more similar to Model 1 than Model 3
         assert!(!similar.is_empty());
@@ -615,8 +708,15 @@ mod tests {
     async fn test_get_trending_models() {
         let engine = SearchEngine::new("/tmp/test_index").await.unwrap();
 
-        let model1 = create_test_model(1, "Alpha Model", ModelCategory::Embedding, "PyTorch", vec![]);
-        let model2 = create_test_model(2, "Beta Model", ModelCategory::Embedding, "PyTorch", vec![]);
+        let model1 = create_test_model(
+            1,
+            "Alpha Model",
+            ModelCategory::Embedding,
+            "PyTorch",
+            vec![],
+        );
+        let model2 =
+            create_test_model(2, "Beta Model", ModelCategory::Embedding, "PyTorch", vec![]);
 
         engine.index_model(&model1).await.unwrap();
         engine.index_model(&model2).await.unwrap();
@@ -631,7 +731,13 @@ mod tests {
 
         // Add 5 models with different prices for deterministic sorting
         for i in 1..=5 {
-            let mut model = create_test_model(i, &format!("Model {}", i), ModelCategory::Embedding, "PyTorch", vec![]);
+            let mut model = create_test_model(
+                i,
+                &format!("Model {}", i),
+                ModelCategory::Embedding,
+                "PyTorch",
+                vec![],
+            );
             model.base_price = (i as u64) * 100; // Prices: 100, 200, 300, 400, 500
             engine.index_model(&model).await.unwrap();
         }

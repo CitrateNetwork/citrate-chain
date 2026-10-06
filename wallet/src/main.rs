@@ -13,13 +13,13 @@
 )]
 
 use anyhow::Result;
+use citrate_execution::types::Address;
+use citrate_wallet::{Wallet, WalletConfig};
 use clap::{Parser, Subcommand};
 use colored::*;
 use console::Term;
 use dialoguer::{Input, Password, Select};
 use indicatif::{ProgressBar, ProgressStyle};
-use citrate_execution::types::Address;
-use citrate_wallet::{Wallet, WalletConfig};
 use primitive_types::U256;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -626,7 +626,10 @@ fn format_latt(wei: U256) -> String {
     // Format with up to 6 decimal places
     let fraction_str = format!("{:018}", fraction);
     let fraction_trimmed = if fraction_str.len() >= 6 {
-        fraction_str.get(..6).unwrap_or(&fraction_str).trim_end_matches('0')
+        fraction_str
+            .get(..6)
+            .unwrap_or(&fraction_str)
+            .trim_end_matches('0')
     } else {
         fraction_str.trim_end_matches('0')
     };

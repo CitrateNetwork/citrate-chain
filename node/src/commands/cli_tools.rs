@@ -64,7 +64,9 @@ pub async fn execute(
                 CliToolCommands::Governance(cmd) => governance::execute(cmd, &config).await,
                 CliToolCommands::Advanced(cmd) => advanced::execute(cmd, &config).await,
                 CliToolCommands::Wizard(cmd) => wizard::execute(cmd, &config).await,
-                CliToolCommands::CliInit { .. } => Err(anyhow::anyhow!("cli-init is handled before dispatch")),
+                CliToolCommands::CliInit { .. } => {
+                    Err(anyhow::anyhow!("cli-init is handled before dispatch"))
+                }
             }
         }
     }

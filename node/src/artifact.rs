@@ -205,7 +205,12 @@ impl ArtifactService for NodeArtifactService {
             .json()
             .await
             .map_err(|e| ExecutionError::Reverted(format!("ipfs add parse error: {}", e)))?;
-        let cid = json.get("Hash").unwrap_or(&serde_json::Value::Null).as_str().unwrap_or("").to_string();
+        let cid = json
+            .get("Hash")
+            .unwrap_or(&serde_json::Value::Null)
+            .as_str()
+            .unwrap_or("")
+            .to_string();
         if cid.is_empty() {
             return Err(ExecutionError::Reverted(
                 "ipfs add returned empty cid".into(),

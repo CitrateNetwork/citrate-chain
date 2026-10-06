@@ -66,7 +66,8 @@ pub fn sign_permit(signing_key: &[u8; 32], digest: H256) -> Result<[u8; 65], Per
     let eth_hash = eth_signed_message_hash(digest);
 
     // Use prehash signer so we can sign the 32-byte hash directly.
-    let (signature, recovery_id): (Signature, RecoveryId) = key.sign_prehash(eth_hash.as_bytes())?;
+    let (signature, recovery_id): (Signature, RecoveryId) =
+        key.sign_prehash(eth_hash.as_bytes())?;
     let r = signature.r().to_bytes();
     let s = signature.s().to_bytes();
     // Recovery ids are 0..=3, so this cannot wrap.

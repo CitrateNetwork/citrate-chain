@@ -112,7 +112,10 @@ fn mcopy_executes_under_cancun() {
         output[1..].iter().all(|&b| b == 0),
         "uninitialised memory must read as zero per EVM spec"
     );
-    assert!(gas_used > 21_000, "real execution must consume more than the base tx cost");
+    assert!(
+        gas_used > 21_000,
+        "real execution must consume more than the base tx cost"
+    );
 }
 
 /// MCOPY zero-length is a no-op (per EIP-5656). Verifies the opcode
@@ -215,7 +218,11 @@ fn dynamic_string_return_via_mcopy() {
     assert_eq!(length, U256::from(3u64), "ABI length chunk must be 3");
 
     // Decode chunk 2: bytes 0..3 = "abc", rest padding
-    assert_eq!(&output[64..67], b"abc", "first 3 bytes of data chunk must be 'abc'");
+    assert_eq!(
+        &output[64..67],
+        b"abc",
+        "first 3 bytes of data chunk must be 'abc'"
+    );
     assert!(
         output[67..96].iter().all(|&b| b == 0),
         "remaining 29 bytes of data chunk must be zero-padded"

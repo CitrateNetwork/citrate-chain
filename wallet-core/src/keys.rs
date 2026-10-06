@@ -94,7 +94,9 @@ pub(crate) fn argon2_for_version(version: u32) -> Result<argon2::Argon2<'static>
         }
         KDF_VERSION_LOW_MEMORY => {
             let params = Params::new(46336, 1, 1, Some(32)).map_err(|e| {
-                WalletError::KeyGeneration(format!("WAL-01: Argon2 low-memory params rejected: {e}"))
+                WalletError::KeyGeneration(format!(
+                    "WAL-01: Argon2 low-memory params rejected: {e}"
+                ))
             })?;
             Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
         }
@@ -144,9 +146,7 @@ impl UnifiedKey {
                 let pubkey = key.verifying_key().to_bytes();
                 derive_address_from_ed25519(&pubkey)
             }
-            UnifiedKey::Secp256k1(key) => {
-                derive_address_from_secp256k1(key)
-            }
+            UnifiedKey::Secp256k1(key) => derive_address_from_secp256k1(key),
         }
     }
 
@@ -281,8 +281,9 @@ impl KeyManager {
         }
 
         // Generate BIP39 mnemonic (24 words = 256 bits of entropy)
-        let mnemonic_obj = bip39::Mnemonic::generate(24)
-            .map_err(|e| WalletError::KeyGeneration(format!("Mnemonic generation failed: {}", e)))?;
+        let mnemonic_obj = bip39::Mnemonic::generate(24).map_err(|e| {
+            WalletError::KeyGeneration(format!("Mnemonic generation failed: {}", e))
+        })?;
         let mnemonic = mnemonic_obj.to_string();
 
         // WAL-04: Derive Ed25519 key from mnemonic seed (first 32 bytes of
@@ -402,7 +403,8 @@ impl KeyManager {
         let entries = self.entries_read();
         if entries.iter().any(|e| e.address == address) {
             return Err(WalletError::KeyGeneration(format!(
-                "Account {} already exists", address
+                "Account {} already exists",
+                address
             )));
         }
         drop(entries);
@@ -431,7 +433,8 @@ impl KeyManager {
 
         let signing_key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
         let address = derive_address_from_secp256k1(&signing_key);
-        let public_key_hex = hex::encode(UnifiedKey::Secp256k1(signing_key.clone()).public_key_bytes());
+        let public_key_hex =
+            hex::encode(UnifiedKey::Secp256k1(signing_key.clone()).public_key_bytes());
         // WAL-04: zeroize the secp256k1 secret bytes on drop. The k256
         // SigningKey itself zeroizes via the k256 crate's Drop impl, but
         // the intermediate `[u8; 32]` here is a fresh copy that needs
@@ -473,7 +476,9 @@ impl KeyManager {
                         }
                         KeyType::Secp256k1 => {
                             let sk = k256::ecdsa::SigningKey::from_bytes((&*secret_bytes).into())
-                                .map_err(|e| WalletError::Decryption(format!("Invalid secp256k1 key: {}", e)))?;
+                                .map_err(|e| {
+                                WalletError::Decryption(format!("Invalid secp256k1 key: {}", e))
+                            })?;
                             UnifiedKey::Secp256k1(sk)
                         }
                     };
@@ -636,11 +641,7 @@ impl KeyManager {
     }
 
     /// Export private key hex for the given address (requires password).
-    pub fn export_private_key(
-        &self,
-        address: &str,
-        password: &str,
-    ) -> Result<String, WalletError> {
+    pub fn export_private_key(&self, address: &str, password: &str) -> Result<String, WalletError> {
         let entries = self.entries_read();
         let entry = entries
             .iter()
@@ -742,15 +743,15 @@ const BIP44_EVM_PATH_PREFIX: &str = "m/44'/60'/0'/0";
 /// does NOT implement Zeroize/Drop on `ExtendedKeyAttrs`, so the XPrv's
 /// chain code is left as stack residue (not zeroized) — low impact, since
 /// the chain code is not the private scalar and the leaf key IS zeroized.
-pub fn secp256k1_from_seed(
-    seed: &[u8],
-    account_index: u32,
-) -> Result<UnifiedKey, WalletError> {
+pub fn secp256k1_from_seed(seed: &[u8], account_index: u32) -> Result<UnifiedKey, WalletError> {
     use core::str::FromStr;
 
     let path_str = format!("{}/{}", BIP44_EVM_PATH_PREFIX, account_index);
     let path = bip32::DerivationPath::from_str(&path_str).map_err(|e| {
-        WalletError::KeyGeneration(format!("BIP44: invalid derivation path {}: {}", path_str, e))
+        WalletError::KeyGeneration(format!(
+            "BIP44: invalid derivation path {}: {}",
+            path_str, e
+        ))
     })?;
 
     // XPrv::derive_from_path runs the BIP32 HMAC-SHA512 child-key ladder
@@ -811,7 +812,14 @@ fn encrypt_key(
     public_key_hex: &str,
     label: &str,
 ) -> Result<EncryptedKeyEntry, WalletError> {
-    encrypt_key_raw(&signing_key.to_bytes(), password, address, public_key_hex, label, KeyType::Ed25519)
+    encrypt_key_raw(
+        &signing_key.to_bytes(),
+        password,
+        address,
+        public_key_hex,
+        label,
+        KeyType::Ed25519,
+    )
 }
 
 // =========================================================================
@@ -844,7 +852,10 @@ const KEYSTORE_AAD_DOMAIN: &[u8] = b"citrate-keystore-v2";
 #[cfg(feature = "native")]
 fn keystore_v2_aad(kdf_version: u32, key_type: KeyType, address: &str) -> Vec<u8> {
     let mut aad = Vec::with_capacity(
-        KEYSTORE_AAD_DOMAIN.len().saturating_add(5).saturating_add(address.len()),
+        KEYSTORE_AAD_DOMAIN
+            .len()
+            .saturating_add(5)
+            .saturating_add(address.len()),
     );
     aad.extend_from_slice(KEYSTORE_AAD_DOMAIN);
     aad.extend_from_slice(&kdf_version.to_le_bytes());
@@ -1023,7 +1034,9 @@ mod tests {
     async fn test_create_account() {
         let path = test_keystore();
         let mgr = KeyManager::new(&path);
-        let result = mgr.create_account("strongpassword1", "Primary").expect("create account");
+        let result = mgr
+            .create_account("strongpassword1", "Primary")
+            .expect("create account");
         assert!(result.address.starts_with("0x"));
         assert_eq!(result.address.len(), 42);
         assert!(!result.public_key_hex.is_empty());
@@ -1044,7 +1057,9 @@ mod tests {
     async fn test_unlock_and_sign() {
         let path = test_keystore();
         let mgr = KeyManager::new(&path);
-        let result = mgr.create_account("testpassword1", "Primary").expect("create");
+        let result = mgr
+            .create_account("testpassword1", "Primary")
+            .expect("create");
         let count = mgr.unlock("testpassword1").expect("unlock");
         assert_eq!(count, 1);
         let key = mgr.get_signing_key(&result.address).expect("get key");
@@ -1056,7 +1071,8 @@ mod tests {
     async fn test_wrong_password_rejected() {
         let path = test_keystore();
         let mgr = KeyManager::new(&path);
-        mgr.create_account("correctpassword", "Primary").expect("create");
+        mgr.create_account("correctpassword", "Primary")
+            .expect("create");
         let result = mgr.unlock("wrongpassword!");
         assert!(matches!(result, Err(WalletError::InvalidPassword)));
         std::fs::remove_dir_all(&path).ok();
@@ -1066,7 +1082,9 @@ mod tests {
     async fn test_lock_clears_keys() {
         let path = test_keystore();
         let mgr = KeyManager::new(&path);
-        let result = mgr.create_account("testpassword1", "Primary").expect("create");
+        let result = mgr
+            .create_account("testpassword1", "Primary")
+            .expect("create");
         mgr.unlock("testpassword1").expect("unlock");
         assert!(mgr.is_unlocked());
         mgr.lock();
@@ -1079,7 +1097,9 @@ mod tests {
     async fn test_persist_and_reload() {
         let path = test_keystore();
         let mgr = KeyManager::new(&path);
-        let result = mgr.create_account("testpassword1", "Primary").expect("create");
+        let result = mgr
+            .create_account("testpassword1", "Primary")
+            .expect("create");
 
         // Create new manager pointing to same path
         let mgr2 = KeyManager::new(&path);
@@ -1104,7 +1124,9 @@ mod tests {
         let key = Ed25519SigningKey::generate(&mut rand::rngs::OsRng);
         let key_hex = hex::encode(key.to_bytes());
 
-        let result = mgr.import_account(&key_hex, "testpassword1", "Imported").expect("import");
+        let result = mgr
+            .import_account(&key_hex, "testpassword1", "Imported")
+            .expect("import");
         assert!(result.address.starts_with("0x"));
         assert!(result.mnemonic.is_empty()); // no mnemonic for imports
 
@@ -1123,7 +1145,8 @@ mod tests {
         let key = Ed25519SigningKey::generate(&mut rand::rngs::OsRng);
         let key_hex = hex::encode(key.to_bytes());
 
-        mgr.import_account(&key_hex, "testpassword1", "First").expect("import 1");
+        mgr.import_account(&key_hex, "testpassword1", "First")
+            .expect("import 1");
         let result = mgr.import_account(&key_hex, "testpassword1", "Duplicate");
         assert!(result.is_err());
 
@@ -1152,10 +1175,13 @@ mod tests {
     async fn test_delete_account() {
         let path = test_keystore();
         let mgr = KeyManager::new(&path);
-        let result = mgr.create_account("testpassword1", "Primary").expect("create");
+        let result = mgr
+            .create_account("testpassword1", "Primary")
+            .expect("create");
         assert!(!mgr.is_empty());
 
-        mgr.delete_account(&result.address, "testpassword1").expect("delete");
+        mgr.delete_account(&result.address, "testpassword1")
+            .expect("delete");
         assert!(mgr.is_empty());
 
         std::fs::remove_dir_all(&path).ok();
@@ -1165,7 +1191,9 @@ mod tests {
     async fn test_delete_wrong_password_rejected() {
         let path = test_keystore();
         let mgr = KeyManager::new(&path);
-        let result = mgr.create_account("testpassword1", "Primary").expect("create");
+        let result = mgr
+            .create_account("testpassword1", "Primary")
+            .expect("create");
         let del = mgr.delete_account(&result.address, "wrongpassword");
         assert!(del.is_err());
         assert!(!mgr.is_empty()); // still there
@@ -1176,9 +1204,13 @@ mod tests {
     async fn test_export_private_key() {
         let path = test_keystore();
         let mgr = KeyManager::new(&path);
-        let result = mgr.create_account("testpassword1", "Primary").expect("create");
+        let result = mgr
+            .create_account("testpassword1", "Primary")
+            .expect("create");
 
-        let exported = mgr.export_private_key(&result.address, "testpassword1").expect("export");
+        let exported = mgr
+            .export_private_key(&result.address, "testpassword1")
+            .expect("export");
         assert_eq!(exported.len(), 64); // 32 bytes hex
         std::fs::remove_dir_all(&path).ok();
     }
@@ -1187,7 +1219,9 @@ mod tests {
     async fn test_export_wrong_password_rejected() {
         let path = test_keystore();
         let mgr = KeyManager::new(&path);
-        let result = mgr.create_account("testpassword1", "Primary").expect("create");
+        let result = mgr
+            .create_account("testpassword1", "Primary")
+            .expect("create");
         let export = mgr.export_private_key(&result.address, "wrongpassword");
         assert!(export.is_err());
         std::fs::remove_dir_all(&path).ok();
@@ -1197,9 +1231,12 @@ mod tests {
     async fn test_multiple_accounts() {
         let path = test_keystore();
         let mgr = KeyManager::new(&path);
-        mgr.create_account("testpassword1", "Account 1").expect("create 1");
-        mgr.create_account("testpassword1", "Account 2").expect("create 2");
-        mgr.create_account("testpassword1", "Account 3").expect("create 3");
+        mgr.create_account("testpassword1", "Account 1")
+            .expect("create 1");
+        mgr.create_account("testpassword1", "Account 2")
+            .expect("create 2");
+        mgr.create_account("testpassword1", "Account 3")
+            .expect("create 3");
 
         let accounts = mgr.list_accounts();
         assert_eq!(accounts.len(), 3);
@@ -1280,9 +1317,15 @@ mod tests {
     async fn test_create_account_has_24_word_mnemonic() {
         let path = test_keystore();
         let mgr = KeyManager::new(&path);
-        let result = mgr.create_account("strongpassword1", "Primary").expect("create");
+        let result = mgr
+            .create_account("strongpassword1", "Primary")
+            .expect("create");
         let word_count = result.mnemonic.split_whitespace().count();
-        assert_eq!(word_count, 24, "Mnemonic should be 24 words, got {}", word_count);
+        assert_eq!(
+            word_count, 24,
+            "Mnemonic should be 24 words, got {}",
+            word_count
+        );
         std::fs::remove_dir_all(&path).ok();
     }
 
@@ -1290,17 +1333,27 @@ mod tests {
     async fn test_recover_from_mnemonic() {
         let path = test_keystore();
         let mgr = KeyManager::new(&path);
-        let created = mgr.create_account("strongpassword1", "Original").expect("create");
+        let created = mgr
+            .create_account("strongpassword1", "Original")
+            .expect("create");
 
         // Delete and recover
-        mgr.delete_account(&created.address, "strongpassword1").expect("delete");
+        mgr.delete_account(&created.address, "strongpassword1")
+            .expect("delete");
         assert!(mgr.is_empty());
 
-        let recovered = mgr.recover_from_mnemonic(&created.mnemonic, "newpassword1", "Recovered")
+        let recovered = mgr
+            .recover_from_mnemonic(&created.mnemonic, "newpassword1", "Recovered")
             .expect("recover");
 
-        assert_eq!(created.address, recovered.address, "Recovered address should match original");
-        assert_eq!(created.public_key_hex, recovered.public_key_hex, "Recovered pubkey should match");
+        assert_eq!(
+            created.address, recovered.address,
+            "Recovered address should match original"
+        );
+        assert_eq!(
+            created.public_key_hex, recovered.public_key_hex,
+            "Recovered pubkey should match"
+        );
 
         std::fs::remove_dir_all(&path).ok();
     }
@@ -1331,11 +1384,14 @@ mod tests {
     async fn test_mnemonic_produces_deterministic_key() {
         let path1 = test_keystore();
         let mgr1 = KeyManager::new(&path1);
-        let result1 = mgr1.create_account("password1234", "Test").expect("create 1");
+        let result1 = mgr1
+            .create_account("password1234", "Test")
+            .expect("create 1");
 
         let path2 = test_keystore();
         let mgr2 = KeyManager::new(&path2);
-        let result2 = mgr2.recover_from_mnemonic(&result1.mnemonic, "different!!", "Recovered")
+        let result2 = mgr2
+            .recover_from_mnemonic(&result1.mnemonic, "different!!", "Recovered")
             .expect("recover");
 
         assert_eq!(result1.address, result2.address);
@@ -1349,8 +1405,12 @@ mod tests {
     async fn test_two_accounts_have_different_mnemonics() {
         let path = test_keystore();
         let mgr = KeyManager::new(&path);
-        let a1 = mgr.create_account("strongpassword1", "Account 1").expect("create 1");
-        let a2 = mgr.create_account("strongpassword1", "Account 2").expect("create 2");
+        let a1 = mgr
+            .create_account("strongpassword1", "Account 1")
+            .expect("create 1");
+        let a2 = mgr
+            .create_account("strongpassword1", "Account 2")
+            .expect("create 2");
         assert_ne!(a1.mnemonic, a2.mnemonic);
         assert_ne!(a1.address, a2.address);
         std::fs::remove_dir_all(&path).ok();
@@ -1360,7 +1420,9 @@ mod tests {
     async fn test_recover_duplicate_rejected() {
         let path = test_keystore();
         let mgr = KeyManager::new(&path);
-        let result = mgr.create_account("strongpassword1", "Original").expect("create");
+        let result = mgr
+            .create_account("strongpassword1", "Original")
+            .expect("create");
         let dup = mgr.recover_from_mnemonic(&result.mnemonic, "strongpassword1", "Duplicate");
         assert!(dup.is_err(), "Recovering duplicate address should fail");
         std::fs::remove_dir_all(&path).ok();
@@ -1372,7 +1434,8 @@ mod tests {
     async fn test_create_secp256k1_account() {
         let path = test_keystore();
         let mgr = KeyManager::new(&path);
-        let result = mgr.create_secp256k1_account("strongpassword1", "EVM Account")
+        let result = mgr
+            .create_secp256k1_account("strongpassword1", "EVM Account")
             .expect("create secp256k1");
         assert!(result.address.starts_with("0x"));
         assert_eq!(result.address.len(), 42);
@@ -1385,7 +1448,8 @@ mod tests {
     async fn test_secp256k1_unlock_and_sign() {
         let path = test_keystore();
         let mgr = KeyManager::new(&path);
-        let result = mgr.create_secp256k1_account("strongpassword1", "EVM")
+        let result = mgr
+            .create_secp256k1_account("strongpassword1", "EVM")
             .expect("create");
         mgr.unlock("strongpassword1").expect("unlock");
         let key = mgr.get_signing_key(&result.address).expect("get key");
@@ -1403,14 +1467,21 @@ mod tests {
     async fn test_secp256k1_address_deterministic() {
         let path = test_keystore();
         let mgr = KeyManager::new(&path);
-        let r1 = mgr.create_secp256k1_account("strongpassword1", "A").expect("create 1");
+        let r1 = mgr
+            .create_secp256k1_account("strongpassword1", "A")
+            .expect("create 1");
 
         // Export and re-import
-        let privkey = mgr.export_private_key(&r1.address, "strongpassword1").expect("export");
-        mgr.delete_account(&r1.address, "strongpassword1").expect("delete");
+        let privkey = mgr
+            .export_private_key(&r1.address, "strongpassword1")
+            .expect("export");
+        mgr.delete_account(&r1.address, "strongpassword1")
+            .expect("delete");
 
         // Import the same key as Ed25519 (different address) to verify no collision
-        let _r2 = mgr.import_account(&privkey, "strongpassword1", "Re-imported").expect("import");
+        let _r2 = mgr
+            .import_account(&privkey, "strongpassword1", "Re-imported")
+            .expect("import");
         // Ed25519 and secp256k1 produce different addresses from the same secret
         // (different curves, different pubkey formats)
         // This is expected — the key type determines the address derivation
@@ -1423,8 +1494,11 @@ mod tests {
         let path = test_keystore();
         let mgr = KeyManager::new(&path);
 
-        let ed = mgr.create_account("strongpassword1", "Ed25519 Account").expect("create ed25519");
-        let secp = mgr.create_secp256k1_account("strongpassword1", "Secp256k1 Account")
+        let ed = mgr
+            .create_account("strongpassword1", "Ed25519 Account")
+            .expect("create ed25519");
+        let secp = mgr
+            .create_secp256k1_account("strongpassword1", "Secp256k1 Account")
             .expect("create secp256k1");
 
         let accounts = mgr.list_accounts();
@@ -1454,7 +1528,8 @@ mod tests {
     async fn test_secp256k1_persist_and_reload() {
         let path = test_keystore();
         let mgr = KeyManager::new(&path);
-        let result = mgr.create_secp256k1_account("strongpassword1", "Persist")
+        let result = mgr
+            .create_secp256k1_account("strongpassword1", "Persist")
             .expect("create");
 
         // Reload from disk
@@ -1537,9 +1612,13 @@ mod tests {
         // Named vector: the published MetaMask/standard address. Assert
         // exact EIP-55 checksum match (via address::to_eip55_checksum),
         // not just lowercase equality.
-        let key = secp256k1_from_mnemonic(ABANDON_MNEMONIC, 0)
-            .expect("canonical mnemonic must derive");
-        assert_eq!(key.key_type(), KeyType::Secp256k1, "must be a secp256k1 key");
+        let key =
+            secp256k1_from_mnemonic(ABANDON_MNEMONIC, 0).expect("canonical mnemonic must derive");
+        assert_eq!(
+            key.key_type(),
+            KeyType::Secp256k1,
+            "must be a secp256k1 key"
+        );
 
         let derived_lower = key.derive_address();
         let derived_eip55 = crate::address::to_eip55_checksum(&derived_lower);
@@ -1576,7 +1655,10 @@ mod tests {
         let k1 = secp256k1_from_mnemonic(ABANDON_MNEMONIC, 1).expect("index 1");
         let a0 = k0.derive_address();
         let a1 = k1.derive_address();
-        assert_ne!(a0, a1, "index 0 and index 1 must derive distinct addresses (HD)");
+        assert_ne!(
+            a0, a1,
+            "index 0 and index 1 must derive distinct addresses (HD)"
+        );
 
         // Determinism: re-derive index 0 and index 1.
         let a0_again = secp256k1_from_mnemonic(ABANDON_MNEMONIC, 0)
@@ -1612,14 +1694,12 @@ mod tests {
         // 32-byte message digest (stand-in for an EIP-155 signing hash).
         let msg_hash = Keccak256::digest(b"citrate B1.1.0 ecrecover round-trip");
 
-        let (signature, recovery_id): (Signature, RecoveryId) = signing_key
-            .sign_prehash(&msg_hash)
-            .expect("prehash sign");
+        let (signature, recovery_id): (Signature, RecoveryId) =
+            signing_key.sign_prehash(&msg_hash).expect("prehash sign");
 
         // ecrecover the verifying key from (hash, sig, recovery_id).
-        let recovered_vk =
-            VerifyingKey::recover_from_prehash(&msg_hash, &signature, recovery_id)
-                .expect("recover verifying key");
+        let recovered_vk = VerifyingKey::recover_from_prehash(&msg_hash, &signature, recovery_id)
+            .expect("recover verifying key");
 
         // Address of the recovered key.
         let uncompressed = recovered_vk.to_encoded_point(false);
@@ -1733,8 +1813,7 @@ mod kdf_dispatcher_tests {
     #[test]
     fn test_wal01_v2_dispatcher_differs_from_default() {
         // Mutation-killer: catches `Ok(Default::default())` in the v2 arm.
-        let v2 = argon2_for_version(KDF_VERSION_CURRENT)
-            .expect("v2 dispatcher succeeds");
+        let v2 = argon2_for_version(KDF_VERSION_CURRENT).expect("v2 dispatcher succeeds");
         let default_argon2 = argon2::Argon2::default();
         assert_ne!(
             v2.params().m_cost(),
@@ -1748,8 +1827,7 @@ mod kdf_dispatcher_tests {
     fn test_wal01_legacy_dispatcher_matches_default() {
         // The KDF_VERSION_LEGACY arm IS supposed to return Argon2::default()
         // — pin that contract so the legacy unlock path keeps working.
-        let v1 = argon2_for_version(KDF_VERSION_LEGACY)
-            .expect("v1 dispatcher succeeds");
+        let v1 = argon2_for_version(KDF_VERSION_LEGACY).expect("v1 dispatcher succeeds");
         let default_argon2 = argon2::Argon2::default();
         assert_eq!(v1.params().m_cost(), default_argon2.params().m_cost());
         assert_eq!(v1.params().t_cost(), default_argon2.params().t_cost());

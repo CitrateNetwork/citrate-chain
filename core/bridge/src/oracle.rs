@@ -138,11 +138,11 @@ fn verify_attestation_signature(
         }
     })?;
 
-    pubkey.verify(&message, &sig).map_err(|_| {
-        BridgeError::InvalidSignature {
+    pubkey
+        .verify(&message, &sig)
+        .map_err(|_| BridgeError::InvalidSignature {
             oracle_id: hex::encode(attestation.oracle_id),
-        }
-    })
+        })
 }
 
 /// Check if an attestation timestamp is within the acceptable freshness window.
@@ -200,11 +200,7 @@ impl OracleRegistry {
     }
 
     /// Register a new oracle.
-    pub fn register_oracle(
-        &mut self,
-        id: OracleId,
-        name: String,
-    ) -> Result<(), BridgeError> {
+    pub fn register_oracle(&mut self, id: OracleId, name: String) -> Result<(), BridgeError> {
         if self.oracles.contains_key(&id) {
             return Err(BridgeError::OracleAlreadyRegistered {
                 oracle_id: hex::encode(id),
@@ -302,10 +298,7 @@ impl OracleRegistry {
         }
 
         // Check for duplicate attestation from same oracle
-        let event_attestations = self
-            .attestations
-            .entry(attestation.event_id)
-            .or_default();
+        let event_attestations = self.attestations.entry(attestation.event_id).or_default();
 
         if event_attestations
             .iter()
@@ -710,8 +703,7 @@ mod tests {
             .as_secs()
             - 600; // 10 minutes ago
 
-        let message =
-            attestation_message(0, &[0u8; 32], &event_id, &event_hash, old_timestamp);
+        let message = attestation_message(0, &[0u8; 32], &event_id, &event_hash, old_timestamp);
         let sig = sk.sign(&message);
 
         let att = OracleAttestation {

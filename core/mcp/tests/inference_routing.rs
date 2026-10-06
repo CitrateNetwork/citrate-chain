@@ -7,7 +7,8 @@
 use citrate_execution::{Address, Hash};
 use citrate_mcp::registry::ModelRegistry;
 use citrate_mcp::types::{
-    ComputeRequirements, Currency, HardwareType, ModelId, ModelMetadata, PricingModel, RequestStatus,
+    ComputeRequirements, Currency, HardwareType, ModelId, ModelMetadata, PricingModel,
+    RequestStatus,
 };
 use citrate_storage::pruning::PruningConfig;
 use citrate_storage::StorageManager;
@@ -60,7 +61,11 @@ async fn test_model_registration_creates_entry() {
     let provider = Address([0xBB; 20]);
 
     let model_id = registry
-        .register(metadata.clone(), vec![provider], Some("QmTestCID".to_string()))
+        .register(
+            metadata.clone(),
+            vec![provider],
+            Some("QmTestCID".to_string()),
+        )
         .await
         .unwrap();
 
@@ -121,7 +126,10 @@ async fn test_inference_request_routes_to_provider() {
         .await
         .unwrap();
     assert_ne!(request_id_b.0, [0u8; 32]);
-    assert_ne!(request_id_a.0, request_id_b.0, "requests should have different IDs");
+    assert_ne!(
+        request_id_a.0, request_id_b.0,
+        "requests should have different IDs"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -148,7 +156,12 @@ async fn test_model_not_found_returns_error() {
 
     // Create request for unknown model → error
     let result = registry
-        .create_request(unknown_model, Hash::new([1u8; 32]), requester, U256::from(100))
+        .create_request(
+            unknown_model,
+            Hash::new([1u8; 32]),
+            requester,
+            U256::from(100),
+        )
         .await;
     assert!(result.is_err());
 }
@@ -208,10 +221,7 @@ async fn test_duplicate_model_registration_rejected() {
 
     // Second registration of same model fails
     let result = registry.register(metadata, vec![provider], None).await;
-    assert!(
-        result.is_err(),
-        "Duplicate model registration should fail"
-    );
+    assert!(result.is_err(), "Duplicate model registration should fail");
 }
 
 // ---------------------------------------------------------------------------

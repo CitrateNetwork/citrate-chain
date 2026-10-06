@@ -157,14 +157,18 @@ pub fn salt_to_wei(salt: &str) -> Result<u128, String> {
     match (parts.next(), parts.next(), parts.next()) {
         (Some(whole_str), None, None) => {
             // Whole number only
-            let whole: u128 = whole_str.parse()
+            let whole: u128 = whole_str
+                .parse()
                 .map_err(|_| format!("Invalid number: {}", whole_str))?;
             whole.checked_mul(WEI_PER_SALT).ok_or_else(too_large)
         }
         (Some(whole_str), Some(frac_str), None) => {
             // Has decimal part
-            let whole: u128 = if whole_str.is_empty() { 0 } else {
-                whole_str.parse()
+            let whole: u128 = if whole_str.is_empty() {
+                0
+            } else {
+                whole_str
+                    .parse()
                     .map_err(|_| format!("Invalid whole part: {}", whole_str))?
             };
 
@@ -174,7 +178,8 @@ pub fn salt_to_wei(salt: &str) -> Result<u128, String> {
 
             // Pad to 18 digits
             let padded = format!("{:0<18}", frac_str);
-            let frac: u128 = padded.parse()
+            let frac: u128 = padded
+                .parse()
                 .map_err(|_| format!("Invalid decimal part: {}", frac_str))?;
 
             whole
@@ -201,7 +206,8 @@ pub fn format_salt_display(wei: u128) -> String {
     } else {
         // Add commas
         let chars: Vec<char> = whole.chars().rev().collect();
-        let with_commas: String = chars.chunks(3)
+        let with_commas: String = chars
+            .chunks(3)
             .map(|c| c.iter().collect::<String>())
             .collect::<Vec<_>>()
             .join(",")
@@ -254,7 +260,10 @@ mod tests {
     #[test]
     fn test_fixed_decimals() {
         assert_eq!(wei_to_salt_fixed(WEI_PER_SALT, 4), "1.0000");
-        assert_eq!(wei_to_salt_fixed(WEI_PER_SALT + WEI_PER_SALT / 3, 4), "1.3333");
+        assert_eq!(
+            wei_to_salt_fixed(WEI_PER_SALT + WEI_PER_SALT / 3, 4),
+            "1.3333"
+        );
     }
 
     #[test]
@@ -266,7 +275,10 @@ mod tests {
     #[test]
     fn test_salt_to_wei_fractional() {
         assert_eq!(salt_to_wei("0.5").expect("parse"), WEI_PER_SALT / 2);
-        assert_eq!(salt_to_wei("1.5").expect("parse"), WEI_PER_SALT + WEI_PER_SALT / 2);
+        assert_eq!(
+            salt_to_wei("1.5").expect("parse"),
+            WEI_PER_SALT + WEI_PER_SALT / 2
+        );
     }
 
     #[test]
@@ -288,11 +300,21 @@ mod tests {
 
     #[test]
     fn test_roundtrip() {
-        let amounts = vec![0, 1, WEI_PER_SALT, WEI_PER_SALT / 3, 42 * WEI_PER_SALT + 123];
+        let amounts = vec![
+            0,
+            1,
+            WEI_PER_SALT,
+            WEI_PER_SALT / 3,
+            42 * WEI_PER_SALT + 123,
+        ];
         for wei in amounts {
             let salt = wei_to_salt(wei);
             let back = salt_to_wei(&salt).expect("roundtrip");
-            assert_eq!(back, wei, "Failed roundtrip for wei={}: salt='{}', back={}", wei, salt, back);
+            assert_eq!(
+                back, wei,
+                "Failed roundtrip for wei={}: salt='{}', back={}",
+                wei, salt, back
+            );
         }
     }
 
@@ -300,12 +322,18 @@ mod tests {
     fn test_display_format() {
         assert_eq!(format_salt_display(0), "0 SALT");
         assert_eq!(format_salt_display(WEI_PER_SALT), "1 SALT");
-        assert_eq!(format_salt_display(1_000_000 * WEI_PER_SALT), "1,000,000 SALT");
+        assert_eq!(
+            format_salt_display(1_000_000 * WEI_PER_SALT),
+            "1,000,000 SALT"
+        );
     }
 
     #[test]
     fn test_display_with_fraction() {
-        assert_eq!(format_salt_display(WEI_PER_SALT + WEI_PER_SALT / 2), "1.5 SALT");
+        assert_eq!(
+            format_salt_display(WEI_PER_SALT + WEI_PER_SALT / 2),
+            "1.5 SALT"
+        );
     }
 
     #[test]
@@ -337,7 +365,13 @@ mod tests {
     #[test]
     fn grains_to_salt_matches_wei_to_salt() {
         // grain ≡ wei — the two helpers must always agree.
-        for g in [0u128, 1, WEI_PER_SALT, 42 * WEI_PER_SALT + 123, u128::MAX / 2] {
+        for g in [
+            0u128,
+            1,
+            WEI_PER_SALT,
+            42 * WEI_PER_SALT + 123,
+            u128::MAX / 2,
+        ] {
             assert_eq!(grains_to_salt(g), wei_to_salt(g));
         }
     }
@@ -350,13 +384,22 @@ mod tests {
         assert_eq!(salt_to_wei(".25"), Ok(WEI_PER_SALT / 4));
         let max_whole = u128::MAX / WEI_PER_SALT;
         assert!(salt_to_wei(&max_whole.to_string()).is_ok());
-        assert_eq!(salt_to_wei(&(max_whole + 1).to_string()), Err("Amount too large".into()));
+        assert_eq!(
+            salt_to_wei(&(max_whole + 1).to_string()),
+            Err("Amount too large".into())
+        );
         assert_eq!(
             salt_to_wei(&format!("{max_whole}.999999999999999999")),
             Err("Amount too large".into())
         );
         assert!(salt_to_wei("1.2.3").is_err());
-        assert_eq!(format_salt_display(1_234 * WEI_PER_SALT + WEI_PER_SALT / 2), "1,234.5 SALT");
-        assert_eq!(wei_to_salt_fixed(WEI_PER_SALT / 2, 30), format!("0.{}", "5".to_string() + &"0".repeat(17)));
+        assert_eq!(
+            format_salt_display(1_234 * WEI_PER_SALT + WEI_PER_SALT / 2),
+            "1,234.5 SALT"
+        );
+        assert_eq!(
+            wei_to_salt_fixed(WEI_PER_SALT / 2, 30),
+            format!("0.{}", "5".to_string() + &"0".repeat(17))
+        );
     }
 }

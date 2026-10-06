@@ -38,7 +38,10 @@ fn resolve_inference_mode(args: &[String]) -> InferenceMode {
     let production_default = Executor::production_inference_mode();
     #[cfg(feature = "dev-mode")]
     {
-        if args.iter().any(|a| a == "--allow-nondeterministic-inference") {
+        if args
+            .iter()
+            .any(|a| a == "--allow-nondeterministic-inference")
+        {
             warn!(
                 "REM-N-03: --allow-nondeterministic-inference is set; \
                  the 0x0101 / 0x0102 inference precompiles will run \
@@ -50,7 +53,10 @@ fn resolve_inference_mode(args: &[String]) -> InferenceMode {
     }
     #[cfg(not(feature = "dev-mode"))]
     {
-        if args.iter().any(|a| a == "--allow-nondeterministic-inference") {
+        if args
+            .iter()
+            .any(|a| a == "--allow-nondeterministic-inference")
+        {
             warn!(
                 "REM-N-03: --allow-nondeterministic-inference is only \
                  available in builds compiled with the `dev-mode` \

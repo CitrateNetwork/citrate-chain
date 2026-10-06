@@ -177,7 +177,7 @@ impl BlockBuilder {
             timestamp,
             height: parent_height.saturating_add(1),
             blue_score: parent_blue_score.saturating_add(1), // Will be properly calculated by consensus
-            blue_work: 0,                      // Will be calculated by consensus
+            blue_work: 0,                                    // Will be calculated by consensus
             pruning_point: Hash::default(),
             proposer_pubkey: self.proposer_key,
             vrf_reveal: vrf_proof,

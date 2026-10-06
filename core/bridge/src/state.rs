@@ -56,7 +56,10 @@ pub struct RelayState {
     pub last_citrate_height: u64,
 
     /// Map of event ID → tracked event for deduplication and status tracking.
-    #[serde(serialize_with = "serialize_event_map", deserialize_with = "deserialize_event_map")]
+    #[serde(
+        serialize_with = "serialize_event_map",
+        deserialize_with = "deserialize_event_map"
+    )]
     pub events: HashMap<EventId, TrackedEvent>,
 
     /// Total deposits processed since relay start.
@@ -245,11 +248,7 @@ mod tests {
         let event_id = [43u8; 32];
         state.track_event(make_deposit(event_id));
 
-        assert!(state.update_event_status(
-            &event_id,
-            EventStatus::AwaitingAttestations,
-            None
-        ));
+        assert!(state.update_event_status(&event_id, EventStatus::AwaitingAttestations, None));
 
         let tracked = state.events.get(&event_id).unwrap();
         assert_eq!(tracked.status, EventStatus::AwaitingAttestations);

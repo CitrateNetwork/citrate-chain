@@ -464,7 +464,10 @@ mod tests {
 
         // Register CPU-only provider
         let cpu_provider = create_test_provider(1, 32, 200);
-        registry.register_provider(cpu_provider.clone()).await.unwrap();
+        registry
+            .register_provider(cpu_provider.clone())
+            .await
+            .unwrap();
         registry
             .register_model_provider(cpu_provider.address, model_id)
             .await
@@ -484,7 +487,10 @@ mod tests {
 
         // Now register a GPU provider
         let gpu_provider = create_test_provider_with_gpu(2, 32, 200);
-        registry.register_provider(gpu_provider.clone()).await.unwrap();
+        registry
+            .register_provider(gpu_provider.clone())
+            .await
+            .unwrap();
         registry
             .register_model_provider(gpu_provider.address, model_id)
             .await
@@ -530,7 +536,10 @@ mod tests {
         registry.register_provider(provider).await.unwrap();
 
         // Successful job with 100ms latency
-        registry.update_reputation(address, true, 100).await.unwrap();
+        registry
+            .update_reputation(address, true, 100)
+            .await
+            .unwrap();
 
         let info = registry.get_provider(&address).await.unwrap();
         assert_eq!(info.total_executions, 1);
@@ -546,8 +555,14 @@ mod tests {
         registry.register_provider(provider).await.unwrap();
 
         // One success, one failure
-        registry.update_reputation(address, true, 100).await.unwrap();
-        registry.update_reputation(address, false, 200).await.unwrap();
+        registry
+            .update_reputation(address, true, 100)
+            .await
+            .unwrap();
+        registry
+            .update_reputation(address, false, 200)
+            .await
+            .unwrap();
 
         let info = registry.get_provider(&address).await.unwrap();
         assert_eq!(info.total_executions, 2);
@@ -585,8 +600,14 @@ mod tests {
             .unwrap();
 
         // Give provider2 good reputation
-        registry.update_reputation(provider2.address, true, 50).await.unwrap();
-        registry.update_reputation(provider2.address, true, 50).await.unwrap();
+        registry
+            .update_reputation(provider2.address, true, 50)
+            .await
+            .unwrap();
+        registry
+            .update_reputation(provider2.address, true, 50)
+            .await
+            .unwrap();
 
         let requirements = ComputeRequirements {
             min_memory: 1000,
@@ -596,7 +617,10 @@ mod tests {
         };
 
         // Should select provider with better score
-        let selected = registry.select_provider(&model_id, &requirements).await.unwrap();
+        let selected = registry
+            .select_provider(&model_id, &requirements)
+            .await
+            .unwrap();
         // Provider 2 should have higher score due to more capacity and good reputation
         assert_eq!(selected, provider2.address);
     }

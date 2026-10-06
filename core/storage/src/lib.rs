@@ -38,9 +38,9 @@ pub mod state_manager;
 use anyhow::Result;
 use cache::Cache;
 use chain::{BlockStore, TransactionStore};
+use citrate_consensus::types::Hash;
 use crypto::at_rest::{AtRestStats, EncryptionAtRestConfig};
 use db::RocksDB;
-use citrate_consensus::types::Hash;
 use pruning::{Pruner, PruningConfig};
 use state::StateStore;
 use std::path::Path;
@@ -61,8 +61,7 @@ pub struct StorageManager {
 }
 
 /// Configuration for storage manager
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct StorageConfig {
     /// Pruning configuration
     pub pruning: PruningConfig,
@@ -71,7 +70,6 @@ pub struct StorageConfig {
     /// see `crypto::at_rest` for the key/meta lifecycle.
     pub encryption: Option<EncryptionAtRestConfig>,
 }
-
 
 impl StorageConfig {
     /// Create config with encryption at rest enabled
@@ -84,10 +82,13 @@ impl StorageConfig {
 impl StorageManager {
     /// Create a new storage manager (encryption at rest disabled)
     pub fn new(path: impl AsRef<Path>, pruning_config: PruningConfig) -> Result<Self> {
-        Self::with_config(path, StorageConfig {
-            pruning: pruning_config,
-            encryption: None,
-        })
+        Self::with_config(
+            path,
+            StorageConfig {
+                pruning: pruning_config,
+                encryption: None,
+            },
+        )
     }
 
     /// Create storage manager with full configuration.
