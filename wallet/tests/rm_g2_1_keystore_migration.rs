@@ -47,8 +47,8 @@ fn rm_g2_1_round_trip_two_entries() {
         .to_bytes();
 
     // Run the migrator. Returns the count of entries written.
-    let migrated = migrate_to_unified_keystore(&mut legacy, PW, &unified_path)
-        .expect("migration succeeds");
+    let migrated =
+        migrate_to_unified_keystore(&mut legacy, PW, &unified_path).expect("migration succeeds");
     assert_eq!(migrated, 2, "must migrate both legacy entries");
 
     // Re-lock the legacy store immediately — the migrator already
@@ -65,7 +65,10 @@ fn rm_g2_1_round_trip_two_entries() {
     let addr_b = citrate_wallet_core::keys::derive_address_from_ed25519(&vk_b.to_bytes());
     let accounts = manager.list_accounts();
     let addresses: Vec<&str> = accounts.iter().map(|a| a.address.as_str()).collect();
-    assert!(addresses.contains(&addr_a.as_str()), "alpha must round-trip");
+    assert!(
+        addresses.contains(&addr_a.as_str()),
+        "alpha must round-trip"
+    );
     assert!(addresses.contains(&addr_b.as_str()), "beta must round-trip");
 
     // Sign the same `msg` via the unified manager. Because ed25519 is
@@ -77,11 +80,13 @@ fn rm_g2_1_round_trip_two_entries() {
     let sig_a_unified = key_a.sign(msg);
     let sig_b_unified = key_b.sign(msg);
     assert_eq!(
-        &sig_a_unified[..], &sig_a_legacy[..],
+        &sig_a_unified[..],
+        &sig_a_legacy[..],
         "alpha signature must be identical pre/post migration",
     );
     assert_eq!(
-        &sig_b_unified[..], &sig_b_legacy[..],
+        &sig_b_unified[..],
+        &sig_b_legacy[..],
         "beta signature must be identical pre/post migration",
     );
 }

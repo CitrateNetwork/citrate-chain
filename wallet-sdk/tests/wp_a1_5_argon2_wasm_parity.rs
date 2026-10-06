@@ -12,16 +12,15 @@ use argon2::{Algorithm, Argon2, Params, Version};
 
 const TEST_PASSWORD: &[u8] = b"parity-test-password-12345";
 const TEST_SALT: [u8; 16] = [
-    0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89,
-    0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89,
+    0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89,
 ];
 
 /// Mirrors the body of `wallet-sdk/src/wasm.rs::argon2_v2_derive_key` so
 /// we can invoke it on the native target. If the WASM body changes, this
 /// test fixture must be updated in lockstep — that's the parity contract.
 fn wasm_recipe(password: &[u8], salt: &[u8]) -> Vec<u8> {
-    let params = Params::new(65536, 3, 1, Some(32))
-        .expect("WP-A1.5: v2 params are statically valid");
+    let params =
+        Params::new(65536, 3, 1, Some(32)).expect("WP-A1.5: v2 params are statically valid");
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut out = vec![0u8; 32];
     argon2

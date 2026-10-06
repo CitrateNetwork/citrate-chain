@@ -34,7 +34,9 @@ use std::sync::Arc;
 
 use citrate_execution::precompiles::tensor_format::{encode, Dtype};
 use citrate_execution::precompiles::verify::{addresses, execute as verify_execute};
-use citrate_execution::revm_adapter::{execute_contract_call_with_context, BlockContext, ValueSemantics};
+use citrate_execution::revm_adapter::{
+    execute_contract_call_with_context, BlockContext, ValueSemantics,
+};
 use citrate_execution::state::StateDB;
 use citrate_execution::types::Address;
 use primitive_types::U256;

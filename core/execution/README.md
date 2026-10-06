@@ -6,7 +6,7 @@ EVM-compatible transaction execution engine with AI precompiles, state managemen
 
 `citrate-execution` is the largest core crate in the Citrate blockchain, providing the full execution layer for transaction processing. It wraps [REVM](https://github.com/bluealloy/revm) (the same EVM used by Foundry/Anvil) via a `StateDBAdapter` that bridges Citrate's in-memory state to REVM's `Database` trait, enabling production-grade EVM execution including contract deployment, storage, and EIP-3607 compliance.
 
-Beyond standard EVM execution, the crate extends the virtual machine with AI-native capabilities: a custom opcode range (0xA0-0xDF) for model loading, tensor operations, and proof generation; precompiled contracts at addresses 0x01-0x09 (Ethereum standard) and 0x0100-0x0202 (AI inference and x402 payment protocol); and an inference runtime targeting Apple Silicon Metal GPUs.
+Beyond standard EVM execution, the crate extends the virtual machine with AI-native capabilities: a custom opcode range (0xA0-0xDF) for model loading, tensor operations, and proof generation; precompiled contracts at addresses 0x01-0x09 (Ethereum standard) and Citrate precompiles from 0x0100 to 0x0202 (AI inference, deterministic verify and Q16 compute, Ed25519, agent operations, and the x402 payment protocol; `contracts/addresses/40204.json` lists the always-on set in its `precompiles` section); and an inference runtime targeting Apple Silicon Metal GPUs.
 
 The state layer implements a Merkle Patricia Trie (MPT) for account and storage state, a multi-level LRU cache with hit-rate tracking, and dirty-slot tracking for efficient persistence. Cryptographic modules provide AES-256-GCM model encryption, ECIES key exchange on secp256k1, Shamir's Secret Sharing over GF(p), and HD key derivation. The ZKP subsystem offers experimental Groth16 circuits on BLS12-381 via arkworks (production gated behind the `zkp_production` feature in `citrate-mcp`).
 
@@ -31,7 +31,13 @@ The state layer implements a Merkle Patricia Trie (MPT) for account and storage 
 | `vm/evm_integration` | `src/vm/evm_integration.rs` | `EVMIntegration`: high-level EVM execution bridge |
 | `vm/evm_tests` | `src/vm/evm_tests.rs` | EVM opcode test suite (test-only) |
 | `precompiles/mod` | `src/precompiles/mod.rs` | `PrecompileExecutor`: Ethereum precompiles 0x01-0x09 (ECRECOVER, SHA256, RIPEMD160, IDENTITY, MODEXP, ECADD, ECMUL, ECPAIRING, BLAKE2F) |
-| `precompiles/inference` | `src/precompiles/inference.rs` | `InferencePrecompile`: AI precompiles at 0x0100-0x0106 (model deploy, inference, batch, metadata, proof verify, benchmark, encryption) |
+| `precompiles/inference` | `src/precompiles/inference.rs` | `InferencePrecompile`: AI precompiles at 0x0100-0x0106 (model deploy, inference, batch, metadata, benchmark, encryption; 0x0104 is a retired legacy proof-verify address that always rejects) |
+| `precompiles/verify` | `src/precompiles/verify.rs` | Deterministic verify precompiles at 0x0107-0x0109 (TENSOR_COMMIT, INFERENCE_PROOF_VERIFY, MERKLE_VERIFY_TENSOR) |
+| `precompiles/compute` | `src/precompiles/compute.rs` | Q16.16 deterministic tensor precompiles at 0x010A-0x010F (matmul, dot, softmax, relu, linear, transpose) |
+| `precompiles/q16` | `src/precompiles/q16/` | Q16.16 fixed-point library, plus BELNAP_AGGREGATE (0x0110) and ROUTING_INFERENCE (0x0111) |
+| `precompiles/ed25519` | `src/precompiles/ed25519.rs` | Ed25519 (RFC 8032) signature verification at 0x0120 |
+| `precompiles/lora`, `memory_anchor`, `agent_ops` | `src/precompiles/{lora,memory_anchor,agent_ops}.rs` | Agent precompile fork (`agent_fork.rs`): LORA_APPLY 0x0112, LORA_MERGE 0x0113, MEMORY_ANCHOR_VERIFY 0x0121, AGENT_OPS 0x0122. On chain 40204 the fork is pinned at height 0, so these are active from the r1005 genesis. |
+| `precompiles/commd_fold_verify` | `src/precompiles/commd_fold_verify.rs` | FOLD_COMMD_VERIFY at 0x0130 (feature `commd-fold-verify`; not consensus-active by default) |
 | `precompiles/x402` | `src/precompiles/x402.rs` | x402 payment protocol precompiles at 0x0200-0x0202 (EIP-712 verify, EIP-3009 transferWithAuthorization, batch payment verify) |
 | `parallel/mod` | `src/parallel/mod.rs` | Parallel execution module root |
 | `parallel/executor` | `src/parallel/executor.rs` | `ParallelExecutor`: concurrent transaction batch execution with conflict-aware scheduling |

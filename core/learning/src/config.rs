@@ -80,7 +80,7 @@ pub struct LearningConfig {
 impl Default for LearningConfig {
     fn default() -> Self {
         Self {
-            embedding_dimensions: 768,       // Paper II Table A2
+            embedding_dimensions: 768, // Paper II Table A2
             min_participants: 3,
             stale_threshold_rounds: 10,
             phase_timeout_ms: 30_000,
@@ -90,11 +90,11 @@ impl Default for LearningConfig {
             router_hidden_dim: 64,
             router_num_destinations: 4,
             router_learning_rate: 0.01,
-            max_adapter_bytes: 1_048_576,    // 1 MB
-            belnap_high_threshold: 0.8,      // Paper II Table A2
-            belnap_low_threshold: 0.3,       // Paper II Table A2
-            temperature: 1.0,                // Paper II Table A2
-            lora_rank: 16,                   // Paper II Table A2
+            max_adapter_bytes: 1_048_576,          // 1 MB
+            belnap_high_threshold: 0.8,            // Paper II Table A2
+            belnap_low_threshold: 0.3,             // Paper II Table A2
+            temperature: 1.0,                      // Paper II Table A2
+            lora_rank: 16,                         // Paper II Table A2
             adapter_consolidation_interval: 1_000, // Paper II Table A2 (~83 min)
             macro_confidence_threshold: 0.6,
             macro_loss_threshold: 0.5,
@@ -191,9 +191,7 @@ impl LearningConfig {
                 reason: "must be > 0".to_string(),
             });
         }
-        if self.belnap_inconsistency_threshold < 0.0
-            || self.belnap_inconsistency_threshold > 1.0
-        {
+        if self.belnap_inconsistency_threshold < 0.0 || self.belnap_inconsistency_threshold > 1.0 {
             return Err(LearningError::ConfigInvalid {
                 field: "belnap_inconsistency_threshold".to_string(),
                 reason: "must be in [0.0, 1.0]".to_string(),
@@ -294,7 +292,10 @@ mod tests {
         let config = LearningConfig::default();
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: LearningConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(config.embedding_dimensions, deserialized.embedding_dimensions);
+        assert_eq!(
+            config.embedding_dimensions,
+            deserialized.embedding_dimensions
+        );
         assert_eq!(config.min_participants, deserialized.min_participants);
     }
 }

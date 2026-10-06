@@ -18,6 +18,20 @@
 //! This crate is lean on purpose (ark-bn254 + Poseidon only, no halo2), so the desktop
 //! client can depend on it without the proving stack.
 
+// PANIC-S1 G2: CommD is the 0x0130 precompile's commitment math (consensus path).
+// Production code may not panic; Fr field ops are modular (clippy.toml allowlist).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
 use ark_bn254::Fr;
 use ark_ff::{BigInteger, PrimeField, Zero};
 use sha3::Digest as _;
@@ -52,13 +66,17 @@ pub fn poseidon_merkle(leaves: &[Fr]) -> Fr {
     }
     let mut level: Vec<Fr> = leaves.to_vec();
     level.resize(level.len().next_power_of_two(), Fr::zero());
+    // `level` has a power-of-two length >= 1, so every chunk is an exact pair.
     while level.len() > 1 {
         level = level
-            .chunks(2)
-            .map(|pair| poseidon_hash(&[pair[0], pair[1]]))
+            .chunks_exact(2)
+            .map(|pair| match pair {
+                [a, b] => poseidon_hash(&[*a, *b]),
+                _ => Fr::zero(),
+            })
             .collect();
     }
-    level[0]
+    level.first().copied().unwrap_or_else(Fr::zero)
 }
 
 /// Domain separator for `dataCommit`, so the sponge can NEVER coincide with a Merkle
@@ -74,7 +92,7 @@ fn data_commit_domain() -> Fr {
 /// from the Merkle `commD` over the same leaves; this independence is what makes the
 /// wrong-CommD challenge sound (a slash requires a sponge collision — infeasible).
 pub fn poseidon_sponge(leaves: &[Fr]) -> Fr {
-    let mut inputs = Vec::with_capacity(leaves.len() + 2);
+    let mut inputs = Vec::with_capacity(leaves.len().saturating_add(2));
     inputs.push(data_commit_domain());
     inputs.push(Fr::from(leaves.len() as u64));
     inputs.extend_from_slice(leaves);
@@ -87,8 +105,7 @@ pub fn poseidon_sponge(leaves: &[Fr]) -> Fr {
 /// this, then absorbs one leaf per step). `len` is public (bound into the commitment), so this is a
 /// pure function of the leaf count. Returns the full 3-lane state `[capacity, rate0, rate1]`.
 pub fn data_commit_preamble_state(n_leaves: usize) -> [Fr; 3] {
-    let s = poseidon_permute(&[Fr::zero(), data_commit_domain(), Fr::from(n_leaves as u64)]);
-    [s[0], s[1], s[2]]
+    poseidon_permute(&[Fr::zero(), data_commit_domain(), Fr::from(n_leaves as u64)])
 }
 
 /// The canonical CommD of `data`: big-endian bytes of `poseidon_merkle(pack_bytes(data))`.
@@ -110,22 +127,21 @@ pub fn compute_data_commit(data: &[u8]) -> [u8; 32] {
 pub fn compute_data_commit_streaming(data: &[u8]) -> [u8; 32] {
     let leaves = pack_bytes(data);
     let mut state = data_commit_preamble_state(leaves.len());
-    let mut pos = 0usize; // which rate lane (0 or 1) the next leaf lands in
+    let mut second_lane = false; // which rate lane (1 or 2) the next leaf lands in
     for leaf in &leaves {
-        state[1 + pos] += leaf; // absorb = ADD into the current rate lane
-        if pos == 1 {
-            let p = poseidon_permute(&state);
-            state = [p[0], p[1], p[2]];
-            pos = 0;
+        // absorb = ADD into the current rate lane
+        if second_lane {
+            state[2] += leaf;
+            state = poseidon_permute(&state);
         } else {
-            pos = 1;
+            state[1] += leaf;
         }
+        second_lane = !second_lane;
     }
     // Squeeze: a pending half-pair (odd leaf count, pos==1) triggers the final permutation. An even
     // count already permuted when its last pair completed above.
-    if pos == 1 {
-        let p = poseidon_permute(&state);
-        state = [p[0], p[1], p[2]];
+    if second_lane {
+        state = poseidon_permute(&state);
     }
     fr_to_be_bytes(state[1])
 }
@@ -135,8 +151,12 @@ pub fn fr_to_be_bytes(f: Fr) -> [u8; 32] {
     let be = f.into_bigint().to_bytes_be();
     let mut out = [0u8; 32];
     // BN254 is 254-bit -> to_bytes_be yields <= 32 bytes; right-align into the fixed buffer.
-    let start = 32 - be.len();
-    out[start..].copy_from_slice(&be);
+    if let Some(dst) = 32usize
+        .checked_sub(be.len())
+        .and_then(|start| out.get_mut(start..))
+    {
+        dst.copy_from_slice(&be);
+    }
     out
 }
 
@@ -166,14 +186,8 @@ pub struct IncrementalMerkle {
 impl IncrementalMerkle {
     /// A tree of the given depth (all positions empty; root = the all-zero root).
     pub fn new(depth: u32) -> Self {
-        let d = depth as usize;
-        let mut zeros = Vec::with_capacity(d + 1);
-        zeros.push(Fr::zero());
-        for h in 1..=d {
-            let z = zeros[h - 1];
-            zeros.push(poseidon_hash(&[z, z]));
-        }
-        let root = zeros[d];
+        let zeros = zero_subtree_roots(depth as usize);
+        let root = zeros.last().copied().unwrap_or_else(Fr::zero);
         Self {
             depth,
             filled: zeros.clone(),
@@ -198,19 +212,25 @@ impl IncrementalMerkle {
         let mut sibs = Vec::with_capacity(self.depth as usize);
         let mut cur = leaf;
         let mut idx = self.index;
-        for h in 0..self.depth as usize {
+        // zeros/filled have depth + 1 entries, so the zip runs exactly `depth` levels.
+        for (zero_h, filled_h) in self
+            .zeros
+            .iter()
+            .zip(self.filled.iter_mut())
+            .take(self.depth as usize)
+        {
             if idx & 1 == 0 {
-                sibs.push(self.zeros[h]);
-                self.filled[h] = cur;
-                cur = poseidon_hash(&[cur, self.zeros[h]]);
+                sibs.push(*zero_h);
+                *filled_h = cur;
+                cur = poseidon_hash(&[cur, *zero_h]);
             } else {
-                sibs.push(self.filled[h]);
-                cur = poseidon_hash(&[self.filled[h], cur]);
+                sibs.push(*filled_h);
+                cur = poseidon_hash(&[*filled_h, cur]);
             }
             idx >>= 1;
         }
         self.root = cur;
-        self.index += 1;
+        self.index = self.index.saturating_add(1);
         sibs
     }
 
@@ -234,7 +254,10 @@ impl IncrementalMerkle {
 /// the commitment. A fixed `max_depth` (independent of the file) gives ONE R1CS shape ⇒ ONE baked Nova
 /// verifier key for the 0x0130 precompile. The circuit `FixedCommDFoldStep` mirrors this exactly;
 /// `fixed_depth_matches_batch` pins it. `max_depth` must satisfy `2^max_depth >= N`.
-pub fn compute_comm_d_fixed_depth(data: &[u8], max_depth: u32) -> [u8; 32] {
+///
+/// Returns `None` if `max_depth` is too small for the data (`2^max_depth < N`). PANIC-S1: this
+/// used to `assert!`, a panic reachable by any caller passing a short depth.
+pub fn compute_comm_d_fixed_depth(data: &[u8], max_depth: u32) -> Option<[u8; 32]> {
     let leaves = pack_bytes(data);
     let n = leaves.len();
     let d: u32 = if n <= 1 {
@@ -242,29 +265,24 @@ pub fn compute_comm_d_fixed_depth(data: &[u8], max_depth: u32) -> [u8; 32] {
     } else {
         n.next_power_of_two().trailing_zeros()
     };
-    assert!(
-        d <= max_depth,
-        "max_depth {max_depth} too small for {n} leaves (needs {d})"
-    );
+    if d > max_depth {
+        return None;
+    }
 
     // zeros[h] = all-zero subtree root at height h.
     let md = max_depth as usize;
-    let mut zeros = Vec::with_capacity(md + 1);
-    zeros.push(Fr::zero());
-    for h in 1..=md {
-        let z = zeros[h - 1];
-        zeros.push(poseidon_hash(&[z, z]));
-    }
+    let zeros = zero_subtree_roots(md);
 
-    let mut filled = zeros[0..md].to_vec(); // cached left sibling per height (unused above d)
+    // cached left sibling per height (unused above d)
+    let mut filled: Vec<Fr> = zeros.iter().take(md).copied().collect();
     let mut root = Fr::zero();
     for (index, leaf) in (0u64..).zip(leaves.iter()) {
         let mut cur = *leaf;
-        for (h, filled_h) in filled.iter_mut().enumerate().take(md) {
+        for (h, (filled_h, zero_h)) in filled.iter_mut().zip(&zeros).enumerate() {
             if (h as u32) < d {
                 if (index >> h) & 1 == 0 {
                     *filled_h = cur;
-                    cur = poseidon_hash(&[cur, zeros[h]]);
+                    cur = poseidon_hash(&[cur, *zero_h]);
                 } else {
                     cur = poseidon_hash(&[*filled_h, cur]);
                 }
@@ -273,7 +291,19 @@ pub fn compute_comm_d_fixed_depth(data: &[u8], max_depth: u32) -> [u8; 32] {
         }
         root = cur;
     }
-    fr_to_be_bytes(root)
+    Some(fr_to_be_bytes(root))
+}
+
+/// `zeros[h]` = root of an all-zero subtree of height `h`, for `h in 0..=depth`.
+fn zero_subtree_roots(depth: usize) -> Vec<Fr> {
+    let mut zeros = Vec::with_capacity(depth.saturating_add(1));
+    let mut z = Fr::zero();
+    zeros.push(z);
+    for _ in 0..depth {
+        z = poseidon_hash(&[z, z]);
+        zeros.push(z);
+    }
+    zeros
 }
 
 /// Streaming (fold-friendly) computation of the SAME CommD as [`compute_comm_d`], via
@@ -329,9 +359,9 @@ impl CommDFold {
         self.keccak.update(bytes);
         self.carry.extend_from_slice(bytes);
         while self.carry.len() >= BYTES_PER_LEAF {
-            let leaf = Fr::from_le_bytes_mod_order(&self.carry[..BYTES_PER_LEAF]);
-            self.merkle.insert(leaf);
-            self.carry.drain(..BYTES_PER_LEAF);
+            // carry.len() >= BYTES_PER_LEAF here, so `drain(..BYTES_PER_LEAF)` is in bounds.
+            let leaf_bytes: Vec<u8> = self.carry.drain(..BYTES_PER_LEAF).collect();
+            self.merkle.insert(Fr::from_le_bytes_mod_order(&leaf_bytes));
         }
     }
 
@@ -355,6 +385,28 @@ impl CommDFold {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panic_s1_fixed_depth_too_small_is_none_not_a_panic() {
+        let data = vec![7u8; 31 * 5]; // 5 leaves -> needs depth 3
+        assert_eq!(compute_comm_d_fixed_depth(&data, 2), None);
+        assert_eq!(
+            compute_comm_d_fixed_depth(&data, 3),
+            Some(compute_comm_d(&data))
+        );
+    }
+
+    #[test]
+    fn panic_s1_fr_to_be_bytes_right_aligns() {
+        assert_eq!(fr_to_be_bytes(Fr::zero()), [0u8; 32]);
+        let mut one = [0u8; 32];
+        one[31] = 1;
+        assert_eq!(fr_to_be_bytes(Fr::from(1u64)), one);
+        let mut v = [0u8; 32];
+        v[30] = 0x01;
+        v[31] = 0x02;
+        assert_eq!(fr_to_be_bytes(Fr::from(0x0102u64)), v);
+    }
     use sha3::Digest as KeccakDigest; // Keccak256::digest in the fold test
 
     #[test]
@@ -485,7 +537,7 @@ mod tests {
                 let data: Vec<u8> = (0..n_bytes).map(|i| (i * 7 + 1) as u8).collect();
                 assert_eq!(
                     compute_comm_d_fixed_depth(&data, max_depth),
-                    compute_comm_d(&data),
+                    Some(compute_comm_d(&data)),
                     "fixed-depth (max {max_depth}) != batch CommD at {n_bytes} bytes"
                 );
             }

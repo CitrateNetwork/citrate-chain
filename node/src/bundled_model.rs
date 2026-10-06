@@ -52,7 +52,7 @@ pub fn discover_bundled_models(models_dir: &Path) -> Vec<BundledModelInfo> {
                             "Discovered bundled model: {} v{} (hash: {})",
                             manifest.name,
                             manifest.version,
-                            &hash[..16]
+                            hash.get(..16).unwrap_or(&hash)
                         );
                         models.push(BundledModelInfo {
                             manifest,
@@ -85,19 +85,18 @@ pub fn verify_model_integrity(model_dir: &Path) -> Result<bool, String> {
         .map_err(|e| format!("Failed to read checksums: {}", e))?;
 
     for line in content.lines() {
-        let parts: Vec<&str> = line.splitn(2, "  ").collect();
-        if parts.len() != 2 {
+        let Some((hash_part, file_part)) = line.split_once("  ") else {
             continue;
-        }
-        let expected_hash = parts[0].trim();
-        let file_path = model_dir.join(parts[1].trim().trim_start_matches("./"));
+        };
+        let expected_hash = hash_part.trim();
+        let file_path = model_dir.join(file_part.trim().trim_start_matches("./"));
 
         if !file_path.exists() {
-            return Err(format!("Missing file: {}", parts[1]));
+            return Err(format!("Missing file: {}", file_part));
         }
 
-        let file_bytes =
-            std::fs::read(&file_path).map_err(|e| format!("Failed to read {}: {}", parts[1], e))?;
+        let file_bytes = std::fs::read(&file_path)
+            .map_err(|e| format!("Failed to read {}: {}", file_part, e))?;
 
         let mut hasher = Sha256::new();
         hasher.update(&file_bytes);
@@ -106,7 +105,7 @@ pub fn verify_model_integrity(model_dir: &Path) -> Result<bool, String> {
         if actual_hash != expected_hash {
             return Err(format!(
                 "Integrity check failed for {}: expected {}, got {}",
-                parts[1], expected_hash, actual_hash
+                file_part, expected_hash, actual_hash
             ));
         }
     }

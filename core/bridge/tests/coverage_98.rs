@@ -42,7 +42,7 @@ fn setup_relay() -> BridgeRelay {
         oracle_threshold: 1,
         ..Default::default()
     };
-    let relay = BridgeRelay::new(config);
+    let relay = BridgeRelay::new(config).expect("relay");
     let sk = default_oracle_key();
     {
         let mut reg = relay.oracle_registry().write();
@@ -136,13 +136,21 @@ fn make_oracle_update_event(id: u8, is_addition: bool) -> BridgeEvent {
 #[test]
 fn test_bridge_event_source_block_withdrawal() {
     let event = make_withdrawal_event(1, 5000);
-    assert_eq!(event.source_block(), 200, "Withdrawal source_block = citrate_block_height");
+    assert_eq!(
+        event.source_block(),
+        200,
+        "Withdrawal source_block = citrate_block_height"
+    );
 }
 
 #[test]
 fn test_bridge_event_source_block_oracle_update() {
     let event = make_oracle_update_event(1, true);
-    assert_eq!(event.source_block(), 0, "OracleUpdate source_block should be 0");
+    assert_eq!(
+        event.source_block(),
+        0,
+        "OracleUpdate source_block should be 0"
+    );
 }
 
 #[test]
@@ -162,14 +170,20 @@ fn test_withdrawal_event_id_different_heights() {
     let tx = [0xAA; 32];
     let id1 = WithdrawalEvent::compute_event_id(&tx, 100);
     let id2 = WithdrawalEvent::compute_event_id(&tx, 101);
-    assert_ne!(id1, id2, "Different block heights must produce different event IDs");
+    assert_ne!(
+        id1, id2,
+        "Different block heights must produce different event IDs"
+    );
 }
 
 #[test]
 fn test_withdrawal_event_id_different_tx_hashes() {
     let id1 = WithdrawalEvent::compute_event_id(&[1u8; 32], 100);
     let id2 = WithdrawalEvent::compute_event_id(&[2u8; 32], 100);
-    assert_ne!(id1, id2, "Different tx hashes must produce different event IDs");
+    assert_ne!(
+        id1, id2,
+        "Different tx hashes must produce different event IDs"
+    );
 }
 
 // ============================================================
@@ -248,7 +262,11 @@ fn test_error_display_strings() {
 
     for err in &errors {
         let display = format!("{}", err);
-        assert!(!display.is_empty(), "Error display must not be empty: {:?}", err);
+        assert!(
+            !display.is_empty(),
+            "Error display must not be empty: {:?}",
+            err
+        );
         // Also test Debug
         let debug = format!("{:?}", err);
         assert!(!debug.is_empty());
@@ -365,10 +383,11 @@ fn test_metrics_default_is_new() {
 fn test_metrics_health_stale_heartbeat() {
     let metrics = BridgeMetrics::new();
     // Set heartbeat far in the past (> 60 seconds ago)
-    metrics
-        .last_heartbeat
-        .store(1_000_000, Ordering::Relaxed);
-    assert!(!metrics.is_healthy(), "Stale heartbeat should not be healthy");
+    metrics.last_heartbeat.store(1_000_000, Ordering::Relaxed);
+    assert!(
+        !metrics.is_healthy(),
+        "Stale heartbeat should not be healthy"
+    );
 }
 
 #[test]
@@ -415,8 +434,14 @@ fn test_oracle_registry_set_threshold() {
     // A threshold of 0 (0-of-N mints every event with no attestations) and any
     // value above the active-oracle count are rejected, and a rejected update
     // must not mutate the threshold.
-    assert!(registry.set_threshold(5).is_err(), "no oracles => 5 rejected");
-    assert!(registry.set_threshold(0).is_err(), "0-of-N must be rejected");
+    assert!(
+        registry.set_threshold(5).is_err(),
+        "no oracles => 5 rejected"
+    );
+    assert!(
+        registry.set_threshold(0).is_err(),
+        "0-of-N must be rejected"
+    );
     assert_eq!(
         registry.threshold(),
         2,
@@ -530,7 +555,11 @@ fn test_relay_state_update_status_with_error() {
     state.track_event(tracked);
 
     // Update with an error message
-    state.update_event_status(&event_id, EventStatus::Failed, Some("mint failed".to_string()));
+    state.update_event_status(
+        &event_id,
+        EventStatus::Failed,
+        Some("mint failed".to_string()),
+    );
 
     let te = state.events.get(&event_id).unwrap();
     assert_eq!(te.status, EventStatus::Failed);
@@ -685,7 +714,10 @@ fn test_minter_current_multiplier_after_deposits() {
     // After 1 ETH deposited: multiplier = 1.0 + 0.001 * 1.0 / 1000.0 = 1.000001
     let m = minter.current_multiplier();
     assert!(m > 1.0, "Multiplier should increase after deposits");
-    assert!(m < 1.01, "Multiplier should still be close to 1.0 after 1 ETH");
+    assert!(
+        m < 1.01,
+        "Multiplier should still be close to 1.0 after 1 ETH"
+    );
 }
 
 #[test]
@@ -694,7 +726,10 @@ fn test_minter_preview_does_not_change_multiplier() {
     let before = minter.current_multiplier();
     let _preview = minter.preview_conversion(5.0);
     let after = minter.current_multiplier();
-    assert_eq!(before, after, "preview_conversion must not change multiplier");
+    assert_eq!(
+        before, after,
+        "preview_conversion must not change multiplier"
+    );
 }
 
 #[test]
@@ -736,7 +771,10 @@ async fn test_relay_processes_oracle_update_event() {
     let results = relay.poll_cycle(&source).await.unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].status, EventStatus::Processed);
-    assert!(results[0].salt_amount.is_none(), "OracleUpdate has no SALT amount");
+    assert!(
+        results[0].salt_amount.is_none(),
+        "OracleUpdate has no SALT amount"
+    );
     assert!(results[0].error.is_none());
 }
 
@@ -797,14 +835,8 @@ async fn test_relay_metrics_after_withdrawal() {
     relay.poll_cycle(&source).await.unwrap();
 
     let metrics = relay.metrics();
-    assert_eq!(
-        metrics.withdrawals_processed.load(Ordering::Relaxed),
-        1
-    );
-    assert_eq!(
-        metrics.total_salt_burned.load(Ordering::Relaxed),
-        8000
-    );
+    assert_eq!(metrics.withdrawals_processed.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.total_salt_burned.load(Ordering::Relaxed), 8000);
 }
 
 // ============================================================
@@ -892,7 +924,10 @@ async fn test_relay_retry_exhausted() {
 async fn test_mock_event_source_default() {
     let source = MockEventSource::default();
     let block = source.current_block().await.unwrap();
-    assert_eq!(block, 100, "Default MockEventSource head block should be 100");
+    assert_eq!(
+        block, 100,
+        "Default MockEventSource head block should be 100"
+    );
 }
 
 #[tokio::test]
@@ -1061,7 +1096,7 @@ async fn test_relay_no_new_blocks_yields_empty() {
         oracle_threshold: 1,
         ..Default::default()
     };
-    let relay = BridgeRelay::new(config);
+    let relay = BridgeRelay::new(config).expect("relay");
     let sk = default_oracle_key();
     relay
         .oracle_registry()
@@ -1133,10 +1168,7 @@ async fn test_relay_deposit_exceeds_cap() {
     assert!(results[0].error.as_ref().unwrap().contains("exceeds"));
 
     // Deposit failure should be recorded in metrics
-    assert_eq!(
-        relay.metrics().deposits_failed.load(Ordering::Relaxed),
-        1
-    );
+    assert_eq!(relay.metrics().deposits_failed.load(Ordering::Relaxed), 1);
 }
 
 // ============================================================
@@ -1189,10 +1221,7 @@ async fn test_relay_failed_deposit_metric() {
 
     relay.poll_cycle(&source).await.unwrap();
 
-    assert_eq!(
-        relay.metrics().deposits_failed.load(Ordering::Relaxed),
-        1
-    );
+    assert_eq!(relay.metrics().deposits_failed.load(Ordering::Relaxed), 1);
     assert_eq!(
         relay.metrics().deposits_processed.load(Ordering::Relaxed),
         0

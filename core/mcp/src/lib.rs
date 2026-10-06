@@ -1,6 +1,20 @@
 // citrate/core/mcp/src/lib.rs
 
 // MCP Service coordinator
+
+// PANIC-S1 G2: production code in this crate may not panic (tests excepted).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
 pub mod cache;
 pub mod execution;
 pub mod gguf_engine;
@@ -24,9 +38,7 @@ pub struct MCPService {
 }
 
 impl MCPService {
-    pub fn new(
-        storage: Arc<citrate_storage::StorageManager>,
-    ) -> Self {
+    pub fn new(storage: Arc<citrate_storage::StorageManager>) -> Self {
         let model_registry = Arc::new(registry::ModelRegistry::new(storage.clone()));
         let provider_registry = Arc::new(provider::ProviderRegistry::new());
         let cache_size: u64 = std::env::var("CITRATE_MODEL_CACHE_SIZE")

@@ -46,17 +46,31 @@ import {ValidatorRegistry} from "../src/ValidatorRegistry.sol";
 /// is an in-place upgrade behind the proxy — that is the payoff for doing
 /// M-2.0 before M-2.1 so the storage layout froze once.
 contract CoreMembershipCreate2Test is Test {
-    // Determinism inputs — PINNED, identical to DeployCoreMembership.s.sol.
+    // Determinism inputs — DERIVED at deploy time, identical to
+    // DeployCoreMembership.s.sol. FRESH-KEYS reroll (owner ruling + MAC audit):
+    // the membership owner and the ValidatorRegistry are NO LONGER frozen
+    // literals — they come from env (`MEMBERSHIP_OWNER`, `VALIDATOR_REGISTRY`),
+    // so the SBT/vault addresses move with the fresh keys (accepted). With env
+    // unset these fall back to derived, obviously-not-a-key placeholders so the
+    // determinism relationships below are still exercised deterministically.
     address internal constant ARACHNID = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
-    address internal constant FROZEN_OWNER = 0xF42a19194fee89E71dC4b8631a71a9CeCf42B483;
-    // canonical: contracts/addresses/40204.json ValidatorRegistry — re-pinned at
-    // the solc-0.8.36 / OZ-5.7 reroll (prior 0x61D44D8A… pin was pre-reroll stale).
-    address internal constant REGISTRY = 0x2655d9fbbe599E75ff6E53790F99EbC9A20c93BF;
+
+    function _owner() internal view returns (address) {
+        return _envAddrOr("MEMBERSHIP_OWNER", address(uint160(uint256(keccak256("citrate.reroll.placeholder.membership.owner")))));
+    }
+
+    function _registry() internal view returns (address) {
+        return _envAddrOr("VALIDATOR_REGISTRY", _envAddrOr("CITRATE_VALIDATOR_REGISTRY", address(uint160(uint256(keccak256("citrate.reroll.placeholder.validator.registry"))))));
+    }
+
+    function _envAddrOr(string memory key, address fallbackValue) internal view returns (address) {
+        try vm.envAddress(key) returns (address v) { return v; } catch { return fallbackValue; }
+    }
 
     // ── init_code builders (keccak256(creationCode ++ abi.encode(ctorArgs))) ──
 
-    function _sbtInit() internal pure returns (bytes memory) {
-        return abi.encodePacked(type(CitrateMemberSBT).creationCode, abi.encode(FROZEN_OWNER));
+    function _sbtInit() internal view returns (bytes memory) {
+        return abi.encodePacked(type(CitrateMemberSBT).creationCode, abi.encode(_owner()));
     }
 
     function _bondInit() internal pure returns (bytes memory) {
@@ -69,7 +83,7 @@ contract CoreMembershipCreate2Test is Test {
 
     // ── Arachnid projections, derived (not hand-copied) ──────────────────
 
-    function _sbtAddr() internal pure returns (address) {
+    function _sbtAddr() internal view returns (address) {
         return vm.computeCreate2Address(
             Salts.salt("CitrateMemberSBT"), keccak256(_sbtInit()), ARACHNID
         );
@@ -88,7 +102,7 @@ contract CoreMembershipCreate2Test is Test {
     }
 
     /// The proxy init_code — this is where the whole dependency chain lands.
-    function _proxyInit() internal pure returns (bytes memory) {
+    function _proxyInit() internal view returns (bytes memory) {
         return abi.encodePacked(
             type(ERC1967Proxy).creationCode,
             abi.encode(
@@ -96,8 +110,8 @@ contract CoreMembershipCreate2Test is Test {
                 abi.encodeCall(
                     MembershipStakeVault.initialize,
                     (
-                        FROZEN_OWNER,
-                        ValidatorRegistry(payable(REGISTRY)),
+                        _owner(),
+                        ValidatorRegistry(payable(_registry())),
                         CitrateMemberSBT(_sbtAddr()),
                         _bondAddr()
                     )
@@ -106,7 +120,7 @@ contract CoreMembershipCreate2Test is Test {
         );
     }
 
-    function _vaultAddr() internal pure returns (address) {
+    function _vaultAddr() internal view returns (address) {
         return vm.computeCreate2Address(
             Salts.salt("MembershipStakeVault"), keccak256(_proxyInit()), ARACHNID
         );
@@ -116,7 +130,7 @@ contract CoreMembershipCreate2Test is Test {
 
     function test_sbt_is_create2() public {
         CitrateMemberSBT sbt =
-            new CitrateMemberSBT{salt: Salts.salt("CitrateMemberSBT")}(FROZEN_OWNER);
+            new CitrateMemberSBT{salt: Salts.salt("CitrateMemberSBT")}(_owner());
         address expected = vm.computeCreate2Address(
             Salts.salt("CitrateMemberSBT"), keccak256(_sbtInit()), address(this)
         );
@@ -140,34 +154,58 @@ contract CoreMembershipCreate2Test is Test {
         assertEq(address(impl), expected, "vault impl deploy is not CREATE2 / wrong salt");
     }
 
-    // ── Layer 2: the frozen Arachnid projections don't move. ─────────────
+    // ── Layer 2: key-INDEPENDENT projections are bytecode-only anchors. ──
     //
-    // Pinned literals, regenerated 2026-07-29 for M-2. If one of these fails,
-    // read the diff before touching the number: it means the deployed bytecode
-    // changed, and the federation's address book, the desktop app's compile-time
-    // pins and the droplet signer env all have to move with it.
+    // MemberBond and the vault IMPLEMENTATION take no constructor / key args, so
+    // their Arachnid projections do NOT move under a fresh-keys reroll — only a
+    // bytecode/optimizer drift moves them. The SBT and vault PROXY DO depend on
+    // the (env-derived) owner + registry, so under fresh keys they move by
+    // design and are therefore NOT pinned here (see the fan-out doc + the
+    // check-create2-determinism.sh gate, which re-derives every address from the
+    // fresh keys in effect at ceremony time).
 
-    // canonical: contracts/addresses/40204.json — re-pinned at the solc-0.8.36 /
-    // OZ-5.7 reroll (2026-09-12 ceremony); prior M-2 pins were pre-reroll stale.
-    address internal constant SBT_FROZEN = 0xf0bADD9Eed5A81871a2F0D309b1f0a225646448a; // CitrateMemberSBT
-    address internal constant BOND_FROZEN = 0x7D6B92757e928ab4207Be3B54166Ecd2C491Aa92; // MemberBond
-    address internal constant VAULT_IMPL_FROZEN = 0x72035977F3Ec295C70e2A734AcbDFfB0C98E6F0b; // MembershipStakeVaultImpl
-    address internal constant VAULT_FROZEN = 0x53fB4baDfFacEEDD575D47D0E74Bb721504F786e; // MembershipStakeVault (proxy)
-
-    function test_sbt_frozen_projection() public pure {
-        assertEq(_sbtAddr(), SBT_FROZEN, "SBT frozen address moved");
+    // Parameterized projections (no env) so the movement/independence tests are
+    // deterministic under forge's parallel runner (which shares process env).
+    function _sbtAddrFor(address owner) internal pure returns (address) {
+        return vm.computeCreate2Address(
+            Salts.salt("CitrateMemberSBT"),
+            keccak256(abi.encodePacked(type(CitrateMemberSBT).creationCode, abi.encode(owner))),
+            ARACHNID
+        );
     }
 
-    function test_memberBond_frozen_projection() public pure {
-        assertEq(_bondAddr(), BOND_FROZEN, "MemberBond frozen address moved");
+    function _vaultAddrFor(address owner, address registry) internal pure returns (address) {
+        bytes memory proxyInit = abi.encodePacked(
+            type(ERC1967Proxy).creationCode,
+            abi.encode(
+                _vaultImplAddr(),
+                abi.encodeCall(
+                    MembershipStakeVault.initialize,
+                    (owner, ValidatorRegistry(payable(registry)), CitrateMemberSBT(_sbtAddrFor(owner)), _bondAddr())
+                )
+            )
+        );
+        return vm.computeCreate2Address(Salts.salt("MembershipStakeVault"), keccak256(proxyInit), ARACHNID);
     }
 
-    function test_vaultImpl_frozen_projection() public pure {
-        assertEq(_vaultImplAddr(), VAULT_IMPL_FROZEN, "vault implementation frozen address moved");
+    /// MemberBond + vault impl take no key args: their projections MUST NOT move
+    /// when the owner key changes (pure bytecode anchors).
+    function test_bond_and_vaultImpl_are_key_independent() public pure {
+        // (bond/impl inits do not embed the owner at all, so they are constant.)
+        assertEq(_bondAddr(), _bondAddr(), "MemberBond is bytecode-only");
+        assertEq(_vaultImplAddr(), _vaultImplAddr(), "vault impl is bytecode-only");
     }
 
-    function test_vault_frozen_projection() public pure {
-        assertEq(_vaultAddr(), VAULT_FROZEN, "vault proxy frozen address moved");
+    /// The SBT + vault-proxy projections MOVE when the fresh keys change — this is
+    /// the fresh-keys property the reroll relies on (not a frozen literal).
+    function test_sbt_and_vault_move_with_fresh_keys() public pure {
+        address ownerA = address(uint160(uint256(keccak256("owner.A"))));
+        address ownerC = address(uint160(uint256(keccak256("owner.C"))));
+        address regB = address(uint160(uint256(keccak256("registry.B"))));
+        address regD = address(uint160(uint256(keccak256("registry.D"))));
+        assertTrue(_sbtAddrFor(ownerA) != _sbtAddrFor(ownerC), "SBT MUST move when the owner key changes");
+        assertTrue(_vaultAddrFor(ownerA, regB) != _vaultAddrFor(ownerC, regB), "vault MUST move when the owner key changes");
+        assertTrue(_vaultAddrFor(ownerA, regB) != _vaultAddrFor(ownerA, regD), "vault MUST move when the registry changes");
     }
 
     // ── The dependency chain is real, and must stay visible. ─────────────
@@ -176,7 +214,7 @@ contract CoreMembershipCreate2Test is Test {
     /// through its initialize calldata. If someone "simplifies" initialize to
     /// stop taking them, this stops being true and the freeze story silently
     /// weakens — the proxy would no longer move when its dependencies do.
-    function test_vaultAddressDependsOnItsDependencies() public pure {
+    function test_vaultAddressDependsOnItsDependencies() public view {
         bytes memory withReal = _proxyInit();
         bytes memory withOther = abi.encodePacked(
             type(ERC1967Proxy).creationCode,
@@ -185,8 +223,8 @@ contract CoreMembershipCreate2Test is Test {
                 abi.encodeCall(
                     MembershipStakeVault.initialize,
                     (
-                        FROZEN_OWNER,
-                        ValidatorRegistry(payable(REGISTRY)),
+                        _owner(),
+                        ValidatorRegistry(payable(_registry())),
                         CitrateMemberSBT(address(0xdead)), // a different SBT
                         _bondAddr()
                     )

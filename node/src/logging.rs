@@ -61,14 +61,14 @@ impl TraceId {
     /// Create trace ID from string (for propagation)
     pub fn parse(s: &str) -> Option<Self> {
         let parts: Vec<&str> = s.split('-').collect();
-        if parts.len() != 3 {
+        let [timestamp, counter, random] = parts.as_slice() else {
             return None;
-        }
+        };
 
         Some(Self {
-            timestamp: u64::from_str_radix(parts[0], 16).ok()?,
-            counter: u64::from_str_radix(parts[1], 16).ok()?,
-            random: u16::from_str_radix(parts[2], 16).ok()?,
+            timestamp: u64::from_str_radix(timestamp, 16).ok()?,
+            counter: u64::from_str_radix(counter, 16).ok()?,
+            random: u16::from_str_radix(random, 16).ok()?,
         })
     }
 }

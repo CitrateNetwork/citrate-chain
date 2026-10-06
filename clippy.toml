@@ -1,0 +1,22 @@
+# PANIC-S1 (citrate-federation sprint 2026-09-30-panic-s1-chain-panic-surface).
+# `arithmetic_side_effects` flags every operator on non-primitive types. Elliptic-
+# curve points and scalars implement MODULAR group/field arithmetic: `+ - *` on
+# them wraps in the group by definition and cannot overflow or panic. Listing
+# them keeps the lint meaningful (integer overflow) instead of drowning it in
+# false positives. Add a type here ONLY if its operators are total (never panic).
+arithmetic-side-effects-allowed = [
+    "ark_r1cs_std::fields::fp::FpVar",
+    "ark_ec::models::short_weierstrass::Projective",
+    "ark_ec::short_weierstrass::Projective",
+    "ark_ec::models::short_weierstrass::affine::Affine",
+    "p256::ProjectivePoint",
+    "p256::Scalar",
+    "p256::AffinePoint",
+    "primeorder::ProjectivePoint",
+    "primeorder::projective::ProjectivePoint",
+    "p256::arithmetic::scalar::Scalar",
+    # BN254 scalar field (citrate-commd Poseidon): modular field arithmetic.
+    "ark_bn254::Fr",
+    "ark_ff::Fp",
+    "ark_ff::fields::models::fp::Fp",
+]

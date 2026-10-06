@@ -15,7 +15,9 @@ use citrate_execution::zkp::verifier::Verifier;
 
 fn initialized_backend() -> ZKPBackend {
     let backend = ZKPBackend::new();
-    backend.initialize().expect("backend initialize should succeed");
+    backend
+        .initialize()
+        .expect("backend initialize should succeed");
     backend
 }
 
@@ -66,7 +68,11 @@ fn make_data_integrity_circuit_data() -> Vec<u8> {
 fn test_zkp_backend_initialize() {
     let backend = ZKPBackend::new();
     let result = backend.initialize();
-    assert!(result.is_ok(), "initialize() should not fail: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "initialize() should not fail: {:?}",
+        result.err()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -81,7 +87,11 @@ fn test_zkp_backend_generate_proof_model_execution() {
         public_inputs: vec![],
     };
     let response = backend.generate_proof(request);
-    assert!(response.is_ok(), "model execution proof generation failed: {:?}", response.err());
+    assert!(
+        response.is_ok(),
+        "model execution proof generation failed: {:?}",
+        response.err()
+    );
     let resp = response.unwrap();
     assert_eq!(resp.proof_type, ProofType::ModelExecution);
     assert!(!resp.proof.proof_bytes.is_empty());
@@ -99,7 +109,11 @@ fn test_zkp_backend_generate_proof_gradient() {
         public_inputs: vec![],
     };
     let response = backend.generate_proof(request);
-    assert!(response.is_ok(), "gradient proof generation failed: {:?}", response.err());
+    assert!(
+        response.is_ok(),
+        "gradient proof generation failed: {:?}",
+        response.err()
+    );
     assert_eq!(response.unwrap().proof_type, ProofType::GradientSubmission);
 }
 
@@ -115,7 +129,11 @@ fn test_zkp_backend_generate_proof_state_transition() {
         public_inputs: vec![],
     };
     let response = backend.generate_proof(request);
-    assert!(response.is_ok(), "state transition proof failed: {:?}", response.err());
+    assert!(
+        response.is_ok(),
+        "state transition proof failed: {:?}",
+        response.err()
+    );
     assert_eq!(response.unwrap().proof_type, ProofType::StateTransition);
 }
 
@@ -131,7 +149,11 @@ fn test_zkp_backend_generate_proof_data_integrity() {
         public_inputs: vec![],
     };
     let response = backend.generate_proof(request);
-    assert!(response.is_ok(), "data integrity proof failed: {:?}", response.err());
+    assert!(
+        response.is_ok(),
+        "data integrity proof failed: {:?}",
+        response.err()
+    );
     assert_eq!(response.unwrap().proof_type, ProofType::DataIntegrity);
 }
 
@@ -181,7 +203,11 @@ fn test_zkp_backend_prove_tensor_computation() {
         vec![vec![1, 2, 3], vec![4, 5, 6]],
         vec![7, 8, 9],
     );
-    assert!(result.is_ok(), "tensor computation proof failed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "tensor computation proof failed: {:?}",
+        result.err()
+    );
     assert!(!result.unwrap().proof_bytes.is_empty());
 }
 
@@ -232,7 +258,11 @@ fn test_zkp_backend_batch_generate() {
         },
     ];
     let results = backend.batch_generate_proofs(requests);
-    assert!(results.is_ok(), "batch proof generation failed: {:?}", results.err());
+    assert!(
+        results.is_ok(),
+        "batch proof generation failed: {:?}",
+        results.err()
+    );
     assert_eq!(results.unwrap().len(), 3);
 }
 
@@ -242,9 +272,18 @@ fn test_zkp_backend_batch_generate() {
 #[test]
 fn test_zkp_backend_estimate_proving_time() {
     let backend = ZKPBackend::new();
-    assert_eq!(backend.estimate_proving_time(ProofType::ModelExecution), 500);
-    assert_eq!(backend.estimate_proving_time(ProofType::GradientSubmission), 750);
-    assert_eq!(backend.estimate_proving_time(ProofType::StateTransition), 300);
+    assert_eq!(
+        backend.estimate_proving_time(ProofType::ModelExecution),
+        500
+    );
+    assert_eq!(
+        backend.estimate_proving_time(ProofType::GradientSubmission),
+        750
+    );
+    assert_eq!(
+        backend.estimate_proving_time(ProofType::StateTransition),
+        300
+    );
     assert_eq!(backend.estimate_proving_time(ProofType::DataIntegrity), 400);
 }
 
@@ -261,7 +300,12 @@ fn test_zkp_prover_setup_all_types() {
         ProofType::DataIntegrity,
     ] {
         let result = prover.setup(*proof_type);
-        assert!(result.is_ok(), "prover setup failed for {:?}: {:?}", proof_type, result.err());
+        assert!(
+            result.is_ok(),
+            "prover setup failed for {:?}: {:?}",
+            proof_type,
+            result.err()
+        );
     }
 }
 
@@ -279,7 +323,11 @@ fn test_zkp_verifier_new() {
     let result = verifier.verify(ProofType::ModelExecution, &bad_proof);
     assert!(result.is_err());
     let err_msg = format!("{}", result.unwrap_err());
-    assert!(err_msg.contains("Key not found"), "expected KeyNotFound, got: {}", err_msg);
+    assert!(
+        err_msg.contains("Key not found"),
+        "expected KeyNotFound, got: {}",
+        err_msg
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -362,7 +410,10 @@ fn test_zkp_circuit_creation() {
 fn test_zkp_backend_default() {
     let backend = ZKPBackend::default();
     // Default should be identical to new()
-    assert_eq!(backend.estimate_proving_time(ProofType::ModelExecution), 500);
+    assert_eq!(
+        backend.estimate_proving_time(ProofType::ModelExecution),
+        500
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -379,7 +430,11 @@ fn test_zkp_generate_proof_invalid_circuit_data() {
     let result = backend.generate_proof(request);
     assert!(result.is_err());
     let err_msg = format!("{}", result.unwrap_err());
-    assert!(err_msg.contains("Invalid circuit"), "expected InvalidCircuit, got: {}", err_msg);
+    assert!(
+        err_msg.contains("Invalid circuit"),
+        "expected InvalidCircuit, got: {}",
+        err_msg
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -413,14 +468,12 @@ fn test_zkp_verifier_default() {
 #[test]
 fn test_zkp_prove_training_round() {
     let backend = initialized_backend();
-    let result = backend.prove_training_round(
-        &[1u8; 32],
-        &[2u8; 32],
-        vec![3u8; 64],
-        0.05,
-        512,
+    let result = backend.prove_training_round(&[1u8; 32], &[2u8; 32], vec![3u8; 64], 0.05, 512);
+    assert!(
+        result.is_ok(),
+        "prove_training_round failed: {:?}",
+        result.err()
     );
-    assert!(result.is_ok(), "prove_training_round failed: {:?}", result.err());
 }
 
 // ---------------------------------------------------------------------------

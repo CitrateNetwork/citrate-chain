@@ -135,7 +135,11 @@ async fn test_invalid_block_reduces_peer_score() {
 
     // Score should have decreased by SCORE_INVALID_BLOCK (-25)
     let score = peer.info.read().await.score;
-    assert_eq!(score, -25, "Expected score to be -25 after invalid block, got {}", score);
+    assert_eq!(
+        score, -25,
+        "Expected score to be -25 after invalid block, got {}",
+        score
+    );
 }
 
 #[tokio::test]
@@ -161,7 +165,10 @@ async fn test_score_below_threshold_triggers_ban() {
     }
 
     // Peer should now be banned and removed
-    assert!(pm.get_peer(&peer_id).is_none(), "Peer should be removed after score drops below threshold");
+    assert!(
+        pm.get_peer(&peer_id).is_none(),
+        "Peer should be removed after score drops below threshold"
+    );
     assert!(pm.is_banned(&addr).await, "Peer address should be banned");
 }
 
@@ -182,7 +189,11 @@ async fn test_valid_blocks_increase_score() {
     assert!(result.is_ok(), "Genesis block should pass validation");
 
     let score = peer.info.read().await.score;
-    assert_eq!(score, 1, "Score should increase by 1 for a valid block, got {}", score);
+    assert_eq!(
+        score, 1,
+        "Score should increase by 1 for a valid block, got {}",
+        score
+    );
 }
 
 #[tokio::test]
@@ -201,9 +212,16 @@ async fn test_banned_peer_reconnection_rejected() {
     // Try to connect — should fail
     let peer_id = PeerId::new("banned_reconnect".into());
     let result = pm.connect_to_peer(peer_id, addr).await;
-    assert!(result.is_err(), "Connecting to a banned address should fail");
+    assert!(
+        result.is_err(),
+        "Connecting to a banned address should fail"
+    );
     let err_msg = result.unwrap_err().to_string();
-    assert!(err_msg.contains("banned"), "Error should mention ban: {}", err_msg);
+    assert!(
+        err_msg.contains("banned"),
+        "Error should mention ban: {}",
+        err_msg
+    );
 }
 
 // ===========================================================================
@@ -270,7 +288,10 @@ async fn test_inbound_connection_rejected_at_capacity() {
         Direction::Inbound,
     );
     let result = pm.add_peer(extra_inbound).await;
-    assert!(result.is_err(), "Should reject inbound peer beyond max_inbound");
+    assert!(
+        result.is_err(),
+        "Should reject inbound peer beyond max_inbound"
+    );
 
     let (_, inbound, _) = pm.get_peer_counts().await;
     assert_eq!(inbound, 2);
@@ -353,7 +374,10 @@ async fn test_future_timestamp_block_rejected() {
     let future_ts = current_timestamp() + 3600;
     let block = make_non_genesis_block(5, 10, future_ts);
     let result = gossip.handle_new_block(block, &peer_id).await;
-    assert!(result.is_err(), "Block with future timestamp should be rejected");
+    assert!(
+        result.is_err(),
+        "Block with future timestamp should be rejected"
+    );
 
     let score = peer.info.read().await.score;
     assert_eq!(score, -25, "Score should decrease by SCORE_INVALID_BLOCK");
@@ -371,7 +395,10 @@ async fn test_zero_blue_score_non_genesis_rejected() {
     // Non-genesis block with blue_score = 0
     let block = make_non_genesis_block(10, 0, current_timestamp());
     let result = gossip.handle_new_block(block, &peer_id).await;
-    assert!(result.is_err(), "Non-genesis block with zero blue_score should be rejected");
+    assert!(
+        result.is_err(),
+        "Non-genesis block with zero blue_score should be rejected"
+    );
 }
 
 #[tokio::test]
@@ -400,10 +427,16 @@ async fn test_duplicate_block_deduplicated() {
 
     // Second submission — now propagated=true, so this is deduplicated
     let result2 = gossip.handle_new_block(genesis, &peer_id).await;
-    assert!(result2.is_ok(), "Duplicate block should be silently deduplicated");
+    assert!(
+        result2.is_ok(),
+        "Duplicate block should be silently deduplicated"
+    );
 
     let (blocks_received, _, _, _, duplicates_filtered, _, _, _) = gossip.get_stats().await;
-    assert_eq!(blocks_received, 1, "Only one block should be counted as received");
+    assert_eq!(
+        blocks_received, 1,
+        "Only one block should be counted as received"
+    );
     assert_eq!(duplicates_filtered, 1, "One duplicate should be filtered");
 }
 
@@ -439,7 +472,10 @@ async fn test_subnet_diversity_enforcement() {
     let (total, _, _) = pm.get_peer_counts().await;
     // Currently all are accepted (no subnet limit). When subnet limits are
     // added, expect total < 5.
-    assert_eq!(total, 5, "All same-subnet peers currently accepted (no subnet limit enforced)");
+    assert_eq!(
+        total, 5,
+        "All same-subnet peers currently accepted (no subnet limit enforced)"
+    );
 }
 
 #[tokio::test]
@@ -606,5 +642,8 @@ async fn test_gossip_stats_tracking() {
 
     let (br, _bp, tr, _tp, _dup, _, _, _) = gossip.get_stats().await;
     assert_eq!(br, 1);
-    assert_eq!(tr, 1, "transactions_received should be 1 after one valid tx");
+    assert_eq!(
+        tr, 1,
+        "transactions_received should be 1 after one valid tx"
+    );
 }

@@ -5,7 +5,7 @@
 //! Attack surfaces: overflow, replay, malleability, cross-chain,
 //! nonce manipulation, gas manipulation, data injection.
 
-use citrate_wallet_core::chain::{TransactionBuilder, RpcClient};
+use citrate_wallet_core::chain::{RpcClient, TransactionBuilder};
 use citrate_wallet_core::keys::UnifiedKey;
 use ed25519_dalek::SigningKey as Ed25519SigningKey;
 
@@ -28,12 +28,14 @@ fn test_ed25519_signature_binds_chain_id() {
         .to("0xb5ddd4eb356ddf3bf51eb3aec1ed28213be59129")
         .value(1000)
         .chain_id(1)
-        .sign(&key, 0).expect("sign chain 1");
+        .sign(&key, 0)
+        .expect("sign chain 1");
     let tx2 = TransactionBuilder::new()
         .to("0xb5ddd4eb356ddf3bf51eb3aec1ed28213be59129")
         .value(1000)
         .chain_id(40204)
-        .sign(&key, 0).expect("sign chain 40204");
+        .sign(&key, 0)
+        .expect("sign chain 40204");
 
     assert_ne!(tx1.signature, tx2.signature, "v2 binds chain_id");
 }
@@ -41,9 +43,18 @@ fn test_ed25519_signature_binds_chain_id() {
 #[test]
 fn test_different_nonces_produce_different_hashes() {
     let key = test_key();
-    let tx1 = TransactionBuilder::new().value(1000).sign(&key, 0).expect("nonce 0");
-    let tx2 = TransactionBuilder::new().value(1000).sign(&key, 1).expect("nonce 1");
-    assert_ne!(tx1.hash, tx2.hash, "Different nonces must produce different hashes");
+    let tx1 = TransactionBuilder::new()
+        .value(1000)
+        .sign(&key, 0)
+        .expect("nonce 0");
+    let tx2 = TransactionBuilder::new()
+        .value(1000)
+        .sign(&key, 1)
+        .expect("nonce 1");
+    assert_ne!(
+        tx1.hash, tx2.hash,
+        "Different nonces must produce different hashes"
+    );
 }
 
 #[test]
@@ -56,15 +67,23 @@ fn test_same_params_produce_same_hash() {
         .to(to_addr)
         .value(1000)
         .chain_id(40204)
-        .sign(&key, 5).expect("sign 1");
+        .sign(&key, 5)
+        .expect("sign 1");
     let tx2 = TransactionBuilder::new()
         .to(to_addr)
         .value(1000)
         .chain_id(40204)
-        .sign(&key, 5).expect("sign 2");
+        .sign(&key, 5)
+        .expect("sign 2");
 
-    assert_eq!(tx1.hash, tx2.hash, "Same params must produce same hash (deterministic)");
-    assert_eq!(tx1.signature, tx2.signature, "Ed25519 signatures must be deterministic");
+    assert_eq!(
+        tx1.hash, tx2.hash,
+        "Same params must produce same hash (deterministic)"
+    );
+    assert_eq!(
+        tx1.signature, tx2.signature,
+        "Ed25519 signatures must be deterministic"
+    );
 }
 
 // =========================================================================
@@ -74,9 +93,7 @@ fn test_same_params_produce_same_hash() {
 #[test]
 fn test_max_u128_value() {
     let key = test_key();
-    let tx = TransactionBuilder::new()
-        .value(u128::MAX)
-        .sign(&key, 0);
+    let tx = TransactionBuilder::new().value(u128::MAX).sign(&key, 0);
     assert!(tx.is_ok(), "Max u128 value should not panic");
 }
 
@@ -85,34 +102,29 @@ fn test_zero_value() {
     let key = test_key();
     let tx = TransactionBuilder::new()
         .value(0)
-        .sign(&key, 0).expect("zero value");
+        .sign(&key, 0)
+        .expect("zero value");
     assert_eq!(tx.value, 0);
 }
 
 #[test]
 fn test_max_nonce() {
     let key = test_key();
-    let tx = TransactionBuilder::new()
-        .value(1000)
-        .sign(&key, u64::MAX);
+    let tx = TransactionBuilder::new().value(1000).sign(&key, u64::MAX);
     assert!(tx.is_ok(), "Max nonce should not panic");
 }
 
 #[test]
 fn test_max_gas_price() {
     let key = test_key();
-    let tx = TransactionBuilder::new()
-        .gas_price(u64::MAX)
-        .sign(&key, 0);
+    let tx = TransactionBuilder::new().gas_price(u64::MAX).sign(&key, 0);
     assert!(tx.is_ok(), "Max gas price should not panic");
 }
 
 #[test]
 fn test_max_gas_limit() {
     let key = test_key();
-    let tx = TransactionBuilder::new()
-        .gas_limit(u64::MAX)
-        .sign(&key, 0);
+    let tx = TransactionBuilder::new().gas_limit(u64::MAX).sign(&key, 0);
     assert!(tx.is_ok(), "Max gas limit should not panic");
 }
 
@@ -121,7 +133,8 @@ fn test_zero_gas_limit() {
     let key = test_key();
     let tx = TransactionBuilder::new()
         .gas_limit(0)
-        .sign(&key, 0).expect("zero gas");
+        .sign(&key, 0)
+        .expect("zero gas");
     assert_eq!(tx.gas_limit, 0);
 }
 
@@ -130,7 +143,8 @@ fn test_zero_gas_price() {
     let key = test_key();
     let tx = TransactionBuilder::new()
         .gas_price(0)
-        .sign(&key, 0).expect("zero gas price");
+        .sign(&key, 0)
+        .expect("zero gas price");
     assert_eq!(tx.gas_price, 0);
 }
 
@@ -144,7 +158,8 @@ fn test_large_data_payload() {
     let data = vec![0xABu8; 100_000]; // 100KB payload
     let tx = TransactionBuilder::new()
         .data(data.clone())
-        .sign(&key, 0).expect("large data");
+        .sign(&key, 0)
+        .expect("large data");
     assert_eq!(tx.data.len(), 100_000);
 }
 
@@ -153,7 +168,8 @@ fn test_empty_data() {
     let key = test_key();
     let tx = TransactionBuilder::new()
         .data(vec![])
-        .sign(&key, 0).expect("empty data");
+        .sign(&key, 0)
+        .expect("empty data");
     assert!(tx.data.is_empty());
 }
 
@@ -163,7 +179,8 @@ fn test_data_with_null_bytes() {
     let data = vec![0x00; 100];
     let tx = TransactionBuilder::new()
         .data(data)
-        .sign(&key, 0).expect("null data");
+        .sign(&key, 0)
+        .expect("null data");
     assert_eq!(tx.data.len(), 100);
 }
 
@@ -181,16 +198,16 @@ fn test_to_address_with_injection() {
         .to("0x' OR 1=1; DROP TABLE --")
         .value(1000)
         .sign(&key, 0);
-    assert!(result.is_err(), "Garbage hex must error cleanly, not silently accept");
+    assert!(
+        result.is_err(),
+        "Garbage hex must error cleanly, not silently accept"
+    );
 }
 
 #[test]
 fn test_to_address_empty() {
     let key = test_key();
-    let tx = TransactionBuilder::new()
-        .to("")
-        .value(1000)
-        .sign(&key, 0);
+    let tx = TransactionBuilder::new().to("").value(1000).sign(&key, 0);
     assert!(tx.is_ok(), "Empty to-address should not panic");
 }
 
@@ -200,7 +217,8 @@ fn test_contract_deploy_no_to() {
     let tx = TransactionBuilder::new()
         .data(vec![0x60, 0x80, 0x60, 0x40])
         .gas_limit(1_000_000)
-        .sign(&key, 0).expect("deploy");
+        .sign(&key, 0)
+        .expect("deploy");
     assert!(tx.to.is_none(), "Contract deploy has no to-address");
 }
 
@@ -237,39 +255,71 @@ fn test_signature_length_ed25519() {
     let key = test_key();
     let tx = TransactionBuilder::new()
         .value(1000)
-        .sign(&key, 0).expect("sign");
-    assert_eq!(tx.signature.len(), 128, "Ed25519 signature = 64 bytes = 128 hex chars");
+        .sign(&key, 0)
+        .expect("sign");
+    assert_eq!(
+        tx.signature.len(),
+        128,
+        "Ed25519 signature = 64 bytes = 128 hex chars"
+    );
 }
 
 #[test]
 fn test_signature_changes_with_different_key() {
     let key1 = test_key();
     let key2 = test_key();
-    let tx1 = TransactionBuilder::new().value(1000).sign(&key1, 0).expect("sign 1");
-    let tx2 = TransactionBuilder::new().value(1000).sign(&key2, 0).expect("sign 2");
-    assert_ne!(tx1.signature, tx2.signature, "Different keys must produce different signatures");
+    let tx1 = TransactionBuilder::new()
+        .value(1000)
+        .sign(&key1, 0)
+        .expect("sign 1");
+    let tx2 = TransactionBuilder::new()
+        .value(1000)
+        .sign(&key2, 0)
+        .expect("sign 2");
+    assert_ne!(
+        tx1.signature, tx2.signature,
+        "Different keys must produce different signatures"
+    );
     // Tx hash must also differ because `from` (signer pubkey) is part of the
     // canonical signed bytes. The prior assertion that same content → same
     // hash regardless of signer was incorrect for chain-compatible txs: if
     // two different signers produced the same tx hash, the hash would no
     // longer uniquely identify a submitted transaction.
-    assert_ne!(tx1.hash, tx2.hash, "Hash must depend on signer (via the from field)");
+    assert_ne!(
+        tx1.hash, tx2.hash,
+        "Hash must depend on signer (via the from field)"
+    );
 }
 
 #[test]
 fn test_raw_bytes_not_empty() {
     let key = test_key();
-    let tx = TransactionBuilder::new().value(1000).sign(&key, 0).expect("sign");
-    assert!(!tx.raw.is_empty(), "Serialized transaction must not be empty");
-    assert!(tx.raw.len() > 100, "Serialized transaction should be substantial");
+    let tx = TransactionBuilder::new()
+        .value(1000)
+        .sign(&key, 0)
+        .expect("sign");
+    assert!(
+        !tx.raw.is_empty(),
+        "Serialized transaction must not be empty"
+    );
+    assert!(
+        tx.raw.len() > 100,
+        "Serialized transaction should be substantial"
+    );
 }
 
 #[test]
 fn test_from_field_matches_signer() {
     let key = test_key();
     let expected_from = hex::encode(key.verifying_key().to_bytes());
-    let tx = TransactionBuilder::new().value(1000).sign(&key, 0).expect("sign");
-    assert_eq!(tx.from, expected_from, "From field must match the signing key's public key");
+    let tx = TransactionBuilder::new()
+        .value(1000)
+        .sign(&key, 0)
+        .expect("sign");
+    assert_eq!(
+        tx.from, expected_from,
+        "From field must match the signing key's public key"
+    );
 }
 
 // =========================================================================
@@ -284,7 +334,10 @@ fn test_unified_ed25519_sign_consistency() {
     let data = b"test transaction data";
     let sig1 = unified.sign(data);
     let sig2 = unified.sign(data);
-    assert_eq!(sig1, sig2, "UnifiedKey Ed25519 signing must be deterministic");
+    assert_eq!(
+        sig1, sig2,
+        "UnifiedKey Ed25519 signing must be deterministic"
+    );
 }
 
 #[test]
@@ -295,7 +348,10 @@ fn test_unified_secp256k1_sign_consistency() {
     let data = b"test transaction data";
     let sig1 = unified.sign(data);
     let sig2 = unified.sign(data);
-    assert_eq!(sig1, sig2, "UnifiedKey secp256k1 signing must be deterministic (RFC 6979)");
+    assert_eq!(
+        sig1, sig2,
+        "UnifiedKey secp256k1 signing must be deterministic (RFC 6979)"
+    );
 }
 
 #[test]
@@ -312,7 +368,10 @@ fn test_unified_key_types_produce_different_signatures() {
     let ed_sig = ed_unified.sign(data);
     let secp_sig = secp_unified.sign(data);
 
-    assert_ne!(ed_sig, secp_sig, "Different curves must produce different signatures from same secret");
+    assert_ne!(
+        ed_sig, secp_sig,
+        "Different curves must produce different signatures from same secret"
+    );
 }
 
 // =========================================================================

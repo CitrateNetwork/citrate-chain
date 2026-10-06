@@ -408,9 +408,7 @@ fn test_network_message_serialization_roundtrip_inference_request() {
     let recovered: NetworkMessage = bincode::deserialize(&bytes).unwrap();
     match recovered {
         NetworkMessage::InferenceRequest {
-            max_fee,
-            requester,
-            ..
+            max_fee, requester, ..
         } => {
             assert_eq!(max_fee, 1_000_000);
             assert_eq!(requester, vec![5, 6, 7]);
@@ -696,22 +694,42 @@ fn test_peer_info_initial_values() {
 
 #[test]
 fn test_protocol_version_compatible_same_major() {
-    let v1 = ProtocolVersion { major: 1, minor: 0, patch: 0 };
-    let v2 = ProtocolVersion { major: 1, minor: 5, patch: 3 };
+    let v1 = ProtocolVersion {
+        major: 1,
+        minor: 0,
+        patch: 0,
+    };
+    let v2 = ProtocolVersion {
+        major: 1,
+        minor: 5,
+        patch: 3,
+    };
     assert!(v1.is_compatible(&v2));
     assert!(v2.is_compatible(&v1));
 }
 
 #[test]
 fn test_protocol_version_incompatible_different_major() {
-    let v1 = ProtocolVersion { major: 1, minor: 0, patch: 0 };
-    let v2 = ProtocolVersion { major: 2, minor: 0, patch: 0 };
+    let v1 = ProtocolVersion {
+        major: 1,
+        minor: 0,
+        patch: 0,
+    };
+    let v2 = ProtocolVersion {
+        major: 2,
+        minor: 0,
+        patch: 0,
+    };
     assert!(!v1.is_compatible(&v2));
 }
 
 #[test]
 fn test_protocol_version_display() {
-    let v = ProtocolVersion { major: 1, minor: 2, patch: 3 };
+    let v = ProtocolVersion {
+        major: 1,
+        minor: 2,
+        patch: 3,
+    };
     assert_eq!(format!("{}", v), "1.2.3");
 }
 
@@ -730,7 +748,11 @@ fn test_protocol_version_current() {
 fn test_message_priority_all_variants() {
     // Critical
     assert_eq!(
-        NetworkMessage::GetHeaders { from: Hash::default(), count: 1 }.priority(),
+        NetworkMessage::GetHeaders {
+            from: Hash::default(),
+            count: 1
+        }
+        .priority(),
         MessagePriority::Critical
     );
 
@@ -743,7 +765,10 @@ fn test_message_priority_all_variants() {
         MessagePriority::Normal
     );
     assert_eq!(
-        NetworkMessage::Transactions { transactions: vec![] }.priority(),
+        NetworkMessage::Transactions {
+            transactions: vec![]
+        }
+        .priority(),
         MessagePriority::Normal
     );
 
@@ -759,7 +784,10 @@ fn test_message_priority_all_variants() {
 
     // Default Normal (for variants not explicitly matched)
     assert_eq!(
-        NetworkMessage::Disconnect { reason: "bye".into() }.priority(),
+        NetworkMessage::Disconnect {
+            reason: "bye".into()
+        }
+        .priority(),
         MessagePriority::Normal
     );
     assert_eq!(
@@ -776,15 +804,35 @@ fn test_message_priority_all_variants() {
 fn test_message_requires_response_comprehensive() {
     // Messages that require responses
     assert!(NetworkMessage::Ping { nonce: 0 }.requires_response());
-    assert!(NetworkMessage::GetBlocks { from: Hash::default(), count: 1, step: 1 }.requires_response());
-    assert!(NetworkMessage::GetHeaders { from: Hash::default(), count: 1 }.requires_response());
+    assert!(NetworkMessage::GetBlocks {
+        from: Hash::default(),
+        count: 1,
+        step: 1
+    }
+    .requires_response());
+    assert!(NetworkMessage::GetHeaders {
+        from: Hash::default(),
+        count: 1
+    }
+    .requires_response());
     assert!(NetworkMessage::GetTransactions { hashes: vec![] }.requires_response());
     assert!(NetworkMessage::GetMempool.requires_response());
     assert!(NetworkMessage::GetPeers.requires_response());
-    assert!(NetworkMessage::GetBlueSet { block: Hash::default() }.requires_response());
+    assert!(NetworkMessage::GetBlueSet {
+        block: Hash::default()
+    }
+    .requires_response());
     assert!(NetworkMessage::GetDagInfo { blocks: vec![] }.requires_response());
-    assert!(NetworkMessage::GetState { root: Hash::default(), keys: vec![] }.requires_response());
-    assert!(NetworkMessage::GetBlocksByHeight { from_height: 0, count: 1 }.requires_response());
+    assert!(NetworkMessage::GetState {
+        root: Hash::default(),
+        keys: vec![]
+    }
+    .requires_response());
+    assert!(NetworkMessage::GetBlocksByHeight {
+        from_height: 0,
+        count: 1
+    }
+    .requires_response());
 
     // Messages that do NOT require responses
     assert!(!NetworkMessage::Pong { nonce: 0 }.requires_response());
@@ -951,7 +999,11 @@ async fn test_peer_manager_max_inbound_limit() {
     // First inbound succeeds
     let (tx1, rx1) = mpsc::channel(10);
     let p1 = Arc::new(Peer::new(
-        PeerInfo::new(PeerId::new("in_1".into()), "127.0.0.1:9600".parse().unwrap(), Direction::Inbound),
+        PeerInfo::new(
+            PeerId::new("in_1".into()),
+            "127.0.0.1:9600".parse().unwrap(),
+            Direction::Inbound,
+        ),
         tx1,
         rx1,
     ));
@@ -960,7 +1012,11 @@ async fn test_peer_manager_max_inbound_limit() {
     // Second inbound fails
     let (tx2, rx2) = mpsc::channel(10);
     let p2 = Arc::new(Peer::new(
-        PeerInfo::new(PeerId::new("in_2".into()), "127.0.0.1:9601".parse().unwrap(), Direction::Inbound),
+        PeerInfo::new(
+            PeerId::new("in_2".into()),
+            "127.0.0.1:9601".parse().unwrap(),
+            Direction::Inbound,
+        ),
         tx2,
         rx2,
     ));
@@ -982,7 +1038,11 @@ async fn test_peer_manager_max_outbound_limit() {
     // First outbound succeeds
     let (tx1, rx1) = mpsc::channel(10);
     let p1 = Arc::new(Peer::new(
-        PeerInfo::new(PeerId::new("out_1".into()), "127.0.0.1:9700".parse().unwrap(), Direction::Outbound),
+        PeerInfo::new(
+            PeerId::new("out_1".into()),
+            "127.0.0.1:9700".parse().unwrap(),
+            Direction::Outbound,
+        ),
         tx1,
         rx1,
     ));
@@ -991,7 +1051,11 @@ async fn test_peer_manager_max_outbound_limit() {
     // Second outbound fails
     let (tx2, rx2) = mpsc::channel(10);
     let p2 = Arc::new(Peer::new(
-        PeerInfo::new(PeerId::new("out_2".into()), "127.0.0.1:9701".parse().unwrap(), Direction::Outbound),
+        PeerInfo::new(
+            PeerId::new("out_2".into()),
+            "127.0.0.1:9701".parse().unwrap(),
+            Direction::Outbound,
+        ),
         tx2,
         rx2,
     ));
@@ -1024,7 +1088,11 @@ async fn test_update_peer_score_positive() {
     let peer_id = PeerId::new("score_test".into());
     let (tx, rx) = mpsc::channel(10);
     let peer = Arc::new(Peer::new(
-        PeerInfo::new(peer_id.clone(), "127.0.0.1:9800".parse().unwrap(), Direction::Inbound),
+        PeerInfo::new(
+            peer_id.clone(),
+            "127.0.0.1:9800".parse().unwrap(),
+            Direction::Inbound,
+        ),
         tx,
         rx,
     ));
@@ -1041,7 +1109,9 @@ async fn test_update_peer_score_positive() {
 async fn test_update_peer_score_nonexistent() {
     let manager = PeerManager::new(PeerManagerConfig::default());
     // Should not panic
-    manager.update_peer_score(&PeerId::new("ghost".into()), -5).await;
+    manager
+        .update_peer_score(&PeerId::new("ghost".into()), -5)
+        .await;
 }
 
 // ---------------------------------------------------------------------------

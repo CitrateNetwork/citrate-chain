@@ -24,8 +24,8 @@ fn fresh_keystore() -> PathBuf {
 
 fn read_entries_json(keystore_path: &Path) -> Vec<Value> {
     let path = keystore_path.join("keys.json");
-    let content = std::fs::read_to_string(&path)
-        .expect("keystore JSON should exist after create_account");
+    let content =
+        std::fs::read_to_string(&path).expect("keystore JSON should exist after create_account");
     serde_json::from_str(&content).expect("keystore JSON should parse as JSON array")
 }
 
@@ -124,9 +124,7 @@ fn test_wal01_unlock_does_not_auto_migrate() {
     km.lock();
 
     let entries = read_entries_json(&path);
-    let kdf_version = entries[0]
-        .get("kdf_version")
-        .and_then(|v| v.as_u64());
+    let kdf_version = entries[0].get("kdf_version").and_then(|v| v.as_u64());
     assert!(
         kdf_version.is_none() || kdf_version == Some(1),
         "WAL-01 / WP-A1.3: read-only unlock must NOT auto-migrate. \
@@ -166,9 +164,7 @@ fn test_wal01_explicit_migrate_upgrades_v1_to_v2() {
     // Verify the migrated entry still unlocks under the same password.
     let km2 = KeyManager::new(&path);
     km2.load().expect("load post-migration");
-    let count = km2
-        .unlock(password)
-        .expect("migrated entry should unlock");
+    let count = km2.unlock(password).expect("migrated entry should unlock");
     assert_eq!(count, 1, "migrated entry should unlock");
     assert!(
         !km2.has_legacy_kdf_entries(),
@@ -218,9 +214,7 @@ fn test_wal01_migration_fails_atomically_on_wrong_password() {
 
     // Keystore unchanged on disk.
     let entries = read_entries_json(&path);
-    let kdf_version = entries[0]
-        .get("kdf_version")
-        .and_then(|v| v.as_u64());
+    let kdf_version = entries[0].get("kdf_version").and_then(|v| v.as_u64());
     assert!(
         kdf_version.is_none() || kdf_version == Some(1),
         "WP-A1.3: failed migration must leave keystore at v1, got kdf_version: {:?}",
@@ -233,7 +227,10 @@ fn test_wal01_migration_fails_atomically_on_wrong_password() {
     let count = km2
         .unlock(password)
         .expect("v1 entry should still unlock under correct password");
-    assert_eq!(count, 1, "atomicity: keystore unaltered by failed migration");
+    assert_eq!(
+        count, 1,
+        "atomicity: keystore unaltered by failed migration"
+    );
 }
 
 #[test]
@@ -257,7 +254,9 @@ fn test_wal01_migration_preserves_address_and_pubkey() {
 
     let entries_pre = read_entries_json(&path);
     let address_pre = entries_pre[0]["address"].as_str().expect("pre address");
-    let pubkey_pre = entries_pre[0]["public_key_hex"].as_str().expect("pre pubkey");
+    let pubkey_pre = entries_pre[0]["public_key_hex"]
+        .as_str()
+        .expect("pre pubkey");
 
     let km = KeyManager::new(&path);
     km.load().expect("load");
@@ -265,7 +264,9 @@ fn test_wal01_migration_preserves_address_and_pubkey() {
 
     let entries_post = read_entries_json(&path);
     let address_post = entries_post[0]["address"].as_str().expect("post address");
-    let pubkey_post = entries_post[0]["public_key_hex"].as_str().expect("post pubkey");
+    let pubkey_post = entries_post[0]["public_key_hex"]
+        .as_str()
+        .expect("post pubkey");
 
     assert_eq!(
         address_pre, address_post,

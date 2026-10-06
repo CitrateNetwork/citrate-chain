@@ -1,3 +1,17 @@
+// PANIC-S1 G2: block production / apply / sync path (T1); panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use citrate_consensus::chain_selection::ChainSelector;
 use citrate_consensus::crypto::{self, Ed25519SigningKey};
 use citrate_consensus::dag_store::{DagStore, DagStoreError};
@@ -334,7 +348,7 @@ impl PanicBreaker {
         } else if !self.suspects.is_empty() {
             let probe_len = self.suspects.len().div_ceil(2);
             let probe: std::collections::HashSet<Hash> =
-                self.suspects[..probe_len].iter().copied().collect();
+                self.suspects.iter().take(probe_len).copied().collect();
             let narrowed: Vec<Transaction> = out
                 .iter()
                 .filter(|t| probe.contains(&t.hash))
@@ -385,7 +399,7 @@ impl PanicBreaker {
                 match round.len() {
                     0 => {}
                     1 => {
-                        self.control = Some(round[0]);
+                        self.control = round.first().copied();
                         self.suspects = round;
                     }
                     _ => self.suspects = round,
@@ -402,7 +416,7 @@ impl PanicBreaker {
     fn strike(&mut self, culprit: Hash) -> Vec<Hash> {
         let n = {
             let n = self.strikes.entry(culprit).or_insert(0);
-            *n += 1;
+            *n = n.saturating_add(1);
             *n
         };
         if n < PANIC_STRIKES_TO_EVICT {
@@ -649,7 +663,7 @@ impl BlockProducer {
         if latest_height > 0 {
             info!(
                 "Loading {} blocks from storage into DAG...",
-                latest_height + 1
+                latest_height.saturating_add(1)
             );
             for height in 0..=latest_height {
                 if let Ok(Some(block_hash)) = storage.blocks.get_block_by_height(height) {
@@ -702,7 +716,7 @@ impl BlockProducer {
             }
             info!(
                 "DAG loaded: {} blocks, resuming from height {}",
-                latest_height + 1,
+                latest_height.saturating_add(1),
                 latest_height
             );
         }
@@ -804,7 +818,7 @@ impl BlockProducer {
         if latest_height > 0 {
             info!(
                 "Loading {} blocks from storage into DAG...",
-                latest_height + 1
+                latest_height.saturating_add(1)
             );
             for height in 0..=latest_height {
                 if let Ok(Some(block_hash)) = storage.blocks.get_block_by_height(height) {
@@ -857,7 +871,7 @@ impl BlockProducer {
             }
             info!(
                 "DAG loaded: {} blocks, resuming from height {}",
-                latest_height + 1,
+                latest_height.saturating_add(1),
                 latest_height
             );
         }
@@ -1075,7 +1089,7 @@ impl BlockProducer {
 
             match self.guard_round(supervised_round(self.clone())).await {
                 RoundOutcome::Produced(block_hash) => {
-                    block_count += 1;
+                    block_count = block_count.saturating_add(1);
                     info!(
                         "Produced block #{} hash={} txs={}",
                         block_count,
@@ -1369,7 +1383,13 @@ impl BlockProducer {
         // contract assumes it is. Until then, in-band and correct beats exact and
         // rejected.
         let mut blue_set = citrate_consensus::types::BlueSet::new();
-        let blue_score = parent_blue_score + 1;
+        // A block at u64::MAX height/score cannot be extended: refuse to build.
+        let next_height = last_height
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("parent height {last_height} cannot be extended"))?;
+        let blue_score = parent_blue_score.checked_add(1).ok_or_else(|| {
+            anyhow::anyhow!("parent blue score {parent_blue_score} cannot be extended")
+        })?;
         blue_set.score = blue_score;
         blue_set.work = parent_blue_work; // base; calculate_blue_work below recomputes
 
@@ -1408,7 +1428,7 @@ impl BlockProducer {
         let transactions: Vec<citrate_consensus::types::Transaction> = if self
             .ghostdag
             .pba_hardening()
-            .active_at(last_height + 1)
+            .active_at(next_height)
         {
             let chain_id = self.executor.chain_id();
             let mut keep = Vec::with_capacity(transactions.len());
@@ -1449,7 +1469,7 @@ impl BlockProducer {
                     None => now,
                 }
             },
-            height: last_height + 1,
+            height: next_height,
             blue_score,
             blue_work,
             pruning_point: Hash::default(),
@@ -1458,27 +1478,12 @@ impl BlockProducer {
                 &self.signing_key,
                 &PublicKey::new(self.signing_key.verifying_key().to_bytes()),
                 &parent_vrf_output,
-                last_height + 1,
+                next_height,
             ),
-            base_fee_per_gas: {
-                // EIP-1559 base fee calculation from parent block
-                let parent_base_fee: u64 = 1_000_000_000; // 1 gwei minimum
-                let parent_gas_used: u64 = 0; // Will be read from parent block when available
-                let parent_gas_limit: u64 = 30_000_000;
-                let target_gas = parent_gas_limit / 2;
-                if parent_gas_used == target_gas {
-                    parent_base_fee
-                } else if parent_gas_used > target_gas {
-                    let delta = parent_gas_used - target_gas;
-                    let fee_delta = std::cmp::max(parent_base_fee * delta / target_gas / 8, 1);
-                    parent_base_fee + fee_delta
-                } else {
-                    let delta = target_gas - parent_gas_used;
-                    let fee_delta = parent_base_fee * delta / target_gas / 8;
-                    std::cmp::max(parent_base_fee.saturating_sub(fee_delta), 1_000_000_000)
-                    // floor at 1 gwei
-                }
-            },
+            // The §R' import rule requires the canonical base fee; the former inline
+            // "EIP-1559" computation used constant inputs (parent gas used = 0) and
+            // always evaluated to exactly this value.
+            base_fee_per_gas: citrate_execution::block_rewards::CANONICAL_BASE_FEE_PER_GAS,
             gas_used: 0,           // Will be updated after execution
             gas_limit: 30_000_000, // 30M gas default
             // EXECUTE-ON-RECEIVE: commit the beneficiary so receivers can reproduce state_root.
@@ -1558,7 +1563,11 @@ impl BlockProducer {
             .ghostdag_params(self.ghostdag.params().clone())
             .transactions(executed_transactions.clone())
             .build_unhashed();
-        let reward = self.reward_calculator.calculate_reward(&temp_block);
+        // PANIC-S1 D3: an uncomputable reward rejects the block (never panics/saturates).
+        let reward = self
+            .reward_calculator
+            .calculate_reward(&temp_block)
+            .map_err(|e| anyhow::anyhow!("block reward rejected: {e}"))?;
         // `basic_credits` mirrors `canonical_apply::reward_credits` exactly:
         // [(coinbase, validator_reward), (0x11..treasury, treasury_reward)]. Below the
         // VALIDATOR-S1 activation (or before a snapshot is materialized) this credits only
@@ -1871,8 +1880,8 @@ impl BlockProducer {
         use sha3::{Digest, Keccak256};
 
         // Compute function selector for heartbeat()
-        let selector_hash = Keccak256::digest(b"heartbeat()");
-        let calldata_hex = format!("0x{}", hex::encode(&selector_hash[..4]));
+        let [a, b, c, d, ..]: [u8; 32] = Keccak256::digest(b"heartbeat()").into();
+        let calldata_hex = format!("0x{}", hex::encode([a, b, c, d]));
 
         // Use the HeartbeatMonitor contract address from compute contract addresses.
         // In production this would be loaded from contract_addresses config.
@@ -1963,7 +1972,8 @@ impl BlockProducer {
         if cand_height >= applied_height {
             return false;
         }
-        let steps = applied_height - cand_height;
+        // cand_height < applied_height (checked above).
+        let steps = applied_height.saturating_sub(cand_height);
         if steps > SUPERSEDE_WALK_CAP {
             return false; // too deep to be post-restart DAG lag — leave it to the drain
         }
@@ -2078,7 +2088,7 @@ impl BlockProducer {
                 if child_h.saturating_sub(tip_h)
                     > citrate_consensus::ghostdag::MERGE_PARENT_MAX_DEPTH
                 {
-                    dropped_deep += 1;
+                    dropped_deep = dropped_deep.saturating_add(1);
                     continue;
                 }
             }
@@ -2343,9 +2353,7 @@ impl BlockProducer {
             hasher.update(receipt.gas_used.to_le_bytes());
         }
 
-        let hash_bytes = hasher.finalize();
-        let mut hash_array = [0u8; 32];
-        hash_array.copy_from_slice(&hash_bytes[..32]);
+        let hash_array: [u8; 32] = hasher.finalize().into();
         Ok(Hash::new(hash_array))
     }
 
@@ -2357,20 +2365,16 @@ impl BlockProducer {
         // Hash any AI-related transaction data
         for tx in transactions {
             // Check if transaction contains AI operations
-            if tx.data.len() >= 4 {
-                match &tx.data[0..4] {
-                    [0x01, 0x00, 0x00, 0x00] | // Register model
-                    [0x02, 0x00, 0x00, 0x00] => { // Inference request
-                        hasher.update(&tx.data);
-                    }
-                    _ => {}
+            match tx.data.get(0..4) {
+                Some([0x01, 0x00, 0x00, 0x00]) | // Register model
+                Some([0x02, 0x00, 0x00, 0x00]) => { // Inference request
+                    hasher.update(&tx.data);
                 }
+                _ => {}
             }
         }
 
-        let hash_bytes = hasher.finalize();
-        let mut hash_array = [0u8; 32];
-        hash_array.copy_from_slice(&hash_bytes[..32]);
+        let hash_array: [u8; 32] = hasher.finalize().into();
         Ok(Hash::new(hash_array))
     }
 
@@ -2688,9 +2692,10 @@ impl CandidateWindow {
     }
 
     pub(crate) fn record(&mut self, tx: &Transaction) {
-        self.count += 1;
+        self.count = self.count.saturating_add(1);
         self.bytes = self.bytes.saturating_add(Mempool::tx_size(tx));
-        *self.per_sender.entry(tx.from).or_insert(0) += 1;
+        let per_sender = self.per_sender.entry(tx.from).or_insert(0);
+        *per_sender = per_sender.saturating_add(1);
     }
 }
 
@@ -2819,7 +2824,8 @@ impl SelectionBudget {
             return AdmitOutcome::Skip;
         }
         entry.next_nonce = after_nonce;
-        entry.remaining = remaining - cost;
+        // remaining >= cost (checked above).
+        entry.remaining = remaining.saturating_sub(cost);
         AdmitOutcome::Admitted
     }
 
@@ -3265,8 +3271,8 @@ mod tests {
             .with_state_balance_reader({
                 let exec = executor.clone();
                 Arc::new(move |pk: &PublicKey| {
-                    let bal = exec
-                        .get_balance(&citrate_execution::address_utils::normalize_address(pk));
+                    let bal =
+                        exec.get_balance(&citrate_execution::address_utils::normalize_address(pk));
                     let cap = U256::from(u128::MAX);
                     (if bal > cap { cap } else { bal }).low_u128()
                 })
@@ -3278,7 +3284,9 @@ mod tests {
         let honest_price = 1_000_000_000u64;
         let honest_cost = 21_000u128 * honest_price as u128;
         state_db.accounts.create_account_if_not_exists(honest);
-        state_db.accounts.set_balance(honest, U256::from(honest_cost));
+        state_db
+            .accounts
+            .set_balance(honest, U256::from(honest_cost));
 
         let honest_tx = {
             let mut t = transfer_tx(0xA1, honest, recipient, 0);
@@ -4162,7 +4170,8 @@ mod tests {
         *receiver.reward_policy_handle().write() = Some(mk_policy());
         receiver.set_validator_activation_height(0);
         let reward = RewardCalculator::new(crate::canonical_apply::canonical_reward_config())
-            .calculate_reward(&sealed);
+            .calculate_reward(&sealed)
+            .expect("canonical reward");
         let basic_credits = [
             (Address(sealed.header.coinbase), reward.validator_reward),
             (Address(TREASURY), reward.treasury_reward),
@@ -4417,7 +4426,8 @@ mod tests {
             block: &Block,
         ) -> Result<Hash, citrate_execution::types::ExecutionError> {
             let reward = RewardCalculator::new(crate::canonical_apply::canonical_reward_config())
-                .calculate_reward(block);
+                .calculate_reward(block)
+                .expect("canonical reward");
             let credits = [
                 (Address(block.header.coinbase), reward.validator_reward),
                 (Address(TREASURY), reward.treasury_reward),

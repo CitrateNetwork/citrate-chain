@@ -1350,7 +1350,6 @@ dependencies = [
  "async-trait",
  "citrate-learning",
  "citrate-learning-daemon",
- "citrate-primitives",
  "csv",
  "futures",
  "proptest",
@@ -1387,6 +1386,34 @@ dependencies = [
  "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber 0.3.23",
+]
+
+[[package]]
+name = "citrate-fl-replay"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "citrate-execution",
+ "hex",
+ "k256",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sha3 0.10.9",
+]
+
+[[package]]
+name = "citrate-fork"
+version = "0.4.0"
+dependencies = [
+ "citrate-consensus",
+ "citrate-execution",
+ "hex",
+ "primitive-types",
+ "reqwest",
+ "revm",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1588,10 +1615,6 @@ dependencies = [
  "tracing-subscriber 0.3.23",
  "zeroize",
 ]
-
-[[package]]
-name = "citrate-primitives"
-version = "0.4.0"
 
 [[package]]
 name = "citrate-security"
@@ -5490,6 +5513,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes 1.11.1",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",

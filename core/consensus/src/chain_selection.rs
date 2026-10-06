@@ -260,10 +260,7 @@ impl ChainSelector {
         // Check finality constraints - cannot reorg past finalized blocks
         if let Some(ref tracker) = self.finality_tracker {
             if let Err(e) = tracker.check_reorg_allowed(&common_ancestor).await {
-                warn!(
-                    "Reorg rejected by finality tracker: {:?}",
-                    e
-                );
+                warn!("Reorg rejected by finality tracker: {:?}", e);
                 if let FinalityError::ReorgPastFinalized(hash) = e {
                     return Err(ChainSelectionError::ReorgPastFinalized(hash));
                 }
@@ -349,7 +346,7 @@ impl ChainSelector {
                 };
             }
 
-            depth += 1;
+            depth = depth.saturating_add(1);
         }
 
         Err(ChainSelectionError::InvalidChainState)

@@ -12,7 +12,7 @@ import "../src/defense_prime/ReleaseManifestRegistry.sol";
 contract DeployDpf17Release is ScriptEnv, GovernanceOps {
     function run() external returns (address rel) {
         address deployer = deployerAddress();
-        address governance = envAddressOr("GOVERNANCE", deployer);
+        address governance = requiredGovernance("GOVERNANCE", deployer);
 
         console.log("=== DPF-17 Release deployment (Stage 15 - FINAL) ===");
         console.log("Deployer:        ", deployer);

@@ -21,7 +21,10 @@ use ed25519_dalek::{Signer, SigningKey};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Drive one event through the relay's public poll cycle.
-async fn process_one(relay: &BridgeRelay, event: BridgeEvent) -> citrate_bridge::relay::ProcessingResult {
+async fn process_one(
+    relay: &BridgeRelay,
+    event: BridgeEvent,
+) -> citrate_bridge::relay::ProcessingResult {
     let source = MockEventSource::new();
     source.add_event(event);
     let mut results = relay.poll_cycle(&source).await.expect("poll cycle");
@@ -67,6 +70,7 @@ fn test_relay(threshold: usize) -> BridgeRelay {
         oracle_threshold: threshold,
         ..Default::default()
     })
+    .expect("relay")
 }
 
 fn honest_deposit(seed: u8) -> DepositEvent {
@@ -132,7 +136,13 @@ async fn brg1_first_attestation_no_longer_binds_alone() {
     relay
         .oracle_registry()
         .write()
-        .submit_attestation(signed_att(&sk_evil, domain, event_id, tampered.canonical_hash(), ts))
+        .submit_attestation(signed_att(
+            &sk_evil,
+            domain,
+            event_id,
+            tampered.canonical_hash(),
+            ts,
+        ))
         .expect("evil att accepted (signature is valid)");
     relay
         .oracle_registry()
@@ -159,7 +169,11 @@ async fn brg1_first_attestation_no_longer_binds_alone() {
 
     // The tampered deposit must NOT mint.
     let result = process_one(&relay, BridgeEvent::Deposit(tampered)).await;
-    assert_eq!(result.status, EventStatus::Rejected, "BRG-1 regression: 1-of-N minted");
+    assert_eq!(
+        result.status,
+        EventStatus::Rejected,
+        "BRG-1 regression: 1-of-N minted"
+    );
     assert!(result.salt_amount.is_none());
 }
 
@@ -190,10 +204,22 @@ async fn brg1_honest_quorum_still_mints_despite_one_liar() {
         let mut reg = relay.oracle_registry().write();
         reg.submit_attestation(signed_att(&sk_evil, domain, event_id, lie, ts))
             .expect("liar's att stored");
-        reg.submit_attestation(signed_att(&sk_h1, domain, event_id, honest.canonical_hash(), ts + 1))
-            .expect("h1");
-        reg.submit_attestation(signed_att(&sk_h2, domain, event_id, honest.canonical_hash(), ts + 2))
-            .expect("h2");
+        reg.submit_attestation(signed_att(
+            &sk_h1,
+            domain,
+            event_id,
+            honest.canonical_hash(),
+            ts + 1,
+        ))
+        .expect("h1");
+        reg.submit_attestation(signed_att(
+            &sk_h2,
+            domain,
+            event_id,
+            honest.canonical_hash(),
+            ts + 2,
+        ))
+        .expect("h2");
     }
 
     let result = process_one(&relay, BridgeEvent::Deposit(honest)).await;
@@ -234,7 +260,13 @@ async fn brg2_withdrawal_requires_bound_attestations() {
     relay
         .oracle_registry()
         .write()
-        .submit_attestation(signed_att(&sk, domain, event_id, tampered.canonical_hash(), now_secs()))
+        .submit_attestation(signed_att(
+            &sk,
+            domain,
+            event_id,
+            tampered.canonical_hash(),
+            now_secs(),
+        ))
         .expect("att stored");
     // Note: relay dedupes processed event_ids; use a fresh relay to
     // re-present the honest withdrawal against the tampered attestation.
@@ -248,7 +280,13 @@ async fn brg2_withdrawal_requires_bound_attestations() {
     relay2
         .oracle_registry()
         .write()
-        .submit_attestation(signed_att(&sk, domain2, event_id, tampered.canonical_hash(), now_secs()))
+        .submit_attestation(signed_att(
+            &sk,
+            domain2,
+            event_id,
+            tampered.canonical_hash(),
+            now_secs(),
+        ))
         .expect("att stored");
     let r2 = process_one(&relay2, BridgeEvent::Withdrawal(w.clone())).await;
     assert_eq!(
@@ -268,7 +306,13 @@ async fn brg2_withdrawal_requires_bound_attestations() {
     relay3
         .oracle_registry()
         .write()
-        .submit_attestation(signed_att(&sk, domain3, event_id, w.canonical_hash(), now_secs()))
+        .submit_attestation(signed_att(
+            &sk,
+            domain3,
+            event_id,
+            w.canonical_hash(),
+            now_secs(),
+        ))
         .expect("att stored");
     let r3 = process_one(&relay3, BridgeEvent::Withdrawal(w)).await;
     assert_eq!(r3.status, EventStatus::Processed);
@@ -290,14 +334,18 @@ fn brg3_cross_domain_replay_rejected() {
 
     // Registry on domain A accepts.
     let mut reg_a = OracleRegistry::with_domain(1, domain_a.0, domain_a.1);
-    reg_a.register_oracle(oracle_id, "o".into()).expect("register");
+    reg_a
+        .register_oracle(oracle_id, "o".into())
+        .expect("register");
     reg_a
         .submit_attestation(att.clone())
         .expect("valid on its own domain");
 
     // Same attestation on a different chain id → rejected.
     let mut reg_b = OracleRegistry::with_domain(1, 1, domain_a.1);
-    reg_b.register_oracle(oracle_id, "o".into()).expect("register");
+    reg_b
+        .register_oracle(oracle_id, "o".into())
+        .expect("register");
     assert!(
         reg_b.submit_attestation(att.clone()).is_err(),
         "BRG-3 regression: attestation replayed across chain ids"
@@ -305,7 +353,9 @@ fn brg3_cross_domain_replay_rejected() {
 
     // Same attestation on a different bridge instance → rejected.
     let mut reg_c = OracleRegistry::with_domain(1, domain_a.0, [0xC0u8; 32]);
-    reg_c.register_oracle(oracle_id, "o".into()).expect("register");
+    reg_c
+        .register_oracle(oracle_id, "o".into())
+        .expect("register");
     assert!(
         reg_c.submit_attestation(att).is_err(),
         "BRG-3 regression: attestation replayed across bridge instances"
@@ -319,7 +369,10 @@ fn brg4_inactive_oracle_attestation_not_counted() {
     let domain = (0u64, [0u8; 32]);
     let mut reg = OracleRegistry::with_domain(2, domain.0, domain.1);
     let (sk1, sk2) = (key(8), key(9));
-    let (o1, o2) = (sk1.verifying_key().to_bytes(), sk2.verifying_key().to_bytes());
+    let (o1, o2) = (
+        sk1.verifying_key().to_bytes(),
+        sk2.verifying_key().to_bytes(),
+    );
     reg.register_oracle(o1, "o1".into()).expect("register");
     reg.register_oracle(o2, "o2".into()).expect("register");
 

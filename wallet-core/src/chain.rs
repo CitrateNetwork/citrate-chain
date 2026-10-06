@@ -177,9 +177,10 @@ impl TransactionBuilder {
         let pubkey_uncompressed = pubkey_bytes.as_bytes();
         // EVM address = Keccak256(pubkey[1..65])[12..32]
         let mut address_hasher = Keccak256::new();
-        address_hasher.update(&pubkey_uncompressed[1..]); // Skip 0x04 prefix
-        let address_hash = address_hasher.finalize();
-        let from_addr = hex::encode(&address_hash[12..]);
+        address_hasher.update(pubkey_uncompressed.get(1..).unwrap_or_default()); // Skip 0x04 prefix
+        let address_hash: [u8; 32] = address_hasher.finalize().into();
+        let [_, _, _, _, _, _, _, _, _, _, _, _, from @ ..] = address_hash;
+        let from_addr = hex::encode(from);
 
         Ok(SignedTransaction {
             hash: hex::encode(signed.hash),
@@ -288,8 +289,11 @@ impl TransactionBuilder {
                         decoded.len()
                     )));
                 }
+                // 20 or 32 bytes (checked above), left-aligned in a 32-byte key.
                 let mut pk_bytes = [0u8; 32];
-                pk_bytes[..decoded.len()].copy_from_slice(&decoded);
+                if let Some(dst) = pk_bytes.get_mut(..decoded.len()) {
+                    dst.copy_from_slice(&decoded);
+                }
                 Some(cc_types::PublicKey::new(pk_bytes))
             }
         } else {
@@ -785,7 +789,10 @@ mod tests {
             .clone()
             .expect("captured request body");
         assert_eq!(body["method"], "eth_call");
-        assert_eq!(body["params"][0]["to"], "0xdead000000000000000000000000000000000000");
+        assert_eq!(
+            body["params"][0]["to"],
+            "0xdead000000000000000000000000000000000000"
+        );
         assert_eq!(body["params"][0]["data"], "0xdeadbeef");
         assert_eq!(body["params"][1], "latest");
     }

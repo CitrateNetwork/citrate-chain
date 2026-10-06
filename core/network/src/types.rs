@@ -81,7 +81,7 @@ pub struct NetworkConfig {
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
-            listen_addr: "0.0.0.0:30303".parse().unwrap_or_else(|e| panic!("valid default address: {e}")),
+            listen_addr: std::net::SocketAddr::from(([0, 0, 0, 0], 30303)),
             bootstrap_nodes: Vec::new(),
             max_peers: 50,
             max_inbound: 30,

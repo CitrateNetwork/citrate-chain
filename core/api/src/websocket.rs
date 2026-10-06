@@ -1,18 +1,18 @@
 // citrate/core/api/src/websocket.rs
 
 use crate::methods::ai::InferenceResult;
-use futures::{SinkExt, StreamExt};
 use citrate_execution::types::{Address, JobId, ModelId};
+use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{
     accept_hdr_async_with_config,
     tungstenite::{
-        handshake::server::{Request, Response, ErrorResponse},
+        handshake::server::{ErrorResponse, Request, Response},
         http::StatusCode,
         protocol::WebSocketConfig,
         Message,
@@ -359,30 +359,29 @@ async fn handle_connection(
     // The tungstenite callback signature fixes the (large) ErrorResponse
     // type; boxing it would break the API. (clippy::result_large_err)
     #[allow(clippy::result_large_err)]
-    let origin_callback = move |req: &Request, response: Response|
-        -> Result<Response, ErrorResponse>
-    {
-        if allowed_origins.is_empty() {
-            return Ok(response);
-        }
-        let origin = req
-            .headers()
-            .get("origin")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if !allowed_origins.iter().any(|allowed| allowed == origin) {
-            warn!(
-                "L-API-01: rejecting WS upgrade — Origin '{}' not in allowed_origins",
-                origin
-            );
-            let body = "Origin not allowed";
-            let resp = ErrorResponse::new(Some(body.to_string()));
-            let (mut parts, body) = resp.into_parts();
-            parts.status = StatusCode::FORBIDDEN;
-            return Err(ErrorResponse::from_parts(parts, body));
-        }
-        Ok(response)
-    };
+    let origin_callback =
+        move |req: &Request, response: Response| -> Result<Response, ErrorResponse> {
+            if allowed_origins.is_empty() {
+                return Ok(response);
+            }
+            let origin = req
+                .headers()
+                .get("origin")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if !allowed_origins.iter().any(|allowed| allowed == origin) {
+                warn!(
+                    "L-API-01: rejecting WS upgrade — Origin '{}' not in allowed_origins",
+                    origin
+                );
+                let body = "Origin not allowed";
+                let resp = ErrorResponse::new(Some(body.to_string()));
+                let (mut parts, body) = resp.into_parts();
+                parts.status = StatusCode::FORBIDDEN;
+                return Err(ErrorResponse::from_parts(parts, body));
+            }
+            Ok(response)
+        };
 
     // M-API-02: tungstenite WebSocketConfig caps the frame size.
     let tungstenite_cfg = WebSocketConfig {
@@ -460,7 +459,9 @@ async fn handle_connection_messages(
 
         match message {
             Some(Ok(Message::Text(text))) => {
-                if let Err(e) = handle_text_message(connection.clone(), text, max_subs_per_conn).await {
+                if let Err(e) =
+                    handle_text_message(connection.clone(), text, max_subs_per_conn).await
+                {
                     warn!("Error handling WebSocket message: {}", e);
                 }
             }

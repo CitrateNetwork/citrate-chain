@@ -57,7 +57,7 @@ fn fr_hex_be(f: &Fr) -> String {
     let bigint = f.into_bigint();
     let mut bytes_le = bigint.to_bytes_le();
     bytes_le.reverse(); // → big-endian
-    // Fr fits in 32 bytes. Pad on the left if shorter.
+                        // Fr fits in 32 bytes. Pad on the left if shorter.
     let mut out = [0u8; 32];
     let off = 32 - bytes_le.len().min(32);
     out[off..].copy_from_slice(&bytes_le[..bytes_le.len().min(32)]);
@@ -66,7 +66,10 @@ fn fr_hex_be(f: &Fr) -> String {
 
 #[test]
 fn poseidon_frozen_vectors_v1() {
-    assert_eq!(FIXTURE_VERSION, 1, "fixture version must remain v1 unless a deliberate ADR-tracked bump");
+    assert_eq!(
+        FIXTURE_VERSION, 1,
+        "fixture version must remain v1 unless a deliberate ADR-tracked bump"
+    );
 
     // Vector 1: empty input → field zero (sentinel for absent commitment).
     let h0 = poseidon_hash(&[]);
@@ -125,7 +128,8 @@ fn poseidon_frozen_vectors_v1() {
     // Determinism: same input → same output, twice.
     let h12_again = poseidon_hash(&[Fr::from(1u64), Fr::from(2u64)]);
     assert_eq!(
-        fr_hex_be(&h12), fr_hex_be(&h12_again),
+        fr_hex_be(&h12),
+        fr_hex_be(&h12_again),
         "poseidon_hash is non-deterministic — STOP"
     );
 }

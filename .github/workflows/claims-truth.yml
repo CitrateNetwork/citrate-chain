@@ -30,6 +30,10 @@ jobs:
         run: python3 verification/check_claims.py
       - name: Deployed-contract count vs getCode snapshot (offline)
         run: python3 verification/check_address_code.py --offline
+      - name: Address-book tools (unit tests, loopback only)
+        # HUP-S7.1: scripts/ops/hup-book-update.py guards what the operator writes into
+        # contracts/addresses/40204.json; its tests use a loopback fake RPC, no network.
+        run: python3 -m unittest discover -s scripts/ops/tests -p 'test_*.py' -v
       - name: Live getCode sweep (read-only RPC, scheduled only)
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: python3 verification/check_address_code.py --check

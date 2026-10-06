@@ -13,13 +13,13 @@
 use primitive_types::U256;
 
 use citrate_consensus::types::*;
-use citrate_economics::rewards::{RewardCalculator, RewardConfig};
-use citrate_economics::token::{Token, TokenConfig};
 use citrate_economics::dynamic_pricing::{
     DynamicPricingConfig, DynamicPricingManager, UtilizationMetrics,
 };
 use citrate_economics::genesis::GenesisConfig;
 use citrate_economics::latt_to_wei;
+use citrate_economics::rewards::{RewardCalculator, RewardConfig};
+use citrate_economics::token::{Token, TokenConfig};
 use citrate_execution::types::Address;
 
 // ---------------------------------------------------------------------------
@@ -43,15 +43,21 @@ fn test_reward_calculation_no_overflow_max_values() {
     // Height that would cause 64+ halvings
     let extreme_height = config.halving_interval * 65;
     let block = make_block(extreme_height, vec![]);
-    let reward = calculator.calculate_reward(&block);
+    let reward = calculator.calculate_reward(&block).expect("valid config");
 
-    assert_eq!(reward.total_reward, U256::zero(), "Reward after 64 halvings must be zero");
+    assert_eq!(
+        reward.total_reward,
+        U256::zero(),
+        "Reward after 64 halvings must be zero"
+    );
     assert_eq!(reward.validator_reward, U256::zero());
     assert_eq!(reward.treasury_reward, U256::zero());
 
     // u64::MAX height — should not panic
     let block_max = make_block(u64::MAX, vec![]);
-    let reward_max = calculator.calculate_reward(&block_max);
+    let reward_max = calculator
+        .calculate_reward(&block_max)
+        .expect("valid config");
     assert_eq!(reward_max.total_reward, U256::zero());
 }
 
@@ -72,14 +78,25 @@ fn test_total_supply_conservation() {
     // Simulate 100 reward distributions
     for i in 0u64..100 {
         let block = make_block(i, vec![]);
-        let reward = calculator.calculate_reward(&block);
+        let reward = calculator.calculate_reward(&block).expect("valid config");
         token.mint(&validator, reward.total_reward).unwrap();
         expected_total_minted += reward.total_reward;
     }
 
-    assert_eq!(token.total_minted, expected_total_minted, "Total minted must equal sum of all rewards");
-    assert_eq!(token.circulating_supply(), expected_total_minted, "Circulating supply must equal total minted when no burns");
-    assert_eq!(token.balance_of(&validator), expected_total_minted, "Validator balance must equal total minted");
+    assert_eq!(
+        token.total_minted, expected_total_minted,
+        "Total minted must equal sum of all rewards"
+    );
+    assert_eq!(
+        token.circulating_supply(),
+        expected_total_minted,
+        "Circulating supply must equal total minted when no burns"
+    );
+    assert_eq!(
+        token.balance_of(&validator),
+        expected_total_minted,
+        "Validator balance must equal total minted"
+    );
 }
 
 // ============================================================================
@@ -108,7 +125,8 @@ fn test_base_fee_adjustment_under_load() {
     assert!(
         after_load > initial_price,
         "Gas price should increase under sustained high utilization: initial={}, after={}",
-        initial_price, after_load
+        initial_price,
+        after_load
     );
 
     // Now submit several blocks at low utilization (10%)
@@ -129,7 +147,8 @@ fn test_base_fee_adjustment_under_load() {
     assert!(
         after_low < price_before_low,
         "Gas price should decrease under sustained low utilization: before={}, after={}",
-        price_before_low, after_low
+        price_before_low,
+        after_low
     );
 }
 
@@ -171,7 +190,8 @@ fn test_zero_gas_block_decreases_fee() {
     assert!(
         price_after <= price_before,
         "Empty block should not increase gas price: before={}, after={}",
-        price_before, price_after
+        price_before,
+        price_after
     );
 }
 
@@ -205,7 +225,8 @@ fn test_full_gas_block_increases_fee() {
     assert!(
         price_after_full > initial_base,
         "Sustained full blocks should increase gas price above initial: initial={}, after={}",
-        initial_base, price_after_full
+        initial_base,
+        price_after_full
     );
 }
 
@@ -254,7 +275,7 @@ fn make_transactions(count: usize) -> Vec<Transaction> {
 fn economic_simulation_10k_blocks_supply_conservation() {
     // --- Setup genesis supply ---
     let genesis = GenesisConfig::testnet_beta();
-    let genesis_supply = genesis.total_preallocation();
+    let genesis_supply = genesis.total_preallocation().expect("no overflow");
 
     // --- Create token with genesis pre-allocations ---
     let token_config = TokenConfig::default();
@@ -301,7 +322,7 @@ fn economic_simulation_10k_blocks_supply_conservation() {
         let block = make_block(height, transactions);
 
         // --- Calculate and distribute reward ---
-        let reward = calculator.calculate_reward(&block);
+        let reward = calculator.calculate_reward(&block).expect("valid config");
 
         // Invariant (c): no overflow — if mint would exceed supply, that's
         // fine for the simulation because 10k blocks at 10 SALT/block is only
@@ -440,18 +461,11 @@ fn economic_simulation_max_u256_height_no_panic() {
     let calculator = RewardCalculator::new(config);
 
     // Heights near u64::MAX boundaries
-    let extreme_heights: Vec<u64> = vec![
-        u64::MAX,
-        u64::MAX - 1,
-        u64::MAX / 2,
-        u64::MAX / 3,
-        0,
-        1,
-    ];
+    let extreme_heights: Vec<u64> = vec![u64::MAX, u64::MAX - 1, u64::MAX / 2, u64::MAX / 3, 0, 1];
 
     for &h in &extreme_heights {
         let block = make_block(h, make_transactions(100));
-        let reward = calculator.calculate_reward(&block);
+        let reward = calculator.calculate_reward(&block).expect("valid config");
 
         // At these extreme heights (far past 64 halvings), reward is zero
         if h > halving_interval * 64 {
@@ -499,7 +513,8 @@ fn economic_simulation_fee_rises_then_falls_with_demand() {
     assert!(
         price_after_spike > initial_price,
         "Fee must rise after 200 blocks at 95%% utilization: initial={}, after_spike={}",
-        initial_price, price_after_spike
+        initial_price,
+        price_after_spike
     );
 
     // Phase 2: 200 blocks at 5% utilization (demand collapse)
@@ -519,7 +534,8 @@ fn economic_simulation_fee_rises_then_falls_with_demand() {
     assert!(
         price_after_trough < price_after_spike,
         "Fee must fall after demand collapse: after_spike={}, after_trough={}",
-        price_after_spike, price_after_trough
+        price_after_spike,
+        price_after_trough
     );
 }
 
@@ -541,7 +557,7 @@ fn economic_simulation_reward_proportionality_across_halvings() {
     for halving in 0u64..5 {
         let height = halving_interval * halving;
         let block = make_block(height, vec![]);
-        let reward = calculator.calculate_reward(&block);
+        let reward = calculator.calculate_reward(&block).expect("valid config");
 
         // Expected reward: base_reward >> halvings, converted to wei.
         let expected_base = base_reward >> halving;
@@ -558,16 +574,23 @@ fn economic_simulation_reward_proportionality_across_halvings() {
             assert!(
                 reward.total_reward > U256::zero(),
                 "Reward at halving {} (height {}) should be positive",
-                halving, height
+                halving,
+                height
             );
         }
 
         // Proportionality: validator gets 90%, treasury gets 10%
         let expected_validator = reward.total_reward * U256::from(90) / U256::from(100);
         let expected_treasury = reward.total_reward - expected_validator;
-        assert_eq!(reward.validator_reward, expected_validator,
-            "Validator reward mismatch at halving {}", halving);
-        assert_eq!(reward.treasury_reward, expected_treasury,
-            "Treasury reward mismatch at halving {}", halving);
+        assert_eq!(
+            reward.validator_reward, expected_validator,
+            "Validator reward mismatch at halving {}",
+            halving
+        );
+        assert_eq!(
+            reward.treasury_reward, expected_treasury,
+            "Treasury reward mismatch at halving {}",
+            halving
+        );
     }
 }

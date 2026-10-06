@@ -12,7 +12,10 @@ pub struct NetworkApi {
 
 impl NetworkApi {
     pub fn new(peer_manager: Arc<PeerManager>, chain_id: u64) -> Self {
-        Self { peer_manager, chain_id }
+        Self {
+            peer_manager,
+            chain_id,
+        }
     }
 
     /// Get network version

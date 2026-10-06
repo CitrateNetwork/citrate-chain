@@ -4,9 +4,7 @@
 
 use citrate_consensus::dag_store::DagStore;
 use citrate_consensus::ghostdag::GhostDag;
-use citrate_consensus::hardening::{
-    pba_hardening_height, set_pba_hardening_height, PbaHardening,
-};
+use citrate_consensus::hardening::{pba_hardening_height, set_pba_hardening_height, PbaHardening};
 use citrate_consensus::types::GhostDagParams;
 use std::sync::Arc;
 

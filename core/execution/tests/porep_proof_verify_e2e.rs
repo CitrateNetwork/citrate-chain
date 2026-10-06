@@ -21,8 +21,8 @@
 
 #![cfg(feature = "halo2-substrate")]
 
-use citrate_execution::precompiles::verify::{addresses, execute, gas_costs};
 use citrate_execution::precompiles::q16::{ops as q16_ops, Q16};
+use citrate_execution::precompiles::verify::{addresses, execute, gas_costs};
 use citrate_execution::types::Address;
 use citrate_execution::zkp::halo2::circuits::InferenceCircuit;
 use citrate_execution::zkp::halo2::porep::{self, seal_reduced, PoRepCircuit, SealedReplica};
@@ -245,7 +245,13 @@ fn generate_inference_proof(
 fn precompile_0x0108_accepts_valid_porep_proof() {
     for v in 0..porep::N {
         let (sealed, proof_bytes) = generate_porep_proof(v);
-        let wire = build_porep_wire(&sealed, v, CIRCUIT_VERSION_POREP_REDUCED, 40204, &proof_bytes);
+        let wire = build_porep_wire(
+            &sealed,
+            v,
+            CIRCUIT_VERSION_POREP_REDUCED,
+            40204,
+            &proof_bytes,
+        );
 
         let addr = Address(addresses::INFERENCE_PROOF_VERIFY);
         let result = execute(&addr, &wire, 100_000_000)
@@ -253,13 +259,19 @@ fn precompile_0x0108_accepts_valid_porep_proof() {
 
         assert!(result.success, "precompile ran (challenge {v})");
         assert_eq!(result.output.len(), 32);
-        assert_eq!(result.output[31], 1, "PoRep proof must verify (challenge {v})");
+        assert_eq!(
+            result.output[31], 1,
+            "PoRep proof must verify (challenge {v})"
+        );
         assert!(result.output[..31].iter().all(|&b| b == 0));
 
         // Gas uses the v2 schedule.
         let expected_gas = gas_costs::POREP_PROOF_VERIFY_BASE
             + gas_costs::POREP_PROOF_VERIFY_PER_BYTE * wire.len() as u64;
-        assert_eq!(result.gas_used, expected_gas, "v2 gas schedule (challenge {v})");
+        assert_eq!(
+            result.gas_used, expected_gas,
+            "v2 gas schedule (challenge {v})"
+        );
     }
 }
 
@@ -269,10 +281,19 @@ fn precompile_0x0108_rejects_tampered_porep_proof() {
     let (sealed, mut proof_bytes) = generate_porep_proof(v);
     proof_bytes[0] ^= 0xFF; // flip a proof byte
 
-    let wire = build_porep_wire(&sealed, v, CIRCUIT_VERSION_POREP_REDUCED, 40204, &proof_bytes);
+    let wire = build_porep_wire(
+        &sealed,
+        v,
+        CIRCUIT_VERSION_POREP_REDUCED,
+        40204,
+        &proof_bytes,
+    );
     let addr = Address(addresses::INFERENCE_PROOF_VERIFY);
     let result = execute(&addr, &wire, 100_000_000).expect("precompile runs");
-    assert_eq!(result.output[31], 0, "tampered PoRep proof must be rejected");
+    assert_eq!(
+        result.output[31], 0,
+        "tampered PoRep proof must be rejected"
+    );
 }
 
 // ===========================================================================
@@ -303,7 +324,10 @@ fn precompile_0x0108_v1_inference_unchanged_regression() {
         .expect("v1 inference proof must still verify through the dispatcher");
 
     assert!(result.success);
-    assert_eq!(result.output[31], 1, "v1 inference proof verifies (unchanged)");
+    assert_eq!(
+        result.output[31], 1,
+        "v1 inference proof verifies (unchanged)"
+    );
     assert!(result.output[..31].iter().all(|&b| b == 0));
 
     // v1 gas formula is byte-for-byte the original inference schedule.
@@ -404,7 +428,13 @@ fn domain_sep_porep_tampered_public_input_rejected() {
     // Tamper CommR (one of the 8 public inputs).
     sealed.comm_r += Halo2Fr::from(1u64);
 
-    let wire = build_porep_wire(&sealed, v, CIRCUIT_VERSION_POREP_REDUCED, 40204, &proof_bytes);
+    let wire = build_porep_wire(
+        &sealed,
+        v,
+        CIRCUIT_VERSION_POREP_REDUCED,
+        40204,
+        &proof_bytes,
+    );
     let addr = Address(addresses::INFERENCE_PROOF_VERIFY);
     let result = execute(&addr, &wire, 100_000_000).expect("precompile runs");
     assert_eq!(
@@ -456,7 +486,13 @@ fn precompile_0x0108_rejects_out_of_range_challenge_nonce() {
     let v = 0usize;
     let (sealed, proof_bytes) = generate_porep_proof(v);
     // Claim challenge index N (out of range) on the wire.
-    let wire = build_porep_wire(&sealed, porep::N, CIRCUIT_VERSION_POREP_REDUCED, 40204, &proof_bytes);
+    let wire = build_porep_wire(
+        &sealed,
+        porep::N,
+        CIRCUIT_VERSION_POREP_REDUCED,
+        40204,
+        &proof_bytes,
+    );
     let addr = Address(addresses::INFERENCE_PROOF_VERIFY);
     let result = execute(&addr, &wire, 100_000_000);
     assert!(

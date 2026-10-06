@@ -16,8 +16,7 @@ use serde::Deserialize;
 use std::time::Duration;
 
 /// Default verify endpoint. Cloudflare's documented URL.
-const DEFAULT_VERIFY_URL: &str =
-    "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+const DEFAULT_VERIFY_URL: &str = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 
 /// HTTP timeout for the verify call. Generous enough to absorb
 /// transient slowness; short enough that a /drip request doesn't
@@ -46,6 +45,10 @@ impl TurnstileVerifier {
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| DEFAULT_VERIFY_URL.to_string());
+        // INVARIANT: with this static configuration `build()` fails only if the TLS
+        // backend cannot initialize at all; the faucet cannot verify captchas without
+        // a client, so failing at startup is correct (PANIC-S1 PROVE+KEEP).
+        #[allow(clippy::expect_used)]
         let client = reqwest::Client::builder()
             .timeout(VERIFY_TIMEOUT)
             .build()
@@ -61,15 +64,8 @@ impl TurnstileVerifier {
     /// optional; when present, Cloudflare uses it to bind the
     /// challenge to the requesting IP (additional defense against
     /// token replay across IPs).
-    pub async fn verify(
-        &self,
-        token: &str,
-        remote_ip: Option<&str>,
-    ) -> Result<bool, String> {
-        let mut form = vec![
-            ("secret", self.secret.as_str()),
-            ("response", token),
-        ];
+    pub async fn verify(&self, token: &str, remote_ip: Option<&str>) -> Result<bool, String> {
+        let mut form = vec![("secret", self.secret.as_str()), ("response", token)];
         if let Some(ip) = remote_ip {
             form.push(("remoteip", ip));
         }
@@ -94,10 +90,7 @@ impl TurnstileVerifier {
             .map_err(|e| format!("turnstile response not JSON: {}", e))?;
 
         if !body.success && !body.error_codes.is_empty() {
-            tracing::warn!(
-                "Turnstile rejected: error-codes = {:?}",
-                body.error_codes
-            );
+            tracing::warn!("Turnstile rejected: error-codes = {:?}", body.error_codes);
         }
         Ok(body.success)
     }
@@ -149,10 +142,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn test_unreachable_endpoint_errors() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        std::env::set_var(
-            "FAUCET_TURNSTILE_VERIFY_URL",
-            "http://127.0.0.1:1/verify",
-        );
+        std::env::set_var("FAUCET_TURNSTILE_VERIFY_URL", "http://127.0.0.1:1/verify");
         let v = TurnstileVerifier::new("test-secret");
         let r = v.verify("any-token", Some("1.2.3.4")).await;
         assert!(r.is_err(), "unreachable URL must error");

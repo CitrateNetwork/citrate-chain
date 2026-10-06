@@ -16,8 +16,7 @@
 // 10. dirty_storage cleared on rollback (Sprint EL-1, Issue #19)
 
 use citrate_consensus::types::{
-    Block, BlockBuilder, Hash, PublicKey, Signature,
-    Transaction as ConsensusTransaction, VrfProof,
+    Block, BlockBuilder, Hash, PublicKey, Signature, Transaction as ConsensusTransaction, VrfProof,
 };
 use citrate_execution::{address_utils, types::*, Executor, StateDB};
 use primitive_types::U256;
@@ -118,7 +117,9 @@ fn new_executor() -> (Executor, Arc<StateDB>) {
 
 /// Sum balances across a list of addresses.
 fn total_balance(executor: &Executor, addrs: &[Address]) -> U256 {
-    addrs.iter().fold(U256::zero(), |acc, a| acc + executor.get_balance(a))
+    addrs
+        .iter()
+        .fold(U256::zero(), |acc, a| acc + executor.get_balance(a))
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -319,7 +320,11 @@ async fn test_nonce_incremented_on_failed_tx() {
             if !receipt.status {
                 // Failed execution: nonce was incremented by the rollback path
                 // (rollback restores snapshot then re-increments nonce and deducts gas)
-                assert_eq!(executor.get_nonce(&alice), 1, "Failed tx should still increment nonce");
+                assert_eq!(
+                    executor.get_nonce(&alice),
+                    1,
+                    "Failed tx should still increment nonce"
+                );
             }
         }
         Err(_) => {
@@ -588,7 +593,11 @@ async fn test_invalid_nonce_full_rollback() {
         U256::zero(),
         "Bob should get nothing"
     );
-    assert_eq!(executor.get_nonce(&alice), 0, "Nonce should not be incremented");
+    assert_eq!(
+        executor.get_nonce(&alice),
+        0,
+        "Nonce should not be incremented"
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -628,7 +637,9 @@ fn test_large_state_rollback_correctness() {
     // Initialize 200 accounts
     for i in 1u8..=200 {
         let addr = Address([i; 20]);
-        state_db.accounts.set_balance(addr, U256::from(i as u64 * 1000));
+        state_db
+            .accounts
+            .set_balance(addr, U256::from(i as u64 * 1000));
         state_db.set_storage(addr, b"slot".to_vec(), vec![i]);
     }
 
@@ -772,7 +783,7 @@ fn test_transfer_rollback_sender_balance_exact() {
 
     // Simulate a transfer
     state_db.accounts.set_balance(alice, U256::from(4500)); // -500
-    state_db.accounts.set_balance(bob, U256::from(1500));   // +500
+    state_db.accounts.set_balance(bob, U256::from(1500)); // +500
 
     // Rollback
     state_db.restore(snap);
@@ -882,7 +893,11 @@ async fn test_deploy_insufficient_gas_no_code_left() {
 
     // No code should be left behind at any address
     let code_hash = state_db.accounts.get_code_hash(&deployer);
-    assert_eq!(code_hash, Hash::default(), "No code should be on deployer account");
+    assert_eq!(
+        code_hash,
+        Hash::default(),
+        "No code should be on deployer account"
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

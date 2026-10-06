@@ -36,9 +36,7 @@ use ark_bn254::Fr as ArkFr;
 use halo2_proofs::{
     arithmetic::Field,
     circuit::{AssignedCell, Layouter, Value},
-    plonk::{
-        Advice, Column, ConstraintSystem, ErrorFront, Expression, Fixed, Selector,
-    },
+    plonk::{Advice, Column, ConstraintSystem, ErrorFront, Expression, Fixed, Selector},
     poly::Rotation,
 };
 use halo2curves::bn256::Fr as Halo2Fr;
@@ -347,7 +345,10 @@ impl PoseidonChip {
                     //   row N: state = state_curr; absorb_in = [in0, in1 (or 0)]; s_absorb on
                     //   row N+1: state = state_curr + [0, in0, in1]
                     // Then if not last chunk, permutation occupies rows N+1..N+1+TOTAL_ROUNDS.
-                    let in0 = inputs.get(chunk_start).copied().unwrap_or(Value::known(Halo2Fr::ZERO));
+                    let in0 = inputs
+                        .get(chunk_start)
+                        .copied()
+                        .unwrap_or(Value::known(Halo2Fr::ZERO));
                     let in1 = if RATE >= 2 {
                         inputs
                             .get(chunk_start + 1)
@@ -404,13 +405,8 @@ impl PoseidonChip {
                 }
 
                 // Final permute (squeeze trigger).
-                state_vals = Self::assign_permutation_rows(
-                    &mut region,
-                    config,
-                    cfg,
-                    &mut row,
-                    state_vals,
-                )?;
+                state_vals =
+                    Self::assign_permutation_rows(&mut region, config, cfg, &mut row, state_vals)?;
 
                 // Assign the final state row (no selector — terminal).
                 let mut output_cell: Option<AssignedCell<Halo2Fr, Halo2Fr>> = None;
@@ -488,8 +484,7 @@ impl PoseidonChip {
                 )?;
             }
             // Selector.
-            let is_full = round < HALF_FULL_ROUNDS
-                || round >= HALF_FULL_ROUNDS + PARTIAL_ROUNDS;
+            let is_full = round < HALF_FULL_ROUNDS || round >= HALF_FULL_ROUNDS + PARTIAL_ROUNDS;
             if is_full {
                 config.s_full.enable(region, cur_row)?;
             } else {
@@ -653,13 +648,8 @@ impl PoseidonChip {
                 }
 
                 // Final permute (squeeze).
-                state_vals = Self::assign_permutation_rows(
-                    &mut region,
-                    config,
-                    cfg,
-                    &mut row,
-                    state_vals,
-                )?;
+                state_vals =
+                    Self::assign_permutation_rows(&mut region, config, cfg, &mut row, state_vals)?;
 
                 let mut output_cell: Option<AssignedCell<Halo2Fr, Halo2Fr>> = None;
                 for j in 0..STATE_WIDTH {
@@ -730,8 +720,8 @@ impl PoseidonChip {
                     }
 
                     // Determine round type and enable selector.
-                    let is_full = round < HALF_FULL_ROUNDS
-                        || round >= HALF_FULL_ROUNDS + PARTIAL_ROUNDS;
+                    let is_full =
+                        round < HALF_FULL_ROUNDS || round >= HALF_FULL_ROUNDS + PARTIAL_ROUNDS;
                     if is_full {
                         config.s_full.enable(&mut region, round)?;
                     } else {
@@ -1006,8 +996,19 @@ impl LinearChip {
         });
 
         LinearChipConfig {
-            w, x, prod, hi, lo, acc, b, y,
-            s_prod, s_shift, s_acc_init, s_acc_step, s_output,
+            w,
+            x,
+            prod,
+            hi,
+            lo,
+            acc,
+            b,
+            y,
+            s_prod,
+            s_shift,
+            s_acc_init,
+            s_acc_step,
+            s_output,
         }
     }
 
@@ -1054,12 +1055,7 @@ impl LinearChip {
                             j,
                             || weights[i * in_dim + j],
                         )?;
-                        region.assign_advice(
-                            || format!("x[{}]", j),
-                            config.x,
-                            j,
-                            || inputs[j],
-                        )?;
+                        region.assign_advice(|| format!("x[{}]", j), config.x, j, || inputs[j])?;
 
                         // Compute prod, hi, lo from the witnessed values.
                         // Need to extract i64 from the Value<Halo2Fr>; the
@@ -1081,12 +1077,15 @@ impl LinearChip {
                         // representation. For safe-range inputs the field
                         // element fits in i64 (positive: low 64 bits;
                         // negative: -((p - field) low 64 bits)).
-                        let (hi_v, lo_v) = w_val.zip(x_val).map(|(w_fr, x_fr)| {
-                            let w_signed = halo2_fr_to_signed_i64(&w_fr);
-                            let x_signed = halo2_fr_to_signed_i64(&x_fr);
-                            let p_signed: i128 = (w_signed as i128) * (x_signed as i128);
-                            signed_shift_decomp(p_signed)
-                        }).unzip();
+                        let (hi_v, lo_v) = w_val
+                            .zip(x_val)
+                            .map(|(w_fr, x_fr)| {
+                                let w_signed = halo2_fr_to_signed_i64(&w_fr);
+                                let x_signed = halo2_fr_to_signed_i64(&x_fr);
+                                let p_signed: i128 = (w_signed as i128) * (x_signed as i128);
+                                signed_shift_decomp(p_signed)
+                            })
+                            .unzip();
 
                         region.assign_advice(
                             || format!("hi[{},{}]", i, j),
@@ -1211,12 +1210,15 @@ impl LinearChip {
                             || prod_field,
                         )?;
 
-                        let (hi_v, lo_v) = w_val.zip(x_val).map(|(w_fr, x_fr)| {
-                            let w_signed = halo2_fr_to_signed_i64(&w_fr);
-                            let x_signed = halo2_fr_to_signed_i64(&x_fr);
-                            let p_signed: i128 = (w_signed as i128) * (x_signed as i128);
-                            signed_shift_decomp(p_signed)
-                        }).unzip();
+                        let (hi_v, lo_v) = w_val
+                            .zip(x_val)
+                            .map(|(w_fr, x_fr)| {
+                                let w_signed = halo2_fr_to_signed_i64(&w_fr);
+                                let x_signed = halo2_fr_to_signed_i64(&x_fr);
+                                let p_signed: i128 = (w_signed as i128) * (x_signed as i128);
+                                signed_shift_decomp(p_signed)
+                            })
+                            .unzip();
 
                         region.assign_advice(
                             || format!("hi[{},{}]", i, j),
@@ -1339,7 +1341,7 @@ pub fn assert_in_circuit_matches_off_chain_pair(a: Halo2Fr, b: Halo2Fr) {
     use halo2_proofs::{
         circuit::{Layouter, SimpleFloorPlanner, Value},
         dev::MockProver,
-        plonk::{Circuit, ConstraintSystem, ErrorFront, Instance, Column},
+        plonk::{Circuit, Column, ConstraintSystem, ErrorFront, Instance},
     };
 
     /// Test circuit: hashes (a, b) and exposes the result as a
@@ -1405,15 +1407,16 @@ pub fn assert_in_circuit_matches_off_chain_pair(a: Halo2Fr, b: Halo2Fr) {
     let k = 8;
     let public_inputs = vec![vec![expected]];
 
-    let prover = MockProver::run(k, &circuit, public_inputs)
-        .expect("MockProver setup");
+    let prover = MockProver::run(k, &circuit, public_inputs).expect("MockProver setup");
     let r = prover.verify();
     assert_eq!(
         r,
         Ok(()),
         "PoseidonChip::hash_pair output does NOT match off-chain \
          poseidon_hash. a={:?} b={:?} expected={:?}",
-        a, b, expected,
+        a,
+        b,
+        expected,
     );
 }
 
@@ -1520,8 +1523,7 @@ mod tests {
         // For our tests with up to ~10 inputs (= 5 perms = ~325
         // rows), k=10 suffices but we use k=11 for headroom.
         let k = 11;
-        let prover =
-            MockProver::run(k, &circuit, vec![vec![expected]]).expect("mockprover setup");
+        let prover = MockProver::run(k, &circuit, vec![vec![expected]]).expect("mockprover setup");
         let r = prover.verify();
         assert_eq!(
             r,
@@ -1667,8 +1669,7 @@ mod tests {
                 config: Self::Config,
                 mut layouter: impl Layouter<Halo2Fr>,
             ) -> Result<(), ErrorFront> {
-                let out =
-                    PoseidonChip::hash_n(&config.poseidon, &mut layouter, &self.chunks)?;
+                let out = PoseidonChip::hash_n(&config.poseidon, &mut layouter, &self.chunks)?;
                 layouter.constrain_instance(out.cell(), config.instance, 0)?;
                 Ok(())
             }
@@ -1683,8 +1684,7 @@ mod tests {
         // ~5-15 permutations × 65 rows ≈ 325-975 rows. k=12
         // (4096 rows) safely covers most reference inputs.
         let k = 12;
-        let prover = MockProver::run(k, &circuit, vec![vec![expected]])
-            .expect("MockProver setup");
+        let prover = MockProver::run(k, &circuit, vec![vec![expected]]).expect("MockProver setup");
         let r = prover.verify();
         assert_eq!(
             r,
@@ -1769,12 +1769,10 @@ mod tests {
         // Off-chain reference computes the truth.
         let expected_q16 =
             crate::precompiles::q16::ops::linear(weights, inputs, biases, out_dim, in_dim);
-        let expected_fr: Vec<Halo2Fr> =
-            expected_q16.iter().copied().map(q16_to_halo2_fr).collect();
+        let expected_fr: Vec<Halo2Fr> = expected_q16.iter().copied().map(q16_to_halo2_fr).collect();
 
         // Circuit witnesses (signed-into-field).
-        let weights_fr: Vec<Halo2Fr> =
-            weights.iter().copied().map(q16_to_halo2_fr).collect();
+        let weights_fr: Vec<Halo2Fr> = weights.iter().copied().map(q16_to_halo2_fr).collect();
         let inputs_fr: Vec<Halo2Fr> = inputs.iter().copied().map(q16_to_halo2_fr).collect();
         let biases_fr: Vec<Halo2Fr> = biases.iter().copied().map(q16_to_halo2_fr).collect();
 
@@ -1850,8 +1848,7 @@ mod tests {
         // with out_dim ≤ 4 and in_dim ≤ 16, total ≤ 68 rows, plenty of
         // headroom.
         let k = 8;
-        let prover = MockProver::run(k, &circuit, vec![expected_fr])
-            .expect("MockProver setup");
+        let prover = MockProver::run(k, &circuit, vec![expected_fr]).expect("MockProver setup");
         let r = prover.verify();
         assert_eq!(
             r,
@@ -1903,10 +1900,13 @@ mod tests {
     fn linear_chip_3x4() {
         // 3-output, 4-input layer with mixed signs.
         let w: Vec<Q16> = [
-            1, -2, 3, -4,    // row 0
-            5, 6, -7, -8,    // row 1
+            1, -2, 3, -4, // row 0
+            5, 6, -7, -8, // row 1
             -9, 10, 11, -12, // row 2
-        ].iter().map(|&n| Q16::from_int(n)).collect();
+        ]
+        .iter()
+        .map(|&n| Q16::from_int(n))
+        .collect();
         let x: Vec<Q16> = [1, 2, 3, 4].iter().map(|&n| Q16::from_int(n)).collect();
         let b: Vec<Q16> = [100, -200, 300].iter().map(|&n| Q16::from_int(n)).collect();
         assert_linear_chip_matches(&w, &x, &b, 3, 4);

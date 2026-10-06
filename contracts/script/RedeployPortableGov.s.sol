@@ -28,7 +28,7 @@ import "../src/edu/ai-gateway/AILearningCycleCorePortable.sol";
 contract RedeployPortableGov is ScriptEnv {
     function run() external {
         address deployer = deployerAddress();
-        address governance = envAddressOr("GOVERNANCE", deployer);
+        address governance = requiredGovernance("GOVERNANCE", deployer);
         address registry = vm.envAddress("REGISTRY");
 
         require(governance != deployer, "GOVERNANCE must be the multisig, not the deployer");

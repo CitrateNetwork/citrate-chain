@@ -56,7 +56,12 @@ impl Aead {
     /// Returns `ciphertext || tag` (the standard AES-GCM output shape;
     /// the tag is the last 16 bytes). The same `aad` MUST be supplied
     /// to [`Aead::open`] to recover the plaintext.
-    pub fn seal(&self, nonce: &[u8; 12], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, AeadError> {
+    pub fn seal(
+        &self,
+        nonce: &[u8; 12],
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>, AeadError> {
         let nonce = Nonce::from_slice(nonce);
         self.inner
             .encrypt(
@@ -79,7 +84,12 @@ impl Aead {
     ///
     /// The error variant intentionally does not distinguish among
     /// these to avoid timing-side-channel disclosure.
-    pub fn open(&self, nonce: &[u8; 12], ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, AeadError> {
+    pub fn open(
+        &self,
+        nonce: &[u8; 12],
+        ciphertext: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>, AeadError> {
         let nonce = Nonce::from_slice(nonce);
         self.inner
             .decrypt(

@@ -47,10 +47,7 @@ struct NSError {
 #[allow(clippy::duplicated_attributes)]
 extern "C" {
     // Model loading
-    fn MLModelLoad(
-        path: *const c_char,
-        error: *mut *mut NSError,
-    ) -> *mut c_void;
+    fn MLModelLoad(path: *const c_char, error: *mut *mut NSError) -> *mut c_void;
 
     // Model compilation
     fn MLModelCompileModelAtURL(
@@ -111,19 +108,14 @@ pub struct CoreMLModel {
 impl CoreMLModel {
     /// Load a compiled CoreML model from disk
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path_str = path
-            .as_ref()
-            .to_str()
-            .context("Invalid path encoding")?;
+        let path_str = path.as_ref().to_str().context("Invalid path encoding")?;
 
         let c_path = CString::new(path_str)?;
         let mut error: *mut NSError = ptr::null_mut();
 
         // SAFETY: `c_path` is a valid null-terminated CString kept alive for the call.
         // `error` is a valid out-pointer. MLModelLoad returns null on failure, checked below.
-        let model = unsafe {
-            MLModelLoad(c_path.as_ptr(), &mut error)
-        };
+        let model = unsafe { MLModelLoad(c_path.as_ptr(), &mut error) };
 
         if model.is_null() {
             let error_msg = Self::get_error_message(error);
@@ -158,9 +150,7 @@ impl CoreMLModel {
 
         // SAFETY: `c_path` is a valid null-terminated CString kept alive for the call.
         // `error` is a valid out-pointer. Returns null on failure, checked below.
-        let compiled_path = unsafe {
-            MLModelCompileModelAtURL(c_path.as_ptr(), &mut error)
-        };
+        let compiled_path = unsafe { MLModelCompileModelAtURL(c_path.as_ptr(), &mut error) };
 
         if compiled_path.is_null() {
             let error_msg = Self::get_error_message(error);
@@ -177,11 +167,7 @@ impl CoreMLModel {
         // SAFETY: `compiled_path` was checked non-null above. MLModelCompileModelAtURL
         // returns a valid null-terminated C string on success. The pointer remains valid
         // until the enclosing autorelease pool drains.
-        let result = unsafe {
-            CStr::from_ptr(compiled_path)
-                .to_string_lossy()
-                .into_owned()
-        };
+        let result = unsafe { CStr::from_ptr(compiled_path).to_string_lossy().into_owned() };
 
         Ok(result)
     }
@@ -223,11 +209,7 @@ impl CoreMLModel {
         unsafe {
             let data_ptr = MLMultiArrayGetDataPointer(input_array);
             if !data_ptr.is_null() {
-                ptr::copy_nonoverlapping(
-                    input.as_ptr(),
-                    data_ptr,
-                    input.len(),
-                );
+                ptr::copy_nonoverlapping(input.as_ptr(), data_ptr, input.len());
             }
         }
 
@@ -237,21 +219,24 @@ impl CoreMLModel {
         let provider = unsafe { MLFeatureProviderCreate() };
         if provider.is_null() {
             // SAFETY: `input_array` is non-null (verified above) and has not been released yet.
-            unsafe { MLMultiArrayRelease(input_array); }
+            unsafe {
+                MLMultiArrayRelease(input_array);
+            }
             anyhow::bail!("Failed to create feature provider");
         }
 
         // Set input
-        let input_name = CString::new(self.input_names[0].as_str())?;
+        let input_name = CString::new(
+            self.input_names
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("model declares no input"))?
+                .as_str(),
+        )?;
         // SAFETY: `provider` and `input_array` are verified non-null. `input_name` is a
         // valid null-terminated CString kept alive for the call. The provider takes
         // ownership of a reference to the array.
         unsafe {
-            MLFeatureProviderSetMultiArray(
-                provider,
-                input_name.as_ptr(),
-                input_array,
-            );
+            MLFeatureProviderSetMultiArray(provider, input_name.as_ptr(), input_array);
         }
 
         // Run prediction
@@ -290,18 +275,24 @@ impl CoreMLModel {
         }
 
         // Extract output
-        let output_name = CString::new(self.output_names[0].as_str())?;
+        let output_name = CString::new(
+            self.output_names
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("model declares no output"))?
+                .as_str(),
+        )?;
         // SAFETY: `output_provider` is verified non-null above. `output_name` is a valid
         // null-terminated CString kept alive for the call. Returns null if the named
         // feature is not found, checked below.
-        let output_array = unsafe {
-            MLFeatureProviderGetMultiArray(output_provider, output_name.as_ptr())
-        };
+        let output_array =
+            unsafe { MLFeatureProviderGetMultiArray(output_provider, output_name.as_ptr()) };
 
         if output_array.is_null() {
             // SAFETY: `output_provider` is non-null (checked above) and cast to *mut
             // for release. Released exactly once on this error path.
-            unsafe { MLFeatureProviderRelease(output_provider as *mut _); }
+            unsafe {
+                MLFeatureProviderRelease(output_provider as *mut _);
+            }
             anyhow::bail!("Failed to get output array");
         }
 
@@ -318,11 +309,7 @@ impl CoreMLModel {
         unsafe {
             let data_ptr = MLMultiArrayGetDataPointer(output_array);
             if !data_ptr.is_null() {
-                ptr::copy_nonoverlapping(
-                    data_ptr,
-                    output.as_mut_ptr(),
-                    output_count as usize,
-                );
+                ptr::copy_nonoverlapping(data_ptr, output.as_mut_ptr(), output_count as usize);
             }
         }
 
@@ -352,9 +339,7 @@ impl CoreMLModel {
             if desc.is_null() {
                 "Unknown error".to_string()
             } else {
-                CStr::from_ptr(desc)
-                    .to_string_lossy()
-                    .into_owned()
+                CStr::from_ptr(desc).to_string_lossy().into_owned()
             }
         }
     }

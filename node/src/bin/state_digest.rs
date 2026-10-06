@@ -4,13 +4,29 @@
 //
 // Usage: state-digest /path/to/.citrate
 
+// PANIC-S1 G2: production code in this crate may not panic (tests excepted).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use citrate_execution::StateDB;
 use citrate_storage::pruning::PruningConfig;
 use citrate_storage::StorageManager;
 use std::collections::BTreeMap;
 
 fn main() -> anyhow::Result<()> {
-    let dir = std::env::args().nth(1).expect("usage: state-digest <data-dir>");
+    let dir = std::env::args()
+        .nth(1)
+        .ok_or_else(|| anyhow::anyhow!("usage: state-digest <data-dir>"))?;
     let storage = StorageManager::new(&dir, PruningConfig::default())?;
     let state_db = StateDB::new();
 
@@ -25,7 +41,10 @@ fn main() -> anyhow::Result<()> {
     // Count slots per address (incl. zero-valued rows) for the digest.
     let mut slot_count: BTreeMap<[u8; 20], usize> = BTreeMap::new();
     for ((address, storage_key), storage_value) in slots {
-        *slot_count.entry(address.0).or_default() += 1;
+        {
+            let c = slot_count.entry(address.0).or_default();
+            *c = c.saturating_add(1);
+        }
         state_db.set_storage(
             address,
             storage_key.as_bytes().to_vec(),

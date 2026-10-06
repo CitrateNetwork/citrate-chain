@@ -35,11 +35,7 @@ fn test_generate_block_vrf_produces_nonempty_proof() {
         "ECVRF proof must be 114 bytes, got {}",
         proof.proof.len()
     );
-    assert_ne!(
-        proof.output,
-        Hash::default(),
-        "VRF output must not be zero"
-    );
+    assert_ne!(proof.output, Hash::default(), "VRF output must not be zero");
 
     // Proof bytes must not be all-zero
     assert!(
@@ -214,8 +210,5 @@ fn test_ecvrf_tampered_proof_rejects() {
     proof.c[0] ^= 0xFF;
 
     let result = citrate_consensus::ecvrf::verify(alpha, &proof);
-    assert!(
-        result.is_err(),
-        "Tampered proof must fail verification"
-    );
+    assert!(result.is_err(), "Tampered proof must fail verification");
 }

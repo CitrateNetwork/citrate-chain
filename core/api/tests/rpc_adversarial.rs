@@ -12,8 +12,8 @@ use citrate_api::eth_tx_decoder::decode_eth_transaction;
 fn test_malformed_rlp_returns_error_not_panic() {
     // Random garbage bytes that are not valid RLP, bincode, or typed tx
     let garbage: Vec<u8> = vec![
-        0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA, 0x99, 0x88,
-        0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00,
+        0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+        0x00,
     ];
 
     let result = decode_eth_transaction(&garbage);
@@ -41,7 +41,9 @@ fn test_oversized_bincode_rejected() {
 
     let err_msg = result.unwrap_err();
     assert!(
-        err_msg.contains("too large") || err_msg.contains("256KB") || err_msg.contains("Invalid RLP"),
+        err_msg.contains("too large")
+            || err_msg.contains("256KB")
+            || err_msg.contains("Invalid RLP"),
         "Error message should indicate size limit or invalid format: {}",
         err_msg
     );
@@ -57,14 +59,14 @@ fn test_invalid_address_length_rejected() {
     //
     // Legacy RLP: [nonce, gasPrice, gasLimit, to, value, data, v, r, s]
     let mut stream = rlp::RlpStream::new_list(9);
-    stream.append(&0u64);           // nonce
+    stream.append(&0u64); // nonce
     stream.append(&1_000_000_000u64); // gasPrice
-    stream.append(&21_000u64);       // gasLimit
-    // INVALID: 19-byte address instead of 20
+    stream.append(&21_000u64); // gasLimit
+                               // INVALID: 19-byte address instead of 20
     stream.append(&vec![0xABu8; 19].as_slice());
-    stream.append(&0u64);           // value
+    stream.append(&0u64); // value
     stream.append(&Vec::<u8>::new().as_slice()); // data (empty)
-    stream.append(&27u64);          // v
+    stream.append(&27u64); // v
     stream.append(&vec![1u8; 32].as_slice()); // r
     stream.append(&vec![1u8; 32].as_slice()); // s
 
@@ -88,10 +90,7 @@ fn test_invalid_address_length_rejected() {
 fn test_empty_transaction_rejected() {
     let empty: Vec<u8> = vec![];
     let result = decode_eth_transaction(&empty);
-    assert!(
-        result.is_err(),
-        "Empty transaction data must be rejected"
-    );
+    assert!(result.is_err(), "Empty transaction data must be rejected");
 
     let err_msg = result.unwrap_err();
     assert!(
@@ -117,16 +116,16 @@ fn test_valid_legacy_tx_decodes() {
 
     // Build a structurally valid legacy tx RLP
     let mut stream = rlp::RlpStream::new_list(9);
-    stream.append(&0u64);               // nonce
-    stream.append(&20_000_000_000u64);   // gasPrice (20 gwei)
-    stream.append(&21_000u64);           // gasLimit
-    // Valid 20-byte address
+    stream.append(&0u64); // nonce
+    stream.append(&20_000_000_000u64); // gasPrice (20 gwei)
+    stream.append(&21_000u64); // gasLimit
+                               // Valid 20-byte address
     stream.append(&vec![0x42u8; 20].as_slice());
     stream.append(&1_000_000_000_000_000_000u64); // value: 1 ETH in wei
-    stream.append(&Vec::<u8>::new().as_slice());   // data (empty)
-    stream.append(&27u64);               // v (pre-EIP-155)
-    // r and s — these won't form a valid ECDSA signature but the decoder
-    // should handle the error gracefully
+    stream.append(&Vec::<u8>::new().as_slice()); // data (empty)
+    stream.append(&27u64); // v (pre-EIP-155)
+                           // r and s — these won't form a valid ECDSA signature but the decoder
+                           // should handle the error gracefully
     stream.append(&vec![0x11u8; 32].as_slice()); // r
     stream.append(&vec![0x22u8; 32].as_slice()); // s
 
@@ -164,18 +163,18 @@ fn test_valid_eip1559_tx_decodes() {
     // [chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit, to, value, data, accessList, yParity, r, s]
 
     let mut stream = rlp::RlpStream::new_list(12);
-    stream.append(&1u64);               // chainId
-    stream.append(&5u64);               // nonce
-    stream.append(&2_000_000_000u64);   // maxPriorityFeePerGas (2 gwei)
-    stream.append(&30_000_000_000u64);  // maxFeePerGas (30 gwei)
-    stream.append(&21_000u64);          // gasLimit
-    // Valid 20-byte to address
+    stream.append(&1u64); // chainId
+    stream.append(&5u64); // nonce
+    stream.append(&2_000_000_000u64); // maxPriorityFeePerGas (2 gwei)
+    stream.append(&30_000_000_000u64); // maxFeePerGas (30 gwei)
+    stream.append(&21_000u64); // gasLimit
+                               // Valid 20-byte to address
     stream.append(&vec![0xABu8; 20].as_slice());
-    stream.append(&0u64);               // value
+    stream.append(&0u64); // value
     stream.append(&Vec::<u8>::new().as_slice()); // data (empty)
-    // Empty access list
+                                                 // Empty access list
     stream.begin_list(0);
-    stream.append(&0u64);               // yParity
+    stream.append(&0u64); // yParity
     stream.append(&vec![0x33u8; 32].as_slice()); // r
     stream.append(&vec![0x44u8; 32].as_slice()); // s
 

@@ -6,6 +6,20 @@
 //! See `.agentile/planset/2026-05-04-it-turnkey-deployment/02_SIGNING_AND_KYC_ARCHITECTURE.md`
 //! for the architecture this crate implements.
 
+// PANIC-S1 G2: production code in this crate may not panic (tests excepted).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 pub mod auth_mode;
 pub mod error;
 pub mod models;

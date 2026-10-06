@@ -7,7 +7,7 @@
 //! rewards they have accrued so far.
 
 use super::{Cid, ModelMetadata, ModelType};
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -143,12 +143,12 @@ impl PinningManager {
         let size_gb = bytes_to_gb(metadata.size_bytes);
         let days = (duration_hours as f64 / 24.0).max(1.0);
         let base = (size_gb * days).ceil().max(1.0) as u64;
-        base * reward_multiplier(&metadata.model_type)
+        base.saturating_mul(reward_multiplier(&metadata.model_type))
     }
 
     pub fn reward_for_bytes(bytes: u64, model_type: &ModelType) -> u64 {
         let size_gb = bytes_to_gb(bytes).ceil().max(1.0) as u64;
-        size_gb * reward_multiplier(model_type)
+        size_gb.saturating_mul(reward_multiplier(model_type))
     }
 }
 
@@ -218,22 +218,19 @@ impl PersistentPinRegistry {
 
     /// Persist current state to the JSON file.
     pub fn save(&self) -> Result<()> {
-        let json = serde_json::to_string_pretty(&self.pins)
-            .context("Failed to serialize pin registry")?;
+        let json =
+            serde_json::to_string_pretty(&self.pins).context("Failed to serialize pin registry")?;
         if let Some(parent) = self.persist_path.parent() {
-            std::fs::create_dir_all(parent)
-                .context("Failed to create pin registry directory")?;
+            std::fs::create_dir_all(parent).context("Failed to create pin registry directory")?;
         }
-        std::fs::write(&self.persist_path, json)
-            .context("Failed to write pin registry file")?;
+        std::fs::write(&self.persist_path, json).context("Failed to write pin registry file")?;
         Ok(())
     }
 
     fn load_from_file(path: &Path) -> Result<HashMap<String, PinnedModelInfo>> {
-        let data = std::fs::read_to_string(path)
-            .context("Failed to read pin registry file")?;
-        let pins: HashMap<String, PinnedModelInfo> = serde_json::from_str(&data)
-            .context("Failed to deserialize pin registry")?;
+        let data = std::fs::read_to_string(path).context("Failed to read pin registry file")?;
+        let pins: HashMap<String, PinnedModelInfo> =
+            serde_json::from_str(&data).context("Failed to deserialize pin registry")?;
         Ok(pins)
     }
 }

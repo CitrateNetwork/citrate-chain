@@ -35,8 +35,7 @@ fn test_ed25519_rfc8032_test_vector_1() {
 
     // Verify public key matches the known answer from RFC 8032
     let expected_pk =
-        hex::decode("3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29")
-            .unwrap();
+        hex::decode("3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29").unwrap();
     assert_eq!(
         verifying_key.to_bytes(),
         expected_pk.as_slice(),
@@ -73,8 +72,7 @@ fn test_ed25519_rfc8032_test_vector_2() {
     // Message: 0x72 (single byte 'r')
 
     let seed =
-        hex::decode("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb")
-            .unwrap();
+        hex::decode("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb").unwrap();
     let mut seed_arr = [0u8; 32];
     seed_arr.copy_from_slice(&seed);
 
@@ -83,8 +81,7 @@ fn test_ed25519_rfc8032_test_vector_2() {
 
     // Verify public key matches RFC 8032 Test Vector 2
     let expected_pk =
-        hex::decode("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c")
-            .unwrap();
+        hex::decode("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c").unwrap();
     assert_eq!(
         verifying_key.to_bytes(),
         expected_pk.as_slice(),
@@ -188,8 +185,7 @@ fn test_keystore_argon2_params_minimum() {
         .expect("generate_key under v2 KDF should succeed");
 
     let bytes = std::fs::read(&path).expect("read keystore JSON");
-    let entries: Vec<EncryptedKey> =
-        serde_json::from_slice(&bytes).expect("parse keystore JSON");
+    let entries: Vec<EncryptedKey> = serde_json::from_slice(&bytes).expect("parse keystore JSON");
     assert_eq!(entries.len(), 1);
 
     assert!(
@@ -228,8 +224,10 @@ fn test_aes_gcm_nonce_uniqueness() {
     let (_dir, mut ks) = temp_keystore();
 
     let password = "test-password-nonce";
-    ks.generate_key(password, Some("key-1".to_string())).unwrap();
-    ks.generate_key(password, Some("key-2".to_string())).unwrap();
+    ks.generate_key(password, Some("key-1".to_string()))
+        .unwrap();
+    ks.generate_key(password, Some("key-2".to_string()))
+        .unwrap();
 
     let accounts = ks.list_accounts();
     assert_eq!(accounts.len(), 2);

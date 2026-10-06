@@ -1,9 +1,9 @@
 //! High-level wallet API — the main entry point for SDK consumers.
 
-use citrate_wallet_core::keys::KeyManager;
-use citrate_wallet_core::chain::{TransactionBuilder, RpcClient};
-use citrate_wallet_core::session::SessionManager;
+use citrate_wallet_core::chain::{RpcClient, TransactionBuilder};
 use citrate_wallet_core::error::WalletError;
+use citrate_wallet_core::keys::KeyManager;
+use citrate_wallet_core::session::SessionManager;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -212,7 +212,9 @@ impl Wallet {
         password: &str,
         label: &str,
     ) -> Result<SdkAccount, WalletError> {
-        let result = self.key_manager.recover_from_mnemonic(mnemonic, password, label)?;
+        let result = self
+            .key_manager
+            .recover_from_mnemonic(mnemonic, password, label)?;
         Ok(SdkAccount {
             address: result.address,
             public_key: result.public_key_hex,
@@ -229,7 +231,9 @@ impl Wallet {
         password: &str,
         label: &str,
     ) -> Result<(SdkAccount, zeroize::Zeroizing<String>), WalletError> {
-        let result = self.key_manager.recover_from_mnemonic(mnemonic, password, label)?;
+        let result = self
+            .key_manager
+            .recover_from_mnemonic(mnemonic, password, label)?;
         let z_mnemonic = zeroize::Zeroizing::new(result.mnemonic);
         let account = SdkAccount {
             address: result.address,
@@ -247,7 +251,9 @@ impl Wallet {
         password: &str,
         label: &str,
     ) -> Result<SdkAccount, WalletError> {
-        let result = self.key_manager.import_account(private_key_hex, password, label)?;
+        let result = self
+            .key_manager
+            .import_account(private_key_hex, password, label)?;
         Ok(SdkAccount {
             address: result.address,
             public_key: result.public_key_hex,
@@ -272,8 +278,7 @@ impl Wallet {
 
     /// Unlock the wallet with a password.
     pub async fn unlock(&self, password: &str) -> Result<usize, WalletError> {
-        let primary = self.key_manager.primary_address()
-            .unwrap_or_default();
+        let primary = self.key_manager.primary_address().unwrap_or_default();
 
         // Check rate limiting
         {
@@ -299,8 +304,7 @@ impl Wallet {
 
     /// Lock the wallet — clears all decrypted keys from memory.
     pub async fn lock(&self) {
-        let primary = self.key_manager.primary_address()
-            .unwrap_or_default();
+        let primary = self.key_manager.primary_address().unwrap_or_default();
         self.key_manager.lock();
         self.session.write().await.end_session(&primary);
     }
@@ -364,39 +368,41 @@ impl Wallet {
 
         let unified_key = self.key_manager.get_signing_key(from)?;
         // P0 fix: nonce fetch failure is a real error, not silent zero
-        let nonce = self.rpc_client.get_nonce(from).await
-            .map_err(|e| WalletError::TransactionFailed(
-                format!("Cannot fetch nonce: {}. Is the node running?", e)
-            ))?;
+        let nonce = self.rpc_client.get_nonce(from).await.map_err(|e| {
+            WalletError::TransactionFailed(format!(
+                "Cannot fetch nonce: {}. Is the node running?",
+                e
+            ))
+        })?;
 
         let signed = match &unified_key {
-            citrate_wallet_core::keys::UnifiedKey::Ed25519(ed_key) => {
-                TransactionBuilder::new()
-                    .to(to)
-                    .value(value_wei)
-                    .gas_limit(gas_limit.unwrap_or(21_000))
-                    .gas_price(gas_price.unwrap_or(1_000_000_000))
-                    .chain_id(self.config.chain_id)
-                    .sign(ed_key, nonce)?
-            }
-            citrate_wallet_core::keys::UnifiedKey::Secp256k1(secp_key) => {
-                TransactionBuilder::new()
-                    .to(to)
-                    .value(value_wei)
-                    .gas_limit(gas_limit.unwrap_or(21_000))
-                    .gas_price(gas_price.unwrap_or(1_000_000_000))
-                    .chain_id(self.config.chain_id)
-                    .sign_secp256k1(secp_key, nonce)?
-            }
+            citrate_wallet_core::keys::UnifiedKey::Ed25519(ed_key) => TransactionBuilder::new()
+                .to(to)
+                .value(value_wei)
+                .gas_limit(gas_limit.unwrap_or(21_000))
+                .gas_price(gas_price.unwrap_or(1_000_000_000))
+                .chain_id(self.config.chain_id)
+                .sign(ed_key, nonce)?,
+            citrate_wallet_core::keys::UnifiedKey::Secp256k1(secp_key) => TransactionBuilder::new()
+                .to(to)
+                .value(value_wei)
+                .gas_limit(gas_limit.unwrap_or(21_000))
+                .gas_price(gas_price.unwrap_or(1_000_000_000))
+                .chain_id(self.config.chain_id)
+                .sign_secp256k1(secp_key, nonce)?,
         };
 
         // P0 fix: submission failure is a real error, not fake success
-        let tx_hash = self.rpc_client
+        let tx_hash = self
+            .rpc_client
             .send_raw_transaction(&signed.raw)
             .await
-            .map_err(|e| WalletError::TransactionFailed(
-                format!("Transaction submission failed: {}. Signed but not accepted.", e)
-            ))?;
+            .map_err(|e| {
+                WalletError::TransactionFailed(format!(
+                    "Transaction submission failed: {}. Signed but not accepted.",
+                    e
+                ))
+            })?;
 
         Ok(SdkTransaction {
             hash: tx_hash,
@@ -428,11 +434,7 @@ impl Wallet {
     }
 
     /// Delete an account (requires password).
-    pub async fn delete_account(
-        &self,
-        address: &str,
-        password: &str,
-    ) -> Result<(), WalletError> {
+    pub async fn delete_account(&self, address: &str, password: &str) -> Result<(), WalletError> {
         self.key_manager.delete_account(address, password)
     }
 
@@ -470,7 +472,10 @@ mod tests {
     #[tokio::test]
     async fn test_create_account() {
         let wallet = test_wallet("create");
-        let account = wallet.create_account("strongpassword1", "Primary").await.expect("create");
+        let account = wallet
+            .create_account("strongpassword1", "Primary")
+            .await
+            .expect("create");
         assert!(account.address.starts_with("0x"));
         assert_eq!(account.address.len(), 42);
         assert_eq!(account.mnemonic.split_whitespace().count(), 24);
@@ -480,7 +485,10 @@ mod tests {
     #[tokio::test]
     async fn test_create_evm_account() {
         let wallet = test_wallet("evm");
-        let account = wallet.create_evm_account("strongpassword1", "EVM").await.expect("create evm");
+        let account = wallet
+            .create_evm_account("strongpassword1", "EVM")
+            .await
+            .expect("create evm");
         assert!(account.address.starts_with("0x"));
         assert_eq!(account.address.len(), 42);
     }
@@ -488,7 +496,10 @@ mod tests {
     #[tokio::test]
     async fn test_unlock_lock() {
         let wallet = test_wallet("unlock");
-        wallet.create_account("strongpassword1", "Primary").await.expect("create");
+        wallet
+            .create_account("strongpassword1", "Primary")
+            .await
+            .expect("create");
 
         let count = wallet.unlock("strongpassword1").await.expect("unlock");
         assert_eq!(count, 1);
@@ -501,7 +512,10 @@ mod tests {
     #[tokio::test]
     async fn test_wrong_password() {
         let wallet = test_wallet("wrong_pwd");
-        wallet.create_account("strongpassword1", "Primary").await.expect("create");
+        wallet
+            .create_account("strongpassword1", "Primary")
+            .await
+            .expect("create");
         let result = wallet.unlock("wrongpassword!").await;
         assert!(result.is_err());
     }
@@ -509,17 +523,26 @@ mod tests {
     #[tokio::test]
     async fn test_sign_message() {
         let wallet = test_wallet("sign");
-        let account = wallet.create_account("strongpassword1", "Primary").await.expect("create");
+        let account = wallet
+            .create_account("strongpassword1", "Primary")
+            .await
+            .expect("create");
         wallet.unlock("strongpassword1").await.expect("unlock");
 
-        let sig = wallet.sign_message(&account.address, b"hello world").await.expect("sign");
+        let sig = wallet
+            .sign_message(&account.address, b"hello world")
+            .await
+            .expect("sign");
         assert_eq!(sig.len(), 64); // Ed25519 signature
     }
 
     #[tokio::test]
     async fn test_sign_requires_unlock() {
         let wallet = test_wallet("sign_locked");
-        let account = wallet.create_account("strongpassword1", "Primary").await.expect("create");
+        let account = wallet
+            .create_account("strongpassword1", "Primary")
+            .await
+            .expect("create");
         let result = wallet.sign_message(&account.address, b"test").await;
         assert!(result.is_err(), "Signing without unlock should fail");
     }
@@ -527,9 +550,18 @@ mod tests {
     #[tokio::test]
     async fn test_list_accounts() {
         let wallet = test_wallet("list");
-        wallet.create_account("strongpassword1", "Account 1").await.expect("create 1");
-        wallet.create_account("strongpassword1", "Account 2").await.expect("create 2");
-        wallet.create_evm_account("strongpassword1", "EVM").await.expect("create evm");
+        wallet
+            .create_account("strongpassword1", "Account 1")
+            .await
+            .expect("create 1");
+        wallet
+            .create_account("strongpassword1", "Account 2")
+            .await
+            .expect("create 2");
+        wallet
+            .create_evm_account("strongpassword1", "EVM")
+            .await
+            .expect("create evm");
 
         let accounts = wallet.list_accounts().await;
         assert_eq!(accounts.len(), 3);
@@ -539,25 +571,42 @@ mod tests {
     #[tokio::test]
     async fn test_recover_from_mnemonic() {
         let wallet = test_wallet("recover");
-        let original = wallet.create_account("strongpassword1", "Original").await.expect("create");
+        let original = wallet
+            .create_account("strongpassword1", "Original")
+            .await
+            .expect("create");
         let mnemonic = original.mnemonic.clone();
 
-        wallet.delete_account(&original.address, "strongpassword1").await.expect("delete");
+        wallet
+            .delete_account(&original.address, "strongpassword1")
+            .await
+            .expect("delete");
         assert!(wallet.is_first_run().await);
 
-        let recovered = wallet.recover_account(&mnemonic, "newpassword12", "Recovered")
-            .await.expect("recover");
+        let recovered = wallet
+            .recover_account(&mnemonic, "newpassword12", "Recovered")
+            .await
+            .expect("recover");
         assert_eq!(original.address, recovered.address);
     }
 
     #[tokio::test]
     async fn test_import_account() {
         let wallet = test_wallet("import");
-        let original = wallet.create_account("strongpassword1", "Original").await.expect("create");
-        let privkey = wallet.export_private_key(&original.address, "strongpassword1").await.expect("export");
+        let original = wallet
+            .create_account("strongpassword1", "Original")
+            .await
+            .expect("create");
+        let privkey = wallet
+            .export_private_key(&original.address, "strongpassword1")
+            .await
+            .expect("export");
 
         let wallet2 = test_wallet("import2");
-        let imported = wallet2.import_account(&privkey, "differentpwd1", "Imported").await.expect("import");
+        let imported = wallet2
+            .import_account(&privkey, "differentpwd1", "Imported")
+            .await
+            .expect("import");
         // Same key, same address
         assert_eq!(original.address, imported.address);
     }
@@ -565,18 +614,29 @@ mod tests {
     #[tokio::test]
     async fn test_delete_account() {
         let wallet = test_wallet("delete");
-        let account = wallet.create_account("strongpassword1", "Primary").await.expect("create");
+        let account = wallet
+            .create_account("strongpassword1", "Primary")
+            .await
+            .expect("create");
         assert!(!wallet.is_first_run().await);
 
-        wallet.delete_account(&account.address, "strongpassword1").await.expect("delete");
+        wallet
+            .delete_account(&account.address, "strongpassword1")
+            .await
+            .expect("delete");
         assert!(wallet.is_first_run().await);
     }
 
     #[tokio::test]
     async fn test_delete_wrong_password() {
         let wallet = test_wallet("delete_wrong");
-        let account = wallet.create_account("strongpassword1", "Primary").await.expect("create");
-        let result = wallet.delete_account(&account.address, "wrongpassword!").await;
+        let account = wallet
+            .create_account("strongpassword1", "Primary")
+            .await
+            .expect("create");
+        let result = wallet
+            .delete_account(&account.address, "wrongpassword!")
+            .await;
         assert!(result.is_err());
         assert!(!wallet.is_first_run().await);
     }
@@ -591,7 +651,10 @@ mod tests {
     async fn test_primary_address() {
         let wallet = test_wallet("primary");
         assert!(wallet.primary_address().await.is_none());
-        let account = wallet.create_account("strongpassword1", "Primary").await.expect("create");
+        let account = wallet
+            .create_account("strongpassword1", "Primary")
+            .await
+            .expect("create");
         assert_eq!(wallet.primary_address().await, Some(account.address));
     }
 
@@ -619,30 +682,54 @@ mod tests {
     #[tokio::test]
     async fn test_sign_deterministic() {
         let wallet = test_wallet("deterministic");
-        let account = wallet.create_account("strongpassword1", "Primary").await.expect("create");
+        let account = wallet
+            .create_account("strongpassword1", "Primary")
+            .await
+            .expect("create");
         wallet.unlock("strongpassword1").await.expect("unlock");
 
-        let sig1 = wallet.sign_message(&account.address, b"determinism test").await.expect("sign 1");
-        let sig2 = wallet.sign_message(&account.address, b"determinism test").await.expect("sign 2");
+        let sig1 = wallet
+            .sign_message(&account.address, b"determinism test")
+            .await
+            .expect("sign 1");
+        let sig2 = wallet
+            .sign_message(&account.address, b"determinism test")
+            .await
+            .expect("sign 2");
         assert_eq!(sig1, sig2);
     }
 
     #[tokio::test]
     async fn test_multiple_accounts_sign_differently() {
         let wallet = test_wallet("multi_sign");
-        let a1 = wallet.create_account("strongpassword1", "A1").await.expect("create 1");
-        let a2 = wallet.create_account("strongpassword1", "A2").await.expect("create 2");
+        let a1 = wallet
+            .create_account("strongpassword1", "A1")
+            .await
+            .expect("create 1");
+        let a2 = wallet
+            .create_account("strongpassword1", "A2")
+            .await
+            .expect("create 2");
         wallet.unlock("strongpassword1").await.expect("unlock");
 
-        let sig1 = wallet.sign_message(&a1.address, b"test").await.expect("sign 1");
-        let sig2 = wallet.sign_message(&a2.address, b"test").await.expect("sign 2");
+        let sig1 = wallet
+            .sign_message(&a1.address, b"test")
+            .await
+            .expect("sign 1");
+        let sig2 = wallet
+            .sign_message(&a2.address, b"test")
+            .await
+            .expect("sign 2");
         assert_ne!(sig1, sig2);
     }
 
     #[tokio::test]
     async fn test_rate_limiting() {
         let wallet = test_wallet("rate_limit");
-        wallet.create_account("strongpassword1", "Primary").await.expect("create");
+        wallet
+            .create_account("strongpassword1", "Primary")
+            .await
+            .expect("create");
 
         // 5 wrong attempts (default max_failed_attempts)
         for _ in 0..5 {
