@@ -132,9 +132,7 @@ impl RelayService {
 
         debug!(
             "Relayed {} bytes from {} to {}",
-            payload_len,
-            from.0,
-            target_peer_id
+            payload_len, from.0, target_peer_id
         );
 
         Ok(())

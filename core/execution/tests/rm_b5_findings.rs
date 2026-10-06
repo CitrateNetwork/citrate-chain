@@ -7,10 +7,12 @@
 // H-03 is exercised through the existing MVCC test suite plus the
 // `journal.requires_serial_commit()` gate in commit.rs.
 
-use citrate_execution::precompiles::inference::{InferenceMode, InferencePrecompile, addresses as iaddr};
-use citrate_execution::types::Address;
-use citrate_execution::inference::metal_runtime::MetalRuntime;
 use citrate_execution::executor::Executor;
+use citrate_execution::inference::metal_runtime::MetalRuntime;
+use citrate_execution::precompiles::inference::{
+    addresses as iaddr, InferenceMode, InferencePrecompile,
+};
+use citrate_execution::types::Address;
 use std::sync::Arc;
 
 fn make_inference(strict: bool) -> InferencePrecompile {

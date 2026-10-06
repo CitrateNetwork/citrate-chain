@@ -24,7 +24,8 @@ impl Default for TokenConfig {
             name: "Citrate".to_string(),
             symbol: "SALT".to_string(),
             decimals: DECIMALS,
-            total_supply: U256::from(crate::TOTAL_SUPPLY).saturating_mul(U256::exp10(DECIMALS as usize)),
+            total_supply: U256::from(crate::TOTAL_SUPPLY)
+                .saturating_mul(U256::exp10(DECIMALS as usize)),
             initial_distribution: HashMap::new(),
         }
     }
@@ -78,7 +79,8 @@ impl Token {
         }
 
         // Update balances
-        self.balances.insert(*from, from_balance.saturating_sub(amount));
+        self.balances
+            .insert(*from, from_balance.saturating_sub(amount));
         let to_balance = self.balance_of(to);
         self.balances.insert(*to, to_balance.saturating_add(amount));
 
@@ -291,7 +293,10 @@ mod tests {
         token.transfer(&alice, &bob, U256::from(3_000)).unwrap();
         let supply_after = token.circulating_supply();
 
-        assert_eq!(supply_before, supply_after, "Transfer must conserve circulating supply");
+        assert_eq!(
+            supply_before, supply_after,
+            "Transfer must conserve circulating supply"
+        );
         assert_eq!(
             token.balance_of(&alice) + token.balance_of(&bob),
             amount,

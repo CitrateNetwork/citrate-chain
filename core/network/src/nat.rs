@@ -33,7 +33,10 @@ pub enum NatType {
 impl NatType {
     /// Whether hole punching is likely to succeed with this NAT type.
     pub fn supports_hole_punch(&self) -> bool {
-        matches!(self, NatType::None | NatType::FullCone | NatType::Restricted | NatType::PortRestricted)
+        matches!(
+            self,
+            NatType::None | NatType::FullCone | NatType::Restricted | NatType::PortRestricted
+        )
     }
 
     /// Whether a relay is needed for reliable connectivity.
@@ -215,7 +218,9 @@ pub async fn detect_nat(local_bind: Option<SocketAddr>) -> NatInfo {
 
         match result {
             Ok(Ok((len, _from))) => {
-                if let Some(external) = parse_stun_response(buf.get(..len).unwrap_or_default(), &txn_id) {
+                if let Some(external) =
+                    parse_stun_response(buf.get(..len).unwrap_or_default(), &txn_id)
+                {
                     let nat_type = if external.ip() == local_addr.ip() {
                         NatType::None
                     } else {

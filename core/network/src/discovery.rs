@@ -107,7 +107,7 @@ pub fn filter_by_subnet_cap(
     let mut counts: HashMap<[u8; 7], usize> = HashMap::new();
     for addr in existing {
         let c = counts.entry(subnet_group(&addr.ip())).or_insert(0);
-            *c = c.saturating_add(1);
+        *c = c.saturating_add(1);
     }
 
     let mut accepted = Vec::with_capacity(candidates.len());
@@ -168,7 +168,8 @@ impl Discovery {
         let mut added = 0usize;
         for node in &self.config.bootstrap_nodes {
             if let Some((_, addr)) = crate::bootnode::resolve_bootnode(node).await {
-                self.add_bootstrap_peer(format!("bootstrap_{}", node), addr).await;
+                self.add_bootstrap_peer(format!("bootstrap_{}", node), addr)
+                    .await;
                 added = added.saturating_add(1);
             } else {
                 warn!("Could not resolve bootstrap node: {}", node);
@@ -188,7 +189,10 @@ impl Discovery {
     pub async fn add_peer(&self, id: String, addr: SocketAddr, score: i32) {
         // CHAIN-B-A010: bound the attacker-controlled id and cap the map size.
         if id.len() > MAX_PEER_ID_LEN {
-            debug!("Discovery: rejecting oversized peer id ({} bytes)", id.len());
+            debug!(
+                "Discovery: rejecting oversized peer id ({} bytes)",
+                id.len()
+            );
             return;
         }
 
@@ -456,8 +460,7 @@ impl Discovery {
             .iter()
             .map(|p| (p.addr, p.is_bootstrap))
             .collect();
-        let accepted =
-            filter_by_subnet_cap(&keyed, &existing_addrs, MAX_PEERS_PER_SUBNET_GROUP);
+        let accepted = filter_by_subnet_cap(&keyed, &existing_addrs, MAX_PEERS_PER_SUBNET_GROUP);
 
         accepted
             .into_iter()
@@ -505,7 +508,10 @@ impl Discovery {
 
     /// A-10: Diagnostics — return count of protected bootstrap peers currently known.
     pub async fn bootstrap_peer_count(&self) -> usize {
-        self.known_peers.iter().filter(|p| p.value().is_bootstrap).count()
+        self.known_peers
+            .iter()
+            .filter(|p| p.value().is_bootstrap)
+            .count()
     }
 
     /// A-10: Diagnostics — return count of currently connected bootstrap peers.
@@ -577,14 +583,30 @@ mod tests {
         let a: IpAddr = "10.1.2.3".parse().expect("valid ip");
         let b: IpAddr = "10.1.2.250".parse().expect("valid ip");
         let c: IpAddr = "10.1.3.3".parse().expect("valid ip");
-        assert_eq!(subnet_group(&a), subnet_group(&b), "same /24 must group together");
-        assert_ne!(subnet_group(&a), subnet_group(&c), "different /24 must not group");
+        assert_eq!(
+            subnet_group(&a),
+            subnet_group(&b),
+            "same /24 must group together"
+        );
+        assert_ne!(
+            subnet_group(&a),
+            subnet_group(&c),
+            "different /24 must not group"
+        );
 
         let v6a: IpAddr = "2001:db8:aaaa:1::1".parse().expect("valid ip");
         let v6b: IpAddr = "2001:db8:aaaa:2::9".parse().expect("valid ip");
         let v6c: IpAddr = "2001:db8:bbbb:1::1".parse().expect("valid ip");
-        assert_eq!(subnet_group(&v6a), subnet_group(&v6b), "same /48 must group together");
-        assert_ne!(subnet_group(&v6a), subnet_group(&v6c), "different /48 must not group");
+        assert_eq!(
+            subnet_group(&v6a),
+            subnet_group(&v6b),
+            "same /48 must group together"
+        );
+        assert_ne!(
+            subnet_group(&v6a),
+            subnet_group(&v6c),
+            "different /48 must not group"
+        );
 
         // v4 and v6 keys never collide (tag byte differs)
         assert_ne!(subnet_group(&a)[0], subnet_group(&v6a)[0]);
@@ -614,8 +636,8 @@ mod tests {
         let mk = |s: &str| -> SocketAddr { s.parse().expect("valid addr") };
         let existing = vec![mk("10.0.0.10:30303"), mk("10.0.0.11:30303")];
         let candidates = vec![
-            (mk("10.0.0.1:30303"), false), // 3rd in group — kept
-            (mk("10.0.0.2:30303"), false), // 4th in group — dropped
+            (mk("10.0.0.1:30303"), false),   // 3rd in group — kept
+            (mk("10.0.0.2:30303"), false),   // 4th in group — dropped
             (mk("172.16.0.1:30303"), false), // fresh group — kept
         ];
         let accepted = filter_by_subnet_cap(&candidates, &existing, 3);
@@ -631,7 +653,7 @@ mod tests {
             (mk("10.0.0.1:30301"), true),
             (mk("10.0.0.2:30302"), true),
             (mk("10.0.0.3:30303"), true),
-            (mk("10.0.0.4:30304"), true), // exempt: kept despite >cap
+            (mk("10.0.0.4:30304"), true),  // exempt: kept despite >cap
             (mk("10.0.0.5:30305"), false), // non-exempt, group full — dropped
         ];
         let accepted = filter_by_subnet_cap(&candidates, &[], 3);
@@ -759,12 +781,17 @@ mod tests {
 
         // Simulate 10 failed attempts — way above the normal attempts<3 cap
         for _ in 0..10 {
-            discovery.update_attempts("bootstrap_127.0.0.1:30303", false).await;
+            discovery
+                .update_attempts("bootstrap_127.0.0.1:30303", false)
+                .await;
         }
 
         // find_peers should STILL return the bootstrap node because is_bootstrap=true
         let candidates = discovery.find_peers().await;
-        assert!(!candidates.is_empty(), "Bootstrap peer must remain in candidates after 10 failed attempts");
+        assert!(
+            !candidates.is_empty(),
+            "Bootstrap peer must remain in candidates after 10 failed attempts"
+        );
         assert_eq!(candidates[0].0, "bootstrap_127.0.0.1:30303");
     }
 
@@ -863,7 +890,10 @@ mod tests {
             .await;
         }
         let (held, _, _) = peer_manager.get_peer_counts().await;
-        assert_eq!(held, 3, "exactly the count the old `< 3` escape does not cover");
+        assert_eq!(
+            held, 3,
+            "exactly the count the old `< 3` escape does not cover"
+        );
 
         let candidates = discovery.find_peers().await;
         assert!(
@@ -979,8 +1009,15 @@ mod tests {
         discovery.cleanup_expired().await;
 
         // Bootstrap peer must survive; regular peer must be removed
-        assert_eq!(discovery.bootstrap_peer_count().await, 1, "Bootstrap peer must not be expired");
-        assert!(!discovery.known_peers.contains_key("regular"), "Regular peer must be expired");
+        assert_eq!(
+            discovery.bootstrap_peer_count().await,
+            1,
+            "Bootstrap peer must not be expired"
+        );
+        assert!(
+            !discovery.known_peers.contains_key("regular"),
+            "Regular peer must be expired"
+        );
     }
 
     // A-10 diagnostics: bootstrap_peer_count + connected_bootstrap_count
@@ -1014,14 +1051,20 @@ mod tests {
 
         // The first goes down. `mark_disconnected` is NOT called (production
         // never calls it) — the count must fall anyway.
-        peer_manager.remove_peer(&PeerId::new("boot1".to_string())).await;
+        peer_manager
+            .remove_peer(&PeerId::new("boot1".to_string()))
+            .await;
         assert_eq!(
             discovery.connected_bootstrap_count().await,
             1,
             "a dropped bootstrap stops counting as connected without any \
              bookkeeping call, because the peer manager is the source of truth"
         );
-        assert_eq!(discovery.bootstrap_peer_count().await, 3, "Total bootstrap count stays at 3");
+        assert_eq!(
+            discovery.bootstrap_peer_count().await,
+            3,
+            "Total bootstrap count stays at 3"
+        );
     }
 
     #[tokio::test]

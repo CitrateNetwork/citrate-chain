@@ -824,11 +824,7 @@ pub fn register_eth_methods_with_finality(
         // finalized height is behind the tip rather than mislabel latest state.
         let tag = params.get(1).and_then(|v| v.as_str());
         let latest_height = block_on(ChainApi::new(storage_bal.clone()).get_height()).unwrap_or(0);
-        require_serviceable_finality_tag(
-            tag,
-            finalized_bal.load(Ordering::SeqCst),
-            latest_height,
-        )?;
+        require_serviceable_finality_tag(tag, finalized_bal.load(Ordering::SeqCst), latest_height)?;
 
         let addr_str = match arg(&params, 0).as_str() {
             Some(a) if a.starts_with("0x") => a.get(2..).unwrap_or_default(),
@@ -1733,7 +1729,8 @@ pub fn register_eth_methods_with_finality(
                             if let Ok(Some(receipt)) =
                                 storage_fee.transactions.get_receipt(&tx.hash)
                             {
-                                gas_from_receipts = gas_from_receipts.saturating_add(receipt.gas_used);
+                                gas_from_receipts =
+                                    gas_from_receipts.saturating_add(receipt.gas_used);
                                 has_receipt_data = true;
                             }
                         }
@@ -1796,7 +1793,8 @@ pub fn register_eth_methods_with_finality(
                         let mut block_rewards: Vec<String> = Vec::new();
                         for pct in &percentiles {
                             // tips is non-empty here.
-                            let idx = ((pct / 100.0) * tips.len().saturating_sub(1) as f64).floor() as usize;
+                            let idx = ((pct / 100.0) * tips.len().saturating_sub(1) as f64).floor()
+                                as usize;
                             let tip = tips.get(idx).copied().unwrap_or(0);
                             block_rewards.push(format!("0x{:x}", tip));
                         }
@@ -2028,7 +2026,9 @@ pub fn register_eth_methods_with_finality(
                                 if i >= log.topics.len() {
                                     false // Log doesn't have this topic position
                                 } else {
-                                    log.topics.get(i).is_some_and(|t| allowed_topics.contains(t))
+                                    log.topics
+                                        .get(i)
+                                        .is_some_and(|t| allowed_topics.contains(t))
                                 }
                             }
                         }
@@ -2370,7 +2370,9 @@ pub fn register_eth_methods_with_finality(
                                         if i >= log.topics.len() {
                                             false
                                         } else {
-                                            log.topics.get(i).is_some_and(|t| allowed_topics.contains(t))
+                                            log.topics
+                                                .get(i)
+                                                .is_some_and(|t| allowed_topics.contains(t))
                                         }
                                     }
                                 },
@@ -2488,7 +2490,9 @@ pub fn register_eth_methods_with_finality(
                                         if i >= log.topics.len() {
                                             false
                                         } else {
-                                            log.topics.get(i).is_some_and(|t| allowed_topics.contains(t))
+                                            log.topics
+                                                .get(i)
+                                                .is_some_and(|t| allowed_topics.contains(t))
                                         }
                                     }
                                 },
@@ -2734,7 +2738,9 @@ pub fn register_eth_methods_with_finality(
             Ok(value) => {
                 // Always return left-padded 32-byte hex.
                 // Left-pad the last (up to) 32 bytes.
-                let tail = value.get(value.len().saturating_sub(32)..).unwrap_or_default();
+                let tail = value
+                    .get(value.len().saturating_sub(32)..)
+                    .unwrap_or_default();
                 let mut padded = vec![0u8; 32usize.saturating_sub(tail.len())];
                 padded.extend_from_slice(tail);
                 Ok(Value::String(format!("0x{}", hex::encode(padded))))
@@ -3223,7 +3229,6 @@ pub fn register_eth_methods_with_finality(
         });
     }
 }
-
 
 /// Positional JSON-RPC argument `i`, or `null` when absent, so a short params
 /// array flows into each method's existing "invalid params" path instead of

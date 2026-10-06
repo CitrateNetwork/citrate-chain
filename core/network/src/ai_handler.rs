@@ -9,10 +9,10 @@ use chrono;
 use citrate_consensus::types::Hash;
 use citrate_execution::ModelId;
 use citrate_storage::state_manager::StateManager;
-use tracing::{debug, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::{debug, info, warn};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PBA-L1b-004: peer AI gossip is ADVISORY and BOUNDED.
@@ -374,7 +374,10 @@ impl AINetworkHandler {
                 announced_at: now,
             },
         );
-        debug!("Cached peer model announcement {} from {}", model_id, peer_id);
+        debug!(
+            "Cached peer model announcement {} from {}",
+            model_id, peer_id
+        );
 
         Ok(None)
     }
@@ -447,7 +450,11 @@ impl AINetworkHandler {
                 let provider_key = *input_hash.as_bytes();
 
                 match executor
-                    .execute_inference(*model_id.as_bytes(), input_hash.as_bytes().to_vec(), provider_key)
+                    .execute_inference(
+                        *model_id.as_bytes(),
+                        input_hash.as_bytes().to_vec(),
+                        provider_key,
+                    )
                     .await
                 {
                     Ok(result) => {
@@ -475,11 +482,17 @@ impl AINetworkHandler {
                         }));
                     }
                     Err(e) => {
-                        warn!("Inference execution failed for request {}: {}", request_id, e);
+                        warn!(
+                            "Inference execution failed for request {}: {}",
+                            request_id, e
+                        );
                     }
                 }
             } else {
-                debug!("No inference executor configured, skipping inference request for model {}", model_id);
+                debug!(
+                    "No inference executor configured, skipping inference request for model {}",
+                    model_id
+                );
             }
         }
 
@@ -545,7 +558,10 @@ impl AINetworkHandler {
         if training.contains_key(&job_id) {
             return Ok(None);
         }
-        let from_peer = training.values().filter(|j| &j.announcer == peer_id).count();
+        let from_peer = training
+            .values()
+            .filter(|j| &j.announcer == peer_id)
+            .count();
         if from_peer >= MAX_TRAINING_JOBS_PER_PEER {
             debug!("PBA-L1b-004: {} is at its training-announce quota", peer_id);
             return Ok(None);
@@ -617,7 +633,8 @@ impl AINetworkHandler {
             }
         };
         if known {
-            self.store_gradient_reference(job_id, gradient_hash, epoch).await?;
+            self.store_gradient_reference(job_id, gradient_hash, epoch)
+                .await?;
         }
 
         Ok(None)
@@ -649,7 +666,10 @@ impl AINetworkHandler {
     ) -> Result<Option<NetworkMessage>> {
         debug!(
             "Received weight sync for model {} version {} ({} bytes) from peer {}",
-            model_id, version, weight_delta.len(), peer_id
+            model_id,
+            version,
+            weight_delta.len(),
+            peer_id
         );
 
         // Check if we should accept this update
@@ -827,7 +847,10 @@ impl AINetworkHandler {
             input_data.push(val);
         }
 
-        debug!("Retrieved {} input values for hash {:?}", data_size, input_hash);
+        debug!(
+            "Retrieved {} input values for hash {:?}",
+            data_size, input_hash
+        );
         Ok(input_data)
     }
 }
@@ -901,9 +924,8 @@ mod tests {
                 .unwrap(),
             );
             let state_manager = Arc::new(StateManager::new(storage.db.clone()));
-            let peer_manager = Arc::new(PeerManager::new(
-                crate::peer::PeerManagerConfig::default(),
-            ));
+            let peer_manager =
+                Arc::new(PeerManager::new(crate::peer::PeerManagerConfig::default()));
             let mut handler = AINetworkHandler::new(state_manager, peer_manager);
             if let Some(exec) = executor {
                 handler.inference_executor = Some(exec);
@@ -933,11 +955,7 @@ mod tests {
             };
             handler
                 .state_manager
-                .register_model(
-                    ModelId(model_id),
-                    model_state,
-                    "QmTestCID".to_string(),
-                )
+                .register_model(ModelId(model_id), model_state, "QmTestCID".to_string())
                 .unwrap();
         }
     }
@@ -965,9 +983,7 @@ mod tests {
 
         match response.unwrap() {
             NetworkMessage::InferenceResponse {
-                request_id,
-                proof,
-                ..
+                request_id, proof, ..
             } => {
                 assert_eq!(request_id, Hash::new([99u8; 32]));
                 assert_eq!(proof, b"mock_proof".to_vec());
@@ -1036,7 +1052,10 @@ mod pba_r2_bounds {
         let dir = tempfile::TempDir::new().unwrap();
         let db = Arc::new(citrate_storage::db::RocksDB::open(dir.path()).unwrap());
         let pm = Arc::new(PeerManager::new(crate::peer::PeerManagerConfig::default()));
-        (AINetworkHandler::new(Arc::new(StateManager::new(db)), pm), dir)
+        (
+            AINetworkHandler::new(Arc::new(StateManager::new(db)), pm),
+            dir,
+        )
     }
 
     fn id(i: u32) -> Hash {
@@ -1121,24 +1140,48 @@ mod pba_r2_bounds {
         let (h, _d) = handler();
         // owner 20 + "n" + "1" + "f" + "cid" = 26 bytes of fixed fields.
         let at_cap = "x".repeat(MAX_ANNOUNCE_METADATA_BYTES - 26);
-        h.handle_message(&peer("p"), &announce(1, at_cap.clone())).await.unwrap();
-        assert!(h.has_cached_model(&id(1)).await, "exactly at the cap is accepted");
-        h.handle_message(&peer("p"), &announce(2, at_cap + "x")).await.unwrap();
-        assert!(!h.has_cached_model(&id(2)).await, "one byte over is refused");
+        h.handle_message(&peer("p"), &announce(1, at_cap.clone()))
+            .await
+            .unwrap();
+        assert!(
+            h.has_cached_model(&id(1)).await,
+            "exactly at the cap is accepted"
+        );
+        h.handle_message(&peer("p"), &announce(2, at_cap + "x"))
+            .await
+            .unwrap();
+        assert!(
+            !h.has_cached_model(&id(2)).await,
+            "one byte over is refused"
+        );
     }
 
     #[tokio::test]
     async fn cache_expiry_and_counters() {
         let (h, _d) = handler();
         assert!(!h.has_cached_model(&id(1)).await);
-        h.handle_message(&peer("p"), &announce(1, "d".into())).await.unwrap();
-        h.handle_message(&peer("p"), &announce(2, "d".into())).await.unwrap();
+        h.handle_message(&peer("p"), &announce(1, "d".into()))
+            .await
+            .unwrap();
+        h.handle_message(&peer("p"), &announce(2, "d".into()))
+            .await
+            .unwrap();
         assert!(h.has_cached_model(&id(1)).await);
         assert_eq!(h.cached_model_count().await, 2);
-        h.model_cache.write().await.get_mut(&id(1)).unwrap().announced_at = expired();
-        assert!(!h.has_cached_model(&id(1)).await, "an expired announcement is not live");
+        h.model_cache
+            .write()
+            .await
+            .get_mut(&id(1))
+            .unwrap()
+            .announced_at = expired();
+        assert!(
+            !h.has_cached_model(&id(1)).await,
+            "an expired announcement is not live"
+        );
         // The next announcement prunes it.
-        h.handle_message(&peer("q"), &announce(3, "d".into())).await.unwrap();
+        h.handle_message(&peer("q"), &announce(3, "d".into()))
+            .await
+            .unwrap();
         assert_eq!(h.cached_model_count().await, 2);
         assert!(!h.model_cache.read().await.contains_key(&id(1)));
     }
@@ -1147,15 +1190,24 @@ mod pba_r2_bounds {
     async fn expired_entries_free_the_per_peer_quota() {
         let (h, _d) = handler();
         for i in 0..MAX_MODELS_PER_PEER as u32 {
-            h.handle_message(&peer("p"), &announce(i, "d".into())).await.unwrap();
+            h.handle_message(&peer("p"), &announce(i, "d".into()))
+                .await
+                .unwrap();
         }
-        h.handle_message(&peer("p"), &announce(10_000, "d".into())).await.unwrap();
+        h.handle_message(&peer("p"), &announce(10_000, "d".into()))
+            .await
+            .unwrap();
         assert!(!h.has_cached_model(&id(10_000)).await, "quota reached");
         for m in h.model_cache.write().await.values_mut() {
             m.announced_at = expired();
         }
-        h.handle_message(&peer("p"), &announce(10_000, "d".into())).await.unwrap();
-        assert!(h.has_cached_model(&id(10_000)).await, "expired entries no longer count");
+        h.handle_message(&peer("p"), &announce(10_000, "d".into()))
+            .await
+            .unwrap();
+        assert!(
+            h.has_cached_model(&id(10_000)).await,
+            "expired entries no longer count"
+        );
         assert_eq!(h.cached_model_count().await, 1);
     }
 
@@ -1164,8 +1216,12 @@ mod pba_r2_bounds {
         let (h, _d) = handler();
         for p in 0..(MAX_PROVIDERS_PER_MODEL + 5) {
             let who = peer(&format!("p{p}"));
-            h.handle_message(&who, &announce(1, "d".into())).await.unwrap();
-            h.handle_message(&who, &announce(1, "d".into())).await.unwrap();
+            h.handle_message(&who, &announce(1, "d".into()))
+                .await
+                .unwrap();
+            h.handle_message(&who, &announce(1, "d".into()))
+                .await
+                .unwrap();
         }
         let cache = h.model_cache.read().await;
         let providers = &cache.get(&id(1)).unwrap().providers;
@@ -1188,9 +1244,14 @@ mod pba_r2_bounds {
             }
         }
         assert_eq!(h.cached_model_count().await, MAX_CACHED_MODELS);
-        h.handle_message(&peer("late"), &announce(999_999, "d".into())).await.unwrap();
+        h.handle_message(&peer("late"), &announce(999_999, "d".into()))
+            .await
+            .unwrap();
         assert_eq!(h.cached_model_count().await, MAX_CACHED_MODELS, "cap holds");
-        assert!(h.has_cached_model(&id(999_999)).await, "newest admitted, oldest evicted");
+        assert!(
+            h.has_cached_model(&id(999_999)).await,
+            "newest admitted, oldest evicted"
+        );
     }
 
     #[tokio::test]
@@ -1243,11 +1304,15 @@ mod pba_r2_bounds {
         for p in 0..peers {
             for j in 0..MAX_PENDING_INFERENCES_PER_PEER {
                 let i = (p * MAX_PENDING_INFERENCES_PER_PEER + j) as u32;
-                h.handle_message(&peer(&format!("p{p}")), &request(i)).await.unwrap();
+                h.handle_message(&peer(&format!("p{p}")), &request(i))
+                    .await
+                    .unwrap();
             }
         }
         assert_eq!(h.pending_inference_count().await, MAX_PENDING_INFERENCES);
-        h.handle_message(&peer("late"), &request(999_999)).await.unwrap();
+        h.handle_message(&peer("late"), &request(999_999))
+            .await
+            .unwrap();
         assert_eq!(h.pending_inference_count().await, MAX_PENDING_INFERENCES);
         assert!(h.pending_inferences.read().await.contains_key(&id(999_999)));
     }
@@ -1286,11 +1351,15 @@ mod pba_r2_bounds {
         for p in 0..peers {
             for j in 0..MAX_TRAINING_JOBS_PER_PEER {
                 let i = (p * MAX_TRAINING_JOBS_PER_PEER + j) as u32;
-                h.handle_message(&peer(&format!("p{p}")), &training(i)).await.unwrap();
+                h.handle_message(&peer(&format!("p{p}")), &training(i))
+                    .await
+                    .unwrap();
             }
         }
         assert_eq!(h.active_training_count().await, MAX_TRAINING_JOBS);
-        h.handle_message(&peer("late"), &training(999_999)).await.unwrap();
+        h.handle_message(&peer("late"), &training(999_999))
+            .await
+            .unwrap();
         assert_eq!(h.active_training_count().await, MAX_TRAINING_JOBS);
         assert!(h.active_training.read().await.contains_key(&id(999_999)));
     }
@@ -1306,9 +1375,13 @@ mod pba_r2_bounds {
         };
         h.handle_message(&peer("x"), &grad(7)).await.unwrap(); // unknown job: ignored
         assert_eq!(h.active_training_count().await, 0);
-        h.handle_message(&peer("owner"), &training(7)).await.unwrap();
+        h.handle_message(&peer("owner"), &training(7))
+            .await
+            .unwrap();
         for p in 0..(MAX_PROVIDERS_PER_MODEL + 4) {
-            h.handle_message(&peer(&format!("g{p}")), &grad(7)).await.unwrap();
+            h.handle_message(&peer(&format!("g{p}")), &grad(7))
+                .await
+                .unwrap();
         }
         h.handle_message(&peer("g0"), &grad(7)).await.unwrap(); // repeat participant
         let t = h.active_training.read().await;

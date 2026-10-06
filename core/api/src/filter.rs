@@ -270,7 +270,6 @@ impl FilterRegistry {
                 std::thread::sleep(interval);
                 self.cleanup_stale_filters();
             })
-
     }
 }
 

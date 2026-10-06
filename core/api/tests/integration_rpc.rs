@@ -7,9 +7,7 @@ use citrate_storage::StorageManager;
 use std::sync::Arc;
 use tempfile::TempDir;
 
-use citrate_consensus::types::{
-    Block, BlockBuilder, Hash, PublicKey, Signature, Transaction,
-};
+use citrate_consensus::types::{Block, BlockBuilder, Hash, PublicKey, Signature, Transaction};
 use citrate_execution::types::{AccessPolicy, ModelId, ModelMetadata, ModelState};
 use citrate_execution::types::{Address, TransactionReceipt};
 
@@ -195,7 +193,10 @@ async fn test_eth_get_block_reports_persisted_gas_and_receipt_fields() {
     // CBF-S1 WP-3: `miner` is the block's coinbase, NOT the low-20-bytes of the
     // proposer pubkey. It equals the coinbase set above (0xCD..), proving the
     // miner is sourced from the coinbase and not from truncating the proposer.
-    assert_eq!(v["result"]["miner"], "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd");
+    assert_eq!(
+        v["result"]["miner"],
+        "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+    );
     // The consensus signing key is surfaced separately (a key, not an account),
     // so it must NOT equal the miner address.
     assert_ne!(v["result"]["proposerPubkey"], v["result"]["miner"]);
@@ -342,8 +343,8 @@ async fn test_eth_get_transaction_count_latest_vs_pending() {
         data: vec![],
         signature: Signature::new([1; 64]),
         tx_type: None,
-        chain_id: Some(40204),  // M-01: chain domain binding required (canonical testnet beta)
-        ecdsa_verified: true,   // C-01: embedded EVM address needs this flag
+        chain_id: Some(40204), // M-01: chain domain binding required (canonical testnet beta)
+        ecdsa_verified: true,  // C-01: embedded EVM address needs this flag
         ..Default::default()
     };
     let tx1 = Transaction {
@@ -426,7 +427,10 @@ async fn test_eth_latest_reads_survive_simulation_before_persist() {
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
     let state_db = Arc::new(citrate_execution::StateDB::new());
-    let executor = Arc::new(Executor::with_storage(state_db, Some(storage.state.clone())));
+    let executor = Arc::new(Executor::with_storage(
+        state_db,
+        Some(storage.state.clone()),
+    ));
 
     let sender = Address([0x11; 20]);
     let recipient = Address([0x22; 20]);
@@ -451,7 +455,10 @@ async fn test_eth_latest_reads_survive_simulation_before_persist() {
         ..Default::default()
     };
 
-    let receipt = executor.execute_transaction(&block, &mined_tx).await.unwrap();
+    let receipt = executor
+        .execute_transaction(&block, &mined_tx)
+        .await
+        .unwrap();
     assert!(receipt.status);
 
     // Reproduce the live corruption shape: a simulation occurs before the mined
@@ -469,7 +476,10 @@ async fn test_eth_latest_reads_survive_simulation_before_persist() {
         ecdsa_verified: true,
         ..Default::default()
     };
-    let sim_receipt = executor.simulate_transaction(&block, &sim_tx).await.unwrap();
+    let sim_receipt = executor
+        .simulate_transaction(&block, &sim_tx)
+        .await
+        .unwrap();
     assert!(sim_receipt.status);
 
     executor.persist_state_changes().await.unwrap();
@@ -495,7 +505,8 @@ async fn test_eth_latest_reads_survive_simulation_before_persist() {
     let balance_req = serde_json::json!({
         "jsonrpc":"2.0","id":1,"method":"eth_getBalance",
         "params":[format!("0x{}", hex::encode(recipient.0)), "latest"]
-    }).to_string();
+    })
+    .to_string();
     let balance_resp = io.handle_request(&balance_req).await.unwrap();
     let balance_json: serde_json::Value = serde_json::from_str(&balance_resp).unwrap();
     assert_eq!(balance_json["result"], "0x7b");
@@ -503,7 +514,8 @@ async fn test_eth_latest_reads_survive_simulation_before_persist() {
     let nonce_req = serde_json::json!({
         "jsonrpc":"2.0","id":2,"method":"eth_getTransactionCount",
         "params":[format!("0x{}", hex::encode(sender.0)), "latest"]
-    }).to_string();
+    })
+    .to_string();
     let nonce_resp = io.handle_request(&nonce_req).await.unwrap();
     let nonce_json: serde_json::Value = serde_json::from_str(&nonce_resp).unwrap();
     assert_eq!(nonce_json["result"], "0x1");
@@ -1135,7 +1147,15 @@ async fn test_eth_call_ai_model_exec_path() {
     executor.set_balance(&from, U256::from(1_000_000u64));
 
     let mut io = jsonrpc_core::IoHandler::new();
-    citrate_api::eth_rpc::register_eth_methods(&mut io, storage.clone(), mempool, executor, 1, Arc::new(FilterRegistry::new()), None);
+    citrate_api::eth_rpc::register_eth_methods(
+        &mut io,
+        storage.clone(),
+        mempool,
+        executor,
+        1,
+        Arc::new(FilterRegistry::new()),
+        None,
+    );
 
     // Data: 32-byte model hash + some inference bytes
     let mut data = model_hash.as_bytes().to_vec();
@@ -1171,7 +1191,10 @@ async fn test_eth_call_ai_model_exec_path() {
         // Failure path — pre-WP-8 this was hidden as `"0x"`; now it
         // surfaces as a structured error which is the correct
         // semantic for a view call that couldn't execute.
-        assert!(v["error"].is_object(), "response must carry either a result or an error: {v}");
+        assert!(
+            v["error"].is_object(),
+            "response must carry either a result or an error: {v}"
+        );
     }
 }
 
@@ -1191,7 +1214,15 @@ async fn test_eth_call_ai_model_exec_missing_model_errors() {
     executor.set_balance(&from, primitive_types::U256::from(1_000_000u64));
 
     let mut io = jsonrpc_core::IoHandler::new();
-    citrate_api::eth_rpc::register_eth_methods(&mut io, storage.clone(), mempool, executor, 1, Arc::new(FilterRegistry::new()), None);
+    citrate_api::eth_rpc::register_eth_methods(
+        &mut io,
+        storage.clone(),
+        mempool,
+        executor,
+        1,
+        Arc::new(FilterRegistry::new()),
+        None,
+    );
 
     // Data: 32-byte model hash that is not registered
     let missing_hash = citrate_consensus::types::Hash::new([0xEE; 32]);
@@ -1251,8 +1282,8 @@ async fn test_eth_chain_id_is_configurable() {
         None,
     );
 
-    let req = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]})
-        .to_string();
+    let req =
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}).to_string();
     let resp = io1.handle_request(&req).await.unwrap();
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["result"], "0x9d0c"); // 40204 in hex
@@ -1294,7 +1325,10 @@ async fn test_eth_estimate_gas_real_execution() {
     // Deploy some code to test contract calls
     let contract_addr = Address([0x22; 20]);
     // Simple contract that returns data (PUSH1 0x01 PUSH1 0x00 MSTORE PUSH1 0x20 PUSH1 0x00 RETURN)
-    executor.set_code(&contract_addr, vec![0x60, 0x01, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+    executor.set_code(
+        &contract_addr,
+        vec![0x60, 0x01, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3],
+    );
 
     let mut io = jsonrpc_core::IoHandler::new();
     citrate_api::eth_rpc::register_eth_methods(
@@ -1315,10 +1349,14 @@ async fn test_eth_estimate_gas_real_execution() {
             "to": format!("0x{}", hex::encode(contract_addr.0)),
             "value": "0x1"
         }]
-    }).to_string();
+    })
+    .to_string();
     let resp_transfer = io.handle_request(&req_transfer).await.unwrap();
     let v_transfer: serde_json::Value = serde_json::from_str(&resp_transfer).unwrap();
-    assert_eq!(v_transfer["result"], "0x5208", "Simple transfer should be 21000 gas");
+    assert_eq!(
+        v_transfer["result"], "0x5208",
+        "Simple transfer should be 21000 gas"
+    );
 
     // Test 2: Contract call with data should return more than 21000
     let req_call = serde_json::json!({
@@ -1328,20 +1366,29 @@ async fn test_eth_estimate_gas_real_execution() {
             "to": format!("0x{}", hex::encode(contract_addr.0)),
             "data": "0x12345678" // Some function selector
         }]
-    }).to_string();
+    })
+    .to_string();
     let resp_call = io.handle_request(&req_call).await.unwrap();
     let v_call: serde_json::Value = serde_json::from_str(&resp_call).unwrap();
     let gas_str = v_call["result"].as_str().unwrap();
     let gas = u64::from_str_radix(gas_str.trim_start_matches("0x"), 16).unwrap();
-    assert!(gas >= 21000, "Contract call should use at least 21000 gas, got {}", gas);
+    assert!(
+        gas >= 21000,
+        "Contract call should use at least 21000 gas, got {}",
+        gas
+    );
 
     // Test 3: No params should return default 21000
     let req_empty = serde_json::json!({
         "jsonrpc":"2.0","id":3,"method":"eth_estimateGas","params":[]
-    }).to_string();
+    })
+    .to_string();
     let resp_empty = io.handle_request(&req_empty).await.unwrap();
     let v_empty: serde_json::Value = serde_json::from_str(&resp_empty).unwrap();
-    assert_eq!(v_empty["result"], "0x5208", "Empty params should default to 21000");
+    assert_eq!(
+        v_empty["result"], "0x5208",
+        "Empty params should default to 21000"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1377,7 +1424,8 @@ async fn test_eth_estimate_gas_contract_deploy_not_simple_transfer() {
             "from": format!("0x{}", hex::encode(from_addr.0)),
             "data": init_code
         }]
-    }).to_string();
+    })
+    .to_string();
     let resp = io.handle_request(&req).await.unwrap();
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
     let gas_hex = v["result"].as_str().unwrap();
@@ -1411,9 +1459,8 @@ async fn test_eth_call_executes_at_canonical_tip_not_height_zero() {
     use primitive_types::U256;
 
     let tmp = TempDir::new().expect("tempdir");
-    let storage = Arc::new(
-        StorageManager::new(tmp.path(), PruningConfig::default()).expect("storage"),
-    );
+    let storage =
+        Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).expect("storage"));
 
     // Seed a chain whose tip is height 7 (make_block sets timestamp = 1_000_000 + h).
     let mut parent = Hash::default();
@@ -1434,10 +1481,16 @@ async fn test_eth_call_executes_at_canonical_tip_not_height_zero() {
 
     // NUMBER-returning contract.
     let number_addr = Address([0xCE; 20]);
-    executor.set_code(&number_addr, vec![0x43, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+    executor.set_code(
+        &number_addr,
+        vec![0x43, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3],
+    );
     // TIMESTAMP-returning contract (0x42 instead of 0x43).
     let time_addr = Address([0xCF; 20]);
-    executor.set_code(&time_addr, vec![0x42, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+    executor.set_code(
+        &time_addr,
+        vec![0x42, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3],
+    );
 
     let mut io = jsonrpc_core::IoHandler::new();
     citrate_api::eth_rpc::register_eth_methods(
@@ -1466,11 +1519,18 @@ async fn test_eth_call_executes_at_canonical_tip_not_height_zero() {
     };
 
     // block.number must be the tip, NOT 0.
-    let resp = io.handle_request(&call_word(number_addr)).await.expect("response");
+    let resp = io
+        .handle_request(&call_word(number_addr))
+        .await
+        .expect("response");
     let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
     let out = v["result"].as_str().unwrap_or_default();
     let raw = hex::decode(out.strip_prefix("0x").unwrap_or(out)).expect("hex output");
-    assert_eq!(raw.len(), 32, "NUMBER must return one 32-byte word, got {out}");
+    assert_eq!(
+        raw.len(),
+        32,
+        "NUMBER must return one 32-byte word, got {out}"
+    );
     let got_height = U256::from_big_endian(&raw);
     assert_eq!(
         got_height,
@@ -1478,10 +1538,16 @@ async fn test_eth_call_executes_at_canonical_tip_not_height_zero() {
         "eth_call executed at block.number {got_height} instead of the canonical tip \
          {expected_height} — the height-0 simulation-context bug has regressed"
     );
-    assert!(!got_height.is_zero(), "block.number must never be 0 at a non-genesis tip");
+    assert!(
+        !got_height.is_zero(),
+        "block.number must never be 0 at a non-genesis tip"
+    );
 
     // block.timestamp must be the tip's, NOT 0.
-    let resp = io.handle_request(&call_word(time_addr)).await.expect("response");
+    let resp = io
+        .handle_request(&call_word(time_addr))
+        .await
+        .expect("response");
     let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
     let out = v["result"].as_str().unwrap_or_default();
     let raw = hex::decode(out.strip_prefix("0x").unwrap_or(out)).expect("hex output");
@@ -1508,9 +1574,8 @@ async fn test_block_miner_is_coinbase_not_truncated_proposer_pubkey() {
     ensure_test_rate_limit_bypass();
 
     let tmp = TempDir::new().expect("tempdir");
-    let storage = Arc::new(
-        StorageManager::new(tmp.path(), PruningConfig::default()).expect("storage"),
-    );
+    let storage =
+        Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).expect("storage"));
 
     // Mirror the live 40204 shape: a proposer pubkey whose first 20 bytes are
     // NOT the coinbase, so truncation is detectable.
@@ -1573,7 +1638,9 @@ async fn test_block_miner_is_coinbase_not_truncated_proposer_pubkey() {
     );
 
     // The consensus key stays available, separately, for validator attribution.
-    let proposer = v["result"]["proposerPubkey"].as_str().expect("proposerPubkey field");
+    let proposer = v["result"]["proposerPubkey"]
+        .as_str()
+        .expect("proposerPubkey field");
     assert_eq!(proposer, format!("0x{}", hex::encode(pubkey_bytes)));
     assert_eq!(
         proposer.len(),

@@ -1,11 +1,6 @@
 // citrate/core/marketplace/src/indexing.rs
 
-use crate::{
-    metadata::MetadataCache,
-    search::SearchEngine,
-    storage::MarketplaceStorage,
-    types::*,
-};
+use crate::{metadata::MetadataCache, search::SearchEngine, storage::MarketplaceStorage, types::*};
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -254,7 +249,8 @@ impl IndexingService {
                 Arc::clone(&search_engine),
                 Arc::clone(&storage),
                 Arc::clone(&metadata_cache),
-            ).await;
+            )
+            .await;
 
             match result {
                 Ok(()) => {
@@ -389,9 +385,7 @@ impl IndexingService {
         Ok(())
     }
 
-    async fn schedule_full_reindex(
-        task_queue: Arc<RwLock<Vec<IndexingTask>>>,
-    ) -> Result<()> {
+    async fn schedule_full_reindex(task_queue: Arc<RwLock<Vec<IndexingTask>>>) -> Result<()> {
         let task = IndexingTask {
             operation: IndexingOperation::ReindexAll,
             priority: 20, // Low priority for scheduled reindex
@@ -401,9 +395,9 @@ impl IndexingService {
         let mut queue = task_queue.write().await;
 
         // Check if full reindex is already queued
-        let has_reindex = queue.iter().any(|t| {
-            matches!(t.operation, IndexingOperation::ReindexAll)
-        });
+        let has_reindex = queue
+            .iter()
+            .any(|t| matches!(t.operation, IndexingOperation::ReindexAll));
 
         if !has_reindex {
             queue.push(task);
@@ -414,16 +408,19 @@ impl IndexingService {
         Ok(())
     }
 
-    async fn update_stats_for_success(
-        task: &IndexingTask,
-        stats: Arc<RwLock<IndexingStats>>,
-    ) {
+    async fn update_stats_for_success(task: &IndexingTask, stats: Arc<RwLock<IndexingStats>>) {
         let mut stats = stats.write().await;
 
         match &task.operation {
-            IndexingOperation::AddModel(_) => stats.models_indexed = stats.models_indexed.saturating_add(1),
-            IndexingOperation::UpdateModel(_) => stats.models_updated = stats.models_updated.saturating_add(1),
-            IndexingOperation::RemoveModel(_) => stats.models_removed = stats.models_removed.saturating_add(1),
+            IndexingOperation::AddModel(_) => {
+                stats.models_indexed = stats.models_indexed.saturating_add(1)
+            }
+            IndexingOperation::UpdateModel(_) => {
+                stats.models_updated = stats.models_updated.saturating_add(1)
+            }
+            IndexingOperation::RemoveModel(_) => {
+                stats.models_removed = stats.models_removed.saturating_add(1)
+            }
             IndexingOperation::ReindexAll => {
                 stats.last_full_reindex = Some(chrono::Utc::now());
             }
@@ -514,7 +511,8 @@ impl Drop for BatchIndexer {
     fn drop(&mut self) {
         if !self.pending_adds.is_empty()
             || !self.pending_updates.is_empty()
-            || !self.pending_removes.is_empty() {
+            || !self.pending_removes.is_empty()
+        {
             warn!("BatchIndexer dropped with pending operations - data may be lost");
         }
     }

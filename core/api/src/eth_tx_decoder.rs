@@ -1,8 +1,8 @@
 // citrate/core/api/src/eth_tx_decoder.rs
 
+use citrate_consensus::types::{Hash, PublicKey, Signature, Transaction};
 use ethereum_types::{H160, H256, U256 as EthU256};
 use hex;
-use citrate_consensus::types::{Hash, PublicKey, Signature, Transaction};
 use rlp::{DecoderError, Rlp, RlpStream};
 use secp256k1::{ecdsa::RecoverableSignature, ecdsa::RecoveryId, Message, Secp256k1};
 use sha3::{Digest, Keccak256};
@@ -10,12 +10,7 @@ use tracing::debug;
 
 /// PBA-L1a-018: a signed transaction has exactly ONE byte encoding: the list
 /// has exactly the fields the type defines and spans the whole input.
-fn require_canonical_list(
-    rlp: &Rlp,
-    whole: &[u8],
-    items: usize,
-    what: &str,
-) -> Result<(), String> {
+fn require_canonical_list(rlp: &Rlp, whole: &[u8], items: usize, what: &str) -> Result<(), String> {
     let n = rlp
         .item_count()
         .map_err(|e| format!("{what}: bad RLP list: {e:?}"))?;
@@ -121,7 +116,10 @@ pub fn decode_eth_transaction(tx_bytes: &[u8]) -> Result<Transaction, String> {
 
 fn decode_eth_transaction_inner(tx_bytes: &[u8]) -> Result<Transaction, String> {
     debug!("Decoding {} bytes of transaction data", tx_bytes.len());
-    debug!("First 20 bytes: {:?}", tx_bytes.get(..20).unwrap_or(tx_bytes));
+    debug!(
+        "First 20 bytes: {:?}",
+        tx_bytes.get(..20).unwrap_or(tx_bytes)
+    );
 
     // Check if this might be an Ethereum transaction (starts with certain patterns)
     if tx_bytes.is_empty() {
@@ -153,184 +151,185 @@ fn decode_eth_transaction_inner(tx_bytes: &[u8]) -> Result<Transaction, String> 
     if rlp.is_list() {
         // Try to decode as legacy transaction
         if let Ok(legacy_tx) = LegacyTransaction::decode(&rlp) {
-                // PBA-L1a-018: exactly the 9 legacy fields, no trailing bytes.
-                require_canonical_list(&rlp, tx_bytes, 9, "legacy tx")?;
-                debug!("Successfully decoded legacy Ethereum transaction");
-                debug!("  Nonce: {}", legacy_tx.nonce);
-                debug!("  Gas limit: {}", legacy_tx.gas_limit);
-                debug!("  To: {:?}", legacy_tx.to);
-                debug!("  Value: {}", legacy_tx.value);
-                debug!("  Data length: {}", legacy_tx.data.len());
+            // PBA-L1a-018: exactly the 9 legacy fields, no trailing bytes.
+            require_canonical_list(&rlp, tx_bytes, 9, "legacy tx")?;
+            debug!("Successfully decoded legacy Ethereum transaction");
+            debug!("  Nonce: {}", legacy_tx.nonce);
+            debug!("  Gas limit: {}", legacy_tx.gas_limit);
+            debug!("  To: {:?}", legacy_tx.to);
+            debug!("  Value: {}", legacy_tx.value);
+            debug!("  Data length: {}", legacy_tx.data.len());
 
-                // Determine chain ID and recovery ID from v value
-                // EIP-155: v = chainId * 2 + 35 + {0,1}
-                // Pre-EIP-155: v = 27 + {0,1}
-                let (recovery_id, chain_id_opt) = if legacy_tx.v >= 35 {
-                    // EIP-155 transaction
-                    // v >= 35 here: v - 35 = 2 * chain_id + recovery_id.
-                    let base = legacy_tx.v.saturating_sub(35);
-                    let chain_id = base >> 1;
-                    let recovery_id = (base & 1) as i32;
-                    debug!(
-                        "  EIP-155 transaction: chain_id={}, recovery_id={}",
-                        chain_id, recovery_id
-                    );
-                    (recovery_id, Some(chain_id))
-                } else if legacy_tx.v == 27 || legacy_tx.v == 28 {
-                    // Pre-EIP-155 transaction
-                    let recovery_id = legacy_tx.v.saturating_sub(27) as i32;
-                    debug!("  Pre-EIP-155 transaction: recovery_id={}", recovery_id);
-                    (recovery_id, None)
-                } else {
-                    debug!("  Invalid v value: {}", legacy_tx.v);
-                    return Err(format!("Invalid v value: {}", legacy_tx.v));
-                };
+            // Determine chain ID and recovery ID from v value
+            // EIP-155: v = chainId * 2 + 35 + {0,1}
+            // Pre-EIP-155: v = 27 + {0,1}
+            let (recovery_id, chain_id_opt) = if legacy_tx.v >= 35 {
+                // EIP-155 transaction
+                // v >= 35 here: v - 35 = 2 * chain_id + recovery_id.
+                let base = legacy_tx.v.saturating_sub(35);
+                let chain_id = base >> 1;
+                let recovery_id = (base & 1) as i32;
+                debug!(
+                    "  EIP-155 transaction: chain_id={}, recovery_id={}",
+                    chain_id, recovery_id
+                );
+                (recovery_id, Some(chain_id))
+            } else if legacy_tx.v == 27 || legacy_tx.v == 28 {
+                // Pre-EIP-155 transaction
+                let recovery_id = legacy_tx.v.saturating_sub(27) as i32;
+                debug!("  Pre-EIP-155 transaction: recovery_id={}", recovery_id);
+                (recovery_id, None)
+            } else {
+                debug!("  Invalid v value: {}", legacy_tx.v);
+                return Err(format!("Invalid v value: {}", legacy_tx.v));
+            };
 
-                // Build the transaction data for signing (pre-signature)
-                let mut stream = if let Some(_chain_id) = chain_id_opt {
-                    // EIP-155 signing data includes chain ID
-                    rlp::RlpStream::new_list(9)
-                } else {
-                    // Pre-EIP-155 signing data
-                    rlp::RlpStream::new_list(6)
-                };
+            // Build the transaction data for signing (pre-signature)
+            let mut stream = if let Some(_chain_id) = chain_id_opt {
+                // EIP-155 signing data includes chain ID
+                rlp::RlpStream::new_list(9)
+            } else {
+                // Pre-EIP-155 signing data
+                rlp::RlpStream::new_list(6)
+            };
 
-                stream.append(&legacy_tx.nonce);
-                stream.append(&legacy_tx.gas_price);
-                stream.append(&legacy_tx.gas_limit);
+            stream.append(&legacy_tx.nonce);
+            stream.append(&legacy_tx.gas_price);
+            stream.append(&legacy_tx.gas_limit);
 
-                // Handle 'to' field
-                if let Some(to) = legacy_tx.to {
-                    stream.append(&to.as_bytes());
-                } else {
-                    stream.append_empty_data();
-                }
+            // Handle 'to' field
+            if let Some(to) = legacy_tx.to {
+                stream.append(&to.as_bytes());
+            } else {
+                stream.append_empty_data();
+            }
 
-                stream.append(&legacy_tx.value);
-                stream.append(&legacy_tx.data);
+            stream.append(&legacy_tx.value);
+            stream.append(&legacy_tx.data);
 
-                // For EIP-155, append chain ID and zeros
-                if let Some(chain_id) = chain_id_opt {
-                    stream.append(&chain_id);
-                    stream.append(&0u8);
-                    stream.append(&0u8);
-                }
+            // For EIP-155, append chain ID and zeros
+            if let Some(chain_id) = chain_id_opt {
+                stream.append(&chain_id);
+                stream.append(&0u8);
+                stream.append(&0u8);
+            }
 
-                let signable_data = stream.out().to_vec();
-                let sighash = Keccak256::digest(&signable_data);
-                debug!("  Signature hash: 0x{}", hex::encode(sighash));
+            let signable_data = stream.out().to_vec();
+            let sighash = Keccak256::digest(&signable_data);
+            debug!("  Signature hash: 0x{}", hex::encode(sighash));
 
-                // Recover the sender's public key and address
-                let secp = Secp256k1::new();
+            // Recover the sender's public key and address
+            let secp = Secp256k1::new();
 
-                // Create the recoverable signature
-                let mut rs_bytes = [0u8; 64];
-                rs_bytes[..32].copy_from_slice(legacy_tx.r.as_bytes());
-                rs_bytes[32..].copy_from_slice(legacy_tx.s.as_bytes());
+            // Create the recoverable signature
+            let mut rs_bytes = [0u8; 64];
+            rs_bytes[..32].copy_from_slice(legacy_tx.r.as_bytes());
+            rs_bytes[32..].copy_from_slice(legacy_tx.s.as_bytes());
 
-                debug!("  Signature R: 0x{}", hex::encode(&rs_bytes[..32]));
-                debug!("  Signature S: 0x{}", hex::encode(&rs_bytes[32..]));
+            debug!("  Signature R: 0x{}", hex::encode(&rs_bytes[..32]));
+            debug!("  Signature S: 0x{}", hex::encode(&rs_bytes[32..]));
 
-                // SECREM-01 EXEC-1: enforce EIP-2 low-s. This legacy decode
-                // path uses `secp256k1` recovery, which (unlike the
-                // precompile's `recover_address`) does NOT reject high-s
-                // signatures — so `(r, s)` and `(r, n−s)` both recover the
-                // same signer, yielding two valid encodings (two tx hashes)
-                // for one transaction: malleability that breaks receipt
-                // polling. Reject high-s before recovery.
-                if is_high_s(&rs_bytes[32..]) {
-                    return Err(
-                        "EIP-2 violation: signature s-value is not in the low half-order \
+            // SECREM-01 EXEC-1: enforce EIP-2 low-s. This legacy decode
+            // path uses `secp256k1` recovery, which (unlike the
+            // precompile's `recover_address`) does NOT reject high-s
+            // signatures — so `(r, s)` and `(r, n−s)` both recover the
+            // same signer, yielding two valid encodings (two tx hashes)
+            // for one transaction: malleability that breaks receipt
+            // polling. Reject high-s before recovery.
+            if is_high_s(&rs_bytes[32..]) {
+                return Err(
+                    "EIP-2 violation: signature s-value is not in the low half-order \
                          (malleable signature rejected)"
-                            .into(),
-                    );
-                }
-
-                // Recover the sender address from signature (fail-closed: C-03).
-                // Any failure in the recovery chain returns Err — never fabricate fallback addresses.
-                let recid = RecoveryId::from_i32(recovery_id)
-                    .map_err(|e| format!("Invalid recovery ID {}: {}", recovery_id, e))?;
-                let recsig = RecoverableSignature::from_compact(&rs_bytes, recid)
-                    .map_err(|e| format!("Invalid recoverable signature: {}", e))?;
-                let msg = Message::from_slice(&sighash)
-                    .map_err(|e| format!("Invalid signature hash: {}", e))?;
-                let pubkey = secp.recover_ecdsa(&msg, &recsig)
-                    .map_err(|e| format!("ECDSA recovery failed: {}", e))?;
-
-                // Get uncompressed public key (65 bytes: 0x04 + x + y)
-                let uncompressed = pubkey.serialize_uncompressed();
-
-                // Hash the public key (excluding the 0x04 prefix)
-                let mut hasher = Keccak256::new();
-                hasher.update(&uncompressed[1..]);
-                let hash: [u8; 32] = hasher.finalize().into();
-
-                // The address is the last 20 bytes of the hash.
-
-                let [_, _, _, _, _, _, _, _, _, _, _, _, addr_bytes @ ..] = hash;
-                let from_addr = H160::from_slice(&addr_bytes);
-                debug!(
-                    "  Recovered address: 0x{}",
-                    hex::encode(from_addr.as_bytes())
+                        .into(),
                 );
-                debug!("  From address: 0x{}", hex::encode(from_addr.as_bytes()));
+            }
 
-                // Convert addresses to PublicKey format by embedding 20 bytes in 32-byte field
-                let mut from_pk_bytes = [0u8; 32];
-                from_pk_bytes[..20].copy_from_slice(from_addr.as_bytes());
-                let from_pk = PublicKey::new(from_pk_bytes);
+            // Recover the sender address from signature (fail-closed: C-03).
+            // Any failure in the recovery chain returns Err — never fabricate fallback addresses.
+            let recid = RecoveryId::from_i32(recovery_id)
+                .map_err(|e| format!("Invalid recovery ID {}: {}", recovery_id, e))?;
+            let recsig = RecoverableSignature::from_compact(&rs_bytes, recid)
+                .map_err(|e| format!("Invalid recoverable signature: {}", e))?;
+            let msg = Message::from_slice(&sighash)
+                .map_err(|e| format!("Invalid signature hash: {}", e))?;
+            let pubkey = secp
+                .recover_ecdsa(&msg, &recsig)
+                .map_err(|e| format!("ECDSA recovery failed: {}", e))?;
 
-                let to_pk = legacy_tx.to.map(|addr| {
-                    let mut pk_bytes = [0u8; 32];
-                    pk_bytes[..20].copy_from_slice(addr.as_bytes());
-                    PublicKey::new(pk_bytes)
-                });
+            // Get uncompressed public key (65 bytes: 0x04 + x + y)
+            let uncompressed = pubkey.serialize_uncompressed();
 
-                // Convert gas price (wei to gwei for our system)
-                let gas_price = if legacy_tx.gas_price > EthU256::from(u64::MAX) {
-                    u64::MAX
-                } else {
-                    legacy_tx.gas_price.as_u64()
-                };
+            // Hash the public key (excluding the 0x04 prefix)
+            let mut hasher = Keccak256::new();
+            hasher.update(&uncompressed[1..]);
+            let hash: [u8; 32] = hasher.finalize().into();
 
-                // Convert value to u128
-                let value = if legacy_tx.value > EthU256::from(u128::MAX) {
-                    u128::MAX
-                } else {
-                    legacy_tx.value.as_u128()
-                };
+            // The address is the last 20 bytes of the hash.
 
-                // Create signature from r, s (compact)
-                let mut sig_bytes = [0u8; 64];
-                sig_bytes[..32].copy_from_slice(legacy_tx.r.as_bytes());
-                sig_bytes[32..].copy_from_slice(legacy_tx.s.as_bytes());
+            let [_, _, _, _, _, _, _, _, _, _, _, _, addr_bytes @ ..] = hash;
+            let from_addr = H160::from_slice(&addr_bytes);
+            debug!(
+                "  Recovered address: 0x{}",
+                hex::encode(from_addr.as_bytes())
+            );
+            debug!("  From address: 0x{}", hex::encode(from_addr.as_bytes()));
 
-                let mut tx = Transaction {
-                    hash: Hash::new(hash_bytes), // Use the calculated hash
-                    from: from_pk,
-                    to: to_pk,
-                    value,
-                    data: legacy_tx.data.clone(),
-                    nonce: legacy_tx.nonce,
-                    gas_price,
-                    gas_limit: legacy_tx.gas_limit,
-                    signature: Signature::new(sig_bytes),
-                    tx_type: None,
-                    eth_tx_type: 0,
-                    chain_id: chain_id_opt,
-                    ecdsa_verified: true, // ECDSA signature was cryptographically verified during recovery above
-                    ..Default::default()
-                };
+            // Convert addresses to PublicKey format by embedding 20 bytes in 32-byte field
+            let mut from_pk_bytes = [0u8; 32];
+            from_pk_bytes[..20].copy_from_slice(from_addr.as_bytes());
+            let from_pk = PublicKey::new(from_pk_bytes);
 
-                // Determine transaction type from data
-                tx.determine_type();
+            let to_pk = legacy_tx.to.map(|addr| {
+                let mut pk_bytes = [0u8; 32];
+                pk_bytes[..20].copy_from_slice(addr.as_bytes());
+                PublicKey::new(pk_bytes)
+            });
 
-                debug!("Successfully converted to Citrate transaction format");
-                debug!(
-                    "Final transaction hash: 0x{}",
-                    hex::encode(tx.hash.as_bytes())
-                );
-                return Ok(tx);
+            // Convert gas price (wei to gwei for our system)
+            let gas_price = if legacy_tx.gas_price > EthU256::from(u64::MAX) {
+                u64::MAX
+            } else {
+                legacy_tx.gas_price.as_u64()
+            };
+
+            // Convert value to u128
+            let value = if legacy_tx.value > EthU256::from(u128::MAX) {
+                u128::MAX
+            } else {
+                legacy_tx.value.as_u128()
+            };
+
+            // Create signature from r, s (compact)
+            let mut sig_bytes = [0u8; 64];
+            sig_bytes[..32].copy_from_slice(legacy_tx.r.as_bytes());
+            sig_bytes[32..].copy_from_slice(legacy_tx.s.as_bytes());
+
+            let mut tx = Transaction {
+                hash: Hash::new(hash_bytes), // Use the calculated hash
+                from: from_pk,
+                to: to_pk,
+                value,
+                data: legacy_tx.data.clone(),
+                nonce: legacy_tx.nonce,
+                gas_price,
+                gas_limit: legacy_tx.gas_limit,
+                signature: Signature::new(sig_bytes),
+                tx_type: None,
+                eth_tx_type: 0,
+                chain_id: chain_id_opt,
+                ecdsa_verified: true, // ECDSA signature was cryptographically verified during recovery above
+                ..Default::default()
+            };
+
+            // Determine transaction type from data
+            tx.determine_type();
+
+            debug!("Successfully converted to Citrate transaction format");
+            debug!(
+                "Final transaction hash: 0x{}",
+                hex::encode(tx.hash.as_bytes())
+            );
+            return Ok(tx);
         } else {
             debug!("Failed to decode as legacy RLP, falling back to bincode");
         }
@@ -400,9 +399,8 @@ fn decode_eip1559_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
     let access_list = parse_access_list(&rlp, 8)?;
     debug!("  Access list entries: {}", access_list.len());
 
-    let y_parity: u64 = canonical_y_parity(
-        rlp.val_at(9).map_err(|e| format!("yParity: {:?}", e))?,
-    )?;
+    let y_parity: u64 =
+        canonical_y_parity(rlp.val_at(9).map_err(|e| format!("yParity: {:?}", e))?)?;
 
     // PBA-L1a-018: canonical signature words (no truncation / zero padding).
     let r_bytes: Vec<u8> = rlp.val_at(10).map_err(|e| format!("r: {:?}", e))?;
@@ -511,14 +509,30 @@ fn decode_eip1559_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
         .iter()
         .map(|e| {
             let addr = e.address.as_bytes().to_vec();
-            let keys = e.storage_keys.iter().map(|k| k.as_bytes().to_vec()).collect();
+            let keys = e
+                .storage_keys
+                .iter()
+                .map(|k| k.as_bytes().to_vec())
+                .collect();
             (addr, keys)
         })
         .collect();
 
-    let max_fee_val = if max_fee > EthU256::from(u64::MAX) { u64::MAX } else { max_fee.as_u64() };
-    let max_prio_val = if max_priority_fee > EthU256::from(u64::MAX) { u64::MAX } else { max_priority_fee.as_u64() };
-    let decoded_chain_id = if chain_id_u256 > EthU256::from(u64::MAX) { None } else { Some(chain_id_u256.as_u64()) };
+    let max_fee_val = if max_fee > EthU256::from(u64::MAX) {
+        u64::MAX
+    } else {
+        max_fee.as_u64()
+    };
+    let max_prio_val = if max_priority_fee > EthU256::from(u64::MAX) {
+        u64::MAX
+    } else {
+        max_priority_fee.as_u64()
+    };
+    let decoded_chain_id = if chain_id_u256 > EthU256::from(u64::MAX) {
+        None
+    } else {
+        Some(chain_id_u256.as_u64())
+    };
 
     let mut tx = Transaction {
         hash: Hash::new(hash_bytes),
@@ -580,9 +594,13 @@ fn parse_access_list(rlp: &Rlp, index: usize) -> Result<Vec<AccessListEntry>, St
     let mut access_list = Vec::with_capacity(item_count);
 
     for i in 0..item_count {
-        let entry_rlp = access_list_rlp.at(i).map_err(|e| format!("access_entry[{}]: {:?}", i, e))?;
+        let entry_rlp = access_list_rlp
+            .at(i)
+            .map_err(|e| format!("access_entry[{}]: {:?}", i, e))?;
 
-        let address_bytes: Vec<u8> = entry_rlp.val_at(0).map_err(|e| format!("address: {:?}", e))?;
+        let address_bytes: Vec<u8> = entry_rlp
+            .val_at(0)
+            .map_err(|e| format!("address: {:?}", e))?;
         if address_bytes.len() != 20 {
             return Err(format!(
                 "H-API-02: access list address[{}] is {} bytes; expected 20",
@@ -592,7 +610,9 @@ fn parse_access_list(rlp: &Rlp, index: usize) -> Result<Vec<AccessListEntry>, St
         }
         let address = H160::from_slice(&address_bytes);
 
-        let storage_keys_rlp = entry_rlp.at(1).map_err(|e| format!("storage_keys: {:?}", e))?;
+        let storage_keys_rlp = entry_rlp
+            .at(1)
+            .map_err(|e| format!("storage_keys: {:?}", e))?;
         let key_count = storage_keys_rlp.item_count().unwrap_or(0);
         if key_count > MAX_STORAGE_KEYS_PER_ENTRY {
             return Err(format!(
@@ -603,7 +623,9 @@ fn parse_access_list(rlp: &Rlp, index: usize) -> Result<Vec<AccessListEntry>, St
         let mut storage_keys = Vec::with_capacity(key_count);
 
         for j in 0..key_count {
-            let key_bytes: Vec<u8> = storage_keys_rlp.val_at(j).map_err(|e| format!("storage_key[{}]: {:?}", j, e))?;
+            let key_bytes: Vec<u8> = storage_keys_rlp
+                .val_at(j)
+                .map_err(|e| format!("storage_key[{}]: {:?}", j, e))?;
             if key_bytes.len() != 32 {
                 return Err(format!(
                     "H-API-02: access list entry[{}].storage_key[{}] is {} bytes; expected 32",
@@ -671,9 +693,8 @@ fn decode_eip2930_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
     let access_list = parse_access_list(&rlp, 7)?;
     debug!("  Access list entries: {}", access_list.len());
 
-    let y_parity: u64 = canonical_y_parity(
-        rlp.val_at(8).map_err(|e| format!("yParity: {:?}", e))?,
-    )?;
+    let y_parity: u64 =
+        canonical_y_parity(rlp.val_at(8).map_err(|e| format!("yParity: {:?}", e))?)?;
 
     // PBA-L1a-018: canonical signature words (no truncation / zero padding).
     let r_bytes: Vec<u8> = rlp.val_at(9).map_err(|e| format!("r: {:?}", e))?;
@@ -781,12 +802,20 @@ fn decode_eip2930_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
         .iter()
         .map(|e| {
             let addr = e.address.as_bytes().to_vec();
-            let keys = e.storage_keys.iter().map(|k| k.as_bytes().to_vec()).collect();
+            let keys = e
+                .storage_keys
+                .iter()
+                .map(|k| k.as_bytes().to_vec())
+                .collect();
             (addr, keys)
         })
         .collect();
 
-    let decoded_chain_id = if chain_id_u256 > EthU256::from(u64::MAX) { None } else { Some(chain_id_u256.as_u64()) };
+    let decoded_chain_id = if chain_id_u256 > EthU256::from(u64::MAX) {
+        None
+    } else {
+        Some(chain_id_u256.as_u64())
+    };
 
     let mut tx = Transaction {
         hash: Hash::new(hash_bytes),
@@ -809,7 +838,10 @@ fn decode_eip2930_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
 
     debug!("Successfully decoded EIP-2930 transaction");
     debug!("  From: 0x{}", hex::encode(from_addr.as_bytes()));
-    debug!("  To: {:?}", to_opt.map(|t| format!("0x{}", hex::encode(t.as_bytes()))));
+    debug!(
+        "  To: {:?}",
+        to_opt.map(|t| format!("0x{}", hex::encode(t.as_bytes())))
+    );
     debug!("  Nonce: {}", nonce);
     debug!("  Access list entries: {}", access_list.len());
 
@@ -884,11 +916,17 @@ mod tests_pba_l1a_018 {
     /// PBA-L1a-018: signature words are canonical integers of 1..=32 bytes.
     #[test]
     fn canonical_sig_word_bounds() {
-        assert!(canonical_sig_word(&[0x01; 33], "r").is_err(), "33 bytes rejected");
+        assert!(
+            canonical_sig_word(&[0x01; 33], "r").is_err(),
+            "33 bytes rejected"
+        );
         assert!(canonical_sig_word(&[0x01; 32], "r").is_ok());
         let short = canonical_sig_word(&[0x01; 31], "r").expect("31 bytes ok");
         assert_eq!(short.as_bytes()[0], 0, "left-padded");
-        assert!(canonical_sig_word(&[0x00, 0x01], "r").is_err(), "leading zero");
+        assert!(
+            canonical_sig_word(&[0x00, 0x01], "r").is_err(),
+            "leading zero"
+        );
         assert!(canonical_y_parity(1).is_ok());
         assert!(canonical_y_parity(2).is_err());
     }

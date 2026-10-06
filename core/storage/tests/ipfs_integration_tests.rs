@@ -6,8 +6,8 @@
 //! and integration with the storage layer.
 
 use citrate_storage::ipfs::{
-    DaemonConfig, DaemonStatus, IpfsDaemon, IPFSService, ModelMetadata,
-    ModelFramework, ModelType, Cid,
+    Cid, DaemonConfig, DaemonStatus, IPFSService, IpfsDaemon, ModelFramework, ModelMetadata,
+    ModelType,
 };
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -20,7 +20,7 @@ fn test_config(temp_dir: &TempDir) -> DaemonConfig {
         api_addr: "/ip4/127.0.0.1/tcp/15001".to_string(), // Use non-standard port for testing
         gateway_addr: "/ip4/127.0.0.1/tcp/18080".to_string(),
         swarm_addrs: vec!["/ip4/0.0.0.0/tcp/14001".to_string()],
-        auto_start: false, // Manual control in tests
+        auto_start: false,    // Manual control in tests
         auto_download: false, // Don't auto-download in unit tests
         enable_pubsub: false,
         low_power: true,
@@ -66,7 +66,10 @@ async fn test_daemon_status_when_not_running() {
 
     // Should report not installed or stopped
     let status = daemon.status().await;
-    assert!(matches!(status, DaemonStatus::NotInstalled | DaemonStatus::Stopped));
+    assert!(matches!(
+        status,
+        DaemonStatus::NotInstalled | DaemonStatus::Stopped
+    ));
 }
 
 #[tokio::test]
@@ -128,7 +131,7 @@ async fn test_pinning_rewards_calculation() {
         name: "Vision Model".to_string(),
         version: "1.0".to_string(),
         framework: ModelFramework::PyTorch,
-        model_type: ModelType::Vision, // 3x multiplier
+        model_type: ModelType::Vision,  // 3x multiplier
         size_bytes: 1024 * 1024 * 1024, // 1GB
         input_shape: vec![1, 3, 224, 224],
         output_shape: vec![1, 1000],
@@ -160,10 +163,10 @@ async fn test_model_type_multipliers() {
     let mut service = IPFSService::new("http://localhost:5001".to_string());
 
     let test_cases = vec![
-        (ModelType::Language, 2),     // 2x
-        (ModelType::Vision, 3),       // 3x
-        (ModelType::Audio, 2),        // 2x
-        (ModelType::Multimodal, 4),   // 4x
+        (ModelType::Language, 2),      // 2x
+        (ModelType::Vision, 3),        // 3x
+        (ModelType::Audio, 2),         // 2x
+        (ModelType::Multimodal, 4),    // 4x
         (ModelType::Reinforcement, 3), // 3x
     ];
 
@@ -332,7 +335,9 @@ fn test_persistent_pin_register_and_query() {
         model_type: ModelType::Language,
     };
 
-    registry.register_pin("QmTest123".to_string(), info.clone()).unwrap();
+    registry
+        .register_pin("QmTest123".to_string(), info.clone())
+        .unwrap();
 
     let retrieved = registry.get_pin("QmTest123").unwrap();
     assert_eq!(retrieved, &info);
@@ -376,20 +381,30 @@ fn test_persistent_pin_save_and_reload() {
     // Scope 1: create, register, auto-save via register_pin
     {
         let mut registry = PersistentPinRegistry::new(path.clone()).unwrap();
-        registry.register_pin("QmPersist1".to_string(), PinnedModelInfo {
-            cid: "QmPersist1".to_string(),
-            model_id: Some("model-a".to_string()),
-            pinned_at: 1700000001,
-            size_bytes: 2048,
-            model_type: ModelType::Audio,
-        }).unwrap();
-        registry.register_pin("QmPersist2".to_string(), PinnedModelInfo {
-            cid: "QmPersist2".to_string(),
-            model_id: None,
-            pinned_at: 1700000002,
-            size_bytes: 4096,
-            model_type: ModelType::Multimodal,
-        }).unwrap();
+        registry
+            .register_pin(
+                "QmPersist1".to_string(),
+                PinnedModelInfo {
+                    cid: "QmPersist1".to_string(),
+                    model_id: Some("model-a".to_string()),
+                    pinned_at: 1700000001,
+                    size_bytes: 2048,
+                    model_type: ModelType::Audio,
+                },
+            )
+            .unwrap();
+        registry
+            .register_pin(
+                "QmPersist2".to_string(),
+                PinnedModelInfo {
+                    cid: "QmPersist2".to_string(),
+                    model_id: None,
+                    pinned_at: 1700000002,
+                    size_bytes: 4096,
+                    model_type: ModelType::Multimodal,
+                },
+            )
+            .unwrap();
     }
 
     // Scope 2: reload from file
@@ -412,13 +427,18 @@ fn test_persistent_pin_list_all() {
     let mut registry = PersistentPinRegistry::new(path).unwrap();
 
     for i in 0..5 {
-        registry.register_pin(format!("QmList{}", i), PinnedModelInfo {
-            cid: format!("QmList{}", i),
-            model_id: Some(format!("model-{}", i)),
-            pinned_at: 1700000000 + i as u64,
-            size_bytes: 1024 * (i as u64 + 1),
-            model_type: ModelType::Language,
-        }).unwrap();
+        registry
+            .register_pin(
+                format!("QmList{}", i),
+                PinnedModelInfo {
+                    cid: format!("QmList{}", i),
+                    model_id: Some(format!("model-{}", i)),
+                    pinned_at: 1700000000 + i as u64,
+                    size_bytes: 1024 * (i as u64 + 1),
+                    model_type: ModelType::Language,
+                },
+            )
+            .unwrap();
     }
 
     let pins = registry.list_pins();

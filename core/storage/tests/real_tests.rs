@@ -3,8 +3,8 @@
 use citrate_consensus::types::{
     Block, BlockBuilder, Hash, PublicKey, Signature, Transaction, VrfProof,
 };
-use citrate_storage::{pruning::PruningConfig, StorageManager};
 use citrate_execution::types::Address;
+use citrate_storage::{pruning::PruningConfig, StorageManager};
 use tempfile::TempDir;
 
 fn create_test_block(num: u8, height: u64) -> Block {
@@ -64,7 +64,8 @@ mod storage_manager_tests {
     fn test_height_indexing() {
         let temp_dir = TempDir::new().unwrap();
         let config = PruningConfig::default();
-        let storage = StorageManager::new(temp_dir.path(), config).expect("Failed to create storage");
+        let storage =
+            StorageManager::new(temp_dir.path(), config).expect("Failed to create storage");
 
         // Store blocks at different heights
         for i in 0..5 {
@@ -81,7 +82,8 @@ mod storage_manager_tests {
     fn test_block_by_height() {
         let temp_dir = TempDir::new().unwrap();
         let config = PruningConfig::default();
-        let storage = StorageManager::new(temp_dir.path(), config).expect("Failed to create storage");
+        let storage =
+            StorageManager::new(temp_dir.path(), config).expect("Failed to create storage");
 
         let block = create_test_block(5, 50);
         storage.blocks.put_block(&block).unwrap();
@@ -99,7 +101,8 @@ mod storage_manager_tests {
     fn test_transaction_storage() {
         let temp_dir = TempDir::new().unwrap();
         let config = PruningConfig::default();
-        let storage = StorageManager::new(temp_dir.path(), config).expect("Failed to create storage");
+        let storage =
+            StorageManager::new(temp_dir.path(), config).expect("Failed to create storage");
 
         let tx = Transaction {
             hash: Hash::new([1; 32]),
@@ -115,10 +118,7 @@ mod storage_manager_tests {
             ..Default::default()
         };
 
-        storage
-            .transactions
-            .put_transaction(&tx)
-            .unwrap();
+        storage.transactions.put_transaction(&tx).unwrap();
 
         // Verify transaction was stored
         // Note: get_transaction might not exist, this is a placeholder
@@ -135,7 +135,8 @@ mod storage_manager_tests {
             batch_size: 1000,
             auto_prune: true,
         };
-        let storage = StorageManager::new(temp_dir.path(), config).expect("Failed to create storage");
+        let storage =
+            StorageManager::new(temp_dir.path(), config).expect("Failed to create storage");
 
         // Verify pruning is configured
         assert!(storage.blocks.get_latest_height().is_ok());
@@ -150,7 +151,8 @@ mod chain_store_tests {
     fn test_genesis_block() {
         let temp_dir = TempDir::new().unwrap();
         let config = PruningConfig::default();
-        let storage = StorageManager::new(temp_dir.path(), config).expect("Failed to create storage");
+        let storage =
+            StorageManager::new(temp_dir.path(), config).expect("Failed to create storage");
 
         let genesis = create_test_block(0, 0);
         storage.blocks.put_block(&genesis).unwrap();
@@ -168,7 +170,8 @@ mod chain_store_tests {
     fn test_multiple_blocks_same_height() {
         let temp_dir = TempDir::new().unwrap();
         let config = PruningConfig::default();
-        let storage = StorageManager::new(temp_dir.path(), config).expect("Failed to create storage");
+        let storage =
+            StorageManager::new(temp_dir.path(), config).expect("Failed to create storage");
 
         // Create two different blocks at same height (fork)
         let block1 = create_test_block(1, 100);
@@ -186,7 +189,8 @@ mod chain_store_tests {
     fn test_block_range() {
         let temp_dir = TempDir::new().unwrap();
         let config = PruningConfig::default();
-        let storage = StorageManager::new(temp_dir.path(), config).expect("Failed to create storage");
+        let storage =
+            StorageManager::new(temp_dir.path(), config).expect("Failed to create storage");
 
         // Store blocks 0-10
         for i in 0..11 {
@@ -208,7 +212,8 @@ mod state_store_tests {
     fn test_state_operations() {
         let temp_dir = TempDir::new().unwrap();
         let config = PruningConfig::default();
-        let storage = StorageManager::new(temp_dir.path(), config).expect("Failed to create storage");
+        let storage =
+            StorageManager::new(temp_dir.path(), config).expect("Failed to create storage");
 
         let address = Address([0u8; 20]);
         // State operations would go here
@@ -220,7 +225,8 @@ mod state_store_tests {
     fn test_account_balance() {
         let temp_dir = TempDir::new().unwrap();
         let config = PruningConfig::default();
-        let storage = StorageManager::new(temp_dir.path(), config).expect("Failed to create storage");
+        let storage =
+            StorageManager::new(temp_dir.path(), config).expect("Failed to create storage");
 
         let address = Address([1u8; 20]);
 
@@ -233,7 +239,8 @@ mod state_store_tests {
     fn test_nonce_tracking() {
         let temp_dir = TempDir::new().unwrap();
         let config = PruningConfig::default();
-        let storage = StorageManager::new(temp_dir.path(), config).expect("Failed to create storage");
+        let storage =
+            StorageManager::new(temp_dir.path(), config).expect("Failed to create storage");
 
         let address = Address([2u8; 20]);
 

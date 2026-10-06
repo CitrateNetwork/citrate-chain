@@ -61,7 +61,8 @@ impl GGUFEngine {
             );
         }
 
-        if !embedding_binary.exists() && !config.llama_cpp_path.join("build/bin/embedding").exists() {
+        if !embedding_binary.exists() && !config.llama_cpp_path.join("build/bin/embedding").exists()
+        {
             warn!(
                 "llama.cpp embedding binary not found at {:?}",
                 embedding_binary
@@ -308,12 +309,10 @@ mod tests {
         let config = GGUFEngineConfig::default();
         let engine = GGUFEngine::new(config).unwrap();
 
-        let messages = vec![
-            ChatMessage {
-                role: "user".to_string(),
-                content: "Hello".to_string(),
-            },
-        ];
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "Hello".to_string(),
+        }];
 
         let prompt = engine.format_chat_prompt(&messages);
         assert!(prompt.contains("### User:"));

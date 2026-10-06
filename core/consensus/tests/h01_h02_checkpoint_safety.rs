@@ -16,9 +16,7 @@
 // Sister TLA+ spec: `specs/tla/consensus/CheckpointVoteSafety.tla`
 // (added in WP-B2.1 + WP-B2.2).
 
-use citrate_consensus::checkpoint::{
-    canonical_vote_message, CITRATE_VOTE_DOMAIN_SEPARATOR,
-};
+use citrate_consensus::checkpoint::{canonical_vote_message, CITRATE_VOTE_DOMAIN_SEPARATOR};
 use citrate_consensus::{
     Block, BlockBuilder, CheckpointConfig, CheckpointManager, CheckpointVote, DagStore, Hash,
     PublicKey, Signature, VrfProof,
@@ -120,13 +118,12 @@ async fn h01_invalid_vote_flood_does_not_lock_out_honest_voters() {
     // hit quorum MUST succeed.
     for (i, sk) in honest_keys.iter().enumerate().take(4) {
         let vote = signed_vote_for_chain(sk, 50, hash_for(50), chain_id);
-        let reached = mgr
-            .submit_vote(vote)
-            .await
-            .unwrap_or_else(|e| panic!(
+        let reached = mgr.submit_vote(vote).await.unwrap_or_else(|e| {
+            panic!(
                 "H-01: honest voter #{i} rejected after attacker flood: {:?}",
                 e
-            ));
+            )
+        });
         if i < 3 {
             assert!(!reached);
         } else {
@@ -186,7 +183,10 @@ fn h02_canonical_message_layout_pinned() {
     assert_eq!(msg.len(), 69);
 
     // Domain separator at the start.
-    assert_eq!(&msg[..CITRATE_VOTE_DOMAIN_SEPARATOR.len()], CITRATE_VOTE_DOMAIN_SEPARATOR);
+    assert_eq!(
+        &msg[..CITRATE_VOTE_DOMAIN_SEPARATOR.len()],
+        CITRATE_VOTE_DOMAIN_SEPARATOR
+    );
 
     // chain_id immediately after separator, little-endian.
     let chain_start = CITRATE_VOTE_DOMAIN_SEPARATOR.len();
@@ -216,7 +216,9 @@ async fn h01_block_hash_mismatch_does_not_lock_voter() {
 
     let sk = test_key(11);
     let pk = PublicKey::new(sk.verifying_key().to_bytes());
-    mgr.propose(50, hash_for(50), vec![pk]).await.expect("propose");
+    mgr.propose(50, hash_for(50), vec![pk])
+        .await
+        .expect("propose");
 
     // Attacker (or buggy client) submits a vote signed for the
     // WRONG block at the right height. Pre-fix this would have
@@ -287,7 +289,10 @@ async fn h01_h02_legacy_signed_vote_rejected_voter_not_locked() {
     };
 
     let res = mgr.submit_vote(legacy_vote).await;
-    assert!(res.is_err(), "H-02: legacy-canonical-format vote must be rejected");
+    assert!(
+        res.is_err(),
+        "H-02: legacy-canonical-format vote must be rejected"
+    );
 
     // The honest voter's NEW vote must still succeed.
     let honest_vote = signed_vote_for_chain(&sk, 50, hash_for(50), chain_id);

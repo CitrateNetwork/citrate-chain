@@ -204,7 +204,9 @@ impl PerformanceTracker {
                     Arc::clone(&performance_windows),
                     Arc::clone(&model_health),
                     &config,
-                ).await {
+                )
+                .await
+                {
                     error!(error = %e, "Failed to aggregate performance data");
                 }
             }
@@ -215,7 +217,11 @@ impl PerformanceTracker {
     }
 
     /// Record a performance data point
-    pub async fn record_performance(&self, model_id: &ModelId, data_point: PerformanceDataPoint) -> Result<()> {
+    pub async fn record_performance(
+        &self,
+        model_id: &ModelId,
+        data_point: PerformanceDataPoint,
+    ) -> Result<()> {
         // Add to real-time data
         let mut entry = self.real_time_data.entry(*model_id).or_default();
         entry.push_back(data_point.clone());
@@ -247,9 +253,7 @@ impl PerformanceTracker {
 
     /// Submit benchmark results
     pub async fn submit_benchmark(&self, result: BenchmarkResult) -> Result<()> {
-        let mut benchmarks = self.benchmark_results
-            .entry(result.model_id)
-            .or_default();
+        let mut benchmarks = self.benchmark_results.entry(result.model_id).or_default();
 
         benchmarks.push(result.clone());
 
@@ -271,7 +275,9 @@ impl PerformanceTracker {
 
     /// Get model health status
     pub async fn get_model_health(&self, model_id: &ModelId) -> Option<ModelHealthStatus> {
-        self.model_health.get(model_id).map(|entry| entry.value().clone())
+        self.model_health
+            .get(model_id)
+            .map(|entry| entry.value().clone())
     }
 
     /// Get performance metrics for a time range
@@ -281,10 +287,12 @@ impl PerformanceTracker {
         start_time: DateTime<Utc>,
         end_time: DateTime<Utc>,
     ) -> Result<Vec<PerformanceWindow>> {
-        let windows = self.performance_windows
+        let windows = self
+            .performance_windows
             .get(model_id)
             .map(|entry| {
-                entry.iter()
+                entry
+                    .iter()
                     .filter(|w| w.start_time >= start_time && w.end_time <= end_time)
                     .cloned()
                     .collect()
@@ -295,7 +303,11 @@ impl PerformanceTracker {
     }
 
     /// Get latest benchmark results
-    pub async fn get_benchmark_results(&self, model_id: &ModelId, limit: usize) -> Vec<BenchmarkResult> {
+    pub async fn get_benchmark_results(
+        &self,
+        model_id: &ModelId,
+        limit: usize,
+    ) -> Vec<BenchmarkResult> {
         self.benchmark_results
             .get(model_id)
             .map(|entry| {
@@ -327,7 +339,9 @@ impl PerformanceTracker {
     pub async fn resolve_alert(&self, model_id: &ModelId, alert_type: AlertType) -> Result<()> {
         if let Some(mut alerts) = self.active_alerts.get_mut(model_id) {
             for alert in alerts.iter_mut() {
-                if std::mem::discriminant(&alert.alert_type) == std::mem::discriminant(&alert_type) && !alert.resolved {
+                if std::mem::discriminant(&alert.alert_type) == std::mem::discriminant(&alert_type)
+                    && !alert.resolved
+                {
                     alert.resolved = true;
                     info!(
                         model_id = ?model_id,
@@ -413,8 +427,8 @@ impl PerformanceTracker {
 
             // Limit window retention
             let cutoff_time = current_time
-            .checked_sub_signed(Duration::days(config.metrics_retention_days as i64))
-            .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC);
+                .checked_sub_signed(Duration::days(config.metrics_retention_days as i64))
+                .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC);
             while let Some(front) = windows.front() {
                 if front.start_time < cutoff_time {
                     windows.pop_front();
@@ -436,7 +450,11 @@ impl PerformanceTracker {
         }
 
         let index = (percentile * sorted_values.len().saturating_sub(1) as f64) as usize;
-        sorted_values.get(index).or(sorted_values.last()).copied().unwrap_or(0)
+        sorted_values
+            .get(index)
+            .or(sorted_values.last())
+            .copied()
+            .unwrap_or(0)
     }
 
     async fn update_model_health(
@@ -463,8 +481,19 @@ impl PerformanceTracker {
 
         // Determine performance trend
         let trend = if recent_windows.len() >= 3 {
-            let recent_avg = recent_windows.iter().take(3).map(|w| w.avg_latency_ms).sum::<f32>() / 3.0;
-            let older_avg = recent_windows.iter().skip(3).take(3).map(|w| w.avg_latency_ms).sum::<f32>() / 3.0;
+            let recent_avg = recent_windows
+                .iter()
+                .take(3)
+                .map(|w| w.avg_latency_ms)
+                .sum::<f32>()
+                / 3.0;
+            let older_avg = recent_windows
+                .iter()
+                .skip(3)
+                .take(3)
+                .map(|w| w.avg_latency_ms)
+                .sum::<f32>()
+                / 3.0;
 
             if recent_avg < older_avg * 0.9 {
                 PerformanceTrend::Improving
@@ -478,11 +507,17 @@ impl PerformanceTracker {
         };
 
         // Calculate health score
-        let latency_score = (1.0 - (current_window.avg_latency_ms / config.alert_thresholds.high_latency_ms as f32).min(1.0)).max(0.0);
-        let error_score = (1.0 - (current_window.error_rate / config.alert_thresholds.high_error_rate).min(1.0)).max(0.0);
+        let latency_score = (1.0
+            - (current_window.avg_latency_ms / config.alert_thresholds.high_latency_ms as f32)
+                .min(1.0))
+        .max(0.0);
+        let error_score = (1.0
+            - (current_window.error_rate / config.alert_thresholds.high_error_rate).min(1.0))
+        .max(0.0);
         let uptime_score = (uptime_percentage / 100.0).max(0.0);
 
-        let health_score = (latency_score * 0.4 + error_score * 0.3 + uptime_score * 0.3).clamp(0.0, 1.0);
+        let health_score =
+            (latency_score * 0.4 + error_score * 0.3 + uptime_score * 0.3).clamp(0.0, 1.0);
 
         // Determine overall health level
         let overall_health = match health_score {
@@ -501,7 +536,7 @@ impl PerformanceTracker {
             current_error_rate: current_window.error_rate,
             performance_trend: trend,
             active_alerts: Vec::new(), // Will be populated separately
-            last_benchmark: None, // Will be updated when benchmarks are run
+            last_benchmark: None,      // Will be updated when benchmarks are run
             health_score,
             last_updated: Utc::now(),
         };
@@ -509,7 +544,11 @@ impl PerformanceTracker {
         model_health.insert(*model_id, health_status);
     }
 
-    async fn check_immediate_alerts(&self, model_id: &ModelId, data_point: &PerformanceDataPoint) -> Result<()> {
+    async fn check_immediate_alerts(
+        &self,
+        model_id: &ModelId,
+        data_point: &PerformanceDataPoint,
+    ) -> Result<()> {
         let mut alerts = Vec::new();
 
         // High latency alert
@@ -517,7 +556,13 @@ impl PerformanceTracker {
             alerts.push(PerformanceAlert {
                 model_id: *model_id,
                 alert_type: AlertType::HighLatency,
-                severity: if data_point.latency_ms > self.config.alert_thresholds.high_latency_ms.saturating_mul(2) {
+                severity: if data_point.latency_ms
+                    > self
+                        .config
+                        .alert_thresholds
+                        .high_latency_ms
+                        .saturating_mul(2)
+                {
                     AlertSeverity::Critical
                 } else {
                     AlertSeverity::Warning
@@ -623,7 +668,8 @@ impl PerformanceTracker {
         }
 
         // Calculate rank based on health score
-        let all_scores: Vec<(ModelId, f32)> = self.model_health
+        let all_scores: Vec<(ModelId, f32)> = self
+            .model_health
             .iter()
             .map(|e| (*e.key(), e.value().health_score))
             .collect();
@@ -638,12 +684,14 @@ impl PerformanceTracker {
             .unwrap_or(total_models as u32);
 
         // Calculate market share from request volume
-        let total_requests: u64 = self.performance_windows
+        let total_requests: u64 = self
+            .performance_windows
             .iter()
             .map(|e| e.value().iter().map(|w| w.total_requests).sum::<u64>())
             .sum();
 
-        let model_requests: u64 = self.performance_windows
+        let model_requests: u64 = self
+            .performance_windows
             .get(model_id)
             .map(|w| w.iter().map(|pw| pw.total_requests).sum())
             .unwrap_or(0);
@@ -789,12 +837,34 @@ mod tests {
         let config = PerformanceConfig::default();
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: PerformanceConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.metrics_retention_days, config.metrics_retention_days);
-        assert_eq!(deserialized.sampling_interval_seconds, config.sampling_interval_seconds);
-        assert_eq!(deserialized.benchmark_threshold_ms, config.benchmark_threshold_ms);
-        assert!((deserialized.error_rate_threshold - config.error_rate_threshold).abs() < f32::EPSILON);
-        assert_eq!(deserialized.enable_real_time_monitoring, config.enable_real_time_monitoring);
-        assert_eq!(deserialized.alert_thresholds.high_latency_ms, config.alert_thresholds.high_latency_ms);
-        assert!((deserialized.alert_thresholds.high_error_rate - config.alert_thresholds.high_error_rate).abs() < f32::EPSILON);
+        assert_eq!(
+            deserialized.metrics_retention_days,
+            config.metrics_retention_days
+        );
+        assert_eq!(
+            deserialized.sampling_interval_seconds,
+            config.sampling_interval_seconds
+        );
+        assert_eq!(
+            deserialized.benchmark_threshold_ms,
+            config.benchmark_threshold_ms
+        );
+        assert!(
+            (deserialized.error_rate_threshold - config.error_rate_threshold).abs() < f32::EPSILON
+        );
+        assert_eq!(
+            deserialized.enable_real_time_monitoring,
+            config.enable_real_time_monitoring
+        );
+        assert_eq!(
+            deserialized.alert_thresholds.high_latency_ms,
+            config.alert_thresholds.high_latency_ms
+        );
+        assert!(
+            (deserialized.alert_thresholds.high_error_rate
+                - config.alert_thresholds.high_error_rate)
+                .abs()
+                < f32::EPSILON
+        );
     }
 }

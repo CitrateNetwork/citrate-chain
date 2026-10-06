@@ -57,7 +57,10 @@ async fn c03_malicious_blue_score_ignored_by_ordering() {
     let genesis = block_with_header_score(0xAA, 0, Hash::default(), 1);
     let g_hash = genesis.hash();
     dag.store_block(genesis.clone()).await.expect("genesis");
-    ghostdag.add_block(&genesis).await.expect("ghostdag genesis");
+    ghostdag
+        .add_block(&genesis)
+        .await
+        .expect("ghostdag genesis");
 
     // Honest child at height 1 (band for a child of genesis is exactly
     // genesis.header.blue_score + 1 = 2).
@@ -74,7 +77,13 @@ async fn c03_malicious_blue_score_ignored_by_ordering() {
         .await
         .expect_err("C-03/CONS-2 regression: u64::MAX header score admitted");
     assert!(
-        matches!(err, GhostDagError::BlueScoreOutOfRange { claimed: u64::MAX, .. }),
+        matches!(
+            err,
+            GhostDagError::BlueScoreOutOfRange {
+                claimed: u64::MAX,
+                ..
+            }
+        ),
         "wrong rejection reason: {err:?}"
     );
 
@@ -125,7 +134,10 @@ async fn c03_recomputed_score_invariant_under_header_lies() {
     dag.store_block(honest.clone()).await.expect("honest");
     ghostdag.add_block(&honest).await.expect("honest admitted");
     assert_eq!(
-        ghostdag.get_blue_score(&honest.hash()).await.expect("score"),
+        ghostdag
+            .get_blue_score(&honest.hash())
+            .await
+            .expect("score"),
         2
     );
 }

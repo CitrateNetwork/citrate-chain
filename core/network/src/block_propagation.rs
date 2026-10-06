@@ -103,9 +103,7 @@ impl BlockPropagation {
                 "H-NET-01: rejecting block {} from peer {} — hash mismatch",
                 block_hash, peer_id
             );
-            return Err(anyhow::anyhow!(
-                "H-NET-01: block hash verification failed"
-            ));
+            return Err(anyhow::anyhow!("H-NET-01: block hash verification failed"));
         }
 
         // Signature verification (skip genesis).
@@ -126,10 +124,7 @@ impl BlockPropagation {
                         "H-NET-01: rejecting block {} from peer {} — signature error: {}",
                         block_hash, peer_id, e
                     );
-                    return Err(anyhow::anyhow!(
-                        "H-NET-01: block signature error: {}",
-                        e
-                    ));
+                    return Err(anyhow::anyhow!("H-NET-01: block signature error: {}", e));
                 }
             }
         }
@@ -298,7 +293,6 @@ impl BlockPropagation {
     /// LRU is already self-trimming in `track_recent_broadcast`,
     /// so this method only needs to handle the header cache.
     pub async fn cleanup(&self) {
-
         // Clean up header cache
         let mut cache = self.header_cache.write().await;
         if cache.len() > 50000 {

@@ -61,8 +61,9 @@ mod tests {
 
     #[tokio::test]
     async fn resolves_literal_ip_without_dns() {
-        let (pid, addr) =
-            resolve_bootnode("noise_f356@142.93.50.217:30303").await.expect("literal IP resolves");
+        let (pid, addr) = resolve_bootnode("noise_f356@142.93.50.217:30303")
+            .await
+            .expect("literal IP resolves");
         assert_eq!(pid.map(|p| p.0), Some("noise_f356".to_string()));
         assert_eq!(addr.to_string(), "142.93.50.217:30303");
     }
@@ -70,13 +71,17 @@ mod tests {
     #[tokio::test]
     async fn resolves_loopback_hostname() {
         // `localhost` is always resolvable without network egress.
-        let (_, addr) = resolve_bootnode("localhost:30303").await.expect("localhost resolves");
+        let (_, addr) = resolve_bootnode("localhost:30303")
+            .await
+            .expect("localhost resolves");
         assert!(addr.ip().is_loopback());
         assert_eq!(addr.port(), 30303);
     }
 
     #[tokio::test]
     async fn unresolvable_host_returns_none() {
-        assert!(resolve_bootnode("nonexistent.invalid:30303").await.is_none());
+        assert!(resolve_bootnode("nonexistent.invalid:30303")
+            .await
+            .is_none());
     }
 }

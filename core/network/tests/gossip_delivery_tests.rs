@@ -6,12 +6,9 @@
 use std::sync::Arc;
 
 use citrate_consensus::types::{
-    Block, BlockBuilder, Hash, PublicKey, Signature, Transaction,
-    TransactionType, VrfProof,
+    Block, BlockBuilder, Hash, PublicKey, Signature, Transaction, TransactionType, VrfProof,
 };
-use citrate_network::{
-    GossipConfig, GossipProtocol, PeerId, PeerManager, PeerManagerConfig,
-};
+use citrate_network::{GossipConfig, GossipProtocol, PeerId, PeerManager, PeerManagerConfig};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -110,7 +107,10 @@ async fn test_gossip_block_received_increments_counter() {
     let _ = gossip.handle_new_block(block, &peer_id).await;
 
     let (br_after, _, _, _, _, _, _, _) = gossip.get_stats().await;
-    assert_eq!(br_after, 1, "blocks_received should be 1 after submitting one block");
+    assert_eq!(
+        br_after, 1,
+        "blocks_received should be 1 after submitting one block"
+    );
 }
 
 /// Submit a block that fails validation (hash mismatch by construction)
@@ -126,7 +126,10 @@ async fn test_gossip_invalid_block_returns_error() {
     // The block_hash does not match compute_hash(), so validate_block
     // should reject it at the HASH_MISMATCH check.
     let result = gossip.handle_new_block(block, &peer_id).await;
-    assert!(result.is_err(), "Invalid block should be rejected with an error");
+    assert!(
+        result.is_err(),
+        "Invalid block should be rejected with an error"
+    );
 }
 
 /// Submit a valid-looking transaction to the gossip handler and verify that
@@ -144,7 +147,10 @@ async fn test_gossip_transaction_received_increments_counter() {
     let _ = gossip.handle_new_transaction(tx, &peer_id).await;
 
     let (_, _, tr_after, _, _, _, _, _) = gossip.get_stats().await;
-    assert_eq!(tr_after, 1, "transactions_received should be 1 after submitting one tx");
+    assert_eq!(
+        tr_after, 1,
+        "transactions_received should be 1 after submitting one tx"
+    );
 }
 
 /// Test peer scoring boundary behavior. The default score_threshold is -100.
@@ -154,7 +160,10 @@ async fn test_gossip_transaction_received_increments_counter() {
 async fn test_gossip_peer_scoring_boundary() {
     // Use default config where score_threshold = -100
     let config = PeerManagerConfig::default();
-    assert_eq!(config.score_threshold, -100, "Default threshold should be -100");
+    assert_eq!(
+        config.score_threshold, -100,
+        "Default threshold should be -100"
+    );
 
     let pm = Arc::new(PeerManager::new(config));
 
@@ -228,8 +237,14 @@ async fn test_gossip_seen_block_cache_prevents_reprocessing() {
     let (br_2, _, _, _, dup_2, _, _, _) = gossip.get_stats().await;
 
     // blocks_received should be 2 (processed twice because propagated=false)
-    assert_eq!(br_2, 2, "Second submission should also increment blocks_received (not yet propagated)");
-    assert_eq!(dup_2, 0, "No duplicates_filtered because propagated was false");
+    assert_eq!(
+        br_2, 2,
+        "Second submission should also increment blocks_received (not yet propagated)"
+    );
+    assert_eq!(
+        dup_2, 0,
+        "No duplicates_filtered because propagated was false"
+    );
 
     // Now verify the deduplication path works by testing with the transaction
     // gossip handler, which has a cleaner dedup path via broadcast_transaction.

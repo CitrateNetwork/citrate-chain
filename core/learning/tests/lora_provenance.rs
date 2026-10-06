@@ -5,8 +5,8 @@
 //! spectral norm safety threshold enforcement, and application latency benchmarks.
 
 use citrate_learning::adapters::{
-    apply_lora, compose_lora, compose_lora_chain, remove_lora, spectral_norm_bound,
-    AdapterFactory, AdapterMetadata, LoraAdapter, ProvenanceChain, ProvenanceEntry,
+    apply_lora, compose_lora, compose_lora_chain, remove_lora, spectral_norm_bound, AdapterFactory,
+    AdapterMetadata, LoraAdapter, ProvenanceChain, ProvenanceEntry,
 };
 use citrate_learning::embeddings::EmbeddingVector;
 use citrate_learning::safety::SafetyGuard;
@@ -68,15 +68,8 @@ fn test_three_level_provenance_chain() {
     assert!(a3.provenance.validate().is_ok());
 
     // Compose: a1 + a2
-    let composed_12 = compose_lora(
-        &a1,
-        &a2,
-        test_metadata(12),
-        creator,
-        1200,
-        vec![0u8; 64],
-    )
-    .unwrap();
+    let composed_12 =
+        compose_lora(&a1, &a2, test_metadata(12), creator, 1200, vec![0u8; 64]).unwrap();
     assert_eq!(composed_12.rank, 8); // 4 + 4
     assert_eq!(composed_12.dim, dim);
 
@@ -262,15 +255,8 @@ fn test_composition_different_ranks_numerical_stability() {
     assert_eq!(a16.rank, 16);
 
     // Compose r=4 + r=8
-    let composed_4_8 = compose_lora(
-        &a4,
-        &a8,
-        test_metadata(12),
-        creator,
-        1200,
-        vec![0u8; 64],
-    )
-    .unwrap();
+    let composed_4_8 =
+        compose_lora(&a4, &a8, test_metadata(12), creator, 1200, vec![0u8; 64]).unwrap();
     assert_eq!(composed_4_8.rank, 12);
 
     // Compose (r=4 + r=8) + r=16

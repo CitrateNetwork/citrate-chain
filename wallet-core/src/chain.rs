@@ -789,7 +789,10 @@ mod tests {
             .clone()
             .expect("captured request body");
         assert_eq!(body["method"], "eth_call");
-        assert_eq!(body["params"][0]["to"], "0xdead000000000000000000000000000000000000");
+        assert_eq!(
+            body["params"][0]["to"],
+            "0xdead000000000000000000000000000000000000"
+        );
         assert_eq!(body["params"][0]["data"], "0xdeadbeef");
         assert_eq!(body["params"][1], "latest");
     }

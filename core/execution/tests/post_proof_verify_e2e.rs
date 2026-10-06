@@ -182,13 +182,19 @@ fn precompile_0x0108_accepts_valid_post_proof() {
 
         assert!(result.success, "precompile ran (challenge {v})");
         assert_eq!(result.output.len(), 32);
-        assert_eq!(result.output[31], 1, "PoSt proof must verify (challenge {v})");
+        assert_eq!(
+            result.output[31], 1,
+            "PoSt proof must verify (challenge {v})"
+        );
         assert!(result.output[..31].iter().all(|&b| b == 0));
 
         // Gas uses the v3 schedule.
         let expected_gas = gas_costs::POST_PROOF_VERIFY_BASE
             + gas_costs::POST_PROOF_VERIFY_PER_BYTE * wire.len() as u64;
-        assert_eq!(result.gas_used, expected_gas, "v3 gas schedule (challenge {v})");
+        assert_eq!(
+            result.gas_used, expected_gas,
+            "v3 gas schedule (challenge {v})"
+        );
     }
 }
 
@@ -346,7 +352,7 @@ fn domain_sep_inference_proof_as_v3_rejected() {
     wire.extend_from_slice(&fr_to_be32(&filler)); // CommC
     wire.extend_from_slice(&fr_to_be32(&Halo2Fr::from(0u64))); // challengeNonce=0
     wire.extend_from_slice(&fr_to_be32(&filler)); // epoch
-    // A short, bogus "proof" body — not a real inference transcript.
+                                                  // A short, bogus "proof" body — not a real inference transcript.
     wire.extend_from_slice(&[0u8; 192]);
 
     let addr = Address(addresses::INFERENCE_PROOF_VERIFY);

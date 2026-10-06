@@ -234,7 +234,9 @@ mod tests {
         let provider = DocusignProvider::new(cfg.clone());
         let body = br#"{"event":"envelope-completed","envelopeId":"abc"}"#;
         let sig = sign_payload(&cfg.webhook_secret, body);
-        provider.verify_webhook_signature(body, &sig).expect("valid sig");
+        provider
+            .verify_webhook_signature(body, &sig)
+            .expect("valid sig");
     }
 
     #[test]
@@ -244,10 +246,7 @@ mod tests {
         let body = br#"{"event":"envelope-completed","envelopeId":"abc"}"#;
         let sig = sign_payload("wrong-secret", body);
         let result = provider.verify_webhook_signature(body, &sig);
-        assert!(matches!(
-            result,
-            Err(SigningError::WebhookSignatureInvalid)
-        ));
+        assert!(matches!(result, Err(SigningError::WebhookSignatureInvalid)));
     }
 
     #[test]
@@ -258,10 +257,7 @@ mod tests {
         let tampered = br#"{"event":"envelope-completed","envelopeId":"xyz"}"#;
         let sig = sign_payload(&cfg.webhook_secret, original);
         let result = provider.verify_webhook_signature(tampered, &sig);
-        assert!(matches!(
-            result,
-            Err(SigningError::WebhookSignatureInvalid)
-        ));
+        assert!(matches!(result, Err(SigningError::WebhookSignatureInvalid)));
     }
 
     #[test]
@@ -270,10 +266,7 @@ mod tests {
         let provider = DocusignProvider::new(cfg);
         let body = br#"{"event":"envelope-completed","envelopeId":"abc"}"#;
         let result = provider.verify_webhook_signature(body, "not-hex-G");
-        assert!(matches!(
-            result,
-            Err(SigningError::WebhookSignatureInvalid)
-        ));
+        assert!(matches!(result, Err(SigningError::WebhookSignatureInvalid)));
     }
 
     #[test]
@@ -281,15 +274,27 @@ mod tests {
         let mut cfg = test_config();
         cfg.clear_rbv_enabled = false;
         let provider = DocusignProvider::new(cfg);
-        assert_eq!(provider.effective_risk_level(RiskLevel::High), RiskLevel::Medium);
-        assert_eq!(provider.effective_risk_level(RiskLevel::Medium), RiskLevel::Medium);
-        assert_eq!(provider.effective_risk_level(RiskLevel::Low), RiskLevel::Low);
+        assert_eq!(
+            provider.effective_risk_level(RiskLevel::High),
+            RiskLevel::Medium
+        );
+        assert_eq!(
+            provider.effective_risk_level(RiskLevel::Medium),
+            RiskLevel::Medium
+        );
+        assert_eq!(
+            provider.effective_risk_level(RiskLevel::Low),
+            RiskLevel::Low
+        );
     }
 
     #[test]
     fn effective_risk_level_preserves_high_when_clear_enabled() {
         let cfg = test_config();
         let provider = DocusignProvider::new(cfg);
-        assert_eq!(provider.effective_risk_level(RiskLevel::High), RiskLevel::High);
+        assert_eq!(
+            provider.effective_risk_level(RiskLevel::High),
+            RiskLevel::High
+        );
     }
 }

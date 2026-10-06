@@ -1,9 +1,9 @@
 // citrate/core/economics/src/dynamic_pricing.rs
 
+use anyhow::Result;
 use primitive_types::U256;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use anyhow::Result;
 
 /// Dynamic pricing configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,14 +40,14 @@ impl Default for DynamicPricingConfig {
     fn default() -> Self {
         Self {
             base_gas_price: U256::from(1_000_000_000), // 1 Gwei
-            target_utilization: 70, // 70% target
-            max_price_multiplier: 50, // 50x max
-            min_price_multiplier: 10, // 0.1x min
-            adjustment_factor: 125, // 1.25% per block
-            utilization_window: 20, // 20 blocks
-            ai_inference_multiplier: 200, // 2x for AI ops
-            model_deployment_base: crate::salt(100), // 100 SALT
-            compute_scaling_factor: 150, // 1.5x scaling per compute unit
+            target_utilization: 70,                    // 70% target
+            max_price_multiplier: 50,                  // 50x max
+            min_price_multiplier: 10,                  // 0.1x min
+            adjustment_factor: 125,                    // 1.25% per block
+            utilization_window: 20,                    // 20 blocks
+            ai_inference_multiplier: 200,              // 2x for AI ops
+            model_deployment_base: crate::salt(100),   // 100 SALT
+            compute_scaling_factor: 150,               // 1.5x scaling per compute unit
         }
     }
 }
@@ -98,8 +98,10 @@ impl DynamicPricingManager {
         let new_gas_price = self.calculate_new_gas_price(avg_utilization, &metrics)?;
 
         // Update price history
-        self.price_history.push_back((metrics.block_height, new_gas_price));
-        if self.price_history.len() > 100 { // Keep last 100 blocks
+        self.price_history
+            .push_back((metrics.block_height, new_gas_price));
+        if self.price_history.len() > 100 {
+            // Keep last 100 blocks
             self.price_history.pop_front();
         }
 
@@ -131,7 +133,11 @@ impl DynamicPricingManager {
     }
 
     /// Calculate dynamic gas price based on network utilization
-    fn calculate_new_gas_price(&self, utilization: f64, metrics: &UtilizationMetrics) -> Result<U256> {
+    fn calculate_new_gas_price(
+        &self,
+        utilization: f64,
+        metrics: &UtilizationMetrics,
+    ) -> Result<U256> {
         let target = self.config.target_utilization as f64 / 100.0;
         let utilization_ratio = utilization / target;
 
@@ -158,8 +164,11 @@ impl DynamicPricingManager {
         let new_price_f64 = base_price_f64 * adjustment * ai_scaling;
 
         // Apply bounds
-        let max_price = self.config.base_gas_price.as_u128() as f64 * self.config.max_price_multiplier as f64;
-        let min_price = self.config.base_gas_price.as_u128() as f64 * self.config.min_price_multiplier as f64 / 100.0;
+        let max_price =
+            self.config.base_gas_price.as_u128() as f64 * self.config.max_price_multiplier as f64;
+        let min_price = self.config.base_gas_price.as_u128() as f64
+            * self.config.min_price_multiplier as f64
+            / 100.0;
 
         let bounded_price = new_price_f64.min(max_price).max(min_price);
 
@@ -172,7 +181,8 @@ impl DynamicPricingManager {
             return 0.0;
         }
 
-        let total_utilization: f64 = self.utilization_history
+        let total_utilization: f64 = self
+            .utilization_history
             .iter()
             .map(|m| m.gas_used as f64 / m.gas_limit as f64)
             .sum();
@@ -218,8 +228,12 @@ impl DynamicPricingManager {
     /// Get price for specific operation type
     pub fn get_operation_price(&self, operation: OperationType) -> U256 {
         match operation {
-            OperationType::StandardTransaction => self.current_gas_price.saturating_mul(U256::from(21_000)),
-            OperationType::ContractCall => self.current_gas_price.saturating_mul(U256::from(50_000)),
+            OperationType::StandardTransaction => {
+                self.current_gas_price.saturating_mul(U256::from(21_000))
+            }
+            OperationType::ContractCall => {
+                self.current_gas_price.saturating_mul(U256::from(50_000))
+            }
             OperationType::AIInference { compute_units } => {
                 let base = self.current_gas_price.saturating_mul(U256::from(100_000));
                 let scaling = crate::mul_div(
@@ -228,17 +242,17 @@ impl DynamicPricingManager {
                     U256::from(100),
                 );
                 base.saturating_add(crate::mul_div(base, scaling, U256::from(100)))
-            },
+            }
             OperationType::ModelDeployment { model_size_mb } => {
                 let base = self.config.model_deployment_base;
                 let size_scaling = U256::from(model_size_mb).saturating_mul(U256::exp10(16)); // 0.01 SALT per MB
                 base.saturating_add(size_scaling)
-            },
+            }
             OperationType::ModelTraining { dataset_size_gb } => {
                 let base = self.current_gas_price.saturating_mul(U256::from(1_000_000));
                 let data_scaling = U256::from(dataset_size_gb).saturating_mul(U256::exp10(17)); // 0.1 SALT per GB
                 base.saturating_add(data_scaling)
-            },
+            }
         }
     }
 
@@ -258,7 +272,8 @@ impl DynamicPricingManager {
             return PriceTrend::Stable;
         }
 
-        let recent_prices: Vec<f64> = self.price_history
+        let recent_prices: Vec<f64> = self
+            .price_history
             .iter()
             .rev()
             .take(10)
@@ -269,7 +284,9 @@ impl DynamicPricingManager {
         let n = recent_prices.len() as f64;
         let sum_x: f64 = (0..recent_prices.len()).map(|i| i as f64).sum();
         let sum_y: f64 = recent_prices.iter().sum();
-        let sum_xy: f64 = recent_prices.iter().enumerate()
+        let sum_xy: f64 = recent_prices
+            .iter()
+            .enumerate()
             .map(|(i, &y)| i as f64 * y)
             .sum();
         let sum_x2: f64 = (0..recent_prices.len()).map(|i| (i as f64).powi(2)).sum();
@@ -297,8 +314,16 @@ pub struct PricingUpdate {
 
 #[derive(Debug, Clone)]
 pub enum PriceChange {
-    Increase { old_price: U256, new_price: U256, factor: f64 },
-    Decrease { old_price: U256, new_price: U256, factor: f64 },
+    Increase {
+        old_price: U256,
+        new_price: U256,
+        factor: f64,
+    },
+    Decrease {
+        old_price: U256,
+        new_price: U256,
+        factor: f64,
+    },
     NoChange(U256),
 }
 
@@ -346,7 +371,8 @@ mod tests {
         let pricing = DynamicPricingManager::new(config);
 
         let standard_cost = pricing.get_operation_price(OperationType::StandardTransaction);
-        let ai_cost = pricing.get_operation_price(OperationType::AIInference { compute_units: 100 });
+        let ai_cost =
+            pricing.get_operation_price(OperationType::AIInference { compute_units: 100 });
 
         assert!(ai_cost > standard_cost);
     }

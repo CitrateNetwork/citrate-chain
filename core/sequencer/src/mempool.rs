@@ -1322,10 +1322,7 @@ impl Mempool {
     /// Equal-priority eviction is allowed on purpose: tied transactions are
     /// interchangeable in value, and allowing the tie keeps the count / byte-budget
     /// caps enforceable (a pool full of equal-fee txs must still make room).
-    async fn evict_lower_priority_than(
-        &self,
-        incoming: TxPriority,
-    ) -> Result<(), MempoolError> {
+    async fn evict_lower_priority_than(&self, incoming: TxPriority) -> Result<(), MempoolError> {
         let priority_queue = self.priority_queue.read().await;
 
         let lowest = priority_queue
@@ -1356,7 +1353,9 @@ impl Mempool {
         // Approximate size calculation
         // hash 32 + nonce 8 + from 32 + to 32 + value 16 + gas_limit 8 + gas_price 8
         // + data + signature 64
-        tx.data.len().saturating_add(32 + 8 + 32 + 32 + 16 + 8 + 8 + 64)
+        tx.data
+            .len()
+            .saturating_add(32 + 8 + 32 + 32 + 16 + 8 + 8 + 64)
     }
 
     /// Clear expired transactions

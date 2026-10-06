@@ -11,12 +11,14 @@
 
 use async_trait::async_trait;
 use citrate_consensus::types::Hash;
-use citrate_network::ai_handler::{AINetworkHandler, NetworkInferenceExecutor, NetworkInferenceResult};
+use citrate_network::ai_handler::{
+    AINetworkHandler, NetworkInferenceExecutor, NetworkInferenceResult,
+};
 use citrate_network::peer::{PeerId, PeerManager, PeerManagerConfig};
 use citrate_network::protocol::{ModelMetadata, NetworkMessage};
+use citrate_storage::pruning::PruningConfig;
 use citrate_storage::state_manager::StateManager;
 use citrate_storage::StorageManager;
-use citrate_storage::pruning::PruningConfig;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -52,9 +54,7 @@ impl NetworkInferenceExecutor for MockExecutor {
 
 fn make_handler(executor: Option<Arc<dyn NetworkInferenceExecutor>>) -> AINetworkHandler {
     let temp_dir = tempfile::TempDir::new().unwrap();
-    let storage = Arc::new(
-        StorageManager::new(temp_dir.path(), PruningConfig::default()).unwrap(),
-    );
+    let storage = Arc::new(StorageManager::new(temp_dir.path(), PruningConfig::default()).unwrap());
     let state_manager = Arc::new(StateManager::new(storage.db.clone()));
     let peer_manager = Arc::new(PeerManager::new(PeerManagerConfig::default()));
     let mut handler = AINetworkHandler::new(state_manager, peer_manager);
@@ -103,7 +103,10 @@ async fn test_model_announcement_stored_in_registry() {
 
     // Handle announcement
     let response = handler.handle_message(&peer, &announce).await.unwrap();
-    assert!(response.is_none(), "ModelAnnounce should not produce a response");
+    assert!(
+        response.is_none(),
+        "ModelAnnounce should not produce a response"
+    );
 
     // Verify model is stored by trying to run inference on it
     let request = NetworkMessage::InferenceRequest {
@@ -115,7 +118,10 @@ async fn test_model_announcement_stored_in_registry() {
     };
 
     let resp = handler.handle_message(&peer, &request).await.unwrap();
-    assert!(resp.is_some(), "Inference should succeed after model announcement");
+    assert!(
+        resp.is_some(),
+        "Inference should succeed after model announcement"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -193,7 +199,10 @@ async fn test_duplicate_announcement_same_peer_deduplicated() {
     };
 
     let resp = handler.handle_message(&peer, &request).await.unwrap();
-    assert!(resp.is_some(), "Model should still work after duplicate announcement");
+    assert!(
+        resp.is_some(),
+        "Model should still work after duplicate announcement"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -264,7 +273,11 @@ async fn test_query_models_by_framework_filtered() {
         };
 
         let resp = handler.handle_message(&peer, &request).await.unwrap();
-        assert!(resp.is_some(), "Model with framework '{}' should be available", label);
+        assert!(
+            resp.is_some(),
+            "Model with framework '{}' should be available",
+            label
+        );
     }
 }
 
@@ -285,7 +298,7 @@ async fn test_announcement_with_invalid_owner_handles_gracefully() {
     let announce = NetworkMessage::ModelAnnounce {
         model_id,
         model_hash: Hash::new([51u8; 32]),
-        owner: vec![],  // Invalid: should be 20 bytes
+        owner: vec![], // Invalid: should be 20 bytes
         metadata: make_metadata("bad-owner-model", "gguf"),
         weight_cid: "QmBadOwner".to_string(),
     };
@@ -293,7 +306,10 @@ async fn test_announcement_with_invalid_owner_handles_gracefully() {
     // Should not panic, just handle gracefully
     let result = handler.handle_message(&peer, &announce).await;
     // Either Ok(None) or an error — but no panic
-    assert!(result.is_ok() || result.is_err(), "Should handle invalid owner gracefully");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "Should handle invalid owner gracefully"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -391,7 +407,7 @@ async fn test_announcement_with_empty_model_name() {
         model_hash: Hash::new([81u8; 32]),
         owner: vec![0xAA; 20],
         metadata: ModelMetadata {
-            name: "".to_string(),  // Empty name
+            name: "".to_string(), // Empty name
             version: "1.0".to_string(),
             description: "Empty name model".to_string(),
             framework: "gguf".to_string(),
@@ -405,5 +421,8 @@ async fn test_announcement_with_empty_model_name() {
 
     // Should not panic; handler accepts it (validation is application-layer)
     let result = handler.handle_message(&peer, &announce).await;
-    assert!(result.is_ok(), "Empty model name should not crash the handler");
+    assert!(
+        result.is_ok(),
+        "Empty model name should not crash the handler"
+    );
 }

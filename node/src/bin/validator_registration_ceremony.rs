@@ -160,7 +160,10 @@ async fn main() -> Result<()> {
     let stake_wei = salt_to_wei(cli.stake_salt);
 
     for (i, spec) in specs.iter().enumerate() {
-        println!("\n─── node #{} ───────────────────────────────", i.saturating_add(1));
+        println!(
+            "\n─── node #{} ───────────────────────────────",
+            i.saturating_add(1)
+        );
         register_one(&client, &cli, registry, stake_wei, spec).await?;
     }
 
@@ -184,7 +187,11 @@ async fn register_one(
 
     println!("coinbase        : 0x{}", hex::encode(spec.coinbase));
     println!("proposer pubkey : 0x{}", hex::encode(proposer_pubkey));
-    println!("staker ({:<28}): 0x{}", spec.staker_key_env, hex::encode(staker));
+    println!(
+        "staker ({:<28}): 0x{}",
+        spec.staker_key_env,
+        hex::encode(staker)
+    );
 
     // 2. On-chain registrationNonce[staker] → the digest's replay nonce.
     let reg_nonce = if cli.dry_run {
@@ -197,7 +204,13 @@ async fn register_one(
 
     // Register digest (identical to what the contract reconstructs), then ed25519-sign
     // the 32-byte digest (the contract's `_ed25519Verify` message == abi.encodePacked(digest)).
-    let digest = registration_digest(cli.chain_id, &registry, &staker, &proposer_pubkey, reg_nonce);
+    let digest = registration_digest(
+        cli.chain_id,
+        &registry,
+        &staker,
+        &proposer_pubkey,
+        reg_nonce,
+    );
     let sig: ed25519_dalek::Signature = {
         use ed25519_dalek::Signer;
         proposer.sign(&digest)
@@ -217,7 +230,10 @@ async fn register_one(
     let calldata = encode_register_validator(&proposer_pubkey, &sig_bytes);
 
     if cli.dry_run {
-        println!("[dry-run] calldata (0x{}...) — not broadcast", hex::encode(calldata.get(..8).unwrap_or(&calldata)));
+        println!(
+            "[dry-run] calldata (0x{}...) — not broadcast",
+            hex::encode(calldata.get(..8).unwrap_or(&calldata))
+        );
         return Ok(());
     }
 
@@ -228,7 +244,8 @@ async fn register_one(
     let bal = eth_balance(client, &cli.rpc_url, &staker)
         .await
         .context("eth_getBalance(staker)")?;
-    let needed = stake_wei.saturating_add((cli.gas_price as u128).saturating_mul(cli.gas_limit as u128));
+    let needed =
+        stake_wei.saturating_add((cli.gas_price as u128).saturating_mul(cli.gas_limit as u128));
     if bal < needed {
         bail!(
             "staker 0x{} balance {} wei < required {} wei (stake + max gas). Fund it in genesis.",
@@ -379,17 +396,27 @@ fn parse_nodes(nodes: &[String]) -> Result<Vec<NodeSpec>> {
         }
         let mut proposer_seed = [0u8; 32];
         proposer_seed.copy_from_slice(&proposer_seed_raw);
-        let coinbase = parse_addr20(coinbase_str).with_context(|| format!("--node coinbase in {spec}"))?;
-        let key_hex = std::env::var(env_name)
-            .map_err(|_| anyhow!("staker key env var `{env_name}` is not set (referenced by --node {spec})"))?;
+        let coinbase =
+            parse_addr20(coinbase_str).with_context(|| format!("--node coinbase in {spec}"))?;
+        let key_hex = std::env::var(env_name).map_err(|_| {
+            anyhow!("staker key env var `{env_name}` is not set (referenced by --node {spec})")
+        })?;
         let key_bytes = hex::decode(key_hex.trim().trim_start_matches("0x"))
             .with_context(|| format!("staker key in `{env_name}` is not valid hex"))?;
         if key_bytes.len() != 32 {
-            bail!("staker key in `{env_name}` must be 32 bytes, got {}", key_bytes.len());
+            bail!(
+                "staker key in `{env_name}` must be 32 bytes, got {}",
+                key_bytes.len()
+            );
         }
         let staker_key = Secp256k1SigningKey::from_slice(&key_bytes)
             .map_err(|e| anyhow!("staker key in `{env_name}` is not a valid secp256k1 key: {e}"))?;
-        out.push(NodeSpec { coinbase, staker_key, staker_key_env: env_name.to_string(), proposer_seed });
+        out.push(NodeSpec {
+            coinbase,
+            staker_key,
+            staker_key_env: env_name.to_string(),
+            proposer_seed,
+        });
     }
     Ok(out)
 }
@@ -435,7 +462,10 @@ async fn rpc(client: &reqwest::Client, url: &str, method: &str, params: Value) -
         .send()
         .await
         .with_context(|| format!("POST {method} to {url}"))?;
-    let body: Value = resp.json().await.with_context(|| format!("decode {method} response"))?;
+    let body: Value = resp
+        .json()
+        .await
+        .with_context(|| format!("decode {method} response"))?;
     if let Some(err) = body.get("error") {
         bail!("{method} RPC error: {err}");
     }
@@ -445,25 +475,51 @@ async fn rpc(client: &reqwest::Client, url: &str, method: &str, params: Value) -
 }
 
 fn hex_to_u64(v: &Value) -> Result<u64> {
-    let s = v.as_str().ok_or_else(|| anyhow!("expected hex-string quantity, got {v}"))?;
-    u64::from_str_radix(s.trim_start_matches("0x"), 16).with_context(|| format!("parse quantity {s}"))
+    let s = v
+        .as_str()
+        .ok_or_else(|| anyhow!("expected hex-string quantity, got {v}"))?;
+    u64::from_str_radix(s.trim_start_matches("0x"), 16)
+        .with_context(|| format!("parse quantity {s}"))
 }
 
 fn hex_to_u128(v: &Value) -> Result<u128> {
-    let s = v.as_str().ok_or_else(|| anyhow!("expected hex-string quantity, got {v}"))?;
-    u128::from_str_radix(s.trim_start_matches("0x"), 16).with_context(|| format!("parse quantity {s}"))
+    let s = v
+        .as_str()
+        .ok_or_else(|| anyhow!("expected hex-string quantity, got {v}"))?;
+    u128::from_str_radix(s.trim_start_matches("0x"), 16)
+        .with_context(|| format!("parse quantity {s}"))
 }
 
 async fn eth_block_number(client: &reqwest::Client, url: &str) -> Result<u64> {
     hex_to_u64(&rpc(client, url, "eth_blockNumber", json!([])).await?)
 }
 
-async fn eth_transaction_count(client: &reqwest::Client, url: &str, addr: &[u8; 20]) -> Result<u64> {
-    hex_to_u64(&rpc(client, url, "eth_getTransactionCount", json!([addr_hex(addr), "pending"])).await?)
+async fn eth_transaction_count(
+    client: &reqwest::Client,
+    url: &str,
+    addr: &[u8; 20],
+) -> Result<u64> {
+    hex_to_u64(
+        &rpc(
+            client,
+            url,
+            "eth_getTransactionCount",
+            json!([addr_hex(addr), "pending"]),
+        )
+        .await?,
+    )
 }
 
 async fn eth_balance(client: &reqwest::Client, url: &str, addr: &[u8; 20]) -> Result<u128> {
-    hex_to_u128(&rpc(client, url, "eth_getBalance", json!([addr_hex(addr), "latest"])).await?)
+    hex_to_u128(
+        &rpc(
+            client,
+            url,
+            "eth_getBalance",
+            json!([addr_hex(addr), "latest"]),
+        )
+        .await?,
+    )
 }
 
 /// eth_call registrationNonce(address) → uint256 (fits u64 in practice).
@@ -486,10 +542,16 @@ async fn eth_registration_nonce(
         json!([{"to": addr_hex(&registry), "data": format!("0x{}", hex::encode(&data))}, "latest"]),
     )
     .await?;
-    let s = ret.as_str().ok_or_else(|| anyhow!("eth_call returned non-string"))?;
-    let bytes = hex::decode(s.trim_start_matches("0x")).context("decode registrationNonce return")?;
+    let s = ret
+        .as_str()
+        .ok_or_else(|| anyhow!("eth_call returned non-string"))?;
+    let bytes =
+        hex::decode(s.trim_start_matches("0x")).context("decode registrationNonce return")?;
     if bytes.len() != 32 {
-        bail!("registrationNonce return not 32 bytes ({} bytes)", bytes.len());
+        bail!(
+            "registrationNonce return not 32 bytes ({} bytes)",
+            bytes.len()
+        );
     }
     // Low 8 bytes of the big-endian uint256 (nonce never realistically exceeds u64).
     let b8: [u8; 8] = bytes
@@ -500,8 +562,16 @@ async fn eth_registration_nonce(
 }
 
 async fn eth_send_raw(client: &reqwest::Client, url: &str, raw: &[u8]) -> Result<String> {
-    let ret = rpc(client, url, "eth_sendRawTransaction", json!([format!("0x{}", hex::encode(raw))])).await?;
-    ret.as_str().map(|s| s.to_string()).ok_or_else(|| anyhow!("eth_sendRawTransaction returned non-string"))
+    let ret = rpc(
+        client,
+        url,
+        "eth_sendRawTransaction",
+        json!([format!("0x{}", hex::encode(raw))]),
+    )
+    .await?;
+    ret.as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("eth_sendRawTransaction returned non-string"))
 }
 
 /// Poll up to ~60s for the receipt; Ok(true) if status 0x1, Ok(false) if 0x0.
@@ -582,7 +652,8 @@ mod tests {
     fn test_staker_key(seed: u8) -> Secp256k1SigningKey {
         let mut b = [0u8; 32];
         b[31] = seed;
-        Secp256k1SigningKey::from_slice(&b).expect("nonzero 32-byte scalar is a valid secp256k1 key")
+        Secp256k1SigningKey::from_slice(&b)
+            .expect("nonzero 32-byte scalar is a valid secp256k1 key")
     }
 
     fn node_spec(coinbase: [u8; 20], staker_seed: u8) -> NodeSpec {
@@ -677,7 +748,10 @@ mod tests {
         let b = citrate_consensus::crypto::generate_block_signing_key()
             .verifying_key()
             .to_bytes();
-        assert_ne!(a, b, "each node must mint its own independent proposer identity");
+        assert_ne!(
+            a, b,
+            "each node must mint its own independent proposer identity"
+        );
     }
 
     /// A persisted seed must round-trip to the same key, or a node would come back
@@ -744,7 +818,10 @@ mod tests {
     #[test]
     fn salt_to_wei_is_1e18() {
         assert_eq!(salt_to_wei(1), 1_000_000_000_000_000_000u128);
-        assert_eq!(salt_to_wei(32_000), 32_000u128 * 1_000_000_000_000_000_000u128);
+        assert_eq!(
+            salt_to_wei(32_000),
+            32_000u128 * 1_000_000_000_000_000_000u128
+        );
     }
 
     // ── Guard edges ──────────────────────────────────────────────────────────
@@ -753,14 +830,35 @@ mod tests {
     fn seed_timing_guard_boundary() {
         // Default margin 100 → refuse-after limit S(1)-100 = 700.
         assert_eq!(seed_timing_refuse_limit(), 700);
-        assert!(seed_timing_permitted(0, false), "genesis-era height permitted");
-        assert!(seed_timing_permitted(699, false), "one below limit permitted");
-        assert!(!seed_timing_permitted(700, false), "at the limit is refused");
-        assert!(!seed_timing_permitted(701, false), "past the limit is refused");
-        assert!(!seed_timing_permitted(FIRST_SNAPSHOT_HEIGHT, false), "at S(1) refused");
+        assert!(
+            seed_timing_permitted(0, false),
+            "genesis-era height permitted"
+        );
+        assert!(
+            seed_timing_permitted(699, false),
+            "one below limit permitted"
+        );
+        assert!(
+            !seed_timing_permitted(700, false),
+            "at the limit is refused"
+        );
+        assert!(
+            !seed_timing_permitted(701, false),
+            "past the limit is refused"
+        );
+        assert!(
+            !seed_timing_permitted(FIRST_SNAPSHOT_HEIGHT, false),
+            "at S(1) refused"
+        );
         // --force overrides at and beyond the boundary.
-        assert!(seed_timing_permitted(700, true), "force overrides at the limit");
-        assert!(seed_timing_permitted(u64::MAX, true), "force overrides everywhere");
+        assert!(
+            seed_timing_permitted(700, true),
+            "force overrides at the limit"
+        );
+        assert!(
+            seed_timing_permitted(u64::MAX, true),
+            "force overrides everywhere"
+        );
     }
 
     #[test]

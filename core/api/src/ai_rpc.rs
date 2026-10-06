@@ -3,10 +3,10 @@
 use crate::methods::ai::{AiApi, ChatCompletionRequest, EmbeddingsRequest};
 // PIL-49: shared Tokio runtime so block_on can drive tokio::sync::* wakers.
 use crate::rpc_runtime::block_on;
-use jsonrpc_core::{IoHandler, Params};
 use citrate_execution::executor::Executor;
 use citrate_sequencer::mempool::Mempool;
 use citrate_storage::StorageManager;
+use jsonrpc_core::{IoHandler, Params};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -22,7 +22,11 @@ pub fn register_ai_methods(
     mempool: Arc<Mempool>,
     executor: Arc<Executor>,
 ) {
-    let ai_api = Arc::new(AiApi::new(storage.clone(), mempool.clone(), executor.clone()));
+    let ai_api = Arc::new(AiApi::new(
+        storage.clone(),
+        mempool.clone(),
+        executor.clone(),
+    ));
 
     // citrate_getTextEmbedding - Generate embeddings for text
     let ai_api_embed = ai_api.clone();
@@ -79,11 +83,8 @@ pub fn register_ai_methods(
                     Ok(json!(response.data.first().map(|d| &d.embedding)))
                 } else {
                     // Multiple texts - return array of embeddings
-                    let embeddings: Vec<Vec<f32>> = response
-                        .data
-                        .into_iter()
-                        .map(|d| d.embedding)
-                        .collect();
+                    let embeddings: Vec<Vec<f32>> =
+                        response.data.into_iter().map(|d| d.embedding).collect();
                     Ok(json!(embeddings))
                 }
             }
@@ -154,12 +155,8 @@ pub fn register_ai_methods(
                 let Some(query_embedding) = response.data.first().map(|d| &d.embedding) else {
                     return Err(jsonrpc_core::Error::internal_error());
                 };
-                let doc_embeddings: Vec<&Vec<f32>> = response
-                    .data
-                    .iter()
-                    .skip(1)
-                    .map(|d| &d.embedding)
-                    .collect();
+                let doc_embeddings: Vec<&Vec<f32>> =
+                    response.data.iter().skip(1).map(|d| &d.embedding).collect();
 
                 // Calculate cosine similarity scores
                 let mut scored_docs: Vec<(usize, f32, String)> = documents
@@ -173,7 +170,8 @@ pub fn register_ai_methods(
                     .collect();
 
                 // Sort by similarity (descending)
-                scored_docs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                scored_docs
+                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
                 // Take top_k results
                 let results: Vec<serde_json::Value> = scored_docs
@@ -252,13 +250,13 @@ pub fn register_ai_methods(
         match block_on(api.chat_completions(request, None)) {
             Ok(response) => {
                 // Return full response
-                Ok(serde_json::to_value(response).map_err(|e| {
-                    jsonrpc_core::Error {
+                Ok(
+                    serde_json::to_value(response).map_err(|e| jsonrpc_core::Error {
                         code: jsonrpc_core::ErrorCode::ServerError(-32000),
                         message: "Failed to serialize response".to_string(),
                         data: Some(json!({"error": e.to_string()})),
-                    }
-                })?)
+                    })?,
+                )
             }
             Err(e) => Err(jsonrpc_core::Error {
                 code: jsonrpc_core::ErrorCode::ServerError(-32000),

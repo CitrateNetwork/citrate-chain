@@ -205,9 +205,9 @@ impl ModelCache {
         if let Some(model_id) = queue.pop_back() {
             if let Some(cached) = self.cache.write().await.remove(&model_id) {
                 {
-                let mut size = self.current_size.write().await;
-                *size = size.saturating_sub(cached.size);
-            }
+                    let mut size = self.current_size.write().await;
+                    *size = size.saturating_sub(cached.size);
+                }
 
                 debug!(
                     "Evicted model {:?} from cache (LRU)",
@@ -463,6 +463,9 @@ mod tests {
             stats.current_size, size_after_first,
             "re-inserting the same key must not drift current_size"
         );
-        assert_eq!(stats.total_models, 1, "re-insert must not duplicate the entry");
+        assert_eq!(
+            stats.total_models, 1,
+            "re-insert must not duplicate the entry"
+        );
     }
 }

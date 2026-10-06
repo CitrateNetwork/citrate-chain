@@ -95,8 +95,8 @@ pub fn verify_model_integrity(model_dir: &Path) -> Result<bool, String> {
             return Err(format!("Missing file: {}", file_part));
         }
 
-        let file_bytes =
-            std::fs::read(&file_path).map_err(|e| format!("Failed to read {}: {}", file_part, e))?;
+        let file_bytes = std::fs::read(&file_path)
+            .map_err(|e| format!("Failed to read {}: {}", file_part, e))?;
 
         let mut hasher = Sha256::new();
         hasher.update(&file_bytes);

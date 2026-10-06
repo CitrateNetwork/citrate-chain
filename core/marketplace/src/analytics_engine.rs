@@ -52,11 +52,7 @@
 // For production deployments requiring historical analytics, configure external
 // metrics aggregation before go-live.
 
-use crate::{
-    performance_tracker::*,
-    rating_system::*,
-    types::*,
-};
+use crate::{performance_tracker::*, rating_system::*, types::*};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -227,19 +223,18 @@ impl AnalyticsEngine {
         let performance_analysis = self.analyze_performance(model_id).await?;
         let user_engagement = self.analyze_user_engagement(model_id).await?;
         let market_position = self.analyze_market_position(model_id).await?;
-        let recommendations = self.generate_recommendations(
-            model_id,
-            &rating_analysis,
-            &performance_analysis,
-            &user_engagement,
-        ).await?;
+        let recommendations = self
+            .generate_recommendations(
+                model_id,
+                &rating_analysis,
+                &performance_analysis,
+                &user_engagement,
+            )
+            .await?;
 
         // Calculate overall score
-        let overall_score = self.calculate_overall_score(
-            &rating_analysis,
-            &performance_analysis,
-            &user_engagement,
-        );
+        let overall_score =
+            self.calculate_overall_score(&rating_analysis, &performance_analysis, &user_engagement);
 
         Ok(ModelAnalyticsReport {
             model_id: *model_id,
@@ -254,7 +249,10 @@ impl AnalyticsEngine {
     }
 
     /// Get comparative analytics for multiple models
-    pub async fn compare_models(&self, model_ids: &[ModelId]) -> Result<HashMap<ModelId, ModelAnalyticsReport>> {
+    pub async fn compare_models(
+        &self,
+        model_ids: &[ModelId],
+    ) -> Result<HashMap<ModelId, ModelAnalyticsReport>> {
         let mut reports = HashMap::new();
 
         for model_id in model_ids {
@@ -284,7 +282,10 @@ impl AnalyticsEngine {
     // Private analysis methods
 
     async fn analyze_ratings(&self, model_id: &ModelId) -> Result<RatingAnalysis> {
-        let model_rating = self.rating_system.get_model_rating(model_id).await
+        let model_rating = self
+            .rating_system
+            .get_model_rating(model_id)
+            .await
             .unwrap_or_else(|| ModelRating {
                 model_id: *model_id,
                 average_rating: 0.0,
@@ -296,7 +297,10 @@ impl AnalyticsEngine {
                 last_updated: Utc::now(),
             });
 
-        let reviews = self.rating_system.get_model_reviews(model_id, 100, ReviewSortOrder::Newest).await;
+        let reviews = self
+            .rating_system
+            .get_model_reviews(model_id, 100, ReviewSortOrder::Newest)
+            .await;
 
         // Calculate rating trend
         let rating_trend = self.calculate_rating_trend(&reviews);
@@ -305,21 +309,29 @@ impl AnalyticsEngine {
         let review_quality_score = if reviews.is_empty() {
             0.0
         } else {
-            reviews.iter().map(|r| {
-                (r.quality.helpfulness_score * 0.3) +
-                (r.quality.detail_score * 0.3) +
-                (r.quality.reviewer_credibility * 0.2) +
-                (if r.quality.verified_purchase { 0.2 } else { 0.0 })
-            }).sum::<f32>() / reviews.len() as f32
+            reviews
+                .iter()
+                .map(|r| {
+                    (r.quality.helpfulness_score * 0.3)
+                        + (r.quality.detail_score * 0.3)
+                        + (r.quality.reviewer_credibility * 0.2)
+                        + (if r.quality.verified_purchase {
+                            0.2
+                        } else {
+                            0.0
+                        })
+                })
+                .sum::<f32>()
+                / reviews.len() as f32
         };
 
         // Analyze sentiment
         let sentiment_analysis = self.analyze_review_sentiment(&reviews);
 
         // Calculate user satisfaction index
-        let user_satisfaction_index = (model_rating.weighted_rating / 5.0) * 0.6 +
-                                     (review_quality_score * 0.2) +
-                                     ((sentiment_analysis.overall_sentiment + 1.0) / 2.0 * 0.2);
+        let user_satisfaction_index = (model_rating.weighted_rating / 5.0) * 0.6
+            + (review_quality_score * 0.2)
+            + ((sentiment_analysis.overall_sentiment + 1.0) / 2.0 * 0.2);
 
         Ok(RatingAnalysis {
             current_rating: model_rating.weighted_rating,
@@ -333,7 +345,10 @@ impl AnalyticsEngine {
 
     async fn analyze_performance(&self, model_id: &ModelId) -> Result<PerformanceAnalysis> {
         let health_status = self.performance_tracker.get_model_health(model_id).await;
-        let benchmark_results = self.performance_tracker.get_benchmark_results(model_id, 10).await;
+        let benchmark_results = self
+            .performance_tracker
+            .get_benchmark_results(model_id, 10)
+            .await;
 
         let (reliability_score, speed_score, efficiency_score, scalability_score) =
             if let Some(health) = &health_status {
@@ -445,7 +460,8 @@ impl AnalyticsEngine {
                 category: RecommendationCategory::Performance,
                 priority: RecommendationPriority::High,
                 title: "Optimize Response Times".to_string(),
-                description: "Reduce latency to improve user experience and satisfaction.".to_string(),
+                description: "Reduce latency to improve user experience and satisfaction."
+                    .to_string(),
                 expected_impact: 0.7,
                 implementation_difficulty: 0.7,
             });
@@ -468,7 +484,9 @@ impl AnalyticsEngine {
                 category: RecommendationCategory::UserExperience,
                 priority: RecommendationPriority::Medium,
                 title: "Improve User Sentiment".to_string(),
-                description: "Focus on features and improvements that address negative sentiment themes.".to_string(),
+                description:
+                    "Focus on features and improvements that address negative sentiment themes."
+                        .to_string(),
                 expected_impact: 0.6,
                 implementation_difficulty: 0.4,
             });
@@ -488,15 +506,16 @@ impl AnalyticsEngine {
         let engagement_weight = 0.3;
 
         let rating_score = rating_analysis.user_satisfaction_index;
-        let performance_score = performance_analysis.reliability_score * 0.3 +
-            performance_analysis.speed_score * 0.3 +
-            performance_analysis.efficiency_score * 0.2 +
-            performance_analysis.scalability_score * 0.2;
+        let performance_score = performance_analysis.reliability_score * 0.3
+            + performance_analysis.speed_score * 0.3
+            + performance_analysis.efficiency_score * 0.2
+            + performance_analysis.scalability_score * 0.2;
         let engagement_score = user_engagement.engagement_score;
 
-        (rating_score * rating_weight +
-         performance_score * performance_weight +
-         engagement_score * engagement_weight).clamp(0.0, 1.0)
+        (rating_score * rating_weight
+            + performance_score * performance_weight
+            + engagement_score * engagement_weight)
+            .clamp(0.0, 1.0)
     }
 
     fn calculate_rating_trend(&self, reviews: &[EnhancedUserReview]) -> RatingTrend {
@@ -505,7 +524,13 @@ impl AnalyticsEngine {
         }
 
         let recent_avg = reviews.iter().take(3).map(|r| r.review.rating).sum::<f32>() / 3.0;
-        let older_avg = reviews.iter().skip(3).take(3).map(|r| r.review.rating).sum::<f32>() / 3.0;
+        let older_avg = reviews
+            .iter()
+            .skip(3)
+            .take(3)
+            .map(|r| r.review.rating)
+            .sum::<f32>()
+            / 3.0;
 
         let diff = recent_avg - older_avg;
 
@@ -530,7 +555,8 @@ impl AnalyticsEngine {
             };
         }
 
-        let sentiments: Vec<f32> = reviews.iter()
+        let sentiments: Vec<f32> = reviews
+            .iter()
             .filter_map(|r| r.sentiment_analysis.as_ref())
             .map(|s| s.overall_sentiment)
             .collect();
@@ -549,20 +575,39 @@ impl AnalyticsEngine {
             .saturating_sub(negative_count);
 
         let total = sentiments.len() as f32;
-        let positive_percentage = if total > 0.0 { positive_count as f32 / total * 100.0 } else { 0.0 };
-        let negative_percentage = if total > 0.0 { negative_count as f32 / total * 100.0 } else { 0.0 };
-        let neutral_percentage = if total > 0.0 { neutral_count as f32 / total * 100.0 } else { 100.0 };
+        let positive_percentage = if total > 0.0 {
+            positive_count as f32 / total * 100.0
+        } else {
+            0.0
+        };
+        let negative_percentage = if total > 0.0 {
+            negative_count as f32 / total * 100.0
+        } else {
+            0.0
+        };
+        let neutral_percentage = if total > 0.0 {
+            neutral_count as f32 / total * 100.0
+        } else {
+            100.0
+        };
 
         // Calculate sentiment trend
         let sentiment_trend = if reviews.len() >= 6 {
-            let recent_sentiment = reviews.iter().take(3)
+            let recent_sentiment = reviews
+                .iter()
+                .take(3)
                 .filter_map(|r| r.sentiment_analysis.as_ref())
                 .map(|s| s.overall_sentiment)
-                .sum::<f32>() / 3.0;
-            let older_sentiment = reviews.iter().skip(3).take(3)
+                .sum::<f32>()
+                / 3.0;
+            let older_sentiment = reviews
+                .iter()
+                .skip(3)
+                .take(3)
                 .filter_map(|r| r.sentiment_analysis.as_ref())
                 .map(|s| s.overall_sentiment)
-                .sum::<f32>() / 3.0;
+                .sum::<f32>()
+                / 3.0;
 
             if recent_sentiment > older_sentiment + 0.1 {
                 SentimentTrend::ImprovingPositivity
@@ -585,7 +630,10 @@ impl AnalyticsEngine {
         }
     }
 
-    fn calculate_benchmark_comparison(&self, _benchmark_results: &[BenchmarkResult]) -> BenchmarkComparison {
+    fn calculate_benchmark_comparison(
+        &self,
+        _benchmark_results: &[BenchmarkResult],
+    ) -> BenchmarkComparison {
         // Placeholder implementation
         BenchmarkComparison {
             vs_category_average: 0.0,
@@ -598,9 +646,7 @@ impl AnalyticsEngine {
     async fn analyze_uptime(&self, model_id: &ModelId) -> Result<UptimeAnalysis> {
         let health_status = self.performance_tracker.get_model_health(model_id).await;
 
-        let current_uptime = health_status
-            .map(|h| h.uptime_percentage)
-            .unwrap_or(0.0);
+        let current_uptime = health_status.map(|h| h.uptime_percentage).unwrap_or(0.0);
 
         Ok(UptimeAnalysis {
             current_uptime,

@@ -38,9 +38,7 @@ pub struct MCPService {
 }
 
 impl MCPService {
-    pub fn new(
-        storage: Arc<citrate_storage::StorageManager>,
-    ) -> Self {
+    pub fn new(storage: Arc<citrate_storage::StorageManager>) -> Self {
         let model_registry = Arc::new(registry::ModelRegistry::new(storage.clone()));
         let provider_registry = Arc::new(provider::ProviderRegistry::new());
         let cache_size: u64 = std::env::var("CITRATE_MODEL_CACHE_SIZE")

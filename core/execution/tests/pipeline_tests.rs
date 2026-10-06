@@ -2,8 +2,7 @@
 // Every test exercises the REAL Executor.execute_transaction() pipeline.
 
 use citrate_consensus::types::{
-    Block, BlockBuilder, Hash, PublicKey, Signature,
-    Transaction as ConsensusTransaction, VrfProof,
+    Block, BlockBuilder, Hash, PublicKey, Signature, Transaction as ConsensusTransaction, VrfProof,
 };
 use citrate_execution::{address_utils, types::*, Executor, StateDB};
 use primitive_types::U256;
@@ -210,7 +209,10 @@ fn test_transfer_zero_value_uses_gas() {
         .expect("Zero-value transfer should succeed");
 
     assert!(receipt.status, "Zero-value transfer should succeed");
-    assert!(receipt.gas_used > 0, "Gas must be consumed even for zero-value transfers");
+    assert!(
+        receipt.gas_used > 0,
+        "Gas must be consumed even for zero-value transfers"
+    );
 
     let final_balance = executor.get_balance(&sender_addr);
     assert!(
@@ -508,10 +510,7 @@ fn test_contract_deployment_stores_code() {
     let deployer_addr = make_address(120);
 
     // Fund deployer generously
-    executor.set_balance(
-        &deployer_addr,
-        U256::from(10u64).pow(U256::from(18u64)),
-    );
+    executor.set_balance(&deployer_addr, U256::from(10u64).pow(U256::from(18u64)));
 
     // Minimal init code that returns 0x42 as runtime code:
     // PUSH1 0x01      (60 01) — size of runtime code
@@ -529,11 +528,11 @@ fn test_contract_deployment_stores_code() {
         0x60, 0x01, // PUSH1 0x01 (runtime code size = 1 byte)
         0x60, 0x0a, // PUSH1 0x0a (runtime code offset in init = 10)
         0x60, 0x00, // PUSH1 0x00 (memory dest)
-        0x39,       // CODECOPY
+        0x39, // CODECOPY
         0x60, 0x01, // PUSH1 0x01 (return size)
         0x60, 0x00, // PUSH1 0x00 (return offset)
-        0xf3,       // RETURN
-        0x00,       // STOP (this is the runtime code)
+        0xf3, // RETURN
+        0x00, // STOP (this is the runtime code)
     ];
 
     let tx = deploy_tx(deployer_pk, init_code, 0, 1_000_000, 1);
@@ -582,7 +581,15 @@ fn test_call_nonexistent_contract() {
     executor.set_balance(&caller_addr, U256::from(1_000_000u64));
 
     // Call a contract address that has no code — just some arbitrary calldata
-    let tx = call_tx(caller_pk, target_pk, vec![0xDE, 0xAD, 0xBE, 0xEF], 0, 0, 100_000, 1);
+    let tx = call_tx(
+        caller_pk,
+        target_pk,
+        vec![0xDE, 0xAD, 0xBE, 0xEF],
+        0,
+        0,
+        100_000,
+        1,
+    );
     let receipt = rt()
         .block_on(executor.execute_transaction(&block, &tx))
         .expect("Call to empty address should not hard-error");
@@ -637,7 +644,11 @@ fn test_stack_overflow_1025_pushes() {
                 "Sender balance must not increase after executing stack-overflow bytecode"
             );
             // Nonce should have incremented (tx was processed)
-            assert_eq!(executor.get_nonce(&caller_addr), 1, "Nonce should increment");
+            assert_eq!(
+                executor.get_nonce(&caller_addr),
+                1,
+                "Nonce should increment"
+            );
         }
         Err(_) => {
             // Error is acceptable — the executor caught the overflow.
@@ -677,7 +688,11 @@ fn test_invalid_opcode_reverts() {
                 "Sender balance must not increase after INVALID opcode execution"
             );
             // Nonce should have incremented (tx was processed)
-            assert_eq!(executor.get_nonce(&caller_addr), 1, "Nonce should increment");
+            assert_eq!(
+                executor.get_nonce(&caller_addr),
+                1,
+                "Nonce should increment"
+            );
         }
         Err(_) => {
             // Halt/Revert error is also acceptable
@@ -779,5 +794,9 @@ fn r2_res_04_reverting_tx_receipt_reports_full_gas_limit() {
         U256::from(header_gas_used) * U256::from(GAS_PRICE),
         "gas actually charged to the sender must equal the summed receipt gas_used"
     );
-    assert_eq!(executor.get_nonce(&caller_addr), N, "every tx must have advanced the nonce");
+    assert_eq!(
+        executor.get_nonce(&caller_addr),
+        N,
+        "every tx must have advanced the nonce"
+    );
 }

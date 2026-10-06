@@ -15,8 +15,8 @@
 //! - Import of malformed keys
 //! - Mnemonic recovery edge cases
 
-use citrate_wallet_core::keys::{KeyManager};
 use citrate_wallet_core::error::WalletError;
+use citrate_wallet_core::keys::KeyManager;
 use std::path::PathBuf;
 
 fn test_path(_name: &str) -> PathBuf {
@@ -31,15 +31,22 @@ fn test_path(_name: &str) -> PathBuf {
 async fn test_wrong_password_returns_invalid_not_data() {
     let path = test_path("brute1");
     let mgr = KeyManager::new(&path);
-    mgr.create_account("correctpassword1", "Primary").expect("create");
+    mgr.create_account("correctpassword1", "Primary")
+        .expect("create");
 
     // Wrong passwords should return InvalidPassword, never partial decryption
-    for wrong in ["wrong1234567", "CORRECTPASSWORD1", "correctpassword", "correctpassword1!"] {
+    for wrong in [
+        "wrong1234567",
+        "CORRECTPASSWORD1",
+        "correctpassword",
+        "correctpassword1!",
+    ] {
         let result = mgr.unlock(wrong);
         assert!(
             matches!(result, Err(WalletError::InvalidPassword)),
             "Wrong password '{}' should return InvalidPassword, got {:?}",
-            wrong, result
+            wrong,
+            result
         );
     }
     std::fs::remove_dir_all(&path).ok();
@@ -90,7 +97,9 @@ async fn test_password_with_special_characters() {
 async fn test_cannot_get_key_when_locked() {
     let path = test_path("locked_extract");
     let mgr = KeyManager::new(&path);
-    let result = mgr.create_account("strongpassword1", "Primary").expect("create");
+    let result = mgr
+        .create_account("strongpassword1", "Primary")
+        .expect("create");
 
     // Never unlocked — should not be able to get key
     let err = mgr.get_signing_key(&result.address);
@@ -109,14 +118,18 @@ async fn test_cannot_get_key_when_locked() {
 async fn test_export_requires_password() {
     let path = test_path("export_pwd");
     let mgr = KeyManager::new(&path);
-    let result = mgr.create_account("strongpassword1", "Primary").expect("create");
+    let result = mgr
+        .create_account("strongpassword1", "Primary")
+        .expect("create");
 
     // Wrong password should not export
     let err = mgr.export_private_key(&result.address, "wrongpassword!");
     assert!(err.is_err());
 
     // Correct password should export
-    let exported = mgr.export_private_key(&result.address, "strongpassword1").expect("export");
+    let exported = mgr
+        .export_private_key(&result.address, "strongpassword1")
+        .expect("export");
     assert_eq!(exported.len(), 64); // 32 bytes hex
 
     std::fs::remove_dir_all(&path).ok();
@@ -126,7 +139,9 @@ async fn test_export_requires_password() {
 async fn test_delete_requires_password() {
     let path = test_path("delete_pwd");
     let mgr = KeyManager::new(&path);
-    let result = mgr.create_account("strongpassword1", "Primary").expect("create");
+    let result = mgr
+        .create_account("strongpassword1", "Primary")
+        .expect("create");
 
     // Wrong password should not delete
     let err = mgr.delete_account(&result.address, "wrongpassword!");
@@ -134,7 +149,8 @@ async fn test_delete_requires_password() {
     assert!(!mgr.is_empty(), "Account should still exist");
 
     // Correct password should delete
-    mgr.delete_account(&result.address, "strongpassword1").expect("delete");
+    mgr.delete_account(&result.address, "strongpassword1")
+        .expect("delete");
     assert!(mgr.is_empty());
 
     std::fs::remove_dir_all(&path).ok();
@@ -153,7 +169,10 @@ async fn test_corrupted_keystore_file() {
 
     let mgr = KeyManager::new(&path);
     let result = mgr.load();
-    assert!(result.is_err(), "Loading corrupted keystore should fail gracefully");
+    assert!(
+        result.is_err(),
+        "Loading corrupted keystore should fail gracefully"
+    );
 
     std::fs::remove_dir_all(&path).ok();
 }
@@ -175,7 +194,8 @@ async fn test_empty_keystore_file() {
 async fn test_keystore_with_tampered_ciphertext() {
     let path = test_path("tampered");
     let mgr = KeyManager::new(&path);
-    mgr.create_account("strongpassword1", "Primary").expect("create");
+    mgr.create_account("strongpassword1", "Primary")
+        .expect("create");
 
     // Read the keystore file
     let content = std::fs::read_to_string(path.join("keys.json")).expect("read");
@@ -230,7 +250,9 @@ async fn test_import_all_ff_key() {
 async fn test_import_too_short_key() {
     let path = test_path("short_key");
     let mgr = KeyManager::new(&path);
-    assert!(mgr.import_account("deadbeef", "password12", "Short").is_err());
+    assert!(mgr
+        .import_account("deadbeef", "password12", "Short")
+        .is_err());
     std::fs::remove_dir_all(&path).ok();
 }
 
@@ -247,7 +269,13 @@ async fn test_import_too_long_key() {
 async fn test_import_non_hex_key() {
     let path = test_path("nonhex_key");
     let mgr = KeyManager::new(&path);
-    assert!(mgr.import_account("gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg", "password12", "NonHex").is_err());
+    assert!(mgr
+        .import_account(
+            "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+            "password12",
+            "NonHex"
+        )
+        .is_err());
     std::fs::remove_dir_all(&path).ok();
 }
 
@@ -259,7 +287,8 @@ async fn test_import_non_hex_key() {
 async fn test_concurrent_unlock_lock() {
     let path = test_path("concurrent");
     let mgr = std::sync::Arc::new(KeyManager::new(&path));
-    mgr.create_account("strongpassword1", "Primary").expect("create");
+    mgr.create_account("strongpassword1", "Primary")
+        .expect("create");
 
     let mut handles = vec![];
     for _ in 0..10 {
@@ -305,7 +334,10 @@ async fn test_concurrent_create_accounts() {
     // The important thing: no panics, no corruption, at least some accounts created
     assert!(created >= 1, "At least 1 concurrent create should succeed");
     let accounts = mgr.list_accounts();
-    assert!(!accounts.is_empty(), "At least 1 account should exist in memory");
+    assert!(
+        !accounts.is_empty(),
+        "At least 1 account should exist in memory"
+    );
 
     std::fs::remove_dir_all(&path).ok();
 }
@@ -318,8 +350,11 @@ async fn test_concurrent_create_accounts() {
 async fn test_mnemonic_case_sensitivity() {
     let path = test_path("mnemonic_case");
     let mgr = KeyManager::new(&path);
-    let result = mgr.create_account("strongpassword1", "Primary").expect("create");
-    mgr.delete_account(&result.address, "strongpassword1").expect("delete");
+    let result = mgr
+        .create_account("strongpassword1", "Primary")
+        .expect("create");
+    mgr.delete_account(&result.address, "strongpassword1")
+        .expect("delete");
 
     // Try recovering with uppercase mnemonic
     let upper = result.mnemonic.to_uppercase();
@@ -335,11 +370,18 @@ async fn test_mnemonic_case_sensitivity() {
 async fn test_mnemonic_extra_whitespace() {
     let path = test_path("mnemonic_space");
     let mgr = KeyManager::new(&path);
-    let result = mgr.create_account("strongpassword1", "Primary").expect("create");
-    mgr.delete_account(&result.address, "strongpassword1").expect("delete");
+    let result = mgr
+        .create_account("strongpassword1", "Primary")
+        .expect("create");
+    mgr.delete_account(&result.address, "strongpassword1")
+        .expect("delete");
 
     // Add extra spaces between words
-    let spaced = result.mnemonic.split_whitespace().collect::<Vec<_>>().join("  ");
+    let spaced = result
+        .mnemonic
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("  ");
     let recovery = mgr.recover_from_mnemonic(&spaced, "strongpassword1", "Spaced");
     // Should handle gracefully — either accept or return clear error
     let _ = recovery;
@@ -358,10 +400,17 @@ async fn test_ed25519_and_secp256k1_produce_different_addresses() {
     let path = test_path("addr_diff");
     let mgr = KeyManager::new(&path);
 
-    let ed = mgr.create_account("strongpassword1", "Ed25519").expect("create ed");
-    let secp = mgr.create_secp256k1_account("strongpassword1", "Secp").expect("create secp");
+    let ed = mgr
+        .create_account("strongpassword1", "Ed25519")
+        .expect("create ed");
+    let secp = mgr
+        .create_secp256k1_account("strongpassword1", "Secp")
+        .expect("create secp");
 
-    assert_ne!(ed.address, secp.address, "Different key types must produce different addresses");
+    assert_ne!(
+        ed.address, secp.address,
+        "Different key types must produce different addresses"
+    );
     std::fs::remove_dir_all(&path).ok();
 }
 
@@ -371,10 +420,18 @@ async fn test_address_format_consistency() {
     let mgr = KeyManager::new(&path);
 
     for i in 0..10 {
-        let result = mgr.create_account("strongpassword1", &format!("Test {}", i))
+        let result = mgr
+            .create_account("strongpassword1", &format!("Test {}", i))
             .expect("create");
-        assert!(result.address.starts_with("0x"), "Address must start with 0x");
-        assert_eq!(result.address.len(), 42, "Address must be 42 chars (0x + 40 hex)");
+        assert!(
+            result.address.starts_with("0x"),
+            "Address must start with 0x"
+        );
+        assert_eq!(
+            result.address.len(),
+            42,
+            "Address must be 42 chars (0x + 40 hex)"
+        );
         // All hex characters
         assert!(
             result.address[2..].chars().all(|c| c.is_ascii_hexdigit()),
@@ -393,7 +450,9 @@ async fn test_address_format_consistency() {
 async fn test_sign_with_ed25519_produces_valid_length() {
     let path = test_path("sign_ed");
     let mgr = KeyManager::new(&path);
-    let result = mgr.create_account("strongpassword1", "Primary").expect("create");
+    let result = mgr
+        .create_account("strongpassword1", "Primary")
+        .expect("create");
     mgr.unlock("strongpassword1").expect("unlock");
 
     let key = mgr.get_signing_key(&result.address).expect("get key");
@@ -406,7 +465,9 @@ async fn test_sign_with_ed25519_produces_valid_length() {
 async fn test_sign_with_secp256k1_produces_valid_length() {
     let path = test_path("sign_secp");
     let mgr = KeyManager::new(&path);
-    let result = mgr.create_secp256k1_account("strongpassword1", "EVM").expect("create");
+    let result = mgr
+        .create_secp256k1_account("strongpassword1", "EVM")
+        .expect("create");
     mgr.unlock("strongpassword1").expect("unlock");
 
     let key = mgr.get_signing_key(&result.address).expect("get key");
@@ -419,7 +480,8 @@ async fn test_sign_with_secp256k1_produces_valid_length() {
 async fn test_sign_empty_message() {
     let path = test_path("sign_empty");
     let mgr = KeyManager::new(&path);
-    mgr.create_account("strongpassword1", "Primary").expect("create");
+    mgr.create_account("strongpassword1", "Primary")
+        .expect("create");
     mgr.unlock("strongpassword1").expect("unlock");
     let accounts = mgr.list_accounts();
     let key = mgr.get_signing_key(&accounts[0].address).expect("key");
@@ -432,7 +494,8 @@ async fn test_sign_empty_message() {
 async fn test_sign_large_message() {
     let path = test_path("sign_large");
     let mgr = KeyManager::new(&path);
-    mgr.create_account("strongpassword1", "Primary").expect("create");
+    mgr.create_account("strongpassword1", "Primary")
+        .expect("create");
     mgr.unlock("strongpassword1").expect("unlock");
     let accounts = mgr.list_accounts();
     let key = mgr.get_signing_key(&accounts[0].address).expect("key");
@@ -446,7 +509,8 @@ async fn test_sign_large_message() {
 async fn test_sign_deterministic() {
     let path = test_path("sign_det");
     let mgr = KeyManager::new(&path);
-    mgr.create_account("strongpassword1", "Primary").expect("create");
+    mgr.create_account("strongpassword1", "Primary")
+        .expect("create");
     mgr.unlock("strongpassword1").expect("unlock");
     let accounts = mgr.list_accounts();
     let key = mgr.get_signing_key(&accounts[0].address).expect("key");

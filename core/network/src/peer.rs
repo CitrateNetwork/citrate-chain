@@ -1,11 +1,11 @@
 // citrate/core/network/src/peer.rs
 
 // Peer connection and management
-use crate::{NetworkError, NetworkMessage, ProtocolVersion};
 use crate::protocol::MAX_INBOUND_MESSAGE_BYTES;
+use crate::{NetworkError, NetworkMessage, ProtocolVersion};
+use citrate_consensus::types::Hash;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
-use citrate_consensus::types::Hash;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -523,14 +523,15 @@ impl PeerManager {
             let mut stats = self.stats.write().await;
             stats.total_connected = stats.total_connected.saturating_sub(1);
             match old_dir {
-                Direction::Inbound => {
-                    stats.inbound_count = stats.inbound_count.saturating_sub(1)
-                }
+                Direction::Inbound => stats.inbound_count = stats.inbound_count.saturating_sub(1),
                 Direction::Outbound => {
                     stats.outbound_count = stats.outbound_count.saturating_sub(1)
                 }
             }
-            debug!("Closed superseded connection for reconnecting peer {}", peer_id);
+            debug!(
+                "Closed superseded connection for reconnecting peer {}",
+                peer_id
+            );
         }
 
         // Check limits (the reconnecting peer is now NOT double-counted against them).
@@ -650,11 +651,7 @@ impl PeerManager {
     /// the map for `total`.
     pub async fn get_peer_counts(&self) -> (usize, usize, usize) {
         let stats = self.stats.read().await;
-        (
-            self.peers.len(),
-            stats.inbound_count,
-            stats.outbound_count,
-        )
+        (self.peers.len(), stats.inbound_count, stats.outbound_count)
     }
 
     /// Ban a peer for the configured ban duration.
@@ -666,7 +663,10 @@ impl PeerManager {
         let expires = ban_expiry(self.config.ban_duration);
         self.banned_peers.insert(addr, expires);
         self.banned_ips.insert(addr.ip(), expires);
-        warn!("Banned peer {} until {:?} ({:?} from now)", addr, expires, self.config.ban_duration);
+        warn!(
+            "Banned peer {} until {:?} ({:?} from now)",
+            addr, expires, self.config.ban_duration
+        );
     }
 
     /// Ban a peer by identity AND address/IP.
@@ -912,7 +912,7 @@ async fn handle_incoming(
             peer_id,
             version,
             nid == network_id,
-            remote_genesis == local_genesis_hash,  // GenesisBinding invariant (P2PPeerHandshake.tla)
+            remote_genesis == local_genesis_hash, // GenesisBinding invariant (P2PPeerHandshake.tla)
         ),
         _ => return Err(NetworkError::ProtocolError("Expected Hello".into())),
     };
@@ -965,7 +965,8 @@ async fn handle_incoming(
             Ok(b) => b,
             Err(_) => break,
         };
-        if let Ok(msg) = NetworkMessage::decode_inbound(&bytes) { // SECURITY: C-01 network-variant sanitize at decode
+        if let Ok(msg) = NetworkMessage::decode_inbound(&bytes) {
+            // SECURITY: C-01 network-variant sanitize at decode
             // Basic responses
             match msg {
                 NetworkMessage::Ping { nonce } => {
@@ -1080,7 +1081,8 @@ async fn perform_handshake_outbound(
     tokio::spawn(async move {
         while let Some(frame) = stream.next().await {
             if let Ok(bytes) = frame {
-                if let Ok(msg) = NetworkMessage::decode_inbound(&bytes) { // SECURITY: C-01 network-variant sanitize at decode
+                if let Ok(msg) = NetworkMessage::decode_inbound(&bytes) {
+                    // SECURITY: C-01 network-variant sanitize at decode
                     if let Some(tx) = pm2.incoming.read().await.clone() {
                         let _ = tx.send((peer_id.clone(), msg)).await;
                     }
@@ -1110,7 +1112,6 @@ where
     let bytes = bincode::serialize(msg).map_err(|e| NetworkError::DecodeError(e.to_string()))?;
     sink.send(bytes.into()).await.map_err(NetworkError::Io)
 }
-
 
 /// When a ban of `duration` ends. An absurdly large configured duration (past
 /// `Instant`'s range) is treated as a one-year ban instead of panicking.
@@ -1209,7 +1210,10 @@ mod tests {
         // reporting a bug. Verified: against the pre-fix `.await` this test ran
         // past 60s with no verdict.
         let send = |m| tokio::time::timeout(std::time::Duration::from_secs(2), peer.send(m));
-        send(ping()).await.expect("must not block").expect("first fits");
+        send(ping())
+            .await
+            .expect("must not block")
+            .expect("first fits");
         assert!(
             send(ping()).await.expect("must not block").is_err(),
             "second is shed"
@@ -1218,7 +1222,10 @@ mod tests {
 
         // The writer drains one frame — the peer is reading again.
         rx.recv().await.expect("drained");
-        send(ping()).await.expect("must not block").expect("room again");
+        send(ping())
+            .await
+            .expect("must not block")
+            .expect("room again");
         assert_eq!(
             peer.info.read().await.send_drops,
             0,
@@ -1280,7 +1287,11 @@ mod tests {
         info.head_height = 500_000;
         let peer = Arc::new(Peer::new(info, send_tx, recv_rx));
         pm.add_peer(peer.clone()).await.expect("registers");
-        assert_eq!(pm.get_all_peers().len(), 1, "peer is registered and selectable");
+        assert_eq!(
+            pm.get_all_peers().len(),
+            1,
+            "peer is registered and selectable"
+        );
 
         // The writer task returns — this is precisely what every one of its four
         // exit paths does (encrypt fail, send error, WRITE_TIMEOUT, encode fail).
@@ -1336,7 +1347,10 @@ mod tests {
 
         // The writer task owns the receiver. Its death closes the channel.
         drop(rx);
-        assert!(!peer.is_closed(), "not closed until we discover the dead channel");
+        assert!(
+            !peer.is_closed(),
+            "not closed until we discover the dead channel"
+        );
 
         let res = tokio::time::timeout(std::time::Duration::from_secs(2), peer.send(ping()))
             .await
@@ -1409,7 +1423,11 @@ mod tests {
              resolve to while the peer receives nothing"
         );
         assert!(!second.is_closed(), "the live connection stays open");
-        assert_eq!(manager.get_peer_counts().await.0, 1, "still exactly one peer");
+        assert_eq!(
+            manager.get_peer_counts().await.0,
+            1,
+            "still exactly one peer"
+        );
     }
 
     /// Re-registering the SAME connection must not tear it down. Without the
@@ -1440,7 +1458,9 @@ mod tests {
         let peer = peer_with_id("noise_xyz", "10.0.0.2:30303", Direction::Outbound);
         manager.add_peer(peer.clone()).await.expect("add");
 
-        let removed = manager.remove_peer(&PeerId::new("noise_xyz".to_string())).await;
+        let removed = manager
+            .remove_peer(&PeerId::new("noise_xyz".to_string()))
+            .await;
         assert!(removed.is_some());
         assert!(peer.is_closed(), "remove_peer must close the connection");
     }
@@ -1577,9 +1597,17 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
         manager.cleanup_expired_bans();
 
-        assert_eq!(manager.banned_peers.len(), 0, "SocketAddr bans must be pruned");
+        assert_eq!(
+            manager.banned_peers.len(),
+            0,
+            "SocketAddr bans must be pruned"
+        );
         assert_eq!(manager.banned_ips.len(), 0, "IP bans must be pruned");
-        assert_eq!(manager.banned_peer_ids.len(), 0, "peer-ID bans must be pruned");
+        assert_eq!(
+            manager.banned_peer_ids.len(),
+            0,
+            "peer-ID bans must be pruned"
+        );
         assert!(!manager.is_banned(&addr).await);
         assert!(!manager.is_peer_id_banned(&peer_id).await);
     }
@@ -1674,7 +1702,10 @@ mod tests {
             );
         }
         let (total, inbound, outbound) = manager.get_peer_counts().await;
-        assert_eq!(inbound, 1, "five connects of one peer_id must count as one inbound, not leak");
+        assert_eq!(
+            inbound, 1,
+            "five connects of one peer_id must count as one inbound, not leak"
+        );
         assert_eq!(total, 1);
         assert_eq!(outbound, 0);
 
@@ -1709,7 +1740,11 @@ mod tests {
 
         let (tx, rx) = mpsc::channel(10);
         let live = Arc::new(Peer::new(
-            PeerInfo::new(pid.clone(), "127.0.0.1:9001".parse().expect("addr"), Direction::Inbound),
+            PeerInfo::new(
+                pid.clone(),
+                "127.0.0.1:9001".parse().expect("addr"),
+                Direction::Inbound,
+            ),
             tx,
             rx,
         ));
@@ -1719,7 +1754,11 @@ mod tests {
         // NOT evict the mapped peer.
         let (tx2, rx2) = mpsc::channel(10);
         let stale = Arc::new(Peer::new(
-            PeerInfo::new(pid.clone(), "127.0.0.1:9002".parse().expect("addr"), Direction::Inbound),
+            PeerInfo::new(
+                pid.clone(),
+                "127.0.0.1:9002".parse().expect("addr"),
+                Direction::Inbound,
+            ),
             tx2,
             rx2,
         ));

@@ -66,7 +66,9 @@ fn test_half_opposite_produces_all_both() {
 
     // 4 positive, 4 negative — equal trust
     let result = classify_belnap(
-        &[&e_pos, &e_neg, &e_pos, &e_neg, &e_pos, &e_neg, &e_pos, &e_neg],
+        &[
+            &e_pos, &e_neg, &e_pos, &e_neg, &e_pos, &e_neg, &e_pos, &e_neg,
+        ],
         &[&conf, &conf, &conf, &conf, &conf, &conf, &conf, &conf],
         &[10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0],
         1.0,
@@ -275,24 +277,14 @@ fn test_reduce_belnap_states_idempotent() {
     // Various classification matrices
     let test_cases: Vec<Vec<Vec<BelnapValue>>> = vec![
         vec![vec![True, False, Both, Neither]],
-        vec![
-            vec![True, True, False],
-            vec![False, True, True],
-        ],
+        vec![vec![True, True, False], vec![False, True, True]],
         vec![
             vec![Both, Neither, True],
             vec![Neither, Both, False],
             vec![True, False, Both],
         ],
-        vec![
-            vec![Neither; 8],
-            vec![True; 8],
-        ],
-        vec![
-            vec![Both; 4],
-            vec![Both; 4],
-            vec![Both; 4],
-        ],
+        vec![vec![Neither; 8], vec![True; 8]],
+        vec![vec![Both; 4], vec![Both; 4], vec![Both; 4]],
     ];
 
     for (i, classifications) in test_cases.iter().enumerate() {
@@ -392,7 +384,11 @@ fn test_extreme_confidence_values() {
     };
     let result = agg.aggregate_paraconsistent(&input).unwrap();
     for &v in &result.state_vector {
-        assert_eq!(v, BelnapValue::True, "identical with max confidence should be True");
+        assert_eq!(
+            v,
+            BelnapValue::True,
+            "identical with max confidence should be True"
+        );
     }
 
     // Test with slightly negative confidence (-0.1) — should be clamped to 0.0

@@ -9,9 +9,9 @@
 //! 2. The user can deploy without needing a JSON-RPC mediator —
 //!    they ship the raw bytes to the bundler.
 
-use ethabi::Token;
 #[cfg(test)]
 use ethabi::ParamType;
+use ethabi::Token;
 use ethereum_types::Address;
 use serde::{Deserialize, Serialize};
 
@@ -178,7 +178,10 @@ mod tests {
 
     #[test]
     fn guardian_install_data_layout_matches_onchain() {
-        let g = vec![Address::from_slice(&[0x01u8; 20]), Address::from_slice(&[0x02u8; 20])];
+        let g = vec![
+            Address::from_slice(&[0x01u8; 20]),
+            Address::from_slice(&[0x02u8; 20]),
+        ];
         let bytes = guardian_install_data(1, &g);
         assert_eq!(bytes.len(), 2 + 2 * 20);
         assert_eq!(bytes[0], 1);

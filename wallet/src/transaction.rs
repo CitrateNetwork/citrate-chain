@@ -1,7 +1,7 @@
 use crate::errors::WalletError;
-use ed25519_dalek::SigningKey;
 use citrate_consensus::types::{Hash, PublicKey, Signature, Transaction};
 use citrate_execution::types::Address;
+use ed25519_dalek::SigningKey;
 use primitive_types::U256;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};

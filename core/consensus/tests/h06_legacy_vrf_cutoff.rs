@@ -14,9 +14,7 @@
 // Sister doc: `docs/security/ECVRF_DEPRECATION_PLAN.md`.
 
 use citrate_consensus::types::{Hash, PublicKey, VrfProof};
-use citrate_consensus::vrf::{
-    VrfProposerSelector, DEFAULT_LEGACY_VRF_CUTOFF_HEIGHT,
-};
+use citrate_consensus::vrf::{VrfProposerSelector, DEFAULT_LEGACY_VRF_CUTOFF_HEIGHT};
 use sha3::{Digest, Sha3_256};
 
 fn legacy_forged_proof(proposer: &PublicKey, prev_vrf: &Hash, slot: u64) -> VrfProof {
@@ -177,11 +175,7 @@ fn h06_ecvrf_proofs_accepted_at_any_height() {
         let proof = selector
             .generate_vrf_proof(&secret, &proposer, &prev_vrf, slot)
             .expect("ECVRF prove");
-        assert_eq!(
-            proof.proof.len(),
-            114,
-            "ECVRF proof must be 114 bytes"
-        );
+        assert_eq!(proof.proof.len(), 114, "ECVRF proof must be 114 bytes");
         let ok = selector
             .verify_vrf_math_only(&proposer, &proof, &prev_vrf, slot)
             .expect("verify");
