@@ -3,7 +3,7 @@ title: "Agent precompile fork: LoRA, memory-anchor and agent-ops precompiles"
 created: 2026-10-01
 branch: hup/n5-chain-precompiles
 author: Larry Klosowski + Claude Opus 5.5
-updated: 2026-10-04
+updated: 2026-10-05
 status: ACCEPTED. Active at genesis of the 2026-10-05 40204 reroll (release pin height 0). The placeholder gas schedule is owner-signed (2026-10-04).
 chain: 40204
 ---
@@ -236,10 +236,14 @@ the same call revert with them. Registration, adapters, training and merge recor
 
 ## 7. Post-activation checks (operator, after genesis on 40204)
 
-A top-level call or `eth_call` whose `to` is a precompile address returns `0x` on a
-Citrate node at every height: the executor hands a top-level call to REVM only when the
-target account has code. The precompiles are reached from contract code. So the checks
-need a calling contract:
+Since D3 (reroll, `dgx/d3-toplevel-precompile`), a top-level transaction or `eth_call`
+whose `to` is a precompile address runs the precompile once the PBA hardening is active
+(40204: from block 1 of the reroll genesis). The executor sends a call to a code-less
+address through REVM whenever REVM registers that address as a precompile for the block
+(`revm_adapter::is_revm_precompile_at`), so the agent precompiles answer a direct
+`eth_call` the same way they answer contract code. Below the hardening height, and on
+older binaries, the old behaviour stays: such a call returns `0x`. The checks below still
+go through a calling contract, because that is the path the contracts use:
 
 1. Before H, on a devnet built from the release commit with
    `CITRATE_AGENT_PRECOMPILES_HEIGHT` set low: run `scripts/devnet-precompile-check.sh`.
