@@ -22,16 +22,12 @@
 
 use std::sync::Arc;
 
-use citrate_learning_daemon::aggregator::{
-    BelnapAggregator, EmbeddingEntry, MemoryEmbeddingCache,
-};
+use citrate_learning_daemon::aggregator::{BelnapAggregator, EmbeddingEntry, MemoryEmbeddingCache};
 use citrate_learning_daemon::chain::{ChainAdapter, FakeChain};
 use citrate_learning_daemon::finalizer::try_finalize_cycle;
 use citrate_learning_daemon::orchestrator::{Aggregator, Trainer};
 use citrate_learning_daemon::state::{CycleStatus, DaemonState, FinalizeStatus};
-use citrate_learning_daemon::trainer::{
-    MemoryIpfsClient, RoutingTrainer, StubTrainingBackend,
-};
+use citrate_learning_daemon::trainer::{MemoryIpfsClient, RoutingTrainer, StubTrainingBackend};
 use ethereum_types::H160;
 use tempfile::TempDir;
 
@@ -120,8 +116,12 @@ async fn chaos_finalize_crash_after_chain_accept() {
     {
         let state = Arc::new(DaemonState::open(dir.path()).expect("open"));
         // Promote cycle 5 to Committed so finalize is allowed.
-        state.set_cycle_status(5, CycleStatus::Computed).expect("computed");
-        state.set_cycle_status(5, CycleStatus::Committed).expect("committed");
+        state
+            .set_cycle_status(5, CycleStatus::Computed)
+            .expect("computed");
+        state
+            .set_cycle_status(5, CycleStatus::Committed)
+            .expect("committed");
 
         // Submit finalize. Chain accepts. Then the daemon dies.
         let _tx = chain.finalize_cycle(5).await.expect("finalize ok");
@@ -163,8 +163,12 @@ async fn chaos_trainer_crash_between_ipfs_pin_and_chain_commit() {
     // Pre-condition setup: cycle 3 must be Committed for the
     // trainer to run.
     let state = Arc::new(DaemonState::open(dir.path()).expect("open"));
-    state.set_cycle_status(3, CycleStatus::Computed).expect("computed");
-    state.set_cycle_status(3, CycleStatus::Committed).expect("committed");
+    state
+        .set_cycle_status(3, CycleStatus::Computed)
+        .expect("computed");
+    state
+        .set_cycle_status(3, CycleStatus::Committed)
+        .expect("committed");
 
     // First incarnation: trainer runs, IPFS pin succeeds, chain
     // commit fails. Idempotent flow: rerun produces identical CID
@@ -198,13 +202,7 @@ async fn chaos_trainer_crash_between_ipfs_pin_and_chain_commit() {
     // inputs → identical CID → re-pin is idempotent → chain commit
     // succeeds.
     let backend2 = Arc::new(StubTrainingBackend { n_weights: 16 });
-    let trainer2 = RoutingTrainer::new(
-        chain.clone(),
-        state.clone(),
-        cache,
-        ipfs.clone(),
-        backend2,
-    );
+    let trainer2 = RoutingTrainer::new(chain.clone(), state.clone(), cache, ipfs.clone(), backend2);
     trainer2.train(3).await.expect("retry succeeds");
 
     // Exactly one routing-weights commit on chain.
@@ -245,19 +243,15 @@ async fn chaos_repeated_kills_converge_to_consistent_state() {
         let state = Arc::new(DaemonState::open(dir.path()).expect("open 2"));
         // Manually advance cycle to Committed (simulating that an
         // out-of-band commit observation reconciled it).
-        state.set_cycle_status(7, CycleStatus::Committed).expect("committed");
+        state
+            .set_cycle_status(7, CycleStatus::Committed)
+            .expect("committed");
 
         let cache: Arc<MemoryEmbeddingCache> = Arc::new(MemoryEmbeddingCache::new());
         cache.insert(7, make_entry(0x01, 32768));
         let backend = Arc::new(StubTrainingBackend { n_weights: 8 });
         let ipfs = Arc::new(MemoryIpfsClient::new());
-        let trainer = RoutingTrainer::new(
-            chain.clone(),
-            state.clone(),
-            cache,
-            ipfs,
-            backend,
-        );
+        let trainer = RoutingTrainer::new(chain.clone(), state.clone(), cache, ipfs, backend);
         chain.arm_next_error("round 2 outage");
         let _ = trainer.train(7).await;
         // Chain still has 0 routing weights commits.

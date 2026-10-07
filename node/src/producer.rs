@@ -1,9 +1,23 @@
+// PANIC-S1 G2: block production / apply / sync path (T1); panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use citrate_consensus::chain_selection::ChainSelector;
 use citrate_consensus::crypto::{self, Ed25519SigningKey};
 use citrate_consensus::dag_store::{DagStore, DagStoreError};
 use citrate_consensus::ghostdag::GhostDag;
-use citrate_consensus::tip_selection::TipSelector;
 use citrate_consensus::hardening::PbaHardening;
+use citrate_consensus::tip_selection::TipSelector;
 use citrate_consensus::types::{
     Block, BlockBuilder, BlockHeader, GhostDagParams, Hash, PublicKey, Transaction, VrfProof,
 };
@@ -254,9 +268,7 @@ impl AttestedNetworkHead {
                 // Stay bounded: evict the lowest-height candidate on overflow. The gate
                 // also prunes at/below the finalized floor on every recompute.
                 while obs.len() > ATTESTED_OBSERVED_CAP {
-                    if let Some(min_hash) =
-                        obs.iter().min_by_key(|(_, ht)| **ht).map(|(k, _)| *k)
-                    {
+                    if let Some(min_hash) = obs.iter().min_by_key(|(_, ht)| **ht).map(|(k, _)| *k) {
                         obs.remove(&min_hash);
                     } else {
                         break;
@@ -333,9 +345,10 @@ impl ProduceCatchupGate {
     /// Candidates at/below the finalized floor are pruned in passing (bounded record).
     /// No-op unless both the candidate record and the scratch watermark are wired.
     fn recompute_attested_ahead(&self, selected: Option<(Hash, u64)>, storage: &StorageManager) {
-        let (Some(scratch), Some(observed)) =
-            (self.attested_ahead.as_ref(), self.attested_observed.as_ref())
-        else {
+        let (Some(scratch), Some(observed)) = (
+            self.attested_ahead.as_ref(),
+            self.attested_observed.as_ref(),
+        ) else {
             return;
         };
         let floor = self
@@ -823,7 +836,7 @@ impl PanicBreaker {
         } else if !self.suspects.is_empty() {
             let probe_len = self.suspects.len().div_ceil(2);
             let probe: std::collections::HashSet<Hash> =
-                self.suspects[..probe_len].iter().copied().collect();
+                self.suspects.iter().take(probe_len).copied().collect();
             let narrowed: Vec<Transaction> = out
                 .iter()
                 .filter(|t| probe.contains(&t.hash))
@@ -874,7 +887,7 @@ impl PanicBreaker {
                 match round.len() {
                     0 => {}
                     1 => {
-                        self.control = Some(round[0]);
+                        self.control = round.first().copied();
                         self.suspects = round;
                     }
                     _ => self.suspects = round,
@@ -891,7 +904,7 @@ impl PanicBreaker {
     fn strike(&mut self, culprit: Hash) -> Vec<Hash> {
         let n = {
             let n = self.strikes.entry(culprit).or_insert(0);
-            *n += 1;
+            *n = n.saturating_add(1);
             *n
         };
         if n < PANIC_STRIKES_TO_EVICT {
@@ -1138,7 +1151,7 @@ impl BlockProducer {
         if latest_height > 0 {
             info!(
                 "Loading {} blocks from storage into DAG...",
-                latest_height + 1
+                latest_height.saturating_add(1)
             );
             for height in 0..=latest_height {
                 if let Ok(Some(block_hash)) = storage.blocks.get_block_by_height(height) {
@@ -1191,7 +1204,7 @@ impl BlockProducer {
             }
             info!(
                 "DAG loaded: {} blocks, resuming from height {}",
-                latest_height + 1,
+                latest_height.saturating_add(1),
                 latest_height
             );
         }
@@ -1293,7 +1306,7 @@ impl BlockProducer {
         if latest_height > 0 {
             info!(
                 "Loading {} blocks from storage into DAG...",
-                latest_height + 1
+                latest_height.saturating_add(1)
             );
             for height in 0..=latest_height {
                 if let Ok(Some(block_hash)) = storage.blocks.get_block_by_height(height) {
@@ -1346,7 +1359,7 @@ impl BlockProducer {
             }
             info!(
                 "DAG loaded: {} blocks, resuming from height {}",
-                latest_height + 1,
+                latest_height.saturating_add(1),
                 latest_height
             );
         }
@@ -1572,7 +1585,9 @@ impl BlockProducer {
     /// stall alert (ops surface wired to the RPC in a follow-up).
     #[allow(dead_code)]
     pub fn catchup_override_handle(&self) -> Option<Arc<AtomicBool>> {
-        self.produce_gate.as_ref().map(|g| g.override_resume.clone())
+        self.produce_gate
+            .as_ref()
+            .map(|g| g.override_resume.clone())
     }
 
     /// VALIDATOR-S1 (v5): if `height` is a snapshot boundary S(E), rebuild the shared
@@ -1628,7 +1643,7 @@ impl BlockProducer {
 
             match self.guard_round(supervised_round(self.clone())).await {
                 RoundOutcome::Produced(block_hash) => {
-                    block_count += 1;
+                    block_count = block_count.saturating_add(1);
                     info!(
                         "Produced block #{} hash={} txs={}",
                         block_count,
@@ -1818,10 +1833,7 @@ impl BlockProducer {
             // the applied-tip lock we already hold for the whole build (0 in the legacy /
             // no-lock path, where `attested_ahead` is also never wired ⇒ inert). Strictly
             // additive: this only ever makes the producer REFRAIN.
-            let local_tip = applied_guard
-                .as_ref()
-                .map(|g| g.tip().height)
-                .unwrap_or(0);
+            let local_tip = applied_guard.as_ref().map(|g| g.tip().height).unwrap_or(0);
             // VERIFY-255-F2-H1: the attested-ahead watermark was RE-DERIVED against the LIVE
             // fork-choice-selected head at the top of this method — GhostDAG's `select_tip`
             // (the SAME authority the drain reorgs toward), resolved to a height via storage.
@@ -1983,7 +1995,13 @@ impl BlockProducer {
         // contract assumes it is. Until then, in-band and correct beats exact and
         // rejected.
         let mut blue_set = citrate_consensus::types::BlueSet::new();
-        let blue_score = parent_blue_score + 1;
+        // A block at u64::MAX height/score cannot be extended: refuse to build.
+        let next_height = last_height
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("parent height {last_height} cannot be extended"))?;
+        let blue_score = parent_blue_score.checked_add(1).ok_or_else(|| {
+            anyhow::anyhow!("parent blue score {parent_blue_score} cannot be extended")
+        })?;
         blue_set.score = blue_score;
         blue_set.work = parent_blue_work; // base; calculate_blue_work below recomputes
 
@@ -2022,7 +2040,7 @@ impl BlockProducer {
         let transactions: Vec<citrate_consensus::types::Transaction> = if self
             .ghostdag
             .pba_hardening()
-            .active_at(last_height + 1)
+            .active_at(next_height)
         {
             let chain_id = self.executor.chain_id();
             let mut keep = Vec::with_capacity(transactions.len());
@@ -2063,7 +2081,7 @@ impl BlockProducer {
                     None => now,
                 }
             },
-            height: last_height + 1,
+            height: next_height,
             blue_score,
             blue_work,
             pruning_point: Hash::default(),
@@ -2072,27 +2090,12 @@ impl BlockProducer {
                 &self.signing_key,
                 &PublicKey::new(self.signing_key.verifying_key().to_bytes()),
                 &parent_vrf_output,
-                last_height + 1,
+                next_height,
             ),
-            base_fee_per_gas: {
-                // EIP-1559 base fee calculation from parent block
-                let parent_base_fee: u64 = 1_000_000_000; // 1 gwei minimum
-                let parent_gas_used: u64 = 0; // Will be read from parent block when available
-                let parent_gas_limit: u64 = 30_000_000;
-                let target_gas = parent_gas_limit / 2;
-                if parent_gas_used == target_gas {
-                    parent_base_fee
-                } else if parent_gas_used > target_gas {
-                    let delta = parent_gas_used - target_gas;
-                    let fee_delta = std::cmp::max(parent_base_fee * delta / target_gas / 8, 1);
-                    parent_base_fee + fee_delta
-                } else {
-                    let delta = target_gas - parent_gas_used;
-                    let fee_delta = parent_base_fee * delta / target_gas / 8;
-                    std::cmp::max(parent_base_fee.saturating_sub(fee_delta), 1_000_000_000)
-                    // floor at 1 gwei
-                }
-            },
+            // The §R' import rule requires the canonical base fee; the former inline
+            // "EIP-1559" computation used constant inputs (parent gas used = 0) and
+            // always evaluated to exactly this value.
+            base_fee_per_gas: citrate_execution::block_rewards::CANONICAL_BASE_FEE_PER_GAS,
             gas_used: 0,           // Will be updated after execution
             gas_limit: 30_000_000, // 30M gas default
             // EXECUTE-ON-RECEIVE: commit the beneficiary so receivers can reproduce state_root.
@@ -2172,7 +2175,11 @@ impl BlockProducer {
             .ghostdag_params(self.ghostdag.params().clone())
             .transactions(executed_transactions.clone())
             .build_unhashed();
-        let reward = self.reward_calculator.calculate_reward(&temp_block);
+        // PANIC-S1 D3: an uncomputable reward rejects the block (never panics/saturates).
+        let reward = self
+            .reward_calculator
+            .calculate_reward(&temp_block)
+            .map_err(|e| anyhow::anyhow!("block reward rejected: {e}"))?;
         // `basic_credits` mirrors `canonical_apply::reward_credits` exactly:
         // [(coinbase, validator_reward), (0x11..treasury, treasury_reward)]. Below the
         // VALIDATOR-S1 activation (or before a snapshot is materialized) this credits only
@@ -2485,8 +2492,8 @@ impl BlockProducer {
         use sha3::{Digest, Keccak256};
 
         // Compute function selector for heartbeat()
-        let selector_hash = Keccak256::digest(b"heartbeat()");
-        let calldata_hex = format!("0x{}", hex::encode(&selector_hash[..4]));
+        let [a, b, c, d, ..]: [u8; 32] = Keccak256::digest(b"heartbeat()").into();
+        let calldata_hex = format!("0x{}", hex::encode([a, b, c, d]));
 
         // Use the HeartbeatMonitor contract address from compute contract addresses.
         // In production this would be loaded from contract_addresses config.
@@ -2577,7 +2584,8 @@ impl BlockProducer {
         if cand_height >= applied_height {
             return false;
         }
-        let steps = applied_height - cand_height;
+        // cand_height < applied_height (checked above).
+        let steps = applied_height.saturating_sub(cand_height);
         if steps > SUPERSEDE_WALK_CAP {
             return false; // too deep to be post-restart DAG lag — leave it to the drain
         }
@@ -2692,7 +2700,7 @@ impl BlockProducer {
                 if child_h.saturating_sub(tip_h)
                     > citrate_consensus::ghostdag::MERGE_PARENT_MAX_DEPTH
                 {
-                    dropped_deep += 1;
+                    dropped_deep = dropped_deep.saturating_add(1);
                     continue;
                 }
             }
@@ -2754,6 +2762,10 @@ impl BlockProducer {
         let executor = self.executor.clone();
         let mut budget = SelectionBudget::new(MAX_GAS_PER_BLOCK);
         let mut ai_declared: u64 = 0;
+        // PBA-N9: candidates the budget deems permanently unincludable (unpayable
+        // alone / oversized) are removed from the pool after the pass, so a flood
+        // of them cannot persist for `tx_expiry_secs` (3600s) or waste every round.
+        let mut to_drop: Vec<Hash> = Vec::new();
         for tx in ai_txs {
             if seen.contains(&tx.hash) {
                 continue;
@@ -2764,13 +2776,17 @@ impl BlockProducer {
             if next > MAX_AI_GAS_PER_BLOCK {
                 continue;
             }
-            if budget.try_admit(&tx, |from| {
+            match budget.admit_outcome(&tx, |from| {
                 let addr = citrate_execution::address_utils::normalize_address(from);
                 (executor.get_nonce(&addr), executor.get_balance(&addr))
             }) {
-                ai_declared = next;
-                seen.insert(tx.hash);
-                selected.push(tx);
+                AdmitOutcome::Admitted => {
+                    ai_declared = next;
+                    seen.insert(tx.hash);
+                    selected.push(tx);
+                }
+                AdmitOutcome::Drop => to_drop.push(tx.hash),
+                AdmitOutcome::Skip => {}
             }
         }
         // Count and byte caps apply to EXECUTED transactions (see
@@ -2799,13 +2815,17 @@ impl BlockProducer {
             if !window.fits(&tx) {
                 continue;
             }
-            if budget.try_admit(&tx, |from| {
+            match budget.admit_outcome(&tx, |from| {
                 let addr = citrate_execution::address_utils::normalize_address(from);
                 (executor.get_nonce(&addr), executor.get_balance(&addr))
             }) {
-                window.record(&tx);
-                seen.insert(tx.hash);
-                selected.push(tx);
+                AdmitOutcome::Admitted => {
+                    window.record(&tx);
+                    seen.insert(tx.hash);
+                    selected.push(tx);
+                }
+                AdmitOutcome::Drop => to_drop.push(tx.hash),
+                AdmitOutcome::Skip => {}
             }
         }
         let total_gas = ai_declared;
@@ -2815,6 +2835,18 @@ impl BlockProducer {
             total_gas,
             MAX_GAS_PER_BLOCK
         );
+
+        // PBA-N9: drop the permanently-unincludable candidates from the pool.
+        // A failure before a receipt costs the sender nothing on chain, and here
+        // the candidate was never even executed, so removal (not a ban) is the
+        // conservative choice: the sender may re-submit once funded, and the
+        // admission balance check will gate the re-submission.
+        if !to_drop.is_empty() {
+            debug!("PBA-N9: dropping {} unpayable candidates", to_drop.len());
+            for hash in to_drop {
+                let _ = self.mempool.remove_transaction(&hash).await;
+            }
+        }
 
         Ok(selected)
     }
@@ -2933,9 +2965,7 @@ impl BlockProducer {
             hasher.update(receipt.gas_used.to_le_bytes());
         }
 
-        let hash_bytes = hasher.finalize();
-        let mut hash_array = [0u8; 32];
-        hash_array.copy_from_slice(&hash_bytes[..32]);
+        let hash_array: [u8; 32] = hasher.finalize().into();
         Ok(Hash::new(hash_array))
     }
 
@@ -2947,20 +2977,16 @@ impl BlockProducer {
         // Hash any AI-related transaction data
         for tx in transactions {
             // Check if transaction contains AI operations
-            if tx.data.len() >= 4 {
-                match &tx.data[0..4] {
-                    [0x01, 0x00, 0x00, 0x00] | // Register model
-                    [0x02, 0x00, 0x00, 0x00] => { // Inference request
-                        hasher.update(&tx.data);
-                    }
-                    _ => {}
+            match tx.data.get(0..4) {
+                Some([0x01, 0x00, 0x00, 0x00]) | // Register model
+                Some([0x02, 0x00, 0x00, 0x00]) => { // Inference request
+                    hasher.update(&tx.data);
                 }
+                _ => {}
             }
         }
 
-        let hash_bytes = hasher.finalize();
-        let mut hash_array = [0u8; 32];
-        hash_array.copy_from_slice(&hash_bytes[..32]);
+        let hash_array: [u8; 32] = hasher.finalize().into();
         Ok(Hash::new(hash_array))
     }
 
@@ -3278,9 +3304,10 @@ impl CandidateWindow {
     }
 
     pub(crate) fn record(&mut self, tx: &Transaction) {
-        self.count += 1;
+        self.count = self.count.saturating_add(1);
         self.bytes = self.bytes.saturating_add(Mempool::tx_size(tx));
-        *self.per_sender.entry(tx.from).or_insert(0) += 1;
+        let per_sender = self.per_sender.entry(tx.from).or_insert(0);
+        *per_sender = per_sender.saturating_add(1);
     }
 }
 
@@ -3313,10 +3340,39 @@ impl BlockGasMeter {
     }
 }
 
+/// PBA-N9 (security#134): the outcome of considering a candidate for selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmitOutcome {
+    /// Selected into the block.
+    Admitted,
+    /// Not selectable this round, but keep it pooled: its nonce is not yet the
+    /// sender's next nonce, or it is affordable alone but not alongside this
+    /// sender's earlier candidates already taken this round (a later block may
+    /// include it).
+    Skip,
+    /// Drop it from the pool: it can never be validly included as-is — larger
+    /// than a whole block, its successor nonce would overflow, or its sender's
+    /// COMMITTED balance cannot cover even this single transaction. Leaving such
+    /// a candidate pooled lets a flood persist to `tx_expiry_secs` (3600s) and
+    /// burns selection work every round (the N9 producer half).
+    Drop,
+}
+
+/// Per-sender budget state tracked across a single selection pass.
+struct SenderBudget {
+    /// Next nonce expected from this sender, advanced per admitted candidate.
+    next_nonce: u64,
+    /// Committed balance remaining after the candidates already admitted.
+    remaining: primitive_types::U256,
+    /// The sender's committed balance at the start of the pass (for deciding
+    /// whether a rejected candidate is unpayable alone vs. only cumulatively).
+    original: primitive_types::U256,
+}
+
 pub(crate) struct SelectionBudget {
     max_gas: u64,
-    /// sender -> (next expected nonce, remaining balance) after admitted txs.
-    senders: HashMap<PublicKey, (u64, primitive_types::U256)>,
+    /// sender -> budget state after admitted txs.
+    senders: HashMap<PublicKey, SenderBudget>,
 }
 
 impl SelectionBudget {
@@ -3327,37 +3383,73 @@ impl SelectionBudget {
         }
     }
 
-    /// Admit `tx` if it fits and is payable; `state` returns the sender's
-    /// on-chain `(nonce, balance)` (queried once per sender).
-    pub(crate) fn try_admit<F>(&mut self, tx: &Transaction, state: F) -> bool
+    /// Classify `tx` against the budget and, when admitted, advance the sender's
+    /// nonce and spend its balance. `state` returns the sender's on-chain
+    /// `(nonce, balance)` (queried once per sender). PBA-N9: distinguishes a
+    /// candidate that should be DROPPED (unpayable alone / oversized) from one
+    /// that should be kept pooled (`Skip`): the fee-market cost bound uses
+    /// `max_fee_per_gas` (falling back to `gas_price`) plus `value`, so a
+    /// genuinely-payable transaction is never dropped.
+    pub(crate) fn admit_outcome<F>(&mut self, tx: &Transaction, state: F) -> AdmitOutcome
     where
         F: FnOnce(&PublicKey) -> (u64, primitive_types::U256),
     {
         use primitive_types::U256;
         if tx.gas_limit > self.max_gas {
-            return false; // can never fit a block: skip it, keep filling (SEQ-H2)
+            // Can never fit a block (SEQ-H2). It is dead weight in the pool.
+            return AdmitOutcome::Drop;
         }
-        let (next_nonce, balance) = *self
-            .senders
-            .entry(tx.from)
-            .or_insert_with(|| state(&tx.from));
+        let entry = self.senders.entry(tx.from).or_insert_with(|| {
+            let (next_nonce, balance) = state(&tx.from);
+            SenderBudget {
+                next_nonce,
+                remaining: balance,
+                original: balance,
+            }
+        });
+        let next_nonce = entry.next_nonce;
+        let remaining = entry.remaining;
+        let original = entry.original;
         if tx.nonce != next_nonce {
-            return false;
+            // Future/gap nonce (or already consumed): keep it pooled.
+            return AdmitOutcome::Skip;
         }
         let Some(after_nonce) = next_nonce.checked_add(1) else {
-            return false;
+            // u64::MAX nonce has no successor: never includable.
+            return AdmitOutcome::Drop;
         };
+        let price = tx.max_fee_per_gas.unwrap_or(tx.gas_price);
         let cost = U256::from(tx.gas_limit)
-            .checked_mul(U256::from(tx.gas_price))
+            .checked_mul(U256::from(price))
             .and_then(|g| g.checked_add(U256::from(tx.value)));
         let Some(cost) = cost else {
-            return false;
+            // Absurd (overflowing) declared cost: unpayable against any balance.
+            return AdmitOutcome::Drop;
         };
-        if balance < cost {
-            return false;
+        if original < cost {
+            // The sender cannot afford even this one transaction on its own.
+            return AdmitOutcome::Drop;
         }
-        self.senders.insert(tx.from, (after_nonce, balance - cost));
-        true
+        if remaining < cost {
+            // Affordable alone, but not alongside this sender's earlier admitted
+            // candidates this round: keep it pooled for a later block.
+            return AdmitOutcome::Skip;
+        }
+        entry.next_nonce = after_nonce;
+        // remaining >= cost (checked above).
+        entry.remaining = remaining.saturating_sub(cost);
+        AdmitOutcome::Admitted
+    }
+
+    /// Admit `tx` if it fits and is payable; `state` returns the sender's
+    /// on-chain `(nonce, balance)` (queried once per sender). Thin wrapper over
+    /// [`Self::admit_outcome`] kept for the budget-semantics unit tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn try_admit<F>(&mut self, tx: &Transaction, state: F) -> bool
+    where
+        F: FnOnce(&PublicKey) -> (u64, primitive_types::U256),
+    {
+        matches!(self.admit_outcome(tx, state), AdmitOutcome::Admitted)
     }
 }
 
@@ -3743,6 +3835,153 @@ mod tests {
         let mut b = SelectionBudget::new(30_000_000);
         let max = transfer_tx(11, a, r, u64::MAX);
         assert!(!b.try_admit(&max, |_: &PublicKey| (u64::MAX, U256::MAX)));
+    }
+
+    /// PBA-N9 (security#134, rescore #20): an unfunded pool flood must not evict
+    /// honest transactions or empty blocks.
+    ///
+    /// Verifier harness for the mempool-DoS finding: `eth_/tx_sendRawTransaction`
+    /// and P2P gossip all route through `Mempool::add_transaction`, which — before
+    /// the fix — checked signature + nonce but NEVER sender balance. An attacker
+    /// could flood a bounded pool with unfunded, high-fee transactions; they were
+    /// admitted (no balance check), evicted honest lower-fee transactions (a full
+    /// pool evicted purely on priority), and then the producer skipped them unpaid
+    /// while leaving them pooled for `tx_expiry_secs` — empty blocks at zero cost.
+    ///
+    /// With the fix (cumulative sender-balance admission on every ingress path +
+    /// payable-aware eviction), each unfunded flood transaction is rejected with
+    /// `InsufficientBalance`, the honest transaction survives, and the produced
+    /// block contains it.
+    #[tokio::test]
+    async fn verify5_n9_unfunded_pool_flood_evicts_honest() {
+        use citrate_sequencer::mempool::MempoolError;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let storage =
+            Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).expect("storage"));
+        let state_db = Arc::new(citrate_execution::StateDB::new());
+        let executor = Arc::new(Executor::with_storage_and_chain_id(
+            state_db.clone(),
+            Some(storage.state.clone()),
+            40204,
+        ));
+
+        // Production wiring: nonce + balance readers over the executor's state
+        // view. Small pool so an admitted flood would clearly evict the honest tx.
+        let mempool = Arc::new(
+            Mempool::new(MempoolConfig {
+                require_valid_signature: false,
+                max_size: 4,
+                ..Default::default()
+            })
+            .with_state_nonce_reader({
+                let exec = executor.clone();
+                Arc::new(move |pk: &PublicKey| {
+                    exec.get_nonce(&citrate_execution::address_utils::normalize_address(pk))
+                })
+            })
+            .with_state_balance_reader({
+                let exec = executor.clone();
+                Arc::new(move |pk: &PublicKey| {
+                    let bal =
+                        exec.get_balance(&citrate_execution::address_utils::normalize_address(pk));
+                    let cap = U256::from(u128::MAX);
+                    (if bal > cap { cap } else { bal }).low_u128()
+                })
+            }),
+        );
+
+        let honest = Address([0x11; 20]);
+        let recipient = Address([0x33; 20]);
+        let honest_price = 1_000_000_000u64;
+        let honest_cost = 21_000u128 * honest_price as u128;
+        state_db.accounts.create_account_if_not_exists(honest);
+        state_db
+            .accounts
+            .set_balance(honest, U256::from(honest_cost));
+
+        let honest_tx = {
+            let mut t = transfer_tx(0xA1, honest, recipient, 0);
+            t.gas_price = honest_price; // exactly funds one transfer
+            t
+        };
+        mempool
+            .add_transaction(honest_tx.clone(), TxClass::Standard)
+            .await
+            .expect("honest tx is funded and admitted");
+
+        // Flood: 32 unfunded senders (no account -> balance 0), each a high-fee
+        // transfer that, pre-fix, would have out-prioritised and evicted the
+        // honest tx from the 4-slot pool.
+        let mut rejected = 0usize;
+        for i in 0..32u8 {
+            let mut flood = transfer_tx(0x40 + i, Address([0x80 + i; 20]), recipient, 0);
+            flood.gas_price = 1_000_000_000_000; // 1000x the honest fee
+            match mempool.add_transaction(flood, TxClass::Standard).await {
+                Err(MempoolError::InsufficientBalance { .. }) => rejected += 1,
+                other => panic!("unfunded flood tx must be rejected for balance, got {other:?}"),
+            }
+        }
+        assert_eq!(rejected, 32, "every unfunded flood tx must be rejected");
+
+        // The honest tx survived the flood.
+        assert!(
+            mempool.contains(&honest_tx.hash).await,
+            "N9: honest tx must not be evicted by an unfunded flood"
+        );
+        assert_eq!(
+            mempool.stats().await.total_transactions,
+            1,
+            "only the honest tx remains pooled"
+        );
+
+        // Cumulative check: a single sender's individually-affordable-but-
+        // collectively-unaffordable second tx is also rejected. The honest sender
+        // is funded for exactly ONE transfer, so a second (nonce 1) is unpayable
+        // on top of the pooled first.
+        let honest_2 = {
+            let mut t = transfer_tx(0xA2, honest, recipient, 1);
+            t.gas_price = honest_price;
+            t
+        };
+        assert!(
+            matches!(
+                mempool.add_transaction(honest_2, TxClass::Standard).await,
+                Err(MempoolError::InsufficientBalance { .. })
+            ),
+            "N9: a collectively-unaffordable second tx must be rejected against the pending set"
+        );
+
+        // The producer selects the honest tx and produces a non-empty block.
+        let producer = BlockProducer::new(
+            storage.clone(),
+            executor,
+            mempool,
+            embedded_pubkey(Address([0x44; 20])),
+            test_signing_key(),
+            2,
+        );
+        let selected = producer
+            .select_transactions_with_ai_priority()
+            .await
+            .expect("selection");
+        let selected_hashes: Vec<Hash> = selected.iter().map(|t| t.hash).collect();
+        assert!(
+            selected_hashes.contains(&honest_tx.hash),
+            "honest tx must be selected; got {selected_hashes:?}"
+        );
+
+        let block_hash = producer.produce_block().await.expect("produce block");
+        let block = storage
+            .blocks
+            .get_block(&block_hash)
+            .expect("read block")
+            .expect("block stored");
+        let block_hashes: Vec<Hash> = block.transactions.iter().map(|t| t.hash).collect();
+        assert!(
+            block_hashes.contains(&honest_tx.hash),
+            "N9: the produced block must include the honest tx (not be empty); got {block_hashes:?}"
+        );
     }
 
     #[test]
@@ -4543,7 +4782,8 @@ mod tests {
         *receiver.reward_policy_handle().write() = Some(mk_policy());
         receiver.set_validator_activation_height(0);
         let reward = RewardCalculator::new(crate::canonical_apply::canonical_reward_config())
-            .calculate_reward(&sealed);
+            .calculate_reward(&sealed)
+            .expect("canonical reward");
         let basic_credits = [
             (Address(sealed.header.coinbase), reward.validator_reward),
             (Address(TREASURY), reward.treasury_reward),
@@ -4798,7 +5038,8 @@ mod tests {
             block: &Block,
         ) -> Result<Hash, citrate_execution::types::ExecutionError> {
             let reward = RewardCalculator::new(crate::canonical_apply::canonical_reward_config())
-                .calculate_reward(block);
+                .calculate_reward(block)
+                .expect("canonical reward");
             let credits = [
                 (Address(block.header.coinbase), reward.validator_reward),
                 (Address(TREASURY), reward.treasury_reward),
@@ -5226,11 +5467,7 @@ mod tests {
     /// Build a v2 block at `height` off `parent`, hash-bound for the live
     /// hardening, optionally signed by `sign` (whose verifying key is set as the
     /// proposer, so `verify_block_signature` passes).
-    fn f2_block(
-        height: u64,
-        parent: Hash,
-        sign: Option<&Ed25519SigningKey>,
-    ) -> Block {
+    fn f2_block(height: u64, parent: Hash, sign: Option<&Ed25519SigningKey>) -> Block {
         let proposer = match sign {
             Some(sk) => PublicKey::new(sk.verifying_key().to_bytes()),
             None => PublicKey::new([0x11; 32]),
@@ -5325,7 +5562,10 @@ mod tests {
         let mut parent = head.clone();
         for h in 4..=7u64 {
             let ext = f2_block(h, parent.header.block_hash, Some(&sk));
-            storage.blocks.put_block(&ext).expect("hold extension block");
+            storage
+                .blocks
+                .put_block(&ext)
+                .expect("hold extension block");
             assert!(
                 attested.observe(&storage, &ext),
                 "a validly-signed child of a held block is attested-ahead evidence"
@@ -5456,7 +5696,10 @@ mod tests {
     /// deadband (RESUME, REFUSE] does NOT toggle production.
     #[test]
     fn f2_boundary_flapping_hysteresis_no_toggle() {
-        assert!(CATCHUP_RESUME_GAP < CATCHUP_REFUSE_GAP, "deadband must be non-empty");
+        assert!(
+            CATCHUP_RESUME_GAP < CATCHUP_REFUSE_GAP,
+            "deadband must be non-empty"
+        );
         let attested = Arc::new(AtomicU64::new(0));
         let gate = f2_gate(attested.clone(), Duration::from_secs(3600)); // no stalls here
         let local_tip = 0u64;
@@ -5491,14 +5734,20 @@ mod tests {
 
         // First round: refuses (behind), no alert yet.
         assert!(gate.evaluate_network_height(local_tip).is_err());
-        assert!(!alert.load(Ordering::SeqCst), "no alert before the stall window");
+        assert!(
+            !alert.load(Ordering::SeqCst),
+            "no alert before the stall window"
+        );
 
         // No sync progress for longer than the stall window.
         std::thread::sleep(Duration::from_millis(180));
         let err = gate
             .evaluate_network_height(local_tip)
             .expect_err("stalled while behind must keep refusing");
-        assert!(alert.load(Ordering::SeqCst), "the stall alert must be surfaced");
+        assert!(
+            alert.load(Ordering::SeqCst),
+            "the stall alert must be surfaced"
+        );
         assert!(
             err.to_string().contains("override"),
             "the stall refusal must demand a human-in-command override, got: {err}"
@@ -5532,12 +5781,21 @@ mod tests {
         // progress) across more than one stall window: the timer keeps resetting
         // and no alert fires.
         for tip in [0u64, 10, 20, 30, 40] {
-            assert!(gate.evaluate_network_height(tip).is_err(), "still behind at tip {tip}");
+            assert!(
+                gate.evaluate_network_height(tip).is_err(),
+                "still behind at tip {tip}"
+            );
             std::thread::sleep(Duration::from_millis(60));
-            assert!(!alert.load(Ordering::SeqCst), "progress must reset the stall timer");
+            assert!(
+                !alert.load(Ordering::SeqCst),
+                "progress must reset the stall timer"
+            );
         }
         // Within RESUME_GAP now: resume cleanly, no override needed.
-        assert!(gate.evaluate_network_height(50).is_ok(), "resume once caught up");
+        assert!(
+            gate.evaluate_network_height(50).is_ok(),
+            "resume once caught up"
+        );
     }
 
     /// TEST 7 — revert-check. The F2 gate must stay WIRED: `produce_block` calls
@@ -5679,8 +5937,15 @@ mod tests {
         let base1 = storage.blocks.get_block(&base1_hash).unwrap().unwrap();
         let k = Ed25519SigningKey::from_bytes(&[0x42; 32]);
         let losing_tip = f2_signed_side_chain(&attested, &storage, &base1, 8, &k);
-        assert_eq!(losing_tip.header.height, 9, "losing branch reaches height 9");
-        assert_eq!(attested.best(), 9, "raw lifetime max is 9 (candidates recorded)");
+        assert_eq!(
+            losing_tip.header.height, 9,
+            "losing branch reaches height 9"
+        );
+        assert_eq!(
+            attested.best(),
+            9,
+            "raw lifetime max is 9 (candidates recorded)"
+        );
 
         // Canonical head is 5; the losing branch at 9 does not descend from it, so gap == 0.
         producer.produce_block().await.expect(
@@ -5699,7 +5964,10 @@ mod tests {
         let over = gate.override_resume.clone();
         let tip = 0u64;
 
-        assert!(gate.evaluate_network_height(tip).is_err(), "behind ⇒ refuse");
+        assert!(
+            gate.evaluate_network_height(tip).is_err(),
+            "behind ⇒ refuse"
+        );
         over.store(true, Ordering::SeqCst);
         assert!(
             gate.evaluate_network_height(tip).is_ok(),
@@ -5890,9 +6158,8 @@ mod tests {
                 if *ht <= reference_best {
                     continue;
                 }
-                if ProduceCatchupGate::descends_from(
-                    &storage, *hash, selected.0, selected.1, floor,
-                ) {
+                if ProduceCatchupGate::descends_from(&storage, *hash, selected.0, selected.1, floor)
+                {
                     reference_best = *ht;
                 }
             }
@@ -5991,7 +6258,8 @@ mod multi_producer_regression {
             !merging.is_empty(),
             "merging blocks must take the real calculate_blue_set path"
         );
-    }}
+    }
+}
 
 #[cfg(test)]
 mod blue_score_band_regression {
@@ -6127,7 +6395,8 @@ mod pba_l1b_001_producer_filter {
             window.contains("tx_auth::verify_for_block(&t, chain_id)"),
             "PBA-L1b-001: produce_block must filter candidates with tx_auth::verify_for_block"
         );
-    }}
+    }
+}
 
 /// Producer circuit breaker and round rollback: a transaction that makes
 /// every production round panic is found, evicted and quarantined, and a

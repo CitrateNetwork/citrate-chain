@@ -6,6 +6,7 @@ import "@openzeppelin/contracts/token/ERC1155/IERC1155Receiver.sol";
 
 import "../../src/cit_agent/OrganizationSBT.sol";
 import "../../src/cit_agent/AgentSBT.sol";
+import "../../src/core_membership/CitrateMemberSBT.sol";
 import "../../src/cit_agent/CapsuleRegistry.sol";
 import "../../src/cit_agent/AnchorRegistry.sol";
 import "../../src/cit_agent/BenchmarkRegistry.sol";
@@ -54,7 +55,7 @@ contract CitAgentContractsTest is Test, IERC1155Receiver {
         bob = address(0xB0B);
 
         org = new OrganizationSBT(admin);
-        agent = new AgentSBT(admin, org);
+        agent = new AgentSBT(admin, org, IERC721(address(new CitrateMemberSBT(admin))));
         capsules = new CapsuleRegistry(admin);
         anchors = new AnchorRegistry();
         benchmarks = new BenchmarkRegistry();

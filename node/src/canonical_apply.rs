@@ -29,6 +29,20 @@
 // reward path, which is a pure function of `header.height` + `transactions`.
 // This module recomputes that same basic reward to build the credit list.
 
+// PANIC-S1 G2: block production / apply / sync path (T1); panic-free outside tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use std::sync::Arc;
 
 use std::collections::BTreeMap;
@@ -508,9 +522,21 @@ impl CanonicalApplicator {
     /// applied on the basic reward path: `[(coinbase, validator_reward),
     /// (treasury, treasury_reward)]`. `coinbase` comes from the committed v2
     /// header field (`block.header.coinbase`).
-    fn reward_credits(&self, block: &Block) -> Vec<(citrate_execution::types::Address, U256)> {
-        let reward = self.reward_calculator.calculate_reward(block);
-        vec![
+    ///
+    /// PANIC-S1 D3: a reward that cannot be computed (overflow / invalid config) is
+    /// an ERROR, never a panic or a saturated amount. Callers fold it into their
+    /// existing reject path via `ExecutionError::RewardSettlement`, so the block is
+    /// rejected (or the reorg aborted and rolled back) exactly like any other
+    /// execution failure.
+    fn reward_credits(
+        &self,
+        block: &Block,
+    ) -> Result<
+        Vec<(citrate_execution::types::Address, U256)>,
+        citrate_economics::rewards::RewardError,
+    > {
+        let reward = self.reward_calculator.calculate_reward(block)?;
+        Ok(vec![
             (
                 citrate_execution::types::Address(block.header.coinbase),
                 reward.validator_reward,
@@ -519,7 +545,7 @@ impl CanonicalApplicator {
                 citrate_execution::types::Address(TREASURY_ADDR),
                 reward.treasury_reward,
             ),
-        ]
+        ])
     }
 
     /// Persist the applied-tip pointer + this block's verified state root (crash
@@ -570,11 +596,14 @@ impl CanonicalApplicator {
         let mut extensions: Vec<Block> = children
             .into_iter()
             .filter_map(|h| self.storage.blocks.get_block(&h).ok().flatten())
-            .filter(|b| b.selected_parent() == tip.hash && b.header.height == tip.height + 1)
+            .filter(|b| {
+                b.selected_parent() == tip.hash
+                    && Some(b.header.height) == tip.height.checked_add(1)
+            })
             .collect();
         match extensions.len() {
             0 => Ok(None),
-            1 => Ok(Some(extensions.pop().expect("len == 1"))),
+            1 => Ok(extensions.pop()),
             _ => Err(()),
         }
     }
@@ -606,12 +635,15 @@ impl CanonicalApplicator {
             };
             let block_hash = block.header.block_hash;
             let height = block.header.height;
-            let credits = self.reward_credits(&block);
-            match self
-                .executor
-                .apply_block(&block, block.header.coinbase, &credits)
-                .await
-            {
+            let apply_result = match self.reward_credits(&block) {
+                Ok(credits) => {
+                    self.executor
+                        .apply_block(&block, block.header.coinbase, &credits)
+                        .await
+                }
+                Err(e) => Err(ExecutionError::RewardSettlement(e.to_string())),
+            };
+            match apply_result {
                 Ok(_root) => {
                     state.record(block_hash, height, self.executor.state_snapshot());
                     self.persist_applied(&block_hash, height, &block.state_root);
@@ -940,12 +972,15 @@ impl CanonicalApplicator {
         }
 
         for block in &branch {
-            let credits = self.reward_credits(block);
-            match self
-                .executor
-                .apply_block_no_persist(block, block.header.coinbase, &credits)
-                .await
-            {
+            let apply_result = match self.reward_credits(block) {
+                Ok(credits) => {
+                    self.executor
+                        .apply_block_no_persist(block, block.header.coinbase, &credits)
+                        .await
+                }
+                Err(e) => Err(ExecutionError::RewardSettlement(e.to_string())),
+            };
+            match apply_result {
                 Ok(_) => {
                     let h = block.header.height;
                     let hh = block.header.block_hash;
@@ -1506,15 +1541,18 @@ impl CanonicalApplicator {
                 Some(b) => b,
                 None => break, // missing block — reach check below rolls back
             };
-            let credits = self.reward_credits(&block);
             // TRUSTED replay: skip the per-block full-trie root recompute (the ~O(N^2)
             // wall that made a from-genesis rebuild take hours). Correctness is
             // recovered by verifying the FINAL head root once, below.
-            match self
-                .executor
-                .apply_block_trusted(&block, block.header.coinbase, &credits)
-                .await
-            {
+            let apply_result = match self.reward_credits(&block) {
+                Ok(credits) => {
+                    self.executor
+                        .apply_block_trusted(&block, block.header.coinbase, &credits)
+                        .await
+                }
+                Err(e) => Err(ExecutionError::RewardSettlement(e.to_string())),
+            };
+            match apply_result {
                 Ok(_) => {
                     // Record the block's CLAIMED root (trusted) in the ring; the ring
                     // snapshot is the executor state, which is correct regardless.
@@ -1683,7 +1721,9 @@ mod tests {
 
     /// Reward credits the driver applies, computed the same way it does internally.
     fn reward_for(block: &Block) -> (U256, U256) {
-        let r = RewardCalculator::new(canonical_reward_config()).calculate_reward(block);
+        let r = RewardCalculator::new(canonical_reward_config())
+            .calculate_reward(block)
+            .expect("canonical reward");
         (r.validator_reward, r.treasury_reward)
     }
 
@@ -3658,8 +3698,9 @@ mod tests {
                 .await
                 .expect("producer tx must execute");
         }
-        let reward =
-            RewardCalculator::new(canonical_reward_config()).calculate_reward(&provisional);
+        let reward = RewardCalculator::new(canonical_reward_config())
+            .calculate_reward(&provisional)
+            .expect("canonical reward");
         for (addr, amt) in [
             (Address(CB), reward.validator_reward),
             (Address(TREASURY_ADDR), reward.treasury_reward),
@@ -3976,8 +4017,9 @@ mod tests {
                     .expect("producer tx executes"),
             );
         }
-        let reward =
-            RewardCalculator::new(canonical_reward_config()).calculate_reward(&provisional);
+        let reward = RewardCalculator::new(canonical_reward_config())
+            .calculate_reward(&provisional)
+            .expect("canonical reward");
         let basic = [
             (Address(CB), reward.validator_reward),
             (Address(TREASURY_ADDR), reward.treasury_reward),
@@ -5318,8 +5360,9 @@ mod tests {
             block_hashes: std::collections::HashMap::new(),
         });
         let provisional = mk_block_cb(height, parent, Hash::default(), vrf, coinbase);
-        let reward =
-            RewardCalculator::new(canonical_reward_config()).calculate_reward(&provisional);
+        let reward = RewardCalculator::new(canonical_reward_config())
+            .calculate_reward(&provisional)
+            .expect("canonical reward");
         for (addr, amt) in [
             (Address(coinbase), reward.validator_reward),
             (Address(TREASURY_ADDR), reward.treasury_reward),
@@ -6355,8 +6398,9 @@ mod tests {
                     .expect("producer tx executes"),
             );
         }
-        let reward =
-            RewardCalculator::new(canonical_reward_config()).calculate_reward(&provisional);
+        let reward = RewardCalculator::new(canonical_reward_config())
+            .calculate_reward(&provisional)
+            .expect("canonical reward");
         let basic = [
             (Address(coinbase), reward.validator_reward),
             (Address(TREASURY_ADDR), reward.treasury_reward),
@@ -7082,7 +7126,9 @@ mod tests {
     // A second test SIGKILLs the child at random wall-clock instants.
     // =====================================================================
 
-    use citrate_execution::executor::{StateStorageChange as V251Change, StateStoreTrait as V251Trait};
+    use citrate_execution::executor::{
+        StateStorageChange as V251Change, StateStoreTrait as V251Trait,
+    };
     use citrate_execution::types::AccountState as V251Acct;
 
     const V251_DIR: &str = "V251_CHILD_DIR";
@@ -7203,27 +7249,66 @@ mod tests {
     async fn v251_blocks() -> (Block, Block, Block, Block) {
         let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
         pa.set_balance(&Address(ALICE), U256::from(FUND));
-        let a1 = produce(&pa, Hash::default(), 1, VRF_OUT, vec![transfer(ALICE, DAVE, 1_000, 0)]).await;
-        let a2 = produce(&pa, a1.header.block_hash, 2, VRF_OUT, vec![transfer(ALICE, BOB, 1_000, 1)]).await;
+        let a1 = produce(
+            &pa,
+            Hash::default(),
+            1,
+            VRF_OUT,
+            vec![transfer(ALICE, DAVE, 1_000, 0)],
+        )
+        .await;
+        let a2 = produce(
+            &pa,
+            a1.header.block_hash,
+            2,
+            VRF_OUT,
+            vec![transfer(ALICE, BOB, 1_000, 1)],
+        )
+        .await;
         let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
         pb.set_balance(&Address(ALICE), U256::from(FUND));
-        let _b1 = produce(&pb, Hash::default(), 1, VRF_OUT, vec![transfer(ALICE, DAVE, 1_000, 0)]).await;
+        let _b1 = produce(
+            &pb,
+            Hash::default(),
+            1,
+            VRF_OUT,
+            vec![transfer(ALICE, DAVE, 1_000, 0)],
+        )
+        .await;
         let vrf_b = [0x5B; 32];
-        let b2 = produce(&pb, a1.header.block_hash, 2, vrf_b, vec![transfer(ALICE, CAROL, 1_000, 1)]).await;
-        let b3 = produce(&pb, b2.header.block_hash, 3, vrf_b, vec![transfer(ALICE, CAROL, 1_000, 2)]).await;
+        let b2 = produce(
+            &pb,
+            a1.header.block_hash,
+            2,
+            vrf_b,
+            vec![transfer(ALICE, CAROL, 1_000, 1)],
+        )
+        .await;
+        let b3 = produce(
+            &pb,
+            b2.header.block_hash,
+            3,
+            vrf_b,
+            vec![transfer(ALICE, CAROL, 1_000, 2)],
+        )
+        .await;
         (a1, a2, b2, b3)
     }
 
     /// CHILD body: the scenario, with every executor write going through the
     /// abort store. Prints the total write count when it completes.
     async fn v251_child_scenario(dir: &std::path::Path, abort_at: u64) {
-        let storage = Arc::new(StorageManager::new(dir, PruningConfig::default()).expect("storage"));
+        let storage =
+            Arc::new(StorageManager::new(dir, PruningConfig::default()).expect("storage"));
         let store = Arc::new(V251AbortStore {
             inner: storage.state.clone(),
             writes: AtomicU64::new(0),
             abort_at,
         });
-        let exec = Arc::new(Executor::with_storage(Arc::new(StateDB::new()), Some(store.clone())));
+        let exec = Arc::new(Executor::with_storage(
+            Arc::new(StateDB::new()),
+            Some(store.clone()),
+        ));
         exec.set_balance(&Address(ALICE), U256::from(FUND));
         exec.persist_state_changes().await.expect("persist genesis");
         let (a1, a2, b2, b3) = v251_blocks().await;
@@ -7258,7 +7343,13 @@ mod tests {
 
     /// Reopen `dir` like `start_node` and check the boot invariant.
     /// Returns (tip height or None, invariant holds, detail).
-    fn v251_check(dir: &std::path::Path, a1: &Block, a2: &Block, b2: &Block, b3: &Block) -> (Option<u64>, bool, String) {
+    fn v251_check(
+        dir: &std::path::Path,
+        a1: &Block,
+        a2: &Block,
+        b2: &Block,
+        b3: &Block,
+    ) -> (Option<u64>, bool, String) {
         let storage = StorageManager::new(dir, PruningConfig::default()).expect("reopen");
         let sdb = StateDB::new();
         for (addr, acct) in storage.state.get_all_accounts().expect("accounts") {
@@ -7267,11 +7358,19 @@ mod tests {
         for ((addr, key), val) in storage.state.get_all_storage().expect("storage") {
             sdb.set_storage(addr, key.as_bytes().to_vec(), val.as_bytes().to_vec());
         }
-        let n_accounts = storage.state.get_all_accounts().map(|v| v.len()).unwrap_or(0);
+        let n_accounts = storage
+            .state
+            .get_all_accounts()
+            .map(|v| v.len())
+            .unwrap_or(0);
         let root = sdb.calculate_state_root();
         let tip = storage.blocks.get_applied_tip().ok().flatten();
         if tip.is_none() && n_accounts == 0 {
-            return (None, true, "pre-genesis (nothing persisted yet)".to_string());
+            return (
+                None,
+                true,
+                "pre-genesis (nothing persisted yet)".to_string(),
+            );
         }
         let expected = match tip {
             None => v251_genesis_root(),
@@ -7284,7 +7383,13 @@ mod tests {
                     .find(|b| b.header.block_hash == h)
                     .map(|b| b.state_root);
                 named.unwrap_or_else(|| {
-                    storage.blocks.get_block(&h).ok().flatten().map(|b| b.state_root).unwrap_or_default()
+                    storage
+                        .blocks
+                        .get_block(&h)
+                        .ok()
+                        .flatten()
+                        .map(|b| b.state_root)
+                        .unwrap_or_default()
                 })
             }
         };
@@ -7295,14 +7400,21 @@ mod tests {
                 .map(|(n, _)| n.to_string())
                 .unwrap_or_else(|| format!("{h}"))
         };
-        let which_root = [("genesis", v251_genesis_root()), ("a1", a1.state_root), ("a2", a2.state_root), ("b2", b2.state_root), ("b3", b3.state_root)]
-            .iter()
-            .find(|(_, r)| *r == root)
-            .map(|(n, _)| n.to_string())
-            .unwrap_or_else(|| "UNKNOWN".to_string());
+        let which_root = [
+            ("genesis", v251_genesis_root()),
+            ("a1", a1.state_root),
+            ("a2", a2.state_root),
+            ("b2", b2.state_root),
+            ("b3", b3.state_root),
+        ]
+        .iter()
+        .find(|(_, r)| *r == root)
+        .map(|(n, _)| n.to_string())
+        .unwrap_or_else(|| "UNKNOWN".to_string());
         let detail = format!(
             "tip={} durable_state_is={} ok={}",
-            tip.map(|(h, n)| format!("{}@{n}", label(&h))).unwrap_or_else(|| "none".into()),
+            tip.map(|(h, n)| format!("{}@{n}", label(&h)))
+                .unwrap_or_else(|| "none".into()),
             which_root,
             root == expected
         );
@@ -7316,26 +7428,33 @@ mod tests {
         for (k, v) in envs {
             cmd.env(k, v);
         }
-        cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
         cmd.spawn().expect("spawn child")
     }
 
     /// Child entry point (a no-op unless V251_CHILD_DIR is set).
     #[tokio::test]
     async fn verify251_child() {
-        let Ok(dir) = std::env::var(V251_DIR) else { return };
+        let Ok(dir) = std::env::var(V251_DIR) else {
+            return;
+        };
         let dir = std::path::PathBuf::from(dir);
         if std::env::var(V251_LOOP).is_ok() {
             // Random-SIGKILL mode: run the scenario repeatedly on fresh subdirs.
             for i in 0.. {
                 let sub = dir.join(format!("run{i}"));
                 std::fs::create_dir_all(&sub).expect("subdir");
-                std::fs::write(dir.join("current"), sub.to_string_lossy().as_bytes()).expect("current");
+                std::fs::write(dir.join("current"), sub.to_string_lossy().as_bytes())
+                    .expect("current");
                 v251_child_scenario(&sub, u64::MAX).await;
                 std::fs::remove_dir_all(&sub).ok();
             }
         }
-        let abort_at: u64 = std::env::var(V251_ABORT_AT).ok().and_then(|v| v.parse().ok()).unwrap_or(u64::MAX);
+        let abort_at: u64 = std::env::var(V251_ABORT_AT)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(u64::MAX);
         v251_child_scenario(&dir, abort_at).await;
     }
 
@@ -7358,14 +7477,29 @@ mod tests {
         let (a1, a2, b2, b3) = v251_blocks().await;
         // Dry run: count writes.
         let dry = tempfile::tempdir().expect("dir");
-        let out = v251_spawn(test, &[(V251_DIR, dry.path().to_string_lossy().into()), ("V251_SCENARIO", scenario.to_string())])
-            .wait_with_output()
-            .expect("dry");
+        let out = v251_spawn(
+            test,
+            &[
+                (V251_DIR, dry.path().to_string_lossy().into()),
+                ("V251_SCENARIO", scenario.to_string()),
+            ],
+        )
+        .wait_with_output()
+        .expect("dry");
         let stdout = String::from_utf8_lossy(&out.stdout);
         let total: u64 = stdout
             .lines()
-            .find_map(|l| l.split("V251_TOTAL_WRITES=").nth(1).map(|v| v.trim().parse().unwrap()))
-            .unwrap_or_else(|| panic!("dry run failed: {stdout}\n{}", String::from_utf8_lossy(&out.stderr)));
+            .find_map(|l| {
+                l.split("V251_TOTAL_WRITES=")
+                    .nth(1)
+                    .map(|v| v.trim().parse().unwrap())
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "dry run failed: {stdout}\n{}",
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            });
         let (_, ok, d) = v251_check(dry.path(), &a1, &a2, &b2, &b3);
         println!("V251 [{scenario}] dry run: total_writes={total} final: {d}");
         assert!(ok);
@@ -7374,19 +7508,30 @@ mod tests {
             let dir = tempfile::tempdir().expect("dir");
             let out = v251_spawn(
                 test,
-                &[(V251_DIR, dir.path().to_string_lossy().into()), (V251_ABORT_AT, k.to_string()), ("V251_SCENARIO", scenario.to_string())],
+                &[
+                    (V251_DIR, dir.path().to_string_lossy().into()),
+                    (V251_ABORT_AT, k.to_string()),
+                    ("V251_SCENARIO", scenario.to_string()),
+                ],
             )
             .wait_with_output()
             .expect("child");
             let err = String::from_utf8_lossy(&out.stderr);
-            let what = err.lines().find(|l| l.contains("V251 ABORT")).unwrap_or("?").to_string();
+            let what = err
+                .lines()
+                .find(|l| l.contains("V251 ABORT"))
+                .unwrap_or("?")
+                .to_string();
             let (_, ok, d) = v251_check(dir.path(), &a1, &a2, &b2, &b3);
             println!("V251 [{scenario}] abort k={k:>2} [{what}] -> {d}");
             if !ok {
                 torn.push(format!("k={k} {what} {d}"));
             }
         }
-        assert!(torn.is_empty(), "TORN durable state/tip after crash: {torn:#?}");
+        assert!(
+            torn.is_empty(),
+            "TORN durable state/tip after crash: {torn:#?}"
+        );
     }
 
     /// Random wall-clock SIGKILL of a child looping the scenario.
@@ -7407,7 +7552,10 @@ mod tests {
             let dir = tempfile::tempdir().expect("dir");
             let mut child = v251_spawn(
                 test,
-                &[(V251_DIR, dir.path().to_string_lossy().into()), (V251_LOOP, "1".into())],
+                &[
+                    (V251_DIR, dir.path().to_string_lossy().into()),
+                    (V251_LOOP, "1".into()),
+                ],
             );
             let wait_ms = 300 + seed % 1500;
             std::thread::sleep(std::time::Duration::from_millis(wait_ms));
@@ -7462,5 +7610,4 @@ mod tests {
         }
         assert!(!flag.load(Ordering::SeqCst), "flag cleared on normal drop");
     }
-
 }

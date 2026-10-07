@@ -1,7 +1,7 @@
 // citrate/core/execution/benches/parallel_bench.rs
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use citrate_consensus::types::{Hash, PublicKey, Signature, Transaction};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use std::collections::HashMap;
 
 fn mk_tx(sender: u8, nonce: u64) -> Transaction {

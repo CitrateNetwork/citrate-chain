@@ -329,15 +329,15 @@ fn ac04_block_hash_integrity_preserved() {
     let block = make_signed_block(&key, 5);
 
     // Hash must be verifiable
-    assert!(block.verify_hash(), "AC-04: Valid block must pass verify_hash");
+    assert!(
+        block.verify_hash(),
+        "AC-04: Valid block must pass verify_hash"
+    );
 
     // Recomputing hash must give same result
     let hash1 = block.compute_hash();
     let hash2 = block.compute_hash();
-    assert_eq!(
-        hash1, hash2,
-        "AC-04: compute_hash must be deterministic"
-    );
+    assert_eq!(hash1, hash2, "AC-04: compute_hash must be deterministic");
 }
 
 /// Verify that blocks at different heights produce different hashes.
@@ -363,18 +363,24 @@ fn ac04_different_heights_different_hashes() {
 fn ac05_peer_id_bound_to_noise_key() {
     use citrate_network::noise::NoiseKeypair;
 
-    let kp1 = NoiseKeypair::generate();
-    let kp2 = NoiseKeypair::generate();
+    let kp1 = NoiseKeypair::generate().expect("keygen");
+    let kp2 = NoiseKeypair::generate().expect("keygen");
 
     let id1 = kp1.derive_peer_id();
     let id2 = kp2.derive_peer_id();
 
     // Different keys → different PeerIds
-    assert_ne!(id1, id2, "AC-05: Different Noise keys must produce different PeerIds");
+    assert_ne!(
+        id1, id2,
+        "AC-05: Different Noise keys must produce different PeerIds"
+    );
 
     // Same key → same PeerId (deterministic)
     let id1_again = kp1.derive_peer_id();
-    assert_eq!(id1, id1_again, "AC-05: Same Noise key must produce same PeerId");
+    assert_eq!(
+        id1, id1_again,
+        "AC-05: Same Noise key must produce same PeerId"
+    );
 
     // PeerId format must be noise_<hex>
     assert!(
@@ -389,7 +395,7 @@ fn ac05_sybil_peer_id_does_not_match_noise_id() {
     use citrate_network::noise::NoiseKeypair;
     use citrate_network::peer::PeerId;
 
-    let kp = NoiseKeypair::generate();
+    let kp = NoiseKeypair::generate().expect("keygen");
     let noise_id = kp.derive_peer_id();
 
     // Attacker creates many fake PeerIds
@@ -430,27 +436,51 @@ fn j3_block_hash_binds_all_fields() {
     // Tamper each field and verify hash changes
     let mut b = base.clone();
     b.header.height = 999;
-    assert_ne!(b.compute_hash(), base_hash, "J.3: height change must change hash");
+    assert_ne!(
+        b.compute_hash(),
+        base_hash,
+        "J.3: height change must change hash"
+    );
 
     let mut b = base.clone();
     b.header.timestamp = 0;
-    assert_ne!(b.compute_hash(), base_hash, "J.3: timestamp change must change hash");
+    assert_ne!(
+        b.compute_hash(),
+        base_hash,
+        "J.3: timestamp change must change hash"
+    );
 
     let mut b = base.clone();
     b.state_root = Hash::new([0xFF; 32]);
-    assert_ne!(b.compute_hash(), base_hash, "J.3: state_root change must change hash");
+    assert_ne!(
+        b.compute_hash(),
+        base_hash,
+        "J.3: state_root change must change hash"
+    );
 
     let mut b = base.clone();
     b.tx_root = Hash::new([0xFF; 32]);
-    assert_ne!(b.compute_hash(), base_hash, "J.3: tx_root change must change hash");
+    assert_ne!(
+        b.compute_hash(),
+        base_hash,
+        "J.3: tx_root change must change hash"
+    );
 
     let mut b = base.clone();
     b.header.blue_score = 99999;
-    assert_ne!(b.compute_hash(), base_hash, "J.3: blue_score change must change hash");
+    assert_ne!(
+        b.compute_hash(),
+        base_hash,
+        "J.3: blue_score change must change hash"
+    );
 
     let mut b = base.clone();
     b.header.selected_parent_hash = Hash::new([0xFF; 32]);
-    assert_ne!(b.compute_hash(), base_hash, "J.3: parent_hash change must change hash");
+    assert_ne!(
+        b.compute_hash(),
+        base_hash,
+        "J.3: parent_hash change must change hash"
+    );
 }
 
 /// Signature verification is identity-bound — only the proposer's key validates.
@@ -496,13 +526,17 @@ async fn j3_vrf_proposer_binding_invariant() {
 
     // Must verify under correct proposer
     assert!(
-        selector.verify_vrf_math_only(&proposer_a, &proof, &prev_vrf, slot).unwrap(),
+        selector
+            .verify_vrf_math_only(&proposer_a, &proof, &prev_vrf, slot)
+            .unwrap(),
         "J.3: VRF must verify under correct proposer"
     );
 
     // Must NOT verify under different proposer
     assert!(
-        !selector.verify_vrf_math_only(&proposer_b, &proof, &prev_vrf, slot).unwrap(),
+        !selector
+            .verify_vrf_math_only(&proposer_b, &proof, &prev_vrf, slot)
+            .unwrap(),
         "J.3: VRF must not verify under different proposer"
     );
 }

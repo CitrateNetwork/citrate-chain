@@ -2,8 +2,7 @@
 // Every test exercises the REAL Executor.execute_transaction() pipeline.
 
 use citrate_consensus::types::{
-    Block, BlockBuilder, Hash, PublicKey, Signature,
-    Transaction as ConsensusTransaction, VrfProof,
+    Block, BlockBuilder, Hash, PublicKey, Signature, Transaction as ConsensusTransaction, VrfProof,
 };
 use citrate_execution::{address_utils, types::*, Executor, StateDB};
 use primitive_types::U256;
@@ -210,7 +209,10 @@ fn test_transfer_zero_value_uses_gas() {
         .expect("Zero-value transfer should succeed");
 
     assert!(receipt.status, "Zero-value transfer should succeed");
-    assert!(receipt.gas_used > 0, "Gas must be consumed even for zero-value transfers");
+    assert!(
+        receipt.gas_used > 0,
+        "Gas must be consumed even for zero-value transfers"
+    );
 
     let final_balance = executor.get_balance(&sender_addr);
     assert!(
@@ -508,10 +510,7 @@ fn test_contract_deployment_stores_code() {
     let deployer_addr = make_address(120);
 
     // Fund deployer generously
-    executor.set_balance(
-        &deployer_addr,
-        U256::from(10u64).pow(U256::from(18u64)),
-    );
+    executor.set_balance(&deployer_addr, U256::from(10u64).pow(U256::from(18u64)));
 
     // Minimal init code that returns 0x42 as runtime code:
     // PUSH1 0x01      (60 01) — size of runtime code
@@ -529,11 +528,11 @@ fn test_contract_deployment_stores_code() {
         0x60, 0x01, // PUSH1 0x01 (runtime code size = 1 byte)
         0x60, 0x0a, // PUSH1 0x0a (runtime code offset in init = 10)
         0x60, 0x00, // PUSH1 0x00 (memory dest)
-        0x39,       // CODECOPY
+        0x39, // CODECOPY
         0x60, 0x01, // PUSH1 0x01 (return size)
         0x60, 0x00, // PUSH1 0x00 (return offset)
-        0xf3,       // RETURN
-        0x00,       // STOP (this is the runtime code)
+        0xf3, // RETURN
+        0x00, // STOP (this is the runtime code)
     ];
 
     let tx = deploy_tx(deployer_pk, init_code, 0, 1_000_000, 1);
@@ -582,7 +581,15 @@ fn test_call_nonexistent_contract() {
     executor.set_balance(&caller_addr, U256::from(1_000_000u64));
 
     // Call a contract address that has no code — just some arbitrary calldata
-    let tx = call_tx(caller_pk, target_pk, vec![0xDE, 0xAD, 0xBE, 0xEF], 0, 0, 100_000, 1);
+    let tx = call_tx(
+        caller_pk,
+        target_pk,
+        vec![0xDE, 0xAD, 0xBE, 0xEF],
+        0,
+        0,
+        100_000,
+        1,
+    );
     let receipt = rt()
         .block_on(executor.execute_transaction(&block, &tx))
         .expect("Call to empty address should not hard-error");
@@ -637,7 +644,11 @@ fn test_stack_overflow_1025_pushes() {
                 "Sender balance must not increase after executing stack-overflow bytecode"
             );
             // Nonce should have incremented (tx was processed)
-            assert_eq!(executor.get_nonce(&caller_addr), 1, "Nonce should increment");
+            assert_eq!(
+                executor.get_nonce(&caller_addr),
+                1,
+                "Nonce should increment"
+            );
         }
         Err(_) => {
             // Error is acceptable — the executor caught the overflow.
@@ -677,10 +688,115 @@ fn test_invalid_opcode_reverts() {
                 "Sender balance must not increase after INVALID opcode execution"
             );
             // Nonce should have incremented (tx was processed)
-            assert_eq!(executor.get_nonce(&caller_addr), 1, "Nonce should increment");
+            assert_eq!(
+                executor.get_nonce(&caller_addr),
+                1,
+                "Nonce should increment"
+            );
         }
         Err(_) => {
             // Halt/Revert error is also acceptable
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// R2-RES-04 regression: a FAILED/reverted tx's receipt must report the FULL
+// charged gas (gas_limit), not the pre-failure work meter.
+// ---------------------------------------------------------------------------
+
+/// R2-RES-04. A reverting transaction pays its ENTIRE gas limit (no refund on
+/// the failure path), so its receipt `gas_used` MUST equal that full limit —
+/// which is what the header `gas_used` (sum of receipt gas_used) and the
+/// `receipt_root` (hashes receipt gas_used) then commit. Reproduces the MAC
+/// finding: N reverting txs, each charged its full limit, must sum to
+/// N * gas_limit in the header — not the (much smaller) pre-failure gas.
+///
+/// Contract runtime is `PUSH1 0x00; PUSH1 0x00; REVERT` (0x60 0x00 0x60 0x00
+/// 0xfd): it reverts after consuming only intrinsic + ~6 gas, so the
+/// pre-failure meter (`context.gas_used`, ~21_006) is FAR below the 30_000
+/// gas_limit. Pre-fix the receipt reported ~21_006 and 1000 txs summed to
+/// ~21M; post-fix each reports the full 30_000 and they sum to exactly 30M.
+#[test]
+fn r2_res_04_reverting_tx_receipt_reports_full_gas_limit() {
+    let (executor, _state_db) = new_executor();
+    let block = test_block();
+
+    let caller_pk = make_pubkey_for_address(190);
+    let contract_pk = make_pubkey_for_address(191);
+    let caller_addr = make_address(190);
+    let contract_addr = make_address(191);
+
+    // Deploy an always-reverting contract directly.
+    // PUSH1 0x00, PUSH1 0x00, REVERT  → reverts with empty returndata.
+    executor.set_code(&contract_addr, vec![0x60, 0x00, 0x60, 0x00, 0xfd]);
+
+    // Mirror the MAC repro: 1000 reverting txs, each with gas_limit 30_000 at
+    // gas_price 1. Expected charge = 1000 * 30_000 = 30_000_000 (30M), NOT the
+    // pre-failure ~700k/~21M the header used to report.
+    const N: u64 = 1000;
+    const GAS_LIMIT: u64 = 30_000;
+    const GAS_PRICE: u64 = 1;
+
+    let initial_balance = U256::from(10u64).pow(U256::from(18u64));
+    executor.set_balance(&caller_addr, initial_balance);
+
+    let runtime = rt();
+    let mut receipts: Vec<TransactionReceipt> = Vec::with_capacity(N as usize);
+    for nonce in 0..N {
+        // value = 0 so the ONLY balance movement is the gas charge.
+        // Non-empty calldata routes to the contract-CALL path (empty data is a
+        // plain Transfer that never runs code); 0xAABBCCDD is not an AI-op selector.
+        let tx = call_tx(
+            caller_pk,
+            contract_pk,
+            vec![0xAA, 0xBB, 0xCC, 0xDD],
+            0,
+            nonce,
+            GAS_LIMIT,
+            GAS_PRICE,
+        );
+        let receipt = runtime
+            .block_on(executor.execute_transaction(&block, &tx))
+            .expect("reverting call must still yield a receipt, not an error");
+
+        assert!(
+            !receipt.status,
+            "tx {nonce}: a REVERT must produce a failed receipt (status=false)"
+        );
+        // THE FIX: the receipt reports the full charged gas (the limit), not
+        // the pre-failure meter. Pre-fix this was ~21_006 and FAILED here.
+        assert_eq!(
+            receipt.gas_used, GAS_LIMIT,
+            "tx {nonce}: failed-tx receipt gas_used must equal the full charged gas_limit \
+             ({GAS_LIMIT}), not the pre-failure meter"
+        );
+        receipts.push(receipt);
+    }
+
+    // Header gas_used is the sum of receipt gas_used — the EXACT fold the
+    // producer runs (node/src/producer.rs: receipts.iter().map(|r| r.gas_used).sum()).
+    let header_gas_used: u64 = receipts.iter().map(|r| r.gas_used).sum();
+    assert_eq!(
+        header_gas_used,
+        N * GAS_LIMIT,
+        "header gas_used must sum to N*gas_limit = {} (30M for the MAC repro), not the \
+         under-reported pre-failure total",
+        N * GAS_LIMIT
+    );
+
+    // Independent proof the reported gas equals what the sender actually PAID:
+    // balance debited = header_gas_used * gas_price (value transfers were 0).
+    let final_balance = executor.get_balance(&caller_addr);
+    let charged = initial_balance - final_balance;
+    assert_eq!(
+        charged,
+        U256::from(header_gas_used) * U256::from(GAS_PRICE),
+        "gas actually charged to the sender must equal the summed receipt gas_used"
+    );
+    assert_eq!(
+        executor.get_nonce(&caller_addr),
+        N,
+        "every tx must have advanced the nonce"
+    );
 }

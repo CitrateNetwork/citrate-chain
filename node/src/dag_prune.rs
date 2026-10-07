@@ -272,7 +272,11 @@ mod tests {
         storage.blocks.put_applied_tip(&parent, N).expect("tip");
 
         let before = dag.get_stats().await.total_blocks;
-        assert_eq!(before, N as usize + 1, "every block retained pre-prune (genesis + N)");
+        assert_eq!(
+            before,
+            N as usize + 1,
+            "every block retained pre-prune (genesis + N)"
+        );
 
         // One pass: point = 1500 - 1000 = 500, so heights 0..=499 go.
         let dropped = prune_once(&storage, &dag, N, RETAIN).await;

@@ -25,7 +25,7 @@ import "../src/edu/ai-gateway/AILearningCycleCorePortable.sol";
 contract DeployAIGateway is ScriptEnv {
     function run() external {
         address deployer = deployerAddress();
-        address governance = envAddressOr("GOVERNANCE", deployer);
+        address governance = requiredGovernance("GOVERNANCE", deployer);
 
         console.log("=== Deploying AI Gateway (Portable) ===");
         console.log("Deployer:", deployer);

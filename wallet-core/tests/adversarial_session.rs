@@ -23,7 +23,7 @@ fn normal_manager() -> SessionManager {
 #[test]
 fn test_lockout_cannot_be_bypassed_by_success() {
     let mut mgr = SessionManager::new(3, 300, 60); // 5 min lockout
-    // Trigger lockout
+                                                   // Trigger lockout
     let _ = mgr.record_failure("0xabc");
     let _ = mgr.record_failure("0xabc");
     let _ = mgr.record_failure("0xabc"); // locked out
@@ -69,7 +69,10 @@ fn test_lockout_boundary_one_below_max() {
     mgr.record_failure("0xabc").expect("attempt 1");
     mgr.record_failure("0xabc").expect("attempt 2");
     // 2 failures — NOT locked out yet
-    assert!(!mgr.is_locked_out("0xabc"), "2/3 failures should not lock out");
+    assert!(
+        !mgr.is_locked_out("0xabc"),
+        "2/3 failures should not lock out"
+    );
 }
 
 // =========================================================================
@@ -83,7 +86,10 @@ fn test_session_expires_immediately_with_zero_timeout() {
 
     // Session should expire essentially immediately
     std::thread::sleep(std::time::Duration::from_millis(10));
-    assert!(!mgr.is_session_active("0xabc"), "Zero-timeout session should expire immediately");
+    assert!(
+        !mgr.is_session_active("0xabc"),
+        "Zero-timeout session should expire immediately"
+    );
 }
 
 #[test]
@@ -99,7 +105,10 @@ fn test_touch_extends_session() {
 
     // Without touch, 1s would have passed and session would expire
     // With touch at 500ms, only 500ms elapsed since last touch
-    assert!(mgr.is_session_active("0xabc"), "Touch should extend session");
+    assert!(
+        mgr.is_session_active("0xabc"),
+        "Touch should extend session"
+    );
 }
 
 #[test]
@@ -145,7 +154,10 @@ fn test_end_session_doesnt_affect_other_addresses() {
     mgr.record_success("0xbbb");
     mgr.end_session("0xaaa");
     assert!(!mgr.is_session_active("0xaaa"));
-    assert!(mgr.is_session_active("0xbbb"), "Ending A should not affect B");
+    assert!(
+        mgr.is_session_active("0xbbb"),
+        "Ending A should not affect B"
+    );
 }
 
 // =========================================================================
@@ -188,7 +200,11 @@ fn test_status_lockout_remaining_secs() {
     assert!(status.is_locked_out);
     assert!(status.lockout_remaining_secs.is_some());
     let remaining = status.lockout_remaining_secs.expect("remaining secs");
-    assert!(remaining > 0 && remaining <= 60, "Remaining should be between 0 and 60, got {}", remaining);
+    assert!(
+        remaining > 0 && remaining <= 60,
+        "Remaining should be between 0 and 60, got {}",
+        remaining
+    );
 }
 
 #[test]
@@ -199,7 +215,11 @@ fn test_status_session_remaining_secs() {
     let status = mgr.get_status("0xabc");
     assert!(status.is_active);
     let remaining = status.remaining_secs.expect("remaining");
-    assert!(remaining > 0 && remaining <= 300, "Remaining should be 0-300, got {}", remaining);
+    assert!(
+        remaining > 0 && remaining <= 300,
+        "Remaining should be 0-300, got {}",
+        remaining
+    );
 }
 
 #[test]

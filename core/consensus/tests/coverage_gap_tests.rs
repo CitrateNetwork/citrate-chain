@@ -43,8 +43,12 @@ fn genesis_block() -> Block {
     make_block(0xFF, 0, 1, Hash::default())
 }
 
-async fn setup_chain_selector() -> (Arc<DagStore>, Arc<GhostDag>, Arc<TipSelector>, ChainSelector)
-{
+async fn setup_chain_selector() -> (
+    Arc<DagStore>,
+    Arc<GhostDag>,
+    Arc<TipSelector>,
+    ChainSelector,
+) {
     let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
     let tip_selector = Arc::new(TipSelector::new(
@@ -108,7 +112,12 @@ async fn test_set_finality_tracker() {
         ghostdag.clone(),
         SelectionStrategy::HighestBlueScore,
     ));
-    let mut cs = ChainSelector::new(dag_store.clone(), ghostdag.clone(), tip_selector.clone(), 50);
+    let mut cs = ChainSelector::new(
+        dag_store.clone(),
+        ghostdag.clone(),
+        tip_selector.clone(),
+        50,
+    );
     assert!(cs.finality_tracker().is_none());
 
     let ft = Arc::new(FinalityTracker::new(
@@ -837,11 +846,26 @@ fn test_transaction_type_from_data_short_input() {
 
 #[test]
 fn test_transaction_type_priority_weight_ordering() {
-    assert!(TransactionType::ModelDeploy.priority_weight() > TransactionType::TrainingJob.priority_weight());
-    assert!(TransactionType::TrainingJob.priority_weight() > TransactionType::ModelUpdate.priority_weight());
-    assert!(TransactionType::ModelUpdate.priority_weight() > TransactionType::LoraAdapter.priority_weight());
-    assert!(TransactionType::LoraAdapter.priority_weight() > TransactionType::InferenceRequest.priority_weight());
-    assert!(TransactionType::InferenceRequest.priority_weight() > TransactionType::Standard.priority_weight());
+    assert!(
+        TransactionType::ModelDeploy.priority_weight()
+            > TransactionType::TrainingJob.priority_weight()
+    );
+    assert!(
+        TransactionType::TrainingJob.priority_weight()
+            > TransactionType::ModelUpdate.priority_weight()
+    );
+    assert!(
+        TransactionType::ModelUpdate.priority_weight()
+            > TransactionType::LoraAdapter.priority_weight()
+    );
+    assert!(
+        TransactionType::LoraAdapter.priority_weight()
+            > TransactionType::InferenceRequest.priority_weight()
+    );
+    assert!(
+        TransactionType::InferenceRequest.priority_weight()
+            > TransactionType::Standard.priority_weight()
+    );
 }
 
 #[test]
@@ -968,7 +992,7 @@ fn test_blue_set_duplicate_insert() {
     let h = Hash::new([0xAA; 32]);
     bs.insert(h);
     bs.insert(h); // duplicate
-    // HashSet deduplicates, but score increments each time
+                  // HashSet deduplicates, but score increments each time
     assert_eq!(bs.size(), 1);
     assert_eq!(bs.score, 2); // score is incremented regardless
 }
@@ -1226,7 +1250,11 @@ fn test_required_model_new() {
 
 #[test]
 fn test_pin_status_serialization_roundtrip() {
-    for status in [PinStatus::Pinned, PinStatus::Unpinned, PinStatus::Unverified] {
+    for status in [
+        PinStatus::Pinned,
+        PinStatus::Unpinned,
+        PinStatus::Unverified,
+    ] {
         let json = serde_json::to_string(&status).unwrap();
         let d: PinStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(status, d);

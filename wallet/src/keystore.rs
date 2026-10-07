@@ -33,7 +33,12 @@ use crate::errors::WalletError;
 const CLI_KEYSTORE_AAD_DOMAIN: &[u8] = b"citrate-cli-keystore-v2";
 
 fn cli_keystore_aad(kdf_version: u32, public_key: &[u8]) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(CLI_KEYSTORE_AAD_DOMAIN.len() + 4 + public_key.len());
+    let mut aad = Vec::with_capacity(
+        CLI_KEYSTORE_AAD_DOMAIN
+            .len()
+            .saturating_add(4)
+            .saturating_add(public_key.len()),
+    );
     aad.extend_from_slice(CLI_KEYSTORE_AAD_DOMAIN);
     aad.extend_from_slice(&kdf_version.to_le_bytes());
     aad.extend_from_slice(public_key);
@@ -61,8 +66,9 @@ fn argon2_for_version(version: u32) -> Result<Argon2<'static>, WalletError> {
     match version {
         KDF_VERSION_LEGACY => Ok(Argon2::default()),
         KDF_VERSION_CURRENT => {
-            let params = Params::new(65536, 3, 1, Some(32))
-                .expect("WAL-01: Argon2 v2 params (m=65536, t=3, p=1, out=32) are statically valid; see docs/security/KDF_POLICY.md");
+            let params = Params::new(65536, 3, 1, Some(32)).map_err(|e| {
+                WalletError::Other(format!("WAL-01: Argon2 v2 params rejected: {e}"))
+            })?;
             Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
         }
         unknown => Err(WalletError::Decryption(format!(
@@ -165,7 +171,8 @@ impl KeyStore {
         password: &str,
         alias: Option<String>,
     ) -> Result<VerifyingKey, WalletError> {
-        let hex_str = private_key_hex.strip_prefix("0x")
+        let hex_str = private_key_hex
+            .strip_prefix("0x")
             .or_else(|| private_key_hex.strip_prefix("0X"))
             .unwrap_or(private_key_hex);
         // WAL-04: hex-decoded private key bytes erased on drop.
@@ -277,13 +284,16 @@ impl KeyStore {
             .map_err(|e| WalletError::Encryption(e.to_string()))?;
 
         // Get the hash bytes for AES key
-        let hash_bytes = password_hash.hash
+        let hash_bytes = password_hash
+            .hash
             .ok_or_else(|| WalletError::Encryption("argon2 hash output missing".to_string()))?;
         let key_bytes = hash_bytes.as_bytes();
 
         // WAL-04: AES key erased on drop.
         let mut aes_key: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
-        aes_key.copy_from_slice(&key_bytes[..32]);
+        aes_key.copy_from_slice(key_bytes.first_chunk::<32>().ok_or_else(|| {
+            WalletError::Decryption("argon2 output shorter than 32 bytes".to_string())
+        })?);
 
         // Create cipher
         let key = Key::<Aes256Gcm>::from_slice(aes_key.as_ref());
@@ -346,13 +356,16 @@ impl KeyStore {
             .map_err(|e| WalletError::Decryption(e.to_string()))?;
 
         // Get the hash bytes for AES key
-        let hash_bytes = password_hash.hash
+        let hash_bytes = password_hash
+            .hash
             .ok_or_else(|| WalletError::Decryption("argon2 hash output missing".to_string()))?;
         let key_bytes = hash_bytes.as_bytes();
 
         // WAL-04: AES key erased on drop.
         let mut aes_key: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
-        aes_key.copy_from_slice(&key_bytes[..32]);
+        aes_key.copy_from_slice(key_bytes.first_chunk::<32>().ok_or_else(|| {
+            WalletError::Decryption("argon2 output shorter than 32 bytes".to_string())
+        })?);
 
         // Create cipher
         let key = Key::<Aes256Gcm>::from_slice(aes_key.as_ref());
@@ -366,24 +379,23 @@ impl KeyStore {
         // required since v1 and v2 envelopes are byte-distinguishable
         // by the field.
         // WAL-04: decrypted private key plaintext erased on drop.
-        let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(if encrypted.kdf_version
-            == KDF_VERSION_LEGACY
-        {
-            cipher
-                .decrypt(nonce, encrypted.ciphertext.as_ref())
-                .map_err(|_| WalletError::InvalidPassword)?
-        } else {
-            let aad = cli_keystore_aad(encrypted.kdf_version, &encrypted.public_key);
-            cipher
-                .decrypt(
-                    nonce,
-                    Payload {
-                        msg: encrypted.ciphertext.as_ref(),
-                        aad: &aad,
-                    },
-                )
-                .map_err(|_| WalletError::InvalidPassword)?
-        });
+        let plaintext: Zeroizing<Vec<u8>> =
+            Zeroizing::new(if encrypted.kdf_version == KDF_VERSION_LEGACY {
+                cipher
+                    .decrypt(nonce, encrypted.ciphertext.as_ref())
+                    .map_err(|_| WalletError::InvalidPassword)?
+            } else {
+                let aad = cli_keystore_aad(encrypted.kdf_version, &encrypted.public_key);
+                cipher
+                    .decrypt(
+                        nonce,
+                        Payload {
+                            msg: encrypted.ciphertext.as_ref(),
+                            aad: &aad,
+                        },
+                    )
+                    .map_err(|_| WalletError::InvalidPassword)?
+            });
 
         // Convert to signing key (ed25519-dalek 2.x SigningKey is
         // ZeroizeOnDrop, so the resulting key wipes itself).
@@ -475,31 +487,30 @@ pub fn migrate_to_unified_keystore(
     for (idx, entry) in legacy.keys.iter().enumerate() {
         // We already unlocked, so the corresponding SigningKey is
         // at the same index in `unlocked`.
-        let signing_key = legacy
-            .unlocked
-            .get(idx)
-            .ok_or_else(|| WalletError::Other(format!(
+        let signing_key = legacy.unlocked.get(idx).ok_or_else(|| {
+            WalletError::Other(format!(
                 "RM-G2.1: unlocked SigningKey missing for entry {}",
                 idx,
-            )))?;
+            ))
+        })?;
 
         let secret_hex = hex::encode(signing_key.to_bytes());
-        let label = entry.alias.clone().unwrap_or_else(|| format!("Migrated #{}", idx));
+        let label = entry
+            .alias
+            .clone()
+            .unwrap_or_else(|| format!("Migrated #{}", idx));
 
         // KeyManager::import_account hashes the password under v2,
         // produces a fresh AAD-bound entry, and persists. Errors
         // bubble up with full context.
-        citrate_wallet_core::KeyManager::import_account(
-            &target,
-            &secret_hex,
-            password,
-            &label,
-        )
-        .map_err(|e| WalletError::Other(format!(
-            "RM-G2.1: migration failed for entry {}: {}",
-            idx, e,
-        )))?;
-        migrated += 1;
+        citrate_wallet_core::KeyManager::import_account(&target, &secret_hex, password, &label)
+            .map_err(|e| {
+                WalletError::Other(format!(
+                    "RM-G2.1: migration failed for entry {}: {}",
+                    idx, e,
+                ))
+            })?;
+        migrated = migrated.saturating_add(1);
     }
 
     // Re-lock the legacy keystore so the in-memory plaintext
@@ -596,7 +607,13 @@ mod tests {
     #[test]
     fn test_import_key_invalid_hex_rejected() {
         let (_dir, mut ks) = temp_keystore();
-        let err = ks.import_key("not_hex_at_all_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", "pw", None).unwrap_err();
+        let err = ks
+            .import_key(
+                "not_hex_at_all_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+                "pw",
+                None,
+            )
+            .unwrap_err();
         match err {
             WalletError::HexDecode(_) => {}
             _ => panic!("Expected HexDecode error, got {:?}", err),

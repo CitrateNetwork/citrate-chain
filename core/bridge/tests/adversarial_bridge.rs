@@ -2,9 +2,9 @@
 // Tests oracle attestation security, double-processing prevention,
 // threshold enforcement, and malicious oracle scenarios.
 
-use citrate_bridge::oracle::{OracleAttestation, OracleRegistry};
 use citrate_bridge::events::EventId;
-use ed25519_dalek::{SigningKey, Signer};
+use citrate_bridge::oracle::{OracleAttestation, OracleRegistry};
+use ed25519_dalek::{Signer, SigningKey};
 
 /// Helper: create a deterministic signing key from a seed byte
 fn test_signing_key(seed: u8) -> SigningKey {
@@ -72,7 +72,10 @@ fn test_threshold_not_met_with_insufficient_attestations() {
         registry.submit_attestation(att).unwrap();
     }
 
-    assert!(!registry.is_threshold_met(&event_id), "2/3 should not meet threshold");
+    assert!(
+        !registry.is_threshold_met(&event_id),
+        "2/3 should not meet threshold"
+    );
     assert_eq!(registry.attestation_count(&event_id), 2);
 }
 
@@ -94,7 +97,10 @@ fn test_threshold_met_with_sufficient_attestations() {
         registry.submit_attestation(att).unwrap();
     }
 
-    assert!(registry.is_threshold_met(&event_id), "2/2 should meet threshold");
+    assert!(
+        registry.is_threshold_met(&event_id),
+        "2/2 should meet threshold"
+    );
 }
 
 #[test]
@@ -260,5 +266,8 @@ fn test_multiple_events_tracked_independently() {
     registry.submit_attestation(att).unwrap();
 
     assert!(registry.is_threshold_met(&event_a), "Event A should be met");
-    assert!(!registry.is_threshold_met(&event_b), "Event B should NOT be met");
+    assert!(
+        !registry.is_threshold_met(&event_b),
+        "Event B should NOT be met"
+    );
 }

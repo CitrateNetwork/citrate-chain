@@ -99,13 +99,19 @@ mod tests {
             "generatedDateTime": "2026-05-04T22:45:01Z"
         }"#;
         let result = parse_docusign_event(body);
-        assert!(matches!(result, Err(SigningError::WebhookPayloadInvalid(_))));
+        assert!(matches!(
+            result,
+            Err(SigningError::WebhookPayloadInvalid(_))
+        ));
     }
 
     #[test]
     fn parse_docusign_event_malformed_json_rejected() {
         let body = b"not json {{";
         let result = parse_docusign_event(body);
-        assert!(matches!(result, Err(SigningError::WebhookPayloadInvalid(_))));
+        assert!(matches!(
+            result,
+            Err(SigningError::WebhookPayloadInvalid(_))
+        ));
     }
 }

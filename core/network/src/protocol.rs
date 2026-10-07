@@ -303,7 +303,6 @@ pub enum NetworkMessage {
     },
 
     // WP-F.2: Learning gossip messages (paraconsensus layer)
-
     /// Learning-layer message (embedding broadcast or LoRA adapter offer).
     /// Gossiped at BFT checkpoint boundaries.
     LearningGossip {
@@ -522,8 +521,8 @@ mod tests {
     fn decode_inbound_rejects_oversized_length_prefix() {
         // Re-serialize a real empty Headers message, then overwrite its
         // 8-byte little-endian Vec length prefix with a huge value.
-        let mut wire = bincode::serialize(&NetworkMessage::Headers { headers: vec![] })
-            .expect("serialize");
+        let mut wire =
+            bincode::serialize(&NetworkMessage::Headers { headers: vec![] }).expect("serialize");
         // The variant discriminant (u32) precedes the Vec length (u64).
         // Find the length field: it's the 8 bytes right after the 4-byte
         // discriminant for this single-field variant.

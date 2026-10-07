@@ -260,7 +260,10 @@ async fn test_learning_different_participants_not_deduped() {
     assert!(r2.is_ok());
 
     let (_, _, _, _, _, lr, _, ld) = gossip.get_stats().await;
-    assert_eq!(lr, 2, "Both embeddings should be received (different participants)");
+    assert_eq!(
+        lr, 2,
+        "Both embeddings should be received (different participants)"
+    );
     assert_eq!(ld, 0, "No duplicates");
 }
 
@@ -285,7 +288,10 @@ async fn test_learning_different_checkpoints_not_deduped() {
     assert!(r2.is_ok());
 
     let (_, _, _, _, _, lr, _, _) = gossip.get_stats().await;
-    assert_eq!(lr, 2, "Both embeddings should be accepted (different checkpoints)");
+    assert_eq!(
+        lr, 2,
+        "Both embeddings should be accepted (different checkpoints)"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -305,7 +311,10 @@ async fn test_learning_invalid_message_rejected() {
     let msg = LearningMessage::Embedding(emb);
 
     let result = gossip.handle_learning_message(msg, &peer_id).await;
-    assert!(result.is_err(), "Invalid learning message should be rejected");
+    assert!(
+        result.is_err(),
+        "Invalid learning message should be rejected"
+    );
 
     let (_, _, _, _, _, lr, _, _) = gossip.get_stats().await;
     assert_eq!(lr, 0, "Invalid messages should not count as received");
@@ -322,7 +331,10 @@ async fn test_learning_self_mentor_rejected() {
     let msg = LearningMessage::Adapter(offer);
 
     let result = gossip.handle_learning_message(msg, &peer_id).await;
-    assert!(result.is_err(), "Self-mentoring adapter offer should be rejected");
+    assert!(
+        result.is_err(),
+        "Self-mentoring adapter offer should be rejected"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -419,7 +431,10 @@ async fn test_adapter_offer_gossip_handler() {
     assert!(result.is_ok());
 
     let (_, _, _, _, _, lr, _, _) = gossip.get_stats().await;
-    assert_eq!(lr, 1, "Adapter offer should be counted as learning_received");
+    assert_eq!(
+        lr, 1,
+        "Adapter offer should be counted as learning_received"
+    );
 
     let data = gossip.get_learning_data(100).await.unwrap();
     assert_eq!(data.adapters.len(), 1);

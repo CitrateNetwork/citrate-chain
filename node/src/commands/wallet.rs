@@ -427,7 +427,9 @@ async fn send_transaction(
     }
 
     if let Some(receipt) = receipt {
-        let status = receipt["status"]
+        let status = receipt
+            .get("status")
+            .unwrap_or(&serde_json::Value::Null)
             .as_str()
             .map(|s| s == "0x1")
             .unwrap_or(false);
@@ -438,7 +440,11 @@ async fn send_transaction(
             println!("{}", "Transaction failed!".red());
         }
 
-        if let Some(block) = receipt["blockNumber"].as_str() {
+        if let Some(block) = receipt
+            .get("blockNumber")
+            .unwrap_or(&serde_json::Value::Null)
+            .as_str()
+        {
             let block_num = u64::from_str_radix(block.trim_start_matches("0x"), 16)?;
             println!("  Block: #{}", block_num);
         }
@@ -590,12 +596,15 @@ async fn interactive_mode(wallet: &mut Wallet) -> Result<()> {
 
 fn format_latt(wei: U256) -> String {
     let decimals = U256::from(10).pow(U256::from(18));
-    let whole = wei / decimals;
-    let fraction = wei % decimals;
+    let whole = wei.checked_div(decimals).unwrap_or_default();
+    let fraction = wei.checked_rem(decimals).unwrap_or_default();
 
     let fraction_str = format!("{:018}", fraction);
     let fraction_trimmed = if fraction_str.len() >= 6 {
-        fraction_str[..6].trim_end_matches('0')
+        fraction_str
+            .get(..6)
+            .unwrap_or(&fraction_str)
+            .trim_end_matches('0')
     } else {
         fraction_str.trim_end_matches('0')
     };
@@ -644,8 +653,8 @@ mod tests_e003 {
 
     #[test]
     fn test_e003_import_key_file_path() {
-        let tmp = std::env::temp_dir()
-            .join(format!("e003_wallet_import_{}.key", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("e003_wallet_import_{}.key", std::process::id()));
         let hex_key = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
         std::fs::write(&tmp, format!("0x{hex_key}\n")).expect("write test key file");
 
@@ -676,12 +685,8 @@ mod tests_e003 {
 
     #[test]
     fn test_e003_argparse_accepts_key_file_flag() {
-        let result =
-            TestCli::try_parse_from(["test-wallet", "import", "--key-file", "/tmp/k.key"]);
-        assert!(
-            result.is_ok(),
-            "E003: `--key-file` must parse"
-        );
+        let result = TestCli::try_parse_from(["test-wallet", "import", "--key-file", "/tmp/k.key"]);
+        assert!(result.is_ok(), "E003: `--key-file` must parse");
     }
 
     #[test]

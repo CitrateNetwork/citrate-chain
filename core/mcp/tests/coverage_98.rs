@@ -17,8 +17,8 @@ use citrate_mcp::gguf_engine::{
 use citrate_mcp::provider::ProviderRegistry;
 use citrate_mcp::registry::ModelRegistry;
 use citrate_mcp::types::{
-    ComputeCapacity, ComputeRequirements, Currency, ExecutionProof, ExecutionRequest,
-    HardwareType, ModelId, ModelMetadata, PricingModel, ProviderInfo, RequestId, RequestStatus,
+    ComputeCapacity, ComputeRequirements, Currency, ExecutionProof, ExecutionRequest, HardwareType,
+    ModelId, ModelMetadata, PricingModel, ProviderInfo, RequestId, RequestStatus,
 };
 use citrate_mcp::verification::ExecutionVerifier;
 
@@ -35,8 +35,7 @@ fn make_storage() -> Arc<citrate_storage::StorageManager> {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let pruning = citrate_storage::pruning::PruningConfig::default();
     Arc::new(
-        citrate_storage::StorageManager::new(tmp.path(), pruning)
-            .expect("create StorageManager"),
+        citrate_storage::StorageManager::new(tmp.path(), pruning).expect("create StorageManager"),
     )
 }
 
@@ -200,7 +199,10 @@ async fn test_registry_register_duplicate_fails() {
     // Second registration with same hash should fail
     let result = registry.register(meta, providers, None).await;
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("already registered"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("already registered"));
 }
 
 #[tokio::test]
@@ -213,7 +215,10 @@ async fn test_registry_validate_empty_name() {
 
     let result = registry.register(meta, vec![], None).await;
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("name cannot be empty"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("name cannot be empty"));
 }
 
 #[tokio::test]
@@ -225,7 +230,10 @@ async fn test_registry_validate_zero_size() {
 
     let result = registry.register(meta, vec![], None).await;
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("size cannot be zero"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("size cannot be zero"));
 }
 
 #[tokio::test]
@@ -331,10 +339,7 @@ async fn test_registry_create_request() {
 
     let provider = Address([60u8; 20]);
     let meta = make_model_metadata("request-model", 1000, 0x44);
-    let model_id = registry
-        .register(meta, vec![provider], None)
-        .await
-        .unwrap();
+    let model_id = registry.register(meta, vec![provider], None).await.unwrap();
 
     let requester = Address([70u8; 20]);
     let input_hash = Hash::new([0xBB; 32]);
@@ -395,10 +400,7 @@ async fn test_registry_update_request_status_completed() {
 
     let provider = Address([80u8; 20]);
     let meta = make_model_metadata("status-model", 1000, 0x66);
-    let model_id = registry
-        .register(meta, vec![provider], None)
-        .await
-        .unwrap();
+    let model_id = registry.register(meta, vec![provider], None).await.unwrap();
 
     let request_id = registry
         .create_request(
@@ -466,7 +468,10 @@ async fn test_registry_update_request_status_not_found() {
         .update_request_status(RequestId([0xFF; 32]), RequestStatus::Cancelled)
         .await;
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Request not found"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Request not found"));
 }
 
 // =============================================================================
@@ -478,7 +483,11 @@ fn test_gguf_config_default() {
     let config = GGUFEngineConfig::default();
     assert!(config.context_size > 0);
     assert!(config.threads > 0);
-    assert!(config.models_dir.to_str().unwrap().contains(".citrate/models"));
+    assert!(config
+        .models_dir
+        .to_str()
+        .unwrap()
+        .contains(".citrate/models"));
 }
 
 #[test]
@@ -1479,7 +1488,10 @@ async fn test_provider_latency_affects_score() {
         supported_hardware: vec![HardwareType::CPU],
     };
 
-    let selected = registry.select_provider(&model_id, &requirements).await.unwrap();
+    let selected = registry
+        .select_provider(&model_id, &requirements)
+        .await
+        .unwrap();
     // Fast provider should win due to lower latency (higher latency score)
     assert_eq!(selected, p_fast.address);
 }
@@ -1543,7 +1555,11 @@ async fn test_registry_persist_and_retrieve_multiple() {
     for i in 0..5u8 {
         let meta = make_model_metadata(&format!("model-{}", i), 1000 + i as u64, i + 100);
         let model_id = registry
-            .register(meta, vec![Address([i + 50; 20])], Some(format!("QmCid{}", i)))
+            .register(
+                meta,
+                vec![Address([i + 50; 20])],
+                Some(format!("QmCid{}", i)),
+            )
             .await
             .unwrap();
         ids.push(model_id);

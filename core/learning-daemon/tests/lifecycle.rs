@@ -8,9 +8,7 @@
 //! trainer, finalizer) are `#[ignore = "WP-3.X"]` per RM-FL-1
 //! retro item #1 — un-ignore them when the impl lands.
 
-use citrate_learning_daemon::aggregator::{
-    BelnapAggregator, EmbeddingEntry, MemoryEmbeddingCache,
-};
+use citrate_learning_daemon::aggregator::{BelnapAggregator, EmbeddingEntry, MemoryEmbeddingCache};
 use citrate_learning_daemon::chain::{FakeChain, LearningEvent};
 use citrate_learning_daemon::orchestrator::{
     Aggregator, Finalizer, Orchestrator, StubAggregator, StubFinalizer, StubTrainer, Trainer,
@@ -31,10 +29,7 @@ fn fixture() -> (Arc<FakeChain>, Arc<DaemonState>, TempDir) {
     (chain, state, dir)
 }
 
-fn make_orchestrator(
-    chain: Arc<FakeChain>,
-    state: Arc<DaemonState>,
-) -> Orchestrator<FakeChain> {
+fn make_orchestrator(chain: Arc<FakeChain>, state: Arc<DaemonState>) -> Orchestrator<FakeChain> {
     Orchestrator::new(
         chain,
         state,
@@ -137,8 +132,7 @@ async fn scenario_1_happy_cycle_aggregator_path() {
     cache.insert(1, make_entry(0x02, 32768));
     cache.insert(1, make_entry(0x03, 32768));
 
-    let aggregator =
-        Arc::new(BelnapAggregator::new(chain.clone(), state.clone(), cache));
+    let aggregator = Arc::new(BelnapAggregator::new(chain.clone(), state.clone(), cache));
     let orchestrator = Orchestrator::new(
         chain.clone(),
         state.clone(),
@@ -180,8 +174,7 @@ async fn scenario_2_missed_checkpoint_aggregator_processes_all_observed() {
         cache.insert(1, make_entry(i + 1, 32768));
     }
 
-    let aggregator =
-        Arc::new(BelnapAggregator::new(chain.clone(), state.clone(), cache));
+    let aggregator = Arc::new(BelnapAggregator::new(chain.clone(), state.clone(), cache));
     aggregator.aggregate(1).await.expect("ok");
 
     let commits = chain.submitted_commits();
@@ -238,7 +231,9 @@ async fn scenario_3b_killed_during_aggregation_resumes_correctly() {
         // commit yet. (We don't actually call aggregate() here
         // because that goes all the way to Committed in one shot —
         // we simulate the partial state directly.)
-        state.set_cycle_status(1, CycleStatus::Computed).expect("ok");
+        state
+            .set_cycle_status(1, CycleStatus::Computed)
+            .expect("ok");
     } // Daemon dies. RocksDB closes.
 
     // Second incarnation: same on-disk state, fresh process.
@@ -246,8 +241,7 @@ async fn scenario_3b_killed_during_aggregation_resumes_correctly() {
     let cache2 = Arc::new(MemoryEmbeddingCache::new());
     cache2.insert(1, make_entry(0x01, 32768));
 
-    let aggregator =
-        Arc::new(BelnapAggregator::new(chain.clone(), state2.clone(), cache2));
+    let aggregator = Arc::new(BelnapAggregator::new(chain.clone(), state2.clone(), cache2));
     aggregator.aggregate(1).await.expect("ok");
 
     // Idempotency: status was already Computed on disk, so
@@ -282,10 +276,18 @@ async fn scenario_4_two_daemons_no_double_finalize() {
 
     // Both daemons observed the cycle as Committed (real flow:
     // both saw the AggregationCommitted event).
-    state_a.set_cycle_status(1, CycleStatus::Computed).expect("ok");
-    state_a.set_cycle_status(1, CycleStatus::Committed).expect("ok");
-    state_b.set_cycle_status(1, CycleStatus::Computed).expect("ok");
-    state_b.set_cycle_status(1, CycleStatus::Committed).expect("ok");
+    state_a
+        .set_cycle_status(1, CycleStatus::Computed)
+        .expect("ok");
+    state_a
+        .set_cycle_status(1, CycleStatus::Committed)
+        .expect("ok");
+    state_b
+        .set_cycle_status(1, CycleStatus::Computed)
+        .expect("ok");
+    state_b
+        .set_cycle_status(1, CycleStatus::Committed)
+        .expect("ok");
 
     // Daemon A wins the race.
     try_finalize_cycle(chain.clone(), state_a.clone(), 1)
@@ -325,7 +327,11 @@ async fn scenario_5_rpc_outage_does_not_advance_hwm() {
     chain.arm_next_error("connection refused");
     let err = watcher.step().await.expect_err("RPC error surfaces");
     assert!(matches!(err, DaemonError::Chain(_)));
-    assert_eq!(state.last_processed_block(), 0, "HWM did NOT advance during outage");
+    assert_eq!(
+        state.last_processed_block(),
+        0,
+        "HWM did NOT advance during outage"
+    );
 
     // RPC recovers — next step advances normally.
     let step = watcher.step().await.expect("step");
@@ -443,7 +449,10 @@ async fn orchestrator_finalize_skips_when_already_called() {
     state
         .set_cycle_status(1, CycleStatus::Committed)
         .expect("ok");
-    orchestrator.try_finalize(1).await.expect("first finalize ok");
+    orchestrator
+        .try_finalize(1)
+        .await
+        .expect("first finalize ok");
 
     // Second call: orchestrator skips silently (idempotent at this
     // layer; the chain-level guard is the second line of defense).
@@ -457,7 +466,9 @@ async fn orchestrator_dispatches_aggregation_committed_event() {
     let orchestrator = make_orchestrator(chain.clone(), state.clone());
 
     // Pre-set cycle to Computed so dispatch_event can promote it.
-    state.set_cycle_status(1, CycleStatus::Computed).expect("ok");
+    state
+        .set_cycle_status(1, CycleStatus::Computed)
+        .expect("ok");
 
     chain.produce_block();
     chain.emit_event(

@@ -38,7 +38,7 @@ import "../src/ComputePoolTraining.sol";
 contract DeployComputePoolTraining is ScriptEnv {
     function run() external {
         address deployer = deployerAddress();
-        address governance = envAddressOr("GOVERNANCE", deployer);
+        address governance = requiredGovernance("GOVERNANCE", deployer);
 
         console.log("=== ComputePoolTraining deployment ===");
         console.log("Deployer:   ", deployer);

@@ -12,7 +12,9 @@ contract PBA_L2_046_Permission is Test {
     function test_L2_046_callerWithoutBasePermissionRefused() public {
         PricedRegistry reg = new PricedRegistry();
         LoRAFactory f = new LoRAFactory(address(reg), address(this));
-        vm.etch(address(0x1001), type(LoraPrecompileStub).runtimeCode);
+        // A node that serves 0x0101 inference to contracts (HUP-S7.2: adapter
+        // inference goes to 0x0101 via CitratePrecompiles, failing closed otherwise).
+        vm.etch(address(0x0101), type(LoraPrecompileStub).runtimeCode);
         address creator = makeAddr("creator");
         vm.deal(creator, 10 ether);
         reg.setPerm(creator);

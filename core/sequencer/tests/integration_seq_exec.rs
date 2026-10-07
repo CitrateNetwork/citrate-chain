@@ -63,8 +63,8 @@ async fn test_build_block_and_execute_transactions() {
     let proposer = PublicKey::new([7; 32]);
     let state_db_for_builder = Arc::new(citrate_execution::StateDB::new());
     let executor_for_builder = Arc::new(Executor::new(state_db_for_builder.clone()));
-    let builder = BlockBuilder::new(cfg, mempool.clone(), proposer)
-        .with_executor(executor_for_builder);
+    let builder =
+        BlockBuilder::new(cfg, mempool.clone(), proposer).with_executor(executor_for_builder);
 
     // Three txs, distinct senders; one classified as inference by builder
     let tx1 = make_tx(0, 2_000_000_000, [1; 32], [2; 32], vec![]);

@@ -25,12 +25,12 @@
 
 #![cfg(feature = "halo2-substrate")]
 
-use citrate_execution::precompiles::verify::{addresses, execute};
 use citrate_execution::precompiles::q16::{ops as q16_ops, Q16};
+use citrate_execution::precompiles::verify::{addresses, execute};
 use citrate_execution::types::Address;
 use citrate_execution::zkp::halo2::circuits::InferenceCircuit;
-use citrate_execution::zkp::halo2::CIRCUIT_VERSION_LINEAR_Q16;
 use citrate_execution::zkp::halo2::ptau::load_ptau_into_params_kzg;
+use citrate_execution::zkp::halo2::CIRCUIT_VERSION_LINEAR_Q16;
 use citrate_execution::zkp::poseidon_bn254::poseidon_hash;
 
 use ark_bn254::Fr as ArkFr;
@@ -132,13 +132,11 @@ fn precompile_0x0108_with_real_ptau_srs() {
 
     // 5. Prover side: load the same .ptau and generate the proof.
     eprintln!("Loading .ptau from {} (k={})", path, V1_K);
-    let params = load_ptau_into_params_kzg(&path, V1_K)
-        .expect("load real .ptau");
+    let params = load_ptau_into_params_kzg(&path, V1_K).expect("load real .ptau");
     eprintln!("ParamsKZG ready. Running keygen + proof generation...");
 
     // Build the circuit witness in halo2 Fr.
-    let weights_fr: Vec<Halo2Fr> =
-        weights.iter().copied().map(q16_to_halo2_fr).collect();
+    let weights_fr: Vec<Halo2Fr> = weights.iter().copied().map(q16_to_halo2_fr).collect();
     let inputs_fr: Vec<Halo2Fr> = inputs.iter().copied().map(q16_to_halo2_fr).collect();
     let biases_fr: Vec<Halo2Fr> = biases.iter().copied().map(q16_to_halo2_fr).collect();
     let circuit = InferenceCircuit {
@@ -152,8 +150,7 @@ fn precompile_0x0108_with_real_ptau_srs() {
     let vk = keygen_vk(&params, &circuit.without_witnesses()).expect("vk");
     let pk = keygen_pk(&params, vk.clone(), &circuit.without_witnesses()).expect("pk");
 
-    let public_inputs: Vec<Vec<Halo2Fr>> =
-        vec![vec![input_commit, model_commit, output_commit]];
+    let public_inputs: Vec<Vec<Halo2Fr>> = vec![vec![input_commit, model_commit, output_commit]];
     let mut transcript = Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(vec![]);
     let prover_rng = StdRng::from_seed([0xAB; 32]);
     create_proof::<KZGCommitmentScheme<Bn256>, ProverSHPLONK<'_, Bn256>, _, _, _, _>(

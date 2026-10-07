@@ -63,19 +63,28 @@ contract DeployComplianceRegistry is ScriptEnv {
 
         bool seedE2E = envUintOr("CMO_PORTAL_SEED_E2E", 0) == 1;
 
+        // G2: govern the CMO-portal contracts with the ceremony GOVERNANCE, not the
+        // deployer (fail-closed on 40204). Plain CREATE, so this does not move the
+        // deployed addresses — only who holds governance. The E2E seed path below
+        // calls onlyGovernance methods as the deployer, so it is dev-only: reject it
+        // on 40204 where governance is (correctly) the multisig, not the deployer.
+        address gov = requiredGovernance("GOVERNANCE", deployer);
+        require(!seedE2E || block.chainid != 40204, "CMO_PORTAL_SEED_E2E is dev-only (governance != deployer on 40204)");
+
         console.log("=== Deploying CMO Portal Contracts ===");
-        console.log("Deployer/Governance:", deployer);
+        console.log("Deployer:", deployer);
+        console.log("Governance:", gov);
         console.log("Chain ID:", block.chainid);
         console.log("Seed E2E sample data:", seedE2E);
 
         vm.startBroadcast();
 
         // 1. InstitutionTreeV1 (governance-owned)
-        InstitutionTreeV1 tree = new InstitutionTreeV1(deployer);
+        InstitutionTreeV1 tree = new InstitutionTreeV1(gov);
         console.log("institutionTree=", address(tree));
 
         // 2. ComplianceRegistry (depends on tree address)
-        ComplianceRegistry reg = new ComplianceRegistry(deployer, address(tree));
+        ComplianceRegistry reg = new ComplianceRegistry(gov, address(tree));
         console.log("complianceRegistry=", address(reg));
 
         if (seedE2E) {

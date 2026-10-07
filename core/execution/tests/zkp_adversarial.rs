@@ -9,14 +9,13 @@
 
 use citrate_execution::zkp::backend::ZKPBackend;
 use citrate_execution::zkp::circuits::{DataIntegrityCircuit, StateTransitionCircuit};
-use citrate_execution::zkp::mimc::{mimc_hash, mimc_encrypt, fr_to_bytes_le};
+use citrate_execution::zkp::mimc::{fr_to_bytes_le, mimc_encrypt, mimc_hash};
 use citrate_execution::zkp::types::{
-    GradientProofCircuit, ModelExecutionCircuit, ProofRequest, ProofType,
-    SerializableProof,
+    GradientProofCircuit, ModelExecutionCircuit, ProofRequest, ProofType, SerializableProof,
 };
 
 use ark_bls12_381::Fr;
-use ark_ff::{PrimeField, Zero, One};
+use ark_ff::{One, PrimeField, Zero};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -24,7 +23,9 @@ use ark_ff::{PrimeField, Zero, One};
 
 fn initialized_backend() -> ZKPBackend {
     let backend = ZKPBackend::new();
-    backend.initialize().expect("backend initialize should succeed");
+    backend
+        .initialize()
+        .expect("backend initialize should succeed");
     backend
 }
 
@@ -108,7 +109,9 @@ fn test_random_bytes_never_verify() {
 
     for &size in &sizes {
         let random_proof = SerializableProof {
-            proof_bytes: (0..size).map(|i| (i as u8).wrapping_mul(37).wrapping_add(17)).collect(),
+            proof_bytes: (0..size)
+                .map(|i| (i as u8).wrapping_mul(37).wrapping_add(17))
+                .collect(),
             public_inputs: vec!["12345".to_string()],
         };
 
@@ -183,7 +186,12 @@ fn test_proof_from_wrong_circuit_rejected() {
     );
 
     let result = backend.verify_proof(ProofType::ModelExecution, &data_proof);
-    if let Ok(valid) = result { assert!(!valid, "DataIntegrity proof must not verify as ModelExecution") }
+    if let Ok(valid) = result {
+        assert!(
+            !valid,
+            "DataIntegrity proof must not verify as ModelExecution"
+        )
+    }
 }
 
 /// Replaying a valid proof with different public inputs must fail.
@@ -212,7 +220,10 @@ fn test_replayed_proof_with_different_inputs_fails() {
 
     let result = backend.verify_proof(ProofType::ModelExecution, &replayed_proof);
     if let Ok(valid) = result {
-        assert!(!valid, "Replayed proof with different public inputs must not verify");
+        assert!(
+            !valid,
+            "Replayed proof with different public inputs must not verify"
+        );
     } // Verification math error is also acceptable
 }
 
@@ -276,7 +287,10 @@ fn test_public_input_overflow_rejected() {
 
     let result = backend.verify_proof(ProofType::ModelExecution, &overflow_proof);
     if let Ok(valid) = result {
-        assert!(!valid, "u128::MAX public input must not produce a valid proof");
+        assert!(
+            !valid,
+            "u128::MAX public input must not produce a valid proof"
+        );
     } // Expected
 }
 
@@ -323,7 +337,9 @@ fn test_duplicate_public_inputs_handled() {
     };
 
     let result = backend.verify_proof(ProofType::ModelExecution, &dup_proof);
-    if let Ok(v) = result { assert!(!v, "Proof with duplicated public inputs must not verify") }
+    if let Ok(v) = result {
+        assert!(!v, "Proof with duplicated public inputs must not verify")
+    }
 }
 
 // ===========================================================================
@@ -361,11 +377,7 @@ fn test_gradient_zero_samples_rejected() {
     let backend = initialized_backend();
 
     let circuit_data = make_gradient_data(
-        &[1u8; 32],
-        &[2u8; 32],
-        &[3u8; 32],
-        0.5,
-        0, // zero samples
+        &[1u8; 32], &[2u8; 32], &[3u8; 32], 0.5, 0, // zero samples
     );
 
     let request = ProofRequest {
@@ -392,11 +404,8 @@ fn test_gradient_zero_hash_rejected() {
         let backend = initialized_backend();
 
         let circuit_data = make_gradient_data(
-            &[1u8; 32],
-            &[2u8; 32],
-            &[0u8; 32], // all-zero gradient hash
-            0.5,
-            100,
+            &[1u8; 32], &[2u8; 32], &[0u8; 32], // all-zero gradient hash
+            0.5, 100,
         );
 
         let request = ProofRequest {
@@ -471,7 +480,9 @@ fn test_proof_from_different_setup_rejected() {
 
     // Sanity: proof verifies on backend A
     assert!(
-        backend_a.verify_proof(ProofType::ModelExecution, &proof).unwrap(),
+        backend_a
+            .verify_proof(ProofType::ModelExecution, &proof)
+            .unwrap(),
         "Proof must verify on the backend that generated it",
     );
 
@@ -494,7 +505,9 @@ fn test_proof_from_different_setup_rejected() {
 fn test_verify_after_double_initialize() {
     let backend = ZKPBackend::new();
     backend.initialize().expect("First initialize must succeed");
-    backend.initialize().expect("Second initialize must succeed");
+    backend
+        .initialize()
+        .expect("Second initialize must succeed");
 
     // Generate and verify a proof after double-init
     let proof = generate_valid_proof(
@@ -607,7 +620,8 @@ fn test_mimc_length_extension_resistance() {
     for i in 0..hashes.len() {
         for j in (i + 1)..hashes.len() {
             assert_ne!(
-                hashes[i], hashes[j],
+                hashes[i],
+                hashes[j],
                 "Length extension collision: inputs of length {} and {} hash to the same value",
                 i + 1,
                 j + 1,
@@ -649,7 +663,8 @@ fn test_fr_to_bytes_edge_cases() {
         let bytes = fr_to_bytes_le(&val);
         let recovered = Fr::from_le_bytes_mod_order(&bytes);
         assert_eq!(
-            val, recovered,
+            val,
+            recovered,
             "Fr roundtrip failed for value with bytes {:?}",
             &bytes[..8],
         );
@@ -672,7 +687,9 @@ fn test_single_bit_flip_detected() {
     );
 
     // Verify original is valid
-    assert!(backend.verify_proof(ProofType::ModelExecution, &valid).unwrap());
+    assert!(backend
+        .verify_proof(ProofType::ModelExecution, &valid)
+        .unwrap());
 
     // Flip each byte in the proof and verify it's rejected
     // (only test first 32 bytes to keep test time reasonable)
@@ -683,11 +700,7 @@ fn test_single_bit_flip_detected() {
 
         let result = backend.verify_proof(ProofType::ModelExecution, &tampered);
         if let Ok(v) = result {
-            assert!(
-                !v,
-                "Proof with bit flip at byte {} must not verify",
-                i,
-            );
+            assert!(!v, "Proof with bit flip at byte {} must not verify", i,);
         } // Deserialization failure is fine
     }
 }
@@ -757,7 +770,10 @@ fn test_extended_proof_bytes_trailing_ignored() {
     if let Ok(v) = result {
         // This actually verifies because arkworks ignores trailing bytes.
         // The test passes — it documents the behavior.
-        assert!(v, "Extended proof with trailing bytes still verifies via arkworks");
+        assert!(
+            v,
+            "Extended proof with trailing bytes still verifies via arkworks"
+        );
     } // If arkworks ever changes to reject trailing bytes, that's fine too
 }
 
@@ -813,9 +829,7 @@ fn test_state_transition_zero_tx_hash_rejected() {
     let backend = initialized_backend();
 
     let circuit_data = make_state_transition_data(
-        &[1u8; 32],
-        &[2u8; 32],
-        &[0u8; 32], // zero transaction hash
+        &[1u8; 32], &[2u8; 32], &[0u8; 32], // zero transaction hash
     );
 
     let request = ProofRequest {

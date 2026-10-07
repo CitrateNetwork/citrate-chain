@@ -163,7 +163,11 @@ fn ipfs_add_blocking(data: Vec<u8>) -> Result<String, String> {
             .json()
             .await
             .map_err(|e| format!("IPFS parse error: {}", e))?;
-        let cid = json["Hash"].as_str().unwrap_or("").to_string();
+        let cid = json
+            .get("Hash")
+            .and_then(|h| h.as_str())
+            .unwrap_or("")
+            .to_string();
         if cid.is_empty() {
             return Err("IPFS returned empty CID".to_string());
         }
@@ -536,9 +540,7 @@ pub fn rpc_host_allowlist(
 impl Default for RpcConfig {
     fn default() -> Self {
         Self {
-            listen_addr: "127.0.0.1:8545"
-                .parse()
-                .unwrap_or_else(|e| panic!("valid hardcoded address: {e}")),
+            listen_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 8545)),
             max_connections: 100,
             // C-02 FIX: No wildcard CORS by default — prevents browser-to-localhost abuse
             cors_origins: vec!["http://localhost:*".to_string()],
@@ -609,6 +611,7 @@ impl RpcServer {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -635,6 +638,10 @@ impl RpcServer {
         // NEVER registered on a public bind, so the override cannot be reached over the
         // public RPC. Setting it resumes production one round; the gate auto-clears it.
         catchup_override: Option<Arc<std::sync::atomic::AtomicBool>>,
+        // BFT-finalized height source (the canonical applicator's `finalized_height`
+        // handle). Backs the `finalized`/`safe` RPC block tags. When None, the tags
+        // resolve to genesis (block 0) — the documented pre-checkpoint behaviour.
+        finalized_height: Option<Arc<std::sync::atomic::AtomicU64>>,
     ) -> Self {
         let mut io_handler = IoHandler::new();
 
@@ -644,13 +651,18 @@ impl RpcServer {
         // CHAIN-B-D003: start the stale-filter sweeper. Previously
         // `cleanup_stale_filters()` had zero call sites, so an unauthenticated
         // `eth_newFilter` flood grew retained heap for the process lifetime.
-        filter_registry
+        if let Err(e) = filter_registry
             .clone()
-            .spawn_cleanup(std::time::Duration::from_secs(60));
+            .spawn_cleanup(std::time::Duration::from_secs(60))
+        {
+            // The sweeper bounds eth_newFilter heap growth; without it filters are
+            // still bounded by the per-registry caps, so keep serving but say so.
+            tracing::error!("could not spawn the stale-filter sweeper thread: {e}");
+        }
 
         // Register Ethereum-compatible RPC methods
         // WP-I.3: Pass pause_flag so emergency methods are actually registered
-        eth_rpc::register_eth_methods(
+        eth_rpc::register_eth_methods_with_finality(
             &mut io_handler,
             storage.clone(),
             mempool.clone(),
@@ -658,6 +670,7 @@ impl RpcServer {
             chain_id,
             filter_registry,
             pause_flag,
+            finalized_height.unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicU64::new(0))),
         );
 
         // Truthful eth_syncing OVERRIDE (last registration wins): report progress
@@ -711,9 +724,9 @@ impl RpcServer {
                                 return Err(jsonrpc_core::Error::invalid_params(e.to_string()))
                             }
                         };
-                        let map = value
-                            .as_object()
-                            .ok_or_else(|| jsonrpc_core::Error::invalid_params("Expected object"))?;
+                        let map = value.as_object().ok_or_else(|| {
+                            jsonrpc_core::Error::invalid_params("Expected object")
+                        })?;
                         require_operator_auth(map)?;
                         override_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                         warn!(
@@ -886,10 +899,13 @@ impl RpcServer {
             // C-01 FIX: Validate caller ownership before allowing update
             // Parse the 'from' address and verify it matches the model owner
             let from_addr_trimmed = from_hex.trim_start_matches("0x");
-            if from_addr_trimmed.len() >= 40 {
-                let mut caller_addr = [0u8; 20];
-                if let Ok(bytes) = hex::decode(&from_addr_trimmed[..40]) {
-                    caller_addr.copy_from_slice(&bytes[..20]);
+            // `get(..40)` is None for a non-ASCII string whose 40th byte is not a
+            // char boundary (a user-supplied param used to panic the handler here).
+            if let Some(addr_hex) = from_addr_trimmed.get(..40) {
+                if let Some(caller_addr) = hex::decode(addr_hex)
+                    .ok()
+                    .and_then(|bytes| <[u8; 20]>::try_from(bytes.as_slice()).ok())
+                {
                     let caller = citrate_execution::types::Address(caller_addr);
                     if caller != existing.owner {
                         return Err(jsonrpc_core::Error {
@@ -935,7 +951,7 @@ impl RpcServer {
             let updated_model = citrate_execution::types::ModelState {
                 owner: existing.owner,
                 model_hash: existing.model_hash,
-                version: existing.version + 1,
+                version: existing.version.saturating_add(1),
                 metadata: updated_metadata,
                 access_policy: existing.access_policy.clone(),
                 usage_stats: existing.usage_stats.clone(),
@@ -1212,8 +1228,9 @@ impl RpcServer {
                     "Missing transaction data",
                 ));
             }
-            let tx_hex = params[0]
-                .as_str()
+            let tx_hex = params
+                .first()
+                .and_then(|p| p.as_str())
                 .ok_or_else(|| jsonrpc_core::Error::invalid_params("Invalid tx hex"))?;
             let tx_bytes = match hex::decode(tx_hex.trim().trim_start_matches("0x")) {
                 Ok(b) => b,
@@ -1232,9 +1249,10 @@ impl RpcServer {
             // Check sender balance covers value + gas
             let sender_addr = citrate_execution::address_utils::normalize_address(&tx.from);
             let balance = exec.get_canonical_account(&sender_addr).balance; // SRP-S4 WP-2.2: non-warming committed read
+                                                                            // u64 × u64 < 2^128 and + u128 stays far below 2^256: neither saturates.
             let gas_cost = primitive_types::U256::from(tx.gas_limit)
-                * primitive_types::U256::from(tx.gas_price);
-            let total_cost = gas_cost + primitive_types::U256::from(tx.value);
+                .saturating_mul(primitive_types::U256::from(tx.gas_price));
+            let total_cost = gas_cost.saturating_add(primitive_types::U256::from(tx.value));
             if balance < total_cost {
                 return Err(jsonrpc_core::Error::invalid_params(format!(
                     "Insufficient funds: account balance {} < required {}",
@@ -1481,13 +1499,14 @@ impl RpcServer {
 
             // Compare after stripping metadata trailers
             fn strip_metadata(code: &[u8]) -> &[u8] {
-                if code.len() >= 2 {
-                    let l = u16::from_be_bytes([code[code.len()-2], code[code.len()-1]]) as usize;
-                    if code.len() >= l + 2 {
-                        let start = code.len() - (l + 2);
-                        let first = code[start];
-                        if (first & 0xE0) == 0xA0 { // likely CBOR map (0xA0..0xBF)
-                            return &code[..start];
+                // Solidity appends CBOR metadata followed by its 2-byte length.
+                if let Some((body, len_bytes)) = code.split_last_chunk::<2>() {
+                    let l = u16::from_be_bytes(*len_bytes) as usize;
+                    if let Some(start) = body.len().checked_sub(l) {
+                        if let (Some(&first), Some(stripped)) = (code.get(start), code.get(..start)) {
+                            if (first & 0xE0) == 0xA0 { // likely CBOR map (0xA0..0xBF)
+                                return stripped;
+                            }
                         }
                     }
                 }
@@ -1789,9 +1808,9 @@ impl RpcServer {
                     if let Some(ts) = v.get("timestamp").and_then(|t| t.as_str()) {
                         if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
                             let dt_utc = dt.with_timezone(&chrono::Utc);
-                            if (now - dt_utc).num_seconds() as u64 > age {
+                            if now.signed_duration_since(dt_utc).num_seconds() as u64 > age {
                                 let _ = storage_gc.db.delete_cf("metadata", k);
-                                removed += 1;
+                                removed = removed.saturating_add(1);
                             }
                         }
                     }
@@ -1817,7 +1836,7 @@ impl RpcServer {
                 if remaining.len() > max as usize {
                     for (k, _v) in remaining.into_iter().skip(max as usize) {
                         let _ = storage_gc.db.delete_cf("metadata", &k);
-                        removed += 1;
+                        removed = removed.saturating_add(1);
                     }
                 }
             }
@@ -2338,7 +2357,9 @@ impl RpcServer {
             };
             // Accept both {model_id: ...} and [{model_id: ...}]
             let obj_value = match &value {
-                serde_json::Value::Array(arr) if !arr.is_empty() => arr[0].clone(),
+                serde_json::Value::Array(arr) if !arr.is_empty() => {
+                    arr.first().cloned().unwrap_or_default()
+                }
                 _ => value.clone(),
             };
             let obj = match obj_value.as_object() {
@@ -2496,7 +2517,9 @@ impl RpcServer {
             };
             // Accept both {model_id: ...} and [{model_id: ...}]
             let obj_value = match &value {
-                serde_json::Value::Array(arr) if !arr.is_empty() => arr[0].clone(),
+                serde_json::Value::Array(arr) if !arr.is_empty() => {
+                    arr.first().cloned().unwrap_or_default()
+                }
                 _ => value.clone(),
             };
             let obj = match obj_value.as_object() {

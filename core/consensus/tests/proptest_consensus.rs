@@ -7,13 +7,13 @@
 use proptest::prelude::*;
 use std::sync::Arc;
 
-use citrate_consensus::{
-    Block, BlockBuilder, CheckpointConfig, GhostDagParams,
-    Hash, PublicKey, Signature, Transaction, VrfProof,
-};
 use citrate_consensus::checkpoint::CommitteeSelector;
 use citrate_consensus::dag_store::DagStore;
 use citrate_consensus::ghostdag::GhostDag;
+use citrate_consensus::{
+    Block, BlockBuilder, CheckpointConfig, GhostDagParams, Hash, PublicKey, Signature, Transaction,
+    VrfProof,
+};
 
 /// Helper: build a minimal valid Block from raw byte arrays for property tests.
 fn make_block(
@@ -115,7 +115,13 @@ async fn build_chain(n: usize, seed: u64) -> (GhostDag, Arc<DagStore>, Vec<Hash>
     let mut prev = genesis.hash();
 
     for i in 0..n {
-        let block = make_dag_block(hash_for(seed, i as u64), prev, vec![], (i + 1) as u64, (i + 1) as u64);
+        let block = make_dag_block(
+            hash_for(seed, i as u64),
+            prev,
+            vec![],
+            (i + 1) as u64,
+            (i + 1) as u64,
+        );
         dag_store.store_block(block.clone()).await.unwrap();
         ghostdag.add_block(&block).await.unwrap();
         hashes.push(block.hash());

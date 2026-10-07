@@ -78,7 +78,11 @@ fn global_version_sentinel_excluded_from_account_iter() {
     store.put_account_version(&addr(2), 7).unwrap();
 
     let all = store.get_all_account_versions().unwrap();
-    assert_eq!(all.len(), 2, "global-version sentinel must not leak into account iter");
+    assert_eq!(
+        all.len(),
+        2,
+        "global-version sentinel must not leak into account iter"
+    );
     let got: HashMap<Address, u64> = all.into_iter().collect();
     assert_eq!(got[&addr(1)], 5);
     assert_eq!(got[&addr(2)], 7);
@@ -152,7 +156,11 @@ fn batch_overwrites_single() {
         .put_account_versions(&[(addr(1), 50), (addr(2), 60)])
         .unwrap();
 
-    let all: HashMap<Address, u64> = store.get_all_account_versions().unwrap().into_iter().collect();
+    let all: HashMap<Address, u64> = store
+        .get_all_account_versions()
+        .unwrap()
+        .into_iter()
+        .collect();
     assert_eq!(all[&addr(1)], 50);
     assert_eq!(all[&addr(2)], 60);
 }

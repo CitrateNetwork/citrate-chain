@@ -52,12 +52,16 @@ impl std::fmt::Display for InferenceAuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MalformedSignature => write!(f, "signature must be 65 hex bytes (r||s||v)"),
-            Self::MissingTimestamp => write!(f, "signed requests require a 'timestamp' (unix seconds)"),
+            Self::MissingTimestamp => {
+                write!(f, "signed requests require a 'timestamp' (unix seconds)")
+            }
             Self::StaleTimestamp => write!(
                 f,
                 "timestamp outside the ±{MAX_TIMESTAMP_SKEW_SECS}s freshness window"
             ),
-            Self::SignatureMismatch => write!(f, "signature does not verify for the claimed 'from'"),
+            Self::SignatureMismatch => {
+                write!(f, "signature does not verify for the claimed 'from'")
+            }
             Self::MissingFrom => write!(f, "signed requests require 'from'"),
         }
     }
@@ -112,21 +116,21 @@ pub fn resolve_identity(
 
     let sig_bytes = hex::decode(sig_hex.trim_start_matches("0x"))
         .map_err(|_| InferenceAuthError::MalformedSignature)?;
-    if sig_bytes.len() != 65 {
-        return Err(InferenceAuthError::MalformedSignature);
-    }
-    let r = &sig_bytes[0..32];
-    let s = &sig_bytes[32..64];
+    let sig: &[u8; 65] = sig_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| InferenceAuthError::MalformedSignature)?;
+    let (r, rest) = sig.split_at(32);
+    let (s, v) = rest.split_at(32);
     // Accept both raw recovery ids {0,1} and Ethereum-style {27,28}.
-    let v = match sig_bytes[64] {
-        v @ 0..=1 => v,
-        v @ 27..=28 => v - 27,
+    let v = match v {
+        [v @ 0..=1] => *v,
+        [v @ 27..=28] => v.saturating_sub(27),
         _ => return Err(InferenceAuthError::MalformedSignature),
     };
 
     let msg = auth_message_hash(chain_id, model_id, input, ts);
-    let recovered =
-        recover_address(&msg, r, s, v).ok_or(InferenceAuthError::SignatureMismatch)?;
+    let recovered = recover_address(&msg, r, s, v).ok_or(InferenceAuthError::SignatureMismatch)?;
 
     if recovered != from.0 {
         return Err(InferenceAuthError::SignatureMismatch);
@@ -153,13 +157,11 @@ mod tests {
     }
 
     fn sign(sk: &SigningKey, msg: &[u8; 32]) -> String {
-        let (sig, recid): (Signature, _) =
-            sk.sign_prehash_recoverable(msg).expect("sign");
+        let (sig, recid): (Signature, _) = sk.sign_prehash_recoverable(msg).expect("sign");
         // Normalize to low-s (recover_address rejects high-s per EIP-2).
         let (sig, recid) = if let Some(normalized) = sig.normalize_s() {
             // Flipping s flips the recovery id parity.
-            let flipped = k256::ecdsa::RecoveryId::from_byte(recid.to_byte() ^ 1)
-                .expect("recid");
+            let flipped = k256::ecdsa::RecoveryId::from_byte(recid.to_byte() ^ 1).expect("recid");
             (normalized, flipped)
         } else {
             (sig, recid)
@@ -241,18 +243,29 @@ mod tests {
 
         // Different model.
         assert!(resolve_identity(
-            CHAIN_ID, &[8u8; 32], b"input", Some(addr), Some(&sig), Some(NOW), NOW
+            CHAIN_ID,
+            &[8u8; 32],
+            b"input",
+            Some(addr),
+            Some(&sig),
+            Some(NOW),
+            NOW
         )
         .is_err());
         // Different input.
         assert!(resolve_identity(
-            CHAIN_ID, &model, b"other", Some(addr), Some(&sig), Some(NOW), NOW
+            CHAIN_ID,
+            &model,
+            b"other",
+            Some(addr),
+            Some(&sig),
+            Some(NOW),
+            NOW
         )
         .is_err());
         // Different chain (cross-deployment replay).
         assert!(
-            resolve_identity(1, &model, b"input", Some(addr), Some(&sig), Some(NOW), NOW)
-                .is_err()
+            resolve_identity(1, &model, b"input", Some(addr), Some(&sig), Some(NOW), NOW).is_err()
         );
     }
 

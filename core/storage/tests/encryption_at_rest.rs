@@ -185,7 +185,10 @@ fn on_disk_values_are_ciphertext() {
 
     // Raw bytes for the account: sealed envelope, not the bincode plaintext.
     let raw_account = raw_read(tmp.path(), "accounts", &addr.0).expect("raw account bytes");
-    assert!(is_sealed(&raw_account), "account value must carry the envelope prefix");
+    assert!(
+        is_sealed(&raw_account),
+        "account value must carry the envelope prefix"
+    );
     assert_ne!(raw_account, plaintext_account);
     // Ciphertext must not embed the plaintext.
     assert!(!raw_account
@@ -195,7 +198,10 @@ fn on_disk_values_are_ciphertext() {
     // Raw bytes for the block written via the batch path: also sealed.
     let raw_block =
         raw_read(tmp.path(), "blocks", Hash::new([2; 32]).as_bytes()).expect("raw block bytes");
-    assert!(is_sealed(&raw_block), "batch-written value must carry the envelope prefix");
+    assert!(
+        is_sealed(&raw_block),
+        "batch-written value must carry the envelope prefix"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -220,10 +226,7 @@ fn iterators_decrypt_values() {
         .get_all_accounts()
         .expect("get_all_accounts should succeed");
     assert_eq!(accounts.len(), 5);
-    let total: u128 = accounts
-        .iter()
-        .map(|(_, a)| a.balance.as_u128())
-        .sum();
+    let total: u128 = accounts.iter().map(|(_, a)| a.balance.as_u128()).sum();
     assert_eq!(total, 100 + 200 + 300 + 400 + 500);
 
     // Raw iter_cf on the wrapper also yields decrypted values.
@@ -262,8 +265,8 @@ fn wrong_key_rejected_at_open() {
             .expect("put_account should succeed");
     }
 
-    let wrong = StorageConfig::default()
-        .with_encryption(EncryptionAtRestConfig::with_raw_key(WRONG_KEY));
+    let wrong =
+        StorageConfig::default().with_encryption(EncryptionAtRestConfig::with_raw_key(WRONG_KEY));
     let err = open_must_fail(tmp.path(), wrong, "wrong key must be rejected at open");
     let at_rest = err
         .downcast_ref::<AtRestError>()
@@ -276,8 +279,9 @@ fn wrong_key_rejected_at_open() {
 fn password_salt_persists_and_wrong_password_rejected() {
     let tmp = TempDir::new().expect("tempdir");
     let config = || {
-        StorageConfig::default()
-            .with_encryption(EncryptionAtRestConfig::with_password("desktop-beta-passphrase"))
+        StorageConfig::default().with_encryption(EncryptionAtRestConfig::with_password(
+            "desktop-beta-passphrase",
+        ))
     };
 
     {
@@ -508,8 +512,7 @@ fn bench_encrypted_vs_raw_overhead() {
     };
 
     let raw_dir = TempDir::new().expect("tempdir");
-    let raw_mgr =
-        StorageManager::new(raw_dir.path(), PruningConfig::default()).expect("raw open");
+    let raw_mgr = StorageManager::new(raw_dir.path(), PruningConfig::default()).expect("raw open");
     let (raw_put, raw_get, raw_iter) = run(&raw_mgr, "raw      ");
 
     let enc_dir = TempDir::new().expect("tempdir");

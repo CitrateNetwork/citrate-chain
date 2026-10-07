@@ -25,8 +25,7 @@ fn workspace_root() -> PathBuf {
 fn read_text(rel: &str) -> String {
     let mut p = workspace_root();
     p.push(rel);
-    fs::read_to_string(&p)
-        .unwrap_or_else(|e| panic!("K1.9: cannot read {}: {e}", p.display()))
+    fs::read_to_string(&p).unwrap_or_else(|e| panic!("K1.9: cannot read {}: {e}", p.display()))
 }
 
 #[test]

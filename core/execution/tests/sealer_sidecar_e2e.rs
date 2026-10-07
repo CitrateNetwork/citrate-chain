@@ -115,10 +115,20 @@ fn prover_porep_proof_verifies_through_0x0108() {
     let sealed = seal_reduced(pinner, cid, sector, epoch, data);
     let proof = prove_porep_reduced(&sealed, pinner, 1).expect("prove porep");
     let wire = porep_wire(
-        &sealed.replica_id, &sealed.cid, &sealed.sector_index,
-        &sealed.comm_d, &sealed.comm_r, &sealed.comm_c, &sealed.epoch, 1, &proof,
+        &sealed.replica_id,
+        &sealed.cid,
+        &sealed.sector_index,
+        &sealed.comm_d,
+        &sealed.comm_r,
+        &sealed.comm_c,
+        &sealed.epoch,
+        1,
+        &proof,
     );
-    assert!(verify_via_precompile(&wire), "sidecar PoRep proof must verify via 0x0108");
+    assert!(
+        verify_via_precompile(&wire),
+        "sidecar PoRep proof must verify via 0x0108"
+    );
 }
 
 #[test]
@@ -130,8 +140,15 @@ fn seal_proof_at_index0_verifies_matching_contract_seal_wire() {
     let sealed = seal_reduced(pinner, cid, sector, epoch, data);
     let proof = prove_porep_reduced(&sealed, pinner, 0).expect("prove porep @0");
     let wire = porep_wire(
-        &sealed.replica_id, &sealed.cid, &sealed.sector_index,
-        &sealed.comm_d, &sealed.comm_r, &sealed.comm_c, &sealed.epoch, 0, &proof,
+        &sealed.replica_id,
+        &sealed.cid,
+        &sealed.sector_index,
+        &sealed.comm_d,
+        &sealed.comm_r,
+        &sealed.comm_c,
+        &sealed.epoch,
+        0,
+        &proof,
     );
     assert!(
         verify_via_precompile(&wire),
@@ -145,10 +162,19 @@ fn prover_post_proof_verifies_through_0x0108() {
     let sealed = seal_reduced(pinner, cid, sector, epoch, data);
     let proof = prove_post_reduced(&sealed, pinner, 1).expect("prove post");
     let wire = post_wire(
-        &sealed.replica_id, &sealed.cid, &sealed.sector_index,
-        &sealed.comm_r, &sealed.comm_c, &sealed.epoch, 1, &proof,
+        &sealed.replica_id,
+        &sealed.cid,
+        &sealed.sector_index,
+        &sealed.comm_r,
+        &sealed.comm_c,
+        &sealed.epoch,
+        1,
+        &proof,
     );
-    assert!(verify_via_precompile(&wire), "sidecar PoSt proof must verify via 0x0108");
+    assert!(
+        verify_via_precompile(&wire),
+        "sidecar PoSt proof must verify via 0x0108"
+    );
 }
 
 /// REGRESSION GUARD for the contract↔circuit replicaID binding (PIN-S6 finding):
@@ -166,10 +192,20 @@ fn wire_must_carry_the_circuits_poseidon_replica_id() {
 
     // (a) the circuit's Poseidon replicaID verifies.
     let good = porep_wire(
-        &sealed.replica_id, &sealed.cid, &sealed.sector_index,
-        &sealed.comm_d, &sealed.comm_r, &sealed.comm_c, &sealed.epoch, 1, &proof,
+        &sealed.replica_id,
+        &sealed.cid,
+        &sealed.sector_index,
+        &sealed.comm_d,
+        &sealed.comm_r,
+        &sealed.comm_c,
+        &sealed.epoch,
+        1,
+        &proof,
     );
-    assert!(verify_via_precompile(&good), "Poseidon replicaID must verify");
+    assert!(
+        verify_via_precompile(&good),
+        "Poseidon replicaID must verify"
+    );
 
     // (b) a keccak-derived replicaID (different field element) must NOT verify
     //     with the same proof — demonstrating the contract cannot substitute its
@@ -177,7 +213,9 @@ fn wire_must_carry_the_circuits_poseidon_replica_id() {
     let keccak_rid = {
         let h = Keccak256::digest(b"any-keccak-derived-replica-id-binding");
         let mut le = [0u8; 32];
-        for (i, b) in h.iter().enumerate() { le[31 - i] = *b; }
+        for (i, b) in h.iter().enumerate() {
+            le[31 - i] = *b;
+        }
         // reduce into the field via from_repr-or-mod isn't needed: just feed the
         // raw 32 bytes through the same to_fr path the precompile uses.
         let mut wire = good.clone();
@@ -199,10 +237,20 @@ fn tampered_sidecar_proof_rejected() {
     let mid = proof.len() / 2;
     proof[mid] ^= 0x01;
     let wire = porep_wire(
-        &sealed.replica_id, &sealed.cid, &sealed.sector_index,
-        &sealed.comm_d, &sealed.comm_r, &sealed.comm_c, &sealed.epoch, 1, &proof,
+        &sealed.replica_id,
+        &sealed.cid,
+        &sealed.sector_index,
+        &sealed.comm_d,
+        &sealed.comm_r,
+        &sealed.comm_c,
+        &sealed.epoch,
+        1,
+        &proof,
     );
-    assert!(!verify_via_precompile(&wire), "a tampered proof must not verify");
+    assert!(
+        !verify_via_precompile(&wire),
+        "a tampered proof must not verify"
+    );
 }
 
 // ── Full sidecar BINARY e2e: drive the citrate-sealer process over its JSON
@@ -255,10 +303,17 @@ fn sealer_binary_roundtrip_verifies_through_0x0108() {
     let line = String::from_utf8(output.stdout).expect("utf8");
     let resp: serde_json::Value =
         serde_json::from_str(line.lines().next().expect("a response line")).expect("json");
-    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "sealer returned error: {resp}");
+    assert_eq!(
+        resp["ok"],
+        serde_json::Value::Bool(true),
+        "sealer returned error: {resp}"
+    );
 
     let parse = |k: &str| -> Halo2Fr {
-        let s = resp[k].as_str().expect("hex field").trim_start_matches("0x");
+        let s = resp[k]
+            .as_str()
+            .expect("hex field")
+            .trim_start_matches("0x");
         let bytes = hex::decode(s).expect("hex");
         let mut le = [0u8; 32];
         for (i, b) in bytes.iter().enumerate() {
@@ -270,11 +325,22 @@ fn sealer_binary_roundtrip_verifies_through_0x0108() {
     let comm_d = parse("comm_d");
     let comm_r = parse("comm_r");
     let comm_c = parse("comm_c");
-    let proof_hex = resp["proof"].as_str().expect("proof").trim_start_matches("0x");
+    let proof_hex = resp["proof"]
+        .as_str()
+        .expect("proof")
+        .trim_start_matches("0x");
     let proof = hex::decode(proof_hex).expect("proof hex");
 
     let wire = porep_wire(
-        &replica_id, &cid, &sector, &comm_d, &comm_r, &comm_c, &epoch, 1, &proof,
+        &replica_id,
+        &cid,
+        &sector,
+        &comm_d,
+        &comm_r,
+        &comm_c,
+        &epoch,
+        1,
+        &proof,
     );
     assert!(
         verify_via_precompile(&wire),

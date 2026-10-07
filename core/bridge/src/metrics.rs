@@ -131,7 +131,7 @@ impl BridgeMetrics {
         if last == 0 {
             return false;
         }
-        now - last < 60
+        now.saturating_sub(last) < 60
     }
 
     /// Generate a Prometheus-compatible metrics snapshot.
@@ -152,18 +152,15 @@ impl BridgeMetrics {
             self.deposits_failed.load(Ordering::Relaxed)
         ));
 
-        output.push_str(
-            "# HELP citrate_bridge_withdrawals_total Total withdrawals processed\n",
-        );
+        output.push_str("# HELP citrate_bridge_withdrawals_total Total withdrawals processed\n");
         output.push_str("# TYPE citrate_bridge_withdrawals_total counter\n");
         output.push_str(&format!(
             "citrate_bridge_withdrawals_total {}\n",
             self.withdrawals_processed.load(Ordering::Relaxed)
         ));
 
-        output.push_str(
-            "# HELP citrate_bridge_salt_credited_total Total SALT credited via bridge\n",
-        );
+        output
+            .push_str("# HELP citrate_bridge_salt_credited_total Total SALT credited via bridge\n");
         output.push_str("# TYPE citrate_bridge_salt_credited_total counter\n");
         output.push_str(&format!(
             "citrate_bridge_salt_credited_total {}\n",
@@ -191,9 +188,7 @@ impl BridgeMetrics {
             self.events_pending.load(Ordering::Relaxed)
         ));
 
-        output.push_str(
-            "# HELP citrate_bridge_last_eth_block Last processed Ethereum block\n",
-        );
+        output.push_str("# HELP citrate_bridge_last_eth_block Last processed Ethereum block\n");
         output.push_str("# TYPE citrate_bridge_last_eth_block gauge\n");
         output.push_str(&format!(
             "citrate_bridge_last_eth_block {}\n",

@@ -1,17 +1,25 @@
 // citrate/core/economics/src/unified_economics.rs
 
 use crate::{
-    governance::{GovernanceManager, GovernanceConfig, ProposalType, ProposalUpdate},
-    dynamic_pricing::{DynamicPricingManager, DynamicPricingConfig, UtilizationMetrics, OperationType, PricingUpdate},
-    enhanced_rewards::{EnhancedRewardCalculator, EnhancedRewardConfig, ValidatorPerformance, AIContribution, NetworkHealth, EnhancedRewardDistribution},
-    revenue_sharing::{RevenueShareManager, RevenueShareConfig, RevenuePool, StakeholderType, RevenueDistribution},
+    dynamic_pricing::{
+        DynamicPricingConfig, DynamicPricingManager, OperationType, PricingUpdate,
+        UtilizationMetrics,
+    },
+    enhanced_rewards::{
+        AIContribution, EnhancedRewardCalculator, EnhancedRewardConfig, EnhancedRewardDistribution,
+        NetworkHealth, ValidatorPerformance,
+    },
+    governance::{GovernanceConfig, GovernanceManager, ProposalType, ProposalUpdate},
+    revenue_sharing::{
+        RevenueDistribution, RevenuePool, RevenueShareConfig, RevenueShareManager, StakeholderType,
+    },
     token::{Token, TokenConfig},
 };
+use anyhow::{anyhow, Result};
 use citrate_execution::types::Address;
 use primitive_types::U256;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use anyhow::{Result, anyhow};
 
 /// Unified economic system configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,7 +43,7 @@ impl Default for UnifiedEconomicsConfig {
             rewards_config: EnhancedRewardConfig::default(),
             revenue_share_config: RevenueShareConfig::default(),
             gas_governance_ratio: 0.1, // 10% weight from gas usage
-            minimum_governance_balance: U256::from(100) * U256::from(10).pow(U256::from(18)), // 100 SALT
+            minimum_governance_balance: crate::salt(100), // 100 SALT
             economic_security_threshold: 0.67, // 67% threshold for economic security
         }
     }
@@ -44,12 +52,12 @@ impl Default for UnifiedEconomicsConfig {
 /// Unified governance and gas token voting power calculation
 #[derive(Debug, Clone)]
 pub struct VotingPower {
-    pub token_power: U256,        // Power from token holdings
-    pub gas_usage_power: U256,    // Power from gas usage (network participation)
-    pub staking_power: U256,      // Power from staking/validation
-    pub reputation_power: U256,   // Power from AI contributions and reputation
-    pub total_power: U256,        // Combined voting power
-    pub quadratic_power: U256,    // Quadratic voting power to prevent plutocracy
+    pub token_power: U256,      // Power from token holdings
+    pub gas_usage_power: U256,  // Power from gas usage (network participation)
+    pub staking_power: U256,    // Power from staking/validation
+    pub reputation_power: U256, // Power from AI contributions and reputation
+    pub total_power: U256,      // Combined voting power
+    pub quadratic_power: U256,  // Quadratic voting power to prevent plutocracy
 }
 
 /// Economic state snapshot
@@ -132,10 +140,9 @@ impl UnifiedEconomicsManager {
         self.distribute_rewards(&reward_distribution)?;
 
         // Process governance proposals
-        let governance_updates = self.governance.process_proposals(
-            block_height,
-            self.token.circulating_supply(),
-        );
+        let governance_updates = self
+            .governance
+            .process_proposals(block_height, self.token.circulating_supply());
 
         // Execute any ready proposals
         let executed_proposals = self.execute_ready_proposals()?;
@@ -169,24 +176,36 @@ impl UnifiedEconomicsManager {
     }
 
     /// Calculate unified voting power for an address
-    pub fn calculate_voting_power(&self, address: Address, block_height: u64) -> Result<VotingPower> {
+    pub fn calculate_voting_power(
+        &self,
+        address: Address,
+        block_height: u64,
+    ) -> Result<VotingPower> {
         // Token-based power (primary component)
         let token_balance = self.token.balance_of(&address);
-        let staked_balance = self.staking_balances.get(&address).copied().unwrap_or(U256::zero());
-        let token_power = token_balance + staked_balance;
+        let staked_balance = self
+            .staking_balances
+            .get(&address)
+            .copied()
+            .unwrap_or(U256::zero());
+        let token_power = token_balance.saturating_add(staked_balance);
 
         // Gas usage power (network participation)
         let gas_usage_power = self.calculate_gas_usage_power(&address, block_height);
 
         // Staking power (additional weight for validators)
-        let staking_power = staked_balance * U256::from(120) / U256::from(100); // 20% bonus for staking
+        let staking_power = crate::mul_div(staked_balance, U256::from(120), U256::from(100)); // 20% bonus for staking
 
         // Reputation power (AI contributions)
         let reputation_score = self.reputation_scores.get(&address).copied().unwrap_or(0.0);
-        let reputation_power = U256::from((reputation_score * 1000.0) as u64) * U256::from(10).pow(U256::from(15)); // Scale reputation
+        let reputation_power =
+            U256::from((reputation_score * 1000.0) as u64).saturating_mul(U256::exp10(15)); // Scale reputation
 
         // Calculate total linear power
-        let total_power = token_power + gas_usage_power + staking_power + reputation_power;
+        let total_power = token_power
+            .saturating_add(gas_usage_power)
+            .saturating_add(staking_power)
+            .saturating_add(reputation_power);
 
         // Apply quadratic voting to prevent plutocracy
         let quadratic_power = self.calculate_quadratic_power(total_power);
@@ -210,21 +229,31 @@ impl UnifiedEconomicsManager {
 
         // Transfer to staking
         self.token.burn(&staker, amount)?;
-        let current_stake = self.staking_balances.get(&staker).copied().unwrap_or(U256::zero());
-        self.staking_balances.insert(staker, current_stake + amount);
+        let current_stake = self
+            .staking_balances
+            .get(&staker)
+            .copied()
+            .unwrap_or(U256::zero());
+        self.staking_balances
+            .insert(staker, current_stake.saturating_add(amount));
 
         Ok(())
     }
 
     /// Unstake tokens (with potential slashing)
     pub fn unstake_tokens(&mut self, staker: Address, amount: U256) -> Result<()> {
-        let staked = self.staking_balances.get(&staker).copied().unwrap_or(U256::zero());
+        let staked = self
+            .staking_balances
+            .get(&staker)
+            .copied()
+            .unwrap_or(U256::zero());
         if staked < amount {
             return Err(anyhow!("Insufficient staked amount"));
         }
 
         // Remove from staking
-        self.staking_balances.insert(staker, staked - amount);
+        self.staking_balances
+            .insert(staker, staked.saturating_sub(amount));
 
         // Return tokens (mint back)
         self.token.mint(&staker, amount)?;
@@ -241,8 +270,12 @@ impl UnifiedEconomicsManager {
         block_height: u64,
     ) -> Result<()> {
         // Check minimum balance for governance participation
-        let total_balance = self.token.balance_of(&voter) +
-                           self.staking_balances.get(&voter).copied().unwrap_or(U256::zero());
+        let total_balance = self.token.balance_of(&voter).saturating_add(
+            self.staking_balances
+                .get(&voter)
+                .copied()
+                .unwrap_or(U256::zero()),
+        );
 
         if total_balance < self.config.minimum_governance_balance {
             return Err(anyhow!("Insufficient balance for governance participation"));
@@ -253,11 +286,12 @@ impl UnifiedEconomicsManager {
 
         // Use quadratic power for governance to ensure fairness
         // (but fall back to linear if quadratic is too small)
-        let _effective_power = if voting_power.quadratic_power > self.config.governance_config.vote_threshold {
-            voting_power.quadratic_power
-        } else {
-            voting_power.total_power
-        };
+        let _effective_power =
+            if voting_power.quadratic_power > self.config.governance_config.vote_threshold {
+                voting_power.quadratic_power
+            } else {
+                voting_power.total_power
+            };
 
         // Temporarily override governance vote calculation
         // (In practice, we'd modify the governance manager to accept custom voting power)
@@ -278,15 +312,20 @@ impl UnifiedEconomicsManager {
     }
 
     /// Pay gas fees (automatically burns a portion for deflationary pressure)
-    pub fn pay_gas_fees(&mut self, payer: Address, amount: U256, burn_percentage: u8) -> Result<()> {
+    pub fn pay_gas_fees(
+        &mut self,
+        payer: Address,
+        amount: U256,
+        burn_percentage: u8,
+    ) -> Result<()> {
         // Check balance
         if self.token.balance_of(&payer) < amount {
             return Err(anyhow!("Insufficient balance for gas fees"));
         }
 
         // Calculate burn amount
-        let burn_amount = amount * U256::from(burn_percentage) / U256::from(100);
-        let remainder = amount - burn_amount;
+        let burn_amount = crate::mul_div(amount, U256::from(burn_percentage), U256::from(100));
+        let remainder = amount.saturating_sub(burn_amount);
 
         // Burn portion of gas fees
         if burn_amount > U256::zero() {
@@ -304,7 +343,10 @@ impl UnifiedEconomicsManager {
 
     /// Calculate economic security of the network
     pub fn calculate_economic_security(&self) -> f64 {
-        let total_staked: U256 = self.staking_balances.values().fold(U256::zero(), |acc, &x| acc + x);
+        let total_staked: U256 = self
+            .staking_balances
+            .values()
+            .fold(U256::zero(), |acc, &x| acc.saturating_add(x));
         let total_supply = self.token.circulating_supply();
 
         if total_supply.is_zero() {
@@ -342,16 +384,21 @@ impl UnifiedEconomicsManager {
     fn calculate_gas_usage_power(&self, address: &Address, block_height: u64) -> U256 {
         let history = self.gas_usage_history.get(address);
         if let Some(history) = history {
-            let recent_usage: U256 = history.iter()
+            let recent_usage: U256 = history
+                .iter()
                 // saturating_sub: `block_height - height` underflows (and panics
                 // under overflow-checks) when a recorded height is above the
                 // query height — reachable via getVotingPower's hard-coded 0.
                 .filter(|(height, _)| block_height.saturating_sub(*height) <= 100) // Last 100 blocks
                 .map(|(_, gas)| *gas)
-                .fold(U256::zero(), |acc, x| acc + x);
+                .fold(U256::zero(), |acc, x| acc.saturating_add(x));
 
             // Convert gas usage to voting power (scaled down)
-            recent_usage * U256::from((self.config.gas_governance_ratio * 100.0) as u64) / U256::from(100)
+            crate::mul_div(
+                recent_usage,
+                U256::from((self.config.gas_governance_ratio * 100.0) as u64),
+                U256::from(100),
+            )
         } else {
             U256::zero()
         }
@@ -386,7 +433,8 @@ impl UnifiedEconomicsManager {
         if distribution.treasury_allocation > U256::zero() {
             // Treasury address should be configurable
             let treasury = Address([0x11; 20]); // Placeholder
-            self.token.mint(&treasury, distribution.treasury_allocation)?;
+            self.token
+                .mint(&treasury, distribution.treasury_allocation)?;
         }
 
         Ok(())
@@ -407,7 +455,10 @@ impl UnifiedEconomicsManager {
     }
 
     fn calculate_economic_state(&self, block_height: u64) -> EconomicState {
-        let total_staked: U256 = self.staking_balances.values().fold(U256::zero(), |acc, &x| acc + x);
+        let total_staked: U256 = self
+            .staking_balances
+            .values()
+            .fold(U256::zero(), |acc, &x| acc.saturating_add(x));
         let treasury_balance = self.token.balance_of(&Address([0x11; 20])); // Treasury placeholder
 
         EconomicState {
@@ -438,7 +489,10 @@ impl UnifiedEconomicsManager {
     }
 
     pub fn get_staked_balance(&self, address: &Address) -> U256 {
-        self.staking_balances.get(address).copied().unwrap_or(U256::zero())
+        self.staking_balances
+            .get(address)
+            .copied()
+            .unwrap_or(U256::zero())
     }
 
     pub fn get_reputation_score(&self, address: &Address) -> f64 {
@@ -451,16 +505,12 @@ impl UnifiedEconomicsManager {
         address: Address,
         stakeholder_type: StakeholderType,
     ) -> Result<()> {
-        self.revenue_sharing.register_stakeholder(address, stakeholder_type)
+        self.revenue_sharing
+            .register_stakeholder(address, stakeholder_type)
     }
 
     /// Collect revenue fees for distribution
-    pub fn collect_fee(
-        &mut self,
-        pool: RevenuePool,
-        amount: U256,
-        source: Address,
-    ) -> Result<()> {
+    pub fn collect_fee(&mut self, pool: RevenuePool, amount: U256, source: Address) -> Result<()> {
         self.revenue_sharing.collect_revenue(pool, amount, source)
     }
 
@@ -483,7 +533,9 @@ impl UnifiedEconomicsManager {
             if *staked_amount > U256::zero() {
                 self.revenue_sharing.update_contribution(
                     *address,
-                    *staked_amount / U256::from(100), // Scale down for contribution scoring
+                    staked_amount
+                        .checked_div(U256::from(100))
+                        .unwrap_or_default(), // Scale down for contribution scoring
                     1, // One block of activity
                 )?;
             }
@@ -493,11 +545,8 @@ impl UnifiedEconomicsManager {
         for (address, reputation) in &self.reputation_scores {
             if *reputation > 0.5 {
                 let contribution = U256::from((*reputation * 1000.0) as u64);
-                self.revenue_sharing.update_contribution(
-                    *address,
-                    contribution,
-                    1,
-                )?;
+                self.revenue_sharing
+                    .update_contribution(*address, contribution, 1)?;
             }
         }
 
@@ -510,12 +559,18 @@ impl UnifiedEconomicsManager {
     }
 
     /// Get stakeholder revenue sharing information
-    pub fn get_stakeholder_revenue_info(&self, address: &Address) -> Option<&crate::revenue_sharing::StakeholderContribution> {
+    pub fn get_stakeholder_revenue_info(
+        &self,
+        address: &Address,
+    ) -> Option<&crate::revenue_sharing::StakeholderContribution> {
         self.revenue_sharing.get_stakeholder_contribution(address)
     }
 
     /// Get revenue distribution history
-    pub fn get_revenue_distribution_history(&self, pool: Option<RevenuePool>) -> Vec<&RevenueDistribution> {
+    pub fn get_revenue_distribution_history(
+        &self,
+        pool: Option<RevenuePool>,
+    ) -> Vec<&RevenueDistribution> {
         self.revenue_sharing.get_distribution_history(pool)
     }
 
@@ -555,7 +610,7 @@ mod tests {
         let mut economics = UnifiedEconomicsManager::new(config);
 
         let address = Address([1; 20]);
-        let amount = U256::from(1000) * U256::from(10).pow(U256::from(18));
+        let amount = crate::salt(1000);
 
         // Mint some tokens
         economics.token.mint(&address, amount).unwrap();
@@ -571,7 +626,7 @@ mod tests {
         let mut economics = UnifiedEconomicsManager::new(config);
 
         let address = Address([1; 20]);
-        let amount = U256::from(1000) * U256::from(10).pow(U256::from(18));
+        let amount = crate::salt(1000);
 
         // Mint and stake tokens
         economics.token.mint(&address, amount).unwrap();

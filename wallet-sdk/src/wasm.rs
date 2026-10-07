@@ -235,12 +235,9 @@ pub fn secp256k1_sign_hash(private_key: &[u8], msg_hash: &[u8]) -> Result<Vec<u8
     // k256's PrehashSigner doesn't return the recovery id directly —
     // we recompute it. The pattern matches wallet-core's
     // `Secp256k1.sign_evm_tx` so the on-the-wire format is identical.
-    let recovery_id = RecoveryId::trial_recovery_from_prehash(
-        signing_key.verifying_key(),
-        msg_hash,
-        &signature,
-    )
-    .map_err(|e| JsError::new(&format!("EXT-10: recovery id failed: {}", e)))?;
+    let recovery_id =
+        RecoveryId::trial_recovery_from_prehash(signing_key.verifying_key(), msg_hash, &signature)
+            .map_err(|e| JsError::new(&format!("EXT-10: recovery id failed: {}", e)))?;
 
     // k256's Signature is automatically normalized to low-S by
     // `sign_prehash` per EIP-2; assert defensively.

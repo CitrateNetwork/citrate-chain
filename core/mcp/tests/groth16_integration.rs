@@ -10,10 +10,10 @@
 // These tests document the actual state and verify what works.
 
 use citrate_execution::zkp::backend::ZKPBackend;
+use citrate_execution::zkp::circuits::{DataIntegrityCircuit, StateTransitionCircuit};
 use citrate_execution::zkp::types::{
-    ModelExecutionCircuit, GradientProofCircuit, ProofRequest, ProofType, SerializableProof,
+    GradientProofCircuit, ModelExecutionCircuit, ProofRequest, ProofType, SerializableProof,
 };
-use citrate_execution::zkp::circuits::{StateTransitionCircuit, DataIntegrityCircuit};
 use std::time::Instant;
 
 fn setup_backend() -> ZKPBackend {
@@ -26,9 +26,12 @@ fn model_exec_request() -> ProofRequest {
     ProofRequest {
         proof_type: ProofType::ModelExecution,
         circuit_data: bincode::serialize(&ModelExecutionCircuit {
-            model_hash: vec![1u8; 32], input_hash: vec![2u8; 32],
-            output_hash: vec![3u8; 32], computation_trace: vec![],
-        }).unwrap(),
+            model_hash: vec![1u8; 32],
+            input_hash: vec![2u8; 32],
+            output_hash: vec![3u8; 32],
+            computation_trace: vec![],
+        })
+        .unwrap(),
         public_inputs: vec![],
     }
 }
@@ -37,9 +40,13 @@ fn gradient_request() -> ProofRequest {
     ProofRequest {
         proof_type: ProofType::GradientSubmission,
         circuit_data: bincode::serialize(&GradientProofCircuit {
-            model_hash: vec![4u8; 32], dataset_hash: vec![5u8; 32],
-            gradient_hash: vec![6u8; 32], loss_value: 0.5, num_samples: 100,
-        }).unwrap(),
+            model_hash: vec![4u8; 32],
+            dataset_hash: vec![5u8; 32],
+            gradient_hash: vec![6u8; 32],
+            loss_value: 0.5,
+            num_samples: 100,
+        })
+        .unwrap(),
         public_inputs: vec![],
     }
 }
@@ -48,9 +55,11 @@ fn state_transition_request() -> ProofRequest {
     ProofRequest {
         proof_type: ProofType::StateTransition,
         circuit_data: bincode::serialize(&StateTransitionCircuit {
-            old_state_root: vec![7u8; 32], new_state_root: vec![8u8; 32],
+            old_state_root: vec![7u8; 32],
+            new_state_root: vec![8u8; 32],
             transaction_hash: vec![9u8; 32],
-        }).unwrap(),
+        })
+        .unwrap(),
         public_inputs: vec![],
     }
 }
@@ -59,9 +68,12 @@ fn data_integrity_request() -> ProofRequest {
     ProofRequest {
         proof_type: ProofType::DataIntegrity,
         circuit_data: bincode::serialize(&DataIntegrityCircuit {
-            data_hash: vec![10u8; 32], merkle_path: vec![],
-            merkle_root: vec![10u8; 32], leaf_index: 0,
-        }).unwrap(),
+            data_hash: vec![10u8; 32],
+            merkle_path: vec![],
+            merkle_root: vec![10u8; 32],
+            leaf_index: 0,
+        })
+        .unwrap(),
         public_inputs: vec![],
     }
 }
@@ -79,7 +91,11 @@ fn test_groth16_init() {
 fn test_model_execution_generates() {
     let b = setup_backend();
     let r = b.generate_proof(model_exec_request());
-    assert!(r.is_ok(), "ModelExecution proof generation failed: {:?}", r.err());
+    assert!(
+        r.is_ok(),
+        "ModelExecution proof generation failed: {:?}",
+        r.err()
+    );
     assert!(!r.unwrap().proof.proof_bytes.is_empty());
 }
 
@@ -87,21 +103,33 @@ fn test_model_execution_generates() {
 fn test_gradient_submission_generates() {
     let b = setup_backend();
     let r = b.generate_proof(gradient_request());
-    assert!(r.is_ok(), "GradientSubmission proof generation failed: {:?}", r.err());
+    assert!(
+        r.is_ok(),
+        "GradientSubmission proof generation failed: {:?}",
+        r.err()
+    );
 }
 
 #[test]
 fn test_state_transition_generates() {
     let b = setup_backend();
     let r = b.generate_proof(state_transition_request());
-    assert!(r.is_ok(), "StateTransition proof generation failed: {:?}", r.err());
+    assert!(
+        r.is_ok(),
+        "StateTransition proof generation failed: {:?}",
+        r.err()
+    );
 }
 
 #[test]
 fn test_data_integrity_generates() {
     let b = setup_backend();
     let r = b.generate_proof(data_integrity_request());
-    assert!(r.is_ok(), "DataIntegrity proof generation failed: {:?}", r.err());
+    assert!(
+        r.is_ok(),
+        "DataIntegrity proof generation failed: {:?}",
+        r.err()
+    );
 }
 
 // ── 6. Proof serialization roundtrip ────────────────────────────────
@@ -143,7 +171,12 @@ fn test_all_types_verify() {
     ] {
         let r = b.generate_proof(req).unwrap();
         let result = b.verify_proof(pt, &r.proof);
-        assert!(result.is_ok(), "{:?} verification failed: {:?}", pt, result.err());
+        assert!(
+            result.is_ok(),
+            "{:?} verification failed: {:?}",
+            pt,
+            result.err()
+        );
         assert!(result.unwrap(), "{:?} proof should verify as valid", pt);
     }
 }
@@ -181,7 +214,10 @@ fn test_all_types_generation_benchmark() {
 fn test_generation_time_recorded() {
     let b = setup_backend();
     let r = b.generate_proof(model_exec_request()).unwrap();
-    assert!(r.generation_time_ms > 0, "Generation time should be recorded");
+    assert!(
+        r.generation_time_ms > 0,
+        "Generation time should be recorded"
+    );
 }
 
 // ── 11. Multiple proofs from same input are all independently valid ──
@@ -193,13 +229,27 @@ fn test_generation_time_recorded() {
 fn test_multiple_proofs_from_same_input_are_valid() {
     let b = setup_backend();
     let r1 = b.generate_proof(model_exec_request()).expect("first proof");
-    let r2 = b.generate_proof(model_exec_request()).expect("second proof");
+    let r2 = b
+        .generate_proof(model_exec_request())
+        .expect("second proof");
     // Both proofs should produce non-empty proof bytes
-    assert!(!r1.proof.proof_bytes.is_empty(), "First proof bytes non-empty");
-    assert!(!r2.proof.proof_bytes.is_empty(), "Second proof bytes non-empty");
+    assert!(
+        !r1.proof.proof_bytes.is_empty(),
+        "First proof bytes non-empty"
+    );
+    assert!(
+        !r2.proof.proof_bytes.is_empty(),
+        "Second proof bytes non-empty"
+    );
     // Both should have public inputs
-    assert!(!r1.proof.public_inputs.is_empty(), "First proof has public inputs");
-    assert!(!r2.proof.public_inputs.is_empty(), "Second proof has public inputs");
+    assert!(
+        !r1.proof.public_inputs.is_empty(),
+        "First proof has public inputs"
+    );
+    assert!(
+        !r2.proof.public_inputs.is_empty(),
+        "Second proof has public inputs"
+    );
     // Groth16 blinding factors mean bytes may differ — that is correct
 }
 
@@ -229,11 +279,11 @@ fn test_invalid_circuit_data_rejected() {
 fn test_diagnostic_verification_error() {
     let b = setup_backend();
     let r = b.generate_proof(model_exec_request()).unwrap();
-    
+
     println!("Proof bytes length: {}", r.proof.proof_bytes.len());
     println!("Public inputs count: {}", r.proof.public_inputs.len());
     println!("Public inputs: {:?}", r.proof.public_inputs);
-    
+
     let result = b.verify_proof(ProofType::ModelExecution, &r.proof);
     match &result {
         Ok(v) => println!("Verification result: valid={}", v),

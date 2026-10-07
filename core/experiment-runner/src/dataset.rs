@@ -40,9 +40,7 @@ impl DatasetCid {
         for line in text.lines() {
             match Self::parse(line) {
                 Ok(cid) => return Ok(cid),
-                Err(DatasetError::Empty | DatasetError::CommentLine) => {
-                    continue
-                }
+                Err(DatasetError::Empty | DatasetError::CommentLine) => continue,
                 Err(e) => return Err(e),
             }
         }
@@ -98,20 +96,16 @@ mod tests {
             DatasetCid::parse("# rotation note"),
             Err(DatasetError::CommentLine)
         ));
-        assert!(matches!(
-            DatasetCid::parse("   "),
-            Err(DatasetError::Empty)
-        ));
+        assert!(matches!(DatasetCid::parse("   "), Err(DatasetError::Empty)));
         let ok = DatasetCid::parse("baexamplecidvalue").expect("ok");
         assert_eq!(ok.as_str(), "baexamplecidvalue");
     }
 
     #[test]
     fn parse_accepts_0x_bytes32_form() {
-        let ok = DatasetCid::parse(
-            "0xabcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
-        )
-        .expect("ok");
+        let ok =
+            DatasetCid::parse("0xabcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789")
+                .expect("ok");
         assert!(ok.as_str().starts_with("0x"));
     }
 }

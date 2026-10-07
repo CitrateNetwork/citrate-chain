@@ -1,11 +1,25 @@
+// PANIC-S1 G2: production code in this crate may not panic (tests excepted).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::string_slice
+    )
+)]
+
 use anyhow::Result;
+use citrate_execution::types::Address;
+use citrate_wallet::{Wallet, WalletConfig};
 use clap::{Parser, Subcommand};
 use colored::*;
 use console::Term;
 use dialoguer::{Input, Password, Select};
 use indicatif::{ProgressBar, ProgressStyle};
-use citrate_execution::types::Address;
-use citrate_wallet::{Wallet, WalletConfig};
 use primitive_types::U256;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -438,8 +452,9 @@ async fn send_transaction(
     pb.finish_and_clear();
 
     if let Some(receipt) = receipt {
-        let status = receipt["status"]
-            .as_str()
+        let status = receipt
+            .get("status")
+            .and_then(|s| s.as_str())
             .map(|s| s == "0x1")
             .unwrap_or(false);
 
@@ -449,7 +464,7 @@ async fn send_transaction(
             println!("{}", "✗ Transaction failed!".red());
         }
 
-        if let Some(block) = receipt["blockNumber"].as_str() {
+        if let Some(block) = receipt.get("blockNumber").and_then(|b| b.as_str()) {
             let block_num = u64::from_str_radix(block.trim_start_matches("0x"), 16)?;
             println!("  Block: #{}", block_num);
         }
@@ -604,14 +619,17 @@ async fn interactive_mode(wallet: &mut Wallet) -> Result<()> {
 
 /// Format U256 wei to SALT string
 fn format_latt(wei: U256) -> String {
-    let decimals = U256::from(10).pow(U256::from(18));
-    let whole = wei / decimals;
-    let fraction = wei % decimals;
+    let decimals = U256::exp10(18);
+    let whole = wei.checked_div(decimals).unwrap_or_default();
+    let fraction = wei.checked_rem(decimals).unwrap_or_default();
 
     // Format with up to 6 decimal places
     let fraction_str = format!("{:018}", fraction);
     let fraction_trimmed = if fraction_str.len() >= 6 {
-        fraction_str[..6].trim_end_matches('0')
+        fraction_str
+            .get(..6)
+            .unwrap_or(&fraction_str)
+            .trim_end_matches('0')
     } else {
         fraction_str.trim_end_matches('0')
     };

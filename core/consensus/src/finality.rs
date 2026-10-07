@@ -194,7 +194,10 @@ impl FinalityTracker {
             return Ok(vec![]);
         }
 
-        let target_final_height = current_height - self.config.confirmation_depth;
+        let Some(target_final_height) = current_height.checked_sub(self.config.confirmation_depth)
+        else {
+            return Ok(vec![]);
+        };
         let current_final_height = self.finalized_height.load(AtomicOrdering::SeqCst);
 
         // Check if we need to finalize any blocks
@@ -230,8 +233,7 @@ impl FinalityTracker {
             // Update finalized height
             self.finalized_height
                 .fetch_max(*height, AtomicOrdering::SeqCst);
-            self.finalized_count
-                .fetch_add(1, AtomicOrdering::SeqCst);
+            self.finalized_count.fetch_add(1, AtomicOrdering::SeqCst);
 
             // Emit event
             if self.config.emit_events {
@@ -311,7 +313,7 @@ impl FinalityTracker {
             // Skip if already finalized
             if !self.dag_store.is_finalized(&current).await {
                 blocks.push((current, height));
-                count += 1;
+                count = count.saturating_add(1);
             }
 
             if block.is_genesis() {
@@ -330,10 +332,7 @@ impl FinalityTracker {
     /// Check if a reorg would violate finality
     ///
     /// Returns an error if the proposed reorg would reorganize past a finalized block.
-    pub async fn check_reorg_allowed(
-        &self,
-        common_ancestor: &Hash,
-    ) -> Result<(), FinalityError> {
+    pub async fn check_reorg_allowed(&self, common_ancestor: &Hash) -> Result<(), FinalityError> {
         // If there's no finalized tip yet, reorg is allowed
         let finalized_tip = match self.get_finalized_tip().await {
             Some(tip) => tip,
@@ -374,7 +373,10 @@ impl FinalityTracker {
     }
 
     /// Get finality status for a block
-    pub async fn get_finality_status(&self, block_hash: &Hash) -> Result<FinalityStatus, FinalityError> {
+    pub async fn get_finality_status(
+        &self,
+        block_hash: &Hash,
+    ) -> Result<FinalityStatus, FinalityError> {
         let block = self
             .dag_store
             .get_block(block_hash)
@@ -398,7 +400,7 @@ impl FinalityTracker {
         // We need to know the current tip height for this
         let confirmations = if finalized_height > 0 {
             // Estimate based on finalized height + confirmation depth
-            let estimated_tip = finalized_height + self.config.confirmation_depth;
+            let estimated_tip = finalized_height.saturating_add(self.config.confirmation_depth);
             estimated_tip.saturating_sub(block_height)
         } else {
             0
@@ -582,11 +584,17 @@ mod tests {
         // Test 1: Reorg from the finalized tip (height 4) - should be OK
         // Branching FROM the finalized tip is allowed
         let result = tracker.check_reorg_allowed(&blocks[4].hash()).await;
-        assert!(result.is_ok(), "Branching from finalized tip should be allowed");
+        assert!(
+            result.is_ok(),
+            "Branching from finalized tip should be allowed"
+        );
 
         // Test 2: Reorg from an unfinalized block (height 5) - should be OK
         let result = tracker.check_reorg_allowed(&blocks[5].hash()).await;
-        assert!(result.is_ok(), "Branching from unfinalized block should be allowed");
+        assert!(
+            result.is_ok(),
+            "Branching from unfinalized block should be allowed"
+        );
 
         // Test 3: Reorg from a block BELOW finalized height (height 3) - should FAIL
         // This would orphan finalized block at height 4
@@ -619,11 +627,17 @@ mod tests {
             .unwrap();
 
         // Finalized block
-        let status = tracker.get_finality_status(&blocks[0].hash()).await.unwrap();
+        let status = tracker
+            .get_finality_status(&blocks[0].hash())
+            .await
+            .unwrap();
         assert_eq!(status, FinalityStatus::Finalized);
 
         // Unfinalized block
-        let status = tracker.get_finality_status(&blocks[10].hash()).await.unwrap();
+        let status = tracker
+            .get_finality_status(&blocks[10].hash())
+            .await
+            .unwrap();
         assert!(matches!(status, FinalityStatus::Unfinalized { .. }));
     }
 

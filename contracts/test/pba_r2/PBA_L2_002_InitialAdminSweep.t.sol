@@ -30,6 +30,7 @@ import {GuardianTokenRegistry} from "../../src/edu/GuardianTokenRegistry.sol";
 import {InstitutionTreeV1} from "../../src/edu/InstitutionTreeV1.sol";
 import {OrganizationSBT} from "../../src/cit_agent/OrganizationSBT.sol";
 import {AgentSBT} from "../../src/cit_agent/AgentSBT.sol";
+import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {CapsuleRegistry} from "../../src/cit_agent/CapsuleRegistry.sol";
 import {MultisigTimelock2of3} from "../../src/cit_agent/MultisigTimelock2of3.sol";
 
@@ -301,11 +302,11 @@ contract PBA_L2_002_InitialAdminSweep is Test {
 
     function test_AgentSBT_factoryReverts() public {
         vm.expectRevert(InitialAdmin.InitialAdmin_Create2Factory.selector);
-        new AgentSBT(FACTORY, OrganizationSBT(address(0x0A9)));
+        new AgentSBT(FACTORY, OrganizationSBT(address(0x0A9)), IERC721(address(0x0AA)));
     }
 
     function test_AgentSBT_realKeyDeploys() public {
-        AgentSBT c = new AgentSBT(KEY, OrganizationSBT(address(0x0A9)));
+        AgentSBT c = new AgentSBT(KEY, OrganizationSBT(address(0x0A9)), IERC721(address(0x0AA)));
         assertEq(c.owner(), KEY);
     }
 

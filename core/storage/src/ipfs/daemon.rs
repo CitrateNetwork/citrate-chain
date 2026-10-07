@@ -9,7 +9,7 @@
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -28,6 +28,37 @@ pub const DEFAULT_GATEWAY_PORT: u16 = 8080;
 
 /// Default IPFS swarm port
 pub const DEFAULT_SWARM_PORT: u16 = 4001;
+
+#[cfg(windows)]
+fn ipfs_path_lookup_command() -> (&'static str, &'static str) {
+    ("where.exe", "ipfs")
+}
+
+#[cfg(not(windows))]
+fn ipfs_path_lookup_command() -> (&'static str, &'static str) {
+    ("which", "ipfs")
+}
+
+fn is_ipfs_binary(path: &Path) -> bool {
+    Command::new(path)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| {
+            output.status.success() && {
+                let version = String::from_utf8_lossy(&output.stdout);
+                version.contains("ipfs") || version.contains("kubo")
+            }
+        })
+}
+
+fn verified_ipfs_path_from_lookup(stdout: &[u8]) -> Option<PathBuf> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .find(|path| path.exists() && is_ipfs_binary(path))
+}
 
 /// IPFS daemon status
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -113,6 +144,10 @@ pub struct IpfsDaemon {
 impl IpfsDaemon {
     /// Create a new IPFS daemon manager
     pub fn new(config: DaemonConfig) -> Self {
+        // INVARIANT: with this static configuration `build()` fails only if the TLS
+        // backend cannot initialize at all, in which case no client of this kind can
+        // exist; there is no degraded mode to fall back to (PANIC-S1 PROVE+KEEP).
+        #[allow(clippy::panic)]
         let http_client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -198,25 +233,16 @@ impl IpfsDaemon {
 
         for path_str in &search_paths {
             let path = PathBuf::from(path_str);
-            if path.exists() {
-                // Verify it's actually IPFS
-                if let Ok(output) = Command::new(&path).arg("--version").output() {
-                    if output.status.success() {
-                        let version = String::from_utf8_lossy(&output.stdout);
-                        if version.contains("ipfs") || version.contains("kubo") {
-                            return Ok(path);
-                        }
-                    }
-                }
+            if path.exists() && is_ipfs_binary(&path) {
+                return Ok(path);
             }
         }
 
         // Try PATH
-        if let Ok(output) = Command::new("which").arg("ipfs").output() {
+        let (lookup_command, lookup_arg) = ipfs_path_lookup_command();
+        if let Ok(output) = Command::new(lookup_command).arg(lookup_arg).output() {
             if output.status.success() {
-                let path_str = String::from_utf8_lossy(&output.stdout);
-                let path = PathBuf::from(path_str.trim());
-                if path.exists() {
+                if let Some(path) = verified_ipfs_path_from_lookup(&output.stdout) {
                     return Ok(path);
                 }
             }
@@ -247,7 +273,8 @@ impl IpfsDaemon {
         tokio::fs::create_dir_all(&install_dir).await?;
 
         // Download archive
-        let response = self.http_client
+        let response = self
+            .http_client
             .get(&download_url)
             .send()
             .await
@@ -264,7 +291,9 @@ impl IpfsDaemon {
         info!("Downloaded {} bytes", archive_bytes.len());
 
         // Extract archive
-        let binary_path = self.extract_archive(&archive_bytes, &install_dir, os).await?;
+        let binary_path = self
+            .extract_archive(&archive_bytes, &install_dir, os)
+            .await?;
 
         // Make executable on Unix
         #[cfg(unix)]
@@ -327,8 +356,7 @@ impl IpfsDaemon {
         if os == "windows" {
             // Extract ZIP
             let cursor = Cursor::new(archive_bytes);
-            let mut archive = zip::ZipArchive::new(cursor)
-                .context("Failed to open ZIP archive")?;
+            let mut archive = zip::ZipArchive::new(cursor).context("Failed to open ZIP archive")?;
 
             for i in 0..archive.len() {
                 let mut file = archive.by_index(i)?;
@@ -425,7 +453,10 @@ impl IpfsDaemon {
         // Configure CORS for API access
         let cors_configs = [
             ("API.HTTPHeaders.Access-Control-Allow-Origin", r#"["*"]"#),
-            ("API.HTTPHeaders.Access-Control-Allow-Methods", r#"["PUT", "POST", "GET"]"#),
+            (
+                "API.HTTPHeaders.Access-Control-Allow-Methods",
+                r#"["PUT", "POST", "GET"]"#,
+            ),
         ];
 
         for (key, value) in cors_configs {
@@ -486,7 +517,8 @@ impl IpfsDaemon {
                 return Err(anyhow!("Shutdown requested during startup"));
             }
 
-            match self.http_client
+            match self
+                .http_client
                 .post(format!("{}/api/v0/id", api_url))
                 .send()
                 .await
@@ -511,7 +543,8 @@ impl IpfsDaemon {
     pub async fn is_running(&self) -> bool {
         let api_url = self.api_url();
 
-        match self.http_client
+        match self
+            .http_client
             .post(format!("{}/api/v0/id", api_url))
             .timeout(Duration::from_secs(5))
             .send()
@@ -558,7 +591,8 @@ impl IpfsDaemon {
             addresses: Vec<String>,
         }
 
-        let response = self.http_client
+        let response = self
+            .http_client
             .post(format!("{}/api/v0/id", api_url))
             .send()
             .await?;
@@ -580,7 +614,8 @@ impl IpfsDaemon {
 
         // Try graceful shutdown via API
         let api_url = self.api_url();
-        let shutdown_result = self.http_client
+        let shutdown_result = self
+            .http_client
             .post(format!("{}/api/v0/shutdown", api_url))
             .timeout(Duration::from_secs(10))
             .send()
@@ -653,7 +688,8 @@ impl IpfsDaemon {
             peers: Option<Vec<serde_json::Value>>,
         }
 
-        let response = self.http_client
+        let response = self
+            .http_client
             .post(format!("{}/api/v0/swarm/peers", api_url))
             .send()
             .await?;
@@ -672,7 +708,8 @@ impl IpfsDaemon {
             repo_size: u64,
         }
 
-        let response = self.http_client
+        let response = self
+            .http_client
             .post(format!("{}/api/v0/repo/stat", api_url))
             .send()
             .await?;
@@ -717,10 +754,11 @@ fn parse_multiaddr(addr: &str) -> Option<(String, u16)> {
     let parts: Vec<&str> = addr.split('/').collect();
 
     // /ip4/127.0.0.1/tcp/5001
-    if parts.len() >= 5 && (parts[1] == "ip4" || parts[1] == "ip6") && parts[3] == "tcp" {
-        let ip = parts[2].to_string();
-        let port = parts[4].parse().ok()?;
-        return Some((ip, port));
+    if let [_, proto, ip, "tcp", port, ..] = parts.as_slice() {
+        if *proto == "ip4" || *proto == "ip6" {
+            let port = port.parse().ok()?;
+            return Some((ip.to_string(), port));
+        }
     }
 
     None
@@ -806,6 +844,24 @@ mod tests {
         // Should fail since path doesn't exist
         let result = daemon.find_ipfs_binary().await;
         assert!(result.is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_path_lookup_accepts_where_candidate() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let candidate = temp.path().join("ipfs.cmd");
+        std::fs::write(&candidate, "@echo ipfs version 0.32.1\r\n")
+            .expect("test IPFS command should be written");
+
+        let (command, argument) = ipfs_path_lookup_command();
+        assert_eq!((command, argument), ("where.exe", "ipfs"));
+
+        let lookup_output = format!("{}\r\n", candidate.display());
+        assert_eq!(
+            verified_ipfs_path_from_lookup(lookup_output.as_bytes()),
+            Some(candidate)
+        );
     }
 
     #[tokio::test]

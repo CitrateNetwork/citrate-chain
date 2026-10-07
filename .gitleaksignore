@@ -1,0 +1,8 @@
+# Reviewed false positives (gitleaks fingerprint = commit:file:rule:line).
+# 9c4936f1 committed contracts/addresses/40204.provenance.json with a JSON field
+# named "key" whose values are contract names ("X402Facilitator", "IPFSIncentivesV2",
+# "IPFSIncentivesV3"); generic-api-key misread them as credentials. The file holds
+# only public tx hashes and addresses; the field was renamed to "name" in the next commit.
+9c4936f1f68e05578262f681246d23e09d6a9984:contracts/addresses/40204.provenance.json:generic-api-key:104
+9c4936f1f68e05578262f681246d23e09d6a9984:contracts/addresses/40204.provenance.json:generic-api-key:1234
+9c4936f1f68e05578262f681246d23e09d6a9984:contracts/addresses/40204.provenance.json:generic-api-key:1245

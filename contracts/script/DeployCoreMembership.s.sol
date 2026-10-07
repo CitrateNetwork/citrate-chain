@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
-import {Script, console2} from "forge-std/Script.sol";
+import {console2} from "forge-std/Script.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import "./ScriptEnv.sol";
 import "./Salts.sol";
 import {CitrateMemberSBT} from "../src/core_membership/CitrateMemberSBT.sol";
 import {MemberBond} from "../src/core_membership/MemberBond.sol";
@@ -60,17 +61,27 @@ import {ValidatorRegistry} from "../src/ValidatorRegistry.sol";
 /// `MemberBond.activate`'s `registerValidator{value: principal}` would register
 /// a validator whose bond does not exist — phantom stake in the consensus
 /// proposer set. `run()` refuses to broadcast before the activation height.
-contract DeployCoreMembership is Script {
-    /// The grant/treasury signer (current membership owner). PINNED — it is a
-    /// constructor arg for the SBT and an initialize arg for the vault, so it
-    /// feeds both init_code hashes and must NOT come from env.
-    address constant FROZEN_OWNER = 0xF42a19194fee89E71dC4b8631a71a9CeCf42B483;
+contract DeployCoreMembership is ScriptEnv {
+    /// The grant/treasury signer (membership owner). It is a constructor arg for
+    /// the SBT and an initialize arg for the vault, so it feeds both init_code
+    /// hashes and therefore FIXES the SBT + vault CREATE2 addresses. It is DERIVED
+    /// at deploy time from env `MEMBERSHIP_OWNER` (fresh-keys reroll: the fresh
+    /// grant signer), defaulting to the ceremony deployer when unset. Under
+    /// fresh keys this moves — accepted (owner ruling, MAC audit).
+    function _membershipOwner() internal view returns (address o) {
+        o = requiredGovernance("MEMBERSHIP_OWNER", deployerAddress());
+        require(o != address(0), "set MEMBERSHIP_OWNER (or CEREMONY_DEPLOYER_ADDRESS)");
+    }
 
-    /// The deployed ValidatorRegistry on 40204. PINNED — it feeds the vault
-    /// proxy's init_code hash through the initialize calldata.
-    /// Updated for the solc-0.8.36 reroll (2026-09-07): the registry moved with
-    /// the compiler bump; this is its new deterministic address.
-    address constant REGISTRY = 0x2655d9fbbe599E75ff6E53790F99EbC9A20c93BF;
+    /// The ValidatorRegistry the vault bonds into. DERIVED from what the reroll
+    /// deploys — env `VALIDATOR_REGISTRY` (or the fleet pin
+    /// `CITRATE_VALIDATOR_REGISTRY`) — NEVER a frozen literal. It feeds the vault
+    /// proxy's init_code hash through the initialize calldata; `run()` fails
+    /// closed if it names an address with no code on this chain.
+    function _validatorRegistry() internal view returns (address r) {
+        r = envAddressOr("VALIDATOR_REGISTRY", envAddressOr("CITRATE_VALIDATOR_REGISTRY", address(0)));
+        require(r != address(0), "set VALIDATOR_REGISTRY to the reroll's ValidatorRegistry");
+    }
 
     /// Height at which citrate-chain #140 makes contract-initiated value
     /// transfers real. Deploying below this would produce phantom bonds.
@@ -85,7 +96,9 @@ contract DeployCoreMembership is Script {
 
     function run() external {
         require(block.chainid == 40204, "refusing to deploy off chain 40204 (testnet-beta)");
-        require(REGISTRY.code.length > 0, "ValidatorRegistry has no code on this chain");
+        address owner = _membershipOwner();
+        address registry = _validatorRegistry();
+        require(registry.code.length > 0, "ValidatorRegistry has no code on this chain");
         require(
             block.number >= VALUE_TRANSFER_ACTIVATION_HEIGHT,
             "refusing to deploy below the value-transfer activation height: bonds would be phantom"
@@ -94,7 +107,7 @@ contract DeployCoreMembership is Script {
         vm.startBroadcast();
 
         CitrateMemberSBT sbt =
-            new CitrateMemberSBT{salt: Salts.salt("CitrateMemberSBT")}(FROZEN_OWNER);
+            new CitrateMemberSBT{salt: Salts.salt("CitrateMemberSBT")}(owner);
 
         MemberBond bondImpl = new MemberBond{salt: Salts.salt("MemberBond")}();
 
@@ -105,15 +118,15 @@ contract DeployCoreMembership is Script {
             address(vaultImpl),
             abi.encodeCall(
                 MembershipStakeVault.initialize,
-                (FROZEN_OWNER, ValidatorRegistry(payable(REGISTRY)), sbt, address(bondImpl))
+                (owner, ValidatorRegistry(payable(registry)), sbt, address(bondImpl))
             )
         );
 
         vm.stopBroadcast();
 
         console2.log("chainid             :", block.chainid);
-        console2.log("initialOwner        :", FROZEN_OWNER);
-        console2.log("ValidatorRegistry   :", REGISTRY);
+        console2.log("initialOwner        :", owner);
+        console2.log("ValidatorRegistry   :", registry);
         console2.log("CitrateMemberSBT    :", address(sbt));
         console2.log("MemberBond (impl)   :", address(bondImpl));
         console2.log("MembershipStakeVault impl :", address(vaultImpl));

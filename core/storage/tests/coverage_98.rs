@@ -9,9 +9,7 @@
 //   - transaction_store.rs (75% -> ~98%): put/get/delete, batch, receipts, block tx index,
 //     has_transaction, compact
 
-use citrate_consensus::types::{
-    Block, BlockBuilder, Hash, PublicKey, Signature, Transaction,
-};
+use citrate_consensus::types::{Block, BlockBuilder, Hash, PublicKey, Signature, Transaction};
 use citrate_execution::types::{
     AccessPolicy, AccountState, Address, JobStatus, ModelMetadata, ModelState, TrainingJob,
     TransactionReceipt, UsageStats,
@@ -618,8 +616,7 @@ fn block_store_merge_parents() {
     store.put_block(&parent_b).unwrap();
 
     // Block with merge parent
-    let merge_block =
-        make_block_with_merge(3, 2, parent_a.hash(), vec![parent_b.hash()]);
+    let merge_block = make_block_with_merge(3, 2, parent_a.hash(), vec![parent_b.hash()]);
     store.put_block(&merge_block).unwrap();
 
     // Both parents should have merge_block as a child
@@ -898,7 +895,10 @@ async fn state_manager_inference_cache() {
     // the in-memory AI state is still updated even though the DB persist fails.
     // We test that the method returns an error (known gap: missing CF).
     let cache_result = manager.cache_inference_result(result);
-    assert!(cache_result.is_err(), "Expected error for missing 'cache' CF");
+    assert!(
+        cache_result.is_err(),
+        "Expected error for missing 'cache' CF"
+    );
 
     // The in-memory cache should still have been populated before the DB write
     let stats = manager.get_ai_stats();
@@ -969,7 +969,10 @@ async fn state_manager_prune_inference_cache() {
     manager.prune_inference_cache(3600);
 
     let stats = manager.get_ai_stats();
-    assert_eq!(stats.cached_inferences, 1, "Only the recent entry should survive");
+    assert_eq!(
+        stats.cached_inferences, 1,
+        "Only the recent entry should survive"
+    );
 }
 
 #[tokio::test]
@@ -1061,8 +1064,8 @@ fn storage_manager_encrypted_config_enables_encryption() {
     use citrate_storage::crypto::at_rest::EncryptionAtRestConfig;
 
     let tmp = TempDir::new().unwrap();
-    let config = StorageConfig::default()
-        .with_encryption(EncryptionAtRestConfig::with_raw_key([42u8; 32]));
+    let config =
+        StorageConfig::default().with_encryption(EncryptionAtRestConfig::with_raw_key([42u8; 32]));
     assert!(config.encryption.is_some());
 
     let mgr = StorageManager::with_config(tmp.path(), config).unwrap();
@@ -1128,11 +1131,7 @@ fn storage_manager_persistence() {
         let mgr = StorageManager::new(&path, PruningConfig::default()).unwrap();
         let tx = make_tx(42);
         assert!(mgr.transactions.has_transaction(&tx.hash).unwrap());
-        let acct = mgr
-            .state
-            .get_account(&make_address(0xAA))
-            .unwrap()
-            .unwrap();
+        let acct = mgr.state.get_account(&make_address(0xAA)).unwrap().unwrap();
         assert_eq!(acct.nonce, 99);
     }
 }

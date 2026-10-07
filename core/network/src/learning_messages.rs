@@ -136,7 +136,13 @@ impl LearningEmbedding {
     /// so the embedding cannot be detached from its (height, participant)
     /// identity, re-bound to another chain, or have its payload mutated.
     pub fn signing_payload(&self, chain_id: u64) -> Vec<u8> {
-        let mut m = Vec::with_capacity(64 + self.embedding.len() * 4 + self.confidence.len());
+        let mut m = Vec::with_capacity(
+            self.embedding
+                .len()
+                .saturating_mul(4)
+                .saturating_add(self.confidence.len())
+                .saturating_add(64),
+        );
         m.extend_from_slice(LEARNING_SIG_DOMAIN);
         m.extend_from_slice(&chain_id.to_le_bytes());
         m.extend_from_slice(&self.checkpoint_height.to_le_bytes());
@@ -224,7 +230,7 @@ impl AdapterOffer {
 
     /// FWA-C2-01: canonical bytes the `mentor` signs.
     pub fn signing_payload(&self, chain_id: u64) -> Vec<u8> {
-        let mut m = Vec::with_capacity(128 + self.adapter_cid.len());
+        let mut m = Vec::with_capacity(self.adapter_cid.len().saturating_add(128));
         m.extend_from_slice(LEARNING_SIG_DOMAIN);
         m.extend_from_slice(&chain_id.to_le_bytes());
         m.extend_from_slice(&self.checkpoint_height.to_le_bytes());
