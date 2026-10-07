@@ -48,6 +48,7 @@ serde_json = "1.0"
 bincode = { workspace = true }
 toml = "0.8"
 tracing = "0.1"
+tracing-appender = "0.2"
 
 # Forces openssl-sys to use the vendored feature across the entire
 # build graph (Cargo feature unification). Required for the
