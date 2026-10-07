@@ -1,70 +1,542 @@
-# citrate-node.service.ps1 — Windows service registration for Citrate node
-#
-# Registers citrate-node as a Windows service using NSSM or sc.exe
-# Run as Administrator for system-wide service, or as current user for user-level.
+# citrate-node.service.ps1 - Windows service registration for Citrate node
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File citrate-node.service.ps1 [install|uninstall|start|stop|status]
+#   Add -NodeBin, -DataDir, or -ConfigPath to override install inputs; add -ValidateOnly
+#   to return the exact service plan without service, firewall, directory, or ACL mutation.
+#
+# Install requires an existing executable, canonical node.toml, and db directory on a
+# stable local volume. Their ACLs must allow NetworkService's required access while
+# preventing untrusted identities from replacing executable, configuration, or database content.
 
 param(
-    [Parameter(Position=0)]
+    [Parameter(Position = 0)]
     [ValidateSet("install", "uninstall", "start", "stop", "status")]
-    [string]$Action = "install"
+    [string]$Action = "install",
+
+    [string]$NodeBin,
+
+    [string]$DataDir = (Join-Path ([Environment]::GetFolderPath("CommonApplicationData")) "Citrate"),
+
+    [string]$ConfigPath,
+
+    [switch]$ValidateOnly
 )
+
+$ErrorActionPreference = "Stop"
 
 $ServiceName = "CitrateNode"
 $DisplayName = "Citrate Blockchain Node"
 $Description = "Citrate AI-native Layer-1 blockchain node with GhostDAG consensus"
-$DataDir = Join-Path $env:USERPROFILE ".citrate"
-$LogDir = Join-Path $DataDir "logs"
+$NetworkServiceSid = "S-1-5-20"
+$NetworkServiceAccount = "NT AUTHORITY\NetworkService"
+$WindowsDirectory = Split-Path -Parent ([Environment]::SystemDirectory)
+$ScExe = Join-Path $WindowsDirectory "System32\sc.exe"
+$NodeBinWasSpecified = $PSBoundParameters.ContainsKey("NodeBin")
+$ConfigPathWasSpecified = $PSBoundParameters.ContainsKey("ConfigPath")
 
-# Locate the node binary (check sidecar location first, then PATH)
-$AppDir = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$NodeBin = Join-Path $AppDir "citrate-node.exe"
-if (-not (Test-Path $NodeBin)) {
-    $NodeBin = (Get-Command citrate-node -ErrorAction SilentlyContinue).Source
-}
-if (-not $NodeBin -or -not (Test-Path $NodeBin)) {
-    Write-Error "citrate-node.exe not found. Install Citrate first."
-    exit 1
+function Resolve-NodeBinary {
+    if ($NodeBinWasSpecified) {
+        if ([string]::IsNullOrWhiteSpace($NodeBin)) {
+            throw "NodeBin must not be empty."
+        }
+
+        return $NodeBin
+    }
+
+    $besideScript = Join-Path $PSScriptRoot "citrate-node.exe"
+    if (Test-Path -LiteralPath $besideScript -PathType Leaf) {
+        return $besideScript
+    }
+
+    try {
+        $command = Get-Command "citrate-node.exe" -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    } catch [System.Management.Automation.CommandNotFoundException] {
+        $command = $null
+    }
+    if ($command) {
+        return $command.Source
+    }
+
+    throw "citrate-node.exe was not found beside this script or on PATH."
 }
 
-function Install-Service {
+function Assert-SafePathText {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Description
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        throw "$Description path must not be empty."
+    }
+
+    if ($Path.IndexOf('"') -ge 0) {
+        throw "$Description path must not contain a quote."
+    }
+
+    foreach ($character in $Path.ToCharArray()) {
+        if ([char]::IsControl($character)) {
+            throw "$Description path must not contain control characters."
+        }
+    }
+
+    if ($Path.StartsWith("\\") -or $Path.StartsWith("//") -or $Path.StartsWith("\??\") -or $Path.StartsWith("\Device\")) {
+        throw "$Description path must be a local drive path, not a UNC or device path."
+    }
+
+    if ($Path -notmatch '^[A-Za-z]:[\\/]') {
+        throw "$Description path must be absolute."
+    }
+
+    if ($Path.Substring(2).Contains(":")) {
+        throw "$Description path must not use an alternate data stream."
+    }
+
+    $root = [System.IO.Path]::GetPathRoot($Path)
+    try {
+        $drive = New-Object System.IO.DriveInfo($root)
+    } catch {
+        throw "$Description path must use a local fixed drive."
+    }
+    if ($drive.DriveType -ne [System.IO.DriveType]::Fixed) {
+        throw "$Description path must use a local fixed drive."
+    }
+
+    $mountvolExe = Join-Path $WindowsDirectory "System32\mountvol.exe"
+    $volumeName = @(& $mountvolExe $root "/L" 2>&1)
+    if ($LASTEXITCODE -ne 0 -or $volumeName.Count -eq 0) {
+        throw "$Description path must use a stable mounted local volume."
+    }
+}
+
+function Assert-NoReparsePoint {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Description
+    )
+
+    $root = [System.IO.Path]::GetPathRoot($Path)
+    $current = $root
+    $relative = $Path.Substring($root.Length)
+
+    foreach ($part in $relative.Split([char[]]@('\', '/'), [StringSplitOptions]::RemoveEmptyEntries)) {
+        $current = Join-Path $current $part
+        $item = Get-Item -LiteralPath $current -Force
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "$Description path must not contain a reparse point: $current"
+        }
+    }
+}
+
+function Resolve-SafeExistingPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("File", "Directory")]
+        [string]$PathType,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Description,
+
+        [switch]$RequireNonEmpty
+    )
+
+    Assert-SafePathText -Path $Path -Description $Description
+
+    try {
+        $normalized = [System.IO.Path]::GetFullPath($Path)
+        $item = Get-Item -LiteralPath $normalized -Force
+    } catch {
+        throw "$Description does not exist: $Path"
+    }
+
+    if ($PathType -eq "File" -and $item.PSIsContainer) {
+        throw "$Description must be a file: $normalized"
+    }
+    if ($PathType -eq "Directory" -and -not $item.PSIsContainer) {
+        throw "$Description must be a directory: $normalized"
+    }
+    if ($RequireNonEmpty -and $item.Length -eq 0) {
+        throw "$Description must not be empty: $normalized"
+    }
+
+    Assert-NoReparsePoint -Path $normalized -Description $Description
+    return $normalized
+}
+
+function Assert-NetworkServiceAccess {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [System.Security.AccessControl.FileSystemRights]$RequiredRights,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Description,
+
+        [System.Security.AccessControl.InheritanceFlags]$RequiredInheritance = [System.Security.AccessControl.InheritanceFlags]::None
+    )
+
+    # NetworkService receives these well-known groups in its service token. Evaluating
+    # SIDs directly avoids localized account names. The canonical DACL order is honored:
+    # a deny ACE rejects rights not already granted by an earlier applicable allow ACE.
+    $applicableSids = @(
+        "S-1-5-20", # NetworkService
+        "S-1-5-6",  # Service
+        "S-1-5-80-0", # All Services
+        "S-1-5-11", # Authenticated Users
+        "S-1-5-32-545", # Builtin Users
+        "S-1-1-0"   # Everyone
+    )
+    $remaining = [int64]$RequiredRights
+    $acl = Get-Acl -LiteralPath $Path
+    $rules = $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
+
+    foreach ($rule in $rules) {
+        if ($applicableSids -notcontains $rule.IdentityReference.Value) {
+            continue
+        }
+        if ($RequiredInheritance -eq [System.Security.AccessControl.InheritanceFlags]::None) {
+            if (($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) {
+                continue
+            }
+        } else {
+            if (($rule.InheritanceFlags -band $RequiredInheritance) -eq 0) {
+                continue
+            }
+            if (
+                $rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+                ($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::NoPropagateInherit) -ne 0
+            ) {
+                continue
+            }
+        }
+
+        $applicable = ([int64]$rule.FileSystemRights) -band $remaining
+        if ($applicable -eq 0) {
+            continue
+        }
+
+        if ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Deny) {
+            throw "NetworkService is denied required $Description access to: $Path"
+        }
+
+        $remaining = $remaining -band (-bnot $applicable)
+        if ($remaining -eq 0) {
+            return
+        }
+    }
+
+    throw "NetworkService lacks required $Description access to: $Path"
+}
+
+function Assert-TrustedPathIntegrity {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Description,
+
+        [string[]]$AdditionalTrustedWriterSids = @(),
+
+        [switch]$Ancestor,
+
+        [switch]$CheckChildInheritance
+    )
+
+    $trustedWriterSids = @(
+        "S-1-5-18", # LocalSystem
+        "S-1-5-32-544", # Builtin Administrators
+        "S-1-3-0", # Creator Owner; resolves to the already validated owner on children
+        # NT SERVICE\TrustedInstaller
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
+        [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    ) + $AdditionalTrustedWriterSids
+    $mutationRights = [int64](
+        [System.Security.AccessControl.FileSystemRights]::Delete -bor
+        [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+        [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+        [System.Security.AccessControl.FileSystemRights]::TakeOwnership
+    )
+    if (-not $Ancestor) {
+        $mutationRights = $mutationRights -bor [int64][System.Security.AccessControl.FileSystemRights]::Write
+    }
+    $acl = Get-Acl -LiteralPath $Path
+    try {
+        $ownerSid = (New-Object System.Security.Principal.NTAccount($acl.Owner)).Translate(
+            [System.Security.Principal.SecurityIdentifier]
+        ).Value
+    } catch {
+        throw "$Description owner could not be validated: $Path"
+    }
+    if ($trustedWriterSids -notcontains $ownerSid) {
+        throw "$Description has an untrusted owner: $Path"
+    }
+
+    $rules = $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
+    foreach ($rule in $rules) {
+        if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) {
+            continue
+        }
+        $appliesDirectly = ($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) -eq 0
+        $appliesToChildren = $CheckChildInheritance -and $rule.InheritanceFlags -ne [System.Security.AccessControl.InheritanceFlags]::None
+        if (-not $appliesDirectly -and -not $appliesToChildren) {
+            continue
+        }
+        if (([int64]$rule.FileSystemRights -band $mutationRights) -eq 0) {
+            continue
+        }
+        if ($trustedWriterSids -notcontains $rule.IdentityReference.Value) {
+            throw "$Description grants untrusted write access to $($rule.IdentityReference.Value): $Path"
+        }
+    }
+}
+
+function Assert-TrustedPathChain {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Description
+    )
+
+    $current = $Path
+    $initialItem = Get-Item -LiteralPath $Path -Force
+    $strictThroughLevel = if ($initialItem.PSIsContainer) { 0 } else { 1 }
+    $level = 0
+    while ($current) {
+        Assert-TrustedPathIntegrity -Path $current -Description $Description -Ancestor:($level -gt $strictThroughLevel)
+        $parent = Split-Path -Parent $current
+        if (-not $parent -or [string]::Equals($parent, $current, [StringComparison]::OrdinalIgnoreCase)) {
+            break
+        }
+        $current = $parent
+        $level++
+    }
+}
+
+function Assert-TrustedDatabaseTree {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    Assert-TrustedPathIntegrity `
+        -Path $Path `
+        -Description "Database directory" `
+        -AdditionalTrustedWriterSids @($NetworkServiceSid) `
+        -CheckChildInheritance
+    Assert-NetworkServiceAccess `
+        -Path $Path `
+        -RequiredRights ([System.Security.AccessControl.FileSystemRights]::Modify) `
+        -Description "future database file modify" `
+        -RequiredInheritance ([System.Security.AccessControl.InheritanceFlags]::ObjectInherit)
+    Assert-NetworkServiceAccess `
+        -Path $Path `
+        -RequiredRights ([System.Security.AccessControl.FileSystemRights]::Modify) `
+        -Description "future database directory modify" `
+        -RequiredInheritance ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit)
+
+    $pendingDirectories = New-Object "System.Collections.Generic.Queue[string]"
+    $pendingDirectories.Enqueue($Path)
+    while ($pendingDirectories.Count -gt 0) {
+        $directory = $pendingDirectories.Dequeue()
+        foreach ($child in @(Get-ChildItem -LiteralPath $directory -Force)) {
+            if (($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Database directory must not contain a reparse point: $($child.FullName)"
+            }
+
+            Assert-TrustedPathIntegrity `
+                -Path $child.FullName `
+                -Description "Database content" `
+                -AdditionalTrustedWriterSids @($NetworkServiceSid) `
+                -CheckChildInheritance:$child.PSIsContainer
+            Assert-NetworkServiceAccess `
+                -Path $child.FullName `
+                -RequiredRights ([System.Security.AccessControl.FileSystemRights]::Modify) `
+                -Description "database content modify"
+            if ($child.PSIsContainer) {
+                Assert-NetworkServiceAccess `
+                    -Path $child.FullName `
+                    -RequiredRights ([System.Security.AccessControl.FileSystemRights]::Modify) `
+                    -Description "future database file modify" `
+                    -RequiredInheritance ([System.Security.AccessControl.InheritanceFlags]::ObjectInherit)
+                Assert-NetworkServiceAccess `
+                    -Path $child.FullName `
+                    -RequiredRights ([System.Security.AccessControl.FileSystemRights]::Modify) `
+                    -Description "future database directory modify" `
+                    -RequiredInheritance ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit)
+                $pendingDirectories.Enqueue($child.FullName)
+            }
+        }
+    }
+}
+
+function New-ServicePlan {
+    $resolvedScExe = Resolve-SafeExistingPath -Path $ScExe -PathType File -Description "sc.exe" -RequireNonEmpty
+    $resolvedNodeBin = Resolve-SafeExistingPath -Path (Resolve-NodeBinary) -PathType File -Description "NodeBin" -RequireNonEmpty
+    if (-not [string]::Equals([System.IO.Path]::GetExtension($resolvedNodeBin), ".exe", [StringComparison]::OrdinalIgnoreCase)) {
+        throw "NodeBin must be a .exe file."
+    }
+    $resolvedDataDir = Resolve-SafeExistingPath -Path $DataDir -PathType Directory -Description "DataDir"
+    $databasePath = Resolve-SafeExistingPath -Path (Join-Path $resolvedDataDir "db") -PathType Directory -Description "Database directory"
+
+    if ($ConfigPathWasSpecified) {
+        if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+            throw "ConfigPath must not be empty."
+        }
+        $candidateConfigPath = $ConfigPath
+    } else {
+        $candidateConfigPath = Join-Path $resolvedDataDir "node.toml"
+    }
+
+    if (-not [string]::Equals([System.IO.Path]::GetFileName($candidateConfigPath), "node.toml", [StringComparison]::OrdinalIgnoreCase)) {
+        throw "ConfigPath must use the canonical node.toml filename."
+    }
+
+    $resolvedConfigPath = Resolve-SafeExistingPath -Path $candidateConfigPath -PathType File -Description "ConfigPath" -RequireNonEmpty
+    $nodeDirectory = Split-Path -Parent $resolvedNodeBin
+    $configDirectory = Split-Path -Parent $resolvedConfigPath
+
+    Assert-NetworkServiceAccess -Path $nodeDirectory -RequiredRights Traverse -Description "executable traversal"
+    Assert-NetworkServiceAccess -Path $resolvedNodeBin -RequiredRights ReadAndExecute -Description "executable read/execute"
+    Assert-NetworkServiceAccess -Path $resolvedDataDir -RequiredRights Traverse -Description "data directory traversal"
+    if (-not [string]::Equals($resolvedDataDir, $configDirectory, [StringComparison]::OrdinalIgnoreCase)) {
+        Assert-NetworkServiceAccess -Path $configDirectory -RequiredRights Traverse -Description "config traversal"
+    }
+    Assert-NetworkServiceAccess -Path $resolvedConfigPath -RequiredRights Read -Description "config read"
+    Assert-NetworkServiceAccess -Path $databasePath -RequiredRights Modify -Description "database modify"
+    Assert-TrustedPathChain -Path $resolvedNodeBin -Description "NodeBin path"
+    Assert-TrustedPathChain -Path $resolvedDataDir -Description "DataDir path"
+    Assert-TrustedPathChain -Path $resolvedConfigPath -Description "ConfigPath"
+    Assert-TrustedDatabaseTree -Path $databasePath
+
+    $imagePath = '"' + $resolvedNodeBin + '" --data-dir "' + $databasePath + '" --config "' + $resolvedConfigPath + '"'
+    $scArguments = @(
+        "create",
+        $ServiceName,
+        "binPath=",
+        $imagePath,
+        "DisplayName=",
+        $DisplayName,
+        "start=",
+        "auto",
+        "obj=",
+        $NetworkServiceAccount
+    )
+
+    return [pscustomobject]@{
+        ServiceName = $ServiceName
+        Identity = [pscustomobject]@{
+            Sid = $NetworkServiceSid
+            Account = $NetworkServiceAccount
+        }
+        NodeBin = $resolvedNodeBin
+        DataDir = $resolvedDataDir
+        DatabasePath = $databasePath
+        ConfigPath = $resolvedConfigPath
+        ImagePath = $imagePath
+        ScExecutable = $resolvedScExe
+        ScArguments = $scArguments
+    }
+}
+
+function Assert-Administrator {
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object System.Security.Principal.WindowsPrincipal($identity)
+    if (-not $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw "Action '$Action' requires an elevated PowerShell session."
+    }
+}
+
+function Invoke-Sc {
+    param(
+        [string]$Executable = $ScExe,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments
+    )
+
+    try {
+        # Windows PowerShell 5.1 removes embedded quotes when constructing a native
+        # command line unless they are escaped for CommandLineToArgvW.
+        $nativeArguments = @($Arguments | ForEach-Object { $_.Replace('"', '\"') })
+        $output = & $Executable @nativeArguments 2>&1
+    } catch {
+        throw "Unable to run sc.exe at '$Executable': $($_.Exception.Message)"
+    }
+    if ($LASTEXITCODE -ne 0) {
+        throw "sc.exe at '$Executable' failed with exit code ${LASTEXITCODE}: $($output -join [Environment]::NewLine)"
+    }
+    $output
+}
+
+function Get-CitrateService {
+    param(
+        [string]$Name = $ServiceName
+    )
+
+    try {
+        return Get-Service -Name $Name -ErrorAction Stop
+    } catch [Microsoft.PowerShell.Commands.ServiceCommandException] {
+        if ($_.FullyQualifiedErrorId -like "NoServiceFoundForGivenName*") {
+            return $null
+        }
+
+        throw "Unable to query Windows service '$Name': $($_.Exception.Message)"
+    } catch {
+        throw "Unable to query Windows service '$Name': $($_.Exception.Message)"
+    }
+}
+
+function Assert-CitrateServiceAbsent {
+    param(
+        [string]$Name = $ServiceName
+    )
+
+    if (Get-CitrateService -Name $Name) {
+        throw "Windows service '$Name' already exists. Uninstall it before installing CitrateNode."
+    }
+}
+
+function Install-CitrateService {
+    param(
+        [Parameter(Mandatory = $true)]
+        [psobject]$Plan
+    )
+
     Write-Host "Installing $ServiceName service..."
-
-    # Ensure data directory exists
-    New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
-    New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-
-    $BinPath = "`"$NodeBin`" --data-dir `"$DataDir\db`" --config `"$DataDir\config.toml`""
-
-    # Use sc.exe for native service registration
-    sc.exe create $ServiceName `
-        binPath= $BinPath `
-        DisplayName= $DisplayName `
-        start= auto `
-        obj= "NT AUTHORITY\NetworkService"
-
-    sc.exe description $ServiceName $Description
-
-    # Configure failure recovery: restart after 10s, 30s, 60s
-    sc.exe failure $ServiceName reset= 86400 actions= restart/10000/restart/30000/restart/60000
-
+    Invoke-Sc -Executable $Plan.ScExecutable -Arguments $Plan.ScArguments
+    Invoke-Sc -Executable $Plan.ScExecutable -Arguments @("description", $ServiceName, $Description)
+    Invoke-Sc -Executable $Plan.ScExecutable -Arguments @("failure", $ServiceName, "reset=", "86400", "actions=", "restart/10000/restart/30000/restart/60000")
     Write-Host "Service installed. Start with: .\citrate-node.service.ps1 start"
 }
 
-function Uninstall-Service {
+function Uninstall-CitrateService {
     Write-Host "Removing $ServiceName service..."
-    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    if ($svc) {
-        if ($svc.Status -eq "Running") {
-            Stop-Service -Name $ServiceName -Force
-        }
-        sc.exe delete $ServiceName
-        Write-Host "Service removed."
-    } else {
+    $service = Get-CitrateService
+    if (-not $service) {
         Write-Host "Service not found."
+        return
     }
+
+    if ($service.Status -eq "Running") {
+        Stop-Service -Name $ServiceName -Force
+    }
+    Invoke-Sc -Arguments @("delete", $ServiceName)
+    Write-Host "Service removed."
 }
 
 function Start-CitrateService {
@@ -79,30 +551,25 @@ function Stop-CitrateService {
     Write-Host "Service stopped."
 }
 
-function Get-ServiceStatus {
-    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    if ($svc) {
-        Write-Host "Service: $($svc.DisplayName)"
-        Write-Host "Status:  $($svc.Status)"
-        Write-Host "Binary:  $NodeBin"
-        Write-Host "DataDir: $DataDir"
+function Get-CitrateServiceStatus {
+    $service = Get-CitrateService
+    if ($service) {
+        Write-Host "Service: $($service.DisplayName)"
+        Write-Host "Status:  $($service.Status)"
     } else {
         Write-Host "Service not installed."
     }
 }
 
-# Configure Windows Firewall rules
 function Set-FirewallRules {
     Write-Host "Configuring firewall rules..."
 
-    # Allow inbound P2P traffic
     New-NetFirewallRule -DisplayName "Citrate P2P" `
         -Direction Inbound -Protocol TCP -LocalPort 30303 `
         -Action Allow -Profile Private,Domain `
         -Description "Citrate blockchain P2P networking" `
         -ErrorAction SilentlyContinue
 
-    # Allow inbound RPC (localhost only by default)
     New-NetFirewallRule -DisplayName "Citrate RPC" `
         -Direction Inbound -Protocol TCP -LocalPort 8545 `
         -Action Allow -Profile Private `
@@ -113,10 +580,33 @@ function Set-FirewallRules {
     Write-Host "Firewall rules configured."
 }
 
+if ($ValidateOnly) {
+    if ($Action -ne "install") {
+        throw "ValidateOnly is supported only for the install action."
+    }
+    New-ServicePlan
+    return
+}
+
 switch ($Action) {
-    "install"   { Install-Service; Set-FirewallRules }
-    "uninstall" { Uninstall-Service }
-    "start"     { Start-CitrateService }
-    "stop"      { Stop-CitrateService }
-    "status"    { Get-ServiceStatus }
+    "install" {
+        $plan = New-ServicePlan
+        Assert-CitrateServiceAbsent
+        Assert-Administrator
+        $plan = New-ServicePlan
+        Install-CitrateService -Plan $plan
+        Set-FirewallRules
+    }
+    "uninstall" {
+        Uninstall-CitrateService
+    }
+    "start" {
+        Start-CitrateService
+    }
+    "stop" {
+        Stop-CitrateService
+    }
+    "status" {
+        Get-CitrateServiceStatus
+    }
 }
