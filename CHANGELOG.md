@@ -132,6 +132,9 @@ See `.agentile/sprints/CURRENT.md` for live counts. Workspace gate at v0.4.0: **
   - Gossip used for tx/block propagation; basic sync triggers on Hello/HelloAck.
   - Files: `node/src/main.rs`, `node/Cargo.toml` (added `rand`).
 
+### Fixed
+- Explicit non-empty `LOG_FILE` now adds append-only, ANSI-free file logging alongside console output; removed the inert implicit `/var/log/citrate/node.log` production path.
+
 ### Security / Robustness
 - Transport frame cap: 1 MB.
 - Per‑connection message rate limit: 200 msgs/sec.
