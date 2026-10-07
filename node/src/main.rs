@@ -1730,6 +1730,19 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         None
     };
     if let Some(addr) = metrics_addr {
+        // VERIFY-255-O1 (INFO): the metrics endpoint serves read-only status gauges
+        // (including the F2 catch-up gauges) and defaults to loopback. If an operator has
+        // pointed CITRATE_METRICS_ADDR at a non-loopback interface, those gauges become
+        // reachable off-box. That is read-only data, so this is a startup WARN (not a
+        // refusal); the operator-gated catch-up OVERRIDE RPC stays loopback-gated regardless.
+        if !addr.ip().is_loopback() {
+            tracing::warn!(
+                "CITRATE_METRICS_ADDR binds the metrics/status gauges to non-loopback {} — \
+                 these read-only gauges will be reachable off-box. Bind 127.0.0.1 (the default) \
+                 and expose metrics via a trusted scraper/proxy if you need remote access.",
+                addr
+            );
+        }
         tokio::spawn(async move {
             if let Err(e) = citrate_api::metrics_server::MetricsServer::new(addr)
                 .start()
@@ -2044,6 +2057,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // Monotonic via fetch_max. Function-scoped so both the P2P tasks and the RPC
     // server can read it.
     let max_seen_height = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // F2 (producer network-height catch-up gate): the highest peer block height that is
+    // VALIDLY SIGNED and CHAINS to a block we hold (see `AttestedNetworkHead`). This is
+    // the ONLY "how far ahead is the network" signal the producer gate consults — it is
+    // deliberately SEPARATE from `max_seen_height` (which mixes in clamped UNVERIFIED
+    // claims for sync-target purposes) and never derived from `PeerInfo.head_height` or
+    // `SyncManager.target_height`. Updated at both block-receive sites below.
+    let attested_network_head = producer::AttestedNetworkHead::new();
 
     // Start P2P listener and connect to bootstrap nodes
     {
@@ -2746,6 +2767,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // clones existed only to feed the two open-coded admission ladders and
         // are gone with them.
         let max_seen_for_rx = max_seen_height.clone();
+        // F2: attested-network-head handle for the receive tasks (clonable; `observe`
+        // records the block as a candidate the producer gate re-evaluates per round).
+        let attested_for_rx = attested_network_head.clone();
 
         // SYNC-S1 / D2: the network handler's handle on the single admission
         // path (constructed at function scope above, alongside the genesis seed
@@ -2999,6 +3023,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                                 &max_seen_for_rx,
                                                 block.header.height,
                                             );
+                                            // F2: an admitted block is signed + genesis-linked;
+                                            // record it as an attested candidate (re-checks
+                                            // signature + parent ancestry itself). The producer
+                                            // gate decides per round whether it is still "ahead"
+                                            // of the fork-choice head (VERIFY-255-F2-H1).
+                                            attested_for_rx.observe(&storage_for_handler, &block);
                                             if completed_partial {
                                                 // D4a: admission.rs already warns (budgeted); a
                                                 // per-block warn here doubled the storm.
@@ -3225,6 +3255,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                         if block.header.height > highest_admitted {
                                             highest_admitted = block.header.height;
                                         }
+                                        // F2: record the signed, genesis-linked synced block
+                                        // as an attested candidate (see the H1 note above).
+                                        attested_for_rx.observe(&storage_for_handler, &block);
                                         if completed_partial {
                                             // D4a: admission.rs already warns (budgeted); a
                                             // per-block warn here doubled the storm.
@@ -3599,6 +3632,13 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // flag and stops producing blocks.
     let pause_flag = Arc::new(AtomicBool::new(false));
 
+    // VERIFY-255-F2-M1: shared handle to the producer F2 catch-up human-in-command override.
+    // Hoisted here (like `pause_flag`) so the same Arc reaches BOTH the RPC server (which
+    // registers the loopback-only, operator-authenticated `citrate_producerCatchupResume`)
+    // and the producer gate (`with_catchup_override`, below). The RPC server is built before
+    // the gate, so the flag must exist first.
+    let catchup_override = Arc::new(AtomicBool::new(false));
+
     // Start RPC server if enabled
     let rpc_handle = if config.rpc.enabled {
         info!("Starting RPC server on {}", config.rpc.listen_addr);
@@ -3662,6 +3702,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // forward-sync liveness: let eth_syncing report highestBlock from the
             // sync driver's max-seen height (truthful "stalled" vs "synced").
             Some(max_seen_height.clone()),
+            // VERIFY-255-F2-M1: the catch-up override handle. Only wired into a
+            // loopback-bound RPC (the server refuses to register it on a public bind).
+            Some(catchup_override.clone()),
             // Stage 0 checkpoint finality: back the `finalized`/`safe` RPC tags with
             // the same `finalized_height` handle the canonical applicator exposes and
             // the 5 s finality poll keeps current. None (no applicator) => tags resolve
@@ -3884,6 +3927,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // restart, so a lagging/replaying node never forks the fleet by sealing on a
             // stale (but self-consistent) applied tip.
             producer_instance = producer_instance.with_produce_catchup_gate(app);
+            // F2 (network-height catch-up): also refuse to seal while this node is BEHIND
+            // its peers — measured only from validly-signed, chain-descending peer heads
+            // (`attested_network_head`), never a self-reported Hello height / sync target.
+            producer_instance = producer_instance.with_network_height_gate(&attested_network_head);
+            // VERIFY-255-F2-M1: share the catch-up override with the gate so the loopback
+            // admin RPC (`citrate_producerCatchupResume`) can resume a latched producer. The
+            // gate consumes it (auto-clears) on the next resume.
+            producer_instance = producer_instance.with_catchup_override(catchup_override.clone());
         }
 
         // WP-I.3: Share the same pause_flag between RPC server and producer
