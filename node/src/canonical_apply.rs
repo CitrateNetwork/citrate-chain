@@ -7245,6 +7245,13 @@ mod tests {
         e.calculate_state_root()
     }
 
+    /// A scenario transfer at the sender's CURRENT account nonce in the producing
+    /// executor (read from its state, not hard-coded), so each block's txs carry the
+    /// exact sequence the producer will accept: 0, 1 on branch A; 0, 1, 2 on branch B.
+    fn v251_transfer(exec: &Executor, from: [u8; 20], to: [u8; 20], value: u128) -> Transaction {
+        transfer(from, to, value, exec.get_nonce(&Address(from)))
+    }
+
     /// The deterministic blocks of the scenario (independent in-memory producers).
     async fn v251_blocks() -> (Block, Block, Block, Block) {
         let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
@@ -7254,7 +7261,7 @@ mod tests {
             Hash::default(),
             1,
             VRF_OUT,
-            vec![transfer(ALICE, DAVE, 1_000, 0)],
+            vec![v251_transfer(&pa, ALICE, DAVE, 1_000)],
         )
         .await;
         let a2 = produce(
@@ -7262,7 +7269,7 @@ mod tests {
             a1.header.block_hash,
             2,
             VRF_OUT,
-            vec![transfer(ALICE, BOB, 1_000, 1)],
+            vec![v251_transfer(&pa, ALICE, BOB, 1_000)],
         )
         .await;
         let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
@@ -7272,7 +7279,7 @@ mod tests {
             Hash::default(),
             1,
             VRF_OUT,
-            vec![transfer(ALICE, DAVE, 1_000, 0)],
+            vec![v251_transfer(&pb, ALICE, DAVE, 1_000)],
         )
         .await;
         let vrf_b = [0x5B; 32];
@@ -7281,7 +7288,7 @@ mod tests {
             a1.header.block_hash,
             2,
             vrf_b,
-            vec![transfer(ALICE, CAROL, 1_000, 1)],
+            vec![v251_transfer(&pb, ALICE, CAROL, 1_000)],
         )
         .await;
         let b3 = produce(
@@ -7289,7 +7296,7 @@ mod tests {
             b2.header.block_hash,
             3,
             vrf_b,
-            vec![transfer(ALICE, CAROL, 1_000, 2)],
+            vec![v251_transfer(&pb, ALICE, CAROL, 1_000)],
         )
         .await;
         (a1, a2, b2, b3)
