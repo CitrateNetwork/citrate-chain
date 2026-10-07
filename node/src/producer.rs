@@ -342,6 +342,7 @@ impl ProduceCatchupGate {
     ///   * a reorg that moves the selected head re-bases the watermark for free (the old
     ///     branch's candidates stop descending from the new head);
     ///   * there is no monotonic lifetime max to strand an honest producer above its chain.
+    ///
     /// Candidates at/below the finalized floor are pruned in passing (bounded record).
     /// No-op unless both the candidate record and the scratch watermark are wired.
     fn recompute_attested_ahead(&self, selected: Option<(Hash, u64)>, storage: &StorageManager) {
@@ -1573,8 +1574,8 @@ impl BlockProducer {
         self
     }
 
-    /// F2: the surfaced stall-alert flag (true while production is latched OFF after a
-    /// >60s no-progress stall). The monitor/RPC reads this to page a human (ops surface
+    /// F2: the surfaced stall-alert flag (true while production is latched OFF after
+    /// a >60s no-progress stall). The monitor/RPC reads this to page a human (ops surface
     /// wired to the RPC in a follow-up).
     #[allow(dead_code)]
     pub fn catchup_alert_handle(&self) -> Option<Arc<AtomicBool>> {
@@ -5696,10 +5697,12 @@ mod tests {
     /// deadband (RESUME, REFUSE] does NOT toggle production.
     #[test]
     fn f2_boundary_flapping_hysteresis_no_toggle() {
-        assert!(
-            CATCHUP_RESUME_GAP < CATCHUP_REFUSE_GAP,
-            "deadband must be non-empty"
-        );
+        const {
+            assert!(
+                CATCHUP_RESUME_GAP < CATCHUP_REFUSE_GAP,
+                "deadband must be non-empty"
+            )
+        };
         let attested = Arc::new(AtomicU64::new(0));
         let gate = f2_gate(attested.clone(), Duration::from_secs(3600)); // no stalls here
         let local_tip = 0u64;
