@@ -403,22 +403,26 @@ fn resolve_config_path(cli_config: Option<PathBuf>) -> Option<PathBuf> {
 async fn main() -> Result<()> {
     // Initialize structured logging
     // Uses LOG_FORMAT env var (json, pretty, compact) and RUST_LOG for levels
-    let log_config = if std::env::var("LOG_FORMAT")
-        .map(|f| f == "json")
-        .unwrap_or(false)
-    {
-        logging::LogConfig::production()
-    } else {
-        logging::LogConfig::from_env()
+    let log_config = logging::LogConfig::from_env();
+    let _logging_guard = match logging::init_logging(&log_config) {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            // Fallback to basic logging if structured logging fails
+            eprintln!("Warning: Failed to initialize structured logging: {}", e);
+            if let Err(fallback_error) = tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::from_default_env().add_directive("citrate=info".parse()?),
+                )
+                .try_init()
+            {
+                eprintln!(
+                    "Warning: Failed to initialize fallback logging: {}",
+                    fallback_error
+                );
+            }
+            None
+        }
     };
-
-    if let Err(e) = logging::init_logging(&log_config) {
-        // Fallback to basic logging if structured logging fails
-        eprintln!("Warning: Failed to initialize structured logging: {}", e);
-        tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::from_default_env().add_directive("citrate=info".parse()?))
-            .init();
-    }
 
     let cli = Cli::parse();
 
