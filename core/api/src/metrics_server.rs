@@ -169,6 +169,30 @@ pub static NETWORK_BYTES_SENT: Lazy<prometheus::CounterVec> = Lazy::new(|| {
     )
 });
 
+// Producer F2 catch-up gate (VERIFY-255-F2-M1: read-only ops status the fleet monitor
+// scrapes off the loopback-bound metrics server). `state` is producing|refusing|latched.
+pub static PRODUCER_CATCHUP_STATE: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
+    crate::metrics::must(
+        register_gauge_vec!(
+            "citrate_producer_catchup_state",
+            "Producer F2 catch-up gate state (1 = active in that state, 0 = not)",
+            &["state"]
+        ),
+        "Failed to register producer catchup state metric",
+    )
+});
+
+pub static PRODUCER_CATCHUP_HEIGHTS: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
+    crate::metrics::must(
+        register_gauge_vec!(
+            "citrate_producer_catchup_heights",
+            "Producer F2 catch-up gate heights (attested_ahead watermark, applied_tip, gap)",
+            &["kind"]
+        ),
+        "Failed to register producer catchup heights metric",
+    )
+});
+
 /// Metrics server configuration
 pub struct MetricsServer {
     addr: SocketAddr,
@@ -245,6 +269,37 @@ pub fn update_dag_metrics(height: u64, tips: usize, blue_score: u64) {
     DAG_HEIGHT.with_label_values(&[]).set(height as f64);
     DAG_TIPS_COUNT.with_label_values(&[]).set(tips as f64);
     DAG_BLUE_SCORE.with_label_values(&[]).set(blue_score as f64);
+}
+
+/// VERIFY-255-F2-M1: publish the producer F2 catch-up gate status (read-only) to the
+/// loopback-bound metrics surface the fleet monitor scrapes. `refusing`/`alert_latched`
+/// are mutually reported so a dashboard can show producing vs refusing(gap=N) vs latched.
+pub fn update_producer_catchup_status(
+    refusing: bool,
+    alert_latched: bool,
+    gap: u64,
+    attested_ahead: u64,
+    applied_tip: u64,
+) {
+    let producing = !refusing && !alert_latched;
+    PRODUCER_CATCHUP_STATE
+        .with_label_values(&["producing"])
+        .set(producing as u8 as f64);
+    PRODUCER_CATCHUP_STATE
+        .with_label_values(&["refusing"])
+        .set((refusing && !alert_latched) as u8 as f64);
+    PRODUCER_CATCHUP_STATE
+        .with_label_values(&["alert_latched"])
+        .set(alert_latched as u8 as f64);
+    PRODUCER_CATCHUP_HEIGHTS
+        .with_label_values(&["gap"])
+        .set(gap as f64);
+    PRODUCER_CATCHUP_HEIGHTS
+        .with_label_values(&["attested_ahead"])
+        .set(attested_ahead as f64);
+    PRODUCER_CATCHUP_HEIGHTS
+        .with_label_values(&["applied_tip"])
+        .set(applied_tip as f64);
 }
 
 /// Record RPC request
