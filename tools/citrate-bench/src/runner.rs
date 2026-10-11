@@ -697,11 +697,11 @@ mod tests {
         let mix = MixedWorkload::new(vec![
             MixEntry {
                 class: Arc::new(SimpleTransfer::default_bench()),
-                weight: 40,
+                weight: 2,
             },
             MixEntry {
                 class: Arc::new(OtherTransfer(other)),
-                weight: 60,
+                weight: 3,
             },
         ])
         .expect("mix");
@@ -726,9 +726,9 @@ mod tests {
         let sum: u64 = result.effective_mix.iter().map(|(_, n)| *n).sum();
         assert_eq!(sum, result.signed_ok);
 
-        // Weight-based expectation: over ~200 txs with weights 40/60,
-        // each class gets within a couple of full cycles of its
-        // configured ratio.
+        // The dispatcher is deterministic. Compute the exact expected
+        // 40/60 split for however many transactions the timed runner
+        // completed instead of assuming it always reaches ~200.
         let simple = result
             .effective_mix
             .iter()
@@ -741,7 +741,12 @@ mod tests {
             .find(|(n, _)| *n == "other_transfer")
             .expect("other")
             .1;
-        assert!(other >= simple, "60%% class should have >= 40%% class");
+        let full_cycles = sum / 5;
+        let remainder = sum % 5;
+        let expected_simple = full_cycles * 2 + remainder.min(2);
+        let expected_other = sum - expected_simple;
+        assert_eq!(simple, expected_simple);
+        assert_eq!(other, expected_other);
     }
 
     #[tokio::test]
