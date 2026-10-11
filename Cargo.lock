@@ -4316,6 +4316,7 @@ dependencies = [
  "citrate-network",
  "citrate-sequencer",
  "citrate-storage",
+ "dirs",
  "prometheus",
  "serde",
  "tokio",

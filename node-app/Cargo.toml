@@ -17,6 +17,7 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 axum = "0.7"
 prometheus = { version = "0.13", default-features = false }
+dirs = "5.0"
 
 # Citrate crates
 citrate-api = { path = "../core/api" }
