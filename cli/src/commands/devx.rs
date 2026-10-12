@@ -190,9 +190,11 @@ mod tests {
 
     #[test]
     fn predicts_the_onchain_vector() {
-        // On-chain CitrateWalletFactory.predictAddress(0x4242…) = 0xfb43484C…
-        // against the CURRENT vendored AA-stack addresses (factory
-        // 0x2d742b98…768d, impl 0x86486d1d…a51a). The citrate-sdk-js prediction
+        // On-chain CitrateWalletFactory.predictAddress(0x4242…) = 0x6Ef76179…
+        // against the CURRENT vendored AA-stack addresses (the r1005 reroll book,
+        // 2026-10-06; verified with `cast` against the live factory on the new
+        // genesis). The previous golden 0xfb43484C… was the pre-r1005 factory.
+        // The citrate-sdk-js prediction
         // test asserts the same value, so this is Rust↔JS↔on-chain parity. The
         // previous golden 0x1615Af12… was captured 2026-07-25, before the AA
         // stack was redeployed; citrate-sdk-python still bundles the old
@@ -204,7 +206,7 @@ mod tests {
         let addr = predict_address(factory, implementation, &uid);
         assert_eq!(
             to_checksum(&addr),
-            "0xfb43484CDbA25C6457C2775C1d6dfeD71cE4e720"
+            "0x6Ef7617980a1fe91D3449315E8D48f99A68Bb5eA"
         );
     }
 

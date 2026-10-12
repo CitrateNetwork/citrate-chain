@@ -155,9 +155,13 @@ https://docs.citrate.ai/local-stack
   with `--config`, or use the `devnet` subcommand / `--network local`.
 - Key CLI flags: `--data-dir`, `--rpc-addr`, `--p2p-addr`, `--mine`,
   `--bootstrap-nodes`, `--chain-id` (default 40204), `--coinbase`, `--no-rpc`.
-- Env: `RUST_LOG` (log level), `LOG_FORMAT` (`json|pretty|compact`),
-  `CITRATE_METRICS_ADDR` (Prometheus bind), `CITRATE_OPERATOR_TOKEN` (required for
-  operator RPC methods on a non-loopback bind).
+- Env: `RUST_LOG` (log level), `LOG_FORMAT` (`json|pretty|compact`), and `LOG_FILE`
+  (optional explicit file path; creates parent directories and appends ANSI-free
+  records while retaining console output). File logging has no implicit path and
+  buffered records are flushed on normal shutdown, not guaranteed after abrupt
+  termination. `CITRATE_METRICS_ADDR` sets the Prometheus bind;
+  `CITRATE_OPERATOR_TOKEN` is required for operator RPC methods on a non-loopback
+  bind.
 - Foundry: `contracts/foundry.toml` (canonical) and the root `foundry.toml` mirror
   the deterministic CREATE2 settings.
 

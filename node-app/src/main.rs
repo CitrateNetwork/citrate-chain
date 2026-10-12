@@ -67,10 +67,28 @@ fn resolve_inference_mode(args: &[String]) -> InferenceMode {
     production_default
 }
 
+fn resolve_data_dir(
+    override_dir: Option<PathBuf>,
+    home_dir: Option<PathBuf>,
+    is_windows: bool,
+) -> PathBuf {
+    override_dir.unwrap_or_else(|| {
+        if is_windows {
+            home_dir
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".citrate")
+                .join("node-app")
+        } else {
+            PathBuf::from("/data")
+        }
+    })
+}
 fn data_dir() -> PathBuf {
-    std::env::var_os("CITRATE_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/data"))
+    resolve_data_dir(
+        std::env::var_os("CITRATE_DATA_DIR").map(PathBuf::from),
+        dirs::home_dir(),
+        cfg!(windows),
+    )
 }
 
 fn rpc_addr() -> SocketAddr {
@@ -213,6 +231,8 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// HUP-S7.2: this RPC binary executes eth_call / eth_estimateGas with the
     /// same execution crate as the node, so it must publish the agent
     /// precompile fork height through the same resolver, before the executor
@@ -242,6 +262,58 @@ mod tests {
         assert!(
             !body.contains("set_agent_precompiles_height("),
             "one publication path"
+        );
+    }
+
+    #[test]
+    fn override_takes_precedence_on_windows() {
+        let override_dir = PathBuf::from("custom-data");
+        let home_dir = PathBuf::from("windows-home");
+
+        assert_eq!(
+            resolve_data_dir(Some(override_dir.clone()), Some(home_dir), true),
+            override_dir,
+            "CITRATE_DATA_DIR should override the Windows home-directory default"
+        );
+    }
+
+    #[test]
+    fn override_takes_precedence_on_non_windows() {
+        let override_dir = PathBuf::from("custom-data");
+
+        assert_eq!(
+            resolve_data_dir(Some(override_dir.clone()), None, false),
+            override_dir,
+            "CITRATE_DATA_DIR should override the non-Windows /data default"
+        );
+    }
+
+    #[test]
+    fn windows_default_uses_home_directory() {
+        let home_dir = PathBuf::from("windows-home");
+
+        assert_eq!(
+            resolve_data_dir(None, Some(home_dir.clone()), true),
+            home_dir.join(".citrate").join("node-app"),
+            "Windows should isolate node-app data under the user's .citrate directory"
+        );
+    }
+
+    #[test]
+    fn windows_default_falls_back_to_current_directory_without_home() {
+        assert_eq!(
+            resolve_data_dir(None, None, true),
+            PathBuf::from(".").join(".citrate").join("node-app"),
+            "Windows should use ./.citrate/node-app when no home directory is available"
+        );
+    }
+
+    #[test]
+    fn non_windows_default_remains_data() {
+        assert_eq!(
+            resolve_data_dir(None, Some(PathBuf::from("ignored-home")), false),
+            PathBuf::from("/data"),
+            "non-Windows platforms should preserve the /data default"
         );
     }
 }

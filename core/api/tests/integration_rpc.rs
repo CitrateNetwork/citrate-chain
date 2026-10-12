@@ -268,10 +268,16 @@ async fn test_eth_get_tx_and_receipt_by_hash() {
     .to_string();
     let resp_tx = io.handle_request(&req_tx).await.unwrap();
     let vtx: serde_json::Value = serde_json::from_str(&resp_tx).unwrap();
-    // Some environments may not index transactions for direct lookup yet; allow null here.
-    if vtx["result"].is_object() {
-        assert_eq!(vtx["result"]["nonce"], "0x2a");
-    }
+    assert!(vtx["result"].is_object(), "stored tx must be found: {vtx}");
+    assert_eq!(vtx["result"]["nonce"], "0x2a");
+    // A mined tx reports the block its receipt records, not block 0 / zero hash.
+    assert_eq!(vtx["result"]["blockNumber"], "0x7");
+    assert_eq!(
+        vtx["result"]["blockHash"],
+        format!("0x{}", hex::encode(block_hash.as_bytes()))
+    );
+    // The block body isn't stored in this fixture, so the index is unknown (null), never a fake 0.
+    assert!(vtx["result"]["transactionIndex"].is_null());
 
     // eth_getTransactionReceipt
     let req_rc = serde_json::json!({
@@ -285,6 +291,7 @@ async fn test_eth_get_tx_and_receipt_by_hash() {
     let vrc: serde_json::Value = serde_json::from_str(&resp_rc).unwrap();
     assert!(vrc["result"].is_object());
     assert_eq!(vrc["result"]["blockNumber"], "0x7");
+    assert!(vrc["result"]["transactionIndex"].is_null());
 }
 
 #[tokio::test(flavor = "multi_thread")]

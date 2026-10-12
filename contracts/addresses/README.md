@@ -91,8 +91,9 @@ simulation now prints *next-nonce* addresses that have no code.
 
 Instead, the book is derived from the chain itself.
 `40204.provenance.json` records every transaction the deployer
-(`0xa3512bE8…`) sent on the fresh chain: nonces 0–115, contiguous, all
-with `status=1`. For each transaction it records the tx hash, block, the
+(`0x7DAbC319…Acdf`, r1005 reroll 2026-10-06, genesis `1dcfc490…`) sent on
+the fresh chain: nonces 0–102, contiguous, all with `status=1` (no orphans
+this time; the 2026-09-29 chain had nonces 0–115 under `0xa3512bE8…`). For each transaction it records the tx hash, block, the
 created address, and the forge artifact whose creation code prefixes the
 init code. It also marks each entry `canonical` or `orphan`, where an
 orphan is the leftover of a partial first run that a complete rerun
