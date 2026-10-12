@@ -9,7 +9,7 @@
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -28,6 +28,37 @@ pub const DEFAULT_GATEWAY_PORT: u16 = 8080;
 
 /// Default IPFS swarm port
 pub const DEFAULT_SWARM_PORT: u16 = 4001;
+
+#[cfg(windows)]
+fn ipfs_path_lookup_command() -> (&'static str, &'static str) {
+    ("where.exe", "ipfs")
+}
+
+#[cfg(not(windows))]
+fn ipfs_path_lookup_command() -> (&'static str, &'static str) {
+    ("which", "ipfs")
+}
+
+fn is_ipfs_binary(path: &Path) -> bool {
+    Command::new(path)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| {
+            output.status.success() && {
+                let version = String::from_utf8_lossy(&output.stdout);
+                version.contains("ipfs") || version.contains("kubo")
+            }
+        })
+}
+
+fn verified_ipfs_path_from_lookup(stdout: &[u8]) -> Option<PathBuf> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .find(|path| path.exists() && is_ipfs_binary(path))
+}
 
 /// IPFS daemon status
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -202,25 +233,16 @@ impl IpfsDaemon {
 
         for path_str in &search_paths {
             let path = PathBuf::from(path_str);
-            if path.exists() {
-                // Verify it's actually IPFS
-                if let Ok(output) = Command::new(&path).arg("--version").output() {
-                    if output.status.success() {
-                        let version = String::from_utf8_lossy(&output.stdout);
-                        if version.contains("ipfs") || version.contains("kubo") {
-                            return Ok(path);
-                        }
-                    }
-                }
+            if path.exists() && is_ipfs_binary(&path) {
+                return Ok(path);
             }
         }
 
         // Try PATH
-        if let Ok(output) = Command::new("which").arg("ipfs").output() {
+        let (lookup_command, lookup_arg) = ipfs_path_lookup_command();
+        if let Ok(output) = Command::new(lookup_command).arg(lookup_arg).output() {
             if output.status.success() {
-                let path_str = String::from_utf8_lossy(&output.stdout);
-                let path = PathBuf::from(path_str.trim());
-                if path.exists() {
+                if let Some(path) = verified_ipfs_path_from_lookup(&output.stdout) {
                     return Ok(path);
                 }
             }
@@ -822,6 +844,24 @@ mod tests {
         // Should fail since path doesn't exist
         let result = daemon.find_ipfs_binary().await;
         assert!(result.is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_path_lookup_accepts_where_candidate() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let candidate = temp.path().join("ipfs.cmd");
+        std::fs::write(&candidate, "@echo ipfs version 0.32.1\r\n")
+            .expect("test IPFS command should be written");
+
+        let (command, argument) = ipfs_path_lookup_command();
+        assert_eq!((command, argument), ("where.exe", "ipfs"));
+
+        let lookup_output = format!("{}\r\n", candidate.display());
+        assert_eq!(
+            verified_ipfs_path_from_lookup(lookup_output.as_bytes()),
+            Some(candidate)
+        );
     }
 
     #[tokio::test]
