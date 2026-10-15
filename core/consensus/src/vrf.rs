@@ -2,7 +2,7 @@
 
 use crate::types::{Hash, PublicKey, VrfProof};
 use sha3::{Digest, Sha3_256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -21,6 +21,19 @@ pub enum VrfError {
 
     #[error("Cryptographic error: {0}")]
     CryptoError(String),
+
+    /// PSET-EPOCH: the block's epoch is governed by snapshot S(E) at
+    /// `snapshot_height`, which this node has not materialised yet (it is
+    /// behind). Not a verdict on the block: the node cannot judge it yet.
+    #[error(
+        "proposer set for height {height} (snapshot S(E) = {snapshot_height}) not materialised \
+         yet; this node has applied snapshots only up to {latest_materialised}"
+    )]
+    SnapshotNotMaterialized {
+        height: u64,
+        snapshot_height: u64,
+        latest_materialised: u64,
+    },
 }
 
 /// Validator information for VRF
@@ -64,7 +77,28 @@ pub struct VrfProposerSelector {
     /// Audit H-06: legacy 32-byte SHA3 proofs rejected at or above
     /// this height. See [`DEFAULT_LEGACY_VRF_CUTOFF_HEIGHT`].
     legacy_vrf_cutoff_height: u64,
+    /// PSET-EPOCH: `(EPOCH, SNAPSHOT_LAG)` of the registry snapshot schedule,
+    /// S(E) = E*EPOCH - SNAPSHOT_LAG. When set, eligibility is judged against
+    /// the set materialised at the snapshot that governs the BLOCK's height
+    /// (see [`Self::governing_snapshot`]), not the node's latest set.
+    snapshot_schedule: Option<(u64, u64)>,
+    /// PSET-EPOCH: recent per-snapshot sets, keyed by snapshot height S(E).
+    /// Bounded to [`PROPOSER_SET_HISTORY_SNAPSHOTS`] entries.
+    history: Arc<RwLock<BTreeMap<u64, EpochSet>>>,
 }
+
+/// PSET-EPOCH: one epoch's materialised proposer set.
+#[derive(Debug, Clone, Default)]
+struct EpochSet {
+    stakes: HashMap<PublicKey, u128>,
+    min_stake: u128,
+}
+
+/// PSET-EPOCH: how many per-snapshot sets the selector keeps. Matches the
+/// node's per-epoch snapshot retention (`REWARD_SNAPSHOT_RETENTION_EPOCHS`).
+/// A block whose epoch is older than this is far below any tip that could
+/// still reorg onto it; it falls back to the current-set rule.
+pub const PROPOSER_SET_HISTORY_SNAPSHOTS: usize = 8;
 
 impl VrfProposerSelector {
     pub fn new() -> Self {
@@ -73,6 +107,69 @@ impl VrfProposerSelector {
             total_stake: Arc::new(RwLock::new(0)),
             min_stake: Arc::new(RwLock::new(0)),
             legacy_vrf_cutoff_height: DEFAULT_LEGACY_VRF_CUTOFF_HEIGHT,
+            snapshot_schedule: None,
+            history: Arc::new(RwLock::new(BTreeMap::new())),
+        }
+    }
+
+    /// PSET-EPOCH: attach the registry snapshot schedule (S(E) = E*`epoch` -
+    /// `lag`) so admission judges each block against its own epoch's set.
+    /// Without it the selector keeps the legacy current-set rule.
+    pub fn with_snapshot_schedule(mut self, epoch: u64, lag: u64) -> Self {
+        if epoch > 0 && lag < epoch {
+            self.snapshot_schedule = Some((epoch, lag));
+        }
+        self
+    }
+
+    /// PSET-EPOCH: the snapshot height S(E) whose set governs a block at
+    /// `height`: the greatest S(E) (E >= 1) strictly below `height`, because
+    /// the node installs epoch E's set right after applying block S(E) and the
+    /// executor settles blocks S(E)+1.. against it. `None` below S(1)+1, or
+    /// with no schedule attached.
+    pub fn governing_snapshot(&self, height: u64) -> Option<u64> {
+        let (epoch, lag) = self.snapshot_schedule?;
+        let h = height.checked_sub(1)?;
+        let e = h.checked_add(lag)?.checked_div(epoch)?;
+        if e == 0 {
+            return None;
+        }
+        e.checked_mul(epoch)?.checked_sub(lag)
+    }
+
+    /// PSET-EPOCH: [`Self::sync_active_set`] for the snapshot at
+    /// `snapshot_height`, also recorded in the per-epoch history so blocks of
+    /// that epoch are judged against it even after the node moves on.
+    pub async fn sync_active_set_at(
+        &self,
+        snapshot_height: u64,
+        entries: Vec<(PublicKey, u128)>,
+        min_stake: u128,
+    ) {
+        self.record_snapshot(snapshot_height, &entries, min_stake)
+            .await;
+        self.sync_active_set(entries, min_stake).await;
+    }
+
+    /// PSET-EPOCH: record a snapshot's set in the history only (the current
+    /// set is left alone). Used at boot to seed older epochs from the durable
+    /// per-epoch store.
+    pub async fn record_snapshot(
+        &self,
+        snapshot_height: u64,
+        entries: &[(PublicKey, u128)],
+        min_stake: u128,
+    ) {
+        let mut history = self.history.write().await;
+        history.insert(
+            snapshot_height,
+            EpochSet {
+                stakes: entries.iter().copied().collect(),
+                min_stake,
+            },
+        );
+        while history.len() > PROPOSER_SET_HISTORY_SNAPSHOTS {
+            history.pop_first();
         }
     }
 
@@ -377,16 +474,67 @@ impl VrfProposerSelector {
     /// `_vrf_output` / `_slot` are retained for call-site compatibility and the VRF
     /// identity binding (checked separately in `verify_vrf_with_block_signature`); they
     /// do not influence the membership verdict.
+    ///
+    /// PSET-EPOCH: `slot` is the block height. With a snapshot schedule
+    /// attached, the block is judged against the set of the snapshot that
+    /// governs that height ([`Self::governing_snapshot`]), so a node that is
+    /// behind does not reject blocks from validators that registered later, and
+    /// a node that is ahead does not reject blocks from validators that have
+    /// since left. If the governing snapshot is newer than anything this node
+    /// has materialised, a proposer in the latest set is accepted (as before)
+    /// and any other returns [`VrfError::SnapshotNotMaterialized`]: the node
+    /// cannot judge the block yet. With no schedule, no history, a
+    /// block below the first snapshot, or an epoch older than the history, the
+    /// current set decides (the previous rule).
     pub async fn is_eligible_proposer(
         &self,
         pubkey: &PublicKey,
         _vrf_output: &Hash,
-        _slot: u64,
+        slot: u64,
     ) -> Result<bool, VrfError> {
+        if let Some(snapshot_height) = self.governing_snapshot(slot) {
+            let history = self.history.read().await;
+            if let Some(set) = history.get(&snapshot_height) {
+                let stake = set
+                    .stakes
+                    .get(pubkey)
+                    .copied()
+                    .ok_or(VrfError::ValidatorNotFound)?;
+                return Ok(stake >= set.min_stake);
+            }
+            if let Some((&latest, _)) = history.last_key_value() {
+                if snapshot_height > latest {
+                    drop(history);
+                    // Behind. Admission normally runs ahead of apply (a block
+                    // is admitted before its predecessors are applied), so this
+                    // is routine right after every snapshot boundary. A proposer
+                    // in the latest set is accepted as before, so nothing that
+                    // passed admission before is refused now; anyone else is
+                    // deferred rather than judged against the wrong epoch.
+                    if self.current_set_admits(pubkey).await {
+                        return Ok(true);
+                    }
+                    return Err(VrfError::SnapshotNotMaterialized {
+                        height: slot,
+                        snapshot_height,
+                        latest_materialised: latest,
+                    });
+                }
+            }
+        }
         let validators = self.validators.read().await;
         let validator = validators.get(pubkey).ok_or(VrfError::ValidatorNotFound)?;
         let min_stake = *self.min_stake.read().await;
         Ok(validator.is_active && validator.stake >= min_stake)
+    }
+
+    /// The current-set rule on its own: active, and at or above minStake.
+    async fn current_set_admits(&self, pubkey: &PublicKey) -> bool {
+        let validators = self.validators.read().await;
+        let min_stake = *self.min_stake.read().await;
+        validators
+            .get(pubkey)
+            .is_some_and(|v| v.is_active && v.stake >= min_stake)
     }
 
     /// Convert VRF output to a float between 0 and 1.
@@ -1024,5 +1172,78 @@ mod tests {
                 .unwrap(),
             "FWA-C1-01: production selector must reject the forgeable legacy SHA3 proof"
         );
+    }
+
+    /// PSET-EPOCH: admission judges a block against the proposer set of the
+    /// block's OWN epoch, not whatever set the node last synced.
+    ///
+    /// Schedule: EPOCH 1000, SNAPSHOT_LAG 200, so S(1) = 800, S(2) = 1800,
+    /// S(3) = 2800, and a block at height H is governed by the greatest S(E) < H.
+    #[tokio::test]
+    async fn pset_epoch_eligibility_follows_the_block_epoch() {
+        let a = PublicKey::new([0xA1; 32]);
+        let b = PublicKey::new([0xB2; 32]);
+        let vrf = Hash::default();
+        const MIN: u128 = 32;
+
+        // A node that is BEHIND: it has only applied up to epoch 1's snapshot.
+        let behind = VrfProposerSelector::production().with_snapshot_schedule(1000, 200);
+        behind.sync_active_set_at(800, vec![(a, MIN)], MIN).await;
+        // A block at 900 is governed by S(1): `a` is eligible, `b` is not.
+        assert!(behind.is_eligible_proposer(&a, &vrf, 900).await.unwrap());
+        assert!(matches!(
+            behind.is_eligible_proposer(&b, &vrf, 900).await,
+            Ok(false) | Err(VrfError::ValidatorNotFound)
+        ));
+        // A block at 2500 is governed by S(2) = 1800, which this node has not
+        // materialised. `b` registered in epoch 2: judging it against S(1)
+        // (the old behaviour) falsely rejects a valid block. It must be
+        // deferred, not rejected.
+        // `a` is in the latest set this node holds, so it is accepted as before
+        // (no change at a snapshot boundary, where admission runs ahead of apply).
+        assert!(behind.is_eligible_proposer(&a, &vrf, 2500).await.unwrap());
+        match behind.is_eligible_proposer(&b, &vrf, 2500).await {
+            Err(VrfError::SnapshotNotMaterialized {
+                snapshot_height, ..
+            }) => {
+                assert_eq!(snapshot_height, 1800)
+            }
+            other => panic!("expected a deferral for an unmaterialised epoch, got {other:?}"),
+        }
+
+        // A node that is AHEAD: current set is S(3), where `b` has exited.
+        let ahead = VrfProposerSelector::production().with_snapshot_schedule(1000, 200);
+        ahead.sync_active_set_at(800, vec![(a, MIN)], MIN).await;
+        ahead
+            .sync_active_set_at(1800, vec![(a, MIN), (b, MIN)], MIN)
+            .await;
+        ahead.sync_active_set_at(2800, vec![(a, MIN)], MIN).await;
+        // A block from `b` at 2500 (epoch 2) is still valid for a node that has
+        // moved on to epoch 3.
+        assert!(ahead.is_eligible_proposer(&b, &vrf, 2500).await.unwrap());
+        // ... and at 2900 (epoch 3) it is not.
+        assert!(matches!(
+            ahead.is_eligible_proposer(&b, &vrf, 2900).await,
+            Ok(false) | Err(VrfError::ValidatorNotFound)
+        ));
+        // The boundary is exclusive: block S(2) itself is governed by S(1).
+        assert!(matches!(
+            ahead.is_eligible_proposer(&b, &vrf, 1800).await,
+            Ok(false) | Err(VrfError::ValidatorNotFound)
+        ));
+        assert!(ahead.is_eligible_proposer(&b, &vrf, 1801).await.unwrap());
+    }
+
+    /// PSET-EPOCH: with no schedule attached (tests, devnets, older wiring) the
+    /// selector behaves exactly as before: the current set decides.
+    #[tokio::test]
+    async fn pset_epoch_no_schedule_keeps_the_current_set_rule() {
+        let a = PublicKey::new([0xA1; 32]);
+        let sel = VrfProposerSelector::production();
+        sel.sync_active_set(vec![(a, 32)], 32).await;
+        assert!(sel
+            .is_eligible_proposer(&a, &Hash::default(), 5_000)
+            .await
+            .unwrap());
     }
 }
