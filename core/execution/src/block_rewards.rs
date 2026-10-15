@@ -109,6 +109,32 @@ pub const VALIDATOR_INFO_SELECTOR: [u8; 4] = [0x00, 0x40, 0x88, 0x38];
 /// exactly zero (live proof at 40204: `emittedInEpoch` == 0 for every epoch).
 pub const BLOCK_SUBSIDY_SELECTOR: [u8; 4] = [0xce, 0x04, 0x00, 0xb7];
 
+/// RCAP: `ValidatorRegistry.EPOCH` — `currentEpoch()` is `block.number / EPOCH`.
+pub const REGISTRY_EPOCH: u64 = 1000;
+
+/// RCAP: storage slot of `ValidatorRegistry.maxEpochEmission` (`forge inspect
+/// ValidatorRegistry storage-layout`: slot 20). Pinned against the contract by
+/// `ValidatorRegistry.t.sol::test_storage_slots_match_the_executor`.
+pub const MAX_EPOCH_EMISSION_SLOT: [u8; 32] = {
+    let mut s = [0u8; 32];
+    s[31] = 20;
+    s
+};
+
+/// RCAP: storage slot of the `ValidatorRegistry.emittedInEpoch` mapping (slot 16).
+pub const EMITTED_IN_EPOCH_MAPPING_SLOT: u8 = 16;
+
+/// RCAP: storage slot of `emittedInEpoch[block.number / EPOCH]` for a block at
+/// `height`: `keccak256(abi.encode(epoch, 16))`, Solidity's mapping layout.
+pub fn emitted_in_epoch_slot(height: u64) -> [u8; 32] {
+    use sha3::{Digest, Keccak256};
+    let epoch = height.checked_div(REGISTRY_EPOCH).unwrap_or(0);
+    let mut preimage = [0u8; 64];
+    preimage[24..32].copy_from_slice(&epoch.to_be_bytes());
+    preimage[63] = EMITTED_IN_EPOCH_MAPPING_SLOT;
+    Keccak256::digest(preimage).into()
+}
+
 /// Gas ceiling for the `creditReward` system-call. Generous vs. its real cost
 /// (a couple of SSTOREs + an SLOAD ~ 60k). Gas price is 0 so this never charges
 /// anyone; the value only bounds runaway execution.
