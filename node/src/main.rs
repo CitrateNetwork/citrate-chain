@@ -82,6 +82,7 @@ mod registry_sync;
 mod rollback;
 mod startup_guards;
 mod sync_peer;
+mod timing;
 
 use citrate_consensus::dag_store::DagStore;
 use citrate_consensus::ghostdag::GhostDag;
@@ -1993,7 +1994,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             let floor = app.finalized_height_handle();
             let cp = checkpoint_manager.clone();
             tokio::spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+                // #310: Skip — no burst of floor polls after a stall.
+                let mut tick = timing::cadence_interval(std::time::Duration::from_secs(5));
                 loop {
                     tick.tick().await;
                     let h = cp.latest_finalized_height().await;
@@ -2034,7 +2036,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // instead of Theta(N²), but the DAG store still keeps every block it has
     // admitted — measured at ~16 KB/block on the G3 fleet run, i.e. a 3.9 GB
     // follower runs out near 150k blocks. Opt-in via CITRATE_DAG_PRUNE_RETAIN
-    // (no-op when unset) because the merge-block score path is not yet bounded.
+    // (no-op when unset). Merge blocks are scored from a bounded window
+    // (MS-BOUND, ghostdag::MERGE_SCORE_WINDOW), so pruning no longer breaks them.
     dag_prune::spawn(storage.clone(), shared_dag_store.clone());
 
     // D2.4: repair partial admissions already on disk. Any node that ran a
@@ -2320,7 +2323,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // the node advances to head unattended. No-op when there is nothing to drain.
         if let Some(app) = canonical_applicator.clone() {
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                // #310: Skip — a drain that ran long is followed by one
+                // more pass, not a back-to-back burst competing with the
+                // producer for the advance lock.
+                let mut interval = timing::cadence_interval(std::time::Duration::from_secs(1));
                 loop {
                     interval.tick().await;
                     app.drive_drain().await;
@@ -2386,7 +2392,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             let advertised_head = advertised_head.clone();
             let storage_head = storage.clone();
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                // #310: Skip — head advertisement keeps its 1 s cadence.
+                let mut interval = timing::cadence_interval(std::time::Duration::from_secs(1));
                 loop {
                     interval.tick().await;
                     if let Ok(Some((hash, height))) = storage_head.blocks.get_applied_tip() {
@@ -2517,7 +2524,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             let mut rotate_idx: u64 = 0;
             // #155: last peer we logged choosing, so SYNCPEER only fires on change.
             let mut last_logged_choice: Option<String> = None;
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+            // #310: Skip — a slow sync round must not be followed by a burst
+            // of back-to-back block requests to peers.
+            let mut interval = timing::cadence_interval(std::time::Duration::from_secs(2));
             loop {
                 interval.tick().await;
                 // Snapshot every CONNECTED peer with the head it advertises. The
@@ -3653,7 +3662,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             let mut last_processed = 0u64;
             let mut last_drops = 0u64;
             let mut stalled_samples = 0u32;
-            let mut interval = tokio::time::interval(CHECK_EVERY);
+            // #310: Delay — every sample covers a full CHECK_EVERY window, so
+            // a late tick is never followed by a second sample over ~0 s.
+            let mut interval = timing::sampling_interval(CHECK_EVERY);
             loop {
                 interval.tick().await;
                 let processed = msgs_processed.load(std::sync::atomic::Ordering::Relaxed);
