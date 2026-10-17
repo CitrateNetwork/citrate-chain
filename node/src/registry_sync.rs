@@ -287,7 +287,11 @@ impl RegistrySync {
             .map(|(pk, stake)| (PublicKey::new(pk), stake))
             .collect();
         let n = mapped.len();
-        self.selector.sync_active_set(mapped, min_stake).await;
+        // PSET-EPOCH: also keyed by S(E), so admission judges blocks of this
+        // epoch against this set even after the node moves to a later epoch.
+        self.selector
+            .sync_active_set_at(policy.snapshot_height, mapped, min_stake)
+            .await;
         Ok(n)
     }
 
@@ -474,9 +478,13 @@ impl RegistrySync {
                     .into_iter()
                     .map(|(pk, stake)| (PublicKey::new(pk), stake))
                     .collect();
-                self.selector.sync_active_set(mapped, min_stake).await;
+                let older = self.seed_older_proposer_sets(snap_h).await;
+                self.selector
+                    .sync_active_set_at(snap_h, mapped, min_stake)
+                    .await;
                 return Ok(format!(
-                    "durable epoch-{epoch} snapshot (S={snap_h}, {n} validators) reloaded"
+                    "durable epoch-{epoch} snapshot (S={snap_h}, {n} validators) reloaded, \
+                     plus {older} earlier epoch set(s)"
                 ));
             }
             Ok(None) => {}
@@ -498,6 +506,48 @@ impl RegistrySync {
                 EPOCH - SNAPSHOT_LAG
             )),
         }
+    }
+
+    /// PSET-EPOCH: reload the proposer sets of the epochs before `latest` from the
+    /// durable per-epoch store into the selector's history (the current set is left
+    /// alone), so admission after a restart judges a block of an earlier epoch
+    /// against that epoch's set. Returns how many were reloaded. Missing or
+    /// undecodable entries are skipped: such a block falls back to the current set,
+    /// the pre-PSET-EPOCH rule. Data source: `block_store.get_reward_snapshot_at`.
+    async fn seed_older_proposer_sets(&self, latest: u64) -> usize {
+        let mut loaded = 0usize;
+        let history = citrate_consensus::vrf::PROPOSER_SET_HISTORY_SNAPSHOTS as u64;
+        for back in 1..history {
+            let Some(s_e) = back.checked_mul(EPOCH).and_then(|d| latest.checked_sub(d)) else {
+                break;
+            };
+            if snapshot_epoch_at(s_e).is_none() {
+                break;
+            }
+            let blob = match self.storage.blocks.get_reward_snapshot_at(s_e) {
+                Ok(Some(blob)) => blob,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!("PSET-EPOCH: reading per-epoch snapshot S({s_e}) failed ({e})");
+                    continue;
+                }
+            };
+            match decode_reward_snapshot(&blob) {
+                Ok((policy, entries, min_stake)) if policy.snapshot_height == s_e => {
+                    let mapped: Vec<(PublicKey, u128)> = entries
+                        .into_iter()
+                        .map(|(pk, stake)| (PublicKey::new(pk), stake))
+                        .collect();
+                    self.selector.record_snapshot(s_e, &mapped, min_stake).await;
+                    loaded = loaded.saturating_add(1);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("PSET-EPOCH: per-epoch snapshot S({s_e}) failed to decode ({e})")
+                }
+            }
+        }
+        loaded
     }
 
     /// Read-only contract call against current state, via the executor's simulate path
@@ -1320,6 +1370,63 @@ mod tests {
         assert!(
             r.reward_policy_handle().read().is_none(),
             "no policy below S(1)"
+        );
+    }
+
+    /// PSET-EPOCH: a restarted node judges blocks of the epochs before its
+    /// latest snapshot against THEIR sets, reloaded from the durable per-epoch
+    /// store, not against the latest set alone.
+    #[tokio::test]
+    async fn boot_rehydration_restores_per_epoch_proposer_sets() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage = Arc::new(
+            citrate_storage::StorageManager::new(dir.path(), PruningConfig::default())
+                .expect("storage"),
+        );
+        let x = [0x11u8; 32];
+        let y = [0x22u8; 32];
+        let policy_at = |snapshot_height: u64| EpochRewardPolicy {
+            epoch: snapshot_epoch_at(snapshot_height).expect("boundary"),
+            snapshot_height,
+            activation_height: ACTIVATION,
+            registry: REG,
+            reward_minter: [0x50u8; 20],
+            priority_fee_share_bps: SHARE_BPS,
+            block_subsidy: U256::zero(),
+            staker_of: std::collections::HashMap::new(),
+        };
+        // Epoch 2 (S = 1800): x and y. Epoch 3 (S = 2800): y has left.
+        let s2 = encode_reward_snapshot(&policy_at(1800), &[(x, 32), (y, 32)], 32);
+        let s3 = encode_reward_snapshot(&policy_at(2800), &[(x, 32)], 32);
+        storage
+            .blocks
+            .put_reward_snapshot_at(1800, &s2)
+            .expect("put");
+        storage
+            .blocks
+            .put_reward_snapshot_at(2800, &s3)
+            .expect("put");
+        storage.blocks.put_reward_snapshot(&s3).expect("put latest");
+
+        let r = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        let sel =
+            Arc::new(VrfProposerSelector::production().with_snapshot_schedule(EPOCH, SNAPSHOT_LAG));
+        let rs = RegistrySync::new(r, sel.clone(), REG, ACTIVATION, storage);
+        rs.hydrate_on_boot(2900).await.expect("hydrate");
+
+        let yk = PublicKey::new(y);
+        assert!(
+            sel.is_eligible_proposer(&yk, &Hash::default(), 2500)
+                .await
+                .expect("epoch-2 set reloaded"),
+            "a block from y in epoch 2 stays valid after a restart in epoch 3"
+        );
+        assert!(
+            !matches!(
+                sel.is_eligible_proposer(&yk, &Hash::default(), 2900).await,
+                Ok(true)
+            ),
+            "y is not eligible in epoch 3"
         );
     }
 }
