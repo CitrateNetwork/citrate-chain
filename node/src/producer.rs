@@ -35,7 +35,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::time::{interval, Duration};
+use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use crate::contribution_recorder::ContributionRecorder;
@@ -1632,7 +1632,10 @@ impl BlockProducer {
 
     /// Start block production loop
     pub async fn start(self: Arc<Self>) {
-        let mut interval = interval(Duration::from_secs(self.target_block_time));
+        // #310: Skip, not tokio's default Burst — after a round that waited
+        // out a long catch-up, resume at the configured block time instead of
+        // sealing one block per missed tick back to back.
+        let mut interval = crate::timing::production_interval(self.target_block_time);
         let mut block_count = 0u64;
 
         loop {
