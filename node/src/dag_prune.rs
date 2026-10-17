@@ -39,13 +39,15 @@
 // The floor is therefore 10x the deepest revertible reorg, and the default
 // window is 100x it.
 //
-// STILL UNBOUNDED, DELIBERATELY OUT OF SCOPE HERE
+// MERGE BLOCKS (MS-BOUND)
 //
-// A merge block's score falls back to `calculate_blue_set`, which walks the
-// selected-parent chain to genesis and would fail against a pruned store. The
-// live chain is entirely linear (`mergeParentHashes: []` throughout), so this is
-// unexercised today — but it MUST be bounded before the DAG carries real merge
-// traffic. That is why this scheduler is opt-in rather than default-on.
+// A merge block's score used to fall back to `calculate_blue_set`, which walks
+// the selected-parent chain to genesis and fails against a pruned store. Fork
+// choice now scores a merge block from a bounded window
+// (`ghostdag::MERGE_SCORE_WINDOW`, 200 heights), always inside the retained
+// range, so pruned and unpruned nodes compute the same score
+// (`pruned_node_scores_a_sibling_merge_like_an_unpruned_node`). Pruning stays
+// opt-in: it changes the memory/retention behaviour of a consensus surface.
 
 use std::sync::Arc;
 
@@ -55,10 +57,9 @@ use tracing::{debug, info, warn};
 
 /// Env var that enables DAG pruning AND sets the retain window, in blocks.
 ///
-/// Absent => pruning disabled (the default). Opt-in because the merge-block
-/// path above is not yet bounded, and because this changes the memory/retention
-/// behaviour of a T1 consensus surface — it should be switched on deliberately,
-/// not inherited by a node that happened to take an upgrade.
+/// Absent => pruning disabled (the default). Opt-in because this changes the
+/// memory/retention behaviour of a T1 consensus surface — it should be switched
+/// on deliberately, not inherited by a node that happened to take an upgrade.
 pub const RETAIN_ENV: &str = "CITRATE_DAG_PRUNE_RETAIN";
 
 /// Hard floor on the retain window: 10x `MAX_REORG_DEPTH`. A smaller request is
@@ -690,6 +691,123 @@ mod tests {
              now disagree about the canonical chain — a fork, caused by a purely \
              local storage policy. Bound merge-parent depth in consensus before \
              enabling pruning."
+        );
+    }
+
+    /// MS-BOUND: a pruned node scores an ordinary merge block, and gets the same
+    /// score an unpruned node gets.
+    ///
+    /// Two producers sealing at the same height create siblings, and the next
+    /// block merges them. Scoring that merge block used to build the full
+    /// cumulative blue set, which walks the selected-parent chain back to
+    /// genesis; on a pruned DAG store that walk reaches a dropped block and
+    /// `add_block` fails with `BlockNotFound`, so the merge block (and every
+    /// block built on it) can never be admitted. The bounded score reads only a
+    /// window of `MERGE_SCORE_WINDOW` heights below the block, which is always
+    /// inside the retained range.
+    #[tokio::test]
+    async fn pruned_node_scores_a_sibling_merge_like_an_unpruned_node() {
+        use citrate_consensus::dag_store::DagStore;
+        use citrate_consensus::ghostdag::GhostDag;
+        use citrate_consensus::types::{BlockBuilder, GhostDagParams, Hash, VrfProof};
+        use citrate_storage::pruning::PruningConfig;
+
+        fn mk(
+            height: u64,
+            parent: Hash,
+            merges: Vec<Hash>,
+            coinbase: u8,
+        ) -> citrate_consensus::types::Block {
+            let mut b = BlockBuilder::new()
+                .version(2)
+                .height(height)
+                .parent(parent)
+                .merge_parents(merges)
+                .coinbase([coinbase; 20])
+                .timestamp(1000)
+                .vrf_reveal(VrfProof {
+                    proof: vec![],
+                    output: Hash::new([0x5A; 32]),
+                })
+                .transactions(vec![])
+                .state_root(Hash::default())
+                .blue_score(height)
+                .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                .build_unhashed();
+            b.header.block_hash = b.compute_hash();
+            b
+        }
+
+        const N: u64 = 2_500;
+        const RETAIN: u64 = MIN_RETAIN_BLOCKS;
+
+        // Same blocks into two nodes: one prunes, one does not.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let pruned_dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let pruned = GhostDag::new(GhostDagParams::default(), pruned_dag.clone());
+        let full_dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let full = GhostDag::new(GhostDagParams::default(), full_dag.clone());
+
+        let mut parent = Hash::default();
+        for h in 0..=N {
+            let b = mk(h, parent, vec![], 0x33);
+            parent = b.header.block_hash;
+            for (dag, gd) in [(&pruned_dag, &pruned), (&full_dag, &full)] {
+                dag.store_block(b.clone()).await.expect("dag");
+                gd.add_block(&b).await.expect("admit");
+            }
+            storage.blocks.put_block(&b).expect("chain");
+        }
+        storage.blocks.put_applied_tip(&parent, N).expect("tip");
+
+        let dropped = prune_once(&storage, &pruned_dag, N, RETAIN).await;
+        assert!(dropped > 0, "the pruned node must actually have pruned");
+
+        // Two producers seal siblings at N+1; the next block merges them.
+        let a = mk(N + 1, parent, vec![], 0x33);
+        let b = mk(N + 1, parent, vec![], 0x44);
+        let merge = mk(N + 2, a.header.block_hash, vec![b.header.block_hash], 0x33);
+        for blk in [&a, &b, &merge] {
+            for (dag, gd) in [(&pruned_dag, &pruned), (&full_dag, &full)] {
+                dag.store_block(blk.clone()).await.expect("dag");
+                gd.add_block(blk).await.unwrap_or_else(|e| {
+                    panic!(
+                        "a pruned or unpruned node must admit {} @ {}: {e:?}",
+                        blk.header.block_hash, blk.header.height
+                    )
+                });
+            }
+        }
+
+        let h = merge.header.block_hash;
+        let pruned_score = pruned.get_blue_score(&h).await.expect("score");
+        let full_score = full.get_blue_score(&h).await.expect("score");
+        assert_eq!(
+            pruned_score, full_score,
+            "pruned and unpruned nodes must agree on a merge block's score"
+        );
+        // Genesis..N is N+1 blocks, plus a, plus the blue merge parent b, plus merge.
+        assert_eq!(
+            full_score,
+            N + 4,
+            "merge = sp score + 1 + one blue merge parent"
+        );
+
+        // And the chain keeps going on top of it.
+        let child = mk(N + 3, h, vec![], 0x44);
+        pruned_dag.store_block(child.clone()).await.expect("dag");
+        pruned
+            .add_block(&child)
+            .await
+            .expect("child of a merge block admits");
+        assert_eq!(
+            pruned
+                .get_blue_score(&child.header.block_hash)
+                .await
+                .expect("score"),
+            N + 5
         );
     }
 

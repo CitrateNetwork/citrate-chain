@@ -2032,7 +2032,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // instead of Theta(N²), but the DAG store still keeps every block it has
     // admitted — measured at ~16 KB/block on the G3 fleet run, i.e. a 3.9 GB
     // follower runs out near 150k blocks. Opt-in via CITRATE_DAG_PRUNE_RETAIN
-    // (no-op when unset) because the merge-block score path is not yet bounded.
+    // (no-op when unset). Merge blocks are scored from a bounded window
+    // (MS-BOUND, ghostdag::MERGE_SCORE_WINDOW), so pruning no longer breaks them.
     dag_prune::spawn(storage.clone(), shared_dag_store.clone());
 
     // D2.4: repair partial admissions already on disk. Any node that ran a
