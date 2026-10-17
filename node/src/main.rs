@@ -2032,6 +2032,17 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // block 1 against a zero selected-parent and orphans it.
     block_admission.seed_genesis().await;
 
+    // A database that followed a branch the release's canonical checkpoints
+    // exclude stays on it: admission refuses the network's blocks above it.
+    // Say so plainly; the fix is to move the chain data aside and resync.
+    for (height, stored, canonical) in block_admission.stored_checkpoint_conflicts() {
+        error!(
+            "chain data holds block {stored} at height {height}, but this network's canonical \
+             block there is {canonical}: this database is on a branch the network does not \
+             continue. Stop the node, move the chain data aside (keep the keys) and resync."
+        );
+    }
+
     // SYNC-S1 D3: bound DagStore memory. D1 made per-block retention O(1)
     // instead of Theta(N²), but the DAG store still keeps every block it has
     // admitted — measured at ~16 KB/block on the G3 fleet run, i.e. a 3.9 GB
