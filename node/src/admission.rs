@@ -64,6 +64,7 @@
 // surface. With D2.2 a partial admission becomes impossible; with D2.3 alone
 // it becomes self-healing. Self-healing first, impossible second.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -271,7 +272,17 @@ pub struct BlockAdmission {
     repair_log: LogBudget,
     /// D4a: budget for the "re-delivered block below the pruning point" line.
     pruned_log: LogBudget,
+    /// Blocks withdrawn by an operator rollback (`citrate rollback`, see
+    /// `rollback.rs`), plus every block seen built on one. Refused before any
+    /// other check, so a peer still holding the removed branch cannot bring it
+    /// back. Loaded from the database at start; the descendants are kept in
+    /// memory only (they can never be admitted, as their parent never is).
+    withdrawn: std::sync::RwLock<HashSet<Hash>>,
 }
+
+/// Cap on withdrawn hashes held in memory; descendants past it are refused as
+/// missing-parent blocks instead (their parent is never admitted either).
+const MAX_WITHDRAWN: usize = 1_000_000;
 
 impl BlockAdmission {
     pub fn new(
@@ -280,6 +291,7 @@ impl BlockAdmission {
         ghostdag: Arc<GhostDag>,
         applicator: Option<Arc<CanonicalApplicator>>,
     ) -> Self {
+        let withdrawn = std::sync::RwLock::new(crate::rollback::load_withdrawn(&storage));
         Self {
             storage,
             dag_store,
@@ -287,7 +299,47 @@ impl BlockAdmission {
             applicator,
             repair_log: LogBudget::new(REPAIR_LOG_PER_WINDOW, LOG_WINDOW_SECS),
             pruned_log: LogBudget::new(PRUNED_LOG_PER_WINDOW, LOG_WINDOW_SECS),
+            withdrawn,
         }
+        .log_withdrawn()
+    }
+
+    fn log_withdrawn(self) -> Self {
+        let n = self.withdrawn.read().map(|w| w.len()).unwrap_or(0);
+        if n > 0 {
+            info!("admission: refusing {n} block(s) withdrawn by an operator rollback, and their descendants");
+        }
+        self
+    }
+
+    /// Why `block` is refused as withdrawn, if it is: it was withdrawn by an
+    /// operator rollback, or a parent was. A block built on a withdrawn one is
+    /// remembered too, so the whole removed branch is refused.
+    fn withdrawn_reason(&self, block: &Block) -> Option<String> {
+        let hash = block.header.block_hash;
+        let parents = block.parents();
+        {
+            let set = self.withdrawn.read().unwrap_or_else(|e| e.into_inner());
+            if set.is_empty() {
+                return None;
+            }
+            if set.contains(&hash) {
+                return Some(format!(
+                    "block {hash} was withdrawn by an operator rollback"
+                ));
+            }
+            if !parents.iter().any(|p| set.contains(p)) {
+                return None;
+            }
+        }
+        let mut set = self.withdrawn.write().unwrap_or_else(|e| e.into_inner());
+        if set.len() < MAX_WITHDRAWN {
+            set.insert(hash);
+        }
+        Some(format!(
+            "block {hash} @ {} is built on a block withdrawn by an operator rollback",
+            block.header.height
+        ))
     }
 
     /// D4a: the height below which DAG pruning has deliberately dropped
@@ -325,6 +377,12 @@ impl BlockAdmission {
     /// when a previous attempt was interrupted.
     pub async fn admit(&self, block: &Block) -> AdmitOutcome {
         let hash = block.header.block_hash;
+
+        // Operator rollback: a withdrawn branch never re-enters, from any peer.
+        if let Some(why) = self.withdrawn_reason(block) {
+            debug!("admission: {why}");
+            return AdmitOutcome::Rejected(why);
+        }
 
         // R1: presence in each store is established INDEPENDENTLY. A single
         // `has_block` on either store is exactly the bug this module exists
@@ -706,8 +764,6 @@ pub const MAX_ORPHAN_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 /// first (those are the ones whose parents are most likely to arrive next and
 /// unblock them).
 pub fn bound_orphan_buffer(blocks: Vec<Block>) -> Vec<Block> {
-    use std::collections::HashSet;
-
     let mut seen: HashSet<Hash> = HashSet::with_capacity(blocks.len());
     let mut deduped: Vec<Block> = Vec::with_capacity(blocks.len());
     for b in blocks {

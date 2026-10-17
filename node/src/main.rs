@@ -79,6 +79,7 @@ mod network_inference;
 mod persistent_dag;
 mod producer;
 mod registry_sync;
+mod rollback;
 mod startup_guards;
 mod sync_peer;
 
@@ -287,6 +288,30 @@ enum Commands {
         /// Emit the manifest as JSON.
         #[arg(long)]
         json: bool,
+    },
+
+    /// Roll this node's stored chain back to a height. Run it with the node
+    /// stopped. Removes every block above --to-height and any other block at
+    /// it, keeps --keep there, and refuses the removed branch from peers from
+    /// then on. See node/src/rollback.rs.
+    Rollback {
+        /// Keep blocks up to and including this height.
+        #[arg(long, value_name = "HEIGHT")]
+        to_height: u64,
+        /// Hash of the block to keep at --to-height (hex).
+        #[arg(long, value_name = "HASH")]
+        keep: String,
+        /// Also refuse this block, and blocks built on it, from peers (hex;
+        /// repeatable).
+        #[arg(long, value_name = "HASH")]
+        withdraw: Vec<String>,
+        /// Print what would be removed and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Allow the rollback when the applied state is above the cut: the
+        /// node then rebuilds its state from genesis at the next start.
+        #[arg(long)]
+        rebuild_state: bool,
     },
 
     /// Wallet management (accounts, balances, transfers)
@@ -505,6 +530,44 @@ async fn main() -> Result<()> {
         }
         Some(Commands::GenesisInfo) => {
             show_genesis_info()?;
+            return Ok(());
+        }
+        Some(Commands::Rollback {
+            to_height,
+            keep,
+            withdraw,
+            dry_run,
+            rebuild_state,
+        }) => {
+            let data_dir = match cli.data_dir.clone() {
+                Some(d) => d,
+                None => {
+                    let path = resolve_config_path(cli.config.clone()).ok_or_else(|| {
+                        anyhow::anyhow!("no node config found; pass --config or --data-dir")
+                    })?;
+                    NodeConfig::from_file(&path)?.storage.data_dir
+                }
+            };
+            // Opening the data directory fails while the node runs (RocksDB LOCK).
+            let storage = StorageManager::with_config(
+                &data_dir,
+                StorageConfig {
+                    pruning: PruningConfig {
+                        auto_prune: false,
+                        ..PruningConfig::default()
+                    },
+                    encryption: at_rest_encryption_from_env()?,
+                },
+            )?;
+            rollback::run(
+                &storage,
+                &data_dir,
+                to_height,
+                &keep,
+                &withdraw,
+                dry_run,
+                rebuild_state,
+            )?;
             return Ok(());
         }
         Some(Commands::Wallet {
@@ -2339,6 +2402,20 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         let cur = app.applied_tip().await;
                         if head == cur.hash {
                             return; // already converged / healthy — nothing to do
+                        }
+                        // Only behind the head, on its chain (stopped mid-replay, or
+                        // after `citrate rollback`): the drain applies forward from
+                        // here, verifying each block. A from-genesis rebuild would
+                        // throw that progress away and hold the advance lock for the
+                        // whole replay, which starves the P2P handler until the stall
+                        // watchdog restarts the node. A fork on the way still falls
+                        // back to the runtime rebuild.
+                        if app.applied_tip_is_ancestor_of(head).await {
+                            info!(
+                                "canonical recovery: applied tip {} @ {} is behind the fork-choice head {} @ {} on the same chain; the drain advances it (no rebuild)",
+                                cur.hash, cur.height, head, head_h
+                            );
+                            return;
                         }
                         match app
                             .recover_to_head(genesis_snapshot.clone(), genesis_hash)
