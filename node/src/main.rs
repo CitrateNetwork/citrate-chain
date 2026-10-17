@@ -1867,9 +1867,13 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // The shared proposer selector — the SAME Arc the DAG store admits against and the
     // snapshot-sync rebuilds. production() disables the forgeable legacy VRF path.
     let validator_selector: Option<Arc<citrate_consensus::vrf::VrfProposerSelector>> =
-        validator_registry
-            .as_ref()
-            .map(|_| Arc::new(citrate_consensus::vrf::VrfProposerSelector::production()));
+        validator_registry.as_ref().map(|_| {
+            // PSET-EPOCH: judge each block against its own epoch's set.
+            Arc::new(
+                citrate_consensus::vrf::VrfProposerSelector::production()
+                    .with_snapshot_schedule(registry_sync::EPOCH, registry_sync::SNAPSHOT_LAG),
+            )
+        });
 
     let shared_dag_store = {
         let kv = Arc::new(persistent_dag::RocksDbKvStore::new(storage.db.clone()));
