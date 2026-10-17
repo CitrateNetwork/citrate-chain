@@ -160,7 +160,8 @@ pub fn spawn(storage: Arc<StorageManager>, dag_store: Arc<DagStore>) {
          (>= {MIN_RETAIN_BLOCKS}; reorg window is 100)"
     );
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+        // #310: Skip — never run prunes back to back after a slow pass.
+        let mut tick = crate::timing::cadence_interval(std::time::Duration::from_secs(300));
         loop {
             tick.tick().await;
             let applied_height = storage
