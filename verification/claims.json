@@ -100,7 +100,7 @@
       "reproduction_command": "sed -n '48,53p' node/config/testnet.toml",
       "last_verified_at": "2026-09-24T02:37:00Z",
       "verification_status": "reproducible-from-source",
-      "notes": "[checkpoint] interval=50, committee_size=100, quorum_threshold=67 (2/3+1 BFT committee finality, WP-W.2). These are CONFIGURED parameters of a mechanism that is specified but NOT running: no production code path calls CheckpointManager::propose, so no checkpoint is ever proposed or finalized (see deterministic_checkpoint_finality)."
+      "notes": "[checkpoint] interval=50, committee_size=100, quorum_threshold=67 (2/3+1 BFT committee finality, WP-W.2). These are CONFIGURED parameters of a mechanism that is specified but NOT running: a Stage-1 propose loop exists behind CITRATE_CHECKPOINT_FINALITY (off by default), but nothing signs or broadcasts a vote, so no checkpoint is ever finalized (see deterministic_checkpoint_finality)."
     },
     "deterministic_checkpoint_finality": {
       "scope": "citrate-chain",
@@ -124,7 +124,7 @@
       "reproduction_command": "python3 verification/check_claims.py  # fails if this claim says running=true while no non-test code path calls .propose(",
       "last_verified_at": "2026-09-25T05:30:00Z",
       "verification_status": "specified-not-running",
-      "notes": "Checkpoint finality is SPECIFIED, NOT RUNNING on the public testnet: CheckpointManager is constructed, but no production code path calls propose(), so no checkpoint is finalized. Confirmation is probabilistic. The RPC does not serve the 'finalized' block tag. Do NOT publish a finality time (the old 90-100s figure assumed a running committee)."
+      "notes": "Checkpoint finality is SPECIFIED, NOT RUNNING on the public testnet: CheckpointManager is constructed; a Stage-1 propose loop (node/src/checkpoint_driver.rs) exists behind CITRATE_CHECKPOINT_FINALITY, off by default, and no production code signs or broadcasts a vote, so no checkpoint is finalized. Confirmation is probabilistic. The RPC does not serve the 'finalized' block tag. Do NOT publish a finality time (the old 90-100s figure assumed a running committee)."
     },
     "confirmation_latency": {
       "scope": "citrate-chain",
