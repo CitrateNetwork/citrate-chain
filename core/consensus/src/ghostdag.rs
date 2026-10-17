@@ -107,6 +107,22 @@ pub struct GhostDag {
 ///   MERGE_PARENT_MAX_DEPTH (100) < MIN_RETAIN_BLOCKS (1,000) <= retain window
 pub const MERGE_PARENT_MAX_DEPTH: u64 = 100;
 
+/// MS-BOUND: how far below a merge block its fork-choice score may look.
+///
+/// A merge block's score is `score(selected parent) + 1 + (number of its merge
+/// parents that are blue)`, where a merge parent is blue when at most `k` blocks
+/// of the selected parent's past within this window sit in its anticone (see
+/// `bounded_blue_merge_count`). Everything that computation reads lies in
+/// `[height - MERGE_SCORE_WINDOW, height)`, and a block's past within a height
+/// range is fixed by the parent hashes in headers, so every node that holds that
+/// range computes the same score, whether or not it prunes below it.
+///
+/// Must stay well under `MIN_RETAIN_BLOCKS` (1,000) so a pruned node always holds
+/// the window plus one MP-DEPTH of parents below it (300 heights here):
+///
+///   MERGE_PARENT_MAX_DEPTH (100) < MERGE_SCORE_WINDOW (200) < MIN_RETAIN_BLOCKS (1,000)
+pub const MERGE_SCORE_WINDOW: u64 = 2 * MERGE_PARENT_MAX_DEPTH;
+
 /// Height from which MP-DEPTH is enforced on chain 40204.
 ///
 /// **0 since the 2026-08-04 re-roll.** The previous value (100_000) existed
@@ -1177,10 +1193,13 @@ impl GhostDag {
     /// which also repairs the pre-D1 split where the receive path and the
     /// restart-rehydration path disagreed by one on the same block.
     ///
-    /// A merge block still needs a real union, so it falls back to
-    /// [`Self::calculate_blue_set`]. Merge blocks are rare, and the fallback is
-    /// also taken when the selected parent is not yet in `relations` (a cold
-    /// process that has not rehydrated the parent yet).
+    /// **A merge block (MS-BOUND)** scores `sp.score + 1 + blue merge parents`,
+    /// with blueness judged inside [`MERGE_SCORE_WINDOW`] by
+    /// [`Self::bounded_blue_merge_count`]. It used to fall back to
+    /// [`Self::calculate_blue_set`], which builds the cumulative set by walking
+    /// to genesis; on a pruned DAG store that walk fails `BlockNotFound` and the
+    /// merge block can never be admitted. `calculate_blue_set` remains for
+    /// callers that need the full set; fork choice no longer depends on it.
     async fn derive_score_and_work(&self, block: &Block) -> Result<BlueSet, GhostDagError> {
         let lightweight = |score: u64| BlueSet {
             blocks: std::collections::HashSet::new(),
@@ -1193,85 +1212,198 @@ impl GhostDag {
             return Ok(lightweight(1));
         }
 
+        let sp_score = self.score_of(&block.selected_parent()).await?;
+        let added = self.score_contribution(block).await?;
+        Ok(lightweight(score_add(sp_score, added)?))
+    }
+
+    /// What `block` adds on top of its selected parent's score: 1 for itself,
+    /// plus 1 for each blue merge parent (MS-BOUND). Does not depend on any
+    /// score, only on the DAG shape within [`MERGE_SCORE_WINDOW`] below `block`.
+    async fn score_contribution(&self, block: &Block) -> Result<u64, GhostDagError> {
         if block.header.merge_parent_hashes.is_empty() {
-            let sp_score = self
-                .relations
-                .read()
-                .await
-                .get(&block.selected_parent())
-                .map(|r| r.blue_set.score);
-            if let Some(sp_score) = sp_score {
-                return Ok(lightweight(score_add(sp_score, 1)?));
-            }
+            return Ok(1);
+        }
+        let blues = self.bounded_blue_merge_count(block).await?;
+        score_add(1, blues)
+    }
 
-            // SYNC-S1 D3 — durable anchor. `relations` is in-memory, so after a
-            // restart the parent's score is not there, but a previous process
-            // persisted it. One O(1) read replaces the walk below entirely, and
-            // removes the last reason the DAG store must retain deep ancestry
-            // (which is what blocks wiring `prune()`).
-            if let Some(sp_score) = self
-                .dag_store
-                .get_derived_blue_score(&block.selected_parent())
-            {
-                return Ok(lightweight(score_add(sp_score, 1)?));
-            }
+    /// A score this node already holds for `hash`: in-memory `relations`
+    /// first, then the durable `score:<hash>` anchor (SYNC-S1 D3).
+    async fn known_score(&self, hash: &Hash) -> Option<u64> {
+        if let Some(score) = self
+            .relations
+            .read()
+            .await
+            .get(hash)
+            .map(|r| r.blue_set.score)
+        {
+            return Some(score);
+        }
+        self.dag_store.get_derived_blue_score(hash)
+    }
 
-            // COLD PATH — the selected parent is not in `relations`.
-            //
-            // This is not an edge case: `relations` is in-memory only, so after
-            // EVERY restart a follower's first received block lands here. It
-            // must not reach `calculate_blue_set`: that walks the
-            // selected-parent chain to genesis and caches a full cumulative
-            // ancestor set for EVERY block on the way (see
-            // `get_or_calculate_blue_set` phase 2), which rebuilds the entire
-            // Theta(N²) footprint in a single call. At the live chain's height
-            // that is the ~4 GB that OOM-killed boot-3 — so routing the cold
-            // path through it would have reintroduced the exact bug D1 removes,
-            // once per restart.
-            //
-            // Instead walk back to the nearest ancestor whose score is known,
-            // counting edges. `score(b) = score(cursor) + hops` because each
-            // linear step adds exactly one. O(depth) time, O(1) memory, and
-            // only the first block after a restart pays it — its child then
-            // finds it in `relations`.
-            let mut hops: u64 = 1;
-            let mut cursor = block.selected_parent();
-            // An honest chain cannot have more ancestors than its height; a
-            // longer walk means corrupt linkage (or a cycle), so bail out to
-            // the authoritative computation rather than spin.
-            let max_hops = block.header.height.saturating_add(1);
-            while hops <= max_hops {
-                if let Some(score) = self
-                    .relations
-                    .read()
-                    .await
-                    .get(&cursor)
-                    .map(|r| r.blue_set.score)
-                {
-                    return Ok(lightweight(score_add(score, hops)?));
-                }
-                let ancestor = self
-                    .dag_store
-                    .get_block(&cursor)
-                    .await
-                    .map_err(|_| GhostDagError::BlockNotFound(cursor))?;
-                if ancestor.is_genesis() {
-                    return Ok(lightweight(score_add(1, hops)?));
-                }
-                if !ancestor.header.merge_parent_hashes.is_empty() {
-                    // A merge block on the path: its own score needs a real
-                    // union, so compute that ONE block authoritatively and add
-                    // the remaining edges.
-                    let full = self.calculate_blue_set(&ancestor).await?;
-                    return Ok(lightweight(score_add(full.score, hops)?));
-                }
-                cursor = ancestor.selected_parent();
-                hops = hops.saturating_add(1);
-            }
+    /// The fork-choice score of an already-admitted block.
+    ///
+    /// Usually O(1): the score is in `relations` or in the durable anchor.
+    ///
+    /// COLD PATH: neither holds it (a process that has not rehydrated the
+    /// block yet). Walk back along the selected-parent chain to the nearest
+    /// block whose score is known, summing each block's
+    /// [`Self::score_contribution`] on the way, so
+    /// `score(hash) = score(known ancestor) + sum of contributions`. O(depth)
+    /// time and O(1) memory. It must never build a cumulative ancestor set:
+    /// that is the Theta(N²) footprint that OOM-killed boot-3, and against a
+    /// pruned DAG store it walks off the retained window and fails
+    /// `BlockNotFound` (the merge-block wedge MS-BOUND removes).
+    async fn score_of(&self, hash: &Hash) -> Result<u64, GhostDagError> {
+        if let Some(score) = self.known_score(hash).await {
+            return Ok(score);
         }
 
-        let full = self.calculate_blue_set(block).await?;
-        Ok(lightweight(full.score))
+        let mut sum: u64 = 0;
+        let mut cursor = *hash;
+        let mut hops: u64 = 0;
+        let mut max_hops: Option<u64> = None;
+        loop {
+            if let Some(score) = self.known_score(&cursor).await {
+                return score_add(score, sum);
+            }
+            let ancestor = self
+                .dag_store
+                .get_block(&cursor)
+                .await
+                .map_err(|_| GhostDagError::BlockNotFound(cursor))?;
+            if ancestor.is_genesis() {
+                return score_add(1, sum);
+            }
+            // An honest chain cannot have more ancestors than its height; a
+            // longer walk means corrupt linkage (or a cycle).
+            let limit = *max_hops.get_or_insert(ancestor.header.height.saturating_add(1));
+            if hops > limit {
+                return Err(GhostDagError::CycleDetected);
+            }
+            sum = score_add(sum, self.score_contribution(&ancestor).await?)?;
+            cursor = ancestor.selected_parent();
+            hops = hops.saturating_add(1);
+        }
+    }
+
+    /// Selected parent, merge parents and height of a block this node holds,
+    /// from `relations` or, after a restart, the DAG store.
+    async fn links_of(&self, hash: &Hash) -> Result<(Hash, Vec<Hash>, u64), GhostDagError> {
+        if let Some(r) = self.relations.read().await.get(hash) {
+            return Ok((r.selected_parent, r.merge_parents.clone(), r.height));
+        }
+        let block = self
+            .dag_store
+            .get_block(hash)
+            .await
+            .map_err(|_| GhostDagError::BlockNotFound(*hash))?;
+        let sp = if block.is_genesis() {
+            Hash::default()
+        } else {
+            block.selected_parent()
+        };
+        Ok((
+            sp,
+            block.header.merge_parent_hashes.clone(),
+            block.header.height,
+        ))
+    }
+
+    /// `of` and every block reachable from it by parent edges whose height is
+    /// at least `floor`.
+    ///
+    /// Exact for that range, not an approximation: parent edges strictly
+    /// decrease height, so every path from `of` to a block at height `>= floor`
+    /// stays at or above `floor`, and cutting the walk below `floor` never hides
+    /// one. Reads at most one MP-DEPTH below `floor` (a parent's height is
+    /// checked before it is dropped).
+    async fn past_within(&self, of: &Hash, floor: u64) -> Result<HashSet<Hash>, GhostDagError> {
+        // Generous: the window is MERGE_SCORE_WINDOW heights times the DAG
+        // width (max_parents per block).
+        const MAX_VISITED: usize = 1_000_000;
+        let mut visited: HashSet<Hash> = HashSet::new();
+        let mut queue: VecDeque<Hash> = VecDeque::new();
+        queue.push_back(*of);
+        while let Some(current) = queue.pop_front() {
+            if visited.contains(&current) {
+                continue;
+            }
+            let (sp, merges, height) = self.links_of(&current).await?;
+            if height < floor {
+                continue;
+            }
+            visited.insert(current);
+            if visited.len() >= MAX_VISITED {
+                return Err(GhostDagError::CycleDetected);
+            }
+            // The selected parent sits exactly one height below; skip it
+            // without a read once it is under the floor.
+            if sp != Hash::default() && height > floor {
+                queue.push_back(sp);
+            }
+            for p in merges {
+                queue.push_back(p);
+            }
+        }
+        Ok(visited)
+    }
+
+    /// MS-BOUND: how many of `block`'s merge parents are blue, judged only
+    /// within [`MERGE_SCORE_WINDOW`] heights below `block`.
+    ///
+    /// Merge parents are judged in header order (part of the block's content).
+    /// A merge parent already in the selected parent's past adds nothing. Any
+    /// other merge parent is blue when its anticone, within the window,
+    /// holds at most `k` blocks from (the selected parent and its past) plus
+    /// the merge parents already judged blue. This is the k-cluster rule of
+    /// `is_blue_candidate`, with two differences: it never reads below the
+    /// window, and every block of the selected parent's past in the window
+    /// counts (a red one included), which can only make a merge parent red
+    /// sooner, never blue.
+    ///
+    /// For the common case (siblings from producers sealing at the same height,
+    /// merged one block later) it gives the same score as the full blue-set
+    /// union: the union adds exactly the blue merge parents.
+    async fn bounded_blue_merge_count(&self, block: &Block) -> Result<u64, GhostDagError> {
+        let floor = block.header.height.saturating_sub(MERGE_SCORE_WINDOW);
+        let k = self.params.k as usize;
+        let sp_past = self.past_within(&block.selected_parent(), floor).await?;
+
+        // (hash, its past within the window) for each merge parent judged blue.
+        let mut blues: Vec<(Hash, HashSet<Hash>)> = Vec::new();
+        for mp in &block.header.merge_parent_hashes {
+            if sp_past.contains(mp) {
+                continue;
+            }
+            let mp_past = self.past_within(mp, floor).await?;
+            // A block in the selected parent's past cannot be in mp's future
+            // (mp is not in that past), so it is in mp's anticone exactly when
+            // it is not in mp's past.
+            let mut anticone = 0usize;
+            for y in &sp_past {
+                if !mp_past.contains(y) {
+                    anticone = anticone.saturating_add(1);
+                    if anticone > k {
+                        break;
+                    }
+                }
+            }
+            for (b, b_past) in &blues {
+                if anticone > k {
+                    break;
+                }
+                if !mp_past.contains(b) && !b_past.contains(mp) {
+                    anticone = anticone.saturating_add(1);
+                }
+            }
+            if anticone <= k {
+                blues.push((*mp, mp_past));
+            }
+        }
+        Ok(blues.len() as u64)
     }
 
     pub async fn add_block(&self, block: &Block) -> Result<(), GhostDagError> {
@@ -2078,6 +2210,88 @@ mod tests {
             "e: anticone {{b1, b2}}; c is its ancestor, not anticone"
         );
         assert_eq!(blue.score, 6, "blue = {{genesis, b1, b2, c, e, d}}");
+    }
+
+    /// Genesis seeded as the DAG root, the way the other fixtures here do it.
+    async fn ms_bound_fixture(k: u32) -> (Arc<DagStore>, GhostDag, Block) {
+        let params = GhostDagParams {
+            k,
+            ..GhostDagParams::default()
+        };
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = GhostDag::new(params, dag_store.clone());
+        let genesis = create_test_block_with_parents([0xAA; 32], Hash::default(), vec![], 0);
+        dag_store.store_block(genesis.clone()).await.unwrap();
+        ghostdag.add_block(&genesis).await.unwrap();
+        (dag_store, ghostdag, genesis)
+    }
+
+    async fn ms_bound_admit(dag_store: &DagStore, ghostdag: &GhostDag, b: &Block) -> u64 {
+        dag_store.store_block(b.clone()).await.unwrap();
+        ghostdag.add_block(b).await.unwrap();
+        ghostdag.get_blue_score(&b.hash()).await.unwrap()
+    }
+
+    /// MS-BOUND: the bounded fork-choice score matches the full k-cluster union
+    /// on the over-wide-anticone shape (k = 1, three siblings, two merged).
+    #[tokio::test]
+    async fn ms_bound_score_matches_the_full_union_on_a_k_cluster_merge() {
+        let (dag_store, ghostdag, genesis) = ms_bound_fixture(1).await;
+        let b = create_test_block_with_parents([0xB1; 32], genesis.hash(), vec![], 1);
+        let c = create_test_block_with_parents([0xC1; 32], genesis.hash(), vec![], 1);
+        let e = create_test_block_with_parents([0xE1; 32], genesis.hash(), vec![], 1);
+        for blk in [&b, &c, &e] {
+            ms_bound_admit(&dag_store, &ghostdag, blk).await;
+        }
+        let d = create_test_block_with_parents([0xD1; 32], b.hash(), vec![c.hash(), e.hash()], 2);
+        let bounded = ms_bound_admit(&dag_store, &ghostdag, &d).await;
+        let full = ghostdag.calculate_blue_set(&d).await.unwrap().score;
+        assert_eq!(
+            bounded, full,
+            "bounded score must equal the full union here"
+        );
+        assert_eq!(bounded, 4, "genesis, b, one blue merge parent, d");
+    }
+
+    /// MS-BOUND: merging a block already in the selected parent's past adds
+    /// nothing (the union would not grow either).
+    #[tokio::test]
+    async fn ms_bound_merging_an_ancestor_adds_nothing() {
+        let (dag_store, ghostdag, genesis) = ms_bound_fixture(18).await;
+        let a = create_test_block_with_parents([0xA1; 32], genesis.hash(), vec![], 1);
+        let b = create_test_block_with_parents([0xB1; 32], a.hash(), vec![], 2);
+        ms_bound_admit(&dag_store, &ghostdag, &a).await;
+        assert_eq!(ms_bound_admit(&dag_store, &ghostdag, &b).await, 3);
+        let c = create_test_block_with_parents([0xC1; 32], b.hash(), vec![a.hash()], 3);
+        assert_eq!(ms_bound_admit(&dag_store, &ghostdag, &c).await, 4);
+        assert_eq!(ghostdag.calculate_blue_set(&c).await.unwrap().score, 4);
+    }
+
+    /// MS-BOUND: a merge parent from a branch that ran apart for longer than
+    /// k blocks is red: its anticone in the selected parent's window is over k.
+    #[tokio::test]
+    async fn ms_bound_a_long_side_branch_is_red() {
+        let (dag_store, ghostdag, genesis) = ms_bound_fixture(2).await;
+        // Main chain m1..m5 and side chain s1..s4, both from genesis.
+        let mut main = genesis.hash();
+        for h in 1..=5u64 {
+            let blk = create_test_block_with_parents([0x10 + h as u8; 32], main, vec![], h);
+            ms_bound_admit(&dag_store, &ghostdag, &blk).await;
+            main = blk.hash();
+        }
+        let mut side = genesis.hash();
+        for h in 1..=4u64 {
+            let blk = create_test_block_with_parents([0x50 + h as u8; 32], side, vec![], h);
+            ms_bound_admit(&dag_store, &ghostdag, &blk).await;
+            side = blk.hash();
+        }
+        // Merging s4 into m6: s4's anticone holds m1..m5 (5 > k = 2), so red.
+        let m6 = create_test_block_with_parents([0x99; 32], main, vec![side], 6);
+        assert_eq!(
+            ms_bound_admit(&dag_store, &ghostdag, &m6).await,
+            7,
+            "red merge parent adds nothing: sp score 6 + 1"
+        );
     }
 
     #[tokio::test]
