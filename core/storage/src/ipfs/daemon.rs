@@ -348,49 +348,7 @@ impl IpfsDaemon {
         install_dir: &std::path::Path,
         os: &str,
     ) -> Result<PathBuf> {
-        use std::io::Cursor;
-
-        let binary_name = if os == "windows" { "ipfs.exe" } else { "ipfs" };
-        let binary_path = install_dir.join(binary_name);
-
-        if os == "windows" {
-            // Extract ZIP
-            let cursor = Cursor::new(archive_bytes);
-            let mut archive = zip::ZipArchive::new(cursor).context("Failed to open ZIP archive")?;
-
-            for i in 0..archive.len() {
-                let mut file = archive.by_index(i)?;
-                let name = file.name().to_string();
-
-                if name.ends_with(binary_name) || name.ends_with("/ipfs") {
-                    let mut outfile = std::fs::File::create(&binary_path)?;
-                    std::io::copy(&mut file, &mut outfile)?;
-                    break;
-                }
-            }
-        } else {
-            // Extract tar.gz
-            let cursor = Cursor::new(archive_bytes);
-            let gz = flate2::read::GzDecoder::new(cursor);
-            let mut archive = tar::Archive::new(gz);
-
-            for entry in archive.entries()? {
-                let mut entry = entry?;
-                let path = entry.path()?;
-                let path_str = path.to_string_lossy();
-
-                if path_str.ends_with("/ipfs") || path_str == "kubo/ipfs" {
-                    entry.unpack(&binary_path)?;
-                    break;
-                }
-            }
-        }
-
-        if !binary_path.exists() {
-            return Err(anyhow!("Failed to extract IPFS binary"));
-        }
-
-        Ok(binary_path)
+        extract_ipfs_binary(archive_bytes, install_dir, os)
     }
 
     /// Check if the IPFS repository is initialized
@@ -764,9 +722,235 @@ fn parse_multiaddr(addr: &str) -> Option<(String, u16)> {
     None
 }
 
+/// Copy the IPFS binary out of a downloaded release archive (a ZIP on Windows, a tar.gz
+/// elsewhere) to `install_dir`. Only the one binary entry is written, to a fixed path.
+fn extract_ipfs_binary(
+    archive_bytes: &[u8],
+    install_dir: &std::path::Path,
+    os: &str,
+) -> Result<PathBuf> {
+    use std::io::Cursor;
+
+    let binary_name = if os == "windows" { "ipfs.exe" } else { "ipfs" };
+    let binary_path = install_dir.join(binary_name);
+
+    if os == "windows" {
+        // Extract ZIP
+        let cursor = Cursor::new(archive_bytes);
+        let mut archive = zip::ZipArchive::new(cursor).context("Failed to open ZIP archive")?;
+
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i)?;
+            let name = file.name()?.to_string();
+
+            if name.ends_with(binary_name) || name.ends_with("/ipfs") {
+                if !file.is_file() || file.is_symlink() {
+                    return Err(anyhow!(
+                        "IPFS archive entry {name} is not a regular file; refusing to install it"
+                    ));
+                }
+                write_new_binary(&binary_path, &mut file)?;
+                break;
+            }
+        }
+    } else {
+        // Extract tar.gz
+        let cursor = Cursor::new(archive_bytes);
+        let gz = flate2::read::GzDecoder::new(cursor);
+        let mut archive = tar::Archive::new(gz);
+
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            let path = entry.path()?;
+            let path_str = path.to_string_lossy();
+
+            if path_str.ends_with("/ipfs") || path_str == "kubo/ipfs" {
+                if !entry.header().entry_type().is_file() {
+                    return Err(anyhow!(
+                        "IPFS archive entry {path_str} is not a regular file; refusing to install it"
+                    ));
+                }
+                write_new_binary(&binary_path, &mut entry)?;
+                break;
+            }
+        }
+    }
+
+    if !binary_path.exists() {
+        return Err(anyhow!("Failed to extract IPFS binary"));
+    }
+
+    Ok(binary_path)
+}
+
+/// Write the binary's bytes to `path` as a new regular file. Whatever is at `path` already (an
+/// old binary, or a symbolic link pointing elsewhere) is removed first, never followed, and the
+/// archive's own mode bits (setuid/setgid included) are not applied; the caller sets 0o755.
+fn write_new_binary(path: &std::path::Path, contents: &mut impl std::io::Read) -> Result<()> {
+    if std::fs::symlink_metadata(path).is_ok() {
+        std::fs::remove_file(path)
+            .with_context(|| format!("Failed to replace {}", path.display()))?;
+    }
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("Failed to create {}", path.display()))?;
+    std::io::copy(contents, &mut out)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- archive extraction: only the binary, only a regular file, no special bits ---
+
+    fn zip_with(build: impl FnOnce(&mut zip::ZipWriter<std::io::Cursor<Vec<u8>>>)) -> Vec<u8> {
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        build(&mut w);
+        w.finish().expect("finish zip").into_inner()
+    }
+
+    fn tar_gz_with(build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        build(&mut b);
+        let tar_bytes = b.into_inner().expect("finish tar");
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut gz, &tar_bytes).expect("gzip");
+        gz.finish().expect("finish gzip")
+    }
+
+    fn tar_file(b: &mut tar::Builder<Vec<u8>>, path: &str, mode: u32, data: &[u8]) {
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_size(data.len() as u64);
+        h.set_mode(mode);
+        h.set_cksum();
+        b.append_data(&mut h, path, data).expect("tar file");
+    }
+
+    fn tar_symlink(b: &mut tar::Builder<Vec<u8>>, path: &str, target: &str) {
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Symlink);
+        h.set_size(0);
+        h.set_mode(0o777);
+        b.append_link(&mut h, path, target).expect("tar symlink");
+    }
+
+    #[test]
+    fn extract_zip_copies_the_windows_binary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bytes = zip_with(|w| {
+            w.start_file("kubo/ipfs.exe", zip::write::SimpleFileOptions::default())
+                .expect("start");
+            std::io::Write::write_all(w, b"MZ-binary").expect("write");
+        });
+        let out = extract_ipfs_binary(&bytes, dir.path(), "windows").expect("extract");
+        assert_eq!(std::fs::read(&out).expect("read"), b"MZ-binary");
+    }
+
+    #[test]
+    fn extract_zip_refuses_a_symlink_entry_for_the_binary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        let target = outside.path().join("victim");
+        std::fs::write(&target, b"untouched").expect("victim");
+        let bytes = zip_with(|w| {
+            w.add_symlink(
+                "kubo/ipfs.exe",
+                target.to_string_lossy().as_ref(),
+                zip::write::SimpleFileOptions::default(),
+            )
+            .expect("symlink");
+        });
+        assert!(extract_ipfs_binary(&bytes, dir.path(), "windows").is_err());
+        let written = dir.path().join("ipfs.exe");
+        assert!(
+            std::fs::symlink_metadata(&written).is_err(),
+            "nothing is written"
+        );
+        assert_eq!(std::fs::read(&target).expect("victim"), b"untouched");
+    }
+
+    #[test]
+    fn extract_tar_gz_copies_the_binary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bytes = tar_gz_with(|b| tar_file(b, "kubo/ipfs", 0o755, b"ELF-binary"));
+        let out = extract_ipfs_binary(&bytes, dir.path(), "linux").expect("extract");
+        assert_eq!(std::fs::read(&out).expect("read"), b"ELF-binary");
+    }
+
+    #[test]
+    fn extract_tar_gz_refuses_a_symlink_entry_for_the_binary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        let target = outside.path().join("victim");
+        std::fs::write(&target, b"untouched").expect("victim");
+        let bytes = tar_gz_with(|b| tar_symlink(b, "kubo/ipfs", target.to_string_lossy().as_ref()));
+        assert!(extract_ipfs_binary(&bytes, dir.path(), "linux").is_err());
+        assert!(
+            std::fs::symlink_metadata(dir.path().join("ipfs")).is_err(),
+            "no symbolic link is left where the binary would go"
+        );
+        assert_eq!(std::fs::read(&target).expect("victim"), b"untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_replaces_a_symlink_already_at_the_binary_path_instead_of_following_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        let target = outside.path().join("victim");
+        std::fs::write(&target, b"untouched").expect("victim");
+        std::os::unix::fs::symlink(&target, dir.path().join("ipfs")).expect("plant symlink");
+        let bytes = tar_gz_with(|b| tar_file(b, "kubo/ipfs", 0o755, b"ELF-binary"));
+        let out = extract_ipfs_binary(&bytes, dir.path(), "linux").expect("extract");
+        let meta = std::fs::symlink_metadata(&out).expect("meta");
+        assert!(
+            meta.file_type().is_file(),
+            "a regular file replaced the link"
+        );
+        assert_eq!(std::fs::read(&out).expect("read"), b"ELF-binary");
+        assert_eq!(std::fs::read(&target).expect("victim"), b"untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_tar_gz_drops_setuid_and_setgid_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bytes = tar_gz_with(|b| tar_file(b, "kubo/ipfs", 0o6755, b"ELF-binary"));
+        let out = extract_ipfs_binary(&bytes, dir.path(), "linux").expect("extract");
+        let mode = std::fs::metadata(&out).expect("meta").permissions().mode();
+        assert_eq!(
+            mode & 0o7000,
+            0,
+            "no setuid/setgid/sticky bit, got {mode:o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_zip_drops_setuid_and_setgid_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bytes = zip_with(|w| {
+            w.start_file(
+                "kubo/ipfs.exe",
+                zip::write::SimpleFileOptions::default().unix_permissions(0o6755),
+            )
+            .expect("start");
+            std::io::Write::write_all(w, b"MZ-binary").expect("write");
+        });
+        let out = extract_ipfs_binary(&bytes, dir.path(), "windows").expect("extract");
+        let mode = std::fs::metadata(&out).expect("meta").permissions().mode();
+        assert_eq!(
+            mode & 0o7000,
+            0,
+            "no setuid/setgid/sticky bit, got {mode:o}"
+        );
+    }
 
     #[test]
     fn test_default_config() {
