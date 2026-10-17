@@ -338,8 +338,13 @@ impl BlockAdmission {
     }
 
     /// Why `block` is refused by a canonical checkpoint, if it is: it sits at a
-    /// checkpoint height with another hash. It is then remembered with the
-    /// withdrawn blocks, so everything built on it is refused too.
+    /// checkpoint height with another hash.
+    ///
+    /// The refused hash is deliberately NOT remembered: this check runs before
+    /// any signature or VRF verification, so remembering it would let anyone
+    /// grow the refused set with headers that cost nothing to make. A block
+    /// built on a refused one is never admitted anyway: its parent is never
+    /// stored, so it is deferred as missing a parent and never applied.
     fn checkpoint_reason(&self, block: &Block) -> Option<String> {
         let height = block.header.height;
         let hash = block.header.block_hash;
@@ -350,10 +355,6 @@ impl BlockAdmission {
             .map(|(_, w)| *w)?;
         if want == hash {
             return None;
-        }
-        let mut set = self.withdrawn.write().unwrap_or_else(|e| e.into_inner());
-        if set.len() < MAX_WITHDRAWN {
-            set.insert(hash);
         }
         Some(format!(
             "block {hash} @ {height} is not this network's canonical block at that height ({want})"
@@ -1404,6 +1405,12 @@ mod tests {
         matches!(o, AdmitOutcome::Rejected(_))
     }
 
+    /// Stored and applied (newly or already): anything else (refused or
+    /// deferred) keeps the block out of the node.
+    fn admitted(o: &AdmitOutcome) -> bool {
+        !matches!(o, AdmitOutcome::Rejected(_) | AdmitOutcome::Deferred { .. })
+    }
+
     #[tokio::test]
     async fn a_block_at_a_checkpoint_height_with_another_hash_is_refused_with_its_descendants() {
         let (adm, storage, _dag, _d) = harness();
@@ -1431,7 +1438,7 @@ mod tests {
             "not the canonical block at 3"
         );
         assert!(
-            rejected(&adm.admit(&other[3]).await),
+            !admitted(&adm.admit(&other[3]).await),
             "built on the refused block"
         );
         for b in &other[2..] {
@@ -1450,7 +1457,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_merge_block_with_a_refused_parent_is_refused() {
-        let (adm, _storage, _dag, _d) = harness();
+        let (adm, storage, _dag, _d) = harness();
         let g = root();
         let canonical = chain_from(&g, 3, 0x10);
         let sibling = mk(3, canonical[1].header.block_hash, 3, [0xEE; 32]);
@@ -1478,9 +1485,39 @@ mod tests {
             .build_unhashed();
         merge.header.block_hash = merge.compute_hash();
         assert!(
-            rejected(&adm.admit(&merge).await),
+            !admitted(&adm.admit(&merge).await),
             "names the refused block as a parent"
         );
+        assert!(!storage.blocks.has_block(&merge.header.block_hash).unwrap());
+    }
+
+    #[tokio::test]
+    async fn refused_checkpoint_headers_are_not_remembered() {
+        let (adm, _storage, _dag, _d) = harness();
+        let g = root();
+        let canonical = chain_from(&g, 3, 0x10);
+        let adm = adm.with_checkpoints(vec![(3, canonical[2].header.block_hash)]);
+        assert!(!rejected(&adm.admit(&g).await));
+        for b in &canonical[..2] {
+            assert!(!rejected(&adm.admit(b).await));
+        }
+        // Many unsigned headers at the checkpoint height, each with another hash.
+        for i in 0..64u8 {
+            let junk = mk(
+                3,
+                canonical[1].header.block_hash,
+                3,
+                [0xA0u8.wrapping_add(i); 32],
+            );
+            assert!(rejected(&adm.admit(&junk).await));
+        }
+        let n = adm.withdrawn.read().map(|w| w.len()).unwrap_or(usize::MAX);
+        assert_eq!(
+            n, 0,
+            "refused checkpoint headers must not grow the refused set"
+        );
+        // The canonical block is still admitted.
+        assert!(!rejected(&adm.admit(&canonical[2]).await));
     }
 
     #[tokio::test]
