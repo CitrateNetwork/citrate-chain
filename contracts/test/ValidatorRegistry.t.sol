@@ -325,6 +325,24 @@ contract ValidatorRegistryTest is Test {
         reg.creditReward{value: 10_001 ether}(PK_A, 10_001 ether); // > maxEpochEmission
     }
 
+    /// RCAP tripwire: the executor reads `maxEpochEmission` (slot 20) and
+    /// `emittedInEpoch` (mapping at slot 16) straight from storage to clamp the
+    /// vested share to the epoch's headroom
+    /// (`core/execution/src/block_rewards.rs` MAX_EPOCH_EMISSION_SLOT /
+    /// emitted_in_epoch_slot). A storage-layout change must fail here first.
+    function test_storage_slots_match_the_executor() public {
+        _register(alice, PK_A, MIN);
+        vm.deal(minter, 100 ether);
+        vm.prank(minter);
+        reg.creditReward{value: 7 ether}(PK_A, 7 ether);
+        assertEq(uint256(vm.load(address(reg), bytes32(uint256(20)))), reg.maxEpochEmission());
+        uint256 ep = reg.currentEpoch();
+        assertEq(ep, block.number / 1000, "executor uses epoch = height / 1000");
+        bytes32 slot = keccak256(abi.encode(ep, uint256(16)));
+        assertEq(uint256(vm.load(address(reg), slot)), reg.emittedInEpoch(ep));
+        assertEq(reg.emittedInEpoch(ep), 7 ether);
+    }
+
     // ── Governance (timelocked, bounded) ─────────────────────────────────────
     function test_governance_queueExecute_minStake() public {
         vm.prank(gov);
