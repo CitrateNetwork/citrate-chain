@@ -1170,12 +1170,39 @@ fn show_genesis_info() -> Result<()> {
 ///
 /// The commitment in `<data_dir>/encryption.meta` lets a wrong key fail fast on
 /// the next open.
+///
+/// The inputs are read once per process and the result is kept, so the inline
+/// key is removed from this process's environment right after it is read
+/// (nothing this node starts later inherits it) and every caller sees the same
+/// key.
 fn at_rest_encryption_from_env() -> Result<Option<EncryptionAtRestConfig>> {
-    let key = storage_key_from(
-        std::env::var_os(STORAGE_KEY_FILE_ENV),
-        std::env::var(STORAGE_KEY_ENV).ok(),
-    )?;
-    Ok(key.map(|k| EncryptionAtRestConfig::with_raw_key(*k)))
+    static KEY: std::sync::OnceLock<
+        std::result::Result<Option<zeroize::Zeroizing<[u8; 32]>>, String>,
+    > = std::sync::OnceLock::new();
+    let key = KEY.get_or_init(|| {
+        let file = std::env::var_os(STORAGE_KEY_FILE_ENV);
+        let inline = take_env(STORAGE_KEY_ENV).map(|v| v.to_string());
+        storage_key_from(file, inline).map_err(|e| e.to_string())
+    });
+    match key {
+        Ok(k) => Ok(k
+            .as_ref()
+            .map(|k| EncryptionAtRestConfig::with_raw_key(**k))),
+        Err(e) => Err(anyhow::anyhow!("{e}")),
+    }
+}
+
+/// Read `name` from the environment and remove it, so the value is not left
+/// for anything this process reads or starts later. `None` when unset or not
+/// valid UTF-8 (the variable is removed either way).
+fn take_env(name: &str) -> Option<zeroize::Zeroizing<String>> {
+    let value = std::env::var(name).ok().map(zeroize::Zeroizing::new);
+    // `remove_var` races with a concurrent environment read in another thread.
+    // This runs once, during start-up, before the node spawns anything that
+    // reads the environment, and this crate is edition 2021 (where the call is
+    // not `unsafe`).
+    std::env::remove_var(name);
+    value
 }
 
 /// The env var holding the storage key inline (hex).
@@ -1203,32 +1230,85 @@ fn storage_key_from(
     if inline.is_some() {
         anyhow::bail!("set only one of {STORAGE_KEY_FILE_ENV} and {STORAGE_KEY_ENV}");
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let meta = std::fs::metadata(&path)
-            .map_err(|e| anyhow::anyhow!("{STORAGE_KEY_FILE_ENV} {}: {e}", path.display()))?;
-        if !meta.is_file() {
-            anyhow::bail!(
-                "{STORAGE_KEY_FILE_ENV} {} is not a regular file",
-                path.display()
-            );
-        }
-        let mode = meta.permissions().mode() & 0o777;
-        if mode & 0o077 != 0 {
-            anyhow::bail!(
-                "{STORAGE_KEY_FILE_ENV} {} must be owner-only (mode {mode:o}; expected 600)",
-                path.display()
-            );
-        }
-    }
-    let raw = zeroize::Zeroizing::new(
-        std::fs::read_to_string(&path)
-            .map_err(|e| anyhow::anyhow!("{STORAGE_KEY_FILE_ENV} {}: {e}", path.display()))?,
-    );
+    let raw = read_key_file(&path)?;
     let key = parse_storage_key_hex(raw.trim(), STORAGE_KEY_FILE_ENV)?;
     info!("Storage encryption-at-rest ENABLED (key from {STORAGE_KEY_FILE_ENV})");
     Ok(Some(key))
+}
+
+/// Largest key file read (the key is 64 hex chars plus whitespace).
+const MAX_KEY_FILE_BYTES: u64 = 4096;
+
+/// Read the key file. On Unix it is opened once without following a symbolic
+/// link, and every check (regular file, owner-only mode, owned by this process's
+/// effective user) is made on the open handle, so the file checked is the file
+/// read.
+#[cfg(unix)]
+fn read_key_file(path: &std::path::Path) -> Result<zeroize::Zeroizing<String>> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let err = |e: std::io::Error| anyhow::anyhow!("{STORAGE_KEY_FILE_ENV} {}: {e}", path.display());
+    // O_NONBLOCK: opening a FIFO must not block start-up; it fails the
+    // regular-file check below instead.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                anyhow::anyhow!(
+                    "{STORAGE_KEY_FILE_ENV} {} is a symbolic link; name the key file itself",
+                    path.display()
+                )
+            } else {
+                err(e)
+            }
+        })?;
+    let meta = file.metadata().map_err(err)?;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    check_key_file(meta.is_file(), meta.permissions().mode(), meta.uid(), euid)
+        .map_err(|e| anyhow::anyhow!("{STORAGE_KEY_FILE_ENV} {}: {e}", path.display()))?;
+    let mut raw = zeroize::Zeroizing::new(String::new());
+    file.take(MAX_KEY_FILE_BYTES)
+        .read_to_string(&mut raw)
+        .map_err(err)?;
+    Ok(raw)
+}
+
+#[cfg(not(unix))]
+fn read_key_file(path: &std::path::Path) -> Result<zeroize::Zeroizing<String>> {
+    use std::io::Read;
+    let err = |e: std::io::Error| anyhow::anyhow!("{STORAGE_KEY_FILE_ENV} {}: {e}", path.display());
+    let file = std::fs::File::open(path).map_err(err)?;
+    if !file.metadata().map_err(err)?.is_file() {
+        anyhow::bail!(
+            "{STORAGE_KEY_FILE_ENV} {} is not a regular file",
+            path.display()
+        );
+    }
+    let mut raw = zeroize::Zeroizing::new(String::new());
+    file.take(MAX_KEY_FILE_BYTES)
+        .read_to_string(&mut raw)
+        .map_err(err)?;
+    Ok(raw)
+}
+
+/// The key file checks, on values taken from the open handle: a regular file,
+/// no group or other permission bits, owned by the process's effective user.
+#[cfg(unix)]
+fn check_key_file(is_file: bool, mode: u32, owner: u32, euid: u32) -> Result<()> {
+    if !is_file {
+        anyhow::bail!("is not a regular file");
+    }
+    let mode = mode & 0o777;
+    if mode & 0o077 != 0 {
+        anyhow::bail!("must be owner-only (mode {mode:o}; expected 600)");
+    }
+    if owner != euid {
+        anyhow::bail!("is owned by uid {owner}, not this process's user (uid {euid})");
+    }
+    Ok(())
 }
 
 /// 64 hex chars → the 32-byte storage key. `source` names the input in errors;
@@ -4352,6 +4432,39 @@ mod storage_key_source_tests {
         let err =
             storage_key_from(Some(dir.path().as_os_str().to_owned()), None).expect_err("directory");
         assert!(err.to_string().contains("not a regular file"), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_key_file_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = key_file(dir.path(), KEY_HEX, 0o600);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let err = storage_key_from(Some(link.into_os_string()), None).expect_err("symlink");
+        assert!(err.to_string().contains("symbolic link"), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_key_file_owned_by_another_user_is_refused() {
+        // The owner check itself, with an injected effective uid (creating a
+        // file owned by someone else needs root).
+        assert!(check_key_file(true, 0o600, 1000, 1000).is_ok());
+        let err = check_key_file(true, 0o600, 0, 1000).expect_err("other owner");
+        assert!(err.to_string().contains("owned by"), "{err}");
+        assert!(check_key_file(false, 0o600, 1000, 1000).is_err());
+        assert!(check_key_file(true, 0o640, 1000, 1000).is_err());
+    }
+
+    #[test]
+    fn the_inline_key_is_removed_from_the_environment_after_reading() {
+        const NAME: &str = "CITRATE_TEST_STORAGE_KEY_TAKE_ENV";
+        std::env::set_var(NAME, KEY_HEX);
+        let got = take_env(NAME).expect("value");
+        assert_eq!(got.as_str(), KEY_HEX);
+        assert!(std::env::var_os(NAME).is_none(), "still in the environment");
+        assert!(take_env(NAME).is_none());
     }
 
     #[test]

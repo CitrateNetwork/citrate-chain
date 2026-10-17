@@ -84,6 +84,10 @@ console = "0.15"
 indicatif = "0.17"
 colored = "2.0"
 
+[target.'cfg(unix)'.dependencies]
+# Storage key file: open without following a link, check the owner via geteuid.
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3.15"
 # WS-5 ceremony fuzz: property-based coverage of proposer-key derivation,
