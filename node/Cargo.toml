@@ -90,6 +90,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.15"
+# #310: paused-clock tests of the consensus timers (node/src/timing.rs).
+tokio = { version = "1.32", features = ["full", "test-util"] }
 # WS-5 ceremony fuzz: property-based coverage of proposer-key derivation,
 # Register-digest encoding, sign→verify_strict roundtrip, and calldata layout.
 proptest = { workspace = true }
