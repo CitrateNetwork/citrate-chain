@@ -1577,6 +1577,7 @@ dependencies = [
  "hyper 0.14.32",
  "indicatif",
  "k256",
+ "libc",
  "metrics",
  "metrics-exporter-prometheus",
  "once_cell",
