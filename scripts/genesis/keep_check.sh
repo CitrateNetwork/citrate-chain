@@ -20,12 +20,18 @@
 #   * BROADCAST_DIR is given and a broadcast there CREATE/CREATE2-deploys the row's contract
 #     at an address that is NOT pinned for that contract name (the contract was redeployed
 #     somewhere else). A deployment AT the pinned address is the expected deterministic genesis
-#     deployment and passes. Only broadcasts for this chain are read (contracts/broadcast/
-#     <script>/<chain id>/run-latest.json, chain id from the RPC), and with BROADCAST_SINCE
-#     (unix seconds; the ceremony passes the block-0 timestamp) runs recorded before it are
-#     ignored, so an earlier chain's runs on the same chain id are not evidence. A broadcast
-#     that cannot be read or has an unexpected shape, or an in-scope deployment with no
-#     address, fails the gate; a malformed file never stops the later files being examined;
+#     deployment and passes. Every broadcast record for this chain is read: contracts/
+#     broadcast/<script>/<chain id>/run-latest.json AND every timestamped run-<ts>.json next
+#     to it (Foundry keeps one per run; run-latest.json only holds the newest, so an earlier
+#     run that moved a kept contract survives only in its timestamped copy). The chain id
+#     comes from the RPC. With BROADCAST_SINCE (unix seconds; the ceremony passes the
+#     block-0 timestamp) runs recorded before it are ignored, so an earlier chain's runs on
+#     the same chain id are not evidence. A transaction seen in several records (the latest
+#     copy and its timestamped original) is reported once. A broadcast that cannot be read
+#     or has an unexpected shape, an in-scope deployment with no address, a multi-chain
+#     broadcast (broadcast/multi/, not supported as evidence), a BROADCAST_DIR that is not a
+#     directory, or no in-scope run for this chain at all, fails the gate; a malformed file
+#     never stops the later files being examined;
 #   * any helper fails: the broadcast scanner exits non-zero or its output is incomplete, a
 #     book read crashes, or an RPC read fails. The script runs under `set -euo pipefail`, and
 #     every subprocess whose status bash would otherwise drop (command substitutions, the
@@ -258,9 +264,13 @@ while IFS=$'\t' read -r key sec addr cname want impl extra || [[ -n "$key" ]]; d
   fi
 done <"$LIST"
 
-if [[ -n "${BROADCAST_DIR:-}" && -d "$BROADCAST_DIR" && $DRY -eq 0 ]]; then
+if [[ -n "${BROADCAST_DIR:-}" && $DRY -eq 0 ]]; then
   bcid=$("$CAST" chain-id --rpc-url "$RPC" 2>/dev/null) || bcid=""
-  if [[ ! "$bcid" =~ ^[0-9]+$ ]]; then
+  if [[ ! -d "$BROADCAST_DIR" ]]; then
+    # Asked for broadcast evidence and there is none to read: never a silent pass.
+    say "KEEP-FAIL    BROADCAST_DIR $BROADCAST_DIR is not a directory; no broadcast evidence"
+    fail=1
+  elif [[ ! "$bcid" =~ ^[0-9]+$ ]]; then
     say "KEEP-FAIL    cannot read the chain id to select broadcasts under $BROADCAST_DIR"
     fail=1
   elif [[ -n "${BROADCAST_SINCE:-}" && ! "${BROADCAST_SINCE}" =~ ^[0-9]+$ ]]; then
@@ -275,16 +285,20 @@ if [[ -n "${BROADCAST_DIR:-}" && -d "$BROADCAST_DIR" && $DRY -eq 0 ]]; then
     # must never read as "nothing moved".
     scan_rc=0
     bc=$("$PY" - "$BROADCAST_DIR" "$bcid" "${BROADCAST_SINCE:-0}" "$pins" <<'PY'
-import json, sys, pathlib
+# keep_check broadcast scanner
+import json, re, sys, pathlib
 root, cid, since, pins_raw = pathlib.Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4]
 pinned = {}
 for line in pins_raw.splitlines():
     if "\t" in line:
         n, a = line.split("\t", 1)
         pinned.setdefault(n, set()).add(a.strip().lower())
+seen = set()  # transactions already reported (a tx appears in run-latest and run-<ts>)
+in_scope = 0
 
 
 def scan(f, script):
+    global in_scope
     try:
         with open(f) as fh:
             run = json.load(fh)
@@ -304,7 +318,7 @@ def scan(f, script):
             return
         ts = ts / 1000 if ts > 10**12 else ts  # older Foundry wrote milliseconds
         if ts < since:
-            print(f"SKIP\t{script}\trun recorded before BROADCAST_SINCE")
+            print(f"SKIP\t{script}\t{f.name} recorded before BROADCAST_SINCE")
             return
     txs = run.get("transactions")
     if txs is None:
@@ -312,6 +326,7 @@ def scan(f, script):
     if not isinstance(txs, list):
         print(f"BAD\t{script}\tbroadcast {f}: transactions is not a list")
         return
+    in_scope += 1
     for i, t in enumerate(txs):
         if not isinstance(t, dict):
             print(f"BAD\t{script}\tbroadcast {f}: transaction {i} is not an object")
@@ -326,18 +341,46 @@ def scan(f, script):
             print(f"BAD\t{script}\t{name} deployment has no contractAddress")
             continue
         a = a.lower()
+        h = t.get("hash")
+        key = ("hash", h.lower()) if isinstance(h, str) and h else ("deploy", kind, name, a)
+        if key in seen:
+            continue
+        seen.add(key)
         if a in pinned[name]:
             print(f"PIN\t{script}\t{name} at {a}")
         else:
             print(f"MOVE\t{script}\t{name} at {a}")
 
 
-for f in sorted(root.glob(f"*/{cid}/run-latest.json")):
-    script = f.parent.parent.name
+RUN = re.compile(r"run-(latest|[0-9]+)\.json")
+files = []
+for d in sorted(root.glob(f"*/{cid}")):
+    if not d.is_dir():
+        continue
+    script = d.parent.name
+    if script == "multi":
+        continue
+    try:
+        names = sorted(p.name for p in d.iterdir())
+    except OSError as e:
+        print(f"BAD\t{script}\tcannot list {d}: {e}")
+        continue
+    # Timestamped records first (oldest to newest), then run-latest.json: every run is read.
+    stamped = sorted((n for n in names if RUN.fullmatch(n) and n != "run-latest.json"),
+                     key=lambda n: int(n[4:-5]))
+    files += [(d / n, script) for n in stamped]
+    if "run-latest.json" in names:
+        files.append((d / "run-latest.json", script))
+multi = root / "multi"
+if multi.exists():
+    print(f"BAD\tmulti\tmulti-chain broadcasts under {multi} are not supported as evidence; move them aside after review")
+for f, script in files:
     try:
         scan(f, script)
     except Exception as e:  # any shape the checks above missed: report it, keep scanning
         print(f"BAD\t{script}\tbroadcast {f} could not be scanned: {type(e).__name__}: {e}")
+if in_scope == 0:
+    print(f"BAD\t-\tno chain-{cid} broadcast run in scope under {root}; the deployments have no evidence")
 print("DONE\t-\tscan complete")
 PY
     ) || scan_rc=$?

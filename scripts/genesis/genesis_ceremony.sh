@@ -4,7 +4,8 @@
 # Runs after the new chain is producing (runbook §6). Order:
 #   P0  preflight      inputs present, governance values at the genesis floors, tools,
 #                      required contract scripts present; with an RPC: chain id, block-0
-#                      hash, deployer nonce 0
+#                      hash and timestamp, deployer nonce 0; then the run manifest
+#                      (written on a fresh run, re-verified on every resume)
 #   P1  governance     DeployGenesisGovernance: GOVERNANCE + GUARDIAN timelocks, each
 #                      fronted by an m-of-n MultisigProposer; deployer renounces in-run
 #   P2  stack          scripts/ops/regenesis.sh --reroll --with-aa (registries, VR, AA,
@@ -12,8 +13,8 @@
 #   P3  vesting        DeployTeamVesting from the owner's TEAM_VESTING_FILE
 #   P4  dormant        DeployDormantLedgers (FederatedRoundLedger, PatronageLedger)
 #   P5  admins         CheckDeployedAdmins over ONE merged book (the book + the P1/P3/P4
-#                      outputs' contracts): FACTORY-ADMIN 0 and DEPLOYER-ADMIN 0 (the
-#                      handover gate)
+#                      outputs' contracts), every book bound to the run manifest's deployer:
+#                      FACTORY-ADMIN 0 and DEPLOYER-ADMIN 0 (the handover gate)
 #   P6  keep           keep_check.sh verify against the frozen KEEP list
 #   P7  fleet          fleet_agree.sh: every endpoint on the same genesis and tip
 #
@@ -41,6 +42,16 @@
 #   PATRONAGE_KYC_REGISTRY, PATRONAGE_MEMBERSHIP, MEMBERSHIP_OWNER, plus regenesis.sh's env
 #   KEEP_LIST (the rehearsal-1 freeze) · FLEET_RPCS (comma-separated)
 #   GENESIS_OUT_DIR (contracts/genesis) · ADDRESS_BOOK (contracts/addresses/40204.json)
+#
+# Run manifest: GENESIS_OUT_DIR/ceremony-run.json. A fresh --simulate/--confirm run (no
+# --from/--only) writes it at the end of P0: run id, mode, chain id, block-0 hash and
+# timestamp, the deployer address (--sender; on --confirm forge only signs for it with the
+# --account keystore, so the two are the same account) and the keystore account name. Every
+# resume re-reads it and refuses to go on unless the chain, block 0, deployer, account and
+# mode all match this invocation; a missing or malformed manifest is a gate failure, and a
+# fresh run refuses to start over an existing one. P5 checks the manifest's deployer and P6
+# scopes the broadcast evidence to the manifest's block-0 timestamp, so neither trusts a
+# value that only a (possibly stale) book or the environment supplies.
 #
 # Output books: P1/P3/P4 write governance.json, team-vesting.json and dormant-ledgers.json
 # into GENESIS_OUT_DIR, and P2/P4/P5 read them from the same place; every producer and
@@ -121,6 +132,7 @@ DORMANT_REL="$OUT_REL/dormant-ledgers.json"
 GOV_BOOK="$CONTRACTS/$GOV_REL"
 VEST_BOOK="$CONTRACTS/$VEST_REL"
 DORMANT_BOOK="$CONTRACTS/$DORMANT_REL"
+RUN_MANIFEST="$OUT/ceremony-run.json"
 
 idx() {
   local i
@@ -167,6 +179,64 @@ forge_phase() {
 # book_addr <book> <name>: contracts.<name> from a book-shaped JSON.
 book_addr() {
   "$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["contracts"][sys.argv[2]])' "$1" "$2" 2>/dev/null
+}
+
+# manifest_write <path> <run_id> <mode> <chain_id> <genesis_hash> <g0_ts> <deployer> <account>
+# Atomic (temp file + rename), refusing to replace an existing manifest.
+manifest_write() {
+  "$PY" - "$@" <<'PY'
+import json, os, sys
+path, run_id, mode, cid, g0, ts, dep, acct = sys.argv[1:9]
+if os.path.exists(path):
+    sys.exit(f"{path} already exists")
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump({"version": 1, "runId": run_id, "mode": mode, "chainId": int(cid),
+               "genesisHash": g0.lower(), "block0Timestamp": int(ts),
+               "deployer": dep.lower(), "account": acct}, f, indent=2, sort_keys=True)
+    f.write("\n")
+os.link(tmp, path)  # fails if the path appeared meanwhile; never overwrites
+os.unlink(tmp)
+PY
+}
+
+# manifest_check <path> <mode> <chain_id> <genesis_hash> <g0_ts> <deployer> <account>
+# Prints "runId<TAB>deployer<TAB>block0Timestamp" when the manifest is well formed and names
+# this run; exits non-zero with the reason otherwise.
+manifest_check() {
+  "$PY" - "$@" <<'PY'
+import json, re, sys
+path, mode, cid, g0, ts, dep, acct = sys.argv[1:8]
+try:
+    with open(path) as f:
+        m = json.load(f)
+except FileNotFoundError:
+    sys.exit(f"{path} is missing: a resume needs the manifest its fresh run wrote at P0")
+except (OSError, ValueError) as e:
+    sys.exit(f"cannot read {path}: {e}")
+if not isinstance(m, dict):
+    sys.exit(f"{path} is not a JSON object")
+def field(k, typ):
+    v = m.get(k)
+    if not isinstance(v, typ) or isinstance(v, bool):
+        sys.exit(f"{path} .{k} is missing or malformed")
+    return v
+rid = field("runId", str)
+want = {
+    "mode": (field("mode", str), mode),
+    "chainId": (field("chainId", int), int(cid)),
+    "genesisHash": (field("genesisHash", str).lower(), g0.lower()),
+    "block0Timestamp": (field("block0Timestamp", int), int(ts)),
+    "deployer": (field("deployer", str).lower(), dep.lower()),
+    "account": (field("account", str), acct),
+}
+if not re.fullmatch(r"0x[0-9a-f]{40}", want["deployer"][0]) or not rid:
+    sys.exit(f"{path} is malformed")
+bad = [f"{k} {have!r} (this run: {cur!r})" for k, (have, cur) in want.items() if have != cur]
+if bad:
+    sys.exit(f"{path} (run {rid}) is not this run's: " + "; ".join(bad))
+print(f"{rid}\t{want['deployer'][0]}\t{want['block0Timestamp'][0]}")
+PY
 }
 
 count_owners() { # comma-separated list -> number of distinct non-empty entries
@@ -254,10 +324,14 @@ if should P0 || [[ "$MODE" != dry ]]; then
     need_env RPC_URL
     cid=$("$CAST" chain-id --rpc-url "$RPC_URL" 2>/dev/null) || gate_fail P0 "RPC $RPC_URL unreachable"
     [[ "$cid" == "$EXPECTED_CHAIN_ID" ]] || gate_fail P0 "RPC chain id $cid, want $EXPECTED_CHAIN_ID"
+    g0=$("$CAST" block 0 --field hash --rpc-url "$RPC_URL" 2>/dev/null) || gate_fail P0 "cannot read block 0 from $RPC_URL"
+    [[ "$g0" =~ ^0x[0-9a-fA-F]{64}$ ]] || gate_fail P0 "block 0 hash from $RPC_URL is malformed"
     if [[ -n "${EXPECTED_GENESIS_HASH:-}" ]]; then
-      g0=$("$CAST" block 0 --field hash --rpc-url "$RPC_URL" 2>/dev/null) || gate_fail P0 "cannot read block 0 from $RPC_URL"
       [[ "$(lower "$g0")" == "$(lower "$EXPECTED_GENESIS_HASH")" ]] || gate_fail P0 "block 0 is $g0, want $EXPECTED_GENESIS_HASH"
     fi
+    g0ts=$("$CAST" block 0 --field timestamp --rpc-url "$RPC_URL" 2>/dev/null) || gate_fail P0 "cannot read the block-0 timestamp from $RPC_URL"
+    g0ts=$("$PY" -c 'import sys; v=int(sys.argv[1], 0); assert v > 0; print(v)' "$g0ts" 2>/dev/null) ||
+      gate_fail P0 "the block-0 timestamp from $RPC_URL is malformed"
     if [[ "$FROM" == P0 && -z "$ONLY" ]]; then
       nonce=$("$CAST" nonce "$DEPLOYER_ADDRESS" --rpc-url "$RPC_URL" 2>/dev/null) || gate_fail P0 "cannot read the deployer nonce from $RPC_URL"
       [[ "$nonce" == 0 ]] || gate_fail P0 "deployer nonce is $nonce; a fresh ceremony starts at 0 (resume with --from instead)"
@@ -271,6 +345,24 @@ if should P0 || [[ "$MODE" != dry ]]; then
         gate_fail P0 "${pb#*:} already exists and ${pb%%:*} would write it; move it aside (it is not this ceremony's output) or resume after ${pb%%:*}"
       fi
     done
+  fi
+  if [[ "$MODE" != dry ]]; then
+    # Bind this invocation to its ceremony run (see "Run manifest" above).
+    if [[ "$FROM" == P0 && -z "$ONLY" ]]; then
+      [[ ! -e "$RUN_MANIFEST" ]] ||
+        gate_fail P0 "$RUN_MANIFEST already exists: it belongs to an earlier run; move it aside with that run's books, or resume that run with --from"
+      mkdir -p "$OUT" || gate_fail P0 "cannot create $OUT"
+      run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+      manifest_write "$RUN_MANIFEST" "$run_id" "$MODE" "$cid" "$g0" "$g0ts" "$DEPLOYER_ADDRESS" "$ACCOUNT" ||
+        gate_fail P0 "cannot write the run manifest $RUN_MANIFEST"
+      log "P0 run manifest written: run $run_id, deployer $(lower "$DEPLOYER_ADDRESS")${ACCOUNT:+ (account $ACCOUNT)}"
+    fi
+    run_rec=$(manifest_check "$RUN_MANIFEST" "$MODE" "$cid" "$g0" "$g0ts" "$DEPLOYER_ADDRESS" "$ACCOUNT" 2>&1) ||
+      gate_fail P0 "run manifest: $run_rec"
+    IFS=$'\t' read -r RUN_ID RUN_DEPLOYER RUN_G0TS <<<"$run_rec"
+    is_addr "$RUN_DEPLOYER" && [[ "$RUN_G0TS" =~ ^[0-9]+$ && -n "$RUN_ID" ]] || gate_fail P0 "run manifest: unexpected record $run_rec"
+    RUN_G0=$(lower "$g0")
+    log "P0 bound to run $RUN_ID (deployer $RUN_DEPLOYER)"
   fi
   log "P0 preflight PASS (books in $OUT_REL/)"
 fi
@@ -292,9 +384,9 @@ load_governance() {
     return
   fi
   [[ -f "$GOV_BOOK" ]] || gate_fail "$1" "$GOV_BOOK missing (run P1 first)"
-  GOVERNANCE=$(book_addr "$GOV_BOOK" GovernanceTimelock)
-  GUARDIAN=$(book_addr "$GOV_BOOK" GuardianTimelock)
-  GOVERNANCE_MULTISIG=$(book_addr "$GOV_BOOK" GovernanceMultisig)
+  GOVERNANCE=$(book_addr "$GOV_BOOK" GovernanceTimelock) || gate_fail "$1" "governance.json has no GovernanceTimelock"
+  GUARDIAN=$(book_addr "$GOV_BOOK" GuardianTimelock) || gate_fail "$1" "governance.json has no GuardianTimelock"
+  GOVERNANCE_MULTISIG=$(book_addr "$GOV_BOOK" GovernanceMultisig) || gate_fail "$1" "governance.json has no GovernanceMultisig"
   for a in "$GOVERNANCE" "$GUARDIAN" "$GOVERNANCE_MULTISIG"; do is_addr "$a" || gate_fail "$1" "governance.json is incomplete"; done
   export GOVERNANCE GUARDIAN GOVERNANCE_MULTISIG GOVERNANCE_TIMELOCK="$GOVERNANCE"
   export VALIDATOR_GOVERNANCE="${VALIDATOR_GOVERNANCE:-$GOVERNANCE}"
@@ -340,8 +432,11 @@ fi
 # it a single merged book: the canonical book plus the .contracts of every ceremony output,
 # so every contract the ceremony deployed is swept by whatever checker revision is installed
 # (nothing depends on the checker honouring a side channel such as EXTRA_ADDRESS_BOOKS).
-# The merge refuses an extra book that names another deployer, has no contracts, or reuses
-# a name already in the merged book, so no entry is dropped or shadowed. --confirm needs all
+# The checker derives the identity it checks from the book's .deployer, so every book (the
+# canonical one and each output) must name the deployer this run recorded in its manifest
+# at P0: stale books that agree with each other on another deployer are refused, not
+# checked. The merge also refuses an extra book that has no contracts or reuses a name
+# already in the merged book, so no entry is dropped or shadowed. --confirm needs all
 # three outputs; --simulate takes those present, governance always.
 if should P5; then
   P5_BOOK_REL="$OUT_REL/p5-admin-book.json"
@@ -363,10 +458,12 @@ if should P5; then
         log "P5 note: $b absent in a simulation; not swept"
       fi
     done
-    merged=$("$PY" - "$ADDRESS_BOOK" "$P5_BOOK" "${extras[@]}" <<'PY'
+    is_addr "${RUN_DEPLOYER:-}" || gate_fail P5 "no run deployer (the P0 run manifest did not load)"
+    log "P5 deployer bound to run $RUN_ID: $RUN_DEPLOYER"
+    merged=$("$PY" - "$RUN_DEPLOYER" "$ADDRESS_BOOK" "$P5_BOOK" "${extras[@]}" <<'PY'
 import json, re, sys
 ADDR = re.compile(r"0x[0-9a-fA-F]{40}")
-main_path, out_path, extras = sys.argv[1], sys.argv[2], sys.argv[3:]
+run_dep, main_path, out_path, extras = sys.argv[1].lower(), sys.argv[2], sys.argv[3], sys.argv[4:]
 def load(p):
     try:
         with open(p) as f:
@@ -380,6 +477,8 @@ book = load(main_path)
 dep = book.get("deployer")
 if not isinstance(dep, str) or not ADDR.fullmatch(dep):
     sys.exit(f"{main_path} has no deployer address")
+if dep.lower() != run_dep:
+    sys.exit(f"{main_path} names deployer {dep}, not this run's deployer {run_dep}")
 book.setdefault("contracts", {})
 book.setdefault("aaStack", {})
 for sec in ("contracts", "aaStack"):
@@ -389,8 +488,8 @@ taken = set(book["contracts"]) | set(book["aaStack"])
 for p in extras:
     d = load(p)
     xdep = d.get("deployer")
-    if not isinstance(xdep, str) or xdep.lower() != dep.lower():
-        sys.exit(f"{p} names deployer {xdep!r}, not the book's {dep}")
+    if not isinstance(xdep, str) or not ADDR.fullmatch(xdep) or xdep.lower() != run_dep:
+        sys.exit(f"{p} names deployer {xdep!r}, not this run's deployer {run_dep}")
     c = d.get("contracts")
     if not isinstance(c, dict) or not c:
         sys.exit(f"{p} has no contracts")
@@ -402,6 +501,7 @@ for p in extras:
         taken.add(name)
         book["contracts"][name] = a
     print(f"{p}: {len(c)} contract(s)")
+book["deployer"] = run_dep
 with open(out_path, "w") as f:
     json.dump(book, f, indent=2, sort_keys=True)
 PY
@@ -412,8 +512,17 @@ PY
       gate_fail P5 "CheckDeployedAdmins failed (see the report above)"
     }
     printf '%s\n' "$report" | { grep -E 'ADMIN' || true; } | tail -20
-    printf '%s\n' "$report" | grep -qE 'FACTORY-ADMIN failures:[[:space:]]*0$' || gate_fail P5 "FACTORY-ADMIN is not 0"
-    printf '%s\n' "$report" | grep -qE 'DEPLOYER-ADMIN failures:[[:space:]]*0$' || gate_fail P5 "DEPLOYER-ADMIN is not 0: the deployer still holds a role"
+    # Exactly one summary line per class, and it must read 0: a missing, repeated or
+    # unparsable summary is not a pass.
+    admin_count() { # class -> the single "<class> failures: N" value, or nothing
+      local lines
+      lines=$(printf '%s\n' "$report" | sed -nE "s/.*$1 failures:[[:space:]]*([0-9]+)[[:space:]]*\$/\1/p")
+      [[ $(printf '%s' "$lines" | grep -c .) -eq 1 ]] && printf '%s' "$lines"
+    }
+    fa=$(admin_count FACTORY-ADMIN) || gate_fail P5 "the checker report has no single FACTORY-ADMIN summary"
+    da=$(admin_count DEPLOYER-ADMIN) || gate_fail P5 "the checker report has no single DEPLOYER-ADMIN summary"
+    [[ "$fa" == 0 ]] || gate_fail P5 "FACTORY-ADMIN is not 0"
+    [[ "$da" == 0 ]] || gate_fail P5 "DEPLOYER-ADMIN is not 0: the deployer still holds a role"
     log "P5 PASS: FACTORY-ADMIN 0, DEPLOYER-ADMIN 0 over $P5_BOOK_REL"
   fi
 fi
@@ -426,11 +535,10 @@ if should P6; then
   elif [[ "$MODE" == dry ]]; then
     ADDRESS_BOOK="$ADDRESS_BOOK" bash "$HERE/keep_check.sh" verify --dry-run "$KEEP_LIST" || gate_fail P6 "KEEP list malformed"
   else
-    # Only broadcasts recorded on this chain since its block 0 are evidence for P6.
-    g0ts=$("$CAST" block 0 --field timestamp --rpc-url "$RPC_URL" 2>/dev/null) || g0ts=""
-    g0ts=$("$PY" -c 'import sys; print(int(sys.argv[1], 0))' "$g0ts" 2>/dev/null) ||
-      gate_fail P6 "cannot read the block-0 timestamp to scope the broadcast evidence"
-    RPC="$RPC_URL" ADDRESS_BOOK="$ADDRESS_BOOK" BROADCAST_DIR="$CONTRACTS/broadcast" BROADCAST_SINCE="$g0ts" \
+    # Only broadcasts recorded on this chain since its block 0 are evidence for P6. The
+    # timestamp is the run manifest's, which P0 re-checked against the chain.
+    [[ "${RUN_G0TS:-}" =~ ^[0-9]+$ ]] || gate_fail P6 "no block-0 timestamp from the run manifest to scope the broadcast evidence"
+    RPC="$RPC_URL" ADDRESS_BOOK="$ADDRESS_BOOK" BROADCAST_DIR="$CONTRACTS/broadcast" BROADCAST_SINCE="$RUN_G0TS" \
       bash "$HERE/keep_check.sh" verify "$KEEP_LIST" || gate_fail P6 "keep_check failed"
   fi
 fi
@@ -443,7 +551,15 @@ if should P7; then
   else
     dryflag=()
     if [[ "$MODE" == dry ]]; then dryflag=(--dry-run); fi
-    FLEET_RPCS="$FLEET_RPCS" EXPECTED_CHAIN_ID="$EXPECTED_CHAIN_ID" bash "$HERE/fleet_agree.sh" "${dryflag[@]}" ||
+    # Every endpoint must be on THIS run's block 0 (P0 read it and matched the manifest), not
+    # merely agree with each other or with the first endpoint that answers.
+    fleet_g0=()
+    if [[ "$MODE" != dry ]]; then
+      is_hash() { [[ "$1" =~ ^0x[0-9a-f]{64}$ ]]; }
+      is_hash "${RUN_G0:-}" || gate_fail P7 "no block-0 hash from the run manifest to check the fleet against"
+      fleet_g0=(EXPECTED_GENESIS_HASH="$RUN_G0")
+    fi
+    env "${fleet_g0[@]}" FLEET_RPCS="$FLEET_RPCS" EXPECTED_CHAIN_ID="$EXPECTED_CHAIN_ID" bash "$HERE/fleet_agree.sh" "${dryflag[@]}" ||
       gate_fail P7 "the fleet does not agree on genesis and tip"
   fi
 fi

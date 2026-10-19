@@ -124,7 +124,11 @@ require_stopped "$WATCHDOG_SERVICE" "watchdog service"
 "$SYSTEMCTL" stop "$SERVICE" || die "systemctl stop $SERVICE failed; aborting before any file is changed" 1
 require_stopped "$SERVICE" "node service"
 
-cp -a "$BIN" "${BIN}.pregenesis-${TS}" 2>/dev/null || true
+# The old binary is the rollback path: if it exists, its copy must succeed before it is
+# replaced (a failed copy used to be ignored, leaving no way back).
+if [[ -e "$BIN" ]]; then
+  cp -a "$BIN" "${BIN}.pregenesis-${TS}" || die "cannot back up $BIN; aborting before any file is changed (binary and data dir untouched)" 1
+fi
 install -m 0755 "$NEW" "$BIN"
 [[ -n "$NODE_OWNER" ]] && chown "$NODE_OWNER" "$BIN"
 log "binary sha256=$(sha256sum "$BIN" | cut -c1-16)…"

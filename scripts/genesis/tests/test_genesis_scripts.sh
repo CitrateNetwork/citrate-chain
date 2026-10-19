@@ -88,7 +88,8 @@ if [[ "$*" == *CheckDeployedAdmins* ]]; then
     da=$((da + 1))
   fi
   echo "FACTORY-ADMIN failures: ${FAKE_FACTORY_ADMIN:-0}"
-  echo "DEPLOYER-ADMIN failures: $da"
+  [[ "${FAKE_REPORT_DUP:-}" == FACTORY ]] && echo "FACTORY-ADMIN failures: 0"
+  [[ "${FAKE_REPORT_DROP:-}" == DEPLOYER ]] || echo "DEPLOYER-ADMIN failures: $da"
 fi
 EOF
 cat >"$BIN/systemctl" <<'EOF'
@@ -111,7 +112,7 @@ cat >"$BIN/python-scanfault" <<'EOF'
 #!/usr/bin/env bash
 if [[ "${1:-}" == - ]]; then
   src=$(cat)
-  if [[ "$src" == *run-latest.json* ]]; then
+  if [[ "$src" == *"keep_check broadcast scanner"* ]]; then
     case "${FAKE_SCANNER:-}" in
       crash) printf 'PIN\tEarly.s.sol\tAlpha at 0xabc\n'; echo "Traceback: boom" >&2; exit 1 ;;
       truncate) exit 0 ;;
@@ -191,17 +192,53 @@ expect "keep: an unrelated broadcast passes" 0 'no chain-40204 broadcast' -- env
 run_json 2000 Alpha "$(printf '%s' "$A1" | tr 'a-f' 'A-F' | sed 's/^0X/0x/')" >"$BC/run-latest.json"
 expect "keep: a genesis deployment at the pinned address passes" 0 'deploys Alpha at 0x0+a1 \(the pinned address\)' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST"
 # Another chain's broadcasts are not evidence for this one.
-rm "$BC/run-latest.json"
+# Another chain's broadcasts are not evidence for this one (an unrelated chain-40204 run is
+# the in-scope evidence).
+run_json 2000 Other "$(addr 777)" >"$BC/run-latest.json"
 mkdir -p "$T/broadcast/DeployX.s.sol/31337"
 run_json 2000 Alpha "$(addr 777)" >"$T/broadcast/DeployX.s.sol/31337/run-latest.json"
 expect "keep: another chain's broadcast is ignored" 0 'no chain-40204 broadcast' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST"
+rm "$BC/run-latest.json"
+expect "keep: only another chain's broadcasts is no evidence" 1 'no chain-40204 broadcast run in scope' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST"
 rm -r "$T/broadcast/DeployX.s.sol/31337"
+expect "keep: a BROADCAST_DIR that does not exist fails" 1 'is not a directory; no broadcast evidence' -- env RPC=http://r1 BROADCAST_DIR="$T/no-such-broadcast" bash "$KC" verify "$LIST"
 # A run from an earlier chain on the same chain id (before block 0) is ignored with BROADCAST_SINCE.
-run_json 1000 Alpha "$(addr 777)" >"$BC/run-latest.json"
-expect "keep: a run before BROADCAST_SINCE is ignored" 0 'KEEP-SKIP +DeployX.s.sol' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" BROADCAST_SINCE=1500 bash "$KC" verify "$LIST"
+run_json 1000 Alpha "$(addr 777)" >"$BC/run-1000.json"
+run_json 2000 Other "$(addr 777)" >"$BC/run-latest.json"
+expect "keep: a run before BROADCAST_SINCE is ignored" 0 'KEEP-SKIP +DeployX.s.sol: run-1000.json' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" BROADCAST_SINCE=1500 bash "$KC" verify "$LIST"
 expect "keep: the same run after BROADCAST_SINCE counts" 1 'redeploys Alpha' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" BROADCAST_SINCE=500 bash "$KC" verify "$LIST"
-run_json 1600000000000 Alpha "$(addr 777)" >"$BC/run-latest.json"
+rm "$BC/run-1000.json"
+run_json 1600000000000 Alpha "$(addr 777)" >"$BC/run-1600000000000.json"
+run_json 1800000000000 Other "$(addr 777)" >"$BC/run-latest.json"
 expect "keep: a millisecond timestamp is compared in seconds" 0 'KEEP-SKIP' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" BROADCAST_SINCE=1700000000 bash "$KC" verify "$LIST"
+expect "keep: only runs before BROADCAST_SINCE is no evidence" 1 'no chain-40204 broadcast run in scope' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" BROADCAST_SINCE=1900000000 bash "$KC" verify "$LIST"
+rm "$BC/run-1600000000000.json"
+# Foundry keeps every run as run-<ts>.json and overwrites run-latest.json with the newest. An
+# earlier in-scope run that moved a kept contract must still fail the gate when the latest
+# run only holds unrelated transactions.
+run_json 3000 Alpha "$(addr 777)" >"$BC/run-3000.json"
+run_json 4000 Other "$(addr 778)" >"$BC/run-4000.json"
+cp "$BC/run-4000.json" "$BC/run-latest.json"
+expect "keep: an earlier timestamped run that moved a kept contract fails" 1 'DeployX.s.sol redeploys Alpha at 0x0+309 \(not the pinned' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" BROADCAST_SINCE=2500 bash "$KC" verify "$LIST"
+expect "keep: an earlier timestamped run before BROADCAST_SINCE is ignored" 0 'KEEP-SKIP +DeployX.s.sol: run-3000.json' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" BROADCAST_SINCE=3500 bash "$KC" verify "$LIST"
+printf '{not json' >"$BC/run-3500.json"
+expect "keep: a malformed timestamped run fails" 1 'unreadable broadcast .*run-3500.json' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" BROADCAST_SINCE=2500 bash "$KC" verify "$LIST"
+rm "$BC/run-3000.json" "$BC/run-3500.json" "$BC/run-4000.json"
+# The latest copy and its timestamped original hold the same transactions: reported once.
+printf '{"timestamp":5000,"transactions":[{"hash":"0xab","transactionType":"CREATE2","contractName":"Alpha","contractAddress":"%s"}]}' "$(addr 777)" >"$BC/run-5000.json"
+cp "$BC/run-5000.json" "$BC/run-latest.json"
+out=$(env RPC=http://r1 BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST" 2>&1)
+if [[ $? -eq 1 && $(grep -c 'redeploys Alpha' <<<"$out") -eq 1 ]]; then ok "keep: a transaction in run-latest and run-<ts> is reported once"; else bad "keep: a transaction in run-latest and run-<ts> is reported once" "$out"; fi
+printf '{"timestamp":5000,"transactions":[{"transactionType":"CREATE2","contractName":"Alpha","contractAddress":"%s"}]}' "$A1" >"$BC/run-5000.json"
+cp "$BC/run-5000.json" "$BC/run-latest.json"
+out=$(env RPC=http://r1 BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST" 2>&1)
+if [[ $? -eq 0 && $(grep -c 'deploys Alpha at' <<<"$out") -eq 1 ]]; then ok "keep: a hashless duplicate deployment is reported once"; else bad "keep: a hashless duplicate deployment is reported once" "$out"; fi
+rm "$BC/run-5000.json"
+mkdir -p "$T/broadcast/multi/DeployX.s.sol-latest"
+printf '{}' >"$T/broadcast/multi/DeployX.s.sol-latest/run.json"
+run_json 2000 Other "$(addr 777)" >"$BC/run-latest.json"
+expect "keep: a multi-chain broadcast is not accepted as evidence" 1 'multi-chain broadcasts' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST"
+rm -r "$T/broadcast/multi"
 printf '{not json' >"$BC/run-latest.json"
 expect "keep: an unreadable broadcast fails" 1 'unreadable broadcast' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST"
 printf '{"transactions":[{"transactionType":"CREATE","contractName":"Alpha"}]}' >"$BC/run-latest.json"
@@ -397,6 +434,11 @@ expect "reset: a running watchdog service aborts" 1 "watchdog service citrate-he
 untouched "reset: running watchdog service leaves binary and data untouched"
 setup_node
 expect "reset: a missing watchdog timer (stop fails, inactive) still resets" 0 'NOT started' -- "${RNENV[@]}" FAKE_STOP_FAILS=citrate-height-watchdog.timer bash "$RN" --coinbase "$NEWCB" --validator-registry "$NEWVR" --activation-height 0 --confirm
+setup_node
+chmod 000 "$T/node/home/bin/citrate-node"
+expect "reset: a binary that cannot be backed up aborts" 1 'cannot back up' -- "${RNENV[@]}" bash "$RN" --coinbase "$NEWCB" --validator-registry "$NEWVR" --activation-height 0 --confirm
+chmod 755 "$T/node/home/bin/citrate-node"
+untouched "reset: a failed binary backup leaves binary and data untouched"
 expect "reset: a malformed coinbase is a usage error" 2 'coinbase must be' -- "${RNENV[@]}" bash "$RN" --coinbase 0x12 --validator-registry "$NEWVR" --activation-height 0
 
 # ------------------------------------------------------------------ ceremony
@@ -441,9 +483,24 @@ expect "ceremony: an unknown phase is refused" 1 'must be one of' -- "${CEENV[@]
 
 # simulate: P5 reads the admin report
 mkdir -p "$(rpcdir http://127.0.0.1:8545)"
-echo 40204 >"$(rpcdir http://127.0.0.1:8545)/chain-id"
-expect "ceremony: P5 needs P1's governance output" 3 'governance.json missing' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+LRPC="$(rpcdir http://127.0.0.1:8545)"
+echo 40204 >"$LRPC/chain-id"
+echo "$GEN" >"$LRPC/block-0"
+echo 5000 >"$LRPC/block-0-timestamp"
 GB="$REPO/contracts/genesis"
+# mk_manifest <outdir> [deployer] [mode] [account] [genesis] [g0ts]: the record a fresh run
+# writes at P0, for the local fake RPC.
+mk_manifest() {
+  printf '{"version":1,"runId":"test-run","mode":"%s","chainId":40204,"genesisHash":"%s","block0Timestamp":%s,"deployer":"%s","account":"%s"}\n' \
+    "${3:-simulate}" "${5:-$GEN}" "${6:-5000}" "${2:-$DEP}" "${4:-}" >"$1/ceremony-run.json"
+}
+expect "ceremony: a resume needs the run manifest" 3 'run manifest: .*ceremony-run.json is missing' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+printf '{"runId":"x"' >"$GB/ceremony-run.json"
+expect "ceremony: a malformed run manifest fails" 3 'run manifest: cannot read' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+printf '{"runId":"x","mode":"simulate","chainId":40204,"genesisHash":"%s","block0Timestamp":5000,"account":""}' "$GEN" >"$GB/ceremony-run.json"
+expect "ceremony: a run manifest without a deployer fails" 3 'deployer is missing or malformed' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+mk_manifest "$GB"
+expect "ceremony: P5 needs P1's governance output" 3 'governance.json missing' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
 gov_book "$GB" "$DEP"
 expect "ceremony: P5 passes at DEPLOYER-ADMIN 0" 0 'P5 PASS' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
 expect "ceremony: P5 fails while the deployer holds a role" 3 'DEPLOYER-ADMIN is not 0' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 FAKE_DEPLOYER_ADMIN=2 bash "$CE" --simulate --only P5
@@ -460,15 +517,34 @@ printf '{"deployer":"%s","contracts":{"VestingAlice":"%s"}}' "$DEP" "$(addr 71)"
 printf '{"deployer":"%s","contracts":{"FederatedRoundLedger":"%s","PatronageLedger":"%s"}}' "$DEP" "$(addr 81)" "$(addr 82)" >"$GB/dormant-ledgers.json"
 expect "ceremony: P5 fails a deployer role held in the vesting output" 3 'DEPLOYER-ADMIN VestingAlice' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 FAKE_DEPLOYER_HELD=VestingAlice bash "$CE" --simulate --only P5
 expect "ceremony: P5 fails a deployer role held in the dormant-ledger output" 3 'DEPLOYER-ADMIN PatronageLedger' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 FAKE_DEPLOYER_HELD=PatronageLedger bash "$CE" --simulate --only P5
-expect "ceremony: P5 refuses an output from another deployer" 3 'cannot build the merged admin book' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash -c "printf '{\"deployer\":\"%s\",\"contracts\":{\"VestingAlice\":\"%s\"}}' '$(addr 9)' '$(addr 71)' > '$GB/team-vesting.json'; bash '$CE' --simulate --only P5"
+expect "ceremony: P5 refuses an output from another deployer" 3 "names deployer '0x0+9', not this run's deployer" -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash -c "printf '{\"deployer\":\"%s\",\"contracts\":{\"VestingAlice\":\"%s\"}}' '$(addr 9)' '$(addr 71)' > '$GB/team-vesting.json'; bash '$CE' --simulate --only P5"
 printf '{"deployer":"%s","contracts":{"Alpha":"%s"}}' "$DEP" "$(addr 71)" >"$GB/team-vesting.json"
 expect "ceremony: P5 refuses an output that shadows a book name" 3 'cannot build the merged admin book' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
 printf '{"deployer":"%s","contracts":{}}' "$DEP" >"$GB/team-vesting.json"
 expect "ceremony: P5 refuses an output with no contracts" 3 'cannot build the merged admin book' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
 rm "$GB/team-vesting.json" "$GB/dormant-ledgers.json"
-echo "$GEN" >"$(rpcdir http://127.0.0.1:8545)/block-0"
+expect "ceremony: a simulation's manifest does not serve a --confirm resume" 3 "run manifest: .*mode 'simulate' \(this run: 'confirm'\)" -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1 bash "$CE" --confirm --only P5 --account deployer
+mk_manifest "$GB" "$DEP" confirm deployer
 expect "ceremony: --confirm P5 needs every ceremony output" 3 'team-vesting.json missing' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1 bash "$CE" --confirm --only P5 --account deployer
-rm "$(rpcdir http://127.0.0.1:8545)/block-0"
+expect "ceremony: a resume with another keystore account is refused" 3 "account 'deployer' \(this run: 'other'\)" -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1 bash "$CE" --confirm --only P5 --account other
+mk_manifest "$GB"
+# The deployer P5 checks is the run's, from the manifest. Stale books that agree with each
+# other on deployer A while this run (manifest and DEPLOYER_ADDRESS) used B are refused, so
+# the checker never sweeps for A while B may still hold a role.
+DEPB=$(addr 2)
+mk_manifest "$GB" "$DEPB"
+reset_calls
+expect "ceremony: consistent books naming another deployer than the run's fail P5" 3 "names deployer 0x0+1, not this run's deployer 0x0+2" -- "${CEENV[@]}" DEPLOYER_ADDRESS="$DEPB" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+if calls | grep -q CheckDeployedAdmins; then bad "ceremony: a deployer mismatch runs no checker" "$(calls)"; else ok "ceremony: a deployer mismatch runs no checker"; fi
+expect "ceremony: a resume with another DEPLOYER_ADDRESS than the manifest is refused" 3 "run manifest: .*deployer '0x0+2' \(this run: '0x0+1'\)" -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+gov_book "$GB" "$DEPB"
+expect "ceremony: an extra book matching the run but not the canonical book still fails" 3 "addresses/40204.json names deployer 0x0+1, not this run's deployer 0x0+2" -- "${CEENV[@]}" DEPLOYER_ADDRESS="$DEPB" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+gov_book "$GB" "$DEP"
+mk_manifest "$GB"
+expect "ceremony: a manifest from another genesis is refused" 3 'genesisHash' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash -c "echo 0x$(h64 9) > '$LRPC/block-0'; bash '$CE' --simulate --only P5; rc=\$?; echo '$GEN' > '$LRPC/block-0'; exit \$rc"
+# P5 reads one summary per class: a repeated or missing summary is not a pass.
+expect "ceremony: a checker report with no DEPLOYER-ADMIN summary fails" 3 'no single DEPLOYER-ADMIN summary' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 FAKE_REPORT_DROP=DEPLOYER bash "$CE" --simulate --only P5
+expect "ceremony: a checker report with two FACTORY-ADMIN summaries fails" 3 'no single FACTORY-ADMIN summary' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 FAKE_REPORT_DUP=FACTORY bash "$CE" --simulate --only P5
 expect "ceremony: P0 checks the RPC chain id" 3 'chain id 1, want 40204' -- "${CEENV[@]}" RPC_URL=http://n3x bash -c "mkdir -p '$(rpcdir http://n3x)'; echo 1 > '$(rpcdir http://n3x)/chain-id'; bash '$CE' --simulate --only P0"
 reset_calls
 expect "ceremony: P2 takes governance from P1's output" 0 'GOVERNANCE=0x0+1f GUARDIAN=0x0+20' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
@@ -478,26 +554,50 @@ calls | grep -q 'regenesis --reroll --with-aa$' && ok "ceremony: simulate does n
 expect "ceremony: --confirm --from P1 to a remote RPC is refused" 3 'not loopback' -- "${CEENV[@]}" RPC_URL=https://rpc.example EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1 bash "$CE" --confirm --from P1 --account deployer
 expect "ceremony: --confirm --only P2 without --account is refused" 3 'needs --account' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --confirm --only P2
 expect "ceremony: --simulate --from P1 checks the chain id" 3 'chain id 1, want 40204' -- "${CEENV[@]}" RPC_URL=http://n3x bash "$CE" --simulate --from P1
-echo "0x$(h64 f)" >"$(rpcdir http://127.0.0.1:8545)/block-0"
+echo "0x$(h64 f)" >"$LRPC/block-0"
 expect "ceremony: --simulate --only P3 checks the genesis hash" 3 'block 0 is 0x[f]+, want' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" bash "$CE" --simulate --only P3
+echo "$GEN" >"$LRPC/block-0"
 expect "ceremony: --simulate --from P4 checks the council floors" 3 'GOV threshold 2 is below' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GOV_THRESHOLD=2 bash "$CE" --simulate --from P4
 expect "ceremony: --simulate --only P2 checks the deployer seat" 3 'deployer must not hold' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GRD_OWNERS="$(owners 1 22 23)" bash "$CE" --simulate --only P2
-echo 5 >"$(rpcdir http://127.0.0.1:8545)/nonce"
+echo 5 >"$LRPC/nonce"
 expect "ceremony: a resume does not require deployer nonce 0" 0 'P0 preflight PASS' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
 expect "ceremony: a fresh ceremony requires deployer nonce 0" 3 'deployer nonce is 5' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate
-rm "$(rpcdir http://127.0.0.1:8545)/nonce" "$(rpcdir http://127.0.0.1:8545)/block-0"
+rm "$LRPC/nonce"
+# A fresh run refuses to start over an earlier run's manifest, and writes its own at P0.
+expect "ceremony: a fresh run refuses an existing run manifest" 3 'ceremony-run.json already exists' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$GB" bash -c "mv '$GB/governance.json' '$T/gov.aside'; bash '$CE' --simulate; rc=\$?; mv '$T/gov.aside' '$GB/governance.json'; exit \$rc"
+FRESH="$REPO/contracts/genesis/fresh"
+mkdir -p "$FRESH"
+expect "ceremony: a fresh run writes the manifest at P0" 3 'P0 bound to run [0-9TZ]+-[0-9]+ \(deployer 0x0+1\)' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$FRESH" bash "$CE" --simulate
+if python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); sys.exit(0 if (m["deployer"],m["mode"],m["chainId"],m["block0Timestamp"],m["genesisHash"])==(sys.argv[2],"simulate",40204,5000,sys.argv[3]) else 1)' "$FRESH/ceremony-run.json" "$DEP" "$GEN"; then
+  ok "ceremony: the manifest records the run's deployer, chain and block 0"
+else
+  bad "ceremony: the manifest records the run's deployer, chain and block 0" "$(cat "$FRESH/ceremony-run.json" 2>&1)"
+fi
+rm -r "$FRESH"
 
 # P6 integration: the genesis replay's own broadcasts (deployments at the pinned addresses,
 # recorded after block 0) pass; a stale run from an earlier chain on the same id is ignored.
-echo 5000 >"$(rpcdir http://127.0.0.1:8545)/block-0-timestamp"
 mkdir -p "$REPO/contracts/broadcast/Regenesis.s.sol/40204" "$REPO/contracts/broadcast/Old.s.sol/40204"
 printf '{"timestamp":6000,"transactions":[{"transactionType":"CREATE2","contractName":"Alpha","contractAddress":"%s"}]}' "$A1" >"$REPO/contracts/broadcast/Regenesis.s.sol/40204/run-latest.json"
 printf '{"timestamp":100,"transactions":[{"transactionType":"CREATE2","contractName":"Alpha","contractAddress":"%s"}]}' "$(addr 777)" >"$REPO/contracts/broadcast/Old.s.sol/40204/run-latest.json"
 expect "ceremony: P6 passes the genesis deployments at their pins" 0 'KEEP gate PASS' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 KEEP_LIST="$LIST" bash "$CE" --simulate --only P6
 printf '{"timestamp":7000,"transactions":[{"transactionType":"CREATE2","contractName":"Alpha","contractAddress":"%s"}]}' "$(addr 777)" >"$REPO/contracts/broadcast/Old.s.sol/40204/run-latest.json"
 expect "ceremony: P6 fails a post-genesis redeploy away from the pin" 3 'keep_check failed' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 KEEP_LIST="$LIST" bash "$CE" --simulate --only P6
-rm "$(rpcdir http://127.0.0.1:8545)/block-0-timestamp"
-expect "ceremony: P6 needs the block-0 timestamp" 3 'block-0 timestamp' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 KEEP_LIST="$LIST" bash "$CE" --simulate --only P6
+# P6 scopes its evidence with the manifest's block-0 timestamp: an earlier run's redeploy
+# kept only in a timestamped record is still found.
+printf '{"timestamp":6500,"transactions":[{"transactionType":"CREATE2","contractName":"Alpha","contractAddress":"%s"}]}' "$(addr 777)" >"$REPO/contracts/broadcast/Regenesis.s.sol/40204/run-6500.json"
+printf '{"timestamp":100,"transactions":[]}' >"$REPO/contracts/broadcast/Old.s.sol/40204/run-latest.json"
+expect "ceremony: P6 fails a redeploy kept only in a timestamped record" 3 'keep_check failed' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 KEEP_LIST="$LIST" bash "$CE" --simulate --only P6
+rm "$REPO/contracts/broadcast/Regenesis.s.sol/40204/run-6500.json"
+mv "$LRPC/block-0-timestamp" "$T/g0ts.aside"
+expect "ceremony: P0 needs the block-0 timestamp" 3 'block-0 timestamp' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 KEEP_LIST="$LIST" bash "$CE" --simulate --only P6
+mv "$T/g0ts.aside" "$LRPC/block-0-timestamp"
+
+# P7 checks the fleet against THIS run's block 0, not just against the first endpoint.
+mk_node http://n4 40204 100 "0x$(h64 d)" "$TIP"
+mk_node http://n5 40204 100 "0x$(h64 d)" "$TIP"
+expect "ceremony: P7 fails a fleet that agrees on another genesis than the run's" 3 'n4 genesis 0x[d]+ differs from 0x[a]+' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 FLEET_RPCS=http://n4,http://n5 bash "$CE" --simulate --only P7
+expect "ceremony: P7 passes a fleet on the run's genesis" 0 'FLEET AGREE' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 FLEET_RPCS=http://n1,http://n2 bash "$CE" --simulate --only P7
 
 # GENESIS_OUT_DIR: one directory for every producer and consumer path.
 expect "ceremony: an output dir outside contracts/genesis is refused" 1 'GENESIS_OUT_DIR must be contracts/genesis' -- "${CEENV[@]}" GENESIS_OUT_DIR="$T/elsewhere" bash "$CE"
@@ -505,6 +605,7 @@ expect "ceremony: an output dir that escapes contracts/genesis is refused" 1 'GE
 expect "ceremony: dry run reads the books from a nondefault dir" 0 'merge .* \+ genesis/run2/governance.json, genesis/run2/team-vesting.json, genesis/run2/dormant-ledgers.json → genesis/run2/p5-admin-book.json' -- "${CEENV[@]}" GENESIS_OUT_DIR="$REPO/contracts/genesis/run2" bash "$CE"
 RUN2="$REPO/contracts/genesis/run2"
 mkdir -p "$RUN2"
+mk_manifest "$RUN2"
 reset_calls
 expect "ceremony: P1 writes governance into the nondefault dir" 0 'P0 preflight PASS \(books in genesis/run2/\)' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$RUN2" bash "$CE" --simulate --only P1
 calls | grep -q 'forge-env gov=genesis/run2/governance.json ' && ok "ceremony: P1 output path follows GENESIS_OUT_DIR" || bad "ceremony: P1 output path follows GENESIS_OUT_DIR" "$(calls)"
@@ -575,10 +676,19 @@ else
     set_code "$(addr 34)" "$(gov_code "$DEP")"
     printf '{"chainId":31337,"deployer":"%s","contracts":{"Alpha":"%s"},"aaStack":{}}' "$DEP" "$A1" >"$IC/addresses/40204.json"
     IENV=("${CEENV[@]}" REPO_ROOT="$IR" RPC_URL="$IRPC" EXPECTED_CHAIN_ID=31337 FORGE="$REAL_FORGE" CAST="$REAL_CAST")
+    ig0=$("$REAL_CAST" block 0 --field hash --rpc-url "$IRPC")
+    ig0ts=$("$REAL_CAST" block 0 --field timestamp --rpc-url "$IRPC")
+    mk_manifest "$IC/genesis" "$DEP" simulate "" "$ig0" "$((ig0ts))"
+    sed -i 's/"chainId":40204/"chainId":31337/' "$IC/genesis/ceremony-run.json"
     gov_book "$IC/genesis" "$DEP"
     expect "P5 integration: a handed-over governance output passes the real checker" 0 'P5 PASS' -- "${IENV[@]}" bash "$CE" --simulate --only P5
     gov_book "$IC/genesis" "$DEP" "\"GenesisHeld\":\"$(addr 34)\""
     expect "P5 integration: a deployer role held only in the governance output fails the real checker" 3 'DEPLOYER-ADMIN GenesisHeld: governance\(\) is the deployer EOA' -- "${IENV[@]}" bash "$CE" --simulate --only P5
+    # Binding: stale books that agree on the deployer while this run used another one never
+    # reach the checker.
+    mk_manifest "$IC/genesis" "$(addr 2)" simulate "" "$ig0" "$((ig0ts))"
+    sed -i 's/"chainId":40204/"chainId":31337/' "$IC/genesis/ceremony-run.json"
+    expect "P5 integration: books naming another deployer than the run's are refused before the real checker" 3 "not this run's deployer 0x0+2" -- "${IENV[@]}" DEPLOYER_ADDRESS="$(addr 2)" bash "$CE" --simulate --only P5
     kill "$ANVIL_PID" 2>/dev/null
   fi
 fi
