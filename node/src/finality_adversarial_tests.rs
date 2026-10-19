@@ -68,7 +68,7 @@ const VRF_B: [u8; 32] = [0xB0; 32];
 const VRF_C: [u8; 32] = [0xC0; 32];
 
 /// Highest block height any scenario builds (state roots are precomputed).
-const MAX_HEIGHT: u64 = 24;
+const MAX_HEIGHT: u64 = 84;
 
 /// Spec §3 parameters at the scale of a test: interval 2, depth 3.
 fn config(committee_size: usize) -> CheckpointConfig {
@@ -189,6 +189,9 @@ struct TestNode {
     retries: OwnVoteRetries,
     /// Every block this node has stored (re-hydrated into a fresh DAG on restart).
     known: Vec<Block>,
+    /// The applicator's fork-choice head (`None`: nothing to follow, as with no
+    /// fork choice). Set by a test to drive the spine-rebuild recovery path.
+    head: Arc<parking_lot::Mutex<Option<Hash>>>,
 }
 
 /// Build the finality stack over `storage` the way `main.rs` does, then run
@@ -203,7 +206,10 @@ async fn assemble(
     cfg: CheckpointConfig,
     known: Vec<Block>,
 ) -> (TestNode, FloorTick) {
-    let app = Arc::new(CanonicalApplicator::new(exec.clone(), storage.clone()));
+    let head = Arc::new(parking_lot::Mutex::new(None));
+    let app = Arc::new(
+        CanonicalApplicator::new(exec.clone(), storage.clone()).with_fork_choice_cell(head.clone()),
+    );
     let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
     for b in &known {
         let _ = dag.store_block(b.clone()).await;
@@ -245,6 +251,7 @@ async fn assemble(
             cursor: 0,
             retries: OwnVoteRetries::default(),
             known,
+            head,
         },
         boot,
     )
@@ -903,9 +910,11 @@ async fn a4_cross_chain_votes_are_rejected() {
 }
 
 /// A4 / stale-or-forged certificates: each tampered certificate record, found
-/// at boot, halts finality BEFORE any block is admitted — floor not raised (not
-/// even to the earlier valid certificate), RPC tags at genesis, gadget
-/// proposes nothing — and the stop never clears by itself.
+/// at boot, halts finality BEFORE any block is admitted — floor never raised
+/// from the forged record (only restored to the earlier VALID certificate at 6,
+/// whose block is canonical here: boot floor restore, review of #335 @
+/// 5236d2b), RPC tags at genesis, gadget proposes nothing — and the stop never
+/// clears by itself.
 #[tokio::test]
 async fn a4_forged_certificates_halt_at_boot_and_never_clear() {
     let chains = Chains::new();
@@ -963,7 +972,11 @@ async fn a4_forged_certificates_halt_at_boot_and_never_clear() {
             "{what}: {boot:?}"
         );
         assert!(node.gadget.halted(), "{what}");
-        assert_eq!(node.floor(), 0, "{what}: floor not raised");
+        assert_eq!(
+            node.floor(),
+            6,
+            "{what}: not raised from the forged record; restored to the valid A6"
+        );
         assert_eq!(node.rpc_finalized(), FinalizedAnchor::GENESIS, "{what}");
         let out = node.drive().await;
         assert!(out.is_empty(), "{what}: nothing signed while halted");
@@ -1663,7 +1676,11 @@ async fn a8_old_committee_cannot_refinalize_a_competing_history() {
         })
     );
     assert!(node.gadget.halted());
-    assert_eq!(node.floor(), 0, "floor not raised onto B");
+    assert_eq!(
+        node.floor(),
+        2,
+        "floor not raised onto B; restored to the stored A2 certificate at boot"
+    );
     assert_eq!(node.rpc_finalized(), FinalizedAnchor::GENESIS);
 }
 
@@ -1743,6 +1760,126 @@ async fn restart_mid_epoch_resends_recorded_votes_and_restores_floor_at_boot() {
     );
     net.nodes.push(n3);
     net.assert_no_conflicting_finality(&[2, 4, 6, 8]).await;
+}
+
+/// S2 across a restart with many stored certificates the floor does not cover
+/// (review of #335 @ 5236d2b). The network finalized A10 and then, on branch
+/// B (forking at 11), every height 11..=80 — 70 certificates, more than the
+/// 64 the boot check used to register. This node is still on A (A80), so the
+/// latest certificate is a mismatch and the gadget halts. On restart the
+/// boot check must still find A10 — the highest stored certificate whose
+/// block is on this node's applied chain, below all 70 — and raise the floor
+/// to it before any reorg is judged. After a restart the snapshot ring holds
+/// only the tip, so a reorg below it goes through the from-genesis spine
+/// rebuild (`recover_to_head`, the recovery path): fork choice towards a
+/// branch C forking below 10 is refused; towards the certified branch B
+/// (fork point 10) it proceeds, and the safety stop then clears. None of the
+/// 70 uncovered certificates is dropped. TLA+: CheckpointFinalitySafety_
+/// restart.cfg (holds) / _bootlimit.cfg (a truncated boot check reverts the
+/// older finalized block).
+#[tokio::test]
+async fn s2_restart_restores_the_floor_below_many_uncovered_certificates() {
+    const TIP: u64 = 80;
+    const CERTIFIED: u64 = 10;
+    let uncovered = TIP - CERTIFIED;
+    assert!(uncovered > 64, "more than the former registration bound");
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let committee: Vec<PublicKey> = keys.iter().map(pk).collect();
+    let signers: Vec<&Ed25519SigningKey> = keys.iter().take(3).collect();
+    let cfg = config(100);
+    let mut node = TestNode::boot(key(0), &vals, cfg.clone()).await;
+    let genesis_state = node.exec.state_snapshot();
+    let a = chains.main(TIP);
+    node.follow(&a).await;
+    let b = chains.branch(&a, CERTIFIED + 1, TIP, VRF_B);
+    let c = chains.branch(&a, 5, TIP + 2, VRF_C);
+    for blk in b.iter().chain(c.iter()) {
+        node.import(blk).await;
+    }
+    write_certificate(
+        &node.storage,
+        &certificate(
+            CERTIFIED,
+            hash_at(&a, CERTIFIED),
+            &committee,
+            &signers,
+            CHAIN,
+        ),
+    );
+    for h in (CERTIFIED + 1)..=TIP {
+        write_certificate(
+            &node.storage,
+            &certificate(h, hash_at(&b, h), &committee, &signers, CHAIN),
+        );
+    }
+
+    // TLA+ Restart, then the boot check (VerifyFloor while booting).
+    let (node, boot) = node.restart(&vals, cfg).await;
+    assert_eq!(
+        boot,
+        FloorTick::Halted(HaltReason::Mismatch {
+            height: TIP,
+            certified: hash_at(&b, TIP),
+            canonical: Some(hash_at(&a, TIP)),
+        })
+    );
+    assert!(node.gadget.halted());
+    assert_eq!(
+        node.floor(),
+        CERTIFIED,
+        "boot restores the floor to the highest stored certificate on this chain"
+    );
+    let pending = node.app.certified_pending();
+    assert_eq!(
+        pending.len(),
+        usize::try_from(uncovered).expect("fits"),
+        "every certificate above the floor stays registered"
+    );
+    assert_eq!(
+        pending.first(),
+        Some(&(CERTIFIED + 1, hash_at(&b, CERTIFIED + 1)))
+    );
+
+    // TLA+ Reorg below the certified height, via the recovery path: refused.
+    *node.head.lock() = Some(hash_at(&c, TIP + 2));
+    let rebuilt = node
+        .app
+        .recover_to_head(genesis_state.clone(), Hash::default())
+        .await
+        .expect("recovery call returns");
+    assert!(
+        !rebuilt,
+        "S2: a rebuild abandoning the finalized A10 must be refused after restart"
+    );
+    assert_eq!(node.app.applied_tip().await.hash, hash_at(&a, TIP));
+    assert_eq!(node.floor(), CERTIFIED);
+
+    // Fork choice onto the certified branch (fork point 10): proceeds, and the
+    // stop clears on the next pass.
+    *node.head.lock() = Some(hash_at(&b, TIP));
+    let rebuilt = node
+        .app
+        .recover_to_head(genesis_state, Hash::default())
+        .await
+        .expect("recovery call returns");
+    assert!(
+        rebuilt,
+        "the rebuild onto the certified branch must proceed"
+    );
+    assert_eq!(node.app.applied_tip().await.hash, hash_at(&b, TIP));
+    assert_eq!(
+        node.tick().await,
+        FloorTick::Verified {
+            height: TIP,
+            floor_raised: true,
+            recovered: true,
+        }
+    );
+    assert_eq!(node.floor(), TIP);
+    assert!(node.app.certified_pending().is_empty());
+    assert!(!node.gadget.halted());
 }
 
 /// Restart follow-up: a node that missed the votes for a checkpoint while it

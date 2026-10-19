@@ -45,7 +45,7 @@
 
 use std::sync::Arc;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -207,10 +207,99 @@ pub const FLOOR_VERIFY_ATTEMPTS: usize = 3;
 /// than this during the check is re-walked from scratch instead.
 pub const FLOOR_RECHECK_MAX_STEPS: u64 = 256;
 
-/// Bound on the certificates registered with
-/// [`CanonicalApplicator::register_certified`] that the floor does not cover yet
-/// (the highest are kept).
-pub const MAX_CERTIFIED_PENDING: usize = 64;
+/// One descending walk of an applied chain's selected-parent ancestry
+/// (`StorageManager.blocks.get_header`), answering "which block is at height
+/// `h` on this chain?" for a sequence of STRICTLY DESCENDING heights in a
+/// single pass: total header reads <= `tip.height + 1` however many heights
+/// are asked. Heights must strictly decrease between calls; a call that does
+/// not is answered `Err` (never a wrong `Ok`).
+pub struct AppliedWalk<'a> {
+    storage: &'a StorageManager,
+    tip: AppliedTip,
+    /// The block the walk stands on and its verified height, once read.
+    at: Option<(Hash, u64)>,
+    /// Hash to read next (the tip, then selected parents).
+    next: Hash,
+    /// Heights must stay strictly below this (and below the previous read).
+    max_height: u64,
+    /// Last height asked (strict descent check).
+    last_target: Option<u64>,
+    /// The walk failed; every later call returns this error.
+    failed: Option<String>,
+}
+
+impl<'a> AppliedWalk<'a> {
+    fn new(storage: &'a StorageManager, tip: AppliedTip) -> Self {
+        Self {
+            storage,
+            tip,
+            at: None,
+            next: tip.hash,
+            max_height: tip.height,
+            last_target: None,
+            failed: None,
+        }
+    }
+
+    /// The block at `target` on the walked chain: `Ok(None)` when the chain
+    /// steps over `target` or `target` is above the tip.
+    pub fn hash_at(&mut self, target: u64) -> Result<Option<Hash>, String> {
+        if let Some(e) = &self.failed {
+            return Err(e.clone());
+        }
+        if self.last_target.is_some_and(|last| target >= last) {
+            return Err(format!(
+                "applied walk asked for height {target} after {:?} (must descend)",
+                self.last_target
+            ));
+        }
+        self.last_target = Some(target);
+        if target > self.tip.height {
+            return Ok(None);
+        }
+        loop {
+            let (hash, height) = match self.at {
+                Some(at) => at,
+                None => {
+                    let cursor = self.next;
+                    let header = match self.storage.blocks.get_header(&cursor) {
+                        Ok(Some(h)) => h,
+                        Ok(None) => {
+                            return Err(
+                                self.fail(format!("header {cursor} missing on the applied chain"))
+                            )
+                        }
+                        Err(e) => return Err(self.fail(format!("header {cursor}: {e}"))),
+                    };
+                    if header.height > self.max_height {
+                        return Err(self.fail(format!(
+                            "header {cursor} at height {} is not below its child (max {})",
+                            header.height, self.max_height
+                        )));
+                    }
+                    self.next = header.selected_parent_hash;
+                    let at = (cursor, header.height);
+                    self.at = Some(at);
+                    at
+                }
+            };
+            if height == target {
+                return Ok(Some(hash));
+            }
+            if height < target || height == 0 {
+                return Ok(None);
+            }
+            // Step to the selected parent (strictly lower: checked on read).
+            self.max_height = height.saturating_sub(1);
+            self.at = None;
+        }
+    }
+
+    fn fail(&mut self, e: String) -> String {
+        self.failed = Some(e.clone());
+        e
+    }
+}
 
 /// Outcome of [`CanonicalApplicator::verify_certified_floor`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,18 +368,35 @@ pub struct CanonicalApplicator {
     /// and on the verifier poll) and [`Self::effective_floor`] (a registered
     /// certificate that has since become canonical). Never lowered.
     finalized_height: Arc<AtomicU64>,
-    /// Finalized certificates `height -> hash` registered by the Enforced floor
+    /// Finalized certificates `(height, hash)` registered by the Enforced floor
     /// verifier ([`Self::register_certified`]) that the floor does not cover
     /// yet: their blocks were not confirmed on this node's applied chain when
-    /// checked (mismatch, not yet applied, unverifiable), or were loaded at boot
-    /// below a latest certificate that did not match. Every reorg consults them
+    /// checked (mismatch, not yet applied, unverifiable), or were loaded from
+    /// the store at boot above the highest one that is
+    /// (`FloorVerifier::restore_certified_floor`). Every reorg consults them
     /// under the advance lock ([`Self::effective_floor`]): the highest one whose
     /// certified block IS canonical by then raises the floor before the reorg is
     /// judged — so a certified block that becomes canonical is protected at
-    /// once, not at the verifier's next poll. At most
-    /// [`MAX_CERTIFIED_PENDING`] (the highest are kept); entries at or below the
-    /// floor are dropped. Always empty in Legacy / Observed mode.
-    certified_pending: parking_lot::Mutex<BTreeMap<u64, Hash>>,
+    /// once, not at the verifier's next poll. Always empty in Legacy / Observed
+    /// mode.
+    ///
+    /// NO COUNT BOUND, deliberately (review of #335 @ 5236d2b: keeping only the
+    /// highest 64 could drop the one certificate whose block is canonical here,
+    /// leaving it unprotected). An entry leaves the set only when the floor
+    /// reaches its height ([`Self::settle_certified`]), and that is the only
+    /// safe subsumption: the floor is raised only to a certified block that is
+    /// canonical here, and a reorg is judged by HEIGHT (fork point >= floor), so
+    /// every block at or below the floor is protected whichever certificate
+    /// covered it — a lower certificate adds nothing. A higher certificate does
+    /// NOT subsume a lower one while it is not canonical here (the lower one
+    /// may be the only protection for its block), so nothing above the floor
+    /// is ever dropped. Size: at most the verified quorum certificates above
+    /// the floor (one per checkpoint height; two at one height only if quorums
+    /// conflicted), ~40 bytes each. It grows only while this node is off the
+    /// certified chain, i.e. halted, and empties as soon as the highest one is
+    /// canonical. Entries come only from certificates the verifier checked
+    /// (quorum + signatures), so no peer can grow it without a quorum.
+    certified_pending: parking_lot::Mutex<BTreeSet<(u64, Hash)>>,
     /// The height this node has actually APPLIED, published for readers outside
     /// the advance lock. The sync manager judges completion against this: the
     /// height of the last block RECEIVED is not evidence of holding its ancestry
@@ -381,7 +487,7 @@ impl CanonicalApplicator {
             lock: Arc::new(Mutex::new(AppliedState { tip, snapshots })),
             fork_choice: None,
             finalized_height: Arc::new(AtomicU64::new(0)),
-            certified_pending: parking_lot::Mutex::new(BTreeMap::new()),
+            certified_pending: parking_lot::Mutex::new(BTreeSet::new()),
             applied_height: Arc::new(AtomicU64::new(seeded_height)),
             registry_sync: None,
             registry_policy_resync: None,
@@ -406,6 +512,20 @@ impl CanonicalApplicator {
     /// Also captures GhostDAG's "DAG hydration complete" signal, so the runtime
     /// deep-fork rebuild fires only once the tip set is authoritative after a
     /// restart (see `dag_hydrated` + `maybe_runtime_rebuild`).
+    /// Test-only fork choice: the head is whatever `head` holds (`None` = no
+    /// head, which every fork-choice path treats as "nothing to follow").
+    #[cfg(test)]
+    pub(crate) fn with_fork_choice_cell(
+        mut self,
+        head: Arc<parking_lot::Mutex<Option<Hash>>>,
+    ) -> Self {
+        self.fork_choice = Some(Arc::new(move || {
+            let h = *head.lock();
+            Box::pin(async move { h })
+        }));
+        self
+    }
+
     pub fn with_fork_choice(mut self, ghostdag: Arc<GhostDag>) -> Self {
         self.dag_hydrated = Some(ghostdag.dag_hydrated_handle());
         self.fork_choice = Some(Arc::new(move || {
@@ -498,36 +618,44 @@ impl CanonicalApplicator {
     }
 
     /// Register a finalized certificate `(height, hash)` whose block the reorg
-    /// floor does not cover yet (see the `certified_pending` field). A pair at
-    /// or below the floor is ignored. Called only by the Enforced floor
-    /// verifier, with certificates it has verified.
+    /// floor does not cover yet (see the `certified_pending` field: nothing is
+    /// dropped until the floor covers it). A pair at or below the floor is
+    /// ignored. Called only by the Enforced floor verifier, with certificates
+    /// it has verified.
     pub fn register_certified(&self, height: u64, hash: Hash) {
         if height <= self.finalized_height() {
             return;
         }
-        let mut pending = self.certified_pending.lock();
-        pending.insert(height, hash);
-        while pending.len() > MAX_CERTIFIED_PENDING {
-            if pending.pop_first().is_none() {
-                break;
-            }
-        }
+        self.certified_pending.lock().insert((height, hash));
+    }
+
+    /// Raise the floor, under the advance lock, to the highest registered
+    /// certificate whose block is on the applied chain (any depth: heights
+    /// below the snapshot ring are checked by one header walk), exactly as the
+    /// next reorg decision would. Used at boot after the stored certificates
+    /// are registered, so the floor is restored before any block admission,
+    /// drain or recovery. Returns the floor.
+    pub async fn settle_registered_floor(&self) -> u64 {
+        let state = self.lock.lock().await;
+        self.effective_floor(&state, true)
+    }
+
+    /// A single descending walk of the applied chain ending at `tip` (see
+    /// [`AppliedWalk`]).
+    pub fn walk_applied(&self, tip: AppliedTip) -> AppliedWalk<'_> {
+        AppliedWalk::new(&self.storage, tip)
     }
 
     /// The registered certificates the floor does not cover yet, ascending
     /// (tests / diagnostics).
     #[cfg(test)]
     pub fn certified_pending(&self) -> Vec<(u64, Hash)> {
-        self.certified_pending
-            .lock()
-            .iter()
-            .map(|(h, x)| (*h, *x))
-            .collect()
+        self.certified_pending.lock().iter().copied().collect()
     }
 
     /// Drop the registered certificates the floor now covers.
     fn settle_certified(&self, floor: u64) {
-        self.certified_pending.lock().retain(|h, _| *h > floor);
+        self.certified_pending.lock().retain(|(h, _)| *h > floor);
     }
 
     /// The reorg floor for a reorg judged under the advance lock (`state`):
@@ -537,7 +665,8 @@ impl CanonicalApplicator {
     /// `verify_certified_floor`, in the same critical section as the reorg
     /// decision. Heights inside the snapshot ring are read from it; with
     /// `walk_below_ring` (the spine-rebuild path, whose fork point can be below
-    /// the ring) older ones are checked by a header walk.
+    /// the ring) older ones are checked by ONE descending header walk shared by
+    /// all of them ([`AppliedWalk`]), which stops at the first match.
     fn effective_floor(&self, state: &AppliedState, walk_below_ring: bool) -> u64 {
         let floor = self.finalized_height();
         let candidates: Vec<(u64, Hash)> = {
@@ -548,18 +677,20 @@ impl CanonicalApplicator {
             pending
                 .iter()
                 .rev()
-                .filter(|(h, _)| **h > floor && **h <= state.tip.height)
-                .map(|(h, x)| (*h, *x))
+                .filter(|(h, _)| *h > floor && *h <= state.tip.height)
+                .copied()
                 .collect()
         };
+        let mut walk = walk_below_ring.then(|| AppliedWalk::new(&self.storage, state.tip));
         for (height, hash) in candidates {
             let here = match state.snapshots.get(&height) {
                 Some((h, _)) => Some(*h),
-                None if walk_below_ring => self
-                    .applied_hash_at_height(state.tip, height)
-                    .ok()
-                    .flatten(),
-                None => None,
+                None => match walk.as_mut() {
+                    // An unreadable chain proves no match; keep checking the
+                    // ring-held candidates (nothing is dropped either way).
+                    Some(w) => w.hash_at(height).ok().flatten(),
+                    None => None,
+                },
             };
             if here != Some(hash) {
                 continue;
@@ -8043,18 +8174,51 @@ pub(crate) mod tests {
         assert!(app.certified_pending().is_empty());
     }
 
-    /// The registered set is bounded; the highest certificates are kept.
-    #[test]
-    fn registered_certificates_are_bounded() {
+    /// The registered set has no count bound: nothing above the floor is
+    /// dropped (two certificates at one height are both kept), and only the
+    /// floor reaching a height settles the entries at or below it.
+    #[tokio::test]
+    async fn registered_certificates_are_kept_until_the_floor_covers_them() {
         let (exec, storage, _dir) = fresh();
         let app = CanonicalApplicator::new(exec, storage);
-        let n = u64::try_from(MAX_CERTIFIED_PENDING).expect("fits") + 10;
+        let n: u64 = 1_000;
         for h in 1..=n {
             app.register_certified(h, Hash::new([1; 32]));
         }
+        app.register_certified(7, Hash::new([2; 32]));
         let held = app.certified_pending();
-        assert_eq!(held.len(), MAX_CERTIFIED_PENDING);
-        assert_eq!(held.first().map(|(h, _)| *h), Some(11));
-        assert_eq!(held.last().map(|(h, _)| *h), Some(n));
+        assert_eq!(held.len(), usize::try_from(n + 1).expect("fits"));
+        assert_eq!(held.first(), Some(&(1, Hash::new([1; 32]))));
+        assert!(held.contains(&(7, Hash::new([2; 32]))));
+        assert_eq!(held.last(), Some(&(n, Hash::new([1; 32]))));
+        app.finalized_height_handle().store(500, Ordering::SeqCst);
+        app.settle_certified(500);
+        let held = app.certified_pending();
+        assert_eq!(held.len(), 500);
+        assert_eq!(held.first().map(|(h, _)| *h), Some(501));
+        app.register_certified(500, Hash::new([3; 32]));
+        assert_eq!(app.certified_pending().len(), 500, "at the floor: ignored");
+    }
+
+    /// One descending walk answers many heights (strictly descending, else
+    /// `Err`), and `settle_registered_floor` raises the floor to the highest
+    /// registered certificate on the applied chain at any depth.
+    #[tokio::test]
+    async fn applied_walk_and_settle_registered_floor() {
+        let (exec, storage, _dir) = fresh();
+        let app = CanonicalApplicator::new(exec, storage.clone());
+        let (a1, a2, b2, _b3) = setup_fork(&app, &storage).await; // tip a2
+        let tip = app.applied_tip().await;
+        let mut w = app.walk_applied(tip);
+        assert_eq!(w.hash_at(3), Ok(None), "above the tip");
+        assert_eq!(w.hash_at(2), Ok(Some(a2.header.block_hash)));
+        assert_eq!(w.hash_at(1), Ok(Some(a1.header.block_hash)));
+        assert!(w.hash_at(1).is_err(), "must strictly descend");
+
+        app.register_certified(2, b2.header.block_hash); // not canonical here
+        app.register_certified(1, a1.header.block_hash); // canonical
+        assert_eq!(app.settle_registered_floor().await, 1);
+        assert_eq!(app.finalized_height(), 1);
+        assert_eq!(app.certified_pending(), vec![(2, b2.header.block_hash)]);
     }
 }

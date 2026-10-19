@@ -111,6 +111,8 @@ fn gating_config_checks_s1_and_s2() {
         "CheckpointFinalitySafety_strict.cfg",
         "CheckpointFinalitySafety_committees.cfg",
         "CheckpointFinalitySafety_pollonly.cfg",
+        "CheckpointFinalitySafety_restart.cfg",
+        "CheckpointFinalitySafety_bootlimit.cfg",
     ] {
         assert!(CI_SCRIPT.contains(cfg), "{cfg} not run by tla_finality.sh");
     }
@@ -134,6 +136,41 @@ fn strict_s2_config_checks_the_floor_at_finalization() {
     assert!(SPEC_CFG.contains("SyncFloor = TRUE"));
     assert!(CI_SCRIPT
         .contains("expect_pass CheckpointFinalitySafety CheckpointFinalitySafety_strict.cfg"));
+}
+
+/// S2 across restarts (review of #335 @ 5236d2b): the boot check consults
+/// every stored certificate (FloorVerifier::restore_certified_floor), so every
+/// config sets BootRegLimit to at least its number of heights, the restart
+/// config checks S2 over two heights with it, and the truncated mutation keeps
+/// its counterexample alive.
+#[test]
+fn restart_s2_configs_check_the_boot_floor_restore() {
+    const RESTART: &str =
+        include_str!("../../../specs/tla/consensus/CheckpointFinalitySafety_restart.cfg");
+    const BOOTLIMIT: &str =
+        include_str!("../../../specs/tla/consensus/CheckpointFinalitySafety_bootlimit.cfg");
+    assert!(SPEC.contains("BootFloor(n) =="));
+    assert!(SPEC.contains("BootConsulted(n) =="));
+    for cfg in [RESTART, BOOTLIMIT] {
+        assert!(cfg.contains("Heights = {1, 2}"));
+        assert!(cfg.contains("SyncFloor = TRUE"));
+        assert!(cfg.contains("PROPERTY FinalizedNeverReverted"));
+    }
+    assert!(
+        RESTART.contains("BootRegLimit = 2"),
+        "every stored certificate"
+    );
+    assert!(
+        BOOTLIMIT.contains("BootRegLimit = 1"),
+        "truncated (mutation)"
+    );
+    assert!(SPEC_CFG.contains("BootRegLimit = 1") && SPEC_CFG.contains("Heights = {1}"));
+    assert!(CI_SCRIPT
+        .contains("expect_pass CheckpointFinalitySafety CheckpointFinalitySafety_restart.cfg"));
+    assert!(CI_SCRIPT.contains(
+        "expect_violation CheckpointFinalitySafety CheckpointFinalitySafety_bootlimit.cfg \
+         FinalizedNeverReverted"
+    ));
 }
 
 #[test]

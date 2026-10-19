@@ -79,6 +79,14 @@
 // become canonical, so recovery onto the certified branch is protected at once,
 // not at the next poll. The poll stays as the backstop (boot, restarts, missed
 // hooks). Legacy and Observed install no guard: behaviour there is unchanged.
+//
+// RESTART (Enforced). The floor and the registered certificates are in memory
+// only. When the boot check's latest certificate does not raise the floor, the
+// floor is restored from the certificate STORE before any block is admitted
+// ([`FloorVerifier::restore_certified_floor`]): every stored certificate,
+// highest first, is verified and registered until the highest one whose block
+// is on this node's chain is found; the floor is raised to it. Nothing above
+// it is dropped, whatever the number of stored certificates.
 
 // PANIC-S1 G2: runs on the live node; panic-free outside tests.
 #![cfg_attr(
@@ -336,7 +344,7 @@ impl FloorVerifier {
         }
         let out = self.tick().await;
         if self.mode.raises_floor() && !matches!(out, FloorTick::Verified { .. }) {
-            self.register_older_certificates().await;
+            self.restore_certified_floor().await;
         }
         info!(
             "checkpoint finality: boot certificate check ({:?} mode): {:?}",
@@ -346,36 +354,113 @@ impl FloorVerifier {
     }
 
     /// Enforced, at boot, when the latest certificate did not raise the floor
-    /// (mismatch / waiting / unverifiable): the floor is an in-memory value lost
-    /// on restart, so register the older finalized certificates held in memory
-    /// (verified first; at most `MAX_CERTIFIED_PENDING`) with the applicator.
-    /// Every reorg then raises the floor to the highest of them whose block is
-    /// canonical here before judging the reorg, so a restart does not leave an
-    /// older finalized, canonical block unprotected.
-    async fn register_older_certificates(&self) {
-        let certs = self
-            .manager
-            .recent_finalized_certificates(crate::canonical_apply::MAX_CERTIFIED_PENDING)
-            .await;
+    /// (mismatch / waiting / unverifiable). The floor is an in-memory value
+    /// lost on restart, so restore it from the certificate STORE before any
+    /// block admission, drain or recovery (review of #335 @ 5236d2b): walk
+    /// every stored finalized certificate, highest first — the persisted
+    /// records, not only the in-memory window — verify each, and register it
+    /// with the applicator, until one is found whose block is on this node's
+    /// applied chain; raise the floor to that one (under the advance lock,
+    /// `verify_certified_floor`) and stop.
+    ///
+    /// Why stopping there is safe: the floor protects by HEIGHT (a reorg's
+    /// fork point must be >= the floor), so once it is at the highest stored
+    /// certificate that is canonical here, every lower certified block that is
+    /// canonical here is protected too; a lower one that is NOT canonical here
+    /// can never become canonical without a reorg below the floor, which is
+    /// refused. Every certificate ABOVE it is registered, none dropped, so the
+    /// first reorg after any of them becomes canonical raises the floor to it
+    /// (`CanonicalApplicator::effective_floor`). If the chain cannot be read,
+    /// or the floor could not be raised, nothing is skipped: the remaining
+    /// certificates are all registered and the applicator settles the floor
+    /// from them under its lock. A stored certificate that does not verify is
+    /// logged and not used.
+    async fn restore_certified_floor(&self) {
+        let heights = self.manager.finalized_certificate_heights().await;
+        let tip = self.applicator.applied_tip().await;
+        let mut walk = self.applicator.walk_applied(tip);
+        // `false` once the walk cannot be trusted: register everything left.
+        let mut early_stop = true;
         let mut registered = 0usize;
-        for cert in certs {
-            match cert.verify_certificate(self.chain_id) {
-                Ok(()) => {
-                    self.applicator
-                        .register_certified(cert.height, cert.block_hash);
-                    registered = registered.saturating_add(1);
-                }
-                Err(e) => warn!(
+        let mut restored: Option<(u64, Hash)> = None;
+        let floor_handle = self.applicator.finalized_height_handle();
+        for height in heights {
+            if height <= floor_handle.load(Ordering::SeqCst) {
+                break;
+            }
+            let Some(cert) = self.manager.get_checkpoint(height).await else {
+                warn!(
+                    "checkpoint finality: stored certificate at height {} could not be read; \
+                     not registered",
+                    height
+                );
+                continue;
+            };
+            if let Err(e) = cert.verify_certificate(self.chain_id) {
+                warn!(
                     "checkpoint finality: stored certificate {} @ {} does not verify; not \
                      registered: {}",
                     cert.block_hash, cert.height, e
-                ),
+                );
+                continue;
+            }
+            self.applicator
+                .register_certified(cert.height, cert.block_hash);
+            registered = registered.saturating_add(1);
+            if !early_stop {
+                continue;
+            }
+            match walk.hash_at(cert.height) {
+                Ok(Some(here)) if here == cert.block_hash => {
+                    match self
+                        .applicator
+                        .verify_certified_floor(cert.height, cert.block_hash, true)
+                        .await
+                    {
+                        FloorCheck::Match => {
+                            restored = Some((cert.height, cert.block_hash));
+                            break;
+                        }
+                        other => {
+                            warn!(
+                                "checkpoint finality: stored certificate {} @ {} could not \
+                                 raise the floor at boot ({:?}); registering every older \
+                                 certificate instead",
+                                cert.block_hash, cert.height, other
+                            );
+                            early_stop = false;
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(
+                        "checkpoint finality: applied chain unreadable while restoring the \
+                         floor at boot ({}); registering every older certificate instead",
+                        e
+                    );
+                    early_stop = false;
+                }
             }
         }
-        info!(
-            "checkpoint finality: registered {} stored certificate(s) for the reorg floor",
-            registered
-        );
+        // Same check the next reorg would make, under the advance lock (also
+        // settles the case where the walk could not be used).
+        let floor = self.applicator.settle_registered_floor().await;
+        match restored {
+            Some((height, hash)) => info!(
+                "checkpoint finality: reorg floor restored at boot to finalized block {} @ {} \
+                 (the highest stored certificate on this node's chain); {} certificate(s) \
+                 above it registered",
+                hash,
+                height,
+                registered.saturating_sub(1)
+            ),
+            None => info!(
+                "checkpoint finality: no stored certificate confirmed on this node's chain at \
+                 boot; {} certificate(s) registered, reorg floor {}",
+                registered, floor
+            ),
+        }
     }
 
     /// One verification pass (see the module docs).
@@ -1165,6 +1250,49 @@ mod tests {
             },
             "recovered: RPC tags name the certified block"
         );
+    }
+
+    /// Boot restores the floor from ANY number of stored certificates (review
+    /// of #335 @ 5236d2b): the certificate for this node's block a2 is stored
+    /// below 300 certificates for heights this node has not applied yet — more
+    /// than the 64 the boot check used to register and more than the 256 the
+    /// manager keeps in memory. The boot check finds a2 in the persisted store,
+    /// raises the floor to 2, keeps all 300 registered, and a reorg forking
+    /// below a2 is refused.
+    #[tokio::test]
+    async fn boot_restores_the_floor_from_any_number_of_stored_certificates() {
+        let (exec, storage, _dir) = fresh();
+        let app = Arc::new(CanonicalApplicator::new(exec, storage.clone()));
+        let (_a1, a2, _b2, b3) = setup_fork(&app, &storage).await; // tip a2
+        persist_certificate(&storage, &certificate(2, a2.header.block_hash, 3));
+        let above: u64 = 300;
+        for h in 3..3 + above {
+            let mut x = [0xEE; 32];
+            x[..8].copy_from_slice(&h.to_be_bytes());
+            persist_certificate(&storage, &certificate(h, Hash::new(x), 3));
+        }
+        let r = rig(FloorMode::Enforced, manager_over(&storage), app.clone());
+        assert_eq!(
+            r.verifier.boot_check().await,
+            FloorTick::Waiting {
+                height: 2 + above,
+                applied_height: 2
+            }
+        );
+        assert_eq!(load(&r.floor), 2, "restored from the persisted store");
+        assert_eq!(
+            app.certified_pending().len(),
+            usize::try_from(above).expect("fits"),
+            "nothing above the floor is dropped"
+        );
+        let lock = app.advance_lock();
+        let mut state = lock.lock().await;
+        match app.reorg_to(&mut state, b3.header.block_hash).await {
+            ReorgOutcome::Rejected(why) => {
+                assert!(why.contains("below finalized height 2"), "{why}")
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
     }
 
     /// A persisted certificate that does not verify (below quorum) halts finality

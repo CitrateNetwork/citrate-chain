@@ -272,12 +272,31 @@ confirmed now (applied tip below `H`, or the check could not complete) is an `Un
 stop, which clears like a mismatch once the block is confirmed canonical and becomes a
 mismatch if another block is found at `H`. So when finalization becomes visible, either the
 floor covers the certified block or the gadget is halted (proposes and signs nothing). The
-certificate is also registered with the applicator (`register_certified`, at most 64, highest
-kept; at boot, when the latest certificate does not match, the older stored certificates are
-verified and registered too): every reorg first raises the floor to the highest registered
-certificate whose block is canonical, under the advance lock (`effective_floor`), so a
-certified block that becomes canonical after its check is protected at once. The poll stays
-as a backstop. Legacy and Observed install no guard (unchanged).
+certificate is also registered with the applicator (`register_certified`): every reorg first
+raises the floor to the highest registered certificate whose block is canonical, under the
+advance lock (`effective_floor`), so a certified block that becomes canonical after its check
+is protected at once. The registered set has no count bound: an entry leaves it only when the
+floor reaches its height (the floor protects by height, so a lower certificate then adds
+nothing), and nothing above the floor is dropped. (An earlier revision kept only the highest
+64; review of #335 @ 5236d2b showed that could drop the one certificate whose block is
+canonical here.) It holds only verified quorum certificates above the floor and grows only
+while the node is off the certified chain. The poll stays as a backstop. Legacy and Observed
+install no guard (unchanged).
+
+**Restart (Enforced).** The floor and the registered set are in memory. When the boot check's
+latest certificate does not raise the floor (mismatch, not yet applied, unverifiable),
+`FloorVerifier::restore_certified_floor` walks EVERY stored certificate highest first — the
+persisted `checkpoint:{height}` records (`CheckpointManager::finalized_certificate_heights`),
+not only the 256 held in memory — verifies and registers each, and stops at the highest one
+whose block is on the applied chain (one descending header walk, `AppliedWalk`), raising the
+floor to it under the advance lock before any block admission, drain or recovery. After a
+restart the snapshot ring holds only the tip, so a reorg below it goes through the spine
+rebuild (`recover_to_head`), whose I4 guard then sees the restored floor. Test:
+`s2_restart_restores_the_floor_below_many_uncovered_certificates` (70 uncovered certificates
+above the finalized A10; a rebuild forking below 10 is refused) and
+`boot_restores_the_floor_from_any_number_of_stored_certificates` (300 stored above the
+match). TLA+: `CheckpointFinalitySafety_restart.cfg` (holds) and `_bootlimit.cfg` (a boot
+check consulting only the latest stored certificate reverts an older finalized block).
 
 ### 4.6 RPC surface
 Add `finalized` and `safe` block tags to `eth_rpc.rs`. **There are ~8 block-tag parse sites,
@@ -491,11 +510,12 @@ message).
 - **TLA+:** `specs/tla/consensus/CheckpointFinalitySafety.tla` models S1/S2 across nodes
   (actions Propose, SignVote, Finalize, VerifyFloor, Reorg, Restart). TLC runs in CI
   (`.github/workflows/tla-finality.yml` → `scripts/ci/tla_finality.sh`, TLC 1.7.1 sha256-pinned):
-  the bounded gating and strict-S2 configs must pass, and four configs must produce
-  counterexamples (f ≥ n/3; no durable signed-vote record; poll-only floor; per-candidate
-  committees). The two-height config
+  the bounded gating, strict-S2 and restart-S2 configs must pass, and five configs must produce
+  counterexamples (f ≥ n/3; no durable signed-vote record; poll-only floor; truncated boot
+  restore; per-candidate committees). The two-height config
   (`_deep.cfg`) runs on demand (`TLA_FINALITY_DEEP=1`; exhaustive local run 2026-10-19:
-  92.1M distinct states, no violation, 46 min). `CheckpointVoteSafety` now runs too,
+  92.1M distinct states, no violation, 46 min — on the model before the boot floor restore;
+  not re-run since). `CheckpointVoteSafety` now runs too,
   with a submission bound and two invariants restated (errata in the spec: as first written they
   were refuted by a valid vote followed by a rejected resubmission, and the unbounded sequence
   never terminated).

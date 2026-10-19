@@ -36,9 +36,14 @@ EXTENDS Naturals, FiniteSets, TLC
 \*                below the floor (I4); the floor is first raised to a registered
 \*                certificate whose block is canonical (effective_floor)
 \*   Restart      process restart: pending checkpoints, the floor (an in-memory atomic),
-\*                the registered certificate and the verifier state are lost; certificates and the signed-vote
-\*                record persist; FloorVerifier::boot_check runs before any block is
-\*                admitted (Reorg is disabled while booting)
+\*                the registered certificates and the verifier state are lost; certificates
+\*                and the signed-vote record persist; FloorVerifier::boot_check runs before
+\*                any block is admitted (Reorg is disabled while booting). The boot check
+\*                (VerifyFloor while booting) consults the stored certificates highest
+\*                first (FloorVerifier::restore_certified_floor), raises the floor to the
+\*                highest whose block is canonical here and registers every one above it.
+\*                The code consults ALL of them (BootRegLimit >= Cardinality(Heights));
+\*                a smaller BootRegLimit models a truncated boot registration
 \*
 \* Votes are modeled as a global set of sent votes. Delivery order and loss do
 \* not matter for safety (a node can only count votes that were sent), so
@@ -70,6 +75,15 @@ EXTENDS Naturals, FiniteSets, TLC
 \*                                        follows only the verifier's poll, the Stage 2
 \*                                        design): TLC MUST find Finalize -> Reorg below
 \*                                        the new certificate -> VerifyFloor halts.
+\*   CheckpointFinalitySafety_restart.cfg one node, three Byzantine voters, two heights:
+\*                                        S2 across restarts with the boot check consulting
+\*                                        every stored certificate (BootRegLimit = 2). Must
+\*                                        hold.
+\*   CheckpointFinalitySafety_bootlimit.cfg the same with BootRegLimit = 1 (only the latest
+\*                                        stored certificate consulted at boot — the bounded
+\*                                        registration reviewed on #335 @ 5236d2b): TLC MUST
+\*                                        find Restart -> boot -> Reorg reverting an older
+\*                                        finalized, canonical block.
 \*   CheckpointFinalitySafety_committees.cfg 5 voters (f = 1), committees of 4 per
 \*                                        candidate: TLC MUST find an S1 violation with no
 \*                                        honest equivocation — two siblings finalized by
@@ -84,8 +98,10 @@ CONSTANTS
     None,           \* "no block / no value"
     DurableRecord,  \* TRUE: the Stage 1a signed-vote record is in force
     CommitteeSize,  \* committee size per candidate (config.committee_size)
-    SyncFloor       \* TRUE: the floor is raised / finality halted AT finalization
+    SyncFloor,      \* TRUE: the floor is raised / finality halted AT finalization
                     \* (FinalizationGuard); FALSE: only by the verifier's poll
+    BootRegLimit    \* how many stored certificates (highest first) the boot check
+                    \* consults; the code consults all (>= Cardinality(Heights))
 
 Voters == Nodes \cup Byz
 
@@ -102,6 +118,7 @@ ASSUME Heights \subseteq Nat /\ 0 \notin Heights
 ASSUME None \notin Hashes
 ASSUME DurableRecord \in BOOLEAN
 ASSUME SyncFloor \in BOOLEAN
+ASSUME BootRegLimit \in Nat \ {0}
 
 VARIABLES
     canon,      \* canon[n][h]: the block at height h on node n's applied chain
@@ -141,6 +158,19 @@ Max(a, b) == IF a > b THEN a ELSE b
 EffFloor(n) ==
     LET hs == {h \in reg[n] : fin[n][h] # None /\ canon[n][h] = fin[n][h]}
              \cup {floor[n]}
+    IN CHOOSE m \in hs : \A k \in hs : k <= m
+
+\* Heights node n holds a stored certificate for.
+Stored(n) == {k \in Heights : fin[n][k] # None}
+
+\* The stored certificates the boot check consults: the BootRegLimit highest.
+BootConsulted(n) ==
+    {k \in Stored(n) : Cardinality({j \in Stored(n) : j > k}) < BootRegLimit}
+
+\* The floor the boot check restores (FloorVerifier::restore_certified_floor):
+\* the highest consulted certificate whose block is canonical here, else 0.
+BootFloor(n) ==
+    LET hs == {k \in BootConsulted(n) : canon[n][k] = fin[n][k]} \cup {0}
     IN CHOOSE m \in hs : \A k \in hs : k <= m
 
 \* ---- Init ----
@@ -204,20 +234,21 @@ Finalize(n, h) ==
        ELSE UNCHANGED <<floor, halted, reg>>
     /\ UNCHANGED <<canon, sent, booting>>
 
-\* Floor verifier pass (Enforced mode) on the latest certificate.
+\* Floor verifier pass (Enforced mode) on the latest certificate. While
+\* booting (SyncFloor), the boot check also restores the floor from the older
+\* stored certificates and registers them (FloorVerifier::boot_check).
 VerifyFloor(n) ==
-    LET h == LatestFin(n) IN
+    LET h == LatestFin(n)
+        ok == canon[n][h] = fin[n][h]
+        fromLatest == IF ok THEN Max(floor[n], h) ELSE floor[n]
+        fromBoot == IF booting[n] /\ SyncFloor THEN BootFloor(n) ELSE 0
+    IN
     /\ h > 0
-    /\ IF canon[n][h] = fin[n][h]
-       THEN /\ floor' = [floor EXCEPT ![n] = IF h > @ THEN h ELSE @]
-            /\ halted' = [halted EXCEPT ![n] = FALSE]
-       ELSE /\ halted' = [halted EXCEPT ![n] = TRUE]
-            /\ UNCHANGED floor
-    \* SyncFloor: the poll registers the certificate it checked; the boot check
-    \* also registers the older stored ones (FloorVerifier::boot_check).
+    /\ floor' = [floor EXCEPT ![n] = Max(fromLatest, fromBoot)]
+    /\ halted' = [halted EXCEPT ![n] = ~ok]
     /\ reg' = IF SyncFloor
               THEN [reg EXCEPT ![n] = @ \cup {h}
-                       \cup (IF booting[n] THEN {k \in Heights : fin[n][k] # None} ELSE {})]
+                       \cup (IF booting[n] THEN BootConsulted(n) ELSE {})]
               ELSE reg
     /\ booting' = [booting EXCEPT ![n] = FALSE]
     /\ UNCHANGED <<canon, sent, pending, fin>>

@@ -630,16 +630,39 @@ impl CheckpointManager {
         self.get_checkpoint(height).await
     }
 
-    /// Up to `limit` finalized certificates held in memory (the most recent
-    /// [`MAX_FINALIZED_IN_MEMORY`]), highest height first, AS STORED: callers
-    /// must [`Checkpoint::verify_certificate`] each before trusting it.
-    pub async fn recent_finalized_certificates(&self, limit: usize) -> Vec<Checkpoint> {
-        let finalized = self.finalized.read().await;
-        let mut out: Vec<Checkpoint> = finalized.values().cloned().collect();
-        drop(finalized);
-        out.sort_by_key(|c| std::cmp::Reverse(c.height));
-        out.truncate(limit);
-        out
+    /// Every height holding a finalized certificate — the in-memory window AND
+    /// the persistent `DAG_METADATA` `checkpoint:{height}` records (the memory
+    /// window keeps only the latest [`MAX_FINALIZED_IN_MEMORY`]) — highest
+    /// first. Read each with [`Self::get_checkpoint`] and
+    /// [`Checkpoint::verify_certificate`] before trusting it. Scans the
+    /// metadata column family (as [`Self::with_persistence`] does at load):
+    /// meant for boot, not for a hot path. If the scan fails, only the
+    /// in-memory heights are returned and a warning is logged.
+    pub async fn finalized_certificate_heights(&self) -> Vec<u64> {
+        let mut heights: std::collections::BTreeSet<u64> =
+            self.finalized.read().await.keys().copied().collect();
+        if let Some(kv) = &self.persistent {
+            match kv.kv_iter_cf(cf::DAG_METADATA) {
+                Ok(entries) => {
+                    for (key, _) in entries {
+                        let height = key
+                            .strip_prefix(b"checkpoint:".as_slice())
+                            .and_then(|rest| std::str::from_utf8(rest).ok())
+                            .and_then(|rest| rest.parse::<u64>().ok());
+                        if let Some(h) = height {
+                            heights.insert(h);
+                        }
+                    }
+                }
+                Err(e) => warn!(
+                    "checkpoint: could not list persisted finalized certificates ({}); \
+                     using the {} held in memory",
+                    e,
+                    heights.len()
+                ),
+            }
+        }
+        heights.into_iter().rev().collect()
     }
 
     /// Whether `height` holds a finalized checkpoint (memory or persistent store).
