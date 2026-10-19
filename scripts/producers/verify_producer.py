@@ -10,6 +10,17 @@ the UI truth contract (docs/ui-truth/UI_TRUTH_CONTRACT.md §1-§2).
 
 Checks and their sources:
   network     eth_chainId AND eth_getBlockByNumber(0x0).hash equal the profile's.
+  state       The registry reads are eth_call at `latest`, which runs on the node's APPLIED
+              state; eth_blockNumber and block hashes come from its stored headers. A node
+              that is syncing or replaying stores headers ahead of the state it has
+              applied, so its registry answers can be older than its head. Before the
+              registry reads (and again after them, for the committee check) the node must
+              show that its state has caught up: eth_syncing is exactly `false` (the node
+              reports {currentBlock, highestBlock} while its applied tip is behind the
+              highest block it has seen) AND its head block's timestamp is at most
+              --max-head-age seconds old (a node replaying from disk after a restart, or cut
+              off from its peers, can report `false` while its head is stale). If either
+              fails or cannot be read, registered/eligible/committee are UNKNOWN.
   registered  ValidatorRegistry.validatorInfo(pubkey).status == Active and isActive(pubkey);
               the registered staker equals --staker; pubkeyOfStaker(staker) == pubkey.
               "Registered · active from epoch N" while actEpoch > currentEpoch().
@@ -44,6 +55,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +68,15 @@ CHECKS = ("network", "registered", "eligible", "committee", "producing")
 # tests/test_verify_producer.py parses that file and fails if these drift.
 MIN_FINALITY_COMMITTEE = 4
 BATCH = 100
+# The head block must be at most this old, or MAX_HEAD_AGE_BLOCKS block times if longer,
+# for the node's state to count as caught up (see "state" above). Overridable with
+# --max-head-age.
+MAX_HEAD_AGE_FLOOR_S = 120
+MAX_HEAD_AGE_BLOCKS = 30
+
+
+def default_max_head_age(prof: pl.Profile) -> int:
+    return max(MAX_HEAD_AGE_FLOOR_S, MAX_HEAD_AGE_BLOCKS * int(prof["block_time"]))
 
 
 def derived_quorum(n: int) -> int:
@@ -88,6 +109,7 @@ def planned_calls(prof: pl.Profile, staker: str | None, pubkey: str | None, wind
         "eth_chainId",
         "eth_getBlockByNumber(0x0)",
         "eth_blockNumber",
+        "eth_syncing + eth_getBlockByNumber(head).timestamp (applied state caught up), before and after the registry reads",
         'eth_getBlockByNumber("finalized")',
     ]
     if staker:
@@ -165,6 +187,40 @@ def block_hash(rpc: pl.Rpc, height: int) -> str | None:
     return h.lower() if isinstance(h, str) else None
 
 
+def applied_state_problem(rpc: pl.Rpc, head: int, max_age: int, now: float | None = None) -> str | None:
+    """None when the node shows its applied state has caught up with its head; otherwise
+    the reason it cannot be shown (see "state" in the module docstring). Unreadable or
+    malformed evidence is a reason too: it is never read as "caught up"."""
+    try:
+        syncing = rpc.call("eth_syncing", [])
+    except pl.RpcError as e:
+        return f"could not read the node's sync status (eth_syncing): {e}"
+    if syncing is not False:
+        if not isinstance(syncing, dict):
+            return f"eth_syncing returned {syncing!r}, not false or a progress object"
+        try:
+            cur = pl.parse_qty(syncing.get("currentBlock"), "eth_syncing.currentBlock")
+            top = pl.parse_qty(syncing.get("highestBlock"), "eth_syncing.highestBlock")
+        except pl.RpcError as e:
+            return f"the node reports it is syncing, with a malformed progress object ({e})"
+        return (
+            f"the node is syncing or replaying: its applied state is at block {cur}, behind the "
+            f"highest block it has seen ({top}; its head {head})"
+        )
+    try:
+        b = rpc.call("eth_getBlockByNumber", [pl.qty(head), False])
+        ts = pl.parse_qty(b.get("timestamp") if isinstance(b, dict) else None, f"block {head} timestamp")
+    except pl.RpcError as e:
+        return f"could not read the head block's timestamp: {e}"
+    age = int((time.time() if now is None else now) - ts)
+    if age > max_age:
+        return (
+            f"the head block {head} is {age} s old (limit {max_age} s): the node is behind the "
+            f"network or replaying, so its state can lag its headers"
+        )
+    return None
+
+
 def read_bracket(rpc: pl.Rpc, head_before: int, hash_before: str | None) -> tuple[int, str] | str:
     """Close the bracket around the registry reads, which all use `latest`.
 
@@ -204,6 +260,22 @@ def verify(args: argparse.Namespace) -> Result:
         r.set("network", False, str(e), "eth_chainId + genesis hash")
         return r
     head = net["head"]
+    max_age = args.max_head_age if args.max_head_age is not None else default_max_head_age(prof)
+    # The registry reads below run on the node's applied state. Refuse to read it as
+    # current unless the node shows that state has caught up with its head.
+    lag = applied_state_problem(rpc, head, max_age)
+    r.network["applied_state"] = "caught up" if lag is None else f"not shown: {lag}"
+    if lag is not None:
+        for cid in ("registered", "eligible", "committee"):
+            r.set(
+                cid,
+                None,
+                f"unknown: {lag}. The registry reads run on the node's applied state, which "
+                "can be older than its head; re-run when the node has caught up, or use an RPC "
+                "node that has",
+                "eth_syncing + head block timestamp",
+            )
+        return r
 
     staker = pl.norm_addr(args.staker) if args.staker else None
     pubkey = pl.norm_b32(args.pubkey) if args.pubkey else None
@@ -247,6 +319,12 @@ def verify(args: argparse.Namespace) -> Result:
         fin = rpc.call("eth_getBlockByNumber", ["finalized", False])
         finalized = pl.parse_qty(fin.get("number") if isinstance(fin, dict) else None, "finalized.number")
         bracket = read_bracket(rpc, head, hash_before)
+        if not isinstance(bracket, str):
+            # Close the applied-state check too: the reads must not have run while the node
+            # fell behind (a restart into replay, a stall) between the two checks.
+            lag_after = applied_state_problem(rpc, bracket[0], max_age)
+            if lag_after is not None:
+                bracket = f"after the registry reads, {lag_after}"
     except pl.RpcError as e:
         r.set("registered", None, f"unavailable: {e}", "ValidatorRegistry reads")
         return r
@@ -257,6 +335,7 @@ def verify(args: argparse.Namespace) -> Result:
     snapshot_members = qualifying_members(members, e_gov, min_stake)
     effective_committee = min(snapshot_members, committee_size)
     r.network = {
+        **r.network,
         "head": head,
         "current_epoch": cur_epoch,
         "registered_validators": registered_count,
@@ -379,7 +458,7 @@ def verify(args: argparse.Namespace) -> Result:
             None,
             f"unknown: {bracket_problem}. The registry reads use the latest state, so they cannot be "
             f"tied to snapshot S({e_gov})",
-            "eth_blockNumber + block hashes around the registry reads",
+            "eth_blockNumber + block hashes + eth_syncing/head timestamp around the registry reads",
             governing_snapshot_epoch=e_gov,
             finality=finality_note,
         )
@@ -513,6 +592,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--pubkey", help="the proposer pubkey (citrate-node registration-proof)")
     ap.add_argument("--rpc", help="override the profile's public RPC")
     ap.add_argument("--window", type=int, default=1000, help="blocks to scan for production")
+    ap.add_argument(
+        "--max-head-age",
+        type=int,
+        default=None,
+        help=f"seconds; the head block must be at most this old for the node's state to count as "
+        f"caught up (default max({MAX_HEAD_AGE_FLOOR_S}, {MAX_HEAD_AGE_BLOCKS} x profile block_time))",
+    )
     ap.add_argument("--require", default=",".join(CHECKS), help=f"subset of {','.join(CHECKS)}")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--dry-run", action="store_true", help="print the reads it would make; no network")
@@ -526,6 +612,8 @@ def main(argv: list[str] | None = None) -> int:
             raise pl.ToolError(f"unknown checks: {', '.join(unknown)}")
         if not 1 <= args.window <= 10_000:
             raise pl.ToolError("--window must be 1..10000")
+        if args.max_head_age is not None and not 1 <= args.max_head_age <= 86_400:
+            raise pl.ToolError("--max-head-age must be 1..86400 seconds")
         if args.dry_run:
             prof = pl.load_profile(args.profile, allow_pending=True)
             print(f"DRY RUN against {args.rpc or prof['public_rpc']} (profile {prof.name}, status {prof['status']}):")

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -55,6 +56,16 @@ class FakeChain:
         # the chain between reads); hash_override[height] replaces a block hash (a reorg).
         self.on_call: Any = None
         self.hash_override: dict[int, str] = {}
+        # Applied state vs stored headers. The registry answers stand for the APPLIED state;
+        # `applied` (None = the head) is the height it has reached and `max_seen` (None = the
+        # head) the highest block the node has seen. eth_syncing answers as the node does
+        # (core/api/src/server.rs): false unless max_seen > applied. `syncing_reply` replaces
+        # that answer outright; `head_age` is how many seconds old the head block is (2 s
+        # blocks before it).
+        self.applied: int | None = None
+        self.max_seen: int | None = None
+        self.syncing_reply: Any = None
+        self.head_age = 0
 
     def add_validator(self, pubkey: str, staker: str, stake: int, act_epoch: int, status: str = "Active") -> None:
         self.validators[pubkey.lower()] = {
@@ -130,7 +141,17 @@ class FakeChain:
             return {"number": "0x0", "hash": self.genesis, "proposerPubkey": "0x" + "00" * 32, "miner": "0x" + "00" * 20}
         pk, miner = self.producers.get(h, self.default_producer)
         hsh = self.hash_override.get(h, "0x" + f"{h:064x}")
-        return {"number": hex(h), "hash": hsh, "proposerPubkey": pk, "miner": miner}
+        ts = max(0, int(time.time()) - self.head_age - 2 * (self.head - h))
+        return {"number": hex(h), "hash": hsh, "proposerPubkey": pk, "miner": miner, "timestamp": hex(ts)}
+
+    def syncing(self) -> Any:
+        if self.syncing_reply is not None:
+            return self.syncing_reply
+        applied = self.head if self.applied is None else self.applied
+        seen = self.head if self.max_seen is None else self.max_seen
+        if seen <= applied:
+            return False
+        return {"startingBlock": hex(applied), "currentBlock": hex(applied), "highestBlock": hex(seen)}
 
     def handle(self, method: str, params: list[Any]) -> Any:
         if method in self.fail_methods:
@@ -139,6 +160,8 @@ class FakeChain:
             return hex(self.chain_id)
         if method == "eth_blockNumber":
             return hex(self.head)
+        if method == "eth_syncing":
+            return self.syncing()
         if method == "eth_getBlockByNumber":
             tag = params[0]
             if tag == "finalized":

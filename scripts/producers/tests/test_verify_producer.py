@@ -239,6 +239,119 @@ class TestVerify(unittest.TestCase):
         self.assertIn("snapshot boundary", com["state"])
         self.assertEqual(rc, 3)
 
+    # ── applied state behind the stored headers (sync / replay) ───────────────────
+
+    def _stale_registry_chain(self) -> FakeChain:
+        """Stored headers at 512,900 (governing snapshot S(513) = block 512,800); the applied
+        state is at 511,500. Validator 0x99.. was removed at block 512,000, before the
+        snapshot, so S(513) has three qualifying members (too few to finalize); the stale
+        applied state still lists it, which reads as four. The removal is outside the
+        snapshot-to-head log scan, so only the lag evidence can catch this."""
+        c = FakeChain()
+        others(c, 2)
+        c.add_validator(PK, STAKER, STAKE, 3)
+        c.add_validator("0x" + "99" * 32, "0x" + "99" * 20, STAKE, 3)  # removed at 512,000
+        c.head = 512_900
+        c.applied = 511_500
+        c.logs.append({"block": 512_000, "topic0": "ab" * 32})
+        return c
+
+    def test_committee_unknown_while_the_node_reports_syncing(self):
+        c = self._stale_registry_chain()
+        c.max_seen = c.head  # gossip has shown the node blocks past its applied tip
+        with RpcStub(c) as s:
+            rc, body, _ = run(s.url, "--staker", STAKER, "--require", "committee")
+        com = body["checks"]["committee"]
+        self.assertIsNone(com["ok"], com)
+        self.assertEqual(rc, 3)
+        self.assertIn("syncing or replaying", com["state"])
+        self.assertIn("block 511500", com["state"])
+        for cid in ("registered", "eligible"):
+            self.assertIsNone(body["checks"][cid]["ok"], body["checks"][cid])
+        self.assertTrue(body["network"]["applied_state"].startswith("not shown"))
+        # No registry read is made from the stale state.
+        self.assertEqual(c.log_queries, [])
+
+    def test_committee_unknown_while_replaying_after_a_restart(self):
+        # After a restart the node replays stored blocks with eth_syncing still false (it
+        # has seen nothing past its applied tip yet); the head it reports is old.
+        c = self._stale_registry_chain()
+        c.max_seen = c.applied
+        c.head_age = 900
+        with RpcStub(c) as s:
+            rc, body, _ = run(s.url, "--staker", STAKER, "--require", "committee")
+        com = body["checks"]["committee"]
+        self.assertIsNone(com["ok"], com)
+        self.assertEqual(rc, 3)
+        self.assertIn("s old (limit 120 s)", com["state"])
+
+    def test_stale_registry_control_without_lag_evidence(self):
+        # Control for the two tests above: the same stale registry with neither signal
+        # (syncing false, fresh head) is read as current. The UNKNOWNs come from the lag
+        # evidence, not from anything else in the fixture.
+        c = self._stale_registry_chain()
+        c.max_seen = c.applied
+        with RpcStub(c) as s:
+            _, body, _ = run(s.url, "--staker", STAKER, "--require", "committee")
+        self.assertIs(body["checks"]["committee"]["ok"], True, body["checks"]["committee"])
+        self.assertEqual(body["network"]["applied_state"], "caught up")
+
+    def test_unreadable_or_malformed_sync_status_is_unknown(self):
+        for reply, word in (
+            (None, "could not read the node's sync status"),
+            ("0x1", "not false or a progress object"),
+            ({"currentBlock": "zz"}, "malformed progress object"),
+            (True, "not false or a progress object"),
+        ):
+            c = FakeChain()
+            others(c)
+            c.add_validator(PK, STAKER, STAKE, 3)
+            if reply is None:
+                c.fail_methods.add("eth_syncing")
+            else:
+                c.syncing_reply = reply
+            with RpcStub(c) as s:
+                rc, body, _ = run(s.url, "--staker", STAKER, "--require", "committee")
+            com = body["checks"]["committee"]
+            self.assertIsNone(com["ok"], (reply, com))
+            self.assertEqual(rc, 3)
+            self.assertIn(word, com["state"])
+
+    def test_committee_unknown_when_the_node_falls_behind_during_the_reads(self):
+        c = self.c
+        c.head = 512_900
+        c.add_validator(PK, STAKER, STAKE, 3)
+
+        def fall_behind(chain):
+            chain.max_seen = chain.head + 50  # the node now sees blocks it has not applied
+
+        c.on_call = self._advance_on_first("fd4665ae", fall_behind)
+        with RpcStub(c) as s:
+            rc, body, _ = run(s.url, "--staker", STAKER, "--require", "registered,committee")
+        com = body["checks"]["committee"]
+        self.assertIsNone(com["ok"], com)
+        self.assertIn("after the registry reads", com["state"])
+        self.assertIn("syncing or replaying", com["state"])
+        self.assertIs(body["checks"]["registered"]["ok"], True)
+        self.assertEqual(rc, 3)
+
+    def test_max_head_age_is_configurable(self):
+        c = self.c
+        c.add_validator(PK, STAKER, STAKE, 3)
+        c.head_age = 200
+        with RpcStub(c) as s:
+            rc, body, _ = run(s.url, "--staker", STAKER, "--require", "committee")
+            self.assertIsNone(body["checks"]["committee"]["ok"])
+            self.assertEqual(rc, 3)
+            rc, body, _ = run(s.url, "--staker", STAKER, "--require", "committee", "--max-head-age", "300")
+            self.assertIs(body["checks"]["committee"]["ok"], True, body["checks"]["committee"])
+            self.assertEqual(rc, 0)
+        for bad in ("0", "86401"):
+            with redirect_stderr(io.StringIO()):
+                self.assertEqual(
+                    v.main(["--profile", "40204-r1005", "--staker", STAKER, "--max-head-age", bad]), 2
+                )
+
     def test_small_committee_is_never_ok(self):
         c = FakeChain()
         c.add_validator(PK, STAKER, STAKE, 3)
@@ -461,6 +574,7 @@ class TestVerify(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(s.requests, [])
         self.assertIn("validatorInfo", out.getvalue())
+        self.assertIn("eth_syncing", out.getvalue())
 
     def test_input_validation(self):
         for argv in (["--profile", "40204-r1005"], ["--profile", "40204-r1005", "--staker", STAKER, "--require", "bogus"]):
