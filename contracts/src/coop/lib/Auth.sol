@@ -1,10 +1,10 @@
 // ── VENDORED: DO NOT EDIT. Change upstream, then re-vendor with a new header. ─────
 // Source:    CitrateNetwork/citrate-coop contracts/src/lib/Auth.sol
-// Upstream:  github.com/CitrateNetwork/citrate-coop @ 99b2d0d29d38e0576c0118e083c5de48747cc3ba
-//            (fetched from GitHub main, not from a local copy), vendored 2026-10-19.
-// Includes:  PBA R2 remediation (citrate-coop #3, 3d4aaae6) and the Apache-2.0 relicense.
+// Upstream:  github.com/CitrateNetwork/citrate-coop @ 34f6283837c6fae2a6a4500509783c876b1008ea
+//            (branch fix/explicit-initial-admin; re-vendor from main after it merges), vendored 2026-10-18.
+// Includes:  PBA R2 remediation (citrate-coop #3), Apache-2.0 relicense, explicit initial admin/registrar.
 // Integrity: every line after this 10-line header is byte-identical to upstream:
-//            `tail -n +11 <this file> | sha256sum` == f2196a0bab6786f83d917c959114cc9f03f029a5e2266d9acfd58429d9b0458c
+//            `tail -n +11 <this file> | sha256sum` == c2af64ebdb196a608c642686e1e01db048971758c73e8068e480088fedae3bbd
 // Why:       C2 D9 / C4: deployed dormant at betanet genesis by the citrate-chain
 //            ceremony (script/DeployDormantLedgers.s.sol).
 // ───────────────────────────────────────────────────────────────────────────────────
@@ -12,7 +12,11 @@
 pragma solidity ^0.8.26;
 
 /// @title Auth — minimal role-based access control (RFC-CIT-COOP-0001)
-/// @notice Tiny, dependency-free AccessControl. Deployer gets DEFAULT_ADMIN_ROLE.
+/// @notice Tiny, dependency-free AccessControl. The initial DEFAULT_ADMIN_ROLE holder is passed
+///         EXPLICITLY to the constructor — it is never inferred from `msg.sender`.
+/// @dev The initial admin is an explicit, audited deploy input rather than the deploying
+///      account, so the role holder is whatever the deploy names. The canonical CREATE2
+///      deployer is rejected as a holder because it is a permissionless relay.
 abstract contract Auth {
     bytes32 public constant DEFAULT_ADMIN_ROLE = 0x00;
 
@@ -23,11 +27,24 @@ abstract contract Auth {
     event RoleGranted(bytes32 indexed role, address indexed account, address indexed sender);
     event RoleRevoked(bytes32 indexed role, address indexed account, address indexed sender);
 
+    /// Canonical (Arachnid) CREATE2 deployer — a permissionless relay; never a valid role holder.
+    address internal constant CREATE2_DEPLOYER = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
+
     error Unauthorized(bytes32 role, address account);
     error LastAdmin();
+    error ZeroRoleHolder();
+    error Create2DeployerAsHolder();
 
-    constructor() {
-        _grant(DEFAULT_ADMIN_ROLE, msg.sender);
+    /// @param initialAdmin the sole initial DEFAULT_ADMIN_ROLE holder (non-zero, not the CREATE2 relay)
+    constructor(address initialAdmin) {
+        _requireHolder(initialAdmin);
+        _grantAs(DEFAULT_ADMIN_ROLE, initialAdmin, address(0));
+    }
+
+    /// @dev Reject the zero address and the CREATE2 relay as an initial role holder.
+    function _requireHolder(address account) internal pure {
+        if (account == address(0)) revert ZeroRoleHolder();
+        if (account == CREATE2_DEPLOYER) revert Create2DeployerAsHolder();
     }
 
     modifier onlyRole(bytes32 role) {
@@ -55,10 +72,17 @@ abstract contract Auth {
     }
 
     function _grant(bytes32 role, address account) internal {
+        _grantAs(role, account, msg.sender);
+    }
+
+    /// @dev Grant with an explicit `sender` for the event. Constructors use this with
+    ///      `sender = address(0)` (a construction-time grant from an explicit argument), so no
+    ///      code path reachable from a constructor reads `msg.sender`.
+    function _grantAs(bytes32 role, address account, address sender) internal {
         if (!_roles[role][account]) {
             if (role == DEFAULT_ADMIN_ROLE) _adminCount += 1;
             _roles[role][account] = true;
-            emit RoleGranted(role, account, msg.sender);
+            emit RoleGranted(role, account, sender);
         }
     }
 }

@@ -155,6 +155,23 @@ abstract contract AdminChecks {
         require(ok && has, string.concat(name, ": intended key lacks DEFAULT_ADMIN_ROLE"));
     }
 
+    /// @notice Revert unless `expected` holds DEFAULT_ADMIN_ROLE on `target` and NO address in
+    ///         `others` does. For contracts whose initial admin is a constructor argument: checks
+    ///         the actual accounts that took part in the deploy (configured deployer, the real
+    ///         broadcaster, the CREATE2 factory), not only the one the script was told about.
+    function _assertSoleAdminAmong(string memory name, address target, address expected, address[] memory others)
+        internal
+        view
+    {
+        _assertAdminRole(name, target, expected);
+        for (uint256 i = 0; i < others.length; i++) {
+            require(others[i] != expected, string.concat(name, ": intended admin is also a deploy account"));
+            (bool ok, bool has) =
+                _readBool(target, abi.encodeWithSignature("hasRole(bytes32,address)", DEFAULT_ADMIN_ROLE, others[i]));
+            require(ok && !has, string.concat(name, ": a deploy account holds DEFAULT_ADMIN_ROLE"));
+        }
+    }
+
     /// @notice Revert unless `owner()` is exactly `expected`.
     function _assertOwner(string memory name, address target, address expected) internal view {
         _assertNoFactoryAdmin(name, target);

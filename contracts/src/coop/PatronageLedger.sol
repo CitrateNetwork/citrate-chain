@@ -1,10 +1,10 @@
 // ── VENDORED: DO NOT EDIT. Change upstream, then re-vendor with a new header. ─────
 // Source:    CitrateNetwork/citrate-coop contracts/src/PatronageLedger.sol
-// Upstream:  github.com/CitrateNetwork/citrate-coop @ 99b2d0d29d38e0576c0118e083c5de48747cc3ba
-//            (fetched from GitHub main, not from a local copy), vendored 2026-10-19.
-// Includes:  PBA R2 remediation (citrate-coop #3, 3d4aaae6) and the Apache-2.0 relicense.
+// Upstream:  github.com/CitrateNetwork/citrate-coop @ 34f6283837c6fae2a6a4500509783c876b1008ea
+//            (branch fix/explicit-initial-admin; re-vendor from main after it merges), vendored 2026-10-18.
+// Includes:  PBA R2 remediation (citrate-coop #3), Apache-2.0 relicense, explicit initial admin/registrar.
 // Integrity: every line after this 10-line header is byte-identical to upstream:
-//            `tail -n +11 <this file> | sha256sum` == 51b741248c235861fdc6d0685f8fcce4307e1e173e68960f5d2b0076295ea3d2
+//            `tail -n +11 <this file> | sha256sum` == b7a3efd84e3ff73d7ce3a70df059dd986a1fa763bdf9eed7c9065582d549d263
 // Why:       C2 D9 / C4: deployed dormant at betanet genesis by the citrate-chain
 //            ceremony (script/DeployDormantLedgers.s.sol).
 // ───────────────────────────────────────────────────────────────────────────────────
@@ -92,7 +92,8 @@ contract PatronageLedger is Auth {
     error ComputeTooLarge();  // PBA-L2-040 B-019
     error BadWeights();       // PBA-L2-040 B-018
 
-    constructor(address kycRegistry, address membership_) {
+    /// @param initialAdmin sole initial DEFAULT_ADMIN_ROLE holder (explicit; see Auth)
+    constructor(address kycRegistry, address membership_, address initialAdmin) Auth(initialAdmin) {
         kyc = IKYCRegistry(kycRegistry);
         membership = IMembership(membership_);
     }

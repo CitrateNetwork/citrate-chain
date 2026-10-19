@@ -1,10 +1,10 @@
 // ── VENDORED: DO NOT EDIT. Change upstream, then re-vendor with a new header. ─────
 // Source:    CitrateNetwork/citrate-coop contracts/src/MembershipSBT.sol
-// Upstream:  github.com/CitrateNetwork/citrate-coop @ 99b2d0d29d38e0576c0118e083c5de48747cc3ba
-//            (fetched from GitHub main, not from a local copy), vendored 2026-10-19.
-// Includes:  PBA R2 remediation (citrate-coop #3, 3d4aaae6) and the Apache-2.0 relicense.
+// Upstream:  github.com/CitrateNetwork/citrate-coop @ 34f6283837c6fae2a6a4500509783c876b1008ea
+//            (branch fix/explicit-initial-admin; re-vendor from main after it merges), vendored 2026-10-18.
+// Includes:  PBA R2 remediation (citrate-coop #3), Apache-2.0 relicense, explicit initial admin/registrar.
 // Integrity: every line after this 10-line header is byte-identical to upstream:
-//            `tail -n +11 <this file> | sha256sum` == 93b4438487b43cab961a57a62c5c4b3993c77e2280924fadcb2c3637ff5df936
+//            `tail -n +11 <this file> | sha256sum` == b3f73e20e2f6286388e3b7262a410df283277b4ba8ed6776032b8bd6f37590cb
 // Why:       C2 D9 / C4: deployed dormant at betanet genesis by the citrate-chain
 //            ceremony (script/DeployDormantLedgers.s.sol).
 // ───────────────────────────────────────────────────────────────────────────────────
@@ -71,10 +71,16 @@ contract MembershipSBT is Auth {
     error HookAlreadySet();
     error ZeroHook();
 
-    constructor(address kycRegistry, bytes32[] memory modelIds) {
+    /// @param initialAdmin     sole initial DEFAULT_ADMIN_ROLE holder (see Auth)
+    /// @param initialRegistrar sole initial REGISTRAR_ROLE holder (bootstrap onboarding). Explicit —
+    ///                         never `msg.sender` — for the same reason as the admin.
+    constructor(address kycRegistry, bytes32[] memory modelIds, address initialAdmin, address initialRegistrar)
+        Auth(initialAdmin)
+    {
+        _requireHolder(initialRegistrar);
         kyc = IKYCRegistry(kycRegistry);
         projectModelIds = modelIds;
-        _grant(REGISTRAR_ROLE, msg.sender);
+        _grantAs(REGISTRAR_ROLE, initialRegistrar, address(0)); // construction-time grant (see Auth)
     }
 
     // --- minting / membership ---

@@ -12,6 +12,7 @@ import {MembershipSBT} from "../../src/coop/MembershipSBT.sol";
 import {Auth} from "../../src/coop/lib/Auth.sol";
 import {KYCRegistry} from "../../src/KYCRegistry.sol";
 import {MultisigProposer} from "../../src/genesis/MultisigProposer.sol";
+import {AdminChecks} from "../../script/lib/AdminChecks.sol";
 
 /// @title DeployDormantLedgers.t: FederatedRoundLedger + PatronageLedger at genesis (C2 D9 / C4)
 contract DeployDormantLedgersTest is Test {
@@ -40,7 +41,7 @@ contract DeployDormantLedgersTest is Test {
             false
         );
         kyc = new KYCRegistry(address(0), makeAddr("kyc-admin"));
-        membership = new MembershipSBT(address(kyc), new bytes32[](0));
+        membership = new MembershipSBT(address(kyc), new bytes32[](0), makeAddr("sbt-admin"), makeAddr("sbt-registrar"));
     }
 
     function _deploy() internal returns (DeployDormantLedgers.Deployed memory d) {
@@ -52,7 +53,7 @@ contract DeployDormantLedgersTest is Test {
         DeployDormantLedgers.Deployed memory d = _deploy();
         PatronageLedger l = PatronageLedger(d.patronageLedger);
         assertTrue(l.hasRole(l.DEFAULT_ADMIN_ROLE(), gov.governanceTimelock));
-        assertFalse(l.hasRole(l.DEFAULT_ADMIN_ROLE(), SENDER), "deployer admin revoked");
+        assertFalse(l.hasRole(l.DEFAULT_ADMIN_ROLE(), SENDER), "deployer never holds admin");
         assertFalse(l.hasRole(l.DEFAULT_ADMIN_ROLE(), 0x4e59b44847b379578588920cA78FbF26c0B4956C));
         bytes32[3] memory ops = [l.SETTLER_ROLE(), l.COOP_ROLE(), l.YEAR_KEEPER_ROLE()];
         for (uint256 i = 0; i < 3; i++) {
@@ -189,12 +190,49 @@ contract DeployDormantLedgersTest is Test {
         vm.removeFile(out);
     }
 
-    /// Before the hand-over the gate catches a deployer-administered PatronageLedger.
+    /// chain#320 P1 regression: DEPLOYER_ADDRESS names A but Forge broadcasts as B. The script
+    /// must refuse before sending anything (previously B became the constructor admin, "revoked"
+    /// A who never held it, and every check that only looked at A passed).
+    function test_reverts_when_broadcaster_is_not_the_configured_deployer() public {
+        address configured = makeAddr("configured-deployer-A");
+        DeployDormantLedgers s = new DeployDormantLedgers();
+        uint64 nonceBefore = vm.getNonce(SENDER);
+        vm.expectRevert(bytes("broadcast sender is not the configured deployer (DEPLOYER_ADDRESS)"));
+        s.deployWith(configured, gov.governanceTimelock, address(kyc), address(membership)); // broadcasts as SENDER (B)
+        assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
+    }
+
+    // No env-driven (`run`) variant: DEPLOYER_ADDRESS is process-global and other suites set it
+    // concurrently. `run` passes deployerAddress() straight to deployWith, so the check above
+    // is the same code path.
+
+    /// The admin postcondition checks the ACTUAL deploy accounts, not only the configured one:
+    /// a ledger whose admin is the broadcaster / factory / anyone but governance is refused.
+    function test_sole_admin_postcondition_rejects_any_deploy_account_admin() public {
+        AdminChecksHarness h = new AdminChecksHarness();
+        address b = makeAddr("broadcaster-B");
+        address[] memory others = new address[](3);
+        (others[0], others[1], others[2]) = (SENDER, b, 0x4e59b44847b379578588920cA78FbF26c0B4956C);
+
+        PatronageLedger good = new PatronageLedger(address(kyc), address(membership), gov.governanceTimelock);
+        h.soleAdminAmong(address(good), gov.governanceTimelock, others); // passes
+
+        PatronageLedger heldByB = new PatronageLedger(address(kyc), address(membership), b);
+        vm.expectRevert(bytes("PatronageLedger: intended key lacks DEFAULT_ADMIN_ROLE"));
+        h.soleAdminAmong(address(heldByB), gov.governanceTimelock, others);
+
+        // B is admin AND governance was granted too: still refused (B kept admin).
+        vm.prank(b);
+        heldByB.grantRole(0x00, gov.governanceTimelock);
+        vm.expectRevert(bytes("PatronageLedger: a deploy account holds DEFAULT_ADMIN_ROLE"));
+        h.soleAdminAmong(address(heldByB), gov.governanceTimelock, others);
+    }
+
+    /// The gate catches a deployer-administered PatronageLedger.
     function test_admin_gate_flags_a_ledger_still_held_by_the_deployer() public {
         vm.etch(P256_VERIFIER, hex"600160005260206000f3");
         address deployer = makeAddr("deployer");
-        vm.prank(deployer);
-        PatronageLedger held = new PatronageLedger(address(kyc), address(membership));
+        PatronageLedger held = new PatronageLedger(address(kyc), address(membership), deployer);
         string memory book = string.concat(
             '{"deployer":"',
             vm.toString(deployer),
@@ -205,5 +243,11 @@ contract DeployDormantLedgersTest is Test {
         CheckDeployedAdmins c = new CheckDeployedAdmins();
         vm.expectRevert(bytes("CheckDeployedAdmins: deployer EOA holds governance/owner/DEFAULT_ADMIN (see log)"));
         c.check(book, false);
+    }
+}
+
+contract AdminChecksHarness is AdminChecks {
+    function soleAdminAmong(address target, address expected, address[] memory others) external view {
+        _assertSoleAdminAmong("PatronageLedger", target, expected, others);
     }
 }

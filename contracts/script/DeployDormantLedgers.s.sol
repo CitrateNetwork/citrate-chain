@@ -22,19 +22,26 @@ import {PatronageLedger} from "../src/coop/PatronageLedger.sol";
 ///           does not read it until wired.
 ///
 ///         PatronageLedger (vendored from citrate-coop, src/coop/): plain CREATE from the
-///           deployer, NOT CREATE2. Its `Auth` constructor grants DEFAULT_ADMIN_ROLE to
-///           `msg.sender`, which under a salted deploy is the Arachnid factory (the
-///           PBA-L2-002 orphaning). Under CREATE the deployer is admin; the script then
-///           grants DEFAULT_ADMIN_ROLE to GOVERNANCE_TIMELOCK and revokes its own. No
+///           deployer, NOT CREATE2. Its `Auth` constructor takes the initial DEFAULT_ADMIN
+///           explicitly (it never reads `msg.sender`), and the script passes
+///           GOVERNANCE_TIMELOCK directly, so there is no deployer-held admin and no
+///           hand-over step: the broadcaster never holds any role, even transiently. No
 ///           SETTLER / COOP / LEDGER_YEAR_KEEPER role is granted to anyone. Its address
-///           therefore depends on the deployer nonce, and every run deploys a new instance:
-///           take the address from DORMANT_LEDGERS_OUT, do not re-run to "reuse".
+///           depends on the deployer nonce, and every run deploys a new instance: take the
+///           address from DORMANT_LEDGERS_OUT, do not re-run to "reuse".
+///
+///         Fail closed on signer mismatch: the account Forge actually broadcasts as must be
+///           the configured deployer (CEREMONY_DEPLOYER_ADDRESS / DEPLOYER_ADDRESS), or the
+///           script reverts before sending anything. Postconditions then check, on the live
+///           ledger, that GOVERNANCE_TIMELOCK is admin and that none of {configured deployer,
+///           actual broadcaster, CREATE2 factory, this script} holds DEFAULT_ADMIN_ROLE.
 ///
 ///         Required env: GOVERNANCE_TIMELOCK (an OZ TimelockController, e.g. the
 ///         GovernanceTimelock from DeployGenesisGovernance), PATRONAGE_KYC_REGISTRY and
 ///         PATRONAGE_MEMBERSHIP (the KYC registry and membership contract PatronageLedger
 ///         reads; both immutable, both must have code), DORMANT_LEDGERS_OUT, and
-///         CEREMONY_DEPLOYER_ADDRESS or DEPLOYER_ADDRESS (the forge signer).
+///         CEREMONY_DEPLOYER_ADDRESS or DEPLOYER_ADDRESS (must equal the forge
+///         broadcast signer; enforced).
 contract DeployDormantLedgers is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook {
     string internal constant FRL = "FederatedRoundLedger";
 
@@ -69,18 +76,22 @@ contract DeployDormantLedgers is ScriptEnv, AdminChecks, Create2Deploy, GenesisB
         console.log("Governance timelock:", governance);
 
         vm.startBroadcast();
+        // The account Forge signs with is chosen by CLI flags (--sender / --private-key /
+        // --account), not by DEPLOYER_ADDRESS. Every postcondition and the address-book gate are
+        // phrased in terms of the configured deployer, so a different broadcaster would escape
+        // them: refuse to send anything unless the two agree.
+        (, address broadcaster,) = vm.readCallers();
+        require(broadcaster == deployer, "broadcast sender is not the configured deployer (DEPLOYER_ADDRESS)");
         bytes memory frlInit = type(FederatedRoundLedger).creationCode;
         d.federatedRoundLedger = _isLive(FRL, frlInit)
             ? _create2Address(FRL, frlInit)
             : address(new FederatedRoundLedger{salt: Salts.salt(FRL)}());
 
-        PatronageLedger ledger = new PatronageLedger(kyc, membership);
-        ledger.grantRole(ledger.DEFAULT_ADMIN_ROLE(), governance);
-        ledger.revokeRole(ledger.DEFAULT_ADMIN_ROLE(), deployer);
-        d.patronageLedger = address(ledger);
+        // GOVERNANCE_TIMELOCK is the explicit initial admin: nothing to hand over or revoke.
+        d.patronageLedger = address(new PatronageLedger(kyc, membership, governance));
         vm.stopBroadcast();
 
-        _assertDormant(d, deployer, governance, kyc, membership);
+        _assertDormant(d, deployer, broadcaster, governance, kyc, membership);
         console.log("FederatedRoundLedger:", d.federatedRoundLedger);
         console.log("PatronageLedger     :", d.patronageLedger);
     }
@@ -99,23 +110,31 @@ contract DeployDormantLedgers is ScriptEnv, AdminChecks, Create2Deploy, GenesisB
         return ok && ret.length == 32;
     }
 
-    function _assertDormant(Deployed memory d, address deployer, address governance, address kyc, address membership)
-        internal
-        view
-    {
+    function _assertDormant(
+        Deployed memory d,
+        address deployer,
+        address broadcaster,
+        address governance,
+        address kyc,
+        address membership
+    ) internal view {
         require(d.federatedRoundLedger.code.length != 0, "FederatedRoundLedger: no code");
         _assertNoFactoryAdmin("FederatedRoundLedger", d.federatedRoundLedger);
         _assertNoDeployerAdmin("FederatedRoundLedger", d.federatedRoundLedger, deployer);
 
         PatronageLedger ledger = PatronageLedger(d.patronageLedger);
-        _assertAdminRole("PatronageLedger", d.patronageLedger, governance);
+        address[] memory notAdmin = new address[](4);
+        (notAdmin[0], notAdmin[1], notAdmin[2], notAdmin[3]) = (deployer, broadcaster, ARACHNID_FACTORY, address(this));
+        _assertSoleAdminAmong("PatronageLedger", d.patronageLedger, governance, notAdmin);
         _assertNoDeployerAdmin("PatronageLedger", d.patronageLedger, deployer);
+        _assertNoDeployerAdmin("PatronageLedger", d.patronageLedger, broadcaster);
         require(address(ledger.kyc()) == kyc, "PatronageLedger: kyc mismatch");
         require(address(ledger.membership()) == membership, "PatronageLedger: membership mismatch");
         bytes32[3] memory ops = [ledger.SETTLER_ROLE(), ledger.COOP_ROLE(), ledger.YEAR_KEEPER_ROLE()];
         for (uint256 i = 0; i < 3; i++) {
             require(
-                !ledger.hasRole(ops[i], deployer) && !ledger.hasRole(ops[i], governance),
+                !ledger.hasRole(ops[i], deployer) && !ledger.hasRole(ops[i], broadcaster)
+                    && !ledger.hasRole(ops[i], governance),
                 "PatronageLedger: an operational role is wired (not dormant)"
             );
         }
