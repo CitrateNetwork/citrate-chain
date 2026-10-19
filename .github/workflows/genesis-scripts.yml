@@ -1,15 +1,16 @@
 name: genesis-scripts
 
 # scripts/genesis/: the ceremony tooling (keep_check, fleet_agree, reset_node, ceremony).
-# The tests use fake cast/forge/systemctl in a temp dir: no network, no chain, no keys. One
-# integration case runs the real admin checker against a local anvil (Foundry, below).
+# The tests use fake cast/forge/systemctl in a temp dir: no network, no chain, no keys. The
+# integration cases run the real admin checker, and a fresh-genesis P2/P5 through the real
+# regenesis.sh and address-book generator, against local anvil chains (Foundry, below).
 
 on:
   push:
     branches: [main]
-    paths: ['scripts/genesis/**', 'scripts/ops/regenesis.sh', 'contracts/script/CheckDeployedAdmins.s.sol', 'contracts/script/lib/AdminChecks.sol', '.github/workflows/genesis-scripts.yml']
+    paths: ['scripts/genesis/**', 'scripts/ops/regenesis.sh', 'scripts/ops/emit-address-table.sh', 'scripts/ci/check-create2-determinism.sh', 'contracts/script/DeployValidatorRegistry.s.sol', 'contracts/script/DeployCoreMembership.s.sol', 'contracts/script/CheckDeployedAdmins.s.sol', 'contracts/script/lib/AdminChecks.sol', '.github/workflows/genesis-scripts.yml']
   pull_request:
-    paths: ['scripts/genesis/**', 'scripts/ops/regenesis.sh', 'contracts/script/CheckDeployedAdmins.s.sol', 'contracts/script/lib/AdminChecks.sol', '.github/workflows/genesis-scripts.yml']
+    paths: ['scripts/genesis/**', 'scripts/ops/regenesis.sh', 'scripts/ops/emit-address-table.sh', 'scripts/ci/check-create2-determinism.sh', 'contracts/script/DeployValidatorRegistry.s.sol', 'contracts/script/DeployCoreMembership.s.sol', 'contracts/script/CheckDeployedAdmins.s.sol', 'contracts/script/lib/AdminChecks.sol', '.github/workflows/genesis-scripts.yml']
   workflow_dispatch:
 
 permissions:
@@ -21,12 +22,18 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: shellcheck
-        run: shellcheck -x -S warning scripts/genesis/*.sh scripts/genesis/tests/*.sh
+        run: shellcheck -x -S warning scripts/genesis/*.sh scripts/genesis/tests/*.sh scripts/ops/regenesis.sh scripts/ops/emit-address-table.sh
+      # The fresh-genesis end-to-end case compiles the real ValidatorRegistry and membership
+      # contracts, which import OpenZeppelin (a submodule); without it that case is skipped.
+      - name: openzeppelin submodule
+        run: git submodule update --init --depth 1 contracts/lib/openzeppelin-contracts
       # The P5 integration case runs the real CheckDeployedAdmins under forge against a local
       # anvil; without Foundry it is skipped.
       - name: foundry
         uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
         with:
           version: v1.8.3
-      - name: tests (offline)
+      - name: tests (offline + anvil integration)
+        env:
+          GENESIS_E2E_REQUIRED: "1" # a skipped integration case fails the job here
         run: bash scripts/genesis/tests/test_genesis_scripts.sh

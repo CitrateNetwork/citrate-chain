@@ -9,7 +9,10 @@
 #   P1  governance     DeployGenesisGovernance: GOVERNANCE + GUARDIAN timelocks, each
 #                      fronted by an m-of-n MultisigProposer; deployer renounces in-run
 #   P2  stack          scripts/ops/regenesis.sh --reroll --with-aa (registries, VR, AA,
-#                      membership), with GOVERNANCE/GUARDIAN taken from P1's output
+#                      membership), with GOVERNANCE/GUARDIAN taken from P1's output; its
+#                      address book comes from emit-address-table.sh in fresh-genesis mode
+#                      (this run's deployer and broadcasts only) and, on --confirm, is
+#                      re-derived, checked against the broadcasts and recorded (C8)
 #   P3  vesting        DeployTeamVesting from the owner's TEAM_VESTING_FILE
 #   P4  dormant        DeployDormantLedgers (FederatedRoundLedger, PatronageLedger)
 #   P5  admins         CheckDeployedAdmins over ONE merged book (the book + the P1/P3/P4
@@ -76,6 +79,15 @@
 #      first use) and P6 refuses another; keep_check matches each row's contract_name to the
 #      broadcast deployments at its pinned address.
 #   C7 fleet on this run's block 0 (P7).
+#   C8 stack book = generator output: P2 runs the generator (scripts/ops/emit-address-table.sh,
+#      via regenesis.sh) with EMIT_FRESH_GENESIS=1, EMIT_DEPLOYER = the manifest's deployer,
+#      EMIT_BROADCAST_SINCE = its block-0 timestamp and EMIT_OUTPUT = ADDRESS_BOOK; a different
+#      preset of any of them (or of DEPLOYER) fails P2 before anything is sent. After a
+#      --confirm P2 the ceremony re-runs the generator into a scratch file and requires the
+#      same book byte for byte, requires the book's deployer, ValidatorRegistry and membership
+#      entries (SBT, MemberBond, vault implementation, vault proxy, root aliases) to be this
+#      run's broadcasts, and records the book in the manifest (stackBook). P5 and P6 read only
+#      that book on --confirm (and check it whenever it is recorded).
 #
 # Output books: P1/P3/P4 write governance.json, team-vesting.json and dormant-ledgers.json
 # into GENESIS_OUT_DIR, and P2/P4/P5 read them from the same place; every producer and
@@ -157,6 +169,8 @@ GOV_BOOK="$CONTRACTS/$GOV_REL"
 VEST_BOOK="$CONTRACTS/$VEST_REL"
 DORMANT_BOOK="$CONTRACTS/$DORMANT_REL"
 RUN_MANIFEST="$OUT/ceremony-run.json"
+EMITTER="${EMITTER:-$REPO_ROOT/scripts/ops/emit-address-table.sh}"
+book_abs=$(norm_path "$ADDRESS_BOOK") || die "cannot resolve ADDRESS_BOOK $ADDRESS_BOOK" 1
 
 idx() {
   local i
@@ -403,6 +417,105 @@ count_owners_list() { # comma-separated list -> distinct non-empty lowercased en
   printf '%s' "$1" | tr ',' '\n' | sed 's/[[:space:]]//g' | { grep -v '^$' || true; } | tr 'A-F' 'a-f' | sort -u
 }
 
+# stack_book_json <book>: the part of the address book the gates depend on (deployer,
+# contracts, aaStack and the membership root aliases), compact, lowercased, sorted.
+stack_book_json() {
+  "$PY" - "$1" <<'PY' 2>/dev/null
+import json, re, sys
+ADDR = re.compile(r"0x[0-9a-fA-F]{40}")
+b = json.load(open(sys.argv[1]))
+dep = b.get("deployer")
+assert isinstance(dep, str) and ADDR.fullmatch(dep)
+out = {"deployer": dep.lower()}
+for sec in ("contracts", "aaStack"):
+    d = b.get(sec, {})
+    assert isinstance(d, dict) and all(isinstance(v, str) and ADDR.fullmatch(v) for v in d.values())
+    out[sec] = {k: v.lower() for k, v in d.items()}
+for k in ("CitrateMemberSBT", "MembershipStakeVault"):
+    if k in b:
+        assert isinstance(b[k], str) and ADDR.fullmatch(b[k])
+        out["root." + k] = b[k].lower()
+print(json.dumps(out, sort_keys=True, separators=(",", ":")))
+PY
+}
+
+# stack_book_bound <phase> <require 0|1>: C8 for a reader of ADDRESS_BOOK. The book must be the
+# one P2 recorded in the run manifest; with require=1 a manifest without one fails.
+stack_book_bound() {
+  local ph="$1" sb why
+  if ! manifest_has "$RUN_MANIFEST" stackBook; then
+    [[ "$2" == 1 ]] && gate_fail "$ph" "the run manifest records no stack book: run P2 with --confirm in this run first"
+    log "$ph note: no stack book recorded in this run's manifest; $ADDRESS_BOOK is not bound to a P2 run"
+    return 0
+  fi
+  sb=$(stack_book_json "$ADDRESS_BOOK") || gate_fail "$ph" "$ADDRESS_BOOK is not a well-formed address book"
+  why=$(manifest_bind check "$RUN_MANIFEST" stackBook "$sb" 2>&1) ||
+    gate_fail "$ph" "$ADDRESS_BOOK is not the stack book this run's P2 generated: $why"
+  log "$ph address book is the stack book P2 generated and recorded"
+}
+
+# verify_stack_book: C8 after a --confirm P2 (see the header).
+verify_stack_book() {
+  local check why sb
+  [[ -f "$book_abs" ]] || gate_fail P2 "$ADDRESS_BOOK missing after regenesis.sh: the generator did not write it"
+  check="$OUT/stack-book.check.json"
+  rm -f "$check"
+  EMIT_FRESH_GENESIS=1 EMIT_DEPLOYER="$RUN_DEPLOYER" EMIT_BROADCAST_SINCE="$RUN_G0TS" EMIT_OUTPUT="$check" \
+    bash "$EMITTER" >"$OUT/stack-book.check.log" 2>&1 ||
+    gate_fail P2 "re-running the generator failed (see $OUT/stack-book.check.log)"
+  why=$("$PY" - "$book_abs" "$check" "$RUN_DEPLOYER" "$CONTRACTS/broadcast" "$EXPECTED_CHAIN_ID" "$RUN_G0TS" <<'PY' 2>&1
+import json, sys
+book_p, check_p, dep, bdir, cid, since = sys.argv[1:7]
+since = int(since)
+book, check = json.load(open(book_p)), json.load(open(check_p))
+if book != check:
+    diff = sorted(k for k in set(book) | set(check) if book.get(k) != check.get(k))
+    sys.exit(f"the book differs from what the generator emits for this run (keys: {', '.join(diff)})")
+if str(book.get("deployer", "")).lower() != dep:
+    sys.exit(f"the book names deployer {book.get('deployer')!r}, not this run's {dep}")
+def deployed(script, with_names):
+    p = f"{bdir}/{script}/{cid}/run-latest.json"
+    try:
+        run = json.load(open(p))
+    except (OSError, ValueError) as e:
+        sys.exit(f"cannot read this run's {script} broadcast: {e}")
+    ts = run.get("timestamp")
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+        sys.exit(f"{p} has no timestamp")
+    if (ts / 1000 if ts > 10**12 else ts) < since:
+        sys.exit(f"{p} was recorded before this chain's block 0")
+    got = {}
+    for tx in run.get("transactions") or []:
+        if tx.get("transactionType") in ("CREATE", "CREATE2") and tx.get("contractName") in with_names and tx.get("contractAddress"):
+            got[tx["contractName"]] = tx["contractAddress"].lower()
+    return got
+c = {k: v.lower() for k, v in book.get("contracts", {}).items()}
+vr = deployed("DeployValidatorRegistry.s.sol", {"ValidatorRegistry"})
+m = deployed("DeployCoreMembership.s.sol", {"CitrateMemberSBT", "MemberBond", "MembershipStakeVault", "ERC1967Proxy"})
+want = {
+    "ValidatorRegistry": vr.get("ValidatorRegistry"),
+    "CitrateMemberSBT": m.get("CitrateMemberSBT"),
+    "MemberBond": m.get("MemberBond"),
+    "MembershipStakeVaultImpl": m.get("MembershipStakeVault"),
+    "MembershipStakeVault": m.get("ERC1967Proxy"),
+}
+for k, v in want.items():
+    if not v:
+        sys.exit(f"this run's broadcasts deployed no {k}")
+    if c.get(k) != v:
+        sys.exit(f"the book's {k} is {c.get(k)}, this run deployed {v}")
+for k in ("CitrateMemberSBT", "MembershipStakeVault"):
+    if str(book.get(k, "")).lower() != want[k]:
+        sys.exit(f"the book's root alias {k} is {book.get(k)!r}, this run deployed {want[k]}")
+print(f"ValidatorRegistry {want['ValidatorRegistry']}, CitrateMemberSBT {want['CitrateMemberSBT']}, MembershipStakeVault {want['MembershipStakeVault']} (impl {want['MembershipStakeVaultImpl']})")
+PY
+  ) || gate_fail P2 "stack book: $why"
+  log "P2 stack book = generator output for this run: $why"
+  sb=$(stack_book_json "$book_abs") || gate_fail P2 "$ADDRESS_BOOK is not a well-formed address book"
+  why=$(manifest_bind bind "$RUN_MANIFEST" stackBook "$sb" 2>&1) || gate_fail P2 "cannot record the stack book: $why"
+  rm -f "$check"
+}
+
 log "mode=$MODE from=$FROM${ONLY:+ only=$ONLY} chain=$EXPECTED_CHAIN_ID"
 
 # The governance addresses every later phase uses come from P1's output, never from a constant.
@@ -570,11 +683,32 @@ if should P2; then
   rargs=(--reroll --with-aa)
   # regenesis.sh takes --account only; the keystore password comes from forge's own prompt.
   if [[ "$MODE" == confirm ]]; then rargs+=(--broadcast --account "$ACCOUNT"); fi
-  log "P2 contract stack via regenesis.sh"
+  log "P2 contract stack via regenesis.sh; address book → $ADDRESS_BOOK (fresh genesis)"
   if [[ "$MODE" == dry ]]; then
-    describe_cmd RPC_URL='$RPC_URL' DEPLOYER_ADDRESS='$DEPLOYER_ADDRESS' bash "$REGENESIS" "${rargs[@]}"
+    describe_cmd RPC_URL='$RPC_URL' DEPLOYER_ADDRESS='$DEPLOYER_ADDRESS' EMIT_FRESH_GENESIS=1 EMIT_DEPLOYER='<manifest deployer>' \
+      EMIT_BROADCAST_SINCE='<manifest block-0 timestamp>' EMIT_OUTPUT="$book_abs" bash "$REGENESIS" "${rargs[@]}"
   else
+    # C8: the generator gets this run's deployer, block 0 and book path; a preset that says
+    # otherwise is refused before anything is sent.
+    is_addr "${RUN_DEPLOYER:-}" && [[ "${RUN_G0TS:-}" =~ ^[0-9]+$ ]] || gate_fail P2 "no run deployer or block-0 timestamp (the P0 run manifest did not load)"
+    for v in DEPLOYER EMIT_DEPLOYER; do
+      if [[ -n "${!v:-}" && "$(lower "${!v}")" != "$RUN_DEPLOYER" ]]; then
+        gate_fail P2 "$v is set to ${!v}, but this run's deployer is $RUN_DEPLOYER; unset it: the ceremony sets the generator's deployer from the run manifest"
+      fi
+    done
+    [[ -z "${EMIT_OUTPUT:-}" || "$(norm_path "$EMIT_OUTPUT")" == "$book_abs" ]] ||
+      gate_fail P2 "EMIT_OUTPUT is set to $EMIT_OUTPUT, but the ceremony's book is $ADDRESS_BOOK"
+    [[ -z "${EMIT_BROADCAST_SINCE:-}" || "$EMIT_BROADCAST_SINCE" == "$RUN_G0TS" ]] ||
+      gate_fail P2 "EMIT_BROADCAST_SINCE is set to $EMIT_BROADCAST_SINCE, but this run's block 0 is at $RUN_G0TS"
+    [[ -z "${EMIT_FRESH_GENESIS:-}" || "$EMIT_FRESH_GENESIS" == 1 ]] ||
+      gate_fail P2 "EMIT_FRESH_GENESIS is set to $EMIT_FRESH_GENESIS; a genesis ceremony always regenerates a fresh book"
+    export EMIT_FRESH_GENESIS=1 EMIT_DEPLOYER="$RUN_DEPLOYER" EMIT_BROADCAST_SINCE="$RUN_G0TS" EMIT_OUTPUT="$book_abs"
     RPC_URL="$RPC_URL" bash "$REGENESIS" "${rargs[@]}" || step_fail P2 regenesis.sh
+    if [[ "$MODE" == confirm ]]; then
+      verify_stack_book
+    else
+      log "P2 note: a simulation broadcasts nothing, so regenesis.sh writes no book; $ADDRESS_BOOK is unchanged"
+    fi
   fi
 fi
 
@@ -655,6 +789,8 @@ if should P5; then
     else
       log "P5 note: no ValidatorRegistry in $ADDRESS_BOOK in a simulation; its governance is not checked"
     fi
+    # C8: the book swept here is the one P2 generated for this run.
+    stack_book_bound P5 "$([[ "$MODE" == confirm ]] && echo 1 || echo 0)"
     merged=$("$PY" - "$RUN_DEPLOYER" "$ADDRESS_BOOK" "$P5_BOOK" "${extras[@]}" <<'PY'
 import json, re, sys
 ADDR = re.compile(r"0x[0-9a-fA-F]{40}")
@@ -734,6 +870,7 @@ if should P6; then
     # timestamp is the run manifest's, which P0 re-checked against the chain.
     [[ "${RUN_G0TS:-}" =~ ^[0-9]+$ ]] || gate_fail P6 "no block-0 timestamp from the run manifest to scope the broadcast evidence"
     load_governance P6 1
+    stack_book_bound P6 "$([[ "$MODE" == confirm ]] && echo 1 || echo 0)"
     keep_sha=$(sha256sum "$KEEP_LIST" | cut -c1-64) || gate_fail P6 "cannot hash KEEP_LIST"
     why=$(manifest_bind bind "$RUN_MANIFEST" keepListSha256 "\"$keep_sha\"" 2>&1) || gate_fail P6 "KEEP list is not the one this run recorded: $why"
     RPC="$RPC_URL" ADDRESS_BOOK="$ADDRESS_BOOK" BROADCAST_DIR="$CONTRACTS/broadcast" BROADCAST_SINCE="$RUN_G0TS" \

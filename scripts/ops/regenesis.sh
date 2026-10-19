@@ -66,7 +66,7 @@ done
 
 command -v forge >/dev/null || die "forge not on PATH"
 command -v jq >/dev/null || die "jq is required"
-: "${RPC_URL:?set RPC_URL to the re-rolled chain's RPC}"
+: "${RPC_URL:?set RPC_URL to the RPC of the re-rolled chain}"
 : "${DEPLOYER_ADDRESS:?set DEPLOYER_ADDRESS (the fresh ceremony deployer; scripts read it)}"
 export CEREMONY_DEPLOYER_ADDRESS="${CEREMONY_DEPLOYER_ADDRESS:-$DEPLOYER_ADDRESS}"
 
@@ -151,9 +151,18 @@ fi
 # ---------------------------------------------------------------------------
 # Post: regenerate the canonical address table + verify CREATE2 determinism.
 # ---------------------------------------------------------------------------
+# The book names the deployer this run deployed with (EMIT_DEPLOYER), never a pin left in
+# .env.testnet. Under EMIT_FRESH_GENESIS=1 (the G5 genesis ceremony) a failed regeneration
+# stops the run: the ceremony's later gates read this book.
 if [[ "$BROADCAST" == "1" ]]; then
   log "regenerating canonical address table"
-  bash "${REPO_ROOT}/scripts/ops/emit-address-table.sh" || err "emit-address-table failed (continue: check manually)"
+  if ! EMIT_DEPLOYER="$DEPLOYER_ADDRESS" bash "${REPO_ROOT}/scripts/ops/emit-address-table.sh"; then
+    if [[ "${EMIT_FRESH_GENESIS:-0}" == "1" ]]; then
+      err "emit-address-table failed in a fresh genesis"
+      exit 2
+    fi
+    err "emit-address-table failed (continue: check manually)"
+  fi
 fi
 log "checking CREATE2 determinism"
 bash "${REPO_ROOT}/scripts/ci/check-create2-determinism.sh" || die "CREATE2 determinism check failed"

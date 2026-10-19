@@ -513,7 +513,7 @@ CE="$G/genesis_ceremony.sh"
 REPO="$T/repo"
 mkdir -p "$REPO/contracts/script" "$REPO/contracts/genesis" "$REPO/contracts/addresses" "$REPO/scripts/ops"
 for s in DeployGenesisGovernance DeployTeamVesting DeployDormantLedgers CheckDeployedAdmins; do : >"$REPO/contracts/script/$s.s.sol"; done
-printf '#!/usr/bin/env bash\necho "regenesis $*" >>"$FAKE/calls.log"\necho "regenesis-env vg=${VALIDATOR_GOVERNANCE:-} vs=${VALIDATOR_SLASHER:-} gov=${GOVERNANCE:-}" >>"$FAKE/calls.log"\n' >"$REPO/scripts/ops/regenesis.sh"
+printf '#!/usr/bin/env bash\necho "regenesis $*" >>"$FAKE/calls.log"\necho "regenesis-env vg=${VALIDATOR_GOVERNANCE:-} vs=${VALIDATOR_SLASHER:-} gov=${GOVERNANCE:-}" >>"$FAKE/calls.log"\necho "regenesis-emit fresh=${EMIT_FRESH_GENESIS:-} dep=${EMIT_DEPLOYER:-} since=${EMIT_BROADCAST_SINCE:-} out=${EMIT_OUTPUT:-}" >>"$FAKE/calls.log"\n' >"$REPO/scripts/ops/regenesis.sh"
 DEP=$(addr 1)
 printf '{"chainId":40204,"deployer":"%s","contracts":{"Alpha":"%s","Beta":"%s","Vault":"%s"},"aaStack":{},"Vault":"%s"}' "$DEP" "$A1" "$A2" "$A3" "$A3" >"$REPO/contracts/addresses/40204.json"
 # gov_book <dir> <deployer> [extra "Name":"0x..." pairs]: a P1-shaped governance output.
@@ -712,6 +712,40 @@ reset_calls
 expect "ceremony C4: a matching preset is accepted" 0 'done \(mode=simulate\)' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 VALIDATOR_GOVERNANCE="$(addr 31 | tr 'a-f' 'A-F' | sed 's/^0X/0x/')" bash "$CE" --simulate --only P2
 calls | grep -q "^regenesis-env vg=$(addr 31) vs=$(addr 31) gov=$(addr 31)$" && ok "ceremony C4: regenesis gets VALIDATOR_GOVERNANCE and VALIDATOR_SLASHER = GOVERNANCE" ||
   bad "ceremony C4: regenesis gets VALIDATOR_GOVERNANCE and VALIDATOR_SLASHER = GOVERNANCE" "$(calls)"
+# C8 (Codex 527c80b): the generator regenesis.sh runs gets this run's deployer, block 0 and book
+# path in fresh-genesis mode; a preset that says otherwise stops P2 before anything is sent.
+calls | grep -q "^regenesis-emit fresh=1 dep=$DEP since=5000 out=$REPO/contracts/addresses/40204.json$" &&
+  ok "ceremony C8: regenesis gets the fresh-genesis generator inputs from the run manifest" ||
+  bad "ceremony C8: regenesis gets the fresh-genesis generator inputs from the run manifest" "$(calls)"
+for preset in "EMIT_DEPLOYER=$STALE:EMIT_DEPLOYER is set to 0x0+63, but this run's deployer is" \
+  "DEPLOYER=$STALE:DEPLOYER is set to 0x0+63, but this run's deployer is" \
+  "EMIT_OUTPUT=$T/elsewhere.json:EMIT_OUTPUT is set to .*elsewhere.json, but the ceremony's book is" \
+  "EMIT_BROADCAST_SINCE=4000:EMIT_BROADCAST_SINCE is set to 4000, but this run's block 0 is at 5000" \
+  "EMIT_FRESH_GENESIS=0:EMIT_FRESH_GENESIS is set to 0"; do
+  reset_calls
+  expect "ceremony C8: a conflicting ${preset%%=*} is refused before P2 runs" 3 "${preset#*:}" -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 "${preset%%:*}" bash "$CE" --simulate --only P2
+  if calls | grep -q '^regenesis'; then bad "ceremony C8: a refused ${preset%%=*} runs no regenesis" "$(calls)"; else ok "ceremony C8: a refused ${preset%%=*} runs no regenesis"; fi
+done
+reset_calls
+expect "ceremony C8: a matching EMIT_DEPLOYER preset is accepted" 0 'done \(mode=simulate\)' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EMIT_DEPLOYER="$DEP" bash "$CE" --simulate --only P2
+expect "ceremony C8: the dry run plans the fresh-genesis book" 0 'DRYRUN .*EMIT_FRESH_GENESIS=1 .*EMIT_OUTPUT=.*/contracts/addresses/40204.json bash .*regenesis.sh --reroll --with-aa' -- "${CEENV[@]}" bash "$CE" --only P2
+# C8 on P5/P6: once P2 recorded its book, a different book is refused; --confirm needs one.
+GBK="$REPO/contracts/addresses/40204.json"
+cp "$GBK" "$T/book.orig"
+mk_manifest "$GB"
+gov_book "$GB" "$DEP"
+python3 - "$GB/ceremony-run.json" "$GBK" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1])); b = json.load(open(sys.argv[2]))
+m["stackBook"] = {"deployer": b["deployer"].lower(), "contracts": {k: v.lower() for k, v in b["contracts"].items()},
+                  "aaStack": {}}
+json.dump(m, open(sys.argv[1], "w"))
+PY
+expect "ceremony C8: P5 passes over the recorded stack book" 0 'P5 address book is the stack book P2 generated' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+python3 -c 'import json,sys; b=json.load(open(sys.argv[1])); b["contracts"]["Alpha"]=sys.argv[2]; json.dump(b,open(sys.argv[1],"w"))' "$GBK" "$A2"
+expect "ceremony C8: P5 refuses a book other than the recorded stack book" 3 "is not the stack book this run's P2 generated" -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+cp "$T/book.orig" "$GBK"
+mk_manifest "$GB"
 # P5 reads the registry's authority from the chain: a stale EOA there fails the handover gate.
 VR=$(addr 123)
 printf '{"chainId":40204,"deployer":"%s","contracts":{"Alpha":"%s","Beta":"%s","Vault":"%s","ValidatorRegistry":"%s"},"aaStack":{},"Vault":"%s"}' "$DEP" "$A1" "$A2" "$A3" "$VR" "$A3" >"$T/book-vr.json"
@@ -735,6 +769,9 @@ mk_manifest "$GB" "$DEP" confirm deployer
 printf '{"deployer":"%s","contracts":{"VestingAlice":"%s"}}' "$DEP" "$(addr 71)" >"$GB/team-vesting.json"
 printf '{"deployer":"%s","contracts":{"FederatedRoundLedger":"%s","PatronageLedger":"%s"}}' "$DEP" "$(addr 81)" "$(addr 82)" >"$GB/dormant-ledgers.json"
 expect "ceremony C4: --confirm P5 needs a ValidatorRegistry in the book" 3 'has no ValidatorRegistry' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1 bash "$CE" --confirm --only P5 --account deployer
+vr_chain "$(addr 31)" "$(addr 31)" "$Z40"
+expect "ceremony C8: --confirm P5 needs a stack book recorded by P2" 3 'records no stack book' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1 ADDRESS_BOOK="$T/book-vr.json" bash "$CE" --confirm --only P5 --account deployer
+rm -rf "$FAKE/call/$VR"
 rm "$GB/team-vesting.json" "$GB/dormant-ledgers.json"
 
 # C3: every gate reads both councils from the chain and holds them to the validated inputs
@@ -849,6 +886,64 @@ expect "ceremony: P5 checks the nondefault dir's books" 0 'P5 PASS' -- "${CEENV[
 calls | grep -q '^forge-book genesis/run2/p5-admin-book.json$' && grep -q "$(addr 41)" "$RUN2/p5-admin-book.json" && ok "ceremony: P5 merges the nondefault dir's books" || bad "ceremony: P5 merges the nondefault dir's books" "$(calls)"
 rm -r "$RUN2"
 
+# ------------------------------------------------------------------ address-book generator
+# scripts/ops/emit-address-table.sh (what regenesis.sh runs and P2 verifies, C8) over synthetic
+# broadcasts in a temp repo. ENV_TESTNET points at a file inside the temp dir; the real one is
+# never read.
+GR="$T/genrepo"
+EMIT="$GR/scripts/ops/emit-address-table.sh"
+mkdir -p "$GR/scripts/ops" "$GR/contracts/addresses"
+cp "$G/../ops/emit-address-table.sh" "$EMIT"
+printf 'DEPLOYER_ADDRESS=%s\nCITRATE_AA_ENTRY_POINT=%s\n' "$(addr 4242)" "$(addr 4243)" >"$T/env.testnet"
+# bcast <script> <timestamp> <name:addr>...: a forge run-latest.json with CREATE2 rows.
+bcast() {
+  local f="$GR/contracts/broadcast/$1/40204/run-latest.json" ts="$2" rows="" r
+  shift 2
+  for r in "$@"; do rows+="${rows:+,}{\"transactionType\":\"CREATE2\",\"contractName\":\"${r%%:*}\",\"contractAddress\":\"${r#*:}\"}"; done
+  mkdir -p "$(dirname "$f")"
+  printf '{"timestamp":%s,"transactions":[%s]}\n' "$ts" "$rows" >"$f"
+}
+GBOOK="$GR/contracts/addresses/40204.json"
+stale_book() {
+  printf '{"chainId":40204,"deployer":"0x4250675F9015E65fC866F3a373F82bb9DFc000c6","contracts":{"ValidatorRegistry":"%s","CitrateMemberSBT":"%s","MemberBond":"%s","MembershipStakeVaultImpl":"%s","MembershipStakeVault":"%s","AnchorRegistry":"%s"},"aaStack":{},"CitrateMemberSBT":"%s","MembershipStakeVault":"%s","governance":{"GOVERNANCE":"%s","GUARDIAN":"%s"}}\n' \
+    "$(addr 3001)" "$(addr 3002)" "$(addr 3003)" "$(addr 3004)" "$(addr 3005)" "$(addr 3006)" "$(addr 3002)" "$(addr 3005)" "$(addr 3007)" "$(addr 3008)" >"$GBOOK"
+}
+jqv() { jq -r "$1" "$GBOOK"; }
+FD=$(addr 2001)
+bcast DeployValidatorRegistry.s.sol 9000 "ValidatorRegistry:$(addr 2101)"
+bcast DeployCoreMembership.s.sol 9001 "CitrateMemberSBT:$(addr 2102)" "MemberBond:$(addr 2103)" "MembershipStakeVault:$(addr 2104)" "ERC1967Proxy:$(addr 2105)"
+bcast DeployEduStack.s.sol 1000 "StaleEdu:$(addr 2999)" # an earlier chain's broadcast
+stale_book
+GEMIT=(env ENV_TESTNET="$T/env.testnet" RPC_URL= GOVERNANCE="$(addr 31)" GUARDIAN="$(addr 32)")
+expect "generator: a fresh genesis needs EMIT_DEPLOYER" 1 'needs EMIT_DEPLOYER' -- "${GEMIT[@]}" EMIT_FRESH_GENESIS=1 EMIT_BROADCAST_SINCE=5000 bash "$EMIT"
+expect "generator: a fresh genesis needs EMIT_BROADCAST_SINCE" 1 'needs EMIT_BROADCAST_SINCE' -- "${GEMIT[@]}" EMIT_FRESH_GENESIS=1 EMIT_DEPLOYER="$FD" bash "$EMIT"
+expect "generator: a malformed EMIT_DEPLOYER is refused" 1 'EMIT_DEPLOYER is not an address' -- "${GEMIT[@]}" EMIT_DEPLOYER=0x12 bash "$EMIT"
+expect "generator: a fresh genesis builds the book from this run's broadcasts" 0 'not carried from the previous book: AnchorRegistry' -- "${GEMIT[@]}" EMIT_FRESH_GENESIS=1 EMIT_DEPLOYER="$FD" EMIT_BROADCAST_SINCE=5000 bash "$EMIT"
+[[ "$(jqv .deployer)" == "$FD" ]] && ok "generator: the fresh book names EMIT_DEPLOYER, not the .env.testnet or historical deployer" ||
+  bad "generator: the fresh book names EMIT_DEPLOYER, not the .env.testnet or historical deployer" "$(jqv .deployer)"
+[[ "$(jqv '[.contracts.ValidatorRegistry, .contracts.CitrateMemberSBT, .contracts.MemberBond, .contracts.MembershipStakeVaultImpl, .contracts.MembershipStakeVault, .CitrateMemberSBT, .MembershipStakeVault] | join(" ")')" == \
+  "$(addr 2101) $(addr 2102) $(addr 2103) $(addr 2104) $(addr 2105) $(addr 2102) $(addr 2105)" ]] &&
+  ok "generator: membership entries and root aliases come from this run's DeployCoreMembership (impl vs proxy kept)" ||
+  bad "generator: membership entries and root aliases come from this run's DeployCoreMembership (impl vs proxy kept)" "$(cat "$GBOOK")"
+[[ "$(jqv '[(.contracts | has("AnchorRegistry")), (.contracts | has("StaleEdu")), (.aaStack | length)] | join(" ")')" == "false false 0" ]] &&
+  ok "generator: a fresh book carries no previous-book entry, no pre-genesis broadcast and no .env.testnet pin" ||
+  bad "generator: a fresh book carries no previous-book entry, no pre-genesis broadcast and no .env.testnet pin" "$(cat "$GBOOK")"
+[[ "$(jqv '[.governance.GOVERNANCE, .governance.GUARDIAN] | join(" ")')" == "$(addr 31) $(addr 32)" ]] &&
+  ok "generator: the fresh book's governance block is this run's GOVERNANCE/GUARDIAN" ||
+  bad "generator: the fresh book's governance block is this run's GOVERNANCE/GUARDIAN" "$(jqv .governance)"
+cp "$GBOOK" "$T/fresh1.json"
+expect "generator: a fresh regeneration is reproducible" 0 'wrote' -- "${GEMIT[@]}" EMIT_FRESH_GENESIS=1 EMIT_DEPLOYER="$FD" EMIT_BROADCAST_SINCE=5000 EMIT_OUTPUT="$T/fresh2.json" bash "$EMIT"
+cmp -s "$T/fresh1.json" "$T/fresh2.json" && ok "generator: the same broadcasts give the same fresh book byte for byte" || bad "generator: the same broadcasts give the same fresh book byte for byte" "$(diff "$T/fresh1.json" "$T/fresh2.json")"
+# Not fresh: EMIT_DEPLOYER (what regenesis.sh passes) wins over .env.testnet, the regenerated
+# membership entries replace the old ones and their root aliases follow; other keys carry over.
+stale_book
+expect "generator: an incremental regeneration still runs" 0 'wrote' -- "${GEMIT[@]}" EMIT_DEPLOYER="$FD" bash "$EMIT"
+[[ "$(jqv '[.deployer, .contracts.MembershipStakeVault, .MembershipStakeVault, .CitrateMemberSBT, .contracts.AnchorRegistry] | join(" ")')" == "$FD $(addr 2105) $(addr 2105) $(addr 2102) $(addr 3006)" ]] &&
+  ok "generator: an incremental book takes EMIT_DEPLOYER and the new membership, and keeps the rest" ||
+  bad "generator: an incremental book takes EMIT_DEPLOYER and the new membership, and keeps the rest" "$(cat "$GBOOK")"
+bcast DeployCoreMembership.s.sol 9001 "CitrateMemberSBT:$(addr 2102)" "MemberBond:$(addr 2103)" "MembershipStakeVault:$(addr 2104)"
+expect "generator: a membership broadcast without the vault proxy is refused" 2 'expected CitrateMemberSBT, MemberBond, MembershipStakeVault and its ERC1967Proxy' -- "${GEMIT[@]}" EMIT_FRESH_GENESIS=1 EMIT_DEPLOYER="$FD" EMIT_BROADCAST_SINCE=5000 bash "$EMIT"
+
 # ------------------------------------------------------------------ P5 with the real checker
 # Integration: the real CheckDeployedAdmins (this tree's script and AdminChecks) under real
 # forge, against a local anvil, driven through genesis_ceremony.sh --simulate --only P5. A
@@ -862,7 +957,11 @@ REAL_CAST=$(command -v cast || true)
 REAL_ANVIL=$(command -v anvil || true)
 SRC="$(cd "$G/../.." && pwd)/contracts"
 if [[ -z "$REAL_FORGE" || -z "$REAL_CAST" || -z "$REAL_ANVIL" || "${GENESIS_TESTS_NO_FOUNDRY:-0}" == 1 ]]; then
-  printf 'SKIP P5 real-checker integration (forge/cast/anvil not on PATH)\n'
+  if [[ "${GENESIS_E2E_REQUIRED:-0}" == 1 ]]; then
+    bad "integration: required (GENESIS_E2E_REQUIRED=1) but forge/cast/anvil are not on PATH"
+  else
+    printf 'SKIP P5 real-checker integration (forge/cast/anvil not on PATH)\n'
+  fi
 else
   IR="$T/irepo"
   IC="$IR/contracts"
@@ -1018,6 +1117,160 @@ SOL
     printf '{"chainId":31337,"deployer":"%s","contracts":{"Alpha":"%s","ValidatorRegistry":"%s"},"aaStack":{}}' "$DEP" "$A1" "$GVR" >"$IC/addresses/40204.json"
     expect "P5 integration: P5 passes a registry governed by this run's GOVERNANCE" 0 'governance and slasher are GOVERNANCE' -- "${IENV[@]}" bash "$CE" --simulate --only P5
     kill "$ANVIL_PID" 2>/dev/null
+
+    # ---------------------------------------------------------- fresh genesis end to end (C8)
+    # P2 --confirm on a fresh anvil chain (id 40204) through the REAL regenesis.sh, the REAL
+    # emit-address-table.sh and the real DeployValidatorRegistry / DeployCoreMembership scripts,
+    # then P5 --confirm with the real checker over the book the generator wrote. The other
+    # ceremonies regenesis.sh runs (DeployAll, AA, ...) are not in this temp project: a forge shim
+    # on PATH says so and skips them, and stands in for the keystore (--account becomes anvil's
+    # --unlocked for the impersonated deployer). Two runs on two fresh chains with a different
+    # MEMBERSHIP_OWNER and a different governance council (so a different ValidatorRegistry):
+    # the book follows each run, and nothing from the stale committed book survives.
+    if [[ ! -f "$SRC/lib/openzeppelin-contracts/contracts/proxy/ERC1967/ERC1967Proxy.sol" ]]; then
+      if [[ "${GENESIS_E2E_REQUIRED:-0}" == 1 ]]; then
+        bad "fresh genesis e2e: required (GENESIS_E2E_REQUIRED=1) but contracts/lib/openzeppelin-contracts is not checked out"
+      else
+        printf 'SKIP fresh-genesis end to end (contracts/lib/openzeppelin-contracts is not checked out)\n'
+      fi
+    else
+      FR="$T/frepo"
+      FC="$FR/contracts"
+      ROOT_SRC="$(cd "$G/../.." && pwd)"
+      mkdir -p "$FC/script/lib" "$FC/src/core_membership" "$FC/src/lib" "$FC/src/aa/lib/webauthn" "$FC/src/fixtures" "$FC/lib" \
+        "$FC/genesis" "$FC/addresses" "$FR/scripts/ops" "$FR/scripts/ci" "$T/fbin"
+      cp "$IC/foundry.toml" "$IC/remappings.txt" "$FC/"
+      ln -s "$SRC/lib/forge-std" "$FC/lib/forge-std"
+      ln -s "$SRC/lib/openzeppelin-contracts" "$FC/lib/openzeppelin-contracts"
+      for f in script/CheckDeployedAdmins.s.sol script/lib/AdminChecks.sol script/DeployValidatorRegistry.s.sol \
+        script/DeployCoreMembership.s.sol script/ScriptEnv.sol script/Salts.sol src/ValidatorRegistry.sol \
+        src/lib/ReentrancyGuard.sol src/lib/Governable.sol src/lib/InitialAdmin.sol src/aa/lib/webauthn/P256.sol \
+        src/core_membership/CitrateMemberSBT.sol src/core_membership/MemberBond.sol \
+        src/core_membership/MembershipStakeVault.sol src/core_membership/MemberEmblem.sol; do
+        cp "$SRC/$f" "$FC/$f"
+      done
+      cp "$IC/src/fixtures/GenesisFixtures.sol" "$FC/src/fixtures/"
+      for s in DeployGenesisGovernance DeployTeamVesting DeployDormantLedgers; do cp "$IC/script/$s.s.sol" "$FC/script/"; done
+      cp "$ROOT_SRC/scripts/ops/regenesis.sh" "$ROOT_SRC/scripts/ops/emit-address-table.sh" "$FR/scripts/ops/"
+      cp "$ROOT_SRC/scripts/ci/check-create2-determinism.sh" "$FR/scripts/ci/"
+      cat >"$T/fbin/forge" <<'EOF'
+#!/usr/bin/env bash
+# Test shim for regenesis.sh: --account NAME becomes --unlocked (anvil signs for the
+# impersonated deployer); `forge script script/X` for a ceremony this temp project does not
+# hold is reported and skipped. Everything else is the real forge.
+args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --account) args+=(--unlocked); shift 2 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+if [[ "${args[0]:-}" == script && ! -f "${args[1]:-}" ]]; then
+  echo "forge shim: ${args[1]} is not in this test's stack; skipped"
+  exit 0
+fi
+exec "$REAL_FORGE" "${args[@]}"
+EOF
+      chmod +x "$T/fbin/forge"
+      export REAL_FORGE
+      fport=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+      FRPC="http://127.0.0.1:$fport"
+      FANVIL_PID=""
+      trap 'kill "$ANVIL_PID" ${FANVIL_PID:+"$FANVIL_PID"} 2>/dev/null; rm -rf "$T"' EXIT
+      FDEP=0xd1e0000000000000000000000000000000000001 # the fresh deployer (impersonated)
+      fcast() { "$REAL_CAST" "$@" --rpc-url "$FRPC"; }
+      ffcreate() { # contract [constructor args...] -> deployed address (deployed by anvil's first account)
+        (cd "$FC" && "$REAL_FORGE" create --rpc-url "$FRPC" --unlocked --from "$ANVIL0" --broadcast "src/fixtures/GenesisFixtures.sol:$1" ${2:+--constructor-args} "${@:2}" 2>&1) |
+          sed -n 's/^Deployed to: //p'
+      }
+      fcouncil() { # delay threshold owner ids... -> "timelock multisig"
+        local d="$1" t="$2" tl ms ids=""
+        shift 2
+        for i in "$@"; do ids+="${ids:+,}$(addr "$i")"; done
+        tl=$(ffcreate FixtureTimelock "$d")
+        ms=$(ffcreate FixtureMultisig "$tl" "[$ids]" "$t")
+        fcast send "$tl" "setProposer(address)" "$ms" --unlocked --from "$ANVIL0" >/dev/null 2>&1
+        printf '%s %s\n' "$tl" "$ms"
+      }
+      FCODE_MSIG=$(addr 209)
+      # e2e_run <label> <membership owner> <extra txs before the councils>: a fresh chain, P2
+      # and P5 --confirm. Sets RUN_VR RUN_SBT RUN_VAULT RUN_VAULT_IMPL from the generated book.
+      e2e_run() {
+        local label="$1" owner="$2" i g0 g0ts book="$FC/addresses/40204.json"
+        [[ -z "$FANVIL_PID" ]] || { kill "$FANVIL_PID" 2>/dev/null; wait "$FANVIL_PID" 2>/dev/null; }
+        "$REAL_ANVIL" --port "$fport" --chain-id 40204 --silent >"$T/fanvil.log" 2>&1 &
+        FANVIL_PID=$!
+        for _ in $(seq 100); do fcast chain-id >/dev/null 2>&1 && break; sleep 0.1; done
+        for ((i = 0; i < $3; i++)); do fcast send "$(addr 77)" --value 1 --unlocked --from "$ANVIL0" >/dev/null 2>&1; done
+        read -r GTL GMS < <(fcouncil 172800 3 11 12 13 14 15)
+        read -r RTL RMS < <(fcouncil 3600 2 21 22 23)
+        fcast rpc anvil_impersonateAccount "$FDEP" >/dev/null
+        fcast rpc anvil_setBalance "$FDEP" 0x56bc75e2d63100000 >/dev/null
+        for a in 71 81 82; do fcast rpc anvil_setCode "$(addr "$a")" "$(gov_code "$FCODE_MSIG")" >/dev/null; done
+        # The checker needs the P-256 verifier, which regenesis.sh's aa/DeployP256Verifier step (not
+        # in this temp project) provisions on a real chain.
+        fcast rpc anvil_setCode 0xc2b78104907F722DABAc4C69f826a522B2754De4 0x600160005260206000f3 >/dev/null
+        g0=$(fcast block 0 --field hash)
+        g0ts=$(fcast block 0 --field timestamp)
+        rm -f "$FC"/genesis/*.json
+        mk_manifest "$FC/genesis" "$FDEP" confirm fixture "$g0" "$((g0ts))"
+        gov_book "$FC/genesis" "$FDEP"
+        printf '{"deployer":"%s","contracts":{"VestingAlice":"%s"}}' "$FDEP" "$(addr 71)" >"$FC/genesis/team-vesting.json"
+        printf '{"deployer":"%s","contracts":{"FederatedRoundLedger":"%s","PatronageLedger":"%s"}}' "$FDEP" "$(addr 81)" "$(addr 82)" >"$FC/genesis/dormant-ledgers.json"
+        FENV=("${CEENV[@]}" REPO_ROOT="$FR" DEPLOYER_ADDRESS="$FDEP" RPC_URL="$FRPC" EXPECTED_CHAIN_ID=40204
+          EXPECTED_GENESIS_HASH="$g0" FORGE="$REAL_FORGE" CAST="$REAL_CAST" PATH="$T/fbin:$PATH" MEMBERSHIP_OWNER="$owner"
+          TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS="$FRPC")
+        if [[ "$label" == run1 ]]; then
+          # A stale generator preset is refused before anything is broadcast.
+          expect "fresh genesis e2e: a stale EMIT_DEPLOYER stops P2 before any broadcast" 3 'EMIT_DEPLOYER is set to 0x0+63' -- "${FENV[@]}" EMIT_DEPLOYER="$STALE" bash "$CE" --confirm --only P2 --account fixture
+          [[ "$(fcast nonce "$FDEP")" == 0 ]] && ok "fresh genesis e2e: the refused P2 sent nothing" || bad "fresh genesis e2e: the refused P2 sent nothing" "nonce $(fcast nonce "$FDEP")"
+        fi
+        expect "fresh genesis e2e ($label): P2 deploys through regenesis.sh and the generator, and the book is verified" 0 'P2 stack book = generator output for this run' -- "${FENV[@]}" bash "$CE" --confirm --only P2 --account fixture
+        RUN_VR=$(jq -r '.contracts.ValidatorRegistry' "$book")
+        RUN_SBT=$(jq -r '.contracts.CitrateMemberSBT' "$book")
+        RUN_VAULT=$(jq -r '.contracts.MembershipStakeVault' "$book")
+        RUN_VAULT_IMPL=$(jq -r '.contracts.MembershipStakeVaultImpl' "$book")
+        if [[ "$(jq -r '.deployer' "$book")" == "$FDEP" && "$(jq -r '[.CitrateMemberSBT, .MembershipStakeVault] | join(" ")' "$book")" == "$RUN_SBT $RUN_VAULT" &&
+          "$(jq -r '(.contracts | has("AnchorRegistry")) or (.contracts | has("StaleEdu"))' "$book")" == false &&
+          "$(jq -r '.governance.GOVERNANCE' "$book")" == "$GTL" && "$RUN_VAULT" != "$RUN_VAULT_IMPL" ]]; then
+          ok "fresh genesis e2e ($label): the book names the run's deployer, membership (impl and proxy), root aliases and governance, nothing stale"
+        else
+          bad "fresh genesis e2e ($label): the book names the run's deployer, membership (impl and proxy), root aliases and governance, nothing stale" "$(cat "$book")"
+        fi
+        local sbt_owner vr_gov
+        sbt_owner=$(fcast call "$RUN_SBT" "owner()(address)" 2>/dev/null)
+        vr_gov=$(fcast call "$RUN_VR" "governance()(address)" 2>/dev/null)
+        [[ "$(lower "$sbt_owner")" == "$(lower "$owner")" && "$(lower "$vr_gov")" == "$(lower "$GTL")" ]] &&
+          ok "fresh genesis e2e ($label): the booked SBT and registry are live with this run's owner and governance" ||
+          bad "fresh genesis e2e ($label): the booked SBT and registry are live with this run's owner and governance" "sbt owner $sbt_owner, vr governance $vr_gov"
+        expect "fresh genesis e2e ($label): P5 --confirm passes the real checker over the generated book" 0 'P5 PASS: FACTORY-ADMIN 0, DEPLOYER-ADMIN 0' -- "${FENV[@]}" bash "$CE" --confirm --only P5 --account fixture
+      }
+      lower() { printf '%s' "$1" | tr 'A-F' 'a-f'; }
+      # The committed book before the genesis: an earlier chain's deployer, membership and extras.
+      printf '{"chainId":40204,"deployer":"0x4250675F9015E65fC866F3a373F82bb9DFc000c6","contracts":{"ValidatorRegistry":"%s","CitrateMemberSBT":"%s","MemberBond":"%s","MembershipStakeVaultImpl":"%s","MembershipStakeVault":"%s","AnchorRegistry":"%s"},"aaStack":{},"CitrateMemberSBT":"%s","MembershipStakeVault":"%s"}\n' \
+        "$(addr 3001)" "$(addr 3002)" "$(addr 3003)" "$(addr 3004)" "$(addr 3005)" "$(addr 3006)" "$(addr 3002)" "$(addr 3005)" >"$FC/addresses/40204.json"
+      OWNER1=0x0e1a000000000000000000000000000000000001
+      OWNER2=0x0e1a000000000000000000000000000000000002
+      e2e_run run1 "$OWNER1" 0
+      VR1=$RUN_VR SBT1=$RUN_SBT VAULT1=$RUN_VAULT
+      # C8 on the consumer side: a book edited after P2 is not the one P5 sweeps.
+      cp "$FC/addresses/40204.json" "$T/fbook.orig"
+      jq --arg a "$(addr 3005)" '.MembershipStakeVault = $a' "$T/fbook.orig" >"$FC/addresses/40204.json"
+      expect "fresh genesis e2e: P5 refuses a book edited after P2 (stale vault alias)" 3 "is not the stack book this run's P2 generated" -- "${FENV[@]}" bash "$CE" --confirm --only P5 --account fixture
+      cp "$T/fbook.orig" "$FC/addresses/40204.json"
+      # Second genesis: another owner, another council (one extra tx moves the fixture
+      # addresses), and an earlier chain's broadcast left for a ceremony this run does not run.
+      mkdir -p "$FC/broadcast/DeployEduStack.s.sol/40204"
+      printf '{"timestamp":1000,"transactions":[{"transactionType":"CREATE2","contractName":"StaleEdu","contractAddress":"%s"}]}\n' "$(addr 2999)" \
+        >"$FC/broadcast/DeployEduStack.s.sol/40204/run-latest.json"
+      e2e_run run2 "$OWNER2" 1
+      if [[ "$RUN_VR" != "$VR1" && "$RUN_SBT" != "$SBT1" && "$RUN_VAULT" != "$VAULT1" ]]; then
+        ok "fresh genesis e2e: a new owner and registry move the SBT, the vault and the registry, and the book follows"
+      else
+        bad "fresh genesis e2e: a new owner and registry move the SBT, the vault and the registry, and the book follows" "VR $VR1→$RUN_VR SBT $SBT1→$RUN_SBT vault $VAULT1→$RUN_VAULT"
+      fi
+      kill "$FANVIL_PID" 2>/dev/null
+    fi
   fi
 fi
 
