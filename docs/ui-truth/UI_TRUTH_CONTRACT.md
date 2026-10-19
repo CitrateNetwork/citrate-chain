@@ -1,6 +1,6 @@
 ---
 created: 2026-10-19T02:00:00Z
-updated: 2026-10-19T07:47:00Z
+updated: 2026-10-19T09:08:00Z
 branch: docs/c1-ui-truth-v1.1
 author: Larry Klosowski (chain team; DGX session, Claude Opus 5.5)
 status: active
@@ -48,10 +48,41 @@ Use these words exactly. Each has one meaning and one condition. If a state isn'
 |---|---|
 | **Pending** | Transaction is in the mempool, with no receipt |
 | **Included in block N** | Receipt exists (`eth_getTransactionReceipt`) |
-| **Sent, outcome unknown — check tx ⟨hash⟩** | The signed transaction may have reached the node, but the app can't tell whether it was accepted: a transport failure, timeout or unreadable response on `eth_sendRawTransaction`, or a failed receipt poll after the node returned a hash. ⟨hash⟩ is keccak256 of the signed raw transaction, which is the hash the node assigns. Tell the member to check the hash (for example on the explorer) before trying again. Never show "Not sent" here, and never re-send automatically |
-| **Not sent** | Only when the transaction provably didn't enter the node's mempool: the node answered `eth_sendRawTransaction` with a JSON-RPC error, or the flow failed before submission (locked vault, signing, nonce or gas-price read) |
+| **Sent, outcome unknown — check tx ⟨hash⟩** | The signed transaction may have reached the node, but the app can't prove it wasn't accepted. This is the state for every `eth_sendRawTransaction` outcome that isn't on the definitive list below: a transport failure, timeout or unreadable response; any error code or message not on the list (including `-32603` internal errors); the ambiguous errors (already known, nonce in use); any error at all on a re-submission of signed bytes the app has sent before; and a failed receipt poll after the node returned a hash. ⟨hash⟩ is keccak256 of the signed raw transaction, which is the hash the node assigns. Reconcile by that hash (`eth_getTransactionByHash`, then `eth_getTransactionReceipt`), and tell the member to check it (for example on the explorer) before trying again. Never show "Not sent" here, never re-send automatically, and never sign a new transaction for the same payment while this state holds |
+| **Not sent** | Only when the node provably didn't accept this transaction: the flow failed before submission (locked vault, signing, nonce or gas-price read), or the node answered the **first** submission of these signed bytes with one of the definitive errors listed below. Any other error means "Sent, outcome unknown" |
 | **N confirmations** | Head − N. This is a depth count, not finality |
 | ~~Final, Finalized, Settled, Irreversible~~ | **Banned** until checkpoint finality runs and the `finalized` tag returns a height above 0. Today the `finalized` tag returns the genesis block |
+
+#### Which `eth_sendRawTransaction` errors mean "Not sent"
+
+Verified against `core/api/src/server.rs:1213-1278` (the handler the node serves; it replaces the `eth_rpc.rs:1024` registration, last registration wins), `core/sequencer/src/mempool.rs:549-787` (`add_transaction`) and `:790-1019` (`validate_transaction`), and `core/api/src/rate_limit.rs:457-470`, all at c384fc98. The handler checks the request, decodes, checks the balance, then calls `mempool.add_transaction`. Every error returned before or by `add_transaction` leaves the pool without this transaction: the insert (`mempool.rs:748`) is the last fallible step, and nothing after it returns an error. Every handler error uses code `-32602` (Invalid params), so **match on the message, not the code**.
+
+**Definitive (show "Not sent")**, only on the first submission of these signed bytes, to any node. Messages are listed exactly; `…` is variable text.
+
+| Code | Message | Source |
+|---|---|---|
+| HTTP 429, `-32099` | `Rate limit exceeded. Try again later.` | Request middleware; the handler never ran |
+| `-32602` | `Missing transaction data`, `Invalid tx hex`, `Invalid hex`, or a params-parse message | Request checks |
+| `-32602` | `Failed to parse transaction: …` | Decoder (malformed RLP or signature values, high-s signature, wrong `v`) |
+| `-32602` | `Insufficient funds: account balance … < required …` | Committed-balance check before the mempool |
+| `-32602` | `Failed to submit transaction: Full` | Pool full of better-priced transactions |
+| `-32602` | `Failed to submit transaction: SenderLimitExceeded` | Per-sender pool limit |
+| `-32602` | `Failed to submit transaction: InvalidSignature` | Signature gates |
+| `-32602` | `Failed to submit transaction: GasPriceTooLow { …` | Minimum gas price |
+| `-32602` | `Failed to submit transaction: InsufficientBalance { …` | Balance covers neither this nor the sender's pooled transactions |
+| `-32602` | `Failed to submit transaction: InvalidTransaction(…` | Size, payload, gas limit, chain ID, nonce too far ahead, sender refused, signature verification |
+| `-32602` | `Failed to submit transaction: NonceTooLow { …` | The account's committed nonce is past this transaction's nonce, so it can never be included. Say "nonce already used", and reconcile the account's recent transactions before offering a new one |
+
+**Ambiguous (show "Sent, outcome unknown — check tx ⟨hash⟩")**:
+
+| Message | Why it doesn't prove non-acceptance |
+|---|---|
+| `Failed to submit transaction: DuplicateTransaction(…` | The node already holds this transaction (`mempool.rs:592-595`) or accepted and later evicted it (`:598-600`). This is what a re-send returns after an earlier submission succeeded and its response was lost. It means "previously submitted": reconcile by hash |
+| `Failed to submit transaction: DuplicateNonce { …` | Another transaction from this account with the same nonce is pending, which can be an earlier signing of the same payment (`:627-635`). The same message is also used for a nonce gap (`:637-643`), so the app can't tell the two apart. Reconcile the account's pending transactions |
+| Any error on a **re-submission** of bytes already sent once | If the first submission was accepted and mined, the re-send fails at the balance check (the balance already paid for it) or with `NonceTooLow` (`:820-825`), both of which look definitive. Only the first submission's error counts |
+| Any other code or message, including `-32603` (Internal error) and a dropped connection | Not proven to come before the mempool insert |
+
+The node doesn't yet return a distinct "already known" code; core matches on these messages until it does (§9 Already-known error).
 
 ### Validators
 
@@ -252,6 +283,7 @@ Open follow-ups from the DGX reviews of the stack (not in main or in any open PR
 - **claims.json errata**: precompile set (agent precompiles 0x0112, 0x0113, 0x0121, 0x0122 are live; 0x0104 retired), ModelRegistry precompile flag (fixed in G, set agrees = true), the `finalized` tag note (the tag is served since #250 and returns genesis), the supply pointer (`lib.rs:75`), the `deployed_contracts` verification date, and re-run test counts.
 - **Consensus set RPC**: expose the governing epoch snapshot (membership and effective stake for the epoch governing a height) so the app can show consensus membership, not just live-registry eligibility.
 - **Producers RPC** (optimisation, not a prerequisite): distinct proposers over a stated window in one call. The sampled source in §2 (batched `eth_getBlockByNumber` → `proposerPubkey`) already works and stays the reference until this exists.
+- **Already-known error**: give `eth_sendRawTransaction` distinct, stable error codes for "already known" (`DuplicateTransaction`) and "nonce in use" (`DuplicateNonce`), and separate the nonce-gap case from `DuplicateNonce`, so core doesn't have to match on Debug-formatted messages (§1).
 - **R1 export**: add the sample member bond (§7) to `export-fixtures.sh`.
 - **RPC honesty**: real node version and consensus fingerprint over RPC, a genesis-hash method, errors instead of silent defaults (§3), drop the DAG-stats estimates, and fix the `eth_feeHistory` reward shape and `citrate_getToken.totalMinted`.
 - **Mainnet profile**: `GenesisConfig::mainnet()` uses chain ID 1 and placeholder addresses; `node/config/mainnet.toml` is a skeleton. Resolved in C2.
@@ -277,7 +309,7 @@ The chain team's answers to the design slice-1 questions (citrate-core #350). Th
 ## 12. Changes in v1.1
 
 - §1 Network: "Synced" needs a public head read in the last 60 s; new **Sync unknown · network head unavailable**; no sync percentage; "Resync required" uses the §6 availability rule.
-- §1 Transactions: new **Sent, outcome unknown — check tx ⟨hash⟩** and a narrow **Not sent**.
+- §1 Transactions: new **Sent, outcome unknown — check tx ⟨hash⟩** and a narrow **Not sent**, which only the listed definitive `eth_sendRawTransaction` errors on a first submission can produce. Already-known and nonce-in-use errors, and any error on a re-send, are "outcome unknown".
 - §1 Validators: "Registered · active from epoch N" and "Validator active" conditions include `status`; Exiting and Slashed are reachable and derived from `status`, not stake; new "— · registry state inconsistent".
 - §1 Rewards: the tab is "Rewards"; "Earnings" banned in every form; "today" only for local per-day sources.
 - §2: "Registered validators" with "N eligible (live registry)" on one cadence, no consensus number; peers split into this node vs the public RPC node (`rpc_node_peer_count`); producer sample shortfall rule; LiquidStakingPool deposit and withdrawal delay rows; unread lock end wording; "Today" values from the committed fixture.
