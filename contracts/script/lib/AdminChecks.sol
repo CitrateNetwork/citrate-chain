@@ -15,6 +15,10 @@ pragma solidity ^0.8.26;
 abstract contract AdminChecks {
     address internal constant ARACHNID_FACTORY = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
     bytes32 internal constant DEFAULT_ADMIN_ROLE = 0x00;
+    /// OZ TimelockController role ids (keccak256 of the role name, as OZ defines them).
+    bytes32 internal constant TIMELOCK_PROPOSER_ROLE = keccak256("PROPOSER_ROLE");
+    bytes32 internal constant TIMELOCK_EXECUTOR_ROLE = keccak256("EXECUTOR_ROLE");
+    bytes32 internal constant TIMELOCK_CANCELLER_ROLE = keccak256("CANCELLER_ROLE");
 
     function _readAddress(address target, bytes memory cd) internal view returns (bool ok, address value) {
         (bool success, bytes memory ret) = target.staticcall(cd);
@@ -45,7 +49,7 @@ abstract contract AdminChecks {
             target, abi.encodeWithSignature("hasRole(bytes32,address)", DEFAULT_ADMIN_ROLE, ARACHNID_FACTORY)
         );
         if (ok && has) return "CREATE2 factory holds DEFAULT_ADMIN_ROLE";
-        return "";
+        return _governingSeatProblem(target, ARACHNID_FACTORY, "CREATE2 factory");
     }
 
     /// @notice Like `_factoryAdminProblem` but for an arbitrary EOA holder — the
@@ -66,7 +70,67 @@ abstract contract AdminChecks {
             target, abi.encodeWithSignature("hasRole(bytes32,address)", DEFAULT_ADMIN_ROLE, deployer)
         );
         if (ok && has) return "deployer EOA holds DEFAULT_ADMIN_ROLE";
+        return _governingSeatProblem(target, deployer, "deployer EOA");
+    }
+
+    /// @notice C4 genesis governance: the seats that govern without being an "admin" slot.
+    ///         OZ `TimelockController` PROPOSER / EXECUTOR / CANCELLER (whoever holds them
+    ///         runs the timelock, and through it everything it administers), and an owner
+    ///         seat on an m-of-n (`isOwner(address)`: MultisigProposer, MultisigTimelock2of3).
+    ///         Empty string when `holder` sits in none of them.
+    function _governingSeatProblem(address target, address holder, string memory who)
+        internal
+        view
+        returns (string memory)
+    {
+        bytes32[3] memory roles = [TIMELOCK_PROPOSER_ROLE, TIMELOCK_EXECUTOR_ROLE, TIMELOCK_CANCELLER_ROLE];
+        string[3] memory names = ["PROPOSER_ROLE", "EXECUTOR_ROLE", "CANCELLER_ROLE"];
+        for (uint256 i = 0; i < 3; i++) {
+            (bool ok, bool has) =
+                _readBool(target, abi.encodeWithSignature("hasRole(bytes32,address)", roles[i], holder));
+            if (ok && has) return string.concat(who, " holds timelock ", names[i]);
+        }
+        (bool okOwner, bool owner) = _readBool(target, abi.encodeWithSignature("isOwner(address)", holder));
+        if (okOwner && owner) return string.concat(who, " is a multisig owner");
         return "";
+    }
+
+    /// @notice Revert unless OZ TimelockController `timelock` has been handed over to
+    ///         `multisig`: the multisig holds PROPOSER, EXECUTOR and CANCELLER, execution is
+    ///         not open to everyone, the timelock administers itself, its delay is
+    ///         `minDelay`, and `deployer` (and the CREATE2 factory) hold no seat on it.
+    function _assertTimelockHandover(
+        string memory name,
+        address timelock,
+        address multisig,
+        address deployer,
+        uint256 minDelay
+    ) internal view {
+        _assertNoFactoryAdmin(name, timelock);
+        _assertNoDeployerAdmin(name, timelock, deployer);
+        bytes32[3] memory roles = [TIMELOCK_PROPOSER_ROLE, TIMELOCK_EXECUTOR_ROLE, TIMELOCK_CANCELLER_ROLE];
+        for (uint256 i = 0; i < 3; i++) {
+            (bool ok, bool has) =
+                _readBool(timelock, abi.encodeWithSignature("hasRole(bytes32,address)", roles[i], multisig));
+            require(ok && has, string.concat(name, ": multisig lacks a timelock role"));
+        }
+        (bool okOpen, bool open) =
+            _readBool(timelock, abi.encodeWithSignature("hasRole(bytes32,address)", TIMELOCK_EXECUTOR_ROLE, address(0)));
+        require(okOpen && !open, string.concat(name, ": timelock execution is open to anyone"));
+        (bool okSelf, bool self) =
+            _readBool(timelock, abi.encodeWithSignature("hasRole(bytes32,address)", DEFAULT_ADMIN_ROLE, timelock));
+        require(okSelf && self, string.concat(name, ": timelock does not administer itself"));
+        (bool okDelay, bytes memory ret) = timelock.staticcall(abi.encodeWithSignature("getMinDelay()"));
+        require(
+            okDelay && ret.length == 32 && abi.decode(ret, (uint256)) == minDelay,
+            string.concat(name, ": timelock minDelay is not the intended value")
+        );
+    }
+
+    /// @notice Revert if `deployer` holds any admin slot or governing seat on `target`.
+    function _assertNoDeployerAdmin(string memory name, address target, address deployer) internal view {
+        string memory problem = _deployerAdminProblem(target, deployer);
+        require(bytes(problem).length == 0, string.concat(name, ": ", problem));
     }
 
     /// @notice Revert if `target` names the CREATE2 factory in any admin slot.

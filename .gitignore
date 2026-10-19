@@ -124,3 +124,7 @@ handoffs/
 # closure-scoped frozen-projection profile (contracts/foundry.toml [profile.membership])
 contracts/out-membership/
 contracts/cache-membership/
+
+# C4 genesis ceremony inputs/outputs (contracts/foundry.toml fs_permissions ./genesis).
+# Private until the genesis commit is public (C2 D2): never commit.
+contracts/genesis/

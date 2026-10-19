@@ -23,7 +23,12 @@ import {P256} from "../src/aa/lib/webauthn/P256.sol";
 ///         The post-redeploy run (against the regenerated book) always uses
 ///         REQUIRE_ALL_CODE=true, so a NO-CODE entry fails it:
 ///           REQUIRE_ALL_CODE=true forge script script/CheckDeployedAdmins.s.sol --rpc-url https://rpc.citrate.ai
-///         Env: ADDRESS_BOOK (default addresses/40204.json), REQUIRE_ALL_CODE.
+///         Env: ADDRESS_BOOK (default addresses/40204.json), REQUIRE_ALL_CODE,
+///         EXTRA_ADDRESS_BOOKS (optional, comma-separated genesis ceremony outputs).
+///
+///         DEPLOYER-ADMIN also covers the C4 genesis seats (AdminChecks
+///         `_governingSeatProblem`): the deployer must not hold a TimelockController
+///         PROPOSER / EXECUTOR / CANCELLER role or an m-of-n owner seat (`isOwner`).
 ///
 ///         Expected on the 2026-09-24 deployment (a fork of 40204): 22
 ///         FACTORY-ADMIN (21 admin slots + X402Paywall.provider), VERIFIER
@@ -38,15 +43,36 @@ contract CheckDeployedAdmins is Script, AdminChecks {
 
     function run() external {
         string memory path = vm.envOr("ADDRESS_BOOK", string("addresses/40204.json"));
-        check(vm.readFile(path), vm.envOr("REQUIRE_ALL_CODE", false));
+        string[] memory extraPaths = vm.envOr("EXTRA_ADDRESS_BOOKS", ",", new string[](0));
+        string[] memory extras = new string[](extraPaths.length);
+        for (uint256 i = 0; i < extraPaths.length; i++) {
+            extras[i] = vm.readFile(extraPaths[i]);
+        }
+        checkAll(vm.readFile(path), extras, vm.envOr("REQUIRE_ALL_CODE", false));
     }
 
     /// @notice The gate over an address-book JSON document (sections
     ///         `.contracts` and `.aaStack`). Reverts on failure.
     function check(string memory json, bool requireAllCode) public {
+        checkAll(json, new string[](0), requireAllCode);
+    }
+
+    /// @notice `check` plus the `.contracts` of each extra book: the C4 genesis ceremony
+    ///         outputs (DeployGenesisGovernance / DeployTeamVesting / DeployDormantLedgers
+    ///         write book-shaped JSON) before they are folded into the canonical book.
+    ///         Env: EXTRA_ADDRESS_BOOKS=path1,path2. Each extra must name the same
+    ///         `.deployer` as the main book, so the DEPLOYER-ADMIN class covers them too.
+    function checkAll(string memory json, string[] memory extras, bool requireAllCode) public {
         address deployer = vm.parseJsonAddress(json, ".deployer");
         _sweep(json, ".contracts", deployer);
         _sweep(json, ".aaStack", deployer);
+        for (uint256 i = 0; i < extras.length; i++) {
+            require(
+                vm.parseJsonAddress(extras[i], ".deployer") == deployer,
+                "CheckDeployedAdmins: extra address book names a different deployer"
+            );
+            _sweep(extras[i], ".contracts", deployer);
+        }
         verifierMissing = P256.VERIFIER.code.length == 0;
         if (verifierMissing) console.log("VERIFIER missing: no code at", P256.VERIFIER);
         console.log("FACTORY-ADMIN failures:", factoryAdmin);
