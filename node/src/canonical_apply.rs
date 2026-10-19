@@ -207,6 +207,11 @@ pub const FLOOR_VERIFY_ATTEMPTS: usize = 3;
 /// than this during the check is re-walked from scratch instead.
 pub const FLOOR_RECHECK_MAX_STEPS: u64 = 256;
 
+/// Bound on the certificates registered with
+/// [`CanonicalApplicator::register_certified`] that the floor does not cover yet
+/// (the highest are kept).
+pub const MAX_CERTIFIED_PENDING: usize = 64;
+
 /// Outcome of [`CanonicalApplicator::verify_certified_floor`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FloorCheck {
@@ -268,10 +273,24 @@ pub struct CanonicalApplicator {
     /// disables reorg (steps 2–3 behavior only). Wired under `CITRATE_BLOCK_V2`.
     fork_choice: Option<ForkChoice>,
     /// Last finalized height — the reorg floor (I4: never revert below finality).
-    /// Defaults to 0 (genesis). Raised only by `verify_certified_floor` (Stage 1c,
-    /// enforcement pin ON): a verified certificate whose hash is this node's block
-    /// at that height, under the advance lock. Never lowered.
+    /// Defaults to 0 (genesis). Raised only under the advance lock, and only to a
+    /// certified height whose certified hash is this node's block there:
+    /// `verify_certified_floor` (Stage 1c, enforcement pin ON — at finalization
+    /// and on the verifier poll) and [`Self::effective_floor`] (a registered
+    /// certificate that has since become canonical). Never lowered.
     finalized_height: Arc<AtomicU64>,
+    /// Finalized certificates `height -> hash` registered by the Enforced floor
+    /// verifier ([`Self::register_certified`]) that the floor does not cover
+    /// yet: their blocks were not confirmed on this node's applied chain when
+    /// checked (mismatch, not yet applied, unverifiable), or were loaded at boot
+    /// below a latest certificate that did not match. Every reorg consults them
+    /// under the advance lock ([`Self::effective_floor`]): the highest one whose
+    /// certified block IS canonical by then raises the floor before the reorg is
+    /// judged — so a certified block that becomes canonical is protected at
+    /// once, not at the verifier's next poll. At most
+    /// [`MAX_CERTIFIED_PENDING`] (the highest are kept); entries at or below the
+    /// floor are dropped. Always empty in Legacy / Observed mode.
+    certified_pending: parking_lot::Mutex<BTreeMap<u64, Hash>>,
     /// The height this node has actually APPLIED, published for readers outside
     /// the advance lock. The sync manager judges completion against this: the
     /// height of the last block RECEIVED is not evidence of holding its ancestry
@@ -362,6 +381,7 @@ impl CanonicalApplicator {
             lock: Arc::new(Mutex::new(AppliedState { tip, snapshots })),
             fork_choice: None,
             finalized_height: Arc::new(AtomicU64::new(0)),
+            certified_pending: parking_lot::Mutex::new(BTreeMap::new()),
             applied_height: Arc::new(AtomicU64::new(seeded_height)),
             registry_sync: None,
             registry_policy_resync: None,
@@ -477,6 +497,86 @@ impl CanonicalApplicator {
         self.finalized_height.load(Ordering::SeqCst)
     }
 
+    /// Register a finalized certificate `(height, hash)` whose block the reorg
+    /// floor does not cover yet (see the `certified_pending` field). A pair at
+    /// or below the floor is ignored. Called only by the Enforced floor
+    /// verifier, with certificates it has verified.
+    pub fn register_certified(&self, height: u64, hash: Hash) {
+        if height <= self.finalized_height() {
+            return;
+        }
+        let mut pending = self.certified_pending.lock();
+        pending.insert(height, hash);
+        while pending.len() > MAX_CERTIFIED_PENDING {
+            if pending.pop_first().is_none() {
+                break;
+            }
+        }
+    }
+
+    /// The registered certificates the floor does not cover yet, ascending
+    /// (tests / diagnostics).
+    #[cfg(test)]
+    pub fn certified_pending(&self) -> Vec<(u64, Hash)> {
+        self.certified_pending
+            .lock()
+            .iter()
+            .map(|(h, x)| (*h, *x))
+            .collect()
+    }
+
+    /// Drop the registered certificates the floor now covers.
+    fn settle_certified(&self, floor: u64) {
+        self.certified_pending.lock().retain(|h, _| *h > floor);
+    }
+
+    /// The reorg floor for a reorg judged under the advance lock (`state`):
+    /// the floor, raised first to the highest registered certificate
+    /// (`certified_pending`) whose certified block is now at its height on the
+    /// applied chain — the same `(height, hash)` check as
+    /// `verify_certified_floor`, in the same critical section as the reorg
+    /// decision. Heights inside the snapshot ring are read from it; with
+    /// `walk_below_ring` (the spine-rebuild path, whose fork point can be below
+    /// the ring) older ones are checked by a header walk.
+    fn effective_floor(&self, state: &AppliedState, walk_below_ring: bool) -> u64 {
+        let floor = self.finalized_height();
+        let candidates: Vec<(u64, Hash)> = {
+            let pending = self.certified_pending.lock();
+            if pending.is_empty() {
+                return floor;
+            }
+            pending
+                .iter()
+                .rev()
+                .filter(|(h, _)| **h > floor && **h <= state.tip.height)
+                .map(|(h, x)| (*h, *x))
+                .collect()
+        };
+        for (height, hash) in candidates {
+            let here = match state.snapshots.get(&height) {
+                Some((h, _)) => Some(*h),
+                None if walk_below_ring => self
+                    .applied_hash_at_height(state.tip, height)
+                    .ok()
+                    .flatten(),
+                None => None,
+            };
+            if here != Some(hash) {
+                continue;
+            }
+            self.finalized_height.fetch_max(height, Ordering::SeqCst);
+            let raised = self.finalized_height();
+            self.settle_certified(raised);
+            info!(
+                "finality floor: certified block {} @ {} is canonical on this node; reorg \
+                 floor raised to it",
+                hash, height
+            );
+            return raised;
+        }
+        floor
+    }
+
     /// The block at `target` on the applied chain ending at `tip`, walking
     /// selected parents through the persisted headers
     /// (`StorageManager.blocks.get_header`). `Ok(None)` when the chain steps
@@ -572,6 +672,7 @@ impl CanonicalApplicator {
             }
             if raise {
                 self.finalized_height.fetch_max(height, Ordering::SeqCst);
+                self.settle_certified(height);
             }
             drop(state);
             return FloorCheck::Match;
@@ -972,8 +1073,9 @@ impl CanonicalApplicator {
             branch.push(block);
         };
 
-        // I4: never revert below the finalized floor.
-        let floor = self.finalized_height();
+        // I4: never revert below the finalized floor (including a registered
+        // certificate whose block has become canonical since it was checked).
+        let floor = self.effective_floor(state, false);
         if fork.height < floor {
             return ReorgOutcome::Rejected(format!(
                 "reorg fork point height {} below finalized height {}",
@@ -1579,7 +1681,7 @@ impl CanonicalApplicator {
         // consensus alarm instead of self-healing onto a finality-violating fork. (Inert
         // while `finalized_height()` is 0 — no checkpoint proposed yet — so this changes no
         // honest-traffic outcome today; it is the floor the guard needs once finality wires.)
-        let floor = self.finalized_height();
+        let floor = self.effective_floor(&state, true);
         if floor > 0 && floor <= state.tip.height {
             if let Some(finalized_hash) = self.ancestor_hash_at_height(state.tip.hash, floor) {
                 if !self.head_descends_from(head, finalized_hash, floor) {
@@ -7889,5 +7991,70 @@ pub(crate) mod tests {
             other => panic!("expected Rejected (finality), got {other:?}"),
         }
         assert_eq!(state.tip.hash, a2.header.block_hash);
+    }
+
+    /// S2: a registered certificate whose block is canonical raises the floor
+    /// at the next reorg decision (under the advance lock), before the reorg is
+    /// judged; one whose block is not canonical changes nothing until it is.
+    #[tokio::test]
+    async fn registered_certificate_raises_the_floor_once_canonical() {
+        let (exec, storage, _dir) = fresh();
+        let app = CanonicalApplicator::new(exec, storage.clone());
+        let (_a1, a2, b2, b3) = setup_fork(&app, &storage).await; // tip a2
+        let floor = app.finalized_height_handle();
+
+        // b2 is certified but this node is on a2: no effect, the reorg onto
+        // the certified branch proceeds (fork point a1 @ 1 >= floor 0).
+        app.register_certified(2, b2.header.block_hash);
+        {
+            let lock = app.advance_lock();
+            let mut state = lock.lock().await;
+            assert_eq!(app.effective_floor(&state, true), 0);
+            match app.reorg_to(&mut state, b3.header.block_hash).await {
+                ReorgOutcome::Reorged { .. } => {}
+                other => panic!("expected Reorged onto b3, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            floor.load(Ordering::SeqCst),
+            0,
+            "not raised by the reorg onto it"
+        );
+        assert_eq!(app.certified_pending(), vec![(2, b2.header.block_hash)]);
+
+        // b2 is now canonical: a reorg back to a2 (fork point 1) is refused,
+        // and the floor is raised to 2 by that decision.
+        {
+            let lock = app.advance_lock();
+            let mut state = lock.lock().await;
+            match app.reorg_to(&mut state, a2.header.block_hash).await {
+                ReorgOutcome::Rejected(why) => {
+                    assert!(why.contains("below finalized height 2"), "{why}")
+                }
+                other => panic!("expected Rejected, got {other:?}"),
+            }
+        }
+        assert_eq!(floor.load(Ordering::SeqCst), 2);
+        assert!(app.certified_pending().is_empty(), "settled");
+        assert_eq!(app.applied_tip().await.hash, b3.header.block_hash);
+
+        // At or below the floor: ignored.
+        app.register_certified(2, a2.header.block_hash);
+        assert!(app.certified_pending().is_empty());
+    }
+
+    /// The registered set is bounded; the highest certificates are kept.
+    #[test]
+    fn registered_certificates_are_bounded() {
+        let (exec, storage, _dir) = fresh();
+        let app = CanonicalApplicator::new(exec, storage);
+        let n = u64::try_from(MAX_CERTIFIED_PENDING).expect("fits") + 10;
+        for h in 1..=n {
+            app.register_certified(h, Hash::new([1; 32]));
+        }
+        let held = app.certified_pending();
+        assert_eq!(held.len(), MAX_CERTIFIED_PENDING);
+        assert_eq!(held.first().map(|(h, _)| *h), Some(11));
+        assert_eq!(held.last().map(|(h, _)| *h), Some(n));
     }
 }

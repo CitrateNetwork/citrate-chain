@@ -7,8 +7,10 @@
 #   MUST PASS  specs/tla/consensus/CheckpointFinalitySafety.cfg   (S1 + S2, f = 1 of 4)
 #   MUST FAIL  CheckpointFinalitySafety_byz2.cfg      NoConflictingFinality (f >= n/3)
 #   MUST FAIL  CheckpointFinalitySafety_norecord.cfg  NoConflictingFinality (no signed-vote record)
-#   MUST FAIL  CheckpointFinalitySafety_strict.cfg    FinalizedStaysCanonical (open finding:
-#              the floor is raised by the verifier poll, after finalization)
+#   MUST PASS  specs/tla/consensus/CheckpointFinalitySafety_strict.cfg (§5 S2 as written:
+#              floor raised at finalization)
+#   MUST FAIL  CheckpointFinalitySafety_pollonly.cfg  FinalizedStaysCanonical (the floor
+#              follows only the verifier poll, after finalization)
 #   MUST FAIL  CheckpointFinalitySafety_committees.cfg NoConflictingFinality (open finding:
 #              committees are drawn per candidate block, so siblings can be finalized
 #              by different committees without any equivocation)
@@ -86,7 +88,8 @@ expect_pass CheckpointVoteSafety CheckpointVoteSafety.cfg
 expect_pass CheckpointFinalitySafety CheckpointFinalitySafety.cfg
 expect_violation CheckpointFinalitySafety CheckpointFinalitySafety_byz2.cfg NoConflictingFinality
 expect_violation CheckpointFinalitySafety CheckpointFinalitySafety_norecord.cfg NoConflictingFinality
-expect_violation CheckpointFinalitySafety CheckpointFinalitySafety_strict.cfg FinalizedStaysCanonical
+expect_pass CheckpointFinalitySafety CheckpointFinalitySafety_strict.cfg
+expect_violation CheckpointFinalitySafety CheckpointFinalitySafety_pollonly.cfg FinalizedStaysCanonical
 expect_violation CheckpointFinalitySafety CheckpointFinalitySafety_committees.cfg NoConflictingFinality
 if [ "${TLA_FINALITY_DEEP:-0}" = "1" ]; then
     TIMEOUT="${TLC_DEEP_TIMEOUT:-7200}" expect_pass CheckpointFinalitySafety CheckpointFinalitySafety_deep.cfg

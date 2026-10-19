@@ -259,6 +259,26 @@ normal fork choice; an invalid certificate never clears automatically. "Reorg to
 branch if it can" is deliberately NOT implemented as a forced reorg (no safe path exists for
 it yet): the node halts finality and alarms instead.
 
+**Floor at finalization (Enforced, spec §5 S2).** The 5 s poll alone left a window between
+`finalize_checkpoint` and the next poll in which a reorg could revert a just-finalized block.
+In Enforced mode the floor verifier is installed as the manager's `FinalizationGuard`
+(`FloorVerifier::install_finalization_guard`, `main.rs`), which `finalize_checkpoint` runs
+once quorum is confirmed and BEFORE the finalization is visible (DAG mark, persisted
+certificate, `latest_finalized_height()`), with no manager lock held (finalizations are
+serialized by their own mutex). It runs the poll's check under the same locks
+(`FloorVerifier::on_finalize`): a match raises the floor in the advance-lock critical section
+that confirmed it; a different block at `H` is a mismatch stop; a block that cannot be
+confirmed now (applied tip below `H`, or the check could not complete) is an `Unconfirmed`
+stop, which clears like a mismatch once the block is confirmed canonical and becomes a
+mismatch if another block is found at `H`. So when finalization becomes visible, either the
+floor covers the certified block or the gadget is halted (proposes and signs nothing). The
+certificate is also registered with the applicator (`register_certified`, at most 64, highest
+kept; at boot, when the latest certificate does not match, the older stored certificates are
+verified and registered too): every reorg first raises the floor to the highest registered
+certificate whose block is canonical, under the advance lock (`effective_floor`), so a
+certified block that becomes canonical after its check is protected at once. The poll stays
+as a backstop. Legacy and Observed install no guard (unchanged).
+
 ### 4.6 RPC surface
 Add `finalized` and `safe` block tags to `eth_rpc.rs`. **There are ~8 block-tag parse sites,
 not 2** (`:329, :832, :1662, :1683, :1886, :1897, :2555, :2616`) — all must learn the new
@@ -443,13 +463,15 @@ message).
   binding a certificate's committee to the governing epoch snapshot before certificates arrive
   from peers (`verify_certificate` checks internal consistency only). One is an open finding,
   below.
-- **Open finding (S2 window):** §5 S2 is stated against `latest_finalized_height()`. The
-  code raises the reorg floor only on the verifier's 5 s poll,
-  so between `finalize_checkpoint` and the next poll a reorg below the new certificate still
-  proceeds; the poll then halts finality (safety stop), never pins the wrong branch. Test:
-  `s2_strict_reorg_below_fresh_certificate_is_rejected` (ignored, "bug: …"); TLA+:
-  `CheckpointFinalitySafety_strict.cfg`. Decision for the owner: raise the floor at finalization
-  (after the same hash check) or restate S2 against the verified height.
+- **S2 window (found by this suite, fixed):** the reorg floor used to follow finality only on
+  the verifier's 5 s poll, so between `finalize_checkpoint` and the next poll a reorg below the
+  new certificate still proceeded. The floor is now raised at finalization (§4.5, "Floor at
+  finalization"). Tests: `s2_strict_reorg_below_fresh_certificate_is_rejected`,
+  `s2_certificate_not_yet_applied_pauses_then_protects_on_return`,
+  `s2_unconfirmed_becomes_mismatch_when_another_block_is_applied`; TLA+:
+  `CheckpointFinalitySafety_strict.cfg` must pass (`FinalizedNeverReverted`,
+  `FinalizedStaysCanonical`), `CheckpointFinalitySafety_pollonly.cfg` (the poll-only design)
+  must still produce the counterexample.
 - **Open finding (S1 across sibling committees; review of #333 @ 0286eff):** the committee for
   `(H, block)` is drawn by `FinalityGadget::committee_for` from the governing snapshot with the
   CANDIDATE block's own VRF output as seed. Once the validator set is larger than
@@ -469,8 +491,9 @@ message).
 - **TLA+:** `specs/tla/consensus/CheckpointFinalitySafety.tla` models S1/S2 across nodes
   (actions Propose, SignVote, Finalize, VerifyFloor, Reorg, Restart). TLC runs in CI
   (`.github/workflows/tla-finality.yml` → `scripts/ci/tla_finality.sh`, TLC 1.7.1 sha256-pinned):
-  the bounded gating config must pass, and four configs must produce counterexamples
-  (f ≥ n/3; no durable signed-vote record; strict S2; per-candidate committees). The two-height config
+  the bounded gating and strict-S2 configs must pass, and four configs must produce
+  counterexamples (f ≥ n/3; no durable signed-vote record; poll-only floor; per-candidate
+  committees). The two-height config
   (`_deep.cfg`) runs on demand (`TLA_FINALITY_DEEP=1`; exhaustive local run 2026-10-19:
   92.1M distinct states, no violation, 46 min). `CheckpointVoteSafety` now runs too,
   with a submission bound and two invariants restated (errata in the spec: as first written they

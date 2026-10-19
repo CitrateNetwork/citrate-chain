@@ -2171,7 +2171,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             //   Observed (voting ON, enforcement OFF): verified height -> metric
             //            only; floor and RPC tags unchanged (genesis).
             //   Enforced (both ON): verified height raises the floor and the
-            //            RPC tags.
+            //            RPC tags — AT FINALIZATION (the verifier is installed as
+            //            the checkpoint manager's FinalizationGuard, so the floor
+            //            rises before the finalized height is visible; spec §5 S2),
+            //            with the 5 s poll as a backstop.
             // Mismatch / invalid certificate: safety stop (gadget halted, floor and
             // RPC tags frozen, CHECKPOINT FINALITY SAFETY STOP alarm + metrics).
             // Same compiled voting pin and chain id as `finality_gadget` (whose
@@ -2184,6 +2187,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 finality_gadget.safety_stop(),
                 finality_observed.clone(),
             ));
+            // Enforced only (no-op in Legacy / Observed): installed before the
+            // boot check and before the driver / vote handler can finalize.
+            let _ = floor_verifier.install_finalization_guard();
             // Boot check BEFORE any block admission, drain or recovery (all set up
             // below): a node restarting with a certificate for a branch it is not on
             // halts finality before it does anything else.
