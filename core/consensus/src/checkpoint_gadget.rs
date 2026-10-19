@@ -73,19 +73,32 @@ fn pinned_in(table: &[(u64, bool)], chain_id: u64) -> bool {
         .is_some_and(|(_, on)| *on)
 }
 
-/// §11.5 early-vote buffer bound: distinct `(height, block_hash)` keys held at once.
-pub const MAX_EARLY_VOTE_KEYS: usize = 32;
-/// §11.5 early-vote buffer bound: distinct hashes buffered for ONE height. Honest
-/// votes at a buried height name one hash; more than a few is an attacker or a
-/// deep fork, and must not crowd out other heights.
-pub const MAX_EARLY_HASHES_PER_HEIGHT: usize = 4;
-/// §11.5 early-vote buffer bound: votes held per `(height, block_hash)` key.
-/// >= the default committee cap (100), so one honest checkpoint fits whole.
-pub const MAX_EARLY_VOTES_PER_KEY: usize = 256;
 /// §11.5 early-vote buffer bound: a vote more than this many blocks above the
-/// node's last observed canonical tip is not buffered (it cannot be for a block
-/// this node is about to bury).
+/// node's horizon base — the greater of its last observed canonical tip and its
+/// latest finalized height, so `0` before the first tip observation, never
+/// "unbounded" — is not buffered (it cannot be for a block this node is about
+/// to bury). A buffered vote whose height falls more than this many blocks
+/// BELOW the observed tip is expired: the node has passed it without proposing.
 pub const EARLY_VOTE_HORIZON_BLOCKS: u64 = 256;
+/// §11.5 early-vote buffer bound: votes held per voter in the authenticated
+/// buffer (one per height — a voter's second, different hash at a height is
+/// refused). Capacity is accounted PER VOTER, so no validator — and no set of
+/// validators — can crowd out another validator's early votes. At the cap a
+/// vote for a nearer height evicts the voter's own farthest one.
+pub const MAX_EARLY_VOTES_PER_VOTER: usize = 64;
+/// §11.5 memory backstop for the authenticated buffer (all voters). Only
+/// reachable with a very large validator set; when full, a new vote evicts the
+/// farthest vote of the voter holding the most (fair share), and is refused
+/// only when its own voter already holds the most.
+pub const MAX_EARLY_VOTES_TOTAL: usize = 16_384;
+/// §11.5: votes whose governing epoch validator snapshot is not materialized on
+/// this node yet cannot be authenticated, so they live in a SEPARATE small
+/// quota that can never take capacity from votes of known validators. They are
+/// re-checked against the snapshot once it appears (members are promoted,
+/// non-members dropped) and on replay.
+pub const MAX_UNVERIFIED_EARLY_VOTES: usize = 64;
+/// Per-voter bound inside the unverified quota.
+pub const MAX_UNVERIFIED_VOTES_PER_VOTER: usize = 4;
 /// Bound on the durable signed-vote record, in checkpoint boundaries: records
 /// are kept for at most this many boundaries below the highest height this node
 /// has signed. Older records are deleted together with raising the durable
@@ -202,8 +215,10 @@ pub enum InboundOutcome {
         error: CheckpointError,
         relay: Option<CheckpointVote>,
     },
-    /// Signature-valid vote for a checkpoint this node has not proposed yet;
-    /// held in the bounded early-vote buffer (switch ON only).
+    /// Signature-valid vote for a checkpoint this node has not proposed yet,
+    /// from a member of the governing epoch validator snapshot (or, while that
+    /// snapshot is not on this node, within the small unverified quota); held in
+    /// the bounded early-vote buffer (switch ON only).
     Buffered,
     /// Rejected (invalid, duplicate, stale, or the buffer refused it).
     Rejected(CheckpointError),
@@ -264,11 +279,177 @@ pub enum SkipReason {
     ProposeFailed(String),
 }
 
+/// §11.5 early-vote store: votes keyed by `(height, block_hash)` with a per-voter
+/// index (`voter -> height -> hash`) so capacity is accounted per voter and one
+/// voter holds at most one vote per height.
+#[derive(Default)]
+struct EarlyBuffer {
+    votes: BTreeMap<(u64, Hash), HashMap<PublicKey, CheckpointVote>>,
+    by_voter: HashMap<PublicKey, BTreeMap<u64, Hash>>,
+    len: usize,
+}
+
+impl EarlyBuffer {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn keys(&self) -> usize {
+        self.votes.len()
+    }
+
+    fn voter_count(&self, voter: &PublicKey) -> usize {
+        self.by_voter.get(voter).map_or(0, BTreeMap::len)
+    }
+
+    /// Remove `voter`'s vote at `height`, if held.
+    fn remove_entry(&mut self, voter: &PublicKey, height: u64) {
+        let Some(heights) = self.by_voter.get_mut(voter) else {
+            return;
+        };
+        let Some(hash) = heights.remove(&height) else {
+            return;
+        };
+        if heights.is_empty() {
+            self.by_voter.remove(voter);
+        }
+        let key = (height, hash);
+        if let Some(slot) = self.votes.get_mut(&key) {
+            if slot.remove(voter).is_some() {
+                self.len = self.len.saturating_sub(1);
+            }
+            if slot.is_empty() {
+                self.votes.remove(&key);
+            }
+        }
+    }
+
+    /// Admit `vote` under a per-voter cap and a total cap (see
+    /// [`MAX_EARLY_VOTES_PER_VOTER`] / [`MAX_EARLY_VOTES_TOTAL`] for the policy).
+    fn insert(
+        &mut self,
+        vote: CheckpointVote,
+        per_voter_cap: usize,
+        total_cap: usize,
+    ) -> Result<(), CheckpointError> {
+        let voter = vote.voter;
+        let height = vote.height;
+        if let Some(held) = self.by_voter.get(&voter).and_then(|m| m.get(&height)) {
+            return Err(if *held == vote.block_hash {
+                CheckpointError::DuplicateVote(voter)
+            } else {
+                CheckpointError::StorageError(
+                    "voter already has an early vote for another hash at this height".to_string(),
+                )
+            });
+        }
+        if self.voter_count(&voter) >= per_voter_cap {
+            // Nearest-first: a nearer height displaces this voter's own farthest.
+            let farthest = self
+                .by_voter
+                .get(&voter)
+                .and_then(|m| m.keys().next_back().copied());
+            match farthest {
+                Some(far) if height < far => self.remove_entry(&voter, far),
+                _ => {
+                    return Err(CheckpointError::StorageError(
+                        "early-vote buffer full for voter".to_string(),
+                    ))
+                }
+            }
+        }
+        if self.len >= total_cap {
+            // Fair share: evict from the voter holding the most (deterministic
+            // tie-break by key bytes), never from a lighter voter.
+            let own = self.voter_count(&voter);
+            let heaviest = self
+                .by_voter
+                .iter()
+                .map(|(pk, m)| (m.len(), *pk.as_bytes(), *pk))
+                .max_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            let victim = heaviest.and_then(|(count, _, pk)| {
+                let far = self.by_voter.get(&pk)?.keys().next_back().copied()?;
+                (count > own).then_some((pk, far))
+            });
+            match victim {
+                Some((pk, far)) => self.remove_entry(&pk, far),
+                None => {
+                    return Err(CheckpointError::StorageError(
+                        "early-vote buffer full".to_string(),
+                    ))
+                }
+            }
+        }
+        self.by_voter
+            .entry(voter)
+            .or_default()
+            .insert(height, vote.block_hash);
+        self.votes
+            .entry((height, vote.block_hash))
+            .or_default()
+            .insert(voter, vote);
+        self.len = self.len.saturating_add(1);
+        Ok(())
+    }
+
+    /// Remove every vote at `height` (all hashes) and return them.
+    fn take_height(&mut self, height: u64) -> Vec<CheckpointVote> {
+        let keys: Vec<(u64, Hash)> = self
+            .votes
+            .range((height, Hash::new([0u8; 32]))..=(height, Hash::new([0xffu8; 32])))
+            .map(|(k, _)| *k)
+            .collect();
+        self.take_keys(&keys)
+    }
+
+    /// Drop every vote whose height fails `keep`.
+    fn retain_heights(&mut self, keep: impl Fn(u64) -> bool) {
+        let keys: Vec<(u64, Hash)> = self
+            .votes
+            .keys()
+            .filter(|(h, _)| !keep(*h))
+            .copied()
+            .collect();
+        let _ = self.take_keys(&keys);
+    }
+
+    fn take_keys(&mut self, keys: &[(u64, Hash)]) -> Vec<CheckpointVote> {
+        let mut out = Vec::new();
+        for key in keys {
+            let Some(slot) = self.votes.remove(key) else {
+                continue;
+            };
+            for (voter, vote) in slot {
+                if let Some(heights) = self.by_voter.get_mut(&voter) {
+                    heights.remove(&key.0);
+                    if heights.is_empty() {
+                        self.by_voter.remove(&voter);
+                    }
+                }
+                self.len = self.len.saturating_sub(1);
+                out.push(vote);
+            }
+        }
+        out
+    }
+
+    /// Distinct heights held.
+    fn heights(&self) -> Vec<u64> {
+        let mut hs: Vec<u64> = self.votes.keys().map(|(h, _)| *h).collect();
+        hs.dedup();
+        hs
+    }
+}
+
 #[derive(Default)]
 struct GadgetState {
-    /// §11.5: signature-valid votes received before this node proposed the
-    /// checkpoint they name, keyed by `(height, block_hash)`.
-    early: BTreeMap<(u64, Hash), HashMap<PublicKey, CheckpointVote>>,
+    /// §11.5: signature-valid votes from members of the governing epoch
+    /// validator snapshot, received before this node proposed the checkpoint
+    /// they name.
+    early: EarlyBuffer,
+    /// §11.5: signature-valid votes whose governing snapshot is not on this node
+    /// yet — a separate small quota (see [`MAX_UNVERIFIED_EARLY_VOTES`]).
+    unverified: EarlyBuffer,
     /// Highest canonical tip the node has reported (bounds the buffer horizon).
     observed_tip: u64,
     /// Cached durable signed-vote watermarks, loaded from the store on first use
@@ -445,15 +626,21 @@ impl FinalityGadget {
         // §11.5 replay: votes that arrived before this proposal.
         let buffered = {
             let mut st = self.state.lock().await;
-            let votes = st.early.remove(&(height, block_hash));
-            // Votes for any OTHER hash at this height can never attach now.
-            st.early.retain(|(h, _), _| *h != height);
+            // Votes for any OTHER hash at this height can never attach now, so
+            // the whole height is drained from both buffers.
+            let mut votes = st.early.take_height(height);
+            votes.extend(st.unverified.take_height(height));
             votes
         };
-        if let Some(votes) = buffered {
-            let mut votes: Vec<CheckpointVote> = votes.into_values().collect();
-            // Deterministic replay order (by voter bytes).
+        {
+            let mut votes: Vec<CheckpointVote> = buffered
+                .into_iter()
+                .filter(|v| v.block_hash == block_hash)
+                .collect();
+            // Deterministic replay order (by voter bytes); a voter held in both
+            // buffers is replayed once.
             votes.sort_by(|a, b| a.voter.as_bytes().cmp(b.voter.as_bytes()));
+            votes.dedup_by(|a, b| a.voter == b.voter);
             for vote in votes {
                 match self.manager.submit_vote(vote.clone()).await {
                     Ok(quorum) => {
@@ -472,11 +659,46 @@ impl FinalityGadget {
     }
 
     /// Record the latest canonical tip this node has applied (bounds the
-    /// early-vote horizon).
+    /// early-vote horizon), expire buffered votes the node has passed, and
+    /// re-check unverified votes whose governing snapshot has since appeared.
+    /// Switch OFF: nothing (the buffers are never used).
     pub async fn observe_tip(&self, tip: u64) {
+        if !self.enabled {
+            return;
+        }
+        let pending_heights = {
+            let mut st = self.state.lock().await;
+            if tip > st.observed_tip {
+                st.observed_tip = tip;
+            }
+            let floor = st.observed_tip.saturating_sub(EARLY_VOTE_HORIZON_BLOCKS);
+            st.early.retain_heights(|h| h >= floor);
+            st.unverified.retain_heights(|h| h >= floor);
+            st.unverified.heights()
+        };
+        let Some(source) = self.committee_source.as_ref() else {
+            return;
+        };
+        // Snapshot lookups happen outside the state lock.
+        let mut resolved = Vec::new();
+        for h in pending_heights {
+            if let Some((_snapshot, set)) = source.epoch_committee_set(h).await {
+                resolved.push((h, set));
+            }
+        }
+        if resolved.is_empty() {
+            return;
+        }
         let mut st = self.state.lock().await;
-        if tip > st.observed_tip {
-            st.observed_tip = tip;
+        for (h, set) in resolved {
+            for vote in st.unverified.take_height(h) {
+                if set.iter().any(|(pk, _)| *pk == vote.voter) {
+                    // A refusal here (duplicate / voter cap) just drops it.
+                    let _ = st
+                        .early
+                        .insert(vote, MAX_EARLY_VOTES_PER_VOTER, MAX_EARLY_VOTES_TOTAL);
+                }
+            }
         }
     }
 
@@ -486,8 +708,11 @@ impl FinalityGadget {
     /// `finalize_checkpoint` on quorum; nothing is buffered or relayed.
     ///
     /// Switch ON: as above when the checkpoint is pending; otherwise a
-    /// signature-valid vote for a future boundary is buffered (§11.5). Every vote
-    /// accepted for the first time is returned for a single re-gossip.
+    /// signature-valid vote for a future boundary, within the horizon, from a
+    /// member of the epoch validator snapshot governing that boundary is
+    /// buffered (§11.5); outsiders are refused (`NotInCommittee`) and take no
+    /// buffer space. Every vote accepted for the first time is returned for a
+    /// single re-gossip.
     pub async fn on_inbound_vote(&self, vote: CheckpointVote) -> InboundOutcome {
         let height = vote.height;
         if !self.enabled {
@@ -540,16 +765,29 @@ impl FinalityGadget {
         if !cfg.is_checkpoint_height(height) {
             return InboundOutcome::Rejected(CheckpointError::NotCheckpointBoundary);
         }
-        if height <= self.manager.latest_finalized_height().await
-            || self.manager.is_finalized(height).await
-        {
+        let finalized = self.manager.latest_finalized_height().await;
+        if height <= finalized || self.manager.is_finalized(height).await {
             return InboundOutcome::Rejected(CheckpointError::AlreadyExists(height));
         }
         // Verify before holding: an unverifiable vote must not take buffer space.
-        // Committee membership is checked on replay (the committee needs the
-        // block at `height`, which this node does not have buried yet).
         if let Err(e) = verify_vote_signature(&vote, cfg.chain_id) {
             return InboundOutcome::Rejected(e);
+        }
+        // Authenticate the voter against the epoch validator snapshot that
+        // governs `height` (the same set `committee_for` selects from). Exact
+        // committee membership needs the block's VRF seed and is checked on
+        // replay; set membership is what keeps outsiders out of the buffer.
+        // `None` = the snapshot is not on this node yet => unverified quota.
+        let Some(source) = self.committee_source.as_ref() else {
+            // No committee can ever be derived here; nothing to buffer for.
+            return InboundOutcome::Rejected(CheckpointError::NotInCommittee(vote.voter));
+        };
+        let member = source
+            .epoch_committee_set(height)
+            .await
+            .map(|(_snapshot, set)| set.iter().any(|(pk, _)| *pk == vote.voter));
+        if member == Some(false) {
+            return InboundOutcome::Rejected(CheckpointError::NotInCommittee(vote.voter));
         }
         let mut st = self.state.lock().await;
         // Re-check under the buffer lock: `on_buried_checkpoint` creates the
@@ -562,35 +800,28 @@ impl FinalityGadget {
             drop(st);
             return self.submit_pending(vote).await;
         }
-        if st.observed_tip > 0 && height > st.observed_tip.saturating_add(EARLY_VOTE_HORIZON_BLOCKS)
+        // Horizon, enforced from the first vote: before any tip observation
+        // the base is the finalized height (0 on a fresh node), never unbounded.
+        let base = st.observed_tip.max(finalized);
+        if height > base.saturating_add(EARLY_VOTE_HORIZON_BLOCKS)
+            || height.saturating_add(EARLY_VOTE_HORIZON_BLOCKS) < st.observed_tip
         {
             return InboundOutcome::Rejected(CheckpointError::BlockNotFound(vote.block_hash));
         }
-        let key = (height, vote.block_hash);
-        if !st.early.contains_key(&key) {
-            let hashes_at_height = st
-                .early
-                .range((height, Hash::new([0u8; 32]))..=(height, Hash::new([0xffu8; 32])))
-                .count();
-            if hashes_at_height >= MAX_EARLY_HASHES_PER_HEIGHT
-                || st.early.len() >= MAX_EARLY_VOTE_KEYS
-            {
-                return InboundOutcome::Rejected(CheckpointError::StorageError(
-                    "early-vote buffer full".to_string(),
-                ));
-            }
+        let admitted = if member == Some(true) {
+            st.early
+                .insert(vote, MAX_EARLY_VOTES_PER_VOTER, MAX_EARLY_VOTES_TOTAL)
+        } else {
+            st.unverified.insert(
+                vote,
+                MAX_UNVERIFIED_VOTES_PER_VOTER,
+                MAX_UNVERIFIED_EARLY_VOTES,
+            )
+        };
+        match admitted {
+            Ok(()) => InboundOutcome::Buffered,
+            Err(e) => InboundOutcome::Rejected(e),
         }
-        let slot = st.early.entry(key).or_default();
-        if slot.contains_key(&vote.voter) {
-            return InboundOutcome::Rejected(CheckpointError::DuplicateVote(vote.voter));
-        }
-        if slot.len() >= MAX_EARLY_VOTES_PER_KEY {
-            return InboundOutcome::Rejected(CheckpointError::StorageError(
-                "early-vote buffer full for checkpoint".to_string(),
-            ));
-        }
-        slot.insert(vote.voter, vote);
-        InboundOutcome::Buffered
     }
 
     async fn finalize(&self, height: u64) -> bool {
@@ -761,7 +992,8 @@ impl FinalityGadget {
         let floor = self.manager.latest_finalized_height().await;
         self.manager.prune_at_or_below(floor).await;
         let mut st = self.state.lock().await;
-        st.early.retain(|(h, _), _| *h > floor);
+        st.early.retain_heights(|h| h > floor);
+        st.unverified.retain_heights(|h| h > floor);
         if self.enabled && floor > 0 {
             self.prune_signed_records(&mut st, floor);
         }
@@ -787,19 +1019,24 @@ impl FinalityGadget {
         SignedVoteMeta::decode(&bytes)
     }
 
-    /// Number of `(height, hash)` keys in the early-vote buffer.
+    /// Number of `(height, hash)` keys in the early-vote buffers (authenticated
+    /// plus unverified quota).
     pub async fn early_vote_keys(&self) -> usize {
-        self.state.lock().await.early.len()
+        let st = self.state.lock().await;
+        st.early.keys().saturating_add(st.unverified.keys())
     }
 
-    /// Total votes held in the early-vote buffer.
+    /// Total votes held in the early-vote buffers (authenticated plus
+    /// unverified quota).
     pub async fn early_vote_count(&self) -> usize {
-        self.state
-            .lock()
-            .await
-            .early
-            .values()
-            .fold(0usize, |acc, m| acc.saturating_add(m.len()))
+        let st = self.state.lock().await;
+        st.early.len().saturating_add(st.unverified.len())
+    }
+
+    /// Votes held in the unverified quota only (governing snapshot not yet on
+    /// this node).
+    pub async fn unverified_early_vote_count(&self) -> usize {
+        self.state.lock().await.unverified.len()
     }
 }
 
@@ -1290,25 +1527,267 @@ mod tests {
         assert_eq!(g.early_vote_keys().await, 0);
     }
 
-    /// §11.5 bound: the buffer never exceeds its key/hash caps under a flood.
+    /// §11.5 bound: one member cannot flood — one vote per height (a second
+    /// hash at a height is refused), at most MAX_EARLY_VOTES_PER_VOTER overall,
+    /// and at the cap a nearer height displaces only that voter's farthest.
     #[tokio::test]
-    async fn early_buffer_is_bounded_under_flood() {
+    async fn early_buffer_is_bounded_per_voter_under_flood() {
         let ks = keys(4);
         let g = gadget(&ks, true).await;
         let k1 = ks.get(1).expect("key 1");
-        // Many hashes at one height.
+        // Many hashes at one height: only the first is held.
         for i in 0u8..20 {
             let v = sign_checkpoint_vote(CHAIN, 10, Hash::new([i.saturating_add(100); 32]), k1);
             let _ = g.on_inbound_vote(v).await;
         }
-        assert!(g.early_vote_keys().await <= MAX_EARLY_HASHES_PER_HEIGHT);
-        // Many heights.
-        for h in 0u64..200 {
+        assert_eq!(g.early_vote_count().await, 1);
+        // Many heights (all within the startup horizon of 256).
+        for h in 0u64..120 {
             let height = 12u64.saturating_add(h.saturating_mul(2));
             let v = sign_checkpoint_vote(CHAIN, height, Hash::new([1; 32]), k1);
             let _ = g.on_inbound_vote(v).await;
         }
-        assert!(g.early_vote_keys().await <= MAX_EARLY_VOTE_KEYS);
+        assert_eq!(g.early_vote_count().await, MAX_EARLY_VOTES_PER_VOTER);
+        // Another member is unaffected by k1's flood.
+        let k2 = ks.get(2).expect("key 2");
+        let v = sign_checkpoint_vote(CHAIN, 200, Hash::new([1; 32]), k2);
+        assert!(matches!(
+            g.on_inbound_vote(v).await,
+            InboundOutcome::Buffered
+        ));
+        // k1's original h=10 vote (its nearest) survived the flood.
+        let dup = sign_checkpoint_vote(CHAIN, 10, Hash::new([100; 32]), k1);
+        assert!(matches!(
+            g.on_inbound_vote(dup).await,
+            InboundOutcome::Rejected(CheckpointError::DuplicateVote(_))
+        ));
+    }
+
+    /// Distinct signing keys that are NOT in any validator snapshot.
+    fn outsiders(n: u16) -> Vec<SigningKey> {
+        (0..n)
+            .map(|i| {
+                let mut seed = [0u8; 32];
+                seed[..2].copy_from_slice(&i.to_le_bytes());
+                seed[2] = 0xEE;
+                SigningKey::from_bytes(&seed)
+            })
+            .collect()
+    }
+
+    /// Outsider flood: 256 arbitrary keys sign valid-signature votes for the
+    /// checkpoint (and for far heights / junk hashes) BEFORE this node proposes.
+    /// None takes buffer space; the honest early votes still buffer, replay and
+    /// finalize.
+    #[tokio::test]
+    async fn outsider_flood_does_not_displace_honest_early_votes() {
+        let ks = keys(4);
+        let g = gadget(&ks, true).await;
+        for (i, o) in outsiders(256).iter().enumerate() {
+            for v in [
+                sign_checkpoint_vote(CHAIN, 10, block_hash(10), o),
+                sign_checkpoint_vote(CHAIN, 10, Hash::new([0xAB; 32]), o),
+                sign_checkpoint_vote(
+                    CHAIN,
+                    12u64.saturating_add(2 * i as u64 % 200),
+                    block_hash(12),
+                    o,
+                ),
+            ] {
+                let res = g.on_inbound_vote(v).await;
+                assert!(
+                    matches!(
+                        res,
+                        InboundOutcome::Rejected(CheckpointError::NotInCommittee(_))
+                    ),
+                    "outsider {i}: {res:?}"
+                );
+            }
+        }
+        assert_eq!(g.early_vote_count().await, 0);
+        for k in ks.iter().skip(1) {
+            let res = g
+                .on_inbound_vote(sign_checkpoint_vote(CHAIN, 10, block_hash(10), k))
+                .await;
+            assert!(matches!(res, InboundOutcome::Buffered), "got {res:?}");
+        }
+        let out = g
+            .on_buried_checkpoint(10, block_hash(10), &Hash::new([4; 32]), None)
+            .await;
+        assert!(out.proposed && out.finalized);
+        assert_eq!(g.manager().latest_finalized_height().await, 10);
+    }
+
+    /// Startup (observed tip 0): far-future votes are refused even from members,
+    /// so 32+ far-future keys cannot occupy the buffer; in-horizon votes buffer.
+    #[tokio::test]
+    async fn startup_with_no_tip_cannot_be_poisoned_by_far_future_keys() {
+        let ks = keys(4);
+        let g = gadget(&ks, true).await;
+        let k1 = ks.get(1).expect("key 1");
+        for i in 0u64..64 {
+            let far = EARLY_VOTE_HORIZON_BLOCKS
+                .saturating_add(2)
+                .saturating_add(i.saturating_mul(1000));
+            let res = g
+                .on_inbound_vote(sign_checkpoint_vote(CHAIN, far, block_hash(10), k1))
+                .await;
+            assert!(
+                matches!(res, InboundOutcome::Rejected(_)),
+                "h={far}: {res:?}"
+            );
+        }
+        assert_eq!(g.early_vote_keys().await, 0);
+        for k in ks.iter().skip(1) {
+            let res = g
+                .on_inbound_vote(sign_checkpoint_vote(CHAIN, 10, block_hash(10), k))
+                .await;
+            assert!(matches!(res, InboundOutcome::Buffered), "got {res:?}");
+        }
+        let out = g
+            .on_buried_checkpoint(10, block_hash(10), &Hash::new([4; 32]), None)
+            .await;
+        assert!(out.finalized);
+    }
+
+    /// Stale entries are evicted: a vote the node's tip has passed by more than
+    /// the horizon is dropped on the next tip observation, and refused on entry.
+    #[tokio::test]
+    async fn stale_early_votes_are_evicted() {
+        let ks = keys(4);
+        let g = gadget(&ks, true).await;
+        let k1 = ks.get(1).expect("key 1");
+        let k2 = ks.get(2).expect("key 2");
+        let res = g
+            .on_inbound_vote(sign_checkpoint_vote(CHAIN, 10, block_hash(10), k1))
+            .await;
+        assert!(matches!(res, InboundOutcome::Buffered));
+        let res = g
+            .on_inbound_vote(sign_checkpoint_vote(CHAIN, 200, block_hash(10), k2))
+            .await;
+        assert!(matches!(res, InboundOutcome::Buffered));
+        let tip = 10u64
+            .saturating_add(EARLY_VOTE_HORIZON_BLOCKS)
+            .saturating_add(2);
+        g.observe_tip(tip).await;
+        assert_eq!(g.early_vote_count().await, 1, "only the h=200 vote is live");
+        let res = g
+            .on_inbound_vote(sign_checkpoint_vote(CHAIN, 10, block_hash(10), k2))
+            .await;
+        assert!(matches!(res, InboundOutcome::Rejected(_)), "stale on entry");
+    }
+
+    /// Snapshot not yet on this node: votes go to a separate small quota an
+    /// outsider flood can fill but never spill out of — known validators' votes
+    /// for snapshot-covered heights still buffer. When the snapshot appears,
+    /// members are promoted and outsiders dropped.
+    #[tokio::test]
+    async fn unverified_quota_cannot_starve_known_validators_and_is_revalidated() {
+        let ks = keys(4);
+        let kv: Arc<dyn KvStore> = Arc::new(MemKv::default());
+        let mgr = Arc::new(CheckpointManager::with_persistence(
+            config(),
+            dag_with(4).await,
+            kv,
+        ));
+        let sel = selector_with(&ks).await; // S(1) = 1 governs 2..=1000
+        let g = FinalityGadget::with_switch(mgr, Some(sel.clone()), true);
+        g.observe_tip(990).await;
+        // 1002 is governed by S(2) = 1001, not on this node yet.
+        let h_unknown = 1002u64;
+        for o in outsiders(256).iter() {
+            let _ = g
+                .on_inbound_vote(sign_checkpoint_vote(CHAIN, h_unknown, block_hash(1), o))
+                .await;
+        }
+        assert_eq!(
+            g.unverified_early_vote_count().await,
+            MAX_UNVERIFIED_EARLY_VOTES,
+            "outsiders capped to the separate quota"
+        );
+        // Known validators' votes for a snapshot-covered height are unaffected.
+        for k in ks.iter().skip(1) {
+            let res = g
+                .on_inbound_vote(sign_checkpoint_vote(CHAIN, 998, block_hash(1), k))
+                .await;
+            assert!(matches!(res, InboundOutcome::Buffered), "got {res:?}");
+        }
+        // Install S(2) = 1001 with the same set: the outsiders are dropped.
+        let set: Vec<(PublicKey, u128)> = ks.iter().map(|k| (pk(k), 1000u128)).collect();
+        sel.record_snapshot(1001, &set, 1).await;
+        g.observe_tip(991).await;
+        assert_eq!(
+            g.unverified_early_vote_count().await,
+            0,
+            "outsiders dropped once the snapshot is known"
+        );
+        assert_eq!(g.early_vote_count().await, 3);
+        // With the snapshot known, outsiders are refused outright.
+        let os = outsiders(6);
+        let o0 = os.first().expect("outsider");
+        let res = g
+            .on_inbound_vote(sign_checkpoint_vote(CHAIN, h_unknown, block_hash(1), o0))
+            .await;
+        assert!(matches!(
+            res,
+            InboundOutcome::Rejected(CheckpointError::NotInCommittee(_))
+        ));
+
+        // Promotion: 2002 is governed by S(3) = 2001 (not on this node). A
+        // member's vote waits in the quota next to outsiders, then is promoted.
+        g.observe_tip(1990).await; // the h=998 votes are now stale and expire
+        assert_eq!(g.early_vote_count().await, 0);
+        let k1 = ks.get(1).expect("key 1");
+        let res = g
+            .on_inbound_vote(sign_checkpoint_vote(CHAIN, 2002, block_hash(1), k1))
+            .await;
+        assert!(matches!(res, InboundOutcome::Buffered), "got {res:?}");
+        for o in &os {
+            let _ = g
+                .on_inbound_vote(sign_checkpoint_vote(CHAIN, 2002, block_hash(1), o))
+                .await;
+        }
+        assert_eq!(g.unverified_early_vote_count().await, 7);
+        sel.record_snapshot(2001, &set, 1).await;
+        g.observe_tip(1991).await;
+        assert_eq!(g.unverified_early_vote_count().await, 0);
+        assert_eq!(
+            g.early_vote_count().await,
+            1,
+            "the member's vote was promoted"
+        );
+    }
+
+    /// Fair-share backstop: at the total cap a lighter voter evicts the heaviest
+    /// voter's farthest vote; the heaviest cannot evict a lighter one.
+    #[test]
+    fn early_buffer_total_cap_is_fair_share() {
+        let ks = keys(3);
+        let k0 = ks.first().expect("k0");
+        let k1 = ks.get(1).expect("k1");
+        let mut b = EarlyBuffer::default();
+        for h in [10u64, 12, 14] {
+            b.insert(sign_checkpoint_vote(CHAIN, h, block_hash(1), k0), 8, 4)
+                .expect("k0 fits");
+        }
+        b.insert(sign_checkpoint_vote(CHAIN, 10, block_hash(1), k1), 8, 4)
+            .expect("k1 fits");
+        // Full (4). k1 (1 held) evicts k0's farthest (14).
+        b.insert(sign_checkpoint_vote(CHAIN, 12, block_hash(1), k1), 8, 4)
+            .expect("k1 evicts k0's farthest");
+        assert_eq!(b.len(), 4);
+        assert_eq!(b.voter_count(&pk(k0)), 2);
+        assert_eq!(b.voter_count(&pk(k1)), 2);
+        // Now tied at 2: neither may evict the other.
+        assert!(b
+            .insert(sign_checkpoint_vote(CHAIN, 16, block_hash(1), k0), 8, 4)
+            .is_err());
+        assert_eq!(b.len(), 4);
+        // Draining a height updates the per-voter index.
+        let taken = b.take_height(10);
+        assert_eq!(taken.len(), 2);
+        assert_eq!(b.voter_count(&pk(k0)), 1);
+        assert_eq!(b.len(), 2);
     }
 
     /// §11.9: finalization prunes pending + voted + buffered state at/below it,

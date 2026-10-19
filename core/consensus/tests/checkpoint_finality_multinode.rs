@@ -246,6 +246,45 @@ async fn four_validators_reach_quorum_and_finalize_everywhere() {
     }
 }
 
+/// Outsider flood against the slow node: before node 3 buries H, a peer floods
+/// it with 256 arbitrary keys' signature-valid votes for H (and junk hashes).
+/// None is buffered, the honest early votes are, and node 3 still finalizes H
+/// after the other three already finalized and spent their one-time relays.
+#[tokio::test]
+async fn outsider_flood_cannot_block_the_slow_node() {
+    let nodes = network(4, CHAIN, true).await;
+    let slow = nodes.get(3).expect("node 3");
+    let h = 10u64;
+    for i in 0u16..256 {
+        let mut seed = [0u8; 32];
+        seed[..2].copy_from_slice(&i.to_le_bytes());
+        seed[2] = 0xEE;
+        let attacker = Ed25519SigningKey::from_bytes(&seed);
+        for hash in [hash_at(h), seed_at(h)] {
+            let res = slow
+                .gadget
+                .on_inbound_vote(sign_checkpoint_vote(CHAIN, h, hash, &attacker))
+                .await;
+            assert!(matches!(res, InboundOutcome::Rejected(_)), "{res:?}");
+            assert!(res.relay().is_none(), "outsider votes are never relayed");
+        }
+    }
+    assert_eq!(slow.gadget.early_vote_count().await, 0);
+
+    let mut queue = VecDeque::new();
+    for i in 0..3 {
+        bury(&nodes, i, h, &mut queue).await;
+    }
+    gossip(&nodes, &mut queue).await;
+    for n in nodes.iter().take(3) {
+        assert_eq!(n.gadget.manager().latest_finalized_height().await, h);
+    }
+    assert_eq!(slow.gadget.early_vote_count().await, 3);
+    bury(&nodes, 3, h, &mut queue).await;
+    gossip(&nodes, &mut queue).await;
+    assert_eq!(slow.gadget.manager().latest_finalized_height().await, h);
+}
+
 /// Successive checkpoints keep finalizing; finality is monotone.
 #[tokio::test]
 async fn successive_checkpoints_finalize_in_order() {
