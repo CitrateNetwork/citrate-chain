@@ -5,7 +5,7 @@ author: Larry Klosowski (chain team; DGX session, Claude Opus 5.5)
 status: active
 version: v1 (2026-10-19). Re-issued at each rehearsal and at genesis
 applies_to: citrate-core, the design prototype (design/CitrateCore.dc.html), citrate.ai and docs copy
-verified_against: citrate-chain c384fc98, address book 40204.json (deployedAt 2026-10-06), live 40204 at block ~499,000
+verified_against: citrate-chain c384fc98, address book 40204.json (deployedAt 2026-10-06), live 40204 at head ~501,000 (latest state)
 ---
 
 # UI truth contract v1 (betanet workstream C1)
@@ -95,7 +95,7 @@ Service states (Alive, Ready, Stopping, Quarantined) belong to the K1 services c
 
 ## 2. Number catalog
 
-Amounts are SALT with 18 decimals (wei), so divide by 1e18. Addresses come from `contracts/addresses/40204.json`. "Today" was read live on 40204 at block ~499,000 (fixture `docs/ui-truth/fixtures/40204-2026-10-19.json`).
+Amounts are SALT with 18 decimals (wei), so divide by 1e18. Addresses come from `contracts/addresses/40204.json`. "Today" is latest state on live 40204 around head 501,000 (fixture `docs/ui-truth/fixtures/40204-2026-10-19.json`; per-read heads inside it).
 
 | Number | Source | Display | Today |
 |---|---|---|---|
@@ -106,7 +106,7 @@ Amounts are SALT with 18 decimals (wei), so divide by 1e18. Addresses come from 
 | Peers | Local `net_peerCount` | "N direct peers", not "the network" | 3 (public RPC) |
 | Base fee / gas price | `baseFeePerGas` of the latest block | "1 gwei (fixed)". It is a consensus constant | 1 gwei |
 | Active validators | `ValidatorRegistry.activeCount()` | Integer | 5 |
-| Producing validators | Distinct `proposerPubkey` over the last 1,000 blocks | Integer. Show it next to *active* so the gap is visible | 1 |
+| Producing validators | Distinct `proposerPubkey` over the last 1,000 blocks (fixture `producing_validators`, with its window) | Integer, with the window stated ("over the last N blocks"). A sample of N ≥ 100 is allowed if N is shown. Show it next to *active* so the gap is visible. A validator absent from the window is "not seen producing in the last N blocks", not "not producing" | 1 |
 | Minimum stake | `ValidatorRegistry.minStake()` | SALT. Read it; don't hard-code 32,000 | 32,000 |
 | Block reward | `ValidatorRegistry.blockSubsidy()` | "N SALT per block, to the producer". It is governance-set, so read it, never hard-code it | 10 SALT |
 | Epoch | `ValidatorRegistry.currentEpoch()`; `EPOCH()` = 1,000 blocks | Integer | 499 |
@@ -175,7 +175,10 @@ A node on a stale genesis usually shows up first as `net_peerCount` stuck at 0, 
 
 ## 7. Fixtures and rehearsal exports
 
-- `scripts/ui-truth/export-fixtures.sh [rpc] [out]` reads every catalog value at one block and writes `docs/ui-truth/fixtures/<chain>-<date>.json`. Each read records its source and the block number. The file carries `"fixture": true` and a label that must appear on screen.
+- `scripts/ui-truth/export-fixtures.sh [rpc] [out]` reads every catalog value and writes `docs/ui-truth/fixtures/<chain>-<date>.json`. The file carries `"fixture": true` and a label that must appear on screen.
+- **An export is not a single-block snapshot.** The node serves *latest* committed state for every block tag; there are no historical state reads. So each read records its source, `state: "latest"`, and the head it was observed at (`observed_head`). The file records `head_at_start`, `head_at_end` and `single_epoch`. Validator-set and registry parameters change only at epoch boundaries (1,000 blocks), so `single_epoch: true` means those reads are mutually consistent. If an export crosses an epoch, it warns, and it must be re-run before use.
+- `producing_validators` is exported with its window (`from_block`, `to_block`). Show it next to active validators.
+- `scripts/ui-truth/test-export-fixtures.sh` tests this offline against a stub RPC whose head moves during the export.
 - **Now**: `fixtures/40204-2026-10-19.json` (live 40204) is the prototype's data until rehearsal 1.
 - **Rehearsal 1** and **rehearsal 2**: the chain team exports from the rehearsal network and re-issues this contract. Design v2 uses the R1 export.
 - States that need data the chain doesn't have yet (Challenged pin, Exiting validator, an open round) are drawn from the state tables in §1, labelled "fixture", with values from the parameter reads.
