@@ -238,6 +238,8 @@ python3 scripts/producers/gen_node_config.py --profile 40204-r1005 --staker 0xâ€
 systemctl restart citrate-node
 ```
 
+Run the first command and continue only if it exits 0. The committee check reads the registry at the head, so it reports **UNKNOWN** (exit 3) when the registry changed after the governing snapshot (a registration, a stake change, an unbond, a slash or an executed parameter change) or when its logs cannot be read. UNKNOWN is not a pass: wait for the next snapshot (the message names its block) and run it again.
+
 Within a few hundred blocks the verifier should show **Producing blocks**:
 
 ```bash

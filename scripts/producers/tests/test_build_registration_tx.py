@@ -48,6 +48,7 @@ class TestBuild(unittest.TestCase):
         self.tmp.cleanup()
         os.environ.pop("FAKE_NODE_LOG", None)
         os.environ.pop("FAKE_NODE_FAIL", None)
+        os.environ.pop("FAKE_NODE_CHAIN_ID", None)
 
     def build(self, url, *extra):
         return run("--profile", "40204-r1005", "--rpc", url, "--staker", STAKER, "--config", "/x/node.toml",
@@ -125,6 +126,21 @@ class TestBuild(unittest.TestCase):
             rc, _, _, err = self.build(s.url)
         self.assertEqual(rc, 2)
         self.assertIn("proposer.key does not exist", err)
+
+    def test_refuses_a_proof_for_another_chain(self):
+        # node.toml from another network: the proof is signed for its chain id, the profile is
+        # 40204. The builder must stop instead of emitting a transaction the registry rejects.
+        os.environ["FAKE_NODE_CHAIN_ID"] = "31337"
+        with RpcStub(self.c) as s:
+            rc, _, text, err = self.build(s.url)
+        self.assertEqual(rc, 2)
+        self.assertIn("bound to chain 31337", err)
+        self.assertNotIn("unsigned_tx", text)
+        os.environ["FAKE_NODE_CHAIN_ID"] = "31337"
+        rc, _, _, err = run("--profile", "rehearsal-1", "--staker", STAKER, "--config", "/x/node.toml",
+                            "--citrate-bin", FAKE_BIN, "--dry-run")
+        self.assertEqual(rc, 2, err)
+        self.assertIn("bound to chain 31337", err)
 
     def test_dry_run_reads_nothing_and_is_marked(self):
         with RpcStub(self.c) as s:

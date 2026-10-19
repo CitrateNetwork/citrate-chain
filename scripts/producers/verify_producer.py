@@ -18,9 +18,12 @@ Checks and their sources:
   committee   DERIVED, not observed: no RPC exposes the consensus snapshot or the checkpoint
               committee. The committee for a checkpoint is the governing snapshot S(E)'s
               members at or above minStake (core/consensus/src/vrf.rs epoch_committee_set),
-              all of them while the set is <= committee_size (checkpoint.rs select). A
-              validator still Active now is in S(E) when actEpoch <= E. Finality status is
-              reported from the `finalized` block tag.
+              all of them while the set is <= committee_size (checkpoint.rs select). The
+              registry can only be read at latest (eth_call ignores historical block tags),
+              so the latest stakes, set and minStake stand in for S(E)'s ONLY when
+              eth_getLogs shows no stake-, set- or parameter-changing registry event from
+              block S(E) to the head; otherwise, or if the logs cannot be read, the check is
+              UNKNOWN. Finality status is reported from the `finalized` block tag.
   producing   "Producing blocks": a block in the last --window blocks has proposerPubkey ==
               pubkey; every such block's miner (coinbase) must equal the staker.
 
@@ -72,6 +75,7 @@ def planned_calls(prof: pl.Profile, staker: str | None, pubkey: str | None, wind
         f"eth_call {reg}.activeCount()",
         f"eth_call {reg}.activeSet()",
         f"eth_call {reg}.validatorInfo(k) for each active-set member k (eligible count)",
+        f"eth_getLogs {reg} from the governing snapshot block to the head, {pl.LOGS_CHUNK} blocks per call",
         f"eth_getBlockByNumber(n) for the last {window} blocks, in batches of {BATCH}",
     ]
     return calls
@@ -95,6 +99,31 @@ def fetch_window(rpc: pl.Rpc, head: int, window: int) -> list[dict[str, Any]] | 
                 return None
             blocks.append({"height": h, "proposer": pk.lower(), "miner": miner.lower()})
     return blocks
+
+
+def registry_changes_since(rpc: pl.Rpc, reg: str, start: int, head: int) -> list[str] | None:
+    """Registry logs from `start` to `head` that can change stakes, the set or minStake, as
+    "block:topic0" strings. None when the logs cannot be read completely."""
+    benign = set(pl.REGISTRY_EVENTS_NO_STAKE_EFFECT.values())
+    changes: list[str] = []
+    for lo in range(start, head + 1, pl.LOGS_CHUNK):
+        hi = min(lo + pl.LOGS_CHUNK - 1, head)
+        try:
+            logs = rpc.call(
+                "eth_getLogs", [{"address": reg, "fromBlock": pl.qty(lo), "toBlock": pl.qty(hi)}]
+            )
+        except pl.RpcError:
+            return None
+        if not isinstance(logs, list):
+            return None
+        for lg in logs:
+            if not isinstance(lg, dict):
+                return None
+            topics = lg.get("topics") or []
+            t0 = str(topics[0]).lower().removeprefix("0x") if topics else ""
+            if t0 not in benign:
+                changes.append(f"{lg.get('blockNumber')}:{t0[:8] or 'anonymous'}")
+    return changes
 
 
 def verify(args: argparse.Namespace) -> Result:
@@ -204,6 +233,12 @@ def verify(args: argparse.Namespace) -> Result:
         else f"finalized height {finalized}"
     )
     snapshot_members = sum(1 for ae in member_epochs if e_gov is not None and ae <= e_gov)
+    # The stakes, set and minStake read above are LATEST. They describe S(E) only if nothing
+    # that changes them happened from the snapshot block to the head.
+    changes: list[str] | None = []
+    if reg_ok and e_gov is not None and act <= e_gov:
+        changes = registry_changes_since(rpc, reg, pl.snapshot_height(e_gov), head)
+    snap_src = f"eth_getLogs {reg} blocks {pl.snapshot_height(e_gov) if e_gov else '-'}..{head}"
     if not reg_ok or e_gov is None:
         r.set("committee", False, "not in the committee", "derived: S(E) membership rule", finality=finality_note)
     elif act > e_gov:
@@ -215,8 +250,36 @@ def verify(args: argparse.Namespace) -> Result:
             governing_snapshot_epoch=e_gov,
             finality=finality_note,
         )
+    elif changes is None:
+        r.set(
+            "committee",
+            None,
+            f"unknown: cannot confirm the registry is unchanged since snapshot S({e_gov}) "
+            f"(block {pl.snapshot_height(e_gov)}); the snapshot's stakes are not readable over RPC",
+            snap_src,
+            governing_snapshot_epoch=e_gov,
+            finality=finality_note,
+        )
+    elif changes:
+        r.set(
+            "committee",
+            None,
+            f"unknown: the registry changed after snapshot S({e_gov}) (block {pl.snapshot_height(e_gov)}): "
+            f"{len(changes)} stake/set/parameter event(s), first at {changes[0]}. Latest state does not "
+            f"describe S({e_gov}); re-check after the next snapshot S({e_gov + 1}) = block "
+            f"{pl.snapshot_height(e_gov + 1)}",
+            snap_src,
+            governing_snapshot_epoch=e_gov,
+            registry_changes=changes[:10],
+            finality=finality_note,
+        )
     elif eff is None or eff < min_stake:
-        r.set("committee", False, "below minStake: filtered out of the committee", "activeSet().effStakes vs minStake()")
+        r.set(
+            "committee",
+            False,
+            "below minStake: filtered out of the committee",
+            "activeSet().effStakes vs minStake(), registry unchanged since S(E)",
+        )
     else:
         size_ok = snapshot_members <= int(prof["checkpoint"]["committee_size"])
         r.set(
@@ -234,7 +297,7 @@ def verify(args: argparse.Namespace) -> Result:
                 if size_ok
                 else "set larger than committee_size: membership is a VRF draw, not derivable here"
             ),
-            "derived: vrf.rs epoch_committee_set + checkpoint.rs select",
+            "derived: vrf.rs epoch_committee_set + checkpoint.rs select; " + snap_src + " shows no change",
             governing_snapshot_epoch=e_gov,
             snapshot_members=snapshot_members,
             finality=finality_note,

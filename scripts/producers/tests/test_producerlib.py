@@ -72,6 +72,12 @@ class TestKeccakAndSelectors(unittest.TestCase):
         )
         self.assertEqual(keccak256(b"transfer(address,uint256)")[:4].hex(), "a9059cbb")
 
+    def test_every_pinned_event_topic(self):
+        src = (HERE.parents[2] / "contracts/src/ValidatorRegistry.sol").read_text()
+        for sig, topic in pl.REGISTRY_EVENTS_NO_STAKE_EFFECT.items():
+            self.assertEqual(keccak256(sig.encode()).hex(), topic, sig)
+            self.assertIn(f"event {sig.split('(')[0]}(", src, sig)
+
     def test_every_pinned_selector(self):
         for sig, sel in pl.SELECTORS.items():
             self.assertEqual(keccak256(sig.encode())[:4].hex(), sel, sig)

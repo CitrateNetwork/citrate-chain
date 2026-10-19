@@ -49,6 +49,8 @@ class FakeChain:
         self.finalized = 0
         self.fail_methods: set[str] = set()
         self.registry_code = "0x6080"
+        self.logs: list[dict[str, Any]] = []  # {"block": int, "topic0": hex64}
+        self.log_queries: list[tuple[int, int]] = []
 
     def add_validator(self, pubkey: str, staker: str, stake: int, act_epoch: int, status: str = "Active") -> None:
         self.validators[pubkey.lower()] = {
@@ -143,6 +145,18 @@ class FakeChain:
             return self.call(params[0]["to"], params[0]["data"])
         if method == "eth_getCode":
             return self.registry_code if params[0].lower() == REGISTRY else "0x"
+        if method == "eth_getLogs":
+            f = params[0]
+            lo, hi = int(f["fromBlock"], 16), int(f["toBlock"], 16)
+            self.log_queries.append((lo, hi))
+            hi = min(hi, lo + 1000)  # the node's per-call cap
+            if str(f.get("address", "")).lower() != REGISTRY:
+                return []
+            return [
+                {"address": REGISTRY, "blockNumber": hex(lg["block"]), "topics": ["0x" + lg["topic0"]]}
+                for lg in self.logs
+                if lo <= lg["block"] <= hi
+            ]
         if method == "eth_getBalance":
             return hex(self.balances.get(params[0].lower(), 0))
         if method == "eth_getTransactionCount":

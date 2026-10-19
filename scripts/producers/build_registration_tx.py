@@ -37,7 +37,9 @@ import producerlib as pl  # noqa: E402
 DEFAULT_STAKE_SALT = 32_000  # used only in --dry-run when minStake can't be read
 
 
-def run_registration_proof(binary: str, config: str, staker: str, registry: str, nonce: int) -> dict:
+def run_registration_proof(
+    binary: str, config: str, staker: str, registry: str, nonce: int, chain_id: int
+) -> dict:
     exe = shutil.which(binary) or (binary if os.path.isfile(binary) else None)
     if exe is None:
         raise pl.ToolError(f"node binary {binary!r} not found (pass --citrate-bin)")
@@ -68,13 +70,32 @@ def run_registration_proof(binary: str, config: str, staker: str, registry: str,
         proof = json.loads("\n".join(lines[start:]))
     except (ValueError, json.JSONDecodeError) as e:
         raise pl.ToolError(f"registration-proof printed no JSON: {cp.stdout[:400]!r}") from e
-    for k in ("proposer_pubkey", "ed25519_signature", "calldata", "staker", "registry", "registration_nonce"):
+    for k in (
+        "proposer_pubkey",
+        "ed25519_signature",
+        "calldata",
+        "staker",
+        "registry",
+        "registration_nonce",
+        "chain_id",
+    ):
         if k not in proof:
             raise pl.ToolError(f"registration-proof output lacks {k}")
     if proof["staker"].lower() != staker or proof["registry"].lower() != registry.lower():
         raise pl.ToolError("registration-proof bound a different staker or registry")
     if int(proof["registration_nonce"]) != nonce:
         raise pl.ToolError("registration-proof bound a different nonce")
+    # The proof is signed over the node config's chain id; the transaction uses the profile's.
+    # A mismatch would produce a transaction the registry rejects, so stop here.
+    try:
+        proof_chain = int(proof["chain_id"])
+    except (TypeError, ValueError) as e:
+        raise pl.ToolError(f"registration-proof chain_id is not a number: {proof['chain_id']!r}") from e
+    if proof_chain != chain_id:
+        raise pl.ToolError(
+            f"registration-proof is bound to chain {proof_chain} (from {config}), but the profile is "
+            f"chain {chain_id}: use this network's node.toml (or the matching --profile)"
+        )
     return proof
 
 
@@ -153,7 +174,9 @@ def build(args: argparse.Namespace) -> dict:
             f"{pl.salt(stake_wei + max_fee)}; fund the staker first"
         )
 
-    proof = run_registration_proof(args.citrate_bin, args.config, staker, reg, chain["registration_nonce"])
+    proof = run_registration_proof(
+        args.citrate_bin, args.config, staker, reg, chain["registration_nonce"], int(prof["chain_id"])
+    )
     if not args.dry_run:
         check_pubkey_free(rpc, reg, proof["proposer_pubkey"])
 

@@ -12,6 +12,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 
+import producerlib as pl  # noqa: E402
 import verify_producer as v  # noqa: E402
 from rpcstub import FakeChain, RpcStub  # noqa: E402
 
@@ -86,6 +87,72 @@ class TestVerify(unittest.TestCase):
             rc, body, _ = run(s.url, "--staker", STAKER, "--require", "committee")
         self.assertEqual(rc, 1)
         self.assertIn("S(513) = block 512800", body["checks"]["committee"]["state"])
+
+    def test_committee_unknown_when_stake_changed_after_the_snapshot(self):
+        # A stake change after S(E) means the latest stakes do not describe S(E).
+        c = self.c
+        c.head = 512_900  # governing snapshot S(513) = block 512,800
+        c.add_validator(PK, STAKER, STAKE, 3)
+        stake_increased = "8a12a1190b63d1c04ed6ccb47df714257f26e7f702cbff29ca2c079eac2e4d83"
+        c.logs.append({"block": 512_850, "topic0": stake_increased})
+        with RpcStub(c) as s:
+            rc, body, _ = run(s.url, "--staker", STAKER, "--require", "committee")
+        com = body["checks"]["committee"]
+        self.assertIsNone(com["ok"], com)
+        self.assertEqual(rc, 3)
+        self.assertIn("changed after snapshot S(513)", com["state"])
+
+    def test_committee_unknown_when_a_governance_param_executed(self):
+        # ParamExecuted (e.g. a minStake change) after S(E): neither PASS nor FAIL is provable,
+        # including the below-minStake branch.
+        c = self.c
+        c.head = 512_900
+        c.add_validator(PK, STAKER, STAKE, 3)
+        c.min_stake = STAKE + 1  # latest minStake now above the stake
+        param_executed = "ff" * 32  # any registry event not on the no-effect list counts
+        c.logs.append({"block": 512_801, "topic0": param_executed})
+        with RpcStub(c) as s:
+            rc, body, _ = run(s.url, "--staker", STAKER, "--require", "committee")
+        self.assertIsNone(body["checks"]["committee"]["ok"], body["checks"]["committee"])
+        self.assertEqual(rc, 3)
+
+    def test_committee_ignores_reward_only_events(self):
+        c = self.c
+        c.head = 512_900
+        c.add_validator(PK, STAKER, STAKE, 3)
+        c.logs.append({"block": 512_850, "topic0": pl.REGISTRY_EVENTS_NO_STAKE_EFFECT["RewardCredited(bytes32,uint256,uint256)"]})
+        with RpcStub(c) as s:
+            _, body, _ = run(s.url, "--staker", STAKER, "--require", "committee")
+        self.assertTrue(body["checks"]["committee"]["ok"], body["checks"]["committee"])
+
+    def test_committee_unknown_when_logs_unreadable(self):
+        c = self.c
+        c.head = 512_900
+        c.add_validator(PK, STAKER, STAKE, 3)
+        c.fail_methods.add("eth_getLogs")
+        with RpcStub(c) as s:
+            rc, body, _ = run(s.url, "--staker", STAKER, "--require", "committee")
+        self.assertIsNone(body["checks"]["committee"]["ok"])
+        self.assertIn("cannot confirm", body["checks"]["committee"]["state"])
+        self.assertEqual(rc, 3)
+
+    def test_committee_log_scan_covers_snapshot_to_head_in_capped_chunks(self):
+        c = self.c
+        c.head = 513_799  # the longest range: S(513) = block 512,800 still governs block 513,800
+        c.add_validator(PK, STAKER, STAKE, 3)
+        with RpcStub(c) as s:
+            run(s.url, "--staker", STAKER, "--require", "committee")
+        q = sorted(c.log_queries)
+        self.assertEqual(q[0][0], 512_800)
+        self.assertEqual(q[-1][1], 513_799)
+        self.assertTrue(all(hi - lo < 1000 for lo, hi in q), q)
+        for (_, hi), (lo2, _) in zip(q, q[1:]):
+            self.assertEqual(lo2, hi + 1)
+        # A change at the end of the range is seen.
+        c.logs.append({"block": 513_799, "topic0": "ab" * 32})
+        with RpcStub(c) as s:
+            _, body, _ = run(s.url, "--staker", STAKER, "--require", "committee")
+        self.assertIsNone(body["checks"]["committee"]["ok"])
 
     def test_small_committee_is_flagged(self):
         c = FakeChain()

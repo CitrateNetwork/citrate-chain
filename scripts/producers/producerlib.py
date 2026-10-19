@@ -46,6 +46,22 @@ SELECTORS = {
     "stakeOf(bytes32)": "07177c9c",
 }
 
+# ValidatorRegistry events that change neither a bonded stake, the active set nor minStake
+# (topic0 = keccak256(signature), pinned and re-checked like SELECTORS). Every OTHER registry
+# log (registration, stake change, unbond, eviction, slash, demotion, ParamExecuted, or any
+# event this list does not know) counts as a change to the committee inputs.
+REGISTRY_EVENTS_NO_STAKE_EFFECT = {
+    "RewardCredited(bytes32,uint256,uint256)": "e8f08f8e2d5a793bc43cf83eece124128850204c74c6c9406db3ef2c0ac59862",
+    "RewardsClaimed(bytes32,address,uint256)": "fec539b3c42d74cd492c3ecf7966bf014b327beef98e935cdc3ec5e54a6901c7",
+    "BountyClaimed(address,uint256)": "ac56e31790f51d5ee1fd63f4e99bd0bb5363ff7e23dd9005bdfb0bb52da5a4a6",
+    "ParamQueued(bytes32,uint256,uint256)": "da63fef2ee390b6d1933db896ed0e564a4705c828df03b0d9e1523da5018c9b6",
+    "SlasherQueued(address,uint256)": "ec5446b54b1b9913e906d8238b2369acee39b4dedc20d0834d2539ff5b6fd978",
+    "SlasherSet(address)": "93984378289228ac490c326f8dbcc3f9b2c703753c272e7c572949e115da985e",
+}
+# The node's eth_getLogs serves at most 1000 blocks per call (core/api/src/eth_rpc.rs) and
+# silently truncates a longer range, so ranges are read in chunks no larger than this.
+LOGS_CHUNK = 500
+
 ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 B32_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
 QTY_RE = re.compile(r"^0x[0-9a-fA-F]{1,64}$")

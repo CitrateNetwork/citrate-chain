@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Test-only stand-in for `citrate-node registration-proof` (the real subcommand is
 tested in node/src/registration_proof.rs). Echoes its inputs into the same JSON shape,
-with a log line first, as the real binary may print. Records its argv to $FAKE_NODE_LOG."""
+with a log line first, as the real binary may print. FAKE_NODE_CHAIN_ID stands in for the
+chain id of the node.toml it was given. Records its argv to $FAKE_NODE_LOG."""
 import json
 import os
 import sys
@@ -18,7 +19,7 @@ pk = "0x" + "5e" * 32
 sig = "0x" + "77" * 64
 print("2026-10-19T00:00:00Z INFO citrate: config loaded")
 print(json.dumps({
-    "chain_id": 40204,
+    "chain_id": int(os.environ.get("FAKE_NODE_CHAIN_ID", "40204")),
     "registry": get("--registry").lower(),
     "staker": get("--staker").lower(),
     "registration_nonce": int(get("--nonce")),
