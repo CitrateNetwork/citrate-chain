@@ -16,6 +16,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
@@ -93,8 +94,14 @@ impl CooldownPolicy {
 /// Reasons a drip can be denied by the cooldown layer.
 #[derive(Debug, Clone)]
 pub enum CooldownDenial {
-    AddressCooldown { remaining_secs: u64 },
-    IpCooldown { remaining_secs: u64 },
+    AddressCooldown {
+        remaining_secs: u64,
+    },
+    IpCooldown {
+        remaining_secs: u64,
+    },
+    /// Required-gates mode only: the cooldown file cannot be written, so no window can be kept.
+    PersistenceUnavailable,
 }
 
 /// File-backed cooldown tracker. Thread-safe via interior `RwLock`.
@@ -102,6 +109,11 @@ pub struct Cooldowns {
     state: RwLock<CooldownState>,
     file: Option<PathBuf>,
     policy: CooldownPolicy,
+    /// G4 required-gates mode: persistence is part of the policy, so a failed write stops new
+    /// reservations until a write succeeds again (fail closed).
+    persistence_required: bool,
+    /// False after a failed write while `persistence_required` is on.
+    persistence_ok: AtomicBool,
 }
 
 impl Cooldowns {
@@ -112,6 +124,8 @@ impl Cooldowns {
             state: RwLock::new(CooldownState::default()),
             file: None,
             policy,
+            persistence_required: false,
+            persistence_ok: AtomicBool::new(true),
         }
     }
 
@@ -124,6 +138,61 @@ impl Cooldowns {
             state: RwLock::new(initial),
             file: Some(path),
             policy,
+            persistence_required: false,
+            persistence_ok: AtomicBool::new(true),
+        }
+    }
+
+    /// G4 required-gates mode: a file-backed tracker whose persistence is verified before the
+    /// faucet serves anything. A missing file starts empty; any other read error, a path that is
+    /// not a regular file, or content that does not parse is a startup error (never "start
+    /// empty"). The loaded state is then written back once, so an unwritable location also fails
+    /// at startup. After startup, a failed write makes [`Self::try_reserve`] refuse with
+    /// [`CooldownDenial::PersistenceUnavailable`] until a later write succeeds.
+    pub fn with_file_required(path: PathBuf, policy: CooldownPolicy) -> Result<Self, String> {
+        let initial = load_from_disk_strict(&path)?;
+        persist_to_disk(&path, &initial).map_err(|e| {
+            format!(
+                "FAUCET_COOLDOWN_FILE {} is not writable: {e}",
+                path.display()
+            )
+        })?;
+        Ok(Self {
+            state: RwLock::new(initial),
+            file: Some(path),
+            policy,
+            persistence_required: true,
+            persistence_ok: AtomicBool::new(true),
+        })
+    }
+
+    /// False only in required-gates mode after a persistence write failed and no later write has
+    /// succeeded.
+    pub fn persistence_ok(&self) -> bool {
+        self.persistence_ok.load(Ordering::SeqCst)
+    }
+
+    /// In required-gates mode with persistence down, try one write of the current state; on
+    /// success the tracker is healthy again.
+    fn recover_persistence(&self) -> bool {
+        if self.persistence_ok() {
+            return true;
+        }
+        let Some(path) = self.file.as_ref() else {
+            return true;
+        };
+        let snapshot = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match persist_to_disk(path, &snapshot) {
+            Ok(()) => {
+                self.persistence_ok.store(true, Ordering::SeqCst);
+                tracing::info!("faucet cooldown: persistence restored");
+                true
+            }
+            Err(_) => false,
         }
     }
 
@@ -157,6 +226,9 @@ impl Cooldowns {
     /// between reserve and outcome forgets the reservation, which
     /// matches the pre-fix exposure and only risks one extra drip.
     pub fn try_reserve(&self, address: &str, ip: &str) -> Result<(), CooldownDenial> {
+        if self.persistence_required && !self.recover_persistence() {
+            return Err(CooldownDenial::PersistenceUnavailable);
+        }
         let now = unix_seconds();
         let mut state = self
             .state
@@ -195,8 +267,16 @@ impl Cooldowns {
             state.clone()
         };
         if let Some(path) = self.file.as_ref() {
-            if let Err(e) = persist_to_disk(path, &snapshot) {
-                warn!("faucet cooldown: persist failed: {}", e);
+            match persist_to_disk(path, &snapshot) {
+                Ok(()) => {}
+                Err(e) if self.persistence_required => {
+                    self.persistence_ok.store(false, Ordering::SeqCst);
+                    tracing::error!(
+                        "faucet cooldown: persist failed, refusing new drips until it succeeds: {}",
+                        e
+                    );
+                }
+                Err(e) => warn!("faucet cooldown: persist failed: {}", e),
             }
         }
     }
@@ -276,19 +356,84 @@ fn load_from_disk(path: &PathBuf) -> CooldownState {
     }
 }
 
+/// Strict load for required-gates mode: only a missing file means "start empty".
+fn load_from_disk_strict(path: &PathBuf) -> Result<CooldownState, String> {
+    match std::fs::metadata(path) {
+        Ok(m) if !m.is_file() => {
+            return Err(format!(
+                "FAUCET_COOLDOWN_FILE {} is not a regular file",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CooldownState::default());
+        }
+        Err(e) => {
+            return Err(format!(
+                "FAUCET_COOLDOWN_FILE {} cannot be read: {e}",
+                path.display()
+            ));
+        }
+    }
+    let bytes = std::fs::read(path).map_err(|e| {
+        format!(
+            "FAUCET_COOLDOWN_FILE {} cannot be read: {e}",
+            path.display()
+        )
+    })?;
+    serde_json::from_slice(&bytes).map_err(|e| {
+        format!(
+            "FAUCET_COOLDOWN_FILE {} is not valid cooldown state ({e}); fix or move it before \
+             starting with FAUCET_REQUIRE_GATES on",
+            path.display()
+        )
+    })
+}
+
+/// Write the state to a sibling temporary file (mode 0600 on Unix) and rename it over `path`,
+/// so a crash mid-write never leaves a truncated file behind.
 fn persist_to_disk(path: &PathBuf, state: &CooldownState) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    if path.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "{} is a directory",
+            path.display()
+        )));
     }
     let bytes = serde_json::to_vec_pretty(state)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    std::fs::write(path, &bytes)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp = PathBuf::from(tmp_name);
+    let write = || -> std::io::Result<()> {
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    };
+    let result = write();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    Ok(())
+    result
 }
 
 // Manual `Debug` impl for `CooldownDenial` — derived would suffice
@@ -308,6 +453,7 @@ impl std::fmt::Display for CooldownDenial {
                 remaining_secs / 3600,
                 (remaining_secs % 3600) / 60
             ),
+            Self::PersistenceUnavailable => write!(f, "cooldown persistence unavailable"),
         }
     }
 }
@@ -434,6 +580,104 @@ mod tests {
         let cd = Cooldowns::with_file(path, CooldownPolicy::default());
         cd.check("0xabc", "1.2.3.4")
             .expect("starts empty after corruption");
+    }
+
+    /// G4 required gates: a directory is not a cooldown file.
+    #[test]
+    fn g4_required_rejects_directory_path() {
+        let tmp = TempDir::new().expect("tempdir");
+        let err =
+            Cooldowns::with_file_required(tmp.path().to_path_buf(), CooldownPolicy::default())
+                .err()
+                .expect("directory must be rejected");
+        assert!(err.contains("not a regular file"), "{err}");
+    }
+
+    /// G4 required gates: corrupt state stops startup instead of resetting every window.
+    #[test]
+    fn g4_required_rejects_corrupt_state() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("cooldowns.json");
+        std::fs::write(&path, b"not-json").expect("write garbage");
+        let err = Cooldowns::with_file_required(path.clone(), CooldownPolicy::default())
+            .err()
+            .expect("corrupt state must be rejected");
+        assert!(err.contains("not valid cooldown state"), "{err}");
+        // The corrupt file is left for the operator, not overwritten.
+        assert_eq!(std::fs::read(&path).expect("still there"), b"not-json");
+    }
+
+    /// G4 required gates: a missing file is fine (first start) and is created at startup.
+    #[test]
+    fn g4_required_missing_file_starts_empty_and_is_created() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("sub").join("cooldowns.json");
+        let cd = Cooldowns::with_file_required(path.clone(), CooldownPolicy::default())
+            .expect("missing file is a fresh start");
+        assert!(path.is_file(), "startup write probe created the file");
+        cd.check("0xabc", "1.2.3.4").expect("empty");
+        cd.record_success("0xabc", "1.2.3.4");
+        let cd2 = Cooldowns::with_file_required(path, CooldownPolicy::default())
+            .expect("reload persisted state");
+        cd2.check("0xabc", "9.9.9.9")
+            .expect_err("window survives restart");
+    }
+
+    /// G4 required gates: an unwritable location fails at startup.
+    #[test]
+    fn g4_required_rejects_unwritable_location() {
+        let tmp = TempDir::new().expect("tempdir");
+        // The parent "directory" is a regular file, so nothing can be created beneath it.
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"x").expect("write blocker");
+        let err = Cooldowns::with_file_required(
+            blocker.join("cooldowns.json"),
+            CooldownPolicy::default(),
+        )
+        .err()
+        .expect("unwritable path must be rejected");
+        assert!(
+            err.contains("not writable") || err.contains("cannot be read"),
+            "{err}"
+        );
+    }
+
+    /// G4 required gates: a write failure after startup closes the faucet until a write works.
+    #[test]
+    fn g4_required_write_failure_fails_closed_then_recovers() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("cooldowns.json");
+        let cd =
+            Cooldowns::with_file_required(path.clone(), CooldownPolicy::default()).expect("start");
+        assert!(cd.persistence_ok());
+        // Make the next write fail: replace the file with a directory.
+        std::fs::remove_file(&path).expect("rm");
+        std::fs::create_dir(&path).expect("mkdir in its place");
+        cd.try_reserve("0xabc", "1.2.3.4")
+            .expect("reserve while healthy");
+        cd.record_success("0xabc", "1.2.3.4");
+        assert!(!cd.persistence_ok(), "failed write is noticed");
+        match cd.try_reserve("0xdef", "5.6.7.8") {
+            Err(CooldownDenial::PersistenceUnavailable) => {}
+            other => panic!("expected PersistenceUnavailable, got {:?}", other),
+        }
+        // Repair the path: the next reservation writes successfully and proceeds.
+        std::fs::remove_dir(&path).expect("rmdir");
+        cd.try_reserve("0xdef", "5.6.7.8")
+            .expect("recovered after the path is writable again");
+        assert!(cd.persistence_ok());
+    }
+
+    /// The non-required tracker keeps its old behaviour: write failures never block drips.
+    #[test]
+    fn g4_optional_write_failure_does_not_block() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("cooldowns.json");
+        std::fs::create_dir(&path).expect("dir in place of file");
+        let cd = Cooldowns::with_file(path, CooldownPolicy::default());
+        cd.record_success("0xabc", "1.2.3.4");
+        cd.try_reserve("0xdef", "5.6.7.8")
+            .expect("not fail-closed when optional");
     }
 
     #[cfg(unix)]

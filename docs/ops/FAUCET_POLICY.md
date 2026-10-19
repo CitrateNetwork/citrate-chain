@@ -37,7 +37,11 @@ Where things stand:
    redeploy doesn't reset them.
 6. **All of the above or nothing.** The deploy sets `FAUCET_REQUIRE_GATES=true`. The faucet then
    refuses to start if the global cap, the SBT gate or the cooldown file is missing, and names
-   each missing variable. `/status` reports `"gates_required": true`.
+   each missing variable. `/status` reports `"gates_required": true`. In this mode the cooldown
+   file must also load cleanly (a missing file is a fresh start; a directory, an unreadable file
+   or unparseable content stops startup) and must be writable at startup. If a later write
+   fails, new drips are refused with `"code": "cooldown_store_unavailable"` until a write
+   succeeds again.
 7. **A fixed budget.** The faucet signer is funded once, at genesis, with a capped amount. There
    is no separate reserve and no top-up without a governance vote. The funded balance is the hard
    upper bound on everything the faucet can ever send.
@@ -130,30 +134,50 @@ install -m 0755 citrate-faucet "$BIN"
 
 ### 4.3 Set the policy in the env file
 
-Only non-secret lines are written. The key line is never read or printed.
+Only non-secret lines are written. The key line is never read, printed, or passed on a command
+line. Run this block as root in one shell. It refuses to continue unless the env file is already
+private, every file it creates is mode 0600 from the moment it exists (`umask 077` plus `mktemp`
+in the same directory), the temporary file is removed on any failure, and the env file is replaced
+by one atomic `mv` that keeps its owner and group.
 
 ```bash
+(
+set -euo pipefail
+umask 077
 E=/etc/citrate-faucet.env
-cp -a "$E" "$E.pre-g4"
-grep -v -E '^(FAUCET_MAX_DRIPS_PER_HOUR|FAUCET_MEMBER_SBT|FAUCET_COOLDOWN_FILE|FAUCET_REQUIRE_GATES|FAUCET_ADDRESS_COOLDOWN_SECS|FAUCET_IP_COOLDOWN_SECS)=' "$E" > "$E.new"
-cat >> "$E.new" <<'ENV'
+# The env file must already be private (0600 or 0400) before anything is copied from it.
+case "$(stat -c '%a' "$E")" in 600|400) ;; *) echo "refusing: $E is not mode 0600" >&2; exit 1 ;; esac
+cp -a "$E" "$E.pre-g4"                    # rollback copy; -a keeps the 0600 mode and owner
+T=$(mktemp "$E.new.XXXXXX")               # created 0600 under umask 077, same filesystem as $E
+trap 'rm -f "$T"' EXIT
+grep -v -E '^(FAUCET_MAX_DRIPS_PER_HOUR|FAUCET_MEMBER_SBT|FAUCET_COOLDOWN_FILE|FAUCET_REQUIRE_GATES|FAUCET_ADDRESS_COOLDOWN_SECS|FAUCET_IP_COOLDOWN_SECS)=' "$E" > "$T"
+cat >> "$T" <<'ENV'
 FAUCET_REQUIRE_GATES=true
 FAUCET_MAX_DRIPS_PER_HOUR=<OPEN-3>
 FAUCET_MEMBER_SBT=<CitrateMemberSBT from contracts/addresses/40204.json>
 FAUCET_COOLDOWN_FILE=/var/lib/citrate-faucet/cooldowns.json
 ENV
 # Add FAUCET_ADDRESS_COOLDOWN_SECS / FAUCET_IP_COOLDOWN_SECS only if OPEN-1 / OPEN-2 differ from the defaults.
-chmod 600 "$E.new" && mv "$E.new" "$E"
-grep -c '^FAUCET_PRIVATE_KEY=' "$E"   # must print 1: the key line survived the filter
-install -d -m 0700 /var/lib/citrate-faucet   # match the unit's User= if it is not root
+test "$(grep -c '^FAUCET_PRIVATE_KEY=' "$T")" = 1   # the key line survived the filter (prints nothing)
+chown --reference="$E" "$T"
+chmod 600 "$T"
+mv -f "$T" "$E"
+trap - EXIT
+stat -c '%a %U:%G' "$E"                   # expect 600 and the original owner
+install -d -m 0700 /var/lib/citrate-faucet  # match the unit's User= if it is not root
+) && echo "env updated" || echo "env NOT changed; fix the error above and rerun" >&2
 ```
+
+Do not use `sudo -E`, `env`, `printenv`, `set -x`, `bash -x` or `systemctl show -p Environment`
+on this host while doing this; none of the steps above needs them. If the block stops with an
+error, the env file is unchanged and the temporary file is already removed.
 
 ### 4.4 Check the proxy setting
 
 If a reverse proxy on the same host forwards to the faucet and `FAUCET_TRUSTED_PROXIES` is not
 set, the faucet sees every caller as the proxy's address, so all callers share one per-IP window.
-Check with `grep -c '^FAUCET_TRUSTED_PROXIES=' "$E"` and the proxy config. If the proxy is on
-loopback, set `FAUCET_TRUSTED_PROXIES=127.0.0.1` with the same filter-and-append pattern.
+Check with `grep -c '^FAUCET_TRUSTED_PROXIES=' /etc/citrate-faucet.env` and the proxy config. If the proxy is on
+loopback, set `FAUCET_TRUSTED_PROXIES=127.0.0.1` with the same block as 4.3 (umask 077, `mktemp`, filter, append, atomic `mv`).
 
 ### 4.5 Restart and verify
 

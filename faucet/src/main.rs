@@ -149,6 +149,7 @@ fn denial_parts(d: &cooldowns::CooldownDenial) -> (&'static str, u64) {
             ("address", *remaining_secs)
         }
         cooldowns::CooldownDenial::IpCooldown { remaining_secs } => ("ip", *remaining_secs),
+        cooldowns::CooldownDenial::PersistenceUnavailable => ("persistence", 0),
     }
 }
 
@@ -283,7 +284,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .filter(|p| !p.trim().is_empty());
     let cooldown_file_set = cooldown_file.is_some();
+    // G4: parsed here because required-gates mode also changes how the cooldown file is opened.
+    let gates_required =
+        policy::parse_require_gates(std::env::var("FAUCET_REQUIRE_GATES").ok().as_deref())?;
     let cooldowns = match cooldown_file {
+        Some(path) if gates_required => {
+            let p = PathBuf::from(&path);
+            // Required mode: the file must load cleanly and be writable before anything is served,
+            // and a later write failure refuses new drips until a write succeeds.
+            let c = Cooldowns::with_file_required(p.clone(), cooldown_policy)?;
+            info!(
+                "Cooldowns persisted to {} (verified readable and writable)",
+                p.display()
+            );
+            Arc::new(c)
+        }
         Some(path) => {
             let p = PathBuf::from(&path);
             info!("Cooldowns persisted to {}", p.display());
@@ -344,8 +359,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     // G4: with FAUCET_REQUIRE_GATES on, a missing policy gate stops the faucet at startup.
-    let gates_required =
-        policy::parse_require_gates(std::env::var("FAUCET_REQUIRE_GATES").ok().as_deref())?;
     policy::check_required_gates(
         gates_required,
         policy::GateConfig {
@@ -969,6 +982,12 @@ async fn request_tokens(
     // `release()` the reservation so legitimate users can retry.
     let now = unix_now();
     if let Err(denial) = state.cooldowns.try_reserve(&recipient_hex, &client_ip) {
+        if matches!(denial, cooldowns::CooldownDenial::PersistenceUnavailable) {
+            return Ok(Json(FaucetResponse::deny(
+                "cooldown_store_unavailable",
+                "The faucet cannot record drips right now, try again later",
+            )));
+        }
         let (limit, remaining) = denial_parts(&denial);
         return Ok(Json(FaucetResponse::rate_limited(
             limit,
@@ -1800,6 +1819,27 @@ mod tests {
             again["code"], "node_unreachable",
             "the slot was returned, not held"
         );
+    }
+
+    #[tokio::test]
+    async fn g4_required_cooldown_store_down_refuses_drips() {
+        // Required-gates mode: once a cooldown write fails, the faucet refuses new drips with a
+        // stable code instead of dripping without a persisted window.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("cooldowns.json");
+        let mut st = test_state("http://127.0.0.1:9");
+        st.gates_required = true;
+        st.cooldowns = Arc::new(
+            Cooldowns::with_file_required(path.clone(), CooldownPolicy::default()).expect("start"),
+        );
+        let cooldowns = st.cooldowns.clone();
+        let base = serve(st, None).await;
+        std::fs::remove_file(&path).expect("rm");
+        std::fs::create_dir(&path).expect("dir in place of file");
+        cooldowns.record_success("00000000000000000000000000000000000000aa", "10.0.0.1");
+        assert!(!cooldowns.persistence_ok());
+        let r = post_drip(&base, &addr_of(0x52), None).await;
+        assert_eq!(r["code"], "cooldown_store_unavailable", "{r}");
     }
 
     #[tokio::test]

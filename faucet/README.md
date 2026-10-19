@@ -59,6 +59,8 @@ runbook are in [`docs/ops/FAUCET_POLICY.md`](../docs/ops/FAUCET_POLICY.md). The 
   unset keeps 24 h and 1 h). One drip per address per window is the per-address cap.
 - `FAUCET_REQUIRE_GATES=true`: the faucet refuses to start unless `FAUCET_MAX_DRIPS_PER_HOUR`,
   `FAUCET_MEMBER_SBT` and `FAUCET_COOLDOWN_FILE` are all set, and names any that are missing.
+  The cooldown file must also load cleanly and be writable at startup; a later write failure
+  refuses new drips (`cooldown_store_unavailable`) until a write succeeds.
 
 Testing: `cargo test -p citrate-faucet` runs one test against a local `anvil` (chain id 40204,
 on loopback, with a throwaway key made at run time) when Foundry is installed: a real drip,
