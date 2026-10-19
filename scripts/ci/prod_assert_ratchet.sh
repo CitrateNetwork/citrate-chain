@@ -10,9 +10,13 @@
 #
 # Usage: prod_assert_ratchet.sh [--list]   |   prod_assert_ratchet.sh --self-test
 set -uo pipefail
-# Git exports GIT_DIR/GIT_INDEX_FILE/GIT_WORK_TREE to hooks (pre-push runs this script). They
-# would override `git -C <dir>` below, so the self-test temp repo would list the outer repo.
-unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_OBJECT_DIRECTORY
+# Git exports repository variables (GIT_DIR, GIT_INDEX_FILE, GIT_WORK_TREE, GIT_COMMON_DIR, ...)
+# to hooks, and pre-push runs this script. They override `git -C <dir>`, so the self-test's temp
+# repo would otherwise list, stage into and re-initialise the OUTER repo. Clear every variable git
+# itself names as repository-local, plus the common ones in case git is unavailable here.
+# shellcheck disable=SC2046
+unset $(git rev-parse --local-env-vars 2>/dev/null) \
+  GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_OBJECT_DIRECTORY GIT_COMMON_DIR
 REPO_ROOT="${PROD_ASSERT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 BASELINE="$REPO_ROOT/scripts/ci/prod-assert-baseline.txt"
 
@@ -62,6 +66,24 @@ self_test() {
     [ "$(scan "$g" | wc -l)" -eq 1 ] || { echo "self-test: git mode must count tracked files only"; rc=1; }
   else
     echo "self-test: git unavailable, git-mode case not exercised"; rc=1
+  fi
+  # Hook env: rerun this self-test with a fake outer repo's GIT_DIR / GIT_INDEX_FILE /
+  # GIT_WORK_TREE exported (as a git hook would) and check the outer repo is untouched:
+  # nothing staged, and core.bare unchanged.
+  if [ -z "${PROD_ASSERT_NESTED:-}" ]; then
+    local o="$d/outer"
+    if mkdir -p "$o" && git -C "$o" init -q 2>/dev/null; then
+      local bare_before; bare_before="$(git -C "$o" config --get core.bare)"
+      PROD_ASSERT_NESTED=1 GIT_DIR="$o/.git" GIT_INDEX_FILE="$o/.git/index" GIT_WORK_TREE="$o" \
+        GIT_COMMON_DIR="$o/.git" bash "${BASH_SOURCE[0]}" --self-test >/dev/null 2>&1 \
+        || { echo "self-test: nested self-test failed under a hook's git env"; rc=1; }
+      [ -z "$(git -C "$o" diff --cached --name-only 2>/dev/null)" ] \
+        || { echo "self-test: hook git env leaked: files staged into the outer repo"; rc=1; }
+      [ "$(git -C "$o" config --get core.bare)" = "$bare_before" ] \
+        || { echo "self-test: hook git env leaked: outer repo core.bare changed"; rc=1; }
+    else
+      echo "self-test: git unavailable, hook-env case not exercised"; rc=1
+    fi
   fi
   [ $rc -eq 0 ] && echo "prod-assert ratchet self-test: ok"; return $rc
 }
