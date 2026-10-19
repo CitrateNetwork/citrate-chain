@@ -59,6 +59,12 @@ The bundle is staged in a temporary directory and moved into place only when com
 refusal leaves nothing behind. An existing non-empty output directory is never overwritten.
 
 Other options: `--out DIR`, `--label NAME` (default `r1`; use `r2` for rehearsal 2), `--book PATH`.
+The provenance check covers every bundled input and every tool the export runs: the address
+book, `claims.json`, the address-code snapshot, the book schema, `export-r1.sh` itself,
+`scripts/ui-truth/export-fixtures.sh`, `verification/check_claims.py`,
+`verification/check_address_code.py`, and, offline, the bundled fixture. Online, every contract
+the fixture reads (GOVERNANCE and GUARDIAN included) must have code, and the fixture's two
+governance `minDelay()` reads must succeed.
 `--allow-dirty` accepts inputs that differ from `HEAD` for a scratch run only; the manifest
 lists them under `source.inputs_differ_from_head`, and such a bundle isn't handed off.
 

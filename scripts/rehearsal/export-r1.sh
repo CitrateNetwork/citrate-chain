@@ -16,9 +16,11 @@
 #
 # The export refuses (non-zero exit, nothing left behind) when an input is missing or the
 # inputs disagree: book/claims chain id, RPC chain id, expected genesis hash, a contract the
-# fixture needs is absent or malformed, the claims or address-code gate fails, or the address
-# book / claims file differs from the committed HEAD (unless --allow-dirty, which the manifest
-# then records).
+# fixture needs is absent, malformed or (online) has no code, the claims or address-code gate
+# fails, a governance read in the fresh fixture failed, or any input or executed tool differs
+# from the committed HEAD: the address book, claims.json, the address-code snapshot, the book
+# schema, this wrapper, the fixture exporter, both verification scripts and (offline) the
+# bundled fixture (unless --allow-dirty, which the manifest then records).
 #
 # Options:
 #   --rpc URL              JSON-RPC endpoint (online mode; required unless --offline)
@@ -93,17 +95,27 @@ for k in $NEEDED; do
   [[ "$a" =~ ^0x0{40}$ ]] && die "address book maps $k to the zero address"
 done
 
-# Provenance: the bundled book and claims must be what HEAD says, or the git SHA proves nothing.
+# Provenance: every input bundled and every tool executed must be what HEAD says, or the git
+# SHA proves nothing (a locally edited checker could otherwise pass a bad book).
 GIT_SHA=$(git rev-parse HEAD)
 dirty=()
-for f in "$BOOK" "$CLAIMS" verification/address-code.snapshot.json scripts/ui-truth/export-fixtures.sh; do
-  rel=$(realpath --relative-to="$ROOT" "$f")
-  if [[ "$rel" == ../* ]] || ! git ls-files --error-unmatch -- "$rel" >/dev/null 2>&1 \
-     || ! git diff --quiet HEAD -- "$rel"; then dirty+=("$rel"); fi
-done
-if [ ${#dirty[@]} -gt 0 ] && [ "$ALLOW_DIRTY" != true ]; then
-  die "inputs differ from HEAD $GIT_SHA: ${dirty[*]} (commit the frozen book first, or pass --allow-dirty for a scratch run)"
-fi
+note_dirty() {  # path... — record each path that is outside the repo, untracked or modified
+  local f rel
+  for f in "$@"; do
+    rel=$(realpath --relative-to="$ROOT" "$f")
+    if [[ "$rel" == ../* ]] || ! git ls-files --error-unmatch -- "$rel" >/dev/null 2>&1 \
+       || ! git diff --quiet HEAD -- "$rel"; then dirty+=("$rel"); fi
+  done
+}
+require_clean() {
+  if [ ${#dirty[@]} -gt 0 ] && [ "$ALLOW_DIRTY" != true ]; then
+    die "inputs differ from HEAD $GIT_SHA: ${dirty[*]} (commit the frozen inputs and tools first, or pass --allow-dirty for a scratch run)"
+  fi
+}
+note_dirty "$BOOK" "$CLAIMS" verification/address-code.snapshot.json contracts/addresses/schema.json \
+  scripts/rehearsal/export-r1.sh scripts/ui-truth/export-fixtures.sh \
+  verification/check_claims.py verification/check_address_code.py
+require_clean
 
 # ── 2. Gates that already guard public claims ───────────────────────────────────────────
 python3 -I verification/check_claims.py --root "$ROOT" >/dev/null \
@@ -134,6 +146,13 @@ if [ "$MODE" = online ]; then
   RPC_HEIGHT=$(printf '%d' "$q")
   python3 -I verification/check_address_code.py --check --rpc "$RPC" --book "$BOOK" >/dev/null \
     || die "address-code check failed against $RPC: the book, the committed snapshot and live code disagree (re-probe and commit the snapshot at the freeze)"
+  # Every contract the fixture reads, governance included, must have code on this chain.
+  for k in $NEEDED; do
+    a=$(jq -r --arg k "$k" '.contracts[$k] // .[$k] // .governance[$k] // empty' "$BOOK")
+    code=$(rpc_result eth_getCode "[\"$a\",\"latest\"]")
+    [[ "$code" =~ ^0x[0-9a-fA-F]+$ ]] || die "eth_getCode unavailable or malformed for $k ($a) from $RPC"
+    [[ "$code" =~ ^0x0*$ ]] && die "$k ($a) has no code on $RPC: the book does not describe this chain"
+  done
 fi
 
 # ── 4. Build the bundle in a scratch dir; move into place only when complete ────────────
@@ -160,6 +179,8 @@ else
     [ -n "$FIXTURE_IN" ] || die "no committed fixture for chain $BOOK_CHAIN under docs/ui-truth/fixtures/"
   fi
   [ -f "$FIXTURE_IN" ] || die "fixture not found: $FIXTURE_IN"
+  note_dirty "$FIXTURE_IN"
+  require_clean
   cp "$FIXTURE_IN" "$STAGE/ui-truth-fixture.json"
   FIXTURE_SRC="copied from $FIXTURE_IN (offline dry run, not a rehearsal export)"
 fi
@@ -173,6 +194,12 @@ fx_chain=$(jq -r '.reads[] | select(.id == "chain_id") | .value' "$FX")
 if [ "$MODE" = online ]; then
   fx_gen=$(jq -r '.reads[] | select(.id == "genesis_hash") | .value' "$FX")
   [ "${fx_gen,,}" = "${GENESIS,,}" ] || die "fixture genesis_hash ($fx_gen) differs from the RPC genesis $GENESIS"
+  # The governance reads are required: a failed minDelay() means the address is not the
+  # timelock the book claims.
+  for id in governance_min_delay_s guardian_min_delay_s; do
+    jq -e --arg id "$id" '[.reads[] | select(.id == $id)] | length == 1 and (.[0].value | type == "string")' "$FX" >/dev/null \
+      || die "fixture read $id failed or is missing: the governance address in the book did not answer minDelay()"
+  done
 fi
 
 (cd "$STAGE" && sha256sum ui-truth-fixture.json "$BOOK_NAME" claims.json > SHA256SUMS)
@@ -207,7 +234,9 @@ jq -n --arg label "$LABEL" --arg mode "$MODE" --arg at "$(date -u +%Y-%m-%dT%H:%
               "verification/check_claims.py" ]
             + (if $mode == "online"
                then ["RPC chain id matches the book", "RPC genesis matches --expect-genesis",
-                     "verification/check_address_code.py --check (live)", "fixture genesis matches RPC"]
+                     "verification/check_address_code.py --check (live, governance included)",
+                     "every fixture contract (governance included) has code",
+                     "fixture genesis matches RPC", "fixture governance minDelay() reads succeeded"]
                else ["verification/check_address_code.py --offline"] end)),
     files: $files,
     consumers: ["citrate-core (MAC lane)", "design"]}' > "$STAGE/MANIFEST.json"

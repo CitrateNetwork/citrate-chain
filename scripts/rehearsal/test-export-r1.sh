@@ -5,7 +5,10 @@
 #   2. refusals: book/claims chain id mismatch, missing fixture contract, malformed address,
 #      non-empty output dir, dirty inputs without --allow-dirty, online without --expect-genesis
 #   3. online against the stub: happy path records height + genesis; RPC chain id mismatch and
-#      genesis mismatch refuse and leave no bundle
+#      genesis mismatch refuse and leave no bundle; a governance address with no code, or whose
+#      minDelay() read fails, refuses
+#   4. provenance, in a throwaway local clone: a modified verification script, wrapper or
+#      offline fixture refuses without --allow-dirty and is recorded with it
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 tmp=$(mktemp -d); trap 'jobs -p | xargs -r kill 2>/dev/null; rm -rf "$tmp"' EXIT
@@ -73,5 +76,59 @@ stub 18622 0x1
 refuses "RPC chain id mismatch" "RPC http://127.0.0.1:18622 serves 1" --rpc http://127.0.0.1:18622 --expect-genesis "$G0" --out "$tmp/r7"
 kill "$STUB"; wait "$STUB" 2>/dev/null || true
 check "online refusals leave no bundle" '[ ! -e "$tmp/r6" ] && [ ! -e "$tmp/r7" ]'
+
+# Governance addresses take part in the live gates.
+govs=$(python3 -I - <<'PY'
+import json, sys
+sys.path.insert(0, "verification")
+import check_address_code as c
+book = json.load(open("contracts/addresses/40204.json"))
+print(" ".join(sorted(n for n, _ in c.book_entries(book) if n.startswith("governance."))))
+PY
+)
+check "address-code entries include governance" '[ "$govs" = "governance.GOVERNANCE governance.GUARDIAN" ]'
+GOV=$(jq -r .governance.GOVERNANCE contracts/addresses/40204.json)
+GRD=$(jq -r .governance.GUARDIAN contracts/addresses/40204.json)
+STUB_CODELESS=${GRD,,} stub 18623 0x9d0c
+refuses "governance address without code" "address-code check failed" --rpc http://127.0.0.1:18623 --expect-genesis "$G0" --out "$tmp/r8"
+kill "$STUB"; wait "$STUB" 2>/dev/null || true
+STUB_CALL_FAIL=$GOV stub 18624 0x9d0c
+refuses "governance minDelay() read failed" "governance_min_delay_s failed" --rpc http://127.0.0.1:18624 --expect-genesis "$G0" --out "$tmp/r9"
+kill "$STUB"; wait "$STUB" 2>/dev/null || true
+check "governance refusals leave no bundle" '[ ! -e "$tmp/r8" ] && [ ! -e "$tmp/r9" ]'
+
+# ── 4. provenance (a throwaway clone; the checkout under test is never modified) ──
+R="$tmp/repo"
+git clone -q --shared --no-checkout . "$R"
+git -C "$R" checkout -q --detach HEAD
+# Test the working-tree versions of the files under test, committed in the clone.
+for f in scripts/rehearsal/export-r1.sh scripts/rehearsal/test-export-r1.sh scripts/ui-truth/export-fixtures.sh \
+         scripts/ui-truth/stub_rpc.py verification/check_address_code.py verification/check_claims.py; do
+  cp "$f" "$R/$f"
+done
+git -C "$R" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -am "test: files under test" >/dev/null 2>&1 || true
+RX="$R/scripts/rehearsal/export-r1.sh"
+prov_refuses() {  # name file-to-modify (check() evals in this scope: no $1/$2 inside it)
+  local pn=$1 pf=$2 prc=0
+  if [[ "$pf" == *.json ]]; then  # keep it valid JSON so only provenance can refuse it
+    jq '.local_edit = true' "$R/$pf" > "$tmp/edit.json" && cp "$tmp/edit.json" "$R/$pf"
+  else
+    echo "# local edit" >> "$R/$pf"
+  fi
+  "$RX" --offline --out "$tmp/p-$pn" >"$tmp/log" 2>&1 || prc=$?
+  check "provenance: modified $pf refuses" '[ "$prc" -ne 0 ] && grep -qF "$pf" "$tmp/log" && grep -q "inputs differ from HEAD" "$tmp/log" && [ ! -e "$tmp/p-$pn" ]'
+  prc=0
+  "$RX" --offline --allow-dirty --out "$tmp/pd-$pn" >"$tmp/log" 2>&1 || prc=$?
+  check "provenance: modified $pf recorded with --allow-dirty" \
+    '[ "$prc" -eq 0 ] && jq -e --arg f "$pf" ".source.inputs_differ_from_head | index(\$f)" "$tmp/pd-$pn/MANIFEST.json" >/dev/null'
+  git -C "$R" checkout -q -- "$pf"
+}
+prov_refuses checkclaims verification/check_claims.py
+prov_refuses checkcode verification/check_address_code.py
+prov_refuses wrapper scripts/rehearsal/export-r1.sh
+prov_refuses fixture "$(git -C "$R" ls-files 'docs/ui-truth/fixtures/40204-*.json' | sort | tail -1)"
+cp "$R/$(git -C "$R" ls-files 'docs/ui-truth/fixtures/40204-*.json' | sort | tail -1)" "$tmp/fx-copy.json"
+rc=0; "$RX" --offline --fixture "$tmp/fx-copy.json" --out "$tmp/p-untracked" >"$tmp/log" 2>&1 || rc=$?
+check "provenance: an untracked offline fixture refuses" '[ "$rc" -ne 0 ] && grep -q "inputs differ from HEAD" "$tmp/log"'
 
 exit $fail
