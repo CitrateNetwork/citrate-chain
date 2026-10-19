@@ -13,8 +13,10 @@ headbad, eth_blockNumber returns a malformed quantity; with hostilets, block tim
 Bash arithmetic-injection string (the exporter must never evaluate it).
 ValidatorRegistry reads are ABI-encoded: two validators, one with actEpoch <= currentEpoch
 (7) and one pending (actEpoch 9).
+Environment (used by scripts/rehearsal/test-export-r1.sh): STUB_CHAIN_ID overrides the chain id
+(default 0x9d0c = 40204); eth_getCode returns non-empty code for every address.
 """
-import json, sys
+import json, os, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PORT, HEAD, STEP = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
@@ -47,7 +49,9 @@ def answer(req):
         state["head"] += STEP
         res = hex(state["head"])
     elif m == "eth_chainId":
-        res = "0x9d0c"
+        res = os.environ.get("STUB_CHAIN_ID", "0x9d0c")
+    elif m == "eth_getCode":
+        res = "0x6080604052"
     elif m == "net_version":
         res = "40204"
     elif m == "eth_syncing":
