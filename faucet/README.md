@@ -5,7 +5,8 @@ Test token faucet for the Citrate network. Drips SALT tokens to requested addres
 ## Contents
 
 - `src/main.rs` -- HTTP server, drip endpoint, rate limiting logic, cooldown tracking
-- `src/cooldowns.rs` -- per-address (24 h) and per-IP (1 h) cooldowns, optionally persisted
+- `src/cooldowns.rs` -- per-address (default 24 h) and per-IP (default 1 h) cooldowns, optionally persisted
+- `src/policy.rs` -- `FAUCET_REQUIRE_GATES`: refuse to start unless the cap, SBT gate and cooldown file are all set
 - `src/limits.rs` -- optional faucet-wide hourly drip cap
 - `src/membership.rs` -- optional membership-SBT check (fails closed)
 - `src/liveness.rs` -- the `/ready` probe (RPC chain id + faucet balance)
@@ -29,7 +30,7 @@ cargo run --bin citrate-faucet
 |---|---|
 | `GET /health` | Liveness: the process is up. Never touches the RPC. Always 200. |
 | `GET /ready` | Readiness: the RPC answers with the configured chain id and the faucet balance covers one more drip. 200 when ready, 503 with a `reason` when not. Cached for 15 s. |
-| `GET /status` | Static facts plus limits: `drip_wei`, cooldowns, `global_cap_per_hour`, `captcha`, `turnstile_site_key`, `membership_check`. |
+| `GET /status` | Static facts plus limits: `drip_wei`, cooldowns, `global_cap_per_hour`, `captcha`, `turnstile_site_key`, `membership_check`, `gates_required`. |
 | `GET /eligibility?address=0x…` | Read-only: would a request for this address, from this caller, pass the cooldowns now? Reserves nothing. On a refusal it gives `retry_after_secs` and `next_eligible_at` (Unix seconds). |
 | `POST /faucet` | The drip. A refusal carries a stable `code` (`invalid_address`, `not_whitelisted`, `captcha_required`, `captcha_failed`, `captcha_unavailable`, `not_member`, `membership_unavailable`, `rate_limited`, `signing_failed`, `rpc_error`, `unknown_rpc_response`, `node_unreachable`); a `rate_limited` refusal also names the `limit` (`address`, `ip` or `global`) and the next eligible time. |
 
@@ -48,6 +49,16 @@ owner sign-off, so the suggested values are placeholders.
   only. The page accepts `/?address=0x…` to fill the address in, which is how the desktop app
   opens it in an in-app window.
 - `FAUCET_DESKTOP_ORIGINS`: the exact desktop-app webview origins allowed by CORS.
+
+## Betanet policy (C2 G4)
+
+The policy the faucet runs under from the betanet genesis, the open amounts, and the deploy
+runbook are in [`docs/ops/FAUCET_POLICY.md`](../docs/ops/FAUCET_POLICY.md). The settings it adds:
+
+- `FAUCET_ADDRESS_COOLDOWN_SECS` / `FAUCET_IP_COOLDOWN_SECS`: the two windows (60 s to 30 days;
+  unset keeps 24 h and 1 h). One drip per address per window is the per-address cap.
+- `FAUCET_REQUIRE_GATES=true`: the faucet refuses to start unless `FAUCET_MAX_DRIPS_PER_HOUR`,
+  `FAUCET_MEMBER_SBT` and `FAUCET_COOLDOWN_FILE` are all set, and names any that are missing.
 
 Testing: `cargo test -p citrate-faucet` runs one test against a local `anvil` (chain id 40204,
 on loopback, with a throwaway key made at run time) when Foundry is installed: a real drip,

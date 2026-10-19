@@ -45,6 +45,51 @@ impl Default for CooldownPolicy {
     }
 }
 
+/// Shortest cooldown accepted from the environment (a typo guard, not a policy).
+pub const MIN_COOLDOWN_SECS: u64 = 60;
+/// Longest cooldown accepted from the environment: 30 days (a typo guard, not a policy).
+pub const MAX_COOLDOWN_SECS: u64 = 30 * 24 * 3600;
+
+/// Parse one cooldown variable. Unset or blank: `Ok(default)`. Anything that is not a whole
+/// number of seconds from [`MIN_COOLDOWN_SECS`] to [`MAX_COOLDOWN_SECS`] is a startup error, never
+/// silently replaced by the default.
+fn parse_cooldown(name: &str, raw: Option<&str>, default: u64) -> Result<u64, String> {
+    let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(default);
+    };
+    let secs: u64 = s
+        .parse()
+        .map_err(|_| format!("{name} must be a whole number of seconds, got {s:?}"))?;
+    if !(MIN_COOLDOWN_SECS..=MAX_COOLDOWN_SECS).contains(&secs) {
+        return Err(format!(
+            "{name} must be {MIN_COOLDOWN_SECS} to {MAX_COOLDOWN_SECS} seconds, got {secs}"
+        ));
+    }
+    Ok(secs)
+}
+
+impl CooldownPolicy {
+    /// G4 (genesis faucet policy): the per-address and per-IP windows from
+    /// `FAUCET_ADDRESS_COOLDOWN_SECS` and `FAUCET_IP_COOLDOWN_SECS`. Each one unset keeps its
+    /// default (24 h per address, 1 h per IP), so an operator who sets neither gets exactly the
+    /// behaviour before this change. One drip per address per window is the per-address cap.
+    pub fn from_env(address_raw: Option<&str>, ip_raw: Option<&str>) -> Result<Self, String> {
+        let d = CooldownPolicy::default();
+        Ok(CooldownPolicy {
+            address_cooldown_secs: parse_cooldown(
+                "FAUCET_ADDRESS_COOLDOWN_SECS",
+                address_raw,
+                d.address_cooldown_secs,
+            )?,
+            ip_cooldown_secs: parse_cooldown(
+                "FAUCET_IP_COOLDOWN_SECS",
+                ip_raw,
+                d.ip_cooldown_secs,
+            )?,
+        })
+    }
+}
+
 /// Reasons a drip can be denied by the cooldown layer.
 #[derive(Debug, Clone)]
 pub enum CooldownDenial {
@@ -271,6 +316,48 @@ impl std::fmt::Display for CooldownDenial {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn g4_policy_from_env_defaults_when_unset() {
+        let p = CooldownPolicy::from_env(None, Some("  ")).expect("ok");
+        assert_eq!(p.address_cooldown_secs, 24 * 3600);
+        assert_eq!(p.ip_cooldown_secs, 3600);
+    }
+
+    #[test]
+    fn g4_policy_from_env_reads_both_windows() {
+        let p = CooldownPolicy::from_env(Some(" 172800 "), Some("600")).expect("ok");
+        assert_eq!(p.address_cooldown_secs, 172_800);
+        assert_eq!(p.ip_cooldown_secs, 600);
+    }
+
+    #[test]
+    fn g4_policy_from_env_rejects_bad_values() {
+        for bad in ["0", "59", "-1", "1h", "1.5", "2592001"] {
+            let e = CooldownPolicy::from_env(Some(bad), None).expect_err(bad);
+            assert!(e.contains("FAUCET_ADDRESS_COOLDOWN_SECS"), "{e}");
+            let e = CooldownPolicy::from_env(None, Some(bad)).expect_err(bad);
+            assert!(e.contains("FAUCET_IP_COOLDOWN_SECS"), "{e}");
+        }
+        // The bounds themselves are accepted.
+        CooldownPolicy::from_env(Some("60"), Some("2592000")).expect("bounds");
+    }
+
+    #[test]
+    fn g4_configured_address_window_is_enforced() {
+        let policy = CooldownPolicy::from_env(Some("7200"), Some("60")).expect("ok");
+        let cd = Cooldowns::in_memory(policy);
+        cd.try_reserve("0xabc", "1.1.1.1").expect("first");
+        match cd.try_reserve("0xabc", "2.2.2.2") {
+            Err(CooldownDenial::AddressCooldown { remaining_secs }) => {
+                assert!(
+                    remaining_secs > 7000 && remaining_secs <= 7200,
+                    "{remaining_secs}"
+                );
+            }
+            other => panic!("expected address cooldown, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_first_request_passes() {
