@@ -142,7 +142,7 @@ Amounts are SALT with 18 decimals (wei), so divide by 1e18. Addresses come from 
 | LiquidStakingPool withdrawal delay | `LiquidStakingPool.WITHDRAWAL_DELAY()` (a contract constant, so a bundled constant matching it is acceptable) | As a duration (row below): "50,400 blocks (~28 h)" | 50,400 blocks |
 | Durations given in blocks | Blocks × block time measured over the last 100 blocks | Show both, e.g. "50,400 blocks (~28 h)". With no measurement, show the block count only. Never assume 12 s blocks | — |
 
-Not in the catalog, so **not shown**: circulating or issued supply (no source exists), TPS (the app has no reason to show it; claims.json covers public copy), SALT price, any USD value of SALT, APY or yield, "finalized height", node version (no RPC serves it yet, see §9).
+Not in the catalog, so **not shown**: circulating or issued supply (no source exists), TPS (the app has no reason to show it; claims.json covers public copy), SALT price, any USD value of SALT, APY or yield, "finalized height", any finality time (claims.json publishes none while checkpoint finality isn't running), node version (no RPC serves it yet, see §9).
 
 ## 3. Never show (fabricated or misleading RPC values)
 
@@ -173,7 +173,7 @@ These return a believable value on error. Treat their 0 or `true` as "unknown" u
 | SkillRegistry / ModelRegistry | Deployed. 0 skills / 1 model | Populated for Store v1 (first-party) |
 | LiquidStakingPool | Deployed, empty | The plan retires the liquid path; pending the money-path decision |
 | Governance | 2-of-3 multisig, 2 h delay (GOVERNANCE and GUARDIAN) | 3-of-5 hardware governance, separate 2-of-3 hardware guardian; timelock set in C2 |
-| Liquidity | None | None until the 1.0 soft fork |
+| Liquidity (needs counsel; provisional until counsel review, C2 D3/D4 decided by 2026-10-30) | No protocol gate: SALT transfers work on 40204. No trading venue | No protocol gate: SALT and wSALT are transferable from genesis. Any trading venue is a market event (C2 D4), not a chain state; the app never shows it |
 
 ## 5. Money copy (provisional until counsel review)
 
@@ -182,7 +182,7 @@ These return a believable value on error. Treat their 0 or `true` as "unknown" u
 3. **Membership price**: comes only from the membership service, never a constant in the app (no waiver). Until core-membership serves a public price route (board item C1-P), the app shows no price at all: it links "See membership pricing" to membership.citrate.ai, where Stripe checkout shows the exact charge. Membership buys membership; it does not buy SALT.
 4. **Grant**: say exactly what the contracts do. "Your membership comes with a 32,000 SALT grant, locked in your bond until ⟨date⟩." Say "staked" only after `activated()`. Use one explanation everywhere: onboarding, Wallet, Node and the Hermes context.
 5. **Rewards**: only on-chain reads (§2), named as rewards for producing blocks. No projections, formulas or "at current demand". If a member's node isn't producing, don't say it earns.
-6. **Betanet balances**: don't promise that SALT carries over to mainnet. Until the C2 genesis spec decides, say: "Betanet. What carries over to mainnet is set in the genesis spec."
+6. **Betanet balances** (C2 D3; provisional until counsel review, C2 D3/D4 decided by 2026-10-30). Before 2026-12-01 the app is on the current testnet. Say: "Testnet. This network may be reset before betanet launches on 1 December 2026." From the betanet genesis (2026-12-01, shipped with 0.5.2) the chain is the mainnet chain: no reset is planned, and balances, SBTs, bonds and contracts carry into mainnet when the 1.0 soft fork activates (targeted 2027-02-01). Approved string: "Betanet. This is the chain mainnet keeps: balances carry into mainnet when the 1.0 upgrade activates, targeted for February 2027." Never say "guaranteed". Never attach a value, price or venue to carried-over SALT (§5.1, §5.2). Never describe 1.0 as turning on transfers or liquidity (D4): 1.0 is an upgrade that carries hardening and anything not ready at genesis.
 7. **Disclaimers**: the existing "not purchased, not an investment" line appears anywhere the grant is mentioned, not only in one onboarding step.
 8. **Daemons and SALT**: daemons can't spend SALT. Write "Daemons can't spend SALT"; never show "0 SALT spend", which reads like a balance that could grow. Gateway escalation spend is shown in its own unit, with its daily cap.
 
@@ -281,7 +281,8 @@ The chain team's answers to the design slice-1 questions (citrate-core #350). Th
 - §1 Validators: "Registered · active from epoch N" and "Validator active" conditions include `status`; Exiting and Slashed are reachable and derived from `status`, not stake; new "— · registry state inconsistent".
 - §1 Rewards: the tab is "Rewards"; "Earnings" banned in every form; "today" only for local per-day sources.
 - §2: "Registered validators" with "N eligible (live registry)" on one cadence, no consensus number; peers split into this node vs the public RPC node (`rpc_node_peer_count`); producer sample shortfall rule; LiquidStakingPool deposit and withdrawal delay rows; unread lock end wording; "Today" values from the committed fixture.
-- §5: USD for own provider keys (2), no in-app membership price until C1-P (3), "Daemons can't spend SALT" (8).
+- §5: USD for own provider keys (2), no in-app membership price until C1-P (3), betanet balances per C2 D3 (6, provisional until counsel review), "Daemons can't spend SALT" (8).
+- §4: the Liquidity row per C2 D4 option A (no protocol gate; needs counsel). No finality time is introduced anywhere.
 - §6: the checkpoint availability rule.
 - §7: exporter range checks, the `rpc_node_peer_count` id, on-screen pill and footnote, R1 sample bond.
 - §8: V13 and follow-ups V14–V20. §9: producers RPC, R1 export bond. §11: slice-1 rulings.
