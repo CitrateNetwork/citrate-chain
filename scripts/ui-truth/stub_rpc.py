@@ -1,15 +1,18 @@
 """Stub JSON-RPC node for testing export-fixtures.sh. Not a chain: it exists so the export's
 provenance logic (head drift, epoch crossing, producer sampling) can be tested offline.
 
-  python3 stub_rpc.py <port> <start_head> <step_per_blockNumber_call>
+  python3 stub_rpc.py <port> <start_head> <step_per_blockNumber_call> [fail_mod]
 
 Every eth_blockNumber call advances the head by <step>, which models blocks landing while
 an export runs. Blocks alternate between two proposers. eth_call returns uint256(1).
+With [fail_mod] > 0, every block whose number is divisible by it fails: odd multiples return
+a JSON-RPC error, even multiples return a null block (models a partial producer sample).
 """
 import json, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PORT, HEAD, STEP = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+FAIL_MOD = int(sys.argv[4]) if len(sys.argv) > 4 else 0
 state = {"head": HEAD}
 
 
@@ -29,6 +32,10 @@ def answer(req):
     elif m == "eth_getBlockByNumber":
         tag = p[0] if p else "latest"
         n = state["head"] if tag == "latest" else int(tag, 16)
+        if FAIL_MOD and n % FAIL_MOD == 0 and tag != "latest" and n > 1000:
+            if (n // FAIL_MOD) % 2:
+                return {"jsonrpc": "2.0", "id": req.get("id"), "error": {"code": -32000, "message": "stub: unavailable"}}
+            return {"jsonrpc": "2.0", "id": req.get("id"), "result": None}
         res = {"number": hex(n), "hash": "0x" + f"{n:064x}", "timestamp": hex(2 * n),
                "baseFeePerGas": "0x3b9aca00", "proposerPubkey": "0x" + ("aa" if n % 2 else "bb") * 32}
     elif m == "eth_call":

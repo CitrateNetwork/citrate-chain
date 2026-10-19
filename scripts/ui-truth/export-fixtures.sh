@@ -9,9 +9,11 @@
 #
 # The node serves LATEST committed state for every block tag (there are no per-height
 # historical state reads; core/api/src/eth_rpc.rs), so an export is not a single-block
-# snapshot. Each read therefore records the head it was observed at, every read is
-# labelled `state: latest`, and the file says whether the export stayed inside one
-# epoch (validator set and registry params can only change at epoch boundaries).
+# snapshot, and the reads are NOT mutually consistent: registry state (registrations,
+# stake changes, executed params) can change in any block. Each read therefore records the
+# head it was observed at and is labelled `state: latest`. The file also records whether
+# the export crossed an epoch boundary and whether the head moved at all; neither is a
+# consistency guarantee.
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -61,18 +63,28 @@ for h in 365784 365785; do
 done
 
 # Producing validators (contract §2): distinct proposerPubkey over the window, fetched in
-# JSON-RPC batches of 100 blocks. Shown next to active validators so the gap is visible.
+# JSON-RPC batches of 100 blocks. Every block in the window must come back as a successful
+# response with a 32-byte proposer key; otherwise the value is reported as unavailable
+# (with how many blocks came back), never as a count. Shown next to active validators.
 OBSERVED=$(head_now)
 lo=$(( OBSERVED - PRODUCER_WINDOW + 1 )); [ "$lo" -lt 1 ] && lo=1
-proposers=$(for (( s=lo; s<=OBSERVED; s+=100 )); do
+want=$(( OBSERVED - lo + 1 ))
+keys=$(for (( s=lo; s<=OBSERVED; s+=100 )); do
   e=$(( s + 99 )); [ "$e" -gt "$OBSERVED" ] && e=$OBSERVED
   batch=$(for (( h=s; h<=e; h++ )); do printf '{"jsonrpc":"2.0","id":%d,"method":"eth_getBlockByNumber","params":["0x%x",false]},' "$h" "$h"; done)
-  curl -fsS -X POST -H 'content-type: application/json' --data "[${batch%,}]" "$RPC" | jq -r '.[].result.proposerPubkey // empty'
-done | sort -u)
+  curl -fsS -X POST -H 'content-type: application/json' --data "[${batch%,}]" "$RPC" 2>/dev/null \
+    | jq -r '.[]? | select(.result != null and (.result.proposerPubkey // "" | test("^0x[0-9a-fA-F]{64}$"))) | "\(.id) \(.result.proposerPubkey)"' 2>/dev/null
+done | sort -u -k1,1n)
+got=$(printf '%s\n' "$keys" | grep -c . || true)
+if [ "$got" -eq "$want" ]; then
+  producing=$(jq -cn --argjson n "$(printf '%s\n' "$keys" | awk '{print $2}' | sort -u | grep -c .)" \
+    --argjson lo "$lo" --argjson hi "$OBSERVED" '{count:$n, from_block:$lo, to_block:$hi}')
+else
+  producing=$(jq -cn --argjson got "$got" --argjson want "$want" --argjson lo "$lo" --argjson hi "$OBSERVED" \
+    '{unavailable:true, reason:"producer sample incomplete", blocks_returned:$got, blocks_requested:$want, from_block:$lo, to_block:$hi}')
+fi
 row producing_validators \
-  "distinct eth_getBlockByNumber(n).proposerPubkey for n in [$lo, $OBSERVED]" \
-  "$(jq -cn --argjson n "$(printf '%s\n' "$proposers" | grep -c . || true)" --argjson lo "$lo" --argjson hi "$OBSERVED" \
-     '{count:$n, from_block:$lo, to_block:$hi}')"
+  "distinct eth_getBlockByNumber(n).proposerPubkey for n in [$lo, $OBSERVED]" "$producing"
 
 # Validators and rewards (ValidatorRegistry is the only producer source).
 call validator_active_count ValidatorRegistry "activeCount()(uint256)"
@@ -106,7 +118,9 @@ printf '%s\n' "${rows[@]}" | jq -s --arg rpc "$RPC" --argjson hs "$HEAD_START" -
     head_at_start: $hs, head_at_end: $he,
     epoch_at_start: (($hs / $ep) | floor), epoch_at_end: (($he / $ep) | floor),
     single_epoch: ((($hs / $ep) | floor) == (($he / $ep) | floor)),
+    head_moved: ($hs != $he),
+    consistency: "none: each read is latest state at its own observed_head",
     address_book_deployed_at: $book, reads: .}' > "$OUT"
 consistent=$(jq -r .single_epoch "$OUT")
 echo "wrote $OUT ($(jq '.reads | length' "$OUT") reads, head $HEAD_START→$HEAD_END, single_epoch=$consistent)"
-[ "$consistent" = true ] || echo "WARNING: export crossed an epoch boundary; validator/registry reads may mix epochs. Re-run." >&2
+[ "$consistent" = true ] || echo "WARNING: export crossed an epoch boundary (validator-set snapshots differ across reads). Re-run if that matters." >&2
