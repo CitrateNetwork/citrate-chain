@@ -24,7 +24,12 @@
 #     <script>/<chain id>/run-latest.json, chain id from the RPC), and with BROADCAST_SINCE
 #     (unix seconds; the ceremony passes the block-0 timestamp) runs recorded before it are
 #     ignored, so an earlier chain's runs on the same chain id are not evidence. A broadcast
-#     that cannot be read, or an in-scope deployment with no address, fails the gate.
+#     that cannot be read or has an unexpected shape, or an in-scope deployment with no
+#     address, fails the gate; a malformed file never stops the later files being examined;
+#   * any helper fails: the broadcast scanner exits non-zero or its output is incomplete, a
+#     book read crashes, or an RPC read fails. The script runs under `set -euo pipefail`, and
+#     every subprocess whose status bash would otherwise drop (command substitutions, the
+#     scanner) is checked explicitly.
 #
 # Usage
 #   RPC=<url> keep_check.sh verify KEEP_LIST.tsv
@@ -44,12 +49,14 @@
 #
 # Exit: 0 pass · 1 gate failed · 2 usage or input error
 # Needs: cast (Foundry; override with CAST=...), python3.
-set -uo pipefail
+set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/genesis/lib.sh
 . "$HERE/lib.sh"
 GENESIS_LOG_TAG=keep_check
+# A command that fails outside an explicit check stops the script non-zero (set -e); say where.
+trap 'err "unexpected failure (exit $?) at line $LINENO; the gate did not pass"' ERR
 
 CAST="${CAST:-${FOUNDRY_BIN:+$FOUNDRY_BIN/}cast}"
 PY="${PYTHON:-python3}"
@@ -57,7 +64,7 @@ PY="${PYTHON:-python3}"
 EIP1967_IMPL=0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc
 
 usage() {
-  sed -n '2,/^set -uo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//' >&2
+  sed -n '2,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//' >&2
   exit 2
 }
 
@@ -80,7 +87,16 @@ codehash() { # addr -> keccak256(code), EMPTY or RPC-ERROR
     echo "RPC-ERROR"
     return
   }
-  if [[ -z "$code" || "$code" == "0x" ]]; then echo "EMPTY"; else lower "$("$CAST" keccak "$code")"; fi
+  if [[ -z "$code" || "$code" == "0x" ]]; then
+    echo "EMPTY"
+    return
+  fi
+  local h
+  h=$("$CAST" keccak "$code" 2>/dev/null) || {
+    echo "KECCAK-ERROR"
+    return
+  }
+  lower "$h"
 }
 
 impl_of() { # addr -> 0x<40 hex> from the ERC-1967 slot
@@ -89,10 +105,20 @@ impl_of() { # addr -> 0x<40 hex> from the ERC-1967 slot
     echo "RPC-ERROR"
     return
   }
+  [[ "$w" =~ ^0x[0-9a-fA-F]{64}$ ]] || {
+    echo "RPC-ERROR"
+    return
+  }
   lower "0x${w: -40}"
 }
 
-book_get() { # book section key -> lowercased address, MISSING, or - for a non-string
+book_get() { # book section key -> lowercased address, MISSING, - for a non-string, or BOOK-ERROR
+  local out
+  out=$(book_get_raw "$@") || out="BOOK-ERROR"
+  [[ -n "$out" ]] || out="BOOK-ERROR"
+  printf '%s\n' "$out"
+}
+book_get_raw() {
   "$PY" - "$1" "$2" "$3" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -109,7 +135,7 @@ keys)
   [[ -f "$ADDRESS_BOOK" ]] || die "address book not found: $ADDRESS_BOOK" 2
   printf '# KEEP keys from %s (sections %s). Mark ERC-1967 proxies yes by hand.\n' "$ADDRESS_BOOK" "${ARGS[0]}"
   printf '# key\tsection\tcontract_name\tproxy\n'
-  "$PY" - "$ADDRESS_BOOK" "${ARGS[0]}" <<'PY'
+  if "$PY" - "$ADDRESS_BOOK" "${ARGS[0]}" <<'PY'
 import json, re, sys
 d = json.load(open(sys.argv[1]))
 for sec in sys.argv[2].split(","):
@@ -121,7 +147,7 @@ for sec in sys.argv[2].split(","):
         if isinstance(v, str) and re.fullmatch(r"0x[0-9a-fA-F]{40}", v) and int(v, 16) != 0:
             print(f"{k}\t{sec}\t{k}\tno")
 PY
-  exit $?
+  then exit 0; else die "cannot read sections ${ARGS[0]} from $ADDRESS_BOOK" 2; fi
   ;;
 pin)
   [[ ${#ARGS[@]} -eq 1 ]] || usage
@@ -134,7 +160,7 @@ pin)
       addr=$(book_get "$ADDRESS_BOOK" "$sec" "$key")
       is_addr "$addr" || die "book has no address for $sec.$key" 2
       describe_cmd "$CAST" code "$addr" --rpc-url '$RPC'
-      [[ "$proxy" == yes ]] && describe_cmd "$CAST" storage "$addr" "$EIP1967_IMPL" --rpc-url '$RPC'
+      if [[ "$proxy" == yes ]]; then describe_cmd "$CAST" storage "$addr" "$EIP1967_IMPL" --rpc-url '$RPC'; fi
     done <"$KEYS"
     exit 0
   fi
@@ -148,9 +174,12 @@ pin)
     addr=$(book_get "$ADDRESS_BOOK" "$sec" "$key")
     is_addr "$addr" || die "book has no address for $sec.$key" 2
     h=$(codehash "$addr")
-    [[ "$h" == EMPTY || "$h" == RPC-ERROR ]] && die "cannot pin $key at $addr: $h" 2
+    [[ "$h" =~ ^0x[0-9a-f]{64}$ ]] || die "cannot pin $key at $addr: $h" 2
     impl="-"
-    [[ "$proxy" == yes ]] && impl=$(impl_of "$addr")
+    if [[ "$proxy" == yes ]]; then
+      impl=$(impl_of "$addr")
+      is_addr "$impl" || die "cannot pin the implementation of $key at $addr: $impl" 2
+    fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$key" "$sec" "$addr" "${cname:--}" "$h" "$impl"
   done <"$KEYS"
   exit 0
@@ -187,7 +216,7 @@ while IFS=$'\t' read -r key sec addr cname want impl extra; do
   addr=$(lower "$addr")
   if [[ $DRY -eq 1 ]]; then
     describe_cmd "$CAST" code "$addr" --rpc-url '$RPC'
-    [[ "$impl" != "-" ]] && describe_cmd "$CAST" storage "$addr" "$EIP1967_IMPL" --rpc-url '$RPC'
+    if [[ "$impl" != "-" ]]; then describe_cmd "$CAST" storage "$addr" "$EIP1967_IMPL" --rpc-url '$RPC'; fi
   else
     got=$(codehash "$addr")
     if [[ "$got" == "$want" ]]; then
@@ -227,7 +256,7 @@ while IFS=$'\t' read -r key sec addr cname want impl extra; do
 done <"$LIST"
 
 if [[ -n "${BROADCAST_DIR:-}" && -d "$BROADCAST_DIR" && $DRY -eq 0 ]]; then
-  bcid=$("$CAST" chain-id --rpc-url "$RPC" 2>/dev/null)
+  bcid=$("$CAST" chain-id --rpc-url "$RPC" 2>/dev/null) || bcid=""
   if [[ ! "$bcid" =~ ^[0-9]+$ ]]; then
     say "KEEP-FAIL    cannot read the chain id to select broadcasts under $BROADCAST_DIR"
     fail=1
@@ -236,7 +265,12 @@ if [[ -n "${BROADCAST_DIR:-}" && -d "$BROADCAST_DIR" && $DRY -eq 0 ]]; then
     fail=1
   else
     # name<TAB>address for every KEEP row with a contract name: the pinned deployments.
-    pins=$(grep -v '^#' "$LIST" | awk -F'\t' 'NF>=4 && $4!="-"{print $4 "\t" tolower($3)}')
+    pins=$(awk -F'\t' '!/^#/ && NF>=4 && $4!="-"{print $4 "\t" tolower($3)}' "$LIST")
+    # The scanner validates every run and transaction it reads; a malformed one is reported
+    # as BAD and the scan goes on to the rest. It ends with a DONE line. A non-zero exit, a
+    # missing DONE, or a line of an unknown kind fails the gate: a crash part-way through
+    # must never read as "nothing moved".
+    scan_rc=0
     bc=$("$PY" - "$BROADCAST_DIR" "$bcid" "${BROADCAST_SINCE:-0}" "$pins" <<'PY'
 import json, sys, pathlib
 root, cid, since, pins_raw = pathlib.Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4]
@@ -245,33 +279,71 @@ for line in pins_raw.splitlines():
     if "\t" in line:
         n, a = line.split("\t", 1)
         pinned.setdefault(n, set()).add(a.strip().lower())
-for f in sorted(root.glob(f"*/{cid}/run-latest.json")):
-    script = f.parent.parent.name
+
+
+def scan(f, script):
     try:
-        run = json.load(open(f))
+        with open(f) as fh:
+            run = json.load(fh)
     except (OSError, ValueError) as e:
         print(f"BAD\t{script}\tunreadable broadcast {f}: {e}")
-        continue
+        return
+    if not isinstance(run, dict):
+        print(f"BAD\t{script}\tbroadcast {f} is not a JSON object")
+        return
     ts = run.get("timestamp")
-    if since and isinstance(ts, (int, float)):
+    if ts is not None and (isinstance(ts, bool) or not isinstance(ts, (int, float))):
+        print(f"BAD\t{script}\tbroadcast {f} has a non-numeric timestamp")
+        return
+    if since:
+        if ts is None:
+            print(f"BAD\t{script}\tbroadcast {f} has no timestamp to compare with BROADCAST_SINCE")
+            return
         ts = ts / 1000 if ts > 10**12 else ts  # older Foundry wrote milliseconds
         if ts < since:
             print(f"SKIP\t{script}\trun recorded before BROADCAST_SINCE")
+            return
+    txs = run.get("transactions")
+    if txs is None:
+        txs = []
+    if not isinstance(txs, list):
+        print(f"BAD\t{script}\tbroadcast {f}: transactions is not a list")
+        return
+    for i, t in enumerate(txs):
+        if not isinstance(t, dict):
+            print(f"BAD\t{script}\tbroadcast {f}: transaction {i} is not an object")
             continue
-    for t in run.get("transactions", []) or []:
-        name = t.get("contractName")
-        if t.get("transactionType") not in ("CREATE", "CREATE2") or name not in pinned:
+        kind, name, a = t.get("transactionType"), t.get("contractName"), t.get("contractAddress")
+        if not isinstance(kind, (str, type(None))) or not isinstance(name, (str, type(None))):
+            print(f"BAD\t{script}\tbroadcast {f}: transaction {i} has a malformed type or contract name")
             continue
-        a = (t.get("contractAddress") or "").lower()
-        if not a:
+        if kind not in ("CREATE", "CREATE2") or name not in pinned:
+            continue
+        if not isinstance(a, str) or not a:
             print(f"BAD\t{script}\t{name} deployment has no contractAddress")
-        elif a in pinned[name]:
+            continue
+        a = a.lower()
+        if a in pinned[name]:
             print(f"PIN\t{script}\t{name} at {a}")
         else:
             print(f"MOVE\t{script}\t{name} at {a}")
+
+
+for f in sorted(root.glob(f"*/{cid}/run-latest.json")):
+    script = f.parent.parent.name
+    try:
+        scan(f, script)
+    except Exception as e:  # any shape the checks above missed: report it, keep scanning
+        print(f"BAD\t{script}\tbroadcast {f} could not be scanned: {type(e).__name__}: {e}")
+print("DONE\t-\tscan complete")
 PY
-    )
+    ) || scan_rc=$?
     nbad=0
+    done_seen=0
+    if [[ $scan_rc -ne 0 ]]; then
+      say "KEEP-FAIL    the broadcast scanner exited $scan_rc; its output is not evidence"
+      nbad=1
+    fi
     while IFS=$'\t' read -r kind s detail; do
       case "$kind" in
         PIN) say "KEEP-OK      $s deploys $detail (the pinned address)" ;;
@@ -284,8 +356,18 @@ PY
           say "KEEP-FAIL    $s: $detail"
           nbad=1
           ;;
+        DONE) done_seen=1 ;;
+        "") ;;
+        *)
+          say "KEEP-FAIL    unexpected broadcast scanner output: $kind"
+          nbad=1
+          ;;
       esac
     done <<<"$bc"
+    if [[ $done_seen -ne 1 ]]; then
+      say "KEEP-FAIL    the broadcast scan did not complete"
+      nbad=1
+    fi
     if [[ $nbad -ne 0 ]]; then
       fail=1
     else

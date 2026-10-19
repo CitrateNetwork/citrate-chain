@@ -57,7 +57,7 @@ done
 d="$FAKE/rpc/$(printf '%s' "$rpc" | tr -c 'A-Za-z0-9' '_')"
 case "${args[0]}" in
   code) a=$(printf '%s' "${args[1]}" | tr 'A-F' 'a-f'); cat "$FAKE/code/$a" 2>/dev/null || echo 0x ;;
-  keccak) printf '0x%s\n' "$(printf '%s' "${args[1]}" | sha256sum | cut -c1-64)" ;;
+  keccak) [[ -z "${FAKE_KECCAK_FAIL:-}" ]] || exit 1; printf '0x%s\n' "$(printf '%s' "${args[1]}" | sha256sum | cut -c1-64)" ;;
   storage) a=$(printf '%s' "${args[1]}" | tr 'A-F' 'a-f'); cat "$FAKE/impl/$a" 2>/dev/null || printf '0x%064d\n' 0 ;;
   chain-id) [[ -f "$d/chain-id" ]] || exit 1; cat "$d/chain-id" ;;
   block-number) [[ -f "$d/head" ]] || exit 1; cat "$d/head" ;;
@@ -74,6 +74,7 @@ EOF
 cat >"$BIN/forge" <<'EOF'
 #!/usr/bin/env bash
 echo "forge $*" >>"$FAKE/calls.log"
+echo "forge-env gov=${GENESIS_GOVERNANCE_OUT:-} vest=${TEAM_VESTING_OUT:-} dormant=${DORMANT_LEDGERS_OUT:-} govbook=${GENESIS_GOVERNANCE_BOOK:-} extras=${EXTRA_ADDRESS_BOOKS:-}" >>"$FAKE/calls.log"
 if [[ "$*" == *CheckDeployedAdmins* ]]; then
   echo "FACTORY-ADMIN failures: ${FAKE_FACTORY_ADMIN:-0}"
   echo "DEPLOYER-ADMIN failures: ${FAKE_DEPLOYER_ADMIN:-0}"
@@ -91,6 +92,23 @@ case "$1" in
     echo inactive; exit 3 ;;
 esac
 exit 0
+EOF
+# Fake python that crashes the keep_check broadcast scanner (recognised by its script text
+# on stdin) and runs every other script with the real interpreter. FAKE_SCANNER=crash prints a
+# partial result and exits 1; FAKE_SCANNER=truncate prints nothing and exits 0.
+cat >"$BIN/python-scanfault" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == - ]]; then
+  src=$(cat)
+  if [[ "$src" == *run-latest.json* ]]; then
+    case "${FAKE_SCANNER:-}" in
+      crash) printf 'PIN\tEarly.s.sol\tAlpha at 0xabc\n'; echo "Traceback: boom" >&2; exit 1 ;;
+      truncate) exit 0 ;;
+    esac
+  fi
+  exec python3 - "${@:2}" <<<"$src"
+fi
+exec python3 "$@"
 EOF
 chmod +x "$BIN"/*
 export FAKE CAST="$BIN/cast" FORGE="$BIN/forge" SYSTEMCTL="$BIN/systemctl"
@@ -178,6 +196,41 @@ expect "keep: an unreadable broadcast fails" 1 'unreadable broadcast' -- env RPC
 printf '{"transactions":[{"transactionType":"CREATE","contractName":"Alpha"}]}' >"$BC/run-latest.json"
 expect "keep: a kept deployment with no address fails" 1 'has no contractAddress' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST"
 expect "keep: broadcasts need a readable chain id" 1 'cannot read the chain id' -- env RPC=http://nochain BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST"
+# A scanner that crashes, or stops without finishing, fails the gate whatever it printed.
+run_json 2000 Other "$(addr 777)" >"$BC/run-latest.json"
+expect "keep: a crashing broadcast scanner fails the gate" 1 'broadcast scanner exited 1' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" PYTHON="$BIN/python-scanfault" FAKE_SCANNER=crash bash "$KC" verify "$LIST"
+expect "keep: a crashing scanner is never reported as a pass" 1 'KEEP gate FAIL' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" PYTHON="$BIN/python-scanfault" FAKE_SCANNER=crash bash "$KC" verify "$LIST"
+expect "keep: a scanner that stops early fails the gate" 1 'broadcast scan did not complete' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" PYTHON="$BIN/python-scanfault" FAKE_SCANNER=truncate bash "$KC" verify "$LIST"
+expect "keep: the fault-injecting python passes a clean scan through" 0 'no chain-40204 broadcast' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" PYTHON="$BIN/python-scanfault" bash "$KC" verify "$LIST"
+# Schema errors in an earlier broadcast are reported AND the later broadcasts are still read.
+mkdir -p "$T/broadcast/AAA.s.sol/40204" "$T/broadcast/ZZZ.s.sol/40204"
+run_json 2000 Alpha "$(addr 777)" >"$T/broadcast/ZZZ.s.sol/40204/run-latest.json"
+schema_case() { # name json
+  printf '%s' "$2" >"$T/broadcast/AAA.s.sol/40204/run-latest.json"
+  local out rc
+  out=$(env RPC=http://r1 BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST" 2>&1)
+  rc=$?
+  if [[ $rc -eq 1 ]] && grep -q 'KEEP-FAIL    AAA.s.sol' <<<"$out" && grep -q 'ZZZ.s.sol redeploys Alpha' <<<"$out"; then
+    ok "keep: $1 fails and the later redeploy is still found"
+  else
+    bad "keep: $1 fails and the later redeploy is still found (exit $rc)" "$out"
+  fi
+}
+schema_case "a null transaction" '{"timestamp":2000,"transactions":[null]}'
+schema_case "transactions that is not a list" '{"timestamp":2000,"transactions":{"a":1}}'
+schema_case "a run that is not an object" '[1,2]'
+schema_case "a non-numeric timestamp" '{"timestamp":"soon","transactions":[]}'
+schema_case "a non-string contract name" '{"timestamp":2000,"transactions":[{"transactionType":"CREATE","contractName":["Alpha"]}]}'
+schema_case "a non-string contract address" '{"timestamp":2000,"transactions":[{"transactionType":"CREATE","contractName":"Alpha","contractAddress":7}]}'
+printf '{"transactions":[]}' >"$T/broadcast/AAA.s.sol/40204/run-latest.json"
+run_json 2000 Other "$(addr 777)" >"$T/broadcast/ZZZ.s.sol/40204/run-latest.json"
+expect "keep: a run with no timestamp fails when BROADCAST_SINCE scopes the evidence" 1 'no timestamp to compare' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" BROADCAST_SINCE=1500 bash "$KC" verify "$LIST"
+rm -r "$T/broadcast/AAA.s.sol" "$T/broadcast/ZZZ.s.sol"
+# Other helper failures fail the gate too.
+printf '{not json' >"$T/badbook.json"
+expect "keep: an unreadable address book fails" 1 'book.contracts moved: want 0x[0-9a-f]+ got BOOK-ERROR' -- env RPC=http://r1 ADDRESS_BOOK="$T/badbook.json" bash "$KC" verify "$LIST"
+expect "keep: a failing keccak fails" 1 'code changed: .* got KECCAK-ERROR' -- env RPC=http://r1 FAKE_KECCAK_FAIL=1 bash "$KC" verify "$LIST"
+expect "keep: keys on an unreadable book is an input error" 2 'cannot read sections' -- env ADDRESS_BOOK="$T/badbook.json" bash "$KC" keys contracts
 rm -r "$T/broadcast"
 
 reset_calls
@@ -386,6 +439,31 @@ printf '{"timestamp":7000,"transactions":[{"transactionType":"CREATE2","contract
 expect "ceremony: P6 fails a post-genesis redeploy away from the pin" 3 'keep_check failed' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 KEEP_LIST="$LIST" bash "$CE" --simulate --only P6
 rm "$(rpcdir http://127.0.0.1:8545)/block-0-timestamp"
 expect "ceremony: P6 needs the block-0 timestamp" 3 'block-0 timestamp' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 KEEP_LIST="$LIST" bash "$CE" --simulate --only P6
+
+# GENESIS_OUT_DIR: one directory for every producer and consumer path.
+expect "ceremony: an output dir outside contracts/genesis is refused" 1 'GENESIS_OUT_DIR must be contracts/genesis' -- "${CEENV[@]}" GENESIS_OUT_DIR="$T/elsewhere" bash "$CE"
+expect "ceremony: an output dir that escapes contracts/genesis is refused" 1 'GENESIS_OUT_DIR must be' -- "${CEENV[@]}" GENESIS_OUT_DIR="$REPO/contracts/genesis/../addresses" bash "$CE"
+expect "ceremony: dry run reads the books from a nondefault dir" 0 'EXTRA_ADDRESS_BOOKS=genesis/run2/governance.json,genesis/run2/team-vesting.json,genesis/run2/dormant-ledgers.json' -- "${CEENV[@]}" GENESIS_OUT_DIR="$REPO/contracts/genesis/run2" bash "$CE"
+RUN2="$REPO/contracts/genesis/run2"
+mkdir -p "$RUN2"
+reset_calls
+expect "ceremony: P1 writes governance into the nondefault dir" 0 'P0 preflight PASS \(books in genesis/run2/\)' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$RUN2" bash "$CE" --simulate --only P1
+calls | grep -q 'forge-env gov=genesis/run2/governance.json ' && ok "ceremony: P1 output path follows GENESIS_OUT_DIR" || bad "ceremony: P1 output path follows GENESIS_OUT_DIR" "$(calls)"
+# A stale book in the nondefault dir: P1 refuses to run over it (nothing sent).
+printf '{"contracts":{"GovernanceTimelock":"%s","GuardianTimelock":"%s","GovernanceMultisig":"%s"}}' "$(addr 41)" "$(addr 42)" "$(addr 43)" >"$RUN2/governance.json"
+reset_calls
+expect "ceremony: P1 refuses a stale governance book" 3 'run2/governance.json already exists and P1 would write it' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$RUN2" bash "$CE" --simulate --only P1
+if calls | grep -q '^forge'; then bad "ceremony: a refused P1 runs no forge" "$(calls)"; else ok "ceremony: a refused P1 runs no forge"; fi
+expect "ceremony: a stale book stops a resumed run before P1" 3 'already exists and P1' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$RUN2" bash "$CE" --simulate --from P1
+# Consumers read the same directory: P2 takes the run2 book, not contracts/genesis/governance.json.
+expect "ceremony: P2 reads governance from the nondefault dir" 0 'GOVERNANCE=0x0+29 GUARDIAN=0x0+2a' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$RUN2" bash "$CE" --simulate --only P2
+reset_calls
+expect "ceremony: P4 runs with the nondefault dir" 0 'P4 dormant ledgers' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$RUN2" PATRONAGE_KYC_REGISTRY="$(addr 51)" PATRONAGE_MEMBERSHIP="$(addr 52)" bash "$CE" --simulate --only P4
+calls | grep -q 'forge-env gov=[^ ]* vest=[^ ]* dormant=genesis/run2/dormant-ledgers.json govbook=genesis/run2/governance.json ' && ok "ceremony: P4 reads and writes the nondefault dir" || bad "ceremony: P4 reads and writes the nondefault dir" "$(calls)"
+reset_calls
+expect "ceremony: P5 checks the nondefault dir's books" 0 'P5 PASS' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$RUN2" bash "$CE" --simulate --only P5
+calls | grep -q 'extras=genesis/run2/governance.json$' && ok "ceremony: P5 EXTRA_ADDRESS_BOOKS follows GENESIS_OUT_DIR" || bad "ceremony: P5 EXTRA_ADDRESS_BOOKS follows GENESIS_OUT_DIR" "$(calls)"
+rm -r "$RUN2"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

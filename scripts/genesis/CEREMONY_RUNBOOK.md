@@ -154,8 +154,10 @@ RPC_URL=<loopback rpc> bash scripts/genesis/genesis_ceremony.sh --confirm --acco
 | P3 | Team vesting wallets from `TEAM_VESTING_FILE` | The deploy script's checks |
 | P4 | FederatedRoundLedger and PatronageLedger, dormant, admin = GOVERNANCE timelock | The deploy script's governance check |
 | P5 | `CheckDeployedAdmins` over the book and the P1/P3/P4 outputs | **`FACTORY-ADMIN 0` and `DEPLOYER-ADMIN 0`** |
-| P6 | `keep_check.sh verify` against `KEEP_LIST.genesis.tsv`, reading only this chain's broadcasts recorded since block 0 | Every frozen address has the frozen code; a kept contract deployed anywhere but its pinned address fails |
+| P6 | `keep_check.sh verify` against `KEEP_LIST.genesis.tsv`, reading only this chain's broadcasts recorded since block 0 | Every frozen address has the frozen code; a kept contract deployed anywhere but its pinned address fails; a broadcast that cannot be scanned, or a scanner that crashes, fails the gate |
 | P7 | `fleet_agree.sh` | All endpoints agree |
+
+The phase outputs (`governance.json`, `team-vesting.json`, `dormant-ledgers.json`) live in one directory, `GENESIS_OUT_DIR` (default `contracts/genesis`; it must be that directory or one below it). A phase that writes one of them refuses to start while the file already exists, so move an earlier run's or a simulation's output aside first.
 
 A failed phase prints the exact `--from Pn` to resume with. A phase that failed after broadcasting part of its transactions is never re-run blindly: read `contracts/broadcast/` and the chain first.
 

@@ -41,13 +41,23 @@
 #   KEEP_LIST (the rehearsal-1 freeze) · FLEET_RPCS (comma-separated)
 #   GENESIS_OUT_DIR (contracts/genesis) · ADDRESS_BOOK (contracts/addresses/40204.json)
 #
+# Output books: P1/P3/P4 write governance.json, team-vesting.json and dormant-ledgers.json
+# into GENESIS_OUT_DIR, and P2/P4/P5 read them from the same place; every producer and
+# consumer path is derived from that one directory. Forge may only write under
+# contracts/genesis (foundry.toml fs_permissions), so GENESIS_OUT_DIR must be that directory
+# or one below it; anything else is refused before any phase runs. A phase that writes a
+# book refuses to start, in --simulate or --confirm, while that book already exists: an
+# older file in the directory would otherwise be read as this ceremony's output.
+#
 # Exit: 0 ok · 1 precondition/usage · 2 a phase step failed · 3 a gate failed
-set -uo pipefail
+set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/genesis/lib.sh
 . "$HERE/lib.sh"
 GENESIS_LOG_TAG=ceremony
+# A command that fails outside an explicit check stops the run non-zero (set -e); say where.
+trap 'err "unexpected failure (exit $?) at line $LINENO; inspect before resuming with --from"' ERR
 
 REPO_ROOT="${REPO_ROOT:-$(cd "$HERE/../.." && pwd)}"
 CONTRACTS="$REPO_ROOT/contracts"
@@ -58,9 +68,6 @@ REGENESIS="${REGENESIS:-$REPO_ROOT/scripts/ops/regenesis.sh}"
 EXPECTED_CHAIN_ID="${EXPECTED_CHAIN_ID:-40204}"
 OUT="${GENESIS_OUT_DIR:-$CONTRACTS/genesis}"
 ADDRESS_BOOK="${ADDRESS_BOOK:-$CONTRACTS/addresses/40204.json}"
-GOV_BOOK="$OUT/governance.json"
-VEST_BOOK="$OUT/team-vesting.json"
-DORMANT_BOOK="$OUT/dormant-ledgers.json"
 
 # Genesis floors (owner decisions 2026-10-19, C2 D5). #324 enforces these on-chain in the
 # deploy script; this preflight refuses earlier, before anything is sent.
@@ -89,13 +96,30 @@ while [[ $# -gt 0 ]]; do
     --password-file) PASSWORD_FILE="${2:-}"; shift 2 ;;
     --private-key | --private-key=*) die "raw private keys are refused; sign with --account (Foundry keystore)" 1 ;;
     -h | --help)
-      sed -n '2,/^set -uo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//' >&2
+      sed -n '2,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//' >&2
       exit 1
       ;;
     *) die "unknown argument $1" 1 ;;
   esac
 done
 refuse_raw_keys
+
+# The one output directory, as forge sees it (relative to contracts/) and as this script
+# sees it (absolute). Lexical normalisation only, so it works before the directory exists.
+norm_path() { "$PY" -c 'import os,sys; print(os.path.normpath(os.path.abspath(sys.argv[1])))' "$1"; }
+contracts_abs=$(norm_path "$CONTRACTS") || die "cannot resolve $CONTRACTS" 1
+out_abs=$(norm_path "$OUT") || die "cannot resolve GENESIS_OUT_DIR $OUT" 1
+case "$out_abs" in
+  "$contracts_abs/genesis" | "$contracts_abs/genesis/"*) OUT_REL="${out_abs#"$contracts_abs/"}" ;;
+  *) die "GENESIS_OUT_DIR must be contracts/genesis or a directory below it (forge writes only there); got $OUT" 1 ;;
+esac
+OUT="$out_abs"
+GOV_REL="$OUT_REL/governance.json"
+VEST_REL="$OUT_REL/team-vesting.json"
+DORMANT_REL="$OUT_REL/dormant-ledgers.json"
+GOV_BOOK="$CONTRACTS/$GOV_REL"
+VEST_BOOK="$CONTRACTS/$VEST_REL"
+DORMANT_BOOK="$CONTRACTS/$DORMANT_REL"
 
 idx() {
   local i
@@ -124,14 +148,14 @@ step_fail() {
 SIGN=()
 if [[ -n "$ACCOUNT" ]]; then
   SIGN=(--account "$ACCOUNT")
-  [[ -n "$PASSWORD_FILE" ]] && SIGN+=(--password-file "$PASSWORD_FILE")
+  if [[ -n "$PASSWORD_FILE" ]]; then SIGN+=(--password-file "$PASSWORD_FILE"); fi
 fi
 
 # forge_phase <phase> <script> : forge script in the mode's shape.
 forge_phase() {
   local phase="$1" script="$2" args
   args=(script "script/$script" --rpc-url "${RPC_URL:-\$RPC_URL}" --sender "${DEPLOYER_ADDRESS:-\$DEPLOYER_ADDRESS}" --slow)
-  [[ "$MODE" == confirm ]] && args+=(--broadcast "${SIGN[@]}")
+  if [[ "$MODE" == confirm ]]; then args+=(--broadcast "${SIGN[@]}"); fi
   if [[ "$MODE" == dry ]]; then
     describe_cmd "(cd contracts &&" "$FORGE" "${args[@]}" ")"
     return 0
@@ -145,7 +169,7 @@ book_addr() {
 }
 
 count_owners() { # comma-separated list -> number of distinct non-empty entries
-  printf '%s' "$1" | tr ',' '\n' | sed 's/[[:space:]]//g' | grep -v '^$' | tr 'A-F' 'a-f' | sort -u | wc -l | tr -d ' '
+  count_owners_list "$1" | wc -l | tr -d ' '
 }
 
 need_env() { # name...
@@ -177,13 +201,21 @@ check_council() { # prefix min_threshold min_owners min_delay
 }
 
 overlap_check() {
-  local shared
-  shared=$(comm -12 <(count_owners_list "$GOV_OWNERS") <(count_owners_list "$GRD_OWNERS"))
+  # No process substitution: bash drops its exit status, so both lists are captured and
+  # checked first.
+  local gov grd a shared=""
+  gov=$(count_owners_list "$GOV_OWNERS") || gate_fail P0 "cannot read GOV_OWNERS"
+  grd=$(count_owners_list "$GRD_OWNERS") || gate_fail P0 "cannot read GRD_OWNERS"
+  for a in $gov; do
+    if grep -qxF -- "$a" <<<"$grd"; then shared+="$a "; fi
+  done
   if [[ -n "$shared" && "${ALLOW_SHARED_HOLDERS:-0}" != 1 ]]; then
     gate_fail P0 "an address sits on both GOVERNANCE and GUARDIAN (needs the owner's written approval and ALLOW_SHARED_HOLDERS=1)"
   fi
 }
-count_owners_list() { printf '%s' "$1" | tr ',' '\n' | sed 's/[[:space:]]//g' | grep -v '^$' | tr 'A-F' 'a-f' | sort -u; }
+count_owners_list() { # comma-separated list -> distinct non-empty lowercased entries, one per line
+  printf '%s' "$1" | tr ',' '\n' | sed 's/[[:space:]]//g' | { grep -v '^$' || true; } | tr 'A-F' 'a-f' | sort -u
+}
 
 log "mode=$MODE from=$FROM${ONLY:+ only=$ONLY} chain=$EXPECTED_CHAIN_ID"
 
@@ -222,20 +254,29 @@ if should P0 || [[ "$MODE" != dry ]]; then
     cid=$("$CAST" chain-id --rpc-url "$RPC_URL" 2>/dev/null) || gate_fail P0 "RPC $RPC_URL unreachable"
     [[ "$cid" == "$EXPECTED_CHAIN_ID" ]] || gate_fail P0 "RPC chain id $cid, want $EXPECTED_CHAIN_ID"
     if [[ -n "${EXPECTED_GENESIS_HASH:-}" ]]; then
-      g0=$("$CAST" block 0 --field hash --rpc-url "$RPC_URL" 2>/dev/null)
+      g0=$("$CAST" block 0 --field hash --rpc-url "$RPC_URL" 2>/dev/null) || gate_fail P0 "cannot read block 0 from $RPC_URL"
       [[ "$(lower "$g0")" == "$(lower "$EXPECTED_GENESIS_HASH")" ]] || gate_fail P0 "block 0 is $g0, want $EXPECTED_GENESIS_HASH"
     fi
     if [[ "$FROM" == P0 && -z "$ONLY" ]]; then
-      nonce=$("$CAST" nonce "$DEPLOYER_ADDRESS" --rpc-url "$RPC_URL" 2>/dev/null)
+      nonce=$("$CAST" nonce "$DEPLOYER_ADDRESS" --rpc-url "$RPC_URL" 2>/dev/null) || gate_fail P0 "cannot read the deployer nonce from $RPC_URL"
       [[ "$nonce" == 0 ]] || gate_fail P0 "deployer nonce is $nonce; a fresh ceremony starts at 0 (resume with --from instead)"
     fi
   fi
-  log "P0 preflight PASS"
+  if [[ "$MODE" != dry ]]; then
+    # A phase about to write a book must not find one already there: it would be an earlier
+    # run's (or a simulation's) output, and later phases would read it as this run's.
+    for pb in "P1:$GOV_BOOK" "P3:$VEST_BOOK" "P4:$DORMANT_BOOK"; do
+      if should "${pb%%:*}" && [[ -e "${pb#*:}" ]]; then
+        gate_fail P0 "${pb#*:} already exists and ${pb%%:*} would write it; move it aside (it is not this ceremony's output) or resume after ${pb%%:*}"
+      fi
+    done
+  fi
+  log "P0 preflight PASS (books in $OUT_REL/)"
 fi
 
 # ---------------------------------------------------------------- P1
 if should P1; then
-  export GENESIS_GOVERNANCE_OUT="genesis/governance.json"
+  export GENESIS_GOVERNANCE_OUT="$GOV_REL"
   export GENESIS_PROFILE=1
   export GOV_PROPOSAL_TTL="${GOV_PROPOSAL_TTL:-$GENESIS_TTL_SECS}" GRD_PROPOSAL_TTL="${GRD_PROPOSAL_TTL:-$GENESIS_TTL_SECS}"
   log "P1 governance → $GOV_BOOK"
@@ -264,7 +305,7 @@ if should P2; then
   load_governance P2
   rargs=(--reroll --with-aa)
   # regenesis.sh takes --account only; the keystore password comes from forge's own prompt.
-  [[ "$MODE" == confirm ]] && rargs+=(--broadcast --account "$ACCOUNT")
+  if [[ "$MODE" == confirm ]]; then rargs+=(--broadcast --account "$ACCOUNT"); fi
   log "P2 contract stack via regenesis.sh"
   if [[ "$MODE" == dry ]]; then
     describe_cmd RPC_URL='$RPC_URL' DEPLOYER_ADDRESS='$DEPLOYER_ADDRESS' bash "$REGENESIS" "${rargs[@]}"
@@ -279,7 +320,7 @@ if should P3; then
     [[ "$MODE" == confirm ]] && gate_fail P3 "TEAM_VESTING_FILE is required"
     log "P3 vesting: TEAM_VESTING_FILE unset (OPEN: owner amounts); planned only"
   fi
-  export TEAM_VESTING_FILE="${TEAM_VESTING_FILE:-genesis/team-vesting.input.json}" TEAM_VESTING_OUT="genesis/team-vesting.json"
+  export TEAM_VESTING_FILE="${TEAM_VESTING_FILE:-genesis/team-vesting.input.json}" TEAM_VESTING_OUT="$VEST_REL"
   log "P3 team vesting → $VEST_BOOK"
   forge_phase P3 DeployTeamVesting.s.sol
 fi
@@ -287,7 +328,7 @@ fi
 # ---------------------------------------------------------------- P4
 if should P4; then
   load_governance P4
-  export DORMANT_LEDGERS_OUT="genesis/dormant-ledgers.json" GENESIS_GOVERNANCE_BOOK="genesis/governance.json"
+  export DORMANT_LEDGERS_OUT="$DORMANT_REL" GENESIS_GOVERNANCE_BOOK="$GOV_REL"
   [[ "$MODE" == dry ]] || need_env PATRONAGE_KYC_REGISTRY PATRONAGE_MEMBERSHIP
   log "P4 dormant ledgers → $DORMANT_BOOK"
   forge_phase P4 DeployDormantLedgers.s.sol
@@ -295,9 +336,9 @@ fi
 
 # ---------------------------------------------------------------- P5
 if should P5; then
-  extras="genesis/governance.json"
-  [[ -f "$VEST_BOOK" || "$MODE" == dry ]] && extras+=",genesis/team-vesting.json"
-  [[ -f "$DORMANT_BOOK" || "$MODE" == dry ]] && extras+=",genesis/dormant-ledgers.json"
+  extras="$GOV_REL"
+  if [[ -f "$VEST_BOOK" || "$MODE" == dry ]]; then extras+=",$VEST_REL"; fi
+  if [[ -f "$DORMANT_BOOK" || "$MODE" == dry ]]; then extras+=",$DORMANT_REL"; fi
   log "P5 admin handover gate (FACTORY-ADMIN 0, DEPLOYER-ADMIN 0)"
   cmd=("$FORGE" script script/CheckDeployedAdmins.s.sol --rpc-url "${RPC_URL:-\$RPC_URL}")
   if [[ "$MODE" == dry ]]; then
@@ -307,7 +348,7 @@ if should P5; then
       printf '%s\n' "$report" | tail -40
       gate_fail P5 "CheckDeployedAdmins failed to run"
     }
-    printf '%s\n' "$report" | grep -E 'ADMIN' | tail -20
+    printf '%s\n' "$report" | { grep -E 'ADMIN' || true; } | tail -20
     printf '%s\n' "$report" | grep -qE 'FACTORY-ADMIN failures:[[:space:]]*0$' || gate_fail P5 "FACTORY-ADMIN is not 0"
     printf '%s\n' "$report" | grep -qE 'DEPLOYER-ADMIN failures:[[:space:]]*0$' || gate_fail P5 "DEPLOYER-ADMIN is not 0: the deployer still holds a role"
     log "P5 PASS: FACTORY-ADMIN 0, DEPLOYER-ADMIN 0"
@@ -323,7 +364,7 @@ if should P6; then
     ADDRESS_BOOK="$ADDRESS_BOOK" bash "$HERE/keep_check.sh" verify --dry-run "$KEEP_LIST" || gate_fail P6 "KEEP list malformed"
   else
     # Only broadcasts recorded on this chain since its block 0 are evidence for P6.
-    g0ts=$("$CAST" block 0 --field timestamp --rpc-url "$RPC_URL" 2>/dev/null)
+    g0ts=$("$CAST" block 0 --field timestamp --rpc-url "$RPC_URL" 2>/dev/null) || g0ts=""
     g0ts=$("$PY" -c 'import sys; print(int(sys.argv[1], 0))' "$g0ts" 2>/dev/null) ||
       gate_fail P6 "cannot read the block-0 timestamp to scope the broadcast evidence"
     RPC="$RPC_URL" ADDRESS_BOOK="$ADDRESS_BOOK" BROADCAST_DIR="$CONTRACTS/broadcast" BROADCAST_SINCE="$g0ts" \
@@ -338,7 +379,7 @@ if should P7; then
     log "P7 fleet: FLEET_RPCS unset; skipped"
   else
     dryflag=()
-    [[ "$MODE" == dry ]] && dryflag=(--dry-run)
+    if [[ "$MODE" == dry ]]; then dryflag=(--dry-run); fi
     FLEET_RPCS="$FLEET_RPCS" EXPECTED_CHAIN_ID="$EXPECTED_CHAIN_ID" bash "$HERE/fleet_agree.sh" "${dryflag[@]}" ||
       gate_fail P7 "the fleet does not agree on genesis and tip"
   fi
