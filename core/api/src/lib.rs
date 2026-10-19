@@ -15,6 +15,7 @@
 )]
 
 pub mod ai_rpc;
+pub mod canonical_logs;
 pub mod economics_rpc;
 pub mod eth_rpc;
 pub mod eth_subscriptions;
