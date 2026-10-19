@@ -8,7 +8,8 @@ an export runs. Blocks alternate between two proposers. eth_call returns uint256
 With [fail_mod] > 0, every block whose number is divisible by it fails: odd multiples return
 a JSON-RPC error, even multiples return a null block (models a partial producer sample).
 With [batch_fault] = http500 or badjson, the batch request covering the current head (the
-final producer batch) fails at the transport or parse level instead.
+final producer batch) fails at the transport or parse level instead. With [batch_fault] =
+headbad, eth_blockNumber returns a malformed quantity.
 """
 import json, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -22,6 +23,8 @@ state = {"head": HEAD}
 def answer(req):
     m, p = req.get("method"), req.get("params") or []
     if m == "eth_blockNumber":
+        if BATCH_FAULT == "headbad":
+            return {"jsonrpc": "2.0", "id": req.get("id"), "result": "not-a-quantity"}
         state["head"] += STEP
         res = hex(state["head"])
     elif m == "eth_chainId":

@@ -27,7 +27,18 @@ command -v cast >/dev/null || { echo "cast (foundry) is required" >&2; exit 1; }
 addr() { jq -er --arg k "$1" '.contracts[$k] // .[$k] // .governance[$k]' "$BOOK"; }
 rpc() { curl -fsS -X POST -H 'content-type: application/json' \
   --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":$2}" "$RPC" | jq -c 'if has("result") then .result else {error: .error} end'; }
-head_now() { printf '%d' "$(rpc eth_blockNumber '[]' | jq -r .)"; }
+# The head must be a real quantity: a failed or malformed eth_blockNumber aborts the export
+# (no file is written) instead of being recorded as block 0.
+head_now() {
+  local q; q=$(curl -fsS -X POST -H 'content-type: application/json' \
+    --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' "$RPC" 2>/dev/null \
+    | jq -r '.result // empty' 2>/dev/null) || q=""
+  if [[ ! "$q" =~ ^0x[0-9a-fA-F]+$ ]]; then
+    echo "export-fixtures: eth_blockNumber unavailable or malformed (${q:-no response}); no fixture written" >&2
+    exit 3
+  fi
+  printf '%d' "$q"
+}
 
 HEAD_START=$(head_now)
 rows=()
@@ -91,12 +102,41 @@ row producing_validators \
   "distinct eth_getBlockByNumber(n).proposerPubkey for n in [$lo, $OBSERVED]" "$producing"
 
 # Validators and rewards (ValidatorRegistry is the only producer source).
-call validator_active_count ValidatorRegistry "activeCount()(uint256)"
+call registered_validators  ValidatorRegistry "activeCount()(uint256)"
 call validator_min_stake    ValidatorRegistry "minStake()(uint256)"
 call block_subsidy          ValidatorRegistry "blockSubsidy()(uint256)"
 call max_epoch_emission     ValidatorRegistry "maxEpochEmission()(uint256)"
 call current_epoch          ValidatorRegistry "currentEpoch()(uint256)"
 call validator_active_set   ValidatorRegistry "activeSet()(bytes32[],uint256[])"
+
+# Consensus-active validators: members of the registry set whose activation epoch has come
+# (validatorInfo.actEpoch <= currentEpoch). activeCount() also counts registrations that are
+# still pending activation, so the two are exported separately (contract §1/§2).
+OBSERVED=$(head_now)
+VR=$(addr ValidatorRegistry)
+cur_epoch=$(cast call --rpc-url "$RPC" "$VR" "currentEpoch()(uint256)" 2>/dev/null | awk '{print $1}') || cur_epoch=""
+keys_raw=$(cast call --rpc-url "$RPC" "$VR" "activeSet()(bytes32[],uint256[])" 2>/dev/null | head -1) || keys_raw=""
+active=0; pending=0; unknown=0
+if [[ "$cur_epoch" =~ ^[0-9]+$ ]] && [ -n "$keys_raw" ]; then
+  for k in $(printf '%s' "$keys_raw" | tr -d '[] ' | tr ',' ' '); do
+    ae=$(cast call --rpc-url "$RPC" "$VR" \
+      "validatorInfo(bytes32)(address,uint256,uint256,uint256,uint256,uint64,uint64,uint64,uint8,uint256)" "$k" 2>/dev/null \
+      | sed -n 6p | awk '{print $1}') || ae=""
+    if [[ ! "$ae" =~ ^[0-9]+$ ]]; then unknown=$((unknown + 1))
+    elif [ "$ae" -le "$cur_epoch" ]; then active=$((active + 1))
+    else pending=$((pending + 1)); fi
+  done
+  if [ "$unknown" -eq 0 ]; then
+    cav=$(jq -cn --argjson a "$active" --argjson p "$pending" --argjson e "$cur_epoch" \
+      '{count:$a, pending_activation:$p, current_epoch:$e}')
+  else
+    cav=$(jq -cn --argjson u "$unknown" '{unavailable:true, reason:"validatorInfo read failed", unreadable:$u}')
+  fi
+else
+  cav='{"unavailable":true,"reason":"currentEpoch or activeSet read failed"}'
+fi
+row consensus_active_validators \
+  "ValidatorRegistry activeSet() members with validatorInfo(pubkey).actEpoch <= currentEpoch()" "$cav"
 
 # Membership (Track M).
 call grants_issued          MembershipStakeVault "nextGrantId()(uint256)"

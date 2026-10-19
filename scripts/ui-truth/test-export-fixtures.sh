@@ -21,6 +21,7 @@ check "steady: single_epoch true"            '[ "$(jq -r .single_epoch "$tmp/ste
 check "steady: every read is labelled latest" '[ "$(jq "[.reads[] | select(.state != \"latest\")] | length" "$tmp/steady.json")" = 0 ]'
 check "steady: every read has observed_head"  '[ "$(jq "[.reads[] | select(.observed_head == null)] | length" "$tmp/steady.json")" = 0 ]'
 check "steady: no read_at_block claim"        '[ "$(jq "has(\"read_at_block\")" "$tmp/steady.json")" = false ]'
+check "registered and consensus-active exported separately" '[ "$(jq "[.reads[].id] | (index(\"registered_validators\") != null) and (index(\"consensus_active_validators\") != null) and (index(\"validator_active_count\") == null)" "$tmp/steady.json")" = true ]'
 check "producers: 2 distinct over 1000 blocks" '[ "$(jq -c ".reads[] | select(.id==\"producing_validators\") | .value | [.count, .to_block - .from_block + 1]" "$tmp/steady.json")" = "[2,1000]" ]'
 
 run 18602 500990 1 "$tmp/drift.json"
@@ -40,5 +41,14 @@ for fault in http500 badjson; do
   check "$fault: export completes, file written" '[ -s "$tmp/$fault.json" ]'
   check "$fault: final-batch failure → unavailable, 900/1000" '[ "$(jq -c ".reads[] | select(.id==\"producing_validators\") | .value | [.unavailable, .blocks_returned, .blocks_requested]" "$tmp/$fault.json")" = "[true,900,1000]" ]'
 done
+
+# A malformed eth_blockNumber aborts the export: no file, non-zero exit, never a 0 head.
+python3 -I scripts/ui-truth/stub_rpc.py 18612 500200 0 0 headbad & hp=$!
+sleep 0.5
+if scripts/ui-truth/export-fixtures.sh "http://127.0.0.1:18612" "$tmp/headbad.json" >"$tmp/log" 2>&1; then hb_rc=0; else hb_rc=$?; fi
+kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null || true
+check "headbad: export aborts non-zero"        '[ "$hb_rc" -ne 0 ]'
+check "headbad: no fixture written"            '[ ! -e "$tmp/headbad.json" ]'
+check "headbad: says why"                      'grep -q "eth_blockNumber unavailable or malformed" "$tmp/log"'
 
 exit $fail

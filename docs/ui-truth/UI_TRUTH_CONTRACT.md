@@ -105,7 +105,8 @@ Amounts are SALT with 18 decimals (wei), so divide by 1e18. Addresses come from 
 | Block time | Timestamp delta over the last 100 blocks | "~2 s". Never the 1 s config value | 2 s |
 | Peers | Local `net_peerCount` | "N direct peers", not "the network" | 3 (public RPC) |
 | Base fee / gas price | `baseFeePerGas` of the latest block | "1 gwei (fixed)". It is a consensus constant | 1 gwei |
-| Active validators | `ValidatorRegistry.activeCount()` | Integer | 5 |
+| Registered validators | `ValidatorRegistry.activeCount()` (fixture `registered_validators`) | Integer, labelled "registered". It **includes** registrations still pending activation, so never call it "active" | 5 |
+| Consensus-active validators | `activeSet()` members with `validatorInfo(pubkey).actEpoch` ≤ `currentEpoch()` (fixture `consensus_active_validators`, which also reports `pending_activation`) | Integer. This is the "active" number. Example: right after a registration, registered = 6, consensus-active = 5, pending = 1 | 5 |
 | Producing validators | Distinct `proposerPubkey` over the last 1,000 blocks (fixture `producing_validators`, with its window) | Integer, with the window stated ("over the last N blocks"). A sample of N ≥ 100 is allowed if N is shown. Show it next to *active* so the gap is visible. A validator absent from the window is "not seen producing in the last N blocks", not "not producing" | 1 |
 | Minimum stake | `ValidatorRegistry.minStake()` | SALT. Read it; don't hard-code 32,000 | 32,000 |
 | Block reward | `ValidatorRegistry.blockSubsidy()` | "N SALT per block, to the producer". It is governance-set, so read it, never hard-code it | 10 SALT |
