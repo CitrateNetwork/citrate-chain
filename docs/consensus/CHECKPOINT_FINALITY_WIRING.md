@@ -455,7 +455,8 @@ message).
   (`.github/workflows/tla-finality.yml` → `scripts/ci/tla_finality.sh`, TLC 1.7.1 sha256-pinned):
   the bounded gating config must pass, and three mutation configs must produce counterexamples
   (f ≥ n/3; no durable signed-vote record; strict S2). The two-height config
-  (`_deep.cfg`) runs on demand (`TLA_FINALITY_DEEP=1`). `CheckpointVoteSafety` now runs too,
+  (`_deep.cfg`) runs on demand (`TLA_FINALITY_DEEP=1`; exhaustive local run 2026-10-19:
+  92.1M distinct states, no violation, 46 min). `CheckpointVoteSafety` now runs too,
   with a submission bound and two invariants restated (errata in the spec: as first written they
   were refuted by a valid vote followed by a rejected resubmission, and the unbounded sequence
   never terminated).
