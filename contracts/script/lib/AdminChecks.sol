@@ -66,9 +66,7 @@ abstract contract AdminChecks {
         (ok, a) = _readAddress(target, abi.encodeWithSignature("provider()"));
         if (ok && a == deployer) return "provider() is the deployer EOA";
         bool has;
-        (ok, has) = _readBool(
-            target, abi.encodeWithSignature("hasRole(bytes32,address)", DEFAULT_ADMIN_ROLE, deployer)
-        );
+        (ok, has) = _readBool(target, abi.encodeWithSignature("hasRole(bytes32,address)", DEFAULT_ADMIN_ROLE, deployer));
         if (ok && has) return "deployer EOA holds DEFAULT_ADMIN_ROLE";
         return _governingSeatProblem(target, deployer, "deployer EOA");
     }
@@ -106,6 +104,21 @@ abstract contract AdminChecks {
         address deployer,
         uint256 minDelay
     ) internal view {
+        _assertTimelockSeats(name, timelock, multisig, deployer);
+        require(
+            _timelockMinDelay(timelock) == minDelay,
+            string.concat(name, ": timelock minDelay is not the intended value")
+        );
+    }
+
+    /// @notice The seat half of `_assertTimelockHandover` (everything but the delay value):
+    ///         `multisig` holds PROPOSER, EXECUTOR and CANCELLER, execution is not open to
+    ///         everyone, the timelock administers itself, and neither `deployer` nor the
+    ///         CREATE2 factory holds an admin slot or governing seat on it.
+    function _assertTimelockSeats(string memory name, address timelock, address multisig, address deployer)
+        internal
+        view
+    {
         _assertNoFactoryAdmin(name, timelock);
         _assertNoDeployerAdmin(name, timelock, deployer);
         bytes32[3] memory roles = [TIMELOCK_PROPOSER_ROLE, TIMELOCK_EXECUTOR_ROLE, TIMELOCK_CANCELLER_ROLE];
@@ -120,11 +133,13 @@ abstract contract AdminChecks {
         (bool okSelf, bool self) =
             _readBool(timelock, abi.encodeWithSignature("hasRole(bytes32,address)", DEFAULT_ADMIN_ROLE, timelock));
         require(okSelf && self, string.concat(name, ": timelock does not administer itself"));
-        (bool okDelay, bytes memory ret) = timelock.staticcall(abi.encodeWithSignature("getMinDelay()"));
-        require(
-            okDelay && ret.length == 32 && abi.decode(ret, (uint256)) == minDelay,
-            string.concat(name, ": timelock minDelay is not the intended value")
-        );
+    }
+
+    /// @notice `getMinDelay()` of an OZ TimelockController. Reverts when `timelock` has none.
+    function _timelockMinDelay(address timelock) internal view returns (uint256) {
+        (bool ok, bytes memory ret) = timelock.staticcall(abi.encodeWithSignature("getMinDelay()"));
+        require(ok && ret.length == 32, "timelock: getMinDelay() unreadable");
+        return abi.decode(ret, (uint256));
     }
 
     /// @notice Revert if `deployer` holds any admin slot or governing seat on `target`.
@@ -149,9 +164,8 @@ abstract contract AdminChecks {
     /// @notice Revert unless `expected` holds DEFAULT_ADMIN_ROLE.
     function _assertAdminRole(string memory name, address target, address expected) internal view {
         _assertNoFactoryAdmin(name, target);
-        (bool ok, bool has) = _readBool(
-            target, abi.encodeWithSignature("hasRole(bytes32,address)", DEFAULT_ADMIN_ROLE, expected)
-        );
+        (bool ok, bool has) =
+            _readBool(target, abi.encodeWithSignature("hasRole(bytes32,address)", DEFAULT_ADMIN_ROLE, expected));
         require(ok && has, string.concat(name, ": intended key lacks DEFAULT_ADMIN_ROLE"));
     }
 
