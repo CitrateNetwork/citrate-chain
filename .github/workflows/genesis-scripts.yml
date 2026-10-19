@@ -1,14 +1,15 @@
 name: genesis-scripts
 
 # scripts/genesis/: the ceremony tooling (keep_check, fleet_agree, reset_node, ceremony).
-# The tests use fake cast/forge/systemctl in a temp dir: no network, no chain, no keys.
+# The tests use fake cast/forge/systemctl in a temp dir: no network, no chain, no keys. One
+# integration case runs the real admin checker against a local anvil (Foundry, below).
 
 on:
   push:
     branches: [main]
-    paths: ['scripts/genesis/**', 'scripts/ops/regenesis.sh', '.github/workflows/genesis-scripts.yml']
+    paths: ['scripts/genesis/**', 'scripts/ops/regenesis.sh', 'contracts/script/CheckDeployedAdmins.s.sol', 'contracts/script/lib/AdminChecks.sol', '.github/workflows/genesis-scripts.yml']
   pull_request:
-    paths: ['scripts/genesis/**', 'scripts/ops/regenesis.sh', '.github/workflows/genesis-scripts.yml']
+    paths: ['scripts/genesis/**', 'scripts/ops/regenesis.sh', 'contracts/script/CheckDeployedAdmins.s.sol', 'contracts/script/lib/AdminChecks.sol', '.github/workflows/genesis-scripts.yml']
   workflow_dispatch:
 
 permissions:
@@ -21,5 +22,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: shellcheck
         run: shellcheck -x -S warning scripts/genesis/*.sh scripts/genesis/tests/*.sh
+      # The P5 integration case runs the real CheckDeployedAdmins under forge against a local
+      # anvil; without Foundry it is skipped.
+      - name: foundry
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+        with:
+          version: v1.8.3
       - name: tests (offline)
         run: bash scripts/genesis/tests/test_genesis_scripts.sh

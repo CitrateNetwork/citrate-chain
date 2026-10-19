@@ -153,7 +153,7 @@ RPC_URL=<loopback rpc> bash scripts/genesis/genesis_ceremony.sh --confirm --acco
 | P2 | The contract stack via `scripts/ops/regenesis.sh --reroll --with-aa`, with GOVERNANCE/GUARDIAN/VALIDATOR_GOVERNANCE read from P1's output | regenesis exit status |
 | P3 | Team vesting wallets from `TEAM_VESTING_FILE` | The deploy script's checks |
 | P4 | FederatedRoundLedger and PatronageLedger, dormant, admin = GOVERNANCE timelock | The deploy script's governance check |
-| P5 | `CheckDeployedAdmins` over the book and the P1/P3/P4 outputs | **`FACTORY-ADMIN 0` and `DEPLOYER-ADMIN 0`** |
+| P5 | `CheckDeployedAdmins` over one merged book, `p5-admin-book.json` in `GENESIS_OUT_DIR`: the address book plus the `contracts` of every P1/P3/P4 output (all three on `--confirm`). The merge refuses an output that names another deployer, has no contracts, or reuses a name, so the checker sweeps every ceremony contract through the one book it always reads | **`FACTORY-ADMIN 0` and `DEPLOYER-ADMIN 0`** |
 | P6 | `keep_check.sh verify` against `KEEP_LIST.genesis.tsv`, reading only this chain's broadcasts recorded since block 0 | Every frozen address has the frozen code; a kept contract deployed anywhere but its pinned address fails; a broadcast that cannot be scanned, or a scanner that crashes, fails the gate |
 | P7 | `fleet_agree.sh` | All endpoints agree |
 

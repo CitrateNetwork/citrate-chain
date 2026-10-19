@@ -155,7 +155,7 @@ pin)
   [[ -f "$KEYS" ]] || die "keys file not found: $KEYS" 2
   [[ -n "${ADDRESS_BOOK:-}" ]] || die "pin needs ADDRESS_BOOK" 2
   if [[ $DRY -eq 1 ]]; then
-    while IFS=$'\t' read -r key sec cname proxy; do
+    while IFS=$'\t' read -r key sec cname proxy || [[ -n "$key" ]]; do
       [[ -z "$key" || "$key" == \#* ]] && continue
       addr=$(book_get "$ADDRESS_BOOK" "$sec" "$key")
       is_addr "$addr" || die "book has no address for $sec.$key" 2
@@ -169,7 +169,7 @@ pin)
   cid=$("$CAST" chain-id --rpc-url "$RPC") || die "RPC unreachable: $RPC" 2
   printf '# KEEP list pinned from chain %s at block %s (keccak256(eth_getCode)). Do not edit by hand.\n' "$cid" "$blk"
   printf '# key\tsection\taddress\tcontract_name\tcode_hash\texpected_impl\n'
-  while IFS=$'\t' read -r key sec cname proxy; do
+  while IFS=$'\t' read -r key sec cname proxy || [[ -n "$key" ]]; do
     [[ -z "$key" || "$key" == \#* ]] && continue
     addr=$(book_get "$ADDRESS_BOOK" "$sec" "$key")
     is_addr "$addr" || die "book has no address for $sec.$key" 2
@@ -204,7 +204,10 @@ row_ok() { # addr code_hash impl extra
   [[ "$3" == "-" ]] || is_addr "$3"
 }
 lineno=0
-while IFS=$'\t' read -r key sec addr cname want impl extra; do
+# `|| [[ -n $key ]]`: a last row without a trailing newline is still read (read returns
+# non-zero at EOF but fills the fields), so it is checked, never silently dropped. The same
+# holds for the keys loops above.
+while IFS=$'\t' read -r key sec addr cname want impl extra || [[ -n "$key" ]]; do
   lineno=$((lineno + 1))
   [[ -z "$key" || "$key" == \#* ]] && continue
   if ! row_ok "$addr" "$want" "${impl:-}" "${extra:-}"; then

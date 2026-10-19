@@ -11,8 +11,9 @@
 #                      membership), with GOVERNANCE/GUARDIAN taken from P1's output
 #   P3  vesting        DeployTeamVesting from the owner's TEAM_VESTING_FILE
 #   P4  dormant        DeployDormantLedgers (FederatedRoundLedger, PatronageLedger)
-#   P5  admins         CheckDeployedAdmins over the book + P1/P3/P4 outputs:
-#                      FACTORY-ADMIN 0 and DEPLOYER-ADMIN 0 (the handover gate)
+#   P5  admins         CheckDeployedAdmins over ONE merged book (the book + the P1/P3/P4
+#                      outputs' contracts): FACTORY-ADMIN 0 and DEPLOYER-ADMIN 0 (the
+#                      handover gate)
 #   P6  keep           keep_check.sh verify against the frozen KEEP list
 #   P7  fleet          fleet_agree.sh: every endpoint on the same genesis and tip
 #
@@ -335,23 +336,85 @@ if should P4; then
 fi
 
 # ---------------------------------------------------------------- P5
+# The checker reads ONE book (ADDRESS_BOOK) and sweeps its .contracts and .aaStack. P5 hands
+# it a single merged book: the canonical book plus the .contracts of every ceremony output,
+# so every contract the ceremony deployed is swept by whatever checker revision is installed
+# (nothing depends on the checker honouring a side channel such as EXTRA_ADDRESS_BOOKS).
+# The merge refuses an extra book that names another deployer, has no contracts, or reuses
+# a name already in the merged book, so no entry is dropped or shadowed. --confirm needs all
+# three outputs; --simulate takes those present, governance always.
 if should P5; then
-  extras="$GOV_REL"
-  if [[ -f "$VEST_BOOK" || "$MODE" == dry ]]; then extras+=",$VEST_REL"; fi
-  if [[ -f "$DORMANT_BOOK" || "$MODE" == dry ]]; then extras+=",$DORMANT_REL"; fi
-  log "P5 admin handover gate (FACTORY-ADMIN 0, DEPLOYER-ADMIN 0)"
+  P5_BOOK_REL="$OUT_REL/p5-admin-book.json"
+  P5_BOOK="$CONTRACTS/$P5_BOOK_REL"
+  log "P5 admin handover gate (FACTORY-ADMIN 0, DEPLOYER-ADMIN 0) over the book + the ceremony outputs"
   cmd=("$FORGE" script script/CheckDeployedAdmins.s.sol --rpc-url "${RPC_URL:-\$RPC_URL}")
   if [[ "$MODE" == dry ]]; then
-    describe_cmd "(cd contracts && ADDRESS_BOOK=$ADDRESS_BOOK EXTRA_ADDRESS_BOOKS=$extras REQUIRE_ALL_CODE=true" "${cmd[@]}" ")"
+    log "P5 would merge $ADDRESS_BOOK + $GOV_REL, $VEST_REL, $DORMANT_REL → $P5_BOOK_REL"
+    describe_cmd "(cd contracts && ADDRESS_BOOK=$P5_BOOK_REL REQUIRE_ALL_CODE=true" "${cmd[@]}" ")"
   else
-    report=$(cd "$CONTRACTS" && ADDRESS_BOOK="$ADDRESS_BOOK" EXTRA_ADDRESS_BOOKS="$extras" REQUIRE_ALL_CODE=true "${cmd[@]}" 2>&1) || {
+    extras=("$GOV_BOOK")
+    [[ -f "$GOV_BOOK" ]] || gate_fail P5 "$GOV_BOOK missing (run P1 first)"
+    for b in "$VEST_BOOK" "$DORMANT_BOOK"; do
+      if [[ -f "$b" ]]; then
+        extras+=("$b")
+      elif [[ "$MODE" == confirm ]]; then
+        gate_fail P5 "$b missing: the handover gate must cover every ceremony output (run P3/P4 first)"
+      else
+        log "P5 note: $b absent in a simulation; not swept"
+      fi
+    done
+    merged=$("$PY" - "$ADDRESS_BOOK" "$P5_BOOK" "${extras[@]}" <<'PY'
+import json, re, sys
+ADDR = re.compile(r"0x[0-9a-fA-F]{40}")
+main_path, out_path, extras = sys.argv[1], sys.argv[2], sys.argv[3:]
+def load(p):
+    try:
+        with open(p) as f:
+            d = json.load(f)
+    except (OSError, ValueError) as e:
+        sys.exit(f"cannot read {p}: {e}")
+    if not isinstance(d, dict):
+        sys.exit(f"{p} is not a JSON object")
+    return d
+book = load(main_path)
+dep = book.get("deployer")
+if not isinstance(dep, str) or not ADDR.fullmatch(dep):
+    sys.exit(f"{main_path} has no deployer address")
+book.setdefault("contracts", {})
+book.setdefault("aaStack", {})
+for sec in ("contracts", "aaStack"):
+    if not isinstance(book[sec], dict):
+        sys.exit(f"{main_path} .{sec} is not an object")
+taken = set(book["contracts"]) | set(book["aaStack"])
+for p in extras:
+    d = load(p)
+    xdep = d.get("deployer")
+    if not isinstance(xdep, str) or xdep.lower() != dep.lower():
+        sys.exit(f"{p} names deployer {xdep!r}, not the book's {dep}")
+    c = d.get("contracts")
+    if not isinstance(c, dict) or not c:
+        sys.exit(f"{p} has no contracts")
+    for name, a in c.items():
+        if not isinstance(a, str) or not ADDR.fullmatch(a) or int(a, 16) == 0:
+            sys.exit(f"{p} .contracts.{name} is not an address")
+        if name in taken:
+            sys.exit(f"{p} .contracts.{name} is already in the merged book")
+        taken.add(name)
+        book["contracts"][name] = a
+    print(f"{p}: {len(c)} contract(s)")
+with open(out_path, "w") as f:
+    json.dump(book, f, indent=2, sort_keys=True)
+PY
+    ) || gate_fail P5 "cannot build the merged admin book"
+    printf '%s\n' "$merged" | sed 's/^/    P5 swept /'
+    report=$(cd "$CONTRACTS" && ADDRESS_BOOK="$P5_BOOK_REL" REQUIRE_ALL_CODE=true "${cmd[@]}" 2>&1) || {
       printf '%s\n' "$report" | tail -40
-      gate_fail P5 "CheckDeployedAdmins failed to run"
+      gate_fail P5 "CheckDeployedAdmins failed (see the report above)"
     }
     printf '%s\n' "$report" | { grep -E 'ADMIN' || true; } | tail -20
     printf '%s\n' "$report" | grep -qE 'FACTORY-ADMIN failures:[[:space:]]*0$' || gate_fail P5 "FACTORY-ADMIN is not 0"
     printf '%s\n' "$report" | grep -qE 'DEPLOYER-ADMIN failures:[[:space:]]*0$' || gate_fail P5 "DEPLOYER-ADMIN is not 0: the deployer still holds a role"
-    log "P5 PASS: FACTORY-ADMIN 0, DEPLOYER-ADMIN 0"
+    log "P5 PASS: FACTORY-ADMIN 0, DEPLOYER-ADMIN 0 over $P5_BOOK_REL"
   fi
 fi
 

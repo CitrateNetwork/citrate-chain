@@ -76,8 +76,19 @@ cat >"$BIN/forge" <<'EOF'
 echo "forge $*" >>"$FAKE/calls.log"
 echo "forge-env gov=${GENESIS_GOVERNANCE_OUT:-} vest=${TEAM_VESTING_OUT:-} dormant=${DORMANT_LEDGERS_OUT:-} govbook=${GENESIS_GOVERNANCE_BOOK:-} extras=${EXTRA_ADDRESS_BOOKS:-}" >>"$FAKE/calls.log"
 if [[ "$*" == *CheckDeployedAdmins* ]]; then
+  # Like the real checker: read ONE book, ADDRESS_BOOK (relative to contracts/, the cwd).
+  # FAKE_DEPLOYER_HELD=<name>: the contract of that name in the book still has the deployer
+  # in a role, so it counts as a DEPLOYER-ADMIN failure only if the book the checker reads
+  # actually contains it.
+  echo "forge-book ${ADDRESS_BOOK:-}" >>"$FAKE/calls.log"
+  [[ -f "${ADDRESS_BOOK:-}" ]] || { echo "fake forge: cannot read ADDRESS_BOOK ${ADDRESS_BOOK:-}" >&2; exit 1; }
+  da=${FAKE_DEPLOYER_ADMIN:-0}
+  if [[ -n "${FAKE_DEPLOYER_HELD:-}" ]] && grep -q "\"${FAKE_DEPLOYER_HELD}\"" "$ADDRESS_BOOK"; then
+    echo "DEPLOYER-ADMIN ${FAKE_DEPLOYER_HELD}: governance() is the deployer EOA"
+    da=$((da + 1))
+  fi
   echo "FACTORY-ADMIN failures: ${FAKE_FACTORY_ADMIN:-0}"
-  echo "DEPLOYER-ADMIN failures: ${FAKE_DEPLOYER_ADMIN:-0}"
+  echo "DEPLOYER-ADMIN failures: $da"
 fi
 EOF
 cat >"$BIN/systemctl" <<'EOF'
@@ -254,6 +265,24 @@ if RPC=http://r1 ADDRESS_BOOK="$BOOK" bash "$KC" pin "$KEYS" >"$PINNED" 2>"$T/pi
 expect "keep: a freshly pinned list verifies" 0 'KEEP gate PASS \(3 entries\)' -- env RPC=http://r1 ADDRESS_BOOK="$BOOK" bash "$KC" verify "$PINNED"
 grep -q "^Vault.*$IMPL\$" "$PINNED" && ok "keep: pin records the proxy implementation" || bad "keep: pin records the proxy implementation" "$(cat "$PINNED")"
 
+# A final row without a trailing newline is still a row: `read` returns non-zero at EOF but
+# fills the fields. Before the fix the loops dropped it, so a changed last contract passed.
+NONL="$T/keep-nonl.tsv"
+printf 'Alpha\tcontracts\t%s\tAlpha\t%s\t-\nBeta\tcontracts\t%s\t-\t%s\t-' "$A1" "$(hash_of 0x6001)" "$A2" "$(hash_of 0x6002)" >"$NONL"
+expect "keep: an unterminated last row is counted" 0 'KEEP gate PASS \(2 entries\)' -- env RPC=http://r1 bash "$KC" verify "$NONL"
+printf '0x60ff' >"$FAKE/code/$A2"
+expect "keep: an unterminated last row that changed fails" 1 'KEEP-FAIL +Beta .*code changed' -- env RPC=http://r1 bash "$KC" verify "$NONL"
+printf '0x6002' >"$FAKE/code/$A2"
+expect "keep: --dry-run counts an unterminated last row" 0 'KEEP dry run OK \(2 entries' -- bash "$KC" verify --dry-run "$NONL"
+printf 'Alpha\tcontracts\tAlpha\tno\nBeta\tcontracts\t-\tno' >"$T/keys-nonl.tsv"
+if RPC=http://r1 ADDRESS_BOOK="$BOOK" bash "$KC" pin "$T/keys-nonl.tsv" >"$T/pinned-nonl.tsv" 2>"$T/pin.err" &&
+  grep -q "^Beta	contracts	$A2	" "$T/pinned-nonl.tsv"; then
+  ok "keep: pin records an unterminated last key"
+else
+  bad "keep: pin records an unterminated last key" "$(cat "$T/pinned-nonl.tsv" "$T/pin.err")"
+fi
+expect "keep: pin --dry-run reads an unterminated last key" 0 "cast code $A2" -- env ADDRESS_BOOK="$BOOK" bash "$KC" pin --dry-run "$T/keys-nonl.tsv"
+
 # ------------------------------------------------------------------ fleet_agree
 FA="$G/fleet_agree.sh"
 h64() { printf '%064d' 0 | tr 0 "$1"; }
@@ -376,9 +405,15 @@ REPO="$T/repo"
 mkdir -p "$REPO/contracts/script" "$REPO/contracts/genesis" "$REPO/contracts/addresses" "$REPO/scripts/ops"
 for s in DeployGenesisGovernance DeployTeamVesting DeployDormantLedgers CheckDeployedAdmins; do : >"$REPO/contracts/script/$s.s.sol"; done
 printf '#!/usr/bin/env bash\necho "regenesis $*" >>"$FAKE/calls.log"\n' >"$REPO/scripts/ops/regenesis.sh"
-cp "$BOOK" "$REPO/contracts/addresses/40204.json"
+DEP=$(addr 1)
+printf '{"chainId":40204,"deployer":"%s","contracts":{"Alpha":"%s","Beta":"%s","Vault":"%s"},"aaStack":{},"Vault":"%s"}' "$DEP" "$A1" "$A2" "$A3" "$A3" >"$REPO/contracts/addresses/40204.json"
+# gov_book <dir> <deployer> [extra "Name":"0x..." pairs]: a P1-shaped governance output.
+gov_book() {
+  printf '{"deployer":"%s","contracts":{"GovernanceTimelock":"%s","GuardianTimelock":"%s","GovernanceMultisig":"%s"%s}}' \
+    "$2" "$(addr 31)" "$(addr 32)" "$(addr 33)" "${3:+,$3}" >"$1/governance.json"
+}
 owners() { local i out=""; for i in "$@"; do out+="${out:+,}$(addr "$i")"; done; printf '%s' "$out"; }
-CEENV=(env REPO_ROOT="$REPO" DEPLOYER_ADDRESS="$(addr 1)"
+CEENV=(env REPO_ROOT="$REPO" DEPLOYER_ADDRESS="$DEP"
   GOV_OWNERS="$(owners 11 12 13 14 15)" GOV_THRESHOLD=3 GOV_MIN_DELAY=172800
   GRD_OWNERS="$(owners 21 22 23)" GRD_THRESHOLD=2 GRD_MIN_DELAY=3600)
 
@@ -407,10 +442,34 @@ expect "ceremony: an unknown phase is refused" 1 'must be one of' -- "${CEENV[@]
 # simulate: P5 reads the admin report
 mkdir -p "$(rpcdir http://127.0.0.1:8545)"
 echo 40204 >"$(rpcdir http://127.0.0.1:8545)/chain-id"
+expect "ceremony: P5 needs P1's governance output" 3 'governance.json missing' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+GB="$REPO/contracts/genesis"
+gov_book "$GB" "$DEP"
 expect "ceremony: P5 passes at DEPLOYER-ADMIN 0" 0 'P5 PASS' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
 expect "ceremony: P5 fails while the deployer holds a role" 3 'DEPLOYER-ADMIN is not 0' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 FAKE_DEPLOYER_ADMIN=2 bash "$CE" --simulate --only P5
+# The checker reads one book: every ceremony output's contracts must be in it. Before the
+# merge, P5 passed the outputs through EXTRA_ADDRESS_BOOKS, which the checker never read, so
+# a role still held on a contract that only a ceremony output lists passed the gate.
+reset_calls
+expect "ceremony: P5 sweeps the governance output" 0 'P5 PASS' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+calls | grep -q '^forge-book genesis/p5-admin-book.json$' && ok "ceremony: P5 hands the checker the merged book" || bad "ceremony: P5 hands the checker the merged book" "$(calls)"
+python3 -c 'import json,sys; c=json.load(open(sys.argv[1]))["contracts"]; sys.exit(0 if {"Alpha","Beta","GovernanceTimelock","GuardianTimelock","GovernanceMultisig"} <= set(c) else 1)' "$GB/p5-admin-book.json" &&
+  ok "ceremony: the merged book holds the book and governance contracts" || bad "ceremony: the merged book holds the book and governance contracts" "$(cat "$GB/p5-admin-book.json")"
+expect "ceremony: P5 fails a deployer role held in the governance output" 3 'DEPLOYER-ADMIN GovernanceMultisig' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 FAKE_DEPLOYER_HELD=GovernanceMultisig bash "$CE" --simulate --only P5
+printf '{"deployer":"%s","contracts":{"VestingAlice":"%s"}}' "$DEP" "$(addr 71)" >"$GB/team-vesting.json"
+printf '{"deployer":"%s","contracts":{"FederatedRoundLedger":"%s","PatronageLedger":"%s"}}' "$DEP" "$(addr 81)" "$(addr 82)" >"$GB/dormant-ledgers.json"
+expect "ceremony: P5 fails a deployer role held in the vesting output" 3 'DEPLOYER-ADMIN VestingAlice' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 FAKE_DEPLOYER_HELD=VestingAlice bash "$CE" --simulate --only P5
+expect "ceremony: P5 fails a deployer role held in the dormant-ledger output" 3 'DEPLOYER-ADMIN PatronageLedger' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 FAKE_DEPLOYER_HELD=PatronageLedger bash "$CE" --simulate --only P5
+expect "ceremony: P5 refuses an output from another deployer" 3 'cannot build the merged admin book' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash -c "printf '{\"deployer\":\"%s\",\"contracts\":{\"VestingAlice\":\"%s\"}}' '$(addr 9)' '$(addr 71)' > '$GB/team-vesting.json'; bash '$CE' --simulate --only P5"
+printf '{"deployer":"%s","contracts":{"Alpha":"%s"}}' "$DEP" "$(addr 71)" >"$GB/team-vesting.json"
+expect "ceremony: P5 refuses an output that shadows a book name" 3 'cannot build the merged admin book' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+printf '{"deployer":"%s","contracts":{}}' "$DEP" >"$GB/team-vesting.json"
+expect "ceremony: P5 refuses an output with no contracts" 3 'cannot build the merged admin book' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+rm "$GB/team-vesting.json" "$GB/dormant-ledgers.json"
+echo "$GEN" >"$(rpcdir http://127.0.0.1:8545)/block-0"
+expect "ceremony: --confirm P5 needs every ceremony output" 3 'team-vesting.json missing' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1 bash "$CE" --confirm --only P5 --account deployer
+rm "$(rpcdir http://127.0.0.1:8545)/block-0"
 expect "ceremony: P0 checks the RPC chain id" 3 'chain id 1, want 40204' -- "${CEENV[@]}" RPC_URL=http://n3x bash -c "mkdir -p '$(rpcdir http://n3x)'; echo 1 > '$(rpcdir http://n3x)/chain-id'; bash '$CE' --simulate --only P0"
-printf '{"contracts":{"GovernanceTimelock":"%s","GuardianTimelock":"%s","GovernanceMultisig":"%s"}}' "$(addr 31)" "$(addr 32)" "$(addr 33)" >"$REPO/contracts/genesis/governance.json"
 reset_calls
 expect "ceremony: P2 takes governance from P1's output" 0 'GOVERNANCE=0x0+1f GUARDIAN=0x0+20' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
 calls | grep -q 'regenesis --reroll --with-aa$' && ok "ceremony: simulate does not broadcast" || bad "ceremony: simulate does not broadcast" "$(calls)"
@@ -443,14 +502,14 @@ expect "ceremony: P6 needs the block-0 timestamp" 3 'block-0 timestamp' -- "${CE
 # GENESIS_OUT_DIR: one directory for every producer and consumer path.
 expect "ceremony: an output dir outside contracts/genesis is refused" 1 'GENESIS_OUT_DIR must be contracts/genesis' -- "${CEENV[@]}" GENESIS_OUT_DIR="$T/elsewhere" bash "$CE"
 expect "ceremony: an output dir that escapes contracts/genesis is refused" 1 'GENESIS_OUT_DIR must be' -- "${CEENV[@]}" GENESIS_OUT_DIR="$REPO/contracts/genesis/../addresses" bash "$CE"
-expect "ceremony: dry run reads the books from a nondefault dir" 0 'EXTRA_ADDRESS_BOOKS=genesis/run2/governance.json,genesis/run2/team-vesting.json,genesis/run2/dormant-ledgers.json' -- "${CEENV[@]}" GENESIS_OUT_DIR="$REPO/contracts/genesis/run2" bash "$CE"
+expect "ceremony: dry run reads the books from a nondefault dir" 0 'merge .* \+ genesis/run2/governance.json, genesis/run2/team-vesting.json, genesis/run2/dormant-ledgers.json → genesis/run2/p5-admin-book.json' -- "${CEENV[@]}" GENESIS_OUT_DIR="$REPO/contracts/genesis/run2" bash "$CE"
 RUN2="$REPO/contracts/genesis/run2"
 mkdir -p "$RUN2"
 reset_calls
 expect "ceremony: P1 writes governance into the nondefault dir" 0 'P0 preflight PASS \(books in genesis/run2/\)' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$RUN2" bash "$CE" --simulate --only P1
 calls | grep -q 'forge-env gov=genesis/run2/governance.json ' && ok "ceremony: P1 output path follows GENESIS_OUT_DIR" || bad "ceremony: P1 output path follows GENESIS_OUT_DIR" "$(calls)"
 # A stale book in the nondefault dir: P1 refuses to run over it (nothing sent).
-printf '{"contracts":{"GovernanceTimelock":"%s","GuardianTimelock":"%s","GovernanceMultisig":"%s"}}' "$(addr 41)" "$(addr 42)" "$(addr 43)" >"$RUN2/governance.json"
+printf '{"deployer":"%s","contracts":{"GovernanceTimelock":"%s","GuardianTimelock":"%s","GovernanceMultisig":"%s"}}' "$DEP" "$(addr 41)" "$(addr 42)" "$(addr 43)" >"$RUN2/governance.json"
 reset_calls
 expect "ceremony: P1 refuses a stale governance book" 3 'run2/governance.json already exists and P1 would write it' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$RUN2" bash "$CE" --simulate --only P1
 if calls | grep -q '^forge'; then bad "ceremony: a refused P1 runs no forge" "$(calls)"; else ok "ceremony: a refused P1 runs no forge"; fi
@@ -462,8 +521,67 @@ expect "ceremony: P4 runs with the nondefault dir" 0 'P4 dormant ledgers' -- "${
 calls | grep -q 'forge-env gov=[^ ]* vest=[^ ]* dormant=genesis/run2/dormant-ledgers.json govbook=genesis/run2/governance.json ' && ok "ceremony: P4 reads and writes the nondefault dir" || bad "ceremony: P4 reads and writes the nondefault dir" "$(calls)"
 reset_calls
 expect "ceremony: P5 checks the nondefault dir's books" 0 'P5 PASS' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$RUN2" bash "$CE" --simulate --only P5
-calls | grep -q 'extras=genesis/run2/governance.json$' && ok "ceremony: P5 EXTRA_ADDRESS_BOOKS follows GENESIS_OUT_DIR" || bad "ceremony: P5 EXTRA_ADDRESS_BOOKS follows GENESIS_OUT_DIR" "$(calls)"
+calls | grep -q '^forge-book genesis/run2/p5-admin-book.json$' && grep -q "$(addr 41)" "$RUN2/p5-admin-book.json" && ok "ceremony: P5 merges the nondefault dir's books" || bad "ceremony: P5 merges the nondefault dir's books" "$(calls)"
 rm -r "$RUN2"
+
+# ------------------------------------------------------------------ P5 with the real checker
+# Integration: the real CheckDeployedAdmins (this tree's script and AdminChecks) under real
+# forge, against a local anvil, driven through genesis_ceremony.sh --simulate --only P5. A
+# contract that only the governance output lists, and whose governance() is still the
+# deployer, must fail the gate. Needs forge, cast and anvil (Foundry) and solc 0.8.36 in the
+# Foundry cache; without the tools it is skipped and says so (it is not counted as passed).
+# The temp project is the checker's own sources plus forge-std; its foundry.toml adds read
+# access to ./genesis, which the genesis contract set (chain#320) adds to contracts/.
+REAL_FORGE=$(command -v forge || true)
+REAL_CAST=$(command -v cast || true)
+REAL_ANVIL=$(command -v anvil || true)
+SRC="$(cd "$G/../.." && pwd)/contracts"
+if [[ -z "$REAL_FORGE" || -z "$REAL_CAST" || -z "$REAL_ANVIL" || "${GENESIS_TESTS_NO_FOUNDRY:-0}" == 1 ]]; then
+  printf 'SKIP P5 real-checker integration (forge/cast/anvil not on PATH)\n'
+else
+  IR="$T/irepo"
+  IC="$IR/contracts"
+  mkdir -p "$IC/script/lib" "$IC/src/aa/lib/webauthn" "$IC/lib" "$IC/genesis" "$IC/addresses" "$IR/scripts/ops"
+  sed 's|{ access = "read", path = "./addresses" }\]|{ access = "read", path = "./addresses" }, { access = "read", path = "./genesis" }]|' \
+    "$SRC/foundry.toml" >"$IC/foundry.toml"
+  cp "$SRC/remappings.txt" "$IC/"
+  ln -s "$SRC/lib/forge-std" "$IC/lib/forge-std"
+  cp "$SRC/script/CheckDeployedAdmins.s.sol" "$IC/script/"
+  cp "$SRC/script/lib/AdminChecks.sol" "$IC/script/lib/"
+  cp "$SRC/src/aa/lib/webauthn/P256.sol" "$IC/src/aa/lib/webauthn/"
+  # P0 only checks that the other ceremony scripts exist.
+  for s in DeployGenesisGovernance DeployTeamVesting DeployDormantLedgers; do
+    printf '// SPDX-License-Identifier: Apache-2.0\npragma solidity ^0.8.26;\n' >"$IC/script/$s.s.sol"
+  done
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$IR/scripts/ops/regenesis.sh"
+  if ! out=$(cd "$IC" && "$REAL_FORGE" build 2>&1); then
+    bad "P5 integration: the checker builds" "$out"
+  else
+    port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+    IRPC="http://127.0.0.1:$port"
+    "$REAL_ANVIL" --port "$port" --silent >"$T/anvil.log" 2>&1 &
+    ANVIL_PID=$!
+    trap 'kill "$ANVIL_PID" 2>/dev/null; rm -rf "$T"' EXIT
+    for _ in $(seq 100); do
+      "$REAL_CAST" chain-id --rpc-url "$IRPC" >/dev/null 2>&1 && break
+      sleep 0.1
+    done
+    # Runtime code answering governance() with the given address; any other call reverts.
+    gov_code() { printf '0x60003560e01c635aa6e67514601357600080fd5b73%s60005260206000f3' "${1#0x}"; }
+    set_code() { "$REAL_CAST" rpc anvil_setCode "$1" "$2" --rpc-url "$IRPC" >/dev/null; }
+    MSIG=$(addr 209)
+    set_code 0xc2b78104907F722DABAc4C69f826a522B2754De4 0x600160005260206000f3 # the P-256 verifier
+    for i in 161 31 32 33; do set_code "$(addr "$i")" "$(gov_code "$MSIG")"; done
+    set_code "$(addr 34)" "$(gov_code "$DEP")"
+    printf '{"chainId":31337,"deployer":"%s","contracts":{"Alpha":"%s"},"aaStack":{}}' "$DEP" "$A1" >"$IC/addresses/40204.json"
+    IENV=("${CEENV[@]}" REPO_ROOT="$IR" RPC_URL="$IRPC" EXPECTED_CHAIN_ID=31337 FORGE="$REAL_FORGE" CAST="$REAL_CAST")
+    gov_book "$IC/genesis" "$DEP"
+    expect "P5 integration: a handed-over governance output passes the real checker" 0 'P5 PASS' -- "${IENV[@]}" bash "$CE" --simulate --only P5
+    gov_book "$IC/genesis" "$DEP" "\"GenesisHeld\":\"$(addr 34)\""
+    expect "P5 integration: a deployer role held only in the governance output fails the real checker" 3 'DEPLOYER-ADMIN GenesisHeld: governance\(\) is the deployer EOA' -- "${IENV[@]}" bash "$CE" --simulate --only P5
+    kill "$ANVIL_PID" 2>/dev/null
+  fi
+fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
