@@ -2086,10 +2086,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     ));
     let finality_voting_on = finality_gadget.enabled();
     // Finalized height as VERIFIED by the Stage 1c floor verifier while the
-    // producer path runs: backs the `finalized`/`safe` RPC tags, and only ever
-    // advances to a certificate whose (height, hash) is this node's own canonical
-    // block (spec §4.5). Whether the reorg floor follows it is the separate
-    // compiled enforcement pin (`finality_floor::FloorMode`).
+    // producer path runs; only ever advances to a certificate whose (height,
+    // hash) is this node's own canonical block (spec §4.5). Always reported as
+    // `citrate_finality_verified_height`; the reorg floor AND the
+    // `finalized`/`safe` RPC tags follow it only under the separate compiled
+    // enforcement pin (`finality_floor::FloorMode::Enforced`).
     let finality_observed = Arc::new(std::sync::atomic::AtomicU64::new(0));
     // The handle the RPC `finalized`/`safe` tags read, chosen by the floor
     // verifier for its mode; stays `None` without a canonical applicator (tags
@@ -2164,8 +2165,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             //            can finalize with voting off, so the old height poll never
             //            moved the floor on a node that never voted; a certificate
             //            persisted by an earlier voting-ON run is logged and ignored.
-            //   Observed (voting ON, enforcement OFF): verified height -> RPC tags.
-            //   Enforced (both ON): verified height also raises the floor.
+            //   Observed (voting ON, enforcement OFF): verified height -> metric
+            //            only; floor and RPC tags unchanged (genesis).
+            //   Enforced (both ON): verified height raises the floor and the
+            //            RPC tags.
             // Mismatch / invalid certificate: safety stop (gadget halted, floor and
             // RPC tags frozen, CHECKPOINT FINALITY SAFETY STOP alarm + metrics).
             // Same compiled voting pin and chain id as `finality_gadget` (whose
@@ -2219,7 +2222,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         error!(
             "chain data holds block {stored} at height {height}, but this network's canonical \
              block there is {canonical}: this database is on a branch the network does not \
-             continue. Stop the node, move the chain data aside (keep the keys) and resync."
+             continue. Stop the node, move the chain data aside (keep the keys) and resync. \
+             {}",
+            citrate_storage::VOTING_VALIDATOR_WIPE_NOTE
         );
     }
 
@@ -4024,10 +4029,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // the same `finalized_height` handle the canonical applicator exposes and
             // the 5 s finality poll keeps current. None (no applicator) => tags resolve
             // to genesis (block 0), never error.
-            // WP-S.3 Stage 1a/1c: with the producer path ON the tags read the
-            // VERIFIED finalized height (`FloorVerifier::rpc_finalized_handle`:
-            // Observed and Enforced modes); with it OFF (Legacy) the unchanged
-            // applicator handle, which nothing raises.
+            // WP-S.3 Stage 1c: only in Enforced mode (voting + enforcement pins
+            // ON) do the tags read the VERIFIED finalized height
+            // (`FloorVerifier::rpc_finalized_handle`); Legacy and Observed keep
+            // the unchanged applicator handle, which neither raises.
             finality_rpc_handle.clone(),
         );
 

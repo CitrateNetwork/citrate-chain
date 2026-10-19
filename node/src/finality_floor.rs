@@ -26,10 +26,16 @@
 //                certificate persisted by an earlier voting-ON run is NEVER used
 //                to raise the floor by its raw height (it is not hash-checked) —
 //                it is logged and ignored.
-//   * Observed — voting ON, enforcement OFF. Certificates are verified as above;
-//                a verified height feeds the finalized/safe RPC tags; the reorg
-//                floor is NOT raised.
-//   * Enforced — both ON. A verified certificate also raises the reorg floor.
+//   * Observed — voting ON, enforcement OFF. Certificates are verified as above
+//                and the verified height is published ONLY as the
+//                `citrate_finality_verified_height` metric. The reorg floor is
+//                NOT raised, and the finalized/safe RPC tags do NOT advance (they
+//                keep reading the applicator's floor, i.e. genesis): nothing
+//                enforces the floor in this mode, so a reorg below the verified
+//                height still proceeds, and labelling such a block "finalized"
+//                would claim a guarantee the node does not give.
+//   * Enforced — both ON. A verified certificate also raises the reorg floor,
+//                and the finalized/safe RPC tags follow the verified height.
 //
 // SAFETY STOP. A certificate that does not match this node's chain (a different
 // block at that height, or a chain that steps over it), or does not verify, is
@@ -78,9 +84,11 @@ pub const FLOOR_POLL_SECS: u64 = 5;
 pub enum FloorMode {
     /// Voting OFF: certificates are never used; floor + RPC tags unchanged.
     Legacy,
-    /// Voting ON, enforcement OFF: verified certificates feed the RPC tags only.
+    /// Voting ON, enforcement OFF: verified certificates are reported (metric)
+    /// only; neither the floor nor the RPC tags move.
     Observed,
-    /// Voting ON, enforcement ON: verified certificates also raise the floor.
+    /// Voting ON, enforcement ON: verified certificates raise the floor and
+    /// advance the RPC tags.
     Enforced,
 }
 
@@ -173,14 +181,17 @@ pub struct FloorVerifier {
     /// verifier's `state` -> the stop's gate (the gadget never awaits the
     /// verifier state).
     gadget_halt: Arc<SafetyStop>,
-    /// Verified finalized height (Observed / Enforced): backs the RPC tags.
+    /// Verified finalized height (Observed / Enforced): the
+    /// `citrate_finality_verified_height` metric; backs the RPC tags in
+    /// Enforced mode only.
     verified_height: Arc<AtomicU64>,
     state: Mutex<VerifierState>,
 }
 
 impl FloorVerifier {
-    /// `verified_height` is the handle the RPC `finalized`/`safe` tags read when
-    /// voting is on; it only ever advances to a verified, matching height.
+    /// `verified_height` only ever advances to a verified, matching height; the
+    /// RPC `finalized`/`safe` tags read it in Enforced mode only
+    /// ([`Self::rpc_finalized_handle`]).
     pub fn new(
         mode: FloorMode,
         manager: Arc<CheckpointManager>,
@@ -201,12 +212,13 @@ impl FloorVerifier {
     }
 
     /// The handle the RPC `finalized`/`safe` tags must read in this mode:
-    /// Legacy keeps today's source (the applicator's floor handle, unchanged);
-    /// Observed / Enforced read the verified height.
+    /// Legacy and Observed keep today's source (the applicator's floor handle,
+    /// which neither mode raises, so the tags stay at genesis); only Enforced,
+    /// where the floor is actually enforced, reads the verified height.
     pub fn rpc_finalized_handle(&self) -> Arc<AtomicU64> {
         match self.mode {
-            FloorMode::Legacy => self.applicator.finalized_height_handle(),
-            FloorMode::Observed | FloorMode::Enforced => self.verified_height.clone(),
+            FloorMode::Legacy | FloorMode::Observed => self.applicator.finalized_height_handle(),
+            FloorMode::Enforced => self.verified_height.clone(),
         }
     }
 
@@ -392,7 +404,8 @@ impl FloorVerifier {
     }
 
     fn alarm(&self, reason: &HaltReason) {
-        let frozen = self.verified_height.load(Ordering::SeqCst);
+        // What the finalized/safe RPC tags currently answer in this mode.
+        let frozen = self.rpc_finalized_handle().load(Ordering::SeqCst);
         match reason {
             HaltReason::Mismatch {
                 height,
@@ -620,9 +633,10 @@ mod tests {
         assert_eq!(r.verifier.halt_reason().await, None);
     }
 
-    /// Enforcement OFF: the certificate is verified and feeds the RPC tags, the
-    /// floor stays at today's value, so a reorg below it PROCEEDS — and the node
-    /// then reports that it left the finalized block (safety stop).
+    /// Enforcement OFF: the certificate is verified and reported (metric), but
+    /// neither the floor nor the RPC tags move, so a reorg below it PROCEEDS —
+    /// and the node then reports that it left the finalized block (safety
+    /// stop). The tags never claimed it final.
     #[tokio::test]
     async fn observed_does_not_raise_the_floor_and_reorg_proceeds() {
         let (exec, storage, _dir) = fresh();
@@ -639,7 +653,13 @@ mod tests {
             }
         );
         assert_eq!(load(&r.floor), 0, "observed: floor untouched");
-        assert_eq!(load(&r.verified), 2, "observed: RPC tags advance");
+        assert_eq!(load(&r.verified), 2, "observed: verified height reported");
+        let rpc = r.verifier.rpc_finalized_handle();
+        assert!(
+            Arc::ptr_eq(&rpc, &app.finalized_height_handle()),
+            "observed: RPC tags read the (unraised) floor, not the verified height"
+        );
+        assert_eq!(load(&rpc), 0, "observed: finalized/safe stay at genesis");
 
         {
             let lock = app.advance_lock();
@@ -659,7 +679,8 @@ mod tests {
         );
         assert!(r.gadget.halted());
         assert_eq!(load(&r.floor), 0);
-        assert_eq!(load(&r.verified), 2, "RPC tags frozen, never advanced past");
+        assert_eq!(load(&r.verified), 2, "verified height frozen");
+        assert_eq!(load(&rpc), 0, "RPC tags never advanced");
     }
 
     /// Boot with a persisted certificate for ANOTHER branch: finality halts

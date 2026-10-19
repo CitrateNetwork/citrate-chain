@@ -116,8 +116,9 @@ pub const METRIC_FINALITY_HALTED: &str = "citrate_finality_halted";
 /// Safety stops entered: a finalized certificate that does not match this
 /// node's applied chain, or does not verify.
 pub const METRIC_FINALITY_CERT_MISMATCH_TOTAL: &str = "citrate_finality_certificate_mismatch_total";
-/// Highest finalized checkpoint height verified against this node's chain
-/// (backs the `finalized`/`safe` RPC tags while voting is on).
+/// Highest finalized checkpoint height verified against this node's chain.
+/// The only place it is visible in Observed mode (voting ON, enforcement OFF);
+/// the `finalized`/`safe` RPC tags follow it in Enforced mode only.
 pub const METRIC_FINALITY_VERIFIED_HEIGHT: &str = "citrate_finality_verified_height";
 /// The reorg floor actually enforced by the canonical applicator.
 pub const METRIC_FINALITY_FLOOR_HEIGHT: &str = "citrate_finality_floor_height";
