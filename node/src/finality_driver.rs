@@ -350,6 +350,17 @@ async fn report(
     if let Some(refusal) = &out.sign_refused {
         debug!("checkpoint {}: own vote refused ({:?})", cp.height, refusal);
     }
+    // Safety stop engaged since the gadget returned: emit nothing. (Any own
+    // vote in `outbound` was signed before the stop, under the gadget's
+    // signing gate; withholding it only costs latency.)
+    if gadget.halted() {
+        debug!(
+            "checkpoint {}: safety stop engaged; withholding {} outbound vote(s)",
+            cp.height,
+            out.outbound.len()
+        );
+        return out.own_vote_retryable;
+    }
     broadcast_votes(peers, &out.outbound).await;
     out.own_vote_retryable
 }

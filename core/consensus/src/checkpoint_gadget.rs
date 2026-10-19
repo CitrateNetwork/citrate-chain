@@ -36,14 +36,28 @@
 // its hash against the node's own applied chain before anything uses it, and is
 // gated by a SEPARATE compiled pin, [`CHECKPOINT_ENFORCEMENT_PINS`]. When that
 // check fails (mismatch / invalid certificate) the verifier HALTS this gadget
-// ([`FinalityGadget::halt_handle`]): a halted gadget proposes and signs nothing
+// ([`FinalityGadget::safety_stop`]): a halted gadget proposes and signs nothing
 // ([`SkipReason::Halted`]) until the verifier clears the halt.
+//
+// HALT / SIGN SERIALIZATION (PR #323 review, P2). The halt flag is a
+// [`SafetyStop`]: it is only ever set or cleared while holding its signing gate
+// (an async mutex), and the signing path holds that same gate across
+// halt-check -> durable authorization -> signature -> local submit -> queue for
+// broadcast, re-checking the flag under the gate before authorizing and again
+// before queueing. So a halt either completes before a signing decision begins
+// (that decision then sees it and signs nothing) or waits until an in-flight
+// decision has finished; a signer that read "not halted" earlier and then
+// suspended can never sign after the halt. Lock order (outermost first):
+//   FloorVerifier state -> SafetyStop gate -> GadgetState -> CheckpointManager
+// locks (the persistent store is synchronous, below all of them). The gate is
+// never awaited while holding GadgetState or any manager lock, and the verifier
+// state is never awaited while holding the gate.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 use tracing::{debug, error, info, warn};
 
 use crate::checkpoint::{
@@ -210,6 +224,81 @@ pub enum SignRefusal {
     BelowSignedFloor { floor: u64 },
     /// A stored record or watermark did not decode (fail closed).
     CorruptRecord(String),
+    /// The Stage 1c safety stop was engaged before this signing decision took
+    /// the signing gate: nothing was authorized, signed or queued.
+    Halted,
+}
+
+/// Stage 1c safety stop shared by the finality gadget (signer) and the node's
+/// finality floor verifier (which engages / clears it).
+///
+/// The flag is written ONLY while holding `gate`; the signing path holds `gate`
+/// across its whole check -> authorize -> sign -> queue sequence (see
+/// [`SafetyStop::signing_permit`]). An unlocked [`SafetyStop::is_engaged`] read
+/// is a fast-path / reporting hint only and never authorizes a signature.
+#[derive(Debug, Default)]
+pub struct SafetyStop {
+    gate: Mutex<()>,
+    engaged: AtomicBool,
+}
+
+/// Proof that the safety stop was NOT engaged when the signing gate was taken.
+/// While it is alive the stop cannot be engaged (engaging waits for the gate).
+pub struct SigningPermit<'a> {
+    stop: &'a SafetyStop,
+    _gate: MutexGuard<'a, ()>,
+}
+
+impl SigningPermit<'_> {
+    /// Re-check under the held gate. Always `false` while the permit is alive
+    /// (the flag only changes under the gate); kept as an explicit check at each
+    /// step so the invariant is local to the signing code, not only structural.
+    fn halted(&self) -> bool {
+        self.stop.engaged.load(Ordering::SeqCst)
+    }
+}
+
+impl SafetyStop {
+    /// Engage the stop. Waits for any in-flight signing decision to finish;
+    /// once this returns, no new signature is created until [`Self::clear`].
+    pub async fn engage(&self) {
+        let _gate = self.gate.lock().await;
+        self.engaged.store(true, Ordering::SeqCst);
+    }
+
+    /// Clear the stop (the verifier does this only when a mismatch resolved).
+    pub async fn clear(&self) {
+        let _gate = self.gate.lock().await;
+        self.engaged.store(false, Ordering::SeqCst);
+    }
+
+    /// Unlocked read of the flag: a hint for fast paths and reporting. A signing
+    /// decision must use [`Self::signing_permit`] instead.
+    pub fn is_engaged(&self) -> bool {
+        self.engaged.load(Ordering::SeqCst)
+    }
+
+    /// Take the signing gate. `None` if the stop is engaged. The returned permit
+    /// must be held across authorization, signing and queueing.
+    async fn signing_permit(&self) -> Option<SigningPermit<'_>> {
+        let gate = self.gate.lock().await;
+        if self.engaged.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(SigningPermit {
+            stop: self,
+            _gate: gate,
+        })
+    }
+}
+
+/// Test-only pause point in the signing path, after the unlocked pre-checks and
+/// before the signing gate is taken (the window PR #323's review identified).
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct SignPause {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) resume: tokio::sync::Notify,
 }
 
 impl SignRefusal {
@@ -542,10 +631,13 @@ pub struct FinalityGadget {
     /// committee can be derived = nothing is proposed.
     committee_source: Option<Arc<VrfProposerSelector>>,
     enabled: bool,
-    /// Stage 1c safety stop, set and cleared ONLY by the node's finality floor
-    /// verifier. While set, nothing is proposed or signed.
-    halted: Arc<AtomicBool>,
+    /// Stage 1c safety stop, engaged and cleared ONLY by the node's finality
+    /// floor verifier. While engaged, nothing is proposed or signed; signing is
+    /// serialized against it through its gate (module docs, lock order).
+    safety_stop: Arc<SafetyStop>,
     state: Mutex<GadgetState>,
+    #[cfg(test)]
+    sign_pause: Option<Arc<SignPause>>,
 }
 
 impl FinalityGadget {
@@ -571,21 +663,30 @@ impl FinalityGadget {
             manager,
             committee_source,
             enabled,
-            halted: Arc::new(AtomicBool::new(false)),
+            safety_stop: Arc::new(SafetyStop::default()),
             state: Mutex::new(GadgetState::default()),
+            #[cfg(test)]
+            sign_pause: None,
         }
     }
 
-    /// The halt flag shared with the node's finality floor verifier, which sets
-    /// it on a certificate mismatch / invalid certificate and clears it (mismatch
-    /// only) once the certified block is canonical on this node again.
-    pub fn halt_handle(&self) -> Arc<AtomicBool> {
-        self.halted.clone()
+    /// Install a pause point before the signing gate (tests only).
+    #[cfg(test)]
+    pub(crate) fn with_sign_pause(mut self, pause: Arc<SignPause>) -> Self {
+        self.sign_pause = Some(pause);
+        self
     }
 
-    /// Whether the gadget is halted (see [`Self::halt_handle`]).
+    /// The safety stop shared with the node's finality floor verifier, which
+    /// engages it on a certificate mismatch / invalid certificate and clears it
+    /// (mismatch only) once the certified block is canonical on this node again.
+    pub fn safety_stop(&self) -> Arc<SafetyStop> {
+        self.safety_stop.clone()
+    }
+
+    /// Whether the gadget is halted (unlocked hint; see [`SafetyStop`]).
     pub fn halted(&self) -> bool {
-        self.halted.load(Ordering::SeqCst)
+        self.safety_stop.is_engaged()
     }
 
     /// Whether the producer path is switched on.
@@ -700,42 +801,8 @@ impl FinalityGadget {
 
         // Own vote first (it is the one peers are most likely missing). The
         // signing decision is made durable BEFORE the vote exists.
-        // Re-check the halt right before signing: the verifier may have halted the
-        // gadget while the proposal above was being made.
-        if let (Some(key), true, false) = (signer, in_committee, self.halted()) {
-            let authorized = {
-                let mut st = self.state.lock().await;
-                self.authorize_sign(&mut st, height, block_hash)
-            };
-            if let Err(refusal) = &authorized {
-                match refusal {
-                    SignRefusal::Conflicting { signed } => error!(
-                        "checkpoint {}: SAFETY STOP — this node already signed {} at this \
-                         height; refusing to sign {} (would be equivocation)",
-                        height, signed, block_hash
-                    ),
-                    other => error!(
-                        "checkpoint {}: not signing {}: {:?}",
-                        height, block_hash, other
-                    ),
-                }
-                out.own_vote_retryable = refusal.is_recoverable();
-                out.sign_refused = Some(refusal.clone());
-            }
-            if authorized.is_ok() {
-                let vote =
-                    sign_checkpoint_vote(self.manager.config().chain_id, height, block_hash, key);
-                match self.manager.submit_vote(vote.clone()).await {
-                    Ok(quorum) => {
-                        out.signed_own_vote = true;
-                        out.outbound.push(vote);
-                        if quorum {
-                            out.finalized |= self.finalize(height).await;
-                        }
-                    }
-                    Err(e) => warn!("checkpoint {}: own vote not accepted: {}", height, e),
-                }
-            }
+        if let (Some(key), true) = (signer, in_committee) {
+            self.sign_own_vote(height, block_hash, key, &mut out).await;
         }
 
         // §11.5 replay: votes that arrived before this proposal.
@@ -772,6 +839,83 @@ impl FinalityGadget {
 
         self.prune().await;
         out
+    }
+
+    /// Sign, submit and queue this node's own vote at `height`, serialized
+    /// against the safety stop: the signing gate is held from the halt check
+    /// through authorization, signature, local submit and queueing (lock order:
+    /// gate -> GadgetState, then gate -> manager; GadgetState is released before
+    /// any manager call). Finalization runs after the gate is released.
+    async fn sign_own_vote(
+        &self,
+        height: u64,
+        block_hash: Hash,
+        key: &Ed25519SigningKey,
+        out: &mut BuriedOutcome,
+    ) {
+        #[cfg(test)]
+        if let Some(pause) = &self.sign_pause {
+            pause.reached.notify_one();
+            pause.resume.notified().await;
+        }
+
+        let quorum = {
+            let Some(permit) = self.safety_stop.signing_permit().await else {
+                info!(
+                    "checkpoint {}: safety stop engaged; not signing {}",
+                    height, block_hash
+                );
+                out.sign_refused = Some(SignRefusal::Halted);
+                return;
+            };
+            // Re-check under the gate immediately before authorizing.
+            if permit.halted() {
+                out.sign_refused = Some(SignRefusal::Halted);
+                return;
+            }
+            let authorized = {
+                let mut st = self.state.lock().await;
+                self.authorize_sign(&mut st, height, block_hash)
+            };
+            if let Err(refusal) = authorized {
+                match &refusal {
+                    SignRefusal::Conflicting { signed } => error!(
+                        "checkpoint {}: SAFETY STOP — this node already signed {} at this \
+                         height; refusing to sign {} (would be equivocation)",
+                        height, signed, block_hash
+                    ),
+                    other => error!(
+                        "checkpoint {}: not signing {}: {:?}",
+                        height, block_hash, other
+                    ),
+                }
+                out.own_vote_retryable = refusal.is_recoverable();
+                out.sign_refused = Some(refusal);
+                return;
+            }
+            let vote =
+                sign_checkpoint_vote(self.manager.config().chain_id, height, block_hash, key);
+            // Re-check under the gate before the vote leaves this function.
+            if permit.halted() {
+                out.sign_refused = Some(SignRefusal::Halted);
+                return;
+            }
+            match self.manager.submit_vote(vote.clone()).await {
+                Ok(quorum) => {
+                    out.signed_own_vote = true;
+                    out.outbound.push(vote);
+                    quorum
+                }
+                Err(e) => {
+                    warn!("checkpoint {}: own vote not accepted: {}", height, e);
+                    return;
+                }
+            }
+            // `permit` (the gate) is released here.
+        };
+        if quorum {
+            out.finalized |= self.finalize(height).await;
+        }
     }
 
     /// Record the latest canonical tip this node has applied (bounds the
@@ -2413,7 +2557,7 @@ mod tests {
         let kv = Arc::new(MemKv::default());
         let g = gadget_over(&ks, true, kv.clone(), 40).await;
         assert!(!g.halted());
-        g.halt_handle().store(true, Ordering::SeqCst);
+        g.safety_stop().engage().await;
         assert!(g.halted());
         let before = kv.batches.load(Ordering::SeqCst);
         let seed = Hash::new([1; 32]);
@@ -2426,12 +2570,101 @@ mod tests {
         assert_eq!(g.signed_vote_at(10), None, "nothing signed");
         assert_eq!(kv.batches.load(Ordering::SeqCst), before, "nothing written");
 
-        g.halt_handle().store(false, Ordering::SeqCst);
+        g.safety_stop().clear().await;
         let out = g
             .on_buried_checkpoint(10, block_hash(10), &seed, ks.first())
             .await;
         assert!(out.proposed && out.signed_own_vote, "resumes once cleared");
         assert_eq!(g.signed_vote_at(10), Some(block_hash(10)));
+    }
+
+    /// PR #323 review (P2): a signer that passed the unlocked halt check and is
+    /// suspended before the signing gate must NOT sign once the safety stop is
+    /// engaged from another task: no durable record, no local vote, no outbound.
+    #[tokio::test]
+    async fn halt_engaged_while_signer_suspended_prevents_signing() {
+        let ks = keys(4);
+        let kv = Arc::new(MemKv::default());
+        let pause = Arc::new(SignPause::default());
+        let g = Arc::new(
+            gadget_over(&ks, true, kv.clone(), 40)
+                .await
+                .with_sign_pause(pause.clone()),
+        );
+        let k0 = ks.first().expect("key 0").clone();
+        let seed = Hash::new([1; 32]);
+        let signer = {
+            let g = g.clone();
+            tokio::spawn(async move {
+                g.on_buried_checkpoint(10, block_hash(10), &seed, Some(&k0))
+                    .await
+            })
+        };
+        // The signer passed every unlocked pre-check and proposed; it is now
+        // paused just before the signing gate.
+        tokio::time::timeout(std::time::Duration::from_secs(5), pause.reached.notified())
+            .await
+            .expect("signer reached the pause point");
+        assert_eq!(g.manager().pending_hash(10).await, Some(block_hash(10)));
+        let batches_before = kv.batches.load(Ordering::SeqCst);
+
+        // The verifier engages the stop from another task; it must not wait on
+        // the paused signer (which holds no gate yet).
+        let stop = g.safety_stop();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::spawn(async move { stop.engage().await }),
+        )
+        .await
+        .expect("engage completes while the signer is suspended")
+        .expect("engage task");
+        assert!(g.halted());
+
+        pause.resume.notify_one();
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), signer)
+            .await
+            .expect("signer finishes")
+            .expect("signer task");
+        assert!(!out.signed_own_vote, "no signature after the stop");
+        assert!(out.outbound.is_empty(), "no outbound vote");
+        assert_eq!(out.sign_refused, Some(SignRefusal::Halted));
+        assert_eq!(g.signed_vote_at(10), None, "no durable signing record");
+        assert_eq!(
+            kv.batches.load(Ordering::SeqCst),
+            batches_before,
+            "nothing written"
+        );
+        assert_eq!(g.manager().pending_vote_count(10).await, Some(0));
+    }
+
+    /// Engaging the stop waits for an in-flight signing decision (the gate is
+    /// held), and once it returns no new signing permit is issued.
+    #[tokio::test]
+    async fn engage_waits_for_in_flight_signing_and_blocks_new_permits() {
+        let stop = Arc::new(SafetyStop::default());
+        let permit = stop.signing_permit().await.expect("not engaged");
+        let engaging = {
+            let stop = stop.clone();
+            tokio::spawn(async move { stop.engage().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!engaging.is_finished(), "engage waits for the held gate");
+        assert!(!permit.halted() && !stop.is_engaged());
+        drop(permit);
+        tokio::time::timeout(std::time::Duration::from_secs(5), engaging)
+            .await
+            .expect("engage completes once the gate is released")
+            .expect("engage task");
+        assert!(stop.is_engaged());
+        assert!(
+            stop.signing_permit().await.is_none(),
+            "no permit while engaged"
+        );
+        stop.clear().await;
+        assert!(
+            stop.signing_permit().await.is_some(),
+            "permits resume after clear"
+        );
     }
 
     /// Stage 1c: a finalized certificate survives a restart (a fresh manager over

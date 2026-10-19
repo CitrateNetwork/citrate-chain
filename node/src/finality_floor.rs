@@ -56,13 +56,13 @@
     )
 )]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use citrate_consensus::checkpoint::CheckpointManager;
 use citrate_consensus::checkpoint_gadget::{
-    checkpoint_enforcement_pinned, checkpoint_voting_pinned,
+    checkpoint_enforcement_pinned, checkpoint_voting_pinned, SafetyStop,
 };
 use citrate_consensus::types::Hash;
 use tokio::sync::Mutex;
@@ -167,8 +167,12 @@ pub struct FloorVerifier {
     manager: Arc<CheckpointManager>,
     /// Data source of this node's chain + owner of the reorg floor.
     applicator: Arc<CanonicalApplicator>,
-    /// The finality gadget's halt flag (`FinalityGadget::halt_handle`).
-    gadget_halt: Arc<AtomicBool>,
+    /// The finality gadget's safety stop (`FinalityGadget::safety_stop`).
+    /// Engaged / cleared only through its signing gate, so a halt is
+    /// serialized against the gadget's signing path. Lock order: this
+    /// verifier's `state` -> the stop's gate (the gadget never awaits the
+    /// verifier state).
+    gadget_halt: Arc<SafetyStop>,
     /// Verified finalized height (Observed / Enforced): backs the RPC tags.
     verified_height: Arc<AtomicU64>,
     state: Mutex<VerifierState>,
@@ -181,7 +185,7 @@ impl FloorVerifier {
         mode: FloorMode,
         manager: Arc<CheckpointManager>,
         applicator: Arc<CanonicalApplicator>,
-        gadget_halt: Arc<AtomicBool>,
+        gadget_halt: Arc<SafetyStop>,
         verified_height: Arc<AtomicU64>,
     ) -> Self {
         let chain_id = manager.config().chain_id;
@@ -250,7 +254,7 @@ impl FloorVerifier {
         // An invalid certificate never clears.
         if let Some(reason @ HaltReason::InvalidCertificate { .. }) = &st.halt {
             let reason = reason.clone();
-            self.gadget_halt.store(true, Ordering::SeqCst);
+            self.gadget_halt.engage().await;
             self.publish(true);
             return FloorTick::Halted(reason);
         }
@@ -276,7 +280,7 @@ impl FloorVerifier {
                     st.halt = None;
                     recovered = true;
                     self.verified_height.fetch_max(height, Ordering::SeqCst);
-                    self.gadget_halt.store(false, Ordering::SeqCst);
+                    self.gadget_halt.clear().await;
                 }
                 FloorCheck::Mismatch { canonical } => {
                     st.halt = Some(HaltReason::Mismatch {
@@ -284,10 +288,10 @@ impl FloorVerifier {
                         certified,
                         canonical,
                     });
-                    return self.still_halted(&st);
+                    return self.still_halted(&st).await;
                 }
                 FloorCheck::NotYetApplied { .. } | FloorCheck::Unverifiable(_) => {
-                    return self.still_halted(&st);
+                    return self.still_halted(&st).await;
                 }
             }
         }
@@ -305,7 +309,7 @@ impl FloorVerifier {
                 certified: cert.block_hash,
                 reason: e.to_string(),
             };
-            return self.enter_halt(&mut st, reason);
+            return self.enter_halt(&mut st, reason).await;
         }
 
         match self
@@ -329,7 +333,7 @@ impl FloorVerifier {
                     certified: cert.block_hash,
                     canonical,
                 };
-                self.enter_halt(&mut st, reason)
+                self.enter_halt(&mut st, reason).await
             }
             FloorCheck::NotYetApplied { applied_height } => {
                 self.publish(false);
@@ -365,8 +369,8 @@ impl FloorVerifier {
         }))
     }
 
-    fn still_halted(&self, st: &VerifierState) -> FloorTick {
-        self.gadget_halt.store(true, Ordering::SeqCst);
+    async fn still_halted(&self, st: &VerifierState) -> FloorTick {
+        self.gadget_halt.engage().await;
         self.publish(true);
         match &st.halt {
             Some(reason) => FloorTick::Halted(reason.clone()),
@@ -374,8 +378,10 @@ impl FloorVerifier {
         }
     }
 
-    fn enter_halt(&self, st: &mut VerifierState, reason: HaltReason) -> FloorTick {
-        self.gadget_halt.store(true, Ordering::SeqCst);
+    async fn enter_halt(&self, st: &mut VerifierState, reason: HaltReason) -> FloorTick {
+        // Waits for any in-flight signing decision; once engaged, the gadget
+        // creates no new signature until the stop is cleared.
+        self.gadget_halt.engage().await;
         if st.halt.as_ref() != Some(&reason) {
             crate::metrics::record_finality_certificate_mismatch();
             self.alarm(&reason);
@@ -527,7 +533,7 @@ mod tests {
         let gadget = FinalityGadget::with_switch(mgr.clone(), None, mode != FloorMode::Legacy);
         let verified = Arc::new(AtomicU64::new(0));
         let floor = app.finalized_height_handle();
-        let verifier = FloorVerifier::new(mode, mgr, app, gadget.halt_handle(), verified.clone());
+        let verifier = FloorVerifier::new(mode, mgr, app, gadget.safety_stop(), verified.clone());
         Rig {
             verifier,
             gadget,
@@ -733,7 +739,7 @@ mod tests {
         assert_eq!(load(&r.floor), 0);
         assert_eq!(load(&r.verified), 0);
         // Even if something cleared the gadget flag, the next pass re-halts.
-        r.gadget.halt_handle().store(false, Ordering::SeqCst);
+        r.gadget.safety_stop().clear().await;
         assert_eq!(r.verifier.tick().await, first);
         assert!(
             r.gadget.halted(),

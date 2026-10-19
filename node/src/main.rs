@@ -2175,7 +2175,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 floor_mode,
                 checkpoint_manager.clone(),
                 app.clone(),
-                finality_gadget.halt_handle(),
+                finality_gadget.safety_stop(),
                 finality_observed.clone(),
             ));
             // Boot check BEFORE any block admission, drain or recovery (all set up
