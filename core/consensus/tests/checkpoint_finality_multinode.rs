@@ -16,7 +16,9 @@ use citrate_consensus::checkpoint::{
     sign_checkpoint_vote, CheckpointConfig, CheckpointManager, CheckpointVote,
     MAX_FINALIZED_IN_MEMORY,
 };
-use citrate_consensus::checkpoint_gadget::{FinalityGadget, InboundOutcome, SkipReason};
+use citrate_consensus::checkpoint_gadget::{
+    FinalityGadget, InboundOutcome, SignRefusal, SkipReason,
+};
 use citrate_consensus::crypto::Ed25519SigningKey;
 use citrate_consensus::dag_store::{DagStore, KvStore};
 use citrate_consensus::types::{BlockBuilder, Hash, PublicKey};
@@ -395,4 +397,126 @@ async fn finalized_memory_is_bounded_and_trimmed_entries_stay_readable() {
         reloaded.finalized_in_memory_len().await,
         MAX_FINALIZED_IN_MEMORY
     );
+}
+
+/// The competing branch's block at `height` (a sibling of `hash_at(height)`).
+fn fork_hash_at(height: u64) -> Hash {
+    let mut b = [0u8; 32];
+    b[..8].copy_from_slice(&height.to_le_bytes());
+    b[31] = 0xBB;
+    Hash::new(b)
+}
+
+/// DAG holding the main chain 0..len AND a competing block at `fork_height`
+/// (child of the main chain's block below it): both branches' checkpoint
+/// candidates exist in the store, as they do after a reorg.
+async fn dag_with_fork(len: u64, fork_height: u64) -> Arc<DagStore> {
+    let dag = dag(len).await;
+    let b = BlockBuilder::new()
+        .hash(fork_hash_at(fork_height))
+        .height(fork_height)
+        .parent(hash_at(fork_height.saturating_sub(1)))
+        .build_unhashed();
+    dag.store_block(b).await.expect("store fork block");
+    dag
+}
+
+/// One validator's process over a persistent store; "restart" = build a fresh
+/// manager + gadget over the SAME store.
+async fn boot(kv: &Arc<MemKv>, keys: &[Ed25519SigningKey], fork_height: u64) -> FinalityGadget {
+    let set: Vec<(PublicKey, u128)> = keys.iter().map(|k| (pk(k), 32_000u128)).collect();
+    let sel = VrfProposerSelector::new().with_snapshot_schedule(1000, 999);
+    sel.sync_active_set_at(1, set, 1).await;
+    let store: Arc<dyn KvStore> = kv.clone();
+    let mgr = Arc::new(CheckpointManager::with_persistence(
+        config(CHAIN),
+        dag_with_fork(64, fork_height).await,
+        store,
+    ));
+    FinalityGadget::with_switch(mgr, Some(Arc::new(sel)), true)
+}
+
+/// PR #321 review (P2) regression: sign hash A at H -> reorg onto a SHORTER
+/// winning branch whose tip is below H + D -> restart before that branch grows
+/// -> the branch grows and buries a DIFFERENT hash B at H. The restarted node
+/// must NOT sign B (equivocation); every vote it ever emits at H names A.
+#[tokio::test]
+async fn restart_after_shorter_branch_reorg_never_double_signs() {
+    let keys: Vec<Ed25519SigningKey> = (0u8..4).map(key).collect();
+    let me = keys.first().expect("validator 0");
+    let h = 10u64;
+    let kv = Arc::new(MemKv::new());
+    let mut emitted: Vec<CheckpointVote> = Vec::new();
+
+    // Process 1: tip reached H + D on branch A; A at H is buried -> signed.
+    {
+        let g = boot(&kv, &keys, h).await;
+        g.observe_tip(h.saturating_add(3)).await;
+        let out = g
+            .on_buried_checkpoint(h, hash_at(h), &seed_at(h), Some(me))
+            .await;
+        assert!(out.signed_own_vote, "signed A at H");
+        emitted.extend(out.outbound);
+        assert_eq!(g.signed_vote_at(h), Some(hash_at(h)), "durable before emit");
+        // Reorg onto the shorter branch B (tip < H + D): nothing buried at H on
+        // B yet, so the gadget is not called. Then the process dies.
+    }
+
+    // Process 2 (restart): fresh manager + gadget, no in-memory memory of A.
+    // Branch B grows and buries B at H.
+    let g = boot(&kv, &keys, h).await;
+    assert_eq!(g.manager().pending_hash(h).await, None, "fresh process");
+    g.observe_tip(h.saturating_add(3)).await;
+    let out = g
+        .on_buried_checkpoint(h, fork_hash_at(h), &seed_at(h), Some(me))
+        .await;
+    assert!(out.proposed, "B is proposed for aggregation (not a vote)");
+    assert!(!out.signed_own_vote, "MUST NOT sign B");
+    assert_eq!(
+        out.sign_refused,
+        Some(SignRefusal::Conflicting { signed: hash_at(h) })
+    );
+    emitted.extend(out.outbound);
+
+    // A third process re-buries A: idempotent, same hash only.
+    drop(g);
+    let g = boot(&kv, &keys, h).await;
+    let out = g
+        .on_buried_checkpoint(h, hash_at(h), &seed_at(h), Some(me))
+        .await;
+    assert!(out.signed_own_vote, "re-signing the same hash is allowed");
+    emitted.extend(out.outbound);
+
+    let mine: Vec<&CheckpointVote> = emitted
+        .iter()
+        .filter(|v| v.voter == pk(me) && v.height == h)
+        .collect();
+    assert_eq!(mine.len(), 2, "A, then A again");
+    assert!(
+        mine.iter().all(|v| v.block_hash == hash_at(h)),
+        "no vote for B ever left the node: {mine:?}"
+    );
+}
+
+/// Finality prunes every validator's durable signed-vote record at/below the
+/// finalized height (bounded growth); a restart after that still refuses the
+/// finalized height.
+#[tokio::test]
+async fn finality_prunes_durable_signed_records_on_every_node() {
+    let nodes = network(4, CHAIN, true).await;
+    let mut queue = VecDeque::new();
+    for h in [10u64, 12] {
+        for i in 0..nodes.len() {
+            bury(&nodes, i, h, &mut queue).await;
+        }
+        gossip(&nodes, &mut queue).await;
+    }
+    for (i, n) in nodes.iter().enumerate() {
+        assert_eq!(n.gadget.manager().latest_finalized_height().await, 12);
+        assert_eq!(n.gadget.signed_vote_at(10), None, "node {i}");
+        assert_eq!(n.gadget.signed_vote_at(12), None, "node {i}");
+        let meta = n.gadget.signed_vote_meta().expect("meta");
+        assert_eq!(meta.floor, 12, "node {i}");
+        assert_eq!(meta.highest, 12, "node {i}");
+    }
 }

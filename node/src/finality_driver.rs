@@ -12,6 +12,14 @@
 // which proposes, signs (if this node is a committee member) and replays early
 // votes. The resulting votes are broadcast as `NetworkMessage::CheckpointVote`.
 //
+// Restart safety (no equivocation) is NOT this loop's job: the gadget records
+// every signing decision durably — synced, before the vote exists — and refuses
+// a different hash at an already-signed height, in this process or any later
+// one (`checkpoint_gadget::SignRefusal`). So boundaries already buried when the
+// process starts are processed like any other (bounded by
+// MAX_BOUNDARIES_PER_PASS), which also lets a restarted validator re-broadcast
+// the identical vote it signed before going down.
+//
 // Spawned ONLY when the compiled switch (`checkpoint_voting_pinned`) is on for the
 // running chain; with it off this module never runs.
 
@@ -169,11 +177,11 @@ pub fn spawn(
         let interval = gadget.manager().config().interval;
         let depth = gadget.manager().config().vote_depth.max(1);
         let mut tick = crate::timing::cadence_interval(Duration::from_secs(1));
-        // Boundaries already buried when this process started are skipped: this
-        // node may have signed them before a restart, and the canonical block at
-        // a buried height could in principle differ now. Never risk signing a
-        // second hash at a height (equivocation).
-        let mut cursor: Option<u64> = None;
+        // Highest boundary already handed to the gadget. Starts at 0: there is no
+        // "skip what was buried at startup" heuristic — equivocation across
+        // restarts is prevented by the gadget's durable signed-vote record, which
+        // is consulted on every sign attempt (see module docs).
+        let mut cursor: u64 = 0;
         info!(
             "checkpoint finality: producer path ON (interval {}, vote depth {}, signer {})",
             interval,
@@ -185,11 +193,9 @@ pub fn spawn(
             let tip = applicator.applied_tip().await;
             gadget.observe_tip(tip.height).await;
             let Some(highest) = highest_buried_boundary(tip.height, interval, depth) else {
-                cursor.get_or_insert(0);
                 continue;
             };
-            let after = *cursor.get_or_insert(highest);
-            let heights = boundaries_to_process(after, highest, interval);
+            let heights = boundaries_to_process(cursor, highest, interval);
             if heights.is_empty() {
                 continue;
             }
@@ -211,7 +217,7 @@ pub fn spawn(
                         "checkpoint finality: canonical walk failed, skipping boundaries {:?}: {}",
                         heights, e
                     );
-                    cursor = Some(highest);
+                    cursor = highest;
                     continue;
                 }
             };
@@ -222,9 +228,14 @@ pub fn spawn(
                 if let Some(reason) = &out.skipped {
                     debug!("checkpoint {}: not proposed ({:?})", cp.height, reason);
                 }
+                // The gadget already logged the refusal at error level; nothing
+                // was signed, submitted or queued for broadcast for it.
+                if let Some(refusal) = &out.sign_refused {
+                    debug!("checkpoint {}: own vote refused ({:?})", cp.height, refusal);
+                }
                 broadcast_votes(&peers, &out.outbound).await;
             }
-            cursor = Some(highest);
+            cursor = highest;
         }
     })
 }

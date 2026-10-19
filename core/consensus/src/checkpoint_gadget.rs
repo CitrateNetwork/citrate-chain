@@ -21,6 +21,15 @@
 // nothing; inbound votes take exactly the pre-Stage-1a path (`submit_vote`, then
 // `finalize_checkpoint` on quorum).
 //
+// SIGNING PROTECTION (PR #321 review, P2). Before this node's vote is signed,
+// submitted locally or broadcast, the decision `(chain_id, height) -> block_hash`
+// is written to the manager's persistent store with a synced (fsync'd) write.
+// Every later sign attempt — including after a restart, on a fresh gadget over
+// the same store — consults that record: same hash = idempotent re-sign (the
+// ed25519 signature is deterministic, so the identical vote), different hash =
+// refused and logged as a safety stop. If the write fails, or there is no
+// persistent store, nothing is signed. See [`SignRefusal`].
+//
 // NOT HERE (Stage 1c): floor ENFORCEMENT (§4.5). Finalizing a checkpoint advances
 // `CheckpointManager::latest_finalized_height()` only; nothing in this module
 // raises the reorg floor.
@@ -29,13 +38,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::checkpoint::{
     sign_checkpoint_vote, verify_vote_signature, CheckpointError, CheckpointManager,
     CheckpointVote, CommitteeSelector, ProposeOutcome,
 };
 use crate::crypto::Ed25519SigningKey;
+use crate::dag_store::{cf, KvOp, KvStore};
 use crate::types::{Hash, PublicKey};
 use crate::vrf::VrfProposerSelector;
 
@@ -76,8 +86,104 @@ pub const MAX_EARLY_VOTES_PER_KEY: usize = 256;
 /// node's last observed canonical tip is not buffered (it cannot be for a block
 /// this node is about to bury).
 pub const EARLY_VOTE_HORIZON_BLOCKS: u64 = 256;
-/// Bound on the per-height "this node already signed" record (equivocation guard).
+/// Bound on the durable signed-vote record, in checkpoint boundaries: records
+/// are kept for at most this many boundaries below the highest height this node
+/// has signed. Older records are deleted together with raising the durable
+/// signed floor past them (see [`SignRefusal::BelowSignedFloor`]), so pruning
+/// above the finalized floor never re-opens a height for signing.
 pub const MAX_SIGNED_HEIGHTS: usize = 1024;
+
+/// `DAG_METADATA` key prefix of the durable signed-vote record:
+/// `checkpoint_signed:<chain_id>:<height>` -> the 32-byte block hash signed.
+/// (Distinct from the manager's `checkpoint:` finalized-certificate prefix.)
+pub const SIGNED_VOTE_KEY_PREFIX: &str = "checkpoint_signed:";
+/// `DAG_METADATA` key prefix of the signed-vote watermarks:
+/// `checkpoint_signed_meta:<chain_id>` -> 16 bytes, `floor || highest` (u64 BE).
+pub const SIGNED_VOTE_META_PREFIX: &str = "checkpoint_signed_meta:";
+
+/// Key of the durable record of this node's vote at `(chain_id, height)`.
+pub fn signed_vote_key(chain_id: u64, height: u64) -> Vec<u8> {
+    format!("{SIGNED_VOTE_KEY_PREFIX}{chain_id}:{height}").into_bytes()
+}
+
+/// Key of the durable signed-vote watermarks for `chain_id`.
+pub fn signed_vote_meta_key(chain_id: u64) -> Vec<u8> {
+    format!("{SIGNED_VOTE_META_PREFIX}{chain_id}").into_bytes()
+}
+
+/// Durable watermarks of the signed-vote record.
+///
+/// * `floor`: this node never signs at a height `<= floor`, and every record at
+///   or below it has been deleted (in the same atomic, synced batch that raised
+///   it). Raised to the finalized height on prune, and to
+///   `highest - MAX_SIGNED_HEIGHTS * interval` when signing, so records only
+///   ever exist in `(floor, highest]` and that span is bounded.
+/// * `highest`: the highest height this node has signed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SignedVoteMeta {
+    pub floor: u64,
+    pub highest: u64,
+}
+
+impl SignedVoteMeta {
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(16);
+        out.extend_from_slice(&self.floor.to_be_bytes());
+        out.extend_from_slice(&self.highest.to_be_bytes());
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let raw: [u8; 16] = bytes.try_into().ok()?;
+        let (f, h) = raw.split_at(8);
+        Some(Self {
+            floor: u64::from_be_bytes(f.try_into().ok()?),
+            highest: u64::from_be_bytes(h.try_into().ok()?),
+        })
+    }
+}
+
+/// Why this node refused to sign its own vote at a height.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignRefusal {
+    /// The manager has no persistent store: a signing decision could not survive
+    /// a restart, so none is made (fail closed).
+    NoDurableStore,
+    /// Reading or durably writing the signed-vote record failed.
+    StoreUnavailable(String),
+    /// This node already signed a DIFFERENT hash at this height (possibly before
+    /// a restart). Signing again would be equivocation: a safety stop.
+    Conflicting { signed: Hash },
+    /// The height is at or below the durable signed floor.
+    BelowSignedFloor { floor: u64 },
+    /// A stored record or watermark did not decode (fail closed).
+    CorruptRecord(String),
+}
+
+/// Boundary heights in `(after, upto]` for `interval`, ascending, at most
+/// `MAX_SIGNED_HEIGHTS + 1` of them (the records only ever span that many).
+fn boundaries_between(after: u64, upto: u64, interval: u64) -> Vec<u64> {
+    let mut out = Vec::new();
+    if interval == 0 || upto <= after {
+        return out;
+    }
+    let Some(first) = after
+        .checked_div(interval)
+        .and_then(|q| q.checked_add(1))
+        .and_then(|q| q.checked_mul(interval))
+    else {
+        return out;
+    };
+    let mut h = first;
+    while h <= upto && out.len() <= MAX_SIGNED_HEIGHTS {
+        out.push(h);
+        match h.checked_add(interval) {
+            Some(next) => h = next,
+            None => break,
+        }
+    }
+    out
+}
 
 /// What happened to an inbound vote.
 #[derive(Debug)]
@@ -132,6 +238,9 @@ pub struct BuriedOutcome {
     pub outbound: Vec<CheckpointVote>,
     /// Why nothing was proposed, when nothing was.
     pub skipped: Option<SkipReason>,
+    /// Why this node (a committee member with a signer) did NOT sign its own
+    /// vote, when it did not. Nothing was submitted or broadcast for it.
+    pub sign_refused: Option<SignRefusal>,
 }
 
 /// Why a buried checkpoint was not (newly) proposed.
@@ -162,9 +271,10 @@ struct GadgetState {
     early: BTreeMap<(u64, Hash), HashMap<PublicKey, CheckpointVote>>,
     /// Highest canonical tip the node has reported (bounds the buffer horizon).
     observed_tip: u64,
-    /// Heights at which THIS node already signed, and the hash it signed. A
-    /// second, different hash at the same height is never signed.
-    signed: BTreeMap<u64, Hash>,
+    /// Cached durable signed-vote watermarks, loaded from the store on first use
+    /// (never at construction, so a switched-OFF gadget never touches the
+    /// store) and updated only after a successful synced write.
+    signed_meta: Option<SignedVoteMeta>,
 }
 
 /// The producer/outbound half of checkpoint finality.
@@ -295,22 +405,28 @@ impl FinalityGadget {
             }
         }
 
-        // Own vote first (it is the one peers are most likely missing).
+        // Own vote first (it is the one peers are most likely missing). The
+        // signing decision is made durable BEFORE the vote exists.
         if let (Some(key), true) = (signer, in_committee) {
-            let may_sign = {
+            let authorized = {
                 let mut st = self.state.lock().await;
-                match st.signed.get(&height) {
-                    Some(prev) => *prev == block_hash,
-                    None => {
-                        st.signed.insert(height, block_hash);
-                        while st.signed.len() > MAX_SIGNED_HEIGHTS {
-                            st.signed.pop_first();
-                        }
-                        true
-                    }
-                }
+                self.authorize_sign(&mut st, height, block_hash)
             };
-            if may_sign {
+            if let Err(refusal) = &authorized {
+                match refusal {
+                    SignRefusal::Conflicting { signed } => error!(
+                        "checkpoint {}: SAFETY STOP — this node already signed {} at this \
+                         height; refusing to sign {} (would be equivocation)",
+                        height, signed, block_hash
+                    ),
+                    other => error!(
+                        "checkpoint {}: not signing {}: {:?}",
+                        height, block_hash, other
+                    ),
+                }
+                out.sign_refused = Some(refusal.clone());
+            }
+            if authorized.is_ok() {
                 let vote =
                     sign_checkpoint_vote(self.manager.config().chain_id, height, block_hash, key);
                 match self.manager.submit_vote(vote.clone()).await {
@@ -494,15 +610,181 @@ impl FinalityGadget {
         }
     }
 
+    /// The durable signed-vote watermarks, loading them on first use.
+    fn signed_meta(
+        &self,
+        st: &mut GadgetState,
+        kv: &Arc<dyn KvStore>,
+    ) -> Result<SignedVoteMeta, SignRefusal> {
+        if let Some(meta) = st.signed_meta {
+            return Ok(meta);
+        }
+        let key = signed_vote_meta_key(self.manager.config().chain_id);
+        let meta = match kv.kv_get(cf::DAG_METADATA, &key) {
+            Ok(None) => SignedVoteMeta::default(),
+            Ok(Some(bytes)) => SignedVoteMeta::decode(&bytes).ok_or_else(|| {
+                SignRefusal::CorruptRecord(format!("signed-vote watermarks: {} bytes", bytes.len()))
+            })?,
+            Err(e) => return Err(SignRefusal::StoreUnavailable(e)),
+        };
+        st.signed_meta = Some(meta);
+        Ok(meta)
+    }
+
+    /// Equivocation protection across restarts. Decide whether this node may
+    /// sign `block_hash` at `height`, and — for a first signature at `height` —
+    /// durably record the decision BEFORE returning `Ok`. Caller holds the state
+    /// lock, which serializes every check-then-write.
+    ///
+    /// Data source: the manager's persistent store, `DAG_METADATA`
+    /// `checkpoint_signed:<chain_id>:<height>` and `checkpoint_signed_meta:<chain_id>`,
+    /// written with `KvStore::kv_write_batch` (atomic; `RocksDbKvStore` commits
+    /// it with `write_batch_sync`, i.e. WAL fsync before returning).
+    fn authorize_sign(
+        &self,
+        st: &mut GadgetState,
+        height: u64,
+        block_hash: Hash,
+    ) -> Result<(), SignRefusal> {
+        let kv = self
+            .manager
+            .persistent_store()
+            .ok_or(SignRefusal::NoDurableStore)?;
+        let meta = self.signed_meta(st, kv)?;
+        if height <= meta.floor {
+            return Err(SignRefusal::BelowSignedFloor { floor: meta.floor });
+        }
+        let chain_id = self.manager.config().chain_id;
+        let record_key = signed_vote_key(chain_id, height);
+        match kv.kv_get(cf::DAG_METADATA, &record_key) {
+            Ok(Some(bytes)) => {
+                let raw: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                    SignRefusal::CorruptRecord(format!(
+                        "signed-vote record at {height}: {} bytes",
+                        bytes.len()
+                    ))
+                })?;
+                let signed = Hash::new(raw);
+                return if signed == block_hash {
+                    Ok(()) // idempotent: the identical vote again
+                } else {
+                    Err(SignRefusal::Conflicting { signed })
+                };
+            }
+            Ok(None) => {}
+            Err(e) => return Err(SignRefusal::StoreUnavailable(e)),
+        }
+
+        // First signature at `height`: bound the record span, then write the
+        // record + watermarks (+ deletions below the new floor) atomically.
+        let interval = self.manager.config().interval.max(1);
+        let horizon = interval.saturating_mul(MAX_SIGNED_HEIGHTS as u64);
+        let highest = meta.highest.max(height);
+        let floor = meta.floor.max(highest.saturating_sub(horizon));
+        if height <= floor {
+            return Err(SignRefusal::BelowSignedFloor { floor });
+        }
+        let next = SignedVoteMeta { floor, highest };
+        let mut ops = vec![
+            KvOp::Put {
+                cf: cf::DAG_METADATA.to_string(),
+                key: record_key,
+                value: block_hash.as_bytes().to_vec(),
+            },
+            KvOp::Put {
+                cf: cf::DAG_METADATA.to_string(),
+                key: signed_vote_meta_key(chain_id),
+                value: next.encode(),
+            },
+        ];
+        for h in boundaries_between(meta.floor, floor.min(meta.highest), interval) {
+            ops.push(KvOp::Delete {
+                cf: cf::DAG_METADATA.to_string(),
+                key: signed_vote_key(chain_id, h),
+            });
+        }
+        kv.kv_write_batch(&ops)
+            .map_err(SignRefusal::StoreUnavailable)?;
+        st.signed_meta = Some(next);
+        Ok(())
+    }
+
+    /// Raise the durable signed floor to `floor` and delete the records at or
+    /// below it, in one atomic synced batch. Failure is safe: the records and
+    /// the old floor remain, and are retried on the next prune.
+    fn prune_signed_records(&self, st: &mut GadgetState, floor: u64) {
+        let Some(kv) = self.manager.persistent_store() else {
+            return;
+        };
+        let meta = match self.signed_meta(st, kv) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("checkpoint: signed-vote record not pruned: {:?}", e);
+                return;
+            }
+        };
+        if floor <= meta.floor {
+            return;
+        }
+        let chain_id = self.manager.config().chain_id;
+        let interval = self.manager.config().interval.max(1);
+        let next = SignedVoteMeta {
+            floor,
+            highest: meta.highest,
+        };
+        let mut ops = vec![KvOp::Put {
+            cf: cf::DAG_METADATA.to_string(),
+            key: signed_vote_meta_key(chain_id),
+            value: next.encode(),
+        }];
+        for h in boundaries_between(meta.floor, floor.min(meta.highest), interval) {
+            ops.push(KvOp::Delete {
+                cf: cf::DAG_METADATA.to_string(),
+                key: signed_vote_key(chain_id, h),
+            });
+        }
+        match kv.kv_write_batch(&ops) {
+            Ok(()) => st.signed_meta = Some(next),
+            Err(e) => warn!(
+                "checkpoint: signed-vote record prune to {} failed: {}",
+                floor, e
+            ),
+        }
+    }
+
     /// §11.9: drop everything at or below the latest finalized height — pending
     /// checkpoints, per-height voted markers (in the manager), buffered early
-    /// votes and signed-height records (here).
+    /// votes and, switch ON only, the durable signed-vote records (here; the
+    /// signed floor is raised in the same write, so a pruned height can never be
+    /// signed again).
     pub async fn prune(&self) {
         let floor = self.manager.latest_finalized_height().await;
         self.manager.prune_at_or_below(floor).await;
         let mut st = self.state.lock().await;
         st.early.retain(|(h, _), _| *h > floor);
-        st.signed.retain(|h, _| *h > floor);
+        if self.enabled && floor > 0 {
+            self.prune_signed_records(&mut st, floor);
+        }
+    }
+
+    /// The durable record of this node's own vote at `height`, if any
+    /// (`checkpoint_signed:<chain_id>:<height>`). `None` also when there is no
+    /// persistent store or the read fails.
+    pub fn signed_vote_at(&self, height: u64) -> Option<Hash> {
+        let kv = self.manager.persistent_store()?;
+        let key = signed_vote_key(self.manager.config().chain_id, height);
+        let bytes = kv.kv_get(cf::DAG_METADATA, &key).ok()??;
+        let raw: [u8; 32] = bytes.as_slice().try_into().ok()?;
+        Some(Hash::new(raw))
+    }
+
+    /// The durable signed-vote watermarks as stored (`None` = none written yet,
+    /// no store, or unreadable).
+    pub fn signed_vote_meta(&self) -> Option<SignedVoteMeta> {
+        let kv = self.manager.persistent_store()?;
+        let key = signed_vote_meta_key(self.manager.config().chain_id);
+        let bytes = kv.kv_get(cf::DAG_METADATA, &key).ok()??;
+        SignedVoteMeta::decode(&bytes)
     }
 
     /// Number of `(height, hash)` keys in the early-vote buffer.
@@ -528,8 +810,101 @@ mod tests {
     use crate::dag_store::DagStore;
     use crate::types::{BlockBuilder, Signature};
     use ed25519_dalek::{Signer, SigningKey};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     const CHAIN: u64 = 40204;
+
+    /// (column family, key) -> value.
+    type MemMap = HashMap<(String, Vec<u8>), Vec<u8>>;
+
+    /// In-memory persistent store. `fail_writes` makes every put / delete /
+    /// batch fail (a full or broken disk); reads keep working.
+    #[derive(Default)]
+    struct MemKv {
+        inner: std::sync::Mutex<MemMap>,
+        fail_writes: AtomicBool,
+        batches: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MemKv {
+        fn failing() -> Self {
+            let kv = Self::default();
+            kv.fail_writes.store(true, Ordering::SeqCst);
+            kv
+        }
+        fn check_writable(&self) -> Result<(), String> {
+            if self.fail_writes.load(Ordering::SeqCst) {
+                Err("injected write failure".to_string())
+            } else {
+                Ok(())
+            }
+        }
+        fn keys_with_prefix(&self, prefix: &str) -> usize {
+            self.inner
+                .lock()
+                .expect("memkv lock")
+                .keys()
+                .filter(|(_, k)| k.starts_with(prefix.as_bytes()))
+                .count()
+        }
+    }
+
+    impl KvStore for MemKv {
+        fn kv_get(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+            Ok(self
+                .inner
+                .lock()
+                .map_err(|e| e.to_string())?
+                .get(&(cf.to_string(), key.to_vec()))
+                .cloned())
+        }
+        fn kv_put(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), String> {
+            self.check_writable()?;
+            self.inner
+                .lock()
+                .map_err(|e| e.to_string())?
+                .insert((cf.to_string(), key.to_vec()), value.to_vec());
+            Ok(())
+        }
+        fn kv_delete(&self, cf: &str, key: &[u8]) -> Result<(), String> {
+            self.check_writable()?;
+            self.inner
+                .lock()
+                .map_err(|e| e.to_string())?
+                .remove(&(cf.to_string(), key.to_vec()));
+            Ok(())
+        }
+        fn kv_exists(&self, cf: &str, key: &[u8]) -> Result<bool, String> {
+            Ok(self.kv_get(cf, key)?.is_some())
+        }
+        fn kv_iter_cf(&self, cf: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+            Ok(self
+                .inner
+                .lock()
+                .map_err(|e| e.to_string())?
+                .iter()
+                .filter(|((c, _), _)| c == cf)
+                .map(|((_, k), v)| (k.clone(), v.clone()))
+                .collect())
+        }
+        /// Atomic: all ops or none.
+        fn kv_write_batch(&self, ops: &[KvOp]) -> Result<(), String> {
+            self.check_writable()?;
+            self.batches.fetch_add(1, Ordering::SeqCst);
+            let mut m = self.inner.lock().map_err(|e| e.to_string())?;
+            for op in ops {
+                match op {
+                    KvOp::Put { cf, key, value } => {
+                        m.insert((cf.clone(), key.clone()), value.clone());
+                    }
+                    KvOp::Delete { cf, key } => {
+                        m.remove(&(cf.clone(), key.clone()));
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
 
     fn key(id: u8) -> SigningKey {
         let mut seed = [0u8; 32];
@@ -581,9 +956,23 @@ mod tests {
         Hash::new([height.saturating_add(1); 32])
     }
 
-    async fn gadget(keys: &[SigningKey], enabled: bool) -> FinalityGadget {
-        let mgr = Arc::new(CheckpointManager::new(config(), dag_with(40).await));
+    async fn gadget_over(
+        keys: &[SigningKey],
+        enabled: bool,
+        kv: Arc<MemKv>,
+        dag_len: u8,
+    ) -> FinalityGadget {
+        let kv: Arc<dyn KvStore> = kv;
+        let mgr = Arc::new(CheckpointManager::with_persistence(
+            config(),
+            dag_with(dag_len).await,
+            kv,
+        ));
         FinalityGadget::with_switch(mgr, Some(selector_with(keys).await), enabled)
+    }
+
+    async fn gadget(keys: &[SigningKey], enabled: bool) -> FinalityGadget {
+        gadget_over(keys, enabled, Arc::new(MemKv::default()), 40).await
     }
 
     fn keys(n: u8) -> Vec<SigningKey> {
@@ -928,8 +1317,7 @@ mod tests {
     async fn pruning_bounds_memory_during_stall_and_after_finality() {
         // 3-member committee: never finalizes => a permanent quorum stall.
         let ks = keys(3);
-        let mgr = Arc::new(CheckpointManager::new(config(), dag_with(250).await));
-        let g = FinalityGadget::with_switch(mgr, Some(selector_with(&ks).await), true);
+        let g = gadget_over(&ks, true, Arc::new(MemKv::default()), 250).await;
         let k0 = ks.first().expect("key 0");
         for h in (10u64..=240).step_by(2) {
             let hash = Hash::new([u8::try_from(h).expect("h < 256").saturating_add(1); 32]);
@@ -971,5 +1359,208 @@ mod tests {
             1,
             "only the h=32 early vote survives"
         );
+    }
+
+    /// Write-before-sign: a store that refuses writes yields NO signature — the
+    /// vote is neither submitted locally nor returned for broadcast.
+    #[tokio::test]
+    async fn failed_durable_write_means_no_signature() {
+        let ks = keys(4);
+        let kv = Arc::new(MemKv::failing());
+        let g = gadget_over(&ks, true, kv.clone(), 40).await;
+        let k0 = ks.first().expect("key 0");
+        let out = g
+            .on_buried_checkpoint(10, block_hash(10), &Hash::new([1; 32]), Some(k0))
+            .await;
+        assert!(out.proposed, "aggregation still proceeds");
+        assert!(!out.signed_own_vote);
+        assert!(out.outbound.is_empty(), "nothing to broadcast");
+        assert!(
+            matches!(out.sign_refused, Some(SignRefusal::StoreUnavailable(_))),
+            "{:?}",
+            out.sign_refused
+        );
+        assert_eq!(g.manager().pending_vote_count(10).await, Some(0));
+        assert_eq!(g.signed_vote_at(10), None);
+    }
+
+    /// No persistent store at all: fail closed (never sign).
+    #[tokio::test]
+    async fn no_durable_store_means_no_signature() {
+        let ks = keys(4);
+        let mgr = Arc::new(CheckpointManager::new(config(), dag_with(40).await));
+        let g = FinalityGadget::with_switch(mgr, Some(selector_with(&ks).await), true);
+        let out = g
+            .on_buried_checkpoint(10, block_hash(10), &Hash::new([1; 32]), ks.first())
+            .await;
+        assert!(out.proposed && !out.signed_own_vote && out.outbound.is_empty());
+        assert_eq!(out.sign_refused, Some(SignRefusal::NoDurableStore));
+    }
+
+    /// The record is durable before the vote is emitted, survives a restart
+    /// (fresh manager + gadget over the same store), refuses a conflicting hash
+    /// and re-signs the same hash idempotently (identical vote bytes).
+    #[tokio::test]
+    async fn durable_record_refuses_conflict_and_is_idempotent_across_restart() {
+        let ks = keys(5);
+        let kv = Arc::new(MemKv::default());
+        let k0 = ks.first().expect("key 0");
+        let seed = Hash::new([1; 32]);
+        let first = {
+            let g = gadget_over(&ks, true, kv.clone(), 40).await;
+            let out = g
+                .on_buried_checkpoint(10, block_hash(10), &seed, Some(k0))
+                .await;
+            assert!(out.signed_own_vote);
+            assert_eq!(g.signed_vote_at(10), Some(block_hash(10)));
+            assert_eq!(
+                g.signed_vote_meta(),
+                Some(SignedVoteMeta {
+                    floor: 0,
+                    highest: 10
+                })
+            );
+            out.outbound.first().cloned().expect("own vote")
+        };
+        // "Restart" #1, canonical block at 10 is now a different hash.
+        let g = gadget_over(&ks, true, kv.clone(), 40).await;
+        let out = g
+            .on_buried_checkpoint(10, block_hash(11), &seed, Some(k0))
+            .await;
+        assert!(out.proposed, "fresh manager proposes the new hash");
+        assert!(!out.signed_own_vote && out.outbound.is_empty());
+        assert_eq!(
+            out.sign_refused,
+            Some(SignRefusal::Conflicting {
+                signed: block_hash(10)
+            })
+        );
+        assert_eq!(g.signed_vote_at(10), Some(block_hash(10)), "unchanged");
+        // "Restart" #2, back on the original hash: the identical vote again.
+        let g = gadget_over(&ks, true, kv, 40).await;
+        let out = g
+            .on_buried_checkpoint(10, block_hash(10), &seed, Some(k0))
+            .await;
+        assert!(out.signed_own_vote);
+        let again = out.outbound.first().expect("own vote again");
+        assert_eq!(
+            (again.height, again.block_hash, again.voter, again.signature),
+            (first.height, first.block_hash, first.voter, first.signature),
+            "same vote bytes"
+        );
+    }
+
+    /// Records are bounded: past MAX_SIGNED_HEIGHTS boundaries the floor rises,
+    /// old records are deleted and their heights are refused (not re-opened).
+    #[tokio::test]
+    async fn durable_record_is_bounded_by_the_signing_horizon() {
+        let ks = keys(1);
+        let kv = Arc::new(MemKv::default());
+        let g = gadget_over(&ks, true, kv.clone(), 4).await;
+        let mut st = g.state.lock().await;
+        let n = u64::try_from(MAX_SIGNED_HEIGHTS)
+            .expect("fits")
+            .saturating_add(10);
+        for i in 1..=n {
+            let h = i.saturating_mul(2);
+            g.authorize_sign(&mut st, h, Hash::new([7; 32]))
+                .expect("authorize");
+        }
+        drop(st);
+        let top = n.saturating_mul(2);
+        let meta = g.signed_vote_meta().expect("meta");
+        assert_eq!(meta.highest, top);
+        assert_eq!(
+            meta.floor,
+            top.saturating_sub(2 * MAX_SIGNED_HEIGHTS as u64)
+        );
+        assert_eq!(
+            kv.keys_with_prefix(SIGNED_VOTE_KEY_PREFIX),
+            MAX_SIGNED_HEIGHTS
+        );
+        assert_eq!(g.signed_vote_at(2), None, "deleted below the floor");
+        let mut st = g.state.lock().await;
+        assert_eq!(
+            g.authorize_sign(&mut st, 2, Hash::new([8; 32])),
+            Err(SignRefusal::BelowSignedFloor { floor: meta.floor })
+        );
+        drop(st);
+        // Never prunes above the floor: the lowest record above it survives.
+        assert_eq!(
+            g.signed_vote_at(meta.floor.saturating_add(2)),
+            Some(Hash::new([7; 32]))
+        );
+    }
+
+    /// Finality prunes the durable records at/below the finalized height and
+    /// raises the signed floor with them; records above it survive.
+    #[tokio::test]
+    async fn finality_prunes_durable_records_at_or_below_the_floor() {
+        let ks = keys(4);
+        let kv = Arc::new(MemKv::default());
+        let g = gadget_over(&ks, true, kv.clone(), 40).await;
+        let seed = Hash::new([6; 32]);
+        let k0 = ks.first().expect("key 0");
+        for h in [10u64, 12, 14] {
+            let out = g
+                .on_buried_checkpoint(
+                    h,
+                    block_hash(u8::try_from(h).expect("small")),
+                    &seed,
+                    Some(k0),
+                )
+                .await;
+            assert!(out.signed_own_vote, "h={h}");
+        }
+        for k in ks.iter().skip(1).take(2) {
+            let _ = g
+                .on_inbound_vote(sign_checkpoint_vote(CHAIN, 12, block_hash(12), k))
+                .await;
+        }
+        assert_eq!(g.manager().latest_finalized_height().await, 12);
+        assert_eq!(g.signed_vote_at(10), None);
+        assert_eq!(g.signed_vote_at(12), None);
+        assert_eq!(g.signed_vote_at(14), Some(block_hash(14)));
+        assert_eq!(
+            g.signed_vote_meta(),
+            Some(SignedVoteMeta {
+                floor: 12,
+                highest: 14
+            })
+        );
+    }
+
+    /// Switch OFF: the store is never written (byte-identical to pre-Stage-1a).
+    #[tokio::test]
+    async fn switch_off_never_writes_the_store() {
+        let ks = keys(4);
+        let kv = Arc::new(MemKv::default());
+        let g = gadget_over(&ks, false, kv.clone(), 40).await;
+        let before = kv.batches.load(Ordering::SeqCst);
+        let _ = g
+            .on_buried_checkpoint(10, block_hash(10), &Hash::new([1; 32]), ks.first())
+            .await;
+        g.prune().await;
+        assert_eq!(kv.batches.load(Ordering::SeqCst), before);
+        assert_eq!(kv.keys_with_prefix(SIGNED_VOTE_KEY_PREFIX), 0);
+        assert_eq!(kv.keys_with_prefix(SIGNED_VOTE_META_PREFIX), 0);
+    }
+
+    #[test]
+    fn signed_vote_meta_round_trips_and_rejects_bad_lengths() {
+        let m = SignedVoteMeta {
+            floor: 7,
+            highest: u64::MAX,
+        };
+        assert_eq!(SignedVoteMeta::decode(&m.encode()), Some(m));
+        assert_eq!(SignedVoteMeta::decode(&[0u8; 15]), None);
+        assert_eq!(boundaries_between(3, 11, 2), vec![4, 6, 8, 10]);
+        assert_eq!(boundaries_between(4, 4, 2), Vec::<u64>::new());
+        assert_eq!(boundaries_between(0, 10, 0), Vec::<u64>::new());
+        assert_eq!(
+            signed_vote_key(40204, 12),
+            b"checkpoint_signed:40204:12".to_vec()
+        );
+        assert!(!signed_vote_key(1, 2).starts_with(b"checkpoint:"));
     }
 }

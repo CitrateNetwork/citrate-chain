@@ -477,6 +477,15 @@ impl CheckpointManager {
         &self.config
     }
 
+    /// The persistent backend this manager was built with
+    /// ([`Self::with_persistence`]), if any. The finality gadget keeps its
+    /// durable signed-vote record (equivocation protection across restarts) in
+    /// the same store; a manager built with [`Self::new`] has none, and a
+    /// gadget over it refuses to sign.
+    pub fn persistent_store(&self) -> Option<&Arc<dyn KvStore>> {
+        self.persistent.as_ref()
+    }
+
     /// Get the latest finalized checkpoint height.
     pub async fn latest_finalized_height(&self) -> u64 {
         *self.latest_finalized_height.read().await

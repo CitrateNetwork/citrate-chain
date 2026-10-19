@@ -143,6 +143,23 @@ outbound construct-sign-broadcast path does not exist today and is the primary n
 The validator signing key is the node's consensus key (same key registered in
 `ValidatorRegistry`); confirm availability in the producer context (D-4).
 
+**Signing protection (Stage 1a, PR #321 review P2).** A validator must never sign two
+hashes at one height, including across restarts (sign A at H, reorg onto a shorter
+branch, restart, that branch later buries B at H). Every signing decision is therefore
+recorded durably **before** the vote is signed, submitted locally or broadcast:
+`dag_metadata` key `checkpoint_signed:<chain_id>:<H>` → the 32-byte hash, plus
+`checkpoint_signed_meta:<chain_id>` → `floor ‖ highest` (u64 BE), written in one
+`KvStore::kv_write_batch` (RocksDB: `write_batch_sync`, WAL fsync before return). Each sign
+attempt consults the record: same hash → idempotent re-sign (deterministic ed25519, the
+identical vote); different hash → refused and logged at error level (safety stop for that
+height); height `<= floor` → refused. Write failure or no persistent store → no signature
+(fail closed). Records at/below the finalized height are deleted and the floor raised to it
+in one synced batch; records more than 1024 boundaries below `highest` are deleted the same
+way (floor raised past them), so the record is bounded and pruning never re-opens a height.
+This replaces the earlier "skip boundaries already buried at startup" driver heuristic.
+The record lives in the node's database: wiping the data dir while keeping `proposer.key`
+discards it, exactly like a slashing-protection DB — do not do that on a voting validator.
+
 ### 4.4 Aggregation & finalization
 Inbound votes are already handled (`main.rs:3328` → `submit_vote`). On reaching quorum,
 `finalize_checkpoint` marks the checkpoint finalized, persists it, and advances
