@@ -3,7 +3,16 @@
 # anvil chain with chain id 40204, as `forge script --broadcast` (not `forge test`):
 #
 #   DeployGenesisGovernance -> (KYCRegistry + MembershipSBT stand-ins) -> DeployDormantLedgers
-#   -> CheckDeployedAdmins (over both ceremony books), which must report 0 failures.
+#   -> CheckDeployedAdmins (over both ceremony books), which must report 0 failures, including
+#   GENESIS-FLOOR and TIMELOCK-HOLDERS.
+#
+# Then the chain#324 negatives, each of which must be refused:
+#   - forge simulating another chain id than the 40204 node (--chain-id 1), for the deploy
+#     script (nothing sent: deployer nonce unchanged) and for the gate;
+#   - DeployDormantLedgers without GENESIS_GOVERNANCE_BOOK (the GuardianCanceller's CANCELLER
+#     seat on the GOVERNANCE timelock is then an unexpected canceller; nothing sent);
+#   - a rogue extra CANCELLER, then a rogue extra DEFAULT_ADMIN, on the GOVERNANCE timelock
+#     (granted by impersonating the timelock), which the gate must flag as TIMELOCK-HOLDERS.
 #
 # Then the chain#320 negatives, each of which must be refused with nothing sent:
 #   - forge simulating another chain id than the 40204 node (--chain-id 1): DeployGenesisGovernance,
@@ -65,6 +74,8 @@ export GRD_OWNERS=0x000000000000000000000000000000000000B001,0x00000000000000000
 export GRD_THRESHOLD=2 GRD_MIN_DELAY=3600
 export GENESIS_GOVERNANCE_OUT="$OUT_REL/governance.json"
 export DORMANT_LEDGERS_OUT="$OUT_REL/dormant.json"
+# The governance book: its GuardianCanceller is the GOVERNANCE timelock's one allowed extra CANCELLER.
+export GENESIS_GOVERNANCE_BOOK="$OUT_REL/governance.json"
 
 cd "$CONTRACTS"
 run_script() {
@@ -107,14 +118,20 @@ fail() {
 
 echo "=== forge script CheckDeployedAdmins (read-only) ==="
 gate "$OUT/gate.log" || true
-grep -E "failures|NO-CODE|VERIFIER|FACTORY|DEPLOYER|TIMELOCK|Error|revert" "$OUT/gate.log" | grep -v "\[" || true
+grep -E "failures|NO-CODE|VERIFIER|FACTORY|DEPLOYER|TIMELOCK|GENESIS|Error|revert" "$OUT/gate.log" | grep -v "\[" || true
 grep -q "Script ran successfully" "$OUT/gate.log" || fail "gate FAILED"
-for class in "FACTORY-ADMIN" "DEPLOYER-ADMIN" "TIMELOCK-HOLDERS"; do
+for class in "FACTORY-ADMIN" "DEPLOYER-ADMIN" "TIMELOCK-HOLDERS" "GENESIS-FLOOR"; do
   grep -qE "^ *${class} failures: 0$" "$OUT/gate.log" || fail "gate: ${class} failures not 0"
 done
-echo "genesis-pipeline-anvil: pipeline PASS (0 FACTORY-ADMIN / DEPLOYER-ADMIN / TIMELOCK-HOLDERS)"
+CANCELLER="$(sed -n 's/.*"GuardianCanceller":"\(0x[0-9a-fA-F]*\)".*/\1/p' "$GOV_JSON")"
+CANCELLER_ROLE="$(cast keccak CANCELLER_ROLE)"
+[ "$(cast call --rpc-url "$RPC" "$GOVERNANCE_TIMELOCK" 'hasRole(bytes32,address)(bool)' "$CANCELLER_ROLE" "$CANCELLER")" = true ] ||
+  fail "GuardianCanceller does not hold CANCELLER on the GOVERNANCE timelock"
+grep -q '"genesisProfile":true' "$GOV_JSON" && grep -q '"nodeChainId":40204' "$GOV_JSON" ||
+  fail "governance book does not record the genesis profile / node chain id"
+echo "genesis-pipeline-anvil: pipeline PASS (0 FACTORY-ADMIN / DEPLOYER-ADMIN / TIMELOCK-HOLDERS / GENESIS-FLOOR)"
 
-# ---- chain#320 negatives (each must be refused) ----
+# ---- chain#320 / chain#324 negatives (each must be refused) ----
 nonce() { cast nonce --rpc-url "$RPC" "$1"; }
 MISMATCH="chain id mismatch: node reports 40204, forge simulates 1"
 
@@ -138,9 +155,9 @@ echo "refused (DeployGenesisGovernance, DeployDormantLedgers, gate), nothing sen
 echo "=== negative: hidden PROPOSER/EXECUTOR with TIMELOCK_HISTORY_FROM_BLOCK past the grant ==="
 FKEY="$(cast wallet private-key "$MNEMONIC" 1)"
 FADMIN="$(cast wallet address --private-key "$FKEY")"
-ROGUE=0x000000000000000000000000000000000000bAd2
+LATE_ROGUE=0x000000000000000000000000000000000000bAd2
 fixture() { # <stage>
-  FIXTURE_STAGE="$1" FIXTURE_ADMIN="$FADMIN" FIXTURE_ROGUE="$ROGUE" FIXTURE_OUT="$OUT_REL/late.json" \
+  FIXTURE_STAGE="$1" FIXTURE_ADMIN="$FADMIN" FIXTURE_ROGUE="$LATE_ROGUE" FIXTURE_OUT="$OUT_REL/late.json" \
     FIXTURE_HELPER="${HELPER:-0x0000000000000000000000000000000000000000}" \
     forge script test/genesis/anvil/LateHistoryWindowFixture.s.sol --tc LateHistoryWindowFixture --rpc-url "$RPC" --broadcast \
     --private-key "$FKEY" --slow -q >"$OUT/fixture-$1.log" 2>&1 || { cat "$OUT/fixture-$1.log" >&2; fail "fixture stage $1"; }
@@ -153,14 +170,14 @@ LATE_FROM=$(($(cast block-number --rpc-url "$RPC") + 1))
 fixture 2
 PROPOSER_ROLE="$(cast keccak PROPOSER_ROLE)"
 EXECUTOR_ROLE="$(cast keccak EXECUTOR_ROLE)"
-[ "$(cast call --rpc-url "$RPC" "$LATE_TL" 'hasRole(bytes32,address)(bool)' "$PROPOSER_ROLE" "$ROGUE")" = true ] &&
-  [ "$(cast call --rpc-url "$RPC" "$LATE_TL" 'hasRole(bytes32,address)(bool)' "$EXECUTOR_ROLE" "$ROGUE")" = true ] ||
+[ "$(cast call --rpc-url "$RPC" "$LATE_TL" 'hasRole(bytes32,address)(bool)' "$PROPOSER_ROLE" "$LATE_ROGUE")" = true ] &&
+  [ "$(cast call --rpc-url "$RPC" "$LATE_TL" 'hasRole(bytes32,address)(bool)' "$EXECUTOR_ROLE" "$LATE_ROGUE")" = true ] ||
   fail "fixture: ROGUE does not hold the hidden seats"
 [ "$(cast call --rpc-url "$RPC" "$LATE_TL" 'getMinDelay()(uint256)' | cut -d' ' -f1)" = 172800 ] || fail "fixture: delay is not 48 h"
 late_dormant() { # <log> [env...]: DeployDormantLedgers against the fixture timelock
   local log="$1"
   shift
-  env GOVERNANCE_TIMELOCK="$LATE_TL" GOVERNANCE_MULTISIG="$LATE_MS" "$@" forge script script/DeployDormantLedgers.s.sol \
+  env -u GENESIS_GOVERNANCE_BOOK GOVERNANCE_TIMELOCK="$LATE_TL" GOVERNANCE_MULTISIG="$LATE_MS" "$@" forge script script/DeployDormantLedgers.s.sol \
     --rpc-url "$RPC" --broadcast --private-key "$KEY" >"$log" 2>&1
 }
 before="$(nonce "$DEPLOYER")"
@@ -182,4 +199,30 @@ fi
 grep -E "^ *TIMELOCK-HOLDERS GovernanceTimelock: role history does not start at the timelock's construction" "$OUT/neg-late-gate.log" ||
   fail "gate late window: not a TIMELOCK-HOLDERS construction failure"
 echo "refused (deploy from block $LATE_FROM and from 0, gate from block $LATE_FROM), nothing sent"
-echo "genesis-pipeline-anvil: PASS (pipeline + chain#320 negatives on anvil 40204)"
+echo "=== negative: DeployDormantLedgers without GENESIS_GOVERNANCE_BOOK ==="
+before="$(nonce "$DEPLOYER")"
+if env -u GENESIS_GOVERNANCE_BOOK forge script script/DeployDormantLedgers.s.sol --rpc-url "$RPC" --broadcast \
+  --private-key "$KEY" >"$OUT/neg-nobook.log" 2>&1; then fail "DeployDormantLedgers ran without the governance book"; fi
+grep -q "CANCELLER_ROLE is held by an account other than the multisig" "$OUT/neg-nobook.log" ||
+  fail "no-book run: not refused on the canceller seat"
+[ "$(nonce "$DEPLOYER")" = "$before" ] || fail "no-book run sent a transaction"
+echo "refused, nothing sent"
+
+as_timelock() { # <signature> <args...>: a GOVERNANCE timelock self-call (stands in for a governance op)
+  cast send --rpc-url "$RPC" --unlocked --from "$GOVERNANCE_TIMELOCK" "$GOVERNANCE_TIMELOCK" "$@" >/dev/null
+}
+cast rpc --rpc-url "$RPC" anvil_impersonateAccount "$GOVERNANCE_TIMELOCK" >/dev/null
+cast rpc --rpc-url "$RPC" anvil_setBalance "$GOVERNANCE_TIMELOCK" 0xDE0B6B3A7640000 >/dev/null
+ROGUE=0x000000000000000000000000000000000000bAd1
+ADMIN_ROLE=0x0000000000000000000000000000000000000000000000000000000000000000
+for role in CANCELLER ADMIN; do
+  [ "$role" = CANCELLER ] && r="$CANCELLER_ROLE" || r="$ADMIN_ROLE"
+  echo "=== negative: rogue extra ${role} on the GOVERNANCE timelock ==="
+  as_timelock 'grantRole(bytes32,address)' "$r" "$ROGUE"
+  if gate "$OUT/neg-rogue-$role.log"; then fail "gate passed with a rogue ${role}"; fi
+  grep -qE "^ *TIMELOCK-HOLDERS failures: [1-9]" "$OUT/neg-rogue-$role.log" || fail "rogue ${role}: not a TIMELOCK-HOLDERS failure"
+  grep -E "^ *TIMELOCK-HOLDERS GovernanceTimelock" "$OUT/neg-rogue-$role.log" || true
+  as_timelock 'revokeRole(bytes32,address)' "$r" "$ROGUE"
+done
+gate "$OUT/gate-after.log" || fail "gate does not pass again after the rogue seats are revoked"
+echo "genesis-pipeline-anvil: PASS (pipeline + chain#320 / chain#324 negatives on anvil 40204)"

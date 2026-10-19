@@ -12,6 +12,7 @@ import {InitialAdmin} from "../../src/lib/InitialAdmin.sol";
 ///      CANCELLER, and the timelock administers itself.
 contract MultisigProposerTest is Test {
     uint256 internal constant DELAY = 2 days;
+    uint256 internal constant TTL = 7 days;
 
     TimelockController internal tl;
     MultisigProposer internal ms;
@@ -30,7 +31,7 @@ contract MultisigProposerTest is Test {
     function _council(address[] memory o, uint256 m) internal returns (TimelockController t, MultisigProposer p) {
         address[] memory none = new address[](0);
         t = new TimelockController(DELAY, none, none, address(this));
-        p = new MultisigProposer(address(t), o, m);
+        p = new MultisigProposer(address(t), o, m, TTL);
         t.grantRole(t.PROPOSER_ROLE(), address(p));
         t.grantRole(t.EXECUTOR_ROLE(), address(p));
         t.grantRole(t.CANCELLER_ROLE(), address(p));
@@ -91,62 +92,62 @@ contract MultisigProposerTest is Test {
 
     function test_constructor_rejects_zero_owners() public {
         vm.expectRevert(abi.encodeWithSelector(MultisigProposer.BadOwnerCount.selector, 0));
-        new MultisigProposer(address(tl), new address[](0), 1);
+        new MultisigProposer(address(tl), new address[](0), 1, TTL);
     }
 
     function test_constructor_rejects_eleven_owners() public {
         vm.expectRevert(abi.encodeWithSelector(MultisigProposer.BadOwnerCount.selector, 11));
-        new MultisigProposer(address(tl), _owners(11), 1);
+        new MultisigProposer(address(tl), _owners(11), 1, TTL);
     }
 
     function test_constructor_accepts_ten_of_ten_and_one_of_one() public {
-        MultisigProposer a = new MultisigProposer(address(tl), _owners(10), 10);
+        MultisigProposer a = new MultisigProposer(address(tl), _owners(10), 10, TTL);
         assertEq(a.threshold(), 10);
-        MultisigProposer b = new MultisigProposer(address(tl), _owners(1), 1);
+        MultisigProposer b = new MultisigProposer(address(tl), _owners(1), 1, TTL);
         assertEq(b.threshold(), 1);
     }
 
     function test_constructor_rejects_threshold_zero() public {
         vm.expectRevert(abi.encodeWithSelector(MultisigProposer.BadThreshold.selector, 0, 3));
-        new MultisigProposer(address(tl), _owners(3), 0);
+        new MultisigProposer(address(tl), _owners(3), 0, TTL);
     }
 
     function test_constructor_rejects_threshold_above_owner_count() public {
         vm.expectRevert(abi.encodeWithSelector(MultisigProposer.BadThreshold.selector, 4, 3));
-        new MultisigProposer(address(tl), _owners(3), 4);
+        new MultisigProposer(address(tl), _owners(3), 4, TTL);
     }
 
     function test_constructor_rejects_duplicate_owner() public {
         address[] memory o = _owners(3);
         o[2] = o[0];
         vm.expectRevert(abi.encodeWithSelector(MultisigProposer.DuplicateOwner.selector, o[0]));
-        new MultisigProposer(address(tl), o, 2);
+        new MultisigProposer(address(tl), o, 2, TTL);
     }
 
     function test_constructor_rejects_zero_owner() public {
         address[] memory o = _owners(3);
         o[1] = address(0);
         vm.expectRevert(InitialAdmin.InitialAdmin_Zero.selector);
-        new MultisigProposer(address(tl), o, 2);
+        new MultisigProposer(address(tl), o, 2, TTL);
     }
 
     function test_constructor_rejects_create2_factory_owner() public {
         address[] memory o = _owners(3);
         o[1] = InitialAdmin.CREATE2_FACTORY;
         vm.expectRevert(InitialAdmin.InitialAdmin_Create2Factory.selector);
-        new MultisigProposer(address(tl), o, 2);
+        new MultisigProposer(address(tl), o, 2, TTL);
     }
 
     function test_constructor_rejects_timelock_as_owner() public {
         address[] memory o = _owners(3);
         o[1] = address(tl);
         vm.expectRevert(MultisigProposer.OwnerIsTimelock.selector);
-        new MultisigProposer(address(tl), o, 2);
+        new MultisigProposer(address(tl), o, 2, TTL);
     }
 
     function test_constructor_rejects_codeless_timelock() public {
         vm.expectRevert(MultisigProposer.TimelockHasNoCode.selector);
-        new MultisigProposer(makeAddr("not-a-timelock"), _owners(3), 2);
+        new MultisigProposer(makeAddr("not-a-timelock"), _owners(3), 2, TTL);
     }
 
     // ── access ──────────────────────────────────────────────────────
@@ -181,7 +182,7 @@ contract MultisigProposerTest is Test {
 
     function test_propose_counts_the_proposers_approval() public {
         bytes32 id = _propose(0, hex"deadbeef");
-        (, uint256 approvals, bool exists, bool executed) = ms.getProposal(id);
+        (, uint256 approvals, bool exists, bool executed,) = ms.getProposal(id);
         assertEq(approvals, 1);
         assertTrue(exists);
         assertFalse(executed);
@@ -209,7 +210,7 @@ contract MultisigProposerTest is Test {
         _approve(3, id);
         _approve(4, id);
         _exec(2, id); // owner 2 never approved, still may trigger
-        (,,, bool executed) = ms.getProposal(id);
+        (,,, bool executed,) = ms.getProposal(id);
         assertTrue(executed);
     }
 
@@ -322,7 +323,7 @@ contract MultisigProposerTest is Test {
         vm.prank(owners[1]);
         vm.expectPartialRevert(MultisigProposer.ExecutionFailed.selector);
         ms.execute(execId);
-        (,,, bool executed) = ms.getProposal(execId);
+        (,,, bool executed,) = ms.getProposal(execId);
         assertFalse(executed, "a failed call leaves the proposal pending");
 
         vm.warp(block.timestamp + DELAY);
@@ -356,7 +357,7 @@ contract MultisigProposerTest is Test {
 
     function test_rotation_via_timelock_role_swap() public {
         address[] memory next = _owners(3);
-        MultisigProposer ms2 = new MultisigProposer(address(tl), next, 2);
+        MultisigProposer ms2 = new MultisigProposer(address(tl), next, 2, TTL);
         address[] memory targets = new address[](6);
         uint256[] memory values = new uint256[](6);
         bytes[] memory payloads = new bytes[](6);
@@ -416,7 +417,7 @@ contract MultisigProposerTest is Test {
         address[] memory o = _owners(n);
         o[j] = o[i];
         vm.expectRevert(abi.encodeWithSelector(MultisigProposer.DuplicateOwner.selector, o[i]));
-        new MultisigProposer(address(tl), o, 1);
+        new MultisigProposer(address(tl), o, 1, TTL);
     }
 
     /// Any threshold outside 1..n is refused.
@@ -424,6 +425,114 @@ contract MultisigProposerTest is Test {
         uint256 n = bound(nSeed, 1, 10);
         vm.assume(m == 0 || m > n);
         vm.expectRevert(abi.encodeWithSelector(MultisigProposer.BadThreshold.selector, m, n));
-        new MultisigProposer(address(tl), _owners(n), m);
+        new MultisigProposer(address(tl), _owners(n), m, TTL);
+    }
+
+    // ── proposal expiry ─────────────────────────────────────────────
+
+    function test_constructor_records_ttl_and_rejects_out_of_bounds() public {
+        assertEq(ms.proposalTtl(), TTL);
+        uint256 lo = ms.MIN_PROPOSAL_TTL();
+        uint256 hi = ms.MAX_PROPOSAL_TTL();
+        assertEq(lo, 1 days);
+        assertEq(hi, 30 days);
+        new MultisigProposer(address(tl), _owners(3), 2, lo);
+        new MultisigProposer(address(tl), _owners(3), 2, hi);
+        vm.expectRevert(abi.encodeWithSelector(MultisigProposer.BadProposalTtl.selector, lo - 1));
+        new MultisigProposer(address(tl), _owners(3), 2, lo - 1);
+        vm.expectRevert(abi.encodeWithSelector(MultisigProposer.BadProposalTtl.selector, hi + 1));
+        new MultisigProposer(address(tl), _owners(3), 2, hi + 1);
+        vm.expectRevert(abi.encodeWithSelector(MultisigProposer.BadProposalTtl.selector, 0));
+        new MultisigProposer(address(tl), _owners(3), 2, 0);
+    }
+
+    function test_propose_records_expiry() public {
+        bytes32 id = _propose(0, hex"deadbeef");
+        (,,,, uint256 expiresAt) = ms.getProposal(id);
+        assertEq(expiresAt, block.timestamp + TTL);
+    }
+
+    /// An approved-but-unexecuted proposal cannot run once expired, cannot gather or lose
+    /// approvals either, and re-proposing the same call gives a fresh, runnable proposal.
+    function test_expired_proposal_cannot_execute_and_can_be_reproposed() public {
+        bytes memory payload = abi.encodeCall(tl.updateDelay, (3 days));
+        bytes memory data = _scheduleCall(address(tl), payload, 0);
+        bytes32 id = _propose(0, data);
+        _approve(1, id);
+        _approve(2, id);
+        uint256 expiresAt = block.timestamp + TTL;
+        vm.warp(expiresAt);
+
+        vm.prank(owners[0]);
+        vm.expectRevert(abi.encodeWithSelector(MultisigProposer.ProposalExpired.selector, expiresAt));
+        ms.execute(id);
+        vm.prank(owners[3]);
+        vm.expectRevert(abi.encodeWithSelector(MultisigProposer.ProposalExpired.selector, expiresAt));
+        ms.approve(id);
+        vm.prank(owners[1]);
+        vm.expectRevert(abi.encodeWithSelector(MultisigProposer.ProposalExpired.selector, expiresAt));
+        ms.revoke(id);
+        bytes32 opId = tl.hashOperation(address(tl), 0, payload, bytes32(0), bytes32(0));
+        assertFalse(tl.isOperation(opId), "nothing reached the timelock");
+
+        bytes32 again = _pass(data);
+        assertTrue(again != id, "re-proposal gets a new id");
+        assertTrue(tl.isOperationPending(opId));
+        (,,, bool executed,) = ms.getProposal(id);
+        assertFalse(executed, "the expired proposal stays unexecuted");
+    }
+
+    /// The expiry boundary for any TTL in bounds and any elapsed time: execute succeeds
+    /// iff elapsed < ttl.
+    function testFuzz_execute_iff_unexpired(uint256 ttlSeed, uint256 elapsedSeed) public {
+        uint256 ttl = bound(ttlSeed, 1 days, 30 days);
+        uint256 elapsed = bound(elapsedSeed, 0, 31 days);
+        address[] memory none = new address[](0);
+        TimelockController t = new TimelockController(DELAY, none, none, address(this));
+        MultisigProposer p = new MultisigProposer(address(t), owners, 3, ttl);
+        t.grantRole(t.PROPOSER_ROLE(), address(p));
+        t.renounceRole(t.DEFAULT_ADMIN_ROLE(), address(this));
+
+        bytes memory payload = abi.encodeCall(t.updateDelay, (1 days));
+        vm.prank(owners[0]);
+        bytes32 id = p.propose(_scheduleCall(address(t), payload, 0));
+        vm.prank(owners[1]);
+        p.approve(id);
+        vm.prank(owners[2]);
+        p.approve(id);
+        uint256 expiresAt = block.timestamp + ttl;
+        vm.warp(block.timestamp + elapsed);
+        vm.prank(owners[0]);
+        if (elapsed < ttl) {
+            p.execute(id);
+            assertTrue(t.isOperationPending(t.hashOperation(address(t), 0, payload, bytes32(0), bytes32(0))));
+        } else {
+            vm.expectRevert(abi.encodeWithSelector(MultisigProposer.ProposalExpired.selector, expiresAt));
+            p.execute(id);
+        }
+    }
+
+    /// Exact boundary: one second before expiry executes, at expiry reverts.
+    function test_expiry_boundary_is_exclusive() public {
+        // Fixed timestamps throughout: via-IR may reorder or reuse `block.timestamp` reads
+        // around vm.warp, so the test never reads it.
+        uint256 t0 = 1_000_000;
+        vm.warp(t0);
+        bytes memory data = _scheduleCall(address(tl), abi.encodeCall(tl.updateDelay, (3 days)), 0);
+        bytes32 id = _propose(0, data);
+        _approve(1, id);
+        _approve(2, id);
+        vm.warp(t0 + TTL - 1);
+        _exec(0, id);
+        bytes32 id2 = _propose(0, _scheduleCall(address(tl), abi.encodeCall(tl.updateDelay, (4 days)), 0));
+        _approve(1, id2);
+        _approve(2, id2);
+        uint256 expires2 = t0 + TTL - 1 + TTL;
+        (,,,, uint256 recorded) = ms.getProposal(id2);
+        assertEq(recorded, expires2);
+        vm.warp(expires2);
+        vm.prank(owners[0]);
+        vm.expectRevert(abi.encodeWithSelector(MultisigProposer.ProposalExpired.selector, expires2));
+        ms.execute(id2);
     }
 }

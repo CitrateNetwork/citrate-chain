@@ -36,18 +36,28 @@ import {P256} from "../src/aa/lib/webauthn/P256.sol";
 ///         established (AdminChecks `_timelockHolderProblem`: rebuilt from the timelock's
 ///         RoleGranted / RoleRevoked logs, re-read with hasRole). An entry `<P>Timelock` must
 ///         have a `<P>Multisig` beside it in the same section; the timelock must be its own SOLE
-///         admin and that multisig its SOLE proposer, executor and canceller. No paired
-///         multisig, no node, or an incomplete history fails it. The paired multisig must also
-///         be authenticated: the MultisigProposer DeployGenesisGovernance deploys for that
-///         timelock and its reported owners / threshold, at its CREATE2 address under the salt
-///         "Genesis.<P>Multisig" (AdminChecks `_multisigProposerProblem`). GATE: must be 0.
+///         admin and that multisig its SOLE proposer, executor and canceller. The one permitted
+///         extra canceller is a GOVERNANCE timelock's GuardianCanceller, and only when a book in
+///         this run lists it beside that GovernanceTimelock and it verifies on chain
+///         (GenesisProfile `_bookGuardianCanceller`: its CREATE2 address for (GovernanceTimelock,
+///         GuardianTimelock), this build's runtime code, its wiring, and the GuardianTimelock's
+///         own sole holders). No paired multisig, no node, or an incomplete history fails it.
+///         The paired multisig must also be authenticated: the MultisigProposer
+///         DeployGenesisGovernance deploys for that timelock and its reported owners / threshold
+///         / proposalTtl, at its CREATE2 address under the salt "Genesis.<P>Multisig"
+///         (AdminChecks `_multisigProposerProblem`). GATE: must be 0.
 ///
 ///         GENESIS-FLOOR (chain 40204, as reported by the node; GenesisProfile): every book's
-///         C4 genesis councils are re-checked ON CHAIN, from the deployed contracts and not from
-///         the book's params (GenesisProfile `_councilFloorProblem`): GovernanceTimelock minDelay
-///         >= 48 h and GovernanceMultisig >= 3-of-5, GuardianTimelock minDelay >= 1 h, each
-///         multisig fronting its own timelock. A timelock listed without its multisig fails.
-///         Without a node the 40204 gate fails closed. GATE: must be 0.
+///         C4 genesis councils are re-checked ON CHAIN against the genesis floors, from the
+///         deployed contracts, not from the book's params: GovernanceTimelock minDelay >= 48 h,
+///         GovernanceMultisig >= 3-of-5 (majority), GuardianMultisig >= 2-of-3 (majority),
+///         each multisig fronting its timelock with the fixed 14-day proposal TTL, and the
+///         GuardianCanceller wired to them as GOVERNANCE's guardian CANCELLER. Every listed
+///         GovernanceTimelock must have such a verified GuardianCanceller, listed by some book in
+///         the run and holding CANCELLER on it now (the guardian veto is required). A book that
+///         records `params.genesisProfile = false` or `params.overrideUsed = true` fails too.
+///         The node's eth_chainId must equal the simulated chain id (any mismatch reverts),
+///         and without a node the 40204 gate fails closed. GATE: must be 0.
 ///
 ///         Expected on the 2026-09-24 deployment (a fork of 40204): 22
 ///         FACTORY-ADMIN (21 admin slots + X402Paywall.provider), VERIFIER
@@ -87,6 +97,14 @@ contract CheckDeployedAdmins is GenesisProfile {
         // The node decides whether the genesis floors apply; a simulated id that differs reverts.
         bool genesis = _resolveChainProfile(false).genesis;
         address deployer = vm.parseJsonAddress(json, ".deployer");
+        // The GuardianCanceller each GOVERNANCE timelock may carry as its one extra canceller,
+        // from the book(s) that list it, verified on chain before any timelock is swept.
+        delete cancellerTimelocks;
+        delete cancellerOf;
+        _registerGuardianCanceller(json);
+        for (uint256 i = 0; i < extras.length; i++) {
+            _registerGuardianCanceller(extras[i]);
+        }
         _sweep(json, ".contracts", deployer);
         _sweep(json, ".aaStack", deployer);
         if (genesis) _genesisFloorSweep(json);
@@ -97,6 +115,12 @@ contract CheckDeployedAdmins is GenesisProfile {
             );
             _sweep(extras[i], ".contracts", deployer);
             if (genesis) _genesisFloorSweep(extras[i]);
+        }
+        if (genesis) {
+            _guardianVetoSweep(json);
+            for (uint256 i = 0; i < extras.length; i++) {
+                _guardianVetoSweep(extras[i]);
+            }
         }
         verifierMissing = P256.VERIFIER.code.length == 0;
         if (verifierMissing) console.log("VERIFIER missing: no code at", P256.VERIFIER);
@@ -118,10 +142,17 @@ contract CheckDeployedAdmins is GenesisProfile {
 
     /// @notice GENESIS-FLOOR over one book: the councils it lists, read from chain.
     function _genesisFloorSweep(string memory json) internal {
+        if (vm.keyExistsJson(json, ".params.genesisProfile") && !vm.parseJsonBool(json, ".params.genesisProfile")) {
+            _floorFail("book was generated off the genesis profile");
+        }
+        if (vm.keyExistsJson(json, ".params.overrideUsed") && vm.parseJsonBool(json, ".params.overrideUsed")) {
+            _floorFail("book records a safety override");
+        }
         (bool hasGovTl, address govTl) = _entry(json, "GovernanceTimelock");
         (bool hasGovMs, address govMs) = _entry(json, "GovernanceMultisig");
         (bool hasGrdTl, address grdTl) = _entry(json, "GuardianTimelock");
         (bool hasGrdMs, address grdMs) = _entry(json, "GuardianMultisig");
+        (bool hasCanceller, address canceller) = _entry(json, "GuardianCanceller");
         if (hasGovTl || hasGovMs) {
             if (!(hasGovTl && hasGovMs)) {
                 _floorFail("GovernanceTimelock and GovernanceMultisig must be listed together");
@@ -133,6 +164,48 @@ contract CheckDeployedAdmins is GenesisProfile {
             if (!(hasGrdTl && hasGrdMs)) _floorFail("GuardianTimelock and GuardianMultisig must be listed together");
             else _floorCheck(_councilFloorProblem("GUARDIAN", grdTl, grdMs, false));
         }
+        if (hasGovTl && hasGrdTl) {
+            (bool okGov, uint256 govDelay) = _readUint(govTl, abi.encodeWithSignature("getMinDelay()"));
+            (bool okGrd, uint256 grdDelay) = _readUint(grdTl, abi.encodeWithSignature("getMinDelay()"));
+            if (!okGov || !okGrd || grdDelay >= govDelay) {
+                _floorFail("GuardianTimelock minDelay is not shorter than GovernanceTimelock minDelay");
+            }
+        }
+        if (hasCanceller) {
+            if (!(hasGovTl && hasGrdTl)) _floorFail("GuardianCanceller listed without both timelocks");
+            else _floorCheck(_cancellerProblem(canceller, govTl, grdTl));
+        }
+    }
+
+    /// @notice GENESIS-FLOOR: the guardian veto is required on the genesis profile. Every
+    ///         GovernanceTimelock a book lists must have a GuardianCanceller that some book in
+    ///         this run lists beside it and that verified on chain (`_registerGuardianCanceller`),
+    ///         and that canceller must hold CANCELLER_ROLE on the timelock now. A book that simply
+    ///         omits the canceller (for example after its role was revoked) fails here instead of
+    ///         passing with the council as sole canceller.
+    function _guardianVetoSweep(string memory json) internal {
+        (bool hasGovTl, address govTl) = _entry(json, "GovernanceTimelock");
+        if (!hasGovTl) return;
+        address[] memory extra = _allowedExtraCancellers(govTl);
+        if (extra.length == 0) {
+            _floorFail("GovernanceTimelock has no verified GuardianCanceller in this run's books (guardian veto)");
+            return;
+        }
+        (bool ok, bool has) =
+            _readBool(govTl, abi.encodeWithSignature("hasRole(bytes32,address)", TIMELOCK_CANCELLER_ROLE, extra[0]));
+        if (!ok || !has) _floorFail("GuardianCanceller lacks CANCELLER on GovernanceTimelock (guardian veto)");
+    }
+
+    /// @notice Empty when `canceller` is GOVERNANCE's guardian CANCELLER, answering to `grdTl`.
+    function _cancellerProblem(address canceller, address govTl, address grdTl) internal view returns (string memory) {
+        (bool okT, address t) = _readAddress(canceller, abi.encodeWithSignature("governanceTimelock()"));
+        if (!okT || t != govTl) return "GuardianCanceller cancels on another timelock";
+        (bool okG, address g) = _readAddress(canceller, abi.encodeWithSignature("guardian()"));
+        if (!okG || g != grdTl) return "GuardianCanceller answers to another guardian";
+        (bool okR, bool has) =
+            _readBool(govTl, abi.encodeWithSignature("hasRole(bytes32,address)", TIMELOCK_CANCELLER_ROLE, canceller));
+        if (!okR || !has) return "GuardianCanceller lacks CANCELLER on GovernanceTimelock";
+        return "";
     }
 
     function _entry(string memory json, string memory name) internal view returns (bool, address) {
@@ -200,7 +273,57 @@ contract CheckDeployedAdmins is GenesisProfile {
         string memory mproblem =
             _multisigProposerProblem(council, target, string.concat(GENESIS_SALT_PREFIX, multisigName));
         if (bytes(mproblem).length != 0) return string.concat(multisigName, ": ", mproblem);
-        return _timelockHolderProblem(target, council, new address[](0));
+        return _timelockHolderProblem(target, council, _allowedExtraCancellers(target));
+    }
+
+    /// GOVERNANCE timelock -> the verified GuardianCanceller a book in this run lists beside it.
+    address[] internal cancellerTimelocks;
+    address[] internal cancellerOf;
+
+    /// @notice When `json` lists a GuardianCanceller, verify it against the book's own
+    ///         GovernanceTimelock / GuardianTimelock / GuardianMultisig (`_bookGuardianCanceller`)
+    ///         and record it as that timelock's one permitted extra canceller. A listed canceller
+    ///         that does not verify, or two books naming different cancellers for the same
+    ///         timelock, is a TIMELOCK-HOLDERS failure and permits nothing.
+    function _registerGuardianCanceller(string memory json) internal {
+        if (!vm.keyExistsJson(json, ".contracts.GuardianCanceller")) return;
+        if (!vm.keyExistsJson(json, ".contracts.GovernanceTimelock")) {
+            _holderFail("GuardianCanceller listed without a GovernanceTimelock");
+            return;
+        }
+        address govTl = vm.parseJsonAddress(json, ".contracts.GovernanceTimelock");
+        (string memory problem, address canceller) = _bookGuardianCanceller(json, govTl);
+        if (bytes(problem).length != 0) {
+            _holderFail(problem);
+            return;
+        }
+        for (uint256 i = 0; i < cancellerTimelocks.length; i++) {
+            if (cancellerTimelocks[i] != govTl) continue;
+            if (cancellerOf[i] != canceller) {
+                _holderFail("two books name different GuardianCancellers for one GovernanceTimelock");
+                cancellerOf[i] = address(0);
+            }
+            return;
+        }
+        cancellerTimelocks.push(govTl);
+        cancellerOf.push(canceller);
+    }
+
+    /// @notice The extra canceller `timelock` may carry: its verified GuardianCanceller, or none.
+    function _allowedExtraCancellers(address timelock) internal view returns (address[] memory extra) {
+        for (uint256 i = 0; i < cancellerTimelocks.length; i++) {
+            if (cancellerTimelocks[i] == timelock && cancellerOf[i] != address(0)) {
+                extra = new address[](1);
+                extra[0] = cancellerOf[i];
+                return extra;
+            }
+        }
+        return new address[](0);
+    }
+
+    function _holderFail(string memory problem) internal {
+        console.log(string.concat("TIMELOCK-HOLDERS ", problem));
+        timelockHolders++;
     }
 
     function _slice(bytes memory b, uint256 from, uint256 to) internal pure returns (bytes memory out) {

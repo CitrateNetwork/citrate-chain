@@ -2,7 +2,9 @@
 pragma solidity ^0.8.26;
 
 import {DeployGenesisGovernance} from "../../script/DeployGenesisGovernance.s.sol";
-import {DormantWithHistory, GateWithHistory} from "./RoleHistoryHarness.sol";
+import {AdminChecks} from "../../script/lib/AdminChecks.sol";
+import {GenesisProfile} from "../../script/lib/GenesisProfile.sol";
+import {DormantWithHistory, GateWithHistory, RecordedRoleHistory} from "./RoleHistoryHarness.sol";
 
 /// @title Node stand-in for the GenesisProfile chain-id check
 /// @notice `forge test` has no fork, so `vm.rpc("eth_chainId")` is unavailable there (the real
@@ -16,7 +18,8 @@ import {DormantWithHistory, GateWithHistory} from "./RoleHistoryHarness.sol";
 ///                    eth_chainId = 0x9d0c).
 ///           NONE   : no RPC (pure simulation)
 ///         DormantWithNode / GateWithNode also take the timelock role history from the test's
-///         RoleLogArchive (RoleHistoryHarness: call `useArchive`).
+///         RoleLogArchive (RoleHistoryHarness: call `useArchive`), since both scripts now
+///         establish complete timelock holder sets; without an archive that check fails closed.
 abstract contract NodeStub {
     uint8 internal constant NONE = 0;
     uint8 internal constant HONEST = 1;
@@ -63,5 +66,20 @@ contract DormantWithNode is DormantWithHistory, NodeStub {
 contract GateWithNode is GateWithHistory, NodeStub {
     function _nodeChainId() internal view override returns (bool, uint256) {
         return _stubNode();
+    }
+}
+
+/// Direct access to GenesisProfile `_bookGuardianCanceller`, over the test's recorded history.
+contract BookCancellerChecks is GenesisProfile, RecordedRoleHistory {
+    function problem(string memory json, address govTl) external returns (string memory, address) {
+        return _bookGuardianCanceller(json, govTl);
+    }
+
+    function _timelockRoleHistory(address timelock)
+        internal
+        override(AdminChecks, RecordedRoleHistory)
+        returns (bool, string memory, RoleEvent[] memory)
+    {
+        return RecordedRoleHistory._timelockRoleHistory(timelock);
     }
 }

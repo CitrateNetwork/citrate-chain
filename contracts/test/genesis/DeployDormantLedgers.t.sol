@@ -12,6 +12,7 @@ import {MembershipSBT} from "../../src/coop/MembershipSBT.sol";
 import {Auth} from "../../src/coop/lib/Auth.sol";
 import {KYCRegistry} from "../../src/KYCRegistry.sol";
 import {MultisigProposer} from "../../src/genesis/MultisigProposer.sol";
+import {GuardianCanceller} from "../../src/genesis/GuardianCanceller.sol";
 import {AdminChecks} from "../../script/lib/AdminChecks.sol";
 import {Salts} from "../../script/Salts.sol";
 import {
@@ -33,6 +34,9 @@ contract DeployDormantLedgersTest is Test {
     KYCRegistry internal kyc;
     MembershipSBT internal membership;
     RoleLogArchive internal archive;
+    /// setUp's governance book (DeployGenesisGovernance shape): its GuardianCanceller is the one
+    /// extra CANCELLER the GOVERNANCE timelock may carry.
+    string internal govBookJson;
 
     function setUp() public {
         // The timelock role history the scripts replay (no node in forge test: RoleHistoryHarness).
@@ -49,10 +53,12 @@ contract DeployDormantLedgersTest is Test {
         DeployGenesisGovernance g = new DeployGenesisGovernance();
         gov = g.deployWith(
             SENDER,
-            DeployGenesisGovernance.Council({owners: govOwners, threshold: 3, minDelay: 48 hours}),
-            DeployGenesisGovernance.Council({owners: grdOwners, threshold: 2, minDelay: 1 hours}),
+            DeployGenesisGovernance.Council({owners: govOwners, threshold: 3, minDelay: 48 hours, proposalTtl: 7 days}),
+            DeployGenesisGovernance.Council({owners: grdOwners, threshold: 2, minDelay: 1 hours, proposalTtl: 7 days}),
+            false,
             false
         );
+        govBookJson = _fullGovBook(block.chainid, gov);
         kyc = new KYCRegistry(address(0), makeAddr("kyc-admin"));
         membership = new MembershipSBT(address(kyc), new bytes32[](0), makeAddr("sbt-admin"), makeAddr("sbt-registrar"));
     }
@@ -88,7 +94,41 @@ contract DeployDormantLedgersTest is Test {
 
     function _deploy() internal returns (DeployDormantLedgers.Deployed memory d) {
         DeployDormantLedgers s = _dormant();
-        d = s.deployWith(SENDER, gov.governanceTimelock, gov.governanceMultisig, address(kyc), address(membership));
+        d = s.deployWith(
+            SENDER, gov.governanceTimelock, gov.governanceMultisig, address(kyc), address(membership), govBookJson
+        );
+    }
+
+    /// A governance book as DeployGenesisGovernance writes it (contracts section) for `g`.
+    function _fullGovBook(uint256 chainId, DeployGenesisGovernance.Deployed memory g)
+        internal
+        pure
+        returns (string memory)
+    {
+        return string.concat(
+            '{"chainId":',
+            vm.toString(chainId),
+            ',"deployer":"',
+            vm.toString(SENDER),
+            '","contracts":{"GovernanceTimelock":"',
+            vm.toString(g.governanceTimelock),
+            '","GovernanceMultisig":"',
+            vm.toString(g.governanceMultisig),
+            '","GuardianTimelock":"',
+            vm.toString(g.guardianTimelock),
+            '","GuardianMultisig":"',
+            vm.toString(g.guardianMultisig),
+            '","GuardianCanceller":"',
+            vm.toString(g.guardianCanceller),
+            '"},"aaStack":{},"params":{}}'
+        );
+    }
+
+    /// The gate over `book` with setUp's governance book alongside it (as the ceremony runs it).
+    function _gateWithGov(CheckDeployedAdmins c, string memory book, bool requireAllCode) internal {
+        string[] memory extras = new string[](1);
+        extras[0] = govBookJson;
+        c.checkAll(book, extras, requireAllCode);
     }
 
     function test_patronage_ledger_is_governed_by_the_timelock_and_dormant() public {
@@ -196,9 +236,13 @@ contract DeployDormantLedgersTest is Test {
     function test_rejects_codeless_kyc_or_membership() public {
         DeployDormantLedgers s = _dormant();
         _expectRevert(bytes("PATRONAGE_KYC_REGISTRY has no code on this chain"));
-        s.deployWith(SENDER, gov.governanceTimelock, gov.governanceMultisig, makeAddr("nokyc"), address(membership));
+        s.deployWith(
+            SENDER, gov.governanceTimelock, gov.governanceMultisig, makeAddr("nokyc"), address(membership), govBookJson
+        );
         _expectRevert(bytes("PATRONAGE_MEMBERSHIP has no code on this chain"));
-        s.deployWith(SENDER, gov.governanceTimelock, gov.governanceMultisig, address(kyc), makeAddr("nomember"));
+        s.deployWith(
+            SENDER, gov.governanceTimelock, gov.governanceMultisig, address(kyc), makeAddr("nomember"), govBookJson
+        );
     }
 
     /// The only test that sets GOVERNANCE_TIMELOCK / PATRONAGE_* / DORMANT_LEDGERS_OUT.
@@ -221,7 +265,23 @@ contract DeployDormantLedgersTest is Test {
         vm.createDir("genesis", true);
         string memory out = "genesis/test-dormant-ledgers.json";
         vm.setEnv("DORMANT_LEDGERS_OUT", out);
+
+        // GENESIS_GOVERNANCE_BOOK cross-check: a book naming another timelock stops the run.
+        string memory govBook = "genesis/test-dormant-governance-book.json";
+        vm.writeFile(govBook, _govBook(block.chainid, makeAddr("other-timelock")));
+        vm.setEnv("GENESIS_GOVERNANCE_BOOK", govBook);
+        uint64 nonceBefore = vm.getNonce(SENDER);
+        vm.expectRevert(bytes("GOVERNANCE_TIMELOCK does not match GENESIS_GOVERNANCE_BOOK"));
+        s.run();
+        assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
+        // A book naming the timelock but not its GuardianCanceller: the canceller seat is refused.
+        vm.writeFile(govBook, _govBook(block.chainid, gov.governanceTimelock));
+        _expectRevert(bytes("GENESIS_GOVERNANCE_BOOK: governance book lists no GuardianCanceller"));
+        s.run();
+        vm.writeFile(govBook, _fullGovBook(block.chainid, gov));
         DeployDormantLedgers.Deployed memory d = s.run();
+        vm.setEnv("GENESIS_GOVERNANCE_BOOK", "");
+        vm.removeFile(govBook);
         string memory book = vm.readFile(out);
         assertEq(vm.parseJsonAddress(book, ".contracts.PatronageLedger"), d.patronageLedger);
         assertEq(vm.parseJsonAddress(book, ".contracts.FederatedRoundLedger"), d.federatedRoundLedger);
@@ -231,10 +291,50 @@ contract DeployDormantLedgersTest is Test {
 
         vm.etch(P256_VERIFIER, hex"600160005260206000f3");
         CheckDeployedAdmins c = _gate();
-        c.check(book, true);
+        _gateWithGov(c, book, true);
         assertEq(c.deployerAdmin(), 0, "DEPLOYER-ADMIN reads 0 after hand-over");
+        assertEq(c.timelockHolders(), 0, "TIMELOCK-HOLDERS reads 0 with the governance book alongside");
         assertEq(c.factoryAdmin(), 0);
         vm.removeFile(out);
+    }
+
+    function _govBook(uint256 chainId, address timelock) internal pure returns (string memory) {
+        return string.concat(
+            '{"chainId":',
+            vm.toString(chainId),
+            ',"deployer":"0x0000000000000000000000000000000000000001","contracts":{"GovernanceTimelock":"',
+            vm.toString(timelock),
+            '"},"aaStack":{},"params":{}}'
+        );
+    }
+
+    function test_governance_book_cross_check() public {
+        DeployDormantLedgers s = new DeployDormantLedgers();
+        s.checkGovernanceBook(_govBook(block.chainid, gov.governanceTimelock), gov.governanceTimelock);
+        vm.expectRevert(bytes("GOVERNANCE_TIMELOCK does not match GENESIS_GOVERNANCE_BOOK"));
+        s.checkGovernanceBook(_govBook(block.chainid, gov.guardianTimelock), gov.governanceTimelock);
+        vm.expectRevert(bytes("GENESIS_GOVERNANCE_BOOK: book is for another chain"));
+        s.checkGovernanceBook(_govBook(block.chainid + 1, gov.governanceTimelock), gov.governanceTimelock);
+        vm.expectRevert(bytes("GENESIS_GOVERNANCE_BOOK: no contracts.GovernanceTimelock"));
+        s.checkGovernanceBook('{"chainId":1,"contracts":{}}', gov.governanceTimelock);
+    }
+
+    /// The book DeployGenesisGovernance actually writes passes the cross-check.
+    function test_governance_book_from_the_governance_script_passes() public {
+        DeployGenesisGovernance g = new DeployGenesisGovernance();
+        DeployGenesisGovernance.Council memory c1 =
+            DeployGenesisGovernance.Council({owners: govOwners, threshold: 3, minDelay: 48 hours, proposalTtl: 7 days});
+        address[] memory grdOwners = new address[](3);
+        for (uint256 i = 0; i < 3; i++) {
+            grdOwners[i] = address(uint160(0xB000 + i));
+        }
+        DeployGenesisGovernance.Council memory c2 =
+            DeployGenesisGovernance.Council({owners: grdOwners, threshold: 2, minDelay: 1 hours, proposalTtl: 7 days});
+        string memory book = g.bookJson(SENDER, gov, c1, c2);
+        DeployDormantLedgers s = new DeployDormantLedgers();
+        s.checkGovernanceBook(book, gov.governanceTimelock);
+        vm.expectRevert(bytes("GOVERNANCE_TIMELOCK does not match GENESIS_GOVERNANCE_BOOK"));
+        s.checkGovernanceBook(book, gov.guardianTimelock);
     }
 
     /// chain#320 P1 regression: DEPLOYER_ADDRESS names A but Forge broadcasts as B. The script
@@ -245,7 +345,10 @@ contract DeployDormantLedgersTest is Test {
         DeployDormantLedgers s = _dormant();
         uint64 nonceBefore = vm.getNonce(SENDER);
         _expectRevert(bytes("broadcast sender is not the configured deployer (DEPLOYER_ADDRESS)"));
-        s.deployWith(configured, gov.governanceTimelock, gov.governanceMultisig, address(kyc), address(membership)); // broadcasts as SENDER (B)
+        // broadcasts as SENDER (B)
+        s.deployWith(
+            configured, gov.governanceTimelock, gov.governanceMultisig, address(kyc), address(membership), govBookJson
+        );
         assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
     }
 
@@ -261,7 +364,7 @@ contract DeployDormantLedgersTest is Test {
         address[] memory me = new address[](1);
         me[0] = SENDER;
         TimelockController weak = new TimelockController(0, me, me, SENDER);
-        MultisigProposer ms = _ceremonyMultisig(GOV_SALT, address(weak), govOwners, 3);
+        MultisigProposer ms = _ceremonyMultisig(GOV_SALT, address(weak), govOwners, 3, 14 days);
         DeployDormantLedgers s = _dormant();
 
         // As-is: the multisig holds no seat and the deployer administers the timelock.
@@ -295,7 +398,7 @@ contract DeployDormantLedgersTest is Test {
     function test_rejects_council_that_is_not_the_timelocks_multisig() public {
         DeployDormantLedgers s = _dormant();
         // A multisig with no seat on the timelock.
-        MultisigProposer stranger = new MultisigProposer(gov.governanceTimelock, govOwners, 3);
+        MultisigProposer stranger = new MultisigProposer(gov.governanceTimelock, govOwners, 3, 14 days);
         _expectRevert(bytes("GOVERNANCE_TIMELOCK: multisig lacks a timelock role"));
         s.deployWith(SENDER, gov.governanceTimelock, address(stranger), address(kyc), address(membership));
         _expectRevert(bytes("GOVERNANCE_MULTISIG has no code on this chain"));
@@ -306,7 +409,7 @@ contract DeployDormantLedgersTest is Test {
     function test_rejects_timelock_with_open_execution() public {
         address[] memory none = new address[](0);
         TimelockController tl = new TimelockController(48 hours, none, none, SENDER);
-        MultisigProposer ms = new MultisigProposer(address(tl), govOwners, 3);
+        MultisigProposer ms = new MultisigProposer(address(tl), govOwners, 3, 14 days);
         _grantCouncil(tl, address(ms));
         vm.startPrank(SENDER);
         tl.grantRole(tl.EXECUTOR_ROLE(), address(0));
@@ -318,37 +421,99 @@ contract DeployDormantLedgersTest is Test {
     }
 
     /// A correctly handed-over rehearsal council (2-of-3, 1 h) passes off the genesis chain and
-    /// the genesis profile refuses it. The floor is chosen by chain id alone (no env override).
+    /// the genesis profile refuses it. The floor is chosen by the node's chain id (no override).
     function test_genesis_profile_floor_is_48h_and_3_of_5() public {
         DeployGenesisGovernance.Deployed memory weakDelay = _council(3, 5, 24 hours);
         // 72 h: the timelock's CREATE2 address depends on (deployer, delay), and setUp owns 48 h.
         DeployGenesisGovernance.Deployed memory weakCouncil = _council(2, 3, 72 hours);
         DeployDormantLedgers s = _dormant();
         s.deployWith(
-            SENDER, weakDelay.governanceTimelock, weakDelay.governanceMultisig, address(kyc), address(membership)
+            SENDER,
+            weakDelay.governanceTimelock,
+            weakDelay.governanceMultisig,
+            address(kyc),
+            address(membership),
+            _fullGovBook(block.chainid, weakDelay)
         );
         s.deployWith(
-            SENDER, weakCouncil.governanceTimelock, weakCouncil.governanceMultisig, address(kyc), address(membership)
+            SENDER,
+            weakCouncil.governanceTimelock,
+            weakCouncil.governanceMultisig,
+            address(kyc),
+            address(membership),
+            _fullGovBook(block.chainid, weakCouncil)
         );
 
         vm.chainId(40204);
-        _expectRevert(bytes("GOVERNANCE_TIMELOCK: minDelay below the 48 h genesis floor"));
+        _expectRevert(bytes("GOVERNANCE timelock: minDelay below the 48 h genesis floor"));
         s.deployWith(
-            SENDER, weakDelay.governanceTimelock, weakDelay.governanceMultisig, address(kyc), address(membership)
+            SENDER,
+            weakDelay.governanceTimelock,
+            weakDelay.governanceMultisig,
+            address(kyc),
+            address(membership),
+            _fullGovBook(block.chainid, weakDelay)
         );
-        _expectRevert(bytes("GOVERNANCE_MULTISIG: below the 3-of-5 genesis floor"));
+        _expectRevert(bytes("GOVERNANCE multisig: below the 3-of-5 genesis floor"));
         s.deployWith(
-            SENDER, weakCouncil.governanceTimelock, weakCouncil.governanceMultisig, address(kyc), address(membership)
+            SENDER,
+            weakCouncil.governanceTimelock,
+            weakCouncil.governanceMultisig,
+            address(kyc),
+            address(membership),
+            _fullGovBook(block.chainid, weakCouncil)
         );
     }
 
     /// The correct genesis council (3-of-5, 48 h, self-administered, no deploy-account seat)
     /// passes on the genesis profile, and the ledger is handed to it.
     function test_correct_genesis_council_passes_on_genesis_profile() public {
+        // 3-of-5, 96 h, the fixed 14-day TTL (setUp's council uses a 7-day TTL).
+        DeployGenesisGovernance.Deployed memory g = _council(3, 5, 96 hours);
         vm.chainId(40204);
-        DeployDormantLedgers.Deployed memory d = _deploy();
+        DormantWithNode s = new DormantWithNode();
+        s.useArchive(archive);
+        DeployDormantLedgers.Deployed memory d = s.deployWith(
+            SENDER,
+            g.governanceTimelock,
+            g.governanceMultisig,
+            address(kyc),
+            address(membership),
+            _fullGovBook(40204, g)
+        );
         PatronageLedger l = PatronageLedger(d.patronageLedger);
-        assertTrue(l.hasRole(l.DEFAULT_ADMIN_ROLE(), gov.governanceTimelock));
+        assertTrue(l.hasRole(l.DEFAULT_ADMIN_ROLE(), g.governanceTimelock));
+        string memory book = s.bookJson(SENDER, g.governanceTimelock, g.governanceMultisig, d);
+        assertTrue(vm.parseJsonBool(book, ".params.genesisProfile"));
+        assertEq(vm.parseJsonUint(book, ".params.nodeChainId"), 40204);
+        assertFalse(vm.parseJsonBool(book, ".params.overrideUsed"));
+
+        // setUp's council is 3-of-5 / 48 h but with a 7-day TTL: below the genesis profile.
+        vm.expectRevert(bytes("GOVERNANCE multisig: proposalTtl is not the fixed 14-day genesis value"));
+        s.deployWith(SENDER, gov.governanceTimelock, gov.governanceMultisig, address(kyc), address(membership));
+    }
+
+    /// The dormant-ledger floors use the node's chain id: a 40204 node with forge simulating
+    /// chain 1 (--chain-id 1 / --chain 1 / FOUNDRY_CHAIN_ID=1) is refused before broadcast, and
+    /// without a node the genesis profile fails closed.
+    function test_dormant_floor_uses_the_node_chain_id() public {
+        DeployGenesisGovernance.Deployed memory weak = _council(2, 3, 24 hours);
+        DormantWithNode s = new DormantWithNode();
+        s.nodeReports(40204);
+        vm.chainId(1);
+        uint64 nonceBefore = vm.getNonce(SENDER);
+        vm.expectRevert(
+            bytes(
+                "chain id mismatch: node reports 40204, forge simulates 1 (drop --chain-id / --chain / FOUNDRY_CHAIN_ID)"
+            )
+        );
+        s.deployWith(SENDER, weak.governanceTimelock, weak.governanceMultisig, address(kyc), address(membership));
+        assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
+
+        vm.chainId(40204);
+        DeployDormantLedgers real = new DeployDormantLedgers();
+        vm.expectRevert(bytes("genesis profile needs a live node: run with --rpc-url (eth_chainId unavailable)"));
+        real.deployWith(SENDER, gov.governanceTimelock, gov.governanceMultisig, address(kyc), address(membership));
     }
 
     /// The governance timelock / multisig are in the book, so the gate sees a deployer seat there.
@@ -372,7 +537,7 @@ contract DeployDormantLedgersTest is Test {
     /// whatever extra seats it wants before `_finish`.
     function _handedTimelock() internal returns (TimelockController tl, MultisigProposer ms) {
         tl = _ceremonyTimelock();
-        ms = _ceremonyMultisig(GOV_SALT, address(tl), govOwners, 3);
+        ms = _ceremonyMultisig(GOV_SALT, address(tl), govOwners, 3, 14 days);
         _grantCouncil(tl, address(ms));
     }
 
@@ -398,11 +563,16 @@ contract DeployDormantLedgersTest is Test {
 
     /// A MultisigProposer deployed the way DeployGenesisGovernance deploys one: through the
     /// Arachnid factory under `Salts.salt(saltName)`, so it carries the ceremony's CREATE2 provenance.
-    function _ceremonyMultisig(string memory saltName, address tl, address[] memory owners, uint256 threshold)
-        internal
-        returns (MultisigProposer)
-    {
-        bytes memory init = abi.encodePacked(type(MultisigProposer).creationCode, abi.encode(tl, owners, threshold));
+    function _ceremonyMultisig(
+        string memory saltName,
+        address tl,
+        address[] memory owners,
+        uint256 threshold,
+        uint256 proposalTtl
+    ) internal returns (MultisigProposer) {
+        bytes memory init = abi.encodePacked(
+            type(MultisigProposer).creationCode, abi.encode(tl, owners, threshold, proposalTtl)
+        );
         (bool ok, bytes memory ret) = ARACHNID.call(abi.encodePacked(Salts.salt(saltName), init));
         require(ok && ret.length == 20, "factory deploy failed");
         return MultisigProposer(address(bytes20(ret)));
@@ -480,15 +650,76 @@ contract DeployDormantLedgersTest is Test {
     function test_clean_pipeline_councils_have_exact_holder_sets() public {
         HolderChecksWithHistory h = new HolderChecksWithHistory();
         h.useArchive(archive);
-        assertEq(h.problem(gov.governanceTimelock, gov.governanceMultisig, new address[](0)), "");
+        // GOVERNANCE carries the GuardianCanceller as its one extra CANCELLER (chain#324): clean
+        // only when it is named; unnamed, it is an unexpected canceller.
+        address[] memory guardianSeat = new address[](1);
+        guardianSeat[0] = gov.guardianCanceller;
+        assertEq(h.problem(gov.governanceTimelock, gov.governanceMultisig, guardianSeat), "");
+        assertEq(
+            h.problem(gov.governanceTimelock, gov.governanceMultisig, new address[](0)),
+            "CANCELLER_ROLE is held by an account other than the multisig"
+        );
         assertEq(h.problem(gov.guardianTimelock, gov.guardianMultisig, new address[](0)), "");
         // The wrong council for a timelock is not its holder set.
         assertEq(
             h.problem(gov.governanceTimelock, gov.guardianMultisig, new address[](0)),
             "PROPOSER_ROLE holders are not exactly the multisig"
         );
+        // On the genesis profile, with a council at the genesis floors (14-day TTL).
+        DeployGenesisGovernance.Deployed memory g = _council(3, 5, 96 hours);
         vm.chainId(40204);
-        _deploy();
+        _dormant()
+            .deployWith(
+                SENDER,
+                g.governanceTimelock,
+                g.governanceMultisig,
+                address(kyc),
+                address(membership),
+                _fullGovBook(40204, g)
+            );
+    }
+
+    /// The GOVERNANCE timelock's GuardianCanceller is accepted only from the governance book, and
+    /// only as verified on chain: an impostor listed there is refused before anything is sent.
+    function test_guardian_canceller_comes_only_from_a_verified_governance_book() public {
+        DeployDormantLedgers s = _dormant();
+        uint64 nonceBefore = vm.getNonce(SENDER);
+        // No book: the canceller seat is an unexpected canceller.
+        _expectRevert(bytes("GOVERNANCE_TIMELOCK: CANCELLER_ROLE is held by an account other than the multisig"));
+        s.deployWith(SENDER, gov.governanceTimelock, gov.governanceMultisig, address(kyc), address(membership));
+        // A book naming a same-code impostor (plain CREATE, not the CREATE2 instance).
+        GuardianCanceller impostor = new GuardianCanceller(gov.governanceTimelock, gov.guardianTimelock);
+        string memory forged =
+            vm.replace(govBookJson, vm.toString(gov.guardianCanceller), vm.toString(address(impostor)));
+        _expectRevert(
+            bytes(
+                "GENESIS_GOVERNANCE_BOOK: GuardianCanceller is not at its CREATE2 address for (GovernanceTimelock, GuardianTimelock)"
+            )
+        );
+        s.deployWith(SENDER, gov.governanceTimelock, gov.governanceMultisig, address(kyc), address(membership), forged);
+        assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
+    }
+
+    /// The GuardianCanceller is the ONLY extra: a rogue canceller or admin beside it is refused.
+    function test_rogue_seat_beside_the_guardian_canceller_is_refused() public {
+        TimelockController tl = TimelockController(payable(gov.governanceTimelock));
+        (bytes32 cancellerRole, bytes32 adminRole) = (tl.CANCELLER_ROLE(), tl.DEFAULT_ADMIN_ROLE());
+        address rogue = makeAddr("rogue");
+        vm.prank(gov.governanceTimelock);
+        tl.grantRole(cancellerRole, rogue);
+        DeployDormantLedgers s = _dormant();
+        _expectRevert(bytes("GOVERNANCE_TIMELOCK: CANCELLER_ROLE is held by an account other than the multisig"));
+        s.deployWith(
+            SENDER, gov.governanceTimelock, gov.governanceMultisig, address(kyc), address(membership), govBookJson
+        );
+        vm.startPrank(gov.governanceTimelock);
+        tl.revokeRole(cancellerRole, rogue);
+        tl.grantRole(adminRole, rogue);
+        vm.stopPrank();
+        _expectRevert(bytes("GOVERNANCE_TIMELOCK: DEFAULT_ADMIN_ROLE holders are not exactly the timelock itself"));
+        s.deployWith(
+            SENDER, gov.governanceTimelock, gov.governanceMultisig, address(kyc), address(membership), govBookJson
+        );
     }
 
     /// An extra canceller is accepted only when the caller names it (a guardian canceller seat).
@@ -607,7 +838,7 @@ contract DeployDormantLedgersTest is Test {
         uint64 nonceBefore = vm.getNonce(SENDER);
         _expectRevert(
             bytes(
-                "GOVERNANCE_MULTISIG: not the MultisigProposer the ceremony deploys (Genesis.GovernanceMultisig) for this timelock, owners and threshold"
+                "GOVERNANCE_MULTISIG: not the MultisigProposer the ceremony deploys (Genesis.GovernanceMultisig) for this timelock, owners, threshold and proposal TTL"
             )
         );
         s.deployWith(SENDER, address(tl), address(fwd), address(kyc), address(membership));
@@ -621,7 +852,7 @@ contract DeployDormantLedgersTest is Test {
         AdminChecksHarness a = new AdminChecksHarness();
         assertEq(
             a.multisigProblem(address(fwd), address(tl), GOV_SALT),
-            "not the MultisigProposer the ceremony deploys (Genesis.GovernanceMultisig) for this timelock, owners and threshold"
+            "not the MultisigProposer the ceremony deploys (Genesis.GovernanceMultisig) for this timelock, owners, threshold and proposal TTL"
         );
         string memory book = _dormant().bookJson(SENDER, address(tl), address(fwd), d);
         CheckDeployedAdmins c = _gate();
@@ -636,7 +867,7 @@ contract DeployDormantLedgersTest is Test {
         assertEq(a.multisigProblem(gov.governanceMultisig, gov.governanceTimelock, GOV_SALT), "");
         assertEq(a.multisigProblem(gov.guardianMultisig, gov.guardianTimelock, GRD_SALT), "");
         string memory bad =
-            "not the MultisigProposer the ceremony deploys (Genesis.GovernanceMultisig) for this timelock, owners and threshold";
+            "not the MultisigProposer the ceremony deploys (Genesis.GovernanceMultisig) for this timelock, owners, threshold and proposal TTL";
         // The right council for the wrong timelock, and under the wrong salt.
         assertEq(a.multisigProblem(gov.governanceMultisig, gov.guardianTimelock, GOV_SALT), bad);
         assertEq(a.multisigProblem(gov.guardianMultisig, gov.guardianTimelock, GOV_SALT), bad);
@@ -646,7 +877,7 @@ contract DeployDormantLedgersTest is Test {
         vm.chainId(40204);
         TimelockController tl = _ceremonyTimelock();
         // Genuine 3-of-5 code and args, plain CREATE (no ceremony provenance): refused.
-        MultisigProposer plain = new MultisigProposer(address(tl), govOwners, 3);
+        MultisigProposer plain = new MultisigProposer(address(tl), govOwners, 3, 14 days);
         _grantCouncil(tl, address(plain));
         _finish(tl);
         assertEq(a.multisigProblem(address(plain), address(tl), GOV_SALT), bad);
@@ -656,28 +887,61 @@ contract DeployDormantLedgersTest is Test {
 
         // Genuine code under the GUARDIAN salt, fronting the governance timelock: refused.
         TimelockController tl2 = _ceremonyTimelock();
-        MultisigProposer wrongSalt = _ceremonyMultisig(GRD_SALT, address(tl2), govOwners, 3);
+        MultisigProposer wrongSalt = _ceremonyMultisig(GRD_SALT, address(tl2), govOwners, 3, 14 days);
         _grantCouncil(tl2, address(wrongSalt));
         _finish(tl2);
         _expectRevert(bytes(string.concat("GOVERNANCE_MULTISIG: ", bad)));
         s.deployWith(SENDER, address(tl2), address(wrongSalt), address(kyc), address(membership));
 
+        // The proposal TTL is part of the provenance: a council built with a 7-day TTL that
+        // reports the fixed 14-day value (same salt, timelock, owners, threshold) is refused,
+        // and so is a TTL-less (pre-#324 3-argument) encoding of an honest council.
+        TimelockController tl4 = _ceremonyTimelock();
+        MultisigProposer sevenDay = _ceremonyMultisig(GOV_SALT, address(tl4), govOwners, 3, 7 days);
+        assertEq(a.multisigProblem(address(sevenDay), address(tl4), GOV_SALT), "");
+        vm.etch(address(sevenDay), address(new TtlLiar(address(tl4), govOwners, 3, 14 days)).code);
+        assertEq(a.multisigProblem(address(sevenDay), address(tl4), GOV_SALT), bad);
+        assertTrue(
+            vm.computeCreate2Address(
+                Salts.salt(GOV_SALT),
+                keccak256(
+                    abi.encodePacked(type(MultisigProposer).creationCode, abi.encode(address(tl4), govOwners, 3))
+                ),
+                ARACHNID
+            ) != address(sevenDay),
+            "the TTL is in the init code"
+        );
+
         // Ceremony provenance with 2-of-5 args: authenticated, so its threshold is real, and the
         // genesis floor refuses it.
         TimelockController tl3 = _ceremonyTimelock();
-        MultisigProposer twoOfFive = _ceremonyMultisig(GOV_SALT, address(tl3), govOwners, 2);
+        MultisigProposer twoOfFive = _ceremonyMultisig(GOV_SALT, address(tl3), govOwners, 2, 14 days);
         _grantCouncil(tl3, address(twoOfFive));
         _finish(tl3);
         assertEq(a.multisigProblem(address(twoOfFive), address(tl3), GOV_SALT), "");
-        _expectRevert(bytes("GOVERNANCE_MULTISIG: below the 3-of-5 genesis floor"));
+        _expectRevert(bytes("GOVERNANCE multisig: below the 3-of-5 genesis floor"));
         s.deployWith(SENDER, address(tl3), address(twoOfFive), address(kyc), address(membership));
 
-        // The genuine 3-of-5 pipeline council passes the deploy and the gate.
+        // The genuine 3-of-5 pipeline council (genesis floors: 14-day TTL) passes the deploy and
+        // the gate, with its governance book alongside (GuardianCanceller).
         vm.etch(P256_VERIFIER, hex"600160005260206000f3");
-        DeployDormantLedgers.Deployed memory d = _deploy();
+        vm.chainId(31337); // _council deploys on a rehearsal chain (no node in forge test)
+        DeployGenesisGovernance.Deployed memory g = _council(3, 5, 96 hours);
+        vm.chainId(40204);
+        DeployDormantLedgers.Deployed memory d = s.deployWith(
+            SENDER,
+            g.governanceTimelock,
+            g.governanceMultisig,
+            address(kyc),
+            address(membership),
+            _fullGovBook(40204, g)
+        );
         CheckDeployedAdmins c = _gate();
-        c.check(s.bookJson(SENDER, gov.governanceTimelock, gov.governanceMultisig, d), false);
+        string[] memory extras = new string[](1);
+        extras[0] = _fullGovBook(40204, g);
+        c.checkAll(s.bookJson(SENDER, g.governanceTimelock, g.governanceMultisig, d), extras, false);
         assertEq(c.timelockHolders(), 0);
+        assertEq(c.genesisFloor(), 0);
     }
 
     /// The post-deploy gate establishes the complete sets on every timelock in the book.
@@ -689,7 +953,7 @@ contract DeployDormantLedgersTest is Test {
         _finish(tl);
         DeployDormantLedgers s = _dormant();
         CheckDeployedAdmins clean = _gate();
-        clean.check(s.bookJson(SENDER, gov.governanceTimelock, gov.governanceMultisig, d), false);
+        _gateWithGov(clean, s.bookJson(SENDER, gov.governanceTimelock, gov.governanceMultisig, d), false);
         assertEq(clean.timelockHolders(), 0);
 
         string memory book = s.bookJson(SENDER, address(tl), address(ms), d);
@@ -744,9 +1008,16 @@ contract DeployDormantLedgersTest is Test {
         return new DeployGenesisGovernance()
             .deployWith(
                 SENDER,
-                DeployGenesisGovernance.Council({owners: owners, threshold: threshold, minDelay: delay}),
-                DeployGenesisGovernance.Council({owners: grdOwners, threshold: 2, minDelay: 1 hours}),
-                false
+                DeployGenesisGovernance.Council({
+                    owners: owners, threshold: threshold, minDelay: delay, proposalTtl: 14 days
+                }),
+                // GUARDIAN delay = delay / 2: its timelock address depends on (deployer, delay), and
+                // setUp's 1 h guardian timelock is already handed over (a reuse would skip it).
+                DeployGenesisGovernance.Council({
+                    owners: grdOwners, threshold: 2, minDelay: delay / 2, proposalTtl: 14 days
+                }),
+                false,
+                true // rehearsal chain: weak councils are the point of this helper
             );
     }
 
@@ -852,7 +1123,7 @@ contract DeployDormantLedgersTest is Test {
         (bool ok, bytes memory ret) = ARACHNID.call(abi.encodePacked(Salts.salt(GOV_TL_SALT), init));
         require(ok && ret.length == 20, "factory deploy failed");
         TimelockController tl = TimelockController(payable(address(bytes20(ret))));
-        MultisigProposer ms = _ceremonyMultisig(GOV_SALT, address(tl), govOwners, 3);
+        MultisigProposer ms = _ceremonyMultisig(GOV_SALT, address(tl), govOwners, 3, 14 days);
         address rogue = makeAddr("rogue");
         _grantAs(tl, tl.PROPOSER_ROLE(), rogue);
         _grantAs(tl, tl.EXECUTOR_ROLE(), rogue);
@@ -878,6 +1149,9 @@ contract DeployDormantLedgersTest is Test {
         _expectRevert(bytes("GOVERNANCE_TIMELOCK: role history does not start at the timelock's construction"));
         s.deployWith(SENDER, address(tl), address(ms), address(kyc), address(membership));
         assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
+        // The gate off the genesis profile (the 40204 gate would also flag the missing guardian
+        // veto first): the late window alone is a TIMELOCK-HOLDERS failure.
+        vm.chainId(1);
         CheckDeployedAdmins c = _gate();
         string memory book =
             s.bookJson(SENDER, address(tl), address(ms), DeployDormantLedgers.Deployed(address(0), address(0)));
@@ -889,7 +1163,7 @@ contract DeployDormantLedgersTest is Test {
     function test_full_window_finds_the_hidden_seat_of_a_factory_timelock() public {
         vm.chainId(40204);
         TimelockController tl = _ceremonyTimelock();
-        MultisigProposer ms = _ceremonyMultisig(GOV_SALT, address(tl), govOwners, 3);
+        MultisigProposer ms = _ceremonyMultisig(GOV_SALT, address(tl), govOwners, 3, 14 days);
         _grantAs(tl, tl.PROPOSER_ROLE(), makeAddr("rogue"));
         _grantCouncil(tl, address(ms));
         _finish(tl);
@@ -905,7 +1179,7 @@ contract DeployDormantLedgersTest is Test {
     /// its history starts. Refused even with exact holder sets.
     function test_plain_create_timelock_has_no_provable_construction() public {
         TimelockController tl = new TimelockController(48 hours, new address[](0), new address[](0), SENDER);
-        MultisigProposer ms = _ceremonyMultisig(GOV_SALT, address(tl), govOwners, 3);
+        MultisigProposer ms = _ceremonyMultisig(GOV_SALT, address(tl), govOwners, 3, 14 days);
         _grantCouncil(tl, address(ms));
         _finish(tl);
         HolderChecksWithHistory h = new HolderChecksWithHistory();
@@ -947,7 +1221,9 @@ contract DeployDormantLedgersTest is Test {
     function test_ceremony_timelocks_prove_their_construction() public {
         HolderChecksWithHistory h = new HolderChecksWithHistory();
         h.useArchive(archive);
-        assertEq(h.problem(gov.governanceTimelock, gov.governanceMultisig, new address[](0)), "");
+        address[] memory extra = new address[](1);
+        extra[0] = gov.guardianCanceller;
+        assertEq(h.problem(gov.governanceTimelock, gov.governanceMultisig, extra), "");
         assertEq(h.problem(gov.guardianTimelock, gov.guardianMultisig, new address[](0)), "");
     }
 
@@ -993,13 +1269,13 @@ contract DeployDormantLedgersTest is Test {
         s.deployWith(SENDER, gov.governanceTimelock, gov.governanceMultisig, address(kyc), address(membership));
     }
 
-    /// A weak (1 h, 2-of-3) council on a 40204 node is refused even when forge simulates chain 1.
+    /// A weak (4 h, 2-of-3) council on a 40204 node is refused even when forge simulates chain 1.
     function test_weak_council_cannot_skip_the_genesis_floor_by_chain_id() public {
-        DeployGenesisGovernance.Deployed memory weak = _council(2, 3, 1 hours);
+        DeployGenesisGovernance.Deployed memory weak = _council(2, 3, 4 hours);
         DormantWithNode s = new DormantWithNode();
         s.useArchive(archive);
         vm.chainId(40204);
-        _expectRevert(bytes("GOVERNANCE_TIMELOCK: minDelay below the 48 h genesis floor"));
+        _expectRevert(bytes("GOVERNANCE timelock: minDelay below the 48 h genesis floor"));
         s.deployWith(SENDER, weak.governanceTimelock, weak.governanceMultisig, address(kyc), address(membership));
         s.nodeReports(40204);
         vm.chainId(1);
@@ -1049,6 +1325,10 @@ contract SelfReportingForwarder {
         return false;
     }
 
+    function proposalTtl() external pure returns (uint256) {
+        return 14 days;
+    }
+
     /// The real control path: a single signature, no approvals.
     function forward(bytes calldata data) external returns (bytes memory ret) {
         require(msg.sender == signer, "not signer");
@@ -1089,5 +1369,29 @@ contract ForgedTimelockInit {
         assembly ("memory-safe") {
             sstore(slot, 1)
         }
+    }
+}
+
+/// Answers the MultisigProposer getters from immutables only (so its code can be etched over a
+/// real council's address and still report a chosen owner set / threshold / TTL).
+contract TtlLiar {
+    address public immutable timelock;
+    uint256 public immutable threshold;
+    uint256 public immutable proposalTtl;
+    address internal immutable o0;
+    address internal immutable o1;
+    address internal immutable o2;
+    address internal immutable o3;
+    address internal immutable o4;
+
+    constructor(address timelock_, address[] memory owners_, uint256 threshold_, uint256 ttl_) {
+        require(owners_.length == 5, "five owners");
+        (timelock, threshold, proposalTtl) = (timelock_, threshold_, ttl_);
+        (o0, o1, o2, o3, o4) = (owners_[0], owners_[1], owners_[2], owners_[3], owners_[4]);
+    }
+
+    function owners() external view returns (address[] memory o) {
+        o = new address[](5);
+        (o[0], o[1], o[2], o[3], o[4]) = (o0, o1, o2, o3, o4);
     }
 }
