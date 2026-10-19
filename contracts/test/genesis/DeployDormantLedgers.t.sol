@@ -21,6 +21,7 @@ import {
     HolderChecksWithHistory,
     HolderChecksLive
 } from "./RoleHistoryHarness.sol";
+import {DormantWithNode, GateWithNode} from "./NodeChainIdHarness.sol";
 
 /// @title DeployDormantLedgers.t: FederatedRoundLedger + PatronageLedger at genesis (C2 D9 / C4)
 contract DeployDormantLedgersTest is Test {
@@ -74,13 +75,13 @@ contract DeployDormantLedgersTest is Test {
     }
 
     function _dormant() internal returns (DeployDormantLedgers s) {
-        DormantWithHistory h = new DormantWithHistory();
+        DormantWithNode h = new DormantWithNode();
         h.useArchive(archive);
         s = h;
     }
 
     function _gate() internal returns (CheckDeployedAdmins c) {
-        GateWithHistory g = new GateWithHistory();
+        GateWithNode g = new GateWithNode();
         g.useArchive(archive);
         c = g;
     }
@@ -370,12 +371,28 @@ contract DeployDormantLedgersTest is Test {
     /// admin renounced: what an operator might pass as GOVERNANCE_TIMELOCK. The caller adds
     /// whatever extra seats it wants before `_finish`.
     function _handedTimelock() internal returns (TimelockController tl, MultisigProposer ms) {
-        tl = new TimelockController(48 hours, new address[](0), new address[](0), SENDER);
+        tl = _ceremonyTimelock();
         ms = _ceremonyMultisig(GOV_SALT, address(tl), govOwners, 3);
         _grantCouncil(tl, address(ms));
     }
 
     string internal constant GOV_SALT = "Genesis.GovernanceMultisig";
+    string internal constant GOV_TL_SALT = "Genesis.GovernanceTimelock";
+    uint256 internal timelockSeq;
+
+    /// A genuine OZ timelock deployed the way DeployGenesisGovernance deploys one: through the
+    /// Arachnid factory under the ceremony salt, admin = SENDER, no initial proposers / executors.
+    /// The delay is 48 h plus a per-test sequence number of seconds, so every call gets its own
+    /// CREATE2 address (the setUp ceremony already holds the exact-48 h one).
+    function _ceremonyTimelock() internal returns (TimelockController) {
+        uint256 delay = 48 hours + (++timelockSeq);
+        bytes memory init = abi.encodePacked(
+            type(TimelockController).creationCode, abi.encode(delay, new address[](0), new address[](0), SENDER)
+        );
+        (bool ok, bytes memory ret) = ARACHNID.call(abi.encodePacked(Salts.salt(GOV_TL_SALT), init));
+        require(ok && ret.length == 20, "factory deploy failed");
+        return TimelockController(payable(address(bytes20(ret))));
+    }
     string internal constant GRD_SALT = "Genesis.GuardianMultisig";
     address internal constant ARACHNID = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
 
@@ -562,7 +579,7 @@ contract DeployDormantLedgersTest is Test {
     /// A genuine 48 h OZ timelock whose sole proposer / executor / canceller is a single-signer
     /// forwarder that reports 3-of-5, fronts the timelock, and owns no deploy account.
     function _forwardedTimelock() internal returns (TimelockController tl, SelfReportingForwarder fwd) {
-        tl = new TimelockController(48 hours, new address[](0), new address[](0), SENDER);
+        tl = _ceremonyTimelock();
         fwd = new SelfReportingForwarder(address(tl), makeAddr("lone-signer"), govOwners);
         _grantCouncil(tl, address(fwd));
         _finish(tl);
@@ -581,8 +598,10 @@ contract DeployDormantLedgersTest is Test {
         assertEq(h.problem(address(tl), address(fwd), new address[](0)), "");
         // ...yet one key schedules on the timelock alone.
         bytes memory op = abi.encodeCall(TimelockController.updateDelay, (0));
-        vm.prank(makeAddr("lone-signer"));
-        fwd.forward(abi.encodeCall(TimelockController.schedule, (address(tl), 0, op, bytes32(0), bytes32(0), 48 hours)));
+        uint256 delay = tl.getMinDelay();
+        address signer = makeAddr("lone-signer");
+        vm.prank(signer);
+        fwd.forward(abi.encodeCall(TimelockController.schedule, (address(tl), 0, op, bytes32(0), bytes32(0), delay)));
 
         DeployDormantLedgers s = _dormant();
         uint64 nonceBefore = vm.getNonce(SENDER);
@@ -625,7 +644,7 @@ contract DeployDormantLedgersTest is Test {
         assertEq(a.multisigProblem(address(kyc), gov.governanceTimelock, GOV_SALT), "threshold() unreadable");
 
         vm.chainId(40204);
-        TimelockController tl = new TimelockController(48 hours, new address[](0), new address[](0), SENDER);
+        TimelockController tl = _ceremonyTimelock();
         // Genuine 3-of-5 code and args, plain CREATE (no ceremony provenance): refused.
         MultisigProposer plain = new MultisigProposer(address(tl), govOwners, 3);
         _grantCouncil(tl, address(plain));
@@ -636,7 +655,7 @@ contract DeployDormantLedgersTest is Test {
         s.deployWith(SENDER, address(tl), address(plain), address(kyc), address(membership));
 
         // Genuine code under the GUARDIAN salt, fronting the governance timelock: refused.
-        TimelockController tl2 = new TimelockController(48 hours, new address[](0), new address[](0), SENDER);
+        TimelockController tl2 = _ceremonyTimelock();
         MultisigProposer wrongSalt = _ceremonyMultisig(GRD_SALT, address(tl2), govOwners, 3);
         _grantCouncil(tl2, address(wrongSalt));
         _finish(tl2);
@@ -645,7 +664,7 @@ contract DeployDormantLedgersTest is Test {
 
         // Ceremony provenance with 2-of-5 args: authenticated, so its threshold is real, and the
         // genesis floor refuses it.
-        TimelockController tl3 = new TimelockController(48 hours, new address[](0), new address[](0), SENDER);
+        TimelockController tl3 = _ceremonyTimelock();
         MultisigProposer twoOfFive = _ceremonyMultisig(GOV_SALT, address(tl3), govOwners, 2);
         _grantCouncil(tl3, address(twoOfFive));
         _finish(tl3);
@@ -816,6 +835,181 @@ contract DeployDormantLedgersTest is Test {
         membership.grantRole(reg, relay);
         vm.stopPrank();
     }
+
+    // ---- chain#320 P1: the history window must provably start at the CREATE2 construction ----
+
+    /// The window starts after a hidden PROPOSER / EXECUTOR grant, and inside it the timelock
+    /// re-emits the pair its constructor ends with (RoleGranted(DEFAULT_ADMIN, timelock) and
+    /// MinDelayChange(0, d)). Every later event and the live state agree, so only the
+    /// construction provenance of the first event refuses it.
+    function test_late_window_with_a_reemitted_construction_pair_is_refused() public {
+        vm.chainId(40204);
+        vm.etch(P256_VERIFIER, hex"600160005260206000f3");
+        archive.absorb();
+        bytes memory init = abi.encodePacked(
+            type(TimelockController).creationCode, abi.encode(0, new address[](0), new address[](0), SENDER)
+        );
+        (bool ok, bytes memory ret) = ARACHNID.call(abi.encodePacked(Salts.salt(GOV_TL_SALT), init));
+        require(ok && ret.length == 20, "factory deploy failed");
+        TimelockController tl = TimelockController(payable(address(bytes20(ret))));
+        MultisigProposer ms = _ceremonyMultisig(GOV_SALT, address(tl), govOwners, 3);
+        address rogue = makeAddr("rogue");
+        _grantAs(tl, tl.PROPOSER_ROLE(), rogue);
+        _grantAs(tl, tl.EXECUTOR_ROLE(), rogue);
+        bytes32 adminRole = tl.DEFAULT_ADMIN_ROLE();
+        vm.prank(SENDER);
+        tl.revokeRole(adminRole, address(tl));
+        vm.getRecordedLogs(); // ---- the window (a late TIMELOCK_HISTORY_FROM_BLOCK) starts here ----
+        _grantAs(tl, adminRole, address(tl)); // RoleGranted(DEFAULT_ADMIN, timelock)
+        vm.prank(address(tl));
+        tl.updateDelay(48 hours); // MinDelayChange(0, 48 h)
+        _grantCouncil(tl, address(ms));
+        _finish(tl);
+        assertTrue(tl.hasRole(tl.PROPOSER_ROLE(), rogue) && tl.hasRole(tl.EXECUTOR_ROLE(), rogue), "hidden seat");
+
+        HolderChecksWithHistory h = new HolderChecksWithHistory();
+        h.useArchive(archive);
+        assertEq(
+            h.problem(address(tl), address(ms), new address[](0)),
+            "role history does not start at the timelock's construction"
+        );
+        DeployDormantLedgers s = _dormant();
+        uint64 nonceBefore = vm.getNonce(SENDER);
+        _expectRevert(bytes("GOVERNANCE_TIMELOCK: role history does not start at the timelock's construction"));
+        s.deployWith(SENDER, address(tl), address(ms), address(kyc), address(membership));
+        assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
+        CheckDeployedAdmins c = _gate();
+        string memory book =
+            s.bookJson(SENDER, address(tl), address(ms), DeployDormantLedgers.Deployed(address(0), address(0)));
+        _expectRevert(bytes("CheckDeployedAdmins: a timelock's role holders are not exactly its council (see log)"));
+        c.check(book, false);
+    }
+
+    /// The same timelock with the whole history: the hidden seat is found.
+    function test_full_window_finds_the_hidden_seat_of_a_factory_timelock() public {
+        vm.chainId(40204);
+        TimelockController tl = _ceremonyTimelock();
+        MultisigProposer ms = _ceremonyMultisig(GOV_SALT, address(tl), govOwners, 3);
+        _grantAs(tl, tl.PROPOSER_ROLE(), makeAddr("rogue"));
+        _grantCouncil(tl, address(ms));
+        _finish(tl);
+        HolderChecksWithHistory h = new HolderChecksWithHistory();
+        h.useArchive(archive);
+        assertEq(
+            h.problem(address(tl), address(ms), new address[](0)), "PROPOSER_ROLE holders are not exactly the multisig"
+        );
+    }
+
+    /// A genuine OZ timelock built with plain CREATE (not through the ceremony's factory path):
+    /// its first self-admin grant was not made by the CREATE2 factory, so nothing proves where
+    /// its history starts. Refused even with exact holder sets.
+    function test_plain_create_timelock_has_no_provable_construction() public {
+        TimelockController tl = new TimelockController(48 hours, new address[](0), new address[](0), SENDER);
+        MultisigProposer ms = _ceremonyMultisig(GOV_SALT, address(tl), govOwners, 3);
+        _grantCouncil(tl, address(ms));
+        _finish(tl);
+        HolderChecksWithHistory h = new HolderChecksWithHistory();
+        h.useArchive(archive);
+        assertEq(
+            h.problem(address(tl), address(ms), new address[](0)),
+            "role history does not start at the timelock's construction"
+        );
+    }
+
+    /// Custom init code run through the factory under the ceremony salt: it emits a perfect
+    /// constructor-shaped history (sender = factory), silently stores a hidden PROPOSER, and
+    /// returns genuine TimelockController runtime code. The runtime-code check passes and the
+    /// replay agrees with every named account; the CREATE2 rebuild of the constructor arguments
+    /// does not reproduce its address, so it is refused.
+    function test_forged_constructor_events_through_the_factory_are_refused() public {
+        address council = makeAddr("council");
+        address hidden = makeAddr("hidden");
+        bytes memory init = abi.encodePacked(
+            type(ForgedTimelockInit).creationCode,
+            abi.encode(type(TimelockController).runtimeCode, council, hidden, uint256(48 hours))
+        );
+        (bool ok, bytes memory ret) = ARACHNID.call(abi.encodePacked(Salts.salt(GOV_TL_SALT), init));
+        require(ok && ret.length == 20, "factory deploy failed");
+        TimelockController tl = TimelockController(payable(address(bytes20(ret))));
+        assertEq(address(tl).codehash, keccak256(type(TimelockController).runtimeCode), "genuine runtime");
+        assertTrue(tl.hasRole(tl.PROPOSER_ROLE(), hidden), "hidden seat, never logged");
+        assertTrue(tl.hasRole(tl.DEFAULT_ADMIN_ROLE(), address(tl)));
+        assertEq(tl.getMinDelay(), 48 hours);
+        HolderChecksWithHistory h = new HolderChecksWithHistory();
+        h.useArchive(archive);
+        assertEq(
+            h.problem(address(tl), council, new address[](0)),
+            "role history: the timelock is not the ceremony's CREATE2 TimelockController for its creation events"
+        );
+    }
+
+    /// The setUp ceremony's councils are rebuilt from their creation events under both salts.
+    function test_ceremony_timelocks_prove_their_construction() public {
+        HolderChecksWithHistory h = new HolderChecksWithHistory();
+        h.useArchive(archive);
+        assertEq(h.problem(gov.governanceTimelock, gov.governanceMultisig, new address[](0)), "");
+        assertEq(h.problem(gov.guardianTimelock, gov.guardianMultisig, new address[](0)), "");
+    }
+
+    // ---- chain#320 P1 (b): the profile follows the node's chain id, not forge's ----
+
+    function test_simulated_chain_id_must_match_the_node() public {
+        DormantWithNode s = new DormantWithNode();
+        s.useArchive(archive);
+        s.nodeReports(40204);
+        vm.chainId(1); // what --chain-id 1 / --chain 1 / FOUNDRY_CHAIN_ID=1 give against a 40204 node
+        uint64 nonceBefore = vm.getNonce(SENDER);
+        _expectRevert(
+            bytes(
+                "chain id mismatch: node reports 40204, forge simulates 1 (drop --chain-id / --chain / FOUNDRY_CHAIN_ID)"
+            )
+        );
+        s.deployWith(SENDER, gov.governanceTimelock, gov.governanceMultisig, address(kyc), address(membership));
+        assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
+
+        GateWithNode g = new GateWithNode();
+        g.useArchive(archive);
+        g.nodeReports(40204);
+        string memory book = s.bookJson(
+            SENDER,
+            gov.governanceTimelock,
+            gov.governanceMultisig,
+            DeployDormantLedgers.Deployed(address(0), address(0))
+        );
+        _expectRevert(
+            bytes(
+                "chain id mismatch: node reports 40204, forge simulates 1 (drop --chain-id / --chain / FOUNDRY_CHAIN_ID)"
+            )
+        );
+        g.check(book, false);
+    }
+
+    function test_genesis_profile_needs_a_node() public {
+        DormantWithNode s = new DormantWithNode();
+        s.useArchive(archive);
+        s.noNode();
+        vm.chainId(40204);
+        _expectRevert(bytes("genesis profile needs a live node: run with --rpc-url (eth_chainId unavailable)"));
+        s.deployWith(SENDER, gov.governanceTimelock, gov.governanceMultisig, address(kyc), address(membership));
+    }
+
+    /// A weak (1 h, 2-of-3) council on a 40204 node is refused even when forge simulates chain 1.
+    function test_weak_council_cannot_skip_the_genesis_floor_by_chain_id() public {
+        DeployGenesisGovernance.Deployed memory weak = _council(2, 3, 1 hours);
+        DormantWithNode s = new DormantWithNode();
+        s.useArchive(archive);
+        vm.chainId(40204);
+        _expectRevert(bytes("GOVERNANCE_TIMELOCK: minDelay below the 48 h genesis floor"));
+        s.deployWith(SENDER, weak.governanceTimelock, weak.governanceMultisig, address(kyc), address(membership));
+        s.nodeReports(40204);
+        vm.chainId(1);
+        _expectRevert(
+            bytes(
+                "chain id mismatch: node reports 40204, forge simulates 1 (drop --chain-id / --chain / FOUNDRY_CHAIN_ID)"
+            )
+        );
+        s.deployWith(SENDER, weak.governanceTimelock, weak.governanceMultisig, address(kyc), address(membership));
+    }
 }
 
 contract AdminChecksHarness is AdminChecks {
@@ -861,5 +1055,39 @@ contract SelfReportingForwarder {
         bool ok;
         (ok, ret) = timelock.call(data);
         require(ok, "forward failed");
+    }
+}
+
+/// Init code that imitates a TimelockController construction (test only): constructor-shaped
+/// events with the factory as `sender`, a silently stored extra PROPOSER, then genuine
+/// TimelockController runtime code. OZ v5 storage: AccessControl `_roles` at slot 0
+/// (RoleData.hasRole mapping first), TimelockController `_minDelay` at slot 2.
+contract ForgedTimelockInit {
+    event RoleGranted(bytes32 indexed role, address indexed account, address indexed sender);
+    event MinDelayChange(uint256 oldDuration, uint256 newDuration);
+
+    constructor(bytes memory runtime, address council, address hidden, uint256 delay) {
+        _set(bytes32(0), address(this));
+        emit RoleGranted(bytes32(0), address(this), msg.sender);
+        bytes32[3] memory roles = [keccak256("PROPOSER_ROLE"), keccak256("CANCELLER_ROLE"), keccak256("EXECUTOR_ROLE")];
+        for (uint256 i = 0; i < 3; i++) {
+            _set(roles[i], council);
+            emit RoleGranted(roles[i], council, msg.sender);
+        }
+        _set(roles[0], hidden); // no event
+        assembly ("memory-safe") {
+            sstore(2, delay)
+        }
+        emit MinDelayChange(0, delay);
+        assembly ("memory-safe") {
+            return(add(runtime, 32), mload(runtime))
+        }
+    }
+
+    function _set(bytes32 role, address account) private {
+        bytes32 slot = keccak256(abi.encode(account, keccak256(abi.encode(role, uint256(0)))));
+        assembly ("memory-safe") {
+            sstore(slot, 1)
+        }
     }
 }

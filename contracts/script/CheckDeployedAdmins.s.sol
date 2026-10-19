@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import "forge-std/Script.sol";
 import "./lib/AdminChecks.sol";
+import "./lib/GenesisProfile.sol";
 import {P256} from "../src/aa/lib/webauthn/P256.sol";
 
 /// @title CheckDeployedAdmins — read-only post-deploy gate (PBA-L2-002, PBA-L2-011)
@@ -46,7 +47,7 @@ import {P256} from "../src/aa/lib/webauthn/P256.sol";
 ///         missing, ~20 NO-CODE -> FAIL. After the PBA-L2-002 redeploy and
 ///         DeployP256Verifier, run with REQUIRE_ALL_CODE=true: 0 FACTORY-ADMIN,
 ///         VERIFIER present, 0 NO-CODE -> PASS (reconcile the book first).
-contract CheckDeployedAdmins is Script, AdminChecks {
+contract CheckDeployedAdmins is GenesisProfile {
     uint256 public factoryAdmin;
     uint256 public deployerAdmin;
     uint256 public noCode;
@@ -75,6 +76,8 @@ contract CheckDeployedAdmins is Script, AdminChecks {
     ///         Env: EXTRA_ADDRESS_BOOKS=path1,path2. Each extra must name the same
     ///         `.deployer` as the main book, so the DEPLOYER-ADMIN class covers them too.
     function checkAll(string memory json, string[] memory extras, bool requireAllCode) public {
+        // A simulated chain id that differs from the node's reverts (GenesisProfile).
+        _resolveChainProfile(false);
         address deployer = vm.parseJsonAddress(json, ".deployer");
         _sweep(json, ".contracts", deployer);
         _sweep(json, ".aaStack", deployer);

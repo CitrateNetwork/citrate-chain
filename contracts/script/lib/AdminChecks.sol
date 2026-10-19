@@ -168,6 +168,10 @@ abstract contract AdminChecks {
         uint8 kind;
         bytes32 role;
         address account;
+        /// RoleGranted / RoleRevoked `sender` (topic 3): the caller that made the change.
+        address sender;
+        /// HISTORY_DELAY_INIT only: the delay the constructor set (`MinDelayChange(0, d)`).
+        uint256 delay;
         bytes32 txHash;
     }
 
@@ -182,6 +186,8 @@ abstract contract AdminChecks {
     /// @notice The timelock's role history, oldest first, from the node behind the active fork.
     ///         Pages `eth_getLogs` in windows of at most ROLE_HISTORY_MAX_WINDOW blocks from
     ///         TIMELOCK_HISTORY_FROM_BLOCK (default 0, i.e. the whole chain) to the fork head.
+    ///         FROM_BLOCK is only a speed-up and is not trusted: `_timelockHolders` refuses any
+    ///         window whose first event is not the timelock's CREATE2 construction.
     ///         `ok == false` (with the reason) when any page cannot be fetched or is malformed.
     /// @dev Virtual only so `forge test` (which has no node) can supply recorded logs;
     ///      scripts never override it.
@@ -243,12 +249,13 @@ abstract contract AdminChecks {
         if (topics.length == 4 && (topics[0] == ROLE_GRANTED_SIG || topics[0] == ROLE_REVOKED_SIG)) {
             e.kind = topics[0] == ROLE_GRANTED_SIG ? HISTORY_GRANT : HISTORY_REVOKE;
             (e.role, e.account, e.txHash) = (topics[1], address(uint160(uint256(topics[2]))), txHash);
+            e.sender = address(uint160(uint256(topics[3])));
             return (true, e);
         }
         if (topics.length == 1 && topics[0] == MIN_DELAY_CHANGE_SIG && data.length == 64) {
-            (uint256 oldDelay,) = abi.decode(data, (uint256, uint256));
+            (uint256 oldDelay, uint256 newDelay) = abi.decode(data, (uint256, uint256));
             if (oldDelay == 0) {
-                (e.kind, e.txHash) = (HISTORY_DELAY_INIT, txHash);
+                (e.kind, e.delay, e.txHash) = (HISTORY_DELAY_INIT, newDelay, txHash);
                 return (true, e);
             }
         }
@@ -274,7 +281,9 @@ abstract contract AdminChecks {
 
     /// @notice Replay `events` into the live holders of the four timelock roles. Empty `problem`
     ///         when the set is established: the history starts with the constructor's
-    ///         self-administration grant, the same transaction emitted `MinDelayChange(0, d)`,
+    ///         self-administration grant (made by the CREATE2 factory, and the constructor's
+    ///         events rebuild the timelock's ceremony CREATE2 address: `_timelockCreationProblem`),
+    ///         the same transaction emitted `MinDelayChange(0, d)`,
     ///         and every account the history names reads back from `hasRole` exactly as the
     ///         replay says (a missing grant or revoke shows up as a disagreement).
     function _timelockHolders(address timelock, RoleEvent[] memory events)
@@ -284,9 +293,12 @@ abstract contract AdminChecks {
     {
         if (events.length == 0) return ("role history is empty", h);
         RoleEvent memory first = events[0];
-        if (first.kind != HISTORY_GRANT || first.role != DEFAULT_ADMIN_ROLE || first.account != timelock) {
-            return ("role history does not start at the timelock's construction", h);
-        }
+        if (
+            first.kind != HISTORY_GRANT || first.role != DEFAULT_ADMIN_ROLE || first.account != timelock
+                || first.sender != ARACHNID_FACTORY
+        ) return ("role history does not start at the timelock's construction", h);
+        string memory creation = _timelockCreationProblem(timelock, events);
+        if (bytes(creation).length != 0) return (creation, h);
         bool constructed;
         uint256 n;
         bytes32[] memory roles = new bytes32[](events.length);
@@ -327,6 +339,101 @@ abstract contract AdminChecks {
             dst[counts[slot]++] = accounts[j];
         }
         return ("", h);
+    }
+
+    // ---- Where the history starts: the timelock's own CREATE2 construction (chain#320 P1) ----
+    //
+    // A replay is only complete if its window covers the timelock's construction. That used to
+    // be taken from the first in-window `RoleGranted(DEFAULT_ADMIN_ROLE, timelock)` plus a
+    // `MinDelayChange(0, d)` in the same transaction, a pair a deployer-controlled timelock can
+    // emit again later; a window that starts after an earlier grant then never sees it. Nor can
+    // the window be checked against state at a block (`eth_getCode(timelock, from - 1)`): the
+    // Citrate node answers eth_getCode with the latest state whatever the block tag.
+    //
+    // The check therefore uses nothing but the logs. The first in-window event must be the
+    // self-admin grant made BY THE CREATE2 FACTORY (topic `sender` == the Arachnid deployer),
+    // and the constructor arguments rebuilt from that transaction's events must reproduce the
+    // timelock's own address under a ceremony salt:
+    //   address == keccak256(0xff ++ factory ++ Salts.salt(name) ++
+    //                        keccak256(TimelockController.creationCode ++ abi.encode(args)))[12:]
+    // That address commits to OZ TimelockController's genuine init code with those arguments,
+    // so this constructor (and no other code: the timelock cannot self-destruct) ran there, and
+    // its events are real. Inside the genuine contract a RoleGranted carries the factory as
+    // `sender` only from the constructor: every later grant's sender is its caller, and the
+    // Arachnid deployer (its runtime is checked) calls nothing, it only runs CREATE2. So the
+    // first in-window event can only be the construction itself, and a window that starts after
+    // it fails closed, whatever TIMELOCK_HISTORY_FROM_BLOCK says. It holds on anvil and on the
+    // Citrate node alike, since both serve eth_getLogs topics, transaction hashes and order.
+
+    /// Runtime code of the Arachnid deterministic-deployment proxy (0x4e59…956C).
+    bytes32 internal constant ARACHNID_FACTORY_CODEHASH = keccak256(
+        hex"7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe03601600081602082378035828234f58015156039578182fd5b8082525050506014600cf3"
+    );
+
+    /// Salts DeployGenesisGovernance gives its timelocks ("Genesis." + book name).
+    function _ceremonyTimelockSalts() internal pure returns (string[2] memory) {
+        return ["Genesis.GovernanceTimelock", "Genesis.GuardianTimelock"];
+    }
+
+    /// @notice Empty when `events` (oldest first, `events[0]` the factory-made self-admin grant)
+    ///         open with the construction of `timelock`: the OZ TimelockController constructor's
+    ///         events, all in one transaction and all made by the CREATE2 factory, rebuild
+    ///         (minDelay, proposers, executors, admin) such that the ceremony's CREATE2 address
+    ///         for them is `timelock`. See the section comment for why this proves the window
+    ///         starts at the construction.
+    function _timelockCreationProblem(address timelock, RoleEvent[] memory events)
+        internal
+        view
+        returns (string memory)
+    {
+        if (ARACHNID_FACTORY.codehash != ARACHNID_FACTORY_CODEHASH) {
+            return "role history: no Arachnid CREATE2 factory at its canonical address";
+        }
+        // OZ TimelockController(minDelay, proposers, executors, admin) emits, in order:
+        //   RoleGranted(ADMIN, this); [RoleGranted(ADMIN, admin)]; per proposer RoleGranted(PROPOSER, p)
+        //   then RoleGranted(CANCELLER, p); per executor RoleGranted(EXECUTOR, e); MinDelayChange(0, minDelay).
+        bytes32 creationTx = events[0].txHash;
+        address admin;
+        uint256 nP;
+        uint256 nE;
+        address[] memory proposers = new address[](events.length);
+        address[] memory executors = new address[](events.length);
+        bool done;
+        uint256 minDelay;
+        for (uint256 i = 1; i < events.length && !done; i++) {
+            RoleEvent memory e = events[i];
+            if (e.txHash != creationTx) break;
+            if (e.kind == HISTORY_DELAY_INIT) {
+                (done, minDelay) = (true, e.delay);
+            } else if (e.kind != HISTORY_GRANT || e.sender != ARACHNID_FACTORY) {
+                return "role history: the timelock's creation transaction is not its constructor alone";
+            } else if (e.role == DEFAULT_ADMIN_ROLE && i == 1) {
+                admin = e.account;
+            } else if (e.role == TIMELOCK_PROPOSER_ROLE && nE == 0) {
+                proposers[nP++] = e.account;
+            } else if (
+                e.role == TIMELOCK_CANCELLER_ROLE && nE == 0 && nP != 0 && proposers[nP - 1] == e.account
+                    && events[i - 1].role == TIMELOCK_PROPOSER_ROLE
+            ) {
+                continue;
+            } else if (e.role == TIMELOCK_EXECUTOR_ROLE) {
+                executors[nE++] = e.account;
+            } else {
+                return "role history: the timelock's creation transaction is not its constructor alone";
+            }
+        }
+        if (!done) return "role history: no constructor MinDelayChange(0, d) in the creation transaction";
+        assembly ("memory-safe") {
+            mstore(proposers, nP)
+            mstore(executors, nE)
+        }
+        bytes memory init =
+            abi.encodePacked(type(TimelockController).creationCode, abi.encode(minDelay, proposers, executors, admin));
+        string[2] memory salts = _ceremonyTimelockSalts();
+        for (uint256 k = 0; k < salts.length; k++) {
+            if (_ceremonyCreate2Address(salts[k], init) == timelock) return "";
+        }
+        return "role history: the timelock is not the ceremony's CREATE2 TimelockController for its creation events";
     }
 
     function _roleSlot(bytes32 role) private pure returns (uint256) {

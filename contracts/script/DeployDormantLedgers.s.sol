@@ -7,6 +7,7 @@ import "./Salts.sol";
 import "./lib/AdminChecks.sol";
 import "./lib/Create2Deploy.sol";
 import "./lib/GenesisBook.sol";
+import "./lib/GenesisProfile.sol";
 import {FederatedRoundLedger} from "../src/FederatedRoundLedger.sol";
 import {PatronageLedger} from "../src/coop/PatronageLedger.sol";
 import {MultisigProposer} from "../src/genesis/MultisigProposer.sol";
@@ -38,7 +39,9 @@ import {MultisigProposer} from "../src/genesis/MultisigProposer.sol";
 ///           of {configured deployer, actual broadcaster, CREATE2 factory} holds
 ///           DEFAULT_ADMIN or a timelock role. Neither may they be multisig owners. Floors:
 ///             genesis profile (chain 40204, owner decision): delay >= 48 h AND the council
-///               is at least 3-of-5. Selected by chain id; there is no override.
+///               is at least 3-of-5. Selected by the chain id the NODE reports, which must
+///               equal forge's simulated id (GenesisProfile `_resolveChainProfile`), so
+///               --chain-id / --chain / FOUNDRY_CHAIN_ID cannot select another profile; no override.
 ///             rehearsal (any other chain): delay >= 1 h (DeployGenesisGovernance's floor).
 ///           Complete holder sets, not only named accounts: the timelock must run this
 ///           build's OZ TimelockController code, be its own SOLE DEFAULT_ADMIN, and have the
@@ -69,16 +72,13 @@ import {MultisigProposer} from "../src/genesis/MultisigProposer.sol";
 ///         reads; both immutable, both must have code), DORMANT_LEDGERS_OUT, and
 ///         CEREMONY_DEPLOYER_ADDRESS or DEPLOYER_ADDRESS (must equal the forge
 ///         broadcast signer; enforced). Needs --rpc-url (the role history comes from the
-///         node). Optional: TIMELOCK_HISTORY_FROM_BLOCK (a block at or before the timelock's
-///         creation; a later one fails the construction check), TIMELOCK_HISTORY_WINDOW (1..1000).
-contract DeployDormantLedgers is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook {
+///         node). Optional: TIMELOCK_HISTORY_FROM_BLOCK (a speed-up only: a block at or before the
+///         timelock's creation; a later one fails closed, because the first event replayed must be
+///         the factory-made construction, AdminChecks `_timelockCreationProblem`),
+///         TIMELOCK_HISTORY_WINDOW (1..1000).
+contract DeployDormantLedgers is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook, GenesisProfile {
     string internal constant FRL = "FederatedRoundLedger";
 
-    /// Genesis profile: the 40204 GOVERNANCE council is at least 3-of-5 behind a 48 h delay.
-    uint256 public constant GENESIS_CHAIN_ID = 40204;
-    uint256 public constant GENESIS_GOV_MIN_DELAY = 48 hours;
-    uint256 public constant GENESIS_GOV_MIN_THRESHOLD = 3;
-    uint256 public constant GENESIS_GOV_MIN_OWNERS = 5;
     /// Rehearsal chains: same floor as DeployGenesisGovernance.MIN_DELAY_FLOOR.
     uint256 public constant REHEARSAL_GOV_MIN_DELAY = 1 hours;
 
@@ -106,12 +106,15 @@ contract DeployDormantLedgers is ScriptEnv, AdminChecks, Create2Deploy, GenesisB
         require(deployer != address(0), "deployer must be set");
         require(governance != deployer, "GOVERNANCE_TIMELOCK cannot be the deployer");
         require(_isTimelock(governance), "GOVERNANCE_TIMELOCK is not a TimelockController");
+        // Node chain id vs simulated chain id, before anything else (GenesisProfile): the
+        // genesis floors are chosen by the chain the node reports, not by forge's --chain-id.
+        bool genesis = _resolveChainProfile(false).genesis;
         // Script-contract addresses are simulation-only (forge refuses `address(this)` on a
         // script run path), so the deploy accounts are the configured deployer and, below, the
         // actual broadcaster.
         address[] memory accounts = new address[](1);
         accounts[0] = deployer;
-        _assertGovernanceCouncil(governance, council, accounts);
+        _assertGovernanceCouncil(governance, council, accounts, genesis);
         require(kyc.code.length != 0, "PATRONAGE_KYC_REGISTRY has no code on this chain");
         require(membership.code.length != 0, "PATRONAGE_MEMBERSHIP has no code on this chain");
 
@@ -134,7 +137,7 @@ contract DeployDormantLedgers is ScriptEnv, AdminChecks, Create2Deploy, GenesisB
         _assertDormant(d, deployer, broadcaster, governance, kyc, membership);
         address[] memory deployAccounts = new address[](2);
         (deployAccounts[0], deployAccounts[1]) = (deployer, broadcaster);
-        _assertGovernanceCouncil(governance, council, deployAccounts);
+        _assertGovernanceCouncil(governance, council, deployAccounts, genesis);
         console.log("FederatedRoundLedger:", d.federatedRoundLedger);
         console.log("PatronageLedger     :", d.patronageLedger);
     }
@@ -162,7 +165,9 @@ contract DeployDormantLedgers is ScriptEnv, AdminChecks, Create2Deploy, GenesisB
     /// @notice Revert unless `governance` is a self-administered timelock run only by `council`
     ///         (a MultisigProposer fronting it), at or above this profile's floors, on which no
     ///         address in `accounts` (the deploy accounts) holds an admin slot or governing seat.
-    function _assertGovernanceCouncil(address governance, address council, address[] memory accounts) internal {
+    function _assertGovernanceCouncil(address governance, address council, address[] memory accounts, bool genesis)
+        internal
+    {
         string memory tl = "GOVERNANCE_TIMELOCK";
         string memory ms = "GOVERNANCE_MULTISIG";
         require(council.code.length != 0, "GOVERNANCE_MULTISIG has no code on this chain");
@@ -178,7 +183,6 @@ contract DeployDormantLedgers is ScriptEnv, AdminChecks, Create2Deploy, GenesisB
             _assertNoDeployerAdmin(ms, council, accounts[i]);
         }
 
-        bool genesis = block.chainid == GENESIS_CHAIN_ID;
         uint256 delay = _timelockMinDelay(governance);
         require(
             delay >= (genesis ? GENESIS_GOV_MIN_DELAY : REHEARSAL_GOV_MIN_DELAY),

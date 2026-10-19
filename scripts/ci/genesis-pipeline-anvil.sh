@@ -5,6 +5,13 @@
 #   DeployGenesisGovernance -> (KYCRegistry + MembershipSBT stand-ins) -> DeployDormantLedgers
 #   -> CheckDeployedAdmins (over both ceremony books), which must report 0 failures.
 #
+# Then the chain#320 negatives, each of which must be refused with nothing sent:
+#   - forge simulating another chain id than the 40204 node (--chain-id 1): DeployGenesisGovernance,
+#     DeployDormantLedgers and the gate;
+#   - a deployer-controlled GOVERNANCE timelock with a hidden PROPOSER/EXECUTOR and
+#     TIMELOCK_HISTORY_FROM_BLOCK past that grant (plus a re-emitted constructor pair), for
+#     DeployDormantLedgers (window and full history) and the gate.
+#
 # Catches what `forge test` cannot: forge refusing a script run path (e.g. `address(this)` in a
 # script contract), broadcast-vs-simulation differences, and the role history read through a real
 # node's eth_getLogs.
@@ -87,8 +94,92 @@ run_script script/DeployDormantLedgers.s.sol
 # The gate requires the P-256 verifier the passkey validator hard-codes; anvil has none.
 cast rpc --rpc-url "$RPC" anvil_setCode "$P256_VERIFIER" 0x600160005260206000f3 >/dev/null
 
+GATE_ENV=(ADDRESS_BOOK="$GENESIS_GOVERNANCE_OUT" EXTRA_ADDRESS_BOOKS="$DORMANT_LEDGERS_OUT" REQUIRE_ALL_CODE=true)
+gate() { # <log> [extra forge args...]: run the read-only gate; returns forge's status
+  local log="$1"
+  shift
+  env "${GATE_ENV[@]}" forge script script/CheckDeployedAdmins.s.sol --rpc-url "$RPC" "$@" >"$log" 2>&1
+}
+fail() {
+  echo "genesis-pipeline-anvil: $*" >&2
+  exit 1
+}
+
 echo "=== forge script CheckDeployedAdmins (read-only) ==="
-ADDRESS_BOOK="$GENESIS_GOVERNANCE_OUT" EXTRA_ADDRESS_BOOKS="$DORMANT_LEDGERS_OUT" REQUIRE_ALL_CODE=true \
-  forge script script/CheckDeployedAdmins.s.sol --rpc-url "$RPC" 2>&1 | tee "$OUT/gate.log" | grep -E "failures|NO-CODE|VERIFIER|FACTORY|DEPLOYER|TIMELOCK|Error|revert" || true
-grep -q "Script ran successfully" "$OUT/gate.log" || { echo "genesis-pipeline-anvil: gate FAILED" >&2; exit 1; }
-echo "genesis-pipeline-anvil: PASS (DeployGenesisGovernance -> DeployDormantLedgers -> CheckDeployedAdmins on anvil 40204)"
+gate "$OUT/gate.log" || true
+grep -E "failures|NO-CODE|VERIFIER|FACTORY|DEPLOYER|TIMELOCK|Error|revert" "$OUT/gate.log" | grep -v "\[" || true
+grep -q "Script ran successfully" "$OUT/gate.log" || fail "gate FAILED"
+for class in "FACTORY-ADMIN" "DEPLOYER-ADMIN" "TIMELOCK-HOLDERS"; do
+  grep -qE "^ *${class} failures: 0$" "$OUT/gate.log" || fail "gate: ${class} failures not 0"
+done
+echo "genesis-pipeline-anvil: pipeline PASS (0 FACTORY-ADMIN / DEPLOYER-ADMIN / TIMELOCK-HOLDERS)"
+
+# ---- chain#320 negatives (each must be refused) ----
+nonce() { cast nonce --rpc-url "$RPC" "$1"; }
+MISMATCH="chain id mismatch: node reports 40204, forge simulates 1"
+
+echo "=== negative: forge simulating chain 1 against the 40204 node (--chain-id 1) ==="
+before="$(nonce "$DEPLOYER")"
+for s in DeployGenesisGovernance DeployDormantLedgers; do
+  if forge script "script/$s.s.sol" --rpc-url "$RPC" --broadcast --private-key "$KEY" --chain-id 1 \
+    >"$OUT/neg-chainid-$s.log" 2>&1; then fail "$s ran with --chain-id 1"; fi
+  grep -q "$MISMATCH" "$OUT/neg-chainid-$s.log" || fail "$s --chain-id 1: not refused on the chain id"
+done
+[ "$(nonce "$DEPLOYER")" = "$before" ] || fail "a --chain-id 1 run sent a transaction"
+if gate "$OUT/neg-chainid-gate.log" --chain-id 1; then fail "gate ran with --chain-id 1"; fi
+grep -q "$MISMATCH" "$OUT/neg-chainid-gate.log" || fail "gate --chain-id 1: not refused on the chain id"
+echo "refused (DeployGenesisGovernance, DeployDormantLedgers, gate), nothing sent"
+
+# A deployer-controlled GOVERNANCE timelock (test/genesis/anvil/LateHistoryWindowFixture.s.sol):
+# ceremony-salt CREATE2 timelock + CREATE2-correct 3-of-5 council, 48 h, self-administered, no
+# deploy-account seat, but ROGUE keeps PROPOSER and EXECUTOR from a grant made BEFORE
+# LATE_FROM; after LATE_FROM the timelock re-emits its constructor's closing pair
+# (RoleGranted(DEFAULT_ADMIN, timelock) + MinDelayChange(0, 48 h)) in one transaction.
+echo "=== negative: hidden PROPOSER/EXECUTOR with TIMELOCK_HISTORY_FROM_BLOCK past the grant ==="
+FKEY="$(cast wallet private-key "$MNEMONIC" 1)"
+FADMIN="$(cast wallet address --private-key "$FKEY")"
+ROGUE=0x000000000000000000000000000000000000bAd2
+fixture() { # <stage>
+  FIXTURE_STAGE="$1" FIXTURE_ADMIN="$FADMIN" FIXTURE_ROGUE="$ROGUE" FIXTURE_OUT="$OUT_REL/late.json" \
+    FIXTURE_HELPER="${HELPER:-0x0000000000000000000000000000000000000000}" \
+    forge script test/genesis/anvil/LateHistoryWindowFixture.s.sol --tc LateHistoryWindowFixture --rpc-url "$RPC" --broadcast \
+    --private-key "$FKEY" --slow -q >"$OUT/fixture-$1.log" 2>&1 || { cat "$OUT/fixture-$1.log" >&2; fail "fixture stage $1"; }
+}
+fixture 1
+LATE_TL="$(sed -n 's/.*"timelock":"\(0x[0-9a-fA-F]*\)".*/\1/p' "$OUT/late.json")"
+LATE_MS="$(sed -n 's/.*"multisig":"\(0x[0-9a-fA-F]*\)".*/\1/p' "$OUT/late.json")"
+HELPER="$(sed -n 's/.*"helper":"\(0x[0-9a-fA-F]*\)".*/\1/p' "$OUT/late.json")"
+LATE_FROM=$(($(cast block-number --rpc-url "$RPC") + 1))
+fixture 2
+PROPOSER_ROLE="$(cast keccak PROPOSER_ROLE)"
+EXECUTOR_ROLE="$(cast keccak EXECUTOR_ROLE)"
+[ "$(cast call --rpc-url "$RPC" "$LATE_TL" 'hasRole(bytes32,address)(bool)' "$PROPOSER_ROLE" "$ROGUE")" = true ] &&
+  [ "$(cast call --rpc-url "$RPC" "$LATE_TL" 'hasRole(bytes32,address)(bool)' "$EXECUTOR_ROLE" "$ROGUE")" = true ] ||
+  fail "fixture: ROGUE does not hold the hidden seats"
+[ "$(cast call --rpc-url "$RPC" "$LATE_TL" 'getMinDelay()(uint256)' | cut -d' ' -f1)" = 172800 ] || fail "fixture: delay is not 48 h"
+late_dormant() { # <log> [env...]: DeployDormantLedgers against the fixture timelock
+  local log="$1"
+  shift
+  env GOVERNANCE_TIMELOCK="$LATE_TL" GOVERNANCE_MULTISIG="$LATE_MS" "$@" forge script script/DeployDormantLedgers.s.sol \
+    --rpc-url "$RPC" --broadcast --private-key "$KEY" >"$log" 2>&1
+}
+before="$(nonce "$DEPLOYER")"
+if late_dormant "$OUT/neg-late-window.log" TIMELOCK_HISTORY_FROM_BLOCK="$LATE_FROM"; then
+  fail "DeployDormantLedgers accepted the hidden seat with TIMELOCK_HISTORY_FROM_BLOCK=$LATE_FROM"
+fi
+grep -q "GOVERNANCE_TIMELOCK: role history does not start at the timelock's construction" "$OUT/neg-late-window.log" ||
+  fail "late window: not refused on the construction check"
+if late_dormant "$OUT/neg-late-full.log"; then fail "DeployDormantLedgers accepted the hidden seat (full history)"; fi
+grep -q "GOVERNANCE_TIMELOCK: PROPOSER_ROLE holders are not exactly the multisig" "$OUT/neg-late-full.log" ||
+  fail "full history: hidden PROPOSER not found"
+[ "$(nonce "$DEPLOYER")" = "$before" ] || fail "a late-window run sent a transaction"
+printf '{"chainId":40204,"deployer":"%s","contracts":{"GovernanceTimelock":"%s","GovernanceMultisig":"%s"},"aaStack":{},"params":{}}' \
+  "$DEPLOYER" "$LATE_TL" "$LATE_MS" >"$OUT/late-book.json"
+if ADDRESS_BOOK="$OUT_REL/late-book.json" TIMELOCK_HISTORY_FROM_BLOCK="$LATE_FROM" \
+  forge script script/CheckDeployedAdmins.s.sol --rpc-url "$RPC" >"$OUT/neg-late-gate.log" 2>&1; then
+  fail "gate passed the hidden seat with TIMELOCK_HISTORY_FROM_BLOCK=$LATE_FROM"
+fi
+grep -E "^ *TIMELOCK-HOLDERS GovernanceTimelock: role history does not start at the timelock's construction" "$OUT/neg-late-gate.log" ||
+  fail "gate late window: not a TIMELOCK-HOLDERS construction failure"
+echo "refused (deploy from block $LATE_FROM and from 0, gate from block $LATE_FROM), nothing sent"
+echo "genesis-pipeline-anvil: PASS (pipeline + chain#320 negatives on anvil 40204)"

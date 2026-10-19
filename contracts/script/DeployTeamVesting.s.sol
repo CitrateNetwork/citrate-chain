@@ -7,6 +7,7 @@ import "./Salts.sol";
 import "./lib/AdminChecks.sol";
 import "./lib/Create2Deploy.sol";
 import "./lib/GenesisBook.sol";
+import "./lib/GenesisProfile.sol";
 import {TeamVestingWallet} from "../src/genesis/TeamVestingWallet.sol";
 
 /// @title DeployTeamVesting: one funded OZ VestingWalletCliff per team holder (C2 D2 / G2)
@@ -36,7 +37,7 @@ import {TeamVestingWallet} from "../src/genesis/TeamVestingWallet.sol";
 ///         start > 0, duration > 0, cliff <= duration, amount > 0, label unique. Re-runnable:
 ///         a live wallet is reused and topped up only to `amount` (balance + released);
 ///         a wallet already holding more than `amount` fails the run.
-contract DeployTeamVesting is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook {
+contract DeployTeamVesting is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook, GenesisProfile {
     struct Grant {
         string label;
         address beneficiary;
@@ -76,6 +77,8 @@ contract DeployTeamVesting is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
     /// @notice The ceremony with explicit inputs (no env reads), for tests and callers.
     function deployWith(address deployer, Grant[] memory grants) public returns (address[] memory wallets) {
         require(deployer != address(0), "deployer must be set");
+        // Node chain id vs simulated chain id (GenesisProfile): the book records block.chainid.
+        _resolveChainProfile(false);
         require(grants.length > 0, "no vesting grants");
         uint256 total = 0;
         for (uint256 i = 0; i < grants.length; i++) {

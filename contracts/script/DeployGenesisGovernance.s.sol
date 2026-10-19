@@ -7,6 +7,7 @@ import "./Salts.sol";
 import "./lib/AdminChecks.sol";
 import "./lib/Create2Deploy.sol";
 import "./lib/GenesisBook.sol";
+import "./lib/GenesisProfile.sol";
 import {TimelockController} from "@openzeppelin/contracts/governance/TimelockController.sol";
 import {MultisigProposer} from "../src/genesis/MultisigProposer.sol";
 
@@ -42,9 +43,12 @@ import {MultisigProposer} from "../src/genesis/MultisigProposer.sol";
 ///         contract re-checks), minDelay >= 1 hour, the deployer is no owner, and the two
 ///         councils share no owner (unless ALLOW_SHARED_HOLDERS=1).
 ///
+///         Chain id (GenesisProfile): the node's eth_chainId must equal forge's simulated
+///         chain id, or the run reverts before broadcasting; on 40204 a node is required.
+///
 ///         Dry run:  forge script script/DeployGenesisGovernance.s.sol --rpc-url <rpc>
 ///         Then:     ADDRESS_BOOK=genesis/governance.json forge script script/CheckDeployedAdmins.s.sol --rpc-url <rpc>
-contract DeployGenesisGovernance is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook {
+contract DeployGenesisGovernance is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook, GenesisProfile {
     /// Same floor as MultisigTimelock2of3.MIN_DELAY_FLOOR (C044(a)); D5 uses it for GUARDIAN.
     uint256 public constant MIN_DELAY_FLOOR = 1 hours;
 
@@ -83,6 +87,9 @@ contract DeployGenesisGovernance is ScriptEnv, AdminChecks, Create2Deploy, Genes
         returns (Deployed memory d)
     {
         require(deployer != address(0), "deployer must be set");
+        // Node chain id vs simulated chain id, before anything else (GenesisProfile): the book
+        // records block.chainid, so a --chain-id / --chain / FOUNDRY_CHAIN_ID override is refused.
+        _resolveChainProfile(false);
         _validate("GOVERNANCE", gov, deployer);
         _validate("GUARDIAN", grd, deployer);
         if (!allowShared) {
