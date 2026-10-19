@@ -9,8 +9,8 @@ tmp=$(mktemp -d); trap 'jobs -p | xargs -r kill 2>/dev/null; rm -rf "$tmp"' EXIT
 fail=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
 
-run() {  # port start step out [fail_mod]
-  python3 -I scripts/ui-truth/stub_rpc.py "$1" "$2" "$3" "${5:-0}" & local pid=$!
+run() {  # port start step out [fail_mod] [batch_fault]
+  python3 -I scripts/ui-truth/stub_rpc.py "$1" "$2" "$3" "${5:-0}" "${6:-}" & local pid=$!
   for _ in $(seq 50); do curl -fsS -o /dev/null -X POST -d '{"jsonrpc":"2.0","id":1,"method":"eth_chainId"}' "http://127.0.0.1:$1" 2>/dev/null && break; sleep 0.1; done
   scripts/ui-truth/export-fixtures.sh "http://127.0.0.1:$1" "$4" >"$tmp/log" 2>&1 || { cat "$tmp/log"; return 1; }
   kill "$pid"; wait "$pid" 2>/dev/null || true
@@ -34,5 +34,11 @@ check "head_moved reported"                     '[ "$(jq ".head_moved" "$tmp/dri
 run 18603 500200 0 "$tmp/partial.json" 97
 check "partial: producer count withheld"       '[ "$(jq ".reads[] | select(.id==\"producing_validators\") | .value | has(\"count\")" "$tmp/partial.json")" = false ]'
 check "partial: marked unavailable with tally" '[ "$(jq -c ".reads[] | select(.id==\"producing_validators\") | .value | [.unavailable, .blocks_returned < .blocks_requested]" "$tmp/partial.json")" = "[true,true]" ]'
+
+for fault in http500 badjson; do
+  run 1861$([ $fault = http500 ] && echo 0 || echo 1) 500200 0 "$tmp/$fault.json" 0 $fault
+  check "$fault: export completes, file written" '[ -s "$tmp/$fault.json" ]'
+  check "$fault: final-batch failure → unavailable, 900/1000" '[ "$(jq -c ".reads[] | select(.id==\"producing_validators\") | .value | [.unavailable, .blocks_returned, .blocks_requested]" "$tmp/$fault.json")" = "[true,900,1000]" ]'
+done
 
 exit $fail

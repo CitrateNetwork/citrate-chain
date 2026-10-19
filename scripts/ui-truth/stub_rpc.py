@@ -1,18 +1,21 @@
 """Stub JSON-RPC node for testing export-fixtures.sh. Not a chain: it exists so the export's
 provenance logic (head drift, epoch crossing, producer sampling) can be tested offline.
 
-  python3 stub_rpc.py <port> <start_head> <step_per_blockNumber_call> [fail_mod]
+  python3 stub_rpc.py <port> <start_head> <step_per_blockNumber_call> [fail_mod] [batch_fault]
 
 Every eth_blockNumber call advances the head by <step>, which models blocks landing while
 an export runs. Blocks alternate between two proposers. eth_call returns uint256(1).
 With [fail_mod] > 0, every block whose number is divisible by it fails: odd multiples return
 a JSON-RPC error, even multiples return a null block (models a partial producer sample).
+With [batch_fault] = http500 or badjson, the batch request covering the current head (the
+final producer batch) fails at the transport or parse level instead.
 """
 import json, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PORT, HEAD, STEP = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
 FAIL_MOD = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+BATCH_FAULT = sys.argv[5] if len(sys.argv) > 5 else ""
 state = {"head": HEAD}
 
 
@@ -50,8 +53,13 @@ def answer(req):
 class H(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        final_batch = isinstance(body, list) and any(r.get("id") == state["head"] for r in body)
+        if BATCH_FAULT == "http500" and final_batch:
+            self.send_response(500); self.send_header("content-length", "0"); self.end_headers(); return
         out = [answer(r) for r in body] if isinstance(body, list) else answer(body)
         data = json.dumps(out).encode()
+        if BATCH_FAULT == "badjson" and final_batch:
+            data = data[: len(data) // 2]
         self.send_response(200)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(data)))

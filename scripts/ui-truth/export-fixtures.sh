@@ -72,9 +72,13 @@ want=$(( OBSERVED - lo + 1 ))
 keys=$(for (( s=lo; s<=OBSERVED; s+=100 )); do
   e=$(( s + 99 )); [ "$e" -gt "$OBSERVED" ] && e=$OBSERVED
   batch=$(for (( h=s; h<=e; h++ )); do printf '{"jsonrpc":"2.0","id":%d,"method":"eth_getBlockByNumber","params":["0x%x",false]},' "$h" "$h"; done)
-  curl -fsS -X POST -H 'content-type: application/json' --data "[${batch%,}]" "$RPC" 2>/dev/null \
-    | jq -r '.[]? | select(.result != null and (.result.proposerPubkey // "" | test("^0x[0-9a-fA-F]{64}$"))) | "\(.id) \(.result.proposerPubkey)"' 2>/dev/null
-done | sort -u -k1,1n)
+  # A failed batch (HTTP error, dropped connection, malformed JSON) contributes nothing; the
+  # completeness check below then reports the sample as unavailable instead of aborting.
+  body=$(curl -fsS -X POST -H 'content-type: application/json' --data "[${batch%,}]" "$RPC" 2>/dev/null) || body=""
+  printf '%s' "$body" \
+    | jq -r '.[]? | select(.result != null and (.result.proposerPubkey // "" | test("^0x[0-9a-fA-F]{64}$"))) | "\(.id) \(.result.proposerPubkey)"' 2>/dev/null \
+    || true
+done | sort -u -k1,1n || true)
 got=$(printf '%s\n' "$keys" | grep -c . || true)
 if [ "$got" -eq "$want" ]; then
   producing=$(jq -cn --argjson n "$(printf '%s\n' "$keys" | awk '{print $2}' | sort -u | grep -c .)" \
