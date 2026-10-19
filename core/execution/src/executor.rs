@@ -1146,6 +1146,23 @@ impl Executor {
         }
     }
 
+    /// C1-R: [`Self::persist_receipt_index`] for a startup path that cannot await
+    /// (the canonical applicator's constructor settling an unfinished rebuild).
+    /// Same store, same single fsync'd batch, but it does NOT take the exec lock:
+    /// call it only before the executor runs blocks concurrently.
+    pub fn persist_receipt_index_at_startup(
+        &self,
+        index: &ReceiptIndexBatch,
+    ) -> anyhow::Result<()> {
+        if index.is_empty() {
+            return Ok(());
+        }
+        match &self.state_store {
+            Some(store) => store.put_receipt_index(index),
+            None => Ok(()),
+        }
+    }
+
     /// C1-R: [`Self::persist_state_changes_with_tip`] plus the block's RPC receipt
     /// index, all in the ONE atomic state batch: after a crash either the block's
     /// state, tip AND receipts are durable, or none of them are (and the block is

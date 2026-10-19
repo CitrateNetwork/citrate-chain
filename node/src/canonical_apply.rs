@@ -335,7 +335,25 @@ impl CanonicalApplicator {
         // C1-R: a from-genesis rebuild that stopped mid-replay may have left the
         // receipts of its old applied chain above the durable tip. Make the receipt
         // index match the durable applied chain before anything reads or extends it.
-        Self::reconcile_interrupted_rebuild_receipts(&storage, tip);
+        // A failure keeps the marker; the cleanup repeats on the next start or
+        // before the next from-genesis rebuild (which refuses to run until it
+        // completes).
+        let cleaned = Self::interrupted_rebuild_cleanup(&storage, tip).and_then(|batches| {
+            batches.iter().enumerate().try_for_each(|(i, b)| {
+                executor.persist_receipt_index_at_startup(b).map_err(|e| {
+                    anyhow::anyhow!(
+                        "write {} of {} failed (the rebuild marker is kept): {e}",
+                        i.saturating_add(1),
+                        batches.len()
+                    )
+                })
+            })
+        });
+        if let Err(e) = cleaned {
+            warn!(
+                "C1-R: receipt cleanup after an unfinished rebuild did not complete: {e}; it is retried on the next start or rebuild"
+            );
+        }
         // Seed the reorg ring with the current state as-of the seeded tip: the
         // executor reflects this tip's state at construction, so it is the base a
         // reorg can revert to before any new block is applied.
@@ -1474,8 +1492,25 @@ impl CanonicalApplicator {
         };
         let mut state = self.lock.lock().await;
         // C1-R: settle any receipts an earlier, unfinished rebuild left above the
-        // durable tip before this rebuild records its own marker.
-        Self::reconcile_interrupted_rebuild_receipts(&self.storage, state.tip);
+        // durable tip before this rebuild records its own marker. The writes go
+        // through the executor's store (the same fsync'd path as the rebuild). If
+        // the cleanup does not complete, ABORT before changing anything: recording
+        // this rebuild's marker would overwrite the earlier one, and the receipts
+        // only that marker reaches would stay visible for good.
+        let batches = Self::interrupted_rebuild_cleanup(&self.storage, state.tip).map_err(|e| {
+            anyhow::anyhow!(
+                "C1-R: receipt cleanup before the rebuild failed (rebuild aborted): {e}"
+            )
+        })?;
+        for (i, batch) in batches.iter().enumerate() {
+            self.executor.persist_receipt_index(batch).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "C1-R: receipt cleanup write {} of {} failed (the rebuild marker is kept; rebuild aborted): {e}",
+                    i.saturating_add(1),
+                    batches.len()
+                )
+            })?;
+        }
         if state.tip.hash == head {
             return Ok(false);
         }
@@ -1544,7 +1579,7 @@ impl CanonicalApplicator {
         // tip is below it. The reset batch therefore also records `pre_tip` as the
         // rebuild marker: if the process stops before the replay passes the prefix,
         // the next start removes every receipt of that old chain that is not on the
-        // durable applied chain (`reconcile_interrupted_rebuild_receipts`), whatever
+        // durable applied chain (`interrupted_rebuild_cleanup`), whatever
         // branch fork choice picks then. Success and every abort clear the marker.
         let spine_set: std::collections::HashSet<Hash> = spine.iter().copied().collect();
         let (abandon_index, restore_index, common) =
@@ -1828,63 +1863,67 @@ impl CanonicalApplicator {
     /// chain that is not on the durable applied chain ending at `durable`, then
     /// clears the marker. The walk descends both chains from their tips to their
     /// common ancestor, so it costs the span the rebuild had left to replay, never
-    /// a scan of all stored receipts. Removals commit in bounded, idempotent chunks
-    /// and the marker is cleared only with the last one, so a stop part-way simply
-    /// repeats the cleanup on the next start. Blocks re-applied later rewrite their
-    /// receipts as usual.
-    fn reconcile_interrupted_rebuild_receipts(storage: &StorageManager, durable: AppliedTip) {
-        let marker = match storage.transactions.get_receipt_reconcile_marker() {
-            Ok(Some(m)) => m,
-            Ok(None) => return,
-            Err(e) => {
-                warn!("C1-R: could not read the receipt rebuild marker: {e}");
-                return;
-            }
+    /// a scan of all stored receipts. This returns the batches to commit, in
+    /// order: bounded, idempotent removal chunks, each written as one fsync'd
+    /// batch, with the marker clear in the SAME batch as the last chunk, so the
+    /// clear becomes durable only together with the cleanup's final write. A
+    /// caller stops at the first failed write and leaves the rest unwritten: the
+    /// marker is then still in place and the cleanup runs again on the next start
+    /// or rebuild. A storage READ failure is returned as `Err` (no batches), for
+    /// the same reason. Blocks re-applied later rewrite their receipts as usual.
+    fn interrupted_rebuild_cleanup(
+        storage: &StorageManager,
+        durable: AppliedTip,
+    ) -> anyhow::Result<Vec<ReceiptIndexBatch>> {
+        let marker = match storage
+            .transactions
+            .get_receipt_reconcile_marker()
+            .map_err(|e| anyhow::anyhow!("could not read the receipt rebuild marker: {e}"))?
+        {
+            Some(m) => m,
+            None => return Ok(Vec::new()),
         };
-        let removals = Self::interrupted_rebuild_removals(storage, marker, durable);
-        let total = removals.len();
-        let mut chunks = removals.chunks(RECEIPT_RECONCILE_CHUNK).peekable();
-        let mut committed: usize = 0;
-        loop {
-            let chunk = chunks.next().unwrap_or(&[]);
-            let last = chunks.peek().is_none();
-            let mut batch = ReceiptIndexBatch {
+        let removals = Self::interrupted_rebuild_removals(storage, marker, durable)?;
+        info!(
+            "C1-R: unfinished rebuild from {} @ {}: removing {} receipt entr(y/ies) off the durable applied chain at {} @ {}",
+            marker.0,
+            marker.1,
+            removals.len(),
+            durable.hash,
+            durable.height
+        );
+        let mut batches: Vec<ReceiptIndexBatch> = removals
+            .chunks(RECEIPT_RECONCILE_CHUNK)
+            .map(|chunk| ReceiptIndexBatch {
                 removals: chunk.to_vec(),
                 ..ReceiptIndexBatch::default()
-            };
-            if last {
-                batch = batch.with_marker(ReceiptReconcileMarker::Clear);
-            }
-            if let Err(e) = citrate_execution::executor::StateStoreTrait::put_receipt_index(
-                &*storage.state,
-                &batch,
-            ) {
-                warn!(
-                    "C1-R: receipt cleanup after an unfinished rebuild failed ({committed}/{total} removals committed): {e}; it is retried on the next start or rebuild"
-                );
-                return;
-            }
-            committed = committed.saturating_add(chunk.len());
-            if last {
-                break;
-            }
+            })
+            .collect();
+        match batches.pop() {
+            Some(last) => batches.push(last.with_marker(ReceiptReconcileMarker::Clear)),
+            None => batches
+                .push(ReceiptIndexBatch::default().with_marker(ReceiptReconcileMarker::Clear)),
         }
-        info!(
-            "C1-R: unfinished rebuild from {} @ {}: removed {} receipt entr(y/ies) off the durable applied chain at {} @ {}",
-            marker.0, marker.1, total, durable.hash, durable.height
-        );
+        Ok(batches)
     }
 
-    /// The `(block, tx)` removals for [`Self::reconcile_interrupted_rebuild_receipts`]:
+    /// The `(block, tx)` removals for [`Self::interrupted_rebuild_cleanup`]:
     /// every transaction of every block on the chain ending at `old` that is not on
-    /// the chain ending at `durable`. Read-only. A block that cannot be read ends the
-    /// walk on that side (nothing below it can be identified).
+    /// the chain ending at `durable`. Read-only. A block that is not stored ends the
+    /// walk on that side (nothing below it can be identified); a storage READ error
+    /// is returned instead, so a failing store never clears the marker on a partial
+    /// walk.
     fn interrupted_rebuild_removals(
         storage: &StorageManager,
         old: (Hash, u64),
         durable: AppliedTip,
-    ) -> Vec<(Hash, Hash)> {
-        let load = |h: &Hash| storage.blocks.get_block(h).ok().flatten();
+    ) -> anyhow::Result<Vec<(Hash, Hash)>> {
+        let load = |h: &Hash| {
+            storage
+                .blocks
+                .get_block(h)
+                .map_err(|e| anyhow::anyhow!("receipt cleanup could not read block {h}: {e}"))
+        };
         let mut out = Vec::new();
         let (mut old_hash, mut old_height) = old;
         let (mut cur_hash, mut cur_height) = (durable.hash, durable.height);
@@ -1894,23 +1933,23 @@ impl CanonicalApplicator {
             if old_height >= cur_height {
                 // Above the durable tip, or a different block at the same height:
                 // not on the durable applied chain.
-                let Some(b) = load(&old_hash) else { break };
+                let Some(b) = load(&old_hash)? else { break };
                 out.extend(b.transactions.iter().map(|tx| (old_hash, tx.hash)));
                 if b.header.height == 0 {
                     break;
                 }
                 old_hash = b.selected_parent();
-                old_height = match load(&old_hash) {
+                old_height = match load(&old_hash)? {
                     Some(p) => p.header.height,
                     None => break,
                 };
             } else {
-                let Some(b) = load(&cur_hash) else { break };
+                let Some(b) = load(&cur_hash)? else { break };
                 if b.header.height == 0 {
                     break;
                 }
                 cur_hash = b.selected_parent();
-                cur_height = match load(&cur_hash) {
+                cur_height = match load(&cur_hash)? {
                     Some(p) => p.header.height,
                     // The durable chain's genesis is not always a stored block.
                     None => b.header.height.saturating_sub(1),
@@ -1923,7 +1962,7 @@ impl CanonicalApplicator {
                 old.0, steps
             );
         }
-        out
+        Ok(out)
     }
 }
 
@@ -7430,6 +7469,9 @@ mod tests {
         inner: Arc<citrate_storage::state::StateStore>,
         writes: AtomicU64,
         abort_at: u64,
+        /// C1-R failure injection: while set, `put_receipt_index` returns a
+        /// storage error without writing (a transient disk / I/O failure).
+        fail_receipt_index: AtomicBool,
     }
 
     impl V251AbortStore {
@@ -7516,6 +7558,9 @@ mod tests {
             i: &citrate_execution::executor::ReceiptIndexBatch,
         ) -> anyhow::Result<()> {
             self.w("put_receipt_index");
+            if self.fail_receipt_index.load(Ordering::SeqCst) {
+                anyhow::bail!("injected storage failure (put_receipt_index)");
+            }
             V251Trait::put_receipt_index(&*self.inner, i)
         }
         fn put_account_version(&self, a: &Address, v: u64) -> anyhow::Result<()> {
@@ -7843,6 +7888,7 @@ mod tests {
             inner: storage.state.clone(),
             writes: AtomicU64::new(0),
             abort_at,
+            fail_receipt_index: AtomicBool::new(false),
         });
         let exec = Arc::new(Executor::with_storage(
             Arc::new(StateDB::new()),
@@ -8117,9 +8163,35 @@ mod tests {
         if std::env::var(V251_DIR).is_ok() {
             return;
         }
-        let test = "canonical_apply::tests::verify251_child";
         let (a1, a2, b2, b3) = v251_blocks().await;
         let (c1, c2) = c1r_fork_c().await;
+        let dir = tempfile::tempdir().expect("dir");
+        c1r_crash_after_rebuild_reset(dir.path(), &a1, &a2);
+        c1r_resume_and_check(dir.path(), &[&a1, &a2, &b2, &b3, &c1, &c2], &c2)
+            .await
+            .expect("restart converging on C leaves no receipt of the abandoned prefix");
+        let storage = StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen");
+        assert!(
+            storage
+                .transactions
+                .get_receipt(&a1.transactions[0].hash)
+                .expect("read")
+                .is_none(),
+            "a1 is not executed on C: its receipt is gone"
+        );
+        assert!(storage
+            .transactions
+            .get_block_transactions(&a1.header.block_hash)
+            .expect("read")
+            .is_empty());
+    }
+
+    /// C1-R: run the `recover` scenario in a child and crash it right after the
+    /// rebuild's reset batch (before the first replayed block), leaving the durable
+    /// tip at genesis, a1's receipt above it and the rebuild marker at a2. Asserts
+    /// that precondition.
+    fn c1r_crash_after_rebuild_reset(dir: &std::path::Path, a1: &Block, a2: &Block) {
+        let test = "canonical_apply::tests::verify251_child";
         // Find the rebuild's reset batch: the first reorg batch of the `recover`
         // scenario (the linear a1/a2 applies use the applied-tip batch).
         let dry = tempfile::tempdir().expect("dir");
@@ -8142,11 +8214,10 @@ mod tests {
             .and_then(|n| n.parse().ok())
             .unwrap_or_else(|| panic!("no reset batch in trace:\n{trace}"));
         // Crash before the write that follows the reset (the first replay block).
-        let dir = tempfile::tempdir().expect("dir");
         let out = v251_spawn(
             test,
             &[
-                (V251_DIR, dir.path().to_string_lossy().into()),
+                (V251_DIR, dir.to_string_lossy().into()),
                 ("V251_SCENARIO", "recover".to_string()),
                 (V251_ABORT_AT, (reset_at + 1).to_string()),
             ],
@@ -8154,47 +8225,125 @@ mod tests {
         .wait_with_output()
         .expect("child");
         assert!(!out.status.success(), "child must have crashed");
-        {
-            // Precondition: the crash left exactly the state Codex described.
-            let storage =
-                StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen");
-            let tip = storage.blocks.get_applied_tip().expect("tip");
-            assert_eq!(tip.map(|t| t.1), Some(0), "durable tip reset to genesis");
-            let r = storage
-                .transactions
-                .get_receipt(&a1.transactions[0].hash)
-                .expect("read");
-            assert_eq!(
-                r.map(|r| r.block_hash),
-                Some(a1.header.block_hash),
-                "shared prefix a1 keeps its receipt above the durable tip"
-            );
-            assert_eq!(
-                storage
-                    .transactions
-                    .get_receipt_reconcile_marker()
-                    .expect("read"),
-                Some((a2.header.block_hash, 2)),
-                "the reset batch recorded the old applied tip"
-            );
-        }
-        c1r_resume_and_check(dir.path(), &[&a1, &a2, &b2, &b3, &c1, &c2], &c2)
-            .await
-            .expect("restart converging on C leaves no receipt of the abandoned prefix");
-        let storage = StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen");
-        assert!(
+        // Precondition: the crash left exactly the state Codex described.
+        let storage = StorageManager::new(dir, PruningConfig::default()).expect("reopen");
+        let tip = storage.blocks.get_applied_tip().expect("tip");
+        assert_eq!(tip.map(|t| t.1), Some(0), "durable tip reset to genesis");
+        let r = storage
+            .transactions
+            .get_receipt(&a1.transactions[0].hash)
+            .expect("read");
+        assert_eq!(
+            r.map(|r| r.block_hash),
+            Some(a1.header.block_hash),
+            "shared prefix a1 keeps its receipt above the durable tip"
+        );
+        assert_eq!(
             storage
                 .transactions
+                .get_receipt_reconcile_marker()
+                .expect("read"),
+            Some((a2.header.block_hash, 2)),
+            "the reset batch recorded the old applied tip"
+        );
+    }
+
+    /// C1-R: the interrupted-rebuild cleanup hits a STORAGE FAILURE. The marker
+    /// must survive it, and the next rebuild (toward branch C, which forks below
+    /// the old prefix a1) must not record its own marker over it: before this, the
+    /// cleanup logged the error and the rebuild went on, replacing the marker with
+    /// its own lower `pre_tip`, so a1's receipt was out of the cleanup's reach and
+    /// `eth_getTransactionReceipt` reported the abandoned transaction as mined for
+    /// good. Once the store recovers, the retried cleanup removes it and the
+    /// rebuild converges on C with a consistent receipt index.
+    #[tokio::test]
+    async fn c1r_failed_cleanup_keeps_marker_and_blocks_rebuild_until_it_succeeds() {
+        if std::env::var(V251_DIR).is_ok() {
+            return;
+        }
+        let (a1, a2, b2, b3) = v251_blocks().await;
+        let (c1, c2) = c1r_fork_c().await;
+        let dir = tempfile::tempdir().expect("dir");
+        c1r_crash_after_rebuild_reset(dir.path(), &a1, &a2);
+
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen"));
+        let sdb = StateDB::new();
+        for (addr, acct) in storage.state.get_all_accounts().expect("accounts") {
+            sdb.accounts.load_account(addr, acct);
+        }
+        for ((addr, key), val) in storage.state.get_all_storage().expect("storage") {
+            sdb.set_storage(addr, key.as_bytes().to_vec(), val.as_bytes().to_vec());
+        }
+        let store = Arc::new(V251AbortStore {
+            inner: storage.state.clone(),
+            writes: AtomicU64::new(0),
+            abort_at: u64::MAX,
+            fail_receipt_index: AtomicBool::new(true),
+        });
+        let exec = Arc::new(Executor::with_storage(Arc::new(sdb), Some(store.clone())));
+        let all = [&a1, &a2, &b2, &b3, &c1, &c2];
+        for b in all {
+            persist(&storage, b);
+        }
+        let marker =
+            |s: &StorageManager| s.transactions.get_receipt_reconcile_marker().expect("read");
+        let a1_receipt = |s: &StorageManager| {
+            s.transactions
                 .get_receipt(&a1.transactions[0].hash)
                 .expect("read")
-                .is_none(),
+                .map(|r| r.block_hash)
+        };
+
+        // Startup cleanup fails: the marker and a1's receipt are untouched.
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        assert_eq!(
+            marker(&storage),
+            Some((a2.header.block_hash, 2)),
+            "startup failure keeps the marker"
+        );
+        assert_eq!(a1_receipt(&storage), Some(a1.header.block_hash));
+
+        // A rebuild toward C while the store still fails: refused, nothing changed.
+        app.fork_choice = Some(fork_choice_returning(c2.header.block_hash));
+        let g = Executor::new(Arc::new(StateDB::new()));
+        g.set_balance(&Address(ALICE), U256::from(FUND));
+        app.set_genesis(g.state_snapshot(), Hash::default());
+        let res = app
+            .recover_to_head(g.state_snapshot(), Hash::default())
+            .await;
+        assert!(
+            res.is_err(),
+            "the rebuild must abort when the cleanup cannot commit: {res:?}"
+        );
+        assert_eq!(
+            marker(&storage),
+            Some((a2.header.block_hash, 2)),
+            "the original marker is not replaced by the rebuild's own"
+        );
+        assert_eq!(app.applied_tip().await.height, 0, "applied tip unchanged");
+        assert_eq!(a1_receipt(&storage), Some(a1.header.block_hash));
+
+        // The store recovers: the retried cleanup and the rebuild both complete.
+        store.fail_receipt_index.store(false, Ordering::SeqCst);
+        let ok = app
+            .recover_to_head(g.state_snapshot(), Hash::default())
+            .await
+            .expect("rebuild after the store recovers");
+        assert!(ok, "rebuild converged");
+        let tip = app.applied_tip().await;
+        assert_eq!(tip.hash, c2.header.block_hash, "converged on C");
+        assert_eq!(
+            marker(&storage),
+            None,
+            "marker cleared once the cleanup is durable"
+        );
+        assert_eq!(
+            a1_receipt(&storage),
+            None,
             "a1 is not executed on C: its receipt is gone"
         );
-        assert!(storage
-            .transactions
-            .get_block_transactions(&a1.header.block_hash)
-            .expect("read")
-            .is_empty());
+        c1r_receipts_consistent(&storage, Some(tip.hash), &all).expect("receipt index matches C");
     }
 
     /// Copy a (closed) RocksDB directory, so one crashed store can be resumed
