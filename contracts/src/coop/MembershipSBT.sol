@@ -1,17 +1,23 @@
 // ── VENDORED: DO NOT EDIT. Change upstream, then re-vendor with a new header. ─────
-// Source:    citrate-coop/contracts/src/MembershipSBT.sol (BUSL-1.1, licensor Citrate Inc.)
-// Upstream:  Citrate-Labs metarepo working tree, where citrate-coop is tracked
-//            (audit LAB-B-010; coop remote git@github.com:CitrateNetwork/citrate-coop.git),
-//            labs main 2206a47ddc56542dd6fdc4d53f6f0cf411eb86d4, copied 2026-10-18.
+// Source:    CitrateNetwork/citrate-coop contracts/src/MembershipSBT.sol
+// Upstream:  github.com/CitrateNetwork/citrate-coop @ 99b2d0d29d38e0576c0118e083c5de48747cc3ba
+//            (fetched from GitHub main, not from a local copy), vendored 2026-10-19.
+// Includes:  PBA R2 remediation (citrate-coop #3, 3d4aaae6) and the Apache-2.0 relicense.
 // Integrity: every line after this 10-line header is byte-identical to upstream:
-//            `tail -n +11 <this file> | sha256sum` == a00f20c9a180df3d1c23282d4989a2259dc3baeee00576709b5cc21b9cb6773e
-// Why:       C2 D9 / C4: PatronageLedger is deployed dormant at betanet genesis by the
-//            citrate-chain ceremony (script/DeployDormantLedgers.s.sol).
+//            `tail -n +11 <this file> | sha256sum` == 93b4438487b43cab961a57a62c5c4b3993c77e2280924fadcb2c3637ff5df936
+// Why:       C2 D9 / C4: deployed dormant at betanet genesis by the citrate-chain
+//            ceremony (script/DeployDormantLedgers.s.sol).
 // ───────────────────────────────────────────────────────────────────────────────────
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
 import "./lib/Auth.sol";
+
+/// @notice PBA-L2-040 (COOP-02): told when a member is expelled so vote-weight state (delegation)
+///         never outlives the seat. The CooperativeGovernor implements it.
+interface IExpelHook {
+    function onMemberExpelled(address member) external;
+}
 
 /// @notice The KYC oracle the IDP authority mirrors on-chain.
 interface IKYCRegistry {
@@ -49,6 +55,9 @@ contract MembershipSBT is Auth {
     mapping(bytes32 => bool) public identityUsed;    // kyc identity => has a seat
     mapping(address => Member) private _members;
 
+    /// PBA-L2-040 (COOP-02): the governor, notified on expel. Set once by the admin (the factory).
+    address public governanceHook;
+
     event MemberAdmitted(address indexed member, uint256 indexed tokenId, MemberClass class, bytes32 kycIdentity);
     event MemberExpelled(address indexed member, uint256 indexed tokenId);
     event Locked(uint256 tokenId); // ERC-5192
@@ -59,6 +68,8 @@ contract MembershipSBT is Auth {
     error WorkerMajorityViolated();
     error SoulboundLocked();
     error NotAMember();
+    error HookAlreadySet();
+    error ZeroHook();
 
     constructor(address kycRegistry, bytes32[] memory modelIds) {
         kyc = IKYCRegistry(kycRegistry);
@@ -99,18 +110,31 @@ contract MembershipSBT is Auth {
         emit Locked(tokenId);
     }
 
+    /// @notice Wire the governance hook (one-shot; the factory does it before handing admin over).
+    function setGovernanceHook(address hook) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (governanceHook != address(0)) revert HookAlreadySet();
+        if (hook == address(0)) revert ZeroHook();
+        governanceHook = hook;
+    }
+
     /// @notice Expel a member (governance, for cause). Frees the seat and identity.
+    /// @dev PBA-L2-040: (COOP-03/B-014) re-checks the AB 816 >= 51% worker share, which mint enforced
+    ///      but expel did not; (COOP-02) notifies the governor so the member's delegation is cleared.
     function expel(address member) external onlyRole(REGISTRAR_ROLE) {
         uint256 tokenId = tokenOf[member];
         if (tokenId == 0) revert NotAMember();
         Member storage m = _members[member];
-        if (m.class == MemberClass.Worker) _workerCount -= 1;
-        _memberCount -= 1;
+        uint256 newWorkers = m.class == MemberClass.Worker ? _workerCount - 1 : _workerCount;
+        uint256 newTotal = _memberCount - 1;
+        if (newWorkers * 100 < 51 * newTotal) revert WorkerMajorityViolated();
+        _workerCount = newWorkers;
+        _memberCount = newTotal;
         identityUsed[m.kycIdentity] = false;
         delete ownerOf[tokenId];
         delete tokenOf[member];
         delete _members[member];
         emit MemberExpelled(member, tokenId);
+        if (governanceHook != address(0)) IExpelHook(governanceHook).onMemberExpelled(member);
     }
 
     // --- ERC-5192 soulbound: every token is permanently locked ---
@@ -151,6 +175,12 @@ contract MembershipSBT is Auth {
 
     function agentIdsOf(address a) external view returns (bytes32[] memory) {
         return _members[a].agentIds;
+    }
+
+    /// @notice The id the next admitted member will get (ids only grow). The governor snapshots it
+    ///         at propose: only members seated before the proposal may vote on it (PBA-L2-040 B-014).
+    function nextTokenId() external view returns (uint256) {
+        return _nextTokenId;
     }
 
     function workerCount() external view returns (uint256) {

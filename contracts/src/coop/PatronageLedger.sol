@@ -1,14 +1,14 @@
 // ── VENDORED: DO NOT EDIT. Change upstream, then re-vendor with a new header. ─────
-// Source:    citrate-coop/contracts/src/PatronageLedger.sol (BUSL-1.1, licensor Citrate Inc.)
-// Upstream:  Citrate-Labs metarepo working tree, where citrate-coop is tracked
-//            (audit LAB-B-010; coop remote git@github.com:CitrateNetwork/citrate-coop.git),
-//            labs main 2206a47ddc56542dd6fdc4d53f6f0cf411eb86d4, copied 2026-10-18.
+// Source:    CitrateNetwork/citrate-coop contracts/src/PatronageLedger.sol
+// Upstream:  github.com/CitrateNetwork/citrate-coop @ 99b2d0d29d38e0576c0118e083c5de48747cc3ba
+//            (fetched from GitHub main, not from a local copy), vendored 2026-10-19.
+// Includes:  PBA R2 remediation (citrate-coop #3, 3d4aaae6) and the Apache-2.0 relicense.
 // Integrity: every line after this 10-line header is byte-identical to upstream:
-//            `tail -n +11 <this file> | sha256sum` == c5f655097509e3b3010f295edf44b3589589fbfdf1823bd80de193526580f2d3
-// Why:       C2 D9 / C4: PatronageLedger is deployed dormant at betanet genesis by the
-//            citrate-chain ceremony (script/DeployDormantLedgers.s.sol).
+//            `tail -n +11 <this file> | sha256sum` == 51b741248c235861fdc6d0685f8fcce4307e1e173e68960f5d2b0076295ea3d2
+// Why:       C2 D9 / C4: deployed dormant at betanet genesis by the citrate-chain
+//            ceremony (script/DeployDormantLedgers.s.sol).
 // ───────────────────────────────────────────────────────────────────────────────────
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
 import "./lib/Auth.sol";
@@ -34,6 +34,11 @@ contract PatronageLedger is Auth {
     bytes32 public constant YEAR_KEEPER_ROLE = keccak256("LEDGER_YEAR_KEEPER_ROLE");
 
     uint256 private constant ACC = 1e18;
+    /// PBA-L2-040 bounds. B-010: data quality is a basis-point fraction (<= 100%). B-018: weights are
+    /// basis-point multipliers in (0, 100%]. B-019: one record's metered compute is capped so
+    /// `units * accDividendPerUnit` cannot overflow and brick a member's dividend accounting.
+    uint16 public constant MAX_BPS = 10_000;
+    uint256 public constant MAX_COMPUTE_PER_RECORD = 1e30;
 
     IKYCRegistry public immutable kyc;
     IMembership public immutable membership;
@@ -83,6 +88,9 @@ contract PatronageLedger is Auth {
     error NotKyc();
     error NotMember();
     error NoUnits(); // SETL-M1: cannot credit revenue before any patronage units exist
+    error BadQuality();       // PBA-L2-040 B-010
+    error ComputeTooLarge();  // PBA-L2-040 B-019
+    error BadWeights();       // PBA-L2-040 B-018
 
     constructor(address kycRegistry, address membership_) {
         kyc = IKYCRegistry(kycRegistry);
@@ -109,6 +117,8 @@ contract PatronageLedger is Auth {
         if (!contributionsOpen) revert WindowClosed();
         if (!kyc.isVerified(member)) revert NotKyc();
         if (!membership.isMember(member)) revert NotMember();
+        if (dataQualityBps > MAX_BPS) revert BadQuality();
+        if (computeMetered > MAX_COMPUTE_PER_RECORD) revert ComputeTooLarge();
 
         recorded[roundId][member] = true;
 
@@ -159,6 +169,7 @@ contract PatronageLedger is Auth {
     }
 
     function setWeights(uint16 wCompute_, uint16 wData_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (wCompute_ == 0 || wData_ == 0 || wCompute_ > MAX_BPS || wData_ > MAX_BPS) revert BadWeights();
         wCompute = wCompute_;
         wData = wData_;
         emit WeightsSet(wCompute_, wData_);
