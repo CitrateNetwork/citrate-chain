@@ -420,3 +420,136 @@ fn executed_chain_index_errors_on_a_missing_ancestor() {
     // A range entirely above the gap is still served.
     assert_eq!(idx.executed_blocks(&storage, 2, 2).expect("top").len(), 1);
 }
+
+/// Builds a straight chain `tag` over heights `lo..=hi` on top of `parent`,
+/// every block carrying one log-emitting tx with a receipt. Returns the hashes.
+fn build_branch(
+    storage: &StorageManager,
+    tag: u8,
+    mut parent: Hash,
+    lo: u64,
+    hi: u64,
+) -> Vec<Hash> {
+    let mut out = Vec::new();
+    for h in lo..=hi {
+        let t = tx(tag, h);
+        let b = block(hash_of(tag, h), parent, vec![], h, vec![t.clone()]);
+        storage.blocks.put_block(&b).expect("block");
+        put_receipt(storage, &b, &t, tag, 1);
+        parent = b.hash();
+        out.push(parent);
+    }
+    out
+}
+
+/// A chain replacement deeper than any fixed depth (the spine-rebuild path is
+/// bounded only by the finalized floor) that lands at `extra` blocks above the
+/// old tip, with no query in between. Logs for a height under a warmed
+/// checkpoint must come from the new chain, never the abandoned one.
+fn deep_replacement_serves_the_new_chain(extra: u64) {
+    const OLD: u8 = 0xA0;
+    const NEW: u8 = 0xB0;
+    let (storage, _tmp) = storage();
+    let top = SETTLED_DEPTH + CHECKPOINT_STRIDE + 10;
+    let g = block(hash_of(0xEE, 0), Hash::default(), vec![], 0, vec![]);
+    storage.blocks.put_block(&g).expect("g");
+    let old = build_branch(&storage, OLD, g.hash(), 1, top);
+    storage
+        .blocks
+        .put_applied_tip(old.last().expect("tip"), top)
+        .expect("tip");
+
+    let io = io(storage.clone());
+    // Warm the handler's cache: a deep page caches the checkpoint at 1024 (an
+    // OLD block), and the page itself is served from the OLD chain.
+    let warm = logs(
+        &io,
+        serde_json::json!({"fromBlock": "0x3e8", "toBlock": "0x3fc"}),
+    );
+    assert_eq!(warm.len(), 21);
+    assert!(warm.iter().all(|l| l["topics"][0]
+        .as_str()
+        .expect("t0")
+        .ends_with(&format!("{:02x}", OLD ^ 0x55))));
+
+    // Fork at height 500 (below the cached 1024 checkpoint, > 1,000 below the
+    // tip) and replace the applied chain.
+    let fork_parent = old[499];
+    let new = build_branch(&storage, NEW, fork_parent, 501, top + extra);
+    storage
+        .blocks
+        .put_applied_tip(new.last().expect("tip"), top + extra)
+        .expect("tip");
+
+    let got = logs(
+        &io,
+        serde_json::json!({"fromBlock": "0x3e8", "toBlock": "0x3fc"}),
+    );
+    assert_eq!(got.len(), 21, "{got:?}");
+    for (i, l) in got.iter().enumerate() {
+        let h = 1_000 + i as u64;
+        assert_eq!(l["blockHash"], hx(&hash_of(NEW, h)), "height {h}: {l}");
+        assert_eq!(l["topics"][0], hx(&topic(NEW, h)), "height {h}: {l}");
+    }
+    // Below the fork point the shared history is unchanged.
+    let shared = logs(
+        &io,
+        serde_json::json!({"fromBlock": "0x1f0", "toBlock": "0x1f4"}),
+    );
+    assert!(shared.iter().all(|l| l["topics"][0]
+        .as_str()
+        .expect("t0")
+        .ends_with(&format!("{:02x}", OLD ^ 0x55))));
+}
+
+#[test]
+fn getlogs_after_deep_replacement_at_the_same_tip_height() {
+    deep_replacement_serves_the_new_chain(0);
+}
+
+#[test]
+fn getlogs_after_deep_replacement_at_a_higher_tip() {
+    deep_replacement_serves_the_new_chain(7);
+}
+
+/// The index level: checkpoints survive a tip that extends the anchor, and are
+/// dropped by one that does not.
+#[test]
+fn executed_chain_index_keeps_checkpoints_only_on_extension() {
+    let (storage, _tmp) = storage();
+    let top = SETTLED_DEPTH + CHECKPOINT_STRIDE + 10;
+    let g = block(hash_of(0xEE, 0), Hash::default(), vec![], 0, vec![]);
+    storage.blocks.put_block(&g).expect("g");
+    let old = build_branch(&storage, 0xA0, g.hash(), 1, top + 3);
+    storage
+        .blocks
+        .put_applied_tip(&old[top as usize - 1], top)
+        .expect("tip");
+    let idx = ExecutedChainIndex::new();
+    idx.executed_blocks(&storage, 0, 10).expect("warm");
+    assert_eq!(idx.checkpoint_count(), 2);
+
+    // Extension: kept.
+    storage
+        .blocks
+        .put_applied_tip(&old[top as usize + 2], top + 3)
+        .expect("tip");
+    idx.executed_blocks(&storage, 1_000, 1_001).expect("page");
+    assert_eq!(
+        idx.checkpoint_count(),
+        2,
+        "an extending tip keeps the cache"
+    );
+
+    // Replacement at the same height: dropped, and the page follows the new chain.
+    let new = build_branch(&storage, 0xB0, old[9], 11, top + 3);
+    storage
+        .blocks
+        .put_applied_tip(new.last().expect("tip"), top + 3)
+        .expect("tip");
+    let page = idx.executed_blocks(&storage, 1_000, 1_001).expect("page");
+    assert_eq!(
+        page.iter().map(|b| b.hash()).collect::<Vec<_>>(),
+        vec![hash_of(0xB0, 1_000), hash_of(0xB0, 1_001)]
+    );
+}

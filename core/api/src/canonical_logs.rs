@@ -26,10 +26,28 @@
 // A walk reads one header per height between its start and `from`. To keep
 // deep-history pages O(range), the resolver remembers the executed hash at every
 // `CHECKPOINT_STRIDE`-th height once it is at least `SETTLED_DEPTH` below the
-// applied tip, and later walks start from the nearest such checkpoint. A block
-// that deep can never be reorged: `canonical_apply::MAX_REORG_DEPTH` is 100, and
-// `SETTLED_DEPTH` is 10x that (the same margin as `dag_prune::MIN_RETAIN_BLOCKS`).
-// The checkpoints are dropped whenever the applied tip height goes backwards.
+// applied tip, and later walks start from the nearest such checkpoint.
+//
+// CACHE SOUNDNESS
+//
+// Depth below the tip is NOT a reorg bound: `canonical_apply::MAX_REORG_DEPTH`
+// only bounds the in-memory rollback, and a deeper fork is taken by the
+// from-genesis spine rebuild (`recover_to_head`), bounded only by the finalized
+// floor (0 until checkpoint finality is wired). Such a rebuild can replace
+// history arbitrarily deep and finish at the same or a greater height between
+// two RPC calls, and the abandoned blocks stay in storage.
+//
+// So every checkpoint is tied to verified ancestry. The cache records the
+// applied tip (`anchor`) the checkpoints were collected under; every checkpoint
+// is an ancestor of it. On each call, before any checkpoint is used, the new
+// applied tip is checked to EXTEND the anchor: the resolver walks the new tip's
+// selected-parent chain down to the anchor's height and compares hashes. A match
+// means the chain only grew, so every checkpoint is still an ancestor of the new
+// tip, and the anchor moves up. Anything else — a different block at the anchor
+// height (chain replaced, at any depth), a lower tip, a broken walk, or a gap
+// wider than `MAX_ANCHOR_WALK` — drops every checkpoint. The verification walk
+// costs one header per block the tip advanced since the previous call, so it is
+// amortised over chain growth.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -51,9 +69,14 @@ pub const LOG_RANGE_LIMIT_CODE: i64 = -32005;
 /// clamped answer is indistinguishable from "no logs after fromBlock+1000".
 pub const LEGACY_CLAMP_ENV: &str = "CITRATE_RPC_GETLOGS_CLAMP_RANGE";
 
-/// A block at least this far below the applied tip is settled (10x the deepest
-/// reorg `canonical_apply` accepts), so its hash can be cached.
+/// Checkpoints are only collected at least this far below the applied tip, so
+/// the cache holds stable history rather than churning near the tip. This is a
+/// cache policy, not the soundness argument (see "CACHE SOUNDNESS" above).
 pub const SETTLED_DEPTH: u64 = 1_000;
+
+/// Widest tip advance the anchor check walks; a larger jump since the previous
+/// call drops the cache instead (the next deep query re-walks from the tip).
+pub const MAX_ANCHOR_WALK: u64 = 16 * CHECKPOINT_STRIDE;
 
 /// Spacing of cached settled checkpoints.
 pub const CHECKPOINT_STRIDE: u64 = 1_024;
@@ -93,10 +116,55 @@ pub fn bound_log_range(from: u64, to: u64, legacy_clamp: bool) -> Result<u64, js
 
 #[derive(Default)]
 struct CacheState {
-    /// height -> executed block hash, only for settled heights.
+    /// height -> executed block hash. Every entry is on the selected-parent
+    /// chain of `anchor`.
     checkpoints: BTreeMap<u64, Hash>,
-    /// Highest applied-tip height seen; a lower one clears the checkpoints.
-    tip_high_water: u64,
+    /// The applied tip the checkpoints were verified against.
+    anchor: Option<(Hash, u64)>,
+}
+
+impl CacheState {
+    /// Re-anchor the cache on the current applied tip, keeping the checkpoints
+    /// only when the tip provably extends the previous anchor.
+    fn reanchor(&mut self, storage: &StorageManager, tip_hash: Hash, tip_height: u64) {
+        let keep = match self.anchor {
+            Some((hash, height)) if hash == tip_hash && height == tip_height => return,
+            Some((hash, height)) => {
+                tip_height >= height
+                    && tip_height.saturating_sub(height) <= MAX_ANCHOR_WALK
+                    && hash_at_height(storage, tip_hash, tip_height, height) == Some(hash)
+            }
+            None => false,
+        };
+        if !keep {
+            self.checkpoints.clear();
+        }
+        self.anchor = Some((tip_hash, tip_height));
+    }
+}
+
+/// The hash at `target` on the selected-parent chain of `(start, start_height)`,
+/// or `None` when the chain cannot be followed (missing or malformed header).
+fn hash_at_height(
+    storage: &StorageManager,
+    start: Hash,
+    start_height: u64,
+    target: u64,
+) -> Option<Hash> {
+    let mut cursor = start;
+    let mut expect_at_most = start_height;
+    loop {
+        let header = storage.blocks.get_header(&cursor).ok().flatten()?;
+        let h = header.height;
+        if h > expect_at_most || h < target {
+            return None;
+        }
+        if h == target {
+            return Some(cursor);
+        }
+        expect_at_most = h.saturating_sub(1);
+        cursor = header.selected_parent_hash;
+    }
 }
 
 /// Settled-checkpoint cache shared by every `eth_getLogs` call on one handler.
@@ -139,10 +207,9 @@ impl ExecutedChainIndex {
 
         let (mut cursor, mut expect_at_most) = {
             let mut st = self.state.lock().map_err(|_| "log index lock poisoned")?;
-            if tip_height < st.tip_high_water {
-                st.checkpoints.clear();
-            }
-            st.tip_high_water = tip_height;
+            // Before any checkpoint is trusted: the tip must extend the anchor
+            // the checkpoints were collected under.
+            st.reanchor(storage, tip_hash, tip_height);
             let nearest = if to <= settled_below {
                 st.checkpoints
                     .range(to..=settled_below)
@@ -197,7 +264,9 @@ impl ExecutedChainIndex {
 
         if !found.is_empty() {
             if let Ok(mut st) = self.state.lock() {
-                if st.tip_high_water == tip_height {
+                // Only under the anchor this walk started from: the found
+                // hashes are its ancestors, not necessarily a newer anchor's.
+                if st.anchor == Some((tip_hash, tip_height)) {
                     st.checkpoints.extend(found);
                 }
             }
