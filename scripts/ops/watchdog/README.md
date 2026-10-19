@@ -29,11 +29,18 @@ pause cannot restart a node that is only catching up. The sync-aware check below
 not cover every replay: a drain holds the head without reporting `eth_syncing`
 progress (2026-10-15), which is why the pause is explicit.
 
+`pause` returns only once no poll that started before the marker can still act: every
+poll holds an exclusive flock on `$STATE_DIR/.poll.lock` from its marker check through any
+restart, and `pause` writes `PAUSE` and then waits (up to `LOCK_WAIT_SECS`, default 300 s)
+for that lock. If the wait times out it exits non-zero with "NOT confirmed": the marker is
+in place, but do not start the maintenance until a re-run of `pause` succeeds. A poll that
+finds the lock taken by a control command restarts nothing that round.
+
 ## Incident containment
 For a suspected key compromise, never `pause` and `systemctl stop citrate-node`: a
 stopped node's RPC goes quiet and an active watchdog restarts it after `STALL_SECS`.
 ```
-citrate-watchdog-ctl.sh contain "<reason>"   # marker, watchdog timer off, poll stopped, THEN node stopped+disabled
+citrate-watchdog-ctl.sh contain "<reason>"   # marker, running poll drained, watchdog timer off, THEN node stopped+disabled
 citrate-watchdog-ctl.sh status               # CONTAINED
 citrate-watchdog-ctl.sh release "<reason>"   # after the security response; starts nothing
 ```

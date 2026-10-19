@@ -25,6 +25,13 @@
 # key compromise) disables this timer, stops any running poll, writes $STATE_DIR/CONTAIN and
 # only then stops and disables the node. While CONTAIN exists this script restarts nothing,
 # with no deadline, even if the timer is re-enabled by hand.
+#
+# POLL LOCK: a whole poll (the PAUSE/CONTAIN check, the RPC reads and any restart) runs
+# holding an exclusive flock on $STATE_DIR/.poll.lock. citrate-watchdog-ctl.sh takes the same
+# lock after writing PAUSE/CONTAIN and reports success only once it holds it, so when pause or
+# contain returns, no poll that read the marker before it was written is still able to restart
+# the node. If the lock is busy (a control command is running) this poll restarts nothing and
+# exits.
 set -u
 RPC="${RPC:-http://127.0.0.1:8545}"
 UNIT="${UNIT:-citrate-node}"
@@ -37,10 +44,19 @@ CONTAIN_FILE="$STATE_DIR/CONTAIN"
 NODE_LABEL="${NODE_LABEL:-$(hostname -s 2>/dev/null || echo node)}"
 mkdir -p "$STATE_DIR"
 ALERT="${ALERT:-/usr/local/bin/citrate-alert.sh}"
+LOCK_FILE="$STATE_DIR/.poll.lock"
+
+# Hold the poll lock (fd 9) for the rest of this run; it is released when the script exits.
+# Commands started below get `9>&-` so nothing they leave behind keeps the lock.
+exec 9>>"$LOCK_FILE"
+if ! flock -n 9; then
+  logger -t citrate-watchdog "a pause/contain/resume is in progress (poll lock held); not checking $UNIT this poll" 9>&-
+  exit 0
+fi
 
 rpc() { # method -> raw json
   curl -s -m 8 -X POST "$RPC" -H 'content-type: application/json' \
-    --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":[]}"
+    --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":[]}" 9>&-
 }
 
 now=$(date +%s)
@@ -65,7 +81,7 @@ if [ -e "$PAUSE_FILE" ]; then
     if [ "$((now - last_nag))" -ge 3600 ]; then
       echo "$now" > "$STATE.nag"
       logger -t citrate-watchdog "PAUSED past its deadline ($reason); still not restarting $UNIT"
-      [ -x "$ALERT" ] && "$ALERT" "CITRATE watchdog pause expired" "$NODE_LABEL: watchdog paused for '$reason' past its deadline. Resume with citrate-watchdog-ctl.sh resume once the replay is done."
+      [ -x "$ALERT" ] && "$ALERT" 9>&- "CITRATE watchdog pause expired" "$NODE_LABEL: watchdog paused for '$reason' past its deadline. Resume with citrate-watchdog-ctl.sh resume once the replay is done."
     fi
   else
     logger -t citrate-watchdog "paused ($reason) until $until_ts; not checking $UNIT"
@@ -82,8 +98,8 @@ if [ -z "$head_hex" ] || [ "${head_hex#0x}" = "$head_hex" ]; then
   echo "$last_down" > "$STATE.downsince"
   if [ "$((now - last_down))" -ge "$STALL_SECS" ]; then
     logger -t citrate-watchdog "RPC unreachable ${STALL_SECS}s -> restart $UNIT"
-    systemctl restart "$UNIT"
-    [ -x "$ALERT" ] && "$ALERT" "CITRATE NodeDown" "$NODE_LABEL $UNIT RPC unreachable ${STALL_SECS}s; auto-restarted."
+    systemctl restart "$UNIT" 9>&-
+    [ -x "$ALERT" ] && "$ALERT" 9>&- "CITRATE NodeDown" "$NODE_LABEL $UNIT RPC unreachable ${STALL_SECS}s; auto-restarted."
     rm -f "$STATE.downsince"
   fi
   exit 0
@@ -113,12 +129,12 @@ if [ "$((now - prev_t))" -ge "$STALL_SECS" ]; then
   n="$(cat "$STATE.restarts" 2>/dev/null || echo 0)"; n=$((n+1)); echo "$n" > "$STATE.restarts"
   dec=$(( $(printf '%d' "$progress") ))
   logger -t citrate-watchdog "Stall($mode): progress $progress ($dec) frozen ${STALL_SECS}s (restart #$n) -> restart $UNIT"
-  systemctl restart "$UNIT"
+  systemctl restart "$UNIT" 9>&-
   echo "$now" > "$STATE.time"
   if [ "$n" -ge 3 ]; then
-    [ -x "$ALERT" ] && "$ALERT" "CITRATE Stall CRITICAL" "$NODE_LABEL $mode stalled at $dec; $n auto-restarts did not clear it. MANUAL ACTION NEEDED."
+    [ -x "$ALERT" ] && "$ALERT" 9>&- "CITRATE Stall CRITICAL" "$NODE_LABEL $mode stalled at $dec; $n auto-restarts did not clear it. MANUAL ACTION NEEDED."
   else
-    [ -x "$ALERT" ] && "$ALERT" "CITRATE Stall" "$NODE_LABEL $mode progress $dec frozen ${STALL_SECS}s; auto-restarted (#$n)."
+    [ -x "$ALERT" ] && "$ALERT" 9>&- "CITRATE Stall" "$NODE_LABEL $mode progress $dec frozen ${STALL_SECS}s; auto-restarted (#$n)."
   fi
 fi
 exit 0
