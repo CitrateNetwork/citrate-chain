@@ -2011,16 +2011,16 @@ pub fn register_eth_methods_with_finality(
         // `block.transactions` order, then receipt log order. The height index
         // is last-writer-wins across DAG siblings and can name a block whose
         // transactions never executed (see `canonical_logs`).
-        let blocks = executed_chain_logs
-            .executed_blocks(&storage_logs, from_block, effective_to)
-            .map_err(|e| jsonrpc_core::Error {
-                code: jsonrpc_core::ErrorCode::InternalError,
-                message: format!("eth_getLogs: {e}"),
-                data: None,
-            })?;
+        // The resolver names the blocks (hashes only); each body is loaded,
+        // scanned and dropped before the next, so a request holds one block.
+        let executed = executed_chain_logs
+            .executed_hashes(&storage_logs, from_block, effective_to)
+            .map_err(|e| e.to_rpc_error())?;
 
         let mut result_logs: Vec<Value> = Vec::new();
-        for block in &blocks {
+        for (_, executed_hash) in &executed {
+            let block = crate::canonical_logs::load_executed_block(&storage_logs, executed_hash)
+                .map_err(|e| e.to_rpc_error())?;
             let block_hash = block.header.block_hash;
             // logIndex is the log's position in its block (Ethereum semantics),
             // counted over every log of the block, matched or not.

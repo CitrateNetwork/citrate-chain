@@ -48,6 +48,14 @@
 // wider than `MAX_ANCHOR_WALK` — drops every checkpoint. The verification walk
 // costs one header per block the tip advanced since the previous call, so it is
 // amortised over chain growth.
+//
+// PER-REQUEST BOUNDS
+//
+// The resolver returns hashes only; bodies are loaded and dropped one block at a
+// time by the caller, so memory per request is one block plus the matched logs.
+// Header reads per request are capped at `MAX_HEADER_WALK`. A cold cache deep
+// below the tip needs more: the request publishes the checkpoints it reached and
+// returns a retryable error, and only one such fill runs at a time.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -167,15 +175,82 @@ fn hash_at_height(
     }
 }
 
+/// Why the resolver could not name the executed blocks of a range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogIndexError {
+    /// The walk needed more than the per-request header budget. Checkpoints it
+    /// collected are kept, so the same request makes progress when retried.
+    /// Also returned when another request is already filling the cold cache.
+    Retry(String),
+    /// The executed chain cannot be followed (missing or malformed ancestor).
+    Unavailable(String),
+}
+
+impl std::fmt::Display for LogIndexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogIndexError::Retry(m) | LogIndexError::Unavailable(m) => f.write_str(m),
+        }
+    }
+}
+
+/// JSON-RPC error code for a retryable [`LogIndexError::Retry`] ("resource
+/// unavailable", EIP-1474).
+pub const LOG_INDEX_RETRY_CODE: i64 = -32002;
+
+impl LogIndexError {
+    /// The JSON-RPC error `eth_getLogs` returns for this condition.
+    pub fn to_rpc_error(&self) -> jsonrpc_core::Error {
+        match self {
+            LogIndexError::Retry(m) => jsonrpc_core::Error {
+                code: jsonrpc_core::ErrorCode::ServerError(LOG_INDEX_RETRY_CODE),
+                message: format!("eth_getLogs: {m}; retry the same request"),
+                data: Some(serde_json::json!({ "retryable": true })),
+            },
+            LogIndexError::Unavailable(m) => jsonrpc_core::Error {
+                code: jsonrpc_core::ErrorCode::InternalError,
+                message: format!("eth_getLogs: {m}"),
+                data: None,
+            },
+        }
+    }
+}
+
+/// Most headers one request may read while resolving its range (the anchor
+/// check is bounded separately by [`MAX_ANCHOR_WALK`]). With a warm cache any
+/// allowed range needs at most `SETTLED_DEPTH + MAX_LOG_BLOCK_RANGE +
+/// CHECKPOINT_STRIDE` reads; only a cold walk deep into history exceeds it, and
+/// that walk is split across retries.
+pub const MAX_HEADER_WALK: u64 = 64 * CHECKPOINT_STRIDE;
+
 /// Settled-checkpoint cache shared by every `eth_getLogs` call on one handler.
-#[derive(Default)]
 pub struct ExecutedChainIndex {
     state: Mutex<CacheState>,
+    /// Held by the one request allowed to run a walk longer than the budget
+    /// (a cold-cache fill); others get [`LogIndexError::Retry`] instead of
+    /// repeating the same scan.
+    fill: Mutex<()>,
+    walk_budget: u64,
+}
+
+impl Default for ExecutedChainIndex {
+    fn default() -> Self {
+        Self::with_walk_budget(MAX_HEADER_WALK)
+    }
 }
 
 impl ExecutedChainIndex {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An index whose per-request header budget is `walk_budget` (at least 1).
+    pub fn with_walk_budget(walk_budget: u64) -> Self {
+        Self {
+            state: Mutex::new(CacheState::default()),
+            fill: Mutex::new(()),
+            walk_budget: walk_budget.max(1),
+        }
     }
 
     /// Number of cached checkpoints (tests / diagnostics).
@@ -186,17 +261,23 @@ impl ExecutedChainIndex {
             .unwrap_or_default()
     }
 
-    /// The executed blocks with height in `from..=to`, ascending (the canonical
-    /// execution order). Heights above the applied tip have not executed and are
-    /// absent. `Err` when the executed chain cannot be followed down to `from`
-    /// (a missing or malformed ancestor) — never a silently shortened answer.
-    pub fn executed_blocks(
+    /// `(height, hash)` of the executed blocks with height in `from..=to`,
+    /// ascending (the canonical execution order). Only hashes are returned:
+    /// callers load one body at a time ([`load_executed_block`]) so a request
+    /// never holds a whole range of blocks. Heights above the applied tip have
+    /// not executed and are absent. [`LogIndexError::Unavailable`] when the
+    /// executed chain cannot be followed down to `from` — never a silently
+    /// shortened answer; [`LogIndexError::Retry`] when the walk would exceed
+    /// the per-request header budget.
+    pub fn executed_hashes(
         &self,
         storage: &StorageManager,
         from: u64,
         to: u64,
-    ) -> Result<Vec<Block>, String> {
-        let Some((tip_hash, tip_height)) = applied_anchor(storage)? else {
+    ) -> Result<Vec<(u64, Hash)>, LogIndexError> {
+        let Some((tip_hash, tip_height)) =
+            applied_anchor(storage).map_err(LogIndexError::Unavailable)?
+        else {
             return Ok(Vec::new());
         };
         let to = to.min(tip_height);
@@ -206,7 +287,10 @@ impl ExecutedChainIndex {
         let settled_below = tip_height.saturating_sub(SETTLED_DEPTH);
 
         let (mut cursor, mut expect_at_most) = {
-            let mut st = self.state.lock().map_err(|_| "log index lock poisoned")?;
+            let mut st = self
+                .state
+                .lock()
+                .map_err(|_| LogIndexError::Unavailable("log index lock poisoned".into()))?;
             // Before any checkpoint is trusted: the tip must extend the anchor
             // the checkpoints were collected under.
             st.reanchor(storage, tip_hash, tip_height);
@@ -230,30 +314,54 @@ impl ExecutedChainIndex {
             }
         };
 
+        // Heights strictly decrease along the walk, so it reads at most
+        // `start - from + 1` headers. A longer walk than the budget is a cold
+        // fill: one request at a time runs it, each run bounded by the budget.
+        let span = expect_at_most.saturating_sub(from).saturating_add(1);
+        let _fill_guard = if span > self.walk_budget {
+            match self.fill.try_lock() {
+                Ok(g) => Some(g),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Err(LogIndexError::Retry(
+                        "log index is warming (another request is filling it)".into(),
+                    ))
+                }
+                Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+            }
+        } else {
+            None
+        };
+
         let mut found: Vec<(u64, Hash)> = Vec::new();
-        let mut out_rev: Vec<Block> = Vec::new();
+        let mut out_rev: Vec<(u64, Hash)> = Vec::new();
+        let mut reads: u64 = 0;
+        let mut exhausted = false;
         loop {
+            if reads >= self.walk_budget {
+                exhausted = true;
+                break;
+            }
+            reads = reads.saturating_add(1);
             let header = storage
                 .blocks
                 .get_header(&cursor)
-                .map_err(|e| format!("header {cursor}: {e}"))?
-                .ok_or_else(|| format!("executed chain broken: block {cursor} is not stored"))?;
+                .map_err(|e| LogIndexError::Unavailable(format!("header {cursor}: {e}")))?
+                .ok_or_else(|| {
+                    LogIndexError::Unavailable(format!(
+                        "executed chain broken: block {cursor} is not stored"
+                    ))
+                })?;
             let h = header.height;
             if h > expect_at_most {
-                return Err(format!(
+                return Err(LogIndexError::Unavailable(format!(
                     "executed chain malformed: block {cursor} at height {h} above its child"
-                ));
+                )));
             }
             if h <= settled_below && h.checked_rem(CHECKPOINT_STRIDE) == Some(0) {
                 found.push((h, cursor));
             }
             if h <= to && h >= from {
-                let block = storage
-                    .blocks
-                    .get_block(&cursor)
-                    .map_err(|e| format!("block {cursor}: {e}"))?
-                    .ok_or_else(|| format!("executed chain broken: block {cursor} has no body"))?;
-                out_rev.push(block);
+                out_rev.push((h, cursor));
             }
             if h <= from || h == 0 {
                 break;
@@ -271,9 +379,25 @@ impl ExecutedChainIndex {
                 }
             }
         }
+        if exhausted {
+            return Err(LogIndexError::Retry(format!(
+                "log index is warming (reached height {expect_at_most} toward {from})"
+            )));
+        }
         out_rev.reverse();
         Ok(out_rev)
     }
+}
+
+/// The body of an executed block named by [`ExecutedChainIndex::executed_hashes`].
+pub fn load_executed_block(storage: &StorageManager, hash: &Hash) -> Result<Block, LogIndexError> {
+    storage
+        .blocks
+        .get_block(hash)
+        .map_err(|e| LogIndexError::Unavailable(format!("block {hash}: {e}")))?
+        .ok_or_else(|| {
+            LogIndexError::Unavailable(format!("executed chain broken: block {hash} has no body"))
+        })
 }
 
 /// The block the executor's state reflects: the persisted applied tip, or — on a
@@ -315,6 +439,50 @@ mod tests {
         assert_eq!(e.code, jsonrpc_core::ErrorCode::ServerError(-32005));
         assert_eq!(e.data.unwrap()["maxBlockRange"], 1_000);
         assert!(bound_log_range(u64::MAX - 1, u64::MAX, false).is_ok());
+    }
+
+    /// While one request fills a cold cache, another that would also need a
+    /// walk over the budget is told to retry instead of repeating the scan; a
+    /// request that fits the budget is served.
+    #[test]
+    fn concurrent_cold_fill_is_not_duplicated() {
+        use citrate_consensus::types::BlockBuilder;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let storage = StorageManager::new(
+            tmp.path(),
+            citrate_storage::pruning::PruningConfig::default(),
+        )
+        .expect("storage");
+        let mut parent = Hash::default();
+        for h in 0..10u64 {
+            let mut raw = [0u8; 32];
+            raw[..8].copy_from_slice(&h.to_be_bytes());
+            raw[31] = 0xA0;
+            let b = BlockBuilder::new()
+                .hash(Hash::new(raw))
+                .parent(parent)
+                .height(h)
+                .build_unhashed();
+            storage.blocks.put_block(&b).expect("block");
+            parent = b.hash();
+        }
+        storage.blocks.put_applied_tip(&parent, 9).expect("tip");
+
+        let idx = ExecutedChainIndex::with_walk_budget(3);
+        let held = idx.fill.lock().expect("fill gate");
+        match idx.executed_hashes(&storage, 0, 0) {
+            Err(LogIndexError::Retry(m)) => assert!(m.contains("another request"), "{m}"),
+            other => panic!("expected retry while a fill runs, got {other:?}"),
+        }
+        assert_eq!(
+            idx.executed_hashes(&storage, 8, 9).expect("near tip").len(),
+            2
+        );
+        drop(held);
+        assert!(matches!(
+            idx.executed_hashes(&storage, 0, 0),
+            Err(LogIndexError::Retry(_))
+        ));
     }
 
     #[test]

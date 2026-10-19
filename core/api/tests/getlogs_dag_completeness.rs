@@ -5,7 +5,8 @@
 // Drives the real registered IoHandler over RocksDB.
 
 use citrate_api::canonical_logs::{
-    bound_log_range, ExecutedChainIndex, CHECKPOINT_STRIDE, SETTLED_DEPTH,
+    bound_log_range, ExecutedChainIndex, LogIndexError, CHECKPOINT_STRIDE, LOG_INDEX_RETRY_CODE,
+    SETTLED_DEPTH,
 };
 use citrate_api::eth_rpc::register_eth_methods_with_finality;
 use citrate_api::FilterRegistry;
@@ -381,14 +382,14 @@ fn executed_chain_index_resolves_deep_history_through_checkpoints() {
     );
 
     let idx = ExecutedChainIndex::new();
-    let first = idx.executed_blocks(&storage, 0, 10).expect("walk");
-    let hashes: Vec<Hash> = first.iter().map(|b| b.hash()).collect();
+    let first = idx.executed_hashes(&storage, 0, 10).expect("walk");
+    let hashes: Vec<Hash> = first.iter().map(|(_, h)| *h).collect();
     assert_eq!(hashes, canon[0..=10].to_vec());
     assert_eq!(idx.checkpoint_count(), 2, "checkpoints at 0 and 1024");
 
     // A page just below the 1024 checkpoint resolves from it.
-    let page = idx.executed_blocks(&storage, 1_000, 1_020).expect("page");
-    let hashes: Vec<Hash> = page.iter().map(|b| b.hash()).collect();
+    let page = idx.executed_hashes(&storage, 1_000, 1_020).expect("page");
+    let hashes: Vec<Hash> = page.iter().map(|(_, h)| *h).collect();
     assert_eq!(hashes, canon[1_000..=1_020].to_vec());
 
     // A tip regression drops the cache.
@@ -397,10 +398,10 @@ fn executed_chain_index_resolves_deep_history_through_checkpoints() {
         .put_applied_tip(&canon[2_000], 2_000)
         .expect("tip");
     let again = idx
-        .executed_blocks(&storage, 3, 6)
+        .executed_hashes(&storage, 3, 6)
         .expect("after regression");
     assert_eq!(
-        again.iter().map(|b| b.hash()).collect::<Vec<_>>(),
+        again.iter().map(|(_, h)| *h).collect::<Vec<_>>(),
         canon[3..=6].to_vec()
     );
 }
@@ -416,9 +417,9 @@ fn executed_chain_index_errors_on_a_missing_ancestor() {
     storage.blocks.put_block(&b2).expect("b2");
     storage.blocks.put_applied_tip(&b2.hash(), 2).expect("tip");
     let idx = ExecutedChainIndex::new();
-    assert!(idx.executed_blocks(&storage, 0, 2).is_err());
+    assert!(idx.executed_hashes(&storage, 0, 2).is_err());
     // A range entirely above the gap is still served.
-    assert_eq!(idx.executed_blocks(&storage, 2, 2).expect("top").len(), 1);
+    assert_eq!(idx.executed_hashes(&storage, 2, 2).expect("top").len(), 1);
 }
 
 /// Builds a straight chain `tag` over heights `lo..=hi` on top of `parent`,
@@ -526,7 +527,7 @@ fn executed_chain_index_keeps_checkpoints_only_on_extension() {
         .put_applied_tip(&old[top as usize - 1], top)
         .expect("tip");
     let idx = ExecutedChainIndex::new();
-    idx.executed_blocks(&storage, 0, 10).expect("warm");
+    idx.executed_hashes(&storage, 0, 10).expect("warm");
     assert_eq!(idx.checkpoint_count(), 2);
 
     // Extension: kept.
@@ -534,7 +535,7 @@ fn executed_chain_index_keeps_checkpoints_only_on_extension() {
         .blocks
         .put_applied_tip(&old[top as usize + 2], top + 3)
         .expect("tip");
-    idx.executed_blocks(&storage, 1_000, 1_001).expect("page");
+    idx.executed_hashes(&storage, 1_000, 1_001).expect("page");
     assert_eq!(
         idx.checkpoint_count(),
         2,
@@ -547,9 +548,60 @@ fn executed_chain_index_keeps_checkpoints_only_on_extension() {
         .blocks
         .put_applied_tip(new.last().expect("tip"), top + 3)
         .expect("tip");
-    let page = idx.executed_blocks(&storage, 1_000, 1_001).expect("page");
+    let page = idx.executed_hashes(&storage, 1_000, 1_001).expect("page");
     assert_eq!(
-        page.iter().map(|b| b.hash()).collect::<Vec<_>>(),
+        page.iter().map(|(_, h)| *h).collect::<Vec<_>>(),
         vec![hash_of(0xB0, 1_000), hash_of(0xB0, 1_001)]
     );
+}
+
+/// A cold walk deeper than the per-request header budget is split across
+/// retries: each call reads at most the budget, publishes the checkpoints it
+/// reached, and returns a retryable error; the retry that fits the budget
+/// answers in full.
+#[test]
+fn executed_chain_index_bounds_a_cold_walk_and_progresses_on_retry() {
+    let (storage, _tmp) = storage();
+    let top = 6_000u64;
+    let mut parent = Hash::default();
+    let mut canon = Vec::new();
+    for h in 0..=top {
+        let b = block(hash_of(0xA0, h), parent, vec![], h, vec![]);
+        storage.blocks.put_block(&b).expect("block");
+        parent = b.hash();
+        canon.push(parent);
+    }
+    storage.blocks.put_applied_tip(&parent, top).expect("tip");
+
+    let idx = ExecutedChainIndex::with_walk_budget(2_500);
+    // 6000 -> 3501: reaches the 4096 checkpoint.
+    match idx.executed_hashes(&storage, 0, 10) {
+        Err(LogIndexError::Retry(_)) => {}
+        other => panic!("first cold call must be a bounded retry, got {other:?}"),
+    }
+    assert_eq!(idx.checkpoint_count(), 1);
+    // 4096 -> 1597: reaches 3072 and 2048.
+    assert!(matches!(
+        idx.executed_hashes(&storage, 0, 10),
+        Err(LogIndexError::Retry(_))
+    ));
+    assert_eq!(idx.checkpoint_count(), 3);
+    // 2048 -> 0 fits the budget.
+    let got = idx
+        .executed_hashes(&storage, 0, 10)
+        .expect("third call answers");
+    assert_eq!(
+        got.iter().map(|(_, h)| *h).collect::<Vec<_>>(),
+        canon[0..=10].to_vec()
+    );
+    // Warm: a query near the tip and one deep in history both fit.
+    assert!(idx.executed_hashes(&storage, 5_990, 6_000).is_ok());
+    assert!(idx.executed_hashes(&storage, 100, 200).is_ok());
+
+    let rpc = LogIndexError::Retry("x".into()).to_rpc_error();
+    assert_eq!(
+        rpc.code,
+        jsonrpc_core::ErrorCode::ServerError(LOG_INDEX_RETRY_CODE)
+    );
+    assert_eq!(rpc.data.expect("data")["retryable"], true);
 }
