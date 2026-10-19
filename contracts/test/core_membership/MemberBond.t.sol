@@ -64,17 +64,12 @@ contract MemberBondTest is Test {
 
         MembershipStakeVault impl = new MembershipStakeVault();
         vault = MembershipStakeVault(
-            payable(
-                address(
+            payable(address(
                     new ERC1967Proxy(
                         address(impl),
-                        abi.encodeCall(
-                            MembershipStakeVault.initialize,
-                            (admin, registry, sbt, address(bondImpl))
-                        )
+                        abi.encodeCall(MembershipStakeVault.initialize, (admin, registry, sbt, address(bondImpl)))
                     )
-                )
-            )
+                ))
         );
 
         _mockVerify(true);
@@ -301,10 +296,7 @@ contract MemberBondTest is Test {
 
         // Warp a full year WITHOUT advancing blocks — the stall case.
         vm.warp(block.timestamp + 364 days);
-        assertTrue(
-            block.number < bond.unlockBlock(),
-            "precondition: the height leg has NOT been reached"
-        );
+        assertTrue(block.number < bond.unlockBlock(), "precondition: the height leg has NOT been reached");
         assertTrue(bond.isUnlocked(), "wall-clock alone must unlock a stalled chain");
     }
 
@@ -448,111 +440,192 @@ contract MemberBondTest is Test {
         assertEq(address(bond).balance, 0, "and nothing is stranded in the bond");
     }
 
-    // ── Genesis (C4) — exit for a bond that never activated ───────────────
+    // ── Genesis (C4) — a never-activated grant returns to the TREASURY ────
     //
-    // A member who never runs a node never calls `activate`. Before this path
-    // existed their principal had no exit at all: `requestRelease` and
-    // `withdrawToMember` both require an activated bond, and nothing else pays
-    // out. It is the same entitlement as the activated path (principal to the
-    // member once the lock has run and KYC holds), reached without a registry
-    // round trip, and it is also the only exit if governance later raises the
-    // registry's `minStake` above the grant.
+    // Owner decision 2026-10-19 (fed#331): an unactivated grant is never the
+    // member's to withdraw, before or after the lock. Only activated, staked
+    // bonds pay out, under the normal exit rules. After the lock the vault's
+    // governance-set treasury, and only it, may reclaim the principal once,
+    // and the bond can never be activated afterwards.
 
-    function test_withdrawUnactivated_paysPrincipalAfterLockAndKyc() public {
-        _grant(member, memberTokenId);
-        MemberBond bond = MemberBond(payable(vault.bondOf(member)));
-        sbt.setKycVerified(memberTokenId, true);
+    /// The grantor (this test contract owns the vault) can hold a membership token itself.
+    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
+        return this.onERC721Received.selector;
+    }
+
+    address internal vaultGov = address(0x60AA);
+    address internal treasury = address(0x7EA5);
+
+    function _setTreasury(address t) internal {
+        if (vault.governance() == address(0)) vault.initializeGovernance(vaultGov);
+        vm.prank(vaultGov);
+        vault.setTreasury(t);
+        vm.prank(t);
+        vault.acceptTreasury();
+    }
+
+    function _unlock(MemberBond bond) internal {
         vm.roll(block.number + bond.LOCK_BLOCKS());
-
-        vm.prank(member);
-        bond.withdrawUnactivated();
-
-        assertEq(member.balance, GRANT_AMOUNT, "the member receives the principal");
-        assertEq(address(bond).balance, 0, "the bond is empty");
-        assertTrue(bond.releaseRequested(), "the exit is recorded for the vault");
     }
 
-    function test_withdrawUnactivated_kycIsCheckedBeforeTheLock() public {
-        _grant(member, memberTokenId);
-        MemberBond bond = MemberBond(payable(vault.bondOf(member)));
-        vm.prank(member);
-        vm.expectRevert(MemberBond.KycRequired.selector);
-        bond.withdrawUnactivated();
-    }
-
-    function test_withdrawUnactivated_isLocked() public {
-        _grant(member, memberTokenId);
-        MemberBond bond = MemberBond(payable(vault.bondOf(member)));
-        sbt.setKycVerified(memberTokenId, true);
-        vm.roll(block.number + bond.LOCK_BLOCKS() - 1);
-        vm.warp(block.timestamp + bond.LOCK_SECONDS() - 1);
-        vm.prank(member);
-        vm.expectRevert(MemberBond.StillLocked.selector);
-        bond.withdrawUnactivated();
-    }
-
-    /// The wall-clock leg alone unlocks it: a stalled chain must not hold the
-    /// principal past the member's year.
-    function test_withdrawUnactivated_wallClockLegUnlocksOnAStalledChain() public {
-        _grant(member, memberTokenId);
-        MemberBond bond = MemberBond(payable(vault.bondOf(member)));
-        sbt.setKycVerified(memberTokenId, true);
-        vm.warp(block.timestamp + bond.LOCK_SECONDS());
-        vm.prank(member);
-        bond.withdrawUnactivated();
-        assertEq(member.balance, GRANT_AMOUNT);
-    }
-
-    function test_withdrawUnactivated_onlyMember() public {
-        _grant(member, memberTokenId);
-        MemberBond bond = MemberBond(payable(vault.bondOf(member)));
-        sbt.setKycVerified(memberTokenId, true);
-        vm.roll(block.number + bond.LOCK_BLOCKS());
-        vm.prank(attacker);
-        vm.expectRevert(MemberBond.NotMember.selector);
-        bond.withdrawUnactivated();
-        vm.prank(address(vault));
-        vm.expectRevert(MemberBond.NotMember.selector);
-        bond.withdrawUnactivated();
-    }
-
-    function test_withdrawUnactivated_refusedOnceActivated() public {
-        _grant(member, memberTokenId);
-        MemberBond bond = MemberBond(payable(vault.bondOf(member)));
-        vm.prank(member);
-        bond.activate(PK_A, SIG);
-        sbt.setKycVerified(memberTokenId, true);
-        vm.roll(block.number + bond.LOCK_BLOCKS());
-        vm.prank(member);
-        vm.expectRevert(MemberBond.AlreadyActivated.selector);
-        bond.withdrawUnactivated();
-    }
-
-    function test_withdrawUnactivated_onlyOnce_andBlocksLaterActivation() public {
-        _grant(member, memberTokenId);
-        MemberBond bond = MemberBond(payable(vault.bondOf(member)));
-        sbt.setKycVerified(memberTokenId, true);
-        vm.roll(block.number + bond.LOCK_BLOCKS());
-        vm.startPrank(member);
-        bond.withdrawUnactivated();
-        vm.expectRevert(MemberBond.AlreadyReleasing.selector);
-        bond.withdrawUnactivated();
-        vm.expectRevert(MemberBond.AlreadyReleasing.selector);
-        bond.activate(PK_A, SIG);
+    /// Every value-out path refuses `who` on an unactivated bond.
+    function _assertNoPayoutPath(MemberBond bond, address who) internal {
+        uint256 before = who.balance;
+        vm.startPrank(who);
+        (bool ok,) = address(bond).call(abi.encodeWithSignature("withdrawUnactivated()"));
+        assertFalse(ok, "no member exit for an unactivated bond exists");
+        vm.expectRevert();
+        bond.withdrawToMember();
+        vm.expectRevert();
+        bond.requestRelease();
+        vm.expectRevert();
+        bond.claimRewards();
+        vm.expectRevert();
+        bond.reclaimUnactivated();
         vm.stopPrank();
+        assertEq(who.balance, before, "nothing paid");
+        assertEq(address(bond).balance, GRANT_AMOUNT, "principal stays in the bond");
     }
 
-    /// The vault mirrors the exit: attribution (validator eligibility) stops.
-    function test_withdrawUnactivated_vaultRecordsTheRelease() public {
+    /// The member, a third party, and the grantor holding a grant as a member can
+    /// never take an unactivated grant: before the lock, after it, KYC or not.
+    function test_unactivated_noMemberOrThirdPartyEverWithdraws() public {
+        _setTreasury(treasury);
+        _grant(member, memberTokenId);
+        uint256 adminToken = sbt.mintMember(
+            admin, keccak256("sub-grantor"), uint64(block.timestamp), uint64(block.timestamp + 365 days)
+        );
+        _grant(admin, adminToken); // the grantor (vault owner) granted itself
+        MemberBond bond = MemberBond(payable(vault.bondOf(member)));
+        MemberBond own = MemberBond(payable(vault.bondOf(admin)));
+
+        _assertNoPayoutPath(bond, member);
+        _assertNoPayoutPath(bond, attacker);
+        _assertNoPayoutPath(own, admin);
+        sbt.setKycVerified(memberTokenId, true);
+        sbt.setKycVerified(adminToken, true);
+        _unlock(bond);
+        vm.warp(block.timestamp + bond.LOCK_SECONDS());
+        assertTrue(bond.isUnlocked() && bond.isKycVerified());
+        _assertNoPayoutPath(bond, member);
+        _assertNoPayoutPath(bond, attacker);
+        _assertNoPayoutPath(bond, admin);
+        _assertNoPayoutPath(own, admin);
+        _assertNoPayoutPath(bond, address(vault));
+    }
+
+    function test_reclaim_sendsPrincipalToTheTreasuryAfterTheLock() public {
+        _setTreasury(treasury);
         uint256 id = _grant(member, memberTokenId);
         MemberBond bond = MemberBond(payable(vault.bondOf(member)));
-        sbt.setKycVerified(memberTokenId, true);
-        vm.roll(block.number + bond.LOCK_BLOCKS());
-        vm.prank(member);
-        bond.withdrawUnactivated();
+        _unlock(bond);
 
-        vault.recordRelease(id);
+        vm.expectEmit(true, true, false, true, address(bond));
+        emit MemberBond.UnactivatedReclaimed(treasury, member, GRANT_AMOUNT);
+        vm.prank(treasury);
+        bond.reclaimUnactivated();
+
+        assertEq(treasury.balance, GRANT_AMOUNT, "principal to the treasury");
+        assertEq(member.balance, 0, "never to the member");
+        assertEq(address(bond).balance, 0);
+        assertTrue(bond.reclaimed());
+        assertFalse(bond.releaseRequested());
+
+        vault.recordReclaim(id);
         assertEq(vault.attributedStake(member), 0, "attribution detached");
-        assertEq(uint256(vault.getGrant(id).state), uint256(MembershipStakeVault.GrantState.Released));
+        assertEq(uint256(vault.getGrant(id).state), uint256(MembershipStakeVault.GrantState.Reclaimed));
+        vm.expectRevert(
+            abi.encodeWithSelector(MembershipStakeVault.WrongState.selector, MembershipStakeVault.GrantState.Reclaimed)
+        );
+        vault.recordReclaim(id);
+    }
+
+    /// Either leg of the lock must have run; one block / one second short is refused.
+    function test_reclaim_onlyAfterTheLock() public {
+        _setTreasury(treasury);
+        _grant(member, memberTokenId);
+        MemberBond bond = MemberBond(payable(vault.bondOf(member)));
+        vm.roll(block.number + bond.LOCK_BLOCKS() - 1);
+        vm.warp(block.timestamp + bond.LOCK_SECONDS() - 1);
+        vm.prank(treasury);
+        vm.expectRevert(MemberBond.StillLocked.selector);
+        bond.reclaimUnactivated();
+        // The wall-clock leg alone unlocks it (a stalled chain).
+        vm.warp(block.timestamp + 1);
+        vm.prank(treasury);
+        bond.reclaimUnactivated();
+        assertEq(treasury.balance, GRANT_AMOUNT);
+    }
+
+    function test_reclaim_onlyOnce_andActivationIsClosedAfterwards() public {
+        _setTreasury(treasury);
+        _grant(member, memberTokenId);
+        MemberBond bond = MemberBond(payable(vault.bondOf(member)));
+        _unlock(bond);
+        vm.startPrank(treasury);
+        bond.reclaimUnactivated();
+        vm.expectRevert(MemberBond.AlreadyReclaimed.selector);
+        bond.reclaimUnactivated();
+        vm.stopPrank();
+        vm.prank(member);
+        vm.expectRevert(MemberBond.AlreadyReclaimed.selector);
+        bond.activate(PK_A, SIG);
+        assertEq(treasury.balance, GRANT_AMOUNT, "paid exactly once");
+    }
+
+    function test_reclaim_refusedOnceActivated() public {
+        _setTreasury(treasury);
+        _grant(member, memberTokenId);
+        MemberBond bond = MemberBond(payable(vault.bondOf(member)));
+        vm.prank(member);
+        bond.activate(PK_A, SIG);
+        _unlock(bond);
+        vm.prank(treasury);
+        vm.expectRevert(MemberBond.AlreadyActivated.selector);
+        bond.reclaimUnactivated();
+        assertEq(treasury.balance, 0);
+    }
+
+    function test_reclaim_onlyTheTreasury_andNeverTheMember() public {
+        _grant(member, memberTokenId);
+        MemberBond bond = MemberBond(payable(vault.bondOf(member)));
+        _unlock(bond);
+        // No treasury set: nobody can reclaim.
+        vm.prank(treasury);
+        vm.expectRevert(MemberBond.TreasuryNotSet.selector);
+        bond.reclaimUnactivated();
+        _setTreasury(treasury);
+        address[4] memory notTreasury = [member, attacker, admin, vaultGov];
+        for (uint256 i = 0; i < notTreasury.length; i++) {
+            vm.prank(notTreasury[i]);
+            vm.expectRevert(MemberBond.NotTreasury.selector);
+            bond.reclaimUnactivated();
+        }
+        // Governance naming the member as treasury does not let the member take it.
+        _setTreasury(member);
+        vm.prank(member);
+        vm.expectRevert(MemberBond.TreasuryIsMember.selector);
+        bond.reclaimUnactivated();
+        assertEq(address(bond).balance, GRANT_AMOUNT);
+    }
+
+    /// Only activated, staked bonds pay out to the member, under the normal exit.
+    function test_activatedBond_stillExitsToTheMember() public {
+        _setTreasury(treasury);
+        _grant(member, memberTokenId);
+        MemberBond bond = MemberBond(payable(vault.bondOf(member)));
+        vm.prank(member);
+        bond.activate(PK_A, SIG);
+        sbt.setKycVerified(memberTokenId, true);
+        _unlock(bond);
+        vm.prank(member);
+        bond.requestRelease();
+        vm.roll(block.number + registry.EPOCH() * (registry.EXIT_LOCK_EPOCHS() + 1));
+        vm.prank(member);
+        bond.withdrawToMember();
+        assertEq(member.balance, GRANT_AMOUNT);
+        assertEq(treasury.balance, 0);
+        assertTrue(bond.releaseRequested(), "a paid member has requested the release");
+        assertFalse(bond.reclaimed());
     }
 }

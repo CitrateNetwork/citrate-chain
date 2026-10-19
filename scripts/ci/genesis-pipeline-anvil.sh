@@ -17,7 +17,7 @@
 #
 # Then the chain#320 negatives, each of which must be refused with nothing sent:
 #   - forge simulating another chain id than the 40204 node (--chain-id 1): DeployGenesisGovernance,
-#     DeployDormantLedgers and the gate;
+#     DeployDormantLedgers, DeployGenesisMembership and the gate;
 #   - a deployer-controlled GOVERNANCE timelock with a hidden PROPOSER/EXECUTOR and
 #     TIMELOCK_HISTORY_FROM_BLOCK past that grant (plus a re-emitted constructor pair), for
 #     DeployDormantLedgers (window and full history) and the gate.
@@ -149,7 +149,7 @@ MISMATCH="chain id mismatch: node reports 40204, forge simulates 1"
 
 echo "=== negative: forge simulating chain 1 against the 40204 node (--chain-id 1) ==="
 before="$(nonce "$DEPLOYER")"
-for s in DeployGenesisGovernance DeployDormantLedgers; do
+for s in DeployGenesisGovernance DeployDormantLedgers DeployGenesisMembership; do
   if forge script "script/$s.s.sol" --rpc-url "$RPC" --broadcast --private-key "$KEY" --chain-id 1 \
     >"$OUT/neg-chainid-$s.log" 2>&1; then fail "$s ran with --chain-id 1"; fi
   grep -q "$MISMATCH" "$OUT/neg-chainid-$s.log" || fail "$s --chain-id 1: not refused on the chain id"
@@ -157,7 +157,7 @@ done
 [ "$(nonce "$DEPLOYER")" = "$before" ] || fail "a --chain-id 1 run sent a transaction"
 if gate "$OUT/neg-chainid-gate.log" --chain-id 1; then fail "gate ran with --chain-id 1"; fi
 grep -q "$MISMATCH" "$OUT/neg-chainid-gate.log" || fail "gate --chain-id 1: not refused on the chain id"
-echo "refused (DeployGenesisGovernance, DeployDormantLedgers, gate), nothing sent"
+echo "refused (DeployGenesisGovernance, DeployDormantLedgers, DeployGenesisMembership, gate), nothing sent"
 
 # A deployer-controlled GOVERNANCE timelock (test/genesis/anvil/LateHistoryWindowFixture.s.sol):
 # ceremony-salt CREATE2 timelock + CREATE2-correct 3-of-5 council, 48 h, self-administered, no

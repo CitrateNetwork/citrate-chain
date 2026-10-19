@@ -53,9 +53,7 @@ contract MembershipStakeVaultTest is Test {
         member2 = address(0x3E3B4);
         attacker = address(0xBAD);
 
-        registry = new ValidatorRegistry(
-            gov, slasher, minter, GRANT_AMOUNT, 1 ether, 5000, 10_000 ether
-        );
+        registry = new ValidatorRegistry(gov, slasher, minter, GRANT_AMOUNT, 1 ether, 5000, 10_000 ether);
         sbt = new CitrateMemberSBT(admin);
         bondImpl = new MemberBond();
         vault = _deployVault(admin);
@@ -65,23 +63,21 @@ contract MembershipStakeVaultTest is Test {
         vm.deal(admin, 1_000_000 ether);
         vm.deal(attacker, 100_000 ether);
 
-        tokenId = sbt.mintMember(
-            member, keccak256("sub-1"), uint64(block.timestamp), uint64(block.timestamp + 365 days)
-        );
-        tokenId2 = sbt.mintMember(
-            member2, keccak256("sub-2"), uint64(block.timestamp), uint64(block.timestamp + 365 days)
-        );
+        tokenId =
+            sbt.mintMember(member, keccak256("sub-1"), uint64(block.timestamp), uint64(block.timestamp + 365 days));
+        tokenId2 =
+            sbt.mintMember(member2, keccak256("sub-2"), uint64(block.timestamp), uint64(block.timestamp + 365 days));
     }
 
     function _deployVault(address owner_) internal returns (MembershipStakeVault) {
         MembershipStakeVault impl = new MembershipStakeVault();
         return MembershipStakeVault(
-            payable(address(new ERC1967Proxy(
-                address(impl),
-                abi.encodeCall(
-                    MembershipStakeVault.initialize, (owner_, registry, sbt, address(bondImpl))
-                )
-            )))
+            payable(address(
+                    new ERC1967Proxy(
+                        address(impl),
+                        abi.encodeCall(MembershipStakeVault.initialize, (owner_, registry, sbt, address(bondImpl)))
+                    )
+                ))
         );
     }
 
@@ -174,9 +170,7 @@ contract MembershipStakeVaultTest is Test {
         registry.creditReward{value: 500 ether}(PK_B, 500 ether);
         vm.roll(block.number + registry.EPOCH() * 5);
 
-        assertEq(
-            vault.attributedStake(member), before, "attribution is invariant to registry events"
-        );
+        assertEq(vault.attributedStake(member), before, "attribution is invariant to registry events");
     }
 
     function testAttribution_eligibilityThreshold() public {
@@ -193,9 +187,7 @@ contract MembershipStakeVaultTest is Test {
 
         assertEq(vault.attributedStake(member), 0, "attribution detached");
         assertFalse(vault.isValidatorEligible(member), "eligibility drops");
-        assertEq(
-            uint8(vault.getGrant(id).state), uint8(MembershipStakeVault.GrantState.Lapsed), "Lapsed"
-        );
+        assertEq(uint8(vault.getGrant(id).state), uint8(MembershipStakeVault.GrantState.Lapsed), "Lapsed");
     }
 
     /// Lapsing a membership must NOT seize the bond - the principal stays put.
@@ -212,20 +204,14 @@ contract MembershipStakeVaultTest is Test {
         vault.renew(id);
 
         assertEq(vault.attributedStake(member), GRANT_AMOUNT, "attribution restored");
-        assertEq(
-            uint8(vault.getGrant(id).state),
-            uint8(MembershipStakeVault.GrantState.Attributed),
-            "Attributed"
-        );
+        assertEq(uint8(vault.getGrant(id).state), uint8(MembershipStakeVault.GrantState.Attributed), "Attributed");
     }
 
     function testLapse_wrongStateReverts() public {
         uint256 id = _grant();
         vault.lapse(id);
         vm.expectRevert(
-            abi.encodeWithSelector(
-                MembershipStakeVault.WrongState.selector, MembershipStakeVault.GrantState.Lapsed
-            )
+            abi.encodeWithSelector(MembershipStakeVault.WrongState.selector, MembershipStakeVault.GrantState.Lapsed)
         );
         vault.lapse(id);
     }
@@ -233,9 +219,7 @@ contract MembershipStakeVaultTest is Test {
     function testRenew_wrongStateReverts() public {
         uint256 id = _grant();
         vm.expectRevert(
-            abi.encodeWithSelector(
-                MembershipStakeVault.WrongState.selector, MembershipStakeVault.GrantState.Attributed
-            )
+            abi.encodeWithSelector(MembershipStakeVault.WrongState.selector, MembershipStakeVault.GrantState.Attributed)
         );
         vault.renew(id);
     }
@@ -278,11 +262,7 @@ contract MembershipStakeVaultTest is Test {
         vault.recordRelease(id);
 
         assertEq(vault.attributedStake(member), 0, "attribution detached on exit");
-        assertEq(
-            uint8(vault.getGrant(id).state),
-            uint8(MembershipStakeVault.GrantState.Released),
-            "Released"
-        );
+        assertEq(uint8(vault.getGrant(id).state), uint8(MembershipStakeVault.GrantState.Released), "Released");
     }
 
     /// Permissionless by design: it carries no authority, only mirrors the
@@ -318,13 +298,13 @@ contract MembershipStakeVaultTest is Test {
 
         assertEq(bond.balance, GRANT_AMOUNT, "bond funded");
         vm.prank(admin);
-        (bool ok, ) = address(vault).call(abi.encodeWithSignature("sweep(address)", bond));
+        (bool ok,) = address(vault).call(abi.encodeWithSignature("sweep(address)", bond));
         assertFalse(ok, "no sweep function exists");
         assertEq(bond.balance, GRANT_AMOUNT, "bond untouched");
     }
 
     function testCustody_plainTransfersToVaultRevert() public {
-        (bool ok, ) = address(vault).call{value: 1 ether}("");
+        (bool ok,) = address(vault).call{value: 1 ether}("");
         assertFalse(ok, "the vault must not accept unsolicited SALT");
     }
 
@@ -344,9 +324,7 @@ contract MembershipStakeVaultTest is Test {
         vm.expectRevert(MembershipStakeVault.ZeroAddress.selector);
         new ERC1967Proxy(
             address(impl),
-            abi.encodeCall(
-                MembershipStakeVault.initialize, (address(0), registry, sbt, address(bondImpl))
-            )
+            abi.encodeCall(MembershipStakeVault.initialize, (address(0), registry, sbt, address(bondImpl)))
         );
     }
 
@@ -455,6 +433,42 @@ contract MembershipStakeVaultTest is Test {
         vault.acceptGovernance();
         assertEq(vault.governance(), next);
         assertEq(vault.pendingGovernance(), address(0));
+    }
+
+    /// The treasury (where unactivated principal returns) is set by governance,
+    /// two-step: the nominee must accept; zero is refused; nobody else can set it.
+    function testTreasury_governanceSetsItTwoStep() public {
+        vault.initializeGovernance(governor);
+        address t = address(0x7EA5);
+        assertEq(vault.treasury(), address(0), "unset at genesis");
+
+        vm.expectRevert(MembershipStakeVault.NotGovernance.selector);
+        vault.setTreasury(t); // the grant orchestrator cannot
+        vm.prank(attacker);
+        vm.expectRevert(MembershipStakeVault.NotGovernance.selector);
+        vault.setTreasury(attacker);
+        vm.prank(governor);
+        vm.expectRevert(MembershipStakeVault.TreasuryIsZero.selector);
+        vault.setTreasury(address(0));
+
+        vm.prank(governor);
+        vault.setTreasury(t);
+        assertEq(vault.pendingTreasury(), t);
+        assertEq(vault.treasury(), address(0), "not moved until accepted");
+        vm.prank(attacker);
+        vm.expectRevert(MembershipStakeVault.NotPendingTreasury.selector);
+        vault.acceptTreasury();
+        vm.prank(t);
+        vault.acceptTreasury();
+        assertEq(vault.treasury(), t);
+        assertEq(vault.pendingTreasury(), address(0));
+    }
+
+    /// recordReclaim mirrors only a reclaim the bond actually made.
+    function testRecordReclaim_revertsUnlessReclaimed() public {
+        uint256 id = _grant();
+        vm.expectRevert(bytes("not reclaimed"));
+        vault.recordReclaim(id);
     }
 
     function testGovernance_transferRejectsZero() public {

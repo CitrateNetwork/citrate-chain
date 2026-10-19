@@ -8,6 +8,7 @@ import "./Salts.sol";
 import "./lib/AdminChecks.sol";
 import "./lib/Create2Deploy.sol";
 import "./lib/GenesisBook.sol";
+import "./lib/GenesisProfile.sol";
 import {CitrateMemberSBT} from "../src/core_membership/CitrateMemberSBT.sol";
 import {MemberBond} from "../src/core_membership/MemberBond.sol";
 import {MembershipStakeVault} from "../src/core_membership/MembershipStakeVault.sol";
@@ -40,9 +41,13 @@ import {MultisigProposer} from "../src/genesis/MultisigProposer.sol";
 ///           - GOVERNANCE_TIMELOCK is an OZ TimelockController that administers itself, with
 ///             execution not open to everyone, run by GOVERNANCE_MULTISIG, on which neither the
 ///             configured deployer nor the CREATE2 factory holds an admin slot or governing
-///             seat (and neither is a council owner). Floors: chain 40204 (the genesis profile,
-///             selected by chain id, no override) needs minDelay >= 48 h AND a council of at
-///             least 3-of-5; any other chain (rehearsal) needs minDelay >= 1 h.
+///             seat (and neither is a council owner). Floors: the genesis profile (chain 40204
+///             as the NODE reports it: eth_chainId must equal forge's simulated id, so
+///             --chain-id / --chain / FOUNDRY_CHAIN_ID cannot select another profile;
+///             GenesisProfile `_resolveChainProfile`, no override) needs the GenesisProfile
+///             floors read from chain (`_councilFloorProblem`: minDelay >= 48 h, a council of at
+///             least 3-of-5 with a majority threshold, proposal TTL fixed at 14 days); any other
+///             chain (rehearsal) needs minDelay >= 1 h.
 ///           - GOVERNANCE_MULTISIG is authenticated before any of its getters is read: its
 ///             address must be the CREATE2 address DeployGenesisGovernance gives a
 ///             MultisigProposer for (this timelock, its reported owners, its reported
@@ -51,7 +56,8 @@ import {MultisigProposer} from "../src/genesis/MultisigProposer.sol";
 ///             refused.
 ///           - Complete holder sets, not only named accounts: the timelock runs this build's
 ///             OZ TimelockController code, is its own SOLE DEFAULT_ADMIN, and has the council
-///             as SOLE PROPOSER, EXECUTOR and CANCELLER, rebuilt from the timelock's
+///             as SOLE PROPOSER, EXECUTOR and CANCELLER (the only other CANCELLER allowed is the
+///             GuardianCanceller from GENESIS_GOVERNANCE_BOOK, verified on chain), rebuilt from the timelock's
 ///             RoleGranted / RoleRevoked logs (AdminChecks `_assertTimelockSoleHolders`; needs
 ///             --rpc-url, see DeployDormantLedgers for TIMELOCK_HISTORY_FROM_BLOCK / _WINDOW).
 ///             No node, a failed page, or a history that does not start at the timelock's
@@ -62,7 +68,8 @@ import {MultisigProposer} from "../src/genesis/MultisigProposer.sol";
 ///             grant carries, otherwise no granted member could ever activate.
 ///           - the forge broadcaster is the configured deployer.
 ///         Postconditions on the live contracts: vault owner == GRANTOR, vault governance ==
-///         GOVERNANCE_TIMELOCK, no pending governance, SBT owner == GRANTOR, the vault holds
+///         GOVERNANCE_TIMELOCK, no pending governance, no treasury and no pending treasury
+///         (unactivated principal returns to a treasury only GOVERNANCE sets, two-step), SBT owner == GRANTOR, the vault holds
 ///         no SALT, and neither the deployer, the actual broadcaster nor the CREATE2 factory
 ///         holds any admin slot on the SBT or the vault; the governance checks are re-run
 ///         with the broadcaster added to the deploy accounts. The script contract's own address
@@ -74,26 +81,27 @@ import {MultisigProposer} from "../src/genesis/MultisigProposer.sol";
 ///         DeployGenesisGovernance), MEMBERSHIP_GRANTOR (the treasury-signer address
 ///         that places grants), VALIDATOR_REGISTRY, GENESIS_MEMBERSHIP_OUT, and
 ///         CEREMONY_DEPLOYER_ADDRESS or DEPLOYER_ADDRESS (must equal the forge broadcast
-///         signer; enforced). Output: a book-shaped JSON at GENESIS_MEMBERSHIP_OUT, which
+///         signer; enforced). Optional: GENESIS_GOVERNANCE_BOOK (DeployGenesisGovernance's
+///         book; required in practice on genesis, where the GOVERNANCE timelock carries the
+///         GuardianCanceller). Output: a book-shaped JSON at GENESIS_MEMBERSHIP_OUT, which
 ///         `CheckDeployedAdmins` reads through EXTRA_ADDRESS_BOOKS; it lists GovernanceTimelock
 ///         with its paired GovernanceMultisig, so the gate's TIMELOCK-HOLDERS check re-runs. Nothing touches
 ///         `addresses/40204.json`.
 ///
 ///         NOTE: chain 40204 rejects EIP-1559 transactions; broadcast with `--legacy` and an
 ///         explicit gas limit.
-contract DeployGenesisMembership is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook {
+contract DeployGenesisMembership is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook, GenesisProfile {
     string internal constant SBT = "CitrateMemberSBT";
     string internal constant BOND = "MemberBond";
     string internal constant VAULT_IMPL = "MembershipStakeVault.impl";
     string internal constant VAULT = "MembershipStakeVault";
 
-    uint256 public constant GENESIS_CHAIN_ID = 40204;
-    /// Genesis profile: GOVERNANCE runs behind a 48 h delay (C2 D5, owner decision 2026-10-19).
-    uint256 public constant GENESIS_GOV_MIN_DELAY = 48 hours;
-    uint256 public constant GENESIS_GOV_MIN_THRESHOLD = 3;
-    uint256 public constant GENESIS_GOV_MIN_OWNERS = 5;
-    /// Rehearsal chains: DeployGenesisGovernance.MIN_DELAY_FLOOR.
+    /// Rehearsal chains: DeployGenesisGovernance.MIN_DELAY_FLOOR. The genesis floors are
+    /// GenesisProfile's (shared with DeployGenesisGovernance, DeployDormantLedgers and the gate).
     uint256 public constant REHEARSAL_GOV_MIN_DELAY = 1 hours;
+
+    /// @notice The profile the last `deployWith` resolved; written into the book.
+    ChainProfile public chainProfile;
 
     struct Deployed {
         address sbt;
@@ -109,16 +117,39 @@ contract DeployGenesisMembership is ScriptEnv, AdminChecks, Create2Deploy, Genes
         address grantor = vm.envAddress("MEMBERSHIP_GRANTOR");
         address registry = vm.envAddress("VALIDATOR_REGISTRY");
         vm.envString("GENESIS_MEMBERSHIP_OUT"); // resolve before broadcasting: a missing path fails first
-        d = deployWith(deployer, governance, council, grantor, registry);
+        string memory govBook = vm.envOr("GENESIS_GOVERNANCE_BOOK", string(""));
+        // Node chain id vs simulated chain id first (GenesisProfile), before the book's chainId.
+        _resolveChainProfile(false);
+        string memory govJson = bytes(govBook).length != 0 ? vm.readFile(govBook) : "";
+        if (bytes(govJson).length != 0) checkGovernanceBook(govJson, governance);
+        d = deployWith(deployer, governance, council, grantor, registry, govJson);
         _writeBook("GENESIS_MEMBERSHIP_OUT", bookJson(deployer, governance, council, grantor, registry, d));
     }
 
-    /// @notice The ceremony with explicit inputs (no env reads), for tests and callers.
+    /// @notice The ceremony with explicit inputs (no env reads), for tests and callers, with no
+    ///         governance book: the timelock may then carry no CANCELLER but `council`.
     function deployWith(address deployer, address governance, address council, address grantor, address registry)
         public
         returns (Deployed memory d)
     {
-        _assertInputs(deployer, governance, council, grantor, registry);
+        return deployWith(deployer, governance, council, grantor, registry, "");
+    }
+
+    /// @notice As above; `governanceBook` (DeployGenesisGovernance's book JSON, or "") supplies
+    ///         the verified GuardianCanceller the timelock may carry as its only extra CANCELLER.
+    function deployWith(
+        address deployer,
+        address governance,
+        address council,
+        address grantor,
+        address registry,
+        string memory governanceBook
+    ) public returns (Deployed memory d) {
+        // Node chain id vs simulated chain id, before anything else (GenesisProfile).
+        ChainProfile memory cp = _resolveChainProfile(false);
+        chainProfile = cp;
+        address[] memory extraCancellers = _governanceExtraCancellers(governance, governanceBook);
+        _assertInputs(deployer, governance, council, grantor, registry, cp.genesis, extraCancellers);
 
         console.log("=== Genesis membership (Track M) ===");
         console.log("Deployer           :", deployer);
@@ -163,7 +194,7 @@ contract DeployGenesisMembership is ScriptEnv, AdminChecks, Create2Deploy, Genes
         _assertHandedOver(d, deployer, broadcaster, governance, grantor, registry);
         address[] memory deployAccounts = new address[](2);
         (deployAccounts[0], deployAccounts[1]) = (deployer, broadcaster);
-        _assertGovernanceCouncil(governance, council, deployAccounts, _governanceExtraCancellers());
+        _assertGovernanceCouncil(governance, council, deployAccounts, cp.genesis, extraCancellers);
         console.log("CitrateMemberSBT          :", d.sbt);
         console.log("MemberBond (impl)         :", d.bondImplementation);
         console.log("MembershipStakeVault impl :", d.vaultImplementation);
@@ -196,14 +227,50 @@ contract DeployGenesisMembership is ScriptEnv, AdminChecks, Create2Deploy, Genes
             '","lockSeconds":',
             vm.toString(MemberBond(payable(d.bondImplementation)).LOCK_SECONDS()),
             ',"lockBlocks":',
-            vm.toString(MemberBond(payable(d.bondImplementation)).LOCK_BLOCKS())
+            vm.toString(MemberBond(payable(d.bondImplementation)).LOCK_BLOCKS()),
+            _profileParams()
         );
         return _bookJson(deployer, names, addrs, params);
     }
 
-    function _assertInputs(address deployer, address governance, address council, address grantor, address registry)
-        internal
-    {
+    function _profileParams() internal view returns (string memory) {
+        ChainProfile memory p = chainProfile;
+        return string.concat(
+            ',"genesisProfile":',
+            vm.toString(p.genesis),
+            ',"nodeChainIdChecked":',
+            vm.toString(p.nodeChecked),
+            ',"nodeChainId":',
+            vm.toString(p.nodeChainId),
+            ',"overrides":{},"overrideUsed":false'
+        );
+    }
+
+    /// @notice GENESIS_GOVERNANCE_BOOK must be for this chain and name GOVERNANCE_TIMELOCK.
+    function checkGovernanceBook(string memory json, address governance) public view {
+        require(
+            vm.keyExistsJson(json, ".contracts.GovernanceTimelock"),
+            "GENESIS_GOVERNANCE_BOOK: no contracts.GovernanceTimelock"
+        );
+        require(
+            vm.keyExistsJson(json, ".chainId") && vm.parseJsonUint(json, ".chainId") == block.chainid,
+            "GENESIS_GOVERNANCE_BOOK: book is for another chain"
+        );
+        require(
+            vm.parseJsonAddress(json, ".contracts.GovernanceTimelock") == governance,
+            "GOVERNANCE_TIMELOCK does not match GENESIS_GOVERNANCE_BOOK"
+        );
+    }
+
+    function _assertInputs(
+        address deployer,
+        address governance,
+        address council,
+        address grantor,
+        address registry,
+        bool genesis,
+        address[] memory extraCancellers
+    ) internal {
         require(deployer != address(0), "deployer must be set");
         require(governance != deployer, "GOVERNANCE_TIMELOCK cannot be the deployer");
         require(_isTimelock(governance), "GOVERNANCE_TIMELOCK is not a TimelockController");
@@ -211,7 +278,7 @@ contract DeployGenesisMembership is ScriptEnv, AdminChecks, Create2Deploy, Genes
         // broadcaster is added after `_startBroadcastAsDeployer` proves it (deployWith).
         address[] memory accounts = new address[](1);
         accounts[0] = deployer;
-        _assertGovernanceCouncil(governance, council, accounts, _governanceExtraCancellers());
+        _assertGovernanceCouncil(governance, council, accounts, genesis, extraCancellers);
 
         require(grantor != address(0), "MEMBERSHIP_GRANTOR must be set");
         require(grantor != deployer, "MEMBERSHIP_GRANTOR cannot be the deployer");
@@ -228,11 +295,20 @@ contract DeployGenesisMembership is ScriptEnv, AdminChecks, Create2Deploy, Genes
     }
 
     /// @notice Accounts other than the council that may hold CANCELLER_ROLE on
-    ///         GOVERNANCE_TIMELOCK. None today; the governance-hardening change that adds a
-    ///         guardian canceller extends this one list (shared by the pre-broadcast check and
-    ///         the postcondition).
-    function _governanceExtraCancellers() internal view virtual returns (address[] memory) {
-        return new address[](0);
+    ///         GOVERNANCE_TIMELOCK: the GuardianCanceller that governance book `json` lists
+    ///         beside it, verified on chain (GenesisProfile `_bookGuardianCanceller`: CREATE2
+    ///         address, runtime code, wiring, and the guardian council's own holder sets), or
+    ///         none when no book is given. A listed canceller that does not verify reverts. One
+    ///         list, shared by the pre-broadcast check and the postcondition.
+    function _governanceExtraCancellers(address governance, string memory json)
+        internal
+        returns (address[] memory extra)
+    {
+        if (bytes(json).length == 0) return new address[](0);
+        (string memory problem, address canceller) = _bookGuardianCanceller(json, governance);
+        require(bytes(problem).length == 0, string.concat("GENESIS_GOVERNANCE_BOOK: ", problem));
+        extra = new address[](1);
+        extra[0] = canceller;
     }
 
     /// @notice Revert unless `governance` is a self-administered timelock run only by `council`
@@ -244,6 +320,7 @@ contract DeployGenesisMembership is ScriptEnv, AdminChecks, Create2Deploy, Genes
         address governance,
         address council,
         address[] memory accounts,
+        bool genesis,
         address[] memory extraCancellers
     ) internal {
         string memory tl = "GOVERNANCE_TIMELOCK";
@@ -260,22 +337,16 @@ contract DeployGenesisMembership is ScriptEnv, AdminChecks, Create2Deploy, Genes
             _assertNoDeployerAdmin(ms, council, accounts[i]);
         }
 
-        bool genesis = block.chainid == GENESIS_CHAIN_ID;
-        uint256 delay = _timelockMinDelay(governance);
-        require(
-            delay >= (genesis ? GENESIS_GOV_MIN_DELAY : REHEARSAL_GOV_MIN_DELAY),
-            genesis
-                ? "GOVERNANCE_TIMELOCK: minDelay below the 48 h genesis floor"
-                : "GOVERNANCE_TIMELOCK: minDelay below the 1 h rehearsal floor"
-        );
-
         (bool ok, address fronted) = _readAddress(council, abi.encodeWithSignature("timelock()"));
         require(ok && fronted == governance, "GOVERNANCE_MULTISIG does not front GOVERNANCE_TIMELOCK");
         if (genesis) {
-            MultisigProposer m = MultisigProposer(council);
+            // GenesisProfile's floors (48 h, >= 3-of-5 majority, fixed 14-day proposal TTL),
+            // shared with DeployGenesisGovernance, DeployDormantLedgers and CheckDeployedAdmins.
+            _requireCouncilFloor("GOVERNANCE", governance, council, true);
+        } else {
             require(
-                m.threshold() >= GENESIS_GOV_MIN_THRESHOLD && m.owners().length >= GENESIS_GOV_MIN_OWNERS,
-                "GOVERNANCE_MULTISIG: below the 3-of-5 genesis floor"
+                _timelockMinDelay(governance) >= REHEARSAL_GOV_MIN_DELAY,
+                "GOVERNANCE_TIMELOCK: minDelay below the 1 h rehearsal floor"
             );
         }
         // Complete holder sets: the timelock is its SOLE admin and the council its SOLE proposer
@@ -297,6 +368,12 @@ contract DeployGenesisMembership is ScriptEnv, AdminChecks, Create2Deploy, Genes
         _assertOwner("MembershipStakeVault", d.vault, grantor);
         _assertGovernance("MembershipStakeVault", d.vault, governance);
         require(vault.pendingGovernance() == address(0), "MembershipStakeVault: a governance transfer is pending");
+        // The treasury (unactivated principal returns there) is GOVERNANCE's to set, two-step; the
+        // ceremony never sets it.
+        require(
+            vault.treasury() == address(0) && vault.pendingTreasury() == address(0),
+            "MembershipStakeVault: treasury set outside governance"
+        );
         require(address(vault.registry()) == registry, "MembershipStakeVault: registry mismatch");
         require(address(vault.sbt()) == d.sbt, "MembershipStakeVault: sbt mismatch");
         require(
