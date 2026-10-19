@@ -53,6 +53,30 @@
 # scopes the broadcast evidence to the manifest's block-0 timestamp, so neither trusts a
 # value that only a (possibly stale) book or the environment supplies.
 #
+# Invariants (every gate's pass implies them; runbook §4.1 maps each to its code and test):
+#   C1 run binding: every --simulate/--confirm invocation re-proves chain id, block-0 hash and
+#      timestamp, deployer, account and mode against the run manifest (P0).
+#   C2 governance identity: the four governance contracts every later phase uses are the ones
+#      recorded in the manifest the first time they were verified on chain; a governance.json
+#      that names others fails (load_governance + manifest_bind).
+#   C3 governance floors on chain: at P0 (once recorded), after P1 (--confirm), before P2/P4
+#      use it (--confirm) and at every gate P5/P6/P7, each council is read from the chain:
+#      the multisig fronts its timelock and is its proposer, its owners and threshold are the
+#      P0-validated inputs (on 40204 also >= the genesis floors, a strict majority), the
+#      timelock delay is the input (>= floor), the deployer holds no seat or timelock role,
+#      and the GUARDIAN delay is shorter than the GOVERNANCE delay (check_governance_onchain).
+#   C4 no authority override: VALIDATOR_GOVERNANCE and VALIDATOR_SLASHER are always P1's
+#      GOVERNANCE; a different preset value (or a conflicting GOVERNANCE, GUARDIAN,
+#      GOVERNANCE_TIMELOCK or GOVERNANCE_MULTISIG) fails the phase before anything is sent,
+#      and P5 reads ValidatorRegistry.governance()/slasher() (= GOVERNANCE) and
+#      pendingGovernance() (= 0) from the chain.
+#   C5 handover over the exact outputs: P5 merges only books bound to the manifest (deployer,
+#      governance contracts, and the vesting/dormant contract maps, recorded at first use).
+#   C6 no redeploy over the exact KEEP list: the KEEP list's sha256 is recorded at P0 (or at
+#      first use) and P6 refuses another; keep_check matches each row's contract_name to the
+#      broadcast deployments at its pinned address.
+#   C7 fleet on this run's block 0 (P7).
+#
 # Output books: P1/P3/P4 write governance.json, team-vesting.json and dormant-ledgers.json
 # into GENESIS_OUT_DIR, and P2/P4/P5 read them from the same place; every producer and
 # consumer path is derived from that one directory. Forge may only write under
@@ -239,6 +263,97 @@ print(f"{rid}\t{want['deployer'][0]}\t{want['block0Timestamp'][0]}")
 PY
 }
 
+# manifest_bind <check|bind> <path> <key> <json value>: the run manifest's record of a value
+# this run depends on (governance contracts, an output book's contracts, the KEEP list hash).
+# check: if the manifest already records <key>, it must equal <value>. bind: the same, and if
+# it does not record it yet, record it now (atomic rewrite).
+manifest_bind() {
+  "$PY" - "$@" <<'PY'
+import json, os, sys
+mode, path, key, raw = sys.argv[1:5]
+val = json.loads(raw)
+try:
+    with open(path) as f:
+        m = json.load(f)
+except (OSError, ValueError) as e:
+    sys.exit(f"cannot read the run manifest {path}: {e}")
+if not isinstance(m, dict):
+    sys.exit(f"{path} is not a JSON object")
+if key in m:
+    if m[key] != val:
+        sys.exit(f"{path} records {key} = {json.dumps(m[key], sort_keys=True)}; this run now has {json.dumps(val, sort_keys=True)}")
+    sys.exit(0)
+if mode != "bind":
+    sys.exit(0)
+m[key] = val
+tmp = path + ".bind.tmp"
+with open(tmp, "w") as f:
+    json.dump(m, f, indent=2, sort_keys=True)
+    f.write("\n")
+os.replace(tmp, path)
+PY
+}
+manifest_has() { # path key
+  "$PY" -c 'import json,sys; sys.exit(0 if sys.argv[2] in json.load(open(sys.argv[1])) else 1)' "$1" "$2" 2>/dev/null
+}
+# book_contracts_json <book>: its .contracts as compact JSON with lowercased addresses.
+book_contracts_json() {
+  "$PY" -c '
+import json, re, sys
+c = json.load(open(sys.argv[1])).get("contracts")
+if not isinstance(c, dict) or not c or not all(isinstance(v, str) and re.fullmatch(r"0x[0-9a-fA-F]{40}", v) for v in c.values()):
+    sys.exit(1)
+print(json.dumps({k: v.lower() for k, v in c.items()}, sort_keys=True, separators=(",", ":")))' "$1" 2>/dev/null
+}
+
+# cast_read <addr> <sig> [args...]: the first token of `cast call` (cast may append a
+# "[1.728e5]" style annotation), or failure.
+cast_read() {
+  local out
+  out=$("$CAST" call "$@" --rpc-url "$RPC_URL" 2>/dev/null) || return 1
+  out="${out%% *}"
+  [[ -n "$out" ]] || return 1
+  printf '%s\n' "$out"
+}
+PROPOSER_ROLE=0xb09aa5aeb3702cfd50b6b62bc4532604938f21248a27a1d5ca736082b6819cc1 # keccak256("PROPOSER_ROLE")
+DEFAULT_ADMIN_ROLE=0x0000000000000000000000000000000000000000000000000000000000000000
+
+# council_onchain <phase> <P> <timelock> <multisig> <min_threshold> <min_owners> <min_delay>
+# C3 for one council: what the chain says, against the P0-validated inputs and the floors.
+# Prints the timelock delay.
+council_onchain() {
+  local ph="$1" p="$2" tl="$3" ms="$4" ov tv dv d t mtl raw got want n a dep
+  ov="${p}_OWNERS" tv="${p}_THRESHOLD" dv="${p}_MIN_DELAY"
+  dep=$(lower "${RUN_DEPLOYER:-$DEPLOYER_ADDRESS}")
+  d=$(cast_read "$tl" "getMinDelay()(uint256)") && [[ "$d" =~ ^[0-9]+$ ]] || gate_fail "$ph" "$p: cannot read getMinDelay() at $tl"
+  mtl=$(cast_read "$ms" "timelock()(address)") && is_addr "$mtl" || gate_fail "$ph" "$p: cannot read timelock() at $ms"
+  [[ "$(lower "$mtl")" == "$(lower "$tl")" ]] || gate_fail "$ph" "$p: multisig $ms fronts $mtl, not its timelock $tl"
+  t=$(cast_read "$ms" "threshold()(uint256)") && [[ "$t" =~ ^[0-9]+$ ]] || gate_fail "$ph" "$p: cannot read threshold() at $ms"
+  raw=$("$CAST" call "$ms" "owners()(address[])" --rpc-url "$RPC_URL" 2>/dev/null) || gate_fail "$ph" "$p: cannot read owners() at $ms"
+  got=$(printf '%s' "$raw" | tr -d '[] ' | tr ',' '\n' | { grep -v '^$' || true; } | tr 'A-F' 'a-f' | sort -u)
+  for a in $got; do is_addr "$a" || gate_fail "$ph" "$p: owners() at $ms returned a malformed address"; done
+  n=$(printf '%s' "$got" | grep -c . || true)
+  want=$(count_owners_list "${!ov}")
+  [[ "$got" == "$want" ]] || gate_fail "$ph" "$p: the multisig's owners on chain are not the ${p}_OWNERS this run validated"
+  [[ "$t" == "${!tv}" ]] || gate_fail "$ph" "$p: threshold on chain is $t, the validated input is ${!tv}"
+  [[ "$d" == "${!dv}" ]] || gate_fail "$ph" "$p: timelock delay on chain is ${d}s, the validated input is ${!dv}s"
+  if [[ "$EXPECTED_CHAIN_ID" == 40204 ]]; then
+    ((n >= $6)) || gate_fail "$ph" "$p: $n owners on chain; the genesis floor is $6"
+    ((t >= $5)) || gate_fail "$ph" "$p: threshold $t on chain is below the genesis floor $5"
+    ((d >= $7)) || gate_fail "$ph" "$p: delay ${d}s on chain is below the genesis floor ${7}s"
+  fi
+  ((t <= n && t * 2 > n)) || gate_fail "$ph" "$p: threshold $t of $n owners on chain is not a majority"
+  ! grep -qxF -- "$dep" <<<"$got" || gate_fail "$ph" "$p: the deployer holds an owner seat on chain"
+  [[ "$(cast_read "$tl" "hasRole(bytes32,address)(bool)" "$PROPOSER_ROLE" "$ms")" == true ]] ||
+    gate_fail "$ph" "$p: the multisig $ms is not the proposer of $tl on chain"
+  for r in "$PROPOSER_ROLE" "$DEFAULT_ADMIN_ROLE"; do
+    [[ "$(cast_read "$tl" "hasRole(bytes32,address)(bool)" "$r" "$dep")" == false ]] ||
+      gate_fail "$ph" "$p: the deployer still holds (or cannot be shown not to hold) role $r on $tl"
+  done
+  log "    $p on chain: $t-of-$n, delay ${d}s, multisig fronts and proposes for $tl" >&2
+  printf '%s\n' "$d"
+}
+
 count_owners() { # comma-separated list -> number of distinct non-empty entries
   count_owners_list "$1" | wc -l | tr -d ' '
 }
@@ -289,6 +404,65 @@ count_owners_list() { # comma-separated list -> distinct non-empty lowercased en
 }
 
 log "mode=$MODE from=$FROM${ONLY:+ only=$ONLY} chain=$EXPECTED_CHAIN_ID"
+
+# The governance addresses every later phase uses come from P1's output, never from a constant.
+# load_governance <phase> <onchain 0|1>: read governance.json; require it to be the governance
+# the manifest recorded (C2); with onchain=1 run check_governance_onchain (C3) and record it
+# if this is the first verified load; export the addresses, and set every authority input the
+# stack scripts read to GOVERNANCE, refusing a different preset value (C4).
+load_governance() {
+  if [[ "$MODE" == dry ]]; then
+    export GOVERNANCE='<GovernanceTimelock from governance.json>' GUARDIAN='<GuardianTimelock from governance.json>'
+    export GOVERNANCE_TIMELOCK="$GOVERNANCE" GOVERNANCE_MULTISIG='<GovernanceMultisig from governance.json>'
+    export VALIDATOR_GOVERNANCE="$GOVERNANCE" VALIDATOR_SLASHER="$GOVERNANCE"
+    return
+  fi
+  local ph="$1" a v want gov_json why pre=()
+  # Preset values, read before this function assigns any of them.
+  for v in VALIDATOR_GOVERNANCE VALIDATOR_SLASHER GOVERNANCE GUARDIAN GOVERNANCE_TIMELOCK GOVERNANCE_MULTISIG GUARDIAN_MULTISIG; do
+    pre+=("$v=${!v:-}")
+  done
+  [[ -f "$GOV_BOOK" ]] || gate_fail "$ph" "$GOV_BOOK missing (run P1 first)"
+  GOVERNANCE=$(book_addr "$GOV_BOOK" GovernanceTimelock) || gate_fail "$ph" "governance.json has no GovernanceTimelock"
+  GUARDIAN=$(book_addr "$GOV_BOOK" GuardianTimelock) || gate_fail "$ph" "governance.json has no GuardianTimelock"
+  GOVERNANCE_MULTISIG=$(book_addr "$GOV_BOOK" GovernanceMultisig) || gate_fail "$ph" "governance.json has no GovernanceMultisig"
+  GUARDIAN_MULTISIG=$(book_addr "$GOV_BOOK" GuardianMultisig) || gate_fail "$ph" "governance.json has no GuardianMultisig"
+  for a in "$GOVERNANCE" "$GUARDIAN" "$GOVERNANCE_MULTISIG" "$GUARDIAN_MULTISIG"; do is_addr "$a" || gate_fail "$ph" "governance.json is incomplete"; done
+  # C4: an authority input left in the environment (a stale EOA from an earlier reroll) must
+  # never override the council this run deployed.
+  for v in "${pre[@]}"; do
+    a="${v#*=}"
+    case "${v%%=*}" in
+      GUARDIAN) want="$GUARDIAN" ;;
+      GOVERNANCE_MULTISIG) want="$GOVERNANCE_MULTISIG" ;;
+      GUARDIAN_MULTISIG) want="$GUARDIAN_MULTISIG" ;;
+      *) want="$GOVERNANCE" ;;
+    esac
+    if [[ -n "$a" && "$(lower "$a")" != "$(lower "$want")" ]]; then
+      gate_fail "$ph" "${v%%=*} is set to $a, but this run's governance is $want (governance.json); unset it: the ceremony sets it from P1's output"
+    fi
+  done
+  gov_json=$(printf '{"GovernanceTimelock":"%s","GovernanceMultisig":"%s","GuardianTimelock":"%s","GuardianMultisig":"%s"}' \
+    "$(lower "$GOVERNANCE")" "$(lower "$GOVERNANCE_MULTISIG")" "$(lower "$GUARDIAN")" "$(lower "$GUARDIAN_MULTISIG")")
+  why=$(manifest_bind check "$RUN_MANIFEST" governance "$gov_json" 2>&1) ||
+    gate_fail "$ph" "governance.json is not the governance this run recorded: $why"
+  if [[ "$2" == 1 ]]; then
+    check_governance_onchain "$ph"
+    why=$(manifest_bind bind "$RUN_MANIFEST" governance "$gov_json" 2>&1) || gate_fail "$ph" "cannot record the governance in the run manifest: $why"
+  fi
+  export GOVERNANCE GUARDIAN GOVERNANCE_MULTISIG GUARDIAN_MULTISIG GOVERNANCE_TIMELOCK="$GOVERNANCE"
+  export VALIDATOR_GOVERNANCE="$GOVERNANCE" VALIDATOR_SLASHER="$GOVERNANCE"
+  log "    GOVERNANCE=$GOVERNANCE GUARDIAN=$GUARDIAN"
+}
+# check_governance_onchain <phase>: C3 for both councils (see council_onchain) and the delay
+# order between them.
+check_governance_onchain() {
+  local gd rd
+  gd=$(council_onchain "$1" GOV "$GOVERNANCE" "$GOVERNANCE_MULTISIG" $GOV_MIN_THRESHOLD $GOV_MIN_OWNERS $GOV_MIN_DELAY_SECS) || exit 3
+  rd=$(council_onchain "$1" GRD "$GUARDIAN" "$GUARDIAN_MULTISIG" $GRD_MIN_THRESHOLD $GRD_MIN_OWNERS $GRD_MIN_DELAY_SECS) || exit 3
+  ((rd < gd)) || gate_fail "$1" "the GUARDIAN delay on chain (${rd}s) is not shorter than the GOVERNANCE delay (${gd}s)"
+  log "$1 governance floors hold on chain for the recorded councils"
+}
 
 # ---------------------------------------------------------------- P0
 # The preflight is mandatory whenever the run talks to a chain (simulate or confirm), whatever
@@ -363,6 +537,17 @@ if should P0 || [[ "$MODE" != dry ]]; then
     is_addr "$RUN_DEPLOYER" && [[ "$RUN_G0TS" =~ ^[0-9]+$ && -n "$RUN_ID" ]] || gate_fail P0 "run manifest: unexpected record $run_rec"
     RUN_G0=$(lower "$g0")
     log "P0 bound to run $RUN_ID (deployer $RUN_DEPLOYER)"
+    # C6: the KEEP list this run checks is fixed by its hash, recorded on the fresh run.
+    if [[ -n "${KEEP_LIST:-}" ]]; then
+      keep_sha=$(sha256sum "$KEEP_LIST" | cut -c1-64) || gate_fail P0 "cannot hash KEEP_LIST"
+      bind_mode=check
+      if [[ "$FROM" == P0 && -z "$ONLY" ]]; then bind_mode=bind; fi
+      why=$(manifest_bind "$bind_mode" "$RUN_MANIFEST" keepListSha256 "\"$keep_sha\"" 2>&1) || gate_fail P0 "KEEP list: $why"
+    fi
+    # C2/C3: once the run has recorded its governance, every invocation re-proves it on chain.
+    if manifest_has "$RUN_MANIFEST" governance; then
+      load_governance P0 1
+    fi
   fi
   log "P0 preflight PASS (books in $OUT_REL/)"
 fi
@@ -374,28 +559,14 @@ if should P1; then
   export GOV_PROPOSAL_TTL="${GOV_PROPOSAL_TTL:-$GENESIS_TTL_SECS}" GRD_PROPOSAL_TTL="${GRD_PROPOSAL_TTL:-$GENESIS_TTL_SECS}"
   log "P1 governance → $GOV_BOOK"
   forge_phase P1 DeployGenesisGovernance.s.sol
+  # A broadcast P1 is checked on chain and recorded in the manifest at once (C2, C3).
+  if [[ "$MODE" == confirm ]]; then load_governance P1 1; fi
 fi
-
-# The governance addresses every later phase uses come from P1's output, never from a constant.
-load_governance() {
-  if [[ "$MODE" == dry ]]; then
-    export GOVERNANCE='<GovernanceTimelock from governance.json>' GUARDIAN='<GuardianTimelock from governance.json>'
-    export GOVERNANCE_TIMELOCK="$GOVERNANCE" GOVERNANCE_MULTISIG='<GovernanceMultisig from governance.json>'
-    return
-  fi
-  [[ -f "$GOV_BOOK" ]] || gate_fail "$1" "$GOV_BOOK missing (run P1 first)"
-  GOVERNANCE=$(book_addr "$GOV_BOOK" GovernanceTimelock) || gate_fail "$1" "governance.json has no GovernanceTimelock"
-  GUARDIAN=$(book_addr "$GOV_BOOK" GuardianTimelock) || gate_fail "$1" "governance.json has no GuardianTimelock"
-  GOVERNANCE_MULTISIG=$(book_addr "$GOV_BOOK" GovernanceMultisig) || gate_fail "$1" "governance.json has no GovernanceMultisig"
-  for a in "$GOVERNANCE" "$GUARDIAN" "$GOVERNANCE_MULTISIG"; do is_addr "$a" || gate_fail "$1" "governance.json is incomplete"; done
-  export GOVERNANCE GUARDIAN GOVERNANCE_MULTISIG GOVERNANCE_TIMELOCK="$GOVERNANCE"
-  export VALIDATOR_GOVERNANCE="${VALIDATOR_GOVERNANCE:-$GOVERNANCE}"
-  log "    GOVERNANCE=$GOVERNANCE GUARDIAN=$GUARDIAN"
-}
 
 # ---------------------------------------------------------------- P2
 if should P2; then
-  load_governance P2
+  # --confirm: the council the registry will be governed by is proven on chain first (C3).
+  load_governance P2 "$([[ "$MODE" == confirm ]] && echo 1 || echo 0)"
   rargs=(--reroll --with-aa)
   # regenesis.sh takes --account only; the keystore password comes from forge's own prompt.
   if [[ "$MODE" == confirm ]]; then rargs+=(--broadcast --account "$ACCOUNT"); fi
@@ -420,7 +591,7 @@ fi
 
 # ---------------------------------------------------------------- P4
 if should P4; then
-  load_governance P4
+  load_governance P4 "$([[ "$MODE" == confirm ]] && echo 1 || echo 0)"
   export DORMANT_LEDGERS_OUT="$DORMANT_REL" GENESIS_GOVERNANCE_BOOK="$GOV_REL"
   [[ "$MODE" == dry ]] || need_env PATRONAGE_KYC_REGISTRY PATRONAGE_MEMBERSHIP
   log "P4 dormant ledgers → $DORMANT_BOOK"
@@ -460,6 +631,30 @@ if should P5; then
     done
     is_addr "${RUN_DEPLOYER:-}" || gate_fail P5 "no run deployer (the P0 run manifest did not load)"
     log "P5 deployer bound to run $RUN_ID: $RUN_DEPLOYER"
+    load_governance P5 1
+    # C5: the vesting and dormant-ledger outputs are the ones this run recorded.
+    for kb in "teamVesting:$VEST_BOOK" "dormantLedgers:$DORMANT_BOOK"; do
+      [[ -f "${kb#*:}" ]] || continue
+      cj=$(book_contracts_json "${kb#*:}") || gate_fail P5 "${kb#*:} has no well-formed contracts"
+      why=$(manifest_bind bind "$RUN_MANIFEST" "${kb%%:*}" "$cj" 2>&1) || gate_fail P5 "${kb#*:} is not the output this run recorded: $why"
+    done
+    # C4: the ValidatorRegistry is governed by this run's GOVERNANCE, whatever the env said.
+    vr=$(book_addr "$ADDRESS_BOOK" ValidatorRegistry) || vr=""
+    if is_addr "$vr"; then
+      for f in governance slasher; do
+        got=$(cast_read "$vr" "$f()(address)") && is_addr "$got" || gate_fail P5 "cannot read ValidatorRegistry.$f() at $vr"
+        [[ "$(lower "$got")" == "$(lower "$GOVERNANCE")" ]] ||
+          gate_fail P5 "ValidatorRegistry.$f() is $got, not this run's GOVERNANCE $GOVERNANCE"
+      done
+      got=$(cast_read "$vr" "pendingGovernance()(address)") && is_addr "$got" || gate_fail P5 "cannot read ValidatorRegistry.pendingGovernance() at $vr"
+      [[ "$(lower "$got")" == 0x0000000000000000000000000000000000000000 ]] ||
+        gate_fail P5 "ValidatorRegistry.pendingGovernance() is $got: a governance transfer is pending"
+      log "P5 ValidatorRegistry $vr: governance and slasher are GOVERNANCE, nothing pending"
+    elif [[ "$MODE" == confirm ]]; then
+      gate_fail P5 "$ADDRESS_BOOK has no ValidatorRegistry; the handover gate must check its governance"
+    else
+      log "P5 note: no ValidatorRegistry in $ADDRESS_BOOK in a simulation; its governance is not checked"
+    fi
     merged=$("$PY" - "$RUN_DEPLOYER" "$ADDRESS_BOOK" "$P5_BOOK" "${extras[@]}" <<'PY'
 import json, re, sys
 ADDR = re.compile(r"0x[0-9a-fA-F]{40}")
@@ -538,6 +733,9 @@ if should P6; then
     # Only broadcasts recorded on this chain since its block 0 are evidence for P6. The
     # timestamp is the run manifest's, which P0 re-checked against the chain.
     [[ "${RUN_G0TS:-}" =~ ^[0-9]+$ ]] || gate_fail P6 "no block-0 timestamp from the run manifest to scope the broadcast evidence"
+    load_governance P6 1
+    keep_sha=$(sha256sum "$KEEP_LIST" | cut -c1-64) || gate_fail P6 "cannot hash KEEP_LIST"
+    why=$(manifest_bind bind "$RUN_MANIFEST" keepListSha256 "\"$keep_sha\"" 2>&1) || gate_fail P6 "KEEP list is not the one this run recorded: $why"
     RPC="$RPC_URL" ADDRESS_BOOK="$ADDRESS_BOOK" BROADCAST_DIR="$CONTRACTS/broadcast" BROADCAST_SINCE="$RUN_G0TS" \
       bash "$HERE/keep_check.sh" verify "$KEEP_LIST" || gate_fail P6 "keep_check failed"
   fi
@@ -557,6 +755,7 @@ if should P7; then
     if [[ "$MODE" != dry ]]; then
       is_hash() { [[ "$1" =~ ^0x[0-9a-f]{64}$ ]]; }
       is_hash "${RUN_G0:-}" || gate_fail P7 "no block-0 hash from the run manifest to check the fleet against"
+      load_governance P7 1
       fleet_g0=(EXPECTED_GENESIS_HASH="$RUN_G0")
     fi
     env "${fleet_g0[@]}" FLEET_RPCS="$FLEET_RPCS" EXPECTED_CHAIN_ID="$EXPECTED_CHAIN_ID" bash "$HERE/fleet_agree.sh" "${dryflag[@]}" ||

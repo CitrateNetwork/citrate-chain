@@ -68,6 +68,14 @@ case "${args[0]}" in
       [[ -f "$d/block-${args[1]}" ]] || exit 1; cat "$d/block-${args[1]}"
     fi ;;
   nonce) cat "$d/nonce" 2>/dev/null || echo 0 ;;
+  call)
+    # $FAKE/call/<addr>/<function>[_<arg>...] holds the decoded answer; a missing file is a
+    # revert, except hasRole, which answers false.
+    a=$(printf '%s' "${args[1]}" | tr 'A-F' 'a-f'); fn="${args[2]%%(*}"
+    key="$fn"; for x in "${args[@]:3}"; do key+="_$(printf '%s' "$x" | tr 'A-F' 'a-f')"; done
+    if [[ -f "$FAKE/call/$a/$key" ]]; then cat "$FAKE/call/$a/$key"
+    elif [[ "$fn" == hasRole ]]; then echo false
+    else exit 1; fi ;;
   *) echo "fake cast: unsupported ${args[*]}" >&2; exit 9 ;;
 esac
 EOF
@@ -184,9 +192,14 @@ mkdir -p "$BC"
 run_json() { # timestamp name address
   printf '{"timestamp":%s,"transactions":[{"transactionType":"CREATE2","contractName":"%s","contractAddress":"%s"}]}' "$1" "$2" "$3"
 }
+# anchored_json <timestamp> <address>: an unrelated deployment plus the genesis deployment of
+# the named KEEP row (Alpha) at its pin, which every passing broadcast set must contain.
+anchored_json() {
+  printf '{"timestamp":%s,"transactions":[{"transactionType":"CREATE2","contractName":"Other","contractAddress":"%s"},{"transactionType":"CREATE2","contractName":"Alpha","contractAddress":"%s"}]}' "$1" "$2" "$A1"
+}
 run_json 2000 Alpha "$(addr 777)" >"$BC/run-latest.json"
 expect "keep: a broadcast that redeploys a kept contract elsewhere fails" 1 'DeployX.s.sol redeploys Alpha at 0x0+309 \(not the pinned' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST"
-run_json 2000 Other "$(addr 777)" >"$BC/run-latest.json"
+anchored_json 2000 "$(addr 777)" >"$BC/run-latest.json"
 expect "keep: an unrelated broadcast passes" 0 'no chain-40204 broadcast' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST"
 # The deterministic genesis replay deploys the kept contract AT its pinned address: that passes.
 run_json 2000 Alpha "$(printf '%s' "$A1" | tr 'a-f' 'A-F' | sed 's/^0X/0x/')" >"$BC/run-latest.json"
@@ -194,7 +207,7 @@ expect "keep: a genesis deployment at the pinned address passes" 0 'deploys Alph
 # Another chain's broadcasts are not evidence for this one.
 # Another chain's broadcasts are not evidence for this one (an unrelated chain-40204 run is
 # the in-scope evidence).
-run_json 2000 Other "$(addr 777)" >"$BC/run-latest.json"
+anchored_json 2000 "$(addr 777)" >"$BC/run-latest.json"
 mkdir -p "$T/broadcast/DeployX.s.sol/31337"
 run_json 2000 Alpha "$(addr 777)" >"$T/broadcast/DeployX.s.sol/31337/run-latest.json"
 expect "keep: another chain's broadcast is ignored" 0 'no chain-40204 broadcast' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST"
@@ -204,12 +217,12 @@ rm -r "$T/broadcast/DeployX.s.sol/31337"
 expect "keep: a BROADCAST_DIR that does not exist fails" 1 'is not a directory; no broadcast evidence' -- env RPC=http://r1 BROADCAST_DIR="$T/no-such-broadcast" bash "$KC" verify "$LIST"
 # A run from an earlier chain on the same chain id (before block 0) is ignored with BROADCAST_SINCE.
 run_json 1000 Alpha "$(addr 777)" >"$BC/run-1000.json"
-run_json 2000 Other "$(addr 777)" >"$BC/run-latest.json"
+anchored_json 2000 "$(addr 777)" >"$BC/run-latest.json"
 expect "keep: a run before BROADCAST_SINCE is ignored" 0 'KEEP-SKIP +DeployX.s.sol: run-1000.json' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" BROADCAST_SINCE=1500 bash "$KC" verify "$LIST"
 expect "keep: the same run after BROADCAST_SINCE counts" 1 'redeploys Alpha' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" BROADCAST_SINCE=500 bash "$KC" verify "$LIST"
 rm "$BC/run-1000.json"
 run_json 1600000000000 Alpha "$(addr 777)" >"$BC/run-1600000000000.json"
-run_json 1800000000000 Other "$(addr 777)" >"$BC/run-latest.json"
+anchored_json 1800000000000 "$(addr 777)" >"$BC/run-latest.json"
 expect "keep: a millisecond timestamp is compared in seconds" 0 'KEEP-SKIP' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" BROADCAST_SINCE=1700000000 bash "$KC" verify "$LIST"
 expect "keep: only runs before BROADCAST_SINCE is no evidence" 1 'no chain-40204 broadcast run in scope' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" BROADCAST_SINCE=1900000000 bash "$KC" verify "$LIST"
 rm "$BC/run-1600000000000.json"
@@ -217,7 +230,7 @@ rm "$BC/run-1600000000000.json"
 # earlier in-scope run that moved a kept contract must still fail the gate when the latest
 # run only holds unrelated transactions.
 run_json 3000 Alpha "$(addr 777)" >"$BC/run-3000.json"
-run_json 4000 Other "$(addr 778)" >"$BC/run-4000.json"
+anchored_json 4000 "$(addr 778)" >"$BC/run-4000.json"
 cp "$BC/run-4000.json" "$BC/run-latest.json"
 expect "keep: an earlier timestamped run that moved a kept contract fails" 1 'DeployX.s.sol redeploys Alpha at 0x0+309 \(not the pinned' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" BROADCAST_SINCE=2500 bash "$KC" verify "$LIST"
 expect "keep: an earlier timestamped run before BROADCAST_SINCE is ignored" 0 'KEEP-SKIP +DeployX.s.sol: run-3000.json' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" BROADCAST_SINCE=3500 bash "$KC" verify "$LIST"
@@ -245,7 +258,7 @@ printf '{"transactions":[{"transactionType":"CREATE","contractName":"Alpha"}]}' 
 expect "keep: a kept deployment with no address fails" 1 'has no contractAddress' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST"
 expect "keep: broadcasts need a readable chain id" 1 'cannot read the chain id' -- env RPC=http://nochain BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST"
 # A scanner that crashes, or stops without finishing, fails the gate whatever it printed.
-run_json 2000 Other "$(addr 777)" >"$BC/run-latest.json"
+anchored_json 2000 "$(addr 777)" >"$BC/run-latest.json"
 expect "keep: a crashing broadcast scanner fails the gate" 1 'broadcast scanner exited 1' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" PYTHON="$BIN/python-scanfault" FAKE_SCANNER=crash bash "$KC" verify "$LIST"
 expect "keep: a crashing scanner is never reported as a pass" 1 'KEEP gate FAIL' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" PYTHON="$BIN/python-scanfault" FAKE_SCANNER=crash bash "$KC" verify "$LIST"
 expect "keep: a scanner that stops early fails the gate" 1 'broadcast scan did not complete' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" PYTHON="$BIN/python-scanfault" FAKE_SCANNER=truncate bash "$KC" verify "$LIST"
@@ -278,8 +291,59 @@ rm -r "$T/broadcast/AAA.s.sol" "$T/broadcast/ZZZ.s.sol"
 printf '{not json' >"$T/badbook.json"
 expect "keep: an unreadable address book fails" 1 'book.contracts moved: want 0x[0-9a-f]+ got BOOK-ERROR' -- env RPC=http://r1 ADDRESS_BOOK="$T/badbook.json" bash "$KC" verify "$LIST"
 expect "keep: a failing keccak fails" 1 'code changed: .* got KECCAK-ERROR' -- env RPC=http://r1 FAKE_KECCAK_FAIL=1 bash "$KC" verify "$LIST"
-expect "keep: keys on an unreadable book is an input error" 2 'cannot read sections' -- env ADDRESS_BOOK="$T/badbook.json" bash "$KC" keys contracts
+expect "keep: keys on an unreadable book is an input error" 2 'cannot read sections' -- env ADDRESS_BOOK="$T/badbook.json" BROADCAST_DIR="$T/broadcast" bash "$KC" keys contracts
 rm -r "$T/broadcast"
+
+# Contract names come from the broadcasts, never from the book key (Codex r6 on chain#329).
+# emit-address-table.sh renames the EduStack Forwarder to EduForwarder in the book, so a KEEP
+# row named after the book key never matches a broadcast, and a Forwarder redeployed
+# elsewhere would pass. Rehearsal-chain broadcasts (RBC): Alpha, the Forwarder behind the
+# book's EduForwarder, and the Vault proxy; Beta has no broadcast deployment.
+A4=$(addr 165)
+printf '0x6004' >"$FAKE/code/$A4"
+ABOOK="$T/alias-book.json"
+printf '{"chainId":40204,"contracts":{"Alpha":"%s","Beta":"%s","Vault":"%s","EduForwarder":"%s"},"aaStack":{}}' "$A1" "$A2" "$A3" "$A4" >"$ABOOK"
+RBC="$T/rbc"
+mkdir -p "$RBC/DeployAll.s.sol/40204"
+printf '{"timestamp":1000,"transactions":[{"transactionType":"CREATE2","contractName":"Alpha","contractAddress":"%s"},{"transactionType":"CREATE2","contractName":"Forwarder","contractAddress":"%s"},{"transactionType":"CREATE2","contractName":"ERC1967Proxy","contractAddress":"%s"}]}' "$A1" "$A4" "$A3" >"$RBC/DeployAll.s.sol/40204/run-latest.json"
+expect "keep: keys needs the broadcasts" 2 'keys needs BROADCAST_DIR' -- env ADDRESS_BOOK="$ABOOK" bash "$KC" keys contracts
+AKEYS="$T/alias-keys.tsv"
+if ADDRESS_BOOK="$ABOOK" BROADCAST_DIR="$RBC" bash "$KC" keys contracts >"$AKEYS" 2>"$T/keys.err" &&
+  grep -q "^EduForwarder	contracts	Forwarder	no$" "$AKEYS" && grep -q "^Alpha	contracts	Alpha	no$" "$AKEYS"; then
+  ok "keep: keys names EduForwarder by its broadcast name, Forwarder"
+else
+  bad "keep: keys names EduForwarder by its broadcast name, Forwarder" "$(cat "$AKEYS" "$T/keys.err")"
+fi
+grep -q "^Beta	contracts	-	no$" "$AKEYS" && grep -q 'WARNING: .*contracts.Beta .*redeploy detection is OFF' "$T/keys.err" &&
+  ok "keep: keys marks a row with no broadcast deployment - and warns" || bad "keep: keys marks a row with no broadcast deployment - and warns" "$(cat "$AKEYS" "$T/keys.err")"
+sed -i 's/^Vault\tcontracts\tERC1967Proxy\tno$/Vault\tcontracts\tERC1967Proxy\tyes/' "$AKEYS"
+echo 1234 >"$(rpcdir http://r1)/head"
+printf 'EduForwarder\tcontracts\tEduForwarder\tno\n' >"$T/alias-wrong.tsv"
+expect "keep: pin refuses a book-key name the broadcasts never deployed" 2 'EduForwarder is not what the broadcasts deploy at 0x0+a5 \(Forwarder\)' -- env RPC=http://r1 ADDRESS_BOOK="$ABOOK" BROADCAST_DIR="$RBC" bash "$KC" pin "$T/alias-wrong.tsv"
+printf 'EduForwarder\tcontracts\t-\tno\n' >"$T/alias-dash.tsv"
+expect "keep: pin refuses - where the broadcasts show a deployment" 2 'contract_name is - but the broadcasts deploy Forwarder' -- env RPC=http://r1 ADDRESS_BOOK="$ABOOK" BROADCAST_DIR="$RBC" bash "$KC" pin "$T/alias-dash.tsv"
+expect "keep: pin needs the broadcasts" 2 'pin needs BROADCAST_DIR' -- env RPC=http://r1 ADDRESS_BOOK="$ABOOK" bash "$KC" pin "$AKEYS"
+echo 1234 >"$(rpcdir http://r1)/head"
+APIN="$T/alias-pinned.tsv"
+if RPC=http://r1 ADDRESS_BOOK="$ABOOK" BROADCAST_DIR="$RBC" bash "$KC" pin "$AKEYS" >"$APIN" 2>"$T/pin.err"; then ok "keep: pin accepts broadcast-derived names"; else bad "keep: pin accepts broadcast-derived names" "$(cat "$T/pin.err")"; fi
+# Genesis-chain broadcasts (GBC): the deterministic replay of all three at their pins.
+GBC="$T/gbc"
+mkdir -p "$GBC/DeployAll.s.sol/40204" "$GBC/Later.s.sol/40204"
+cp "$RBC/DeployAll.s.sol/40204/run-latest.json" "$GBC/DeployAll.s.sol/40204/run-latest.json"
+printf '{"timestamp":1500,"transactions":[]}' >"$GBC/Later.s.sol/40204/run-latest.json"
+expect "keep: the alias list verifies against an untouched genesis replay" 0 'KEEP gate PASS \(4 entries\)' -- env RPC=http://r1 ADDRESS_BOOK="$ABOOK" BROADCAST_DIR="$GBC" bash "$KC" verify "$APIN"
+# Codex scenario: the pinned Forwarder stays intact and another Forwarder is deployed elsewhere.
+printf '{"timestamp":1500,"transactions":[{"transactionType":"CREATE2","contractName":"Forwarder","contractAddress":"%s"}]}' "$(addr 888)" >"$GBC/Later.s.sol/40204/run-latest.json"
+expect "keep: a Forwarder redeployed elsewhere fails under the EduForwarder alias" 1 'Later.s.sol redeploys Forwarder at 0x0+378 \(not the pinned' -- env RPC=http://r1 ADDRESS_BOOK="$ABOOK" BROADCAST_DIR="$GBC" bash "$KC" verify "$APIN"
+# The same scenario with a KEEP row still named after the book key (the pre-fix list) is no
+# longer a pass: the pinned address is deployed under another name, and the name never anchors.
+sed 's/^\(EduForwarder\tcontracts\t[^\t]*\t\)Forwarder\t/\1EduForwarder\t/' "$APIN" >"$T/alias-stale.tsv"
+expect "keep: a KEEP row named by the book key fails (pinned address deployed as Forwarder)" 1 'deploys Forwarder at 0x0+a5, the pinned address of EduForwarder whose KEEP row names EduForwarder' -- env RPC=http://r1 ADDRESS_BOOK="$ABOOK" BROADCAST_DIR="$GBC" bash "$KC" verify "$T/alias-stale.tsv"
+expect "keep: a KEEP row name with no deployment at its pin fails" 1 'no in-scope broadcast deploys EduForwarder at 0x0+a5' -- env RPC=http://r1 ADDRESS_BOOK="$ABOOK" BROADCAST_DIR="$GBC" bash "$KC" verify "$T/alias-stale.tsv"
+# A - row (Beta, no deployment at pin time) that the genesis broadcasts DO deploy: fail.
+printf '{"timestamp":1500,"transactions":[{"transactionType":"CREATE2","contractName":"Beta","contractAddress":"%s"}]}' "$A2" >"$GBC/Later.s.sol/40204/run-latest.json"
+expect "keep: a deployment at a - row's pinned address fails" 1 'deploys Beta at 0x0+a2, the pinned address of Beta whose KEEP row names -' -- env RPC=http://r1 ADDRESS_BOOK="$ABOOK" BROADCAST_DIR="$GBC" bash "$KC" verify "$APIN"
+rm -r "$RBC" "$GBC"
 
 reset_calls
 expect "keep: --dry-run needs no RPC" 0 'KEEP dry run OK \(3 entries' -- bash "$KC" verify --dry-run "$LIST"
@@ -293,12 +357,15 @@ expect "keep: an empty list fails" 1 'empty KEEP list' -- env RPC=http://r1 bash
 expect "keep: verify without RPC is a usage error" 2 'verify needs RPC' -- bash "$KC" verify "$LIST"
 
 KEYS="$T/keys.tsv"
-ADDRESS_BOOK="$BOOK" bash "$KC" keys contracts >"$KEYS"
+KBC="$T/kbc"
+mkdir -p "$KBC/DeployAll.s.sol/40204"
+run_json 1000 Alpha "$A1" >"$KBC/DeployAll.s.sol/40204/run-latest.json"
+ADDRESS_BOOK="$BOOK" BROADCAST_DIR="$KBC" bash "$KC" keys contracts >"$KEYS" 2>/dev/null
 if [[ $(grep -vc '^#' "$KEYS") -eq 3 ]] && ! grep -q Zero "$KEYS"; then ok "keep: keys lists the book's nonzero addresses"; else bad "keep: keys lists the book's nonzero addresses" "$(cat "$KEYS")"; fi
-sed -i 's/^Vault\tcontracts\tVault\tno$/Vault\tcontracts\t-\tyes/' "$KEYS"
+sed -i 's/^Vault\tcontracts\t-\tno$/Vault\tcontracts\t-\tyes/' "$KEYS"
 echo 1234 >"$(rpcdir http://r1)/head"
 PINNED="$T/pinned.tsv"
-if RPC=http://r1 ADDRESS_BOOK="$BOOK" bash "$KC" pin "$KEYS" >"$PINNED" 2>"$T/pin.err"; then ok "keep: pin records the chain"; else bad "keep: pin records the chain" "$(cat "$T/pin.err")"; fi
+if RPC=http://r1 ADDRESS_BOOK="$BOOK" BROADCAST_DIR="$KBC" bash "$KC" pin "$KEYS" >"$PINNED" 2>"$T/pin.err"; then ok "keep: pin records the chain"; else bad "keep: pin records the chain" "$(cat "$T/pin.err")"; fi
 expect "keep: a freshly pinned list verifies" 0 'KEEP gate PASS \(3 entries\)' -- env RPC=http://r1 ADDRESS_BOOK="$BOOK" bash "$KC" verify "$PINNED"
 grep -q "^Vault.*$IMPL\$" "$PINNED" && ok "keep: pin records the proxy implementation" || bad "keep: pin records the proxy implementation" "$(cat "$PINNED")"
 
@@ -312,7 +379,7 @@ expect "keep: an unterminated last row that changed fails" 1 'KEEP-FAIL +Beta .*
 printf '0x6002' >"$FAKE/code/$A2"
 expect "keep: --dry-run counts an unterminated last row" 0 'KEEP dry run OK \(2 entries' -- bash "$KC" verify --dry-run "$NONL"
 printf 'Alpha\tcontracts\tAlpha\tno\nBeta\tcontracts\t-\tno' >"$T/keys-nonl.tsv"
-if RPC=http://r1 ADDRESS_BOOK="$BOOK" bash "$KC" pin "$T/keys-nonl.tsv" >"$T/pinned-nonl.tsv" 2>"$T/pin.err" &&
+if RPC=http://r1 ADDRESS_BOOK="$BOOK" BROADCAST_DIR="$KBC" bash "$KC" pin "$T/keys-nonl.tsv" >"$T/pinned-nonl.tsv" 2>"$T/pin.err" &&
   grep -q "^Beta	contracts	$A2	" "$T/pinned-nonl.tsv"; then
   ok "keep: pin records an unterminated last key"
 else
@@ -446,14 +513,41 @@ CE="$G/genesis_ceremony.sh"
 REPO="$T/repo"
 mkdir -p "$REPO/contracts/script" "$REPO/contracts/genesis" "$REPO/contracts/addresses" "$REPO/scripts/ops"
 for s in DeployGenesisGovernance DeployTeamVesting DeployDormantLedgers CheckDeployedAdmins; do : >"$REPO/contracts/script/$s.s.sol"; done
-printf '#!/usr/bin/env bash\necho "regenesis $*" >>"$FAKE/calls.log"\n' >"$REPO/scripts/ops/regenesis.sh"
+printf '#!/usr/bin/env bash\necho "regenesis $*" >>"$FAKE/calls.log"\necho "regenesis-env vg=${VALIDATOR_GOVERNANCE:-} vs=${VALIDATOR_SLASHER:-} gov=${GOVERNANCE:-}" >>"$FAKE/calls.log"\n' >"$REPO/scripts/ops/regenesis.sh"
 DEP=$(addr 1)
 printf '{"chainId":40204,"deployer":"%s","contracts":{"Alpha":"%s","Beta":"%s","Vault":"%s"},"aaStack":{},"Vault":"%s"}' "$DEP" "$A1" "$A2" "$A3" "$A3" >"$REPO/contracts/addresses/40204.json"
 # gov_book <dir> <deployer> [extra "Name":"0x..." pairs]: a P1-shaped governance output.
+# The four addresses come from GTL/RTL/GMS/RMS (defaults 31, 32, 33, 35).
 gov_book() {
-  printf '{"deployer":"%s","contracts":{"GovernanceTimelock":"%s","GuardianTimelock":"%s","GovernanceMultisig":"%s"%s}}' \
-    "$2" "$(addr 31)" "$(addr 32)" "$(addr 33)" "${3:+,$3}" >"$1/governance.json"
+  printf '{"deployer":"%s","contracts":{"GovernanceTimelock":"%s","GuardianTimelock":"%s","GovernanceMultisig":"%s","GuardianMultisig":"%s"%s}}' \
+    "$2" "${GTL:-$(addr 31)}" "${RTL:-$(addr 32)}" "${GMS:-$(addr 33)}" "${RMS:-$(addr 35)}" "${3:+,$3}" >"$1/governance.json"
 }
+PROPOSER=0xb09aa5aeb3702cfd50b6b62bc4532604938f21248a27a1d5ca736082b6819cc1
+# fake_call <addr> <key> <answer>: what `cast call` returns for that address and call.
+fake_call() {
+  local a; a=$(printf '%s' "$1" | tr 'A-F' 'a-f')
+  mkdir -p "$FAKE/call/$a"
+  printf '%s\n' "$3" >"$FAKE/call/$a/$2"
+}
+# council_chain <timelock> <multisig> <delay> <threshold> <owner ids...>: a council as P1
+# deploys it (the multisig fronts the timelock and is its proposer).
+council_chain() {
+  local tl="$1" ms="$2" d="$3" t="$4" i list=""
+  shift 4
+  for i in "$@"; do list+="${list:+, }$(addr "$i")"; done
+  rm -rf "$FAKE/call/$(printf '%s' "$tl" | tr 'A-F' 'a-f')" "$FAKE/call/$(printf '%s' "$ms" | tr 'A-F' 'a-f')"
+  fake_call "$tl" getMinDelay "$d [1e5]"
+  fake_call "$tl" "hasRole_${PROPOSER}_$(printf '%s' "$ms" | tr 'A-F' 'a-f')" true
+  fake_call "$ms" timelock "$tl"
+  fake_call "$ms" threshold "$t"
+  fake_call "$ms" owners "[$list]"
+}
+# gov_chain [gtl gms rtl rms]: both councils on chain exactly as CEENV declares them.
+gov_chain() {
+  council_chain "${1:-$(addr 31)}" "${2:-$(addr 33)}" 172800 3 11 12 13 14 15
+  council_chain "${3:-$(addr 32)}" "${4:-$(addr 35)}" 3600 2 21 22 23
+}
+gov_chain
 owners() { local i out=""; for i in "$@"; do out+="${out:+,}$(addr "$i")"; done; printf '%s' "$out"; }
 CEENV=(env REPO_ROOT="$REPO" DEPLOYER_ADDRESS="$DEP"
   GOV_OWNERS="$(owners 11 12 13 14 15)" GOV_THRESHOLD=3 GOV_MIN_DELAY=172800
@@ -519,9 +613,11 @@ expect "ceremony: P5 fails a deployer role held in the vesting output" 3 'DEPLOY
 expect "ceremony: P5 fails a deployer role held in the dormant-ledger output" 3 'DEPLOYER-ADMIN PatronageLedger' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 FAKE_DEPLOYER_HELD=PatronageLedger bash "$CE" --simulate --only P5
 expect "ceremony: P5 refuses an output from another deployer" 3 "names deployer '0x0+9', not this run's deployer" -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash -c "printf '{\"deployer\":\"%s\",\"contracts\":{\"VestingAlice\":\"%s\"}}' '$(addr 9)' '$(addr 71)' > '$GB/team-vesting.json'; bash '$CE' --simulate --only P5"
 printf '{"deployer":"%s","contracts":{"Alpha":"%s"}}' "$DEP" "$(addr 71)" >"$GB/team-vesting.json"
+mk_manifest "$GB"
 expect "ceremony: P5 refuses an output that shadows a book name" 3 'cannot build the merged admin book' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
 printf '{"deployer":"%s","contracts":{}}' "$DEP" >"$GB/team-vesting.json"
-expect "ceremony: P5 refuses an output with no contracts" 3 'cannot build the merged admin book' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+mk_manifest "$GB"
+expect "ceremony: P5 refuses an output with no contracts" 3 'team-vesting.json has no well-formed contracts' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
 rm "$GB/team-vesting.json" "$GB/dormant-ledgers.json"
 expect "ceremony: a simulation's manifest does not serve a --confirm resume" 3 "run manifest: .*mode 'simulate' \(this run: 'confirm'\)" -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1 bash "$CE" --confirm --only P5 --account deployer
 mk_manifest "$GB" "$DEP" confirm deployer
@@ -599,6 +695,133 @@ mk_node http://n5 40204 100 "0x$(h64 d)" "$TIP"
 expect "ceremony: P7 fails a fleet that agrees on another genesis than the run's" 3 'n4 genesis 0x[d]+ differs from 0x[a]+' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 FLEET_RPCS=http://n4,http://n5 bash "$CE" --simulate --only P7
 expect "ceremony: P7 passes a fleet on the run's genesis" 0 'FLEET AGREE' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 FLEET_RPCS=http://n1,http://n2 bash "$CE" --simulate --only P7
 
+# ---------------------------------------------------------------- round-6 invariants (C2-C6)
+# C4 (Codex r6 on chain#329): a stale VALIDATOR_GOVERNANCE in the ceremony environment used to
+# override P1's GOVERNANCE, so DeployValidatorRegistry made that EOA the registry's governance,
+# and P5 (factory + deployer only) still passed.
+mk_manifest "$GB"
+gov_book "$GB" "$DEP"
+gov_chain
+STALE=$(addr 99)
+reset_calls
+expect "ceremony C4: a conflicting VALIDATOR_GOVERNANCE is refused before P2 runs" 3 "VALIDATOR_GOVERNANCE is set to 0x0+63, but this run's governance is 0x0+1f" -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 VALIDATOR_GOVERNANCE="$STALE" bash "$CE" --simulate --only P2
+if calls | grep -q '^regenesis'; then bad "ceremony C4: a refused P2 runs no regenesis" "$(calls)"; else ok "ceremony C4: a refused P2 runs no regenesis"; fi
+expect "ceremony C4: a conflicting VALIDATOR_SLASHER is refused" 3 'VALIDATOR_SLASHER is set to' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 VALIDATOR_SLASHER="$STALE" bash "$CE" --simulate --only P2
+expect "ceremony C4: a conflicting GOVERNANCE preset is refused" 3 'GOVERNANCE is set to 0x0+63, but this run' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GOVERNANCE="$STALE" bash "$CE" --simulate --only P2
+reset_calls
+expect "ceremony C4: a matching preset is accepted" 0 'done \(mode=simulate\)' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 VALIDATOR_GOVERNANCE="$(addr 31 | tr 'a-f' 'A-F' | sed 's/^0X/0x/')" bash "$CE" --simulate --only P2
+calls | grep -q "^regenesis-env vg=$(addr 31) vs=$(addr 31) gov=$(addr 31)$" && ok "ceremony C4: regenesis gets VALIDATOR_GOVERNANCE and VALIDATOR_SLASHER = GOVERNANCE" ||
+  bad "ceremony C4: regenesis gets VALIDATOR_GOVERNANCE and VALIDATOR_SLASHER = GOVERNANCE" "$(calls)"
+# P5 reads the registry's authority from the chain: a stale EOA there fails the handover gate.
+VR=$(addr 123)
+printf '{"chainId":40204,"deployer":"%s","contracts":{"Alpha":"%s","Beta":"%s","Vault":"%s","ValidatorRegistry":"%s"},"aaStack":{},"Vault":"%s"}' "$DEP" "$A1" "$A2" "$A3" "$VR" "$A3" >"$T/book-vr.json"
+vr_chain() { # governance slasher pending
+  fake_call "$VR" governance "$1"
+  fake_call "$VR" slasher "$2"
+  fake_call "$VR" pendingGovernance "$3"
+}
+Z40=0x0000000000000000000000000000000000000000
+vr_chain "$(addr 31)" "$(addr 31)" "$Z40"
+expect "ceremony C4: P5 passes a registry governed by GOVERNANCE" 0 'ValidatorRegistry 0x0+7b: governance and slasher are GOVERNANCE' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 ADDRESS_BOOK="$T/book-vr.json" bash "$CE" --simulate --only P5
+vr_chain "$STALE" "$(addr 31)" "$Z40"
+expect "ceremony C4: P5 fails a registry governed by a stale EOA" 3 'ValidatorRegistry.governance\(\) is 0x0+63, not this run' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 ADDRESS_BOOK="$T/book-vr.json" bash "$CE" --simulate --only P5
+vr_chain "$(addr 31)" "$STALE" "$Z40"
+expect "ceremony C4: P5 fails a registry with another slasher" 3 'ValidatorRegistry.slasher\(\) is 0x0+63' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 ADDRESS_BOOK="$T/book-vr.json" bash "$CE" --simulate --only P5
+vr_chain "$(addr 31)" "$(addr 31)" "$STALE"
+expect "ceremony C4: P5 fails a registry with a pending governance transfer" 3 'pendingGovernance\(\) is 0x0+63' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 ADDRESS_BOOK="$T/book-vr.json" bash "$CE" --simulate --only P5
+rm -rf "$FAKE/call/$VR"
+expect "ceremony C4: P5 fails when the registry cannot be read" 3 'cannot read ValidatorRegistry.governance' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 ADDRESS_BOOK="$T/book-vr.json" bash "$CE" --simulate --only P5
+mk_manifest "$GB" "$DEP" confirm deployer
+printf '{"deployer":"%s","contracts":{"VestingAlice":"%s"}}' "$DEP" "$(addr 71)" >"$GB/team-vesting.json"
+printf '{"deployer":"%s","contracts":{"FederatedRoundLedger":"%s","PatronageLedger":"%s"}}' "$DEP" "$(addr 81)" "$(addr 82)" >"$GB/dormant-ledgers.json"
+expect "ceremony C4: --confirm P5 needs a ValidatorRegistry in the book" 3 'has no ValidatorRegistry' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1 bash "$CE" --confirm --only P5 --account deployer
+rm "$GB/team-vesting.json" "$GB/dormant-ledgers.json"
+
+# C3: every gate reads both councils from the chain and holds them to the validated inputs
+# and the genesis floors.
+mk_manifest "$GB"
+gov_chain
+expect "ceremony C3: P5 checks the councils on chain" 0 'P5 governance floors hold on chain' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+c3_case() { # name pattern setup...
+  local name="$1" pat="$2"
+  shift 2
+  mk_manifest "$GB"
+  gov_chain
+  "$@"
+  expect "ceremony C3: $name" 3 "$pat" -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+}
+c3_case "a 2-of-5 governance on chain fails" 'GOV: threshold on chain is 2, the validated input is 3' fake_call "$(addr 33)" threshold 2
+c3_case "a governance multisig with other owners fails" 'GOV: the multisig.s owners on chain are not' fake_call "$(addr 33)" owners "[$(addr 11), $(addr 12), $(addr 13), $(addr 14), $(addr 16)]"
+c3_case "a 24 h governance delay on chain fails" 'GOV: timelock delay on chain is 86400s' fake_call "$(addr 31)" getMinDelay 86400
+c3_case "a multisig fronting another timelock fails" 'GOV: multisig 0x0+21 fronts 0x0+63' fake_call "$(addr 33)" timelock "$STALE"
+c3_case "a multisig that is not the timelock's proposer fails" 'is not the proposer of' rm -f "$FAKE/call/$(addr 31)/hasRole_${PROPOSER}_$(addr 33)"
+c3_case "a deployer still proposer on the timelock fails" 'the deployer still holds' fake_call "$(addr 31)" "hasRole_${PROPOSER}_$DEP" true
+c3_case "a deployer still admin of the timelock fails" 'the deployer still holds' fake_call "$(addr 32)" "hasRole_0x0000000000000000000000000000000000000000000000000000000000000000_$DEP" true
+c3_case "an unreadable timelock fails" 'GRD: cannot read getMinDelay' rm -f "$FAKE/call/$(addr 32)/getMinDelay"
+c3_case "a guardian delay not shorter than governance fails" 'GRD: timelock delay on chain is 172800s' fake_call "$(addr 32)" getMinDelay 172800
+# On a rehearsal chain (not 40204) the genesis floors do not apply, but the councils on chain
+# must still be exactly the inputs P0 validated there.
+RRPC=http://127.0.0.1:8546
+mkdir -p "$(rpcdir "$RRPC")"
+echo 31337 >"$(rpcdir "$RRPC")/chain-id"
+echo "$GEN" >"$(rpcdir "$RRPC")/block-0"
+echo 5000 >"$(rpcdir "$RRPC")/block-0-timestamp"
+REH="$REPO/contracts/genesis/reh"
+mkdir -p "$REH"
+mk_manifest "$REH"
+sed -i 's/"chainId":40204/"chainId":31337/' "$REH/ceremony-run.json"
+gov_book "$REH" "$DEP"
+REHENV=("${CEENV[@]}" RPC_URL="$RRPC" EXPECTED_CHAIN_ID=31337 GENESIS_OUT_DIR="$REH" GOV_OWNERS="$(owners 11 12 13)" GOV_THRESHOLD=2 GOV_MIN_DELAY=7200 GOV_PROPOSAL_TTL=86400)
+gov_chain
+expect "ceremony C3: a rehearsal chain holds the councils to its own inputs" 3 "GOV: the multisig.s owners on chain are not the GOV_OWNERS" -- "${REHENV[@]}" bash "$CE" --simulate --only P5
+council_chain "$(addr 31)" "$(addr 33)" 7200 2 11 12 13
+expect "ceremony C3: a rehearsal council matching its inputs passes" 0 'P5 PASS' -- "${REHENV[@]}" bash "$CE" --simulate --only P5
+rm -r "$REH"
+gov_chain
+# P6 and P7 are gates too: a council that fails on chain fails them.
+mk_manifest "$GB"
+fake_call "$(addr 33)" threshold 2
+mkdir -p "$REPO/contracts/broadcast/Regenesis.s.sol/40204"
+printf '{"timestamp":6000,"transactions":[{"transactionType":"CREATE2","contractName":"Alpha","contractAddress":"%s"}]}' "$A1" >"$REPO/contracts/broadcast/Regenesis.s.sol/40204/run-latest.json"
+expect "ceremony C3: P6 fails a council below its inputs" 3 'GOV: threshold on chain is 2' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 KEEP_LIST="$LIST" bash "$CE" --simulate --only P6
+expect "ceremony C3: P7 fails a council below its inputs" 3 'GOV: threshold on chain is 2' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 FLEET_RPCS=http://n1,http://n2 bash "$CE" --simulate --only P7
+gov_chain
+
+# C2: once a gate has verified and recorded the governance, a different governance.json fails
+# every later invocation, P0 included, even if it is internally consistent on chain.
+mk_manifest "$GB"
+gov_book "$GB" "$DEP"
+expect "ceremony C2: P5 records the verified governance" 0 'P5 PASS' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+python3 -c 'import json,sys; g=json.load(open(sys.argv[1]))["governance"]; sys.exit(0 if g["GovernanceTimelock"]==sys.argv[2] and g["GuardianMultisig"]==sys.argv[3] else 1)' "$GB/ceremony-run.json" "$(addr 31)" "$(addr 35)" &&
+  ok "ceremony C2: the manifest holds the four governance addresses" || bad "ceremony C2: the manifest holds the four governance addresses" "$(cat "$GB/ceremony-run.json")"
+GTL=$(addr 51) GMS=$(addr 53) RTL=$(addr 52) RMS=$(addr 55) gov_book "$GB" "$DEP"
+gov_chain "$(addr 51)" "$(addr 53)" "$(addr 52)" "$(addr 55)"
+expect "ceremony C2: a swapped governance.json fails the P0 preflight of a resume" 3 'GATE FAIL at P0: governance.json is not the governance this run recorded' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P7
+reset_calls
+expect "ceremony C2: a swapped governance.json stops P2 before regenesis" 3 'not the governance this run recorded' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
+if calls | grep -q '^regenesis'; then bad "ceremony C2: no regenesis with a swapped governance" "$(calls)"; else ok "ceremony C2: no regenesis with a swapped governance"; fi
+gov_book "$GB" "$DEP"
+expect "ceremony C2: P0 re-proves the recorded governance on chain" 3 'GATE FAIL at P0: GOV: threshold on chain is 2' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash -c "$(declare -f fake_call); FAKE='$FAKE'; fake_call '$(addr 33)' threshold 2; bash '$CE' --simulate --only P5"
+gov_chain
+
+# C5: the vesting / dormant outputs P5 sweeps are the ones this run first recorded.
+mk_manifest "$GB"
+printf '{"deployer":"%s","contracts":{"VestingAlice":"%s"}}' "$DEP" "$(addr 71)" >"$GB/team-vesting.json"
+expect "ceremony C5: P5 records the vesting output" 0 'P5 PASS' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+printf '{"deployer":"%s","contracts":{"VestingAlice":"%s"}}' "$DEP" "$(addr 72)" >"$GB/team-vesting.json"
+expect "ceremony C5: P5 refuses a vesting output other than the recorded one" 3 'team-vesting.json is not the output this run recorded' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+rm "$GB/team-vesting.json"
+
+# C6: the KEEP list is fixed by hash for the run.
+mk_manifest "$GB"
+expect "ceremony C6: P6 records the KEEP list" 0 'KEEP gate PASS' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 KEEP_LIST="$LIST" bash "$CE" --simulate --only P6
+cp "$LIST" "$T/keep-other.tsv"
+printf '# edited after the run started\n' >>"$T/keep-other.tsv"
+expect "ceremony C6: P6 refuses another KEEP list than the recorded one (P0 stops it first)" 3 'GATE FAIL at P0: KEEP list: .* records keepListSha256' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 KEEP_LIST="$T/keep-other.tsv" bash "$CE" --simulate --only P6
+expect "ceremony C6: a resume's P0 refuses another KEEP list" 3 'GATE FAIL at P0: KEEP list: ' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 KEEP_LIST="$T/keep-other.tsv" bash "$CE" --simulate --only P7
+rm -r "$REPO/contracts/broadcast"
+mk_manifest "$GB"
+
 # GENESIS_OUT_DIR: one directory for every producer and consumer path.
 expect "ceremony: an output dir outside contracts/genesis is refused" 1 'GENESIS_OUT_DIR must be contracts/genesis' -- "${CEENV[@]}" GENESIS_OUT_DIR="$T/elsewhere" bash "$CE"
 expect "ceremony: an output dir that escapes contracts/genesis is refused" 1 'GENESIS_OUT_DIR must be' -- "${CEENV[@]}" GENESIS_OUT_DIR="$REPO/contracts/genesis/../addresses" bash "$CE"
@@ -610,7 +833,8 @@ reset_calls
 expect "ceremony: P1 writes governance into the nondefault dir" 0 'P0 preflight PASS \(books in genesis/run2/\)' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$RUN2" bash "$CE" --simulate --only P1
 calls | grep -q 'forge-env gov=genesis/run2/governance.json ' && ok "ceremony: P1 output path follows GENESIS_OUT_DIR" || bad "ceremony: P1 output path follows GENESIS_OUT_DIR" "$(calls)"
 # A stale book in the nondefault dir: P1 refuses to run over it (nothing sent).
-printf '{"deployer":"%s","contracts":{"GovernanceTimelock":"%s","GuardianTimelock":"%s","GovernanceMultisig":"%s"}}' "$DEP" "$(addr 41)" "$(addr 42)" "$(addr 43)" >"$RUN2/governance.json"
+printf '{"deployer":"%s","contracts":{"GovernanceTimelock":"%s","GuardianTimelock":"%s","GovernanceMultisig":"%s","GuardianMultisig":"%s"}}' "$DEP" "$(addr 41)" "$(addr 42)" "$(addr 43)" "$(addr 44)" >"$RUN2/governance.json"
+gov_chain "$(addr 41)" "$(addr 43)" "$(addr 42)" "$(addr 44)"
 reset_calls
 expect "ceremony: P1 refuses a stale governance book" 3 'run2/governance.json already exists and P1 would write it' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$RUN2" bash "$CE" --simulate --only P1
 if calls | grep -q '^forge'; then bad "ceremony: a refused P1 runs no forge" "$(calls)"; else ok "ceremony: a refused P1 runs no forge"; fi
@@ -647,6 +871,62 @@ else
     "$SRC/foundry.toml" >"$IC/foundry.toml"
   cp "$SRC/remappings.txt" "$IC/"
   ln -s "$SRC/lib/forge-std" "$IC/lib/forge-std"
+  # On-chain councils for the C3 checks (and a registry for C4): minimal contracts with the
+  # getters P5 reads. They exist only in this temp project.
+  mkdir -p "$IC/src/fixtures"
+  cat >"$IC/src/fixtures/GenesisFixtures.sol" <<'SOL'
+// SPDX-License-Identifier: Apache-2.0
+pragma solidity ^0.8.26;
+
+contract FixtureTimelock {
+    uint256 internal immutable _delay;
+    address internal _proposer;
+
+    constructor(uint256 d) {
+        _delay = d;
+    }
+
+    function setProposer(address p) external {
+        require(_proposer == address(0), "set");
+        _proposer = p;
+    }
+
+    function getMinDelay() external view returns (uint256) {
+        return _delay;
+    }
+
+    function hasRole(bytes32 role, address a) external view returns (bool) {
+        return role == keccak256("PROPOSER_ROLE") && a == _proposer;
+    }
+}
+
+contract FixtureMultisig {
+    address public immutable timelock;
+    uint256 public immutable threshold;
+    address[] internal _owners;
+
+    constructor(address t, address[] memory o, uint256 th) {
+        timelock = t;
+        _owners = o;
+        threshold = th;
+    }
+
+    function owners() external view returns (address[] memory) {
+        return _owners;
+    }
+}
+
+contract FixtureRegistry {
+    address public governance;
+    address public slasher;
+    address public pendingGovernance;
+
+    constructor(address g, address s) {
+        governance = g;
+        slasher = s;
+    }
+}
+SOL
   cp "$SRC/script/CheckDeployedAdmins.s.sol" "$IC/script/"
   cp "$SRC/script/lib/AdminChecks.sol" "$IC/script/lib/"
   cp "$SRC/src/aa/lib/webauthn/P256.sol" "$IC/src/aa/lib/webauthn/"
@@ -674,6 +954,28 @@ else
     set_code 0xc2b78104907F722DABAc4C69f826a522B2754De4 0x600160005260206000f3 # the P-256 verifier
     for i in 161 31 32 33; do set_code "$(addr "$i")" "$(gov_code "$MSIG")"; done
     set_code "$(addr 34)" "$(gov_code "$DEP")"
+    ANVIL0=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 # anvil's first unlocked account
+    fcreate() { # contract [constructor args...] -> deployed address
+      (cd "$IC" && "$REAL_FORGE" create --rpc-url "$IRPC" --unlocked --from "$ANVIL0" --broadcast "src/fixtures/GenesisFixtures.sol:$1" ${2:+--constructor-args} "${@:2}" 2>&1) |
+        sed -n 's/^Deployed to: //p'
+    }
+    council_fixture() { # delay threshold owner ids... -> "timelock multisig"
+      local d="$1" t="$2" tl ms ids=""
+      shift 2
+      for i in "$@"; do ids+="${ids:+,}$(addr "$i")"; done
+      tl=$(fcreate FixtureTimelock "$d")
+      ms=$(fcreate FixtureMultisig "$tl" "[$ids]" "$t")
+      "$REAL_CAST" send "$tl" "setProposer(address)" "$ms" --unlocked --from "$ANVIL0" --rpc-url "$IRPC" >/dev/null 2>&1
+      printf '%s %s\n' "$tl" "$ms"
+    }
+    read -r GTL GMS < <(council_fixture 172800 3 11 12 13 14 15)
+    read -r RTL RMS < <(council_fixture 3600 2 21 22 23)
+    export GTL GMS RTL RMS
+    if is_addr_t() { [[ "$1" =~ ^0x[0-9a-fA-F]{40}$ ]]; }; is_addr_t "$GTL" && is_addr_t "$GMS" && is_addr_t "$RTL" && is_addr_t "$RMS"; then
+      ok "P5 integration: council fixtures deployed on anvil"
+    else
+      bad "P5 integration: council fixtures deployed on anvil" "$GTL $GMS $RTL $RMS"
+    fi
     printf '{"chainId":31337,"deployer":"%s","contracts":{"Alpha":"%s"},"aaStack":{}}' "$DEP" "$A1" >"$IC/addresses/40204.json"
     IENV=("${CEENV[@]}" REPO_ROOT="$IR" RPC_URL="$IRPC" EXPECTED_CHAIN_ID=31337 FORGE="$REAL_FORGE" CAST="$REAL_CAST")
     ig0=$("$REAL_CAST" block 0 --field hash --rpc-url "$IRPC")
@@ -689,6 +991,32 @@ else
     mk_manifest "$IC/genesis" "$(addr 2)" simulate "" "$ig0" "$((ig0ts))"
     sed -i 's/"chainId":40204/"chainId":31337/' "$IC/genesis/ceremony-run.json"
     expect "P5 integration: books naming another deployer than the run's are refused before the real checker" 3 "not this run's deployer 0x0+2" -- "${IENV[@]}" DEPLOYER_ADDRESS="$(addr 2)" bash "$CE" --simulate --only P5
+    # C3 on a real chain: a council whose threshold differs from the validated input fails.
+    mk_manifest "$IC/genesis" "$DEP" simulate "" "$ig0" "$((ig0ts))"
+    sed -i 's/"chainId":40204/"chainId":31337/' "$IC/genesis/ceremony-run.json"
+    gov_book "$IC/genesis" "$DEP"
+    expect "P5 integration: the real councils pass the on-chain floor check" 0 'P5 governance floors hold on chain' -- "${IENV[@]}" bash "$CE" --simulate --only P5
+    mk_manifest "$IC/genesis" "$DEP" simulate "" "$ig0" "$((ig0ts))"
+    sed -i 's/"chainId":40204/"chainId":31337/' "$IC/genesis/ceremony-run.json"
+    read -r WTL WMS < <(council_fixture 172800 2 11 12 13 14 15)
+    GTL="$WTL" GMS="$WMS" gov_book "$IC/genesis" "$DEP"
+    expect "P5 integration: a 2-of-5 governance council on chain fails" 3 'GOV: threshold on chain is 2, the validated input is 3' -- "${IENV[@]}" bash "$CE" --simulate --only P5
+    # C4 on a real chain (Codex r6): the registry's governance is a stale EOA. The real checker
+    # alone does not see it (the EOA is neither the factory nor the deployer); P5 does.
+    mk_manifest "$IC/genesis" "$DEP" simulate "" "$ig0" "$((ig0ts))"
+    sed -i 's/"chainId":40204/"chainId":31337/' "$IC/genesis/ceremony-run.json"
+    gov_book "$IC/genesis" "$DEP"
+    SVR=$(fcreate FixtureRegistry "$(addr 99)" "$GTL")
+    printf '{"chainId":31337,"deployer":"%s","contracts":{"Alpha":"%s","ValidatorRegistry":"%s"},"aaStack":{}}' "$DEP" "$A1" "$SVR" >"$IC/addresses/40204.json"
+    if (cd "$IC" && ADDRESS_BOOK=addresses/40204.json "$REAL_FORGE" script script/CheckDeployedAdmins.s.sol --rpc-url "$IRPC" 2>&1) | grep -q 'DEPLOYER-ADMIN failures: 0'; then
+      ok "P5 integration: the real checker alone passes a registry governed by a stale EOA"
+    else
+      bad "P5 integration: the real checker alone passes a registry governed by a stale EOA"
+    fi
+    expect "P5 integration: P5 fails a registry governed by a stale EOA" 3 'ValidatorRegistry.governance\(\) is 0x0+63' -- "${IENV[@]}" bash "$CE" --simulate --only P5
+    GVR=$(fcreate FixtureRegistry "$GTL" "$GTL")
+    printf '{"chainId":31337,"deployer":"%s","contracts":{"Alpha":"%s","ValidatorRegistry":"%s"},"aaStack":{}}' "$DEP" "$A1" "$GVR" >"$IC/addresses/40204.json"
+    expect "P5 integration: P5 passes a registry governed by this run's GOVERNANCE" 0 'governance and slasher are GOVERNANCE' -- "${IENV[@]}" bash "$CE" --simulate --only P5
     kill "$ANVIL_PID" 2>/dev/null
   fi
 fi
