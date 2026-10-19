@@ -160,6 +160,22 @@ This replaces the earlier "skip boundaries already buried at startup" driver heu
 The record lives in the node's database: wiping the data dir while keeping `proposer.key`
 discards it, exactly like a slashing-protection DB — do not do that on a voting validator.
 
+**Own-vote retry (Stage 1a, PR #321 review).** A failed durable write leaves the checkpoint
+pending without this node's vote. A repeat report of the same `(H, hash)` therefore retries
+the own vote when it is not yet in the pending checkpoint, always through the durable
+record above (a record for a different hash at `H` is still refused). The driver keeps
+boundaries whose own vote failed for a transient reason (store unavailable) and re-reports
+them on later passes — bounded to 60 attempts, 16 boundaries and a 256-block horizon, on a
+separate canonical walk after the pass's new boundaries — until the vote is cast, refused
+permanently, or the checkpoint is finalized.
+
+**Early-vote admission before the governing snapshot (Stage 1a, PR #321 review).** When the
+snapshot that governs `H` is not on this node yet, an early vote is checked provisionally
+against the latest snapshot the node holds: voters in it use the unverified quota (64),
+everyone else a separate lower-priority quota (32) that cannot displace them. Both are
+re-checked against the governing snapshot when it appears. Buffer eviction ties break by
+arrival order, never by key bytes.
+
 ### 4.4 Aggregation & finalization
 Inbound votes are already handled (`main.rs:3328` → `submit_vote`). On reaching quorum,
 `finalize_checkpoint` marks the checkpoint finalized, persists it, and advances

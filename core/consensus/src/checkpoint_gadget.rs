@@ -88,17 +88,32 @@ pub const EARLY_VOTE_HORIZON_BLOCKS: u64 = 256;
 pub const MAX_EARLY_VOTES_PER_VOTER: usize = 64;
 /// §11.5 memory backstop for the authenticated buffer (all voters). Only
 /// reachable with a very large validator set; when full, a new vote evicts the
-/// farthest vote of the voter holding the most (fair share), and is refused
-/// only when its own voter already holds the most.
+/// farthest vote of the voter holding the most (fair share; among equally heavy
+/// voters the one that arrived in the buffer LAST — arrival order, never key
+/// bytes, which a key generator could grind), and is refused only when its own
+/// voter already holds the most.
 pub const MAX_EARLY_VOTES_TOTAL: usize = 16_384;
 /// §11.5: votes whose governing epoch validator snapshot is not materialized on
-/// this node yet cannot be authenticated, so they live in a SEPARATE small
-/// quota that can never take capacity from votes of known validators. They are
+/// this node yet cannot be authenticated, so they live in SEPARATE small
+/// quotas that can never take capacity from votes of known validators. They are
 /// re-checked against the snapshot once it appears (members are promoted,
 /// non-members dropped) and on replay.
+///
+/// The unverified space is split by a PROVISIONAL membership check against the
+/// most recent validator snapshot this node holds
+/// ([`VrfProposerSelector::latest_epoch_committee_set`]): voters in it use this
+/// quota; everyone else (including all voters while the node holds no snapshot
+/// at all) uses the strictly lower-priority [`MAX_UNKNOWN_EARLY_VOTES`] quota,
+/// which has its own capacity and so can never displace a provisionally-known
+/// voter — free keys cannot evict validator votes before promotion.
 pub const MAX_UNVERIFIED_EARLY_VOTES: usize = 64;
-/// Per-voter bound inside the unverified quota.
+/// Per-voter bound inside each unverified sub-quota.
 pub const MAX_UNVERIFIED_VOTES_PER_VOTER: usize = 4;
+/// Capacity of the lower-priority unverified sub-quota for voters that are not
+/// in the latest snapshot this node holds (see [`MAX_UNVERIFIED_EARLY_VOTES`]).
+/// Kept so a validator that joined in the not-yet-materialized epoch can still
+/// have its early vote held, best-effort.
+pub const MAX_UNKNOWN_EARLY_VOTES: usize = 32;
 /// Bound on the durable signed-vote record, in checkpoint boundaries: records
 /// are kept for at most this many boundaries below the highest height this node
 /// has signed. Older records are deleted together with raising the durable
@@ -171,6 +186,16 @@ pub enum SignRefusal {
     BelowSignedFloor { floor: u64 },
     /// A stored record or watermark did not decode (fail closed).
     CorruptRecord(String),
+}
+
+impl SignRefusal {
+    /// Whether the refusal is transient, i.e. reporting the same checkpoint
+    /// again may succeed once the condition clears (a store that failed to read
+    /// or write). Every other refusal is permanent for that height: retrying it
+    /// can never yield a vote.
+    pub fn is_recoverable(&self) -> bool {
+        matches!(self, Self::StoreUnavailable(_))
+    }
 }
 
 /// Boundary heights in `(after, upto]` for `interval`, ascending, at most
@@ -256,6 +281,11 @@ pub struct BuriedOutcome {
     /// Why this node (a committee member with a signer) did NOT sign its own
     /// vote, when it did not. Nothing was submitted or broadcast for it.
     pub sign_refused: Option<SignRefusal>,
+    /// The own vote was not cast for a transient reason
+    /// ([`SignRefusal::is_recoverable`]): the caller should report this
+    /// checkpoint again later. A repeat report of the same `(height, hash)`
+    /// retries the own vote (see [`FinalityGadget::on_buried_checkpoint`]).
+    pub own_vote_retryable: bool,
 }
 
 /// Why a buried checkpoint was not (newly) proposed.
@@ -266,7 +296,8 @@ pub enum SkipReason {
     /// No epoch validator-set snapshot is materialized for this height (no
     /// registry configured, or the governing S(E) has not been applied).
     NoCommittee,
-    /// Already proposed for this exact hash (idempotent re-report).
+    /// Already proposed for this exact hash (idempotent re-report). An own vote
+    /// that was not cast earlier is still retried on such a report.
     AlreadyPending,
     /// Already finalized, or at/below the latest finalized height.
     AlreadyFinalized,
@@ -286,6 +317,11 @@ pub enum SkipReason {
 struct EarlyBuffer {
     votes: BTreeMap<(u64, Hash), HashMap<PublicKey, CheckpointVote>>,
     by_voter: HashMap<PublicKey, BTreeMap<u64, Hash>>,
+    /// Arrival sequence of each voter currently held (assigned when the voter's
+    /// first vote is admitted). The eviction tie-break: deterministic and not
+    /// selectable by choosing key bytes.
+    arrival: HashMap<PublicKey, u64>,
+    next_arrival: u64,
     len: usize,
 }
 
@@ -312,6 +348,7 @@ impl EarlyBuffer {
         };
         if heights.is_empty() {
             self.by_voter.remove(voter);
+            self.arrival.remove(voter);
         }
         let key = (height, hash);
         if let Some(slot) = self.votes.get_mut(&key) {
@@ -359,13 +396,14 @@ impl EarlyBuffer {
             }
         }
         if self.len >= total_cap {
-            // Fair share: evict from the voter holding the most (deterministic
-            // tie-break by key bytes), never from a lighter voter.
+            // Fair share: evict from the voter holding the most, never from a
+            // lighter voter. Ties go to the most recent arrival (so incumbents
+            // keep their place), never to key bytes.
             let own = self.voter_count(&voter);
             let heaviest = self
                 .by_voter
                 .iter()
-                .map(|(pk, m)| (m.len(), *pk.as_bytes(), *pk))
+                .map(|(pk, m)| (m.len(), self.arrival.get(pk).copied().unwrap_or(0), *pk))
                 .max_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
             let victim = heaviest.and_then(|(count, _, pk)| {
                 let far = self.by_voter.get(&pk)?.keys().next_back().copied()?;
@@ -379,6 +417,10 @@ impl EarlyBuffer {
                     ))
                 }
             }
+        }
+        if !self.arrival.contains_key(&voter) {
+            self.arrival.insert(voter, self.next_arrival);
+            self.next_arrival = self.next_arrival.saturating_add(1);
         }
         self.by_voter
             .entry(voter)
@@ -424,6 +466,7 @@ impl EarlyBuffer {
                     heights.remove(&key.0);
                     if heights.is_empty() {
                         self.by_voter.remove(&voter);
+                        self.arrival.remove(&voter);
                     }
                 }
                 self.len = self.len.saturating_sub(1);
@@ -448,8 +491,12 @@ struct GadgetState {
     /// they name.
     early: EarlyBuffer,
     /// §11.5: signature-valid votes whose governing snapshot is not on this node
-    /// yet — a separate small quota (see [`MAX_UNVERIFIED_EARLY_VOTES`]).
+    /// yet, from voters in the latest snapshot it holds — a separate small quota
+    /// (see [`MAX_UNVERIFIED_EARLY_VOTES`]).
     unverified: EarlyBuffer,
+    /// §11.5: as `unverified`, for voters NOT in the latest snapshot held — the
+    /// lower-priority sub-quota (see [`MAX_UNKNOWN_EARLY_VOTES`]).
+    unknown: EarlyBuffer,
     /// Highest canonical tip the node has reported (bounds the buffer horizon).
     observed_tip: u64,
     /// Cached durable signed-vote watermarks, loaded from the store on first use
@@ -534,6 +581,13 @@ impl FinalityGadget {
     /// replay buffered early votes for it, and — if `signer` is in the committee
     /// and has not signed at this height — sign and submit this node's own vote.
     /// The caller broadcasts `outcome.outbound`.
+    ///
+    /// A repeat report of an already-pending `(height, block_hash)` proposes
+    /// nothing, but if this node is a committee member whose vote is not yet in
+    /// the pending checkpoint (e.g. the durable signed-vote write failed on the
+    /// first report) the own vote is retried. Equivocation protection is
+    /// unchanged: every attempt goes through the durable record, which admits
+    /// only the hash already recorded at `height`, if any.
     pub async fn on_buried_checkpoint(
         &self,
         height: u64,
@@ -561,7 +615,17 @@ impl FinalityGadget {
             Ok(ProposeOutcome::Proposed) => out.proposed = true,
             Ok(ProposeOutcome::AlreadyPending) => {
                 out.skipped = Some(SkipReason::AlreadyPending);
-                return out;
+                let own_vote_missing = match (signer_pk, in_committee) {
+                    (Some(pk), true) => !self.manager.has_pending_vote(height, &pk).await,
+                    _ => false,
+                };
+                if !own_vote_missing {
+                    return out;
+                }
+                debug!(
+                    "checkpoint {}: pending without this node's vote; retrying own vote",
+                    height
+                );
             }
             Ok(ProposeOutcome::AlreadyFinalized) => {
                 out.skipped = Some(SkipReason::AlreadyFinalized);
@@ -605,6 +669,7 @@ impl FinalityGadget {
                         height, block_hash, other
                     ),
                 }
+                out.own_vote_retryable = refusal.is_recoverable();
                 out.sign_refused = Some(refusal.clone());
             }
             if authorized.is_ok() {
@@ -630,6 +695,7 @@ impl FinalityGadget {
             // the whole height is drained from both buffers.
             let mut votes = st.early.take_height(height);
             votes.extend(st.unverified.take_height(height));
+            votes.extend(st.unknown.take_height(height));
             votes
         };
         {
@@ -674,7 +740,12 @@ impl FinalityGadget {
             let floor = st.observed_tip.saturating_sub(EARLY_VOTE_HORIZON_BLOCKS);
             st.early.retain_heights(|h| h >= floor);
             st.unverified.retain_heights(|h| h >= floor);
-            st.unverified.heights()
+            st.unknown.retain_heights(|h| h >= floor);
+            let mut hs = st.unverified.heights();
+            hs.extend(st.unknown.heights());
+            hs.sort_unstable();
+            hs.dedup();
+            hs
         };
         let Some(source) = self.committee_source.as_ref() else {
             return;
@@ -691,7 +762,11 @@ impl FinalityGadget {
         }
         let mut st = self.state.lock().await;
         for (h, set) in resolved {
-            for vote in st.unverified.take_height(h) {
+            // Provisionally-known voters first, so they reach the authenticated
+            // buffer ahead of the lower-priority sub-quota.
+            let mut votes = st.unverified.take_height(h);
+            votes.extend(st.unknown.take_height(h));
+            for vote in votes {
                 if set.iter().any(|(pk, _)| *pk == vote.voter) {
                     // A refusal here (duplicate / voter cap) just drops it.
                     let _ = st
@@ -789,6 +864,15 @@ impl FinalityGadget {
         if member == Some(false) {
             return InboundOutcome::Rejected(CheckpointError::NotInCommittee(vote.voter));
         }
+        // Governing snapshot missing: a provisional check against the latest
+        // snapshot this node holds picks the unverified sub-quota (§11.5).
+        let provisional = match member {
+            Some(_) => false,
+            None => source
+                .latest_epoch_committee_set()
+                .await
+                .is_some_and(|(_snapshot, set)| set.iter().any(|(pk, _)| *pk == vote.voter)),
+        };
         let mut st = self.state.lock().await;
         // Re-check under the buffer lock: `on_buried_checkpoint` creates the
         // pending checkpoint BEFORE it takes this lock to drain the buffer, so if
@@ -811,11 +895,17 @@ impl FinalityGadget {
         let admitted = if member == Some(true) {
             st.early
                 .insert(vote, MAX_EARLY_VOTES_PER_VOTER, MAX_EARLY_VOTES_TOTAL)
-        } else {
+        } else if provisional {
             st.unverified.insert(
                 vote,
                 MAX_UNVERIFIED_VOTES_PER_VOTER,
                 MAX_UNVERIFIED_EARLY_VOTES,
+            )
+        } else {
+            st.unknown.insert(
+                vote,
+                MAX_UNVERIFIED_VOTES_PER_VOTER,
+                MAX_UNKNOWN_EARLY_VOTES,
             )
         };
         match admitted {
@@ -994,6 +1084,7 @@ impl FinalityGadget {
         let mut st = self.state.lock().await;
         st.early.retain_heights(|h| h > floor);
         st.unverified.retain_heights(|h| h > floor);
+        st.unknown.retain_heights(|h| h > floor);
         if self.enabled && floor > 0 {
             self.prune_signed_records(&mut st, floor);
         }
@@ -1023,20 +1114,33 @@ impl FinalityGadget {
     /// plus unverified quota).
     pub async fn early_vote_keys(&self) -> usize {
         let st = self.state.lock().await;
-        st.early.keys().saturating_add(st.unverified.keys())
+        st.early
+            .keys()
+            .saturating_add(st.unverified.keys())
+            .saturating_add(st.unknown.keys())
     }
 
     /// Total votes held in the early-vote buffers (authenticated plus
     /// unverified quota).
     pub async fn early_vote_count(&self) -> usize {
         let st = self.state.lock().await;
-        st.early.len().saturating_add(st.unverified.len())
+        st.early
+            .len()
+            .saturating_add(st.unverified.len())
+            .saturating_add(st.unknown.len())
     }
 
-    /// Votes held in the unverified quota only (governing snapshot not yet on
-    /// this node).
+    /// Votes held in the unverified quotas (governing snapshot not yet on this
+    /// node): both the provisionally-known and the lower-priority sub-quota.
     pub async fn unverified_early_vote_count(&self) -> usize {
-        self.state.lock().await.unverified.len()
+        let st = self.state.lock().await;
+        st.unverified.len().saturating_add(st.unknown.len())
+    }
+
+    /// Votes held in the lower-priority unverified sub-quota only (voters not in
+    /// the latest snapshot this node holds).
+    pub async fn unknown_early_vote_count(&self) -> usize {
+        self.state.lock().await.unknown.len()
     }
 }
 
@@ -1702,9 +1806,10 @@ mod tests {
         }
         assert_eq!(
             g.unverified_early_vote_count().await,
-            MAX_UNVERIFIED_EARLY_VOTES,
-            "outsiders capped to the separate quota"
+            MAX_UNKNOWN_EARLY_VOTES,
+            "outsiders capped to the separate lower-priority quota"
         );
+        assert_eq!(g.unknown_early_vote_count().await, MAX_UNKNOWN_EARLY_VOTES);
         // Known validators' votes for a snapshot-covered height are unaffected.
         for k in ks.iter().skip(1) {
             let res = g
@@ -1756,6 +1861,118 @@ mod tests {
             1,
             "the member's vote was promoted"
         );
+    }
+
+    /// Probe regression (§11.5): near an epoch boundary the governing snapshot
+    /// S(2) is not on this node yet. 2000 free outsider keys flood votes for the
+    /// boundary, before AND after the 3 honest validators' votes. Outsiders are
+    /// not in the latest snapshot this node holds (S(1)), so they only reach the
+    /// lower-priority sub-quota and cannot evict the validators' provisionally
+    /// admitted votes; once S(2) materializes the validator votes are promoted
+    /// and finalize the checkpoint on replay.
+    #[tokio::test]
+    async fn outsider_flood_cannot_evict_validator_votes_before_promotion() {
+        let ks = keys(4);
+        let kv: Arc<dyn KvStore> = Arc::new(MemKv::default());
+        let mgr = Arc::new(CheckpointManager::with_persistence(
+            config(),
+            dag_with(4).await,
+            kv,
+        ));
+        let sel = selector_with(&ks).await; // S(1) = 1 governs 2..=1000
+        let g = FinalityGadget::with_switch(mgr, Some(sel.clone()), true);
+        g.observe_tip(990).await;
+        let h = 1002u64; // governed by S(2) = 1001, not on this node yet
+        let target = block_hash(1);
+        let flood = outsiders(2000);
+        let (before, after) = flood.split_at(1000);
+        for o in before {
+            let _ = g
+                .on_inbound_vote(sign_checkpoint_vote(CHAIN, h, target, o))
+                .await;
+        }
+        for k in ks.iter().skip(1) {
+            let res = g
+                .on_inbound_vote(sign_checkpoint_vote(CHAIN, h, target, k))
+                .await;
+            assert!(matches!(res, InboundOutcome::Buffered), "got {res:?}");
+        }
+        for o in after {
+            let _ = g
+                .on_inbound_vote(sign_checkpoint_vote(CHAIN, h, target, o))
+                .await;
+        }
+        assert_eq!(g.unknown_early_vote_count().await, MAX_UNKNOWN_EARLY_VOTES);
+        assert_eq!(
+            g.unverified_early_vote_count().await,
+            MAX_UNKNOWN_EARLY_VOTES.saturating_add(3),
+            "all 3 validator votes survive the flood"
+        );
+        // S(2) materializes with the same validator set: promotion.
+        let set: Vec<(PublicKey, u128)> = ks.iter().map(|k| (pk(k), 1000u128)).collect();
+        sel.record_snapshot(1001, &set, 1).await;
+        g.observe_tip(991).await;
+        assert_eq!(g.unverified_early_vote_count().await, 0);
+        assert_eq!(g.early_vote_count().await, 3, "0 outsiders, 3 validators");
+        let out = g
+            .on_buried_checkpoint(h, target, &Hash::new([4; 32]), None)
+            .await;
+        assert!(out.proposed && out.finalized, "{out:?}");
+        assert_eq!(g.manager().latest_finalized_height().await, h);
+    }
+
+    /// With no snapshot held at all, nothing is provisionally known: every
+    /// voter goes to the lower-priority sub-quota (bounded), none is refused
+    /// for lack of a snapshot.
+    #[tokio::test]
+    async fn no_snapshot_held_uses_only_the_lower_priority_quota() {
+        let ks = keys(4);
+        let kv: Arc<dyn KvStore> = Arc::new(MemKv::default());
+        let mgr = Arc::new(CheckpointManager::with_persistence(
+            config(),
+            dag_with(4).await,
+            kv,
+        ));
+        let sel = Arc::new(VrfProposerSelector::new().with_snapshot_schedule(1000, 999));
+        let g = FinalityGadget::with_switch(mgr, Some(sel), true);
+        for k in &ks {
+            let res = g
+                .on_inbound_vote(sign_checkpoint_vote(CHAIN, 10, block_hash(1), k))
+                .await;
+            assert!(matches!(res, InboundOutcome::Buffered), "got {res:?}");
+        }
+        assert_eq!(g.unknown_early_vote_count().await, 4);
+        for o in outsiders(100).iter() {
+            let _ = g
+                .on_inbound_vote(sign_checkpoint_vote(CHAIN, 10, block_hash(1), o))
+                .await;
+        }
+        assert_eq!(g.unknown_early_vote_count().await, MAX_UNKNOWN_EARLY_VOTES);
+        assert_eq!(g.early_vote_count().await, MAX_UNKNOWN_EARLY_VOTES);
+    }
+
+    /// Eviction ties are broken by arrival order (the latest arrival among the
+    /// heaviest is evicted), independent of key bytes: whichever voter arrived
+    /// first keeps its vote.
+    #[test]
+    fn early_buffer_tie_break_is_arrival_order_not_key_bytes() {
+        let ks = keys(3);
+        let k0 = ks.first().expect("k0");
+        let k1 = ks.get(1).expect("k1");
+        let k2 = ks.get(2).expect("k2");
+        for (first, second) in [(k0, k1), (k1, k0)] {
+            let mut b = EarlyBuffer::default();
+            b.insert(sign_checkpoint_vote(CHAIN, 10, block_hash(1), first), 4, 2)
+                .expect("first fits");
+            b.insert(sign_checkpoint_vote(CHAIN, 10, block_hash(1), second), 4, 2)
+                .expect("second fits");
+            // Full, both hold 1; a fresh voter (0 held) evicts one of them.
+            b.insert(sign_checkpoint_vote(CHAIN, 10, block_hash(1), k2), 4, 2)
+                .expect("fresh voter evicts the latest arrival");
+            assert_eq!(b.voter_count(&pk(first)), 1, "incumbent kept");
+            assert_eq!(b.voter_count(&pk(second)), 0, "latest arrival evicted");
+            assert_eq!(b.len(), 2);
+        }
     }
 
     /// Fair-share backstop: at the total cap a lighter voter evicts the heaviest
@@ -1861,6 +2078,89 @@ mod tests {
         );
         assert_eq!(g.manager().pending_vote_count(10).await, Some(0));
         assert_eq!(g.signed_vote_at(10), None);
+    }
+
+    /// A transient durable-write failure is recoverable without a restart: the
+    /// checkpoint stays pending, a repeat report of the same `(height, hash)`
+    /// retries the own vote, and once the store recovers the vote is recorded,
+    /// signed and emitted exactly once.
+    #[tokio::test]
+    async fn own_vote_is_retried_after_transient_store_failure() {
+        let ks = keys(4);
+        let kv = Arc::new(MemKv::failing());
+        let g = gadget_over(&ks, true, kv.clone(), 40).await;
+        let k0 = ks.first().expect("key 0");
+        let seed = Hash::new([1; 32]);
+        let first = g
+            .on_buried_checkpoint(10, block_hash(10), &seed, Some(k0))
+            .await;
+        assert!(first.proposed && !first.signed_own_vote && first.outbound.is_empty());
+        assert!(first.own_vote_retryable, "{:?}", first.sign_refused);
+        // Still failing: the repeat report retries, is refused again, stays retryable.
+        let second = g
+            .on_buried_checkpoint(10, block_hash(10), &seed, Some(k0))
+            .await;
+        assert_eq!(second.skipped, Some(SkipReason::AlreadyPending));
+        assert!(matches!(
+            second.sign_refused,
+            Some(SignRefusal::StoreUnavailable(_))
+        ));
+        assert!(second.own_vote_retryable && second.outbound.is_empty());
+        assert_eq!(g.signed_vote_at(10), None);
+        // Storage recovers: the next report casts the vote (durably first).
+        kv.fail_writes.store(false, Ordering::SeqCst);
+        let third = g
+            .on_buried_checkpoint(10, block_hash(10), &seed, Some(k0))
+            .await;
+        assert_eq!(third.skipped, Some(SkipReason::AlreadyPending));
+        assert!(third.signed_own_vote, "{:?}", third.sign_refused);
+        assert!(!third.own_vote_retryable);
+        assert_eq!(third.outbound.len(), 1);
+        assert_eq!(g.signed_vote_at(10), Some(block_hash(10)));
+        assert_eq!(g.manager().pending_vote_count(10).await, Some(1));
+        // The vote is in: further reports are a plain no-op.
+        let fourth = g
+            .on_buried_checkpoint(10, block_hash(10), &seed, Some(k0))
+            .await;
+        assert_eq!(fourth.skipped, Some(SkipReason::AlreadyPending));
+        assert!(!fourth.signed_own_vote && fourth.outbound.is_empty());
+        assert!(fourth.sign_refused.is_none() && !fourth.own_vote_retryable);
+    }
+
+    /// The retry path keeps equivocation protection: after a restart onto a
+    /// different canonical hash at an already-signed height, every repeat report
+    /// is refused against the durable record and is not retryable.
+    #[tokio::test]
+    async fn own_vote_retry_still_refuses_a_different_hash() {
+        let ks = keys(4);
+        let kv = Arc::new(MemKv::default());
+        let k0 = ks.first().expect("key 0");
+        let seed = Hash::new([1; 32]);
+        {
+            let g = gadget_over(&ks, true, kv.clone(), 40).await;
+            let out = g
+                .on_buried_checkpoint(10, block_hash(10), &seed, Some(k0))
+                .await;
+            assert!(out.signed_own_vote);
+        }
+        let g = gadget_over(&ks, true, kv, 40).await;
+        let expected = Some(SignRefusal::Conflicting {
+            signed: block_hash(10),
+        });
+        let first = g
+            .on_buried_checkpoint(10, block_hash(11), &seed, Some(k0))
+            .await;
+        assert!(first.proposed && !first.signed_own_vote);
+        assert_eq!(first.sign_refused, expected);
+        assert!(!first.own_vote_retryable);
+        let again = g
+            .on_buried_checkpoint(10, block_hash(11), &seed, Some(k0))
+            .await;
+        assert_eq!(again.skipped, Some(SkipReason::AlreadyPending));
+        assert_eq!(again.sign_refused, expected);
+        assert!(!again.signed_own_vote && again.outbound.is_empty() && !again.own_vote_retryable);
+        assert_eq!(g.manager().pending_vote_count(10).await, Some(0));
+        assert_eq!(g.signed_vote_at(10), Some(block_hash(10)), "unchanged");
     }
 
     /// No persistent store at all: fail closed (never sign).

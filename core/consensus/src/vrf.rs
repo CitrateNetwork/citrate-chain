@@ -94,6 +94,20 @@ struct EpochSet {
     min_stake: u128,
 }
 
+impl EpochSet {
+    /// Members at or above this snapshot's `min_stake`, sorted by pubkey bytes.
+    fn eligible_members(&self) -> Vec<(PublicKey, u128)> {
+        let mut members: Vec<(PublicKey, u128)> = self
+            .stakes
+            .iter()
+            .filter(|(_, stake)| **stake >= self.min_stake)
+            .map(|(pk, stake)| (*pk, *stake))
+            .collect();
+        members.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        members
+    }
+}
+
 /// PSET-EPOCH: how many per-snapshot sets the selector keeps. Matches the
 /// node's per-epoch snapshot retention (`REWARD_SNAPSHOT_RETENTION_EPOCHS`).
 /// A block whose epoch is older than this is far below any tip that could
@@ -189,14 +203,20 @@ impl VrfProposerSelector {
         let snapshot_height = self.governing_snapshot(height)?;
         let history = self.history.read().await;
         let set = history.get(&snapshot_height)?;
-        let mut members: Vec<(PublicKey, u128)> = set
-            .stakes
-            .iter()
-            .filter(|(_, stake)| **stake >= set.min_stake)
-            .map(|(pk, stake)| (*pk, *stake))
-            .collect();
-        members.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-        Some((snapshot_height, members))
+        Some((snapshot_height, set.eligible_members()))
+    }
+
+    /// WP-S.3 §11.5: the MOST RECENT snapshot set this node holds, as
+    /// `(snapshot_height, [(pubkey, stake)])` with the same filtering and order
+    /// as [`Self::epoch_committee_set`]. NOT a committee input: it is only a
+    /// provisional admission hint for early votes whose governing snapshot has
+    /// not materialized on this node yet (a node behind an epoch boundary still
+    /// knows who the validators were one epoch ago). `None` when the history is
+    /// empty. Data source: the same per-epoch history.
+    pub async fn latest_epoch_committee_set(&self) -> Option<(u64, Vec<(PublicKey, u128)>)> {
+        let history = self.history.read().await;
+        let (&snapshot_height, set) = history.last_key_value()?;
+        Some((snapshot_height, set.eligible_members()))
     }
 
     /// VALIDATOR-S1: set the initial membership stake floor. Builder form used at

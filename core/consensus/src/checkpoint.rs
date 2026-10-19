@@ -833,6 +833,16 @@ impl CheckpointManager {
         None
     }
 
+    /// Whether the pending checkpoint at `height` already holds an accepted vote
+    /// from `voter` (`false` when nothing is pending there).
+    pub async fn has_pending_vote(&self, height: u64, voter: &PublicKey) -> bool {
+        self.pending
+            .read()
+            .await
+            .get(&height)
+            .is_some_and(|cp| cp.votes.contains_key(voter))
+    }
+
     /// Get pending vote count for a checkpoint.
     pub async fn pending_vote_count(&self, height: u64) -> Option<usize> {
         self.pending
