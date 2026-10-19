@@ -1,14 +1,14 @@
 // ── VENDORED: DO NOT EDIT. Change upstream, then re-vendor with a new header. ─────
 // Source:    CitrateNetwork/citrate-coop contracts/src/lib/Auth.sol
-// Upstream:  github.com/CitrateNetwork/citrate-coop @ c6a342414c4a05abac6b39566550d73230511329
+// Upstream:  github.com/CitrateNetwork/citrate-coop @ b8a884f01d84a4605e5752e052ef092e1922ba0b
 //            (branch fix/explicit-initial-admin; re-vendor from main after it merges), vendored 2026-10-18.
 // Includes:  PBA R2 remediation (citrate-coop #3), Apache-2.0 relicense, explicit initial admin/registrar, role-holder validation.
 // Integrity: every line after this 10-line header is byte-identical to upstream:
-//            `tail -n +11 <this file> | sha256sum` == a689bd0a1f2d254df3dc79224de42514bb0e97b31082ae32d4c04bba9d982327
+//            `tail -n +11 <this file> | sha256sum` == b1ec51d8ac4b94f438429c10c8d07e530f28cd5545473c91026d38205232313f
 // Why:       C2 D9 / C4: deployed dormant at betanet genesis by the citrate-chain
 //            ceremony (script/DeployDormantLedgers.s.sol).
 // ───────────────────────────────────────────────────────────────────────────────────
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
 /// @title Auth — minimal role-based access control (RFC-CIT-COOP-0001)

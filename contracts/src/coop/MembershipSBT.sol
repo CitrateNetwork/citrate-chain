@@ -1,6 +1,6 @@
 // ── VENDORED: DO NOT EDIT. Change upstream, then re-vendor with a new header. ─────
 // Source:    CitrateNetwork/citrate-coop contracts/src/MembershipSBT.sol
-// Upstream:  github.com/CitrateNetwork/citrate-coop @ c6a342414c4a05abac6b39566550d73230511329
+// Upstream:  github.com/CitrateNetwork/citrate-coop @ b8a884f01d84a4605e5752e052ef092e1922ba0b
 //            (branch fix/explicit-initial-admin; re-vendor from main after it merges), vendored 2026-10-18.
 // Includes:  PBA R2 remediation (citrate-coop #3), Apache-2.0 relicense, explicit initial admin/registrar, role-holder validation.
 // Integrity: every line after this 10-line header is byte-identical to upstream:
