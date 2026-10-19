@@ -72,6 +72,7 @@ mod dag_prune;
 mod finality_adversarial_tests;
 mod finality_driver;
 mod finality_floor;
+mod finality_sync;
 mod genesis;
 mod hardening_rejoin;
 mod inference;
@@ -2099,6 +2100,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // by hash); stays `None` without a canonical applicator (tags then resolve
     // to genesis).
     let mut finality_rpc_handle: Option<citrate_api::FinalizedTagSource> = None;
+    // WP-S.3 Stage 1b (spec §11.10): late-joiner checkpoint certificate sync.
+    // `None` in Legacy mode (voting pin OFF, every chain in this release) and
+    // without a canonical applicator: nothing is requested, served or accepted.
+    let mut certificate_sync: Option<Arc<finality_sync::CertificateSync>> = None;
 
     // EXECUTE-ON-RECEIVE (step 2): the fast-path applier. Active under v2 headers
     // (CITRATE_BLOCK_V2) — the flag that makes a block's state_root reproducible by a
@@ -2195,6 +2200,15 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // halts finality before it does anything else.
             let _ = floor_verifier.boot_check().await;
             finality_rpc_handle = Some(floor_verifier.rpc_finalized_handle());
+            // Stage 1b: peer certificates are verified against this node's own
+            // epoch committee and chain, then handed to this floor verifier.
+            certificate_sync = finality_sync::CertificateSync::new(
+                finality_gadget.clone(),
+                app.clone(),
+                storage.clone(),
+                floor_verifier.clone(),
+            )
+            .map(Arc::new);
             let _ = floor_verifier.spawn();
             Some(app)
         } else {
@@ -3074,6 +3088,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // takes exactly the old submit_vote -> finalize path, or (switch ON) also
         // buffers early votes and returns accepted votes for one re-gossip.
         let finality_gadget_for_net = finality_gadget.clone();
+        // WP-S.3 Stage 1b: serves / accepts checkpoint certificates (`None`:
+        // compiled off, the two sync messages are ignored).
+        let certificate_sync_for_net = certificate_sync.clone();
         // #85: the success half of the sync-peer accounting (invariant I3) —
         // the tick task can only ever observe timeouts, so the peer that
         // actually answers has to be credited from the receive side.
@@ -3823,6 +3840,38 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             .await;
                         }
                     }
+                    // WP-S.3 Stage 1b (spec §11.10): a peer asks for a finalized
+                    // checkpoint certificate. Rate-limited per peer and size-bounded
+                    // inside `serve`; no answer when compiled off or none in range.
+                    NetworkMessage::GetCheckpoint { above, at_or_below } => {
+                        if let Some(cs) = &certificate_sync_for_net {
+                            if let Some(resp) = cs.serve(&pid.0, above, at_or_below).await {
+                                let _ = pm_for_rx
+                                    .send_to_peers(std::slice::from_ref(&pid), &resp)
+                                    .await;
+                            }
+                        }
+                    }
+                    // Stage 1b: only the answer to this node's outstanding request
+                    // is used; it is verified (epoch committee, quorum, signatures,
+                    // (height, hash) on this node's chain) off the message loop.
+                    NetworkMessage::CheckpointCertificate {
+                        height,
+                        block_hash,
+                        signatures,
+                    } => match &certificate_sync_for_net {
+                        Some(cs) if cs.accept_response(&pid.0).await => {
+                            let cs = cs.clone();
+                            let peer = pid.0.clone();
+                            tokio::spawn(async move {
+                                let _ = cs.process(&peer, height, block_hash, signatures).await;
+                            });
+                        }
+                        _ => tracing::debug!(
+                            "Checkpoint certificate from peer {} not requested; ignored",
+                            pid.0
+                        ),
+                    },
                     _ => {
                         tracing::debug!("Unhandled message variant from peer {}", pid.0);
                     }
@@ -4168,6 +4217,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     peer_manager.clone(),
                     proposer_signing_key.clone(),
                 );
+                // Stage 1b: fetch finalized certificates from peers so a node that
+                // joined late or restarted behind gets its floor without waiting
+                // to take part in a live quorum.
+                if let Some(cs) = &certificate_sync {
+                    finality_sync::spawn_requester(cs.clone(), peer_manager.clone());
+                }
             }
             None => warn!(
                 "checkpoint finality: producer path ON but execute-on-receive is disabled — \
