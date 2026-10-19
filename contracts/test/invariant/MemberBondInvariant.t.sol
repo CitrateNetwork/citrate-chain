@@ -40,6 +40,11 @@ contract MemberBondHandler is Test {
     uint256 public lockedReclaims;
     /// A member's own reclaim attempt that did not revert. Must stay zero.
     uint256 public memberReclaims;
+    /// Successful activations once the bond had unlocked. Must stay zero: the
+    /// activation window closes at unlock (owner decision 2026-10-19).
+    uint256 public lateActivations;
+    /// Set when member i activated while the bond was still locked.
+    bool[MEMBERS] public activatedInWindow;
 
     constructor() {
         registry = new ValidatorRegistry(
@@ -104,8 +109,12 @@ contract MemberBondHandler is Test {
         // Resolve the bond BEFORE the prank: `bondOf` is an external call to the vault and
         // would consume it, so the bond would see the handler, not the member.
         MemberBond bond = bondOf(i);
+        bool wasUnlocked = bond.isUnlocked();
         vm.prank(members[i]);
-        try bond.activate(pubkeyOf(i), new bytes(64)) {} catch {}
+        try bond.activate(pubkeyOf(i), new bytes(64)) {
+            if (wasUnlocked) lateActivations++;
+            else activatedInWindow[i] = true;
+        } catch {}
     }
 
     /// The treasury reclaims a bond (allowed only after the lock, unactivated, once).
@@ -287,6 +296,20 @@ contract MemberBondInvariant is Test {
         assertEq(h.TREASURY().balance, reclaimedGrants * GRANT, "treasury holds other than the reclaimed grants");
         assertEq(h.memberReclaims(), 0, "a member reclaimed");
         assertEq(h.lockedReclaims(), 0, "reclaimed inside the lock");
+    }
+
+    /// Owner decision 2026-10-19: the activation window closes at unlock. No
+    /// bond activates once unlocked, so a grant not activated inside the lock
+    /// never pays its member anything, by any path, ever; it stays in the bond
+    /// or goes to the treasury (conservation is `invariant_principalIsConserved`).
+    function invariant_activationWindowClosesAtUnlock() public view {
+        assertEq(h.lateActivations(), 0, "a bond activated after its unlock");
+        for (uint256 i = 0; i < h.memberCount(); i++) {
+            if (!h.granted(i) || h.activatedInWindow(i)) continue;
+            MemberBond bond = h.bondOf(i);
+            assertFalse(bond.activated(), "activated outside the window");
+            assertEq(h.members(i).balance, 0, "a grant not activated inside the lock paid its member");
+        }
     }
 
     /// MAC P3: activated implies the treasury reclaim never succeeds.

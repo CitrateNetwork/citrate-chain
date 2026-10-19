@@ -124,6 +124,7 @@ contract MemberBond is Initializable {
     error TreasuryNotSet();
     error TreasuryIsMember();
     error AlreadyReclaimed();
+    error ActivationWindowClosed();
 
     event BondInitialized(
         address indexed member,
