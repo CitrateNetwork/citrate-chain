@@ -127,8 +127,9 @@ host's existing systemd unit `citrate-faucet` and its env file `/etc/citrate-fau
 
 ```bash
 systemctl cat citrate-faucet          # read ExecStart; use that path below as $BIN
-cp -a "$BIN" "$BIN.pre-g4"            # rollback copy
-sha256sum "$BIN.pre-g4"               # record it
+# Rollback copy, taken once: a second run must not replace it with the G4 binary.
+[ -e "$BIN.pre-g4" ] || cp -a "$BIN" "$BIN.pre-g4"
+sha256sum "$BIN.pre-g4"               # record it (on a rerun, check it still matches the first record)
 install -m 0755 citrate-faucet "$BIN"
 ```
 
@@ -144,7 +145,19 @@ The block stops at the first failed step. The subshell runs on its own (never as
 `&&` or `||`, which would switch `set -e` off inside it), and every step that comes before the
 `mv` also carries an explicit `|| exit 1`, so a failed backup, filter, append, key check, `chown`
 or `chmod` can never reach the `mv`. The result is read from the subshell's exit status
-afterwards. `FAUCET_ENV` and `FAUCET_STATE_DIR` default to the production paths; the faucet's
+afterwards.
+
+The rollback copy `$E.pre-g4` is written once. If it already exists (for example the block ran
+before and you are rerunning it to change a value), it is kept as it is and the block says so;
+it is never overwritten, so §4.6 always restores the env from before the first run. If it exists
+but is a symlink or not a regular file, the block refuses. Remove it only as §4.6 says, after
+the new config is confirmed.
+
+The two `<...>` values below are placeholders: replace them before running. If one is left
+as is, the faucet refuses to start (strict parsing), so the mistake shows at 4.5 and the faucet
+does not run with a wrong value.
+
+`FAUCET_ENV` and `FAUCET_STATE_DIR` default to the production paths; the faucet's
 test suite (`faucet/tests/runbook_env_block.rs`) runs this exact block against a throwaway env
 file, including each failure path.
 
@@ -157,7 +170,15 @@ D=${FAUCET_STATE_DIR:-/var/lib/citrate-faucet}
 # The env file must already be private (0600 or 0400) before anything is copied from it.
 case "$(stat -c '%a' "$E")" in 600|400) ;; *) echo "refusing: $E is not mode 0600" >&2; exit 1 ;; esac
 install -d -m 0700 "$D"                     || exit 1   # match the unit's User= if it is not root
-cp -a "$E" "$E.pre-g4"                      || exit 1   # rollback copy; -a keeps the 0600 mode and owner
+# Rollback copy, taken on the first run only. A rerun keeps it, so it always holds the pre-G4 env.
+if [ -L "$E.pre-g4" ] || { [ -e "$E.pre-g4" ] && [ ! -f "$E.pre-g4" ]; }; then
+  echo "refusing: $E.pre-g4 exists and is not a regular file" >&2; exit 1
+fi
+if [ -e "$E.pre-g4" ]; then
+  echo "keeping the existing rollback copy $E.pre-g4 (not overwritten)"
+else
+  cp -a "$E" "$E.pre-g4"                    || exit 1   # -a keeps the 0600 mode and owner
+fi
 T=$(mktemp "$E.new.XXXXXX")                 || exit 1   # created 0600 under umask 077, same filesystem as $E
 trap 'rm -f "$T"' EXIT
 grep -v -E '^(FAUCET_MAX_DRIPS_PER_HOUR|FAUCET_MEMBER_SBT|FAUCET_COOLDOWN_FILE|FAUCET_REQUIRE_GATES|FAUCET_ADDRESS_COOLDOWN_SECS|FAUCET_IP_COOLDOWN_SECS)=' "$E" > "$T" || exit 1

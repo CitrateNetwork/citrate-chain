@@ -197,3 +197,69 @@ fn env_block_stops_on_every_failed_step() {
         c.assert_unchanged(&c.run(), &format!("failing {cmd}"));
     }
 }
+
+/// The rollback copy is written once. A second run (after a success, then after a failure) keeps
+/// the copy of the env from before the first run, so §4.6 rollback never restores a G4 env.
+#[test]
+fn env_block_rerun_keeps_the_first_rollback_copy() {
+    let c = case(&base_env(), 0o600);
+    let backup = c.env.with_file_name("citrate-faucet.env.pre-g4");
+
+    let first = c.run();
+    assert!(
+        String::from_utf8_lossy(&first.stdout).contains("env updated"),
+        "first run: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(std::fs::read(&backup).expect("backup"), c.original);
+    let after_first = std::fs::read(&c.env).expect("env");
+    assert_ne!(after_first, c.original);
+
+    // Rerun that succeeds: the env is rewritten, the rollback copy is not.
+    let second = c.run();
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(stdout.contains("env updated"), "second run: {stdout}");
+    assert!(
+        stdout.contains("keeping the existing rollback copy"),
+        "{stdout}"
+    );
+    assert_eq!(std::fs::read(&backup).expect("backup"), c.original);
+    assert_eq!(std::fs::read(&c.env).expect("env"), after_first);
+
+    // Rerun that fails late: env unchanged from the first run, rollback copy still the original.
+    c.shim("chmod", "exit 1");
+    let third = c.run();
+    assert!(
+        String::from_utf8_lossy(&third.stderr).contains("env NOT changed"),
+        "third run: {}",
+        String::from_utf8_lossy(&third.stderr)
+    );
+    assert_eq!(std::fs::read(&backup).expect("backup"), c.original);
+    assert_eq!(std::fs::read(&c.env).expect("env"), after_first);
+    assert!(c.leftovers().is_empty(), "{:?}", c.leftovers());
+}
+
+/// A rollback copy that is a symlink (or not a regular file) is refused, not followed.
+#[test]
+fn env_block_refuses_a_rollback_copy_that_is_not_a_regular_file() {
+    let c = case(&base_env(), 0o600);
+    let elsewhere = c.env.with_file_name("elsewhere");
+    std::fs::write(&elsewhere, "untouched\n").expect("elsewhere");
+    let backup = c.env.with_file_name("citrate-faucet.env.pre-g4");
+    std::os::unix::fs::symlink(&elsewhere, &backup).expect("symlink");
+    let out = c.run();
+    c.assert_unchanged(&out, "symlinked rollback copy");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not a regular file"));
+    assert_eq!(
+        std::fs::read_to_string(&elsewhere).expect("elsewhere"),
+        "untouched\n"
+    );
+    assert!(std::fs::symlink_metadata(&backup)
+        .expect("meta")
+        .file_type()
+        .is_symlink());
+
+    let c = case(&base_env(), 0o600);
+    std::fs::create_dir(c.env.with_file_name("citrate-faucet.env.pre-g4")).expect("dir");
+    c.assert_unchanged(&c.run(), "directory rollback copy");
+}
