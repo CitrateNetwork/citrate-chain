@@ -36,7 +36,8 @@ jobs:
         run: python3 -m unittest discover -s scripts/ops/tests -p 'test_*.py' -v
       - name: Producer operator tools (unit tests, loopback only)
         # C3-P: scripts/producers/ (preflight, config generator, registration tx builder,
-        # post-join verifier). Fake RPC on 127.0.0.1 and a fake host root; no network.
+        # post-join verifier, and the runbook's node install block run against good and
+        # bad release fixtures). Fake RPC on 127.0.0.1 and a fake host root; no network.
         run: python3 -m unittest discover -s scripts/producers/tests -p 'test_*.py' -v
       - name: Height watchdog pause/resume (hermetic shell test)
         run: bash scripts/ops/tests/test_height_watchdog.sh

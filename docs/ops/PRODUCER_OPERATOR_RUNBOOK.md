@@ -103,27 +103,77 @@ Rules for the host's lifetime:
 
 Producers run only binaries the chain team has released from `main`, never a branch build and never a local build. The chain team announces, per release: the tag, each tarball's SHA-256 and the `citrate-node consensus` fingerprint.
 
+Run the block below as one paste. It runs in its own `bash` with `set -euo pipefail`, so the first failed step ends it and nothing after that step runs. Fill in the four values from the announcement first. A placeholder left in place fails the checks.
+
+<!-- runbook-test: install-block. scripts/producers/tests/test_runbook_install_block.py runs this exact block against good and bad fixtures. -->
 ```bash
-TAG=v0.5.x                                  # the announced tag
-ARCH=x86_64-unknown-linux-gnu               # or aarch64-unknown-linux-gnu
-BASE=https://github.com/CitrateNetwork/citrate-chain/releases/download/$TAG
-cd /tmp && for f in citrate-chain-$ARCH.tar.gz{,.sha256,.sig,.pem}; do curl -fsSLO "$BASE/$f"; done
+bash <<'INSTALL_CITRATE_NODE'
+set -euo pipefail
+TAG='PASTE-ANNOUNCED-TAG'                           # e.g. v0.5.2
+ARCH='x86_64-unknown-linux-gnu'                     # or aarch64-unknown-linux-gnu
+EXPECTED_SHA256='PASTE-ANNOUNCED-TARBALL-SHA256'    # 64 hex characters
+EXPECTED_FINGERPRINT='PASTE-ANNOUNCED-FINGERPRINT'  # 0x + 32 hex characters
+INSTALL_DIR='/usr/local/bin'
+BASE="https://github.com/CitrateNetwork/citrate-chain/releases/download/$TAG"
+TARBALL="citrate-chain-$ARCH.tar.gz"
+IDENTITY='^https://github\.com/CitrateNetwork/citrate-chain/\.github/workflows/(release|release-tier2)\.yml@refs/(heads/main|tags/v[0-9A-Za-z._-]+)$'
 
-sha256sum -c citrate-chain-$ARCH.tar.gz.sha256
-cosign verify-blob citrate-chain-$ARCH.tar.gz \
-  --signature citrate-chain-$ARCH.tar.gz.sig --certificate citrate-chain-$ARCH.tar.gz.pem \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  --certificate-identity-regexp '^https://github\.com/CitrateNetwork/citrate-chain/\.github/workflows/(release|release-tier2)\.yml@refs/(heads/main|tags/v[0-9A-Za-z._-]+)$'
+refuse() { echo "REFUSED: $*. Nothing was installed. Tell the chain team." >&2; exit 1; }
 
-tar -xzf citrate-chain-$ARCH.tar.gz
-[ -f /usr/local/bin/citrate-node ] && cp -a /usr/local/bin/citrate-node /usr/local/bin/citrate-node.prev
-install -m 0755 citrate-chain-$ARCH/citrate-node /usr/local/bin/citrate-node
-citrate-node consensus            # the fingerprint must equal the announced one
+if ! command -v cosign >/dev/null; then refuse "cosign is not installed"; fi
+
+# Download, verify, unpack and run from one fresh private directory (mode 0700).
+# The file that is installed is the file that was verified.
+WORK="$(mktemp -d)"
+trap 'rm -rf -- "${WORK:?}"' EXIT
+cd "$WORK"
+for f in "$TARBALL" "$TARBALL.sig" "$TARBALL.pem"; do
+  if ! curl -fsSL --proto '=https' -o "$f" "$BASE/$f"; then refuse "download of $f failed"; fi
+done
+
+# 1. The tarball's SHA-256 against the announced value
+ACTUAL_SHA256="$(sha256sum "$TARBALL" | cut -d' ' -f1)"
+if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then refuse "tarball SHA-256 is $ACTUAL_SHA256, not the announced one"; fi
+
+# 2. Sigstore signature, signed by the chain repo's release workflow on main or a tag
+if ! cosign verify-blob "$TARBALL" \
+    --signature "$TARBALL.sig" --certificate "$TARBALL.pem" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-identity-regexp "$IDENTITY"; then
+  refuse "cosign signature check failed"
+fi
+
+# 3. Unpack the verified tarball; check the unpacked binary's consensus fingerprint
+mkdir stage
+tar -xzf "$TARBALL" -C stage --no-same-owner
+BIN="stage/citrate-chain-$ARCH/citrate-node"
+if [ -L "$BIN" ]; then refuse "the tarball's citrate-node is a symlink"; fi
+if [ ! -f "$BIN" ]; then refuse "the tarball has no citrate-chain-$ARCH/citrate-node"; fi
+GOT_FINGERPRINT="$(RUST_LOG=error "./$BIN" consensus --json | python3 -c 'import json,sys; l=sys.stdin.read().splitlines(); print(json.loads("\n".join(l[l.index("{"):]))["fingerprint"])')"
+if [ "$GOT_FINGERPRINT" != "$EXPECTED_FINGERPRINT" ]; then refuse "consensus fingerprint is $GOT_FINGERPRINT, not the announced one"; fi
+
+# 4. Install the verified file: keep the old binary as .prev, copy, compare, rename into place
+if [ -f "$INSTALL_DIR/citrate-node" ]; then cp -a "$INSTALL_DIR/citrate-node" "$INSTALL_DIR/citrate-node.prev"; fi
+install -m 0755 "$BIN" "$INSTALL_DIR/citrate-node.new"
+if ! cmp -s "$BIN" "$INSTALL_DIR/citrate-node.new"; then rm -f -- "$INSTALL_DIR/citrate-node.new"; refuse "the copied binary differs from the verified one"; fi
+mv -f -- "$INSTALL_DIR/citrate-node.new" "$INSTALL_DIR/citrate-node"
+echo "INSTALLED citrate-node $TAG ($ARCH): tarball SHA-256 $ACTUAL_SHA256, fingerprint $GOT_FINGERPRINT"
+INSTALL_CITRATE_NODE
 ```
 
-Install `cosign` from the Sigstore project's own signed release. The identity regexp is the one `scripts/deploy_testnet.sh` enforces. If either check fails, stop and tell the chain team. Don't install the binary.
+The block checks these in order and stops at the first failure:
 
-Then get the tools at the same tag: `git clone --depth 1 --branch $TAG https://github.com/CitrateNetwork/citrate-chain /opt/citrate-chain`. The commands below run from `/opt/citrate-chain`.
+1. `cosign` is present.
+2. Every file downloaded.
+3. The tarball's SHA-256 equals the announced value.
+4. The Sigstore signature and signer identity verify.
+5. The unpacked binary's `citrate-node consensus` fingerprint equals the announced one.
+
+The binary runs only after the hash and the signature pass. That first run is the fingerprint check, from the private directory. The binary is installed only after all the checks pass. On any failure the block prints `REFUSED: …`, exits non-zero and leaves `/usr/local/bin` as it was. Don't work around a refusal. Tell the chain team.
+
+Install `cosign` from the Sigstore project's own signed release. The identity regexp is the one `scripts/deploy_testnet.sh` enforces. `scripts/producers/tests/test_runbook_install_block.py` runs this exact block from this file against a bad hash, a bad signature, a bad fingerprint, a missing `cosign` and a failed download, and checks that each one refuses.
+
+Then get the tools at the same tag. Set `TAG` in your shell to the announced tag first, because the block above ran in its own shell: `git clone --depth 1 --branch "$TAG" https://github.com/CitrateNetwork/citrate-chain /opt/citrate-chain`. The commands below run from `/opt/citrate-chain`.
 
 ## 4. Keys: what exists, who makes it, where it lives
 

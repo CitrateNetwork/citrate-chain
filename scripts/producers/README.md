@@ -35,4 +35,4 @@ python3 -m unittest discover -s scripts/producers/tests -p 'test_*.py' -v
 CITRATE_NODE_BIN=target/debug/citrate python3 -m unittest discover -s scripts/producers/tests -p 'test_build*.py'
 ```
 
-The tests use a fake JSON-RPC server on 127.0.0.1 (`tests/rpcstub.py`), a fake host root and a fake node binary (`tests/fake_citrate_node.py`). These are test-only; the tools never import them. CI runs them in `.github/workflows/claims-truth.yml`.
+The tests use a fake JSON-RPC server on 127.0.0.1 (`tests/rpcstub.py`), a fake host root and a fake node binary (`tests/fake_citrate_node.py`). These are test-only; the tools never import them. `tests/test_runbook_install_block.py` runs the node install block of `docs/ops/PRODUCER_OPERATOR_RUNBOOK.md` §3, read from the runbook, against a good release and against a bad hash, a bad signature, a bad fingerprint, a missing `cosign` and a failed download, with fake `curl` and `cosign` and every path under a temp dir; each bad case must refuse and leave the install dir unchanged. CI runs them in `.github/workflows/claims-truth.yml`.

@@ -70,6 +70,10 @@ class TestPreflight(unittest.TestCase):
         self.tmp.cleanup()
         pf.THRESHOLDS["min_disk_free_gib"] = 100
 
+    # The fake host's `citrate` user is the test's own uid (the data dir must be owned by
+    # it). As uid 0 (CI as root, or `unshare --map-root-user`) that user is root, which
+    # preflight rightly FAILs, and no other uid is mapped to chown to.
+    @unittest.skipIf(os.getuid() == 0, "needs a non-root uid for the fake `citrate` user")
     def test_good_host_has_no_failures(self):
         rep = pf.run(host(self.root), args(), None)
         self.assertFalse(rep.failed, rep.rows)
