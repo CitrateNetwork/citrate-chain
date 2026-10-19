@@ -10,6 +10,9 @@
 #
 # Usage: prod_assert_ratchet.sh [--list]   |   prod_assert_ratchet.sh --self-test
 set -uo pipefail
+# Git exports GIT_DIR/GIT_INDEX_FILE/GIT_WORK_TREE to hooks (pre-push runs this script). They
+# would override `git -C <dir>` below, so the self-test temp repo would list the outer repo.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_OBJECT_DIRECTORY
 REPO_ROOT="${PROD_ASSERT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 BASELINE="$REPO_ROOT/scripts/ci/prod-assert-baseline.txt"
 
