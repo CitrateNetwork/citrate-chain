@@ -56,7 +56,7 @@ Use these words exactly. Each has one meaning and one condition. If a state isn'
 | **Not a validator** | No stake in the registry for this key | `ValidatorRegistry.validatorInfo(pubkey).status` = None |
 | **Bond locked · not staked** | Membership grant sits in the member's bond, not in the registry | `MemberBond.activated()` = false |
 | **Registered · active from epoch N** | Registered in the registry; consensus activation is pending | `validatorInfo(pubkey).actEpoch` (= N) > `currentEpoch()`. Show the actual N; never promise "next epoch", because registration near a snapshot boundary can activate two epochs later. `isActive(pubkey)` is already true at registration and can't tell these apart |
-| **Validator active** | Active for consensus | `isActive(pubkey)` = true **and** `validatorInfo(pubkey).actEpoch` ≤ `currentEpoch()` |
+| **Validator active** | Active in the live registry, activation epoch reached | `isActive(pubkey)` = true **and** `validatorInfo(pubkey).actEpoch` ≤ `currentEpoch()`. Consensus follows the epoch snapshot, so it can lag by up to an epoch after a change; "Producing blocks" is the evidence of participation |
 | **Producing blocks** | This node actually proposed blocks recently | A block in the last 1,000 has `proposerPubkey` = this node's key. *Active* does not imply this: today only one validator produces |
 | **Exiting** / **Slashed** | Registry status 2 / 3 | `validatorInfo.status` |
 | ~~Validating~~ (for stake ≥ 32k), ~~building blocks~~, ~~producing again~~ | **Banned.** Use the words above. Self-stake in LiquidStakingPool never makes a validator; only the registry does |
@@ -106,7 +106,8 @@ Amounts are SALT with 18 decimals (wei), so divide by 1e18. Addresses come from 
 | Peers | Local `net_peerCount` | "N direct peers", not "the network" | 3 (public RPC) |
 | Base fee / gas price | `baseFeePerGas` of the latest block | "1 gwei (fixed)". It is a consensus constant | 1 gwei |
 | Registered validators | `ValidatorRegistry.activeCount()` (fixture `registered_validators`) | Integer, labelled "registered". It **includes** registrations still pending activation, so never call it "active" | 5 |
-| Consensus-active validators | `activeSet()` members with `validatorInfo(pubkey).actEpoch` ≤ `currentEpoch()` (fixture `consensus_active_validators`, which also reports `pending_activation`) | Integer. This is the "active" number. Example: right after a registration, registered = 6, consensus-active = 5, pending = 1 | 5 |
+| Eligible validators (live registry) | Live `activeSet()` members with `validatorInfo(pubkey).actEpoch` ≤ `currentEpoch()` (fixture `eligible_validators`, which also reports `pending_activation`) | Integer, labelled "eligible". It is the live registry, **not** consensus membership: consensus uses the governing epoch snapshot, so a validator that registered or exited after that snapshot differs for up to an epoch. Example: right after a registration, registered = 6, eligible = 5, pending = 1 | 5 |
+| Consensus validator set | The governing epoch snapshot S(E) (node-internal) | **Unavailable**: no RPC exposes it yet (§9). Don't show a consensus-set number | — |
 | Producing validators | Distinct `proposerPubkey` over the last 1,000 blocks (fixture `producing_validators`, with its window) | Integer, with the window stated ("over the last N blocks"). A sample of N ≥ 100 is allowed if N is shown. Show it next to *active* so the gap is visible. A validator absent from the window is "not seen producing in the last N blocks", not "not producing" | 1 |
 | Minimum stake | `ValidatorRegistry.minStake()` | SALT. Read it; don't hard-code 32,000 | 32,000 |
 | Block reward | `ValidatorRegistry.blockSubsidy()` | "N SALT per block, to the producer". It is governance-set, so read it, never hard-code it | 10 SALT |
@@ -206,6 +207,7 @@ These are for the core lane to fix against this contract. Each is a board item o
 ## 9. Chain-side follow-ups (DGX lane)
 
 - **claims.json errata**: precompile set (agent precompiles 0x0112, 0x0113, 0x0121, 0x0122 are live; 0x0104 retired), ModelRegistry precompile flag (fixed in G, set agrees = true), the `finalized` tag note (the tag is served since #250 and returns genesis), the supply pointer (`lib.rs:75`), the `deployed_contracts` verification date, and re-run test counts.
+- **Consensus set RPC**: expose the governing epoch snapshot (membership and effective stake for the epoch governing a height) so the app can show consensus membership, not just live-registry eligibility.
 - **RPC honesty**: real node version and consensus fingerprint over RPC, a genesis-hash method, errors instead of silent defaults (§3), drop the DAG-stats estimates, and fix the `eth_feeHistory` reward shape and `citrate_getToken.totalMinted`.
 - **Mainnet profile**: `GenesisConfig::mainnet()` uses chain ID 1 and placeholder addresses; `node/config/mainnet.toml` is a skeleton. Resolved in C2.
 

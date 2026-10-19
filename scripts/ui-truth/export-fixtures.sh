@@ -66,7 +66,15 @@ OBSERVED=$(head_now); row base_fee      "eth_getBlockByNumber(latest).baseFeePer
 OBSERVED=$(head_now)
 t1=$(rpc eth_getBlockByNumber "[\"$(printf '0x%x' "$OBSERVED")\",false]" | jq -r .timestamp)
 t0=$(rpc eth_getBlockByNumber "[\"$(printf '0x%x' $((OBSERVED-100)))\",false]" | jq -r .timestamp)
-row block_time_s "timestamp delta over the 100 blocks ending at observed_head" "$(jq -cn --argjson a $((t1)) --argjson b $((t0)) '($a-$b)/100')"
+# RPC values never reach shell arithmetic unvalidated: Bash evaluates expressions (and array
+# subscripts) inside $(( )), so only a bounded hex quantity is converted; anything else makes
+# the metric unavailable.
+if [[ "$t1" =~ ^0x[0-9a-fA-F]{1,15}$ && "$t0" =~ ^0x[0-9a-fA-F]{1,15}$ ]]; then
+  bt=$(jq -cn --argjson a "$(printf '%d' "$t1")" --argjson b "$(printf '%d' "$t0")" '($a-$b)/100')
+else
+  bt='{"unavailable":true,"reason":"block timestamp missing or malformed"}'
+fi
+row block_time_s "timestamp delta over the 100 blocks ending at observed_head" "$bt"
 for h in 365784 365785; do
   OBSERVED=$(head_now)
   row "checkpoint_$h" "eth_getBlockByNumber($h).hash (canonical checkpoint)" \
@@ -109,9 +117,11 @@ call max_epoch_emission     ValidatorRegistry "maxEpochEmission()(uint256)"
 call current_epoch          ValidatorRegistry "currentEpoch()(uint256)"
 call validator_active_set   ValidatorRegistry "activeSet()(bytes32[],uint256[])"
 
-# Consensus-active validators: members of the registry set whose activation epoch has come
-# (validatorInfo.actEpoch <= currentEpoch). activeCount() also counts registrations that are
-# still pending activation, so the two are exported separately (contract §1/§2).
+# Eligible validators (LIVE registry): members of the current registry set whose activation
+# epoch has come (validatorInfo.actEpoch <= currentEpoch). This is not consensus membership:
+# consensus uses the governing epoch snapshot S(E) (node registry_sync / vrf), which no RPC
+# exposes yet, so a validator that registered or exited after the snapshot differs here for up
+# to an epoch. Consensus membership is exported as unavailable until such a source exists.
 OBSERVED=$(head_now)
 VR=$(addr ValidatorRegistry)
 cur_epoch=$(cast call --rpc-url "$RPC" "$VR" "currentEpoch()(uint256)" 2>/dev/null | awk '{print $1}') || cur_epoch=""
@@ -135,8 +145,10 @@ if [[ "$cur_epoch" =~ ^[0-9]+$ ]] && [ -n "$keys_raw" ]; then
 else
   cav='{"unavailable":true,"reason":"currentEpoch or activeSet read failed"}'
 fi
-row consensus_active_validators \
-  "ValidatorRegistry activeSet() members with validatorInfo(pubkey).actEpoch <= currentEpoch()" "$cav"
+row eligible_validators \
+  "live ValidatorRegistry activeSet() members with validatorInfo(pubkey).actEpoch <= currentEpoch()" "$cav"
+row consensus_validator_set "governing epoch snapshot S(E) (node-internal)" \
+  '{"unavailable":true,"reason":"no RPC exposes the governing consensus snapshot yet (contract §9)"}' 
 
 # Membership (Track M).
 call grants_issued          MembershipStakeVault "nextGrantId()(uint256)"

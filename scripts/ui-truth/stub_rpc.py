@@ -9,7 +9,10 @@ With [fail_mod] > 0, every block whose number is divisible by it fails: odd mult
 a JSON-RPC error, even multiples return a null block (models a partial producer sample).
 With [batch_fault] = http500 or badjson, the batch request covering the current head (the
 final producer batch) fails at the transport or parse level instead. With [batch_fault] =
-headbad, eth_blockNumber returns a malformed quantity.
+headbad, eth_blockNumber returns a malformed quantity; with hostilets, block timestamps are a
+Bash arithmetic-injection string (the exporter must never evaluate it).
+ValidatorRegistry reads are ABI-encoded: two validators, one with actEpoch <= currentEpoch
+(7) and one pending (actEpoch 9).
 """
 import json, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -17,7 +20,23 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 PORT, HEAD, STEP = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
 FAIL_MOD = int(sys.argv[4]) if len(sys.argv) > 4 else 0
 BATCH_FAULT = sys.argv[5] if len(sys.argv) > 5 else ""
+MARKER = sys.argv[6] if len(sys.argv) > 6 else "/nonexistent/stub-marker"
 state = {"head": HEAD}
+W = lambda v: f"{v:064x}"
+K1, K2 = "11" * 32, "22" * 32
+
+
+def registry_call(data):
+    """Minimal ABI-encoded ValidatorRegistry responses; everything else is uint256(1)."""
+    sel = data[2:10]
+    if sel == "76671808":  # currentEpoch()
+        return "0x" + W(7)
+    if sel == "fd4665ae":  # activeSet() -> (bytes32[], uint256[])
+        return "0x" + W(64) + W(64 + 32 * 3) + W(2) + K1 + K2 + W(2) + W(32000) + W(32000)
+    if sel == "00408838":  # validatorInfo(bytes32): actEpoch is the 6th word
+        act = 5 if data[10:74] == K1 else 9
+        return "0x" + W(1) + W(32000) + W(0) + W(0) + W(32000) + W(act) + W(0) + W(0) + W(1) + W(0)
+    return "0x" + W(1)
 
 
 def answer(req):
@@ -42,10 +61,12 @@ def answer(req):
             if (n // FAIL_MOD) % 2:
                 return {"jsonrpc": "2.0", "id": req.get("id"), "error": {"code": -32000, "message": "stub: unavailable"}}
             return {"jsonrpc": "2.0", "id": req.get("id"), "result": None}
-        res = {"number": hex(n), "hash": "0x" + f"{n:064x}", "timestamp": hex(2 * n),
+        ts = "a[$(touch " + MARKER + ")]" if BATCH_FAULT == "hostilets" else hex(2 * n)
+        res = {"number": hex(n), "hash": "0x" + f"{n:064x}", "timestamp": ts,
                "baseFeePerGas": "0x3b9aca00", "proposerPubkey": "0x" + ("aa" if n % 2 else "bb") * 32}
     elif m == "eth_call":
-        res = "0x" + "0" * 63 + "1"
+        data = ((p[0] or {}).get("data") or (p[0] or {}).get("input") or "") if p else ""
+        res = registry_call(data)
     elif m == "eth_gasPrice":
         res = "0x3b9aca00"
     else:
