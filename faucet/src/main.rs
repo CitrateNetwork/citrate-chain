@@ -621,15 +621,41 @@ fn window_label(secs: u64) -> String {
     }
 }
 
+/// G4: the same window in words, for the page's description ("24&nbsp;hours", "2&nbsp;days",
+/// "1&nbsp;hour"). Uses the same unit as [`window_label`], so the two statements always agree.
+fn window_phrase(secs: u64) -> String {
+    let (n, unit) = if secs.is_multiple_of(86_400) && secs >= 2 * 86_400 {
+        (secs / 86_400, "day")
+    } else if secs.is_multiple_of(3600) {
+        (secs / 3600, "hour")
+    } else if secs.is_multiple_of(60) {
+        (secs / 60, "minute")
+    } else {
+        (secs, "second")
+    };
+    format!("{n}&nbsp;{unit}{}", if n == 1 { "" } else { "s" })
+}
+
+/// The two places [`PAGE_HTML`] states the per-address window, as written for the 24h default.
+const PAGE_WINDOW_SENTENCE: &str = "once every 24&nbsp;hours.";
+const PAGE_WINDOW_FOOTER: &str = "&middot; 24h cooldown &middot;";
+
 fn render_page(turnstile_site_key: Option<&str>, address_cooldown_secs: u64) -> String {
-    let page = PAGE_HTML.replacen(
-        "&middot; 24h cooldown &middot;",
-        &format!(
-            "&middot; {} cooldown &middot;",
-            window_label(address_cooldown_secs)
-        ),
-        1,
-    );
+    // Both statements of the window come from the configured policy, never just one of them.
+    let page = PAGE_HTML
+        .replacen(
+            PAGE_WINDOW_SENTENCE,
+            &format!("once every {}.", window_phrase(address_cooldown_secs)),
+            1,
+        )
+        .replacen(
+            PAGE_WINDOW_FOOTER,
+            &format!(
+                "&middot; {} cooldown &middot;",
+                window_label(address_cooldown_secs)
+            ),
+            1,
+        );
     match turnstile_site_key {
         Some(key) => page.replacen(
             "<button id=\"btn\">",
@@ -1776,6 +1802,46 @@ mod tests {
         let page = render_page(None, 2 * 86_400);
         assert!(page.contains("&middot; 2d cooldown &middot;"));
         assert!(!page.contains("24h cooldown"));
+    }
+
+    #[test]
+    fn g4_window_phrase_matches_the_label_unit() {
+        assert_eq!(window_phrase(86_400), "24&nbsp;hours");
+        assert_eq!(window_phrase(2 * 86_400), "2&nbsp;days");
+        assert_eq!(window_phrase(3600), "1&nbsp;hour");
+        assert_eq!(window_phrase(5400), "90&nbsp;minutes");
+        assert_eq!(window_phrase(60), "1&nbsp;minute");
+        assert_eq!(window_phrase(61), "61&nbsp;seconds");
+    }
+
+    #[test]
+    fn g4_page_description_and_footer_both_follow_the_policy() {
+        // The template states the 24h default in both places; a rendering must replace both.
+        assert_eq!(PAGE_HTML.matches(PAGE_WINDOW_SENTENCE).count(), 1);
+        assert_eq!(PAGE_HTML.matches(PAGE_WINDOW_FOOTER).count(), 1);
+        for (secs, phrase, label) in [
+            (2 * 86_400, "2&nbsp;days", "2d"),
+            (3600, "1&nbsp;hour", "1h"),
+            (5400, "90&nbsp;minutes", "90m"),
+        ] {
+            let page = render_page(None, secs);
+            assert!(
+                page.contains(&format!("once every {phrase}.")),
+                "description for {secs}s"
+            );
+            assert!(
+                page.contains(&format!("&middot; {label} cooldown &middot;")),
+                "footer for {secs}s"
+            );
+            assert!(
+                !page.contains("24&nbsp;hours"),
+                "stale description for {secs}s"
+            );
+            assert!(!page.contains("24h"), "stale footer for {secs}s");
+            assert!(!page.contains("24 hours"), "stale description for {secs}s");
+        }
+        // The default renders the page exactly as written.
+        assert_eq!(render_page(None, 86_400), PAGE_HTML);
     }
 
     #[tokio::test]
