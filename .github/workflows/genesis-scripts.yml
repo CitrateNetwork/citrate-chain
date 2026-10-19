@@ -1,0 +1,25 @@
+name: genesis-scripts
+
+# scripts/genesis/: the ceremony tooling (keep_check, fleet_agree, reset_node, ceremony).
+# The tests use fake cast/forge/systemctl in a temp dir: no network, no chain, no keys.
+
+on:
+  push:
+    branches: [main]
+    paths: ['scripts/genesis/**', 'scripts/ops/regenesis.sh', '.github/workflows/genesis-scripts.yml']
+  pull_request:
+    paths: ['scripts/genesis/**', 'scripts/ops/regenesis.sh', '.github/workflows/genesis-scripts.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: shellcheck
+        run: shellcheck -x -S warning scripts/genesis/*.sh scripts/genesis/tests/*.sh
+      - name: tests (offline)
+        run: bash scripts/genesis/tests/test_genesis_scripts.sh
