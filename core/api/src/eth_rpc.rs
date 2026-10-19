@@ -2983,6 +2983,15 @@ pub fn register_eth_methods_with_finality(
         Ok(Value::String(format!("0x{}", hex::encode(hash))))
     });
 
+    // citrate_executedHead - The persisted applied tip `{number, hash}`: the tip
+    // eth_getLogs serves up to. eth_blockNumber can be ahead of it (stored
+    // headers). Errors (-32603) when no applied tip is persisted; never a guess.
+    let storage_exec_head = storage.clone();
+    io_handler.add_sync_method(
+        crate::canonical_logs::EXECUTED_HEAD_METHOD,
+        move |_params: Params| crate::canonical_logs::executed_head_json(&storage_exec_head),
+    );
+
     // citrate_getDagStats - Get DAG statistics including tips, height, and GhostDAG parameters
     let storage_dag = storage.clone();
     io_handler.add_sync_method("citrate_getDagStats", move |_params: Params| {

@@ -2094,6 +2094,60 @@ mod tests {
         );
     }
 
+    /// `citrate_executedHead` (citrate-api) reads the tip this applicator
+    /// persists: it follows apply and reorg, matches the block eth_getLogs'
+    /// resolver ends at, and stays below the stored-header height while a
+    /// persisted fork sits above the tip.
+    #[tokio::test]
+    async fn executed_head_rpc_follows_apply_and_reorg() {
+        use citrate_api::canonical_logs::{executed_head, executed_head_json, ExecutedChainIndex};
+        let (exec, storage, _dir) = fresh();
+        let app = CanonicalApplicator::new(exec, storage.clone());
+        let hex_of = |h: &Hash| format!("0x{}", hex::encode(h.as_bytes()));
+
+        let (_a1, a2, _b2, b3) = setup_fork(&app, &storage).await;
+        let a2h = a2.header.block_hash;
+        assert_eq!(executed_head(&storage), Ok((a2h, 2)));
+        assert_eq!(
+            executed_head_json(&storage).expect("head"),
+            serde_json::json!({"number": "0x2", "hash": hex_of(&a2h)})
+        );
+        assert_eq!(
+            storage.blocks.get_latest_height().expect("latest"),
+            3,
+            "b3 is stored above the applied tip (eth_blockNumber reports 3)"
+        );
+        // This fixture stores no genesis block (a1's parent is the zero hash),
+        // so the executed chain is resolved from height 1.
+        let idx = ExecutedChainIndex::new();
+        assert_eq!(
+            idx.executed_hashes(&storage, 1, u64::MAX)
+                .expect("executed")
+                .last(),
+            Some(&(2, a2h))
+        );
+
+        let lock = app.advance_lock();
+        let mut state = lock.lock().await;
+        assert!(matches!(
+            app.reorg_to(&mut state, b3.header.block_hash).await,
+            ReorgOutcome::Reorged { .. }
+        ));
+        drop(state);
+        let b3h = b3.header.block_hash;
+        assert_eq!(executed_head(&storage), Ok((b3h, 3)));
+        assert_eq!(
+            executed_head_json(&storage).expect("head"),
+            serde_json::json!({"number": "0x3", "hash": hex_of(&b3h)})
+        );
+        assert_eq!(
+            idx.executed_hashes(&storage, 1, u64::MAX)
+                .expect("executed")
+                .last(),
+            Some(&(3, b3h))
+        );
+    }
+
     #[tokio::test]
     async fn reorg_aborts_on_bad_block_and_restores_pre_reorg_state() {
         let (exec, storage, _dir) = fresh();

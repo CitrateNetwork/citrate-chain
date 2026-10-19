@@ -87,6 +87,30 @@ The server includes production-grade infrastructure: per-client sliding-window r
 | `citrate_runInference` | Execute model inference |
 | `citrate_gasPrice` | Dynamic gas price |
 | `citrate_getEconomicState` | Economic metrics snapshot |
+| `citrate_executedHead` | The persisted applied tip `{number, hash}`: the tip `eth_getLogs` serves up to (see below) |
+
+#### `citrate_executedHead`
+
+Params: none. Result: `{"number": "0x…", "hash": "0x…"}`, the persisted applied
+tip, which is the newest block whose transactions this node executed. It is the
+same tip `eth_getLogs` walks from (`canonical_logs::executed_head`), and
+`eth_getLogs` serves no log above it.
+
+`eth_blockNumber` reports the stored-header height. It can be ahead of the
+executed head while blocks are admitted but not yet applied, so it does not bound
+what `eth_getLogs` has served.
+
+When no applied tip is persisted, or it cannot be read, the method returns
+JSON-RPC error `-32603`. It never falls back to the height index.
+
+A log scanner that persists progress:
+
+1. Call `citrate_executedHead`. Call the result `H`.
+2. Call `eth_getLogs` with `toBlock` ≤ `H.number`.
+3. Persist progress no higher than `H.number`. Keep a confirmation margin below
+   it: the executed head can move down or change hash on a reorg (the tests in
+   `tests/executed_head.rs` cover both), and the two calls are not atomic.
+4. On an error from step 1, don't advance.
 
 ### WebSocket
 

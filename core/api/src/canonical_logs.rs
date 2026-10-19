@@ -485,6 +485,42 @@ pub fn load_executed_block(storage: &StorageManager, hash: &Hash) -> Result<Bloc
         })
 }
 
+/// JSON-RPC method that reports [`executed_head`].
+pub const EXECUTED_HEAD_METHOD: &str = "citrate_executedHead";
+
+/// The persisted applied tip `(hash, height)`: the newest block whose
+/// transactions this node has executed, and the tip [`ExecutedChainIndex`]
+/// walks from when it serves `eth_getLogs`. `eth_blockNumber` reports the
+/// stored-header height instead, which can be ahead of this.
+///
+/// An error when no applied tip is persisted or it cannot be read. This never
+/// falls back to the height index: a store without a persisted tip has not
+/// proven that any block executed, so a client must not record log-scan
+/// progress against it.
+pub fn executed_head(storage: &StorageManager) -> Result<(Hash, u64), String> {
+    storage
+        .blocks
+        .get_applied_tip()
+        .map_err(|e| format!("applied tip: {e}"))?
+        .ok_or_else(|| "no applied tip is persisted (no block has executed yet)".to_string())
+}
+
+/// The `citrate_executedHead` response: `{"number": "0x…", "hash": "0x…"}`, or
+/// an internal error (-32603) when [`executed_head`] fails.
+pub fn executed_head_json(
+    storage: &StorageManager,
+) -> Result<serde_json::Value, jsonrpc_core::Error> {
+    let (hash, number) = executed_head(storage).map_err(|m| jsonrpc_core::Error {
+        code: jsonrpc_core::ErrorCode::InternalError,
+        message: format!("{EXECUTED_HEAD_METHOD}: {m}"),
+        data: None,
+    })?;
+    Ok(serde_json::json!({
+        "number": format!("0x{number:x}"),
+        "hash": format!("0x{}", hex::encode(hash.as_bytes())),
+    }))
+}
+
 /// The block the executor's state reflects: the persisted applied tip, or — on a
 /// store that never wrote one — the block the height index names at the stored
 /// head.
