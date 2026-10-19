@@ -432,12 +432,39 @@ pub struct ReceiptIndexBatch {
     pub receipts: Vec<TransactionReceipt>,
     /// Transaction bodies to index (by hash, and by sender + nonce).
     pub transactions: Vec<Transaction>,
+    /// Rebuild bookkeeping committed with the same batch (see
+    /// [`ReceiptReconcileMarker`]). `None` leaves the stored marker unchanged.
+    pub reconcile_marker: Option<ReceiptReconcileMarker>,
+}
+
+/// C1-R: durable note that receipts of an older applied chain may still sit
+/// ABOVE the durable applied tip.
+///
+/// A from-genesis rebuild resets the durable tip to genesis but keeps the receipts
+/// of blocks shared by the old applied chain and the rebuild target (they are
+/// rewritten, identically, as the replay reaches them). If the process stops
+/// before the replay gets there and the next run converges on a different branch,
+/// nothing else would ever name those blocks again. The rebuild therefore records
+/// the old applied tip in the reset batch (`Set`) and drops the note once the
+/// receipt index matches the applied chain again (`Clear`); a restart that finds
+/// the note removes every receipt of the old chain that is not on the durable
+/// applied chain, walking only from the old tip down to the common ancestor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiptReconcileMarker {
+    /// Record `(hash, height)`: the applied tip whose chain may keep receipts
+    /// above the durable tip.
+    Set(Hash, u64),
+    /// Remove the record.
+    Clear,
 }
 
 impl ReceiptIndexBatch {
     /// No index writes.
     pub fn is_empty(&self) -> bool {
-        self.removals.is_empty() && self.receipts.is_empty() && self.transactions.is_empty()
+        self.removals.is_empty()
+            && self.receipts.is_empty()
+            && self.transactions.is_empty()
+            && self.reconcile_marker.is_none()
     }
 
     /// The index entries for one executed block: its transactions and their
@@ -457,14 +484,25 @@ impl ReceiptIndexBatch {
             removals: Vec::new(),
             receipts,
             transactions: block.transactions.clone(),
+            reconcile_marker: None,
         }
     }
 
     /// Append another batch's entries (removals stay ahead of puts at commit time).
+    /// A marker change in `other` replaces this batch's.
     pub fn extend(&mut self, other: ReceiptIndexBatch) {
         self.removals.extend(other.removals);
         self.receipts.extend(other.receipts);
         self.transactions.extend(other.transactions);
+        if other.reconcile_marker.is_some() {
+            self.reconcile_marker = other.reconcile_marker;
+        }
+    }
+
+    /// This batch with its marker change set to `marker`.
+    pub fn with_marker(mut self, marker: ReceiptReconcileMarker) -> Self {
+        self.reconcile_marker = Some(marker);
+        self
     }
 }
 
@@ -1092,6 +1130,20 @@ impl Executor {
     ) -> anyhow::Result<usize> {
         self.persist_state_changes_with_tip_and_index(applied_tip, &ReceiptIndexBatch::default())
             .await
+    }
+
+    /// C1-R: commit receipt-index changes on their own (no state, no tip) as one
+    /// fsync'd batch. Used for rebuild bookkeeping that has no state change to ride
+    /// with. A store-less executor keeps no receipt index, so this is a no-op there.
+    pub async fn persist_receipt_index(&self, index: &ReceiptIndexBatch) -> anyhow::Result<()> {
+        if index.is_empty() {
+            return Ok(());
+        }
+        let _guard = self.commit_coordinator.acquire_exec_lock().await;
+        match &self.state_store {
+            Some(store) => store.put_receipt_index(index),
+            None => Ok(()),
+        }
     }
 
     /// C1-R: [`Self::persist_state_changes_with_tip`] plus the block's RPC receipt

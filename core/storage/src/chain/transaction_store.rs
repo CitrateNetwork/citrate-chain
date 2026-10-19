@@ -3,7 +3,7 @@
 use crate::db::{column_families::*, RocksDB};
 use anyhow::Result;
 use citrate_consensus::types::{Hash, Transaction};
-use citrate_execution::executor::ReceiptIndexBatch;
+use citrate_execution::executor::{ReceiptIndexBatch, ReceiptReconcileMarker};
 use citrate_execution::types::TransactionReceipt;
 use std::sync::Arc;
 use tracing::debug;
@@ -243,7 +243,49 @@ pub(crate) fn stage_receipt_index(
             &[],
         )?;
     }
+    match index.reconcile_marker {
+        Some(ReceiptReconcileMarker::Set(hash, height)) => {
+            db.batch_put_cf(
+                batch,
+                CF_METADATA,
+                RECEIPT_RECONCILE_KEY,
+                &encode_reconcile_marker(&hash, height),
+            )?;
+        }
+        Some(ReceiptReconcileMarker::Clear) => {
+            db.batch_delete_cf(batch, CF_METADATA, RECEIPT_RECONCILE_KEY)?;
+        }
+        None => {}
+    }
     Ok(())
+}
+
+/// C1-R: `CF_METADATA` key of the [`ReceiptReconcileMarker`] (value: block hash
+/// `[32]` ‖ height big-endian `[8]`, the applied-tip layout).
+const RECEIPT_RECONCILE_KEY: &[u8] = b"receipt_reconcile_from";
+
+fn encode_reconcile_marker(hash: &Hash, height: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(40);
+    buf.extend_from_slice(hash.as_bytes());
+    buf.extend_from_slice(&height.to_be_bytes());
+    buf
+}
+
+impl TransactionStore {
+    /// C1-R: the old applied tip recorded by an unfinished from-genesis rebuild
+    /// (see [`ReceiptReconcileMarker`]), if any. A malformed value reads as absent.
+    pub fn get_receipt_reconcile_marker(&self) -> Result<Option<(Hash, u64)>> {
+        let Some(bytes) = self.db.get_cf(CF_METADATA, RECEIPT_RECONCILE_KEY)? else {
+            return Ok(None);
+        };
+        let Some((hash, height)) = bytes.split_at_checked(32) else {
+            return Ok(None);
+        };
+        match (<[u8; 32]>::try_from(hash), <[u8; 8]>::try_from(height)) {
+            (Ok(hash), Ok(height)) => Ok(Some((Hash::new(hash), u64::from_be_bytes(height)))),
+            _ => Ok(None),
+        }
+    }
 }
 
 // Key generation helpers
