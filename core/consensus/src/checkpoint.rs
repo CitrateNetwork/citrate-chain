@@ -277,12 +277,11 @@ impl Checkpoint {
     ///    [`canonical_vote_message`]`(chain_id, height, block_hash)`.
     ///
     /// What this does NOT establish: that the committee itself is the one the
-    /// validator registry yields for this height. A stored certificate is either
-    /// produced by this node's own manager, whose committee came from its own
-    /// epoch snapshot, or installed by Stage 1b certificate sync
-    /// ([`CheckpointManager::install_synced_certificate`]), which only accepts a
-    /// [`VerifiedCertificate`] whose committee this node derived itself — the
-    /// committee a peer sends is never used.
+    /// validator registry yields for this height — the certificate's own
+    /// `committee` field is trusted. Anything that reads a certificate from
+    /// storage or from a peer must use [`Self::verify_certificate_against`] with
+    /// a committee it derived itself (the node's floor verifier does, at boot,
+    /// on every poll and at finalization).
     pub fn verify_certificate(&self, chain_id: u64) -> Result<(), CheckpointError> {
         let height = self.height;
         let invalid = |reason: String| CheckpointError::InvalidCertificate { height, reason };
@@ -325,6 +324,40 @@ impl Checkpoint {
     }
 }
 
+impl Checkpoint {
+    /// [`Self::verify_certificate`] against `committee`, a committee the CALLER
+    /// derived for this height (epoch validator snapshot + the certified block's
+    /// VRF beacon; `FinalityGadget::committee_for`) — never the one recorded in
+    /// the certificate. The recorded committee must be exactly that committee
+    /// (same members, no duplicates); then quorum, membership and every
+    /// signature are checked over it. A certificate whose recorded committee is
+    /// any other set — e.g. outsider keys that signed validly — is refused.
+    pub fn verify_certificate_against(
+        &self,
+        chain_id: u64,
+        committee: &[PublicKey],
+    ) -> Result<(), CheckpointError> {
+        let height = self.height;
+        let invalid = |reason: String| CheckpointError::InvalidCertificate { height, reason };
+        let derived: HashSet<&PublicKey> = committee.iter().collect();
+        let recorded: HashSet<&PublicKey> = self.committee.iter().collect();
+        if derived.len() != committee.len() {
+            return Err(invalid(
+                "the derived committee lists a member twice".to_string(),
+            ));
+        }
+        if recorded.len() != self.committee.len() || recorded != derived {
+            return Err(invalid(format!(
+                "the recorded committee ({} members) is not the committee this node \
+                 derives for height {height} ({} members)",
+                self.committee.len(),
+                committee.len()
+            )));
+        }
+        self.verify_certificate(chain_id)
+    }
+}
+
 /// A finalized checkpoint certificate received from a peer (Stage 1b, spec
 /// §11.10) that has passed [`CheckpointManager::verify_synced_certificate`]
 /// against a committee THIS node derived. Only that function constructs one,
@@ -346,7 +379,9 @@ impl VerifiedCertificate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncedInstall {
     /// Stored as the latest finalized checkpoint (memory + persistent store).
-    Installed { height: u64 },
+    /// `guarded`: the manager's [`FinalizationGuard`] ran on it before it
+    /// became visible (`false`: no guard is installed).
+    Installed { height: u64, guarded: bool },
     /// At or below the latest finalized height this node already holds; nothing
     /// was changed.
     Stale { height: u64, latest: u64 },
@@ -821,16 +856,52 @@ impl CheckpointManager {
     /// finalized mark, `DAG_METADATA` `checkpoint:{height}`, in-memory window,
     /// latest finalized height) and drop pending / replay state at or below it.
     /// A certificate at or below the latest finalized height changes nothing.
+    ///
+    /// Same finalization path as [`Self::finalize_checkpoint`]: serialized
+    /// with every other finalization (`finalize_serial`), and with a
+    /// [`FinalizationGuard`] installed the guard runs on the certificate BEFORE
+    /// any of the above becomes visible, with no other manager lock held (the
+    /// node's guard raises the reorg floor, or engages the finality safety
+    /// stop, in that step). As for a local finalization the guard cannot veto:
+    /// the certificate has a verified quorum of this node's own committee.
     /// The certificate record is written with the synced write
-    /// ([`KvStore::kv_put_durable`]) before anything else changes; if that
-    /// write fails nothing is installed and `StorageError` is returned.
+    /// ([`KvStore::kv_put_durable`]) BEFORE the guard runs and before anything
+    /// else changes, as for a local finalization (#362): if that write fails
+    /// the guard does not run, nothing is installed and `StorageError` is
+    /// returned (the sync poll asks again later).
+    /// Once the certificate record has been written and the install is
+    /// visible, the guard's [`FinalizationGuard::after_finalize`] runs (the
+    /// node publishes the finalized RPC pair there, only if the certificate
+    /// is persisted).
     pub async fn install_synced_certificate(
         &self,
         cert: VerifiedCertificate,
     ) -> Result<SyncedInstall, CheckpointError> {
         let checkpoint = cert.checkpoint;
         let height = checkpoint.height;
-        // Held across the whole install so two installs cannot interleave.
+        // Outermost lock: no other finalization (local or synced) can move the
+        // latest finalized height until this install is done.
+        let _serial = self.finalize_serial.lock().await;
+        {
+            let latest = *self.latest_finalized_height.read().await;
+            if height <= latest {
+                return Ok(SyncedInstall::Stale { height, latest });
+            }
+        }
+        // Durable BEFORE the guard and before anything is visible, exactly as a
+        // local finalization (#362): the guard raises the floor, so the
+        // certificate it acts on must already survive a crash or power loss. A
+        // failed write runs no guard, installs nothing and surfaces as
+        // `StorageError` (the sync poll asks again later).
+        self.persist_certificate(&checkpoint)?;
+        let guarded = match self.finalization_guard.get() {
+            Some(guard) => {
+                // No manager lock is held here (only `finalize_serial`).
+                guard.before_finalize(&checkpoint).await;
+                true
+            }
+            None => false,
+        };
         let mut latest = self.latest_finalized_height.write().await;
         if height <= *latest {
             return Ok(SyncedInstall::Stale {
@@ -838,16 +909,13 @@ impl CheckpointManager {
                 latest: *latest,
             });
         }
-        // Durable BEFORE anything is visible, exactly as a local finalization
-        // (#362): a failed write installs nothing and surfaces as
-        // `StorageError` (the sync poll asks again later).
-        self.persist_certificate(&checkpoint)?;
         if let Err(e) = self.dag_store.finalize_block(&checkpoint.block_hash).await {
             debug!(
                 "synced checkpoint {}: block {} not marked finalized in the DAG store: {}",
                 height, checkpoint.block_hash, e
             );
         }
+        let cp = checkpoint.clone();
         {
             let mut finalized = self.finalized.write().await;
             finalized.insert(height, checkpoint);
@@ -855,12 +923,17 @@ impl CheckpointManager {
         }
         *latest = height;
         drop(latest);
+        // Publication after persistence, as for a local finalization: still
+        // under `finalize_serial`, with no other manager lock held.
+        if let Some(guard) = self.finalization_guard.get() {
+            guard.after_finalize(&cp).await;
+        }
         self.prune_at_or_below(height).await;
         info!(
             "Installed synced checkpoint certificate at height {}",
             height
         );
-        Ok(SyncedInstall::Installed { height })
+        Ok(SyncedInstall::Installed { height, guarded })
     }
 
     /// Whether `height` holds a finalized checkpoint (memory or persistent store).
@@ -2634,7 +2707,10 @@ mod tests {
         );
         assert_eq!(
             mgr.install_synced_certificate(cert).await.expect("install"),
-            SyncedInstall::Installed { height: 5 }
+            SyncedInstall::Installed {
+                height: 5,
+                guarded: false
+            }
         );
         assert_eq!(mgr.latest_finalized_height().await, 5);
         let stored = mgr.latest_finalized_certificate().await.expect("stored");
@@ -2848,5 +2924,160 @@ mod tests {
         assert_eq!(mgr.latest_finalized_height().await, 5);
         assert!(stored_certificate(&kv, 5).is_some());
         assert!(mgr.dag_store.is_finalized(&h5).await);
+    }
+
+    /// Review of #332 @ 354908b: a synced certificate goes through the same
+    /// finalization path as a local one — the guard runs BEFORE it is visible
+    /// (latest finalized height unchanged, nothing stored), exactly once.
+    #[tokio::test]
+    async fn synced_install_runs_the_finalization_guard_before_it_is_visible() {
+        let (mgr, probe, b5) = guarded(None).await;
+        let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+        let cert = mgr
+            .verify_synced_certificate(5, b5, &sigs(&[0, 1, 2], 5, &b5), committee)
+            .expect("verifies");
+        assert_eq!(
+            mgr.install_synced_certificate(cert).await.expect("install"),
+            SyncedInstall::Installed {
+                height: 5,
+                guarded: true
+            }
+        );
+        assert_eq!(
+            *probe.seen.lock().expect("probe lock"),
+            vec![(5, b5, 0, false)],
+            "guard saw the certificate before it was visible"
+        );
+        assert_eq!(mgr.latest_finalized_height().await, 5);
+        assert!(mgr.get_checkpoint(5).await.is_some());
+    }
+
+    /// #362 for synced installs: with a persistent store the guard runs only
+    /// once the certificate is on disk through the synced write; if that write
+    /// fails the guard never runs and nothing is installed.
+    #[tokio::test]
+    async fn synced_install_is_durable_before_the_guard_and_a_failed_write_runs_no_guard() {
+        for allow in [0usize, usize::MAX] {
+            let kv = FaultKv::new(allow);
+            let (mgr, blocks) = sync_mgr_over(kv.clone()).await;
+            let mgr = Arc::new(mgr);
+            let probe = Arc::new(ProbeGuard::default());
+            *probe.mgr.lock().expect("probe lock") = Some(Arc::downgrade(&mgr));
+            assert!(mgr.install_finalization_guard(probe.clone()));
+            let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+            let h5 = blocks[5].hash();
+            let cert = mgr
+                .verify_synced_certificate(5, h5, &sigs(&[0, 1, 2], 5, &h5), committee)
+                .expect("verifies");
+            let out = mgr.install_synced_certificate(cert).await;
+            if allow == 0 {
+                assert!(
+                    matches!(out, Err(CheckpointError::StorageError(_))),
+                    "{out:?}"
+                );
+                assert!(
+                    probe.seen.lock().expect("probe lock").is_empty(),
+                    "no guard (no floor) without a durable certificate"
+                );
+                assert!(probe.after.lock().expect("probe lock").is_empty());
+                assert_eq!(mgr.latest_finalized_height().await, 0);
+                assert!(stored_certificate(&kv, 5).is_none());
+            } else {
+                assert_eq!(
+                    out.expect("install"),
+                    SyncedInstall::Installed {
+                        height: 5,
+                        guarded: true
+                    }
+                );
+                assert_eq!(
+                    *probe.seen.lock().expect("probe lock"),
+                    vec![(5, h5, 0, true)],
+                    "the guard runs before the install is visible, on a durable record"
+                );
+                assert_eq!(FaultKv::load(&kv.durable_cert_writes), 1);
+                assert_eq!(FaultKv::load(&kv.plain_cert_writes), 0);
+            }
+        }
+    }
+
+    /// A stale synced certificate never reaches the guard, and a local
+    /// finalization and a synced install of the same height are serialized: the
+    /// second one finds the height already finalized.
+    #[tokio::test]
+    async fn stale_synced_install_does_not_run_the_guard() {
+        let (mgr, probe, b5) = guarded(None).await;
+        for i in 0..3u8 {
+            mgr.submit_vote(make_signed_vote(i, 5, &b5))
+                .await
+                .expect("vote");
+        }
+        mgr.finalize_checkpoint(5).await.expect("finalize");
+        assert_eq!(probe.seen.lock().expect("probe lock").len(), 1);
+        let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+        let cert = mgr
+            .verify_synced_certificate(5, b5, &sigs(&[0, 1, 2], 5, &b5), committee)
+            .expect("verifies");
+        assert_eq!(
+            mgr.install_synced_certificate(cert).await.expect("stale"),
+            SyncedInstall::Stale {
+                height: 5,
+                latest: 5
+            }
+        );
+        assert_eq!(
+            probe.seen.lock().expect("probe lock").len(),
+            1,
+            "guard not run for a stale certificate"
+        );
+    }
+
+    /// `verify_certificate_against`: the recorded committee must be exactly the
+    /// caller-derived one (order does not matter); a certificate signed validly
+    /// by a different committee is refused even though it is self-consistent.
+    #[tokio::test]
+    async fn verify_certificate_against_binds_the_recorded_committee() {
+        let (mgr, blocks) = sync_mgr().await;
+        let derived: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+        let h5 = blocks[5].hash();
+        let cert = mgr
+            .verify_synced_certificate(5, h5, &sigs(&[0, 1, 2], 5, &h5), derived.clone())
+            .expect("verifies")
+            .checkpoint()
+            .clone();
+        cert.verify_certificate_against(40204, &derived)
+            .expect("same committee");
+        let mut reversed = derived.clone();
+        reversed.reverse();
+        cert.verify_certificate_against(40204, &reversed)
+            .expect("order does not matter");
+        assert!(cert.verify_certificate_against(1337, &derived).is_err());
+
+        // Self-consistent certificate of an outsider committee.
+        let outsiders: Vec<PublicKey> = (10..14).map(make_pubkey).collect();
+        let foreign = mgr
+            .verify_synced_certificate(5, h5, &sigs(&[10, 11, 12], 5, &h5), outsiders)
+            .expect("self-consistent")
+            .checkpoint()
+            .clone();
+        foreign.verify_certificate(40204).expect("internally valid");
+        let err = foreign
+            .verify_certificate_against(40204, &derived)
+            .expect_err("not this node's committee");
+        assert!(err.to_string().contains("recorded committee"), "got {err}");
+
+        // A recorded superset / subset of the derived committee is refused.
+        let mut superset = cert.clone();
+        superset.committee.push(make_pubkey(9));
+        assert!(superset
+            .verify_certificate_against(40204, &derived)
+            .is_err());
+        let mut subset = cert.clone();
+        subset.committee.truncate(3);
+        assert!(subset.verify_certificate_against(40204, &derived).is_err());
+        // A derived committee listing a member twice is refused.
+        let mut dup = derived.clone();
+        dup.push(make_pubkey(0));
+        assert!(cert.verify_certificate_against(40204, &dup).is_err());
     }
 }
