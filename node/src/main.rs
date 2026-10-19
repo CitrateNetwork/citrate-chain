@@ -2092,10 +2092,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // `finalized`/`safe` RPC tags follow it only under the separate compiled
     // enforcement pin (`finality_floor::FloorMode::Enforced`).
     let finality_observed = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    // The handle the RPC `finalized`/`safe` tags read, chosen by the floor
-    // verifier for its mode; stays `None` without a canonical applicator (tags
-    // then resolve to genesis).
-    let mut finality_rpc_handle: Option<Arc<std::sync::atomic::AtomicU64>> = None;
+    // The source the RPC `finalized`/`safe` tags read, chosen by the floor
+    // verifier for its mode (Enforced: verified (height, hash) pairs resolved
+    // by hash); stays `None` without a canonical applicator (tags then resolve
+    // to genesis).
+    let mut finality_rpc_handle: Option<citrate_api::FinalizedTagSource> = None;
 
     // EXECUTE-ON-RECEIVE (step 2): the fast-path applier. Active under v2 headers
     // (CITRATE_BLOCK_V2) — the flag that makes a block's state_root reproducible by a
@@ -4030,8 +4031,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // the 5 s finality poll keeps current. None (no applicator) => tags resolve
             // to genesis (block 0), never error.
             // WP-S.3 Stage 1c: only in Enforced mode (voting + enforcement pins
-            // ON) do the tags read the VERIFIED finalized height
-            // (`FloorVerifier::rpc_finalized_handle`); Legacy and Observed keep
+            // ON) do the tags read the VERIFIED finalized (height, hash) pairs,
+            // resolved by the certified block's hash, never a sibling through the
+            // height index (`FloorVerifier::rpc_finalized_handle`); Legacy and Observed keep
             // the unchanged applicator handle, which neither raises.
             finality_rpc_handle.clone(),
         );
@@ -4467,13 +4469,44 @@ fn load_or_generate_proposer_key(
         let seed_bytes = Zeroizing::new(key.to_bytes().to_vec());
         write_secret_file_0600(proposer_key_path, &seed_bytes)?;
         info!(
-            "Minted a new persistent proposer identity at {:?} (pubkey {}). This key is NOT \
-             recoverable from public data — back it up alongside noise.key and preserve it \
-             across data-dir wipes, or the node must re-register before it can propose again.",
-            proposer_key_path,
-            hex::encode(key.verifying_key().to_bytes())
+            "{}",
+            proposer_key_minted_message(
+                proposer_key_path,
+                &hex::encode(key.verifying_key().to_bytes())
+            )
         );
         Ok(key)
+    }
+}
+
+/// Log line for a newly minted `proposer.key`. Carries the voting-validator
+/// wipe warning: the same key with a wiped data directory loses the durable
+/// checkpoint signed-vote record.
+fn proposer_key_minted_message(proposer_key_path: &std::path::Path, pubkey_hex: &str) -> String {
+    format!(
+        "Minted a new persistent proposer identity at {:?} (pubkey {}). This key is NOT \
+         recoverable from public data — back it up alongside noise.key and preserve it \
+         across data-dir wipes, or the node must re-register before it can propose again. \
+         {}",
+        proposer_key_path,
+        pubkey_hex,
+        citrate_storage::VOTING_VALIDATOR_WIPE_NOTE
+    )
+}
+
+#[cfg(test)]
+mod proposer_key_message_tests {
+    use super::proposer_key_minted_message;
+
+    #[test]
+    fn minted_proposer_key_message_carries_the_voting_validator_wipe_note() {
+        let msg = proposer_key_minted_message(std::path::Path::new("/data/proposer.key"), "ab12");
+        assert!(msg.contains("ab12"));
+        assert!(msg.contains("/data/proposer.key"));
+        assert!(
+            msg.contains(citrate_storage::VOTING_VALIDATOR_WIPE_NOTE),
+            "mint log must warn voting validators about wiping the data dir"
+        );
     }
 }
 

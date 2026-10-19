@@ -638,10 +638,11 @@ impl RpcServer {
         // NEVER registered on a public bind, so the override cannot be reached over the
         // public RPC. Setting it resumes production one round; the gate auto-clears it.
         catchup_override: Option<Arc<std::sync::atomic::AtomicBool>>,
-        // BFT-finalized height source (the canonical applicator's `finalized_height`
-        // handle). Backs the `finalized`/`safe` RPC block tags. When None, the tags
+        // Source of the `finalized`/`safe` RPC block tags: a height handle (the
+        // canonical applicator's `finalized_height`), or verified (height, hash)
+        // pairs resolved by hash (finality enforcement ON). When None, the tags
         // resolve to genesis (block 0) — the documented pre-checkpoint behaviour.
-        finalized_height: Option<Arc<std::sync::atomic::AtomicU64>>,
+        finalized: Option<crate::finalized_tag::FinalizedTagSource>,
     ) -> Self {
         let mut io_handler = IoHandler::new();
 
@@ -670,7 +671,7 @@ impl RpcServer {
             chain_id,
             filter_registry,
             pause_flag,
-            finalized_height.unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicU64::new(0))),
+            finalized.unwrap_or_default(),
         );
 
         // Truthful eth_syncing OVERRIDE (last registration wins): report progress

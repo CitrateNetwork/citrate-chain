@@ -168,7 +168,9 @@ height it already signed (double-signing). A voting validator must therefore do 
 (`checkpoint_signed:<chain_id>:<H>` and `checkpoint_signed_meta:<chain_id>`) over into the
 new data directory; or (b) rotate its consensus key and re-register it in
 `ValidatorRegistry` after the wipe, so the old record no longer applies to the key it signs
-with. Non-voting nodes are unaffected.
+with. Non-voting nodes are unaffected. The same warning
+(`citrate_storage::VOTING_VALIDATOR_WIPE_NOTE`) is part of the log line printed when a node
+mints a new `proposer.key`.
 
 **Own-vote retry (Stage 1a, PR #321 review).** A failed durable write leaves the checkpoint
 pending without this node's vote. A repeat report of the same `(H, hash)` therefore retries
@@ -187,9 +189,13 @@ the same 256-block horizon). Nothing is due while the stop is engaged; on the fi
 after it clears, they are reported again on a fresh canonical walk from the current tip, so
 the node proposes and votes them on the chain it is now on. Every revisit goes through the
 normal signing path (signing gate, durable record): a height this key already signed for a
-different hash is refused and not revisited again. Residual: an own vote signed just before
-the stop engaged and withheld from broadcast is in the local pending checkpoint, so the
-revisit does not re-broadcast it (latency only; a restart re-broadcasts it).
+different hash is refused and not revisited again. An own vote signed just before the stop
+engaged (under the signing gate) and withheld from broadcast is already in the local pending
+checkpoint, so the gadget would not emit it again; the driver therefore keeps that recorded
+vote with the halted boundary (`OwnVoteRetries::hold`, same bounds) and, on the revisit after
+the stop clears, re-broadcasts the SAME vote if its block is still canonical at that height
+(PR #323 review L1a). No new signature is created for it, and the broadcast is still withheld
+while the stop is engaged.
 
 **Early-vote admission before the governing snapshot (Stage 1a, PR #321 review).** When the
 snapshot that governs `H` is not on this node yet, an early vote is checked provisionally
@@ -243,7 +249,7 @@ voting ON + `CHECKPOINT_ENFORCEMENT_PINS` OFF → **Observed** (certificates are
 verified height is exported only as `citrate_finality_verified_height`; the floor is not
 raised and the `finalized`/`safe` RPC tags do not advance — they stay at genesis, see §4.6);
 both ON → **Enforced** (the verified certificate raises the floor and the RPC tags follow the
-verified height). On a mismatch or an invalid certificate the floor is not
+verified `(height, hash)` pair, §4.6). On a mismatch or an invalid certificate the floor is not
 raised, the RPC tags do not advance, the gadget is halted (`SkipReason::Halted`: it proposes
 and signs nothing), an `error!` "CHECKPOINT FINALITY SAFETY STOP" with operator guidance is
 logged, and the metrics `citrate_finality_halted`, `citrate_finality_certificate_mismatch_total`,
@@ -273,6 +279,22 @@ verified height is visible there only through the `citrate_finality_verified_hei
 (with `citrate_finality_floor_height` and `citrate_finality_halted`). A read-only status RPC
 (mode, verified height, floor, halted) is not added in this stage: the RPC crate has no
 handle to the floor verifier, and the metrics carry the same data.
+
+**Resolve by hash, not height (Stage 1c, PR #323 review R1).** The block store's height index
+is not a canonical index: every stored block writes its height key, so the last block written
+at a height wins — possibly an uncertified sibling of the certified block. In Enforced mode
+the tags therefore read the verifier's verified `(height, hash)` pairs
+(`citrate_api::finalized_tag::FinalizedTagSource::Verified`, recorded only on a verified,
+matching certificate) and every block-lookup site (`eth_getBlockByNumber`,
+`eth_getBlockTransactionCountByNumber`, `eth_getTransactionByBlockNumberAndIndex`, and the
+newest block of `eth_feeHistory`) fetches the certified block BY HASH. If that block is not
+stored locally, the previous verified pair is served, else genesis — never a sibling. Range
+reads (`eth_getLogs`, `eth_newFilter`) take the resolved pair's height as their bound. The
+state-read guard (`eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`,
+`eth_getStorageAt`, `eth_call`, `eth_estimateGas`) additionally requires, for a verified pair,
+that the applied tip (`BlockStore::get_applied_tip`) IS the certified hash before serving
+latest state under `finalized`/`safe`. Legacy and Observed keep the height-only source, which
+stays at genesis.
 
 ### 4.7 Config & remnants
 - Plumb `CheckpointNodeConfig` (`config.rs:65`) → `CheckpointConfig` (today `main.rs:1767`

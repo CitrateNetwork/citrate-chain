@@ -35,7 +35,12 @@
 //                height still proceeds, and labelling such a block "finalized"
 //                would claim a guarantee the node does not give.
 //   * Enforced — both ON. A verified certificate also raises the reorg floor,
-//                and the finalized/safe RPC tags follow the verified height.
+//                and the finalized/safe RPC tags follow the verified
+//                (height, hash) PAIR: the RPC resolves them by the certified
+//                block's hash, never through the height index (where the last
+//                block written at a height — possibly an uncertified sibling —
+//                wins). If that block is not stored locally the previous
+//                verified pair is served, else genesis.
 //
 // SAFETY STOP. A certificate that does not match this node's chain (a different
 // block at that height, or a chain that steps over it), or does not verify, is
@@ -66,6 +71,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use citrate_api::finalized_tag::{FinalizedTagSource, VerifiedFinalized};
 use citrate_consensus::checkpoint::CheckpointManager;
 use citrate_consensus::checkpoint_gadget::{
     checkpoint_enforcement_pinned, checkpoint_voting_pinned, SafetyStop,
@@ -185,6 +191,9 @@ pub struct FloorVerifier {
     /// `citrate_finality_verified_height` metric; backs the RPC tags in
     /// Enforced mode only.
     verified_height: Arc<AtomicU64>,
+    /// Verified `(height, hash)` pairs (Observed / Enforced): what the RPC
+    /// `finalized`/`safe` tags resolve BY HASH in Enforced mode only.
+    verified_pairs: Arc<VerifiedFinalized>,
     state: Mutex<VerifierState>,
 }
 
@@ -207,19 +216,42 @@ impl FloorVerifier {
             applicator,
             gadget_halt,
             verified_height,
+            verified_pairs: Arc::new(VerifiedFinalized::new()),
             state: Mutex::new(VerifierState::default()),
         }
     }
 
-    /// The handle the RPC `finalized`/`safe` tags must read in this mode:
+    /// The source the RPC `finalized`/`safe` tags must read in this mode:
     /// Legacy and Observed keep today's source (the applicator's floor handle,
     /// which neither mode raises, so the tags stay at genesis); only Enforced,
-    /// where the floor is actually enforced, reads the verified height.
-    pub fn rpc_finalized_handle(&self) -> Arc<AtomicU64> {
+    /// where the floor is actually enforced, reads the verified
+    /// `(height, hash)` pairs — resolved by hash, so an uncertified sibling at
+    /// the finalized height is never served.
+    pub fn rpc_finalized_handle(&self) -> FinalizedTagSource {
         match self.mode {
-            FloorMode::Legacy | FloorMode::Observed => self.applicator.finalized_height_handle(),
-            FloorMode::Enforced => self.verified_height.clone(),
+            FloorMode::Legacy | FloorMode::Observed => {
+                FinalizedTagSource::Height(self.applicator.finalized_height_handle())
+            }
+            FloorMode::Enforced => FinalizedTagSource::Verified(self.verified_pairs.clone()),
         }
+    }
+
+    /// The finalized height the RPC tags currently name in this mode (for the
+    /// alarm text).
+    fn rpc_finalized_height(&self) -> u64 {
+        match self.mode {
+            FloorMode::Legacy | FloorMode::Observed => self
+                .applicator
+                .finalized_height_handle()
+                .load(Ordering::SeqCst),
+            FloorMode::Enforced => self.verified_pairs.latest().map_or(0, |(h, _)| h),
+        }
+    }
+
+    /// Publish a verified, matching `(height, hash)`.
+    fn record_verified(&self, height: u64, hash: Hash) {
+        self.verified_height.fetch_max(height, Ordering::SeqCst);
+        self.verified_pairs.record(height, hash);
     }
 
     /// The current safety stop, if any.
@@ -291,7 +323,7 @@ impl FloorVerifier {
                     );
                     st.halt = None;
                     recovered = true;
-                    self.verified_height.fetch_max(height, Ordering::SeqCst);
+                    self.record_verified(height, certified);
                     self.gadget_halt.clear().await;
                 }
                 FloorCheck::Mismatch { canonical } => {
@@ -330,8 +362,7 @@ impl FloorVerifier {
             .await
         {
             FloorCheck::Match => {
-                self.verified_height
-                    .fetch_max(cert.height, Ordering::SeqCst);
+                self.record_verified(cert.height, cert.block_hash);
                 self.publish(false);
                 FloorTick::Verified {
                     height: cert.height,
@@ -405,7 +436,7 @@ impl FloorVerifier {
 
     fn alarm(&self, reason: &HaltReason) {
         // What the finalized/safe RPC tags currently answer in this mode.
-        let frozen = self.rpc_finalized_handle().load(Ordering::SeqCst);
+        let frozen = self.rpc_finalized_height();
         match reason {
             HaltReason::Mismatch {
                 height,
@@ -467,6 +498,7 @@ mod tests {
     use crate::canonical_apply::tests::{fresh, setup_fork};
     use crate::canonical_apply::ReorgOutcome;
     use crate::persistent_dag::RocksDbKvStore;
+    use citrate_api::finalized_tag::FinalizedAnchor;
     use citrate_consensus::checkpoint::{
         sign_checkpoint_vote, Checkpoint, CheckpointConfig, CheckpointStatus,
     };
@@ -559,6 +591,11 @@ mod tests {
         a.load(Ordering::SeqCst)
     }
 
+    /// The RPC tag source reads the applicator's (unraised) floor handle.
+    fn reads_floor_handle(src: &FinalizedTagSource, app: &CanonicalApplicator) -> bool {
+        matches!(src, FinalizedTagSource::Height(h) if Arc::ptr_eq(h, &app.finalized_height_handle()))
+    }
+
     #[test]
     fn both_pins_off_is_legacy_and_modes_follow_the_switches() {
         assert_eq!(FloorMode::for_chain(40204), FloorMode::Legacy);
@@ -593,11 +630,8 @@ mod tests {
         assert_eq!(r.verifier.tick().await, FloorTick::Legacy);
         assert_eq!(load(&r.floor), 0, "floor never raised in Legacy");
         let rpc = r.verifier.rpc_finalized_handle();
-        assert!(
-            Arc::ptr_eq(&rpc, &app.finalized_height_handle()),
-            "RPC reads today's handle"
-        );
-        assert_eq!(load(&rpc), 0);
+        assert!(reads_floor_handle(&rpc, &app), "RPC reads today's handle");
+        assert_eq!(rpc.resolve(&storage), FinalizedAnchor::GENESIS);
         assert!(!r.gadget.halted());
         assert!(Arc::new(r.verifier).spawn().is_none(), "no Legacy loop");
     }
@@ -606,7 +640,7 @@ mod tests {
     async fn enforced_raises_the_floor_from_a_verified_matching_certificate() {
         let (exec, storage, _dir) = fresh();
         let app = Arc::new(CanonicalApplicator::new(exec, storage.clone()));
-        let (_a1, a2, _b2, _b3) = setup_fork(&app, &storage).await;
+        let (_a1, a2, b2, _b3) = setup_fork(&app, &storage).await;
         let mgr = manager_over(&storage);
         let r = rig(FloorMode::Enforced, mgr, app);
         assert_eq!(r.verifier.boot_check().await, FloorTick::NoCertificate);
@@ -627,8 +661,22 @@ mod tests {
             }
         );
         assert_eq!(load(&r.floor), 2, "floor raised to the certified height");
-        assert_eq!(load(&r.verified), 2, "RPC tags advanced");
-        assert!(Arc::ptr_eq(&r.verifier.rpc_finalized_handle(), &r.verified));
+        assert_eq!(load(&r.verified), 2, "verified height reported");
+        assert_eq!(
+            r.verifier.rpc_finalized_handle().resolve(&storage),
+            FinalizedAnchor {
+                height: 2,
+                hash: Some(a2.header.block_hash)
+            },
+            "RPC tags advanced to the verified (height, hash) pair"
+        );
+        // R1: the height index names the uncertified sibling b2 (written last at
+        // height 2); the tags resolve by the certified hash, not through it.
+        assert_eq!(
+            storage.blocks.get_block_by_height(2).expect("height index"),
+            Some(b2.header.block_hash),
+            "precondition: last-written sibling wins the height index"
+        );
         assert!(!r.gadget.halted());
         assert_eq!(r.verifier.halt_reason().await, None);
     }
@@ -656,10 +704,14 @@ mod tests {
         assert_eq!(load(&r.verified), 2, "observed: verified height reported");
         let rpc = r.verifier.rpc_finalized_handle();
         assert!(
-            Arc::ptr_eq(&rpc, &app.finalized_height_handle()),
+            reads_floor_handle(&rpc, &app),
             "observed: RPC tags read the (unraised) floor, not the verified height"
         );
-        assert_eq!(load(&rpc), 0, "observed: finalized/safe stay at genesis");
+        assert_eq!(
+            rpc.resolve(&storage),
+            FinalizedAnchor::GENESIS,
+            "observed: finalized/safe stay at genesis"
+        );
 
         {
             let lock = app.advance_lock();
@@ -680,7 +732,11 @@ mod tests {
         assert!(r.gadget.halted());
         assert_eq!(load(&r.floor), 0);
         assert_eq!(load(&r.verified), 2, "verified height frozen");
-        assert_eq!(load(&rpc), 0, "RPC tags never advanced");
+        assert_eq!(
+            rpc.resolve(&storage),
+            FinalizedAnchor::GENESIS,
+            "RPC tags never advanced"
+        );
     }
 
     /// Boot with a persisted certificate for ANOTHER branch: finality halts
@@ -710,7 +766,16 @@ mod tests {
             .await;
         assert_eq!(out.skipped, Some(SkipReason::Halted));
         assert_eq!(load(&r.floor), 0, "mismatch: floor not raised");
-        assert_eq!(load(&r.verified), 0, "mismatch: RPC tags not advanced");
+        assert_eq!(
+            load(&r.verified),
+            0,
+            "mismatch: verified height not advanced"
+        );
+        assert_eq!(
+            r.verifier.rpc_finalized_handle().resolve(&storage),
+            FinalizedAnchor::GENESIS,
+            "mismatch: RPC tags not advanced"
+        );
         // Still halted on the next pass (nothing changed).
         assert_eq!(r.verifier.tick().await, FloorTick::Halted(halted));
 
@@ -736,6 +801,14 @@ mod tests {
         assert_eq!(r.verifier.halt_reason().await, None);
         assert_eq!(load(&r.floor), 2);
         assert_eq!(load(&r.verified), 2);
+        assert_eq!(
+            r.verifier.rpc_finalized_handle().resolve(&storage),
+            FinalizedAnchor {
+                height: 2,
+                hash: Some(b2.header.block_hash)
+            },
+            "recovered: RPC tags name the certified block"
+        );
     }
 
     /// A persisted certificate that does not verify (below quorum) halts finality

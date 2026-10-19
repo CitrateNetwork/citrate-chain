@@ -42,6 +42,16 @@
 // signed-vote record), so a height already signed for a different hash before
 // the halt is still refused.
 //
+// Held own vote: an own vote the gadget signed just BEFORE the stop engaged
+// (still under its signing gate) is withheld from broadcast while the stop is
+// engaged. The gadget has already submitted it locally, so a later report of
+// the same boundary finds it pending and emits nothing — the vote would never
+// reach peers until restart. The driver therefore keeps that already-signed
+// vote with the halted boundary and, on the revisit after the stop clears,
+// re-broadcasts the SAME recorded vote (only if its block is still canonical at
+// that height). No new signature is created for it; the broadcast is still
+// withheld while the stop is engaged.
+//
 // Spawned ONLY when the compiled switch (`checkpoint_voting_pinned`) is on for the
 // running chain; with it off this module never runs.
 
@@ -68,7 +78,7 @@ use citrate_consensus::checkpoint_gadget::{
     FinalityGadget, SignRefusal, SkipReason, EARLY_VOTE_HORIZON_BLOCKS,
 };
 use citrate_consensus::crypto::Ed25519SigningKey;
-use citrate_consensus::types::Hash;
+use citrate_consensus::types::{Hash, PublicKey};
 use citrate_network::peer::PeerManager;
 use citrate_network::NetworkMessage;
 use citrate_storage::StorageManager;
@@ -119,6 +129,10 @@ pub enum Followup {
 pub struct OwnVoteRetries {
     attempts: BTreeMap<u64, u32>,
     halted: BTreeSet<u64>,
+    /// Own votes already signed (before the stop engaged) but withheld from
+    /// broadcast, keyed by height. Always a subset of `halted`: re-broadcast
+    /// as-is on the revisit after the stop clears, never re-signed.
+    held: BTreeMap<u64, CheckpointVote>,
 }
 
 impl OwnVoteRetries {
@@ -128,18 +142,15 @@ impl OwnVoteRetries {
             Followup::Done => {
                 self.attempts.remove(&height);
                 self.halted.remove(&height);
+                self.held.remove(&height);
             }
             Followup::Halted => {
                 self.attempts.remove(&height);
-                self.halted.insert(height);
-                while self.halted.len() > MAX_HALT_REVISITS {
-                    if self.halted.pop_first().is_none() {
-                        break;
-                    }
-                }
+                self.mark_halted(height);
             }
             Followup::Retry => {
                 self.halted.remove(&height);
+                self.held.remove(&height);
                 let made = self
                     .attempts
                     .get(&height)
@@ -164,10 +175,48 @@ impl OwnVoteRetries {
         }
     }
 
+    /// Track `height` for a revisit after the stop clears (bounded: past
+    /// [`MAX_HALT_REVISITS`] the LOWEST is dropped with its held vote).
+    fn mark_halted(&mut self, height: u64) {
+        self.halted.insert(height);
+        while self.halted.len() > MAX_HALT_REVISITS {
+            match self.halted.pop_first() {
+                Some(dropped) => {
+                    self.held.remove(&dropped);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Keep this node's own vote, already signed but withheld because the
+    /// safety stop is engaged, for re-broadcast on the revisit after the stop
+    /// clears. The first vote held at a height is kept (the durable signed-vote
+    /// record admits only one hash per height, so a second one is the same).
+    pub fn hold(&mut self, vote: CheckpointVote) {
+        let height = vote.height;
+        self.attempts.remove(&height);
+        self.mark_halted(height);
+        if self.halted.contains(&height) {
+            self.held.entry(height).or_insert(vote);
+        }
+    }
+
+    /// Whether an own vote is held at `height`.
+    pub fn has_held(&self, height: u64) -> bool {
+        self.held.contains_key(&height)
+    }
+
+    /// Take the own vote held at `height`, if any.
+    pub fn take_held(&mut self, height: u64) -> Option<CheckpointVote> {
+        self.held.remove(&height)
+    }
+
     /// Forget `height` (e.g. it is no longer on the canonical chain).
     pub fn forget(&mut self, height: u64) {
         self.attempts.remove(&height);
         self.halted.remove(&height);
+        self.held.remove(&height);
     }
 
     /// Drop boundaries more than [`OWN_VOTE_RETRY_HORIZON_BLOCKS`] below
@@ -178,6 +227,7 @@ impl OwnVoteRetries {
         let floor = highest.saturating_sub(OWN_VOTE_RETRY_HORIZON_BLOCKS);
         self.attempts.retain(|h, _| *h >= floor);
         self.halted.retain(|h| *h >= floor);
+        self.held.retain(|h, _| *h >= floor);
         if halted {
             return Vec::new();
         }
@@ -191,6 +241,62 @@ impl OwnVoteRetries {
     fn len(&self) -> usize {
         self.attempts.len().saturating_add(self.halted.len())
     }
+
+    /// Number of own votes held for re-broadcast.
+    #[cfg(test)]
+    fn held_len(&self) -> usize {
+        self.held.len()
+    }
+}
+
+/// This node's voting key as it appears in [`CheckpointVote::voter`].
+fn signer_pk(signer: Option<&Ed25519SigningKey>) -> Option<PublicKey> {
+    signer.map(|k| PublicKey::new(k.verifying_key().to_bytes()))
+}
+
+/// Hold this node's own votes out of `votes` (withheld because the safety stop
+/// is engaged) for re-broadcast after it clears. Other votes (replayed early
+/// votes, relays) are dropped as before: their signers broadcast them.
+fn hold_own_votes(
+    retries: &mut OwnVoteRetries,
+    signer: Option<&Ed25519SigningKey>,
+    votes: Vec<CheckpointVote>,
+) {
+    let Some(me) = signer_pk(signer) else {
+        return;
+    };
+    for vote in votes {
+        if vote.voter == me {
+            debug!(
+                "checkpoint {}: holding already-signed own vote for {} until the safety stop clears",
+                vote.height, vote.block_hash
+            );
+            retries.hold(vote);
+        }
+    }
+}
+
+/// Broadcast gate applied after a pass: if the safety stop is engaged now,
+/// nothing is returned for broadcast and this node's own votes are held for
+/// re-broadcast after it clears (see module docs); otherwise `outbound` is
+/// returned unchanged.
+pub fn gate_outbound(
+    gadget: &FinalityGadget,
+    signer: Option<&Ed25519SigningKey>,
+    retries: &mut OwnVoteRetries,
+    outbound: Vec<CheckpointVote>,
+) -> Vec<CheckpointVote> {
+    if !gadget.halted() {
+        return outbound;
+    }
+    if !outbound.is_empty() {
+        debug!(
+            "checkpoint finality: safety stop engaged; withholding {} outbound vote(s)",
+            outbound.len()
+        );
+    }
+    hold_own_votes(retries, signer, outbound);
+    Vec::new()
 }
 
 /// A canonical checkpoint block buried at least `vote_depth` deep.
@@ -346,14 +452,11 @@ pub fn spawn(
                 &lookup,
             )
             .await;
-            // Same rule as `report`: nothing is emitted once the stop is engaged.
-            if gadget.halted() {
-                if !outbound.is_empty() {
-                    debug!(
-                        "checkpoint finality: safety stop engaged; withholding {} outbound vote(s)",
-                        outbound.len()
-                    );
-                }
+            // Same rule as `report`: nothing is emitted once the stop is
+            // engaged; this node's own already-signed votes are held and
+            // re-broadcast after it clears.
+            let outbound = gate_outbound(&gadget, signer.as_ref(), &mut retries, outbound);
+            if outbound.is_empty() {
                 continue;
             }
             broadcast_votes(&peers, &outbound).await;
@@ -391,7 +494,7 @@ where
         match canonical_at_heights(tip_hash, tip_height, &heights, lookup) {
             Ok(found) => {
                 for cp in found {
-                    let next = report(gadget, signer, &cp, &mut outbound).await;
+                    let next = report(gadget, signer, &cp, &mut outbound, retries).await;
                     retries.record(cp.height, next);
                 }
             }
@@ -425,12 +528,15 @@ where
 }
 
 /// Hand one buried checkpoint to the gadget and collect what it produced for
-/// broadcast. Returns what the boundary needs next.
+/// broadcast. Returns what the boundary needs next. An own vote signed before
+/// the safety stop engaged is held in `retries` (not broadcast) for the
+/// revisit after the stop clears.
 async fn report(
     gadget: &FinalityGadget,
     signer: Option<&Ed25519SigningKey>,
     cp: &BuriedCheckpoint,
     outbound: &mut Vec<CheckpointVote>,
+    retries: &mut OwnVoteRetries,
 ) -> Followup {
     let out = gadget
         .on_buried_checkpoint(cp.height, cp.hash, &cp.seed, signer)
@@ -443,15 +549,17 @@ async fn report(
     if let Some(refusal) = &out.sign_refused {
         debug!("checkpoint {}: own vote refused ({:?})", cp.height, refusal);
     }
-    // Safety stop engaged since the gadget returned: emit nothing. (Any own
+    // Safety stop engaged since the gadget returned: emit nothing. Any own
     // vote in `outbound` was signed before the stop, under the gadget's
-    // signing gate; withholding it only costs latency.)
+    // signing gate; it is held and re-broadcast (not re-signed) on the revisit
+    // after the stop clears, so withholding it only costs latency.
     if gadget.halted() {
         debug!(
             "checkpoint {}: safety stop engaged; withholding {} outbound vote(s)",
             cp.height,
             out.outbound.len()
         );
+        hold_own_votes(retries, signer, out.outbound);
         return Followup::Halted;
     }
     if out.skipped == Some(SkipReason::Halted) || out.sign_refused == Some(SignRefusal::Halted) {
@@ -493,8 +601,12 @@ async fn revisit<F>(
                 due, e
             );
             // Counts as an attempt, so a persistent walk failure is bounded too.
+            // A boundary holding an already-signed own vote stays as it is
+            // (bounded by the horizon) so the vote is not lost to a walk error.
             for h in due {
-                retries.record(h, Followup::Retry);
+                if !retries.has_held(h) {
+                    retries.record(h, Followup::Retry);
+                }
             }
             return;
         }
@@ -506,8 +618,28 @@ async fn revisit<F>(
         }
     }
     for cp in found {
-        let next = report(gadget, signer, &cp, outbound).await;
+        let held = retries.take_held(cp.height);
+        let next = report(gadget, signer, &cp, outbound, retries).await;
         retries.record(cp.height, next);
+        let Some(vote) = held else {
+            continue;
+        };
+        if next == Followup::Halted {
+            // Still (or again) halted: keep the vote for the next revisit.
+            retries.hold(vote);
+        } else if vote.block_hash != cp.hash {
+            // The block it signs is no longer canonical at this height.
+            debug!(
+                "checkpoint {}: dropping held own vote for {} (canonical block is now {})",
+                cp.height, vote.block_hash, cp.hash
+            );
+        } else if !outbound
+            .iter()
+            .any(|v| v.height == vote.height && v.voter == vote.voter)
+        {
+            // Re-broadcast the recorded vote as-is; nothing is signed here.
+            outbound.push(vote);
+        }
     }
 }
 
@@ -679,6 +811,63 @@ mod tests {
         assert_eq!(r.len(), 0, "all below the horizon");
     }
 
+    /// Held own votes ride on the halted boundary: due only once the stop
+    /// clears, dropped with it (Done / Retry / forget / count cap / horizon).
+    #[test]
+    fn held_own_votes_follow_their_halted_boundary() {
+        use citrate_consensus::types::{PublicKey, Signature};
+        let vote = |height: u64| CheckpointVote {
+            height,
+            block_hash: h(9),
+            voter: PublicKey::new([3; 32]),
+            signature: Signature::new([4; 64]),
+        };
+        let mut r = OwnVoteRetries::default();
+        r.record(10, Followup::Retry);
+        r.hold(vote(10));
+        assert!(r.has_held(10));
+        assert!(r.due(10, true).is_empty(), "nothing due while halted");
+        assert_eq!(r.due(10, false), vec![10], "moved from retry to halted");
+        assert_eq!(r.len(), 1);
+        // The first held vote at a height is kept.
+        let mut other = vote(10);
+        other.signature = Signature::new([5; 64]);
+        r.hold(other);
+        assert_eq!(
+            r.take_held(10).map(|v| v.signature.as_bytes().to_vec()),
+            Some(vec![4u8; 64]),
+            "first held vote kept"
+        );
+        assert!(r.take_held(10).is_none());
+        // Done / Retry / forget drop it.
+        r.hold(vote(12));
+        r.record(12, Followup::Done);
+        assert!(!r.has_held(12));
+        r.hold(vote(14));
+        r.record(14, Followup::Retry);
+        assert!(!r.has_held(14));
+        r.hold(vote(16));
+        r.forget(16);
+        assert!(!r.has_held(16));
+        r.forget(10);
+        r.forget(14);
+        assert_eq!(r.len(), 0);
+        // Count cap: the lowest boundary is dropped together with its vote.
+        let n = (MAX_HALT_REVISITS as u64).saturating_add(1);
+        for i in 1..=n {
+            r.hold(vote(i.saturating_mul(2)));
+        }
+        assert_eq!(r.held_len(), MAX_HALT_REVISITS);
+        assert!(!r.has_held(2), "lowest dropped");
+        // Horizon.
+        let far = n
+            .saturating_mul(2)
+            .saturating_add(OWN_VOTE_RETRY_HORIZON_BLOCKS)
+            .saturating_add(2);
+        assert!(r.due(far, false).is_empty());
+        assert_eq!(r.held_len(), 0);
+    }
+
     mod revisit_after_halt {
         use super::super::*;
         use citrate_consensus::checkpoint::{CheckpointConfig, CheckpointManager};
@@ -837,6 +1026,106 @@ mod tests {
             )
             .await;
             assert!(out.is_empty(), "no repeat");
+        }
+
+        /// L1a: an own vote signed just before the safety stop engaged is
+        /// withheld from broadcast, held, and re-broadcast — the SAME recorded
+        /// vote, no new signature — on the first pass after the stop clears.
+        /// Without the hold the revisit finds the vote already pending and emits
+        /// nothing, so peers never receive it until restart.
+        #[tokio::test]
+        async fn own_vote_signed_before_a_halt_is_rebroadcast_after_it_clears() {
+            let (_exec, storage, _dir) = crate::canonical_apply::tests::fresh();
+            let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+            let (headers, hashes) = chain(&dag, 16, 0).await;
+            let lookup = |x: &Hash| Ok(headers.get(x).copied());
+            let tip = |h: u64| hashes.get(h as usize).copied().expect("tip hash");
+            let ks: Vec<Ed25519SigningKey> = (0..4u8).map(key).collect();
+            let me = ks.first().expect("key 0");
+            let g = gadget_over(dag, &storage, &ks).await;
+            let (mut cursor, mut retries) = (0u64, OwnVoteRetries::default());
+
+            // Boundary 2 is signed in this pass ...
+            let out = run_pass(&g, Some(me), &mut cursor, &mut retries, tip(6), 6, &lookup).await;
+            assert_eq!(heights(&out), vec![2]);
+            let signed = out.first().cloned().expect("own vote");
+            assert_eq!(signed.voter, pk(me));
+            assert_eq!(g.signed_vote_at(2), Some(signed.block_hash));
+            // ... and the stop engages before it is broadcast.
+            g.safety_stop().engage().await;
+            let sent = gate_outbound(&g, Some(me), &mut retries, out);
+            assert!(sent.is_empty(), "withheld while halted");
+            assert!(retries.has_held(2));
+
+            // Still halted: nothing is emitted, the vote stays held.
+            let out = run_pass(&g, Some(me), &mut cursor, &mut retries, tip(6), 6, &lookup).await;
+            let out = gate_outbound(&g, Some(me), &mut retries, out);
+            assert!(out.is_empty());
+            assert!(retries.has_held(2));
+            // The gadget alone would never re-emit it: it is already pending.
+            assert!(g.manager().has_pending_vote(2, &pk(me)).await);
+
+            // Stop clears: the next pass re-broadcasts the identical vote.
+            g.safety_stop().clear().await;
+            let out = run_pass(&g, Some(me), &mut cursor, &mut retries, tip(6), 6, &lookup).await;
+            let out = gate_outbound(&g, Some(me), &mut retries, out);
+            let key_of = |v: &CheckpointVote| {
+                (
+                    v.height,
+                    v.block_hash,
+                    v.voter,
+                    v.signature.as_bytes().to_vec(),
+                )
+            };
+            assert_eq!(
+                out.iter().map(key_of).collect::<Vec<_>>(),
+                vec![key_of(&signed)],
+                "the recorded vote, re-sent as-is"
+            );
+            assert_eq!(
+                g.signed_vote_at(2),
+                Some(signed.block_hash),
+                "record unchanged"
+            );
+            assert!(!retries.has_held(2));
+            assert_eq!(retries.len(), 0);
+            let out = run_pass(&g, Some(me), &mut cursor, &mut retries, tip(6), 6, &lookup).await;
+            assert!(out.is_empty(), "sent once");
+        }
+
+        /// A held own vote whose block is no longer canonical at that height
+        /// when the stop clears is dropped, and the gadget still refuses to sign
+        /// the new canonical block there (durable record).
+        #[tokio::test]
+        async fn held_own_vote_is_dropped_if_its_block_left_the_canonical_chain() {
+            let (_exec, storage, _dir) = crate::canonical_apply::tests::fresh();
+            let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+            let (ha, a) = chain(&dag, 8, 0xA0).await;
+            let (hb, b) = chain(&dag, 8, 0xB0).await;
+            let ks: Vec<Ed25519SigningKey> = (0..4u8).map(key).collect();
+            let me = ks.first().expect("key 0");
+            let g = gadget_over(dag, &storage, &ks).await;
+            let (mut cursor, mut retries) = (0u64, OwnVoteRetries::default());
+            let lookup_a = |x: &Hash| Ok(ha.get(x).copied());
+            let tip_a = a.get(6).copied().expect("a6");
+            let out = run_pass(&g, Some(me), &mut cursor, &mut retries, tip_a, 6, &lookup_a).await;
+            assert_eq!(heights(&out), vec![2]);
+            g.safety_stop().engage().await;
+            assert!(gate_outbound(&g, Some(me), &mut retries, out).is_empty());
+            assert!(retries.has_held(2));
+
+            // The node is now on branch B; the stop clears.
+            g.safety_stop().clear().await;
+            let lookup_b = |x: &Hash| Ok(hb.get(x).copied());
+            let tip_b = b.get(6).copied().expect("b6");
+            let out = run_pass(&g, Some(me), &mut cursor, &mut retries, tip_b, 6, &lookup_b).await;
+            assert!(
+                out.iter().all(|v| v.height != 2),
+                "neither the stale held vote nor a new signature at 2: {out:?}"
+            );
+            assert_eq!(g.signed_vote_at(2), a.get(2).copied(), "record unchanged");
+            assert!(!retries.has_held(2));
+            assert_eq!(retries.len(), 0);
         }
 
         /// The revisit is still bound by the durable signed-vote record: a
