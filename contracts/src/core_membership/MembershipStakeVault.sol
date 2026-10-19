@@ -87,14 +87,12 @@ contract MembershipStakeVault is Initializable, UUPSUpgradeable, ReentrancyGuard
 
     /// Single-step, matching the previous `Ownable` behaviour. The zero-address
     /// guard is the one hardening added: this contract's owner is the only
-    /// address that can place grants or authorize an upgrade, so orphaning it
-    /// would freeze the money path permanently.
+    /// address that can place grants, so orphaning it would stop new grants.
     ///
-    /// AUDIT NOTE (M-3): single-step transfer of a T1 money contract's owner is
-    /// a live footgun — a typo'd address is unrecoverable. Two-step
-    /// (`Ownable2Step`) is the safer shape; retained single-step here only for
-    /// behavioural parity with the deployed contract. Flagged for the rule-8
-    /// security review.
+    /// AUDIT NOTE (M-3): single-step transfer is retained for behavioural
+    /// parity with the deployed contract. Since the C4 genesis split, the owner
+    /// no longer holds upgrade authority, and a mistyped transfer is
+    /// recoverable: `governance` can reinstate an owner with `setOwner`.
     function transferOwnership(address newOwner) external onlyOwner {
         if (newOwner == address(0)) revert OwnerIsZero();
         address previous = owner;
@@ -148,12 +146,21 @@ contract MembershipStakeVault is Initializable, UUPSUpgradeable, ReentrancyGuard
     /// detaches, renew re-attaches).
     mapping(address => uint256) public attributedPrincipal;
 
+    /// Upgrade authority (C4 genesis): the GOVERNANCE timelock. Separate from
+    /// `owner`, the grant orchestrator, so the hot grant-signing key can place
+    /// grants but cannot replace the code that custodies them. Zero until
+    /// `initializeGovernance`; while zero, nobody can upgrade.
+    address public governance;
+    /// Two-step governance transfer: the nominee must accept.
+    address public pendingGovernance;
+
     /// Validator stake requirement on chain 40204 (planset 02 §4).
     uint256 public constant VALIDATOR_STAKE_REQUIREMENT = 32_000 ether;
 
     /// @dev Storage gap so future upgrades can add state without colliding
     /// with anything a child contract or a later version introduces.
-    uint256[44] private __gap;
+    /// 44 -> 42: `governance` and `pendingGovernance` took two slots.
+    uint256[42] private __gap;
 
     // ============================================================
     // Errors / Events
@@ -210,10 +217,62 @@ contract MembershipStakeVault is Initializable, UUPSUpgradeable, ReentrancyGuard
         bondImplementation = bondImplementation_;
     }
 
-    /// Upgrade authority is the vault owner — the Rule-8 dual-control treasury
-    /// signer today, expected to migrate to the timelocked multisig controller
-    /// before mainnet. Upgradeability is owner decision A.3.
-    function _authorizeUpgrade(address) internal override onlyOwner {}
+    // ============================================================
+    // Governance (C4 genesis) — upgrade authority, split from the grant role
+    // ============================================================
+
+    error NotGovernance();
+    error GovernanceIsZero();
+    error NotPendingGovernance();
+
+    event GovernanceTransferStarted(address indexed previousGovernance, address indexed newGovernance);
+    event GovernanceTransferred(address indexed previousGovernance, address indexed newGovernance);
+
+    modifier onlyGovernance() {
+        if (msg.sender != governance) revert NotGovernance();
+        _;
+    }
+
+    /// Install upgrade authority, once. The genesis ceremony
+    /// (`DeployGenesisMembership`) calls it right after `initialize`, before
+    /// handing the owner role to the grant signer. `reinitializer(2)` makes it
+    /// one-shot: after it runs, only governance can move governance.
+    function initializeGovernance(address governance_) external reinitializer(2) onlyOwner {
+        if (governance_ == address(0)) revert GovernanceIsZero();
+        governance = governance_;
+        emit GovernanceTransferred(address(0), governance_);
+    }
+
+    /// Nominate a new governance; it takes effect when the nominee accepts.
+    function transferGovernance(address newGovernance) external onlyGovernance {
+        if (newGovernance == address(0)) revert GovernanceIsZero();
+        pendingGovernance = newGovernance;
+        emit GovernanceTransferStarted(governance, newGovernance);
+    }
+
+    function acceptGovernance() external {
+        if (msg.sender != pendingGovernance) revert NotPendingGovernance();
+        address previous = governance;
+        governance = msg.sender;
+        pendingGovernance = address(0);
+        emit GovernanceTransferred(previous, msg.sender);
+    }
+
+    /// Replace the grant orchestrator without its cooperation: the recovery
+    /// path for a lost or compromised grant-signing key. Bonds already placed
+    /// are unaffected; the vault cannot reach them either way.
+    function setOwner(address newOwner) external onlyGovernance {
+        if (newOwner == address(0)) revert OwnerIsZero();
+        address previous = owner;
+        owner = newOwner;
+        emit OwnershipTransferred(previous, newOwner);
+    }
+
+    /// Upgrade authority is GOVERNANCE (the timelock), not the grant
+    /// orchestrator. Upgradeability itself is owner decision A.3; moving the
+    /// authority off the hot treasury signer before mainnet was the stated
+    /// plan, and the betanet genesis is the mainnet genesis (C2).
+    function _authorizeUpgrade(address) internal override onlyGovernance {}
 
     // ============================================================
     // Grant lifecycle (owner = grant orchestrator, Rule 8)

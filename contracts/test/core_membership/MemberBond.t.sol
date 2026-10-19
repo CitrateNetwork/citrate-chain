@@ -447,4 +447,112 @@ contract MemberBondTest is Test {
         assertEq(member.balance - before, GRANT_AMOUNT, "principal reaches the member");
         assertEq(address(bond).balance, 0, "and nothing is stranded in the bond");
     }
+
+    // ── Genesis (C4) — exit for a bond that never activated ───────────────
+    //
+    // A member who never runs a node never calls `activate`. Before this path
+    // existed their principal had no exit at all: `requestRelease` and
+    // `withdrawToMember` both require an activated bond, and nothing else pays
+    // out. It is the same entitlement as the activated path (principal to the
+    // member once the lock has run and KYC holds), reached without a registry
+    // round trip, and it is also the only exit if governance later raises the
+    // registry's `minStake` above the grant.
+
+    function test_withdrawUnactivated_paysPrincipalAfterLockAndKyc() public {
+        _grant(member, memberTokenId);
+        MemberBond bond = MemberBond(payable(vault.bondOf(member)));
+        sbt.setKycVerified(memberTokenId, true);
+        vm.roll(block.number + bond.LOCK_BLOCKS());
+
+        vm.prank(member);
+        bond.withdrawUnactivated();
+
+        assertEq(member.balance, GRANT_AMOUNT, "the member receives the principal");
+        assertEq(address(bond).balance, 0, "the bond is empty");
+        assertTrue(bond.releaseRequested(), "the exit is recorded for the vault");
+    }
+
+    function test_withdrawUnactivated_kycIsCheckedBeforeTheLock() public {
+        _grant(member, memberTokenId);
+        MemberBond bond = MemberBond(payable(vault.bondOf(member)));
+        vm.prank(member);
+        vm.expectRevert(MemberBond.KycRequired.selector);
+        bond.withdrawUnactivated();
+    }
+
+    function test_withdrawUnactivated_isLocked() public {
+        _grant(member, memberTokenId);
+        MemberBond bond = MemberBond(payable(vault.bondOf(member)));
+        sbt.setKycVerified(memberTokenId, true);
+        vm.roll(block.number + bond.LOCK_BLOCKS() - 1);
+        vm.warp(block.timestamp + bond.LOCK_SECONDS() - 1);
+        vm.prank(member);
+        vm.expectRevert(MemberBond.StillLocked.selector);
+        bond.withdrawUnactivated();
+    }
+
+    /// The wall-clock leg alone unlocks it: a stalled chain must not hold the
+    /// principal past the member's year.
+    function test_withdrawUnactivated_wallClockLegUnlocksOnAStalledChain() public {
+        _grant(member, memberTokenId);
+        MemberBond bond = MemberBond(payable(vault.bondOf(member)));
+        sbt.setKycVerified(memberTokenId, true);
+        vm.warp(block.timestamp + bond.LOCK_SECONDS());
+        vm.prank(member);
+        bond.withdrawUnactivated();
+        assertEq(member.balance, GRANT_AMOUNT);
+    }
+
+    function test_withdrawUnactivated_onlyMember() public {
+        _grant(member, memberTokenId);
+        MemberBond bond = MemberBond(payable(vault.bondOf(member)));
+        sbt.setKycVerified(memberTokenId, true);
+        vm.roll(block.number + bond.LOCK_BLOCKS());
+        vm.prank(attacker);
+        vm.expectRevert(MemberBond.NotMember.selector);
+        bond.withdrawUnactivated();
+        vm.prank(address(vault));
+        vm.expectRevert(MemberBond.NotMember.selector);
+        bond.withdrawUnactivated();
+    }
+
+    function test_withdrawUnactivated_refusedOnceActivated() public {
+        _grant(member, memberTokenId);
+        MemberBond bond = MemberBond(payable(vault.bondOf(member)));
+        vm.prank(member);
+        bond.activate(PK_A, SIG);
+        sbt.setKycVerified(memberTokenId, true);
+        vm.roll(block.number + bond.LOCK_BLOCKS());
+        vm.prank(member);
+        vm.expectRevert(MemberBond.AlreadyActivated.selector);
+        bond.withdrawUnactivated();
+    }
+
+    function test_withdrawUnactivated_onlyOnce_andBlocksLaterActivation() public {
+        _grant(member, memberTokenId);
+        MemberBond bond = MemberBond(payable(vault.bondOf(member)));
+        sbt.setKycVerified(memberTokenId, true);
+        vm.roll(block.number + bond.LOCK_BLOCKS());
+        vm.startPrank(member);
+        bond.withdrawUnactivated();
+        vm.expectRevert(MemberBond.AlreadyReleasing.selector);
+        bond.withdrawUnactivated();
+        vm.expectRevert(MemberBond.AlreadyReleasing.selector);
+        bond.activate(PK_A, SIG);
+        vm.stopPrank();
+    }
+
+    /// The vault mirrors the exit: attribution (validator eligibility) stops.
+    function test_withdrawUnactivated_vaultRecordsTheRelease() public {
+        uint256 id = _grant(member, memberTokenId);
+        MemberBond bond = MemberBond(payable(vault.bondOf(member)));
+        sbt.setKycVerified(memberTokenId, true);
+        vm.roll(block.number + bond.LOCK_BLOCKS());
+        vm.prank(member);
+        bond.withdrawUnactivated();
+
+        vault.recordRelease(id);
+        assertEq(vault.attributedStake(member), 0, "attribution detached");
+        assertEq(uint256(vault.getGrant(id).state), uint256(MembershipStakeVault.GrantState.Released));
+    }
 }

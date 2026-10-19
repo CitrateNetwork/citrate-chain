@@ -187,6 +187,8 @@ contract MemberBond is Initializable {
     /// exists.
     function activate(bytes32 pubkey_, bytes calldata ed25519Sig) external onlyMember {
         if (activated) revert AlreadyActivated();
+        // An exited bond (see `withdrawUnactivated`) has no principal left to bond.
+        if (releaseRequested) revert AlreadyReleasing();
         activated = true;
         pubkey = pubkey_;
 
@@ -244,6 +246,32 @@ contract MemberBond is Initializable {
         registry.withdraw(pubkey);
         uint256 amount = address(this).balance - before;
 
+        if (amount > 0) _payMember(amount);
+        emit PrincipalWithdrawn(member, amount);
+    }
+
+    /// Exit for a bond that was never activated: pay the principal straight to
+    /// the member once the lock has run and KYC holds.
+    ///
+    /// Without this, a member who never runs a node has no exit at all:
+    /// `requestRelease` and `withdrawToMember` both need an activated bond, and
+    /// the vault deliberately has no clawback. It is also the only exit if
+    /// governance later raises the registry's `minStake` above the principal,
+    /// because `activate` would then revert. The entitlement is the same as the
+    /// activated path's (principal to the member after the lock, KYC first);
+    /// it just skips the registry round trip, which an unbonded principal never
+    /// entered.
+    ///
+    /// Sets `releaseRequested`, so `activate` is closed afterwards and the
+    /// vault's permissionless `recordRelease` detaches attribution.
+    function withdrawUnactivated() external onlyMember withdrawable {
+        if (activated) revert AlreadyActivated();
+        if (releaseRequested) revert AlreadyReleasing();
+        releaseRequested = true;
+
+        // Everything here is the member's: `receive` admits only the registry,
+        // which never pays a bond that did not bond, so this is the principal.
+        uint256 amount = address(this).balance;
         if (amount > 0) _payMember(amount);
         emit PrincipalWithdrawn(member, amount);
     }

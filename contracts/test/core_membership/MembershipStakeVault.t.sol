@@ -43,6 +43,7 @@ contract MembershipStakeVaultTest is Test {
     bytes32 internal constant PK_B = bytes32(uint256(0xBBBB));
     bytes internal SIG = new bytes(64);
 
+    address internal governor = address(0x60FE);
     uint256 internal tokenId;
     uint256 internal tokenId2;
 
@@ -377,12 +378,17 @@ contract MembershipStakeVaultTest is Test {
         vault.transferOwnership(address(0));
     }
 
-    /// Upgrade authority is the owner and nobody else - this is the whole
-    /// security boundary of a UUPS money contract.
-    function testUpgrade_onlyOwnerMayAuthorize() public {
+    /// Upgrade authority is GOVERNANCE and nobody else - this is the whole
+    /// security boundary of a UUPS money contract. Since the C4 genesis split
+    /// that excludes the grant orchestrator (owner) too.
+    function testUpgrade_onlyGovernanceMayAuthorize() public {
+        vault.initializeGovernance(governor);
         MembershipStakeVault next = new MembershipStakeVault();
         vm.prank(attacker);
-        vm.expectRevert(MembershipStakeVault.NotOwner.selector);
+        vm.expectRevert(MembershipStakeVault.NotGovernance.selector);
+        vault.upgradeToAndCall(address(next), bytes(""));
+        // The owner (grant orchestrator) is refused too.
+        vm.expectRevert(MembershipStakeVault.NotGovernance.selector);
         vault.upgradeToAndCall(address(next), bytes(""));
     }
 
@@ -390,11 +396,103 @@ contract MembershipStakeVaultTest is Test {
     /// wrong, this is where it shows up.
     function testUpgrade_preservesState() public {
         uint256 id = _grant();
+        vault.initializeGovernance(governor);
         MembershipStakeVault next = new MembershipStakeVault();
+        vm.prank(governor);
         vault.upgradeToAndCall(address(next), bytes(""));
 
         assertEq(vault.attributedStake(member), GRANT_AMOUNT, "attribution survives upgrade");
         assertEq(vault.getGrant(id).member, member, "grant survives upgrade");
         assertEq(vault.owner(), admin, "owner survives upgrade");
+        assertEq(vault.governance(), governor, "governance survives upgrade");
+    }
+
+    // -- Governance split (C4 genesis) ------------------------------
+
+    /// Until governance is installed nobody can upgrade, not even the owner:
+    /// there is no hot-key fallback.
+    function testGovernance_unsetMeansNoUpgrade() public {
+        assertEq(vault.governance(), address(0));
+        MembershipStakeVault next = new MembershipStakeVault();
+        vm.expectRevert(MembershipStakeVault.NotGovernance.selector);
+        vault.upgradeToAndCall(address(next), bytes(""));
+    }
+
+    function testGovernance_initializeIsOwnerOnlyAndOnce() public {
+        vm.prank(attacker);
+        vm.expectRevert(MembershipStakeVault.NotOwner.selector);
+        vault.initializeGovernance(attacker);
+
+        vm.expectRevert(MembershipStakeVault.GovernanceIsZero.selector);
+        vault.initializeGovernance(address(0));
+
+        vault.initializeGovernance(governor);
+        assertEq(vault.governance(), governor);
+
+        // One-shot: the owner cannot re-point governance afterwards.
+        vm.expectRevert();
+        vault.initializeGovernance(attacker);
+        assertEq(vault.governance(), governor);
+    }
+
+    function testGovernance_twoStepTransfer() public {
+        vault.initializeGovernance(governor);
+        address next = address(0x6E0);
+
+        vm.expectRevert(MembershipStakeVault.NotGovernance.selector);
+        vault.transferGovernance(next);
+
+        vm.prank(governor);
+        vault.transferGovernance(next);
+        assertEq(vault.pendingGovernance(), next);
+        assertEq(vault.governance(), governor, "not moved until accepted");
+
+        vm.prank(attacker);
+        vm.expectRevert(MembershipStakeVault.NotPendingGovernance.selector);
+        vault.acceptGovernance();
+
+        vm.prank(next);
+        vault.acceptGovernance();
+        assertEq(vault.governance(), next);
+        assertEq(vault.pendingGovernance(), address(0));
+    }
+
+    function testGovernance_transferRejectsZero() public {
+        vault.initializeGovernance(governor);
+        vm.prank(governor);
+        vm.expectRevert(MembershipStakeVault.GovernanceIsZero.selector);
+        vault.transferGovernance(address(0));
+    }
+
+    /// Governance can replace a lost or compromised grant orchestrator; the
+    /// orchestrator cannot use this path, and nobody else can.
+    function testGovernance_setOwnerRecoversTheGrantRole() public {
+        vault.initializeGovernance(governor);
+        address fresh = address(0xF4E5);
+
+        vm.expectRevert(MembershipStakeVault.NotGovernance.selector);
+        vault.setOwner(fresh);
+        vm.prank(attacker);
+        vm.expectRevert(MembershipStakeVault.NotGovernance.selector);
+        vault.setOwner(fresh);
+        vm.prank(governor);
+        vm.expectRevert(MembershipStakeVault.OwnerIsZero.selector);
+        vault.setOwner(address(0));
+
+        vm.prank(governor);
+        vault.setOwner(fresh);
+        assertEq(vault.owner(), fresh);
+
+        vm.expectRevert(MembershipStakeVault.NotOwner.selector);
+        _grant();
+    }
+
+    /// Governance holds no grant power: placing grants stays the owner's.
+    function testGovernance_cannotGrant() public {
+        vault.initializeGovernance(governor);
+        vm.deal(governor, GRANT_AMOUNT);
+        vm.prank(governor);
+        vm.expectRevert(MembershipStakeVault.NotOwner.selector);
+        vault.grant{value: GRANT_AMOUNT}(member, GRANT_AMOUNT, tokenId);
     }
 }
