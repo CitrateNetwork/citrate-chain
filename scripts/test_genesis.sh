@@ -65,5 +65,5 @@ fi
 echo ""
 echo "-----------------------------------"
 echo "Cleaning up test directory..."
-rm -rf "$TEST_DATA_DIR"
+rm -rf "${TEST_DATA_DIR:?}"
 echo "✓ Test complete"

@@ -59,10 +59,12 @@ def probe(url: str, book: dict) -> dict:
     chain_id = int(rpc(url, "eth_chainId", []), 16)
     if chain_id != book["chainId"]:
         raise SystemExit(f"RPC chainId {chain_id} != book chainId {book['chainId']}")
+    # The node serves eth_getCode from its latest state and does not honour a block-number
+    # tag, so the read asks for "latest" and `block` records the head when the probe started.
     block = int(rpc(url, "eth_blockNumber", []), 16)
     codeless, with_code, precompile = [], [], []
     for name, addr in book_entries(book):
-        code = rpc(url, "eth_getCode", [addr, hex(block)])
+        code = rpc(url, "eth_getCode", [addr, "latest"])
         has = isinstance(code, str) and code not in ("0x", "0x0", "")
         if name.startswith("precompiles."):
             precompile.append(name)

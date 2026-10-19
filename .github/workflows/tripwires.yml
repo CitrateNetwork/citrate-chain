@@ -1,0 +1,46 @@
+name: Tripwires
+
+# Source-level regression fences for bug classes found on 2026-10-19 (scripts/ci/*_tripwire.sh):
+# Forge scripts that branch on block.chainid without the node chain-id check or use
+# address(this); reads of past state through eth_getCode / eth_call block tags; finalized/safe
+# and log ranges resolved through the height index; a finalization hook that publishes RPC
+# state before persistence; unguarded `rm -r "$VAR"` and ops scripts without pipefail; signals
+# sent to synthetic pids. Reviewed exceptions: scripts/ci/tripwire-allowlist.txt.
+# Shell + perl only: seconds, no toolchain. No path filter on purpose. Mirrors the
+# consensus-tripwires gate in scripts/ci/local-ci.sh.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tripwires-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  tripwires:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # Each tripwire first proves it still detects its class on its positive fixture and
+      # stays quiet on its negative one, then scans the tree.
+      - name: Self-test and scan
+        run: |
+          set -uo pipefail
+          rc=0
+          for t in forge_script historical_state_read rpc_height_index \
+                   finalization_publish_order shell_safety synthetic_pid_signal; do
+            s="scripts/ci/${t}_tripwire.sh"
+            echo "::group::$s"
+            "$s" --self-test || rc=1
+            "$s" || rc=1
+            echo "::endgroup::"
+          done
+          exit "$rc"

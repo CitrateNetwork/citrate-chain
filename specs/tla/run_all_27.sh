@@ -72,7 +72,7 @@ for i in $(seq 0 $((TOTAL - 1))); do
 
     end_s=$(date +%s)
     elapsed=$((end_s - start_s))
-    rm -rf "$tmpdir"
+    rm -rf "${tmpdir:?}"
 
     # Parse states (use subshells to avoid pipefail issues)
     gen=$(echo "$output" | grep -oP '[\d,]+ states generated' | tail -1 | grep -oP '^[\d,]+' | tr -d ',' 2>/dev/null) || gen="0"

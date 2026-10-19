@@ -239,7 +239,7 @@ log_ok "created fresh $DATA_DIR"
 log_step "Step 3 — clear forge broadcast + cache"
 for dir in "$BROADCAST_DIR" "$CACHE_DIR"; do
     if [ -d "$dir" ]; then
-        if ! rm -rf "$dir"; then
+        if ! rm -rf "${dir:?}"; then
             log_err "failed to clear $dir"
             exit 3
         fi

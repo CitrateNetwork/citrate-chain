@@ -12,7 +12,7 @@ SCRIPT="$ROOT/scripts/devnet-precompile-check.sh"
 [ -f "$SCRIPT" ] || { echo "FAIL - missing $SCRIPT"; exit 2; }
 fails=0
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+trap 'rm -rf "${TMP:?}"' EXIT
 
 expect_refusal() { # name expected-message env...
   local name="$1" want="$2"; shift 2
