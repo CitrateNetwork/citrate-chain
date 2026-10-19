@@ -3,6 +3,8 @@ pragma solidity ^0.8.26;
 
 import {Vm} from "forge-std/Vm.sol";
 import {TimelockController} from "@openzeppelin/contracts/governance/TimelockController.sol";
+import {MultisigProposer} from "../../src/genesis/MultisigProposer.sol";
+import {Salts} from "../Salts.sol";
 
 /// @title AdminChecks — post-deploy admin/owner/governance assertions (PBA-L2-002)
 /// @notice The 2026-09-24 pre-bounty audit found that `new X{salt:}()` in a forge
@@ -384,6 +386,82 @@ abstract contract AdminChecks {
         address[] memory extraCancellers
     ) internal {
         string memory problem = _timelockHolderProblem(timelock, council, extraCancellers);
+        require(bytes(problem).length == 0, string.concat(name, ": ", problem));
+    }
+
+    // ---- Council authentication: CREATE2 provenance of a MultisigProposer ----
+    //
+    // A council's getters (`timelock()`, `threshold()`, `owners()`, `isOwner()`) are only worth
+    // reading once the contract is known to BE a MultisigProposer built with those values: any
+    // contract can answer them (a single-signer forwarder can report 3-of-5 and `isOwner == false`
+    // for every deploy account while holding the timelock's roles itself). The genesis ceremony
+    // (DeployGenesisGovernance) deploys each council with `new MultisigProposer{salt}` through the
+    // Arachnid factory, so its address is
+    //   keccak256(0xff ++ factory ++ Salts.salt(saltName) ++ keccak256(creationCode ++ args))[12:]
+    // Recomputing that from the expected timelock and the CLAIMED owners / threshold, and getting
+    // the council's own address back, proves the runtime code (the factory ran exactly that init
+    // code there; the constructor is deterministic) and both immutables (timelock, threshold) and
+    // the owner set the constructor stored (no function writes it afterwards). A contract that
+    // lies about any of them sits at a different address.
+
+    /// Salt-name prefix DeployGenesisGovernance gives its councils: "Genesis." + book name
+    /// ("GovernanceMultisig", "GuardianMultisig").
+    string internal constant GENESIS_SALT_PREFIX = "Genesis.";
+
+    /// @notice The address the Arachnid factory gives `initCode` under `Salts.salt(saltName)`.
+    function _ceremonyCreate2Address(string memory saltName, bytes memory initCode) internal pure returns (address) {
+        return address(
+            uint160(
+                uint256(
+                    keccak256(
+                        abi.encodePacked(bytes1(0xff), ARACHNID_FACTORY, Salts.salt(saltName), keccak256(initCode))
+                    )
+                )
+            )
+        );
+    }
+
+    /// @notice MultisigProposer init code for the given constructor arguments (one place, so a
+    ///         constructor change is one edit here).
+    function _multisigProposerInitCode(address timelock, address[] memory owners, uint256 threshold)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        return abi.encodePacked(type(MultisigProposer).creationCode, abi.encode(timelock, owners, threshold));
+    }
+
+    /// @notice Empty when `multisig` is the MultisigProposer that the genesis ceremony deploys
+    ///         under `saltName` for (`timelock`, its reported owners, its reported threshold),
+    ///         i.e. its address is that CREATE2 address and it has code. Only after this passes
+    ///         are its getters the contract's real state. Never reverts on a well-formed answer;
+    ///         a malformed `owners()` return reverts in decoding, which fails the caller closed.
+    function _multisigProposerProblem(address multisig, address timelock, string memory saltName)
+        internal
+        view
+        returns (string memory)
+    {
+        if (multisig.code.length == 0) return "no code at address";
+        (bool okT, bytes memory rt) = multisig.staticcall(abi.encodeWithSignature("threshold()"));
+        if (!okT || rt.length != 32) return "threshold() unreadable";
+        (bool okO, bytes memory ro) = multisig.staticcall(abi.encodeWithSignature("owners()"));
+        if (!okO || ro.length < 64) return "owners() unreadable";
+        address[] memory owners = abi.decode(ro, (address[]));
+        uint256 threshold = abi.decode(rt, (uint256));
+        if (_ceremonyCreate2Address(saltName, _multisigProposerInitCode(timelock, owners, threshold)) != multisig) {
+            return string.concat(
+                "not the MultisigProposer the ceremony deploys (", saltName, ") for this timelock, owners and threshold"
+            );
+        }
+        return "";
+    }
+
+    /// @notice Revert unless `_multisigProposerProblem` is empty (see there).
+    function _assertMultisigProposer(string memory name, address multisig, address timelock, string memory saltName)
+        internal
+        view
+    {
+        string memory problem = _multisigProposerProblem(multisig, timelock, saltName);
         require(bytes(problem).length == 0, string.concat(name, ": ", problem));
     }
 

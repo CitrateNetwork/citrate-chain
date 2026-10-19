@@ -35,7 +35,7 @@ import {MultisigProposer} from "../src/genesis/MultisigProposer.sol";
 ///           GOVERNANCE_TIMELOCK must be an OZ TimelockController that administers itself,
 ///           whose PROPOSER / EXECUTOR / CANCELLER is GOVERNANCE_MULTISIG (a MultisigProposer
 ///           fronting that timelock), with execution not open to everyone, and on which none
-///           of {configured deployer, actual broadcaster, CREATE2 factory, this script} holds
+///           of {configured deployer, actual broadcaster, CREATE2 factory} holds
 ///           DEFAULT_ADMIN or a timelock role. Neither may they be multisig owners. Floors:
 ///             genesis profile (chain 40204, owner decision): delay >= 48 h AND the council
 ///               is at least 3-of-5. Selected by chain id; there is no override.
@@ -48,6 +48,11 @@ import {MultisigProposer} from "../src/genesis/MultisigProposer.sol";
 ///           TIMELOCK_HISTORY_FROM_BLOCK, default 0) and every account found is re-read with
 ///           hasRole. No node, a failed page, or a history that does not start at the
 ///           timelock's construction fails closed.
+///           The council is authenticated before any of its getters is read: its address
+///           must be the CREATE2 address DeployGenesisGovernance gives a MultisigProposer for
+///           (this timelock, its reported owners, its reported threshold) under the salt
+///           "Genesis.GovernanceMultisig" (AdminChecks `_multisigProposerProblem`). That proves
+///           the code and the values; a contract that only answers the same getters is refused.
 ///           The timelock and multisig are written to the book's `contracts`, so the
 ///           CheckDeployedAdmins gate re-checks them too.
 ///
@@ -55,7 +60,7 @@ import {MultisigProposer} from "../src/genesis/MultisigProposer.sol";
 ///           the configured deployer (CEREMONY_DEPLOYER_ADDRESS / DEPLOYER_ADDRESS), or the
 ///           script reverts before sending anything. Postconditions then check, on the live
 ///           ledger, that GOVERNANCE_TIMELOCK is admin and that none of {configured deployer,
-///           actual broadcaster, CREATE2 factory, this script} holds DEFAULT_ADMIN_ROLE.
+///           actual broadcaster, CREATE2 factory} holds DEFAULT_ADMIN_ROLE.
 ///
 ///         Required env: GOVERNANCE_TIMELOCK (an OZ TimelockController, e.g. the
 ///         GovernanceTimelock from DeployGenesisGovernance), GOVERNANCE_MULTISIG (its
@@ -101,8 +106,11 @@ contract DeployDormantLedgers is ScriptEnv, AdminChecks, Create2Deploy, GenesisB
         require(deployer != address(0), "deployer must be set");
         require(governance != deployer, "GOVERNANCE_TIMELOCK cannot be the deployer");
         require(_isTimelock(governance), "GOVERNANCE_TIMELOCK is not a TimelockController");
-        address[] memory accounts = new address[](2);
-        (accounts[0], accounts[1]) = (deployer, address(this));
+        // Script-contract addresses are simulation-only (forge refuses `address(this)` on a
+        // script run path), so the deploy accounts are the configured deployer and, below, the
+        // actual broadcaster.
+        address[] memory accounts = new address[](1);
+        accounts[0] = deployer;
         _assertGovernanceCouncil(governance, council, accounts);
         require(kyc.code.length != 0, "PATRONAGE_KYC_REGISTRY has no code on this chain");
         require(membership.code.length != 0, "PATRONAGE_MEMBERSHIP has no code on this chain");
@@ -124,8 +132,8 @@ contract DeployDormantLedgers is ScriptEnv, AdminChecks, Create2Deploy, GenesisB
         vm.stopBroadcast();
 
         _assertDormant(d, deployer, broadcaster, governance, kyc, membership);
-        address[] memory deployAccounts = new address[](3);
-        (deployAccounts[0], deployAccounts[1], deployAccounts[2]) = (deployer, broadcaster, address(this));
+        address[] memory deployAccounts = new address[](2);
+        (deployAccounts[0], deployAccounts[1]) = (deployer, broadcaster);
         _assertGovernanceCouncil(governance, council, deployAccounts);
         console.log("FederatedRoundLedger:", d.federatedRoundLedger);
         console.log("PatronageLedger     :", d.patronageLedger);
@@ -159,6 +167,10 @@ contract DeployDormantLedgers is ScriptEnv, AdminChecks, Create2Deploy, GenesisB
         string memory ms = "GOVERNANCE_MULTISIG";
         require(council.code.length != 0, "GOVERNANCE_MULTISIG has no code on this chain");
         _assertTimelockSeats(tl, governance, council, accounts[0]);
+        // Authenticate the council before trusting any of its getters (chain#320 P1): it must be
+        // the MultisigProposer DeployGenesisGovernance deploys for this timelock (CREATE2
+        // provenance), so timelock(), threshold(), owners() and isOwner() below are its real state.
+        _assertMultisigProposer(ms, council, governance, string.concat(GENESIS_SALT_PREFIX, "GovernanceMultisig"));
         _assertNoFactoryAdmin(ms, council);
         for (uint256 i = 0; i < accounts.length; i++) {
             require(accounts[i] != council, "GOVERNANCE_MULTISIG cannot be a deploy account");
@@ -202,8 +214,8 @@ contract DeployDormantLedgers is ScriptEnv, AdminChecks, Create2Deploy, GenesisB
         _assertNoDeployerAdmin("FederatedRoundLedger", d.federatedRoundLedger, deployer);
 
         PatronageLedger ledger = PatronageLedger(d.patronageLedger);
-        address[] memory notAdmin = new address[](4);
-        (notAdmin[0], notAdmin[1], notAdmin[2], notAdmin[3]) = (deployer, broadcaster, ARACHNID_FACTORY, address(this));
+        address[] memory notAdmin = new address[](3);
+        (notAdmin[0], notAdmin[1], notAdmin[2]) = (deployer, broadcaster, ARACHNID_FACTORY);
         _assertSoleAdminAmong("PatronageLedger", d.patronageLedger, governance, notAdmin);
         _assertNoDeployerAdmin("PatronageLedger", d.patronageLedger, deployer);
         _assertNoDeployerAdmin("PatronageLedger", d.patronageLedger, broadcaster);

@@ -36,7 +36,10 @@ import {P256} from "../src/aa/lib/webauthn/P256.sol";
 ///         RoleGranted / RoleRevoked logs, re-read with hasRole). An entry `<P>Timelock` must
 ///         have a `<P>Multisig` beside it in the same section; the timelock must be its own SOLE
 ///         admin and that multisig its SOLE proposer, executor and canceller. No paired
-///         multisig, no node, or an incomplete history fails it. GATE: must be 0.
+///         multisig, no node, or an incomplete history fails it. The paired multisig must also
+///         be authenticated: the MultisigProposer DeployGenesisGovernance deploys for that
+///         timelock and its reported owners / threshold, at its CREATE2 address under the salt
+///         "Genesis.<P>Multisig" (AdminChecks `_multisigProposerProblem`). GATE: must be 0.
 ///
 ///         Expected on the 2026-09-24 deployment (a fork of 40204): 22
 ///         FACTORY-ADMIN (21 admin slots + X402Paywall.provider), VERIFIER
@@ -139,9 +142,16 @@ contract CheckDeployedAdmins is Script, AdminChecks {
         if (n.length < suffix.length || keccak256(_slice(n, n.length - suffix.length, n.length)) != keccak256(suffix)) {
             return "a timelock entry must be named <P>Timelock with a <P>Multisig beside it";
         }
-        string memory key = string.concat(section, ".", string(_slice(n, 0, n.length - suffix.length)), "Multisig");
+        string memory multisigName = string.concat(string(_slice(n, 0, n.length - suffix.length)), "Multisig");
+        string memory key = string.concat(section, ".", multisigName);
         if (!vm.keyExistsJson(json, key)) return "no paired <P>Multisig entry in the same section";
-        return _timelockHolderProblem(target, vm.parseJsonAddress(json, key), new address[](0));
+        address council = vm.parseJsonAddress(json, key);
+        // Authenticate the paired council (chain#320 P1) as the ceremony's MultisigProposer for this
+        // timelock (CREATE2 provenance under "Genesis.<P>Multisig") before it counts as the council.
+        string memory mproblem =
+            _multisigProposerProblem(council, target, string.concat(GENESIS_SALT_PREFIX, multisigName));
+        if (bytes(mproblem).length != 0) return string.concat(multisigName, ": ", mproblem);
+        return _timelockHolderProblem(target, council, new address[](0));
     }
 
     function _slice(bytes memory b, uint256 from, uint256 to) internal pure returns (bytes memory out) {

@@ -13,6 +13,7 @@ import {Auth} from "../../src/coop/lib/Auth.sol";
 import {KYCRegistry} from "../../src/KYCRegistry.sol";
 import {MultisigProposer} from "../../src/genesis/MultisigProposer.sol";
 import {AdminChecks} from "../../script/lib/AdminChecks.sol";
+import {Salts} from "../../script/Salts.sol";
 import {
     RoleLogArchive,
     DormantWithHistory,
@@ -259,7 +260,7 @@ contract DeployDormantLedgersTest is Test {
         address[] memory me = new address[](1);
         me[0] = SENDER;
         TimelockController weak = new TimelockController(0, me, me, SENDER);
-        MultisigProposer ms = new MultisigProposer(address(weak), govOwners, 3);
+        MultisigProposer ms = _ceremonyMultisig(GOV_SALT, address(weak), govOwners, 3);
         DeployDormantLedgers s = _dormant();
 
         // As-is: the multisig holds no seat and the deployer administers the timelock.
@@ -370,8 +371,24 @@ contract DeployDormantLedgersTest is Test {
     /// whatever extra seats it wants before `_finish`.
     function _handedTimelock() internal returns (TimelockController tl, MultisigProposer ms) {
         tl = new TimelockController(48 hours, new address[](0), new address[](0), SENDER);
-        ms = new MultisigProposer(address(tl), govOwners, 3);
+        ms = _ceremonyMultisig(GOV_SALT, address(tl), govOwners, 3);
         _grantCouncil(tl, address(ms));
+    }
+
+    string internal constant GOV_SALT = "Genesis.GovernanceMultisig";
+    string internal constant GRD_SALT = "Genesis.GuardianMultisig";
+    address internal constant ARACHNID = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
+
+    /// A MultisigProposer deployed the way DeployGenesisGovernance deploys one: through the
+    /// Arachnid factory under `Salts.salt(saltName)`, so it carries the ceremony's CREATE2 provenance.
+    function _ceremonyMultisig(string memory saltName, address tl, address[] memory owners, uint256 threshold)
+        internal
+        returns (MultisigProposer)
+    {
+        bytes memory init = abi.encodePacked(type(MultisigProposer).creationCode, abi.encode(tl, owners, threshold));
+        (bool ok, bytes memory ret) = ARACHNID.call(abi.encodePacked(Salts.salt(saltName), init));
+        require(ok && ret.length == 20, "factory deploy failed");
+        return MultisigProposer(address(bytes20(ret)));
     }
 
     function _finish(TimelockController tl) internal {
@@ -540,6 +557,110 @@ contract DeployDormantLedgersTest is Test {
         );
     }
 
+    // ---- chain#320 P1: the council is authenticated before its getters are trusted ----
+
+    /// A genuine 48 h OZ timelock whose sole proposer / executor / canceller is a single-signer
+    /// forwarder that reports 3-of-5, fronts the timelock, and owns no deploy account.
+    function _forwardedTimelock() internal returns (TimelockController tl, SelfReportingForwarder fwd) {
+        tl = new TimelockController(48 hours, new address[](0), new address[](0), SENDER);
+        fwd = new SelfReportingForwarder(address(tl), makeAddr("lone-signer"), govOwners);
+        _grantCouncil(tl, address(fwd));
+        _finish(tl);
+    }
+
+    function test_rejects_self_reporting_forwarder_council() public {
+        vm.chainId(40204);
+        (TimelockController tl, SelfReportingForwarder fwd) = _forwardedTimelock();
+        // Everything it reports is compliant, and the timelock's holder sets are exactly it.
+        MultisigProposer asCouncil = MultisigProposer(address(fwd));
+        assertEq(asCouncil.threshold(), 3);
+        assertEq(asCouncil.owners().length, 5);
+        assertEq(asCouncil.timelock(), address(tl));
+        HolderChecksWithHistory h = new HolderChecksWithHistory();
+        h.useArchive(archive);
+        assertEq(h.problem(address(tl), address(fwd), new address[](0)), "");
+        // ...yet one key schedules on the timelock alone.
+        bytes memory op = abi.encodeCall(TimelockController.updateDelay, (0));
+        vm.prank(makeAddr("lone-signer"));
+        fwd.forward(abi.encodeCall(TimelockController.schedule, (address(tl), 0, op, bytes32(0), bytes32(0), 48 hours)));
+
+        DeployDormantLedgers s = _dormant();
+        uint64 nonceBefore = vm.getNonce(SENDER);
+        _expectRevert(
+            bytes(
+                "GOVERNANCE_MULTISIG: not the MultisigProposer the ceremony deploys (Genesis.GovernanceMultisig) for this timelock, owners and threshold"
+            )
+        );
+        s.deployWith(SENDER, address(tl), address(fwd), address(kyc), address(membership));
+        assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
+    }
+
+    function test_admin_gate_rejects_self_reporting_forwarder_council() public {
+        vm.etch(P256_VERIFIER, hex"600160005260206000f3");
+        DeployDormantLedgers.Deployed memory d = _deploy();
+        (TimelockController tl, SelfReportingForwarder fwd) = _forwardedTimelock();
+        AdminChecksHarness a = new AdminChecksHarness();
+        assertEq(
+            a.multisigProblem(address(fwd), address(tl), GOV_SALT),
+            "not the MultisigProposer the ceremony deploys (Genesis.GovernanceMultisig) for this timelock, owners and threshold"
+        );
+        string memory book = _dormant().bookJson(SENDER, address(tl), address(fwd), d);
+        CheckDeployedAdmins c = _gate();
+        _expectRevert(bytes("CheckDeployedAdmins: a timelock's role holders are not exactly its council (see log)"));
+        c.check(book, false);
+    }
+
+    /// Genuine MultisigProposer code is not enough: it must be the ceremony's instance for this
+    /// timelock (right salt, right args). The genuine 3-of-5 pipeline councils pass.
+    function test_council_authentication_requires_ceremony_provenance_and_args() public {
+        AdminChecksHarness a = new AdminChecksHarness();
+        assertEq(a.multisigProblem(gov.governanceMultisig, gov.governanceTimelock, GOV_SALT), "");
+        assertEq(a.multisigProblem(gov.guardianMultisig, gov.guardianTimelock, GRD_SALT), "");
+        string memory bad =
+            "not the MultisigProposer the ceremony deploys (Genesis.GovernanceMultisig) for this timelock, owners and threshold";
+        // The right council for the wrong timelock, and under the wrong salt.
+        assertEq(a.multisigProblem(gov.governanceMultisig, gov.guardianTimelock, GOV_SALT), bad);
+        assertEq(a.multisigProblem(gov.guardianMultisig, gov.guardianTimelock, GOV_SALT), bad);
+        assertEq(a.multisigProblem(makeAddr("nomultisig"), gov.governanceTimelock, GOV_SALT), "no code at address");
+        assertEq(a.multisigProblem(address(kyc), gov.governanceTimelock, GOV_SALT), "threshold() unreadable");
+
+        vm.chainId(40204);
+        TimelockController tl = new TimelockController(48 hours, new address[](0), new address[](0), SENDER);
+        // Genuine 3-of-5 code and args, plain CREATE (no ceremony provenance): refused.
+        MultisigProposer plain = new MultisigProposer(address(tl), govOwners, 3);
+        _grantCouncil(tl, address(plain));
+        _finish(tl);
+        assertEq(a.multisigProblem(address(plain), address(tl), GOV_SALT), bad);
+        DeployDormantLedgers s = _dormant();
+        _expectRevert(bytes(string.concat("GOVERNANCE_MULTISIG: ", bad)));
+        s.deployWith(SENDER, address(tl), address(plain), address(kyc), address(membership));
+
+        // Genuine code under the GUARDIAN salt, fronting the governance timelock: refused.
+        TimelockController tl2 = new TimelockController(48 hours, new address[](0), new address[](0), SENDER);
+        MultisigProposer wrongSalt = _ceremonyMultisig(GRD_SALT, address(tl2), govOwners, 3);
+        _grantCouncil(tl2, address(wrongSalt));
+        _finish(tl2);
+        _expectRevert(bytes(string.concat("GOVERNANCE_MULTISIG: ", bad)));
+        s.deployWith(SENDER, address(tl2), address(wrongSalt), address(kyc), address(membership));
+
+        // Ceremony provenance with 2-of-5 args: authenticated, so its threshold is real, and the
+        // genesis floor refuses it.
+        TimelockController tl3 = new TimelockController(48 hours, new address[](0), new address[](0), SENDER);
+        MultisigProposer twoOfFive = _ceremonyMultisig(GOV_SALT, address(tl3), govOwners, 2);
+        _grantCouncil(tl3, address(twoOfFive));
+        _finish(tl3);
+        assertEq(a.multisigProblem(address(twoOfFive), address(tl3), GOV_SALT), "");
+        _expectRevert(bytes("GOVERNANCE_MULTISIG: below the 3-of-5 genesis floor"));
+        s.deployWith(SENDER, address(tl3), address(twoOfFive), address(kyc), address(membership));
+
+        // The genuine 3-of-5 pipeline council passes the deploy and the gate.
+        vm.etch(P256_VERIFIER, hex"600160005260206000f3");
+        DeployDormantLedgers.Deployed memory d = _deploy();
+        CheckDeployedAdmins c = _gate();
+        c.check(s.bookJson(SENDER, gov.governanceTimelock, gov.governanceMultisig, d), false);
+        assertEq(c.timelockHolders(), 0);
+    }
+
     /// The post-deploy gate establishes the complete sets on every timelock in the book.
     function test_admin_gate_flags_an_unrelated_admin_on_the_governance_timelock() public {
         vm.etch(P256_VERIFIER, hex"600160005260206000f3");
@@ -700,5 +821,45 @@ contract DeployDormantLedgersTest is Test {
 contract AdminChecksHarness is AdminChecks {
     function soleAdminAmong(address target, address expected, address[] memory others) external view {
         _assertSoleAdminAmong("PatronageLedger", target, expected, others);
+    }
+
+    function multisigProblem(address multisig, address timelock, string memory saltName)
+        external
+        view
+        returns (string memory)
+    {
+        return _multisigProposerProblem(multisig, timelock, saltName);
+    }
+}
+
+/// chain#320 P1 regression: one key runs the timelock through this contract, while its getters
+/// describe a compliant council (3-of-5, fronting the timelock, no deploy account an owner).
+contract SelfReportingForwarder {
+    address public immutable timelock;
+    address internal immutable signer;
+    address[] internal _reported;
+
+    constructor(address timelock_, address signer_, address[] memory reportedOwners) {
+        (timelock, signer, _reported) = (timelock_, signer_, reportedOwners);
+    }
+
+    function threshold() external pure returns (uint256) {
+        return 3;
+    }
+
+    function owners() external view returns (address[] memory) {
+        return _reported;
+    }
+
+    function isOwner(address) external pure returns (bool) {
+        return false;
+    }
+
+    /// The real control path: a single signature, no approvals.
+    function forward(bytes calldata data) external returns (bytes memory ret) {
+        require(msg.sender == signer, "not signer");
+        bool ok;
+        (ok, ret) = timelock.call(data);
+        require(ok, "forward failed");
     }
 }
