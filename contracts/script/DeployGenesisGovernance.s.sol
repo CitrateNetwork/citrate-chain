@@ -32,7 +32,9 @@ import {MultisigProposer} from "../src/genesis/MultisigProposer.sol";
 ///           GOV_OWNERS=0xA,0xB,…   GOV_THRESHOLD=3   GOV_MIN_DELAY=172800
 ///           GRD_OWNERS=0xC,0xD,…   GRD_THRESHOLD=2   GRD_MIN_DELAY=3600
 ///           GENESIS_GOVERNANCE_OUT=genesis/governance.json   (book-shaped output)
-///           CEREMONY_DEPLOYER_ADDRESS or DEPLOYER_ADDRESS     (must be the forge signer)
+///           CEREMONY_DEPLOYER_ADDRESS or DEPLOYER_ADDRESS     (must be the forge signer; enforced:
+///                                                              the run reverts before deploying
+///                                                              anything if the broadcaster differs)
 ///         Optional: ALLOW_SHARED_HOLDERS=1 lets one address sit on both councils (C2 D5
 ///         requires the owner's written approval for that; off unless set).
 ///
@@ -95,13 +97,20 @@ contract DeployGenesisGovernance is ScriptEnv, AdminChecks, Create2Deploy, Genes
         console.log("Deployer:", deployer);
         console.log("Chain ID:", block.chainid);
 
-        vm.startBroadcast();
+        // Refuses to deploy anything unless the forge signer is the configured deployer.
+        address broadcaster = _startBroadcastAsDeployer(deployer);
+        _requireNotOwner("GOVERNANCE", gov, broadcaster);
+        _requireNotOwner("GUARDIAN", grd, broadcaster);
         (d.governanceTimelock, d.governanceMultisig) = _deployCouncil(GOV_TIMELOCK, GOV_MULTISIG, gov, deployer);
         (d.guardianTimelock, d.guardianMultisig) = _deployCouncil(GRD_TIMELOCK, GRD_MULTISIG, grd, deployer);
         vm.stopBroadcast();
 
         _assertCouncil("GOVERNANCE", d.governanceTimelock, d.governanceMultisig, gov, deployer);
         _assertCouncil("GUARDIAN", d.guardianTimelock, d.guardianMultisig, grd, deployer);
+        _assertNoDeployerAdmin("GOVERNANCE", d.governanceTimelock, broadcaster);
+        _assertNoDeployerAdmin("GOVERNANCE", d.governanceMultisig, broadcaster);
+        _assertNoDeployerAdmin("GUARDIAN", d.guardianTimelock, broadcaster);
+        _assertNoDeployerAdmin("GUARDIAN", d.guardianMultisig, broadcaster);
 
         console.log("GovernanceTimelock :", d.governanceTimelock);
         console.log("GovernanceMultisig :", d.governanceMultisig);
@@ -155,6 +164,12 @@ contract DeployGenesisGovernance is ScriptEnv, AdminChecks, Create2Deploy, Genes
             for (uint256 j = i + 1; j < n; j++) {
                 require(c.owners[i] != c.owners[j], string.concat(name, ": duplicate owner"));
             }
+        }
+    }
+
+    function _requireNotOwner(string memory name, Council memory c, address broadcaster) internal pure {
+        for (uint256 i = 0; i < c.owners.length; i++) {
+            require(c.owners[i] != broadcaster, string.concat(name, ": the broadcaster cannot be an owner"));
         }
     }
 

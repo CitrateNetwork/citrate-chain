@@ -26,7 +26,11 @@ import {TeamVestingWallet} from "../src/genesis/TeamVestingWallet.sol";
 ///         "TeamVesting_<label>" (a JSON-path-safe key for CheckDeployedAdmins).
 ///
 ///         Required env: TEAM_VESTING_FILE, TEAM_VESTING_OUT, and CEREMONY_DEPLOYER_ADDRESS
-///         or DEPLOYER_ADDRESS (the forge signer, which pays the total).
+///         or DEPLOYER_ADDRESS (must equal the forge signer, which pays the total; enforced).
+///
+///         Fail closed on signer mismatch: the account Forge actually broadcasts as must be
+///         the configured deployer, or the script reverts before deploying or funding
+///         anything; no beneficiary may be that broadcaster either.
 ///
 ///         Checks before broadcasting, per entry: beneficiary nonzero and not the deployer,
 ///         start > 0, duration > 0, cliff <= duration, amount > 0, label unique. Re-runnable:
@@ -90,7 +94,13 @@ contract DeployTeamVesting is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
         console.log("Total (wei):", total);
 
         wallets = new address[](grants.length);
-        vm.startBroadcast();
+        // Refuses to deploy or fund anything unless the forge signer is the configured deployer.
+        address broadcaster = _startBroadcastAsDeployer(deployer);
+        for (uint256 i = 0; i < grants.length; i++) {
+            require(
+                grants[i].beneficiary != broadcaster, string.concat(grants[i].label, ": beneficiary is the broadcaster")
+            );
+        }
         for (uint256 i = 0; i < grants.length; i++) {
             wallets[i] = _deployAndFund(grants[i]);
         }
@@ -98,6 +108,7 @@ contract DeployTeamVesting is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
 
         for (uint256 i = 0; i < grants.length; i++) {
             _assertWallet(grants[i], wallets[i], deployer);
+            _assertNoDeployerAdmin(_salted(grants[i]), wallets[i], broadcaster);
             console.log(string.concat("TeamVesting.", grants[i].label, ":"), wallets[i]);
         }
     }

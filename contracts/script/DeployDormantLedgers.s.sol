@@ -75,13 +75,8 @@ contract DeployDormantLedgers is ScriptEnv, AdminChecks, Create2Deploy, GenesisB
         console.log("Deployer:", deployer);
         console.log("Governance timelock:", governance);
 
-        vm.startBroadcast();
-        // The account Forge signs with is chosen by CLI flags (--sender / --private-key /
-        // --account), not by DEPLOYER_ADDRESS. Every postcondition and the address-book gate are
-        // phrased in terms of the configured deployer, so a different broadcaster would escape
-        // them: refuse to send anything unless the two agree.
-        (, address broadcaster,) = vm.readCallers();
-        require(broadcaster == deployer, "broadcast sender is not the configured deployer (DEPLOYER_ADDRESS)");
+        // Refuses to send anything unless the forge signer is the configured deployer.
+        address broadcaster = _startBroadcastAsDeployer(deployer);
         bytes memory frlInit = type(FederatedRoundLedger).creationCode;
         d.federatedRoundLedger = _isLive(FRL, frlInit)
             ? _create2Address(FRL, frlInit)

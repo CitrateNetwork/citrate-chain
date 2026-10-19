@@ -11,6 +11,21 @@ import "forge-std/Script.sol";
 ///         main book (EXTRA_ADDRESS_BOOKS=<file>,…). The path must sit under a directory
 ///         foundry.toml grants write access to (`./genesis`).
 abstract contract GenesisBook is Script {
+    string internal constant BROADCASTER_MISMATCH =
+        "broadcast sender is not the configured deployer (DEPLOYER_ADDRESS)";
+
+    /// @notice `vm.startBroadcast()`, then fail closed unless the account Forge actually signs as
+    ///         equals `deployer`. The signer is chosen by CLI flags (--sender / --private-key /
+    ///         --account), not by DEPLOYER_ADDRESS, while every validation, postcondition and the
+    ///         address-book gate are phrased in terms of the configured deployer. Call this as the
+    ///         first statement of the broadcast, before anything is deployed or funded.
+    /// @return broadcaster the actual broadcast sender (== `deployer` once this returns).
+    function _startBroadcastAsDeployer(address deployer) internal returns (address broadcaster) {
+        vm.startBroadcast();
+        (, broadcaster,) = vm.readCallers();
+        require(broadcaster == deployer, BROADCASTER_MISMATCH);
+    }
+
     /// @param params a JSON object body (without braces) of ceremony parameters, or "".
     function _bookJson(address deployer, string[] memory names, address[] memory addrs, string memory params)
         internal

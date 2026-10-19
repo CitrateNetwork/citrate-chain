@@ -189,6 +189,32 @@ contract DeployTeamVestingTest is Test {
         s.deployWith(SENDER, g);
     }
 
+    /// Signer-mismatch regression: DEPLOYER_ADDRESS names A but Forge broadcasts as B, and a
+    /// grant names B as its beneficiary. The script must revert before deploying or funding.
+    function test_reverts_when_broadcaster_is_not_the_configured_deployer() public {
+        address configured = makeAddr("configured-deployer-A");
+        DeployTeamVesting s = new DeployTeamVesting();
+        DeployTeamVesting.Grant[] memory g = _grants();
+        g[1].beneficiary = SENDER; // the actual broadcaster (B)
+        uint64 nonceBefore = vm.getNonce(SENDER);
+        uint256 balanceBefore = SENDER.balance;
+        vm.expectRevert(bytes("broadcast sender is not the configured deployer (DEPLOYER_ADDRESS)"));
+        s.deployWith(configured, g); // broadcasts as SENDER (B)
+        assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
+        assertEq(SENDER.balance, balanceBefore, "nothing funded");
+    }
+
+    /// Same mismatch with a schedule that names neither account: still refused, nothing sent.
+    function test_reverts_on_signer_mismatch_even_with_a_clean_schedule() public {
+        DeployTeamVesting s = new DeployTeamVesting();
+        uint64 nonceBefore = vm.getNonce(SENDER);
+        uint256 balanceBefore = SENDER.balance;
+        vm.expectRevert(bytes("broadcast sender is not the configured deployer (DEPLOYER_ADDRESS)"));
+        s.deployWith(makeAddr("configured-deployer-A"), _grants());
+        assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
+        assertEq(SENDER.balance, balanceBefore, "nothing funded");
+    }
+
     function test_wallet_refuses_factory_beneficiary_and_long_cliff() public {
         vm.expectRevert(InitialAdmin.InitialAdmin_Create2Factory.selector);
         new TeamVestingWallet(InitialAdmin.CREATE2_FACTORY, START, YEAR, 0);

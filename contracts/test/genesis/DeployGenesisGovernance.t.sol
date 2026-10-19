@@ -156,6 +156,28 @@ contract DeployGenesisGovernanceTest is Test {
         s.deployWith(SENDER, _gov(), grd, false);
     }
 
+    /// Signer-mismatch regression: DEPLOYER_ADDRESS names A but Forge broadcasts as B, and B
+    /// sits on a council. The script must revert before deploying anything.
+    function test_reverts_when_broadcaster_is_not_the_configured_deployer() public {
+        address configured = makeAddr("configured-deployer-A");
+        DeployGenesisGovernance s = new DeployGenesisGovernance();
+        DeployGenesisGovernance.Council memory gov = _gov();
+        gov.owners[4] = SENDER; // the actual broadcaster (B)
+        uint64 nonceBefore = vm.getNonce(SENDER);
+        vm.expectRevert(bytes("broadcast sender is not the configured deployer (DEPLOYER_ADDRESS)"));
+        s.deployWith(configured, gov, _grd(), false); // broadcasts as SENDER (B)
+        assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
+    }
+
+    /// Same mismatch with councils that name neither account: still refused, nothing sent.
+    function test_reverts_on_signer_mismatch_even_with_clean_councils() public {
+        DeployGenesisGovernance s = new DeployGenesisGovernance();
+        uint64 nonceBefore = vm.getNonce(SENDER);
+        vm.expectRevert(bytes("broadcast sender is not the configured deployer (DEPLOYER_ADDRESS)"));
+        s.deployWith(makeAddr("configured-deployer-A"), _gov(), _grd(), false);
+        assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
+    }
+
     function test_shared_holder_rejected_unless_allowed() public {
         DeployGenesisGovernance.Council memory grd = _grd();
         grd.owners[0] = _gov().owners[2];
