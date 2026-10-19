@@ -1,0 +1,42 @@
+name: tla-finality
+
+# WP-S.3 Stage 2 (docs/consensus/CHECKPOINT_FINALITY_WIRING.md §8.4): bounded TLC
+# model checking of checkpoint finality (S1 no conflicting finality, S2 floor
+# integrity) plus mutation configs that must produce counterexamples. Gating.
+# Same script runs locally: scripts/ci/tla_finality.sh
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'specs/tla/consensus/Checkpoint*'
+      - 'scripts/ci/tla_finality.sh'
+      - 'core/consensus/src/checkpoint*.rs'
+      - 'node/src/finality_*.rs'
+      - '.github/workflows/tla-finality.yml'
+  pull_request:
+    paths:
+      - 'specs/tla/consensus/Checkpoint*'
+      - 'scripts/ci/tla_finality.sh'
+      - 'core/consensus/src/checkpoint*.rs'
+      - 'node/src/finality_*.rs'
+      - '.github/workflows/tla-finality.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tla-finality-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  tlc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Java (runner-provided)
+        run: java -version
+      - name: TLC — checkpoint finality S1/S2 (bounded) + mutation configs
+        run: bash scripts/ci/tla_finality.sh
