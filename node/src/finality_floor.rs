@@ -72,7 +72,19 @@
 //     mismatch once the certified block is confirmed canonical.
 //
 // So when finalization becomes visible, either the floor covers the certified
-// block or the gadget is halted (proposes / signs nothing). In both non-matching
+// block or the gadget is halted (proposes / signs nothing).
+//
+// PUBLICATION AFTER PERSISTENCE (review of #335 @ db243a1). The guard raises
+// the floor but never PUBLISHES: it runs before the certificate is persisted,
+// and the floor is in memory only, so a block reported finalized there and then
+// lost to a crash before persistence could be reorged out after the restart.
+// The finalized/safe RPC pair (and the verified-height metric) advance only in
+// [`FloorVerifier::after_finalize`] — once the manager has written the
+// certificate, with the same (height, hash) re-confirmed under the advance
+// lock and no safety stop in force — or from the poll; and every publication
+// path first requires the exact certificate to be in the persistent store
+// (`CheckpointManager::is_certificate_persisted`), so a failed write is never
+// published either. In both non-matching
 // cases the pair is also registered with the applicator
 // (`CanonicalApplicator::register_certified`): every later reorg re-checks it
 // under the advance lock and raises the floor first if the certified block has
@@ -311,10 +323,21 @@ impl FloorVerifier {
         }
     }
 
-    /// Publish a verified, matching `(height, hash)`.
-    fn record_verified(&self, height: u64, hash: Hash) {
+    /// Publish a verified, matching `(height, hash)` — only if its certificate
+    /// is in the persistent store, so a restart reloads it (and restores the
+    /// floor from it) before any reorg. Returns whether it was published.
+    fn record_verified(&self, height: u64, hash: Hash) -> bool {
+        if !self.manager.is_certificate_persisted(height, &hash) {
+            warn!(
+                "checkpoint finality: finalized block {} @ {} is not published (finalized/safe \
+                 RPC tags unchanged): its certificate is not in the persistent store",
+                hash, height
+            );
+            return false;
+        }
         self.verified_height.fetch_max(height, Ordering::SeqCst);
         self.verified_pairs.record(height, hash);
+        true
     }
 
     /// The current safety stop, if any.
@@ -499,7 +522,7 @@ impl FloorVerifier {
                     );
                     st.halt = None;
                     recovered = true;
-                    self.record_verified(height, certified);
+                    let _ = self.record_verified(height, certified);
                     self.gadget_halt.clear().await;
                 }
                 FloorCheck::Mismatch { canonical } => {
@@ -548,7 +571,7 @@ impl FloorVerifier {
             .await
         {
             FloorCheck::Match => {
-                self.record_verified(cert.height, cert.block_hash);
+                let _ = self.record_verified(cert.height, cert.block_hash);
                 self.publish(false);
                 FloorTick::Verified {
                     height: cert.height,
@@ -600,7 +623,9 @@ impl FloorVerifier {
     /// FINALIZATION"). Runs from `CheckpointManager::finalize_checkpoint` before
     /// the certificate is persisted or the latest finalized height moves. Same
     /// verification as [`Self::tick`]'s main path, under the same verifier
-    /// state lock and advance lock. Returns `None` outside Enforced mode.
+    /// state lock and advance lock, but it raises the floor WITHOUT publishing:
+    /// the RPC tags advance only after persistence ([`Self::after_finalize`]).
+    /// Returns `None` outside Enforced mode.
     pub async fn on_finalize(&self, cert: &Checkpoint) -> Option<FloorTick> {
         if !self.mode.raises_floor() {
             return None;
@@ -630,7 +655,7 @@ impl FloorVerifier {
                     // until the poll clears it.
                     return Some(self.still_halted(&st).await);
                 }
-                self.record_verified(cert.height, cert.block_hash);
+                // Not published here: the certificate is not persisted yet.
                 self.publish(false);
                 info!(
                     "checkpoint finality: finalized block {} @ {} is canonical on this node; \
@@ -665,6 +690,54 @@ impl FloorVerifier {
             return Some(self.still_halted(&st).await);
         }
         Some(self.enter_halt(&mut st, reason).await)
+    }
+
+    /// Publication after finalization (Enforced; module docs, "PUBLICATION
+    /// AFTER PERSISTENCE"). Runs from `CheckpointManager::finalize_checkpoint`
+    /// once the certificate write has been attempted and the finalization is
+    /// visible. Publishes `cert`'s exact (height, hash) only if no safety stop
+    /// is in force, the certificate still verifies, the pair is confirmed
+    /// canonical with the floor at or above it under the advance lock (the
+    /// guard raised it), and the certificate is persisted. Otherwise publishes
+    /// nothing and leaves it to the poll. Returns `None` outside Enforced mode.
+    pub async fn after_finalize(&self, cert: &Checkpoint) -> Option<FloorTick> {
+        if !self.mode.raises_floor() {
+            return None;
+        }
+        let st = self.state.lock().await;
+        if st.halt.is_some() {
+            return Some(self.still_halted(&st).await);
+        }
+        if let Err(e) = cert.verify_certificate(self.chain_id) {
+            // Left to the poll, which halts on it.
+            return Some(FloorTick::Unverifiable(e.to_string()));
+        }
+        match self
+            .applicator
+            .verify_certified_floor(cert.height, cert.block_hash, true)
+            .await
+        {
+            FloorCheck::Match => {
+                let published = self.record_verified(cert.height, cert.block_hash);
+                self.publish(false);
+                if published {
+                    info!(
+                        "checkpoint finality: finalized block {} @ {} persisted; finalized/safe \
+                         RPC tags advanced",
+                        cert.block_hash, cert.height
+                    );
+                }
+                Some(FloorTick::Verified {
+                    height: cert.height,
+                    floor_raised: true,
+                    recovered: false,
+                })
+            }
+            other => Some(FloorTick::Unverifiable(format!(
+                "finalized block {} @ {} not confirmed after finalization: {:?}",
+                cert.block_hash, cert.height, other
+            ))),
+        }
     }
 
     /// Spawn the periodic pass (every [`FLOOR_POLL_SECS`]). `None` in Legacy
@@ -788,6 +861,12 @@ impl FinalizationGuard for FinalizeHook {
     async fn before_finalize(&self, certificate: &Checkpoint) {
         if let Some(verifier) = self.0.upgrade() {
             let _ = verifier.on_finalize(certificate).await;
+        }
+    }
+
+    async fn after_finalize(&self, certificate: &Checkpoint) {
+        if let Some(verifier) = self.0.upgrade() {
+            let _ = verifier.after_finalize(certificate).await;
         }
     }
 }
@@ -928,6 +1007,7 @@ mod tests {
             assert!(!v.install_finalization_guard(), "{mode:?}");
             assert!(!mgr.has_finalization_guard(), "{mode:?}");
             assert_eq!(v.on_finalize(&cert).await, None, "{mode:?}");
+            assert_eq!(v.after_finalize(&cert).await, None, "{mode:?}");
             assert_eq!(load(&app.finalized_height_handle()), 0, "{mode:?}");
             assert!(app.certified_pending().is_empty(), "{mode:?}");
         }
@@ -946,8 +1026,29 @@ mod tests {
             })
         );
         assert_eq!(load(&r.floor), 2);
-        assert_eq!(load(&r.verified), 2);
+        assert_eq!(load(&r.verified), 0, "not published before persistence");
         assert!(app.certified_pending().is_empty(), "settled on a match");
+        // Published only by the post-finalization hook, and only once the
+        // certificate is persisted.
+        assert_eq!(
+            v.after_finalize(&cert).await,
+            Some(FloorTick::Verified {
+                height: 2,
+                floor_raised: true,
+                recovered: false
+            })
+        );
+        assert_eq!(load(&r.verified), 0, "certificate not persisted");
+        persist_certificate(&storage, &cert);
+        let _ = v.after_finalize(&cert).await;
+        assert_eq!(load(&r.verified), 2);
+        assert_eq!(
+            v.rpc_finalized_handle().resolve(&storage),
+            FinalizedAnchor {
+                height: 2,
+                hash: Some(a2.header.block_hash)
+            }
+        );
     }
 
     /// Enforced: a certificate that does not verify, handed to the

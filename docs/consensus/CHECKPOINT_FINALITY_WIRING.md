@@ -283,6 +283,23 @@ canonical here.) It holds only verified quorum certificates above the floor and 
 while the node is off the certified chain. The poll stays as a backstop. Legacy and Observed
 install no guard (unchanged).
 
+**Publication after persistence (Enforced).** The guard raises the floor but does NOT publish:
+it runs before the certificate is persisted, and the floor is in memory, so a block reported
+finalized there and lost to a crash before the write could be reorged out after the restart
+(review of #335 @ db243a1). The `finalized`/`safe` RPC pair and the verified-height metric
+advance only in the manager's post-finalization hook (`FinalizationGuard::after_finalize` →
+`FloorVerifier::after_finalize`: no safety stop in force, certificate re-verified, the exact
+`(height, hash)` re-confirmed canonical under the advance lock) or from the poll, and every
+publication path first requires that exact certificate in the persistent store
+(`CheckpointManager::is_certificate_persisted`), so a failed write is never published either.
+Durability is RocksDB's default write (WAL, not fsynced per write): it survives a process
+crash, not a host power loss. Tests:
+`s2_rpc_finalized_is_published_only_after_the_certificate_is_persisted` (guard runs, crash
+before persistence, restart: nothing was published and the rebuild below 4 proceeds; once
+persisted the pair is published and after a restart the same rebuild is refused) and
+`s2_cleared_stop_does_not_publish_an_unpersisted_certificate`. The TLA+ model does not model
+RPC publication (finalize and persist are one step there).
+
 **Restart (Enforced).** The floor and the registered set are in memory. When the boot check's
 latest certificate does not raise the floor (mismatch, not yet applied, unverifiable),
 `FloorVerifier::restore_certified_floor` walks EVERY stored certificate highest first — the

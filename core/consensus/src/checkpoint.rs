@@ -474,11 +474,25 @@ pub(crate) fn verify_vote_signature(
 ///
 /// Called with no manager lock held (only the manager's finalization mutex, which
 /// serializes finalizations), so the hook may read the manager.
+///
+/// PUBLICATION. `before_finalize` must not PUBLISH the finalization (e.g. the
+/// finalized/safe RPC tags): the certificate is not persisted yet, so a crash
+/// before persistence would restart without it and could abandon a block
+/// already reported as finalized. Publication belongs in
+/// [`Self::after_finalize`], which runs once the certificate record has been
+/// written (check [`CheckpointManager::is_certificate_persisted`]: the write
+/// can fail).
 #[async_trait::async_trait]
 pub trait FinalizationGuard: Send + Sync {
     /// `certificate` has `status == Finalized`, a committee of at least
     /// [`MIN_FINALITY_COMMITTEE`] and its derived quorum of votes.
     async fn before_finalize(&self, certificate: &Checkpoint);
+
+    /// Runs after the finalization is visible: the block marked in the DAG
+    /// store, the certificate persistence attempted, the latest finalized
+    /// height and the in-memory record updated. No manager lock is held (only
+    /// the finalization mutex). Default: nothing.
+    async fn after_finalize(&self, _certificate: &Checkpoint) {}
 }
 
 /// Checkpoint manager — proposes, collects votes, and finalizes checkpoints.
@@ -628,6 +642,27 @@ impl CheckpointManager {
             return None;
         }
         self.get_checkpoint(height).await
+    }
+
+    /// Whether the finalized certificate for `(height, block_hash)` is in the
+    /// persistent store (`DAG_METADATA` `checkpoint:{height}`), i.e. a restart
+    /// would load it. `false` without a persistent backend, when the record is
+    /// absent or unreadable, or when it names another block. The finality floor
+    /// verifier publishes a finalized pair (RPC `finalized`/`safe`) only once
+    /// this holds.
+    pub fn is_certificate_persisted(&self, height: u64, block_hash: &Hash) -> bool {
+        let Some(kv) = self.persistent.as_ref() else {
+            return false;
+        };
+        let key = format!("checkpoint:{}", height);
+        match kv.kv_get(cf::DAG_METADATA, key.as_bytes()) {
+            Ok(Some(bytes)) => bincode::deserialize::<Checkpoint>(&bytes).is_ok_and(|cp| {
+                cp.status == CheckpointStatus::Finalized
+                    && cp.height == height
+                    && cp.block_hash == *block_hash
+            }),
+            _ => false,
+        }
     }
 
     /// Every height holding a finalized certificate — the in-memory window AND
@@ -1004,6 +1039,7 @@ impl CheckpointManager {
         if height > *latest {
             *latest = height;
         }
+        drop(latest);
 
         info!(
             "Finalized checkpoint at height {} with {}/{} votes",
@@ -1022,6 +1058,12 @@ impl CheckpointManager {
         let mut voted = self.voted.write().await;
         voted.retain(|(h, _)| *h != height);
         drop(voted);
+        drop(pending);
+
+        // Still under `finalize_serial`, with no other manager lock held.
+        if let Some(guard) = self.finalization_guard.get() {
+            guard.after_finalize(&cp).await;
+        }
 
         Ok(cp)
     }
@@ -1493,11 +1535,17 @@ mod tests {
         );
     }
 
+    /// (height, hash, latest finalized height, readable, persisted).
+    type AfterSeen = (u64, Hash, u64, bool, bool);
+
     /// Records what was visible on the manager when the guard ran.
     #[derive(Default)]
     struct ProbeGuard {
         mgr: std::sync::Mutex<Option<std::sync::Weak<CheckpointManager>>>,
         seen: std::sync::Mutex<Vec<(u64, Hash, u64, bool)>>,
+        /// What `after_finalize` saw: (height, hash, latest finalized height,
+        /// certificate readable, certificate persisted).
+        after: std::sync::Mutex<Vec<AfterSeen>>,
         /// Prune pending checkpoints at or below this height from inside the
         /// guard (simulates an eviction racing the finalization).
         prune_during: Option<u64>,
@@ -1526,6 +1574,29 @@ mod tests {
             if let Some(floor) = self.prune_during {
                 mgr.prune_at_or_below(floor).await;
             }
+        }
+
+        async fn after_finalize(&self, certificate: &Checkpoint) {
+            let mgr = self
+                .mgr
+                .lock()
+                .expect("probe lock")
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+                .expect("manager alive");
+            // Reads every manager lock: proves none is held here.
+            let latest = mgr.latest_finalized_height().await;
+            let stored = mgr.get_checkpoint(certificate.height).await.is_some();
+            let _ = mgr.pending_len().await;
+            let persisted =
+                mgr.is_certificate_persisted(certificate.height, &certificate.block_hash);
+            self.after.lock().expect("probe lock").push((
+                certificate.height,
+                certificate.block_hash,
+                latest,
+                stored,
+                persisted,
+            ));
         }
     }
 
@@ -1583,6 +1654,12 @@ mod tests {
             &[(5, b5, 0, false)],
             "guard saw the certificate while nothing was finalized yet"
         );
+        assert_eq!(
+            probe.after.lock().expect("probe lock").as_slice(),
+            &[(5, b5, 5, true, false)],
+            "after_finalize runs once the finalization is visible; no persistent \
+             backend here, so the certificate is never reported persisted"
+        );
         assert_eq!(mgr.latest_finalized_height().await, 5);
         assert!(matches!(
             mgr.finalize_checkpoint(5).await,
@@ -1593,6 +1670,7 @@ mod tests {
             1,
             "guard once per finalization"
         );
+        assert_eq!(probe.after.lock().expect("probe lock").len(), 1);
     }
 
     /// A pending checkpoint pruned while the guard runs still finalizes as the

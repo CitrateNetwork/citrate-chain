@@ -1386,6 +1386,165 @@ async fn s2_certificate_not_yet_applied_pauses_then_protects_on_return() {
     assert!(!net.node(3).gadget.halted());
 }
 
+/// S2 publication (review of #335 @ db243a1): the finalization-time guard
+/// raises the floor BEFORE the certificate is persisted, so it must not publish
+/// the finalized/safe RPC pair — a crash in that interval restarts without the
+/// certificate (and with the in-memory floor lost), and a block already
+/// reported finalized could then be reorged out. The pair is published only
+/// once the certificate is in the persistent store; after that a restart
+/// restores the floor from it and refuses the same reorg.
+#[tokio::test]
+async fn s2_rpc_finalized_is_published_only_after_the_certificate_is_persisted() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let committee: Vec<PublicKey> = keys.iter().map(pk).collect();
+    let signers: Vec<&Ed25519SigningKey> = keys.iter().take(3).collect();
+    let cfg = config(100);
+    let mut node = TestNode::boot(key(0), &vals, cfg.clone()).await;
+    let genesis_state = node.exec.state_snapshot();
+    let a = chains.main(8);
+    node.follow(&a).await;
+    let b = chains.branch(&a, 3, 10, VRF_B);
+    for blk in &b {
+        node.import(blk).await;
+    }
+    let cert = certificate(4, hash_at(&a, 4), &committee, &signers, CHAIN);
+
+    // The guard (CheckpointManager::finalize_checkpoint's pre-finalization
+    // hook) runs: floor raised, nothing published.
+    assert_eq!(node.verifier.on_finalize(&cert).await, Some(verified(4)));
+    assert_eq!(node.floor(), 4, "floor raised at finalization");
+    assert_eq!(
+        node.rpc_finalized(),
+        FinalizedAnchor::GENESIS,
+        "nothing published before the certificate is persisted"
+    );
+    // The certificate write did not happen (or failed): the post-finalization
+    // hook and the poll still publish nothing.
+    assert!(!node.mgr().is_certificate_persisted(4, &hash_at(&a, 4)));
+    assert_eq!(node.verifier.after_finalize(&cert).await, Some(verified(4)));
+    assert_eq!(node.rpc_finalized(), FinalizedAnchor::GENESIS);
+    assert_eq!(node.tick().await, FloorTick::NoCertificate);
+    assert_eq!(node.rpc_finalized(), FinalizedAnchor::GENESIS);
+
+    // Crash in that interval: the restart has neither the certificate nor the
+    // floor, so a rebuild abandoning A4 proceeds — and no block it abandons was
+    // ever reported finalized.
+    let (node, boot) = node.restart(&vals, cfg.clone()).await;
+    assert_eq!(boot, FloorTick::NoCertificate);
+    assert_eq!(node.floor(), 0);
+    assert_eq!(node.rpc_finalized(), FinalizedAnchor::GENESIS);
+    *node.head.lock() = Some(hash_at(&b, 10));
+    assert!(
+        node.app
+            .recover_to_head(genesis_state.clone(), Hash::default())
+            .await
+            .expect("recovery call returns"),
+        "nothing finalized here after the restart: the rebuild proceeds"
+    );
+    assert_eq!(node.app.applied_tip().await.hash, hash_at(&b, 10));
+    *node.head.lock() = Some(hash_at(&a, 8));
+    assert!(
+        node.app
+            .recover_to_head(genesis_state.clone(), Hash::default())
+            .await
+            .expect("recovery call returns"),
+        "back onto A"
+    );
+    assert_eq!(node.app.applied_tip().await.hash, hash_at(&a, 8));
+
+    // The certificate is persisted (as finalize_checkpoint does before the
+    // post-finalization hook): now, and only now, the pair is published.
+    assert_eq!(node.verifier.on_finalize(&cert).await, Some(verified(4)));
+    assert_eq!(node.rpc_finalized(), FinalizedAnchor::GENESIS);
+    write_certificate(&node.storage, &cert);
+    assert!(node.mgr().is_certificate_persisted(4, &hash_at(&a, 4)));
+    assert_eq!(node.verifier.after_finalize(&cert).await, Some(verified(4)));
+    assert_eq!(
+        node.rpc_finalized(),
+        FinalizedAnchor {
+            height: 4,
+            hash: Some(hash_at(&a, 4))
+        }
+    );
+
+    // A crash after publication: the restart restores the floor from the stored
+    // certificate before anything else, so the same rebuild is refused.
+    let (node, boot) = node.restart(&vals, cfg).await;
+    assert_eq!(boot, verified(4));
+    assert_eq!(node.floor(), 4);
+    assert_eq!(
+        node.rpc_finalized(),
+        FinalizedAnchor {
+            height: 4,
+            hash: Some(hash_at(&a, 4))
+        }
+    );
+    *node.head.lock() = Some(hash_at(&b, 10));
+    assert!(
+        !node
+            .app
+            .recover_to_head(genesis_state, Hash::default())
+            .await
+            .expect("recovery call returns"),
+        "S2: a block published as finalized must not be abandoned after a restart"
+    );
+    assert_eq!(node.app.applied_tip().await.hash, hash_at(&a, 8));
+    assert_eq!(node.floor(), 4);
+}
+
+/// S2 publication, recovery variant: an `Unconfirmed` stop entered at
+/// finalization (certified block above the applied tip) clears on the poll once
+/// the block is applied — the floor is raised then — but the pair is still not
+/// published while its certificate is not persisted. A safety stop in force
+/// also blocks the post-finalization publication.
+#[tokio::test]
+async fn s2_cleared_stop_does_not_publish_an_unpersisted_certificate() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let committee: Vec<PublicKey> = keys.iter().map(pk).collect();
+    let signers: Vec<&Ed25519SigningKey> = keys.iter().take(3).collect();
+    let mut node = TestNode::boot(key(0), &vals, config(100)).await;
+    let a = chains.main(8);
+    node.follow(a.get(..3).expect("A1..A3")).await;
+    let cert = certificate(4, hash_at(&a, 4), &committee, &signers, CHAIN);
+    let t = node.verifier.on_finalize(&cert).await;
+    assert!(
+        matches!(
+            &t,
+            Some(FloorTick::Halted(HaltReason::Unconfirmed { height: 4, .. }))
+        ),
+        "{t:?}"
+    );
+    // A stop is in force: the post-finalization hook publishes nothing.
+    assert!(matches!(
+        node.verifier.after_finalize(&cert).await,
+        Some(FloorTick::Halted(_))
+    ));
+    assert_eq!(node.rpc_finalized(), FinalizedAnchor::GENESIS);
+    node.follow(&a).await;
+    let t = node.tick().await;
+    assert!(matches!(t, FloorTick::NoCertificate), "{t:?}");
+    assert!(!node.gadget.halted(), "stop cleared: A4 is canonical");
+    assert_eq!(node.floor(), 4, "floor raised when the stop cleared");
+    assert_eq!(
+        node.rpc_finalized(),
+        FinalizedAnchor::GENESIS,
+        "not published: the certificate is not persisted"
+    );
+    write_certificate(&node.storage, &cert);
+    assert_eq!(node.verifier.after_finalize(&cert).await, Some(verified(4)));
+    assert_eq!(
+        node.rpc_finalized(),
+        FinalizedAnchor {
+            height: 4,
+            hash: Some(hash_at(&a, 4))
+        }
+    );
+}
+
 /// An `Unconfirmed` stop becomes a mismatch (with the alarm) once the node's
 /// chain is found to hold another block at the certified height.
 #[tokio::test]
