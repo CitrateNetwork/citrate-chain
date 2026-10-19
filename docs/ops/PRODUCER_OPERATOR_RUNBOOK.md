@@ -259,14 +259,17 @@ The height watchdog restarts a producer whose progress has stopped. It runs ever
 install -m 0755 scripts/ops/watchdog/citrate-height-watchdog.sh scripts/ops/watchdog/citrate-watchdog-ctl.sh /usr/local/bin/
 cp scripts/ops/watchdog/citrate-height-watchdog.{service,timer} /etc/systemd/system/
 systemctl daemon-reload && systemctl enable --now citrate-height-watchdog.timer
+citrate-watchdog-ctl.sh resume    # arms it; status must then say ACTIVE
 ```
+
+It fails closed: it restarts the node only while it is armed (`resume` arms it) and not paused or contained. A fresh install, or a pause file deleted by hand, leaves it restarting nothing and alerting hourly that it is disarmed. The guarantees `pause` gives, and the code and tests behind each one, are listed in `scripts/ops/watchdog/README.md` ("Invariants").
 
 It is sync-aware: while the node reports `eth_syncing`, it tracks `currentBlock`, not the head. That isn't enough on its own. **A restart during a replay throws the replay away**, and some replays hold the head still without reporting progress (a drain after a rollback, a state copy, a rebuild). Restarting a node mid-replay turned a recoverable state rebuild into a halt on 2026-09-27. So:
 
-- **Pause before** any replay, drain, rollback, state copy, data reset or planned rebuild: `citrate-watchdog-ctl.sh pause <hours> "<reason>"` (1–48 h). It returns only after any poll already running has finished; if it prints `NOT confirmed`, don't start the work until a re-run succeeds.
+- **Pause before** any replay, drain, rollback, state copy, data reset or planned rebuild: `citrate-watchdog-ctl.sh pause <hours> "<reason>"` (1–48 h). It returns only after any poll already running has finished, and it waits for any other pause, resume or containment command to finish first; if it prints `NOT confirmed`, don't start the work until a re-run succeeds.
 - While paused it restarts nothing. A pause doesn't lift itself: after its deadline the watchdog alerts once an hour, still without restarting, until someone resumes it.
 - **Resume after** the node is caught up (`eth_syncing` false, head within 5 blocks of the public RPC): `citrate-watchdog-ctl.sh resume`. Resuming resets the stall clock, so the first poll can't restart a node that is merely catching up.
-- `citrate-watchdog-ctl.sh status` shows the state.
+- `citrate-watchdog-ctl.sh status` shows the state: `ACTIVE`, `PAUSED`, `CONTAINED` or `DISARMED`.
 - **Incidents are not pauses.** For a suspected key compromise use `citrate-watchdog-ctl.sh contain` (§11), never `pause` plus `systemctl stop`: a pause is meant to be lifted, and containment turns the watchdog off before the node stops.
 
 Alerts go through `/usr/local/bin/citrate-alert.sh "<title>" "<body>"`. Provide your own (email, pager, chat webhook), executable by root. Set `NODE_LABEL` in a drop-in for the watchdog service if your hostname isn't descriptive.
@@ -305,7 +308,7 @@ With `CITRATE_METRICS=1` (set by the generated env file) the node serves Prometh
 
   Don't use a bare `systemctl stop citrate-node`: the watchdog (§9) restarts a node whose RPC has been unreachable for 3 minutes, which would bring the signer back online. `contain` turns the watchdog off first, in this order: it writes a containment marker the watchdog obeys on every poll with no deadline, waits for a poll already running to finish (the poll lock), disables and stops `citrate-height-watchdog.timer` and its service, and only then stops and disables `citrate-node`, so neither the watchdog nor a reboot starts it again. It stops at the first step that fails and says which one. If it fails, stop the node by hand after the watchdog is off. While contained, `resume` is refused. Check with `citrate-watchdog-ctl.sh status` (shows `CONTAINED`) and `systemctl is-active citrate-node citrate-height-watchdog.timer` (both `inactive`).
 
-  Then email security@citrate.ai. Don't post details publicly. See `SECURITY.md`. Only after the security response is done does `citrate-watchdog-ctl.sh release "<reason>"` lift the containment; it starts nothing, and the node and the watchdog timer are started again by hand when the chain team says so.
+  Then email security@citrate.ai. Don't post details publicly. See `SECURITY.md`. Only after the security response is done does `citrate-watchdog-ctl.sh release "<reason>"` lift the containment; it starts nothing and leaves the watchdog disarmed. The node and the watchdog timer are started again by hand when the chain team says so, followed by `citrate-watchdog-ctl.sh resume` to arm the watchdog.
 - **Chain halt or fork:** pause the watchdog, don't restart in a loop, collect `journalctl -u citrate-node --since -1h`, and contact the chain team. Don't roll back or wipe anything unless they ask. Any rollback uses `citrate-node rollback` with the chain team's exact height and hash.
 
 ## Appendix: the tools

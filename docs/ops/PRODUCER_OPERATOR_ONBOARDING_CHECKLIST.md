@@ -46,7 +46,7 @@ Use one copy of §2 per operator. The goal for rehearsal 1 (2026-11-13) is **at 
 ### Software (runbook §3)
 
 - [ ] The installed release tag, and the `citrate-node consensus` fingerprint they see (it must equal the announced one)
-- [ ] The watchdog installed, with the alert hook pointing at their on-call (`citrate-watchdog-ctl.sh status` output)
+- [ ] The watchdog installed, with the alert hook pointing at their on-call (`citrate-watchdog-ctl.sh status` output, showing `ACTIVE`)
 
 ## 3. Chain-team actions per operator, in order
 
