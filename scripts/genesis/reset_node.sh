@@ -4,7 +4,9 @@
 # Generalized from the r1005 reroll's reset-node script (2026-10-05). For one node it:
 #   1. pauses the height watchdog timer (re-enabled by hand once the chain is past genesis;
 #      a watchdog that restarts a node mid-replay caused the 2026-09-27 replay loop);
-#   2. stops the node service;
+#   2. stops the node service. The watchdog timer, its service and the node must all report
+#      inactive (or failed) afterwards, or the reset aborts before touching the binary or
+#      the data dir;
 #   3. installs the staged binary, after checking its sha256 when EXPECTED_BIN_SHA256 is set
 #      (every node must run the same build);
 #   4. ARCHIVES the data dir (a move, never a delete: the old chain stays recoverable) and
@@ -28,7 +30,8 @@
 # Env (defaults are the fleet layout): CITRATE_HOME=/home/citrate  DATA_DIR=$CITRATE_HOME/.citrate
 #   BIN=$CITRATE_HOME/bin/citrate-node  NEW_BIN=$BIN.new  SERVICE=citrate-node
 #   DROPIN=/etc/systemd/system/$SERVICE.service.d/reroll.conf  WATCHDOG_TIMER=citrate-height-watchdog.timer
-#   NODE_OWNER=citrate:citrate (empty = no chown)  SYSTEMCTL=systemctl  EXPECTED_BIN_SHA256 (optional)
+#   WATCHDOG_SERVICE=<timer name>.service  NODE_OWNER=citrate:citrate (empty = no chown)
+#   SYSTEMCTL=systemctl  EXPECTED_BIN_SHA256 (optional)
 #
 # Exit: 0 ok · 1 precondition failed · 2 usage
 set -euo pipefail
@@ -101,9 +104,25 @@ if [[ $CONFIRM -ne 1 ]]; then
 fi
 
 # ---- execute ----
-"$SYSTEMCTL" stop "$WATCHDOG_TIMER" 2>/dev/null || true
-log "watchdog timer: $("$SYSTEMCTL" is-active "$WATCHDOG_TIMER" 2>/dev/null || echo inactive)"
-"$SYSTEMCTL" stop "$SERVICE" || true
+# Nothing on disk is touched until the watchdog (timer and its service) and the node are
+# confirmed stopped. `is-active` must answer exactly inactive or failed; anything else
+# (active, activating, deactivating, reloading, no answer) aborts the reset.
+unit_state() { { "$SYSTEMCTL" is-active "$1" 2>/dev/null || true; } | head -n1; }
+require_stopped() { # unit what
+  local st
+  st=$(unit_state "$1")
+  case "$st" in
+    inactive | failed) log "$2 $1: $st" ;;
+    *) die "$2 $1 is '${st:-unknown}' after stop; aborting before any file is changed (binary and data dir untouched)" 1 ;;
+  esac
+}
+WATCHDOG_SERVICE="${WATCHDOG_SERVICE:-${WATCHDOG_TIMER%.timer}.service}"
+# The timer may not exist on every node, so a failed stop is judged by the state check below.
+"$SYSTEMCTL" stop "$WATCHDOG_TIMER" 2>/dev/null || log "watchdog timer stop returned non-zero; checking its state"
+require_stopped "$WATCHDOG_TIMER" "watchdog timer"
+require_stopped "$WATCHDOG_SERVICE" "watchdog service"
+"$SYSTEMCTL" stop "$SERVICE" || die "systemctl stop $SERVICE failed; aborting before any file is changed" 1
+require_stopped "$SERVICE" "node service"
 
 cp -a "$BIN" "${BIN}.pregenesis-${TS}" 2>/dev/null || true
 install -m 0755 "$NEW" "$BIN"

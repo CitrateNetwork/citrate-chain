@@ -50,7 +50,7 @@ cat >"$BIN/cast" <<'EOF'
 #!/usr/bin/env bash
 # Fake cast. Reads canned answers from $FAKE; logs every call.
 echo "cast $*" >>"$FAKE/calls.log"
-rpc=""; args=()
+rpc=""; field=""; args=()
 while [[ $# -gt 0 ]]; do
   case "$1" in --rpc-url) rpc="$2"; shift 2 ;; --field) field="$2"; shift 2 ;; *) args+=("$1"); shift ;; esac
 done
@@ -61,7 +61,12 @@ case "${args[0]}" in
   storage) a=$(printf '%s' "${args[1]}" | tr 'A-F' 'a-f'); cat "$FAKE/impl/$a" 2>/dev/null || printf '0x%064d\n' 0 ;;
   chain-id) [[ -f "$d/chain-id" ]] || exit 1; cat "$d/chain-id" ;;
   block-number) [[ -f "$d/head" ]] || exit 1; cat "$d/head" ;;
-  block) [[ -f "$d/block-${args[1]}" ]] || exit 1; cat "$d/block-${args[1]}" ;;
+  block)
+    if [[ "${field:-}" == timestamp ]]; then
+      [[ -f "$d/block-${args[1]}-timestamp" ]] || exit 1; cat "$d/block-${args[1]}-timestamp"
+    else
+      [[ -f "$d/block-${args[1]}" ]] || exit 1; cat "$d/block-${args[1]}"
+    fi ;;
   nonce) cat "$d/nonce" 2>/dev/null || echo 0 ;;
   *) echo "fake cast: unsupported ${args[*]}" >&2; exit 9 ;;
 esac
@@ -76,8 +81,15 @@ fi
 EOF
 cat >"$BIN/systemctl" <<'EOF'
 #!/usr/bin/env bash
+# Fake systemctl. FAKE_STOP_FAILS / FAKE_STILL_ACTIVE: space-separated unit names whose stop
+# returns non-zero / which still report active afterwards.
 echo "systemctl $*" >>"$FAKE/calls.log"
-[[ "$1" == is-active ]] && echo inactive
+case "$1" in
+  stop) [[ " ${FAKE_STOP_FAILS:-} " == *" $2 "* ]] && exit 1 ;;
+  is-active)
+    if [[ " ${FAKE_STILL_ACTIVE:-} " == *" $2 "* ]]; then echo active; exit 0; fi
+    echo inactive; exit 3 ;;
+esac
 exit 0
 EOF
 chmod +x "$BIN"/*
@@ -135,12 +147,38 @@ ROOTMOVED="$T/rootmoved.json"
 sed "s/\"Vault\":\"$A3\"}/\"Vault\":\"$(addr 998)\"}/" "$BOOK" >"$ROOTMOVED"
 expect "keep: a root-level pin that disagrees fails" 1 'Vault book.<root> moved' -- env RPC=http://r1 ADDRESS_BOOK="$ROOTMOVED" bash "$KC" verify "$LIST"
 
+mkdir -p "$(rpcdir http://r1)"
+echo 40204 >"$(rpcdir http://r1)/chain-id"
 BC="$T/broadcast/DeployX.s.sol/40204"
 mkdir -p "$BC"
-printf '{"transactions":[{"transactionType":"CREATE2","contractName":"Alpha","contractAddress":"%s"}]}' "$(addr 777)" >"$BC/run-latest.json"
-expect "keep: a broadcast that redeploys a kept contract fails" 1 'Alpha redeployed by DeployX.s.sol' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST"
-printf '{"transactions":[{"transactionType":"CREATE2","contractName":"Other","contractAddress":"%s"}]}' "$(addr 777)" >"$BC/run-latest.json"
-expect "keep: an unrelated broadcast passes" 0 'no broadcast under' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST"
+run_json() { # timestamp name address
+  printf '{"timestamp":%s,"transactions":[{"transactionType":"CREATE2","contractName":"%s","contractAddress":"%s"}]}' "$1" "$2" "$3"
+}
+run_json 2000 Alpha "$(addr 777)" >"$BC/run-latest.json"
+expect "keep: a broadcast that redeploys a kept contract elsewhere fails" 1 'DeployX.s.sol redeploys Alpha at 0x0+309 \(not the pinned' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST"
+run_json 2000 Other "$(addr 777)" >"$BC/run-latest.json"
+expect "keep: an unrelated broadcast passes" 0 'no chain-40204 broadcast' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST"
+# The deterministic genesis replay deploys the kept contract AT its pinned address: that passes.
+run_json 2000 Alpha "$(printf '%s' "$A1" | tr 'a-f' 'A-F' | sed 's/^0X/0x/')" >"$BC/run-latest.json"
+expect "keep: a genesis deployment at the pinned address passes" 0 'deploys Alpha at 0x0+a1 \(the pinned address\)' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST"
+# Another chain's broadcasts are not evidence for this one.
+rm "$BC/run-latest.json"
+mkdir -p "$T/broadcast/DeployX.s.sol/31337"
+run_json 2000 Alpha "$(addr 777)" >"$T/broadcast/DeployX.s.sol/31337/run-latest.json"
+expect "keep: another chain's broadcast is ignored" 0 'no chain-40204 broadcast' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST"
+rm -r "$T/broadcast/DeployX.s.sol/31337"
+# A run from an earlier chain on the same chain id (before block 0) is ignored with BROADCAST_SINCE.
+run_json 1000 Alpha "$(addr 777)" >"$BC/run-latest.json"
+expect "keep: a run before BROADCAST_SINCE is ignored" 0 'KEEP-SKIP +DeployX.s.sol' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" BROADCAST_SINCE=1500 bash "$KC" verify "$LIST"
+expect "keep: the same run after BROADCAST_SINCE counts" 1 'redeploys Alpha' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" BROADCAST_SINCE=500 bash "$KC" verify "$LIST"
+run_json 1600000000000 Alpha "$(addr 777)" >"$BC/run-latest.json"
+expect "keep: a millisecond timestamp is compared in seconds" 0 'KEEP-SKIP' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" BROADCAST_SINCE=1700000000 bash "$KC" verify "$LIST"
+printf '{not json' >"$BC/run-latest.json"
+expect "keep: an unreadable broadcast fails" 1 'unreadable broadcast' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST"
+printf '{"transactions":[{"transactionType":"CREATE","contractName":"Alpha"}]}' >"$BC/run-latest.json"
+expect "keep: a kept deployment with no address fails" 1 'has no contractAddress' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST"
+expect "keep: broadcasts need a readable chain id" 1 'cannot read the chain id' -- env RPC=http://nochain BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST"
+rm -r "$T/broadcast"
 
 reset_calls
 expect "keep: --dry-run needs no RPC" 0 'KEEP dry run OK \(3 entries' -- bash "$KC" verify --dry-run "$LIST"
@@ -157,8 +195,6 @@ KEYS="$T/keys.tsv"
 ADDRESS_BOOK="$BOOK" bash "$KC" keys contracts >"$KEYS"
 if [[ $(grep -vc '^#' "$KEYS") -eq 3 ]] && ! grep -q Zero "$KEYS"; then ok "keep: keys lists the book's nonzero addresses"; else bad "keep: keys lists the book's nonzero addresses" "$(cat "$KEYS")"; fi
 sed -i 's/^Vault\tcontracts\tVault\tno$/Vault\tcontracts\t-\tyes/' "$KEYS"
-mkdir -p "$(rpcdir http://r1)"
-echo 40204 >"$(rpcdir http://r1)/chain-id"
 echo 1234 >"$(rpcdir http://r1)/head"
 PINNED="$T/pinned.tsv"
 if RPC=http://r1 ADDRESS_BOOK="$BOOK" bash "$KC" pin "$KEYS" >"$PINNED" 2>"$T/pin.err"; then ok "keep: pin records the chain"; else bad "keep: pin records the chain" "$(cat "$T/pin.err")"; fi
@@ -255,6 +291,30 @@ expect "reset: refuses a node without noise.key" 1 'noise.key is missing' -- "${
 setup_node
 expect "reset: refuses a binary with the wrong sha256" 1 'sha256 .* != EXPECTED_BIN_SHA256' -- "${RNENV[@]}" EXPECTED_BIN_SHA256="$(h64 0)" bash "$RN" --coinbase "$NEWCB" --validator-registry "$NEWVR" --activation-height 0 --confirm
 [[ -f "$T/node/home/.citrate/chaindata/000001.sst" ]] && ok "reset: a refused run changed nothing" || bad "reset: a refused run changed nothing"
+untouched() { # name: binary still old, data dir not archived, nothing replaced
+  if grep -q 'echo old' "$T/node/home/bin/citrate-node" && [[ -f "$T/node/home/.citrate/chaindata/000001.sst" ]] &&
+    ! ls -d "$T"/node/home/.citrate.pregenesis-* >/dev/null 2>&1; then
+    ok "$1"
+  else
+    bad "$1" "$(ls -A "$T/node/home" "$T/node/home/.citrate")"
+  fi
+}
+setup_node
+expect "reset: a node whose stop fails aborts" 1 'stop citrate-node failed' -- "${RNENV[@]}" FAKE_STOP_FAILS=citrate-node bash "$RN" --coinbase "$NEWCB" --validator-registry "$NEWVR" --activation-height 0 --confirm
+untouched "reset: failed node stop leaves binary and data untouched"
+setup_node
+expect "reset: a node still active after stop aborts" 1 "node service citrate-node is 'active'" -- "${RNENV[@]}" FAKE_STILL_ACTIVE=citrate-node bash "$RN" --coinbase "$NEWCB" --validator-registry "$NEWVR" --activation-height 0 --confirm
+untouched "reset: active node leaves binary and data untouched"
+setup_node
+reset_calls
+expect "reset: a watchdog timer still active aborts" 1 "watchdog timer citrate-height-watchdog.timer is 'active'" -- "${RNENV[@]}" FAKE_STOP_FAILS=citrate-height-watchdog.timer FAKE_STILL_ACTIVE=citrate-height-watchdog.timer bash "$RN" --coinbase "$NEWCB" --validator-registry "$NEWVR" --activation-height 0 --confirm
+untouched "reset: active watchdog timer leaves binary and data untouched"
+if ! calls | grep -q 'stop citrate-node$'; then ok "reset: node not stopped while the watchdog is up"; else bad "reset: node not stopped while the watchdog is up" "$(calls)"; fi
+setup_node
+expect "reset: a running watchdog service aborts" 1 "watchdog service citrate-height-watchdog.service is 'active'" -- "${RNENV[@]}" FAKE_STILL_ACTIVE=citrate-height-watchdog.service bash "$RN" --coinbase "$NEWCB" --validator-registry "$NEWVR" --activation-height 0 --confirm
+untouched "reset: running watchdog service leaves binary and data untouched"
+setup_node
+expect "reset: a missing watchdog timer (stop fails, inactive) still resets" 0 'NOT started' -- "${RNENV[@]}" FAKE_STOP_FAILS=citrate-height-watchdog.timer bash "$RN" --coinbase "$NEWCB" --validator-registry "$NEWVR" --activation-height 0 --confirm
 expect "reset: a malformed coinbase is a usage error" 2 'coinbase must be' -- "${RNENV[@]}" bash "$RN" --coinbase 0x12 --validator-registry "$NEWVR" --activation-height 0
 
 # ------------------------------------------------------------------ ceremony
@@ -301,6 +361,31 @@ printf '{"contracts":{"GovernanceTimelock":"%s","GuardianTimelock":"%s","Governa
 reset_calls
 expect "ceremony: P2 takes governance from P1's output" 0 'GOVERNANCE=0x0+1f GUARDIAN=0x0+20' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
 calls | grep -q 'regenesis --reroll --with-aa$' && ok "ceremony: simulate does not broadcast" || bad "ceremony: simulate does not broadcast" "$(calls)"
+
+# Resume paths: the safety preflight runs before any phase that talks to a chain.
+expect "ceremony: --confirm --from P1 to a remote RPC is refused" 3 'not loopback' -- "${CEENV[@]}" RPC_URL=https://rpc.example EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1 bash "$CE" --confirm --from P1 --account deployer
+expect "ceremony: --confirm --only P2 without --account is refused" 3 'needs --account' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --confirm --only P2
+expect "ceremony: --simulate --from P1 checks the chain id" 3 'chain id 1, want 40204' -- "${CEENV[@]}" RPC_URL=http://n3x bash "$CE" --simulate --from P1
+echo "0x$(h64 f)" >"$(rpcdir http://127.0.0.1:8545)/block-0"
+expect "ceremony: --simulate --only P3 checks the genesis hash" 3 'block 0 is 0x[f]+, want' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" bash "$CE" --simulate --only P3
+expect "ceremony: --simulate --from P4 checks the council floors" 3 'GOV threshold 2 is below' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GOV_THRESHOLD=2 bash "$CE" --simulate --from P4
+expect "ceremony: --simulate --only P2 checks the deployer seat" 3 'deployer must not hold' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GRD_OWNERS="$(owners 1 22 23)" bash "$CE" --simulate --only P2
+echo 5 >"$(rpcdir http://127.0.0.1:8545)/nonce"
+expect "ceremony: a resume does not require deployer nonce 0" 0 'P0 preflight PASS' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+expect "ceremony: a fresh ceremony requires deployer nonce 0" 3 'deployer nonce is 5' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate
+rm "$(rpcdir http://127.0.0.1:8545)/nonce" "$(rpcdir http://127.0.0.1:8545)/block-0"
+
+# P6 integration: the genesis replay's own broadcasts (deployments at the pinned addresses,
+# recorded after block 0) pass; a stale run from an earlier chain on the same id is ignored.
+echo 5000 >"$(rpcdir http://127.0.0.1:8545)/block-0-timestamp"
+mkdir -p "$REPO/contracts/broadcast/Regenesis.s.sol/40204" "$REPO/contracts/broadcast/Old.s.sol/40204"
+printf '{"timestamp":6000,"transactions":[{"transactionType":"CREATE2","contractName":"Alpha","contractAddress":"%s"}]}' "$A1" >"$REPO/contracts/broadcast/Regenesis.s.sol/40204/run-latest.json"
+printf '{"timestamp":100,"transactions":[{"transactionType":"CREATE2","contractName":"Alpha","contractAddress":"%s"}]}' "$(addr 777)" >"$REPO/contracts/broadcast/Old.s.sol/40204/run-latest.json"
+expect "ceremony: P6 passes the genesis deployments at their pins" 0 'KEEP gate PASS' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 KEEP_LIST="$LIST" bash "$CE" --simulate --only P6
+printf '{"timestamp":7000,"transactions":[{"transactionType":"CREATE2","contractName":"Alpha","contractAddress":"%s"}]}' "$(addr 777)" >"$REPO/contracts/broadcast/Old.s.sol/40204/run-latest.json"
+expect "ceremony: P6 fails a post-genesis redeploy away from the pin" 3 'keep_check failed' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 KEEP_LIST="$LIST" bash "$CE" --simulate --only P6
+rm "$(rpcdir http://127.0.0.1:8545)/block-0-timestamp"
+expect "ceremony: P6 needs the block-0 timestamp" 3 'block-0 timestamp' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 KEEP_LIST="$LIST" bash "$CE" --simulate --only P6
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

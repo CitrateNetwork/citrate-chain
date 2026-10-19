@@ -24,6 +24,10 @@
 #   --confirm          broadcasts. A non-loopback RPC_URL also needs CITRATE_ALLOW_REMOTE=1.
 #   --from Pn          resume at phase n after a fix (no phase is re-run blindly).
 #   --only Pn          run a single phase.
+#   The P0 safety preflight (inputs, governance floors, chain id, block-0 hash, remote-RPC
+#   authorization, deployer seat) runs on EVERY --simulate/--confirm invocation, including
+#   --from and --only. Only the fresh-deployer nonce-0 check is limited to a new ceremony
+#   (no --from/--only).
 #
 # Signing: --account NAME (Foundry keystore) and optionally --password-file PATH. A raw key
 # (--private-key, or PRIVATE_KEY/DEPLOYER_PRIVATE_KEY in the environment) is refused.
@@ -184,7 +188,11 @@ count_owners_list() { printf '%s' "$1" | tr ',' '\n' | sed 's/[[:space:]]//g' | 
 log "mode=$MODE from=$FROM${ONLY:+ only=$ONLY} chain=$EXPECTED_CHAIN_ID"
 
 # ---------------------------------------------------------------- P0
-if should P0; then
+# The preflight is mandatory whenever the run talks to a chain (simulate or confirm), whatever
+# --from/--only selects: a resume must re-prove the chain, the genesis and the inputs before it
+# sends anything. A dry run only runs it when P0 is selected.
+if should P0 || [[ "$MODE" != dry ]]; then
+  should P0 || log "P0 preflight (mandatory before a $MODE run that resumes at ${ONLY:-$FROM})"
   need_env DEPLOYER_ADDRESS GOV_OWNERS GOV_THRESHOLD GOV_MIN_DELAY GRD_OWNERS GRD_THRESHOLD GRD_MIN_DELAY
   is_addr "$DEPLOYER_ADDRESS" || gate_fail P0 "DEPLOYER_ADDRESS is malformed"
   check_council GOV $GOV_MIN_THRESHOLD $GOV_MIN_OWNERS $GOV_MIN_DELAY_SECS
@@ -314,7 +322,11 @@ if should P6; then
   elif [[ "$MODE" == dry ]]; then
     ADDRESS_BOOK="$ADDRESS_BOOK" bash "$HERE/keep_check.sh" verify --dry-run "$KEEP_LIST" || gate_fail P6 "KEEP list malformed"
   else
-    RPC="$RPC_URL" ADDRESS_BOOK="$ADDRESS_BOOK" BROADCAST_DIR="$CONTRACTS/broadcast" \
+    # Only broadcasts recorded on this chain since its block 0 are evidence for P6.
+    g0ts=$("$CAST" block 0 --field timestamp --rpc-url "$RPC_URL" 2>/dev/null)
+    g0ts=$("$PY" -c 'import sys; print(int(sys.argv[1], 0))' "$g0ts" 2>/dev/null) ||
+      gate_fail P6 "cannot read the block-0 timestamp to scope the broadcast evidence"
+    RPC="$RPC_URL" ADDRESS_BOOK="$ADDRESS_BOOK" BROADCAST_DIR="$CONTRACTS/broadcast" BROADCAST_SINCE="$g0ts" \
       bash "$HERE/keep_check.sh" verify "$KEEP_LIST" || gate_fail P6 "keep_check failed"
   fi
 fi

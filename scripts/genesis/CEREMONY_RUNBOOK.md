@@ -127,7 +127,7 @@ EXPECTED_BIN_SHA256=<release sha256> bash scripts/genesis/reset_node.sh \
 # then the same command with --confirm
 ```
 
-The old data dir is moved to `.citrate.pregenesis-<ts>`, never deleted. `proposer.key` is not carried: each node mints a fresh consensus key on first start. New operator hosts that were never on a previous chain start from their own provisioning instead (producer runbook, C3).
+The script aborts before touching the binary or the data dir unless the watchdog timer, the watchdog service and the node all report inactive after the stop. The old data dir is moved to `.citrate.pregenesis-<ts>`, never deleted. `proposer.key` is not carried: each node mints a fresh consensus key on first start. New operator hosts that were never on a previous chain start from their own provisioning instead (producer runbook, C3).
 
 ### 6.3 Start the chain
 
@@ -148,13 +148,13 @@ RPC_URL=<loopback rpc> bash scripts/genesis/genesis_ceremony.sh --confirm --acco
 
 | Phase | Does | Gate |
 |---|---|---|
-| P0 | Inputs, floors, tools, scripts present; chain id, block-0 hash, deployer nonce 0 | Any failure stops before a transaction |
+| P0 | Inputs, floors, tools, scripts present; chain id, block-0 hash, remote-RPC authorization, deployer seat; deployer nonce 0 on a fresh start. Runs on **every** `--simulate`/`--confirm` invocation, including `--from` and `--only` resumes (only the nonce-0 check is skipped on a resume) | Any failure stops before a transaction |
 | P1 | GOVERNANCE and GUARDIAN: each a TimelockController fronted by a MultisigProposer. The GUARDIAN timelock gets CANCELLER only on GOVERNANCE (pending #324). The deployer renounces in the same run | The deploy script's own postconditions |
 | P2 | The contract stack via `scripts/ops/regenesis.sh --reroll --with-aa`, with GOVERNANCE/GUARDIAN/VALIDATOR_GOVERNANCE read from P1's output | regenesis exit status |
 | P3 | Team vesting wallets from `TEAM_VESTING_FILE` | The deploy script's checks |
 | P4 | FederatedRoundLedger and PatronageLedger, dormant, admin = GOVERNANCE timelock | The deploy script's governance check |
 | P5 | `CheckDeployedAdmins` over the book and the P1/P3/P4 outputs | **`FACTORY-ADMIN 0` and `DEPLOYER-ADMIN 0`** |
-| P6 | `keep_check.sh verify` against `KEEP_LIST.genesis.tsv` | Every frozen address has the frozen code |
+| P6 | `keep_check.sh verify` against `KEEP_LIST.genesis.tsv`, reading only this chain's broadcasts recorded since block 0 | Every frozen address has the frozen code; a kept contract deployed anywhere but its pinned address fails |
 | P7 | `fleet_agree.sh` | All endpoints agree |
 
 A failed phase prints the exact `--from Pn` to resume with. A phase that failed after broadcasting part of its transactions is never re-run blindly: read `contracts/broadcast/` and the chain first.

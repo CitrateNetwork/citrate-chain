@@ -17,12 +17,19 @@
 #   * the row is a proxy and its implementation slot differs from the pin;
 #   * ADDRESS_BOOK is given and maps the key to a different address (or drops it), in its
 #     section or in a root-level entry of the same name;
-#   * BROADCAST_DIR is given and a broadcast there CREATE/CREATE2-deploys a new instance of
-#     the row's contract (the contract was redeployed somewhere else).
+#   * BROADCAST_DIR is given and a broadcast there CREATE/CREATE2-deploys the row's contract
+#     at an address that is NOT pinned for that contract name (the contract was redeployed
+#     somewhere else). A deployment AT the pinned address is the expected deterministic genesis
+#     deployment and passes. Only broadcasts for this chain are read (contracts/broadcast/
+#     <script>/<chain id>/run-latest.json, chain id from the RPC), and with BROADCAST_SINCE
+#     (unix seconds; the ceremony passes the block-0 timestamp) runs recorded before it are
+#     ignored, so an earlier chain's runs on the same chain id are not evidence. A broadcast
+#     that cannot be read, or an in-scope deployment with no address, fails the gate.
 #
 # Usage
 #   RPC=<url> keep_check.sh verify KEEP_LIST.tsv
 #       optional env: ADDRESS_BOOK=<book.json>  BROADCAST_DIR=<contracts/broadcast>
+#                     BROADCAST_SINCE=<unix seconds>
 #   keep_check.sh verify --dry-run KEEP_LIST.tsv
 #       checks the list's format (and the book, if ADDRESS_BOOK is set) and prints the reads
 #       it would make. No RPC.
@@ -219,22 +226,71 @@ while IFS=$'\t' read -r key sec addr cname want impl extra; do
   fi
 done <"$LIST"
 
-if [[ -n "${BROADCAST_DIR:-}" && -d "$BROADCAST_DIR" ]]; then
-  mapfile -t names < <(grep -v '^#' "$LIST" | awk -F'\t' 'NF>=4 && $4!="-"{print $4}' | sort -u)
-  redeploys=$("$PY" - "$BROADCAST_DIR" "${names[@]}" <<'PY'
-import json, sys, pathlib
-root = pathlib.Path(sys.argv[1]); keep = set(sys.argv[2:])
-for f in sorted(root.glob("*/*/run-latest.json")):
-    for t in json.load(open(f)).get("transactions", []):
-        if t.get("transactionType") in ("CREATE", "CREATE2") and t.get("contractName") in keep:
-            print(f"{f.parent.parent.name}\t{t['contractName']}\t{t.get('contractAddress')}")
-PY
-  )
-  if [[ -n "$redeploys" ]]; then
-    while IFS=$'\t' read -r s c a; do say "KEEP-FAIL    $c redeployed by $s at $a"; done <<<"$redeploys"
+if [[ -n "${BROADCAST_DIR:-}" && -d "$BROADCAST_DIR" && $DRY -eq 0 ]]; then
+  bcid=$("$CAST" chain-id --rpc-url "$RPC" 2>/dev/null)
+  if [[ ! "$bcid" =~ ^[0-9]+$ ]]; then
+    say "KEEP-FAIL    cannot read the chain id to select broadcasts under $BROADCAST_DIR"
+    fail=1
+  elif [[ -n "${BROADCAST_SINCE:-}" && ! "${BROADCAST_SINCE}" =~ ^[0-9]+$ ]]; then
+    say "KEEP-FAIL    BROADCAST_SINCE must be unix seconds"
     fail=1
   else
-    say "KEEP-OK      no broadcast under $BROADCAST_DIR deploys a KEEP contract"
+    # name<TAB>address for every KEEP row with a contract name: the pinned deployments.
+    pins=$(grep -v '^#' "$LIST" | awk -F'\t' 'NF>=4 && $4!="-"{print $4 "\t" tolower($3)}')
+    bc=$("$PY" - "$BROADCAST_DIR" "$bcid" "${BROADCAST_SINCE:-0}" "$pins" <<'PY'
+import json, sys, pathlib
+root, cid, since, pins_raw = pathlib.Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4]
+pinned = {}
+for line in pins_raw.splitlines():
+    if "\t" in line:
+        n, a = line.split("\t", 1)
+        pinned.setdefault(n, set()).add(a.strip().lower())
+for f in sorted(root.glob(f"*/{cid}/run-latest.json")):
+    script = f.parent.parent.name
+    try:
+        run = json.load(open(f))
+    except (OSError, ValueError) as e:
+        print(f"BAD\t{script}\tunreadable broadcast {f}: {e}")
+        continue
+    ts = run.get("timestamp")
+    if since and isinstance(ts, (int, float)):
+        ts = ts / 1000 if ts > 10**12 else ts  # older Foundry wrote milliseconds
+        if ts < since:
+            print(f"SKIP\t{script}\trun recorded before BROADCAST_SINCE")
+            continue
+    for t in run.get("transactions", []) or []:
+        name = t.get("contractName")
+        if t.get("transactionType") not in ("CREATE", "CREATE2") or name not in pinned:
+            continue
+        a = (t.get("contractAddress") or "").lower()
+        if not a:
+            print(f"BAD\t{script}\t{name} deployment has no contractAddress")
+        elif a in pinned[name]:
+            print(f"PIN\t{script}\t{name} at {a}")
+        else:
+            print(f"MOVE\t{script}\t{name} at {a}")
+PY
+    )
+    nbad=0
+    while IFS=$'\t' read -r kind s detail; do
+      case "$kind" in
+        PIN) say "KEEP-OK      $s deploys $detail (the pinned address)" ;;
+        SKIP) say "KEEP-SKIP    $s: $detail" ;;
+        MOVE)
+          say "KEEP-FAIL    $s redeploys $detail (not the pinned address)"
+          nbad=1
+          ;;
+        BAD)
+          say "KEEP-FAIL    $s: $detail"
+          nbad=1
+          ;;
+      esac
+    done <<<"$bc"
+    if [[ $nbad -ne 0 ]]; then
+      fail=1
+    else
+      say "KEEP-OK      no chain-$bcid broadcast under $BROADCAST_DIR deploys a KEEP contract away from its pin"
+    fi
   fi
 fi
 
