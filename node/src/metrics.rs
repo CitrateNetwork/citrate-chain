@@ -109,6 +109,19 @@ pub const METRIC_IPFS_LATENCY: &str = "citrate_ipfs_latency_seconds";
 pub const METRIC_IPFS_BYTES_UPLOADED: &str = "citrate_ipfs_bytes_uploaded_total";
 pub const METRIC_IPFS_BYTES_DOWNLOADED: &str = "citrate_ipfs_bytes_downloaded_total";
 
+// Checkpoint finality floor (WP-S.3 Stage 1c, node/src/finality_floor.rs)
+/// 1 while the finality floor verifier holds a safety stop (certificate
+/// mismatch or invalid certificate), else 0.
+pub const METRIC_FINALITY_HALTED: &str = "citrate_finality_halted";
+/// Safety stops entered: a finalized certificate that does not match this
+/// node's applied chain, or does not verify.
+pub const METRIC_FINALITY_CERT_MISMATCH_TOTAL: &str = "citrate_finality_certificate_mismatch_total";
+/// Highest finalized checkpoint height verified against this node's chain
+/// (backs the `finalized`/`safe` RPC tags while voting is on).
+pub const METRIC_FINALITY_VERIFIED_HEIGHT: &str = "citrate_finality_verified_height";
+/// The reorg floor actually enforced by the canonical applicator.
+pub const METRIC_FINALITY_FLOOR_HEIGHT: &str = "citrate_finality_floor_height";
+
 // ============================================================================
 // Initialization
 // ============================================================================
@@ -273,6 +286,24 @@ fn register_metric_descriptions() {
         Unit::Bytes,
         "Total bytes downloaded from IPFS"
     );
+
+    // Checkpoint finality floor (Stage 1c)
+    describe_gauge!(
+        METRIC_FINALITY_HALTED,
+        "1 while checkpoint finality is in a safety stop (certificate mismatch or invalid certificate)"
+    );
+    describe_counter!(
+        METRIC_FINALITY_CERT_MISMATCH_TOTAL,
+        "Checkpoint finality safety stops entered (certificate not on this node's chain, or invalid)"
+    );
+    describe_gauge!(
+        METRIC_FINALITY_VERIFIED_HEIGHT,
+        "Highest finalized checkpoint height verified against this node's applied chain"
+    );
+    describe_gauge!(
+        METRIC_FINALITY_FLOOR_HEIGHT,
+        "Reorg floor enforced by the canonical applicator (finalized height)"
+    );
 }
 
 // ============================================================================
@@ -385,6 +416,19 @@ pub fn record_dag_metrics(tips: usize, blue_score: u64, width: usize, depth: u64
     gauge!(METRIC_DAG_BLUE_SCORE, blue_score as f64);
     gauge!(METRIC_DAG_WIDTH, width as f64);
     gauge!(METRIC_DAG_DEPTH, depth as f64);
+}
+
+/// Record the checkpoint-finality floor state (Stage 1c): safety-stop flag,
+/// verified finalized height, enforced reorg floor.
+pub fn record_finality_floor(halted: bool, verified_height: u64, floor_height: u64) {
+    gauge!(METRIC_FINALITY_HALTED, if halted { 1.0 } else { 0.0 });
+    gauge!(METRIC_FINALITY_VERIFIED_HEIGHT, verified_height as f64);
+    gauge!(METRIC_FINALITY_FLOOR_HEIGHT, floor_height as f64);
+}
+
+/// Count one checkpoint-finality safety stop (certificate mismatch / invalid).
+pub fn record_finality_certificate_mismatch() {
+    counter!(METRIC_FINALITY_CERT_MISMATCH_TOTAL, 1);
 }
 
 /// Record sync status

@@ -199,6 +199,36 @@ needs **new code**:
   **halts finality progress and alarms** (a safety stop, never a silent wrong-branch pin).
 - Only after the hash check passes does the reorg guard reject fork points below the floor.
 
+**Stage 1c implementation (not running: both compiled pins are OFF for 40204).**
+`node/src/finality_floor.rs` (`FloorVerifier`) runs one check at boot, before any block
+admission, drain or recovery, then every 5 s. Each pass:
+1. takes `CheckpointManager::latest_finalized_certificate()` (memory, else the persisted
+   `dag_metadata` `checkpoint:{H}`) and re-verifies it with `Checkpoint::verify_certificate`:
+   status finalized, committee >= 4, votes >= `floor(2n/3)+1`, every voter a committee member,
+   every signature valid for this chain id (`CheckpointError::InvalidCertificate` otherwise);
+2. calls `CanonicalApplicator::verify_certified_floor(H, hash, raise)`, which walks this
+   node's applied chain through the stored headers OUTSIDE the advance lock, then re-confirms
+   UNDER the lock that the applied tip is unchanged (or only extended forward) and, when
+   `raise`, raises the floor before releasing the lock, so a reorg cannot slip in between the
+   check and the raise. Result `Match` / `Mismatch` / `NotYetApplied` / `Unverifiable`; a chain
+   that steps over `H` is a `Mismatch`.
+
+Modes, from two compiled pins in `checkpoint_gadget.rs`: voting OFF → **Legacy** (no poll; a
+certificate persisted by an earlier voting-ON run is logged and ignored, never used to raise
+the floor by its raw height; with voting OFF nothing can finalize, so for a node that never
+ran voting this is byte-identical to the old height poll, which never moved the floor);
+voting ON + `CHECKPOINT_ENFORCEMENT_PINS` OFF → **Observed** (verified height backs the
+`finalized`/`safe` RPC tags, floor not raised); both ON → **Enforced** (the verified
+certificate also raises the floor). On a mismatch or an invalid certificate the floor is not
+raised, the RPC tags do not advance, the gadget is halted (`SkipReason::Halted`: it proposes
+and signs nothing), an `error!` "CHECKPOINT FINALITY SAFETY STOP" with operator guidance is
+logged, and the metrics `citrate_finality_halted`, `citrate_finality_certificate_mismatch_total`,
+`citrate_finality_verified_height` and `citrate_finality_floor_height` are exported. A
+mismatch stop clears only when the certified block becomes canonical on this node through
+normal fork choice; an invalid certificate never clears automatically. "Reorg to the certified
+branch if it can" is deliberately NOT implemented as a forced reorg (no safe path exists for
+it yet): the node halts finality and alarms instead.
+
 ### 4.6 RPC surface
 Add `finalized` and `safe` block tags to `eth_rpc.rs`. **There are ~8 block-tag parse sites,
 not 2** (`:329, :832, :1662, :1683, :1886, :1897, :2555, :2616`) — all must learn the new
@@ -216,6 +246,10 @@ the first finalized checkpoint, resolve to genesis (block 0), never error. Close
 - Point checkpoint persistence at the dedicated `CF_CHECKPOINTS` column
   (`column_families.rs:27`, currently dead) or delete it and keep the `dag_metadata`
   `checkpoint:*` scheme — pick one, remove the dead one (D-6).
+  **Stage 1c:** certificates stay in `dag_metadata` `checkpoint:*`. `CF_CHECKPOINTS` stays
+  listed but unused: RocksDB refuses to open a database holding a column family the open call
+  does not list, and every existing node database has it, so removing it needs a `drop_cf`
+  migration first (not done here).
 
 ---
 
@@ -263,6 +297,10 @@ the first finalized checkpoint, resolve to genesis (block 0), never error. Close
 - The **reorg guard itself is already live and ungated** (`canonical_apply.rs:657`); what the
   pin gates is *raising the floor above 0*, i.e. whether finalized certificates actually
   constrain fork-choice.
+- Two separate compiled pins (`core/consensus/src/checkpoint_gadget.rs`), both OFF for 40204:
+  `CHECKPOINT_VOTING_PINS` (step 1: the producer path) and `CHECKPOINT_ENFORCEMENT_PINS`
+  (step 4: a verified certificate raises the floor, §4.5). Enforcement without voting has no
+  effect.
 
 A straggler on old code is weaker (won't honor finality) but not forked off — it still
 accepts the same blocks. Coordinate the enable-release per `feedback_deploy_from_main_only`.
@@ -363,7 +401,8 @@ the design + test bar and tracked here so #12 addresses every one:
 - **(2) quorum & min committee** — `floor(2n/3)+1`, min 4 (§3, D-2/D-2a). Resolved.
 - **(3) vote at depth D** — no tip voting (§3). Resolved.
 - **(4) floor is a hash, enforcement is real code** — `(height,hash)` cert, verify on-chain at
-  runtime + boot, halt-not-pin on mismatch (§4.5). Resolved.
+  runtime + boot, halt-not-pin on mismatch (§4.5). Resolved. Implemented in Stage 1c
+  (`node/src/finality_floor.rs`, §4.5), behind the enforcement pin (OFF).
 - **(5) liveness — early votes & relay:** **buffer** inbound votes that arrive *before* this
   node proposes the checkpoint (keyed by `(height,hash)`, replayed into `submit_vote` on
   propose), and **re-gossip** every accepted, valid vote to peers (today the inbound handler
@@ -383,7 +422,10 @@ the design + test bar and tracked here so #12 addresses every one:
 - **(11) claims tripwire:** `check_claims.py` currently passes on any non-test `.propose(`
   call — a default-off flag would false-positive "running". Tighten it (require the flag/pin
   ON **and** an outbound vote path) **in the same PR**; MAC flips the tripwire only when
-  finality actually runs. Add.
+  finality actually runs. Add. **Stage 1c:** "running" now requires both compiled pins ON for
+  40204, a non-test `sign_checkpoint_vote(` call, and a `node/src` file that builds
+  `NetworkMessage::CheckpointVote { .. }` (not a match pattern) and calls `.broadcast(`; a
+  missing pin table counts as OFF with a warning (`verification/tests/test_check_claims.py`).
 - **(1, config) chain_id:** stop hard-coding 40204 in `CheckpointConfig::default` — take
   `chain_id` from node chain config so devnet 1337 signs correct vote messages (§4.7).
 

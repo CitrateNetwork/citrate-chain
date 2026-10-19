@@ -30,11 +30,17 @@
 // refused and logged as a safety stop. If the write fails, or there is no
 // persistent store, nothing is signed. See [`SignRefusal`].
 //
-// NOT HERE (Stage 1c): floor ENFORCEMENT (§4.5). Finalizing a checkpoint advances
-// `CheckpointManager::latest_finalized_height()` only; nothing in this module
-// raises the reorg floor.
+// FLOOR ENFORCEMENT (Stage 1c, §4.5) is NOT in this module: finalizing a
+// checkpoint advances `CheckpointManager::latest_finalized_height()` only. The
+// node's `finality_floor::FloorVerifier` re-verifies the certificate and checks
+// its hash against the node's own applied chain before anything uses it, and is
+// gated by a SEPARATE compiled pin, [`CHECKPOINT_ENFORCEMENT_PINS`]. When that
+// check fails (mismatch / invalid certificate) the verifier HALTS this gadget
+// ([`FinalityGadget::halt_handle`]): a halted gadget proposes and signs nothing
+// ([`SkipReason::Halted`]) until the verifier clears the halt.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -64,6 +70,24 @@ pub const CHECKPOINT_VOTING_PINS: &[(u64, bool)] = &[(40204, false)];
 /// `chain_id`. Data source: the compiled table [`CHECKPOINT_VOTING_PINS`].
 pub fn checkpoint_voting_pinned(chain_id: u64) -> bool {
     pinned_in(CHECKPOINT_VOTING_PINS, chain_id)
+}
+
+/// Compiled-in per-chain switch for checkpoint-finality floor ENFORCEMENT
+/// (spec §4.5, §6 step 4): whether a verified finalized certificate raises this
+/// node's reorg floor. SEPARATE from [`CHECKPOINT_VOTING_PINS`] so the producer
+/// path can run with the floor only observed first (§6 step 1). Enforcement
+/// requires voting: with voting OFF this pin is ignored. A chain that is not
+/// listed is OFF.
+///
+/// OWNER STEP (enable release): flip 40204 to `true` only after healthy
+/// finalization has been observed on the fleet with voting ON and late joiners
+/// can fetch certificates (spec §6, §11.10).
+pub const CHECKPOINT_ENFORCEMENT_PINS: &[(u64, bool)] = &[(40204, false)];
+
+/// Whether this release enforces the checkpoint-finality floor for `chain_id`.
+/// Data source: the compiled table [`CHECKPOINT_ENFORCEMENT_PINS`].
+pub fn checkpoint_enforcement_pinned(chain_id: u64) -> bool {
+    pinned_in(CHECKPOINT_ENFORCEMENT_PINS, chain_id)
 }
 
 fn pinned_in(table: &[(u64, bool)], chain_id: u64) -> bool {
@@ -293,6 +317,10 @@ pub struct BuriedOutcome {
 pub enum SkipReason {
     /// The compiled switch is OFF for this chain.
     Disabled,
+    /// The node's finality floor verifier found a finalized certificate that
+    /// does not match this node's chain (or does not verify) and halted the
+    /// gadget: nothing is proposed or signed until the halt clears.
+    Halted,
     /// No epoch validator-set snapshot is materialized for this height (no
     /// registry configured, or the governing S(E) has not been applied).
     NoCommittee,
@@ -514,6 +542,9 @@ pub struct FinalityGadget {
     /// committee can be derived = nothing is proposed.
     committee_source: Option<Arc<VrfProposerSelector>>,
     enabled: bool,
+    /// Stage 1c safety stop, set and cleared ONLY by the node's finality floor
+    /// verifier. While set, nothing is proposed or signed.
+    halted: Arc<AtomicBool>,
     state: Mutex<GadgetState>,
 }
 
@@ -540,8 +571,21 @@ impl FinalityGadget {
             manager,
             committee_source,
             enabled,
+            halted: Arc::new(AtomicBool::new(false)),
             state: Mutex::new(GadgetState::default()),
         }
+    }
+
+    /// The halt flag shared with the node's finality floor verifier, which sets
+    /// it on a certificate mismatch / invalid certificate and clears it (mismatch
+    /// only) once the certified block is canonical on this node again.
+    pub fn halt_handle(&self) -> Arc<AtomicBool> {
+        self.halted.clone()
+    }
+
+    /// Whether the gadget is halted (see [`Self::halt_handle`]).
+    pub fn halted(&self) -> bool {
+        self.halted.load(Ordering::SeqCst)
     }
 
     /// Whether the producer path is switched on.
@@ -600,6 +644,10 @@ impl FinalityGadget {
             out.skipped = Some(SkipReason::Disabled);
             return out;
         }
+        if self.halted() {
+            out.skipped = Some(SkipReason::Halted);
+            return out;
+        }
         let Some(committee) = self.committee_for(height, seed).await else {
             out.skipped = Some(SkipReason::NoCommittee);
             return out;
@@ -652,7 +700,9 @@ impl FinalityGadget {
 
         // Own vote first (it is the one peers are most likely missing). The
         // signing decision is made durable BEFORE the vote exists.
-        if let (Some(key), true) = (signer, in_committee) {
+        // Re-check the halt right before signing: the verifier may have halted the
+        // gadget while the proposal above was being made.
+        if let (Some(key), true, false) = (signer, in_committee, self.halted()) {
             let authorized = {
                 let mut st = self.state.lock().await;
                 self.authorize_sign(&mut st, height, block_hash)
@@ -2341,5 +2391,90 @@ mod tests {
             b"checkpoint_signed:40204:12".to_vec()
         );
         assert!(!signed_vote_key(1, 2).starts_with(b"checkpoint:"));
+    }
+
+    /// Stage 1c: the enforcement pin is separate from the voting pin and OFF for
+    /// every chain in this release.
+    #[test]
+    fn enforcement_pin_is_off_for_every_chain_in_this_release() {
+        assert!(!checkpoint_enforcement_pinned(40204));
+        assert!(!checkpoint_enforcement_pinned(1337));
+        assert!(!checkpoint_enforcement_pinned(0));
+        assert!(CHECKPOINT_ENFORCEMENT_PINS
+            .iter()
+            .any(|(id, _)| *id == 40204));
+    }
+
+    /// Stage 1c: a halted gadget proposes nothing, signs nothing, writes nothing
+    /// and broadcasts nothing; clearing the halt resumes normal operation.
+    #[tokio::test]
+    async fn halted_gadget_does_nothing_until_cleared() {
+        let ks = keys(4);
+        let kv = Arc::new(MemKv::default());
+        let g = gadget_over(&ks, true, kv.clone(), 40).await;
+        assert!(!g.halted());
+        g.halt_handle().store(true, Ordering::SeqCst);
+        assert!(g.halted());
+        let before = kv.batches.load(Ordering::SeqCst);
+        let seed = Hash::new([1; 32]);
+        let out = g
+            .on_buried_checkpoint(10, block_hash(10), &seed, ks.first())
+            .await;
+        assert_eq!(out.skipped, Some(SkipReason::Halted));
+        assert!(!out.proposed && !out.signed_own_vote && out.outbound.is_empty());
+        assert_eq!(g.manager().pending_hash(10).await, None, "nothing proposed");
+        assert_eq!(g.signed_vote_at(10), None, "nothing signed");
+        assert_eq!(kv.batches.load(Ordering::SeqCst), before, "nothing written");
+
+        g.halt_handle().store(false, Ordering::SeqCst);
+        let out = g
+            .on_buried_checkpoint(10, block_hash(10), &seed, ks.first())
+            .await;
+        assert!(out.proposed && out.signed_own_vote, "resumes once cleared");
+        assert_eq!(g.signed_vote_at(10), Some(block_hash(10)));
+    }
+
+    /// Stage 1c: a finalized certificate survives a restart (a fresh manager over
+    /// the same store reloads it), still verifies, and is what
+    /// `latest_finalized_certificate` returns.
+    #[tokio::test]
+    async fn finalized_certificate_survives_restart_and_verifies() {
+        let ks = keys(4);
+        let kv = Arc::new(MemKv::default());
+        let g = gadget_over(&ks, true, kv.clone(), 40).await;
+        let seed = Hash::new([1; 32]);
+        let out = g
+            .on_buried_checkpoint(10, block_hash(10), &seed, ks.first())
+            .await;
+        assert!(out.signed_own_vote);
+        for k in ks.iter().skip(1) {
+            let _ = g
+                .on_inbound_vote(sign_checkpoint_vote(CHAIN, 10, block_hash(10), k))
+                .await;
+        }
+        let live = g
+            .manager()
+            .latest_finalized_certificate()
+            .await
+            .expect("finalized live");
+        assert_eq!((live.height, live.block_hash), (10, block_hash(10)));
+        live.verify_certificate(CHAIN)
+            .expect("live certificate verifies");
+        drop(g);
+
+        let kv_dyn: Arc<dyn KvStore> = kv;
+        let restarted = CheckpointManager::with_persistence(config(), dag_with(40).await, kv_dyn);
+        assert_eq!(restarted.latest_finalized_height().await, 10);
+        let cert = restarted
+            .latest_finalized_certificate()
+            .await
+            .expect("certificate reloaded after restart");
+        assert_eq!((cert.height, cert.block_hash), (10, block_hash(10)));
+        cert.verify_certificate(CHAIN)
+            .expect("reloaded certificate verifies");
+        assert!(
+            cert.verify_certificate(1337).is_err(),
+            "bound to its own chain id"
+        );
     }
 }

@@ -100,7 +100,7 @@
       "reproduction_command": "sed -n '48,53p' node/config/testnet.toml",
       "last_verified_at": "2026-09-24T02:37:00Z",
       "verification_status": "reproducible-from-source",
-      "notes": "[checkpoint] interval=50, committee_size=100, quorum_threshold=67 (2/3+1 BFT committee finality, WP-W.2). These are CONFIGURED parameters of a mechanism that is specified but NOT running: no production code path calls CheckpointManager::propose, so no checkpoint is ever proposed or finalized (see deterministic_checkpoint_finality)."
+      "notes": "[checkpoint] interval=50, committee_size=100, quorum_threshold=67 (2/3+1 BFT committee finality, WP-W.2). These are CONFIGURED parameters of a mechanism that is specified but NOT running: the producer path that proposes checkpoints is compiled in but pinned OFF for 40204 (CHECKPOINT_VOTING_PINS), so no checkpoint is ever proposed or finalized (see deterministic_checkpoint_finality)."
     },
     "deterministic_checkpoint_finality": {
       "scope": "citrate-chain",
@@ -121,10 +121,10 @@
         "specs/tla/consensus/CheckpointVoteSafety.tla",
         "verification/check_claims.py"
       ],
-      "reproduction_command": "python3 verification/check_claims.py  # fails if this claim says running=true while no non-test code path calls .propose(",
+      "reproduction_command": "python3 verification/check_claims.py  # fails if this claim says running=true unless CHECKPOINT_VOTING_PINS and CHECKPOINT_ENFORCEMENT_PINS are ON for 40204, a non-test path calls sign_checkpoint_vote(, and a node file builds NetworkMessage::CheckpointVote and broadcasts it",
       "last_verified_at": "2026-09-25T05:30:00Z",
       "verification_status": "specified-not-running",
-      "notes": "Checkpoint finality is SPECIFIED, NOT RUNNING on the public testnet: CheckpointManager is constructed, but no production code path calls propose(), so no checkpoint is finalized. Confirmation is probabilistic. The RPC does not serve the 'finalized' block tag. Do NOT publish a finality time (the old 90-100s figure assumed a running committee)."
+      "notes": "Checkpoint finality is SPECIFIED, NOT RUNNING on the public testnet. The code exists behind two compiled pins in core/consensus/src/checkpoint_gadget.rs, both OFF for 40204 in this release: CHECKPOINT_VOTING_PINS (Stage 1a producer path: propose, sign, broadcast, relay) and CHECKPOINT_ENFORCEMENT_PINS (Stage 1c: a verified certificate whose (height, hash) is the node's own canonical block raises the reorg floor; node/src/finality_floor.rs). With voting OFF nothing is proposed, so no checkpoint finalizes, the reorg floor stays at 0 and the 'finalized'/'safe' RPC tags resolve to genesis. Running additionally needs a staked validator committee of at least 4. Confirmation is probabilistic. Do NOT publish a finality time (the old 90-100s figure assumed a running committee)."
     },
     "confirmation_latency": {
       "scope": "citrate-chain",

@@ -198,6 +198,31 @@ pub enum ReorgOutcome {
     Rejected(String),
 }
 
+/// How many times [`CanonicalApplicator::verify_certified_floor`] re-walks when
+/// the applied chain moved (other than forward) during a check.
+pub const FLOOR_VERIFY_ATTEMPTS: usize = 3;
+
+/// Bound, in blocks, on the under-lock re-confirmation walk of
+/// [`CanonicalApplicator::verify_certified_floor`]: a tip that advanced further
+/// than this during the check is re-walked from scratch instead.
+pub const FLOOR_RECHECK_MAX_STEPS: u64 = 256;
+
+/// Outcome of [`CanonicalApplicator::verify_certified_floor`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FloorCheck {
+    /// The certified block IS the block at its height on this node's applied
+    /// chain (and, if raising was requested, the floor now covers it).
+    Match,
+    /// This node's applied chain holds a different block at the certified
+    /// height (`canonical: Some`), or steps over that height (`canonical: None`).
+    Mismatch { canonical: Option<Hash> },
+    /// The applied tip is still below the certified height.
+    NotYetApplied { applied_height: u64 },
+    /// The check could not complete (a header missing from the store, or the
+    /// applied chain kept moving). Nothing was concluded or raised.
+    Unverifiable(String),
+}
+
 /// Result of attempting to apply a received block on the fast path.
 #[derive(Debug)]
 pub enum ApplyOutcome {
@@ -243,7 +268,9 @@ pub struct CanonicalApplicator {
     /// disables reorg (steps 2–3 behavior only). Wired under `CITRATE_BLOCK_V2`.
     fork_choice: Option<ForkChoice>,
     /// Last finalized height — the reorg floor (I4: never revert below finality).
-    /// Defaults to 0 (genesis); tightened when wired to the checkpoint manager.
+    /// Defaults to 0 (genesis). Raised only by `verify_certified_floor` (Stage 1c,
+    /// enforcement pin ON): a verified certificate whose hash is this node's block
+    /// at that height, under the advance lock. Never lowered.
     finalized_height: Arc<AtomicU64>,
     /// The height this node has actually APPLIED, published for readers outside
     /// the advance lock. The sync manager judges completion against this: the
@@ -448,6 +475,110 @@ impl CanonicalApplicator {
 
     fn finalized_height(&self) -> u64 {
         self.finalized_height.load(Ordering::SeqCst)
+    }
+
+    /// The block at `target` on the applied chain ending at `tip`, walking
+    /// selected parents through the persisted headers
+    /// (`StorageManager.blocks.get_header`). `Ok(None)` when the chain steps
+    /// over `target` (a selected parent more than one height below its child)
+    /// or `target` is above `tip`. Headers are immutable by hash, so the walk
+    /// needs no lock: it describes the chain ending at `tip` whatever happens to
+    /// the applied tip meanwhile.
+    fn applied_hash_at_height(&self, tip: AppliedTip, target: u64) -> Result<Option<Hash>, String> {
+        if target > tip.height {
+            return Ok(None);
+        }
+        let mut cursor = tip.hash;
+        let mut max_height = tip.height;
+        // Heights strictly decrease, so `tip.height - target + 1` reads suffice.
+        let mut reads_left = tip.height.saturating_sub(target).saturating_add(1);
+        while reads_left > 0 {
+            reads_left = reads_left.saturating_sub(1);
+            let header = self
+                .storage
+                .blocks
+                .get_header(&cursor)
+                .map_err(|e| format!("header {cursor}: {e}"))?
+                .ok_or_else(|| format!("header {cursor} missing on the applied chain"))?;
+            let h = header.height;
+            if h > max_height {
+                return Err(format!(
+                    "header {cursor} at height {h} is not below its child (max {max_height})"
+                ));
+            }
+            if h == target {
+                return Ok(Some(cursor));
+            }
+            if h < target || h == 0 {
+                return Ok(None);
+            }
+            max_height = h.saturating_sub(1);
+            cursor = header.selected_parent_hash;
+        }
+        Err(format!(
+            "walk from {} @ {} did not reach height {target}",
+            tip.hash, tip.height
+        ))
+    }
+
+    /// Stage 1c (spec §4.5): is the finality certificate's `(height, hash)` the
+    /// block at `height` on THIS node's applied chain — and, if `raise`, raise
+    /// the reorg floor to `height` atomically with that answer.
+    ///
+    /// The selected-parent walk (header reads, possibly long at boot) runs
+    /// OUTSIDE the advance lock so it never stalls the producer. The verdict is
+    /// then re-confirmed UNDER the lock: the applied tip must still be the walked
+    /// tip, or a forward extension of it (the walked tip is on the current tip's
+    /// selected-parent chain, checked within [`FLOOR_RECHECK_MAX_STEPS`]). Only
+    /// then is the floor raised, before the lock is released — so no reorg can
+    /// slip between "the certified block is canonical here" and "the floor
+    /// protects it" (no TOCTOU). If the chain moved otherwise, the check is
+    /// retried up to [`FLOOR_VERIFY_ATTEMPTS`] times, then `Unverifiable`.
+    ///
+    /// A chain that steps over `height` is a `Mismatch { canonical: None }`:
+    /// the certified block is not on it.
+    pub async fn verify_certified_floor(&self, height: u64, hash: Hash, raise: bool) -> FloorCheck {
+        for _ in 0..FLOOR_VERIFY_ATTEMPTS {
+            let walked = self.applied_tip().await;
+            if height > walked.height {
+                return FloorCheck::NotYetApplied {
+                    applied_height: walked.height,
+                };
+            }
+            let at = match self.applied_hash_at_height(walked, height) {
+                Ok(at) => at,
+                Err(e) => return FloorCheck::Unverifiable(e),
+            };
+            let state = self.lock.lock().await;
+            let now = state.tip;
+            let unchanged = now == walked
+                || (now.height > walked.height
+                    && now.height.saturating_sub(walked.height) <= FLOOR_RECHECK_MAX_STEPS
+                    && matches!(
+                        self.applied_hash_at_height(now, walked.height),
+                        Ok(Some(h)) if h == walked.hash
+                    ));
+            if !unchanged {
+                drop(state);
+                debug!(
+                    "finality floor: applied tip moved {} @ {} -> {} @ {} during the certificate \
+                     check at {}; re-checking",
+                    walked.hash, walked.height, now.hash, now.height, height
+                );
+                continue;
+            }
+            if at != Some(hash) {
+                return FloorCheck::Mismatch { canonical: at };
+            }
+            if raise {
+                self.finalized_height.fetch_max(height, Ordering::SeqCst);
+            }
+            drop(state);
+            return FloorCheck::Match;
+        }
+        FloorCheck::Unverifiable(format!(
+            "the applied chain kept moving during {FLOOR_VERIFY_ATTEMPTS} attempts"
+        ))
     }
 
     /// Walk `start`'s selected-parent ancestry down to `target` height and return the hash of
@@ -1680,7 +1811,7 @@ pub fn record_produced(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use citrate_consensus::dag_store::DagStore;
     use citrate_consensus::types::{BlockBuilder, PublicKey, Signature, Transaction, VrfProof};
@@ -1696,7 +1827,12 @@ mod tests {
     /// `vrf` only distinguishes block HASHES (it feeds prevrandao, which
     /// reward-only blocks never read) — so two branches can share a state root
     /// while forking, exactly as sibling blocks from different producers do.
-    fn mk_block_vrf(height: u64, parent: Hash, state_root: Hash, vrf: [u8; 32]) -> Block {
+    pub(crate) fn mk_block_vrf(
+        height: u64,
+        parent: Hash,
+        state_root: Hash,
+        vrf: [u8; 32],
+    ) -> Block {
         let mut b = BlockBuilder::new()
             .version(2)
             .height(height)
@@ -1716,13 +1852,13 @@ mod tests {
 
     /// A-branch block (canonical VRF). Transactions are exercised by the
     /// executor's own `apply_block` tests; here we isolate the DRIVER.
-    fn mk_block(height: u64, parent: Hash, state_root: Hash) -> Block {
+    pub(crate) fn mk_block(height: u64, parent: Hash, state_root: Hash) -> Block {
         mk_block_vrf(height, parent, state_root, VRF_OUT)
     }
 
     /// B-branch block — distinct VRF so it forks from the A-branch at the same
     /// height with an identical (reward-only) state root but a different hash.
-    fn mk_block_b(height: u64, parent: Hash, state_root: Hash) -> Block {
+    pub(crate) fn mk_block_b(height: u64, parent: Hash, state_root: Hash) -> Block {
         mk_block_vrf(height, parent, state_root, [0x5B; 32])
     }
 
@@ -1754,7 +1890,7 @@ mod tests {
         exec.calculate_state_root()
     }
 
-    fn fresh() -> (Arc<Executor>, Arc<StorageManager>, tempfile::TempDir) {
+    pub(crate) fn fresh() -> (Arc<Executor>, Arc<StorageManager>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage =
             Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
@@ -1764,7 +1900,7 @@ mod tests {
 
     /// Persist a block exactly as the receive path does (`put_block` precedes the
     /// driver), so the drain can find it via the DAG parent→children index.
-    fn persist(storage: &StorageManager, block: &Block) {
+    pub(crate) fn persist(storage: &StorageManager, block: &Block) {
         storage.blocks.put_block(block).expect("put_block");
     }
 
@@ -1795,7 +1931,7 @@ mod tests {
     /// Build a linked chain of `n` reward-only blocks from genesis, each carrying
     /// the correct CUMULATIVE post-execution state root (computed on a mirror
     /// executor). `blocks[i].parent == blocks[i-1].hash`.
-    fn chain(n: u64) -> Vec<Block> {
+    pub(crate) fn chain(n: u64) -> Vec<Block> {
         let exec = Executor::new(Arc::new(StateDB::new()));
         let mut blocks = Vec::new();
         let mut parent = Hash::default();
@@ -1998,14 +2134,14 @@ mod tests {
     }
 
     /// Cumulative reward-only state roots for heights 1..=n (mirrors `chain`).
-    fn roots(n: u64) -> Vec<Hash> {
+    pub(crate) fn roots(n: u64) -> Vec<Hash> {
         chain(n).iter().map(|b| b.state_root).collect()
     }
 
     /// Apply the A-branch [a1, a2] so the applied tip is a2 @ height 2, then
     /// persist a competing B-branch [b2, b3] that forks at a1. Returns everything
     /// the reorg tests need. b2/b3 are persisted but NOT applied (a fork above a1).
-    async fn setup_fork(
+    pub(crate) async fn setup_fork(
         app: &CanonicalApplicator,
         storage: &StorageManager,
     ) -> (Block, Block, Block, Block) {
@@ -7623,5 +7759,135 @@ mod tests {
             assert!(flag.load(Ordering::SeqCst), "flag held during the rebuild");
         }
         assert!(!flag.load(Ordering::SeqCst), "flag cleared on normal drop");
+    }
+
+    /// Stage 1c §4.5: the floor is raised only for the certified hash that IS
+    /// this node's block at that height, only when raising is asked for, and
+    /// never lowered.
+    #[tokio::test]
+    async fn certified_floor_raises_only_on_hash_match() {
+        let (exec, storage, _dir) = fresh();
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        let (a1, a2, b2, _b3) = setup_fork(&app, &storage).await; // tip a2 @ 2
+        let floor = app.finalized_height_handle();
+
+        // Wrong hash at height 2 (the competing sibling): mismatch, no raise.
+        assert_eq!(
+            app.verify_certified_floor(2, b2.header.block_hash, true)
+                .await,
+            FloorCheck::Mismatch {
+                canonical: Some(a2.header.block_hash)
+            }
+        );
+        assert_eq!(floor.load(Ordering::SeqCst), 0, "mismatch never raises");
+
+        // Right hash, observe-only: match, no raise.
+        assert_eq!(
+            app.verify_certified_floor(2, a2.header.block_hash, false)
+                .await,
+            FloorCheck::Match
+        );
+        assert_eq!(floor.load(Ordering::SeqCst), 0, "observe-only never raises");
+
+        // Right hash, enforce: raised.
+        assert_eq!(
+            app.verify_certified_floor(2, a2.header.block_hash, true)
+                .await,
+            FloorCheck::Match
+        );
+        assert_eq!(floor.load(Ordering::SeqCst), 2);
+
+        // A lower certified height matches but never lowers the floor.
+        assert_eq!(
+            app.verify_certified_floor(1, a1.header.block_hash, true)
+                .await,
+            FloorCheck::Match
+        );
+        assert_eq!(floor.load(Ordering::SeqCst), 2, "monotonic");
+
+        // Above the applied tip: not yet applied, nothing concluded.
+        assert_eq!(
+            app.verify_certified_floor(3, Hash::new([7; 32]), true)
+                .await,
+            FloorCheck::NotYetApplied { applied_height: 2 }
+        );
+        assert_eq!(floor.load(Ordering::SeqCst), 2);
+    }
+
+    /// Stage 1c: a chain that steps over the certified height does not contain
+    /// the certified block — a mismatch, never a match and never a raise.
+    #[tokio::test]
+    async fn certified_floor_on_a_skipped_height_is_a_mismatch() {
+        let (exec, storage, _dir) = fresh();
+        let r = roots(3);
+        let b1 = mk_block(1, Hash::default(), r[0]);
+        // Selected parent jumps from height 3 straight to height 1.
+        let b3 = mk_block(3, b1.header.block_hash, r[2]);
+        persist(&storage, &b1);
+        persist(&storage, &b3);
+        storage
+            .blocks
+            .put_applied_tip(&b3.header.block_hash, 3)
+            .expect("applied tip");
+        let app = CanonicalApplicator::new(exec, storage.clone());
+        assert_eq!(app.applied_tip().await.height, 3);
+        assert_eq!(
+            app.verify_certified_floor(2, Hash::new([2; 32]), true)
+                .await,
+            FloorCheck::Mismatch { canonical: None }
+        );
+        assert_eq!(app.finalized_height_handle().load(Ordering::SeqCst), 0);
+        assert_eq!(
+            app.verify_certified_floor(1, b1.header.block_hash, true)
+                .await,
+            FloorCheck::Match
+        );
+        assert_eq!(app.finalized_height_handle().load(Ordering::SeqCst), 1);
+    }
+
+    /// Stage 1c: a header missing from the applied chain makes the check
+    /// unverifiable — nothing is concluded and nothing is raised.
+    #[tokio::test]
+    async fn certified_floor_with_missing_header_is_unverifiable() {
+        let (exec, storage, _dir) = fresh();
+        let r = roots(3);
+        let b1 = mk_block(1, Hash::default(), r[0]);
+        let b2 = mk_block(2, b1.header.block_hash, r[1]);
+        let b3 = mk_block(3, b2.header.block_hash, r[2]);
+        persist(&storage, &b1);
+        persist(&storage, &b3); // b2 never stored
+        storage
+            .blocks
+            .put_applied_tip(&b3.header.block_hash, 3)
+            .expect("applied tip");
+        let app = CanonicalApplicator::new(exec, storage.clone());
+        assert!(matches!(
+            app.verify_certified_floor(1, b1.header.block_hash, true)
+                .await,
+            FloorCheck::Unverifiable(_)
+        ));
+        assert_eq!(app.finalized_height_handle().load(Ordering::SeqCst), 0);
+    }
+
+    /// Stage 1c end-to-end through the applicator: once a VERIFIED certificate
+    /// raised the floor, a reorg whose fork point is below it is `Rejected` and
+    /// the applied tip keeps the finalized block.
+    #[tokio::test]
+    async fn reorg_below_a_certified_floor_is_rejected() {
+        let (exec, storage, _dir) = fresh();
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        let (_a1, a2, _b2, b3) = setup_fork(&app, &storage).await;
+        assert_eq!(
+            app.verify_certified_floor(2, a2.header.block_hash, true)
+                .await,
+            FloorCheck::Match
+        );
+        let lock = app.advance_lock();
+        let mut state = lock.lock().await;
+        match app.reorg_to(&mut state, b3.header.block_hash).await {
+            ReorgOutcome::Rejected(why) => assert!(why.contains("finalized"), "got: {why}"),
+            other => panic!("expected Rejected (finality), got {other:?}"),
+        }
+        assert_eq!(state.tip.hash, a2.header.block_hash);
     }
 }
