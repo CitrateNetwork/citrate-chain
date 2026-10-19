@@ -11,14 +11,26 @@
 # when eth_syncing != false, use eth_syncing.currentBlock as the progress
 # signal. The node is only "wedged" if its progress signal (currentBlock while
 # syncing, else the canonical head) is frozen for STALL_SECS.
+#
+# OPERATOR PAUSE (2026-10 producer runbook): a replay, a drain after a rollback, a
+# state copy or any planned rebuild holds the head still for hours, and a restart
+# mid-replay throws the replay away (2026-09-27, 2026-10-04, 2026-10-15). Before
+# any of those, pause the watchdog with `citrate-watchdog-ctl.sh pause <hours>
+# <reason>`. While $STATE_DIR/PAUSE exists this script restarts nothing. A pause
+# never lifts itself: past its deadline it alerts (hourly) until an operator runs
+# `citrate-watchdog-ctl.sh resume`, which also re-baselines the stall clock so the
+# first poll after a long pause cannot restart a node that is merely catching up.
 set -u
 RPC="${RPC:-http://127.0.0.1:8545}"
 UNIT="${UNIT:-citrate-node}"
 STALL_SECS="${STALL_SECS:-180}"      # progress must move within 3 min
 POLL_SECS="${POLL_SECS:-30}"
-STATE="/var/lib/citrate-watchdog/state"
-mkdir -p "$(dirname "$STATE")"
-ALERT="/usr/local/bin/citrate-alert.sh"
+STATE_DIR="${STATE_DIR:-/var/lib/citrate-watchdog}"
+STATE="$STATE_DIR/state"
+PAUSE_FILE="$STATE_DIR/PAUSE"
+NODE_LABEL="${NODE_LABEL:-$(hostname -s 2>/dev/null || echo node)}"
+mkdir -p "$STATE_DIR"
+ALERT="${ALERT:-/usr/local/bin/citrate-alert.sh}"
 
 rpc() { # method -> raw json
   curl -s -m 8 -X POST "$RPC" -H 'content-type: application/json' \
@@ -26,6 +38,27 @@ rpc() { # method -> raw json
 }
 
 now=$(date +%s)
+
+# 0) Operator pause: restart nothing; forget the stall baseline.
+if [ -e "$PAUSE_FILE" ]; then
+  rm -f "$STATE.progress" "$STATE.time" "$STATE.restarts" "$STATE.downsince"
+  until_ts="$(sed -n 's/^until=\([0-9][0-9]*\)$/\1/p' "$PAUSE_FILE" | head -1)"
+  reason="$(sed -n 's/^reason=//p' "$PAUSE_FILE" | head -1)"
+  [ -n "$until_ts" ] || until_ts=0
+  if [ "$now" -ge "$until_ts" ]; then
+    last_nag="$(cat "$STATE.nag" 2>/dev/null || echo 0)"
+    case "$last_nag" in ''|*[!0-9]*) last_nag=0 ;; esac
+    if [ "$((now - last_nag))" -ge 3600 ]; then
+      echo "$now" > "$STATE.nag"
+      logger -t citrate-watchdog "PAUSED past its deadline ($reason); still not restarting $UNIT"
+      [ -x "$ALERT" ] && "$ALERT" "CITRATE watchdog pause expired" "$NODE_LABEL: watchdog paused for '$reason' past its deadline. Resume with citrate-watchdog-ctl.sh resume once the replay is done."
+    fi
+  else
+    logger -t citrate-watchdog "paused ($reason) until $until_ts; not checking $UNIT"
+  fi
+  exit 0
+fi
+rm -f "$STATE.nag"
 
 # 1) Liveness: is the RPC answering at all?
 head_json="$(rpc eth_blockNumber)"
@@ -36,7 +69,7 @@ if [ -z "$head_hex" ] || [ "${head_hex#0x}" = "$head_hex" ]; then
   if [ "$((now - last_down))" -ge "$STALL_SECS" ]; then
     logger -t citrate-watchdog "RPC unreachable ${STALL_SECS}s -> restart $UNIT"
     systemctl restart "$UNIT"
-    [ -x "$ALERT" ] && "$ALERT" "CITRATE NodeDown" "rpc-1 $UNIT RPC unreachable ${STALL_SECS}s; auto-restarted."
+    [ -x "$ALERT" ] && "$ALERT" "CITRATE NodeDown" "$NODE_LABEL $UNIT RPC unreachable ${STALL_SECS}s; auto-restarted."
     rm -f "$STATE.downsince"
   fi
   exit 0
@@ -69,9 +102,9 @@ if [ "$((now - prev_t))" -ge "$STALL_SECS" ]; then
   systemctl restart "$UNIT"
   echo "$now" > "$STATE.time"
   if [ "$n" -ge 3 ]; then
-    [ -x "$ALERT" ] && "$ALERT" "CITRATE Stall CRITICAL" "rpc-1 $mode stalled at $dec; $n auto-restarts did not clear it. MANUAL ACTION NEEDED."
+    [ -x "$ALERT" ] && "$ALERT" "CITRATE Stall CRITICAL" "$NODE_LABEL $mode stalled at $dec; $n auto-restarts did not clear it. MANUAL ACTION NEEDED."
   else
-    [ -x "$ALERT" ] && "$ALERT" "CITRATE Stall" "rpc-1 $mode progress $dec frozen ${STALL_SECS}s; auto-restarted (#$n)."
+    [ -x "$ALERT" ] && "$ALERT" "CITRATE Stall" "$NODE_LABEL $mode progress $dec frozen ${STALL_SECS}s; auto-restarted (#$n)."
   fi
 fi
 exit 0

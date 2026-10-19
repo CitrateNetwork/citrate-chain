@@ -1,15 +1,36 @@
 # citrate-height-watchdog
 
-External anti-wedge auto-recovery for the block producer (rpc-1). The node has no
+External anti-wedge auto-recovery for a block producer. The node has no
 `sd_notify`, so this systemd timer (every 30s) polls the local RPC and restarts
-`citrate-node` if the producer is genuinely wedged.
+`citrate-node` if the producer is genuinely wedged. Producer operators: see
+`docs/ops/PRODUCER_OPERATOR_RUNBOOK.md` §9.
 
 ## Install (per producer host)
 ```
-install -m0755 citrate-height-watchdog.sh /usr/local/bin/citrate-height-watchdog.sh
+install -m0755 citrate-height-watchdog.sh citrate-watchdog-ctl.sh /usr/local/bin/
 cp citrate-height-watchdog.service citrate-height-watchdog.timer /etc/systemd/system/
 systemctl daemon-reload && systemctl enable --now citrate-height-watchdog.timer
 ```
+Alerts go to `/usr/local/bin/citrate-alert.sh "<title>" "<body>"` (override with
+`ALERT=`); they name the host by `NODE_LABEL` (default: the short hostname).
+
+## Pause during replays (2026-10 producer runbook)
+Before a replay, a drain after a rollback, a state copy, a data reset or a planned
+rebuild:
+```
+citrate-watchdog-ctl.sh pause <1-48 hours> "<reason>"
+citrate-watchdog-ctl.sh status
+citrate-watchdog-ctl.sh resume        # once eth_syncing is false and the head is caught up
+```
+While `$STATE_DIR/PAUSE` exists the watchdog restarts nothing. A pause does not lift
+itself: past its deadline the watchdog alerts hourly, still without restarting, until
+someone resumes. `resume` clears the stall baseline so the first poll after a long
+pause cannot restart a node that is only catching up. The sync-aware check below does
+not cover every replay: a drain holds the head without reporting `eth_syncing`
+progress (2026-10-15), which is why the pause is explicit.
+
+Tests: `bash scripts/ops/tests/test_height_watchdog.sh` (hermetic: shimmed curl,
+systemctl, logger and alert hook).
 
 ## 2026-09-27 fix — sync-aware liveness (CRITICAL)
 The original script used `eth_blockNumber` (the canonical head) as its liveness
