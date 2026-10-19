@@ -49,6 +49,24 @@
 // costs one header per block the tip advanced since the previous call, so it is
 // amortised over chain growth.
 //
+// A walk runs outside the cache lock, so the tip usually advances while it runs
+// (other requests re-anchor). Its checkpoints are ancestors of the tip it started
+// from; they stay valid for every later anchor reached through verified
+// extensions. `generation` counts the times the checkpoints were dropped (any
+// other re-anchor outcome, or a purge). A walk publishes what it found only when
+// the generation is unchanged since it started: the anchor may have moved, but
+// only along verified extensions of the walk's start tip. Gating on the anchor
+// itself would throw cold-fill progress away whenever the tip advances.
+//
+// MISSING ANCESTORS: ERROR WINS
+//
+// When the executed chain cannot be followed down to `fromBlock` (a missing or
+// malformed ancestor), the resolver returns `LogIndexError::Unavailable`
+// (-32603); it never returns the part of the range it could reach. Any other
+// range resolver that is combined with this one (for example a finality-tag
+// range walk that stops at a missing ancestor) must adopt the same rule: a
+// broken walk is an error, never a silently shortened answer.
+//
 // PER-REQUEST BOUNDS
 //
 // The resolver returns hashes only; bodies are loaded and dropped one block at a
@@ -129,6 +147,9 @@ struct CacheState {
     checkpoints: BTreeMap<u64, Hash>,
     /// The applied tip the checkpoints were verified against.
     anchor: Option<(Hash, u64)>,
+    /// Bumped every time `checkpoints` is dropped. Unchanged between two points
+    /// in time means every anchor move in between was a verified extension.
+    generation: u64,
 }
 
 impl CacheState {
@@ -145,9 +166,16 @@ impl CacheState {
             None => false,
         };
         if !keep {
-            self.checkpoints.clear();
+            self.drop_checkpoints();
         }
         self.anchor = Some((tip_hash, tip_height));
+    }
+
+    /// Forget every checkpoint and start a new generation, so walks that began
+    /// under the old one do not publish into the new one.
+    fn drop_checkpoints(&mut self) {
+        self.checkpoints.clear();
+        self.generation = self.generation.wrapping_add(1);
     }
 }
 
@@ -286,7 +314,7 @@ impl ExecutedChainIndex {
         }
         let settled_below = tip_height.saturating_sub(SETTLED_DEPTH);
 
-        let (mut cursor, mut expect_at_most) = {
+        let (mut cursor, mut expect_at_most, start_generation) = {
             let mut st = self
                 .state
                 .lock()
@@ -302,16 +330,17 @@ impl ExecutedChainIndex {
             } else {
                 None
             };
-            match nearest {
+            let (cursor, start) = match nearest {
                 Some((h, hash)) if storage.blocks.has_block(&hash).unwrap_or(false) => (hash, h),
                 Some(_) => {
                     // A checkpoint whose block is gone: the store changed under
                     // us (purge). Start over from the tip.
-                    st.checkpoints.clear();
+                    st.drop_checkpoints();
                     (tip_hash, tip_height)
                 }
                 None => (tip_hash, tip_height),
-            }
+            };
+            (cursor, start, st.generation)
         };
 
         // Heights strictly decrease along the walk, so it reads at most
@@ -372,9 +401,11 @@ impl ExecutedChainIndex {
 
         if !found.is_empty() {
             if let Ok(mut st) = self.state.lock() {
-                // Only under the anchor this walk started from: the found
-                // hashes are its ancestors, not necessarily a newer anchor's.
-                if st.anchor == Some((tip_hash, tip_height)) {
+                // The found hashes are ancestors of the tip this walk started
+                // from. With the generation unchanged, every anchor move since
+                // was a verified extension of that tip, so they are ancestors
+                // of the current anchor too (see "CACHE SOUNDNESS").
+                if st.generation == start_generation {
                     st.checkpoints.extend(found);
                 }
             }

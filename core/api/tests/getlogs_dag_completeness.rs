@@ -605,3 +605,92 @@ fn executed_chain_index_bounds_a_cold_walk_and_progresses_on_retry() {
     );
     assert_eq!(rpc.data.expect("data")["retryable"], true);
 }
+
+/// A cold fill deep below the tip must make progress while the tip advances.
+/// A second thread keeps appending blocks and serving near-tip queries (each
+/// re-anchors the cache on a verified extension) while the deep request is
+/// retried. Every retry has to keep the checkpoints it found, so the deep
+/// request completes within the same number of tries as with no churn.
+#[test]
+fn executed_chain_index_cold_fill_survives_tip_churn() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (storage, _tmp) = storage();
+    let top = 12_000u64;
+    let budget = 2_000u64;
+    let mut parent = Hash::default();
+    let mut canon = Vec::new();
+    for h in 0..=top {
+        let b = block(hash_of(0xA0, h), parent, vec![], h, vec![]);
+        storage.blocks.put_block(&b).expect("block");
+        parent = b.hash();
+        canon.push(parent);
+    }
+    storage.blocks.put_applied_tip(&parent, top).expect("tip");
+
+    let idx = Arc::new(ExecutedChainIndex::with_walk_budget(budget));
+    let stop = Arc::new(AtomicBool::new(false));
+    let appended = Arc::new(AtomicU64::new(0));
+    let churn = {
+        let (storage, idx, stop, appended) =
+            (storage.clone(), idx.clone(), stop.clone(), appended.clone());
+        std::thread::spawn(move || {
+            let mut parent = parent;
+            let mut h = top;
+            while !stop.load(Ordering::Acquire) {
+                h += 1;
+                let b = block(hash_of(0xA0, h), parent, vec![], h, vec![]);
+                storage.blocks.put_block(&b).expect("block");
+                parent = b.hash();
+                storage.blocks.put_applied_tip(&parent, h).expect("tip");
+                appended.fetch_add(1, Ordering::AcqRel);
+                let near = idx
+                    .executed_hashes(&storage, h.saturating_sub(5), h)
+                    .expect("near-tip query fits the budget");
+                assert_eq!(near.len(), 6);
+            }
+        })
+    };
+
+    // Each retry restarts at the lowest checkpoint it reached, so a cold fill
+    // advances at least one stride per try. Allow slack for the blocks the
+    // churn thread adds above the start.
+    let max_tries = top / CHECKPOINT_STRIDE + 4;
+    let mut tries = 0u64;
+    let mut overlapped = 0u64;
+    let mut last_count = idx.checkpoint_count();
+    let got = loop {
+        tries += 1;
+        assert!(
+            tries <= max_tries,
+            "deep query not complete after {max_tries} tries; {} checkpoints kept",
+            idx.checkpoint_count()
+        );
+        let before = appended.load(Ordering::Acquire);
+        let res = idx.executed_hashes(&storage, 0, 10);
+        if appended.load(Ordering::Acquire) != before {
+            overlapped += 1;
+        }
+        match res {
+            Ok(v) => break v,
+            Err(LogIndexError::Retry(m)) => {
+                let count = idx.checkpoint_count();
+                assert!(
+                    count > last_count,
+                    "retry {tries} kept no new checkpoints ({count} after {last_count}): {m}"
+                );
+                last_count = count;
+            }
+            Err(e) => panic!("deep query failed: {e:?}"),
+        }
+    };
+    stop.store(true, Ordering::Release);
+    churn.join().expect("churn thread");
+
+    assert!(overlapped > 0, "the tip never advanced during a deep walk");
+    assert_eq!(
+        got.iter().map(|(_, h)| *h).collect::<Vec<_>>(),
+        canon[0..=10].to_vec()
+    );
+    assert!(idx.checkpoint_count() as u64 >= top / CHECKPOINT_STRIDE - 1);
+}
