@@ -173,6 +173,32 @@ impl VrfProposerSelector {
         }
     }
 
+    /// WP-S.3 §4.1 / §11.6: the validator set that GOVERNS `height` — the
+    /// snapshot materialised at [`Self::governing_snapshot`]`(height)` — as
+    /// `(snapshot_height, [(pubkey, stake)])`, restricted to members at or above
+    /// that snapshot's `min_stake` (the same rule as `is_eligible_proposer`) and
+    /// sorted by pubkey bytes. This is the checkpoint committee's input set.
+    ///
+    /// Deliberately NEVER falls back to the live (latest) set: two nodes that
+    /// have crossed an epoch boundary at different moments must still derive the
+    /// identical committee for `height`. `None` when no schedule is attached, no
+    /// snapshot governs `height`, or that snapshot is not (or no longer) in the
+    /// history. Data source: the per-epoch history filled by `registry_sync`
+    /// from `ValidatorRegistry.activeSet()` + `minStake()` read at state S(E).
+    pub async fn epoch_committee_set(&self, height: u64) -> Option<(u64, Vec<(PublicKey, u128)>)> {
+        let snapshot_height = self.governing_snapshot(height)?;
+        let history = self.history.read().await;
+        let set = history.get(&snapshot_height)?;
+        let mut members: Vec<(PublicKey, u128)> = set
+            .stakes
+            .iter()
+            .filter(|(_, stake)| **stake >= set.min_stake)
+            .map(|(pk, stake)| (*pk, *stake))
+            .collect();
+        members.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        Some((snapshot_height, members))
+    }
+
     /// VALIDATOR-S1: set the initial membership stake floor. Builder form used at
     /// construction; the live value is updated each epoch via [`Self::sync_active_set`].
     pub fn with_min_stake(mut self, min_stake: u128) -> Self {
