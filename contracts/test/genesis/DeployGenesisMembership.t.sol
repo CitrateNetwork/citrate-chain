@@ -10,19 +10,29 @@ import {CitrateMemberSBT} from "../../src/core_membership/CitrateMemberSBT.sol";
 import {MemberBond} from "../../src/core_membership/MemberBond.sol";
 import {MembershipStakeVault} from "../../src/core_membership/MembershipStakeVault.sol";
 import {ValidatorRegistry} from "../../src/ValidatorRegistry.sol";
+import {CheckDeployedAdmins} from "../../script/CheckDeployedAdmins.s.sol";
+import {Salts} from "../../script/Salts.sol";
+import {RoleLogArchive, MembershipWithHistory, GateWithHistory} from "./RoleHistoryHarness.sol";
+import {SelfReportingForwarder} from "./DeployDormantLedgers.t.sol";
 
 /// @title DeployGenesisMembership.t: the Track M money path in the genesis set (C2 D9 / C4)
 contract DeployGenesisMembershipTest is Test {
     address constant SENDER = 0x1804c8AB1F12E6bbf3894d4083f33e07309d1f38; // forge default sender
     address constant ARACHNID = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
     uint256 constant GRANT = 32_000 ether;
+    address constant P256_VERIFIER = 0xc2b78104907F722DABAc4C69f826a522B2754De4;
+    string constant GOV_SALT = "Genesis.GovernanceMultisig";
 
     DeployGenesisGovernance.Deployed internal gov;
     address[] internal govOwners;
     ValidatorRegistry internal registry;
     address internal grantor;
+    RoleLogArchive internal archive;
 
     function setUp() public {
+        // The timelock role history the script replays (no node in forge test: RoleHistoryHarness).
+        vm.recordLogs();
+        archive = new RoleLogArchive();
         gov = _governance(48 hours);
         grantor = makeAddr("treasury-signer");
         registry = new ValidatorRegistry(
@@ -40,16 +50,37 @@ contract DeployGenesisMembershipTest is Test {
         for (uint256 i = 0; i < 3; i++) {
             grdOwners[i] = address(uint160(0xB000 + i));
         }
-        g = new DeployGenesisGovernance().deployWith(
-            SENDER,
-            DeployGenesisGovernance.Council({owners: govOwners, threshold: 3, minDelay: delay}),
-            DeployGenesisGovernance.Council({owners: grdOwners, threshold: 2, minDelay: 1 hours}),
-            false
-        );
+        g = new DeployGenesisGovernance()
+            .deployWith(
+                SENDER,
+                DeployGenesisGovernance.Council({owners: govOwners, threshold: 3, minDelay: delay}),
+                DeployGenesisGovernance.Council({owners: grdOwners, threshold: 2, minDelay: 1 hours}),
+                false
+            );
+    }
+
+    /// The script with the test's recorded role history standing in for the node.
+    function _script() internal returns (DeployGenesisMembership s) {
+        MembershipWithHistory h = new MembershipWithHistory();
+        h.useArchive(archive);
+        s = h;
+    }
+
+    function _gate() internal returns (CheckDeployedAdmins c) {
+        GateWithHistory g = new GateWithHistory();
+        g.useArchive(archive);
+        c = g;
+    }
+
+    /// `vm.expectRevert`, after moving the recorded logs into the archive from THIS frame: a
+    /// reverted script call would roll back an absorb made inside it (RoleHistoryHarness).
+    function _expectRevert(bytes memory reason) internal {
+        archive.absorb();
+        vm.expectRevert(reason);
     }
 
     function _deploy() internal returns (DeployGenesisMembership.Deployed memory d) {
-        d = new DeployGenesisMembership().deployWith(SENDER, gov.governanceTimelock, grantor, address(registry));
+        d = _script().deployWith(SENDER, gov.governanceTimelock, gov.governanceMultisig, grantor, address(registry));
     }
 
     function _pass(bytes memory data) internal {
@@ -168,19 +199,25 @@ contract DeployGenesisMembershipTest is Test {
     // ── Fail closed ─────────────────────────────────────────────────────────
 
     function test_refuses_a_non_timelock_governance() public {
-        DeployGenesisMembership s = new DeployGenesisMembership();
-        vm.expectRevert(bytes("GOVERNANCE_TIMELOCK is not a TimelockController"));
-        s.deployWith(SENDER, makeAddr("eoa"), grantor, address(registry));
+        DeployGenesisMembership s = _script();
+        _expectRevert(bytes("GOVERNANCE_TIMELOCK is not a TimelockController"));
+        s.deployWith(SENDER, makeAddr("eoa"), gov.governanceMultisig, grantor, address(registry));
     }
 
-    function test_refuses_governance_below_48h_on_the_genesis_chain() public {
+    /// A correctly handed-over ceremony council passes off the genesis chain; the genesis profile
+    /// (chosen by chain id alone) refuses a delay under 48 h and a council under 3-of-5.
+    function test_genesis_profile_floor_is_48h_and_3_of_5() public {
+        DeployGenesisGovernance.Deployed memory weakDelay = _council(3, 5, 24 hours);
+        // 72 h: the timelock's CREATE2 address depends on (deployer, delay), and setUp owns 48 h.
+        DeployGenesisGovernance.Deployed memory weakCouncil = _council(2, 3, 72 hours);
+        DeployGenesisMembership s = _script();
+        s.deployWith(SENDER, weakDelay.governanceTimelock, weakDelay.governanceMultisig, grantor, address(registry));
+
         vm.chainId(40204);
-        address[] memory council = new address[](1);
-        council[0] = makeAddr("council");
-        TimelockController weak = new TimelockController(1 hours, council, council, address(0));
-        DeployGenesisMembership s = new DeployGenesisMembership();
-        vm.expectRevert(bytes("GOVERNANCE_TIMELOCK: minDelay below the 48 h genesis floor"));
-        s.deployWith(SENDER, address(weak), grantor, address(registry));
+        _expectRevert(bytes("GOVERNANCE_TIMELOCK: minDelay below the 48 h genesis floor"));
+        s.deployWith(SENDER, weakDelay.governanceTimelock, weakDelay.governanceMultisig, grantor, address(registry));
+        _expectRevert(bytes("GOVERNANCE_MULTISIG: below the 3-of-5 genesis floor"));
+        s.deployWith(SENDER, weakCouncil.governanceTimelock, weakCouncil.governanceMultisig, grantor, address(registry));
     }
 
     function test_accepts_48h_governance_on_the_genesis_chain() public {
@@ -190,57 +227,265 @@ contract DeployGenesisMembershipTest is Test {
     }
 
     function test_refuses_the_deployer_as_grantor() public {
-        DeployGenesisMembership s = new DeployGenesisMembership();
-        vm.expectRevert(bytes("MEMBERSHIP_GRANTOR cannot be the deployer"));
-        s.deployWith(SENDER, gov.governanceTimelock, SENDER, address(registry));
+        DeployGenesisMembership s = _script();
+        _expectRevert(bytes("MEMBERSHIP_GRANTOR cannot be the deployer"));
+        s.deployWith(SENDER, gov.governanceTimelock, gov.governanceMultisig, SENDER, address(registry));
     }
 
     function test_refuses_the_governance_timelock_as_grantor() public {
-        DeployGenesisMembership s = new DeployGenesisMembership();
-        vm.expectRevert(bytes("MEMBERSHIP_GRANTOR cannot be the governance timelock"));
-        s.deployWith(SENDER, gov.governanceTimelock, gov.governanceTimelock, address(registry));
+        DeployGenesisMembership s = _script();
+        _expectRevert(bytes("MEMBERSHIP_GRANTOR cannot be the governance timelock"));
+        s.deployWith(SENDER, gov.governanceTimelock, gov.governanceMultisig, gov.governanceTimelock, address(registry));
+    }
+
+    function test_refuses_the_governance_multisig_as_grantor() public {
+        DeployGenesisMembership s = _script();
+        _expectRevert(bytes("MEMBERSHIP_GRANTOR cannot be the governance multisig"));
+        s.deployWith(SENDER, gov.governanceTimelock, gov.governanceMultisig, gov.governanceMultisig, address(registry));
     }
 
     function test_refuses_a_zero_grantor() public {
-        DeployGenesisMembership s = new DeployGenesisMembership();
-        vm.expectRevert(bytes("MEMBERSHIP_GRANTOR must be set"));
-        s.deployWith(SENDER, gov.governanceTimelock, address(0), address(registry));
+        DeployGenesisMembership s = _script();
+        _expectRevert(bytes("MEMBERSHIP_GRANTOR must be set"));
+        s.deployWith(SENDER, gov.governanceTimelock, gov.governanceMultisig, address(0), address(registry));
     }
 
     function test_refuses_a_codeless_registry() public {
-        DeployGenesisMembership s = new DeployGenesisMembership();
-        vm.expectRevert(bytes("VALIDATOR_REGISTRY has no code on this chain"));
-        s.deployWith(SENDER, gov.governanceTimelock, grantor, makeAddr("nothing"));
+        DeployGenesisMembership s = _script();
+        _expectRevert(bytes("VALIDATOR_REGISTRY has no code on this chain"));
+        s.deployWith(SENDER, gov.governanceTimelock, gov.governanceMultisig, grantor, makeAddr("nothing"));
     }
 
     function test_refuses_a_registry_whose_min_stake_exceeds_the_grant() public {
         ValidatorRegistry steep = new ValidatorRegistry(
             gov.governanceTimelock, makeAddr("slasher"), makeAddr("minter"), GRANT + 1, 1 ether, 5000, 10_000 ether
         );
-        DeployGenesisMembership s = new DeployGenesisMembership();
-        vm.expectRevert(bytes("VALIDATOR_REGISTRY minStake exceeds the 32,000 SALT grant: members could never activate"));
-        s.deployWith(SENDER, gov.governanceTimelock, grantor, address(steep));
+        DeployGenesisMembership s = _script();
+        _expectRevert(bytes("VALIDATOR_REGISTRY minStake exceeds the 32,000 SALT grant: members could never activate"));
+        s.deployWith(SENDER, gov.governanceTimelock, gov.governanceMultisig, grantor, address(steep));
     }
 
     function test_refuses_a_broadcaster_that_is_not_the_deployer() public {
-        DeployGenesisMembership s = new DeployGenesisMembership();
-        vm.expectRevert(bytes("broadcast sender is not the configured deployer (DEPLOYER_ADDRESS)"));
-        s.deployWith(makeAddr("someone-else"), gov.governanceTimelock, grantor, address(registry));
+        DeployGenesisMembership s = _script();
+        _expectRevert(bytes("broadcast sender is not the configured deployer (DEPLOYER_ADDRESS)"));
+        s.deployWith(
+            makeAddr("someone-else"), gov.governanceTimelock, gov.governanceMultisig, grantor, address(registry)
+        );
     }
 
     // ── Output ──────────────────────────────────────────────────────────────
 
     function test_book_names_every_contract_and_the_lock() public {
-        DeployGenesisMembership s = new DeployGenesisMembership();
+        DeployGenesisMembership s = _script();
         DeployGenesisMembership.Deployed memory d =
-            s.deployWith(SENDER, gov.governanceTimelock, grantor, address(registry));
-        string memory json = s.bookJson(SENDER, gov.governanceTimelock, grantor, address(registry), d);
+            s.deployWith(SENDER, gov.governanceTimelock, gov.governanceMultisig, grantor, address(registry));
+        string memory json =
+            s.bookJson(SENDER, gov.governanceTimelock, gov.governanceMultisig, grantor, address(registry), d);
         assertEq(vm.parseJsonAddress(json, ".contracts.MembershipStakeVault"), d.vault);
         assertEq(vm.parseJsonAddress(json, ".contracts.CitrateMemberSBT"), d.sbt);
         assertEq(vm.parseJsonAddress(json, ".contracts.MemberBond"), d.bondImplementation);
         assertEq(vm.parseJsonAddress(json, ".contracts.GovernanceTimelock"), gov.governanceTimelock);
+        assertEq(vm.parseJsonAddress(json, ".contracts.GovernanceMultisig"), gov.governanceMultisig);
         assertEq(vm.parseJsonAddress(json, ".params.grantor"), grantor);
         assertEq(vm.parseJsonUint(json, ".params.lockSeconds"), 364 days);
         assertEq(vm.parseJsonUint(json, ".params.lockBlocks"), 364 days / 2);
+    }
+
+    /// The only test that sets MEMBERSHIP_GRANTOR / VALIDATOR_REGISTRY / GENESIS_MEMBERSHIP_OUT
+    /// (env is process-global, and DeployDormantLedgers.t sets GOVERNANCE_* concurrently with the
+    /// same values). The book it writes passes the admin gate, TIMELOCK-HOLDERS included
+    /// (GovernanceTimelock is paired with its GovernanceMultisig).
+    function test_run_requires_env_then_writes_a_gated_book() public {
+        vm.setEnv("DEPLOYER_ADDRESS", vm.toString(SENDER));
+        vm.setEnv("GOVERNANCE_TIMELOCK", vm.toString(gov.governanceTimelock));
+        vm.setEnv("GOVERNANCE_MULTISIG", vm.toString(gov.governanceMultisig));
+        vm.setEnv("VALIDATOR_REGISTRY", vm.toString(address(registry)));
+        vm.setEnv("GENESIS_MEMBERSHIP_OUT", "genesis/test-genesis-membership.json");
+        DeployGenesisMembership s = _script();
+        archive.absorb();
+        vm.expectRevert();
+        s.run(); // MEMBERSHIP_GRANTOR unset
+        vm.setEnv("MEMBERSHIP_GRANTOR", vm.toString(grantor));
+
+        vm.createDir("genesis", true);
+        DeployGenesisMembership.Deployed memory d = s.run();
+        string memory book = vm.readFile("genesis/test-genesis-membership.json");
+        assertEq(vm.parseJsonAddress(book, ".contracts.MembershipStakeVault"), d.vault);
+        assertEq(vm.parseJsonAddress(book, ".contracts.GovernanceTimelock"), gov.governanceTimelock);
+        assertEq(vm.parseJsonAddress(book, ".contracts.GovernanceMultisig"), gov.governanceMultisig);
+
+        vm.etch(P256_VERIFIER, hex"600160005260206000f3");
+        CheckDeployedAdmins c = _gate();
+        c.check(book, true);
+        assertEq(c.deployerAdmin(), 0, "DEPLOYER-ADMIN reads 0 after hand-over");
+        assertEq(c.factoryAdmin(), 0);
+        vm.removeFile("genesis/test-genesis-membership.json");
+    }
+
+    // ── Governance: the council is authenticated and the holder sets are complete ──
+
+    function test_refuses_a_council_that_is_not_the_timelocks_multisig() public {
+        DeployGenesisMembership s = _script();
+        MultisigProposer stranger = new MultisigProposer(gov.governanceTimelock, govOwners, 3);
+        _expectRevert(bytes("GOVERNANCE_TIMELOCK: multisig lacks a timelock role"));
+        s.deployWith(SENDER, gov.governanceTimelock, address(stranger), grantor, address(registry));
+        _expectRevert(bytes("GOVERNANCE_MULTISIG has no code on this chain"));
+        s.deployWith(SENDER, gov.governanceTimelock, makeAddr("nomultisig"), grantor, address(registry));
+        // The GUARDIAN council is a genuine ceremony multisig, but not GOVERNANCE's.
+        _expectRevert(bytes("GOVERNANCE_TIMELOCK: multisig lacks a timelock role"));
+        s.deployWith(SENDER, gov.governanceTimelock, gov.guardianMultisig, grantor, address(registry));
+    }
+
+    /// A single-signer forwarder that reports a compliant 3-of-5 council and is the timelock's
+    /// sole proposer / executor / canceller is refused on CREATE2 provenance, before broadcast.
+    function test_refuses_a_self_reporting_forwarder_council() public {
+        vm.chainId(40204);
+        TimelockController tl = new TimelockController(48 hours, new address[](0), new address[](0), SENDER);
+        SelfReportingForwarder fwd = new SelfReportingForwarder(address(tl), makeAddr("lone-signer"), govOwners);
+        _grantCouncil(tl, address(fwd));
+        _finish(tl);
+        DeployGenesisMembership s = _script();
+        uint64 nonceBefore = vm.getNonce(SENDER);
+        _expectRevert(
+            bytes(
+                "GOVERNANCE_MULTISIG: not the MultisigProposer the ceremony deploys (Genesis.GovernanceMultisig) for this timelock, owners and threshold"
+            )
+        );
+        s.deployWith(SENDER, address(tl), address(fwd), grantor, address(registry));
+        assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
+    }
+
+    /// Named-account checks pass (no deploy account holds anything); the complete holder sets
+    /// do not: an extra admin, proposer, executor or canceller is refused before broadcast.
+    function test_refuses_any_extra_timelock_role_holder() public {
+        vm.chainId(40204);
+        bytes32[4] memory roles =
+            [bytes32(0x00), keccak256("PROPOSER_ROLE"), keccak256("EXECUTOR_ROLE"), keccak256("CANCELLER_ROLE")];
+        string[4] memory reasons = [
+            "GOVERNANCE_TIMELOCK: DEFAULT_ADMIN_ROLE holders are not exactly the timelock itself",
+            "GOVERNANCE_TIMELOCK: PROPOSER_ROLE holders are not exactly the multisig",
+            "GOVERNANCE_TIMELOCK: EXECUTOR_ROLE holders are not exactly the multisig",
+            "GOVERNANCE_TIMELOCK: CANCELLER_ROLE is held by an account other than the multisig"
+        ];
+        DeployGenesisMembership s = _script();
+        for (uint256 i = 0; i < 4; i++) {
+            (TimelockController tl, MultisigProposer ms) = _handedTimelock();
+            vm.prank(SENDER);
+            tl.grantRole(roles[i], makeAddr("operator"));
+            _finish(tl);
+            uint64 nonceBefore = vm.getNonce(SENDER);
+            _expectRevert(bytes(reasons[i]));
+            s.deployWith(SENDER, address(tl), address(ms), grantor, address(registry));
+            assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
+        }
+    }
+
+    /// A hand-built timelock with exactly the ceremony council and nothing else passes, so the
+    /// check above is about the extra holder, not about the hand-built setup.
+    function test_accepts_a_hand_built_timelock_with_exact_holders() public {
+        vm.chainId(40204);
+        (TimelockController tl, MultisigProposer ms) = _handedTimelock();
+        _finish(tl);
+        DeployGenesisMembership.Deployed memory d =
+            _script().deployWith(SENDER, address(tl), address(ms), grantor, address(registry));
+        assertEq(MembershipStakeVault(payable(d.vault)).governance(), address(tl));
+    }
+
+    /// The extra-canceller hook: one named account may cancel besides the council, and only it.
+    function test_extra_canceller_hook_allows_only_the_named_account() public {
+        vm.chainId(40204);
+        address guardian = makeAddr("guardian-canceller");
+        MembershipWithExtraCanceller s = new MembershipWithExtraCanceller(guardian);
+        s.useArchive(archive);
+
+        (TimelockController tl, MultisigProposer ms) = _handedTimelock();
+        vm.prank(SENDER);
+        tl.grantRole(keccak256("CANCELLER_ROLE"), guardian);
+        _finish(tl);
+        s.deployWith(SENDER, address(tl), address(ms), grantor, address(registry));
+
+        DeployGenesisMembership plain = _script();
+        _expectRevert(bytes("GOVERNANCE_TIMELOCK: CANCELLER_ROLE is held by an account other than the multisig"));
+        plain.deployWith(SENDER, address(tl), address(ms), grantor, address(registry));
+    }
+
+    /// No node behind the role-history read (the production path under `forge test`): refused
+    /// before anything is sent.
+    function test_missing_role_history_fails_closed() public {
+        DeployGenesisMembership live = new DeployGenesisMembership();
+        uint64 nonceBefore = vm.getNonce(SENDER);
+        _expectRevert(
+            bytes(
+                string.concat(
+                    "GOVERNANCE_TIMELOCK: role history unavailable: eth_getLogs failed for blocks 0-",
+                    vm.toString(block.number)
+                )
+            )
+        );
+        live.deployWith(SENDER, gov.governanceTimelock, gov.governanceMultisig, grantor, address(registry));
+        assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
+    }
+
+    // ── helpers ─────────────────────────────────────────────────────────────
+
+    function _council(uint256 threshold, uint256 n, uint256 delay)
+        internal
+        returns (DeployGenesisGovernance.Deployed memory)
+    {
+        address[] memory owners = new address[](n);
+        for (uint256 i = 0; i < n; i++) {
+            owners[i] = address(uint160(0xC000 + (threshold << 8) + (n << 4) + i));
+        }
+        address[] memory grdOwners = new address[](3);
+        for (uint256 i = 0; i < 3; i++) {
+            grdOwners[i] = address(uint160(0xB000 + i));
+        }
+        return new DeployGenesisGovernance()
+            .deployWith(
+                SENDER,
+                DeployGenesisGovernance.Council({owners: owners, threshold: threshold, minDelay: delay}),
+                DeployGenesisGovernance.Council({owners: grdOwners, threshold: 2, minDelay: 1 hours}),
+                false
+            );
+    }
+
+    /// A 48 h OZ timelock, deployer-administered for now, with a ceremony-provenance council
+    /// holding all three seats. The caller adds any extra seats, then `_finish`.
+    function _handedTimelock() internal returns (TimelockController tl, MultisigProposer ms) {
+        tl = new TimelockController(48 hours, new address[](0), new address[](0), SENDER);
+        bytes memory init =
+            abi.encodePacked(type(MultisigProposer).creationCode, abi.encode(address(tl), govOwners, uint256(3)));
+        (bool ok, bytes memory ret) = ARACHNID.call(abi.encodePacked(Salts.salt(GOV_SALT), init));
+        require(ok && ret.length == 20, "factory deploy failed");
+        ms = MultisigProposer(address(bytes20(ret)));
+        _grantCouncil(tl, address(ms));
+    }
+
+    function _grantCouncil(TimelockController tl, address ms) internal {
+        vm.startPrank(SENDER);
+        tl.grantRole(tl.PROPOSER_ROLE(), ms);
+        tl.grantRole(tl.EXECUTOR_ROLE(), ms);
+        tl.grantRole(tl.CANCELLER_ROLE(), ms);
+        vm.stopPrank();
+    }
+
+    function _finish(TimelockController tl) internal {
+        bytes32 adminRole = tl.DEFAULT_ADMIN_ROLE();
+        vm.prank(SENDER);
+        tl.renounceRole(adminRole, SENDER);
+    }
+}
+
+/// The script with one extra allowed canceller, the shape a guardian canceller will take.
+contract MembershipWithExtraCanceller is MembershipWithHistory {
+    address internal immutable extra;
+
+    constructor(address extra_) {
+        extra = extra_;
+    }
+
+    function _governanceExtraCancellers() internal view override returns (address[] memory a) {
+        a = new address[](1);
+        a[0] = extra;
     }
 }

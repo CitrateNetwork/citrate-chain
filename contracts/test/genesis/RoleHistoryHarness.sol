@@ -4,6 +4,7 @@ pragma solidity ^0.8.26;
 import {Vm} from "forge-std/Vm.sol";
 import {AdminChecks} from "../../script/lib/AdminChecks.sol";
 import {DeployDormantLedgers} from "../../script/DeployDormantLedgers.s.sol";
+import {DeployGenesisMembership} from "../../script/DeployGenesisMembership.s.sol";
 import {CheckDeployedAdmins} from "../../script/CheckDeployedAdmins.s.sol";
 
 /// @title Node stand-in for the timelock role history (AdminChecks `_timelockRoleHistory`)
@@ -80,6 +81,16 @@ abstract contract RecordedRoleHistory is AdminChecks {
 }
 
 contract DormantWithHistory is DeployDormantLedgers, RecordedRoleHistory {
+    function _timelockRoleHistory(address timelock)
+        internal
+        override(AdminChecks, RecordedRoleHistory)
+        returns (bool, string memory, RoleEvent[] memory)
+    {
+        return RecordedRoleHistory._timelockRoleHistory(timelock);
+    }
+}
+
+contract MembershipWithHistory is DeployGenesisMembership, RecordedRoleHistory {
     function _timelockRoleHistory(address timelock)
         internal
         override(AdminChecks, RecordedRoleHistory)

@@ -12,6 +12,7 @@ import {CitrateMemberSBT} from "../src/core_membership/CitrateMemberSBT.sol";
 import {MemberBond} from "../src/core_membership/MemberBond.sol";
 import {MembershipStakeVault} from "../src/core_membership/MembershipStakeVault.sol";
 import {ValidatorRegistry} from "../src/ValidatorRegistry.sol";
+import {MultisigProposer} from "../src/genesis/MultisigProposer.sol";
 
 /// @title DeployGenesisMembership: the Track M money path in the genesis contract set (C2 D9 / C4)
 /// @notice Deploys the membership grant path for the betanet genesis: the 32,000-SALT grant
@@ -37,25 +38,45 @@ import {ValidatorRegistry} from "../src/ValidatorRegistry.sol";
 ///
 ///         Fail closed before anything is sent:
 ///           - GOVERNANCE_TIMELOCK is an OZ TimelockController that administers itself, with
-///             execution not open to everyone, on which neither the configured deployer nor
-///             this script holds an admin slot or governing seat. Floors: chain 40204 (the
-///             genesis profile, selected by chain id, no override) needs minDelay >= 48 h;
-///             any other chain (rehearsal) >= 1 h.
-///           - GRANTOR is nonzero and is not the deployer, the governance timelock or the
-///             CREATE2 factory.
+///             execution not open to everyone, run by GOVERNANCE_MULTISIG, on which neither the
+///             configured deployer nor the CREATE2 factory holds an admin slot or governing
+///             seat (and neither is a council owner). Floors: chain 40204 (the genesis profile,
+///             selected by chain id, no override) needs minDelay >= 48 h AND a council of at
+///             least 3-of-5; any other chain (rehearsal) needs minDelay >= 1 h.
+///           - GOVERNANCE_MULTISIG is authenticated before any of its getters is read: its
+///             address must be the CREATE2 address DeployGenesisGovernance gives a
+///             MultisigProposer for (this timelock, its reported owners, its reported
+///             threshold) under the salt "Genesis.GovernanceMultisig" (AdminChecks
+///             `_assertMultisigProposer`). A contract that only answers the same getters is
+///             refused.
+///           - Complete holder sets, not only named accounts: the timelock runs this build's
+///             OZ TimelockController code, is its own SOLE DEFAULT_ADMIN, and has the council
+///             as SOLE PROPOSER, EXECUTOR and CANCELLER, rebuilt from the timelock's
+///             RoleGranted / RoleRevoked logs (AdminChecks `_assertTimelockSoleHolders`; needs
+///             --rpc-url, see DeployDormantLedgers for TIMELOCK_HISTORY_FROM_BLOCK / _WINDOW).
+///             No node, a failed page, or a history that does not start at the timelock's
+///             construction fails closed.
+///           - GRANTOR is nonzero and is not the deployer, the governance timelock, the
+///             governance multisig or the CREATE2 factory.
 ///           - VALIDATOR_REGISTRY has code and its `minStake()` is at most the 32,000 SALT a
 ///             grant carries, otherwise no granted member could ever activate.
 ///           - the forge broadcaster is the configured deployer.
 ///         Postconditions on the live contracts: vault owner == GRANTOR, vault governance ==
 ///         GOVERNANCE_TIMELOCK, no pending governance, SBT owner == GRANTOR, the vault holds
-///         no SALT, and neither the deployer, the broadcaster, this script nor the CREATE2
-///         factory holds any admin slot on the SBT or the vault.
+///         no SALT, and neither the deployer, the actual broadcaster nor the CREATE2 factory
+///         holds any admin slot on the SBT or the vault; the governance checks are re-run
+///         with the broadcaster added to the deploy accounts. The script contract's own address
+///         is never an account here: it exists only in simulation (forge refuses
+///         `address(this)` on a script run path), so the deploy accounts are the configured
+///         deployer and the broadcaster.
 ///
-///         Required env: GOVERNANCE_TIMELOCK, MEMBERSHIP_GRANTOR (the treasury-signer address
+///         Required env: GOVERNANCE_TIMELOCK, GOVERNANCE_MULTISIG (its GovernanceMultisig from
+///         DeployGenesisGovernance), MEMBERSHIP_GRANTOR (the treasury-signer address
 ///         that places grants), VALIDATOR_REGISTRY, GENESIS_MEMBERSHIP_OUT, and
 ///         CEREMONY_DEPLOYER_ADDRESS or DEPLOYER_ADDRESS (must equal the forge broadcast
 ///         signer; enforced). Output: a book-shaped JSON at GENESIS_MEMBERSHIP_OUT, which
-///         `CheckDeployedAdmins` reads through EXTRA_ADDRESS_BOOKS. Nothing touches
+///         `CheckDeployedAdmins` reads through EXTRA_ADDRESS_BOOKS; it lists GovernanceTimelock
+///         with its paired GovernanceMultisig, so the gate's TIMELOCK-HOLDERS check re-runs. Nothing touches
 ///         `addresses/40204.json`.
 ///
 ///         NOTE: chain 40204 rejects EIP-1559 transactions; broadcast with `--legacy` and an
@@ -69,6 +90,8 @@ contract DeployGenesisMembership is ScriptEnv, AdminChecks, Create2Deploy, Genes
     uint256 public constant GENESIS_CHAIN_ID = 40204;
     /// Genesis profile: GOVERNANCE runs behind a 48 h delay (C2 D5, owner decision 2026-10-19).
     uint256 public constant GENESIS_GOV_MIN_DELAY = 48 hours;
+    uint256 public constant GENESIS_GOV_MIN_THRESHOLD = 3;
+    uint256 public constant GENESIS_GOV_MIN_OWNERS = 5;
     /// Rehearsal chains: DeployGenesisGovernance.MIN_DELAY_FLOOR.
     uint256 public constant REHEARSAL_GOV_MIN_DELAY = 1 hours;
 
@@ -82,23 +105,25 @@ contract DeployGenesisMembership is ScriptEnv, AdminChecks, Create2Deploy, Genes
     function run() external returns (Deployed memory d) {
         address deployer = deployerAddress();
         address governance = vm.envAddress("GOVERNANCE_TIMELOCK");
+        address council = vm.envAddress("GOVERNANCE_MULTISIG");
         address grantor = vm.envAddress("MEMBERSHIP_GRANTOR");
         address registry = vm.envAddress("VALIDATOR_REGISTRY");
         vm.envString("GENESIS_MEMBERSHIP_OUT"); // resolve before broadcasting: a missing path fails first
-        d = deployWith(deployer, governance, grantor, registry);
-        _writeBook("GENESIS_MEMBERSHIP_OUT", bookJson(deployer, governance, grantor, registry, d));
+        d = deployWith(deployer, governance, council, grantor, registry);
+        _writeBook("GENESIS_MEMBERSHIP_OUT", bookJson(deployer, governance, council, grantor, registry, d));
     }
 
     /// @notice The ceremony with explicit inputs (no env reads), for tests and callers.
-    function deployWith(address deployer, address governance, address grantor, address registry)
+    function deployWith(address deployer, address governance, address council, address grantor, address registry)
         public
         returns (Deployed memory d)
     {
-        _assertInputs(deployer, governance, grantor, registry);
+        _assertInputs(deployer, governance, council, grantor, registry);
 
         console.log("=== Genesis membership (Track M) ===");
         console.log("Deployer           :", deployer);
         console.log("Governance timelock:", governance);
+        console.log("Governance multisig:", council);
         console.log("Grantor            :", grantor);
         console.log("ValidatorRegistry  :", registry);
 
@@ -109,9 +134,12 @@ contract DeployGenesisMembership is ScriptEnv, AdminChecks, Create2Deploy, Genes
         // Refuses to send anything unless the forge signer is the configured deployer.
         address broadcaster = _startBroadcastAsDeployer(deployer);
 
-        d.sbt = _isLive(SBT, sbtInit) ? _create2Address(SBT, sbtInit) : address(new CitrateMemberSBT{salt: Salts.salt(SBT)}(grantor));
-        d.bondImplementation =
-            _isLive(BOND, bondInit) ? _create2Address(BOND, bondInit) : address(new MemberBond{salt: Salts.salt(BOND)}());
+        d.sbt = _isLive(SBT, sbtInit)
+            ? _create2Address(SBT, sbtInit)
+            : address(new CitrateMemberSBT{salt: Salts.salt(SBT)}(grantor));
+        d.bondImplementation = _isLive(BOND, bondInit)
+            ? _create2Address(BOND, bondInit)
+            : address(new MemberBond{salt: Salts.salt(BOND)}());
         d.vaultImplementation = _isLive(VAULT_IMPL, implInit)
             ? _create2Address(VAULT_IMPL, implInit)
             : address(new MembershipStakeVault{salt: Salts.salt(VAULT_IMPL)}());
@@ -133,24 +161,31 @@ contract DeployGenesisMembership is ScriptEnv, AdminChecks, Create2Deploy, Genes
         vm.stopBroadcast();
 
         _assertHandedOver(d, deployer, broadcaster, governance, grantor, registry);
+        address[] memory deployAccounts = new address[](2);
+        (deployAccounts[0], deployAccounts[1]) = (deployer, broadcaster);
+        _assertGovernanceCouncil(governance, council, deployAccounts, _governanceExtraCancellers());
         console.log("CitrateMemberSBT          :", d.sbt);
         console.log("MemberBond (impl)         :", d.bondImplementation);
         console.log("MembershipStakeVault impl :", d.vaultImplementation);
         console.log("MembershipStakeVault      :", d.vault);
     }
 
-    function bookJson(address deployer, address governance, address grantor, address registry, Deployed memory d)
-        public
-        view
-        returns (string memory)
-    {
-        string[] memory names = new string[](5);
-        address[] memory addrs = new address[](5);
+    function bookJson(
+        address deployer,
+        address governance,
+        address council,
+        address grantor,
+        address registry,
+        Deployed memory d
+    ) public view returns (string memory) {
+        string[] memory names = new string[](6);
+        address[] memory addrs = new address[](6);
         (names[0], addrs[0]) = ("CitrateMemberSBT", d.sbt);
         (names[1], addrs[1]) = ("MemberBond", d.bondImplementation);
         (names[2], addrs[2]) = ("MembershipStakeVaultImpl", d.vaultImplementation);
         (names[3], addrs[3]) = ("MembershipStakeVault", d.vault);
         (names[4], addrs[4]) = ("GovernanceTimelock", governance);
+        (names[5], addrs[5]) = ("GovernanceMultisig", council);
         string memory params = string.concat(
             '"governance":"',
             vm.toString(governance),
@@ -166,26 +201,22 @@ contract DeployGenesisMembership is ScriptEnv, AdminChecks, Create2Deploy, Genes
         return _bookJson(deployer, names, addrs, params);
     }
 
-    function _assertInputs(address deployer, address governance, address grantor, address registry)
+    function _assertInputs(address deployer, address governance, address council, address grantor, address registry)
         internal
-        view
     {
         require(deployer != address(0), "deployer must be set");
         require(governance != deployer, "GOVERNANCE_TIMELOCK cannot be the deployer");
         require(_isTimelock(governance), "GOVERNANCE_TIMELOCK is not a TimelockController");
-        _assertTimelockShape(governance, deployer);
-        uint256 delay = _timelockMinDelay(governance);
-        bool genesis = block.chainid == GENESIS_CHAIN_ID;
-        require(
-            delay >= (genesis ? GENESIS_GOV_MIN_DELAY : REHEARSAL_GOV_MIN_DELAY),
-            genesis
-                ? "GOVERNANCE_TIMELOCK: minDelay below the 48 h genesis floor"
-                : "GOVERNANCE_TIMELOCK: minDelay below the 1 h rehearsal floor"
-        );
+        // Before broadcasting the only known deploy account is the configured deployer; the
+        // broadcaster is added after `_startBroadcastAsDeployer` proves it (deployWith).
+        address[] memory accounts = new address[](1);
+        accounts[0] = deployer;
+        _assertGovernanceCouncil(governance, council, accounts, _governanceExtraCancellers());
 
         require(grantor != address(0), "MEMBERSHIP_GRANTOR must be set");
         require(grantor != deployer, "MEMBERSHIP_GRANTOR cannot be the deployer");
         require(grantor != governance, "MEMBERSHIP_GRANTOR cannot be the governance timelock");
+        require(grantor != council, "MEMBERSHIP_GRANTOR cannot be the governance multisig");
         require(grantor != ARACHNID_FACTORY, "MEMBERSHIP_GRANTOR cannot be the CREATE2 factory");
 
         require(registry.code.length != 0, "VALIDATOR_REGISTRY has no code on this chain");
@@ -196,20 +227,60 @@ contract DeployGenesisMembership is ScriptEnv, AdminChecks, Create2Deploy, Genes
         );
     }
 
-    /// @notice The timelock administers itself, execution is not open to everyone, and neither
-    ///         the deployer nor this script holds an admin slot or governing seat on it.
-    function _assertTimelockShape(address governance, address deployer) internal view {
+    /// @notice Accounts other than the council that may hold CANCELLER_ROLE on
+    ///         GOVERNANCE_TIMELOCK. None today; the governance-hardening change that adds a
+    ///         guardian canceller extends this one list (shared by the pre-broadcast check and
+    ///         the postcondition).
+    function _governanceExtraCancellers() internal view virtual returns (address[] memory) {
+        return new address[](0);
+    }
+
+    /// @notice Revert unless `governance` is a self-administered timelock run only by `council`
+    ///         (the ceremony's MultisigProposer fronting it), at or above this profile's floors,
+    ///         on which no address in `accounts` (the deploy accounts) holds an admin slot or
+    ///         governing seat. `extraCancellers` may hold CANCELLER_ROLE besides the council.
+    ///         Same checks, in the same order, as DeployDormantLedgers (chain#320).
+    function _assertGovernanceCouncil(
+        address governance,
+        address council,
+        address[] memory accounts,
+        address[] memory extraCancellers
+    ) internal {
         string memory tl = "GOVERNANCE_TIMELOCK";
-        _assertNoFactoryAdmin(tl, governance);
-        _assertNoDeployerAdmin(tl, governance, deployer);
-        _assertNoDeployerAdmin(tl, governance, address(this));
-        (bool okOpen, bool open) = _readBool(
-            governance, abi.encodeWithSignature("hasRole(bytes32,address)", TIMELOCK_EXECUTOR_ROLE, address(0))
+        string memory ms = "GOVERNANCE_MULTISIG";
+        require(council.code.length != 0, "GOVERNANCE_MULTISIG has no code on this chain");
+        _assertTimelockSeats(tl, governance, council, accounts[0]);
+        // Authenticate the council before trusting any of its getters: it must be the
+        // MultisigProposer DeployGenesisGovernance deploys for this timelock (CREATE2 provenance).
+        _assertMultisigProposer(ms, council, governance, string.concat(GENESIS_SALT_PREFIX, "GovernanceMultisig"));
+        _assertNoFactoryAdmin(ms, council);
+        for (uint256 i = 0; i < accounts.length; i++) {
+            require(accounts[i] != council, "GOVERNANCE_MULTISIG cannot be a deploy account");
+            _assertNoDeployerAdmin(tl, governance, accounts[i]);
+            _assertNoDeployerAdmin(ms, council, accounts[i]);
+        }
+
+        bool genesis = block.chainid == GENESIS_CHAIN_ID;
+        uint256 delay = _timelockMinDelay(governance);
+        require(
+            delay >= (genesis ? GENESIS_GOV_MIN_DELAY : REHEARSAL_GOV_MIN_DELAY),
+            genesis
+                ? "GOVERNANCE_TIMELOCK: minDelay below the 48 h genesis floor"
+                : "GOVERNANCE_TIMELOCK: minDelay below the 1 h rehearsal floor"
         );
-        require(okOpen && !open, "GOVERNANCE_TIMELOCK: execution is open to anyone");
-        (bool okSelf, bool self) =
-            _readBool(governance, abi.encodeWithSignature("hasRole(bytes32,address)", DEFAULT_ADMIN_ROLE, governance));
-        require(okSelf && self, "GOVERNANCE_TIMELOCK: timelock does not administer itself");
+
+        (bool ok, address fronted) = _readAddress(council, abi.encodeWithSignature("timelock()"));
+        require(ok && fronted == governance, "GOVERNANCE_MULTISIG does not front GOVERNANCE_TIMELOCK");
+        if (genesis) {
+            MultisigProposer m = MultisigProposer(council);
+            require(
+                m.threshold() >= GENESIS_GOV_MIN_THRESHOLD && m.owners().length >= GENESIS_GOV_MIN_OWNERS,
+                "GOVERNANCE_MULTISIG: below the 3-of-5 genesis floor"
+            );
+        }
+        // Complete holder sets: the timelock is its SOLE admin and the council its SOLE proposer
+        // and executor (and canceller, besides `extraCancellers`), from the role history.
+        _assertTimelockSoleHolders(tl, governance, council, extraCancellers);
     }
 
     function _assertHandedOver(
@@ -228,17 +299,21 @@ contract DeployGenesisMembership is ScriptEnv, AdminChecks, Create2Deploy, Genes
         require(vault.pendingGovernance() == address(0), "MembershipStakeVault: a governance transfer is pending");
         require(address(vault.registry()) == registry, "MembershipStakeVault: registry mismatch");
         require(address(vault.sbt()) == d.sbt, "MembershipStakeVault: sbt mismatch");
-        require(vault.bondImplementation() == d.bondImplementation, "MembershipStakeVault: bond implementation mismatch");
+        require(
+            vault.bondImplementation() == d.bondImplementation, "MembershipStakeVault: bond implementation mismatch"
+        );
         require(d.vault.balance == 0, "MembershipStakeVault: the vault must hold no SALT");
         _assertOwner("CitrateMemberSBT", d.sbt, grantor);
         require(sbt.owner() == grantor, "CitrateMemberSBT: owner is not the grantor");
 
-        address[4] memory accounts = [deployer, broadcaster, address(this), ARACHNID_FACTORY];
+        // Deploy accounts: the configured deployer and the actual broadcaster (no script-contract
+        // address: it exists only in simulation). The factory has its own check.
+        address[2] memory accounts = [deployer, broadcaster];
         string[4] memory names = ["MembershipStakeVault", "CitrateMemberSBT", "MemberBond", "MembershipStakeVault.impl"];
         address[4] memory targets = [d.vault, d.sbt, d.bondImplementation, d.vaultImplementation];
         for (uint256 t = 0; t < targets.length; t++) {
             _assertNoFactoryAdmin(names[t], targets[t]);
-            for (uint256 a = 0; a < 3; a++) {
+            for (uint256 a = 0; a < accounts.length; a++) {
                 _assertNoDeployerAdmin(names[t], targets[t], accounts[a]);
             }
         }
