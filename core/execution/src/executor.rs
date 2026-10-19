@@ -4089,6 +4089,10 @@ impl Executor {
 }
 
 #[cfg(test)]
+#[path = "executor_journal_routing_tests.rs"]
+mod journal_routing_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
