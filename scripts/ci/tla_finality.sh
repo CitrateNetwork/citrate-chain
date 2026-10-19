@@ -9,6 +9,9 @@
 #   MUST FAIL  CheckpointFinalitySafety_norecord.cfg  NoConflictingFinality (no signed-vote record)
 #   MUST FAIL  CheckpointFinalitySafety_strict.cfg    FinalizedStaysCanonical (open finding:
 #              the floor is raised by the verifier poll, after finalization)
+#   MUST FAIL  CheckpointFinalitySafety_committees.cfg NoConflictingFinality (open finding:
+#              committees are drawn per candidate block, so siblings can be finalized
+#              by different committees without any equivocation)
 #
 # The MUST-FAIL configs are mutation checks: they prove the model can see the
 # violations the passing config rules out. If one of them starts passing, the
@@ -84,6 +87,7 @@ expect_pass CheckpointFinalitySafety CheckpointFinalitySafety.cfg
 expect_violation CheckpointFinalitySafety CheckpointFinalitySafety_byz2.cfg NoConflictingFinality
 expect_violation CheckpointFinalitySafety CheckpointFinalitySafety_norecord.cfg NoConflictingFinality
 expect_violation CheckpointFinalitySafety CheckpointFinalitySafety_strict.cfg FinalizedStaysCanonical
+expect_violation CheckpointFinalitySafety CheckpointFinalitySafety_committees.cfg NoConflictingFinality
 if [ "${TLA_FINALITY_DEEP:-0}" = "1" ]; then
     TIMEOUT="${TLC_DEEP_TIMEOUT:-7200}" expect_pass CheckpointFinalitySafety CheckpointFinalitySafety_deep.cfg
 fi

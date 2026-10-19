@@ -109,6 +109,7 @@ fn gating_config_checks_s1_and_s2() {
         "CheckpointFinalitySafety_byz2.cfg",
         "CheckpointFinalitySafety_norecord.cfg",
         "CheckpointFinalitySafety_strict.cfg",
+        "CheckpointFinalitySafety_committees.cfg",
     ] {
         assert!(CI_SCRIPT.contains(cfg), "{cfg} not run by tla_finality.sh");
     }
@@ -123,9 +124,18 @@ fn model_constants_are_the_rust_constants() {
     assert_eq!(min, MIN_FINALITY_COMMITTEE);
     assert_eq!(
         definition(SPEC, "Quorum"),
-        Some("(2 * Cardinality(Voters)) \\div 3 + 1"),
-        "the model's quorum rule is floor(2n/3)+1"
+        Some("(2 * CommitteeSize) \\div 3 + 1"),
+        "the model's quorum rule is floor(2n/3)+1 over the candidate's committee"
     );
+    // Committees are per candidate (committee_for seeds the selector with the
+    // candidate block's VRF output): only committee members' votes count.
+    assert_eq!(
+        definition(SPEC, "Supporters(h, x)"),
+        Some("{v \\in Committee(h, x) : <<v, h, x>> \\in AllVotes}")
+    );
+    // The gating config's committee is the whole 4-voter set, as the trace
+    // walks below assume; the per-candidate case is the _committees finding.
+    assert!(SPEC_CFG.contains("CommitteeSize = 4"));
     for n in 1usize..=1000 {
         assert_eq!(derived_quorum(n), (2 * n) / 3 + 1, "n = {n}");
     }

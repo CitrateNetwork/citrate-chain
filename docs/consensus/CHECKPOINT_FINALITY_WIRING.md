@@ -450,11 +450,27 @@ message).
   `s2_strict_reorg_below_fresh_certificate_is_rejected` (ignored, "bug: …"); TLA+:
   `CheckpointFinalitySafety_strict.cfg`. Decision for the owner: raise the floor at finalization
   (after the same hash check) or restate S2 against the verified height.
+- **Open finding (S1 across sibling committees; review of #333 @ 0286eff):** the committee for
+  `(H, block)` is drawn by `FinalityGadget::committee_for` from the governing snapshot with the
+  CANDIDATE block's own VRF output as seed. Once the validator set is larger than
+  `committee_size`, two siblings at `H` get different committees, and the quorum bound
+  (`floor(2n/3)+1` of ONE committee) no longer forces two quorums to share an honest signer.
+  Under a partition along the fork, each committee can finalize its own sibling with no
+  equivocation and no Byzantine key. Tests: `open_finding_sibling_committees_finalize_conflicting_blocks`
+  (passes: pins the counterexample — 8 validators, committees of 4 overlapping in at most one
+  member, both siblings finalize) and `s1_sibling_committees_never_finalize_conflicting_blocks`
+  (ignored, "bug: …"). TLA+: committees are now modelled per candidate (`comm`, `CommitteeSize`);
+  `CheckpointFinalitySafety_committees.cfg` (5 voters, f = 1, committees of 4) must produce the
+  violation. The gating configs keep `CommitteeSize` = all voters, i.e. they verify S1 only
+  for a committee shared by every candidate. Decision for the owner (protocol change, before
+  voting is enabled): make the committee independent of the candidate (e.g. seed it from a
+  block every candidate at `H` shares, or use the whole snapshot set while it is small), or
+  require the quorum over a fixed set.
 - **TLA+:** `specs/tla/consensus/CheckpointFinalitySafety.tla` models S1/S2 across nodes
   (actions Propose, SignVote, Finalize, VerifyFloor, Reorg, Restart). TLC runs in CI
   (`.github/workflows/tla-finality.yml` → `scripts/ci/tla_finality.sh`, TLC 1.7.1 sha256-pinned):
-  the bounded gating config must pass, and three mutation configs must produce counterexamples
-  (f ≥ n/3; no durable signed-vote record; strict S2). The two-height config
+  the bounded gating config must pass, and four configs must produce counterexamples
+  (f ≥ n/3; no durable signed-vote record; strict S2; per-candidate committees). The two-height config
   (`_deep.cfg`) runs on demand (`TLA_FINALITY_DEEP=1`; exhaustive local run 2026-10-19:
   92.1M distinct states, no violation, 46 min). `CheckpointVoteSafety` now runs too,
   with a submission bound and two invariants restated (errata in the spec: as first written they

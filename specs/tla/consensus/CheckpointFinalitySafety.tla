@@ -40,8 +40,18 @@ EXTENDS Naturals, FiniteSets, TLC
 \* Finalize may count any sent vote; Byzantine voters are assumed to have sent
 \* every possible vote.
 \*
+\* Committees are PER CANDIDATE: FinalityGadget::committee_for seeds
+\* CommitteeSelector::select with the candidate block's own VRF output, so
+\* sibling candidates at one height can get different committees once the
+\* validator set is larger than committee_size. `comm[<<h, x>>]` is that
+\* committee, chosen arbitrarily (any CommitteeSize-subset of Voters) at Init
+\* and fixed thereafter; only its members' votes count toward the candidate's
+\* quorum, and an honest node signs only as a member. With CommitteeSize =
+\* Cardinality(Voters) every candidate has the same committee (the full set).
+\*
 \* Configs:
-\*   CheckpointFinalitySafety.cfg         f = 1 of 4 voters: every invariant holds (gating).
+\*   CheckpointFinalitySafety.cfg         f = 1 of 4 voters, committee = all 4: every
+\*                                        invariant holds (gating).
 \*   CheckpointFinalitySafety_byz2.cfg    f = 2 of 4 (>= 1/3): TLC MUST find an S1
 \*                                        violation (the model has teeth).
 \*   CheckpointFinalitySafety_norecord.cfg no durable signed-vote record: TLC MUST find an
@@ -53,6 +63,11 @@ EXTENDS Naturals, FiniteSets, TLC
 \*                                        verifier's poll, AFTER finalization, so a reorg
 \*                                        in between proceeds and the next poll halts
 \*                                        finality (open finding, see the Stage 2 PR).
+\*   CheckpointFinalitySafety_committees.cfg 5 voters (f = 1), committees of 4 per
+\*                                        candidate: TLC MUST find an S1 violation with no
+\*                                        honest equivocation — two siblings finalized by
+\*                                        different committees (open finding, review of
+\*                                        #333 @ 0286eff; see the spec doc §8).
 
 CONSTANTS
     Nodes,          \* honest nodes; each is also a committee voter with its own chain
@@ -60,7 +75,8 @@ CONSTANTS
     Heights,        \* checkpoint heights, e.g. 1..2
     Hashes,         \* candidate blocks per height (siblings), e.g. {a, b}
     None,           \* "no block / no value"
-    DurableRecord   \* TRUE: the Stage 1a signed-vote record is in force
+    DurableRecord,  \* TRUE: the Stage 1a signed-vote record is in force
+    CommitteeSize   \* committee size per candidate (config.committee_size)
 
 Voters == Nodes \cup Byz
 
@@ -68,10 +84,11 @@ Voters == Nodes \cup Byz
 MinCommittee == 4
 
 \* Rust: checkpoint::derived_quorum(n) = floor(2n/3) + 1
-Quorum == (2 * Cardinality(Voters)) \div 3 + 1
+Quorum == (2 * CommitteeSize) \div 3 + 1
 
 ASSUME Nodes \cap Byz = {}
 ASSUME Cardinality(Voters) >= MinCommittee
+ASSUME CommitteeSize \in MinCommittee..Cardinality(Voters)
 ASSUME Heights \subseteq Nat /\ 0 \notin Heights
 ASSUME None \notin Hashes
 ASSUME DurableRecord \in BOOLEAN
@@ -83,9 +100,15 @@ VARIABLES
     fin,        \* fin[n][h]: the hash node n finalized at h (persisted certificate), or None
     floor,      \* floor[n]: node n's reorg floor (0 = none)
     halted,     \* halted[n]: node n's finality safety stop is engaged
-    booting     \* booting[n]: restarted, boot check not run yet
+    booting,    \* booting[n]: restarted, boot check not run yet
+    comm        \* comm[<<h, x>>]: the committee of candidate x at h (fixed at Init)
 
-vars == <<canon, sent, pending, fin, floor, halted, booting>>
+vars == <<canon, sent, pending, fin, floor, halted, booting, comm>>
+
+\* Every committee the selector could return.
+Committees == {S \in SUBSET Voters : Cardinality(S) = CommitteeSize}
+
+Committee(h, x) == comm[<<h, x>>]
 
 ByzVotes == Byz \X Heights \X Hashes
 AllVotes == sent \cup ByzVotes
@@ -95,7 +118,8 @@ LatestFin(n) ==
     LET hs == {h \in Heights : fin[n][h] # None}
     IN IF hs = {} THEN 0 ELSE CHOOSE m \in hs : \A k \in hs : k <= m
 
-Supporters(h, x) == {v \in Voters : <<v, h, x>> \in AllVotes}
+\* Votes that count toward candidate x at h: from its committee only.
+Supporters(h, x) == {v \in Committee(h, x) : <<v, h, x>> \in AllVotes}
 
 \* ---- Init ----
 
@@ -107,6 +131,7 @@ Init ==
     /\ floor = [n \in Nodes |-> 0]
     /\ halted = [n \in Nodes |-> FALSE]
     /\ booting = [n \in Nodes |-> FALSE]
+    /\ comm \in [Heights \X Hashes -> Committees]
 
 \* ---- Actions ----
 
@@ -128,6 +153,7 @@ SignVote(n, h) ==
     /\ ~halted[n]
     /\ ~booting[n]
     /\ x # None
+    /\ n \in Committee(h, x)
     /\ <<n, h, x>> \notin sent
     /\ DurableRecord => \A y \in Hashes : <<n, h, y>> \in sent => y = x
     /\ sent' = sent \cup {<<n, h, x>>}
@@ -181,8 +207,10 @@ Restart(n) ==
     /\ booting' = [booting EXCEPT ![n] = TRUE]
     /\ UNCHANGED <<canon, sent, fin>>
 
+\* The committees never change (comm is fixed at Init).
 Next ==
-    \E n \in Nodes :
+    /\ UNCHANGED comm
+    /\ \E n \in Nodes :
         \/ \E h \in Heights : Propose(n, h) \/ SignVote(n, h) \/ Finalize(n, h)
         \/ VerifyFloor(n)
         \/ BootNoCertificate(n)
@@ -204,6 +232,7 @@ TypeOK ==
     /\ floor \in [Nodes -> Heights \cup {0}]
     /\ halted \in [Nodes -> BOOLEAN]
     /\ booting \in [Nodes -> BOOLEAN]
+    /\ comm \in [Heights \X Hashes -> Committees]
 
 \* S1: no two nodes finalize different blocks at one height.
 NoConflictingFinality ==

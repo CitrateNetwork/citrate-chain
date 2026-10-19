@@ -30,8 +30,9 @@
 // tick), Reorg (`reorg_to`), Restart (rebuild the node over its store).
 //
 // Scenarios that need late-joiner certificate sync (C3-S1b, spec §11.10) are
-// `#[ignore = "needs C3-S1b"]`; the open S2 finding is
-// `#[ignore = "bug: ..."]`. None of them is a pass today.
+// `#[ignore = "needs C3-S1b"]`; the open findings (S2 window; S1 across
+// sibling committees) are `#[ignore = "bug: ..."]`. None of them is a pass
+// today.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1345,6 +1346,118 @@ async fn a7_committee_is_fixed_by_snapshot_height_and_block_seed() {
         late,
         Some(CommitteeSelector::select(&grown_set, 22, &seed, 4))
     );
+}
+
+/// A7 follow-up, S1 across sibling candidates. The committee for a checkpoint
+/// is drawn from the governing snapshot with the CANDIDATE block's own VRF
+/// output as seed (`FinalityGadget::committee_for`), so two siblings at the
+/// same height get different committees once the validator set is larger than
+/// `committee_size`. Eight equal-stake validators, committee size 4 (quorum 3):
+/// a sibling B4 whose committee shares at most one member with A4's is found
+/// deterministically. The network splits along the fork: A4's committee
+/// members follow A, the rest of B4's committee follows B. No key signs two
+/// hashes, no one is Byzantine, and each side still collects 3 of its own 4.
+/// Returns both sides after one round each.
+struct SiblingSplit {
+    side_a: Net,
+    side_b: Net,
+    a: Vec<Block>,
+    b: Vec<Block>,
+    committee_a: Vec<PublicKey>,
+    committee_b: Vec<PublicKey>,
+}
+
+const SPLIT_HEIGHT: u64 = 4;
+
+async fn sibling_committee_split() -> SiblingSplit {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..8).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let cfg = config(4);
+    let h = SPLIT_HEIGHT;
+    let committee = |branch: &[Block]| {
+        CommitteeSelector::select(&vals.set, h, &at(branch, h).header.vrf_reveal.output, 4)
+    };
+    let a = chains.main(8);
+    let committee_a = committee(&a);
+    let (b, committee_b) = (0u8..=255)
+        .filter(|t| *t != VRF_A[0])
+        .find_map(|t| {
+            let b = chains.branch(&a, h, 8, [t; 32]);
+            let cb = committee(&b);
+            let shared = cb.iter().filter(|k| committee_a.contains(k)).count();
+            (shared <= 1).then_some((b, cb))
+        })
+        .expect("a sibling seed whose committee overlaps A4's in at most one member");
+    assert_eq!((committee_a.len(), committee_b.len()), (4, 4));
+    let mut nodes_a = Vec::new();
+    let mut nodes_b = Vec::new();
+    for k in &keys {
+        let me = pk(k);
+        if committee_a.contains(&me) {
+            nodes_a.push(TestNode::boot(k.clone(), &vals, cfg.clone()).await);
+        } else if committee_b.contains(&me) {
+            nodes_b.push(TestNode::boot(k.clone(), &vals, cfg.clone()).await);
+        }
+    }
+    let mut side_a = Net::new(nodes_a);
+    let mut side_b = Net::new(nodes_b);
+    side_a.follow_all(&a).await;
+    side_b.follow_all(&b).await;
+    let _ = side_a.round().await;
+    let _ = side_b.round().await;
+    SiblingSplit {
+        side_a,
+        side_b,
+        a,
+        b,
+        committee_a,
+        committee_b,
+    }
+}
+
+/// Pins the counterexample (review of #333 @ 0286eff, P2): with per-candidate
+/// committees, sibling blocks A4 and B4 BOTH finalize, on disjoint honest
+/// signers, with no equivocation and no Byzantine key. Expected to start
+/// failing once the protocol fixes the committee independently of the
+/// candidate (or otherwise prevents this); then update this test and
+/// un-ignore `s1_sibling_committees_never_finalize_conflicting_blocks`.
+/// TLA+: CheckpointFinalitySafety_committees.cfg.
+#[tokio::test]
+async fn open_finding_sibling_committees_finalize_conflicting_blocks() {
+    let split = sibling_committee_split().await;
+    let h = SPLIT_HEIGHT;
+    assert_ne!(
+        split.committee_a, split.committee_b,
+        "committee follows the candidate"
+    );
+    for n in &split.side_a.nodes {
+        assert_eq!(n.finalized_hash(h).await, Some(hash_at(&split.a, h)));
+    }
+    for n in &split.side_b.nodes {
+        assert_eq!(n.finalized_hash(h).await, Some(hash_at(&split.b, h)));
+    }
+    split.side_a.assert_honest_no_equivocation();
+    split.side_b.assert_honest_no_equivocation();
+}
+
+/// S1 as specified (§5): at most one block finalizes per height network-wide,
+/// whatever the candidate. Fails today with per-candidate committees (see the
+/// test above).
+#[tokio::test]
+#[ignore = "bug: S1 — sibling candidates draw their committees from their own VRF seeds; disjoint committees can both finalize"]
+async fn s1_sibling_committees_never_finalize_conflicting_blocks() {
+    let split = sibling_committee_split().await;
+    let h = SPLIT_HEIGHT;
+    let mut seen: Option<Hash> = None;
+    for n in split.side_a.nodes.iter().chain(split.side_b.nodes.iter()) {
+        if let Some(x) = n.finalized_hash(h).await {
+            match seen {
+                None => seen = Some(x),
+                Some(y) => assert_eq!(x, y, "S1 violated at height {h}"),
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
