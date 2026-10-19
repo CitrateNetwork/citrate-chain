@@ -103,14 +103,51 @@ what `eth_getLogs` has served.
 When no applied tip is persisted, or it cannot be read, the method returns
 JSON-RPC error `-32603`. It never falls back to the height index.
 
-A log scanner that persists progress:
+`number` and `hash` come from one stored record, so `eth_getBlockByHash(hash)`
+returns the executed block at `number`. **Confirm the head by hash, never by
+number:** `eth_getBlockByNumber(number)` reads the height index, where the last
+block stored at a height wins. A non-executed sibling stored after the executed
+block at the head height makes `eth_getBlockByNumber(head.number)` return the
+sibling while `citrate_executedHead` and `eth_getLogs` both name the executed
+block (`tests/executed_head.rs`,
+`executed_head_names_the_executed_block_not_a_later_sibling`).
 
-1. Call `citrate_executedHead`. Call the result `H`.
-2. Call `eth_getLogs` with `toBlock` ≤ `H.number`.
-3. Persist progress no higher than `H.number`. Keep a confirmation margin below
-   it: the executed head can move down or change hash on a reorg (the tests in
-   `tests/executed_head.rs` cover both), and the two calls are not atomic.
-4. On an error from step 1, don't advance.
+The block producer commits its applied tip together with state, then writes
+the block's receipts in a later step (`node/src/producer.rs`:
+`persist_state_changes_with_tip`, then `put_receipts`). In that window the
+executed head already includes a block whose logs are not stored yet, so a
+scanner keeps a margin below the head (step 4).
+
+##### Log scanner protocol
+
+A scanner that persists progress (`from` is the first unscanned height,
+`target` the highest height it wants):
+
+1. `h1 = citrate_executedHead`. On any error, stop this pass and don't advance.
+2. Page `eth_getLogs` over `from..=min(target, h1.number)` in windows of at most
+   1,000 blocks (`MAX_LOG_BLOCK_RANGE`). On `-32002`, retry the same window. On
+   any other error, stop and don't advance.
+3. `h2 = citrate_executedHead` (on error, don't advance).
+4. Persist progress no higher than `min(target, h1.number, h2.number) − margin`,
+   never `h1.number`. The two reads and `eth_getLogs` are not atomic: on a reorg
+   the head can move down between them, and `eth_getLogs` then serves only up to
+   the lower tip. The margin must cover both the reorg depth the application
+   tolerates and the producer's receipt write after its tip commit (above).
+5. Treat logs as discovery hints. Confirm anything that moves value from
+   contract state at a confirmed block, so a reorg deeper than the margin can't
+   cause a wrong action.
+
+`tests/executed_head.rs` covers this: concurrent apply and reorg while reading
+(`executed_head_under_concurrent_apply_never_leads_get_logs`) and a rewind
+between `h1` and `h2` (`scanner_protocol_survives_a_rewind_between_reads`).
+
+**Deploy dependency.** A follower or RPC-only node needs chain#336 (followers
+persist receipts for the blocks they apply). Without it, the applied tip
+advances over peer blocks with no receipts stored, so `citrate_executedHead`
+moves forward while `eth_getLogs` returns nothing for those blocks, and a
+scanner would persist progress past missing logs. Merge and deploy #334, #336
+and #337 together on the serving RPC nodes before a client relies on this
+protocol.
 
 ### WebSocket
 

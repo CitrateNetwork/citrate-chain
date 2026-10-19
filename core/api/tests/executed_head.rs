@@ -272,3 +272,219 @@ fn executed_head_errors_without_a_persisted_tip() {
     );
     assert!(stored.get("result").is_none(), "{stored}");
 }
+
+fn hex_u64(v: &Value) -> u64 {
+    let s = v.as_str().expect("hex string");
+    u64::from_str_radix(s.trim_start_matches("0x"), 16).expect("hex number")
+}
+
+/// `(height, hash)` of the executed head.
+fn head_pair(io: &jsonrpc_core::IoHandler) -> (u64, String) {
+    let h = head(io);
+    (
+        hex_u64(&h["number"]),
+        h["hash"].as_str().expect("hash").to_string(),
+    )
+}
+
+/// `(blockNumber, blockHash)` of every log eth_getLogs serves over `from..=to`.
+fn logs_between(io: &jsonrpc_core::IoHandler, from: u64, to: u64) -> Vec<(u64, String)> {
+    let v = call(
+        io,
+        "eth_getLogs",
+        json!([{"fromBlock": format!("0x{from:x}"), "toBlock": format!("0x{to:x}")}]),
+    );
+    assert!(v.get("error").is_none(), "unexpected error: {v}");
+    v["result"]
+        .as_array()
+        .expect("log array")
+        .iter()
+        .map(|l| {
+            (
+                hex_u64(&l["blockNumber"]),
+                l["blockHash"].as_str().expect("blockHash").to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Concurrent apply: a writer thread moves the applied tip (apply forward,
+/// reorg sideways and down) the way the applicator does, while a reader
+/// follows the scanner's read order: head, then eth_getLogs up to head.number.
+/// The head is always an applied-tip pair the writer wrote (never the height
+/// index's block at that height, which is a non-executed sibling here), and
+/// getLogs never serves above it.
+#[test]
+fn executed_head_under_concurrent_apply_never_leads_get_logs() {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (storage, _tmp) = storage();
+    // A chain a0..=a9; tips only reach a6, so a7..a9 are stored headers
+    // ahead of execution (eth_blockNumber = 9).
+    let a = a_chain(&storage, 9);
+    // B branch forking at a2: the tip reorgs between A and B.
+    let mut b = Vec::new();
+    let mut parent = a[2].hash();
+    for h in 3..=6 {
+        let blk = put(&storage, 0xB0, h, parent);
+        parent = blk.hash();
+        b.push(blk);
+    }
+    // Non-executed siblings at 3..=6, written last: the height index names
+    // these, and no applied tip ever does.
+    for h in 3..=6 {
+        put(&storage, 0xC0, h, a[h as usize - 1].hash());
+    }
+    let tips: Vec<(Hash, u64)> = a[3..=6]
+        .iter()
+        .chain(b.iter())
+        .map(|blk| (blk.hash(), blk.header.height))
+        .collect();
+    let valid: HashSet<(u64, String)> = tips.iter().map(|(h, n)| (*n, hx(h))).collect();
+    let parent_of: HashMap<String, String> = a
+        .iter()
+        .chain(b.iter())
+        .map(|blk| (hx(&blk.hash()), hx(&blk.header.selected_parent_hash)))
+        .collect();
+    tip(&storage, &a[3]);
+    let io = io(storage.clone());
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let storage = storage.clone();
+        let stop = stop.clone();
+        let tips = tips.clone();
+        std::thread::spawn(move || {
+            let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+            let mut writes = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let (h, n) = tips[(x % tips.len() as u64) as usize];
+                storage.blocks.put_applied_tip(&h, n).expect("applied tip");
+                writes += 1;
+            }
+            writes
+        })
+    };
+
+    let mut below = 0u32;
+    for _ in 0..2_000 {
+        let (n, hash) = head_pair(&io);
+        assert!(
+            valid.contains(&(n, hash.clone())),
+            "head ({n}, {hash}) is not an applied tip the writer wrote"
+        );
+        let by_hash = call(&io, "eth_getBlockByHash", json!([hash, false]));
+        assert_eq!(hex_u64(&by_hash["result"]["number"]), n, "{by_hash}");
+
+        let logs = logs_between(&io, 0, n);
+        let top = logs.last().map(|(h, _)| *h).expect("genesis log at least");
+        assert!(top <= n, "getLogs served height {top} above head {n}");
+        if top < n {
+            below += 1;
+        }
+        // Contiguous from genesis, one block per height, on one
+        // selected-parent chain.
+        for (i, (height, bh)) in logs.iter().enumerate() {
+            assert_eq!(*height, i as u64, "gap or duplicate in {logs:?}");
+            if i > 0 {
+                assert_eq!(parent_of[bh], logs[i - 1].1, "not one chain: {logs:?}");
+            }
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    let writes = writer.join().expect("writer thread");
+    assert!(writes > 0, "writer never ran");
+    // `below` counts reads where the tip moved down between the two calls:
+    // allowed (the scanner persists min(h1, h2)), never the reverse.
+    eprintln!("tip writes: {writes}, reads served below head: {below}");
+}
+
+/// A sibling at the executed head's height, stored after the executed block:
+/// the height index names the sibling, the executed head names the executed
+/// block. eth_getBlockByNumber(head.number) returns the sibling, so a client
+/// confirms the head with eth_getBlockByHash(head.hash), never by number.
+#[test]
+fn executed_head_names_the_executed_block_not_a_later_sibling() {
+    let (storage, _tmp) = storage();
+    let a = a_chain(&storage, 3);
+    tip(&storage, &a[3]);
+    // Sibling of a3 (same parent a2), written after the tip.
+    let s3 = put(&storage, 0xC0, 3, a[2].hash());
+    let io = io(storage.clone());
+
+    assert_eq!(
+        head(&io),
+        json!({"number": "0x3", "hash": hx(&a[3].hash())})
+    );
+
+    let by_hash = call(&io, "eth_getBlockByHash", json!([hx(&a[3].hash()), false]));
+    assert_eq!(by_hash["result"]["number"], "0x3", "{by_hash}");
+    assert_eq!(by_hash["result"]["hash"], hx(&a[3].hash()), "{by_hash}");
+
+    // The documented caveat: by number, the height index's last writer wins.
+    let by_number = call(&io, "eth_getBlockByNumber", json!(["0x3", false]));
+    assert_eq!(by_number["result"]["hash"], hx(&s3.hash()), "{by_number}");
+
+    // getLogs at the head height serves the executed block's logs.
+    assert_eq!(logs_between(&io, 3, 3), vec![(3, hx(&a[3].hash()))]);
+}
+
+/// One pass of the documented scanner protocol (core/api/README.md): read h1,
+/// getLogs over `from..=min(target, h1)`, read h2, persist at most
+/// `min(target, h1, h2) - margin`. Returns the logs served and that height
+/// (`None`: don't advance).
+fn scan_once(
+    io: &jsonrpc_core::IoHandler,
+    from: u64,
+    target: u64,
+    margin: u64,
+    between: impl FnOnce(),
+) -> (Vec<(u64, String)>, Option<u64>) {
+    let (h1, _) = head_pair(io);
+    between();
+    let logs = logs_between(io, from, target.min(h1));
+    let (h2, _) = head_pair(io);
+    (logs, target.min(h1).min(h2).checked_sub(margin))
+}
+
+/// The head rewinds between the scanner's two reads (h2 < h1): getLogs served
+/// only up to the rewound tip, so progress persisted at min(h1, h2) − margin
+/// never passes a height whose logs were not served. Persisting h1 would skip
+/// a height.
+#[test]
+fn scanner_protocol_survives_a_rewind_between_reads() {
+    let (storage, _tmp) = storage();
+    let a = a_chain(&storage, 4);
+    let b3 = put(&storage, 0xB0, 3, a[2].hash());
+    let b4 = put(&storage, 0xB0, 4, b3.hash());
+    let b5 = put(&storage, 0xB0, 5, b4.hash());
+    tip(&storage, &b5);
+    let io = io(storage.clone());
+
+    let (logs, persist) = scan_once(&io, 0, 100, 0, || tip(&storage, &a[4]));
+    let served: Vec<u64> = logs.iter().map(|(h, _)| *h).collect();
+    assert_eq!(served, vec![0, 1, 2, 3, 4], "served after rewind");
+    assert_eq!(logs[4].1, hx(&a[4].hash()), "rewound branch served");
+    assert_eq!(persist, Some(4), "min(h1 = 5, h2 = 4) - 0");
+    assert!(
+        persist.is_some_and(|p| p <= *served.last().expect("served")),
+        "persisted above the highest height served"
+    );
+
+    // With a margin, progress stays that far below min(h1, h2).
+    tip(&storage, &b5);
+    let (_, persist) = scan_once(&io, 0, 100, 2, || tip(&storage, &a[4]));
+    assert_eq!(persist, Some(2));
+
+    // The target bounds the range; a margin above the head means no progress.
+    tip(&storage, &a[4]);
+    let (logs, persist) = scan_once(&io, 0, 2, 0, || {});
+    assert_eq!(logs.last().map(|(h, _)| *h), Some(2));
+    assert_eq!(persist, Some(2), "min(target = 2, h1, h2)");
+    let (_, persist) = scan_once(&io, 0, 100, 9, || {});
+    assert_eq!(persist, None);
+}
