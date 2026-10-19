@@ -26,22 +26,40 @@
 //   2. stale: its height is above this node's latest finalized height;
 //   3. (height, hash) binding: the certified block IS the block at that height
 //      on this node's applied chain (`CanonicalApplicator::verify_certified_floor`,
-//      read-only). A certificate for a sibling, or above the applied tip, is
-//      refused — it never halts finality here, since the peer chose to send it;
+//      read-only pre-check; re-checked under the advance lock in step 6). Above
+//      the applied tip: not used yet. A SIBLING (another block at that height,
+//      or a chain that steps over it): see CONFLICTING FINALITY below;
 //   4. epoch-pinned committee: derived HERE, exactly as the producer path derives
-//      it (`FinalityGadget::committee_for`): the validator snapshot governing the
+//      it (`finality_floor::CertificateCommittees`, i.e.
+//      `FinalityGadget::committee_for`): the validator snapshot governing the
 //      height, plus the VRF beacon in this node's own copy of the certified
 //      block's header. The message carries no committee;
 //   5. quorum + signatures: `CheckpointManager::verify_synced_certificate` —
 //      boundary height, committee >= 4, floor(2n/3)+1 distinct members, every
-//      ed25519 signature valid for this chain id over (height, hash).
+//      ed25519 signature valid for this chain id over (height, hash);
+//   6. install through the finalization path
+//      (`CheckpointManager::install_synced_certificate`): serialized with local
+//      finalizations, and in Enforced mode the manager's FinalizationGuard
+//      (`FloorVerifier::on_finalize`) runs BEFORE the certificate is visible
+//      (DAG mark, persisted record, latest finalized height). The guard
+//      re-verifies it against the derived committee and, under the advance
+//      lock, raises the reorg floor if the block is canonical here or engages
+//      the safety stop if a reorg moved the node off it in the meantime —
+//      exactly as for a certificate this node finalized itself. Enforced sync
+//      never runs without that guard (`CertificateSync::new` returns `None`).
+//      A floor verifier pass then reports the result (Observed: metric only).
 //
-// Only then is it installed as this node's latest finalized certificate
-// (`CheckpointManager::install_synced_certificate`, persisted like a locally
-// finalized one) and the floor verifier runs a pass at once, so it is handled
-// exactly like a certificate this node finalized itself: re-verified, re-checked
-// against the chain under the advance lock, and used per the floor mode
-// (Observed: metric only; Enforced: raises the reorg floor and the RPC tags).
+// CONFLICTING FINALITY (owner Q1 on #332; same semantics as a stored-certificate
+// mismatch in #323). A sibling certificate is checked further only if this
+// node holds the sibling's header (it needs the header's VRF beacon to derive
+// the committee):
+//
+//   * it VERIFIES against the committee derived here -> a quorum of this node's
+//     own committee finalized a block this node is not on: mismatch safety stop
+//     and alarm (`FloorVerifier::on_conflicting_certificate`). It is NOT
+//     installed and the floor is NOT raised;
+//   * it does not verify, or its committee cannot be derived -> refused with a
+//     log only. Unauthenticated peer input never halts finality.
 //
 // SWITCH. Same compiled pins as Stage 1a/1c. In Legacy mode (voting pin OFF,
 // every chain in this release) `CertificateSync::new` returns `None`: nothing is
@@ -68,17 +86,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use citrate_consensus::checkpoint::SyncedInstall;
+use citrate_consensus::checkpoint::{SyncedInstall, VerifiedCertificate};
 use citrate_consensus::checkpoint_gadget::FinalityGadget;
 use citrate_consensus::types::{Hash, PublicKey, Signature};
 use citrate_network::peer::PeerManager;
 use citrate_network::{CheckpointSignature, NetworkMessage, PeerId};
-use citrate_storage::StorageManager;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::canonical_apply::{CanonicalApplicator, FloorCheck};
-use crate::finality_floor::{FloorMode, FloorTick, FloorVerifier};
+use crate::finality_floor::{CommitteeUnavailable, FloorMode, FloorTick, FloorVerifier};
 
 /// Requester cadence.
 pub const CERT_SYNC_POLL_SECS: u64 = 10;
@@ -109,11 +126,23 @@ pub enum SyncOutcome {
     Stale { height: u64, latest: u64 },
     /// The certified block is not the block at that height on this node's
     /// applied chain (`canonical`: what is there, `None` if the chain steps
-    /// over the height).
+    /// over the height), and the certificate did not verify against the
+    /// committee derived here (or none could be derived: `reason`). Refused;
+    /// finality is not halted.
     NotOnThisChain {
         height: u64,
         certified: Hash,
         canonical: Option<Hash>,
+        reason: String,
+    },
+    /// Conflicting finality: a sibling of this node's block at `height` that
+    /// VERIFIES against the committee derived here. Not installed; `floor` is
+    /// the safety stop it engaged.
+    ConflictingFinality {
+        height: u64,
+        certified: Hash,
+        canonical: Option<Hash>,
+        floor: FloorTick,
     },
     /// This node's applied tip is below the certified height.
     NotYetApplied { height: u64, applied_height: u64 },
@@ -147,9 +176,10 @@ pub struct CertificateSync {
     gadget: Arc<FinalityGadget>,
     /// Data source of this node's applied chain (binding check, applied tip).
     applicator: Arc<CanonicalApplicator>,
-    /// Data source of the certified block's header (its VRF beacon).
-    storage: Arc<StorageManager>,
-    /// Runs a pass right after an install.
+    /// The guard of every install (Enforced), the committee source
+    /// (`FloorVerifier::committees`: epoch snapshot + this node's copy of the
+    /// certified block's header), the conflicting-finality stop, and a pass
+    /// after each install.
     floor: Arc<FloorVerifier>,
     state: Mutex<SyncState>,
 }
@@ -160,22 +190,30 @@ fn elapsed_at_least(now: Instant, since: Instant, secs: u64) -> bool {
 
 impl CertificateSync {
     /// `None` in Legacy mode (voting pin OFF): certificate sync is compiled off
-    /// with the rest of checkpoint finality.
+    /// with the rest of checkpoint finality. Also `None` in Enforced mode when
+    /// `floor` is not installed as the checkpoint manager's finalization guard
+    /// (`FloorVerifier::install_finalization_guard`): a synced certificate
+    /// must never become visible before the floor rises or finality halts.
     pub fn new(
         gadget: Arc<FinalityGadget>,
         applicator: Arc<CanonicalApplicator>,
-        storage: Arc<StorageManager>,
         floor: Arc<FloorVerifier>,
     ) -> Option<Self> {
         let mode = floor.mode();
         if mode == FloorMode::Legacy {
             return None;
         }
+        if mode.raises_floor() && !gadget.manager().has_finalization_guard() {
+            error!(
+                "checkpoint finality: certificate sync NOT started — Enforced mode but the \
+                 floor verifier is not the checkpoint manager's finalization guard"
+            );
+            return None;
+        }
         Some(Self {
             mode,
             gadget,
             applicator,
-            storage,
             floor,
             state: Mutex::new(SyncState::default()),
         })
@@ -338,6 +376,11 @@ impl CertificateSync {
                 "checkpoint sync: installed finalized certificate {} @ {} from {} ({:?} mode): {:?}",
                 block_hash, height, peer, self.mode, floor
             ),
+            SyncOutcome::ConflictingFinality { height, floor, .. } => error!(
+                "checkpoint sync: peer {} presented certificate {} @ {} that VERIFIES against \
+                 this node's committee but is not on this node's chain: {:?}",
+                peer, block_hash, height, floor
+            ),
             SyncOutcome::Stale { .. }
             | SyncOutcome::NotYetApplied { .. }
             | SyncOutcome::Unverifiable { .. }
@@ -351,6 +394,16 @@ impl CertificateSync {
             }
         }
         out
+    }
+
+    /// Test-only: forget the outstanding request and the request / serve
+    /// spacing (in-process harnesses do not advance the clock).
+    #[cfg(test)]
+    pub(crate) async fn reset_rate_limits_for_tests(&self) {
+        let mut st = self.state.lock().await;
+        st.outstanding = None;
+        st.last_request = None;
+        st.served.clear();
     }
 
     /// Test convenience: accept (must be solicited) + process.
@@ -403,20 +456,15 @@ impl CertificateSync {
                 reason: "not a checkpoint boundary".to_string(),
             };
         }
-        // 3. (height, hash) binding to this node's applied chain (read-only).
-        match self
+        // 3. (height, hash) binding to this node's applied chain (read-only
+        // pre-check; the guard re-checks it under the advance lock at install).
+        let sibling_of = match self
             .applicator
             .verify_certified_floor(height, block_hash, false)
             .await
         {
-            FloorCheck::Match => {}
-            FloorCheck::Mismatch { canonical } => {
-                return SyncOutcome::NotOnThisChain {
-                    height,
-                    certified: block_hash,
-                    canonical,
-                }
-            }
+            FloorCheck::Match => None,
+            FloorCheck::Mismatch { canonical } => Some(canonical),
             FloorCheck::NotYetApplied { applied_height } => {
                 return SyncOutcome::NotYetApplied {
                     height,
@@ -426,32 +474,27 @@ impl CertificateSync {
             FloorCheck::Unverifiable(reason) => {
                 return SyncOutcome::Unverifiable { height, reason }
             }
-        }
+        };
         // 4. committee, derived here: governing epoch snapshot + this node's
         // copy of the certified block's VRF beacon.
-        let seed = match self.storage.blocks.get_header(&block_hash) {
-            Ok(Some(h)) if h.height == height => h.vrf_reveal.output,
-            Ok(Some(h)) => {
-                return SyncOutcome::Unverifiable {
-                    height,
-                    reason: format!("stored header {} is at height {}", block_hash, h.height),
+        let committee = match self.floor.committees().derive(height, block_hash).await {
+            Ok(c) => c,
+            Err(why) => {
+                if let Some(canonical) = sibling_of {
+                    return SyncOutcome::NotOnThisChain {
+                        height,
+                        certified: block_hash,
+                        canonical,
+                        reason: why.to_string(),
+                    };
                 }
+                return match why {
+                    CommitteeUnavailable::NoSnapshot => SyncOutcome::NoCommittee { height },
+                    CommitteeUnavailable::Header(reason) => {
+                        SyncOutcome::Unverifiable { height, reason }
+                    }
+                };
             }
-            Ok(None) => {
-                return SyncOutcome::Unverifiable {
-                    height,
-                    reason: format!("header {} not stored", block_hash),
-                }
-            }
-            Err(e) => {
-                return SyncOutcome::Unverifiable {
-                    height,
-                    reason: e.to_string(),
-                }
-            }
-        };
-        let Some(committee) = self.gadget.committee_for(height, &seed).await else {
-            return SyncOutcome::NoCommittee { height };
         };
         // 5. quorum + signatures against that committee.
         let sigs: Vec<(PublicKey, Signature)> =
@@ -460,12 +503,26 @@ impl CertificateSync {
         {
             Ok(v) => v,
             Err(e) => {
+                if let Some(canonical) = sibling_of {
+                    return SyncOutcome::NotOnThisChain {
+                        height,
+                        certified: block_hash,
+                        canonical,
+                        reason: e.to_string(),
+                    };
+                }
                 return SyncOutcome::Invalid {
                     height,
                     reason: e.to_string(),
-                }
+                };
             }
         };
+        if let Some(canonical) = sibling_of {
+            return self.conflicting(&verified, canonical).await;
+        }
+        // 6. install through the finalization path: in Enforced mode the
+        // manager's FinalizationGuard (this node's floor verifier) runs before
+        // the certificate is visible.
         match manager.install_synced_certificate(verified).await {
             Ok(SyncedInstall::Installed { .. }) => {}
             Ok(SyncedInstall::Stale { height, latest }) => {
@@ -478,9 +535,29 @@ impl CertificateSync {
                 }
             }
         }
-        // Handled from here exactly like a locally finalized certificate.
+        // Report (Observed: publishes the verified height; Enforced: the guard
+        // already acted, this pass re-reads the same certificate).
         let floor = self.floor.tick().await;
         SyncOutcome::Installed { height, floor }
+    }
+
+    /// A verified sibling certificate: conflicting finality (module docs).
+    async fn conflicting(
+        &self,
+        verified: &VerifiedCertificate,
+        canonical: Option<Hash>,
+    ) -> SyncOutcome {
+        let cp = verified.checkpoint();
+        let floor = self
+            .floor
+            .on_conflicting_certificate(verified, canonical)
+            .await;
+        SyncOutcome::ConflictingFinality {
+            height: cp.height,
+            certified: cp.block_hash,
+            canonical,
+            floor,
+        }
     }
 }
 
@@ -536,6 +613,7 @@ pub fn spawn_requester(
 mod tests {
     use super::*;
     use crate::canonical_apply::tests::{fresh, setup_fork};
+    use crate::finality_floor::{CertificateCommittees, HaltReason};
     use crate::persistent_dag::RocksDbKvStore;
     use citrate_api::finalized_tag::FinalizedAnchor;
     use citrate_consensus::checkpoint::{
@@ -545,6 +623,7 @@ mod tests {
     use citrate_consensus::dag_store::{cf, DagStore, KvStore};
     use citrate_consensus::types::Block;
     use citrate_consensus::vrf::VrfProposerSelector;
+    use citrate_storage::StorageManager;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     const CHAIN: u64 = 40204;
@@ -684,10 +763,12 @@ mod tests {
             app.clone(),
             gadget.safety_stop(),
             verified.clone(),
+            CertificateCommittees::new(gadget.clone(), storage.clone()),
         ));
+        // As main.rs: the guard is installed (Enforced only) before sync starts.
+        assert_eq!(floor.install_finalization_guard(), mode.raises_floor());
         let sync =
-            CertificateSync::new(gadget.clone(), app.clone(), storage.clone(), floor.clone())
-                .expect("not Legacy");
+            CertificateSync::new(gadget.clone(), app.clone(), floor.clone()).expect("not Legacy");
         (
             Node {
                 storage,
@@ -731,9 +812,10 @@ mod tests {
             app.clone(),
             gadget.safety_stop(),
             Arc::new(AtomicU64::new(0)),
+            CertificateCommittees::new(gadget.clone(), storage),
         ));
         assert_eq!(FloorMode::for_chain(CHAIN), FloorMode::Legacy, "pins OFF");
-        assert!(CertificateSync::new(gadget, app, storage, floor).is_none());
+        assert!(CertificateSync::new(gadget, app, floor).is_none());
     }
 
     #[tokio::test]
@@ -843,28 +925,219 @@ mod tests {
         assert_untouched(&m);
     }
 
-    /// A correctly signed certificate for the SIBLING b2 at height 2 while
-    /// this node's chain holds a2: refused, and finality is not halted.
+    /// Owner Q1 on #332: a certificate for the SIBLING b2 at height 2 (its
+    /// header is stored here) while this node's chain holds a2, signed by a
+    /// quorum of the committee this node derives for b2: conflicting
+    /// finality. Mismatch safety stop + alarm; nothing installed, floor and
+    /// verified height untouched. The stop clears once fork choice moves this
+    /// node onto b2 (normal poll recovery).
     #[tokio::test]
-    async fn sibling_hash_is_rejected_without_halting() {
-        let (n, (_a1, a2, b2, _b3)) = node(FloorMode::Enforced).await;
-        let now = Instant::now();
-        n.solicit("peer-a", now).await;
-        let sib = b2.header.block_hash;
-        let out = n
-            .sync
-            .on_certificate_at("peer-a", cert_msg(2, sib, signed(&[0, 1, 2], 2, sib)), now)
-            .await;
-        assert_eq!(
-            out,
-            SyncOutcome::NotOnThisChain {
+    async fn verified_sibling_certificate_halts_and_is_not_installed() {
+        for mode in [FloorMode::Enforced, FloorMode::Observed] {
+            let (n, (_a1, a2, b2, b3)) = node(mode).await;
+            let now = Instant::now();
+            n.solicit("peer-a", now).await;
+            let sib = b2.header.block_hash;
+            let out = n
+                .sync
+                .on_certificate_at("peer-a", cert_msg(2, sib, signed(&[0, 1, 2], 2, sib)), now)
+                .await;
+            let stop = HaltReason::Mismatch {
                 height: 2,
                 certified: sib,
                 canonical: Some(a2.header.block_hash),
+            };
+            assert_eq!(
+                out,
+                SyncOutcome::ConflictingFinality {
+                    height: 2,
+                    certified: sib,
+                    canonical: Some(a2.header.block_hash),
+                    floor: FloorTick::Halted(stop.clone()),
+                },
+                "{mode:?}"
+            );
+            assert!(n.gadget.halted(), "{mode:?}: safety stop engaged");
+            assert_eq!(n.latest().await, 0, "{mode:?}: not installed");
+            assert_eq!(n.floor_height(), 0, "{mode:?}: floor not raised");
+            assert_eq!(n.verified_height(), 0, "{mode:?}");
+            assert_eq!(n.floor.halt_reason().await, Some(stop.clone()));
+            // The poll keeps it while a2 is canonical here.
+            assert_eq!(n.floor.tick().await, FloorTick::Halted(stop), "{mode:?}");
+            // Fork choice moves the node onto b2 -> b3: the stop clears.
+            let lock = n.app.advance_lock();
+            {
+                let mut st = lock.lock().await;
+                let _ = n.app.reorg_to(&mut st, b3.header.block_hash).await;
+            }
+            assert!(
+                matches!(n.floor.tick().await, FloorTick::NoCertificate),
+                "{mode:?}: recovered (nothing installed, so no certificate)"
+            );
+            assert!(!n.gadget.halted(), "{mode:?}: cleared");
+            // Recovery is the poll's: b2 (a verified quorum certificate) is
+            // now canonical, so Enforced raises the floor to it; sync then
+            // fetches and installs the certificate. Nothing is PUBLISHED yet:
+            // the peer's certificate was never persisted here (#335,
+            // publication after persistence).
+            let raised = if mode.raises_floor() { 2 } else { 0 };
+            assert_eq!(n.floor_height(), raised, "{mode:?}");
+            assert_eq!(n.verified_height(), 0, "{mode:?}: not persisted here");
+            let later = now + Duration::from_secs(CERT_REQUEST_TIMEOUT_SECS);
+            n.solicit("peer-a", later).await;
+            let out = n
+                .sync
+                .on_certificate_at(
+                    "peer-a",
+                    cert_msg(2, sib, signed(&[0, 1, 2], 2, sib)),
+                    later,
+                )
+                .await;
+            assert!(
+                matches!(out, SyncOutcome::Installed { height: 2, .. }),
+                "{mode:?}: {out:?}"
+            );
+            assert_eq!(n.latest().await, 2, "{mode:?}");
+            // Installed AND persisted: published now (Enforced from the
+            // post-finalization hook, Observed from the pass sync runs after
+            // the install).
+            assert_eq!(n.verified_height(), 2, "{mode:?}: published once persisted");
+        }
+    }
+
+    /// Owner Q1, the other half: a sibling certificate that does NOT verify
+    /// against the committee derived here (outsider signers, below quorum, a
+    /// forged signature), or whose committee cannot be derived (the sibling's
+    /// header is not held here), is refused with a log only — unauthenticated
+    /// peer input never halts finality.
+    #[tokio::test]
+    async fn unverified_sibling_certificate_is_refused_without_halting() {
+        let (n, (_a1, a2, b2, _b3)) = node(FloorMode::Enforced).await;
+        let sib = b2.header.block_hash;
+        let mut forged = signed(&[0, 1, 2], 2, sib);
+        if let (Some(slot), Some(other)) = (forged.get_mut(2), signed(&[3], 2, sib).first()) {
+            slot.signature = other.signature;
+        }
+        let unknown = Hash::new([0x77; 32]);
+        let cases: Vec<(&str, Hash, Vec<CheckpointSignature>, &str)> = vec![
+            (
+                "outsiders",
+                sib,
+                signed(&[10, 11, 12, 13], 2, sib),
+                "not in the committee",
+            ),
+            ("below quorum", sib, signed(&[0, 1], 2, sib), "quorum"),
+            ("forged signature", sib, forged, "does not verify"),
+            (
+                "header not held",
+                unknown,
+                signed(&[0, 1, 2], 2, unknown),
+                "not stored",
+            ),
+        ];
+        let mut now = Instant::now();
+        for (what, hash, sigs, why) in cases {
+            n.solicit("peer-a", now).await;
+            let out = n
+                .sync
+                .on_certificate_at("peer-a", cert_msg(2, hash, sigs), now)
+                .await;
+            match &out {
+                SyncOutcome::NotOnThisChain {
+                    height: 2,
+                    certified,
+                    canonical,
+                    reason,
+                } => {
+                    assert_eq!(*certified, hash, "{what}");
+                    assert_eq!(*canonical, Some(a2.header.block_hash), "{what}");
+                    assert!(reason.contains(why), "{what}: {reason}");
+                }
+                other => panic!("{what}: {other:?}"),
+            }
+            assert_eq!(n.latest().await, 0, "{what}");
+            assert_untouched(&n);
+            now += Duration::from_secs(CERT_REQUEST_MIN_INTERVAL_SECS);
+        }
+    }
+
+    /// Enforced certificate sync never runs without the finalization guard: a
+    /// synced certificate must not become visible before the floor rises or
+    /// finality halts (review of #332 @ 354908b).
+    #[tokio::test]
+    async fn enforced_sync_requires_the_finalization_guard() {
+        let (exec, storage, _dir) = fresh();
+        let app = Arc::new(CanonicalApplicator::new(exec, storage.clone()));
+        let mgr = Arc::new(CheckpointManager::new(
+            config(),
+            Arc::new(DagStore::with_permissive_vrf_for_testing()),
+        ));
+        let gadget = Arc::new(FinalityGadget::with_switch(
+            mgr.clone(),
+            Some(selector(1, &[0, 1, 2, 3]).await),
+            true,
+        ));
+        let floor = Arc::new(FloorVerifier::new(
+            FloorMode::Enforced,
+            mgr.clone(),
+            app.clone(),
+            gadget.safety_stop(),
+            Arc::new(AtomicU64::new(0)),
+            CertificateCommittees::new(gadget.clone(), storage),
+        ));
+        assert!(CertificateSync::new(gadget.clone(), app.clone(), floor.clone()).is_none());
+        assert!(floor.install_finalization_guard());
+        assert!(mgr.has_finalization_guard());
+        assert!(CertificateSync::new(gadget, app, floor).is_some());
+    }
+
+    /// The synced install runs the floor verifier as the finalization guard:
+    /// by the time the certificate is visible (latest finalized height moved)
+    /// the floor already covers it — no poll is involved. Checked from inside
+    /// the install: the guard records the floor and latest height it ran with.
+    #[tokio::test]
+    async fn synced_install_raises_the_floor_before_the_certificate_is_visible() {
+        let (n, (_a1, a2, _b2, _b3)) = node(FloorMode::Enforced).await;
+        let h = a2.header.block_hash;
+        let mgr = n.gadget.manager();
+        let committee = n.floor.committees().derive(2, h).await.expect("committee");
+        let sigs: Vec<(PublicKey, Signature)> = signed(&[0, 1, 2], 2, h)
+            .into_iter()
+            .map(|s| (s.voter, s.signature))
+            .collect();
+        let cert = mgr
+            .verify_synced_certificate(2, h, &sigs, committee)
+            .expect("verifies");
+        // Watch the latest finalized height and the floor while installing.
+        let floor_handle = n.app.finalized_height_handle();
+        let watcher_mgr = mgr.clone();
+        let watcher = tokio::spawn(async move {
+            let mut violations = 0u32;
+            for _ in 0..2_000 {
+                let latest = watcher_mgr.latest_finalized_height().await;
+                let floor = floor_handle.load(Ordering::SeqCst);
+                if latest >= 2 && floor < 2 {
+                    violations = violations.saturating_add(1);
+                }
+                if latest >= 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            violations
+        });
+        assert_eq!(
+            mgr.install_synced_certificate(cert).await.expect("install"),
+            SyncedInstall::Installed {
+                height: 2,
+                guarded: true
             }
         );
-        assert_eq!(n.latest().await, 0);
-        assert_untouched(&n);
+        assert_eq!(watcher.await.expect("watcher"), 0);
+        assert_eq!(n.floor_height(), 2, "raised by the guard, no tick");
+        // Published by `after_finalize`, once the certificate is persisted
+        // (#335): no tick needed.
+        assert_eq!(n.verified_height(), 2, "published after persistence");
     }
 
     #[tokio::test]
@@ -1181,9 +1454,11 @@ mod tests {
             app.clone(),
             gadget.safety_stop(),
             verified.clone(),
+            CertificateCommittees::new(gadget.clone(), storage.clone()),
         ));
+        assert!(floor.install_finalization_guard());
         let b = Node {
-            sync: CertificateSync::new(gadget.clone(), app.clone(), storage.clone(), floor.clone())
+            sync: CertificateSync::new(gadget.clone(), app.clone(), floor.clone())
                 .expect("not Legacy"),
             storage,
             app,
@@ -1247,7 +1522,11 @@ mod tests {
             Arc::new(RocksDbKvStore::new(b.storage.db.clone())),
         ));
         assert_eq!(mgr2.latest_finalized_height().await, 2);
-        let gadget2 = FinalityGadget::with_switch(mgr2.clone(), None, true);
+        let gadget2 = Arc::new(FinalityGadget::with_switch(
+            mgr2.clone(),
+            Some(selector(1, &[0, 1, 2, 3]).await),
+            true,
+        ));
         let (exec2, _unused_storage, _unused_dir) = fresh();
         let app2 = Arc::new(CanonicalApplicator::new(exec2, b.storage.clone()));
         let floor2 = FloorVerifier::new(
@@ -1256,6 +1535,7 @@ mod tests {
             app2.clone(),
             gadget2.safety_stop(),
             Arc::new(AtomicU64::new(0)),
+            CertificateCommittees::new(gadget2.clone(), b.storage.clone()),
         );
         assert_eq!(
             floor2.boot_check().await,

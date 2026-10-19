@@ -2191,6 +2191,13 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 app.clone(),
                 finality_gadget.safety_stop(),
                 finality_observed.clone(),
+                // Every certificate (boot, poll, finalization, peer sync) is
+                // verified against the committee derived HERE (epoch snapshot,
+                // rehydrated above, + the certified block's VRF beacon).
+                finality_floor::CertificateCommittees::new(
+                    finality_gadget.clone(),
+                    storage.clone(),
+                ),
             ));
             // Enforced only (no-op in Legacy / Observed): installed before the
             // boot check and before the driver / vote handler can finalize.
@@ -2202,10 +2209,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             finality_rpc_handle = Some(floor_verifier.rpc_finalized_handle());
             // Stage 1b: peer certificates are verified against this node's own
             // epoch committee and chain, then handed to this floor verifier.
+            // Enforced: installed only with the guard above in place, so a
+            // synced certificate goes through the same finalization path.
             certificate_sync = finality_sync::CertificateSync::new(
                 finality_gadget.clone(),
                 app.clone(),
-                storage.clone(),
                 floor_verifier.clone(),
             )
             .map(Arc::new);
