@@ -58,9 +58,9 @@ Use one copy of §2 per operator. The goal for rehearsal 1 (2026-11-13) is **at 
 | 4 | Operator generates config, starts with mining off, syncs | Their `eth_syncing` = false |
 | 5 | Operator runs `build_registration_tx.py`, signs with their wallet, publishes | Registration tx hash |
 | 6 | `verify_producer.py --staker <addr> --require registered` | "Registered · active from epoch N" |
-| 7 | After activation: `--require registered,eligible,committee` | "Validator active", in the committee |
+| 7 | After activation: `--require registered,eligible`, then `--require committee` | "Validator active"; committee state begins "in the checkpoint committee" (it FAILS as "too small to finalize" until four members qualify) |
 | 8 | Operator turns mining on; `verify_producer.py --staker <addr>` passes all five checks | "Producing blocks" |
-| 9 | Network check: the verifier's `producing_validators` ≥ 4 over a 1,000-block window | Its JSON output on the C3 board item |
+| 9 | Network check: the verifier's `producing_validators` ≥ 4 over a 1,000-block window, and `--require committee` exits 0 (`committee_qualifying_members` ≥ `min_finality_committee`) | Its JSON output on the C3 board item |
 
 ## 4. Timing back from rehearsal 1 (2026-11-13)
 

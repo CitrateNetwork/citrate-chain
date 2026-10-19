@@ -283,16 +283,25 @@ def check_ssh_firewall(h: Host, a: argparse.Namespace, r: Report) -> None:
 
 
 def check_journal(h: Host, a: argparse.Namespace, r: Report) -> None:
-    conf = h.read("/etc/systemd/journald.conf") or ""
+    main_conf = h.read("/etc/systemd/journald.conf")
+    unreadable = []
+    if main_conf is None and h.path("/etc/systemd/journald.conf").exists():
+        unreadable.append("/etc/systemd/journald.conf")
+    conf = main_conf or ""
     dropins = h.path("/etc/systemd/journald.conf.d")
     if dropins.is_dir():
         for p in sorted(dropins.glob("*.conf")):
             try:
                 conf += "\n" + p.read_text(errors="replace")
             except OSError:
-                pass
-    if re.search(r"^\s*SystemMaxUse\s*=\s*\S+", conf, re.M):
-        r.add("PASS", "journald", "SystemMaxUse is capped")
+                unreadable.append(str(p))
+    # Drop-ins are applied in order and the last assignment wins; an empty or "infinity"
+    # value removes the cap. An unreadable drop-in could hold that last assignment.
+    values = re.findall(r"^\s*SystemMaxUse\s*=[ \t]*(\S*)", conf, re.M)
+    if unreadable:
+        r.add("UNKNOWN", "journald", f"cannot read {', '.join(unreadable)}: SystemMaxUse not determinable")
+    elif values and values[-1] and values[-1].lower() != "infinity":
+        r.add("PASS", "journald", f"SystemMaxUse is capped ({values[-1]})")
     else:
         r.add("WARN", "journald", "SystemMaxUse not set: cap the journal (runbook §2), a log flood filled a disk once")
 

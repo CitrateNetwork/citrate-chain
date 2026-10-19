@@ -233,12 +233,13 @@ Registration needs two signatures: the proposer key signs a proof that you contr
 Turn mining on only when `verify_producer.py` shows the validator **active** and **in the committee** for the governing snapshot:
 
 ```bash
-python3 scripts/producers/verify_producer.py --profile 40204-r1005 --staker 0x… --require registered,eligible,committee
+python3 scripts/producers/verify_producer.py --profile 40204-r1005 --staker 0x… --require registered,eligible
+python3 scripts/producers/verify_producer.py --profile 40204-r1005 --staker 0x… --require committee
 python3 scripts/producers/gen_node_config.py --profile 40204-r1005 --staker 0x… --mining on --force
 systemctl restart citrate-node
 ```
 
-Run the first command and continue only if it exits 0. The committee check reads the registry at the head, so it reports **UNKNOWN** (exit 3) when the registry changed after the governing snapshot (a registration, a stake change, an unbond, a slash or an executed parameter change) or when its logs cannot be read. UNKNOWN is not a pass: wait for the next snapshot (the message names its block) and run it again.
+The first command must exit 0. The committee check (second command) counts only members that are activation-ready for the governing snapshot **and** at or above minStake, and compares that count with the minimum committee for checkpoint finality (`MIN_FINALITY_COMMITTEE` = 4, quorum ⌊2n/3⌋+1, `core/consensus/src/checkpoint.rs`). It exits 0 only when the validator is in a committee that can finalize. While fewer than four producers qualify (the first producers of a network), it FAILS (exit 1) with "in the checkpoint committee …, but the committee is too small to finalize"; that FAIL is expected during bring-up, and you may turn mining on when the state begins "in the checkpoint committee" (`"in_committee": true` in `--json`). Any other FAIL, such as "below minStake" or "not yet", means stop. The committee check reads the registry at the head, so it reports **UNKNOWN** (exit 3) when the registry changed after the governing snapshot (a registration, a stake change, an unbond, a slash or an executed parameter change) or when its logs cannot be read. UNKNOWN is not a pass: wait for the next snapshot (the message names its block) and run it again.
 
 Within a few hundred blocks the verifier should show **Producing blocks**:
 

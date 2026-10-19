@@ -3,8 +3,10 @@ coinbase rule, derived committee membership, and unknown-is-not-zero."""
 
 import io
 import json
+import re
 import sys
 import unittest
+from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
@@ -237,12 +239,151 @@ class TestVerify(unittest.TestCase):
         self.assertIn("snapshot boundary", com["state"])
         self.assertEqual(rc, 3)
 
-    def test_small_committee_is_flagged(self):
+    def test_small_committee_is_never_ok(self):
         c = FakeChain()
         c.add_validator(PK, STAKER, STAKE, 3)
         with RpcStub(c) as s:
+            rc, body, _ = run(s.url, "--staker", STAKER, "--require", "committee")
+        com = body["checks"]["committee"]
+        self.assertIs(com["ok"], False, com)
+        self.assertEqual(rc, 1)
+        self.assertIn("too small to finalize", com["state"])
+        self.assertIn("< the minimum 4", com["state"])
+        self.assertIs(com["in_committee"], True)
+        self.assertIsNone(body["network"]["finality_quorum"])
+
+    def test_committee_counts_only_members_at_or_above_min_stake(self):
+        # Four registered, activation-ready members; one is below a raised minStake, so the
+        # committee has three qualifying members and can never finalize.
+        c = FakeChain()
+        c.add_validator("0x" + "01" * 32, "0x" + "a1" * 20, STAKE, 3)
+        c.add_validator("0x" + "02" * 32, "0x" + "a2" * 20, STAKE, 3)
+        c.add_validator("0x" + "03" * 32, "0x" + "a3" * 20, STAKE - 1, 3)
+        c.add_validator(PK, STAKER, STAKE, 3)
+        c.min_stake = STAKE
+        with RpcStub(c) as s:
+            rc, body, _ = run(s.url, "--staker", STAKER, "--require", "committee")
+        com = body["checks"]["committee"]
+        self.assertIs(com["ok"], False, com)
+        self.assertEqual(rc, 1)
+        self.assertEqual(com["snapshot_members"], 3)
+        self.assertEqual(com["effective_committee"], 3)
+        self.assertIn("3 qualifying members", com["state"])
+        self.assertEqual(body["network"]["registered_validators"], 4)
+        self.assertEqual(body["network"]["committee_qualifying_members"], 3)
+        self.assertEqual(body["network"]["eligible_validators"], 3)
+        self.assertEqual(body["network"]["below_min_stake"], 1)
+
+    def test_committee_at_exactly_the_minimum_is_ok(self):
+        c = FakeChain()
+        others(c, 3)
+        c.add_validator(PK, STAKER, STAKE, 3)
+        with RpcStub(c) as s:
+            rc, body, _ = run(s.url, "--staker", STAKER, "--require", "committee")
+        com = body["checks"]["committee"]
+        self.assertIs(com["ok"], True, com)
+        self.assertEqual(rc, 0)
+        self.assertEqual(com["effective_committee"], 4)
+        self.assertEqual(com["quorum"], 3)
+        self.assertIn("finality quorum 3 of 4", com["state"])
+        self.assertEqual(body["network"]["finality_quorum"], 3)
+
+    def test_committee_quorum_follows_the_derived_rule(self):
+        with RpcStub(self.c) as s:  # four others + this validator = 5 qualifying
+            self.c.add_validator(PK, STAKER, STAKE, 3)
             _, body, _ = run(s.url, "--staker", STAKER, "--require", "committee")
-        self.assertIn("finality needs at least 4", body["checks"]["committee"]["state"])
+        self.assertEqual(body["checks"]["committee"]["quorum"], 4)  # floor(10/3) + 1
+
+    def _with_committee_size(self, size: int):
+        real = pl.load_profile
+
+        def load(name, **kw):
+            prof = real(name, **kw)
+            raw = json.loads(json.dumps(prof.raw))
+            raw["checkpoint"]["committee_size"] = size
+            return pl.Profile(raw)
+
+        return mock.patch.object(v.pl, "load_profile", load)
+
+    def test_set_larger_than_committee_size_is_unknown(self):
+        c = self.c
+        c.add_validator(PK, STAKER, STAKE, 3)  # 5 qualifying, committee_size 4: a VRF draw
+        with self._with_committee_size(4), RpcStub(c) as s:
+            rc, body, _ = run(s.url, "--staker", STAKER, "--require", "committee")
+        self.assertIsNone(body["checks"]["committee"]["ok"])
+        self.assertEqual(rc, 3)
+
+    def test_committee_size_below_the_minimum_is_never_ok(self):
+        c = self.c
+        c.add_validator(PK, STAKER, STAKE, 3)  # 5 qualifying, but at most 3 are drawn
+        with self._with_committee_size(3), RpcStub(c) as s:
+            rc, body, _ = run(s.url, "--staker", STAKER, "--require", "committee")
+        self.assertIs(body["checks"]["committee"]["ok"], False)
+        self.assertEqual(rc, 1)
+
+    def test_finality_constants_match_the_consensus_code(self):
+        src = (HERE.parents[2] / "core/consensus/src/checkpoint.rs").read_text()
+        m = re.search(r"pub const MIN_FINALITY_COMMITTEE: usize = (\d+);", src)
+        self.assertIsNotNone(m, "MIN_FINALITY_COMMITTEE not found in checkpoint.rs")
+        self.assertEqual(int(m.group(1)), v.MIN_FINALITY_COMMITTEE)
+        body = re.search(r"pub fn derived_quorum\(n: usize\) -> usize \{\s*(.*?)\s*\}\n", src, re.S)
+        self.assertIsNotNone(body, "derived_quorum not found in checkpoint.rs")
+        self.assertEqual(body.group(1), "(n.saturating_mul(2) / 3).saturating_add(1)")
+        for n, q in ((0, 1), (3, 3), (4, 3), (5, 4), (6, 5), (100, 67)):
+            self.assertEqual(v.derived_quorum(n), q)
+
+    def test_eligible_requires_min_stake(self):
+        c = self.c
+        c.add_validator(PK, STAKER, STAKE - 1, 3)
+        c.min_stake = STAKE
+        with RpcStub(c) as s:
+            rc, body, _ = run(s.url, "--staker", STAKER, "--require", "eligible")
+        self.assertIs(body["checks"]["eligible"]["ok"], False)
+        self.assertIn("below minStake", body["checks"]["eligible"]["state"])
+        self.assertEqual(rc, 1)
+
+    def test_pubkey_only_checks_the_staker_binding(self):
+        # The pubkey's recorded staker is bound to a different pubkey.
+        c = self.c
+        c.add_validator("0x" + "77" * 32, STAKER, STAKE, 3)
+        c.add_validator(PK, STAKER, STAKE, 3)
+        with RpcStub(c) as s:
+            rc, body, _ = run(s.url, "--pubkey", PK, "--require", "registered")
+        self.assertIs(body["checks"]["registered"]["ok"], False)
+        self.assertIn("pubkeyOfStaker", body["checks"]["registered"]["state"])
+        self.assertEqual(rc, 1)
+
+    def test_pubkey_only_binding_holds(self):
+        c = self.c
+        c.add_validator(PK, STAKER, STAKE, 3)
+        seen = []
+        c.on_call = lambda _chain, _to, data: seen.append(data[2:10])
+        with RpcStub(c) as s:
+            rc, body, _ = run(s.url, "--pubkey", PK, "--require", "registered")
+        self.assertEqual(rc, 0, body)
+        self.assertIn(pl.SELECTORS["pubkeyOfStaker(address)"], seen)
+
+    def test_active_count_mismatch_is_unknown(self):
+        c = self.c
+        c.add_validator(PK, STAKER, STAKE, 3)
+
+        def add_member(chain):
+            chain.add_validator("0x" + "88" * 32, "0x" + "88" * 20, STAKE, 3)
+
+        c.on_call = self._advance_on_first("fd4665ae", add_member)  # after activeCount()
+        with RpcStub(c) as s:
+            rc, body, _ = run(s.url, "--staker", STAKER)
+        self.assertIsNone(body["checks"]["registered"]["ok"])
+        self.assertIn("activeCount", body["checks"]["registered"]["state"])
+        self.assertEqual(rc, 3)
+
+    def test_unreadable_genesis_is_unknown_not_wrong_network(self):
+        c = self.c
+        c.genesis = None
+        with RpcStub(c) as s:
+            rc, body, _ = run(s.url, "--staker", STAKER)
+        self.assertIsNone(body["checks"]["network"]["ok"])
+        self.assertEqual(rc, 3)
 
     def test_unregistered_staker(self):
         with RpcStub(self.c) as s:

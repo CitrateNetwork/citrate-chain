@@ -195,6 +195,22 @@ class TestPreflight(unittest.TestCase):
         (d / "cap.conf").write_text("[Journal]\nSystemMaxUse=2G\n")
         self.assertEqual(levels(pf.run(host(self.root), args(), None))["journald"], "PASS")
 
+    def test_journal_cap_last_assignment_wins(self):
+        (self.root / "etc/systemd/journald.conf").write_text("[Journal]\nSystemMaxUse=1G\n")
+        d = self.root / "etc/systemd/journald.conf.d"
+        d.mkdir()
+        (d / "z-reset.conf").write_text("[Journal]\nSystemMaxUse=\n")
+        self.assertEqual(levels(pf.run(host(self.root), args(), None))["journald"], "WARN")
+        (d / "z-reset.conf").write_text("[Journal]\nSystemMaxUse=infinity\n")
+        self.assertEqual(levels(pf.run(host(self.root), args(), None))["journald"], "WARN")
+
+    def test_unreadable_journal_dropin_is_unknown_not_pass(self):
+        (self.root / "etc/systemd/journald.conf").write_text("[Journal]\nSystemMaxUse=1G\n")
+        d = self.root / "etc/systemd/journald.conf.d"
+        d.mkdir()
+        (d / "broken.conf").mkdir()  # reading it raises OSError (IsADirectoryError), even as root
+        self.assertEqual(levels(pf.run(host(self.root), args(), None))["journald"], "UNKNOWN")
+
     def test_dry_run_lists_checks(self):
         out = io.StringIO()
         with redirect_stdout(out):

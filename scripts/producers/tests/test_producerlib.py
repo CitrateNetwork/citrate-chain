@@ -130,6 +130,13 @@ class TestEncoding(unittest.TestCase):
         with self.assertRaises(pl.RpcError):
             pl.decode_active_set("0x")
 
+    def test_decode_active_set_rejects_duplicate_keys(self):
+        # A repeated pubkey would inflate the member count the committee check relies on.
+        k = "01" * 32
+        ret = "0x" + "".join(f"{x:064x}" for x in (64, 160, 2)) + k + k + "".join(f"{x:064x}" for x in (2, 5, 5))
+        with self.assertRaises(pl.RpcError):
+            pl.decode_active_set(ret)
+
     def test_decode_validator_info(self):
         c = FakeChain()
         c.add_validator("0x" + "01" * 32, "0x" + "a1" * 20, 7, 9)

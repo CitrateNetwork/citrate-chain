@@ -13,17 +13,25 @@ Checks and their sources:
   registered  ValidatorRegistry.validatorInfo(pubkey).status == Active and isActive(pubkey);
               the registered staker equals --staker; pubkeyOfStaker(staker) == pubkey.
               "Registered · active from epoch N" while actEpoch > currentEpoch().
-  eligible    "Validator active": isActive(pubkey) and actEpoch <= currentEpoch() (live
-              registry; consensus follows the epoch snapshot and can lag up to an epoch).
+  registered  With --pubkey alone, the staker is validatorInfo(pubkey).staker and
+              pubkeyOfStaker(that staker) must still name this pubkey.
+  eligible    "Validator active": isActive(pubkey), actEpoch <= currentEpoch() and its
+              activeSet() effective stake >= minStake() (live registry; consensus follows
+              the epoch snapshot and can lag up to an epoch; vrf.rs is_eligible_proposer).
   committee   DERIVED, not observed: no RPC exposes the consensus snapshot or the checkpoint
               committee. The committee for a checkpoint is the governing snapshot S(E)'s
-              members at or above minStake (core/consensus/src/vrf.rs epoch_committee_set),
+              members at or above minStake (core/consensus/src/vrf.rs is_eligible_proposer),
               all of them while the set is <= committee_size (checkpoint.rs select). The
               registry can only be read at latest (eth_call ignores historical block tags),
               so the latest stakes, set and minStake stand in for S(E)'s ONLY when
               eth_getLogs shows no stake-, set- or parameter-changing registry event from
               block S(E) to the head; otherwise, or if the logs cannot be read, the check is
-              UNKNOWN. Finality status is reported from the `finalized` block tag.
+              UNKNOWN. The committee counts only members that are BOTH activation-ready
+              for S(E) and at or above minStake. Checkpoint finality needs an effective
+              committee of at least MIN_FINALITY_COMMITTEE (checkpoint.rs, quorum
+              floor(2n/3)+1); a smaller committee never finalizes, so the check FAILS even
+              when this validator is in it. Finality status is reported from the
+              `finalized` block tag.
   producing   "Producing blocks": a block in the last --window blocks has proposerPubkey ==
               pubkey; every such block's miner (coinbase) must equal the staker.
 
@@ -43,8 +51,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import producerlib as pl  # noqa: E402
 
 CHECKS = ("network", "registered", "eligible", "committee", "producing")
-MIN_FINALITY_COMMITTEE = 4  # CHECKPOINT_FINALITY_WIRING.md D-2a
+# Checkpoint finality constants, mirrored from core/consensus/src/checkpoint.rs
+# (MIN_FINALITY_COMMITTEE and derived_quorum; CHECKPOINT_FINALITY_WIRING.md D-2/D-2a).
+# tests/test_verify_producer.py parses that file and fails if these drift.
+MIN_FINALITY_COMMITTEE = 4
 BATCH = 100
+
+
+def derived_quorum(n: int) -> int:
+    """checkpoint.rs derived_quorum: floor(2n/3) + 1."""
+    return (n * 2) // 3 + 1
+
+
+def qualifying_members(members: list[tuple[int, int]], epoch: int | None, min_stake: int) -> int:
+    """Members of snapshot S(epoch) that the consensus counts: activation epoch <= epoch AND
+    effective stake >= minStake (vrf.rs is_eligible_proposer; checkpoint committee input).
+    `members` is (activation epoch, effective stake) per activeSet() entry."""
+    if epoch is None:
+        return 0
+    return sum(1 for ae, stake in members if ae <= epoch and stake >= min_stake)
 
 
 class Result:
@@ -65,11 +90,15 @@ def planned_calls(prof: pl.Profile, staker: str | None, pubkey: str | None, wind
         "eth_blockNumber",
         'eth_getBlockByNumber("finalized")',
     ]
-    if staker and not pubkey:
+    if staker:
         calls.append(f"eth_call {reg}.pubkeyOfStaker({staker})")
     calls += [
         f"eth_call {reg}.validatorInfo({who})",
         f"eth_call {reg}.isActive({who})",
+    ]
+    if not staker:
+        calls.append(f"eth_call {reg}.pubkeyOfStaker(validatorInfo({who}).staker) (binding check)")
+    calls += [
         f"eth_call {reg}.currentEpoch()",
         f"eth_call {reg}.minStake()",
         f"eth_call {reg}.activeCount()",
@@ -196,15 +225,25 @@ def verify(args: argparse.Namespace) -> Result:
         # they could have seen (see read_bracket).
         hash_before = block_hash(rpc, head)
         info = pl.decode_validator_info(rpc.eth_call(reg, pl.calldata("validatorInfo(bytes32)", pubkey)))
+        if staker is None and info["status"] == "Active":
+            # --pubkey alone: bind the identity both ways, as with --staker.
+            bound = pl.uint_word(
+                rpc.eth_call(reg, pl.calldata("pubkeyOfStaker(address)", info["staker"])), "pubkeyOfStaker"
+            )
         in_set = pl.bool_word(rpc.eth_call(reg, pl.calldata("isActive(bytes32)", pubkey)), "isActive")
         cur_epoch = pl.uint_word(rpc.eth_call(reg, pl.calldata("currentEpoch()")), "currentEpoch")
         min_stake = pl.uint_word(rpc.eth_call(reg, pl.calldata("minStake()")), "minStake")
         registered_count = pl.uint_word(rpc.eth_call(reg, pl.calldata("activeCount()")), "activeCount")
         aset = pl.decode_active_set(rpc.eth_call(reg, pl.calldata("activeSet()")))
-        member_epochs = []
-        for k, _ in aset:
+        if len(aset) != registered_count:
+            # Both are _activeSet.length; a difference means the reads saw different states
+            # or a malformed reply. The member count would be wrong either way.
+            raise pl.RpcError(f"activeSet() has {len(aset)} entries but activeCount() is {registered_count}")
+        # (activation epoch, effective stake) per member: the committee rule needs both.
+        members: list[tuple[int, int]] = []
+        for k, eff_k in aset:
             mi = pl.decode_validator_info(rpc.eth_call(reg, pl.calldata("validatorInfo(bytes32)", k)))
-            member_epochs.append(mi["act_epoch"])
+            members.append((mi["act_epoch"], eff_k))
         fin = rpc.call("eth_getBlockByNumber", ["finalized", False])
         finalized = pl.parse_qty(fin.get("number") if isinstance(fin, dict) else None, "finalized.number")
         bracket = read_bracket(rpc, head, hash_before)
@@ -212,15 +251,28 @@ def verify(args: argparse.Namespace) -> Result:
         r.set("registered", None, f"unavailable: {e}", "ValidatorRegistry reads")
         return r
 
-    eligible_count = sum(1 for ae in member_epochs if ae <= cur_epoch)
+    eligible_count = qualifying_members(members, cur_epoch, min_stake)
+    e_gov = pl.governing_snapshot_epoch(head + 1)
+    committee_size = int(prof["checkpoint"]["committee_size"])
+    snapshot_members = qualifying_members(members, e_gov, min_stake)
+    effective_committee = min(snapshot_members, committee_size)
     r.network = {
         "head": head,
         "current_epoch": cur_epoch,
         "registered_validators": registered_count,
         "eligible_validators": eligible_count,
-        "pending_activation": len(member_epochs) - eligible_count,
+        "pending_activation": sum(1 for ae, _ in members if ae > cur_epoch),
+        "below_min_stake": sum(1 for _, st in members if st < min_stake),
         "min_stake": pl.salt(min_stake),
         "finalized_height": finalized,
+        # Latest-registry view of the governing snapshot's committee; the committee check
+        # says whether it can be tied to S(E).
+        "committee_qualifying_members": snapshot_members,
+        "committee_size": committee_size,
+        "min_finality_committee": MIN_FINALITY_COMMITTEE,
+        "finality_quorum": (
+            derived_quorum(effective_committee) if effective_committee >= MIN_FINALITY_COMMITTEE else None
+        ),
     }
     binding_problems = []
     if staker is None:
@@ -250,8 +302,29 @@ def verify(args: argparse.Namespace) -> Result:
 
     # eligible (live registry)
     reg_ok = r.checks["registered"]["ok"] is True
-    if reg_ok and act <= cur_epoch:
-        r.set("eligible", True, "Validator active (eligible, live registry)", "isActive + actEpoch <= currentEpoch()")
+    eff = dict(aset).get(pubkey)
+    if reg_ok and eff is None:
+        r.set(
+            "eligible",
+            None,
+            "unknown: isActive(pubkey) is true but the pubkey is absent from activeSet() (the reads "
+            "straddled a change); re-run",
+            "isActive vs activeSet()",
+        )
+    elif reg_ok and eff < min_stake:
+        r.set(
+            "eligible",
+            False,
+            f"below minStake: effective stake {pl.salt(eff)} < {pl.salt(min_stake)}",
+            "activeSet().effStakes vs minStake()",
+        )
+    elif reg_ok and act <= cur_epoch:
+        r.set(
+            "eligible",
+            True,
+            "Validator active (eligible, live registry)",
+            "isActive + actEpoch <= currentEpoch() + effective stake >= minStake()",
+        )
     elif reg_ok:
         r.set(
             "eligible",
@@ -263,14 +336,11 @@ def verify(args: argparse.Namespace) -> Result:
         r.set("eligible", False, "not registered", "validatorInfo")
 
     # committee (derived)
-    e_gov = pl.governing_snapshot_epoch(head + 1)
-    eff = dict(aset).get(pubkey)
     finality_note = (
         "checkpoint finality is not running on this network (the finalized tag returns genesis)"
         if finalized == 0
         else f"finalized height {finalized}"
     )
-    snapshot_members = sum(1 for ae in member_epochs if e_gov is not None and ae <= e_gov)
     # The stakes, set and minStake read above are LATEST. They describe S(E) only if nothing
     # that changes them happened from the snapshot block to the head.
     # The reads saw state from some block in [head, head_after] (read_bracket), so the scan
@@ -336,7 +406,16 @@ def verify(args: argparse.Namespace) -> Result:
             registry_changes=changes[:10],
             finality=finality_note,
         )
-    elif eff is None or eff < min_stake:
+    elif eff is None:
+        r.set(
+            "committee",
+            None,
+            "unknown: the pubkey is absent from activeSet() although isActive(pubkey) is true; re-run",
+            "isActive vs activeSet()",
+            governing_snapshot_epoch=e_gov,
+            finality=finality_note,
+        )
+    elif eff < min_stake:
         r.set(
             "committee",
             False,
@@ -344,27 +423,54 @@ def verify(args: argparse.Namespace) -> Result:
             "activeSet().effStakes vs minStake(), registry unchanged since S(E)",
         )
     else:
-        size_ok = snapshot_members <= int(prof["checkpoint"]["committee_size"])
-        r.set(
-            "committee",
-            True if size_ok else None,
-            (
-                f"in the checkpoint committee for snapshot S({e_gov}) (derived from the registry rule; "
-                f"no RPC exposes the committee). {snapshot_members} members"
-                + (
-                    f"; finality needs at least {MIN_FINALITY_COMMITTEE}"
-                    if snapshot_members < MIN_FINALITY_COMMITTEE
-                    else ""
-                )
-                + f". {finality_note[0].upper()}{finality_note[1:]}"
-                if size_ok
-                else "set larger than committee_size: membership is a VRF draw, not derivable here"
-            ),
-            "derived: vrf.rs epoch_committee_set + checkpoint.rs select; " + snap_src + " shows no change",
-            governing_snapshot_epoch=e_gov,
-            snapshot_members=snapshot_members,
-            finality=finality_note,
+        src = "derived: vrf.rs is_eligible_proposer + checkpoint.rs select/MIN_FINALITY_COMMITTEE; " + snap_src + " shows no change"
+        size = (
+            f"{snapshot_members} qualifying members (activation-ready for S({e_gov}) and at or above "
+            f"minStake {pl.salt(min_stake)}), committee_size {committee_size}"
         )
+        detail = {
+            "governing_snapshot_epoch": e_gov,
+            "snapshot_members": snapshot_members,
+            "effective_committee": effective_committee,
+            "min_finality_committee": MIN_FINALITY_COMMITTEE,
+            "finality": finality_note,
+            # This validator is a member either way below; whether the committee as a whole can
+            # finalize decides ok. Automation reads this field, operators read the state words.
+            "in_committee": snapshot_members <= committee_size,
+        }
+        if effective_committee < MIN_FINALITY_COMMITTEE:
+            # Never OK: a committee below the minimum proposes and votes but never finalizes.
+            r.set(
+                "committee",
+                False,
+                f"in the checkpoint committee for snapshot S({e_gov}), but the committee is too small to "
+                f"finalize: {size}; effective committee {effective_committee} < the minimum "
+                f"{MIN_FINALITY_COMMITTEE} (quorum {derived_quorum(MIN_FINALITY_COMMITTEE)} of "
+                f"{MIN_FINALITY_COMMITTEE}). {finality_note[0].upper()}{finality_note[1:]}",
+                src,
+                **detail,
+            )
+        elif snapshot_members > committee_size:
+            r.set(
+                "committee",
+                None,
+                f"unknown: {size}; the set is larger than committee_size, so membership is a VRF draw, "
+                "not derivable here",
+                src,
+                **detail,
+            )
+        else:
+            r.set(
+                "committee",
+                True,
+                f"in the checkpoint committee for snapshot S({e_gov}) (derived from the registry rule; "
+                f"no RPC exposes the committee). {size}; finality quorum "
+                f"{derived_quorum(effective_committee)} of {effective_committee} (minimum committee "
+                f"{MIN_FINALITY_COMMITTEE}). {finality_note[0].upper()}{finality_note[1:]}",
+                src,
+                quorum=derived_quorum(effective_committee),
+                **detail,
+            )
 
     # producing
     blocks = fetch_window(rpc, head, args.window)

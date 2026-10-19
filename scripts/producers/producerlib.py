@@ -259,6 +259,8 @@ def decode_active_set(ret: str) -> list[tuple[str, int]]:
     if ia + n >= len(w) or ib + m >= len(w):
         raise RpcError("activeSet: array truncated")
     keys = ["0x" + f"{w[ia + 1 + i]:064x}" for i in range(n)]
+    if len(set(keys)) != n:
+        raise RpcError("activeSet: duplicate pubkeys")
     stakes = [w[ib + 1 + i] for i in range(m)]
     return list(zip(keys, stakes))
 
@@ -362,7 +364,10 @@ def check_network(rpc: Rpc, prof: Profile) -> dict[str, Any]:
     if cid != prof["chain_id"]:
         raise ToolError(f"RPC chain id {cid} != profile chain id {prof['chain_id']}")
     g = rpc.call("eth_getBlockByNumber", ["0x0", False])
-    gh = g.get("hash") if isinstance(g, dict) else None
+    if not isinstance(g, dict) or not isinstance(g.get("hash"), str):
+        # Unreadable is not a mismatch: report it as an RPC failure (UNKNOWN), not a wrong network.
+        raise RpcError(f"eth_getBlockByNumber(0x0) returned {g!r}")
+    gh = g["hash"]
     if not isinstance(gh, str) or gh.lower() != str(prof["genesis_hash"]).lower():
         raise ToolError(f"RPC genesis {gh} != profile genesis {prof['genesis_hash']}")
     head = parse_qty(rpc.call("eth_blockNumber", []), "eth_blockNumber")
