@@ -9,8 +9,12 @@ With [fail_mod] > 0, every block whose number is divisible by it fails: odd mult
 a JSON-RPC error, even multiples return a null block (models a partial producer sample).
 With [batch_fault] = http500 or badjson, the batch request covering the current head (the
 final producer batch) fails at the transport or parse level instead. With [batch_fault] =
-headbad, eth_blockNumber returns a malformed quantity; with hostilets, block timestamps are a
-Bash arithmetic-injection string (the exporter must never evaluate it).
+headbad, eth_blockNumber returns a malformed quantity; headlong, an oversized quantity (20 hex
+digits); headzero, 0x0 (what the node returns on error); headhostile, a long string with
+terminal escape bytes (the exporter must not echo it raw). With hostilets, block timestamps
+are a Bash arithmetic-injection string (the exporter must never evaluate it). With epochhuge,
+currentEpoch() is 2^200 (wider than Bash arithmetic).
+eth_getTransactionCount answers 0x0 (newer cast versions ask for it on eth_call).
 ValidatorRegistry reads are ABI-encoded: two validators, one with actEpoch <= currentEpoch
 (7) and one pending (actEpoch 9).
 """
@@ -30,7 +34,7 @@ def registry_call(data):
     """Minimal ABI-encoded ValidatorRegistry responses; everything else is uint256(1)."""
     sel = data[2:10]
     if sel == "76671808":  # currentEpoch()
-        return "0x" + W(7)
+        return "0x" + W(2 ** 200 if BATCH_FAULT == "epochhuge" else 7)
     if sel == "fd4665ae":  # activeSet() -> (bytes32[], uint256[])
         return "0x" + W(64) + W(64 + 32 * 3) + W(2) + K1 + K2 + W(2) + W(32000) + W(32000)
     if sel == "00408838":  # validatorInfo(bytes32): actEpoch is the 6th word
@@ -42,8 +46,10 @@ def registry_call(data):
 def answer(req):
     m, p = req.get("method"), req.get("params") or []
     if m == "eth_blockNumber":
-        if BATCH_FAULT == "headbad":
-            return {"jsonrpc": "2.0", "id": req.get("id"), "result": "not-a-quantity"}
+        bad = {"headbad": "not-a-quantity", "headlong": "0x" + "f" * 20, "headzero": "0x0",
+               "headhostile": "\x1b[31m0xdead$(id)\x07" + "A" * 500}.get(BATCH_FAULT)
+        if bad is not None:
+            return {"jsonrpc": "2.0", "id": req.get("id"), "result": bad}
         state["head"] += STEP
         res = hex(state["head"])
     elif m == "eth_chainId":
@@ -67,6 +73,8 @@ def answer(req):
     elif m == "eth_call":
         data = ((p[0] or {}).get("data") or (p[0] or {}).get("input") or "") if p else ""
         res = registry_call(data)
+    elif m == "eth_getTransactionCount":
+        res = "0x0"
     elif m == "eth_gasPrice":
         res = "0x3b9aca00"
     else:
