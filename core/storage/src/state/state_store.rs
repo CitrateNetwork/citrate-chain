@@ -3,7 +3,7 @@
 use crate::db::{column_families::*, RocksDB};
 use anyhow::Result;
 use citrate_consensus::types::Hash;
-use citrate_execution::executor::{StateStorageChange, StateStoreTrait};
+use citrate_execution::executor::{ReceiptIndexBatch, StateStorageChange, StateStoreTrait};
 use citrate_execution::types::{AccountState, Address, JobId, ModelId, ModelState, TrainingJob};
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -75,7 +75,12 @@ impl StateStoreTrait for StateStore {
         accounts: &[(Address, AccountState)],
         storage: &[StateStorageChange],
     ) -> Result<()> {
-        self.write_state_batch_with_applied_tip(accounts, storage, None)
+        self.write_state_batch_with_applied_tip(
+            accounts,
+            storage,
+            None,
+            &ReceiptIndexBatch::default(),
+        )
     }
 
     /// SRP-S3b: atomically persist the state batch AND the applied-tip pointer in ONE
@@ -88,8 +93,9 @@ impl StateStoreTrait for StateStore {
         accounts: &[(Address, AccountState)],
         storage: &[StateStorageChange],
         applied_tip: Option<(Hash, u64)>,
+        index: &ReceiptIndexBatch,
     ) -> Result<()> {
-        if accounts.is_empty() && storage.is_empty() && applied_tip.is_none() {
+        if accounts.is_empty() && storage.is_empty() && applied_tip.is_none() && index.is_empty() {
             return Ok(());
         }
 
@@ -112,6 +118,8 @@ impl StateStoreTrait for StateStore {
                 }
             }
         }
+        // C1-R: the block's RPC receipt index commits in this same batch.
+        crate::chain::transaction_store::stage_receipt_index(&self.db, &mut batch, index)?;
         if let Some((hash, height)) = applied_tip {
             // Same key + layout as BlockStore::put_applied_tip (hash[32] || height_be[8]).
             let mut buf = [0u8; 40];
@@ -150,12 +158,14 @@ impl StateStoreTrait for StateStore {
         account_dels: &[Address],
         code: &[(Hash, Vec<u8>)],
         applied_tip: Option<(Hash, u64)>,
+        index: &ReceiptIndexBatch,
     ) -> Result<()> {
         if accounts.is_empty()
             && storage.is_empty()
             && account_dels.is_empty()
             && code.is_empty()
             && applied_tip.is_none()
+            && index.is_empty()
         {
             return Ok(());
         }
@@ -187,6 +197,8 @@ impl StateStoreTrait for StateStore {
             self.db
                 .batch_put_cf(&mut batch, CF_CODE, code_hash.as_bytes(), code)?;
         }
+        // C1-R: the block's RPC receipt index commits in this same batch.
+        crate::chain::transaction_store::stage_receipt_index(&self.db, &mut batch, index)?;
         if let Some((hash, height)) = applied_tip {
             // Same key + layout as BlockStore::put_applied_tip (hash[32] || height_be[8]).
             let mut buf = [0u8; 40];
@@ -223,6 +235,18 @@ impl StateStoreTrait for StateStore {
             crate::chain::block_store::APPLIED_TIP_KEY,
             &buf,
         )
+    }
+
+    /// C1-R: the receipt index on its own, as one fsync'd batch. The commit paths
+    /// stage it inside their state batch instead; this override keeps the
+    /// standalone trait method honest for any caller of the default fallback.
+    fn put_receipt_index(&self, index: &ReceiptIndexBatch) -> Result<()> {
+        if index.is_empty() {
+            return Ok(());
+        }
+        let mut batch = self.db.batch();
+        crate::chain::transaction_store::stage_receipt_index(&self.db, &mut batch, index)?;
+        self.db.write_batch_sync(batch)
     }
 
     // Sprint P950-A-4 WP-A.4.3: persist MVCC per-account versions.
