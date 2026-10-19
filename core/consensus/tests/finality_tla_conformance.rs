@@ -6,7 +6,7 @@
 //! Two layers:
 //!
 //! 1. Static: the TLA+ module defines the actions and invariants this suite
-//!    and the node adversarial suite (`node/src/finality_adversarial.rs`) refer
+//!    and the node adversarial suite (`node/src/finality_adversarial_tests.rs`) refer
 //!    to, the gating TLC config checks them, and the constants the model uses
 //!    (`MinCommittee`, the `Quorum` rule) and the vote message layout (69 bytes,
 //!    domain-separated, chain id + height + hash) are the Rust ones.

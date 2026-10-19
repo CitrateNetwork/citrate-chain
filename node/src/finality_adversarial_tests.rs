@@ -1,4 +1,4 @@
-// node/src/finality_adversarial.rs
+// node/src/finality_adversarial_tests.rs
 //
 // WP-S.3 Stage 2 — checkpoint-finality integration + adversarial suite A1–A8
 // (docs/consensus/CHECKPOINT_FINALITY_WIRING.md §8.2, §8.3).

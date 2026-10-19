@@ -429,7 +429,7 @@ message).
 ---
 
 ### 8.5 Stage 2 implementation (tests only; finality still not running — both pins OFF)
-- **Adversarial + integration suite:** `node/src/finality_adversarial.rs` (test-only module of
+- **Adversarial + integration suite:** `node/src/finality_adversarial_tests.rs` (test-only module of
   the node binary, because the driver and floor verifier live there). Each scenario runs 3–5
   in-process nodes, each with its own RocksDB store, `CanonicalApplicator`,
   `CheckpointManager` + `FinalityGadget` (switch forced ON in the test), the driver pass
