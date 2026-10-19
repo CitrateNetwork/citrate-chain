@@ -158,6 +158,35 @@ class TestPreflight(unittest.TestCase):
         self.assertEqual(lv["binary-sha256"], "FAIL")
         self.assertEqual(lv["fingerprint"], "FAIL")
 
+    def test_rejected_binary_is_never_executed(self):
+        binp = self.root / "usr/local/bin/citrate-node"
+        binp.parent.mkdir(parents=True)
+        binp.write_bytes(b"tampered")
+        seen = []
+        h = host(self.root)
+        inner = h.run
+
+        def recording(cmd):
+            seen.append(list(cmd))
+            return inner(cmd)
+
+        h.run = recording
+        rep = pf.run(h, args(expect_sha256="00" * 32, expect_fingerprint="0xABC"), None)
+        lv = levels(rep)
+        self.assertEqual(lv["binary-sha256"], "FAIL")
+        self.assertEqual(lv["fingerprint"], "FAIL")
+        self.assertTrue(rep.failed)
+        self.assertFalse(
+            any(str(binp) in cmd for cmd in seen),
+            f"the rejected binary reached the command runner: {seen}",
+        )
+        # A matching hash does execute it (once) for the fingerprint.
+        import hashlib
+
+        seen.clear()
+        pf.run(h, args(expect_sha256=hashlib.sha256(b"tampered").hexdigest()), None)
+        self.assertTrue(any(str(binp) in cmd for cmd in seen), seen)
+
     def test_missing_journal_cap_warns(self):
         (self.root / "etc/systemd/journald.conf").write_text("[Journal]\n")
         self.assertEqual(levels(pf.run(host(self.root), args(), None))["journald"], "WARN")

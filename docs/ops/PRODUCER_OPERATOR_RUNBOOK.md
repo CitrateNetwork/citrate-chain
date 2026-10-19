@@ -56,7 +56,7 @@ Run the preflight before anything else and send its output to the chain team:
 sudo python3 scripts/producers/preflight.py --profile 40204-r1005
 ```
 
-It checks architecture, OS, CPU, memory, disk, NTP, the service user, data-dir and key-file permissions (by `stat` only: it never reads a key), sshd, the firewall, listening ports, the journald cap, the binary hash and fingerprint, and that bootnodes and the public RPC are reachable. FAIL lines must be fixed. WARN lines are fixed or explained.
+It checks architecture, OS, CPU, memory, disk, NTP, the service user, data-dir and key-file permissions (by `stat` only: it never reads a key), sshd, the firewall, listening ports, the journald cap, the binary hash and fingerprint, and that bootnodes and the public RPC are reachable. FAIL lines must be fixed. WARN lines are fixed or explained. With `--expect-sha256`, a binary whose hash does not match is never executed: the fingerprint line then reads FAIL "not checked". Reinstall from the release (§3) and rerun.
 
 ## 2. OS hardening
 
@@ -266,6 +266,7 @@ It is sync-aware: while the node reports `eth_syncing`, it tracks `currentBlock`
 - While paused it restarts nothing. A pause doesn't lift itself: after its deadline the watchdog alerts once an hour, still without restarting, until someone resumes it.
 - **Resume after** the node is caught up (`eth_syncing` false, head within 5 blocks of the public RPC): `citrate-watchdog-ctl.sh resume`. Resuming resets the stall clock, so the first poll can't restart a node that is merely catching up.
 - `citrate-watchdog-ctl.sh status` shows the state.
+- **Incidents are not pauses.** For a suspected key compromise use `citrate-watchdog-ctl.sh contain` (§11), never `pause` plus `systemctl stop`: a pause is meant to be lifted, and containment turns the watchdog off before the node stops.
 
 Alerts go through `/usr/local/bin/citrate-alert.sh "<title>" "<body>"`. Provide your own (email, pager, chat webhook), executable by root. Set `NODE_LABEL` in a drop-in for the watchdog service if your hostname isn't descriptive.
 
@@ -295,7 +296,15 @@ With `CITRATE_METRICS=1` (set by the generated env file) the node serves Prometh
 ## 11. Exit and incidents
 
 - **Leaving:** tell the chain team first. Unbonding (`initiateUnbond`) starts a 6-epoch exit lock. Stop mining when the registry shows *Exiting*. Keep the host and its keys until the exit completes.
-- **Suspected key compromise:** stop the node at once (`systemctl stop citrate-node`) and keep it stopped, so the key can't sign twice. Then email security@citrate.ai. Don't post details publicly. See `SECURITY.md`.
+- **Suspected key compromise:** contain the node at once, so the key can't sign again, and keep it contained:
+
+  ```bash
+  sudo citrate-watchdog-ctl.sh contain "suspected key compromise"
+  ```
+
+  Don't use a bare `systemctl stop citrate-node`: the watchdog (§9) restarts a node whose RPC has been unreachable for 3 minutes, which would bring the signer back online. `contain` turns the watchdog off first, in this order: it writes a containment marker the watchdog obeys on every poll with no deadline, disables and stops `citrate-height-watchdog.timer`, stops a poll already running, and only then stops and disables `citrate-node`, so neither the watchdog nor a reboot starts it again. It stops at the first step that fails and says which one. If it fails, stop the node by hand after the watchdog is off. While contained, `resume` is refused. Check with `citrate-watchdog-ctl.sh status` (shows `CONTAINED`) and `systemctl is-active citrate-node citrate-height-watchdog.timer` (both `inactive`).
+
+  Then email security@citrate.ai. Don't post details publicly. See `SECURITY.md`. Only after the security response is done does `citrate-watchdog-ctl.sh release "<reason>"` lift the containment; it starts nothing, and the node and the watchdog timer are started again by hand when the chain team says so.
 - **Chain halt or fork:** pause the watchdog, don't restart in a loop, collect `journalctl -u citrate-node --since -1h`, and contact the chain team. Don't roll back or wipe anything unless they ask. Any rollback uses `citrate-node rollback` with the chain team's exact height and hash.
 
 ## Appendix: the tools
@@ -307,6 +316,6 @@ With `CITRATE_METRICS=1` (set by the generated env file) the node serves Prometh
 | `citrate-node registration-proof` | Proposer public key; the signed registration proof and calldata (§5–6) | Read-only by design |
 | `build_registration_tx.py` | Unsigned `registerValidator` transaction (§6) | No chain reads; output marked DO NOT SIGN |
 | `verify_producer.py` | Registered / eligible / committee / producing, from public RPC (§6, §8, §9) | Lists the reads |
-| `citrate-watchdog-ctl.sh` | Pause / resume / status of the watchdog (§9) | `--dry-run pause …` |
+| `citrate-watchdog-ctl.sh` | Pause / resume / status of the watchdog (§9); incident containment (§11) | `--dry-run pause …`, `--dry-run contain …` |
 
 Network profiles are `scripts/producers/profiles/<name>.json`. `40204-r1005` is the live network. `rehearsal-1` stays `pending-genesis` until the chain team fills its genesis hash, registry address and bootnodes at the rehearsal genesis cut. Until then the tools refuse it outside `--dry-run`.

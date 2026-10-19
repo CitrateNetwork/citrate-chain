@@ -126,6 +126,39 @@ def registry_changes_since(rpc: pl.Rpc, reg: str, start: int, head: int) -> list
     return changes
 
 
+def block_hash(rpc: pl.Rpc, height: int) -> str | None:
+    """Canonical hash at `height` per the RPC, lowercased; None when absent or unreadable."""
+    try:
+        b = rpc.call("eth_getBlockByNumber", [pl.qty(height), False])
+    except pl.RpcError:
+        return None
+    h = b.get("hash") if isinstance(b, dict) else None
+    return h.lower() if isinstance(h, str) else None
+
+
+def read_bracket(rpc: pl.Rpc, head_before: int, hash_before: str | None) -> tuple[int, str] | str:
+    """Close the bracket around the registry reads, which all use `latest`.
+
+    Every value the reads returned is the state at some canonical block in
+    [head_before, head_after], provided the block at head_before is still canonical (no
+    reorg during the reads). Returns (head_after, hash_after) when that holds, or the reason
+    it cannot be shown."""
+    if hash_before is None:
+        return f"could not read the hash of block {head_before} before the registry reads"
+    try:
+        head_after = pl.parse_qty(rpc.call("eth_blockNumber", []), "eth_blockNumber")
+    except (pl.RpcError, pl.ToolError) as e:
+        return f"could not read the head after the registry reads: {e}"
+    if head_after < head_before:
+        return f"the head went back from {head_before} to {head_after} during the reads"
+    if block_hash(rpc, head_before) != hash_before:
+        return f"block {head_before} changed during the reads (reorganisation)"
+    hash_after = block_hash(rpc, head_after)
+    if hash_after is None:
+        return f"could not read the hash of block {head_after} after the registry reads"
+    return head_after, hash_after
+
+
 def verify(args: argparse.Namespace) -> Result:
     prof = pl.load_profile(args.profile)
     rpc = pl.Rpc(args.rpc or prof["public_rpc"])
@@ -158,6 +191,10 @@ def verify(args: argparse.Namespace) -> Result:
                 pubkey = f"0x{bound:064x}"
         if pubkey is None:
             raise pl.ToolError("pass --staker or --pubkey")
+        # Open the bracket: the registry reads below use `latest`, and the head can move (or
+        # reorganise) while they run. The committee check needs to know which blocks' state
+        # they could have seen (see read_bracket).
+        hash_before = block_hash(rpc, head)
         info = pl.decode_validator_info(rpc.eth_call(reg, pl.calldata("validatorInfo(bytes32)", pubkey)))
         in_set = pl.bool_word(rpc.eth_call(reg, pl.calldata("isActive(bytes32)", pubkey)), "isActive")
         cur_epoch = pl.uint_word(rpc.eth_call(reg, pl.calldata("currentEpoch()")), "currentEpoch")
@@ -170,6 +207,7 @@ def verify(args: argparse.Namespace) -> Result:
             member_epochs.append(mi["act_epoch"])
         fin = rpc.call("eth_getBlockByNumber", ["finalized", False])
         finalized = pl.parse_qty(fin.get("number") if isinstance(fin, dict) else None, "finalized.number")
+        bracket = read_bracket(rpc, head, hash_before)
     except pl.RpcError as e:
         r.set("registered", None, f"unavailable: {e}", "ValidatorRegistry reads")
         return r
@@ -235,10 +273,25 @@ def verify(args: argparse.Namespace) -> Result:
     snapshot_members = sum(1 for ae in member_epochs if e_gov is not None and ae <= e_gov)
     # The stakes, set and minStake read above are LATEST. They describe S(E) only if nothing
     # that changes them happened from the snapshot block to the head.
+    # The reads saw state from some block in [head, head_after] (read_bracket), so the scan
+    # must run to head_after, and the snapshot governing must be the same across that span.
     changes: list[str] | None = []
-    if reg_ok and e_gov is not None and act <= e_gov:
-        changes = registry_changes_since(rpc, reg, pl.snapshot_height(e_gov), head)
-    snap_src = f"eth_getLogs {reg} blocks {pl.snapshot_height(e_gov) if e_gov else '-'}..{head}"
+    bracket_problem: str | None = None
+    scan_to = head
+    if isinstance(bracket, str):
+        bracket_problem = bracket
+    else:
+        scan_to, hash_after = bracket
+        if pl.governing_snapshot_epoch(scan_to + 1) != e_gov:
+            bracket_problem = (
+                f"the head crossed a snapshot boundary during the reads ({head} -> {scan_to}); re-run"
+            )
+    if reg_ok and e_gov is not None and act <= e_gov and bracket_problem is None:
+        changes = registry_changes_since(rpc, reg, pl.snapshot_height(e_gov), scan_to)
+        # The scanned logs must belong to the chain the reads saw.
+        if changes is not None and block_hash(rpc, scan_to) != hash_after:
+            bracket_problem = f"block {scan_to} changed during the log scan (reorganisation); re-run"
+    snap_src = f"eth_getLogs {reg} blocks {pl.snapshot_height(e_gov) if e_gov else '-'}..{scan_to}"
     if not reg_ok or e_gov is None:
         r.set("committee", False, "not in the committee", "derived: S(E) membership rule", finality=finality_note)
     elif act > e_gov:
@@ -247,6 +300,16 @@ def verify(args: argparse.Namespace) -> Result:
             False,
             f"not yet: joins the snapshot S({act}) = block {pl.snapshot_height(act)}",
             "derived: actEpoch vs governing snapshot epoch",
+            governing_snapshot_epoch=e_gov,
+            finality=finality_note,
+        )
+    elif bracket_problem is not None:
+        r.set(
+            "committee",
+            None,
+            f"unknown: {bracket_problem}. The registry reads use the latest state, so they cannot be "
+            f"tied to snapshot S({e_gov})",
+            "eth_blockNumber + block hashes around the registry reads",
             governing_snapshot_epoch=e_gov,
             finality=finality_note,
         )

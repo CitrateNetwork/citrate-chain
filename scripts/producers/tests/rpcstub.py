@@ -51,6 +51,10 @@ class FakeChain:
         self.registry_code = "0x6080"
         self.logs: list[dict[str, Any]] = []  # {"block": int, "topic0": hex64}
         self.log_queries: list[tuple[int, int]] = []
+        # Test hooks: on_call(chain, to, data) runs before every eth_call is answered (to move
+        # the chain between reads); hash_override[height] replaces a block hash (a reorg).
+        self.on_call: Any = None
+        self.hash_override: dict[int, str] = {}
 
     def add_validator(self, pubkey: str, staker: str, stake: int, act_epoch: int, status: str = "Active") -> None:
         self.validators[pubkey.lower()] = {
@@ -125,7 +129,8 @@ class FakeChain:
         if h == 0:
             return {"number": "0x0", "hash": self.genesis, "proposerPubkey": "0x" + "00" * 32, "miner": "0x" + "00" * 20}
         pk, miner = self.producers.get(h, self.default_producer)
-        return {"number": hex(h), "hash": "0x" + f"{h:064x}", "proposerPubkey": pk, "miner": miner}
+        hsh = self.hash_override.get(h, "0x" + f"{h:064x}")
+        return {"number": hex(h), "hash": hsh, "proposerPubkey": pk, "miner": miner}
 
     def handle(self, method: str, params: list[Any]) -> Any:
         if method in self.fail_methods:
@@ -142,6 +147,8 @@ class FakeChain:
                 return self.block(self.head)
             return self.block(int(tag, 16))
         if method == "eth_call":
+            if self.on_call is not None:
+                self.on_call(self, params[0]["to"], params[0]["data"])
             return self.call(params[0]["to"], params[0]["data"])
         if method == "eth_getCode":
             return self.registry_code if params[0].lower() == REGISTRY else "0x"

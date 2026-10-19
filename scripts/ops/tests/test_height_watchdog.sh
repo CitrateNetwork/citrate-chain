@@ -23,7 +23,13 @@ f="$RPCDIR/$m"; [ -f "$f" ] && cat "$f"
 EOF
 cat > "$T/bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
+# Records each call, and whether containment was already marked when it ran.
+c=no; [ -e "$STATE_DIR/CONTAIN" ] && c=yes
 echo "$*" >> "$LOGDIR/systemctl.log"
+echo "$c $*" >> "$LOGDIR/systemctl-contain.log"
+# SYSTEMCTL_FAIL=<substring>: fail the call whose arguments contain it.
+if [ -n "${SYSTEMCTL_FAIL:-}" ] && [[ "$*" == *"$SYSTEMCTL_FAIL"* ]]; then exit 1; fi
+exit 0
 EOF
 cat > "$T/bin/logger" <<'EOF'
 #!/usr/bin/env bash
@@ -87,7 +93,49 @@ if bash "$CTL" pause 49 x 2>/dev/null; then bad "pause 49 accepted"; else ok "pa
 if bash "$CTL" pause 2 2>/dev/null; then bad "pause without reason accepted"; else ok "pause needs a reason"; fi
 bash "$CTL" --dry-run pause 3 "dry" | grep -q "DRY RUN" && [ ! -e "$STATE_DIR/PAUSE" ] \
   && ok "dry-run pause writes nothing" || bad "dry-run pause wrote a file"
-bash "$CTL" pause 3 "real" >/dev/null; bash "$CTL" status | grep -q PAUSED && ok "status shows PAUSED" || bad "status wrong"
+bash "$CTL" pause 3 "real" >/dev/null; st="$(bash "$CTL" status)"; grep -q PAUSED <<<"$st" && ok "status shows PAUSED" || bad "status wrong"
+
+# 8. incident containment: watchdog off BEFORE the node stops; nothing restarts it
+reset; head_is 0x50; synced; bash "$WD"
+bash "$CTL" contain "suspected key compromise" >/dev/null
+expected=$'yes disable --now citrate-height-watchdog.timer\nyes stop citrate-height-watchdog.service\nyes disable --now citrate-node'
+[ "$(cat "$T/systemctl-contain.log")" = "$expected" ] \
+  && ok "contain marks, disables the watchdog, then stops the node (in that order)" \
+  || bad "contain order: $(cat "$T/systemctl-contain.log")"
+# The node is down: the RPC no longer answers. Even a poll that still fires (timer
+# re-enabled by hand, or one already in flight) must not restart it, ever.
+rm -f "$T/rpc/eth_blockNumber" "$T/rpc/eth_syncing"
+bash "$WD"; echo $(( $(date +%s) - 100000 )) > "$STATE_DIR/state.downsince"; bash "$WD"; bash "$WD"
+[ "$(restarts)" = 0 ] && ok "contained node is never restarted" || bad "contained node restarted $(restarts)x"
+st="$(bash "$CTL" status)"; grep -q CONTAINED <<<"$st" && ok "status shows CONTAINED" || bad "status does not show containment"
+if bash "$CTL" resume 2>/dev/null; then bad "resume lifted containment"; else ok "resume refused while contained"; fi
+[ -e "$STATE_DIR/CONTAIN" ] && ok "containment survives a resume attempt" || bad "CONTAIN removed by resume"
+if bash "$CTL" release 2>/dev/null; then bad "release without reason accepted"; else ok "release needs a reason"; fi
+: > "$T/systemctl.log"
+bash "$CTL" release "security response complete" >/dev/null
+[ ! -e "$STATE_DIR/CONTAIN" ] && ok "release clears containment" || bad "release kept CONTAIN"
+[ ! -s "$T/systemctl.log" ] && ok "release starts nothing" || bad "release called systemctl: $(cat "$T/systemctl.log")"
+
+# 9. contain input validation, dry run, and a failed step stops before the node is touched
+reset
+if bash "$CTL" contain 2>/dev/null; then bad "contain without reason accepted"; else ok "contain needs a reason"; fi
+dry="$(bash "$CTL" --dry-run contain "drill")"; grep -q "DRY RUN" <<<"$dry" && [ ! -e "$STATE_DIR/CONTAIN" ] && [ ! -e "$T/systemctl.log" ] \
+  && ok "dry-run contain changes nothing" || bad "dry-run contain changed state"
+reset
+if SYSTEMCTL_FAIL="citrate-height-watchdog.timer" bash "$CTL" contain "x" >/dev/null 2>&1; then
+  bad "contain succeeded although the watchdog could not be disabled"
+else
+  ok "contain fails when the watchdog cannot be disabled"
+fi
+grep -q "citrate-node" "$T/systemctl.log" && bad "node stopped although the watchdog is still on" \
+  || ok "node untouched after a failed watchdog step"
+[ -e "$STATE_DIR/CONTAIN" ] && ok "containment marker still blocks restarts after a failed step" || bad "no marker after failed step"
+reset
+if SYSTEMCTL_FAIL="disable --now citrate-node" bash "$CTL" contain "x" >/dev/null 2>"$T/err"; then
+  bad "contain reported success although the node stop failed"
+else
+  grep -q "FAILED at '4/4" "$T/err" && ok "a failed node stop is reported" || bad "node-stop failure message: $(cat "$T/err")"
+fi
 
 echo "watchdog tests: $pass passed, $fail failed"
 [ "$fail" = 0 ]

@@ -154,6 +154,89 @@ class TestVerify(unittest.TestCase):
             _, body, _ = run(s.url, "--staker", STAKER, "--require", "committee")
         self.assertIsNone(body["checks"]["committee"]["ok"])
 
+    # ── the registry reads use `latest` while the head moves ──────────────────────
+
+    def _advance_on_first(self, selector: str, fn):
+        """Run fn(chain) once, right before the first eth_call with this selector."""
+        fired = []
+
+        def hook(chain, _to, data):
+            if not fired and data[2:10] == selector:
+                fired.append(1)
+                fn(chain)
+
+        return hook
+
+    def test_committee_stake_change_after_the_head_read_is_not_missed(self):
+        # Below minStake at S(513); the stake rises in block head+1, after the head was read
+        # but before activeSet() is read. The scan must reach the block the reads could see.
+        c = self.c
+        c.head = 512_900
+        c.add_validator(PK, STAKER, STAKE - 1, 3)
+        c.min_stake = STAKE
+        stake_increased = "8a12a1190b63d1c04ed6ccb47df714257f26e7f702cbff29ca2c079eac2e4d83"
+
+        def raise_stake(chain):
+            chain.head += 1
+            chain.validators[PK]["stake"] = STAKE
+            chain.logs.append({"block": chain.head, "topic0": stake_increased})
+
+        c.on_call = self._advance_on_first("fd4665ae", raise_stake)  # activeSet()
+        with RpcStub(c) as s:
+            rc, body, _ = run(s.url, "--staker", STAKER, "--require", "committee")
+        com = body["checks"]["committee"]
+        self.assertIsNone(com["ok"], com)
+        self.assertEqual(rc, 3)
+        self.assertIn("changed after snapshot S(513)", com["state"])
+        self.assertEqual(max(hi for _, hi in c.log_queries), 512_901, c.log_queries)
+
+    def test_committee_passes_when_the_head_only_advances(self):
+        c = self.c
+        c.head = 512_900
+        c.add_validator(PK, STAKER, STAKE, 3)
+
+        def advance(chain):
+            chain.head += 3
+
+        c.on_call = self._advance_on_first("fd4665ae", advance)
+        with RpcStub(c) as s:
+            rc, body, _ = run(s.url, "--staker", STAKER, "--require", "committee")
+        self.assertTrue(body["checks"]["committee"]["ok"], body["checks"]["committee"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(max(hi for _, hi in c.log_queries), 512_903)
+
+    def test_committee_unknown_on_a_reorg_during_the_reads(self):
+        c = self.c
+        c.head = 512_900
+        c.add_validator(PK, STAKER, STAKE, 3)
+
+        def reorg(chain):
+            chain.hash_override[512_900] = "0x" + "ee" * 32
+
+        c.on_call = self._advance_on_first("fd4665ae", reorg)
+        with RpcStub(c) as s:
+            rc, body, _ = run(s.url, "--staker", STAKER, "--require", "committee")
+        com = body["checks"]["committee"]
+        self.assertIsNone(com["ok"], com)
+        self.assertIn("reorganisation", com["state"])
+        self.assertEqual(rc, 3)
+
+    def test_committee_unknown_when_the_reads_cross_a_snapshot_boundary(self):
+        c = self.c
+        c.head = 512_799  # the next block follows S(512); from 512,801 S(513) governs
+        c.add_validator(PK, STAKER, STAKE, 3)
+
+        def advance(chain):
+            chain.head += 2
+
+        c.on_call = self._advance_on_first("fd4665ae", advance)
+        with RpcStub(c) as s:
+            rc, body, _ = run(s.url, "--staker", STAKER, "--require", "committee")
+        com = body["checks"]["committee"]
+        self.assertIsNone(com["ok"], com)
+        self.assertIn("snapshot boundary", com["state"])
+        self.assertEqual(rc, 3)
+
     def test_small_committee_is_flagged(self):
         c = FakeChain()
         c.add_validator(PK, STAKER, STAKE, 3)

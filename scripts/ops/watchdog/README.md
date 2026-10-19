@@ -29,6 +29,17 @@ pause cannot restart a node that is only catching up. The sync-aware check below
 not cover every replay: a drain holds the head without reporting `eth_syncing`
 progress (2026-10-15), which is why the pause is explicit.
 
+## Incident containment
+For a suspected key compromise, never `pause` and `systemctl stop citrate-node`: a
+stopped node's RPC goes quiet and an active watchdog restarts it after `STALL_SECS`.
+```
+citrate-watchdog-ctl.sh contain "<reason>"   # marker, watchdog timer off, poll stopped, THEN node stopped+disabled
+citrate-watchdog-ctl.sh status               # CONTAINED
+citrate-watchdog-ctl.sh release "<reason>"   # after the security response; starts nothing
+```
+While `$STATE_DIR/CONTAIN` exists the watchdog restarts nothing, with no deadline, and
+`resume` is refused. Each step is checked; the first failure stops the command.
+
 Tests: `bash scripts/ops/tests/test_height_watchdog.sh` (hermetic: shimmed curl,
 systemctl, logger and alert hook).
 

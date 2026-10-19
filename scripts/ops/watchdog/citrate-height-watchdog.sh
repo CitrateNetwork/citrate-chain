@@ -20,6 +20,11 @@
 # never lifts itself: past its deadline it alerts (hourly) until an operator runs
 # `citrate-watchdog-ctl.sh resume`, which also re-baselines the stall clock so the
 # first poll after a long pause cannot restart a node that is merely catching up.
+#
+# INCIDENT CONTAINMENT: `citrate-watchdog-ctl.sh contain <reason>` (runbook §11, suspected
+# key compromise) disables this timer, stops any running poll, writes $STATE_DIR/CONTAIN and
+# only then stops and disables the node. While CONTAIN exists this script restarts nothing,
+# with no deadline, even if the timer is re-enabled by hand.
 set -u
 RPC="${RPC:-http://127.0.0.1:8545}"
 UNIT="${UNIT:-citrate-node}"
@@ -28,6 +33,7 @@ POLL_SECS="${POLL_SECS:-30}"
 STATE_DIR="${STATE_DIR:-/var/lib/citrate-watchdog}"
 STATE="$STATE_DIR/state"
 PAUSE_FILE="$STATE_DIR/PAUSE"
+CONTAIN_FILE="$STATE_DIR/CONTAIN"
 NODE_LABEL="${NODE_LABEL:-$(hostname -s 2>/dev/null || echo node)}"
 mkdir -p "$STATE_DIR"
 ALERT="${ALERT:-/usr/local/bin/citrate-alert.sh}"
@@ -39,7 +45,15 @@ rpc() { # method -> raw json
 
 now=$(date +%s)
 
-# 0) Operator pause: restart nothing; forget the stall baseline.
+# 0a) Incident containment (`citrate-watchdog-ctl.sh contain`): the node was stopped on
+# purpose (e.g. suspected key compromise). Never restart it, never expire, never nag.
+if [ -e "$CONTAIN_FILE" ]; then
+  rm -f "$STATE.progress" "$STATE.time" "$STATE.restarts" "$STATE.downsince"
+  logger -t citrate-watchdog "CONTAINED: $UNIT stopped for an incident; not checking or restarting it"
+  exit 0
+fi
+
+# 0b) Operator pause: restart nothing; forget the stall baseline.
 if [ -e "$PAUSE_FILE" ]; then
   rm -f "$STATE.progress" "$STATE.time" "$STATE.restarts" "$STATE.downsince"
   until_ts="$(sed -n 's/^until=\([0-9][0-9]*\)$/\1/p' "$PAUSE_FILE" | head -1)"

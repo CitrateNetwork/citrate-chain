@@ -304,8 +304,13 @@ def check_binary(h: Host, a: argparse.Namespace, r: Report) -> None:
         return
     digest = hashlib.sha256(b.read_bytes()).hexdigest()
     if a.expect_sha256:
-        lvl = "PASS" if digest == a.expect_sha256.lower() else "FAIL"
-        r.add(lvl, "binary-sha256", f"{digest} (expected {a.expect_sha256.lower()})")
+        if digest != a.expect_sha256.lower():
+            r.add("FAIL", "binary-sha256", f"{digest} (expected {a.expect_sha256.lower()})")
+            # Never execute a binary whose hash was rejected: preflight runs as root, and the
+            # binary may be tampered with or truncated. The fingerprint check is skipped.
+            r.add("FAIL", "fingerprint", "not checked: the binary was not executed because its sha256 does not match")
+            return
+        r.add("PASS", "binary-sha256", f"{digest} (expected {a.expect_sha256.lower()})")
     else:
         r.add("INFO", "binary-sha256", f"{digest} (pass --expect-sha256 to compare with the release)")
     rc, out = h.run(["env", "RUST_LOG=error", str(b), "consensus", "--json"])
