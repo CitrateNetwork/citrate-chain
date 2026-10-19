@@ -140,32 +140,44 @@ private, every file it creates is mode 0600 from the moment it exists (`umask 07
 in the same directory), the temporary file is removed on any failure, and the env file is replaced
 by one atomic `mv` that keeps its owner and group.
 
+The block stops at the first failed step. The subshell runs on its own (never as the left side of
+`&&` or `||`, which would switch `set -e` off inside it), and every step that comes before the
+`mv` also carries an explicit `|| exit 1`, so a failed backup, filter, append, key check, `chown`
+or `chmod` can never reach the `mv`. The result is read from the subshell's exit status
+afterwards. `FAUCET_ENV` and `FAUCET_STATE_DIR` default to the production paths; the faucet's
+test suite (`faucet/tests/runbook_env_block.rs`) runs this exact block against a throwaway env
+file, including each failure path.
+
 ```bash
 (
 set -euo pipefail
 umask 077
-E=/etc/citrate-faucet.env
+E=${FAUCET_ENV:-/etc/citrate-faucet.env}
+D=${FAUCET_STATE_DIR:-/var/lib/citrate-faucet}
 # The env file must already be private (0600 or 0400) before anything is copied from it.
 case "$(stat -c '%a' "$E")" in 600|400) ;; *) echo "refusing: $E is not mode 0600" >&2; exit 1 ;; esac
-cp -a "$E" "$E.pre-g4"                    # rollback copy; -a keeps the 0600 mode and owner
-T=$(mktemp "$E.new.XXXXXX")               # created 0600 under umask 077, same filesystem as $E
+install -d -m 0700 "$D"                     || exit 1   # match the unit's User= if it is not root
+cp -a "$E" "$E.pre-g4"                      || exit 1   # rollback copy; -a keeps the 0600 mode and owner
+T=$(mktemp "$E.new.XXXXXX")                 || exit 1   # created 0600 under umask 077, same filesystem as $E
 trap 'rm -f "$T"' EXIT
-grep -v -E '^(FAUCET_MAX_DRIPS_PER_HOUR|FAUCET_MEMBER_SBT|FAUCET_COOLDOWN_FILE|FAUCET_REQUIRE_GATES|FAUCET_ADDRESS_COOLDOWN_SECS|FAUCET_IP_COOLDOWN_SECS)=' "$E" > "$T"
-cat >> "$T" <<'ENV'
+grep -v -E '^(FAUCET_MAX_DRIPS_PER_HOUR|FAUCET_MEMBER_SBT|FAUCET_COOLDOWN_FILE|FAUCET_REQUIRE_GATES|FAUCET_ADDRESS_COOLDOWN_SECS|FAUCET_IP_COOLDOWN_SECS)=' "$E" > "$T" || exit 1
+cat >> "$T" <<'ENV' || exit 1
 FAUCET_REQUIRE_GATES=true
 FAUCET_MAX_DRIPS_PER_HOUR=<OPEN-3>
 FAUCET_MEMBER_SBT=<CitrateMemberSBT from contracts/addresses/40204.json>
 FAUCET_COOLDOWN_FILE=/var/lib/citrate-faucet/cooldowns.json
 ENV
 # Add FAUCET_ADDRESS_COOLDOWN_SECS / FAUCET_IP_COOLDOWN_SECS only if OPEN-1 / OPEN-2 differ from the defaults.
-test "$(grep -c '^FAUCET_PRIVATE_KEY=' "$T")" = 1   # the key line survived the filter (prints nothing)
-chown --reference="$E" "$T"
-chmod 600 "$T"
-mv -f "$T" "$E"
+n=$(grep -c '^FAUCET_PRIVATE_KEY=' "$T" || true)   # a count only; the line itself is never printed
+[ "$n" = 1 ] || { echo "refusing: expected exactly one key line after filtering, found $n" >&2; exit 1; }
+chown --reference="$E" "$T"                 || exit 1
+chmod 600 "$T"                              || exit 1
+mv -f "$T" "$E"                             || exit 1
 trap - EXIT
-stat -c '%a %U:%G' "$E"                   # expect 600 and the original owner
-install -d -m 0700 /var/lib/citrate-faucet  # match the unit's User= if it is not root
-) && echo "env updated" || echo "env NOT changed; fix the error above and rerun" >&2
+stat -c '%a %U:%G' "$E" || true             # expect 600 and the original owner (report only)
+)
+rc=$?
+if [ "$rc" -eq 0 ]; then echo "env updated"; else echo "env NOT changed (exit $rc); fix the error above and rerun" >&2; fi
 ```
 
 Do not use `sudo -E`, `env`, `printenv`, `set -x`, `bash -x` or `systemctl show -p Environment`

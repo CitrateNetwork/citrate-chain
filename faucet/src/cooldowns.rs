@@ -16,8 +16,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
@@ -114,6 +114,10 @@ pub struct Cooldowns {
     persistence_required: bool,
     /// False after a failed write while `persistence_required` is on.
     persistence_ok: AtomicBool,
+    /// Serialises every disk write (success path and recovery path). The snapshot is taken
+    /// while this is held, so writes land in snapshot order and a later write never publishes
+    /// an older state than an earlier one.
+    persist_lock: Mutex<()>,
 }
 
 impl Cooldowns {
@@ -126,6 +130,7 @@ impl Cooldowns {
             policy,
             persistence_required: false,
             persistence_ok: AtomicBool::new(true),
+            persist_lock: Mutex::new(()),
         }
     }
 
@@ -140,6 +145,7 @@ impl Cooldowns {
             policy,
             persistence_required: false,
             persistence_ok: AtomicBool::new(true),
+            persist_lock: Mutex::new(()),
         }
     }
 
@@ -163,6 +169,7 @@ impl Cooldowns {
             policy,
             persistence_required: true,
             persistence_ok: AtomicBool::new(true),
+            persist_lock: Mutex::new(()),
         })
     }
 
@@ -181,6 +188,14 @@ impl Cooldowns {
         let Some(path) = self.file.as_ref() else {
             return true;
         };
+        let _writer = self
+            .persist_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.persistence_ok() {
+            // Another writer restored persistence while this one waited.
+            return true;
+        }
         let snapshot = self
             .state
             .read()
@@ -257,27 +272,39 @@ impl Cooldowns {
     /// already passed `check`.
     pub fn record_success(&self, address: &str, ip: &str) {
         let now = unix_seconds();
-        let snapshot = {
+        {
             let mut state = self
                 .state
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.address_last.insert(address_key(address), now);
             state.ip_last.insert(ip.to_string(), now);
-            state.clone()
+        }
+        let Some(path) = self.file.as_ref() else {
+            return;
         };
-        if let Some(path) = self.file.as_ref() {
-            match persist_to_disk(path, &snapshot) {
-                Ok(()) => {}
-                Err(e) if self.persistence_required => {
-                    self.persistence_ok.store(false, Ordering::SeqCst);
-                    tracing::error!(
-                        "faucet cooldown: persist failed, refusing new drips until it succeeds: {}",
-                        e
-                    );
-                }
-                Err(e) => warn!("faucet cooldown: persist failed: {}", e),
+        // One writer at a time; the snapshot is taken under the writer lock so it contains every
+        // record completed before this write started (including ones whose own write is queued
+        // behind this one).
+        let _writer = self
+            .persist_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snapshot = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match persist_to_disk(path, &snapshot) {
+            Ok(()) => {}
+            Err(e) if self.persistence_required => {
+                self.persistence_ok.store(false, Ordering::SeqCst);
+                tracing::error!(
+                    "faucet cooldown: persist failed, refusing new drips until it succeeds: {}",
+                    e
+                );
             }
+            Err(e) => warn!("faucet cooldown: persist failed: {}", e),
         }
     }
 
@@ -391,8 +418,13 @@ fn load_from_disk_strict(path: &PathBuf) -> Result<CooldownState, String> {
     })
 }
 
-/// Write the state to a sibling temporary file (mode 0600 on Unix) and rename it over `path`,
-/// so a crash mid-write never leaves a truncated file behind.
+/// Distinguishes temporary files of writes within one process.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Write the state to a fresh, exclusively created sibling temporary file (mode 0600 on Unix),
+/// fsync it, rename it over `path`, then fsync the directory, so a crash mid-write never leaves a
+/// truncated file behind and no two writes ever share a temporary inode. Callers inside
+/// [`Cooldowns`] additionally serialise writes through `persist_lock`.
 fn persist_to_disk(path: &PathBuf, state: &CooldownState) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -408,12 +440,17 @@ fn persist_to_disk(path: &PathBuf, state: &CooldownState) -> std::io::Result<()>
     let bytes = serde_json::to_vec_pretty(state)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     let mut tmp_name = path.as_os_str().to_owned();
-    tmp_name.push(".tmp");
+    tmp_name.push(format!(
+        ".tmp.{}.{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     let tmp = PathBuf::from(tmp_name);
     let write = || -> std::io::Result<()> {
         use std::io::Write;
         let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        // create_new: never open (and truncate) a file another writer may still hold.
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -427,7 +464,18 @@ fn persist_to_disk(path: &PathBuf, state: &CooldownState) -> std::io::Result<()>
         }
         f.write_all(&bytes)?;
         f.sync_all()?;
-        std::fs::rename(&tmp, path)
+        drop(f);
+        std::fs::rename(&tmp, path)?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            let dir = if parent.as_os_str().is_empty() {
+                std::path::Path::new(".")
+            } else {
+                parent
+            };
+            std::fs::File::open(dir)?.sync_all()?;
+        }
+        Ok(())
     };
     let result = write();
     if result.is_err() {
@@ -719,6 +767,100 @@ mod tests {
         assert_eq!(
             wins, 1,
             "FAUCET-1 regression: {wins} concurrent requests passed the cooldown gate"
+        );
+    }
+
+    /// Concurrent successful drips persist without corrupting the file: every write goes through
+    /// one writer with its own temporary file, the final file is valid JSON holding every
+    /// completed cooldown, and no temporary file is left behind.
+    #[test]
+    fn g4_concurrent_persistence_keeps_every_cooldown() {
+        use std::sync::Arc;
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("cooldowns.json");
+        let cd = Arc::new(
+            Cooldowns::with_file_required(path.clone(), CooldownPolicy::default()).expect("start"),
+        );
+        const THREADS: usize = 16;
+        const PER_THREAD: usize = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let cd = cd.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for i in 0..PER_THREAD {
+                        let addr = format!("0x{t:02x}{i:02x}");
+                        let ip = format!("10.0.{t}.{i}");
+                        cd.try_reserve(&addr, &ip).expect("distinct keys reserve");
+                        cd.record_success(&addr, &ip);
+                        // Exercise the recovery writer concurrently too.
+                        assert!(cd.recover_persistence());
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("thread");
+        }
+        assert!(cd.persistence_ok(), "no write failed");
+        let on_disk = load_from_disk_strict(&path).expect("valid JSON on disk");
+        assert_eq!(on_disk.address_last.len(), THREADS * PER_THREAD);
+        assert_eq!(on_disk.ip_last.len(), THREADS * PER_THREAD);
+        for t in 0..THREADS {
+            for i in 0..PER_THREAD {
+                assert!(on_disk
+                    .address_last
+                    .contains_key(&address_key(&format!("0x{t:02x}{i:02x}"))));
+                assert!(on_disk.ip_last.contains_key(&format!("10.0.{t}.{i}")));
+            }
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("readdir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .filter(|n| n != "cooldowns.json")
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+        // A restart sees every cooldown.
+        let reloaded =
+            Cooldowns::with_file_required(path, CooldownPolicy::default()).expect("restart");
+        assert!(matches!(
+            reloaded.check("0x0000", "192.0.2.1"),
+            Err(CooldownDenial::AddressCooldown { .. })
+        ));
+    }
+
+    /// Two independent writers (e.g. two trackers on one path) never share a temporary file:
+    /// each publishes a complete document.
+    #[test]
+    fn g4_persist_uses_a_unique_temporary_file_per_write() {
+        use std::sync::Arc;
+        let tmp = TempDir::new().expect("tempdir");
+        let path = Arc::new(tmp.path().join("cooldowns.json"));
+        let handles: Vec<_> = (0..8)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let mut st = CooldownState::default();
+                    for i in 0..200 {
+                        st.address_last.insert(format!("{t:02x}{i:04x}"), i);
+                    }
+                    for _ in 0..20 {
+                        persist_to_disk(&path, &st).expect("write");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("thread");
+        }
+        let on_disk = load_from_disk_strict(&path).expect("valid JSON");
+        assert_eq!(
+            on_disk.address_last.len(),
+            200,
+            "one writer's complete document"
         );
     }
 
