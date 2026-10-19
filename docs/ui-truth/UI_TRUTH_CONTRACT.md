@@ -37,7 +37,7 @@ Use these words exactly. Each has one meaning and one condition. If a state isn'
 | **Sync stalled** | Peers exist but the applied height isn't moving | Local height unchanged for ≥ 60 s with `net_peerCount` > 0 |
 | **No peers** | Can't reach the network | `net_peerCount` = 0 for ≥ 60 s. If the genesis check fails too, show *Update required* instead |
 | **Update required** | This build is for a different genesis | Genesis hash ≠ the release genesis the app ships with (§6) |
-| **Resync required** | Local data is on a withdrawn branch | A canonical checkpoint hash doesn't match (§6) |
+| **Resync required** | Local data is on a withdrawn branch | The local node has applied the checkpoint height, returns that block, and its hash differs from the canonical checkpoint (§6). A missing block, a null or an error response is never "Resync required" |
 | **Error** | The node failed to start or crashed | Supervisor failed or start blocked |
 
 ### Blocks and transactions
@@ -55,8 +55,8 @@ Use these words exactly. Each has one meaning and one condition. If a state isn'
 |---|---|---|
 | **Not a validator** | No stake in the registry for this key | `ValidatorRegistry.validatorInfo(pubkey).status` = None |
 | **Bond locked · not staked** | Membership grant sits in the member's bond, not in the registry | `MemberBond.activated()` = false |
-| **Staked · active from next epoch** | Stake is registered but the validator isn't in the set yet | Registered stake, `isActive(pubkey)` = false. The set changes at epoch snapshots (every 1,000 blocks, with a lag) |
-| **Validator active** | In the active set | `ValidatorRegistry.isActive(pubkey)` = true |
+| **Registered · active from epoch N** | Registered in the registry; consensus activation is pending | `validatorInfo(pubkey).actEpoch` (= N) > `currentEpoch()`. Show the actual N; never promise "next epoch", because registration near a snapshot boundary can activate two epochs later. `isActive(pubkey)` is already true at registration and can't tell these apart |
+| **Validator active** | Active for consensus | `isActive(pubkey)` = true **and** `validatorInfo(pubkey).actEpoch` ≤ `currentEpoch()` |
 | **Producing blocks** | This node actually proposed blocks recently | A block in the last 1,000 has `proposerPubkey` = this node's key. *Active* does not imply this: today only one validator produces |
 | **Exiting** / **Slashed** | Registry status 2 / 3 | `validatorInfo.status` |
 | ~~Validating~~ (for stake ≥ 32k), ~~building blocks~~, ~~producing again~~ | **Banned.** Use the words above. Self-stake in LiquidStakingPool never makes a validator; only the registry does |
@@ -169,7 +169,7 @@ These return a believable value on error. Treat their 0 or `true` as "unknown" u
 
 1. `eth_chainId` = `0x9d0c`.
 2. `eth_getBlockByNumber("0x0").hash` = the release genesis the app ships with. Today that is `0x1dcfc4909dd9fdcb0f03c823d627e4b2032cc86bef5fc4561030d6c64b9775f1`. A new genesis ships with 0.5.2. A mismatch means **Update required**.
-3. Canonical checkpoints: block 365,784 = `0x63dcd4a8c7cd701080e242e5949402da93143bfd0659b3012e57998da4aa2c56` and 365,785 = `0x51482ff9724a2f0cbf4fe678f3ce556f6222334d5b2a3f5eba8a2b52af0cf3d2`. A mismatch means **Resync required**. The list grows with each release; read it from the bundled release, not from this file.
+3. Canonical checkpoints: block 365,784 = `0x63dcd4a8c7cd701080e242e5949402da93143bfd0659b3012e57998da4aa2c56` and 365,785 = `0x51482ff9724a2f0cbf4fe678f3ce556f6222334d5b2a3f5eba8a2b52af0cf3d2`. Compare only once the local node's applied height has reached the checkpoint **and** `eth_getBlockByNumber` returns that block. Below that height, or on a null or error response, the state stays **Syncing** (or the unavailable state); it is never "Resync required". Only a returned block with a different hash means **Resync required**. The list grows with each release; read it from the bundled release, not from this file.
 
 A node on a stale genesis usually shows up first as `net_peerCount` stuck at 0, because peers reject the handshake.
 
