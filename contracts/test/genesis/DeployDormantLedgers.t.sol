@@ -244,6 +244,53 @@ contract DeployDormantLedgersTest is Test {
         vm.expectRevert(bytes("CheckDeployedAdmins: deployer EOA holds governance/owner/DEFAULT_ADMIN (see log)"));
         c.check(book, false);
     }
+
+    /// Governance cannot strand the genesis ledger / SBT: an admin grant to the zero address or
+    /// the CREATE2 relay reverts (so it cannot inflate the admin count), and the sole usable admin
+    /// still cannot revoke itself.
+    function test_sole_admin_cannot_be_stranded_via_unusable_admin_grant() public {
+        address relay = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
+        DeployDormantLedgers.Deployed memory d = _deploy();
+        Auth[2] memory surfaces = [Auth(d.patronageLedger), Auth(address(membership))];
+        address[2] memory admins = [gov.governanceTimelock, makeAddr("sbt-admin")];
+        bytes32 adminRole = 0x00;
+        for (uint256 i = 0; i < 2; i++) {
+            vm.startPrank(admins[i]);
+            vm.expectRevert(Auth.ZeroRoleHolder.selector);
+            surfaces[i].grantRole(adminRole, address(0));
+            vm.expectRevert(Auth.Create2DeployerAsHolder.selector);
+            surfaces[i].grantRole(adminRole, relay);
+            vm.expectRevert(Auth.LastAdmin.selector);
+            surfaces[i].revokeRole(adminRole, admins[i]);
+            vm.stopPrank();
+            assertTrue(surfaces[i].hasRole(adminRole, admins[i]), "sole usable admin lost");
+            assertFalse(surfaces[i].hasRole(adminRole, address(0)));
+            assertFalse(surfaces[i].hasRole(adminRole, relay));
+        }
+    }
+
+    /// Operator roles are validated too: no role can be granted to the zero address or the relay.
+    function test_operator_role_grant_to_unusable_holder_reverts() public {
+        address relay = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
+        DeployDormantLedgers.Deployed memory d = _deploy();
+        PatronageLedger l = PatronageLedger(d.patronageLedger);
+        bytes32[3] memory ops = [l.SETTLER_ROLE(), l.COOP_ROLE(), l.YEAR_KEEPER_ROLE()];
+        vm.startPrank(gov.governanceTimelock);
+        for (uint256 i = 0; i < 3; i++) {
+            vm.expectRevert(Auth.ZeroRoleHolder.selector);
+            l.grantRole(ops[i], address(0));
+            vm.expectRevert(Auth.Create2DeployerAsHolder.selector);
+            l.grantRole(ops[i], relay);
+        }
+        vm.stopPrank();
+        bytes32 reg = membership.REGISTRAR_ROLE();
+        vm.startPrank(makeAddr("sbt-admin"));
+        vm.expectRevert(Auth.ZeroRoleHolder.selector);
+        membership.grantRole(reg, address(0));
+        vm.expectRevert(Auth.Create2DeployerAsHolder.selector);
+        membership.grantRole(reg, relay);
+        vm.stopPrank();
+    }
 }
 
 contract AdminChecksHarness is AdminChecks {
