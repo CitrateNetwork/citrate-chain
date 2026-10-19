@@ -7,6 +7,7 @@ import {DeployGenesisGovernance} from "../../script/DeployGenesisGovernance.s.so
 import {CheckDeployedAdmins} from "../../script/CheckDeployedAdmins.s.sol";
 import {MultisigProposer} from "../../src/genesis/MultisigProposer.sol";
 import {AdminChecks} from "../../script/lib/AdminChecks.sol";
+import {RoleLogArchive, GateWithHistory} from "./RoleHistoryHarness.sol";
 
 contract GovAdminChecksHarness is AdminChecks {
     function deployerProblem(address target, address deployer) external view returns (string memory) {
@@ -220,6 +221,8 @@ contract DeployGenesisGovernanceTest is Test {
     /// (The only test that sets GOV_* / GRD_* / GENESIS_GOVERNANCE_OUT: vm.setEnv is
     /// process-global and forge runs tests in parallel.)
     function test_run_requires_env_then_writes_a_book_the_admin_gate_passes() public {
+        vm.recordLogs(); // the gate replays the timelocks' role history (RoleHistoryHarness)
+        RoleLogArchive archive = new RoleLogArchive();
         vm.setEnv("DEPLOYER_ADDRESS", vm.toString(SENDER));
         DeployGenesisGovernance s = new DeployGenesisGovernance();
         vm.expectRevert();
@@ -250,11 +253,13 @@ contract DeployGenesisGovernanceTest is Test {
         assertEq(vm.parseJsonUint(book, ".params.guardian.minDelay"), 3600);
 
         vm.etch(P256_VERIFIER, hex"600160005260206000f3");
-        CheckDeployedAdmins c = new CheckDeployedAdmins();
+        GateWithHistory c = new GateWithHistory();
+        c.useArchive(archive);
         c.check(book, true);
         assertEq(c.deployerAdmin(), 0, "DEPLOYER-ADMIN reads 0 after hand-over");
         assertEq(c.factoryAdmin(), 0);
         assertEq(c.noCode(), 0);
+        assertEq(c.timelockHolders(), 0, "both councils hold their timelocks exclusively");
         vm.removeFile(out);
     }
 

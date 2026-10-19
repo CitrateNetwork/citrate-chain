@@ -30,6 +30,14 @@ import {P256} from "../src/aa/lib/webauthn/P256.sol";
 ///         `_governingSeatProblem`): the deployer must not hold a TimelockController
 ///         PROPOSER / EXECUTOR / CANCELLER role or an m-of-n owner seat (`isOwner`).
 ///
+///         TIMELOCK-HOLDERS (chain#320 P1): every book entry that answers `getMinDelay()` is
+///         treated as an OZ TimelockController and its COMPLETE role-holder sets are
+///         established (AdminChecks `_timelockHolderProblem`: rebuilt from the timelock's
+///         RoleGranted / RoleRevoked logs, re-read with hasRole). An entry `<P>Timelock` must
+///         have a `<P>Multisig` beside it in the same section; the timelock must be its own SOLE
+///         admin and that multisig its SOLE proposer, executor and canceller. No paired
+///         multisig, no node, or an incomplete history fails it. GATE: must be 0.
+///
 ///         Expected on the 2026-09-24 deployment (a fork of 40204): 22
 ///         FACTORY-ADMIN (21 admin slots + X402Paywall.provider), VERIFIER
 ///         missing, ~20 NO-CODE -> FAIL. After the PBA-L2-002 redeploy and
@@ -39,6 +47,7 @@ contract CheckDeployedAdmins is Script, AdminChecks {
     uint256 public factoryAdmin;
     uint256 public deployerAdmin;
     uint256 public noCode;
+    uint256 public timelockHolders;
     bool public verifierMissing;
 
     function run() external {
@@ -79,9 +88,13 @@ contract CheckDeployedAdmins is Script, AdminChecks {
         console.log("DEPLOYER-ADMIN failures:", deployerAdmin);
         console.log("NO-CODE entries (reported):", noCode);
         console.log("VERIFIER present:", !verifierMissing);
+        console.log("TIMELOCK-HOLDERS failures:", timelockHolders);
         require(factoryAdmin == 0, "CheckDeployedAdmins: CREATE2 factory holds an admin slot (see log)");
         require(deployerAdmin == 0, "CheckDeployedAdmins: deployer EOA holds governance/owner/DEFAULT_ADMIN (see log)");
         require(!verifierMissing, "CheckDeployedAdmins: P-256 verifier not provisioned");
+        require(
+            timelockHolders == 0, "CheckDeployedAdmins: a timelock's role holders are not exactly its council (see log)"
+        );
         if (requireAllCode) require(noCode == 0, "CheckDeployedAdmins: address-book entries without code");
     }
 
@@ -104,6 +117,37 @@ contract CheckDeployedAdmins is Script, AdminChecks {
                 console.log(string.concat("DEPLOYER-ADMIN ", names[i], ": ", dproblem), target);
                 deployerAdmin++;
             }
+            string memory hproblem = _timelockEntryProblem(json, section, names[i], target);
+            if (bytes(hproblem).length != 0) {
+                console.log(string.concat("TIMELOCK-HOLDERS ", names[i], ": ", hproblem), target);
+                timelockHolders++;
+            }
+        }
+    }
+
+    /// @notice Empty unless `target` is a timelock (answers `getMinDelay()`) whose complete
+    ///         holder sets are not exactly {itself} as admin and its paired `<P>Multisig` as
+    ///         proposer / executor / canceller.
+    function _timelockEntryProblem(string memory json, string memory section, string memory name, address target)
+        internal
+        returns (string memory)
+    {
+        (bool ok, bytes memory ret) = target.staticcall(abi.encodeWithSignature("getMinDelay()"));
+        if (!ok || ret.length != 32) return "";
+        bytes memory n = bytes(name);
+        bytes memory suffix = bytes("Timelock");
+        if (n.length < suffix.length || keccak256(_slice(n, n.length - suffix.length, n.length)) != keccak256(suffix)) {
+            return "a timelock entry must be named <P>Timelock with a <P>Multisig beside it";
+        }
+        string memory key = string.concat(section, ".", string(_slice(n, 0, n.length - suffix.length)), "Multisig");
+        if (!vm.keyExistsJson(json, key)) return "no paired <P>Multisig entry in the same section";
+        return _timelockHolderProblem(target, vm.parseJsonAddress(json, key), new address[](0));
+    }
+
+    function _slice(bytes memory b, uint256 from, uint256 to) internal pure returns (bytes memory out) {
+        out = new bytes(to - from);
+        for (uint256 i = from; i < to; i++) {
+            out[i - from] = b[i];
         }
     }
 }

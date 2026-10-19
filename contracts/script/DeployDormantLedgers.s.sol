@@ -40,6 +40,14 @@ import {MultisigProposer} from "../src/genesis/MultisigProposer.sol";
 ///             genesis profile (chain 40204, owner decision): delay >= 48 h AND the council
 ///               is at least 3-of-5. Selected by chain id; there is no override.
 ///             rehearsal (any other chain): delay >= 1 h (DeployGenesisGovernance's floor).
+///           Complete holder sets, not only named accounts: the timelock must run this
+///           build's OZ TimelockController code, be its own SOLE DEFAULT_ADMIN, and have the
+///           council as SOLE PROPOSER, EXECUTOR and CANCELLER. OZ AccessControl is not
+///           enumerable, so the sets are rebuilt from the timelock's RoleGranted / RoleRevoked
+///           logs (AdminChecks `_timelockRoleHistory`: eth_getLogs paged <= 1000 blocks from
+///           TIMELOCK_HISTORY_FROM_BLOCK, default 0) and every account found is re-read with
+///           hasRole. No node, a failed page, or a history that does not start at the
+///           timelock's construction fails closed.
 ///           The timelock and multisig are written to the book's `contracts`, so the
 ///           CheckDeployedAdmins gate re-checks them too.
 ///
@@ -55,7 +63,9 @@ import {MultisigProposer} from "../src/genesis/MultisigProposer.sol";
 ///         PATRONAGE_MEMBERSHIP (the KYC registry and membership contract PatronageLedger
 ///         reads; both immutable, both must have code), DORMANT_LEDGERS_OUT, and
 ///         CEREMONY_DEPLOYER_ADDRESS or DEPLOYER_ADDRESS (must equal the forge
-///         broadcast signer; enforced).
+///         broadcast signer; enforced). Needs --rpc-url (the role history comes from the
+///         node). Optional: TIMELOCK_HISTORY_FROM_BLOCK (a block at or before the timelock's
+///         creation; a later one fails the construction check), TIMELOCK_HISTORY_WINDOW (1..1000).
 contract DeployDormantLedgers is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook {
     string internal constant FRL = "FederatedRoundLedger";
 
@@ -144,7 +154,7 @@ contract DeployDormantLedgers is ScriptEnv, AdminChecks, Create2Deploy, GenesisB
     /// @notice Revert unless `governance` is a self-administered timelock run only by `council`
     ///         (a MultisigProposer fronting it), at or above this profile's floors, on which no
     ///         address in `accounts` (the deploy accounts) holds an admin slot or governing seat.
-    function _assertGovernanceCouncil(address governance, address council, address[] memory accounts) internal view {
+    function _assertGovernanceCouncil(address governance, address council, address[] memory accounts) internal {
         string memory tl = "GOVERNANCE_TIMELOCK";
         string memory ms = "GOVERNANCE_MULTISIG";
         require(council.code.length != 0, "GOVERNANCE_MULTISIG has no code on this chain");
@@ -174,6 +184,9 @@ contract DeployDormantLedgers is ScriptEnv, AdminChecks, Create2Deploy, GenesisB
                 "GOVERNANCE_MULTISIG: below the 3-of-5 genesis floor"
             );
         }
+        // Complete holder sets (chain#320 P1): the timelock is its SOLE admin and the council its
+        // SOLE proposer, executor and canceller, established from the timelock's role history.
+        _assertTimelockSoleHolders(tl, governance, council, new address[](0));
     }
 
     function _assertDormant(

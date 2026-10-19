@@ -13,6 +13,13 @@ import {Auth} from "../../src/coop/lib/Auth.sol";
 import {KYCRegistry} from "../../src/KYCRegistry.sol";
 import {MultisigProposer} from "../../src/genesis/MultisigProposer.sol";
 import {AdminChecks} from "../../script/lib/AdminChecks.sol";
+import {
+    RoleLogArchive,
+    DormantWithHistory,
+    GateWithHistory,
+    HolderChecksWithHistory,
+    HolderChecksLive
+} from "./RoleHistoryHarness.sol";
 
 /// @title DeployDormantLedgers.t: FederatedRoundLedger + PatronageLedger at genesis (C2 D9 / C4)
 contract DeployDormantLedgersTest is Test {
@@ -23,8 +30,12 @@ contract DeployDormantLedgersTest is Test {
     address[] internal govOwners;
     KYCRegistry internal kyc;
     MembershipSBT internal membership;
+    RoleLogArchive internal archive;
 
     function setUp() public {
+        // The timelock role history the scripts replay (no node in forge test: RoleHistoryHarness).
+        vm.recordLogs();
+        archive = new RoleLogArchive();
         govOwners = new address[](5);
         address[] memory grdOwners = new address[](3);
         for (uint256 i = 0; i < 5; i++) {
@@ -44,8 +55,37 @@ contract DeployDormantLedgersTest is Test {
         membership = new MembershipSBT(address(kyc), new bytes32[](0), makeAddr("sbt-admin"), makeAddr("sbt-registrar"));
     }
 
+    /// `vm.expectRevert`, after moving the recorded logs into the archive from THIS frame: a
+    /// reverted script call would roll back an absorb made inside it (RoleHistoryHarness).
+    function _expectRevert(bytes memory reason) internal {
+        archive.absorb();
+        vm.expectRevert(reason);
+    }
+
+    function _expectRevert(bytes4 selector) internal {
+        archive.absorb();
+        vm.expectRevert(selector);
+    }
+
+    function _expectRevert() internal {
+        archive.absorb();
+        vm.expectRevert();
+    }
+
+    function _dormant() internal returns (DeployDormantLedgers s) {
+        DormantWithHistory h = new DormantWithHistory();
+        h.useArchive(archive);
+        s = h;
+    }
+
+    function _gate() internal returns (CheckDeployedAdmins c) {
+        GateWithHistory g = new GateWithHistory();
+        g.useArchive(archive);
+        c = g;
+    }
+
     function _deploy() internal returns (DeployDormantLedgers.Deployed memory d) {
-        DeployDormantLedgers s = new DeployDormantLedgers();
+        DeployDormantLedgers s = _dormant();
         d = s.deployWith(SENDER, gov.governanceTimelock, gov.governanceMultisig, address(kyc), address(membership));
     }
 
@@ -73,13 +113,13 @@ contract DeployDormantLedgersTest is Test {
         (bytes32 settler, bytes32 coop, bytes32 keeper, bytes32 admin) =
             (l.SETTLER_ROLE(), l.COOP_ROLE(), l.YEAR_KEEPER_ROLE(), l.DEFAULT_ADMIN_ROLE());
         vm.startPrank(SENDER);
-        vm.expectRevert(abi.encodeWithSelector(Auth.Unauthorized.selector, settler, SENDER));
+        _expectRevert(abi.encodeWithSelector(Auth.Unauthorized.selector, settler, SENDER));
         l.commitRound(keccak256("r"), keccak256("h"));
-        vm.expectRevert(abi.encodeWithSelector(Auth.Unauthorized.selector, coop, SENDER));
+        _expectRevert(abi.encodeWithSelector(Auth.Unauthorized.selector, coop, SENDER));
         l.creditRevenue(1);
-        vm.expectRevert(abi.encodeWithSelector(Auth.Unauthorized.selector, keeper, SENDER));
+        _expectRevert(abi.encodeWithSelector(Auth.Unauthorized.selector, keeper, SENDER));
         l.advanceYear();
-        vm.expectRevert(abi.encodeWithSelector(Auth.Unauthorized.selector, admin, SENDER));
+        _expectRevert(abi.encodeWithSelector(Auth.Unauthorized.selector, admin, SENDER));
         l.grantRole(settler, SENDER);
         vm.stopPrank();
     }
@@ -142,38 +182,38 @@ contract DeployDormantLedgersTest is Test {
     }
 
     function test_rejects_governance_that_is_not_a_timelock() public {
-        DeployDormantLedgers s = new DeployDormantLedgers();
-        vm.expectRevert(bytes("GOVERNANCE_TIMELOCK is not a TimelockController"));
+        DeployDormantLedgers s = _dormant();
+        _expectRevert(bytes("GOVERNANCE_TIMELOCK is not a TimelockController"));
         s.deployWith(SENDER, gov.governanceMultisig, gov.governanceMultisig, address(kyc), address(membership));
-        vm.expectRevert(bytes("GOVERNANCE_TIMELOCK is not a TimelockController"));
+        _expectRevert(bytes("GOVERNANCE_TIMELOCK is not a TimelockController"));
         s.deployWith(SENDER, makeAddr("eoa"), gov.governanceMultisig, address(kyc), address(membership));
-        vm.expectRevert(bytes("GOVERNANCE_TIMELOCK cannot be the deployer"));
+        _expectRevert(bytes("GOVERNANCE_TIMELOCK cannot be the deployer"));
         s.deployWith(SENDER, SENDER, gov.governanceMultisig, address(kyc), address(membership));
     }
 
     function test_rejects_codeless_kyc_or_membership() public {
-        DeployDormantLedgers s = new DeployDormantLedgers();
-        vm.expectRevert(bytes("PATRONAGE_KYC_REGISTRY has no code on this chain"));
+        DeployDormantLedgers s = _dormant();
+        _expectRevert(bytes("PATRONAGE_KYC_REGISTRY has no code on this chain"));
         s.deployWith(SENDER, gov.governanceTimelock, gov.governanceMultisig, makeAddr("nokyc"), address(membership));
-        vm.expectRevert(bytes("PATRONAGE_MEMBERSHIP has no code on this chain"));
+        _expectRevert(bytes("PATRONAGE_MEMBERSHIP has no code on this chain"));
         s.deployWith(SENDER, gov.governanceTimelock, gov.governanceMultisig, address(kyc), makeAddr("nomember"));
     }
 
     /// The only test that sets GOVERNANCE_TIMELOCK / PATRONAGE_* / DORMANT_LEDGERS_OUT.
     function test_run_requires_env_then_writes_a_gated_book() public {
         vm.setEnv("DEPLOYER_ADDRESS", vm.toString(SENDER));
-        DeployDormantLedgers s = new DeployDormantLedgers();
-        vm.expectRevert();
+        DeployDormantLedgers s = _dormant();
+        _expectRevert();
         s.run(); // GOVERNANCE_TIMELOCK unset
         vm.setEnv("GOVERNANCE_TIMELOCK", vm.toString(gov.governanceTimelock));
-        vm.expectRevert();
+        _expectRevert();
         s.run(); // GOVERNANCE_MULTISIG unset
         vm.setEnv("GOVERNANCE_MULTISIG", vm.toString(gov.governanceMultisig));
         vm.setEnv("PATRONAGE_KYC_REGISTRY", vm.toString(address(kyc)));
-        vm.expectRevert();
+        _expectRevert();
         s.run(); // PATRONAGE_MEMBERSHIP unset
         vm.setEnv("PATRONAGE_MEMBERSHIP", vm.toString(address(membership)));
-        vm.expectRevert();
+        _expectRevert();
         s.run(); // DORMANT_LEDGERS_OUT unset
 
         vm.createDir("genesis", true);
@@ -188,7 +228,7 @@ contract DeployDormantLedgersTest is Test {
         assertEq(vm.parseJsonAddress(book, ".contracts.GovernanceMultisig"), gov.governanceMultisig);
 
         vm.etch(P256_VERIFIER, hex"600160005260206000f3");
-        CheckDeployedAdmins c = new CheckDeployedAdmins();
+        CheckDeployedAdmins c = _gate();
         c.check(book, true);
         assertEq(c.deployerAdmin(), 0, "DEPLOYER-ADMIN reads 0 after hand-over");
         assertEq(c.factoryAdmin(), 0);
@@ -200,9 +240,9 @@ contract DeployDormantLedgersTest is Test {
     /// A who never held it, and every check that only looked at A passed).
     function test_reverts_when_broadcaster_is_not_the_configured_deployer() public {
         address configured = makeAddr("configured-deployer-A");
-        DeployDormantLedgers s = new DeployDormantLedgers();
+        DeployDormantLedgers s = _dormant();
         uint64 nonceBefore = vm.getNonce(SENDER);
-        vm.expectRevert(bytes("broadcast sender is not the configured deployer (DEPLOYER_ADDRESS)"));
+        _expectRevert(bytes("broadcast sender is not the configured deployer (DEPLOYER_ADDRESS)"));
         s.deployWith(configured, gov.governanceTimelock, gov.governanceMultisig, address(kyc), address(membership)); // broadcasts as SENDER (B)
         assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
     }
@@ -220,43 +260,43 @@ contract DeployDormantLedgersTest is Test {
         me[0] = SENDER;
         TimelockController weak = new TimelockController(0, me, me, SENDER);
         MultisigProposer ms = new MultisigProposer(address(weak), govOwners, 3);
-        DeployDormantLedgers s = new DeployDormantLedgers();
+        DeployDormantLedgers s = _dormant();
 
         // As-is: the multisig holds no seat and the deployer administers the timelock.
-        vm.expectRevert(bytes("GOVERNANCE_TIMELOCK: deployer EOA holds DEFAULT_ADMIN_ROLE"));
+        _expectRevert(bytes("GOVERNANCE_TIMELOCK: deployer EOA holds DEFAULT_ADMIN_ROLE"));
         s.deployWith(SENDER, address(weak), address(ms), address(kyc), address(membership));
 
         // The multisig is wired in too, but the deployer keeps its seats: still refused.
         _grantCouncil(weak, address(ms));
-        vm.expectRevert(bytes("GOVERNANCE_TIMELOCK: deployer EOA holds DEFAULT_ADMIN_ROLE"));
+        _expectRevert(bytes("GOVERNANCE_TIMELOCK: deployer EOA holds DEFAULT_ADMIN_ROLE"));
         s.deployWith(SENDER, address(weak), address(ms), address(kyc), address(membership));
 
         // Admin renounced, deployer still proposer / executor: refused.
         vm.startPrank(SENDER);
         weak.renounceRole(weak.DEFAULT_ADMIN_ROLE(), SENDER);
-        vm.expectRevert(bytes("GOVERNANCE_TIMELOCK: deployer EOA holds timelock PROPOSER_ROLE"));
+        _expectRevert(bytes("GOVERNANCE_TIMELOCK: deployer EOA holds timelock PROPOSER_ROLE"));
         s.deployWith(SENDER, address(weak), address(ms), address(kyc), address(membership));
         weak.renounceRole(weak.PROPOSER_ROLE(), SENDER);
         weak.renounceRole(weak.CANCELLER_ROLE(), SENDER);
-        vm.expectRevert(bytes("GOVERNANCE_TIMELOCK: deployer EOA holds timelock EXECUTOR_ROLE"));
+        _expectRevert(bytes("GOVERNANCE_TIMELOCK: deployer EOA holds timelock EXECUTOR_ROLE"));
         s.deployWith(SENDER, address(weak), address(ms), address(kyc), address(membership));
         weak.renounceRole(weak.EXECUTOR_ROLE(), SENDER);
         vm.stopPrank();
         uint64 nonceBefore = vm.getNonce(SENDER);
 
         // Fully handed over to the multisig, but the delay is zero: refused on the delay floor.
-        vm.expectRevert(bytes("GOVERNANCE_TIMELOCK: minDelay below the 1 h rehearsal floor"));
+        _expectRevert(bytes("GOVERNANCE_TIMELOCK: minDelay below the 1 h rehearsal floor"));
         s.deployWith(SENDER, address(weak), address(ms), address(kyc), address(membership));
         assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
     }
 
     function test_rejects_council_that_is_not_the_timelocks_multisig() public {
-        DeployDormantLedgers s = new DeployDormantLedgers();
+        DeployDormantLedgers s = _dormant();
         // A multisig with no seat on the timelock.
         MultisigProposer stranger = new MultisigProposer(gov.governanceTimelock, govOwners, 3);
-        vm.expectRevert(bytes("GOVERNANCE_TIMELOCK: multisig lacks a timelock role"));
+        _expectRevert(bytes("GOVERNANCE_TIMELOCK: multisig lacks a timelock role"));
         s.deployWith(SENDER, gov.governanceTimelock, address(stranger), address(kyc), address(membership));
-        vm.expectRevert(bytes("GOVERNANCE_MULTISIG has no code on this chain"));
+        _expectRevert(bytes("GOVERNANCE_MULTISIG has no code on this chain"));
         s.deployWith(SENDER, gov.governanceTimelock, makeAddr("nomultisig"), address(kyc), address(membership));
     }
 
@@ -270,8 +310,8 @@ contract DeployDormantLedgersTest is Test {
         tl.grantRole(tl.EXECUTOR_ROLE(), address(0));
         tl.renounceRole(tl.DEFAULT_ADMIN_ROLE(), SENDER);
         vm.stopPrank();
-        DeployDormantLedgers s = new DeployDormantLedgers();
-        vm.expectRevert(bytes("GOVERNANCE_TIMELOCK: timelock execution is open to anyone"));
+        DeployDormantLedgers s = _dormant();
+        _expectRevert(bytes("GOVERNANCE_TIMELOCK: timelock execution is open to anyone"));
         s.deployWith(SENDER, address(tl), address(ms), address(kyc), address(membership));
     }
 
@@ -281,7 +321,7 @@ contract DeployDormantLedgersTest is Test {
         DeployGenesisGovernance.Deployed memory weakDelay = _council(3, 5, 24 hours);
         // 72 h: the timelock's CREATE2 address depends on (deployer, delay), and setUp owns 48 h.
         DeployGenesisGovernance.Deployed memory weakCouncil = _council(2, 3, 72 hours);
-        DeployDormantLedgers s = new DeployDormantLedgers();
+        DeployDormantLedgers s = _dormant();
         s.deployWith(
             SENDER, weakDelay.governanceTimelock, weakDelay.governanceMultisig, address(kyc), address(membership)
         );
@@ -290,11 +330,11 @@ contract DeployDormantLedgersTest is Test {
         );
 
         vm.chainId(40204);
-        vm.expectRevert(bytes("GOVERNANCE_TIMELOCK: minDelay below the 48 h genesis floor"));
+        _expectRevert(bytes("GOVERNANCE_TIMELOCK: minDelay below the 48 h genesis floor"));
         s.deployWith(
             SENDER, weakDelay.governanceTimelock, weakDelay.governanceMultisig, address(kyc), address(membership)
         );
-        vm.expectRevert(bytes("GOVERNANCE_MULTISIG: below the 3-of-5 genesis floor"));
+        _expectRevert(bytes("GOVERNANCE_MULTISIG: below the 3-of-5 genesis floor"));
         s.deployWith(
             SENDER, weakCouncil.governanceTimelock, weakCouncil.governanceMultisig, address(kyc), address(membership)
         );
@@ -316,11 +356,229 @@ contract DeployDormantLedgersTest is Test {
         me[0] = SENDER;
         TimelockController weak = new TimelockController(0, me, me, address(0));
         DeployDormantLedgers.Deployed memory d = _deploy();
-        DeployDormantLedgers s = new DeployDormantLedgers();
+        DeployDormantLedgers s = _dormant();
         string memory book = s.bookJson(SENDER, address(weak), gov.governanceMultisig, d);
-        CheckDeployedAdmins c = new CheckDeployedAdmins();
-        vm.expectRevert(bytes("CheckDeployedAdmins: deployer EOA holds governance/owner/DEFAULT_ADMIN (see log)"));
+        CheckDeployedAdmins c = _gate();
+        _expectRevert(bytes("CheckDeployedAdmins: deployer EOA holds governance/owner/DEFAULT_ADMIN (see log)"));
         c.check(book, false);
+    }
+
+    // ---- chain#320 P1: complete holder sets, not only the named accounts ----
+
+    /// A genuine OZ timelock, 48 h, handed to a 3-of-5 MultisigProposer by SENDER, with SENDER's
+    /// admin renounced: what an operator might pass as GOVERNANCE_TIMELOCK. The caller adds
+    /// whatever extra seats it wants before `_finish`.
+    function _handedTimelock() internal returns (TimelockController tl, MultisigProposer ms) {
+        tl = new TimelockController(48 hours, new address[](0), new address[](0), SENDER);
+        ms = new MultisigProposer(address(tl), govOwners, 3);
+        _grantCouncil(tl, address(ms));
+    }
+
+    function _finish(TimelockController tl) internal {
+        bytes32 adminRole = tl.DEFAULT_ADMIN_ROLE();
+        vm.prank(SENDER);
+        tl.renounceRole(adminRole, SENDER);
+    }
+
+    function _grantAs(TimelockController tl, bytes32 role, address who) internal {
+        vm.prank(SENDER);
+        tl.grantRole(role, who);
+    }
+
+    /// The Codex finding verbatim: 48 h, 3-of-5, plus an unrelated EOA holding DEFAULT_ADMIN_ROLE.
+    /// No deploy account holds anything, so the named-account checks pass; the complete set does not.
+    function test_rejects_unrelated_admin_on_an_otherwise_correct_timelock() public {
+        vm.chainId(40204);
+        (TimelockController tl, MultisigProposer ms) = _handedTimelock();
+        _grantAs(tl, tl.DEFAULT_ADMIN_ROLE(), makeAddr("eve"));
+        _finish(tl);
+        DeployDormantLedgers s = _dormant();
+        uint64 nonceBefore = vm.getNonce(SENDER);
+        _expectRevert(bytes("GOVERNANCE_TIMELOCK: DEFAULT_ADMIN_ROLE holders are not exactly the timelock itself"));
+        s.deployWith(SENDER, address(tl), address(ms), address(kyc), address(membership));
+        assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
+    }
+
+    function test_rejects_extra_proposer_executor_or_canceller() public {
+        vm.chainId(40204);
+        bytes32[3] memory roles = [keccak256("PROPOSER_ROLE"), keccak256("EXECUTOR_ROLE"), keccak256("CANCELLER_ROLE")];
+        string[3] memory reasons = [
+            "GOVERNANCE_TIMELOCK: PROPOSER_ROLE holders are not exactly the multisig",
+            "GOVERNANCE_TIMELOCK: EXECUTOR_ROLE holders are not exactly the multisig",
+            "GOVERNANCE_TIMELOCK: CANCELLER_ROLE is held by an account other than the multisig"
+        ];
+        DeployDormantLedgers s = _dormant();
+        for (uint256 i = 0; i < 3; i++) {
+            (TimelockController tl, MultisigProposer ms) = _handedTimelock();
+            _grantAs(tl, roles[i], makeAddr("operator"));
+            _finish(tl);
+            _expectRevert(bytes(reasons[i]));
+            s.deployWith(SENDER, address(tl), address(ms), address(kyc), address(membership));
+        }
+    }
+
+    /// A holder that was granted and later revoked (or renounced) holds nothing: accepted.
+    function test_granted_then_revoked_holders_are_accepted() public {
+        vm.chainId(40204);
+        (TimelockController tl, MultisigProposer ms) = _handedTimelock();
+        address eve = makeAddr("eve");
+        _grantAs(tl, tl.DEFAULT_ADMIN_ROLE(), eve);
+        _grantAs(tl, tl.PROPOSER_ROLE(), eve);
+        _grantAs(tl, tl.CANCELLER_ROLE(), makeAddr("temp-canceller"));
+        (bytes32 proposer, bytes32 canceller) = (tl.PROPOSER_ROLE(), tl.CANCELLER_ROLE());
+        address temp = makeAddr("temp-canceller");
+        vm.startPrank(SENDER);
+        tl.revokeRole(proposer, eve);
+        tl.revokeRole(canceller, temp);
+        vm.stopPrank();
+        bytes32 adminRole = tl.DEFAULT_ADMIN_ROLE();
+        vm.prank(eve);
+        tl.renounceRole(adminRole, eve);
+        _finish(tl);
+
+        DeployDormantLedgers.Deployed memory d =
+            _dormant().deployWith(SENDER, address(tl), address(ms), address(kyc), address(membership));
+        PatronageLedger l = PatronageLedger(d.patronageLedger);
+        assertTrue(l.hasRole(l.DEFAULT_ADMIN_ROLE(), address(tl)));
+    }
+
+    /// The clean pipeline council (DeployGenesisGovernance) is established exactly, for both councils.
+    function test_clean_pipeline_councils_have_exact_holder_sets() public {
+        HolderChecksWithHistory h = new HolderChecksWithHistory();
+        h.useArchive(archive);
+        assertEq(h.problem(gov.governanceTimelock, gov.governanceMultisig, new address[](0)), "");
+        assertEq(h.problem(gov.guardianTimelock, gov.guardianMultisig, new address[](0)), "");
+        // The wrong council for a timelock is not its holder set.
+        assertEq(
+            h.problem(gov.governanceTimelock, gov.guardianMultisig, new address[](0)),
+            "PROPOSER_ROLE holders are not exactly the multisig"
+        );
+        vm.chainId(40204);
+        _deploy();
+    }
+
+    /// An extra canceller is accepted only when the caller names it (a guardian canceller seat).
+    function test_named_extra_canceller_is_allowed_and_only_that_one() public {
+        (TimelockController tl, MultisigProposer ms) = _handedTimelock();
+        address guardian = makeAddr("guardian-canceller");
+        _grantAs(tl, tl.CANCELLER_ROLE(), guardian);
+        _finish(tl);
+        HolderChecksWithHistory h = new HolderChecksWithHistory();
+        h.useArchive(archive);
+        address[] memory extra = new address[](1);
+        extra[0] = guardian;
+        assertEq(h.problem(address(tl), address(ms), extra), "");
+        assertEq(
+            h.problem(address(tl), address(ms), new address[](0)),
+            "CANCELLER_ROLE is held by an account other than the multisig"
+        );
+        extra[0] = makeAddr("someone-else");
+        assertEq(
+            h.problem(address(tl), address(ms), extra), "CANCELLER_ROLE is held by an account other than the multisig"
+        );
+    }
+
+    /// No node (the production history source under forge test): fails closed, nothing sent.
+    function test_missing_history_fails_closed() public {
+        string memory noNode =
+            string.concat("role history unavailable: eth_getLogs failed for blocks 0-", vm.toString(block.number));
+        assertEq(new HolderChecksLive().problem(gov.governanceTimelock, gov.governanceMultisig), noNode);
+
+        DeployDormantLedgers live = new DeployDormantLedgers();
+        uint64 nonceBefore = vm.getNonce(SENDER);
+        _expectRevert(bytes(string.concat("GOVERNANCE_TIMELOCK: ", noNode)));
+        live.deployWith(SENDER, gov.governanceTimelock, gov.governanceMultisig, address(kyc), address(membership));
+        assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
+
+        // A harness that was never given a history: same.
+        DormantWithHistory blind = new DormantWithHistory();
+        _expectRevert(bytes("GOVERNANCE_TIMELOCK: role history unavailable: no archive"));
+        blind.deployWith(SENDER, gov.governanceTimelock, gov.governanceMultisig, address(kyc), address(membership));
+    }
+
+    /// A history that starts after the timelock was built (a late TIMELOCK_HISTORY_FROM_BLOCK, a
+    /// pruned range) cannot establish the set, even when every later event is present.
+    function test_history_that_misses_the_construction_fails_closed() public {
+        archive.absorb();
+        (TimelockController tl, MultisigProposer ms) = _handedTimelock();
+        vm.getRecordedLogs(); // the construction and the council grants never reach the archive
+        (bytes32 proposer, address later) = (tl.PROPOSER_ROLE(), makeAddr("later"));
+        _grantAs(tl, proposer, later);
+        vm.prank(SENDER);
+        tl.revokeRole(proposer, later);
+        _finish(tl);
+        DeployDormantLedgers s = _dormant();
+        _expectRevert(bytes("GOVERNANCE_TIMELOCK: role history does not start at the timelock's construction"));
+        s.deployWith(SENDER, address(tl), address(ms), address(kyc), address(membership));
+    }
+
+    /// A history with a gap (here: a lost revoke) disagrees with the live state: fails closed.
+    function test_history_that_disagrees_with_live_state_fails_closed() public {
+        (TimelockController tl, MultisigProposer ms) = _handedTimelock();
+        address eve = makeAddr("eve");
+        bytes32 executor = tl.EXECUTOR_ROLE();
+        _grantAs(tl, executor, eve);
+        archive.absorb();
+        vm.prank(SENDER);
+        tl.revokeRole(executor, eve);
+        vm.getRecordedLogs(); // the revoke is lost
+        _finish(tl);
+        DeployDormantLedgers s = _dormant();
+        _expectRevert(
+            bytes("GOVERNANCE_TIMELOCK: role history disagrees with the live hasRole state (incomplete history)")
+        );
+        s.deployWith(SENDER, address(tl), address(ms), address(kyc), address(membership));
+    }
+
+    /// A contract that only imitates a timelock (getMinDelay / hasRole) is not the OZ build.
+    function test_rejects_non_oz_timelock_code() public {
+        HolderChecksWithHistory h = new HolderChecksWithHistory();
+        h.useArchive(archive);
+        assertEq(
+            h.problem(gov.governanceMultisig, gov.governanceMultisig, new address[](0)),
+            "runtime code is not this build's OZ TimelockController"
+        );
+    }
+
+    /// The post-deploy gate establishes the complete sets on every timelock in the book.
+    function test_admin_gate_flags_an_unrelated_admin_on_the_governance_timelock() public {
+        vm.etch(P256_VERIFIER, hex"600160005260206000f3");
+        DeployDormantLedgers.Deployed memory d = _deploy();
+        (TimelockController tl, MultisigProposer ms) = _handedTimelock();
+        _grantAs(tl, tl.DEFAULT_ADMIN_ROLE(), makeAddr("eve"));
+        _finish(tl);
+        DeployDormantLedgers s = _dormant();
+        CheckDeployedAdmins clean = _gate();
+        clean.check(s.bookJson(SENDER, gov.governanceTimelock, gov.governanceMultisig, d), false);
+        assertEq(clean.timelockHolders(), 0);
+
+        string memory book = s.bookJson(SENDER, address(tl), address(ms), d);
+        CheckDeployedAdmins c = _gate();
+        _expectRevert(bytes("CheckDeployedAdmins: a timelock's role holders are not exactly its council (see log)"));
+        c.check(book, false);
+    }
+
+    function test_admin_gate_requires_a_paired_multisig_and_a_history() public {
+        vm.etch(P256_VERIFIER, hex"600160005260206000f3");
+        string memory unpaired = string.concat(
+            '{"deployer":"',
+            vm.toString(SENDER),
+            '","contracts":{"Gov":"',
+            vm.toString(gov.governanceTimelock),
+            '","GovernanceTimelock":"',
+            vm.toString(gov.governanceTimelock),
+            '"},"aaStack":{}}'
+        );
+        CheckDeployedAdmins c = _gate();
+        _expectRevert(bytes("CheckDeployedAdmins: a timelock's role holders are not exactly its council (see log)"));
+        c.check(unpaired, false);
+
+        // A correct book, but no node to read the history from: the gate fails closed.
+        DeployDormantLedgers.Deployed memory d = _deploy();
+        string memory book = _dormant().bookJson(SENDER, gov.governanceTimelock, gov.governanceMultisig, d);
+        CheckDeployedAdmins live = new CheckDeployedAdmins();
+        _expectRevert(bytes("CheckDeployedAdmins: a timelock's role holders are not exactly its council (see log)"));
+        live.check(book, false);
     }
 
     function _grantCouncil(TimelockController tl, address ms) internal {
@@ -364,13 +622,13 @@ contract DeployDormantLedgersTest is Test {
         h.soleAdminAmong(address(good), gov.governanceTimelock, others); // passes
 
         PatronageLedger heldByB = new PatronageLedger(address(kyc), address(membership), b);
-        vm.expectRevert(bytes("PatronageLedger: intended key lacks DEFAULT_ADMIN_ROLE"));
+        _expectRevert(bytes("PatronageLedger: intended key lacks DEFAULT_ADMIN_ROLE"));
         h.soleAdminAmong(address(heldByB), gov.governanceTimelock, others);
 
         // B is admin AND governance was granted too: still refused (B kept admin).
         vm.prank(b);
         heldByB.grantRole(0x00, gov.governanceTimelock);
-        vm.expectRevert(bytes("PatronageLedger: a deploy account holds DEFAULT_ADMIN_ROLE"));
+        _expectRevert(bytes("PatronageLedger: a deploy account holds DEFAULT_ADMIN_ROLE"));
         h.soleAdminAmong(address(heldByB), gov.governanceTimelock, others);
     }
 
@@ -386,8 +644,8 @@ contract DeployDormantLedgersTest is Test {
             vm.toString(address(held)),
             '"},"aaStack":{}}'
         );
-        CheckDeployedAdmins c = new CheckDeployedAdmins();
-        vm.expectRevert(bytes("CheckDeployedAdmins: deployer EOA holds governance/owner/DEFAULT_ADMIN (see log)"));
+        CheckDeployedAdmins c = _gate();
+        _expectRevert(bytes("CheckDeployedAdmins: deployer EOA holds governance/owner/DEFAULT_ADMIN (see log)"));
         c.check(book, false);
     }
 
@@ -402,11 +660,11 @@ contract DeployDormantLedgersTest is Test {
         bytes32 adminRole = 0x00;
         for (uint256 i = 0; i < 2; i++) {
             vm.startPrank(admins[i]);
-            vm.expectRevert(Auth.ZeroRoleHolder.selector);
+            _expectRevert(Auth.ZeroRoleHolder.selector);
             surfaces[i].grantRole(adminRole, address(0));
-            vm.expectRevert(Auth.Create2DeployerAsHolder.selector);
+            _expectRevert(Auth.Create2DeployerAsHolder.selector);
             surfaces[i].grantRole(adminRole, relay);
-            vm.expectRevert(Auth.LastAdmin.selector);
+            _expectRevert(Auth.LastAdmin.selector);
             surfaces[i].revokeRole(adminRole, admins[i]);
             vm.stopPrank();
             assertTrue(surfaces[i].hasRole(adminRole, admins[i]), "sole usable admin lost");
@@ -423,17 +681,17 @@ contract DeployDormantLedgersTest is Test {
         bytes32[3] memory ops = [l.SETTLER_ROLE(), l.COOP_ROLE(), l.YEAR_KEEPER_ROLE()];
         vm.startPrank(gov.governanceTimelock);
         for (uint256 i = 0; i < 3; i++) {
-            vm.expectRevert(Auth.ZeroRoleHolder.selector);
+            _expectRevert(Auth.ZeroRoleHolder.selector);
             l.grantRole(ops[i], address(0));
-            vm.expectRevert(Auth.Create2DeployerAsHolder.selector);
+            _expectRevert(Auth.Create2DeployerAsHolder.selector);
             l.grantRole(ops[i], relay);
         }
         vm.stopPrank();
         bytes32 reg = membership.REGISTRAR_ROLE();
         vm.startPrank(makeAddr("sbt-admin"));
-        vm.expectRevert(Auth.ZeroRoleHolder.selector);
+        _expectRevert(Auth.ZeroRoleHolder.selector);
         membership.grantRole(reg, address(0));
-        vm.expectRevert(Auth.Create2DeployerAsHolder.selector);
+        _expectRevert(Auth.Create2DeployerAsHolder.selector);
         membership.grantRole(reg, relay);
         vm.stopPrank();
     }
