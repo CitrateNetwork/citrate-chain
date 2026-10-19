@@ -618,7 +618,7 @@ message).
   enabled.
   Stage 1 also carries the liveness fixes (early-vote buffer + vote relay, §11.5), the
   epoch-pinned committee (§11.6), pending/voted pruning (§11.9), late-joiner certificate sync
-  (§11.10), and the `check_claims.py` tightening (§11.11).
+  (§11.10, Stage 1b), and the `check_claims.py` tightening (§11.11).
 - **Stage 2 — verification:** integration + adversarial tests (§8) + TLA+/conformance in CI.
 - **Stage 3 — enable:** flip the compiled enforcement pin (§6, node-local, NO activation
   height) in a release, *after* the committee exists (§7) and late-joiners can fetch certs.
@@ -667,6 +667,30 @@ the design + test bar and tracked here so #12 addresses every one:
 - **(10) late joiners:** a syncing node must be able to **fetch finalized checkpoint
   certificates** during sync (new `GetCheckpoint`/`CheckpointCert` p2p messages + apply on
   receipt), else its floor stays 0 until it participates live. Add to Stage 1 + a sync test.
+  **Stage 1b** (`node/src/finality_sync.rs`, compiled off with the voting pin):
+  - *Wire.* `NetworkMessage::GetCheckpoint { above, at_or_below }` and
+    `NetworkMessage::CheckpointCertificate { height, block_hash, signatures }`, appended
+    after every existing variant. Protocol version 1.2 (`CHECKPOINT_CERT_SYNC`, a minor
+    bump: older nodes still accept the handshake); `Peer::send` withholds both messages
+    from peers below 1.2, which could not decode them. The certificate carries **no
+    committee**.
+  - *Request.* Every 10 s, one outstanding request at a time (expires after 10 s, at
+    least 5 s apart), round robin over 1.2+ peers, for the highest certificate with
+    `finalized height < h <= applied tip`. Only the answer from the peer asked, before
+    expiry, is processed; one verification at a time, off the message loop.
+  - *Serve.* At most once per peer per 5 s (bounded rate table); the highest finalized
+    certificate in range; never more than 512 signatures or 60 KiB encoded (block
+    serving's budget under the 64 KiB Noise message limit). Nothing in range: no answer.
+  - *Trust.* Size first, then: above the local finalized height; a checkpoint boundary;
+    the certified block is the block at that height on this node's applied chain
+    (read-only `verify_certified_floor`); committee derived **locally** from the epoch
+    snapshot governing the height plus this node's copy of the block's VRF beacon
+    (`FinalityGadget::committee_for`, as the producer path); quorum, membership and every
+    signature (`CheckpointManager::verify_synced_certificate`). A sibling hash or a
+    certificate above the applied tip is refused and **does not** halt finality (a peer
+    chose to send it). A passing certificate is persisted like a locally finalized one
+    and the floor verifier runs a pass at once, so the mode rules apply unchanged
+    (Observed: metric only; Enforced: raises the floor and the RPC tags).
 - **(11) claims tripwire:** `check_claims.py` currently passes on any non-test `.propose(`
   call — a default-off flag would false-positive "running". Tighten it (require the flag/pin
   ON **and** an outbound vote path) **in the same PR**; MAC flips the tripwire only when

@@ -296,6 +296,11 @@ impl FloorVerifier {
         }
     }
 
+    /// The mode this verifier runs in (from the two compiled pins).
+    pub fn mode(&self) -> FloorMode {
+        self.mode
+    }
+
     /// The source the RPC `finalized`/`safe` tags must read in this mode:
     /// Legacy and Observed keep today's source (the applicator's floor handle,
     /// which neither mode raises, so the tags stay at genesis); only Enforced,
