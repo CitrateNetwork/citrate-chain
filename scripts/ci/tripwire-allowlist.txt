@@ -40,3 +40,9 @@ rpc-finality-height-index | core/api/src/eth_rpc.rs | [eth_feeHistory] | board:C
 
 # ── shell-pipefail ────────────────────────────────────────────────────────────────────────────
 shell-pipefail | scripts/ops/watchdog/citrate-height-watchdog.sh | * | chain#330 (board:C3-P) | the watchdog is being rewritten with a test suite in chain#330; add pipefail there rather than conflict with it. Its pipelines only feed sed/grep extraction under set -u
+
+# ── tla-frame: actions that prime a variable a sibling conjunct keeps UNCHANGED ──────────────
+# Found on main when the tripwire landed; reported to the owner, spec fix tracked separately.
+tla-frame | specs/tla/gui/OnboardingFlow.tla | [ChooseHomeUser] | board:QA-T (owner report 2026-10-19) | persona' is set beside UNCHANGED persona, so the persona choice never fires (guard persona = "none"); fix the frame in the spec, then re-run TLC
+tla-frame | specs/tla/gui/OnboardingFlow.tla | [ChooseTeacher] | board:QA-T (owner report 2026-10-19) | same frame clash as ChooseHomeUser; fix together
+tla-frame | specs/tla/gui/OnboardingFlow.tla | [ChooseDeveloper] | board:QA-T (owner report 2026-10-19) | same frame clash as ChooseHomeUser; fix together

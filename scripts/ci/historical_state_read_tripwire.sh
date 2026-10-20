@@ -14,8 +14,8 @@
 #       `--fork-block-number`, `vm.createFork(url, n)`, `vm.createSelectFork(url, n)`,
 #       `vm.rollFork(..)`, `cast call|code|balance|storage|nonce … --block`.
 #
-# Scope: every tracked source/script file outside core/api (the server itself), docs (*.md)
-# and vendored trees. Comment lines are skipped. A read that is pinned on purpose (a tool that
+# Scope: every tracked source/script file outside core/api (the server itself), docs (*.md),
+# vendored trees and this script (its own patterns would match). Comment lines are skipped. A read that is pinned on purpose (a tool that
 # documents the latest-state behaviour, a gate that compares two nodes at the same head) goes in
 # the allowlist with its reason.
 #
@@ -33,7 +33,7 @@ FIXTURES="$HERE/fixtures/rpc-historical-state"
 
 scan() { # <root>
   (cd "$1" && tw_files . | grep -E '\.(rs|py|sh|bash|ts|tsx|js|mjs|cjs|sol|yml|yaml)$' \
-     | grep -vE '^core/api/' \
+     | grep -vE '^core/api/|^scripts/ci/historical_state_read_tripwire\.sh$' \
      | xargs -r -d '\n' grep -lE 'eth_(getCode|call|getBalance|getStorageAt|getTransactionCount)|fork-block-number|createSelectFork|createFork|rollFork|cast[[:space:]]+(call|code|balance|storage|nonce)' 2>/dev/null \
      | xargs -r -d '\n' perl -e '
     for my $f (@ARGV) {

@@ -147,7 +147,7 @@ fi
 # Append-only — never delete a tripwire "to make room"; add the new one here.
 # The 2026-10-19 set (forge script chain id / address(this), historical state reads, finality
 # tags via the height index, finalization publish order, shell rm/pipefail, synthetic-pid
-# signals) shares scripts/ci/tripwire-allowlist.txt for reviewed exceptions; CI runs the same
+# signals, TLA+ frame clashes) shares scripts/ci/tripwire-allowlist.txt for reviewed exceptions; CI runs the same
 # list in .github/workflows/tripwires.yml.
 consensus_tripwires() {
   local rc=0 t
@@ -163,6 +163,7 @@ consensus_tripwires() {
     "scripts/ci/finalization_publish_order_tripwire.sh" \
     "scripts/ci/shell_safety_tripwire.sh" \
     "scripts/ci/synthetic_pid_signal_tripwire.sh" \
+    "scripts/ci/tla_frame_tripwire.sh" \
   ; do
     if [ ! -x "$t" ]; then
       echo "missing/!executable tripwire: $t"; rc=1; continue
