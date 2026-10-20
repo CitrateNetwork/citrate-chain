@@ -1856,10 +1856,39 @@ pub fn register_eth_methods_with_finality(
         Ok(Value::String("0x3b9aca00".to_string()))
     });
 
+    // The executed-chain resolver (and its settled-checkpoint cache), shared by
+    // eth_getLogs and citrate_isExecuted so both answer from the same walk.
+    let executed_chain = Arc::new(crate::canonical_logs::ExecutedChainIndex::new());
+
+    // citrate_isExecuted - Whether a block hash is on the persisted applied
+    // (executed selected-parent) chain eth_getLogs serves:
+    // {"executed": bool, "number": "0x…" | null}. eth_getBlockByHash serves any
+    // stored block, including ones a reorg abandoned, so it only proves storage.
+    let storage_is_exec = storage.clone();
+    let executed_chain_is_exec = executed_chain.clone();
+    io_handler.add_sync_method(
+        crate::canonical_logs::IS_EXECUTED_METHOD,
+        move |params: Params| {
+            // Walks up to SETTLED_DEPTH + CHECKPOINT_STRIDE headers: priced like eth_getLogs.
+            crate::rate_limit::check_method_budget(10)?;
+            let params: Vec<Value> = match params {
+                Params::None => Vec::new(),
+                p => p
+                    .parse()
+                    .map_err(|e| jsonrpc_core::Error::invalid_params(e.to_string()))?,
+            };
+            crate::canonical_logs::is_executed_json(
+                &executed_chain_is_exec,
+                &storage_is_exec,
+                &params,
+            )
+        },
+    );
+
     // eth_getLogs - Get logs matching filter criteria
     let storage_logs = storage.clone();
     let finalized_logs = finalized_height.clone();
-    let executed_chain_logs = Arc::new(crate::canonical_logs::ExecutedChainIndex::new());
+    let executed_chain_logs = executed_chain.clone();
     let legacy_clamp_logs = crate::canonical_logs::legacy_clamp_from_env();
     io_handler.add_sync_method("eth_getLogs", move |params: Params| {
         // WP-I.4: eth_getLogs costs 10 budget units

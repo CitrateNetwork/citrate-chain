@@ -474,6 +474,74 @@ impl ExecutedChainIndex {
     }
 }
 
+impl ExecutedChainIndex {
+    /// Whether `hash` is on the executed chain of the persisted applied tip:
+    /// `Some(height)` when it is, `None` when it is not (unknown, above the
+    /// tip, or a stored block the tip's chain does not contain).
+    pub fn is_executed(
+        &self,
+        storage: &StorageManager,
+        hash: &Hash,
+    ) -> Result<Option<u64>, LogIndexError> {
+        executed_head(storage).map_err(LogIndexError::Unavailable)?;
+        // STUB (red commit): any stored block counts as executed.
+        Ok(storage
+            .blocks
+            .get_header(hash)
+            .map_err(|e| LogIndexError::Unavailable(format!("header {hash}: {e}")))?
+            .map(|h| h.height))
+    }
+}
+
+/// JSON-RPC method that reports [`ExecutedChainIndex::is_executed`].
+pub const IS_EXECUTED_METHOD: &str = "citrate_isExecuted";
+
+/// The `citrate_isExecuted` response for `params` (`[hash]`):
+/// `{"executed": true, "number": "0x…"}` or `{"executed": false, "number": null}`.
+/// Errors: -32602 for a missing or malformed hash, -32603 when no applied tip
+/// is persisted or the executed chain cannot be followed, -32002 (retryable)
+/// when a cold lookup deep below the tip exceeds the per-request header budget.
+pub fn is_executed_json(
+    index: &ExecutedChainIndex,
+    storage: &StorageManager,
+    params: &[serde_json::Value],
+) -> Result<serde_json::Value, jsonrpc_core::Error> {
+    let hash = parse_block_hash(params.first())?;
+    let number = index.is_executed(storage, &hash).map_err(|e| match e {
+        LogIndexError::Retry(m) => jsonrpc_core::Error {
+            code: jsonrpc_core::ErrorCode::ServerError(LOG_INDEX_RETRY_CODE),
+            message: format!("{IS_EXECUTED_METHOD}: {m}; retry the same request"),
+            data: Some(serde_json::json!({ "retryable": true })),
+        },
+        LogIndexError::Unavailable(m) => jsonrpc_core::Error {
+            code: jsonrpc_core::ErrorCode::InternalError,
+            message: format!("{IS_EXECUTED_METHOD}: {m}"),
+            data: None,
+        },
+    })?;
+    Ok(match number {
+        Some(n) => serde_json::json!({ "executed": true, "number": format!("0x{n:x}") }),
+        None => serde_json::json!({ "executed": false, "number": null }),
+    })
+}
+
+/// A 32-byte block hash given as a `0x`-prefixed hex string (-32602 otherwise).
+fn parse_block_hash(v: Option<&serde_json::Value>) -> Result<Hash, jsonrpc_core::Error> {
+    let invalid =
+        |m: &str| jsonrpc_core::Error::invalid_params(format!("{IS_EXECUTED_METHOD}: {m}"));
+    let s = v
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| invalid("expected params [blockHash]"))?;
+    let digits = s
+        .strip_prefix("0x")
+        .ok_or_else(|| invalid("block hash must be 0x-prefixed hex"))?;
+    let bytes = hex::decode(digits).map_err(|_| invalid("block hash is not hex"))?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| invalid("block hash must be 32 bytes"))?;
+    Ok(Hash::new(arr))
+}
+
 /// The body of an executed block named by [`ExecutedChainIndex::executed_hashes`].
 pub fn load_executed_block(storage: &StorageManager, hash: &Hash) -> Result<Block, LogIndexError> {
     storage
