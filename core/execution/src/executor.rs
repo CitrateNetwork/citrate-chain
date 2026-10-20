@@ -2334,6 +2334,15 @@ impl Executor {
         if let Some(to) = receipt.to {
             writes.record_write(to);
         }
+        // From the activation height precompile storage and the model / job
+        // registries are journaled under their own slot addresses; carry
+        // those into the version bump the serial fallback commits with.
+        if Self::tx_writes_journaled(context) {
+            let j = context.journal.lock();
+            for addr in j.write_set().iter() {
+                writes.record_write(*addr);
+            }
+        }
 
         Ok((receipt, writes))
     }
@@ -2349,6 +2358,11 @@ impl Executor {
         for ((addr, key), value) in journal.iter_storage_writes() {
             self.state_db.set_storage(*addr, key.clone(), value.clone());
         }
+        // Disjoint from the writes above (the later of a write and a delete to
+        // one slot wins inside the journal), so the order is immaterial.
+        for (addr, key) in journal.iter_storage_deletes() {
+            self.state_db.delete_storage(*addr, key);
+        }
         for (addr, pending) in journal.iter_writes() {
             if let Some(new_balance) = pending.new_balance {
                 self.state_db.accounts.set_balance(*addr, new_balance);
@@ -2360,6 +2374,12 @@ impl Executor {
                 self.state_db.accounts.create_account_if_not_exists(*addr);
                 self.set_code(addr, code.clone());
             }
+        }
+        for (id, model) in journal.iter_models() {
+            self.state_db.apply_journaled_model(*id, model.clone());
+        }
+        for (id, job) in journal.iter_jobs() {
+            self.state_db.apply_journaled_job(*id, job.clone());
         }
     }
 
@@ -2746,6 +2766,199 @@ impl Executor {
 
         debug!("Transfer: {} -> {} : {}", from, to, value);
         Ok(())
+    }
+
+    // ─────────────── in-tx state access (journal routing) ───────────────
+    //
+    // From `supply_hardening_height` every state write a transaction makes
+    // goes into its journal: governance-precompile storage, the model
+    // registry and its artifact / proof index, training jobs and the rewards
+    // they pay. The journal is drained over `state_db` only when the tx
+    // commits; a revert discards it (keeping gas burn + nonce) and a lost
+    // MVCC check drops it, so neither leaves anything behind. Reads are
+    // journal-first so a tx sees its own writes, and are recorded in the read
+    // set so a concurrent commit to the same entry forces a retry.
+    //
+    // Below the height each helper is exactly the legacy direct call, so
+    // historical blocks replay to the roots they were produced with.
+
+    /// Whether this tx's writes go through its journal.
+    fn tx_writes_journaled(context: &ExecutionContext) -> bool {
+        crate::supply_hardening::supply_hardening_active(context.block_number)
+    }
+
+    /// The MVCC slot address standing for one model-registry or training-job
+    /// entry (those stores are not keyed by account). Derived by hashing, so it
+    /// cannot coincide with a real account in practice; it never holds state.
+    fn registry_slot(tag: &[u8], id: &Hash) -> Address {
+        use sha3::{Digest, Keccak256};
+        let mut h = Keccak256::new();
+        h.update(b"citrate.exec.registry-slot:");
+        h.update(tag);
+        h.update(id.as_bytes());
+        let d: [u8; 32] = h.finalize().into();
+        let mut a = [0u8; 20];
+        a.copy_from_slice(&d[12..]);
+        Address(a)
+    }
+
+    fn tx_get_storage(
+        &self,
+        context: &ExecutionContext,
+        addr: &Address,
+        key: &[u8],
+    ) -> Option<Vec<u8>> {
+        if Self::tx_writes_journaled(context) {
+            let mut j = context.journal.lock();
+            j.record_read(*addr);
+            if let Some(entry) = j.storage_entry(addr, key) {
+                return entry.map(|v| v.to_vec());
+            }
+        }
+        self.state_db.get_storage(addr, key)
+    }
+
+    fn tx_set_storage(
+        &self,
+        context: &ExecutionContext,
+        addr: Address,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) {
+        if Self::tx_writes_journaled(context) {
+            context
+                .journal
+                .lock()
+                .record_storage_write(addr, key, value);
+        } else {
+            // LEGACY-PRE-SUPPLY-HARDENING
+            self.state_db.set_storage(addr, key, value);
+        }
+    }
+
+    fn tx_delete_storage(&self, context: &ExecutionContext, addr: Address, key: &[u8]) {
+        if Self::tx_writes_journaled(context) {
+            context
+                .journal
+                .lock()
+                .record_storage_delete(addr, key.to_vec());
+        } else {
+            // LEGACY-PRE-SUPPLY-HARDENING
+            self.state_db.delete_storage(addr, key);
+        }
+    }
+
+    fn tx_get_model(&self, context: &ExecutionContext, id: &ModelId) -> Option<ModelState> {
+        if Self::tx_writes_journaled(context) {
+            let mut j = context.journal.lock();
+            j.record_read(Self::registry_slot(b"model", &id.0));
+            if let Some(m) = j.pending_model(id) {
+                return Some(m.clone());
+            }
+        }
+        self.state_db.get_model(id)
+    }
+
+    /// Register a new model. Same error as `StateDB::register_model` when the
+    /// id is already taken, judged on this tx's journal-first view.
+    fn tx_register_model(
+        &self,
+        context: &ExecutionContext,
+        id: ModelId,
+        model: ModelState,
+    ) -> Result<(), ExecutionError> {
+        if Self::tx_writes_journaled(context) {
+            if self.tx_get_model(context, &id).is_some() {
+                return Err(ExecutionError::Reverted("Model already exists".to_string()));
+            }
+            let mut j = context.journal.lock();
+            j.mark_written(Self::registry_slot(b"model", &id.0));
+            j.record_model(id, model);
+            Ok(())
+        } else {
+            // LEGACY-PRE-SUPPLY-HARDENING
+            self.state_db.register_model(id, model)
+        }
+    }
+
+    /// Replace an existing model. Same error as `StateDB::update_model` when
+    /// the id is unknown, judged on this tx's journal-first view.
+    fn tx_update_model(
+        &self,
+        context: &ExecutionContext,
+        id: ModelId,
+        model: ModelState,
+    ) -> Result<(), ExecutionError> {
+        if Self::tx_writes_journaled(context) {
+            if self.tx_get_model(context, &id).is_none() {
+                return Err(ExecutionError::ModelNotFound(id));
+            }
+            let mut j = context.journal.lock();
+            j.mark_written(Self::registry_slot(b"model", &id.0));
+            j.record_model(id, model);
+            Ok(())
+        } else {
+            // LEGACY-PRE-SUPPLY-HARDENING
+            self.state_db.update_model(id, model)
+        }
+    }
+
+    fn tx_get_job(
+        &self,
+        context: &ExecutionContext,
+        id: &JobId,
+    ) -> Option<crate::types::TrainingJob> {
+        if Self::tx_writes_journaled(context) {
+            let mut j = context.journal.lock();
+            j.record_read(Self::registry_slot(b"job", &id.0));
+            if let Some(job) = j.pending_job(id) {
+                return Some(job.clone());
+            }
+        }
+        self.state_db.get_training_job(id)
+    }
+
+    /// Replace an existing training job (same error as
+    /// `StateDB::update_training_job` when it is unknown).
+    fn tx_update_job(
+        &self,
+        context: &ExecutionContext,
+        id: JobId,
+        job: crate::types::TrainingJob,
+    ) -> Result<(), ExecutionError> {
+        if Self::tx_writes_journaled(context) {
+            if self.tx_get_job(context, &id).is_none() {
+                return Err(ExecutionError::Reverted("Job not found".to_string()));
+            }
+            let mut j = context.journal.lock();
+            j.mark_written(Self::registry_slot(b"job", &id.0));
+            j.record_job(id, job);
+            Ok(())
+        } else {
+            // LEGACY-PRE-SUPPLY-HARDENING
+            self.state_db.update_training_job(id, job)
+        }
+    }
+
+    /// An account balance as this tx sees it.
+    fn tx_get_balance(&self, context: &ExecutionContext, addr: &Address) -> U256 {
+        if Self::tx_writes_journaled(context) {
+            let mut j = context.journal.lock();
+            j.record_read(*addr);
+            if let Some(b) = j.pending_balance(addr) {
+                return b;
+            }
+        }
+        self.state_db.accounts.get_balance(addr)
+    }
+
+    fn tx_set_balance(&self, context: &ExecutionContext, addr: Address, balance: U256) {
+        if Self::tx_writes_journaled(context) {
+            context.journal.lock().record_balance(addr, balance);
+        } else {
+            // LEGACY-PRE-SUPPLY-HARDENING
+            self.state_db.accounts.set_balance(addr, balance);
+        }
     }
 
     /// Journal-routed value transfer for REVM-adjacent paths (precompile
@@ -3147,8 +3360,7 @@ impl Executor {
         // chain.
         let admin_key = b"ADMIN".to_vec();
         let current_admin: Option<Address> = self
-            .state_db
-            .get_storage(&gov_addr, &admin_key)
+            .tx_get_storage(context, &gov_addr, &admin_key)
             .and_then(|v| v.first_chunk::<20>().map(|a| Address(*a)));
 
         if selector == sel_set_admin {
@@ -3170,8 +3382,7 @@ impl Executor {
             }
             let mut addr = [0u8; 20];
             addr.copy_from_slice(args.get(12..32).ok_or(ExecutionError::InvalidInput)?);
-            self.state_db
-                .set_storage(gov_addr, admin_key, addr.to_vec());
+            self.tx_set_storage(context, gov_addr, admin_key, addr.to_vec());
             return Ok(());
         }
 
@@ -3235,7 +3446,7 @@ impl Executor {
             pending_key.extend_from_slice(key);
             let mut stored = eta.to_le_bytes().to_vec();
             stored.extend_from_slice(value);
-            self.state_db.set_storage(gov_addr, pending_key, stored);
+            self.tx_set_storage(context, gov_addr, pending_key, stored);
             return Ok(());
         }
 
@@ -3249,7 +3460,7 @@ impl Executor {
             let key = args.get(0..32).ok_or(ExecutionError::InvalidInput)?;
             let mut pending_key = b"PENDING:".to_vec();
             pending_key.extend_from_slice(key);
-            if let Some(stored) = self.state_db.get_storage(&gov_addr, &pending_key) {
+            if let Some(stored) = self.tx_get_storage(context, &gov_addr, &pending_key) {
                 if stored.len() < 8 {
                     return Err(ExecutionError::InvalidInput);
                 }
@@ -3262,9 +3473,8 @@ impl Executor {
                 let value = stored.get(8..).ok_or(ExecutionError::InvalidInput)?;
                 let mut param_key = b"PARAM:".to_vec();
                 param_key.extend_from_slice(key);
-                self.state_db
-                    .set_storage(gov_addr, param_key, value.to_vec());
-                self.state_db.delete_storage(gov_addr, &pending_key);
+                self.tx_set_storage(context, gov_addr, param_key, value.to_vec());
+                self.tx_delete_storage(context, gov_addr, &pending_key);
                 return Ok(());
             } else {
                 return Err(ExecutionError::Reverted("No such pending param".into()));
@@ -3278,7 +3488,7 @@ impl Executor {
             let key = args.get(0..32).ok_or(ExecutionError::InvalidInput)?;
             let mut param_key = b"PARAM:".to_vec();
             param_key.extend_from_slice(key);
-            if let Some(value) = self.state_db.get_storage(&gov_addr, &param_key) {
+            if let Some(value) = self.tx_get_storage(context, &gov_addr, &param_key) {
                 context.output = value;
             } else {
                 context.output = Vec::new();
@@ -3564,6 +3774,31 @@ impl Executor {
         k
     }
 
+    /// Append `cid` to a model's artifact list inside a transaction.
+    fn tx_add_model_artifact(&self, context: &ExecutionContext, model_hash: &Hash, cid: &str) {
+        self.tx_append_index(context, Self::artifact_index_key(model_hash), cid);
+    }
+
+    /// Append `cid` to the JSON list at `key` under the artifact precompile
+    /// address (no-op when already present). Same bytes as the legacy
+    /// `add_model_artifact` / `add_model_proof_artifact`.
+    fn tx_append_index(&self, context: &ExecutionContext, key: Vec<u8>, cid: &str) {
+        let addr = Self::artifact_precompile_address();
+        let mut list: Vec<String> = if let Some(bytes) = self.tx_get_storage(context, &addr, &key) {
+            serde_json::from_slice(&bytes).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if !list.iter().any(|c| c == cid) {
+            list.push(cid.to_string());
+        }
+        if let Ok(bytes) = serde_json::to_vec(&list) {
+            self.tx_set_storage(context, addr, key, bytes);
+        }
+    }
+
+    /// Append `cid` to a model's artifact list outside any transaction (API
+    /// path). Never call this from transaction execution.
     pub fn add_model_artifact(&self, model_hash: &Hash, cid: &str) {
         let addr = Self::artifact_precompile_address();
         let key = Self::artifact_index_key(model_hash);
@@ -3596,20 +3831,13 @@ impl Executor {
         k
     }
 
-    fn add_model_proof_artifact(&self, model_hash: &Hash, cid: &str) {
-        let addr = Self::artifact_precompile_address();
-        let key = Self::proof_index_key(model_hash);
-        let mut list: Vec<String> = if let Some(bytes) = self.state_db.get_storage(&addr, &key) {
-            serde_json::from_slice(&bytes).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        if !list.iter().any(|c| c == cid) {
-            list.push(cid.to_string());
-        }
-        if let Ok(bytes) = serde_json::to_vec(&list) {
-            self.state_db.set_storage(addr, key, bytes);
-        }
+    fn tx_add_model_proof_artifact(
+        &self,
+        context: &ExecutionContext,
+        model_hash: &Hash,
+        cid: &str,
+    ) {
+        self.tx_append_index(context, Self::proof_index_key(model_hash), cid);
     }
 
     pub fn list_model_proofs(&self, model_hash: &Hash) -> Vec<String> {
@@ -3740,16 +3968,15 @@ impl Executor {
         };
         let persisted_state = model_state.clone();
 
-        self.state_db.register_model(model_id, model_state)?;
+        self.tx_register_model(context, model_id, model_state)?;
 
         if let Some(cid) = artifact_cid.clone() {
             let art_addr = Self::artifact_precompile_address();
             let mut key = b"MODEL_CID:".to_vec();
             key.extend_from_slice(model_hash.as_bytes());
-            self.state_db
-                .set_storage(art_addr, key, cid.clone().into_bytes());
+            self.tx_set_storage(context, art_addr, key, cid.clone().into_bytes());
 
-            self.add_model_artifact(&model_hash, &cid);
+            self.tx_add_model_artifact(context, &model_hash, &cid);
             // Note: artifact pinning is handled by the IPFS add call (add?pin=true)
             // or by the caller. We skip explicit pin here to avoid deadlocking
             // when execute_register_model is called via futures::executor::block_on
@@ -3820,8 +4047,7 @@ impl Executor {
         context.use_gas(self.gas_schedule.model_update)?;
 
         let mut model = self
-            .state_db
-            .get_model(&model_id)
+            .tx_get_model(context, &model_id)
             .ok_or(ExecutionError::ModelNotFound(model_id))?;
 
         // Check ownership
@@ -3837,10 +4063,10 @@ impl Executor {
             .ok_or(ExecutionError::Overflow("model version"))?;
         let updated_model = model.clone();
 
-        self.state_db.update_model(model_id, model)?;
+        self.tx_update_model(context, model_id, model)?;
 
         if let Some(cid) = artifact_cid.clone() {
-            self.add_model_artifact(&updated_model.model_hash, &cid);
+            self.tx_add_model_artifact(context, &updated_model.model_hash, &cid);
             if let Some(art) = &self.artifact_service {
                 let replicas = self.default_artifact_replicas();
                 if let Err(err) = art.pin(&cid, replicas).await {
@@ -3946,8 +4172,7 @@ impl Executor {
         }
 
         let mut model = self
-            .state_db
-            .get_model(&model_id)
+            .tx_get_model(context, &model_id)
             .ok_or(ExecutionError::ModelNotFound(model_id))?;
 
         // Check access policy
@@ -3994,7 +4219,7 @@ impl Executor {
                 if let Some(art) = &self.artifact_service {
                     // Add to first provider, then pin across others via pin()
                     if let Ok(cid) = art.add(&proof_bytes).await {
-                        self.add_model_proof_artifact(&model_id.0, &cid);
+                        self.tx_add_model_proof_artifact(context, &model_id.0, &cid);
                         let _ = art.pin(&cid, self.default_artifact_replicas()).await;
                     }
                 }
@@ -4014,7 +4239,7 @@ impl Executor {
             .total_gas_used
             .saturating_add(context.gas_used);
         model.usage_stats.last_used = context.timestamp;
-        self.state_db.update_model(model_id, model)?;
+        self.tx_update_model(context, model_id, model)?;
 
         info!("Inference executed: model={:?}, from={}", model_id, from);
         Ok(())
@@ -4032,8 +4257,7 @@ impl Executor {
         context.use_gas(self.gas_schedule.training_submit)?;
 
         let mut job = self
-            .state_db
-            .get_training_job(&job_id)
+            .tx_get_job(context, &job_id)
             .ok_or(ExecutionError::Reverted("Job not found".to_string()))?;
 
         // Check job status
@@ -4068,20 +4292,18 @@ impl Executor {
                 .participants
                 .iter()
                 .map(|participant| {
-                    self.state_db
-                        .accounts
-                        .get_balance(participant)
+                    self.tx_get_balance(context, participant)
                         .checked_add(reward_per_participant)
                         .map(|balance| (*participant, balance))
                         .ok_or(ExecutionError::Overflow("participant reward"))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             for (participant, balance) in credits {
-                self.state_db.accounts.set_balance(participant, balance);
+                self.tx_set_balance(context, participant, balance);
             }
         }
 
-        self.state_db.update_training_job(job_id, job)?;
+        self.tx_update_job(context, job_id, job)?;
 
         info!("Gradient submitted: job={:?}, from={}", job_id, from);
         Ok(())

@@ -236,6 +236,22 @@ impl StateDB {
         Ok(())
     }
 
+    /// Apply a model-registry entry recorded in a committed tx journal.
+    ///
+    /// Insert-or-replace: the executor already checked existence against the
+    /// journal-first view when the tx ran, and the MVCC check guarantees no
+    /// other committed tx changed the entry since. Only the journal drain calls
+    /// this; inside a tx, write through the journal.
+    pub(crate) fn apply_journaled_model(&self, model_id: ModelId, model: ModelState) {
+        self.models.insert(model_id, model);
+    }
+
+    /// Apply a training-job entry recorded in a committed tx journal
+    /// (see [`Self::apply_journaled_model`]).
+    pub(crate) fn apply_journaled_job(&self, job_id: JobId, job: TrainingJob) {
+        self.training_jobs.insert(job_id, job);
+    }
+
     /// Calculate state root.
     ///
     /// CONSENSUS-CRITICAL — must be IDEMPOTENT and a PURE function of the
