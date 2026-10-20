@@ -362,6 +362,19 @@ impl ExecutedChainIndex {
         else {
             return Ok(Vec::new());
         };
+        self.executed_hashes_under(storage, tip_hash, tip_height, from, to)
+    }
+
+    /// [`Self::executed_hashes`] on the selected-parent chain of the given tip,
+    /// which the caller read once from storage.
+    fn executed_hashes_under(
+        &self,
+        storage: &StorageManager,
+        tip_hash: Hash,
+        tip_height: u64,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<(u64, Hash)>, LogIndexError> {
         let to = to.min(tip_height);
         if from > to {
             return Ok(Vec::new());
@@ -475,21 +488,40 @@ impl ExecutedChainIndex {
 }
 
 impl ExecutedChainIndex {
-    /// Whether `hash` is on the executed chain of the persisted applied tip:
-    /// `Some(height)` when it is, `None` when it is not (unknown, above the
-    /// tip, or a stored block the tip's chain does not contain).
+    /// Whether `hash` is on the executed (selected-parent) chain of the
+    /// persisted applied tip: `Some(height)` when it is, `None` when it is not
+    /// (never stored, stored above the tip, or a stored block the tip's chain
+    /// does not contain: a losing sibling, a merge parent, or a block a reorg
+    /// abandoned).
+    ///
+    /// The tip is read once ([`executed_head`]; an error when none is
+    /// persisted, never the height index). The block's stored height `h`
+    /// picks the height to compare at, and the same walk `eth_getLogs` uses
+    /// names the executed block at `h` under that tip; `hash` is executed iff
+    /// it is that block. The answer is point-in-time: a later reorg can
+    /// abandon a block reported executed here.
     pub fn is_executed(
         &self,
         storage: &StorageManager,
         hash: &Hash,
     ) -> Result<Option<u64>, LogIndexError> {
-        executed_head(storage).map_err(LogIndexError::Unavailable)?;
-        // STUB (red commit): any stored block counts as executed.
-        Ok(storage
+        let (tip_hash, tip_height) = executed_head(storage).map_err(LogIndexError::Unavailable)?;
+        let Some(header) = storage
             .blocks
             .get_header(hash)
             .map_err(|e| LogIndexError::Unavailable(format!("header {hash}: {e}")))?
-            .map(|h| h.height))
+        else {
+            return Ok(None);
+        };
+        let h = header.height;
+        if h > tip_height {
+            return Ok(None);
+        }
+        let at = self.executed_hashes_under(storage, tip_hash, tip_height, h, h)?;
+        Ok(at
+            .first()
+            .filter(|(height, executed)| *height == h && executed == hash)
+            .map(|(height, _)| *height))
     }
 }
 
