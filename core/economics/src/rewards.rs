@@ -15,7 +15,7 @@
 )]
 
 use crate::token::DECIMALS;
-use citrate_consensus::types::Block;
+use citrate_consensus::types::{AiOpKind, Block};
 use citrate_execution::types::{Address, TransactionReceipt};
 use primitive_types::U256;
 use serde::{Deserialize, Serialize};
@@ -115,7 +115,9 @@ impl RewardCalculator {
         Ok(())
     }
 
-    /// Calculate block reward for a given block.
+    /// The LEGACY block reward rule (calldata-based bonus arms), in force below
+    /// the supply-hardening height. Block application goes through
+    /// [`Self::calculate_block_reward`], which selects the rule by height.
     ///
     /// Errors (never panics, never saturates) on an invalid config or on overflow;
     /// the caller rejects the block.
@@ -164,8 +166,129 @@ impl RewardCalculator {
                 .ok_or(over("total + model bonus"))?;
         }
 
-        // Calculate treasury allocation (treasury_percentage <= 100, validated above,
-        // so treasury_reward <= total_reward and the subtraction cannot underflow).
+        // Treasury allocation.
+        self.split(total_reward)
+    }
+
+    /// The block reward under the rule in force at the block's height.
+    ///
+    /// `executed_basis` is whether the supply-hardening fork is active at the
+    /// block's height (`citrate_execution::supply_hardening`):
+    ///
+    /// * `false`: the legacy rule ([`Self::calculate_reward`]), unchanged, so
+    ///   blocks produced before the height replay to the same mints.
+    /// * `true`: the bonus arms are a pure function of the block's EXECUTED
+    ///   results. `receipts` must be positionally aligned with
+    ///   `block.transactions` (one receipt per transaction, as the executor
+    ///   produces them); any other shape is an error and the block is
+    ///   rejected. Then:
+    ///   1. the inference bonus counts only transactions that executed
+    ///      successfully as the executor's inference operation; calldata that
+    ///      merely starts with the operation's selector earns nothing when the
+    ///      call reverts;
+    ///   2. the deployment bonus needs a successful contract creation or model
+    ///      registration;
+    ///   3. every bonus arm decays on the base subsidy's halving schedule;
+    ///   4. the combined bonus is capped at the base subsidy for the height,
+    ///      so a block never issues more than twice the published schedule
+    ///      and issues nothing once the base subsidy reaches zero.
+    ///
+    /// The base subsidy itself is identical under both rules.
+    pub fn calculate_block_reward(
+        &self,
+        block: &Block,
+        receipts: &[TransactionReceipt],
+        executed_basis: bool,
+    ) -> Result<BlockReward, RewardError> {
+        if !executed_basis {
+            return self.calculate_reward(block);
+        }
+        self.validate()?;
+        let over = RewardError::Overflow;
+        if receipts.len() != block.transactions.len() {
+            return Err(RewardError::ReceiptMismatch {
+                txs: block.transactions.len(),
+                receipts: receipts.len(),
+            });
+        }
+
+        let halvings = block
+            .header
+            .height
+            .checked_div(self.config.halving_interval)
+            .ok_or(RewardError::InvalidConfig("halving_interval must be > 0"))?;
+        let base_salt = if halvings >= 64 {
+            0
+        } else {
+            self.config.block_reward >> halvings
+        };
+        let base_reward = U256::from(base_salt)
+            .checked_mul(pow10(DECIMALS, "base reward scale")?)
+            .ok_or(over("base reward"))?;
+        // Bonus arms decay with the base (in wei): v / 2^halvings, zero from 64
+        // halvings on (the base is zero there too).
+        let divisor = if halvings >= 64 {
+            None
+        } else {
+            U256::from(2u8).checked_pow(U256::from(halvings))
+        };
+        let halve = |v: U256| -> U256 {
+            divisor
+                .and_then(|d| v.checked_div(d))
+                .unwrap_or_else(U256::zero)
+        };
+
+        let executed = block
+            .transactions
+            .iter()
+            .zip(receipts)
+            .filter(|(_, r)| r.status)
+            .map(|(tx, _)| tx);
+        let mut inference_count = 0u64;
+        let mut deployed = false;
+        for tx in executed {
+            match AiOpKind::of(tx) {
+                Some(AiOpKind::InferenceRequest) => {
+                    // bounded by the block's tx count
+                    inference_count = inference_count.saturating_add(1);
+                }
+                Some(AiOpKind::RegisterModel) => deployed = true,
+                _ if tx.to.is_none() => deployed = true,
+                _ => {}
+            }
+        }
+
+        let inference_bonus = halve(
+            U256::from(self.config.inference_bonus)
+                .checked_mul(U256::from(inference_count))
+                .and_then(|v| {
+                    v.checked_mul(pow10(DECIMALS.saturating_sub(2), "inference scale").ok()?)
+                })
+                .ok_or(over("inference bonus"))?,
+        );
+        let model_bonus = if deployed {
+            halve(
+                U256::from(self.config.model_deployment_bonus)
+                    .checked_mul(pow10(DECIMALS, "model bonus scale")?)
+                    .ok_or(over("model deployment bonus"))?,
+            )
+        } else {
+            U256::zero()
+        };
+        let bonus = inference_bonus
+            .checked_add(model_bonus)
+            .ok_or(over("bonus sum"))?
+            .min(base_reward);
+        let total_reward = base_reward
+            .checked_add(bonus)
+            .ok_or(over("total + bonus"))?;
+        self.split(total_reward)
+    }
+
+    /// Treasury / validator split of `total_reward` (treasury_percentage <= 100,
+    /// validated, so the subtraction cannot underflow).
+    fn split(&self, total_reward: U256) -> Result<BlockReward, RewardError> {
+        let over = RewardError::Overflow;
         let treasury_reward = total_reward
             .checked_mul(U256::from(self.config.treasury_percentage))
             .ok_or(over("treasury share"))?
@@ -174,23 +297,11 @@ impl RewardCalculator {
         let validator_reward = total_reward
             .checked_sub(treasury_reward)
             .ok_or(over("validator share"))?;
-
         Ok(BlockReward {
             validator_reward,
             treasury_reward,
             total_reward,
         })
-    }
-
-    /// TEST-FIRST STUB: the executed-receipts rule lands in the next commit.
-    /// Until then every height uses the legacy rule.
-    pub fn calculate_block_reward(
-        &self,
-        block: &Block,
-        _receipts: &[TransactionReceipt],
-        _executed_basis: bool,
-    ) -> Result<BlockReward, RewardError> {
-        self.calculate_reward(block)
     }
 
     /// Count inference transactions in block

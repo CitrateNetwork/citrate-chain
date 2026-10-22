@@ -35,6 +35,30 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
+/// The basic block-reward credits for a block, as a function of the block and
+/// its EXECUTED receipts (positionally aligned with `block.transactions`).
+///
+/// The node injects its reward policy here, so this crate stays free of
+/// economics while the reward can depend on what actually executed. The
+/// producer and every receiver run the same function over the same
+/// deterministic receipts, so they credit byte-identical mints. Returns e.g.
+/// `[(beneficiary, validator_reward), (treasury, treasury_reward)]`; an error
+/// rejects the block (`ExecutionError::RewardSettlement`).
+pub type RewardFn<'a> = &'a (dyn Fn(&Block, &[TransactionReceipt]) -> Result<Vec<(Address, U256)>, ExecutionError>
+         + Send
+         + Sync);
+
+/// A [`RewardFn`] that credits a fixed, receipt-independent list. For callers
+/// whose credits do not depend on execution (tests, and reward-free blocks).
+pub fn fixed_reward(
+    credits: &[(Address, U256)],
+) -> impl Fn(&Block, &[TransactionReceipt]) -> Result<Vec<(Address, U256)>, ExecutionError>
+       + Send
+       + Sync
+       + '_ {
+    move |_block, _receipts| Ok(credits.to_vec())
+}
+
 /// Execution context for a transaction
 /// Extract a human-readable message from a caught panic payload
 /// (`Box<dyn Any + Send>` from `catch_unwind`). Panics carry either a
@@ -1395,9 +1419,10 @@ impl Executor {
     ///
     /// `coinbase` feeds the EVM COINBASE opcode + block context (recovered from
     /// `block.header.coinbase` for v>=2 blocks — the field that makes state_root
-    /// reproducible by receivers). `reward_credits` are the post-execution mints the
-    /// producer applied, e.g. `[(beneficiary, validator_reward), (treasury, treasury_reward)]`
-    /// — supplied by the caller so this atom stays free of reward/economics policy (and so
+    /// reproducible by receivers). `reward` computes the post-execution mints the
+    /// producer applied, e.g. `[(beneficiary, validator_reward), (treasury, treasury_reward)]`,
+    /// from the executed receipts (see [`RewardFn`]) — supplied by the caller so this atom
+    /// stays free of reward/economics policy (and so
     /// the VALIDATOR-S1 §R' on-chain reward path can slot in as just another credit list).
     ///
     /// Revert safety: `execute_transaction` drains its journal into `state_db` on commit
@@ -1411,9 +1436,9 @@ impl Executor {
         &self,
         block: &Block,
         coinbase: [u8; 20],
-        reward_credits: &[(Address, U256)],
+        reward: RewardFn<'_>,
     ) -> Result<Hash, ExecutionError> {
-        self.apply_block_inner(block, coinbase, reward_credits, true, true)
+        self.apply_block_inner(block, coinbase, reward, true, true)
             .await
     }
 
@@ -1430,9 +1455,9 @@ impl Executor {
         &self,
         block: &Block,
         coinbase: [u8; 20],
-        reward_credits: &[(Address, U256)],
+        reward: RewardFn<'_>,
     ) -> Result<Hash, ExecutionError> {
-        self.apply_block_inner(block, coinbase, reward_credits, true, false)
+        self.apply_block_inner(block, coinbase, reward, true, false)
             .await
     }
 
@@ -1446,9 +1471,9 @@ impl Executor {
         &self,
         block: &Block,
         coinbase: [u8; 20],
-        reward_credits: &[(Address, U256)],
+        reward: RewardFn<'_>,
     ) -> Result<Hash, ExecutionError> {
-        self.apply_block_inner(block, coinbase, reward_credits, false, true)
+        self.apply_block_inner(block, coinbase, reward, false, true)
             .await
     }
 
@@ -1456,7 +1481,7 @@ impl Executor {
         &self,
         block: &Block,
         coinbase: [u8; 20],
-        reward_credits: &[(Address, U256)],
+        reward: RewardFn<'_>,
         persist: bool,
         verify_root: bool,
     ) -> Result<Hash, ExecutionError> {
@@ -1498,6 +1523,21 @@ impl Executor {
                 }
             }
         }
+
+        // The basic block-reward credits are derived HERE, after execution, from
+        // the executed receipts, via the caller-injected reward function. The
+        // producer runs the same function over the same deterministic receipts,
+        // so both credit byte-identical mints. An uncomputable reward rejects
+        // the block (world state reverted).
+        let reward_credits = match reward(block, &receipts) {
+            Ok(c) => c,
+            Err(e) => {
+                self.state_db.restore(snapshot);
+                self.set_block_context(prev_ctx);
+                return Err(e);
+            }
+        };
+        let reward_credits: &[(Address, U256)] = &reward_credits;
 
         // Post-execution reward settlement — the SINGLE shared entrypoint the
         // PRODUCER also calls (node/src/producer.rs). It applies the basic block
@@ -4249,7 +4289,7 @@ mod tests {
         let blk = block_with(vec![tx], expected);
 
         let got = exec
-            .apply_block(&blk, CB, &[(cb_addr, reward)])
+            .apply_block(&blk, CB, &fixed_reward(&[(cb_addr, reward)]))
             .await
             .expect("valid block must apply");
         assert_eq!(
@@ -4283,7 +4323,7 @@ mod tests {
         let blk = block_with(vec![tx], Hash::new([0xFF; 32]));
 
         let err = exec
-            .apply_block(&blk, CB, &[(cb_addr, U256::from(500u64))])
+            .apply_block(&blk, CB, &fixed_reward(&[(cb_addr, U256::from(500u64))]))
             .await
             .expect_err("bad state_root must be rejected");
         assert!(

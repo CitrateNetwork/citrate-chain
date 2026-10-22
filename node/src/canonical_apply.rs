@@ -105,6 +105,44 @@ pub fn canonical_reward_config() -> RewardConfig {
     }
 }
 
+/// The block reward for `block` under the rule in force at its height — the
+/// ONE selection the producer and every receive path share.
+///
+/// Below `supply_hardening_height` (`citrate_execution::supply_hardening`) the
+/// legacy rule applies unchanged, so historical blocks replay to the mints
+/// they were produced with. At/after it the bonus arms are computed from the
+/// block's executed `receipts` (positionally aligned with
+/// `block.transactions`), halved with the base subsidy and capped at it.
+pub fn canonical_block_reward(
+    calculator: &RewardCalculator,
+    block: &Block,
+    receipts: &[citrate_execution::types::TransactionReceipt],
+) -> Result<citrate_economics::BlockReward, citrate_economics::rewards::RewardError> {
+    canonical_block_reward_at(
+        calculator,
+        block,
+        receipts,
+        citrate_execution::supply_hardening::supply_hardening_height(),
+    )
+}
+
+/// [`canonical_block_reward`] under an explicit activation height (pure).
+pub fn canonical_block_reward_at(
+    calculator: &RewardCalculator,
+    block: &Block,
+    receipts: &[citrate_execution::types::TransactionReceipt],
+    supply_hardening_height: Option<u64>,
+) -> Result<citrate_economics::BlockReward, citrate_economics::rewards::RewardError> {
+    calculator.calculate_block_reward(
+        block,
+        receipts,
+        citrate_execution::supply_hardening::active_at(
+            supply_hardening_height,
+            block.header.height,
+        ),
+    )
+}
+
 /// The block whose post-execution world state the executor currently reflects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AppliedTip {
@@ -525,24 +563,25 @@ impl CanonicalApplicator {
         self.lock.lock().await.tip
     }
 
-    /// Deterministic reward credits for `block` — the SAME mints the producer
-    /// applied on the basic reward path: `[(coinbase, validator_reward),
-    /// (treasury, treasury_reward)]`. `coinbase` comes from the committed v2
-    /// header field (`block.header.coinbase`).
+    /// Deterministic reward credits for `block` given its EXECUTED `receipts` —
+    /// the SAME mints the producer applied on the basic reward path:
+    /// `[(coinbase, validator_reward), (treasury, treasury_reward)]`. `coinbase`
+    /// comes from the committed v2 header field (`block.header.coinbase`). The
+    /// rule in force at the block's height is chosen by
+    /// [`canonical_block_reward`].
     ///
-    /// PANIC-S1 D3: a reward that cannot be computed (overflow / invalid config) is
-    /// an ERROR, never a panic or a saturated amount. Callers fold it into their
-    /// existing reject path via `ExecutionError::RewardSettlement`, so the block is
-    /// rejected (or the reorg aborted and rolled back) exactly like any other
-    /// execution failure.
+    /// PANIC-S1 D3: a reward that cannot be computed (overflow / invalid config /
+    /// receipts that do not match the block) is an ERROR
+    /// (`ExecutionError::RewardSettlement`), never a panic or a saturated amount,
+    /// so the block is rejected (or the reorg aborted and rolled back) exactly
+    /// like any other execution failure.
     fn reward_credits(
         &self,
         block: &Block,
-    ) -> Result<
-        Vec<(citrate_execution::types::Address, U256)>,
-        citrate_economics::rewards::RewardError,
-    > {
-        let reward = self.reward_calculator.calculate_reward(block)?;
+        receipts: &[citrate_execution::types::TransactionReceipt],
+    ) -> Result<Vec<(citrate_execution::types::Address, U256)>, ExecutionError> {
+        let reward = canonical_block_reward(&self.reward_calculator, block, receipts)
+            .map_err(|e| ExecutionError::RewardSettlement(e.to_string()))?;
         Ok(vec![
             (
                 citrate_execution::types::Address(block.header.coinbase),
@@ -642,14 +681,13 @@ impl CanonicalApplicator {
             };
             let block_hash = block.header.block_hash;
             let height = block.header.height;
-            let apply_result = match self.reward_credits(&block) {
-                Ok(credits) => {
-                    self.executor
-                        .apply_block(&block, block.header.coinbase, &credits)
-                        .await
-                }
-                Err(e) => Err(ExecutionError::RewardSettlement(e.to_string())),
+            let reward = |b: &Block, r: &[citrate_execution::types::TransactionReceipt]| {
+                self.reward_credits(b, r)
             };
+            let apply_result = self
+                .executor
+                .apply_block(&block, block.header.coinbase, &reward)
+                .await;
             match apply_result {
                 Ok(_root) => {
                     state.record(block_hash, height, self.executor.state_snapshot());
@@ -979,14 +1017,13 @@ impl CanonicalApplicator {
         }
 
         for block in &branch {
-            let apply_result = match self.reward_credits(block) {
-                Ok(credits) => {
-                    self.executor
-                        .apply_block_no_persist(block, block.header.coinbase, &credits)
-                        .await
-                }
-                Err(e) => Err(ExecutionError::RewardSettlement(e.to_string())),
+            let reward = |b: &Block, r: &[citrate_execution::types::TransactionReceipt]| {
+                self.reward_credits(b, r)
             };
+            let apply_result = self
+                .executor
+                .apply_block_no_persist(block, block.header.coinbase, &reward)
+                .await;
             match apply_result {
                 Ok(_) => {
                     let h = block.header.height;
@@ -1551,14 +1588,13 @@ impl CanonicalApplicator {
             // TRUSTED replay: skip the per-block full-trie root recompute (the ~O(N^2)
             // wall that made a from-genesis rebuild take hours). Correctness is
             // recovered by verifying the FINAL head root once, below.
-            let apply_result = match self.reward_credits(&block) {
-                Ok(credits) => {
-                    self.executor
-                        .apply_block_trusted(&block, block.header.coinbase, &credits)
-                        .await
-                }
-                Err(e) => Err(ExecutionError::RewardSettlement(e.to_string())),
+            let reward = |b: &Block, r: &[citrate_execution::types::TransactionReceipt]| {
+                self.reward_credits(b, r)
             };
+            let apply_result = self
+                .executor
+                .apply_block_trusted(&block, block.header.coinbase, &reward)
+                .await;
             match apply_result {
                 Ok(_) => {
                     // Record the block's CLAIMED root (trusted) in the ring; the ring
@@ -3739,6 +3775,158 @@ mod tests {
         // reflects the shared funded state.
         let app = CanonicalApplicator::new(follower.clone(), storage.clone());
         (producer, app, follower, storage, dir)
+    }
+
+    /// A transaction that carries the inference operation's selector but
+    /// reverts (no such model).
+    fn reverting_inference(from: [u8; 20], nonce: u64) -> Transaction {
+        let mut data = vec![0x02, 0x00, 0x00, 0x00];
+        data.extend_from_slice(&[0x5A; 32]);
+        Transaction {
+            nonce,
+            from: embedded(from),
+            to: Some(embedded(BOB)),
+            value: 0,
+            gas_limit: 100_000,
+            gas_price: 1_000_000_000,
+            data,
+            signature: Signature::new([1; 64]),
+            chain_id: Some(40204),
+            ..Default::default()
+        }
+    }
+
+    /// Produce on `exec` with the reward rule selected for `activation`, the
+    /// way the producer does (execute → reward from the executed receipts →
+    /// settle → root).
+    async fn produce_gated(
+        exec: &Executor,
+        height: u64,
+        txs: Vec<Transaction>,
+        activation: Option<u64>,
+    ) -> (Block, citrate_economics::BlockReward) {
+        exec.set_block_context(BlockContext {
+            coinbase: CB,
+            prevrandao: VRF_OUT,
+            block_hashes: std::collections::HashMap::new(),
+        });
+        let provisional = mk_block_txs(
+            height,
+            Hash::default(),
+            Hash::default(),
+            VRF_OUT,
+            txs.clone(),
+        );
+        let mut receipts = Vec::new();
+        for tx in &txs {
+            receipts.push(
+                exec.execute_transaction(&provisional, tx)
+                    .await
+                    .expect("producer tx must execute"),
+            );
+        }
+        let calc = RewardCalculator::new(canonical_reward_config());
+        let reward = canonical_block_reward_at(&calc, &provisional, &receipts, activation)
+            .expect("canonical reward");
+        for (addr, amt) in [
+            (Address(CB), reward.validator_reward),
+            (Address(TREASURY_ADDR), reward.treasury_reward),
+        ] {
+            let bal = exec.get_balance(&addr);
+            exec.set_balance(&addr, bal + amt);
+        }
+        let root = exec.calculate_state_root();
+        (
+            mk_block_txs(height, Hash::default(), root, VRF_OUT, txs),
+            reward,
+        )
+    }
+
+    /// Receiver-side application with the reward rule selected for `activation`.
+    async fn receive_gated(
+        exec: &Executor,
+        block: &Block,
+        activation: Option<u64>,
+    ) -> Result<Hash, ExecutionError> {
+        let calc = RewardCalculator::new(canonical_reward_config());
+        let reward = |b: &Block, r: &[citrate_execution::types::TransactionReceipt]| {
+            let rw = canonical_block_reward_at(&calc, b, r, activation)
+                .map_err(|e| ExecutionError::RewardSettlement(e.to_string()))?;
+            Ok(vec![
+                (Address(b.header.coinbase), rw.validator_reward),
+                (Address(TREASURY_ADDR), rw.treasury_reward),
+            ])
+        };
+        exec.apply_block(block, block.header.coinbase, &reward)
+            .await
+    }
+
+    fn funded_exec() -> Executor {
+        let e = Executor::new(Arc::new(StateDB::new()));
+        e.set_balance(&Address(ALICE), U256::from(FUND));
+        e
+    }
+
+    /// At/after the supply hardening height, reverted calls carrying the
+    /// inference selector mint no bonus; producer and receiver agree on the
+    /// root. Below it, the legacy mint is reproduced exactly.
+    #[tokio::test]
+    async fn reward_gate_reverted_selector_calls_mint_nothing_after_activation() {
+        let txs: Vec<_> = (0..5).map(|n| reverting_inference(ALICE, n)).collect();
+        let base = U256::from(10u64) * U256::from(10u64).pow(U256::from(18u64));
+
+        // Active.
+        let producer = funded_exec();
+        let (block, reward) = produce_gated(&producer, 7, txs.clone(), Some(1)).await;
+        assert_eq!(reward.total_reward, base, "no bonus for reverted calls");
+        let receiver = funded_exec();
+        let got = receive_gated(&receiver, &block, Some(1))
+            .await
+            .expect("receiver reproduces the gated root");
+        assert_eq!(got, block.state_root);
+        // A receiver on the legacy rule rejects the gated block (different mint).
+        let legacy_receiver = funded_exec();
+        assert!(matches!(
+            receive_gated(&legacy_receiver, &block, None).await,
+            Err(ExecutionError::StateRootMismatch { .. })
+        ));
+
+        // Below the height (and unset): the legacy mint, byte-identical replay.
+        for activation in [None, Some(8)] {
+            let producer = funded_exec();
+            let (block, reward) = produce_gated(&producer, 7, txs.clone(), activation).await;
+            let centi = U256::from(10u64).pow(U256::from(16u64));
+            assert_eq!(reward.total_reward, base + centi * U256::from(5u8));
+            let receiver = funded_exec();
+            assert_eq!(
+                receive_gated(&receiver, &block, activation)
+                    .await
+                    .expect("replays"),
+                block.state_root
+            );
+        }
+    }
+
+    /// A reward function that errors rejects the block and leaves world state
+    /// untouched (fail closed).
+    #[tokio::test]
+    async fn reward_fn_error_rejects_block_and_reverts_state() {
+        let producer = funded_exec();
+        let (block, _) =
+            produce_gated(&producer, 7, vec![reverting_inference(ALICE, 0)], Some(1)).await;
+        let receiver = funded_exec();
+        let before = receiver.calculate_state_root();
+        let failing = |_: &Block, _: &[citrate_execution::types::TransactionReceipt]| {
+            Err(ExecutionError::RewardSettlement("uncomputable".into()))
+        };
+        assert!(matches!(
+            receiver
+                .apply_block(&block, block.header.coinbase, &failing)
+                .await,
+            Err(ExecutionError::RewardSettlement(_))
+        ));
+        assert_eq!(receiver.calculate_state_root(), before, "state reverted");
+        assert_eq!(receiver.get_balance(&Address(ALICE)), U256::from(FUND));
     }
 
     #[tokio::test]
