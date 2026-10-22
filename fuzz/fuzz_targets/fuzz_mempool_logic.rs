@@ -24,6 +24,8 @@
 //! A sender whose bytes 20..32 are all zero is EVM-shaped, and the mempool
 //! now requires a secp256k1 recovery for those, so an EVM-shaped fuzz sender
 //! would be rejected on every add and the harness would exercise nothing.
+//! For the same reason each added transaction is a plain transfer (see the
+//! `to` field below).
 use citrate_consensus::types::{Hash, PublicKey, Signature, Transaction};
 use libfuzzer_sys::fuzz_target;
 
@@ -94,7 +96,11 @@ fuzz_target!(|data: &[u8]| {
                         hash,
                         nonce,
                         from: sender,
-                        to: None,
+                        // A plain transfer. Admission now only takes payloads
+                        // the executor can parse, and an empty-data tx with
+                        // no recipient is not one (it is neither a transfer
+                        // nor a deployment), so `to: None` was always rejected.
+                        to: Some(PublicKey::new([0x02; 32])),
                         value: 0,
                         gas_limit: 21000,
                         gas_price,
