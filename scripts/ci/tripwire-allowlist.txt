@@ -46,3 +46,7 @@ shell-pipefail | scripts/ops/watchdog/citrate-height-watchdog.sh | * | chain#330
 tla-frame | specs/tla/gui/OnboardingFlow.tla | [ChooseHomeUser] | board:QA-T (owner report 2026-10-19) | persona' is set beside UNCHANGED persona, so the persona choice never fires (guard persona = "none"); fix the frame in the spec, then re-run TLC
 tla-frame | specs/tla/gui/OnboardingFlow.tla | [ChooseTeacher] | board:QA-T (owner report 2026-10-19) | same frame clash as ChooseHomeUser; fix together
 tla-frame | specs/tla/gui/OnboardingFlow.tla | [ChooseDeveloper] | board:QA-T (owner report 2026-10-19) | same frame clash as ChooseHomeUser; fix together
+
+# ── wallet-gate-signing: raw ECDSA signing outside the wallet crates ──────────────────────────
+wallet-gate-signing | faucet/src/main.rs | .sign_prehash_recoverable(&sighash) | board:QA-T | sign_drip_tx hand-rolls the EIP-155 legacy encoding (it strips leading zeros from r/s correctly); move it onto citrate_wallet_core::sign_eip155_legacy_tx with a vector test in a faucet PR rather than change the live faucet here
+wallet-gate-signing | tools/citrate-bench/src/tx/legacy.rs | .sign_prehash_recoverable(&hash) | board:QA-T | load-test signer for devnet/throwaway keys, kept byte-identical to tests/load bench_signed.rs for drift cross-checks; switch both to wallet-core together
