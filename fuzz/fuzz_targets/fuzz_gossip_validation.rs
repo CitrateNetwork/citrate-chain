@@ -114,8 +114,11 @@ fn spec_accepts(
             header.height,
             &block.transactions,
         );
-    let signature_ok =
-        is_genesis || matches!(citrate_consensus::crypto::verify_block_signature(block), Ok(true));
+    let signature_ok = is_genesis
+        || matches!(
+            citrate_consensus::crypto::verify_block_signature(block),
+            Ok(true)
+        );
 
     size_ok
         && height_ok
