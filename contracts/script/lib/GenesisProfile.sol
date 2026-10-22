@@ -21,7 +21,7 @@ import {GuardianCanceller} from "../../src/genesis/GuardianCanceller.sol";
 ///         Floors (owner decisions 2026-10-19, fed#331), all read from chain by
 ///         `_councilFloorProblem`:
 ///           GOVERNANCE  minDelay >= 48 h; multisig m >= 3, n >= 5, m > n/2
-///           GUARDIAN    multisig m >= 2, n >= 3, m > n/2
+///           GUARDIAN    minDelay >= 1 h; multisig m >= 2, n >= 3, m > n/2
 ///           both        multisig fronts its timelock; proposalTtl == 14 days (fixed)
 abstract contract GenesisProfile is Script, AdminChecks {
     /// The chain id that is always deployed under the genesis profile.
@@ -31,6 +31,8 @@ abstract contract GenesisProfile is Script, AdminChecks {
     uint256 public constant GENESIS_GOV_MIN_OWNERS = 5;
     uint256 public constant GENESIS_GRD_MIN_THRESHOLD = 2;
     uint256 public constant GENESIS_GRD_MIN_OWNERS = 3;
+    /// Unconditional council delay floor (equal to DeployGenesisGovernance.MIN_DELAY_FLOOR).
+    uint256 public constant COUNCIL_MIN_DELAY = 1 hours;
     /// Proposal TTL on the genesis profile: fixed, no other value is accepted.
     uint256 public constant GENESIS_PROPOSAL_TTL = 14 days;
     /// Rehearsal bounds; equal to MultisigProposer.MIN_/MAX_PROPOSAL_TTL (a test pins equality).
@@ -108,9 +110,10 @@ abstract contract GenesisProfile is Script, AdminChecks {
     {
         if (timelock.code.length == 0) return string.concat(name, " timelock: no code");
         if (multisig.code.length == 0) return string.concat(name, " multisig: no code");
-        (bool okDelay, bytes memory d) = timelock.staticcall(abi.encodeWithSignature("getMinDelay()"));
-        if (!okDelay || d.length != 32) return string.concat(name, " timelock: getMinDelay() unreadable");
-        if (governance && abi.decode(d, (uint256)) < GENESIS_GOV_MIN_DELAY) {
+        (bool okDelay, uint256 delay) = _readUint(timelock, abi.encodeWithSignature("getMinDelay()"));
+        if (!okDelay) return string.concat(name, " timelock: getMinDelay() unreadable");
+        if (delay < COUNCIL_MIN_DELAY) return string.concat(name, " timelock: minDelay below the 1 h floor");
+        if (governance && delay < GENESIS_GOV_MIN_DELAY) {
             return string.concat(name, " timelock: minDelay below the 48 h genesis floor");
         }
         (bool okFront, address fronted) = _readAddress(multisig, abi.encodeWithSignature("timelock()"));
