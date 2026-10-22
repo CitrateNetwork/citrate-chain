@@ -935,9 +935,14 @@ impl CheckpointManager {
     ///
     /// With a [`FinalizationGuard`] installed, the guard runs on the certificate
     /// after quorum is confirmed and before any of the above (or the latest
-    /// finalized height) changes. If the pending checkpoint is evicted or pruned
-    /// while the guard runs, the certificate the guard saw (which has quorum) is
-    /// the one finalized, so the guard's verdict always describes what finalizes.
+    /// finalized height) changes. Once the guard has run, the certificate it saw
+    /// (which has quorum) is what finalizes: if the pending checkpoint is
+    /// evicted, pruned, replaced, or pruned and RE-PROPOSED for the same hash
+    /// while the guard runs, the pending entry is used only when it extends that
+    /// certificate ([`extends_certificate`]); otherwise the guarded certificate
+    /// is finalized. So the guard's state change (floor raised / safety stop) is
+    /// never left without its certificate, and every finalization after a guard
+    /// returns `Ok`.
     pub async fn finalize_checkpoint(&self, height: u64) -> Result<Checkpoint, CheckpointError> {
         let _serial = self.finalize_serial.lock().await;
         let guarded = match self.finalization_guard.get() {
@@ -967,14 +972,20 @@ impl CheckpointManager {
             None => None,
         };
 
+        let was_guarded = guarded.is_some();
         let mut pending = self.pending.write().await;
         let mut checkpoint = match (pending.remove(&height), guarded) {
-            // Votes only accumulate on a pending checkpoint, so it still has
-            // quorum and the same block hash as the guarded certificate.
-            (Some(cp), Some(seen)) if cp.block_hash == seen.block_hash => cp,
-            // Evicted / pruned while the guard ran (or replaced by a later
-            // proposal for another hash, which can never finalize now that this
-            // height has a quorum certificate): finalize what the guard saw.
+            // The entry still pending extends the guarded certificate (same
+            // block and committee, every guarded vote): it has at least that
+            // quorum and carries everything the guard verified.
+            (Some(cp), Some(seen)) if extends_certificate(&cp, &seen) => cp,
+            // Anything else after a guard ran — evicted or pruned, replaced by a
+            // proposal for another hash (which can never finalize now that this
+            // height has a quorum certificate), or pruned and re-proposed for the
+            // SAME hash with fewer votes or another committee: matching hashes
+            // alone do not show the entry survived the guard. Finalize what the
+            // guard saw; the replacement (and its replay markers, below) is
+            // settled with the height.
             (_, Some(mut seen)) => {
                 seen.status = CheckpointStatus::Pending;
                 seen
@@ -989,6 +1000,9 @@ impl CheckpointManager {
         let effective_quorum = match checkpoint.effective_quorum() {
             Some(q) => q,
             None => {
+                // Unreachable after a guard ran: the guarded certificate (or its
+                // extension, same committee) passed this check before the guard.
+                debug_assert!(!was_guarded, "guarded certificate lost its committee");
                 let n = checkpoint.committee.len();
                 pending.insert(height, checkpoint);
                 return Err(CheckpointError::CommitteeTooSmall(
@@ -999,6 +1013,9 @@ impl CheckpointManager {
         };
 
         if !checkpoint.has_derived_quorum() {
+            // Unreachable after a guard ran (see above): the guard's state
+            // change is never left without its certificate.
+            debug_assert!(!was_guarded, "guarded certificate lost its quorum");
             // Put it back
             let votes = checkpoint.votes.len();
             pending.insert(height, checkpoint);
@@ -1097,6 +1114,23 @@ impl CheckpointManager {
             .get(&height)
             .map(|cp| cp.vote_count())
     }
+}
+
+/// Whether `current` (the entry pending at finalization) extends `guarded` (the
+/// certificate a [`FinalizationGuard`] ran on): same height, block and
+/// committee, and every guarded vote present with the same signature. Then
+/// `current` has at least `guarded`'s quorum and may be finalized in its place.
+/// A matching block hash alone is NOT enough: the pending entry may have been
+/// pruned and re-proposed for the same hash (with no votes, or another
+/// committee) while the guard ran.
+fn extends_certificate(current: &Checkpoint, guarded: &Checkpoint) -> bool {
+    current.height == guarded.height
+        && current.block_hash == guarded.block_hash
+        && current.committee == guarded.committee
+        && guarded
+            .votes
+            .iter()
+            .all(|(voter, sig)| current.votes.get(voter) == Some(sig))
 }
 
 /// Drop the lowest finalized heights until at most [`MAX_FINALIZED_IN_MEMORY`] remain.

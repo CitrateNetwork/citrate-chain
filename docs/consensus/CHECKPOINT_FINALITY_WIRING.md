@@ -283,6 +283,21 @@ canonical here.) It holds only verified quorum certificates above the floor and 
 while the node is off the certified chain. The poll stays as a backstop. Legacy and Observed
 install no guard (unchanged).
 
+**The guarded certificate is the one finalized.** Once the guard has run, `finalize_checkpoint`
+finalizes the certificate the guard ran on. The entry still pending at that height replaces it
+only when it extends that certificate (same block, same committee, every guarded vote with
+the same signature: `extends_certificate`). A matching block hash alone is not enough: while
+the guard awaits, the pending checkpoint can be pruned or evicted and re-proposed for the same
+hash with no votes, and finalizing that replacement would fail its quorum check after the
+guard had already raised the floor or engaged a stop (review of #335 @ fa6595a1). So every
+finalization after a guard returns `Ok` and records the guarded certificate (debug builds
+assert this on the two remaining error paths). Tests:
+`finalization_guard_certificate_survives_a_same_hash_re_proposal` and
+`finalization_guard_keeps_the_certificate_unless_the_replacement_extends_it` (barrier guard,
+consensus) and `s2_guarded_certificate_survives_a_same_hash_re_proposal_and_a_restart` (real
+verifier guard parked on the advance lock, a concurrent finalization queued, then a restart
+from disk: floor, certificate and RPC pair agree and the rebuild below is refused).
+
 **Publication after persistence (Enforced).** The guard raises the floor but does NOT publish:
 it runs before the certificate is persisted, and the floor is in memory, so a block reported
 finalized there and lost to a crash before the write could be reorged out after the restart
