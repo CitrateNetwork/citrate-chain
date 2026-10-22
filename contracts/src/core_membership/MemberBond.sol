@@ -38,9 +38,10 @@ interface IMembershipTreasury {
 ///       the lock + KYC gates below.
 ///     * Principal of a bond that was NEVER activated never reaches the member
 ///       (owner decision 2026-10-19, fed#331: unactivated grants return to the
-///       treasury). After the lock, the vault's governance-set `treasury`, and
-///       only it, may `reclaimUnactivated`; the principal goes to the treasury
-///       and the bond can never be activated afterwards.
+///       treasury). Activation is open only inside the lock; after it, the
+///       vault's governance-set `treasury`, and only it, may
+///       `reclaimUnactivated`; the principal goes to the treasury and the bond
+///       can never be activated afterwards.
 /// - **The proposer key is the member's**: only they can prove control of it, so
 ///   only they can `activate`. The vault deliberately cannot.
 /// - **Rewards are the member's** (owner-confirmed, #139 §"What I need from the
@@ -200,7 +201,8 @@ contract MemberBond is Initializable {
 
     /// Bond the principal into `ValidatorRegistry` under the member's proposer
     /// key. Member-callable only, through the app's SignatureCeremony, once the
-    /// node is synced.
+    /// node is synced, and only while the bond is still locked (the activation
+    /// window closes at unlock).
     ///
     /// Grant and bond are necessarily two transactions: at grant time — the
     /// moment of payment — the member has no node and no proposer key. The
@@ -211,6 +213,10 @@ contract MemberBond is Initializable {
         if (activated) revert AlreadyActivated();
         // A reclaimed bond (see `reclaimUnactivated`) has no principal left to bond.
         if (reclaimed) revert AlreadyReclaimed();
+        // The activation window closes at unlock (either leg, exactly `isUnlocked`): a grant
+        // not activated inside the lock is reclaimable by the treasury only, so it can never
+        // be activated at the end of the year and exited to the member.
+        if (isUnlocked()) revert ActivationWindowClosed();
         activated = true;
         pubkey = pubkey_;
 
