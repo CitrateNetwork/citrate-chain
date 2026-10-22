@@ -559,8 +559,15 @@ pub fn is_executed_json(
 
 /// A 32-byte block hash given as a `0x`-prefixed hex string (-32602 otherwise).
 fn parse_block_hash(v: Option<&serde_json::Value>) -> Result<Hash, jsonrpc_core::Error> {
-    let invalid =
-        |m: &str| jsonrpc_core::Error::invalid_params(format!("{IS_EXECUTED_METHOD}: {m}"));
+    parse_block_hash_for(IS_EXECUTED_METHOD, v)
+}
+
+/// [`parse_block_hash`] with `method` in the -32602 message.
+pub fn parse_block_hash_for(
+    method: &str,
+    v: Option<&serde_json::Value>,
+) -> Result<Hash, jsonrpc_core::Error> {
+    let invalid = |m: &str| jsonrpc_core::Error::invalid_params(format!("{method}: {m}"));
     let s = v
         .and_then(|v| v.as_str())
         .ok_or_else(|| invalid("expected params [blockHash]"))?;
@@ -572,6 +579,41 @@ fn parse_block_hash(v: Option<&serde_json::Value>) -> Result<Hash, jsonrpc_core:
         .try_into()
         .map_err(|_| invalid("block hash must be 32 bytes"))?;
     Ok(Hash::new(arr))
+}
+
+/// JSON-RPC method: `eth_getLogs` plus the executed block the answer is
+/// complete through, from the same tip snapshot (see the API README).
+pub const GET_LOGS_METHOD: &str = "citrate_getLogs";
+
+/// JSON-RPC error code `citrate_getLogs` returns when the block named by
+/// `afterBlockHash` is not the executed block at `fromBlock - 1` ("resource not
+/// found", EIP-1474): the chain the caller scanned was replaced.
+pub const LOG_CURSOR_REORGED_CODE: i64 = -32001;
+
+/// The retryable -32002 `citrate_getLogs` returns when an executed block in the
+/// range has a transaction with no receipt recorded for that block (the
+/// producer writes receipts just after it commits the tip; a node that does not
+/// store peer-block receipts never has them).
+pub fn receipts_not_stored_error(height: u64, block: &Hash, tx: &Hash) -> jsonrpc_core::Error {
+    jsonrpc_core::Error {
+        code: jsonrpc_core::ErrorCode::ServerError(LOG_INDEX_RETRY_CODE),
+        message: format!(
+            "{GET_LOGS_METHOD}: receipts for executed block {block} at height {height} are not stored (transaction {tx}); retry the same request"
+        ),
+        data: Some(serde_json::json!({
+            "retryable": true,
+            "blockNumber": format!("0x{height:x}"),
+            "blockHash": format!("0x{}", hex::encode(block.as_bytes())),
+        })),
+    }
+}
+
+/// `{"number": "0x…", "hash": "0x…"}` for an executed block.
+pub fn block_ref_json(height: u64, hash: &Hash) -> serde_json::Value {
+    serde_json::json!({
+        "number": format!("0x{height:x}"),
+        "hash": format!("0x{}", hex::encode(hash.as_bytes())),
+    })
 }
 
 /// The body of an executed block named by [`ExecutedChainIndex::executed_hashes`].

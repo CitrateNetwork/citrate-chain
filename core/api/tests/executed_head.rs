@@ -3,6 +3,11 @@
 // height, which can be ahead of it; a log scanner bounds its progress by this
 // method instead.
 //
+// citrate_getLogs(filter): eth_getLogs plus `through`, the executed block the
+// answer is complete through, from the same tip snapshot; `afterBlockHash`
+// chains windows so a scan never spans two chains. A scanner persists only a
+// `through`.
+//
 // citrate_isExecuted(hash): whether a block is on that tip's executed
 // (selected-parent) chain. eth_getBlockByHash serves any stored block,
 // including ones a reorg abandoned, so it only proves storage; a scanner's
@@ -14,7 +19,8 @@
 // applicator itself driving this method's data source).
 
 use citrate_api::canonical_logs::{
-    executed_head, ExecutedChainIndex, EXECUTED_HEAD_METHOD, IS_EXECUTED_METHOD, SETTLED_DEPTH,
+    executed_head, ExecutedChainIndex, EXECUTED_HEAD_METHOD, GET_LOGS_METHOD, IS_EXECUTED_METHOD,
+    SETTLED_DEPTH,
 };
 use citrate_api::eth_rpc::register_eth_methods_with_finality;
 use citrate_api::FilterRegistry;
@@ -406,7 +412,8 @@ fn executed_head_under_concurrent_apply_never_leads_get_logs() {
     let writes = writer.join().expect("writer thread");
     assert!(writes > 0, "writer never ran");
     // `below` counts reads where the tip moved down between the two calls:
-    // allowed (the scanner persists min(h1, h2)), never the reverse.
+    // allowed, never the reverse. This is why a scanner persists the `through`
+    // of citrate_getLogs, never a head read (see the citrate_getLogs tests).
     eprintln!("tip writes: {writes}, reads served below head: {below}");
 }
 
@@ -438,62 +445,6 @@ fn executed_head_names_the_executed_block_not_a_later_sibling() {
 
     // getLogs at the head height serves the executed block's logs.
     assert_eq!(logs_between(&io, 3, 3), vec![(3, hx(&a[3].hash()))]);
-}
-
-/// One pass of the documented scanner protocol (core/api/README.md): read h1,
-/// getLogs over `from..=min(target, h1)`, read h2, persist at most
-/// `min(target, h1, h2) - margin`. Returns the logs served and that height
-/// (`None`: don't advance).
-fn scan_once(
-    io: &jsonrpc_core::IoHandler,
-    from: u64,
-    target: u64,
-    margin: u64,
-    between: impl FnOnce(),
-) -> (Vec<(u64, String)>, Option<u64>) {
-    let (h1, _) = head_pair(io);
-    between();
-    let logs = logs_between(io, from, target.min(h1));
-    let (h2, _) = head_pair(io);
-    (logs, target.min(h1).min(h2).checked_sub(margin))
-}
-
-/// The head rewinds between the scanner's two reads (h2 < h1): getLogs served
-/// only up to the rewound tip, so progress persisted at min(h1, h2) − margin
-/// never passes a height whose logs were not served. Persisting h1 would skip
-/// a height.
-#[test]
-fn scanner_protocol_survives_a_rewind_between_reads() {
-    let (storage, _tmp) = storage();
-    let a = a_chain(&storage, 4);
-    let b3 = put(&storage, 0xB0, 3, a[2].hash());
-    let b4 = put(&storage, 0xB0, 4, b3.hash());
-    let b5 = put(&storage, 0xB0, 5, b4.hash());
-    tip(&storage, &b5);
-    let io = io(storage.clone());
-
-    let (logs, persist) = scan_once(&io, 0, 100, 0, || tip(&storage, &a[4]));
-    let served: Vec<u64> = logs.iter().map(|(h, _)| *h).collect();
-    assert_eq!(served, vec![0, 1, 2, 3, 4], "served after rewind");
-    assert_eq!(logs[4].1, hx(&a[4].hash()), "rewound branch served");
-    assert_eq!(persist, Some(4), "min(h1 = 5, h2 = 4) - 0");
-    assert!(
-        persist.is_some_and(|p| p <= *served.last().expect("served")),
-        "persisted above the highest height served"
-    );
-
-    // With a margin, progress stays that far below min(h1, h2).
-    tip(&storage, &b5);
-    let (_, persist) = scan_once(&io, 0, 100, 2, || tip(&storage, &a[4]));
-    assert_eq!(persist, Some(2));
-
-    // The target bounds the range; a margin above the head means no progress.
-    tip(&storage, &a[4]);
-    let (logs, persist) = scan_once(&io, 0, 2, 0, || {});
-    assert_eq!(logs.last().map(|(h, _)| *h), Some(2));
-    assert_eq!(persist, Some(2), "min(target = 2, h1, h2)");
-    let (_, persist) = scan_once(&io, 0, 100, 9, || {});
-    assert_eq!(persist, None);
 }
 
 // ---------------------------------------------------------------------------
@@ -850,4 +801,454 @@ fn is_executed_is_sound_across_a_deep_replacement() {
     assert_eq!(is_exec(&io, &b[4].hash()), executed_at(10));
     assert_eq!(is_exec(&io, &a[5].hash()), executed_at(5));
     assert_eq!(is_exec(&io, &a[depth as usize].hash()), not_executed());
+}
+
+// ---------------------------------------------------------------------------
+// citrate_getLogs: the rewind-safe scan
+// ---------------------------------------------------------------------------
+
+/// The raw `citrate_getLogs` response over `from..=to`, chained to `after`.
+fn clogs_raw(io: &jsonrpc_core::IoHandler, from: u64, to: u64, after: Option<&str>) -> Value {
+    let mut filter = json!({"fromBlock": format!("0x{from:x}"), "toBlock": format!("0x{to:x}")});
+    if let Some(a) = after {
+        filter["afterBlockHash"] = json!(a);
+    }
+    call(io, GET_LOGS_METHOD, json!([filter]))
+}
+
+/// `(height, hash)` of a `through` value (`None` for null).
+fn block_ref(v: &Value) -> Option<(u64, String)> {
+    if v.is_null() {
+        return None;
+    }
+    Some((
+        hex_u64(&v["number"]),
+        v["hash"].as_str().expect("hash").to_string(),
+    ))
+}
+
+/// `(blockNumber, blockHash)` of each log in a citrate_getLogs result.
+fn result_logs(result: &Value) -> Vec<(u64, String)> {
+    result["logs"]
+        .as_array()
+        .expect("logs array")
+        .iter()
+        .map(|l| {
+            (
+                hex_u64(&l["blockNumber"]),
+                l["blockHash"].as_str().expect("blockHash").to_string(),
+            )
+        })
+        .collect()
+}
+
+/// A scanner's durable state: the persisted cursor (the last `through`) and
+/// the rows found (here: one log per block, keyed by height).
+#[derive(Default, Debug)]
+struct Scan {
+    cursor: Option<(u64, String)>,
+    found: std::collections::BTreeMap<u64, String>,
+    rewinds: u32,
+}
+
+/// One pass of the README's cursor protocol: windows of `window` heights from
+/// the cursor (or 0) up to `target`, each chained to the cursor with
+/// `afterBlockHash`; persist each `through`; -32001 rewinds to the start and
+/// drops what was found; stop at a null `through`, a `through` below the
+/// window's end (caught up), or any other error. `between(i)` runs before
+/// window `i`.
+fn cursor_pass(
+    io: &jsonrpc_core::IoHandler,
+    scan: &mut Scan,
+    target: u64,
+    window: u64,
+    mut between: impl FnMut(u32),
+) {
+    for i in 0..64u32 {
+        between(i);
+        let from = scan.cursor.as_ref().map_or(0, |(n, _)| n + 1);
+        if from > target {
+            return;
+        }
+        let to = (from + window - 1).min(target);
+        let v = clogs_raw(io, from, to, scan.cursor.as_ref().map(|(_, h)| h.as_str()));
+        if v["error"]["code"] == -32001 {
+            scan.cursor = None;
+            scan.found.clear();
+            scan.rewinds += 1;
+            continue;
+        }
+        assert!(v.get("error").is_none(), "window {from}..={to}: {v}");
+        for (n, h) in result_logs(&v["result"]) {
+            scan.found.insert(n, h);
+        }
+        match block_ref(&v["result"]["through"]) {
+            None => return,
+            Some(t) => {
+                let caught_up = t.0 < to;
+                scan.cursor = Some(t);
+                if caught_up {
+                    return;
+                }
+            }
+        }
+    }
+    panic!("scan did not finish in 64 windows: {scan:?}");
+}
+
+/// `height -> hash` of the executed chain of `top`, heights `0..=top_height`.
+fn chain_map(blocks: &[&Block]) -> std::collections::BTreeMap<u64, String> {
+    blocks
+        .iter()
+        .map(|b| (b.header.height, hx(&b.hash())))
+        .collect()
+}
+
+/// The shape: `logs` exactly as eth_getLogs serves them for the same range,
+/// `through` the executed block at the top of the served range.
+#[test]
+fn get_logs_answers_logs_and_the_block_it_is_complete_through() {
+    let (storage, _tmp) = storage();
+    let a = a_chain(&storage, 9);
+    tip(&storage, &a[6]);
+    let io = io(storage.clone());
+
+    let v = clogs_raw(&io, 2, 5, None);
+    assert_eq!(
+        v["result"]["through"],
+        json!({"number": "0x5", "hash": hx(&a[5].hash())})
+    );
+    let plain = call(
+        &io,
+        "eth_getLogs",
+        json!([{"fromBlock": "0x2", "toBlock": "0x5"}]),
+    );
+    assert_eq!(
+        v["result"]["logs"], plain["result"],
+        "same logs as eth_getLogs"
+    );
+
+    // A range reaching past the executed head is complete through the head.
+    let v = clogs_raw(&io, 4, 9, None);
+    assert_eq!(
+        block_ref(&v["result"]["through"]),
+        Some((6, hx(&a[6].hash())))
+    );
+    assert_eq!(result_logs(&v["result"]).len(), 3);
+    // Nothing executed in the range: through is null.
+    let v = clogs_raw(&io, 7, 9, None);
+    assert_eq!(v["result"], json!({"logs": [], "through": null}), "{v}");
+    // Over the limit: -32005, never clamped.
+    let v = clogs_raw(&io, 0, 1_001, None);
+    assert_eq!(v["error"]["code"], -32005, "{v}");
+}
+
+/// A sibling at the head height, written after the executed block, owns the
+/// height index: `through` names the executed block, and a cursor naming the
+/// sibling is refused with -32001.
+#[test]
+fn get_logs_through_names_the_executed_block_not_a_later_sibling() {
+    let (storage, _tmp) = storage();
+    let a = a_chain(&storage, 3);
+    tip(&storage, &a[3]);
+    let s3 = put(&storage, 0xC0, 3, a[2].hash());
+    let io = io(storage.clone());
+
+    let v = clogs_raw(&io, 0, 3, None);
+    assert_eq!(
+        block_ref(&v["result"]["through"]),
+        Some((3, hx(&a[3].hash())))
+    );
+    assert_eq!(
+        result_logs(&v["result"]).last().cloned(),
+        Some((3, hx(&a[3].hash())))
+    );
+    // Chained on the executed block: nothing new yet, no error.
+    let v = clogs_raw(&io, 4, 10, Some(&hx(&a[3].hash())));
+    assert_eq!(v["result"], json!({"logs": [], "through": null}), "{v}");
+    // Chained on the sibling: refused.
+    let v = clogs_raw(&io, 4, 10, Some(&hx(&s3.hash())));
+    assert_eq!(v["error"]["code"], -32001, "{v}");
+    let v = clogs_raw(&io, 3, 3, Some(&hx(&s3.hash())));
+    assert_eq!(
+        v["error"]["code"], -32001,
+        "a cursor at height 2 is a2: {v}"
+    );
+}
+
+/// Concurrent apply versus read: a writer moves the applied tip between two
+/// branches and down; every citrate_getLogs answer is internally consistent:
+/// its logs cover exactly `from..=through.number`, one per height, on
+/// `through`'s own selected-parent chain, and `through` is on the chain of a
+/// tip the writer wrote. A cursor every chain shares is never refused.
+#[test]
+fn get_logs_through_is_atomic_under_concurrent_apply() {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (storage, _tmp) = storage();
+    let a = a_chain(&storage, 9);
+    let mut b = Vec::new();
+    let mut parent = a[2].hash();
+    for h in 3..=6 {
+        let blk = put(&storage, 0xB0, h, parent);
+        parent = blk.hash();
+        b.push(blk);
+    }
+    for h in 3..=6 {
+        put(&storage, 0xC0, h, a[h as usize - 1].hash());
+    }
+    let tips: Vec<(Hash, u64)> = a[3..=6]
+        .iter()
+        .chain(b.iter())
+        .map(|blk| (blk.hash(), blk.header.height))
+        .collect();
+    let parent_of: HashMap<String, String> = a
+        .iter()
+        .chain(b.iter())
+        .map(|blk| (hx(&blk.hash()), hx(&blk.header.selected_parent_hash)))
+        .collect();
+    let on_a_tip_chain: HashSet<String> = a[..=6]
+        .iter()
+        .chain(b.iter())
+        .map(|blk| hx(&blk.hash()))
+        .collect();
+    tip(&storage, &a[3]);
+    let io = io(storage.clone());
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let storage = storage.clone();
+        let stop = stop.clone();
+        let tips = tips.clone();
+        std::thread::spawn(move || {
+            let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+            let mut writes = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let (h, n) = tips[(x % tips.len() as u64) as usize];
+                storage.blocks.put_applied_tip(&h, n).expect("applied tip");
+                writes += 1;
+            }
+            writes
+        })
+    };
+
+    let a2 = hx(&a[2].hash());
+    for i in 0..2_000u32 {
+        let (from, after) = if i % 2 == 0 {
+            (0, None)
+        } else {
+            (3, Some(a2.as_str()))
+        };
+        let v = clogs_raw(&io, from, 9, after);
+        assert!(v.get("error").is_none(), "read {i}: {v}");
+        let (tn, th) = block_ref(&v["result"]["through"]).expect("every tip is above 3");
+        assert!(
+            on_a_tip_chain.contains(&th),
+            "through {th} is on no written tip's chain"
+        );
+        let logs = result_logs(&v["result"]);
+        let heights: Vec<u64> = logs.iter().map(|(n, _)| *n).collect();
+        assert_eq!(heights, (from..=tn).collect::<Vec<_>>(), "read {i}: {v}");
+        assert_eq!(
+            logs.last().map(|(_, h)| h.clone()),
+            Some(th.clone()),
+            "read {i}"
+        );
+        for w in logs.windows(2) {
+            assert_eq!(
+                parent_of[&w[1].1], w[0].1,
+                "read {i}: logs span two chains: {logs:?}"
+            );
+        }
+        if from == 3 {
+            assert_eq!(parent_of[&logs[0].1], a2, "chained on a2");
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    let writes = writer.join().expect("writer thread");
+    assert!(writes > 0, "writer never ran");
+    eprintln!("tip writes: {writes}");
+}
+
+/// A rewind mid-scan, including the case where the tip goes back to the same
+/// height and hash before the scanner looks again: the scanner persists only
+/// what each answer says it is complete through, so no height is skipped.
+#[test]
+fn cursor_scan_never_skips_logs_across_a_rewind() {
+    let (storage, _tmp) = storage();
+    let a = a_chain(&storage, 20);
+    tip(&storage, &a[20]);
+    let io = io(storage.clone());
+    let mut scan = Scan::default();
+
+    // Window 0 serves 0..=7; then the tip rewinds to a4 (below the cursor)
+    // for window 1, which therefore serves nothing.
+    cursor_pass(&io, &mut scan, 100, 8, |i| {
+        if i == 1 {
+            tip(&storage, &a[4]);
+        }
+    });
+    assert_eq!(scan.cursor, Some((7, hx(&a[7].hash()))), "{scan:?}");
+
+    // Codex's sequence for one call: the tip is low while the call is served
+    // and back at the same height and hash right after.
+    tip(&storage, &a[12]);
+    let v = clogs_raw(&io, 8, 15, Some(&hx(&a[7].hash())));
+    tip(&storage, &a[20]);
+    let t = block_ref(&v["result"]["through"]).expect("served 8..=12");
+    assert_eq!(
+        t,
+        (12, hx(&a[12].hash())),
+        "complete through the tip it served from"
+    );
+    for (n, h) in result_logs(&v["result"]) {
+        scan.found.insert(n, h);
+    }
+    scan.cursor = Some(t);
+
+    // The next pass resumes at 13, not at 16.
+    cursor_pass(&io, &mut scan, 100, 8, |_| {});
+    let all: Vec<&Block> = a.iter().collect();
+    assert_eq!(scan.found, chain_map(&all), "every height once, no skip");
+    assert_eq!(scan.cursor, Some((20, hx(&a[20].hash()))));
+    assert_eq!(scan.rewinds, 0);
+}
+
+/// A reorg mid-scan below the cursor: the next window is refused (-32001), the
+/// scanner starts over, and what it ends with is exactly the new chain, with
+/// nothing from the abandoned branch and no height of the new one missing.
+#[test]
+fn cursor_scan_restarts_on_a_reorg_below_the_cursor() {
+    let (storage, _tmp) = storage();
+    let a = a_chain(&storage, 20);
+    let mut b = Vec::new();
+    let mut parent = a[10].hash();
+    for h in 11..=25 {
+        let blk = put(&storage, 0xB0, h, parent);
+        parent = blk.hash();
+        b.push(blk);
+    }
+    tip(&storage, &a[20]);
+    let io = io(storage.clone());
+    let mut scan = Scan::default();
+
+    // Two windows on A (through a15), then the chain switches to B at 11.
+    cursor_pass(&io, &mut scan, 100, 8, |i| {
+        if i == 2 {
+            tip(&storage, b.last().expect("b tip"));
+        }
+    });
+    assert_eq!(scan.rewinds, 1, "{scan:?}");
+    let mut want: Vec<&Block> = a[..=10].iter().collect();
+    want.extend(b.iter());
+    assert_eq!(scan.found, chain_map(&want));
+    assert_eq!(scan.cursor, Some((25, hx(&b[14].hash()))));
+}
+
+/// Restart: the scanner's persisted cursor works against a reopened store and
+/// a fresh handler (cold cache), including a restart that comes back with the
+/// applied tip below the cursor (a replay after an unclean shutdown).
+#[test]
+fn cursor_scan_resumes_across_a_node_restart() {
+    let tmp = TempDir::new().expect("tempdir");
+    let open =
+        || Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).expect("storage"));
+    let mut scan = Scan::default();
+    let a: Vec<Block>;
+    {
+        let storage = open();
+        a = a_chain(&storage, 30);
+        tip(&storage, &a[15]);
+        let io = io(storage.clone());
+        cursor_pass(&io, &mut scan, 100, 8, |_| {});
+        assert_eq!(scan.cursor, Some((15, hx(&a[15].hash()))));
+        // Replay after an unclean shutdown: the node comes back at a9.
+        tip(&storage, &a[9]);
+    }
+    {
+        let storage = open();
+        let io = io(storage.clone());
+        // Below the cursor: nothing served, nothing refused, cursor kept.
+        cursor_pass(&io, &mut scan, 100, 8, |_| {});
+        assert_eq!(scan.cursor, Some((15, hx(&a[15].hash()))));
+        assert_eq!(is_exec(&io, &a[15].hash()), not_executed());
+        tip(&storage, &a[30]);
+    }
+    {
+        let storage = open();
+        let io = io(storage.clone());
+        assert_eq!(is_exec(&io, &a[15].hash()), executed_at(15));
+        cursor_pass(&io, &mut scan, 100, 8, |_| {});
+    }
+    let all: Vec<&Block> = a.iter().collect();
+    assert_eq!(scan.found, chain_map(&all));
+    assert_eq!(scan.cursor, Some((30, hx(&a[30].hash()))));
+}
+
+/// An executed block whose transaction has no receipt recorded for it (the
+/// producer writes receipts just after committing the tip; a node without
+/// peer-block receipts never has them): citrate_getLogs refuses the range with
+/// a retryable -32002 instead of answering it as complete. eth_getLogs is
+/// unchanged and skips the transaction.
+#[test]
+fn get_logs_refuses_a_range_with_missing_receipts() {
+    let (storage, _tmp) = storage();
+    let a = a_chain(&storage, 3);
+    // a4 executed, its receipt not written yet.
+    let t = Transaction {
+        hash: hash_of(0x44, 4),
+        nonce: 4,
+        from: PublicKey::new([1u8; 32]),
+        to: Some(PublicKey::new([2u8; 32])),
+        gas_limit: 50_000,
+        gas_price: 2_000_000_000,
+        signature: Signature::new([7u8; 64]),
+        chain_id: Some(40204),
+        ..Default::default()
+    };
+    let a4 = BlockBuilder::new()
+        .hash(hash_of(0xA0, 4))
+        .parent(a[3].hash())
+        .height(4)
+        .timestamp(1_000_004)
+        .gas_limit(30_000_000)
+        .transactions(vec![t])
+        .build_unhashed();
+    storage.blocks.put_block(&a4).expect("a4");
+    tip(&storage, &a4);
+    let io = io(storage.clone());
+
+    let v = clogs_raw(&io, 0, 4, None);
+    assert_eq!(v["error"]["code"], -32002, "{v}");
+    assert_eq!(v["error"]["data"]["retryable"], true, "{v}");
+    assert_eq!(v["error"]["data"]["blockNumber"], "0x4", "{v}");
+    // Below it the range is complete.
+    let v = clogs_raw(&io, 0, 3, None);
+    assert_eq!(
+        block_ref(&v["result"]["through"]),
+        Some((3, hx(&a[3].hash())))
+    );
+    // eth_getLogs: unchanged.
+    assert_eq!(logs_between(&io, 0, 4).len(), 4);
+}
+
+/// `afterBlockHash` needs `fromBlock >= 1` and a 32-byte hash (-32602).
+#[test]
+fn get_logs_rejects_a_malformed_cursor() {
+    let (storage, _tmp) = storage();
+    let a = a_chain(&storage, 3);
+    tip(&storage, &a[3]);
+    let io = io(storage.clone());
+    let v = clogs_raw(&io, 0, 3, Some(&hx(&a[0].hash())));
+    assert_eq!(v["error"]["code"], -32602, "{v}");
+    for bad in ["0x", "0x1234", "nothex"] {
+        let v = clogs_raw(&io, 1, 3, Some(bad));
+        assert_eq!(v["error"]["code"], -32602, "{bad}: {v}");
+    }
+    let v = call(&io, GET_LOGS_METHOD, json!([]));
+    assert_eq!(v["error"]["code"], -32602, "{v}");
 }

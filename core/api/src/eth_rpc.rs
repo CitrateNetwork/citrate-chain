@@ -1908,132 +1908,15 @@ pub fn register_eth_methods_with_finality(
         crate::filter::validate_log_filter_criteria(filter)
             .map_err(jsonrpc_core::Error::invalid_params)?;
 
-        // Get current height for "latest" resolution
         let current_height = storage_logs.blocks.get_latest_height().unwrap_or(0);
         let finalized = finalized_logs.load(Ordering::SeqCst);
-
-        // Parse fromBlock (default to 0). Absent field keeps its default; a
-        // present tag is resolved via the shared resolver (adds finalized/safe).
-        let from_block = match filter.get("fromBlock").and_then(|v| v.as_str()) {
-            None => 0,
-            Some(tag) => match resolve_block_tag(Some(tag), current_height, finalized) {
-                Some(h) => h,
-                None => {
-                    return Err(jsonrpc_core::Error::invalid_params(format!(
-                        "Invalid fromBlock: {}",
-                        tag
-                    )))
-                }
-            },
-        };
-
-        // Parse toBlock (default to latest). Same handling as fromBlock.
-        let to_block = match filter.get("toBlock").and_then(|v| v.as_str()) {
-            None => current_height,
-            Some(tag) => match resolve_block_tag(Some(tag), current_height, finalized) {
-                Some(h) => h,
-                None => {
-                    return Err(jsonrpc_core::Error::invalid_params(format!(
-                        "Invalid toBlock: {}",
-                        tag
-                    )))
-                }
-            },
-        };
+        let (from_block, to_block, criteria) = parse_log_filter(filter, current_height, finalized)?;
 
         // Limit the block range. Over the limit is a -32005 error, not a silent
         // clamp (a clamped answer reads as "no logs after fromBlock+1000"); the
         // legacy clamp is an operator opt-in (`canonical_logs::LEGACY_CLAMP_ENV`).
         let effective_to =
             crate::canonical_logs::bound_log_range(from_block, to_block, legacy_clamp_logs)?;
-
-        // Parse address filter (single address or array)
-        let address_filter: Vec<Address> = match filter.get("address") {
-            Some(Value::String(addr_str)) => {
-                let addr_hex = addr_str.trim_start_matches("0x");
-                if let Ok(bytes) = hex::decode(addr_hex) {
-                    if bytes.len() == 20 {
-                        let mut arr = [0u8; 20];
-                        arr.copy_from_slice(&bytes);
-                        vec![Address(arr)]
-                    } else {
-                        vec![]
-                    }
-                } else {
-                    vec![]
-                }
-            }
-            Some(Value::Array(addrs)) => addrs
-                .iter()
-                .filter_map(|v| v.as_str())
-                .filter_map(|addr_str| {
-                    let addr_hex = addr_str.trim_start_matches("0x");
-                    hex::decode(addr_hex).ok().and_then(|bytes| {
-                        if bytes.len() == 20 {
-                            let mut arr = [0u8; 20];
-                            arr.copy_from_slice(&bytes);
-                            Some(Address(arr))
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .collect(),
-            _ => vec![],
-        };
-
-        // Parse topics filter (array of arrays, each position can be null or array of hashes)
-        let topics_filter: Vec<Option<Vec<Hash>>> = match filter.get("topics") {
-            Some(Value::Array(topics)) => {
-                topics
-                    .iter()
-                    .map(|topic_entry| {
-                        match topic_entry {
-                            Value::Null => None, // null means "any"
-                            Value::String(hash_str) => {
-                                // Single topic hash
-                                let hash_hex = hash_str.trim_start_matches("0x");
-                                hex::decode(hash_hex).ok().and_then(|bytes| {
-                                    if bytes.len() == 32 {
-                                        let mut arr = [0u8; 32];
-                                        arr.copy_from_slice(&bytes);
-                                        Some(vec![Hash::new(arr)])
-                                    } else {
-                                        None
-                                    }
-                                })
-                            }
-                            Value::Array(hashes) => {
-                                // Array of topic hashes (OR logic)
-                                let parsed: Vec<Hash> = hashes
-                                    .iter()
-                                    .filter_map(|v| v.as_str())
-                                    .filter_map(|hash_str| {
-                                        let hash_hex = hash_str.trim_start_matches("0x");
-                                        hex::decode(hash_hex).ok().and_then(|bytes| {
-                                            if bytes.len() == 32 {
-                                                let mut arr = [0u8; 32];
-                                                arr.copy_from_slice(&bytes);
-                                                Some(Hash::new(arr))
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                    })
-                                    .collect();
-                                if parsed.is_empty() {
-                                    None
-                                } else {
-                                    Some(parsed)
-                                }
-                            }
-                            _ => None,
-                        }
-                    })
-                    .collect()
-            }
-            _ => vec![],
-        };
 
         // Collect matching logs from the EXECUTED chain, in execution order:
         // ascending height along the applied tip's selected-parent chain, then
@@ -2048,67 +1931,68 @@ pub fn register_eth_methods_with_finality(
 
         let mut result_logs: Vec<Value> = Vec::new();
         for (_, executed_hash) in &executed {
-            let block = crate::canonical_logs::load_executed_block(&storage_logs, executed_hash)
-                .map_err(|e| e.to_rpc_error())?;
-            let block_hash = block.header.block_hash;
-            // logIndex is the log's position in its block (Ethereum semantics),
-            // counted over every log of the block, matched or not.
-            let mut log_index_in_block = 0usize;
-
-            for (tx_index, tx) in block.transactions.iter().enumerate() {
-                // Only a receipt recorded for THIS block describes this
-                // execution; a receipt naming another block (the same tx in a
-                // block this node produced and then lost) is not served here,
-                // which keeps blockHash/blockNumber identical to
-                // eth_getTransactionReceipt.
-                let receipt = match storage_logs.transactions.get_receipt(&tx.hash) {
-                    Ok(Some(r)) if r.block_hash == block_hash => r,
-                    _ => continue,
-                };
-
-                for log in receipt.logs.iter() {
-                    let log_index = log_index_in_block;
-                    log_index_in_block = log_index_in_block.saturating_add(1);
-
-                    // Check address filter
-                    if !address_filter.is_empty() && !address_filter.contains(&log.address) {
-                        continue;
-                    }
-
-                    // Check topics filter
-                    let topics_match = topics_filter.iter().enumerate().all(|(i, topic_filter)| {
-                        match topic_filter {
-                            None => true, // null means any
-                            Some(allowed_topics) => log
-                                .topics
-                                .get(i)
-                                .is_some_and(|t| allowed_topics.contains(t)),
-                        }
-                    });
-
-                    if !topics_match {
-                        continue;
-                    }
-
-                    result_logs.push(json!({
-                        "address": format!("0x{}", hex::encode(log.address.0)),
-                        "topics": log.topics.iter()
-                            .map(|t| format!("0x{}", hex::encode(t.as_bytes())))
-                            .collect::<Vec<_>>(),
-                        "data": format!("0x{}", hex::encode(&log.data)),
-                        "blockNumber": format!("0x{:x}", receipt.block_number),
-                        "blockHash": format!("0x{}", hex::encode(receipt.block_hash.as_bytes())),
-                        "transactionHash": format!("0x{}", hex::encode(tx.hash.as_bytes())),
-                        "transactionIndex": format!("0x{:x}", tx_index),
-                        "logIndex": format!("0x{:x}", log_index),
-                        "removed": false
-                    }));
-                }
-            }
+            push_block_logs(
+                &storage_logs,
+                executed_hash,
+                &criteria,
+                ReceiptPolicy::SkipMissing,
+                &mut result_logs,
+            )?;
         }
 
         Ok(Value::Array(result_logs))
     });
+
+    // citrate_getLogs - eth_getLogs plus `through`, the executed block the
+    // answer is complete through. STUB (red commit): the bound comes from a
+    // separate executed-head read, as the two-read scanner protocol did.
+    let storage_clogs = storage.clone();
+    let finalized_clogs = finalized_height.clone();
+    let executed_chain_clogs = executed_chain.clone();
+    io_handler.add_sync_method(
+        crate::canonical_logs::GET_LOGS_METHOD,
+        move |params: Params| {
+            crate::rate_limit::check_method_budget(10)?;
+            let params: Vec<Value> = params
+                .parse()
+                .map_err(|e| jsonrpc_core::Error::invalid_params(e.to_string()))?;
+            let filter = &arg(&params, 0);
+            if !filter.is_object() {
+                return Err(jsonrpc_core::Error::invalid_params("Missing filter object"));
+            }
+            crate::filter::validate_log_filter_criteria(filter)
+                .map_err(jsonrpc_core::Error::invalid_params)?;
+            let current_height = storage_clogs.blocks.get_latest_height().unwrap_or(0);
+            let finalized = finalized_clogs.load(Ordering::SeqCst);
+            let (from_block, to_block, criteria) =
+                parse_log_filter(filter, current_height, finalized)?;
+            let to = crate::canonical_logs::bound_log_range(from_block, to_block, false)?;
+            let executed = executed_chain_clogs
+                .executed_hashes(&storage_clogs, from_block, to)
+                .map_err(|e| e.to_rpc_error())?;
+            let mut logs = Vec::new();
+            for (_, h) in &executed {
+                push_block_logs(
+                    &storage_clogs,
+                    h,
+                    &criteria,
+                    ReceiptPolicy::SkipMissing,
+                    &mut logs,
+                )?;
+            }
+            let through = match crate::canonical_logs::executed_head(&storage_clogs) {
+                Ok((hash, n)) if n <= to && n >= from_block => {
+                    crate::canonical_logs::block_ref_json(n, &hash)
+                }
+                Ok(_) => executed
+                    .last()
+                    .map(|(n, h)| crate::canonical_logs::block_ref_json(*n, h))
+                    .unwrap_or(Value::Null),
+                Err(_) => Value::Null,
+            };
+            Ok(json!({ "logs": logs, "through": through }))
+        },
+    );
 
     // eth_newFilter - Create a new log filter
     let storage_new_filter = storage.clone();
@@ -3293,6 +3177,166 @@ pub fn register_eth_methods_with_finality(
 pub(crate) fn arg(params: &[Value], i: usize) -> &Value {
     static NULL: Value = Value::Null;
     params.get(i).unwrap_or(&NULL)
+}
+
+/// Address and topic criteria of a log filter (`eth_getLogs`, `citrate_getLogs`).
+struct LogCriteria {
+    addresses: Vec<Address>,
+    topics: Vec<Option<Vec<Hash>>>,
+}
+
+impl LogCriteria {
+    fn matches(&self, log: &citrate_execution::types::Log) -> bool {
+        if !self.addresses.is_empty() && !self.addresses.contains(&log.address) {
+            return false;
+        }
+        self.topics
+            .iter()
+            .enumerate()
+            .all(|(i, topic_filter)| match topic_filter {
+                None => true, // null means any
+                Some(allowed) => log.topics.get(i).is_some_and(|t| allowed.contains(t)),
+            })
+    }
+}
+
+/// A 20-byte address from `0x`-prefixed (or bare) hex; `None` otherwise.
+fn parse_filter_address(s: &str) -> Option<Address> {
+    let bytes = hex::decode(s.trim_start_matches("0x")).ok()?;
+    let arr: [u8; 20] = bytes.try_into().ok()?;
+    Some(Address(arr))
+}
+
+/// A 32-byte topic from `0x`-prefixed (or bare) hex; `None` otherwise.
+fn parse_filter_topic(s: &str) -> Option<Hash> {
+    let bytes = hex::decode(s.trim_start_matches("0x")).ok()?;
+    let arr: [u8; 32] = bytes.try_into().ok()?;
+    Some(Hash::new(arr))
+}
+
+/// `fromBlock` (default 0), `toBlock` (default the stored head) and the
+/// address/topic criteria of a log filter. A present block tag is resolved via
+/// the shared resolver (adds finalized/safe); an unparseable one is -32602.
+/// Unparseable addresses and topics are ignored, as `eth_getLogs` always did.
+fn parse_log_filter(
+    filter: &Value,
+    current_height: u64,
+    finalized: u64,
+) -> Result<(u64, u64, LogCriteria), jsonrpc_core::Error> {
+    let block = |field: &str, default: u64| -> Result<u64, jsonrpc_core::Error> {
+        match filter.get(field).and_then(|v| v.as_str()) {
+            None => Ok(default),
+            Some(tag) => resolve_block_tag(Some(tag), current_height, finalized).ok_or_else(|| {
+                jsonrpc_core::Error::invalid_params(format!("Invalid {field}: {tag}"))
+            }),
+        }
+    };
+    let from_block = block("fromBlock", 0)?;
+    let to_block = block("toBlock", current_height)?;
+
+    // Single address or array.
+    let addresses: Vec<Address> = match filter.get("address") {
+        Some(Value::String(a)) => parse_filter_address(a).into_iter().collect(),
+        Some(Value::Array(addrs)) => addrs
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter_map(parse_filter_address)
+            .collect(),
+        _ => vec![],
+    };
+
+    // Array of positions; each null (any), one topic, or an array (OR).
+    let topics: Vec<Option<Vec<Hash>>> = match filter.get("topics") {
+        Some(Value::Array(entries)) => entries
+            .iter()
+            .map(|entry| match entry {
+                Value::String(t) => parse_filter_topic(t).map(|h| vec![h]),
+                Value::Array(hashes) => {
+                    let parsed: Vec<Hash> = hashes
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .filter_map(parse_filter_topic)
+                        .collect();
+                    if parsed.is_empty() {
+                        None
+                    } else {
+                        Some(parsed)
+                    }
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => vec![],
+    };
+    Ok((from_block, to_block, LogCriteria { addresses, topics }))
+}
+
+/// What to do with a transaction of an executed block that has no receipt
+/// recorded for that block.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReceiptPolicy {
+    /// Skip it (`eth_getLogs`).
+    SkipMissing,
+    /// Fail with a retryable -32002 (`citrate_getLogs`): every transaction of
+    /// an executed block has a receipt once it is stored, so a missing one
+    /// means the range cannot be served in full yet.
+    RequireAll,
+}
+
+/// Load executed block `hash` and append its logs that match `criteria` to
+/// `out`, in `block.transactions` order then receipt log order. `logIndex` is
+/// the log's position in its block, counted over every log of the block.
+fn push_block_logs(
+    storage: &StorageManager,
+    hash: &Hash,
+    criteria: &LogCriteria,
+    policy: ReceiptPolicy,
+    out: &mut Vec<Value>,
+) -> Result<(), jsonrpc_core::Error> {
+    let block =
+        crate::canonical_logs::load_executed_block(storage, hash).map_err(|e| e.to_rpc_error())?;
+    let block_hash = block.header.block_hash;
+    let mut log_index_in_block = 0usize;
+
+    for (tx_index, tx) in block.transactions.iter().enumerate() {
+        // Only a receipt recorded for THIS block describes this execution; a
+        // receipt naming another block (the same tx in a block this node
+        // produced and then lost) is not served here, which keeps
+        // blockHash/blockNumber identical to eth_getTransactionReceipt.
+        let receipt = match storage.transactions.get_receipt(&tx.hash) {
+            Ok(Some(r)) if r.block_hash == block_hash => r,
+            _ if policy == ReceiptPolicy::SkipMissing => continue,
+            _ => {
+                return Err(crate::canonical_logs::receipts_not_stored_error(
+                    block.header.height,
+                    &block_hash,
+                    &tx.hash,
+                ))
+            }
+        };
+
+        for log in receipt.logs.iter() {
+            let log_index = log_index_in_block;
+            log_index_in_block = log_index_in_block.saturating_add(1);
+            if !criteria.matches(log) {
+                continue;
+            }
+            out.push(json!({
+                "address": format!("0x{}", hex::encode(log.address.0)),
+                "topics": log.topics.iter()
+                    .map(|t| format!("0x{}", hex::encode(t.as_bytes())))
+                    .collect::<Vec<_>>(),
+                "data": format!("0x{}", hex::encode(&log.data)),
+                "blockNumber": format!("0x{:x}", receipt.block_number),
+                "blockHash": format!("0x{}", hex::encode(receipt.block_hash.as_bytes())),
+                "transactionHash": format!("0x{}", hex::encode(tx.hash.as_bytes())),
+                "transactionIndex": format!("0x{:x}", tx_index),
+                "logIndex": format!("0x{:x}", log_index),
+                "removed": false
+            }));
+        }
+    }
+    Ok(())
 }
 
 /// Where a mined transaction landed: its block hash, block number and index in
