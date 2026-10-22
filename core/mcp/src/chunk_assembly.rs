@@ -51,35 +51,94 @@ pub struct ChunkAssembler {
 }
 
 impl ChunkAssembler {
-    /// Build an assembler for `manifest`.
+    /// Validate `manifest` and build an assembler for it.
+    ///
+    /// Checks, in order: declared total against [`MAX_ASSEMBLED_MODEL_BYTES`],
+    /// chunk size in `1..=MAX_CHUNK_BYTES`, listed chunk count against
+    /// [`MAX_MODEL_CHUNKS`], and listed count against the count implied by
+    /// the declared sizes. The up-front reservation is the declared total
+    /// clamped to [`MAX_INITIAL_RESERVE_BYTES`].
     pub fn new(manifest: &ChunkManifest) -> Result<Self, ManifestAssemblyError> {
-        // Pre-hardening behaviour: capacity taken from the manifest as-is.
-        let planned_capacity = manifest.total_size as usize;
+        let declared_total = manifest.total_size;
+        if declared_total > MAX_ASSEMBLED_MODEL_BYTES {
+            return Err(ManifestAssemblyError::TotalSizeTooLarge {
+                declared: declared_total,
+                max: MAX_ASSEMBLED_MODEL_BYTES,
+            });
+        }
+        let chunk_size = u64::try_from(manifest.chunk_size).unwrap_or(u64::MAX);
+        if chunk_size == 0 || chunk_size > MAX_CHUNK_BYTES {
+            return Err(ManifestAssemblyError::InvalidChunkSize {
+                declared: chunk_size,
+                max: MAX_CHUNK_BYTES,
+            });
+        }
+        let listed = manifest.chunks.len();
+        if listed > MAX_MODEL_CHUNKS {
+            return Err(ManifestAssemblyError::TooManyChunks {
+                listed,
+                max: MAX_MODEL_CHUNKS,
+            });
+        }
+        let expected = declared_total.div_ceil(chunk_size);
+        if u64::try_from(listed).ok() != Some(expected) {
+            return Err(ManifestAssemblyError::ChunkCountMismatch { listed, expected });
+        }
+        let planned_capacity = usize::try_from(declared_total)
+            .unwrap_or(usize::MAX)
+            .min(MAX_INITIAL_RESERVE_BYTES);
         Ok(Self {
-            declared_total: manifest.total_size,
-            chunk_size: manifest.chunk_size as u64,
+            declared_total,
+            chunk_size,
             planned_capacity,
             pushed: 0,
-            buf: Vec::new(),
+            buf: Vec::with_capacity(planned_capacity),
         })
     }
 
-    /// Bytes the assembler will reserve before any chunk is fetched.
+    /// Bytes the assembler reserved before any chunk was fetched.
     pub fn planned_capacity(&self) -> usize {
         self.planned_capacity
     }
 
-    /// Append the next fetched chunk.
+    /// Append the next fetched chunk, rejecting it if it is larger than the
+    /// declared chunk size or would take the payload past the declared total.
     pub fn push(&mut self, bytes: Vec<u8>) -> Result<(), ManifestAssemblyError> {
-        self.pushed += 1;
+        let index = self.pushed;
+        let len = bytes.len();
+        if u64::try_from(len).map_or(true, |l| l > self.chunk_size) {
+            return Err(ManifestAssemblyError::ChunkTooLarge {
+                index,
+                len,
+                chunk_size: self.chunk_size,
+            });
+        }
+        let new_total = self.assembled_len().saturating_add(len as u64);
+        if new_total > self.declared_total {
+            return Err(ManifestAssemblyError::SizeMismatch {
+                declared: self.declared_total,
+                actual: new_total,
+            });
+        }
         self.buf.extend(bytes);
+        self.pushed = index.saturating_add(1);
         Ok(())
     }
 
-    /// Finish assembly, returning the model bytes.
+    /// Finish assembly; the payload must match the declared total exactly.
     pub fn finish(self) -> Result<Vec<u8>, ManifestAssemblyError> {
-        let _ = (self.declared_total, self.chunk_size, self.pushed);
+        let actual = self.assembled_len();
+        if actual != self.declared_total {
+            return Err(ManifestAssemblyError::SizeMismatch {
+                declared: self.declared_total,
+                actual,
+            });
+        }
         Ok(self.buf)
+    }
+
+    fn assembled_len(&self) -> u64 {
+        u64::try_from(self.buf.len()).unwrap_or(u64::MAX)
     }
 }
 
@@ -178,11 +237,7 @@ mod tests {
 
     #[test]
     fn rejects_too_many_chunks() {
-        let m = manifest(
-            (MAX_MODEL_CHUNKS as u64) + 1,
-            1,
-            MAX_MODEL_CHUNKS + 1,
-        );
+        let m = manifest((MAX_MODEL_CHUNKS as u64) + 1, 1, MAX_MODEL_CHUNKS + 1);
         assert!(matches!(
             ChunkAssembler::new(&m),
             Err(ManifestAssemblyError::TooManyChunks { .. })
