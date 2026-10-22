@@ -16,7 +16,7 @@
 
 use crate::token::DECIMALS;
 use citrate_consensus::types::Block;
-use citrate_execution::types::Address;
+use citrate_execution::types::{Address, TransactionReceipt};
 use primitive_types::U256;
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +68,8 @@ pub enum RewardError {
     InvalidConfig(&'static str),
     #[error("reward arithmetic overflow in {0}")]
     Overflow(&'static str),
+    #[error("block has {txs} transactions but {receipts} receipts")]
+    ReceiptMismatch { txs: usize, receipts: usize },
 }
 
 /// Block reward calculation
@@ -178,6 +180,17 @@ impl RewardCalculator {
             treasury_reward,
             total_reward,
         })
+    }
+
+    /// TEST-FIRST STUB: the executed-receipts rule lands in the next commit.
+    /// Until then every height uses the legacy rule.
+    pub fn calculate_block_reward(
+        &self,
+        block: &Block,
+        _receipts: &[TransactionReceipt],
+        _executed_basis: bool,
+    ) -> Result<BlockReward, RewardError> {
+        self.calculate_reward(block)
     }
 
     /// Count inference transactions in block
