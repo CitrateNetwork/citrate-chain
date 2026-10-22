@@ -88,6 +88,13 @@
 #      entries (SBT, MemberBond, vault implementation, vault proxy, root aliases) to be this
 #      run's broadcasts, and records the book in the manifest (stackBook). P5 and P6 read only
 #      that book on --confirm (and check it whenever it is recorded).
+#   C9 one deployer: CEREMONY_DEPLOYER_ADDRESS (which the deploy scripts prefer), DEPLOYER and
+#      EMIT_DEPLOYER, when preset, must be DEPLOYER_ADDRESS byte for byte (an empty value, another
+#      address, case or spelling fails P0 before anything is sent); every phase then runs with
+#      CEREMONY_DEPLOYER_ADDRESS = DEPLOYER_ADDRESS. After a --confirm P2, the deployer-derived
+#      fee recipients (X402Facilitator.treasury, ModelMarketplace.treasuryAddress,
+#      ComputeMarketplace.treasury) of the contracts in the verified book are read from the
+#      chain and must be the book's deployer.
 #
 # Output books: P1/P3/P4 write governance.json, team-vesting.json and dormant-ledgers.json
 # into GENESIS_OUT_DIR, and P2/P4/P5 read them from the same place; every producer and
@@ -512,8 +519,31 @@ PY
   ) || gate_fail P2 "stack book: $why"
   log "P2 stack book = generator output for this run: $why"
   sb=$(stack_book_json "$book_abs") || gate_fail P2 "$ADDRESS_BOOK is not a well-formed address book"
+  check_fee_recipients
   why=$(manifest_bind bind "$RUN_MANIFEST" stackBook "$sb" 2>&1) || gate_fail P2 "cannot record the stack book: $why"
   rm -f "$check"
+}
+
+# C9: the fee recipients DeployAll derives from the deployer (treasury constructor arguments)
+# are read from the chain for every such contract the verified book lists, and must be the
+# book's deployer (= the run's, checked above), never a value only the environment supplied.
+FEE_RECIPIENT_GETTERS=("X402Facilitator:treasury" "ModelMarketplace:treasuryAddress" "ComputeMarketplace:treasury")
+check_fee_recipients() {
+  local e name fn a got seen=""
+  for e in "${FEE_RECIPIENT_GETTERS[@]}"; do
+    name="${e%%:*}" fn="${e#*:}"
+    a=$(book_addr "$book_abs" "$name") || continue
+    is_addr "$a" || gate_fail P2 "the book's $name ($a) is not an address"
+    got=$(cast_read "$a" "$fn()(address)") && is_addr "$got" || gate_fail P2 "cannot read $name.$fn() at $a"
+    [[ "$(lower "$got")" == "$RUN_DEPLOYER" ]] ||
+      gate_fail P2 "$name.$fn() is $(lower "$got"), not the book's deployer $RUN_DEPLOYER"
+    seen+="${seen:+, }$name"
+  done
+  if [[ -n "$seen" ]]; then
+    log "P2 fee recipients are the run's deployer: $seen"
+  else
+    log "P2 note: the book lists no contract with a deployer-derived fee recipient"
+  fi
 }
 
 log "mode=$MODE from=$FROM${ONLY:+ only=$ONLY} chain=$EXPECTED_CHAIN_ID"
@@ -585,6 +615,17 @@ if should P0 || [[ "$MODE" != dry ]]; then
   should P0 || log "P0 preflight (mandatory before a $MODE run that resumes at ${ONLY:-$FROM})"
   need_env DEPLOYER_ADDRESS GOV_OWNERS GOV_THRESHOLD GOV_MIN_DELAY GRD_OWNERS GRD_THRESHOLD GRD_MIN_DELAY
   is_addr "$DEPLOYER_ADDRESS" || gate_fail P0 "DEPLOYER_ADDRESS is malformed"
+  # C9: the deploy scripts read the deployer from CEREMONY_DEPLOYER_ADDRESS before
+  # DEPLOYER_ADDRESS (ScriptEnv), and the generator from EMIT_DEPLOYER/DEPLOYER. A preset alias
+  # must be DEPLOYER_ADDRESS byte for byte (not empty, not another case or spelling); then
+  # every phase gets DEPLOYER_ADDRESS, which the run manifest binds.
+  for v in CEREMONY_DEPLOYER_ADDRESS DEPLOYER EMIT_DEPLOYER; do
+    [[ -n "${!v+x}" ]] || continue
+    [[ -n "${!v}" ]] || gate_fail P0 "$v is set but empty; unset it: the ceremony sets every deployer input from DEPLOYER_ADDRESS"
+    [[ "${!v}" == "$DEPLOYER_ADDRESS" ]] ||
+      gate_fail P0 "$v is set to '${!v}', not exactly DEPLOYER_ADDRESS ($DEPLOYER_ADDRESS); unset it: the ceremony sets every deployer input from DEPLOYER_ADDRESS"
+  done
+  export CEREMONY_DEPLOYER_ADDRESS="$DEPLOYER_ADDRESS"
   check_council GOV $GOV_MIN_THRESHOLD $GOV_MIN_OWNERS $GOV_MIN_DELAY_SECS
   check_council GRD $GRD_MIN_THRESHOLD $GRD_MIN_OWNERS $GRD_MIN_DELAY_SECS
   ((GRD_MIN_DELAY < GOV_MIN_DELAY)) || gate_fail P0 "the GUARDIAN delay must be shorter than the GOVERNANCE delay, or a veto lands too late"

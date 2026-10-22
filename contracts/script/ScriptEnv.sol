@@ -8,15 +8,34 @@ import "forge-std/Script.sol";
 /// @dev Signing is provided by the forge CLI (`--account`, `--keystore`,
 ///      `--private-key`, etc). Scripts must never choose or embed a signer.
 abstract contract ScriptEnv is Script {
+    /// @notice The deployer the scripts derive parameters from (treasury and fee
+    ///         recipients, initial owners). Either input may name it; when both are
+    ///         set they must name the same address, and a set input that is empty,
+    ///         malformed or zero reverts instead of being skipped.
     function deployerAddress() internal view returns (address deployer) {
-        deployer = envAddressOr("CEREMONY_DEPLOYER_ADDRESS", address(0));
-        if (deployer == address(0)) {
-            deployer = envAddressOr("DEPLOYER_ADDRESS", address(0));
-        }
+        address ceremony = _deployerInput("CEREMONY_DEPLOYER_ADDRESS");
+        address plain = _deployerInput("DEPLOYER_ADDRESS");
+        require(
+            ceremony == address(0) || plain == address(0) || ceremony == plain,
+            "CEREMONY_DEPLOYER_ADDRESS and DEPLOYER_ADDRESS name different deployers"
+        );
+        deployer = ceremony != address(0) ? ceremony : plain;
         require(
             deployer != address(0),
             "set CEREMONY_DEPLOYER_ADDRESS or DEPLOYER_ADDRESS"
         );
+    }
+
+    /// @dev address(0) when `key` is unset; reverts when it is set but not a
+    ///      non-zero address.
+    function _deployerInput(string memory key) private view returns (address value) {
+        if (!vm.envExists(key)) return address(0);
+        try vm.envAddress(key) returns (address loaded) {
+            value = loaded;
+        } catch {
+            revert(string.concat(key, " is set but is not an address"));
+        }
+        require(value != address(0), string.concat(key, " is the zero address"));
     }
 
     function envAddressOr(string memory key, address fallbackValue)

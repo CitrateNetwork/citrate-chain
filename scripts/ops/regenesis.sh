@@ -68,7 +68,13 @@ command -v forge >/dev/null || die "forge not on PATH"
 command -v jq >/dev/null || die "jq is required"
 : "${RPC_URL:?set RPC_URL to the RPC of the re-rolled chain}"
 : "${DEPLOYER_ADDRESS:?set DEPLOYER_ADDRESS (the fresh ceremony deployer; scripts read it)}"
-export CEREMONY_DEPLOYER_ADDRESS="${CEREMONY_DEPLOYER_ADDRESS:-$DEPLOYER_ADDRESS}"
+# The deploy scripts read CEREMONY_DEPLOYER_ADDRESS before DEPLOYER_ADDRESS (ScriptEnv), and
+# derive constructor arguments (fee recipients) from it. A preset value that is not exactly
+# DEPLOYER_ADDRESS (another address, empty, another case) is refused, never silently used.
+if [[ -n "${CEREMONY_DEPLOYER_ADDRESS+x}" && "${CEREMONY_DEPLOYER_ADDRESS}" != "${DEPLOYER_ADDRESS}" ]]; then
+  die "CEREMONY_DEPLOYER_ADDRESS (${CEREMONY_DEPLOYER_ADDRESS:-<empty>}) is not exactly DEPLOYER_ADDRESS (${DEPLOYER_ADDRESS}); unset it or set it to the same value"
+fi
+export CEREMONY_DEPLOYER_ADDRESS="$DEPLOYER_ADDRESS"
 
 if [[ "$REROLL" == "1" ]]; then
   export CITRATE_REROLL=1
