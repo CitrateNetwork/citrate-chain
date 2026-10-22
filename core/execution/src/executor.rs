@@ -3845,6 +3845,30 @@ impl Executor {
     }
 
     /// Execute inference request
+    /// Move a model-access or provider fee inside a transaction.
+    ///
+    /// At/after `supply_hardening_height` the fee moves through the per-tx
+    /// journal ([`Self::journal_transfer`]), like every other value movement:
+    /// the payer debit and the credit commit together when the transaction
+    /// succeeds and are discarded together when it reverts. Below the height
+    /// the legacy direct state write is kept so historical blocks replay to
+    /// the roots they were produced with.
+    fn model_fee_transfer(
+        &self,
+        from: Address,
+        to: Address,
+        value: U256,
+        context: &mut ExecutionContext,
+    ) -> Result<(), ExecutionError> {
+        if crate::supply_hardening::supply_hardening_active(context.block_number) {
+            self.journal_transfer(from, to, value, context)
+        } else {
+            // LEGACY-PRE-SUPPLY-HARDENING
+            self.state_db.accounts.transfer(&from, &to, value)?;
+            Ok(())
+        }
+    }
+
     async fn execute_inference(
         &self,
         from: Address,
@@ -3899,14 +3923,10 @@ impl Executor {
                     .ok_or(ExecutionError::Overflow("treasury cut"))?;
                 // treasury_cut <= fee, so this cannot saturate.
                 let owner_cut = fee.saturating_sub(treasury_cut);
-                // Perform transfers
-                self.state_db
-                    .accounts
-                    .transfer(&from, &model.owner, owner_cut)?;
+                let owner = model.owner;
+                self.model_fee_transfer(from, owner, owner_cut, context)?;
                 if treasury_cut > U256::zero() {
-                    self.state_db
-                        .accounts
-                        .transfer(&from, &treasury_address, treasury_cut)?;
+                    self.model_fee_transfer(from, treasury_address, treasury_cut, context)?;
                 }
                 // Lifetime accumulator (CHAIN-B-B010 convention): saturate, never panic.
                 model.usage_stats.total_fees_earned =
@@ -3927,9 +3947,7 @@ impl Executor {
             }
             // Pay provider
             if provider_fee > U256::zero() {
-                self.state_db
-                    .accounts
-                    .transfer(&from, &provider_addr, provider_fee)?;
+                self.model_fee_transfer(from, provider_addr, provider_fee, context)?;
             }
             // Store proof artifact if provided
             if let Some(proof_bytes) = proof_bytes_opt {
