@@ -7,6 +7,7 @@ import "forge-std/Script.sol";
 
 contract DeployThing is Script {
     function run() external {
+        // artifacts land in broadcast/* — a glob in a line comment must not hide the code below
         require(block.chainid != 40204, "legacy script: not for 40204");
         bool live = block.chainid == 40204;
         if (40204 == block.chainid) {

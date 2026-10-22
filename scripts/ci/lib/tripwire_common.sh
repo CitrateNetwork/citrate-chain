@@ -133,3 +133,42 @@ tw_selftest_marked() {
   diff <(echo "$want") <(echo "$got") | sed 's/^</    missed:/; s/^>/    extra: /' | grep -E 'missed|extra'
   return 1
 }
+
+# tw_strip_c <file...> — C-family sources (Rust, Solidity, JS/TS) with comments removed and
+# string-literal contents blanked, one output line per input line: "path:line: code". A small
+# lexer, so a `/*` inside a `//` comment or a string, a `//` inside a string ("http://..."), or a
+# nested Rust block comment does not desynchronise it. Raw strings (r"..", r#".."#) and the
+# char literal '"' are recognised; other char literals and lifetimes pass through as code.
+tw_strip_c() {
+  perl -e '
+    for my $f (@ARGV) {
+      open(my $fh, "<", $f) or next; local $/; my $src = <$fh>; close $fh;
+      my ($out, $i, $n, $depth) = ("", 0, length $src, 0);
+      while ($i < $n) {
+        my $c = substr($src, $i, 1); my $two = substr($src, $i, 2);
+        if ($depth) {
+          if ($two eq "*/") { $depth--; $i += 2; $out .= "  "; next }
+          if ($two eq "/*") { $depth++; $i += 2; $out .= "  "; next }
+          $out .= $c eq "\n" ? "\n" : " "; $i++; next;
+        }
+        if ($two eq "//") { my $e = index($src, "\n", $i); $e = $n if $e < 0; $out .= " " x ($e - $i); $i = $e; next }
+        if ($two eq "/*") { $depth = 1; $i += 2; $out .= "  "; next }
+        if (substr($src, $i, 3) eq "\x27\"\x27") { $out .= "\x27\"\x27"; $i += 3; next }
+        if ($c eq "r" && substr($src, $i) =~ /^r(#*)"/ && ($i == 0 || substr($src, $i - 1, 1) !~ /\w/)) {
+          my $close = "\"" . $1; my $start = $i + 2 + length $1;
+          my $e = index($src, $close, $start); $e = $n - length($close) if $e < 0;
+          my $body = substr($src, $start, $e - $start); $body =~ s/[^\n]/ /g;
+          $out .= "r$1\"" . $body . $close; $i = $e + length $close; next;
+        }
+        if ($c eq "\"") {
+          my $j = $i + 1;
+          while ($j < $n) { my $d = substr($src, $j, 1); if ($d eq "\\") { $j += 2; next } last if $d eq "\""; $j++ }
+          my $body = substr($src, $i + 1, $j - $i - 1); $body =~ s/[^\n]/ /g;
+          $out .= "\"" . $body . "\""; $i = $j + 1; next;
+        }
+        $out .= $c; $i++;
+      }
+      my $ln = 0;
+      print "$f:", ++$ln, ": $_\n" for split /\n/, $out, -1;
+    }' "$@"
+}

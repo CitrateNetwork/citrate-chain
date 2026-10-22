@@ -19,7 +19,7 @@
 #                              ceremony fails at broadcast time after a green test run. Use the
 #                              configured deployer / the broadcaster instead.
 #
-# Comments (// and /* */) are stripped before matching. Scope: contracts/script/**/*.sol.
+# Comments (// and /* */) and string contents are stripped before matching (tw_strip_c). Scope: contracts/script/**/*.sol.
 #
 # Usage: forge_script_tripwire.sh              # scan the tree
 #        forge_script_tripwire.sh --self-test  # prove both fences still detect their class
@@ -37,16 +37,7 @@ script_files() { tw_files "$1" | grep -E '^contracts/script/.*\.sol$' || true; }
 
 # Comment-stripped source, one output line per input line: "path:line: code".
 strip_comments() { # <root>
-  (cd "$1" && script_files . | xargs -r -d '\n' perl -ne '
-    if ($. == 1) { $inblk = 0 }
-    my $l = $_; chomp $l;
-    if ($inblk) { if ($l =~ s{^.*?\*/}{}) { $inblk = 0 } else { $l = "" } }
-    $l =~ s{/\*.*?\*/}{}g;
-    if ($l =~ s{/\*.*$}{}) { $inblk = 1 }
-    $l =~ s{//.*$}{};
-    $l =~ s{"(?:[^"\\]|\\.)*"}{""}g;
-    print "$ARGV:$.: $l\n";
-    close ARGV if eof;') || true
+  (cd "$1" && script_files . | xargs -r -d '\n' bash -c '. "$0"; tw_strip_c "$@"' "$HERE/lib/tripwire_common.sh") || true
 }
 
 scan_chainid() { # <root>
