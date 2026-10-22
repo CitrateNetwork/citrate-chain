@@ -513,8 +513,8 @@ fn getlogs_after_deep_replacement_at_a_higher_tip() {
     deep_replacement_serves_the_new_chain(7);
 }
 
-/// The index level: checkpoints survive a tip that extends the anchor, and are
-/// dropped by one that does not.
+/// The index level: checkpoints survive a tip that extends the anchor; a
+/// replacement serves the new chain above its fork.
 #[test]
 fn executed_chain_index_keeps_checkpoints_only_on_extension() {
     let (storage, _tmp) = storage();

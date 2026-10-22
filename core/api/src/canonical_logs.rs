@@ -39,24 +39,29 @@
 //
 // So every checkpoint is tied to verified ancestry. The cache records the
 // applied tip (`anchor`) the checkpoints were collected under; every checkpoint
-// is an ancestor of it. On each call, before any checkpoint is used, the new
-// applied tip is checked to EXTEND the anchor: the resolver walks the new tip's
-// selected-parent chain down to the anchor's height and compares hashes. A match
-// means the chain only grew, so every checkpoint is still an ancestor of the new
-// tip, and the anchor moves up. Anything else — a different block at the anchor
-// height (chain replaced, at any depth), a lower tip, a broken walk, or a gap
-// wider than `MAX_ANCHOR_WALK` — drops every checkpoint. The verification walk
-// costs one header per block the tip advanced since the previous call, so it is
-// amortised over chain growth.
+// is an ancestor of it. On each call, before any checkpoint is used, the
+// resolver finds the highest block shared by the anchor's and the new tip's
+// selected-parent chains, walking the higher side down one header at a time.
+// Both chains agree at and below that block, so checkpoints at or below its
+// height stay and the ones above it are dropped; the anchor then moves to the
+// new tip. A tip that extends the anchor shares the anchor itself, and an older
+// tip on the anchor's chain (a request that read the tip before a concurrent
+// commit, or a rollback) shares itself; checkpoints are always settled below
+// either, so neither drops anything. A reorg drops only the checkpoints above
+// its fork. A broken walk, or tips or a fork more than `MAX_ANCHOR_WALK` away,
+// drops every checkpoint. The walk costs one header per block between the two
+// tips and the fork, so it is amortised over chain growth.
 //
-// A walk runs outside the cache lock, so the tip usually advances while it runs
-// (other requests re-anchor). Its checkpoints are ancestors of the tip it started
-// from; they stay valid for every later anchor reached through verified
-// extensions. `generation` counts the times the checkpoints were dropped (any
-// other re-anchor outcome, or a purge). A walk publishes what it found only when
-// the generation is unchanged since it started: the anchor may have moved, but
-// only along verified extensions of the walk's start tip. Gating on the anchor
-// itself would throw cold-fill progress away whenever the tip advances.
+// A walk runs outside the cache lock, so the anchor usually moves while it
+// runs (other requests re-anchor). Its checkpoints are ancestors of the tip it
+// started from, which was the anchor at that moment. `generation` changes
+// whenever a re-anchor may have dropped one of them: a walk only finds heights
+// up to `high_water - SETTLED_DEPTH` (`high_water` = the highest anchor of the
+// generation), so a fork at or above that height cannot touch them, and a
+// lower fork, a full drop or a purge starts a new generation. A walk publishes
+// what it found only when the generation is unchanged since it started.
+// Gating on the anchor itself would throw cold-fill progress away whenever the
+// tip moves.
 //
 // MISSING ANCESTORS: ERROR WINS
 //
@@ -147,59 +152,108 @@ struct CacheState {
     checkpoints: BTreeMap<u64, Hash>,
     /// The applied tip the checkpoints were verified against.
     anchor: Option<(Hash, u64)>,
-    /// Bumped every time `checkpoints` is dropped. Unchanged between two points
-    /// in time means every anchor move in between was a verified extension.
+    /// Bumped every time checkpoints a walk in flight may hold are invalidated.
+    /// Unchanged between two points in time means every entry a walk found in
+    /// between is still on the anchor's chain.
     generation: u64,
+    /// Highest anchor height since `generation` last changed. Every walk of
+    /// this generation started at a tip at most this high, so every checkpoint
+    /// it can find is at most `high_water - SETTLED_DEPTH`.
+    high_water: u64,
 }
 
 impl CacheState {
-    /// Re-anchor the cache on the current applied tip, keeping the checkpoints
-    /// only when the tip provably extends the previous anchor.
+    /// Re-anchor the cache on the current applied tip. Checkpoints at or below
+    /// the highest block the old anchor and the new tip share stay (they are on
+    /// both chains); the rest are dropped. A tip that extends the anchor, or an
+    /// older tip on the anchor's chain (a request that read the tip before a
+    /// concurrent commit), shares everything below it, so nothing is dropped.
     fn reanchor(&mut self, storage: &StorageManager, tip_hash: Hash, tip_height: u64) {
-        let keep = match self.anchor {
+        match self.anchor {
             Some((hash, height)) if hash == tip_hash && height == tip_height => return,
             Some((hash, height)) => {
-                tip_height >= height
-                    && tip_height.saturating_sub(height) <= MAX_ANCHOR_WALK
-                    && hash_at_height(storage, tip_hash, tip_height, height) == Some(hash)
+                match common_ancestor(storage, hash, height, tip_hash, tip_height) {
+                    // The anchor is an ancestor of the tip: a pure extension.
+                    Some((shared_hash, _)) if shared_hash == hash => {}
+                    Some((_, shared)) => {
+                        // Keep `..=shared`. Walks in flight found heights of at most
+                        // `high_water - SETTLED_DEPTH`; only when that is above the
+                        // shared height can they hold an entry of the old branch.
+                        let _dropped = self.checkpoints.split_off(&shared.saturating_add(1));
+                        if shared < self.high_water.saturating_sub(SETTLED_DEPTH) {
+                            self.bump_generation(tip_height);
+                        }
+                    }
+                    None => self.drop_checkpoints(tip_height),
+                }
             }
-            None => false,
-        };
-        if !keep {
-            self.drop_checkpoints();
+            None => self.drop_checkpoints(tip_height),
         }
         self.anchor = Some((tip_hash, tip_height));
+        self.high_water = self.high_water.max(tip_height);
     }
 
     /// Forget every checkpoint and start a new generation, so walks that began
     /// under the old one do not publish into the new one.
-    fn drop_checkpoints(&mut self) {
+    fn drop_checkpoints(&mut self, tip_height: u64) {
         self.checkpoints.clear();
+        self.bump_generation(tip_height);
+    }
+
+    fn bump_generation(&mut self, tip_height: u64) {
         self.generation = self.generation.wrapping_add(1);
+        self.high_water = tip_height;
     }
 }
 
-/// The hash at `target` on the selected-parent chain of `(start, start_height)`,
-/// or `None` when the chain cannot be followed (missing or malformed header).
-fn hash_at_height(
+/// The highest block on both selected-parent chains, as `(hash, height)`, or
+/// `None` when a chain cannot be followed (missing or malformed header), the
+/// tips are more than [`MAX_ANCHOR_WALK`] apart, or finding the shared block
+/// takes more than [`MAX_ANCHOR_WALK`] header reads.
+fn common_ancestor(
     storage: &StorageManager,
-    start: Hash,
-    start_height: u64,
-    target: u64,
-) -> Option<Hash> {
-    let mut cursor = start;
-    let mut expect_at_most = start_height;
+    a: Hash,
+    a_height: u64,
+    b: Hash,
+    b_height: u64,
+) -> Option<(Hash, u64)> {
+    if a_height.abs_diff(b_height) > MAX_ANCHOR_WALK {
+        return None;
+    }
+    let header_height = |hash: &Hash| -> Option<(u64, Hash)> {
+        let header = storage.blocks.get_header(hash).ok().flatten()?;
+        Some((header.height, header.selected_parent_hash))
+    };
+    let (mut a, mut b) = (a, b);
+    let (mut ah, mut a_parent) = header_height(&a)?;
+    let (mut bh, mut b_parent) = header_height(&b)?;
+    let mut reads: u64 = 2;
     loop {
-        let header = storage.blocks.get_header(&cursor).ok().flatten()?;
-        let h = header.height;
-        if h > expect_at_most || h < target {
+        if a == b {
+            return (ah == bh).then_some((a, ah));
+        }
+        if reads >= MAX_ANCHOR_WALK {
             return None;
         }
-        if h == target {
-            return Some(cursor);
+        reads = reads.saturating_add(1);
+        // Step the higher side (either on a tie) to its selected parent;
+        // heights must strictly decrease along a chain.
+        if ah >= bh {
+            if ah == 0 {
+                return None;
+            }
+            let (h, p) = header_height(&a_parent)?;
+            if h >= ah {
+                return None;
+            }
+            (a, ah, a_parent) = (a_parent, h, p);
+        } else {
+            let (h, p) = header_height(&b_parent)?;
+            if h >= bh {
+                return None;
+            }
+            (b, bh, b_parent) = (b_parent, h, p);
         }
-        expect_at_most = h.saturating_sub(1);
-        cursor = header.selected_parent_hash;
     }
 }
 
@@ -335,7 +389,7 @@ impl ExecutedChainIndex {
                 Some(_) => {
                     // A checkpoint whose block is gone: the store changed under
                     // us (purge). Start over from the tip.
-                    st.drop_checkpoints();
+                    st.drop_checkpoints(tip_height);
                     (tip_hash, tip_height)
                 }
                 None => (tip_hash, tip_height),
