@@ -8,6 +8,7 @@ import {CheckDeployedAdmins} from "../../script/CheckDeployedAdmins.s.sol";
 import {MultisigProposer} from "../../src/genesis/MultisigProposer.sol";
 import {AdminChecks} from "../../script/lib/AdminChecks.sol";
 import {RoleLogArchive, GateWithHistory} from "./RoleHistoryHarness.sol";
+import {GovernanceWithNode, GateWithNode} from "./NodeChainIdHarness.sol";
 
 contract GovAdminChecksHarness is AdminChecks {
     function deployerProblem(address target, address deployer) external view returns (string memory) {
@@ -335,5 +336,301 @@ contract GenesisAdminGateTest is Test {
         CheckDeployedAdmins c2 = new CheckDeployedAdmins();
         vm.expectRevert(bytes("CheckDeployedAdmins: extra address book names a different deployer"));
         c2.checkAll(_book(""), extras, false);
+    }
+}
+
+/// Genesis profile (chain 40204, as the node reports it): the GOVERNANCE floors (minDelay >= 48 h,
+/// multisig m >= 3 of n >= 5) hold at BOTH entry points: DeployGenesisGovernance refuses a weak
+/// council before it broadcasts, and CheckDeployedAdmins re-reads them from chain. GUARDIAN keeps
+/// its 1 h floor; rehearsal chains keep their 1 h / 1-of-1 minimums.
+contract GenesisGovernanceFloorTest is Test {
+    address constant SENDER = 0x1804c8AB1F12E6bbf3894d4083f33e07309d1f38; // forge default sender
+    address constant P256_VERIFIER = 0xc2b78104907F722DABAc4C69f826a522B2754De4;
+    string constant GATE_FLOOR = "CheckDeployedAdmins: genesis governance floor not met (see log)";
+
+    RoleLogArchive archive;
+
+    function setUp() public {
+        vm.recordLogs(); // the gate replays the timelocks' role history (RoleHistoryHarness)
+        archive = new RoleLogArchive();
+        vm.etch(P256_VERIFIER, hex"600160005260206000f3");
+    }
+
+    function _council(uint256 base, uint256 n, uint256 m, uint256 delay)
+        internal
+        pure
+        returns (DeployGenesisGovernance.Council memory c)
+    {
+        c.owners = new address[](n);
+        for (uint256 i = 0; i < n; i++) {
+            c.owners[i] = address(uint160(base + i));
+        }
+        c.threshold = m;
+        c.minDelay = delay;
+    }
+
+    function _gov() internal pure returns (DeployGenesisGovernance.Council memory) {
+        return _council(0xA000, 5, 3, 48 hours);
+    }
+
+    function _grd() internal pure returns (DeployGenesisGovernance.Council memory) {
+        return _council(0xB000, 3, 2, 1 hours);
+    }
+
+    function _deploy(DeployGenesisGovernance.Council memory gov, DeployGenesisGovernance.Council memory grd)
+        internal
+        returns (GovernanceWithNode s, DeployGenesisGovernance.Deployed memory d)
+    {
+        s = new GovernanceWithNode();
+        d = s.deployWith(SENDER, gov, grd, false);
+    }
+
+    function _gate() internal returns (GateWithNode g) {
+        g = new GateWithNode();
+        g.useArchive(archive);
+    }
+
+    function _expectDeployRefused(DeployGenesisGovernance.Council memory gov, bytes memory reason) internal {
+        GovernanceWithNode s = new GovernanceWithNode();
+        uint64 nonceBefore = vm.getNonce(SENDER);
+        vm.expectRevert(reason);
+        s.deployWith(SENDER, gov, _grd(), false);
+        assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
+    }
+
+    // ---- deploy entry point (before anything is broadcast) ----
+
+    function test_genesis_deploy_refuses_governance_delay_below_48h() public {
+        vm.chainId(40204);
+        DeployGenesisGovernance.Council memory gov = _gov();
+        gov.minDelay = 48 hours - 1;
+        _expectDeployRefused(gov, bytes("GOVERNANCE: minDelay below the 48 h genesis floor"));
+        gov.minDelay = 1 hours;
+        _expectDeployRefused(gov, bytes("GOVERNANCE: minDelay below the 48 h genesis floor"));
+    }
+
+    function test_genesis_deploy_refuses_single_key_governance() public {
+        vm.chainId(40204);
+        _expectDeployRefused(
+            _council(0xA000, 1, 1, 1 hours), bytes("GOVERNANCE: multisig below the 3-of-5 genesis floor")
+        );
+        _expectDeployRefused(
+            _council(0xA000, 1, 1, 48 hours), bytes("GOVERNANCE: multisig below the 3-of-5 genesis floor")
+        );
+    }
+
+    function test_genesis_deploy_refuses_weak_quorum() public {
+        vm.chainId(40204);
+        // 2-of-5: enough owners, too low a threshold.
+        _expectDeployRefused(
+            _council(0xA000, 5, 2, 48 hours), bytes("GOVERNANCE: multisig below the 3-of-5 genesis floor")
+        );
+        // 3-of-4: the threshold, too few owners.
+        _expectDeployRefused(
+            _council(0xA000, 4, 3, 48 hours), bytes("GOVERNANCE: multisig below the 3-of-5 genesis floor")
+        );
+    }
+
+    /// The node, not forge's simulated id, selects the profile: a weak council against a 40204
+    /// node is refused on the chain id before the floors are even reached.
+    function test_genesis_deploy_weak_council_cannot_dodge_by_chain_id() public {
+        GovernanceWithNode s = new GovernanceWithNode();
+        s.nodeReports(40204);
+        vm.chainId(1);
+        vm.expectRevert(
+            bytes(
+                "chain id mismatch: node reports 40204, forge simulates 1 (drop --chain-id / --chain / FOUNDRY_CHAIN_ID)"
+            )
+        );
+        s.deployWith(SENDER, _council(0xA000, 1, 1, 1 hours), _grd(), false);
+    }
+
+    function test_genesis_deploy_accepts_floor_councils_and_guardian_at_1h() public {
+        vm.chainId(40204);
+        (, DeployGenesisGovernance.Deployed memory d) = _deploy(_gov(), _grd());
+        assertEq(TimelockController(payable(d.governanceTimelock)).getMinDelay(), 48 hours);
+        assertEq(TimelockController(payable(d.guardianTimelock)).getMinDelay(), 1 hours);
+        assertEq(MultisigProposer(d.governanceMultisig).threshold(), 3);
+    }
+
+    function test_rehearsal_deploy_keeps_its_minimums() public {
+        (, DeployGenesisGovernance.Deployed memory d) = _deploy(_council(0xA000, 1, 1, 1 hours), _grd());
+        assertEq(MultisigProposer(d.governanceMultisig).threshold(), 1);
+        assertEq(TimelockController(payable(d.governanceTimelock)).getMinDelay(), 1 hours);
+    }
+
+    // ---- admin gate entry point (re-read from chain) ----
+
+    /// A council deployed off the genesis profile, then presented to the gate on a 40204 node.
+    function _gateRefusesOnGenesis(DeployGenesisGovernance.Council memory gov) internal {
+        (GovernanceWithNode s, DeployGenesisGovernance.Deployed memory d) = _deploy(gov, _grd());
+        string memory book = s.bookJson(SENDER, d, gov, _grd());
+        _gate().check(book, true); // rehearsal: passes
+        vm.chainId(40204);
+        GateWithNode g = _gate();
+        vm.expectRevert(bytes(GATE_FLOOR));
+        g.check(book, true);
+    }
+
+    function test_genesis_gate_refuses_governance_delay_below_48h() public {
+        _gateRefusesOnGenesis(_council(0xA000, 5, 3, 1 hours));
+    }
+
+    function test_genesis_gate_refuses_single_key_governance() public {
+        _gateRefusesOnGenesis(_council(0xA000, 1, 1, 1 hours));
+    }
+
+    function test_genesis_gate_refuses_weak_quorum() public {
+        _gateRefusesOnGenesis(_council(0xA000, 5, 2, 48 hours));
+    }
+
+    function test_genesis_gate_refuses_too_few_owners() public {
+        _gateRefusesOnGenesis(_council(0xA000, 4, 3, 48 hours));
+    }
+
+    /// A council that met the floors at genesis and later lowered its own delay fails the gate.
+    function test_genesis_gate_refuses_governance_delay_lowered_after_deploy() public {
+        vm.chainId(40204);
+        (GovernanceWithNode s, DeployGenesisGovernance.Deployed memory d) = _deploy(_gov(), _grd());
+        string memory book = s.bookJson(SENDER, d, _gov(), _grd());
+        _gate().check(book, true);
+
+        TimelockController tl = TimelockController(payable(d.governanceTimelock));
+        MultisigProposer ms = MultisigProposer(d.governanceMultisig);
+        bytes memory payload = abi.encodeCall(tl.updateDelay, (1 hours));
+        _passed(ms, abi.encodeCall(tl.schedule, (address(tl), 0, payload, bytes32(0), 0, 48 hours)));
+        vm.warp(block.timestamp + 48 hours);
+        _passed(ms, abi.encodeCall(tl.execute, (address(tl), 0, payload, bytes32(0), 0)));
+        assertEq(tl.getMinDelay(), 1 hours);
+
+        GateWithNode g = _gate();
+        vm.expectRevert(bytes(GATE_FLOOR));
+        g.check(book, true);
+    }
+
+    function test_genesis_gate_passes_floor_councils() public {
+        vm.chainId(40204);
+        (GovernanceWithNode s, DeployGenesisGovernance.Deployed memory d) = _deploy(_gov(), _grd());
+        GateWithNode g = _gate();
+        g.check(s.bookJson(SENDER, d, _gov(), _grd()), true);
+        assertEq(g.timelockHolders(), 0);
+    }
+
+    /// GUARDIAN lowers its own delay through its 2-of-3 council after a valid genesis deploy.
+    function _guardianLowersDelay(DeployGenesisGovernance.Deployed memory d, uint256 to) internal {
+        TimelockController tl = TimelockController(payable(d.guardianTimelock));
+        MultisigProposer ms = MultisigProposer(d.guardianMultisig);
+        uint256 delay = tl.getMinDelay();
+        bytes memory payload = abi.encodeCall(tl.updateDelay, (to));
+        _passedBy(ms, _grd().owners, abi.encodeCall(tl.schedule, (address(tl), 0, payload, bytes32(0), 0, delay)));
+        vm.warp(block.timestamp + delay);
+        _passedBy(ms, _grd().owners, abi.encodeCall(tl.execute, (address(tl), 0, payload, bytes32(0), 0)));
+        assertEq(tl.getMinDelay(), to);
+    }
+
+    /// A valid genesis deployment whose GUARDIAN later sets its delay to zero fails the gate.
+    function test_genesis_gate_refuses_guardian_delay_lowered_to_zero() public {
+        vm.chainId(40204);
+        (GovernanceWithNode s, DeployGenesisGovernance.Deployed memory d) = _deploy(_gov(), _grd());
+        string memory book = s.bookJson(SENDER, d, _gov(), _grd());
+        _gate().check(book, true);
+        _guardianLowersDelay(d, 0);
+        GateWithNode g = _gate();
+        vm.expectRevert(bytes(GATE_FLOOR));
+        g.check(book, true);
+    }
+
+    /// Boundary: a GUARDIAN delay of exactly 1 h passes the gate, 1 h - 1 s does not.
+    function test_genesis_gate_guardian_delay_boundary() public {
+        vm.chainId(40204);
+        DeployGenesisGovernance.Council memory grd = _grd();
+        grd.minDelay = 2 hours;
+        (GovernanceWithNode s, DeployGenesisGovernance.Deployed memory d) = _deploy(_gov(), grd);
+        string memory book = s.bookJson(SENDER, d, _gov(), grd);
+        _guardianLowersDelay(d, 1 hours);
+        GateWithNode ok = _gate();
+        ok.check(book, true); // exactly 1 h meets the floor (check reverts otherwise)
+        _guardianLowersDelay(d, 1 hours - 1);
+        GateWithNode g = _gate();
+        vm.expectRevert(bytes(GATE_FLOOR));
+        g.check(book, true);
+    }
+
+    /// Boundary at the gate: GOVERNANCE at exactly 48 h passes, 48 h - 1 s is refused.
+    function test_genesis_gate_governance_delay_boundary() public {
+        _gateRefusesOnGenesis(_council(0xA000, 5, 3, 48 hours - 1));
+        vm.chainId(31337);
+        DeployGenesisGovernance.Council memory gov = _council(0xC000, 5, 3, 48 hours);
+        DeployGenesisGovernance.Council memory grd = _council(0xD000, 3, 2, 3 hours);
+        (GovernanceWithNode s, DeployGenesisGovernance.Deployed memory d) = _deploy(gov, grd);
+        string memory book = s.bookJson(SENDER, d, gov, grd);
+        vm.chainId(40204);
+        GateWithNode g = _gate();
+        g.check(book, true);
+    }
+
+    /// A book that lists a council timelock without its multisig cannot skip the floor check.
+    function test_genesis_gate_refuses_timelock_listed_without_its_multisig() public {
+        vm.chainId(40204);
+        (, DeployGenesisGovernance.Deployed memory d) = _deploy(_gov(), _grd());
+        string memory book = string.concat(
+            '{"deployer":"',
+            vm.toString(SENDER),
+            '","contracts":{"GovernanceTimelock":"',
+            vm.toString(d.governanceTimelock),
+            '"},"aaStack":{}}'
+        );
+        GateWithNode g = _gate();
+        vm.expectRevert(bytes(GATE_FLOOR));
+        g.check(book, true);
+    }
+
+    /// The gate on 40204 with no node to ask fails closed (it never falls back to rehearsal).
+    function test_genesis_gate_without_a_node_fails_closed() public {
+        vm.chainId(40204);
+        (GovernanceWithNode s, DeployGenesisGovernance.Deployed memory d) = _deploy(_gov(), _grd());
+        string memory book = s.bookJson(SENDER, d, _gov(), _grd());
+        GateWithNode g = _gate();
+        g.noNode();
+        vm.expectRevert(bytes("genesis profile needs a live node: run with --rpc-url (eth_chainId unavailable)"));
+        g.check(book, true);
+    }
+
+    /// Fuzz the deploy entry point over every legal council shape: on 40204 GOVERNANCE deploys
+    /// iff m >= 3, n >= 5 and minDelay >= 48 h; otherwise nothing is broadcast.
+    function testFuzz_genesis_deploy_governance_floor(uint8 nSeed, uint8 mSeed, uint32 delaySeed) public {
+        vm.chainId(40204);
+        uint256 n = bound(nSeed, 1, 10);
+        uint256 m = bound(mSeed, 1, n);
+        uint256 delay = bound(delaySeed, 1 hours + 1, 96 hours);
+        DeployGenesisGovernance.Council memory gov = _council(0xA000, n, m, delay);
+        GovernanceWithNode s = new GovernanceWithNode();
+        uint64 nonceBefore = vm.getNonce(SENDER);
+        bool ok = m >= 3 && n >= 5 && delay >= 48 hours;
+        if (!ok) {
+            vm.expectRevert();
+            s.deployWith(SENDER, gov, _grd(), false);
+            assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
+        } else {
+            DeployGenesisGovernance.Deployed memory d = s.deployWith(SENDER, gov, _grd(), false);
+            assertEq(TimelockController(payable(d.governanceTimelock)).getMinDelay(), delay);
+            assertEq(MultisigProposer(d.governanceMultisig).threshold(), m);
+        }
+    }
+
+    function _passed(MultisigProposer ms, bytes memory data) internal {
+        _passedBy(ms, _gov().owners, data);
+    }
+
+    function _passedBy(MultisigProposer ms, address[] memory o, bytes memory data) internal {
+        uint256 m = ms.threshold();
+        vm.prank(o[0]);
+        bytes32 id = ms.propose(data);
+        for (uint256 i = 1; i < m; i++) {
+            vm.prank(o[i]);
+            ms.approve(id);
+        }
+        vm.prank(o[0]);
+        ms.execute(id);
     }
 }
