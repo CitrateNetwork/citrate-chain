@@ -42,6 +42,13 @@ import {P256} from "../src/aa/lib/webauthn/P256.sol";
 ///         timelock and its reported owners / threshold, at its CREATE2 address under the salt
 ///         "Genesis.<P>Multisig" (AdminChecks `_multisigProposerProblem`). GATE: must be 0.
 ///
+///         GENESIS-FLOOR (chain 40204, as reported by the node; GenesisProfile): every book's
+///         C4 genesis councils are re-checked ON CHAIN, from the deployed contracts and not from
+///         the book's params (GenesisProfile `_councilFloorProblem`): GovernanceTimelock minDelay
+///         >= 48 h and GovernanceMultisig >= 3-of-5, GuardianTimelock minDelay >= 1 h, each
+///         multisig fronting its own timelock. A timelock listed without its multisig fails.
+///         Without a node the 40204 gate fails closed. GATE: must be 0.
+///
 ///         Expected on the 2026-09-24 deployment (a fork of 40204): 22
 ///         FACTORY-ADMIN (21 admin slots + X402Paywall.provider), VERIFIER
 ///         missing, ~20 NO-CODE -> FAIL. After the PBA-L2-002 redeploy and
@@ -52,6 +59,7 @@ contract CheckDeployedAdmins is GenesisProfile {
     uint256 public deployerAdmin;
     uint256 public noCode;
     uint256 public timelockHolders;
+    uint256 public genesisFloor;
     bool public verifierMissing;
 
     function run() external {
@@ -76,17 +84,19 @@ contract CheckDeployedAdmins is GenesisProfile {
     ///         Env: EXTRA_ADDRESS_BOOKS=path1,path2. Each extra must name the same
     ///         `.deployer` as the main book, so the DEPLOYER-ADMIN class covers them too.
     function checkAll(string memory json, string[] memory extras, bool requireAllCode) public {
-        // A simulated chain id that differs from the node's reverts (GenesisProfile).
-        _resolveChainProfile(false);
+        // The node decides whether the genesis floors apply; a simulated id that differs reverts.
+        bool genesis = _resolveChainProfile(false).genesis;
         address deployer = vm.parseJsonAddress(json, ".deployer");
         _sweep(json, ".contracts", deployer);
         _sweep(json, ".aaStack", deployer);
+        if (genesis) _genesisFloorSweep(json);
         for (uint256 i = 0; i < extras.length; i++) {
             require(
                 vm.parseJsonAddress(extras[i], ".deployer") == deployer,
                 "CheckDeployedAdmins: extra address book names a different deployer"
             );
             _sweep(extras[i], ".contracts", deployer);
+            if (genesis) _genesisFloorSweep(extras[i]);
         }
         verifierMissing = P256.VERIFIER.code.length == 0;
         if (verifierMissing) console.log("VERIFIER missing: no code at", P256.VERIFIER);
@@ -95,13 +105,49 @@ contract CheckDeployedAdmins is GenesisProfile {
         console.log("NO-CODE entries (reported):", noCode);
         console.log("VERIFIER present:", !verifierMissing);
         console.log("TIMELOCK-HOLDERS failures:", timelockHolders);
+        console.log("GENESIS-FLOOR failures:", genesisFloor);
         require(factoryAdmin == 0, "CheckDeployedAdmins: CREATE2 factory holds an admin slot (see log)");
         require(deployerAdmin == 0, "CheckDeployedAdmins: deployer EOA holds governance/owner/DEFAULT_ADMIN (see log)");
         require(!verifierMissing, "CheckDeployedAdmins: P-256 verifier not provisioned");
+        require(genesisFloor == 0, "CheckDeployedAdmins: genesis governance floor not met (see log)");
         require(
             timelockHolders == 0, "CheckDeployedAdmins: a timelock's role holders are not exactly its council (see log)"
         );
         if (requireAllCode) require(noCode == 0, "CheckDeployedAdmins: address-book entries without code");
+    }
+
+    /// @notice GENESIS-FLOOR over one book: the councils it lists, read from chain.
+    function _genesisFloorSweep(string memory json) internal {
+        (bool hasGovTl, address govTl) = _entry(json, "GovernanceTimelock");
+        (bool hasGovMs, address govMs) = _entry(json, "GovernanceMultisig");
+        (bool hasGrdTl, address grdTl) = _entry(json, "GuardianTimelock");
+        (bool hasGrdMs, address grdMs) = _entry(json, "GuardianMultisig");
+        if (hasGovTl || hasGovMs) {
+            if (!(hasGovTl && hasGovMs)) {
+                _floorFail("GovernanceTimelock and GovernanceMultisig must be listed together");
+            } else {
+                _floorCheck(_councilFloorProblem("GOVERNANCE", govTl, govMs, true));
+            }
+        }
+        if (hasGrdTl || hasGrdMs) {
+            if (!(hasGrdTl && hasGrdMs)) _floorFail("GuardianTimelock and GuardianMultisig must be listed together");
+            else _floorCheck(_councilFloorProblem("GUARDIAN", grdTl, grdMs, false));
+        }
+    }
+
+    function _entry(string memory json, string memory name) internal view returns (bool, address) {
+        string memory key = string.concat(".contracts.", name);
+        if (!vm.keyExistsJson(json, key)) return (false, address(0));
+        return (true, vm.parseJsonAddress(json, key));
+    }
+
+    function _floorCheck(string memory problem) internal {
+        if (bytes(problem).length != 0) _floorFail(problem);
+    }
+
+    function _floorFail(string memory problem) internal {
+        console.log(string.concat("GENESIS-FLOOR ", problem));
+        genesisFloor++;
     }
 
     function _sweep(string memory json, string memory section, address deployer) internal {

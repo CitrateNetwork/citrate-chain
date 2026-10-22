@@ -46,6 +46,11 @@ import {MultisigProposer} from "../src/genesis/MultisigProposer.sol";
 ///         Chain id (GenesisProfile): the node's eth_chainId must equal forge's simulated
 ///         chain id, or the run reverts before broadcasting; on 40204 a node is required.
 ///
+///         Genesis floors (chain 40204 as the node reports it): GOVERNANCE m >= 3 of n >= 5 and
+///         minDelay >= 48 h, refused before broadcasting (`_requireGenesisGovernance`) and
+///         re-read from chain after it (`_requireCouncilFloor`, the same check the
+///         CheckDeployedAdmins GENESIS-FLOOR class applies). Rehearsal chains keep the minimums above.
+///
 ///         Dry run:  forge script script/DeployGenesisGovernance.s.sol --rpc-url <rpc>
 ///         Then:     ADDRESS_BOOK=genesis/governance.json forge script script/CheckDeployedAdmins.s.sol --rpc-url <rpc>
 contract DeployGenesisGovernance is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook, GenesisProfile {
@@ -89,9 +94,10 @@ contract DeployGenesisGovernance is ScriptEnv, AdminChecks, Create2Deploy, Genes
         require(deployer != address(0), "deployer must be set");
         // Node chain id vs simulated chain id, before anything else (GenesisProfile): the book
         // records block.chainid, so a --chain-id / --chain / FOUNDRY_CHAIN_ID override is refused.
-        _resolveChainProfile(false);
+        bool genesis = _resolveChainProfile(false).genesis;
         _validate("GOVERNANCE", gov, deployer);
         _validate("GUARDIAN", grd, deployer);
+        if (genesis) _requireGenesisGovernance(gov);
         if (!allowShared) {
             for (uint256 i = 0; i < gov.owners.length; i++) {
                 for (uint256 j = 0; j < grd.owners.length; j++) {
@@ -114,6 +120,11 @@ contract DeployGenesisGovernance is ScriptEnv, AdminChecks, Create2Deploy, Genes
 
         _assertCouncil("GOVERNANCE", d.governanceTimelock, d.governanceMultisig, gov, deployer);
         _assertCouncil("GUARDIAN", d.guardianTimelock, d.guardianMultisig, grd, deployer);
+        if (genesis) {
+            // The same on-chain floors CheckDeployedAdmins applies on 40204 (GENESIS-FLOOR).
+            _requireCouncilFloor("GOVERNANCE", d.governanceTimelock, d.governanceMultisig, true);
+            _requireCouncilFloor("GUARDIAN", d.guardianTimelock, d.guardianMultisig, false);
+        }
         _assertNoDeployerAdmin("GOVERNANCE", d.governanceTimelock, broadcaster);
         _assertNoDeployerAdmin("GOVERNANCE", d.governanceMultisig, broadcaster);
         _assertNoDeployerAdmin("GUARDIAN", d.guardianTimelock, broadcaster);
@@ -172,6 +183,17 @@ contract DeployGenesisGovernance is ScriptEnv, AdminChecks, Create2Deploy, Genes
                 require(c.owners[i] != c.owners[j], string.concat(name, ": duplicate owner"));
             }
         }
+    }
+
+    /// @notice Genesis profile (chain 40204 as the node reports it): GOVERNANCE must meet the
+    ///         genesis floors before anything is broadcast: m >= 3 of n >= 5, minDelay >= 48 h.
+    ///         GUARDIAN keeps the 1 h floor `_validate` applies on every profile.
+    function _requireGenesisGovernance(Council memory gov) internal pure {
+        require(
+            gov.threshold >= GENESIS_GOV_MIN_THRESHOLD && gov.owners.length >= GENESIS_GOV_MIN_OWNERS,
+            "GOVERNANCE: multisig below the 3-of-5 genesis floor"
+        );
+        require(gov.minDelay >= GENESIS_GOV_MIN_DELAY, "GOVERNANCE: minDelay below the 48 h genesis floor");
     }
 
     function _requireNotOwner(string memory name, Council memory c, address broadcaster) internal pure {
