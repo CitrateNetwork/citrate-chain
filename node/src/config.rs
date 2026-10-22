@@ -238,6 +238,19 @@ pub struct ChainConfig {
     #[serde(default)]
     pub agent_precompiles_height: Option<u64>,
 
+    /// Supply-accounting hardening fork activation height
+    /// (`citrate_execution::supply_hardening`): from this height model-access
+    /// and provider fees move through the per-transaction journal, and the
+    /// block reward's bonus arms are computed from executed receipts, halved
+    /// with the base subsidy and capped at it.
+    ///
+    /// A CONSENSUS PARAMETER. Absent (the default, and every shipped profile)
+    /// = not activated. On a release network (40204) only the release pin
+    /// sets it: a value here, or `CITRATE_SUPPLY_HARDENING_HEIGHT`, refuses to
+    /// start unless it equals the pin. Local dev chains may set it.
+    #[serde(default)]
+    pub supply_hardening_height: Option<u64>,
+
     /// A local development chain. The activation height compiled into the
     /// release for this chain id (`citrate_consensus::hardening::
     /// PINNED_ACTIVATIONS`) is not applied, so dev profiles keep choosing
@@ -369,6 +382,7 @@ impl Default for NodeConfig {
                 genesis_profile: None,
                 pba_hardening_height: None,
                 agent_precompiles_height: None,
+                supply_hardening_height: None,
                 dev_profile: false,
             },
             network: NetworkConfig {
@@ -863,6 +877,74 @@ mod tests {
                 "{name} must not schedule the agent precompile fork"
             );
         }
+    }
+
+    /// The supply hardening fork height is published through its one resolver
+    /// before any execution component exists, there is no second publication
+    /// path, no shipped profile schedules it, and the key parses.
+    #[test]
+    fn supply_hardening_is_published_first_and_unset_in_every_shipped_profile() {
+        let main = include_str!("main.rs");
+        let start = main.find("async fn start_node(").expect("start_node");
+        let body = &main[start..];
+        let init = body
+            .find("citrate_execution::supply_hardening::init_for_chain(")
+            .expect("start_node must publish the supply hardening height");
+        for ctor in [
+            "GhostDag::new(",
+            "Executor::with_storage_and_chain_id(",
+            "ConsensusManifest::for_height(",
+        ] {
+            let at = body
+                .find(ctor)
+                .unwrap_or_else(|| panic!("{ctor} in start_node"));
+            assert!(init < at, "supply hardening height published before {ctor}");
+        }
+        assert!(
+            !main.contains("set_supply_hardening_height("),
+            "one publication path"
+        );
+        assert_eq!(NodeConfig::default().chain.supply_hardening_height, None);
+        assert_eq!(NodeConfig::devnet().chain.supply_hardening_height, None);
+        for (name, text) in [
+            (
+                "node/config/devnet.toml",
+                include_str!("../config/devnet.toml"),
+            ),
+            (
+                "node/config/mainnet.toml",
+                include_str!("../config/mainnet.toml"),
+            ),
+            (
+                "node/config/testnet.toml",
+                include_str!("../config/testnet.toml"),
+            ),
+            (
+                "node/config/testnet-beta.toml",
+                include_str!("../config/testnet-beta.toml"),
+            ),
+            (
+                "node/config/team-testnet.toml",
+                include_str!("../config/team-testnet.toml"),
+            ),
+            (
+                "devnet-config.toml",
+                include_str!("../../devnet-config.toml"),
+            ),
+            (
+                "testnet-config.toml",
+                include_str!("../../testnet-config.toml"),
+            ),
+        ] {
+            assert!(
+                !text.contains("supply_hardening_height"),
+                "{name} must not schedule the supply hardening fork"
+            );
+        }
+        let base = include_str!("../config/devnet.toml");
+        let with = base.replacen("[chain]", "[chain]\nsupply_hardening_height = 12", 1);
+        let cfg: NodeConfig = toml::from_str(&with).expect("key parses");
+        assert_eq!(cfg.chain.supply_hardening_height, Some(12));
     }
 
     /// The new key parses, and a TOML without it keeps the fork unset.
