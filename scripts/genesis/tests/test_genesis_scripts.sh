@@ -83,6 +83,7 @@ cat >"$BIN/forge" <<'EOF'
 #!/usr/bin/env bash
 echo "forge $*" >>"$FAKE/calls.log"
 echo "forge-env gov=${GENESIS_GOVERNANCE_OUT:-} vest=${TEAM_VESTING_OUT:-} dormant=${DORMANT_LEDGERS_OUT:-} govbook=${GENESIS_GOVERNANCE_BOOK:-} extras=${EXTRA_ADDRESS_BOOKS:-}" >>"$FAKE/calls.log"
+echo "forge-deployer dep=${DEPLOYER_ADDRESS-<unset>} ceremony=${CEREMONY_DEPLOYER_ADDRESS-<unset>}" >>"$FAKE/calls.log"
 if [[ "$*" == *CheckDeployedAdmins* ]]; then
   # Like the real checker: read ONE book, ADDRESS_BOOK (relative to contracts/, the cwd).
   # FAKE_DEPLOYER_HELD=<name>: the contract of that name in the book still has the deployer
@@ -132,7 +133,8 @@ exec python3 "$@"
 EOF
 chmod +x "$BIN"/*
 export FAKE CAST="$BIN/cast" FORGE="$BIN/forge" SYSTEMCTL="$BIN/systemctl"
-unset RPC RPC_URL ADDRESS_BOOK BROADCAST_DIR KEEP_LIST FLEET_RPCS EXPECTED_GENESIS_HASH PRIVATE_KEY DEPLOYER_PRIVATE_KEY
+unset RPC RPC_URL ADDRESS_BOOK BROADCAST_DIR KEEP_LIST FLEET_RPCS EXPECTED_GENESIS_HASH PRIVATE_KEY DEPLOYER_PRIVATE_KEY \
+  DEPLOYER_ADDRESS CEREMONY_DEPLOYER_ADDRESS DEPLOYER EMIT_DEPLOYER EMIT_OUTPUT EMIT_BROADCAST_SINCE EMIT_FRESH_GENESIS EMITTER
 calls() { cat "$FAKE/calls.log" 2>/dev/null; }
 reset_calls() { : >"$FAKE/calls.log"; }
 
@@ -513,7 +515,16 @@ CE="$G/genesis_ceremony.sh"
 REPO="$T/repo"
 mkdir -p "$REPO/contracts/script" "$REPO/contracts/genesis" "$REPO/contracts/addresses" "$REPO/scripts/ops"
 for s in DeployGenesisGovernance DeployTeamVesting DeployDormantLedgers CheckDeployedAdmins; do : >"$REPO/contracts/script/$s.s.sol"; done
-printf '#!/usr/bin/env bash\necho "regenesis $*" >>"$FAKE/calls.log"\necho "regenesis-env vg=${VALIDATOR_GOVERNANCE:-} vs=${VALIDATOR_SLASHER:-} gov=${GOVERNANCE:-}" >>"$FAKE/calls.log"\necho "regenesis-emit fresh=${EMIT_FRESH_GENESIS:-} dep=${EMIT_DEPLOYER:-} since=${EMIT_BROADCAST_SINCE:-} out=${EMIT_OUTPUT:-}" >>"$FAKE/calls.log"\n' >"$REPO/scripts/ops/regenesis.sh"
+# Fake regenesis.sh: logs what it was given. FAKE_REGEN_BOOK=<file>: also "deploy" by writing
+# that file as the generated book (EMIT_OUTPUT), as the real generator does after a broadcast.
+cat >"$REPO/scripts/ops/regenesis.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "regenesis $*" >>"$FAKE/calls.log"
+echo "regenesis-env vg=${VALIDATOR_GOVERNANCE:-} vs=${VALIDATOR_SLASHER:-} gov=${GOVERNANCE:-}" >>"$FAKE/calls.log"
+echo "regenesis-emit fresh=${EMIT_FRESH_GENESIS:-} dep=${EMIT_DEPLOYER:-} since=${EMIT_BROADCAST_SINCE:-} out=${EMIT_OUTPUT:-}" >>"$FAKE/calls.log"
+echo "regenesis-deployer dep=${DEPLOYER_ADDRESS-<unset>} ceremony=${CEREMONY_DEPLOYER_ADDRESS-<unset>}" >>"$FAKE/calls.log"
+if [[ -n "${FAKE_REGEN_BOOK:-}" ]]; then cp "$FAKE_REGEN_BOOK" "$EMIT_OUTPUT"; fi
+EOF
 DEP=$(addr 1)
 printf '{"chainId":40204,"deployer":"%s","contracts":{"Alpha":"%s","Beta":"%s","Vault":"%s"},"aaStack":{},"Vault":"%s"}' "$DEP" "$A1" "$A2" "$A3" "$A3" >"$REPO/contracts/addresses/40204.json"
 # gov_book <dir> <deployer> [extra "Name":"0x..." pairs]: a P1-shaped governance output.
@@ -717,8 +728,8 @@ calls | grep -q "^regenesis-env vg=$(addr 31) vs=$(addr 31) gov=$(addr 31)$" && 
 calls | grep -q "^regenesis-emit fresh=1 dep=$DEP since=5000 out=$REPO/contracts/addresses/40204.json$" &&
   ok "ceremony C8: regenesis gets the fresh-genesis generator inputs from the run manifest" ||
   bad "ceremony C8: regenesis gets the fresh-genesis generator inputs from the run manifest" "$(calls)"
-for preset in "EMIT_DEPLOYER=$STALE:EMIT_DEPLOYER is set to 0x0+63, but this run's deployer is" \
-  "DEPLOYER=$STALE:DEPLOYER is set to 0x0+63, but this run's deployer is" \
+for preset in "EMIT_DEPLOYER=$STALE:EMIT_DEPLOYER is set to '0x0+63', not exactly DEPLOYER_ADDRESS" \
+  "DEPLOYER=$STALE:DEPLOYER is set to '0x0+63', not exactly DEPLOYER_ADDRESS" \
   "EMIT_OUTPUT=$T/elsewhere.json:EMIT_OUTPUT is set to .*elsewhere.json, but the ceremony's book is" \
   "EMIT_BROADCAST_SINCE=4000:EMIT_BROADCAST_SINCE is set to 4000, but this run's block 0 is at 5000" \
   "EMIT_FRESH_GENESIS=0:EMIT_FRESH_GENESIS is set to 0"; do
@@ -729,8 +740,104 @@ done
 reset_calls
 expect "ceremony C8: a matching EMIT_DEPLOYER preset is accepted" 0 'done \(mode=simulate\)' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EMIT_DEPLOYER="$DEP" bash "$CE" --simulate --only P2
 expect "ceremony C8: the dry run plans the fresh-genesis book" 0 'DRYRUN .*EMIT_FRESH_GENESIS=1 .*EMIT_OUTPUT=.*/contracts/addresses/40204.json bash .*regenesis.sh --reroll --with-aa' -- "${CEENV[@]}" bash "$CE" --only P2
-# C8 on P5/P6: once P2 recorded its book, a different book is refused; --confirm needs one.
 GBK="$REPO/contracts/addresses/40204.json"
+# C9 (Codex 3cc160c on chain#329): every deployer input the deploy scripts read names the
+# run's deployer exactly. ScriptEnv.deployerAddress() prefers CEREMONY_DEPLOYER_ADDRESS over
+# DEPLOYER_ADDRESS, and regenesis.sh kept a preset one, so a stale value redirected the
+# deployer-derived constructor arguments (fee recipients) while the book named DEPLOYER_ADDRESS.
+# P0 refuses any alias that is not byte-for-byte DEPLOYER_ADDRESS (other value, empty, other
+# case, other spelling) before anything is sent, and every phase gets the run's deployer.
+mk_manifest "$GB"
+gov_book "$GB" "$DEP"
+gov_chain
+for preset in "CEREMONY_DEPLOYER_ADDRESS=$STALE:CEREMONY_DEPLOYER_ADDRESS is set to '0x0+63', not exactly DEPLOYER_ADDRESS" \
+  "CEREMONY_DEPLOYER_ADDRESS=:CEREMONY_DEPLOYER_ADDRESS is set but empty" \
+  "CEREMONY_DEPLOYER_ADDRESS=0X${DEP#0x}:CEREMONY_DEPLOYER_ADDRESS is set to '0X0+1', not exactly" \
+  "CEREMONY_DEPLOYER_ADDRESS=${DEP#0x}:CEREMONY_DEPLOYER_ADDRESS is set to '0+1', not exactly" \
+  "CEREMONY_DEPLOYER_ADDRESS= $DEP:CEREMONY_DEPLOYER_ADDRESS is set to ' 0x0+1', not exactly" \
+  "DEPLOYER=:DEPLOYER is set but empty" \
+  "EMIT_DEPLOYER=:EMIT_DEPLOYER is set but empty"; do
+  reset_calls
+  expect "ceremony C9: P0 refuses ${preset%%:*} before P2 runs" 3 "GATE FAIL at P0: ${preset#*:}" -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 "${preset%%:*}" bash "$CE" --simulate --only P2
+  if calls | grep -q '^regenesis'; then bad "ceremony C9: a refused ${preset%%:*} runs no regenesis" "$(calls)"; else ok "ceremony C9: a refused ${preset%%:*} runs no regenesis"; fi
+done
+C9D="$REPO/contracts/genesis/c9"
+mkdir -p "$C9D"
+mk_manifest "$C9D"
+reset_calls
+expect "ceremony C9: P0 refuses a stale CEREMONY_DEPLOYER_ADDRESS before P1's forge" 3 'GATE FAIL at P0: CEREMONY_DEPLOYER_ADDRESS is set to' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 CEREMONY_DEPLOYER_ADDRESS="$STALE" GENESIS_OUT_DIR="$C9D" bash "$CE" --simulate --only P1
+if calls | grep -q '^forge'; then bad "ceremony C9: a refused P1 runs no forge" "$(calls)"; else ok "ceremony C9: a refused P1 runs no forge"; fi
+# A checksum-case difference is refused even in a dry run; the exact spelling passes.
+MIXED=0xAbCdEf0123456789aBcDeF0123456789AbCdEf01
+expect "ceremony C9: a dry run refuses a CEREMONY_DEPLOYER_ADDRESS in another case" 3 "CEREMONY_DEPLOYER_ADDRESS is set to '0xabcdef0123456789abcdef0123456789abcdef01', not exactly DEPLOYER_ADDRESS" -- "${CEENV[@]}" DEPLOYER_ADDRESS="$MIXED" CEREMONY_DEPLOYER_ADDRESS="$(printf '%s' "$MIXED" | tr 'A-F' 'a-f')" bash "$CE"
+expect "ceremony C9: a dry run accepts CEREMONY_DEPLOYER_ADDRESS spelled exactly as DEPLOYER_ADDRESS" 0 'done \(mode=dry\)' -- "${CEENV[@]}" DEPLOYER_ADDRESS="$MIXED" CEREMONY_DEPLOYER_ADDRESS="$MIXED" bash "$CE"
+# Negative controls: no preset, or the exact value, runs; regenesis and forge see the run's deployer.
+reset_calls
+expect "ceremony C9: an exact CEREMONY_DEPLOYER_ADDRESS is accepted" 0 'done \(mode=simulate\)' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 CEREMONY_DEPLOYER_ADDRESS="$DEP" bash "$CE" --simulate --only P2
+reset_calls
+expect "ceremony C9: P2 runs with no deployer alias preset" 0 'done \(mode=simulate\)' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
+calls | grep -q "^regenesis-deployer dep=$DEP ceremony=$DEP$" && ok "ceremony C9: regenesis gets CEREMONY_DEPLOYER_ADDRESS = the run's deployer" ||
+  bad "ceremony C9: regenesis gets CEREMONY_DEPLOYER_ADDRESS = the run's deployer" "$(calls)"
+reset_calls
+expect "ceremony C9: P1 runs with no deployer alias preset" 0 'done \(mode=simulate\)' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$C9D" bash "$CE" --simulate --only P1
+calls | grep -q "^forge-deployer dep=$DEP ceremony=$DEP$" && ok "ceremony C9: forge phases get CEREMONY_DEPLOYER_ADDRESS = the run's deployer" ||
+  bad "ceremony C9: forge phases get CEREMONY_DEPLOYER_ADDRESS = the run's deployer" "$(calls)"
+rm -rf "$C9D"
+# regenesis.sh on its own (the reroll runbooks call it directly): a CEREMONY_DEPLOYER_ADDRESS
+# that is not exactly DEPLOYER_ADDRESS stops it before the build.
+RG="$T/rg"
+mkdir -p "$RG/scripts/ops" "$RG/contracts"
+cp "$G/../ops/regenesis.sh" "$RG/scripts/ops/"
+for preset in "$STALE" "" "$(printf '%s' "$MIXED" | tr 'a-f' 'A-F' | sed 's/^0X/0x/')"; do
+  reset_calls
+  expect "regenesis: CEREMONY_DEPLOYER_ADDRESS='$preset' with DEPLOYER_ADDRESS=$MIXED is refused" 1 'CEREMONY_DEPLOYER_ADDRESS .*is not exactly DEPLOYER_ADDRESS' -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" CEREMONY_DEPLOYER_ADDRESS="$preset" bash "$RG/scripts/ops/regenesis.sh"
+  if calls | grep -q '^forge'; then bad "regenesis: a refused deployer alias runs no forge" "$(calls)"; else ok "regenesis: a refused deployer alias runs no forge"; fi
+done
+reset_calls
+env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" CEREMONY_DEPLOYER_ADDRESS="$MIXED" bash "$RG/scripts/ops/regenesis.sh" >"$T/rg.log" 2>&1
+calls | grep -q '^forge clean' && ! grep -q 'not exactly DEPLOYER_ADDRESS' "$T/rg.log" && ok "regenesis: an exact CEREMONY_DEPLOYER_ADDRESS goes on to the build" ||
+  bad "regenesis: an exact CEREMONY_DEPLOYER_ADDRESS goes on to the build" "$(cat "$T/rg.log")"
+rm -rf "$RG"
+# After a --confirm P2, the deployer-derived fee recipients of the contracts in the book are
+# read from the chain and must be the book's (= the run's) deployer.
+C9B="$T/c9-book.json"
+C9VR=$(addr 401) C9SBT=$(addr 402) C9BOND=$(addr 403) C9VI=$(addr 404) C9VP=$(addr 405)
+C9X=$(addr 411) C9MM=$(addr 412) C9CM=$(addr 413)
+printf '{"chainId":40204,"deployer":"%s","contracts":{"ValidatorRegistry":"%s","CitrateMemberSBT":"%s","MemberBond":"%s","MembershipStakeVaultImpl":"%s","MembershipStakeVault":"%s","X402Facilitator":"%s","ModelMarketplace":"%s","ComputeMarketplace":"%s"},"aaStack":{},"CitrateMemberSBT":"%s","MembershipStakeVault":"%s"}\n' \
+  "$DEP" "$C9VR" "$C9SBT" "$C9BOND" "$C9VI" "$C9VP" "$C9X" "$C9MM" "$C9CM" "$C9SBT" "$C9VP" >"$C9B"
+cat >"$T/fake-emit.sh" <<'EOF'
+#!/usr/bin/env bash
+cp "$FAKE_REGEN_BOOK" "$EMIT_OUTPUT"
+EOF
+mkdir -p "$REPO/contracts/broadcast/DeployValidatorRegistry.s.sol/40204" "$REPO/contracts/broadcast/DeployCoreMembership.s.sol/40204"
+printf '{"timestamp":6000,"transactions":[{"transactionType":"CREATE2","contractName":"ValidatorRegistry","contractAddress":"%s"}]}' "$C9VR" \
+  >"$REPO/contracts/broadcast/DeployValidatorRegistry.s.sol/40204/run-latest.json"
+printf '{"timestamp":6001,"transactions":[{"transactionType":"CREATE2","contractName":"CitrateMemberSBT","contractAddress":"%s"},{"transactionType":"CREATE2","contractName":"MemberBond","contractAddress":"%s"},{"transactionType":"CREATE2","contractName":"MembershipStakeVault","contractAddress":"%s"},{"transactionType":"CREATE2","contractName":"ERC1967Proxy","contractAddress":"%s"}]}' \
+  "$C9SBT" "$C9BOND" "$C9VI" "$C9VP" >"$REPO/contracts/broadcast/DeployCoreMembership.s.sol/40204/run-latest.json"
+cp "$GBK" "$T/book.c9.orig"
+C9ENV=("${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1
+  FAKE_REGEN_BOOK="$C9B" EMITTER="$T/fake-emit.sh")
+c9_fee() { # name want-exit pattern [fake_call setup...]
+  local name="$1" want="$2" pat="$3"
+  shift 3
+  mk_manifest "$GB" "$DEP" confirm deployer
+  gov_book "$GB" "$DEP"
+  gov_chain
+  rm -rf "$FAKE/call/$C9X" "$FAKE/call/$C9MM" "$FAKE/call/$C9CM"
+  fake_call "$C9X" treasury "$DEP"
+  fake_call "$C9MM" treasuryAddress "$DEP"
+  fake_call "$C9CM" treasury "$DEP"
+  "$@"
+  expect "ceremony C9: $name" "$want" "$pat" -- "${C9ENV[@]}" bash "$CE" --confirm --only P2 --account deployer
+  cp "$T/book.c9.orig" "$GBK"
+}
+c9_fee "fee recipients equal to the run's deployer pass P2" 0 'P2 fee recipients are the run.s deployer: X402Facilitator, ModelMarketplace, ComputeMarketplace' true
+c9_fee "an X402Facilitator fee recipient other than the run's deployer fails P2" 3 'X402Facilitator.treasury\(\) is 0x0+63, not the book.s deployer 0x0+1' fake_call "$C9X" treasury "$STALE"
+c9_fee "a ModelMarketplace fee recipient other than the run's deployer fails P2" 3 'ModelMarketplace.treasuryAddress\(\) is 0x0+63' fake_call "$C9MM" treasuryAddress "$STALE"
+c9_fee "an unreadable ComputeMarketplace fee recipient fails P2" 3 'cannot read ComputeMarketplace.treasury\(\)' rm -f "$FAKE/call/$C9CM/treasury"
+rm -rf "$REPO/contracts/broadcast" "$FAKE/call/$C9X" "$FAKE/call/$C9MM" "$FAKE/call/$C9CM"
+mk_manifest "$GB"
+# C8 on P5/P6: once P2 recorded its book, a different book is refused; --confirm needs one.
 cp "$GBK" "$T/book.orig"
 mk_manifest "$GB"
 gov_book "$GB" "$DEP"
@@ -1173,6 +1280,38 @@ exec "$REAL_FORGE" "${args[@]}"
 EOF
       chmod +x "$T/fbin/forge"
       export REAL_FORGE
+      # C9 at the source: ScriptEnv.deployerAddress(), which every deploy script uses, run under
+      # the real forge (local, no RPC) with each combination of the two deployer inputs.
+      cat >"$FC/script/DeployerProbe.s.sol" <<'EOF'
+// SPDX-License-Identifier: Apache-2.0
+pragma solidity ^0.8.26;
+import "./ScriptEnv.sol";
+contract DeployerProbe is ScriptEnv {
+    function run() external {
+        console.log("PROBE-DEPLOYER", deployerAddress());
+    }
+}
+EOF
+      PD=0xabcdef0123456789abcdef0123456789abcdef01
+      probe() { (cd "$FC" && env -u DEPLOYER_ADDRESS -u CEREMONY_DEPLOYER_ADDRESS "$@" "$REAL_FORGE" script script/DeployerProbe.s.sol 2>&1); }
+      for c in "agree:0:PROBE-DEPLOYER $PD:DEPLOYER_ADDRESS=$PD CEREMONY_DEPLOYER_ADDRESS=$PD" \
+        "only DEPLOYER_ADDRESS:0:PROBE-DEPLOYER $PD:DEPLOYER_ADDRESS=$PD" \
+        "only CEREMONY_DEPLOYER_ADDRESS:0:PROBE-DEPLOYER $PD:CEREMONY_DEPLOYER_ADDRESS=$PD" \
+        "disagree:1:CEREMONY_DEPLOYER_ADDRESS and DEPLOYER_ADDRESS name different deployers:DEPLOYER_ADDRESS=$PD CEREMONY_DEPLOYER_ADDRESS=$(addr 99)" \
+        "CEREMONY_DEPLOYER_ADDRESS empty:1:CEREMONY_DEPLOYER_ADDRESS is set but is not an address:DEPLOYER_ADDRESS=$PD CEREMONY_DEPLOYER_ADDRESS=" \
+        "CEREMONY_DEPLOYER_ADDRESS malformed:1:CEREMONY_DEPLOYER_ADDRESS is set but is not an address:DEPLOYER_ADDRESS=$PD CEREMONY_DEPLOYER_ADDRESS=0x12" \
+        "CEREMONY_DEPLOYER_ADDRESS zero:1:CEREMONY_DEPLOYER_ADDRESS is the zero address:DEPLOYER_ADDRESS=$PD CEREMONY_DEPLOYER_ADDRESS=0x0000000000000000000000000000000000000000" \
+        "neither:1:set CEREMONY_DEPLOYER_ADDRESS or DEPLOYER_ADDRESS:"; do
+        IFS=: read -r cname cwant cpat cenv <<<"$c"
+        read -ra cvars <<<"$cenv"
+        out=$(probe "${cvars[@]}")
+        rc=$?
+        if { [[ "$cwant" == 0 && $rc -eq 0 ]] || [[ "$cwant" == 1 && $rc -ne 0 ]]; } && grep -qiF -- "$cpat" <<<"$out"; then
+          ok "ScriptEnv C9: deployer inputs $cname"
+        else
+          bad "ScriptEnv C9: deployer inputs $cname (exit $rc)" "$out"
+        fi
+      done
       fport=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
       FRPC="http://127.0.0.1:$fport"
       FANVIL_PID=""
@@ -1222,8 +1361,11 @@ EOF
           TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS="$FRPC")
         if [[ "$label" == run1 ]]; then
           # A stale generator preset is refused before anything is broadcast.
-          expect "fresh genesis e2e: a stale EMIT_DEPLOYER stops P2 before any broadcast" 3 'EMIT_DEPLOYER is set to 0x0+63' -- "${FENV[@]}" EMIT_DEPLOYER="$STALE" bash "$CE" --confirm --only P2 --account fixture
+          expect "fresh genesis e2e: a stale EMIT_DEPLOYER stops P2 before any broadcast" 3 "EMIT_DEPLOYER is set to '0x0+63'" -- "${FENV[@]}" EMIT_DEPLOYER="$STALE" bash "$CE" --confirm --only P2 --account fixture
           [[ "$(fcast nonce "$FDEP")" == 0 ]] && ok "fresh genesis e2e: the refused P2 sent nothing" || bad "fresh genesis e2e: the refused P2 sent nothing" "nonce $(fcast nonce "$FDEP")"
+          # C9: the alias the deploy scripts prefer, stale, is refused the same way.
+          expect "fresh genesis e2e: a stale CEREMONY_DEPLOYER_ADDRESS stops P2 before any broadcast" 3 "GATE FAIL at P0: CEREMONY_DEPLOYER_ADDRESS is set to '0x0+63'" -- "${FENV[@]}" CEREMONY_DEPLOYER_ADDRESS="$STALE" bash "$CE" --confirm --only P2 --account fixture
+          [[ "$(fcast nonce "$FDEP")" == 0 ]] && ok "fresh genesis e2e: the refused CEREMONY_DEPLOYER_ADDRESS sent nothing" || bad "fresh genesis e2e: the refused CEREMONY_DEPLOYER_ADDRESS sent nothing" "nonce $(fcast nonce "$FDEP")"
         fi
         expect "fresh genesis e2e ($label): P2 deploys through regenesis.sh and the generator, and the book is verified" 0 'P2 stack book = generator output for this run' -- "${FENV[@]}" bash "$CE" --confirm --only P2 --account fixture
         RUN_VR=$(jq -r '.contracts.ValidatorRegistry' "$book")
