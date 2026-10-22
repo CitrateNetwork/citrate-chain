@@ -1545,6 +1545,137 @@ async fn s2_cleared_stop_does_not_publish_an_unpersisted_certificate() {
     );
 }
 
+/// S2 atomicity, guard state change <-> certificate (review of #335 @ fa6595a1).
+/// The finalization-time guard raises the floor; the certificate it ran on must
+/// then be the one finalized and persisted, even if the pending checkpoint is
+/// pruned and RE-PROPOSED for the same block hash (with no votes) while the
+/// guard runs, and while a second finalization of the same height is started.
+///
+/// Deterministic interleaving on the real wiring (manager + installed verifier
+/// guard + applicator): the test holds the applicator's advance lock, so the
+/// guard parks inside its floor check after registering the certificate; the
+/// re-proposal and the concurrent finalization happen there; then the lock is
+/// released. Afterwards the floor, the persisted certificate and the published
+/// RPC pair agree, and a restart that reloads everything from disk restores
+/// the same floor and refuses a rebuild below it. (A crash BEFORE the
+/// certificate is persisted restarts with neither the floor nor the
+/// certificate: `s2_rpc_finalized_is_published_only_after_the_certificate_is_persisted`.)
+#[tokio::test]
+async fn s2_guarded_certificate_survives_a_same_hash_re_proposal_and_a_restart() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let committee: Vec<PublicKey> = keys.iter().map(pk).collect();
+    let cfg = config(100);
+    let mut node = TestNode::boot(key(0), &vals, cfg.clone()).await;
+    let genesis_state = node.exec.state_snapshot();
+    let a = chains.main(8);
+    node.follow(&a).await;
+    let b = chains.branch(&a, 3, 10, VRF_B);
+    for blk in &b {
+        node.import(blk).await;
+    }
+    let h4 = hash_at(&a, 4);
+    let mgr = node.mgr().clone();
+    assert_eq!(
+        mgr.ensure_proposed(4, h4, committee.clone())
+            .await
+            .expect("propose"),
+        citrate_consensus::checkpoint::ProposeOutcome::Proposed
+    );
+    for k in keys.iter().take(3) {
+        mgr.submit_vote(sign_checkpoint_vote(CHAIN, 4, h4, k))
+            .await
+            .expect("vote");
+    }
+
+    // Park the guard inside its floor check.
+    let advance = node.app.advance_lock();
+    let held = advance.lock().await;
+    let first = tokio::spawn({
+        let mgr = mgr.clone();
+        async move { mgr.finalize_checkpoint(4).await }
+    });
+    let mut spins = 0u32;
+    while !node.app.certified_pending().contains(&(4, h4)) {
+        spins += 1;
+        assert!(spins < 100_000, "guard never reached its floor check");
+        tokio::task::yield_now().await;
+    }
+    // Inside the guard: pruned, re-proposed for the same hash with no votes,
+    // and a concurrent finalization of the same height queued.
+    let second = tokio::spawn({
+        let mgr = mgr.clone();
+        async move { mgr.finalize_checkpoint(4).await }
+    });
+    mgr.prune_at_or_below(4).await;
+    assert_eq!(
+        mgr.ensure_proposed(4, h4, committee.clone())
+            .await
+            .expect("re-propose"),
+        citrate_consensus::checkpoint::ProposeOutcome::Proposed
+    );
+    assert_eq!(mgr.pending_vote_count(4).await, Some(0));
+    assert_eq!(node.floor(), 0, "the guard has not raised the floor yet");
+    drop(held);
+
+    let first = first.await.expect("first finalization task");
+    assert!(
+        first.is_ok(),
+        "the certificate the guard ran on must finalize, got {first:?}"
+    );
+    let cp = first.expect("checked above");
+    assert_eq!((cp.height, cp.block_hash, cp.votes.len()), (4, h4, 3));
+    let second = second.await.expect("second finalization task");
+    assert!(
+        matches!(second, Err(CheckpointError::BlockNotFound(_))),
+        "{second:?}"
+    );
+    // The guard's state change and the certificate agree.
+    assert_eq!(node.floor(), 4, "floor raised by the guard");
+    assert!(!node.gadget.halted());
+    assert!(
+        mgr.is_certificate_persisted(4, &h4),
+        "the guarded certificate is persisted"
+    );
+    assert_eq!(mgr.latest_finalized_height().await, 4);
+    assert_eq!(
+        node.rpc_finalized(),
+        FinalizedAnchor {
+            height: 4,
+            hash: Some(h4)
+        }
+    );
+    assert_eq!(node.tick().await, verified(4));
+
+    // Crash and restart from disk: floor, certificate and RPC pair come back
+    // together, and a rebuild abandoning A4 is refused.
+    let (node, boot) = node.restart(&vals, cfg).await;
+    assert_eq!(boot, verified(4));
+    assert_eq!(node.floor(), 4);
+    assert_eq!(node.mgr().latest_finalized_height().await, 4);
+    let stored = node.mgr().get_checkpoint(4).await.expect("reloaded");
+    assert_eq!((stored.block_hash, stored.votes.len()), (h4, 3));
+    assert!(stored.verify_certificate(CHAIN).is_ok());
+    assert_eq!(
+        node.rpc_finalized(),
+        FinalizedAnchor {
+            height: 4,
+            hash: Some(h4)
+        }
+    );
+    *node.head.lock() = Some(hash_at(&b, 10));
+    assert!(
+        !node
+            .app
+            .recover_to_head(genesis_state, Hash::default())
+            .await
+            .expect("recovery call returns"),
+        "S2: the finalized block must not be abandoned after a restart"
+    );
+    assert_eq!(node.app.applied_tip().await.hash, hash_at(&a, 8));
+}
+
 /// An `Unconfirmed` stop becomes a mismatch (with the alarm) once the node's
 /// chain is found to hold another block at the certified height.
 #[tokio::test]

@@ -1692,6 +1692,185 @@ mod tests {
         assert_eq!(mgr.pending_len().await, 0);
     }
 
+    /// Parks `before_finalize` on a barrier so a test can interleave other
+    /// manager calls deterministically between the guard's state change and the
+    /// finalization it precedes.
+    #[derive(Default)]
+    struct GateGuard {
+        /// Signalled once the guard has run (its state change is done).
+        entered: tokio::sync::Notify,
+        /// Awaited before the guard returns to `finalize_checkpoint`.
+        release: tokio::sync::Notify,
+        /// Certificates the guard ran on: (height, hash, vote count).
+        before: std::sync::Mutex<Vec<(u64, Hash, usize)>>,
+        /// Certificates `after_finalize` saw: (height, hash, vote count).
+        after: std::sync::Mutex<Vec<(u64, Hash, usize)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl FinalizationGuard for GateGuard {
+        async fn before_finalize(&self, certificate: &Checkpoint) {
+            self.before.lock().expect("gate lock").push((
+                certificate.height,
+                certificate.block_hash,
+                certificate.votes.len(),
+            ));
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+
+        async fn after_finalize(&self, certificate: &Checkpoint) {
+            self.after.lock().expect("gate lock").push((
+                certificate.height,
+                certificate.block_hash,
+                certificate.votes.len(),
+            ));
+        }
+    }
+
+    async fn gated() -> (Arc<CheckpointManager>, Arc<GateGuard>, Hash, Vec<PublicKey>) {
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let blocks = build_chain(&dag, 6).await;
+        let mgr = Arc::new(CheckpointManager::new(CheckpointConfig::for_testing(), dag));
+        let gate = Arc::new(GateGuard::default());
+        assert!(mgr.install_finalization_guard(gate.clone()));
+        let b5 = blocks.get(5).expect("block 5").hash();
+        let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+        mgr.ensure_proposed(5, b5, committee.clone())
+            .await
+            .expect("propose");
+        for i in 0..3u8 {
+            mgr.submit_vote(make_signed_vote(i, 5, &b5))
+                .await
+                .expect("vote");
+        }
+        (mgr, gate, b5, committee)
+    }
+
+    /// S2 atomicity (guard state change <-> certificate): while the guard runs,
+    /// the pending checkpoint is pruned and RE-PROPOSED for the SAME block hash
+    /// with no votes, and a second finalization of the same height is started.
+    /// The certificate the guard ran on (with its quorum) must still be the one
+    /// finalized: the guard's state change is never left without its
+    /// certificate, and the votes are never dropped. The concurrent finalization
+    /// waits for the first and finds nothing left to finalize.
+    #[tokio::test]
+    async fn finalization_guard_certificate_survives_a_same_hash_re_proposal() {
+        let (mgr, gate, b5, committee) = gated().await;
+
+        let first = tokio::spawn({
+            let mgr = mgr.clone();
+            async move { mgr.finalize_checkpoint(5).await }
+        });
+        gate.entered.notified().await;
+        // The guard has run on the 3-vote certificate; finalization is parked.
+        assert_eq!(
+            gate.before.lock().expect("gate lock").as_slice(),
+            &[(5, b5, 3)]
+        );
+        let second = tokio::spawn({
+            let mgr = mgr.clone();
+            async move { mgr.finalize_checkpoint(5).await }
+        });
+        mgr.prune_at_or_below(5).await;
+        assert_eq!(mgr.pending_len().await, 0, "pruned during the guard");
+        assert_eq!(
+            mgr.ensure_proposed(5, b5, committee.clone())
+                .await
+                .expect("re-propose"),
+            ProposeOutcome::Proposed,
+            "the same hash is re-proposed with no votes"
+        );
+        assert_eq!(mgr.pending_vote_count(5).await, Some(0));
+        gate.release.notify_one();
+
+        let first = first.await.expect("first finalization task");
+        assert!(
+            first.is_ok(),
+            "the guarded certificate must finalize, got {first:?}"
+        );
+        let cp = first.expect("checked above");
+        assert_eq!((cp.height, cp.block_hash, cp.votes.len()), (5, b5, 3));
+        assert_eq!(cp.status, CheckpointStatus::Finalized);
+        assert!(cp.has_derived_quorum());
+        assert_eq!(mgr.latest_finalized_height().await, 5);
+        let stored = mgr.get_checkpoint(5).await.expect("certificate recorded");
+        assert_eq!(stored.votes.len(), 3, "the votes are kept");
+        assert_eq!(mgr.pending_len().await, 0, "the replacement is settled");
+        assert_eq!(
+            gate.after.lock().expect("gate lock").as_slice(),
+            &[(5, b5, 3)],
+            "after_finalize ran on the guarded certificate"
+        );
+
+        // The concurrent finalization ran after the first (serialized): nothing
+        // left to finalize, and the guard never ran a second time.
+        let second = second.await.expect("second finalization task");
+        assert!(
+            matches!(second, Err(CheckpointError::BlockNotFound(_))),
+            "{second:?}"
+        );
+        assert_eq!(gate.before.lock().expect("gate lock").len(), 1);
+        assert_eq!(gate.after.lock().expect("gate lock").len(), 1);
+        assert_eq!(
+            mgr.ensure_proposed(5, b5, committee)
+                .await
+                .expect("re-open attempt"),
+            ProposeOutcome::AlreadyFinalized
+        );
+    }
+
+    /// A same-hash replacement that EXTENDS the guarded certificate (same
+    /// committee, every guarded vote, plus more) may be finalized in its place:
+    /// it carries everything the guard verified. A replacement with another
+    /// committee is not an extension, so the guarded certificate is kept.
+    #[tokio::test]
+    async fn finalization_guard_keeps_the_certificate_unless_the_replacement_extends_it() {
+        // Extension: the re-proposed checkpoint re-collects the same 3 votes
+        // (the replay markers were pruned with it) and a 4th.
+        let (mgr, gate, b5, committee) = gated().await;
+        let task = tokio::spawn({
+            let mgr = mgr.clone();
+            async move { mgr.finalize_checkpoint(5).await }
+        });
+        gate.entered.notified().await;
+        mgr.prune_at_or_below(5).await;
+        mgr.ensure_proposed(5, b5, committee.clone())
+            .await
+            .expect("re-propose");
+        for i in 0..4u8 {
+            mgr.submit_vote(make_signed_vote(i, 5, &b5))
+                .await
+                .expect("vote");
+        }
+        gate.release.notify_one();
+        let cp = task.await.expect("task");
+        assert!(cp.is_ok(), "{cp:?}");
+        let cp = cp.expect("checked above");
+        assert_eq!((cp.block_hash, cp.votes.len()), (b5, 4), "extension kept");
+
+        // Not an extension: same hash, a different committee, no votes.
+        let (mgr, gate, b5, _) = gated().await;
+        let task = tokio::spawn({
+            let mgr = mgr.clone();
+            async move { mgr.finalize_checkpoint(5).await }
+        });
+        gate.entered.notified().await;
+        mgr.prune_at_or_below(5).await;
+        let other: Vec<PublicKey> = (10..14).map(make_pubkey).collect();
+        mgr.ensure_proposed(5, b5, other).await.expect("re-propose");
+        gate.release.notify_one();
+        let cp = task.await.expect("task");
+        assert!(cp.is_ok(), "{cp:?}");
+        let cp = cp.expect("checked above");
+        assert_eq!((cp.block_hash, cp.votes.len()), (b5, 3));
+        assert_eq!(
+            cp.committee,
+            (0..4).map(make_pubkey).collect::<Vec<_>>(),
+            "the guarded certificate's committee is the one recorded"
+        );
+    }
+
     /// Stage 1a §11.9: the pending map is capped; the lowest height is evicted.
     #[tokio::test]
     async fn ensure_proposed_evicts_oldest_beyond_cap() {
