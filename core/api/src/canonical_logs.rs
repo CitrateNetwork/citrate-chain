@@ -525,6 +525,55 @@ impl ExecutedChainIndex {
     }
 }
 
+/// What [`ExecutedChainIndex::executed_after`] found on one tip snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutedRange {
+    /// The executed blocks of the range, ascending. The last one is the block
+    /// the range is complete through; empty when nothing in it has executed.
+    Blocks(Vec<(u64, Hash)>),
+    /// The cursor is not the executed block at `from - 1`: the chain the caller
+    /// scanned was replaced.
+    CursorReplaced,
+}
+
+impl ExecutedChainIndex {
+    /// The executed blocks with height in `from..=to`, all on the selected-parent
+    /// chain of ONE read of the applied tip, so the answer is complete through
+    /// its last block. With `after`, that chain must also hold `after` at height
+    /// `from - 1` (a scanner's cursor); otherwise [`ExecutedRange::CursorReplaced`].
+    /// When the tip is below `from - 1` nothing is served and the cursor is not
+    /// judged: it may be a transient rewind, and the check runs again once the
+    /// chain is back above it. `after` with `from == 0` is a caller error.
+    pub fn executed_after(
+        &self,
+        storage: &StorageManager,
+        from: u64,
+        to: u64,
+        after: Option<&Hash>,
+    ) -> Result<ExecutedRange, LogIndexError> {
+        let (tip_hash, tip_height) = executed_head(storage).map_err(LogIndexError::Unavailable)?;
+        let lo = match after {
+            Some(_) => from.checked_sub(1).ok_or_else(|| {
+                LogIndexError::Unavailable("a cursor needs fromBlock >= 1".into())
+            })?,
+            None => from,
+        };
+        if lo > tip_height {
+            return Ok(ExecutedRange::Blocks(Vec::new()));
+        }
+        let mut blocks =
+            self.executed_hashes_under(storage, tip_hash, tip_height, lo, to.max(lo))?;
+        if let Some(cursor) = after {
+            match blocks.first() {
+                Some((h, hash)) if *h == lo && hash == cursor => {}
+                _ => return Ok(ExecutedRange::CursorReplaced),
+            }
+        }
+        blocks.retain(|(h, _)| *h >= from && *h <= to);
+        Ok(ExecutedRange::Blocks(blocks))
+    }
+}
+
 /// JSON-RPC method that reports [`ExecutedChainIndex::is_executed`].
 pub const IS_EXECUTED_METHOD: &str = "citrate_isExecuted";
 
@@ -604,6 +653,21 @@ pub fn receipts_not_stored_error(height: u64, block: &Hash, tx: &Hash) -> jsonrp
             "retryable": true,
             "blockNumber": format!("0x{height:x}"),
             "blockHash": format!("0x{}", hex::encode(block.as_bytes())),
+        })),
+    }
+}
+
+/// The -32001 `citrate_getLogs` returns when `afterBlockHash` is not the
+/// executed block at `height` (`fromBlock - 1`).
+pub fn cursor_replaced_error(height: u64) -> jsonrpc_core::Error {
+    jsonrpc_core::Error {
+        code: jsonrpc_core::ErrorCode::ServerError(LOG_CURSOR_REORGED_CODE),
+        message: format!(
+            "{GET_LOGS_METHOD}: afterBlockHash is not the executed block at height {height}; the chain was replaced, scan again from an earlier point"
+        ),
+        data: Some(serde_json::json!({
+            "reorged": true,
+            "height": format!("0x{height:x}"),
         })),
     }
 }

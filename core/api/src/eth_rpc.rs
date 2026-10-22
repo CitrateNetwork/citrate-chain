@@ -1944,21 +1944,31 @@ pub fn register_eth_methods_with_finality(
     });
 
     // citrate_getLogs - eth_getLogs plus `through`, the executed block the
-    // answer is complete through. STUB (red commit): the bound comes from a
-    // separate executed-head read, as the two-read scanner protocol did.
+    // answer is complete through, both from ONE read of the applied tip. With
+    // `afterBlockHash` (the caller's previous `through`) the range must sit on
+    // a chain holding it at fromBlock-1, else -32001. A transaction with no
+    // receipt for its executed block is a retryable -32002, never an answer
+    // that claims completeness. See core/api/README.md, "Log scanner protocol".
     let storage_clogs = storage.clone();
     let finalized_clogs = finalized_height.clone();
     let executed_chain_clogs = executed_chain.clone();
     io_handler.add_sync_method(
         crate::canonical_logs::GET_LOGS_METHOD,
         move |params: Params| {
+            // The same walk and per-block reads as eth_getLogs.
             crate::rate_limit::check_method_budget(10)?;
-            let params: Vec<Value> = params
-                .parse()
-                .map_err(|e| jsonrpc_core::Error::invalid_params(e.to_string()))?;
-            let filter = &arg(&params, 0);
+            let params: Vec<Value> = match params {
+                Params::None => Vec::new(),
+                p => p
+                    .parse()
+                    .map_err(|e| jsonrpc_core::Error::invalid_params(e.to_string()))?,
+            };
+            let filter = arg(&params, 0);
             if !filter.is_object() {
-                return Err(jsonrpc_core::Error::invalid_params("Missing filter object"));
+                return Err(jsonrpc_core::Error::invalid_params(format!(
+                    "{}: expected params [filter]",
+                    crate::canonical_logs::GET_LOGS_METHOD
+                )));
             }
             crate::filter::validate_log_filter_criteria(filter)
                 .map_err(jsonrpc_core::Error::invalid_params)?;
@@ -1966,30 +1976,49 @@ pub fn register_eth_methods_with_finality(
             let finalized = finalized_clogs.load(Ordering::SeqCst);
             let (from_block, to_block, criteria) =
                 parse_log_filter(filter, current_height, finalized)?;
+            let after = match filter.get("afterBlockHash") {
+                None | Some(Value::Null) => None,
+                Some(v) => {
+                    if from_block == 0 {
+                        return Err(jsonrpc_core::Error::invalid_params(format!(
+                            "{}: afterBlockHash needs fromBlock >= 1",
+                            crate::canonical_logs::GET_LOGS_METHOD
+                        )));
+                    }
+                    Some(crate::canonical_logs::parse_block_hash_for(
+                        crate::canonical_logs::GET_LOGS_METHOD,
+                        Some(v),
+                    )?)
+                }
+            };
+            // Never the legacy clamp: a clamped range is not complete through
+            // its toBlock.
             let to = crate::canonical_logs::bound_log_range(from_block, to_block, false)?;
-            let executed = executed_chain_clogs
-                .executed_hashes(&storage_clogs, from_block, to)
-                .map_err(|e| e.to_rpc_error())?;
+            let blocks = match executed_chain_clogs
+                .executed_after(&storage_clogs, from_block, to, after.as_ref())
+                .map_err(|e| e.to_rpc_error())?
+            {
+                crate::canonical_logs::ExecutedRange::Blocks(b) => b,
+                crate::canonical_logs::ExecutedRange::CursorReplaced => {
+                    return Err(crate::canonical_logs::cursor_replaced_error(
+                        from_block.saturating_sub(1),
+                    ))
+                }
+            };
             let mut logs = Vec::new();
-            for (_, h) in &executed {
+            for (_, h) in &blocks {
                 push_block_logs(
                     &storage_clogs,
                     h,
                     &criteria,
-                    ReceiptPolicy::SkipMissing,
+                    ReceiptPolicy::RequireAll,
                     &mut logs,
                 )?;
             }
-            let through = match crate::canonical_logs::executed_head(&storage_clogs) {
-                Ok((hash, n)) if n <= to && n >= from_block => {
-                    crate::canonical_logs::block_ref_json(n, &hash)
-                }
-                Ok(_) => executed
-                    .last()
-                    .map(|(n, h)| crate::canonical_logs::block_ref_json(*n, h))
-                    .unwrap_or(Value::Null),
-                Err(_) => Value::Null,
-            };
+            let through = blocks
+                .last()
+                .map(|(n, h)| crate::canonical_logs::block_ref_json(*n, h))
+                .unwrap_or(Value::Null);
             Ok(json!({ "logs": logs, "through": through }))
         },
     );
