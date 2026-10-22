@@ -313,7 +313,15 @@ pub struct ExecutedChainIndex {
     /// repeating the same scan.
     fill: Mutex<()>,
     walk_budget: u64,
+    /// Test seam: runs once, after a walk and before it publishes, so a test
+    /// can interleave another request deterministically. Absent from non-test
+    /// builds.
+    #[cfg(test)]
+    before_publish: Mutex<Option<BeforePublish>>,
 }
+
+#[cfg(test)]
+type BeforePublish = Box<dyn FnOnce(&ExecutedChainIndex) + Send>;
 
 impl Default for ExecutedChainIndex {
     fn default() -> Self {
@@ -332,6 +340,8 @@ impl ExecutedChainIndex {
             state: Mutex::new(CacheState::default()),
             fill: Mutex::new(()),
             walk_budget: walk_budget.max(1),
+            #[cfg(test)]
+            before_publish: Mutex::new(None),
         }
     }
 
@@ -451,6 +461,14 @@ impl ExecutedChainIndex {
             }
             expect_at_most = h.saturating_sub(1);
             cursor = header.selected_parent_hash;
+        }
+
+        #[cfg(test)]
+        {
+            let hook = self.before_publish.lock().ok().and_then(|mut h| h.take());
+            if let Some(hook) = hook {
+                hook(self);
+            }
         }
 
         if !found.is_empty() {
@@ -573,5 +591,143 @@ mod tests {
     #[test]
     fn legacy_clamp_restores_the_old_window() {
         assert_eq!(bound_log_range(7, 50_000, true).unwrap(), 1_007);
+    }
+
+    // ---- In-flight walk vs. a concurrent re-anchor (generation gate) ----
+
+    use std::sync::Arc;
+
+    fn gate_hash(tag: u8, h: u64) -> Hash {
+        let mut raw = [0u8; 32];
+        raw[..8].copy_from_slice(&h.to_be_bytes());
+        raw[31] = tag;
+        Hash::new(raw)
+    }
+
+    /// Stores a straight chain `tag` over `lo..=hi` on `parent`; returns the hashes.
+    fn gate_branch(storage: &StorageManager, tag: u8, mut parent: Hash, lo: u64, hi: u64) -> Vec<Hash> {
+        use citrate_consensus::types::BlockBuilder;
+        let mut out = Vec::new();
+        for h in lo..=hi {
+            let b = BlockBuilder::new()
+                .hash(gate_hash(tag, h))
+                .parent(parent)
+                .height(h)
+                .build_unhashed();
+            storage.blocks.put_block(&b).expect("block");
+            parent = b.hash();
+            out.push(parent);
+        }
+        out
+    }
+
+    /// Chain A over `0..=top` with the applied tip at `top`, where `top` puts a
+    /// checkpoint at 1024 more than `SETTLED_DEPTH` below the tip.
+    fn gate_fixture() -> (Arc<StorageManager>, tempfile::TempDir, Vec<Hash>, u64) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let storage = Arc::new(
+            StorageManager::new(tmp.path(), citrate_storage::pruning::PruningConfig::default())
+                .expect("storage"),
+        );
+        let top = SETTLED_DEPTH + CHECKPOINT_STRIDE + 10;
+        let a = gate_branch(&storage, 0xA0, Hash::default(), 0, top);
+        storage.blocks.put_applied_tip(&a[top as usize], top).expect("tip");
+        (storage, tmp, a, top)
+    }
+
+    /// Replaces the applied chain with chain B, forked from A at height 499 (below
+    /// the 1024 checkpoint), at the same tip height.
+    fn replace_below_checkpoint(storage: &StorageManager, a: &[Hash], top: u64) {
+        let b = gate_branch(storage, 0xB0, a[499], 500, top);
+        storage
+            .blocks
+            .put_applied_tip(b.last().expect("tip"), top)
+            .expect("tip");
+    }
+
+    /// The query a cold walk has to answer, and what it must say after the walk.
+    fn assert_serves_chain_b_at_1024(idx: &ExecutedChainIndex, storage: &StorageManager) {
+        let got = idx.executed_hashes(storage, 1_024, 1_024).expect("page");
+        assert_eq!(
+            got,
+            vec![(1_024, gate_hash(0xB0, 1_024))],
+            "a checkpoint found on the replaced chain was published and served"
+        );
+    }
+
+    /// A cold walk collects checkpoints on chain A. Before it publishes, another
+    /// request re-anchors on chain B, which forks below those checkpoints. The
+    /// walk must not publish them: the generation changed.
+    #[test]
+    fn in_flight_walk_does_not_publish_across_a_fork_below_its_checkpoints() {
+        let (storage, _tmp, a, top) = gate_fixture();
+        let idx = ExecutedChainIndex::new();
+        let s = storage.clone();
+        let a_hook = a.clone();
+        *idx.before_publish.lock().expect("hook") = Some(Box::new(move |idx: &ExecutedChainIndex| {
+            replace_below_checkpoint(&s, &a_hook, top);
+            // A concurrent near-tip request on the new chain re-anchors.
+            let near = idx.executed_hashes(&s, top, top).expect("near tip");
+            assert_eq!(near, vec![(top, gate_hash(0xB0, top))]);
+        }));
+        let cold = idx.executed_hashes(&storage, 0, 0).expect("cold walk");
+        assert_eq!(cold, vec![(0, a[0])], "height 0 is shared by both chains");
+        assert_eq!(
+            idx.checkpoint_count(),
+            0,
+            "the walk's chain-A checkpoints must not be published"
+        );
+        assert_serves_chain_b_at_1024(&idx, &storage);
+    }
+
+    /// Same interleaving, but the concurrent re-anchors take the full-drop path
+    /// (`drop_checkpoints`): first a tip whose chain cannot be followed, then
+    /// chain B. A full drop must start a new generation too.
+    #[test]
+    fn in_flight_walk_does_not_publish_across_a_full_drop() {
+        let (storage, _tmp, a, top) = gate_fixture();
+        let idx = ExecutedChainIndex::new();
+        let s = storage.clone();
+        let a_hook = a.clone();
+        *idx.before_publish.lock().expect("hook") = Some(Box::new(move |idx: &ExecutedChainIndex| {
+            use citrate_consensus::types::BlockBuilder;
+            // A tip whose selected parent is not stored: the common-ancestor
+            // walk breaks, so the cache is dropped.
+            let z = BlockBuilder::new()
+                .hash(gate_hash(0xC0, top))
+                .parent(gate_hash(0xC0, top - 1))
+                .height(top)
+                .build_unhashed();
+            s.blocks.put_block(&z).expect("z");
+            s.blocks.put_applied_tip(&z.hash(), top).expect("tip");
+            idx.executed_hashes(&s, top, top).expect("near tip on z");
+            // Then chain B: re-anchoring from the broken tip drops again.
+            replace_below_checkpoint(&s, &a_hook, top);
+            idx.executed_hashes(&s, top, top).expect("near tip on b");
+        }));
+        idx.executed_hashes(&storage, 0, 0).expect("cold walk");
+        assert_eq!(
+            idx.checkpoint_count(),
+            0,
+            "the walk's chain-A checkpoints must not be published"
+        );
+        assert_serves_chain_b_at_1024(&idx, &storage);
+    }
+
+    /// Control: with no concurrent re-anchor the same walk publishes, so the
+    /// two tests above fail only because of the interleaving.
+    #[test]
+    fn in_flight_walk_publishes_when_nothing_moved() {
+        let (storage, _tmp, a, top) = gate_fixture();
+        let idx = ExecutedChainIndex::new();
+        let s = storage.clone();
+        *idx.before_publish.lock().expect("hook") = Some(Box::new(move |idx: &ExecutedChainIndex| {
+            // A concurrent request at the same tip changes nothing.
+            idx.executed_hashes(&s, top, top).expect("near tip");
+        }));
+        idx.executed_hashes(&storage, 0, 0).expect("cold walk");
+        assert_eq!(idx.checkpoint_count(), 2, "checkpoints at 0 and 1024");
+        let got = idx.executed_hashes(&storage, 1_024, 1_024).expect("page");
+        assert_eq!(got, vec![(1_024, a[1_024])]);
     }
 }
