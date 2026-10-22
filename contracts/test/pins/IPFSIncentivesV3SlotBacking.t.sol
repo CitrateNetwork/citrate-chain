@@ -22,7 +22,22 @@ contract IPFSIncentivesV3SlotBackingTest is Test {
         kyc = new KYCRegistry(address(0), address(this));
         MockFoldVerifier fold = new MockFoldVerifier();
         inc = new IPFSIncentivesV3(
-            kyc, 10 ether, 4 ether, 4, 1, 5000, 2, 10, 32, 1 ether, 32, 55 ether, 302400, 5000, address(fold), address(this)
+            kyc,
+            10 ether,
+            4 ether,
+            4,
+            1,
+            5000,
+            2,
+            10,
+            32,
+            1 ether,
+            32,
+            55 ether,
+            302400,
+            5000,
+            address(fold),
+            address(this)
         );
         vm.etch(VERIFY, type(MockVerifier).runtimeCode);
         (bool ok,) = VERIFY.call(abi.encodeWithSignature("setVerdict(uint256)", uint256(1)));
@@ -39,13 +54,17 @@ contract IPFSIncentivesV3SlotBackingTest is Test {
 
     function _seal() internal {
         vm.prank(PINNER);
-        inc.sealCommit{value: 10 ether}(CID, 0, bytes32("rid"), 1, bytes32("commD"), bytes32("R"), bytes32("C"), hex"00");
+        inc.sealCommit{value: 10 ether}(
+            CID, 0, bytes32("rid"), 1, bytes32("commD"), bytes32("R"), bytes32("C"), hex"00"
+        );
     }
 
     function test_sealIntoUnfundedContractReverts() public {
         vm.prank(PINNER);
         vm.expectRevert(bytes("Insufficient slot funding"));
-        inc.sealCommit{value: 10 ether}(CID, 0, bytes32("rid"), 1, bytes32("commD"), bytes32("R"), bytes32("C"), hex"00");
+        inc.sealCommit{value: 10 ether}(
+            CID, 0, bytes32("rid"), 1, bytes32("commD"), bytes32("R"), bytes32("C"), hex"00"
+        );
         assertEq(inc.totalSlotBudgetFunded(), 0, "no budget created without backing");
     }
 
@@ -53,7 +72,9 @@ contract IPFSIncentivesV3SlotBackingTest is Test {
         inc.fund{value: 1 ether}();
         vm.prank(PINNER);
         vm.expectRevert(bytes("Insufficient slot funding"));
-        inc.sealCommit{value: 10 ether}(CID, 0, bytes32("rid"), 1, bytes32("commD"), bytes32("R"), bytes32("C"), hex"00");
+        inc.sealCommit{value: 10 ether}(
+            CID, 0, bytes32("rid"), 1, bytes32("commD"), bytes32("R"), bytes32("C"), hex"00"
+        );
         assertEq(inc.unallocatedSlotFunding(), 1 ether);
         assertEq(inc.totalSlotBudgetFunded(), 0);
     }

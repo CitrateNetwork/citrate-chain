@@ -29,18 +29,21 @@ contract CitrateWalletFactoryPermitNonceTest is Test {
         factory = new CitrateWalletFactory(address(impl), signer, ownerAddr);
         StubEntryPoint ep = new StubEntryPoint();
         CitratePaymaster pm = new CitratePaymaster(
-            IEntryPoint(address(ep)), ownerAddr, address(factory), signer,
-            0.01 ether, 0.01 ether, 0.02 ether, 20 gwei, 5 ether
+            IEntryPoint(address(ep)),
+            ownerAddr,
+            address(factory),
+            signer,
+            0.01 ether,
+            0.01 ether,
+            0.02 ether,
+            20 gwei,
+            5 ether
         );
         vm.prank(ownerAddr);
         factory.setPaymaster(address(pm));
     }
 
-    function _permitSig(bytes32 userId, bytes memory initData, uint256 expiresAt)
-        internal
-        view
-        returns (bytes memory)
-    {
+    function _permitSig(bytes32 userId, bytes memory initData, uint256 expiresAt) internal view returns (bytes memory) {
         bytes32 ethDigest = factory.permitDigest(userId, initData, expiresAt).toEthSignedMessageHash();
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(SIGNER_PK, ethDigest);
         return abi.encodePacked(r, s, v);

@@ -28,21 +28,27 @@ contract AIInferenceRouterPortablePayoutTest is Test {
     }
 
     function _signReceipt(uint256 requestId, bytes32 outputCommitment) internal view returns (bytes memory) {
-        bytes32 domainSeparator = keccak256(abi.encode(
-            keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
-            keccak256("AIInferenceRouter"),
-            keccak256("1"),
-            block.chainid,
-            address(router)
-        ));
+        bytes32 domainSeparator = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256("AIInferenceRouter"),
+                keccak256("1"),
+                block.chainid,
+                address(router)
+            )
+        );
         (bytes32 mId,,,,) = router.getRequest(requestId);
-        bytes32 structHash = keccak256(abi.encode(
-            keccak256("AIExecutionReceipt(uint256 requestId,bytes32 outputCommitment,bytes32 modelId,uint256 timestamp)"),
-            requestId,
-            outputCommitment,
-            mId,
-            block.timestamp
-        ));
+        bytes32 structHash = keccak256(
+            abi.encode(
+                keccak256(
+                    "AIExecutionReceipt(uint256 requestId,bytes32 outputCommitment,bytes32 modelId,uint256 timestamp)"
+                ),
+                requestId,
+                outputCommitment,
+                mId,
+                block.timestamp
+            )
+        );
         (uint8 v, bytes32 r, bytes32 s) =
             vm.sign(WORKER_PK, keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash)));
         return abi.encodePacked(r, s, v);
