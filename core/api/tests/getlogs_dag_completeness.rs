@@ -392,7 +392,7 @@ fn executed_chain_index_resolves_deep_history_through_checkpoints() {
     let hashes: Vec<Hash> = page.iter().map(|(_, h)| *h).collect();
     assert_eq!(hashes, canon[1_000..=1_020].to_vec());
 
-    // A tip regression drops the cache.
+    // A tip regression to an ancestor is served from the same chain.
     storage
         .blocks
         .put_applied_tip(&canon[2_000], 2_000)
@@ -613,6 +613,19 @@ fn executed_chain_index_bounds_a_cold_walk_and_progresses_on_retry() {
 /// request completes within the same number of tries as with no churn.
 #[test]
 fn executed_chain_index_cold_fill_survives_tip_churn() {
+    cold_fill_under_churn(0);
+}
+
+/// The same with several concurrent near-tip readers. A reader can read the
+/// applied tip, lose the cache lock to a reader that read the next commit, and
+/// re-anchor on a tip one block BELOW the anchor. That tip is an ancestor of
+/// the anchor, so neither the cache nor an in-flight fill may be dropped.
+#[test]
+fn executed_chain_index_cold_fill_survives_concurrent_readers() {
+    cold_fill_under_churn(8);
+}
+
+fn cold_fill_under_churn(readers: usize) {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let (storage, _tmp) = storage();
@@ -652,6 +665,25 @@ fn executed_chain_index_cold_fill_survives_tip_churn() {
         })
     };
 
+    let reader_threads: Vec<_> = (0..readers)
+        .map(|_| {
+            let (storage, idx, stop) = (storage.clone(), idx.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    let (_, h) = storage
+                        .blocks
+                        .get_applied_tip()
+                        .expect("tip read")
+                        .expect("tip");
+                    let near = idx
+                        .executed_hashes(&storage, h.saturating_sub(5), h)
+                        .expect("near-tip query fits the budget");
+                    assert_eq!(near.len(), 6);
+                }
+            })
+        })
+        .collect();
+
     // Each retry restarts at the lowest checkpoint it reached, so a cold fill
     // advances at least one stride per try. Allow slack for the blocks the
     // churn thread adds above the start.
@@ -686,6 +718,9 @@ fn executed_chain_index_cold_fill_survives_tip_churn() {
     };
     stop.store(true, Ordering::Release);
     churn.join().expect("churn thread");
+    for r in reader_threads {
+        r.join().expect("reader thread");
+    }
 
     assert!(overlapped > 0, "the tip never advanced during a deep walk");
     assert_eq!(
@@ -693,4 +728,125 @@ fn executed_chain_index_cold_fill_survives_tip_churn() {
         canon[0..=10].to_vec()
     );
     assert!(idx.checkpoint_count() as u64 >= top / CHECKPOINT_STRIDE - 1);
+}
+
+/// A chain of `top + 1` blocks (tag 0xA0) with the applied tip at `top`.
+fn straight_chain(storage: &StorageManager, top: u64) -> Vec<Hash> {
+    let mut parent = Hash::default();
+    let mut canon = Vec::new();
+    for h in 0..=top {
+        let b = block(hash_of(0xA0, h), parent, vec![], h, vec![]);
+        storage.blocks.put_block(&b).expect("block");
+        parent = b.hash();
+        canon.push(parent);
+    }
+    storage.blocks.put_applied_tip(&parent, top).expect("tip");
+    canon
+}
+
+/// A request that read the applied tip before a concurrent commit re-anchors on
+/// an ancestor of the anchor. Deterministically: warm the cache, set the applied
+/// tip back to its parent, query. The tip only went back along the same chain,
+/// so every checkpoint stays, and the next commit keeps them too.
+#[test]
+fn executed_chain_index_keeps_checkpoints_on_an_older_tip_of_the_same_chain() {
+    let (storage, _tmp) = storage();
+    let top = SETTLED_DEPTH + 4 * CHECKPOINT_STRIDE + 10;
+    let canon = straight_chain(&storage, top);
+    let idx = ExecutedChainIndex::new();
+    idx.executed_hashes(&storage, 0, 10).expect("warm");
+    let warm = idx.checkpoint_count();
+    assert_eq!(warm, 5, "checkpoints at 0, 1024, 2048, 3072, 4096");
+
+    // The stale reader: the tip it sees is the parent of the anchor.
+    storage
+        .blocks
+        .put_applied_tip(&canon[top as usize - 1], top - 1)
+        .expect("tip");
+    let near = idx
+        .executed_hashes(&storage, top - 6, top - 1)
+        .expect("near tip");
+    assert_eq!(near.len(), 6);
+    assert_eq!(
+        idx.checkpoint_count(),
+        warm,
+        "an older tip on the anchor's chain must keep every checkpoint"
+    );
+
+    // Back to the newer tip: still kept, and a deep page is served from them.
+    storage
+        .blocks
+        .put_applied_tip(&canon[top as usize], top)
+        .expect("tip");
+    let page = idx.executed_hashes(&storage, 2_000, 2_010).expect("page");
+    assert_eq!(
+        page.iter().map(|(_, h)| *h).collect::<Vec<_>>(),
+        canon[2_000..=2_010].to_vec()
+    );
+    assert_eq!(idx.checkpoint_count(), warm);
+}
+
+/// A reorg near the tip (the applicator's rollback window) replaces a few
+/// blocks; every checkpoint lies far below the fork and stays valid. A fork
+/// between two checkpoints keeps exactly the ones at or below it, and pages
+/// follow the new chain above it.
+#[test]
+fn executed_chain_index_keeps_checkpoints_below_the_fork_point() {
+    let (storage, _tmp) = storage();
+    let top = SETTLED_DEPTH + 4 * CHECKPOINT_STRIDE + 10;
+    let canon = straight_chain(&storage, top);
+    let idx = ExecutedChainIndex::new();
+    idx.executed_hashes(&storage, 0, 10).expect("warm");
+    let warm = idx.checkpoint_count();
+    assert_eq!(warm, 5);
+
+    // Shallow reorg: fork 5 below the tip, the new branch ends one higher.
+    let fork = top - 5;
+    let side = build_branch(&storage, 0xB0, canon[fork as usize], fork + 1, top + 1);
+    storage
+        .blocks
+        .put_applied_tip(side.last().expect("tip"), top + 1)
+        .expect("tip");
+    let near = idx
+        .executed_hashes(&storage, fork, top + 1)
+        .expect("near tip");
+    let mut want = vec![canon[fork as usize]];
+    want.extend(side.iter().copied());
+    assert_eq!(near.iter().map(|(_, h)| *h).collect::<Vec<_>>(), want);
+    assert_eq!(
+        idx.checkpoint_count(),
+        warm,
+        "a reorg above every checkpoint must keep them all"
+    );
+
+    // Deep fork between the 2048 and 3072 checkpoints: 0, 1024, 2048 stay.
+    let deep = 2_500u64;
+    let other = build_branch(&storage, 0xC0, canon[deep as usize], deep + 1, top + 2);
+    storage
+        .blocks
+        .put_applied_tip(other.last().expect("tip"), top + 2)
+        .expect("tip");
+    let page = idx
+        .executed_hashes(&storage, 2_495, 2_505)
+        .expect("page across the fork");
+    let mut want = canon[2_495..=2_500].to_vec();
+    want.extend(other[..5].iter().copied());
+    assert_eq!(page.iter().map(|(_, h)| *h).collect::<Vec<_>>(), want);
+    // 0, 1024, 2048 kept; the walk from the new tip re-collected 3072 and 4096
+    // on the new chain.
+    assert_eq!(
+        idx.checkpoint_count(),
+        5,
+        "checkpoints at or below the fork must survive a deeper reorg"
+    );
+    let shared = idx.executed_hashes(&storage, 1_000, 1_010).expect("shared");
+    assert_eq!(
+        shared.iter().map(|(_, h)| *h).collect::<Vec<_>>(),
+        canon[1_000..=1_010].to_vec()
+    );
+    let page = idx.executed_hashes(&storage, 3_000, 3_010).expect("page");
+    assert_eq!(
+        page.iter().map(|(_, h)| *h).collect::<Vec<_>>(),
+        other[(3_000 - deep - 1) as usize..=(3_010 - deep - 1) as usize].to_vec()
+    );
 }
