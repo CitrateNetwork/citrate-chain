@@ -687,7 +687,7 @@ impl SnapshotReader<'_> {
 /// unknown-version blob returns `Err` (so the boot path falls back to a recompute)
 /// rather than panicking or silently loading a partial snapshot.
 #[allow(clippy::type_complexity)]
-fn decode_reward_snapshot(
+pub(crate) fn decode_reward_snapshot(
     buf: &[u8],
 ) -> Result<
     (

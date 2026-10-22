@@ -51,6 +51,23 @@ pub enum CheckpointError {
 /// never finalizes. A committee of 4 tolerates 1 Byzantine member at quorum 3.
 pub const MIN_FINALITY_COMMITTEE: usize = 4;
 
+/// Stage 1 (WIRING §3): confirmation depth D. The committee judges a checkpoint
+/// block only once it is buried this many blocks under the applied tip, so a
+/// heavier GhostDAG sibling can no longer replace it.
+pub const CHECKPOINT_CONFIRMATION_DEPTH: u64 = 3;
+
+/// Stage 1: the checkpoint height to propose once the applied tip is at
+/// `applied_height`: the newest boundary (`H > 0`, `H % interval == 0`) with
+/// `H + depth <= applied_height`. `None` when no boundary is that deep yet, or
+/// when `interval` is 0. Pure, so every node derives the same height from the
+/// same applied tip.
+pub fn checkpoint_to_propose(applied_height: u64, interval: u64, depth: u64) -> Option<u64> {
+    let buried = applied_height.checked_sub(depth)?;
+    let rem = buried.checked_rem(interval)?;
+    let h = buried.checked_sub(rem)?;
+    (h > 0).then_some(h)
+}
+
 /// Derived BFT quorum for an effective committee of size `n`: `floor(2n/3) + 1`.
 ///
 /// docs/consensus/CHECKPOINT_FINALITY_WIRING.md §3 (D-2). This is the standard
@@ -470,6 +487,25 @@ impl CheckpointManager {
         }
         // voted is already initialized via new()
         mgr
+    }
+
+    /// Stage 1 (WIRING §11.9): drop pending checkpoints, and the per-height
+    /// replay markers, below `height`. Without votes (one producer, or a stalled
+    /// committee) every proposal would otherwise stay pending forever. Never
+    /// touches finalized checkpoints. Returns how many pending checkpoints went.
+    pub async fn prune_below(&self, height: u64) -> usize {
+        let mut pending = self.pending.write().await;
+        let before = pending.len();
+        pending.retain(|h, _| *h >= height);
+        let dropped = before.saturating_sub(pending.len());
+        drop(pending);
+        self.voted.write().await.retain(|(h, _)| *h >= height);
+        dropped
+    }
+
+    #[cfg(test)]
+    async fn voted_len(&self) -> usize {
+        self.voted.read().await.len()
     }
 
     /// Get the checkpoint config.
@@ -944,6 +980,67 @@ mod tests {
             blocks.push(block);
         }
         blocks
+    }
+
+    /// Stage 1: the checkpoint to propose is the newest boundary buried at
+    /// least `depth` blocks under the applied tip (WIRING §3: vote at depth D,
+    /// never at the tip).
+    #[test]
+    fn stage1_checkpoint_to_propose_waits_for_depth() {
+        assert_eq!(checkpoint_to_propose(10, 2, 3), Some(6));
+        assert_eq!(checkpoint_to_propose(9, 2, 3), Some(6));
+        assert_eq!(checkpoint_to_propose(8, 2, 3), Some(4));
+        assert_eq!(
+            checkpoint_to_propose(4, 2, 3),
+            None,
+            "1 is not a boundary, 0 never is"
+        );
+        assert_eq!(checkpoint_to_propose(2, 2, 3), None);
+        assert_eq!(checkpoint_to_propose(153, 50, 3), Some(150));
+        assert_eq!(checkpoint_to_propose(152, 50, 3), Some(100));
+        assert_eq!(
+            checkpoint_to_propose(u64::MAX, 50, 0),
+            Some(u64::MAX - u64::MAX % 50)
+        );
+        assert_eq!(
+            checkpoint_to_propose(100, 0, 3),
+            None,
+            "interval 0 is not a schedule"
+        );
+    }
+
+    /// Stage 1: pending checkpoints and their replay markers are bounded. With
+    /// no votes arriving (one producer, or a stalled committee) proposals would
+    /// otherwise pile up forever (WIRING §11.9).
+    #[tokio::test]
+    async fn stage1_prune_below_drops_pending_and_voted() {
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let chain = build_chain(&dag, 21).await;
+        let mgr = CheckpointManager::new(CheckpointConfig::for_testing(), dag.clone());
+        let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
+        for h in [5u64, 10, 15, 20] {
+            mgr.propose(h, chain[h as usize].hash(), committee.clone())
+                .await
+                .unwrap();
+        }
+        mgr.submit_vote(make_signed_vote(0, 5, &chain[5].hash()))
+            .await
+            .unwrap();
+        assert_eq!(mgr.prune_below(15).await, 2, "5 and 10 dropped");
+        assert!(mgr.checkpoint_status(5).await.is_none());
+        assert!(mgr.checkpoint_status(10).await.is_none());
+        assert!(mgr.checkpoint_status(15).await.is_some());
+        assert!(mgr.checkpoint_status(20).await.is_some());
+        assert_eq!(
+            mgr.voted_len().await,
+            0,
+            "replay markers below the cut go too"
+        );
+        assert_eq!(
+            mgr.latest_finalized_height().await,
+            0,
+            "pruning never finalizes"
+        );
     }
 
     /// Committee selection is deterministic.

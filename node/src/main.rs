@@ -40,6 +40,7 @@ mod artifact;
 mod block_serve;
 pub mod bundled_model;
 mod canonical_apply;
+mod checkpoint_driver;
 mod commands;
 mod config;
 mod consensus_manifest;
@@ -2071,6 +2072,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             kv,
         ))
     };
+    // Checkpoint finality Stage 1, first slice: propose buried checkpoints with the
+    // epoch-pinned committee. Off unless CITRATE_CHECKPOINT_FINALITY=1; no local vote
+    // is signed yet, so nothing finalizes (see node/src/checkpoint_driver.rs).
+    checkpoint_driver::spawn(storage.clone(), checkpoint_manager.clone());
 
     // WP-S.3 Stage 1a: the checkpoint-finality producer path (propose / sign /
     // broadcast / early-vote buffer / relay). Switched by the COMPILED pin for this

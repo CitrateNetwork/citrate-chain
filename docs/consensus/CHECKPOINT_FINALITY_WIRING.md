@@ -57,8 +57,8 @@ committee exist (see §7).
 | `NetworkMessage::CheckpointVote` + **inbound** handler | ✅ | `protocol.rs:272`, `main.rs:3328` |
 | Finalized-floor sink + 5 s poll + reorg guard (I4) | ✅ wired, fed 0 | `canonical_apply.rs:219,352`; `main.rs:1839` |
 | Active validator set read from `ValidatorRegistry.activeSet()` | ✅ (feeds proposer, not committee) | `registry_sync.rs:274` |
-| **Production `propose()` at checkpoint boundaries** | ❌ missing | — |
-| **Committee selection fed from the active set** | ❌ missing | — |
+| **Production `propose()` at checkpoint boundaries** | ⚙️ Stage 1 slice 1, implemented, off by default (`CITRATE_CHECKPOINT_FINALITY`), not runtime-proven | `node/src/checkpoint_driver.rs` |
+| **Committee selection fed from the active set** | ⚙️ Stage 1 slice 1: epoch-pinned (governing S(E) snapshot, §11.6), off by default | `node/src/checkpoint_driver.rs` |
 | **Outbound vote: construct → sign → broadcast** | ❌ missing | — |
 | **`finalized`/`safe` RPC block tag** | ❌ missing | `eth_rpc.rs:326` |
 | **`CheckpointNodeConfig` → `CheckpointConfig` plumbing** | ❌ ignored (uses `default()`) | `config.rs:65`; `main.rs:1767` |

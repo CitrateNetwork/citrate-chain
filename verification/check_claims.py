@@ -5,10 +5,13 @@ Offline, stdlib only. Fails (exit 1) when:
 
 1. claims.json asserts checkpoint finality is running
    (deterministic_checkpoint_finality.value.running == true, or a status other
-   than specified-not-running) while no non-test code path calls `.propose(`
-   in node/src or core/consensus/src. The reverse (a production caller exists
-   but the claim still says not running) is reported as a warning so the claim
-   gets updated when checkpoint finality is wired.
+   than specified-not-running) while non-test code in node/src or
+   core/consensus/src lacks EITHER half of the mechanism: a `.propose(` call
+   (Stage 1 propose) AND a `sign_checkpoint_vote(` call (the outbound vote:
+   construct, sign, broadcast). Proposing alone finalizes nothing, so a
+   propose caller on its own never counts as running (WIRING §11.11). A
+   production caller of both while the claim still says not running is
+   reported as a warning so the claim gets updated.
 2. consensus_ghostdag / confirmation_latency describe finality as current while
    checkpoint finality is not running.
 3. A public README (see PUBLIC_DOCS) describes finality as current, cites the
@@ -131,8 +134,9 @@ def strip_tests(src: str) -> str:
     return "".join(out)
 
 
-def production_propose_callers(root: Path) -> list[str]:
+def production_callers(root: Path, pattern: str) -> list[str]:
     hits = []
+    rx = re.compile(pattern)
     for base in ("node/src", "core/consensus/src"):
         for f in sorted((root / base).rglob("*.rs")):
             if "/tests/" in str(f) or f.name.endswith("_tests.rs"):
@@ -140,9 +144,19 @@ def production_propose_callers(root: Path) -> list[str]:
             body = strip_tests(f.read_text(errors="replace"))
             for i, line in enumerate(body.splitlines(), 1):
                 code = line.split("//", 1)[0]
-                if re.search(r"\.propose\s*\(", code):
+                if re.search(r"\bfn\s", code):
+                    continue  # a definition is not a caller
+                if rx.search(code):
                     hits.append(f"{f.relative_to(root)}:{i}")
     return hits
+
+
+def production_propose_callers(root: Path) -> list[str]:
+    return production_callers(root, r"\.propose\s*\(")
+
+
+def production_vote_signers(root: Path) -> list[str]:
+    return production_callers(root, r"\bsign_checkpoint_vote\s*\(")
 
 
 def check(root: Path) -> tuple[list[str], list[str]]:
@@ -154,18 +168,26 @@ def check(root: Path) -> tuple[list[str], list[str]]:
     running = bool((dcf.get("value") or {}).get("running", True))
     status = dcf.get("verification_status")
     callers = production_propose_callers(root)
-    if (running or status != "specified-not-running") and not callers:
+    signers = production_vote_signers(root)
+    wired = bool(callers) and bool(signers)
+    if (running or status != "specified-not-running") and not wired:
         errs.append(
             "claims.json deterministic_checkpoint_finality asserts a running mechanism "
-            f"(running={running}, status={status}) but no non-test code calls .propose( "
-            "in node/src or core/consensus/src"
+            f"(running={running}, status={status}) but non-test code in node/src or "
+            "core/consensus/src lacks a .propose( caller and/or a sign_checkpoint_vote( caller "
+            f"(propose: {len(callers)}, outbound vote: {len(signers)})"
         )
-    if callers and not running:
+    if callers and not signers:
         warns.append(
-            f"production .propose( callers exist ({', '.join(callers)}); re-verify and update "
+            f"production .propose( callers exist ({', '.join(callers)}) but no outbound vote "
+            "(sign_checkpoint_vote) — checkpoints are proposed, none can finalize"
+        )
+    if wired and not running:
+        warns.append(
+            f"production .propose( and sign_checkpoint_vote( callers exist; re-verify and update "
             "deterministic_checkpoint_finality if checkpoints now finalize on the live network"
         )
-    finality_running = running and bool(callers)
+    finality_running = running and wired
 
     if not finality_running:
         cg = json.dumps(claims.get("consensus_ghostdag", {}).get("value", {}))
