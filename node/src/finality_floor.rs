@@ -681,6 +681,83 @@ mod tests {
         assert_eq!(r.verifier.halt_reason().await, None);
     }
 
+    /// The range reads behind `eth_getLogs` / `eth_feeHistory` / log filters,
+    /// fed by this verifier's RPC handle: after boot from a persisted
+    /// certificate, and again after a restart that reloads it, heights at or
+    /// below the certified height follow the certified chain (a1, a2) even
+    /// though the height index names the later-written sibling b2; a reorg onto
+    /// b3 across the raised floor is refused and changes nothing.
+    #[tokio::test]
+    async fn enforced_range_reads_follow_the_certified_chain_across_restart() {
+        use citrate_api::finalized_tag::range_block_hashes;
+        let (exec, storage, _dir) = fresh();
+        let app = Arc::new(CanonicalApplicator::new(exec, storage.clone()));
+        let (a1, a2, b2, b3) = setup_fork(&app, &storage).await;
+        persist_certificate(&storage, &certificate(2, a2.header.block_hash, 3));
+        assert_eq!(
+            storage.blocks.get_block_by_height(2).expect("height index"),
+            Some(b2.header.block_hash),
+            "precondition: last-written sibling wins the height index"
+        );
+        let certified = vec![(1, a1.header.block_hash), (2, a2.header.block_hash)];
+        let expected = {
+            let mut v = certified.clone();
+            v.push((3, b3.header.block_hash)); // above the floor: height index
+            v
+        };
+
+        let r = rig(FloorMode::Enforced, manager_over(&storage), app.clone());
+        assert!(matches!(
+            r.verifier.boot_check().await,
+            FloorTick::Verified { height: 2, .. }
+        ));
+        let anchor = r.verifier.rpc_finalized_handle().resolve(&storage);
+        assert_eq!(
+            range_block_hashes(&storage, Some(anchor), 1, 2).expect("range"),
+            certified
+        );
+        assert_eq!(
+            range_block_hashes(&storage, Some(anchor), 1, 3).expect("straddling range"),
+            expected
+        );
+
+        {
+            let lock = app.advance_lock();
+            let mut state = lock.lock().await;
+            match app.reorg_to(&mut state, b3.header.block_hash).await {
+                ReorgOutcome::Rejected(_) => {}
+                other => panic!("reorg across the floor must be refused, got {other:?}"),
+            }
+        }
+
+        // Restart: a fresh manager reloads the certificate from disk and a fresh
+        // verifier re-publishes it at boot.
+        drop(r);
+        let r = rig(FloorMode::Enforced, manager_over(&storage), app.clone());
+        assert_eq!(
+            r.verifier.rpc_finalized_handle().resolve(&storage),
+            FinalizedAnchor::GENESIS,
+            "nothing published before the boot check"
+        );
+        assert!(matches!(
+            r.verifier.boot_check().await,
+            FloorTick::Verified { height: 2, .. }
+        ));
+        let anchor = r.verifier.rpc_finalized_handle().resolve(&storage);
+        assert_eq!(
+            anchor,
+            FinalizedAnchor {
+                height: 2,
+                hash: Some(a2.header.block_hash)
+            }
+        );
+        assert_eq!(
+            range_block_hashes(&storage, Some(anchor), 0, 2).expect("range"),
+            certified,
+            "after restart"
+        );
+    }
+
     /// Enforcement OFF: the certificate is verified and reported (metric), but
     /// neither the floor nor the RPC tags move, so a reorg below it PROCEEDS —
     /// and the node then reports that it left the finalized block (safety

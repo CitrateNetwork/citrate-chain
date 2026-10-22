@@ -148,6 +148,141 @@ impl FinalizedTagSource {
     }
 }
 
+/// Most selected-parent links one finality-bounded range read may follow below
+/// the certified block (header point reads, bounded like the 1000-block log
+/// window they feed). A range that starts deeper than this below the certified
+/// height is refused instead of walked.
+pub const FINALIZED_RANGE_MAX_WALK: u64 = 10_000;
+
+/// Why [`range_block_hashes`] could not list a range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RangeReadError {
+    /// The range starts more than [`FINALIZED_RANGE_MAX_WALK`] blocks below the
+    /// certified height.
+    TooDeep { depth: u64, max: u64 },
+    /// A header read failed, or the stored ancestry is malformed.
+    Storage(String),
+}
+
+impl std::fmt::Display for RangeReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooDeep { depth, max } => write!(
+                f,
+                "range starts {depth} blocks below the finalized block; a range bounded by \
+                 finalized/safe may start at most {max} blocks below it"
+            ),
+            Self::Storage(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// The blocks a log-range read visits for heights `from..=to`, ascending by
+/// height, as `(height, block_hash)`.
+///
+/// `anchor` is `Some` only when a bound of the request came from a finality tag.
+/// When it carries the certified hash (Enforced mode), every height in the range
+/// at or below the certified height is read from the CERTIFIED CHAIN: the
+/// selected-parent chain that ends at the certified block, followed back from it
+/// by hash. This is the same definition the finality floor verifier
+/// (`CanonicalApplicator::verify_certified_floor`) uses for "the block at height
+/// h on this chain", so a log of an uncertified sibling at a finalized height is
+/// never returned. A height the chain steps over has no block (no logs), and if
+/// an ancestor is not stored here the walk stops (nothing below it is served,
+/// never a height-index entry).
+///
+/// Heights above the certified height, and every height when `anchor` is `None`
+/// or carries no hash (Legacy / Observed: genesis only), go through the height
+/// index exactly as before (missing heights are skipped).
+///
+/// Bounded: the walk reads at most `certified_height - from + 1` headers and is
+/// refused past [`FINALIZED_RANGE_MAX_WALK`]; callers cap `to - from` as before.
+pub fn range_block_hashes(
+    storage: &StorageManager,
+    anchor: Option<FinalizedAnchor>,
+    from: u64,
+    to: u64,
+) -> Result<Vec<(u64, Hash)>, RangeReadError> {
+    let mut out = Vec::new();
+    if from > to {
+        return Ok(out);
+    }
+    let mut index_from = Some(from);
+    if let Some(FinalizedAnchor {
+        height: certified_height,
+        hash: Some(certified),
+    }) = anchor
+    {
+        if from <= certified_height {
+            let depth = certified_height.saturating_sub(from);
+            if depth > FINALIZED_RANGE_MAX_WALK {
+                return Err(RangeReadError::TooDeep {
+                    depth,
+                    max: FINALIZED_RANGE_MAX_WALK,
+                });
+            }
+            let mut chain = certified_chain_desc(storage, certified, certified_height, from, to)?;
+            chain.reverse();
+            out = chain;
+            index_from = certified_height.checked_add(1);
+        }
+    }
+    if let Some(start) = index_from {
+        if start <= to {
+            for height in start..=to {
+                // height-index: heights above the certified height, or no certified hash.
+                if let Ok(Some(hash)) = storage.blocks.get_block_by_height(height) {
+                    out.push((height, hash));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Follow selected-parent links back from `start` (stored at `start_height`),
+/// collecting the blocks whose height is in `lo..=hi`, descending.
+fn certified_chain_desc(
+    storage: &StorageManager,
+    start: Hash,
+    start_height: u64,
+    lo: u64,
+    hi: u64,
+) -> Result<Vec<(u64, Hash)>, RangeReadError> {
+    let mut out = Vec::new();
+    let mut cursor = start;
+    let mut max_height = start_height;
+    // Heights strictly decrease along the walk, so this many reads suffice.
+    let mut reads_left = start_height.saturating_sub(lo).saturating_add(1);
+    while reads_left > 0 {
+        reads_left = reads_left.saturating_sub(1);
+        let header = match storage.blocks.get_header(&cursor) {
+            Ok(Some(header)) => header,
+            // Ancestry not stored here: serve nothing below it.
+            Ok(None) => break,
+            Err(e) => return Err(RangeReadError::Storage(format!("header {cursor}: {e}"))),
+        };
+        let h = header.height;
+        if h > max_height {
+            return Err(RangeReadError::Storage(format!(
+                "header {cursor} at height {h} is not below its child (max {max_height})"
+            )));
+        }
+        if h < lo {
+            break;
+        }
+        if h <= hi {
+            out.push((h, cursor));
+        }
+        if h == lo || h == 0 {
+            break;
+        }
+        max_height = h.saturating_sub(1);
+        cursor = header.selected_parent_hash;
+    }
+    Ok(out)
+}
+
 /// Whether `tag` is one of the finality tags.
 pub fn is_finality_tag(tag: Option<&str>) -> bool {
     matches!(tag, Some("finalized") | Some("safe"))

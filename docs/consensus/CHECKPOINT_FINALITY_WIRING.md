@@ -289,7 +289,16 @@ matching certificate) and every block-lookup site (`eth_getBlockByNumber`,
 `eth_getBlockTransactionCountByNumber`, `eth_getTransactionByBlockNumberAndIndex`, and the
 newest block of `eth_feeHistory`) fetches the certified block BY HASH. If that block is not
 stored locally, the previous verified pair is served, else genesis — never a sibling. Range
-reads (`eth_getLogs`, `eth_newFilter`) take the resolved pair's height as their bound. The
+reads (`eth_getLogs`; `eth_newFilter` read through `eth_getFilterLogs` /
+`eth_getFilterChanges`; the `eth_feeHistory` window) take the resolved pair's height as their
+bound, and when a bound is `finalized`/`safe` every height at or below the certified height is
+read from the certified chain: the selected-parent
+chain followed back from the certified hash (the same chain `verify_certified_floor` checks
+against), via `citrate_api::finalized_tag::range_block_hashes`. A height that chain steps over
+has no block (no logs; empty-slot fee defaults); heights above the certified height, and
+`latest`/numeric ranges, still use the height index. The walk is bounded: a range starting
+more than `FINALIZED_RANGE_MAX_WALK` (10,000) blocks below the certified height is refused with
+`-32602`. A log filter keeps the anchor it resolved at creation. The
 state-read guard (`eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`,
 `eth_getStorageAt`, `eth_call`, `eth_estimateGas`) additionally requires, for a verified pair,
 that the applied tip (`BlockStore::get_applied_tip`) IS the certified hash before serving

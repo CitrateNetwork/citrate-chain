@@ -2,7 +2,9 @@
 
 use crate::eth_tx_decoder;
 use crate::filter::{FilterRegistry, FilterType};
-use crate::finalized_tag::{is_finality_tag, FinalizedAnchor, FinalizedTagSource};
+use crate::finalized_tag::{
+    is_finality_tag, range_block_hashes, FinalizedAnchor, FinalizedTagSource, RangeReadError,
+};
 use crate::methods::{mempool::PendingQuery, ChainApi, MempoolApi, StateApi};
 use crate::types::request::BlockId;
 // PIL-49: route block_on through a shared multi-threaded Tokio runtime so
@@ -193,6 +195,7 @@ fn simulation_block_context(storage: &Arc<StorageManager>) -> (u64, u64) {
         Ok(h) => h,
         Err(_) => return (0, 0),
     };
+    // height-index: latest height, simulation timestamp only.
     let timestamp = storage
         .blocks
         .get_block_by_height(height)
@@ -311,6 +314,18 @@ pub fn resolve_block_tag(
             .strip_prefix("0x")
             .and_then(|h| u64::from_str_radix(h, 16).ok()),
         _ => None,
+    }
+}
+
+/// JSON-RPC error for a log range [`range_block_hashes`] could not list.
+fn range_read_error(e: RangeReadError) -> jsonrpc_core::Error {
+    match e {
+        RangeReadError::TooDeep { .. } => jsonrpc_core::Error::invalid_params(e.to_string()),
+        RangeReadError::Storage(msg) => jsonrpc_core::Error {
+            code: jsonrpc_core::ErrorCode::InternalError,
+            message: format!("log range read failed: {msg}"),
+            data: None,
+        },
     }
 }
 
@@ -1783,13 +1798,14 @@ pub fn register_eth_methods_with_finality(
         // latest committed height.
         let api = ChainApi::new(storage_fee.clone());
         let committed_height = block_on(api.get_height()).unwrap_or_default();
-        // A verified finalized anchor also pins the NEWEST block of the window
-        // to the certified hash (the height index may hold a sibling there).
+        // A window ending at `finalized`/`safe` is read along the CERTIFIED
+        // CHAIN: every height at or below the certified height comes from the
+        // selected-parent ancestry of the certified block (`range_block_hashes`),
+        // never from the height index, which may hold a sibling at any of them.
         let newest_tag = params.get(1).and_then(|v| v.as_str());
-        let (current_height, newest_hash) = if is_finality_tag(newest_tag) {
+        let (current_height, window_anchor) = if is_finality_tag(newest_tag) {
             let anchor = finalized_fee.resolve(&storage_fee);
-            let h = anchor.height.min(committed_height);
-            (h, anchor.hash.filter(|_| h == anchor.height))
+            (anchor.height.min(committed_height), Some(anchor))
         } else {
             (committed_height, None)
         };
@@ -1807,23 +1823,21 @@ pub fn register_eth_methods_with_finality(
         // block_count >= 1 (the zero case returned above).
         let start_height = current_height.saturating_sub(block_count.saturating_sub(1));
 
+        // The block read at each height of the window. A height the certified
+        // chain steps over has none and gets the empty-slot defaults below.
+        let window: std::collections::HashMap<u64, Hash> =
+            range_block_hashes(&storage_fee, window_anchor, start_height, current_height)
+                .map_err(range_read_error)?
+                .into_iter()
+                .collect();
+
         // Collect fee data from blocks
         let mut base_fees: Vec<String> = Vec::new();
         let mut gas_used_ratios: Vec<f64> = Vec::new();
         let mut rewards: Vec<Vec<String>> = Vec::new();
 
         for height in start_height..=current_height {
-            // Get block hash at height (the certified hash for a finalized newest
-            // block, else the height index).
-            let at_height = match newest_hash {
-                Some(certified) if height == current_height => Some(certified),
-                _ => storage_fee
-                    .blocks
-                    .get_block_by_height(height)
-                    .ok()
-                    .flatten(),
-            };
-            if let Some(block_hash) = at_height {
+            if let Some(block_hash) = window.get(&height).copied() {
                 // Get block data
                 if let Ok(Some(block)) = storage_fee.blocks.get_block(&block_hash) {
                     // Use persisted gas_used and gas_limit from block header (EIP-1559 fields)
@@ -1978,15 +1992,17 @@ pub fn register_eth_methods_with_finality(
 
         // Get current height for "latest" resolution
         let current_height = storage_logs.blocks.get_latest_height().unwrap_or(0);
-        // Range bound only: the verified finalized HEIGHT (resolved by hash, so
-        // it is a height whose certified block is stored here).
-        let finalized = if is_finality_tag(filter.get("fromBlock").and_then(|v| v.as_str()))
+        // A finality-tag bound resolves to the verified anchor: its HEIGHT
+        // bounds the range, and its HASH (Enforced mode) names the certified
+        // chain that heights at or below it are read from (`range_block_hashes`).
+        let anchor = if is_finality_tag(filter.get("fromBlock").and_then(|v| v.as_str()))
             || is_finality_tag(filter.get("toBlock").and_then(|v| v.as_str()))
         {
-            finalized_logs.resolve(&storage_logs).height
+            Some(finalized_logs.resolve(&storage_logs))
         } else {
-            0
+            None
         };
+        let finalized = anchor.map_or(0, |a| a.height);
 
         // Parse fromBlock (default to 0). Absent field keeps its default; a
         // present tag is resolved via the shared resolver (adds finalized/safe).
@@ -2113,13 +2129,9 @@ pub fn register_eth_methods_with_finality(
         let mut result_logs: Vec<Value> = Vec::new();
         let mut log_index_global = 0usize;
 
-        for height in from_block..=effective_to {
-            // Get block hash at this height
-            let block_hash = match storage_logs.blocks.get_block_by_height(height) {
-                Ok(Some(hash)) => hash,
-                _ => continue,
-            };
-
+        let blocks = range_block_hashes(&storage_logs, anchor, from_block, effective_to)
+            .map_err(range_read_error)?;
+        for (height, block_hash) in blocks {
             // Get all transaction hashes in this block
             let tx_hashes = match storage_logs
                 .transactions
@@ -2206,14 +2218,16 @@ pub fn register_eth_methods_with_finality(
         crate::filter::validate_log_filter_criteria(filter)
             .map_err(jsonrpc_core::Error::invalid_params)?;
         let current_height = storage_new_filter.blocks.get_latest_height().unwrap_or(0);
-        // Range bound only (see eth_getLogs).
-        let finalized = if is_finality_tag(filter.get("fromBlock").and_then(|v| v.as_str()))
+        // Anchor resolved once, at creation (see eth_getLogs); the filter keeps
+        // it so its range reads follow the certified chain.
+        let anchor = if is_finality_tag(filter.get("fromBlock").and_then(|v| v.as_str()))
             || is_finality_tag(filter.get("toBlock").and_then(|v| v.as_str()))
         {
-            finalized_new_filter.resolve(&storage_new_filter).height
+            Some(finalized_new_filter.resolve(&storage_new_filter))
         } else {
-            0
+            None
         };
+        let finalized = anchor.map_or(0, |a| a.height);
 
         // Parse fromBlock (None on absent/unrecognised, unchanged; adds finalized/safe).
         let from_block = resolve_block_tag(
@@ -2312,7 +2326,14 @@ pub fn register_eth_methods_with_finality(
         };
 
         let filter_id = filter_registry_new
-            .new_log_filter(from_block, to_block, addresses, topics, current_height)
+            .new_log_filter_anchored(
+                from_block,
+                to_block,
+                addresses,
+                topics,
+                current_height,
+                anchor,
+            )
             .ok_or_else(|| jsonrpc_core::Error {
                 // CHAIN-B-D003: registry at capacity — refuse rather than grow.
                 code: jsonrpc_core::ErrorCode::ServerError(-32005),
@@ -2428,6 +2449,7 @@ pub fn register_eth_methods_with_finality(
                 // Return new block hashes since last poll
                 let mut block_hashes = Vec::new();
                 for height in last_poll_block.saturating_add(1)..=current_height {
+                    // height-index: block filter, heights after the last poll up to latest.
                     if let Ok(Some(hash)) =
                         storage_filter_changes.blocks.get_block_by_height(height)
                     {
@@ -2448,6 +2470,7 @@ pub fn register_eth_methods_with_finality(
                 to_block,
                 ref addresses,
                 ref topics,
+                finalized_anchor,
             } => {
                 // Calculate effective block range
                 let effective_from = last_poll_block.saturating_add(1);
@@ -2466,13 +2489,14 @@ pub fn register_eth_methods_with_finality(
 
                 let mut result_logs: Vec<Value> = Vec::new();
 
-                for height in effective_from..=effective_to {
-                    let block_hash = match storage_filter_changes.blocks.get_block_by_height(height)
-                    {
-                        Ok(Some(hash)) => hash,
-                        _ => continue,
-                    };
-
+                let blocks = range_block_hashes(
+                    &storage_filter_changes,
+                    finalized_anchor,
+                    effective_from,
+                    effective_to,
+                )
+                .map_err(range_read_error)?;
+                for (height, block_hash) in blocks {
                     let tx_hashes = match storage_filter_changes
                         .transactions
                         .get_block_transactions(&block_hash)
@@ -2582,6 +2606,7 @@ pub fn register_eth_methods_with_finality(
                 to_block,
                 ref addresses,
                 ref topics,
+                finalized_anchor,
             } => {
                 let effective_from = from_block.unwrap_or(0);
                 let effective_to = to_block.unwrap_or(current_height).min(current_height);
@@ -2590,12 +2615,14 @@ pub fn register_eth_methods_with_finality(
 
                 let mut result_logs: Vec<Value> = Vec::new();
 
-                for height in effective_from..=effective_to {
-                    let block_hash = match storage_filter_logs.blocks.get_block_by_height(height) {
-                        Ok(Some(hash)) => hash,
-                        _ => continue,
-                    };
-
+                let blocks = range_block_hashes(
+                    &storage_filter_logs,
+                    finalized_anchor,
+                    effective_from,
+                    effective_to,
+                )
+                .map_err(range_read_error)?;
+                for (height, block_hash) in blocks {
                     let tx_hashes = match storage_filter_logs
                         .transactions
                         .get_block_transactions(&block_hash)
