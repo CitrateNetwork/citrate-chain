@@ -40,7 +40,8 @@ fn over_limit_call(storage: Arc<StorageManager>) -> Value {
 fn legacy_clamp_env_values_as_the_handler_reads_them() {
     std::env::set_var("CITRATE_ALLOW_ANONYMOUS_RATE_LIMIT", "1");
     let tmp = tempfile::TempDir::new().expect("tempdir");
-    let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).expect("storage"));
+    let storage =
+        Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).expect("storage"));
     let g = BlockBuilder::new()
         .hash(Hash::new([0xEE; 32]))
         .parent(Hash::default())
@@ -55,7 +56,10 @@ fn legacy_clamp_env_values_as_the_handler_reads_them() {
         std::env::set_var(LEGACY_CLAMP_ENV, v);
         assert!(legacy_clamp_from_env(), "{v:?} enables the clamp");
         let r = over_limit_call(storage.clone());
-        assert!(r.get("error").is_none(), "{v:?}: clamped, not an error: {r}");
+        assert!(
+            r.get("error").is_none(),
+            "{v:?}: clamped, not an error: {r}"
+        );
         assert!(r["result"].is_array(), "{v:?}: {r}");
     }
     for v in errors {

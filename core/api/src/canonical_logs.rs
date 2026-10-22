@@ -605,7 +605,13 @@ mod tests {
     }
 
     /// Stores a straight chain `tag` over `lo..=hi` on `parent`; returns the hashes.
-    fn gate_branch(storage: &StorageManager, tag: u8, mut parent: Hash, lo: u64, hi: u64) -> Vec<Hash> {
+    fn gate_branch(
+        storage: &StorageManager,
+        tag: u8,
+        mut parent: Hash,
+        lo: u64,
+        hi: u64,
+    ) -> Vec<Hash> {
         use citrate_consensus::types::BlockBuilder;
         let mut out = Vec::new();
         for h in lo..=hi {
@@ -626,12 +632,18 @@ mod tests {
     fn gate_fixture() -> (Arc<StorageManager>, tempfile::TempDir, Vec<Hash>, u64) {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let storage = Arc::new(
-            StorageManager::new(tmp.path(), citrate_storage::pruning::PruningConfig::default())
-                .expect("storage"),
+            StorageManager::new(
+                tmp.path(),
+                citrate_storage::pruning::PruningConfig::default(),
+            )
+            .expect("storage"),
         );
         let top = SETTLED_DEPTH + CHECKPOINT_STRIDE + 10;
         let a = gate_branch(&storage, 0xA0, Hash::default(), 0, top);
-        storage.blocks.put_applied_tip(&a[top as usize], top).expect("tip");
+        storage
+            .blocks
+            .put_applied_tip(&a[top as usize], top)
+            .expect("tip");
         (storage, tmp, a, top)
     }
 
@@ -664,12 +676,13 @@ mod tests {
         let idx = ExecutedChainIndex::new();
         let s = storage.clone();
         let a_hook = a.clone();
-        *idx.before_publish.lock().expect("hook") = Some(Box::new(move |idx: &ExecutedChainIndex| {
-            replace_below_checkpoint(&s, &a_hook, top);
-            // A concurrent near-tip request on the new chain re-anchors.
-            let near = idx.executed_hashes(&s, top, top).expect("near tip");
-            assert_eq!(near, vec![(top, gate_hash(0xB0, top))]);
-        }));
+        *idx.before_publish.lock().expect("hook") =
+            Some(Box::new(move |idx: &ExecutedChainIndex| {
+                replace_below_checkpoint(&s, &a_hook, top);
+                // A concurrent near-tip request on the new chain re-anchors.
+                let near = idx.executed_hashes(&s, top, top).expect("near tip");
+                assert_eq!(near, vec![(top, gate_hash(0xB0, top))]);
+            }));
         let cold = idx.executed_hashes(&storage, 0, 0).expect("cold walk");
         assert_eq!(cold, vec![(0, a[0])], "height 0 is shared by both chains");
         assert_eq!(
@@ -689,22 +702,23 @@ mod tests {
         let idx = ExecutedChainIndex::new();
         let s = storage.clone();
         let a_hook = a.clone();
-        *idx.before_publish.lock().expect("hook") = Some(Box::new(move |idx: &ExecutedChainIndex| {
-            use citrate_consensus::types::BlockBuilder;
-            // A tip whose selected parent is not stored: the common-ancestor
-            // walk breaks, so the cache is dropped.
-            let z = BlockBuilder::new()
-                .hash(gate_hash(0xC0, top))
-                .parent(gate_hash(0xC0, top - 1))
-                .height(top)
-                .build_unhashed();
-            s.blocks.put_block(&z).expect("z");
-            s.blocks.put_applied_tip(&z.hash(), top).expect("tip");
-            idx.executed_hashes(&s, top, top).expect("near tip on z");
-            // Then chain B: re-anchoring from the broken tip drops again.
-            replace_below_checkpoint(&s, &a_hook, top);
-            idx.executed_hashes(&s, top, top).expect("near tip on b");
-        }));
+        *idx.before_publish.lock().expect("hook") =
+            Some(Box::new(move |idx: &ExecutedChainIndex| {
+                use citrate_consensus::types::BlockBuilder;
+                // A tip whose selected parent is not stored: the common-ancestor
+                // walk breaks, so the cache is dropped.
+                let z = BlockBuilder::new()
+                    .hash(gate_hash(0xC0, top))
+                    .parent(gate_hash(0xC0, top - 1))
+                    .height(top)
+                    .build_unhashed();
+                s.blocks.put_block(&z).expect("z");
+                s.blocks.put_applied_tip(&z.hash(), top).expect("tip");
+                idx.executed_hashes(&s, top, top).expect("near tip on z");
+                // Then chain B: re-anchoring from the broken tip drops again.
+                replace_below_checkpoint(&s, &a_hook, top);
+                idx.executed_hashes(&s, top, top).expect("near tip on b");
+            }));
         idx.executed_hashes(&storage, 0, 0).expect("cold walk");
         assert_eq!(
             idx.checkpoint_count(),
@@ -721,10 +735,11 @@ mod tests {
         let (storage, _tmp, a, top) = gate_fixture();
         let idx = ExecutedChainIndex::new();
         let s = storage.clone();
-        *idx.before_publish.lock().expect("hook") = Some(Box::new(move |idx: &ExecutedChainIndex| {
-            // A concurrent request at the same tip changes nothing.
-            idx.executed_hashes(&s, top, top).expect("near tip");
-        }));
+        *idx.before_publish.lock().expect("hook") =
+            Some(Box::new(move |idx: &ExecutedChainIndex| {
+                // A concurrent request at the same tip changes nothing.
+                idx.executed_hashes(&s, top, top).expect("near tip");
+            }));
         idx.executed_hashes(&storage, 0, 0).expect("cold walk");
         assert_eq!(idx.checkpoint_count(), 2, "checkpoints at 0 and 1024");
         let got = idx.executed_hashes(&storage, 1_024, 1_024).expect("page");

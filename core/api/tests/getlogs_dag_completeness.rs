@@ -891,8 +891,7 @@ fn getlogs_skips_a_receipt_that_names_a_lost_sibling_for_the_same_tx() {
         "a receipt naming the lost sibling was served at the executed height: {got:?}"
     );
     assert!(
-        got.iter()
-            .all(|l| l["transactionHash"] != hx(&shared.hash)),
+        got.iter().all(|l| l["transactionHash"] != hx(&shared.hash)),
         "{got:?}"
     );
     assert_eq!(got.len(), 1, "{got:?}");
