@@ -1231,6 +1231,79 @@ contract GenesisFloorGateTest is Test {
         assertEq(c3.timelockHolders(), 0);
     }
 
+    /// GUARDIAN lowers its own delay through its 2-of-3 council (propose + 1 approval).
+    function _guardianLowersDelay(DeployGenesisGovernance.Deployed memory d, address[] memory o, uint256 to) internal {
+        TimelockController tl = TimelockController(payable(d.guardianTimelock));
+        MultisigProposer ms = MultisigProposer(d.guardianMultisig);
+        uint256 delay = tl.getMinDelay();
+        bytes memory payload = abi.encodeCall(tl.updateDelay, (to));
+        bytes[2] memory steps = [
+            abi.encodeCall(tl.schedule, (address(tl), 0, payload, bytes32(0), 0, delay)),
+            abi.encodeCall(tl.execute, (address(tl), 0, payload, bytes32(0), 0))
+        ];
+        for (uint256 k = 0; k < 2; k++) {
+            if (k == 1) vm.warp(block.timestamp + delay);
+            vm.prank(o[0]);
+            bytes32 id = ms.propose(steps[k]);
+            vm.prank(o[1]);
+            ms.approve(id);
+            vm.prank(o[0]);
+            ms.execute(id);
+        }
+        assertEq(tl.getMinDelay(), to);
+    }
+
+    /// The 1 h delay floor holds for GUARDIAN at the gate too: a valid genesis deployment whose
+    /// guardian later lowers its own delay (to 1 h - 1 s, or to 0) fails GENESIS-FLOOR, while
+    /// exactly 1 h passes. Its code, provenance, holders, threshold and TTL stay valid
+    /// throughout, and the delay stays shorter than GOVERNANCE's.
+    function test_gate_on_40204_refuses_a_guardian_delay_below_1h() public {
+        vm.chainId(40204);
+        GovernanceWithNode g = new GovernanceWithNode();
+        DeployGenesisGovernance.Council memory gov = _council(0xA000, 5, 3, 48 hours);
+        DeployGenesisGovernance.Council memory grd = _council(0xB000, 3, 2, 2 hours);
+        DeployGenesisGovernance.Deployed memory d = g.deployWith(SENDER, gov, grd, false, false);
+        string memory book = g.bookJson(SENDER, d, gov, grd);
+        GateHarness h = new GateHarness();
+
+        _guardianLowersDelay(d, grd.owners, 1 hours);
+        assertEq(h.problem(d.guardianTimelock, d.guardianMultisig, false), "", "exactly 1 h meets the floor");
+        GateWithNode atFloor = _gate();
+        atFloor.check(book, false);
+        assertEq(atFloor.genesisFloor(), 0);
+
+        _guardianLowersDelay(d, grd.owners, 1 hours - 1);
+        assertEq(
+            h.problem(d.guardianTimelock, d.guardianMultisig, false), "GUARDIAN timelock: minDelay below the 1 h floor"
+        );
+        GateWithNode below = _gate();
+        _expectRevert(FLOOR);
+        below.check(book, false);
+
+        _guardianLowersDelay(d, grd.owners, 0);
+        assertEq(
+            h.problem(d.guardianTimelock, d.guardianMultisig, false), "GUARDIAN timelock: minDelay below the 1 h floor"
+        );
+        GateWithNode zero = _gate();
+        _expectRevert(FLOOR);
+        zero.check(book, false);
+    }
+
+    /// Fuzz: whatever delay the guardian sets itself after a valid genesis deploy, the shared
+    /// floor check accepts it iff it is at least 1 h (and GOVERNANCE is untouched at 48 h).
+    function testFuzz_guardian_delay_floor_read_from_chain(uint32 seed) public {
+        vm.chainId(40204);
+        GovernanceWithNode g = new GovernanceWithNode();
+        DeployGenesisGovernance.Council memory gov = _council(0xA000, 5, 3, 48 hours);
+        DeployGenesisGovernance.Council memory grd = _council(0xB000, 3, 2, 1 hours);
+        DeployGenesisGovernance.Deployed memory d = g.deployWith(SENDER, gov, grd, false, false);
+        uint256 to = bound(seed, 0, 47 hours);
+        _guardianLowersDelay(d, grd.owners, to);
+        GateHarness h = new GateHarness();
+        assertEq(bytes(h.problem(d.guardianTimelock, d.guardianMultisig, false)).length == 0, to >= 1 hours);
+        assertEq(h.problem(d.governanceTimelock, d.governanceMultisig, true), "");
+    }
+
     function test_floor_problems_read_from_chain() public {
         GateHarness h = new GateHarness();
         vm.chainId(1);
