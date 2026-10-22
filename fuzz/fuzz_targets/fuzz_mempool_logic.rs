@@ -30,8 +30,12 @@ use citrate_consensus::types::{Hash, PublicKey, Signature, Transaction};
 use libfuzzer_sys::fuzz_target;
 
 const RECORD_SIZE: usize = 18;
-const MAX_SIZE: usize = 32;
-const MAX_PER_SENDER: usize = 8;
+// Small enough that the fuzzer reaches a full pool (and the per-sender cap)
+// within a few dozen records, so the eviction and limit paths are exercised.
+// At 32 / 8 a 120 s run never filled the pool, and an off-by-one in the
+// capacity check went undetected.
+const MAX_SIZE: usize = 8;
+const MAX_PER_SENDER: usize = 4;
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < RECORD_SIZE {
@@ -47,7 +51,7 @@ fuzz_target!(|data: &[u8]| {
         use citrate_sequencer::{Mempool, MempoolConfig, MempoolError, TxClass};
 
         let config = MempoolConfig {
-            max_size: MAX_SIZE, // Small capacity for faster fuzzing
+            max_size: MAX_SIZE,
             max_per_sender: MAX_PER_SENDER,
             min_gas_price: 1, // Very low to allow more inputs through
             tx_expiry_secs: 3600,
