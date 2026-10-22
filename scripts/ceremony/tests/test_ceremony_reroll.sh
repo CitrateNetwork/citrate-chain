@@ -33,6 +33,13 @@
 # ============================================================================
 set -euo pipefail
 
+# Sandbox: the script under test must never see the real HOME. Every other write goes to the
+# per-test mktemp workspaces through CITRATE_REPO_ROOT / CEREMONY_DATA_DIR.
+SANDBOX="$(mktemp -d)"
+trap 'rm -rf "${SANDBOX:?}"' EXIT
+export HOME="$SANDBOX/home"
+mkdir -p "$HOME"
+
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 REROLL_SCRIPT="$SCRIPT_DIR/../ceremony-reroll.sh"
 
