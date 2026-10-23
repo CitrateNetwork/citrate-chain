@@ -5,12 +5,6 @@
 
 use citrate_wallet_core::session::SessionManager;
 
-#[allow(dead_code)]
-fn fast_manager() -> SessionManager {
-    // 3 attempts, 1s lockout, 0s timeout (immediate expire for testing)
-    SessionManager::new(3, 1, 0)
-}
-
 fn normal_manager() -> SessionManager {
     // 5 attempts, 5s lockout, 10s timeout
     SessionManager::new(5, 5, 10)
