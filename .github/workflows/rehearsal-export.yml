@@ -1,0 +1,40 @@
+name: rehearsal-export
+
+# scripts/rehearsal/export-r1.sh (the rehearsal export bundle) and the UI truth fixture exporter
+# it drives. Offline cases read repo files only; online cases run against
+# scripts/ui-truth/stub_rpc.py on loopback. No public network, no keys, no transactions.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/rehearsal/**'
+      - 'scripts/ui-truth/**'
+      - 'verification/**'
+      - 'contracts/addresses/**'
+      - 'docs/ui-truth/fixtures/**'
+      - '.github/workflows/rehearsal-export.yml'
+  pull_request:
+    paths:
+      - 'scripts/rehearsal/**'
+      - 'scripts/ui-truth/**'
+      - 'verification/**'
+      - 'contracts/addresses/**'
+      - 'docs/ui-truth/fixtures/**'
+      - '.github/workflows/rehearsal-export.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Foundry (cast, used by the fixture exporter)
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+      - name: UI truth fixture exporter (loopback stub)
+        run: bash scripts/ui-truth/test-export-fixtures.sh
+      - name: Rehearsal export bundle (offline + loopback stub)
+        run: bash scripts/rehearsal/test-export-r1.sh
