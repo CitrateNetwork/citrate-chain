@@ -1,15 +1,15 @@
 ---
 created: 2026-10-19T02:00:00Z
-updated: 2026-10-19T09:08:00Z
-branch: docs/c1-ui-truth-v1.1
+updated: 2026-10-22T12:00:00Z
+branch: docs/c1-ui-truth-v1.2
 author: Larry Klosowski (chain team; DGX session, Claude Opus 5.5)
 status: active
-version: v1.1 (2026-10-19). Re-issued at each rehearsal and at genesis. What changed since v1 is in §12
+version: v1.2 (2026-10-22). Re-issued at each rehearsal and at genesis. What changed is in §12 (v1.1) and §13 (v1.2)
 applies_to: citrate-core, the design prototype (design/CitrateCore.dc.html), citrate.ai and docs copy
-verified_against: citrate-chain c384fc98 (origin/main; contracts/src/ValidatorRegistry.sol, core_membership/MemberBond.sol, LiquidStakingPool.sol), address book 40204.json (deployedAt 2026-10-06), live 40204 at heads 510,030–510,047 (committed fixture) and ~512,250 (v1.1 spot check), latest state
+verified_against: citrate-chain c384fc98 (origin/main; contracts/src/ValidatorRegistry.sol, core_membership/MemberBond.sol, LiquidStakingPool.sol); v1.2 rules against citrate-chain b4dc3b1b (origin/main; core_membership/MemberBond.sol, core/execution/src/executor.rs, core/api/src/eth_rpc.rs), address book 40204.json (deployedAt 2026-10-06), live 40204 at heads 510,030–510,047 (committed fixture) and ~512,250 (v1.1 spot check), latest state
 ---
 
-# UI truth contract v1.1 (betanet workstream C1)
+# UI truth contract v1.2 (betanet workstream C1)
 
 This is the chain team's contract with everyone who draws or ships a screen. It defines the words the app may use for chain state, every on-chain number it may show and where that number comes from, what is live and what is dormant, and how we talk about money. **The chain team has the final say.** If a screen and this file disagree, the screen is wrong. If this file and the chain disagree, tell the chain team; this file gets corrected, not worked around.
 
@@ -47,11 +47,13 @@ Use these words exactly. Each has one meaning and one condition. If a state isn'
 | Word | Condition |
 |---|---|
 | **Pending** | Transaction is in the mempool, with no receipt |
-| **Included in block N** | Receipt exists (`eth_getTransactionReceipt`) |
+| **Included in block N** | Receipt exists (`eth_getTransactionReceipt`) with `status` = `0x1` |
+| **Included in block N · reverted** | Receipt exists with `status` = `0x0`. The transaction is in block N, its call didn't take effect, and **the fee was charged**. Required sub-line: "receipt status 0: the transfer didn't happen; the fee was charged", with the fee stated as SALT = receipt `gasUsed` × `effectiveGasPrice` (`eth_rpc.rs:779, 797`). On 40204 a reverted transaction pays its full gas limit with no refund, and the receipt's `gasUsed` equals that gas limit (`executor.rs:2121, 2229, 2255-2258` at b4dc3b1b), so the receipt alone gives the exact fee. If the receipt read fails, show the fee as "—", never 0 |
 | **Sent, outcome unknown — check tx ⟨hash⟩** | The signed transaction may have reached the node, but the app can't prove it wasn't accepted. This is the state for every `eth_sendRawTransaction` outcome that isn't on the definitive list below: a transport failure, timeout or unreadable response; any error code or message not on the list (including `-32603` internal errors); the ambiguous errors (already known, nonce in use); any error at all on a re-submission of signed bytes the app has sent before; and a failed receipt poll after the node returned a hash. ⟨hash⟩ is keccak256 of the signed raw transaction, which is the hash the node assigns. Reconcile by that hash (`eth_getTransactionByHash`, then `eth_getTransactionReceipt`), and tell the member to check it (for example on the explorer) before trying again. Never show "Not sent" here, never re-send automatically, and never sign a new transaction for the same payment while this state holds |
 | **Not sent** | Only when the node provably didn't accept this transaction: the flow failed before submission (locked vault, signing, nonce or gas-price read), or the node answered the **first** submission of these signed bytes with one of the definitive errors listed below. Any other error means "Sent, outcome unknown" |
 | **N confirmations** | Head − N. This is a depth count, not finality |
 | ~~Final, Finalized, Settled, Irreversible~~ | **Banned** until checkpoint finality runs and the `finalized` tag returns a height above 0. Today the `finalized` tag returns the genesis block |
+| ~~nothing moved~~, ~~no fee~~, ~~Failed · reverted~~, ~~Failed~~ (for a mined transaction) | **Banned.** A reverted transaction moved its fee from the sender. Use "Included in block N · reverted" with the fee. "Failed" alone is not a §1 word: before submission the state is "Not sent", after it "Sent, outcome unknown" or one of the Included words |
 
 #### Which `eth_sendRawTransaction` errors mean "Not sent"
 
@@ -89,7 +91,7 @@ The node doesn't yet return a distinct "already known" code; core matches on the
 | Word | Means | Condition (source) |
 |---|---|---|
 | **Not a validator** | This key was never registered | `ValidatorRegistry.validatorInfo(pubkey).status` = None (0) |
-| **Bond locked · not staked** | Membership grant sits in the member's bond, not in the registry | `MemberBond.activated()` = false |
+| **Bond locked · not staked** | Membership grant sits in the member's bond, not in the registry | `MemberBond.activated()` = false and `isUnlocked()` = false. Once the lock has ended and the bond was never activated, use **Unlocked · not activated** (Membership and bond, below) |
 | **Registered · active from epoch N** | Registered in the registry; consensus activation is pending | `validatorInfo(pubkey).status` = Active (1) and `actEpoch` (= N) > `currentEpoch()`. Show the actual N; never promise "next epoch". Registration sets `actEpoch = (block + SNAPSHOT_LAG) / EPOCH + 1` with `SNAPSHOT_LAG` = 200 (`firstEpochAfterSnapshot`), so a registration in the last 200 blocks of an epoch activates two epochs later. `isActive(pubkey)` is already true at registration and can't tell these apart |
 | **Validator active** | Active in the live registry, activation epoch reached | `isActive(pubkey)` = true **and** `validatorInfo(pubkey).status` = Active (1) **and** `actEpoch` ≤ `currentEpoch()`. Only then. Consensus follows the epoch snapshot, so it can lag by up to an epoch after a change; show the note "consensus can lag by up to an epoch; Producing blocks is the evidence of participation" |
 | **Producing blocks** | This node actually proposed blocks recently | A block in the sampled window has `proposerPubkey` = this node's key (§2 Producing validators: N ≥ 100 blocks, N stated). *Active* does not imply this: today only one validator produces. An absent key reads "Not seen producing in the last N blocks", never "not producing" |
@@ -111,8 +113,19 @@ The node doesn't yet return a distinct "already known" code; core matches on the
 |---|---|
 | **Member** / **Membership lapsed** | `CitrateMemberSBT.isActive(tokenId)` true / false. `isActive` does not include KYC |
 | **Locked until ⟨date⟩ (block N)** | `MemberBond.unlockTimestamp()` and `unlockBlock()`. Show both: the lock opens when either is reached |
-| **Unlocked · verify identity to withdraw** | `isUnlocked()` = true and `isKycVerified()` = false |
-| **Unlocked** | `isUnlocked()` = true and `isKycVerified()` = true |
+| **Unlocked · not activated** | `isUnlocked()` = true and `activated()` = false. The member can't withdraw this principal: `requestRelease()` and `withdrawToMember()` both revert `NotActivated()` for a bond that was never activated (`MemberBond.sol:225-241` at b4dc3b1b). Required detail: "Only an activated bond can be withdrawn." No identity or KYC prompt in this state, and no withdraw action. Don't say where the principal goes (see "Unactivated grants" below) |
+| **Unlocked · verify identity to withdraw** | `activated()` = true **and** `isUnlocked()` = true **and** `isKycVerified()` = false |
+| **Unlocked** | `activated()` = true **and** `isUnlocked()` = true **and** `isKycVerified()` = true. This makes the release *available*, not paid: `requestRelease()` starts the unbond, and `withdrawToMember()` pays once the registry's exit lock has run (§1 Exiting) |
+
+**Withdrawable wording needs `activated()`.** Any word, row, tooltip or agent phrase that says or implies the member can withdraw the principal ("withdraw after the lock", "withdrawable", "verify identity to withdraw", "Needed to withdraw after the lock end") requires `MemberBond.activated()` = true. For a bond that isn't activated, the Withdraw row reads "only an activated bond can be withdrawn" (source: `withdrawToMember` requires `activated()`), before and after the lock. The identity requirement applies to activated bonds only. Its source is the on-chain gate the bond checks, `CitrateMemberSBT.isKycVerified(tokenId)` via `MemberBond.isKycVerified()` (`MemberBond.sol:266`); the `kyc_status` userinfo claim is not what the bond checks and is never the source for a withdraw or rewards gate. `claimRewards()` needs `activated()` and `isKycVerified()` as well (`:207`).
+
+**Unactivated grants: what to say today.** The owner decision of 2026-10-19 (activation open only inside the lock; after the lock the treasury may reclaim a never-activated grant) is implemented in chain #331, which is not merged and not deployed on 40204. On the bonds the app reads today, `activate()` has no lock-end check and there is no reclaim path. So, until a MemberBond with `reclaimUnactivated()` is deployed on the network the app reads (expected with the betanet genesis set; this contract is re-issued then and says so):
+
+- No copy says an unactivated grant "returns to the treasury", "is reclaimed" or "is lost", and none says activation closes at the lock end.
+- The grant copy says only what holds today: "Only an activated bond can be withdrawn."
+- The app doesn't infer the new behaviour from a merge, a release note or a runtime probe; it follows the version of this contract for the network it shows.
+
+On a network where that contract is deployed, the chain team adds these words here (draft, not usable yet): **Unlocked · not activated** gets the detail "Not activated before the lock ended. Only the treasury can reclaim it", the Activate action is drawn off once `isUnlocked()` is true, and **Returned to the treasury** (`reclaimed()` = true) is the word after the reclaim.
 
 ### Rewards
 
@@ -135,7 +148,8 @@ The Node tab and any section that holds these figures is called **Rewards**.
 | **Released** | status Done, `bondHeld` = 0 |
 | **Slashed** | status Slashed |
 | **Pin bonds not live yet** | Required wording until V3 is funded at genesis |
-| **Group rounds not live yet** | Required wording until FederatedRoundLedger and PatronageLedger are deployed. Today neither exists on 40204 |
+| **Group rounds not live yet** | Required wording while rounds can't run, in **both** ledger states: FederatedRoundLedger and PatronageLedger absent (today on 40204), or deployed with no rounds (the genesis plan, §4). In the deployed state the detail may say "Both ledgers are deployed and hold no rounds", with row values "deployed, no rounds (code at the pinned address)" |
+| ~~Deployed · dormant~~ (as a state word, lead, round-card word or chip) | **Banned as a word.** It is not a contract state: neither ledger has a dormant flag, and "deployed dormant" in §4 describes the rollout, not something a read returns. Use "Group rounds not live yet" (rounds) or "Pin bonds not live yet" (pins), with "deployed, no rounds" or "deployed, not funded" as row values |
 
 Service states (Alive, Ready, Stopping, Quarantined) belong to the K1 services contract (SPEC-001), owned by core. They aren't chain state and are out of scope here.
 
@@ -206,12 +220,14 @@ These return a believable value on error. Treat their 0 or `true` as "unknown" u
 | Governance | 2-of-3 multisig, 2 h delay (GOVERNANCE and GUARDIAN) | 3-of-5 hardware governance, separate 2-of-3 hardware guardian; timelock set in C2 |
 | Liquidity (needs counsel; provisional until counsel review, C2 D3/D4 decided by 2026-10-30) | No protocol gate: SALT transfers work on 40204. No trading venue | No protocol gate: SALT and wSALT are transferable from genesis. Any trading venue is a market event (C2 D4), not a chain state; the app never shows it |
 
+"Deployed, dormant" and "Deployed dormant" in this table describe the rollout. They are not §1 words and never appear on screen as a state (§1 Pins and group rounds).
+
 ## 5. Money copy (provisional until counsel review)
 
 1. **No investment language for SALT**: not invest, investment, return, yield, APY, APR, profit, passive income, appreciation, or "price".
 2. **No price or USD value for SALT** anywhere, and no exchange, listing or trading talk before 1.0. USD is allowed only for the member's own third-party provider keys (gateway escalation, model APIs): label it as the provider's list price ("at OpenAI's list price"), and never put it next to a SALT amount. Prefer "cost" to "price" in that copy.
 3. **Membership price**: comes only from the membership service, never a constant in the app (no waiver). Until core-membership serves a public price route (board item C1-P), the app shows no price at all: it links "See membership pricing" to membership.citrate.ai, where Stripe checkout shows the exact charge. Membership buys membership; it does not buy SALT.
-4. **Grant**: say exactly what the contracts do. "Your membership comes with a 32,000 SALT grant, locked in your bond until ⟨date⟩." Say "staked" only after `activated()`. Use one explanation everywhere: onboarding, Wallet, Node and the Hermes context.
+4. **Grant**: say exactly what the contracts do. "Your membership comes with a 32,000 SALT grant, locked in your bond until ⟨date⟩." Say "staked" only after `activated()`, and "withdraw" only for an activated bond (§1 Membership and bond). Say nothing about what happens to a grant that is never activated beyond "Only an activated bond can be withdrawn" until the reclaim path is deployed (§1 Unactivated grants). Use one explanation everywhere: onboarding, Wallet, Node and the Hermes context.
 5. **Rewards**: only on-chain reads (§2), named as rewards for producing blocks. No projections, formulas or "at current demand". If a member's node isn't producing, don't say it earns.
 6. **Betanet balances** (C2 D3; provisional until counsel review, C2 D3/D4 decided by 2026-10-30). Before 2026-12-01 the app is on the current testnet. Say: "Testnet. This network may be reset before betanet launches on 1 December 2026." From the betanet genesis (2026-12-01, shipped with 0.5.2) the chain is the mainnet chain: no reset is planned, and balances, SBTs, bonds and contracts carry into mainnet when the 1.0 soft fork activates (targeted 2027-02-01). Approved string: "Betanet. This is the chain mainnet keeps: balances carry into mainnet when the 1.0 upgrade activates, targeted for February 2027." Never say "guaranteed". Never attach a value, price or venue to carried-over SALT (§5.1, §5.2). Never describe 1.0 as turning on transfers or liquidity (D4): 1.0 is an upgrade that carries hardening and anything not ready at genesis.
 7. **Disclaimers**: the existing "not purchased, not an investment" line appears anywhere the grant is mentioned, not only in one onboarding step.
@@ -318,3 +334,15 @@ The chain team's answers to the design slice-1 questions (citrate-core #350). Th
 - §6: the checkpoint availability rule.
 - §7: exporter range checks, the `rpc_node_peer_count` id, on-screen pill and footnote, R1 sample bond.
 - §8: V13 and follow-ups V14–V20. §9: producers RPC, R1 export bond. §11: slice-1 rulings.
+
+## 13. Changes in v1.2
+
+From the chain-team review of design slice 3 (citrate-core #387 at 2fa84955).
+
+- §1 Membership and bond: new **Unlocked · not activated**. "Unlocked · verify identity to withdraw" and "Unlocked" now require `MemberBond.activated()`; any withdrawable wording requires it too. The identity gate's source is `CitrateMemberSBT.isKycVerified(tokenId)` via `MemberBond.isKycVerified()`, not the `kyc_status` claim. No "returns to the treasury" or activation-window copy until the reclaim path (chain #331) is deployed on the network shown; the words for that are drafted, not usable.
+- §1 Validators: "Bond locked · not staked" holds only while the lock runs.
+- §1 Pins and group rounds: "Group rounds not live yet" in both ledger states (absent, or deployed with no rounds). "Deployed · dormant" is not a contract state and is banned as a word. §4 says its "dormant" entries are rollout descriptions.
+- §1 Transactions: new **Included in block N · reverted**, with the fee (receipt `gasUsed` × `effectiveGasPrice`; a reverted transaction pays its full gas limit). "Included in block N" now needs receipt status `0x1`. Banned: "nothing moved", "no fee", "Failed · reverted", and "Failed" for a mined transaction.
+- §1 Validators: "Validator active" already required `status` = Active alongside `actEpoch` ≤ `currentEpoch()` in v1.1; unchanged.
+- §5.4: withdraw wording and unactivated grants as above.
+- No catalog (§2) or exporter change: the bond rules read `activated`, `isUnlocked` and `isKycVerified`, which the R1 sample bond (§7) already lists, and the reverted rule reads the receipt the app already polls for the Included words.
