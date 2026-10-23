@@ -27,14 +27,19 @@ command -v cast >/dev/null || { echo "cast (foundry) is required" >&2; exit 1; }
 addr() { jq -er --arg k "$1" '.contracts[$k] // .[$k] // .governance[$k]' "$BOOK"; }
 rpc() { curl -fsS -X POST -H 'content-type: application/json' \
   --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":$2}" "$RPC" | jq -c 'if has("result") then .result else {error: .error} end'; }
-# The head must be a real quantity: a failed or malformed eth_blockNumber aborts the export
-# (no file is written) instead of being recorded as block 0.
+# RPC bytes never reach the terminal raw: keep a short, printable-ASCII excerpt only.
+sanitize() { printf '%s' "$1" | LC_ALL=C tr -cd 'A-Za-z0-9._:-' | cut -c1-32; }
+# The head must be a real, bounded quantity: a failed, malformed, zero or oversized
+# eth_blockNumber aborts the export (no file is written) instead of being recorded as block 0
+# or driving the producer loop. At most 13 hex digits (< 2^52), so the value stays exact in
+# Bash arithmetic and in jq (IEEE doubles); 0x0 is what the node returns on error (contract §2).
 head_now() {
   local q; q=$(curl -fsS -X POST -H 'content-type: application/json' \
     --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' "$RPC" 2>/dev/null \
     | jq -r '.result // empty' 2>/dev/null) || q=""
-  if [[ ! "$q" =~ ^0x[0-9a-fA-F]+$ ]]; then
-    echo "export-fixtures: eth_blockNumber unavailable or malformed (${q:-no response}); no fixture written" >&2
+  if [[ ! "$q" =~ ^0x0*[1-9a-fA-F][0-9a-fA-F]{0,12}$ ]]; then
+    local shown; shown=$(sanitize "$q")
+    echo "export-fixtures: eth_blockNumber unavailable or malformed (${shown:-no response}); no fixture written" >&2
     exit 3
   fi
   printf '%d' "$q"
@@ -61,11 +66,11 @@ OBSERVED=$(head_now); row chain_id      "eth_chainId"                    "$(rpc 
 OBSERVED=$(head_now); row genesis_hash  "eth_getBlockByNumber(0x0).hash" "$(rpc eth_getBlockByNumber '["0x0",false]' | jq -c .hash)"
 OBSERVED=$(head_now); row head_height   "eth_blockNumber (stored height)" "$OBSERVED"
 OBSERVED=$(head_now); row syncing       "eth_syncing"                    "$(rpc eth_syncing '[]')"
-OBSERVED=$(head_now); row peer_count    "net_peerCount (the queried RPC node's direct peers, not a member's node)" "$(rpc net_peerCount '[]')"
+OBSERVED=$(head_now); row rpc_node_peer_count "net_peerCount of the queried RPC node itself (its own direct peers; not a member's node, not the network)" "$(rpc net_peerCount '[]')"
 OBSERVED=$(head_now); row base_fee      "eth_getBlockByNumber(latest).baseFeePerGas" "$(rpc eth_getBlockByNumber '["latest",false]' | jq -c .baseFeePerGas)"
 OBSERVED=$(head_now)
 t1=$(rpc eth_getBlockByNumber "[\"$(printf '0x%x' "$OBSERVED")\",false]" | jq -r .timestamp)
-t0=$(rpc eth_getBlockByNumber "[\"$(printf '0x%x' $((OBSERVED-100)))\",false]" | jq -r .timestamp)
+t0=""; [ "$OBSERVED" -gt 100 ] && t0=$(rpc eth_getBlockByNumber "[\"$(printf '0x%x' $((OBSERVED-100)))\",false]" | jq -r .timestamp)
 # RPC values never reach shell arithmetic unvalidated: Bash evaluates expressions (and array
 # subscripts) inside $(( )), so only a bounded hex quantity is converted; anything else makes
 # the metric unavailable.
@@ -127,12 +132,17 @@ VR=$(addr ValidatorRegistry)
 cur_epoch=$(cast call --rpc-url "$RPC" "$VR" "currentEpoch()(uint256)" 2>/dev/null | awk '{print $1}') || cur_epoch=""
 keys_raw=$(cast call --rpc-url "$RPC" "$VR" "activeSet()(bytes32[],uint256[])" 2>/dev/null | head -1) || keys_raw=""
 active=0; pending=0; unknown=0
-if [[ "$cur_epoch" =~ ^[0-9]+$ ]] && [ -n "$keys_raw" ]; then
+# Epoch values are compared with Bash `-le`, which fails (status 2) on anything that does not
+# fit in 64 bits. So both sides must be at most 15 decimal digits (exact in Bash and jq); a
+# larger or malformed value makes the whole read unavailable instead of counting a validator as
+# pending. Each activeSet() member must be a 32-byte key.
+if [[ "$cur_epoch" =~ ^[0-9]{1,15}$ ]] && [ -n "$keys_raw" ]; then
   for k in $(printf '%s' "$keys_raw" | tr -d '[] ' | tr ',' ' '); do
+    if [[ ! "$k" =~ ^0x[0-9a-fA-F]{64}$ ]]; then unknown=$((unknown + 1)); continue; fi
     ae=$(cast call --rpc-url "$RPC" "$VR" \
       "validatorInfo(bytes32)(address,uint256,uint256,uint256,uint256,uint64,uint64,uint64,uint8,uint256)" "$k" 2>/dev/null \
       | sed -n 6p | awk '{print $1}') || ae=""
-    if [[ ! "$ae" =~ ^[0-9]+$ ]]; then unknown=$((unknown + 1))
+    if [[ ! "$ae" =~ ^[0-9]{1,15}$ ]]; then unknown=$((unknown + 1))
     elif [ "$ae" -le "$cur_epoch" ]; then active=$((active + 1))
     else pending=$((pending + 1)); fi
   done
@@ -140,10 +150,10 @@ if [[ "$cur_epoch" =~ ^[0-9]+$ ]] && [ -n "$keys_raw" ]; then
     cav=$(jq -cn --argjson a "$active" --argjson p "$pending" --argjson e "$cur_epoch" \
       '{count:$a, pending_activation:$p, current_epoch:$e}')
   else
-    cav=$(jq -cn --argjson u "$unknown" '{unavailable:true, reason:"validatorInfo read failed", unreadable:$u}')
+    cav=$(jq -cn --argjson u "$unknown" '{unavailable:true, reason:"validatorInfo read failed or out of range", unreadable:$u}')
   fi
 else
-  cav='{"unavailable":true,"reason":"currentEpoch or activeSet read failed"}'
+  cav='{"unavailable":true,"reason":"currentEpoch or activeSet read failed or out of range"}'
 fi
 row eligible_validators \
   "live ValidatorRegistry activeSet() members with validatorInfo(pubkey).actEpoch <= currentEpoch()" "$cav"
@@ -178,5 +188,7 @@ printf '%s\n' "${rows[@]}" | jq -s --arg rpc "$RPC" --argjson hs "$HEAD_START" -
     consistency: "none: each read is latest state at its own observed_head",
     address_book_deployed_at: $book, reads: .}' > "$OUT"
 consistent=$(jq -r .single_epoch "$OUT")
-echo "wrote $OUT ($(jq '.reads | length' "$OUT") reads, head $HEAD_START→$HEAD_END, single_epoch=$consistent)"
+# Braced expansions: Bash 3.2 (stock macOS) in a UTF-8 locale reads the bytes of a following
+# non-ASCII character as part of an unbraced variable name.
+echo "wrote ${OUT} ($(jq '.reads | length' "$OUT") reads, head ${HEAD_START}→${HEAD_END}, single_epoch=${consistent})"
 [ "$consistent" = true ] || echo "WARNING: export crossed an epoch boundary (validator-set snapshots differ across reads). Re-run if that matters." >&2

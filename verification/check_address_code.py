@@ -39,6 +39,13 @@ def book_entries(book: dict) -> list[tuple[str, str]]:
         for name, addr in (book.get(section) or {}).items():
             if isinstance(addr, str) and addr.startswith("0x"):
                 out.append((f"{section}.{name}", addr))
+    # The governance timelocks are nested beside metadata (type, threshold, ...): only the two
+    # address keys are entries. They are not app contracts, so app_counts() leaves them out.
+    gov = book.get("governance") or {}
+    for name in ("GOVERNANCE", "GUARDIAN"):
+        addr = gov.get(name)
+        if isinstance(addr, str) and addr.startswith("0x"):
+            out.append((f"governance.{name}", addr))
     for key, val in book.items():
         if isinstance(val, str) and val.startswith("0x") and len(val) == 42 and key not in ("deployer",):
             out.append((key, val))
