@@ -17,8 +17,12 @@ currentEpoch() is 2^200 (wider than Bash arithmetic).
 eth_getTransactionCount answers 0x0 (newer cast versions ask for it on eth_call).
 ValidatorRegistry reads are ABI-encoded: two validators, one with actEpoch <= currentEpoch
 (7) and one pending (actEpoch 9).
+Environment (used by scripts/rehearsal/test-export-r1.sh): STUB_CHAIN_ID overrides the chain id
+(default 0x9d0c = 40204); eth_getCode returns non-empty code for every address except those in
+STUB_CODELESS (comma-separated, any case), which return "0x"; eth_call to an address in
+STUB_CALL_FAIL (comma-separated) returns a JSON-RPC error.
 """
-import json, sys
+import json, os, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PORT, HEAD, STEP = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
@@ -53,7 +57,10 @@ def answer(req):
         state["head"] += STEP
         res = hex(state["head"])
     elif m == "eth_chainId":
-        res = "0x9d0c"
+        res = os.environ.get("STUB_CHAIN_ID", "0x9d0c")
+    elif m == "eth_getCode":
+        codeless = {a.strip().lower() for a in os.environ.get("STUB_CODELESS", "").split(",") if a.strip()}
+        res = "0x" if (p and str(p[0]).lower() in codeless) else "0x6080604052"
     elif m == "net_version":
         res = "40204"
     elif m == "eth_syncing":
@@ -71,6 +78,9 @@ def answer(req):
         res = {"number": hex(n), "hash": "0x" + f"{n:064x}", "timestamp": ts,
                "baseFeePerGas": "0x3b9aca00", "proposerPubkey": "0x" + ("aa" if n % 2 else "bb") * 32}
     elif m == "eth_call":
+        failing = {a.strip().lower() for a in os.environ.get("STUB_CALL_FAIL", "").split(",") if a.strip()}
+        if p and str((p[0] or {}).get("to", "")).lower() in failing:
+            return {"jsonrpc": "2.0", "id": req.get("id"), "error": {"code": 3, "message": "execution reverted"}}
         data = ((p[0] or {}).get("data") or (p[0] or {}).get("input") or "") if p else ""
         res = registry_call(data)
     elif m == "eth_getTransactionCount":
