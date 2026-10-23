@@ -3,6 +3,7 @@
 use crate::db::{column_families::*, RocksDB};
 use anyhow::Result;
 use citrate_consensus::types::{Hash, Transaction};
+use citrate_execution::executor::{ReceiptIndexBatch, ReceiptReconcileMarker};
 use citrate_execution::types::TransactionReceipt;
 use std::sync::Arc;
 use tracing::debug;
@@ -191,6 +192,99 @@ impl TransactionStore {
         self.db.compact_cf(CF_TRANSACTIONS)?;
         self.db.compact_cf(CF_RECEIPTS)?;
         Ok(())
+    }
+}
+
+/// C1-R: stage a [`ReceiptIndexBatch`] into `batch` with the producer's exact
+/// layout (`put_transactions` + `put_receipts`), so the caller can commit it in the
+/// same `write_batch_sync` as the block's state and applied-tip pointer.
+///
+/// Removals are staged FIRST: for each abandoned `(block, tx)` the `t‖block‖tx`
+/// marker is deleted, and the receipt is deleted only when the stored receipt still
+/// names that block (a receipt already moved to another block is left alone). Puts
+/// follow, so a tx re-executed on the winning branch ends with its new receipt —
+/// RocksDB applies a batch's operations in order.
+pub(crate) fn stage_receipt_index(
+    db: &RocksDB,
+    batch: &mut rocksdb::WriteBatch,
+    index: &ReceiptIndexBatch,
+) -> Result<()> {
+    for (block_hash, tx_hash) in &index.removals {
+        db.batch_delete_cf(batch, CF_METADATA, &block_tx_key(block_hash, tx_hash))?;
+        if let Some(bytes) = db.get_cf(CF_RECEIPTS, tx_hash.as_bytes())? {
+            let stored: TransactionReceipt = bincode::deserialize(&bytes)?;
+            if stored.block_hash == *block_hash {
+                db.batch_delete_cf(batch, CF_RECEIPTS, tx_hash.as_bytes())?;
+            }
+        }
+    }
+    for tx in &index.transactions {
+        let tx_bytes = bincode::serialize(tx)?;
+        db.batch_put_cf(batch, CF_TRANSACTIONS, tx.hash.as_bytes(), &tx_bytes)?;
+        db.batch_put_cf(
+            batch,
+            CF_METADATA,
+            &sender_tx_key(&tx.from, tx.nonce),
+            tx.hash.as_bytes(),
+        )?;
+    }
+    for receipt in &index.receipts {
+        let receipt_bytes = bincode::serialize(receipt)?;
+        db.batch_put_cf(
+            batch,
+            CF_RECEIPTS,
+            receipt.tx_hash.as_bytes(),
+            &receipt_bytes,
+        )?;
+        db.batch_put_cf(
+            batch,
+            CF_METADATA,
+            &block_tx_key(&receipt.block_hash, &receipt.tx_hash),
+            &[],
+        )?;
+    }
+    match index.reconcile_marker {
+        Some(ReceiptReconcileMarker::Set(hash, height)) => {
+            db.batch_put_cf(
+                batch,
+                CF_METADATA,
+                RECEIPT_RECONCILE_KEY,
+                &encode_reconcile_marker(&hash, height),
+            )?;
+        }
+        Some(ReceiptReconcileMarker::Clear) => {
+            db.batch_delete_cf(batch, CF_METADATA, RECEIPT_RECONCILE_KEY)?;
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+/// C1-R: `CF_METADATA` key of the [`ReceiptReconcileMarker`] (value: block hash
+/// `[32]` ‖ height big-endian `[8]`, the applied-tip layout).
+const RECEIPT_RECONCILE_KEY: &[u8] = b"receipt_reconcile_from";
+
+fn encode_reconcile_marker(hash: &Hash, height: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(40);
+    buf.extend_from_slice(hash.as_bytes());
+    buf.extend_from_slice(&height.to_be_bytes());
+    buf
+}
+
+impl TransactionStore {
+    /// C1-R: the old applied tip recorded by an unfinished from-genesis rebuild
+    /// (see [`ReceiptReconcileMarker`]), if any. A malformed value reads as absent.
+    pub fn get_receipt_reconcile_marker(&self) -> Result<Option<(Hash, u64)>> {
+        let Some(bytes) = self.db.get_cf(CF_METADATA, RECEIPT_RECONCILE_KEY)? else {
+            return Ok(None);
+        };
+        let Some((hash, height)) = bytes.split_at_checked(32) else {
+            return Ok(None);
+        };
+        match (<[u8; 32]>::try_from(hash), <[u8; 8]>::try_from(height)) {
+            (Ok(hash), Ok(height)) => Ok(Some((Hash::new(hash), u64::from_be_bytes(height)))),
+            _ => Ok(None),
+        }
     }
 }
 

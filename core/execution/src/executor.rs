@@ -408,6 +408,104 @@ pub struct StateStorageChange {
     pub value: Option<Vec<u8>>,
 }
 
+/// C1-R: the RPC receipt index (NOT consensus data) committed in the SAME write
+/// batch as a block's state + applied-tip pointer, so a node that applies a block
+/// it did not produce can serve `eth_getTransactionReceipt` / `eth_getLogs` for it,
+/// and a crash can never leave the applied tip ahead of its receipts (or receipts
+/// ahead of the tip).
+///
+/// Storage layout is the producer's (`TransactionStore::put_receipts` /
+/// `put_transactions`): `CF_RECEIPTS[tx_hash] = receipt`, a `t‖block_hash‖tx_hash`
+/// marker in `CF_METADATA`, `CF_TRANSACTIONS[tx_hash] = tx` and the `s‖sender‖nonce`
+/// sender index. The store applies `removals` BEFORE the puts, so a tx that sits on
+/// both an abandoned and a winning branch ends with the winning receipt.
+///
+/// Nothing here feeds a state root: receipts are written next to state, never into it.
+#[derive(Debug, Clone, Default)]
+pub struct ReceiptIndexBatch {
+    /// `(block_hash, tx_hash)` pairs of blocks that are no longer executed (a reorg
+    /// or rebuild abandoned them). The store deletes the block→tx marker, and the
+    /// receipt itself only when the stored receipt still names that block.
+    pub removals: Vec<(Hash, Hash)>,
+    /// Receipts to write, keyed by `receipt.tx_hash` and indexed under
+    /// `receipt.block_hash`.
+    pub receipts: Vec<TransactionReceipt>,
+    /// Transaction bodies to index (by hash, and by sender + nonce).
+    pub transactions: Vec<Transaction>,
+    /// Rebuild bookkeeping committed with the same batch (see
+    /// [`ReceiptReconcileMarker`]). `None` leaves the stored marker unchanged.
+    pub reconcile_marker: Option<ReceiptReconcileMarker>,
+}
+
+/// C1-R: durable note that receipts of an older applied chain may still sit
+/// ABOVE the durable applied tip.
+///
+/// A from-genesis rebuild resets the durable tip to genesis but keeps the receipts
+/// of blocks shared by the old applied chain and the rebuild target (they are
+/// rewritten, identically, as the replay reaches them). If the process stops
+/// before the replay gets there and the next run converges on a different branch,
+/// nothing else would ever name those blocks again. The rebuild therefore records
+/// the old applied tip in the reset batch (`Set`) and drops the note once the
+/// receipt index matches the applied chain again (`Clear`); a restart that finds
+/// the note removes every receipt of the old chain that is not on the durable
+/// applied chain, walking only from the old tip down to the common ancestor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiptReconcileMarker {
+    /// Record `(hash, height)`: the applied tip whose chain may keep receipts
+    /// above the durable tip.
+    Set(Hash, u64),
+    /// Remove the record.
+    Clear,
+}
+
+impl ReceiptIndexBatch {
+    /// No index writes.
+    pub fn is_empty(&self) -> bool {
+        self.removals.is_empty()
+            && self.receipts.is_empty()
+            && self.transactions.is_empty()
+            && self.reconcile_marker.is_none()
+    }
+
+    /// The index entries for one executed block: its transactions and their
+    /// receipts, each receipt stamped with the block's hash and height (the same
+    /// fields the producer stamps after sealing).
+    pub fn for_block(block: &Block, receipts: &[TransactionReceipt]) -> Self {
+        let receipts = receipts
+            .iter()
+            .map(|r| {
+                let mut r = r.clone();
+                r.block_hash = block.header.block_hash;
+                r.block_number = block.header.height;
+                r
+            })
+            .collect();
+        Self {
+            removals: Vec::new(),
+            receipts,
+            transactions: block.transactions.clone(),
+            reconcile_marker: None,
+        }
+    }
+
+    /// Append another batch's entries (removals stay ahead of puts at commit time).
+    /// A marker change in `other` replaces this batch's.
+    pub fn extend(&mut self, other: ReceiptIndexBatch) {
+        self.removals.extend(other.removals);
+        self.receipts.extend(other.receipts);
+        self.transactions.extend(other.transactions);
+        if other.reconcile_marker.is_some() {
+            self.reconcile_marker = other.reconcile_marker;
+        }
+    }
+
+    /// This batch with its marker change set to `marker`.
+    pub fn with_marker(mut self, marker: ReceiptReconcileMarker) -> Self {
+        self.reconcile_marker = Some(marker);
+        self
+    }
+}
+
 /// Trait for state storage to avoid circular dependency
 pub trait StateStoreTrait: Send + Sync {
     fn put_account(
@@ -489,13 +587,21 @@ pub trait StateStoreTrait: Send + Sync {
     /// `StateStore` overrides this with a single cross-CF `WriteBatch`; the default here
     /// writes state then tip (non-atomic — only used by in-memory test stores, where a
     /// crash mid-write is not modeled). `applied_tip = None` means "state only".
+    ///
+    /// C1-R: `index` is the block's RPC receipt index, committed in the same batch
+    /// (see [`ReceiptIndexBatch`]); the default writes it last via
+    /// [`Self::put_receipt_index`].
     fn write_state_batch_with_applied_tip(
         &self,
         accounts: &[(Address, crate::types::AccountState)],
         storage: &[StateStorageChange],
         applied_tip: Option<(Hash, u64)>,
+        index: &ReceiptIndexBatch,
     ) -> anyhow::Result<()> {
         self.write_state_batch_sync(accounts, storage)?;
+        if !index.is_empty() {
+            self.put_receipt_index(index)?;
+        }
         if let Some((hash, height)) = applied_tip {
             self.put_applied_tip_meta(&hash, height)?;
         }
@@ -532,6 +638,9 @@ pub trait StateStoreTrait: Send + Sync {
     /// (a faithful single-batch one, or a delegating one) rather than inherit a default.
     /// The real RocksDB-backed `StateStore` implements it with a single cross-CF
     /// `WriteBatch` fsync'd once via `write_batch_sync`.
+    ///
+    /// C1-R: `index` carries the receipt-index changes of the reorg (abandoned
+    /// blocks' receipts removed, the winning branch's written) in the same batch.
     fn write_reorg_batch_sync(
         &self,
         accounts: &[(Address, crate::types::AccountState)],
@@ -539,12 +648,21 @@ pub trait StateStoreTrait: Send + Sync {
         account_dels: &[Address],
         code: &[(Hash, Vec<u8>)],
         applied_tip: Option<(Hash, u64)>,
+        index: &ReceiptIndexBatch,
     ) -> anyhow::Result<()>;
 
     /// Persist the applied-tip pointer (block hash + height). Default no-op for test
     /// stores; the real `StateStore` writes it to `CF_METADATA`. Used by the atomic
     /// [`Self::write_state_batch_with_applied_tip`] default fallback.
     fn put_applied_tip_meta(&self, _hash: &Hash, _height: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// C1-R: persist a receipt index on its own (non-atomic fallback used only by
+    /// the default [`Self::write_state_batch_with_applied_tip`]). Default no-op for
+    /// in-memory test stores, which keep no receipt index; the real RocksDB
+    /// `StateStore` overrides the batch methods and writes the index inside them.
+    fn put_receipt_index(&self, _index: &ReceiptIndexBatch) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -1010,6 +1128,51 @@ impl Executor {
         &self,
         applied_tip: Option<(Hash, u64)>,
     ) -> anyhow::Result<usize> {
+        self.persist_state_changes_with_tip_and_index(applied_tip, &ReceiptIndexBatch::default())
+            .await
+    }
+
+    /// C1-R: commit receipt-index changes on their own (no state, no tip) as one
+    /// fsync'd batch. Used for rebuild bookkeeping that has no state change to ride
+    /// with. A store-less executor keeps no receipt index, so this is a no-op there.
+    pub async fn persist_receipt_index(&self, index: &ReceiptIndexBatch) -> anyhow::Result<()> {
+        if index.is_empty() {
+            return Ok(());
+        }
+        let _guard = self.commit_coordinator.acquire_exec_lock().await;
+        match &self.state_store {
+            Some(store) => store.put_receipt_index(index),
+            None => Ok(()),
+        }
+    }
+
+    /// C1-R: [`Self::persist_receipt_index`] for a startup path that cannot await
+    /// (the canonical applicator's constructor settling an unfinished rebuild).
+    /// Same store, same single fsync'd batch, but it does NOT take the exec lock:
+    /// call it only before the executor runs blocks concurrently.
+    pub fn persist_receipt_index_at_startup(
+        &self,
+        index: &ReceiptIndexBatch,
+    ) -> anyhow::Result<()> {
+        if index.is_empty() {
+            return Ok(());
+        }
+        match &self.state_store {
+            Some(store) => store.put_receipt_index(index),
+            None => Ok(()),
+        }
+    }
+
+    /// C1-R: [`Self::persist_state_changes_with_tip`] plus the block's RPC receipt
+    /// index, all in the ONE atomic state batch: after a crash either the block's
+    /// state, tip AND receipts are durable, or none of them are (and the block is
+    /// re-applied on restart). The index never touches `state_db`, so it cannot move
+    /// a state root.
+    pub async fn persist_state_changes_with_tip_and_index(
+        &self,
+        applied_tip: Option<(Hash, u64)>,
+        index: &ReceiptIndexBatch,
+    ) -> anyhow::Result<usize> {
         let _guard = self.commit_coordinator.acquire_exec_lock().await;
         if let Some(store) = &self.state_store {
             let dirty_accounts = self.state_db.accounts.get_dirty_accounts();
@@ -1043,11 +1206,12 @@ impl Executor {
             let count = account_changes.len().saturating_add(storage_changes.len());
             // Write state + the applied-tip pointer ATOMICALLY. Always write when a tip
             // is supplied (even with 0 dirty changes — the tip must still advance).
-            if count > 0 || applied_tip.is_some() {
+            if count > 0 || applied_tip.is_some() || !index.is_empty() {
                 store.write_state_batch_with_applied_tip(
                     &account_changes,
                     &storage_changes,
                     applied_tip,
+                    index,
                 )?;
             }
 
@@ -1307,6 +1471,19 @@ impl Executor {
         baseline: &crate::state::StateSnapshot,
         applied_tip: Option<(Hash, u64)>,
     ) -> anyhow::Result<()> {
+        self.reconcile_store_from_with_index(baseline, applied_tip, &ReceiptIndexBatch::default())
+    }
+
+    /// C1-R: [`Self::reconcile_store_from`] plus receipt-index changes (abandoned
+    /// blocks' receipts removed, the newly executed branch's written) in the SAME
+    /// fsync'd reorg batch, so the durable receipts always describe the blocks
+    /// executed up to the durable applied tip.
+    pub fn reconcile_store_from_with_index(
+        &self,
+        baseline: &crate::state::StateSnapshot,
+        applied_tip: Option<(Hash, u64)>,
+        index: &ReceiptIndexBatch,
+    ) -> anyhow::Result<()> {
         use std::collections::{HashMap, HashSet};
         let store = match &self.state_store {
             Some(s) => s,
@@ -1372,7 +1549,8 @@ impl Executor {
             || !storage_changes.is_empty()
             || !account_dels.is_empty()
             || !code.is_empty()
-            || applied_tip.is_some();
+            || applied_tip.is_some()
+            || !index.is_empty();
         if must_commit {
             store.write_reorg_batch_sync(
                 &account_puts,
@@ -1380,6 +1558,7 @@ impl Executor {
                 &account_dels,
                 &code,
                 applied_tip,
+                index,
             )?;
         }
         Ok(())
@@ -1415,6 +1594,7 @@ impl Executor {
     ) -> Result<Hash, ExecutionError> {
         self.apply_block_inner(block, coinbase, reward_credits, true, true)
             .await
+            .map(|(root, _)| root)
     }
 
     /// TRUSTED LOCAL REPLAY (canonical recovery): like [`Self::apply_block`]
@@ -1434,6 +1614,7 @@ impl Executor {
     ) -> Result<Hash, ExecutionError> {
         self.apply_block_inner(block, coinbase, reward_credits, true, false)
             .await
+            .map(|(root, _)| root)
     }
 
     /// EXECUTE-ON-RECEIVE (reorg): like [`Self::apply_block`], but advances only
@@ -1450,8 +1631,25 @@ impl Executor {
     ) -> Result<Hash, ExecutionError> {
         self.apply_block_inner(block, coinbase, reward_credits, false, true)
             .await
+            .map(|(root, _)| root)
     }
 
+    /// C1-R: [`Self::apply_block_no_persist`] that also returns the block's
+    /// receipts (positionally aligned with `block.transactions`), so the reorg
+    /// driver can commit them with the winning branch's store reconcile.
+    pub async fn apply_block_no_persist_with_receipts(
+        &self,
+        block: &Block,
+        coinbase: [u8; 20],
+        reward_credits: &[(Address, U256)],
+    ) -> Result<(Hash, Vec<TransactionReceipt>), ExecutionError> {
+        self.apply_block_inner(block, coinbase, reward_credits, false, true)
+            .await
+    }
+
+    /// Returns the verified (or, for a trusted replay, claimed) state root and the
+    /// block's receipts. With `persist`, the receipts are committed to the RPC
+    /// receipt index in the same atomic batch as the state and applied tip (C1-R).
     async fn apply_block_inner(
         &self,
         block: &Block,
@@ -1459,7 +1657,7 @@ impl Executor {
         reward_credits: &[(Address, U256)],
         persist: bool,
         verify_root: bool,
-    ) -> Result<Hash, ExecutionError> {
+    ) -> Result<(Hash, Vec<TransactionReceipt>), ExecutionError> {
         // Defer eager persistence for the whole apply (execution + reward
         // crediting + contract deploys): set_balance/set_code/set_nonce mutate
         // in-memory + dirty-tracking only, so a `no_persist` apply writes nothing
@@ -1542,13 +1740,20 @@ impl Executor {
         };
 
         if !persist {
-            return Ok(got);
+            return Ok((got, receipts));
         }
 
         // SRP-S3b: persist state AND advance the applied-tip to THIS block atomically, so
         // the durable state and the committed applied tip can never diverge on a crash.
+        // C1-R: the block's receipts ride in the same batch, so every node that applies
+        // a block (not only its producer) can serve them, with no crash window between
+        // "block applied" and "receipts stored".
+        let index = ReceiptIndexBatch::for_block(block, &receipts);
         if let Err(e) = self
-            .persist_state_changes_with_tip(Some((block.header.block_hash, block.header.height)))
+            .persist_state_changes_with_tip_and_index(
+                Some((block.header.block_hash, block.header.height)),
+                &index,
+            )
             .await
         {
             // HIGH-1: a durable-write failure must NOT leave in-memory state
@@ -1564,7 +1769,7 @@ impl Executor {
                 "persist after apply_block: {e}"
             )));
         }
-        Ok(got)
+        Ok((got, receipts))
     }
 
     /// VALIDATOR-S1 §R': the shared handle to the FINALIZED epoch reward policy.

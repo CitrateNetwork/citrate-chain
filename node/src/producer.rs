@@ -5240,6 +5240,145 @@ mod tests {
     //   LIVENESS — both producers keep producing. The MP-S1 fix makes a producer
     //              SKIP a round when fork-choice and its applied tip disagree, so
     //              this pins that the skip is transient and never a deadlock.
+    /// C1-R: the producer's receipt path is unchanged, and a FOLLOWER that
+    /// applies the producer's block stores byte-identical receipts in the same
+    /// store + format (`CF_RECEIPTS` by tx hash, the `t‖block‖tx` marker, the tx
+    /// body), with the same block hash and number.
+    #[tokio::test]
+    async fn c1r_follower_receipts_match_the_producers() {
+        use crate::canonical_apply::{ApplyOutcome, CanonicalApplicator};
+        use citrate_execution::StateDB;
+
+        async fn node(
+            producing: bool,
+        ) -> (
+            TempDir,
+            Arc<StorageManager>,
+            Arc<Executor>,
+            Arc<DagStore>,
+            Arc<GhostDag>,
+            CanonicalApplicator,
+            Option<(BlockProducer, Arc<Mempool>)>,
+        ) {
+            let dir = TempDir::new().expect("tempdir");
+            let storage = Arc::new(
+                StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
+            );
+            let executor = Arc::new(Executor::with_storage_and_chain_id(
+                Arc::new(StateDB::new()),
+                Some(storage.state.clone()),
+                40204,
+            ));
+            let sender = Address([0x11; 20]);
+            executor.set_balance(&sender, U256::from(21_000u64 * 1_000_000_000u64 * 10));
+            executor
+                .persist_state_changes()
+                .await
+                .expect("persist funded genesis");
+            let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+            let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+            seed_test_genesis(&storage, &dag, &ghostdag).await;
+            let app = CanonicalApplicator::new(executor.clone(), storage.clone())
+                .with_fork_choice(ghostdag.clone());
+            let producer = if producing {
+                let mempool = Arc::new(Mempool::new(MempoolConfig {
+                    require_valid_signature: false,
+                    ..Default::default()
+                }));
+                let p = BlockProducer::with_shared_dag(
+                    storage.clone(),
+                    executor.clone(),
+                    mempool.clone(),
+                    None,
+                    embedded_pubkey(Address([0x44; 20])),
+                    Ed25519SigningKey::from_bytes(&[42; 32]),
+                    2,
+                    Arc::new(citrate_economics::UnifiedEconomicsManager::new(
+                        citrate_economics::UnifiedEconomicsConfig::default(),
+                    )),
+                    dag.clone(),
+                    ghostdag.clone(),
+                )
+                .await
+                .with_v2_headers(true)
+                .with_applied_tip_lock(app.advance_lock());
+                Some((p, mempool))
+            } else {
+                None
+            };
+            (dir, storage, executor, dag, ghostdag, app, producer)
+        }
+
+        let (_pd, p_storage, _pe, _pdag, _pg, _papp, producer) = node(true).await;
+        let (_fd, f_storage, _fe, f_dag, f_ghostdag, f_app, _) = node(false).await;
+        let (producer, mempool) = producer.expect("producer node");
+
+        let tx = transfer_tx(0xC1, Address([0x11; 20]), Address([0x33; 20]), 0);
+        mempool
+            .add_transaction(tx.clone(), TxClass::Standard)
+            .await
+            .expect("admit tx");
+        let hash = producer.produce_block().await.expect("produce");
+        let block = p_storage
+            .blocks
+            .get_block(&hash)
+            .expect("read block")
+            .expect("sealed block");
+        assert_eq!(block.transactions.len(), 1);
+
+        // Producer side: unchanged — its own receipt, stamped with the sealed block.
+        let p_receipt = p_storage
+            .transactions
+            .get_receipt(&tx.hash)
+            .expect("read")
+            .expect("producer stored its receipt");
+        assert_eq!(p_receipt.block_hash, hash);
+        assert_eq!(p_receipt.block_number, block.header.height);
+
+        // Follower: the real receive path (persist, DAG admit, apply).
+        assert!(f_storage
+            .transactions
+            .get_receipt(&tx.hash)
+            .expect("read")
+            .is_none());
+        f_storage.blocks.put_block(&block).expect("persist");
+        f_dag.store_block(block.clone()).await.expect("dag");
+        f_ghostdag.add_block(&block).await.expect("ghostdag");
+        assert!(matches!(
+            f_app.apply_received(&block).await,
+            ApplyOutcome::Applied { .. }
+        ));
+
+        let f_receipt = f_storage
+            .transactions
+            .get_receipt(&tx.hash)
+            .expect("read")
+            .expect("follower stored the receipt");
+        assert_eq!(
+            bincode::serialize(&f_receipt).expect("ser"),
+            bincode::serialize(&p_receipt).expect("ser"),
+            "follower receipt is byte-identical to the producer's"
+        );
+        assert_eq!(
+            f_storage
+                .transactions
+                .get_block_transactions(&hash)
+                .expect("markers"),
+            p_storage
+                .transactions
+                .get_block_transactions(&hash)
+                .expect("markers"),
+        );
+        assert_eq!(
+            f_storage
+                .transactions
+                .get_transaction(&tx.hash)
+                .expect("tx")
+                .map(|t| t.hash),
+            Some(tx.hash)
+        );
+    }
+
     #[tokio::test]
     async fn mp_s1_two_concurrent_producers_a_follower_reproduces_every_root() {
         use crate::canonical_apply::{ApplyOutcome, CanonicalApplicator};
