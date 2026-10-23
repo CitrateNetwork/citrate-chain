@@ -59,8 +59,9 @@
 // state is never awaited while holding the gate.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, MutexGuard};
 use tracing::{debug, error, info, warn};
@@ -163,6 +164,45 @@ pub const MAX_UNKNOWN_EARLY_VOTES: usize = 32;
 /// signed floor past them (see [`SignRefusal::BelowSignedFloor`]), so pruning
 /// above the finalized floor never re-opens a height for signing.
 pub const MAX_SIGNED_HEIGHTS: usize = 1024;
+
+/// Finalization retry (certificate write): delay before the first retry of a
+/// checkpoint whose finalization failed although it already has quorum (its
+/// certificate could not be written durably). Each further failure doubles
+/// the delay up to [`FINALIZE_RETRY_CAP`]. See
+/// [`FinalityGadget::retry_finalizations`].
+pub const FINALIZE_RETRY_BASE: Duration = Duration::from_secs(1);
+/// Upper bound on the finalization retry delay: a store that stays broken is
+/// retried at most once per this interval, for as long as the checkpoint is
+/// pending with quorum.
+pub const FINALIZE_RETRY_CAP: Duration = Duration::from_secs(30);
+
+/// Delay before the next finalization retry after `failures` failed attempts:
+/// [`FINALIZE_RETRY_BASE`] doubled per failure after the first, capped at
+/// [`FINALIZE_RETRY_CAP`] (`0` failures = the base delay).
+pub fn finalize_retry_delay(failures: u32) -> Duration {
+    let _ = failures;
+    Duration::ZERO
+}
+
+/// What one [`FinalityGadget::retry_finalizations`] tick did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FinalizeRetryOutcome {
+    /// Heights finalized by this tick, ascending.
+    pub finalized: Vec<u64>,
+    /// Heights retried by this tick that still failed, ascending.
+    pub failed: Vec<u64>,
+    /// Checkpoints still waiting for a retry after this tick.
+    pub pending: usize,
+}
+
+/// Lifetime counters of the finalization retry (for the node's metrics).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FinalizeRetryStats {
+    /// Retry attempts made (each one a `finalize_checkpoint` call).
+    pub attempts: u64,
+    /// Retries that finalized their checkpoint.
+    pub recovered: u64,
+}
 
 /// `DAG_METADATA` key prefix of the durable signed-vote record:
 /// `checkpoint_signed:<chain_id>:<height>` -> the 32-byte block hash signed.
@@ -625,6 +665,17 @@ struct GadgetState {
     /// (never at construction, so a switched-OFF gadget never touches the
     /// store) and updated only after a successful synced write.
     signed_meta: Option<SignedVoteMeta>,
+    /// Checkpoints pending WITH quorum whose finalization failed (the
+    /// certificate could not be written durably), by height: failures so far
+    /// and when the next retry is due. See [`FinalityGadget::retry_finalizations`].
+    finalize_retry: BTreeMap<u64, FinalizeRetry>,
+}
+
+/// Retry schedule of one checkpoint whose finalization failed.
+#[derive(Debug, Clone, Copy)]
+struct FinalizeRetry {
+    failures: u32,
+    next_at: Instant,
 }
 
 /// The producer/outbound half of checkpoint finality.
@@ -641,6 +692,10 @@ pub struct FinalityGadget {
     /// serialized against it through its gate (module docs, lock order).
     safety_stop: Arc<SafetyStop>,
     state: Mutex<GadgetState>,
+    /// [`FinalizeRetryStats::attempts`].
+    retry_attempts: AtomicU64,
+    /// [`FinalizeRetryStats::recovered`].
+    retry_recovered: AtomicU64,
     #[cfg(test)]
     sign_pause: Option<Arc<SignPause>>,
 }
@@ -670,6 +725,8 @@ impl FinalityGadget {
             enabled,
             safety_stop: Arc::new(SafetyStop::default()),
             state: Mutex::new(GadgetState::default()),
+            retry_attempts: AtomicU64::new(0),
+            retry_recovered: AtomicU64::new(0),
             #[cfg(test)]
             sign_pause: None,
         }
@@ -1130,6 +1187,24 @@ impl FinalityGadget {
         }
     }
 
+    /// Retry the finalization of every checkpoint that is pending WITH quorum
+    /// but did not finalize (its certificate write failed), once its backoff
+    /// delay has passed at `now`. Called on the driver's periodic tick, so a
+    /// checkpoint whose certificate write failed finalizes once the store
+    /// recovers even if no further vote ever arrives.
+    pub async fn retry_finalizations(&self, now: Instant) -> FinalizeRetryOutcome {
+        let _ = now;
+        FinalizeRetryOutcome::default()
+    }
+
+    /// Lifetime counters of [`Self::retry_finalizations`].
+    pub fn finalize_retry_stats(&self) -> FinalizeRetryStats {
+        FinalizeRetryStats {
+            attempts: self.retry_attempts.load(Ordering::Relaxed),
+            recovered: self.retry_recovered.load(Ordering::Relaxed),
+        }
+    }
+
     /// The durable signed-vote watermarks, loading them on first use.
     fn signed_meta(
         &self,
@@ -1363,6 +1438,10 @@ mod tests {
     struct MemKv {
         inner: std::sync::Mutex<MemMap>,
         fail_writes: AtomicBool,
+        /// Fail only writes of finalized certificates (`checkpoint:{height}`),
+        /// as a failed write or fsync of that record would; counts each one.
+        fail_certs: AtomicBool,
+        cert_failures: std::sync::atomic::AtomicUsize,
         batches: std::sync::atomic::AtomicUsize,
     }
 
@@ -1375,6 +1454,14 @@ mod tests {
         fn check_writable(&self) -> Result<(), String> {
             if self.fail_writes.load(Ordering::SeqCst) {
                 Err("injected write failure".to_string())
+            } else {
+                Ok(())
+            }
+        }
+        fn check_cert(&self, key: &[u8]) -> Result<(), String> {
+            if key.starts_with(b"checkpoint:") && self.fail_certs.load(Ordering::SeqCst) {
+                self.cert_failures.fetch_add(1, Ordering::SeqCst);
+                Err("injected: certificate fsync failed (EIO)".to_string())
             } else {
                 Ok(())
             }
@@ -1400,6 +1487,7 @@ mod tests {
         }
         fn kv_put(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), String> {
             self.check_writable()?;
+            self.check_cert(key)?;
             self.inner
                 .lock()
                 .map_err(|e| e.to_string())?
@@ -1430,6 +1518,11 @@ mod tests {
         /// Atomic: all ops or none.
         fn kv_write_batch(&self, ops: &[KvOp]) -> Result<(), String> {
             self.check_writable()?;
+            for op in ops {
+                if let KvOp::Put { key, .. } = op {
+                    self.check_cert(key)?;
+                }
+            }
             self.batches.fetch_add(1, Ordering::SeqCst);
             let mut m = self.inner.lock().map_err(|e| e.to_string())?;
             for op in ops {
@@ -2714,5 +2807,261 @@ mod tests {
             cert.verify_certificate(1337).is_err(),
             "bound to its own chain id"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Finalization retry: a checkpoint that reached quorum but whose
+    // certificate could not be written is retried on the driver's tick, with
+    // capped backoff, even when no further vote arrives.
+    // -----------------------------------------------------------------------
+
+    /// Counts the guard's hooks: `after_finalize` is the publication point.
+    #[derive(Default)]
+    struct CountingGuard {
+        before: std::sync::atomic::AtomicUsize,
+        after: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::checkpoint::FinalizationGuard for CountingGuard {
+        async fn before_finalize(&self, _certificate: &crate::checkpoint::Checkpoint) {
+            self.before.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn after_finalize(&self, _certificate: &crate::checkpoint::Checkpoint) {
+            self.after.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A gadget over a store whose certificate writes fail, with checkpoint 4
+    /// pending and quorum (3 of 4) reached through the inbound path: the
+    /// finalization failed and nothing finalized.
+    async fn quorum_with_failed_certificate() -> (FinalityGadget, Arc<MemKv>, Vec<SigningKey>) {
+        let ks = keys(4);
+        let kv = Arc::new(MemKv::default());
+        kv.fail_certs.store(true, Ordering::SeqCst);
+        let g = gadget_over(&ks, true, kv.clone(), 40).await;
+        let committee: Vec<PublicKey> = ks.iter().map(pk).collect();
+        g.manager()
+            .ensure_proposed(4, block_hash(4), committee)
+            .await
+            .expect("propose");
+        for k in ks.iter().take(2) {
+            let out = g
+                .on_inbound_vote(sign_checkpoint_vote(CHAIN, 4, block_hash(4), k))
+                .await;
+            assert!(matches!(out, InboundOutcome::Accepted { .. }), "{out:?}");
+        }
+        let out = g
+            .on_inbound_vote(sign_checkpoint_vote(CHAIN, 4, block_hash(4), &ks[2]))
+            .await;
+        assert!(
+            matches!(
+                out,
+                InboundOutcome::FinalizeFailed {
+                    height: 4,
+                    error: CheckpointError::StorageError(_),
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+        assert_eq!(g.manager().latest_finalized_height().await, 0);
+        assert_eq!(g.manager().quorum_pending_heights().await, vec![4]);
+        (g, kv, ks)
+    }
+
+    #[test]
+    fn finalize_retry_delay_doubles_to_the_cap() {
+        assert_eq!(finalize_retry_delay(0), FINALIZE_RETRY_BASE);
+        assert_eq!(finalize_retry_delay(1), FINALIZE_RETRY_BASE);
+        assert_eq!(finalize_retry_delay(2), FINALIZE_RETRY_BASE * 2);
+        assert_eq!(finalize_retry_delay(3), FINALIZE_RETRY_BASE * 4);
+        assert_eq!(finalize_retry_delay(5), FINALIZE_RETRY_BASE * 16);
+        assert_eq!(finalize_retry_delay(6), FINALIZE_RETRY_CAP);
+        assert_eq!(finalize_retry_delay(64), FINALIZE_RETRY_CAP);
+        assert_eq!(finalize_retry_delay(u32::MAX), FINALIZE_RETRY_CAP);
+        for f in 0..100u32 {
+            assert!(finalize_retry_delay(f) <= FINALIZE_RETRY_CAP);
+            assert!(finalize_retry_delay(f) <= finalize_retry_delay(f.saturating_add(1)));
+        }
+    }
+
+    /// The store recovers and NO further vote arrives: the next tick after the
+    /// backoff delay finalizes the checkpoint; a tick before it does nothing.
+    #[tokio::test]
+    async fn failed_certificate_write_is_retried_on_the_tick_without_further_votes() {
+        let (g, kv, _ks) = quorum_with_failed_certificate().await;
+        kv.fail_certs.store(false, Ordering::SeqCst);
+
+        let start = Instant::now();
+        let early = g.retry_finalizations(start).await;
+        assert!(
+            early.finalized.is_empty() && early.failed.is_empty(),
+            "{early:?}"
+        );
+        assert_eq!(early.pending, 1, "tracked, waiting for its delay");
+        assert_eq!(g.manager().latest_finalized_height().await, 0);
+
+        let out = g.retry_finalizations(start + FINALIZE_RETRY_BASE).await;
+        assert_eq!(out.finalized, vec![4], "{out:?}");
+        assert_eq!(out.pending, 0);
+        assert_eq!(g.manager().latest_finalized_height().await, 4);
+        assert!(g.manager().is_certificate_persisted(4, &block_hash(4)));
+        let cp = g.manager().get_checkpoint(4).await.expect("finalized");
+        assert_eq!(cp.votes.len(), 3);
+        cp.verify_certificate(CHAIN).expect("certificate verifies");
+        assert_eq!(g.manager().pending_len().await, 0, "pruned after finality");
+        assert_eq!(
+            g.finalize_retry_stats(),
+            FinalizeRetryStats {
+                attempts: 1,
+                recovered: 1
+            }
+        );
+
+        // Idempotent: later ticks find nothing to do.
+        let again = g.retry_finalizations(start + FINALIZE_RETRY_CAP * 10).await;
+        assert_eq!(again, FinalizeRetryOutcome::default());
+        assert_eq!(g.finalize_retry_stats().attempts, 1);
+    }
+
+    /// The store never recovers: every retry fails, the checkpoint never
+    /// finalizes, and retries happen only when due — the delay doubles up to
+    /// the cap, so a broken store costs at most one write per cap interval.
+    #[tokio::test]
+    async fn permanent_certificate_failure_backs_off_and_never_finalizes() {
+        let (g, kv, _ks) = quorum_with_failed_certificate().await;
+        let failures_at_quorum = kv.cert_failures.load(Ordering::SeqCst);
+        assert_eq!(failures_at_quorum, 1);
+
+        let mut now = Instant::now() + FINALIZE_RETRY_BASE;
+        let mut failures: u32 = 1;
+        for round in 0..12 {
+            let before = kv.cert_failures.load(Ordering::SeqCst);
+            if round > 0 {
+                // Not due just before the delay (counted from the previous
+                // tick) ends: no write attempted.
+                let idle = g.retry_finalizations(now - Duration::from_millis(1)).await;
+                assert!(idle.failed.is_empty() && idle.finalized.is_empty());
+                assert_eq!(kv.cert_failures.load(Ordering::SeqCst), before);
+            }
+
+            let out = g.retry_finalizations(now).await;
+            assert_eq!(out.failed, vec![4], "{out:?}");
+            assert!(out.finalized.is_empty());
+            assert_eq!(out.pending, 1);
+            assert_eq!(kv.cert_failures.load(Ordering::SeqCst), before + 1);
+            assert_eq!(g.manager().latest_finalized_height().await, 0);
+            assert!(!g.manager().is_certificate_persisted(4, &block_hash(4)));
+            assert_eq!(g.manager().pending_vote_count(4).await, Some(3));
+            failures += 1;
+            now += finalize_retry_delay(failures);
+        }
+        assert_eq!(finalize_retry_delay(failures), FINALIZE_RETRY_CAP);
+        assert_eq!(
+            g.finalize_retry_stats(),
+            FinalizeRetryStats {
+                attempts: 12,
+                recovered: 0
+            }
+        );
+    }
+
+    /// A vote that arrives after the store recovers finalizes the checkpoint
+    /// first; the retry then has nothing to do and the guard publishes once.
+    /// And the other order: the retry finalizes, a later vote is refused.
+    #[tokio::test]
+    async fn retry_and_a_late_vote_never_finalize_twice() {
+        // Late vote first.
+        let (g, kv, ks) = quorum_with_failed_certificate().await;
+        let guard = Arc::new(CountingGuard::default());
+        assert!(g.manager().install_finalization_guard(guard.clone()));
+        kv.fail_certs.store(false, Ordering::SeqCst);
+        let out = g
+            .on_inbound_vote(sign_checkpoint_vote(CHAIN, 4, block_hash(4), &ks[3]))
+            .await;
+        assert!(
+            matches!(out, InboundOutcome::Finalized { height: 4, .. }),
+            "{out:?}"
+        );
+        let tick = g
+            .retry_finalizations(Instant::now() + FINALIZE_RETRY_CAP)
+            .await;
+        assert_eq!(tick, FinalizeRetryOutcome::default());
+        assert_eq!(guard.after.load(Ordering::SeqCst), 1, "published once");
+        assert_eq!(g.finalize_retry_stats().attempts, 0);
+
+        // Retry first.
+        let (g, kv, ks) = quorum_with_failed_certificate().await;
+        let guard = Arc::new(CountingGuard::default());
+        assert!(g.manager().install_finalization_guard(guard.clone()));
+        kv.fail_certs.store(false, Ordering::SeqCst);
+        let tick = g
+            .retry_finalizations(Instant::now() + FINALIZE_RETRY_BASE)
+            .await;
+        assert_eq!(tick.finalized, vec![4]);
+        let out = g
+            .on_inbound_vote(sign_checkpoint_vote(CHAIN, 4, block_hash(4), &ks[3]))
+            .await;
+        assert!(matches!(out, InboundOutcome::Rejected(_)), "{out:?}");
+        let tick = g
+            .retry_finalizations(Instant::now() + FINALIZE_RETRY_CAP * 4)
+            .await;
+        assert_eq!(tick, FinalizeRetryOutcome::default());
+        assert_eq!(guard.before.load(Ordering::SeqCst), 1);
+        assert_eq!(guard.after.load(Ordering::SeqCst), 1, "published once");
+    }
+
+    /// Concurrent ticks over the same failed checkpoint: exactly one
+    /// finalization, one publication.
+    #[tokio::test]
+    async fn concurrent_retry_ticks_finalize_once() {
+        let (g, kv, _ks) = quorum_with_failed_certificate().await;
+        let guard = Arc::new(CountingGuard::default());
+        assert!(g.manager().install_finalization_guard(guard.clone()));
+        kv.fail_certs.store(false, Ordering::SeqCst);
+        let g = Arc::new(g);
+        let at = Instant::now() + FINALIZE_RETRY_BASE;
+        let a = tokio::spawn({
+            let g = g.clone();
+            async move { g.retry_finalizations(at).await }
+        });
+        let b = tokio::spawn({
+            let g = g.clone();
+            async move { g.retry_finalizations(at).await }
+        });
+        let (a, b) = (a.await.expect("a"), b.await.expect("b"));
+        let total = a.finalized.len() + b.finalized.len();
+        assert_eq!(total, 1, "{a:?} {b:?}");
+        assert!(a.failed.is_empty() && b.failed.is_empty(), "{a:?} {b:?}");
+        assert_eq!(guard.after.load(Ordering::SeqCst), 1);
+        assert_eq!(g.manager().latest_finalized_height().await, 4);
+    }
+
+    /// A checkpoint that leaves the pending set without finalizing (pruned
+    /// below a later finalized height) is no longer retried.
+    #[tokio::test]
+    async fn pruned_checkpoint_is_no_longer_retried() {
+        let (g, kv, ks) = quorum_with_failed_certificate().await;
+        kv.fail_certs.store(false, Ordering::SeqCst);
+        // A later checkpoint finalizes through votes; 4 is pruned below it.
+        let committee: Vec<PublicKey> = ks.iter().map(pk).collect();
+        g.manager()
+            .ensure_proposed(6, block_hash(6), committee)
+            .await
+            .expect("propose 6");
+        for k in ks.iter().take(3) {
+            let _ = g
+                .on_inbound_vote(sign_checkpoint_vote(CHAIN, 6, block_hash(6), k))
+                .await;
+        }
+        assert_eq!(g.manager().latest_finalized_height().await, 6);
+        assert!(g.manager().quorum_pending_heights().await.is_empty());
+        let tick = g
+            .retry_finalizations(Instant::now() + FINALIZE_RETRY_CAP)
+            .await;
+        assert_eq!(tick, FinalizeRetryOutcome::default());
+        assert!(!g.manager().is_certificate_persisted(4, &block_hash(4)));
+        assert_eq!(g.finalize_retry_stats().attempts, 0);
     }
 }

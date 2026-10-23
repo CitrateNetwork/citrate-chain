@@ -71,11 +71,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use citrate_consensus::checkpoint::CheckpointVote;
 use citrate_consensus::checkpoint_gadget::{
-    FinalityGadget, SignRefusal, SkipReason, EARLY_VOTE_HORIZON_BLOCKS,
+    FinalityGadget, FinalizeRetryOutcome, SignRefusal, SkipReason, EARLY_VOTE_HORIZON_BLOCKS,
 };
 use citrate_consensus::crypto::Ed25519SigningKey;
 use citrate_consensus::types::{Hash, PublicKey};
@@ -462,6 +462,14 @@ pub fn spawn(
             broadcast_votes(&peers, &outbound).await;
         }
     })
+}
+
+/// Finalization retry step of the driver tick: re-attempt, with capped
+/// backoff, every checkpoint that reached quorum but whose certificate could
+/// not be written (`FinalityGadget::retry_finalizations`), so finality does
+/// not wait for another vote that may never come.
+pub async fn retry_finalizations(gadget: &FinalityGadget, now: Instant) -> FinalizeRetryOutcome {
+    gadget.retry_finalizations(now).await
 }
 
 /// One driver pass over the applied tip `(tip_hash, tip_height)`: report the

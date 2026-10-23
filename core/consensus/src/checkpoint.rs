@@ -1153,6 +1153,21 @@ impl CheckpointManager {
         None
     }
 
+    /// Heights pending WITH derived quorum, ascending: checkpoints that can
+    /// finalize but have not (their finalization failed, or is in flight).
+    pub async fn quorum_pending_heights(&self) -> Vec<u64> {
+        let mut heights: Vec<u64> = self
+            .pending
+            .read()
+            .await
+            .iter()
+            .filter(|(_, cp)| cp.has_derived_quorum())
+            .map(|(h, _)| *h)
+            .collect();
+        heights.sort_unstable();
+        heights
+    }
+
     /// Whether the pending checkpoint at `height` already holds an accepted vote
     /// from `voter` (`false` when nothing is pending there).
     pub async fn has_pending_vote(&self, height: u64, voter: &PublicKey) -> bool {

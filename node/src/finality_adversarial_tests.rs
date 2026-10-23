@@ -45,7 +45,10 @@ use citrate_consensus::checkpoint::{
     derived_quorum, sign_checkpoint_vote, Checkpoint, CheckpointConfig, CheckpointError,
     CheckpointManager, CheckpointStatus, CheckpointVote, CommitteeSelector,
 };
-use citrate_consensus::checkpoint_gadget::{FinalityGadget, InboundOutcome, SkipReason};
+use citrate_consensus::checkpoint_gadget::{
+    finalize_retry_delay, FinalityGadget, InboundOutcome, SkipReason, FINALIZE_RETRY_BASE,
+    FINALIZE_RETRY_CAP,
+};
 use citrate_consensus::crypto::Ed25519SigningKey;
 use citrate_consensus::dag_store::{cf, DagStore, KvStore};
 use citrate_consensus::types::{Block, Hash, PublicKey};
@@ -55,7 +58,7 @@ use citrate_storage::StorageManager;
 
 use crate::canonical_apply::tests::{fresh, mk_block_vrf, persist, roots};
 use crate::canonical_apply::{ApplyOutcome, CanonicalApplicator, ReorgOutcome};
-use crate::finality_driver::{gate_outbound, run_pass, OwnVoteRetries};
+use crate::finality_driver::{gate_outbound, retry_finalizations, run_pass, OwnVoteRetries};
 use crate::finality_floor::{FloorMode, FloorTick, FloorVerifier, HaltReason};
 use crate::persistent_dag::RocksDbKvStore;
 
@@ -2097,6 +2100,366 @@ async fn s2_certificate_survives_a_kill_after_publication() {
         "S2: a block published as finalized before the kill must not be abandoned"
     );
     assert_eq!(node.app.applied_tip().await.hash, hash_at(&a, 8));
+}
+
+// ---------------------------------------------------------------------------
+// S2 certificate write retry (follow-up to #368): a checkpoint that reached
+// quorum but whose certificate could not be written is retried on the driver
+// tick (`finality_driver::retry_finalizations`), with capped backoff, so it
+// finalizes once the store recovers even if no further vote ever arrives. A
+// store that never recovers never raises the floor.
+// ---------------------------------------------------------------------------
+
+/// Quorum (3 of 4) for A4 reaches the node through the gadget's inbound path
+/// while every certificate write fails: the finalization failed, nothing moved.
+async fn quorum_with_failing_certificate_store(
+    node: &TestNode,
+    fault: &FaultyCertKv,
+    keys: &[Ed25519SigningKey],
+    h4: Hash,
+) {
+    let committee: Vec<PublicKey> = keys.iter().map(pk).collect();
+    let mgr = node.mgr().clone();
+    mgr.ensure_proposed(4, h4, committee)
+        .await
+        .expect("propose");
+    for k in keys.iter().take(2) {
+        mgr.submit_vote(sign_checkpoint_vote(CHAIN, 4, h4, k))
+            .await
+            .expect("vote");
+    }
+    let third = keys.get(2).expect("key 2");
+    let out = node
+        .gadget
+        .on_inbound_vote(sign_checkpoint_vote(CHAIN, 4, h4, third))
+        .await;
+    assert!(
+        matches!(
+            &out,
+            InboundOutcome::FinalizeFailed {
+                height: 4,
+                error: CheckpointError::StorageError(_),
+                ..
+            }
+        ),
+        "the failed certificate write must surface, got {out:?}"
+    );
+    assert!(fault.failed.load(Ordering::SeqCst) >= 1);
+    assert_eq!(node.floor(), 0);
+    assert_eq!(node.rpc_finalized(), FinalizedAnchor::GENESIS);
+    assert!(!mgr.is_certificate_persisted(4, &h4));
+}
+
+/// The store recovers and NO further vote arrives: the driver's retry step
+/// finalizes A4 within one backoff window — certificate on disk, floor raised,
+/// finalized/safe pair published — and a restart restores the same floor. A
+/// tick before the window does nothing; ticks after it never publish again.
+#[tokio::test]
+async fn s2_certificate_write_failure_is_retried_on_the_tick_without_further_votes() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let cfg = config(100);
+    let (exec, storage, dir) = fresh();
+    let fault = FaultyCertKv::new(&storage, true);
+    let (mut node, boot) = assemble_with(
+        exec,
+        storage,
+        dir,
+        key(0),
+        &vals,
+        cfg.clone(),
+        Vec::new(),
+        fault.clone(),
+    )
+    .await;
+    assert_eq!(boot, FloorTick::NoCertificate);
+    let a = chains.main(8);
+    node.follow(&a).await;
+    let h4 = hash_at(&a, 4);
+    quorum_with_failing_certificate_store(&node, &fault, &keys, h4).await;
+
+    fault.heal();
+    let start = std::time::Instant::now();
+    let early = retry_finalizations(&node.gadget, start).await;
+    assert!(early.finalized.is_empty(), "{early:?}");
+    assert_eq!(node.floor(), 0, "not due before the backoff window");
+
+    let out = retry_finalizations(&node.gadget, start + FINALIZE_RETRY_BASE).await;
+    assert_eq!(out.finalized, vec![4], "{out:?}");
+    assert!(node.mgr().is_certificate_persisted(4, &h4));
+    assert_eq!(node.finalized().await, 4);
+    assert_eq!(node.floor(), 4, "the floor follows the durable certificate");
+    let anchor4 = FinalizedAnchor {
+        height: 4,
+        hash: Some(h4),
+    };
+    assert_eq!(node.rpc_finalized(), anchor4);
+    assert_eq!(node.tick().await, verified(4));
+
+    // Idempotent: no second finalization, the published pair is unchanged.
+    let again = retry_finalizations(&node.gadget, start + FINALIZE_RETRY_CAP * 4).await;
+    assert!(again.finalized.is_empty() && again.failed.is_empty() && again.pending == 0);
+    assert_eq!(node.gadget.finalize_retry_stats().recovered, 1);
+    assert_eq!(node.rpc_finalized(), anchor4);
+
+    let (node, boot) = node.restart(&vals, cfg).await;
+    assert_eq!(boot, verified(4));
+    assert_eq!(node.floor(), 4);
+}
+
+/// The store never recovers: every retry fails, the floor never moves, nothing
+/// is published, no safety stop engages, and the retries respect the capped
+/// backoff (one certificate write per due tick, none in between).
+#[tokio::test]
+async fn s2_permanent_certificate_write_failure_never_raises_the_floor() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let cfg = config(100);
+    let (exec, storage, dir) = fresh();
+    let fault = FaultyCertKv::new(&storage, true);
+    let (mut node, _boot) = assemble_with(
+        exec,
+        storage,
+        dir,
+        key(0),
+        &vals,
+        cfg.clone(),
+        Vec::new(),
+        fault.clone(),
+    )
+    .await;
+    let a = chains.main(8);
+    node.follow(&a).await;
+    let h4 = hash_at(&a, 4);
+    quorum_with_failing_certificate_store(&node, &fault, &keys, h4).await;
+
+    let mut now = std::time::Instant::now() + FINALIZE_RETRY_BASE;
+    let mut failures: u32 = 1;
+    for round in 0..10 {
+        let before = fault.failed.load(Ordering::SeqCst);
+        if round > 0 {
+            let idle =
+                retry_finalizations(&node.gadget, now - std::time::Duration::from_millis(1)).await;
+            assert!(idle.failed.is_empty() && idle.finalized.is_empty());
+            assert_eq!(
+                fault.failed.load(Ordering::SeqCst),
+                before,
+                "backoff respected"
+            );
+        }
+        let out = retry_finalizations(&node.gadget, now).await;
+        assert_eq!(out.failed, vec![4], "{out:?}");
+        assert_eq!(fault.failed.load(Ordering::SeqCst), before + 1);
+        assert_eq!(node.floor(), 0, "no durable certificate, no floor");
+        assert_eq!(node.rpc_finalized(), FinalizedAnchor::GENESIS);
+        assert_eq!(node.finalized().await, 0);
+        assert!(
+            !node.gadget.halted(),
+            "a storage fault is not a safety stop"
+        );
+        assert_eq!(node.tick().await, FloorTick::NoCertificate);
+        failures += 1;
+        now += finalize_retry_delay(failures);
+    }
+    assert_eq!(finalize_retry_delay(failures), FINALIZE_RETRY_CAP);
+    assert!(!node.mgr().is_certificate_persisted(4, &h4));
+    let (node, boot) = node.restart(&vals, cfg).await;
+    assert_eq!(boot, FloorTick::NoCertificate, "nothing finalized survives");
+    assert_eq!(node.floor(), 0);
+    assert_eq!(node.rpc_finalized(), FinalizedAnchor::GENESIS);
+}
+
+// Crash/restart variants (TLA+ Restart around a retried Finalize): a CHILD
+// process reaches quorum with the certificate writes failing, then either
+// heals the store and lets the retry tick finalize ("heal") or keeps failing
+// through several retries ("permanent"); it prints a marker and blocks; the
+// parent SIGKILLs it and reopens the directory. "heal": the certificate the
+// retry wrote is on disk and the boot check restores the floor. "permanent":
+// nothing is on disk, the boot check finds no certificate and the floor and
+// the RPC pair stay at genesis. Run under
+// `unshare --user --map-root-user --pid --fork --mount-proc`.
+
+const RETRY_PARENT: &str = "C368R_CHILD_PARENT";
+const RETRY_MODE: &str = "C368R_CHILD_MODE";
+const RETRY_MARK: &str = "C368R_READY dir=";
+
+/// Child entry point (a no-op unless `C368R_CHILD_PARENT` is set).
+#[tokio::test]
+async fn s2_cert_retry_kill_child() {
+    let Ok(parent) = std::env::var(RETRY_PARENT) else {
+        return;
+    };
+    let heal = std::env::var(RETRY_MODE).as_deref() == Ok("heal");
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let dir = tempfile::Builder::new()
+        .prefix("node-")
+        .tempdir_in(&parent)
+        .expect("child data dir");
+    let storage = Arc::new(
+        StorageManager::new(
+            dir.path(),
+            citrate_storage::pruning::PruningConfig::default(),
+        )
+        .expect("storage"),
+    );
+    let exec = Arc::new(Executor::new(Arc::new(citrate_execution::StateDB::new())));
+    let path = dir.path().to_path_buf();
+    let fault = FaultyCertKv::new(&storage, true);
+    let (mut node, boot) = assemble_with(
+        exec,
+        storage,
+        dir,
+        key(0),
+        &vals,
+        config(100),
+        Vec::new(),
+        fault.clone(),
+    )
+    .await;
+    assert_eq!(boot, FloorTick::NoCertificate);
+    let a = chains.main(8);
+    node.follow(&a).await;
+    let h4 = hash_at(&a, 4);
+    quorum_with_failing_certificate_store(&node, &fault, &keys, h4).await;
+    let mut now = std::time::Instant::now() + FINALIZE_RETRY_BASE;
+    if heal {
+        fault.heal();
+        let out = retry_finalizations(&node.gadget, now).await;
+        assert_eq!(out.finalized, vec![4], "{out:?}");
+        assert_eq!(
+            node.rpc_finalized(),
+            FinalizedAnchor {
+                height: 4,
+                hash: Some(h4)
+            },
+            "published"
+        );
+    } else {
+        for failures in 2..6u32 {
+            let out = retry_finalizations(&node.gadget, now).await;
+            assert_eq!(out.failed, vec![4], "{out:?}");
+            now += finalize_retry_delay(failures);
+        }
+        assert_eq!(node.floor(), 0);
+        assert_eq!(node.rpc_finalized(), FinalizedAnchor::GENESIS);
+    }
+    {
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "{RETRY_MARK}{}", path.display()).expect("marker");
+        out.flush().expect("flush");
+    }
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+/// Run the retry child in `mode`, SIGKILL it at its marker, and return the
+/// parent temp dir (keeps the data alive) and the killed node's data dir.
+fn kill_retry_child(mode: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    use std::io::BufRead as _;
+    let parent = tempfile::tempdir().expect("parent dir");
+    let exe = std::env::current_exe().expect("exe");
+    let mut child = std::process::Command::new(exe)
+        .args([
+            "finality_adversarial_tests::s2_cert_retry_kill_child",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(RETRY_PARENT, parent.path())
+        .env(RETRY_MODE, mode)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn child");
+    let stdout = child.stdout.take().expect("child stdout");
+    let mut data_dir = None;
+    for line in std::io::BufReader::new(stdout).lines() {
+        let line = line.expect("child stdout line");
+        if let Some(p) = line.split(RETRY_MARK).nth(1) {
+            data_dir = Some(std::path::PathBuf::from(p.trim()));
+            break;
+        }
+    }
+    let Some(data_dir) = data_dir else {
+        let out = child.wait_with_output().expect("child output");
+        panic!(
+            "child ({mode}) never reached its marker: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    child.kill().expect("SIGKILL the child");
+    let status = child.wait().expect("reap child");
+    assert!(!status.success(), "the child was killed: {status}");
+    (parent, data_dir)
+}
+
+async fn reopen_killed(data_dir: &std::path::Path) -> (TestNode, FloorTick) {
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let storage = Arc::new(
+        StorageManager::new(data_dir, citrate_storage::pruning::PruningConfig::default())
+            .expect("reopen storage"),
+    );
+    let exec = Arc::new(Executor::new(Arc::new(citrate_execution::StateDB::new())));
+    let placeholder = tempfile::tempdir().expect("placeholder dir");
+    assemble(
+        exec,
+        storage,
+        placeholder,
+        key(0),
+        &vals,
+        config(100),
+        Vec::new(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn s2_retried_certificate_survives_a_kill_after_publication() {
+    if std::env::var(RETRY_PARENT).is_ok() {
+        return;
+    }
+    let (_parent, data_dir) = kill_retry_child("heal");
+    let chains = Chains::new();
+    let h4 = hash_at(&chains.main(8), 4);
+    let (node, boot) = reopen_killed(&data_dir).await;
+    assert!(
+        node.mgr().is_certificate_persisted(4, &h4),
+        "the certificate the retry wrote must be on disk after the kill"
+    );
+    let stored = node.mgr().get_checkpoint(4).await.expect("reloaded");
+    assert!(stored.verify_certificate(CHAIN).is_ok());
+    assert_eq!(boot, verified(4), "boot restores the floor from it");
+    assert_eq!(node.floor(), 4);
+    assert_eq!(
+        node.rpc_finalized(),
+        FinalizedAnchor {
+            height: 4,
+            hash: Some(h4)
+        }
+    );
+}
+
+#[tokio::test]
+async fn s2_kill_during_permanent_certificate_failure_finalizes_nothing() {
+    if std::env::var(RETRY_PARENT).is_ok() {
+        return;
+    }
+    let (_parent, data_dir) = kill_retry_child("permanent");
+    let chains = Chains::new();
+    let h4 = hash_at(&chains.main(8), 4);
+    let (node, boot) = reopen_killed(&data_dir).await;
+    assert!(!node.mgr().is_certificate_persisted(4, &h4));
+    assert_eq!(boot, FloorTick::NoCertificate);
+    assert_eq!(node.floor(), 0);
+    assert_eq!(node.finalized().await, 0);
+    assert_eq!(node.rpc_finalized(), FinalizedAnchor::GENESIS);
 }
 
 /// An `Unconfirmed` stop becomes a mismatch (with the alarm) once the node's
