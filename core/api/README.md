@@ -102,6 +102,18 @@ same tip `eth_getLogs` walks from (`canonical_logs::executed_head`), and
 executed head while blocks are admitted but not yet applied, so it does not bound
 what `eth_getLogs` has served.
 
+In every log query (`eth_getLogs`, `citrate_getLogs`, `eth_newFilter`,
+`eth_getFilterChanges`, `eth_getFilterLogs`) the `latest` and `pending` tags,
+and an omitted `toBlock`, resolve to the executed head, not to
+`eth_blockNumber`. The tag and the walk use one read of the tip, so
+`latest..latest` is the executed head's block even while admitted blocks are
+ahead of it or the tip moves during the call. A numeric range above the
+executed head has nothing executed in it and answers `[]` (for
+`citrate_getLogs`, `through` says how far it served). Log filters read the
+executed chain too: `eth_getFilterChanges` delivers each applied height once,
+starting at `fromBlock` or the executed head at creation, at most 1,001 heights
+per poll (`tests/getlogs_latest_applied_tip.rs`).
+
 When no applied tip is persisted, or it cannot be read, the method returns
 JSON-RPC error `-32603`. It never falls back to the height index.
 

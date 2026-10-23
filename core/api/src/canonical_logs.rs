@@ -366,8 +366,10 @@ impl ExecutedChainIndex {
     }
 
     /// [`Self::executed_hashes`] on the selected-parent chain of the given tip,
-    /// which the caller read once from storage.
-    fn executed_hashes_under(
+    /// which the caller read once from storage ([`log_tip`]). A caller that
+    /// resolves `latest` against that same read gets a range that is never above
+    /// the tip it walks (see [`log_tip`]).
+    pub fn executed_hashes_under(
         &self,
         storage: &StorageManager,
         tip_hash: Hash,
@@ -525,7 +527,7 @@ impl ExecutedChainIndex {
     }
 }
 
-/// What [`ExecutedChainIndex::executed_after`] found on one tip snapshot.
+/// What [`ExecutedChainIndex::executed_after_under`] found on one tip snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutedRange {
     /// The executed blocks of the range, ascending. The last one is the block
@@ -544,14 +546,18 @@ impl ExecutedChainIndex {
     /// When the tip is below `from - 1` nothing is served and the cursor is not
     /// judged: it may be a transient rewind, and the check runs again once the
     /// chain is back above it. `after` with `from == 0` is a caller error.
-    pub fn executed_after(
+    ///
+    /// The tip is the caller's one read of [`executed_head`], the same read it
+    /// resolves the range's `latest`/`pending` against.
+    pub fn executed_after_under(
         &self,
         storage: &StorageManager,
+        tip_hash: Hash,
+        tip_height: u64,
         from: u64,
         to: u64,
         after: Option<&Hash>,
     ) -> Result<ExecutedRange, LogIndexError> {
-        let (tip_hash, tip_height) = executed_head(storage).map_err(LogIndexError::Unavailable)?;
         let lo = match after {
             Some(_) => from.checked_sub(1).ok_or_else(|| {
                 LogIndexError::Unavailable("a cursor needs fromBlock >= 1".into())
@@ -725,6 +731,21 @@ pub fn executed_head_json(
         "number": format!("0x{number:x}"),
         "hash": format!("0x{}", hex::encode(hash.as_bytes())),
     }))
+}
+
+/// The tip a log query reads: `latest` and `pending` resolve to its height, and
+/// the walk names executed blocks from it ([`ExecutedChainIndex::executed_hashes_under`]).
+/// It is the persisted applied tip (the one [`executed_head`] reports), or — on
+/// a store that never wrote one — the block the height index names at the
+/// stored head. `None` on an empty store.
+///
+/// Stored headers can be ahead of this tip (admitted, not yet applied), and
+/// `eth_blockNumber` reports them. Resolving `latest` to that height put
+/// `latest..latest` above every executed block, and the answer was an empty
+/// list that read as complete. Read this ONCE per request and use it for both
+/// the tag and the walk: a second read can see a rewind and drop the range.
+pub fn log_tip(storage: &StorageManager) -> Result<Option<(Hash, u64)>, LogIndexError> {
+    applied_anchor(storage).map_err(LogIndexError::Unavailable)
 }
 
 /// The block the executor's state reflects: the persisted applied tip, or — on a

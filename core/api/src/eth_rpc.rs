@@ -1918,7 +1918,11 @@ pub fn register_eth_methods_with_finality(
         crate::filter::validate_log_filter_criteria(filter)
             .map_err(jsonrpc_core::Error::invalid_params)?;
 
-        let current_height = storage_logs.blocks.get_latest_height().unwrap_or(0);
+        // ONE read of the tip the walk follows; `latest`/`pending` resolve to
+        // its height, never to the stored-header height (which can be ahead of
+        // execution and put `latest..latest` above every executed block).
+        let tip = crate::canonical_logs::log_tip(&storage_logs).map_err(|e| e.to_rpc_error())?;
+        let current_height = tip.map_or(0, |(_, h)| h);
         let finalized = finalized_logs.load(Ordering::SeqCst);
         let (from_block, to_block, criteria) = parse_log_filter(filter, current_height, finalized)?;
 
@@ -1935,9 +1939,18 @@ pub fn register_eth_methods_with_finality(
         // transactions never executed (see `canonical_logs`).
         // The resolver names the blocks (hashes only); each body is loaded,
         // scanned and dropped before the next, so a request holds one block.
-        let executed = executed_chain_logs
-            .executed_hashes(&storage_logs, from_block, effective_to)
-            .map_err(|e| e.to_rpc_error())?;
+        let executed = match tip {
+            Some((tip_hash, tip_height)) => executed_chain_logs
+                .executed_hashes_under(
+                    &storage_logs,
+                    tip_hash,
+                    tip_height,
+                    from_block,
+                    effective_to,
+                )
+                .map_err(|e| e.to_rpc_error())?,
+            None => Vec::new(),
+        };
 
         let mut result_logs: Vec<Value> = Vec::new();
         for (_, executed_hash) in &executed {
@@ -1982,7 +1995,11 @@ pub fn register_eth_methods_with_finality(
             }
             crate::filter::validate_log_filter_criteria(filter)
                 .map_err(jsonrpc_core::Error::invalid_params)?;
-            let current_height = storage_clogs.blocks.get_latest_height().unwrap_or(0);
+            // ONE read of the executed head: `latest`/`pending` resolve to it
+            // and the walk follows it, so `latest..latest` is never above the
+            // tip served. A missing tip is reported after the params check.
+            let head = crate::canonical_logs::executed_head(&storage_clogs);
+            let current_height = head.as_ref().map_or(0, |(_, h)| *h);
             let finalized = finalized_clogs.load(Ordering::SeqCst);
             let (from_block, to_block, criteria) =
                 parse_log_filter(filter, current_height, finalized)?;
@@ -2004,8 +2021,17 @@ pub fn register_eth_methods_with_finality(
             // Never the legacy clamp: a clamped range is not complete through
             // its toBlock.
             let to = crate::canonical_logs::bound_log_range(from_block, to_block, false)?;
+            let (head_hash, head_height) = head
+                .map_err(|m| crate::canonical_logs::LogIndexError::Unavailable(m).to_rpc_error())?;
             let blocks = match executed_chain_clogs
-                .executed_after(&storage_clogs, from_block, to, after.as_ref())
+                .executed_after_under(
+                    &storage_clogs,
+                    head_hash,
+                    head_height,
+                    from_block,
+                    to,
+                    after.as_ref(),
+                )
                 .map_err(|e| e.to_rpc_error())?
             {
                 crate::canonical_logs::ExecutedRange::Blocks(b) => b,
@@ -2051,7 +2077,11 @@ pub fn register_eth_methods_with_finality(
         // PBA-L1a-010: bound the criteria before parsing or retaining them.
         crate::filter::validate_log_filter_criteria(filter)
             .map_err(jsonrpc_core::Error::invalid_params)?;
-        let current_height = storage_new_filter.blocks.get_latest_height().unwrap_or(0);
+        // `latest` (and the first poll's start) is the applied tip the filter's
+        // log reads walk, not the stored-header height (see `log_tip`).
+        let current_height = crate::canonical_logs::log_tip(&storage_new_filter)
+            .map_err(|e| e.to_rpc_error())?
+            .map_or(0, |(_, h)| h);
         let finalized = finalized_new_filter.load(Ordering::SeqCst);
 
         // Parse fromBlock (None on absent/unrecognised, unchanged; adds finalized/safe).
@@ -2222,6 +2252,7 @@ pub fn register_eth_methods_with_finality(
     // eth_getFilterChanges - Get changes since last poll
     let storage_filter_changes = storage.clone();
     let filter_registry_changes = filter_registry.clone();
+    let executed_chain_changes = executed_chain.clone();
     io_handler.add_sync_method("eth_getFilterChanges", move |params: Params| {
         let params: Vec<Value> = match params.parse() {
             Ok(p) => p,
@@ -2256,14 +2287,15 @@ pub fn register_eth_methods_with_finality(
             }
         };
 
-        let current_height = storage_filter_changes
-            .blocks
-            .get_latest_height()
-            .unwrap_or(0);
         let last_poll_block = filter.last_poll_block;
 
         match filter.filter_type {
             FilterType::Block => {
+                // A block filter announces stored blocks (the height index).
+                let current_height = storage_filter_changes
+                    .blocks
+                    .get_latest_height()
+                    .unwrap_or(0);
                 // Return new block hashes since last poll
                 let mut block_hashes = Vec::new();
                 for height in last_poll_block.saturating_add(1)..=current_height {
@@ -2288,89 +2320,54 @@ pub fn register_eth_methods_with_finality(
                 ref addresses,
                 ref topics,
             } => {
-                // Calculate effective block range
-                let effective_from = last_poll_block.saturating_add(1);
-                let effective_to = match to_block {
-                    Some(t) => t.min(current_height),
-                    None => current_height,
+                // Logs come from the EXECUTED chain of ONE read of the applied
+                // tip, like eth_getLogs; the height index can name a sibling
+                // whose transactions never executed, and the stored-header
+                // height can be ahead of execution.
+                let Some((tip_hash, tip_height)) =
+                    crate::canonical_logs::log_tip(&storage_filter_changes)
+                        .map_err(|e| e.to_rpc_error())?
+                else {
+                    return Ok(Value::Array(vec![]));
                 };
-
-                // Skip if from_block was set and we haven't reached it yet
-                if let Some(fb) = from_block {
-                    if effective_from < fb {
-                        filter_registry_changes.update_last_poll_block(filter_id, current_height);
-                        return Ok(Value::Array(vec![]));
-                    }
+                // Next unseen height, but never below the filter's fromBlock
+                // (a tip that jumps past fromBlock between polls must not skip
+                // the heights from fromBlock up to the jump).
+                let start = last_poll_block
+                    .saturating_add(1)
+                    .max(from_block.unwrap_or(0));
+                let end = to_block.map_or(tip_height, |t| t.min(tip_height));
+                if start > end {
+                    // Nothing new (or the tip rewound below the last poll):
+                    // keep the poll position, so nothing is re-sent or skipped.
+                    return Ok(Value::Array(vec![]));
                 }
-
+                // One window per poll; the rest is served by the next poll.
+                let end = end.min(start.saturating_add(crate::canonical_logs::MAX_LOG_BLOCK_RANGE));
+                let criteria = LogCriteria {
+                    addresses: addresses.clone(),
+                    topics: topics.clone(),
+                };
+                let executed = executed_chain_changes
+                    .executed_hashes_under(
+                        &storage_filter_changes,
+                        tip_hash,
+                        tip_height,
+                        start,
+                        end,
+                    )
+                    .map_err(|e| e.to_rpc_error())?;
                 let mut result_logs: Vec<Value> = Vec::new();
-
-                for height in effective_from..=effective_to {
-                    let block_hash = match storage_filter_changes.blocks.get_block_by_height(height)
-                    {
-                        Ok(Some(hash)) => hash,
-                        _ => continue,
-                    };
-
-                    let tx_hashes = match storage_filter_changes
-                        .transactions
-                        .get_block_transactions(&block_hash)
-                    {
-                        Ok(hashes) => hashes,
-                        Err(_) => continue,
-                    };
-
-                    for (tx_index, tx_hash) in tx_hashes.iter().enumerate() {
-                        let receipt = match storage_filter_changes.transactions.get_receipt(tx_hash)
-                        {
-                            Ok(Some(r)) => r,
-                            _ => continue,
-                        };
-
-                        for (log_index, log) in receipt.logs.iter().enumerate() {
-                            // Check address filter
-                            if !addresses.is_empty() && !addresses.contains(&log.address) {
-                                continue;
-                            }
-
-                            // Check topics filter
-                            let topics_match = topics.iter().enumerate().all(
-                                |(i, topic_filter)| match topic_filter {
-                                    None => true,
-                                    Some(allowed_topics) => {
-                                        if i >= log.topics.len() {
-                                            false
-                                        } else {
-                                            log.topics
-                                                .get(i)
-                                                .is_some_and(|t| allowed_topics.contains(t))
-                                        }
-                                    }
-                                },
-                            );
-
-                            if !topics_match {
-                                continue;
-                            }
-
-                            result_logs.push(json!({
-                                "address": format!("0x{}", hex::encode(log.address.0)),
-                                "topics": log.topics.iter()
-                                    .map(|t| format!("0x{}", hex::encode(t.as_bytes())))
-                                    .collect::<Vec<_>>(),
-                                "data": format!("0x{}", hex::encode(&log.data)),
-                                "blockNumber": format!("0x{:x}", height),
-                                "blockHash": format!("0x{}", hex::encode(block_hash.as_bytes())),
-                                "transactionHash": format!("0x{}", hex::encode(tx_hash.as_bytes())),
-                                "transactionIndex": format!("0x{:x}", tx_index),
-                                "logIndex": format!("0x{:x}", log_index),
-                                "removed": false
-                            }));
-                        }
-                    }
+                for (_, h) in &executed {
+                    push_block_logs(
+                        &storage_filter_changes,
+                        h,
+                        &criteria,
+                        ReceiptPolicy::SkipMissing,
+                        &mut result_logs,
+                    )?;
                 }
-
-                filter_registry_changes.update_last_poll_block(filter_id, current_height);
+                filter_registry_changes.update_last_poll_block(filter_id, end);
                 Ok(Value::Array(result_logs))
             }
         }
@@ -2379,6 +2376,7 @@ pub fn register_eth_methods_with_finality(
     // eth_getFilterLogs - Get all logs matching filter (for log filters only)
     let storage_filter_logs = storage.clone();
     let filter_registry_logs = filter_registry.clone();
+    let executed_chain_filter_logs = executed_chain.clone();
     io_handler.add_sync_method("eth_getFilterLogs", move |params: Params| {
         let params: Vec<Value> = match params.parse() {
             Ok(p) => p,
@@ -2413,8 +2411,6 @@ pub fn register_eth_methods_with_finality(
             }
         };
 
-        let current_height = storage_filter_logs.blocks.get_latest_height().unwrap_or(0);
-
         match filter.filter_type {
             FilterType::Log {
                 from_block,
@@ -2422,74 +2418,41 @@ pub fn register_eth_methods_with_finality(
                 ref addresses,
                 ref topics,
             } => {
+                // The executed chain of ONE read of the applied tip, as in
+                // eth_getLogs and eth_getFilterChanges.
+                let Some((tip_hash, tip_height)) =
+                    crate::canonical_logs::log_tip(&storage_filter_logs)
+                        .map_err(|e| e.to_rpc_error())?
+                else {
+                    return Ok(Value::Array(vec![]));
+                };
                 let effective_from = from_block.unwrap_or(0);
-                let effective_to = to_block.unwrap_or(current_height).min(current_height);
-                let max_range = 1000u64;
-                let effective_to = effective_to.min(effective_from.saturating_add(max_range));
-
+                let effective_to = to_block.unwrap_or(tip_height).min(tip_height);
+                let effective_to = effective_to
+                    .min(effective_from.saturating_add(crate::canonical_logs::MAX_LOG_BLOCK_RANGE));
+                let criteria = LogCriteria {
+                    addresses: addresses.clone(),
+                    topics: topics.clone(),
+                };
+                let executed = executed_chain_filter_logs
+                    .executed_hashes_under(
+                        &storage_filter_logs,
+                        tip_hash,
+                        tip_height,
+                        effective_from,
+                        effective_to,
+                    )
+                    .map_err(|e| e.to_rpc_error())?;
                 let mut result_logs: Vec<Value> = Vec::new();
-
-                for height in effective_from..=effective_to {
-                    let block_hash = match storage_filter_logs.blocks.get_block_by_height(height) {
-                        Ok(Some(hash)) => hash,
-                        _ => continue,
-                    };
-
-                    let tx_hashes = match storage_filter_logs
-                        .transactions
-                        .get_block_transactions(&block_hash)
-                    {
-                        Ok(hashes) => hashes,
-                        Err(_) => continue,
-                    };
-
-                    for (tx_index, tx_hash) in tx_hashes.iter().enumerate() {
-                        let receipt = match storage_filter_logs.transactions.get_receipt(tx_hash) {
-                            Ok(Some(r)) => r,
-                            _ => continue,
-                        };
-
-                        for (log_index, log) in receipt.logs.iter().enumerate() {
-                            if !addresses.is_empty() && !addresses.contains(&log.address) {
-                                continue;
-                            }
-
-                            let topics_match = topics.iter().enumerate().all(
-                                |(i, topic_filter)| match topic_filter {
-                                    None => true,
-                                    Some(allowed_topics) => {
-                                        if i >= log.topics.len() {
-                                            false
-                                        } else {
-                                            log.topics
-                                                .get(i)
-                                                .is_some_and(|t| allowed_topics.contains(t))
-                                        }
-                                    }
-                                },
-                            );
-
-                            if !topics_match {
-                                continue;
-                            }
-
-                            result_logs.push(json!({
-                                "address": format!("0x{}", hex::encode(log.address.0)),
-                                "topics": log.topics.iter()
-                                    .map(|t| format!("0x{}", hex::encode(t.as_bytes())))
-                                    .collect::<Vec<_>>(),
-                                "data": format!("0x{}", hex::encode(&log.data)),
-                                "blockNumber": format!("0x{:x}", height),
-                                "blockHash": format!("0x{}", hex::encode(block_hash.as_bytes())),
-                                "transactionHash": format!("0x{}", hex::encode(tx_hash.as_bytes())),
-                                "transactionIndex": format!("0x{:x}", tx_index),
-                                "logIndex": format!("0x{:x}", log_index),
-                                "removed": false
-                            }));
-                        }
-                    }
+                for (_, h) in &executed {
+                    push_block_logs(
+                        &storage_filter_logs,
+                        h,
+                        &criteria,
+                        ReceiptPolicy::SkipMissing,
+                        &mut result_logs,
+                    )?;
                 }
-
                 Ok(Value::Array(result_logs))
             }
             _ => Err(jsonrpc_core::Error {
