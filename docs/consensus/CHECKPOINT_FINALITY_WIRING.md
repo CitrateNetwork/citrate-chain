@@ -206,8 +206,10 @@ arrival order, never by key bytes.
 
 ### 4.4 Aggregation & finalization
 Inbound votes are already handled (`main.rs:3328` → `submit_vote`). On reaching quorum,
-`finalize_checkpoint` marks the checkpoint finalized, persists it, and advances
-`latest_finalized_height()`. Votes are validated against the committee membership, the
+`finalize_checkpoint` writes the certificate durably (a synced write,
+`KvStore::kv_put_durable`), then marks the checkpoint finalized and advances
+`latest_finalized_height()`; if the write fails nothing is finalized (§4.5,
+"Certificate durability"). Votes are validated against the committee membership, the
 domain-separated message (binds `chain_id` + `height` + `block_hash`, rejecting cross-chain
 and cross-height replay per TLA+ H-02), and de-duplicated per voter (equivocation → first
 vote wins, second rejected/loggable-as-slashable — D-5).
@@ -263,8 +265,8 @@ it yet): the node halts finality and alarms instead.
 `finalize_checkpoint` and the next poll in which a reorg could revert a just-finalized block.
 In Enforced mode the floor verifier is installed as the manager's `FinalizationGuard`
 (`FloorVerifier::install_finalization_guard`, `main.rs`), which `finalize_checkpoint` runs
-once quorum is confirmed and BEFORE the finalization is visible (DAG mark, persisted
-certificate, `latest_finalized_height()`), with no manager lock held (finalizations are
+once quorum is confirmed and the certificate is durably written, and BEFORE the finalization
+is visible (DAG mark, `latest_finalized_height()`), with no manager lock held (finalizations are
 serialized by their own mutex). It runs the poll's check under the same locks
 (`FloorVerifier::on_finalize`): a match raises the floor in the advance-lock critical section
 that confirmed it; a different block at `H` is a mismatch stop; a block that cannot be
@@ -299,21 +301,43 @@ verifier guard parked on the advance lock, a concurrent finalization queued, the
 from disk: floor, certificate and RPC pair agree and the rebuild below is refused).
 
 **Publication after persistence (Enforced).** The guard raises the floor but does NOT publish:
-it runs before the certificate is persisted, and the floor is in memory, so a block reported
-finalized there and lost to a crash before the write could be reorged out after the restart
-(review of #335 @ db243a1). The `finalized`/`safe` RPC pair and the verified-height metric
+the finalization is not visible yet when it runs (review of #335 @ db243a1). The `finalized`/`safe` RPC pair and the verified-height metric
 advance only in the manager's post-finalization hook (`FinalizationGuard::after_finalize` →
 `FloorVerifier::after_finalize`: no safety stop in force, certificate re-verified, the exact
 `(height, hash)` re-confirmed canonical under the advance lock) or from the poll, and every
 publication path first requires that exact certificate in the persistent store
-(`CheckpointManager::is_certificate_persisted`), so a failed write is never published either.
-Durability is RocksDB's default write (WAL, not fsynced per write): it survives a process
-crash, not a host power loss. Tests:
+(`CheckpointManager::is_certificate_persisted`), so an unpersisted certificate is never
+published, whoever calls the hooks. Tests:
 `s2_rpc_finalized_is_published_only_after_the_certificate_is_persisted` (guard runs, crash
 before persistence, restart: nothing was published and the rebuild below 4 proceeds; once
 persisted the pair is published and after a restart the same rebuild is refused) and
 `s2_cleared_stop_does_not_publish_an_unpersisted_certificate`. The TLA+ model does not model
 RPC publication (finalize and persist are one step there).
+
+**Certificate durability (#362).** The certificate is written with a synced write
+(`KvStore::kv_put_durable`; on RocksDB `write_batch_sync`, i.e. `WriteOptions::sync = true`)
+BEFORE the guard runs, so the floor raised at finalization and the RPC pair published after it
+always have a certificate that survives a process crash AND a host power loss. If the write
+fails, nothing advances: the guard does not run (no floor), nothing is published, the latest
+finalized height, DAG mark and in-memory record are unchanged, the checkpoint stays pending
+with its votes, and `finalize_checkpoint` returns `CheckpointError::StorageError` (surfaced by
+the gadget as `InboundOutcome::FinalizeFailed`; the next vote for that height retries). This is
+the implementation of the TLA+ `Finalize` action being a single step: a write failure is the
+action not firing. A certificate on disk makes its height final for this node: a same-hash
+re-proposal at that height is refused (`ProposeOutcome::AlreadyFinalized`). If the pending entry
+that finalizes extends the guarded certificate (more votes), it replaces the guarded record
+only if that second synced write succeeds; otherwise the durable guarded certificate is the
+one finalized. Tests: `certificate_write_failure_finalizes_nothing_and_never_runs_the_guard`,
+`certificate_write_failure_without_a_guard_finalizes_nothing`,
+`certificate_is_written_only_through_the_durable_path`,
+`extension_write_failure_keeps_the_durable_guarded_certificate` (consensus, fault-injecting
+store), `s2_certificate_write_failure_raises_no_floor_and_publishes_nothing`,
+`s2_certificate_is_synced_to_disk_before_the_guard_raises_the_floor` (real verifier guard
+over RocksDB), `s2_certificate_survives_a_kill_after_publication` (child process SIGKILLed
+after publication; the reopened store restores the floor) and
+`kv_put_durable_is_a_synced_rocksdb_write`. A SIGKILL does not drop the OS page cache, so the
+kill test proves the ordering across a crash; the power-loss half rests on the synced write,
+pinned by the sync-counter tests. Tripwire: `scripts/ci/finality_certificate_durable_write_tripwire.sh`.
 
 **Restart (Enforced).** The floor and the registered set are in memory. When the boot check's
 latest certificate does not raise the floor (mismatch, not yet applied, unverifiable),
