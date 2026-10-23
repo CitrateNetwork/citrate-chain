@@ -1399,13 +1399,16 @@ async fn s2_certificate_not_yet_applied_pauses_then_protects_on_return() {
     assert!(!net.node(3).gadget.halted());
 }
 
-/// S2 publication (review of #335 @ db243a1): the finalization-time guard
-/// raises the floor BEFORE the certificate is persisted, so it must not publish
-/// the finalized/safe RPC pair — a crash in that interval restarts without the
-/// certificate (and with the in-memory floor lost), and a block already
-/// reported finalized could then be reorged out. The pair is published only
-/// once the certificate is in the persistent store; after that a restart
-/// restores the floor from it and refuses the same reorg.
+/// S2 publication (review of #335 @ db243a1): the verifier's hooks publish the
+/// finalized/safe RPC pair only once the certificate is in the persistent
+/// store, whatever their caller did — a block reported finalized without a
+/// stored certificate could be reorged out after a restart. (Since #362
+/// `finalize_checkpoint` writes the certificate durably before it runs the
+/// guard, and finalizes nothing if that write fails —
+/// `s2_certificate_write_failure_raises_no_floor_and_publishes_nothing`; this
+/// test drives the hooks directly to pin the publication check itself.) After
+/// publication a restart restores the floor from the certificate and refuses
+/// the same reorg.
 #[tokio::test]
 async fn s2_rpc_finalized_is_published_only_after_the_certificate_is_persisted() {
     let chains = Chains::new();
@@ -1567,12 +1570,13 @@ async fn s2_cleared_stop_does_not_publish_an_unpersisted_certificate() {
 /// Deterministic interleaving on the real wiring (manager + installed verifier
 /// guard + applicator): the test holds the applicator's advance lock, so the
 /// guard parks inside its floor check after registering the certificate; the
-/// re-proposal and the concurrent finalization happen there; then the lock is
-/// released. Afterwards the floor, the persisted certificate and the published
-/// RPC pair agree, and a restart that reloads everything from disk restores
-/// the same floor and refuses a rebuild below it. (A crash BEFORE the
-/// certificate is persisted restarts with neither the floor nor the
-/// certificate: `s2_rpc_finalized_is_published_only_after_the_certificate_is_persisted`.)
+/// prune, the re-proposal attempt (refused since #362: the certificate is
+/// already durable when the guard runs) and the concurrent finalization happen
+/// there; then the lock is released. Afterwards the floor, the persisted
+/// certificate and the published RPC pair agree, and a restart that reloads
+/// everything from disk restores the same floor and refuses a rebuild below
+/// it. (A failed certificate write raises no floor at all:
+/// `s2_certificate_write_failure_raises_no_floor_and_publishes_nothing`.)
 #[tokio::test]
 async fn s2_guarded_certificate_survives_a_same_hash_re_proposal_and_a_restart() {
     let chains = Chains::new();
@@ -1615,8 +1619,10 @@ async fn s2_guarded_certificate_survives_a_same_hash_re_proposal_and_a_restart()
         assert!(spins < 100_000, "guard never reached its floor check");
         tokio::task::yield_now().await;
     }
-    // Inside the guard: pruned, re-proposed for the same hash with no votes,
-    // and a concurrent finalization of the same height queued.
+    // Inside the guard: pruned, a same-hash re-proposal attempted, and a
+    // concurrent finalization of the same height queued. The certificate is
+    // already durable when the guard runs (#362), so the height cannot be
+    // re-opened: the re-proposal is refused and nothing is pending there.
     let second = tokio::spawn({
         let mgr = mgr.clone();
         async move { mgr.finalize_checkpoint(4).await }
@@ -1626,9 +1632,10 @@ async fn s2_guarded_certificate_survives_a_same_hash_re_proposal_and_a_restart()
         mgr.ensure_proposed(4, h4, committee.clone())
             .await
             .expect("re-propose"),
-        citrate_consensus::checkpoint::ProposeOutcome::Proposed
+        citrate_consensus::checkpoint::ProposeOutcome::AlreadyFinalized,
+        "a height whose certificate is on disk is never re-opened"
     );
-    assert_eq!(mgr.pending_vote_count(4).await, Some(0));
+    assert_eq!(mgr.pending_vote_count(4).await, None);
     assert_eq!(node.floor(), 0, "the guard has not raised the floor yet");
     drop(held);
 

@@ -459,9 +459,14 @@ pub(crate) fn verify_vote_signature(
 }
 
 /// Hook run by [`CheckpointManager::finalize_checkpoint`] once a checkpoint has
-/// reached quorum and BEFORE the finalization becomes visible anywhere: before
-/// the block is marked finalized in the DAG store, before the certificate is
-/// persisted, and before [`CheckpointManager::latest_finalized_height`] moves.
+/// reached quorum and its certificate has been written DURABLY (synced, see
+/// [`KvStore::kv_put_durable`]), and BEFORE the finalization becomes visible:
+/// before the block is marked finalized in the DAG store and before
+/// [`CheckpointManager::latest_finalized_height`] moves. If the certificate
+/// cannot be written, the hook does not run and nothing is finalized
+/// (`finalize_checkpoint` returns [`CheckpointError::StorageError`]), so the
+/// floor the node raises here always has a certificate that survives a crash
+/// or power loss.
 ///
 /// The node installs its finality floor verifier here (Enforced mode only,
 /// `node/src/finality_floor.rs`): it checks the certified `(height, hash)`
@@ -476,20 +481,18 @@ pub(crate) fn verify_vote_signature(
 /// serializes finalizations), so the hook may read the manager.
 ///
 /// PUBLICATION. `before_finalize` must not PUBLISH the finalization (e.g. the
-/// finalized/safe RPC tags): the certificate is not persisted yet, so a crash
-/// before persistence would restart without it and could abandon a block
-/// already reported as finalized. Publication belongs in
-/// [`Self::after_finalize`], which runs once the certificate record has been
-/// written (check [`CheckpointManager::is_certificate_persisted`]: the write
-/// can fail).
+/// finalized/safe RPC tags): the finalization is not visible yet (latest
+/// finalized height, DAG mark). Publication belongs in [`Self::after_finalize`];
+/// it should still check [`CheckpointManager::is_certificate_persisted`] for the
+/// exact pair it publishes.
 #[async_trait::async_trait]
 pub trait FinalizationGuard: Send + Sync {
     /// `certificate` has `status == Finalized`, a committee of at least
     /// [`MIN_FINALITY_COMMITTEE`] and its derived quorum of votes.
     async fn before_finalize(&self, certificate: &Checkpoint);
 
-    /// Runs after the finalization is visible: the block marked in the DAG
-    /// store, the certificate persistence attempted, the latest finalized
+    /// Runs after the finalization is visible: the certificate durably
+    /// written, the block marked in the DAG store, the latest finalized
     /// height and the in-memory record updated. No manager lock is held (only
     /// the finalization mutex). Default: nothing.
     async fn after_finalize(&self, _certificate: &Checkpoint) {}
@@ -928,14 +931,49 @@ impl CheckpointManager {
         Ok(false)
     }
 
+    /// Write `certificate` (status `Finalized`) to `DAG_METADATA`
+    /// `checkpoint:{height}` DURABLY ([`KvStore::kv_put_durable`]: synced, so it
+    /// survives a power loss, not only a process crash). `Ok` without a
+    /// persistent backend. On `Err` the record must be treated as not written.
+    /// RM-B1 / WP-B1.5 (audit M-06): a serialization failure is an error, never
+    /// an empty record.
+    fn persist_certificate(&self, certificate: &Checkpoint) -> Result<(), CheckpointError> {
+        let Some(kv) = self.persistent.as_ref() else {
+            return Ok(());
+        };
+        let height = certificate.height;
+        let bytes = bincode::serialize(certificate).map_err(|e| {
+            tracing::error!("checkpoint {height}: certificate serialization failed: {e}");
+            CheckpointError::StorageError(format!("serialize certificate at height {height}: {e}"))
+        })?;
+        let key = format!("checkpoint:{}", height);
+        kv.kv_put_durable(cf::DAG_METADATA, key.as_bytes(), &bytes)
+            .map_err(|e| {
+                tracing::error!(
+                    "checkpoint {height}: certificate not persisted ({e}); \
+                     the finalization is not applied"
+                );
+                CheckpointError::StorageError(format!(
+                    "persist certificate at height {height}: {e}"
+                ))
+            })
+    }
+
     /// Finalize a checkpoint that has reached quorum.
     ///
-    /// Moves the checkpoint from pending to finalized, marks the block as finalized
-    /// in the DAG store, and persists to storage if available.
+    /// Writes the certificate durably (synced) when a persistent store is
+    /// configured, then moves the checkpoint from pending to finalized and marks
+    /// the block as finalized in the DAG store. Nothing becomes visible before
+    /// the certificate is durable: if the write fails the call returns
+    /// [`CheckpointError::StorageError`], the checkpoint stays pending with its
+    /// votes, and no guard / post-finalization hook runs.
     ///
     /// With a [`FinalizationGuard`] installed, the guard runs on the certificate
-    /// after quorum is confirmed and before any of the above (or the latest
-    /// finalized height) changes. Once the guard has run, the certificate it saw
+    /// after quorum is confirmed and the certificate is durable, and before the
+    /// DAG mark, the in-memory record or the latest finalized height changes.
+    /// If the pending entry that finalizes extends the guarded certificate
+    /// (more votes) it replaces it on disk only if that write succeeds;
+    /// otherwise the durable guarded certificate is finalized. Once the guard has run, the certificate it saw
     /// (which has quorum) is what finalizes: if the pending checkpoint is
     /// evicted, pruned, replaced, or pruned and RE-PROPOSED for the same hash
     /// while the guard runs, the pending entry is used only when it extends that
@@ -965,6 +1003,12 @@ impl CheckpointManager {
                     candidate.status = CheckpointStatus::Finalized;
                     candidate
                 };
+                // Durable BEFORE the guard: the guard raises the floor, so the
+                // certificate it acts on must already survive a crash or power
+                // loss. A failed write finalizes nothing: the guard does not run,
+                // the pending entry is untouched (a later vote retries), and the
+                // error surfaces.
+                self.persist_certificate(&candidate)?;
                 // No manager lock is held here (only `finalize_serial`).
                 guard.before_finalize(&candidate).await;
                 Some(candidate)
@@ -973,6 +1017,8 @@ impl CheckpointManager {
         };
 
         let was_guarded = guarded.is_some();
+        // The guarded certificate, already durable (written above).
+        let durable = guarded.clone();
         let mut pending = self.pending.write().await;
         let mut checkpoint = match (pending.remove(&height), guarded) {
             // The entry still pending extends the guarded certificate (same
@@ -1024,31 +1070,42 @@ impl CheckpointManager {
 
         checkpoint.status = CheckpointStatus::Finalized;
 
+        // The certificate is durable before the finalization is visible (DAG
+        // mark, latest finalized height, in-memory record, post-finalization
+        // hook / RPC publication).
+        match durable {
+            // No guard ran: write it now. On failure nothing is visible; the
+            // checkpoint goes back to pending with its votes and the error
+            // surfaces (a later vote retries).
+            None => {
+                if let Err(e) = self.persist_certificate(&checkpoint) {
+                    checkpoint.status = CheckpointStatus::Pending;
+                    pending.insert(height, checkpoint);
+                    return Err(e);
+                }
+            }
+            // The guarded certificate is already durable. An extension (more
+            // votes for the same block and committee) replaces it on disk only
+            // if that write succeeds; otherwise the durable guarded certificate
+            // is the one finalized, so memory and disk agree and the floor the
+            // guard raised keeps its persisted certificate.
+            Some(seen) => {
+                if checkpoint.votes.len() != seen.votes.len() {
+                    if let Err(e) = self.persist_certificate(&checkpoint) {
+                        warn!(
+                            "checkpoint {}: extended certificate not persisted ({}); \
+                             finalizing the persisted guarded certificate",
+                            height, e
+                        );
+                        checkpoint = seen;
+                    }
+                }
+            }
+        }
+
         // Mark the block as finalized in the DAG store
         if let Err(e) = self.dag_store.finalize_block(&checkpoint.block_hash).await {
             warn!("Failed to finalize checkpoint block in DAG: {}", e);
-        }
-
-        // Persist to storage.
-        // RM-B1 / WP-B1.5 (audit M-06): on serialization failure log
-        // `error!` and skip the kv_put rather than writing empty bytes
-        // (which would silently deserialize-fail on next restart).
-        if let Some(ref kv) = self.persistent {
-            let key = format!("checkpoint:{}", height);
-            match bincode::serialize(&checkpoint) {
-                Ok(bytes) => {
-                    if let Err(e) = kv.kv_put(cf::DAG_METADATA, key.as_bytes(), &bytes) {
-                        warn!("Failed to persist checkpoint at height {}: {}", height, e);
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "M-06: serialize checkpoint at height {} failed: {} — skipping persistence",
-                        height,
-                        e
-                    );
-                }
-            }
         }
 
         // Update latest finalized height
@@ -1915,8 +1972,11 @@ mod tests {
     /// (`DAG_METADATA` `checkpoint:{height}`): the first `allow_cert_writes`
     /// certificate writes succeed, every later one fails, as a failed write or a
     /// failed fsync would. Counts which path each certificate write took.
+    /// `(column family, key) -> value`.
+    type FaultMap = HashMap<(String, Vec<u8>), Vec<u8>>;
+
     struct FaultKv {
-        map: std::sync::Mutex<HashMap<(String, Vec<u8>), Vec<u8>>>,
+        map: std::sync::Mutex<FaultMap>,
         allow_cert_writes: std::sync::atomic::AtomicUsize,
         durable_cert_writes: std::sync::atomic::AtomicUsize,
         plain_cert_writes: std::sync::atomic::AtomicUsize,
