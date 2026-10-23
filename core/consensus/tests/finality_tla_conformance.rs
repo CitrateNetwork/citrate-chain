@@ -63,6 +63,7 @@ fn spec_defines_every_action_the_code_maps_to() {
         "Reorg(n, h0, c) ==",
         "Restart(n) ==",
         "BootNoCertificate(n) ==",
+        "SyncCert(n, m, h) ==",
     ] {
         assert!(SPEC.contains(action), "TLA+ action `{action}` missing");
     }
@@ -80,6 +81,7 @@ fn spec_defines_every_action_the_code_maps_to() {
         "Reorg(",
         "Restart(",
         "BootNoCertificate(",
+        "SyncCert(",
     ] {
         assert!(next.contains(name), "{name} not in Next");
     }
@@ -113,6 +115,7 @@ fn gating_config_checks_s1_and_s2() {
         "CheckpointFinalitySafety_pollonly.cfg",
         "CheckpointFinalitySafety_restart.cfg",
         "CheckpointFinalitySafety_bootlimit.cfg",
+        "CheckpointFinalitySafety_syncnoguard.cfg",
     ] {
         assert!(CI_SCRIPT.contains(cfg), "{cfg} not run by tla_finality.sh");
     }
@@ -136,6 +139,26 @@ fn strict_s2_config_checks_the_floor_at_finalization() {
     assert!(SPEC_CFG.contains("SyncFloor = TRUE"));
     assert!(CI_SCRIPT
         .contains("expect_pass CheckpointFinalitySafety CheckpointFinalitySafety_strict.cfg"));
+}
+
+/// Stage 1b certificate sync (review of #332 @ 354908b): the gating and strict
+/// configs run SyncCert with the guarded install (the code), and the unguarded
+/// mutation keeps its counterexample alive.
+#[test]
+fn certificate_sync_configs_check_the_guarded_install() {
+    const STRICT: &str =
+        include_str!("../../../specs/tla/consensus/CheckpointFinalitySafety_strict.cfg");
+    const NOGUARD: &str =
+        include_str!("../../../specs/tla/consensus/CheckpointFinalitySafety_syncnoguard.cfg");
+    assert!(SPEC.contains("SyncCert(n, m, h) =="));
+    assert!(SPEC_CFG.contains("CertSync = \"guarded\""));
+    assert!(STRICT.contains("CertSync = \"guarded\""));
+    assert!(NOGUARD.contains("CertSync = \"unguarded\""));
+    assert!(NOGUARD.contains("PROPERTY FinalizedNeverReverted"));
+    assert!(CI_SCRIPT.contains(
+        "expect_violation CheckpointFinalitySafety CheckpointFinalitySafety_syncnoguard.cfg \
+         FinalizedNeverReverted"
+    ));
 }
 
 /// S2 across restarts (review of #335 @ 5236d2b): the boot check consults

@@ -312,7 +312,13 @@ published, whoever calls the hooks. Tests:
 before persistence, restart: nothing was published and the rebuild below 4 proceeds; once
 persisted the pair is published and after a restart the same rebuild is refused) and
 `s2_cleared_stop_does_not_publish_an_unpersisted_certificate`. The TLA+ model does not model
-RPC publication (finalize and persist are one step there).
+RPC publication (finalize and persist are one step there). A synced certificate
+(`CheckpointManager::install_synced_certificate`, Stage 1b) takes the same path: the record is
+written durably first, the guard runs before the install is visible and `after_finalize` runs
+after that, so a peer's certificate
+is published only once it is persisted here; a recovery from a conflicting-finality stop does
+not publish before that install (`verified_sibling_certificate_halts_and_is_not_installed`,
+`synced_install_raises_the_floor_before_the_certificate_is_visible`).
 
 **Certificate durability (#362).** The certificate is written with a synced write
 (`KvStore::kv_put_durable`; on RocksDB `write_batch_sync`, i.e. `WriteOptions::sync = true`)
@@ -561,11 +567,13 @@ message).
   reorg-below-floor rejected), A1–A8 as listed in §8.3, the §4.5 safety stop and its recovery
   through fork choice, and a restart mid-epoch (identical re-signed votes, floor re-raised at
   boot). A1's literal "flagged slashable" part is not tested: D-5 is still "reject only".
-- **Ignored, with reasons:** three scenarios need late-joiner certificate sync (§11.10, C3-S1b):
-  a node that sat on a losing sibling, a node that restarted after the votes were gossiped, and
-  binding a certificate's committee to the governing epoch snapshot before certificates arrive
-  from peers (`verify_certificate` checks internal consistency only). One is an open finding,
-  below.
+- **Formerly ignored, now passing with C3-S1b (§11.10):** a node that sat on a losing sibling
+  catches up through certificate sync, a node that restarted after the votes were gossiped
+  fetches the missed certificate, and a stored certificate whose committee is not the one the
+  governing epoch snapshot yields is rejected at boot. The suite's nodes each run a
+  `CertificateSync` (`Net::sync_cert`, real wire codec), plus the owner-Q1 scenarios (verified
+  sibling halts, unverified sibling refused) and a synced-install-vs-reorg race. One scenario
+  stays ignored: the open finding below.
 - **S2 window (found by this suite, fixed):** the reorg floor used to follow finality only on
   the verifier's 5 s poll, so between `finalize_checkpoint` and the next poll a reorg below the
   new certificate still proceeded. The floor is now raised at finalization (§4.5, "Floor at
@@ -618,7 +626,7 @@ message).
   enabled.
   Stage 1 also carries the liveness fixes (early-vote buffer + vote relay, §11.5), the
   epoch-pinned committee (§11.6), pending/voted pruning (§11.9), late-joiner certificate sync
-  (§11.10), and the `check_claims.py` tightening (§11.11).
+  (§11.10, Stage 1b), and the `check_claims.py` tightening (§11.11).
 - **Stage 2 — verification:** integration + adversarial tests (§8) + TLA+/conformance in CI.
 - **Stage 3 — enable:** flip the compiled enforcement pin (§6, node-local, NO activation
   height) in a release, *after* the committee exists (§7) and late-joiners can fetch certs.
@@ -667,6 +675,61 @@ the design + test bar and tracked here so #12 addresses every one:
 - **(10) late joiners:** a syncing node must be able to **fetch finalized checkpoint
   certificates** during sync (new `GetCheckpoint`/`CheckpointCert` p2p messages + apply on
   receipt), else its floor stays 0 until it participates live. Add to Stage 1 + a sync test.
+  **Stage 1b** (`node/src/finality_sync.rs`, compiled off with the voting pin):
+  - *Wire.* `NetworkMessage::GetCheckpoint { above, at_or_below }` and
+    `NetworkMessage::CheckpointCertificate { height, block_hash, signatures }`, appended
+    after every existing variant. Protocol version 1.2 (`CHECKPOINT_CERT_SYNC`, a minor
+    bump: older nodes still accept the handshake); `Peer::send` withholds both messages
+    from peers below 1.2, which could not decode them. The certificate carries **no
+    committee**.
+  - *Request.* Every 10 s, one outstanding request at a time (expires after 10 s, at
+    least 5 s apart), round robin over 1.2+ peers, for the highest certificate with
+    `finalized height < h <= applied tip`. Only the answer from the peer asked, before
+    expiry, is processed; one verification at a time, off the message loop.
+  - *Serve.* At most once per peer per 5 s (bounded rate table); the highest finalized
+    certificate in range; never more than 512 signatures or 60 KiB encoded (block
+    serving's budget under the 64 KiB Noise message limit). Nothing in range: no answer.
+  - *Trust.* Size first, then: above the local finalized height; a checkpoint boundary;
+    the certified block is the block at that height on this node's applied chain
+    (read-only `verify_certified_floor`); committee derived **locally** from the epoch
+    snapshot governing the height plus this node's copy of the block's VRF beacon
+    (`FinalityGadget::committee_for`, as the producer path); quorum, membership and every
+    signature (`CheckpointManager::verify_synced_certificate`). A certificate above the
+    applied tip is not used yet.
+  - *Install = finalization path* (review of #332 @ 354908b).
+    `CheckpointManager::install_synced_certificate` takes the manager's finalization
+    mutex, writes the certificate record with the synced write (as a local finalization,
+    #362; a failed write runs no guard, installs nothing and returns `StorageError`) and,
+    with a `FinalizationGuard` installed, runs the guard BEFORE the certificate is
+    visible (DAG mark, in-memory record, latest finalized height). In Enforced mode the
+    guard is the floor verifier (`FloorVerifier::on_finalize`): it re-verifies the
+    certificate against the derived committee and, under the advance lock, raises the
+    floor (block canonical) or engages the safety stop (a reorg moved the node off it
+    after the read-only pre-check). Enforced sync is never started without the guard
+    (`CertificateSync::new` returns `None`). A floor verifier pass then reports the
+    result; Observed: metric only.
+  - *Conflicting finality* (owner Q1 on #332, MAC recommendation; same semantics as a
+    stored-certificate mismatch). A **sibling** certificate is checked further only if
+    this node holds the sibling's header (its VRF beacon seeds the committee). If it
+    **verifies** against the committee derived here, a quorum of this node's own
+    committee finalized a block it is not on: mismatch safety stop + alarm
+    (`FloorVerifier::on_conflicting_certificate`), not installed, floor not raised; the
+    stop clears like any mismatch stop once fork choice moves the node onto that block.
+    If it does **not** verify (or no committee can be derived), it is refused with a log
+    only — unauthenticated peer input never halts finality.
+  - *Stored certificates are re-bound to the committee* (A4). The floor verifier never
+    trusts a certificate's recorded committee: at boot (`boot_check` and the store walk
+    in `restore_certified_floor`), on every poll and at finalization it derives the
+    committee for `(height, hash)` from the governing epoch snapshot (rehydrated by
+    `registry_sync` before the boot check) and the block's VRF beacon
+    (`finality_floor::CertificateCommittees`) and verifies with
+    `Checkpoint::verify_certificate_against` (recorded committee must equal the derived
+    one). Internally valid but foreign-committee records halt as invalid certificates;
+    records whose committee cannot be derived here (header or snapshot not held) are not
+    used (boot: not registered; poll: unverifiable; at finalization: `Unconfirmed` pause).
+  - *TLA+.* `SyncCert` in `CheckpointFinalitySafety.tla` (`CertSync = "guarded"` in the
+    gating and strict configs); `CheckpointFinalitySafety_syncnoguard.cfg` (install
+    without the guard) must produce a `FinalizedNeverReverted` counterexample.
 - **(11) claims tripwire:** `check_claims.py` currently passes on any non-test `.propose(`
   call — a default-off flag would false-positive "running". Tighten it (require the flag/pin
   ON **and** an outbound vote path) **in the same PR**; MAC flips the tripwire only when

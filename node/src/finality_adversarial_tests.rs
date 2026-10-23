@@ -32,9 +32,12 @@
 // Finalize includes the floor check the guard runs before the finalization is
 // visible (the TLA+ Finalize action raises the floor or halts in the same step).
 //
-// Scenarios that need late-joiner certificate sync (C3-S1b, spec §11.10) are
-// `#[ignore = "needs C3-S1b"]`; the open S1 finding across sibling
-// committees is `#[ignore = "bug: ..."]`. None of them is a pass today.
+// Late-joiner certificate sync (C3-S1b, spec §11.10) runs over the same
+// pieces: each node has a `CertificateSync` (Enforced, installed only with the
+// finalization guard in place, as main.rs), and `Net::sync_cert` runs one
+// GetCheckpoint / CheckpointCertificate exchange over the real wire codec
+// (TLA+ SyncCert). The open S1 finding across sibling committees is
+// `#[ignore = "bug: ..."]`; it is not a pass today.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -54,12 +57,16 @@ use citrate_consensus::dag_store::{cf, DagStore, KvStore};
 use citrate_consensus::types::{Block, Hash, PublicKey};
 use citrate_consensus::vrf::VrfProposerSelector;
 use citrate_execution::Executor;
+use citrate_network::NetworkMessage;
 use citrate_storage::StorageManager;
 
 use crate::canonical_apply::tests::{fresh, mk_block_vrf, persist, roots};
 use crate::canonical_apply::{ApplyOutcome, CanonicalApplicator, ReorgOutcome};
 use crate::finality_driver::{gate_outbound, retry_finalizations, run_pass, OwnVoteRetries};
-use crate::finality_floor::{FloorMode, FloorTick, FloorVerifier, HaltReason};
+use crate::finality_floor::{
+    CertificateCommittees, FloorMode, FloorTick, FloorVerifier, HaltReason,
+};
+use crate::finality_sync::{CertificateSync, SyncOutcome};
 use crate::persistent_dag::RocksDbKvStore;
 
 const CHAIN: u64 = 40204;
@@ -187,6 +194,7 @@ struct TestNode {
     dag: Arc<DagStore>,
     gadget: Arc<FinalityGadget>,
     verifier: Arc<FloorVerifier>,
+    sync: Arc<CertificateSync>,
     key: Ed25519SigningKey,
     cursor: u64,
     retries: OwnVoteRetries,
@@ -251,9 +259,15 @@ async fn assemble_with(
         app.clone(),
         gadget.safety_stop(),
         Arc::new(AtomicU64::new(0)),
+        CertificateCommittees::new(gadget.clone(), storage.clone()),
     ));
     assert!(verifier.install_finalization_guard(), "Enforced installs");
     let boot = verifier.boot_check().await;
+    // Stage 1b: late-joiner certificate sync over the same pieces (main.rs).
+    let sync = Arc::new(
+        CertificateSync::new(gadget.clone(), app.clone(), verifier.clone())
+            .expect("Enforced with the guard installed"),
+    );
     (
         TestNode {
             exec,
@@ -263,6 +277,7 @@ async fn assemble_with(
             dag,
             gadget,
             verifier,
+            sync,
             key,
             cursor: 0,
             retries: OwnVoteRetries::default(),
@@ -489,6 +504,47 @@ impl Net {
         self.tick_all().await
     }
 
+    /// Stage 1b certificate sync, one exchange (spec §11.10): node `to` asks
+    /// node `from` (`GetCheckpoint`), `from` serves its highest certificate in
+    /// range (`CheckpointCertificate`), `to` verifies and installs it, all over
+    /// the real wire codec. `None`: nothing was requested (nothing to ask for)
+    /// or nothing was served.
+    async fn sync_cert(&mut self, to: usize, from: usize) -> Option<SyncOutcome> {
+        let to_id = format!("node-{to}");
+        let from_id = format!("node-{from}");
+        // In-process time does not advance: lift the request / serve spacing
+        // (covered by finality_sync's own tests) for this exchange.
+        self.node(to).sync.reset_rate_limits_for_tests().await;
+        self.node(from).sync.reset_rate_limits_for_tests().await;
+        let (peer, req) = self
+            .node(to)
+            .sync
+            .request(std::slice::from_ref(&from_id))
+            .await?;
+        assert_eq!(peer, from_id);
+        let req = over_the_wire(&req);
+        let NetworkMessage::GetCheckpoint { above, at_or_below } = req else {
+            panic!("expected GetCheckpoint, got {req:?}");
+        };
+        let resp = self.node(from).sync.serve(&to_id, above, at_or_below).await;
+        let resp = resp?;
+        let NetworkMessage::CheckpointCertificate {
+            height,
+            block_hash,
+            signatures,
+        } = over_the_wire(&resp)
+        else {
+            panic!("expected CheckpointCertificate");
+        };
+        assert!(self.node(to).sync.accept_response(&from_id).await);
+        Some(
+            self.node(to)
+                .sync
+                .process(&from_id, height, block_hash, signatures)
+                .await,
+        )
+    }
+
     async fn tick_all(&mut self) -> Vec<FloorTick> {
         let mut ticks = Vec::new();
         for (i, n) in self.nodes.iter().enumerate() {
@@ -549,6 +605,12 @@ fn verified(height: u64) -> FloorTick {
         floor_raised: true,
         recovered: false,
     }
+}
+
+/// Through the real wire codec (bincode out, bounded `decode_inbound` in).
+fn over_the_wire(msg: &NetworkMessage) -> NetworkMessage {
+    let bytes = bincode::serialize(msg).expect("encode");
+    NetworkMessage::decode_inbound(&bytes).expect("decode_inbound")
 }
 
 /// A finalized certificate for `(height, hash)` with `committee` and the votes
@@ -716,10 +778,11 @@ async fn a1_equivocating_voter_cannot_finalize_two_hashes() {
 }
 
 /// A1 follow-up: a node that sat on the losing sibling at a checkpoint and is
-/// then moved onto the finalized branch by fork choice must reach the same
-/// finalized height as its peers. Needs late-joiner certificate sync.
+/// then moved onto the finalized branch by fork choice reaches the same
+/// finalized height as its peers through certificate sync (C3-S1b). While it
+/// is on the sibling and does not hold the finalized block, the peer's
+/// certificate cannot be checked against its committee: refused, no halt.
 #[tokio::test]
-#[ignore = "needs C3-S1b: late-joiner certificate sync (spec §11.10)"]
 async fn a1_node_on_losing_sibling_catches_up_after_reorg() {
     let chains = Chains::new();
     let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
@@ -737,10 +800,152 @@ async fn a1_node_on_losing_sibling_catches_up_after_reorg() {
     net.send_to(0, sign_checkpoint_vote(CHAIN, 4, hash_at(&a, 4), byz))
         .await;
     net.gossip().await;
+    assert_eq!(net.node(0).finalized_hash(4).await, Some(hash_at(&a, 4)));
+    // On B, without A4's header: refused with a log only.
+    let out = net.sync_cert(2, 0).await;
+    assert!(
+        matches!(&out, Some(SyncOutcome::NotOnThisChain { height: 4, .. })),
+        "{out:?}"
+    );
+    assert!(!net.node(2).gadget.halted());
+    assert_eq!(net.node(2).finalized_hash(4).await, None);
+
     let _ = net.node_mut(2).reorg_onto(&a).await;
     let _ = net.round().await;
+    let out = net.sync_cert(2, 0).await;
+    assert!(
+        matches!(&out, Some(SyncOutcome::Installed { height: 4, .. })),
+        "{out:?}"
+    );
     assert_eq!(net.node(2).finalized_hash(4).await, Some(hash_at(&a, 4)));
+    assert_eq!(net.node(2).floor(), 4);
     assert_eq!(net.node(2).tick().await, verified(4));
+    net.assert_no_conflicting_finality(&[2, 4]).await;
+}
+
+/// Owner Q1 on #332 (MAC recommendation): a node on the losing sibling that
+/// HOLDS the finalized block (stored, not applied) is offered the peers'
+/// certificate. It verifies against the committee this node derives itself —
+/// a quorum of its own committee finalized a block it is not on — so the node
+/// enters the mismatch safety stop and alarms, exactly as for a stored
+/// certificate that does not match. Nothing is installed, the floor is not
+/// raised, and the stop clears once fork choice moves the node onto the
+/// finalized block; the certificate is then installed normally.
+#[tokio::test]
+async fn a1_verified_sibling_certificate_halts_then_recovers() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let byz = keys.get(3).expect("byzantine key");
+    let vals = Validators::equal_stake(&keys);
+    let mut net = network(3, &vals, config(100)).await;
+    let a = chains.main(8);
+    let b = chains.branch(&a, 4, 8, VRF_B);
+    net.node_mut(0).follow(&a).await;
+    net.node_mut(1).follow(&a).await;
+    net.node_mut(2).follow(&b).await;
+    for i in 0..3 {
+        net.drive(i).await;
+    }
+    net.send_to(0, sign_checkpoint_vote(CHAIN, 4, hash_at(&a, 4), byz))
+        .await;
+    net.gossip().await;
+    // Node 2 receives A's blocks but fork choice keeps it on B.
+    for blk in &a {
+        net.node_mut(2).import(blk).await;
+    }
+    let floor_before = net.node(2).floor();
+    let out = net.sync_cert(2, 0).await;
+    match &out {
+        Some(SyncOutcome::ConflictingFinality {
+            height: 4,
+            certified,
+            canonical,
+            floor: FloorTick::Halted(HaltReason::Mismatch { height: 4, .. }),
+        }) => {
+            assert_eq!(*certified, hash_at(&a, 4));
+            assert_eq!(*canonical, Some(hash_at(&b, 4)));
+        }
+        other => panic!("verified sibling must halt: {other:?}"),
+    }
+    assert!(net.node(2).gadget.halted(), "safety stop engaged");
+    assert_eq!(net.node(2).finalized_hash(4).await, None, "not installed");
+    assert_eq!(net.node(2).floor(), floor_before, "floor not raised");
+    assert!(net.node_mut(2).drive().await.is_empty(), "signs nothing");
+    // The poll keeps the stop while B is canonical here.
+    assert!(matches!(
+        net.node(2).tick().await,
+        FloorTick::Halted(HaltReason::Mismatch { height: 4, .. })
+    ));
+    // Fork choice moves node 2 onto A: the poll clears the stop, then the
+    // certificate installs normally.
+    let _ = net.node_mut(2).reorg_onto(&a).await;
+    assert!(matches!(
+        net.node(2).tick().await,
+        FloorTick::Verified {
+            recovered: true,
+            ..
+        }
+    ));
+    assert!(!net.node(2).gadget.halted());
+    let out = net.sync_cert(2, 0).await;
+    assert!(
+        matches!(&out, Some(SyncOutcome::Installed { height: 4, .. })),
+        "{out:?}"
+    );
+    assert_eq!(net.node(2).finalized_hash(4).await, Some(hash_at(&a, 4)));
+    assert_eq!(net.node(2).floor(), 4);
+}
+
+/// Owner Q1, the other half: a sibling certificate that does NOT verify
+/// against the committee this node derives (signed by outsiders, or below
+/// quorum) is unauthenticated peer input — refused with a log only, never a
+/// halt.
+#[tokio::test]
+async fn a1_unverified_sibling_certificate_is_refused_without_halting() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let mut net = network(2, &vals, config(100)).await;
+    let a = chains.main(8);
+    let b = chains.branch(&a, 4, 8, VRF_B);
+    net.node_mut(0).follow(&b).await;
+    net.node_mut(1).follow(&a).await;
+    // Node 1 (on A) holds B's blocks too. Node 0 claims B4 is final with a
+    // forged certificate: stored where node 0 serves it from.
+    for blk in &b {
+        net.node_mut(1).import(blk).await;
+    }
+    let outsiders: Vec<Ed25519SigningKey> = (40..44).map(key).collect();
+    let o: Vec<&Ed25519SigningKey> = outsiders.iter().collect();
+    let k: Vec<&Ed25519SigningKey> = keys.iter().collect();
+    let committee: Vec<PublicKey> = keys.iter().map(pk).collect();
+    let b4 = hash_at(&b, 4);
+    for forged in [
+        certificate(
+            4,
+            b4,
+            &outsiders.iter().map(pk).collect::<Vec<_>>(),
+            &o,
+            CHAIN,
+        ),
+        certificate(4, b4, &committee, &k[..2], CHAIN),
+    ] {
+        let mut src = net.nodes.remove(0);
+        write_certificate(&src.storage, &forged);
+        // Rebuilt over the store so the serving manager loads the record (its
+        // own boot check halts on it — irrelevant: only node 1 is under test).
+        let (n, _) = src.restart(&vals, config(100)).await;
+        src = n;
+        net.nodes.insert(0, src);
+        let out = net.sync_cert(1, 0).await;
+        assert!(
+            matches!(&out, Some(SyncOutcome::NotOnThisChain { height: 4, .. })),
+            "{out:?}"
+        );
+        assert!(!net.node(1).gadget.halted(), "a forged sibling never halts");
+        assert_eq!(net.node(1).finalized().await, 0);
+        delete_certificate(&net.node(0).storage, 4);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1016,14 +1221,13 @@ async fn a4_forged_certificates_halt_at_boot_and_never_clear() {
     assert_eq!(node.floor(), 6);
 }
 
-/// A4 follow-up: a certificate whose committee is NOT the committee the epoch
-/// snapshot yields for that height (here: four outsider keys, every signature
-/// valid) must not verify. `verify_certificate` checks internal consistency
-/// only (documented in checkpoint.rs: certificates are only ever produced by
-/// this node's own manager today). Binding a certificate's committee to the
-/// governing snapshot is required before certificates arrive from peers.
+/// A4 follow-up: a STORED certificate whose committee is NOT the committee the
+/// epoch snapshot yields for that height (here: four outsider keys, every
+/// signature valid — internally consistent) is rejected at boot. The boot
+/// check re-derives the committee for every stored certificate (governing
+/// epoch snapshot + the certified block's VRF beacon) and verifies against
+/// it, never against the record's own committee (review of #332 @ 354908b).
 #[tokio::test]
-#[ignore = "needs C3-S1b: certificate committee bound to the epoch snapshot before certs arrive from peers"]
 async fn a4_certificate_with_a_foreign_committee_is_rejected() {
     let chains = Chains::new();
     let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
@@ -2861,7 +3065,13 @@ async fn s2_restart_restores_the_floor_below_many_uncovered_certificates() {
     assert!(uncovered > 64, "more than the former registration bound");
     let chains = Chains::new();
     let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
-    let vals = Validators::equal_stake(&keys);
+    let mut vals = Validators::equal_stake(&keys);
+    // Every epoch up to the tip has its snapshot (S(2..4) = 21, 41, 61 under
+    // schedule 20/19), as registry_sync records on a live node: the boot check
+    // derives each stored certificate's committee from its governing snapshot.
+    for snap in [21u64, 41, 61] {
+        vals.later.push((snap, vals.set.clone()));
+    }
     let committee: Vec<PublicKey> = keys.iter().map(pk).collect();
     let signers: Vec<&Ed25519SigningKey> = keys.iter().take(3).collect();
     let cfg = config(100);
@@ -2959,9 +3169,8 @@ async fn s2_restart_restores_the_floor_below_many_uncovered_certificates() {
 }
 
 /// Restart follow-up: a node that missed the votes for a checkpoint while it
-/// was down must obtain that checkpoint's certificate from peers.
+/// was down obtains that checkpoint's certificate from a peer (C3-S1b).
 #[tokio::test]
-#[ignore = "needs C3-S1b: late-joiner certificate sync (spec §11.10)"]
 async fn restarted_node_fetches_missed_certificates() {
     let chains = Chains::new();
     let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
@@ -2980,6 +3189,123 @@ async fn restarted_node_fetches_missed_certificates() {
     net.nodes.push(n3);
     *net.online.get_mut(3).expect("flag") = true;
     let _ = net.round().await;
+    let out = net.sync_cert(3, 0).await;
+    assert!(
+        matches!(&out, Some(SyncOutcome::Installed { height: 4, .. })),
+        "{out:?}"
+    );
     assert_eq!(net.node(3).finalized().await, 4);
     assert_eq!(net.node(3).floor(), 4);
+    assert_eq!(net.node(3).tick().await, verified(4));
+    // Persisted like a local certificate: verified again at the next boot.
+    let n3 = net.nodes.pop().expect("node 3");
+    let (n3, boot) = n3.restart(&vals, config(100)).await;
+    assert_eq!(boot, verified(4));
+    assert_eq!(n3.floor(), 4);
+}
+
+/// Review of #332 @ 354908b (blocking 1): a synced certificate becomes visible
+/// only through the finalization guard. `process()` (sync install) races a
+/// reorg below the certified block; whichever wins, the node is never left
+/// with the certificate visible and the certified block reverted while
+/// finality runs: either the floor covers A4 (the reorg is refused) or the
+/// node is in the safety stop (reorg first: the certificate is a verified
+/// sibling, or the guard found the mismatch). TLA+ SyncCert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s2_synced_install_races_a_reorg_below_it() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let a = chains.main(8);
+    let c = chains.branch(&a, 4, 12, VRF_C);
+    let a4 = hash_at(&a, 4);
+    let mut seen = std::collections::BTreeSet::new();
+    for round in 0..9u32 {
+        let mut net = network(4, &vals, config(100)).await;
+        net.follow_all(&a).await;
+        *net.online.get_mut(3).expect("flag") = false;
+        for i in 0..3 {
+            net.drive(i).await;
+        }
+        net.gossip().await;
+        assert_eq!(net.node(0).finalized().await, 4);
+        assert_eq!(net.node(3).finalized().await, 0);
+        for blk in &c {
+            net.node_mut(3).import(blk).await;
+        }
+        // The exchange up to the install, then race install vs reorg.
+        net.node(3).sync.reset_rate_limits_for_tests().await;
+        net.node(0).sync.reset_rate_limits_for_tests().await;
+        let (_, req) = net
+            .node(3)
+            .sync
+            .request(&["node-0".to_string()])
+            .await
+            .expect("due");
+        let NetworkMessage::GetCheckpoint { above, at_or_below } = req else {
+            panic!("expected GetCheckpoint");
+        };
+        let resp = net
+            .node(0)
+            .sync
+            .serve("node-3", above, at_or_below)
+            .await
+            .expect("served");
+        let NetworkMessage::CheckpointCertificate {
+            height,
+            block_hash,
+            signatures,
+        } = resp
+        else {
+            panic!("expected CheckpointCertificate");
+        };
+        assert!(net.node(3).sync.accept_response("node-0").await);
+        let n3 = net.node(3);
+        let sync = n3.sync.clone();
+        let app = n3.app.clone();
+        let c_tip = c.last().expect("tip").header.block_hash;
+        let install = async move { sync.process("node-0", height, block_hash, signatures).await };
+        let reorg = async move {
+            let lock = app.advance_lock();
+            let mut st = lock.lock().await;
+            app.reorg_to(&mut st, c_tip).await
+        };
+        // Every third round runs them in order (install, then reorg) so that
+        // interleaving is always covered; the others race on worker threads.
+        let (out, reorged) = if round % 3 == 0 {
+            let out = install.await;
+            (out, reorg.await)
+        } else {
+            let install = tokio::spawn(install);
+            let reorg = tokio::spawn(reorg);
+            (
+                install.await.expect("install task"),
+                reorg.await.expect("reorg task"),
+            )
+        };
+        let n3 = net.node(3);
+        let tip = n3.app.applied_tip().await;
+        let here = n3.app.walk_applied(tip).hash_at(4).expect("walk");
+        let visible = n3.finalized_hash(4).await == Some(a4);
+        let halted = n3.gadget.halted();
+        let label = match (&out, &reorged) {
+            (SyncOutcome::Installed { .. }, ReorgOutcome::Rejected(_)) => "install-first",
+            (SyncOutcome::ConflictingFinality { .. }, _) => "reorg-first",
+            (SyncOutcome::Installed { .. }, _) => "reorg-between",
+            _ => "other",
+        };
+        seen.insert(label);
+        if here == Some(a4) {
+            assert!(!halted, "{label}: {out:?} / {reorged:?}");
+            assert!(visible, "{label}: installed");
+            assert_eq!(n3.floor(), 4, "{label}: floor covers the certified block");
+        } else {
+            assert!(
+                halted,
+                "{label}: A4 reverted while finality runs: {out:?} / {reorged:?}"
+            );
+        }
+    }
+    assert!(!seen.contains("other"), "{seen:?}");
+    assert!(seen.contains("install-first"), "{seen:?}");
 }

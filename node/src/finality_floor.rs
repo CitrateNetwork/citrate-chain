@@ -7,9 +7,16 @@
 // floor on the height alone can lock a node onto the wrong branch, so before a
 // certificate is used for anything this module:
 //
-//   1. re-verifies the stored certificate (`Checkpoint::verify_certificate`:
-//      finalized, committee >= 4, quorum reached, every voter a member, every
-//      signature valid for this chain);
+//   1. re-verifies the stored certificate against the committee THIS node
+//      derives for its (height, hash) — the governing epoch snapshot + the VRF
+//      beacon of its own copy of the certified block (`CertificateCommittees`),
+//      never the committee recorded in the certificate
+//      (`Checkpoint::verify_certificate_against`: finalized, recorded committee
+//      == derived committee, committee >= 4, quorum reached, every voter a
+//      member, every signature valid for this chain). A certificate whose
+//      committee cannot be derived here (header or snapshot not held) is not
+//      used: skipped at boot, retried by the poll, and at finalization it
+//      pauses finality (`Unconfirmed`);
 //   2. checks its block hash is the block at that height on THIS node's applied
 //      chain (`CanonicalApplicator::verify_certified_floor`, which re-confirms the
 //      answer under the advance lock and raises the floor before releasing it).
@@ -44,8 +51,10 @@
 //                verified pair is served, else genesis.
 //
 // SAFETY STOP. A certificate that does not match this node's chain (a different
-// block at that height, or a chain that steps over it), or does not verify, is
-// never used: the floor is not raised, the RPC tags do not advance, the finality
+// block at that height, or a chain that steps over it) — stored here, or a
+// peer's certificate that verifies against this node's own committee
+// (`on_conflicting_certificate`, Stage 1b) — or a stored one that does not
+// verify, is never used: the floor is not raised, the RPC tags do not advance, the finality
 // gadget is HALTED (proposes / signs nothing) and an `error!` "CHECKPOINT
 // FINALITY SAFETY STOP" with operator guidance is logged, plus the
 // `citrate_finality_*` metrics. A mismatch stop clears only when that
@@ -121,11 +130,14 @@ use std::time::Duration;
 use std::sync::Weak;
 
 use citrate_api::finalized_tag::{FinalizedTagSource, VerifiedFinalized};
-use citrate_consensus::checkpoint::{Checkpoint, CheckpointManager, FinalizationGuard};
-use citrate_consensus::checkpoint_gadget::{
-    checkpoint_enforcement_pinned, checkpoint_voting_pinned, SafetyStop,
+use citrate_consensus::checkpoint::{
+    Checkpoint, CheckpointManager, FinalizationGuard, VerifiedCertificate,
 };
-use citrate_consensus::types::Hash;
+use citrate_consensus::checkpoint_gadget::{
+    checkpoint_enforcement_pinned, checkpoint_voting_pinned, FinalityGadget, SafetyStop,
+};
+use citrate_consensus::types::{Hash, PublicKey};
+use citrate_storage::StorageManager;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -219,6 +231,83 @@ impl HaltReason {
     }
 }
 
+/// Why no committee could be derived for a certificate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitteeUnavailable {
+    /// No validator snapshot governing the height is held here.
+    NoSnapshot,
+    /// The certified block's header (its VRF beacon) is not usable here.
+    Header(String),
+}
+
+impl std::fmt::Display for CommitteeUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoSnapshot => write!(f, "no validator snapshot governing the height is held"),
+            Self::Header(why) => write!(f, "certified block header unusable: {why}"),
+        }
+    }
+}
+
+/// Derives, on THIS node, the committee a certificate for `(height, hash)`
+/// must carry, exactly as the producer path derives it
+/// (`FinalityGadget::committee_for`): the validator snapshot governing the
+/// height, plus the VRF beacon in this node's own copy of the certified
+/// block's header. Never the committee recorded in a certificate.
+///
+/// Data sources: the gadget's epoch snapshot history (filled by
+/// `registry_sync`, rehydrated at boot before the floor verifier's boot check)
+/// and the chain store's headers.
+pub struct CertificateCommittees {
+    gadget: Arc<FinalityGadget>,
+    storage: Arc<StorageManager>,
+}
+
+impl CertificateCommittees {
+    pub fn new(gadget: Arc<FinalityGadget>, storage: Arc<StorageManager>) -> Self {
+        Self { gadget, storage }
+    }
+
+    /// The committee for a certificate of `block_hash` at `height`.
+    pub async fn derive(
+        &self,
+        height: u64,
+        block_hash: Hash,
+    ) -> Result<Vec<PublicKey>, CommitteeUnavailable> {
+        let seed = match self.storage.blocks.get_header(&block_hash) {
+            Ok(Some(h)) if h.height == height => h.vrf_reveal.output,
+            Ok(Some(h)) => {
+                return Err(CommitteeUnavailable::Header(format!(
+                    "stored header {} is at height {}",
+                    block_hash, h.height
+                )))
+            }
+            Ok(None) => {
+                return Err(CommitteeUnavailable::Header(format!(
+                    "header {block_hash} not stored"
+                )))
+            }
+            Err(e) => return Err(CommitteeUnavailable::Header(e.to_string())),
+        };
+        self.gadget
+            .committee_for(height, &seed)
+            .await
+            .ok_or(CommitteeUnavailable::NoSnapshot)
+    }
+}
+
+/// [`FloorVerifier::check_certificate`]'s verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CertCheck {
+    /// Verifies against the committee this node derives for it.
+    Valid,
+    /// Does not verify (internally, or against the derived committee).
+    Invalid(String),
+    /// Internally consistent, but no committee can be derived for it here, so
+    /// it is not used (and not treated as forged).
+    Unavailable(String),
+}
+
 /// What one verification pass concluded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FloorTick {
@@ -269,6 +358,9 @@ pub struct FloorVerifier {
     /// Verified `(height, hash)` pairs (Observed / Enforced): what the RPC
     /// `finalized`/`safe` tags resolve BY HASH in Enforced mode only.
     verified_pairs: Arc<VerifiedFinalized>,
+    /// The committee every certificate is verified against (derived here,
+    /// never read from the certificate).
+    committees: CertificateCommittees,
     state: Mutex<VerifierState>,
 }
 
@@ -276,12 +368,16 @@ impl FloorVerifier {
     /// `verified_height` only ever advances to a verified, matching height; the
     /// RPC `finalized`/`safe` tags read it in Enforced mode only
     /// ([`Self::rpc_finalized_handle`]).
+    ///
+    /// `committees` derives the committee each certificate is checked against
+    /// (review of #332: a stored certificate's own committee is never trusted).
     pub fn new(
         mode: FloorMode,
         manager: Arc<CheckpointManager>,
         applicator: Arc<CanonicalApplicator>,
         gadget_halt: Arc<SafetyStop>,
         verified_height: Arc<AtomicU64>,
+        committees: CertificateCommittees,
     ) -> Self {
         let chain_id = manager.config().chain_id;
         Self {
@@ -292,8 +388,36 @@ impl FloorVerifier {
             gadget_halt,
             verified_height,
             verified_pairs: Arc::new(VerifiedFinalized::new()),
+            committees,
             state: Mutex::new(VerifierState::default()),
         }
+    }
+
+    /// The committee source certificates are verified against.
+    pub fn committees(&self) -> &CertificateCommittees {
+        &self.committees
+    }
+
+    /// Verify `cert` as a finality certificate for this chain against the
+    /// committee THIS node derives for its `(height, block_hash)`. Internal
+    /// consistency is checked first (a record that is not even a well-formed
+    /// certificate is invalid whether or not a committee can be derived).
+    async fn check_certificate(&self, cert: &Checkpoint) -> CertCheck {
+        if let Err(e) = cert.verify_certificate(self.chain_id) {
+            return CertCheck::Invalid(e.to_string());
+        }
+        match self.committees.derive(cert.height, cert.block_hash).await {
+            Ok(committee) => match cert.verify_certificate_against(self.chain_id, &committee) {
+                Ok(()) => CertCheck::Valid,
+                Err(e) => CertCheck::Invalid(e.to_string()),
+            },
+            Err(why) => CertCheck::Unavailable(why.to_string()),
+        }
+    }
+
+    /// The mode this verifier runs in (from the two compiled pins).
+    pub fn mode(&self) -> FloorMode {
+        self.mode
     }
 
     /// The source the RPC `finalized`/`safe` tags must read in this mode:
@@ -419,13 +543,24 @@ impl FloorVerifier {
                 );
                 continue;
             };
-            if let Err(e) = cert.verify_certificate(self.chain_id) {
-                warn!(
-                    "checkpoint finality: stored certificate {} @ {} does not verify; not \
-                     registered: {}",
-                    cert.block_hash, cert.height, e
-                );
-                continue;
+            match self.check_certificate(&cert).await {
+                CertCheck::Valid => {}
+                CertCheck::Invalid(e) => {
+                    warn!(
+                        "checkpoint finality: stored certificate {} @ {} does not verify against \
+                         this node's committee; not registered: {}",
+                        cert.block_hash, cert.height, e
+                    );
+                    continue;
+                }
+                CertCheck::Unavailable(why) => {
+                    warn!(
+                        "checkpoint finality: stored certificate {} @ {} cannot be checked \
+                         against this node's committee ({}); not registered",
+                        cert.block_hash, cert.height, why
+                    );
+                    continue;
+                }
             }
             self.applicator
                 .register_certified(cert.height, cert.block_hash);
@@ -549,15 +684,27 @@ impl FloorVerifier {
             return FloorTick::NoCertificate;
         };
         // Re-verified on every pass (at most `committee_size` ed25519 checks per
-        // 5 s): no cache keyed on (height, hash) that a rewritten record could slip
-        // past.
-        if let Err(e) = cert.verify_certificate(self.chain_id) {
-            let reason = HaltReason::InvalidCertificate {
-                height: cert.height,
-                certified: cert.block_hash,
-                reason: e.to_string(),
-            };
-            return self.enter_halt(&mut st, reason).await;
+        // 5 s), against the committee derived HERE for (height, hash): no cache
+        // keyed on (height, hash) that a rewritten record could slip past, and
+        // the record's own committee is never trusted.
+        match self.check_certificate(&cert).await {
+            CertCheck::Valid => {}
+            CertCheck::Invalid(e) => {
+                let reason = HaltReason::InvalidCertificate {
+                    height: cert.height,
+                    certified: cert.block_hash,
+                    reason: e,
+                };
+                return self.enter_halt(&mut st, reason).await;
+            }
+            CertCheck::Unavailable(why) => {
+                warn!(
+                    "checkpoint finality: certificate {} @ {} not checked this pass: {}",
+                    cert.block_hash, cert.height, why
+                );
+                self.publish(false);
+                return FloorTick::Unverifiable(why);
+            }
         }
 
         if raise {
@@ -633,13 +780,31 @@ impl FloorVerifier {
             return None;
         }
         let mut st = self.state.lock().await;
-        if let Err(e) = cert.verify_certificate(self.chain_id) {
-            let reason = HaltReason::InvalidCertificate {
-                height: cert.height,
-                certified: cert.block_hash,
-                reason: e.to_string(),
-            };
-            return Some(self.enter_halt(&mut st, reason).await);
+        match self.check_certificate(cert).await {
+            CertCheck::Valid => {}
+            CertCheck::Invalid(e) => {
+                let reason = HaltReason::InvalidCertificate {
+                    height: cert.height,
+                    certified: cert.block_hash,
+                    reason: e,
+                };
+                return Some(self.enter_halt(&mut st, reason).await);
+            }
+            CertCheck::Unavailable(why) => {
+                // The finalization cannot be vetoed; it is not confirmed either:
+                // pause finality until the certified block is confirmed here.
+                self.applicator
+                    .register_certified(cert.height, cert.block_hash);
+                if st.halt.is_some() {
+                    return Some(self.still_halted(&st).await);
+                }
+                let reason = HaltReason::Unconfirmed {
+                    height: cert.height,
+                    certified: cert.block_hash,
+                    reason: format!("committee not derivable here: {why}"),
+                };
+                return Some(self.enter_halt(&mut st, reason).await);
+            }
         }
         // Registered first: whatever the check below concludes, no later reorg
         // can revert this block once it is canonical here.
@@ -740,6 +905,54 @@ impl FloorVerifier {
                 cert.block_hash, cert.height, other
             ))),
         }
+    }
+
+    /// Conflicting finality (owner Q1 on #332, MAC recommendation): a peer's
+    /// certificate for `certified` at a height where this node's applied chain
+    /// holds `canonical` (another block, or none), which VERIFIED against the
+    /// committee this node derives for it ([`VerifiedCertificate`]: a quorum
+    /// of this node's own committee, unforgeable under f < n/3). That is the
+    /// same evidence as a stored-certificate mismatch — the network finalized a
+    /// block this node is not on — so it enters the same mismatch safety stop
+    /// and raises the same alarm. Nothing is installed and the floor is not
+    /// raised. The stop clears like any mismatch stop: once `certified` is
+    /// canonical here through normal fork choice (re-checked every poll); that
+    /// recovery pass records the pair as verified and, in Enforced mode,
+    /// raises the floor to it under the advance lock, and certificate sync
+    /// then fetches and installs the certificate itself.
+    ///
+    /// A certificate that does NOT verify never reaches this (it is refused
+    /// with a log only: unauthenticated peer input must not halt finality).
+    pub async fn on_conflicting_certificate(
+        &self,
+        cert: &VerifiedCertificate,
+        canonical: Option<Hash>,
+    ) -> FloorTick {
+        if self.mode == FloorMode::Legacy {
+            return FloorTick::Legacy;
+        }
+        let cp = cert.checkpoint();
+        let mut st = self.state.lock().await;
+        let reason = HaltReason::Mismatch {
+            height: cp.height,
+            certified: cp.block_hash,
+            canonical,
+        };
+        if let Some(existing) = &st.halt {
+            if *existing != reason {
+                error!(
+                    "CHECKPOINT FINALITY: a peer presented a certificate for block {} @ {} \
+                     that verifies against this node's committee, but this node's chain has {}; \
+                     finality is already in a safety stop ({:?})",
+                    cp.block_hash,
+                    cp.height,
+                    canonical.map_or_else(|| "no block there".to_string(), |h| h.to_string()),
+                    existing
+                );
+            }
+            return self.still_halted(&st).await;
+        }
+        self.enter_halt(&mut st, reason).await
     }
 
     /// Spawn the periodic pass (every [`FLOOR_POLL_SECS`]). `None` in Legacy
@@ -887,6 +1100,7 @@ mod tests {
     use citrate_consensus::crypto::Ed25519SigningKey;
     use citrate_consensus::dag_store::{cf, DagStore, KvStore};
     use citrate_consensus::types::PublicKey;
+    use citrate_consensus::vrf::VrfProposerSelector;
     use citrate_storage::StorageManager;
     use std::collections::HashMap;
 
@@ -931,6 +1145,21 @@ mod tests {
         .expect("persist certificate");
     }
 
+    /// Store (not apply) a block at `height` off this node's chain; returns
+    /// its hash. Its header is what committee derivation reads.
+    fn stored_unapplied(storage: &StorageManager, height: u64) -> Hash {
+        let mut tag = [0xEE; 32];
+        tag[..8].copy_from_slice(&height.to_be_bytes());
+        let blk = crate::canonical_apply::tests::mk_block_vrf(
+            height,
+            Hash::new([0xEF; 32]),
+            Hash::default(),
+            tag,
+        );
+        crate::canonical_apply::tests::persist(storage, &blk);
+        blk.header.block_hash
+    }
+
     /// A checkpoint manager over the node's store, as at boot (it loads every
     /// persisted certificate).
     fn manager_over(storage: &StorageManager) -> Arc<CheckpointManager> {
@@ -950,16 +1179,45 @@ mod tests {
 
     struct Rig {
         verifier: FloorVerifier,
-        gadget: FinalityGadget,
+        gadget: Arc<FinalityGadget>,
         verified: Arc<AtomicU64>,
         floor: Arc<AtomicU64>,
     }
 
-    fn rig(mode: FloorMode, mgr: Arc<CheckpointManager>, app: Arc<CanonicalApplicator>) -> Rig {
-        let gadget = FinalityGadget::with_switch(mgr.clone(), None, mode != FloorMode::Legacy);
+    /// The epoch committee source every rig derives committees from: snapshot
+    /// S(1) = 1 (schedule EPOCH 1000, LAG 999, governing heights 2..=1000)
+    /// holding the four `certificate` signers, so the derived committee for
+    /// any certified block stored here is exactly those four.
+    async fn committee_source() -> Arc<VrfProposerSelector> {
+        let sel = VrfProposerSelector::new().with_snapshot_schedule(1000, 999);
+        let set: Vec<(PublicKey, u128)> = (0..4u8)
+            .map(|i| (PublicKey::new(signer(i).verifying_key().to_bytes()), 1000))
+            .collect();
+        sel.record_snapshot(1, &set, 1).await;
+        Arc::new(sel)
+    }
+
+    async fn rig(
+        storage: &Arc<StorageManager>,
+        mode: FloorMode,
+        mgr: Arc<CheckpointManager>,
+        app: Arc<CanonicalApplicator>,
+    ) -> Rig {
+        let gadget = Arc::new(FinalityGadget::with_switch(
+            mgr.clone(),
+            Some(committee_source().await),
+            mode != FloorMode::Legacy,
+        ));
         let verified = Arc::new(AtomicU64::new(0));
         let floor = app.finalized_height_handle();
-        let verifier = FloorVerifier::new(mode, mgr, app, gadget.safety_stop(), verified.clone());
+        let verifier = FloorVerifier::new(
+            mode,
+            mgr,
+            app,
+            gadget.safety_stop(),
+            verified.clone(),
+            CertificateCommittees::new(gadget.clone(), storage.clone()),
+        );
         Rig {
             verifier,
             gadget,
@@ -1005,7 +1263,7 @@ mod tests {
         let cert = certificate(2, a2.header.block_hash, 3);
         for mode in [FloorMode::Legacy, FloorMode::Observed] {
             let mgr = manager_over(&storage);
-            let v = Arc::new(rig(mode, mgr.clone(), app.clone()).verifier);
+            let v = Arc::new(rig(&storage, mode, mgr.clone(), app.clone()).await.verifier);
             assert!(!v.install_finalization_guard(), "{mode:?}");
             assert!(!mgr.has_finalization_guard(), "{mode:?}");
             assert_eq!(v.on_finalize(&cert).await, None, "{mode:?}");
@@ -1014,7 +1272,7 @@ mod tests {
             assert!(app.certified_pending().is_empty(), "{mode:?}");
         }
         let mgr = manager_over(&storage);
-        let r = rig(FloorMode::Enforced, mgr.clone(), app.clone());
+        let r = rig(&storage, FloorMode::Enforced, mgr.clone(), app.clone()).await;
         let v = Arc::new(r.verifier);
         assert!(v.install_finalization_guard());
         assert!(mgr.has_finalization_guard());
@@ -1060,7 +1318,13 @@ mod tests {
         let (exec, storage, _dir) = fresh();
         let app = Arc::new(CanonicalApplicator::new(exec, storage.clone()));
         let (_a1, a2, _b2, _b3) = setup_fork(&app, &storage).await;
-        let r = rig(FloorMode::Enforced, manager_over(&storage), app.clone());
+        let r = rig(
+            &storage,
+            FloorMode::Enforced,
+            manager_over(&storage),
+            app.clone(),
+        )
+        .await;
         let out = r
             .verifier
             .on_finalize(&certificate(2, a2.header.block_hash, 2))
@@ -1092,7 +1356,7 @@ mod tests {
         persist_certificate(&storage, &certificate(2, a2.header.block_hash, 3));
         let mgr = manager_over(&storage);
         assert_eq!(mgr.latest_finalized_height().await, 2, "certificate loaded");
-        let r = rig(FloorMode::Legacy, mgr, app.clone());
+        let r = rig(&storage, FloorMode::Legacy, mgr, app.clone()).await;
         assert_eq!(r.verifier.boot_check().await, FloorTick::Legacy);
         assert_eq!(r.verifier.tick().await, FloorTick::Legacy);
         assert_eq!(load(&r.floor), 0, "floor never raised in Legacy");
@@ -1109,16 +1373,18 @@ mod tests {
         let app = Arc::new(CanonicalApplicator::new(exec, storage.clone()));
         let (_a1, a2, b2, _b3) = setup_fork(&app, &storage).await;
         let mgr = manager_over(&storage);
-        let r = rig(FloorMode::Enforced, mgr, app);
+        let r = rig(&storage, FloorMode::Enforced, mgr, app).await;
         assert_eq!(r.verifier.boot_check().await, FloorTick::NoCertificate);
         assert_eq!(load(&r.floor), 0);
 
         persist_certificate(&storage, &certificate(2, a2.header.block_hash, 3));
         let r = rig(
+            &storage,
             FloorMode::Enforced,
             manager_over(&storage),
             r.verifier.applicator.clone(),
-        );
+        )
+        .await;
         assert_eq!(
             r.verifier.boot_check().await,
             FloorTick::Verified {
@@ -1173,7 +1439,13 @@ mod tests {
             v
         };
 
-        let r = rig(FloorMode::Enforced, manager_over(&storage), app.clone());
+        let r = rig(
+            &storage,
+            FloorMode::Enforced,
+            manager_over(&storage),
+            app.clone(),
+        )
+        .await;
         assert!(matches!(
             r.verifier.boot_check().await,
             FloorTick::Verified { height: 2, .. }
@@ -1200,7 +1472,13 @@ mod tests {
         // Restart: a fresh manager reloads the certificate from disk and a fresh
         // verifier re-publishes it at boot.
         drop(r);
-        let r = rig(FloorMode::Enforced, manager_over(&storage), app.clone());
+        let r = rig(
+            &storage,
+            FloorMode::Enforced,
+            manager_over(&storage),
+            app.clone(),
+        )
+        .await;
         assert_eq!(
             r.verifier.rpc_finalized_handle().resolve(&storage),
             FinalizedAnchor::GENESIS,
@@ -1235,7 +1513,13 @@ mod tests {
         let app = Arc::new(CanonicalApplicator::new(exec, storage.clone()));
         let (_a1, a2, b2, b3) = setup_fork(&app, &storage).await;
         persist_certificate(&storage, &certificate(2, a2.header.block_hash, 3));
-        let r = rig(FloorMode::Observed, manager_over(&storage), app.clone());
+        let r = rig(
+            &storage,
+            FloorMode::Observed,
+            manager_over(&storage),
+            app.clone(),
+        )
+        .await;
         assert_eq!(
             r.verifier.boot_check().await,
             FloorTick::Verified {
@@ -1293,7 +1577,13 @@ mod tests {
         let app = Arc::new(CanonicalApplicator::new(exec, storage.clone()));
         let (_a1, a2, b2, b3) = setup_fork(&app, &storage).await; // tip a2
         persist_certificate(&storage, &certificate(2, b2.header.block_hash, 3));
-        let r = rig(FloorMode::Enforced, manager_over(&storage), app.clone());
+        let r = rig(
+            &storage,
+            FloorMode::Enforced,
+            manager_over(&storage),
+            app.clone(),
+        )
+        .await;
         let halted = HaltReason::Mismatch {
             height: 2,
             certified: b2.header.block_hash,
@@ -1369,12 +1659,19 @@ mod tests {
         let (_a1, a2, _b2, b3) = setup_fork(&app, &storage).await; // tip a2
         persist_certificate(&storage, &certificate(2, a2.header.block_hash, 3));
         let above: u64 = 300;
+        // Blocks this node has stored (headers held) but not applied yet: the
+        // boot check derives each certificate's committee from its header.
         for h in 3..3 + above {
-            let mut x = [0xEE; 32];
-            x[..8].copy_from_slice(&h.to_be_bytes());
-            persist_certificate(&storage, &certificate(h, Hash::new(x), 3));
+            let blk = stored_unapplied(&storage, h);
+            persist_certificate(&storage, &certificate(h, blk, 3));
         }
-        let r = rig(FloorMode::Enforced, manager_over(&storage), app.clone());
+        let r = rig(
+            &storage,
+            FloorMode::Enforced,
+            manager_over(&storage),
+            app.clone(),
+        )
+        .await;
         assert_eq!(
             r.verifier.boot_check().await,
             FloorTick::Waiting {
@@ -1407,7 +1704,7 @@ mod tests {
         let app = Arc::new(CanonicalApplicator::new(exec, storage.clone()));
         let (_a1, a2, _b2, _b3) = setup_fork(&app, &storage).await;
         persist_certificate(&storage, &certificate(2, a2.header.block_hash, 2));
-        let r = rig(FloorMode::Enforced, manager_over(&storage), app);
+        let r = rig(&storage, FloorMode::Enforced, manager_over(&storage), app).await;
         let first = r.verifier.boot_check().await;
         assert!(
             matches!(
@@ -1435,8 +1732,9 @@ mod tests {
         let (exec, storage, _dir) = fresh();
         let app = Arc::new(CanonicalApplicator::new(exec, storage.clone()));
         let _ = setup_fork(&app, &storage).await; // tip @ 2
-        persist_certificate(&storage, &certificate(4, Hash::new([4; 32]), 3));
-        let r = rig(FloorMode::Enforced, manager_over(&storage), app);
+        let b4 = stored_unapplied(&storage, 4);
+        persist_certificate(&storage, &certificate(4, b4, 3));
+        let r = rig(&storage, FloorMode::Enforced, manager_over(&storage), app).await;
         assert_eq!(
             r.verifier.boot_check().await,
             FloorTick::Waiting {
@@ -1447,5 +1745,130 @@ mod tests {
         assert!(!r.gadget.halted());
         assert_eq!(load(&r.floor), 0);
         assert_eq!(load(&r.verified), 0);
+    }
+
+    /// A4 at the unit level (review of #332 @ 354908b): a stored certificate
+    /// that is internally consistent — four outsider keys, every signature
+    /// valid, quorum reached — but whose committee is not the one this node
+    /// derives for the height (epoch snapshot + the block's VRF beacon) halts
+    /// at boot as an invalid certificate; the floor is not raised from it.
+    #[tokio::test]
+    async fn stored_certificate_with_a_foreign_committee_halts_at_boot() {
+        let (exec, storage, _dir) = fresh();
+        let app = Arc::new(CanonicalApplicator::new(exec, storage.clone()));
+        let (_a1, a2, _b2, _b3) = setup_fork(&app, &storage).await;
+        let h = a2.header.block_hash;
+        let outsiders: Vec<Ed25519SigningKey> = (20..24u8).map(signer).collect();
+        let committee: Vec<PublicKey> = outsiders
+            .iter()
+            .map(|k| PublicKey::new(k.verifying_key().to_bytes()))
+            .collect();
+        let mut votes = HashMap::new();
+        for k in &outsiders {
+            let v = sign_checkpoint_vote(CHAIN, 2, h, k);
+            votes.insert(v.voter, v.signature);
+        }
+        let foreign = Checkpoint {
+            height: 2,
+            block_hash: h,
+            committee,
+            votes,
+            status: CheckpointStatus::Finalized,
+        };
+        foreign
+            .verify_certificate(CHAIN)
+            .expect("internally consistent");
+        persist_certificate(&storage, &foreign);
+        let r = rig(
+            &storage,
+            FloorMode::Enforced,
+            manager_over(&storage),
+            app.clone(),
+        )
+        .await;
+        let boot = r.verifier.boot_check().await;
+        assert!(
+            matches!(
+                &boot,
+                FloorTick::Halted(HaltReason::InvalidCertificate { height: 2, reason, .. })
+                    if reason.contains("recorded committee")
+            ),
+            "{boot:?}"
+        );
+        assert!(r.gadget.halted());
+        assert_eq!(load(&r.floor), 0, "never raised from it");
+        assert!(app.certified_pending().is_empty(), "never registered");
+        // The finalization-time check applies the same rule.
+        let r2 = rig(
+            &storage,
+            FloorMode::Enforced,
+            manager_over(&storage),
+            app.clone(),
+        )
+        .await;
+        assert!(matches!(
+            r2.verifier.on_finalize(&foreign).await,
+            Some(FloorTick::Halted(HaltReason::InvalidCertificate {
+                height: 2,
+                ..
+            }))
+        ));
+        assert_eq!(load(&r2.floor), 0);
+    }
+
+    /// A stored certificate whose committee cannot be derived here (the
+    /// certified block's header is not held) is not used and not trusted: at
+    /// boot it is neither registered nor allowed to halt; the poll reports it
+    /// as unverifiable. At finalization (which cannot be vetoed) it pauses
+    /// finality instead of running unprotected.
+    #[tokio::test]
+    async fn certificate_whose_committee_cannot_be_derived_is_not_used() {
+        let (exec, storage, _dir) = fresh();
+        let app = Arc::new(CanonicalApplicator::new(exec, storage.clone()));
+        let _ = setup_fork(&app, &storage).await; // tip @ 2
+        let unknown = Hash::new([4; 32]);
+        persist_certificate(&storage, &certificate(4, unknown, 3));
+        let r = rig(
+            &storage,
+            FloorMode::Enforced,
+            manager_over(&storage),
+            app.clone(),
+        )
+        .await;
+        let boot = r.verifier.boot_check().await;
+        assert!(
+            matches!(&boot, FloorTick::Unverifiable(why) if why.contains("not stored")),
+            "{boot:?}"
+        );
+        assert!(!r.gadget.halted());
+        assert_eq!(load(&r.floor), 0);
+        assert!(app.certified_pending().is_empty(), "not registered");
+        // A node without the governing snapshot cannot derive it either.
+        let (exec, storage2, _dir2) = fresh();
+        let app2 = Arc::new(CanonicalApplicator::new(exec, storage2.clone()));
+        let (_a1, a2, _b2, _b3) = setup_fork(&app2, &storage2).await;
+        let mgr = manager_over(&storage2);
+        let gadget = Arc::new(FinalityGadget::with_switch(mgr.clone(), None, true));
+        let v = FloorVerifier::new(
+            FloorMode::Enforced,
+            mgr,
+            app2.clone(),
+            gadget.safety_stop(),
+            Arc::new(AtomicU64::new(0)),
+            CertificateCommittees::new(gadget.clone(), storage2.clone()),
+        );
+        let out = v
+            .on_finalize(&certificate(2, a2.header.block_hash, 3))
+            .await;
+        assert!(
+            matches!(
+                &out,
+                Some(FloorTick::Halted(HaltReason::Unconfirmed { height: 2, reason, .. }))
+                    if reason.contains("snapshot")
+            ),
+            "{out:?}"
+        );
+        assert!(gadget.halted(), "paused, not unprotected");
+        assert_eq!(app2.finalized_height_handle().load(Ordering::SeqCst), 0);
     }
 }
