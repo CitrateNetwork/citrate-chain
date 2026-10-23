@@ -206,6 +206,23 @@ async fn assemble(
     cfg: CheckpointConfig,
     known: Vec<Block>,
 ) -> (TestNode, FloorTick) {
+    let kv: Arc<dyn KvStore> = Arc::new(RocksDbKvStore::new(storage.db.clone()));
+    assemble_with(exec, storage, dir, key, vals, cfg, known, kv).await
+}
+
+/// [`assemble`] with the manager's persistent store given explicitly (a fault
+/// seam over the node's RocksDB, see [`FaultyCertKv`]).
+#[allow(clippy::too_many_arguments)]
+async fn assemble_with(
+    exec: Arc<Executor>,
+    storage: Arc<StorageManager>,
+    dir: tempfile::TempDir,
+    key: Ed25519SigningKey,
+    vals: &Validators,
+    cfg: CheckpointConfig,
+    known: Vec<Block>,
+    kv: Arc<dyn KvStore>,
+) -> (TestNode, FloorTick) {
     let head = Arc::new(parking_lot::Mutex::new(None));
     let app = Arc::new(
         CanonicalApplicator::new(exec.clone(), storage.clone()).with_fork_choice_cell(head.clone()),
@@ -219,11 +236,7 @@ async fn assemble(
     for (snap, set) in &vals.later {
         sel.sync_active_set_at(*snap, set.clone(), 1).await;
     }
-    let mgr = Arc::new(CheckpointManager::with_persistence(
-        cfg,
-        dag.clone(),
-        Arc::new(RocksDbKvStore::new(storage.db.clone())),
-    ));
+    let mgr = Arc::new(CheckpointManager::with_persistence(cfg, dag.clone(), kv));
     let gadget = Arc::new(FinalityGadget::with_switch(
         mgr.clone(),
         Some(Arc::new(sel)),
@@ -1672,6 +1685,409 @@ async fn s2_guarded_certificate_survives_a_same_hash_re_proposal_and_a_restart()
             .await
             .expect("recovery call returns"),
         "S2: the finalized block must not be abandoned after a restart"
+    );
+    assert_eq!(node.app.applied_tip().await.hash, hash_at(&a, 8));
+}
+
+// ---------------------------------------------------------------------------
+// S2 certificate durability (follow-up to #335): the certificate is written
+// with a synced write BEFORE the guard raises the floor and before anything is
+// published; a failed write raises no floor and publishes nothing.
+// ---------------------------------------------------------------------------
+
+/// Fault seam over the node's real RocksDB store: every write of a certificate
+/// record (`DAG_METADATA` `checkpoint:{height}`) fails while `failing` is set,
+/// as a failed write or a failed fsync would; every other record (blocks, the
+/// signed-vote record, ...) goes straight to RocksDB.
+struct FaultyCertKv {
+    inner: RocksDbKvStore,
+    failing: std::sync::atomic::AtomicBool,
+    failed: AtomicU64,
+}
+
+impl FaultyCertKv {
+    fn new(storage: &StorageManager, failing: bool) -> Arc<Self> {
+        Arc::new(Self {
+            inner: RocksDbKvStore::new(storage.db.clone()),
+            failing: std::sync::atomic::AtomicBool::new(failing),
+            failed: AtomicU64::new(0),
+        })
+    }
+
+    fn heal(&self) {
+        self.failing.store(false, Ordering::SeqCst);
+    }
+
+    fn check(&self, cf_name: &str, key: &[u8]) -> Result<(), String> {
+        if cf_name == cf::DAG_METADATA
+            && key.starts_with(b"checkpoint:")
+            && self.failing.load(Ordering::SeqCst)
+        {
+            self.failed.fetch_add(1, Ordering::SeqCst);
+            return Err("injected: fsync failed (EIO)".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl KvStore for FaultyCertKv {
+    fn kv_get(&self, cf_name: &str, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        self.inner.kv_get(cf_name, key)
+    }
+    fn kv_put(&self, cf_name: &str, key: &[u8], value: &[u8]) -> Result<(), String> {
+        self.check(cf_name, key)?;
+        self.inner.kv_put(cf_name, key, value)
+    }
+    fn kv_put_durable(&self, cf_name: &str, key: &[u8], value: &[u8]) -> Result<(), String> {
+        self.check(cf_name, key)?;
+        self.inner.kv_put_durable(cf_name, key, value)
+    }
+    fn kv_delete(&self, cf_name: &str, key: &[u8]) -> Result<(), String> {
+        self.inner.kv_delete(cf_name, key)
+    }
+    fn kv_exists(&self, cf_name: &str, key: &[u8]) -> Result<bool, String> {
+        self.inner.kv_exists(cf_name, key)
+    }
+    fn kv_iter_cf(&self, cf_name: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+        self.inner.kv_iter_cf(cf_name)
+    }
+    fn kv_write_batch(&self, ops: &[citrate_consensus::dag_store::KvOp]) -> Result<(), String> {
+        for op in ops {
+            if let citrate_consensus::dag_store::KvOp::Put { cf, key, .. } = op {
+                self.check(cf, key)?;
+            }
+        }
+        self.inner.kv_write_batch(ops)
+    }
+}
+
+/// S2 durability, fault injection (TLA+ Finalize does not fire when its
+/// certificate cannot be persisted). Real wiring: the Enforced verifier is the
+/// manager's guard, over the node's RocksDB with the certificate writes failing.
+/// The quorum vote arrives through the gadget's inbound path; the failed write
+/// surfaces there as `FinalizeFailed`, and NOTHING advances: no floor, no
+/// finalized/safe RPC pair, no latest finalized height, no certificate on disk,
+/// no safety stop, and the poll finds nothing either. A restart in that state
+/// boots with nothing finalized. Once the store recovers, the retry finalizes
+/// the same certificate and the floor, the RPC pair and a restart all agree.
+#[tokio::test]
+async fn s2_certificate_write_failure_raises_no_floor_and_publishes_nothing() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let committee: Vec<PublicKey> = keys.iter().map(pk).collect();
+    let cfg = config(100);
+    let (exec, storage, dir) = fresh();
+    let fault = FaultyCertKv::new(&storage, true);
+    let (mut node, boot) = assemble_with(
+        exec,
+        storage,
+        dir,
+        key(0),
+        &vals,
+        cfg.clone(),
+        Vec::new(),
+        fault.clone(),
+    )
+    .await;
+    assert_eq!(boot, FloorTick::NoCertificate);
+    let a = chains.main(8);
+    node.follow(&a).await;
+    let h4 = hash_at(&a, 4);
+    let mgr = node.mgr().clone();
+    mgr.ensure_proposed(4, h4, committee.clone())
+        .await
+        .expect("propose");
+    for k in keys.iter().take(2) {
+        mgr.submit_vote(sign_checkpoint_vote(CHAIN, 4, h4, k))
+            .await
+            .expect("vote");
+    }
+    let third = keys.get(2).expect("key 2");
+    let out = node
+        .gadget
+        .on_inbound_vote(sign_checkpoint_vote(CHAIN, 4, h4, third))
+        .await;
+    assert!(
+        matches!(
+            &out,
+            InboundOutcome::FinalizeFailed {
+                height: 4,
+                error: CheckpointError::StorageError(_),
+                ..
+            }
+        ),
+        "the failed certificate write must surface (fail-closed), got {out:?}"
+    );
+    assert!(fault.failed.load(Ordering::SeqCst) >= 1);
+    assert_eq!(
+        node.floor(),
+        0,
+        "the floor must not move without a durable certificate"
+    );
+    assert_eq!(node.rpc_finalized(), FinalizedAnchor::GENESIS);
+    assert_eq!(node.finalized().await, 0);
+    assert!(!mgr.is_certificate_persisted(4, &h4));
+    assert!(
+        !node.gadget.halted(),
+        "a storage fault is not a safety stop"
+    );
+    assert_eq!(node.tick().await, FloorTick::NoCertificate);
+    assert_eq!(node.floor(), 0);
+    assert_eq!(node.rpc_finalized(), FinalizedAnchor::GENESIS);
+    assert_eq!(mgr.pending_vote_count(4).await, Some(3), "votes kept");
+
+    // The store recovers; the retry finalizes the same certificate.
+    fault.heal();
+    let cp = mgr.finalize_checkpoint(4).await.expect("retry finalizes");
+    assert_eq!((cp.height, cp.block_hash, cp.votes.len()), (4, h4, 3));
+    assert!(mgr.is_certificate_persisted(4, &h4));
+    assert_eq!(node.floor(), 4);
+    assert_eq!(
+        node.rpc_finalized(),
+        FinalizedAnchor {
+            height: 4,
+            hash: Some(h4)
+        }
+    );
+    let (node, boot) = node.restart(&vals, cfg).await;
+    assert_eq!(boot, verified(4));
+    assert_eq!(node.floor(), 4);
+}
+
+/// S2 durability, ordering: when the guard raises the floor, the certificate is
+/// ALREADY on disk through a synced write. The guard is parked inside its floor
+/// check (the test holds the applicator's advance lock); at that instant the
+/// floor has not moved, nothing is published, the certificate record is in
+/// RocksDB and the store's synced-write counter has advanced.
+#[tokio::test]
+async fn s2_certificate_is_synced_to_disk_before_the_guard_raises_the_floor() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let committee: Vec<PublicKey> = keys.iter().map(pk).collect();
+    let mut node = TestNode::boot(key(0), &vals, config(100)).await;
+    let a = chains.main(8);
+    node.follow(&a).await;
+    let h4 = hash_at(&a, 4);
+    let mgr = node.mgr().clone();
+    mgr.ensure_proposed(4, h4, committee)
+        .await
+        .expect("propose");
+    for k in keys.iter().take(3) {
+        mgr.submit_vote(sign_checkpoint_vote(CHAIN, 4, h4, k))
+            .await
+            .expect("vote");
+    }
+    let synced_before = node.storage.db.write_batch_sync_count();
+
+    let advance = node.app.advance_lock();
+    let held = advance.lock().await;
+    let task = tokio::spawn({
+        let mgr = mgr.clone();
+        async move { mgr.finalize_checkpoint(4).await }
+    });
+    let mut spins = 0u32;
+    while !node.app.certified_pending().contains(&(4, h4)) {
+        spins += 1;
+        assert!(spins < 100_000, "guard never reached its floor check");
+        tokio::task::yield_now().await;
+    }
+    // Inside the guard, before the floor is raised.
+    assert_eq!(node.floor(), 0);
+    assert_eq!(node.rpc_finalized(), FinalizedAnchor::GENESIS);
+    assert!(
+        mgr.is_certificate_persisted(4, &h4),
+        "the certificate must be on disk before the floor is raised"
+    );
+    assert!(
+        node.storage.db.write_batch_sync_count() > synced_before,
+        "the certificate write must be synced (fsync), not a plain buffered put"
+    );
+    drop(held);
+    let cp = task.await.expect("task").expect("finalize");
+    assert_eq!((cp.height, cp.block_hash), (4, h4));
+    assert_eq!(node.floor(), 4);
+    assert_eq!(
+        node.rpc_finalized(),
+        FinalizedAnchor {
+            height: 4,
+            hash: Some(h4)
+        }
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S2 durability across a process kill (TLA+ Restart after Finalize). A CHILD
+// process (this test binary re-invoked) finalizes A4 over a RocksDB directory
+// through the real wiring, waits until the finalized/safe pair names A4, prints
+// a marker and blocks; the parent SIGKILLs it (no destructors, no flush, no
+// RocksDB close) and reopens the directory: the certificate is on disk, the
+// boot check restores the floor from it, the RPC pair names A4, and a rebuild
+// abandoning A4 is refused. Run process-kill tests under
+// `unshare --user --map-root-user --pid --fork --mount-proc`.
+// ---------------------------------------------------------------------------
+
+const C362_PARENT: &str = "C362_CHILD_PARENT";
+const C362_MARK: &str = "C362_PUBLISHED dir=";
+
+/// Child entry point (a no-op unless `C362_CHILD_PARENT` is set).
+#[tokio::test]
+async fn s2_cert_kill_child() {
+    let Ok(parent) = std::env::var(C362_PARENT) else {
+        return;
+    };
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let committee: Vec<PublicKey> = keys.iter().map(pk).collect();
+    // The data directory lives under the parent's temp dir; the parent removes
+    // it (this process is killed, so its own TempDir is never dropped).
+    let dir = tempfile::Builder::new()
+        .prefix("node-")
+        .tempdir_in(&parent)
+        .expect("child data dir");
+    let storage = Arc::new(
+        StorageManager::new(
+            dir.path(),
+            citrate_storage::pruning::PruningConfig::default(),
+        )
+        .expect("storage"),
+    );
+    let exec = Arc::new(Executor::new(Arc::new(citrate_execution::StateDB::new())));
+    let path = dir.path().to_path_buf();
+    let (mut node, boot) =
+        assemble(exec, storage, dir, key(0), &vals, config(100), Vec::new()).await;
+    assert_eq!(boot, FloorTick::NoCertificate);
+    let a = chains.main(8);
+    node.follow(&a).await;
+    for blk in &chains.branch(&a, 3, 10, VRF_B) {
+        node.import(blk).await;
+    }
+    let h4 = hash_at(&a, 4);
+    let mgr = node.mgr().clone();
+    mgr.ensure_proposed(4, h4, committee)
+        .await
+        .expect("propose");
+    for k in keys.iter().take(3) {
+        mgr.submit_vote(sign_checkpoint_vote(CHAIN, 4, h4, k))
+            .await
+            .expect("vote");
+    }
+    mgr.finalize_checkpoint(4).await.expect("finalize");
+    assert_eq!(
+        node.rpc_finalized(),
+        FinalizedAnchor {
+            height: 4,
+            hash: Some(h4)
+        },
+        "published"
+    );
+    {
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "{C362_MARK}{}", path.display()).expect("marker");
+        out.flush().expect("flush");
+    }
+    // Wait to be killed; never return (a return would drop the store cleanly).
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+#[tokio::test]
+async fn s2_certificate_survives_a_kill_after_publication() {
+    if std::env::var(C362_PARENT).is_ok() {
+        return;
+    }
+    use std::io::BufRead as _;
+    let parent = tempfile::tempdir().expect("parent dir");
+    let exe = std::env::current_exe().expect("exe");
+    let mut child = std::process::Command::new(exe)
+        .args([
+            "finality_adversarial_tests::s2_cert_kill_child",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(C362_PARENT, parent.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn child");
+    let stdout = child.stdout.take().expect("child stdout");
+    let mut data_dir = None;
+    for line in std::io::BufReader::new(stdout).lines() {
+        let line = line.expect("child stdout line");
+        if let Some(p) = line.split(C362_MARK).nth(1) {
+            data_dir = Some(std::path::PathBuf::from(p.trim()));
+            break;
+        }
+    }
+    let Some(data_dir) = data_dir else {
+        let out = child.wait_with_output().expect("child output");
+        panic!(
+            "child never published: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    child.kill().expect("SIGKILL the child");
+    let status = child.wait().expect("reap child");
+    assert!(
+        !status.success(),
+        "the child was killed, not exited: {status}"
+    );
+
+    // Reopen the killed node's directory as a restart does.
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let a = chains.main(8);
+    let b = chains.branch(&a, 3, 10, VRF_B);
+    let h4 = hash_at(&a, 4);
+    let storage = Arc::new(
+        StorageManager::new(
+            &data_dir,
+            citrate_storage::pruning::PruningConfig::default(),
+        )
+        .expect("reopen storage"),
+    );
+    let exec = Arc::new(Executor::new(Arc::new(citrate_execution::StateDB::new())));
+    let genesis_state = exec.state_snapshot();
+    let placeholder = tempfile::tempdir().expect("placeholder dir");
+    let (node, boot) = assemble(
+        exec,
+        storage,
+        placeholder,
+        key(0),
+        &vals,
+        config(100),
+        Vec::new(),
+    )
+    .await;
+    assert!(
+        node.mgr().is_certificate_persisted(4, &h4),
+        "the certificate published before the kill must be on disk"
+    );
+    let stored = node.mgr().get_checkpoint(4).await.expect("reloaded");
+    assert!(stored.verify_certificate(CHAIN).is_ok());
+    assert_eq!(boot, verified(4), "boot restores the floor from it");
+    assert_eq!(node.floor(), 4);
+    assert_eq!(
+        node.rpc_finalized(),
+        FinalizedAnchor {
+            height: 4,
+            hash: Some(h4)
+        }
+    );
+    *node.head.lock() = Some(hash_at(&b, 10));
+    assert!(
+        !node
+            .app
+            .recover_to_head(genesis_state, Hash::default())
+            .await
+            .expect("recovery call returns"),
+        "S2: a block published as finalized before the kill must not be abandoned"
     );
     assert_eq!(node.app.applied_tip().await.hash, hash_at(&a, 8));
 }

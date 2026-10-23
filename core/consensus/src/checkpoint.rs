@@ -1905,6 +1905,336 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Certificate durability (follow-up to #335): the certificate is written
+    // with a synced write BEFORE the guard raises the floor and before the
+    // finalization is visible; a failed write finalizes nothing.
+    // -----------------------------------------------------------------------
+
+    /// In-memory store with a fault seam on the certificate records
+    /// (`DAG_METADATA` `checkpoint:{height}`): the first `allow_cert_writes`
+    /// certificate writes succeed, every later one fails, as a failed write or a
+    /// failed fsync would. Counts which path each certificate write took.
+    struct FaultKv {
+        map: std::sync::Mutex<HashMap<(String, Vec<u8>), Vec<u8>>>,
+        allow_cert_writes: std::sync::atomic::AtomicUsize,
+        durable_cert_writes: std::sync::atomic::AtomicUsize,
+        plain_cert_writes: std::sync::atomic::AtomicUsize,
+        failed_cert_writes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FaultKv {
+        fn new(allow_cert_writes: usize) -> Arc<Self> {
+            Arc::new(Self {
+                map: std::sync::Mutex::new(HashMap::new()),
+                allow_cert_writes: std::sync::atomic::AtomicUsize::new(allow_cert_writes),
+                durable_cert_writes: std::sync::atomic::AtomicUsize::new(0),
+                plain_cert_writes: std::sync::atomic::AtomicUsize::new(0),
+                failed_cert_writes: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn heal(&self) {
+            self.allow_cert_writes
+                .store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn load(c: &std::sync::atomic::AtomicUsize) -> usize {
+            c.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn is_cert(cf_name: &str, key: &[u8]) -> bool {
+            cf_name == cf::DAG_METADATA && key.starts_with(b"checkpoint:")
+        }
+
+        /// The fault seam: `Err` once the allowance is spent.
+        fn admit_cert_write(&self) -> Result<(), String> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let ok = self
+                .allow_cert_writes
+                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            if ok {
+                Ok(())
+            } else {
+                self.failed_cert_writes.fetch_add(1, SeqCst);
+                Err("injected: fsync failed (EIO)".to_string())
+            }
+        }
+
+        fn insert(&self, cf_name: &str, key: &[u8], value: &[u8]) {
+            self.map
+                .lock()
+                .expect("fault kv lock")
+                .insert((cf_name.to_string(), key.to_vec()), value.to_vec());
+        }
+    }
+
+    impl KvStore for FaultKv {
+        fn kv_get(&self, cf_name: &str, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+            Ok(self
+                .map
+                .lock()
+                .expect("fault kv lock")
+                .get(&(cf_name.to_string(), key.to_vec()))
+                .cloned())
+        }
+
+        fn kv_put(&self, cf_name: &str, key: &[u8], value: &[u8]) -> Result<(), String> {
+            if Self::is_cert(cf_name, key) {
+                self.plain_cert_writes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.admit_cert_write()?;
+            }
+            self.insert(cf_name, key, value);
+            Ok(())
+        }
+
+        fn kv_put_durable(&self, cf_name: &str, key: &[u8], value: &[u8]) -> Result<(), String> {
+            if Self::is_cert(cf_name, key) {
+                self.durable_cert_writes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.admit_cert_write()?;
+            }
+            self.insert(cf_name, key, value);
+            Ok(())
+        }
+
+        fn kv_delete(&self, cf_name: &str, key: &[u8]) -> Result<(), String> {
+            self.map
+                .lock()
+                .expect("fault kv lock")
+                .remove(&(cf_name.to_string(), key.to_vec()));
+            Ok(())
+        }
+
+        fn kv_exists(&self, cf_name: &str, key: &[u8]) -> Result<bool, String> {
+            Ok(self.kv_get(cf_name, key)?.is_some())
+        }
+
+        fn kv_iter_cf(&self, cf_name: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+            Ok(self
+                .map
+                .lock()
+                .expect("fault kv lock")
+                .iter()
+                .filter(|((c, _), _)| c == cf_name)
+                .map(|((_, k), v)| (k.clone(), v.clone()))
+                .collect())
+        }
+    }
+
+    /// The stored certificate record at `height`, as a restart would load it.
+    fn stored_certificate(kv: &FaultKv, height: u64) -> Option<Checkpoint> {
+        kv.kv_get(cf::DAG_METADATA, format!("checkpoint:{height}").as_bytes())
+            .expect("read")
+            .map(|b| bincode::deserialize::<Checkpoint>(&b).expect("decode"))
+    }
+
+    /// A persistent manager over `kv` with a probe guard and a 4-member
+    /// committee proposed at height 5 holding 3 votes (quorum).
+    async fn durable_guarded(
+        kv: Arc<FaultKv>,
+    ) -> (Arc<CheckpointManager>, Arc<ProbeGuard>, Arc<DagStore>, Hash) {
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let blocks = build_chain(&dag, 6).await;
+        let mgr = Arc::new(CheckpointManager::with_persistence(
+            CheckpointConfig::for_testing(),
+            dag.clone(),
+            kv,
+        ));
+        let probe = Arc::new(ProbeGuard::default());
+        *probe.mgr.lock().expect("probe lock") = Some(Arc::downgrade(&mgr));
+        assert!(mgr.install_finalization_guard(probe.clone()));
+        let b5 = blocks.get(5).expect("block 5").hash();
+        let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+        mgr.ensure_proposed(5, b5, committee)
+            .await
+            .expect("propose");
+        for i in 0..3u8 {
+            mgr.submit_vote(make_signed_vote(i, 5, &b5))
+                .await
+                .expect("vote");
+        }
+        (mgr, probe, dag, b5)
+    }
+
+    /// Fault injection, guarded (Enforced) path: the certificate write fails.
+    /// Nothing advances — the guard (which raises the floor) never runs, the
+    /// post-finalization hook (which publishes) never runs, the latest finalized
+    /// height, the in-memory record and the DAG mark are unchanged — and the
+    /// error surfaces. The votes stay pending; once the store recovers the same
+    /// certificate finalizes and is on disk before the guard sees it.
+    #[tokio::test]
+    async fn certificate_write_failure_finalizes_nothing_and_never_runs_the_guard() {
+        let kv = FaultKv::new(0);
+        let (mgr, probe, dag, b5) = durable_guarded(kv.clone()).await;
+
+        let r = mgr.finalize_checkpoint(5).await;
+        assert!(
+            matches!(&r, Err(CheckpointError::StorageError(_))),
+            "a failed certificate write must surface, got {r:?}"
+        );
+        assert_eq!(FaultKv::load(&kv.failed_cert_writes), 1);
+        assert!(
+            probe.seen.lock().expect("probe lock").is_empty(),
+            "the guard (floor raise) must not run on an unpersisted certificate"
+        );
+        assert!(
+            probe.after.lock().expect("probe lock").is_empty(),
+            "nothing may be published"
+        );
+        assert_eq!(mgr.latest_finalized_height().await, 0);
+        assert!(mgr.get_checkpoint(5).await.is_none());
+        assert!(!mgr.is_certificate_persisted(5, &b5));
+        assert!(!dag.is_finalized(&b5).await, "block not marked finalized");
+        assert_eq!(mgr.pending_vote_count(5).await, Some(3), "votes kept");
+
+        // The store recovers: the retry finalizes the same certificate, written
+        // before the guard ran.
+        kv.heal();
+        let cp = mgr
+            .finalize_checkpoint(5)
+            .await
+            .expect("finalize after heal");
+        assert_eq!((cp.height, cp.block_hash, cp.votes.len()), (5, b5, 3));
+        assert_eq!(
+            probe.seen.lock().expect("probe lock").as_slice(),
+            &[(5, b5, 0, true)],
+            "the guard sees the certificate already on disk, nothing visible yet"
+        );
+        assert_eq!(
+            probe.after.lock().expect("probe lock").as_slice(),
+            &[(5, b5, 5, true, true)]
+        );
+        assert_eq!(mgr.latest_finalized_height().await, 5);
+        assert!(dag.is_finalized(&b5).await);
+        let stored = stored_certificate(&kv, 5).expect("on disk");
+        assert_eq!(stored.status, CheckpointStatus::Finalized);
+        assert_eq!(stored.votes.len(), 3);
+    }
+
+    /// Fault injection, unguarded (Legacy / Observed) path: same fail-closed
+    /// contract — no visible finalization, the checkpoint stays pending with its
+    /// votes, and a retry after recovery finalizes it.
+    #[tokio::test]
+    async fn certificate_write_failure_without_a_guard_finalizes_nothing() {
+        let kv = FaultKv::new(0);
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let blocks = build_chain(&dag, 6).await;
+        let mgr = CheckpointManager::with_persistence(
+            CheckpointConfig::for_testing(),
+            dag.clone(),
+            kv.clone(),
+        );
+        let b5 = blocks.get(5).expect("block 5").hash();
+        mgr.ensure_proposed(5, b5, (0..4).map(make_pubkey).collect())
+            .await
+            .expect("propose");
+        for i in 0..3u8 {
+            mgr.submit_vote(make_signed_vote(i, 5, &b5))
+                .await
+                .expect("vote");
+        }
+        let r = mgr.finalize_checkpoint(5).await;
+        assert!(
+            matches!(&r, Err(CheckpointError::StorageError(_))),
+            "a failed certificate write must surface, got {r:?}"
+        );
+        assert_eq!(mgr.latest_finalized_height().await, 0);
+        assert!(mgr.get_checkpoint(5).await.is_none());
+        assert!(!dag.is_finalized(&b5).await);
+        assert_eq!(mgr.pending_vote_count(5).await, Some(3), "votes kept");
+        assert_eq!(
+            mgr.checkpoint_status(5).await,
+            Some(CheckpointStatus::Pending)
+        );
+        kv.heal();
+        let cp = mgr
+            .finalize_checkpoint(5)
+            .await
+            .expect("finalize after heal");
+        assert_eq!(cp.votes.len(), 3);
+        assert_eq!(mgr.latest_finalized_height().await, 5);
+        assert!(mgr.is_certificate_persisted(5, &b5));
+    }
+
+    /// Every certificate write goes through the durable (synced) path; the
+    /// plain, unsynced `kv_put` is never used for a certificate.
+    #[tokio::test]
+    async fn certificate_is_written_only_through_the_durable_path() {
+        let kv = FaultKv::new(usize::MAX);
+        let (mgr, _probe, _dag, b5) = durable_guarded(kv.clone()).await;
+        mgr.finalize_checkpoint(5).await.expect("finalize");
+        assert!(mgr.is_certificate_persisted(5, &b5));
+        assert_eq!(
+            FaultKv::load(&kv.plain_cert_writes),
+            0,
+            "a certificate must never be written with the unsynced kv_put"
+        );
+        assert_eq!(FaultKv::load(&kv.durable_cert_writes), 1);
+    }
+
+    /// The guard ran on a durable 3-vote certificate; the pending entry that
+    /// replaced it extends it with a 4th vote, but writing that extension fails.
+    /// The finalization must fall back to the guarded certificate already on
+    /// disk: memory and disk agree, and the call still succeeds (the floor the
+    /// guard raised has its persisted certificate).
+    #[tokio::test]
+    async fn extension_write_failure_keeps_the_durable_guarded_certificate() {
+        let kv = FaultKv::new(1);
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let blocks = build_chain(&dag, 6).await;
+        let mgr = Arc::new(CheckpointManager::with_persistence(
+            CheckpointConfig::for_testing(),
+            dag,
+            kv.clone(),
+        ));
+        let gate = Arc::new(GateGuard::default());
+        assert!(mgr.install_finalization_guard(gate.clone()));
+        let b5 = blocks.get(5).expect("block 5").hash();
+        let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+        mgr.ensure_proposed(5, b5, committee.clone())
+            .await
+            .expect("propose");
+        for i in 0..3u8 {
+            mgr.submit_vote(make_signed_vote(i, 5, &b5))
+                .await
+                .expect("vote");
+        }
+        let task = tokio::spawn({
+            let mgr = mgr.clone();
+            async move { mgr.finalize_checkpoint(5).await }
+        });
+        gate.entered.notified().await;
+        // The 4th vote lands on the pending entry while the guard runs.
+        mgr.submit_vote(make_signed_vote(3, 5, &b5))
+            .await
+            .expect("4th vote");
+        gate.release.notify_one();
+        let cp = task.await.expect("task");
+        assert!(cp.is_ok(), "{cp:?}");
+        let cp = cp.expect("checked above");
+        assert_eq!(
+            FaultKv::load(&kv.failed_cert_writes),
+            1,
+            "extension write failed"
+        );
+        assert_eq!(
+            cp.votes.len(),
+            3,
+            "the durable guarded certificate is finalized, not the unpersisted extension"
+        );
+        let stored = stored_certificate(&kv, 5).expect("guarded certificate on disk");
+        assert_eq!(stored.votes.len(), 3);
+        assert_eq!(
+            mgr.get_checkpoint(5).await.expect("recorded").votes.len(),
+            3,
+            "memory and disk agree"
+        );
+        assert_eq!(mgr.latest_finalized_height().await, 5);
+    }
+
     /// Stage 1a §11.9: the pending map is capped; the lowest height is evicted.
     #[tokio::test]
     async fn ensure_proposed_evicts_oldest_beyond_cap() {

@@ -48,6 +48,23 @@ pub trait KvStore: Send + Sync {
         }
         Ok(())
     }
+
+    /// Write one value DURABLY: on `Ok` the write has reached stable storage
+    /// (fsync), so neither a process crash nor a host power loss can drop it.
+    /// For records whose loss would regress finality — the finalized checkpoint
+    /// certificate is written with this before the finalization is visible.
+    ///
+    /// The default is a one-op [`Self::kv_write_batch`], which the RocksDB
+    /// adapter commits with `sync = true` (`RocksDB::write_batch_sync`). An
+    /// in-memory test store has nothing to sync. On `Err` the caller must treat
+    /// the record as NOT written.
+    fn kv_put_durable(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), String> {
+        self.kv_write_batch(&[KvOp::Put {
+            cf: cf.to_string(),
+            key: key.to_vec(),
+            value: value.to_vec(),
+        }])
+    }
 }
 
 /// Single operation inside a [`KvStore::kv_write_batch`] payload.
