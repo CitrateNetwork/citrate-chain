@@ -298,7 +298,7 @@ fn latest_to_latest_under_concurrent_apply_is_never_empty() {
                 // apply followed by a one-block rewind.
                 let (h, n) = tips[i % tips.len()];
                 storage.blocks.put_applied_tip(&h, n).expect("applied tip");
-                i = if writes % 2 == 0 {
+                i = if writes.is_multiple_of(2) {
                     i + 2
                 } else {
                     i.saturating_sub(1)
@@ -409,5 +409,67 @@ fn filter_from_a_future_block_is_not_skipped_by_a_tip_jump() {
             .map(|(n, _)| *n)
             .collect::<Vec<_>>(),
         vec![7, 8, 9]
+    );
+}
+
+/// The source of the handler registered by `marker`, up to the next
+/// registration.
+fn handler_source<'a>(src: &'a str, marker: &str) -> &'a str {
+    let start = src
+        .find(marker)
+        .unwrap_or_else(|| panic!("handler {marker} not found in eth_rpc.rs"));
+    let rest = &src[start + marker.len()..];
+    let end = rest
+        .find("io_handler.add_sync_method(")
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// Log-query handlers whose source reads the stored-header height.
+fn log_handlers_reading_header_height(src: &str) -> Vec<&'static str> {
+    const HANDLERS: [(&str, &str); 5] = [
+        ("eth_getLogs", "add_sync_method(\"eth_getLogs\""),
+        ("citrate_getLogs", "crate::canonical_logs::GET_LOGS_METHOD,"),
+        ("eth_newFilter", "add_sync_method(\"eth_newFilter\""),
+        ("eth_getFilterLogs", "add_sync_method(\"eth_getFilterLogs\""),
+        (
+            "eth_getFilterChanges",
+            "add_sync_method(\"eth_getFilterChanges\"",
+        ),
+    ];
+    HANDLERS
+        .iter()
+        .filter(|(name, marker)| {
+            let body = handler_source(src, marker);
+            // A block filter announces stored blocks; only the log arm counts.
+            let body = if *name == "eth_getFilterChanges" {
+                body.split("FilterType::Log {").nth(1).unwrap_or("")
+            } else {
+                body
+            };
+            body.contains("get_latest_height")
+        })
+        .map(|(name, _)| *name)
+        .collect()
+}
+
+/// Tripwire: no log-query handler resolves `latest` (or its poll range) from
+/// the stored-header height. They read `canonical_logs::log_tip` /
+/// `executed_head` once instead. Negative control: the same scan flags a
+/// handler that reads it.
+#[test]
+fn tripwire_log_handlers_do_not_read_the_header_height() {
+    let src = include_str!("../src/eth_rpc.rs");
+    assert_eq!(log_handlers_reading_header_height(src), Vec::<&str>::new());
+
+    let planted = src.replacen(
+        "add_sync_method(\"eth_getLogs\", move |params: Params| {",
+        "add_sync_method(\"eth_getLogs\", move |params: Params| { let _ = storage_logs.blocks.get_latest_height();",
+        1,
+    );
+    assert_ne!(planted, src, "negative control did not apply");
+    assert_eq!(
+        log_handlers_reading_header_height(&planted),
+        vec!["eth_getLogs"]
     );
 }
