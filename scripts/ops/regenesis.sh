@@ -32,6 +32,9 @@
 #   --with-aa       also run the ERC-4337 AA stack (DeployAA) + P256 verifier
 #   --broadcast     actually send txs (omit = simulate only; safe dry-run)
 #   --account NAME  forge keystore account to sign with (passed through)
+#   --password-file PATH  the keystore password file for --account (passed through to
+#                   every forge step as a path; this script never reads or prints it).
+#                   A password on the command line (--password) is refused.
 #   --private-key K forge private key to sign with (passed through; devnet only)
 #
 # DEVNET SAFETY: without --broadcast nothing is sent. A broadcast to a non-local
@@ -53,16 +56,28 @@ REROLL=0
 WITH_AA=0
 BROADCAST=0
 SIGNER_ARGS=()
+ACCOUNT_SET=0
+PASSWORD_FILE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --reroll)      REROLL=1; shift ;;
     --with-aa)     WITH_AA=1; shift ;;
     --broadcast)   BROADCAST=1; shift ;;
-    --account)     SIGNER_ARGS+=(--account "$2"); shift 2 ;;
+    --account)     SIGNER_ARGS+=(--account "$2"); ACCOUNT_SET=1; shift 2 ;;
+    --password-file) PASSWORD_FILE="${2:-}"; shift 2 ;;
+    # Never echo the value: it is the password.
+    --password | --password=*) die "a keystore password on the command line is refused; pass --password-file PATH" ;;
     --private-key) SIGNER_ARGS+=(--private-key "$2"); shift 2 ;;
     *) die "unknown arg: $1" ;;
   esac
 done
+# The password file goes to forge as a path. Its value is not echoed on refusal: a caller
+# that passed the password itself in its place must not see it in the log.
+if [[ -n "$PASSWORD_FILE" ]]; then
+  [[ "$ACCOUNT_SET" == 1 ]] || die "--password-file needs --account (it unlocks that keystore)"
+  [[ -f "$PASSWORD_FILE" && -r "$PASSWORD_FILE" ]] || die "--password-file must name a readable file (the path to the keystore password, not the password)"
+  SIGNER_ARGS+=(--password-file "$PASSWORD_FILE")
+fi
 
 command -v forge >/dev/null || die "forge not on PATH"
 command -v jq >/dev/null || die "jq is required"

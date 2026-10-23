@@ -34,8 +34,10 @@
 #   --from and --only. Only the fresh-deployer nonce-0 check is limited to a new ceremony
 #   (no --from/--only).
 #
-# Signing: --account NAME (Foundry keystore) and optionally --password-file PATH. A raw key
-# (--private-key, or PRIVATE_KEY/DEPLOYER_PRIVATE_KEY in the environment) is refused.
+# Signing: --account NAME (Foundry keystore) and optionally --password-file PATH, which every
+# broadcasting phase gets, P2's regenesis.sh included (as the path; neither script reads or
+# prints the file). A raw key (--private-key, or PRIVATE_KEY/DEPLOYER_PRIVATE_KEY in the
+# environment) and a password on the command line (--password) are refused.
 #
 # Inputs (env). Values marked OPEN are owner decisions recorded in the runbook §2:
 #   RPC_URL, DEPLOYER_ADDRESS, EXPECTED_CHAIN_ID (40204), EXPECTED_GENESIS_HASH (from the cut)
@@ -149,6 +151,8 @@ while [[ $# -gt 0 ]]; do
     --only) ONLY="${2:-}"; shift 2 ;;
     --account) ACCOUNT="${2:-}"; shift 2 ;;
     --password-file) PASSWORD_FILE="${2:-}"; shift 2 ;;
+    # Never echo the value: it is the password.
+    --password | --password=*) die "a keystore password on the command line is refused; pass --password-file PATH" 1 ;;
     --private-key | --private-key=*) die "raw private keys are refused; sign with --account (Foundry keystore)" 1 ;;
     -h | --help)
       sed -n '2,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//' >&2
@@ -158,6 +162,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 refuse_raw_keys
+# The keystore password reaches forge (P1/P3/P4) and regenesis.sh (P2) only as this path. The
+# value is not echoed on refusal: a caller that passed the password itself in its place must
+# not see it in the log.
+if [[ -n "$PASSWORD_FILE" ]]; then
+  [[ -n "$ACCOUNT" ]] || die "--password-file needs --account (it unlocks that keystore)" 1
+  [[ -f "$PASSWORD_FILE" && -r "$PASSWORD_FILE" ]] || die "--password-file must name a readable file (the path to the keystore password, not the password)" 1
+fi
 
 # The one output directory, as forge sees it (relative to contracts/) and as this script
 # sees it (absolute). Lexical normalisation only, so it works before the directory exists.
@@ -194,7 +205,7 @@ should() {
 }
 gate_fail() {
   err "GATE FAIL at $1: $2"
-  err "fix it, then resume: $0 --$MODE --from $1 ${ACCOUNT:+--account $ACCOUNT}"
+  err "fix it, then resume: $0 --$MODE --from $1 ${ACCOUNT:+--account $ACCOUNT}${PASSWORD_FILE:+ --password-file $PASSWORD_FILE}"
   exit 3
 }
 step_fail() {
@@ -722,8 +733,9 @@ if should P2; then
   # --confirm: the council the registry will be governed by is proven on chain first (C3).
   load_governance P2 "$([[ "$MODE" == confirm ]] && echo 1 || echo 0)"
   rargs=(--reroll --with-aa)
-  # regenesis.sh takes --account only; the keystore password comes from forge's own prompt.
-  if [[ "$MODE" == confirm ]]; then rargs+=(--broadcast --account "$ACCOUNT"); fi
+  # The keystore account and, when given, the password file (a path, never the password) go
+  # through to every forge step regenesis.sh runs, as P1/P3/P4 get them (SIGN).
+  if [[ "$MODE" == confirm ]]; then rargs+=(--broadcast "${SIGN[@]}"); fi
   log "P2 contract stack via regenesis.sh; address book → $ADDRESS_BOOK (fresh genesis)"
   if [[ "$MODE" == dry ]]; then
     describe_cmd RPC_URL='$RPC_URL' DEPLOYER_ADDRESS='$DEPLOYER_ADDRESS' EMIT_FRESH_GENESIS=1 EMIT_DEPLOYER='<manifest deployer>' \
