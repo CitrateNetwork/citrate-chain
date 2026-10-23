@@ -71,7 +71,7 @@ if ! grep -Eq "$EXPECTED_KIND" <<< "$BINARY_KIND"; then
 fi
 
 TOPDIR="$(mktemp -d /tmp/citrate-learning-center-rpm.XXXXXX)"
-trap 'rm -rf "$TOPDIR"' EXIT
+trap 'rm -rf "${TOPDIR:?}"' EXIT
 mkdir -p "$TOPDIR/BUILD" "$TOPDIR/BUILDROOT" "$TOPDIR/RPMS" "$TOPDIR/SOURCES" "$TOPDIR/SPECS" "$TOPDIR/SRPMS"
 
 SOURCE_ROOT="$TOPDIR/citrate-learning-center-$RPM_VERSION"

@@ -9,6 +9,14 @@
 # happens before its root check, so the bail paths are testable here.
 set -uo pipefail
 
+# Sandbox: deploy_testnet.sh sources ~/.cargo/env and writes system paths once past its
+# argument checks. This test only reaches the checks, but the script must never see the real
+# HOME.
+SANDBOX="$(mktemp -d)"
+trap 'rm -rf "${SANDBOX:?}"' EXIT
+export HOME="$SANDBOX/home"
+mkdir -p "$HOME"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT="$ROOT/scripts/deploy_testnet.sh"
 RELEASE_WFS=("$ROOT/.github/workflows/release.yml" "$ROOT/.github/workflows/release-tier2.yml")

@@ -96,7 +96,7 @@ run_scan() { # <root>
 
 self_test() {
   local tmp; tmp=$(mktemp -d)
-  trap 'rm -rf "$tmp"' RETURN
+  trap 'rm -rf "${tmp:?}"' RETURN
   mkdir -p "$tmp/scripts" "$tmp/node/src" "$tmp/node/config" "$tmp/.github" "$tmp/docker" "$tmp/config" "$tmp/homebrew"
   # A clean tree must pass...
   printf '[features]\ndefault = ["commd-fold-verify"]\n' > "$tmp/node/Cargo.toml"

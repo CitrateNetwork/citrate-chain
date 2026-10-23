@@ -65,7 +65,7 @@ G='\033[0;32m'; R='\033[0;31m'; Y='\033[1;33m'; N='\033[0m'
 declare -a PIDS=()
 FAILS=0
 
-cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done; wait 2>/dev/null || true; rm -rf "$SCRATCH"; }
+cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done; wait 2>/dev/null || true; rm -rf "${SCRATCH:?}"; }
 trap cleanup EXIT INT TERM
 
 log()  { echo -e "  $*"; }

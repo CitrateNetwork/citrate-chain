@@ -105,7 +105,7 @@ for spec in "${SPECS[@]}"; do
         SPEC_TIME[$spec]="0"
         FAILED=$((FAILED + 1))
         echo "[$spec] SKIP — .tla file not found" >> "$RESULTS_FILE"
-        rm -rf "$TMPDIR"
+        rm -rf "${TMPDIR:?}"
         continue
     fi
 
@@ -116,7 +116,7 @@ for spec in "${SPECS[@]}"; do
         SPEC_TIME[$spec]="0"
         FAILED=$((FAILED + 1))
         echo "[$spec] SKIP — .cfg file not found" >> "$RESULTS_FILE"
-        rm -rf "$TMPDIR"
+        rm -rf "${TMPDIR:?}"
         continue
     fi
 
@@ -176,7 +176,7 @@ for spec in "${SPECS[@]}"; do
     echo "$OUTPUT" > "$TMPDIR/output.log"
 
     # Clean up temp directory (state files can be huge)
-    rm -rf "$TMPDIR"
+    rm -rf "${TMPDIR:?}"
 done
 
 END_TIME=$(date +%s)

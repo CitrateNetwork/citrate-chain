@@ -18,7 +18,7 @@ cleanup() {
     kill -9 "$NODE_PID" 2>/dev/null || true
     wait "$NODE_PID" 2>/dev/null || true
   fi
-  rm -rf "$DATA_DIR"
+  rm -rf "${DATA_DIR:?}"
 }
 trap cleanup EXIT
 
