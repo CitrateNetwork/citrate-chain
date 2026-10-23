@@ -1,0 +1,217 @@
+{
+  "fixture": true,
+  "label": "FIXTURE — captured from 40204, not live",
+  "captured_at": "2026-10-19T06:32:14Z",
+  "rpc": "https://rpc.citrate.ai",
+  "state": "latest (the node serves latest committed state for every block tag; no historical reads)",
+  "head_at_start": 510030,
+  "head_at_end": 510047,
+  "epoch_at_start": 510,
+  "epoch_at_end": 510,
+  "single_epoch": true,
+  "head_moved": true,
+  "consistency": "none: each read is latest state at its own observed_head",
+  "address_book_deployed_at": "2026-10-06T05:43:04Z",
+  "reads": [
+    {
+      "id": "chain_id",
+      "source": "eth_chainId",
+      "state": "latest",
+      "observed_head": 510030,
+      "value": "0x9d0c"
+    },
+    {
+      "id": "genesis_hash",
+      "source": "eth_getBlockByNumber(0x0).hash",
+      "state": "latest",
+      "observed_head": 510030,
+      "value": "0x1dcfc4909dd9fdcb0f03c823d627e4b2032cc86bef5fc4561030d6c64b9775f1"
+    },
+    {
+      "id": "head_height",
+      "source": "eth_blockNumber (stored height)",
+      "state": "latest",
+      "observed_head": 510030,
+      "value": 510030
+    },
+    {
+      "id": "syncing",
+      "source": "eth_syncing",
+      "state": "latest",
+      "observed_head": 510030,
+      "value": false
+    },
+    {
+      "id": "peer_count",
+      "source": "net_peerCount (the queried RPC node's direct peers, not a member's node)",
+      "state": "latest",
+      "observed_head": 510031,
+      "value": "0x3"
+    },
+    {
+      "id": "base_fee",
+      "source": "eth_getBlockByNumber(latest).baseFeePerGas",
+      "state": "latest",
+      "observed_head": 510031,
+      "value": "0x3b9aca00"
+    },
+    {
+      "id": "block_time_s",
+      "source": "timestamp delta over the 100 blocks ending at observed_head",
+      "state": "latest",
+      "observed_head": 510031,
+      "value": 2
+    },
+    {
+      "id": "checkpoint_365784",
+      "source": "eth_getBlockByNumber(365784).hash (canonical checkpoint)",
+      "state": "latest",
+      "observed_head": 510032,
+      "value": "0x63dcd4a8c7cd701080e242e5949402da93143bfd0659b3012e57998da4aa2c56"
+    },
+    {
+      "id": "checkpoint_365785",
+      "source": "eth_getBlockByNumber(365785).hash (canonical checkpoint)",
+      "state": "latest",
+      "observed_head": 510032,
+      "value": "0x51482ff9724a2f0cbf4fe678f3ce556f6222334d5b2a3f5eba8a2b52af0cf3d2"
+    },
+    {
+      "id": "producing_validators",
+      "source": "distinct eth_getBlockByNumber(n).proposerPubkey for n in [509033, 510032]",
+      "state": "latest",
+      "observed_head": 510032,
+      "value": {
+        "count": 1,
+        "from_block": 509033,
+        "to_block": 510032
+      }
+    },
+    {
+      "id": "registered_validators",
+      "source": "eth_call ValidatorRegistry(0xde4F679632be7810D915F637Cc6a72bf076A3BD9).activeCount()(uint256)",
+      "state": "latest",
+      "observed_head": 510035,
+      "value": "5"
+    },
+    {
+      "id": "validator_min_stake",
+      "source": "eth_call ValidatorRegistry(0xde4F679632be7810D915F637Cc6a72bf076A3BD9).minStake()(uint256)",
+      "state": "latest",
+      "observed_head": 510036,
+      "value": "32000000000000000000000 [3.2e22]"
+    },
+    {
+      "id": "block_subsidy",
+      "source": "eth_call ValidatorRegistry(0xde4F679632be7810D915F637Cc6a72bf076A3BD9).blockSubsidy()(uint256)",
+      "state": "latest",
+      "observed_head": 510036,
+      "value": "10000000000000000000 [1e19]"
+    },
+    {
+      "id": "max_epoch_emission",
+      "source": "eth_call ValidatorRegistry(0xde4F679632be7810D915F637Cc6a72bf076A3BD9).maxEpochEmission()(uint256)",
+      "state": "latest",
+      "observed_head": 510037,
+      "value": "10000000000000000000000 [1e22]"
+    },
+    {
+      "id": "current_epoch",
+      "source": "eth_call ValidatorRegistry(0xde4F679632be7810D915F637Cc6a72bf076A3BD9).currentEpoch()(uint256)",
+      "state": "latest",
+      "observed_head": 510037,
+      "value": "510"
+    },
+    {
+      "id": "validator_active_set",
+      "source": "eth_call ValidatorRegistry(0xde4F679632be7810D915F637Cc6a72bf076A3BD9).activeSet()(bytes32[],uint256[])",
+      "state": "latest",
+      "observed_head": 510038,
+      "value": "[0x0f04a3d4c4e84f9bcae3eb96c1b7219ec9154428c356e5a9c4a212894048411d, 0x3f67bb5943edbacd774658a49a1db5f0ee3fe39d6f76d9f800827cc90769a6aa, 0x5351a26740308f64b1900daaeafb6a6a9fd284b84b5ba20c5ffed6a4dbee5561, 0xb4a646a56e3946943f0014459e88595c45737745e0421e201ac1d3f9320ff748, 0xe1a40865bbaf51ac1d1ea3260f469054d60a19c3a2447756cff4f0b6ed1003f5]\n[32000000000000000000000 [3.2e22], 32000000000000000000000 [3.2e22], 32000000000000000000000 [3.2e22], 32000000000000000000000 [3.2e22], 32000000000000000000000 [3.2e22]]"
+    },
+    {
+      "id": "eligible_validators",
+      "source": "live ValidatorRegistry activeSet() members with validatorInfo(pubkey).actEpoch <= currentEpoch()",
+      "state": "latest",
+      "observed_head": 510038,
+      "value": {
+        "count": 5,
+        "pending_activation": 0,
+        "current_epoch": 510
+      }
+    },
+    {
+      "id": "consensus_validator_set",
+      "source": "governing epoch snapshot S(E) (node-internal)",
+      "state": "latest",
+      "observed_head": 510038,
+      "value": {
+        "unavailable": true,
+        "reason": "no RPC exposes the governing consensus snapshot yet (contract §9)"
+      }
+    },
+    {
+      "id": "grants_issued",
+      "source": "eth_call MembershipStakeVault(0xA93F7f688A8F212E0caD59eDBd1F7D3592151751).nextGrantId()(uint256)",
+      "state": "latest",
+      "observed_head": 510041,
+      "value": "5"
+    },
+    {
+      "id": "member_tokens_minted",
+      "source": "eth_call CitrateMemberSBT(0xf8aD11f6d3AeFA605e2EBF7C81ED08A2b38B3A3c).nextTokenId()(uint256)",
+      "state": "latest",
+      "observed_head": 510042,
+      "value": "5"
+    },
+    {
+      "id": "pin_bond",
+      "source": "eth_call IPFSIncentivesV3(0xF5c115E6d88A960CC4f48129524C01004f067135).BOND()(uint256)",
+      "state": "latest",
+      "observed_head": 510043,
+      "value": "10000000000000000000 [1e19]"
+    },
+    {
+      "id": "pin_reward_total",
+      "source": "eth_call IPFSIncentivesV3(0xF5c115E6d88A960CC4f48129524C01004f067135).REWARD()(uint256)",
+      "state": "latest",
+      "observed_head": 510043,
+      "value": "4000000000000000000 [4e18]"
+    },
+    {
+      "id": "pin_rounds",
+      "source": "eth_call IPFSIncentivesV3(0xF5c115E6d88A960CC4f48129524C01004f067135).ROUNDS()(uint256)",
+      "state": "latest",
+      "observed_head": 510044,
+      "value": "4"
+    },
+    {
+      "id": "skills_registered",
+      "source": "eth_call SkillRegistry(0xbeDaD7a474785eCB27fc0Aa02ca583bdb3761A49).totalSkills()(uint256)",
+      "state": "latest",
+      "observed_head": 510044,
+      "value": "0"
+    },
+    {
+      "id": "models_registered",
+      "source": "eth_call ModelRegistry(0x086F13745C53b460512eA2A0367EcdB62A2875eF).totalModels()(uint256)",
+      "state": "latest",
+      "observed_head": 510045,
+      "value": "1"
+    },
+    {
+      "id": "governance_min_delay_s",
+      "source": "eth_call GOVERNANCE(0xfb1E74b869E8911De4948A6cb0912C8d49957e6e).minDelay()(uint256)",
+      "state": "latest",
+      "observed_head": 510045,
+      "value": "7200"
+    },
+    {
+      "id": "guardian_min_delay_s",
+      "source": "eth_call GUARDIAN(0x39B483Fe68c2c6492f83D416BA0B28e54649Bc65).minDelay()(uint256)",
+      "state": "latest",
+      "observed_head": 510046,
+      "value": "7200"
+    }
+  ]
+}
