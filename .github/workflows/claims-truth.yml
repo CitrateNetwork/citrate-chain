@@ -3,7 +3,8 @@ name: claims-truth
 # Public-claims tripwire. Public claims must agree with the
 # code and the committed getCode snapshot:
 #  - verification/check_claims.py: checkpoint finality cannot be claimed as running
-#    while no production code calls CheckpointManager::propose; public READMEs cannot
+#    unless both compiled pins (voting + enforcement) are ON for 40204 and a production
+#    sign + outbound-broadcast path exists (tests: verification/tests); public READMEs cannot
 #    describe finality as current, quote codeless/stale addresses, stale counts,
 #    dead hosts, or curl|bash from mutable main.
 #  - verification/check_address_code.py --offline: claims.json deployed_contracts
@@ -28,6 +29,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Claims vs code (offline)
         run: python3 verification/check_claims.py
+      - name: Claims tripwire (unit tests)
+        run: python3 -m unittest discover -s verification/tests -v
       - name: Deployed-contract count vs getCode snapshot (offline)
         run: python3 verification/check_address_code.py --offline
       - name: Address-book tools (unit tests, loopback only)

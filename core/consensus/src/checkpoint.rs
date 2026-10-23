@@ -41,6 +41,13 @@ pub enum CheckpointError {
 
     #[error("Storage error: {0}")]
     StorageError(String),
+
+    /// A stored (finalized) checkpoint certificate does not verify: wrong status,
+    /// committee below the finality minimum, too few votes for its derived quorum,
+    /// a voter outside its committee, or a signature that does not verify over
+    /// the canonical message for `(chain_id, height, block_hash)`.
+    #[error("Invalid checkpoint certificate at height {height}: {reason}")]
+    InvalidCertificate { height: u64, reason: String },
 }
 
 /// Minimum committee size that may finalize a checkpoint.
@@ -256,6 +263,62 @@ impl Checkpoint {
     /// Get the number of votes collected.
     pub fn vote_count(&self) -> usize {
         self.votes.len()
+    }
+
+    /// Re-check this checkpoint as a finality CERTIFICATE for `chain_id`
+    /// (spec §4.5, Stage 1c). Accepts exactly what an honest
+    /// [`CheckpointManager::finalize_checkpoint`] produces and nothing weaker:
+    ///
+    /// 1. status is [`CheckpointStatus::Finalized`];
+    /// 2. the committee has at least [`MIN_FINALITY_COMMITTEE`] members;
+    /// 3. the votes reach the derived quorum `floor(2n/3)+1` over that committee;
+    /// 4. every voter is a committee member;
+    /// 5. every signature verifies (ed25519) over
+    ///    [`canonical_vote_message`]`(chain_id, height, block_hash)`.
+    ///
+    /// What this does NOT establish: that the committee itself is the one the
+    /// validator registry yields for this height. Certificates are only ever
+    /// produced by this node's own manager (there is no certificate sync yet,
+    /// spec §11.10), whose committee came from its own epoch snapshot.
+    pub fn verify_certificate(&self, chain_id: u64) -> Result<(), CheckpointError> {
+        let height = self.height;
+        let invalid = |reason: String| CheckpointError::InvalidCertificate { height, reason };
+        if self.status != CheckpointStatus::Finalized {
+            return Err(invalid(format!(
+                "status is {:?}, not Finalized",
+                self.status
+            )));
+        }
+        let n = self.committee.len();
+        let quorum = self.effective_quorum().ok_or_else(|| {
+            invalid(format!(
+                "committee of {n} is below the finality minimum {MIN_FINALITY_COMMITTEE}"
+            ))
+        })?;
+        if self.votes.len() < quorum {
+            return Err(invalid(format!(
+                "{} votes; the quorum for a committee of {n} is {quorum}",
+                self.votes.len()
+            )));
+        }
+        let committee: HashSet<&PublicKey> = self.committee.iter().collect();
+        for (voter, signature) in &self.votes {
+            if !committee.contains(voter) {
+                return Err(invalid(format!("voter {voter:?} is not in the committee")));
+            }
+            let vote = CheckpointVote {
+                height,
+                block_hash: self.block_hash,
+                voter: *voter,
+                signature: *signature,
+            };
+            if verify_vote_signature(&vote, chain_id).is_err() {
+                return Err(invalid(format!(
+                    "signature of {voter:?} does not verify for chain {chain_id}"
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -504,6 +567,20 @@ impl CheckpointManager {
         bincode::deserialize::<Checkpoint>(&bytes)
             .ok()
             .filter(|cp| cp.status == CheckpointStatus::Finalized && cp.height == height)
+    }
+
+    /// The finalized checkpoint at [`Self::latest_finalized_height`] — the
+    /// certificate a finality floor would be raised from — from memory, else
+    /// from the persisted `DAG_METADATA` record `checkpoint:{height}`. `None`
+    /// when nothing has finalized (height 0) or the record cannot be read.
+    /// Returned AS STORED: callers must [`Checkpoint::verify_certificate`] it
+    /// before trusting it.
+    pub async fn latest_finalized_certificate(&self) -> Option<Checkpoint> {
+        let height = self.latest_finalized_height().await;
+        if height == 0 {
+            return None;
+        }
+        self.get_checkpoint(height).await
     }
 
     /// Whether `height` holds a finalized checkpoint (memory or persistent store).
@@ -1338,5 +1415,79 @@ mod tests {
         ));
         let right = sign_checkpoint_vote(1337, 5, b5, &k0);
         assert!(mgr.submit_vote(right).await.is_ok());
+    }
+
+    /// Stage 1c §4.5: a certificate produced by an honest finalize verifies; every
+    /// weakening of it (status, committee size, vote count, non-member voter, bad
+    /// signature, other chain, other hash) is `InvalidCertificate`.
+    #[tokio::test]
+    async fn verify_certificate_accepts_honest_and_rejects_every_weakening() {
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let blocks = build_chain(&dag, 6).await;
+        let mgr = CheckpointManager::new(CheckpointConfig::for_testing(), dag);
+        assert!(
+            mgr.latest_finalized_certificate().await.is_none(),
+            "nothing finalized yet"
+        );
+        let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+        let b5 = blocks.get(5).expect("block 5").hash();
+        mgr.ensure_proposed(5, b5, committee)
+            .await
+            .expect("propose");
+        for i in 0..3u8 {
+            mgr.submit_vote(make_signed_vote(i, 5, &b5))
+                .await
+                .expect("vote");
+        }
+        mgr.finalize_checkpoint(5).await.expect("finalize");
+        let cert = mgr
+            .latest_finalized_certificate()
+            .await
+            .expect("latest certificate");
+        assert_eq!((cert.height, cert.block_hash), (5, b5));
+        cert.verify_certificate(40204).expect("honest certificate");
+
+        let invalid = |c: &Checkpoint, chain: u64| {
+            matches!(
+                c.verify_certificate(chain),
+                Err(CheckpointError::InvalidCertificate { height: 5, .. })
+            )
+        };
+        assert!(invalid(&cert, 1337), "other chain id");
+
+        let mut pending = cert.clone();
+        pending.status = CheckpointStatus::Pending;
+        assert!(invalid(&pending, 40204), "not finalized");
+
+        let mut small = cert.clone();
+        small.committee.truncate(3);
+        assert!(invalid(&small, 40204), "committee below minimum");
+
+        let mut thin = cert.clone();
+        thin.votes.remove(&make_pubkey(0));
+        assert!(invalid(&thin, 40204), "below quorum");
+
+        let mut outsider = cert.clone();
+        let sig = outsider
+            .votes
+            .remove(&make_pubkey(0))
+            .expect("vote of member 0");
+        outsider.votes.insert(make_pubkey(9), sig);
+        assert!(invalid(&outsider, 40204), "voter outside the committee");
+
+        let mut forged = cert.clone();
+        let sig1 = *forged.votes.get(&make_pubkey(1)).expect("vote of member 1");
+        forged.votes.insert(make_pubkey(0), sig1);
+        assert!(invalid(&forged, 40204), "signature of another voter");
+
+        let mut moved = cert.clone();
+        moved.block_hash = blocks.get(4).expect("block 4").hash();
+        assert!(invalid(&moved, 40204), "votes do not cover another hash");
+
+        // An extra valid committee vote beyond quorum is still a valid certificate.
+        let mut extra = cert.clone();
+        let v3 = make_signed_vote(3, 5, &b5);
+        extra.votes.insert(v3.voter, v3.signature);
+        extra.verify_certificate(40204).expect("4 of 4 votes");
     }
 }

@@ -23,7 +23,12 @@ pub const CF_DAG_TIPS: &str = "dag_tips";
 pub const CF_DAG_FINALIZED: &str = "dag_finalized";
 pub const CF_DAG_HEIGHT_INDEX: &str = "dag_height_index";
 pub const CF_DAG_METADATA: &str = "dag_metadata";
-// WP-S.3: BFT checkpoint column family
+// WP-S.3: BFT checkpoint column family. UNUSED: finalized checkpoint
+// certificates live in `dag_metadata` under `checkpoint:{height}` (spec D-6,
+// docs/consensus/CHECKPOINT_FINALITY_WIRING.md §4.7). Do NOT remove it from
+// `all_column_families()`: RocksDB refuses to open a database that holds a
+// column family the open call does not list, and every existing node database
+// has this one. Removing it needs a `drop_cf` migration first.
 pub const CF_CHECKPOINTS: &str = "checkpoints";
 
 // Sprint P950-A-4 WP-A.4.3: persistent MVCC per-account version tracker.
