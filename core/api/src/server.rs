@@ -10,7 +10,7 @@ use crate::types::{
     error::ApiError,
     request::{BlockId, CallRequest},
 };
-use crate::{ai_rpc, economics_rpc, eth_rpc};
+use crate::{ai_rpc, economics_rpc, eth_rpc, node_rpc};
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 // PIL-49: shared Tokio runtime so block_on can drive tokio::sync::* wakers.
@@ -612,6 +612,7 @@ impl RpcServer {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -643,6 +644,11 @@ impl RpcServer {
         // pairs resolved by hash (finality enforcement ON). When None, the tags
         // resolve to genesis (block 0) — the documented pre-checkpoint behaviour.
         finalized: Option<crate::finalized_tag::FinalizedTagSource>,
+        // UI truth contract §9: the node's build + consensus identity (version, git
+        // sha, consensus/activation fingerprints, running GhostDAG params). Backs
+        // web3_clientVersion, citrate_nodeIdentity and citrate_getDagStats. When
+        // None, those methods report only what this crate knows and null otherwise.
+        node_identity: Option<node_rpc::NodeIdentity>,
     ) -> Self {
         let mut io_handler = IoHandler::new();
 
@@ -1399,11 +1405,14 @@ impl RpcServer {
             Ok(Value::String(net_version_chain_id.to_string()))
         });
 
-        // web3_clientVersion
-        io_handler.add_sync_method("web3_clientVersion", |_params: Params| {
-            rpc_request("web3_clientVersion");
-            Ok(Value::String("citrate/v0.1.0".to_string()))
-        });
+        // web3_clientVersion, citrate_nodeIdentity and citrate_getDagStats: the
+        // node's real build + consensus identity (crate::node_rpc).
+        node_rpc::register_node_methods(
+            &mut io_handler,
+            storage.clone(),
+            chain_id,
+            node_identity.map(Arc::new),
+        );
 
         // eth_chainId (compatibility)
         let chain_id_for_handler = chain_id;
