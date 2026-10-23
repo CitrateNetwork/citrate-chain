@@ -143,16 +143,17 @@ fn pba_l1a_002_fee_history_response_is_bounded() {
         .iter()
         .map(|r| r.as_array().map_or(0, |a| a.len()))
         .sum();
-    // 64 tx-bearing blocks x 100 percentiles, plus the empty genesis block's
-    // single placeholder entry (heights 0..=64 are in the window).
+    // Heights 0..=64 are in the window: 64 tx-bearing blocks x 100 percentiles,
+    // plus the empty genesis block's 100 zero rewards (C1-F: every row carries
+    // one entry per requested percentile; it used to be a single placeholder).
     assert!(
         total <= 65 * 100,
         "response must be bounded by blocks x 100: {total}"
     );
     assert_eq!(
         total,
-        64 * 100 + 1,
-        "100 percentiles over 64 tx-bearing blocks are all served"
+        65 * 100,
+        "100 percentiles over all 65 blocks in the window are served"
     );
 }
 

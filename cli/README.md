@@ -10,7 +10,6 @@ Command-line interface for interacting with a running Citrate node. Provides sub
 - `src/commands/model.rs` -- AI model registration, listing, and inference
 - `src/commands/governance.rs` -- On-chain governance proposals and voting
 - `src/commands/network.rs` -- Peer info and network diagnostics
-- `src/commands/snapshot.rs` -- State snapshot export/import
 - `src/commands/wizard.rs` -- Interactive setup wizard
 - `src/config.rs` -- CLI configuration (RPC URL, keyfile paths)
 
