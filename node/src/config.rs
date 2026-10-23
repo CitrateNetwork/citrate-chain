@@ -77,6 +77,16 @@ pub struct CheckpointNodeConfig {
     /// Quorum threshold (2/3 + 1 of committee).
     #[serde(default = "default_quorum_threshold")]
     pub quorum_threshold: usize,
+
+    /// Confirmation depth `D` (docs/consensus/CHECKPOINT_FINALITY_WIRING.md §3):
+    /// vote for the canonical block at a boundary only once it is buried this
+    /// many blocks below the applied tip. Never 0 (clamped to 1 by the driver).
+    #[serde(default = "default_vote_depth")]
+    pub vote_depth: u64,
+}
+
+fn default_vote_depth() -> u64 {
+    citrate_consensus::checkpoint::DEFAULT_VOTE_DEPTH
 }
 
 fn default_checkpoint_interval() -> u64 {
@@ -97,6 +107,7 @@ impl Default for CheckpointNodeConfig {
             interval: 50,
             committee_size: 100,
             quorum_threshold: 67,
+            vote_depth: default_vote_depth(),
         }
     }
 }
@@ -461,6 +472,19 @@ impl NodeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stage 1a: `[checkpoint] vote_depth` is optional (existing configs keep
+    /// parsing, default D = 3 per spec §3) and overridable.
+    #[test]
+    fn checkpoint_vote_depth_defaults_and_parses() {
+        let c: CheckpointNodeConfig =
+            toml::from_str("interval = 2").expect("checkpoint table without vote_depth");
+        assert_eq!(c.vote_depth, 3);
+        assert_eq!(CheckpointNodeConfig::default().vote_depth, 3);
+        let c: CheckpointNodeConfig =
+            toml::from_str("interval = 2\nvote_depth = 5").expect("vote_depth override");
+        assert_eq!(c.vote_depth, 5);
+    }
 
     #[test]
     fn test_default_config() {
