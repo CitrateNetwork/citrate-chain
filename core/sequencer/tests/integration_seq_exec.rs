@@ -1,33 +1,9 @@
-use citrate_consensus::types::{BlockHeader, Hash, PublicKey, Signature, Transaction, VrfProof};
+use citrate_consensus::types::{Hash, PublicKey, Signature, Transaction, VrfProof};
 use citrate_execution::executor::Executor;
 use citrate_execution::types::Address;
 use citrate_sequencer::block_builder::{BlockBuilder, BlockBuilderConfig};
 use citrate_sequencer::mempool::{Mempool, MempoolConfig, TxClass};
 use std::sync::Arc;
-
-#[allow(dead_code)]
-fn make_block_header(parent: Hash, height: u64) -> BlockHeader {
-    BlockHeader {
-        version: 1,
-        block_hash: Hash::new([0xEE; 32]),
-        selected_parent_hash: parent,
-        merge_parent_hashes: vec![],
-        timestamp: 1_000_000 + height,
-        height,
-        blue_score: height,
-        blue_work: height as u128,
-        pruning_point: Hash::default(),
-        proposer_pubkey: PublicKey::new([0; 32]),
-        vrf_reveal: VrfProof {
-            proof: vec![],
-            output: Hash::default(),
-        },
-        base_fee_per_gas: 0,
-        gas_used: 0,
-        gas_limit: 30_000_000,
-        coinbase: [0u8; 20],
-    }
-}
 
 fn make_tx(nonce: u64, gas_price: u64, from: [u8; 32], to: [u8; 32], data: Vec<u8>) -> Transaction {
     // Ensure unique hash per tx even when nonce collides across different senders
