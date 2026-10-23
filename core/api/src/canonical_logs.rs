@@ -362,6 +362,19 @@ impl ExecutedChainIndex {
         else {
             return Ok(Vec::new());
         };
+        self.executed_hashes_under(storage, tip_hash, tip_height, from, to)
+    }
+
+    /// [`Self::executed_hashes`] on the selected-parent chain of the given tip,
+    /// which the caller read once from storage.
+    fn executed_hashes_under(
+        &self,
+        storage: &StorageManager,
+        tip_hash: Hash,
+        tip_height: u64,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<(u64, Hash)>, LogIndexError> {
         let to = to.min(tip_height);
         if from > to {
             return Ok(Vec::new());
@@ -474,6 +487,199 @@ impl ExecutedChainIndex {
     }
 }
 
+impl ExecutedChainIndex {
+    /// Whether `hash` is on the executed (selected-parent) chain of the
+    /// persisted applied tip: `Some(height)` when it is, `None` when it is not
+    /// (never stored, stored above the tip, or a stored block the tip's chain
+    /// does not contain: a losing sibling, a merge parent, or a block a reorg
+    /// abandoned).
+    ///
+    /// The tip is read once ([`executed_head`]; an error when none is
+    /// persisted, never the height index). The block's stored height `h`
+    /// picks the height to compare at, and the same walk `eth_getLogs` uses
+    /// names the executed block at `h` under that tip; `hash` is executed iff
+    /// it is that block. The answer is point-in-time: a later reorg can
+    /// abandon a block reported executed here.
+    pub fn is_executed(
+        &self,
+        storage: &StorageManager,
+        hash: &Hash,
+    ) -> Result<Option<u64>, LogIndexError> {
+        let (tip_hash, tip_height) = executed_head(storage).map_err(LogIndexError::Unavailable)?;
+        let Some(header) = storage
+            .blocks
+            .get_header(hash)
+            .map_err(|e| LogIndexError::Unavailable(format!("header {hash}: {e}")))?
+        else {
+            return Ok(None);
+        };
+        let h = header.height;
+        if h > tip_height {
+            return Ok(None);
+        }
+        let at = self.executed_hashes_under(storage, tip_hash, tip_height, h, h)?;
+        Ok(at
+            .first()
+            .filter(|(height, executed)| *height == h && executed == hash)
+            .map(|(height, _)| *height))
+    }
+}
+
+/// What [`ExecutedChainIndex::executed_after`] found on one tip snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutedRange {
+    /// The executed blocks of the range, ascending. The last one is the block
+    /// the range is complete through; empty when nothing in it has executed.
+    Blocks(Vec<(u64, Hash)>),
+    /// The cursor is not the executed block at `from - 1`: the chain the caller
+    /// scanned was replaced.
+    CursorReplaced,
+}
+
+impl ExecutedChainIndex {
+    /// The executed blocks with height in `from..=to`, all on the selected-parent
+    /// chain of ONE read of the applied tip, so the answer is complete through
+    /// its last block. With `after`, that chain must also hold `after` at height
+    /// `from - 1` (a scanner's cursor); otherwise [`ExecutedRange::CursorReplaced`].
+    /// When the tip is below `from - 1` nothing is served and the cursor is not
+    /// judged: it may be a transient rewind, and the check runs again once the
+    /// chain is back above it. `after` with `from == 0` is a caller error.
+    pub fn executed_after(
+        &self,
+        storage: &StorageManager,
+        from: u64,
+        to: u64,
+        after: Option<&Hash>,
+    ) -> Result<ExecutedRange, LogIndexError> {
+        let (tip_hash, tip_height) = executed_head(storage).map_err(LogIndexError::Unavailable)?;
+        let lo = match after {
+            Some(_) => from.checked_sub(1).ok_or_else(|| {
+                LogIndexError::Unavailable("a cursor needs fromBlock >= 1".into())
+            })?,
+            None => from,
+        };
+        if lo > tip_height {
+            return Ok(ExecutedRange::Blocks(Vec::new()));
+        }
+        let mut blocks =
+            self.executed_hashes_under(storage, tip_hash, tip_height, lo, to.max(lo))?;
+        if let Some(cursor) = after {
+            match blocks.first() {
+                Some((h, hash)) if *h == lo && hash == cursor => {}
+                _ => return Ok(ExecutedRange::CursorReplaced),
+            }
+        }
+        blocks.retain(|(h, _)| *h >= from && *h <= to);
+        Ok(ExecutedRange::Blocks(blocks))
+    }
+}
+
+/// JSON-RPC method that reports [`ExecutedChainIndex::is_executed`].
+pub const IS_EXECUTED_METHOD: &str = "citrate_isExecuted";
+
+/// The `citrate_isExecuted` response for `params` (`[hash]`):
+/// `{"executed": true, "number": "0x…"}` or `{"executed": false, "number": null}`.
+/// Errors: -32602 for a missing or malformed hash, -32603 when no applied tip
+/// is persisted or the executed chain cannot be followed, -32002 (retryable)
+/// when a cold lookup deep below the tip exceeds the per-request header budget.
+pub fn is_executed_json(
+    index: &ExecutedChainIndex,
+    storage: &StorageManager,
+    params: &[serde_json::Value],
+) -> Result<serde_json::Value, jsonrpc_core::Error> {
+    let hash = parse_block_hash(params.first())?;
+    let number = index.is_executed(storage, &hash).map_err(|e| match e {
+        LogIndexError::Retry(m) => jsonrpc_core::Error {
+            code: jsonrpc_core::ErrorCode::ServerError(LOG_INDEX_RETRY_CODE),
+            message: format!("{IS_EXECUTED_METHOD}: {m}; retry the same request"),
+            data: Some(serde_json::json!({ "retryable": true })),
+        },
+        LogIndexError::Unavailable(m) => jsonrpc_core::Error {
+            code: jsonrpc_core::ErrorCode::InternalError,
+            message: format!("{IS_EXECUTED_METHOD}: {m}"),
+            data: None,
+        },
+    })?;
+    Ok(match number {
+        Some(n) => serde_json::json!({ "executed": true, "number": format!("0x{n:x}") }),
+        None => serde_json::json!({ "executed": false, "number": null }),
+    })
+}
+
+/// A 32-byte block hash given as a `0x`-prefixed hex string (-32602 otherwise).
+fn parse_block_hash(v: Option<&serde_json::Value>) -> Result<Hash, jsonrpc_core::Error> {
+    parse_block_hash_for(IS_EXECUTED_METHOD, v)
+}
+
+/// [`parse_block_hash`] with `method` in the -32602 message.
+pub fn parse_block_hash_for(
+    method: &str,
+    v: Option<&serde_json::Value>,
+) -> Result<Hash, jsonrpc_core::Error> {
+    let invalid = |m: &str| jsonrpc_core::Error::invalid_params(format!("{method}: {m}"));
+    let s = v
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| invalid("expected params [blockHash]"))?;
+    let digits = s
+        .strip_prefix("0x")
+        .ok_or_else(|| invalid("block hash must be 0x-prefixed hex"))?;
+    let bytes = hex::decode(digits).map_err(|_| invalid("block hash is not hex"))?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| invalid("block hash must be 32 bytes"))?;
+    Ok(Hash::new(arr))
+}
+
+/// JSON-RPC method: `eth_getLogs` plus the executed block the answer is
+/// complete through, from the same tip snapshot (see the API README).
+pub const GET_LOGS_METHOD: &str = "citrate_getLogs";
+
+/// JSON-RPC error code `citrate_getLogs` returns when the block named by
+/// `afterBlockHash` is not the executed block at `fromBlock - 1` ("resource not
+/// found", EIP-1474): the chain the caller scanned was replaced.
+pub const LOG_CURSOR_REORGED_CODE: i64 = -32001;
+
+/// The retryable -32002 `citrate_getLogs` returns when an executed block in the
+/// range has a transaction with no receipt recorded for that block (the
+/// producer writes receipts just after it commits the tip; a node that does not
+/// store peer-block receipts never has them).
+pub fn receipts_not_stored_error(height: u64, block: &Hash, tx: &Hash) -> jsonrpc_core::Error {
+    jsonrpc_core::Error {
+        code: jsonrpc_core::ErrorCode::ServerError(LOG_INDEX_RETRY_CODE),
+        message: format!(
+            "{GET_LOGS_METHOD}: receipts for executed block {block} at height {height} are not stored (transaction {tx}); retry the same request"
+        ),
+        data: Some(serde_json::json!({
+            "retryable": true,
+            "blockNumber": format!("0x{height:x}"),
+            "blockHash": format!("0x{}", hex::encode(block.as_bytes())),
+        })),
+    }
+}
+
+/// The -32001 `citrate_getLogs` returns when `afterBlockHash` is not the
+/// executed block at `height` (`fromBlock - 1`).
+pub fn cursor_replaced_error(height: u64) -> jsonrpc_core::Error {
+    jsonrpc_core::Error {
+        code: jsonrpc_core::ErrorCode::ServerError(LOG_CURSOR_REORGED_CODE),
+        message: format!(
+            "{GET_LOGS_METHOD}: afterBlockHash is not the executed block at height {height}; the chain was replaced, scan again from an earlier point"
+        ),
+        data: Some(serde_json::json!({
+            "reorged": true,
+            "height": format!("0x{height:x}"),
+        })),
+    }
+}
+
+/// `{"number": "0x…", "hash": "0x…"}` for an executed block.
+pub fn block_ref_json(height: u64, hash: &Hash) -> serde_json::Value {
+    serde_json::json!({
+        "number": format!("0x{height:x}"),
+        "hash": format!("0x{}", hex::encode(hash.as_bytes())),
+    })
+}
+
 /// The body of an executed block named by [`ExecutedChainIndex::executed_hashes`].
 pub fn load_executed_block(storage: &StorageManager, hash: &Hash) -> Result<Block, LogIndexError> {
     storage
@@ -483,6 +689,42 @@ pub fn load_executed_block(storage: &StorageManager, hash: &Hash) -> Result<Bloc
         .ok_or_else(|| {
             LogIndexError::Unavailable(format!("executed chain broken: block {hash} has no body"))
         })
+}
+
+/// JSON-RPC method that reports [`executed_head`].
+pub const EXECUTED_HEAD_METHOD: &str = "citrate_executedHead";
+
+/// The persisted applied tip `(hash, height)`: the newest block whose
+/// transactions this node has executed, and the tip [`ExecutedChainIndex`]
+/// walks from when it serves `eth_getLogs`. `eth_blockNumber` reports the
+/// stored-header height instead, which can be ahead of this.
+///
+/// An error when no applied tip is persisted or it cannot be read. This never
+/// falls back to the height index: a store without a persisted tip has not
+/// proven that any block executed, so a client must not record log-scan
+/// progress against it.
+pub fn executed_head(storage: &StorageManager) -> Result<(Hash, u64), String> {
+    storage
+        .blocks
+        .get_applied_tip()
+        .map_err(|e| format!("applied tip: {e}"))?
+        .ok_or_else(|| "no applied tip is persisted (no block has executed yet)".to_string())
+}
+
+/// The `citrate_executedHead` response: `{"number": "0x…", "hash": "0x…"}`, or
+/// an internal error (-32603) when [`executed_head`] fails.
+pub fn executed_head_json(
+    storage: &StorageManager,
+) -> Result<serde_json::Value, jsonrpc_core::Error> {
+    let (hash, number) = executed_head(storage).map_err(|m| jsonrpc_core::Error {
+        code: jsonrpc_core::ErrorCode::InternalError,
+        message: format!("{EXECUTED_HEAD_METHOD}: {m}"),
+        data: None,
+    })?;
+    Ok(serde_json::json!({
+        "number": format!("0x{number:x}"),
+        "hash": format!("0x{}", hex::encode(hash.as_bytes())),
+    }))
 }
 
 /// The block the executor's state reflects: the persisted applied tip, or — on a
