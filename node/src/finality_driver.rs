@@ -440,6 +440,9 @@ pub fn spawn(
         };
         loop {
             tick.tick().await;
+            // A quorum checkpoint whose certificate write failed is retried
+            // here (capped backoff), not only when another vote arrives.
+            retry_finalizations(&gadget, Instant::now()).await;
             let tip = applicator.applied_tip().await;
             gadget.observe_tip(tip.height).await;
             let outbound = run_pass(
@@ -469,7 +472,20 @@ pub fn spawn(
 /// not be written (`FinalityGadget::retry_finalizations`), so finality does
 /// not wait for another vote that may never come.
 pub async fn retry_finalizations(gadget: &FinalityGadget, now: Instant) -> FinalizeRetryOutcome {
-    gadget.retry_finalizations(now).await
+    let out = gadget.retry_finalizations(now).await;
+    crate::metrics::record_finality_finalize_retry(
+        out.finalized.len().saturating_add(out.failed.len()),
+        out.finalized.len(),
+        out.pending,
+    );
+    if !out.failed.is_empty() {
+        warn!(
+            "checkpoint finality: certificate write still failing for {:?}; {} checkpoint(s) \
+             awaiting a finalize retry",
+            out.failed, out.pending
+        );
+    }
+    out
 }
 
 /// One driver pass over the applied tip `(tip_hash, tip_height)`: report the

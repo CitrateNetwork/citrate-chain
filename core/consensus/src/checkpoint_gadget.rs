@@ -180,8 +180,11 @@ pub const FINALIZE_RETRY_CAP: Duration = Duration::from_secs(30);
 /// [`FINALIZE_RETRY_BASE`] doubled per failure after the first, capped at
 /// [`FINALIZE_RETRY_CAP`] (`0` failures = the base delay).
 pub fn finalize_retry_delay(failures: u32) -> Duration {
-    let _ = failures;
-    Duration::ZERO
+    let doublings = failures.saturating_sub(1).min(31);
+    let factor = 1u32.checked_shl(doublings).unwrap_or(u32::MAX);
+    FINALIZE_RETRY_BASE
+        .checked_mul(factor)
+        .map_or(FINALIZE_RETRY_CAP, |d| d.min(FINALIZE_RETRY_CAP))
 }
 
 /// What one [`FinalityGadget::retry_finalizations`] tick did.
@@ -1082,11 +1085,15 @@ impl FinalityGadget {
                 votes: cp.votes.len(),
                 relay,
             },
-            Err(error) => InboundOutcome::FinalizeFailed {
-                height,
-                error,
-                relay,
-            },
+            Err(error) => {
+                self.note_finalize_failure(height, &error, Instant::now())
+                    .await;
+                InboundOutcome::FinalizeFailed {
+                    height,
+                    error,
+                    relay,
+                }
+            }
         }
     }
 
@@ -1182,6 +1189,7 @@ impl FinalityGadget {
             }
             Err(e) => {
                 warn!("checkpoint {}: finalize failed: {}", height, e);
+                self.note_finalize_failure(height, &e, Instant::now()).await;
                 false
             }
         }
@@ -1192,9 +1200,103 @@ impl FinalityGadget {
     /// delay has passed at `now`. Called on the driver's periodic tick, so a
     /// checkpoint whose certificate write failed finalizes once the store
     /// recovers even if no further vote ever arrives.
+    ///
+    /// Idempotent and never double-publishes: each attempt is an ordinary
+    /// `finalize_checkpoint` (serialized by the manager), so a checkpoint that
+    /// finalized meanwhile — through a late vote, or a concurrent tick — is no
+    /// longer pending and is simply dropped. A checkpoint that leaves the
+    /// pending set without finalizing (pruned below a later finalized height,
+    /// evicted) is dropped too. A failed attempt is fail-closed exactly like the
+    /// first one (no floor, nothing published, votes kept) and schedules the
+    /// next after [`finalize_retry_delay`], capped at [`FINALIZE_RETRY_CAP`];
+    /// retries continue while the checkpoint is pending with quorum. Bounded by
+    /// the pending set ([`crate::checkpoint::MAX_PENDING_CHECKPOINTS`]).
     pub async fn retry_finalizations(&self, now: Instant) -> FinalizeRetryOutcome {
-        let _ = now;
-        FinalizeRetryOutcome::default()
+        let mut out = FinalizeRetryOutcome::default();
+        let ready = self.manager.quorum_pending_heights().await;
+        let due: Vec<u64> = {
+            let mut st = self.state.lock().await;
+            st.finalize_retry.retain(|h, _| ready.contains(h));
+            // A quorum checkpoint not yet tracked (its finalization may still be
+            // in flight on the vote path) gets one base delay before a retry.
+            let first = now.checked_add(FINALIZE_RETRY_BASE).unwrap_or(now);
+            for h in &ready {
+                st.finalize_retry.entry(*h).or_insert(FinalizeRetry {
+                    failures: 0,
+                    next_at: first,
+                });
+            }
+            st.finalize_retry
+                .iter()
+                .filter(|(_, r)| r.next_at <= now)
+                .map(|(h, _)| *h)
+                .collect()
+        };
+        // No gadget lock is held across a finalization (module docs, lock order).
+        for height in due {
+            self.retry_attempts.fetch_add(1, Ordering::Relaxed);
+            match self.manager.finalize_checkpoint(height).await {
+                Ok(cp) => {
+                    let failed_before = self
+                        .state
+                        .lock()
+                        .await
+                        .finalize_retry
+                        .remove(&height)
+                        .map_or(0, |r| r.failures);
+                    self.retry_recovered.fetch_add(1, Ordering::Relaxed);
+                    info!(
+                        "checkpoint {}: finalized on retry ({} votes) after {} failed attempt(s)",
+                        cp.height,
+                        cp.votes.len(),
+                        failed_before
+                    );
+                    out.finalized.push(height);
+                }
+                Err(CheckpointError::BlockNotFound(_)) => {
+                    // No longer pending: finalized meanwhile by another path,
+                    // or pruned. Nothing to retry.
+                    self.state.lock().await.finalize_retry.remove(&height);
+                    debug!("checkpoint {}: retry found nothing pending", height);
+                }
+                Err(e) => {
+                    let mut st = self.state.lock().await;
+                    if let Some(r) = st.finalize_retry.get_mut(&height) {
+                        r.failures = r.failures.saturating_add(1);
+                        let delay = finalize_retry_delay(r.failures);
+                        r.next_at = now.checked_add(delay).unwrap_or(now);
+                        warn!(
+                            "checkpoint {}: finalize retry failed ({}; {} failure(s)); \
+                             nothing finalized, next attempt in {:?}",
+                            height, e, r.failures, delay
+                        );
+                    }
+                    out.failed.push(height);
+                }
+            }
+        }
+        if !out.finalized.is_empty() {
+            self.prune().await;
+        }
+        out.pending = self.state.lock().await.finalize_retry.len();
+        out
+    }
+
+    /// Record a failed finalization of `height` at `now` (the certificate write
+    /// failed) so [`Self::retry_finalizations`] retries it after the backoff.
+    async fn note_finalize_failure(&self, height: u64, error: &CheckpointError, now: Instant) {
+        if !matches!(error, CheckpointError::StorageError(_)) {
+            return;
+        }
+        let mut st = self.state.lock().await;
+        let entry = st.finalize_retry.entry(height).or_insert(FinalizeRetry {
+            failures: 0,
+            next_at: now,
+        });
+        entry.failures = entry.failures.saturating_add(1);
+        entry.next_at = now
+            .checked_add(finalize_retry_delay(entry.failures))
+            .unwrap_or(now);
     }
 
     /// Lifetime counters of [`Self::retry_finalizations`].

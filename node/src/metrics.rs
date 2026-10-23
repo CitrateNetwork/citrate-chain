@@ -122,6 +122,13 @@ pub const METRIC_FINALITY_CERT_MISMATCH_TOTAL: &str = "citrate_finality_certific
 pub const METRIC_FINALITY_VERIFIED_HEIGHT: &str = "citrate_finality_verified_height";
 /// The reorg floor actually enforced by the canonical applicator.
 pub const METRIC_FINALITY_FLOOR_HEIGHT: &str = "citrate_finality_floor_height";
+/// Finalize retries of a quorum checkpoint whose certificate write failed.
+pub const METRIC_FINALITY_FINALIZE_RETRIES_TOTAL: &str = "citrate_finality_finalize_retries_total";
+/// Finalize retries that finalized their checkpoint.
+pub const METRIC_FINALITY_FINALIZE_RETRY_RECOVERED_TOTAL: &str =
+    "citrate_finality_finalize_retry_recovered_total";
+/// Quorum checkpoints currently waiting for a finalize retry.
+pub const METRIC_FINALITY_FINALIZE_RETRY_PENDING: &str = "citrate_finality_finalize_retry_pending";
 
 // ============================================================================
 // Initialization
@@ -305,6 +312,18 @@ fn register_metric_descriptions() {
         METRIC_FINALITY_FLOOR_HEIGHT,
         "Reorg floor enforced by the canonical applicator (finalized height)"
     );
+    describe_counter!(
+        METRIC_FINALITY_FINALIZE_RETRIES_TOTAL,
+        "Finalize retries of quorum checkpoints whose certificate write failed"
+    );
+    describe_counter!(
+        METRIC_FINALITY_FINALIZE_RETRY_RECOVERED_TOTAL,
+        "Finalize retries that finalized their checkpoint"
+    );
+    describe_gauge!(
+        METRIC_FINALITY_FINALIZE_RETRY_PENDING,
+        "Quorum checkpoints waiting for a finalize retry (certificate not yet durable)"
+    );
 }
 
 // ============================================================================
@@ -425,6 +444,21 @@ pub fn record_finality_floor(halted: bool, verified_height: u64, floor_height: u
     gauge!(METRIC_FINALITY_HALTED, if halted { 1.0 } else { 0.0 });
     gauge!(METRIC_FINALITY_VERIFIED_HEIGHT, verified_height as f64);
     gauge!(METRIC_FINALITY_FLOOR_HEIGHT, floor_height as f64);
+}
+
+/// Record one finalize-retry tick: attempts made, checkpoints recovered, and
+/// checkpoints still waiting for a retry.
+pub fn record_finality_finalize_retry(attempts: usize, recovered: usize, pending: usize) {
+    if attempts > 0 {
+        counter!(METRIC_FINALITY_FINALIZE_RETRIES_TOTAL, attempts as u64);
+    }
+    if recovered > 0 {
+        counter!(
+            METRIC_FINALITY_FINALIZE_RETRY_RECOVERED_TOTAL,
+            recovered as u64
+        );
+    }
+    gauge!(METRIC_FINALITY_FINALIZE_RETRY_PENDING, pending as f64);
 }
 
 /// Count one checkpoint-finality safety stop (certificate mismatch / invalid).
