@@ -1,51 +1,9 @@
 // Comprehensive tests for the execution module
 
-use citrate_consensus::types::{
-    Block, BlockBuilder, Hash, PublicKey, Signature, Transaction as ConsensusTransaction, VrfProof,
-};
+use citrate_consensus::types::{Hash, PublicKey};
 use citrate_execution::{address_utils, types::*, Executor, StateDB};
 use primitive_types::U256;
 use std::sync::Arc;
-
-#[allow(dead_code)]
-fn create_test_block(height: u64) -> Block {
-    BlockBuilder::new()
-        .hash(Hash::new([height as u8; 32]))
-        .height(height)
-        .timestamp(1000000 + height * 10)
-        .blue_score(height * 10)
-        .blue_work((height as u128) * 1000)
-        .vrf_reveal(VrfProof {
-            proof: vec![0u8; 80],
-            output: Hash::default(),
-        })
-        .build_unhashed()
-}
-
-#[allow(dead_code)]
-fn create_test_transaction(
-    from: PublicKey,
-    to: Option<PublicKey>,
-    value: u128,
-    nonce: u64,
-) -> ConsensusTransaction {
-    let mut hash_bytes = [0u8; 32];
-    hash_bytes[0] = nonce as u8;
-
-    ConsensusTransaction {
-        hash: Hash::new(hash_bytes),
-        nonce,
-        from,
-        to,
-        value,
-        gas_limit: 21000,
-        gas_price: 20,
-        data: vec![],
-        signature: Signature::new([nonce as u8; 64]),
-        tx_type: None,
-        ..Default::default()
-    }
-}
 
 fn create_test_address(num: u8) -> Address {
     let mut addr = [0u8; 20];

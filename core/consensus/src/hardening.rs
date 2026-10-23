@@ -185,6 +185,41 @@ pub const RELEASE_GENESIS: &[(u64, [u8; 32])] = &[
     ),
 ];
 
+/// Canonical blocks compiled into this release, by release genesis: at each
+/// listed height the listed hash is the only block a node admits, so any other
+/// block at that height, and everything built on it, is refused from any peer.
+///
+/// An operator rollback (`citrate rollback`) records the withdrawn blocks only
+/// in the database of the node it ran on. A checkpoint carries the same
+/// decision to every node built from this release: a fresh node, a desktop
+/// node, or a fleet node restored from a copy.
+///
+/// 40204 (testnet_beta genesis): the 2026-10-15 rollback kept 365,784 =
+/// `0x63dcd4a8…2c56`; the network continued with 365,785 = `0x51482ff9…f3d2`.
+/// Heights are strictly increasing per genesis.
+pub const CANONICAL_CHECKPOINTS: &[([u8; 32], u64, [u8; 32])] = &[
+    (
+        hex32("1dcfc4909dd9fdcb0f03c823d627e4b2032cc86bef5fc4561030d6c64b9775f1"),
+        365_784,
+        hex32("63dcd4a8c7cd701080e242e5949402da93143bfd0659b3012e57998da4aa2c56"),
+    ),
+    (
+        hex32("1dcfc4909dd9fdcb0f03c823d627e4b2032cc86bef5fc4561030d6c64b9775f1"),
+        365_785,
+        hex32("51482ff9724a2f0cbf4fe678f3ce556f6222334d5b2a3f5eba8a2b52af0cf3d2"),
+    ),
+];
+
+/// The canonical checkpoints for the chain whose genesis block is `genesis`,
+/// as `(height, hash)` in height order; empty for any other genesis.
+pub fn canonical_checkpoints(genesis: &[u8; 32]) -> Vec<(u64, [u8; 32])> {
+    CANONICAL_CHECKPOINTS
+        .iter()
+        .filter(|(g, _, _)| g == genesis)
+        .map(|(_, h, b)| (*h, *b))
+        .collect()
+}
+
 // INVARIANT: compile-time only. Every call is inside a `const` item, so a bad
 // literal is a BUILD error, never a runtime panic. Pinned by the build itself and
 // by the release-genesis constants test in this module.
@@ -776,6 +811,49 @@ mod tests {
             ActivationSource::Unset,
         ] {
             assert!(!s.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn the_40204_genesis_pins_the_block_above_the_rollback_cut() {
+        let g = RELEASE_GENESIS[0].1;
+        let cps = canonical_checkpoints(&g);
+        assert_eq!(
+            cps,
+            vec![
+                (
+                    365_784,
+                    hex32("63dcd4a8c7cd701080e242e5949402da93143bfd0659b3012e57998da4aa2c56")
+                ),
+                (
+                    365_785,
+                    hex32("51482ff9724a2f0cbf4fe678f3ce556f6222334d5b2a3f5eba8a2b52af0cf3d2")
+                ),
+            ],
+            "365,784 is the kept block of the 2026-10-15 rollback; 365,785 the first block on it"
+        );
+    }
+
+    #[test]
+    fn another_genesis_has_no_checkpoints() {
+        assert!(canonical_checkpoints(&[0x5A; 32]).is_empty());
+        for (_, g) in &RELEASE_GENESIS[1..] {
+            assert!(
+                canonical_checkpoints(g).is_empty(),
+                "only the live 40204 genesis is pinned"
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_heights_are_strictly_increasing_per_genesis() {
+        for (g, _, _) in CANONICAL_CHECKPOINTS {
+            let hs: Vec<u64> = canonical_checkpoints(g).iter().map(|(h, _)| *h).collect();
+            assert!(hs.windows(2).all(|w| w[0] < w[1]), "{hs:?}");
+            assert!(
+                RELEASE_GENESIS.iter().any(|(_, r)| r == g),
+                "a checkpoint names a release genesis"
+            );
         }
     }
 }

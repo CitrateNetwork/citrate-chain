@@ -68,6 +68,7 @@ compile_error!(
 );
 mod contribution_recorder;
 mod dag_prune;
+mod finality_driver;
 mod genesis;
 mod hardening_rejoin;
 mod inference;
@@ -82,6 +83,7 @@ mod registry_sync;
 mod rollback;
 mod startup_guards;
 mod sync_peer;
+mod timing;
 
 use citrate_consensus::dag_store::DagStore;
 use citrate_consensus::ghostdag::GhostDag;
@@ -1217,37 +1219,179 @@ fn show_genesis_info() -> Result<()> {
 /// Encryption-at-rest key sourcing for a light-node / desktop deployment.
 ///
 /// The node itself is key-source-agnostic (`core/storage` was built so "the
-/// desktop GUI supplies the bytes, typically from the OS keyring"): when the
-/// `CITRATE_STORAGE_KEY` env var is present and holds exactly 64 lowercase/
-/// uppercase hex chars (32 bytes), storage-at-rest is enabled with that raw
-/// key via `EncryptionAtRestConfig::with_raw_key`. When the var is absent the
-/// node keeps the default plaintext path (servers / bootnodes / sequencers are
-/// unaffected). A malformed value is a hard error (fail closed) rather than a
-/// silent downgrade to plaintext — an operator who asked for encryption and
-/// typo'd the key must not get an unencrypted DB.
+/// desktop GUI supplies the bytes, typically from the OS keyring"). Two inputs:
 ///
-/// The key never touches disk from the node's side: the parent process
-/// (citrate-core's SidecarSupervisor) holds it in the OS keyring and passes it
-/// only through this env var to the spawned child. The commitment in
-/// `<data_dir>/encryption.meta` lets a wrong key fail fast on the next open.
+/// - `CITRATE_STORAGE_KEY_FILE` (preferred): the path of an owner-only file that
+///   holds the key as 64 hex chars. Only the path is in the environment, so the
+///   environment of this process (and of anything it starts) discloses nothing.
+///   On Unix the file must not be readable or writable by group or others.
+/// - `CITRATE_STORAGE_KEY`: the key itself as 64 hex chars. Kept for operator
+///   scripts and older desktop builds.
+///
+/// Setting both is an error. When neither is set the node keeps the default
+/// plaintext path (servers / bootnodes / sequencers are unaffected). A malformed
+/// value, an unreadable file or a loosely-permissioned file is a hard error (fail
+/// closed) rather than a silent downgrade to plaintext.
+///
+/// The commitment in `<data_dir>/encryption.meta` lets a wrong key fail fast on
+/// the next open.
+///
+/// The inputs are read once per process and the result is kept, so the inline
+/// key is removed from this process's environment right after it is read
+/// (nothing this node starts later inherits it) and every caller sees the same
+/// key.
 fn at_rest_encryption_from_env() -> Result<Option<EncryptionAtRestConfig>> {
-    let raw = match std::env::var("CITRATE_STORAGE_KEY") {
-        Ok(v) if !v.trim().is_empty() => v,
-        _ => return Ok(None),
+    static KEY: std::sync::OnceLock<
+        std::result::Result<Option<zeroize::Zeroizing<[u8; 32]>>, String>,
+    > = std::sync::OnceLock::new();
+    let key = KEY.get_or_init(|| {
+        let file = std::env::var_os(STORAGE_KEY_FILE_ENV);
+        let inline = take_env(STORAGE_KEY_ENV).map(|v| v.to_string());
+        storage_key_from(file, inline).map_err(|e| e.to_string())
+    });
+    match key {
+        Ok(k) => Ok(k
+            .as_ref()
+            .map(|k| EncryptionAtRestConfig::with_raw_key(**k))),
+        Err(e) => Err(anyhow::anyhow!("{e}")),
+    }
+}
+
+/// Read `name` from the environment and remove it, so the value is not left
+/// for anything this process reads or starts later. `None` when unset or not
+/// valid UTF-8 (the variable is removed either way).
+fn take_env(name: &str) -> Option<zeroize::Zeroizing<String>> {
+    let value = std::env::var(name).ok().map(zeroize::Zeroizing::new);
+    // `remove_var` races with a concurrent environment read in another thread.
+    // This runs once, during start-up, before the node spawns anything that
+    // reads the environment, and this crate is edition 2021 (where the call is
+    // not `unsafe`).
+    std::env::remove_var(name);
+    value
+}
+
+/// The env var holding the storage key inline (hex).
+const STORAGE_KEY_ENV: &str = "CITRATE_STORAGE_KEY";
+/// The env var naming an owner-only file that holds the storage key (hex).
+const STORAGE_KEY_FILE_ENV: &str = "CITRATE_STORAGE_KEY_FILE";
+
+/// The storage key from a key file path or an inline hex value (see
+/// [`at_rest_encryption_from_env`]). `None` when neither is set.
+fn storage_key_from(
+    file: Option<std::ffi::OsString>,
+    inline: Option<String>,
+) -> Result<Option<zeroize::Zeroizing<[u8; 32]>>> {
+    let inline = inline
+        .filter(|v| !v.trim().is_empty())
+        .map(zeroize::Zeroizing::new);
+    let Some(path) = file.filter(|p| !p.is_empty()).map(PathBuf::from) else {
+        let Some(raw) = inline else {
+            return Ok(None);
+        };
+        let key = parse_storage_key_hex(raw.trim(), STORAGE_KEY_ENV)?;
+        info!("Storage encryption-at-rest ENABLED (key from {STORAGE_KEY_ENV} env)");
+        return Ok(Some(key));
     };
-    let hex_str = raw.trim();
-    let bytes = hex::decode(hex_str)
-        .map_err(|_| anyhow::anyhow!("CITRATE_STORAGE_KEY must be 64 hex chars (32 bytes)"))?;
+    if inline.is_some() {
+        anyhow::bail!("set only one of {STORAGE_KEY_FILE_ENV} and {STORAGE_KEY_ENV}");
+    }
+    let raw = read_key_file(&path)?;
+    let key = parse_storage_key_hex(raw.trim(), STORAGE_KEY_FILE_ENV)?;
+    info!("Storage encryption-at-rest ENABLED (key from {STORAGE_KEY_FILE_ENV})");
+    Ok(Some(key))
+}
+
+/// Largest key file read (the key is 64 hex chars plus whitespace).
+const MAX_KEY_FILE_BYTES: u64 = 4096;
+
+/// Read the key file. On Unix it is opened once without following a symbolic
+/// link, and every check (regular file, owner-only mode, owned by this process's
+/// effective user) is made on the open handle, so the file checked is the file
+/// read.
+#[cfg(unix)]
+fn read_key_file(path: &std::path::Path) -> Result<zeroize::Zeroizing<String>> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let err = |e: std::io::Error| anyhow::anyhow!("{STORAGE_KEY_FILE_ENV} {}: {e}", path.display());
+    // O_NONBLOCK: opening a FIFO must not block start-up; it fails the
+    // regular-file check below instead.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                anyhow::anyhow!(
+                    "{STORAGE_KEY_FILE_ENV} {} is a symbolic link; name the key file itself",
+                    path.display()
+                )
+            } else {
+                err(e)
+            }
+        })?;
+    let meta = file.metadata().map_err(err)?;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    check_key_file(meta.is_file(), meta.permissions().mode(), meta.uid(), euid)
+        .map_err(|e| anyhow::anyhow!("{STORAGE_KEY_FILE_ENV} {}: {e}", path.display()))?;
+    let mut raw = zeroize::Zeroizing::new(String::new());
+    file.take(MAX_KEY_FILE_BYTES)
+        .read_to_string(&mut raw)
+        .map_err(err)?;
+    Ok(raw)
+}
+
+#[cfg(not(unix))]
+fn read_key_file(path: &std::path::Path) -> Result<zeroize::Zeroizing<String>> {
+    use std::io::Read;
+    let err = |e: std::io::Error| anyhow::anyhow!("{STORAGE_KEY_FILE_ENV} {}: {e}", path.display());
+    let file = std::fs::File::open(path).map_err(err)?;
+    if !file.metadata().map_err(err)?.is_file() {
+        anyhow::bail!(
+            "{STORAGE_KEY_FILE_ENV} {} is not a regular file",
+            path.display()
+        );
+    }
+    let mut raw = zeroize::Zeroizing::new(String::new());
+    file.take(MAX_KEY_FILE_BYTES)
+        .read_to_string(&mut raw)
+        .map_err(err)?;
+    Ok(raw)
+}
+
+/// The key file checks, on values taken from the open handle: a regular file,
+/// no group or other permission bits, owned by the process's effective user.
+#[cfg(unix)]
+fn check_key_file(is_file: bool, mode: u32, owner: u32, euid: u32) -> Result<()> {
+    if !is_file {
+        anyhow::bail!("is not a regular file");
+    }
+    let mode = mode & 0o777;
+    if mode & 0o077 != 0 {
+        anyhow::bail!("must be owner-only (mode {mode:o}; expected 600)");
+    }
+    if owner != euid {
+        anyhow::bail!("is owned by uid {owner}, not this process's user (uid {euid})");
+    }
+    Ok(())
+}
+
+/// 64 hex chars → the 32-byte storage key. `source` names the input in errors;
+/// the value itself is never echoed.
+fn parse_storage_key_hex(hex_str: &str, source: &str) -> Result<zeroize::Zeroizing<[u8; 32]>> {
+    let bytes = zeroize::Zeroizing::new(
+        hex::decode(hex_str)
+            .map_err(|_| anyhow::anyhow!("{source} must be 64 hex chars (32 bytes)"))?,
+    );
     if bytes.len() != 32 {
         anyhow::bail!(
-            "CITRATE_STORAGE_KEY must decode to exactly 32 bytes, got {}",
+            "{source} must decode to exactly 32 bytes, got {}",
             bytes.len()
         );
     }
-    let mut key = [0u8; 32];
+    let mut key = zeroize::Zeroizing::new([0u8; 32]);
     key.copy_from_slice(&bytes);
-    info!("Storage encryption-at-rest ENABLED (key from CITRATE_STORAGE_KEY env)");
-    Ok(Some(EncryptionAtRestConfig::with_raw_key(key)))
+    Ok(key)
 }
 
 async fn start_node(config: NodeConfig) -> Result<()> {
@@ -1867,9 +2011,13 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // The shared proposer selector — the SAME Arc the DAG store admits against and the
     // snapshot-sync rebuilds. production() disables the forgeable legacy VRF path.
     let validator_selector: Option<Arc<citrate_consensus::vrf::VrfProposerSelector>> =
-        validator_registry
-            .as_ref()
-            .map(|_| Arc::new(citrate_consensus::vrf::VrfProposerSelector::production()));
+        validator_registry.as_ref().map(|_| {
+            // PSET-EPOCH: judge each block against its own epoch's set.
+            Arc::new(
+                citrate_consensus::vrf::VrfProposerSelector::production()
+                    .with_snapshot_schedule(registry_sync::EPOCH, registry_sync::SNAPSHOT_LAG),
+            )
+        });
 
     let shared_dag_store = {
         let kv = Arc::new(persistent_dag::RocksDbKvStore::new(storage.db.clone()));
@@ -1914,6 +2062,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             committee_size: config.checkpoint.committee_size,
             quorum_threshold: config.checkpoint.quorum_threshold,
             chain_id: config.chain.chain_id,
+            vote_depth: config.checkpoint.vote_depth,
         };
         let kv = Arc::new(persistent_dag::RocksDbKvStore::new(storage.db.clone()));
         Arc::new(CheckpointManager::with_persistence(
@@ -1922,6 +2071,24 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             kv,
         ))
     };
+
+    // WP-S.3 Stage 1a: the checkpoint-finality producer path (propose / sign /
+    // broadcast / early-vote buffer / relay). Switched by the COMPILED pin for this
+    // chain (`checkpoint_gadget::CHECKPOINT_VOTING_PINS`, OFF for every chain in this
+    // release) — never by env or config. Committee source: the shared epoch-snapshot
+    // proposer selector (`validator_selector`, filled by registry_sync from
+    // `ValidatorRegistry.activeSet()` at each S(E)); `None` when no registry is
+    // configured, in which case no committee can be derived and nothing is proposed.
+    let finality_gadget = Arc::new(citrate_consensus::checkpoint_gadget::FinalityGadget::new(
+        checkpoint_manager.clone(),
+        validator_selector.clone(),
+    ));
+    let finality_voting_on = finality_gadget.enabled();
+    // Finalized height as OBSERVED (not enforced) while the producer path runs:
+    // backs the `finalized`/`safe` RPC tags without raising the reorg floor. Floor
+    // ENFORCEMENT needs the (height, hash) certificate check of spec §4.5 (Stage
+    // 1c); raising the floor on height alone could pin this node to a losing branch.
+    let finality_observed = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // EXECUTE-ON-RECEIVE (step 2): the fast-path applier. Active under v2 headers
     // (CITRATE_BLOCK_V2) — the flag that makes a block's state_root reproducible by a
@@ -1986,10 +2153,27 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // I4: keep the reorg floor in sync with BFT finality so a reorg can
             // never revert below a finalized checkpoint. Cheap poll (the applied
             // height advances ~1/s); the floor is monotonic in the checkpoint mgr.
-            let floor = app.finalized_height_handle();
+            //
+            // WP-S.3 Stage 1a: when the producer path is ON, checkpoints really
+            // finalize, and raising the floor on HEIGHT alone is exactly what spec
+            // §4.5 forbids (it must first check the certified hash is this node's
+            // canonical block). So with the switch ON the poll publishes into the
+            // OBSERVED handle only (RPC tags) and leaves the reorg floor at its
+            // value; hash-checked enforcement is Stage 1c. With the switch OFF this
+            // is the unchanged pre-Stage-1a poll (nothing can finalize then).
+            let floor = if finality_voting_on {
+                info!(
+                    "checkpoint finality: finalized height is OBSERVED only (RPC tags); reorg \
+                     floor enforcement awaits the §4.5 certificate check"
+                );
+                finality_observed.clone()
+            } else {
+                app.finalized_height_handle()
+            };
             let cp = checkpoint_manager.clone();
             tokio::spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+                // #310: Skip — no burst of floor polls after a stall.
+                let mut tick = timing::cadence_interval(std::time::Duration::from_secs(5));
                 loop {
                     tick.tick().await;
                     let h = cp.latest_finalized_height().await;
@@ -2026,11 +2210,23 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // block 1 against a zero selected-parent and orphans it.
     block_admission.seed_genesis().await;
 
+    // A database that followed a branch the release's canonical checkpoints
+    // exclude stays on it: admission refuses the network's blocks above it.
+    // Say so plainly; the fix is to move the chain data aside and resync.
+    for (height, stored, canonical) in block_admission.stored_checkpoint_conflicts() {
+        error!(
+            "chain data holds block {stored} at height {height}, but this network's canonical \
+             block there is {canonical}: this database is on a branch the network does not \
+             continue. Stop the node, move the chain data aside (keep the keys) and resync."
+        );
+    }
+
     // SYNC-S1 D3: bound DagStore memory. D1 made per-block retention O(1)
     // instead of Theta(N²), but the DAG store still keeps every block it has
     // admitted — measured at ~16 KB/block on the G3 fleet run, i.e. a 3.9 GB
     // follower runs out near 150k blocks. Opt-in via CITRATE_DAG_PRUNE_RETAIN
-    // (no-op when unset) because the merge-block score path is not yet bounded.
+    // (no-op when unset). Merge blocks are scored from a bounded window
+    // (MS-BOUND, ghostdag::MERGE_SCORE_WINDOW), so pruning no longer breaks them.
     dag_prune::spawn(storage.clone(), shared_dag_store.clone());
 
     // D2.4: repair partial admissions already on disk. Any node that ran a
@@ -2316,7 +2512,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // the node advances to head unattended. No-op when there is nothing to drain.
         if let Some(app) = canonical_applicator.clone() {
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                // #310: Skip — a drain that ran long is followed by one
+                // more pass, not a back-to-back burst competing with the
+                // producer for the advance lock.
+                let mut interval = timing::cadence_interval(std::time::Duration::from_secs(1));
                 loop {
                     interval.tick().await;
                     app.drive_drain().await;
@@ -2382,7 +2581,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             let advertised_head = advertised_head.clone();
             let storage_head = storage.clone();
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                // #310: Skip — head advertisement keeps its 1 s cadence.
+                let mut interval = timing::cadence_interval(std::time::Duration::from_secs(1));
                 loop {
                     interval.tick().await;
                     if let Ok(Some((hash, height))) = storage_head.blocks.get_applied_tip() {
@@ -2513,7 +2713,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             let mut rotate_idx: u64 = 0;
             // #155: last peer we logged choosing, so SYNCPEER only fires on change.
             let mut last_logged_choice: Option<String> = None;
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+            // #310: Skip — a slow sync round must not be followed by a burst
+            // of back-to-back block requests to peers.
+            let mut interval = timing::cadence_interval(std::time::Duration::from_secs(2));
             loop {
                 interval.tick().await;
                 // Snapshot every CONNECTED peer with the head it advertises. The
@@ -2852,7 +3054,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // path (constructed at function scope above, alongside the genesis seed
         // and the startup reconcile).
         let admission_for_net = block_admission.clone();
-        let checkpoint_mgr_for_net = checkpoint_manager.clone();
+        // WP-S.3 Stage 1a: inbound votes go through the gadget, which (switch OFF)
+        // takes exactly the old submit_vote -> finalize path, or (switch ON) also
+        // buffers early votes and returns accepted votes for one re-gossip.
+        let finality_gadget_for_net = finality_gadget.clone();
         // #85: the success half of the sync-peer accounting (invariant I3) —
         // the tick task can only ever observe timeouts, so the peer that
         // actually answers has to be credited from the receive side.
@@ -3544,33 +3749,62 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             voter: PublicKey::new(voter_bytes),
                             signature: Signature::new(sig_bytes),
                         };
-                        match checkpoint_mgr_for_net.submit_vote(vote).await {
-                            Ok(true) => {
+                        use citrate_consensus::checkpoint_gadget::InboundOutcome;
+                        let outcome = finality_gadget_for_net.on_inbound_vote(vote).await;
+                        match &outcome {
+                            InboundOutcome::Finalized { height, votes, .. } => {
                                 tracing::info!(
                                     "Checkpoint quorum reached at height {}, finalizing",
                                     height
                                 );
-                                match checkpoint_mgr_for_net.finalize_checkpoint(height).await {
-                                    Ok(cp) => tracing::info!(
-                                        "Checkpoint finalized at height {} with {} votes",
-                                        cp.height,
-                                        cp.votes.len()
-                                    ),
-                                    Err(e) => tracing::warn!(
-                                        "Failed to finalize checkpoint at height {}: {}",
-                                        height,
-                                        e
-                                    ),
-                                }
+                                tracing::info!(
+                                    "Checkpoint finalized at height {} with {} votes",
+                                    height,
+                                    votes
+                                );
                             }
-                            Ok(false) => {
+                            InboundOutcome::FinalizeFailed { height, error, .. } => {
+                                tracing::info!(
+                                    "Checkpoint quorum reached at height {}, finalizing",
+                                    height
+                                );
+                                tracing::warn!(
+                                    "Failed to finalize checkpoint at height {}: {}",
+                                    height,
+                                    error
+                                );
+                            }
+                            InboundOutcome::Accepted { .. } => {
                                 tracing::debug!("Checkpoint vote accepted for height {}", height)
                             }
-                            Err(e) => tracing::warn!(
+                            InboundOutcome::Buffered => tracing::debug!(
+                                "Checkpoint vote for height {} buffered (not yet proposed here)",
+                                height
+                            ),
+                            // Switch ON: a duplicate is the routine echo of a relayed
+                            // vote — not worth a warning per peer.
+                            InboundOutcome::Rejected(
+                                citrate_consensus::CheckpointError::DuplicateVote(_),
+                            ) if finality_gadget_for_net.enabled() => tracing::debug!(
+                                "Checkpoint vote from peer {} already counted",
+                                pid.0
+                            ),
+                            InboundOutcome::Rejected(e) => tracing::warn!(
                                 "Checkpoint vote rejected from peer {}: {}",
                                 pid.0,
                                 e
                             ),
+                        }
+                        // §11.5 relay: re-gossip a vote this node accepted for the first
+                        // time. Duplicates are rejected above and never relayed, so a
+                        // vote crosses each node at most once (no loop). Never `Some`
+                        // with the switch OFF.
+                        if let Some(relay) = outcome.relay() {
+                            finality_driver::broadcast_votes(
+                                &pm_for_rx,
+                                std::slice::from_ref(relay),
+                            )
+                            .await;
                         }
                     }
                     _ => {
@@ -3649,7 +3883,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             let mut last_processed = 0u64;
             let mut last_drops = 0u64;
             let mut stalled_samples = 0u32;
-            let mut interval = tokio::time::interval(CHECK_EVERY);
+            // #310: Delay — every sample covers a full CHECK_EVERY window, so
+            // a late tick is never followed by a second sample over ~0 s.
+            let mut interval = timing::sampling_interval(CHECK_EVERY);
             loop {
                 interval.tick().await;
                 let processed = msgs_processed.load(std::sync::atomic::Ordering::Relaxed);
@@ -3786,9 +4022,31 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // the same `finalized_height` handle the canonical applicator exposes and
             // the 5 s finality poll keeps current. None (no applicator) => tags resolve
             // to genesis (block 0), never error.
-            canonical_applicator
-                .as_ref()
-                .map(|app| app.finalized_height_handle()),
+            // WP-S.3 Stage 1a: with the producer path ON the tags read the OBSERVED
+            // finalized height (the floor itself is not raised until Stage 1c).
+            canonical_applicator.as_ref().map(|app| {
+                if finality_voting_on {
+                    finality_observed.clone()
+                } else {
+                    app.finalized_height_handle()
+                }
+            }),
+            // UI truth contract §9: the identity this process computed at start-up.
+            // Version/git from the build stamp (node/build.rs), the consensus
+            // fingerprint from ConsensusManifest (after the PBA + agent-fork heights
+            // were published), the activation fingerprint from the resolved PBA
+            // activation, and the GhostDAG params the shared GhostDag runs with.
+            Some({
+                let manifest = consensus_manifest::ConsensusManifest::current();
+                citrate_api::NodeIdentity {
+                    version: manifest.version.to_string(),
+                    git_sha: manifest.git_sha.to_string(),
+                    git_dirty: manifest.git_dirty,
+                    activation_fingerprint: pba_activation.fingerprint(&manifest.fingerprint),
+                    consensus_fingerprint: manifest.fingerprint,
+                    ghostdag_params: Some(shared_ghostdag.params().clone()),
+                }
+            }),
         );
 
         // PIL-12: spawn the Ethereum-compatible subscription server next
@@ -3890,6 +4148,36 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     } else {
         None
     };
+
+    // WP-S.3 Stage 1a (spec D-4): the checkpoint vote signer is THIS consensus
+    // identity — the `proposer.key` loaded above, whose pubkey is the one registered
+    // in `ValidatorRegistry` and therefore the one `activeSet()` (the committee
+    // source) lists. No other key source exists or is introduced. A node without a
+    // coinbase has no consensus identity: it still proposes + aggregates, never signs.
+    // Spawned only when the compiled switch is ON for this chain.
+    if finality_voting_on {
+        match &canonical_applicator {
+            Some(app) => {
+                if validator_selector.is_none() {
+                    warn!(
+                        "checkpoint finality: producer path ON but no ValidatorRegistry is \
+                         configured — no committee can be derived, nothing will be proposed"
+                    );
+                }
+                finality_driver::spawn(
+                    finality_gadget.clone(),
+                    app.clone(),
+                    storage.clone(),
+                    peer_manager.clone(),
+                    proposer_signing_key.clone(),
+                );
+            }
+            None => warn!(
+                "checkpoint finality: producer path ON but execute-on-receive is disabled — \
+                 no canonical applied chain to bury checkpoints on; not started"
+            ),
+        }
+    }
 
     if config.mining.enabled && coinbase_is_valid {
         info!("Starting block producer...");
@@ -4277,6 +4565,140 @@ mod noise_key_file_tests {
             "loose permissions must be tightened"
         );
         assert_eq!(kp.derive_peer_id(), reloaded.derive_peer_id());
+    }
+}
+
+#[cfg(test)]
+mod storage_key_source_tests {
+    use super::*;
+
+    const KEY_HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    fn key_file(dir: &std::path::Path, body: &str, mode: u32) -> PathBuf {
+        let path = dir.join("storage.key");
+        std::fs::write(&path, body).expect("write key file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("chmod key file");
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        path
+    }
+
+    fn expected() -> [u8; 32] {
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&hex::decode(KEY_HEX).expect("hex"));
+        k
+    }
+
+    #[test]
+    fn neither_input_keeps_plaintext() {
+        assert!(storage_key_from(None, None).expect("ok").is_none());
+        assert!(storage_key_from(Some("".into()), Some("  ".into()))
+            .expect("ok")
+            .is_none());
+    }
+
+    #[test]
+    fn inline_hex_still_works() {
+        let k = storage_key_from(None, Some(format!(" {KEY_HEX}\n")))
+            .expect("ok")
+            .expect("key");
+        assert_eq!(*k, expected());
+    }
+
+    #[test]
+    fn key_file_is_read_and_trimmed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = key_file(dir.path(), &format!("{KEY_HEX}\n"), 0o600);
+        let k = storage_key_from(Some(path.into_os_string()), None)
+            .expect("ok")
+            .expect("key");
+        assert_eq!(*k, expected());
+    }
+
+    #[test]
+    fn both_inputs_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = key_file(dir.path(), KEY_HEX, 0o600);
+        let err = storage_key_from(Some(path.into_os_string()), Some(KEY_HEX.into()))
+            .expect_err("both set");
+        assert!(err.to_string().contains("only one of"), "{err}");
+    }
+
+    #[test]
+    fn missing_key_file_fails_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = storage_key_from(Some(dir.path().join("absent").into_os_string()), None)
+            .expect_err("missing file");
+        assert!(err.to_string().contains(STORAGE_KEY_FILE_ENV), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn loosely_permissioned_key_file_fails_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for mode in [0o644, 0o640, 0o604, 0o660] {
+            let path = key_file(dir.path(), KEY_HEX, mode);
+            let err = storage_key_from(Some(path.into_os_string()), None).expect_err("loose mode");
+            assert!(err.to_string().contains("owner-only"), "{mode:o}: {err}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_directory_is_not_a_key_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err =
+            storage_key_from(Some(dir.path().as_os_str().to_owned()), None).expect_err("directory");
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_key_file_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = key_file(dir.path(), KEY_HEX, 0o600);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let err = storage_key_from(Some(link.into_os_string()), None).expect_err("symlink");
+        assert!(err.to_string().contains("symbolic link"), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_key_file_owned_by_another_user_is_refused() {
+        // The owner check itself, with an injected effective uid (creating a
+        // file owned by someone else needs root).
+        assert!(check_key_file(true, 0o600, 1000, 1000).is_ok());
+        let err = check_key_file(true, 0o600, 0, 1000).expect_err("other owner");
+        assert!(err.to_string().contains("owned by"), "{err}");
+        assert!(check_key_file(false, 0o600, 1000, 1000).is_err());
+        assert!(check_key_file(true, 0o640, 1000, 1000).is_err());
+    }
+
+    #[test]
+    fn the_inline_key_is_removed_from_the_environment_after_reading() {
+        const NAME: &str = "CITRATE_TEST_STORAGE_KEY_TAKE_ENV";
+        std::env::set_var(NAME, KEY_HEX);
+        let got = take_env(NAME).expect("value");
+        assert_eq!(got.as_str(), KEY_HEX);
+        assert!(std::env::var_os(NAME).is_none(), "still in the environment");
+        assert!(take_env(NAME).is_none());
+    }
+
+    #[test]
+    fn malformed_key_never_echoes_the_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secretish = "zz".repeat(32);
+        let path = key_file(dir.path(), &secretish, 0o600);
+        let err = storage_key_from(Some(path.into_os_string()), None).expect_err("bad hex");
+        assert!(!err.to_string().contains(&secretish), "{err}");
+        let short = storage_key_from(None, Some("00ff".into())).expect_err("short");
+        assert!(short.to_string().contains("exactly 32 bytes"), "{short}");
     }
 }
 
