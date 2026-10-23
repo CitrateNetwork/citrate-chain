@@ -850,3 +850,116 @@ fn executed_chain_index_keeps_checkpoints_below_the_fork_point() {
         other[(3_000 - deep - 1) as usize..=(3_010 - deep - 1) as usize].to_vec()
     );
 }
+
+/// The same tx is in the executed block and in a sibling that lost fork
+/// choice, and the stored receipt names the sibling (this node produced it).
+/// That receipt does not describe the executed block's run of the tx, so its
+/// logs are not served at that height; the other tx's logs are, with logIndex
+/// counted over the served receipts only.
+#[test]
+fn getlogs_skips_a_receipt_that_names_a_lost_sibling_for_the_same_tx() {
+    let (storage, _tmp) = storage();
+    let g = block(hash_of(0xEE, 0), Hash::default(), vec![], 0, vec![]);
+    storage.blocks.put_block(&g).expect("g");
+    let shared = tx(0xD1, 1);
+    let own = tx(0xD2, 1);
+    // The lost sibling, produced here first: its receipt for `shared` is stored.
+    let lost = block(hash_of(0xB0, 1), g.hash(), vec![], 1, vec![shared.clone()]);
+    storage.blocks.put_block(&lost).expect("lost");
+    put_receipt(&storage, &lost, &shared, 0xD1, 2);
+    // The executed block carries the same tx, then one of its own.
+    let exec = block(
+        hash_of(0xA0, 1),
+        g.hash(),
+        vec![],
+        1,
+        vec![shared.clone(), own.clone()],
+    );
+    storage.blocks.put_block(&exec).expect("exec");
+    put_receipt(&storage, &exec, &own, 0xD2, 1);
+    let top = block(hash_of(0xA0, 2), exec.hash(), vec![lost.hash()], 2, vec![]);
+    storage.blocks.put_block(&top).expect("top");
+    storage.blocks.put_applied_tip(&top.hash(), 2).expect("tip");
+
+    let io = io(storage.clone());
+    let got = logs(
+        &io,
+        serde_json::json!({"fromBlock": "0x1", "toBlock": "0x1"}),
+    );
+    assert!(
+        got.iter().all(|l| l["blockHash"] != hx(&lost.hash())),
+        "a receipt naming the lost sibling was served at the executed height: {got:?}"
+    );
+    assert!(
+        got.iter().all(|l| l["transactionHash"] != hx(&shared.hash)),
+        "{got:?}"
+    );
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0]["blockHash"], hx(&exec.hash()));
+    assert_eq!(got[0]["transactionHash"], hx(&own.hash));
+    assert_eq!(got[0]["transactionIndex"], "0x1");
+    assert_eq!(got[0]["logIndex"], "0x0");
+}
+
+/// A cached checkpoint whose block has been purged from the store is not
+/// trusted: the request errors (-32603, never a shortened answer) and the cache
+/// is dropped. Once the block is stored again, the range is served from the tip.
+#[test]
+fn executed_chain_index_drops_a_checkpoint_whose_block_was_purged() {
+    let (storage, _tmp) = storage();
+    let top = SETTLED_DEPTH + CHECKPOINT_STRIDE + 10;
+    let canon = straight_chain(&storage, top);
+    let idx = ExecutedChainIndex::new();
+    idx.executed_hashes(&storage, 0, 10).expect("warm");
+    assert_eq!(idx.checkpoint_count(), 2, "checkpoints at 0 and 1024");
+
+    let purged = storage
+        .blocks
+        .get_block(&canon[1_024])
+        .expect("read")
+        .expect("block");
+    storage.blocks.delete_block(&canon[1_024]).expect("purge");
+    match idx.executed_hashes(&storage, 1_000, 1_000) {
+        Err(LogIndexError::Unavailable(m)) => assert!(m.contains("not stored"), "{m}"),
+        other => panic!("expected Unavailable over a purged block, got {other:?}"),
+    }
+    assert_eq!(
+        idx.checkpoint_count(),
+        0,
+        "a checkpoint whose block is gone must be dropped, not kept"
+    );
+
+    storage.blocks.put_block(&purged).expect("re-store");
+    let got = idx.executed_hashes(&storage, 1_000, 1_000).expect("page");
+    assert_eq!(got, vec![(1_000, canon[1_000])]);
+}
+
+/// A selected parent that claims a height at or above its child is a malformed
+/// executed chain: an error, not an answer that skips the bad block.
+#[test]
+fn executed_chain_index_errors_on_a_parent_above_its_child() {
+    let (storage, _tmp) = storage();
+    let g = block(hash_of(0xA0, 0), Hash::default(), vec![], 0, vec![]);
+    storage.blocks.put_block(&g).expect("g");
+    let a1 = block(hash_of(0xA0, 1), g.hash(), vec![], 1, vec![]);
+    storage.blocks.put_block(&a1).expect("a1");
+    // Height 3, but the selected parent of the height-2 tip.
+    let bad = block(hash_of(0xBA, 3), a1.hash(), vec![], 3, vec![]);
+    storage.blocks.put_block(&bad).expect("bad");
+    let t2 = block(hash_of(0xA0, 2), bad.hash(), vec![], 2, vec![]);
+    storage.blocks.put_block(&t2).expect("t2");
+    storage.blocks.put_applied_tip(&t2.hash(), 2).expect("tip");
+
+    let idx = ExecutedChainIndex::new();
+    match idx.executed_hashes(&storage, 0, 2) {
+        Err(LogIndexError::Unavailable(m)) => assert!(m.contains("malformed"), "{m}"),
+        other => panic!("expected a malformed-chain error, got {other:?}"),
+    }
+    let io = io(storage.clone());
+    let v = call(
+        &io,
+        "eth_getLogs",
+        serde_json::json!([{"fromBlock": "0x0", "toBlock": "0x2"}]),
+    );
+    assert_eq!(v["error"]["code"], -32603, "{v}");
+}
