@@ -34,8 +34,10 @@
 #   --from and --only. Only the fresh-deployer nonce-0 check is limited to a new ceremony
 #   (no --from/--only).
 #
-# Signing: --account NAME (Foundry keystore) and optionally --password-file PATH. A raw key
-# (--private-key, or PRIVATE_KEY/DEPLOYER_PRIVATE_KEY in the environment) is refused.
+# Signing: --account NAME (Foundry keystore) and optionally --password-file PATH, which every
+# broadcasting phase gets, P2's regenesis.sh included (as the path; neither script reads or
+# prints the file). A raw key (--private-key, or PRIVATE_KEY/DEPLOYER_PRIVATE_KEY in the
+# environment) and a password on the command line (--password) are refused.
 #
 # Inputs (env). Values marked OPEN are owner decisions recorded in the runbook §2:
 #   RPC_URL, DEPLOYER_ADDRESS, EXPECTED_CHAIN_ID (40204), EXPECTED_GENESIS_HASH (from the cut)
@@ -74,7 +76,12 @@
 #      and P5 reads ValidatorRegistry.governance()/slasher() (= GOVERNANCE) and
 #      pendingGovernance() (= 0) from the chain.
 #   C5 handover over the exact outputs: P5 merges only books bound to the manifest (deployer,
-#      governance contracts, and the vesting/dormant contract maps, recorded at first use).
+#      governance contracts, and the vesting/dormant contract maps). P3 and P4 record their
+#      book's contract map (teamVesting, dormantLedgers) when they write it, after checking it
+#      names the run's deployer (C9) and, on --confirm, that every contract in it is a
+#      deployment in this run's broadcasts of that step (P4's governance entries must be the
+#      run's recorded governance). A --confirm step that writes no book, or a book that fails
+#      these checks, fails the step; --confirm P5 refuses a book its step did not record.
 #   C6 no redeploy over the exact KEEP list: the KEEP list's sha256 is recorded at P0 (or at
 #      first use) and P6 refuses another; keep_check matches each row's contract_name to the
 #      broadcast deployments at its pinned address.
@@ -149,6 +156,8 @@ while [[ $# -gt 0 ]]; do
     --only) ONLY="${2:-}"; shift 2 ;;
     --account) ACCOUNT="${2:-}"; shift 2 ;;
     --password-file) PASSWORD_FILE="${2:-}"; shift 2 ;;
+    # Never echo the value: it is the password.
+    --password | --password=*) die "a keystore password on the command line is refused; pass --password-file PATH" 1 ;;
     --private-key | --private-key=*) die "raw private keys are refused; sign with --account (Foundry keystore)" 1 ;;
     -h | --help)
       sed -n '2,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//' >&2
@@ -158,6 +167,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 refuse_raw_keys
+# The keystore password reaches forge (P1/P3/P4) and regenesis.sh (P2) only as this path. The
+# value is not echoed on refusal: a caller that passed the password itself in its place must
+# not see it in the log.
+if [[ -n "$PASSWORD_FILE" ]]; then
+  [[ -n "$ACCOUNT" ]] || die "--password-file needs --account (it unlocks that keystore)" 1
+  [[ -f "$PASSWORD_FILE" && -r "$PASSWORD_FILE" ]] || die "--password-file must name a readable file (the path to the keystore password, not the password)" 1
+fi
 
 # The one output directory, as forge sees it (relative to contracts/) and as this script
 # sees it (absolute). Lexical normalisation only, so it works before the directory exists.
@@ -194,7 +210,7 @@ should() {
 }
 gate_fail() {
   err "GATE FAIL at $1: $2"
-  err "fix it, then resume: $0 --$MODE --from $1 ${ACCOUNT:+--account $ACCOUNT}"
+  err "fix it, then resume: $0 --$MODE --from $1 ${ACCOUNT:+--account $ACCOUNT}${PASSWORD_FILE:+ --password-file $PASSWORD_FILE}"
   exit 3
 }
 step_fail() {
@@ -546,6 +562,82 @@ check_fee_recipients() {
   fi
 }
 
+# record_output_book <phase> <key> <book> <script> [governance json]: C5 + C9 for the book a
+# P3/P4 step writes, at the step that writes it. The book must name the run manifest's
+# deployer and list well-formed contracts; on --confirm it must exist, and every contract in
+# it must be a CREATE/CREATE2 in this run's <script> broadcasts (run-*.json recorded since
+# this chain's block 0), except the governance contracts P4 records by reference, which must
+# be this run's recorded governance (as must the book's "governance" field). The contract map
+# is then recorded in the run manifest under <key>; --confirm P5 sweeps only what was
+# recorded there. A --simulate step broadcasts nothing, so there the broadcast check is
+# skipped and a missing book is only noted.
+record_output_book() {
+  local ph="$1" key="$2" book="$3" script="$4" gov="${5:-}" why rec cj
+  if [[ ! -f "$book" ]]; then
+    [[ "$MODE" == confirm ]] && gate_fail "$ph" "$book missing after ${script%.s.sol}: the step wrote no book, so nothing it deployed can be swept"
+    log "$ph note: $book absent after a simulation; nothing recorded"
+    return 0
+  fi
+  is_addr "${RUN_DEPLOYER:-}" && [[ "${RUN_G0TS:-}" =~ ^[0-9]+$ ]] || gate_fail "$ph" "no run deployer or block-0 timestamp (the P0 run manifest did not load)"
+  rec=$("$PY" - "$book" "$RUN_DEPLOYER" "$CONTRACTS/broadcast/$script/$EXPECTED_CHAIN_ID" "$RUN_G0TS" "$MODE" "$gov" "$script" <<'PY' 2>&1
+import glob, json, re, sys
+book_p, dep, bdir, since, mode, gov, script = sys.argv[1:8]
+since = int(since)
+ADDR = re.compile(r"0x[0-9a-fA-F]{40}")
+try:
+    with open(book_p) as f:
+        book = json.load(f)
+except (OSError, ValueError) as e:
+    sys.exit(f"cannot read {book_p}: {e}")
+if not isinstance(book, dict):
+    sys.exit(f"{book_p} is not a JSON object")
+bdep = book.get("deployer")
+if not isinstance(bdep, str) or not ADDR.fullmatch(bdep) or bdep.lower() != dep:
+    sys.exit(f"{book_p} names deployer {str(bdep).lower()}, not this run's {dep}")
+c = book.get("contracts")
+if not isinstance(c, dict) or not c:
+    sys.exit(f"{book_p} has no contracts")
+for name, a in c.items():
+    if not isinstance(a, str) or not ADDR.fullmatch(a) or int(a, 16) == 0:
+        sys.exit(f"{book_p} .contracts.{name} is not an address")
+refs = json.loads(gov) if gov else {}
+for name, want in refs.items():
+    if name in c and c[name].lower() != want:
+        sys.exit(f"{book_p}: {name} is {c[name].lower()}, this run's is {want}")
+if refs and "governance" in book and str(book["governance"]).lower() != refs.get("GovernanceTimelock"):
+    sys.exit(f"{book_p}: governance is {str(book['governance']).lower()}, this run's is {refs.get('GovernanceTimelock')}")
+if mode != "confirm":
+    print(f"{len(c)} contract(s), deployer {dep}; a simulation has no broadcast to check")
+    sys.exit(0)
+created, runs = set(), 0
+for p in sorted(glob.glob(f"{bdir}/run-*.json")):
+    try:
+        with open(p) as f:
+            run = json.load(f)
+    except (OSError, ValueError) as e:
+        sys.exit(f"cannot read {p}: {e}")
+    ts = run.get("timestamp") if isinstance(run, dict) else None
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+        sys.exit(f"{p} has no timestamp")
+    if (ts / 1000 if ts > 10**12 else ts) < since:
+        continue
+    runs += 1
+    for tx in run.get("transactions") or []:
+        if tx.get("transactionType") in ("CREATE", "CREATE2") and isinstance(tx.get("contractAddress"), str):
+            created.add(tx["contractAddress"].lower())
+if not runs:
+    sys.exit(f"no {script} broadcast since this chain's block 0 in {bdir}")
+for name, a in sorted(c.items()):
+    if name not in refs and a.lower() not in created:
+        sys.exit(f"{book_p}: {name} {a.lower()} is not a deployment in this run's {script} broadcasts")
+print(f"{len(c)} contract(s), deployer {dep}, each deployed by this run's {script} broadcasts" + (" or this run's governance" if refs else ""))
+PY
+  ) || gate_fail "$ph" "$rec"
+  cj=$(book_contracts_json "$book") || gate_fail "$ph" "$book has no well-formed contracts"
+  why=$(manifest_bind bind "$RUN_MANIFEST" "$key" "$cj" 2>&1) || gate_fail "$ph" "cannot record $book: $why"
+  log "$ph $(basename "$book") recorded in the run manifest ($key): $rec"
+}
+
 log "mode=$MODE from=$FROM${ONLY:+ only=$ONLY} chain=$EXPECTED_CHAIN_ID"
 
 # The governance addresses every later phase uses come from P1's output, never from a constant.
@@ -722,8 +814,9 @@ if should P2; then
   # --confirm: the council the registry will be governed by is proven on chain first (C3).
   load_governance P2 "$([[ "$MODE" == confirm ]] && echo 1 || echo 0)"
   rargs=(--reroll --with-aa)
-  # regenesis.sh takes --account only; the keystore password comes from forge's own prompt.
-  if [[ "$MODE" == confirm ]]; then rargs+=(--broadcast --account "$ACCOUNT"); fi
+  # The keystore account and, when given, the password file (a path, never the password) go
+  # through to every forge step regenesis.sh runs, as P1/P3/P4 get them (SIGN).
+  if [[ "$MODE" == confirm ]]; then rargs+=(--broadcast "${SIGN[@]}"); fi
   log "P2 contract stack via regenesis.sh; address book → $ADDRESS_BOOK (fresh genesis)"
   if [[ "$MODE" == dry ]]; then
     describe_cmd RPC_URL='$RPC_URL' DEPLOYER_ADDRESS='$DEPLOYER_ADDRESS' EMIT_FRESH_GENESIS=1 EMIT_DEPLOYER='<manifest deployer>' \
@@ -762,6 +855,7 @@ if should P3; then
   export TEAM_VESTING_FILE="${TEAM_VESTING_FILE:-genesis/team-vesting.input.json}" TEAM_VESTING_OUT="$VEST_REL"
   log "P3 team vesting → $VEST_BOOK"
   forge_phase P3 DeployTeamVesting.s.sol
+  if [[ "$MODE" != dry ]]; then record_output_book P3 teamVesting "$VEST_BOOK" DeployTeamVesting.s.sol; fi
 fi
 
 # ---------------------------------------------------------------- P4
@@ -771,6 +865,11 @@ if should P4; then
   [[ "$MODE" == dry ]] || need_env PATRONAGE_KYC_REGISTRY PATRONAGE_MEMBERSHIP
   log "P4 dormant ledgers → $DORMANT_BOOK"
   forge_phase P4 DeployDormantLedgers.s.sol
+  if [[ "$MODE" != dry ]]; then
+    # The book also names the governance it was deployed under: it must be this run's.
+    record_output_book P4 dormantLedgers "$DORMANT_BOOK" DeployDormantLedgers.s.sol \
+      "$(printf '{"GovernanceTimelock":"%s","GovernanceMultisig":"%s"}' "$(lower "$GOVERNANCE")" "$(lower "$GOVERNANCE_MULTISIG")")"
+  fi
 fi
 
 # ---------------------------------------------------------------- P5
@@ -807,11 +906,17 @@ if should P5; then
     is_addr "${RUN_DEPLOYER:-}" || gate_fail P5 "no run deployer (the P0 run manifest did not load)"
     log "P5 deployer bound to run $RUN_ID: $RUN_DEPLOYER"
     load_governance P5 1
-    # C5: the vesting and dormant-ledger outputs are the ones this run recorded.
-    for kb in "teamVesting:$VEST_BOOK" "dormantLedgers:$DORMANT_BOOK"; do
-      [[ -f "${kb#*:}" ]] || continue
-      cj=$(book_contracts_json "${kb#*:}") || gate_fail P5 "${kb#*:} has no well-formed contracts"
-      why=$(manifest_bind bind "$RUN_MANIFEST" "${kb%%:*}" "$cj" 2>&1) || gate_fail P5 "${kb#*:} is not the output this run recorded: $why"
+    # C5: the vesting and dormant-ledger outputs are the ones this run recorded. P3/P4 record
+    # them when they write them; on --confirm a book its step did not record is refused (a
+    # simulation still records one at first use here).
+    for kb in "teamVesting:P3:$VEST_BOOK" "dormantLedgers:P4:$DORMANT_BOOK"; do
+      IFS=: read -r k st b <<<"$kb"
+      [[ -f "$b" ]] || continue
+      cj=$(book_contracts_json "$b") || gate_fail P5 "$b has no well-formed contracts"
+      if [[ "$MODE" == confirm ]] && ! manifest_has "$RUN_MANIFEST" "$k"; then
+        gate_fail P5 "$b was not recorded by $st in this run (the run manifest has no $k): it is not this ceremony's output"
+      fi
+      why=$(manifest_bind bind "$RUN_MANIFEST" "$k" "$cj" 2>&1) || gate_fail P5 "$b is not the output this run recorded: $why"
     done
     # C4: the ValidatorRegistry is governed by this run's GOVERNANCE, whatever the env said.
     vr=$(book_addr "$ADDRESS_BOOK" ValidatorRegistry) || vr=""
