@@ -1325,4 +1325,83 @@ mod tests {
             dl.len()
         );
     }
+
+    fn flood_headers(batch: u64, per_batch: u64) -> Vec<BlockHeader> {
+        use citrate_consensus::types::{BlockBuilder, PublicKey};
+        let template = BlockBuilder::new()
+            .parent(Hash::new([7u8; 32]))
+            .height(1)
+            .proposer(PublicKey::new([1; 32]))
+            .build_unhashed()
+            .header;
+        (0..per_batch)
+            .map(|i| {
+                let mut h = template.clone();
+                h.height = batch * per_batch + i + 1;
+                h
+            })
+            .collect()
+    }
+
+    /// The header byte cap must hold on its own. With the sync target below
+    /// the incoming heights, every batch reaches the target and the buffer is
+    /// drained, so the flood test above stays green without the cap. Here the
+    /// target is far ahead, nothing is drained, and only the cap bounds the
+    /// buffer.
+    #[tokio::test]
+    async fn header_byte_cap_holds_while_the_target_is_ahead() {
+        let sync = SyncManager::new(SyncConfig::default());
+        sync.set_target(u64::MAX).await;
+        // 200 x 1024 headers at >= 384 B each is ~79 MB, above the 64 MiB cap.
+        let per_batch: u64 = 1024;
+        for batch in 0..200u64 {
+            sync.handle_headers(&crate::PeerId("p".into()), flood_headers(batch, per_batch))
+                .await
+                .expect("monotonic batch accepted");
+        }
+        let dl = sync.downloaded_headers.read().await;
+        let bytes: usize = dl.iter().map(estimated_header_bytes).sum();
+        assert!(
+            !dl.is_empty(),
+            "with the target ahead the headers are retained, not drained"
+        );
+        assert!(
+            bytes <= MAX_DOWNLOADED_HEADERS_BYTES,
+            "downloaded_headers must stay within the {}-byte cap without a drain; got {} bytes",
+            MAX_DOWNLOADED_HEADERS_BYTES,
+            bytes
+        );
+        // The oldest headers are the ones evicted; the newest batch is kept.
+        assert_eq!(dl.last().map(|h| h.height), Some(200 * per_batch));
+    }
+
+    /// Reaching the sync target hands the headers to block download and
+    /// empties the buffer, so it cannot accumulate across sync ticks.
+    #[tokio::test]
+    async fn header_buffer_is_drained_once_the_target_is_reached() {
+        let sync = SyncManager::new(SyncConfig::default());
+        sync.set_target(2048).await;
+        let peer = crate::PeerId("p".into());
+
+        sync.handle_headers(&peer, flood_headers(0, 1024))
+            .await
+            .expect("batch 1");
+        assert_eq!(
+            sync.downloaded_headers.read().await.len(),
+            1024,
+            "below the target the headers are retained"
+        );
+
+        sync.handle_headers(&peer, flood_headers(1, 1024))
+            .await
+            .expect("batch 2");
+        assert!(
+            sync.downloaded_headers.read().await.is_empty(),
+            "once the target is reached the consumed headers must be drained"
+        );
+        assert!(
+            matches!(sync.get_state().await, SyncState::DownloadingBlocks { .. }),
+            "reaching the target starts block download"
+        );
+    }
 }
