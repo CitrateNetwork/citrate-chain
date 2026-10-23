@@ -116,6 +116,38 @@ pub struct CheckpointConfig {
     /// the testnet-beta chain id (40204) — production configs MUST
     /// set this explicitly.
     pub chain_id: u64,
+
+    /// Confirmation depth `D` (docs/consensus/CHECKPOINT_FINALITY_WIRING.md §3):
+    /// a node votes for the canonical block at boundary height `H` only once its
+    /// applied tip is at least `H + vote_depth` — never at the tip, where a
+    /// heavier GhostDAG sibling can still win. Values below 1 are treated as 1.
+    pub vote_depth: u64,
+}
+
+/// Default confirmation depth `D` (spec §3 chosen parameters: interval 2, D 3).
+pub const DEFAULT_VOTE_DEPTH: u64 = 3;
+
+/// §11.9 memory bound: at most this many checkpoints are pending at once. During
+/// a quorum stall the OLDEST pending checkpoint (and its voted markers) is
+/// evicted to admit a new one, so memory stays bounded however long the stall.
+pub const MAX_PENDING_CHECKPOINTS: usize = 64;
+
+/// §11.9 memory bound: finalized checkpoints kept in memory. Older ones are
+/// dropped from the in-memory map only; they remain in the persistent store and
+/// [`CheckpointManager::get_checkpoint`] reads them back from there.
+pub const MAX_FINALIZED_IN_MEMORY: usize = 256;
+
+/// Outcome of [`CheckpointManager::ensure_proposed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProposeOutcome {
+    /// A new pending checkpoint was created for `(height, block_hash)`.
+    Proposed,
+    /// `(height, block_hash)` was already pending — nothing changed.
+    AlreadyPending,
+    /// `height` is finalized, or at/below the latest finalized height.
+    AlreadyFinalized,
+    /// A DIFFERENT hash is pending at `height`; nothing changed.
+    ConflictingPending { pending: Hash },
 }
 
 impl Default for CheckpointConfig {
@@ -125,6 +157,7 @@ impl Default for CheckpointConfig {
             committee_size: 100,
             quorum_threshold: 67,
             chain_id: 40204,
+            vote_depth: DEFAULT_VOTE_DEPTH,
         }
     }
 }
@@ -137,6 +170,7 @@ impl CheckpointConfig {
             committee_size: 5,
             quorum_threshold: 4,
             chain_id: 40204,
+            vote_depth: 2,
         }
     }
 
@@ -317,6 +351,28 @@ impl CommitteeSelector {
     }
 }
 
+/// Construct this node's signed vote for the checkpoint `(height, block_hash)`
+/// on `chain_id` (spec §4.3): an ed25519 signature by `signing_key` over
+/// [`canonical_vote_message`], so the vote binds chain id, height and hash.
+/// `signing_key` is the node's consensus key — the `proposer.key` identity
+/// registered in `ValidatorRegistry` (spec D-4).
+pub fn sign_checkpoint_vote(
+    chain_id: u64,
+    height: u64,
+    block_hash: Hash,
+    signing_key: &crate::crypto::Ed25519SigningKey,
+) -> CheckpointVote {
+    use ed25519_dalek::Signer;
+    let message = canonical_vote_message(chain_id, height, &block_hash);
+    let sig = signing_key.sign(&message);
+    CheckpointVote {
+        height,
+        block_hash,
+        voter: PublicKey::new(signing_key.verifying_key().to_bytes()),
+        signature: Signature::new(sig.to_bytes()),
+    }
+}
+
 /// Verify a checkpoint vote signature cryptographically (ed25519).
 ///
 /// RM-B1 / WP-B2.2 (audit H-02): canonical message is
@@ -324,7 +380,10 @@ impl CommitteeSelector {
 /// = 69 bytes — see [`canonical_vote_message`]. Cross-chain replay
 /// is structurally impossible because chain_id is bound into the
 /// signed bytes.
-fn verify_vote_signature(vote: &CheckpointVote, chain_id: u64) -> Result<(), CheckpointError> {
+pub(crate) fn verify_vote_signature(
+    vote: &CheckpointVote,
+    chain_id: u64,
+) -> Result<(), CheckpointError> {
     let message = canonical_vote_message(chain_id, vote.height, &vote.block_hash);
 
     let pubkey = VerifyingKey::from_bytes(vote.voter.as_bytes())
@@ -404,6 +463,11 @@ impl CheckpointManager {
             }
         }
         mgr.persistent = Some(kv);
+        // §11.9: keep only the most recent MAX_FINALIZED_IN_MEMORY in memory
+        // (the rest stay readable from `kv` via get_checkpoint).
+        if let Ok(mut finalized) = mgr.finalized.try_write() {
+            trim_finalized(&mut finalized);
+        }
         // voted is already initialized via new()
         mgr
     }
@@ -413,14 +477,137 @@ impl CheckpointManager {
         &self.config
     }
 
+    /// The persistent backend this manager was built with
+    /// ([`Self::with_persistence`]), if any. The finality gadget keeps its
+    /// durable signed-vote record (equivocation protection across restarts) in
+    /// the same store; a manager built with [`Self::new`] has none, and a
+    /// gadget over it refuses to sign.
+    pub fn persistent_store(&self) -> Option<&Arc<dyn KvStore>> {
+        self.persistent.as_ref()
+    }
+
     /// Get the latest finalized checkpoint height.
     pub async fn latest_finalized_height(&self) -> u64 {
         *self.latest_finalized_height.read().await
     }
 
-    /// Get a finalized checkpoint by height.
+    /// Get a finalized checkpoint by height: from memory, else (for one trimmed
+    /// out of the in-memory window) from the persistent `checkpoint:{height}`
+    /// record in `DAG_METADATA`.
     pub async fn get_checkpoint(&self, height: u64) -> Option<Checkpoint> {
-        self.finalized.read().await.get(&height).cloned()
+        if let Some(cp) = self.finalized.read().await.get(&height).cloned() {
+            return Some(cp);
+        }
+        let kv = self.persistent.as_ref()?;
+        let key = format!("checkpoint:{}", height);
+        let bytes = kv.kv_get(cf::DAG_METADATA, key.as_bytes()).ok()??;
+        bincode::deserialize::<Checkpoint>(&bytes)
+            .ok()
+            .filter(|cp| cp.status == CheckpointStatus::Finalized && cp.height == height)
+    }
+
+    /// Whether `height` holds a finalized checkpoint (memory or persistent store).
+    pub async fn is_finalized(&self, height: u64) -> bool {
+        self.get_checkpoint(height).await.is_some()
+    }
+
+    /// The block hash pending at `height`, if a checkpoint is being collected there.
+    pub async fn pending_hash(&self, height: u64) -> Option<Hash> {
+        self.pending
+            .read()
+            .await
+            .get(&height)
+            .map(|cp| cp.block_hash)
+    }
+
+    /// Idempotent propose (spec §4.2): create the pending checkpoint for
+    /// `(height, block_hash)` unless it already exists. Unlike [`Self::propose`]
+    /// a repeat for the SAME hash is not an error, a different pending hash is
+    /// reported (never replaced), and a height at/below the latest finalized
+    /// height is never re-opened. Admitting a new checkpoint while
+    /// [`MAX_PENDING_CHECKPOINTS`] are pending evicts the lowest pending height
+    /// (§11.9 stall bound).
+    pub async fn ensure_proposed(
+        &self,
+        height: u64,
+        block_hash: Hash,
+        committee: Vec<PublicKey>,
+    ) -> Result<ProposeOutcome, CheckpointError> {
+        if !self.config.is_checkpoint_height(height) {
+            return Err(CheckpointError::NotCheckpointBoundary);
+        }
+        let latest = *self.latest_finalized_height.read().await;
+        if height <= latest || self.is_finalized(height).await {
+            return Ok(ProposeOutcome::AlreadyFinalized);
+        }
+        if !self.dag_store.has_block(&block_hash).await {
+            return Err(CheckpointError::BlockNotFound(block_hash));
+        }
+        let mut pending = self.pending.write().await;
+        if let Some(existing) = pending.get(&height) {
+            return Ok(if existing.block_hash == block_hash {
+                ProposeOutcome::AlreadyPending
+            } else {
+                ProposeOutcome::ConflictingPending {
+                    pending: existing.block_hash,
+                }
+            });
+        }
+        while pending.len() >= MAX_PENDING_CHECKPOINTS {
+            let Some(&lowest) = pending.keys().min() else {
+                break;
+            };
+            pending.remove(&lowest);
+            let mut voted = self.voted.write().await;
+            voted.retain(|(h, _)| *h != lowest);
+            drop(voted);
+            warn!(
+                "checkpoint {}: evicted unfinalized pending checkpoint (pending cap {})",
+                lowest, MAX_PENDING_CHECKPOINTS
+            );
+        }
+        info!(
+            "Proposed checkpoint at height {} for block {} (committee {})",
+            height,
+            block_hash,
+            committee.len()
+        );
+        pending.insert(
+            height,
+            Checkpoint {
+                height,
+                block_hash,
+                committee,
+                votes: HashMap::new(),
+                status: CheckpointStatus::Pending,
+            },
+        );
+        Ok(ProposeOutcome::Proposed)
+    }
+
+    /// §11.9: drop pending checkpoints and per-height voted markers at or below
+    /// `floor` (the latest finalized height): nothing there can matter any more.
+    pub async fn prune_at_or_below(&self, floor: u64) {
+        let mut pending = self.pending.write().await;
+        pending.retain(|h, _| *h > floor);
+        drop(pending);
+        let mut voted = self.voted.write().await;
+        voted.retain(|(h, _)| *h > floor);
+    }
+
+    /// Number of pending checkpoints (memory-bound assertions).
+    pub async fn pending_len(&self) -> usize {
+        self.pending.read().await.len()
+    }
+
+    /// Number of `(height, voter)` replay markers held (memory-bound assertions).
+    pub async fn voted_len(&self) -> usize {
+        self.voted.read().await.len()
+    }
+
+    /// Number of finalized checkpoints held in memory (memory-bound assertions).
+    pub async fn finalized_in_memory_len(&self) -> usize {
+        self.finalized.read().await.len()
     }
 
     /// Propose a new checkpoint at the given height.
@@ -622,7 +809,15 @@ impl CheckpointManager {
         );
 
         let cp = checkpoint.clone();
-        self.finalized.write().await.insert(height, checkpoint);
+        {
+            let mut finalized = self.finalized.write().await;
+            finalized.insert(height, checkpoint);
+            trim_finalized(&mut finalized);
+        }
+        // §11.9: the height is settled; its replay markers are dead weight.
+        let mut voted = self.voted.write().await;
+        voted.retain(|(h, _)| *h != height);
+        drop(voted);
 
         Ok(cp)
     }
@@ -638,6 +833,16 @@ impl CheckpointManager {
         None
     }
 
+    /// Whether the pending checkpoint at `height` already holds an accepted vote
+    /// from `voter` (`false` when nothing is pending there).
+    pub async fn has_pending_vote(&self, height: u64, voter: &PublicKey) -> bool {
+        self.pending
+            .read()
+            .await
+            .get(&height)
+            .is_some_and(|cp| cp.votes.contains_key(voter))
+    }
+
     /// Get pending vote count for a checkpoint.
     pub async fn pending_vote_count(&self, height: u64) -> Option<usize> {
         self.pending
@@ -645,6 +850,19 @@ impl CheckpointManager {
             .await
             .get(&height)
             .map(|cp| cp.vote_count())
+    }
+}
+
+/// Drop the lowest finalized heights until at most [`MAX_FINALIZED_IN_MEMORY`] remain.
+fn trim_finalized(finalized: &mut HashMap<u64, Checkpoint>) {
+    if finalized.len() <= MAX_FINALIZED_IN_MEMORY {
+        return;
+    }
+    let mut heights: Vec<u64> = finalized.keys().copied().collect();
+    heights.sort_unstable();
+    let excess = heights.len().saturating_sub(MAX_FINALIZED_IN_MEMORY);
+    for h in heights.into_iter().take(excess) {
+        finalized.remove(&h);
     }
 }
 
@@ -1020,5 +1238,105 @@ mod tests {
         let cp = mgr.finalize_checkpoint(5).await.unwrap();
         assert_eq!(cp.status, CheckpointStatus::Finalized);
         assert_eq!(cp.votes.len(), 3);
+    }
+
+    /// Stage 1a §4.2: `ensure_proposed` is idempotent per (H, hash), reports a
+    /// conflicting hash without replacing it, and never re-opens a finalized height.
+    #[tokio::test]
+    async fn ensure_proposed_outcomes() {
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let blocks = build_chain(&dag, 12).await;
+        let mgr = CheckpointManager::new(CheckpointConfig::for_testing(), dag);
+        let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+        let b5 = blocks.get(5).expect("block 5").hash();
+        let b6 = blocks.get(6).expect("block 6").hash();
+
+        let first = mgr.ensure_proposed(5, b5, committee.clone()).await;
+        assert_eq!(first.expect("propose"), ProposeOutcome::Proposed);
+        let again = mgr.ensure_proposed(5, b5, committee.clone()).await;
+        assert_eq!(again.expect("repeat"), ProposeOutcome::AlreadyPending);
+        let other = mgr.ensure_proposed(5, b6, committee.clone()).await;
+        assert_eq!(
+            other.expect("conflict"),
+            ProposeOutcome::ConflictingPending { pending: b5 }
+        );
+        assert_eq!(mgr.pending_hash(5).await, Some(b5), "never replaced");
+        assert!(matches!(
+            mgr.ensure_proposed(6, b6, committee.clone()).await,
+            Err(CheckpointError::NotCheckpointBoundary)
+        ));
+        assert!(matches!(
+            mgr.ensure_proposed(10, Hash::new([0xEE; 32]), committee.clone())
+                .await,
+            Err(CheckpointError::BlockNotFound(_))
+        ));
+
+        for i in 0..3u8 {
+            mgr.submit_vote(make_signed_vote(i, 5, &b5))
+                .await
+                .expect("vote");
+        }
+        mgr.finalize_checkpoint(5).await.expect("finalize");
+        assert_eq!(
+            mgr.voted_len().await,
+            0,
+            "voted markers dropped on finalize"
+        );
+        let reopened = mgr.ensure_proposed(5, b5, committee).await;
+        assert_eq!(
+            reopened.expect("finalized"),
+            ProposeOutcome::AlreadyFinalized
+        );
+    }
+
+    /// Stage 1a §11.9: the pending map is capped; the lowest height is evicted.
+    #[tokio::test]
+    async fn ensure_proposed_evicts_oldest_beyond_cap() {
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let mut cfg = CheckpointConfig::for_testing();
+        cfg.interval = 1;
+        let count = MAX_PENDING_CHECKPOINTS.saturating_add(10);
+        let blocks = build_chain(&dag, count.saturating_add(1)).await;
+        let mgr = CheckpointManager::new(cfg, dag);
+        let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+        for (h, b) in blocks.iter().enumerate().skip(1) {
+            let h = u64::try_from(h).expect("height fits");
+            mgr.ensure_proposed(h, b.hash(), committee.clone())
+                .await
+                .expect("propose");
+            mgr.submit_vote(make_signed_vote(0, h, &b.hash()))
+                .await
+                .expect("vote");
+        }
+        assert_eq!(mgr.pending_len().await, MAX_PENDING_CHECKPOINTS);
+        assert_eq!(mgr.voted_len().await, MAX_PENDING_CHECKPOINTS);
+        assert_eq!(mgr.pending_hash(1).await, None, "oldest evicted");
+        mgr.prune_at_or_below(u64::MAX).await;
+        assert_eq!(mgr.pending_len().await, 0);
+        assert_eq!(mgr.voted_len().await, 0);
+    }
+
+    /// Stage 1a §4.3: a vote built by `sign_checkpoint_vote` under the manager's
+    /// chain id is accepted; the same key signing for another chain is not.
+    #[tokio::test]
+    async fn sign_checkpoint_vote_is_accepted_only_on_its_chain() {
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let blocks = build_chain(&dag, 6).await;
+        let mut cfg = CheckpointConfig::for_testing();
+        cfg.chain_id = 1337;
+        let mgr = CheckpointManager::new(cfg, dag);
+        let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+        let b5 = blocks.get(5).expect("block 5").hash();
+        mgr.ensure_proposed(5, b5, committee)
+            .await
+            .expect("propose");
+        let k0 = make_signing_key(0);
+        let wrong_chain = sign_checkpoint_vote(40204, 5, b5, &k0);
+        assert!(matches!(
+            mgr.submit_vote(wrong_chain).await,
+            Err(CheckpointError::InvalidSignature(_))
+        ));
+        let right = sign_checkpoint_vote(1337, 5, b5, &k0);
+        assert!(mgr.submit_vote(right).await.is_ok());
     }
 }
