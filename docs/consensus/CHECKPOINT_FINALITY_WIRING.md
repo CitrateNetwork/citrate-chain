@@ -321,7 +321,8 @@ always have a certificate that survives a process crash AND a host power loss. I
 fails, nothing advances: the guard does not run (no floor), nothing is published, the latest
 finalized height, DAG mark and in-memory record are unchanged, the checkpoint stays pending
 with its votes, and `finalize_checkpoint` returns `CheckpointError::StorageError` (surfaced by
-the gadget as `InboundOutcome::FinalizeFailed`; the next vote for that height retries). This is
+the gadget as `InboundOutcome::FinalizeFailed`; retried by the next vote for that height or by
+the driver tick, see "Certificate write retry" below). This is
 the implementation of the TLA+ `Finalize` action being a single step: a write failure is the
 action not firing. A certificate on disk makes its height final for this node: a same-hash
 re-proposal at that height is refused (`ProposeOutcome::AlreadyFinalized`). If the pending entry
@@ -338,6 +339,33 @@ after publication; the reopened store restores the floor) and
 `kv_put_durable_is_a_synced_rocksdb_write`. A SIGKILL does not drop the OS page cache, so the
 kill test proves the ordering across a crash; the power-loss half rests on the synced write,
 pinned by the sync-counter tests. Tripwire: `scripts/ci/finality_certificate_durable_write_tripwire.sh`.
+
+**Certificate write retry (follow-up to #368).** A checkpoint that reached quorum but whose
+certificate write failed must not wait for another vote that may never come (the whole
+committee may already have voted). The finality driver's 1 s tick calls
+`finality_driver::retry_finalizations` → `FinalityGadget::retry_finalizations(now)`, which
+re-attempts `finalize_checkpoint` for every checkpoint pending WITH quorum
+(`CheckpointManager::quorum_pending_heights`) once its backoff has passed: first retry
+`FINALIZE_RETRY_BASE` (1 s) after the failure, doubling per failure, capped at
+`FINALIZE_RETRY_CAP` (30 s), for as long as the checkpoint stays pending with quorum (bounded
+by `MAX_PENDING_CHECKPOINTS`). Every attempt is an ordinary `finalize_checkpoint` (serialized,
+fail-closed), so a failed retry advances nothing, and a checkpoint finalized meanwhile — by a
+late vote or a concurrent tick — is no longer pending and is dropped: one finalization, one
+publication. Pruned / evicted checkpoints are dropped too. Each failed retry logs a warning
+with its failure count and next delay; recovery logs at info. Metrics:
+`citrate_finality_finalize_retries_total`, `citrate_finality_finalize_retry_recovered_total`,
+`citrate_finality_finalize_retry_pending`. The retry state is in memory: after a restart the
+pending checkpoint and its votes are gone too (nothing was finalized, nothing is on disk), and
+the height finalizes through the normal path when its votes are seen again. Tests (consensus):
+`finalize_retry_delay_doubles_to_the_cap`,
+`failed_certificate_write_is_retried_on_the_tick_without_further_votes`,
+`permanent_certificate_failure_backs_off_and_never_finalizes`,
+`retry_and_a_late_vote_never_finalize_twice`, `concurrent_retry_ticks_finalize_once`,
+`pruned_checkpoint_is_no_longer_retried`; (node, real verifier guard over RocksDB)
+`s2_certificate_write_failure_is_retried_on_the_tick_without_further_votes`,
+`s2_permanent_certificate_write_failure_never_raises_the_floor`,
+`s2_retried_certificate_survives_a_kill_after_publication`,
+`s2_kill_during_permanent_certificate_failure_finalizes_nothing` (child processes SIGKILLed).
 
 **Restart (Enforced).** The floor and the registered set are in memory. When the boot check's
 latest certificate does not raise the floor (mismatch, not yet applied, unverifiable),

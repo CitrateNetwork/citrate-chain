@@ -155,6 +155,7 @@ consensus_tripwires() {
     "scripts/ci/prod_assert_ratchet.sh" \
     "scripts/ci/finality_range_height_index_tripwire.sh" \
     "scripts/ci/finality_certificate_durable_write_tripwire.sh" \
+    "scripts/ci/finality_finalize_retry_wired_tripwire.sh" \
   ; do
     if [ ! -x "$t" ]; then
       echo "missing/!executable tripwire: $t"; rc=1; continue

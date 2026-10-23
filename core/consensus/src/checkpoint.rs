@@ -1006,8 +1006,8 @@ impl CheckpointManager {
                 // Durable BEFORE the guard: the guard raises the floor, so the
                 // certificate it acts on must already survive a crash or power
                 // loss. A failed write finalizes nothing: the guard does not run,
-                // the pending entry is untouched (a later vote retries), and the
-                // error surfaces.
+                // the pending entry is untouched (a later vote or the gadget's
+                // retry tick retries), and the error surfaces.
                 self.persist_certificate(&candidate)?;
                 // No manager lock is held here (only `finalize_serial`).
                 guard.before_finalize(&candidate).await;
@@ -1076,7 +1076,7 @@ impl CheckpointManager {
         match durable {
             // No guard ran: write it now. On failure nothing is visible; the
             // checkpoint goes back to pending with its votes and the error
-            // surfaces (a later vote retries).
+            // surfaces (a later vote or the gadget's retry tick retries).
             None => {
                 if let Err(e) = self.persist_certificate(&checkpoint) {
                     checkpoint.status = CheckpointStatus::Pending;
@@ -1151,6 +1151,21 @@ impl CheckpointManager {
             return Some(cp.status.clone());
         }
         None
+    }
+
+    /// Heights pending WITH derived quorum, ascending: checkpoints that can
+    /// finalize but have not (their finalization failed, or is in flight).
+    pub async fn quorum_pending_heights(&self) -> Vec<u64> {
+        let mut heights: Vec<u64> = self
+            .pending
+            .read()
+            .await
+            .iter()
+            .filter(|(_, cp)| cp.has_derived_quorum())
+            .map(|(h, _)| *h)
+            .collect();
+        heights.sort_unstable();
+        heights
     }
 
     /// Whether the pending checkpoint at `height` already holds an accepted vote
