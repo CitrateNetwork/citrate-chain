@@ -68,6 +68,8 @@ compile_error!(
 );
 mod contribution_recorder;
 mod dag_prune;
+#[cfg(test)]
+mod finality_adversarial_tests;
 mod finality_driver;
 mod finality_floor;
 mod genesis;

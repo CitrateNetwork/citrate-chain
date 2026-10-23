@@ -1,0 +1,1630 @@
+// node/src/finality_adversarial_tests.rs
+//
+// WP-S.3 Stage 2 — checkpoint-finality integration + adversarial suite A1–A8
+// (docs/consensus/CHECKPOINT_FINALITY_WIRING.md §8.2, §8.3).
+//
+// Test-only. Every scenario runs several in-process nodes, each with the
+// production pieces a node wires in `main.rs`, over its own on-disk store:
+//
+//   * `CanonicalApplicator` over a RocksDB `StorageManager` (applied chain,
+//     executed and state-root verified; owns the reorg floor);
+//   * `CheckpointManager::with_persistence` over the same RocksDB
+//     (`RocksDbKvStore`, certificates + the durable signed-vote record);
+//   * `FinalityGadget` (producer path; compiled switch forced ON here — every
+//     release pin is OFF) with an epoch-snapshot `VrfProposerSelector`;
+//   * the finality DRIVER pass (`finality_driver::run_pass` + `gate_outbound`,
+//     exactly what `finality_driver::spawn` runs each second, walking the
+//     node's own stored headers);
+//   * the floor VERIFIER (`FloorVerifier`, Enforced mode — both switches ON,
+//     which no release ships yet), sharing the gadget's safety stop.
+//
+// Votes travel through an in-process gossip queue standing in for
+// `NetworkMessage::CheckpointVote` broadcast + the inbound handler's relay.
+// Blocks are reward-only v2 blocks with correct cumulative state roots, so
+// every applied block really executes. Byzantine validators are keys with no
+// node: the test signs their votes and injects them.
+//
+// The TLA+ action each step corresponds to (specs/tla/consensus/
+// CheckpointFinalitySafety.tla) is named in the comments: Propose/SignVote
+// (driver pass), Finalize (gossip reaching quorum), VerifyFloor (verifier
+// tick), Reorg (`reorg_to`), Restart (rebuild the node over its store).
+//
+// Scenarios that need late-joiner certificate sync (C3-S1b, spec §11.10) are
+// `#[ignore = "needs C3-S1b"]`; the open findings (S2 window; S1 across
+// sibling committees) are `#[ignore = "bug: ..."]`. None of them is a pass
+// today.
+
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use citrate_api::finalized_tag::FinalizedAnchor;
+use citrate_consensus::checkpoint::{
+    derived_quorum, sign_checkpoint_vote, Checkpoint, CheckpointConfig, CheckpointError,
+    CheckpointManager, CheckpointStatus, CheckpointVote, CommitteeSelector,
+};
+use citrate_consensus::checkpoint_gadget::{FinalityGadget, InboundOutcome, SkipReason};
+use citrate_consensus::crypto::Ed25519SigningKey;
+use citrate_consensus::dag_store::{cf, DagStore, KvStore};
+use citrate_consensus::types::{Block, Hash, PublicKey};
+use citrate_consensus::vrf::VrfProposerSelector;
+use citrate_execution::Executor;
+use citrate_storage::StorageManager;
+
+use crate::canonical_apply::tests::{fresh, mk_block_vrf, persist, roots};
+use crate::canonical_apply::{ApplyOutcome, CanonicalApplicator, ReorgOutcome};
+use crate::finality_driver::{gate_outbound, run_pass, OwnVoteRetries};
+use crate::finality_floor::{FloorMode, FloorTick, FloorVerifier, HaltReason};
+use crate::persistent_dag::RocksDbKvStore;
+
+const CHAIN: u64 = 40204;
+const FOREIGN_CHAIN: u64 = 1337;
+
+/// VRF tag of the main branch (A) and of competing branches.
+const VRF_A: [u8; 32] = [0x5A; 32];
+const VRF_B: [u8; 32] = [0xB0; 32];
+const VRF_C: [u8; 32] = [0xC0; 32];
+
+/// Highest block height any scenario builds (state roots are precomputed).
+const MAX_HEIGHT: u64 = 24;
+
+/// Spec §3 parameters at the scale of a test: interval 2, depth 3.
+fn config(committee_size: usize) -> CheckpointConfig {
+    CheckpointConfig {
+        interval: 2,
+        committee_size,
+        quorum_threshold: 67,
+        chain_id: CHAIN,
+        vote_depth: 3,
+    }
+}
+
+fn key(i: u8) -> Ed25519SigningKey {
+    let mut seed = [0u8; 32];
+    seed[0] = i;
+    seed[1] = 0xF1;
+    seed[31] = 0xA7;
+    Ed25519SigningKey::from_bytes(&seed)
+}
+
+fn pk(k: &Ed25519SigningKey) -> PublicKey {
+    PublicKey::new(k.verifying_key().to_bytes())
+}
+
+// ---------------------------------------------------------------------------
+// Chains
+// ---------------------------------------------------------------------------
+
+/// Block-tree builder. All branches share the cumulative reward-only state
+/// roots (reward-only blocks with one coinbase produce the same state at the
+/// same height), so any branch applies and executes.
+struct Chains {
+    roots: Vec<Hash>,
+}
+
+impl Chains {
+    fn new() -> Self {
+        Self {
+            roots: roots(MAX_HEIGHT),
+        }
+    }
+
+    fn root(&self, height: u64) -> Hash {
+        let i = usize::try_from(height.saturating_sub(1)).expect("height fits");
+        *self.roots.get(i).expect("height within MAX_HEIGHT")
+    }
+
+    /// A branch of blocks `1..=len`: `base` up to `fork_at - 1`, then new
+    /// blocks tagged `vrf` from `fork_at` (a sibling of `base[fork_at]`).
+    /// Index `h - 1` holds height `h`.
+    fn branch(&self, base: &[Block], fork_at: u64, len: u64, vrf: [u8; 32]) -> Vec<Block> {
+        let mut out: Vec<Block> = base
+            .iter()
+            .take(usize::try_from(fork_at.saturating_sub(1)).expect("fits"))
+            .cloned()
+            .collect();
+        let mut parent = out.last().map_or(Hash::default(), |b| b.header.block_hash);
+        for h in fork_at..=len {
+            let mut tag = vrf;
+            // Distinct hash per height even when the parent repeats a tag.
+            tag[1] = u8::try_from(h).expect("height fits a byte");
+            let b = mk_block_vrf(h, parent, self.root(h), tag);
+            parent = b.header.block_hash;
+            out.push(b);
+        }
+        out
+    }
+
+    fn main(&self, len: u64) -> Vec<Block> {
+        self.branch(&[], 1, len, VRF_A)
+    }
+}
+
+fn at(branch: &[Block], height: u64) -> &Block {
+    branch
+        .get(usize::try_from(height.saturating_sub(1)).expect("fits"))
+        .expect("height on branch")
+}
+
+fn hash_at(branch: &[Block], height: u64) -> Hash {
+    at(branch, height).header.block_hash
+}
+
+// ---------------------------------------------------------------------------
+// Nodes
+// ---------------------------------------------------------------------------
+
+/// The validator set every node's epoch snapshot S(1) holds.
+#[derive(Clone)]
+struct Validators {
+    set: Vec<(PublicKey, u128)>,
+    /// Extra snapshots `(S(E), set)` recorded on every node (A7).
+    later: Vec<(u64, Vec<(PublicKey, u128)>)>,
+    /// Epoch schedule (EPOCH, LAG): S(E) = E * EPOCH - LAG.
+    schedule: (u64, u64),
+}
+
+impl Validators {
+    fn equal_stake(keys: &[Ed25519SigningKey]) -> Self {
+        Self {
+            set: keys.iter().map(|k| (pk(k), 32_000u128)).collect(),
+            later: Vec::new(),
+            schedule: (20, 19),
+        }
+    }
+}
+
+struct TestNode {
+    exec: Arc<Executor>,
+    storage: Arc<StorageManager>,
+    _dir: tempfile::TempDir,
+    app: Arc<CanonicalApplicator>,
+    dag: Arc<DagStore>,
+    gadget: Arc<FinalityGadget>,
+    verifier: FloorVerifier,
+    key: Ed25519SigningKey,
+    cursor: u64,
+    retries: OwnVoteRetries,
+    /// Every block this node has stored (re-hydrated into a fresh DAG on restart).
+    known: Vec<Block>,
+}
+
+/// Build the finality stack over `storage` the way `main.rs` does, then run
+/// the verifier's boot check BEFORE any block is admitted (Restart / boot).
+#[allow(clippy::too_many_arguments)]
+async fn assemble(
+    exec: Arc<Executor>,
+    storage: Arc<StorageManager>,
+    dir: tempfile::TempDir,
+    key: Ed25519SigningKey,
+    vals: &Validators,
+    cfg: CheckpointConfig,
+    known: Vec<Block>,
+) -> (TestNode, FloorTick) {
+    let app = Arc::new(CanonicalApplicator::new(exec.clone(), storage.clone()));
+    let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+    for b in &known {
+        let _ = dag.store_block(b.clone()).await;
+    }
+    let sel = VrfProposerSelector::new().with_snapshot_schedule(vals.schedule.0, vals.schedule.1);
+    sel.sync_active_set_at(1, vals.set.clone(), 1).await;
+    for (snap, set) in &vals.later {
+        sel.sync_active_set_at(*snap, set.clone(), 1).await;
+    }
+    let mgr = Arc::new(CheckpointManager::with_persistence(
+        cfg,
+        dag.clone(),
+        Arc::new(RocksDbKvStore::new(storage.db.clone())),
+    ));
+    let gadget = Arc::new(FinalityGadget::with_switch(
+        mgr.clone(),
+        Some(Arc::new(sel)),
+        true,
+    ));
+    let verifier = FloorVerifier::new(
+        FloorMode::Enforced,
+        mgr,
+        app.clone(),
+        gadget.safety_stop(),
+        Arc::new(AtomicU64::new(0)),
+    );
+    let boot = verifier.boot_check().await;
+    (
+        TestNode {
+            exec,
+            storage,
+            _dir: dir,
+            app,
+            dag,
+            gadget,
+            verifier,
+            key,
+            cursor: 0,
+            retries: OwnVoteRetries::default(),
+            known,
+        },
+        boot,
+    )
+}
+
+impl TestNode {
+    async fn boot(key: Ed25519SigningKey, vals: &Validators, cfg: CheckpointConfig) -> Self {
+        let (exec, storage, dir) = fresh();
+        let (node, tick) = assemble(exec, storage, dir, key, vals, cfg, Vec::new()).await;
+        assert_eq!(tick, FloorTick::NoCertificate, "fresh node boot");
+        node
+    }
+
+    /// Process restart over the same data directory: pending checkpoints,
+    /// buffers, the driver cursor, the verifier state and the (in-memory)
+    /// reorg floor are lost; blocks, certificates and the signed-vote record
+    /// persist. World state is carried over (state persistence is covered by
+    /// the SRP restart tests, not here). Returns the boot check's verdict.
+    async fn restart(self, vals: &Validators, cfg: CheckpointConfig) -> (Self, FloorTick) {
+        let TestNode {
+            exec,
+            storage,
+            _dir,
+            known,
+            key,
+            ..
+        } = self;
+        assemble(exec, storage, _dir, key, vals, cfg, known).await
+    }
+
+    fn me(&self) -> PublicKey {
+        pk(&self.key)
+    }
+
+    fn mgr(&self) -> &Arc<CheckpointManager> {
+        self.gadget.manager()
+    }
+
+    /// Store a block as the receive path does (chain store + DAG).
+    async fn import(&mut self, b: &Block) {
+        if self
+            .known
+            .iter()
+            .any(|k| k.header.block_hash == b.header.block_hash)
+        {
+            return;
+        }
+        persist(&self.storage, b);
+        let _ = self.dag.store_block(b.clone()).await;
+        self.known.push(b.clone());
+    }
+
+    /// Import and apply every block of `branch` above the applied tip (linear
+    /// extension of the applied chain).
+    async fn follow(&mut self, branch: &[Block]) {
+        let tip = self.app.applied_tip().await;
+        for b in branch {
+            self.import(b).await;
+            if b.header.height <= tip.height {
+                continue;
+            }
+            match self.app.apply_received(b).await {
+                ApplyOutcome::Applied { .. } => {}
+                other => panic!("block {} not applied: {other:?}", b.header.height),
+            }
+        }
+    }
+
+    /// Fork choice moves this node to `branch`'s tip (TLA+ Reorg).
+    async fn reorg_onto(&mut self, branch: &[Block]) -> ReorgOutcome {
+        for b in branch {
+            self.import(b).await;
+        }
+        let tip = branch.last().expect("non-empty branch").header.block_hash;
+        let lock = self.app.advance_lock();
+        let mut state = lock.lock().await;
+        self.app.reorg_to(&mut state, tip).await
+    }
+
+    /// One driver pass (TLA+ Propose + SignVote), exactly as
+    /// `finality_driver::spawn` runs it: walk this node's stored headers from
+    /// the applied tip, report buried boundaries, gate the outbound votes.
+    async fn drive(&mut self) -> Vec<CheckpointVote> {
+        let tip = self.app.applied_tip().await;
+        self.gadget.observe_tip(tip.height).await;
+        let storage = self.storage.clone();
+        let lookup = move |h: &Hash| {
+            storage
+                .blocks
+                .get_header(h)
+                .map(|o| o.map(|hd| (hd.height, hd.selected_parent_hash, hd.vrf_reveal.output)))
+                .map_err(|e| e.to_string())
+        };
+        let out = run_pass(
+            &self.gadget,
+            Some(&self.key),
+            &mut self.cursor,
+            &mut self.retries,
+            tip.hash,
+            tip.height,
+            &lookup,
+        )
+        .await;
+        gate_outbound(&self.gadget, Some(&self.key), &mut self.retries, out)
+    }
+
+    /// One floor-verifier pass (TLA+ VerifyFloor).
+    async fn tick(&self) -> FloorTick {
+        self.verifier.tick().await
+    }
+
+    fn floor(&self) -> u64 {
+        self.app.finalized_height_handle().load(Ordering::SeqCst)
+    }
+
+    fn rpc_finalized(&self) -> FinalizedAnchor {
+        self.verifier.rpc_finalized_handle().resolve(&self.storage)
+    }
+
+    async fn finalized(&self) -> u64 {
+        self.mgr().latest_finalized_height().await
+    }
+
+    async fn finalized_hash(&self, height: u64) -> Option<Hash> {
+        let cp = self.mgr().get_checkpoint(height).await?;
+        (cp.status == CheckpointStatus::Finalized).then_some(cp.block_hash)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Network
+// ---------------------------------------------------------------------------
+
+/// In-process gossip: a queue of `(sender, vote)`; delivery to every online
+/// node except the sender; a vote a node accepted for the first time is
+/// relayed once (`InboundOutcome::relay`), as the inbound handler does.
+struct Net {
+    nodes: Vec<TestNode>,
+    online: Vec<bool>,
+    queue: VecDeque<(Option<usize>, CheckpointVote)>,
+    /// Every `(receiver, vote, outcome)` delivered, for assertions.
+    log: Vec<(usize, CheckpointVote, String)>,
+}
+
+impl Net {
+    fn new(nodes: Vec<TestNode>) -> Self {
+        let online = vec![true; nodes.len()];
+        Self {
+            nodes,
+            online,
+            queue: VecDeque::new(),
+            log: Vec::new(),
+        }
+    }
+
+    fn node(&self, i: usize) -> &TestNode {
+        self.nodes.get(i).expect("node index")
+    }
+
+    fn node_mut(&mut self, i: usize) -> &mut TestNode {
+        self.nodes.get_mut(i).expect("node index")
+    }
+
+    async fn follow_all(&mut self, branch: &[Block]) {
+        for n in &mut self.nodes {
+            n.follow(branch).await;
+        }
+    }
+
+    /// Driver pass on node `i`; its outbound votes enter the gossip queue.
+    async fn drive(&mut self, i: usize) -> Vec<CheckpointVote> {
+        let out = self.node_mut(i).drive().await;
+        for v in &out {
+            self.queue.push_back((Some(i), v.clone()));
+        }
+        out
+    }
+
+    /// Deliver one vote to node `to` (a Byzantine or targeted send). Accepted
+    /// votes are relayed into the queue like any other.
+    async fn send_to(&mut self, to: usize, vote: CheckpointVote) -> InboundOutcome {
+        let out = self.node(to).gadget.on_inbound_vote(vote.clone()).await;
+        self.log.push((to, vote, format!("{out:?}")));
+        if let Some(relay) = out.relay() {
+            self.queue.push_back((Some(to), relay.clone()));
+        }
+        out
+    }
+
+    /// Inject a vote from a validator with no node (Byzantine actor) to all.
+    fn inject(&mut self, vote: CheckpointVote) {
+        self.queue.push_back((None, vote));
+    }
+
+    /// Run gossip to quiescence among the online nodes.
+    async fn gossip(&mut self) {
+        let mut steps = 0usize;
+        while let Some((from, vote)) = self.queue.pop_front() {
+            for i in 0..self.nodes.len() {
+                if Some(i) == from || !*self.online.get(i).expect("online flag") {
+                    continue;
+                }
+                let _ = self.send_to(i, vote.clone()).await;
+                steps = steps.saturating_add(1);
+            }
+            assert!(steps < 200_000, "gossip must terminate (relay dedupe)");
+        }
+    }
+
+    /// Driver pass on every online node, then gossip, then a verifier pass on
+    /// every online node.
+    async fn round(&mut self) -> Vec<FloorTick> {
+        for i in 0..self.nodes.len() {
+            if *self.online.get(i).expect("online flag") {
+                self.drive(i).await;
+            }
+        }
+        self.gossip().await;
+        self.tick_all().await
+    }
+
+    async fn tick_all(&mut self) -> Vec<FloorTick> {
+        let mut ticks = Vec::new();
+        for (i, n) in self.nodes.iter().enumerate() {
+            if *self.online.get(i).expect("online flag") {
+                ticks.push(n.tick().await);
+            }
+        }
+        ticks
+    }
+
+    /// S1 across the whole network: at every height, at most one hash is
+    /// finalized by any node. Returns the finalized hash per checked height.
+    async fn assert_no_conflicting_finality(&self, heights: &[u64]) {
+        for &h in heights {
+            let mut seen: Option<Hash> = None;
+            for (i, n) in self.nodes.iter().enumerate() {
+                if let Some(x) = n.finalized_hash(h).await {
+                    match seen {
+                        None => seen = Some(x),
+                        Some(y) => assert_eq!(x, y, "S1 violated at height {h} on node {i}"),
+                    }
+                }
+            }
+        }
+    }
+
+    /// No honest node's own key ever emitted two different hashes at a height.
+    fn assert_honest_no_equivocation(&self) {
+        let honest: Vec<PublicKey> = self.nodes.iter().map(TestNode::me).collect();
+        for (_, v, _) in &self.log {
+            if !honest.contains(&v.voter) {
+                continue;
+            }
+            for (_, w, _) in &self.log {
+                if w.voter == v.voter && w.height == v.height {
+                    assert_eq!(
+                        w.block_hash, v.block_hash,
+                        "honest key equivocated at height {}",
+                        v.height
+                    );
+                }
+            }
+        }
+    }
+}
+
+async fn network(n: u8, vals: &Validators, cfg: CheckpointConfig) -> Net {
+    let mut nodes = Vec::new();
+    for i in 0..n {
+        nodes.push(TestNode::boot(key(i), vals, cfg.clone()).await);
+    }
+    Net::new(nodes)
+}
+
+fn verified(height: u64) -> FloorTick {
+    FloorTick::Verified {
+        height,
+        floor_raised: true,
+        recovered: false,
+    }
+}
+
+/// A finalized certificate for `(height, hash)` with `committee` and the votes
+/// of `signers`, each signed over `chain_id`.
+fn certificate(
+    height: u64,
+    hash: Hash,
+    committee: &[PublicKey],
+    signers: &[&Ed25519SigningKey],
+    chain_id: u64,
+) -> Checkpoint {
+    let mut votes = std::collections::HashMap::new();
+    for k in signers {
+        let v = sign_checkpoint_vote(chain_id, height, hash, k);
+        votes.insert(v.voter, v.signature);
+    }
+    Checkpoint {
+        height,
+        block_hash: hash,
+        committee: committee.to_vec(),
+        votes,
+        status: CheckpointStatus::Finalized,
+    }
+}
+
+/// Write `cert` where `CheckpointManager::finalize_checkpoint` persists it
+/// (`DAG_METADATA` `checkpoint:{height}`, bincode) — a damaged or tampered
+/// record, or one written by a certificate source this node trusts.
+fn write_certificate(storage: &StorageManager, cert: &Checkpoint) {
+    RocksDbKvStore::new(storage.db.clone())
+        .kv_put(
+            cf::DAG_METADATA,
+            format!("checkpoint:{}", cert.height).as_bytes(),
+            &bincode::serialize(cert).expect("serialize certificate"),
+        )
+        .expect("write certificate");
+}
+
+fn delete_certificate(storage: &StorageManager, height: u64) {
+    RocksDbKvStore::new(storage.db.clone())
+        .kv_delete(cf::DAG_METADATA, format!("checkpoint:{height}").as_bytes())
+        .expect("delete certificate");
+}
+
+// ---------------------------------------------------------------------------
+// §8.2 integration: happy path end to end
+// ---------------------------------------------------------------------------
+
+/// Four validators on one chain: driver -> votes -> quorum -> certificate ->
+/// verifier raises the floor (Enforced) on every node -> the RPC tags name the
+/// certified block -> a reorg with its fork point below the floor is rejected.
+#[tokio::test]
+async fn integration_four_nodes_finalize_raise_floor_and_reject_deep_reorg() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let mut net = network(4, &vals, config(100)).await;
+    let a = chains.main(8);
+    net.follow_all(&a).await;
+    // Before anything finalized the tags resolve to genesis.
+    assert_eq!(net.node(0).rpc_finalized(), FinalizedAnchor::GENESIS);
+
+    let ticks = net.round().await;
+    assert!(ticks.iter().all(|t| *t == verified(4)), "{ticks:?}");
+    for n in &net.nodes {
+        assert_eq!(n.finalized().await, 4);
+        assert_eq!(n.floor(), 4);
+        assert_eq!(
+            n.rpc_finalized(),
+            FinalizedAnchor {
+                height: 4,
+                hash: Some(hash_at(&a, 4))
+            }
+        );
+    }
+    net.assert_no_conflicting_finality(&[2, 4]).await;
+
+    // A heavier branch forking below the floor (sibling of A3) is refused.
+    let b = chains.branch(&a, 3, 12, VRF_B);
+    match net.node_mut(0).reorg_onto(&b).await {
+        ReorgOutcome::Rejected(why) => assert!(why.contains("below finalized"), "{why}"),
+        other => panic!("reorg below the floor must be rejected, got {other:?}"),
+    }
+    assert_eq!(net.node(0).app.applied_tip().await.hash, hash_at(&a, 8));
+    assert_eq!(net.node(0).tick().await, verified(4));
+
+    // Finality keeps advancing as the chain grows.
+    let a = chains.main(12);
+    net.follow_all(&a).await;
+    let ticks = net.round().await;
+    assert!(ticks.iter().all(|t| *t == verified(8)), "{ticks:?}");
+    net.assert_honest_no_equivocation();
+}
+
+// ---------------------------------------------------------------------------
+// A1 — equivocation
+// ---------------------------------------------------------------------------
+
+/// A1: a committee member double-votes two sibling hashes at H — A to the
+/// nodes on branch A, B to the node on branch B. At most one hash finalizes
+/// anywhere (A, on the nodes that hold 3 of 4 votes for it); B never does; the
+/// conflicting second vote is rejected and never relayed.
+#[tokio::test]
+async fn a1_equivocating_voter_cannot_finalize_two_hashes() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let byz = keys.get(3).expect("byzantine key");
+    let vals = Validators::equal_stake(&keys);
+    let mut net = network(3, &vals, config(100)).await;
+    let a = chains.main(8);
+    let b = chains.branch(&a, 4, 8, VRF_B); // sibling AT the checkpoint height 4
+    net.node_mut(0).follow(&a).await;
+    net.node_mut(1).follow(&a).await;
+    net.node_mut(2).follow(&b).await;
+
+    for i in 0..3 {
+        net.drive(i).await;
+    }
+    // The Byzantine member signs BOTH siblings at 4 (and the shared block 2).
+    net.inject(sign_checkpoint_vote(CHAIN, 2, hash_at(&a, 2), byz));
+    let vote_a = sign_checkpoint_vote(CHAIN, 4, hash_at(&a, 4), byz);
+    let vote_b = sign_checkpoint_vote(CHAIN, 4, hash_at(&b, 4), byz);
+    net.send_to(0, vote_a.clone()).await;
+    net.send_to(1, vote_a).await;
+    net.send_to(2, vote_b.clone()).await;
+    net.gossip().await;
+
+    // Nodes 0, 1: {0, 1, byz} = quorum 3 for A@4. Node 2: {2, byz} for B@4.
+    for i in [0usize, 1] {
+        assert_eq!(net.node(i).finalized_hash(4).await, Some(hash_at(&a, 4)));
+    }
+    assert_eq!(net.node(2).finalized_hash(4).await, None, "B@4 never final");
+    assert_eq!(net.node(2).finalized().await, 2, "shared block 2 finalized");
+    net.assert_no_conflicting_finality(&[2, 4]).await;
+    net.assert_honest_no_equivocation();
+
+    // The conflicting vote is rejected everywhere it lands on A, never relayed.
+    let out = net.send_to(0, vote_b.clone()).await;
+    assert!(matches!(out, InboundOutcome::Rejected(_)), "{out:?}");
+    assert!(out.relay().is_none());
+    // Node 2 rejected the A votes for its pending B (hash mismatch).
+    assert!(net
+        .log
+        .iter()
+        .filter(|(to, v, _)| *to == 2 && v.height == 4 && v.block_hash == hash_at(&a, 4))
+        .all(|(_, _, o)| o.starts_with("Rejected")));
+
+    let ticks = net.tick_all().await;
+    assert_eq!(ticks, vec![verified(4), verified(4), verified(2)]);
+    assert!(
+        !net.node(2).gadget.halted(),
+        "no certificate for B: no stop"
+    );
+
+    // Fork choice later moves node 2 onto A (fork point 3 >= its floor 2):
+    // allowed. Without certificate sync node 2 cannot learn the A@4
+    // certificate (its pending checkpoint at 4 names B and the votes for A
+    // were already gossiped) — see the C3-S1b test below.
+    match net.node_mut(2).reorg_onto(&a).await {
+        ReorgOutcome::Reorged { .. } => {}
+        other => panic!("reorg above the floor must proceed, got {other:?}"),
+    }
+    assert_eq!(net.node(2).finalized().await, 2);
+    assert_eq!(net.node(2).tick().await, verified(2));
+}
+
+/// A1 follow-up: a node that sat on the losing sibling at a checkpoint and is
+/// then moved onto the finalized branch by fork choice must reach the same
+/// finalized height as its peers. Needs late-joiner certificate sync.
+#[tokio::test]
+#[ignore = "needs C3-S1b: late-joiner certificate sync (spec §11.10)"]
+async fn a1_node_on_losing_sibling_catches_up_after_reorg() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let byz = keys.get(3).expect("byzantine key");
+    let vals = Validators::equal_stake(&keys);
+    let mut net = network(3, &vals, config(100)).await;
+    let a = chains.main(8);
+    let b = chains.branch(&a, 4, 8, VRF_B);
+    net.node_mut(0).follow(&a).await;
+    net.node_mut(1).follow(&a).await;
+    net.node_mut(2).follow(&b).await;
+    for i in 0..3 {
+        net.drive(i).await;
+    }
+    net.send_to(0, sign_checkpoint_vote(CHAIN, 4, hash_at(&a, 4), byz))
+        .await;
+    net.gossip().await;
+    let _ = net.node_mut(2).reorg_onto(&a).await;
+    let _ = net.round().await;
+    assert_eq!(net.node(2).finalized_hash(4).await, Some(hash_at(&a, 4)));
+    assert_eq!(net.node(2).tick().await, verified(4));
+}
+
+// ---------------------------------------------------------------------------
+// A2 — vote withholding / censorship
+// ---------------------------------------------------------------------------
+
+/// A2: 1 of 4 withholding (f = 1) does not stall finality.
+#[tokio::test]
+async fn a2_one_withholder_of_four_does_not_stall() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let mut net = network(4, &vals, config(100)).await;
+    let a = chains.main(8);
+    net.follow_all(&a).await;
+    for i in 0..3 {
+        net.drive(i).await; // node 3 withholds its votes
+    }
+    net.gossip().await;
+    let ticks = net.tick_all().await;
+    assert_eq!(
+        ticks,
+        vec![
+            verified(4),
+            verified(4),
+            verified(4),
+            // The withholder never proposed: the votes it received wait in its
+            // early-vote buffer.
+            FloorTick::NoCertificate
+        ]
+    );
+    // When the withholder runs its own pass it finalizes from that buffer.
+    net.drive(3).await;
+    net.gossip().await;
+    assert_eq!(net.node(3).tick().await, verified(4));
+    net.assert_no_conflicting_finality(&[2, 4]).await;
+}
+
+/// A2 / L2: 2 of 4 withhold (above f): finality stalls at the last finalized
+/// height on every node, blocks keep being applied, nothing halts, and when the
+/// withholders return every stalled boundary finalizes and every floor rises.
+#[tokio::test]
+async fn a2_withheld_quorum_stalls_safely_then_resumes() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let mut net = network(4, &vals, config(100)).await;
+    let a = chains.main(8);
+    net.follow_all(&a).await;
+    // Nodes 2 and 3 are online (they receive) but withhold their votes.
+    net.drive(0).await;
+    net.drive(1).await;
+    net.gossip().await;
+    for t in net.tick_all().await {
+        assert_eq!(t, FloorTick::NoCertificate);
+    }
+    // The chain keeps growing under the stall; still nothing finalizes.
+    let a = chains.main(12);
+    net.follow_all(&a).await;
+    net.drive(0).await;
+    net.drive(1).await;
+    net.gossip().await;
+    for (i, n) in net.nodes.iter().enumerate() {
+        assert_eq!(n.app.applied_tip().await.height, 12, "node {i} applies");
+        assert_eq!(n.finalized().await, 0, "node {i} stalled");
+        assert_eq!(n.tick().await, FloorTick::NoCertificate);
+        assert_eq!(n.floor(), 0);
+        assert!(!n.gadget.halted(), "a stall is not a safety stop");
+    }
+    // Node 2 returns: its first pass votes 2..8 and replays the early votes it
+    // buffered from 0 and 1 -> quorum on 0, 1, 2. Node 3 returns after.
+    net.drive(2).await;
+    net.gossip().await;
+    for i in 0..3 {
+        assert_eq!(net.node(i).finalized().await, 8, "node {i}");
+    }
+    net.drive(3).await;
+    net.gossip().await;
+    let ticks = net.tick_all().await;
+    assert!(ticks.iter().all(|t| *t == verified(8)), "{ticks:?}");
+    for n in &net.nodes {
+        assert_eq!(n.floor(), 8);
+    }
+    net.assert_no_conflicting_finality(&[2, 4, 6, 8]).await;
+    net.assert_honest_no_equivocation();
+}
+
+// ---------------------------------------------------------------------------
+// A3 — Byzantine 1/3
+// ---------------------------------------------------------------------------
+
+/// A3 / S1: n = 7, f = floor((n-1)/3) = 2 Byzantine, quorum 5. Four honest
+/// nodes sit on A, one honest node on the sibling B at checkpoint 4. The two
+/// Byzantine members first push only B (A stalls at 4 honest votes, B reaches 3
+/// on the B node: nothing finalizes at 4 anywhere), then equivocate and also
+/// sign A (A finalizes on the A nodes). B never finalizes.
+#[tokio::test]
+async fn a3_one_third_byzantine_cannot_force_conflicting_finality() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..7).map(key).collect();
+    assert_eq!(derived_quorum(7), 5);
+    let byz: Vec<&Ed25519SigningKey> = keys.iter().skip(5).collect();
+    let vals = Validators::equal_stake(&keys);
+    let mut net = network(5, &vals, config(100)).await;
+    let a = chains.main(8);
+    let b = chains.branch(&a, 4, 8, VRF_B);
+    for i in 0..4 {
+        net.node_mut(i).follow(&a).await;
+    }
+    net.node_mut(4).follow(&b).await;
+    for i in 0..5 {
+        net.drive(i).await;
+    }
+    for z in &byz {
+        net.inject(sign_checkpoint_vote(CHAIN, 4, hash_at(&b, 4), z));
+    }
+    net.gossip().await;
+    // Height 2 (shared) finalized by the 5 honest votes alone; nothing at 4.
+    for (i, n) in net.nodes.iter().enumerate() {
+        assert_eq!(n.finalized().await, 2, "node {i}");
+        assert_eq!(n.finalized_hash(4).await, None, "node {i}");
+    }
+    assert_eq!(net.node(4).mgr().pending_vote_count(4).await, Some(3));
+
+    // Byzantine members equivocate: also sign A@4.
+    for z in &byz {
+        net.inject(sign_checkpoint_vote(CHAIN, 4, hash_at(&a, 4), z));
+    }
+    net.gossip().await;
+    for i in 0..4 {
+        assert_eq!(net.node(i).finalized_hash(4).await, Some(hash_at(&a, 4)));
+    }
+    assert_eq!(net.node(4).finalized_hash(4).await, None, "B never final");
+    net.assert_no_conflicting_finality(&[2, 4]).await;
+    net.assert_honest_no_equivocation();
+    let ticks = net.tick_all().await;
+    assert_eq!(
+        ticks,
+        vec![
+            verified(4),
+            verified(4),
+            verified(4),
+            verified(4),
+            verified(2)
+        ]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A4 — cross-chain replay; forged certificates
+// ---------------------------------------------------------------------------
+
+/// A4 / S3: votes signed for another chain id by the REAL committee are
+/// rejected (all four of them: no finality from them, nothing relayed); the
+/// honest votes then finalize normally.
+#[tokio::test]
+async fn a4_cross_chain_votes_are_rejected() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let mut net = network(4, &vals, config(100)).await;
+    let a = chains.main(8);
+    net.follow_all(&a).await;
+    let _ = net.node_mut(0).drive().await; // node 0 proposes 2, 4 (own vote kept local)
+    for k in &keys {
+        for h in [2u64, 4] {
+            let out = net
+                .send_to(0, sign_checkpoint_vote(FOREIGN_CHAIN, h, hash_at(&a, h), k))
+                .await;
+            assert!(
+                matches!(out, InboundOutcome::Rejected(_)),
+                "foreign vote at {h}: {out:?}"
+            );
+            assert!(out.relay().is_none());
+        }
+    }
+    assert!(net.queue.is_empty(), "nothing relayed");
+    assert_eq!(net.node(0).finalized().await, 0);
+    assert_eq!(net.node(0).mgr().pending_vote_count(4).await, Some(1));
+
+    let ticks = net.round().await;
+    assert!(ticks.iter().all(|t| *t == verified(4)), "{ticks:?}");
+}
+
+/// A4 / stale-or-forged certificates: each tampered certificate record, found
+/// at boot, halts finality BEFORE any block is admitted — floor not raised (not
+/// even to the earlier valid certificate), RPC tags at genesis, gadget
+/// proposes nothing — and the stop never clears by itself.
+#[tokio::test]
+async fn a4_forged_certificates_halt_at_boot_and_never_clear() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let committee: Vec<PublicKey> = keys.iter().map(pk).collect();
+    let vals = Validators::equal_stake(&keys);
+    let cfg = config(100);
+    let mut net = network(4, &vals, cfg.clone()).await;
+    let a = chains.main(10);
+    net.follow_all(&a).await;
+    let ticks = net.round().await;
+    assert!(ticks.iter().all(|t| *t == verified(6)), "{ticks:?}");
+
+    let outsiders: Vec<Ed25519SigningKey> = (40..44).map(key).collect();
+    let h8 = hash_at(&a, 8);
+    let k: Vec<&Ed25519SigningKey> = keys.iter().collect();
+    let o: Vec<&Ed25519SigningKey> = outsiders.iter().collect();
+    let mut pending_status = certificate(8, h8, &committee, &k, CHAIN);
+    pending_status.status = CheckpointStatus::Pending;
+    let mut swapped_hash = certificate(8, hash_at(&a, 6), &committee, &k, CHAIN);
+    swapped_hash.block_hash = h8; // signatures are over a different block
+    let forgeries: Vec<(&str, Checkpoint)> = vec![
+        (
+            "below quorum",
+            certificate(8, h8, &committee, &k[..2], CHAIN),
+        ),
+        (
+            "foreign-chain signatures",
+            certificate(8, h8, &committee, &k, FOREIGN_CHAIN),
+        ),
+        ("signatures over another block", swapped_hash),
+        (
+            "outsider voters",
+            certificate(8, h8, &committee, &[k[0], k[1], o[0]], CHAIN),
+        ),
+        (
+            "committee below the minimum",
+            certificate(8, h8, &committee[..3], &k[..3], CHAIN),
+        ),
+    ];
+    let mut node = net.nodes.pop().expect("node 3");
+    for (what, forged) in forgeries {
+        assert!(
+            forged.verify_certificate(CHAIN).is_err(),
+            "{what}: must not verify"
+        );
+        write_certificate(&node.storage, &forged);
+        let (n, boot) = node.restart(&vals, cfg.clone()).await;
+        node = n;
+        assert!(
+            matches!(
+                boot,
+                FloorTick::Halted(HaltReason::InvalidCertificate { height: 8, .. })
+            ),
+            "{what}: {boot:?}"
+        );
+        assert!(node.gadget.halted(), "{what}");
+        assert_eq!(node.floor(), 0, "{what}: floor not raised");
+        assert_eq!(node.rpc_finalized(), FinalizedAnchor::GENESIS, "{what}");
+        let out = node.drive().await;
+        assert!(out.is_empty(), "{what}: nothing signed while halted");
+        // Never clears by itself, even if something clears the gadget flag.
+        node.gadget.safety_stop().clear().await;
+        assert!(matches!(node.tick().await, FloorTick::Halted(_)), "{what}");
+        assert!(node.gadget.halted(), "{what}");
+        delete_certificate(&node.storage, 8);
+    }
+    // A record whose status is not Finalized is never loaded as a certificate:
+    // the boot check verifies the real one at 6 (nothing is raised from it).
+    assert!(pending_status.verify_certificate(CHAIN).is_err());
+    write_certificate(&node.storage, &pending_status);
+    let (node, boot) = node.restart(&vals, cfg.clone()).await;
+    assert_eq!(boot, verified(6));
+    assert_eq!(node.mgr().latest_finalized_height().await, 6);
+    delete_certificate(&node.storage, 8);
+    // Record removed: the next boot verifies the real certificate again.
+    let (node, boot) = node.restart(&vals, cfg).await;
+    assert_eq!(boot, verified(6));
+    assert_eq!(node.floor(), 6);
+}
+
+/// A4 follow-up: a certificate whose committee is NOT the committee the epoch
+/// snapshot yields for that height (here: four outsider keys, every signature
+/// valid) must not verify. `verify_certificate` checks internal consistency
+/// only (documented in checkpoint.rs: certificates are only ever produced by
+/// this node's own manager today). Binding a certificate's committee to the
+/// governing snapshot is required before certificates arrive from peers.
+#[tokio::test]
+#[ignore = "needs C3-S1b: certificate committee bound to the epoch snapshot before certs arrive from peers"]
+async fn a4_certificate_with_a_foreign_committee_is_rejected() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let cfg = config(100);
+    let mut node = TestNode::boot(key(0), &vals, cfg.clone()).await;
+    let a = chains.main(10);
+    node.follow(&a).await;
+    let outsiders: Vec<Ed25519SigningKey> = (40..44).map(key).collect();
+    let committee: Vec<PublicKey> = outsiders.iter().map(pk).collect();
+    let o: Vec<&Ed25519SigningKey> = outsiders.iter().collect();
+    write_certificate(
+        &node.storage,
+        &certificate(6, hash_at(&a, 6), &committee, &o, CHAIN),
+    );
+    let (node, boot) = node.restart(&vals, cfg).await;
+    assert!(
+        matches!(
+            boot,
+            FloorTick::Halted(HaltReason::InvalidCertificate { .. })
+        ),
+        "{boot:?}"
+    );
+    assert_eq!(node.floor(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// A5 — cross-height replay; stale votes
+// ---------------------------------------------------------------------------
+
+/// A5 / S3: a valid vote for H relabelled to H' is rejected; a correctly
+/// signed vote for (H', hash at H) is rejected (wrong block for H'); a vote for
+/// an already-finalized height is rejected, not buffered, not relayed.
+#[tokio::test]
+async fn a5_cross_height_and_stale_votes_are_rejected() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let mut net = network(4, &vals, config(100)).await;
+    let a = chains.main(8);
+    net.follow_all(&a).await;
+    let _ = net.node_mut(0).drive().await; // pending 2, 4 on node 0
+    let k1 = keys.get(1).expect("key 1");
+    let v2 = sign_checkpoint_vote(CHAIN, 2, hash_at(&a, 2), k1);
+
+    let mut relabelled = v2.clone();
+    relabelled.height = 4;
+    relabelled.block_hash = hash_at(&a, 4);
+    let out = net.send_to(0, relabelled).await;
+    assert!(
+        matches!(
+            out,
+            InboundOutcome::Rejected(CheckpointError::InvalidSignature(_))
+        ),
+        "{out:?}"
+    );
+    let wrong_block = sign_checkpoint_vote(CHAIN, 4, hash_at(&a, 2), k1);
+    let out = net.send_to(0, wrong_block).await;
+    assert!(matches!(out, InboundOutcome::Rejected(_)), "{out:?}");
+    assert_eq!(net.node(0).mgr().pending_vote_count(4).await, Some(1));
+    // A non-boundary height is refused outright.
+    let odd = sign_checkpoint_vote(CHAIN, 5, hash_at(&a, 5), k1);
+    let out = net.send_to(1, odd).await;
+    assert!(
+        matches!(
+            out,
+            InboundOutcome::Rejected(CheckpointError::NotCheckpointBoundary)
+        ),
+        "{out:?}"
+    );
+    net.queue.clear();
+
+    let _ = net.round().await;
+    for n in &net.nodes {
+        assert_eq!(n.finalized().await, 4);
+    }
+    // Stale: a vote for a finalized height, arriving after finality.
+    let late = sign_checkpoint_vote(CHAIN, 2, hash_at(&a, 2), keys.get(3).expect("k3"));
+    for i in 0..4 {
+        let out = net.send_to(i, late.clone()).await;
+        assert!(matches!(out, InboundOutcome::Rejected(_)), "{out:?}");
+        assert!(out.relay().is_none());
+        assert_eq!(net.node(i).gadget.early_vote_count().await, 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A6 — reorg below finality; safety stop and resume
+// ---------------------------------------------------------------------------
+
+/// A6 / S2: after the floor is raised, a reorg with its fork point below it is
+/// rejected, including a heavier branch with a sibling AT the checkpoint; a
+/// reorg whose fork point is at/above the floor proceeds and the certificate
+/// stays verified.
+#[tokio::test]
+async fn a6_reorg_below_finality_is_rejected_above_is_allowed() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let mut net = network(4, &vals, config(100)).await;
+    let a = chains.main(8);
+    net.follow_all(&a).await;
+    let _ = net.round().await;
+    assert_eq!(net.node(0).floor(), 4);
+
+    for fork_at in [2u64, 4] {
+        let b = chains.branch(&a, fork_at, 14, VRF_B);
+        match net.node_mut(0).reorg_onto(&b).await {
+            ReorgOutcome::Rejected(why) => {
+                assert!(why.contains("below finalized"), "fork at {fork_at}: {why}")
+            }
+            other => panic!("fork at {fork_at}: expected Rejected, got {other:?}"),
+        }
+        assert_eq!(net.node(0).app.applied_tip().await.hash, hash_at(&a, 8));
+    }
+    // Fork point exactly at the floor (sibling of A5): allowed.
+    let c = chains.branch(&a, 5, 10, VRF_C);
+    match net.node_mut(0).reorg_onto(&c).await {
+        ReorgOutcome::Reorged { .. } => {}
+        other => panic!("fork point at the floor must reorg, got {other:?}"),
+    }
+    assert_eq!(net.node(0).tick().await, verified(4));
+    assert!(!net.node(0).gadget.halted());
+}
+
+/// Safety stop and resume, end to end (spec §4.5). The floor is raised by the
+/// verifier's poll, so a reorg that lands between finalization and the next
+/// poll proceeds; the poll then finds the certified block off this node's
+/// chain and halts finality (no proposal, no signature, floor and RPC tags
+/// frozen) while the other nodes keep finalizing. When fork choice brings the
+/// node back onto the certified branch the stop clears, the boundaries skipped
+/// during the stop are revisited on the canonical chain, and the node votes
+/// and finalizes with the others again.
+#[tokio::test]
+async fn safety_stop_on_mismatch_then_resume_after_fork_choice() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let mut net = network(4, &vals, config(100)).await;
+    let a = chains.main(8);
+    net.follow_all(&a).await;
+    for i in 0..4 {
+        net.drive(i).await;
+    }
+    net.gossip().await; // Finalize 2, 4 everywhere; no verifier pass yet.
+    for n in &net.nodes {
+        assert_eq!(n.finalized().await, 4);
+        assert_eq!(n.floor(), 0, "floor waits for the verifier poll");
+    }
+    // Node 3 is moved onto a heavier sibling branch forking at 3 BEFORE its
+    // next verifier pass: allowed (its floor is still 0).
+    let b = chains.branch(&a, 4, 12, VRF_B);
+    match net.node_mut(3).reorg_onto(&b).await {
+        ReorgOutcome::Reorged { .. } => {}
+        other => panic!("expected the reorg to proceed, got {other:?}"),
+    }
+    let halted = HaltReason::Mismatch {
+        height: 4,
+        certified: hash_at(&a, 4),
+        canonical: Some(hash_at(&b, 4)),
+    };
+    assert_eq!(net.node(3).tick().await, FloorTick::Halted(halted.clone()));
+    assert!(net.node(3).gadget.halted());
+    assert_eq!(net.node(3).floor(), 0);
+    assert_eq!(net.node(3).rpc_finalized(), FinalizedAnchor::GENESIS);
+
+    // The others advance to 12 and keep finalizing (quorum 3 without node 3);
+    // node 3 runs its driver on B: nothing is proposed or signed, nothing sent.
+    let a = chains.main(12);
+    for i in 0..3 {
+        net.node_mut(i).follow(&a).await;
+    }
+    let out = net.drive(3).await;
+    assert!(out.is_empty());
+    for h in [6u64, 8] {
+        assert_eq!(net.node(3).gadget.signed_vote_at(h), None, "nothing signed");
+        assert_eq!(net.node(3).mgr().pending_hash(h).await, None);
+    }
+    for i in 0..3 {
+        net.drive(i).await;
+    }
+    net.gossip().await;
+    for i in 0..3 {
+        assert_eq!(net.node(i).finalized().await, 8);
+        assert_eq!(net.node(i).tick().await, verified(8));
+    }
+    assert_eq!(net.node(3).tick().await, FloorTick::Halted(halted));
+
+    // Fork choice: A is heavier again; node 3 reorgs back (fork point 3 >=
+    // floor 0). The next poll clears the stop and raises the floor.
+    let a = chains.main(14);
+    for i in 0..3 {
+        net.node_mut(i).follow(&a).await;
+    }
+    match net.node_mut(3).reorg_onto(&a).await {
+        ReorgOutcome::Reorged { .. } => {}
+        other => panic!("expected the reorg back onto A, got {other:?}"),
+    }
+    let t = net.node(3).tick().await;
+    assert!(
+        matches!(
+            t,
+            FloorTick::Verified {
+                recovered: true,
+                ..
+            }
+        ),
+        "{t:?}"
+    );
+    assert!(!net.node(3).gadget.halted());
+    // Node 3's next pass revisits 6 and 8 (skipped during the stop) on A —
+    // proposing them replays the votes it buffered meanwhile -> finalized — and
+    // votes the new boundary 10 with the others.
+    let mut node3_out = Vec::new();
+    for i in 0..4 {
+        let out = net.drive(i).await;
+        if i == 3 {
+            node3_out = out;
+        }
+    }
+    net.gossip().await;
+    let own: Vec<(u64, Hash)> = node3_out
+        .iter()
+        .filter(|v| v.voter == net.node(3).me())
+        .map(|v| (v.height, v.block_hash))
+        .collect();
+    assert_eq!(
+        own,
+        vec![
+            (10, hash_at(&a, 10)),
+            (6, hash_at(&a, 6)),
+            (8, hash_at(&a, 8))
+        ],
+        "new boundary first, then the revisits — all on A"
+    );
+    let ticks = net.tick_all().await;
+    assert!(ticks.iter().all(|t| *t == verified(10)), "{ticks:?}");
+    net.assert_no_conflicting_finality(&[2, 4, 6, 8, 10]).await;
+    net.assert_honest_no_equivocation();
+}
+
+/// OPEN FINDING (Stage 2): the literal §5 S2 — "committed state is never
+/// reverted below `latest_finalized_height()`; a reorg with fork point below the
+/// floor is Rejected" — does not hold between a finalization and the next
+/// floor-verifier pass: `CheckpointManager::finalize_checkpoint` advances
+/// `latest_finalized_height()` but the reorg floor (`CanonicalApplicator`
+/// `finalized_height`) is raised only by `FloorVerifier::tick` (5 s poll), so a
+/// reorg in that window reverts the just-finalized block. The node then halts
+/// (see the test above) instead of silently pinning the wrong branch.
+/// TLA+: CheckpointFinalitySafety_strict.cfg (FinalizedStaysCanonical).
+#[tokio::test]
+#[ignore = "bug: S2 window — reorg below a fresh certificate proceeds until the next floor poll"]
+async fn s2_strict_reorg_below_fresh_certificate_is_rejected() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let mut net = network(4, &vals, config(100)).await;
+    let a = chains.main(8);
+    net.follow_all(&a).await;
+    for i in 0..4 {
+        net.drive(i).await;
+    }
+    net.gossip().await;
+    assert_eq!(net.node(3).finalized().await, 4);
+    let b = chains.branch(&a, 4, 12, VRF_B);
+    match net.node_mut(3).reorg_onto(&b).await {
+        ReorgOutcome::Rejected(_) => {}
+        other => panic!("S2: reorg below the finalized height 4 proceeded: {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A7 — committee grinding
+// ---------------------------------------------------------------------------
+
+/// A7 / S4: with 10 validators and committee size 4, every node derives the
+/// identical committee from (governing snapshot, H, the checkpoint block's
+/// committed VRF output); a validator outside that committee — e.g. one that
+/// would be selected under a different (ground) seed — cannot vote; stake
+/// registered after the snapshot does not move the committee for heights that
+/// snapshot governs.
+#[tokio::test]
+async fn a7_committee_is_fixed_by_snapshot_height_and_block_seed() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..10).map(key).collect();
+    let mut vals = Validators::equal_stake(&keys);
+    // Snapshot S(2) = 21 (schedule 20/19): an attacker key with huge stake
+    // registers after S(1). It governs heights 22.. only.
+    let attacker = key(77);
+    let mut grown = vals.set.clone();
+    grown.push((pk(&attacker), u128::from(u64::MAX)));
+    vals.later.push((21, grown));
+    let cfg = config(4);
+    let mut net = network(3, &vals, cfg.clone()).await;
+    let a = chains.main(8);
+    net.follow_all(&a).await;
+    for i in 0..3 {
+        net.drive(i).await;
+    }
+    let h = 4u64;
+    let seed = at(&a, h).header.vrf_reveal.output;
+    let expected = CommitteeSelector::select(&vals.set, h, &seed, 4);
+    assert_eq!(expected.len(), 4);
+    for (i, n) in net.nodes.iter().enumerate() {
+        let c = n.gadget.committee_for(h, &seed).await.expect("committee");
+        assert_eq!(c, expected, "node {i} derives the same committee");
+        assert!(
+            !c.contains(&pk(&attacker)),
+            "post-snapshot stake is ignored"
+        );
+    }
+    // A validator in the set but outside this committee, which a ground seed
+    // would select: its vote is refused.
+    let outsider = keys
+        .iter()
+        .find(|k| !expected.contains(&pk(k)))
+        .expect("an outsider");
+    let ground = (0u8..=255)
+        .map(|b| Hash::new([b; 32]))
+        .find(|s| CommitteeSelector::select(&vals.set, h, s, 4).contains(&pk(outsider)))
+        .expect("some seed selects the outsider");
+    assert_ne!(ground, seed);
+    let out = net
+        .send_to(0, sign_checkpoint_vote(CHAIN, h, hash_at(&a, h), outsider))
+        .await;
+    assert!(
+        matches!(
+            out,
+            InboundOutcome::Rejected(CheckpointError::NotInCommittee(_))
+        ),
+        "{out:?}"
+    );
+    let out = net
+        .send_to(0, sign_checkpoint_vote(CHAIN, h, hash_at(&a, h), &attacker))
+        .await;
+    assert!(matches!(out, InboundOutcome::Rejected(_)), "{out:?}");
+
+    // The real committee's votes finalize H on every node (quorum 3 of 4).
+    for k in keys.iter().filter(|k| expected.contains(&pk(k))).take(3) {
+        net.inject(sign_checkpoint_vote(CHAIN, h, hash_at(&a, h), k));
+    }
+    net.gossip().await;
+    for (i, n) in net.nodes.iter().enumerate() {
+        let cp = n.mgr().get_checkpoint(h).await.expect("certificate");
+        assert_eq!(cp.status, CheckpointStatus::Finalized, "node {i}");
+        assert_eq!(cp.committee, expected, "node {i}");
+    }
+    // Heights governed by S(2) do see the new set (deterministically).
+    let late = net.node(0).gadget.committee_for(22, &seed).await;
+    let grown_set = vals.later.first().expect("S(2)").1.clone();
+    assert_eq!(
+        late,
+        Some(CommitteeSelector::select(&grown_set, 22, &seed, 4))
+    );
+}
+
+/// A7 follow-up, S1 across sibling candidates. The committee for a checkpoint
+/// is drawn from the governing snapshot with the CANDIDATE block's own VRF
+/// output as seed (`FinalityGadget::committee_for`), so two siblings at the
+/// same height get different committees once the validator set is larger than
+/// `committee_size`. Eight equal-stake validators, committee size 4 (quorum 3):
+/// a sibling B4 whose committee shares at most one member with A4's is found
+/// deterministically. The network splits along the fork: A4's committee
+/// members follow A, the rest of B4's committee follows B. No key signs two
+/// hashes, no one is Byzantine, and each side still collects 3 of its own 4.
+/// Returns both sides after one round each.
+struct SiblingSplit {
+    side_a: Net,
+    side_b: Net,
+    a: Vec<Block>,
+    b: Vec<Block>,
+    committee_a: Vec<PublicKey>,
+    committee_b: Vec<PublicKey>,
+}
+
+const SPLIT_HEIGHT: u64 = 4;
+
+async fn sibling_committee_split() -> SiblingSplit {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..8).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let cfg = config(4);
+    let h = SPLIT_HEIGHT;
+    let committee = |branch: &[Block]| {
+        CommitteeSelector::select(&vals.set, h, &at(branch, h).header.vrf_reveal.output, 4)
+    };
+    let a = chains.main(8);
+    let committee_a = committee(&a);
+    let (b, committee_b) = (0u8..=255)
+        .filter(|t| *t != VRF_A[0])
+        .find_map(|t| {
+            let b = chains.branch(&a, h, 8, [t; 32]);
+            let cb = committee(&b);
+            let shared = cb.iter().filter(|k| committee_a.contains(k)).count();
+            (shared <= 1).then_some((b, cb))
+        })
+        .expect("a sibling seed whose committee overlaps A4's in at most one member");
+    assert_eq!((committee_a.len(), committee_b.len()), (4, 4));
+    let mut nodes_a = Vec::new();
+    let mut nodes_b = Vec::new();
+    for k in &keys {
+        let me = pk(k);
+        if committee_a.contains(&me) {
+            nodes_a.push(TestNode::boot(k.clone(), &vals, cfg.clone()).await);
+        } else if committee_b.contains(&me) {
+            nodes_b.push(TestNode::boot(k.clone(), &vals, cfg.clone()).await);
+        }
+    }
+    let mut side_a = Net::new(nodes_a);
+    let mut side_b = Net::new(nodes_b);
+    side_a.follow_all(&a).await;
+    side_b.follow_all(&b).await;
+    let _ = side_a.round().await;
+    let _ = side_b.round().await;
+    SiblingSplit {
+        side_a,
+        side_b,
+        a,
+        b,
+        committee_a,
+        committee_b,
+    }
+}
+
+/// Pins the counterexample (review of #333 @ 0286eff, P2): with per-candidate
+/// committees, sibling blocks A4 and B4 BOTH finalize, on disjoint honest
+/// signers, with no equivocation and no Byzantine key. Expected to start
+/// failing once the protocol fixes the committee independently of the
+/// candidate (or otherwise prevents this); then update this test and
+/// un-ignore `s1_sibling_committees_never_finalize_conflicting_blocks`.
+/// TLA+: CheckpointFinalitySafety_committees.cfg.
+#[tokio::test]
+async fn open_finding_sibling_committees_finalize_conflicting_blocks() {
+    let split = sibling_committee_split().await;
+    let h = SPLIT_HEIGHT;
+    assert_ne!(
+        split.committee_a, split.committee_b,
+        "committee follows the candidate"
+    );
+    for n in &split.side_a.nodes {
+        assert_eq!(n.finalized_hash(h).await, Some(hash_at(&split.a, h)));
+    }
+    for n in &split.side_b.nodes {
+        assert_eq!(n.finalized_hash(h).await, Some(hash_at(&split.b, h)));
+    }
+    split.side_a.assert_honest_no_equivocation();
+    split.side_b.assert_honest_no_equivocation();
+}
+
+/// S1 as specified (§5): at most one block finalizes per height network-wide,
+/// whatever the candidate. Fails today with per-candidate committees (see the
+/// test above).
+#[tokio::test]
+#[ignore = "bug: S1 — sibling candidates draw their committees from their own VRF seeds; disjoint committees can both finalize"]
+async fn s1_sibling_committees_never_finalize_conflicting_blocks() {
+    let split = sibling_committee_split().await;
+    let h = SPLIT_HEIGHT;
+    let mut seen: Option<Hash> = None;
+    for n in split.side_a.nodes.iter().chain(split.side_b.nodes.iter()) {
+        if let Some(x) = n.finalized_hash(h).await {
+            match seen {
+                None => seen = Some(x),
+                Some(y) => assert_eq!(x, y, "S1 violated at height {h}"),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A8 — long-range / posterior corruption
+// ---------------------------------------------------------------------------
+
+/// A8: after A@4 is finalized, the ENTIRE old committee (posterior corruption
+/// of every key) signs the sibling B@4. Those votes are refused by every node,
+/// no node re-opens the height, and a fully-signed B@4 certificate written into
+/// a node's store halts that node at boot (mismatch with its canonical A@4)
+/// instead of moving its floor or RPC tags onto B. Finality never moves
+/// backwards or sideways.
+#[tokio::test]
+async fn a8_old_committee_cannot_refinalize_a_competing_history() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let committee: Vec<PublicKey> = keys.iter().map(pk).collect();
+    let vals = Validators::equal_stake(&keys);
+    let cfg = config(100);
+    let mut net = network(4, &vals, cfg.clone()).await;
+    let a = chains.main(8);
+    let b = chains.branch(&a, 4, 12, VRF_B);
+    net.follow_all(&a).await;
+    let _ = net.round().await;
+    for k in &keys {
+        net.inject(sign_checkpoint_vote(CHAIN, 4, hash_at(&b, 4), k));
+    }
+    net.gossip().await;
+    assert!(net
+        .log
+        .iter()
+        .filter(|(_, v, _)| v.block_hash == hash_at(&b, 4))
+        .all(|(_, _, o)| o.starts_with("Rejected")));
+    for n in &mut net.nodes {
+        for blk in &b {
+            n.import(blk).await;
+        }
+        let out = n
+            .gadget
+            .on_buried_checkpoint(4, hash_at(&b, 4), &Hash::new([1; 32]), Some(&n.key))
+            .await;
+        assert_eq!(out.skipped, Some(SkipReason::AlreadyFinalized));
+        assert!(out.outbound.is_empty());
+        assert_eq!(n.finalized_hash(4).await, Some(hash_at(&a, 4)));
+        assert_eq!(n.floor(), 4);
+    }
+
+    // A complete, validly signed B@4 certificate lands in node 0's store.
+    let k: Vec<&Ed25519SigningKey> = keys.iter().collect();
+    let posterior = certificate(4, hash_at(&b, 4), &committee, &k, CHAIN);
+    assert!(posterior.verify_certificate(CHAIN).is_ok());
+    let node = net.nodes.remove(0);
+    write_certificate(&node.storage, &posterior);
+    let (node, boot) = node.restart(&vals, cfg).await;
+    assert_eq!(
+        boot,
+        FloorTick::Halted(HaltReason::Mismatch {
+            height: 4,
+            certified: hash_at(&b, 4),
+            canonical: Some(hash_at(&a, 4)),
+        })
+    );
+    assert!(node.gadget.halted());
+    assert_eq!(node.floor(), 0, "floor not raised onto B");
+    assert_eq!(node.rpc_finalized(), FinalizedAnchor::GENESIS);
+}
+
+// ---------------------------------------------------------------------------
+// Restart mid-epoch
+// ---------------------------------------------------------------------------
+
+/// Restart mid-epoch: node 3 signs its votes (durable record) and dies before
+/// they leave the process; node 2 is down. Nodes 0 and 1 stall at 2 votes. On
+/// restart node 3's driver starts from cursor 0, re-signs the SAME votes
+/// (identical bytes: deterministic ed25519 over the recorded hash) and
+/// broadcasts them: 0 and 1 finalize. Later checkpoints finalize with node 3
+/// too, and a further restart re-raises the floor at boot, before any block
+/// is admitted.
+#[tokio::test]
+async fn restart_mid_epoch_resends_recorded_votes_and_restores_floor_at_boot() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let cfg = config(100);
+    let mut net = network(4, &vals, cfg.clone()).await;
+    let a = chains.main(8);
+    net.follow_all(&a).await;
+    *net.online.get_mut(2).expect("flag") = false; // node 2 is down throughout
+    *net.online.get_mut(3).expect("flag") = false;
+    let lost = net.node_mut(3).drive().await; // signed, never broadcast (crash)
+    assert_eq!(lost.len(), 2);
+    assert_eq!(net.node(3).gadget.signed_vote_at(4), Some(hash_at(&a, 4)));
+    net.drive(0).await;
+    net.drive(1).await;
+    net.gossip().await;
+    assert_eq!(net.node(0).finalized().await, 0, "2 of 4: stalled");
+
+    // Restart node 3 mid-epoch (schedule 20/19: S(1) governs 2..=21).
+    let n3 = net.nodes.pop().expect("node 3");
+    let (n3, boot) = n3.restart(&vals, cfg.clone()).await;
+    assert_eq!(boot, FloorTick::NoCertificate);
+    net.nodes.push(n3);
+    *net.online.get_mut(3).expect("flag") = true;
+    let resent = net.drive(3).await;
+    let bytes = |v: &CheckpointVote| (v.height, v.block_hash, v.signature.as_bytes().to_vec());
+    assert_eq!(
+        resent.iter().map(bytes).collect::<Vec<_>>(),
+        lost.iter().map(bytes).collect::<Vec<_>>(),
+        "the recorded votes, re-signed identically"
+    );
+    net.gossip().await;
+    for i in [0usize, 1] {
+        assert_eq!(net.node(i).finalized().await, 4, "node {i}");
+        assert_eq!(net.node(i).tick().await, verified(4));
+    }
+    // Node 3 restarted after 0 and 1 gossiped: it holds only its own vote.
+    // Catching it up on 2 and 4 is certificate sync (C3-S1b, test below).
+    assert_eq!(net.node(3).finalized().await, 0);
+
+    // The chain moves on; 0, 1, 3 finalize 6 and 8 together.
+    let a = chains.main(12);
+    for i in [0usize, 1, 3] {
+        net.node_mut(i).follow(&a).await;
+    }
+    let _ = net.round().await;
+    for i in [0usize, 1, 3] {
+        assert_eq!(net.node(i).finalized().await, 8, "node {i}");
+        assert_eq!(net.node(i).floor(), 8, "node {i}");
+    }
+    // A further restart: the floor is back at 8 from the boot check alone.
+    let n3 = net.nodes.pop().expect("node 3");
+    let (n3, boot) = n3.restart(&vals, cfg).await;
+    assert_eq!(boot, verified(8));
+    assert_eq!(n3.floor(), 8);
+    assert_eq!(
+        n3.rpc_finalized(),
+        FinalizedAnchor {
+            height: 8,
+            hash: Some(hash_at(&a, 8))
+        }
+    );
+    net.nodes.push(n3);
+    net.assert_no_conflicting_finality(&[2, 4, 6, 8]).await;
+}
+
+/// Restart follow-up: a node that missed the votes for a checkpoint while it
+/// was down must obtain that checkpoint's certificate from peers.
+#[tokio::test]
+#[ignore = "needs C3-S1b: late-joiner certificate sync (spec §11.10)"]
+async fn restarted_node_fetches_missed_certificates() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let cfg = config(100);
+    let mut net = network(4, &vals, cfg.clone()).await;
+    let a = chains.main(8);
+    net.follow_all(&a).await;
+    *net.online.get_mut(3).expect("flag") = false;
+    for i in 0..3 {
+        net.drive(i).await;
+    }
+    net.gossip().await;
+    let n3 = net.nodes.pop().expect("node 3");
+    let (n3, _) = n3.restart(&vals, cfg).await;
+    net.nodes.push(n3);
+    *net.online.get_mut(3).expect("flag") = true;
+    let _ = net.round().await;
+    assert_eq!(net.node(3).finalized().await, 4);
+    assert_eq!(net.node(3).floor(), 4);
+}
