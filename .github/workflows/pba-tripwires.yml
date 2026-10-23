@@ -30,3 +30,9 @@ jobs:
         run: scripts/ci/check_pba_exec_tripwires.sh --self-test
       - name: CHAIN-EXEC tripwires (signature setting, node feature set, mempool expiry, metrics bind)
         run: scripts/ci/check_pba_exec_tripwires.sh
+      # The deploy script builds its download and clone URLs from RELEASE_REPO,
+      # so pin the variable itself, not just literal owner names.
+      - name: Deploy script release-source self-test
+        run: bash scripts/tests/test_deploy_testnet_release_source.sh --self-test
+      - name: Deploy script installs only from the pinned release repo
+        run: bash scripts/tests/test_deploy_testnet_release_source.sh .
