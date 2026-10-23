@@ -84,6 +84,11 @@ cat >"$BIN/forge" <<'EOF'
 echo "forge $*" >>"$FAKE/calls.log"
 echo "forge-env gov=${GENESIS_GOVERNANCE_OUT:-} vest=${TEAM_VESTING_OUT:-} dormant=${DORMANT_LEDGERS_OUT:-} govbook=${GENESIS_GOVERNANCE_BOOK:-} extras=${EXTRA_ADDRESS_BOOKS:-}" >>"$FAKE/calls.log"
 echo "forge-deployer dep=${DEPLOYER_ADDRESS-<unset>} ceremony=${CEREMONY_DEPLOYER_ADDRESS-<unset>}" >>"$FAKE/calls.log"
+env >>"$FAKE/forge.env"
+# FAKE_P3_BOOK / FAKE_P4_BOOK=<file>: the vesting / dormant-ledger step "writes" that file as its
+# output book (TEAM_VESTING_OUT / DORMANT_LEDGERS_OUT, relative to contracts/, the cwd).
+if [[ "$*" == *DeployTeamVesting* && -n "${FAKE_P3_BOOK:-}" ]]; then cp "$FAKE_P3_BOOK" "$TEAM_VESTING_OUT"; fi
+if [[ "$*" == *DeployDormantLedgers* && -n "${FAKE_P4_BOOK:-}" ]]; then cp "$FAKE_P4_BOOK" "$DORMANT_LEDGERS_OUT"; fi
 if [[ "$*" == *CheckDeployedAdmins* ]]; then
   # Like the real checker: read ONE book, ADDRESS_BOOK (relative to contracts/, the cwd).
   # FAKE_DEPLOYER_HELD=<name>: the contract of that name in the book still has the deployer
@@ -523,6 +528,7 @@ echo "regenesis $*" >>"$FAKE/calls.log"
 echo "regenesis-env vg=${VALIDATOR_GOVERNANCE:-} vs=${VALIDATOR_SLASHER:-} gov=${GOVERNANCE:-}" >>"$FAKE/calls.log"
 echo "regenesis-emit fresh=${EMIT_FRESH_GENESIS:-} dep=${EMIT_DEPLOYER:-} since=${EMIT_BROADCAST_SINCE:-} out=${EMIT_OUTPUT:-}" >>"$FAKE/calls.log"
 echo "regenesis-deployer dep=${DEPLOYER_ADDRESS-<unset>} ceremony=${CEREMONY_DEPLOYER_ADDRESS-<unset>}" >>"$FAKE/calls.log"
+env >>"$FAKE/regenesis.env"
 if [[ -n "${FAKE_REGEN_BOOK:-}" ]]; then cp "$FAKE_REGEN_BOOK" "$EMIT_OUTPUT"; fi
 EOF
 DEP=$(addr 1)
@@ -598,6 +604,18 @@ GB="$REPO/contracts/genesis"
 mk_manifest() {
   printf '{"version":1,"runId":"test-run","mode":"%s","chainId":40204,"genesisHash":"%s","block0Timestamp":%s,"deployer":"%s","account":"%s"}\n' \
     "${3:-simulate}" "${5:-$GEN}" "${6:-5000}" "${2:-$DEP}" "${4:-}" >"$1/ceremony-run.json"
+}
+# record_outputs <dir>: what a --confirm P3 and P4 record, for fixtures that write the books directly.
+record_outputs() {
+  python3 - "$1" <<'PY2'
+import json, os, sys
+d = sys.argv[1]
+m = json.load(open(f"{d}/ceremony-run.json"))
+for key, f in (("teamVesting", "team-vesting.json"), ("dormantLedgers", "dormant-ledgers.json")):
+    if os.path.exists(f"{d}/{f}"):
+        m[key] = {k: v.lower() for k, v in json.load(open(f"{d}/{f}"))["contracts"].items()}
+json.dump(m, open(f"{d}/ceremony-run.json", "w"))
+PY2
 }
 expect "ceremony: a resume needs the run manifest" 3 'run manifest: .*ceremony-run.json is missing' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
 printf '{"runId":"x"' >"$GB/ceremony-run.json"
@@ -783,6 +801,21 @@ expect "ceremony C9: P1 runs with no deployer alias preset" 0 'done \(mode=simul
 calls | grep -q "^forge-deployer dep=$DEP ceremony=$DEP$" && ok "ceremony C9: forge phases get CEREMONY_DEPLOYER_ADDRESS = the run's deployer" ||
   bad "ceremony C9: forge phases get CEREMONY_DEPLOYER_ADDRESS = the run's deployer" "$(calls)"
 rm -rf "$C9D"
+# --password-file reaches P2 (regenesis.sh, then forge) as a path: the password itself never
+# appears in a child's argv, in its environment or in the ceremony's output. The password is a
+# throwaway string in a file under this test's temp dir.
+PWD_DIR=$(mktemp -d "$T/pw.XXXXXX")
+PW_FILE="$PWD_DIR/keystore.pass"
+PW_STR="dgx-dummy-pw-$RANDOM$RANDOM-not-a-key"
+printf '%s\n' "$PW_STR" >"$PW_FILE"
+chmod 600 "$PW_FILE"
+# no_pw <name> <file...>: none of the files holds the password string.
+no_pw() {
+  local name="$1" f hit=""
+  shift
+  for f in "$@"; do if [[ -f "$f" ]] && grep -qF -- "$PW_STR" "$f"; then hit+=" $f"; fi; done
+  if [[ -z "$hit" ]]; then ok "$name"; else bad "$name" "password string found in:$hit"; fi
+}
 # regenesis.sh on its own (the reroll runbooks call it directly): a CEREMONY_DEPLOYER_ADDRESS
 # that is not exactly DEPLOYER_ADDRESS stops it before the build.
 RG="$T/rg"
@@ -797,6 +830,32 @@ reset_calls
 env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" CEREMONY_DEPLOYER_ADDRESS="$MIXED" bash "$RG/scripts/ops/regenesis.sh" >"$T/rg.log" 2>&1
 calls | grep -q '^forge clean' && ! grep -q 'not exactly DEPLOYER_ADDRESS' "$T/rg.log" && ok "regenesis: an exact CEREMONY_DEPLOYER_ADDRESS goes on to the build" ||
   bad "regenesis: an exact CEREMONY_DEPLOYER_ADDRESS goes on to the build" "$(cat "$T/rg.log")"
+# regenesis.sh forwards --password-file to every forge step as a path, never the password.
+reset_calls
+rm -f "$FAKE/forge.env"
+env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" bash "$RG/scripts/ops/regenesis.sh" --account deployer --password-file "$PW_FILE" >"$T/rg-pw.log" 2>&1
+if calls | grep -q '^forge script script/DeployAll.s.sol .*--account deployer --password-file '"$PW_FILE"'\( \|$\)' &&
+  [[ $(calls | grep '^forge script ' | grep -cvF -- "--password-file $PW_FILE") -eq 0 ]]; then
+  ok "regenesis #364: every forge step gets --account and --password-file (the path)"
+else
+  bad "regenesis #364: every forge step gets --account and --password-file (the path)" "$(calls | grep '^forge' || true; tail -3 "$T/rg-pw.log")"
+fi
+no_pw "regenesis #364: the password is in no forge argv, env or log" "$FAKE/calls.log" "$FAKE/forge.env" "$T/rg-pw.log"
+reset_calls
+expect "regenesis #364: a password on the command line is refused" 1 'password on the command line is refused' -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" bash "$RG/scripts/ops/regenesis.sh" --account deployer --password "$PW_STR"
+env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" bash "$RG/scripts/ops/regenesis.sh" --account deployer "--password=$PW_STR" >"$T/rg-pw2.log" 2>&1
+no_pw "regenesis #364: a refused --password=… is not echoed" "$T/rg-pw2.log" "$FAKE/calls.log"
+expect "regenesis #364: a --password-file that is not a readable file is refused" 1 'password-file must name a readable file' -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" bash "$RG/scripts/ops/regenesis.sh" --account deployer --password-file "$PW_STR"
+expect "regenesis #364: --password-file without --account is refused" 1 'password-file needs --account' -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" bash "$RG/scripts/ops/regenesis.sh" --password-file "$PW_FILE"
+if calls | grep -q '^forge'; then bad "regenesis #364: a refused password input runs no forge" "$(calls)"; else ok "regenesis #364: a refused password input runs no forge"; fi
+# The ceremony refuses the same inputs before any phase, without echoing them.
+expect "ceremony #364: a password on the command line is refused" 1 'password on the command line is refused' -- "${CEENV[@]}" bash "$CE" --account deployer --password "$PW_STR"
+"${CEENV[@]}" bash "$CE" --account deployer "--password=$PW_STR" >"$T/ce-pw2.log" 2>&1
+no_pw "ceremony #364: a refused --password=… is not echoed" "$T/ce-pw2.log"
+expect "ceremony #364: a --password-file that is not a readable file is refused" 1 'password-file must name a readable file' -- "${CEENV[@]}" bash "$CE" --account deployer --password-file "$PW_STR"
+"${CEENV[@]}" bash "$CE" --account deployer --password-file "$PW_STR" >"$T/ce-pw3.log" 2>&1
+no_pw "ceremony #364: a refused --password-file value is not echoed" "$T/ce-pw3.log"
+expect "ceremony #364: --password-file without --account is refused" 1 'password-file needs --account' -- "${CEENV[@]}" bash "$CE" --password-file "$PW_FILE"
 rm -rf "$RG"
 # After a --confirm P2, the deployer-derived fee recipients of the contracts in the book are
 # read from the chain and must be the book's (= the run's) deployer.
@@ -835,6 +894,25 @@ c9_fee "fee recipients equal to the run's deployer pass P2" 0 'P2 fee recipients
 c9_fee "an X402Facilitator fee recipient other than the run's deployer fails P2" 3 'X402Facilitator.treasury\(\) is 0x0+63, not the book.s deployer 0x0+1' fake_call "$C9X" treasury "$STALE"
 c9_fee "a ModelMarketplace fee recipient other than the run's deployer fails P2" 3 'ModelMarketplace.treasuryAddress\(\) is 0x0+63' fake_call "$C9MM" treasuryAddress "$STALE"
 c9_fee "an unreadable ComputeMarketplace fee recipient fails P2" 3 'cannot read ComputeMarketplace.treasury\(\)' rm -f "$FAKE/call/$C9CM/treasury"
+# #364 on P2 (the password fixture is set up before the regenesis.sh cases above).
+mk_manifest "$GB" "$DEP" confirm deployer
+gov_book "$GB" "$DEP"
+gov_chain
+rm -rf "$FAKE/call/$C9X" "$FAKE/call/$C9MM" "$FAKE/call/$C9CM"
+fake_call "$C9X" treasury "$DEP"
+fake_call "$C9MM" treasuryAddress "$DEP"
+fake_call "$C9CM" treasury "$DEP"
+reset_calls
+rm -f "$FAKE/regenesis.env" "$FAKE/forge.env"
+"${C9ENV[@]}" bash "$CE" --confirm --only P2 --account deployer --password-file "$PW_FILE" >"$T/pw-p2.log" 2>&1
+pw_rc=$?
+if [[ $pw_rc -eq 0 ]] && calls | grep -qxF -- "regenesis --reroll --with-aa --broadcast --account deployer --password-file $PW_FILE"; then
+  ok "ceremony #364: --password-file reaches P2's regenesis.sh as a path"
+else
+  bad "ceremony #364: --password-file reaches P2's regenesis.sh as a path" "exit $pw_rc; $(calls | grep '^regenesis ' || true)"
+fi
+no_pw "ceremony #364: the password is in no P2 argv, env or log" "$FAKE/calls.log" "$FAKE/regenesis.env" "$T/pw-p2.log"
+cp "$T/book.c9.orig" "$GBK"
 rm -rf "$REPO/contracts/broadcast" "$FAKE/call/$C9X" "$FAKE/call/$C9MM" "$FAKE/call/$C9CM"
 mk_manifest "$GB"
 # C8 on P5/P6: once P2 recorded its book, a different book is refused; --confirm needs one.
@@ -875,6 +953,7 @@ expect "ceremony C4: P5 fails when the registry cannot be read" 3 'cannot read V
 mk_manifest "$GB" "$DEP" confirm deployer
 printf '{"deployer":"%s","contracts":{"VestingAlice":"%s"}}' "$DEP" "$(addr 71)" >"$GB/team-vesting.json"
 printf '{"deployer":"%s","contracts":{"FederatedRoundLedger":"%s","PatronageLedger":"%s"}}' "$DEP" "$(addr 81)" "$(addr 82)" >"$GB/dormant-ledgers.json"
+record_outputs "$GB" # what --confirm P3/P4 record (#363)
 expect "ceremony C4: --confirm P5 needs a ValidatorRegistry in the book" 3 'has no ValidatorRegistry' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1 bash "$CE" --confirm --only P5 --account deployer
 vr_chain "$(addr 31)" "$(addr 31)" "$Z40"
 expect "ceremony C8: --confirm P5 needs a stack book recorded by P2" 3 'records no stack book' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1 ADDRESS_BOOK="$T/book-vr.json" bash "$CE" --confirm --only P5 --account deployer
@@ -992,6 +1071,117 @@ reset_calls
 expect "ceremony: P5 checks the nondefault dir's books" 0 'P5 PASS' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$RUN2" bash "$CE" --simulate --only P5
 calls | grep -q '^forge-book genesis/run2/p5-admin-book.json$' && grep -q "$(addr 41)" "$RUN2/p5-admin-book.json" && ok "ceremony: P5 merges the nondefault dir's books" || bad "ceremony: P5 merges the nondefault dir's books" "$(calls)"
 rm -r "$RUN2"
+
+# ---------------------------------------------------------------- #363: P3/P4 books recorded when written
+# A --confirm P3/P4 must leave its output book recorded in the run manifest (teamVesting /
+# dormantLedgers), after checking it names the run's deployer (C9) and lists only this run's
+# deployments of that step (or, for P4, the run's recorded governance). A step that writes no
+# book, or a book that cannot be recorded, fails the run; --confirm P5 refuses a book that its
+# step did not record.
+OBK="$T/outbooks"
+mkdir -p "$OBK"
+V1=$(addr 701) V2=$(addr 702) FRLA=$(addr 711) PLA=$(addr 712)
+BCD="$REPO/contracts/broadcast"
+vest_book() { # file deployer [first wallet]
+  printf '{"deployer":"%s","contracts":{"TeamVesting_alice":"%s","TeamVesting_bob":"%s"},"wallets":2,"totalWei":"10"}\n' "$2" "${3:-$V1}" "$V2" >"$1"
+}
+dormant_book() { # file deployer [ledger] [governance timelock]
+  printf '{"deployer":"%s","contracts":{"FederatedRoundLedger":"%s","PatronageLedger":"%s","GovernanceTimelock":"%s","GovernanceMultisig":"%s"},"governance":"%s"}\n' \
+    "$2" "${3:-$FRLA}" "$PLA" "${4:-$(addr 31)}" "$(addr 33)" "${4:-$(addr 31)}" >"$1"
+}
+bc_run() { # script timestamp "type:name:addr"...
+  local d="$BCD/$1/40204" ts="$2" tx="" e t n x
+  shift 2
+  for e in "$@"; do
+    IFS=: read -r t n x <<<"$e"
+    tx+="${tx:+,}{\"transactionType\":\"$t\",\"contractName\":\"$n\",\"contractAddress\":\"$x\"}"
+  done
+  mkdir -p "$d"
+  printf '{"timestamp":%s,"transactions":[%s]}\n' "$ts" "$tx" >"$d/run-latest.json"
+}
+ob_reset() { # [mode]
+  rm -f "$GB/team-vesting.json" "$GB/dormant-ledgers.json"
+  rm -rf "$BCD"
+  echo "$GEN" >"$LRPC/block-0"
+  echo 5000 >"$LRPC/block-0-timestamp"
+  mk_manifest "$GB" "$DEP" "${1:-confirm}" "$([[ "${1:-confirm}" == confirm ]] && echo deployer)"
+  gov_book "$GB" "$DEP"
+  gov_chain
+  reset_calls
+}
+manifest_key() { # key -> its JSON in the run manifest (null if absent)
+  python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(json.dumps(m.get(sys.argv[2]), sort_keys=True, separators=(",",":")))' "$GB/ceremony-run.json" "$1"
+}
+OBENV=("${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1
+  PATRONAGE_KYC_REGISTRY="$(addr 51)" PATRONAGE_MEMBERSHIP="$(addr 52)")
+VEST_OK="$OBK/vest.json"
+vest_book "$VEST_OK" "$DEP"
+DORM_OK="$OBK/dormant.json"
+dormant_book "$DORM_OK" "$DEP"
+want_vest=$(printf '{"TeamVesting_alice":"%s","TeamVesting_bob":"%s"}' "$V1" "$V2")
+want_dorm=$(python3 -c 'import json,sys; print(json.dumps({k: v.lower() for k, v in json.load(open(sys.argv[1]))["contracts"].items()}, sort_keys=True, separators=(",",":")))' "$DORM_OK")
+vest_bc() { bc_run DeployTeamVesting.s.sol "${1:-6000}" "CREATE2:TeamVestingWallet:$V1" "CREATE2:TeamVestingWallet:$V2"; }
+dorm_bc() { bc_run DeployDormantLedgers.s.sol "${1:-6000}" "CREATE2:FederatedRoundLedger:$FRLA" "CREATE:PatronageLedger:$PLA"; }
+
+# P3
+ob_reset
+vest_bc
+expect "ceremony #363: a --confirm P3 records the vesting book it wrote" 0 'P3 team-vesting.json recorded in the run manifest' -- "${OBENV[@]}" FAKE_P3_BOOK="$VEST_OK" bash "$CE" --confirm --only P3 --account deployer
+[[ "$(manifest_key teamVesting)" == "$want_vest" ]] && ok "ceremony #363: the manifest holds P3's wallets" || bad "ceremony #363: the manifest holds P3's wallets" "$(manifest_key teamVesting)"
+ob_reset
+vest_bc
+expect "ceremony #363: a --confirm P3 that writes no book fails" 3 'GATE FAIL at P3: .*team-vesting.json missing after DeployTeamVesting' -- "${OBENV[@]}" bash "$CE" --confirm --only P3 --account deployer
+ob_reset
+vest_bc
+vest_book "$OBK/vest-stale.json" "$STALE"
+expect "ceremony #363 C9: a P3 book naming another deployer fails" 3 "GATE FAIL at P3: .*names deployer 0x0+63, not this run's 0x0+1" -- "${OBENV[@]}" FAKE_P3_BOOK="$OBK/vest-stale.json" bash "$CE" --confirm --only P3 --account deployer
+[[ "$(manifest_key teamVesting)" == null ]] && ok "ceremony #363: a refused P3 book is not recorded" || bad "ceremony #363: a refused P3 book is not recorded" "$(manifest_key teamVesting)"
+ob_reset
+vest_bc
+vest_book "$OBK/vest-other.json" "$DEP" "$(addr 799)"
+expect "ceremony #363: a P3 book listing a wallet this run did not deploy fails" 3 'GATE FAIL at P3: .*TeamVesting_alice 0x0+31f is not a deployment in this run.s DeployTeamVesting.s.sol broadcasts' -- "${OBENV[@]}" FAKE_P3_BOOK="$OBK/vest-other.json" bash "$CE" --confirm --only P3 --account deployer
+ob_reset
+vest_bc 4000
+expect "ceremony #363: a P3 broadcast from before block 0 is no evidence" 3 'GATE FAIL at P3: .*no DeployTeamVesting.s.sol broadcast since this chain.s block 0' -- "${OBENV[@]}" FAKE_P3_BOOK="$VEST_OK" bash "$CE" --confirm --only P3 --account deployer
+ob_reset simulate
+expect "ceremony #363: a simulated P3 records its book" 0 'P3 team-vesting.json recorded in the run manifest' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 FAKE_P3_BOOK="$VEST_OK" bash "$CE" --simulate --only P3
+ob_reset simulate
+expect "ceremony #363 C9: a simulated P3 book naming another deployer fails" 3 "GATE FAIL at P3: .*names deployer 0x0+63" -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 FAKE_P3_BOOK="$OBK/vest-stale.json" bash "$CE" --simulate --only P3
+
+# P4
+ob_reset
+dorm_bc
+expect "ceremony #363: a --confirm P4 records the dormant-ledger book it wrote" 0 'P4 dormant-ledgers.json recorded in the run manifest' -- "${OBENV[@]}" FAKE_P4_BOOK="$DORM_OK" bash "$CE" --confirm --only P4 --account deployer
+[[ "$(manifest_key dormantLedgers)" == "$want_dorm" ]] && ok "ceremony #363: the manifest holds P4's ledgers" || bad "ceremony #363: the manifest holds P4's ledgers" "$(manifest_key dormantLedgers)"
+ob_reset
+dorm_bc
+expect "ceremony #363: a --confirm P4 that writes no book fails" 3 'GATE FAIL at P4: .*dormant-ledgers.json missing after DeployDormantLedgers' -- "${OBENV[@]}" bash "$CE" --confirm --only P4 --account deployer
+ob_reset
+dorm_bc
+dormant_book "$OBK/dorm-stale.json" "$STALE"
+expect "ceremony #363 C9: a P4 book naming another deployer fails" 3 "GATE FAIL at P4: .*names deployer 0x0+63, not this run's 0x0+1" -- "${OBENV[@]}" FAKE_P4_BOOK="$OBK/dorm-stale.json" bash "$CE" --confirm --only P4 --account deployer
+[[ "$(manifest_key dormantLedgers)" == null ]] && ok "ceremony #363: a refused P4 book is not recorded" || bad "ceremony #363: a refused P4 book is not recorded" "$(manifest_key dormantLedgers)"
+ob_reset
+dorm_bc
+dormant_book "$OBK/dorm-other.json" "$DEP" "$(addr 798)"
+expect "ceremony #363: a P4 book listing a ledger this run did not deploy fails" 3 'GATE FAIL at P4: .*FederatedRoundLedger 0x0+31e is not a deployment in this run.s DeployDormantLedgers.s.sol broadcasts' -- "${OBENV[@]}" FAKE_P4_BOOK="$OBK/dorm-other.json" bash "$CE" --confirm --only P4 --account deployer
+ob_reset
+dorm_bc
+dormant_book "$OBK/dorm-gov.json" "$DEP" "$FRLA" "$STALE"
+expect "ceremony #363: a P4 book naming another governance than the run's fails" 3 'GATE FAIL at P4: .*GovernanceTimelock is 0x0+63, this run.s is 0x0+1f' -- "${OBENV[@]}" FAKE_P4_BOOK="$OBK/dorm-gov.json" bash "$CE" --confirm --only P4 --account deployer
+
+# P5 on --confirm: a book its step did not record is refused; recorded books pass this check.
+ob_reset
+cp "$VEST_OK" "$GB/team-vesting.json"
+cp "$DORM_OK" "$GB/dormant-ledgers.json"
+expect "ceremony #363: --confirm P5 refuses a vesting book P3 did not record" 3 'GATE FAIL at P5: .*team-vesting.json was not recorded by P3' -- "${OBENV[@]}" bash "$CE" --confirm --only P5 --account deployer
+record_outputs "$GB"
+python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); del m["dormantLedgers"]; json.dump(m, open(sys.argv[1], "w"))' "$GB/ceremony-run.json"
+expect "ceremony #363: --confirm P5 refuses a dormant-ledger book P4 did not record" 3 'GATE FAIL at P5: .*dormant-ledgers.json was not recorded by P4' -- "${OBENV[@]}" bash "$CE" --confirm --only P5 --account deployer
+record_outputs "$GB"
+expect "ceremony #363: --confirm P5 accepts the books P3 and P4 recorded (control: stops later, at the registry)" 3 'has no ValidatorRegistry' -- "${OBENV[@]}" bash "$CE" --confirm --only P5 --account deployer
+ob_reset simulate
+rm -rf "$BCD"
 
 # ------------------------------------------------------------------ address-book generator
 # scripts/ops/emit-address-table.sh (what regenesis.sh runs and P2 verifies, C8) over synthetic
@@ -1356,6 +1546,7 @@ EOF
         gov_book "$FC/genesis" "$FDEP"
         printf '{"deployer":"%s","contracts":{"VestingAlice":"%s"}}' "$FDEP" "$(addr 71)" >"$FC/genesis/team-vesting.json"
         printf '{"deployer":"%s","contracts":{"FederatedRoundLedger":"%s","PatronageLedger":"%s"}}' "$FDEP" "$(addr 81)" "$(addr 82)" >"$FC/genesis/dormant-ledgers.json"
+        record_outputs "$FC/genesis" # what --confirm P3/P4 record (#363)
         FENV=("${CEENV[@]}" REPO_ROOT="$FR" DEPLOYER_ADDRESS="$FDEP" RPC_URL="$FRPC" EXPECTED_CHAIN_ID=40204
           EXPECTED_GENESIS_HASH="$g0" FORGE="$REAL_FORGE" CAST="$REAL_CAST" PATH="$T/fbin:$PATH" MEMBERSHIP_OWNER="$owner"
           TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS="$FRPC")
