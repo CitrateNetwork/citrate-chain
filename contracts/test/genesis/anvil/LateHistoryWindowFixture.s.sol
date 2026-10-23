@@ -52,14 +52,15 @@ contract LateHistoryWindowFixture is Script {
         address[] memory none = new address[](0);
         bytes memory tlInit = abi.encodePacked(type(TimelockController).creationCode, abi.encode(0, none, none, admin));
         TimelockController tl = TimelockController(payable(_create2(Salts.salt("Genesis.GovernanceTimelock"), tlInit)));
-        bytes memory msInit =
-            abi.encodePacked(type(MultisigProposer).creationCode, abi.encode(address(tl), owners, uint256(3)));
+        bytes memory msInit = abi.encodePacked(
+            type(MultisigProposer).creationCode, abi.encode(address(tl), owners, uint256(3), uint256(14 days))
+        );
         address ms = _create2(Salts.salt("Genesis.GovernanceMultisig"), msInit);
 
         if (stage == 1) {
             vm.startBroadcast(admin);
             new TimelockController{salt: Salts.salt("Genesis.GovernanceTimelock")}(0, none, none, admin);
-            new MultisigProposer{salt: Salts.salt("Genesis.GovernanceMultisig")}(address(tl), owners, 3);
+            new MultisigProposer{salt: Salts.salt("Genesis.GovernanceMultisig")}(address(tl), owners, 3, 14 days);
             tl.grantRole(tl.PROPOSER_ROLE(), rogue);
             tl.grantRole(tl.EXECUTOR_ROLE(), rogue);
             ConstructionPairEmitter helper = new ConstructionPairEmitter();

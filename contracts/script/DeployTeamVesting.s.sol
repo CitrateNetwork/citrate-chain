@@ -34,7 +34,9 @@ import {TeamVestingWallet} from "../src/genesis/TeamVestingWallet.sol";
 ///         anything; no beneficiary may be that broadcaster either.
 ///
 ///         Checks before broadcasting, per entry: beneficiary nonzero and not the deployer,
-///         start > 0, duration > 0, cliff <= duration, amount > 0, label unique. Re-runnable:
+///         start > 0, start not before the deploy block's timestamp (unless
+///         ALLOW_PAST_VESTING_START=1, off unless set), duration > 0, cliff <= duration,
+///         amount > 0, label unique. Re-runnable:
 ///         a live wallet is reused and topped up only to `amount` (balance + released);
 ///         a wallet already holding more than `amount` fails the run.
 contract DeployTeamVesting is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook, GenesisProfile {
@@ -51,7 +53,8 @@ contract DeployTeamVesting is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
         address deployer = deployerAddress();
         Grant[] memory grants = parseGrants(vm.readFile(vm.envString("TEAM_VESTING_FILE")));
         vm.envString("TEAM_VESTING_OUT"); // resolve before broadcasting: a missing path fails first
-        wallets = deployWith(deployer, grants);
+        bool allowPastStart = envUintOr("ALLOW_PAST_VESTING_START", 0) == 1;
+        wallets = deployWith(deployer, grants, allowPastStart);
         _writeBook("TEAM_VESTING_OUT", bookJson(deployer, grants, wallets));
     }
 
@@ -75,14 +78,19 @@ contract DeployTeamVesting is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
     }
 
     /// @notice The ceremony with explicit inputs (no env reads), for tests and callers.
-    function deployWith(address deployer, Grant[] memory grants) public returns (address[] memory wallets) {
+    /// @param allowPastStart accept a `start` before `block.timestamp` (ALLOW_PAST_VESTING_START=1).
+    function deployWith(address deployer, Grant[] memory grants, bool allowPastStart)
+        public
+        returns (address[] memory wallets)
+    {
         require(deployer != address(0), "deployer must be set");
         // Node chain id vs simulated chain id (GenesisProfile): the book records block.chainid.
         _resolveChainProfile(false);
         require(grants.length > 0, "no vesting grants");
+        if (allowPastStart) console.log("WARNING: ALLOW_PAST_VESTING_START=1, past start timestamps accepted");
         uint256 total = 0;
         for (uint256 i = 0; i < grants.length; i++) {
-            _validate(grants[i], deployer);
+            _validate(grants[i], deployer, allowPastStart);
             for (uint256 j = i + 1; j < grants.length; j++) {
                 require(
                     keccak256(bytes(grants[i].label)) != keccak256(bytes(grants[j].label)),
@@ -152,7 +160,7 @@ contract DeployTeamVesting is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
         }
     }
 
-    function _validate(Grant memory g, address deployer) internal pure {
+    function _validate(Grant memory g, address deployer, bool allowPastStart) internal view {
         bytes memory l = bytes(g.label);
         require(l.length != 0 && l.length <= 32, "label must be 1..32 characters");
         for (uint256 i = 0; i < l.length; i++) {
@@ -163,6 +171,10 @@ contract DeployTeamVesting is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
         require(g.beneficiary != address(0), string.concat(g.label, ": zero beneficiary"));
         require(g.beneficiary != deployer, string.concat(g.label, ": beneficiary is the deployer"));
         require(g.start != 0, string.concat(g.label, ": start must be set"));
+        require(
+            allowPastStart || g.start >= block.timestamp,
+            string.concat(g.label, ": start is in the past (ALLOW_PAST_VESTING_START=1 to allow)")
+        );
         require(g.duration != 0, string.concat(g.label, ": duration must be > 0"));
         require(g.cliff <= g.duration, string.concat(g.label, ": cliff exceeds duration"));
         require(g.amount != 0, string.concat(g.label, ": amount must be > 0"));

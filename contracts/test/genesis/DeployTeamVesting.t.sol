@@ -36,7 +36,7 @@ contract DeployTeamVestingTest is Test {
 
     function _deploy() internal returns (address[] memory w) {
         DeployTeamVesting s = new DeployTeamVesting();
-        w = s.deployWith(SENDER, _grants());
+        w = s.deployWith(SENDER, _grants(), false);
     }
 
     // ── deploy + funding ────────────────────────────────────────────
@@ -66,7 +66,11 @@ contract DeployTeamVestingTest is Test {
         vm.warp(START + 2 * YEAR);
         TeamVestingWallet(payable(w[0])).release();
         assertEq(alice.balance, 2000 ether);
-        address[] memory again = _deploy();
+        // A re-run after `start` is a past start: refused unless explicitly allowed.
+        DeployTeamVesting s = new DeployTeamVesting();
+        vm.expectRevert(bytes("team_a: start is in the past (ALLOW_PAST_VESTING_START=1 to allow)"));
+        s.deployWith(SENDER, _grants(), false);
+        address[] memory again = s.deployWith(SENDER, _grants(), true);
         assertEq(again[0].balance, 2000 ether, "balance + released == amount, no new funding");
     }
 
@@ -75,7 +79,7 @@ contract DeployTeamVestingTest is Test {
         vm.deal(w[1], w[1].balance + 1);
         DeployTeamVesting s = new DeployTeamVesting();
         vm.expectRevert(bytes("TeamVesting.team_b: already holds more than its amount"));
-        s.deployWith(SENDER, _grants());
+        s.deployWith(SENDER, _grants(), false);
     }
 
     // ── vesting schedule (OZ VestingWalletCliff) ────────────────────
@@ -153,7 +157,7 @@ contract DeployTeamVestingTest is Test {
         g[1].cliff = g[1].duration + 1;
         DeployTeamVesting s = new DeployTeamVesting();
         vm.expectRevert(bytes("team_b: cliff exceeds duration"));
-        s.deployWith(SENDER, g);
+        s.deployWith(SENDER, g, false);
     }
 
     function test_rejects_zero_amount_duration_start_and_beneficiary() public {
@@ -161,20 +165,68 @@ contract DeployTeamVestingTest is Test {
         DeployTeamVesting.Grant[] memory g = _grants();
         g[0].amount = 0;
         vm.expectRevert(bytes("team_a: amount must be > 0"));
-        s.deployWith(SENDER, g);
+        s.deployWith(SENDER, g, false);
         g = _grants();
         g[0].duration = 0;
         g[0].cliff = 0;
         vm.expectRevert(bytes("team_a: duration must be > 0"));
-        s.deployWith(SENDER, g);
+        s.deployWith(SENDER, g, false);
         g = _grants();
         g[0].start = 0;
         vm.expectRevert(bytes("team_a: start must be set"));
-        s.deployWith(SENDER, g);
+        s.deployWith(SENDER, g, false);
         g = _grants();
         g[0].beneficiary = address(0);
         vm.expectRevert(bytes("team_a: zero beneficiary"));
-        s.deployWith(SENDER, g);
+        s.deployWith(SENDER, g, false);
+    }
+
+    function test_rejects_start_in_the_past_unless_allowed() public {
+        DeployTeamVesting.Grant[] memory g = _grants();
+        g[1].start = uint64(block.timestamp - 1);
+        DeployTeamVesting s = new DeployTeamVesting();
+        uint64 nonceBefore = vm.getNonce(SENDER);
+        vm.expectRevert(bytes("team_b: start is in the past (ALLOW_PAST_VESTING_START=1 to allow)"));
+        s.deployWith(SENDER, g, false);
+        assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
+        address[] memory w = s.deployWith(SENDER, g, true);
+        assertEq(TeamVestingWallet(payable(w[1])).start(), block.timestamp - 1);
+    }
+
+    function test_start_at_the_deploy_timestamp_is_accepted() public {
+        DeployTeamVesting.Grant[] memory g = _grants();
+        g[0].start = uint64(block.timestamp);
+        DeployTeamVesting s = new DeployTeamVesting();
+        address[] memory w = s.deployWith(SENDER, g, false);
+        assertEq(TeamVestingWallet(payable(w[0])).start(), block.timestamp);
+    }
+
+    /// Boundary: any start >= now is accepted, any start < now refused without the override.
+    function testFuzz_past_start_boundary(uint64 startSeed) public {
+        uint64 start = uint64(bound(startSeed, 1, block.timestamp + 10 * YEAR));
+        DeployTeamVesting.Grant[] memory g = _grants();
+        g[0].start = start;
+        g[1].start = uint64(block.timestamp);
+        DeployTeamVesting s = new DeployTeamVesting();
+        if (start < block.timestamp) {
+            vm.expectRevert(bytes("team_a: start is in the past (ALLOW_PAST_VESTING_START=1 to allow)"));
+            s.deployWith(SENDER, g, false);
+        } else {
+            address[] memory w = s.deployWith(SENDER, g, false);
+            assertEq(TeamVestingWallet(payable(w[0])).start(), start);
+        }
+    }
+
+    function test_rejects_cliff_longer_than_duration_and_zero_duration_even_when_past_start_allowed() public {
+        DeployTeamVesting s = new DeployTeamVesting();
+        DeployTeamVesting.Grant[] memory g = _grants();
+        g[0].cliff = g[0].duration + 1;
+        vm.expectRevert(bytes("team_a: cliff exceeds duration"));
+        s.deployWith(SENDER, g, true);
+        g = _grants();
+        g[1].duration = 0;
+        vm.expectRevert(bytes("team_b: duration must be > 0"));
+        s.deployWith(SENDER, g, true);
     }
 
     function test_rejects_deployer_as_beneficiary_and_duplicate_label() public {
@@ -182,11 +234,11 @@ contract DeployTeamVestingTest is Test {
         DeployTeamVesting.Grant[] memory g = _grants();
         g[1].beneficiary = SENDER;
         vm.expectRevert(bytes("team_b: beneficiary is the deployer"));
-        s.deployWith(SENDER, g);
+        s.deployWith(SENDER, g, false);
         g = _grants();
         g[1].label = "team_a";
         vm.expectRevert(bytes("duplicate label team_a"));
-        s.deployWith(SENDER, g);
+        s.deployWith(SENDER, g, false);
     }
 
     /// Signer-mismatch regression: DEPLOYER_ADDRESS names A but Forge broadcasts as B, and a
@@ -199,7 +251,7 @@ contract DeployTeamVestingTest is Test {
         uint64 nonceBefore = vm.getNonce(SENDER);
         uint256 balanceBefore = SENDER.balance;
         vm.expectRevert(bytes("broadcast sender is not the configured deployer (DEPLOYER_ADDRESS)"));
-        s.deployWith(configured, g); // broadcasts as SENDER (B)
+        s.deployWith(configured, g, false); // broadcasts as SENDER (B)
         assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
         assertEq(SENDER.balance, balanceBefore, "nothing funded");
     }
@@ -210,7 +262,7 @@ contract DeployTeamVestingTest is Test {
         uint64 nonceBefore = vm.getNonce(SENDER);
         uint256 balanceBefore = SENDER.balance;
         vm.expectRevert(bytes("broadcast sender is not the configured deployer (DEPLOYER_ADDRESS)"));
-        s.deployWith(makeAddr("configured-deployer-A"), _grants());
+        s.deployWith(makeAddr("configured-deployer-A"), _grants(), false);
         assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
         assertEq(SENDER.balance, balanceBefore, "nothing funded");
     }
@@ -259,6 +311,17 @@ contract DeployTeamVestingTest is Test {
 
         string memory book = vm.readFile(out);
         assertEq(vm.parseJsonAddress(book, ".contracts.TeamVesting_team_a"), w[0]);
+
+        // After `start`, the same schedule is a past start: refused until ALLOW_PAST_VESTING_START=1.
+        uint256 t = block.timestamp;
+        vm.warp(1_800_000_001);
+        vm.expectRevert(bytes("team_a: start is in the past (ALLOW_PAST_VESTING_START=1 to allow)"));
+        s.run();
+        vm.setEnv("ALLOW_PAST_VESTING_START", "1");
+        address[] memory w2 = s.run();
+        assertEq(w2[0], w[0], "re-run reuses the wallet");
+        vm.setEnv("ALLOW_PAST_VESTING_START", "0");
+        vm.warp(t);
         assertEq(vm.parseJsonString(book, ".params.totalWei"), "5000000000000000000000");
 
         vm.etch(P256_VERIFIER, hex"600160005260206000f3");

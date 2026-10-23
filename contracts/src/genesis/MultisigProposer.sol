@@ -20,11 +20,19 @@ import {InitialAdmin} from "../lib/InitialAdmin.sol";
 ///
 ///         Approvals are on-chain transactions (no off-chain signatures), so there is no
 ///         signature, nonce or EIP-712 surface. Holds no value.
+///
+///         Proposals expire `proposalTtl` seconds after they are proposed (fixed at deploy,
+///         1..30 days): from then on they can no longer be approved, revoked or executed, so a
+///         stale approval set cannot be used later. Re-proposing the same call yields a new id.
 contract MultisigProposer {
     uint256 public constant MAX_OWNERS = 10;
+    uint256 public constant MIN_PROPOSAL_TTL = 1 days;
+    uint256 public constant MAX_PROPOSAL_TTL = 30 days;
 
     address public immutable timelock;
     uint256 public immutable threshold;
+    /// @notice Seconds after `propose` during which a proposal may be approved and executed.
+    uint256 public immutable proposalTtl;
 
     address[] private _owners;
     mapping(address => bool) public isOwner;
@@ -34,6 +42,7 @@ contract MultisigProposer {
         uint32 approvals;
         bool exists;
         bool executed;
+        uint64 expiresAt;
     }
 
     /// @notice Proposal ids are keccak256(chainid, this, sequence number, data); the sequence
@@ -42,7 +51,7 @@ contract MultisigProposer {
     mapping(bytes32 => Proposal) private _proposals;
     mapping(bytes32 => mapping(address => bool)) public hasApproved;
 
-    event Proposed(bytes32 indexed id, address indexed proposer, bytes data);
+    event Proposed(bytes32 indexed id, address indexed proposer, bytes data, uint256 expiresAt);
     event Approved(bytes32 indexed id, address indexed owner, uint256 approvals);
     event Revoked(bytes32 indexed id, address indexed owner, uint256 approvals);
     event Executed(bytes32 indexed id, address indexed executor);
@@ -51,11 +60,13 @@ contract MultisigProposer {
     error TimelockHasNoCode();
     error BadOwnerCount(uint256 count);
     error BadThreshold(uint256 threshold, uint256 owners);
+    error BadProposalTtl(uint256 ttl);
     error DuplicateOwner(address owner);
     error OwnerIsTimelock();
     error EmptyCall();
     error UnknownProposal();
     error AlreadyExecuted();
+    error ProposalExpired(uint256 expiresAt);
     error AlreadyApproved();
     error NotApproved();
     error BelowThreshold(uint256 approvals, uint256 threshold);
@@ -66,11 +77,12 @@ contract MultisigProposer {
         _;
     }
 
-    constructor(address timelock_, address[] memory owners_, uint256 threshold_) {
+    constructor(address timelock_, address[] memory owners_, uint256 threshold_, uint256 proposalTtl_) {
         if (timelock_.code.length == 0) revert TimelockHasNoCode();
         uint256 n = owners_.length;
         if (n == 0 || n > MAX_OWNERS) revert BadOwnerCount(n);
         if (threshold_ == 0 || threshold_ > n) revert BadThreshold(threshold_, n);
+        if (proposalTtl_ < MIN_PROPOSAL_TTL || proposalTtl_ > MAX_PROPOSAL_TTL) revert BadProposalTtl(proposalTtl_);
         for (uint256 i = 0; i < n; i++) {
             address o = InitialAdmin.check(owners_[i]); // nonzero, never the CREATE2 factory
             if (o == timelock_) revert OwnerIsTimelock();
@@ -80,16 +92,19 @@ contract MultisigProposer {
         _owners = owners_;
         timelock = timelock_;
         threshold = threshold_;
+        proposalTtl = proposalTtl_;
     }
 
-    /// @notice Propose one call to the timelock. The proposer's approval is counted.
+    /// @notice Propose one call to the timelock. The proposer's approval is counted. The
+    ///         proposal expires at `block.timestamp + proposalTtl`.
     function propose(bytes calldata data) external onlyOwner returns (bytes32 id) {
         if (data.length < 4) revert EmptyCall();
         id = keccak256(abi.encode(block.chainid, address(this), proposalCount++, data));
         Proposal storage p = _proposals[id];
         p.data = data;
         p.exists = true;
-        emit Proposed(id, msg.sender, data);
+        p.expiresAt = uint64(block.timestamp + proposalTtl);
+        emit Proposed(id, msg.sender, data, p.expiresAt);
         _approve(id, p);
     }
 
@@ -106,9 +121,9 @@ contract MultisigProposer {
         emit Revoked(id, msg.sender, p.approvals);
     }
 
-    /// @notice Run an approved action. Marked executed before the call; a call that reverts
-    ///         reverts this too, so the action stays pending and may be retried (for example
-    ///         a timelock `execute` sent before the delay has elapsed).
+    /// @notice Run an approved, unexpired action. Marked executed before the call; a call that
+    ///         reverts reverts this too, so the action stays pending and may be retried until
+    ///         it expires (for example a timelock `execute` sent before the delay has elapsed).
     function execute(bytes32 id) external onlyOwner returns (bytes memory ret) {
         Proposal storage p = _pending(id);
         if (p.approvals < threshold) revert BelowThreshold(p.approvals, threshold);
@@ -126,16 +141,17 @@ contract MultisigProposer {
     function getProposal(bytes32 id)
         external
         view
-        returns (bytes memory data, uint256 approvals, bool exists, bool executed)
+        returns (bytes memory data, uint256 approvals, bool exists, bool executed, uint256 expiresAt)
     {
         Proposal storage p = _proposals[id];
-        return (p.data, p.approvals, p.exists, p.executed);
+        return (p.data, p.approvals, p.exists, p.executed, p.expiresAt);
     }
 
     function _pending(bytes32 id) internal view returns (Proposal storage p) {
         p = _proposals[id];
         if (!p.exists) revert UnknownProposal();
         if (p.executed) revert AlreadyExecuted();
+        if (block.timestamp >= p.expiresAt) revert ProposalExpired(p.expiresAt);
     }
 
     function _approve(bytes32 id, Proposal storage p) internal {

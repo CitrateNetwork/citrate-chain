@@ -505,9 +505,9 @@ abstract contract AdminChecks {
     // (DeployGenesisGovernance) deploys each council with `new MultisigProposer{salt}` through the
     // Arachnid factory, so its address is
     //   keccak256(0xff ++ factory ++ Salts.salt(saltName) ++ keccak256(creationCode ++ args))[12:]
-    // Recomputing that from the expected timelock and the CLAIMED owners / threshold, and getting
+    // Recomputing that from the expected timelock and the CLAIMED owners / threshold / proposalTtl, and getting
     // the council's own address back, proves the runtime code (the factory ran exactly that init
-    // code there; the constructor is deterministic) and both immutables (timelock, threshold) and
+    // code there; the constructor is deterministic), the immutables (timelock, threshold, proposalTtl) and
     // the owner set the constructor stored (no function writes it afterwards). A contract that
     // lies about any of them sits at a different address.
 
@@ -530,16 +530,20 @@ abstract contract AdminChecks {
 
     /// @notice MultisigProposer init code for the given constructor arguments (one place, so a
     ///         constructor change is one edit here).
-    function _multisigProposerInitCode(address timelock, address[] memory owners, uint256 threshold)
-        internal
-        pure
-        returns (bytes memory)
-    {
-        return abi.encodePacked(type(MultisigProposer).creationCode, abi.encode(timelock, owners, threshold));
+    function _multisigProposerInitCode(
+        address timelock,
+        address[] memory owners,
+        uint256 threshold,
+        uint256 proposalTtl
+    ) internal pure returns (bytes memory) {
+        return abi.encodePacked(
+            type(MultisigProposer).creationCode, abi.encode(timelock, owners, threshold, proposalTtl)
+        );
     }
 
     /// @notice Empty when `multisig` is the MultisigProposer that the genesis ceremony deploys
-    ///         under `saltName` for (`timelock`, its reported owners, its reported threshold),
+    ///         under `saltName` for (`timelock`, its reported owners, its reported threshold, its
+    ///         reported proposalTtl),
     ///         i.e. its address is that CREATE2 address and it has code. Only after this passes
     ///         are its getters the contract's real state. Never reverts on a well-formed answer;
     ///         a malformed `owners()` return reverts in decoding, which fails the caller closed.
@@ -553,11 +557,17 @@ abstract contract AdminChecks {
         if (!okT || rt.length != 32) return "threshold() unreadable";
         (bool okO, bytes memory ro) = multisig.staticcall(abi.encodeWithSignature("owners()"));
         if (!okO || ro.length < 64) return "owners() unreadable";
+        (bool okL, bytes memory rl) = multisig.staticcall(abi.encodeWithSignature("proposalTtl()"));
+        if (!okL || rl.length != 32) return "proposalTtl() unreadable";
         address[] memory owners = abi.decode(ro, (address[]));
         uint256 threshold = abi.decode(rt, (uint256));
-        if (_ceremonyCreate2Address(saltName, _multisigProposerInitCode(timelock, owners, threshold)) != multisig) {
+        uint256 ttl = abi.decode(rl, (uint256));
+        if (_ceremonyCreate2Address(saltName, _multisigProposerInitCode(timelock, owners, threshold, ttl)) != multisig)
+        {
             return string.concat(
-                "not the MultisigProposer the ceremony deploys (", saltName, ") for this timelock, owners and threshold"
+                "not the MultisigProposer the ceremony deploys (",
+                saltName,
+                ") for this timelock, owners, threshold and proposal TTL"
             );
         }
         return "";
