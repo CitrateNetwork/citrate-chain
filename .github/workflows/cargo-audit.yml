@@ -46,30 +46,15 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
-      - name: Run cargo audit
-        # Documented ignores live in audit.toml (assessor-friendly).
-        # When either of these closes upstream, REMOVE the --ignore
-        # flag here + the entry in audit.toml. Failure is the
-        # tripwire that catches regression.
-        #
-        # REM-14 (FP-confirmed; closes with alloy-primitives ruint bump):
-        #   RUSTSEC-2025-0137 — ruint reciprocal_mg10 OOB (FALSE
-        #   POSITIVE for citrate-chain; alloy-primitives normalizes
-        #   the divisor before reaching the unsafe path).
-        #
-        # REM-16b (deferred — arkworks 0.4 → 0.6 bump needed, ZK-eng decision):
-        #   RUSTSEC-2025-0055 — tracing-subscriber ANSI log injection via ark-relations 0.4 transitive (direct deps already on 0.3).
-        #
-        # REM-14b (closes with the same alloy-primitives ruint bump as REM-14):
-        #   RUSTSEC-2026-0220 — ruint overflowing_shl/shr returned a wrong
-        #   overflow FLAG (shifted values were correct). Patched >= 1.20.0, but
-        #   alloy-primitives 0.7.7 pins ruint ^1.12 and 1.20 needs a proptest
-        #   no_std feature that conflicts, so it is not bumpable from this
-        #   lockfile. Low severity (flag-only correctness edge). Remove when
-        #   alloy-primitives moves to a ruint >= 1.20 line.
-        run: |
-          cargo audit \
-            --color always \
-            --ignore RUSTSEC-2025-0137 \
-            --ignore RUSTSEC-2025-0055 \
-            --ignore RUSTSEC-2026-0220
+      - name: Lockfile audit self-test (negative + positive control)
+        # Proves the gate still flags a lockfile pinned to a vulnerable
+        # version and passes the patched one. A blind audit is worse than none.
+        run: scripts/ci/audit_all_lockfiles.sh --self-test
+
+      - name: Run cargo audit on every tracked Cargo.lock
+        # Audits the root lockfile AND every sub-lockfile (fuzz/, tests/load/,
+        # tools/citrate-bench/, core/federated/, standalone crates), enumerated
+        # from `git ls-files '*Cargo.lock'`. The accepted-advisory ignore list
+        # and its REM trackers live in that script (single source of truth),
+        # documented for assessors in audit.toml. Failure is the tripwire.
+        run: scripts/ci/audit_all_lockfiles.sh

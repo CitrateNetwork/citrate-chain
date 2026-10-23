@@ -6,8 +6,9 @@
 # or (b) ignored here with a documented REM tracker + reason.
 #
 # cargo-audit reads ~/.cargo/audit.toml NOT project-local, so the
-# actual ignore list is passed via --ignore flags in
-# .github/workflows/cargo-audit.yml. This file is the documentation
+# actual ignore list is passed via --ignore flags by
+# scripts/ci/audit_all_lockfiles.sh (run from .github/workflows/cargo-audit.yml
+# against every tracked Cargo.lock). This file is the documentation
 # source-of-truth for assessors.
 
 [advisories]
