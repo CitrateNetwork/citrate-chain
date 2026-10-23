@@ -4,7 +4,12 @@ pragma solidity ^0.8.26;
 import {DeployGenesisGovernance} from "../../script/DeployGenesisGovernance.s.sol";
 import {AdminChecks} from "../../script/lib/AdminChecks.sol";
 import {GenesisProfile} from "../../script/lib/GenesisProfile.sol";
-import {DormantWithHistory, GateWithHistory, RecordedRoleHistory} from "./RoleHistoryHarness.sol";
+import {
+    DormantWithHistory,
+    GateWithHistory,
+    MembershipWithHistory,
+    RecordedRoleHistory
+} from "./RoleHistoryHarness.sol";
 
 /// @title Node stand-in for the GenesisProfile chain-id check
 /// @notice `forge test` has no fork, so `vm.rpc("eth_chainId")` is unavailable there (the real
@@ -81,5 +86,11 @@ contract BookCancellerChecks is GenesisProfile, RecordedRoleHistory {
         returns (bool, string memory, RoleEvent[] memory)
     {
         return RecordedRoleHistory._timelockRoleHistory(timelock);
+    }
+}
+
+contract MembershipWithNode is MembershipWithHistory, NodeStub {
+    function _nodeChainId() internal view override returns (bool, uint256) {
+        return _stubNode();
     }
 }

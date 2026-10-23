@@ -3,7 +3,8 @@
 # anvil chain with chain id 40204, as `forge script --broadcast` (not `forge test`):
 #
 #   DeployGenesisGovernance -> (KYCRegistry + MembershipSBT stand-ins) -> DeployDormantLedgers
-#   -> CheckDeployedAdmins (over both ceremony books), which must report 0 failures, including
+#   -> (ValidatorRegistry stand-in) -> DeployGenesisMembership
+#   -> CheckDeployedAdmins (over all three ceremony books), which must report 0 failures, including
 #   GENESIS-FLOOR and TIMELOCK-HOLDERS.
 #
 # Then the chain#324 negatives, each of which must be refused:
@@ -16,7 +17,7 @@
 #
 # Then the chain#320 negatives, each of which must be refused with nothing sent:
 #   - forge simulating another chain id than the 40204 node (--chain-id 1): DeployGenesisGovernance,
-#     DeployDormantLedgers and the gate;
+#     DeployDormantLedgers, DeployGenesisMembership and the gate;
 #   - a deployer-controlled GOVERNANCE timelock with a hidden PROPOSER/EXECUTOR and
 #     TIMELOCK_HISTORY_FROM_BLOCK past that grant (plus a re-emitted constructor pair), for
 #     DeployDormantLedgers (window and full history) and the gate.
@@ -76,6 +77,7 @@ export GENESIS_GOVERNANCE_OUT="$OUT_REL/governance.json"
 export DORMANT_LEDGERS_OUT="$OUT_REL/dormant.json"
 # The governance book: its GuardianCanceller is the GOVERNANCE timelock's one allowed extra CANCELLER.
 export GENESIS_GOVERNANCE_BOOK="$OUT_REL/governance.json"
+export GENESIS_MEMBERSHIP_OUT="$OUT_REL/membership.json"
 
 cd "$CONTRACTS"
 run_script() {
@@ -102,10 +104,20 @@ export GOVERNANCE_MULTISIG="$(sed -n 's/.*"GovernanceMultisig":"\(0x[0-9a-fA-F]*
 export PATRONAGE_KYC_REGISTRY="$KYC" PATRONAGE_MEMBERSHIP="$MEMBERSHIP"
 run_script script/DeployDormantLedgers.s.sol
 
+# Track M membership. The ValidatorRegistry is a stand-in governed by the GOVERNANCE timelock
+# (only its code and minStake are checked; it is not in the gated books). minStake = the
+# 32,000 SALT grant. The grantor is a placeholder address: nothing here places a grant.
+REGISTRY="$(create src/ValidatorRegistry.sol:ValidatorRegistry "$GOVERNANCE_TIMELOCK" \
+  0x000000000000000000000000000000000000C001 0x000000000000000000000000000000000000C002 \
+  32000000000000000000000 1000000000000000000 5000 10000000000000000000000)"
+[ -n "$REGISTRY" ] || { echo "genesis-pipeline-anvil: ValidatorRegistry stand-in deploy failed" >&2; exit 1; }
+export VALIDATOR_REGISTRY="$REGISTRY" MEMBERSHIP_GRANTOR=0x000000000000000000000000000000000000D001
+run_script script/DeployGenesisMembership.s.sol
+
 # The gate requires the P-256 verifier the passkey validator hard-codes; anvil has none.
 cast rpc --rpc-url "$RPC" anvil_setCode "$P256_VERIFIER" 0x600160005260206000f3 >/dev/null
 
-GATE_ENV=(ADDRESS_BOOK="$GENESIS_GOVERNANCE_OUT" EXTRA_ADDRESS_BOOKS="$DORMANT_LEDGERS_OUT" REQUIRE_ALL_CODE=true)
+GATE_ENV=(ADDRESS_BOOK="$GENESIS_GOVERNANCE_OUT" EXTRA_ADDRESS_BOOKS="$DORMANT_LEDGERS_OUT,$GENESIS_MEMBERSHIP_OUT" REQUIRE_ALL_CODE=true)
 gate() { # <log> [extra forge args...]: run the read-only gate; returns forge's status
   local log="$1"
   shift
@@ -137,7 +149,7 @@ MISMATCH="chain id mismatch: node reports 40204, forge simulates 1"
 
 echo "=== negative: forge simulating chain 1 against the 40204 node (--chain-id 1) ==="
 before="$(nonce "$DEPLOYER")"
-for s in DeployGenesisGovernance DeployDormantLedgers; do
+for s in DeployGenesisGovernance DeployDormantLedgers DeployGenesisMembership; do
   if forge script "script/$s.s.sol" --rpc-url "$RPC" --broadcast --private-key "$KEY" --chain-id 1 \
     >"$OUT/neg-chainid-$s.log" 2>&1; then fail "$s ran with --chain-id 1"; fi
   grep -q "$MISMATCH" "$OUT/neg-chainid-$s.log" || fail "$s --chain-id 1: not refused on the chain id"
@@ -145,7 +157,7 @@ done
 [ "$(nonce "$DEPLOYER")" = "$before" ] || fail "a --chain-id 1 run sent a transaction"
 if gate "$OUT/neg-chainid-gate.log" --chain-id 1; then fail "gate ran with --chain-id 1"; fi
 grep -q "$MISMATCH" "$OUT/neg-chainid-gate.log" || fail "gate --chain-id 1: not refused on the chain id"
-echo "refused (DeployGenesisGovernance, DeployDormantLedgers, gate), nothing sent"
+echo "refused (DeployGenesisGovernance, DeployDormantLedgers, DeployGenesisMembership, gate), nothing sent"
 
 # A deployer-controlled GOVERNANCE timelock (test/genesis/anvil/LateHistoryWindowFixture.s.sol):
 # ceremony-salt CREATE2 timelock + CREATE2-correct 3-of-5 council, 48 h, self-administered, no
