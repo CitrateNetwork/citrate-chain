@@ -34,7 +34,9 @@
 // checkpoint advances `CheckpointManager::latest_finalized_height()` only. The
 // node's `finality_floor::FloorVerifier` re-verifies the certificate and checks
 // its hash against the node's own applied chain before anything uses it, and is
-// gated by a SEPARATE compiled pin, [`CHECKPOINT_ENFORCEMENT_PINS`]. When that
+// gated by a SEPARATE compiled pin, [`CHECKPOINT_ENFORCEMENT_PINS`]. With that
+// pin ON it runs as the manager's `checkpoint::FinalizationGuard`, i.e. before
+// each finalization becomes visible (spec §5 S2), not only on its poll. When that
 // check fails (mismatch / invalid certificate) the verifier HALTS this gadget
 // ([`FinalityGadget::safety_stop`]): a halted gadget proposes and signs nothing
 // ([`SkipReason::Halted`]) until the verifier clears the halt.
@@ -48,8 +50,11 @@
 // (that decision then sees it and signs nothing) or waits until an in-flight
 // decision has finished; a signer that read "not halted" earlier and then
 // suspended can never sign after the halt. Lock order (outermost first):
-//   FloorVerifier state -> SafetyStop gate -> GadgetState -> CheckpointManager
-// locks (the persistent store is synchronous, below all of them). The gate is
+//   CheckpointManager finalize serial -> FloorVerifier state -> SafetyStop gate
+//   -> GadgetState -> CheckpointManager RwLocks
+// (the persistent store is synchronous, below all of them; the node's advance
+// lock is taken under the verifier state). Finalization is never started while
+// holding the gate, GadgetState or a manager RwLock. The gate is
 // never awaited while holding GadgetState or any manager lock, and the verifier
 // state is never awaited while holding the gate.
 

@@ -34,7 +34,8 @@
 //                enforces the floor in this mode, so a reorg below the verified
 //                height still proceeds, and labelling such a block "finalized"
 //                would claim a guarantee the node does not give.
-//   * Enforced — both ON. A verified certificate also raises the reorg floor,
+//   * Enforced — both ON. A verified certificate also raises the reorg floor
+//                (AT FINALIZATION — see below — with this poll as a backstop),
 //                and the finalized/safe RPC tags follow the verified
 //                (height, hash) PAIR: the RPC resolves them by the certified
 //                block's hash, never through the height index (where the last
@@ -52,6 +53,52 @@
 // (re-checked every poll). An invalid certificate never clears automatically.
 // There is deliberately no forced reorg onto the certified branch: no safe path
 // exists for it here, so the node halts finality and alarms instead.
+//
+// FLOOR AT FINALIZATION (Enforced; spec §5 S2). The poll alone left a window:
+// `CheckpointManager::finalize_checkpoint` advanced the finalized height, but the
+// floor only followed at the next poll (up to FLOOR_POLL_SECS later), so a reorg
+// in between could revert the just-finalized block. In Enforced mode the
+// verifier is installed as the manager's `FinalizationGuard`
+// ([`FloorVerifier::install_finalization_guard`]), which runs BEFORE the
+// finalization becomes visible (DAG mark, persisted certificate, latest
+// finalized height) and does the same check as the poll under the same locks
+// ([`FloorVerifier::on_finalize`]):
+//
+//   * certified block canonical here -> the floor is raised in the advance-lock
+//     critical section that confirmed it (no reorg can slip between);
+//   * a different block at that height -> mismatch safety stop, as the poll;
+//   * not confirmable now (the applied tip is below it, or the check could not
+//     complete) -> `HaltReason::Unconfirmed` safety stop, which clears like a
+//     mismatch once the certified block is confirmed canonical.
+//
+// So when finalization becomes visible, either the floor covers the certified
+// block or the gadget is halted (proposes / signs nothing).
+//
+// PUBLICATION AFTER PERSISTENCE (review of #335 @ db243a1). The guard raises
+// the floor but never PUBLISHES: it runs before the certificate is persisted,
+// and the floor is in memory only, so a block reported finalized there and then
+// lost to a crash before persistence could be reorged out after the restart.
+// The finalized/safe RPC pair (and the verified-height metric) advance only in
+// [`FloorVerifier::after_finalize`] — once the manager has written the
+// certificate, with the same (height, hash) re-confirmed under the advance
+// lock and no safety stop in force — or from the poll; and every publication
+// path first requires the exact certificate to be in the persistent store
+// (`CheckpointManager::is_certificate_persisted`), so a failed write is never
+// published either. In both non-matching
+// cases the pair is also registered with the applicator
+// (`CanonicalApplicator::register_certified`): every later reorg re-checks it
+// under the advance lock and raises the floor first if the certified block has
+// become canonical, so recovery onto the certified branch is protected at once,
+// not at the next poll. The poll stays as the backstop (boot, restarts, missed
+// hooks). Legacy and Observed install no guard: behaviour there is unchanged.
+//
+// RESTART (Enforced). The floor and the registered certificates are in memory
+// only. When the boot check's latest certificate does not raise the floor, the
+// floor is restored from the certificate STORE before any block is admitted
+// ([`FloorVerifier::restore_certified_floor`]): every stored certificate,
+// highest first, is verified and registered until the highest one whose block
+// is on this node's chain is found; the floor is raised to it. Nothing above
+// it is dropped, whatever the number of stored certificates.
 
 // PANIC-S1 G2: runs on the live node; panic-free outside tests.
 #![cfg_attr(
@@ -71,8 +118,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::sync::Weak;
+
 use citrate_api::finalized_tag::{FinalizedTagSource, VerifiedFinalized};
-use citrate_consensus::checkpoint::CheckpointManager;
+use citrate_consensus::checkpoint::{Checkpoint, CheckpointManager, FinalizationGuard};
 use citrate_consensus::checkpoint_gadget::{
     checkpoint_enforcement_pinned, checkpoint_voting_pinned, SafetyStop,
 };
@@ -142,6 +191,32 @@ pub enum HaltReason {
         certified: Hash,
         reason: String,
     },
+    /// At finalization the certified block could not be confirmed on this
+    /// node's applied chain (its tip was below `height`, or the check could not
+    /// complete): finality is paused rather than run unprotected. Clears like a
+    /// mismatch once `certified` is confirmed canonical here; becomes a
+    /// `Mismatch` if another block is found at `height`.
+    Unconfirmed {
+        height: u64,
+        certified: Hash,
+        reason: String,
+    },
+}
+
+impl HaltReason {
+    /// The certified pair a stop waits for, if it can clear (mismatch /
+    /// unconfirmed); `None` for an invalid certificate.
+    fn awaited(&self) -> Option<(u64, Hash)> {
+        match self {
+            Self::Mismatch {
+                height, certified, ..
+            }
+            | Self::Unconfirmed {
+                height, certified, ..
+            } => Some((*height, *certified)),
+            Self::InvalidCertificate { .. } => None,
+        }
+    }
 }
 
 /// What one verification pass concluded.
@@ -248,10 +323,21 @@ impl FloorVerifier {
         }
     }
 
-    /// Publish a verified, matching `(height, hash)`.
-    fn record_verified(&self, height: u64, hash: Hash) {
+    /// Publish a verified, matching `(height, hash)` — only if its certificate
+    /// is in the persistent store, so a restart reloads it (and restores the
+    /// floor from it) before any reorg. Returns whether it was published.
+    fn record_verified(&self, height: u64, hash: Hash) -> bool {
+        if !self.manager.is_certificate_persisted(height, &hash) {
+            warn!(
+                "checkpoint finality: finalized block {} @ {} is not published (finalized/safe \
+                 RPC tags unchanged): its certificate is not in the persistent store",
+                hash, height
+            );
+            return false;
+        }
         self.verified_height.fetch_max(height, Ordering::SeqCst);
         self.verified_pairs.record(height, hash);
+        true
     }
 
     /// The current safety stop, if any.
@@ -280,11 +366,124 @@ impl FloorVerifier {
             return FloorTick::Legacy;
         }
         let out = self.tick().await;
+        if self.mode.raises_floor() && !matches!(out, FloorTick::Verified { .. }) {
+            self.restore_certified_floor().await;
+        }
         info!(
             "checkpoint finality: boot certificate check ({:?} mode): {:?}",
             self.mode, out
         );
         out
+    }
+
+    /// Enforced, at boot, when the latest certificate did not raise the floor
+    /// (mismatch / waiting / unverifiable). The floor is an in-memory value
+    /// lost on restart, so restore it from the certificate STORE before any
+    /// block admission, drain or recovery (review of #335 @ 5236d2b): walk
+    /// every stored finalized certificate, highest first — the persisted
+    /// records, not only the in-memory window — verify each, and register it
+    /// with the applicator, until one is found whose block is on this node's
+    /// applied chain; raise the floor to that one (under the advance lock,
+    /// `verify_certified_floor`) and stop.
+    ///
+    /// Why stopping there is safe: the floor protects by HEIGHT (a reorg's
+    /// fork point must be >= the floor), so once it is at the highest stored
+    /// certificate that is canonical here, every lower certified block that is
+    /// canonical here is protected too; a lower one that is NOT canonical here
+    /// can never become canonical without a reorg below the floor, which is
+    /// refused. Every certificate ABOVE it is registered, none dropped, so the
+    /// first reorg after any of them becomes canonical raises the floor to it
+    /// (`CanonicalApplicator::effective_floor`). If the chain cannot be read,
+    /// or the floor could not be raised, nothing is skipped: the remaining
+    /// certificates are all registered and the applicator settles the floor
+    /// from them under its lock. A stored certificate that does not verify is
+    /// logged and not used.
+    async fn restore_certified_floor(&self) {
+        let heights = self.manager.finalized_certificate_heights().await;
+        let tip = self.applicator.applied_tip().await;
+        let mut walk = self.applicator.walk_applied(tip);
+        // `false` once the walk cannot be trusted: register everything left.
+        let mut early_stop = true;
+        let mut registered = 0usize;
+        let mut restored: Option<(u64, Hash)> = None;
+        let floor_handle = self.applicator.finalized_height_handle();
+        for height in heights {
+            if height <= floor_handle.load(Ordering::SeqCst) {
+                break;
+            }
+            let Some(cert) = self.manager.get_checkpoint(height).await else {
+                warn!(
+                    "checkpoint finality: stored certificate at height {} could not be read; \
+                     not registered",
+                    height
+                );
+                continue;
+            };
+            if let Err(e) = cert.verify_certificate(self.chain_id) {
+                warn!(
+                    "checkpoint finality: stored certificate {} @ {} does not verify; not \
+                     registered: {}",
+                    cert.block_hash, cert.height, e
+                );
+                continue;
+            }
+            self.applicator
+                .register_certified(cert.height, cert.block_hash);
+            registered = registered.saturating_add(1);
+            if !early_stop {
+                continue;
+            }
+            match walk.hash_at(cert.height) {
+                Ok(Some(here)) if here == cert.block_hash => {
+                    match self
+                        .applicator
+                        .verify_certified_floor(cert.height, cert.block_hash, true)
+                        .await
+                    {
+                        FloorCheck::Match => {
+                            restored = Some((cert.height, cert.block_hash));
+                            break;
+                        }
+                        other => {
+                            warn!(
+                                "checkpoint finality: stored certificate {} @ {} could not \
+                                 raise the floor at boot ({:?}); registering every older \
+                                 certificate instead",
+                                cert.block_hash, cert.height, other
+                            );
+                            early_stop = false;
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(
+                        "checkpoint finality: applied chain unreadable while restoring the \
+                         floor at boot ({}); registering every older certificate instead",
+                        e
+                    );
+                    early_stop = false;
+                }
+            }
+        }
+        // Same check the next reorg would make, under the advance lock (also
+        // settles the case where the walk could not be used).
+        let floor = self.applicator.settle_registered_floor().await;
+        match restored {
+            Some((height, hash)) => info!(
+                "checkpoint finality: reorg floor restored at boot to finalized block {} @ {} \
+                 (the highest stored certificate on this node's chain); {} certificate(s) \
+                 above it registered",
+                hash,
+                height,
+                registered.saturating_sub(1)
+            ),
+            None => info!(
+                "checkpoint finality: no stored certificate confirmed on this node's chain at \
+                 boot; {} certificate(s) registered, reorg floor {}",
+                registered, floor
+            ),
+        }
     }
 
     /// One verification pass (see the module docs).
@@ -303,12 +502,13 @@ impl FloorVerifier {
             return FloorTick::Halted(reason);
         }
 
-        // A mismatch clears only once the certified block is canonical here.
+        // A mismatch / unconfirmed stop clears only once the certified block is
+        // canonical here.
         let mut recovered = false;
-        if let Some(HaltReason::Mismatch {
-            height, certified, ..
-        }) = st.halt.clone()
-        {
+        if let Some((height, certified)) = st.halt.as_ref().and_then(HaltReason::awaited) {
+            if raise {
+                self.applicator.register_certified(height, certified);
+            }
             match self
                 .applicator
                 .verify_certified_floor(height, certified, raise)
@@ -317,21 +517,25 @@ impl FloorVerifier {
                 FloorCheck::Match => {
                     info!(
                         "checkpoint finality: RECOVERED — finalized block {} @ {} is canonical on \
-                         this node again (normal fork choice); safety stop cleared, finality \
-                         resumes",
+                         this node (normal fork choice); safety stop cleared, finality resumes",
                         certified, height
                     );
                     st.halt = None;
                     recovered = true;
-                    self.record_verified(height, certified);
+                    let _ = self.record_verified(height, certified);
                     self.gadget_halt.clear().await;
                 }
                 FloorCheck::Mismatch { canonical } => {
-                    st.halt = Some(HaltReason::Mismatch {
+                    let reason = HaltReason::Mismatch {
                         height,
                         certified,
                         canonical,
-                    });
+                    };
+                    if matches!(st.halt, Some(HaltReason::Unconfirmed { .. })) {
+                        // Now known to be a mismatch: raise the alarm.
+                        return self.enter_halt(&mut st, reason).await;
+                    }
+                    st.halt = Some(reason);
                     return self.still_halted(&st).await;
                 }
                 FloorCheck::NotYetApplied { .. } | FloorCheck::Unverifiable(_) => {
@@ -356,13 +560,18 @@ impl FloorVerifier {
             return self.enter_halt(&mut st, reason).await;
         }
 
+        if raise {
+            // Settled at once on a match; otherwise every later reorg re-checks it.
+            self.applicator
+                .register_certified(cert.height, cert.block_hash);
+        }
         match self
             .applicator
             .verify_certified_floor(cert.height, cert.block_hash, raise)
             .await
         {
             FloorCheck::Match => {
-                self.record_verified(cert.height, cert.block_hash);
+                let _ = self.record_verified(cert.height, cert.block_hash);
                 self.publish(false);
                 FloorTick::Verified {
                     height: cert.height,
@@ -393,6 +602,141 @@ impl FloorVerifier {
                 self.publish(false);
                 FloorTick::Unverifiable(why)
             }
+        }
+    }
+
+    /// Enforced mode: install this verifier as `manager`'s
+    /// [`FinalizationGuard`], so the floor is raised (or finality halted) BEFORE
+    /// a finalization becomes visible ([`Self::on_finalize`]). Legacy and
+    /// Observed install nothing (returns `false`): they keep the poll-only
+    /// behaviour. Also `false` if the manager already has a guard. The manager
+    /// holds only a weak reference, so this creates no reference cycle.
+    pub fn install_finalization_guard(self: &Arc<Self>) -> bool {
+        if !self.mode.raises_floor() {
+            return false;
+        }
+        self.manager
+            .install_finalization_guard(Arc::new(FinalizeHook(Arc::downgrade(self))))
+    }
+
+    /// The finalization-time check (Enforced; module docs, "FLOOR AT
+    /// FINALIZATION"). Runs from `CheckpointManager::finalize_checkpoint` before
+    /// the certificate is persisted or the latest finalized height moves. Same
+    /// verification as [`Self::tick`]'s main path, under the same verifier
+    /// state lock and advance lock, but it raises the floor WITHOUT publishing:
+    /// the RPC tags advance only after persistence ([`Self::after_finalize`]).
+    /// Returns `None` outside Enforced mode.
+    pub async fn on_finalize(&self, cert: &Checkpoint) -> Option<FloorTick> {
+        if !self.mode.raises_floor() {
+            return None;
+        }
+        let mut st = self.state.lock().await;
+        if let Err(e) = cert.verify_certificate(self.chain_id) {
+            let reason = HaltReason::InvalidCertificate {
+                height: cert.height,
+                certified: cert.block_hash,
+                reason: e.to_string(),
+            };
+            return Some(self.enter_halt(&mut st, reason).await);
+        }
+        // Registered first: whatever the check below concludes, no later reorg
+        // can revert this block once it is canonical here.
+        self.applicator
+            .register_certified(cert.height, cert.block_hash);
+        let reason = match self
+            .applicator
+            .verify_certified_floor(cert.height, cert.block_hash, true)
+            .await
+        {
+            FloorCheck::Match => {
+                if st.halt.is_some() {
+                    // The floor now protects this canonical certified block, but
+                    // an existing stop keeps the RPC tags / verified height frozen
+                    // until the poll clears it.
+                    return Some(self.still_halted(&st).await);
+                }
+                // Not published here: the certificate is not persisted yet.
+                self.publish(false);
+                info!(
+                    "checkpoint finality: finalized block {} @ {} is canonical on this node; \
+                     reorg floor raised at finalization",
+                    cert.block_hash, cert.height
+                );
+                return Some(FloorTick::Verified {
+                    height: cert.height,
+                    floor_raised: true,
+                    recovered: false,
+                });
+            }
+            FloorCheck::Mismatch { canonical } => HaltReason::Mismatch {
+                height: cert.height,
+                certified: cert.block_hash,
+                canonical,
+            },
+            FloorCheck::NotYetApplied { applied_height } => HaltReason::Unconfirmed {
+                height: cert.height,
+                certified: cert.block_hash,
+                reason: format!("this node's applied tip is at height {applied_height}"),
+            },
+            FloorCheck::Unverifiable(why) => HaltReason::Unconfirmed {
+                height: cert.height,
+                certified: cert.block_hash,
+                reason: why,
+            },
+        };
+        if st.halt.is_some() {
+            // Already stopped: that stop's own certificate decides when it
+            // clears (re-checked every poll).
+            return Some(self.still_halted(&st).await);
+        }
+        Some(self.enter_halt(&mut st, reason).await)
+    }
+
+    /// Publication after finalization (Enforced; module docs, "PUBLICATION
+    /// AFTER PERSISTENCE"). Runs from `CheckpointManager::finalize_checkpoint`
+    /// once the certificate write has been attempted and the finalization is
+    /// visible. Publishes `cert`'s exact (height, hash) only if no safety stop
+    /// is in force, the certificate still verifies, the pair is confirmed
+    /// canonical with the floor at or above it under the advance lock (the
+    /// guard raised it), and the certificate is persisted. Otherwise publishes
+    /// nothing and leaves it to the poll. Returns `None` outside Enforced mode.
+    pub async fn after_finalize(&self, cert: &Checkpoint) -> Option<FloorTick> {
+        if !self.mode.raises_floor() {
+            return None;
+        }
+        let st = self.state.lock().await;
+        if st.halt.is_some() {
+            return Some(self.still_halted(&st).await);
+        }
+        if let Err(e) = cert.verify_certificate(self.chain_id) {
+            // Left to the poll, which halts on it.
+            return Some(FloorTick::Unverifiable(e.to_string()));
+        }
+        match self
+            .applicator
+            .verify_certified_floor(cert.height, cert.block_hash, true)
+            .await
+        {
+            FloorCheck::Match => {
+                let published = self.record_verified(cert.height, cert.block_hash);
+                self.publish(false);
+                if published {
+                    info!(
+                        "checkpoint finality: finalized block {} @ {} persisted; finalized/safe \
+                         RPC tags advanced",
+                        cert.block_hash, cert.height
+                    );
+                }
+                Some(FloorTick::Verified {
+                    height: cert.height,
+                    floor_raised: true,
+                    recovered: false,
+                })
+            }
+            other => Some(FloorTick::Unverifiable(format!(
+                "finalized block {} @ {} not confirmed after finalization: {:?}",
+                cert.block_hash, cert.height, other
+            ))),
         }
     }
 
@@ -461,6 +805,22 @@ impl FloorVerifier {
                      prevents equivocation)."
                 );
             }
+            HaltReason::Unconfirmed {
+                height,
+                certified,
+                reason,
+            } => {
+                error!(
+                    "CHECKPOINT FINALITY SAFETY STOP: the checkpoint at height {height} finalized \
+                     block {certified}, but that block could not be confirmed on this node's \
+                     applied chain when it finalized ({reason}). Finality is PAUSED here: no \
+                     checkpoint is proposed or signed, and the finalized/safe RPC tags stay at \
+                     {frozen}. Block import and production continue, and any reorg is re-checked \
+                     against this certificate. The stop clears by itself once block {certified} \
+                     is confirmed canonical at height {height} on this node; if another block \
+                     is found there it becomes a mismatch stop."
+                );
+            }
             HaltReason::InvalidCertificate {
                 height,
                 certified,
@@ -489,6 +849,25 @@ impl FloorVerifier {
                 .finalized_height_handle()
                 .load(Ordering::SeqCst),
         );
+    }
+}
+
+/// The manager-side handle of an installed verifier (weak: the verifier owns
+/// the manager, not the other way round).
+struct FinalizeHook(Weak<FloorVerifier>);
+
+#[async_trait::async_trait]
+impl FinalizationGuard for FinalizeHook {
+    async fn before_finalize(&self, certificate: &Checkpoint) {
+        if let Some(verifier) = self.0.upgrade() {
+            let _ = verifier.on_finalize(certificate).await;
+        }
+    }
+
+    async fn after_finalize(&self, certificate: &Checkpoint) {
+        if let Some(verifier) = self.0.upgrade() {
+            let _ = verifier.after_finalize(certificate).await;
+        }
     }
 }
 
@@ -611,6 +990,92 @@ mod tests {
         assert!(FloorMode::Enforced.raises_floor());
         assert!(!FloorMode::Observed.raises_floor());
         assert!(!FloorMode::Legacy.raises_floor());
+    }
+
+    /// The finalization-time check exists only in Enforced mode: Legacy and
+    /// Observed install no guard and `on_finalize` does nothing there, so their
+    /// behaviour is the poll's, unchanged.
+    #[tokio::test]
+    async fn finalization_guard_is_enforced_only() {
+        let (exec, storage, _dir) = fresh();
+        let app = Arc::new(CanonicalApplicator::new(exec, storage.clone()));
+        let (_a1, a2, _b2, _b3) = setup_fork(&app, &storage).await;
+        let cert = certificate(2, a2.header.block_hash, 3);
+        for mode in [FloorMode::Legacy, FloorMode::Observed] {
+            let mgr = manager_over(&storage);
+            let v = Arc::new(rig(mode, mgr.clone(), app.clone()).verifier);
+            assert!(!v.install_finalization_guard(), "{mode:?}");
+            assert!(!mgr.has_finalization_guard(), "{mode:?}");
+            assert_eq!(v.on_finalize(&cert).await, None, "{mode:?}");
+            assert_eq!(v.after_finalize(&cert).await, None, "{mode:?}");
+            assert_eq!(load(&app.finalized_height_handle()), 0, "{mode:?}");
+            assert!(app.certified_pending().is_empty(), "{mode:?}");
+        }
+        let mgr = manager_over(&storage);
+        let r = rig(FloorMode::Enforced, mgr.clone(), app.clone());
+        let v = Arc::new(r.verifier);
+        assert!(v.install_finalization_guard());
+        assert!(mgr.has_finalization_guard());
+        assert!(!v.install_finalization_guard(), "first install wins");
+        assert_eq!(
+            v.on_finalize(&cert).await,
+            Some(FloorTick::Verified {
+                height: 2,
+                floor_raised: true,
+                recovered: false
+            })
+        );
+        assert_eq!(load(&r.floor), 2);
+        assert_eq!(load(&r.verified), 0, "not published before persistence");
+        assert!(app.certified_pending().is_empty(), "settled on a match");
+        // Published only by the post-finalization hook, and only once the
+        // certificate is persisted.
+        assert_eq!(
+            v.after_finalize(&cert).await,
+            Some(FloorTick::Verified {
+                height: 2,
+                floor_raised: true,
+                recovered: false
+            })
+        );
+        assert_eq!(load(&r.verified), 0, "certificate not persisted");
+        persist_certificate(&storage, &cert);
+        let _ = v.after_finalize(&cert).await;
+        assert_eq!(load(&r.verified), 2);
+        assert_eq!(
+            v.rpc_finalized_handle().resolve(&storage),
+            FinalizedAnchor {
+                height: 2,
+                hash: Some(a2.header.block_hash)
+            }
+        );
+    }
+
+    /// Enforced: a certificate that does not verify, handed to the
+    /// finalization-time check, halts permanently (never raises the floor).
+    #[tokio::test]
+    async fn on_finalize_invalid_certificate_halts() {
+        let (exec, storage, _dir) = fresh();
+        let app = Arc::new(CanonicalApplicator::new(exec, storage.clone()));
+        let (_a1, a2, _b2, _b3) = setup_fork(&app, &storage).await;
+        let r = rig(FloorMode::Enforced, manager_over(&storage), app.clone());
+        let out = r
+            .verifier
+            .on_finalize(&certificate(2, a2.header.block_hash, 2))
+            .await;
+        assert!(
+            matches!(
+                out,
+                Some(FloorTick::Halted(HaltReason::InvalidCertificate {
+                    height: 2,
+                    ..
+                }))
+            ),
+            "{out:?}"
+        );
+        assert!(r.gadget.halted());
+        assert_eq!(load(&r.floor), 0);
+        assert!(app.certified_pending().is_empty());
     }
 
     /// Improvement over the pre-Stage-1c poll: with voting OFF a certificate
@@ -886,6 +1351,49 @@ mod tests {
             },
             "recovered: RPC tags name the certified block"
         );
+    }
+
+    /// Boot restores the floor from ANY number of stored certificates (review
+    /// of #335 @ 5236d2b): the certificate for this node's block a2 is stored
+    /// below 300 certificates for heights this node has not applied yet — more
+    /// than the 64 the boot check used to register and more than the 256 the
+    /// manager keeps in memory. The boot check finds a2 in the persisted store,
+    /// raises the floor to 2, keeps all 300 registered, and a reorg forking
+    /// below a2 is refused.
+    #[tokio::test]
+    async fn boot_restores_the_floor_from_any_number_of_stored_certificates() {
+        let (exec, storage, _dir) = fresh();
+        let app = Arc::new(CanonicalApplicator::new(exec, storage.clone()));
+        let (_a1, a2, _b2, b3) = setup_fork(&app, &storage).await; // tip a2
+        persist_certificate(&storage, &certificate(2, a2.header.block_hash, 3));
+        let above: u64 = 300;
+        for h in 3..3 + above {
+            let mut x = [0xEE; 32];
+            x[..8].copy_from_slice(&h.to_be_bytes());
+            persist_certificate(&storage, &certificate(h, Hash::new(x), 3));
+        }
+        let r = rig(FloorMode::Enforced, manager_over(&storage), app.clone());
+        assert_eq!(
+            r.verifier.boot_check().await,
+            FloorTick::Waiting {
+                height: 2 + above,
+                applied_height: 2
+            }
+        );
+        assert_eq!(load(&r.floor), 2, "restored from the persisted store");
+        assert_eq!(
+            app.certified_pending().len(),
+            usize::try_from(above).expect("fits"),
+            "nothing above the floor is dropped"
+        );
+        let lock = app.advance_lock();
+        let mut state = lock.lock().await;
+        match app.reorg_to(&mut state, b3.header.block_hash).await {
+            ReorgOutcome::Rejected(why) => {
+                assert!(why.contains("below finalized height 2"), "{why}")
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
     }
 
     /// A persisted certificate that does not verify (below quorum) halts finality

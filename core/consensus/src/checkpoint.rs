@@ -458,6 +458,43 @@ pub(crate) fn verify_vote_signature(
         .map_err(|_| CheckpointError::InvalidSignature(vote.voter))
 }
 
+/// Hook run by [`CheckpointManager::finalize_checkpoint`] once a checkpoint has
+/// reached quorum and BEFORE the finalization becomes visible anywhere: before
+/// the block is marked finalized in the DAG store, before the certificate is
+/// persisted, and before [`CheckpointManager::latest_finalized_height`] moves.
+///
+/// The node installs its finality floor verifier here (Enforced mode only,
+/// `node/src/finality_floor.rs`): it checks the certified `(height, hash)`
+/// against the node's applied chain and raises the reorg floor in the same
+/// critical section as that check, or engages the finality safety stop when the
+/// block is not confirmed on this node's chain. That closes the window in which
+/// a just-finalized block could be reorged out before the floor followed it
+/// (spec §5 S2). The hook cannot veto: a certificate with quorum is a fact about
+/// the network, and it is recorded either way.
+///
+/// Called with no manager lock held (only the manager's finalization mutex, which
+/// serializes finalizations), so the hook may read the manager.
+///
+/// PUBLICATION. `before_finalize` must not PUBLISH the finalization (e.g. the
+/// finalized/safe RPC tags): the certificate is not persisted yet, so a crash
+/// before persistence would restart without it and could abandon a block
+/// already reported as finalized. Publication belongs in
+/// [`Self::after_finalize`], which runs once the certificate record has been
+/// written (check [`CheckpointManager::is_certificate_persisted`]: the write
+/// can fail).
+#[async_trait::async_trait]
+pub trait FinalizationGuard: Send + Sync {
+    /// `certificate` has `status == Finalized`, a committee of at least
+    /// [`MIN_FINALITY_COMMITTEE`] and its derived quorum of votes.
+    async fn before_finalize(&self, certificate: &Checkpoint);
+
+    /// Runs after the finalization is visible: the block marked in the DAG
+    /// store, the certificate persistence attempted, the latest finalized
+    /// height and the in-memory record updated. No manager lock is held (only
+    /// the finalization mutex). Default: nothing.
+    async fn after_finalize(&self, _certificate: &Checkpoint) {}
+}
+
 /// Checkpoint manager — proposes, collects votes, and finalizes checkpoints.
 pub struct CheckpointManager {
     config: CheckpointConfig,
@@ -477,6 +514,16 @@ pub struct CheckpointManager {
 
     /// Replay protection: tracks (height, voter) pairs already seen.
     voted: RwLock<HashSet<(u64, PublicKey)>>,
+
+    /// Runs before a finalization becomes visible ([`FinalizationGuard`]).
+    /// Installed at most once; `None` = finalize exactly as before.
+    finalization_guard: std::sync::OnceLock<Arc<dyn FinalizationGuard>>,
+
+    /// Serializes [`Self::finalize_checkpoint`] so the guard's verdict and the
+    /// finalization it precedes are one step for every other finalization.
+    /// Outermost manager lock: never awaited while holding any other manager
+    /// lock.
+    finalize_serial: tokio::sync::Mutex<()>,
 }
 
 impl CheckpointManager {
@@ -489,7 +536,21 @@ impl CheckpointManager {
             latest_finalized_height: RwLock::new(0),
             persistent: None,
             voted: RwLock::new(HashSet::new()),
+            finalization_guard: std::sync::OnceLock::new(),
+            finalize_serial: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Install the hook run before every finalization becomes visible
+    /// ([`FinalizationGuard`]). The first install wins; returns `false` (and
+    /// changes nothing) if a guard is already installed.
+    pub fn install_finalization_guard(&self, guard: Arc<dyn FinalizationGuard>) -> bool {
+        self.finalization_guard.set(guard).is_ok()
+    }
+
+    /// Whether a [`FinalizationGuard`] is installed.
+    pub fn has_finalization_guard(&self) -> bool {
+        self.finalization_guard.get().is_some()
     }
 
     /// Create with persistent storage for checkpoint durability.
@@ -581,6 +642,62 @@ impl CheckpointManager {
             return None;
         }
         self.get_checkpoint(height).await
+    }
+
+    /// Whether the finalized certificate for `(height, block_hash)` is in the
+    /// persistent store (`DAG_METADATA` `checkpoint:{height}`), i.e. a restart
+    /// would load it. `false` without a persistent backend, when the record is
+    /// absent or unreadable, or when it names another block. The finality floor
+    /// verifier publishes a finalized pair (RPC `finalized`/`safe`) only once
+    /// this holds.
+    pub fn is_certificate_persisted(&self, height: u64, block_hash: &Hash) -> bool {
+        let Some(kv) = self.persistent.as_ref() else {
+            return false;
+        };
+        let key = format!("checkpoint:{}", height);
+        match kv.kv_get(cf::DAG_METADATA, key.as_bytes()) {
+            Ok(Some(bytes)) => bincode::deserialize::<Checkpoint>(&bytes).is_ok_and(|cp| {
+                cp.status == CheckpointStatus::Finalized
+                    && cp.height == height
+                    && cp.block_hash == *block_hash
+            }),
+            _ => false,
+        }
+    }
+
+    /// Every height holding a finalized certificate — the in-memory window AND
+    /// the persistent `DAG_METADATA` `checkpoint:{height}` records (the memory
+    /// window keeps only the latest [`MAX_FINALIZED_IN_MEMORY`]) — highest
+    /// first. Read each with [`Self::get_checkpoint`] and
+    /// [`Checkpoint::verify_certificate`] before trusting it. Scans the
+    /// metadata column family (as [`Self::with_persistence`] does at load):
+    /// meant for boot, not for a hot path. If the scan fails, only the
+    /// in-memory heights are returned and a warning is logged.
+    pub async fn finalized_certificate_heights(&self) -> Vec<u64> {
+        let mut heights: std::collections::BTreeSet<u64> =
+            self.finalized.read().await.keys().copied().collect();
+        if let Some(kv) = &self.persistent {
+            match kv.kv_iter_cf(cf::DAG_METADATA) {
+                Ok(entries) => {
+                    for (key, _) in entries {
+                        let height = key
+                            .strip_prefix(b"checkpoint:".as_slice())
+                            .and_then(|rest| std::str::from_utf8(rest).ok())
+                            .and_then(|rest| rest.parse::<u64>().ok());
+                        if let Some(h) = height {
+                            heights.insert(h);
+                        }
+                    }
+                }
+                Err(e) => warn!(
+                    "checkpoint: could not list persisted finalized certificates ({}); \
+                     using the {} held in memory",
+                    e,
+                    heights.len()
+                ),
+            }
+        }
+        heights.into_iter().rev().collect()
     }
 
     /// Whether `height` holds a finalized checkpoint (memory or persistent store).
@@ -815,11 +932,67 @@ impl CheckpointManager {
     ///
     /// Moves the checkpoint from pending to finalized, marks the block as finalized
     /// in the DAG store, and persists to storage if available.
+    ///
+    /// With a [`FinalizationGuard`] installed, the guard runs on the certificate
+    /// after quorum is confirmed and before any of the above (or the latest
+    /// finalized height) changes. Once the guard has run, the certificate it saw
+    /// (which has quorum) is what finalizes: if the pending checkpoint is
+    /// evicted, pruned, replaced, or pruned and RE-PROPOSED for the same hash
+    /// while the guard runs, the pending entry is used only when it extends that
+    /// certificate ([`extends_certificate`]); otherwise the guarded certificate
+    /// is finalized. So the guard's state change (floor raised / safety stop) is
+    /// never left without its certificate, and every finalization after a guard
+    /// returns `Ok`.
     pub async fn finalize_checkpoint(&self, height: u64) -> Result<Checkpoint, CheckpointError> {
+        let _serial = self.finalize_serial.lock().await;
+        let guarded = match self.finalization_guard.get() {
+            Some(guard) => {
+                let candidate = {
+                    let pending = self.pending.read().await;
+                    let cp = pending
+                        .get(&height)
+                        .ok_or(CheckpointError::BlockNotFound(Hash::default()))?;
+                    let quorum =
+                        cp.effective_quorum()
+                            .ok_or(CheckpointError::CommitteeTooSmall(
+                                cp.committee.len(),
+                                MIN_FINALITY_COMMITTEE,
+                            ))?;
+                    if !cp.has_derived_quorum() {
+                        return Err(CheckpointError::QuorumNotReached(cp.votes.len(), quorum));
+                    }
+                    let mut candidate = cp.clone();
+                    candidate.status = CheckpointStatus::Finalized;
+                    candidate
+                };
+                // No manager lock is held here (only `finalize_serial`).
+                guard.before_finalize(&candidate).await;
+                Some(candidate)
+            }
+            None => None,
+        };
+
+        let was_guarded = guarded.is_some();
         let mut pending = self.pending.write().await;
-        let mut checkpoint = pending
-            .remove(&height)
-            .ok_or(CheckpointError::BlockNotFound(Hash::default()))?;
+        let mut checkpoint = match (pending.remove(&height), guarded) {
+            // The entry still pending extends the guarded certificate (same
+            // block and committee, every guarded vote): it has at least that
+            // quorum and carries everything the guard verified.
+            (Some(cp), Some(seen)) if extends_certificate(&cp, &seen) => cp,
+            // Anything else after a guard ran — evicted or pruned, replaced by a
+            // proposal for another hash (which can never finalize now that this
+            // height has a quorum certificate), or pruned and re-proposed for the
+            // SAME hash with fewer votes or another committee: matching hashes
+            // alone do not show the entry survived the guard. Finalize what the
+            // guard saw; the replacement (and its replay markers, below) is
+            // settled with the height.
+            (_, Some(mut seen)) => {
+                seen.status = CheckpointStatus::Pending;
+                seen
+            }
+            (Some(cp), None) => cp,
+            (None, None) => return Err(CheckpointError::BlockNotFound(Hash::default())),
+        };
 
         // Minimum-committee guard (§3, D-2a): a committee below
         // MIN_FINALITY_COMMITTEE must never finalize. Put the checkpoint back and
@@ -827,6 +1000,9 @@ impl CheckpointManager {
         let effective_quorum = match checkpoint.effective_quorum() {
             Some(q) => q,
             None => {
+                // Unreachable after a guard ran: the guarded certificate (or its
+                // extension, same committee) passed this check before the guard.
+                debug_assert!(!was_guarded, "guarded certificate lost its committee");
                 let n = checkpoint.committee.len();
                 pending.insert(height, checkpoint);
                 return Err(CheckpointError::CommitteeTooSmall(
@@ -837,6 +1013,9 @@ impl CheckpointManager {
         };
 
         if !checkpoint.has_derived_quorum() {
+            // Unreachable after a guard ran (see above): the guard's state
+            // change is never left without its certificate.
+            debug_assert!(!was_guarded, "guarded certificate lost its quorum");
             // Put it back
             let votes = checkpoint.votes.len();
             pending.insert(height, checkpoint);
@@ -877,6 +1056,7 @@ impl CheckpointManager {
         if height > *latest {
             *latest = height;
         }
+        drop(latest);
 
         info!(
             "Finalized checkpoint at height {} with {}/{} votes",
@@ -895,6 +1075,12 @@ impl CheckpointManager {
         let mut voted = self.voted.write().await;
         voted.retain(|(h, _)| *h != height);
         drop(voted);
+        drop(pending);
+
+        // Still under `finalize_serial`, with no other manager lock held.
+        if let Some(guard) = self.finalization_guard.get() {
+            guard.after_finalize(&cp).await;
+        }
 
         Ok(cp)
     }
@@ -928,6 +1114,23 @@ impl CheckpointManager {
             .get(&height)
             .map(|cp| cp.vote_count())
     }
+}
+
+/// Whether `current` (the entry pending at finalization) extends `guarded` (the
+/// certificate a [`FinalizationGuard`] ran on): same height, block and
+/// committee, and every guarded vote present with the same signature. Then
+/// `current` has at least `guarded`'s quorum and may be finalized in its place.
+/// A matching block hash alone is NOT enough: the pending entry may have been
+/// pruned and re-proposed for the same hash (with no votes, or another
+/// committee) while the guard ran.
+fn extends_certificate(current: &Checkpoint, guarded: &Checkpoint) -> bool {
+    current.height == guarded.height
+        && current.block_hash == guarded.block_hash
+        && current.committee == guarded.committee
+        && guarded
+            .votes
+            .iter()
+            .all(|(voter, sig)| current.votes.get(voter) == Some(sig))
 }
 
 /// Drop the lowest finalized heights until at most [`MAX_FINALIZED_IN_MEMORY`] remain.
@@ -1363,6 +1566,342 @@ mod tests {
         assert_eq!(
             reopened.expect("finalized"),
             ProposeOutcome::AlreadyFinalized
+        );
+    }
+
+    /// (height, hash, latest finalized height, readable, persisted).
+    type AfterSeen = (u64, Hash, u64, bool, bool);
+
+    /// Records what was visible on the manager when the guard ran.
+    #[derive(Default)]
+    struct ProbeGuard {
+        mgr: std::sync::Mutex<Option<std::sync::Weak<CheckpointManager>>>,
+        seen: std::sync::Mutex<Vec<(u64, Hash, u64, bool)>>,
+        /// What `after_finalize` saw: (height, hash, latest finalized height,
+        /// certificate readable, certificate persisted).
+        after: std::sync::Mutex<Vec<AfterSeen>>,
+        /// Prune pending checkpoints at or below this height from inside the
+        /// guard (simulates an eviction racing the finalization).
+        prune_during: Option<u64>,
+    }
+
+    #[async_trait::async_trait]
+    impl FinalizationGuard for ProbeGuard {
+        async fn before_finalize(&self, certificate: &Checkpoint) {
+            let mgr = self
+                .mgr
+                .lock()
+                .expect("probe lock")
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+                .expect("manager alive");
+            assert_eq!(certificate.status, CheckpointStatus::Finalized);
+            assert!(certificate.has_derived_quorum());
+            let latest = mgr.latest_finalized_height().await;
+            let stored = mgr.get_checkpoint(certificate.height).await.is_some();
+            self.seen.lock().expect("probe lock").push((
+                certificate.height,
+                certificate.block_hash,
+                latest,
+                stored,
+            ));
+            if let Some(floor) = self.prune_during {
+                mgr.prune_at_or_below(floor).await;
+            }
+        }
+
+        async fn after_finalize(&self, certificate: &Checkpoint) {
+            let mgr = self
+                .mgr
+                .lock()
+                .expect("probe lock")
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+                .expect("manager alive");
+            // Reads every manager lock: proves none is held here.
+            let latest = mgr.latest_finalized_height().await;
+            let stored = mgr.get_checkpoint(certificate.height).await.is_some();
+            let _ = mgr.pending_len().await;
+            let persisted =
+                mgr.is_certificate_persisted(certificate.height, &certificate.block_hash);
+            self.after.lock().expect("probe lock").push((
+                certificate.height,
+                certificate.block_hash,
+                latest,
+                stored,
+                persisted,
+            ));
+        }
+    }
+
+    async fn guarded(prune_during: Option<u64>) -> (Arc<CheckpointManager>, Arc<ProbeGuard>, Hash) {
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let blocks = build_chain(&dag, 6).await;
+        let mgr = Arc::new(CheckpointManager::new(CheckpointConfig::for_testing(), dag));
+        let probe = Arc::new(ProbeGuard {
+            prune_during,
+            ..ProbeGuard::default()
+        });
+        *probe.mgr.lock().expect("probe lock") = Some(Arc::downgrade(&mgr));
+        assert!(mgr.install_finalization_guard(probe.clone()));
+        assert!(
+            !mgr.install_finalization_guard(probe.clone()),
+            "first install wins"
+        );
+        assert!(mgr.has_finalization_guard());
+        let b5 = blocks.get(5).expect("block 5").hash();
+        let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+        mgr.ensure_proposed(5, b5, committee)
+            .await
+            .expect("propose");
+        (mgr, probe, b5)
+    }
+
+    /// S2 (finality floor at finalization): the guard runs once quorum is
+    /// confirmed and BEFORE the finalization is visible — latest finalized
+    /// height unchanged, no stored certificate — and is not called below quorum.
+    #[tokio::test]
+    async fn finalization_guard_runs_before_finalization_is_visible() {
+        let (mgr, probe, b5) = guarded(None).await;
+        for i in 0..2u8 {
+            assert!(!mgr
+                .submit_vote(make_signed_vote(i, 5, &b5))
+                .await
+                .expect("vote"));
+        }
+        assert!(matches!(
+            mgr.finalize_checkpoint(5).await,
+            Err(CheckpointError::QuorumNotReached(2, 3))
+        ));
+        assert!(
+            probe.seen.lock().expect("probe lock").is_empty(),
+            "no quorum: guard not run"
+        );
+        assert!(mgr
+            .submit_vote(make_signed_vote(2, 5, &b5))
+            .await
+            .expect("vote"));
+        let cp = mgr.finalize_checkpoint(5).await.expect("finalize");
+        assert_eq!(cp.block_hash, b5);
+        assert_eq!(
+            probe.seen.lock().expect("probe lock").as_slice(),
+            &[(5, b5, 0, false)],
+            "guard saw the certificate while nothing was finalized yet"
+        );
+        assert_eq!(
+            probe.after.lock().expect("probe lock").as_slice(),
+            &[(5, b5, 5, true, false)],
+            "after_finalize runs once the finalization is visible; no persistent \
+             backend here, so the certificate is never reported persisted"
+        );
+        assert_eq!(mgr.latest_finalized_height().await, 5);
+        assert!(matches!(
+            mgr.finalize_checkpoint(5).await,
+            Err(CheckpointError::BlockNotFound(_))
+        ));
+        assert_eq!(
+            probe.seen.lock().expect("probe lock").len(),
+            1,
+            "guard once per finalization"
+        );
+        assert_eq!(probe.after.lock().expect("probe lock").len(), 1);
+    }
+
+    /// A pending checkpoint pruned while the guard runs still finalizes as the
+    /// certificate the guard saw (the guard's verdict always describes what
+    /// finalizes).
+    #[tokio::test]
+    async fn finalization_guard_verdict_survives_a_concurrent_prune() {
+        let (mgr, probe, b5) = guarded(Some(5)).await;
+        for i in 0..3u8 {
+            mgr.submit_vote(make_signed_vote(i, 5, &b5))
+                .await
+                .expect("vote");
+        }
+        let cp = mgr.finalize_checkpoint(5).await.expect("finalize");
+        assert_eq!((cp.height, cp.block_hash, cp.votes.len()), (5, b5, 3));
+        assert_eq!(cp.status, CheckpointStatus::Finalized);
+        assert_eq!(probe.seen.lock().expect("probe lock").len(), 1);
+        assert_eq!(mgr.latest_finalized_height().await, 5);
+        assert_eq!(mgr.pending_len().await, 0);
+    }
+
+    /// Parks `before_finalize` on a barrier so a test can interleave other
+    /// manager calls deterministically between the guard's state change and the
+    /// finalization it precedes.
+    #[derive(Default)]
+    struct GateGuard {
+        /// Signalled once the guard has run (its state change is done).
+        entered: tokio::sync::Notify,
+        /// Awaited before the guard returns to `finalize_checkpoint`.
+        release: tokio::sync::Notify,
+        /// Certificates the guard ran on: (height, hash, vote count).
+        before: std::sync::Mutex<Vec<(u64, Hash, usize)>>,
+        /// Certificates `after_finalize` saw: (height, hash, vote count).
+        after: std::sync::Mutex<Vec<(u64, Hash, usize)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl FinalizationGuard for GateGuard {
+        async fn before_finalize(&self, certificate: &Checkpoint) {
+            self.before.lock().expect("gate lock").push((
+                certificate.height,
+                certificate.block_hash,
+                certificate.votes.len(),
+            ));
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+
+        async fn after_finalize(&self, certificate: &Checkpoint) {
+            self.after.lock().expect("gate lock").push((
+                certificate.height,
+                certificate.block_hash,
+                certificate.votes.len(),
+            ));
+        }
+    }
+
+    async fn gated() -> (Arc<CheckpointManager>, Arc<GateGuard>, Hash, Vec<PublicKey>) {
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let blocks = build_chain(&dag, 6).await;
+        let mgr = Arc::new(CheckpointManager::new(CheckpointConfig::for_testing(), dag));
+        let gate = Arc::new(GateGuard::default());
+        assert!(mgr.install_finalization_guard(gate.clone()));
+        let b5 = blocks.get(5).expect("block 5").hash();
+        let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+        mgr.ensure_proposed(5, b5, committee.clone())
+            .await
+            .expect("propose");
+        for i in 0..3u8 {
+            mgr.submit_vote(make_signed_vote(i, 5, &b5))
+                .await
+                .expect("vote");
+        }
+        (mgr, gate, b5, committee)
+    }
+
+    /// S2 atomicity (guard state change <-> certificate): while the guard runs,
+    /// the pending checkpoint is pruned and RE-PROPOSED for the SAME block hash
+    /// with no votes, and a second finalization of the same height is started.
+    /// The certificate the guard ran on (with its quorum) must still be the one
+    /// finalized: the guard's state change is never left without its
+    /// certificate, and the votes are never dropped. The concurrent finalization
+    /// waits for the first and finds nothing left to finalize.
+    #[tokio::test]
+    async fn finalization_guard_certificate_survives_a_same_hash_re_proposal() {
+        let (mgr, gate, b5, committee) = gated().await;
+
+        let first = tokio::spawn({
+            let mgr = mgr.clone();
+            async move { mgr.finalize_checkpoint(5).await }
+        });
+        gate.entered.notified().await;
+        // The guard has run on the 3-vote certificate; finalization is parked.
+        assert_eq!(
+            gate.before.lock().expect("gate lock").as_slice(),
+            &[(5, b5, 3)]
+        );
+        let second = tokio::spawn({
+            let mgr = mgr.clone();
+            async move { mgr.finalize_checkpoint(5).await }
+        });
+        mgr.prune_at_or_below(5).await;
+        assert_eq!(mgr.pending_len().await, 0, "pruned during the guard");
+        assert_eq!(
+            mgr.ensure_proposed(5, b5, committee.clone())
+                .await
+                .expect("re-propose"),
+            ProposeOutcome::Proposed,
+            "the same hash is re-proposed with no votes"
+        );
+        assert_eq!(mgr.pending_vote_count(5).await, Some(0));
+        gate.release.notify_one();
+
+        let first = first.await.expect("first finalization task");
+        assert!(
+            first.is_ok(),
+            "the guarded certificate must finalize, got {first:?}"
+        );
+        let cp = first.expect("checked above");
+        assert_eq!((cp.height, cp.block_hash, cp.votes.len()), (5, b5, 3));
+        assert_eq!(cp.status, CheckpointStatus::Finalized);
+        assert!(cp.has_derived_quorum());
+        assert_eq!(mgr.latest_finalized_height().await, 5);
+        let stored = mgr.get_checkpoint(5).await.expect("certificate recorded");
+        assert_eq!(stored.votes.len(), 3, "the votes are kept");
+        assert_eq!(mgr.pending_len().await, 0, "the replacement is settled");
+        assert_eq!(
+            gate.after.lock().expect("gate lock").as_slice(),
+            &[(5, b5, 3)],
+            "after_finalize ran on the guarded certificate"
+        );
+
+        // The concurrent finalization ran after the first (serialized): nothing
+        // left to finalize, and the guard never ran a second time.
+        let second = second.await.expect("second finalization task");
+        assert!(
+            matches!(second, Err(CheckpointError::BlockNotFound(_))),
+            "{second:?}"
+        );
+        assert_eq!(gate.before.lock().expect("gate lock").len(), 1);
+        assert_eq!(gate.after.lock().expect("gate lock").len(), 1);
+        assert_eq!(
+            mgr.ensure_proposed(5, b5, committee)
+                .await
+                .expect("re-open attempt"),
+            ProposeOutcome::AlreadyFinalized
+        );
+    }
+
+    /// A same-hash replacement that EXTENDS the guarded certificate (same
+    /// committee, every guarded vote, plus more) may be finalized in its place:
+    /// it carries everything the guard verified. A replacement with another
+    /// committee is not an extension, so the guarded certificate is kept.
+    #[tokio::test]
+    async fn finalization_guard_keeps_the_certificate_unless_the_replacement_extends_it() {
+        // Extension: the re-proposed checkpoint re-collects the same 3 votes
+        // (the replay markers were pruned with it) and a 4th.
+        let (mgr, gate, b5, committee) = gated().await;
+        let task = tokio::spawn({
+            let mgr = mgr.clone();
+            async move { mgr.finalize_checkpoint(5).await }
+        });
+        gate.entered.notified().await;
+        mgr.prune_at_or_below(5).await;
+        mgr.ensure_proposed(5, b5, committee.clone())
+            .await
+            .expect("re-propose");
+        for i in 0..4u8 {
+            mgr.submit_vote(make_signed_vote(i, 5, &b5))
+                .await
+                .expect("vote");
+        }
+        gate.release.notify_one();
+        let cp = task.await.expect("task");
+        assert!(cp.is_ok(), "{cp:?}");
+        let cp = cp.expect("checked above");
+        assert_eq!((cp.block_hash, cp.votes.len()), (b5, 4), "extension kept");
+
+        // Not an extension: same hash, a different committee, no votes.
+        let (mgr, gate, b5, _) = gated().await;
+        let task = tokio::spawn({
+            let mgr = mgr.clone();
+            async move { mgr.finalize_checkpoint(5).await }
+        });
+        gate.entered.notified().await;
+        mgr.prune_at_or_below(5).await;
+        let other: Vec<PublicKey> = (10..14).map(make_pubkey).collect();
+        mgr.ensure_proposed(5, b5, other).await.expect("re-propose");
+        gate.release.notify_one();
+        let cp = task.await.expect("task");
+        assert!(cp.is_ok(), "{cp:?}");
+        let cp = cp.expect("checked above");
+        assert_eq!((cp.block_hash, cp.votes.len()), (b5, 3));
+        assert_eq!(
+            cp.committee,
+            (0..4).map(make_pubkey).collect::<Vec<_>>(),
+            "the guarded certificate's committee is the one recorded"
         );
     }
 

@@ -7,8 +7,14 @@
 #   MUST PASS  specs/tla/consensus/CheckpointFinalitySafety.cfg   (S1 + S2, f = 1 of 4)
 #   MUST FAIL  CheckpointFinalitySafety_byz2.cfg      NoConflictingFinality (f >= n/3)
 #   MUST FAIL  CheckpointFinalitySafety_norecord.cfg  NoConflictingFinality (no signed-vote record)
-#   MUST FAIL  CheckpointFinalitySafety_strict.cfg    FinalizedStaysCanonical (open finding:
-#              the floor is raised by the verifier poll, after finalization)
+#   MUST PASS  specs/tla/consensus/CheckpointFinalitySafety_strict.cfg (§5 S2 as written:
+#              floor raised at finalization)
+#   MUST FAIL  CheckpointFinalitySafety_pollonly.cfg  FinalizedStaysCanonical (the floor
+#              follows only the verifier poll, after finalization)
+#   MUST PASS  specs/tla/consensus/CheckpointFinalitySafety_restart.cfg (S2 across restarts:
+#              the boot check consults every stored certificate)
+#   MUST FAIL  CheckpointFinalitySafety_bootlimit.cfg FinalizedNeverReverted (the boot check
+#              consults only the latest stored certificate)
 #   MUST FAIL  CheckpointFinalitySafety_committees.cfg NoConflictingFinality (open finding:
 #              committees are drawn per candidate block, so siblings can be finalized
 #              by different committees without any equivocation)
@@ -72,7 +78,7 @@ expect_pass() {
 expect_violation() {
     local spec="$1" cfg="$2" inv="$3" out
     out="$(run_tlc "$spec" "$cfg")"
-    if grep -qE "(Invariant|Property) $inv is violated" <<<"$out"; then
+    if grep -qE "(Invariant|[Pp]roperty) $inv is violated" <<<"$out"; then
         printf '  VIOLATES    %-45s %s (expected)\n' "$cfg" "$inv"
     else
         printf '  FAIL        %-45s expected a %s counterexample\n' "$cfg" "$inv"
@@ -86,7 +92,10 @@ expect_pass CheckpointVoteSafety CheckpointVoteSafety.cfg
 expect_pass CheckpointFinalitySafety CheckpointFinalitySafety.cfg
 expect_violation CheckpointFinalitySafety CheckpointFinalitySafety_byz2.cfg NoConflictingFinality
 expect_violation CheckpointFinalitySafety CheckpointFinalitySafety_norecord.cfg NoConflictingFinality
-expect_violation CheckpointFinalitySafety CheckpointFinalitySafety_strict.cfg FinalizedStaysCanonical
+expect_pass CheckpointFinalitySafety CheckpointFinalitySafety_strict.cfg
+expect_violation CheckpointFinalitySafety CheckpointFinalitySafety_pollonly.cfg FinalizedStaysCanonical
+expect_pass CheckpointFinalitySafety CheckpointFinalitySafety_restart.cfg
+expect_violation CheckpointFinalitySafety CheckpointFinalitySafety_bootlimit.cfg FinalizedNeverReverted
 expect_violation CheckpointFinalitySafety CheckpointFinalitySafety_committees.cfg NoConflictingFinality
 if [ "${TLA_FINALITY_DEEP:-0}" = "1" ]; then
     TIMEOUT="${TLC_DEEP_TIMEOUT:-7200}" expect_pass CheckpointFinalitySafety CheckpointFinalitySafety_deep.cfg
