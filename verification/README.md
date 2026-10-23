@@ -63,8 +63,10 @@ derived from. Re-verify against a new commit before trusting stale values.
    plus `not-measured-here` instead of a guess or a marketing figure.
 2. Marketing/deck figures are not evidence. Where they disagree with a measured
    value, the `notes` field records the stale figure so it can be corrected.
-3. Known discrepancies (e.g. `ModelRegistry.sol`'s precompile constant vs the
-   canonical dispatcher scheme) are recorded as claims/flags, not hidden.
+3. Known discrepancies (e.g. `ModelRegistry.sol`'s former precompile constant vs
+   the canonical dispatcher scheme, resolved in `bf551422`) are recorded as
+   claims/flags, not hidden. A resolved flag keeps its superseded value in
+   `notes`.
 
 ## Regenerating website facts
 

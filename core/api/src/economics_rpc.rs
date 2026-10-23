@@ -215,13 +215,10 @@ pub fn register_economics_methods(
             let pending_txs = block_on(mempool.get_transactions(1000)); // Get up to 1000 transactions
             let mut total_gas_fees = primitive_types::U256::zero();
             let mut ai_operations = 0u32;
-            let mut total_gas_used = 0u64;
             let tx_count = pending_txs.len() as u32;
 
             // Calculate total fees and identify AI operations
             for tx in &pending_txs {
-                total_gas_used = total_gas_used.saturating_add(tx.gas_limit);
-
                 // Calculate fee (gas_limit * gas_price)
                 let fee = primitive_types::U256::from(tx.gas_limit)
                     .saturating_mul(primitive_types::U256::from(tx.gas_price));
@@ -234,29 +231,30 @@ pub fn register_economics_methods(
                 }
             }
 
-            let avg_gas_price = if tx_count > 0 {
-                total_gas_used.checked_div(tx_count as u64).unwrap_or(0)
-            } else {
-                1_000_000_000 // 1 Gwei default
-            };
+            // Source: `gas_price` of the same pending transactions
+            // (Mempool::get_transactions(1000)). This used to divide the summed
+            // gas LIMITS by the count (an average gas limit, labelled a price),
+            // and to report 1 gwei for an empty pool.
+            let avg_gas_price = average_gas_price(pending_txs.iter().map(|tx| tx.gas_price));
 
             Ok(json!({
                 "pendingTransactions": tx_count,
                 "totalGasFees": format!("0x{:x}", total_gas_fees),
-                "avgGasPrice": format!("0x{:x}", avg_gas_price),
+                "avgGasPrice": avg_gas_price.map(|p| format!("0x{:x}", p)),
                 "aiOperations": ai_operations,
                 "queuedForExecution": tx_count,
                 "mempoolSize": stats.total_size,
                 "byClass": stats.by_class,
             }))
         } else {
-            // Fallback when no mempool available
+            // No mempool wired into this server: nothing is known, so nothing is
+            // reported (this used to claim an empty pool at 1 gwei).
             Ok(json!({
-                "pendingTransactions": 0,
-                "totalGasFees": "0x0",
-                "avgGasPrice": "0x3b9aca00", // 1 Gwei
-                "aiOperations": 0,
-                "queuedForExecution": 0
+                "pendingTransactions": Value::Null,
+                "totalGasFees": Value::Null,
+                "avgGasPrice": Value::Null,
+                "aiOperations": Value::Null,
+                "queuedForExecution": Value::Null
             }))
         }
     });
@@ -266,21 +264,12 @@ pub fn register_economics_methods(
     io_handler.add_sync_method("citrate_getToken", move |_params: Params| {
         if let Some(economics) = &economics_token {
             let token = economics.get_token();
-            Ok(json!({
-                "name": token.config.name,
-                "symbol": token.config.symbol,
-                "decimals": token.config.decimals,
-                "totalSupply": format!("0x{:x}", token.config.total_supply),
-                "totalMinted": format!("0x{:x}", token.total_minted),
-            }))
+            Ok(token_json(&token.config))
         } else {
-            Ok(json!({
-                "name": "Citrate",
-                "symbol": "SALT",
-                "decimals": 18,
-                "totalSupply": "0xc9f2c9cd04674edea40000000", // 1B SALT
-                "maxSupply": "0xc9f2c9cd04674edea40000000",
-            }))
+            // Source: TokenConfig::default(), which derives the cap from
+            // citrate_economics::TOTAL_SUPPLY (core/economics/src/lib.rs). This
+            // fallback used to hard-code the pre-reroll 1B SALT cap.
+            Ok(token_json(&citrate_economics::TokenConfig::default()))
         }
     });
 
@@ -384,4 +373,39 @@ pub fn register_economics_methods(
             ))
         }
     });
+}
+
+/// `citrate_getToken` result for a token configuration.
+///
+/// `totalMinted` is `null`: no node component tracks how much SALT has been
+/// minted. The node's `UnifiedEconomicsManager` is built once at start-up and
+/// shared immutably (`node/src/main.rs`), so its `Token::total_minted` never
+/// moves off its initial value; block rewards are credited by the executor
+/// (`citrate_execution::block_rewards`), which keeps no running total. This
+/// method used to report that stale counter as a real `0x0`.
+pub fn token_json(config: &citrate_economics::TokenConfig) -> Value {
+    json!({
+        // Source: TokenConfig (name/symbol/decimals; core/economics/src/token.rs).
+        "name": config.name,
+        "symbol": config.symbol,
+        "decimals": config.decimals,
+        // Source: TokenConfig::total_supply, derived from TOTAL_SUPPLY
+        // (core/economics/src/lib.rs) x 10^decimals.
+        "totalSupply": format!("0x{:x}", config.total_supply),
+        "maxSupply": format!("0x{:x}", config.total_supply),
+        // Not tracked by any node component (see the doc comment).
+        "totalMinted": Value::Null,
+    })
+}
+
+/// Mean of the given gas prices (wei per gas), rounded down; `None` for an
+/// empty input. Sums in U256 so a full pool cannot overflow.
+pub fn average_gas_price<I: IntoIterator<Item = u64>>(prices: I) -> Option<primitive_types::U256> {
+    let mut sum = primitive_types::U256::zero();
+    let mut count = 0u64;
+    for p in prices {
+        sum = sum.saturating_add(primitive_types::U256::from(p));
+        count = count.saturating_add(1);
+    }
+    sum.checked_div(primitive_types::U256::from(count))
 }

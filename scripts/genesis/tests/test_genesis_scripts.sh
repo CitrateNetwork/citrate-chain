@@ -1153,7 +1153,7 @@ dormant_book "$DORM_OK" "$DEP"
 want_vest=$(printf '{"TeamVesting_alice":"%s","TeamVesting_bob":"%s"}' "$V1" "$V2")
 want_dorm=$(python3 -c 'import json,sys; print(json.dumps({k: v.lower() for k, v in json.load(open(sys.argv[1]))["contracts"].items()}, sort_keys=True, separators=(",",":")))' "$DORM_OK")
 vest_bc() { bc_run DeployTeamVesting.s.sol "${1:-6000}" "CREATE2:TeamVestingWallet:$V1" "CREATE2:TeamVestingWallet:$V2"; }
-dorm_bc() { bc_run DeployDormantLedgers.s.sol "${1:-6000}" "CREATE2:FederatedRoundLedger:$FRLA" "CREATE:PatronageLedger:$PLA"; }
+dorm_bc() { bc_run DeployDormantLedgers.s.sol 6000 "CREATE2:FederatedRoundLedger:$FRLA" "CREATE:PatronageLedger:$PLA"; }
 
 # P3
 ob_reset
