@@ -4101,6 +4101,22 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // height index (`FloorVerifier::rpc_finalized_handle`); Legacy and Observed keep
             // the unchanged applicator handle, which neither raises.
             finality_rpc_handle.clone(),
+            // UI truth contract §9: the identity this process computed at start-up.
+            // Version/git from the build stamp (node/build.rs), the consensus
+            // fingerprint from ConsensusManifest (after the PBA + agent-fork heights
+            // were published), the activation fingerprint from the resolved PBA
+            // activation, and the GhostDAG params the shared GhostDag runs with.
+            Some({
+                let manifest = consensus_manifest::ConsensusManifest::current();
+                citrate_api::NodeIdentity {
+                    version: manifest.version.to_string(),
+                    git_sha: manifest.git_sha.to_string(),
+                    git_dirty: manifest.git_dirty,
+                    activation_fingerprint: pba_activation.fingerprint(&manifest.fingerprint),
+                    consensus_fingerprint: manifest.fingerprint,
+                    ghostdag_params: Some(shared_ghostdag.params().clone()),
+                }
+            }),
         );
 
         // PIL-12: spawn the Ethereum-compatible subscription server next

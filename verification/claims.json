@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-09-27T18:36:30Z",
-  "source_commit": "a2d64e67144517d7dfe553ebd5223372c804e602",
+  "generated_at": "2026-10-19T01:05:04Z",
+  "source_commit": "c384fc982882f830306142c70dd643b59fcda1f6",
   "note": "Single machine-readable source of truth for every public technical claim about citrate-chain. Each value is tied to source files and, where applicable, reproducible evidence. Website and marketing facts MUST be generated from this file, not hand-copied. Numbers here were measured/derived from the code at source_commit; see verification_status per claim. See verification/README.md for status definitions.",
   "claims": {
     "salt_total_supply": {
@@ -9,13 +9,13 @@
       "unit": "whole SALT (base tokens; multiply by 10^decimals for wei)",
       "human": "1 trillion SALT",
       "source_files": [
-        "core/economics/src/lib.rs:62"
+        "core/economics/src/lib.rs:75"
       ],
       "evidence_files": [
         "core/economics/src/token.rs:26-27"
       ],
       "reproduction_command": "grep -n 'TOTAL_SUPPLY' core/economics/src/lib.rs",
-      "last_verified_at": "2026-09-24T02:37:00Z",
+      "last_verified_at": "2026-10-19T01:05:04Z",
       "verification_status": "reproducible-from-source",
       "notes": "Code comment: scaled 1000x from a former 1B cap at the 2026-09 reroll. TOTAL_SUPPLY is the single source of truth; TokenConfig::default and GenesisConfig::validate derive the wei cap from it. Any 1-billion figure on public surfaces is stale."
     },
@@ -26,10 +26,11 @@
         "core/economics/src/token.rs:9"
       ],
       "evidence_files": [
-        "core/economics/src/lib.rs:66-71"
+        "core/economics/src/lib.rs:100-102",
+        "core/economics/src/token.rs:26-27"
       ],
       "reproduction_command": "grep -n 'DECIMALS' core/economics/src/token.rs",
-      "last_verified_at": "2026-09-24T02:37:00Z",
+      "last_verified_at": "2026-10-19T01:05:04Z",
       "verification_status": "reproducible-from-source"
     },
     "chain_id": {
@@ -53,6 +54,8 @@
       "scope": "citrate-chain",
       "value": 18,
       "source_files": [
+        "core/consensus/src/types.rs:174-183",
+        "node/src/main.rs:2045-2048",
         "node/config/testnet.toml:8",
         "node/config/mainnet.toml:9",
         "testnet-config.toml:5"
@@ -60,10 +63,10 @@
       "evidence_files": [
         "core/consensus/src/ghostdag.rs"
       ],
-      "reproduction_command": "grep -rn 'ghostdag_k' node/config/*.toml testnet-config.toml",
-      "last_verified_at": "2026-09-24T02:37:00Z",
+      "reproduction_command": "sed -n '174,183p' core/consensus/src/types.rs; sed -n '2045,2048p' node/src/main.rs; grep -rn 'ghostdag_k' node/config/*.toml testnet-config.toml",
+      "last_verified_at": "2026-10-19T01:05:04Z",
       "verification_status": "reproducible-from-source",
-      "notes": "GhostDAG blue-set anticone bound k = 18, consumed by core/consensus/src/ghostdag.rs via GhostDagParams."
+      "notes": "GhostDAG blue-set anticone bound k = 18. ERRATUM (2026-10-19): the running value comes from GhostDagParams::default() (core/consensus/src/types.rs:177), which node/src/main.rs:2045-2048 passes to the shared GhostDag; the [chain] ghostdag_k config key (= 18 in every shipped config) is parsed but not read by the node. The two agree today; a config edit would NOT change k. Since C1-F, citrate_getDagStats.ghostdagParams reports the params the running GhostDag uses."
     },
     "block_time": {
       "scope": "citrate-chain",
@@ -113,8 +116,10 @@
       },
       "source_files": [
         "node/config/testnet.toml:49-52",
-        "core/consensus/src/checkpoint.rs:382",
-        "node/src/main.rs:1520-1530,1592-1606"
+        "core/consensus/src/checkpoint.rs:430",
+        "node/src/main.rs:2051-2071,2133-2148",
+        "core/api/src/eth_rpc.rs:299-313",
+        "node/src/main.rs:3953-3959"
       ],
       "evidence_files": [
         "core/consensus/tests/h01_h02_checkpoint_safety.rs",
@@ -122,9 +127,9 @@
         "verification/check_claims.py"
       ],
       "reproduction_command": "python3 verification/check_claims.py  # fails if this claim says running=true unless CHECKPOINT_VOTING_PINS and CHECKPOINT_ENFORCEMENT_PINS are ON for 40204, a non-test path calls sign_checkpoint_vote(, and a node file builds NetworkMessage::CheckpointVote and broadcasts it",
-      "last_verified_at": "2026-09-25T05:30:00Z",
+      "last_verified_at": "2026-10-19T01:05:04Z",
       "verification_status": "specified-not-running",
-      "notes": "Checkpoint finality is SPECIFIED, NOT RUNNING on the public testnet. The code exists behind two compiled pins in core/consensus/src/checkpoint_gadget.rs, both OFF for 40204 in this release: CHECKPOINT_VOTING_PINS (Stage 1a producer path: propose, sign, broadcast, relay) and CHECKPOINT_ENFORCEMENT_PINS (Stage 1c: a verified certificate whose (height, hash) is the node's own canonical block raises the reorg floor; node/src/finality_floor.rs). With voting OFF nothing is proposed, so no checkpoint finalizes, the reorg floor stays at 0 and the 'finalized'/'safe' RPC tags resolve to genesis. Running additionally needs a staked validator committee of at least 4. Confirmation is probabilistic. Do NOT publish a finality time (the old 90-100s figure assumed a running committee)."
+      "notes": "Checkpoint finality is SPECIFIED, NOT RUNNING on the public testnet. The code exists behind two compiled pins in core/consensus/src/checkpoint_gadget.rs, both OFF for 40204 in this release: CHECKPOINT_VOTING_PINS (Stage 1a producer path: propose, sign, broadcast, relay) and CHECKPOINT_ENFORCEMENT_PINS (Stage 1c: a verified certificate whose (height, hash) is the node's own canonical block raises the reorg floor; node/src/finality_floor.rs). With voting OFF nothing is proposed, so no checkpoint finalizes, the reorg floor stays at 0 and the 'finalized'/'safe' RPC tags resolve to genesis. Running additionally needs a staked validator committee of at least 4. Confirmation is probabilistic. The 'finalized'/'safe' tags are served since #250: block lookups with them return GENESIS (block 0) and account-state reads with them are refused while the finalized height is behind the head; a client must not read 'finalized' = genesis as a finality signal. Do NOT publish a finality time (the old 90-100s figure assumed a running committee)."
     },
     "confirmation_latency": {
       "scope": "citrate-chain",
@@ -147,10 +152,10 @@
     "foundry_tests": {
       "scope": "citrate-chain/contracts",
       "value": {
-        "passed": 2913,
+        "passed": 3191,
         "failed": 0,
         "skipped": 0,
-        "suites": 158
+        "suites": 211
       },
       "source_files": [
         "contracts/"
@@ -159,16 +164,16 @@
         "contracts/foundry.toml",
         "foundry.toml"
       ],
-      "reproduction_command": "cd contracts && forge test --use 0.8.36",
-      "count_method": "forge test --use 0.8.36 final summary line ('2913 tests passed, 0 failed, 0 skipped')",
-      "last_verified_at": "2026-09-24T02:37:00Z",
+      "reproduction_command": "cd contracts && forge test  # solc 0.8.36 is pinned by contracts/foundry.toml",
+      "count_method": "forge test final summary line ('Ran 211 test suites in 129.60s (390.85s CPU time): 3191 tests passed, 0 failed, 0 skipped (3191 total tests)')",
+      "last_verified_at": "2026-10-19T01:05:04Z",
       "verification_status": "measured-here",
-      "notes": "Measured on forge 1.5.1-stable at 3c256a59 (the commits since change no Solidity). 158 test suites, 2913 passed / 0 failed / 0 skipped."
+      "notes": "Measured 2026-10-19 on forge 1.8.3 at c384fc98 (solc 0.8.36 from contracts/foundry.toml; OpenZeppelin submodules initialised at their pinned commits). 211 suites, 3191 passed / 0 failed / 0 skipped. Supersedes the 2913 / 158-suite figure measured at 3c256a59."
     },
     "rust_tests": {
       "scope": "citrate-chain",
       "value": {
-        "tests": 4379,
+        "tests": 4944,
         "doctests_included": false
       },
       "source_files": [
@@ -176,10 +181,10 @@
       ],
       "evidence_files": [],
       "reproduction_command": "cargo test --workspace -- --list 2>/dev/null | grep -c ': test'",
-      "count_method": "cargo test --workspace -- --list | grep -c ': test' (each ': test' line is one #[test]/#[tokio::test] case). The per-binary 'N tests' summary lines sum to the same 4379, cross-checking the count.",
-      "last_verified_at": "2026-09-24T02:37:00Z",
+      "count_method": "cargo test --workspace -- --list | grep -c ': test' (each ': test' line is one #[test]/#[tokio::test] case; exit 0). The per-binary 'N tests' summary lines sum to the same 4944, cross-checking the count. Listing compiles every test binary but runs none.",
+      "last_verified_at": "2026-10-19T01:05:04Z",
       "verification_status": "measured-here",
-      "notes": "4379 unit/integration test cases across the workspace, measured at 3c256a59; later commits change only a doc comment and one test assertion, so the count is unchanged (whole workspace compiled clean, exit 0). Doctests are NOT included (cargo --list does not enumerate them). Marketing surfaces have quoted 5,377 and 6,720 Rust tests; DO NOT copy those; 4379 is the measured figure. (Static grep of #[test]/#[tokio::test] annotations gives ~4,696, an upper-ish approximation that miscounts cfg-gated/macro-generated cases.)"
+      "notes": "4944 unit/integration test cases across the workspace members, listed at c384fc98 on 2026-10-19 (default features). This is an enumeration, not a pass count: the full suite was not run for this figure. Doctests are NOT included (cargo --list does not enumerate them). Supersedes 4379 (3c256a59). Marketing surfaces have quoted 5,377 and 6,720 Rust tests; DO NOT copy those."
     },
     "deployed_contracts": {
       "scope": "citrate-chain",
@@ -204,55 +209,81 @@
       ],
       "reproduction_command": "python3 verification/check_address_code.py --check  # read-only eth_getCode on every book entry; --offline validates the committed snapshot without network",
       "count_method": "contracts (91) + aaStack (7) = 98 gated book entries; eth_getCode at the probed block shows all 98 have code and 0 are codeless (this is the figure check_address_code.py --check gates on: with_code_on_chain == 98, codeless_in_book == 0). The address-code snapshot's with_code_count of 102 = these 98 + 2 genesis entries (ArachnidDeterministicDeployer, P256Verifier) + 2 top-level entries (CitrateMemberSBT, MembershipStakeVault — same names/addresses as in contracts), all of which have code. The governance section (GOVERNANCE + GUARDIAN, each a 2-of-3 MultisigTimelock2of3) is verified by the deploy-admin gate, not counted here. Codeless by design: 21 precompile addresses (VM precompiles, no bytecode). The planned.* coop block was removed (coop not deployed on the fresh-keys chain).",
-      "last_verified_at": "2026-09-30T02:15:56Z",
+      "last_verified_at": "2026-10-06T05:45:23Z",
       "verification_status": "verified",
-      "notes": "Regenerated for the 2026-10-05 r1005 fresh-keys reroll (genesis block 1dcfc490…, G = bf551422) from the on-chain deployer-tx ledger (contracts/addresses/40204.provenance.json). Probe at chain block 750: python3 verification/check_address_code.py --probe --rpc https://rpc.citrate.ai."
+      "notes": "Regenerated for the 2026-10-05 r1005 fresh-keys reroll (genesis block 1dcfc490…, G = bf551422) from the on-chain deployer-tx ledger (contracts/addresses/40204.provenance.json). last_verified_at is the committed snapshot's probed_at (verification/address-code.snapshot.json: chain block 750, 2026-10-06T05:45:23Z; it was previously dated 2026-09-30, before the reroll it describes). Probe: python3 verification/check_address_code.py --probe --rpc https://rpc.citrate.ai. Re-checked offline at c384fc98 on 2026-10-19 (check_address_code.py --offline: 98/98 have code); no live re-probe in that pass."
     },
     "precompiles": {
       "scope": "citrate-chain",
       "value": {
         "hosted_inference": "0x0100-0x0106",
+        "hosted_inference_bridged_to_contract_code": false,
+        "retired": [
+          "0x0104"
+        ],
         "verification": "0x0107-0x0109",
         "deterministic_q16_16_compute": "0x010A-0x010F",
         "learning": "0x0110-0x0111",
-        "recursive_fold_commd": "0x0130",
+        "agent_fork": [
+          "0x0112",
+          "0x0113",
+          "0x0121",
+          "0x0122"
+        ],
         "ed25519": "0x0120",
+        "recursive_fold_commd": "0x0130",
         "x402": "0x0200-0x0202",
+        "bridged_to_contract_code": 20,
         "listed_in_address_table": 21
       },
       "source_files": [
-        "core/execution/src/precompiles/mod.rs:139-154",
-        "core/execution/src/precompiles/inference.rs:19-35"
+        "core/execution/src/precompiles/mod.rs:154-171",
+        "core/execution/src/precompiles/mod.rs:180-185",
+        "core/execution/src/precompiles/mod.rs:214-231",
+        "core/execution/src/precompiles/inference.rs:19-44",
+        "core/execution/src/agent_fork.rs:60",
+        "core/execution/src/revm_adapter.rs:678-735",
+        "node/Cargo.toml:106-120"
       ],
       "evidence_files": [
         "contracts/addresses/40204.json",
         "core/execution/src/precompiles/"
       ],
-      "reproduction_command": "sed -n '80,160p' core/execution/src/precompiles/mod.rs; python3 -c \"import json;print(json.load(open('contracts/addresses/40204.json'))['precompiles'])\"",
-      "last_verified_at": "2026-09-24T02:37:00Z",
+      "reproduction_command": "sed -n '150,232p' core/execution/src/precompiles/mod.rs; sed -n '55,62p' core/execution/src/agent_fork.rs; python3 -c \"import json;print(json.load(open('contracts/addresses/40204.json'))['precompiles'])\"",
+      "last_verified_at": "2026-10-19T01:05:04Z",
       "verification_status": "reproducible-from-source",
-      "notes": "Canonical scheme (WP-B0): the EVM address IS the documented short name. ModelDeploy=0x0100, ModelInference=0x0101 per the dispatcher and 40204.json. FLAG: contracts/src/ModelRegistry.sol:17-18 hardcodes MODEL_PRECOMPILE=0x...1000 and ARTIFACT_PRECOMPILE=0x...1002, which DISAGREE with the canonical inference family (0x0100-0x0106). ModelRegistry's precompile calls therefore target 0x1000/0x1002, addresses outside the pure-precompile set and not present in 40204.json. Tracked as a discrepancy to reconcile."
+      "notes": "ERRATUM (2026-10-19): the precompile set is NOT '0x0100-0x010F'. Canonical scheme (WP-B0): the EVM address IS the short name. Exposed to contract code (REVM bridge, revm_adapter.rs:678-735): the 16 PURE_PRECOMPILE_ADDRESSES (0x0107-0x0109, 0x010A-0x010F, 0x0110-0x0111, 0x0120, 0x0130, 0x0200-0x0202; mod.rs:154-171) plus the 4 AGENT_FORK_PRECOMPILE_ADDRESSES 0x0112 LORA_APPLY, 0x0113 LORA_MERGE, 0x0121 MEMORY_ANCHOR_VERIFY, 0x0122 AGENT_OPS (mod.rs:180-185), live from genesis on 40204 (agent_fork.rs:60 pins Some(0)) = 20 addresses. The hosted-inference family 0x0100-0x0106 is NOT bridged: inside the precompile range it is a reserved, always-failing address set for contract code once pba_hardening_height is active (pinned to genesis on 40204; mod.rs:214-231). 0x0104 is RETIRED (inference.rs:34; always rejects; use the 0x0108 verifier). FEATURE-GATED: 0x0130's recursive-fold CommD verifier needs the commd-fold-verify feature, which is in citrate-node's DEFAULT feature set (node/Cargo.toml:106) but off by default in citrate-execution; without it the address fails closed. 0x0108's live Halo2-KZG verifier needs the halo2-verifier feature, which is NOT in the default node build, so 0x0108 fails closed with SubstrateAbsent on default builds. contracts/addresses/40204.json lists 21 addresses (0x0100-0x0103, 0x0105-0x0111, 0x0120, 0x0200-0x0202); it omits 0x0104 (retired), 0x0130 and the four agent-fork addresses."
     },
     "model_registry_precompile_flag": {
       "scope": "citrate-chain/contracts",
       "value": {
-        "model_registry_constant": "0x0000000000000000000000000000000000001000",
-        "artifact_constant": "0x0000000000000000000000000000000000001002",
+        "model_registry_constant": "0x0000000000000000000000000000000000000101",
+        "artifact_constant": null,
         "canonical_model_deploy": "0x0000000000000000000000000000000000000100",
         "canonical_model_inference": "0x0000000000000000000000000000000000000101",
-        "agrees": false
+        "agrees": true,
+        "removed_constants": [
+          "0x0000000000000000000000000000000000001000",
+          "0x0000000000000000000000000000000000001002"
+        ],
+        "resolved_in": "bf551422",
+        "inference_served_to_contract_code": false
       },
       "source_files": [
-        "contracts/src/ModelRegistry.sol:17-18"
+        "contracts/src/ModelRegistry.sol:11",
+        "contracts/src/ModelRegistry.sol:247-249",
+        "contracts/src/lib/CitratePrecompiles.sol:31-32",
+        "contracts/src/lib/CitratePrecompiles.sol:67-75"
       ],
       "evidence_files": [
-        "core/execution/src/precompiles/inference.rs:19-35",
+        "core/execution/src/precompiles/inference.rs:23-24",
+        "core/execution/src/precompiles/mod.rs:214-231",
         "contracts/addresses/40204.json"
       ],
-      "reproduction_command": "grep -n 'PRECOMPILE' contracts/src/ModelRegistry.sol",
-      "last_verified_at": "2026-09-24T02:37:00Z",
-      "verification_status": "measured-here",
-      "notes": "DISAGREEMENT CONFIRMED. ModelRegistry.sol calls address 0x1000 (=4096) / 0x1002, but the canonical model precompiles live at 0x0100/0x0101. 0x1000 is not a registered pure precompile in the dispatcher nor in 40204.json's precompiles table."
+      "reproduction_command": "grep -n 'CitratePrecompiles\\|0x1000\\|0x1002' contracts/src/ModelRegistry.sol; grep -n 'MODEL_INFERENCE' contracts/src/lib/CitratePrecompiles.sol",
+      "last_verified_at": "2026-10-19T01:05:04Z",
+      "verification_status": "reproducible-from-source",
+      "notes": "RESOLVED in bf551422 (reroll G, #292): ModelRegistry.sol no longer hard-codes 0x1000/0x1002; requestInference routes to 0x0101 MODEL_INFERENCE through CitratePrecompiles.modelInference, the canonical address in the dispatcher and in 40204.json. The address now agrees. Separately, 0x0101 is NOT served to contract code on 40204 (the inference family is a reserved, always-failing range for the REVM bridge; see precompiles), so the helper fails closed and ModelRegistry.requestInference reverts with PrecompileUnavailable (payment included): registration is an on-chain record only. Superseded value (2026-09-24): agrees=false with constants 0x1000/0x1002."
     },
     "network_tps": {
       "scope": "citrate-chain",
@@ -262,7 +293,7 @@
           "verification_status": "derived-from-config",
           "derivation": "block_gas_limit(30,000,000) / gas_per_simple_transfer(21,000) / measured_block_time(~2s) ~= 714, rounded to ~750 for simple transfers",
           "source_files": [
-            "core/sequencer/src/mempool.rs:179",
+            "core/sequencer/src/mempool.rs:181",
             "core/sequencer/src/block_builder.rs:74"
           ],
           "reproduction_command": "grep -n 'MAX_GAS_PER_BLOCK' core/sequencer/src/mempool.rs; python3 -c 'print(30_000_000/21000/2)'  # ~714; tools/citrate-bench can confirm the live figure once bench signers are funded (signs client-side via eth_sendRawTransaction)",
@@ -287,7 +318,7 @@
         }
       },
       "source_files": [
-        "core/sequencer/src/mempool.rs:179",
+        "core/sequencer/src/mempool.rs:181",
         "core/sequencer/src/block_builder.rs:74",
         "CLAUDE.md:165-171"
       ],
