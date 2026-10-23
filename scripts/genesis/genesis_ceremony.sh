@@ -880,9 +880,13 @@ fi
 # The checker derives the identity it checks from the book's .deployer, so every book (the
 # canonical one and each output) must name the deployer this run recorded in its manifest
 # at P0: stale books that agree with each other on another deployer are refused, not
-# checked. The merge also refuses an extra book that has no contracts or reuses a name
-# already in the merged book, so no entry is dropped or shadowed. --confirm needs all
-# three outputs; --simulate takes those present, governance always.
+# checked. The merge also refuses an extra book that has no contracts. A name repeated
+# across books (the dormant-ledger book lists GovernanceTimelock and GovernanceMultisig,
+# which governance.json also lists) is one contract only if every book gives it the same
+# address, compared case-insensitively; it is swept once. A repeat with another address
+# fails, naming both books, and so does a name that appears twice in one book (JSON would
+# keep only the last), so no entry is dropped or shadowed. --confirm needs all three
+# outputs; --simulate takes those present, governance always.
 if should P5; then
   P5_BOOK_REL="$OUT_REL/p5-admin-book.json"
   P5_BOOK="$CONTRACTS/$P5_BOOK_REL"
@@ -942,9 +946,16 @@ import json, re, sys
 ADDR = re.compile(r"0x[0-9a-fA-F]{40}")
 run_dep, main_path, out_path, extras = sys.argv[1].lower(), sys.argv[2], sys.argv[3], sys.argv[4:]
 def load(p):
+    def once(pairs):
+        d = {}
+        for k, v in pairs:
+            if k in d:
+                sys.exit(f"{p}: the key {k!r} appears more than once in one object")
+            d[k] = v
+        return d
     try:
         with open(p) as f:
-            d = json.load(f)
+            d = json.load(f, object_pairs_hook=once)
     except (OSError, ValueError) as e:
         sys.exit(f"cannot read {p}: {e}")
     if not isinstance(d, dict):
@@ -961,7 +972,11 @@ book.setdefault("aaStack", {})
 for sec in ("contracts", "aaStack"):
     if not isinstance(book[sec], dict):
         sys.exit(f"{main_path} .{sec} is not an object")
-taken = set(book["contracts"]) | set(book["aaStack"])
+# name -> (address, the book that first gave it)
+seen = {}
+for sec in ("aaStack", "contracts"):
+    for name, a in book[sec].items():
+        seen[name] = (a, main_path)
 for p in extras:
     d = load(p)
     xdep = d.get("deployer")
@@ -970,14 +985,19 @@ for p in extras:
     c = d.get("contracts")
     if not isinstance(c, dict) or not c:
         sys.exit(f"{p} has no contracts")
+    same = 0
     for name, a in c.items():
         if not isinstance(a, str) or not ADDR.fullmatch(a) or int(a, 16) == 0:
             sys.exit(f"{p} .contracts.{name} is not an address")
-        if name in taken:
-            sys.exit(f"{p} .contracts.{name} is already in the merged book")
-        taken.add(name)
+        if name in seen:
+            prev, src = seen[name]
+            if not isinstance(prev, str) or prev.lower() != a.lower():
+                sys.exit(f"{p} .contracts.{name} is {a}, but {src} already has {prev}: a repeated name must give the same address")
+            same += 1
+            continue
+        seen[name] = (a, p)
         book["contracts"][name] = a
-    print(f"{p}: {len(c)} contract(s)")
+    print(f"{p}: {len(c)} contract(s)" + (f", {same} already in the merged book at the same address" if same else ""))
 book["deployer"] = run_dep
 with open(out_path, "w") as f:
     json.dump(book, f, indent=2, sort_keys=True)
