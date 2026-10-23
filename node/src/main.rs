@@ -68,6 +68,7 @@ compile_error!(
 );
 mod contribution_recorder;
 mod dag_prune;
+mod finality_driver;
 mod genesis;
 mod hardening_rejoin;
 mod inference;
@@ -2061,6 +2062,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             committee_size: config.checkpoint.committee_size,
             quorum_threshold: config.checkpoint.quorum_threshold,
             chain_id: config.chain.chain_id,
+            vote_depth: config.checkpoint.vote_depth,
         };
         let kv = Arc::new(persistent_dag::RocksDbKvStore::new(storage.db.clone()));
         Arc::new(CheckpointManager::with_persistence(
@@ -2069,6 +2071,24 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             kv,
         ))
     };
+
+    // WP-S.3 Stage 1a: the checkpoint-finality producer path (propose / sign /
+    // broadcast / early-vote buffer / relay). Switched by the COMPILED pin for this
+    // chain (`checkpoint_gadget::CHECKPOINT_VOTING_PINS`, OFF for every chain in this
+    // release) — never by env or config. Committee source: the shared epoch-snapshot
+    // proposer selector (`validator_selector`, filled by registry_sync from
+    // `ValidatorRegistry.activeSet()` at each S(E)); `None` when no registry is
+    // configured, in which case no committee can be derived and nothing is proposed.
+    let finality_gadget = Arc::new(citrate_consensus::checkpoint_gadget::FinalityGadget::new(
+        checkpoint_manager.clone(),
+        validator_selector.clone(),
+    ));
+    let finality_voting_on = finality_gadget.enabled();
+    // Finalized height as OBSERVED (not enforced) while the producer path runs:
+    // backs the `finalized`/`safe` RPC tags without raising the reorg floor. Floor
+    // ENFORCEMENT needs the (height, hash) certificate check of spec §4.5 (Stage
+    // 1c); raising the floor on height alone could pin this node to a losing branch.
+    let finality_observed = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // EXECUTE-ON-RECEIVE (step 2): the fast-path applier. Active under v2 headers
     // (CITRATE_BLOCK_V2) — the flag that makes a block's state_root reproducible by a
@@ -2133,7 +2153,23 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // I4: keep the reorg floor in sync with BFT finality so a reorg can
             // never revert below a finalized checkpoint. Cheap poll (the applied
             // height advances ~1/s); the floor is monotonic in the checkpoint mgr.
-            let floor = app.finalized_height_handle();
+            //
+            // WP-S.3 Stage 1a: when the producer path is ON, checkpoints really
+            // finalize, and raising the floor on HEIGHT alone is exactly what spec
+            // §4.5 forbids (it must first check the certified hash is this node's
+            // canonical block). So with the switch ON the poll publishes into the
+            // OBSERVED handle only (RPC tags) and leaves the reorg floor at its
+            // value; hash-checked enforcement is Stage 1c. With the switch OFF this
+            // is the unchanged pre-Stage-1a poll (nothing can finalize then).
+            let floor = if finality_voting_on {
+                info!(
+                    "checkpoint finality: finalized height is OBSERVED only (RPC tags); reorg \
+                     floor enforcement awaits the §4.5 certificate check"
+                );
+                finality_observed.clone()
+            } else {
+                app.finalized_height_handle()
+            };
             let cp = checkpoint_manager.clone();
             tokio::spawn(async move {
                 // #310: Skip — no burst of floor polls after a stall.
@@ -3018,7 +3054,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // path (constructed at function scope above, alongside the genesis seed
         // and the startup reconcile).
         let admission_for_net = block_admission.clone();
-        let checkpoint_mgr_for_net = checkpoint_manager.clone();
+        // WP-S.3 Stage 1a: inbound votes go through the gadget, which (switch OFF)
+        // takes exactly the old submit_vote -> finalize path, or (switch ON) also
+        // buffers early votes and returns accepted votes for one re-gossip.
+        let finality_gadget_for_net = finality_gadget.clone();
         // #85: the success half of the sync-peer accounting (invariant I3) —
         // the tick task can only ever observe timeouts, so the peer that
         // actually answers has to be credited from the receive side.
@@ -3710,33 +3749,62 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             voter: PublicKey::new(voter_bytes),
                             signature: Signature::new(sig_bytes),
                         };
-                        match checkpoint_mgr_for_net.submit_vote(vote).await {
-                            Ok(true) => {
+                        use citrate_consensus::checkpoint_gadget::InboundOutcome;
+                        let outcome = finality_gadget_for_net.on_inbound_vote(vote).await;
+                        match &outcome {
+                            InboundOutcome::Finalized { height, votes, .. } => {
                                 tracing::info!(
                                     "Checkpoint quorum reached at height {}, finalizing",
                                     height
                                 );
-                                match checkpoint_mgr_for_net.finalize_checkpoint(height).await {
-                                    Ok(cp) => tracing::info!(
-                                        "Checkpoint finalized at height {} with {} votes",
-                                        cp.height,
-                                        cp.votes.len()
-                                    ),
-                                    Err(e) => tracing::warn!(
-                                        "Failed to finalize checkpoint at height {}: {}",
-                                        height,
-                                        e
-                                    ),
-                                }
+                                tracing::info!(
+                                    "Checkpoint finalized at height {} with {} votes",
+                                    height,
+                                    votes
+                                );
                             }
-                            Ok(false) => {
+                            InboundOutcome::FinalizeFailed { height, error, .. } => {
+                                tracing::info!(
+                                    "Checkpoint quorum reached at height {}, finalizing",
+                                    height
+                                );
+                                tracing::warn!(
+                                    "Failed to finalize checkpoint at height {}: {}",
+                                    height,
+                                    error
+                                );
+                            }
+                            InboundOutcome::Accepted { .. } => {
                                 tracing::debug!("Checkpoint vote accepted for height {}", height)
                             }
-                            Err(e) => tracing::warn!(
+                            InboundOutcome::Buffered => tracing::debug!(
+                                "Checkpoint vote for height {} buffered (not yet proposed here)",
+                                height
+                            ),
+                            // Switch ON: a duplicate is the routine echo of a relayed
+                            // vote — not worth a warning per peer.
+                            InboundOutcome::Rejected(
+                                citrate_consensus::CheckpointError::DuplicateVote(_),
+                            ) if finality_gadget_for_net.enabled() => tracing::debug!(
+                                "Checkpoint vote from peer {} already counted",
+                                pid.0
+                            ),
+                            InboundOutcome::Rejected(e) => tracing::warn!(
                                 "Checkpoint vote rejected from peer {}: {}",
                                 pid.0,
                                 e
                             ),
+                        }
+                        // §11.5 relay: re-gossip a vote this node accepted for the first
+                        // time. Duplicates are rejected above and never relayed, so a
+                        // vote crosses each node at most once (no loop). Never `Some`
+                        // with the switch OFF.
+                        if let Some(relay) = outcome.relay() {
+                            finality_driver::broadcast_votes(
+                                &pm_for_rx,
+                                std::slice::from_ref(relay),
+                            )
+                            .await;
                         }
                     }
                     _ => {
@@ -3954,9 +4022,31 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // the same `finalized_height` handle the canonical applicator exposes and
             // the 5 s finality poll keeps current. None (no applicator) => tags resolve
             // to genesis (block 0), never error.
-            canonical_applicator
-                .as_ref()
-                .map(|app| app.finalized_height_handle()),
+            // WP-S.3 Stage 1a: with the producer path ON the tags read the OBSERVED
+            // finalized height (the floor itself is not raised until Stage 1c).
+            canonical_applicator.as_ref().map(|app| {
+                if finality_voting_on {
+                    finality_observed.clone()
+                } else {
+                    app.finalized_height_handle()
+                }
+            }),
+            // UI truth contract §9: the identity this process computed at start-up.
+            // Version/git from the build stamp (node/build.rs), the consensus
+            // fingerprint from ConsensusManifest (after the PBA + agent-fork heights
+            // were published), the activation fingerprint from the resolved PBA
+            // activation, and the GhostDAG params the shared GhostDag runs with.
+            Some({
+                let manifest = consensus_manifest::ConsensusManifest::current();
+                citrate_api::NodeIdentity {
+                    version: manifest.version.to_string(),
+                    git_sha: manifest.git_sha.to_string(),
+                    git_dirty: manifest.git_dirty,
+                    activation_fingerprint: pba_activation.fingerprint(&manifest.fingerprint),
+                    consensus_fingerprint: manifest.fingerprint,
+                    ghostdag_params: Some(shared_ghostdag.params().clone()),
+                }
+            }),
         );
 
         // PIL-12: spawn the Ethereum-compatible subscription server next
@@ -4058,6 +4148,36 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     } else {
         None
     };
+
+    // WP-S.3 Stage 1a (spec D-4): the checkpoint vote signer is THIS consensus
+    // identity — the `proposer.key` loaded above, whose pubkey is the one registered
+    // in `ValidatorRegistry` and therefore the one `activeSet()` (the committee
+    // source) lists. No other key source exists or is introduced. A node without a
+    // coinbase has no consensus identity: it still proposes + aggregates, never signs.
+    // Spawned only when the compiled switch is ON for this chain.
+    if finality_voting_on {
+        match &canonical_applicator {
+            Some(app) => {
+                if validator_selector.is_none() {
+                    warn!(
+                        "checkpoint finality: producer path ON but no ValidatorRegistry is \
+                         configured — no committee can be derived, nothing will be proposed"
+                    );
+                }
+                finality_driver::spawn(
+                    finality_gadget.clone(),
+                    app.clone(),
+                    storage.clone(),
+                    peer_manager.clone(),
+                    proposer_signing_key.clone(),
+                );
+            }
+            None => warn!(
+                "checkpoint finality: producer path ON but execute-on-receive is disabled — \
+                 no canonical applied chain to bury checkpoints on; not started"
+            ),
+        }
+    }
 
     if config.mining.enabled && coinbase_is_valid {
         info!("Starting block producer...");

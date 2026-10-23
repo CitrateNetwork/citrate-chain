@@ -356,6 +356,14 @@ fn require_serviceable_finality_tag(
     }
 }
 
+/// `eth_feeHistory` reward row for a block with no transactions (or no stored
+/// block): one `0x0` per requested percentile, so every row has exactly
+/// `rewardPercentiles.len()` entries (execution-apis `eth_feeHistory`). It used
+/// to be a single `0x0` regardless of how many percentiles were asked for.
+pub fn zero_rewards(percentiles: usize) -> Vec<String> {
+    vec!["0x0".to_string(); percentiles]
+}
+
 /// Backwards-compatible entry point that wires the ETH RPC methods without a
 /// live finalized-height source (used by tests and any caller that does not yet
 /// have the canonical applicator's `finalized_height` handle). `finalized`/`safe`
@@ -1818,19 +1826,21 @@ pub fn register_eth_methods_with_finality(
                         }
                         rewards.push(block_rewards);
                     } else {
-                        rewards.push(vec!["0x0".to_string()]);
+                        // EIP-1559 / execution-apis: one reward per requested
+                        // percentile; an empty block's rewards are all zero.
+                        rewards.push(zero_rewards(percentiles.len()));
                     }
                 } else {
                     // Block not found, use defaults
                     base_fees.push("0x3b9aca00".to_string()); // 1 gwei
                     gas_used_ratios.push(0.0);
-                    rewards.push(vec!["0x0".to_string()]);
+                    rewards.push(zero_rewards(percentiles.len()));
                 }
             } else {
                 // No block at height, use defaults
                 base_fees.push("0x3b9aca00".to_string());
                 gas_used_ratios.push(0.0);
-                rewards.push(vec!["0x0".to_string()]);
+                rewards.push(zero_rewards(percentiles.len()));
             }
         }
 
@@ -2934,59 +2944,8 @@ pub fn register_eth_methods_with_finality(
         move |_params: Params| crate::canonical_logs::executed_head_json(&storage_exec_head),
     );
 
-    // citrate_getDagStats - Get DAG statistics including tips, height, and GhostDAG parameters
-    let storage_dag = storage.clone();
-    io_handler.add_sync_method("citrate_getDagStats", move |_params: Params| {
-        let api = ChainApi::new(storage_dag.clone());
-
-        // Get current tips
-        let tips = block_on(api.get_tips()).unwrap_or_default();
-
-        // Get current height
-        let height = block_on(api.get_height()).unwrap_or_default();
-
-        // Get blue score from the highest tip block
-        let mut blue_score = 0u64;
-        if let Some(tip_hash) = tips.first() {
-            if let Ok(block) =
-                block_on(api.get_block(crate::types::request::BlockId::Hash(*tip_hash)))
-            {
-                blue_score = block.blue_score;
-            }
-        }
-
-        // Use default GhostDAG params (network-wide constants)
-        let ghostdag_params = citrate_consensus::types::GhostDagParams::default();
-
-        // Convert tips to hex strings
-        let tips_hex: Vec<String> = tips
-            .iter()
-            .map(|h| format!("0x{}", hex::encode(h.as_bytes())))
-            .collect();
-
-        // For total/blue/red counts, we use height as approximation
-        // In a DAG, most blocks are blue (honest), so we estimate ~95% blue
-        let total_blocks = height;
-        let blue_blocks = (height as f64 * 0.95) as u64;
-        let red_blocks = total_blocks.saturating_sub(blue_blocks);
-
-        Ok(json!({
-            "totalBlocks": total_blocks,
-            "blueBlocks": blue_blocks,
-            "redBlocks": red_blocks,
-            "tipsCount": tips.len(),
-            "maxBlueScore": blue_score,
-            "currentTips": tips_hex,
-            "height": height,
-            "ghostdagParams": {
-                "k": ghostdag_params.k,
-                "maxParents": ghostdag_params.max_parents,
-                "maxBlueScoreDiff": ghostdag_params.max_blue_score_diff,
-                "pruningWindow": ghostdag_params.pruning_window,
-                "finalityDepth": ghostdag_params.finality_depth
-            }
-        }))
-    });
+    // citrate_getDagStats is registered by `crate::node_rpc::register_node_methods`
+    // (it reports the running GhostDAG parameters, which the node supplies).
 
     // citrate_emergencyPause - Pause block production
     // SECREM-01 API-1: these methods authenticate INSIDE the handler via
