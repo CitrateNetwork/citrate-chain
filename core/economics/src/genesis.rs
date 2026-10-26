@@ -149,6 +149,7 @@ fn account(address: Address, balance_latt: u64) -> GenesisAccount {
         balance: latt_to_wei(balance_latt),
         nonce: 0,
         code: None,
+        storage: vec![],
     }
 }
 
@@ -207,6 +208,7 @@ fn arachnid_deterministic_deployer_account() -> GenesisAccount {
         // of the canonical pre-EIP-155 tx" — nonce 1 is post-deploy.
         nonce: 1,
         code: Some(ARACHNID_DETERMINISTIC_DEPLOYER_BYTECODE.to_vec()),
+        storage: vec![],
     }
 }
 
@@ -274,6 +276,11 @@ pub struct GenesisAccount {
     pub balance: U256,
     pub nonce: u64,
     pub code: Option<Vec<u8>>,
+    /// Contract storage at genesis, as (32-byte slot, 32-byte value) pairs. Zero
+    /// values are not stored. Empty for every account except those taken from a
+    /// ceremony state dump (the `r1006` profile).
+    #[serde(default)]
+    pub storage: Vec<([u8; 32], [u8; 32])>,
 }
 
 /// Genesis configuration
@@ -359,6 +366,7 @@ impl GenesisConfig {
                     balance: latt_to_wei(100_000_000),
                     nonce: 0,
                     code: None,
+                    storage: vec![],
                 },
                 // Ecosystem fund
                 GenesisAccount {
@@ -366,6 +374,7 @@ impl GenesisConfig {
                     balance: latt_to_wei(250_000_000),
                     nonce: 0,
                     code: None,
+                    storage: vec![],
                 },
                 // Arachnid deterministic CREATE2 deployer — required for the
                 // ERC-4337 bundler to boot on mainnet.
@@ -450,6 +459,7 @@ impl GenesisConfig {
                 balance: latt_to_wei(10_000_000),
                 nonce: 0,
                 code: None,
+                storage: vec![],
             },
             // Treasury (100M SALT for governance and ecosystem development)
             GenesisAccount {
@@ -457,6 +467,7 @@ impl GenesisConfig {
                 balance: latt_to_wei(100_000_000),
                 nonce: 0,
                 code: None,
+                storage: vec![],
             },
             // Ecosystem fund (50M SALT — reduced vs beta since validators get direct funding)
             GenesisAccount {
@@ -464,6 +475,7 @@ impl GenesisConfig {
                 balance: latt_to_wei(50_000_000),
                 nonce: 0,
                 code: None,
+                storage: vec![],
             },
         ];
 
@@ -476,6 +488,7 @@ impl GenesisConfig {
                 balance: latt_to_wei(100_000),
                 nonce: 0,
                 code: None,
+                storage: vec![],
             });
         }
 
@@ -487,6 +500,7 @@ impl GenesisConfig {
             balance: latt_to_wei(1_000_000),
             nonce: 0,
             code: None,
+            storage: vec![],
         });
 
         // Larry's deployer wallet (0x9f5B156C53305D4b20c94ca08E3219D1C0e7401a)
@@ -496,6 +510,7 @@ impl GenesisConfig {
             balance: latt_to_wei(5_000_000),
             nonce: 0,
             code: None,
+            storage: vec![],
         });
 
         // Faucet signing key account (fresh DGX key, FAUCET_PRIVATE_KEY).
@@ -505,6 +520,7 @@ impl GenesisConfig {
             balance: latt_to_wei(10_000_000),
             nonce: 0,
             code: None,
+            storage: vec![],
         });
 
         // Arachnid deterministic CREATE2 deployer — required for the
@@ -969,6 +985,7 @@ mod tests {
             balance: latt_to_wei(999_999_999_999), // This + existing ~360M > 1T with mining_pool_max
             nonce: 0,
             code: None,
+            storage: vec![],
         });
         assert!(matches!(
             config.validate(),
@@ -986,6 +1003,7 @@ mod tests {
             balance: U256::from(1),
             nonce: 0,
             code: None,
+            storage: vec![],
         });
         assert!(matches!(
             config.validate(),
@@ -1073,6 +1091,52 @@ mod tests {
         );
         assert_eq!(executor_with.state_db().all_models().len(), 1);
         assert_eq!(executor_without.state_db().all_models().len(), 0);
+    }
+
+    /// A ceremony state dump carries contract storage. Genesis must write every
+    /// slot, and the state root must commit to it (two allocs that differ only in
+    /// one slot give two genesis hashes).
+    #[test]
+    fn genesis_storage_is_applied_and_enters_the_state_root() {
+        use citrate_execution::state::state_db::StateDB;
+
+        let contract = Address([0xC1; 20]);
+        let mut slot = [0u8; 32];
+        slot[31] = 7;
+        let mut value = [0u8; 32];
+        value[0] = 0xAB;
+        value[31] = 0x01;
+        let with = |storage: Vec<([u8; 32], [u8; 32])>| GenesisConfig {
+            chain_id: 40204,
+            accounts: vec![GenesisAccount {
+                address: contract,
+                balance: U256::zero(),
+                nonce: 1,
+                code: Some(vec![0x60, 0x00]),
+                storage,
+            }],
+            treasury_address: TESTNET_TREASURY_ADDRESS,
+            team_allocations: HashMap::new(),
+            ecosystem_fund: TESTNET_ECOSYSTEM_ADDRESS,
+            mining_pool_max: latt_to_wei(1),
+        };
+        let run = |c: &GenesisConfig| {
+            let ex = Arc::new(Executor::with_chain_id(Arc::new(StateDB::new()), 40204));
+            let root = initialize_shared_genesis_state(&ex, c).expect("valid genesis");
+            (ex, root)
+        };
+        let (ex, root_with) = run(&with(vec![(slot, value)]));
+        assert_eq!(
+            ex.state_db().get_storage(&contract, &slot),
+            Some(value.to_vec()),
+            "the slot from the alloc is in the genesis state"
+        );
+        let (_, root_without) = run(&with(vec![]));
+        assert_ne!(root_with, root_without, "storage enters the state root");
+        let mut other = value;
+        other[31] = 0x02;
+        let (_, root_other) = run(&with(vec![(slot, other)]));
+        assert_ne!(root_with, root_other, "a changed value moves the root");
     }
 
     #[test]
@@ -1189,6 +1253,7 @@ mod tests {
             balance: U256::MAX,
             nonce: 0,
             code: None,
+            storage: vec![],
         });
         assert!(cfg.total_preallocation().is_none(), "sum overflows U256");
         assert!(matches!(cfg.validate(), Err(GenesisError::ExceedsSupply)));
@@ -1212,6 +1277,7 @@ mod tests {
                 balance: U256::zero(),
                 nonce: 0,
                 code: None,
+                storage: vec![],
             }],
             treasury_address: Address([0x11; 20]),
             team_allocations: HashMap::new(),
