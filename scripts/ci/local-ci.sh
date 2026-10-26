@@ -34,7 +34,7 @@ while [ $# -gt 0 ]; do
     --fast) FAST=1; shift ;;
     --no-forge) NO_FORGE=1; shift ;;
     --list)
-      echo "gates: fmt-changed, clippy, panic-ratchet, consensus-tripwires, test-workspace, forge-build, forge-test"
+      echo "gates: fmt-changed, clippy, panic-ratchet, consensus-tripwires, test-workspace, test-commd, forge-build, forge-test"
       exit 0 ;;
     -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 1 ;;
@@ -153,6 +153,7 @@ consensus_tripwires() {
     "scripts/ci/panic_invariant_tripwire.sh" \
     "scripts/ci/double_lock_tripwire.sh" \
     "scripts/ci/prod_assert_ratchet.sh" \
+    "scripts/ci/excluded_workspace_ci_tripwire.sh" \
   ; do
     if [ ! -x "$t" ]; then
       echo "missing/!executable tripwire: $t"; rc=1; continue
@@ -172,6 +173,7 @@ gate "consensus-tripwires" consensus_tripwires
 
 if [ "$FAST" -eq 1 ]; then
   skip "test-workspace" "--fast"
+  skip "test-commd" "--fast"
   skip "forge-build" "--fast"
   skip "forge-test" "--fast"
 else
@@ -207,6 +209,10 @@ else
   else
     gate "test-workspace" test_workspace
   fi
+
+  # ── gate: commd fold/verify workspaces (mirrors rust-ci.yml commd-workspaces)
+  # Own Cargo workspaces, so test-workspace above never reaches them.
+  gate "test-commd" bash -c "'$REPO_ROOT/scripts/ci/test_commd_workspaces.sh' --self-test && '$REPO_ROOT/scripts/ci/test_commd_workspaces.sh'"
 
   # ── gates: solidity ──────────────────────────────────────────────────────
   if [ "$NO_FORGE" -eq 1 ]; then
