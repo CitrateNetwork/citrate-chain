@@ -93,6 +93,28 @@ os_fixture "$GOV" "0x000000000000000000000000${GOV#0x}" >"$T/os-ok.json"
 expect "control: OrangeSeed bound to governance reaches the code-hash pin (and a fixture's code is refused there)" 1 'code hash is not the pinned' -- \
   "${EA[@]}" --orangeseed "$T/os-ok.json" --governance-book "$T/gov.json" --out "$T/x.json"
 
+# ------------------------------------------------------------ no deployer / factory left in block 0
+# A storage word holding the ceremony deployer (left-padded, or packed beside other fields)
+# or the CREATE2 factory, in ANY kept account, is refused; so is the deployer in runtime code.
+mkd() { # mkd OUT WORD: the fixture dump with one extra slot on account c1
+  jq --arg w "$2" '.accounts[0].storage["0x00000000000000000000000000000000000000000000000000000000000000aa"] = $w' "$T/dump.json" >"$1"
+}
+mkd "$T/d-pad.json" "0x000000000000000000000000${DEP#0x}"
+expect "emit_alloc refuses the deployer left-padded in a storage word" 1 'storage .* holds the ceremony deployer' -- \
+  python3 "$HERE/emit_alloc.py" --dump "$T/d-pad.json" --manifest "$T/manifest.json" --inputs "$T/inputs.env" --book "$T/book40204.json" --out "$T/x.json"
+mkd "$T/d-pack.json" "0x00000001${DEP#0x}0000000000000001"
+expect "emit_alloc refuses the deployer packed in a storage word" 1 'storage .* holds the ceremony deployer' -- \
+  python3 "$HERE/emit_alloc.py" --dump "$T/d-pack.json" --manifest "$T/manifest.json" --inputs "$T/inputs.env" --book "$T/book40204.json" --out "$T/x.json"
+mkd "$T/d-fac.json" "0x0000000000000000000000004e59b44847b379578588920ca78fbf26c0b4956c"
+expect "emit_alloc refuses the CREATE2 factory in a storage word" 1 'storage .* holds the CREATE2 factory' -- \
+  python3 "$HERE/emit_alloc.py" --dump "$T/d-fac.json" --manifest "$T/manifest.json" --inputs "$T/inputs.env" --book "$T/book40204.json" --out "$T/x.json"
+jq --arg c "0x7300${DEP#0x}00" '.accounts[0].code = $c' "$T/dump.json" >"$T/d-code.json"
+expect "emit_alloc refuses the deployer embedded in runtime code" 1 'code holds the ceremony deployer' -- \
+  python3 "$HERE/emit_alloc.py" --dump "$T/d-code.json" --manifest "$T/manifest.json" --inputs "$T/inputs.env" --book "$T/book40204.json" --out "$T/x.json"
+mkd "$T/d-ok.json" "0x000000000000000000000000${DEP:4}00"
+expect "control: a word that merely overlaps the deployer's bytes off-boundary passes" 0 'alloc:' -- \
+  python3 "$HERE/emit_alloc.py" --dump "$T/d-ok.json" --manifest "$T/manifest.json" --inputs "$T/inputs.env" --book "$T/book40204.json" --out "$T/x.json"
+
 # ------------------------------------------------------------ fill_producers (input checks)
 python3 - "$T" <<'PY'
 import json, sys
