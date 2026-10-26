@@ -23,6 +23,76 @@ use sha2::{Digest, Sha256};
 use crate::registry_sync::{EPOCH, SNAPSHOT_LAG};
 use citrate_execution::block_rewards::CANONICAL_BASE_FEE_PER_GAS;
 
+/// Every value the consensus fingerprint is computed from. The fingerprint is a
+/// pure function of these fields (see [`fingerprint_preimage`]), so tests can vary
+/// one input at a time, including the compile-time feature flags.
+#[derive(Debug, Clone, Copy)]
+pub struct FingerprintInputs<'a> {
+    pub git_sha: &'a str,
+    pub feat_halo2_verifier: bool,
+    /// Rendered as the 0x0130 mode: `gated` when compiled in, else `absent`.
+    pub feat_commd_fold_verify: bool,
+    pub activation_gated: &'a [&'a str],
+    pub pba_hardening_height: Option<u64>,
+    pub agent_precompiles_height: Option<u64>,
+    pub value_transfer_activation_height: u64,
+    pub create_nonce_fix_activation_height: u64,
+    pub merge_depth_activation_height: u64,
+    pub canonical_base_fee_per_gas: u64,
+    pub epoch: u64,
+    pub snapshot_lag: u64,
+}
+
+/// Canonical, order-stable pre-image of the consensus-affecting surface.
+/// Deliberately EXCLUDES build_target (arch must not change consensus) and
+/// git_dirty (provenance, surfaced separately as a hard blocker).
+///
+/// v2 pre-image: v1's fields, with 0x0130 reported as activation-gated and the
+/// gated rule set listed, so a diff against a v1 (fleet) manifest shows exactly
+/// which differences wait for the height. Changing this text changes every
+/// fingerprint: `fingerprint_golden_vector_is_pinned` fails until it is updated
+/// on purpose.
+pub fn fingerprint_preimage(i: &FingerprintInputs<'_>) -> String {
+    let commd_mode = if i.feat_commd_fold_verify {
+        "gated"
+    } else {
+        "absent"
+    };
+    let preimage = format!(
+        "citrate-consensus-v3\ngit_sha={}\nhalo2_verifier={}\n\
+         commd_fold_verify={commd_mode}\nactivation_gated={}\n\
+         pba_hardening_height={}\n\
+         value_transfer_height={}\n\
+         create_nonce_fix_height={}\n\
+         merge_depth_height={}\n\
+         base_fee={}\nepoch={}\nsnapshot_lag={}\n",
+        i.git_sha,
+        i.feat_halo2_verifier,
+        i.activation_gated.join("|"),
+        i.pba_hardening_height
+            .map(|h| h.to_string())
+            .unwrap_or_else(|| "unset".to_string()),
+        i.value_transfer_activation_height,
+        i.create_nonce_fix_activation_height,
+        i.merge_depth_activation_height,
+        i.canonical_base_fee_per_gas,
+        i.epoch,
+        i.snapshot_lag,
+    );
+    // HUP-S7.2: appended only when scheduled, so an unset fork keeps the
+    // pre-image (and the fingerprint) byte-identical to the previous form.
+    match i.agent_precompiles_height {
+        Some(h) => format!("{preimage}agent_precompiles_height={h}\n"),
+        None => preimage,
+    }
+}
+
+/// `0x` + the first 16 bytes of sha256 over [`fingerprint_preimage`].
+pub fn fingerprint_of(i: &FingerprintInputs<'_>) -> String {
+    let digest = Sha256::digest(fingerprint_preimage(i).as_bytes());
+    format!("0x{}", hex::encode(digest.get(..16).unwrap_or(&digest)))
+}
+
 /// The compile-time consensus surface of this binary.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConsensusManifest {
@@ -111,46 +181,29 @@ impl ConsensusManifest {
         let feat_commd_fold_verify = env!("CITRATE_FEAT_COMMD_FOLD") == "1"
             || citrate_execution::build_features::COMMD_FOLD_VERIFY;
 
-        // Canonical, order-stable pre-image of the consensus-affecting surface.
-        // Deliberately EXCLUDES build_target (arch must not change consensus) and
-        // git_dirty (provenance, surfaced separately as a hard blocker).
+        // The pre-image is built by `fingerprint_preimage` from these values only.
         let activation_gated: Vec<&'static str> =
             citrate_execution::build_features::ACTIVATION_GATED.to_vec();
-        // v2 pre-image: v1's fields, with 0x0130 reported as activation-gated
-        // and the gated rule set listed, so a diff against a v1 (fleet)
-        // manifest shows exactly which differences wait for the height.
         let value_transfer_activation_height =
             citrate_execution::executor::value_transfer_activation_height();
         let create_nonce_fix_activation_height =
             citrate_execution::executor::create_nonce_fix_activation_height();
         let merge_depth_activation_height =
             citrate_consensus::ghostdag::merge_depth_activation_height();
-        let commd_mode = if feat_commd_fold_verify {
-            "gated"
-        } else {
-            "absent"
-        };
-        let preimage = format!(
-            "citrate-consensus-v3\ngit_sha={git_sha}\nhalo2_verifier={feat_halo2_verifier}\n\
-             commd_fold_verify={commd_mode}\nactivation_gated={}\n\
-             pba_hardening_height={}\n\
-             value_transfer_height={value_transfer_activation_height}\n\
-             create_nonce_fix_height={create_nonce_fix_activation_height}\n\
-             merge_depth_height={merge_depth_activation_height}\n\
-             base_fee={CANONICAL_BASE_FEE_PER_GAS}\nepoch={EPOCH}\nsnapshot_lag={SNAPSHOT_LAG}\n",
-            activation_gated.join("|"),
-            pba_hardening_height
-                .map(|h| h.to_string())
-                .unwrap_or_else(|| "unset".to_string()),
-        );
-        // HUP-S7.2: appended only when scheduled, so an unset fork keeps the
-        // pre-image (and the fingerprint) byte-identical to the previous form.
-        let preimage = match agent_precompiles_height {
-            Some(h) => format!("{preimage}agent_precompiles_height={h}\n"),
-            None => preimage,
-        };
-        let digest = Sha256::digest(preimage.as_bytes());
-        let fingerprint = format!("0x{}", hex::encode(digest.get(..16).unwrap_or(&digest)));
+        let fingerprint = fingerprint_of(&FingerprintInputs {
+            git_sha,
+            feat_halo2_verifier,
+            feat_commd_fold_verify,
+            activation_gated: &activation_gated,
+            pba_hardening_height,
+            agent_precompiles_height,
+            value_transfer_activation_height,
+            create_nonce_fix_activation_height,
+            merge_depth_activation_height,
+            canonical_base_fee_per_gas: CANONICAL_BASE_FEE_PER_GAS,
+            epoch: EPOCH,
+            snapshot_lag: SNAPSHOT_LAG,
+        });
 
         Self {
             version,
