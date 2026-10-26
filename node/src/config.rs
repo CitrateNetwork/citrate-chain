@@ -900,7 +900,7 @@ mod tests {
         for ctor in [
             "GhostDag::new(",
             "Executor::with_storage_and_chain_id(",
-            "ConsensusManifest::for_height(",
+            "ConsensusManifest::for_node(",
         ] {
             let at = body
                 .find(ctor)
@@ -942,7 +942,7 @@ mod tests {
         for ctor in [
             "GhostDag::new(",
             "Executor::with_storage_and_chain_id(",
-            "ConsensusManifest::for_height(",
+            "ConsensusManifest::for_node(",
         ] {
             let at = body
                 .find(ctor)
@@ -980,7 +980,7 @@ mod tests {
         for ctor in [
             "GhostDag::new(",
             "Executor::with_storage_and_chain_id(",
-            "ConsensusManifest::for_height(",
+            "ConsensusManifest::for_node(",
         ] {
             let at = body
                 .find(ctor)
@@ -1049,7 +1049,7 @@ mod tests {
         for marker in [
             "GhostDag::new(",
             "Executor::with_storage_and_chain_id(",
-            "ConsensusManifest::for_height(",
+            "ConsensusManifest::for_node(",
             "storage.state.get_all_storage()",
         ] {
             let at = body
@@ -1125,7 +1125,7 @@ mod tests {
         let init = body
             .find("citrate_consensus::vrf_encoding::init_for_genesis(")
             .expect("start_node must publish the canonical VRF encoding height");
-        for ctor in ["DagStore::", "ConsensusManifest::for_height("] {
+        for ctor in ["DagStore::", "ConsensusManifest::for_node("] {
             let at = body
                 .find(ctor)
                 .unwrap_or_else(|| panic!("{ctor} in start_node"));

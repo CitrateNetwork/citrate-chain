@@ -268,20 +268,6 @@ impl ConsensusManifest {
         )
     }
 
-    /// Explicit PBA, agent-fork and canonical-VRF heights (chain#384).
-    pub fn for_all_heights(
-        pba_hardening_height: Option<u64>,
-        agent_precompiles_height: Option<u64>,
-        vrf_canonical_encoding_height: Option<u64>,
-    ) -> Self {
-        Self::for_every_height(
-            pba_hardening_height,
-            agent_precompiles_height,
-            citrate_execution::exact_code::exact_create_code_height(),
-            vrf_canonical_encoding_height,
-        )
-    }
-
     /// Explicit PBA, agent-fork and exact-created-code heights.
     pub fn for_activations(
         pba_hardening_height: Option<u64>,
@@ -388,6 +374,17 @@ impl ConsensusManifest {
             genesis_hash: None,
             genesis_rules: None,
             fingerprint,
+        }
+    }
+
+    /// THE manifest a node reports, in its boot log, its node-identity RPC and
+    /// `citrate consensus`: every height from its process store (published at start-up),
+    /// bound (v4) to the genesis the node runs when that is known.
+    pub fn for_node(profile: Option<&str>, genesis: Option<&[u8; 32]>) -> Self {
+        let m = Self::current();
+        match genesis {
+            Some(g) => m.bound(profile.unwrap_or("-"), g),
+            None => m,
         }
     }
 
@@ -937,6 +934,40 @@ mod tests {
         assert_eq!(a.vrf_canonical_encoding_height, Some(0));
         assert_ne!(a.fingerprint, unset.fingerprint);
         assert_ne!(a.fingerprint, b.fingerprint);
+    }
+
+    /// The boot log, the node-identity RPC and `citrate consensus` report ONE fingerprint:
+    /// all three take it from `for_node`, and nothing else in those paths builds one.
+    #[test]
+    fn boot_log_identity_rpc_and_consensus_command_share_one_fingerprint() {
+        let main = include_str!("main.rs");
+        let start = main.find("async fn start_node(").expect("start_node");
+        let body = &main[start..];
+        let end = body.find("\nasync fn ").unwrap_or(body.len());
+        let body = &body[..end];
+        assert_eq!(
+            body.matches("ConsensusManifest::for_node(").count(),
+            2,
+            "start_node: the boot stamp and the identity fallback, both for_node"
+        );
+        assert!(body.contains("let manifest = node_manifest.clone()"), "the RPC reuses the boot manifest");
+        for other in ["ConsensusManifest::current()", "ConsensusManifest::for_height(", "ConsensusManifest::for_all("] {
+            assert!(!body.contains(other), "start_node builds a second manifest via {other}");
+        }
+        let cmd = &main[main.find("Some(Commands::Consensus { json })").expect("consensus cmd")..];
+        let cmd = &cmd[..cmd.find("return Ok(());").expect("end")];
+        assert!(cmd.contains("ConsensusManifest::for_node("), "citrate consensus uses for_node");
+        assert!(!cmd.contains("ConsensusManifest::for_all("));
+        // for_node is the current manifest, bound to the genesis exactly as bound() does.
+        let g = [7u8; 32];
+        assert_eq!(
+            ConsensusManifest::for_node(Some("r1006"), Some(&g)).fingerprint,
+            ConsensusManifest::current().bound("r1006", &g).fingerprint
+        );
+        assert_eq!(
+            ConsensusManifest::for_node(None, None).fingerprint,
+            ConsensusManifest::current().fingerprint
+        );
     }
 
     #[test]

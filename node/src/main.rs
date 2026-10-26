@@ -499,46 +499,39 @@ async fn main() -> Result<()> {
                 None => (40204, None, false, None, None, None, None),
             };
             let chain_id = cli.chain_id.unwrap_or(cfg_chain_id);
-            let resolved = citrate_consensus::hardening::resolve_pba_hardening_for_chain(
+            // The genesis this node runs: the data directory's block 0 when it can be read
+            // (not while the node holds the database), else the compiled r1006 genesis for
+            // an r1006 config, else unknown (a release chain id then resolves as its
+            // release genesis, every rule unset).
+            let profile = file_cfg
+                .as_ref()
+                .and_then(|c| c.chain.genesis_profile.clone());
+            let from_data_dir: Option<[u8; 32]> = file_cfg.as_ref().and_then(|c| {
+                StorageManager::new(&c.storage.data_dir, PruningConfig::default())
+                    .ok()
+                    .and_then(|st| st.blocks.get_block_by_height(0).ok().flatten())
+                    .map(|h| *h.as_bytes())
+            });
+            let cmd_genesis: Option<[u8; 32]> = from_data_dir.or_else(|| {
+                (profile.as_deref() == Some(genesis::R1006_PROFILE))
+                    .then_some(citrate_consensus::hardening::R1006_GENESIS)
+            });
+            let g = cmd_genesis.as_ref();
+            // Publish every height exactly as start_node does, then report the ONE
+            // manifest a node reports (ConsensusManifest::for_node).
+            let acts = g.and_then(|g| citrate_consensus::hardening::rules_for_genesis(chain_id, g));
+            citrate_consensus::hardening::init_pba_hardening_for_genesis(
                 chain_id,
+                acts.as_ref(),
                 configured,
                 dev_profile,
             )
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let (agent_height, _) =
-                citrate_execution::agent_fork::resolve_for_chain(chain_id, agent_configured)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-            // Every genesis-keyed rule resolves like start_node. No data directory is
-            // read here: an r1006 config binds the compiled r1006 genesis; otherwise no
-            // genesis is known (a release chain id then resolves as its release genesis).
-            let r1006 = file_cfg
-                .as_ref()
-                .and_then(|c| c.chain.genesis_profile.as_deref())
-                == Some(genesis::R1006_PROFILE);
-            let cmd_genesis: Option<[u8; 32]> =
-                r1006.then_some(citrate_consensus::hardening::R1006_GENESIS);
-            let g = cmd_genesis.as_ref();
-            let pba_height = match g.and_then(|g| {
-                citrate_consensus::hardening::rules_for_genesis(chain_id, g)
-            }) {
-                Some(a) => {
-                    citrate_consensus::hardening::resolve_activation(
-                        a.pba_hardening,
-                        std::env::var(citrate_consensus::hardening::PBA_HARDENING_ENV)
-                            .ok()
-                            .as_deref(),
-                        configured,
-                        false,
-                    )
-                    .map_err(|e| anyhow::anyhow!("{}", e))?
-                    .0
-                }
-                None => resolved.height,
-            };
-            let (exact_height, _) =
-                citrate_execution::exact_code::resolve_for_genesis(chain_id, g, exact_configured)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let (vrf_height, _) = citrate_consensus::vrf_encoding::resolve_for_genesis(
+            citrate_execution::agent_fork::init_for_chain(chain_id, agent_configured)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            citrate_execution::exact_code::init_for_genesis(chain_id, g, exact_configured)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            citrate_consensus::vrf_encoding::init_for_genesis(
                 chain_id,
                 g,
                 file_cfg
@@ -546,31 +539,15 @@ async fn main() -> Result<()> {
                     .and_then(|c| c.chain.vrf_canonical_encoding_height),
             )
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let (supply_height, _) = citrate_execution::supply_hardening::resolve_for_genesis(
+            citrate_execution::supply_hardening::init_for_genesis(chain_id, g, supply_configured)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            citrate_execution::storage_root_hardening::init_for_genesis(
                 chain_id,
                 g,
-                supply_configured,
+                storage_root_configured,
             )
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let (storage_root_height, _) =
-                citrate_execution::storage_root_hardening::resolve_for_genesis(
-                    chain_id,
-                    g,
-                    storage_root_configured,
-                )
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let manifest = consensus_manifest::ConsensusManifest::for_all(
-                pba_height,
-                agent_height,
-                exact_height,
-                vrf_height,
-                supply_height,
-                storage_root_height,
-            );
-            let manifest = match &cmd_genesis {
-                Some(g) => manifest.bound(genesis::R1006_PROFILE, g),
-                None => manifest,
-            };
+            let manifest = consensus_manifest::ConsensusManifest::for_node(profile.as_deref(), g);
             // The activation heights compiled into this release (a node on a
             // pinned chain runs that height; see the start-up banner for the
             // height a configured node resolved).
@@ -1636,32 +1613,6 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         ),
     }
 
-    {
-        // Consensus-alignment stamp — logged at boot so field drift is diagnosable
-        // from the journal (the app node and fleet MUST share this fingerprint).
-        // The fingerprint covers the activation height this node will run
-        // with (release pin for the chain, env override, [chain] key).
-        let m = consensus_manifest::ConsensusManifest::for_height(
-            citrate_consensus::hardening::resolve_pba_hardening_for_chain(
-                config.chain.chain_id,
-                config.chain.pba_hardening_height,
-                config.chain.dev_profile,
-            )
-            .ok()
-            .and_then(|r| r.height),
-        );
-        info!(
-            "Consensus manifest: git={}{} halo2={} pba_hardening_height={:?} fingerprint={}",
-            m.git_sha,
-            if m.git_dirty { "(DIRTY)" } else { "" },
-            m.feat_halo2_verifier,
-            m.pba_hardening_height,
-            m.fingerprint
-        );
-        if m.git_dirty {
-            warn!("Node built from a DIRTY tree — not reproducibly aligned with the fleet");
-        }
-    }
     info!("Chain ID: {}", config.chain.chain_id);
     info!("Data directory: {:?}", config.storage.data_dir);
 
@@ -1678,6 +1629,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         std::env::var("CITRATE_CHAIN_ID").ok().as_deref(),
     )
     .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let node_manifest: Option<consensus_manifest::ConsensusManifest>;
     let pba_activation = {
         // ONE store, ONE resolution order (release pin for the chain, then
         // env override, then [chain] key): consensus, network and execution
@@ -1689,12 +1641,26 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             config.chain.dev_profile,
         )
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-        let manifest = consensus_manifest::ConsensusManifest::current();
-        let manifest = match (running_genesis, config.chain.genesis_profile.as_deref()) {
-            (Some(g), profile) => manifest.bound(profile.unwrap_or("-"), &g),
-            (None, _) => manifest,
-        };
-        let fp = manifest.fingerprint;
+        // Consensus-alignment stamp. ONE manifest for the boot log, the node-identity RPC
+        // and `citrate consensus` (ConsensusManifest::for_node): every height is read from
+        // its process store, all published above, and it is bound to the loaded genesis.
+        let manifest = consensus_manifest::ConsensusManifest::for_node(
+            config.chain.genesis_profile.as_deref(),
+            running_genesis.as_ref(),
+        );
+        info!(
+            "Consensus manifest: git={}{} halo2={} pba_hardening_height={:?} fingerprint={}",
+            manifest.git_sha,
+            if manifest.git_dirty { "(DIRTY)" } else { "" },
+            manifest.feat_halo2_verifier,
+            manifest.pba_hardening_height,
+            manifest.fingerprint
+        );
+        if manifest.git_dirty {
+            warn!("Node built from a DIRTY tree — not reproducibly aligned with the fleet");
+        }
+        let fp = manifest.fingerprint.clone();
+        node_manifest = Some(manifest);
         match pba.height {
             Some(h) => info!(
                 "Block-validity hardening ACTIVE from height {} [{}] (tx signature + \
@@ -4283,7 +4249,13 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // were published), the activation fingerprint from the resolved PBA
             // activation, and the GhostDAG params the shared GhostDag runs with.
             Some({
-                let manifest = consensus_manifest::ConsensusManifest::current();
+                // The same manifest the boot log printed (for_node, bound to this genesis).
+                let manifest = node_manifest.clone().unwrap_or_else(|| {
+                    consensus_manifest::ConsensusManifest::for_node(
+                        config.chain.genesis_profile.as_deref(),
+                        running_genesis.as_ref(),
+                    )
+                });
                 citrate_api::NodeIdentity {
                     version: manifest.version.to_string(),
                     git_sha: manifest.git_sha.to_string(),
