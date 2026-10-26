@@ -12,6 +12,7 @@
     "CITRATE_AA_OWNER": {"class": "p0", "type": "address", "phases": ["P2"], "why": "owner of the AA stack (aa/DeployAA requires it, mid-P2)"},
     "CITRATE_AA_IDENTITY_SIGNER": {"class": "p0", "type": "address", "phases": ["P2"], "why": "the deploy-permit signer (aa/DeployAA requires it, mid-P2)"},
     "CITRATE_AA_SPONSOR_SIGNER": {"class": "p0", "type": "address", "phases": ["P2"], "why": "the paymaster sponsorship signer, a separate key from the identity signer (aa/DeployAA, separation of duties)"},
+    "TREASURY": {"class": "p0", "type": "address", "phases": ["P2"], "pending_reader": "contracts/script/DeployAll.s.sol (chain#396)", "why": "the fee recipient DeployAll sets at construction (X402Facilitator, ModelMarketplace, ComputeMarketplace); never the deployer, and required on 40204"},
     "DEPLOYER_ADDRESS": {"class": "p0-bash", "phases": ["P1", "P2", "P3", "P4"], "why": "the ceremony deployer; P0 checks it and binds it in the run manifest"},
     "CEREMONY_DEPLOYER_ADDRESS": {"class": "p0-bash", "phases": ["P1", "P2", "P3", "P4"], "why": "C9: a preset value must be DEPLOYER_ADDRESS byte for byte; P0 then sets it"},
     "RPC_URL": {"class": "p0-bash", "phases": ["P2"], "why": "the chain; P0 reads chain id and block 0 through it"},
