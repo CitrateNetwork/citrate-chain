@@ -278,7 +278,13 @@ fn mode(m: u8, init: &[u8]) -> Vec<u8> {
 }
 
 /// Every view of `addr`'s code agrees with `expected`, byte for byte.
-async fn assert_exact(chain: &mut Chain, probe: Address, addr: Address, expected: &[u8], what: &str) {
+async fn assert_exact(
+    chain: &mut Chain,
+    probe: Address,
+    addr: Address,
+    expected: &[u8],
+    what: &str,
+) {
     let stored = chain.stored_code(&addr);
     assert_eq!(
         stored.len(),
@@ -296,7 +302,11 @@ async fn assert_exact(chain: &mut Chain, probe: Address, addr: Address, expected
     let (size, hash, copied) = chain.probe(probe, addr).await;
     assert_eq!(size, expected.len() as u64, "{what}: EXTCODESIZE");
     assert_eq!(hash, keccak(expected), "{what}: EXTCODEHASH");
-    assert_eq!(hash, keccak(&stored), "{what}: keccak(eth_getCode) == EXTCODEHASH");
+    assert_eq!(
+        hash,
+        keccak(&stored),
+        "{what}: keccak(eth_getCode) == EXTCODEHASH"
+    );
     assert_eq!(copied, expected, "{what}: EXTCODECOPY");
 }
 
@@ -347,7 +357,14 @@ async fn constructor_create_stores_the_original_runtime() {
         .deploy_init(parent_init(&init_for(&child_runtime())))
         .await;
     let child = chain.call_for_address(parent, vec![0x01]).await;
-    assert_exact(&mut chain, probe, child, &child_runtime(), "constructor child").await;
+    assert_exact(
+        &mut chain,
+        probe,
+        child,
+        &child_runtime(),
+        "constructor child",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -380,7 +397,10 @@ async fn precompiles_have_no_code_and_a_created_precompile_caller_is_exact() {
         let (size, hash, copied) = chain.probe(probe, Address(a)).await;
         assert_eq!(size, 0, "precompile 0x{pc:04x} has no code");
         assert!(copied.is_empty());
-        assert_eq!(hash, [0u8; 32], "precompile 0x{pc:04x} EXTCODEHASH (empty account)");
+        assert_eq!(
+            hash, [0u8; 32],
+            "precompile 0x{pc:04x} EXTCODEHASH (empty account)"
+        );
     }
     let factory = chain.deploy(&factory_runtime()).await;
     let caller = chain
@@ -416,7 +436,8 @@ async fn legacy_scenario() -> (Chain, Address, Address) {
 
 /// The state root the previous binary (no exact-code rule) computes for
 /// `legacy_scenario`. Captured by running this scenario on the parent commit.
-const LEGACY_SCENARIO_ROOT: &str = "303ce59265c76bb379997b167a1fdee33aa00978a4e9b9dd0088b79d40f5f71d";
+const LEGACY_SCENARIO_ROOT: &str =
+    "303ce59265c76bb379997b167a1fdee33aa00978a4e9b9dd0088b79d40f5f71d";
 
 #[tokio::test]
 async fn below_activation_the_padded_form_and_the_state_root_are_unchanged() {

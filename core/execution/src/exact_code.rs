@@ -287,7 +287,10 @@ mod tests {
             resolve(None, None, Some(0)),
             Ok((Some(0), ExactCodeSource::Config))
         );
-        assert_eq!(resolve(None, None, None), Ok((None, ExactCodeSource::Unset)));
+        assert_eq!(
+            resolve(None, None, None),
+            Ok((None, ExactCodeSource::Unset))
+        );
         assert!(resolve(None, Some("abc"), None).is_err());
         assert!(resolve(None, Some(&u64::MAX.to_string()), None).is_err());
     }
