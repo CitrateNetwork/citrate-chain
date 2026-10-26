@@ -241,18 +241,24 @@ grep -q 'P3 ' "$WORK/ceremony-1.log" && grep -q 'missing inputs: PATRONAGE_KYC_R
 # GOVERNANCE, deployed by the ceremony deployer in this fixed order.
 GOVERNANCE=$(jq -r '.contracts.GovernanceTimelock' "$REPO/contracts/genesis/governance.json")
 [[ "$GOVERNANCE" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "no GOVERNANCE in P1's book"
-# create TARGET ARGS...: forge create with the constructor args LAST (forge's
-# --constructor-args takes every argument after it).
+# create TARGET CTOR_SIG ARGS...: deploy TARGET's compiled bytecode from the deployer with a
+# plain create transaction (csend: receipt polled here), at the address its nonce fixes.
 create() {
-  local target="$1"
-  shift
-  (cd "$REPO/contracts" && "$REAL_FORGE" create "$target" --rpc-url "$RPC" --account r1006-ceremony --password-file "$PWF" \
-    --legacy --gas-limit 8000000 --broadcast --json --constructor-args "$@") 2>>"$WORK/standins.log" | tee -a "$WORK/standins.log" | jq -r '.deployedTo'
+  local target="$1" sig="$2" bc args n addr
+  shift 2
+  bc=$(cd "$REPO/contracts" && "$REAL_FORGE" inspect "$target" bytecode 2>>"$WORK/standins.log") || return 1
+  args=$("$REAL_CAST" abi-encode "$sig" "$@") || return 1
+  n=$(c nonce "$DEPLOYER")
+  addr=$("$REAL_CAST" compute-address "$DEPLOYER" --nonce "$n" | awk '{print $NF}' | tr 'A-F' 'a-f')
+  csend --account r1006-ceremony --password-file "$PWF" --legacy --gas-limit 8000000 --create "${bc}${args#0x}" \
+    >>"$WORK/standins.log" 2>&1 || return 1
+  [[ "$(c code "$addr")" != 0x ]] || return 1
+  echo "$addr"
 }
 log "P4 stand-ins under GOVERNANCE $GOVERNANCE"
-KYC=$(create src/KYCRegistry.sol:KYCRegistry "$PATRONAGE_KYC_UPDATER" "$GOVERNANCE")
+KYC=$(create src/KYCRegistry.sol:KYCRegistry "constructor(address,address)" "$PATRONAGE_KYC_UPDATER" "$GOVERNANCE")
 [[ "$KYC" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "KYCRegistry stand-in failed (see $WORK/standins.log)"
-MSBT=$(create src/coop/MembershipSBT.sol:MembershipSBT "$KYC" "[]" "$GOVERNANCE" "$PATRONAGE_REGISTRAR")
+MSBT=$(create src/coop/MembershipSBT.sol:MembershipSBT "constructor(address,bytes32[],address,address)" "$KYC" "[]" "$GOVERNANCE" "$PATRONAGE_REGISTRAR")
 [[ "$MSBT" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "MembershipSBT stand-in failed (see $WORK/standins.log)"
 printf '{"KYCRegistry":"%s","MembershipSBT":"%s"}\n' "$KYC" "$MSBT" >"$WORK/standins.json"
 

@@ -13,6 +13,13 @@ is_broadcast_script=0
 if [[ "${1:-}" == script ]]; then
   for a in "$@"; do [[ "$a" == --broadcast ]] && is_broadcast_script=1; done
 fi
+# One transaction at a time (forge waits for each receipt): with the devnet mining on demand,
+# every transaction then gets its own block, at a height fixed by the ceremony's order.
+if [[ $is_broadcast_script == 1 ]]; then
+  slow=0
+  for a in "$@"; do [[ "$a" == --slow ]] && slow=1; done
+  [[ $slow == 1 ]] || set -- "$@" --slow
+fi
 log=$(mktemp "${TMPDIR:-/tmp}/forge-resume.XXXXXX")
 trap 'rm -f "$log"' EXIT
 "$REAL" "$@" 2>&1 | tee "$log"
