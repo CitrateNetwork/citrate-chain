@@ -57,7 +57,7 @@ use citrate_consensus::dag_store::{cf, DagStore, KvStore};
 use citrate_consensus::types::{Block, Hash, PublicKey};
 use citrate_consensus::vrf::VrfProposerSelector;
 use citrate_execution::Executor;
-use citrate_network::NetworkMessage;
+use citrate_network::{CheckpointSignature, NetworkMessage};
 use citrate_storage::StorageManager;
 
 use crate::canonical_apply::tests::{fresh, mk_block_vrf, persist, roots};
@@ -545,6 +545,32 @@ impl Net {
         )
     }
 
+    /// One exchange in which `peer` (a peer with no node here: Byzantine, or
+    /// serving out of date) answers node `to`'s real `GetCheckpoint` with
+    /// `resp`, a response of its own making, over the real wire codec. `None`:
+    /// node `to` had nothing to ask for.
+    async fn answer_with(
+        &mut self,
+        to: usize,
+        peer: &str,
+        resp: &NetworkMessage,
+    ) -> Option<SyncOutcome> {
+        let sync = self.node(to).sync.clone();
+        sync.reset_rate_limits_for_tests().await;
+        let (asked, _) = sync.request(&[peer.to_string()]).await?;
+        assert_eq!(asked, peer);
+        let NetworkMessage::CheckpointCertificate {
+            height,
+            block_hash,
+            signatures,
+        } = over_the_wire(resp)
+        else {
+            panic!("expected CheckpointCertificate");
+        };
+        assert!(sync.accept_response(peer).await, "solicited response");
+        Some(sync.process(peer, height, block_hash, signatures).await)
+    }
+
     async fn tick_all(&mut self) -> Vec<FloorTick> {
         let mut ticks = Vec::new();
         for (i, n) in self.nodes.iter().enumerate() {
@@ -604,6 +630,34 @@ fn verified(height: u64) -> FloorTick {
         height,
         floor_raised: true,
         recovered: false,
+    }
+}
+
+/// A `CheckpointCertificate` response for `(height, hash)` carrying the votes
+/// of `signers`, each signed over `(chain_id, signed_height, signed_hash)`.
+/// With the signed pair equal to the claimed one and `chain_id = CHAIN`, it is
+/// what an honest peer serves.
+fn cert_response(
+    height: u64,
+    hash: Hash,
+    signers: &[&Ed25519SigningKey],
+    chain_id: u64,
+    signed: (u64, Hash),
+) -> NetworkMessage {
+    let signatures = signers
+        .iter()
+        .map(|k| {
+            let v = sign_checkpoint_vote(chain_id, signed.0, signed.1, k);
+            CheckpointSignature {
+                voter: v.voter,
+                signature: v.signature,
+            }
+        })
+        .collect();
+    NetworkMessage::CheckpointCertificate {
+        height,
+        block_hash: hash,
+        signatures,
     }
 }
 
@@ -3308,4 +3362,326 @@ async fn s2_synced_install_races_a_reorg_below_it() {
     }
     assert!(!seen.contains("other"), "{seen:?}");
     assert!(seen.contains("install-first"), "{seen:?}");
+}
+
+// ---------------------------------------------------------------------------
+// C3-S1b — late joiner fed forged, stale or out-of-order certificates
+// ---------------------------------------------------------------------------
+
+/// Nodes 0..=2 finalize every buried boundary of `a` while node 3 is offline;
+/// node 3 holds `joiner` (applied) and no certificate. Node 3 comes back
+/// online without having voted.
+async fn late_joiner(a: &[Block], joiner: &[Block]) -> (Net, Validators) {
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let mut net = network(4, &vals, config(100)).await;
+    for i in 0..3 {
+        net.node_mut(i).follow(a).await;
+    }
+    net.node_mut(3).follow(joiner).await;
+    *net.online.get_mut(3).expect("flag") = false;
+    for i in 0..3 {
+        net.drive(i).await;
+    }
+    net.gossip().await;
+    *net.online.get_mut(3).expect("flag") = true;
+    assert_eq!(net.node(3).finalized().await, 0);
+    (net, vals)
+}
+
+/// Nothing about node `i`'s finality moved: no certificate, no floor, no
+/// published height, no stop.
+async fn assert_untouched(net: &Net, i: usize, what: &str) {
+    let n = net.node(i);
+    assert_eq!(n.finalized().await, 0, "{what}: nothing finalized");
+    assert_eq!(n.floor(), 0, "{what}: floor not raised");
+    assert_eq!(n.rpc_finalized(), FinalizedAnchor::GENESIS, "{what}: RPC");
+    assert!(!n.gadget.halted(), "{what}: peer input never halts");
+}
+
+/// A late joiner offered forged certificates for a block it holds on its own
+/// chain (A4) by a peer it asked: every one is refused as Invalid — tampered
+/// signature, outsider signers, another chain's signatures, below quorum, a
+/// duplicate voter padding to quorum, signatures over a sibling block or over
+/// another (height, hash) relabelled, a non-boundary height, no signatures.
+/// None installs, raises the floor, publishes a height, halts, or is persisted
+/// (the next boot finds no certificate). The verification slot is released
+/// after each, so the honest peer's certificate then installs.
+#[tokio::test]
+async fn s1b_late_joiner_refuses_forged_certificates_then_installs_the_real_one() {
+    let chains = Chains::new();
+    let a = chains.main(8);
+    let b = chains.branch(&a, 4, 8, VRF_B);
+    let (mut net, vals) = late_joiner(&a, &a).await;
+    assert_eq!(net.node(0).finalized().await, 4);
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let k: Vec<&Ed25519SigningKey> = keys.iter().collect();
+    let outsiders: Vec<Ed25519SigningKey> = (40..44).map(key).collect();
+    let o: Vec<&Ed25519SigningKey> = outsiders.iter().collect();
+    let (a2, a4, a5) = (hash_at(&a, 2), hash_at(&a, 4), hash_at(&a, 5));
+
+    let honest = cert_response(4, a4, &k[..3], CHAIN, (4, a4));
+    let tampered = {
+        let NetworkMessage::CheckpointCertificate {
+            height,
+            block_hash,
+            mut signatures,
+        } = honest.clone()
+        else {
+            unreachable!("built above")
+        };
+        let first = signatures.first_mut().expect("three signatures");
+        let mut bytes = *first.signature.as_bytes();
+        bytes[0] ^= 0x01;
+        first.signature = citrate_consensus::types::Signature::new(bytes);
+        NetworkMessage::CheckpointCertificate {
+            height,
+            block_hash,
+            signatures,
+        }
+    };
+    let padded = {
+        let NetworkMessage::CheckpointCertificate {
+            height,
+            block_hash,
+            mut signatures,
+        } = cert_response(4, a4, &k[..2], CHAIN, (4, a4))
+        else {
+            unreachable!("built above")
+        };
+        let dup = signatures.first().expect("two signatures").clone();
+        signatures.push(dup);
+        NetworkMessage::CheckpointCertificate {
+            height,
+            block_hash,
+            signatures,
+        }
+    };
+    let forgeries = [
+        ("tampered signature", tampered, 4),
+        (
+            "outsider signers",
+            cert_response(4, a4, &o[..3], CHAIN, (4, a4)),
+            4,
+        ),
+        (
+            "another chain's signatures",
+            cert_response(4, a4, &k[..3], FOREIGN_CHAIN, (4, a4)),
+            4,
+        ),
+        (
+            "below quorum",
+            cert_response(4, a4, &k[..2], CHAIN, (4, a4)),
+            4,
+        ),
+        ("duplicate voter padding to quorum", padded, 4),
+        (
+            "signatures over the sibling B4",
+            cert_response(4, a4, &k[..3], CHAIN, (4, hash_at(&b, 4))),
+            4,
+        ),
+        (
+            "signatures over (2, A2) relabelled to (4, A4)",
+            cert_response(4, a4, &k[..3], CHAIN, (2, a2)),
+            4,
+        ),
+        (
+            "non-boundary height",
+            cert_response(5, a5, &k[..3], CHAIN, (5, a5)),
+            5,
+        ),
+        (
+            "no signatures",
+            cert_response(4, a4, &[], CHAIN, (4, a4)),
+            4,
+        ),
+    ];
+    for (what, forged, at) in &forgeries {
+        let out = net.answer_with(3, "byzantine", forged).await;
+        assert!(
+            matches!(&out, Some(SyncOutcome::Invalid { height, .. }) if height == at),
+            "{what}: {out:?}"
+        );
+        assert_untouched(&net, 3, what).await;
+    }
+    // Nothing forged was persisted: a restart finds no certificate.
+    let n3 = net.nodes.pop().expect("node 3");
+    let (n3, boot) = n3.restart(&vals, config(100)).await;
+    assert_eq!(boot, FloorTick::NoCertificate);
+    net.nodes.push(n3);
+
+    // The honest peer's certificate installs (slot released, no poisoning).
+    let out = net.sync_cert(3, 0).await;
+    assert!(
+        matches!(&out, Some(SyncOutcome::Installed { height: 4, .. })),
+        "{out:?}"
+    );
+    assert_eq!(net.node(3).finalized_hash(4).await, Some(a4));
+    assert_eq!(net.node(3).floor(), 4);
+    net.assert_no_conflicting_finality(&[2, 4]).await;
+}
+
+/// A late joiner that already installed the latest certificate (A8) is fed
+/// stale ones — a genuine older certificate (A4) and the same A8 again — by a
+/// peer it asked: Stale, nothing changes. Responses it did not ask for are
+/// not even looked at: from a peer other than the one asked (the asked peer's
+/// answer is still accepted afterwards), or a replay after the request was
+/// answered.
+#[tokio::test]
+async fn s1b_late_joiner_ignores_stale_replayed_and_unsolicited_certificates() {
+    let chains = Chains::new();
+    let a = chains.main(12);
+    let (mut net, _) = late_joiner(&a, &a).await;
+    assert_eq!(net.node(0).finalized().await, 8);
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let k: Vec<&Ed25519SigningKey> = keys.iter().collect();
+    let (a4, a8) = (hash_at(&a, 4), hash_at(&a, 8));
+
+    let out = net.sync_cert(3, 0).await;
+    assert!(
+        matches!(&out, Some(SyncOutcome::Installed { height: 8, .. })),
+        "{out:?}"
+    );
+    assert_eq!(net.node(3).floor(), 8);
+
+    for (what, stale, h) in [
+        (
+            "older genuine certificate",
+            cert_response(4, a4, &k[..3], CHAIN, (4, a4)),
+            4,
+        ),
+        (
+            "the installed certificate again",
+            cert_response(8, a8, &k[..3], CHAIN, (8, a8)),
+            8,
+        ),
+    ] {
+        let out = net.answer_with(3, "out-of-date", &stale).await;
+        assert!(
+            matches!(&out, Some(SyncOutcome::Stale { height, latest: 8 }) if *height == h),
+            "{what}: {out:?}"
+        );
+        assert_eq!(net.node(3).finalized().await, 8, "{what}");
+        assert_eq!(net.node(3).floor(), 8, "{what}");
+        assert!(!net.node(3).gadget.halted(), "{what}");
+    }
+
+    // Grow the chain so node 3 has something to ask for again.
+    let a = chains.main(16);
+    for i in 0..4 {
+        net.node_mut(i).follow(&a).await;
+    }
+    *net.online.get_mut(3).expect("flag") = false;
+    for i in 0..3 {
+        net.drive(i).await;
+    }
+    net.gossip().await;
+    *net.online.get_mut(3).expect("flag") = true;
+    assert_eq!(net.node(0).finalized().await, 12);
+    let sync = net.node(3).sync.clone();
+    sync.reset_rate_limits_for_tests().await;
+    let (asked, _) = sync
+        .request(&["node-0".to_string()])
+        .await
+        .expect("node 3 has blocks beyond its floor");
+    assert_eq!(asked, "node-0");
+    // From someone else while node-0 is asked: ignored, request still open.
+    assert!(!sync.accept_response("byzantine").await);
+    // The asked peer's answer is accepted and installs.
+    assert!(sync.accept_response("node-0").await);
+    let a12 = hash_at(&a, 12);
+    let out = sync
+        .process("node-0", 12, a12, {
+            let NetworkMessage::CheckpointCertificate { signatures, .. } =
+                cert_response(12, a12, &k[..3], CHAIN, (12, a12))
+            else {
+                unreachable!("built above")
+            };
+            signatures
+        })
+        .await;
+    assert!(
+        matches!(&out, SyncOutcome::Installed { height: 12, .. }),
+        "{out:?}"
+    );
+    // A replay of that answer, now that nothing is outstanding: ignored.
+    assert!(!sync.accept_response("node-0").await);
+    assert_eq!(net.node(3).floor(), 12);
+    net.assert_no_conflicting_finality(&[4, 8, 12]).await;
+}
+
+/// Certificates reaching a late joiner out of order. It has applied only up to
+/// A6 when a peer offers A8: NotYetApplied, nothing recorded, no stop. The
+/// honest exchange then installs A6 (the highest at or below its tip), an
+/// older A4 offered after it is Stale, and once the joiner has applied A12 the
+/// same A8 installs. The floor only ever rises, and the next boot verifies A8.
+#[tokio::test]
+async fn s1b_late_joiner_handles_out_of_order_certificates() {
+    let chains = Chains::new();
+    let a = chains.main(12);
+    let (mut net, vals) = late_joiner(&a, &chains.main(6)).await;
+    assert_eq!(net.node(0).finalized().await, 8);
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let k: Vec<&Ed25519SigningKey> = keys.iter().collect();
+    let (a4, a6, a8) = (hash_at(&a, 4), hash_at(&a, 6), hash_at(&a, 8));
+    let cert8 = cert_response(8, a8, &k[..3], CHAIN, (8, a8));
+
+    let out = net.answer_with(3, "ahead", &cert8).await;
+    assert!(
+        matches!(
+            &out,
+            Some(SyncOutcome::NotYetApplied {
+                height: 8,
+                applied_height: 6
+            })
+        ),
+        "{out:?}"
+    );
+    assert_untouched(&net, 3, "certificate above the applied tip").await;
+
+    let out = net.sync_cert(3, 0).await;
+    assert!(
+        matches!(&out, Some(SyncOutcome::Installed { height: 6, .. })),
+        "{out:?}"
+    );
+    assert_eq!(net.node(3).finalized_hash(6).await, Some(a6));
+    assert_eq!(net.node(3).floor(), 6);
+
+    // Applied tip 6 = finalized 6: nothing to ask for, so nothing is accepted.
+    assert!(net
+        .answer_with(3, "older", &cert_response(4, a4, &k[..3], CHAIN, (4, a4)))
+        .await
+        .is_none());
+    net.node_mut(3).follow(&a).await;
+    let out = net
+        .answer_with(3, "older", &cert_response(4, a4, &k[..3], CHAIN, (4, a4)))
+        .await;
+    assert!(
+        matches!(
+            &out,
+            Some(SyncOutcome::Stale {
+                height: 4,
+                latest: 6
+            })
+        ),
+        "{out:?}"
+    );
+    assert_eq!(
+        net.node(3).floor(),
+        6,
+        "an older certificate never lowers it"
+    );
+
+    let out = net.answer_with(3, "ahead", &cert8).await;
+    assert!(
+        matches!(&out, Some(SyncOutcome::Installed { height: 8, .. })),
+        "{out:?}"
+    );
+    assert_eq!(net.node(3).floor(), 8);
+    assert!(!net.node(3).gadget.halted());
+    let n3 = net.nodes.pop().expect("node 3");
+    let (n3, boot) = n3.restart(&vals, config(100)).await;
+    assert_eq!(boot, verified(8));
+    net.nodes.push(n3);
+    net.assert_no_conflicting_finality(&[2, 4, 6, 8]).await;
 }
