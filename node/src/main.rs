@@ -1482,6 +1482,16 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             hex::encode(citrate_consensus::hardening::R1006_GENESIS)
         );
     }
+    let on_demand = producer::check_mine_on_demand(
+        std::env::var(producer::MINE_ON_DEMAND_ENV).ok().as_deref(),
+        config.chain.genesis_profile.as_deref(),
+        config.rpc.listen_addr.ip().is_loopback(),
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
+    producer::set_mine_on_demand(on_demand);
+    if on_demand {
+        warn!("Build devnet: blocks are produced only when a transaction is pending");
+    }
     if running_genesis == Some(citrate_consensus::hardening::R1006_GENESIS) {
         genesis::check_r1006_bootable(genesis::r1006_rehearsal_from_env())?;
     }

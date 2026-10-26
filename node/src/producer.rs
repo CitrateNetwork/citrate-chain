@@ -602,6 +602,45 @@ impl ProduceCatchupGate {
 }
 
 /// Block producer for mining new blocks
+/// Environment switch for the r1006 genesis build devnet: produce a block only when the
+/// mempool holds a transaction. The ceremony sends one transaction at a time, so every
+/// transaction then lands at a height fixed by its position in the ceremony, and the
+/// contracts' block-number and block-timestamp state is the same on every run (the
+/// genesis builder's reproducibility). Never a network setting: the node refuses it
+/// unless the chain runs the dev-accounts `default` genesis profile with RPC on loopback
+/// ([`check_mine_on_demand`]).
+pub const MINE_ON_DEMAND_ENV: &str = "CITRATE_DEVNET_MINE_ON_DEMAND";
+
+static MINE_ON_DEMAND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn mine_on_demand() -> bool {
+    MINE_ON_DEMAND.load(Ordering::SeqCst)
+}
+
+/// Decide the on-demand switch from the env value, the genesis profile and whether RPC
+/// listens on loopback only. `Ok(true)` = on; an env value on anything but a loopback
+/// `default`-profile devnet is refused.
+pub fn check_mine_on_demand(
+    env: Option<&str>,
+    genesis_profile: Option<&str>,
+    rpc_loopback: bool,
+) -> Result<bool, String> {
+    match env {
+        None => Ok(false),
+        Some("1") if genesis_profile == Some("default") && rpc_loopback => Ok(true),
+        Some("1") => Err(format!(
+            "{MINE_ON_DEMAND_ENV}=1 is for the local genesis build devnet only: it needs \
+             genesis_profile = \"default\" and RPC on loopback"
+        )),
+        Some(v) => Err(format!("{MINE_ON_DEMAND_ENV}={v}: only 1 is accepted")),
+    }
+}
+
+/// Publish the switch (the node calls this once, before the producer starts).
+pub fn set_mine_on_demand(on: bool) {
+    MINE_ON_DEMAND.store(on, Ordering::SeqCst);
+}
+
 pub struct BlockProducer {
     storage: Arc<StorageManager>,
     executor: Arc<Executor>,
@@ -1632,6 +1671,7 @@ impl BlockProducer {
 
     /// Start block production loop
     pub async fn start(self: Arc<Self>) {
+        let on_demand = mine_on_demand();
         // #310: Skip, not tokio's default Burst — after a round that waited
         // out a long catch-up, resume at the configured block time instead of
         // sealing one block per missed tick back to back.
@@ -1642,6 +1682,10 @@ impl BlockProducer {
             interval.tick().await;
 
             if self.is_paused() {
+                continue;
+            }
+            // Build devnet only (see `MINE_ON_DEMAND`): no block without a transaction.
+            if on_demand && self.mempool.stats().await.total_transactions == 0 {
                 continue;
             }
 
@@ -6911,5 +6955,25 @@ mod producer_panic_breaker {
             .find("self.panic_breaker.lock().filter(")
             .expect("breaker filter");
         assert!(filter < first_mutation);
+    }
+}
+
+#[cfg(test)]
+mod mine_on_demand_tests {
+    use super::check_mine_on_demand;
+
+    #[test]
+    fn only_a_loopback_default_profile_devnet_may_mine_on_demand() {
+        assert_eq!(check_mine_on_demand(None, Some("testnet_beta"), false), Ok(false));
+        assert_eq!(check_mine_on_demand(Some("1"), Some("default"), true), Ok(true));
+        for (p, lo) in [
+            (Some("testnet_beta"), true),
+            (Some("r1006"), true),
+            (None, true),
+            (Some("default"), false),
+        ] {
+            assert!(check_mine_on_demand(Some("1"), p, lo).is_err(), "{p:?} {lo}");
+        }
+        assert!(check_mine_on_demand(Some("yes"), Some("default"), true).is_err());
     }
 }
