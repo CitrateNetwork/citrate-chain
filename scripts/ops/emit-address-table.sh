@@ -16,6 +16,9 @@
 #
 # Output:
 #   - contracts/addresses/40204.json — the canonical table (EMIT_OUTPUT overrides the path).
+#     Every address in it is written in one canonical spelling, lowercase, whatever case its
+#     source used (an EIP-55 checksummed EMIT_DEPLOYER, a .env.testnet pin, a static block), so
+#     the same inputs give the same book byte for byte.
 #
 # Optional inputs (env):
 #   EMIT_DEPLOYER         the deployer the book names. regenesis.sh passes the DEPLOYER_ADDRESS
@@ -63,6 +66,8 @@ if [[ -n "${EMIT_DEPLOYER:-}" ]] && ! is_addr "$EMIT_DEPLOYER"; then
   err "EMIT_DEPLOYER is not an address: ${EMIT_DEPLOYER}"
   exit 1
 fi
+# One canonical spelling (lowercase): a checksummed and a lowercase deployer are one book.
+EMIT_DEPLOYER="$(printf '%s' "${EMIT_DEPLOYER:-}" | tr 'A-F' 'a-f')"
 SINCE=0
 if [[ "$FRESH" == "1" ]]; then
   [[ -n "${EMIT_DEPLOYER:-}" ]] || { err "EMIT_FRESH_GENESIS=1 needs EMIT_DEPLOYER (the run's deployer)"; exit 1; }
@@ -278,7 +283,7 @@ aa_final=$(jq -n \
 # EMIT_DEPLOYER (what regenesis.sh deployed with) wins over the .env.testnet pin.
 DEPLOYER="${EMIT_DEPLOYER:-}"
 DEPLOYER=${DEPLOYER:-$(get_env "DEPLOYER_ADDRESS")}
-DEPLOYER=${DEPLOYER:-0x4250675F9015E65fC866F3a373F82bb9DFc000c6}
+DEPLOYER=${DEPLOYER:-0x4250675f9015e65fc866f3a373f82bb9dfc000c6}
 
 # Deployed-at: MAX timestamp across every broadcast (i.e. the most recent
 # ceremony) — that's the answer to "when was this table's youngest row?".
@@ -352,7 +357,7 @@ jq -n \
   --argjson prior_extra "$PRIOR_EXTRA" \
   --argjson contracts "$(cat "$contracts_jq")" \
   --argjson aa "$aa_final" \
-  --arg deployer "${DEPLOYER:-0x4250675F9015E65fC866F3a373F82bb9DFc000c6}" \
+  --arg deployer "$DEPLOYER" \
   --arg deployed_at "${DEPLOYED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
   '{
     "$schema": "./schema.json",
@@ -366,7 +371,7 @@ jq -n \
     comment: "Canonical contract-address table for chain 40204 — the single source of truth the federation reads from. Regenerated from broadcast/*.s.sol/40204/run-latest.json + .env.testnet AA pins. See contracts/addresses/README.md.",
     contracts: ($prior_contracts + $contracts),
     aaStack: $aa,
-    genesis: { ArachnidDeterministicDeployer: "0x4e59b44847b379578588920cA78FbF26c0B4956C" },
+    genesis: { ArachnidDeterministicDeployer: "0x4e59b44847b379578588920ca78fbf26c0b4956c" },
     precompiles: {
       ModelDeploy:            "0x0000000000000000000000000000000000000100",
       ModelInference:         "0x0000000000000000000000000000000000000101",
@@ -390,7 +395,8 @@ jq -n \
       X402TransferAuthVerify: "0x0000000000000000000000000000000000000201",
       X402BatchPaymentVerify: "0x0000000000000000000000000000000000000202"
     }
-   } * $prior_extra + $root_aliases' > "$OUTPUT.tmp"
+   } * $prior_extra + $root_aliases
+   | walk(if type == "string" and test("^0x[0-9a-fA-F]{40}$") then ascii_downcase else . end)' > "$OUTPUT.tmp"
 
 # WP-9 GUARD: refuse to write a book that LOSES a key. Merging should make this
 # impossible, but the whole point is that silent loss is the failure mode — so

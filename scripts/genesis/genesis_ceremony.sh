@@ -29,6 +29,10 @@
 #   --confirm          broadcasts. A non-loopback RPC_URL also needs CITRATE_ALLOW_REMOTE=1.
 #   --from Pn          resume at phase n after a fix (no phase is re-run blindly).
 #   --only Pn          run a single phase.
+#   --record-stack-book  with --confirm --only P2: P2 has broadcast but its gate failed (or
+#                      regenesis.sh stopped after the last broadcast). Sends nothing: rebuilds
+#                      the book from this run's P2 broadcasts, runs the P2 gate against the
+#                      chain and records the book (C8). The only way back into P2 once it sent.
 #   The P0 safety preflight (inputs, governance floors, chain id, block-0 hash, remote-RPC
 #   authorization, deployer seat) runs on EVERY --simulate/--confirm invocation, including
 #   --from and --only. Only the fresh-deployer nonce-0 check is limited to a new ceremony
@@ -88,6 +92,8 @@
 #      entries (SBT, MemberBond, vault implementation, vault proxy, root aliases) to be this
 #      run's broadcasts, and records the book in the manifest (stackBook). P5 and P6 read only
 #      that book on --confirm (and check it whenever it is recorded).
+#      Every address the generator writes, and both sides of that comparison, are in one
+#      canonical spelling (lowercase), so an EIP-55 checksummed input names the same book.
 #   C9 one deployer: CEREMONY_DEPLOYER_ADDRESS (which the deploy scripts prefer), DEPLOYER and
 #      EMIT_DEPLOYER, when preset, must be DEPLOYER_ADDRESS byte for byte (an empty value, another
 #      address, case or spelling fails P0 before anything is sent); every phase then runs with
@@ -95,6 +101,10 @@
 #      fee recipients (X402Facilitator.treasury, ModelMarketplace.treasuryAddress,
 #      ComputeMarketplace.treasury) of the contracts in the verified book are read from the
 #      chain and must be the book's deployer.
+#   C10 P2 sends once: on --confirm, P2 refuses to start while this run's P2 broadcasts exist
+#      (recorded since block 0) or once the manifest records stackBook. After a phase has
+#      broadcast, no failure message says to re-run it: a P2 gate failure names
+#      --record-stack-book, a P1 gate failure resumes at P2.
 #
 # Output books: P1/P3/P4 write governance.json, team-vesting.json and dormant-ledgers.json
 # into GENESIS_OUT_DIR, and P2/P4/P5 read them from the same place; every producer and
@@ -112,7 +122,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib.sh"
 GENESIS_LOG_TAG=ceremony
 # A command that fails outside an explicit check stops the run non-zero (set -e); say where.
-trap 'err "unexpected failure (exit $?) at line $LINENO; inspect before resuming with --from"' ERR
+SENT_PHASE="" # the phase that has broadcast in this run (set before its first transaction)
+trap 'err "unexpected failure (exit $?) at line $LINENO; inspect before resuming with --from${SENT_PHASE:+ (never re-run $SENT_PHASE: it has broadcast)}"' ERR
 
 REPO_ROOT="${REPO_ROOT:-$(cd "$HERE/../.." && pwd)}"
 CONTRACTS="$REPO_ROOT/contracts"
@@ -140,6 +151,7 @@ FROM=P0
 ONLY=""
 ACCOUNT=""
 PASSWORD_FILE=""
+RECORD_BOOK=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --simulate) MODE=simulate; shift ;;
@@ -149,6 +161,7 @@ while [[ $# -gt 0 ]]; do
     --only) ONLY="${2:-}"; shift 2 ;;
     --account) ACCOUNT="${2:-}"; shift 2 ;;
     --password-file) PASSWORD_FILE="${2:-}"; shift 2 ;;
+    --record-stack-book) RECORD_BOOK=1; shift ;;
     --private-key | --private-key=*) die "raw private keys are refused; sign with --account (Foundry keystore)" 1 ;;
     -h | --help)
       sed -n '2,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//' >&2
@@ -189,17 +202,52 @@ idx() {
 }
 [[ $(idx "$FROM") -ge 0 ]] || die "--from must be one of ${PHASES[*]}" 1
 [[ -z "$ONLY" || $(idx "$ONLY") -ge 0 ]] || die "--only must be one of ${PHASES[*]}" 1
+if [[ "$RECORD_BOOK" == 1 && ( "$MODE" != confirm || "$ONLY" != P2 ) ]]; then
+  die "--record-stack-book needs --confirm --only P2 (it records the book of a P2 that has broadcast)" 1
+fi
 should() {
   if [[ -n "$ONLY" ]]; then [[ "$1" == "$ONLY" ]]; else [[ $(idx "$1") -ge $(idx "$FROM") ]]; fi
 }
+next_phase() { echo "${PHASES[$(($(idx "$1") + 1))]:-}"; }
+# after_broadcast <phase>: the safe way on once <phase> has broadcast (C10). Never a re-run of
+# that phase: a broadcast phase is re-entered only through a step that sends nothing.
+after_broadcast() {
+  local acct="${ACCOUNT:+ --account $ACCOUNT}" nx
+  nx=$(next_phase "$1")
+  case "$1" in
+    P1) err "fix the cause, then resume after P1: $0 --confirm --from P2$acct (P2 and every later gate re-verify P1's governance on chain before using it)" ;;
+    P2)
+      if [[ -f "${RUN_MANIFEST:-}" ]] && manifest_has "$RUN_MANIFEST" stackBook; then
+        err "P2's book is recorded; resume after P2: $0 --confirm --from P3$acct"
+      else
+        err "fix the cause, then record P2's book from this run's broadcasts and the chain (this sends nothing): $0 --confirm --only P2 --record-stack-book$acct; then resume with --from P3"
+      fi
+      ;;
+    *) err "inspect contracts/broadcast/ and the chain; once $1's output book is in place, resume after it: $0 --confirm --from $nx$acct" ;;
+  esac
+}
 gate_fail() {
   err "GATE FAIL at $1: $2"
-  err "fix it, then resume: $0 --$MODE --from $1 ${ACCOUNT:+--account $ACCOUNT}"
+  if [[ "$MODE" == confirm && "$1" == "$SENT_PHASE" ]]; then
+    err "$1 has already broadcast in this run: do NOT re-run $1, it would send its transactions again"
+    after_broadcast "$1"
+  else
+    err "fix it, then resume: $0 --$MODE --from $1 ${ACCOUNT:+--account $ACCOUNT}"
+  fi
   exit 3
 }
 step_fail() {
   err "STEP FAIL at $1: $2"
-  err "inspect contracts/broadcast/ and the chain before resuming with --from $1 (never re-run a partly broadcast phase blindly)"
+  if [[ "$MODE" == confirm && "$1" == "$SENT_PHASE" ]]; then
+    err "$1 may have sent some or all of its transactions: do NOT re-run $1. Inspect contracts/broadcast/ and the chain first (runbook §6.4)"
+    if [[ "$1" == P2 ]]; then
+      err "if every regenesis.sh step reached the chain, record the book (this sends nothing): $0 --confirm --only P2 --record-stack-book ${ACCOUNT:+--account $ACCOUNT}"
+    else
+      after_broadcast "$1"
+    fi
+  else
+    err "nothing was broadcast; fix it, then resume: $0 --$MODE --from $1 ${ACCOUNT:+--account $ACCOUNT}"
+  fi
   exit 2
 }
 
@@ -218,6 +266,7 @@ forge_phase() {
     describe_cmd "(cd contracts &&" "$FORGE" "${args[@]}" ")"
     return 0
   fi
+  if [[ "$MODE" == confirm ]]; then SENT_PHASE="$phase"; fi
   (cd "$CONTRACTS" && "$FORGE" "${args[@]}") || step_fail "$phase" "$script"
 }
 
@@ -472,9 +521,19 @@ verify_stack_book() {
     gate_fail P2 "re-running the generator failed (see $OUT/stack-book.check.log)"
   why=$("$PY" - "$book_abs" "$check" "$RUN_DEPLOYER" "$CONTRACTS/broadcast" "$EXPECTED_CHAIN_ID" "$RUN_G0TS" <<'PY' 2>&1
 import json, sys
+import re
 book_p, check_p, dep, bdir, cid, since = sys.argv[1:7]
 since = int(since)
-book, check = json.load(open(book_p)), json.load(open(check_p))
+ADDR = re.compile(r"0x[0-9a-fA-F]{40}")
+def canon(x):  # one spelling for every address (lowercase), however it was written
+    if isinstance(x, dict):
+        return {k: canon(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [canon(v) for v in x]
+    if isinstance(x, str) and ADDR.fullmatch(x):
+        return x.lower()
+    return x
+book, check = canon(json.load(open(book_p))), canon(json.load(open(check_p)))
 if book != check:
     diff = sorted(k for k in set(book) | set(check) if book.get(k) != check.get(k))
     sys.exit(f"the book differs from what the generator emits for this run (keys: {', '.join(diff)})")
@@ -522,6 +581,32 @@ PY
   check_fee_recipients
   why=$(manifest_bind bind "$RUN_MANIFEST" stackBook "$sb" 2>&1) || gate_fail P2 "cannot record the stack book: $why"
   rm -f "$check"
+  log "P2 stack book recorded in the run manifest (run $RUN_ID); P2 is done, resume with --from P3"
+}
+
+# P2_BROADCAST_SCRIPTS: every script regenesis.sh broadcasts (its run_step lines, by forge's
+# broadcast directory name). The test suite checks this list against regenesis.sh.
+P2_BROADCAST_SCRIPTS=(DeployAll.s.sol DeployValidatorRegistry.s.sol DeployModelAccessControl.s.sol
+  DeployTEEAttestationRegistry.s.sol DeployComputePoolTraining.s.sol DeployEduStack.s.sol DeployAIGateway.s.sol
+  DeployP256Verifier.s.sol DeployAA.s.sol DeployCoreMembership.s.sol)
+# p2_sent: the P2 scripts with a broadcast record on this chain since this run's block 0, one
+# per line. A record that cannot be read counts as sent (fail closed).
+p2_sent() {
+  "$PY" - "$CONTRACTS/broadcast" "$EXPECTED_CHAIN_ID" "$RUN_G0TS" "${P2_BROADCAST_SCRIPTS[@]}" <<'PY'
+import glob, json, sys
+bdir, cid, since, scripts = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4:]
+for s in scripts:
+    for f in sorted(glob.glob(f"{bdir}/{s}/{cid}/run-*.json")):
+        try:
+            ts = json.load(open(f)).get("timestamp")
+            ts = ts / 1000 if ts > 10**12 else ts
+            sent = ts >= since
+        except Exception:
+            sent = True
+        if sent:
+            print(s)
+            break
+PY
 }
 
 # C9: the fee recipients DeployAll derives from the deployer (treasury constructor arguments)
@@ -732,6 +817,23 @@ if should P2; then
     # C8: the generator gets this run's deployer, block 0 and book path; a preset that says
     # otherwise is refused before anything is sent.
     is_addr "${RUN_DEPLOYER:-}" && [[ "${RUN_G0TS:-}" =~ ^[0-9]+$ ]] || gate_fail P2 "no run deployer or block-0 timestamp (the P0 run manifest did not load)"
+    # C10: P2 sends once. A recorded book means P2 is done; on --confirm, this run's P2
+    # broadcasts on disk mean it has sent, and only the record step (which sends nothing) may
+    # go on from there.
+    if manifest_has "$RUN_MANIFEST" stackBook; then
+      [[ "$MODE" == confirm ]] && SENT_PHASE=P2
+      gate_fail P2 "the run manifest already records the stack book: P2 is done"
+    fi
+    if [[ "$MODE" == confirm ]]; then
+      sent=$(p2_sent) || gate_fail P2 "cannot read this run's broadcast records under contracts/broadcast/"
+      if [[ "$RECORD_BOOK" == 1 ]]; then
+        [[ -n "$sent" ]] || gate_fail P2 "--record-stack-book: no P2 broadcast from this run is recorded, so there is no book to record (run P2)"
+        SENT_PHASE=P2
+      elif [[ -n "$sent" ]]; then
+        SENT_PHASE=P2
+        gate_fail P2 "this run's P2 broadcasts are already recorded ($(printf '%s' "$sent" | paste -sd, -)): P2 has sent its transactions"
+      fi
+    fi
     for v in DEPLOYER EMIT_DEPLOYER; do
       if [[ -n "${!v:-}" && "$(lower "${!v}")" != "$RUN_DEPLOYER" ]]; then
         gate_fail P2 "$v is set to ${!v}, but this run's deployer is $RUN_DEPLOYER; unset it: the ceremony sets the generator's deployer from the run manifest"
@@ -744,7 +846,14 @@ if should P2; then
     [[ -z "${EMIT_FRESH_GENESIS:-}" || "$EMIT_FRESH_GENESIS" == 1 ]] ||
       gate_fail P2 "EMIT_FRESH_GENESIS is set to $EMIT_FRESH_GENESIS; a genesis ceremony always regenerates a fresh book"
     export EMIT_FRESH_GENESIS=1 EMIT_DEPLOYER="$RUN_DEPLOYER" EMIT_BROADCAST_SINCE="$RUN_G0TS" EMIT_OUTPUT="$book_abs"
-    RPC_URL="$RPC_URL" bash "$REGENESIS" "${rargs[@]}" || step_fail P2 regenesis.sh
+    if [[ "$RECORD_BOOK" == 1 ]]; then
+      log "P2 record step: nothing is sent; the book is rebuilt from this run's broadcasts ($(printf '%s' "$sent" | paste -sd, -)) and checked against the chain"
+      RPC_URL="$RPC_URL" bash "$EMITTER" >"$OUT/stack-book.record.log" 2>&1 ||
+        gate_fail P2 "the generator failed over this run's broadcasts (see $OUT/stack-book.record.log)"
+    else
+      if [[ "$MODE" == confirm ]]; then SENT_PHASE=P2; fi
+      RPC_URL="$RPC_URL" bash "$REGENESIS" "${rargs[@]}" || step_fail P2 regenesis.sh
+    fi
     if [[ "$MODE" == confirm ]]; then
       verify_stack_book
     else

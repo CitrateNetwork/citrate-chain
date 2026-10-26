@@ -162,7 +162,8 @@ fi
 # stops the run: the ceremony's later gates read this book.
 if [[ "$BROADCAST" == "1" ]]; then
   log "regenerating canonical address table"
-  if ! EMIT_DEPLOYER="$DEPLOYER_ADDRESS" bash "${REPO_ROOT}/scripts/ops/emit-address-table.sh"; then
+  # One canonical spelling (lowercase), the one the G5 ceremony's P2 gate compares against.
+  if ! EMIT_DEPLOYER="$(printf '%s' "$DEPLOYER_ADDRESS" | tr 'A-F' 'a-f')" bash "${REPO_ROOT}/scripts/ops/emit-address-table.sh"; then
     if [[ "${EMIT_FRESH_GENESIS:-0}" == "1" ]]; then
       err "emit-address-table failed in a fresh genesis"
       exit 2

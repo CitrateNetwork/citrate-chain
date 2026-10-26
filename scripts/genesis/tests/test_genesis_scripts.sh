@@ -805,6 +805,20 @@ env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" CE
 calls | grep -q '^forge clean' && ! grep -q 'not exactly DEPLOYER_ADDRESS' "$T/rg.log" && ok "regenesis: an exact CEREMONY_DEPLOYER_ADDRESS goes on to the build" ||
   bad "regenesis: an exact CEREMONY_DEPLOYER_ADDRESS goes on to the build" "$(cat "$T/rg.log")"
 rm -rf "$RG"
+# C10 tripwire: the ceremony refuses a second P2 by finding this run's broadcasts of the scripts
+# in P2_BROADCAST_SCRIPTS, so that list must be every script regenesis.sh broadcasts. A
+# run_step added to regenesis.sh without the list fails here (negative control below).
+p2_list_sync() { # <regenesis.sh> -> 0 when its run_step scripts are the ceremony's list
+  local want have
+  want=$(sed -n 's/^[[:space:]]*run_step "\([^"]*\)".*/\1/p' "$1" | sed 's|.*/||' | sort -u)
+  have=$(sed -n '/^P2_BROADCAST_SCRIPTS=(/,/)/p' "$CE" | tr ' ()' '\n\n\n' | grep '\.s\.sol$' | sort -u)
+  [[ -n "$want" && "$want" == "$have" ]]
+}
+p2_list_sync "$G/../ops/regenesis.sh" && ok "ceremony C10: P2_BROADCAST_SCRIPTS is every script regenesis.sh broadcasts" ||
+  bad "ceremony C10: P2_BROADCAST_SCRIPTS is every script regenesis.sh broadcasts" "$(sed -n 's/^[[:space:]]*run_step "\([^"]*\)".*/\1/p' "$G/../ops/regenesis.sh")"
+{ cat "$G/../ops/regenesis.sh"; echo 'run_step "DeployNewThing.s.sol"'; } >"$T/regenesis-extra.sh"
+p2_list_sync "$T/regenesis-extra.sh" && bad "ceremony C10: the list check catches a script added to regenesis.sh (negative control)" ||
+  ok "ceremony C10: the list check catches a script added to regenesis.sh (negative control)"
 # After a --confirm P2, the deployer-derived fee recipients of the contracts in the book are
 # read from the chain and must be the book's (= the run's) deployer.
 C9B="$T/c9-book.json"
@@ -1531,7 +1545,7 @@ EOF
           else
             bad "fresh genesis e2e ($label): a gate failure after P2 broadcast names the record step, never a P2 re-run (exit $rc, nonce $n_sent)" "$out"
           fi
-          expect "fresh genesis e2e ($label): --from P2 is refused after P2 broadcast" 3 'this run.s P2 broadcasts are already recorded' -- "${FENV[@]}" bash "$CE" --confirm --from P2 --account fixture
+          expect "fresh genesis e2e ($label): P2 is refused once its broadcasts are recorded" 3 'this run.s P2 broadcasts are already recorded' -- "${FENV[@]}" bash "$CE" --confirm --only P2 --account fixture
           [[ "$(fcast nonce "$FDEP")" == "$n_sent" ]] && ok "fresh genesis e2e ($label): the refused P2 re-run sent nothing" ||
             bad "fresh genesis e2e ($label): the refused P2 re-run sent nothing" "nonce $n_sent -> $(fcast nonce "$FDEP")"
           expect "fresh genesis e2e ($label): the record step verifies and records the book from the broadcasts and the chain" 0 'P2 stack book recorded' -- "${FENV[@]}" bash "$CE" --confirm --only P2 --record-stack-book --account fixture
