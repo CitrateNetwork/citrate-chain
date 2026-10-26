@@ -45,7 +45,7 @@ log() { echo "[r1006 $(date -u +%H:%M:%S)] $*" >&2; }
 
 cmd="${1:-}"; shift || true
 NODE="" DUMP="" WORK="" INPUTS="$HERE/inputs.placeholder.env" REF=HEAD OUT=""
-VALIDATORS="$CHAIN_ROOT/core/economics/assets/r1006/validators.json"
+VALIDATORS="$CHAIN_ROOT/core/economics/assets/r1006/validators.json" ORANGESEED=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --node) NODE="$2"; shift 2 ;;
@@ -56,6 +56,7 @@ while [[ $# -gt 0 ]]; do
     --ref) REF="$2"; shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
     --solc) SOLC_BIN="$2"; shift 2 ;;
+    --orangeseed) ORANGESEED="$2"; shift 2 ;;
     *) die "unknown argument $1" ;;
   esac
 done
@@ -101,7 +102,7 @@ case "$cmd" in
   alloc)
     [[ -f "$WORK/dump.json" ]] || die "--work has no dump.json (run ceremony first)"
     exec "$PY" "$HERE/emit_alloc.py" --dump "$WORK/dump.json" --inputs "$WORK/inputs.env" \
-      --manifest "$WORK/book/ceremony-run.json" --validators "$WORK/validators.json" --out "${OUT:-$WORK/alloc.json}"
+      --manifest "$WORK/book/ceremony-run.json" --book "$WORK/book/40204.json" ${ORANGESEED:+--orangeseed "$ORANGESEED"} --out "${OUT:-$WORK/alloc.json}"
     ;;
   _inner) ;;
   *) sed -n '2,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//' >&2; exit 1 ;;

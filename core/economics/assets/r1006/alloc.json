@@ -3,8 +3,7 @@
  "profile": "r1006",
  "inputsStatus": "placeholder",
  "inputsSha256": "",
- "validatorsStatus": "placeholder",
- "validatorsKeccak256": "",
+ "validatorRegistry": "0x0000000000000000000000000000000000000000",
  "orangeseed": null,
  "deployer": "0x0000000000000000000000000000000000000000",
  "accounts": []

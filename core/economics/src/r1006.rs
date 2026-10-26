@@ -87,8 +87,8 @@ struct AllocFile {
     inputs_status: String,
     #[allow(dead_code)]
     inputs_sha256: String,
-    validators_status: String,
-    validators_keccak256: String,
+    /// The ceremony's ValidatorRegistry (the producer set is registered there).
+    validator_registry: String,
     /// TYPED SLOT for the OrangeSeed accounts: `null` until the OrangeSeed artifacts
     /// (proxy + implementation code and storage, from its PR's GenesisOrangeSeed script)
     /// are merged in by `emit_alloc.py --orangeseed`. While `null` the genesis is not
@@ -118,14 +118,56 @@ struct AllocAccount {
     storage: BTreeMap<String, String>,
 }
 
+/// The producer set file (`assets/r1006/validators.json`, schema `r1006-validators/1`),
+/// written by `scripts/genesis/r1006/fill_producers.py`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ValidatorsFile {
     #[serde(rename = "_doc", default)]
     #[allow(dead_code)]
     doc: Option<String>,
+    schema: String,
     status: String,
-    producers: Vec<serde_json::Value>,
+    #[serde(rename = "validatorRegistry")]
+    validator_registry: Option<String>,
+    validators: Vec<ValidatorEntry>,
+    /// The registry's state after registering `validators` at block 0, computed by
+    /// running the registry's own code (contracts/script/GenesisValidators.s.sol).
+    registry: Option<RegistryDelta>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValidatorEntry {
+    #[allow(dead_code)]
+    name: String,
+    proposer_pubkey: String,
+    staker: String,
+    stake_wei: String,
+    /// The staker's liquid balance at genesis (gas), wei.
+    liquid_wei: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct RegistryDelta {
+    balance: String,
+    #[allow(dead_code)]
+    activation_epoch: u64,
+    storage: BTreeMap<String, String>,
+}
+
+fn decimal(s: &str, what: &str) -> Result<U256, GenesisError> {
+    U256::from_dec_str(s).map_err(|e| invalid(format!("{what} {s}: {e:?}")))
+}
+
+fn parse_validators() -> Result<ValidatorsFile, GenesisError> {
+    let v: ValidatorsFile = serde_json::from_str(R1006_VALIDATORS_JSON)
+        .map_err(|e| invalid(format!("validators.json: {e}")))?;
+    if v.schema != "r1006-validators/1" {
+        return Err(invalid("validators.json: not r1006-validators/1"));
+    }
+    Ok(v)
 }
 
 fn invalid(msg: impl Into<String>) -> GenesisError {
@@ -159,12 +201,6 @@ fn quantity(s: &str) -> Result<U256, GenesisError> {
         .strip_prefix("0x")
         .ok_or_else(|| invalid(format!("balance {s}: no 0x prefix")))?;
     U256::from_str_radix(h, 16).map_err(|e| invalid(format!("balance {s}: {e}")))
-}
-
-/// keccak256 (hex) of the validators file bytes: the binding the alloc records
-/// (`validatorsKeccak256`, written by emit_alloc.py from the same file).
-pub fn validators_digest() -> String {
-    hex::encode(Keccak256::digest(R1006_VALIDATORS_JSON.as_bytes()))
 }
 
 /// The storage of a Solidity `string` at slot 0 holding `s`.
@@ -260,16 +296,15 @@ pub fn readiness() -> Result<Readiness, GenesisError> {
             true
         }
     };
-    let v: ValidatorsFile = serde_json::from_str(R1006_VALIDATORS_JSON)
-        .map_err(|e| invalid(format!("validators.json: {e}")))?;
-    let validators_filled = v.status == "final"
-        && v.producers.len() == R1006_PRODUCER_COUNT
-        && v.producers.iter().all(|p| p.is_object());
+    let v = parse_validators()?;
+    let vr = address(&f.validator_registry)?;
+    let validators_final = v.status == "final"
+        && v.validators.len() == R1006_PRODUCER_COUNT
+        && v.registry.is_some()
+        && v.validator_registry.as_deref().map(address).transpose()? == Some(vr);
     Ok(Readiness {
         inputs_final: f.inputs_status == "final",
-        validators_final: validators_filled
-            && f.validators_status == "final"
-            && f.validators_keccak256 == validators_digest(),
+        validators_final,
         orangeseed_present,
     })
 }
@@ -280,8 +315,42 @@ impl GenesisConfig {
     /// base account at the same address (the Arachnid factory, whose nonce the ceremony
     /// moved). The mining pool is what the 1T supply leaves after every pre-allocation.
     pub fn r1006() -> Result<Self, GenesisError> {
-        let (_, ceremony) = parse_alloc()?;
+        let (f, mut ceremony) = parse_alloc()?;
+        let v = parse_validators()?;
+        if let Some(reg) = &v.registry {
+            let vr = address(&f.validator_registry)?;
+            if v.validator_registry.as_deref().map(address).transpose()? != Some(vr) {
+                return Err(invalid("validators.json was filled for another ValidatorRegistry"));
+            }
+            let acct = ceremony
+                .iter_mut()
+                .find(|a| a.address == vr)
+                .ok_or_else(|| invalid("the ValidatorRegistry is not in the alloc"))?;
+            acct.balance = decimal(&reg.balance, "registry balance")?;
+            let mut slots: BTreeMap<[u8; 32], [u8; 32]> = acct.storage.iter().copied().collect();
+            for (k, val) in &reg.storage {
+                let val = word(val, "registry storage value")?;
+                let k = word(k, "registry storage slot")?;
+                if val == [0u8; 32] {
+                    slots.remove(&k);
+                } else {
+                    slots.insert(k, val);
+                }
+            }
+            acct.storage = slots.into_iter().collect();
+        }
         let mut extra = ceremony;
+        for e in &v.validators {
+            let _ = word(&e.proposer_pubkey, "proposer_pubkey")?;
+            let _ = decimal(&e.stake_wei, "stake_wei")?;
+            extra.push(GenesisAccount {
+                address: address(&e.staker)?,
+                balance: decimal(&e.liquid_wei, "liquid_wei")?,
+                nonce: 0,
+                code: None,
+                storage: vec![],
+            });
+        }
         extra.push(GenesisAccount {
             address: GENESIS_NOTE_ADDRESS,
             balance: U256::zero(),
@@ -317,6 +386,20 @@ impl GenesisConfig {
         cfg.validate()?;
         Ok(cfg)
     }
+}
+
+/// Block 0's hash for `cfg`, built exactly as a node builds it (shared genesis state
+/// on a fresh executor, the canonical genesis block, its state root).
+pub fn genesis_block_hash(cfg: &GenesisConfig) -> Result<[u8; 32], GenesisError> {
+    use citrate_execution::executor::Executor;
+    use citrate_execution::state::state_db::StateDB;
+    use std::sync::Arc;
+    let ex = Arc::new(Executor::with_chain_id(Arc::new(StateDB::new()), cfg.chain_id));
+    let root = crate::genesis::initialize_shared_genesis_state(&ex, cfg)?;
+    let mut b =
+        crate::genesis::create_canonical_genesis_block(crate::genesis::CANONICAL_GENESIS_TIMESTAMP);
+    b.state_root = citrate_consensus::types::Hash::new(root);
+    Ok(*crate::genesis::calculate_canonical_block_hash(&b).as_bytes())
 }
 
 #[cfg(test)]
@@ -363,16 +446,7 @@ mod tests {
     }
 
     fn genesis_hash_of(cfg: &GenesisConfig) -> [u8; 32] {
-        use citrate_execution::executor::Executor;
-        use citrate_execution::state::state_db::StateDB;
-        use std::sync::Arc;
-        let ex = Arc::new(Executor::with_chain_id(Arc::new(StateDB::new()), 40204));
-        let root = crate::genesis::initialize_shared_genesis_state(&ex, cfg).expect("genesis");
-        let mut b = crate::genesis::create_canonical_genesis_block(
-            crate::genesis::CANONICAL_GENESIS_TIMESTAMP,
-        );
-        b.state_root = citrate_consensus::types::Hash::new(root);
-        *crate::genesis::calculate_canonical_block_hash(&b).as_bytes()
+        genesis_block_hash(cfg).expect("genesis")
     }
 
     /// The compiled profile builds exactly the block 0 the release pins, twice over.
@@ -397,9 +471,11 @@ mod tests {
     /// Every account in the ceremony alloc reaches the genesis byte for byte.
     #[test]
     fn every_alloc_account_is_in_the_profile_unchanged() {
-        let (_, alloc) = parse_alloc().expect("alloc");
+        let (f, alloc) = parse_alloc().expect("alloc");
         let cfg = GenesisConfig::r1006().expect("r1006");
-        for a in &alloc {
+        let vr = address(&f.validator_registry).expect("vr");
+        let filled = parse_validators().expect("validators").registry.is_some();
+        for a in alloc.iter().filter(|a| !(filled && a.address == vr)) {
             let g = cfg
                 .accounts
                 .iter()

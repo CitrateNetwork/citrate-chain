@@ -1471,7 +1471,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         g
     };
     let genesis_acts =
-        running_genesis.and_then(|g| citrate_consensus::hardening::genesis_activations(&g));
+        running_genesis.and_then(|g| citrate_consensus::hardening::rules_for_genesis(config.chain.chain_id, &g));
     if config.chain.genesis_profile.as_deref() == Some(genesis::R1006_PROFILE)
         && genesis_acts.is_none()
     {

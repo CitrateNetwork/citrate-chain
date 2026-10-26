@@ -48,8 +48,8 @@ cat >"$T/dump.json" <<EOF
 EOF
 printf '{"deployer":"%s"}\n' "$DEP" >"$T/manifest.json"
 printf 'R1006_INPUTS_STATUS=placeholder\n' >"$T/inputs.env"
-printf '{"status":"placeholder","producers":[null,null,null,null,null,null,null]}\n' >"$T/validators.json"
-EA=(python3 "$HERE/emit_alloc.py" --dump "$T/dump.json" --manifest "$T/manifest.json" --inputs "$T/inputs.env" --validators "$T/validators.json")
+printf '{"contracts":{"ValidatorRegistry":"0x00000000000000000000000000000000000000c1"}}\n' >"$T/book40204.json"
+EA=(python3 "$HERE/emit_alloc.py" --dump "$T/dump.json" --manifest "$T/manifest.json" --inputs "$T/inputs.env" --book "$T/book40204.json")
 "${EA[@]}" --out "$T/a1.json" 2>/dev/null && "${EA[@]}" --out "$T/a2.json" 2>/dev/null
 cmp -s "$T/a1.json" "$T/a2.json" && ok "emit_alloc is byte-for-byte deterministic" || bad "emit_alloc is byte-for-byte deterministic"
 got=$(jq -c '[.accounts[] | [.address[-2:], .balance, .nonce, (.code // "-"), (.storage // {} | length)]]' "$T/a1.json")
@@ -58,7 +58,7 @@ want='[["c1","0x5",1,"0x6000",1],["c2","0x0",0,"-",1],["11","0x0",61,"-",0]]'
   bad "emit_alloc keeps code/storage accounts and the deployer (zero balance), drops EOAs and zero slots" "$got"
 jq '.accounts[3].code = "0x60"' "$T/dump.json" >"$T/dump-bad.json"
 expect "emit_alloc refuses a deployer with code" 1 'deployer has code' -- \
-  python3 "$HERE/emit_alloc.py" --dump "$T/dump-bad.json" --manifest "$T/manifest.json" --inputs "$T/inputs.env" --validators "$T/validators.json" --out "$T/a3.json"
+  python3 "$HERE/emit_alloc.py" --dump "$T/dump-bad.json" --manifest "$T/manifest.json" --inputs "$T/inputs.env" --book "$T/book40204.json" --out "$T/a3.json"
 
 # ------------------------------------------------------------ fill_producers
 VR=0x1111111111111111111111111111111111111111

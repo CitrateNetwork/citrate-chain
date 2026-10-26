@@ -194,47 +194,48 @@ pub const R1006_GENESIS: [u8; 32] =
     hex32("0000000000000000000000000000000000000000000000000000000000000000");
 
 /// Activation heights compiled into this release for ONE genesis, keyed by its block-0
-/// hash rather than by chain id. r1005 and r1006 share chain id 40204; a rule scheduled
-/// for r1006 must not reach a node still on r1005's genesis, and r1005's compiled
-/// constants must not reach r1006.
+/// hash rather than by chain id. r1005 and r1006 share chain id 40204, so a per-chain pin
+/// `(40204, Some(0))` would also switch the rule on for an r1005 node rebuilt from this
+/// release and fork it off the live r1005 chain. Keying by genesis keeps r1005's rules
+/// exactly as they are (its genesis has no entry here) and gives r1006 its own.
 ///
-/// Each field is a rule's activation height (`None` = not scheduled). A field whose rule
-/// is not in this build yet is a typed slot: it records the owner's decision so the PR
-/// that adds the rule only has to read it (see `wired` below).
+/// ONE mechanism for every height-gated rule: a module resolves its height with
+/// [`rules_for_genesis`] for the genesis the node actually loaded, and only falls back to
+/// its per-chain pin table when that returns `None`. A field whose rule is not in this
+/// build is a typed slot: it records the owner's schedule, and the PR that adds the rule
+/// reads it from here (see [`GenesisActivations::WIRED`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenesisActivations {
-    /// Block-validity hardening (this module).
+    /// Block-validity hardening (this module, `PINNED_ACTIVATIONS`).
     pub pba_hardening: Option<u64>,
-    /// Exact created code (`citrate_execution::exact_code`).
+    /// Exact created code (`citrate_execution::exact_code`, `EXACT_CREATE_CODE_PINS`).
     pub exact_create_code: Option<u64>,
-    /// Canonical ECVRF point encoding. Typed slot: the rule is in a separate PR.
+    /// Canonical ECVRF point encoding (`VRF_CANONICAL_ENCODING_PINS`). Typed slot.
     pub vrf_canonical_encoding: Option<u64>,
-    /// Storage-root hardening. Typed slot: the rule is in a separate PR.
+    /// Storage root from the slot set (`citrate_execution::storage_root_hardening`,
+    /// `STORAGE_ROOT_HARDENING_PINS`). Typed slot.
     pub storage_root_hardening: Option<u64>,
-    /// Journaled fee settlement. Typed slot: the rule is in a separate PR.
-    pub journaled_fee_settlement: Option<u64>,
-    /// Executed-state rewards. Typed slot: the rule is in a separate PR.
-    pub executed_state_rewards: Option<u64>,
-    /// Journaled in-transaction writes. Typed slot: the rule is in a separate PR.
-    pub journaled_in_tx_writes: Option<u64>,
+    /// Journaled fee settlement, rewards from executed state and journaled in-tx writes,
+    /// one height (`citrate_execution::supply_hardening`, `SUPPLY_HARDENING_PINS`).
+    /// Typed slot.
+    pub supply_hardening: Option<u64>,
 }
 
 impl GenesisActivations {
     /// Every rule, by name, with its height, in a fixed order (for logs and the
     /// consensus fingerprint).
-    pub fn entries(&self) -> [(&'static str, Option<u64>); 7] {
+    pub fn entries(&self) -> [(&'static str, Option<u64>); 5] {
         [
             ("pba_hardening", self.pba_hardening),
             ("exact_create_code", self.exact_create_code),
             ("vrf_canonical_encoding", self.vrf_canonical_encoding),
             ("storage_root_hardening", self.storage_root_hardening),
-            ("journaled_fee_settlement", self.journaled_fee_settlement),
-            ("executed_state_rewards", self.executed_state_rewards),
-            ("journaled_in_tx_writes", self.journaled_in_tx_writes),
+            ("supply_hardening", self.supply_hardening),
         ]
     }
 
-    /// The rules this build enforces from these heights. The others are recorded only.
+    /// The rules this build enforces from these heights. The others are recorded only,
+    /// until their module (a separate PR) consults [`rules_for_genesis`].
     pub const WIRED: &'static [&'static str] = &["pba_hardening", "exact_create_code"];
 }
 
@@ -246,14 +247,30 @@ pub const R1006_ACTIVATIONS: GenesisActivations = GenesisActivations {
     exact_create_code: Some(0),
     vrf_canonical_encoding: Some(0),
     storage_root_hardening: Some(0),
-    journaled_fee_settlement: Some(0),
-    executed_state_rewards: Some(0),
-    journaled_in_tx_writes: Some(0),
+    supply_hardening: Some(0),
 };
 
 /// Per-genesis activations compiled into this release.
 pub const GENESIS_ACTIVATIONS: &[([u8; 32], GenesisActivations)] =
     &[(R1006_GENESIS, R1006_ACTIVATIONS)];
+
+/// The genesis-keyed rules for a node on `chain_id` whose loaded block 0 is `genesis`:
+///
+/// * a genesis with compiled activations (r1006): `Some` of them, whatever the chain id
+///   (a per-chain pin never overrides them);
+/// * any other genesis, including r1005's and an unknown one: `None`, explicitly. The
+///   module then uses its per-chain pin table exactly as before, so an r1005 node rebuilt
+///   from this release replays its chain unchanged.
+///
+/// An unknown genesis on 40204 gets `None` rather than a refusal: the r1006 ceremony
+/// devnet and every local rehearsal run 40204 with their own genesis, and such a node
+/// cannot pass for a release network (the handshake compares genesis hashes, and
+/// `check_genesis_chain` binds the release geneses to their chain). A node that asks
+/// for the r1006 profile but loads another genesis IS refused, by the node at start-up.
+pub fn rules_for_genesis(chain_id: u64, genesis: &[u8; 32]) -> Option<GenesisActivations> {
+    let _ = chain_id;
+    genesis_activations(genesis)
+}
 
 /// The activations compiled for the chain whose block 0 is `genesis`, if any.
 pub fn genesis_activations(genesis: &[u8; 32]) -> Option<GenesisActivations> {
@@ -960,12 +977,43 @@ mod tests {
         for (name, h) in R1006_ACTIVATIONS.entries() {
             assert_eq!(h, Some(0), "{name}: the owner set every new rule to 0 on r1006");
         }
+        let names: Vec<&str> = R1006_ACTIVATIONS.entries().iter().map(|e| e.0).collect();
+        assert_eq!(
+            names,
+            [
+                "pba_hardening",
+                "exact_create_code",
+                "vrf_canonical_encoding",
+                "storage_root_hardening",
+                "supply_hardening"
+            ]
+        );
         for w in GenesisActivations::WIRED {
             assert!(
                 R1006_ACTIVATIONS.entries().iter().any(|(n, _)| n == w),
                 "{w} is a field"
             );
         }
+    }
+
+    /// r1005's genesis on the new binary: no genesis-keyed rule, so every module keeps its
+    /// per-chain pin (the new rules stay unset: replay-identical). r1006's genesis: every
+    /// rule at 0. An unknown genesis on 40204: `None`, explicitly.
+    #[test]
+    fn genesis_keyed_rules_r1005_none_r1006_zero_unknown_none() {
+        let r1005 = RELEASE_GENESIS[0].1;
+        assert_eq!(rules_for_genesis(40204, &r1005), None);
+        for (_, g) in RELEASE_GENESIS.iter().filter(|(_, g)| *g != R1006_GENESIS) {
+            assert_eq!(rules_for_genesis(40204, g), None, "{}", hex::encode(g));
+        }
+        let r = rules_for_genesis(40204, &R1006_GENESIS).expect("r1006 has rules");
+        assert!(r.entries().iter().all(|(_, h)| *h == Some(0)), "{r:?}");
+        assert_eq!(rules_for_genesis(40204, &[0x42; 32]), None, "unknown genesis");
+        assert_eq!(
+            rules_for_genesis(1337, &R1006_GENESIS),
+            Some(R1006_ACTIVATIONS),
+            "keyed by genesis, not chain id"
+        );
     }
 
     #[test]

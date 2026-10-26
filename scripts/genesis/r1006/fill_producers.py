@@ -1,46 +1,58 @@
 #!/usr/bin/env python3
-"""fill_producers.py: fill the r1006 producer set (the validators registered at genesis).
+"""fill_producers.py: the r1006 validator-set fill (the producers registered at block 0).
 
-The r1006 genesis registers its 7 producers in the ValidatorRegistry during the ceremony,
-so block 0 already has them in the active set. Each producer supplies PUBLIC values only:
+The bring-up (scripts/ops/r1006_bringup.sh genesis-fill, chain#390) calls it as
 
-  name             a label (operator / host)
-  staker           the staker EOA (pays the bond on the ceremony devnet; holds the validator)
-  proposerPubkey   the node's ed25519 proposer public key (32 bytes, 0x-hex)
-  registrationSig  the proposer key's ed25519 signature over the registration digest
-                   (`digest` below), 64 bytes, 0x-hex: proof that the producer holds the key
-  stake            bond in wei (decimal string), >= the registry's 32,000 SALT minimum
+  fill_producers.py PRODUCERS STAKES OUT
 
-Commands
-  digest --registry VR --staker S --pubkey P
-      prints the 32-byte digest a producer signs (chain 40204, nonce 0), the same bytes the
-      contract and citrate_consensus::crypto::registration_digest build.
-  fill --registry VR --from producers.json [--out PATH]
-      checks every entry (7 producers, distinct stakers and keys, every signature verifies
-      for this registry) and writes the validators file with status "final". Rebuild the
-      genesis afterwards (build_r1006_genesis.sh): the alloc records this file's hash, and
-      the r1006 profile is release-ready only when the two agree.
-  check [--path PATH]
-      re-verifies a filled file; exit 1 on any problem, and on a placeholder.
+  PRODUCERS  r1006-producers.json (schema r1006-producers/1, public parts only, from
+             `citrate host-identity` via collect.py): per producer name, proposer_pubkey,
+             staker_address (== coinbase_address, a consensus rule)
+  STAKES     r1006-stakes.json (schema r1006-stakes/1): per staker stake_wei (bonded in the
+             ValidatorRegistry) and liquid_wei (the staker's balance at genesis, for gas)
+  OUT        a directory; receives fill-result.json (schema r1006-genesis-fill/1, the
+             contract in chain#390's render_profile.py), genesis-alloc.json and book.json
 
-Exit: 0 ok, 1 invalid input, 2 usage.
+What it does, in order (any failure exits non-zero and writes no fill-result.json):
+  1. checks both inputs (schemas, exact field forms, distinct keys and stakers, staker ==
+     coinbase, every producer staked >= 32,000 SALT);
+  2. computes the ValidatorRegistry's block-0 state with the producers registered, by
+     running the registry's own code from the genesis alloc in a local EVM
+     (contracts/script/GenesisValidators.s.sol; no chain, nothing signed);
+  3. writes core/economics/assets/r1006/validators.json (status final);
+  4. builds the r1006 genesis from the compiled profile (cargo run of the economics
+     example r1006_genesis_hash) and pins its hash as R1006_GENESIS in
+     core/consensus/src/hardening.rs;
+  5. writes OUT/fill-result.json and the files it names.
+Then commit the two changed files and build the release binary: the node embeds the
+genesis, so the hosts select it by profile (genesis_profile "r1006", genesis_file null).
+
+  fill_producers.py check [--path validators.json]   re-check a filled set (exit 1 on a
+                                                     placeholder or any problem)
 """
-import argparse
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
-DEFAULT_PATH = "core/economics/assets/r1006/validators.json"
-CHAIN_ID = 40204
-COUNT = 7
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[2]
+ASSETS = ROOT / "core/economics/assets/r1006"
+HARDENING = ROOT / "core/consensus/src/hardening.rs"
+BOOK = ROOT / "contracts/addresses/r1006/40204.json"
 MIN_STAKE = 32_000 * 10**18
-REGISTER_TYPE = "Register(uint256 chainId,address registry,address staker,bytes32 proposerPubkey,uint256 nonce)"
-ADDR = re.compile(r"^0x[0-9a-fA-F]{40}$")
-B32 = re.compile(r"^0x[0-9a-fA-F]{64}$")
-B64 = re.compile(r"^0x[0-9a-fA-F]{128}$")
-DOC = ("The r1006 producer set (7). Filled by scripts/genesis/r1006/fill_producers.py; "
-       "public values only: staker address, proposer public key, registration signature, stake.")
+MIN_PRODUCERS = 4
+ADDR = re.compile(r"^0x[0-9a-f]{40}$")
+B32 = re.compile(r"^0x[0-9a-f]{64}$")
+NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+ORANGESEED = "0x000000000000000000000000000000c17a7e5eed"
+DOC = ("The r1006 producer set, registered in the ValidatorRegistry at block 0. Written by "
+       "scripts/genesis/r1006/fill_producers.py from the bring-up's public producer set; public "
+       "values only.")
 
 
 def fail(msg):
@@ -48,110 +60,168 @@ def fail(msg):
     sys.exit(1)
 
 
-def keccak(data: bytes) -> bytes:
-    out = subprocess.run(["cast", "keccak", "0x" + data.hex()], capture_output=True, text=True, check=True)
-    return bytes.fromhex(out.stdout.strip()[2:])
-
-
-def word_u(n: int) -> bytes:
-    return n.to_bytes(32, "big")
-
-
-def word_a(a: str) -> bytes:
-    return bytes(12) + bytes.fromhex(a[2:])
-
-
-def digest(registry: str, staker: str, pubkey: str, nonce: int = 0) -> bytes:
-    return keccak(keccak(REGISTER_TYPE.encode()) + word_u(CHAIN_ID) + word_a(registry) + word_a(staker)
-                  + bytes.fromhex(pubkey[2:]) + word_u(nonce))
-
-
-def verify(pubkey: str, sig: str, msg: bytes) -> bool:
-    from cryptography.exceptions import InvalidSignature
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+def load(p):
     try:
-        Ed25519PublicKey.from_public_bytes(bytes.fromhex(pubkey[2:])).verify(bytes.fromhex(sig[2:]), msg)
-        return True
-    except (InvalidSignature, ValueError):
-        return False
+        return json.loads(Path(p).read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        fail(f"cannot read {p}: {e}")
 
 
-def check_entries(registry, producers):
-    if not ADDR.match(registry or "") or int(registry, 16) == 0:
-        fail(f"registry {registry!r} is not an address")
-    if len(producers) != COUNT:
-        fail(f"{len(producers)} producers, want {COUNT}")
-    stakers, keys, names = set(), set(), set()
-    out = []
-    for i, p in enumerate(producers):
-        if not isinstance(p, dict):
-            fail(f"producer {i}: not filled")
-        extra = set(p) - {"name", "staker", "proposerPubkey", "registrationSig", "stake"}
-        if extra:
-            fail(f"producer {i}: unknown fields {sorted(extra)}")
-        name, staker, pk, sig = p.get("name"), p.get("staker", ""), p.get("proposerPubkey", ""), p.get("registrationSig", "")
-        if not isinstance(name, str) or not re.match(r"^[A-Za-z0-9_.-]{1,40}$", name):
-            fail(f"producer {i}: bad name {name!r}")
-        if not ADDR.match(staker) or int(staker, 16) == 0:
-            fail(f"{name}: bad staker {staker!r}")
+def check_inputs(producers, stakes):
+    if producers.get("schema") != "r1006-producers/1":
+        fail("producers: schema is not r1006-producers/1")
+    if producers.get("chain_id", 40204) != 40204:
+        fail("producers: chain_id is not 40204")
+    if stakes.get("schema") != "r1006-stakes/1":
+        fail("stakes: schema is not r1006-stakes/1")
+    ps = producers.get("producers")
+    if not isinstance(ps, list) or len(ps) < MIN_PRODUCERS:
+        fail(f"producers: need at least {MIN_PRODUCERS}")
+    st = {k.lower(): v for k, v in stakes.get("stakes", {}).items()}
+    out, seen = [], {}
+    for p in ps:
+        name = p.get("name", "")
+        if not NAME.match(str(name)):
+            fail(f"producers: bad name {name!r}")
+        pk, staker, cb = (str(p.get(k, "")) for k in ("proposer_pubkey", "staker_address", "coinbase_address"))
         if not B32.match(pk) or int(pk, 16) == 0:
-            fail(f"{name}: proposerPubkey must be 32 bytes of 0x-hex")
-        if not B64.match(sig):
-            fail(f"{name}: registrationSig must be 64 bytes of 0x-hex")
+            fail(f"{name}: proposer_pubkey is not a 32-byte key (lowercase 0x-hex)")
+        if not ADDR.match(staker) or int(staker, 16) == 0:
+            fail(f"{name}: staker_address is not an address (lowercase 0x-hex)")
+        if cb != staker:
+            fail(f"{name}: staker and coinbase differ (consensus requires coinbase == staker)")
+        for k, v in (("name", name), ("proposer_pubkey", pk), ("staker", staker)):
+            if (k, v) in seen:
+                fail(f"{name}: {k} is the same as {seen[(k, v)]}'s")
+            seen[(k, v)] = name
+        s = st.get(staker)
+        if s is None:
+            fail(f"{name}: staker {staker} has no stake allocation")
         try:
-            stake = int(str(p.get("stake")), 10)
-        except ValueError:
-            fail(f"{name}: stake must be a decimal wei string")
+            stake, liquid = int(s["stake_wei"]), int(s["liquid_wei"])
+        except (KeyError, ValueError):
+            fail(f"{name}: stake_wei / liquid_wei must be decimal wei strings")
         if stake < MIN_STAKE:
             fail(f"{name}: stake {stake} is below the 32,000 SALT minimum")
-        staker, pk, sig = staker.lower(), pk.lower(), sig.lower()
-        for seen, v, what in ((names, name, "name"), (stakers, staker, "staker"), (keys, pk, "proposerPubkey")):
-            if v in seen:
-                fail(f"{name}: duplicate {what} {v}")
-            seen.add(v)
-        if not verify(pk, sig, digest(registry.lower(), staker, pk)):
-            fail(f"{name}: registrationSig does not verify for registry {registry} and staker {staker}")
-        out.append({"name": name, "staker": staker, "proposerPubkey": pk, "registrationSig": sig, "stake": str(stake)})
+        if liquid < 0:
+            fail(f"{name}: negative liquid_wei")
+        out.append({"name": name, "proposer_pubkey": pk, "staker": staker,
+                    "stake_wei": str(stake), "liquid_wei": str(liquid)})
+    if set(st) - {v["staker"] for v in out}:
+        fail(f"stakes: allocations for stakers that are not producers: {sorted(set(st) - {v['staker'] for v in out})}")
     return out
 
 
-def write(path, registry, producers):
-    v = {"_doc": DOC, "status": "final", "validatorRegistry": registry.lower(), "producers": producers}
-    with open(path, "w", newline="\n") as f:
-        f.write(json.dumps(v, indent=1) + "\n")
+def registry_delta(alloc, validators, ts):
+    vr = alloc["validatorRegistry"]
+    acct = next((a for a in alloc["accounts"] if a["address"] == vr), None)
+    if acct is None or not acct.get("code"):
+        fail(f"the ValidatorRegistry {vr} has no code in the alloc")
+    forge = shutil.which("forge") or fail("forge is required")
+    with tempfile.TemporaryDirectory(prefix="r1006-fill-") as t:
+        t = Path(t)
+        (t / "script").mkdir()
+        (t / "lib").mkdir()
+        (t / "genesis").mkdir()
+        os.symlink(ROOT / "contracts/lib/forge-std", t / "lib/forge-std")
+        shutil.copy(ROOT / "contracts/script/GenesisValidators.s.sol", t / "script/")
+        (t / "foundry.toml").write_text(
+            '[profile.default]\nsrc = "script"\nlibs = ["lib"]\nevm_version = "cancun"\n'
+            'fs_permissions = [{ access = "read-write", path = "./genesis" }]\n')
+        (t / "remappings.txt").write_text("forge-std/=lib/forge-std/src/\n")
+        state = {"code": acct["code"], "balance": acct["balance"], "storage": acct.get("storage", {})}
+        (t / "genesis/vr.json").write_text(json.dumps(state))
+        (t / "genesis/validators.json").write_text(json.dumps({"validators": validators}))
+        env = dict(os.environ, FOUNDRY_OFFLINE="true", GENESIS_VR=vr, GENESIS_VR_STATE="genesis/vr.json",
+                   GENESIS_VALIDATORS="genesis/validators.json", GENESIS_TIMESTAMP=str(ts),
+                   GENESIS_VALIDATORS_OUT="genesis/out.json")
+        r = subprocess.run([forge, "script", "script/GenesisValidators.s.sol"], cwd=t, env=env,
+                           capture_output=True, text=True)
+        if r.returncode != 0 or not (t / "genesis/out.json").exists():
+            fail(f"GenesisValidators failed:\n{r.stdout[-3000:]}\n{r.stderr[-3000:]}")
+        out = json.loads((t / "genesis/out.json").read_text())
+    st = out["storage"]
+    if isinstance(st, str):
+        st = json.loads(st)
+    return {"balance": str(int(str(out["balance"]), 0)), "activationEpoch": int(out["activationEpoch"]),
+            "storage": {k.lower(): v.lower() for k, v in sorted(st.items())}}
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    d = sub.add_parser("digest")
-    d.add_argument("--registry", required=True)
-    d.add_argument("--staker", required=True)
-    d.add_argument("--pubkey", required=True)
-    f = sub.add_parser("fill")
-    f.add_argument("--registry", required=True)
-    f.add_argument("--from", dest="src", required=True)
-    f.add_argument("--out", default=DEFAULT_PATH)
-    c = sub.add_parser("check")
-    c.add_argument("--path", default=DEFAULT_PATH)
-    a = ap.parse_args()
-    if a.cmd == "digest":
-        for v, rx, w in ((a.registry, ADDR, "registry"), (a.staker, ADDR, "staker"), (a.pubkey, B32, "pubkey")):
-            if not rx.match(v):
-                fail(f"bad {w} {v!r}")
-        print("0x" + digest(a.registry.lower(), a.staker.lower(), a.pubkey.lower()).hex())
-    elif a.cmd == "fill":
-        src = json.load(open(a.src))
-        producers = src["producers"] if isinstance(src, dict) else src
-        write(a.out, a.registry, check_entries(a.registry, producers))
-        print(f"fill_producers: {COUNT} producers verified for registry {a.registry.lower()}; wrote {a.out}")
-    else:
-        v = json.load(open(a.path))
-        if v.get("status") != "final":
-            fail(f"{a.path} is a placeholder (status {v.get('status')!r})")
-        check_entries(v.get("validatorRegistry"), v.get("producers", []))
-        print(f"fill_producers: {a.path} OK")
+def genesis_hash():
+    env = dict(os.environ, CARGO_PROFILE_DEV_DEBUG="0")
+    r = subprocess.run(["cargo", "run", "--locked", "-q", "-p", "citrate-economics", "--example", "r1006_genesis_hash"],
+                       cwd=ROOT, env=env, capture_output=True, text=True)
+    m = re.search(r"R1006_GENESIS=0x([0-9a-f]{64})", r.stdout)
+    if r.returncode != 0 or not m:
+        fail(f"cannot build the r1006 genesis:\n{r.stdout[-2000:]}\n{r.stderr[-3000:]}")
+    return m.group(1)
+
+
+def pin_hash(h):
+    src = HARDENING.read_text()
+    new, n = re.subn(r'(pub const R1006_GENESIS: \[u8; 32\] =\s*hex32\(")[0-9a-f]{64}("\);)', rf"\g<1>{h}\g<2>", src)
+    if n != 1:
+        fail(f"cannot find the R1006_GENESIS pin in {HARDENING}")
+    HARDENING.write_text(new)
+
+
+def write_json(p, d):
+    p = Path(p)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(d, indent=1) + "\n")
+    tmp.replace(p)
+
+
+def main(argv):
+    if argv[:1] == ["check"]:
+        path = argv[2] if len(argv) > 2 and argv[1] == "--path" else ASSETS / "validators.json"
+        v = load(path)
+        if v.get("status") != "final" or not v.get("registry"):
+            fail(f"{path} is a placeholder (status {v.get('status')!r})")
+        print(f"fill_producers: {path}: {len(v['validators'])} producers, registry {v['validatorRegistry']}")
+        return
+    if len(argv) != 3:
+        fail("usage: fill_producers.py PRODUCERS STAKES OUT  |  fill_producers.py check [--path P]")
+    producers, stakes, out = load(argv[0]), load(argv[1]), Path(argv[2])
+    validators = check_inputs(producers, stakes)
+    alloc = load(ASSETS / "alloc.json")
+    if not ADDR.match(alloc.get("validatorRegistry", "")) or int(alloc["validatorRegistry"], 16) == 0:
+        fail("the compiled alloc names no ValidatorRegistry (build the ceremony alloc first)")
+    reg = registry_delta(alloc, validators, 1767225600)
+    write_json(ASSETS / "validators.json", {"_doc": DOC, "schema": "r1006-validators/1", "status": "final",
+                                            "validatorRegistry": alloc["validatorRegistry"],
+                                            "validators": validators, "registry": reg})
+    h = genesis_hash()
+    pin_hash(h)
+    h2 = genesis_hash()
+    if h2 != h:
+        fail(f"the genesis hash moved after pinning ({h} -> {h2})")
+    out.mkdir(parents=True, exist_ok=True)
+    write_json(out / "genesis-alloc.json",
+               {"alloc": {a["address"]: {"code": a["code"]} for a in alloc["accounts"] if a.get("code")}})
+    if BOOK.exists():
+        shutil.copy(BOOK, out / "book.json")
+    write_json(out / "fill-result.json", {
+        "schema": "r1006-genesis-fill/1",
+        "genesis_hash": "0x" + h,
+        "genesis_profile": "r1006",
+        "genesis_file": None,
+        "alloc_file": "genesis-alloc.json",
+        "address_book": "book.json" if BOOK.exists() else None,
+        "orangeseed": ORANGESEED if alloc.get("orangeseed") else None,
+        "validator_registry": alloc["validatorRegistry"],
+        "validator_activation_height": 0,
+        "validators": [{"proposer_pubkey": v["proposer_pubkey"], "staker": v["staker"], "stake_wei": v["stake_wei"]}
+                       for v in validators],
+        "validators_at_genesis": True,
+        "source": f"scripts/genesis/r1006/fill_producers.py (ceremony alloc inputs {alloc['inputsStatus']}, "
+                  f"{len(validators)} producers registered at block 0)",
+    })
+    print(f"fill_producers: {len(validators)} producers registered at block 0 in {alloc['validatorRegistry']}; "
+          f"genesis 0x{h}; wrote {out}/fill-result.json. Commit {ASSETS / 'validators.json'} and {HARDENING}, "
+          f"then build the release binary.")
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])

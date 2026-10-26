@@ -29,6 +29,13 @@ HEX = re.compile(r"^0x[0-9a-f]*$")
 ADDR = re.compile(r"^0x[0-9a-f]{40}$")
 WORD = re.compile(r"^0x[0-9a-f]{64}$")
 ORANGESEED_PROXY = "0x000000000000000000000000000000c17a7e5eed"
+ORANGESEED_IMPL = "0x000000000000000000000000000000c17a7e5ee0"
+# Pinned from chain#389's GenesisOrangeSeed output (its PR body lists the same hashes). The
+# code is taken from that script's output, never recompiled here.
+ORANGESEED_CODEHASHES = {
+    ORANGESEED_PROXY: "46a010df31eb642b47284650e80051e8f6239a0c995003d230b437810bc4b9b4",
+    ORANGESEED_IMPL: "d2a228771b614b678ea1bf4c9ecf415ceefc8f6af7462267d90947c91df6e96c",
+}
 
 
 def fail(msg):
@@ -58,21 +65,12 @@ def keccak_hex(data):
     return out.stdout.strip().removeprefix("0x")
 
 
-def read_validators(path):
-    raw = open(path, "rb").read()
-    v = json.loads(raw)
-    status = v.get("status")
-    if status not in ("placeholder", "final"):
-        fail("validators file must have status placeholder|final")
-    return status, keccak_hex(raw)
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dump", required=True)
     ap.add_argument("--inputs", required=True)
     ap.add_argument("--manifest", required=True)
-    ap.add_argument("--validators", required=True)
+    ap.add_argument("--book", required=True, help="the ceremony's stack book (contracts/addresses/40204.json)")
     ap.add_argument("--orangeseed", help="the OrangeSeed PR's GenesisOrangeSeed output (alloc JSON)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
@@ -84,7 +82,9 @@ def main():
     if not ADDR.match(deployer):
         fail(f"bad deployer {deployer!r} in the manifest")
     status, inputs_sha = read_inputs(a.inputs)
-    v_status, v_keccak = read_validators(a.validators)
+    vr = json.load(open(a.book))["contracts"]["ValidatorRegistry"].lower()
+    if not ADDR.match(vr):
+        fail(f"bad ValidatorRegistry {vr!r} in the book")
 
     accounts = []
     seen_deployer = False
@@ -121,8 +121,8 @@ def main():
         o = json.load(open(a.orangeseed))
         taken = {x["address"] for x in accounts}
         addrs = sorted(k.lower() for k in o["alloc"])
-        if ORANGESEED_PROXY not in addrs or len(addrs) != 2:
-            fail(f"the OrangeSeed alloc must hold the proxy {ORANGESEED_PROXY} and one implementation, got {addrs}")
+        if addrs != sorted(ORANGESEED_CODEHASHES):
+            fail(f"the OrangeSeed alloc must hold exactly {sorted(ORANGESEED_CODEHASHES)}, got {addrs}")
         for k, v in o["alloc"].items():
             addr = k.lower()
             if addr in taken:
@@ -130,12 +130,14 @@ def main():
             code = v["code"].lower()
             if not HEX.match(code) or code == "0x":
                 fail(f"OrangeSeed {addr}: no code")
+            if keccak_hex(bytes.fromhex(code[2:])) != ORANGESEED_CODEHASHES[addr]:
+                fail(f"OrangeSeed {addr}: code hash is not the pinned {ORANGESEED_CODEHASHES[addr]}")
             st = {kk.lower(): vv.lower() for kk, vv in (v.get("storage") or {}).items() if int(vv, 16) != 0}
             ent = {"address": addr, "balance": norm_qty(v["balance"]), "nonce": int(v["nonce"], 0) if isinstance(v["nonce"], str) else int(v["nonce"]), "code": code}
             if st:
                 ent["storage"] = dict(sorted(st.items()))
             accounts.append(ent)
-        orangeseed = {"proxy": ORANGESEED_PROXY, "implementation": [x for x in addrs if x != ORANGESEED_PROXY][0]}
+        orangeseed = {"proxy": ORANGESEED_PROXY, "implementation": ORANGESEED_IMPL}
     accounts.sort(key=lambda x: x["address"])
 
     alloc = {
@@ -143,8 +145,7 @@ def main():
         "profile": "r1006",
         "inputsStatus": status,
         "inputsSha256": inputs_sha,
-        "validatorsStatus": v_status,
-        "validatorsKeccak256": v_keccak,
+        "validatorRegistry": vr,
         "orangeseed": orangeseed,
         "deployer": deployer,
         "accounts": accounts,
