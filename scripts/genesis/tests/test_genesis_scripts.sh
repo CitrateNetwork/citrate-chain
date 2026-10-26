@@ -519,7 +519,7 @@ expect "reset: a malformed coinbase is a usage error" 2 'coinbase must be' -- "$
 CE="$G/genesis_ceremony.sh"
 REPO="$T/repo"
 mkdir -p "$REPO/contracts/script" "$REPO/contracts/genesis" "$REPO/contracts/addresses" "$REPO/scripts/ops"
-for s in DeployGenesisGovernance DeployTeamVesting DeployDormantLedgers CheckDeployedAdmins; do : >"$REPO/contracts/script/$s.s.sol"; done
+for s in DeployGenesisGovernance DeployTeamVesting DeployDormantLedgers CheckDeployedAdmins DeployGenesisMembership; do : >"$REPO/contracts/script/$s.s.sol"; done
 # Fake regenesis.sh: logs what it was given. FAKE_REGEN_BOOK=<file>: also "deploy" by writing
 # that file as the generated book (EMIT_OUTPUT), as the real generator does after a broadcast.
 cat >"$REPO/scripts/ops/regenesis.sh" <<'EOF'
@@ -568,7 +568,7 @@ gov_chain
 owners() { local i out=""; for i in "$@"; do out+="${out:+,}$(addr "$i")"; done; printf '%s' "$out"; }
 CEENV=(env REPO_ROOT="$REPO" DEPLOYER_ADDRESS="$DEP"
   GOV_OWNERS="$(owners 11 12 13 14 15)" GOV_THRESHOLD=3 GOV_MIN_DELAY=172800
-  GRD_OWNERS="$(owners 21 22 23)" GRD_THRESHOLD=2 GRD_MIN_DELAY=3600)
+  GRD_OWNERS="$(owners 21 22 23)" GRD_THRESHOLD=2 GRD_MIN_DELAY=3600 MEMBERSHIP_GRANTOR="$(addr 51)")
 
 reset_calls
 expect "ceremony: dry run with genesis values passes" 0 'done \(mode=dry\)' -- "${CEENV[@]}" bash "$CE"
@@ -705,7 +705,7 @@ expect "ceremony: a checker report with two FACTORY-ADMIN summaries fails" 3 'no
 expect "ceremony: P0 checks the RPC chain id" 3 'chain id 1, want 40204' -- "${CEENV[@]}" RPC_URL=http://n3x bash -c "mkdir -p '$(rpcdir http://n3x)'; echo 1 > '$(rpcdir http://n3x)/chain-id'; bash '$CE' --simulate --only P0"
 reset_calls
 expect "ceremony: P2 takes governance from P1's output" 0 'GOVERNANCE=0x0+1f GUARDIAN=0x0+20' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
-calls | grep -q 'regenesis --reroll --with-aa$' && ok "ceremony: simulate does not broadcast" || bad "ceremony: simulate does not broadcast" "$(calls)"
+calls | grep -q 'regenesis --reroll --with-aa --genesis-membership$' && ok "ceremony: simulate does not broadcast" || bad "ceremony: simulate does not broadcast" "$(calls)"
 
 # Resume paths: the safety preflight runs before any phase that talks to a chain.
 expect "ceremony: --confirm --from P1 to a remote RPC is refused" 3 'not loopback' -- "${CEENV[@]}" RPC_URL=https://rpc.example EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1 bash "$CE" --confirm --from P1 --account deployer
@@ -789,7 +789,7 @@ for preset in "EMIT_DEPLOYER=$STALE:EMIT_DEPLOYER is set to '0x0+63', not exactl
 done
 reset_calls
 expect "ceremony C8: a matching EMIT_DEPLOYER preset is accepted" 0 'done \(mode=simulate\)' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EMIT_DEPLOYER="$DEP" bash "$CE" --simulate --only P2
-expect "ceremony C8: the dry run plans the fresh-genesis book" 0 'DRYRUN .*EMIT_FRESH_GENESIS=1 .*EMIT_OUTPUT=.*/contracts/addresses/40204.json bash .*regenesis.sh --reroll --with-aa' -- "${CEENV[@]}" bash "$CE" --only P2
+expect "ceremony C8: the dry run plans the fresh-genesis book" 0 'DRYRUN .*EMIT_FRESH_GENESIS=1 .*EMIT_OUTPUT=.*/contracts/addresses/40204.json bash .*regenesis.sh --reroll --with-aa --genesis-membership' -- "${CEENV[@]}" bash "$CE" --only P2
 GBK="$REPO/contracts/addresses/40204.json"
 # C9 (Codex 3cc160c on chain#329): every deployer input the deploy scripts read names the
 # run's deployer exactly. ScriptEnv.deployerAddress() prefers CEREMONY_DEPLOYER_ADDRESS over
@@ -888,6 +888,73 @@ expect "ceremony #364: a --password-file that is not a readable file is refused"
 "${CEENV[@]}" bash "$CE" --account deployer --password-file "$PW_STR" >"$T/ce-pw3.log" 2>&1
 no_pw "ceremony #364: a refused --password-file value is not echoed" "$T/ce-pw3.log"
 expect "ceremony #364: --password-file without --account is refused" 1 'password-file needs --account' -- "${CEENV[@]}" bash "$CE" --password-file "$PW_FILE"
+# G9: the genesis ceremony deploys membership with #331's DeployGenesisMembership (Track M:
+# governance holds upgrade authority, the grantor only the grant role), not the r1005
+# DeployCoreMembership. regenesis.sh --genesis-membership selects it; plain regenesis.sh (the
+# reroll runbooks) keeps DeployCoreMembership.
+mkdir -p "$RG/contracts/script" "$RG/contracts/broadcast/DeployValidatorRegistry.s.sol/40204" "$RG/scripts/ci"
+: >"$RG/contracts/script/DeployGenesisMembership.s.sol"
+printf '{"timestamp":6000,"transactions":[{"transactionType":"CREATE2","contractName":"ValidatorRegistry","contractAddress":"%s"}]}' "$(addr 501)" \
+  >"$RG/contracts/broadcast/DeployValidatorRegistry.s.sol/40204/run-latest.json"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$RG/scripts/ci/check-create2-determinism.sh"
+GM_ENV=(GOVERNANCE_TIMELOCK="$(addr 31)" GOVERNANCE_MULTISIG="$(addr 33)" MEMBERSHIP_GRANTOR="$(addr 51)" GENESIS_MEMBERSHIP_OUT=genesis/membership.json)
+membership_steps() { calls | sed -n 's|^forge script script/\(Deploy[A-Za-z]*Membership\.s\.sol\).*|\1|p' | tr '\n' ' '; }
+reset_calls
+env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" "${GM_ENV[@]}" bash "$RG/scripts/ops/regenesis.sh" --reroll --with-aa --genesis-membership >"$T/rg-gm.log" 2>&1
+[[ "$(membership_steps)" == "DeployGenesisMembership.s.sol " ]] &&
+  ok "regenesis G9: --genesis-membership runs DeployGenesisMembership and not DeployCoreMembership" ||
+  bad "regenesis G9: --genesis-membership runs DeployGenesisMembership and not DeployCoreMembership" "steps: '$(membership_steps)'; $(tail -5 "$T/rg-gm.log")"
+grep -q "^EMIT_MEMBERSHIP_SCRIPT=DeployGenesisMembership.s.sol$" "$FAKE/forge.env" 2>/dev/null &&
+  ok "regenesis G9: the generator is told the membership broadcast is DeployGenesisMembership's" ||
+  bad "regenesis G9: the generator is told the membership broadcast is DeployGenesisMembership's" "$(grep '^EMIT_MEMBERSHIP' "$FAKE/forge.env" 2>&1)"
+reset_calls
+env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" bash "$RG/scripts/ops/regenesis.sh" --reroll --with-aa >"$T/rg-cm.log" 2>&1
+[[ "$(membership_steps)" == "DeployCoreMembership.s.sol " ]] &&
+  ok "regenesis G9: without --genesis-membership the reroll path still runs DeployCoreMembership" ||
+  bad "regenesis G9: without --genesis-membership the reroll path still runs DeployCoreMembership" "steps: '$(membership_steps)'; $(tail -5 "$T/rg-cm.log")"
+for v in GOVERNANCE_TIMELOCK GOVERNANCE_MULTISIG MEMBERSHIP_GRANTOR GENESIS_MEMBERSHIP_OUT; do
+  reset_calls
+  gm_less=()
+  for kv in "${GM_ENV[@]}"; do [[ "$kv" == "$v="* ]] || gm_less+=("$kv"); done
+  expect "regenesis G9: --genesis-membership without $v is refused" 1 "--genesis-membership needs $v" -- env -u "$v" PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" "${gm_less[@]}" bash "$RG/scripts/ops/regenesis.sh" --genesis-membership
+  if calls | grep -q '^forge'; then bad "regenesis G9: a refused --genesis-membership runs no forge ($v)" "$(calls)"; else ok "regenesis G9: a refused --genesis-membership runs no forge ($v)"; fi
+done
+reset_calls
+expect "regenesis G9: an EMIT_MEMBERSHIP_SCRIPT preset that disagrees with --genesis-membership is refused" 1 'EMIT_MEMBERSHIP_SCRIPT is set to DeployCoreMembership.s.sol' -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" "${GM_ENV[@]}" EMIT_MEMBERSHIP_SCRIPT=DeployCoreMembership.s.sol bash "$RG/scripts/ops/regenesis.sh" --genesis-membership
+rm "$RG/contracts/script/DeployGenesisMembership.s.sol"
+reset_calls
+expect "regenesis G9: --genesis-membership without contracts/script/DeployGenesisMembership.s.sol is refused" 1 'DeployGenesisMembership.s.sol is missing' -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" "${GM_ENV[@]}" bash "$RG/scripts/ops/regenesis.sh" --genesis-membership
+if calls | grep -q '^forge'; then bad "regenesis G9: a missing genesis membership script runs no forge" "$(calls)"; else ok "regenesis G9: a missing genesis membership script runs no forge"; fi
+: >"$RG/contracts/script/DeployGenesisMembership.s.sol"
+# The ceremony's P2 through the REAL regenesis.sh (fake forge): which membership script runs,
+# and with the inputs #331's script reads.
+mk_manifest "$GB"
+gov_book "$GB" "$DEP"
+reset_calls
+rm -f "$FAKE/forge.env"
+"${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 REGENESIS="$RG/scripts/ops/regenesis.sh" PATH="$BIN:$PATH" bash "$CE" --simulate --only P2 >"$T/ce-gm.log" 2>&1
+ce_gm_rc=$?
+[[ $ce_gm_rc -eq 0 && "$(membership_steps)" == "DeployGenesisMembership.s.sol " ]] &&
+  ok "ceremony G9: P2 runs #331's DeployGenesisMembership, never DeployCoreMembership" ||
+  bad "ceremony G9: P2 runs #331's DeployGenesisMembership, never DeployCoreMembership" "exit $ce_gm_rc; steps: '$(membership_steps)'; $(tail -5 "$T/ce-gm.log")"
+gm_env_ok=1
+for kv in "GOVERNANCE_TIMELOCK=$(addr 31)" "GOVERNANCE_MULTISIG=$(addr 33)" "MEMBERSHIP_GRANTOR=$(addr 51)" \
+  "GENESIS_MEMBERSHIP_OUT=genesis/membership.json" "GENESIS_GOVERNANCE_BOOK=genesis/governance.json" "EMIT_MEMBERSHIP_SCRIPT=DeployGenesisMembership.s.sol"; do
+  grep -qxF -- "$kv" "$FAKE/forge.env" 2>/dev/null || gm_env_ok=0
+done
+[[ $gm_env_ok == 1 ]] && ok "ceremony G9: the membership step gets P1's governance, the grantor and the output books" ||
+  bad "ceremony G9: the membership step gets P1's governance, the grantor and the output books" "$(grep -E '^(GOVERNANCE_|MEMBERSHIP_|GENESIS_|EMIT_MEMBERSHIP)' "$FAKE/forge.env" 2>&1 | sort -u)"
+reset_calls
+expect "ceremony G9: P2 without MEMBERSHIP_GRANTOR is refused" 3 'MEMBERSHIP_GRANTOR' -- "${CEENV[@]}" MEMBERSHIP_GRANTOR= RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
+if calls | grep -q '^regenesis'; then bad "ceremony G9: a P2 without a grantor runs no regenesis" "$(calls)"; else ok "ceremony G9: a P2 without a grantor runs no regenesis"; fi
+expect "ceremony G9: a MEMBERSHIP_GRANTOR that is the deployer is refused" 3 'MEMBERSHIP_GRANTOR .*is the deployer' -- "${CEENV[@]}" MEMBERSHIP_GRANTOR="$DEP" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
+expect "ceremony G9: a malformed MEMBERSHIP_GRANTOR is refused" 3 'MEMBERSHIP_GRANTOR .*not an address' -- "${CEENV[@]}" MEMBERSHIP_GRANTOR=0x12 RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
+expect "ceremony G9: a preset EMIT_MEMBERSHIP_SCRIPT naming the old script is refused" 3 'EMIT_MEMBERSHIP_SCRIPT is set to DeployCoreMembership.s.sol' -- "${CEENV[@]}" EMIT_MEMBERSHIP_SCRIPT=DeployCoreMembership.s.sol RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
+if calls | grep -q '^regenesis'; then bad "ceremony G9: a refused membership input runs no regenesis" "$(calls)"; else ok "ceremony G9: a refused membership input runs no regenesis"; fi
+expect "ceremony G9: the dry run plans P2 with --genesis-membership" 0 'DRYRUN .*bash .*regenesis.sh --reroll --with-aa --genesis-membership' -- "${CEENV[@]}" bash "$CE" --only P2
+mv "$REPO/contracts/script/DeployGenesisMembership.s.sol" "$T/dgm.moved"
+expect "ceremony G9: P0 refuses a tree without #331's DeployGenesisMembership" 3 'DeployGenesisMembership.s.sol is missing .*chain#331' -- "${CEENV[@]}" bash "$CE" --only P0
+mv "$T/dgm.moved" "$REPO/contracts/script/DeployGenesisMembership.s.sol"
 rm -rf "$RG"
 # After a --confirm P2, the deployer-derived fee recipients of the contracts in the book are
 # read from the chain and must be the book's (= the run's) deployer.
@@ -900,11 +967,11 @@ cat >"$T/fake-emit.sh" <<'EOF'
 #!/usr/bin/env bash
 cp "$FAKE_REGEN_BOOK" "$EMIT_OUTPUT"
 EOF
-mkdir -p "$REPO/contracts/broadcast/DeployValidatorRegistry.s.sol/40204" "$REPO/contracts/broadcast/DeployCoreMembership.s.sol/40204"
+mkdir -p "$REPO/contracts/broadcast/DeployValidatorRegistry.s.sol/40204" "$REPO/contracts/broadcast/DeployGenesisMembership.s.sol/40204"
 printf '{"timestamp":6000,"transactions":[{"transactionType":"CREATE2","contractName":"ValidatorRegistry","contractAddress":"%s"}]}' "$C9VR" \
   >"$REPO/contracts/broadcast/DeployValidatorRegistry.s.sol/40204/run-latest.json"
 printf '{"timestamp":6001,"transactions":[{"transactionType":"CREATE2","contractName":"CitrateMemberSBT","contractAddress":"%s"},{"transactionType":"CREATE2","contractName":"MemberBond","contractAddress":"%s"},{"transactionType":"CREATE2","contractName":"MembershipStakeVault","contractAddress":"%s"},{"transactionType":"CREATE2","contractName":"ERC1967Proxy","contractAddress":"%s"}]}' \
-  "$C9SBT" "$C9BOND" "$C9VI" "$C9VP" >"$REPO/contracts/broadcast/DeployCoreMembership.s.sol/40204/run-latest.json"
+  "$C9SBT" "$C9BOND" "$C9VI" "$C9VP" >"$REPO/contracts/broadcast/DeployGenesisMembership.s.sol/40204/run-latest.json"
 cp "$GBK" "$T/book.c9.orig"
 C9ENV=("${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1
   FAKE_REGEN_BOOK="$C9B" EMITTER="$T/fake-emit.sh")
@@ -938,7 +1005,7 @@ reset_calls
 rm -f "$FAKE/regenesis.env" "$FAKE/forge.env"
 "${C9ENV[@]}" bash "$CE" --confirm --only P2 --account deployer --password-file "$PW_FILE" >"$T/pw-p2.log" 2>&1
 pw_rc=$?
-if [[ $pw_rc -eq 0 ]] && calls | grep -qxF -- "regenesis --reroll --with-aa --broadcast --account deployer --password-file $PW_FILE"; then
+if [[ $pw_rc -eq 0 ]] && calls | grep -qxF -- "regenesis --reroll --with-aa --genesis-membership --broadcast --account deployer --password-file $PW_FILE"; then
   ok "ceremony #364: --password-file reaches P2's regenesis.sh as a path"
 else
   bad "ceremony #364: --password-file reaches P2's regenesis.sh as a path" "exit $pw_rc; $(calls | grep '^regenesis ' || true)"
@@ -1288,6 +1355,24 @@ expect "generator: an incremental regeneration still runs" 0 'wrote' -- "${GEMIT
   bad "generator: an incremental book takes EMIT_DEPLOYER and the new membership, and keeps the rest" "$(cat "$GBOOK")"
 bcast DeployCoreMembership.s.sol 9001 "CitrateMemberSBT:$(addr 2102)" "MemberBond:$(addr 2103)" "MembershipStakeVault:$(addr 2104)"
 expect "generator: a membership broadcast without the vault proxy is refused" 2 'expected CitrateMemberSBT, MemberBond, MembershipStakeVault and its ERC1967Proxy' -- "${GEMIT[@]}" EMIT_FRESH_GENESIS=1 EMIT_DEPLOYER="$FD" EMIT_BROADCAST_SINCE=5000 bash "$EMIT"
+# G9: the genesis ceremony's membership broadcast is DeployGenesisMembership's (#331). With
+# EMIT_MEMBERSHIP_SCRIPT naming it, the book's membership comes from that broadcast only; an
+# r1005 DeployCoreMembership broadcast lying beside it is not read.
+bcast DeployCoreMembership.s.sol 9001 "CitrateMemberSBT:$(addr 2102)" "MemberBond:$(addr 2103)" "MembershipStakeVault:$(addr 2104)" "ERC1967Proxy:$(addr 2105)"
+bcast DeployGenesisMembership.s.sol 9002 "CitrateMemberSBT:$(addr 2202)" "MemberBond:$(addr 2203)" "MembershipStakeVault:$(addr 2204)" "ERC1967Proxy:$(addr 2205)"
+stale_book
+expect "generator G9: a fresh genesis reads the DeployGenesisMembership broadcast" 0 'wrote' -- "${GEMIT[@]}" EMIT_FRESH_GENESIS=1 EMIT_DEPLOYER="$FD" EMIT_BROADCAST_SINCE=5000 EMIT_MEMBERSHIP_SCRIPT=DeployGenesisMembership.s.sol bash "$EMIT"
+[[ "$(jqv '[.contracts.CitrateMemberSBT, .contracts.MemberBond, .contracts.MembershipStakeVaultImpl, .contracts.MembershipStakeVault, .CitrateMemberSBT, .MembershipStakeVault] | join(" ")')" == \
+  "$(addr 2202) $(addr 2203) $(addr 2204) $(addr 2205) $(addr 2202) $(addr 2205)" ]] &&
+  ok "generator G9: membership entries and root aliases come from DeployGenesisMembership, not DeployCoreMembership" ||
+  bad "generator G9: membership entries and root aliases come from DeployGenesisMembership, not DeployCoreMembership" "$(cat "$GBOOK")"
+stale_book
+expect "generator G9: without EMIT_MEMBERSHIP_SCRIPT the reroll path reads DeployCoreMembership" 0 'wrote' -- "${GEMIT[@]}" EMIT_FRESH_GENESIS=1 EMIT_DEPLOYER="$FD" EMIT_BROADCAST_SINCE=5000 bash "$EMIT"
+[[ "$(jqv '.contracts.MembershipStakeVault')" == "$(addr 2105)" ]] &&
+  ok "generator G9: the default membership broadcast is still DeployCoreMembership's" ||
+  bad "generator G9: the default membership broadcast is still DeployCoreMembership's" "$(cat "$GBOOK")"
+expect "generator G9: an unknown EMIT_MEMBERSHIP_SCRIPT is refused" 1 'EMIT_MEMBERSHIP_SCRIPT must be DeployCoreMembership.s.sol or DeployGenesisMembership.s.sol' -- "${GEMIT[@]}" EMIT_FRESH_GENESIS=1 EMIT_DEPLOYER="$FD" EMIT_BROADCAST_SINCE=5000 EMIT_MEMBERSHIP_SCRIPT=DeployOther.s.sol bash "$EMIT"
+rm -rf "$GR/contracts/broadcast/DeployGenesisMembership.s.sol"
 
 # ------------------------------------------------------------------ P5 with the real checker
 # Integration: the real CheckDeployedAdmins (this tree's script and AdminChecks) under real
@@ -1496,6 +1581,44 @@ SOL
       done
       cp "$IC/src/fixtures/GenesisFixtures.sol" "$FC/src/fixtures/"
       for s in DeployGenesisGovernance DeployTeamVesting DeployDormantLedgers; do cp "$IC/script/$s.s.sol" "$FC/script/"; done
+      # Stand-in for #331's DeployGenesisMembership until that PR is in this tree: the same file,
+      # contract name, required env and broadcast shape (CitrateMemberSBT, MemberBond, the
+      # vault implementation and its ERC1967Proxy, owned by MEMBERSHIP_GRANTOR). It skips #331's
+      # on-chain governance provenance checks, which need the real P1 contracts. P2 must run it
+      # and not the r1005 DeployCoreMembership, which is in this project too.
+      cat >"$FC/script/DeployGenesisMembership.s.sol" <<'SOL'
+// SPDX-License-Identifier: Apache-2.0
+pragma solidity ^0.8.26;
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import "./ScriptEnv.sol";
+import "./Salts.sol";
+import {CitrateMemberSBT} from "../src/core_membership/CitrateMemberSBT.sol";
+import {MemberBond} from "../src/core_membership/MemberBond.sol";
+import {MembershipStakeVault} from "../src/core_membership/MembershipStakeVault.sol";
+import {ValidatorRegistry} from "../src/ValidatorRegistry.sol";
+contract DeployGenesisMembership is ScriptEnv {
+    function run() external {
+        address deployer = deployerAddress();
+        require(vm.envAddress("GOVERNANCE_TIMELOCK").code.length != 0, "GOVERNANCE_TIMELOCK has no code");
+        require(vm.envAddress("GOVERNANCE_MULTISIG").code.length != 0, "GOVERNANCE_MULTISIG has no code");
+        address grantor = vm.envAddress("MEMBERSHIP_GRANTOR");
+        require(grantor != address(0) && grantor != deployer, "MEMBERSHIP_GRANTOR");
+        address registry = vm.envAddress("VALIDATOR_REGISTRY");
+        require(registry.code.length != 0, "VALIDATOR_REGISTRY has no code");
+        vm.envString("GENESIS_MEMBERSHIP_OUT");
+        vm.envString("GENESIS_GOVERNANCE_BOOK");
+        vm.startBroadcast(deployer);
+        CitrateMemberSBT sbt = new CitrateMemberSBT{salt: Salts.salt("CitrateMemberSBT")}(grantor);
+        MemberBond bond = new MemberBond{salt: Salts.salt("MemberBond")}();
+        MembershipStakeVault impl = new MembershipStakeVault{salt: Salts.salt("MembershipStakeVault.impl")}();
+        new ERC1967Proxy{salt: Salts.salt("MembershipStakeVault")}(
+            address(impl),
+            abi.encodeCall(MembershipStakeVault.initialize, (grantor, ValidatorRegistry(payable(registry)), sbt, address(bond)))
+        );
+        vm.stopBroadcast();
+    }
+}
+SOL
       cp "$ROOT_SRC/scripts/ops/regenesis.sh" "$ROOT_SRC/scripts/ops/emit-address-table.sh" "$FR/scripts/ops/"
       cp "$ROOT_SRC/scripts/ci/check-create2-determinism.sh" "$FR/scripts/ci/"
       cat >"$T/fbin/forge" <<'EOF'
@@ -1596,7 +1719,7 @@ EOF
         printf '{"deployer":"%s","contracts":{"FederatedRoundLedger":"%s","PatronageLedger":"%s"}}' "$FDEP" "$(addr 81)" "$(addr 82)" >"$FC/genesis/dormant-ledgers.json"
         record_outputs "$FC/genesis" # what --confirm P3/P4 record (#363)
         FENV=("${CEENV[@]}" REPO_ROOT="$FR" DEPLOYER_ADDRESS="$FDEP" RPC_URL="$FRPC" EXPECTED_CHAIN_ID=40204
-          EXPECTED_GENESIS_HASH="$g0" FORGE="$REAL_FORGE" CAST="$REAL_CAST" PATH="$T/fbin:$PATH" MEMBERSHIP_OWNER="$owner"
+          EXPECTED_GENESIS_HASH="$g0" FORGE="$REAL_FORGE" CAST="$REAL_CAST" PATH="$T/fbin:$PATH" MEMBERSHIP_GRANTOR="$owner"
           TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS="$FRPC")
         if [[ "$label" == run1 ]]; then
           # A stale generator preset is refused before anything is broadcast.
@@ -1607,6 +1730,9 @@ EOF
           [[ "$(fcast nonce "$FDEP")" == 0 ]] && ok "fresh genesis e2e: the refused CEREMONY_DEPLOYER_ADDRESS sent nothing" || bad "fresh genesis e2e: the refused CEREMONY_DEPLOYER_ADDRESS sent nothing" "nonce $(fcast nonce "$FDEP")"
         fi
         expect "fresh genesis e2e ($label): P2 deploys through regenesis.sh and the generator, and the book is verified" 0 'P2 stack book = generator output for this run' -- "${FENV[@]}" bash "$CE" --confirm --only P2 --account fixture
+        [[ -f "$FC/broadcast/DeployGenesisMembership.s.sol/40204/run-latest.json" && ! -e "$FC/broadcast/DeployCoreMembership.s.sol" ]] &&
+          ok "fresh genesis e2e ($label): P2 deployed membership with DeployGenesisMembership, not DeployCoreMembership" ||
+          bad "fresh genesis e2e ($label): P2 deployed membership with DeployGenesisMembership, not DeployCoreMembership" "$(ls "$FC/broadcast" 2>&1)"
         RUN_VR=$(jq -r '.contracts.ValidatorRegistry' "$book")
         RUN_SBT=$(jq -r '.contracts.CitrateMemberSBT' "$book")
         RUN_VAULT=$(jq -r '.contracts.MembershipStakeVault' "$book")
