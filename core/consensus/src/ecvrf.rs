@@ -93,6 +93,11 @@ impl EcvrfProof {
             s,
         })
     }
+
+    /// Decode a proof whose curve points are in canonical form.
+    pub fn from_bytes_canonical(bytes: &[u8]) -> Result<Self, EcvrfError> {
+        Self::from_bytes(bytes)
+    }
 }
 
 /// ECVRF errors.
@@ -112,6 +117,9 @@ pub enum EcvrfError {
 
     #[error("invalid secret key")]
     InvalidSecretKey,
+
+    #[error("curve point not in canonical compressed form")]
+    NonCanonicalEncoding,
 }
 
 /// Derive a P-256 scalar from 32 bytes of key material.

@@ -85,6 +85,10 @@ pub struct VrfProposerSelector {
     /// PSET-EPOCH: recent per-snapshot sets, keyed by snapshot height S(E).
     /// Bounded to [`PROPOSER_SET_HISTORY_SNAPSHOTS`] entries.
     history: Arc<RwLock<BTreeMap<u64, EpochSet>>>,
+    /// Height from which an ECVRF proof's curve points must be in canonical
+    /// compressed form ([`crate::vrf_encoding`]). Captured from the process
+    /// store at construction; `None` = not activated.
+    canonical_encoding_height: Option<u64>,
 }
 
 /// PSET-EPOCH: one epoch's materialised proposer set.
@@ -123,6 +127,7 @@ impl VrfProposerSelector {
             legacy_vrf_cutoff_height: DEFAULT_LEGACY_VRF_CUTOFF_HEIGHT,
             snapshot_schedule: None,
             history: Arc::new(RwLock::new(BTreeMap::new())),
+            canonical_encoding_height: crate::vrf_encoding::vrf_canonical_encoding_height(),
         }
     }
 
@@ -262,6 +267,18 @@ impl VrfProposerSelector {
     pub fn with_legacy_cutoff_height(mut self, cutoff: u64) -> Self {
         self.legacy_vrf_cutoff_height = cutoff;
         self
+    }
+
+    /// Override the canonical-encoding activation height captured from the
+    /// process store ([`crate::vrf_encoding`]). `None` = not activated.
+    pub fn with_canonical_encoding_height(mut self, height: Option<u64>) -> Self {
+        self.canonical_encoding_height = height;
+        self
+    }
+
+    /// The canonical-encoding activation height this selector applies.
+    pub fn canonical_encoding_height(&self) -> Option<u64> {
+        self.canonical_encoding_height
     }
 
     /// FWA-C1-01: a selector with the legacy (forgeable SHA3) VRF path
@@ -465,8 +482,16 @@ impl VrfProposerSelector {
         previous_vrf: &Hash,
         slot: u64,
     ) -> Result<bool, VrfError> {
-        let ecvrf_proof = crate::ecvrf::EcvrfProof::from_bytes(&proof.proof)
-            .map_err(|e| VrfError::CryptoError(format!("ECVRF decode: {}", e)))?;
+        // From the activation height the proof's curve points must be in
+        // canonical compressed form; below it the previous decoder applies,
+        // so historical blocks are judged exactly as they were.
+        let decoded = if crate::vrf_encoding::active_at(self.canonical_encoding_height, slot) {
+            crate::ecvrf::EcvrfProof::from_bytes_canonical(&proof.proof)
+        } else {
+            crate::ecvrf::EcvrfProof::from_bytes(&proof.proof)
+        };
+        let ecvrf_proof =
+            decoded.map_err(|e| VrfError::CryptoError(format!("ECVRF decode: {}", e)))?;
 
         let alpha = Self::build_alpha(pubkey, previous_vrf, slot);
 
