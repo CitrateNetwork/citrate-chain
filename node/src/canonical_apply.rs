@@ -9216,6 +9216,318 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // C1-R: the receipt index is RPC data, not consensus data. A stored receipt
+    // that does not decode (a damaged value, or one written by a binary with a
+    // different receipt layout) must never stop the node from following fork
+    // choice: the reorg / rebuild proceeds, and the unreadable receipt goes with
+    // the block it was indexed under.
+    // ---------------------------------------------------------------------
+
+    /// Replace the stored receipt of `tx` with its own encoding minus the last
+    /// byte, so it no longer decodes. Asserts that it no longer does.
+    fn c1r_corrupt_receipt(storage: &StorageManager, tx: &Hash) {
+        use citrate_storage::db::column_families::CF_RECEIPTS;
+        let mut bytes = storage
+            .db
+            .get_cf(CF_RECEIPTS, tx.as_bytes())
+            .expect("read")
+            .expect("a stored receipt to corrupt");
+        bytes.pop();
+        storage
+            .db
+            .put_cf(CF_RECEIPTS, tx.as_bytes(), &bytes)
+            .expect("write");
+        assert!(
+            storage.transactions.get_receipt(tx).is_err(),
+            "precondition: the receipt of {tx} no longer decodes"
+        );
+    }
+
+    /// The follower scenario: A = a1 ← a2 (a2 carries `both`, also on B, and
+    /// `only_a`), B = a1 ← b2 ← b3 (heavier). Returns the blocks and the txs.
+    async fn c1r_corrupt_scenario() -> (Block, Block, Block, Block, Transaction, Transaction) {
+        let shared = c1r_hashed(transfer(ALICE, DAVE, 1_000, 0), ALICE, DAVE, 0);
+        let both = c1r_hashed(transfer(ALICE, BOB, 1_000, 1), ALICE, BOB, 1);
+        let only_a = c1r_hashed(transfer(ALICE, CAROL, 2_000, 2), ALICE, CAROL, 2);
+        let only_b = c1r_hashed(transfer(ALICE, DAVE, 3_000, 2), ALICE, DAVE, 2);
+        let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pa.set_balance(&Address(ALICE), U256::from(FUND));
+        let a1 = produce(&pa, Hash::default(), 1, VRF_OUT, vec![shared.clone()]).await;
+        let a2 = produce(
+            &pa,
+            a1.header.block_hash,
+            2,
+            VRF_OUT,
+            vec![both.clone(), only_a.clone()],
+        )
+        .await;
+        let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pb.set_balance(&Address(ALICE), U256::from(FUND));
+        let _b1 = produce(&pb, Hash::default(), 1, VRF_OUT, vec![shared.clone()]).await;
+        let vrf_b = [0x5B; 32];
+        let b2 = produce(&pb, a1.header.block_hash, 2, vrf_b, vec![both.clone()]).await;
+        let b3 = produce(&pb, b2.header.block_hash, 3, vrf_b, vec![only_b]).await;
+        (a1, a2, b2, b3, both, only_a)
+    }
+
+    /// The corrupt receipts are gone and the index matches the B chain.
+    fn c1r_assert_corrupt_receipts_replaced(
+        storage: &StorageManager,
+        blocks: &[&Block],
+        a2: &Block,
+        b2: &Block,
+        b3: &Block,
+        both: &Transaction,
+        only_a: &Transaction,
+    ) {
+        let r = storage
+            .transactions
+            .get_receipt(&both.hash)
+            .expect("the receipt of the tx on both branches decodes again")
+            .expect("and is stored");
+        assert_eq!((r.block_hash, r.block_number), (b2.header.block_hash, 2));
+        assert!(
+            storage
+                .transactions
+                .get_receipt(&only_a.hash)
+                .expect("no undecodable receipt is left")
+                .is_none(),
+            "the corrupt receipt of the abandoned-only tx is removed"
+        );
+        assert!(storage
+            .transactions
+            .get_block_transactions(&a2.header.block_hash)
+            .expect("markers")
+            .is_empty());
+        c1r_receipts_consistent(storage, Some(b3.header.block_hash), blocks)
+            .expect("receipts follow the executed chain");
+    }
+
+    /// `reorg_to`: an undecodable stored receipt in the abandoned block does not
+    /// decline the reorg. Negative control: the same scenario without the
+    /// corruption reorgs too (`c1r_reorg_replaces_receipts_and_abort_restores_them`).
+    #[tokio::test]
+    async fn c1r_undecodable_receipt_does_not_block_reorg() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let follower = store_backed(&storage);
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        follower
+            .persist_state_changes()
+            .await
+            .expect("persist genesis");
+        let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+        let (a1, a2, b2, b3, both, only_a) = c1r_corrupt_scenario().await;
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        c1r_corrupt_receipt(&storage, &both.hash);
+        c1r_corrupt_receipt(&storage, &only_a.hash);
+        persist(&storage, &b2);
+        persist(&storage, &b3);
+        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        app.apply_received(&b3).await;
+        assert_eq!(
+            app.applied_tip().await.hash,
+            b3.header.block_hash,
+            "the node follows the heavier branch"
+        );
+        assert_eq!(
+            storage.blocks.get_applied_tip().expect("tip"),
+            Some((b3.header.block_hash, 3)),
+            "the durable tip follows it too"
+        );
+        c1r_assert_corrupt_receipts_replaced(
+            &storage,
+            &[&a1, &a2, &b2, &b3],
+            &a2,
+            &b2,
+            &b3,
+            &both,
+            &only_a,
+        );
+    }
+
+    /// An aborted reorg with an undecodable receipt in the abandoned block: the
+    /// node stays on A, nothing it could read is lost, and the abort does not
+    /// fail on the receipt it could not read.
+    #[tokio::test]
+    async fn c1r_undecodable_receipt_aborted_reorg_keeps_the_tip() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let follower = store_backed(&storage);
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        follower
+            .persist_state_changes()
+            .await
+            .expect("persist genesis");
+        let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+        let (a1, a2, b2, _b3, both, only_a) = c1r_corrupt_scenario().await;
+        let b3_bad = mk_block_txs(
+            3,
+            b2.header.block_hash,
+            Hash::new([0xEE; 32]),
+            [0x5C; 32],
+            vec![],
+        );
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        c1r_corrupt_receipt(&storage, &only_a.hash);
+        persist(&storage, &b2);
+        persist(&storage, &b3_bad);
+        app.fork_choice = Some(fork_choice_returning(b3_bad.header.block_hash));
+        app.apply_received(&b3_bad).await;
+        assert_eq!(app.applied_tip().await.hash, a2.header.block_hash);
+        assert_eq!(
+            storage.blocks.get_applied_tip().expect("tip"),
+            Some((a2.header.block_hash, 2))
+        );
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt(&both.hash)
+                .expect("read")
+                .map(|r| r.block_hash),
+            Some(a2.header.block_hash),
+            "the readable receipt of the abandoned block is restored"
+        );
+        let markers = storage
+            .transactions
+            .get_block_transactions(&a2.header.block_hash)
+            .expect("markers");
+        assert!(markers.contains(&both.hash), "its marker is restored");
+    }
+
+    /// `recover_to_head`: the same corruption must not abort the from-genesis
+    /// rebuild onto the heavier branch.
+    #[tokio::test]
+    async fn c1r_undecodable_receipt_does_not_block_rebuild() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let exec = store_backed(&storage);
+        exec.set_balance(&Address(ALICE), U256::from(FUND));
+        exec.persist_state_changes().await.expect("persist genesis");
+        let (a1, a2, b2, b3, both, only_a) = c1r_corrupt_scenario().await;
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        persist(&storage, &b2);
+        persist(&storage, &b3);
+        drop(app);
+        c1r_corrupt_receipt(&storage, &both.hash);
+        c1r_corrupt_receipt(&storage, &only_a.hash);
+        let mut app2 = CanonicalApplicator::new(exec.clone(), storage.clone());
+        app2.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        let g = Executor::new(Arc::new(StateDB::new()));
+        g.set_balance(&Address(ALICE), U256::from(FUND));
+        let res = app2.recover_to_head(g.state_snapshot(), Hash::default()).await;
+        assert!(
+            matches!(res, Ok(true)),
+            "the rebuild converges on the heavier branch: {res:?}"
+        );
+        assert_eq!(app2.applied_tip().await.hash, b3.header.block_hash);
+        assert!(storage
+            .transactions
+            .get_receipt_reconcile_marker()
+            .expect("marker")
+            .is_none());
+        c1r_assert_corrupt_receipts_replaced(
+            &storage,
+            &[&a1, &a2, &b2, &b3],
+            &a2,
+            &b2,
+            &b3,
+            &both,
+            &only_a,
+        );
+    }
+
+    /// The interrupted-rebuild cleanup and the purge-fallback scan
+    /// (`receipt_index_above`) never include the durable tip's own block: its
+    /// receipts are on the applied chain. Pins the `>` boundary; also covers a
+    /// block above the tip and an index entry whose block is not stored.
+    #[tokio::test]
+    async fn c1r_receipt_index_above_keeps_the_durable_tips_receipts() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let exec = store_backed(&storage);
+        exec.set_balance(&Address(ALICE), U256::from(FUND));
+        exec.persist_state_changes().await.expect("persist genesis");
+        let (a1, a2, _, _) = v251_blocks().await;
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        let ghost_block = Hash::new([0xAB; 32]);
+        let ghost_tx = Hash::new([0xAC; 32]);
+        let mut ghost = storage
+            .transactions
+            .get_receipt(&a1.transactions[0].hash)
+            .expect("read")
+            .expect("a1 receipt");
+        ghost.tx_hash = ghost_tx;
+        ghost.block_hash = ghost_block;
+        storage
+            .transactions
+            .put_receipts(&[(ghost_tx, ghost)])
+            .expect("ghost entry");
+        let a1_entries: Vec<(Hash, Hash)> = a1
+            .transactions
+            .iter()
+            .map(|t| (a1.header.block_hash, t.hash))
+            .collect();
+        let a2_entries: Vec<(Hash, Hash)> = a2
+            .transactions
+            .iter()
+            .map(|t| (a2.header.block_hash, t.hash))
+            .collect();
+        let sorted = |mut v: Vec<(Hash, Hash)>| {
+            v.sort();
+            v
+        };
+
+        // Durable tip a1 @ 1: a1 stays; a2 (above) and the unstored block go.
+        let got = CanonicalApplicator::receipt_index_above(&storage, 1).expect("scan");
+        let mut want = a2_entries.clone();
+        want.push((ghost_block, ghost_tx));
+        assert_eq!(sorted(got.clone()), sorted(want));
+        for e in &a1_entries {
+            assert!(!got.contains(e), "the durable tip's own receipt is kept");
+        }
+        // Durable tip a2 @ 2: only the unstored block goes.
+        let got = CanonicalApplicator::receipt_index_above(&storage, 2).expect("scan");
+        assert_eq!(got, vec![(ghost_block, ghost_tx)]);
+        // Negative control: below a1 both blocks are above the tip.
+        let got = CanonicalApplicator::receipt_index_above(&storage, 0).expect("scan");
+        let mut want = a1_entries;
+        want.extend(a2_entries);
+        want.push((ghost_block, ghost_tx));
+        assert_eq!(sorted(got), sorted(want));
+    }
+
+    // ---------------------------------------------------------------------
     // C1-R read-fault injection: every storage read on the reorg, rebuild and
     // receipt-index paths fails in turn. A failing read must abort the operation
     // with memory, store, receipts, rebuild marker, tip and ring unchanged; it is
