@@ -13,6 +13,9 @@
 #              DIR/KEEP_LIST.r1006.tsv, DIR/devnet-data (the stopped node's data dir) and logs.
 #   alloc      turn a dump into the committed allocation (see emit_alloc.py):
 #                build_r1006_genesis.sh alloc --work DIR [--out FILE]
+#                  [--orangeseed-tree CHAIN389_CHECKOUT | --orangeseed FILE]
+#              --orangeseed-tree runs chain#389's GenesisOrangeSeed for this run's
+#              GovernanceTimelock (FOUNDRY_SOLC must name solc 0.8.36 when offline).
 #
 # Isolation. The devnet, forge and cast run inside `unshare --user --map-root-user --net`
 # (a private network namespace with only loopback), so nothing here can reach any other
@@ -46,7 +49,7 @@ log() { echo "[r1006 $(date -u +%H:%M:%S)] $*" >&2; }
 
 cmd="${1:-}"; shift || true
 NODE="" DUMP="" WORK="" INPUTS="$HERE/inputs.placeholder.env" REF=HEAD OUT=""
-VALIDATORS="$CHAIN_ROOT/core/economics/assets/r1006/validators.json" ORANGESEED=""
+VALIDATORS="$CHAIN_ROOT/core/economics/assets/r1006/validators.json" ORANGESEED="" ORANGESEED_TREE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --node) NODE="$2"; shift 2 ;;
@@ -58,6 +61,7 @@ while [[ $# -gt 0 ]]; do
     --out) OUT="$2"; shift 2 ;;
     --solc) SOLC_BIN="$2"; shift 2 ;;
     --orangeseed) ORANGESEED="$2"; shift 2 ;;
+    --orangeseed-tree) ORANGESEED_TREE="$2"; shift 2 ;;
     *) die "unknown argument $1" ;;
   esac
 done
@@ -107,6 +111,19 @@ case "$cmd" in
     ;;
   alloc)
     [[ -f "$WORK/dump.json" ]] || die "--work has no dump.json (run ceremony first)"
+    if [[ -n "$ORANGESEED_TREE" ]]; then
+      # OrangeSeed for THIS ceremony's GovernanceTimelock, from chain#389's own script and
+      # compile (never recompiled here; emit_alloc pins its code hashes).
+      gov=$(jq -r '.contracts.GovernanceTimelock' "$WORK/book/governance.json")
+      [[ "$gov" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "no GovernanceTimelock in this run's governance book"
+      mkdir -p "$ORANGESEED_TREE/contracts/genesis"
+      rm -f "$ORANGESEED_TREE/contracts/genesis/orangeseed.json"
+      (cd "$ORANGESEED_TREE/contracts" && FOUNDRY_OFFLINE=true ORANGESEED_GOVERNANCE="$gov" GENESIS_TIMESTAMP=1767225600 \
+        GENESIS_ORANGESEED_OUT=genesis/orangeseed.json forge script script/GenesisOrangeSeed.s.sol) >"$WORK/orangeseed.log" 2>&1 ||
+        die "GenesisOrangeSeed failed (see $WORK/orangeseed.log)"
+      cp "$ORANGESEED_TREE/contracts/genesis/orangeseed.json" "$WORK/orangeseed.json"
+      ORANGESEED="$WORK/orangeseed.json"
+    fi
     exec "$PY" "$HERE/emit_alloc.py" --dump "$WORK/dump.json" --inputs "$WORK/inputs.env" \
       --manifest "$WORK/book/ceremony-run.json" --book "$WORK/book/40204.json" ${ORANGESEED:+--orangeseed "$ORANGESEED" --governance-book "$WORK/book/governance.json"} --out "${OUT:-$WORK/alloc.json}"
     ;;

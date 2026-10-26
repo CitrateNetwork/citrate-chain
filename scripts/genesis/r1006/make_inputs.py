@@ -54,6 +54,8 @@ def main():
     for r in ("MEMBERSHIP_GRANTOR", "SIGNER_1", "SIGNER_2", "SIGNER_3", "RELAYER", "CITRATE_AA_OWNER",
               "CITRATE_AA_IDENTITY_SIGNER", "CITRATE_AA_SPONSOR_SIGNER"):
         out.append(f"{r}={got[r]}")
+    out += ["# DeployAll's fee/treasury recipient (#396: required on 40204): the fresh TREASURY.",
+            f"TREASURY={got['TREASURY']}"]
     out += ["# Base allocations (replaces r1005's funded accounts; see core/economics/src/r1006.rs).",
             f"BASE_TREASURY={got['TREASURY']}", f"BASE_FAUCET={got['FAUCET']}", f"BASE_TEAM={got['TEAM']}",
             "# P3: one team-vesting grant to TEAM (A-4 amounts/schedule open). Start 2027-10-28T00:00:00Z.",
