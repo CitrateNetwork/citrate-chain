@@ -938,6 +938,38 @@ expect "ceremony: P5 refuses an output that shadows a book name" 3 'cannot build
 printf '{"deployer":"%s","contracts":{}}' "$DEP" >"$GB/team-vesting.json"
 mk_manifest "$GB"
 expect "ceremony: P5 refuses an output with no contracts" 3 'team-vesting.json has no well-formed contracts' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+# A name repeated across the books is one contract only if every book gives it the same
+# address (case-insensitive); the dormant-ledger book repeats GovernanceTimelock and
+# GovernanceMultisig from governance.json. A repeat with another address, or a name twice in
+# one book, is refused before the checker runs.
+p5_dup() { # name want pattern dormant-ledgers.json-body
+  mk_manifest "$GB"
+  gov_book "$GB" "$DEP"
+  printf '{"deployer":"%s","contracts":{"VestingAlice":"%s"}}' "$DEP" "$(addr 71)" >"$GB/team-vesting.json"
+  printf '%s\n' "$4" >"$GB/dormant-ledgers.json"
+  rm -f "$GB/p5-admin-book.json"
+  reset_calls
+  expect "ceremony P5 duplicates: $1" "$2" "$3" -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+}
+p5_dup "an identical repeat across two books passes" 0 'P5 PASS' \
+  "$(printf '{"deployer":"%s","contracts":{"FederatedRoundLedger":"%s","PatronageLedger":"%s","GovernanceTimelock":"%s","GovernanceMultisig":"%s"},"governance":"%s"}' "$DEP" "$(addr 81)" "$(addr 82)" "$(addr 31)" "$(addr 33)" "$(addr 31)")"
+calls | grep -q '^forge-book genesis/p5-admin-book.json$' && ok "ceremony P5 duplicates: the checker reads the merged book" || bad "ceremony P5 duplicates: the checker reads the merged book" "$(calls)"
+[[ $(grep -o '"GovernanceTimelock"' "$GB/p5-admin-book.json" 2>/dev/null | wc -l) -eq 1 && $(grep -o '"GovernanceMultisig"' "$GB/p5-admin-book.json" 2>/dev/null | wc -l) -eq 1 ]] &&
+  python3 -c 'import json,sys; c=json.load(open(sys.argv[1]))["contracts"]; sys.exit(0 if c["GovernanceTimelock"].lower()==sys.argv[2] and c["GovernanceMultisig"].lower()==sys.argv[3] and {"PatronageLedger","FederatedRoundLedger","VestingAlice","GuardianTimelock"} <= set(c) else 1)' "$GB/p5-admin-book.json" "$(addr 31)" "$(addr 33)" &&
+  ok "ceremony P5 duplicates: a repeated name appears once in the merged book" || bad "ceremony P5 duplicates: a repeated name appears once in the merged book" "$(cat "$GB/p5-admin-book.json" 2>&1)"
+p5_dup "a case-only difference is the same address" 0 'P5 PASS' \
+  "$(printf '{"deployer":"%s","contracts":{"FederatedRoundLedger":"%s","PatronageLedger":"%s","GovernanceTimelock":"%s","GovernanceMultisig":"%s"}}' "$DEP" "$(addr 81)" "$(addr 82)" "$(addr 31 | tr 'a-f' 'A-F' | sed 's/^0X/0x/')" "$(addr 33)")"
+p5_dup "a repeat with another address fails, naming both books and addresses" 3 'dormant-ledgers.json .contracts.GovernanceMultisig is 0x0+22, but .*genesis/governance.json already has 0x0+21' \
+  "$(printf '{"deployer":"%s","contracts":{"FederatedRoundLedger":"%s","PatronageLedger":"%s","GovernanceTimelock":"%s","GovernanceMultisig":"%s"}}' "$DEP" "$(addr 81)" "$(addr 82)" "$(addr 31)" "$(addr 34)")"
+[[ ! -f "$GB/p5-admin-book.json" ]] && ! calls | grep -q '^forge-book' && ok "ceremony P5 duplicates: a refused merge writes no book and runs no checker" || bad "ceremony P5 duplicates: a refused merge writes no book and runs no checker" "$(calls)"
+p5_dup "an identical repeat of a canonical-book name passes" 0 'P5 PASS' \
+  "$(printf '{"deployer":"%s","contracts":{"FederatedRoundLedger":"%s","Alpha":"%s"}}' "$DEP" "$(addr 81)" "$A1")"
+p5_dup "a name twice in one book fails" 3 'dormant-ledgers.json: .*PatronageLedger.* appears more than once' \
+  "$(printf '{"deployer":"%s","contracts":{"FederatedRoundLedger":"%s","PatronageLedger":"%s","PatronageLedger":"%s"}}' "$DEP" "$(addr 81)" "$(addr 82)" "$(addr 83)")"
+p5_dup "a name twice in one book fails even at the same address" 3 'dormant-ledgers.json: .*PatronageLedger.* appears more than once' \
+  "$(printf '{"deployer":"%s","contracts":{"FederatedRoundLedger":"%s","PatronageLedger":"%s","PatronageLedger":"%s"}}' "$DEP" "$(addr 81)" "$(addr 82)" "$(addr 82)")"
+mk_manifest "$GB"
+gov_book "$GB" "$DEP"
 rm "$GB/team-vesting.json" "$GB/dormant-ledgers.json"
 expect "ceremony: a simulation's manifest does not serve a --confirm resume" 3 "run manifest: .*mode 'simulate' \(this run: 'confirm'\)" -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1 bash "$CE" --confirm --only P5 --account deployer
 mk_manifest "$GB" "$DEP" confirm deployer
@@ -2082,6 +2114,22 @@ python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); del m["dormantLedge
 expect "ceremony #363: --confirm P5 refuses a dormant-ledger book P4 did not record" 3 'GATE FAIL at P5: .*dormant-ledgers.json was not recorded by P4' -- "${OBENV[@]}" bash "$CE" --confirm --only P5 --account deployer
 record_outputs "$GB"
 expect "ceremony #363: --confirm P5 accepts the books P3 and P4 recorded (control: stops later, at the registry)" 3 'has no ValidatorRegistry' -- "${OBENV[@]}" bash "$CE" --confirm --only P5 --account deployer
+# The same books through the whole --confirm P5: the dormant-ledger book P4 writes repeats
+# GovernanceTimelock and GovernanceMultisig from governance.json (same addresses), and the
+# merge must accept that and sweep each once.
+python3 - "$GB/ceremony-run.json" "$T/book-vr.json" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1])); b = json.load(open(sys.argv[2]))
+m["stackBook"] = {"deployer": b["deployer"].lower(), "contracts": {k: v.lower() for k, v in b["contracts"].items()},
+                  "aaStack": {}}
+json.dump(m, open(sys.argv[1], "w"))
+PY
+vr_chain "$(addr 31)" "$(addr 31)" "$Z40"
+rm -f "$GB/p5-admin-book.json"
+expect "ceremony: --confirm P5 passes over the real-shaped books (dormant ledgers repeat the governance names)" 0 'P5 PASS: FACTORY-ADMIN 0, DEPLOYER-ADMIN 0' -- "${OBENV[@]}" ADDRESS_BOOK="$T/book-vr.json" bash "$CE" --confirm --only P5 --account deployer
+python3 -c 'import json,sys; c=json.load(open(sys.argv[1]))["contracts"]; sys.exit(0 if {"ValidatorRegistry","GovernanceTimelock","GovernanceMultisig","GuardianTimelock","FederatedRoundLedger","PatronageLedger","TeamVesting_alice"} <= set(c) else 1)' "$GB/p5-admin-book.json" 2>/dev/null &&
+  ok "ceremony: --confirm P5 merged every book once" || bad "ceremony: --confirm P5 merged every book once" "$(cat "$GB/p5-admin-book.json" 2>&1)"
+rm -rf "$FAKE/call/$VR" "$GB/p5-admin-book.json"
 ob_reset simulate
 rm -rf "$BCD" "$FAKE/bc-stage"
 
