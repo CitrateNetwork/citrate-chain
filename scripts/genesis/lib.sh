@@ -39,6 +39,13 @@ refuse_raw_keys() {
   done
 }
 
+# password_file_check <path> [identity]: the keystore password file is a regular file (not a
+# symlink) of the effective user, with no group or world bits, in a directory no other user can
+# change. Prints its identity; with <identity>, also requires the file to be unchanged since
+# that check. On refusal prints the reason (never the path) and returns 1. The file is not read.
+GENESIS_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+password_file_check() { "${PY:-python3}" -I "$GENESIS_LIB_DIR/secret_file_check.py" --password-file "$@"; }
+
 # describe_cmd <argv...>: print a command for a dry-run plan. Arguments that follow
 # --password-file are shown as given (a path), never read.
 describe_cmd() {

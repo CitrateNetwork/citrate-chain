@@ -66,6 +66,7 @@ Values not yet decided are **OPEN**. Nothing in this repo carries allocation amo
 - **Producer operators (≥ 4).** Each generates its own staker key on its own host and gives the chain team a public address (C2 D7). Each node also mints its own `proposer.key` on first start (§6.3).
 - **Faucet signer.** A ceremony-held key, funded at genesis with the capped amount (G4 policy).
 - The keystore password is typed at forge's prompt or read from a `--password-file` path, which every broadcasting phase gets (P2's `regenesis.sh` and each forge step it runs included). The scripts pass the path and never read, export or print the file; `--password` on the command line, and a `--password-file` that is not a readable file, are refused without echoing the value.
+- **Password file.** Create it under `umask 077` in a directory only you can write (for example `umask 077; d=$(mktemp -d); read -rs -p 'keystore password: ' p; printf '%s\n' "$p" >"$d/pw"; unset p`), so it is mode 0600 from the moment it exists. `genesis_ceremony.sh` refuses a password file that is a symlink, is not a regular file, belongs to another user, has any group or world bit, or sits in a directory another user can write (a sticky directory such as `/tmp` is accepted). Before every signing step it checks the file again and stops if it is no longer the same file with the same mode and content. Delete the file and its directory as soon as the ceremony session ends (`rm -f "$d/pw" && rmdir "$d"`).
 
 ## 4. Tooling (`scripts/genesis/`)
 
