@@ -118,6 +118,14 @@ pub struct StateDBAdapter {
     /// executor selects the legacy behaviour below
     /// [`CREATE_NONCE_FIX_ACTIVATION_HEIGHT`](crate::executor::CREATE_NONCE_FIX_ACTIVATION_HEIGHT).
     persist_contract_nonces: bool,
+    /// Exact-created-code rule (see [`crate::exact_code`]). When `true`
+    /// (post-activation, the correct rule), `commit` stores a created
+    /// contract's ORIGINAL code bytes. When `false` (pre-activation legacy),
+    /// it stores REVM's analysed form, which carries 33 trailing zero bytes of
+    /// padding, so historical blocks replay identically. Defaults to `true` so
+    /// new code and tests get the correct rule; the execution entry points
+    /// select it by block height.
+    exact_create_code: bool,
 }
 
 /// Which party owns native value movement during a REVM execution.
@@ -155,6 +163,7 @@ impl StateDBAdapter {
             journal: None,
             value_semantics: ValueSemantics::RevmAuthoritative,
             persist_contract_nonces: true,
+            exact_create_code: true,
         }
     }
 
@@ -172,6 +181,14 @@ impl StateDBAdapter {
     /// `false` reproduces the legacy nonce-drop (pre-activation replay).
     pub fn with_contract_nonce_persistence(mut self, persist: bool) -> Self {
         self.persist_contract_nonces = persist;
+        self
+    }
+
+    /// Select the created-code storage rule for this execution
+    /// (consensus-gated by block height, see [`crate::exact_code`]). `true`
+    /// stores original bytes; `false` reproduces the legacy padded form.
+    pub fn with_exact_create_code(mut self, exact: bool) -> Self {
+        self.exact_create_code = exact;
         self
     }
 
@@ -817,7 +834,8 @@ pub fn execute_contract_create_with_context(
     let mut db = StateDBAdapter::new(state_db.clone())
         .with_block_hashes(block_ctx.block_hashes)
         .with_value_semantics(value_semantics)
-        .with_contract_nonce_persistence(crate::executor::persist_contract_nonces_at(block_number));
+        .with_contract_nonce_persistence(crate::executor::persist_contract_nonces_at(block_number))
+        .with_exact_create_code(crate::exact_code::exact_create_code_active(block_number));
     if let Some(h) = writes_handle {
         db = db.with_writes(h);
     }
@@ -1032,7 +1050,8 @@ pub fn execute_contract_call_with_context(
     let mut db = StateDBAdapter::new(state_db)
         .with_block_hashes(block_ctx.block_hashes)
         .with_value_semantics(value_semantics)
-        .with_contract_nonce_persistence(crate::executor::persist_contract_nonces_at(block_number));
+        .with_contract_nonce_persistence(crate::executor::persist_contract_nonces_at(block_number))
+        .with_exact_create_code(crate::exact_code::exact_create_code_active(block_number));
     if let Some(h) = writes_handle {
         db = db.with_writes(h);
     }
