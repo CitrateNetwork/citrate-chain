@@ -7812,4 +7812,428 @@ mod tests {
         }
         assert!(!flag.load(Ordering::SeqCst), "flag cleared on normal drop");
     }
+
+    // ───────────── replay parity with the supply-hardening height unset ─────────────
+    //
+    // A scripted multi-block range that touches every rule the supply-hardening
+    // height gates: transfers, reverted calls carrying the inference operation's
+    // selector, successful and reverted contract creations, a PayPerUse model
+    // with successful and failing paid inference (owner, treasury and provider
+    // fees), governance-precompile queue / execute / rejected writes, and
+    // artifact-precompile model registration (including a duplicate).
+    //
+    // Each block is produced the way the producer does and applied by a
+    // follower through the real receive path (`apply_received`). With the
+    // height unset (the 40204 release default) every per-block state root,
+    // reward and witness digest below must equal the values recorded on the
+    // code before the activation height existed: blocks below activation
+    // replay byte-identically.
+
+    const RP_PROVIDER: [u8; 20] = [0x9E; 20];
+    const RP_MODEL: [u8; 32] = [0x77; 32];
+    const RP_ART_MODEL: [u8; 32] = [0x4D; 32];
+    const RP_PKEY: [u8; 32] = [0xC1; 32];
+    const RP_FEE: u64 = 1_000_000_000_000; // 1e12 wei per paid call
+    const RP_PROVIDER_FEE: u64 = 1_000_000_000; // 1e9 wei per served call
+
+    /// Serves a call when the input starts with 1, fails otherwise (after the
+    /// executor has already handled the model-access fee).
+    struct RpInference;
+
+    #[async_trait::async_trait]
+    impl citrate_execution::InferenceService for RpInference {
+        async fn run_inference(
+            &self,
+            _model_id: citrate_execution::types::ModelId,
+            input: Vec<u8>,
+            _max_gas: u64,
+        ) -> Result<(Vec<u8>, u64, Address, U256, Option<Vec<u8>>), ExecutionError> {
+            if input.first() == Some(&1) {
+                Ok((
+                    vec![0xAA],
+                    0,
+                    Address(RP_PROVIDER),
+                    U256::from(RP_PROVIDER_FEE),
+                    None,
+                ))
+            } else {
+                Err(ExecutionError::InvalidInput)
+            }
+        }
+    }
+
+    fn rp_selector(sig: &[u8]) -> [u8; 4] {
+        use sha3::{Digest, Keccak256};
+        let d = Keccak256::digest(sig);
+        [d[0], d[1], d[2], d[3]]
+    }
+
+    fn rp_word(v: u64) -> [u8; 32] {
+        let mut w = [0u8; 32];
+        w[24..].copy_from_slice(&v.to_be_bytes());
+        w
+    }
+
+    fn rp_precompile(last: u8) -> [u8; 20] {
+        let mut a = [0u8; 20];
+        a[18] = 0x10;
+        a[19] = last;
+        a
+    }
+
+    fn rp_tx(
+        from: [u8; 20],
+        to: Option<[u8; 20]>,
+        value: u128,
+        data: Vec<u8>,
+        nonce: u64,
+        gas_limit: u64,
+    ) -> Transaction {
+        let mut seed = [0u8; 32];
+        seed[..20].copy_from_slice(&from);
+        seed[24..].copy_from_slice(&nonce.to_be_bytes());
+        Transaction {
+            hash: Hash::new(seed),
+            nonce,
+            from: embedded(from),
+            to: to.map(embedded),
+            value,
+            gas_limit,
+            gas_price: 1_000_000_000,
+            data,
+            signature: Signature::new([1; 64]),
+            chain_id: Some(40204),
+            ..Default::default()
+        }
+    }
+
+    fn rp_register_pay_per_use(from: [u8; 20], nonce: u64) -> Transaction {
+        let meta = serde_json::to_vec(&serde_json::json!({
+            "name": "Replay Model",
+            "version": "1.0.0",
+            "description": "replay parity",
+            "framework": "onnx",
+            "input_shape": [1, 4],
+            "output_shape": [1],
+            "size_bytes": 1024
+        }))
+        .expect("metadata serializes");
+        let mut data = vec![0x01, 0x00, 0x00, 0x00];
+        data.extend_from_slice(&RP_MODEL);
+        data.extend_from_slice(&(meta.len() as u32).to_be_bytes());
+        data.extend_from_slice(&meta);
+        data.push(3); // AccessPolicy::PayPerUse
+        data.extend_from_slice(&rp_word(RP_FEE));
+        rp_tx(from, Some(rp_precompile(0x00)), 0, data, nonce, 400_000)
+    }
+
+    fn rp_infer(from: [u8; 20], model: [u8; 32], first_input: u8, nonce: u64) -> Transaction {
+        let mut data = vec![0x02, 0x00, 0x00, 0x00];
+        data.extend_from_slice(&model);
+        data.extend_from_slice(&[first_input, 2, 3, 4]);
+        rp_tx(from, Some(rp_precompile(0x00)), 0, data, nonce, 400_000)
+    }
+
+    fn rp_gov_queue(from: [u8; 20], value: &[u8], nonce: u64) -> Transaction {
+        let mut d = rp_selector(b"queueSetParam(bytes32,bytes,uint64)").to_vec();
+        d.extend_from_slice(&RP_PKEY);
+        d.extend_from_slice(&rp_word(96));
+        d.extend_from_slice(&rp_word(0));
+        d.extend_from_slice(&rp_word(value.len() as u64));
+        d.extend_from_slice(value);
+        rp_tx(from, Some(rp_precompile(0x03)), 0, d, nonce, 400_000)
+    }
+
+    fn rp_gov_execute(from: [u8; 20], nonce: u64) -> Transaction {
+        let mut d = rp_selector(b"executeSetParam(bytes32)").to_vec();
+        d.extend_from_slice(&RP_PKEY);
+        rp_tx(from, Some(rp_precompile(0x03)), 0, d, nonce, 400_000)
+    }
+
+    fn rp_art_register(from: [u8; 20], nonce: u64) -> Transaction {
+        let cid = b"bafy-replay-cid";
+        let mut d = rp_selector(b"registerModel(bytes32,string)").to_vec();
+        d.extend_from_slice(&RP_ART_MODEL);
+        d.extend_from_slice(&rp_word(64));
+        d.extend_from_slice(&rp_word(cid.len() as u64));
+        d.extend_from_slice(cid);
+        rp_tx(from, Some(rp_precompile(0x02)), 0, d, nonce, 400_000)
+    }
+
+    /// The scripted range: (height, transactions).
+    fn rp_range() -> Vec<(u64, Vec<Transaction>)> {
+        let a = |n| n; // ALICE nonces
+        vec![
+            (
+                1,
+                vec![
+                    transfer(ALICE, BOB, 300_000_000_000_000_000, a(0)),
+                    rp_register_pay_per_use(ALICE, a(1)),
+                    rp_infer(ALICE, [0x5A; 32], 1, a(2)),
+                ],
+            ),
+            (
+                2,
+                vec![
+                    rp_infer(BOB, RP_MODEL, 1, 0),
+                    rp_infer(BOB, RP_MODEL, 0, 1),
+                    rp_infer(BOB, RP_MODEL, 1, 2),
+                ],
+            ),
+            (
+                3,
+                vec![
+                    rp_tx(ALICE, None, 0, vec![0x00], a(3), 200_000),
+                    rp_tx(
+                        ALICE,
+                        None,
+                        0,
+                        vec![0x60, 0x00, 0x60, 0x00, 0xfd],
+                        a(4),
+                        200_000,
+                    ),
+                    rp_infer(ALICE, [0x5A; 32], 1, a(5)),
+                    rp_infer(ALICE, [0x5B; 32], 1, a(6)),
+                    rp_infer(ALICE, [0x5C; 32], 1, a(7)),
+                ],
+            ),
+            (
+                4,
+                vec![
+                    rp_gov_queue(ALICE, b"v1", a(8)),
+                    rp_gov_queue(BOB, b"v2", 3),
+                    rp_art_register(ALICE, a(9)),
+                ],
+            ),
+            (
+                5,
+                vec![
+                    rp_gov_execute(ALICE, a(10)),
+                    rp_gov_execute(ALICE, a(11)),
+                    rp_art_register(ALICE, a(12)),
+                ],
+            ),
+            (6, vec![]),
+            (
+                7,
+                vec![
+                    rp_infer(BOB, RP_MODEL, 1, 4),
+                    transfer(BOB, ALICE, 1_000, 5),
+                ],
+            ),
+        ]
+    }
+
+    /// One block's observable result: root, reward credits, receipts, and the
+    /// precompile storage and model registry entries the range writes (the
+    /// precompile addresses hold no account, so the root alone does not fold
+    /// them).
+    fn rp_witness(
+        exec: &Executor,
+        root: Hash,
+        reward: (U256, U256),
+        receipts: &[citrate_execution::types::TransactionReceipt],
+    ) -> String {
+        use sha3::{Digest, Keccak256};
+        let mut h = Keccak256::new();
+        h.update(root.as_bytes());
+        for v in [reward.0, reward.1] {
+            let mut b = [0u8; 32];
+            v.to_big_endian(&mut b);
+            h.update(b);
+        }
+        for r in receipts {
+            h.update([r.status as u8]);
+            h.update(r.gas_used.to_be_bytes());
+            h.update((r.output.len() as u64).to_be_bytes());
+            h.update(&r.output);
+        }
+        for who in [ALICE, BOB, CB, TREASURY_ADDR, RP_PROVIDER] {
+            let mut b = [0u8; 32];
+            exec.get_balance(&Address(who)).to_big_endian(&mut b);
+            h.update(b);
+        }
+        let gov = Address(rp_precompile(0x03));
+        let art = Address(rp_precompile(0x02));
+        let mut keyed = |addr: &Address, prefix: &[u8], suffix: &[u8]| {
+            let mut k = prefix.to_vec();
+            k.extend_from_slice(suffix);
+            match exec.state_db().get_storage(addr, &k) {
+                Some(v) => {
+                    h.update([1]);
+                    h.update((v.len() as u64).to_be_bytes());
+                    h.update(&v);
+                }
+                None => h.update([0]),
+            }
+        };
+        keyed(&gov, b"ADMIN", b"");
+        keyed(&gov, b"PENDING:", &RP_PKEY);
+        keyed(&gov, b"PARAM:", &RP_PKEY);
+        keyed(&art, b"MODEL_CID:", &RP_ART_MODEL);
+        keyed(&art, b"MODEL_ARTS:", &RP_ART_MODEL);
+        for m in [RP_MODEL, RP_ART_MODEL] {
+            let id = citrate_execution::types::ModelId(Hash::new(m));
+            match exec.state_db().get_model(&id) {
+                Some(s) => {
+                    h.update([1]);
+                    h.update(serde_json::to_vec(&s).expect("model serializes"));
+                }
+                None => h.update([0]),
+            }
+        }
+        hex::encode(h.finalize())
+    }
+
+    fn rp_node() -> Arc<Executor> {
+        let state = Arc::new(StateDB::new());
+        state.set_storage(
+            Address(rp_precompile(0x03)),
+            b"ADMIN".to_vec(),
+            ALICE.to_vec(),
+        );
+        let exec = Arc::new(Executor::new(state).with_inference_service(Arc::new(RpInference)));
+        exec.set_balance(&Address(ALICE), U256::from(FUND));
+        exec
+    }
+
+    /// Per height: (state root, witness digest), recorded on the code before
+    /// the supply-hardening height existed (citrate-chain 253d3287).
+    const RP_RECORDED: &[(&str, &str)] = &[
+        (
+            "c2cee92b39b8e7a3a3b55081ba9eb2e05bace34dba1f1b0a09f478dbed19f1f5",
+            "d5aaf722142b55e6641488a6193168b18111646aad2286bacf507873a4ef32e6",
+        ),
+        (
+            "937a24a6fff2d2db82fa31f25bf8e0219dc2a7c8f94df734f34766f1e8701cb1",
+            "95e4102ef80c72b334a187071813814a6b3167dbef1823aa3ca9f5d153a2cb21",
+        ),
+        (
+            "f14ae165ae04175e58ab0a213e593def361e83cdcd4434ed062c2e2b68c179b5",
+            "31fbe18aaf0e4ffb23b88558fdf8703a1c0c30fc5473ba7827ce070e06b35fd3",
+        ),
+        (
+            "b0069e5b96e012cab5650bb36df9697cc0adf145091d53dc92d8771eaf6986e5",
+            "ce7d04a2261a211c6b5520dba136250178e704384a89e5d9d4e03d0f991b9b9d",
+        ),
+        (
+            "7bd3fd1ca5227a2ef960692bed64d904577524b0e7811ea80186c16ee33b781f",
+            "72c865483670298bbcbeb67034e2c4e66fd8074c2a86472e410a2fbe35180e42",
+        ),
+        (
+            "ee4d28a03156757980a3bd6976aaf1f4d578d7e004d975e355f9e1fd1ae8d131",
+            "7a9dafa81caa99346933fcf74468118a0b79cb9590012146dc7993a42d8c1023",
+        ),
+        (
+            "966cb7af31be11b9654bb40f91cd3be3df5d434aa36b49d16286437ef7328b06",
+            "546a216b72fd8e19bdf39da08db976f3e49fff6b630efb7bcb329855671abf44",
+        ),
+    ];
+
+    #[tokio::test]
+    async fn unset_supply_hardening_height_replays_the_legacy_range_byte_identically() {
+        // The 40204 release default: a release network with no height scheduled.
+        assert_eq!(
+            citrate_execution::supply_hardening::pinned_for(40204),
+            Some(None)
+        );
+        let (height, _) = citrate_execution::supply_hardening::init_for_chain(40204, None)
+            .expect("40204 resolves with no override");
+        assert_eq!(height, None, "40204 ships with the height unset");
+        let producer = rp_node();
+        let follower = rp_node();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let app = CanonicalApplicator::new(follower.clone(), storage.clone());
+        let calc = RewardCalculator::new(canonical_reward_config());
+
+        let mut parent = Hash::default();
+        let mut got: Vec<(String, String)> = Vec::new();
+        for (height, txs) in rp_range() {
+            producer.set_block_context(BlockContext {
+                coinbase: CB,
+                prevrandao: VRF_OUT,
+                block_hashes: std::collections::HashMap::new(),
+            });
+            let provisional = mk_block_txs(height, parent, Hash::default(), VRF_OUT, txs.clone());
+            let mut receipts = Vec::new();
+            for tx in &txs {
+                receipts.push(
+                    producer
+                        .execute_transaction(&provisional, tx)
+                        .await
+                        .expect("producer tx must execute"),
+                );
+            }
+            let reward =
+                canonical_block_reward(&calc, &provisional, &receipts).expect("canonical reward");
+            for (addr, amt) in [
+                (Address(CB), reward.validator_reward),
+                (Address(TREASURY_ADDR), reward.treasury_reward),
+            ] {
+                if amt > U256::zero() {
+                    let bal = producer.get_balance(&addr);
+                    producer.set_balance(&addr, bal + amt);
+                }
+            }
+            let root = producer.calculate_state_root();
+            let block = mk_block_txs(height, parent, root, VRF_OUT, txs);
+
+            persist(&storage, &block);
+            assert!(
+                matches!(
+                    app.apply_received(&block).await,
+                    ApplyOutcome::Applied { .. }
+                ),
+                "the follower must apply block {height}"
+            );
+            assert_eq!(
+                follower.calculate_state_root(),
+                root,
+                "root parity at {height}"
+            );
+
+            let witness = rp_witness(
+                &producer,
+                root,
+                (reward.validator_reward, reward.treasury_reward),
+                &receipts,
+            );
+            assert_eq!(
+                witness,
+                rp_witness(
+                    &follower,
+                    root,
+                    (reward.validator_reward, reward.treasury_reward),
+                    &receipts
+                ),
+                "producer and follower witness parity at {height}"
+            );
+            eprintln!(
+                "RP_RECORDED ({:?}, {:?}),",
+                hex::encode(root.as_bytes()),
+                witness
+            );
+            got.push((hex::encode(root.as_bytes()), witness));
+            parent = block.header.block_hash;
+        }
+
+        // The range must reach every gated site, or the recorded values prove
+        // nothing about them.
+        assert!(follower
+            .state_db()
+            .get_model(&citrate_execution::types::ModelId(Hash::new(RP_MODEL)))
+            .is_some());
+        assert!(follower.get_balance(&Address(RP_PROVIDER)) > U256::zero());
+
+        let recorded: Vec<(String, String)> = RP_RECORDED
+            .iter()
+            .map(|(r, w)| (r.to_string(), w.to_string()))
+            .collect();
+        assert_eq!(
+            got, recorded,
+            "with the height unset, the range must replay to the recorded roots"
+        );
+    }
 }
