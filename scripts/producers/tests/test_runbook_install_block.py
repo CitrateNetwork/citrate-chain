@@ -36,7 +36,7 @@ IDENTITY = (
     r"(release|release-tier2)\.yml@refs/(heads/main|tags/v[0-9A-Za-z._-]+)$"
 )
 REAL_TOOLS = ["bash", "sha256sum", "cut", "mktemp", "rm", "mkdir", "tar", "gzip",
-              "install", "cp", "mv", "cmp", "cat"]
+              "install", "cp", "mv", "cmp", "cat", "chmod", "ln"]
 OLD_BINARY = b"#!/bin/sh\necho previously installed node\n"
 
 
@@ -58,29 +58,59 @@ def fill(block: str, values: dict) -> str:
     return block
 
 
-def fake_node(fp: str) -> bytes:
+TAMPERED = "#!/bin/sh\necho not the released node\n"
+
+# What a fake release binary does while it runs for the fingerprint check, after it prints
+# the good fingerprint. Each one changes a file the old block went on to install.
+BEHAVIOURS = {
+    "": "",
+    # write new bytes into the file that is running
+    "rewrite-self": f"printf '%s' '{TAMPERED}' > \"$0\"\n",
+    # put another file (a new inode) at the path that is running
+    "replace-self": f"printf '%s' '{TAMPERED}' > \"$0.x\"; chmod 755 \"$0.x\"; mv -f \"$0.x\" \"$0\"\n",
+    # rewrite every citrate-node under the work dir (the cwd), copies included
+    "rewrite-all": (
+        'for f in "$PWD"/*/citrate-node "$PWD"/*/*/citrate-node; do\n'
+        '  if [ -f "$f" ]; then chmod u+w "$f"; '
+        f"printf '%s' '{TAMPERED}' > \"$f\"; fi\n"
+        "done\n"
+    ),
+}
+
+
+def fake_node(fp: str, behaviour: str = "") -> bytes:
     return (
         "#!/bin/bash\n"
         'echo "$*" >> "$FAKE_NODE_EXEC_LOG"\n'
         "echo '2026-10-19T00:00:00Z INFO citrate: config loaded'\n"
         f"printf '{{\\n  \"fingerprint\": \"{fp}\"\\n}}\\n'\n"
+        # One brace group: bash parses it whole before it runs, so rewriting the running
+        # script cannot cut it short.
+        + (f"{{\n{BEHAVIOURS[behaviour]}exit 0\n}}\n" if behaviour else "")
     ).encode()
 
 
-def make_tarball(fp: str, symlink: bool = False) -> bytes:
+def make_tarball(fp: str, symlink: bool = False, behaviour: str = "", dir_link: str = "",
+                 mode: int = 0o755, uid: int = 0, uname: str = "") -> bytes:
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
         name = f"citrate-chain-{ARCH}/citrate-node"
-        if symlink:
+        if dir_link:
+            info = tarfile.TarInfo(f"citrate-chain-{ARCH}")
+            info.type = tarfile.SYMTYPE
+            info.linkname = dir_link
+            tf.addfile(info)
+        elif symlink:
             info = tarfile.TarInfo(name)
             info.type = tarfile.SYMTYPE
             info.linkname = "/bin/true"
             tf.addfile(info)
         else:
-            data = fake_node(fp)
+            data = fake_node(fp, behaviour)
             info = tarfile.TarInfo(name)
             info.size = len(data)
-            info.mode = 0o755
+            info.mode = mode
+            info.uid, info.uname = uid, uname
             tf.addfile(info, io.BytesIO(data))
     return buf.getvalue()
 
@@ -282,6 +312,67 @@ class InstallBlockTest(unittest.TestCase):
         p = self.run_block()
         self.assert_refused(p, "symlink")
         self.assertEqual(self.log("node-exec"), [])
+
+    # -- the installed file is the verified file -------------------------------
+
+    def released_binary(self) -> bytes:
+        with tarfile.open(fileobj=io.BytesIO(self.tarball)) as tf:
+            return tf.extractfile(f"citrate-chain-{ARCH}/citrate-node").read()
+
+    def publish_signed(self, tarball: bytes):
+        self.publish(tarball)
+        self.announced_sha = hashlib.sha256(self.tarball).hexdigest()
+
+    def test_binary_that_rewrites_itself_while_checked_is_not_installed(self):
+        self.publish_signed(make_tarball(GOOD_FP, behaviour="rewrite-self"))
+        p = self.run_block()
+        self.assert_refused(p, "changed during the fingerprint check")
+        self.assertEqual(self.log("node-exec"), ["consensus --json"])
+
+    def test_binary_that_replaces_itself_while_checked_is_not_installed(self):
+        self.publish_signed(make_tarball(GOOD_FP, behaviour="replace-self"))
+        p = self.run_block()
+        self.assert_refused(p, "changed during the fingerprint check")
+
+    def test_binary_that_rewrites_every_copy_while_checked_is_not_installed(self):
+        self.publish_signed(make_tarball(GOOD_FP, behaviour="rewrite-all"))
+        p = self.run_block()
+        self.assert_refused(p, "changed during the fingerprint check")
+
+    def test_release_directory_given_as_a_symlink_refuses(self):
+        # The signed tarball's release directory points somewhere else, where a binary
+        # with the announced fingerprint waits. Nothing outside the tarball is run or
+        # installed.
+        elsewhere = self.t / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "citrate-node").write_bytes(fake_node(GOOD_FP))
+        (elsewhere / "citrate-node").chmod(0o755)
+        self.publish_signed(make_tarball(GOOD_FP, dir_link=str(elsewhere)))
+        p = self.run_block()
+        self.assert_refused(p, "symlink")
+        self.assertEqual(self.log("node-exec"), [])
+
+    def test_symlinks_planted_at_the_install_side_paths_are_not_followed(self):
+        victim = self.t / "victim"
+        victim.write_bytes(b"untouched\n")
+        for side in ("citrate-node.prev", "citrate-node.new"):
+            os.symlink(victim, self.install / side)
+        p = self.run_block()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(victim.read_bytes(), b"untouched\n")
+        self.assertEqual((self.install / "citrate-node").read_bytes(), self.released_binary())
+        prev = self.install / "citrate-node.prev"
+        self.assertFalse(prev.is_symlink())
+        self.assertEqual(prev.read_bytes(), OLD_BINARY)
+
+    def test_release_file_mode_and_owner_are_not_carried_over(self):
+        self.publish_signed(make_tarball(GOOD_FP, mode=0o6777, uid=4242, uname="mallory"))
+        p = self.run_block()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        st = os.lstat(self.install / "citrate-node")
+        self.assertEqual(st.st_mode & 0o7777, 0o755)
+        self.assertEqual(st.st_uid, os.geteuid())
+        self.assertEqual((self.install / "citrate-node").read_bytes(), self.released_binary())
 
     def test_unfilled_placeholders_refuse(self):
         p = self.run_block(fill_values=False)
