@@ -2705,8 +2705,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let storage_for_sync = storage.clone();
         let max_seen_for_sync = max_seen_height.clone();
         let sync_peers_for_loop = sync_peers.clone();
-        let sync_driver = Arc::new(sync_driver::SyncDriver::new(sync.clone(), sync_peers.clone()));
+        let sync_driver = Arc::new(sync_driver::SyncDriver::new(
+            sync.clone(),
+            sync_peers.clone(),
+        ));
         let driver_for_loop = sync_driver.clone();
+        let wake_for_loop = sync_driver.wake_handle();
         tokio::spawn(async move {
             // #155: last peer we logged choosing, so SYNCPEER only fires on change.
             let mut last_logged_choice: Option<String> = None;
@@ -2714,7 +2718,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // of back-to-back block requests to peers.
             let mut interval = timing::cadence_interval(sync_driver::TICK_INTERVAL);
             loop {
-                interval.tick().await;
+                // Every response wakes the tick so a freed range slot is
+                // refilled at once; the interval bounds timeout detection.
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = wake_for_loop.notified() => {}
+                }
                 // Snapshot every CONNECTED peer with the head it advertises. The
                 // scan is split from the choice deliberately: `best_h` (the sync
                 // TARGET) is the highest head anyone advertises, whereas the peer
@@ -2925,7 +2934,53 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // wedging a cold node at the first out-of-order block (observed live in
             // the contract-deploy region). Bounded to cap memory if a parent never
             // arrives; the sync loop independently re-requests missing parents.
-            let mut orphan_blocks: Vec<citrate_consensus::types::Block> = Vec::new();
+            // Sync admission worker: admits validated sync responses in order,
+            // executing each block (execute-on-receive) and scoring the peer.
+            // Owns the orphan buffer of blocks whose parent is still on the way.
+            let (sync_admit_tx, mut sync_admit_rx) =
+                tokio::sync::mpsc::channel::<sync_driver::ReceivedBlocks>(sync_driver::ADMIT_QUEUE);
+            {
+                let driver = driver_for_rx.clone();
+                let admission = admission_for_net.clone();
+                let storage = storage_for_handler.clone();
+                let max_seen = max_seen_for_rx.clone();
+                let attested = attested_for_rx.clone();
+                tokio::spawn(async move {
+                    let mut orphan_blocks: Vec<citrate_consensus::types::Block> = Vec::new();
+                    while let Some(received) = sync_admit_rx.recv().await {
+                        let pid = received.pid.clone();
+                        let target = max_seen.load(std::sync::atomic::Ordering::Relaxed);
+                        let report = driver
+                            .admit_received(
+                                &admission,
+                                &storage,
+                                &mut orphan_blocks,
+                                received,
+                                target,
+                                // F2: record each signed, genesis-linked synced
+                                // block as an attested candidate.
+                                |block| {
+                                    attested.observe(&storage, block);
+                                },
+                            )
+                            .await;
+                        // #155: INFO, only for non-Material responses, so a
+                        // healthy node is silent and a misbehaving one is loud.
+                        if report.quality != sync_peer::ServeQuality::Material {
+                            tracing::info!(
+                                "SYNCSCORE peer={} {:?} new={} anchor={} applied={} gap={} score={}",
+                                pid.0.get(..14).unwrap_or(&pid.0),
+                                report.quality,
+                                report.newly_admitted,
+                                report.anchor,
+                                report.applied_now,
+                                report.gap,
+                                report.score
+                            );
+                        }
+                    }
+                });
+            }
             while let Some((pid, msg)) = in_rx.recv().await {
                 // #149 liveness heartbeat. Bumped BEFORE the message is handled,
                 // so a loop that is stuck inside a handler stops advancing this
@@ -3040,7 +3095,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             .await;
                     }
                     NetworkMessage::Headers { headers } => {
-                        let _ = sync_for_rx.handle_headers(&pid, headers).await;
+                        driver_for_rx.ingest_headers(&pid, headers).await;
                     }
                     NetworkMessage::GetTransactions { hashes } => {
                         let mut txs = Vec::new();
@@ -3307,37 +3362,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                 b,
                             );
                         }
-                        // Validation, admission (which executes each block and
-                        // verifies its state root) and peer scoring live in
-                        // sync_driver.rs, shared with the multi-peer sync test.
-                        let target = max_seen_for_rx.load(std::sync::atomic::Ordering::Relaxed);
-                        let report = driver_for_rx
-                            .ingest_blocks(
-                                &admission_for_net,
-                                &storage_for_handler,
-                                &mut orphan_blocks,
-                                &pid,
-                                blocks,
-                                target,
-                                // F2: record each signed, genesis-linked synced
-                                // block as an attested candidate.
-                                |block| {
-                                    attested_for_rx.observe(&storage_for_handler, block);
-                                },
-                            )
-                            .await;
-                        // #155: INFO, only for non-Material responses, so a
-                        // healthy node is silent and a misbehaving one is loud.
-                        if report.quality != sync_peer::ServeQuality::Material {
-                            tracing::info!(
-                                "SYNCSCORE peer={} {:?} new={} anchor={} applied={} gap={} score={}",
-                                pid.0.get(..14).unwrap_or(&pid.0),
-                                report.quality,
-                                report.newly_admitted,
-                                report.anchor,
-                                report.applied_now,
-                                report.gap,
-                                report.score
+                        // Validate here (and stop the range's timer); admission,
+                        // which executes each block and verifies its state root,
+                        // runs on the sync admission worker so a slow apply does
+                        // not hold up this loop. See sync_driver.rs.
+                        let received = driver_for_rx.receive_blocks(&pid, blocks).await;
+                        if sync_admit_tx.send(received).await.is_err() {
+                            tracing::warn!(
+                                "sync admission worker is gone; dropping a Blocks response"
                             );
                         }
                     }

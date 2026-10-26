@@ -440,90 +440,91 @@ impl SyncPeerSelector {
         self.failures.get(id).copied().unwrap_or(0)
     }
 
-    /// Pick the peer to pull blocks from this tick, or `None` when no connected
-    /// peer is ahead of us.
-    ///
-    /// I1: candidates are filtered to `head_height > applied_height` — a peer at
-    /// or below our tip cannot advance us, and selecting one is what made the
-    /// live fleet re-import its own anchor every 2 s for seven hours.
-    ///
-    /// I2: among those, de-preferred peers (>= [`DEPREFER_AT_FAILURES`]) are
-    /// skipped ONLY while a clean useful peer exists. When every useful peer is
-    /// de-preferred, the best is used anyway — otherwise the penalty box can
-    /// blacklist the entire network. Counters are NOT cleared on that escape;
-    /// see the module docs for why that would disable the drop-and-re-handshake
-    /// escalation.
-    ///
-    /// Ties on height break on peer id so the choice is deterministic and does
-    /// not oscillate between two equal peers across ticks.
-    ///
-    /// Takes `&self`: selection is a pure read of the counters. Every mutation
-    /// is an explicit `record_*` / `reset` call, so "does choosing a peer change
-    /// its standing?" is answerable from the signature alone — the question that
-    /// the clear-on-escape draft got wrong.
+    /// The peer `rank` puts first, or `None` when no connected peer is ahead
+    /// of us. Production spreads requests over the whole of [`Self::rank`];
+    /// this is kept for the tests below, which pin what the ordering's top
+    /// must be (I1, I2, I4, I5) — now by exercising `rank` itself.
+    #[cfg(test)]
     pub fn select<'a>(
         &self,
         candidates: &'a [SyncCandidate],
         applied_height: u64,
     ) -> Option<&'a SyncCandidate> {
-        // I1 — only peers strictly ahead of our applied tip can help. Advertised
-        // head is unreliable (I4), but it is a valid NECESSARY condition: a peer
-        // that does not even claim to be ahead certainly cannot advance us.
-        let useful: Vec<&SyncCandidate> = candidates
+        self.rank(candidates, applied_height).into_iter().next()
+    }
+
+    /// Every peer that can advance us (I1), best first. The range scheduler
+    /// spreads requests over this list instead of pulling from one peer.
+    ///
+    /// I1: only peers whose advertised head is above our applied height — a
+    /// peer at or below our tip cannot advance us, and selecting one is what
+    /// made the live fleet re-import its own anchor every 2 s for seven hours.
+    ///
+    /// #155 — ONE ORDERING, NO FILTERS, NO FALLBACK LADDER. Ranking, in order
+    /// of decreasing authority: timeout penalty flag (I2: a preference, never a
+    /// veto — a penalised peer still ranks, below an equal clean one), usefulness
+    /// score (what the peer has actually DONE for us), served watermark (how far
+    /// it has carried us), advertised head (the weakest evidence,
+    /// gossip-inflatable — I4), then peer id (deterministic, never oscillates).
+    /// Score outranks advertised head because gossip pins every advertised head
+    /// to the tip on this fleet. A non-empty useful set always yields a first
+    /// peer, so I2 is structural.
+    pub fn rank<'a>(
+        &self,
+        candidates: &'a [SyncCandidate],
+        applied_height: u64,
+    ) -> Vec<&'a SyncCandidate> {
+        let mut useful: Vec<&SyncCandidate> = candidates
             .iter()
             .filter(|c| c.head_height > applied_height)
             .collect();
-        if useful.is_empty() {
-            return None;
-        }
+        useful.sort_by(|a, b| self.preference(b, a));
+        useful
+    }
 
-        // #155 — ONE ORDERING, NO FILTERS, NO FALLBACK LADDER.
-        //
-        // The old body was three successive filter-then-pick stages (clean ->
-        // unpenalised -> everything), each with its own predicate. Every stage
-        // boundary was a place for a peer to be excluded by one rule and not
-        // re-admitted by any other; that is how the [3,5) dead band, the
-        // "1-7 blocks" dead band, and the 38-cycle demote/forgive oscillation all
-        // happened.
-        //
-        // Now there is a single total order and we take its maximum. Ranking, in
-        // order of decreasing authority:
-        //
-        //   1. usefulness score  — what the peer has actually DONE for us
-        //   2. served watermark  — how far it has actually carried us
-        //   3. advertised head   — the weakest evidence, gossip-inflatable (I4)
-        //   4. peer id           — deterministic tie-break, never oscillates
-        //
-        // Score outranks advertised head deliberately: on this fleet gossip pins
-        // every advertised head to the tip, so ranking on it first is ranking on
-        // noise. A peer that has served us is preferred over one that merely
-        // claims height, which is the whole content of I4.
-        //
-        // I2 is now STRUCTURAL. "Never veto every peer" is not a fallback branch
-        // that a future edit could forget — taking a maximum over a non-empty set
-        // always yields a peer. A network of uniformly bad peers still returns the
-        // least-bad one, and its score recovers the moment it serves.
-        //
-        // Timeouts still de-prefer, but as a term in the order rather than a
-        // filter: a peer with failures is ranked below an equal peer without them,
-        // and can still be selected when it is all we have — which is what
-        // unfreezes its counter.
-        useful.into_iter().max_by(|a, b| {
-            let fa = i32::from(self.failures(&a.id) >= DEPREFER_AT_FAILURES);
-            let fb = i32::from(self.failures(&b.id) >= DEPREFER_AT_FAILURES);
-            // Lower penalty flag is better, so compare b to a.
-            fb.cmp(&fa)
-                .then_with(|| self.score(&a.id).cmp(&self.score(&b.id)))
-                .then_with(|| self.served(&a.id).cmp(&self.served(&b.id)))
-                .then_with(|| a.head_height.cmp(&b.head_height))
-                .then_with(|| b.id.cmp(&a.id))
-        })
+    /// `Greater` when `a` is the better source. See [`Self::select`].
+    fn preference(&self, a: &SyncCandidate, b: &SyncCandidate) -> std::cmp::Ordering {
+        let fa = i32::from(self.failures(&a.id) >= DEPREFER_AT_FAILURES);
+        let fb = i32::from(self.failures(&b.id) >= DEPREFER_AT_FAILURES);
+        // Lower penalty flag is better, so compare b to a.
+        fb.cmp(&fa)
+            .then_with(|| self.score(&a.id).cmp(&self.score(&b.id)))
+            .then_with(|| self.served(&a.id).cmp(&self.served(&b.id)))
+            .then_with(|| a.head_height.cmp(&b.head_height))
+            .then_with(|| b.id.cmp(&a.id))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `rank` is the full ordering `select` takes the maximum of: same filter
+    /// (I1), same winner, every useful peer present exactly once.
+    #[test]
+    fn rank_is_the_ordering_select_maximises() {
+        let mut sel = SyncPeerSelector::new();
+        let peers = [
+            cand("boot2", 54600),
+            cand("rpc1", 68091),
+            cand("boot3", 60000),
+            cand("boot1", 61000),
+        ];
+        sel.record_serve("boot3", 32, 54632, 13_000, 32, false);
+        sel.record_timeout("boot1");
+        sel.record_timeout("boot1");
+        sel.record_timeout("boot1");
+        let ranked: Vec<&str> = sel
+            .rank(&peers, 54600)
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(
+            ranked.first().copied(),
+            sel.select(&peers, 54600).map(|c| c.id.as_str())
+        );
+        assert_eq!(ranked, vec!["boot3", "rpc1", "boot1"]);
+    }
 
     fn cand(id: &str, head_height: u64) -> SyncCandidate {
         SyncCandidate {

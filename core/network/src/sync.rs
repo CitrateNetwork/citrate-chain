@@ -3,37 +3,17 @@
 // Synchronization manager for block and header downloads
 use crate::{
     peer::{Peer, PeerId},
+    sync_ranges::{BlocksMatch, PeerSlot, Plan, RangeConfig, RangeCounters, RangeScheduler},
     NetworkError, NetworkMessage,
 };
 use citrate_consensus::crypto;
 use citrate_consensus::types::{Block, BlockHeader, Hash};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
-
-/// CHAIN-B-A004: hard byte budget for the retained header-download buffer.
-/// `downloaded_headers` is fed by every inbound `Headers` message; without a
-/// bound one peer could drive the node to OOM. 64 MiB is far above any honest
-/// in-flight header window (`header_batch_size * max_concurrent_downloads`
-/// headers) yet a firm ceiling on attacker-controlled growth.
-pub(crate) const MAX_DOWNLOADED_HEADERS_BYTES: usize = 64 * 1024 * 1024;
-
-/// Estimated retained heap for one downloaded header. The fixed-size scalar
-/// fields plus the pubkey/VRF material floor at a few hundred bytes; the only
-/// caller-inflatable component is `merge_parent_hashes` (32 B each). Used only
-/// to bound `downloaded_headers`, so a conservative lower-bound estimate is
-/// what keeps the true memory footprint under `MAX_DOWNLOADED_HEADERS_BYTES`.
-pub(crate) fn estimated_header_bytes(h: &BlockHeader) -> usize {
-    // Measured ~485 B/header retained (CHAIN-B-A004 PoC); use 384 B fixed floor
-    // plus the merge-parent vector so a fat header counts for more, not less.
-    h.merge_parent_hashes
-        .len()
-        .saturating_mul(std::mem::size_of::<Hash>())
-        .saturating_add(384)
-}
 
 /// Synchronization state
 #[derive(Debug, Clone, PartialEq)]
@@ -84,19 +64,19 @@ pub struct SyncManager {
     current_height: Arc<RwLock<u64>>,
     target_height: Arc<RwLock<u64>>,
 
-    // Download queue
-    header_queue: Arc<RwLock<VecDeque<Hash>>>,
-    block_queue: Arc<RwLock<VecDeque<Hash>>>,
+    /// Catch-up block ranges and header anchors: what is in flight, to whom,
+    /// and what still needs asking. See `sync_ranges.rs`. Replaces the old
+    /// anchor-at-the-applied-tip requests and the retained header buffer
+    /// (`downloaded_headers`, bounded at 64 MiB and otherwise unused).
+    ranges: Arc<std::sync::Mutex<RangeScheduler>>,
 
-    // Pending requests
-    pending_headers: Arc<RwLock<HashMap<Hash, BlockRequest>>>,
+    /// Ancestry-recovery block requests (SYNC-S3), keyed by anchor. Forward
+    /// catch-up does not use this map; it goes through `ranges`.
     pending_blocks: Arc<RwLock<HashMap<Hash, BlockRequest>>>,
 
-    // Downloaded but not yet processed
-    downloaded_headers: Arc<RwLock<Vec<BlockHeader>>>,
+    // Validated, not yet drained into admission.
     downloaded_blocks: Arc<RwLock<Vec<Block>>>,
     last_header_hash: Arc<RwLock<Option<Hash>>>,
-    last_requested_header: Arc<RwLock<Option<Hash>>>,
 
     /// This node's OWN applied chain height, when wired via
     /// [`SyncManager::with_local_height`].
@@ -170,20 +150,20 @@ impl Default for SyncConfig {
 
 impl SyncManager {
     pub fn new(config: SyncConfig) -> Self {
+        let range_len = u64::from(config.block_batch_size);
         Self {
             config,
             state: Arc::new(RwLock::new(SyncState::Idle)),
             current_height: Arc::new(RwLock::new(0)),
             target_height: Arc::new(RwLock::new(0)),
-            header_queue: Arc::new(RwLock::new(VecDeque::new())),
-            block_queue: Arc::new(RwLock::new(VecDeque::new())),
-            pending_headers: Arc::new(RwLock::new(HashMap::new())),
+            ranges: Arc::new(std::sync::Mutex::new(RangeScheduler::new(RangeConfig {
+                range_len,
+                ..RangeConfig::default()
+            }))),
             pending_blocks: Arc::new(RwLock::new(HashMap::new())),
             last_block_anchor_height: Arc::new(AtomicU64::new(0)),
-            downloaded_headers: Arc::new(RwLock::new(Vec::new())),
             downloaded_blocks: Arc::new(RwLock::new(Vec::new())),
             last_header_hash: Arc::new(RwLock::new(None)),
-            last_requested_header: Arc::new(RwLock::new(None)),
             local_height: None,
             pba_hardening: citrate_consensus::hardening::PbaHardening::from_process(),
         }
@@ -283,11 +263,7 @@ impl SyncManager {
         };
 
         info!("Starting sync from height {} to {}", current, target);
-
-        // Queue initial header requests
-        self.queue_header_downloads(peer_hash, target.saturating_sub(current))
-            .await;
-
+        // Requests are planned by the sync tick (`plan_ranges`).
         Ok(())
     }
 
@@ -311,54 +287,40 @@ impl SyncManager {
         }
     }
 
-    /// Queue header downloads
-    async fn queue_header_downloads(&self, from: Hash, count: u64) {
-        let mut queue = self.header_queue.write().await;
-
-        // Add to queue in batches
-        let batches = count.div_ceil(self.config.header_batch_size as u64);
-
-        for _ in 0..batches.min(10) {
-            queue.push_back(from);
+    /// Plan the next catch-up requests (see `sync_ranges.rs`). `peers` is in
+    /// preference order. The caller sends what comes back, reports any send
+    /// failure with [`Self::release_peer`], and penalises `expired` peers.
+    pub fn plan_ranges(
+        &self,
+        now: Instant,
+        applied: u64,
+        applied_hash: Hash,
+        peers: &[PeerSlot],
+    ) -> Plan {
+        match self.ranges.lock() {
+            Ok(mut r) => r.plan(now, applied, applied_hash, peers),
+            Err(_) => Plan::default(),
         }
     }
 
-    /// Process header download request
-    pub async fn request_headers(&self, peer: &Peer, from: Hash) -> Result<(), NetworkError> {
-        let peer_id = peer.info.read().await.id.clone();
-
-        // Check if already pending
-        if self.pending_headers.read().await.contains_key(&from) {
-            return Ok(());
+    /// `peer` failed to take a request or went away: re-plan what it owed.
+    pub fn release_peer(&self, peer: &PeerId) {
+        if let Ok(mut r) = self.ranges.lock() {
+            r.release_peer(peer);
         }
+    }
 
-        // Respect concurrency: don't exceed max pending
-        if self.pending_headers.read().await.len() >= self.config.max_concurrent_downloads {
-            return Ok(());
-        }
+    /// Range-scheduler counters (requests, retries, timeouts, duplicates).
+    pub fn range_counters(&self) -> RangeCounters {
+        self.ranges
+            .lock()
+            .map(|r| r.counters().clone())
+            .unwrap_or_default()
+    }
 
-        // Send request
-        peer.send(NetworkMessage::GetHeaders {
-            from,
-            count: self.config.header_batch_size,
-        })
-        .await?;
-
-        // Track request
-        self.pending_headers.write().await.insert(
-            from,
-            BlockRequest {
-                hash: from,
-                peer_id,
-                requested_at: Instant::now(),
-                retries: 0,
-            },
-        );
-
-        // Update last requested header
-        *self.last_requested_header.write().await = Some(from);
-
-        Ok(())
+    /// Header anchors currently held (bounded by the scheduler's lookahead).
+    pub fn anchor_count(&self) -> usize {
+        self.ranges.lock().map(|r| r.anchor_count()).unwrap_or(0)
     }
 
     /// Height of the anchor on the most recent `GetBlocks` we sent (#156).
@@ -411,45 +373,18 @@ impl SyncManager {
         Ok(())
     }
 
-    /// Handle received headers
+    /// Handle received headers.
     ///
-    /// WP-H.4: Headers are validated for height monotonicity before storage.
+    /// WP-H.4: heights must be strictly increasing. A valid batch from the peer
+    /// we asked feeds the range scheduler's anchors (bounded by its lookahead);
+    /// headers nobody asked for, or from a peer we did not ask, are dropped.
+    /// An empty batch answers our request too ("nothing above that anchor"),
+    /// and only the responding peer's request is retired (CHAIN-B-A008).
     pub async fn handle_headers(
         &self,
         from_peer: &PeerId,
         headers: Vec<BlockHeader>,
     ) -> Result<(), NetworkError> {
-        // A response from a sync peer answers OUR in-flight header request to
-        // THAT peer, REGARDLESS of its contents. Retire the responding peer's
-        // pending header requests up front — this covers (a) an EMPTY "you're
-        // already at my tip" batch, previously early-returned *before*
-        // retirement, and (b) a batch whose first header's selected-parent does
-        // not exactly equal the requested `from` (a multi-producer GhostDAG
-        // sibling, since both the anchor and the server resolve `from` through
-        // the last-writer-wins height index). Either case used to leave a
-        // phantom `pending_headers` entry that `check_timeouts` then flagged as
-        // a FALSE timeout, dropping the responding peer — the mechanism that
-        // isolated a bootnode from its only block source and split-brained the
-        // fleet. Any still-needed request is re-issued on the next 2s sync tick.
-        //
-        // CHAIN-B-A008: retirement is now keyed by the RESPONDING PEER. The
-        // pre-fix code did a wholesale `clear()` that retired requests
-        // outstanding against EVERY peer, so one attacker emitting empty
-        // `Headers` frames retired honest peers' requests too and `check_timeouts`
-        // could never observe a real timeout — disabling the entire sync-peer
-        // penalty/eviction escalation. A response from peer X now only clears X's
-        // entries (`BlockRequest.peer_id` is set from the same `peer.info.id` the
-        // rx loop uses as `pid`), leaving other peers' requests to time out
-        // normally.
-        self.pending_headers
-            .write()
-            .await
-            .retain(|_, req| req.peer_id != *from_peer);
-        if headers.is_empty() {
-            return Ok(());
-        }
-
-        // Validate header height monotonicity
         for window in headers.windows(2) {
             let [prev, next] = window else { continue };
             if next.height <= prev.height {
@@ -457,64 +392,28 @@ impl SyncManager {
                     "SYNC_REJECT: non-monotonic header heights ({} -> {})",
                     prev.height, next.height
                 );
+                // Retire our request to this peer: it answered, badly.
+                if let Ok(mut r) = self.ranges.lock() {
+                    r.on_headers(from_peer, &[]);
+                }
                 return Err(NetworkError::ProtocolError(
                     "non-monotonic header heights in sync response".into(),
                 ));
             }
         }
-
-        let count = headers.len();
-        // Safety: non-empty guaranteed by early return above
-        let (first, last) = match (headers.first(), headers.last()) {
-            (Some(f), Some(l)) => (f, l),
-            _ => return Ok(()),
-        };
-        let first_height = first.height;
-        let last_height = last.height;
-        let first_hash = first.block_hash;
-        let last_hash = last.block_hash;
-        // (Pending retirement already done unconditionally at the top of this
-        // function — see the comment there.)
-
-        // Store validated headers, bounded by BYTES.
-        // CHAIN-B-A004: `downloaded_headers` was previously an unbounded `Vec`
-        // that every inbound `Headers` message extended and nothing ever
-        // drained — a single peer could drive the node to OOM at ~200 MB/s by
-        // streaming solicited-looking header batches. Cap the retained heap by
-        // an estimated byte budget and drop the OLDEST headers first (FIFO):
-        // the un-consumed tail is always re-derivable from a fresh request.
-        {
-            let mut dl = self.downloaded_headers.write().await;
-            dl.extend(headers);
-            let mut total: usize = dl.iter().map(estimated_header_bytes).sum();
-            if total > MAX_DOWNLOADED_HEADERS_BYTES {
-                let mut drop_count = 0usize;
-                for h in dl.iter() {
-                    if total <= MAX_DOWNLOADED_HEADERS_BYTES {
-                        break;
-                    }
-                    total = total.saturating_sub(estimated_header_bytes(h));
-                    drop_count = drop_count.saturating_add(1);
-                }
-                if drop_count > 0 {
-                    warn!(
-                        "SYNC_CAP: downloaded_headers over {} bytes, evicting {} oldest headers",
-                        MAX_DOWNLOADED_HEADERS_BYTES, drop_count
-                    );
-                    dl.drain(0..drop_count);
-                }
-            }
+        let anchors: Vec<(u64, Hash)> = headers.iter().map(|h| (h.height, h.block_hash)).collect();
+        if let Ok(mut r) = self.ranges.lock() {
+            r.on_headers(from_peer, &anchors);
         }
+        let (Some(first), Some(last)) = (headers.first(), headers.last()) else {
+            return Ok(());
+        };
+        let (first_height, last_height, first_hash) = (first.height, last.height, first.block_hash);
+        *self.last_header_hash.write().await = Some(last.block_hash);
 
-        // Update progress
+        // Progress, saturating: a peer on a shorter branch can answer below us.
         let current = *self.current_height.read().await;
         let target = *self.target_height.read().await;
-        // Guard against u64 underflow: a peer on a shorter/sibling branch can
-        // answer with `target`/`last_height` at or below `current` (e.g. during
-        // a fork or reorg). With release `overflow-checks = true` a bare
-        // subtraction panics the sync worker thread (previously observed here as
-        // "attempt to subtract with overflow"). Saturate, and guard the
-        // denominator so an at-tip peer reports 100% rather than dividing by 0.
         let span = target.saturating_sub(current);
         let done = last_height.saturating_sub(current);
         let progress = if span == 0 {
@@ -522,26 +421,18 @@ impl SyncManager {
         } else {
             (done as f32 / span as f32) * 100.0
         };
-
         *self.state.write().await = SyncState::DownloadingHeaders {
             from: first_hash,
             target_height: target,
             progress,
         };
-
-        info!(
+        debug!(
             "Downloaded {} headers (height {}-{}), progress: {:.1}%",
-            count, first_height, last_height, progress
+            headers.len(),
+            first_height,
+            last_height,
+            progress
         );
-
-        // Update last header hash
-        *self.last_header_hash.write().await = Some(last_hash);
-
-        // Transition to block download if headers complete
-        if last_height >= target {
-            self.start_block_download().await?;
-        }
-
         Ok(())
     }
 
@@ -557,11 +448,14 @@ impl SyncManager {
     /// 3. tx_root consistency (recomputed from transactions)
     ///
     /// Only validated blocks are stored and count toward progress.
+    ///
+    /// Returns how the response relates to the catch-up range it answers, so
+    /// the caller can score the peer against what was actually asked.
     pub async fn handle_blocks(
         &self,
         from_peer: &PeerId,
         blocks: Vec<Block>,
-    ) -> Result<(), NetworkError> {
+    ) -> Result<BlocksMatch, NetworkError> {
         // Retire the RESPONDING peer's pending block requests up front — a
         // response answers our in-flight request to that peer regardless of
         // contents (empty batch, or a batch whose first block's selected-parent
@@ -576,15 +470,16 @@ impl SyncManager {
             .write()
             .await
             .retain(|_, req| req.peer_id != *from_peer);
+        let raw_first_height = blocks.first().map(|b| b.header.height);
         if blocks.is_empty() {
-            return Ok(());
+            return Ok(self.match_range(from_peer, None, &[]));
         }
 
         let total = blocks.len();
         // Safety: non-empty guaranteed by early return above
         let first_height = match blocks.first() {
             Some(b) => b.header.height,
-            None => return Ok(()),
+            None => return Ok(self.match_range(from_peer, None, &[])),
         };
         // (Pending retirement already done unconditionally at the top of this
         // function — see the comment there.)
@@ -667,13 +562,16 @@ impl SyncManager {
             warn!("Sync validation: {}/{} blocks rejected", rejected, total);
         }
 
+        let validated_heights: Vec<u64> = validated.iter().map(|b| b.header.height).collect();
+        let matched = self.match_range(from_peer, raw_first_height, &validated_heights);
+
         if validated.is_empty() {
-            return Ok(());
+            return Ok(matched);
         }
 
         let last_height = match validated.last() {
             Some(b) => b.header.height,
-            None => return Ok(()),
+            None => return Ok(matched),
         };
         let accepted = validated.len();
 
@@ -723,7 +621,7 @@ impl SyncManager {
         // up (wedge #85, see `sync_is_complete`).
         *self.current_height.write().await = self.applied_height().unwrap_or(last_height);
 
-        info!(
+        debug!(
             "Validated and imported {}/{} blocks (height {}-{}), progress: {:.1}%",
             accepted, total, first_height, last_height, progress
         );
@@ -737,70 +635,21 @@ impl SyncManager {
             );
         }
 
-        Ok(())
+        Ok(matched)
     }
 
-    /// Start block download phase
-    // LOCK ORDERING: acquires current_height, target_height, state sequentially (dropped between),
-    // then holds downloaded_headers (read) + block_queue (write) simultaneously — Level 2.
-    // Safe: no reverse ordering (block_queue -> downloaded_headers) exists anywhere.
-    async fn start_block_download(&self) -> Result<(), NetworkError> {
-        let current = *self.current_height.read().await;
-        let target = *self.target_height.read().await;
-
-        *self.state.write().await = SyncState::DownloadingBlocks {
-            from_height: current,
-            to_height: target,
-            progress: 0.0,
-        };
-
-        info!(
-            "Starting block download from height {} to {}",
-            current, target
-        );
-
-        // Queue block downloads based on headers
-        let mut headers = self.downloaded_headers.write().await;
-        let mut block_queue = self.block_queue.write().await;
-
-        // Queue blocks from downloaded headers
-        for header in headers.iter().take(self.config.max_concurrent_downloads) {
-            block_queue.push_back(header.block_hash);
+    fn match_range(&self, peer: &PeerId, first: Option<u64>, validated: &[u64]) -> BlocksMatch {
+        match self.ranges.lock() {
+            Ok(mut r) => r.on_blocks(peer, first, validated),
+            Err(_) => BlocksMatch::Unsolicited,
         }
-
-        debug!("Queued {} blocks for download", block_queue.len());
-
-        // CHAIN-B-A004: drain the header buffer once consumed so it cannot
-        // accumulate across sync ticks. Any header still needed is re-requested
-        // from the node's current tip on the next tick.
-        headers.clear();
-
-        Ok(())
     }
 
-    /// Check for timed out requests
+    /// Ancestry-recovery block requests that timed out (forward catch-up
+    /// timeouts come back from [`Self::plan_ranges`] instead).
     pub async fn check_timeouts(&self) -> Vec<(Hash, PeerId)> {
         let mut timed_out: Vec<(Hash, PeerId)> = Vec::new();
         let now = Instant::now();
-
-        // Check header requests
-        {
-            let mut to_remove: Vec<Hash> = Vec::new();
-            let pending = self.pending_headers.read().await;
-            for (hash, request) in pending.iter() {
-                if now.duration_since(request.requested_at) > self.config.request_timeout {
-                    timed_out.push((*hash, request.peer_id.clone()));
-                    to_remove.push(*hash);
-                }
-            }
-            drop(pending);
-            if !to_remove.is_empty() {
-                let mut pending = self.pending_headers.write().await;
-                for h in to_remove {
-                    pending.remove(&h);
-                }
-            }
-        }
 
         // Check block requests
         {
@@ -845,19 +694,6 @@ impl SyncManager {
     /// Last received header hash (if any)
     pub async fn last_received_header(&self) -> Option<Hash> {
         *self.last_header_hash.read().await
-    }
-
-    /// Last requested header hash (if any)
-    pub async fn last_requested_header(&self) -> Option<Hash> {
-        *self.last_requested_header.read().await
-    }
-
-    /// Current pending counts (headers, blocks)
-    pub async fn pending_counts(&self) -> (usize, usize) {
-        (
-            self.pending_headers.read().await.len(),
-            self.pending_blocks.read().await.len(),
-        )
     }
 
     /// Drain all validated blocks that have been downloaded and verified.
@@ -941,48 +777,66 @@ mod tests {
         assert_eq!(progress, 50.0);
     }
 
-    /// Liveness regression: a completed headers response must RETIRE its
-    /// pending request, keyed by the served batch's selected-parent (== the
-    /// `from` anchor). Pre-fix the entry was never removed, so `check_timeouts`
-    /// later flagged the responding peer as dead — the chain of events that let
-    /// a bootnode permanently ban its only block source and split-brain the
-    /// fleet. The anchor must be GONE from `pending_headers` after handling.
+    fn slots(ids: &[&str], head: u64) -> Vec<PeerSlot> {
+        ids.iter()
+            .map(|i| PeerSlot::new(crate::PeerId(i.to_string()), head))
+            .collect()
+    }
+
+    fn header_requests(plan: &Plan) -> Vec<String> {
+        plan.requests
+            .iter()
+            .filter_map(|r| match r {
+                crate::SyncRequest::Headers { peer, .. } => Some(peer.0.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Liveness regression: a completed headers response must RETIRE the
+    /// request it answers. Pre-fix the entry was never removed, so the
+    /// responding peer was later flagged as timed out — the chain of events
+    /// that let a bootnode drop its only block source and split-brain the
+    /// fleet. With the range scheduler the observable is: once the peer
+    /// answers, the next round asks for the next headers instead of waiting
+    /// out (and penalising) the old request.
     #[tokio::test]
     async fn handle_headers_retires_pending_request() {
-        use crate::PeerId;
         use citrate_consensus::types::{BlockBuilder, PublicKey};
 
         let sync = SyncManager::new(SyncConfig::default());
-        *sync.current_height.write().await = 0;
-        *sync.target_height.write().await = 100;
+        let now = Instant::now();
+        let peers = slots(&["peer-a"], 10_000);
+        let first = sync.plan_ranges(now, 0, Hash::default(), &peers);
+        assert_eq!(header_requests(&first), vec!["peer-a".to_string()]);
+        // Still outstanding: nothing new is asked.
+        let waiting = sync.plan_ranges(now, 0, Hash::default(), &peers);
+        assert!(header_requests(&waiting).is_empty());
 
-        // The request we sent: GetHeaders { from: anchor }.
-        let anchor = Hash::new([9u8; 32]);
-        sync.pending_headers.write().await.insert(
-            anchor,
-            BlockRequest {
-                hash: anchor,
-                peer_id: PeerId("peer-a".to_string()),
-                requested_at: Instant::now(),
-                retries: 0,
-            },
-        );
-        assert!(sync.pending_headers.read().await.contains_key(&anchor));
-
-        // The peer answers: the first served header's selected-parent IS the
-        // anchor (server resolves `from` to anchor.height+1).
-        let served = BlockBuilder::new()
-            .parent(anchor)
-            .height(5)
-            .proposer(PublicKey::new([1; 32]))
-            .build_unhashed();
-        sync.handle_headers(&PeerId("peer-a".to_string()), vec![served.header])
+        let served: Vec<BlockHeader> = (1..=5u64)
+            .map(|h| {
+                let mut hd = BlockBuilder::new()
+                    .parent(Hash::new([9u8; 32]))
+                    .height(h)
+                    .proposer(PublicKey::new([1; 32]))
+                    .build_unhashed()
+                    .header;
+                hd.block_hash = Hash::new([h as u8; 32]);
+                hd
+            })
+            .collect();
+        sync.handle_headers(&crate::PeerId("peer-a".to_string()), served)
             .await
             .expect("handle_headers");
-
+        let next = sync.plan_ranges(now, 0, Hash::default(), &peers);
+        assert_eq!(
+            header_requests(&next),
+            vec!["peer-a".to_string()],
+            "an answered header request must be retired so the next one goes out"
+        );
         assert!(
-            !sync.pending_headers.read().await.contains_key(&anchor),
-            "pending headers request must be retired once answered"
+            next.expired.is_empty(),
+            "an answered request must never later count as a timeout"
         );
     }
 
@@ -1117,16 +971,12 @@ mod tests {
     async fn empty_response_retires_pending() {
         use crate::PeerId;
         let sync = SyncManager::new(SyncConfig::default());
-        let ha = Hash::new([7u8; 32]);
         let ba = Hash::new([8u8; 32]);
-        sync.pending_headers.write().await.insert(
-            ha,
-            BlockRequest {
-                hash: ha,
-                peer_id: PeerId("p".into()),
-                requested_at: Instant::now(),
-                retries: 0,
-            },
+        let now = Instant::now();
+        let peers = slots(&["p"], 10_000);
+        assert_eq!(
+            header_requests(&sync.plan_ranges(now, 0, Hash::default(), &peers)),
+            vec!["p".to_string()]
         );
         sync.pending_blocks.write().await.insert(
             ba,
@@ -1141,8 +991,9 @@ mod tests {
             .await
             .expect("handle empty headers");
         let _ = sync.handle_blocks(&PeerId("p".into()), vec![]).await;
+        let after = sync.plan_ranges(now, 0, Hash::default(), &peers);
         assert!(
-            sync.pending_headers.read().await.is_empty(),
+            after.expired.is_empty() && !header_requests(&after).is_empty(),
             "an empty header response must retire the pending request"
         );
         assert!(
@@ -1283,11 +1134,12 @@ mod tests {
     }
 
     /// CHAIN-B-A004 tripwire: an unbounded flood of `Headers` messages must not
-    /// grow `downloaded_headers` past the byte budget. Pre-fix `handle_headers`
-    /// did a bare `.extend(headers)` and nothing ever drained the vector, so a
-    /// single peer could OOM the node (~200 MB/s at the rate limit). RED before
-    /// the cap (the retained heap would be ~150 MB here); GREEN after. We assert
-    /// the bound rather than exercising a true OOM, which would be unsafe.
+    /// grow what the sync manager retains. Pre-fix `handle_headers` did a bare
+    /// `.extend(headers)` into a buffer nothing drained, so one peer could OOM
+    /// the node; the later cap held it at 64 MiB. Headers now only feed the
+    /// range scheduler's anchors, which are bounded by its lookahead and taken
+    /// only from the peer that was asked. We assert the bound rather than
+    /// exercising a true OOM, which would be unsafe.
     #[tokio::test]
     async fn downloaded_headers_stay_within_byte_cap_under_flood() {
         use citrate_consensus::types::{BlockBuilder, PublicKey};
@@ -1299,30 +1151,64 @@ mod tests {
             .proposer(PublicKey::new([1; 32]))
             .build_unhashed()
             .header;
+        let now = Instant::now();
+        let peers = slots(&["p"], u64::MAX);
 
-        // 400 batches x 1024 headers ≈ 409k headers. Uncapped that retains
-        // ~150 MB (> the 64 MiB cap), so this flood is a genuine RED case.
+        // 400 batches x 1024 headers ≈ 409k headers, half of them solicited.
         let per_batch: u64 = 1024;
         for batch in 0..400u64 {
+            if batch % 2 == 0 {
+                sync.plan_ranges(now, 0, Hash::default(), &peers);
+            }
             let mut headers = Vec::with_capacity(per_batch as usize);
             for i in 0..per_batch {
                 let mut h = template.clone();
                 h.height = batch * per_batch + i + 1; // strictly monotonic in-batch
+                h.block_hash = Hash::new([(i % 251) as u8 + 1; 32]);
                 headers.push(h);
             }
             sync.handle_headers(&crate::PeerId("p".into()), headers)
                 .await
                 .expect("handle_headers should accept a monotonic batch");
         }
-
-        let dl = sync.downloaded_headers.read().await;
-        let bytes: usize = dl.iter().map(estimated_header_bytes).sum();
+        let lookahead = RangeConfig::default().lookahead as usize;
         assert!(
-            bytes <= MAX_DOWNLOADED_HEADERS_BYTES,
-            "downloaded_headers must stay within the {}-byte cap; got {} bytes across {} headers",
-            MAX_DOWNLOADED_HEADERS_BYTES,
-            bytes,
-            dl.len()
+            sync.anchor_count() <= lookahead,
+            "header anchors must stay within the lookahead ({lookahead}); got {}",
+            sync.anchor_count()
+        );
+    }
+
+    /// CHAIN-B-A008 for headers: a header response from one peer must not
+    /// retire (or feed anchors into) a request made to another.
+    #[tokio::test]
+    async fn header_response_from_one_peer_does_not_retire_another_peers_request() {
+        use citrate_consensus::types::{BlockBuilder, PublicKey};
+
+        let sync = SyncManager::new(SyncConfig::default());
+        let now = Instant::now();
+        let peers = slots(&["peer-a", "peer-b"], 10_000);
+        let first = sync.plan_ranges(now, 0, Hash::default(), &peers);
+        assert_eq!(header_requests(&first), vec!["peer-a".to_string()]);
+        let mut h = BlockBuilder::new()
+            .parent(Hash::new([7u8; 32]))
+            .height(1)
+            .proposer(PublicKey::new([1; 32]))
+            .build_unhashed()
+            .header;
+        h.block_hash = Hash::new([0x42; 32]);
+        sync.handle_headers(&crate::PeerId("peer-b".into()), vec![h])
+            .await
+            .expect("headers");
+        assert_eq!(
+            sync.anchor_count(),
+            0,
+            "unsolicited headers must not become anchors"
+        );
+        let again = sync.plan_ranges(now, 0, Hash::default(), &peers);
+        assert!(
+            header_requests(&again).is_empty(),
+            "peer A's request must survive a response from peer B"
         );
     }
 }

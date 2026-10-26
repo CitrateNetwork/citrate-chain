@@ -89,50 +89,22 @@ impl StateStoreTrait for StateStore {
         storage: &[StateStorageChange],
         applied_tip: Option<(Hash, u64)>,
     ) -> Result<()> {
-        if accounts.is_empty() && storage.is_empty() && applied_tip.is_none() {
-            return Ok(());
-        }
+        self.commit_state_batch(accounts, storage, applied_tip, true)
+    }
 
-        let mut batch = self.db.batch();
-        for (address, account) in accounts {
-            let account_bytes = bincode::serialize(account)?;
-            self.db
-                .batch_put_cf(&mut batch, CF_ACCOUNTS, &address.0, &account_bytes)?;
-        }
-        for change in storage {
-            let storage_key = storage_key(&change.address, &change.key);
-            match &change.value {
-                Some(value) => {
-                    self.db
-                        .batch_put_cf(&mut batch, CF_STORAGE, &storage_key, value)?;
-                }
-                None => {
-                    self.db
-                        .batch_delete_cf(&mut batch, CF_STORAGE, &storage_key)?;
-                }
-            }
-        }
-        if let Some((hash, height)) = applied_tip {
-            // Same key + layout as BlockStore::put_applied_tip (hash[32] || height_be[8]).
-            let mut buf = [0u8; 40];
-            buf[..32].copy_from_slice(hash.as_bytes());
-            buf[32..].copy_from_slice(&height.to_be_bytes());
-            self.db.batch_put_cf(
-                &mut batch,
-                CF_METADATA,
-                crate::chain::block_store::APPLIED_TIP_KEY,
-                &buf,
-            )?;
-        }
-
-        self.db.write_batch_sync(batch)?;
-        debug!(
-            "Stored finalized state batch: {} account(s), {} storage mutation(s), tip={}",
-            accounts.len(),
-            storage.len(),
-            applied_tip.is_some()
-        );
-        Ok(())
+    /// Catch-up group commit: the same single atomic batch (state + applied
+    /// tip), written without forcing an fsync. All column families share one
+    /// RocksDB write-ahead log, so the next SYNCED write makes this one durable
+    /// too; until then a process crash still keeps it (it is in the OS page
+    /// cache) and a power loss rolls the store back to an earlier, complete
+    /// block boundary — never a torn one.
+    fn write_state_batch_with_applied_tip_unsynced(
+        &self,
+        accounts: &[(Address, AccountState)],
+        storage: &[StateStorageChange],
+        applied_tip: Option<(Hash, u64)>,
+    ) -> Result<()> {
+        self.commit_state_batch(accounts, storage, applied_tip, false)
     }
 
     /// #126 (crash-consistent reorg commit): persist a REORG store reconciliation —
@@ -289,6 +261,63 @@ impl StateStoreTrait for StateStore {
 }
 
 impl StateStore {
+    fn commit_state_batch(
+        &self,
+        accounts: &[(Address, AccountState)],
+        storage: &[StateStorageChange],
+        applied_tip: Option<(Hash, u64)>,
+        sync: bool,
+    ) -> Result<()> {
+        if accounts.is_empty() && storage.is_empty() && applied_tip.is_none() {
+            return Ok(());
+        }
+
+        let mut batch = self.db.batch();
+        for (address, account) in accounts {
+            let account_bytes = bincode::serialize(account)?;
+            self.db
+                .batch_put_cf(&mut batch, CF_ACCOUNTS, &address.0, &account_bytes)?;
+        }
+        for change in storage {
+            let storage_key = storage_key(&change.address, &change.key);
+            match &change.value {
+                Some(value) => {
+                    self.db
+                        .batch_put_cf(&mut batch, CF_STORAGE, &storage_key, value)?;
+                }
+                None => {
+                    self.db
+                        .batch_delete_cf(&mut batch, CF_STORAGE, &storage_key)?;
+                }
+            }
+        }
+        if let Some((hash, height)) = applied_tip {
+            // Same key + layout as BlockStore::put_applied_tip (hash[32] || height_be[8]).
+            let mut buf = [0u8; 40];
+            buf[..32].copy_from_slice(hash.as_bytes());
+            buf[32..].copy_from_slice(&height.to_be_bytes());
+            self.db.batch_put_cf(
+                &mut batch,
+                CF_METADATA,
+                crate::chain::block_store::APPLIED_TIP_KEY,
+                &buf,
+            )?;
+        }
+
+        if sync {
+            self.db.write_batch_sync(batch)?;
+        } else {
+            self.db.write_batch(batch)?;
+        }
+        debug!(
+            "Stored finalized state batch: {} account(s), {} storage mutation(s), tip={}",
+            accounts.len(),
+            storage.len(),
+            applied_tip.is_some()
+        );
+        Ok(())
+    }
+
     pub fn new(db: Arc<RocksDB>) -> Self {
         Self { db }
     }

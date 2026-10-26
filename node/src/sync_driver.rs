@@ -28,18 +28,22 @@
 )]
 
 use crate::admission::{self, AdmitOutcome, BlockAdmission};
-use crate::sync_peer::{ServeQuality, SyncCandidate, SyncPeerSelector};
-use citrate_consensus::types::{Block, Hash};
+use crate::sync_peer::{self, ServeQuality, SyncCandidate, SyncPeerSelector};
+use citrate_consensus::types::{Block, BlockHeader, Hash};
 use citrate_network::peer::{Peer, PeerId};
-use citrate_network::SyncManager;
+use citrate_network::{BlocksMatch, NetworkMessage, PeerSlot, SyncManager, SyncRequest};
 use citrate_storage::StorageManager;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::Mutex;
+use std::time::{Duration, Instant};
+use tokio::sync::{Mutex, Notify};
 
-/// How often the request side runs.
-pub const TICK_INTERVAL: Duration = Duration::from_secs(2);
+/// How often the request side runs when nothing wakes it. Every response
+/// wakes it too (see [`SyncDriver::wake_handle`]), so a freed range slot is
+/// refilled at once instead of on the next tick; the interval only bounds how
+/// late a timeout is noticed.
+pub const TICK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// A connected peer as the tick sees it.
 #[derive(Clone)]
@@ -60,6 +64,38 @@ pub struct TickReport {
     pub timed_out: Vec<(PeerId, u32)>,
 }
 
+/// One validated `Blocks` response on its way from the network loop to the
+/// sync admission worker.
+#[derive(Debug)]
+pub struct ReceivedBlocks {
+    pub pid: PeerId,
+    pub matched: BlocksMatch,
+    pub validated: Vec<Block>,
+}
+
+/// Bound on validated responses waiting for admission. The scheduler's
+/// lookahead (512 heights, 16 ranges) is the most that can legitimately be
+/// waiting; the rest is headroom for unsolicited answers.
+pub const ADMIT_QUEUE: usize = 64;
+
+/// A follower this far behind the best known network height is catching up:
+/// it uses the catch-up group commit (see `BlockAdmission::
+/// set_catchup_group_commit`). Far above the reorg window (100) and the
+/// finality depth, so a node near the tip always fsyncs every block.
+pub const CATCHUP_GAP: u64 = 1_024;
+
+/// Received blocks per fsync while catching up.
+pub const CATCHUP_GROUP_COMMIT: u64 = 64;
+
+/// The group-commit size for a node `gap` blocks behind.
+pub fn catchup_group_commit_for_gap(gap: u64) -> u64 {
+    if gap > CATCHUP_GAP {
+        CATCHUP_GROUP_COMMIT
+    } else {
+        1
+    }
+}
+
 /// What one `Blocks` response did.
 #[derive(Debug, Clone)]
 pub struct IngestReport {
@@ -75,6 +111,7 @@ pub struct SyncDriver {
     sync: Arc<SyncManager>,
     selector: Arc<Mutex<SyncPeerSelector>>,
     rotate_idx: AtomicU64,
+    wake: Arc<Notify>,
 }
 
 fn applied_tip(storage: &StorageManager) -> (Hash, u64) {
@@ -92,16 +129,34 @@ impl SyncDriver {
             sync,
             selector,
             rotate_idx: AtomicU64::new(0),
+            wake: Arc::new(Notify::new()),
         }
     }
 
+    /// Notified after every response; the tick loop waits on it alongside
+    /// its interval.
+    pub fn wake_handle(&self) -> Arc<Notify> {
+        self.wake.clone()
+    }
+
+    #[cfg(test)]
     pub fn sync(&self) -> &Arc<SyncManager> {
         &self.sync
     }
 
     /// One round of the request side. `target` is the best known network
     /// height (already clamped by the caller).
-    pub async fn tick(&self, storage: &StorageManager, target: u64, peers: &[TickPeer]) -> TickReport {
+    ///
+    /// Every peer that can advance us is ranked (`SyncPeerSelector::rank`, the
+    /// order `select` maximises) and the range scheduler spreads disjoint
+    /// ranges over them, keyed by the next heights not yet requested. See
+    /// core/network/src/sync_ranges.rs.
+    pub async fn tick(
+        &self,
+        storage: &StorageManager,
+        target: u64,
+        peers: &[TickPeer],
+    ) -> TickReport {
         let mut report = TickReport::default();
         let (applied_hash, applied_height) = applied_tip(storage);
         let candidates: Vec<SyncCandidate> = peers
@@ -111,69 +166,161 @@ impl SyncDriver {
                 head_height: p.head_height,
             })
             .collect();
-        let chosen_id = {
+        // Best first; a peer in bad standing (de-preferred by timeouts, or a
+        // negative usefulness score) may hold only one range at a time.
+        let ranked: Vec<(String, usize)> = {
             let sel = self.selector.lock().await;
-            sel.select(&candidates, applied_height).map(|c| c.id.clone())
+            sel.rank(&candidates, applied_height)
+                .into_iter()
+                .map(|c| {
+                    let bad = sel.failures(&c.id) >= sync_peer::DEPREFER_AT_FAILURES
+                        || sel.score(&c.id) < 0;
+                    (c.id.clone(), usize::from(bad))
+                })
+                .collect()
         };
-        report.chosen = chosen_id.clone();
-        let request_peer: Option<Arc<Peer>> = if let Some(id) = chosen_id {
-            peers.iter().find(|p| p.id.0 == id).map(|p| p.peer.clone())
-        } else if applied_height < target && !peers.is_empty() {
-            // Evidence we are behind but nobody admits a head above ours:
-            // rotate rather than park.
-            let n = self.rotate_idx.fetch_add(1, Ordering::Relaxed);
-            let i = (n as usize).checked_rem(peers.len()).unwrap_or(0);
-            peers.get(i).map(|p| p.peer.clone())
-        } else {
-            None
-        };
-        if let Some(peer) = request_peer {
-            let (ph, pb) = self.sync.pending_counts().await;
-            let mut send_failed = false;
-            if ph < 8 && self.sync.request_headers(&peer, applied_hash).await.is_err() {
-                send_failed = true;
-            }
-            if pb < 8
-                && self
-                    .sync
-                    .request_blocks(&peer, applied_hash, applied_height)
-                    .await
-                    .is_err()
-            {
-                send_failed = true;
-            }
-            if send_failed {
-                let pid = peer.info.read().await.id.clone();
-                let fails = self.selector.lock().await.record_timeout(&pid.0);
-                report.send_failed.push((pid, fails));
+        report.chosen = ranked.first().map(|(id, _)| id.clone());
+        let mut slots: Vec<PeerSlot> = ranked
+            .iter()
+            .filter_map(|(id, cap)| {
+                peers.iter().find(|p| p.id.0 == *id).map(|p| PeerSlot {
+                    id: p.id.clone(),
+                    head_height: p.head_height,
+                    max_in_flight: *cap,
+                })
+            })
+            .collect();
+        if slots.is_empty() && applied_height < target && !peers.is_empty() {
+            // Evidence we are behind but nobody admits a head above ours
+            // (stale advertisements): ask everyone, starting from a rotating
+            // offset so one peer serving a side branch cannot pin us.
+            let n = self.rotate_idx.fetch_add(1, Ordering::Relaxed) as usize;
+            for k in 0..peers.len() {
+                let i = n.wrapping_add(k).checked_rem(peers.len()).unwrap_or(0);
+                if let Some(p) = peers.get(i) {
+                    slots.push(PeerSlot::new(p.id.clone(), target));
+                }
             }
         }
+
+        let plan = self
+            .sync
+            .plan_ranges(Instant::now(), applied_height, applied_hash, &slots);
+        // #151: a request that fails to send counts against the peer, and
+        // whatever it was given is re-planned on someone else.
+        let mut failed: Vec<PeerId> = Vec::new();
+        for req in plan.requests {
+            let (pid, msg) = match req {
+                SyncRequest::Headers {
+                    peer, from, count, ..
+                } => (peer, NetworkMessage::GetHeaders { from, count }),
+                SyncRequest::Blocks {
+                    peer, from, count, ..
+                } => (
+                    peer,
+                    NetworkMessage::GetBlocks {
+                        from,
+                        count,
+                        step: 1,
+                    },
+                ),
+            };
+            if failed.contains(&pid) {
+                continue;
+            }
+            let sent = match peers.iter().find(|p| p.id == pid) {
+                Some(tp) => tp.peer.send(msg).await.is_ok(),
+                None => false,
+            };
+            if !sent {
+                self.sync.release_peer(&pid);
+                failed.push(pid);
+            }
+        }
+        let mut sel = self.selector.lock().await;
+        for pid in failed {
+            let fails = sel.record_timeout(&pid.0);
+            report.send_failed.push((pid, fails));
+        }
+        // One timeout per peer per round, however many of its ranges expired
+        // together: they are one slow connection, not several failures.
+        let mut charged: Vec<PeerId> = Vec::new();
+        for e in plan.expired {
+            if charged.contains(&e.peer) {
+                continue;
+            }
+            let pf = sel.record_timeout(&e.peer.0);
+            charged.push(e.peer.clone());
+            report.timed_out.push((e.peer, pf));
+        }
+        drop(sel);
+        // Ancestry-recovery requests (SYNC-S3) keep their own timeouts.
         for (_h, pid) in self.sync.check_timeouts().await {
+            if charged.contains(&pid) {
+                continue;
+            }
             let pf = self.selector.lock().await.record_timeout(&pid.0);
+            charged.push(pid.clone());
             report.timed_out.push((pid, pf));
         }
         report
     }
 
-    /// Take one `Blocks` response from `pid` in: validate, admit in height
-    /// order (deferring blocks whose parent is still on the way into
-    /// `orphans`), and score the peer on what was new. `on_admitted` runs for
-    /// every newly admitted block.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn ingest_blocks<F: FnMut(&Block)>(
+    /// Take one `Headers` response in and wake the request side, which can
+    /// now anchor more ranges.
+    pub async fn ingest_headers(&self, pid: &PeerId, headers: Vec<BlockHeader>) {
+        if let Err(e) = self.sync.handle_headers(pid, headers).await {
+            tracing::debug!("headers from {}: {}", pid.0, e);
+        }
+        self.wake.notify_one();
+    }
+
+    /// Receive side of one `Blocks` response, run on the network loop:
+    /// validate every block (WP-H.4) and record which range it answers, so
+    /// the range's timer stops when the answer ARRIVES, not when admission
+    /// gets to it. Admission is [`Self::admit_received`], on the sync
+    /// admission worker, so a slow apply never holds up header answers, other
+    /// peers' block answers, or serving peers.
+    pub async fn receive_blocks(&self, pid: &PeerId, blocks: Vec<Block>) -> ReceivedBlocks {
+        let matched = self
+            .sync
+            .handle_blocks(pid, blocks)
+            .await
+            .unwrap_or(BlocksMatch::Unsolicited);
+        // Same task as handle_blocks, so this drains exactly its output.
+        let validated = self.sync.drain_validated_blocks().await;
+        self.wake.notify_one();
+        ReceivedBlocks {
+            pid: pid.clone(),
+            matched,
+            validated,
+        }
+    }
+
+    /// Admission side of one `Blocks` response: admit in height order
+    /// (deferring blocks whose parent is still on the way into `orphans`),
+    /// and score the peer on what was new. `on_admitted` runs for every newly
+    /// admitted block.
+    pub async fn admit_received<F: FnMut(&Block)>(
         &self,
         admission: &BlockAdmission,
         storage: &StorageManager,
         orphans: &mut Vec<Block>,
-        pid: &PeerId,
-        blocks: Vec<Block>,
+        received: ReceivedBlocks,
         target: u64,
         mut on_admitted: F,
     ) -> IngestReport {
-        // WP-H.4: handle_blocks validates each block.
-        let _ = self.sync.handle_blocks(pid, blocks).await;
-        // WP-H.5: drain validated blocks into admission.
-        let mut pending = self.sync.drain_validated_blocks().await;
+        let ReceivedBlocks {
+            pid,
+            matched,
+            validated: mut pending,
+        } = received;
+        let pid = &pid;
+        let (_, applied_before) = applied_tip(storage);
+        admission.set_catchup_group_commit(catchup_group_commit_for_gap(
+            target.saturating_sub(applied_before),
+        ));
+        let fresh: HashSet<Hash> = pending.iter().map(|b| b.header.block_hash).collect();
         // CHAIN-B-A005: only re-scan the orphan buffer when this batch
         // actually delivered something new.
         let reprocessed_orphans = !pending.is_empty();
@@ -201,7 +348,9 @@ impl SyncDriver {
                         if completed_partial {
                             tracing::debug!(
                                 "Completed a partial admission of synced block {} @ {}",
-                                hex::encode(block.header.block_hash.as_bytes().get(..8).unwrap_or(&[])),
+                                hex::encode(
+                                    block.header.block_hash.as_bytes().get(..8).unwrap_or(&[])
+                                ),
                                 block.header.height
                             );
                         }
@@ -231,27 +380,38 @@ impl SyncDriver {
                 break;
             }
         }
+        // Blocks from THIS response still waiting on a parent: a range that
+        // arrived ahead of an earlier one. They are new to us and count as
+        // service; they are admitted when the earlier range lands.
+        let deferred_fresh = pending
+            .iter()
+            .filter(|b| fresh.contains(&b.header.block_hash))
+            .count();
         if reprocessed_orphans {
             *orphans = admission::bound_orphan_buffer(std::mem::take(&mut pending));
         }
+        self.wake.notify_one();
 
         // #153/#155/#156: credit the peer on what it delivered, relative to
-        // the gap, neutral when our own question was stale.
+        // what the range asked for and to the gap. A response that answers no
+        // range of ours (ancestry recovery, or a late answer to a range
+        // already reassigned) is our question, not the peer's failure: neutral
+        // when it brings nothing.
         let (_, applied_now) = applied_tip(storage);
         let gap = target.saturating_sub(applied_now);
-        let anchor = self.sync.last_block_anchor_height();
-        let stale_anchor = anchor < applied_now;
+        let (anchor, batch, stale_anchor) = match matched {
+            BlocksMatch::Range { start, end, .. } => (
+                start,
+                usize::try_from(end.saturating_sub(start).saturating_add(1)).unwrap_or(usize::MAX),
+                false,
+            ),
+            BlocksMatch::Unsolicited => (self.sync.last_block_anchor_height(), 32, true),
+        };
+        let useful = newly_admitted.saturating_add(deferred_fresh);
         let mut sel = self.selector.lock().await;
-        let quality = sel.record_serve(
-            &pid.0,
-            newly_admitted,
-            highest_admitted,
-            gap,
-            32, // SyncConfig::block_batch_size
-            stale_anchor,
-        );
+        let quality = sel.record_serve(&pid.0, useful, highest_admitted, gap, batch, stale_anchor);
         IngestReport {
-            newly_admitted,
+            newly_admitted: useful,
             quality,
             score: sel.score(&pid.0),
             anchor,
@@ -357,8 +517,11 @@ mod tests {
             .blue_work(blue_work_for_score(height))
             .proposer(PublicKey::new(key.verifying_key().to_bytes()))
             .build_unhashed();
-        b.tx_root =
-            citrate_consensus::tx_auth::tx_root_for_height(PbaHardening::off(), height, &b.transactions);
+        b.tx_root = citrate_consensus::tx_auth::tx_root_for_height(
+            PbaHardening::off(),
+            height,
+            &b.transactions,
+        );
         b.header.block_hash = b.compute_hash();
         b.signature = crypto::sign_block(&b.header.block_hash, key);
         b
@@ -426,7 +589,10 @@ mod tests {
                     .expect("producer tx executes");
             }
             let r = rewards.calculate_reward(&provisional).expect("reward");
-            for (addr, amt) in [(Address(CB), r.validator_reward), (treasury, r.treasury_reward)] {
+            for (addr, amt) in [
+                (Address(CB), r.validator_reward),
+                (treasury, r.treasury_reward),
+            ] {
                 if amt > U256::zero() {
                     let bal = exec.get_balance(&addr);
                     exec.set_balance(&addr, bal + amt);
@@ -458,7 +624,8 @@ mod tests {
     }
 
     async fn follower(chain: &Chain, dir: &std::path::Path) -> Follower {
-        let storage = Arc::new(StorageManager::new(dir, PruningConfig::default()).expect("storage"));
+        let storage =
+            Arc::new(StorageManager::new(dir, PruningConfig::default()).expect("storage"));
         let g = &chain.genesis;
         storage.blocks.put_block(g).expect("genesis");
         storage
@@ -563,8 +730,8 @@ mod tests {
                         {
                             let mut w = wire.lock().expect("wire");
                             w.get_blocks += 1;
-                            let asked = anchor.saturating_add(1)
-                                ..anchor.saturating_add(u64::from(count));
+                            let asked =
+                                anchor.saturating_add(1)..anchor.saturating_add(u64::from(count));
                             if w.served.range(asked).next().is_some() {
                                 w.duplicate_get_blocks += 1;
                             }
@@ -642,6 +809,9 @@ mod tests {
         rss_peak_kb: u64,
         received_blocks: u64,
         distinct_blocks: u64,
+        /// Time spent validating responses (hash, signature, tx_root) on the
+        /// receive side.
+        validate_secs: f64,
     }
 
     /// Sync `follower` from `peers` until it reaches `n` or `deadline` passes.
@@ -672,18 +842,37 @@ mod tests {
             let storage = f.storage.clone();
             let stop = stop.clone();
             let peers = peers.clone();
+            let wake = driver.wake_handle();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(TICK_INTERVAL);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 while !stop.load(Ordering::Relaxed) {
-                    interval.tick().await;
+                    tokio::select! {
+                        _ = interval.tick() => {}
+                        _ = wake.notified() => {}
+                    }
                     let _ = driver.tick(&storage, n, &peers).await;
                 }
             })
         };
+        // Admission worker, like the node's.
+        let (admit_tx, mut admit_rx) = mpsc::channel::<ReceivedBlocks>(ADMIT_QUEUE);
+        let worker = {
+            let driver = f.driver.clone();
+            let admission = f.admission.clone();
+            let storage = f.storage.clone();
+            tokio::spawn(async move {
+                let mut orphans: Vec<Block> = Vec::new();
+                while let Some(r) = admit_rx.recv().await {
+                    driver
+                        .admit_received(&admission, &storage, &mut orphans, r, n, |_| {})
+                        .await;
+                }
+            })
+        };
         // Receive side: one task, like the network loop.
-        let mut orphans: Vec<Block> = Vec::new();
         let mut received_blocks = 0u64;
+        let mut validate_secs = 0f64;
         let mut distinct: BTreeSet<Hash> = BTreeSet::new();
         let applied = || {
             f.storage
@@ -703,18 +892,23 @@ mod tests {
                     for b in &blocks {
                         distinct.insert(b.header.block_hash);
                     }
-                    f.driver
-                        .ingest_blocks(&f.admission, &f.storage, &mut orphans, &pid, blocks, n, |_| {})
-                        .await;
+                    let t = Instant::now();
+                    let r = f.driver.receive_blocks(&pid, blocks).await;
+                    validate_secs += t.elapsed().as_secs_f64();
+                    if admit_tx.send(r).await.is_err() {
+                        break;
+                    }
                 }
                 NetworkMessage::Headers { headers } => {
-                    let _ = f.driver.sync().handle_headers(&pid, headers).await;
+                    f.driver.ingest_headers(&pid, headers).await;
                 }
                 _ => {}
             }
         }
         let secs = start.elapsed().as_secs_f64();
         stop.store(true, Ordering::Relaxed);
+        drop(admit_tx);
+        let _ = worker.await;
         let _ = ticker.await;
         let _ = sampler.await;
         Outcome {
@@ -724,6 +918,7 @@ mod tests {
             rss_peak_kb: peak.load(Ordering::Relaxed),
             received_blocks,
             distinct_blocks: distinct.len() as u64,
+            validate_secs,
         }
     }
 
@@ -734,13 +929,44 @@ mod tests {
             .unwrap_or(default)
     }
 
-    /// The catch-up floor this test enforces, in applied blocks per second.
-    /// Debug build, two test threads; the release figure is measured separately.
-    const MIN_BLOCKS_PER_SEC: f64 = 100.0;
+    #[test]
+    fn group_commit_only_while_far_behind() {
+        assert_eq!(catchup_group_commit_for_gap(0), 1);
+        assert_eq!(catchup_group_commit_for_gap(CATCHUP_GAP), 1);
+        assert_eq!(
+            catchup_group_commit_for_gap(CATCHUP_GAP + 1),
+            CATCHUP_GROUP_COMMIT
+        );
+        // Near the tip a node must fsync every block: well clear of the reorg
+        // window and the finality depth.
+        const { assert!(CATCHUP_GAP > 10 * 100) };
+    }
 
+    /// Catch-up floor, applied blocks per second. The old driver could not
+    /// exceed one 32-block range per 2 s tick (~15.5 blocks/s) in any build.
+    fn min_blocks_per_sec() -> f64 {
+        if cfg!(debug_assertions) {
+            20.0
+        } else {
+            200.0
+        }
+    }
+
+    /// Always-on: 2,000 blocks (debug-build friendly).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fresh_node_syncs_from_three_peers_one_faulty_without_duplicate_requests() {
-        let n = env_u64("CITRATE_SYNC_TEST_BLOCKS", 20_000);
+        multi_peer_catch_up(env_u64("CITRATE_SYNC_TEST_BLOCKS", 2_000)).await;
+    }
+
+    /// The full 20k-block run. Slow in a debug build; run it in release:
+    /// `cargo test --release -p citrate-node --bin citrate catch_up_20k -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "20k blocks: run in release (see doc comment)"]
+    async fn catch_up_20k_blocks_from_three_peers_one_faulty() {
+        multi_peer_catch_up(env_u64("CITRATE_SYNC_TEST_BLOCKS", 20_000)).await;
+    }
+
+    async fn multi_peer_catch_up(n: u64) {
         let chain = build_chain(n).await;
         let serve_dir = tempfile::tempdir().expect("tempdir");
         let serving = store_with(&chain, serve_dir.path());
@@ -750,19 +976,45 @@ mod tests {
         let (in_tx, in_rx) = mpsc::channel::<(PeerId, NetworkMessage)>(4096);
         let wire = Arc::new(std::sync::Mutex::new(Wire::default()));
         let peers = vec![
-            spawn_peer("peer-a", Behaviour::Honest, n, serving.clone(), in_tx.clone(), wire.clone()),
-            spawn_peer("peer-b", Behaviour::Honest, n, serving.clone(), in_tx.clone(), wire.clone()),
-            spawn_peer("peer-c", Behaviour::EmptyOrSilent, n, serving.clone(), in_tx.clone(), wire.clone()),
+            // The faulty peer sorts first, so on equal standing it is the
+            // preferred source until it proves otherwise: the worst case.
+            spawn_peer(
+                "peer-a",
+                Behaviour::EmptyOrSilent,
+                n,
+                serving.clone(),
+                in_tx.clone(),
+                wire.clone(),
+            ),
+            spawn_peer(
+                "peer-b",
+                Behaviour::Honest,
+                n,
+                serving.clone(),
+                in_tx.clone(),
+                wire.clone(),
+            ),
+            spawn_peer(
+                "peer-c",
+                Behaviour::Honest,
+                n,
+                serving.clone(),
+                in_tx.clone(),
+                wire.clone(),
+            ),
         ];
         // The deadline is what the throughput floor allows, plus slack.
-        let deadline = Duration::from_secs_f64(n as f64 / MIN_BLOCKS_PER_SEC * 1.5 + 10.0);
+        let floor = min_blocks_per_sec();
+        let deadline = Duration::from_secs_f64(n as f64 / floor * 1.5 + 10.0);
         let out = run_sync(&f, peers, in_rx, n, deadline).await;
         let w = wire.lock().expect("wire");
+        let c = f.driver.sync().range_counters();
+        println!("SYNCBENCH scheduler {c:?}");
         let bps = out.applied as f64 / out.secs;
         println!(
             "SYNCBENCH n={n} applied={} secs={:.1} blocks_per_sec={:.1} rss_start_mb={:.0} \
              rss_peak_mb={:.0} get_blocks={} get_headers={} duplicate_get_blocks={} \
-             faulty_get_blocks={} blocks_sent={} received={} distinct={}",
+             faulty_get_blocks={} blocks_sent={} received={} distinct={} validate_secs={:.2}",
             out.applied,
             out.secs,
             bps,
@@ -775,6 +1027,7 @@ mod tests {
             w.blocks_sent,
             out.received_blocks,
             out.distinct_blocks,
+            out.validate_secs,
         );
 
         // Reached the tip, on the right block, with the right state.
@@ -785,7 +1038,10 @@ mod tests {
         assert_eq!(f.executor.calculate_state_root(), tip.state_root);
         for b in &chain.blocks {
             assert_eq!(
-                f.storage.state.get_state_root(&b.header.block_hash).unwrap(),
+                f.storage
+                    .state
+                    .get_state_root(&b.header.block_hash)
+                    .unwrap(),
                 Some(b.state_root),
                 "persisted state root at height {}",
                 b.header.height
@@ -793,12 +1049,25 @@ mod tests {
         }
         // Throughput floor.
         assert!(
-            bps >= MIN_BLOCKS_PER_SEC,
-            "catch-up ran at {bps:.1} blocks/s, floor is {MIN_BLOCKS_PER_SEC}"
+            bps >= floor,
+            "catch-up ran at {bps:.1} blocks/s, floor is {floor}"
         );
         // No request asked for data a peer had already sent.
         assert_eq!(w.duplicate_get_blocks, 0, "duplicate GetBlocks on the wire");
-        // The faulty peer was used and routed around.
+        assert_eq!(
+            c.duplicate_requests, 0,
+            "scheduler issued an overlapping range"
+        );
+        // The faulty peer was used and routed around: its ranges came back
+        // empty or timed out and were served by someone else.
         assert!(w.faulty_get_blocks > 0, "faulty peer never asked");
+        assert!(
+            c.timeouts > 0 && c.empty_responses > 0,
+            "faulty peer's failures not seen"
+        );
+        assert!(
+            c.retries > 0,
+            "faulty peer's ranges were never re-requested"
+        );
     }
 }

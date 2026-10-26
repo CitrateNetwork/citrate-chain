@@ -31,4 +31,6 @@ rules:
       - pattern-either:
           - pattern: let _ = $S.blocks.put_block($B);
           - pattern: let _ = $S.put_block($B);
+          - pattern: let _ = $S.blocks.put_block_unsynced($B);
+          - pattern: let _ = $S.put_block_unsynced($B);
           - pattern: let _ = $DAG.store_block($B).await;
