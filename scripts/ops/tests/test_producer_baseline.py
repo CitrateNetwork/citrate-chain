@@ -1,9 +1,15 @@
 """Tests for scripts/ops/producer_baseline.sh.
 
-The script provisions real hosts, so `apply` and `check` are proven on the hosts
-themselves (PR evidence). These tests cover what can run without touching this
-machine: the disk alert it installs, the node unit template it installs, and a
-tripwire that the script can never change the state of citrate-node.
+The script provisions real hosts, so a full `apply` and `check` is proven on the
+hosts themselves (PR evidence). These tests cover what can run without touching
+this machine: the disk alert and the node unit it installs, tripwires (it never
+changes the state of citrate-node), and behavioural tests of the apply steps.
+
+The behavioural tests source the script in library mode (PRODUCER_BASELINE_LIB=1)
+with every path under a temp root (PRODUCER_BASELINE_ROOT) and PATH shims for
+ufw, sshd, systemctl, apt-get, install, chown, getent, id, useradd, groupadd and
+curl. Each shim appends its argv to a call log in the temp dir, so the tests
+assert what ran and in what order. Nothing outside the temp dir is written.
 
 Run: python3 -m unittest discover -s scripts/ops/tests -p 'test_*.py' -v
 """
@@ -13,6 +19,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -228,6 +235,362 @@ class LayoutTest(unittest.TestCase):
         self.assertRegex(src, r"rmdir[^\n]*/opt/citrate")
         # Nothing in the script deletes recursively or by glob.
         self.assertEqual([l for l in src.splitlines() if re.search(r"\brm\s+-[a-zA-Z]*r", l)], [])
+
+
+# ---- behavioural tests with PATH shims --------------------------------------
+
+SHIM = r"""#!/bin/bash
+# Test shim: logs argv, never touches the host.
+name="$(basename "$0")"
+printf '%s\n' "$name $*" >>"$SHIM_LOG"
+case "$name" in
+  sshd)
+    if [ "${1:-}" = -t ]; then exit "${SHIM_SSHD_T_RC:-0}"; fi
+    if [ "${1:-}" = -T ]; then cat "$SHIM_DIR/sshd_T"; exit 0; fi ;;
+  systemctl)
+    if [ "${1:-}" = is-active ]; then
+      for a in "$@"; do [ "$a" = ssh.socket ] && exit "${SHIM_SOCKET_ACTIVE_RC:-3}"; done
+      exit 0
+    fi
+    if [ "${1:-}" = show ]; then echo "${SHIM_SOCKET_LISTEN:-}"; exit 0; fi ;;
+  ufw)
+    case "${1:-}" in
+      allow)
+        if [ -n "${SHIM_UFW_FAIL:-}" ] && [ "$2" = "$SHIM_UFW_FAIL" ]; then exit 1; fi
+        if [ -z "${SHIM_UFW_DROP:-}" ] || [ "$2" != "$SHIM_UFW_DROP" ]; then
+          echo "ufw allow $2" >>"$SHIM_DIR/ufw_added"
+        fi ;;
+      show)
+        echo "Added user rules (see 'ufw status' for running firewall):"
+        cat "$SHIM_DIR/ufw_added" 2>/dev/null ;;
+      status) echo "Status: inactive" ;;
+    esac ;;
+  install)
+    args=()
+    while [ $# -gt 0 ]; do
+      case "$1" in -o|-g) shift 2 ;; *) args+=("$1"); shift ;; esac
+    done
+    exec /usr/bin/install "${args[@]}" ;;
+  getent)
+    if [ "$1" = passwd ]; then grep "^$2:" "$SHIM_DIR/passwd"; exit; fi
+    exit 0 ;;
+  id)
+    if [ "$*" = "-u" ]; then echo 0; else echo 996; fi ;;
+  curl) exit 7 ;;
+esac
+exit 0
+"""
+SHIMMED = ("sshd", "systemctl", "ufw", "apt-get", "install", "chown", "getent", "id",
+           "useradd", "groupadd", "curl", "sysctl", "swapon", "timedatectl", "chronyc")
+DEFAULT_SSHD_T = (
+    "port 22\nlistenaddress [::]:22\nlistenaddress 0.0.0.0:22\n"
+    "authorizedkeysfile .ssh/authorized_keys .ssh/authorized_keys2\n"
+    "passwordauthentication no\n"
+)
+
+
+class Sandbox:
+    """A temp root, a shim bin dir and a call log. Removed in cleanup()."""
+
+    def __init__(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="dgx-pbshim-"))
+        self.root = self.tmp / "root"
+        self.bin = self.tmp / "bin"
+        self.log = self.tmp / "calls.log"
+        for d in (self.root, self.bin, self.tmp / "t", self.tmp / "home",
+                  self.root / "root/.ssh", self.root / "home/alice/.ssh"):
+            d.mkdir(parents=True)
+        shim = self.bin / "_shim"
+        shim.write_text(SHIM)
+        shim.chmod(0o755)
+        for n in SHIMMED:
+            (self.bin / n).symlink_to("_shim")
+        (self.tmp / "sshd_T").write_text(DEFAULT_SSHD_T)
+        (self.tmp / "passwd").write_text(
+            "root:x:0:0:root:/root:/bin/bash\nalice:x:1000:1000::/home/alice:/bin/bash\n")
+        (self.root / "etc").mkdir()
+        (self.root / "etc/os-release").write_text("ID=ubuntu\nPRETTY_NAME=test\n")
+        (self.root / "etc/logrotate.conf").write_text("weekly\ninclude /etc/logrotate.d\n")
+        self.log.write_text("")
+
+    def add_key(self, user_home: str = "root", name: str = "authorized_keys") -> None:
+        kdir = self.tmp / "k"
+        kdir.mkdir(exist_ok=True)
+        key = kdir / "id"
+        if not key.exists():  # throwaway key, never leaves the temp dir
+            subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "test", "-f", str(key)],
+                           check=True, capture_output=True)
+        (self.root / user_home / ".ssh" / name).write_text("no-pty " + (kdir / "id.pub").read_text())
+
+    def run(self, body: str, **env: str) -> subprocess.CompletedProcess[str]:
+        e = {
+            "PATH": f"{self.bin}:/usr/bin:/bin",
+            "HOME": str(self.tmp / "home"),
+            "TMPDIR": str(self.tmp / "t"),
+            "PRODUCER_BASELINE_LIB": "1",
+            "PRODUCER_BASELINE_ROOT": str(self.root),
+            "SHIM_LOG": str(self.log),
+            "SHIM_DIR": str(self.tmp),
+        }
+        e.update(env)
+        return subprocess.run(["bash", "-c", f'source "$1"; {body}', "harness", str(SCRIPT)],
+                              capture_output=True, text=True, env=e, timeout=60)
+
+    def calls(self, prog: str | None = None) -> list[str]:
+        lines = [l for l in self.log.read_text().splitlines() if l]
+        return [l for l in lines if prog is None or l.split(" ", 1)[0] == prog]
+
+    def cleanup(self) -> None:
+        # Only ever the exact dir mkdtemp made for this test.
+        assert self.tmp.name.startswith("dgx-pbshim-") and self.tmp.parent == Path(tempfile.gettempdir())
+        shutil.rmtree(self.tmp)
+
+
+class ShimTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.sb = Sandbox()
+        self.addCleanup(self.sb.cleanup)
+
+
+class LockoutGuardTest(ShimTestCase):
+    """apply refuses before any change when the operator could be locked out."""
+
+    def test_preflight_passes_with_port_22_and_a_root_key(self) -> None:
+        self.sb.add_key()
+        r = self.sb.run("preflight")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_refuses_when_sshd_listens_on_another_port(self) -> None:
+        self.sb.add_key()
+        for cfg in ("port 2222\nlistenaddress 0.0.0.0:2222\n",
+                    "port 22\nport 2222\n",
+                    "port 22\nlistenaddress 10.0.0.5:2200\n"):
+            (self.sb.tmp / "sshd_T").write_text(cfg + "authorizedkeysfile .ssh/authorized_keys\n")
+            r = self.sb.run("preflight")
+            self.assertEqual(r.returncode, 2, f"{cfg!r}: {r.stdout}{r.stderr}")
+            self.assertIn("port", r.stderr)
+
+    def test_refuses_when_ssh_socket_listens_on_another_port(self) -> None:
+        self.sb.add_key()
+        r = self.sb.run("preflight", SHIM_SOCKET_ACTIVE_RC="0", SHIM_SOCKET_LISTEN="[::]:2222 (Stream)")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        r = self.sb.run("preflight", SHIM_SOCKET_ACTIVE_RC="0", SHIM_SOCKET_LISTEN="[::]:22 (Stream)")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)  # negative control
+
+    def test_refuses_when_sshd_config_is_unreadable(self) -> None:
+        self.sb.add_key()
+        (self.sb.tmp / "sshd_T").write_text("")
+        r = self.sb.run("preflight")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+
+    def test_refuses_without_an_authorized_key(self) -> None:
+        cases = {
+            "no file": None,
+            "empty file": "",
+            "comments only": "# nothing here\n\n",
+            "garbage": "not a key\n",
+        }
+        for name, content in cases.items():
+            ak = self.sb.root / "root/.ssh/authorized_keys"
+            if content is None:
+                ak.unlink(missing_ok=True)
+            else:
+                ak.write_text(content)
+            r = self.sb.run("preflight")
+            self.assertEqual(r.returncode, 2, f"{name}: {r.stdout}{r.stderr}")
+            self.assertIn("authorized key", r.stderr)
+
+    def test_key_in_any_authorizedkeysfile_counts(self) -> None:
+        self.sb.add_key(name="authorized_keys2")
+        r = self.sb.run("preflight")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_absolute_authorizedkeysfile_with_tokens(self) -> None:
+        (self.sb.tmp / "sshd_T").write_text("port 22\nauthorizedkeysfile /etc/ssh/keys/%u\n")
+        (self.sb.root / "etc/ssh/keys").mkdir(parents=True)
+        self.sb.add_key()
+        r = self.sb.run("preflight")
+        self.assertEqual(r.returncode, 2, "key only in ~/.ssh must not count here: " + r.stdout + r.stderr)
+        shutil.copy(self.sb.root / "root/.ssh/authorized_keys", self.sb.root / "etc/ssh/keys/root")
+        r = self.sb.run("preflight")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_sudo_user_key_is_the_one_checked(self) -> None:
+        self.sb.add_key()  # root has a key, alice does not
+        r = self.sb.run("preflight", SUDO_USER="alice")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("alice", r.stderr)
+        self.sb.add_key(user_home="home/alice")
+        r = self.sb.run("preflight", SUDO_USER="alice")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_apply_fails_closed_before_any_change(self) -> None:
+        # No authorized key: do_apply must stop before apt, ufw, sshd reload or any file.
+        r = self.sb.run("do_apply")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        mutating = [c for c in self.sb.calls()
+                    if c.split(" ", 1)[0] in ("apt-get", "ufw", "install", "chown", "useradd", "groupadd")
+                    or (c.startswith("systemctl ") and not c.startswith(("systemctl is-active", "systemctl show")))]
+        self.assertEqual(mutating, [])
+        written = sorted(str(p.relative_to(self.sb.root)) for p in self.sb.root.rglob("*") if p.is_file())
+        self.assertEqual(written, ["etc/logrotate.conf", "etc/os-release"])
+
+    def test_apply_fails_closed_on_wrong_port(self) -> None:  # second guard, same property
+        self.sb.add_key()
+        (self.sb.tmp / "sshd_T").write_text("port 2222\nauthorizedkeysfile .ssh/authorized_keys\n")
+        r = self.sb.run("do_apply")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertEqual(self.sb.calls("apt-get") + self.sb.calls("ufw"), [])
+
+
+class ApplyStepsTest(ShimTestCase):
+    def test_ssh_dropin_is_key_only(self) -> None:
+        r = self.sb.run("apply_ssh")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        conf = (self.sb.root / "etc/ssh/sshd_config.d/10-citrate.conf").read_text().splitlines()
+        for want in ("PasswordAuthentication no", "KbdInteractiveAuthentication no",
+                     "ChallengeResponseAuthentication no", "PermitRootLogin prohibit-password",
+                     "PubkeyAuthentication yes", "PermitEmptyPasswords no"):
+            self.assertIn(want, conf)
+        self.assertEqual([l for l in conf if re.search(r"\byes\b", l) and "Pubkey" not in l], [])
+
+    def test_ssh_reload_gated_on_sshd_t(self) -> None:
+        r = self.sb.run("apply_ssh", SHIM_SSHD_T_RC="1")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertEqual([c for c in self.sb.calls("systemctl") if "reload" in c or "restart" in c], [])
+
+    def test_ssh_reloads_on_every_run(self) -> None:
+        for _ in range(2):
+            r = self.sb.run("apply_ssh")
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        calls = self.sb.calls()
+        self.assertEqual(calls.count("systemctl reload ssh"), 2, calls)
+        # sshd -t comes before each reload
+        idx = [i for i, c in enumerate(calls) if c in ("sshd -t", "systemctl reload ssh")]
+        self.assertEqual([calls[i] for i in idx], ["sshd -t", "systemctl reload ssh"] * 2)
+
+    def test_journald_restarted_on_every_run(self) -> None:
+        for _ in range(2):
+            r = self.sb.run("apply_logs")
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.sb.calls().count("systemctl restart systemd-journald"), 2)
+
+    def test_unattended_never_reboots(self) -> None:
+        r = self.sb.run("apply_unattended")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        conf = (self.sb.root / "etc/apt/apt.conf.d/52citrate-unattended").read_text().splitlines()
+        self.assertIn('Unattended-Upgrade::Automatic-Reboot "false";', conf)
+        self.assertIn('Unattended-Upgrade::Automatic-Reboot-WithUsers "false";', conf)
+        self.assertEqual([l for l in conf if '"true"' in l and "Reboot" in l], [])
+
+    def test_dirs_modes(self) -> None:
+        r = self.sb.run("apply_user_dirs")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        mode = lambda p: (self.sb.root / p).stat().st_mode & 0o7777
+        self.assertEqual(mode("var/lib/citrate/data"), 0o700)
+        self.assertEqual(mode("var/lib/citrate"), 0o750)
+        self.assertEqual(mode("etc/citrate"), 0o755)
+        installs = self.sb.calls("install")
+        self.assertIn(f"install -d -o root -g citrate -m 0750 {self.sb.root}/var/lib/citrate", installs)
+        self.assertIn(f"install -d -o citrate -g citrate -m 0700 {self.sb.root}/var/lib/citrate/data", installs)
+
+    def test_dirs_refuse_symlinks(self) -> None:
+        target = self.sb.root / "elsewhere"
+        target.mkdir(mode=0o755)
+        target.chmod(0o755)
+        for link in ("var/lib/citrate/data", "etc/citrate", "var/lib/citrate"):
+            p = self.sb.root / link
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.symlink_to(target)
+            r = self.sb.run("apply_user_dirs")
+            self.assertEqual(r.returncode, 2, f"{link}: {r.stdout}{r.stderr}")
+            self.assertIn("symlink", r.stderr)
+            self.assertEqual(target.stat().st_mode & 0o7777, 0o755, link)
+            r = self.sb.run("preflight")
+            self.assertEqual(r.returncode, 2, f"preflight {link}: {r.stdout}{r.stderr}")
+            p.unlink()
+
+    def test_firewall_allows_then_defaults_then_enable(self) -> None:
+        r = self.sb.run("apply_firewall")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        ufw = [c for c in self.sb.calls("ufw") if not c.startswith(("ufw status", "ufw show"))]
+        self.assertEqual(ufw, [
+            "ufw allow 22/tcp", "ufw allow 30303/tcp", "ufw allow 30303/udp",
+            "ufw default deny incoming", "ufw default allow outgoing", "ufw --force enable",
+        ])
+
+    def test_firewall_not_enabled_without_ssh_rule(self) -> None:
+        r = self.sb.run("apply_firewall", SHIM_UFW_DROP="22/tcp")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertEqual([c for c in self.sb.calls("ufw") if "enable" in c or "default" in c], [])
+
+    def test_firewall_failed_allow_leaves_defaults_alone(self) -> None:
+        r = self.sb.run("apply_firewall", SHIM_UFW_FAIL="30303/udp")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual([c for c in self.sb.calls("ufw") if "enable" in c or "default" in c], [])
+
+    def test_changed_tracks_piped_files(self) -> None:
+        r = self.sb.run('apply_disk_alert >/dev/null; apply_unit_template >/dev/null; printf "%s\\n" "${CHANGED[@]}"')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        changed = r.stdout.splitlines()
+        self.assertIn("/usr/local/sbin/citrate-disk-alert", changed)
+        self.assertIn("/etc/systemd/system/citrate-node.service", changed)
+        r = self.sb.run('apply_disk_alert >/dev/null; apply_unit_template >/dev/null; echo "n=${#CHANGED[@]}"')
+        self.assertIn("n=0", r.stdout)  # negative control: second run changes nothing
+
+    def test_dispatch_refuses_a_test_root(self) -> None:
+        for mode in ("apply", "check"):
+            e = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(self.sb.tmp / "home"),
+                 "PRODUCER_BASELINE_ROOT": str(self.sb.root)}
+            r = subprocess.run(["bash", str(SCRIPT), mode], capture_output=True, text=True, env=e, timeout=30)
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("PRODUCER_BASELINE_ROOT", r.stderr)
+
+
+class DoAgentKeyTest(ShimTestCase):
+    def gen_key(self, gh: Path, uid: str) -> tuple[Path, str]:
+        subprocess.run(["gpg", "--batch", "--quiet", "--passphrase", "", "--quick-gen-key", uid, "ed25519", "sign", "never"],
+                       env={"GNUPGHOME": str(gh), "PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+                       check=True, capture_output=True)
+        out = subprocess.run(["gpg", "--batch", "--with-colons", "--list-keys", uid],
+                             env={"GNUPGHOME": str(gh)}, check=True, capture_output=True, text=True).stdout
+        fpr = next(l.split(":")[9] for l in out.splitlines() if l.startswith("fpr:"))
+        asc = self.sb.tmp / f"{uid}.asc"
+        asc.write_text(subprocess.run(["gpg", "--batch", "--armor", "--export", uid], env={"GNUPGHOME": str(gh)},
+                                      check=True, capture_output=True, text=True).stdout)
+        return asc, fpr
+
+    def test_key_fingerprint_pin(self) -> None:
+        if not shutil.which("gpg"):
+            self.skipTest("gpg not installed")
+        gh = self.sb.tmp / "gnupg"
+        gh.mkdir(mode=0o700)
+        a, fa = self.gen_key(gh, "a@test.invalid")
+        b, fb = self.gen_key(gh, "b@test.invalid")
+        both = self.sb.tmp / "both.asc"
+        both.write_text(a.read_text() + b.read_text())
+        dearmored = self.sb.tmp / "a.gpg"
+        subprocess.run(["gpg", "--dearmor", "-o", str(dearmored), str(a)], check=True, capture_output=True,
+                       env={"GNUPGHOME": str(gh)})
+        ok = lambda f, fpr: self.sb.run(f'key_fpr_ok "{f}" "{fpr}"').returncode
+        self.assertEqual(ok(a, fa), 0)
+        self.assertEqual(ok(dearmored, fa), 0)
+        self.assertEqual(ok(a, fb), 1)            # wrong key
+        self.assertEqual(ok(both, fa), 1)         # extra key smuggled in
+        self.assertEqual(ok(self.sb.tmp / "passwd", fa), 1)  # not a key at all
+
+    def test_installer_is_not_piped_to_a_shell(self) -> None:
+        src = SCRIPT.read_text()
+        self.assertNotRegex(src, r"curl[^\n]*\|\s*(sudo\s+)?(ba)?sh\b")
+        self.assertRegex(src, r"DO_AGENT_KEY_FPR=902C44B42EA9A17F8578510977B79B3FFAF7EF65")
+        # negative control for the regex
+        self.assertRegex("curl -fsSL https://x/install.sh | bash", r"curl[^\n]*\|\s*(sudo\s+)?(ba)?sh\b")
+
+    def test_install_refused_when_key_download_fails(self) -> None:
+        r = self.sb.run("install_do_agent")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse((self.sb.root / "etc/apt/sources.list.d/digitalocean-agent.list").exists())
+        self.assertEqual([c for c in self.sb.calls("apt-get") if "install" in c], [])
 
 
 if __name__ == "__main__":
