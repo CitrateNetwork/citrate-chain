@@ -478,15 +478,17 @@ async fn main() -> Result<()> {
             // env override and the config file's `[chain].pba_hardening_height`.
             let file_cfg = resolve_config_path(cli.config.clone())
                 .and_then(|p| NodeConfig::from_file(&p).ok());
-            let (cfg_chain_id, configured, dev_profile, agent_configured) = match &file_cfg {
-                Some(c) => (
-                    c.chain.chain_id,
-                    c.chain.pba_hardening_height,
-                    c.chain.dev_profile,
-                    c.chain.agent_precompiles_height,
-                ),
-                None => (40204, None, false, None),
-            };
+            let (cfg_chain_id, configured, dev_profile, agent_configured, supply_configured) =
+                match &file_cfg {
+                    Some(c) => (
+                        c.chain.chain_id,
+                        c.chain.pba_hardening_height,
+                        c.chain.dev_profile,
+                        c.chain.agent_precompiles_height,
+                        c.chain.supply_hardening_height,
+                    ),
+                    None => (40204, None, false, None, None),
+                };
             let chain_id = cli.chain_id.unwrap_or(cfg_chain_id);
             let resolved = citrate_consensus::hardening::resolve_pba_hardening_for_chain(
                 chain_id,
@@ -497,8 +499,14 @@ async fn main() -> Result<()> {
             let (agent_height, _) =
                 citrate_execution::agent_fork::resolve_for_chain(chain_id, agent_configured)
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let manifest =
-                consensus_manifest::ConsensusManifest::for_heights(resolved.height, agent_height);
+            let (supply_height, _) =
+                citrate_execution::supply_hardening::resolve_for_chain(chain_id, supply_configured)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let manifest = consensus_manifest::ConsensusManifest::for_heights(
+                resolved.height,
+                agent_height,
+                supply_height,
+            );
             // The activation heights compiled into this release (a node on a
             // pinned chain runs that height; see the start-up banner for the
             // height a configured node resolved).
@@ -1415,6 +1423,24 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         None => info!(
             "Agent precompile fork not scheduled (source: {}); precompile set unchanged",
             agent_fork_source
+        ),
+    }
+    // Supply-accounting hardening fork height, published before any execution
+    // component is built. Not scheduled on 40204 until a release pins it; on a
+    // release network a disagreeing env or config value aborts start-up.
+    let (supply_height, supply_source) = citrate_execution::supply_hardening::init_for_chain(
+        config.chain.chain_id,
+        config.chain.supply_hardening_height,
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
+    match supply_height {
+        Some(h) => info!(
+            "Supply hardening fork ACTIVE from height {} (source: {})",
+            h, supply_source
+        ),
+        None => info!(
+            "Supply hardening fork not scheduled (source: {}); legacy rules",
+            supply_source
         ),
     }
 
