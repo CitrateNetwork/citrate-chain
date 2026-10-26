@@ -16,7 +16,8 @@
 //     exactly what `finality_driver::spawn` runs each second, walking the
 //     node's own stored headers);
 //   * the floor VERIFIER (`FloorVerifier`, Enforced mode — both switches ON,
-//     which no release ships yet), sharing the gadget's safety stop.
+//     which no release ships yet), sharing the gadget's safety stop and
+//     installed as the manager's finalization guard, as `main.rs` does.
 //
 // Votes travel through an in-process gossip queue standing in for
 // `NetworkMessage::CheckpointVote` broadcast + the inbound handler's relay.
@@ -28,11 +29,12 @@
 // CheckpointFinalitySafety.tla) is named in the comments: Propose/SignVote
 // (driver pass), Finalize (gossip reaching quorum), VerifyFloor (verifier
 // tick), Reorg (`reorg_to`), Restart (rebuild the node over its store).
+// Finalize includes the floor check the guard runs before the finalization is
+// visible (the TLA+ Finalize action raises the floor or halts in the same step).
 //
 // Scenarios that need late-joiner certificate sync (C3-S1b, spec §11.10) are
-// `#[ignore = "needs C3-S1b"]`; the open findings (S2 window; S1 across
-// sibling committees) are `#[ignore = "bug: ..."]`. None of them is a pass
-// today.
+// `#[ignore = "needs C3-S1b"]`; the open S1 finding across sibling
+// committees is `#[ignore = "bug: ..."]`. None of them is a pass today.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -66,7 +68,7 @@ const VRF_B: [u8; 32] = [0xB0; 32];
 const VRF_C: [u8; 32] = [0xC0; 32];
 
 /// Highest block height any scenario builds (state roots are precomputed).
-const MAX_HEIGHT: u64 = 24;
+const MAX_HEIGHT: u64 = 84;
 
 /// Spec §3 parameters at the scale of a test: interval 2, depth 3.
 fn config(committee_size: usize) -> CheckpointConfig {
@@ -181,12 +183,15 @@ struct TestNode {
     app: Arc<CanonicalApplicator>,
     dag: Arc<DagStore>,
     gadget: Arc<FinalityGadget>,
-    verifier: FloorVerifier,
+    verifier: Arc<FloorVerifier>,
     key: Ed25519SigningKey,
     cursor: u64,
     retries: OwnVoteRetries,
     /// Every block this node has stored (re-hydrated into a fresh DAG on restart).
     known: Vec<Block>,
+    /// The applicator's fork-choice head (`None`: nothing to follow, as with no
+    /// fork choice). Set by a test to drive the spine-rebuild recovery path.
+    head: Arc<parking_lot::Mutex<Option<Hash>>>,
 }
 
 /// Build the finality stack over `storage` the way `main.rs` does, then run
@@ -201,7 +206,10 @@ async fn assemble(
     cfg: CheckpointConfig,
     known: Vec<Block>,
 ) -> (TestNode, FloorTick) {
-    let app = Arc::new(CanonicalApplicator::new(exec.clone(), storage.clone()));
+    let head = Arc::new(parking_lot::Mutex::new(None));
+    let app = Arc::new(
+        CanonicalApplicator::new(exec.clone(), storage.clone()).with_fork_choice_cell(head.clone()),
+    );
     let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
     for b in &known {
         let _ = dag.store_block(b.clone()).await;
@@ -221,13 +229,14 @@ async fn assemble(
         Some(Arc::new(sel)),
         true,
     ));
-    let verifier = FloorVerifier::new(
+    let verifier = Arc::new(FloorVerifier::new(
         FloorMode::Enforced,
         mgr,
         app.clone(),
         gadget.safety_stop(),
         Arc::new(AtomicU64::new(0)),
-    );
+    ));
+    assert!(verifier.install_finalization_guard(), "Enforced installs");
     let boot = verifier.boot_check().await;
     (
         TestNode {
@@ -242,6 +251,7 @@ async fn assemble(
             cursor: 0,
             retries: OwnVoteRetries::default(),
             known,
+            head,
         },
         boot,
     )
@@ -900,9 +910,11 @@ async fn a4_cross_chain_votes_are_rejected() {
 }
 
 /// A4 / stale-or-forged certificates: each tampered certificate record, found
-/// at boot, halts finality BEFORE any block is admitted — floor not raised (not
-/// even to the earlier valid certificate), RPC tags at genesis, gadget
-/// proposes nothing — and the stop never clears by itself.
+/// at boot, halts finality BEFORE any block is admitted — floor never raised
+/// from the forged record (only restored to the earlier VALID certificate at 6,
+/// whose block is canonical here: boot floor restore, review of #335 @
+/// 5236d2b), RPC tags at genesis, gadget proposes nothing — and the stop never
+/// clears by itself.
 #[tokio::test]
 async fn a4_forged_certificates_halt_at_boot_and_never_clear() {
     let chains = Chains::new();
@@ -960,7 +972,11 @@ async fn a4_forged_certificates_halt_at_boot_and_never_clear() {
             "{what}: {boot:?}"
         );
         assert!(node.gadget.halted(), "{what}");
-        assert_eq!(node.floor(), 0, "{what}: floor not raised");
+        assert_eq!(
+            node.floor(),
+            6,
+            "{what}: not raised from the forged record; restored to the valid A6"
+        );
         assert_eq!(node.rpc_finalized(), FinalizedAnchor::GENESIS, "{what}");
         let out = node.drive().await;
         assert!(out.is_empty(), "{what}: nothing signed while halted");
@@ -1117,12 +1133,14 @@ async fn a6_reorg_below_finality_is_rejected_above_is_allowed() {
     assert!(!net.node(0).gadget.halted());
 }
 
-/// Safety stop and resume, end to end (spec §4.5). The floor is raised by the
-/// verifier's poll, so a reorg that lands between finalization and the next
-/// poll proceeds; the poll then finds the certified block off this node's
-/// chain and halts finality (no proposal, no signature, floor and RPC tags
-/// frozen) while the other nodes keep finalizing. When fork choice brings the
-/// node back onto the certified branch the stop clears, the boundaries skipped
+/// Safety stop and resume, end to end (spec §4.5). Node 3 proposes and signs
+/// A2 / A4, then fork choice moves it onto a sibling branch B (forking at 3)
+/// BEFORE the votes for A4 reach it — allowed, nothing above 0 is final yet.
+/// When A4 then finalizes on node 3, the finalization-time check finds B4 at
+/// height 4 and halts finality before the finalization is visible: no
+/// proposal, no signature, floor and RPC tags at the last verified pair (A2),
+/// while the other nodes keep finalizing. When fork choice brings the node
+/// back onto the certified branch the stop clears, the boundaries skipped
 /// during the stop are revisited on the canonical chain, and the node votes
 /// and finalizes with the others again.
 #[tokio::test]
@@ -1136,27 +1154,36 @@ async fn safety_stop_on_mismatch_then_resume_after_fork_choice() {
     for i in 0..4 {
         net.drive(i).await;
     }
-    net.gossip().await; // Finalize 2, 4 everywhere; no verifier pass yet.
-    for n in &net.nodes {
-        assert_eq!(n.finalized().await, 4);
-        assert_eq!(n.floor(), 0, "floor waits for the verifier poll");
-    }
-    // Node 3 is moved onto a heavier sibling branch forking at 3 BEFORE its
-    // next verifier pass: allowed (its floor is still 0).
+    // Node 3 is moved onto a heavier sibling branch forking at 3 before any
+    // vote is delivered: allowed (its floor is 0).
     let b = chains.branch(&a, 4, 12, VRF_B);
     match net.node_mut(3).reorg_onto(&b).await {
         ReorgOutcome::Reorged { .. } => {}
         other => panic!("expected the reorg to proceed, got {other:?}"),
     }
+    net.gossip().await; // Finalize 2, 4 everywhere.
     let halted = HaltReason::Mismatch {
         height: 4,
         certified: hash_at(&a, 4),
         canonical: Some(hash_at(&b, 4)),
     };
+    for i in 0..3 {
+        assert_eq!(net.node(i).finalized().await, 4);
+        assert_eq!(net.node(i).floor(), 4, "floor raised at finalization");
+    }
+    // Node 3 holds the certificate for A4 but halted when it finalized; the
+    // floor protects A2 (shared by both branches), not A4.
+    assert_eq!(net.node(3).finalized().await, 4);
+    assert!(net.node(3).gadget.halted(), "halted at finalization");
+    assert_eq!(net.node(3).floor(), 2);
+    assert_eq!(
+        net.node(3).rpc_finalized(),
+        FinalizedAnchor {
+            height: 2,
+            hash: Some(hash_at(&a, 2))
+        }
+    );
     assert_eq!(net.node(3).tick().await, FloorTick::Halted(halted.clone()));
-    assert!(net.node(3).gadget.halted());
-    assert_eq!(net.node(3).floor(), 0);
-    assert_eq!(net.node(3).rpc_finalized(), FinalizedAnchor::GENESIS);
 
     // The others advance to 12 and keep finalizing (quorum 3 without node 3);
     // node 3 runs its driver on B: nothing is proposed or signed, nothing sent.
@@ -1181,7 +1208,7 @@ async fn safety_stop_on_mismatch_then_resume_after_fork_choice() {
     assert_eq!(net.node(3).tick().await, FloorTick::Halted(halted));
 
     // Fork choice: A is heavier again; node 3 reorgs back (fork point 3 >=
-    // floor 0). The next poll clears the stop and raises the floor.
+    // floor 2). The next poll clears the stop and raises the floor.
     let a = chains.main(14);
     for i in 0..3 {
         net.node_mut(i).follow(&a).await;
@@ -1233,17 +1260,13 @@ async fn safety_stop_on_mismatch_then_resume_after_fork_choice() {
     net.assert_honest_no_equivocation();
 }
 
-/// OPEN FINDING (Stage 2): the literal §5 S2 — "committed state is never
-/// reverted below `latest_finalized_height()`; a reorg with fork point below the
-/// floor is Rejected" — does not hold between a finalization and the next
-/// floor-verifier pass: `CheckpointManager::finalize_checkpoint` advances
-/// `latest_finalized_height()` but the reorg floor (`CanonicalApplicator`
-/// `finalized_height`) is raised only by `FloorVerifier::tick` (5 s poll), so a
-/// reorg in that window reverts the just-finalized block. The node then halts
-/// (see the test above) instead of silently pinning the wrong branch.
-/// TLA+: CheckpointFinalitySafety_strict.cfg (FinalizedStaysCanonical).
+/// §5 S2 (strict): "committed state is never reverted below
+/// `latest_finalized_height()`". The reorg floor is raised when the checkpoint
+/// finalizes — before the finalized height is visible — not at the next
+/// floor-verifier poll, so a reorg right after finalization, with no poll in
+/// between, is rejected. (Formerly an open finding: the floor followed only at
+/// the 5 s poll.) TLA+: CheckpointFinalitySafety_strict.cfg.
 #[tokio::test]
-#[ignore = "bug: S2 window — reorg below a fresh certificate proceeds until the next floor poll"]
 async fn s2_strict_reorg_below_fresh_certificate_is_rejected() {
     let chains = Chains::new();
     let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
@@ -1255,12 +1278,434 @@ async fn s2_strict_reorg_below_fresh_certificate_is_rejected() {
         net.drive(i).await;
     }
     net.gossip().await;
-    assert_eq!(net.node(3).finalized().await, 4);
+    for n in &net.nodes {
+        assert_eq!(n.finalized().await, 4);
+        assert_eq!(n.floor(), 4, "floor raised at finalization, no poll needed");
+        assert_eq!(
+            n.rpc_finalized(),
+            FinalizedAnchor {
+                height: 4,
+                hash: Some(hash_at(&a, 4))
+            }
+        );
+        assert!(!n.gadget.halted());
+    }
     let b = chains.branch(&a, 4, 12, VRF_B);
     match net.node_mut(3).reorg_onto(&b).await {
-        ReorgOutcome::Rejected(_) => {}
+        ReorgOutcome::Rejected(why) => assert!(why.contains("below finalized"), "{why}"),
         other => panic!("S2: reorg below the finalized height 4 proceeded: {other:?}"),
     }
+    assert_eq!(net.node(3).app.applied_tip().await.hash, hash_at(&a, 8));
+    // The poll (backstop) agrees and changes nothing.
+    assert_eq!(net.node(3).tick().await, verified(4));
+    assert_eq!(net.node(3).floor(), 4);
+    // The losing branch is never proposed or signed: the driver keeps walking A.
+    let a = chains.main(12);
+    net.follow_all(&a).await;
+    let ticks = net.round().await;
+    assert!(ticks.iter().all(|t| *t == verified(8)), "{ticks:?}");
+    for n in &net.nodes {
+        for h in [6u64, 8] {
+            if let Some(signed) = n.gadget.signed_vote_at(h) {
+                assert_eq!(signed, hash_at(&a, h), "signed only on A");
+            }
+        }
+    }
+    net.assert_no_conflicting_finality(&[2, 4, 6, 8]).await;
+    net.assert_honest_no_equivocation();
+}
+
+/// S2, certified block not yet on this node's applied chain when it finalizes
+/// (fork choice moved node 3 to a SHORTER branch after it proposed A4): the
+/// finalization-time check cannot confirm A4, so finality is paused
+/// (`Unconfirmed`) before the finalization is visible. The certificate is
+/// registered with the applicator: once fork choice brings A4 back, the very
+/// next reorg attempt raises the floor to 4 under the advance lock and is
+/// refused if it would revert A4 — no poll needed. The poll then clears the
+/// stop.
+#[tokio::test]
+async fn s2_certificate_not_yet_applied_pauses_then_protects_on_return() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let mut net = network(4, &vals, config(100)).await;
+    let a = chains.main(8);
+    net.follow_all(&a).await;
+    for i in 0..4 {
+        net.drive(i).await;
+    }
+    // A shorter sibling branch: A1, A2, then B3 (tip height 3 < 4).
+    let short = chains.branch(&a, 3, 3, VRF_B);
+    match net.node_mut(3).reorg_onto(&short).await {
+        ReorgOutcome::Reorged { height: 3, .. } => {}
+        other => panic!("expected the reorg to the short branch, got {other:?}"),
+    }
+    net.gossip().await;
+    assert_eq!(net.node(3).finalized().await, 4);
+    assert!(net.node(3).gadget.halted(), "paused at finalization");
+    assert_eq!(net.node(3).floor(), 2, "A2 is shared and protected");
+    let t = net.node(3).tick().await;
+    assert!(
+        matches!(
+            &t,
+            FloorTick::Halted(HaltReason::Unconfirmed { height: 4, certified, .. })
+                if *certified == hash_at(&a, 4)
+        ),
+        "{t:?}"
+    );
+    assert_eq!(
+        net.node(3).app.certified_pending(),
+        vec![(4, hash_at(&a, 4))]
+    );
+    // Fork choice brings A back (fork point 2 >= floor 2: allowed).
+    match net.node_mut(3).reorg_onto(&a).await {
+        ReorgOutcome::Reorged { .. } => {}
+        other => panic!("expected the reorg back onto A, got {other:?}"),
+    }
+    // Before any poll: a reorg that would revert A4 is refused, and the floor
+    // is raised to 4 by that check.
+    let c = chains.branch(&a, 4, 12, VRF_C);
+    match net.node_mut(3).reorg_onto(&c).await {
+        ReorgOutcome::Rejected(why) => assert!(why.contains("below finalized height 4"), "{why}"),
+        other => panic!("A4 is canonical and certified; reorg must be refused: {other:?}"),
+    }
+    assert_eq!(net.node(3).floor(), 4);
+    assert!(net.node(3).app.certified_pending().is_empty());
+    let t = net.node(3).tick().await;
+    assert!(
+        matches!(
+            t,
+            FloorTick::Verified {
+                height: 4,
+                recovered: true,
+                ..
+            }
+        ),
+        "{t:?}"
+    );
+    assert!(!net.node(3).gadget.halted());
+}
+
+/// S2 publication (review of #335 @ db243a1): the finalization-time guard
+/// raises the floor BEFORE the certificate is persisted, so it must not publish
+/// the finalized/safe RPC pair — a crash in that interval restarts without the
+/// certificate (and with the in-memory floor lost), and a block already
+/// reported finalized could then be reorged out. The pair is published only
+/// once the certificate is in the persistent store; after that a restart
+/// restores the floor from it and refuses the same reorg.
+#[tokio::test]
+async fn s2_rpc_finalized_is_published_only_after_the_certificate_is_persisted() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let committee: Vec<PublicKey> = keys.iter().map(pk).collect();
+    let signers: Vec<&Ed25519SigningKey> = keys.iter().take(3).collect();
+    let cfg = config(100);
+    let mut node = TestNode::boot(key(0), &vals, cfg.clone()).await;
+    let genesis_state = node.exec.state_snapshot();
+    let a = chains.main(8);
+    node.follow(&a).await;
+    let b = chains.branch(&a, 3, 10, VRF_B);
+    for blk in &b {
+        node.import(blk).await;
+    }
+    let cert = certificate(4, hash_at(&a, 4), &committee, &signers, CHAIN);
+
+    // The guard (CheckpointManager::finalize_checkpoint's pre-finalization
+    // hook) runs: floor raised, nothing published.
+    assert_eq!(node.verifier.on_finalize(&cert).await, Some(verified(4)));
+    assert_eq!(node.floor(), 4, "floor raised at finalization");
+    assert_eq!(
+        node.rpc_finalized(),
+        FinalizedAnchor::GENESIS,
+        "nothing published before the certificate is persisted"
+    );
+    // The certificate write did not happen (or failed): the post-finalization
+    // hook and the poll still publish nothing.
+    assert!(!node.mgr().is_certificate_persisted(4, &hash_at(&a, 4)));
+    assert_eq!(node.verifier.after_finalize(&cert).await, Some(verified(4)));
+    assert_eq!(node.rpc_finalized(), FinalizedAnchor::GENESIS);
+    assert_eq!(node.tick().await, FloorTick::NoCertificate);
+    assert_eq!(node.rpc_finalized(), FinalizedAnchor::GENESIS);
+
+    // Crash in that interval: the restart has neither the certificate nor the
+    // floor, so a rebuild abandoning A4 proceeds — and no block it abandons was
+    // ever reported finalized.
+    let (node, boot) = node.restart(&vals, cfg.clone()).await;
+    assert_eq!(boot, FloorTick::NoCertificate);
+    assert_eq!(node.floor(), 0);
+    assert_eq!(node.rpc_finalized(), FinalizedAnchor::GENESIS);
+    *node.head.lock() = Some(hash_at(&b, 10));
+    assert!(
+        node.app
+            .recover_to_head(genesis_state.clone(), Hash::default())
+            .await
+            .expect("recovery call returns"),
+        "nothing finalized here after the restart: the rebuild proceeds"
+    );
+    assert_eq!(node.app.applied_tip().await.hash, hash_at(&b, 10));
+    *node.head.lock() = Some(hash_at(&a, 8));
+    assert!(
+        node.app
+            .recover_to_head(genesis_state.clone(), Hash::default())
+            .await
+            .expect("recovery call returns"),
+        "back onto A"
+    );
+    assert_eq!(node.app.applied_tip().await.hash, hash_at(&a, 8));
+
+    // The certificate is persisted (as finalize_checkpoint does before the
+    // post-finalization hook): now, and only now, the pair is published.
+    assert_eq!(node.verifier.on_finalize(&cert).await, Some(verified(4)));
+    assert_eq!(node.rpc_finalized(), FinalizedAnchor::GENESIS);
+    write_certificate(&node.storage, &cert);
+    assert!(node.mgr().is_certificate_persisted(4, &hash_at(&a, 4)));
+    assert_eq!(node.verifier.after_finalize(&cert).await, Some(verified(4)));
+    assert_eq!(
+        node.rpc_finalized(),
+        FinalizedAnchor {
+            height: 4,
+            hash: Some(hash_at(&a, 4))
+        }
+    );
+
+    // A crash after publication: the restart restores the floor from the stored
+    // certificate before anything else, so the same rebuild is refused.
+    let (node, boot) = node.restart(&vals, cfg).await;
+    assert_eq!(boot, verified(4));
+    assert_eq!(node.floor(), 4);
+    assert_eq!(
+        node.rpc_finalized(),
+        FinalizedAnchor {
+            height: 4,
+            hash: Some(hash_at(&a, 4))
+        }
+    );
+    *node.head.lock() = Some(hash_at(&b, 10));
+    assert!(
+        !node
+            .app
+            .recover_to_head(genesis_state, Hash::default())
+            .await
+            .expect("recovery call returns"),
+        "S2: a block published as finalized must not be abandoned after a restart"
+    );
+    assert_eq!(node.app.applied_tip().await.hash, hash_at(&a, 8));
+    assert_eq!(node.floor(), 4);
+}
+
+/// S2 publication, recovery variant: an `Unconfirmed` stop entered at
+/// finalization (certified block above the applied tip) clears on the poll once
+/// the block is applied — the floor is raised then — but the pair is still not
+/// published while its certificate is not persisted. A safety stop in force
+/// also blocks the post-finalization publication.
+#[tokio::test]
+async fn s2_cleared_stop_does_not_publish_an_unpersisted_certificate() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let committee: Vec<PublicKey> = keys.iter().map(pk).collect();
+    let signers: Vec<&Ed25519SigningKey> = keys.iter().take(3).collect();
+    let mut node = TestNode::boot(key(0), &vals, config(100)).await;
+    let a = chains.main(8);
+    node.follow(a.get(..3).expect("A1..A3")).await;
+    let cert = certificate(4, hash_at(&a, 4), &committee, &signers, CHAIN);
+    let t = node.verifier.on_finalize(&cert).await;
+    assert!(
+        matches!(
+            &t,
+            Some(FloorTick::Halted(HaltReason::Unconfirmed { height: 4, .. }))
+        ),
+        "{t:?}"
+    );
+    // A stop is in force: the post-finalization hook publishes nothing.
+    assert!(matches!(
+        node.verifier.after_finalize(&cert).await,
+        Some(FloorTick::Halted(_))
+    ));
+    assert_eq!(node.rpc_finalized(), FinalizedAnchor::GENESIS);
+    node.follow(&a).await;
+    let t = node.tick().await;
+    assert!(matches!(t, FloorTick::NoCertificate), "{t:?}");
+    assert!(!node.gadget.halted(), "stop cleared: A4 is canonical");
+    assert_eq!(node.floor(), 4, "floor raised when the stop cleared");
+    assert_eq!(
+        node.rpc_finalized(),
+        FinalizedAnchor::GENESIS,
+        "not published: the certificate is not persisted"
+    );
+    write_certificate(&node.storage, &cert);
+    assert_eq!(node.verifier.after_finalize(&cert).await, Some(verified(4)));
+    assert_eq!(
+        node.rpc_finalized(),
+        FinalizedAnchor {
+            height: 4,
+            hash: Some(hash_at(&a, 4))
+        }
+    );
+}
+
+/// S2 atomicity, guard state change <-> certificate (review of #335 @ fa6595a1).
+/// The finalization-time guard raises the floor; the certificate it ran on must
+/// then be the one finalized and persisted, even if the pending checkpoint is
+/// pruned and RE-PROPOSED for the same block hash (with no votes) while the
+/// guard runs, and while a second finalization of the same height is started.
+///
+/// Deterministic interleaving on the real wiring (manager + installed verifier
+/// guard + applicator): the test holds the applicator's advance lock, so the
+/// guard parks inside its floor check after registering the certificate; the
+/// re-proposal and the concurrent finalization happen there; then the lock is
+/// released. Afterwards the floor, the persisted certificate and the published
+/// RPC pair agree, and a restart that reloads everything from disk restores
+/// the same floor and refuses a rebuild below it. (A crash BEFORE the
+/// certificate is persisted restarts with neither the floor nor the
+/// certificate: `s2_rpc_finalized_is_published_only_after_the_certificate_is_persisted`.)
+#[tokio::test]
+async fn s2_guarded_certificate_survives_a_same_hash_re_proposal_and_a_restart() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let committee: Vec<PublicKey> = keys.iter().map(pk).collect();
+    let cfg = config(100);
+    let mut node = TestNode::boot(key(0), &vals, cfg.clone()).await;
+    let genesis_state = node.exec.state_snapshot();
+    let a = chains.main(8);
+    node.follow(&a).await;
+    let b = chains.branch(&a, 3, 10, VRF_B);
+    for blk in &b {
+        node.import(blk).await;
+    }
+    let h4 = hash_at(&a, 4);
+    let mgr = node.mgr().clone();
+    assert_eq!(
+        mgr.ensure_proposed(4, h4, committee.clone())
+            .await
+            .expect("propose"),
+        citrate_consensus::checkpoint::ProposeOutcome::Proposed
+    );
+    for k in keys.iter().take(3) {
+        mgr.submit_vote(sign_checkpoint_vote(CHAIN, 4, h4, k))
+            .await
+            .expect("vote");
+    }
+
+    // Park the guard inside its floor check.
+    let advance = node.app.advance_lock();
+    let held = advance.lock().await;
+    let first = tokio::spawn({
+        let mgr = mgr.clone();
+        async move { mgr.finalize_checkpoint(4).await }
+    });
+    let mut spins = 0u32;
+    while !node.app.certified_pending().contains(&(4, h4)) {
+        spins += 1;
+        assert!(spins < 100_000, "guard never reached its floor check");
+        tokio::task::yield_now().await;
+    }
+    // Inside the guard: pruned, re-proposed for the same hash with no votes,
+    // and a concurrent finalization of the same height queued.
+    let second = tokio::spawn({
+        let mgr = mgr.clone();
+        async move { mgr.finalize_checkpoint(4).await }
+    });
+    mgr.prune_at_or_below(4).await;
+    assert_eq!(
+        mgr.ensure_proposed(4, h4, committee.clone())
+            .await
+            .expect("re-propose"),
+        citrate_consensus::checkpoint::ProposeOutcome::Proposed
+    );
+    assert_eq!(mgr.pending_vote_count(4).await, Some(0));
+    assert_eq!(node.floor(), 0, "the guard has not raised the floor yet");
+    drop(held);
+
+    let first = first.await.expect("first finalization task");
+    assert!(
+        first.is_ok(),
+        "the certificate the guard ran on must finalize, got {first:?}"
+    );
+    let cp = first.expect("checked above");
+    assert_eq!((cp.height, cp.block_hash, cp.votes.len()), (4, h4, 3));
+    let second = second.await.expect("second finalization task");
+    assert!(
+        matches!(second, Err(CheckpointError::BlockNotFound(_))),
+        "{second:?}"
+    );
+    // The guard's state change and the certificate agree.
+    assert_eq!(node.floor(), 4, "floor raised by the guard");
+    assert!(!node.gadget.halted());
+    assert!(
+        mgr.is_certificate_persisted(4, &h4),
+        "the guarded certificate is persisted"
+    );
+    assert_eq!(mgr.latest_finalized_height().await, 4);
+    assert_eq!(
+        node.rpc_finalized(),
+        FinalizedAnchor {
+            height: 4,
+            hash: Some(h4)
+        }
+    );
+    assert_eq!(node.tick().await, verified(4));
+
+    // Crash and restart from disk: floor, certificate and RPC pair come back
+    // together, and a rebuild abandoning A4 is refused.
+    let (node, boot) = node.restart(&vals, cfg).await;
+    assert_eq!(boot, verified(4));
+    assert_eq!(node.floor(), 4);
+    assert_eq!(node.mgr().latest_finalized_height().await, 4);
+    let stored = node.mgr().get_checkpoint(4).await.expect("reloaded");
+    assert_eq!((stored.block_hash, stored.votes.len()), (h4, 3));
+    assert!(stored.verify_certificate(CHAIN).is_ok());
+    assert_eq!(
+        node.rpc_finalized(),
+        FinalizedAnchor {
+            height: 4,
+            hash: Some(h4)
+        }
+    );
+    *node.head.lock() = Some(hash_at(&b, 10));
+    assert!(
+        !node
+            .app
+            .recover_to_head(genesis_state, Hash::default())
+            .await
+            .expect("recovery call returns"),
+        "S2: the finalized block must not be abandoned after a restart"
+    );
+    assert_eq!(node.app.applied_tip().await.hash, hash_at(&a, 8));
+}
+
+/// An `Unconfirmed` stop becomes a mismatch (with the alarm) once the node's
+/// chain is found to hold another block at the certified height.
+#[tokio::test]
+async fn s2_unconfirmed_becomes_mismatch_when_another_block_is_applied() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let mut net = network(4, &vals, config(100)).await;
+    let a = chains.main(8);
+    net.follow_all(&a).await;
+    for i in 0..4 {
+        net.drive(i).await;
+    }
+    let short = chains.branch(&a, 3, 3, VRF_B);
+    let _ = net.node_mut(3).reorg_onto(&short).await;
+    net.gossip().await;
+    assert!(net.node(3).gadget.halted());
+    // Node 3 extends its own branch past height 4.
+    let longer = chains.branch(&a, 3, 6, VRF_B);
+    net.node_mut(3).follow(&longer).await;
+    assert_eq!(
+        net.node(3).tick().await,
+        FloorTick::Halted(HaltReason::Mismatch {
+            height: 4,
+            certified: hash_at(&a, 4),
+            canonical: Some(hash_at(&longer, 4)),
+        })
+    );
+    assert!(net.node(3).gadget.halted());
+    assert_eq!(net.node(3).floor(), 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -1521,7 +1966,11 @@ async fn a8_old_committee_cannot_refinalize_a_competing_history() {
         })
     );
     assert!(node.gadget.halted());
-    assert_eq!(node.floor(), 0, "floor not raised onto B");
+    assert_eq!(
+        node.floor(),
+        2,
+        "floor not raised onto B; restored to the stored A2 certificate at boot"
+    );
     assert_eq!(node.rpc_finalized(), FinalizedAnchor::GENESIS);
 }
 
@@ -1601,6 +2050,126 @@ async fn restart_mid_epoch_resends_recorded_votes_and_restores_floor_at_boot() {
     );
     net.nodes.push(n3);
     net.assert_no_conflicting_finality(&[2, 4, 6, 8]).await;
+}
+
+/// S2 across a restart with many stored certificates the floor does not cover
+/// (review of #335 @ 5236d2b). The network finalized A10 and then, on branch
+/// B (forking at 11), every height 11..=80 — 70 certificates, more than the
+/// 64 the boot check used to register. This node is still on A (A80), so the
+/// latest certificate is a mismatch and the gadget halts. On restart the
+/// boot check must still find A10 — the highest stored certificate whose
+/// block is on this node's applied chain, below all 70 — and raise the floor
+/// to it before any reorg is judged. After a restart the snapshot ring holds
+/// only the tip, so a reorg below it goes through the from-genesis spine
+/// rebuild (`recover_to_head`, the recovery path): fork choice towards a
+/// branch C forking below 10 is refused; towards the certified branch B
+/// (fork point 10) it proceeds, and the safety stop then clears. None of the
+/// 70 uncovered certificates is dropped. TLA+: CheckpointFinalitySafety_
+/// restart.cfg (holds) / _bootlimit.cfg (a truncated boot check reverts the
+/// older finalized block).
+#[tokio::test]
+async fn s2_restart_restores_the_floor_below_many_uncovered_certificates() {
+    const TIP: u64 = 80;
+    const CERTIFIED: u64 = 10;
+    let uncovered = TIP - CERTIFIED;
+    assert!(uncovered > 64, "more than the former registration bound");
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let committee: Vec<PublicKey> = keys.iter().map(pk).collect();
+    let signers: Vec<&Ed25519SigningKey> = keys.iter().take(3).collect();
+    let cfg = config(100);
+    let mut node = TestNode::boot(key(0), &vals, cfg.clone()).await;
+    let genesis_state = node.exec.state_snapshot();
+    let a = chains.main(TIP);
+    node.follow(&a).await;
+    let b = chains.branch(&a, CERTIFIED + 1, TIP, VRF_B);
+    let c = chains.branch(&a, 5, TIP + 2, VRF_C);
+    for blk in b.iter().chain(c.iter()) {
+        node.import(blk).await;
+    }
+    write_certificate(
+        &node.storage,
+        &certificate(
+            CERTIFIED,
+            hash_at(&a, CERTIFIED),
+            &committee,
+            &signers,
+            CHAIN,
+        ),
+    );
+    for h in (CERTIFIED + 1)..=TIP {
+        write_certificate(
+            &node.storage,
+            &certificate(h, hash_at(&b, h), &committee, &signers, CHAIN),
+        );
+    }
+
+    // TLA+ Restart, then the boot check (VerifyFloor while booting).
+    let (node, boot) = node.restart(&vals, cfg).await;
+    assert_eq!(
+        boot,
+        FloorTick::Halted(HaltReason::Mismatch {
+            height: TIP,
+            certified: hash_at(&b, TIP),
+            canonical: Some(hash_at(&a, TIP)),
+        })
+    );
+    assert!(node.gadget.halted());
+    assert_eq!(
+        node.floor(),
+        CERTIFIED,
+        "boot restores the floor to the highest stored certificate on this chain"
+    );
+    let pending = node.app.certified_pending();
+    assert_eq!(
+        pending.len(),
+        usize::try_from(uncovered).expect("fits"),
+        "every certificate above the floor stays registered"
+    );
+    assert_eq!(
+        pending.first(),
+        Some(&(CERTIFIED + 1, hash_at(&b, CERTIFIED + 1)))
+    );
+
+    // TLA+ Reorg below the certified height, via the recovery path: refused.
+    *node.head.lock() = Some(hash_at(&c, TIP + 2));
+    let rebuilt = node
+        .app
+        .recover_to_head(genesis_state.clone(), Hash::default())
+        .await
+        .expect("recovery call returns");
+    assert!(
+        !rebuilt,
+        "S2: a rebuild abandoning the finalized A10 must be refused after restart"
+    );
+    assert_eq!(node.app.applied_tip().await.hash, hash_at(&a, TIP));
+    assert_eq!(node.floor(), CERTIFIED);
+
+    // Fork choice onto the certified branch (fork point 10): proceeds, and the
+    // stop clears on the next pass.
+    *node.head.lock() = Some(hash_at(&b, TIP));
+    let rebuilt = node
+        .app
+        .recover_to_head(genesis_state, Hash::default())
+        .await
+        .expect("recovery call returns");
+    assert!(
+        rebuilt,
+        "the rebuild onto the certified branch must proceed"
+    );
+    assert_eq!(node.app.applied_tip().await.hash, hash_at(&b, TIP));
+    assert_eq!(
+        node.tick().await,
+        FloorTick::Verified {
+            height: TIP,
+            floor_raised: true,
+            recovered: true,
+        }
+    );
+    assert_eq!(node.floor(), TIP);
+    assert!(node.app.certified_pending().is_empty());
+    assert!(!node.gadget.halted());
 }
 
 /// Restart follow-up: a node that missed the votes for a checkpoint while it
