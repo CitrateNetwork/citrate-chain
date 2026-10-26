@@ -14,26 +14,30 @@
 #   producer_baseline.sh check      # print the checklist; exit 1 on any FAIL
 #   producer_baseline.sh print-unit         # the citrate-node unit template
 #   producer_baseline.sh print-disk-alert   # the disk alert script it installs
+#   producer_baseline.sh check-ufw-status < status   # verdict on `ufw status verbose`
 #
 #   ssh root@HOST 'bash -s -- apply' < scripts/ops/producer_baseline.sh
 #
 # What `apply` does:
 #   - apt update/upgrade; unattended-upgrades (security origins only, no auto-reboot)
-#   - `citrate` system user (no login shell); /var/lib/citrate/data (runbook layout)
-#     and /opt/citrate/{bin,data,keys}; data and keys 0700, owned by citrate
+#   - `citrate` system user (no login shell), /var/lib/citrate/data (0700, owned by
+#     citrate; the node mints its keys there) and /etc/citrate: the runbook layout.
+#     Empty /opt/citrate dirs from an earlier layout are removed with rmdir only.
 #   - journald capped (SystemMaxUse=1G, SystemKeepFree=10G); logrotate size cap
 #     (maxsize 200M) run hourly. Two chain halts came from a full disk.
 #   - 4 GiB swapfile, vm.swappiness=10
 #   - chrony time sync
 #   - sshd: keys only, PermitRootLogin prohibit-password, no passwords
+#   - ufw as runbook section 2: deny incoming, allow outgoing, allow 22/tcp and
+#     30303/tcp+udp (SSH is allowed BEFORE ufw is enabled). RPC/metrics stay closed.
 #   - DigitalOcean monitoring agent (verified; installed if missing)
 #   - citrate-disk-alert.timer: every 5 min, logs at crit and fails its unit when
 #     any watched filesystem is at or above 80% used. Local logging only.
 #   - citrate-node.service template (identical to gen_node_config.py's unit for the
 #     default paths), installed DISABLED and not started.
 #
-# Not done here, on purpose: the host firewall (ufw, runbook section 2), the node
-# binary, node.toml, the consensus env, and every key.
+# Not done here, on purpose: the node binary, node.toml, the consensus env, and
+# every key.
 set -euo pipefail
 
 SWAP_FILE=/swapfile
@@ -90,7 +94,7 @@ disk_alert_script() {
 #   CITRATE_DISK_ALERT_SYSLOG  0 to skip logger (tests)
 set -uo pipefail
 PCT="${CITRATE_DISK_ALERT_PCT:-80}"
-PATHS="${CITRATE_DISK_ALERT_PATHS:-/ /var/lib/citrate/data /opt/citrate/data}"
+PATHS="${CITRATE_DISK_ALERT_PATHS:-/ /var/lib/citrate/data}"
 case "$PCT" in ''|*[!0-9]*) echo "citrate-disk-alert: bad threshold '$PCT'" >&2; exit 2 ;; esac
 rc=0
 seen=" "
@@ -153,8 +157,8 @@ $nrconf{override_rc}{qr(^citrate-height-watchdog)} = 0;
 EOF
   apt_noninteractive update -q >/dev/null
   apt_noninteractive upgrade -q
-  apt_noninteractive install -q unattended-upgrades chrony logrotate jq curl python3 >/dev/null
-  note "packages upgraded; unattended-upgrades chrony logrotate jq curl python3 present"
+  apt_noninteractive install -q unattended-upgrades chrony logrotate ufw jq curl python3 >/dev/null
+  note "packages upgraded; unattended-upgrades chrony logrotate ufw jq curl python3 present"
 }
 
 apply_unattended() {
@@ -190,11 +194,25 @@ apply_user_dirs() {
   install -d -o citrate -g citrate -m 0755 /var/lib/citrate
   install -d -o citrate -g citrate -m 0700 /var/lib/citrate/data
   install -d -o root -g root -m 0755 /etc/citrate
-  install -d -o root -g root -m 0755 /opt/citrate
-  install -d -o citrate -g citrate -m 0755 /opt/citrate/bin
-  install -d -o citrate -g citrate -m 0700 /opt/citrate/data
-  install -d -o citrate -g citrate -m 0700 /opt/citrate/keys
-  note "citrate uid $(id -u citrate); data and keys dirs 0700 (contents never read)"
+  note "citrate uid $(id -u citrate); /var/lib/citrate/data 0700 (contents never read)"
+  cleanup_legacy_opt
+}
+
+# An earlier revision also created /opt/citrate/{bin,data,keys}. Remove them only
+# while they are empty: rmdir refuses a non-empty directory, so nothing is lost.
+cleanup_legacy_opt() {
+  [ -d /opt/citrate ] || return 0
+  local d
+  for d in bin data keys; do
+    if [ -d "/opt/citrate/$d" ] && [ ! -L "/opt/citrate/$d" ] && [ -z "$(ls -A "/opt/citrate/$d")" ]; then
+      rmdir "/opt/citrate/$d" && CHANGED+=("rmdir /opt/citrate/$d")
+    fi
+  done
+  if [ -z "$(ls -A /opt/citrate)" ]; then
+    rmdir /opt/citrate && CHANGED+=("rmdir /opt/citrate")
+  else
+    note "/opt/citrate is not empty: left in place ($(ls -A /opt/citrate | tr '\n' ' '))"
+  fi
 }
 
 apply_logs() {
@@ -297,6 +315,44 @@ EOF
   note "key-only"
 }
 
+# Runbook section 2. Rules first, enable last: an active ufw without the SSH rule
+# would cut the session that is running this script.
+apply_firewall() {
+  echo "[firewall]"
+  local before
+  before="$(ufw status verbose 2>/dev/null || true)"
+  ufw default deny incoming >/dev/null
+  ufw default allow outgoing >/dev/null
+  ufw allow 22/tcp >/dev/null
+  ufw allow 30303/tcp >/dev/null
+  ufw allow 30303/udp >/dev/null
+  ufw show added | grep -qx 'ufw allow 22/tcp' || die "ufw has no 22/tcp rule; not enabling"
+  ufw --force enable >/dev/null
+  if [ "$(ufw status verbose)" != "$before" ]; then CHANGED+=("ufw"); fi
+  note "ufw $(ufw status | head -1 | awk '{print $2}'): 22/tcp, 30303/tcp+udp in"
+}
+
+# Reads `ufw status verbose` on stdin. Exit 0 only for the runbook policy: active,
+# deny incoming, allow outgoing, and exactly 22/tcp + 30303/tcp + 30303/udp allowed.
+ufw_status_ok() {
+  local text line rule want
+  text="$(cat)"
+  grep -qx 'Status: active' <<<"$text" || { echo "ufw not active"; return 1; }
+  grep -qE '^Default: deny \(incoming\), allow \(outgoing\)' <<<"$text" \
+    || { echo "defaults are not deny incoming / allow outgoing"; return 1; }
+  for want in 22/tcp 30303/tcp 30303/udp; do
+    grep -qE "^${want}[[:space:]]+ALLOW IN[[:space:]]" <<<"$text" || { echo "$want not allowed in"; return 1; }
+  done
+  while IFS= read -r line; do
+    rule="${line%%  *}"; rule="${rule% (v6)}"
+    case "$rule" in
+      22/tcp|30303/tcp|30303/udp) ;;
+      *) echo "unexpected inbound rule: $line"; return 1 ;;
+    esac
+  done < <(grep -E '[[:space:]](ALLOW|LIMIT)( IN)?[[:space:]]' <<<"$text")
+  return 0
+}
+
 apply_monitoring() {
   echo "[do monitoring]"
   if ! systemctl is-active --quiet do-agent; then
@@ -363,6 +419,7 @@ do_apply() {
   apply_swap
   apply_time
   apply_ssh
+  apply_firewall
   apply_monitoring
   apply_disk_alert
   apply_unit_template
@@ -412,10 +469,12 @@ do_check() {
     row FAIL user "citrate user missing, uid 0 or has a login shell ($v)"
   fi
   ok_if dir-var-data "/var/lib/citrate/data citrate 0700" stat_is /var/lib/citrate/data "citrate:citrate 700"
-  ok_if dir-opt-bin "/opt/citrate/bin citrate 0755" stat_is /opt/citrate/bin "citrate:citrate 755"
-  ok_if dir-opt-data "/opt/citrate/data citrate 0700" stat_is /opt/citrate/data "citrate:citrate 700"
-  ok_if dir-opt-keys "/opt/citrate/keys citrate 0700" stat_is /opt/citrate/keys "citrate:citrate 700"
   ok_if dir-etc "/etc/citrate root 0755" stat_is /etc/citrate "root:root 755"
+  if [ -e /opt/citrate ]; then
+    row WARN legacy-opt "/opt/citrate still present (not empty): $(ls -A /opt/citrate | tr '\n' ' ')"
+  else
+    row PASS legacy-opt "no /opt/citrate (single layout)"
+  fi
 
   v="$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null | grep -E '^SystemMaxUse=' | tail -1 || true)"
   if [ "$v" = "SystemMaxUse=1G" ]; then row PASS journald "$v, journal now $(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.]+[KMGT]' | head -1)"; else row FAIL journald "effective '${v:-unset}'"; fi
@@ -444,6 +503,13 @@ do_check() {
   else
     row FAIL sshd "effective: $v"
   fi
+
+  if v="$(ufw status verbose 2>/dev/null | ufw_status_ok)"; then
+    row PASS firewall "ufw active; deny in, allow out; 22/tcp 30303/tcp 30303/udp only"
+  else
+    row FAIL firewall "${v:-ufw status unreadable}"
+  fi
+  ok_if ufw-enabled "ufw.service enabled at boot" systemctl is-enabled --quiet ufw
 
   ok_if do-agent "DO monitoring agent active, enabled" \
     sh -c 'systemctl is-active --quiet do-agent && systemctl is-enabled --quiet do-agent'
@@ -485,5 +551,6 @@ case "${1:-}" in
   check) do_check ;;
   print-unit) unit_template ;;
   print-disk-alert) disk_alert_script ;;
-  *) echo "usage: $0 apply|check|print-unit|print-disk-alert" >&2; exit 2 ;;
+  check-ufw-status) ufw_status_ok ;;
+  *) echo "usage: $0 apply|check|print-unit|print-disk-alert|check-ufw-status" >&2; exit 2 ;;
 esac
