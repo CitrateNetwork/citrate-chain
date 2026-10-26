@@ -133,6 +133,12 @@ ExecStart=/usr/local/bin/citrate-node --config /etc/citrate/node.toml
 Restart=always
 RestartSec=5s
 LimitNOFILE=65536
+# Memory backstop sized for an 8 GB host: throttle reclaim at 6 GiB, kill at
+# 6.5 GiB (Restart=always brings the node back), and bound swap so a growing
+# node is restarted instead of thrashing the box.
+MemoryHigh=6G
+MemoryMax=6656M
+MemorySwapMax=1G
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
