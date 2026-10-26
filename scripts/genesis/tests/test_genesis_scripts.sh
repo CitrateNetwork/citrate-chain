@@ -765,6 +765,7 @@ cp "$G/genesis_ceremony.sh" "$TW/scripts/genesis/"
 cp "$G/../ops/regenesis.sh" "$TW/scripts/ops/"
 cp -R "$G/../../contracts/script" "$TW/contracts/script"
 cp "$G/phase_inputs.json" "$T/pi-spec.json"
+# shellcheck disable=SC2120 # the spec argument is passed through expect's "$@"
 pi_tw() { python3 -I "$PI" check-spec --repo "$TW" --spec "${1:-$T/pi-spec.json}"; }
 expect "phase inputs tripwire: the copied tree passes (control)" 0 'phase_inputs: OK' -- pi_tw
 cp "$TW/contracts/script/DeployEduStack.s.sol" "$T/edu.orig"
