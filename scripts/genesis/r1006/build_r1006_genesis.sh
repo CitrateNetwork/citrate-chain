@@ -188,7 +188,9 @@ stop_node() {
 }
 trap stop_node EXIT
 start_node() {
-  (cd "$WORK" && exec "$NODE" --config "$WORK/devnet.toml") >>"$WORK/devnet.log" 2>&1 &
+  # Blocks only when a transaction is pending: each ceremony transaction lands at a height
+  # fixed by its position, so block-number and timestamp state is the same on every run.
+  (cd "$WORK" && CITRATE_DEVNET_MINE_ON_DEMAND=1 exec "$NODE" --config "$WORK/devnet.toml") >>"$WORK/devnet.log" 2>&1 &
   NODE_PID=$!
   for _ in $(seq 240); do c chain-id >/dev/null 2>&1 && return 0; sleep 0.5; done
   die "devnet RPC did not come up (see $WORK/devnet.log)"
