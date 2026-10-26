@@ -927,6 +927,9 @@ no_pw() {
 RG="$T/rg"
 mkdir -p "$RG/scripts/ops" "$RG/contracts"
 cp "$G/../ops/regenesis.sh" "$RG/scripts/ops/"
+# regenesis.sh runs the genesis ceremony's shared password-file check from the same tree.
+mkdir -p "$RG/scripts/genesis"
+cp "$G/secret_file_check.py" "$RG/scripts/genesis/"
 for preset in "$STALE" "" "$(printf '%s' "$MIXED" | tr 'a-f' 'A-F' | sed 's/^0X/0x/')"; do
   reset_calls
   expect "regenesis: CEREMONY_DEPLOYER_ADDRESS='$preset' with DEPLOYER_ADDRESS=$MIXED is refused" 1 'CEREMONY_DEPLOYER_ADDRESS .*is not exactly DEPLOYER_ADDRESS' -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" CEREMONY_DEPLOYER_ADDRESS="$preset" bash "$RG/scripts/ops/regenesis.sh"
@@ -951,13 +954,11 @@ reset_calls
 expect "regenesis #364: a password on the command line is refused" 1 'password on the command line is refused' -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" bash "$RG/scripts/ops/regenesis.sh" --account deployer --password "$PW_STR"
 env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" bash "$RG/scripts/ops/regenesis.sh" --account deployer "--password=$PW_STR" >"$T/rg-pw2.log" 2>&1
 no_pw "regenesis #364: a refused --password=… is not echoed" "$T/rg-pw2.log" "$FAKE/calls.log"
-expect "regenesis #364: a --password-file that is not a readable file is refused" 1 'password-file must name a readable file' -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" bash "$RG/scripts/ops/regenesis.sh" --account deployer --password-file "$PW_STR"
+expect "regenesis #364: a --password-file that is not a readable file is refused" 1 'password-file must name an existing regular file' -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" bash "$RG/scripts/ops/regenesis.sh" --account deployer --password-file "$PW_STR"
 expect "regenesis #364: --password-file without --account is refused" 1 'password-file needs --account' -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" bash "$RG/scripts/ops/regenesis.sh" --password-file "$PW_FILE"
 if calls | grep -q '^forge'; then bad "regenesis #364: a refused password input runs no forge" "$(calls)"; else ok "regenesis #364: a refused password input runs no forge"; fi
 # regenesis.sh runs the same shared check as the ceremony (it is also run on its own, from the
 # reroll runbooks), and re-checks the file before every forge step.
-mkdir -p "$RG/scripts/genesis"
-cp "$G/secret_file_check.py" "$RG/scripts/genesis/"
 RGPW="$PWD_DIR/rg"
 mkdir -m 700 "$RGPW"
 (umask 077 && printf '%s\n' "$PW_STR" >"$RGPW/ok" && printf '%s\n' "$PW_STR" >"$RGPW/loose" && printf 'y\n' >"$RGPW/target")
@@ -979,7 +980,7 @@ for how in replace chmod symlink; do
   (umask 077 && printf '%s\n' "$PW_STR" >"$RGPW/pw")
   out=$(env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" FAKE_PW_SWAP="$RGPW/pw" FAKE_PW_SWAP_HOW="$how" bash "$RG/scripts/ops/regenesis.sh" --account deployer --password-file "$RGPW/pw" 2>&1)
   rc=$?
-  if [[ -f "$FAKE/pw-swapped" && $rc -eq 2 ]] && grep -q 'password-file changed since' <<<"$out" && ! calls | grep -q '^forge script '; then
+  if [[ -f "$FAKE/pw-swapped" && $rc -eq 2 ]] && grep -q -- '--password-file .*; stopping before DeployAll.s.sol' <<<"$out" && ! calls | grep -q '^forge script '; then
     ok "regenesis: a password file changed after its check ($how) stops before the first forge step"
   else
     bad "regenesis: a password file changed after its check ($how) stops before the first forge step (exit $rc)" "$(calls | grep '^forge' || true)"$'\n'"$out"

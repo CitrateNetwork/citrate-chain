@@ -953,6 +953,9 @@ if should P2; then
       RPC_URL="$RPC_URL" bash "$EMITTER" >"$OUT/stack-book.record.log" 2>&1 ||
         gate_fail P2 "the generator failed over this run's broadcasts (see $OUT/stack-book.record.log)"
     else
+      if [[ "$MODE" == confirm && -n "$PASSWORD_FILE" ]]; then
+        why=$(password_file_check "$PASSWORD_FILE" "$PASSWORD_FILE_ID") || gate_fail P2 "$why"
+      fi
       if [[ "$MODE" == confirm ]]; then SENT_PHASE=P2; fi
       RPC_URL="$RPC_URL" bash "$REGENESIS" "${rargs[@]}" || step_fail P2 regenesis.sh
     fi
