@@ -613,7 +613,7 @@ PY
 # broadcast directory name). The test suite checks this list against regenesis.sh.
 P2_BROADCAST_SCRIPTS=(DeployAll.s.sol DeployValidatorRegistry.s.sol DeployModelAccessControl.s.sol
   DeployTEEAttestationRegistry.s.sol DeployComputePoolTraining.s.sol DeployEduStack.s.sol DeployAIGateway.s.sol
-  DeployP256Verifier.s.sol DeployAA.s.sol DeployCoreMembership.s.sol)
+  DeployP256Verifier.s.sol DeployAA.s.sol "$GENESIS_MEMBERSHIP_SCRIPT")
 # p2_sent: the P2 scripts with a broadcast record on this chain since this run's block 0, one
 # per line. A record that cannot be read counts as sent (fail closed).
 p2_sent() {
@@ -856,7 +856,8 @@ if should P0 || [[ "$MODE" != dry ]]; then
   if [[ "$MODE" != dry ]]; then
     # A phase about to write a book must not find one already there: it would be an earlier
     # run's (or a simulation's) output, and later phases would read it as this run's.
-    for pb in "P1:$GOV_BOOK" "P2:$MEMB_BOOK" "P3:$VEST_BOOK" "P4:$DORMANT_BOOK"; do
+    # P2's membership book is checked below, once the run manifest is bound (C10).
+    for pb in "P1:$GOV_BOOK" "P3:$VEST_BOOK" "P4:$DORMANT_BOOK"; do
       if should "${pb%%:*}" && [[ -e "${pb#*:}" ]]; then
         gate_fail P0 "${pb#*:} already exists and ${pb%%:*} would write it; move it aside (it is not this ceremony's output) or resume after ${pb%%:*}"
       fi
@@ -889,6 +890,19 @@ if should P0 || [[ "$MODE" != dry ]]; then
     # C2/C3: once the run has recorded its governance, every invocation re-proves it on chain.
     if manifest_has "$RUN_MANIFEST" governance; then
       load_governance P0 1
+    fi
+    # P2 writes the membership book. Found before P2 has sent anything, it is another run's (or
+    # a simulation's). Once this run's P2 has broadcast or its book is recorded, the book is
+    # this run's and P2 itself refuses to run again (C10), naming the record step; the record
+    # step writes no membership book.
+    if should P2 && [[ -e "$MEMB_BOOK" && "$RECORD_BOOK" != 1 ]]; then
+      p2_done=""
+      if manifest_has "$RUN_MANIFEST" stackBook; then p2_done=1; fi
+      if [[ "$MODE" == confirm && -z "$p2_done" ]]; then
+        p2_done=$(p2_sent) || gate_fail P0 "cannot read this run's broadcast records under contracts/broadcast/"
+      fi
+      [[ -n "$p2_done" ]] ||
+        gate_fail P0 "$MEMB_BOOK already exists and P2 would write it; move it aside (it is not this ceremony's output) or resume after P2"
     fi
   fi
   log "P0 preflight PASS (books in $OUT_REL/)"

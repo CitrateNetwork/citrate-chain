@@ -968,8 +968,9 @@ rm -rf "$RG"
 # run_step added to regenesis.sh without the list fails here (negative control below).
 p2_list_sync() { # <regenesis.sh> -> 0 when its run_step scripts are the ceremony's list
   local want have
-  want=$(sed -n 's/^[[:space:]]*run_step "\([^"]*\)".*/\1/p' "$1" | sed 's|.*/||' | sort -u)
-  have=$(sed -n '/^P2_BROADCAST_SCRIPTS=(/,/)/p' "$CE" | tr ' ()' '\n\n\n' | grep '\.s\.sol$' | sort -u)
+  # The membership step is a variable in both: the genesis ceremony's is DeployGenesisMembership.
+  want=$(sed -n 's/^[[:space:]]*run_step "\([^"]*\)".*/\1/p' "$1" | sed -e 's|.*/||' -e 's/^\$MEMBERSHIP_SCRIPT$/DeployGenesisMembership.s.sol/' | sort -u)
+  have=$(sed -n '/^P2_BROADCAST_SCRIPTS=(/,/)/p' "$CE" | sed 's/"\$GENESIS_MEMBERSHIP_SCRIPT"/DeployGenesisMembership.s.sol/' | tr ' ()' '\n\n\n' | grep '\.s\.sol$' | sort -u)
   [[ -n "$want" && "$want" == "$have" ]]
 }
 p2_list_sync "$G/../ops/regenesis.sh" && ok "ceremony C10: P2_BROADCAST_SCRIPTS is every script regenesis.sh broadcasts" ||
