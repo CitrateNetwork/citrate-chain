@@ -1947,6 +1947,10 @@ want_vest=$(printf '{"TeamVesting_alice":"%s","TeamVesting_bob":"%s"}' "$V1" "$V
 want_dorm=$(python3 -c 'import json,sys; print(json.dumps({k: v.lower() for k, v in json.load(open(sys.argv[1]))["contracts"].items()}, sort_keys=True, separators=(",",":")))' "$DORM_OK")
 vest_bc() { bc_run DeployTeamVesting.s.sol "${1:-6000}" "CREATE2:TeamVestingWallet:$V1" "CREATE2:TeamVestingWallet:$V2"; }
 dorm_bc() { bc_run DeployDormantLedgers.s.sol 6000 "CREATE2:FederatedRoundLedger:$FRLA" "CREATE:PatronageLedger:$PLA"; }
+# bcount: the broadcasting forge/regenesis calls; reruns_ph <phase> <output>: lines that would re-enter
+# the phase (a --from/--only of it that is not the record step).
+bcount() { calls | grep -cE '^(forge script .*--broadcast|regenesis .*--broadcast)' || true; }
+reruns_ph() { grep -E -- "--(from|only) $1([^0-9]|$)" <<<"$2" | grep -v -- '--record-book' || true; }
 
 # P3
 ob_reset
@@ -1957,10 +1961,10 @@ ob_reset
 vest_bc
 expect "ceremony #363: a --confirm P3 that writes no book fails" 3 'GATE FAIL at P3: .*team-vesting.json missing after DeployTeamVesting' -- "${OBENV[@]}" bash "$CE" --confirm --only P3 --account deployer
 out=$("${OBENV[@]}" bash "$CE" --confirm --only P3 --account deployer 2>&1)
-if grep -q 'P3 has already broadcast' <<<"$out" && grep -q 'stop and escalate' <<<"$out" && ! grep -qE -- '--(from|only) P3([^0-9]|$)|--from P[0-9]' <<<"$out"; then
-  ok "ceremony recovery: a gate failure after P3 broadcast never resumes into or past P3 (escalate)"
+if grep -q 'P3 has already broadcast' <<<"$out" && grep -qF -- '--confirm --only P3 --record-book' <<<"$out" && [[ -z "$(reruns_ph P3 "$out")" ]]; then
+  ok "ceremony recovery: a gate failure after P3 broadcast never re-runs P3; it names the record step"
 else
-  bad "ceremony recovery: a gate failure after P3 broadcast never resumes into or past P3 (escalate)" "$out"
+  bad "ceremony recovery: a gate failure after P3 broadcast never re-runs P3; it names the record step" "$out"
 fi
 ob_reset
 vest_bc
@@ -1988,10 +1992,10 @@ ob_reset
 dorm_bc
 expect "ceremony #363: a --confirm P4 that writes no book fails" 3 'GATE FAIL at P4: .*dormant-ledgers.json missing after DeployDormantLedgers' -- "${OBENV[@]}" bash "$CE" --confirm --only P4 --account deployer
 out=$("${OBENV[@]}" bash "$CE" --confirm --only P4 --account deployer 2>&1)
-if grep -q 'P4 has already broadcast' <<<"$out" && grep -q 'stop and escalate' <<<"$out" && ! grep -qE -- '--(from|only) P4([^0-9]|$)|--from P[0-9]' <<<"$out"; then
-  ok "ceremony recovery: a gate failure after P4 broadcast never resumes into or past P4 (escalate)"
+if grep -q 'P4 has already broadcast' <<<"$out" && grep -qF -- '--confirm --only P4 --record-book' <<<"$out" && [[ -z "$(reruns_ph P4 "$out")" ]]; then
+  ok "ceremony recovery: a gate failure after P4 broadcast never re-runs P4; it names the record step"
 else
-  bad "ceremony recovery: a gate failure after P4 broadcast never resumes into or past P4 (escalate)" "$out"
+  bad "ceremony recovery: a gate failure after P4 broadcast never re-runs P4; it names the record step" "$out"
 fi
 ob_reset
 dorm_bc
@@ -2006,6 +2010,52 @@ ob_reset
 dorm_bc
 dormant_book "$OBK/dorm-gov.json" "$DEP" "$FRLA" "$STALE"
 expect "ceremony #363: a P4 book naming another governance than the run's fails" 3 'GATE FAIL at P4: .*GovernanceTimelock is 0x0+63, this run.s is 0x0+1f' -- "${OBENV[@]}" FAKE_P4_BOOK="$OBK/dorm-gov.json" bash "$CE" --confirm --only P4 --account deployer
+
+# Recovery after a P3/P4 broadcast whose book did not record: the identical command is refused
+# and sends nothing (C10); the way back in is the record step, --confirm --only Pn --record-book,
+# which sends nothing, rebuilds nothing, and runs the same book checks against this run's
+# broadcasts before recording the book. bcount counts the broadcasting forge calls.
+for c in "P3:teamVesting:team-vesting.json:FAKE_P3_BOOK:$VEST_OK:vest_bc" "P4:dormantLedgers:dormant-ledgers.json:FAKE_P4_BOOK:$DORM_OK:dorm_bc"; do
+  IFS=: read -r ph key file bookvar okbook bcfn <<<"$c"
+  ob_reset
+  "$bcfn"
+  out=$("${OBENV[@]}" bash "$CE" --confirm --only "$ph" --account deployer 2>&1)
+  rc=$?
+  if [[ $rc -eq 3 && "$(bcount)" == 1 ]] && grep -q "GATE FAIL at $ph: .*$file missing after" <<<"$out" &&
+    grep -qF -- "--confirm --only $ph --record-book --account deployer" <<<"$out" && [[ -z "$(reruns_ph "$ph" "$out")" ]]; then
+    ok "ceremony recovery: a $ph gate failure after its broadcast names the record step, never a $ph re-run"
+  else
+    bad "ceremony recovery: a $ph gate failure after its broadcast names the record step, never a $ph re-run (exit $rc, sent $(bcount))" "$out"
+  fi
+  reset_calls
+  expect "ceremony recovery: the identical $ph retry is refused" 3 "GATE FAIL at $ph: this run.s $ph broadcasts are already recorded" -- "${OBENV[@]}" bash "$CE" --confirm --only "$ph" --account deployer
+  [[ "$(bcount)" == 0 ]] && ok "ceremony recovery: the refused $ph retry calls no broadcasting forge" || bad "ceremony recovery: the refused $ph retry calls no broadcasting forge ($(bcount) sent)" "$(calls)"
+  # The record step with a book that is not this run's output still fails its checks.
+  if [[ "$ph" == P3 ]]; then vest_book "$GB/$file" "$STALE"; else dormant_book "$GB/$file" "$STALE"; fi
+  reset_calls
+  expect "ceremony recovery: the $ph record step still refuses a book naming another deployer" 3 "GATE FAIL at $ph: .*names deployer 0x0+63" -- "${OBENV[@]}" bash "$CE" --confirm --only "$ph" --record-book --account deployer
+  [[ "$(manifest_key "$key")" == null && "$(bcount)" == 0 ]] && ok "ceremony recovery: the refused $ph record step records nothing and sends nothing" ||
+    bad "ceremony recovery: the refused $ph record step records nothing and sends nothing" "$(manifest_key "$key"); $(calls)"
+  # Once the cause is fixed (the step's own book in place), the record step records it.
+  cp "$okbook" "$GB/$file"
+  reset_calls
+  expect "ceremony recovery: the $ph record step records the book from this run's broadcasts" 0 "$ph $file recorded in the run manifest \($key\)" -- "${OBENV[@]}" bash "$CE" --confirm --only "$ph" --record-book --account deployer
+  [[ "$(bcount)" == 0 ]] && ok "ceremony recovery: the $ph record step sends nothing" || bad "ceremony recovery: the $ph record step sends nothing" "$(calls)"
+  [[ "$(manifest_key "$key")" != null ]] && ok "ceremony recovery: the $ph record step leaves $key in the manifest" || bad "ceremony recovery: the $ph record step leaves $key in the manifest" "$(cat "$GB/ceremony-run.json")"
+  expect "ceremony recovery: the $ph record step is refused once $ph is recorded" 3 "$ph is done" -- "${OBENV[@]}" bash "$CE" --confirm --only "$ph" --record-book --account deployer
+  reset_calls
+  expect "ceremony recovery: --only $ph after the record step is refused as done" 3 "$file is this run.s $ph output: the run manifest records" -- "${OBENV[@]}" bash "$CE" --confirm --only "$ph" --account deployer
+  [[ "$(bcount)" == 0 ]] && ok "ceremony recovery: --only $ph after the record step sends nothing" || bad "ceremony recovery: --only $ph after the record step sends nothing" "$(calls)"
+  # Without a broadcast from this run there is nothing to record.
+  ob_reset
+  cp "$okbook" "$GB/$file"
+  expect "ceremony recovery: the $ph record step needs this run's $ph broadcast" 3 "GATE FAIL at $ph: the record step: no $ph broadcast from this run is recorded" -- "${OBENV[@]}" bash "$CE" --confirm --only "$ph" --record-book --account deployer
+  [[ "$(manifest_key "$key")" == null ]] && ok "ceremony recovery: a $ph record step without a broadcast records nothing" || bad "ceremony recovery: a $ph record step without a broadcast records nothing" "$(manifest_key "$key")"
+done
+expect "ceremony recovery: --record-book needs --confirm" 1 '--record-book needs --confirm --only P2, P3 or P4' -- "${OBENV[@]}" bash "$CE" --simulate --only P3 --record-book
+expect "ceremony recovery: --record-book needs --only" 1 '--record-book needs --confirm --only P2, P3 or P4' -- "${OBENV[@]}" bash "$CE" --confirm --from P3 --record-book --account deployer
+expect "ceremony recovery: --record-book is refused for a phase that writes no book" 1 '--record-book needs --confirm --only P2, P3 or P4' -- "${OBENV[@]}" bash "$CE" --confirm --only P1 --record-book --account deployer
+expect "ceremony recovery: --record-stack-book stays P2's" 1 '--record-stack-book needs --confirm --only P2' -- "${OBENV[@]}" bash "$CE" --confirm --only P3 --record-stack-book --account deployer
 
 # P5 on --confirm: a book its step did not record is refused; recorded books pass this check.
 ob_reset
