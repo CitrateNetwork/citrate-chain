@@ -33,7 +33,35 @@ def vtuple(v: str) -> tuple[int, ...]:
 
 def check(lock: dict, today: date) -> list[str]:
     """Return the failures for one parsed Cargo.lock (empty list = pass)."""
-    return []
+    pkgs = lock.get("package", [])
+    versions = [p["version"] for p in pkgs if p.get("name") == "crypto-bigint"]
+    old = {v for v in versions if vtuple(v) < FIXED}
+    errors = []
+    if today > EXPIRES:
+        errors.append(f"the {ADVISORY} ignore expired on {EXPIRES}: decide again")
+    if not old:
+        errors.append(
+            f"no crypto-bigint below {'.'.join(map(str, FIXED))} in Cargo.lock: "
+            f"the {ADVISORY} ignore is stale, remove it and this check"
+        )
+        return errors
+    for p in pkgs:
+        for dep in p.get("dependencies", []):
+            parts = dep.split()
+            if parts[0] != "crypto-bigint":
+                continue
+            # A bare name means the lock holds exactly one crypto-bigint.
+            dv = parts[1] if len(parts) > 1 else (versions[0] if len(versions) == 1 else None)
+            if dv is not None and dv not in old:
+                continue
+            ok = p["name"] == ALLOWED_USER and vtuple(p["version"])[:2] == ALLOWED_USER_LINE
+            if not ok:
+                errors.append(
+                    f"{p['name']} {p['version']} -> crypto-bigint {dv or '?'}: "
+                    f"not covered by the {ADVISORY} ignore"
+                )
+    return errors
+
 
 def _lock(*pkgs: tuple[str, str, list[str]]) -> dict:
     return {"package": [{"name": n, "version": v, "dependencies": d} for n, v, d in pkgs]}
