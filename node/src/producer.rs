@@ -82,26 +82,28 @@ fn generate_block_vrf(
     alpha.extend_from_slice(prev_vrf.as_bytes());
     alpha.extend_from_slice(&slot.to_le_bytes());
 
-    match prover(&seed_bytes, &alpha) {
-        Ok((ecvrf_proof, beta)) => {
-            Ok(VrfProof {
-                proof: ecvrf_proof.to_bytes(), // 114 bytes
-                output: Hash::from_bytes(&beta),
-            })
-        }
-        Err(e) => {
-            // Fallback: should never happen with a valid ed25519 key
-            warn!("ECVRF prove failed ({}), using SHA3 fallback", e);
-            use sha3::{Digest, Sha3_256};
-            let mut hasher = Sha3_256::new();
-            hasher.update(&alpha);
-            let output_bytes = hasher.finalize();
-            Ok(VrfProof {
-                proof: output_bytes.to_vec(), // 32 bytes (legacy)
-                output: Hash::from_bytes(&output_bytes),
-            })
-        }
+    // A block may only ever carry a real ECVRF proof. If proving fails there is no
+    // valid block to build for this slot: the caller skips it. (A stand-in proof would
+    // be rejected by every peer, wasting the slot and leaving this producer on its own
+    // fork.)
+    let (ecvrf_proof, beta) =
+        prover(&seed_bytes, &alpha).map_err(|e| anyhow::anyhow!("ECVRF prove error: {e}"))?;
+
+    // Self-check before sealing: the proof must verify for THIS header's alpha and
+    // yield the output we commit, so a proof for the wrong input is never sealed.
+    let proof_bytes = ecvrf_proof.to_bytes();
+    let reverified = citrate_consensus::ecvrf::EcvrfProof::from_bytes(&proof_bytes)
+        .and_then(|p| citrate_consensus::ecvrf::verify(&alpha, &p))
+        .map_err(|e| anyhow::anyhow!("ECVRF proof does not verify for this header: {e}"))?;
+    if reverified != beta {
+        anyhow::bail!("ECVRF proof output does not match the committed output");
     }
+
+    // VRF-PROOF-SOURCE: ecvrf::prove output (RFC 9381), self-verified above.
+    Ok(VrfProof {
+        proof: proof_bytes, // 114 bytes
+        output: Hash::from_bytes(&beta),
+    })
 }
 
 /// VALIDATOR-S1 (v5): configuration for producing the height-binding EquivocationVote
@@ -2035,6 +2037,29 @@ impl BlockProducer {
         blue_set.score = blue_score;
         blue_set.work = parent_blue_work; // base; calculate_blue_work below recomputes
 
+        // Prove the block VRF FIRST, before selecting transactions or opening an executor
+        // round. If proving fails this slot is skipped: no block is built, stored or
+        // broadcast, and the mempool and executor are untouched. Never substitute a
+        // stand-in proof (peers reject it). Producer-side only; validity is unchanged.
+        let proposer_pubkey = PublicKey::new(self.signing_key.verifying_key().to_bytes());
+        let vrf_reveal = match generate_block_vrf(
+            &self.vrf_prover,
+            &self.signing_key,
+            &proposer_pubkey,
+            &parent_vrf_output,
+            next_height,
+        ) {
+            Ok(proof) => proof,
+            Err(e) => {
+                citrate_api::metrics_server::record_producer_vrf_prove_failure();
+                error!(
+                    "VRF prove failed for height {}: {:#}; skipping this slot (no block built or broadcast)",
+                    next_height, e
+                );
+                return Err(e.context(format!("VRF prove failed for height {next_height}")));
+            }
+        };
+
         // Get transactions from mempool with AI priority
         let transactions = self.select_transactions_with_ai_priority().await?;
         // Producer-side panic breaker: skip quarantined transactions and, after
@@ -2115,14 +2140,8 @@ impl BlockProducer {
             blue_score,
             blue_work,
             pruning_point: Hash::default(),
-            proposer_pubkey: PublicKey::new(self.signing_key.verifying_key().to_bytes()),
-            vrf_reveal: generate_block_vrf(
-                &self.vrf_prover,
-                &self.signing_key,
-                &PublicKey::new(self.signing_key.verifying_key().to_bytes()),
-                &parent_vrf_output,
-                next_height,
-            )?,
+            proposer_pubkey,
+            vrf_reveal,
             // The §R' import rule requires the canonical base fee; the former inline
             // "EIP-1559" computation used constant inputs (parent gas used = 0) and
             // always evaluated to exactly this value.
