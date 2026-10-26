@@ -235,6 +235,12 @@ pub fn recover(digest: &B32, sig: &[u8]) -> anyhow::Result<Addr> {
         _ => anyhow::bail!("signature is {} bytes", sig.len()),
     };
     let s = Signature::from_slice(rs)?;
+    // EIP-2 low-s, as the chain's precompiles require. This must be explicit:
+    // from ecdsa 0.17 on, `recover_from_prehash` no longer re-verifies, so it
+    // no longer refuses the high-s twin of a valid signature.
+    if bool::from(k256::elliptic_curve::scalar::IsHigh::is_high(&s.s())) {
+        anyhow::bail!("high-s signature (EIP-2)");
+    }
     let v = match v {
         27 | 28 => v.saturating_sub(27),
         v => v,
