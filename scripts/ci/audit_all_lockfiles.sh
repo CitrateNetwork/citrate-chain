@@ -25,7 +25,13 @@
 #   RUSTSEC-2026-0387  crypto-bigint < 0.7.6 timing variability, reached only
 #           through elliptic-curve 0.13 (no 0.13.x accepts crypto-bigint 0.7).
 #           Guard: scripts/ci/check_crypto_bigint_users.py (blocking step in
-#           cargo-audit.yml and security-audit.yml).
+#           cargo-audit.yml and security-audit.yml). Expiry 2027-01-31 is the
+#           owner-approved window (#377). The guard enforces its own EXPIRES
+#           as well; whichever date is earlier fails first. On main the guard
+#           reads the root Cargo.lock only. Running it per sub-lockfile with
+#           --lock is not a fix: the two commd lockfiles hold no crypto-bigint,
+#           so a per-lockfile run reports them as a stale ignore. #377 makes
+#           the guard check every tracked lockfile with a repo-wide stale test.
 #
 # Usage: audit_all_lockfiles.sh              # audit every tracked Cargo.lock
 #        audit_all_lockfiles.sh --self-test  # prove the gate still flags a
@@ -54,7 +60,18 @@ fi
 # expired_ignores <today YYYY-MM-DD> <entry>... : print one line per entry
 # that is expired or malformed; status 1 if any.
 expired_ignores() {
-  return 0
+  local today="$1" e id until bad=0
+  shift
+  for e in "$@"; do
+    case "$e" in *@*) ;; *) continue ;; esac
+    id="${e%%@*}"; until="${e#*@}"
+    if ! [[ "$until" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+      echo "ignore $id: malformed expiry '$until' (want YYYY-MM-DD)"; bad=1
+    elif [[ "$today" > "$until" ]]; then
+      echo "ignore $id expired on $until"; bad=1
+    fi
+  done
+  return "$bad"
 }
 
 audit_one() { # <lockfile> ; returns cargo-audit's exit status
@@ -103,7 +120,7 @@ self_test() {
   if [ "$n" -lt 2 ]; then
     echo "self-test: enumerated only $n Cargo.lock file(s); sub-lockfiles not covered"; rc=1
   fi
-  [ "$rc" -eq 0 ] && echo "self-test OK (vulnerable pin flagged, clean pin passes, $n lockfiles enumerated)"
+  [ "$rc" -eq 0 ] && echo "self-test OK (vulnerable pin flagged, clean pin passes, expired ignore rejected, $n lockfiles enumerated)"
   return "$rc"
 }
 
