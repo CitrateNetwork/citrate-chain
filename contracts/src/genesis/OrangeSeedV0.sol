@@ -58,8 +58,9 @@ contract OrangeSeedV0 is Initializable, UUPSUpgradeable {
     error NotYetGerminated();
 
     /// @custom:oz-upgrades-unsafe-allow constructor
-    constructor() {}
-    // RED STUB: no initializer lock, no planting record, no upgrade gate, no value check.
+    constructor() {
+        _disableInitializers();
+    }
 
     /// @notice Plant the seed. Runs once, through the proxy, in the same frame that sets the
     ///         proxy's implementation (the proxy constructor, or the genesis state).
@@ -70,25 +71,29 @@ contract OrangeSeedV0 is Initializable, UUPSUpgradeable {
         SeedStorage storage $ = _seed();
         $.planter = planter_;
         $.governance = governance_;
-
+        $.plantedAtBlock = block.number;
+        $.plantedAtTimestamp = block.timestamp;
+        $.storyHash = keccak256(bytes(STORY));
         emit Planted(planter_, governance_, block.number, block.timestamp);
     }
 
     // ── the seed ─────────────────────────────────────────────────────────────
 
     function story() external pure returns (string memory) {
-        return "";
+        return STORY;
     }
 
     function version() external pure virtual returns (uint256) {
-        return 1;
+        return 0;
     }
 
     /// @notice Not yet. A future version, upgraded in by governance, decides what this does.
     /// @dev Deliberately non-payable rather than `pure`: an override may only tighten state
     ///      mutability, so `pure` here would stop a version that inherits V0 from giving
     ///      `germinate` an effect. (solc notes it could be pure; that is intended.)
-    function germinate() external virtual {}
+    function germinate() external virtual {
+        revert NotYetGerminated();
+    }
 
     function planter() external view returns (address) {
         return _seed().planter;
@@ -114,10 +119,13 @@ contract OrangeSeedV0 is Initializable, UUPSUpgradeable {
 
     /// @dev OZ declares this payable; the seed never accepts value, even from governance.
     function upgradeToAndCall(address newImplementation, bytes memory data) public payable virtual override {
+        if (msg.value != 0) revert ValueNotAccepted();
         super.upgradeToAndCall(newImplementation, data);
     }
 
-    function _authorizeUpgrade(address) internal view virtual override {}
+    function _authorizeUpgrade(address) internal view virtual override {
+        if (msg.sender != _seed().governance) revert NotGovernance(msg.sender);
+    }
 
     function _seed() internal pure returns (SeedStorage storage $) {
         assembly {

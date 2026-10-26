@@ -216,6 +216,8 @@ else
   else
     gate "forge-build" bash -c "cd '$REPO_ROOT/contracts' && forge build"
     gate "forge-test"  bash -c "cd '$REPO_ROOT/contracts' && forge test"
+    # OrangeSeed genesis predeploy: storage-layout snapshot + ERC-7201 namespace (self-test first).
+    gate "orangeseed-layout" bash -c "'$REPO_ROOT/scripts/ci/orangeseed_storage_layout.sh' --self-test && '$REPO_ROOT/scripts/ci/orangeseed_storage_layout.sh'"
   fi
 fi
 

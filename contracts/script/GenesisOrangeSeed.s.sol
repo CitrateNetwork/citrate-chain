@@ -78,8 +78,10 @@ contract GenesisOrangeSeed is Script {
         require(proxy != impl, "OrangeSeed: proxy and implementation share an address");
         require(proxy.code.length == 0 && impl.code.length == 0, "OrangeSeed: predeploy address already has code");
 
-        uint256 savedBlock = block.number;
-        uint256 savedTimestamp = block.timestamp;
+        // Cheatcode getters, not `block.number`/`block.timestamp`: under via-IR the optimizer
+        // may move those reads across the vm.roll/vm.warp calls below.
+        uint256 savedBlock = vm.getBlockNumber();
+        uint256 savedTimestamp = vm.getBlockTimestamp();
         vm.roll(0);
         vm.warp(genesisTimestamp);
 

@@ -44,7 +44,9 @@ contract OrangeSeedTest is OrangeSeedBase {
         uint256 sentences;
         for (uint256 i = 0; i < s.length; i++) {
             assertLt(uint8(s[i]), 0x80, "story must be ASCII (no em-dash)");
-            if (s[i] == "." && (i + 1 == s.length || s[i + 1] == " ")) sentences++;
+            // A full stop ends a sentence; the house ellipsis ("...") does not.
+            bool stop = s[i] == "." && (i + 1 == s.length || s[i + 1] == " ");
+            if (stop && !(i > 0 && s[i - 1] == ".")) sentences++;
         }
         assertGe(sentences, 1);
         assertLe(sentences, 3);
@@ -112,10 +114,12 @@ contract OrangeSeedTest is OrangeSeedBase {
         vm.prank(governance);
         vm.expectRevert(abi.encodeWithSelector(ERC1967Utils.ERC1967InvalidImplementation.selector, address(bad)));
         seed.upgradeToAndCall(address(bad), "");
+        // A target with no code: decoding its empty `proxiableUUID` return reverts (no data).
         address eoaTarget = makeAddr("eoaTarget");
         vm.prank(governance);
-        vm.expectRevert(abi.encodeWithSelector(ERC1967Utils.ERC1967InvalidImplementation.selector, eoaTarget));
+        vm.expectRevert();
         seed.upgradeToAndCall(eoaTarget, "");
+        assertEq(address(uint160(uint256(vm.load(proxyAddr, IMPLEMENTATION_SLOT)))), implAddr);
     }
 
     // ── initialization ──────────────────────────────────────────────────────
@@ -216,9 +220,10 @@ contract OrangeSeedTest is OrangeSeedBase {
 
         // V1 keeps the same authority.
         address eoa = makeAddr("someone");
+        address next = address(new OrangeSeedV1Fixture());
         vm.prank(eoa);
         vm.expectRevert(abi.encodeWithSelector(OrangeSeedV0.NotGovernance.selector, eoa));
-        grown.upgradeToAndCall(address(new OrangeSeedV1Fixture()), "");
+        grown.upgradeToAndCall(next, "");
         // And the V1 reinitializer cannot be replayed.
         vm.expectRevert(Initializable.InvalidInitialization.selector);
         grown.initializeV1("again");
@@ -305,8 +310,8 @@ contract OrangeSeedTest is OrangeSeedBase {
         vm.roll(42);
         vm.warp(GENESIS_TS + 5);
         new GenesisOrangeSeed().build(makeAddr("p5"), makeAddr("i5"), governance, planter, GENESIS_TS);
-        assertEq(block.number, 42);
-        assertEq(block.timestamp, GENESIS_TS + 5);
+        assertEq(vm.getBlockNumber(), 42);
+        assertEq(vm.getBlockTimestamp(), GENESIS_TS + 5);
     }
 
     // ── predeploy address ───────────────────────────────────────────────────
