@@ -377,6 +377,78 @@ printf '{"timestamp":1500,"transactions":[{"transactionType":"CREATE2","contract
 expect "keep: a deployment at a - row's pinned address fails" 1 'deploys Beta at 0x0+a2, the pinned address of Beta whose KEEP row names -' -- env RPC=http://r1 ADDRESS_BOOK="$ABOOK" BROADCAST_DIR="$GBC" bash "$KC" verify "$APIN"
 rm -r "$RBC" "$GBC"
 
+# A deployment forge records without a contract name: the P-256 verifier, which
+# aa/DeployP256Verifier.s.sol deploys from vendored init code through the CREATE2 factory
+# (contractName null). The fixture is that step's real broadcast record (chain 40204). The
+# gate identifies such a deployment by its init code, once the record proves its address
+# (CREATE2 of its factory, salt and init code); before, keys, pin and verify all refused it.
+P256=0xc2b78104907f722dabac4c69f826a522b2754de4
+P256_ID=initcode:0x3257821cc41f91063996667ce8ccb18b2ef28210b0e35376a36d6d47f3aea33a
+P256_FIX="$HERE/fixtures/p256-verifier-run.json"
+if [[ "$(jq -r '.transactions[0] | [.transactionType, (.contractName // "null"), .contractAddress, .transaction.to] | join(" ")' "$P256_FIX")" == "CREATE2 null $P256 0x4e59b44847b379578588920ca78fbf26c0b4956c" ]]; then
+  ok "keep nameless: the fixture is a nameless CREATE2 through the factory at the verifier's address"
+else
+  bad "keep nameless: the fixture is a nameless CREATE2 through the factory at the verifier's address" "$(jq -c '.transactions[0] | del(.transaction.input)' "$P256_FIX")"
+fi
+# keccak256 (not FIPS SHA3) is what the identity hashes with: known vectors.
+if [[ "$(python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import broadcast_ident as b; print(b.keccak256(b"").hex(), b.keccak256(b"abc").hex())' "$G" 2>&1)" == "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470 4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45" ]]; then
+  ok "keep nameless: keccak256 matches the known vectors"
+else
+  bad "keep nameless: keccak256 matches the known vectors"
+fi
+printf '0x6005' >"$FAKE/code/$P256"
+PBOOK="$T/p256-book.json"
+printf '{"chainId":40204,"contracts":{"Alpha":"%s"},"aaStack":{"P256Verifier":"%s"}}' "$A1" "$P256" >"$PBOOK"
+PBC="$T/pbc"
+mkdir -p "$PBC/DeployAll.s.sol/40204" "$PBC/DeployP256Verifier.s.sol/40204"
+run_json 1000 Alpha "$A1" >"$PBC/DeployAll.s.sol/40204/run-latest.json"
+cp "$P256_FIX" "$PBC/DeployP256Verifier.s.sol/40204/run-latest.json"
+PKEYS="$T/p256-keys.tsv"
+if ADDRESS_BOOK="$PBOOK" BROADCAST_DIR="$PBC" bash "$KC" keys contracts,aaStack >"$PKEYS" 2>"$T/pkeys.err" &&
+  grep -qxF "P256Verifier	aaStack	$P256_ID	no" "$PKEYS" && grep -qxF "Alpha	contracts	Alpha	no" "$PKEYS"; then
+  ok "keep nameless: keys names the verifier by its init code, next to the named rows"
+else
+  bad "keep nameless: keys names the verifier by its init code, next to the named rows" "$(cat "$PKEYS" "$T/pkeys.err")"
+fi
+echo 1234 >"$(rpcdir http://r1)/head"
+PPIN="$T/p256-pinned.tsv"
+if RPC=http://r1 ADDRESS_BOOK="$PBOOK" BROADCAST_DIR="$PBC" bash "$KC" pin "$PKEYS" >"$PPIN" 2>"$T/ppin.err" &&
+  grep -qP "^P256Verifier\taaStack\t$P256\t$P256_ID\t0x[0-9a-f]{64}\t-$" "$PPIN"; then
+  ok "keep nameless: pin records the verifier row under its init-code identity"
+else
+  bad "keep nameless: pin records the verifier row under its init-code identity" "$(cat "$PPIN" "$T/ppin.err")"
+fi
+printf 'P256Verifier\taaStack\t-\tno\n' >"$T/p256-dash.tsv"
+expect "keep nameless: pin refuses - for the verifier (the broadcasts identify it)" 2 "contract_name is - but the broadcasts deploy $P256_ID" -- env RPC=http://r1 ADDRESS_BOOK="$PBOOK" BROADCAST_DIR="$PBC" bash "$KC" pin "$T/p256-dash.tsv"
+expect "keep nameless: verify passes the real P2 broadcast set" 0 "deploys $P256_ID at $P256 \(the pinned address\)" -- env RPC=http://r1 ADDRESS_BOOK="$PBOOK" BROADCAST_DIR="$PBC" bash "$KC" verify "$PPIN"
+# The same init code through the factory with another salt is the same contract elsewhere.
+P256_MOVED=$(python3 -I - "$G" "$P256_FIX" <<'PY'
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import broadcast_ident as b
+r = json.load(open(sys.argv[2]))
+t = r["transactions"][0]
+init = bytes.fromhex(t["transaction"]["input"][2:])[32:]
+salt = (1).to_bytes(32, "big")
+t["transaction"]["input"] = "0x" + (salt + init).hex()
+t["contractAddress"] = b.create2_address(t["transaction"]["to"], salt, init)
+t["hash"] = "0x" + "11" * 32
+r["timestamp"] = 1791264990000
+print(json.dumps(r))
+PY
+)
+mkdir -p "$PBC/Later.s.sol/40204"
+printf '%s' "$P256_MOVED" >"$PBC/Later.s.sol/40204/run-latest.json"
+expect "keep nameless: the verifier's init code deployed elsewhere fails as a redeploy" 1 "Later.s.sol redeploys $P256_ID at 0x[0-9a-f]{40} \(not the pinned" -- env RPC=http://r1 ADDRESS_BOOK="$PBOOK" BROADCAST_DIR="$PBC" bash "$KC" verify "$PPIN"
+# A nameless record whose address its own fields do not prove has no identity: refused.
+jq '.transactions[0].contractAddress = "0x00000000000000000000000000000000000000c7" | .transactions[0].hash = "0x" + ("22" * 32)' "$P256_FIX" >"$PBC/Later.s.sol/40204/run-latest.json"
+expect "keep nameless: keys refuses a nameless record that does not prove its address" 2 'cannot read the chain-40204 broadcasts' -- env ADDRESS_BOOK="$PBOOK" BROADCAST_DIR="$PBC" bash "$KC" keys contracts,aaStack
+expect "keep nameless: verify fails a nameless record that does not prove its address" 1 'does not prove that address' -- env RPC=http://r1 ADDRESS_BOOK="$PBOOK" BROADCAST_DIR="$PBC" bash "$KC" verify "$PPIN"
+# A nameless plain CREATE (no factory) cannot prove its address from the record either.
+printf '{"timestamp":1791264990000,"transactions":[{"hash":"0x33","transactionType":"CREATE","contractName":null,"contractAddress":"%s","transaction":{"to":null,"input":"0x6001"}}]}' "$(addr 4321)" >"$PBC/Later.s.sol/40204/run-latest.json"
+expect "keep nameless: verify fails a nameless plain CREATE" 1 'not a CREATE2 factory call' -- env RPC=http://r1 ADDRESS_BOOK="$PBOOK" BROADCAST_DIR="$PBC" bash "$KC" verify "$PPIN"
+rm -r "$PBC" "$FAKE/code/$P256"
+
 reset_calls
 expect "keep: --dry-run needs no RPC" 0 'KEEP dry run OK \(3 entries' -- bash "$KC" verify --dry-run "$LIST"
 if calls | grep -q .; then bad "keep: --dry-run made no tool call" "$(calls)"; else ok "keep: --dry-run made no tool call"; fi
@@ -599,7 +671,10 @@ gov_chain
 owners() { local i out=""; for i in "$@"; do out+="${out:+,}$(addr "$i")"; done; printf '%s' "$out"; }
 CEENV=(env REPO_ROOT="$REPO" DEPLOYER_ADDRESS="$DEP"
   GOV_OWNERS="$(owners 11 12 13 14 15)" GOV_THRESHOLD=3 GOV_MIN_DELAY=172800
-  GRD_OWNERS="$(owners 21 22 23)" GRD_THRESHOLD=2 GRD_MIN_DELAY=3600 MEMBERSHIP_GRANTOR="$(addr 51)")
+  GRD_OWNERS="$(owners 21 22 23)" GRD_THRESHOLD=2 GRD_MIN_DELAY=3600
+  SIGNER_1="$(addr 61)" SIGNER_2="$(addr 62)" SIGNER_3="$(addr 63)" RELAYER="$(addr 64)"
+  CITRATE_AA_OWNER="$(addr 65)" CITRATE_AA_IDENTITY_SIGNER="$(addr 66)" CITRATE_AA_SPONSOR_SIGNER="$(addr 67)"
+  MEMBERSHIP_GRANTOR="$(addr 51)")
 
 reset_calls
 expect "ceremony: dry run with genesis values passes" 0 'done \(mode=dry\)' -- "${CEENV[@]}" bash "$CE"
@@ -697,6 +772,57 @@ expect "ceremony: --confirm needs a keystore account" 3 'needs --account' -- "${
 expect "ceremony: --confirm to a remote RPC needs CITRATE_ALLOW_REMOTE" 3 'not loopback' -- "${CEENV[@]}" RPC_URL=https://rpc.example EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1 bash "$CE" --confirm --account deployer
 expect "ceremony: missing genesis contract scripts are named" 3 'chain#320' -- "${CEENV[@]}" REPO_ROOT="$T/empty-repo" bash "$CE"
 expect "ceremony: an unknown phase is refused" 1 'must be one of' -- "${CEENV[@]}" bash "$CE" --from P9
+# Tripwire: every environment key a ceremony phase reads (derived from the ceremony,
+# regenesis.sh and the forge scripts each phase runs) is classified in phase_inputs.json, which
+# P0 checks. Negative controls on a copy of the tree: each kind of drift is caught.
+PI="$G/phase_inputs.py"
+expect "phase inputs tripwire: the tree's phase reads are all classified" 0 'phase_inputs: OK' -- python3 -I "$PI" check-spec
+TW="$T/pi-tree"
+mkdir -p "$TW/scripts/genesis" "$TW/scripts/ops" "$TW/contracts"
+cp "$G/genesis_ceremony.sh" "$TW/scripts/genesis/"
+cp "$G/../ops/regenesis.sh" "$TW/scripts/ops/"
+cp -R "$G/../../contracts/script" "$TW/contracts/script"
+cp "$G/phase_inputs.json" "$T/pi-spec.json"
+# shellcheck disable=SC2120 # the spec argument is passed through expect's "$@"
+pi_tw() { python3 -I "$PI" check-spec --repo "$TW" --spec "${1:-$T/pi-spec.json}"; }
+expect "phase inputs tripwire: the copied tree passes (control)" 0 'phase_inputs: OK' -- pi_tw
+cp "$TW/contracts/script/DeployEduStack.s.sol" "$T/edu.orig"
+sed -i 's|^\(\s*\)address relayer = |\1address extra = vm.envAddress("NEW_EDU_INPUT");\n\1address relayer = |' "$TW/contracts/script/DeployEduStack.s.sol"
+expect "phase inputs tripwire: a new literal read in a P2 script is flagged" 1 'NEW_EDU_INPUT is read \(P2: contracts/script/DeployEduStack.s.sol\) but phase_inputs.json does not classify it' -- pi_tw
+cp "$T/edu.orig" "$TW/contracts/script/DeployEduStack.s.sol"
+cat >>"$TW/contracts/script/DeployEduStack.s.sol" <<'SOL'
+contract EnvHelpers is ScriptEnv {
+    function _need(string memory k) internal view returns (address) { return vm.envAddress(k); }
+    function _pair(string memory prefix) internal view returns (uint256) { return vm.envUint(string.concat(prefix, "_LIMIT")); }
+    function use() external view returns (address a, uint256 n) { a = _need("WRAPPED_INPUT"); n = _pair("PFX"); }
+}
+SOL
+out=$(pi_tw 2>&1)
+if [[ $? -eq 1 ]] && grep -q 'WRAPPED_INPUT is read' <<<"$out" && grep -q 'PFX_LIMIT is read' <<<"$out"; then
+  ok "phase inputs tripwire: a read through a helper, and a prefixed key, are flagged"
+else
+  bad "phase inputs tripwire: a read through a helper, and a prefixed key, are flagged" "$out"
+fi
+cp "$T/edu.orig" "$TW/contracts/script/DeployEduStack.s.sol"
+cat >>"$TW/contracts/script/DeployEduStack.s.sol" <<'SOL'
+contract EnvDynamic is ScriptEnv {
+    function pick(uint256 i) external view returns (address) { string[2] memory ks = ["A", "B"]; return vm.envAddress(ks[i]); }
+}
+SOL
+expect "phase inputs tripwire: a dynamic key is flagged" 1 'reads an environment key P0 cannot check: ks\[i\]' -- pi_tw
+cp "$T/edu.orig" "$TW/contracts/script/DeployEduStack.s.sol"
+jq '.inputs.OLD_INPUT = {"class": "default", "phases": ["P2"], "why": "x"}' "$G/phase_inputs.json" >"$T/pi-stale.json"
+expect "phase inputs tripwire: a spec entry no phase reads is flagged" 1 'OLD_INPUT is in phase_inputs.json but no phase reads it' -- pi_tw "$T/pi-stale.json"
+jq '.inputs.SIGNER_1.phases = ["P3"]' "$G/phase_inputs.json" >"$T/pi-phase.json"
+expect "phase inputs tripwire: a wrong phase list is flagged" 1 "SIGNER_1: phase_inputs.json says phases \['P3'\], the scripts read it in \['P2'\]" -- pi_tw "$T/pi-phase.json"
+jq '.inputs.SIGNER_1.class = "p0-bash"' "$G/phase_inputs.json" >"$T/pi-bash.json"
+expect "phase inputs tripwire: a p0-bash key P0 never names is flagged" 1 'SIGNER_1 is classed p0-bash but the P0 section' -- pi_tw "$T/pi-bash.json"
+jq '.inputs.SIGNER_1.class = "set"' "$G/phase_inputs.json" >"$T/pi-set.json"
+expect "phase inputs tripwire: a set key nothing assigns is flagged" 1 'SIGNER_1 is classed set but neither' -- pi_tw "$T/pi-set.json"
+mv "$TW/contracts/script/DeployAIGateway.s.sol" "$T/aig.aside"
+expect "phase inputs tripwire: a P2 step whose script is missing is flagged" 1 'P2 runs contracts/script/DeployAIGateway.s.sol, which is missing' -- pi_tw
+mv "$T/aig.aside" "$TW/contracts/script/DeployAIGateway.s.sol"
+rm -r "$TW"
 
 # simulate: P5 reads the admin report
 mkdir -p "$(rpcdir http://127.0.0.1:8545)"
@@ -825,7 +951,75 @@ expect "ceremony: --simulate --only P2 checks the deployer seat" 3 'deployer mus
 echo 5 >"$LRPC/nonce"
 expect "ceremony: a resume does not require deployer nonce 0" 0 'P0 preflight PASS' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
 expect "ceremony: a fresh ceremony requires deployer nonce 0" 3 'deployer nonce is 5' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate
+# A deployer that has sent is not a fresh ceremony: the hint never says --from P0 (that is the
+# fresh run that just refused).
+out=$("${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate 2>&1)
+if grep -q 'never start a fresh ceremony over them' <<<"$out" && ! grep -qF -- '--from P0' <<<"$out"; then
+  ok "ceremony: a non-zero deployer nonce names a resume, never --from P0"
+else
+  bad "ceremony: a non-zero deployer nonce names a resume, never --from P0" "$out"
+fi
 rm "$LRPC/nonce"
+# P0 checks every input a later phase of this run reads (phase_inputs.json), before anything is
+# sent. Before, P2's inputs (vault signers, relayer, AA owner and signers, membership owner)
+# were read only by the forge steps inside regenesis.sh: a missing one stopped P2 after its
+# earlier steps had broadcast, and P2 cannot be re-run (C10).
+P0FRESH="$REPO/contracts/genesis/p0fresh"
+mkdir -p "$P0FRESH"
+reset_calls
+out=$("${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$P0FRESH" SIGNER_1= bash "$CE" --simulate 2>&1)
+rc=$?
+if [[ $rc -eq 3 ]] && grep -q 'GATE FAIL at P0: phase inputs: .*SIGNER_1 is not set' <<<"$out" && ! calls | grep -q '^forge\|^regenesis' && [[ ! -e "$P0FRESH/ceremony-run.json" ]]; then
+  ok "ceremony P0 inputs: a missing P2 input stops a fresh run at P0, before P1 (no forge, no manifest)"
+else
+  bad "ceremony P0 inputs: a missing P2 input stops a fresh run at P0, before P1 (no forge, no manifest) (exit $rc)" "$out
+$(calls)"
+fi
+rm -rf "$P0FRESH"
+for v in SIGNER_1 SIGNER_2 SIGNER_3 RELAYER CITRATE_AA_OWNER CITRATE_AA_IDENTITY_SIGNER CITRATE_AA_SPONSOR_SIGNER MEMBERSHIP_GRANTOR; do
+  expect "ceremony P0 inputs: P2 without $v is refused at P0" 3 "GATE FAIL at P0: phase inputs: .*$v is not set" -- "${CEENV[@]}" "$v=" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
+done
+# --confirm: refused at P0 before anything is sent, with the resume of this invocation.
+reset_calls
+out=$("${CEENV[@]}" RELAYER= RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1 bash "$CE" --confirm --only P2 --account deployer 2>&1)
+rc=$?
+if [[ $rc -eq 3 ]] && grep -q 'GATE FAIL at P0: phase inputs: .*RELAYER is not set' <<<"$out" && grep -qF -- '--confirm --only P2 --account deployer' <<<"$out" &&
+  ! grep -qF -- '--from P0' <<<"$out" && ! calls | grep -q '^forge\|^regenesis'; then
+  ok "ceremony P0 inputs: --confirm P2 without RELAYER sends nothing and names this invocation's resume (--only P2)"
+else
+  bad "ceremony P0 inputs: --confirm P2 without RELAYER sends nothing and names this invocation's resume (--only P2) (exit $rc)" "$out
+$(calls)"
+fi
+expect "ceremony P0 inputs: the three vault signers must be distinct" 3 'SIGNER_1, SIGNER_2, SIGNER_3 must be distinct' -- "${CEENV[@]}" SIGNER_2="$(addr 61)" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
+expect "ceremony P0 inputs: a vault signer that is the deployer is refused" 3 'SIGNER_3 .* is the deployer' -- "${CEENV[@]}" SIGNER_3="$DEP" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
+expect "ceremony P0 inputs: the sponsor signer is not the identity signer" 3 'CITRATE_AA_IDENTITY_SIGNER, CITRATE_AA_SPONSOR_SIGNER must be distinct' -- "${CEENV[@]}" CITRATE_AA_SPONSOR_SIGNER="$(addr 66)" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
+expect "ceremony P0 inputs: a malformed relayer is refused" 3 'RELAYER \(0x12\) is not an address' -- "${CEENV[@]}" RELAYER=0x12 RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
+expect "ceremony P0 inputs: a zero AA owner is refused" 3 'CITRATE_AA_OWNER is the zero address' -- "${CEENV[@]}" CITRATE_AA_OWNER=0x0000000000000000000000000000000000000000 RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
+expect "ceremony P0 inputs: an EntryPoint pin is refused (deployed at its projected address)" 3 'CITRATE_AA_ENTRY_POINT is set; a genesis ceremony runs without it' -- "${CEENV[@]}" CITRATE_AA_ENTRY_POINT="$(addr 70)" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
+expect "ceremony P0 inputs: a P-256 init-code override is refused" 3 'P256_VERIFIER_INITCODE is set' -- "${CEENV[@]}" P256_VERIFIER_INITCODE=0x00 RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
+expect "ceremony P0 inputs: a malformed optional cap is refused" 3 'CITRATE_AA_DAILY_CAP \(lots\) is not an unsigned integer' -- "${CEENV[@]}" CITRATE_AA_DAILY_CAP=lots RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
+# Negative controls: a run that does not reach P2 does not need P2's inputs, and a dry run
+# plans without them, naming what a real run will refuse.
+expect "ceremony P0 inputs: --only P5 does not need P2's inputs" 0 'P0 preflight PASS' -- "${CEENV[@]}" SIGNER_1= RELAYER= RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+expect "ceremony P0 inputs: a dry run plans without them and names them" 0 'P0 plan: .*SIGNER_1 is not set' -- "${CEENV[@]}" SIGNER_1= bash "$CE"
+# P4's PATRONAGE_* inputs exist only after P1 (deployed under GOVERNANCE): a run that starts
+# at P4 needs them at P0; a fresh run is checked at P4, before P4 sends.
+expect "ceremony P0 inputs: --from P4 needs P4's inputs at P0, and the resume is --from P4" 3 'GATE FAIL at P0: phase inputs: .*PATRONAGE_KYC_REGISTRY is not set' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --from P4
+out=$("${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --from P4 2>&1)
+if grep -qF -- 'resume: '"$CE"' --simulate --from P4' <<<"$out" && ! grep -qF -- '--from P0' <<<"$out"; then
+  ok "ceremony P0 inputs: a P0 refusal on a resume names that resume, not --from P0"
+else
+  bad "ceremony P0 inputs: a P0 refusal on a resume names that resume, not --from P0" "$out"
+fi
+P0FRESH="$REPO/contracts/genesis/p0fresh"
+mkdir -p "$P0FRESH"
+out=$("${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$P0FRESH" bash "$CE" --simulate 2>&1)
+if grep -q 'P0 preflight PASS' <<<"$out" && ! grep -q 'GATE FAIL at P0' <<<"$out"; then
+  ok "ceremony P0 inputs: a fresh run does not need P4's late inputs at P0"
+else
+  bad "ceremony P0 inputs: a fresh run does not need P4's late inputs at P0" "$out"
+fi
+rm -rf "$P0FRESH"
 # A fresh run refuses to start over an earlier run's manifest, and writes its own at P0.
 expect "ceremony: a fresh run refuses an existing run manifest" 3 'ceremony-run.json already exists' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$GB" bash -c "mv '$GB/governance.json' '$T/gov.aside'; bash '$CE' --simulate; rc=\$?; mv '$T/gov.aside' '$GB/governance.json'; exit \$rc"
 FRESH="$REPO/contracts/genesis/fresh"
@@ -1488,6 +1682,15 @@ expect "ceremony: a stale book stops a resumed run before P1" 3 'already exists 
 expect "ceremony: P2 reads governance from the nondefault dir" 0 'GOVERNANCE=0x0+29 GUARDIAN=0x0+2a' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$RUN2" bash "$CE" --simulate --only P2
 reset_calls
 expect "ceremony: P4 runs with the nondefault dir" 0 'P4 dormant ledgers' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$RUN2" PATRONAGE_KYC_REGISTRY="$(addr 51)" PATRONAGE_MEMBERSHIP="$(addr 52)" bash "$CE" --simulate --only P4
+# A fresh-run-shaped invocation that reaches P4 without P4's inputs: the gate is P4's, and so
+# is the resume (before, it said "GATE FAIL at P0 ... --from P0", which starts a fresh run).
+out=$("${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$RUN2" bash "$CE" --simulate --from P3 2>&1)
+rc=$?
+if [[ $rc -eq 3 ]] && grep -q 'GATE FAIL at P4: .*PATRONAGE_KYC_REGISTRY' <<<"$out" && grep -qF -- "resume: $CE --simulate --from P4" <<<"$out" && ! grep -qF -- '--from P0' <<<"$out"; then
+  ok "ceremony P4: a missing P4 input is P4's gate, resumed with --from P4"
+else
+  bad "ceremony P4: a missing P4 input is P4's gate, resumed with --from P4 (exit $rc)" "$out"
+fi
 calls | grep -q 'forge-env gov=[^ ]* vest=[^ ]* dormant=genesis/run2/dormant-ledgers.json govbook=genesis/run2/governance.json ' && ok "ceremony: P4 reads and writes the nondefault dir" || bad "ceremony: P4 reads and writes the nondefault dir" "$(calls)"
 reset_calls
 expect "ceremony: P5 checks the nondefault dir's books" 0 'P5 PASS' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$RUN2" bash "$CE" --simulate --only P5

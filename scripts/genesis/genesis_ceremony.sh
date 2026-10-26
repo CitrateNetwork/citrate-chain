@@ -256,13 +256,37 @@ after_broadcast() {
     *) err "stop and escalate (runbook §6.4): read contracts/broadcast/ and the chain. $1's output book is recorded only by $1, so no later phase can go on without it" ;;
   esac
 }
+# resume_cmd <phase>: the command that re-enters this run at <phase> once the cause is fixed.
+# P0 is the preflight of THIS invocation, so a P0 failure re-runs the invocation as given
+# (its --from/--only), never --from P0: on a run that has sent, --from P0 is a fresh ceremony,
+# which refuses (deployer nonce) and would print --from P0 again.
+resume_cmd() {
+  local sel="--from $1" rec=""
+  if [[ "$1" == P0 ]]; then
+    if [[ -n "$ONLY" ]]; then
+      sel="--only $ONLY"
+    elif [[ "$FROM" != P0 ]]; then
+      sel="--from $FROM"
+    else
+      sel=""
+    fi
+    if [[ "$RECORD_BOOK" == 1 ]]; then rec=" --record-stack-book"; fi
+  fi
+  printf '%s' "$0 --$MODE${sel:+ $sel}$rec${ACCOUNT:+ --account $ACCOUNT}${PASSWORD_FILE:+ --password-file $PASSWORD_FILE}"
+}
+# gate_fail <phase> <reason> [hint]: the hint replaces the resume line where the generic one
+# would be wrong.
 gate_fail() {
   err "GATE FAIL at $1: $2"
   if [[ "$MODE" == confirm && "$1" == "$SENT_PHASE" ]]; then
     err "$1 has already broadcast in this run: do NOT re-run $1, it would send its transactions again"
     after_broadcast "$1"
+  elif [[ -n "${3:-}" ]]; then
+    err "$3"
+  elif [[ "$1" == P0 && "$FROM" == P0 && -z "$ONLY" ]]; then
+    err "fix it, then run again: $(resume_cmd P0)"
   else
-    err "fix it, then resume: $0 --$MODE --from $1 ${ACCOUNT:+--account $ACCOUNT}${PASSWORD_FILE:+ --password-file $PASSWORD_FILE}"
+    err "fix it, then resume: $(resume_cmd "$1")"
   fi
   exit 3
 }
@@ -462,10 +486,21 @@ count_owners() { # comma-separated list -> number of distinct non-empty entries
   count_owners_list "$1" | wc -l | tr -d ' '
 }
 
-need_env() { # name...
-  local v missing=()
+need_env() { # phase name...: the phase that needs the inputs owns the gate (and the resume)
+  local ph="$1" v missing=()
+  shift
   for v in "$@"; do [[ -n "${!v:-}" ]] || missing+=("$v"); done
-  [[ ${#missing[@]} -eq 0 ]] || gate_fail P0 "missing inputs: ${missing[*]}"
+  [[ ${#missing[@]} -eq 0 ]] || gate_fail "$ph" "missing inputs: ${missing[*]}"
+}
+
+# phase_inputs <phases csv> <last phase before this invocation's first, or empty>: the inputs
+# those phases read (phase_inputs.json; phase_inputs.py check-spec keeps it in step with the
+# scripts), checked against the environment. Prints the problems; non-zero when there are any.
+phase_inputs() {
+  local why
+  why=$("$PY" -I "$HERE/phase_inputs.py" preflight --phases "$1" --started-after "$2" --deployer "${DEPLOYER_ADDRESS:-}" 2>&1) && return 0
+  printf '%s\n' "$why" | awk 'NF { printf "%s%s", (n++ ? " | " : ""), $0 }'
+  return 1
 }
 
 check_council() { # prefix min_threshold min_owners min_delay
@@ -808,7 +843,7 @@ check_governance_onchain() {
 # sends anything. A dry run only runs it when P0 is selected.
 if should P0 || [[ "$MODE" != dry ]]; then
   should P0 || log "P0 preflight (mandatory before a $MODE run that resumes at ${ONLY:-$FROM})"
-  need_env DEPLOYER_ADDRESS GOV_OWNERS GOV_THRESHOLD GOV_MIN_DELAY GRD_OWNERS GRD_THRESHOLD GRD_MIN_DELAY
+  need_env P0 DEPLOYER_ADDRESS GOV_OWNERS GOV_THRESHOLD GOV_MIN_DELAY GRD_OWNERS GRD_THRESHOLD GRD_MIN_DELAY
   is_addr "$DEPLOYER_ADDRESS" || gate_fail P0 "DEPLOYER_ADDRESS is malformed"
   # C9: the deploy scripts read the deployer from CEREMONY_DEPLOYER_ADDRESS before
   # DEPLOYER_ADDRESS (ScriptEnv), and the generator from EMIT_DEPLOYER/DEPLOYER. A preset alias
@@ -834,19 +869,34 @@ if should P0 || [[ "$MODE" != dry ]]; then
   [[ -f "$CONTRACTS/script/$GENESIS_MEMBERSHIP_SCRIPT" ]] ||
     gate_fail P0 "contracts/script/$GENESIS_MEMBERSHIP_SCRIPT is missing (the genesis membership path, chain#331, must be merged)"
   [[ -x "$REGENESIS" || -f "$REGENESIS" ]] || gate_fail P0 "$REGENESIS is missing"
+  # Every input a phase of this invocation reads, checked before anything is sent: a phase
+  # that broadcast part-way and then stopped on a missing input could not be re-run (C10).
+  # An input that an earlier phase produces ("late") is required once that phase is behind
+  # this run; on a fresh run its own phase checks it before it sends.
+  run_phases=""
+  for p in "${PHASES[@]}"; do if should "$p"; then run_phases+="${run_phases:+,}$p"; fi; done
+  first_phase="${ONLY:-$FROM}" started_after=""
+  if [[ "$first_phase" != P0 ]]; then started_after="${PHASES[$(($(idx "$first_phase") - 1))]}"; fi
+  if inputs_why=$(phase_inputs "$run_phases" "$started_after"); then
+    log "P0 phase inputs: every input $run_phases reads is set and well formed"
+  elif [[ "$MODE" == dry ]]; then
+    log "P0 plan: a --simulate/--confirm run refuses until these phase inputs are fixed: $inputs_why"
+  else
+    gate_fail P0 "phase inputs: $inputs_why"
+  fi
   if [[ -n "${TEAM_VESTING_FILE:-}" ]]; then
     [[ -f "$TEAM_VESTING_FILE" || -f "$CONTRACTS/$TEAM_VESTING_FILE" ]] || gate_fail P0 "TEAM_VESTING_FILE not found (a path relative to contracts/, under genesis/)"
   fi
   [[ -z "${KEEP_LIST:-}" || -f "$KEEP_LIST" ]] || gate_fail P0 "KEEP_LIST not found"
   if [[ "$MODE" == confirm ]]; then
     [[ -n "$ACCOUNT" ]] || gate_fail P0 "--confirm needs --account (Foundry keystore)"
-    need_env RPC_URL EXPECTED_GENESIS_HASH TEAM_VESTING_FILE KEEP_LIST FLEET_RPCS MEMBERSHIP_GRANTOR
+    need_env P0 RPC_URL EXPECTED_GENESIS_HASH TEAM_VESTING_FILE KEEP_LIST FLEET_RPCS MEMBERSHIP_GRANTOR
     if ! is_local_rpc "$RPC_URL" && [[ "${CITRATE_ALLOW_REMOTE:-0}" != 1 ]]; then
       gate_fail P0 "RPC_URL is not loopback; a live broadcast needs CITRATE_ALLOW_REMOTE=1 as well"
     fi
   fi
   if [[ "$MODE" != dry ]]; then
-    need_env RPC_URL
+    need_env P0 RPC_URL
     cid=$("$CAST" chain-id --rpc-url "$RPC_URL" 2>/dev/null) || gate_fail P0 "RPC $RPC_URL unreachable"
     [[ "$cid" == "$EXPECTED_CHAIN_ID" ]] || gate_fail P0 "RPC chain id $cid, want $EXPECTED_CHAIN_ID"
     g0=$("$CAST" block 0 --field hash --rpc-url "$RPC_URL" 2>/dev/null) || gate_fail P0 "cannot read block 0 from $RPC_URL"
@@ -859,7 +909,8 @@ if should P0 || [[ "$MODE" != dry ]]; then
       gate_fail P0 "the block-0 timestamp from $RPC_URL is malformed"
     if [[ "$FROM" == P0 && -z "$ONLY" ]]; then
       nonce=$("$CAST" nonce "$DEPLOYER_ADDRESS" --rpc-url "$RPC_URL" 2>/dev/null) || gate_fail P0 "cannot read the deployer nonce from $RPC_URL"
-      [[ "$nonce" == 0 ]] || gate_fail P0 "deployer nonce is $nonce; a fresh ceremony starts at 0 (resume with --from instead)"
+      [[ "$nonce" == 0 ]] || gate_fail P0 "deployer nonce is $nonce; a fresh ceremony starts at 0" \
+        "the deployer has already sent $nonce transaction(s) on this chain, so this is not a fresh ceremony. If they are this ceremony's, resume it at the first phase that has not completed: $0 --$MODE --from Pn${ACCOUNT:+ --account $ACCOUNT}${PASSWORD_FILE:+ --password-file $PASSWORD_FILE} (P0 re-checks the run manifest); never start a fresh ceremony over them"
     fi
   fi
   if [[ "$MODE" != dry ]]; then
@@ -1024,7 +1075,12 @@ fi
 if should P4; then
   load_governance P4 "$([[ "$MODE" == confirm ]] && echo 1 || echo 0)"
   export DORMANT_LEDGERS_OUT="$DORMANT_REL" GENESIS_GOVERNANCE_BOOK="$GOV_REL"
-  [[ "$MODE" == dry ]] || need_env PATRONAGE_KYC_REGISTRY PATRONAGE_MEMBERSHIP
+  # P4's own inputs exist only after P1 (deployed under GOVERNANCE), so a fresh run checks them
+  # here, before P4 sends; the gate and its resume are P4's.
+  if [[ "$MODE" != dry ]]; then
+    need_env P4 PATRONAGE_KYC_REGISTRY PATRONAGE_MEMBERSHIP
+    why=$(phase_inputs P4 P3) || gate_fail P4 "phase inputs: $why"
+  fi
   log "P4 dormant ledgers → $DORMANT_BOOK"
   forge_phase P4 DeployDormantLedgers.s.sol
   if [[ "$MODE" != dry ]]; then
