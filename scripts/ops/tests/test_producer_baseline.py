@@ -246,7 +246,7 @@ printf '%s\n' "$name $*" >>"$SHIM_LOG"
 case "$name" in
   sshd)
     if [ "${1:-}" = -t ]; then exit "${SHIM_SSHD_T_RC:-0}"; fi
-    if [ "${1:-}" = -T ]; then cat "$SHIM_DIR/sshd_T"; exit 0; fi ;;
+    if [ "${1:-}" = -T ]; then exec cat "$SHIM_DIR/sshd_T"; fi ;;
   systemctl)
     if [ "${1:-}" = is-active ]; then
       for a in "$@"; do [ "$a" = ssh.socket ] && exit "${SHIM_SOCKET_ACTIVE_RC:-3}"; done
@@ -286,6 +286,9 @@ DEFAULT_SSHD_T = (
     "port 22\nlistenaddress [::]:22\nlistenaddress 0.0.0.0:22\n"
     "authorizedkeysfile .ssh/authorized_keys .ssh/authorized_keys2\n"
     "passwordauthentication no\n"
+    # Real `sshd -T` prints ~150 lines; pad well past a pipe buffer so a reader
+    # that stops early (awk exit, grep -q) makes sshd die of SIGPIPE under pipefail.
+    + "".join(f"x11displayoffset{i} 10\n" for i in range(20000))
 )
 
 
