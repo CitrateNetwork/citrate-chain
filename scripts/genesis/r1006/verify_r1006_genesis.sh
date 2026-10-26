@@ -108,11 +108,12 @@ up "$NODE" r1006 28545 CITRATE_R1006_REHEARSAL=1
 
 G=$(cast block 0 --field hash --rpc-url "$R06")
 GD=$(cast block 0 --field hash --rpc-url "$DEV")
-PIN=$("$NODE" consensus --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("r1006_genesis",""))' || true)
+PIN=$("$NODE" consensus --json 2>/dev/null | grep -oE '"r1006_genesis": "0x[0-9a-f]{64}"' | grep -oE '0x[0-9a-f]{64}' || true)
+[[ -n "$PIN" ]] || die "cannot read the binary's R1006_GENESIS from 'citrate consensus --json'"
 log "r1006 block 0 $G (devnet block 0 $GD)"
 [[ "$G" != "$GD" ]] || die "the r1006 node serves the devnet's block 0"
 [[ "$G" != 0x1dcfc4909dd9fdcb0f03c823d627e4b2032cc86bef5fc4561030d6c64b9775f1 ]] || die "the r1006 node serves r1005's block 0"
-[[ -z "$PIN" || "$PIN" == "$G" ]] || die "block 0 $G is not the binary's pinned R1006_GENESIS $PIN"
+[[ "$PIN" == "$G" ]] || die "block 0 $G is not the binary's pinned R1006_GENESIS $PIN"
 echo "R1006_BLOCK0=$G" >"$V/result.env"
 
 python3 "$HERE/compare_rpc.py" --alloc "$ALLOC" --dump "$WORK/dump.json" --devnet "$DEV" --r1006 "$R06" | tee "$V/compare.log"
@@ -126,10 +127,19 @@ fi
 
 mkdir -p "$REPO/contracts/genesis"
 cp "$WORK/book/p5-admin-book.json" "$REPO/contracts/genesis/p5-admin-book.json"
+# The admin sweep reads role STATE (hasRole, owner, admin slots) and role HISTORY (events).
+# A genesis chain has no events: its contracts were never deployed by a transaction, so the
+# history-based lines (TIMELOCK-HOLDERS, GENESIS-FLOOR's veto lookup) have nothing to read
+# here. They passed at P5 on the devnet, and compare_rpc above proved every storage slot of
+# every contract identical to that devnet, so the role state they protect is the same. The
+# gate here is the state-based handover: FACTORY-ADMIN 0 and DEPLOYER-ADMIN 0 on the r1006 node.
 (cd "$REPO/contracts" && FOUNDRY_OFFLINE=true ADDRESS_BOOK=genesis/p5-admin-book.json REQUIRE_ALL_CODE=true \
-  forge script script/CheckDeployedAdmins.s.sol --rpc-url "$R06") >"$V/admins.log" 2>&1 || { tail -30 "$V/admins.log"; die "CheckDeployedAdmins failed against the r1006 node"; }
-grep -E 'FACTORY-ADMIN|DEPLOYER-ADMIN' "$V/admins.log" | tail -4
-grep -q 'DEPLOYER-ADMIN 0' "$V/admins.log" || grep -qE 'DEPLOYER-ADMIN[^0-9]*0\b' "$V/admins.log" || die "DEPLOYER-ADMIN is not 0 (see $V/admins.log)"
+  forge script script/CheckDeployedAdmins.s.sol --rpc-url "$R06") >"$V/admins.log" 2>&1 || true
+grep -E 'FACTORY-ADMIN failures|DEPLOYER-ADMIN failures|NO-CODE entries|TIMELOCK-HOLDERS failures|GENESIS-FLOOR failures' "$V/admins.log" | sed 's/^ */  /'
+grep -q 'FACTORY-ADMIN failures: 0' "$V/admins.log" || die "FACTORY-ADMIN is not 0 on the r1006 node (see $V/admins.log)"
+grep -q 'DEPLOYER-ADMIN failures: 0' "$V/admins.log" || die "DEPLOYER-ADMIN is not 0 on the r1006 node (see $V/admins.log)"
+grep -q 'NO-CODE entries (reported): 0' "$V/admins.log" || die "a book entry has no code on the r1006 node (see $V/admins.log)"
+log "admins: FACTORY-ADMIN 0, DEPLOYER-ADMIN 0, NO-CODE 0 on the r1006 node (history-based lines: no events at genesis, see the comment)"
 
 NOTE_LEN=$(cast storage 0x000000000000000000000000000000c17a7e1006 0 --rpc-url "$R06")
 log "genesis note slot 0 = $NOTE_LEN"
