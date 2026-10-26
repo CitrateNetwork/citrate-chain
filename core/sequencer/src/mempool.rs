@@ -681,10 +681,10 @@ impl Mempool {
             let balance = read_balance(&sender);
             let incoming_cost = Self::tx_max_cost(&tx);
             let pooled_cost: u128 = {
+                let txs = self.transactions.read().await;
                 let by_sender = self.by_sender.read().await;
                 match by_sender.get(&sender) {
                     Some(hashes) => {
-                        let txs = self.transactions.read().await;
                         hashes.iter().fold(0u128, |acc, h| {
                             acc.saturating_add(
                                 txs.get(h)
