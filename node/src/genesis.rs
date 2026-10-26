@@ -279,7 +279,10 @@ mod tests {
             canonical_checkpoints(&g).is_empty(),
             "r1005's checkpoints apply to r1006's genesis"
         );
-        assert!(!canonical_checkpoints(&r1005).is_empty(), "negative control");
+        assert!(
+            !canonical_checkpoints(&r1005).is_empty(),
+            "negative control"
+        );
     }
 
     #[test]

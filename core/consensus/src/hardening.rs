@@ -301,7 +301,9 @@ pub fn genesis_rule_pin(
     }
     let on_release_genesis = match genesis {
         None => true,
-        Some(g) => RELEASE_GENESIS.iter().any(|(c, r)| *c == chain_id && r == g),
+        Some(g) => RELEASE_GENESIS
+            .iter()
+            .any(|(c, r)| *c == chain_id && r == g),
     };
     if is_release_network(chain_id) && on_release_genesis {
         Some(None)
@@ -1014,7 +1016,11 @@ mod tests {
         );
         assert!(RELEASE_GENESIS.contains(&(40204, R1006_GENESIS)));
         for (name, h) in R1006_ACTIVATIONS.entries() {
-            assert_eq!(h, Some(0), "{name}: the owner set every new rule to 0 on r1006");
+            assert_eq!(
+                h,
+                Some(0),
+                "{name}: the owner set every new rule to 0 on r1006"
+            );
         }
         let names: Vec<&str> = R1006_ACTIVATIONS.entries().iter().map(|e| e.0).collect();
         assert_eq!(
@@ -1047,7 +1053,11 @@ mod tests {
         }
         let r = rules_for_genesis(40204, &R1006_GENESIS).expect("r1006 has rules");
         assert!(r.entries().iter().all(|(_, h)| *h == Some(0)), "{r:?}");
-        assert_eq!(rules_for_genesis(40204, &[0x42; 32]), None, "unknown genesis");
+        assert_eq!(
+            rules_for_genesis(40204, &[0x42; 32]),
+            None,
+            "unknown genesis"
+        );
         assert_eq!(
             rules_for_genesis(1337, &R1006_GENESIS),
             None,
@@ -1064,21 +1074,36 @@ mod tests {
             Some(None),
             "r1005: unset, per-node refused"
         );
-        assert_eq!(genesis_rule_pin(40204, None, exact), Some(None), "no genesis known");
+        assert_eq!(
+            genesis_rule_pin(40204, None, exact),
+            Some(None),
+            "no genesis known"
+        );
         assert_eq!(
             genesis_rule_pin(40204, Some(&R1006_GENESIS), exact),
             Some(Some(0)),
             "r1006: 0"
         );
-        assert_eq!(genesis_rule_pin(40204, Some(&[0x42; 32]), exact), None, "unknown: local");
-        assert_eq!(genesis_rule_pin(1337, None, exact), None, "dev chain: local");
+        assert_eq!(
+            genesis_rule_pin(40204, Some(&[0x42; 32]), exact),
+            None,
+            "unknown: local"
+        );
+        assert_eq!(
+            genesis_rule_pin(1337, None, exact),
+            None,
+            "dev chain: local"
+        );
         let picks: [fn(&GenesisActivations) -> Option<u64>; 3] = [
             |a| a.vrf_canonical_encoding,
             |a| a.storage_root_hardening,
             |a| a.supply_hardening,
         ];
         for pick in picks {
-            assert_eq!(genesis_rule_pin(40204, Some(&R1006_GENESIS), pick), Some(Some(0)));
+            assert_eq!(
+                genesis_rule_pin(40204, Some(&R1006_GENESIS), pick),
+                Some(Some(0))
+            );
             assert_eq!(genesis_rule_pin(40204, Some(&r1005), pick), Some(None));
         }
     }

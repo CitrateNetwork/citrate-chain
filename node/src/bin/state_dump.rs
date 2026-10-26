@@ -80,10 +80,7 @@ fn main() -> anyhow::Result<()> {
             o.insert("nonce".into(), json!(0));
             o
         });
-        let m: Map<String, Value> = s
-            .iter()
-            .map(|(k, v)| (hex0x(k), json!(hex0x(v))))
-            .collect();
+        let m: Map<String, Value> = s.iter().map(|(k, v)| (hex0x(k), json!(hex0x(v)))).collect();
         o.insert("storage".into(), Value::Object(m));
     }
 

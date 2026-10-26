@@ -188,7 +188,11 @@ pub fn resolve_for_genesis(
         Err(std::env::VarError::NotPresent) => None,
         Err(e) => return Err(format!("{EXACT_CREATE_CODE_ENV}: {e}")),
     };
-    resolve(pin_for_genesis(chain_id, genesis), env_raw.as_deref(), config_value)
+    resolve(
+        pin_for_genesis(chain_id, genesis),
+        env_raw.as_deref(),
+        config_value,
+    )
 }
 
 /// Resolve and publish process-wide. The node calls this once at start-up, after it knows

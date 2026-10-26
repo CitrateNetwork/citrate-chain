@@ -248,7 +248,10 @@ fn parse_alloc() -> Result<(AllocFile, Vec<GenesisAccount>), GenesisError> {
     for a in &f.accounts {
         let addr = address(&a.address)?;
         if prev.is_some_and(|p| p >= addr.0) {
-            return Err(invalid(format!("{}: accounts not strictly sorted", a.address)));
+            return Err(invalid(format!(
+                "{}: accounts not strictly sorted",
+                a.address
+            )));
         }
         prev = Some(addr.0);
         let code = match &a.code {
@@ -288,10 +291,14 @@ pub fn readiness() -> Result<Readiness, GenesisError> {
             let proxy = address(&o.proxy)?;
             let implementation = address(&o.implementation)?;
             if proxy != ORANGESEED_ADDRESS {
-                return Err(invalid("the OrangeSeed proxy is not at its confirmed address"));
+                return Err(invalid(
+                    "the OrangeSeed proxy is not at its confirmed address",
+                ));
             }
             if !has_code(&proxy) || !has_code(&implementation) {
-                return Err(invalid("the OrangeSeed record names an account without code"));
+                return Err(invalid(
+                    "the OrangeSeed record names an account without code",
+                ));
             }
             true
         }
@@ -320,7 +327,9 @@ impl GenesisConfig {
         if let Some(reg) = &v.registry {
             let vr = address(&f.validator_registry)?;
             if v.validator_registry.as_deref().map(address).transpose()? != Some(vr) {
-                return Err(invalid("validators.json was filled for another ValidatorRegistry"));
+                return Err(invalid(
+                    "validators.json was filled for another ValidatorRegistry",
+                ));
             }
             let acct = ceremony
                 .iter_mut()
@@ -380,9 +389,7 @@ impl GenesisConfig {
         let pre = cfg
             .total_preallocation()
             .ok_or(GenesisError::ExceedsSupply)?;
-        cfg.mining_pool_max = supply
-            .checked_sub(pre)
-            .ok_or(GenesisError::ExceedsSupply)?;
+        cfg.mining_pool_max = supply.checked_sub(pre).ok_or(GenesisError::ExceedsSupply)?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -394,7 +401,10 @@ pub fn genesis_block_hash(cfg: &GenesisConfig) -> Result<[u8; 32], GenesisError>
     use citrate_execution::executor::Executor;
     use citrate_execution::state::state_db::StateDB;
     use std::sync::Arc;
-    let ex = Arc::new(Executor::with_chain_id(Arc::new(StateDB::new()), cfg.chain_id));
+    let ex = Arc::new(Executor::with_chain_id(
+        Arc::new(StateDB::new()),
+        cfg.chain_id,
+    ));
     let root = crate::genesis::initialize_shared_genesis_state(&ex, cfg)?;
     let mut b =
         crate::genesis::create_canonical_genesis_block(crate::genesis::CANONICAL_GENESIS_TIMESTAMP);
@@ -486,7 +496,10 @@ mod tests {
             assert_eq!((g.balance, g.nonce), (a.balance, a.nonce));
         }
         let mut seen = HashSet::new();
-        assert!(cfg.accounts.iter().all(|a| seen.insert(a.address.0)), "no duplicates");
+        assert!(
+            cfg.accounts.iter().all(|a| seen.insert(a.address.0)),
+            "no duplicates"
+        );
     }
 
     #[test]

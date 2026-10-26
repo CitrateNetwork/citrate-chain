@@ -501,7 +501,9 @@ async fn main() -> Result<()> {
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
             // A config on the r1006 profile is bound to the r1006 genesis this build
             // compiles: its genesis-pinned rules apply and the fingerprint is v4.
-            let r1006 = file_cfg.as_ref().and_then(|c| c.chain.genesis_profile.as_deref())
+            let r1006 = file_cfg
+                .as_ref()
+                .and_then(|c| c.chain.genesis_profile.as_deref())
                 == Some(genesis::R1006_PROFILE);
             let (pba_height, exact_height) = if r1006 {
                 let a = citrate_consensus::hardening::R1006_ACTIVATIONS;
@@ -531,9 +533,12 @@ async fn main() -> Result<()> {
             } else {
                 // No data directory here: the genesis is not known, so a release chain id
                 // resolves as its release genesis (unset), any other chain locally.
-                let (exact, _) =
-                    citrate_execution::exact_code::resolve_for_genesis(chain_id, None, exact_configured)
-                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                let (exact, _) = citrate_execution::exact_code::resolve_for_genesis(
+                    chain_id,
+                    None,
+                    exact_configured,
+                )
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
                 (resolved.height, exact)
             };
             let manifest = consensus_manifest::ConsensusManifest::for_activations(
@@ -1475,15 +1480,17 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         drop(probe);
         g
     };
-    let genesis_acts =
-        running_genesis.and_then(|g| citrate_consensus::hardening::rules_for_genesis(config.chain.chain_id, &g));
+    let genesis_acts = running_genesis
+        .and_then(|g| citrate_consensus::hardening::rules_for_genesis(config.chain.chain_id, &g));
     if config.chain.genesis_profile.as_deref() == Some(genesis::R1006_PROFILE)
         && genesis_acts.is_none()
     {
         anyhow::bail!(
             "[chain] genesis_profile = \"r1006\" but this data directory's block 0 ({}) is not \
              the r1006 genesis this build compiles ({}). Use a fresh data directory.",
-            running_genesis.map(hex::encode).unwrap_or_else(|| "missing".into()),
+            running_genesis
+                .map(hex::encode)
+                .unwrap_or_else(|| "missing".into()),
             hex::encode(citrate_consensus::hardening::R1006_GENESIS)
         );
     }
@@ -1505,8 +1512,13 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             let wired = citrate_consensus::hardening::GenesisActivations::WIRED.contains(&name);
             info!(
                 "Genesis-pinned rule {name}: {} ({})",
-                h.map(|h| format!("from height {h}")).unwrap_or_else(|| "not scheduled".into()),
-                if wired { "enforced by this build" } else { "recorded; the rule is not in this build" }
+                h.map(|h| format!("from height {h}"))
+                    .unwrap_or_else(|| "not scheduled".into()),
+                if wired {
+                    "enforced by this build"
+                } else {
+                    "recorded; the rule is not in this build"
+                }
             );
         }
     }

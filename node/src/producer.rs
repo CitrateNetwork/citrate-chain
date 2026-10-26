@@ -6964,15 +6964,24 @@ mod mine_on_demand_tests {
 
     #[test]
     fn only_a_loopback_default_profile_devnet_may_mine_on_demand() {
-        assert_eq!(check_mine_on_demand(None, Some("testnet_beta"), false), Ok(false));
-        assert_eq!(check_mine_on_demand(Some("1"), Some("default"), true), Ok(true));
+        assert_eq!(
+            check_mine_on_demand(None, Some("testnet_beta"), false),
+            Ok(false)
+        );
+        assert_eq!(
+            check_mine_on_demand(Some("1"), Some("default"), true),
+            Ok(true)
+        );
         for (p, lo) in [
             (Some("testnet_beta"), true),
             (Some("r1006"), true),
             (None, true),
             (Some("default"), false),
         ] {
-            assert!(check_mine_on_demand(Some("1"), p, lo).is_err(), "{p:?} {lo}");
+            assert!(
+                check_mine_on_demand(Some("1"), p, lo).is_err(),
+                "{p:?} {lo}"
+            );
         }
         assert!(check_mine_on_demand(Some("yes"), Some("default"), true).is_err());
     }

@@ -715,7 +715,10 @@ mod tests {
             ..sample(true)
         };
         let pre = fingerprint_preimage(&bound);
-        assert!(pre.starts_with("citrate-consensus-v4\ngit_sha=0123abc\n"), "{pre}");
+        assert!(
+            pre.starts_with("citrate-consensus-v4\ngit_sha=0123abc\n"),
+            "{pre}"
+        );
         assert!(pre.ends_with(
             "snapshot_lag=200\ngenesis_profile=r1006\ngenesis_hash=0xabc\n\
              genesis_rules=pba_hardening:0\n"
@@ -733,9 +736,18 @@ mod tests {
         seen.insert(base.clone());
         for v in [
             b,
-            GenesisBinding { profile: "testnet_beta", ..b },
-            GenesisBinding { genesis_hash: "0xabd", ..b },
-            GenesisBinding { genesis_rules: "pba_hardening:1", ..b },
+            GenesisBinding {
+                profile: "testnet_beta",
+                ..b
+            },
+            GenesisBinding {
+                genesis_hash: "0xabd",
+                ..b
+            },
+            GenesisBinding {
+                genesis_rules: "pba_hardening:1",
+                ..b
+            },
         ] {
             let f = fingerprint_of(&FingerprintInputs {
                 genesis_binding: Some(v),
@@ -753,13 +765,14 @@ mod tests {
         let r1005 = m.clone().bound("testnet_beta", &RELEASE_GENESIS[0].1);
         let r1006 = m.clone().bound("r1006", &R1006_GENESIS);
         assert_ne!(r1005.fingerprint, r1006.fingerprint);
-        assert_ne!(r1005.fingerprint, m.fingerprint, "bound differs from unbound");
+        assert_ne!(
+            r1005.fingerprint, m.fingerprint,
+            "bound differs from unbound"
+        );
         assert_eq!(r1005.genesis_rules.as_deref(), Some("-"));
-        assert!(r1006
-            .genesis_rules
-            .as_deref()
-            .is_some_and(|r| r.contains("exact_create_code:0")
-                && r.contains("vrf_canonical_encoding:0")));
+        assert!(r1006.genesis_rules.as_deref().is_some_and(
+            |r| r.contains("exact_create_code:0") && r.contains("vrf_canonical_encoding:0")
+        ));
     }
 
     #[test]
