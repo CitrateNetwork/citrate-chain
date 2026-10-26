@@ -176,6 +176,15 @@ if [ "$RC" -eq 0 ] && landed && [ "$(ci_runs)" -eq 1 ]; then
 else
   bad "rc=$RC landed=$(landed && echo y || echo n) runs=$(ci_runs)"
 fi
+# Default settings (no LOCAL_CI_HOOK_MAX_SECS): the hook must run without
+# shell errors and its built-in limit must be a number.
+if grep -qiE "expression expected|syntax error|unbound variable|command not found" <<<"$OUT"; then
+  bad "hook printed a shell error with default settings: $OUT"
+elif ! grep -qE 'LOCAL_CI_HOOK_MAX_SECS:-[0-9]+\}' "$REPO/.git/hooks/pre-push"; then
+  bad "hook default LOCAL_CI_HOOK_MAX_SECS is not a number"
+else
+  ok "default settings: no shell errors, numeric idle limit"
+fi
 
 new_case "hook: CI fails"
 FAKE_SSH_IDLE=60 STANDIN_SLEEP=0 STANDIN_RC=1 push origin main

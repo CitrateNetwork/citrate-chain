@@ -6,7 +6,8 @@
 # git runs the pre-push hook AFTER it has connected to the remote: over ssh
 # the session is open, the remote has advertised its refs, and it is waiting
 # for the pack. While the hook runs local CI (minutes, mostly clippy) that
-# session sits idle. If the remote or anything in between drops it, git
+# session sits idle. GitHub closes an idle receive-pack session after about
+# 6 minutes (362s measured 2026-10-26; a cold --fast run took 733s). Then git
 # finishes the hook, the hook prints LOCAL CI PASSED, git writes the pack into
 # the closed connection and dies of SIGPIPE: exit 141, nothing pushed.
 #

@@ -84,7 +84,10 @@ case "$URL" in
   /*|./*|../*|file://*|http://*|https://*) remote_kind=local-or-http ;;
   *) remote_kind=ssh ;;
 esac
-max="${LOCAL_CI_HOOK_MAX_SECS:-__MAX_SECS__}"
+# GitHub closed an idle git-receive-pack ssh session after 362s when measured
+# on 2026-10-26, and a cold --fast run took 733s (clippy twice), so warn
+# from 300s.
+max="${LOCAL_CI_HOOK_MAX_SECS:-300}"
 if [ "$remote_kind" = ssh ] && [ "$elapsed" -gt "$max" ]; then
   echo
   echo "pre-push: local CI passed in ${elapsed}s with the connection to the remote"
