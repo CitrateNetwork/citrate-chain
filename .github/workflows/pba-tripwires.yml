@@ -30,3 +30,9 @@ jobs:
         run: scripts/ci/check_pba_exec_tripwires.sh --self-test
       - name: CHAIN-EXEC tripwires (signature setting, node feature set, mempool expiry, metrics bind)
         run: scripts/ci/check_pba_exec_tripwires.sh
+      # RUSTSEC-2026-0387: every Cargo.lock stays on the elliptic-curve 0.14
+      # line (k256/p256/p384 0.14, ecdsa 0.17, crypto-bigint >= 0.7.6).
+      - name: Curve-line tripwire self-test
+        run: python3 scripts/ci/check_curve_line.py --self-test
+      - name: Curve-line tripwire (no 0.13 curve crates in any lockfile)
+        run: python3 scripts/ci/check_curve_line.py
