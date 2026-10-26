@@ -29,6 +29,11 @@
 #   --confirm          broadcasts. A non-loopback RPC_URL also needs CITRATE_ALLOW_REMOTE=1.
 #   --from Pn          resume at phase n after a fix (no phase is re-run blindly).
 #   --only Pn          run a single phase.
+#   --record-book      with --confirm --only P3 or P4 (or P2): the phase has broadcast but its
+#                      book did not record (the gate after the step failed). Sends nothing:
+#                      runs the phase's book checks against this run's broadcasts of that step
+#                      and records the book the step wrote (C5). The only way back into P3/P4
+#                      once they sent.
 #   --record-stack-book  with --confirm --only P2: P2 has broadcast but its gate failed (or
 #                      regenesis.sh stopped after the last broadcast). Sends nothing: rebuilds
 #                      the book from this run's P2 broadcasts, runs the P2 gate against the
@@ -175,6 +180,7 @@ ONLY=""
 ACCOUNT=""
 PASSWORD_FILE=""
 RECORD_BOOK=0
+RECORD_FLAG="" # the spelling given (--record-book or --record-stack-book), for the hints
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --simulate) MODE=simulate; shift ;;
@@ -186,7 +192,8 @@ while [[ $# -gt 0 ]]; do
     --password-file) PASSWORD_FILE="${2:-}"; shift 2 ;;
     # Never echo the value: it is the password.
     --password | --password=*) die "a keystore password on the command line is refused; pass --password-file PATH" 1 ;;
-    --record-stack-book) RECORD_BOOK=1; shift ;;
+    --record-stack-book) RECORD_BOOK=1; RECORD_FLAG=--record-stack-book; shift ;;
+    --record-book) RECORD_BOOK=1; RECORD_FLAG=--record-book; shift ;;
     --private-key | --private-key=*) die "raw private keys are refused; sign with --account (Foundry keystore)" 1 ;;
     -h | --help)
       sed -n '2,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//' >&2
@@ -237,8 +244,11 @@ idx() {
 }
 [[ $(idx "$FROM") -ge 0 ]] || die "--from must be one of ${PHASES[*]}" 1
 [[ -z "$ONLY" || $(idx "$ONLY") -ge 0 ]] || die "--only must be one of ${PHASES[*]}" 1
-if [[ "$RECORD_BOOK" == 1 && ( "$MODE" != confirm || "$ONLY" != P2 ) ]]; then
+if [[ "$RECORD_FLAG" == --record-stack-book && ( "$MODE" != confirm || "$ONLY" != P2 ) ]]; then
   die "--record-stack-book needs --confirm --only P2 (it records the book of a P2 that has broadcast)" 1
+fi
+if [[ "$RECORD_FLAG" == --record-book && ( "$MODE" != confirm || ! " P2 P3 P4 " == *" ${ONLY:-none} "* ) ]]; then
+  die "--record-book needs --confirm --only P2, P3 or P4 (it records the book of a phase that has broadcast)" 1
 fi
 should() {
   if [[ -n "$ONLY" ]]; then [[ "$1" == "$ONLY" ]]; else [[ $(idx "$1") -ge $(idx "$FROM") ]]; fi
@@ -258,8 +268,15 @@ after_broadcast() {
       fi
       ;;
     # P3/P4 record their output book themselves, and --confirm P5 refuses an unrecorded one, so
-    # there is no safe resume past them without it.
-    *) err "stop and escalate (runbook §6.4): read contracts/broadcast/ and the chain. $1's output book is recorded only by $1, so no later phase can go on without it" ;;
+    # the way on is the record step (it sends nothing), never past the phase without it.
+    P3 | P4)
+      if [[ -f "${RUN_MANIFEST:-}" ]] && manifest_has "$RUN_MANIFEST" "$(phase_record "$1")"; then
+        err "$1's book is recorded; resume after $1: $0 --confirm --from $(next_phase "$1")$acct"
+      else
+        err "read contracts/broadcast/ and the chain (runbook §6.4); if the step did not complete, stop and escalate. Once the book in $OUT_REL/ is the one the step wrote, record it from this run's broadcasts (this sends nothing): $0 --confirm --only $1 --record-book$acct; then resume with --from $(next_phase "$1")"
+      fi
+      ;;
+    *) err "stop and escalate (runbook §6.4): read contracts/broadcast/ and the chain before anything else" ;;
   esac
 }
 # resume_cmd <phase>: the command that re-enters this run at <phase> once the cause is fixed.
@@ -276,7 +293,7 @@ resume_cmd() {
     else
       sel=""
     fi
-    if [[ "$RECORD_BOOK" == 1 ]]; then rec=" --record-stack-book"; fi
+    if [[ "$RECORD_BOOK" == 1 ]]; then rec=" $RECORD_FLAG"; fi
   fi
   printf '%s' "$0 --$MODE${sel:+ $sel}$rec${ACCOUNT:+ --account $ACCOUNT}${PASSWORD_FILE:+ --password-file $PASSWORD_FILE}"
 }
@@ -768,6 +785,8 @@ stale_books() {
   for pb in "P1:$GOV_BOOK" "P3:$VEST_BOOK" "P4:$DORMANT_BOOK"; do
     ph="${pb%%:*}" book="${pb#*:}"
     should "$ph" && [[ -e "$book" ]] || continue
+    # The record step records the book its phase wrote: it is expected to be there.
+    [[ "$RECORD_BOOK" == 1 && "$ph" == "$ONLY" ]] && continue
     rc=0
     why=$(phase_done "$ph") || rc=$?
     if [[ $rc -eq 0 ]]; then
@@ -789,7 +808,7 @@ stale_books() {
 # sends_once <phase>: the guard every broadcasting phase runs before it sends anything (C10).
 # --simulate/--confirm: refused once the run manifest records the phase's output. --confirm:
 # also refused while this run's broadcasts of the phase exist, except for the record step
-# (--record-stack-book), which sends nothing and needs them. On a pass the phase may broadcast
+# (--record-book / --record-stack-book), which sends nothing and needs them. On a pass the phase may broadcast
 # (run_broadcast); the record step never may.
 SENDS_ONCE_OK=""
 sent=""
@@ -810,7 +829,7 @@ sends_once() {
   if [[ "$MODE" == confirm ]]; then
     sent=$(phase_sent "$ph") || gate_fail "$ph" "cannot read this run's broadcast records under contracts/broadcast/"
     if [[ "$RECORD_BOOK" == 1 ]]; then
-      [[ -n "$sent" ]] || gate_fail "$ph" "--record-stack-book: no $ph broadcast from this run is recorded, so there is no book to record (run $ph)"
+      [[ -n "$sent" ]] || gate_fail "$ph" "the record step: no $ph broadcast from this run is recorded, so there is no book to record (run $ph)"
       SENT_PHASE="$ph"
       return 0
     fi
@@ -1219,8 +1238,12 @@ if should P3; then
   fi
   export TEAM_VESTING_FILE="${TEAM_VESTING_FILE:-genesis/team-vesting.input.json}" TEAM_VESTING_OUT="$VEST_REL"
   sends_once P3
-  log "P3 team vesting → $VEST_BOOK"
-  forge_phase P3 DeployTeamVesting.s.sol
+  if [[ "$RECORD_BOOK" == 1 ]]; then
+    log "P3 record step: nothing is sent; the book is checked against this run's broadcasts ($(printf '%s' "$sent" | paste -sd, -)) and recorded"
+  else
+    log "P3 team vesting → $VEST_BOOK"
+    forge_phase P3 DeployTeamVesting.s.sol
+  fi
   if [[ "$MODE" != dry ]]; then record_output_book P3 teamVesting "$VEST_BOOK" DeployTeamVesting.s.sol; fi
 fi
 
@@ -1235,8 +1258,12 @@ if should P4; then
     need_env P4 PATRONAGE_KYC_REGISTRY PATRONAGE_MEMBERSHIP
     why=$(phase_inputs P4 P3) || gate_fail P4 "phase inputs: $why"
   fi
-  log "P4 dormant ledgers → $DORMANT_BOOK"
-  forge_phase P4 DeployDormantLedgers.s.sol
+  if [[ "$RECORD_BOOK" == 1 ]]; then
+    log "P4 record step: nothing is sent; the book is checked against this run's broadcasts ($(printf '%s' "$sent" | paste -sd, -)) and recorded"
+  else
+    log "P4 dormant ledgers → $DORMANT_BOOK"
+    forge_phase P4 DeployDormantLedgers.s.sol
+  fi
   if [[ "$MODE" != dry ]]; then
     # The book also names the governance it was deployed under: it must be this run's.
     record_output_book P4 dormantLedgers "$DORMANT_BOOK" DeployDormantLedgers.s.sol \

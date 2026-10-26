@@ -2015,8 +2015,8 @@ expect "ceremony #363: a P4 book naming another governance than the run's fails"
 # and sends nothing (C10); the way back in is the record step, --confirm --only Pn --record-book,
 # which sends nothing, rebuilds nothing, and runs the same book checks against this run's
 # broadcasts before recording the book. bcount counts the broadcasting forge calls.
-for c in "P3:teamVesting:team-vesting.json:FAKE_P3_BOOK:$VEST_OK:vest_bc" "P4:dormantLedgers:dormant-ledgers.json:FAKE_P4_BOOK:$DORM_OK:dorm_bc"; do
-  IFS=: read -r ph key file bookvar okbook bcfn <<<"$c"
+for c in "P3:teamVesting:team-vesting.json:$VEST_OK:vest_bc" "P4:dormantLedgers:dormant-ledgers.json:$DORM_OK:dorm_bc"; do
+  IFS=: read -r ph key file okbook bcfn <<<"$c"
   ob_reset
   "$bcfn"
   out=$("${OBENV[@]}" bash "$CE" --confirm --only "$ph" --account deployer 2>&1)
