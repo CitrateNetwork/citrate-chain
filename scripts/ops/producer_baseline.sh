@@ -166,6 +166,15 @@ put_file() {
   chown "$owner" "$path"
 }
 
+# ensure_dir OWNER GROUP MODE PATH: install -d, and record it in CHANGED when the
+# directory was missing or its owner, group or mode differed.
+ensure_dir() {
+  local o="$1" g="$2" m="$3" d="$R$4" before
+  before="$(stat -c '%U:%G %a' "$d" 2>/dev/null || true)"
+  install -d -o "$o" -g "$g" -m "$m" "$d"
+  if [ "$(stat -c '%U:%G %a' "$d")" != "$before" ]; then CHANGED+=("$4"); fi
+}
+
 apt_noninteractive() {
   DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get -y \
     -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@"
@@ -303,9 +312,9 @@ apply_user_dirs() {
   # install -d follows a symlink and would chown/chmod its target.
   refuse_symlinks
   # root-owned parent: the citrate user cannot swap data for a link.
-  install -d -o root -g citrate -m 0750 "$R/var/lib/citrate"
-  install -d -o citrate -g citrate -m 0700 "$R/var/lib/citrate/data"
-  install -d -o root -g root -m 0755 "$R/etc/citrate"
+  ensure_dir root citrate 0750 /var/lib/citrate
+  ensure_dir citrate citrate 0700 /var/lib/citrate/data
+  ensure_dir root root 0755 /etc/citrate
   note "citrate uid $(id -u citrate); /var/lib/citrate root:citrate 0750; data 0700 (contents never read)"
   cleanup_legacy_opt
 }
