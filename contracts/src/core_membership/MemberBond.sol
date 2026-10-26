@@ -6,6 +6,12 @@ import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.s
 import {ValidatorRegistry} from "../ValidatorRegistry.sol";
 import {CitrateMemberSBT} from "./CitrateMemberSBT.sol";
 
+/// The vault's treasury getter (MembershipStakeVault.treasury); an interface so this file does
+/// not import the vault, which imports this one.
+interface IMembershipTreasury {
+    function treasury() external view returns (address);
+}
+
 /// @title MemberBond — M-2.0, the per-member validator bond escrow
 ///
 /// One minimal-proxy clone per member, deployed CREATE2 by
@@ -24,9 +30,18 @@ import {CitrateMemberSBT} from "./CitrateMemberSBT.sol";
 /// ## Who controls what
 ///
 /// - **Principal is the vault's concern**: it funds the bond and the bond alone
-///   decides when it may leave, under the lock + KYC gates below. Neither the
-///   vault nor the owner can pull it out; there is no sweep, no arbitrary call,
-///   no selfdestruct, and every value-out path pays `member` and nobody else.
+///   decides when it may leave. Neither the vault nor the owner can pull it out;
+///   there is no sweep, no arbitrary call, no selfdestruct. Exactly two paths
+///   move principal, and they are exclusive:
+///     * ACTIVATED (bonded) principal leaves only to `member`, through the
+///       registry's normal exit (`requestRelease` + `withdrawToMember`), under
+///       the lock + KYC gates below.
+///     * Principal of a bond that was NEVER activated never reaches the member
+///       (owner decision 2026-10-19, fed#331: unactivated grants return to the
+///       treasury). Activation is open only inside the lock; after it, the
+///       vault's governance-set `treasury`, and only it, may
+///       `reclaimUnactivated`; the principal goes to the treasury and the bond
+///       can never be activated afterwards.
 /// - **The proposer key is the member's**: only they can prove control of it, so
 ///   only they can `activate`. The vault deliberately cannot.
 /// - **Rewards are the member's** (owner-confirmed, #139 §"What I need from the
@@ -89,6 +104,8 @@ contract MemberBond is Initializable {
     bool public activated;
     /// True once `requestRelease` has started the unbond.
     bool public releaseRequested;
+    /// True once the treasury reclaimed the principal of this never-activated bond.
+    bool public reclaimed;
 
     // ============================================================
     // Errors / Events
@@ -104,6 +121,11 @@ contract MemberBond is Initializable {
     error AlreadyReleasing();
     error PayoutFailed();
     error UnsolicitedTransfer();
+    error NotTreasury();
+    error TreasuryNotSet();
+    error TreasuryIsMember();
+    error AlreadyReclaimed();
+    error ActivationWindowClosed();
 
     event BondInitialized(
         address indexed member,
@@ -116,6 +138,7 @@ contract MemberBond is Initializable {
     event RewardsForwarded(address indexed member, uint256 amount);
     event ReleaseRequested(address indexed member, bytes32 indexed pubkey, uint256 amount);
     event PrincipalWithdrawn(address indexed member, uint256 amount);
+    event UnactivatedReclaimed(address indexed treasury, address indexed member, uint256 amount);
 
     // ============================================================
     // Modifiers
@@ -178,7 +201,8 @@ contract MemberBond is Initializable {
 
     /// Bond the principal into `ValidatorRegistry` under the member's proposer
     /// key. Member-callable only, through the app's SignatureCeremony, once the
-    /// node is synced.
+    /// node is synced, and only while the bond is still locked (the activation
+    /// window closes at unlock).
     ///
     /// Grant and bond are necessarily two transactions: at grant time — the
     /// moment of payment — the member has no node and no proposer key. The
@@ -187,6 +211,12 @@ contract MemberBond is Initializable {
     /// exists.
     function activate(bytes32 pubkey_, bytes calldata ed25519Sig) external onlyMember {
         if (activated) revert AlreadyActivated();
+        // A reclaimed bond (see `reclaimUnactivated`) has no principal left to bond.
+        if (reclaimed) revert AlreadyReclaimed();
+        // The activation window closes at unlock (either leg, exactly `isUnlocked`): a grant
+        // not activated inside the lock is reclaimable by the treasury only, so it can never
+        // be activated at the end of the year and exited to the member.
+        if (isUnlocked()) revert ActivationWindowClosed();
         activated = true;
         pubkey = pubkey_;
 
@@ -248,6 +278,39 @@ contract MemberBond is Initializable {
         emit PrincipalWithdrawn(member, amount);
     }
 
+    /// Return the principal of a bond that was never activated to the treasury.
+    ///
+    /// Owner decision 2026-10-19 (fed#331): an unactivated grant is not the
+    /// member's to take; only activated, staked bonds pay out, under the normal
+    /// exit rules. A member who never runs a node therefore has no exit for the
+    /// principal, and after the lock the treasury may take it back.
+    ///
+    /// Callable only by the vault's `treasury` (set by governance, two-step),
+    /// only once the lock has run (either leg), only while the bond is not
+    /// activated, and only once. KYC is not consulted: no person is paid. The
+    /// treasury may never be the member. Sets `reclaimed` before the transfer,
+    /// so `activate` is closed afterwards and the vault's permissionless
+    /// `recordReclaim` detaches attribution.
+    function reclaimUnactivated() external {
+        address treasury = IMembershipTreasury(vault).treasury();
+        if (treasury == address(0)) revert TreasuryNotSet();
+        if (msg.sender != treasury) revert NotTreasury();
+        if (treasury == member) revert TreasuryIsMember();
+        if (activated) revert AlreadyActivated();
+        if (reclaimed) revert AlreadyReclaimed();
+        if (!isUnlocked()) revert StillLocked();
+        reclaimed = true;
+
+        // `receive` admits only the registry, which never pays a bond that did
+        // not bond, so the whole balance is the principal.
+        uint256 amount = address(this).balance;
+        if (amount > 0) {
+            (bool ok,) = payable(treasury).call{value: amount}("");
+            if (!ok) revert PayoutFailed();
+        }
+        emit UnactivatedReclaimed(treasury, member, amount);
+    }
+
     // ============================================================
     // Views
     // ============================================================
@@ -272,7 +335,7 @@ contract MemberBond is Initializable {
     // ============================================================
 
     function _payMember(uint256 amount) internal {
-        (bool ok, ) = payable(member).call{value: amount}("");
+        (bool ok,) = payable(member).call{value: amount}("");
         if (!ok) revert PayoutFailed();
     }
 
