@@ -498,7 +498,7 @@ class ApplyStepsTest(ShimTestCase):
         target = self.sb.root / "elsewhere"
         target.mkdir(mode=0o755)
         target.chmod(0o755)
-        for link in ("var/lib/citrate/data", "etc/citrate", "var/lib/citrate"):
+        for link in ("var/lib/citrate", "var/lib/citrate/data", "etc/citrate"):
             p = self.sb.root / link
             p.parent.mkdir(parents=True, exist_ok=True)
             p.symlink_to(target)

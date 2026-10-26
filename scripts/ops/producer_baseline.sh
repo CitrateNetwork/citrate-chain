@@ -19,18 +19,27 @@
 #   ssh root@HOST 'bash -s -- apply' < scripts/ops/producer_baseline.sh
 #
 # What `apply` does:
+#   - preflight, before any change: refuse unless every port sshd listens on
+#     (`sshd -T`, and ssh.socket if active) is 22, the port the firewall allows;
+#     unless the account running this (root, or $SUDO_USER) has at least one
+#     usable authorized key; and when /var/lib/citrate, its data dir or
+#     /etc/citrate is a symlink.
 #   - apt update/upgrade; unattended-upgrades (security origins only, no auto-reboot)
-#   - `citrate` system user (no login shell), /var/lib/citrate/data (0700, owned by
-#     citrate; the node mints its keys there) and /etc/citrate: the runbook layout.
+#   - `citrate` system user (no login shell), /var/lib/citrate (root:citrate 0750),
+#     /var/lib/citrate/data (0700, owned by citrate; the node mints its keys there)
+#     and /etc/citrate: the runbook layout.
 #     Empty /opt/citrate dirs from an earlier layout are removed with rmdir only.
 #   - journald capped (SystemMaxUse=1G, SystemKeepFree=10G); logrotate size cap
 #     (maxsize 200M) run hourly. Two chain halts came from a full disk.
 #   - 4 GiB swapfile, vm.swappiness=10
 #   - chrony time sync
-#   - sshd: keys only, PermitRootLogin prohibit-password, no passwords
-#   - ufw as runbook section 2: deny incoming, allow outgoing, allow 22/tcp and
-#     30303/tcp+udp (SSH is allowed BEFORE ufw is enabled). RPC/metrics stay closed.
-#   - DigitalOcean monitoring agent (verified; installed if missing)
+#   - sshd: keys only, PermitRootLogin prohibit-password, no passwords; reloaded on
+#     every run once `sshd -t` accepts the config
+#   - ufw as runbook section 2: allow 22/tcp and 30303/tcp+udp first, then deny
+#     incoming / allow outgoing, then enable (only once the 22/tcp rule is
+#     confirmed). RPC/metrics stay closed.
+#   - DigitalOcean monitoring agent, installed if missing from DO's apt repo; its
+#     signing key is checked against a pinned fingerprint before apt trusts it.
 #   - citrate-disk-alert.timer: every 5 min, logs at crit and fails its unit when
 #     any watched filesystem is at or above 80% used. Local logging only.
 #   - citrate-node.service template (identical to gen_node_config.py's unit for the
@@ -38,8 +47,23 @@
 #
 # Not done here, on purpose: the node binary, node.toml, the consensus env, and
 # every key.
+#
+# Tests (scripts/ops/tests/test_producer_baseline.py) source this file with
+# PRODUCER_BASELINE_LIB=1, which skips the dispatch at the bottom, and set
+# PRODUCER_BASELINE_ROOT to a temp dir that prefixes the paths apply writes.
+# `apply` and `check` refuse to run with PRODUCER_BASELINE_ROOT set.
 set -euo pipefail
 
+R="${PRODUCER_BASELINE_ROOT:-}"
+# The only SSH port apply_firewall opens. preflight refuses any other sshd port.
+SSH_FW_PORT=22
+# DigitalOcean Insights apt signing key ("DigitalOcean Insights Engineering
+# <sonar-agent@digitalocean.com>"), the key DO's install.sh fetches. Pinned so a
+# swapped key on the download path is refused.
+DO_AGENT_KEY_URL=https://repos.insights.digitalocean.com/sonar-agent.asc
+DO_AGENT_KEY_FPR=902C44B42EA9A17F8578510977B79B3FFAF7EF65
+DO_AGENT_REPO=https://repos.insights.digitalocean.com/apt/do-agent
+DO_AGENT_KEYRING=/usr/share/keyrings/digitalocean-agent-keyring.gpg
 SWAP_FILE=/swapfile
 SWAP_SIZE_MIB=4096
 SWAPPINESS=10
@@ -125,8 +149,10 @@ EOF
 # ---- helpers ---------------------------------------------------------------
 
 # put_file PATH MODE OWNER:GROUP  (content on stdin). Writes only when it differs.
+# Feed it with a here-doc or `< <(producer)`, never `producer | put_file`: a
+# pipeline runs put_file in a subshell and its CHANGED entry would be lost.
 put_file() {
-  local path="$1" mode="$2" owner="$3" tmp
+  local path="$R$1" mode="$2" owner="$3" tmp
   tmp="$(mktemp)"
   cat >"$tmp"
   if [ -f "$path" ] && cmp -s "$tmp" "$path"; then
@@ -134,7 +160,7 @@ put_file() {
   else
     install -D -m "$mode" -o "${owner%:*}" -g "${owner#*:}" "$tmp" "$path"
     rm -f "$tmp"
-    CHANGED+=("$path")
+    CHANGED+=("$1")
   fi
   chmod "$mode" "$path"
   chown "$owner" "$path"
@@ -143,6 +169,86 @@ put_file() {
 apt_noninteractive() {
   DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get -y \
     -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@"
+}
+
+# ---- preflight (no changes) -------------------------------------------------
+
+# Every TCP port sshd listens on, one per line: `port` and `listenaddress` from
+# `sshd -T`, plus ssh.socket's listeners when socket activation is on. Fails when
+# sshd -T gives nothing.
+sshd_listen_ports() {
+  local cfg key val rest p
+  cfg="$(sshd -T 2>/dev/null)" || return 1
+  [ -n "$cfg" ] || return 1
+  while read -r key val rest; do
+    case "$key" in
+      port) echo "$val" ;;
+      listenaddress) echo "${val##*:}" ;;
+    esac
+  done <<<"$cfg"
+  if systemctl is-active --quiet ssh.socket 2>/dev/null; then
+    for p in $(systemctl show -p Listen --value ssh.socket 2>/dev/null); do
+      case "$p" in *:*) echo "${p##*:}" ;; esac
+    done
+  fi
+}
+
+guard_ssh_ports() {
+  local ports p
+  ports="$(sshd_listen_ports)" || die "cannot read sshd's ports (sshd -T failed); refusing before any change"
+  ports="$(sort -u <<<"$ports")"
+  [ -n "$ports" ] || die "sshd -T reports no port; refusing before any change"
+  for p in $ports; do
+    if [ "$p" != "$SSH_FW_PORT" ]; then
+      die "sshd listens on port $p, but the firewall only allows ${SSH_FW_PORT}/tcp; refusing before any change"
+    fi
+  done
+  note "sshd port ${SSH_FW_PORT} only"
+}
+
+# The account the operator comes back in as: $SUDO_USER under sudo, else root.
+access_user() {
+  if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then echo "$SUDO_USER"; else echo root; fi
+}
+
+# At least one key ssh-keygen accepts in one of sshd's AuthorizedKeysFile paths
+# for access_user, or passwords are not turned off.
+guard_authorized_key() {
+  local user home uid files p f found=0 checked=""
+  local -a toks
+  user="$(access_user)"
+  IFS=: read -r _ _ uid _ _ home _ < <(getent passwd "$user") \
+    || die "no passwd entry for $user; refusing before any change"
+  command -v ssh-keygen >/dev/null || die "ssh-keygen missing; cannot verify an authorized key"
+  files="$(sshd -T 2>/dev/null | awk '$1 == "authorizedkeysfile" { $1 = ""; print; exit }')"
+  read -r -a toks <<<"${files:-.ssh/authorized_keys .ssh/authorized_keys2}"
+  for p in "${toks[@]}"; do
+    [ "$p" = none ] && continue
+    p="${p//%%/$'\001'}"; p="${p//%h/$home}"; p="${p//%u/$user}"; p="${p//%U/$uid}"; p="${p//$'\001'/%}"
+    case "$p" in /*) ;; *) p="$home/$p" ;; esac
+    checked="$checked $p"
+    f="$R$p"
+    if [ -f "$f" ] && ssh-keygen -l -f "$f" >/dev/null 2>&1; then found=1; fi
+  done
+  [ "$found" = 1 ] \
+    || die "no usable authorized key for $user (checked:$checked); refusing to turn off password login"
+  note "authorized key present for $user"
+}
+
+refuse_symlinks() {
+  local p
+  for p in /var/lib/citrate /var/lib/citrate/data /etc/citrate; do
+    if [ -L "$R$p" ]; then die "$p is a symlink; refusing (replace it with a real directory by hand)"; fi
+  done
+  return 0
+}
+
+preflight() {
+  echo "[preflight]"
+  guard_ssh_ports
+  guard_authorized_key
+  refuse_symlinks
+  note "no symlinked citrate dirs"
 }
 
 # ---- apply -----------------------------------------------------------------
@@ -157,8 +263,8 @@ $nrconf{override_rc}{qr(^citrate-height-watchdog)} = 0;
 EOF
   apt_noninteractive update -q >/dev/null
   apt_noninteractive upgrade -q
-  apt_noninteractive install -q unattended-upgrades chrony logrotate ufw jq curl python3 >/dev/null
-  note "packages upgraded; unattended-upgrades chrony logrotate ufw jq curl python3 present"
+  apt_noninteractive install -q unattended-upgrades chrony logrotate ufw jq curl python3 gnupg >/dev/null
+  note "packages upgraded; unattended-upgrades chrony logrotate ufw jq curl python3 gnupg present"
 }
 
 apply_unattended() {
@@ -191,27 +297,30 @@ apply_user_dirs() {
       --shell /usr/sbin/nologin citrate
     CHANGED+=("user citrate")
   fi
-  install -d -o citrate -g citrate -m 0755 /var/lib/citrate
-  install -d -o citrate -g citrate -m 0700 /var/lib/citrate/data
-  install -d -o root -g root -m 0755 /etc/citrate
-  note "citrate uid $(id -u citrate); /var/lib/citrate/data 0700 (contents never read)"
+  # install -d follows a symlink and would chown/chmod its target.
+  refuse_symlinks
+  # root-owned parent: the citrate user cannot swap data for a link.
+  install -d -o root -g citrate -m 0750 "$R/var/lib/citrate"
+  install -d -o citrate -g citrate -m 0700 "$R/var/lib/citrate/data"
+  install -d -o root -g root -m 0755 "$R/etc/citrate"
+  note "citrate uid $(id -u citrate); /var/lib/citrate root:citrate 0750; data 0700 (contents never read)"
   cleanup_legacy_opt
 }
 
 # An earlier revision also created /opt/citrate/{bin,data,keys}. Remove them only
 # while they are empty: rmdir refuses a non-empty directory, so nothing is lost.
 cleanup_legacy_opt() {
-  [ -d /opt/citrate ] || return 0
-  local d
+  local opt="$R/opt/citrate" d
+  [ -d "$opt" ] || return 0
   for d in bin data keys; do
-    if [ -d "/opt/citrate/$d" ] && [ ! -L "/opt/citrate/$d" ] && [ -z "$(ls -A "/opt/citrate/$d")" ]; then
-      rmdir "/opt/citrate/$d" && CHANGED+=("rmdir /opt/citrate/$d")
+    if [ -d "$opt/$d" ] && [ ! -L "$opt/$d" ] && [ -z "$(ls -A "$opt/$d")" ]; then
+      rmdir "$opt/$d" && CHANGED+=("rmdir /opt/citrate/$d")
     fi
   done
-  if [ -z "$(ls -A /opt/citrate)" ]; then
-    rmdir /opt/citrate && CHANGED+=("rmdir /opt/citrate")
+  if [ -z "$(ls -A "$opt")" ]; then
+    rmdir "$opt" && CHANGED+=("rmdir /opt/citrate")
   else
-    note "/opt/citrate is not empty: left in place ($(ls -A /opt/citrate | tr '\n' ' '))"
+    note "/opt/citrate is not empty: left in place ($(ls -A "$opt" | tr '\n' ' '))"
   fi
 }
 
@@ -225,13 +334,13 @@ SystemKeepFree=10G
 SystemMaxFileSize=128M
 RuntimeMaxUse=256M
 EOF
-  if [[ " ${CHANGED[*]-} " == *" /etc/systemd/journald.conf.d/citrate.conf "* ]]; then
-    systemctl restart systemd-journald
-  fi
+  # Every run, not only when the file changed: a run cut short after the write
+  # would otherwise leave journald on the old limits for good.
+  systemctl restart systemd-journald
   # A global default before the include applies to every /etc/logrotate.d entry
   # (rsyslog's /var/log/syslog grew to 51 GB once). Run hourly so maxsize bites.
-  if ! grep -qE '^[[:space:]]*maxsize[[:space:]]' /etc/logrotate.conf; then
-    sed -i '0,/^include \/etc\/logrotate.d/s//# producer_baseline.sh: rotate any log past 200M on the hourly run\nmaxsize 200M\n\n&/' /etc/logrotate.conf
+  if ! grep -qE '^[[:space:]]*maxsize[[:space:]]' "$R/etc/logrotate.conf"; then
+    sed -i '0,/^include \/etc\/logrotate.d/s//# producer_baseline.sh: rotate any log past 200M on the hourly run\nmaxsize 200M\n\n&/' "$R/etc/logrotate.conf"
     CHANGED+=("/etc/logrotate.conf")
   fi
   put_file /etc/logrotate.d/citrate 0644 root:root <<'EOF'
@@ -309,24 +418,26 @@ PubkeyAuthentication yes
 PermitEmptyPasswords no
 EOF
   sshd -t || die "sshd -t rejected the config; not reloading"
-  if [[ " ${CHANGED[*]-} " == *" /etc/ssh/sshd_config.d/10-citrate.conf "* ]]; then
-    systemctl reload ssh
-  fi
+  # Every run: `check` reads the files (sshd -T), not the running daemon, so a
+  # run cut short before the reload must not leave passwords on behind a PASS.
+  systemctl reload ssh
   note "key-only"
 }
 
-# Runbook section 2. Rules first, enable last: an active ufw without the SSH rule
-# would cut the session that is running this script.
+# Runbook section 2. Allows first, then the defaults, then enable. On a host where
+# ufw is already active, `default deny incoming` bites at once, so it must not
+# run before the SSH allow exists (a failed allow stops the script under set -e).
+# preflight has already checked that sshd listens on SSH_FW_PORT only.
 apply_firewall() {
   echo "[firewall]"
   local before
   before="$(ufw status verbose 2>/dev/null || true)"
-  ufw default deny incoming >/dev/null
-  ufw default allow outgoing >/dev/null
   ufw allow 22/tcp >/dev/null
   ufw allow 30303/tcp >/dev/null
   ufw allow 30303/udp >/dev/null
-  ufw show added | grep -qx 'ufw allow 22/tcp' || die "ufw has no 22/tcp rule; not enabling"
+  ufw show added | grep -qx "ufw allow ${SSH_FW_PORT}/tcp" || die "ufw has no ${SSH_FW_PORT}/tcp rule; not enabling"
+  ufw default deny incoming >/dev/null
+  ufw default allow outgoing >/dev/null
   ufw --force enable >/dev/null
   if [ "$(ufw status verbose)" != "$before" ]; then CHANGED+=("ufw"); fi
   note "ufw $(ufw status | head -1 | awk '{print $2}'): 22/tcp, 30303/tcp+udp in"
@@ -353,11 +464,44 @@ ufw_status_ok() {
   return 0
 }
 
+# key_fpr_ok FILE FPR: FILE (armored or binary) holds exactly one OpenPGP primary
+# key, and its fingerprint is FPR.
+key_fpr_ok() {
+  local file="$1" want="$2" gh out n got
+  gh="$(mktemp -d)"
+  out="$(GNUPGHOME="$gh" gpg --batch --quiet --no-tty --with-colons --show-keys "$file" 2>/dev/null)" || out=""
+  find "$gh" -mindepth 1 -delete 2>/dev/null || true
+  rmdir "$gh" 2>/dev/null || true
+  n="$(grep -c '^pub:' <<<"$out" || true)"
+  got="$(awk -F: '/^pub:/ { p = 1; next } p && /^fpr:/ { print $10; exit }' <<<"$out")"
+  [ "$n" = 1 ] && [ "$got" = "$want" ]
+}
+
+# The same apt repo and keyring DO's install.sh sets up, without running a
+# downloaded script as root: the key must match DO_AGENT_KEY_FPR, then apt
+# verifies the packages against it.
+install_do_agent() {
+  local tmp
+  tmp="$(mktemp)"
+  if ! curl -fsSL --proto '=https' "$DO_AGENT_KEY_URL" -o "$tmp"; then
+    rm -f "$tmp"; die "could not fetch the DO agent signing key; not installing"
+  fi
+  if ! key_fpr_ok "$tmp" "$DO_AGENT_KEY_FPR"; then
+    rm -f "$tmp"; die "DO agent signing key is not $DO_AGENT_KEY_FPR; not installing"
+  fi
+  put_file "$DO_AGENT_KEYRING" 0644 root:root < <(gpg --dearmor <"$tmp")
+  rm -f "$tmp"
+  put_file /etc/apt/sources.list.d/digitalocean-agent.list 0644 root:root <<EOF
+deb [signed-by=$DO_AGENT_KEYRING] $DO_AGENT_REPO main main
+EOF
+  apt_noninteractive update -q >/dev/null
+  apt_noninteractive install -q do-agent >/dev/null
+}
+
 apply_monitoring() {
   echo "[do monitoring]"
   if ! systemctl is-active --quiet do-agent; then
-    # DigitalOcean's documented installer for the metrics agent.
-    curl -fsSL --proto '=https' https://repos.insights.digitalocean.com/install.sh | bash
+    install_do_agent
     CHANGED+=("do-agent")
   fi
   systemctl enable do-agent >/dev/null 2>&1 || true
@@ -366,7 +510,7 @@ apply_monitoring() {
 
 apply_disk_alert() {
   echo "[disk alert]"
-  disk_alert_script | put_file /usr/local/sbin/citrate-disk-alert 0755 root:root
+  put_file /usr/local/sbin/citrate-disk-alert 0755 root:root < <(disk_alert_script)
   put_file /etc/systemd/system/citrate-disk-alert.service 0644 root:root <<EOF
 [Unit]
 Description=Citrate disk usage alert (logs at crit at ${DISK_ALERT_PCT}% used)
@@ -396,11 +540,11 @@ EOF
 
 apply_unit_template() {
   echo "[citrate-node unit template]"
-  if [ ! -e "$UNIT_PATH" ]; then
-    unit_template | put_file "$UNIT_PATH" 0644 root:root
+  if [ ! -e "$R$UNIT_PATH" ]; then
+    put_file "$UNIT_PATH" 0644 root:root < <(unit_template)
     systemctl daemon-reload
     note "installed $UNIT_PATH (disabled, not started)"
-  elif unit_template | cmp -s - "$UNIT_PATH"; then
+  elif unit_template | cmp -s - "$R$UNIT_PATH"; then
     note "template already installed; state left as is"
   else
     note "$UNIT_PATH differs from the template (operator unit): left alone"
@@ -409,9 +553,10 @@ apply_unit_template() {
 
 do_apply() {
   [ "$(id -u)" -eq 0 ] || die "apply must run as root"
-  [ -r /etc/os-release ] && . /etc/os-release
+  [ -r "$R/etc/os-release" ] && . "$R/etc/os-release"
   [ "${ID:-}" = ubuntu ] || die "Ubuntu only (found ${ID:-unknown})"
   echo "== producer_baseline apply on $(hostname) =="
+  preflight
   apply_packages
   apply_unattended
   apply_user_dirs
@@ -468,6 +613,7 @@ do_check() {
   else
     row FAIL user "citrate user missing, uid 0 or has a login shell ($v)"
   fi
+  ok_if dir-var-lib "/var/lib/citrate root:citrate 0750" stat_is /var/lib/citrate "root:citrate 750"
   ok_if dir-var-data "/var/lib/citrate/data citrate 0700" stat_is /var/lib/citrate/data "citrate:citrate 700"
   ok_if dir-etc "/etc/citrate root 0755" stat_is /etc/citrate "root:root 755"
   if [ -e /opt/citrate ]; then
@@ -513,6 +659,13 @@ do_check() {
 
   ok_if do-agent "DO monitoring agent active, enabled" \
     sh -c 'systemctl is-active --quiet do-agent && systemctl is-enabled --quiet do-agent'
+  if [ ! -e "$DO_AGENT_KEYRING" ]; then
+    row WARN do-agent-key "no $DO_AGENT_KEYRING (agent not from DO's apt repo?)"
+  elif key_fpr_ok "$DO_AGENT_KEYRING" "$DO_AGENT_KEY_FPR"; then
+    row PASS do-agent-key "apt keyring is the pinned key ${DO_AGENT_KEY_FPR: -16}"
+  else
+    row FAIL do-agent-key "$DO_AGENT_KEYRING is not the pinned key $DO_AGENT_KEY_FPR"
+  fi
 
   ok_if disk-alert "timer active, threshold ${DISK_ALERT_PCT}%" \
     sh -c 'systemctl is-active --quiet citrate-disk-alert.timer && systemctl is-enabled --quiet citrate-disk-alert.timer && [ -x /usr/local/sbin/citrate-disk-alert ]'
@@ -546,6 +699,14 @@ do_check() {
   [ "$FAILS" -eq 0 ]
 }
 
+if [ "${PRODUCER_BASELINE_LIB:-0}" = 1 ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
+case "${1:-}" in
+  apply|check)
+    [ -z "$R" ] || die "PRODUCER_BASELINE_ROOT is for tests only; unset it to $1 a host" ;;
+esac
 case "${1:-}" in
   apply) do_apply ;;
   check) do_check ;;
