@@ -102,7 +102,7 @@ case "$cmd" in
   alloc)
     [[ -f "$WORK/dump.json" ]] || die "--work has no dump.json (run ceremony first)"
     exec "$PY" "$HERE/emit_alloc.py" --dump "$WORK/dump.json" --inputs "$WORK/inputs.env" \
-      --manifest "$WORK/book/ceremony-run.json" --book "$WORK/book/40204.json" ${ORANGESEED:+--orangeseed "$ORANGESEED"} --out "${OUT:-$WORK/alloc.json}"
+      --manifest "$WORK/book/ceremony-run.json" --book "$WORK/book/40204.json" ${ORANGESEED:+--orangeseed "$ORANGESEED" --governance-book "$WORK/book/governance.json"} --out "${OUT:-$WORK/alloc.json}"
     ;;
   _inner) ;;
   *) sed -n '2,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//' >&2; exit 1 ;;

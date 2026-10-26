@@ -60,6 +60,27 @@ jq '.accounts[3].code = "0x60"' "$T/dump.json" >"$T/dump-bad.json"
 expect "emit_alloc refuses a deployer with code" 1 'deployer has code' -- \
   python3 "$HERE/emit_alloc.py" --dump "$T/dump-bad.json" --manifest "$T/manifest.json" --inputs "$T/inputs.env" --book "$T/book40204.json" --out "$T/a3.json"
 
+# ------------------------------------------------------------ OrangeSeed binding
+GOV=0x00000000000000000000000000000000000000c1
+printf '{"contracts":{"GovernanceTimelock":"%s"}}\n' "$GOV" >"$T/gov.json"
+os_fixture() { # os_fixture GOVERNANCE PROXY_SLOT_VALUE
+  printf '{"params":{"governance":"%s"},"alloc":{"0x000000000000000000000000000000c17A7e5EeD":{"balance":"0x0","nonce":"0x1","code":"0x6000","storage":{"0x01":"%s"}},"0x000000000000000000000000000000c17A7E5Ee0":{"balance":"0x0","nonce":"0x1","code":"0x6000","storage":{}}}}\n' "$1" "$2"
+}
+os_fixture 0x00000000000000000000000000000000000000c2 "0x000000000000000000000000${GOV#0x}" >"$T/os-othergov.json"
+expect "OrangeSeed generated for another governance is refused" 1 'not this ceremony.s GovernanceTimelock' -- \
+  "${EA[@]}" --orangeseed "$T/os-othergov.json" --governance-book "$T/gov.json" --out "$T/x.json"
+os_fixture "$GOV" "0x000000000000000000000000${DEP#0x}" >"$T/os-dep.json"
+expect "OrangeSeed whose upgrade authority is not governance is refused" 1 'does not name this ceremony.s GovernanceTimelock' -- \
+  "${EA[@]}" --orangeseed "$T/os-dep.json" --governance-book "$T/gov.json" --out "$T/x.json"
+expect "OrangeSeed without the governance book is refused" 1 'needs --governance-book' -- \
+  "${EA[@]}" --orangeseed "$T/os-dep.json" --out "$T/x.json"
+os_fixture "$GOV" "0x000000000000000000000000${GOV#0x}" | jq --arg d "0x000000000000000000000000${DEP#0x}" '.alloc["0x000000000000000000000000000000c17A7E5Ee0"].storage["0x02"] = $d' >"$T/os-depslot.json"
+expect "OrangeSeed with a slot holding the ceremony deployer is refused" 1 'holds the ceremony deployer' -- \
+  "${EA[@]}" --orangeseed "$T/os-depslot.json" --governance-book "$T/gov.json" --out "$T/x.json"
+os_fixture "$GOV" "0x000000000000000000000000${GOV#0x}" >"$T/os-ok.json"
+expect "control: OrangeSeed bound to governance reaches the code-hash pin (and a fixture's code is refused there)" 1 'code hash is not the pinned' -- \
+  "${EA[@]}" --orangeseed "$T/os-ok.json" --governance-book "$T/gov.json" --out "$T/x.json"
+
 # ------------------------------------------------------------ fill_producers (input checks)
 python3 - "$T" <<'PY'
 import json, sys

@@ -72,6 +72,7 @@ def main():
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--book", required=True, help="the ceremony's stack book (contracts/addresses/40204.json)")
     ap.add_argument("--orangeseed", help="the OrangeSeed PR's GenesisOrangeSeed output (alloc JSON)")
+    ap.add_argument("--governance-book", help="the same ceremony's governance.json (required with --orangeseed)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
@@ -119,6 +120,22 @@ def main():
     orangeseed = None
     if a.orangeseed:
         o = json.load(open(a.orangeseed))
+        if not a.governance_book:
+            fail("--orangeseed needs --governance-book (the same ceremony's governance.json)")
+        gov = json.load(open(a.governance_book))["contracts"]["GovernanceTimelock"].lower()
+        og = str(o.get("params", {}).get("governance", "")).lower()
+        if not ADDR.match(gov) or int(gov, 16) == 0:
+            fail(f"bad GovernanceTimelock {gov!r} in the governance book")
+        if og != gov:
+            fail(f"OrangeSeed was generated for governance {og or 'none'}, not this ceremony's GovernanceTimelock {gov}")
+        gov_word = "0x" + "0" * 24 + gov[2:]
+        dep_word = "0x" + "0" * 24 + deployer[2:]
+        proxy_vals = {vv.lower() for vv in (o["alloc"].get(next(k for k in o["alloc"] if k.lower() == ORANGESEED_PROXY), {}).get("storage") or {}).values()}
+        if gov_word not in proxy_vals:
+            fail("the OrangeSeed proxy's storage does not name this ceremony's GovernanceTimelock (its upgrade authority)")
+        for k, v in o["alloc"].items():
+            if any(vv.lower() == dep_word for vv in (v.get("storage") or {}).values()):
+                fail(f"OrangeSeed {k.lower()}: a storage slot holds the ceremony deployer")
         taken = {x["address"] for x in accounts}
         addrs = sorted(k.lower() for k in o["alloc"])
         if addrs != sorted(ORANGESEED_CODEHASHES):
