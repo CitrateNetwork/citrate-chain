@@ -214,13 +214,16 @@ access_user() {
 # At least one key ssh-keygen accepts in one of sshd's AuthorizedKeysFile paths
 # for access_user, or passwords are not turned off.
 guard_authorized_key() {
-  local user home uid files p f found=0 checked=""
+  local user home uid cfg files p f found=0 checked=""
   local -a toks
   user="$(access_user)"
   IFS=: read -r _ _ uid _ _ home _ < <(getent passwd "$user") \
     || die "no passwd entry for $user; refusing before any change"
   command -v ssh-keygen >/dev/null || die "ssh-keygen missing; cannot verify an authorized key"
-  files="$(sshd -T 2>/dev/null | awk '$1 == "authorizedkeysfile" { $1 = ""; print; exit }')"
+  # Read sshd -T whole first: piping it into a reader that stops early would
+  # kill sshd with SIGPIPE, and pipefail would end the script.
+  cfg="$(sshd -T 2>/dev/null)" || die "cannot read sshd's config (sshd -T failed); refusing before any change"
+  files="$(awk '$1 == "authorizedkeysfile" { $1 = ""; print; exit }' <<<"$cfg")"
   read -r -a toks <<<"${files:-.ssh/authorized_keys .ssh/authorized_keys2}"
   for p in "${toks[@]}"; do
     [ "$p" = none ] && continue
@@ -370,7 +373,7 @@ EOF
 
 apply_swap() {
   echo "[swap]"
-  if ! swapon --show=NAME --noheadings | grep -qx "$SWAP_FILE"; then
+  if ! grep -qx "$SWAP_FILE" <<<"$(swapon --show=NAME --noheadings)"; then
     if [ ! -f "$SWAP_FILE" ]; then
       fallocate -l "${SWAP_SIZE_MIB}M" "$SWAP_FILE"
       chmod 0600 "$SWAP_FILE"
@@ -430,12 +433,13 @@ EOF
 # preflight has already checked that sshd listens on SSH_FW_PORT only.
 apply_firewall() {
   echo "[firewall]"
-  local before
+  local before added
   before="$(ufw status verbose 2>/dev/null || true)"
   ufw allow 22/tcp >/dev/null
   ufw allow 30303/tcp >/dev/null
   ufw allow 30303/udp >/dev/null
-  ufw show added | grep -qx "ufw allow ${SSH_FW_PORT}/tcp" || die "ufw has no ${SSH_FW_PORT}/tcp rule; not enabling"
+  added="$(ufw show added)"
+  grep -qx "ufw allow ${SSH_FW_PORT}/tcp" <<<"$added" || die "ufw has no ${SSH_FW_PORT}/tcp rule; not enabling"
   ufw default deny incoming >/dev/null
   ufw default allow outgoing >/dev/null
   ufw --force enable >/dev/null
