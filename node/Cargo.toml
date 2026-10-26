@@ -21,6 +21,10 @@ path = "src/bin/validator_registration_ceremony.rs"
 name = "state-digest"
 path = "src/bin/state_digest.rs"
 
+[[bin]]
+name = "state-dump"
+path = "src/bin/state_dump.rs"
+
 [dependencies]
 # Local dependencies
 citrate-consensus = { path = "../core/consensus" }
