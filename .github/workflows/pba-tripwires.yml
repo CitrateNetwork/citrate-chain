@@ -30,3 +30,8 @@ jobs:
         run: scripts/ci/check_pba_exec_tripwires.sh --self-test
       - name: CHAIN-EXEC tripwires (signature setting, node feature set, mempool expiry, metrics bind)
         run: scripts/ci/check_pba_exec_tripwires.sh
+      # The testnet deploy script installs only pinned, verified releases. The test greps
+      # all of scripts/ (test fixtures included), so it fails on any new unpinned-download
+      # string anywhere under scripts/. Runs unprivileged with a sandboxed HOME.
+      - name: Deploy-testnet supply-chain test
+        run: bash scripts/tests/test_deploy_testnet_supply_chain.sh
