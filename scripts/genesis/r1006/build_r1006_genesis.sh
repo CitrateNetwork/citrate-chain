@@ -247,9 +247,9 @@ create() {
     --legacy --gas-limit 8000000 --broadcast --json --constructor-args "$@") 2>>"$WORK/standins.log" | tee -a "$WORK/standins.log" | jq -r '.deployedTo'
 }
 log "P4 stand-ins under GOVERNANCE $GOVERNANCE"
-KYC=$(create src/KYCRegistry.sol:KYCRegistry --constructor-args "$PATRONAGE_KYC_UPDATER" "$GOVERNANCE")
+KYC=$(create src/KYCRegistry.sol:KYCRegistry "$PATRONAGE_KYC_UPDATER" "$GOVERNANCE")
 [[ "$KYC" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "KYCRegistry stand-in failed (see $WORK/standins.log)"
-MSBT=$(create src/coop/MembershipSBT.sol:MembershipSBT --constructor-args "$KYC" "[]" "$GOVERNANCE" "$PATRONAGE_REGISTRAR")
+MSBT=$(create src/coop/MembershipSBT.sol:MembershipSBT "$KYC" "[]" "$GOVERNANCE" "$PATRONAGE_REGISTRAR")
 [[ "$MSBT" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "MembershipSBT stand-in failed (see $WORK/standins.log)"
 printf '{"KYCRegistry":"%s","MembershipSBT":"%s"}\n' "$KYC" "$MSBT" >"$WORK/standins.json"
 
