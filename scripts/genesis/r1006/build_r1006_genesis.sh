@@ -136,10 +136,11 @@ ip link set lo up
 REAL_FORGE="$(command -v forge)"
 REAL_CAST="$(command -v cast)"
 export HOME="$WORK/home" FOUNDRY_DISABLE_NIGHTLY_WARNING=1 FOUNDRY_OFFLINE=true FOUNDRY_SOLC="$SOLC_BIN"
-mkdir -p "$HOME" "$WORK/bin" "$WORK/devnet-data"
+mkdir -p "$HOME" "$WORK/devnet-data"
 chmod 700 "$HOME"
-ln -sf "$HERE/forge_resume.sh" "$WORK/bin/forge"
-export R1006_REAL_FORGE="$REAL_FORGE" PATH="$WORK/bin:$PATH"
+# No forge wrapper and no `--resume` (it miscounts the nonce): every forge broadcast in the
+# ceremony runs --slow (forge_phase and regenesis.sh), and every RPC call goes through the
+# receipt-retry proxy below.
 NODE_RPC="http://127.0.0.1:$RPC_PORT"
 # Everything talks to the node through the receipt-retry proxy (G-11): a null
 # eth_getTransactionByHash / eth_getTransactionReceipt for a mined transaction is
