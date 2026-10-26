@@ -499,14 +499,51 @@ async fn main() -> Result<()> {
             let (agent_height, _) =
                 citrate_execution::agent_fork::resolve_for_chain(chain_id, agent_configured)
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let (exact_height, _) =
-                citrate_execution::exact_code::resolve_for_chain(chain_id, exact_configured)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+            // A config on the r1006 profile is bound to the r1006 genesis this build
+            // compiles: its genesis-pinned rules apply and the fingerprint is v4.
+            let r1006 = file_cfg.as_ref().and_then(|c| c.chain.genesis_profile.as_deref())
+                == Some(genesis::R1006_PROFILE);
+            let (pba_height, exact_height) = if r1006 {
+                let a = citrate_consensus::hardening::R1006_ACTIVATIONS;
+                let pba = citrate_consensus::hardening::resolve_activation(
+                    a.pba_hardening,
+                    std::env::var(citrate_consensus::hardening::PBA_HARDENING_ENV)
+                        .ok()
+                        .as_deref(),
+                    configured,
+                    false,
+                )
+                .map_err(|e| anyhow::anyhow!("{}", e))?
+                .0;
+                let exact = citrate_execution::exact_code::resolve(
+                    Some(a.exact_create_code),
+                    std::env::var(citrate_execution::exact_code::EXACT_CREATE_CODE_ENV)
+                        .ok()
+                        .as_deref(),
+                    exact_configured,
+                )
+                .map_err(|e| anyhow::anyhow!("{}", e))?
+                .0;
+                (pba, exact)
+            } else {
+                let (exact, _) =
+                    citrate_execution::exact_code::resolve_for_chain(chain_id, exact_configured)
+                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                (resolved.height, exact)
+            };
             let manifest = consensus_manifest::ConsensusManifest::for_activations(
-                resolved.height,
+                pba_height,
                 agent_height,
                 exact_height,
             );
+            let manifest = if r1006 {
+                manifest.bound(
+                    genesis::R1006_PROFILE,
+                    &citrate_consensus::hardening::R1006_GENESIS,
+                )
+            } else {
+                manifest
+            };
             // The activation heights compiled into this release (a node on a
             // pinned chain runs that height; see the start-up banner for the
             // height a configured node resolved).
@@ -518,6 +555,13 @@ async fn main() -> Result<()> {
                 let mut v = serde_json::to_value(&manifest).unwrap_or_default();
                 if let Some(obj) = v.as_object_mut() {
                     obj.insert("pba_hardening_pins".into(), serde_json::Value::Array(pins));
+                    obj.insert(
+                        "r1006_genesis".into(),
+                        serde_json::Value::String(format!(
+                            "0x{}",
+                            hex::encode(citrate_consensus::hardening::R1006_GENESIS)
+                        )),
+                    );
                 }
                 println!(
                     "{}",

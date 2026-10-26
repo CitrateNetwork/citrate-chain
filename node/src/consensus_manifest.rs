@@ -396,6 +396,12 @@ impl ConsensusManifest {
             "  epoch / lag        {} / {}",
             self.epoch, self.snapshot_lag
         );
+        if let (Some(p), Some(g)) = (&self.genesis_profile, &self.genesis_hash) {
+            println!("  genesis            {p} {g}");
+            if let Some(r) = &self.genesis_rules {
+                println!("  genesis rules      {r}");
+            }
+        }
         println!("  fingerprint        {}", self.fingerprint);
         if self.git_dirty {
             println!(
