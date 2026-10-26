@@ -1,2 +1,0 @@
-# fixture audit config
-ignore = ["RUSTSEC-2026-0387"]

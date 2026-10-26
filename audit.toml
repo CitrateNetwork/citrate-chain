@@ -81,21 +81,14 @@ ignore = [
     "RUSTSEC-2025-0055",
 
     # ─────────────────────────────────────────────────────────────────
-    # crypto-bigint 0.5 timing advisory (time-boxed, EXPIRES 2027-01-31)
+    # crypto-bigint < 0.7.6 (time-boxed) — EXPIRES 2026-11-09
     # ─────────────────────────────────────────────────────────────────
-    # RUSTSEC-2026-0387 — crypto-bigint < 0.7.6: several operations
-    # intended to be constant-time could branch on secret data depending
-    # on compiler and target. Library-level advisory; fixed only in 0.7.6,
-    # no 0.5.x backport.
-    # crypto-bigint 0.5.5 is pulled only by elliptic-curve 0.13 (the k256 /
-    # p256 0.13 line used by wallet-core, execution, consensus and revm's
-    # precompiles). No 0.13 curve release accepts crypto-bigint 0.7; the
-    # fix is the 0.14 curve line, which alloy and revm have not adopted.
-    # Upstream-blocked; the upgrade is tracked.
-    # Guard: scripts/ci/check-crypto-bigint-users.py fails CI if a crate
-    # other than elliptic-curve depends on an unpatched crypto-bigint in
-    # any Cargo.lock, if this ignore goes stale, or after 2027-01-31 while
-    # it is still present here, in deny.toml or in cargo-audit.yml.
+    # RUSTSEC-2026-0387 — crypto-bigint < 0.7.6: multiple timing
+    # variability issues in operations intended to be constant-time.
+    # elliptic-curve 0.13 requires crypto-bigint ^0.5; the fix is in the
+    # 0.14 curve line, held back upstream (revm-precompile,
+    # openmls_rust_crypto and bip32 still require the 0.13 line).
+    # Guard: scripts/ci/check_crypto_bigint_users.py.
     "RUSTSEC-2026-0387",
 ]
 
