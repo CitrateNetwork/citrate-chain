@@ -536,8 +536,10 @@ mod tests {
             db.write_batch(batch).unwrap();
         }
         db.flush().unwrap();
-        for cf in &cfs {
-            for i in 0u64..1024 {
+        // Read a different number of blocks from each column family, so
+        // per-CF caches would report different usage figures.
+        for (n, cf) in cfs.iter().enumerate() {
+            for i in 0u64..(40 * (n as u64 + 1)).min(1024) {
                 assert!(db.get_cf(cf, &i.to_be_bytes()).unwrap().is_some());
             }
         }
