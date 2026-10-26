@@ -2,8 +2,8 @@
 
 use crate::types::{Block, Hash, Tip};
 use crate::vrf::VrfProposerSelector;
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -112,6 +112,35 @@ pub enum DagStoreError {
     Persistence(String),
 }
 
+/// Default number of most-recent blocks whose full bodies (transactions and
+/// genesis/learning sidecars) a PERSISTENT [`DagStore`] keeps in memory. Older
+/// entries keep only the header-bearing skeleton; [`DagStore::get_block`]
+/// reloads the body from the backend. At 300 transactions per block this is
+/// tens of MB, against the unbounded per-transaction growth it replaces.
+pub const DEFAULT_RESIDENT_BODY_CAP: usize = 256;
+
+/// Which blocks of a persistent store currently hold their full body in memory.
+/// Every mutation happens with the `blocks` write lock held, so a reader that
+/// holds the `blocks` read lock sees the two structures agree.
+#[derive(Default)]
+struct BodyResidency {
+    /// Blocks whose body is resident, oldest first.
+    order: VecDeque<Hash>,
+    /// Blocks whose in-memory entry was stripped to its skeleton.
+    stripped: HashSet<Hash>,
+}
+
+/// Drop the parts of a block that only the body readers need. The header,
+/// roots, params and signature stay, so DAG / fork-choice code that reads the
+/// skeleton is unaffected; `hash()` is the header's stored hash.
+fn strip_body(block: &mut Block) {
+    block.transactions = Vec::new();
+    block.embedded_models = Vec::new();
+    block.required_pins = Vec::new();
+    block.learning_embedding = None;
+    block.learning_confidence = None;
+}
+
 /// DAG storage manager.
 /// WP-S.1: Optionally backed by a persistent KvStore for write-through persistence.
 pub struct DagStore {
@@ -174,6 +203,13 @@ pub struct DagStore {
     /// arbitrary height) cannot bypass them. Write-once — a chain's
     /// genesis never changes.
     configured_genesis: Arc<OnceLock<Hash>>,
+
+    /// Bound on resident block bodies (persistent stores only; an in-memory
+    /// store has nowhere to reload from and keeps every body).
+    resident_body_cap: usize,
+
+    /// Body residency bookkeeping (see [`BodyResidency`]).
+    residency: Arc<Mutex<BodyResidency>>,
 }
 
 /// Column family names for persistent DAG storage
@@ -213,6 +249,8 @@ impl DagStore {
             proposer_selector: None,
             enforcement_activation_height: None,
             configured_genesis: Arc::new(OnceLock::new()),
+            resident_body_cap: DEFAULT_RESIDENT_BODY_CAP,
+            residency: Arc::new(Mutex::new(BodyResidency::default())),
         }
     }
 
@@ -232,6 +270,66 @@ impl DagStore {
     pub fn with_enforcement_activation_height(mut self, height: u64) -> Self {
         self.enforcement_activation_height = Some(height);
         self
+    }
+
+    /// Bound how many recent blocks keep their full body in memory (persistent
+    /// stores only). Older bodies are reloaded from the backend on read. Takes
+    /// effect from the next stored block.
+    pub fn with_resident_body_cap(mut self, cap: usize) -> Self {
+        self.resident_body_cap = cap;
+        self
+    }
+
+    /// Number of blocks whose full body is currently held in memory by the
+    /// bounded window (persistent stores; an in-memory store reports 0).
+    pub fn resident_body_count(&self) -> usize {
+        match self.residency.lock() {
+            Ok(r) => r.order.len(),
+            Err(p) => p.into_inner().order.len(),
+        }
+    }
+
+    /// Whether this block's in-memory entry is a stripped skeleton. Callers
+    /// hold the `blocks` lock so the answer matches the map.
+    fn is_stripped(&self, hash: &Hash) -> bool {
+        match self.residency.lock() {
+            Ok(r) => r.stripped.contains(hash),
+            Err(p) => p.into_inner().stripped.contains(hash),
+        }
+    }
+
+    /// Reload a stripped block's full body from the backend. Fails closed: a
+    /// missing or undecodable entry, or one whose hash does not match, is an
+    /// error, never a block with a silently empty body.
+    fn load_full_block(&self, hash: &Hash) -> Result<Block, DagStoreError> {
+        let kv = self.persistent.as_ref().ok_or_else(|| {
+            DagStoreError::StorageError(format!("block {hash} body evicted with no backend"))
+        })?;
+        let bytes = kv
+            .kv_get(cf::DAG_BLOCKS, hash.as_bytes())
+            .map_err(|e| DagStoreError::StorageError(format!("reload block {hash}: {e}")))?
+            .ok_or_else(|| {
+                DagStoreError::StorageError(format!("reload block {hash}: missing from backend"))
+            })?;
+        let block: Block = bincode::deserialize(&bytes)
+            .map_err(|e| DagStoreError::StorageError(format!("decode block {hash}: {e}")))?;
+        if block.hash() != *hash {
+            return Err(DagStoreError::StorageError(format!(
+                "reload block {hash}: backend entry has hash {}",
+                block.hash()
+            )));
+        }
+        Ok(block)
+    }
+
+    /// The full block for an entry of the in-memory map: the resident clone,
+    /// or the backend copy when the entry is a skeleton.
+    fn full_block(&self, hash: &Hash, entry: &Block) -> Result<Block, DagStoreError> {
+        if self.is_stripped(hash) {
+            self.load_full_block(hash)
+        } else {
+            Ok(entry.clone())
+        }
     }
 
     /// SECREM-A001: bind this store to its chain's canonical genesis hash.
@@ -282,6 +380,8 @@ impl DagStore {
             proposer_selector: None,
             enforcement_activation_height: None,
             configured_genesis: Arc::new(OnceLock::new()),
+            resident_body_cap: DEFAULT_RESIDENT_BODY_CAP,
+            residency: Arc::new(Mutex::new(BodyResidency::default())),
         };
         store.load_from_persistent()?;
         Ok(store)
@@ -396,6 +496,7 @@ impl DagStore {
 
         let mut blocks = HashMap::new();
         let mut blocks_by_height: HashMap<u64, Vec<Hash>> = HashMap::new();
+        let mut loaded_stripped: HashSet<Hash> = HashSet::new();
         for (_key, value) in &block_entries {
             let block: Block = bincode::deserialize(value)
                 .map_err(|e| DagStoreError::StorageError(format!("deserialize block: {}", e)))?;
@@ -404,6 +505,12 @@ impl DagStore {
                 .entry(block.header.height)
                 .or_default()
                 .push(hash);
+            // Bodies are on disk; keep the skeleton only. `get_block` reloads a
+            // body on demand, so a restart no longer pulls every transaction of
+            // the stored history into memory.
+            let mut block = block;
+            strip_body(&mut block);
+            loaded_stripped.insert(hash);
             blocks.insert(hash, block);
         }
 
@@ -521,6 +628,12 @@ impl DagStore {
         *self.pruning_point.try_write().map_err(|_| {
             DagStoreError::StorageError("lock contention on pruning_point during load".into())
         })? = pruning_point;
+        *self.residency.lock().map_err(|_| {
+            DagStoreError::StorageError("residency lock poisoned during load".into())
+        })? = BodyResidency {
+            order: VecDeque::new(),
+            stripped: loaded_stripped,
+        };
 
         let stats = self.get_stats_sync();
         info!(
@@ -852,12 +965,16 @@ impl DagStore {
         let mut ops: Vec<KvOp> = Vec::new();
 
         // 1. Block bytes.
+        let mut body_on_disk = false;
         match bincode::serialize(&block) {
-            Ok(bytes) => ops.push(KvOp::Put {
-                cf: cf::DAG_BLOCKS.to_string(),
-                key: hash.as_bytes().to_vec(),
-                value: bytes,
-            }),
+            Ok(bytes) => {
+                body_on_disk = self.persistent.is_some();
+                ops.push(KvOp::Put {
+                    cf: cf::DAG_BLOCKS.to_string(),
+                    key: hash.as_bytes().to_vec(),
+                    value: bytes,
+                })
+            }
             Err(e) => {
                 tracing::error!(
                     "M-06: serialize block {} failed: {} — skipping persistence",
@@ -983,20 +1100,42 @@ impl DagStore {
             .or_insert_with(Vec::new)
             .push(hash);
 
-        self.blocks.write().await.insert(hash, block.clone());
+        let stored_height = block.header.height;
+        {
+            let mut blocks = self.blocks.write().await;
+            blocks.insert(hash, block);
+            // Bound resident bodies: once more than `resident_body_cap` blocks
+            // hold a body, strip the oldest down to its skeleton. Only a body
+            // that reached the backend is ever stripped (it must be reloadable).
+            if body_on_disk {
+                let mut res = match self.residency.lock() {
+                    Ok(r) => r,
+                    Err(p) => p.into_inner(),
+                };
+                res.order.push_back(hash);
+                while res.order.len() > self.resident_body_cap {
+                    let Some(old) = res.order.pop_front() else {
+                        break;
+                    };
+                    if let Some(entry) = blocks.get_mut(&old) {
+                        strip_body(entry);
+                        res.stripped.insert(old);
+                    }
+                }
+            }
+        }
 
-        info!("Stored block {} at height {}", hash, block.header.height);
+        info!("Stored block {} at height {}", hash, stored_height);
         Ok(())
     }
 
     /// Get a block by hash
     pub async fn get_block(&self, hash: &Hash) -> Result<Block, DagStoreError> {
-        self.blocks
-            .read()
-            .await
+        let blocks = self.blocks.read().await;
+        let entry = blocks
             .get(hash)
-            .cloned()
-            .ok_or(DagStoreError::BlockNotFound(*hash))
+            .ok_or(DagStoreError::BlockNotFound(*hash))?;
+        self.full_block(hash, entry)
     }
 
     /// Check if a block exists
@@ -1014,7 +1153,16 @@ impl DagStore {
             .map(|hash_list| {
                 hash_list
                     .iter()
-                    .filter_map(|h| blocks.get(h).cloned())
+                    .filter_map(|h| {
+                        let entry = blocks.get(h)?;
+                        match self.full_block(h, entry) {
+                            Ok(b) => Some(b),
+                            Err(e) => {
+                                warn!("get_blocks_at_height({height}): {e}");
+                                None
+                            }
+                        }
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -1106,6 +1254,7 @@ impl DagStore {
             if let Some(hashes) = blocks_by_height.remove(&height) {
                 for hash in hashes {
                     if blocks.remove(&hash).is_some() {
+                        self.forget_residency(&hash);
                         self.persist_delete_block(&hash);
                         // SYNC-S1 D3: the score anchor must not outlive its
                         // block, or a pruned range leaves stale entries behind
@@ -1127,6 +1276,16 @@ impl DagStore {
             pruned_count, pruning_height
         );
         Ok(pruned_count)
+    }
+
+    /// Drop a removed block from the body-residency bookkeeping.
+    fn forget_residency(&self, hash: &Hash) {
+        let mut res = match self.residency.lock() {
+            Ok(r) => r,
+            Err(p) => p.into_inner(),
+        };
+        res.stripped.remove(hash);
+        res.order.retain(|h| h != hash);
     }
 
     /// Get statistics about the DAG

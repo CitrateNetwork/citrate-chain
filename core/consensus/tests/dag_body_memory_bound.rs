@@ -200,10 +200,11 @@ fn persistent_dag_store_does_not_retain_old_block_bodies() {
                 "heap grew {grown} B over {MEASURED} blocks = {per_block} B/block \
                  (each body carries >= {body_bytes} B of tx data)"
             );
-            // Header + index entries are a few hundred bytes per block. A retained
-            // body is >= 8,000 B of tx payload alone. Allow 2 KiB/block.
+            // The skeleton (an 800 B `Block` plus its header vectors and the map
+            // entries) costs about 2 KiB per block. A retained 40-tx body costs
+            // about 20 KiB more. Allow 4 KiB/block.
             assert!(
-                per_block < 2_048,
+                per_block < 4_096,
                 "DAG store retained {per_block} B per block: old block bodies are kept in memory"
             );
 
