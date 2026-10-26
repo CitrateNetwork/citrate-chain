@@ -44,7 +44,8 @@
 # symlink, in a directory only its owner can change; it is re-checked, and must be the same
 # file, before every signing step. A raw key (--private-key, or PRIVATE_KEY/
 # DEPLOYER_PRIVATE_KEY in the environment) and a password on the command line (--password)
-# are refused.
+# are refused, and so is ETH_PASSWORD (forge's password-file variable, which would bypass that
+# check); ETH_KEYSTORE and ETH_KEYSTORE_ACCOUNT must be unset or name the --account keystore.
 #
 # Inputs (env). Values marked OPEN are owner decisions recorded in the runbook §2:
 #   RPC_URL, DEPLOYER_ADDRESS, EXPECTED_CHAIN_ID (40204), EXPECTED_GENESIS_HASH (from the cut)
@@ -107,14 +108,24 @@
 #   C9 one deployer: CEREMONY_DEPLOYER_ADDRESS (which the deploy scripts prefer), DEPLOYER and
 #      EMIT_DEPLOYER, when preset, must be DEPLOYER_ADDRESS byte for byte (an empty value, another
 #      address, case or spelling fails P0 before anything is sent); every phase then runs with
-#      CEREMONY_DEPLOYER_ADDRESS = DEPLOYER_ADDRESS. After a --confirm P2, the deployer-derived
-#      fee recipients (X402Facilitator.treasury, ModelMarketplace.treasuryAddress,
-#      ComputeMarketplace.treasury) of the contracts in the verified book are read from the
-#      chain and must be the book's deployer.
-#   C10 P2 sends once: on --confirm, P2 refuses to start while this run's P2 broadcasts exist
-#      (recorded since block 0) or once the manifest records stackBook. After a phase has
-#      broadcast, no failure message says to re-run it: a P2 gate failure names
-#      --record-stack-book, a P1 gate failure resumes at P2.
+#      CEREMONY_DEPLOYER_ADDRESS = DEPLOYER_ADDRESS. Fee recipients: P2 hands DeployAll the
+#      genesis treasury (GENESIS_TREASURY: an address, not zero, not the deployer; P0 checks it
+#      whenever P2 runs) and never sets a fee recipient itself. After a --confirm P2 the fee
+#      recipients DeployAll set (X402Facilitator.treasury, ModelMarketplace.treasuryAddress,
+#      ComputeMarketplace.treasury) are read from the chain for the contracts in the verified
+#      book and must be GENESIS_TREASURY, never the ceremony EOA; P5 counts a fee recipient that
+#      is the deployer as a DEPLOYER-ADMIN failure.
+#   C10 every broadcasting phase sends once (P1, P2, P3, P4: SENDS_ONCE_PHASES). One guard,
+#      sends_once, runs before a phase sends anything, and the only command that broadcasts
+#      (run_broadcast) refuses a phase the guard has not cleared in this invocation. On
+#      --simulate/--confirm the guard refuses the phase once the run manifest records its output
+#      (governance, stackBook, teamVesting, dormantLedgers: "Pn is done"); on --confirm, also
+#      while this run's broadcasts of that phase's scripts exist (recorded since block 0). P0's
+#      stale-book check names a book the run manifest or this run's broadcasts account for as
+#      done, never as another run's output to move aside. After a phase has broadcast, no
+#      failure message says to re-run it: a P2 gate failure names --record-stack-book, a P1
+#      gate failure resumes at P2. A fresh --confirm run refuses a contracts/broadcast/ that
+#      already holds records for this chain id (a rehearsal's would count as this run's).
 #
 # Output books: P1/P3/P4 write governance.json, team-vesting.json and dormant-ledgers.json
 # into GENESIS_OUT_DIR, and P2/P4/P5 read them from the same place; every producer and
@@ -122,7 +133,9 @@
 # contracts/genesis (foundry.toml fs_permissions), so GENESIS_OUT_DIR must be that directory
 # or one below it; anything else is refused before any phase runs. A phase that writes a
 # book refuses to start, in --simulate or --confirm, while that book already exists: an
-# older file in the directory would otherwise be read as this ceremony's output.
+# older file in the directory would otherwise be read as this ceremony's output. When this run
+# has already produced it (the manifest records it, or this run's broadcasts of that phase
+# exist), the refusal says the phase is done instead.
 #
 # Exit: 0 ok · 1 precondition/usage · 2 a phase step failed · 3 a gate failed
 set -euo pipefail
@@ -183,6 +196,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 refuse_raw_keys
+refuse_keystore_env "$ACCOUNT"
 # The keystore password reaches forge (P1/P3/P4) and regenesis.sh (P2) only as this path. The
 # value is not echoed on refusal: a caller that passed the password itself in its place must
 # not see it in the log. The file must be private to this user (lib.sh password_file_check);
@@ -229,6 +243,7 @@ fi
 should() {
   if [[ -n "$ONLY" ]]; then [[ "$1" == "$ONLY" ]]; else [[ $(idx "$1") -ge $(idx "$FROM") ]]; fi
 }
+next_phase() { echo "${PHASES[$(($(idx "$1") + 1))]:-}"; }
 # after_broadcast <phase>: the safe way on once <phase> has broadcast (C10). Never a re-run of
 # that phase: a broadcast phase is re-entered only through a step that sends nothing.
 after_broadcast() {
@@ -315,8 +330,19 @@ forge_phase() {
     local why
     why=$(password_file_check "$PASSWORD_FILE" "$PASSWORD_FILE_ID") || gate_fail "$phase" "$why"
   fi
-  if [[ "$MODE" == confirm ]]; then SENT_PHASE="$phase"; fi
-  (cd "$CONTRACTS" && "$FORGE" "${args[@]}") || step_fail "$phase" "$script"
+  run_broadcast "$phase" forge_in_contracts "${args[@]}" || step_fail "$phase" "$script"
+}
+forge_in_contracts() { (cd "$CONTRACTS" && "$FORGE" "$@"); }
+
+# run_broadcast <phase> <cmd...>: the only way this script runs a step that can broadcast
+# (forge_phase for P1/P3/P4, regenesis.sh for P2). It refuses a phase that sends_once has not
+# cleared in this invocation (C10), so a broadcasting phase cannot skip the guard.
+run_broadcast() {
+  local ph="$1"
+  shift
+  [[ "$SENDS_ONCE_OK" == "$ph" ]] || die "internal: $ph would run a broadcasting step without the sends-once guard (C10)" 1
+  if [[ "$MODE" == confirm ]]; then SENT_PHASE="$ph"; fi
+  "$@"
 }
 
 # book_addr <book> <name>: contracts.<name> from a book-shaped JSON.
@@ -325,7 +351,9 @@ book_addr() {
 }
 
 # manifest_write <path> <run_id> <mode> <chain_id> <genesis_hash> <g0_ts> <deployer> <account>
-# Atomic (temp file + rename), refusing to replace an existing manifest.
+# Atomic (temp file + link), refusing to replace an existing manifest. The temp file is created
+# with O_CREAT|O_EXCL: an existing file or symlink there (a crashed run's) is refused, never
+# followed or overwritten.
 manifest_write() {
   "$PY" - "$@" <<'PY'
 import json, os, sys
@@ -333,7 +361,11 @@ path, run_id, mode, cid, g0, ts, dep, acct = sys.argv[1:9]
 if os.path.exists(path):
     sys.exit(f"{path} already exists")
 tmp = path + ".tmp"
-with open(tmp, "w") as f:
+try:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+except FileExistsError:
+    sys.exit(f"{tmp} already exists (an earlier run's temp file?); inspect it and move it aside")
+with os.fdopen(fd, "w") as f:
     json.dump({"version": 1, "runId": run_id, "mode": mode, "chainId": int(cid),
                "genesisHash": g0.lower(), "block0Timestamp": int(ts),
                "deployer": dep.lower(), "account": acct}, f, indent=2, sort_keys=True)
@@ -406,7 +438,11 @@ if mode != "bind":
     sys.exit(0)
 m[key] = val
 tmp = path + ".bind.tmp"
-with open(tmp, "w") as f:
+try:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+except FileExistsError:
+    sys.exit(f"{tmp} already exists (an interrupted record?); inspect it and move it aside")
+with os.fdopen(fd, "w") as f:
     json.dump(m, f, indent=2, sort_keys=True)
     f.write("\n")
 os.replace(tmp, path)
@@ -649,10 +685,46 @@ PY
 P2_BROADCAST_SCRIPTS=(DeployAll.s.sol DeployValidatorRegistry.s.sol DeployModelAccessControl.s.sol
   DeployTEEAttestationRegistry.s.sol DeployComputePoolTraining.s.sol DeployEduStack.s.sol DeployAIGateway.s.sol
   DeployP256Verifier.s.sol DeployAA.s.sol DeployCoreMembership.s.sol)
-# p2_sent: the P2 scripts with a broadcast record on this chain since this run's block 0, one
-# per line. A record that cannot be read counts as sent (fail closed).
-p2_sent() {
-  "$PY" - "$CONTRACTS/broadcast" "$EXPECTED_CHAIN_ID" "$RUN_G0TS" "${P2_BROADCAST_SCRIPTS[@]}" <<'PY'
+# C10: every broadcasting phase sends once. SENDS_ONCE_PHASES lists them; each has the run
+# manifest key that records its output (phase_record) and the scripts it broadcasts, by forge's
+# broadcast directory name (phase_scripts). A phase that broadcasts must be listed here: the
+# guard refuses any other, run_broadcast refuses a phase the guard has not cleared, and the
+# test suite's tripwire runs every phase against this run's broadcasts and counts what it sends.
+SENDS_ONCE_PHASES=(P1 P2 P3 P4)
+phase_record() {
+  case "$1" in
+    P1) echo governance ;;
+    P2) echo stackBook ;;
+    P3) echo teamVesting ;;
+    P4) echo dormantLedgers ;;
+    *) return 1 ;;
+  esac
+}
+phase_record_desc() {
+  case "$1" in
+    P1) echo "P1's governance" ;;
+    P2) echo "the stack book" ;;
+    P3) echo "the vesting book" ;;
+    P4) echo "the dormant-ledger book" ;;
+  esac
+}
+phase_scripts() {
+  case "$1" in
+    P1) echo DeployGenesisGovernance.s.sol ;;
+    P2) printf '%s\n' "${P2_BROADCAST_SCRIPTS[@]}" ;;
+    P3) echo DeployTeamVesting.s.sol ;;
+    P4) echo DeployDormantLedgers.s.sol ;;
+    *) return 1 ;;
+  esac
+}
+# phase_sent <phase>: the phase's scripts with a broadcast record on this chain since this run's
+# block 0, one per line. A record that cannot be read counts as sent (fail closed).
+phase_sent() {
+  local scripts
+  scripts=$(phase_scripts "$1") || return 1
+  [[ -n "$scripts" ]] || return 1
+  # shellcheck disable=SC2086 # one script name per word, none has a space
+  "$PY" - "$CONTRACTS/broadcast" "$EXPECTED_CHAIN_ID" "$RUN_G0TS" $scripts <<'PY'
 import glob, json, sys
 bdir, cid, since, scripts = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4:]
 for s in scripts:
@@ -668,27 +740,137 @@ for s in scripts:
             break
 PY
 }
+# phase_done <phase>: exit 0 and print why when this run has done <phase> (the manifest records
+# its output, or on --confirm this run's broadcasts of it exist); 1 when it has not; 2 (and the
+# reason) when the broadcast records cannot be read. Needs the bound run manifest.
+phase_done() {
+  local ph="$1" key s
+  key=$(phase_record "$ph") || return 1
+  if [[ -f "$RUN_MANIFEST" ]] && manifest_has "$RUN_MANIFEST" "$key"; then
+    printf 'the run manifest records %s (%s)' "$(phase_record_desc "$ph")" "$key"
+    return 0
+  fi
+  [[ "$MODE" == confirm && "${RUN_G0TS:-}" =~ ^[0-9]+$ ]] || return 1
+  if ! s=$(phase_sent "$ph"); then
+    printf "cannot read this run's broadcast records under contracts/broadcast/"
+    return 2
+  fi
+  [[ -n "$s" ]] || return 1
+  printf "this run's %s broadcasts are recorded (%s)" "$ph" "$(printf '%s' "$s" | paste -sd, -)"
+}
+# stale_books: P0's check that a phase about to write its book finds none there. A book with
+# no record in this run is an earlier run's (or a simulation's) output, and later phases would
+# read it as this run's, so it must be moved aside. A book this run accounts for (the manifest
+# records it, or this run's broadcasts of that phase exist) means the phase is done: never
+# move it aside or re-run the phase.
+stale_books() {
+  local pb ph book why rc nx
+  for pb in "P1:$GOV_BOOK" "P3:$VEST_BOOK" "P4:$DORMANT_BOOK"; do
+    ph="${pb%%:*}" book="${pb#*:}"
+    should "$ph" && [[ -e "$book" ]] || continue
+    rc=0
+    why=$(phase_done "$ph") || rc=$?
+    if [[ $rc -eq 0 ]]; then
+      err "GATE FAIL at P0: $book is this run's $ph output: $why. $ph is done"
+      err "do NOT re-run $ph or move its book aside: $ph would send its transactions again"
+      nx=$(next_phase "$ph")
+      if manifest_has "$RUN_MANIFEST" "$(phase_record "$ph")"; then
+        err "resume after $ph: $0 --$MODE --from $nx${ACCOUNT:+ --account $ACCOUNT}${PASSWORD_FILE:+ --password-file $PASSWORD_FILE}"
+      else
+        after_broadcast "$ph"
+      fi
+      exit 3
+    elif [[ $rc -eq 2 ]]; then
+      gate_fail P0 "$book exists and $why"
+    fi
+    gate_fail P0 "$book already exists and $ph would write it; move it aside (this run has no record of it, so it is not this ceremony's output) or resume after $ph"
+  done
+}
+# sends_once <phase>: the guard every broadcasting phase runs before it sends anything (C10).
+# --simulate/--confirm: refused once the run manifest records the phase's output. --confirm:
+# also refused while this run's broadcasts of the phase exist, except for the record step
+# (--record-stack-book), which sends nothing and needs them. On a pass the phase may broadcast
+# (run_broadcast); the record step never may.
+SENDS_ONCE_OK=""
+sent=""
+sends_once() {
+  local ph="$1" key
+  [[ " ${SENDS_ONCE_PHASES[*]} " == *" $ph "* ]] && key=$(phase_record "$ph") ||
+    die "internal: $ph broadcasts but is not in SENDS_ONCE_PHASES (C10)" 1
+  SENDS_ONCE_OK=""
+  if [[ "$MODE" == dry ]]; then
+    SENDS_ONCE_OK="$ph"
+    return 0
+  fi
+  is_addr "${RUN_DEPLOYER:-}" && [[ "${RUN_G0TS:-}" =~ ^[0-9]+$ ]] || gate_fail "$ph" "no run deployer or block-0 timestamp (the P0 run manifest did not load)"
+  if manifest_has "$RUN_MANIFEST" "$key"; then
+    if [[ "$MODE" == confirm ]]; then SENT_PHASE="$ph"; fi
+    gate_fail "$ph" "the run manifest already records $(phase_record_desc "$ph"): $ph is done"
+  fi
+  if [[ "$MODE" == confirm ]]; then
+    sent=$(phase_sent "$ph") || gate_fail "$ph" "cannot read this run's broadcast records under contracts/broadcast/"
+    if [[ "$RECORD_BOOK" == 1 ]]; then
+      [[ -n "$sent" ]] || gate_fail "$ph" "--record-stack-book: no $ph broadcast from this run is recorded, so there is no book to record (run $ph)"
+      SENT_PHASE="$ph"
+      return 0
+    fi
+    if [[ -n "$sent" ]]; then
+      SENT_PHASE="$ph"
+      gate_fail "$ph" "this run's $ph broadcasts are already recorded ($(printf '%s' "$sent" | paste -sd, -)): $ph has sent its transactions"
+    fi
+  fi
+  SENDS_ONCE_OK="$ph"
+}
 
-# C9: the fee recipients DeployAll derives from the deployer (treasury constructor arguments)
-# are read from the chain for every such contract the verified book lists, and must be the
-# book's deployer (= the run's, checked above), never a value only the environment supplied.
+# C9: DeployAll sets its fee recipients (treasury constructor arguments) at construction from
+# the genesis treasury P2 hands it (GENESIS_TREASURY); the ceremony never sets one. Block 0
+# must route no revenue to the ceremony EOA, so after a --confirm P2 each fee recipient the
+# verified book lists is read from the chain and must be GENESIS_TREASURY, never the deployer.
 FEE_RECIPIENT_GETTERS=("X402Facilitator:treasury" "ModelMarketplace:treasuryAddress" "ComputeMarketplace:treasury")
+# treasury_check: GENESIS_TREASURY is an address, not zero and not the deployer; prints the
+# reason and fails otherwise.
+treasury_check() {
+  local t="${GENESIS_TREASURY:-}"
+  [[ -n "$t" ]] || { echo "GENESIS_TREASURY is not set (the fee recipient P2 hands DeployAll)"; return 1; }
+  is_addr "$t" || { echo "GENESIS_TREASURY ($t) is not an address"; return 1; }
+  [[ "$(lower "$t")" != 0x0000000000000000000000000000000000000000 ]] || { echo "GENESIS_TREASURY is the zero address"; return 1; }
+  [[ "$(lower "$t")" != "$(lower "${DEPLOYER_ADDRESS:-}")" ]] || { echo "GENESIS_TREASURY is the deployer: block 0 must route no revenue to the ceremony EOA"; return 1; }
+}
 check_fee_recipients() {
-  local e name fn a got seen=""
+  local e name fn a got seen="" want why
+  why=$(treasury_check) || gate_fail P2 "$why"
+  want=$(lower "$GENESIS_TREASURY")
   for e in "${FEE_RECIPIENT_GETTERS[@]}"; do
     name="${e%%:*}" fn="${e#*:}"
     a=$(book_addr "$book_abs" "$name") || continue
     is_addr "$a" || gate_fail P2 "the book's $name ($a) is not an address"
     got=$(cast_read "$a" "$fn()(address)") && is_addr "$got" || gate_fail P2 "cannot read $name.$fn() at $a"
-    [[ "$(lower "$got")" == "$RUN_DEPLOYER" ]] ||
-      gate_fail P2 "$name.$fn() is $(lower "$got"), not the book's deployer $RUN_DEPLOYER"
+    got=$(lower "$got")
+    [[ "$got" != "$RUN_DEPLOYER" ]] ||
+      gate_fail P2 "$name.$fn() is the deployer $RUN_DEPLOYER: the fee recipient must be GENESIS_TREASURY $want, never the ceremony EOA"
+    [[ "$got" == "$want" ]] ||
+      gate_fail P2 "$name.$fn() is $got, not GENESIS_TREASURY $want"
     seen+="${seen:+, }$name"
   done
   if [[ -n "$seen" ]]; then
-    log "P2 fee recipients are the run's deployer: $seen"
+    log "P2 fee recipients are GENESIS_TREASURY: $seen"
   else
-    log "P2 note: the book lists no contract with a deployer-derived fee recipient"
+    log "P2 note: the book lists no contract with a DeployAll fee recipient"
   fi
+}
+# fee_recipients_held_by_deployer <book>: P5's part of the DEPLOYER-ADMIN gate. Prints one
+# "DEPLOYER-ADMIN <name>: <getter>() is the deployer EOA" line for every fee recipient in the
+# book that is the run's deployer; fails (with the reason) when one cannot be read.
+fee_recipients_held_by_deployer() {
+  local e name fn a got
+  for e in "${FEE_RECIPIENT_GETTERS[@]}"; do
+    name="${e%%:*}" fn="${e#*:}"
+    a=$(book_addr "$1" "$name") || continue
+    is_addr "$a" || { echo "the book's $name ($a) is not an address"; return 1; }
+    got=$(cast_read "$a" "$fn()(address)") && is_addr "$got" || { echo "cannot read $name.$fn() at $a"; return 1; }
+    if [[ "$(lower "$got")" == "$RUN_DEPLOYER" ]]; then echo "DEPLOYER-ADMIN $name: $fn() is the deployer EOA"; fi
+  done
+  return 0
 }
 
 # record_output_book <phase> <key> <book> <script> [governance json]: C5 + C9 for the book a
@@ -786,7 +968,13 @@ load_governance() {
   for v in VALIDATOR_GOVERNANCE VALIDATOR_SLASHER GOVERNANCE GUARDIAN GOVERNANCE_TIMELOCK GOVERNANCE_MULTISIG GUARDIAN_MULTISIG; do
     pre+=("$v=${!v:-}")
   done
-  [[ -f "$GOV_BOOK" ]] || gate_fail "$ph" "$GOV_BOOK missing (run P1 first)"
+  if [[ ! -f "$GOV_BOOK" ]]; then
+    if [[ -f "${RUN_MANIFEST:-}" ]] && manifest_has "$RUN_MANIFEST" governance; then
+      gate_fail "$ph" "$GOV_BOOK is missing, but the run manifest records P1's governance: P1 is done. Put P1's governance.json back (do NOT re-run P1)" \
+        "restore $GOV_BOOK from this run's P1 output, then resume: $(resume_cmd "$ph")"
+    fi
+    gate_fail "$ph" "$GOV_BOOK missing (run P1 first)"
+  fi
   GOVERNANCE=$(book_addr "$GOV_BOOK" GovernanceTimelock) || gate_fail "$ph" "governance.json has no GovernanceTimelock"
   GUARDIAN=$(book_addr "$GOV_BOOK" GuardianTimelock) || gate_fail "$ph" "governance.json has no GuardianTimelock"
   GOVERNANCE_MULTISIG=$(book_addr "$GOV_BOOK" GovernanceMultisig) || gate_fail "$ph" "governance.json has no GovernanceMultisig"
@@ -873,6 +1061,17 @@ if should P0 || [[ "$MODE" != dry ]]; then
   else
     gate_fail P0 "phase inputs: $inputs_why"
   fi
+  # C9: the genesis treasury P2 hands DeployAll as its fee recipient.
+  if should P2; then
+    if tw_why=$(treasury_check); then
+      export GENESIS_TREASURY
+      log "P0 genesis treasury (fee recipient P2 hands DeployAll): $(lower "$GENESIS_TREASURY")"
+    elif [[ "$MODE" == dry ]]; then
+      log "P0 plan: a --simulate/--confirm run that reaches P2 refuses until this is fixed: $tw_why"
+    else
+      gate_fail P0 "$tw_why"
+    fi
+  fi
   if [[ -n "${TEAM_VESTING_FILE:-}" ]]; then
     [[ -f "$TEAM_VESTING_FILE" || -f "$CONTRACTS/$TEAM_VESTING_FILE" ]] || gate_fail P0 "TEAM_VESTING_FILE not found (a path relative to contracts/, under genesis/)"
   fi
@@ -903,13 +1102,19 @@ if should P0 || [[ "$MODE" != dry ]]; then
     fi
   fi
   if [[ "$MODE" != dry ]]; then
-    # A phase about to write a book must not find one already there: it would be an earlier
-    # run's (or a simulation's) output, and later phases would read it as this run's.
-    for pb in "P1:$GOV_BOOK" "P3:$VEST_BOOK" "P4:$DORMANT_BOOK"; do
-      if should "${pb%%:*}" && [[ -e "${pb#*:}" ]]; then
-        gate_fail P0 "${pb#*:} already exists and ${pb%%:*} would write it; move it aside (it is not this ceremony's output) or resume after ${pb%%:*}"
-      fi
-    done
+    # A fresh run has no manifest yet, so a book already there cannot be its output: check
+    # now, before the manifest is written. A resume checks after binding to its run, below.
+    if [[ "$FROM" == P0 && -z "$ONLY" ]]; then stale_books; fi
+    # C10: a fresh --confirm run starts from a broadcast directory with no record for this chain
+    # id. A rehearsal's records on the same id would otherwise count as this run's broadcasts.
+    if [[ "$MODE" == confirm && "$FROM" == P0 && -z "$ONLY" ]]; then
+      old=$("$PY" -c 'import glob, os, sys
+fs = sorted(glob.glob(os.path.join(sys.argv[1], "*", sys.argv[2], "run-*.json")))
+print(", ".join(sorted({os.path.basename(os.path.dirname(os.path.dirname(f))) for f in fs})))' "$CONTRACTS/broadcast" "$EXPECTED_CHAIN_ID") ||
+        gate_fail P0 "cannot list contracts/broadcast/"
+      [[ -z "$old" ]] || gate_fail P0 "contracts/broadcast/ already holds chain $EXPECTED_CHAIN_ID broadcast records ($old) from before this run; a fresh ceremony starts from a clean checkout" \
+        "move contracts/broadcast/ aside (keep it with that run's books), then run again: $(resume_cmd P0)"
+    fi
   fi
   if [[ "$MODE" != dry ]]; then
     # Bind this invocation to its ceremony run (see "Run manifest" above).
@@ -928,6 +1133,7 @@ if should P0 || [[ "$MODE" != dry ]]; then
     is_addr "$RUN_DEPLOYER" && [[ "$RUN_G0TS" =~ ^[0-9]+$ && -n "$RUN_ID" ]] || gate_fail P0 "run manifest: unexpected record $run_rec"
     RUN_G0=$(lower "$g0")
     log "P0 bound to run $RUN_ID (deployer $RUN_DEPLOYER)"
+    if [[ "$FROM" != P0 || -n "$ONLY" ]]; then stale_books; fi
     # C6: the KEEP list this run checks is fixed by its hash, recorded on the fresh run.
     if [[ -n "${KEEP_LIST:-}" ]]; then
       keep_sha=$(sha256sum "$KEEP_LIST" | cut -c1-64) || gate_fail P0 "cannot hash KEEP_LIST"
@@ -948,6 +1154,7 @@ if should P1; then
   export GENESIS_GOVERNANCE_OUT="$GOV_REL"
   export GENESIS_PROFILE=1
   export GOV_PROPOSAL_TTL="${GOV_PROPOSAL_TTL:-$GENESIS_TTL_SECS}" GRD_PROPOSAL_TTL="${GRD_PROPOSAL_TTL:-$GENESIS_TTL_SECS}"
+  sends_once P1
   log "P1 governance → $GOV_BOOK"
   forge_phase P1 DeployGenesisGovernance.s.sol
   # A broadcast P1 is checked on chain and recorded in the manifest at once (C2, C3).
@@ -973,20 +1180,7 @@ if should P2; then
     # C10: P2 sends once. A recorded book means P2 is done; on --confirm, this run's P2
     # broadcasts on disk mean it has sent, and only the record step (which sends nothing) may
     # go on from there.
-    if manifest_has "$RUN_MANIFEST" stackBook; then
-      [[ "$MODE" == confirm ]] && SENT_PHASE=P2
-      gate_fail P2 "the run manifest already records the stack book: P2 is done"
-    fi
-    if [[ "$MODE" == confirm ]]; then
-      sent=$(p2_sent) || gate_fail P2 "cannot read this run's broadcast records under contracts/broadcast/"
-      if [[ "$RECORD_BOOK" == 1 ]]; then
-        [[ -n "$sent" ]] || gate_fail P2 "--record-stack-book: no P2 broadcast from this run is recorded, so there is no book to record (run P2)"
-        SENT_PHASE=P2
-      elif [[ -n "$sent" ]]; then
-        SENT_PHASE=P2
-        gate_fail P2 "this run's P2 broadcasts are already recorded ($(printf '%s' "$sent" | paste -sd, -)): P2 has sent its transactions"
-      fi
-    fi
+    sends_once P2
     for v in DEPLOYER EMIT_DEPLOYER; do
       if [[ -n "${!v:-}" && "$(lower "${!v}")" != "$RUN_DEPLOYER" ]]; then
         gate_fail P2 "$v is set to ${!v}, but this run's deployer is $RUN_DEPLOYER; unset it: the ceremony sets the generator's deployer from the run manifest"
@@ -1007,8 +1201,7 @@ if should P2; then
       if [[ "$MODE" == confirm && -n "$PASSWORD_FILE" ]]; then
         why=$(password_file_check "$PASSWORD_FILE" "$PASSWORD_FILE_ID") || gate_fail P2 "$why"
       fi
-      if [[ "$MODE" == confirm ]]; then SENT_PHASE=P2; fi
-      RPC_URL="$RPC_URL" bash "$REGENESIS" "${rargs[@]}" || step_fail P2 regenesis.sh
+      RPC_URL="$RPC_URL" run_broadcast P2 bash "$REGENESIS" "${rargs[@]}" || step_fail P2 regenesis.sh
     fi
     if [[ "$MODE" == confirm ]]; then
       verify_stack_book
@@ -1025,6 +1218,7 @@ if should P3; then
     log "P3 vesting: TEAM_VESTING_FILE unset (OPEN: owner amounts); planned only"
   fi
   export TEAM_VESTING_FILE="${TEAM_VESTING_FILE:-genesis/team-vesting.input.json}" TEAM_VESTING_OUT="$VEST_REL"
+  sends_once P3
   log "P3 team vesting → $VEST_BOOK"
   forge_phase P3 DeployTeamVesting.s.sol
   if [[ "$MODE" != dry ]]; then record_output_book P3 teamVesting "$VEST_BOOK" DeployTeamVesting.s.sol; fi
@@ -1032,6 +1226,7 @@ fi
 
 # ---------------------------------------------------------------- P4
 if should P4; then
+  sends_once P4
   load_governance P4 "$([[ "$MODE" == confirm ]] && echo 1 || echo 0)"
   export DORMANT_LEDGERS_OUT="$DORMANT_REL" GENESIS_GOVERNANCE_BOOK="$GOV_REL"
   # P4's own inputs exist only after P1 (deployed under GOVERNANCE), so a fresh run checks them
@@ -1175,8 +1370,14 @@ PY
     }
     fa=$(admin_count FACTORY-ADMIN) || gate_fail P5 "the checker report has no single FACTORY-ADMIN summary"
     da=$(admin_count DEPLOYER-ADMIN) || gate_fail P5 "the checker report has no single DEPLOYER-ADMIN summary"
+    # C9: a fee recipient that is the deployer is a DEPLOYER-ADMIN failure too.
+    fee_da=$(fee_recipients_held_by_deployer "$P5_BOOK") || gate_fail P5 "fee recipients: $(printf '%s\n' "$fee_da" | tail -n1)"
+    if [[ -n "$fee_da" ]]; then
+      printf '%s\n' "$fee_da"
+      da=$((da + $(printf '%s\n' "$fee_da" | grep -c .)))
+    fi
     [[ "$fa" == 0 ]] || gate_fail P5 "FACTORY-ADMIN is not 0"
-    [[ "$da" == 0 ]] || gate_fail P5 "DEPLOYER-ADMIN is not 0: the deployer still holds a role"
+    [[ "$da" == 0 ]] || gate_fail P5 "DEPLOYER-ADMIN is not 0: the deployer still holds a role or receives fees"
     log "P5 PASS: FACTORY-ADMIN 0, DEPLOYER-ADMIN 0 over $P5_BOOK_REL"
   fi
 fi

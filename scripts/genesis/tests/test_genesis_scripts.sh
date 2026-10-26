@@ -113,6 +113,32 @@ env >>"$FAKE/forge.env"
 # output book (TEAM_VESTING_OUT / DORMANT_LEDGERS_OUT, relative to contracts/, the cwd).
 if [[ "$*" == *DeployTeamVesting* && -n "${FAKE_P3_BOOK:-}" ]]; then cp "$FAKE_P3_BOOK" "$TEAM_VESTING_OUT"; fi
 if [[ "$*" == *DeployDormantLedgers* && -n "${FAKE_P4_BOOK:-}" ]]; then cp "$FAKE_P4_BOOK" "$DORMANT_LEDGERS_OUT"; fi
+# FAKE_FORGE_BCAST=1: a --broadcast run records its broadcast as forge does
+# (broadcast/<script>/40204/run-<n>.json and run-latest.json, relative to contracts/, the cwd),
+# at FAKE_FORGE_TS (default 6000, after the fake block 0). FAKE_P1_BOOK=<file>: P1 "writes" that
+# file as its governance output (GENESIS_GOVERNANCE_OUT). FAKE_FORGE_FAIL=1: a --broadcast run
+# fails after it has recorded its broadcast (sent, then stopped).
+if [[ "$*" == *--broadcast* && -n "${FAKE_FORGE_BCAST:-}" ]]; then
+  fs=""
+  for a in "$@"; do [[ "$a" == script/* ]] && fs="${a#script/}"; done
+  fd="broadcast/$fs/40204"
+  mkdir -p "$fd"
+  fn=$(find "$fd" -name 'run-[0-9]*.json' | wc -l)
+  printf '{"timestamp":%s,"transactions":[{"transactionType":"CREATE","contractName":"Fake","contractAddress":"0x%040x"}]}\n' "${FAKE_FORGE_TS:-6000}" "$((fn + 4096))" >"$fd/run-$((${FAKE_FORGE_TS:-6000} + fn)).json"
+  cp "$fd/run-$((${FAKE_FORGE_TS:-6000} + fn)).json" "$fd/run-latest.json"
+fi
+if [[ "$*" == *DeployGenesisGovernance* && "$*" == *--broadcast* && -n "${FAKE_P1_BOOK:-}" ]]; then cp "$FAKE_P1_BOOK" "$GENESIS_GOVERNANCE_OUT"; fi
+# $FAKE/bc-stage/<script>/: a broadcast record a test staged for that step; a --broadcast run of
+# the step writes it under broadcast/ (the step sends, then its record exists).
+if [[ "$*" == *--broadcast* ]]; then
+  for a in "$@"; do
+    if [[ "$a" == script/* && -d "$FAKE/bc-stage/${a#script/}" ]]; then
+      mkdir -p "broadcast/${a#script/}"
+      cp -R "$FAKE/bc-stage/${a#script/}/." "broadcast/${a#script/}/"
+    fi
+  done
+fi
+[[ "$*" != *--broadcast* || -z "${FAKE_FORGE_FAIL:-}" ]] || exit 2
 if [[ "$*" == *CheckDeployedAdmins* ]]; then
   # Like the real checker: read ONE book, ADDRESS_BOOK (relative to contracts/, the cwd).
   # FAKE_DEPLOYER_HELD=<name>: the contract of that name in the book still has the deployer
@@ -163,7 +189,8 @@ EOF
 chmod +x "$BIN"/*
 export FAKE CAST="$BIN/cast" FORGE="$BIN/forge" SYSTEMCTL="$BIN/systemctl"
 unset RPC RPC_URL ADDRESS_BOOK BROADCAST_DIR KEEP_LIST FLEET_RPCS EXPECTED_GENESIS_HASH PRIVATE_KEY DEPLOYER_PRIVATE_KEY \
-  DEPLOYER_ADDRESS CEREMONY_DEPLOYER_ADDRESS DEPLOYER EMIT_DEPLOYER EMIT_OUTPUT EMIT_BROADCAST_SINCE EMIT_FRESH_GENESIS EMITTER
+  DEPLOYER_ADDRESS CEREMONY_DEPLOYER_ADDRESS DEPLOYER EMIT_DEPLOYER EMIT_OUTPUT EMIT_BROADCAST_SINCE EMIT_FRESH_GENESIS EMITTER \
+  GENESIS_TREASURY ETH_PASSWORD ETH_KEYSTORE ETH_KEYSTORE_ACCOUNT
 calls() { cat "$FAKE/calls.log" 2>/dev/null; }
 reset_calls() { : >"$FAKE/calls.log"; }
 
@@ -544,7 +571,10 @@ setup_node() {
   chmod +x "$T/node/home/bin/"*
   printf '[Service]\nEnvironment=CITRATE_VALIDATOR_REGISTRY=%s\n' "$A2" >"$T/node/dropin/reroll.conf"
 }
-RNENV=(env CITRATE_HOME="$T/node/home" DROPIN="$T/node/dropin/reroll.conf" NODE_OWNER= SYSTEMCTL="$BIN/systemctl")
+# Fake chown: logs, changes nothing (the tests do not run as root).
+printf '#!/usr/bin/env bash\necho "chown $*" >>"$FAKE/calls.log"\n' >"$BIN/chown"
+chmod +x "$BIN/chown"
+RNENV=(env CITRATE_HOME="$T/node/home" DROPIN="$T/node/dropin/reroll.conf" NODE_OWNER= SYSTEMCTL="$BIN/systemctl" CHOWN="$BIN/chown")
 NEWCB=$(addr 4660)
 NEWVR=$(addr 4661)
 
@@ -571,6 +601,19 @@ else
   bad "reset: watchdog and node stopped, nothing started" "$(calls)"
 fi
 
+# The installed binary is root's (mode 0755), never the node user's: the service account runs
+# it but cannot rewrite it. The new data dir is created 0700 and handed to the node user.
+setup_node
+reset_calls
+expect "reset: --confirm with a node user" 0 'NOT started' -- "${RNENV[@]}" NODE_OWNER=citrate:citrate bash -c 'umask 022; exec "$@"' _ bash "$RN" --coinbase "$NEWCB" --validator-registry "$NEWVR" --activation-height 0 --confirm
+RNB="$T/node/home/bin/citrate-node"
+if calls | grep -qx "chown root:root $RNB" && ! calls | grep -qx "chown citrate:citrate $RNB" && [[ "$(stat -c %a "$RNB")" == 755 ]]; then
+  ok "reset: the installed binary is root-owned 0755, not the node user's"
+else
+  bad "reset: the installed binary is root-owned 0755, not the node user's" "$(calls; stat -c '%a %n' "$RNB")"
+fi
+calls | grep -qx "chown -R citrate:citrate $T/node/home/.citrate" && ok "reset: the new data dir is handed to the node user" || bad "reset: the new data dir is handed to the node user" "$(calls)"
+[[ "$(stat -c %a "$T/node/home/.citrate")" == 700 ]] && ok "reset: the new data dir is mode 0700 under umask 022" || bad "reset: the new data dir is mode 0700 under umask 022" "$(stat -c '%a' "$T/node/home/.citrate")"
 setup_node
 expect "reset: --keep-proposer-key carries it" 0 'NOT started' -- "${RNENV[@]}" bash "$RN" --coinbase "$NEWCB" --validator-registry "$NEWVR" --activation-height 0 --keep-proposer-key --confirm
 [[ -f "$T/node/home/.citrate/proposer.key" ]] && ok "reset: proposer.key present with the flag" || bad "reset: proposer.key present with the flag"
@@ -624,6 +667,7 @@ cat >"$REPO/scripts/ops/regenesis.sh" <<'EOF'
 #!/usr/bin/env bash
 echo "regenesis $*" >>"$FAKE/calls.log"
 echo "regenesis-env vg=${VALIDATOR_GOVERNANCE:-} vs=${VALIDATOR_SLASHER:-} gov=${GOVERNANCE:-}" >>"$FAKE/calls.log"
+echo "regenesis-treasury ${GENESIS_TREASURY-<unset>}" >>"$FAKE/calls.log"
 echo "regenesis-emit fresh=${EMIT_FRESH_GENESIS:-} dep=${EMIT_DEPLOYER:-} since=${EMIT_BROADCAST_SINCE:-} out=${EMIT_OUTPUT:-}" >>"$FAKE/calls.log"
 echo "regenesis-deployer dep=${DEPLOYER_ADDRESS-<unset>} ceremony=${CEREMONY_DEPLOYER_ADDRESS-<unset>}" >>"$FAKE/calls.log"
 env >>"$FAKE/regenesis.env"
@@ -674,7 +718,7 @@ CEENV=(env REPO_ROOT="$REPO" DEPLOYER_ADDRESS="$DEP"
   GRD_OWNERS="$(owners 21 22 23)" GRD_THRESHOLD=2 GRD_MIN_DELAY=3600
   SIGNER_1="$(addr 61)" SIGNER_2="$(addr 62)" SIGNER_3="$(addr 63)" RELAYER="$(addr 64)"
   CITRATE_AA_OWNER="$(addr 65)" CITRATE_AA_IDENTITY_SIGNER="$(addr 66)" CITRATE_AA_SPONSOR_SIGNER="$(addr 67)"
-  MEMBERSHIP_OWNER="$(addr 68)")
+  MEMBERSHIP_OWNER="$(addr 68)" GENESIS_TREASURY="$(addr 90)")
 
 reset_calls
 expect "ceremony: dry run with genesis values passes" 0 'done \(mode=dry\)' -- "${CEENV[@]}" bash "$CE"
@@ -1204,8 +1248,9 @@ p2_list_sync "$G/../ops/regenesis.sh" && ok "ceremony C10: P2_BROADCAST_SCRIPTS 
 { cat "$G/../ops/regenesis.sh"; echo 'run_step "DeployNewThing.s.sol"'; } >"$T/regenesis-extra.sh"
 p2_list_sync "$T/regenesis-extra.sh" && bad "ceremony C10: the list check catches a script added to regenesis.sh (negative control)" ||
   ok "ceremony C10: the list check catches a script added to regenesis.sh (negative control)"
-# After a --confirm P2, the deployer-derived fee recipients of the contracts in the book are
-# read from the chain and must be the book's (= the run's) deployer.
+# After a --confirm P2, the fee recipients of the contracts in the book are read from the chain
+# and must be the GENESIS_TREASURY P2 handed DeployAll (0x..5a here), never the deployer:
+# block 0 routes no revenue to the ceremony EOA.
 C9B="$T/c9-book.json"
 C9VR=$(addr 401) C9SBT=$(addr 402) C9BOND=$(addr 403) C9VI=$(addr 404) C9VP=$(addr 405)
 C9X=$(addr 411) C9MM=$(addr 412) C9CM=$(addr 413)
@@ -1229,7 +1274,7 @@ cp "$GBK" "$T/book.c9.orig"
 C9ENV=("${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1
   FAKE_REGEN_BOOK="$C9B" FAKE_REGEN_BCAST="$C9BC" EMITTER="$T/fake-emit.sh")
 # c9_setup: a --confirm run after P1 (manifest, governance on chain, fee recipients = the
-# deployer), before P2 has sent anything (no broadcast recorded yet).
+# GENESIS_TREASURY), before P2 has sent anything (no broadcast recorded yet).
 c9_setup() {
   rm -rf "$REPO/contracts/broadcast"
   cp "$T/book.c9.orig" "$GBK"
@@ -1237,9 +1282,9 @@ c9_setup() {
   gov_book "$GB" "$DEP"
   gov_chain
   rm -rf "$FAKE/call/$C9X" "$FAKE/call/$C9MM" "$FAKE/call/$C9CM"
-  fake_call "$C9X" treasury "$DEP"
-  fake_call "$C9MM" treasuryAddress "$DEP"
-  fake_call "$C9CM" treasury "$DEP"
+  fake_call "$C9X" treasury "$(addr 90)"
+  fake_call "$C9MM" treasuryAddress "$(addr 90)"
+  fake_call "$C9CM" treasury "$(addr 90)"
 }
 c9_fee() { # name want-exit pattern [fake_call setup...]
   local name="$1" want="$2" pat="$3"
@@ -1249,9 +1294,14 @@ c9_fee() { # name want-exit pattern [fake_call setup...]
   expect "ceremony C9: $name" "$want" "$pat" -- "${C9ENV[@]}" bash "$CE" --confirm --only P2 --account deployer
   cp "$T/book.c9.orig" "$GBK"
 }
-c9_fee "fee recipients equal to the run's deployer pass P2" 0 'P2 fee recipients are the run.s deployer: X402Facilitator, ModelMarketplace, ComputeMarketplace' true
-c9_fee "an X402Facilitator fee recipient other than the run's deployer fails P2" 3 'X402Facilitator.treasury\(\) is 0x0+63, not the book.s deployer 0x0+1' fake_call "$C9X" treasury "$STALE"
-c9_fee "a ModelMarketplace fee recipient other than the run's deployer fails P2" 3 'ModelMarketplace.treasuryAddress\(\) is 0x0+63' fake_call "$C9MM" treasuryAddress "$STALE"
+c9_fee "fee recipients equal to GENESIS_TREASURY pass P2" 0 'P2 fee recipients are GENESIS_TREASURY: X402Facilitator, ModelMarketplace, ComputeMarketplace' true
+c9_fee "an X402Facilitator fee recipient other than GENESIS_TREASURY fails P2" 3 'X402Facilitator.treasury\(\) is 0x0+63, not GENESIS_TREASURY 0x0+5a' fake_call "$C9X" treasury "$STALE"
+c9_fee "a GOVERNANCE fee recipient is not GENESIS_TREASURY and fails P2" 3 'X402Facilitator.treasury\(\) is 0x0+1f, not GENESIS_TREASURY' fake_call "$C9X" treasury "$(addr 31)"
+c9_fee "a ModelMarketplace fee recipient other than GENESIS_TREASURY fails P2" 3 'ModelMarketplace.treasuryAddress\(\) is 0x0+63' fake_call "$C9MM" treasuryAddress "$STALE"
+for g in "X402Facilitator:$C9X:treasury" "ModelMarketplace:$C9MM:treasuryAddress" "ComputeMarketplace:$C9CM:treasury"; do
+  IFS=: read -r gn ga gf <<<"$g"
+  c9_fee "a $gn fee recipient that is the deployer fails P2" 3 "$gn.$gf\\(\\) is the deployer 0x0+1: the fee recipient must be GENESIS_TREASURY" fake_call "$ga" "$gf" "$DEP"
+done
 c9_fee "an unreadable ComputeMarketplace fee recipient fails P2" 3 'cannot read ComputeMarketplace.treasury\(\)' rm -f "$FAKE/call/$C9CM/treasury"
 # #364 on P2 (the password fixture is set up before the regenesis.sh cases above).
 c9_setup
@@ -1322,7 +1372,7 @@ for how in "--only P2" "--from P2"; do
   expect "ceremony recovery: $how is refused once this run's P2 broadcasts exist" 3 'GATE FAIL at P2: this run.s P2 broadcasts are already recorded' -- "${C9ENV[@]}" bash "$CE" --confirm $how --account deployer
   if calls | grep -q '^regenesis'; then bad "ceremony recovery: $how after a broadcast runs no regenesis" "$(calls)"; else ok "ceremony recovery: $how after a broadcast runs no regenesis"; fi
 done
-fake_call "$C9X" treasury "$DEP"
+fake_call "$C9X" treasury "$(addr 90)"
 reset_calls
 expect "ceremony recovery: the record step verifies and records the book from this run's broadcasts" 0 'P2 stack book recorded' -- "${C9ENV[@]}" bash "$CE" --confirm --only P2 --record-stack-book --account deployer
 if calls | grep -q '^regenesis'; then bad "ceremony recovery: the record step sends nothing (no regenesis)" "$(calls)"; else ok "ceremony recovery: the record step sends nothing (no regenesis)"; fi
@@ -1374,6 +1424,276 @@ rm -rf "$P1D"
 # A gate that fails before its phase sent anything still names that phase's resume (control).
 c9_setup
 expect "ceremony recovery: a gate failure before any broadcast resumes at that phase" 3 "fix it, then resume: .* --confirm --from P2 --account deployer" -- "${C9ENV[@]}" VALIDATOR_GOVERNANCE="$STALE" bash "$CE" --confirm --only P2 --account deployer
+# ---------------------------------------------------------------- C10: every broadcasting phase sends once
+# Before, only P2 refused a second send. An identical retry of P1, P3 or P4 after a failure that
+# came after its broadcast sent the phase again, and P0 called a book this run had written "not
+# this ceremony's output; move it aside", which also led to a second send. The fake forge
+# records its broadcasts here (FAKE_FORGE_BCAST=1) and bcount counts the broadcasting calls.
+bcount() { calls | grep -cE '^(forge script .*--broadcast|regenesis .*--broadcast)' || true; }
+C10D="$REPO/contracts/genesis/c10"
+C10ENV=("${C9ENV[@]}" GENESIS_OUT_DIR="$C10D" PATRONAGE_KYC_REGISTRY="$(addr 51)" PATRONAGE_MEMBERSHIP="$(addr 52)" FAKE_FORGE_BCAST=1)
+c10_reset() { # a --confirm run bound to its manifest, nothing sent yet
+  rm -rf "$REPO/contracts/broadcast" "$C10D"
+  mkdir -p "$C10D"
+  mk_manifest "$C10D" "$DEP" confirm deployer
+  gov_chain
+  reset_calls
+}
+c10_record() { # <key> <json>: the run manifest records the phase output <key>
+  python3 -c 'import json,sys; p=sys.argv[1]; m=json.load(open(p)); m[sys.argv[2]]=json.loads(sys.argv[3]); json.dump(m, open(p, "w"))' "$C10D/ceremony-run.json" "$1" "$2"
+}
+C10GOV=$(printf '{"GovernanceTimelock":"%s","GovernanceMultisig":"%s","GuardianTimelock":"%s","GuardianMultisig":"%s"}' "$(addr 31)" "$(addr 33)" "$(addr 32)" "$(addr 35)")
+gov_book "$T" "$DEP"
+mv "$T/governance.json" "$T/c10-gov.json"
+# not_moved_aside <output>: the output never calls this run's book another run's output.
+not_moved_aside() { ! grep -qE 'move it aside|not this ceremony.s output' <<<"$1"; }
+
+# A failure after the phase broadcast, then the identical command again: the retry is refused
+# and sends nothing. P1: its gate fails (no governance.json). P3, P4: the step fails after it
+# has recorded its broadcast.
+for c in "P1:" "P3:FAKE_FORGE_FAIL=1" "P4:FAKE_FORGE_FAIL=1"; do
+  ph="${c%%:*}" fault="${c#*:}"
+  c10_reset
+  if [[ "$ph" == P4 ]]; then gov_book "$C10D" "$DEP"; c10_record governance "$C10GOV"; fi
+  # shellcheck disable=SC2086 # $fault is one VAR=value word or empty
+  out=$("${C10ENV[@]}" $fault bash "$CE" --confirm --only "$ph" --account deployer 2>&1)
+  rc=$?
+  if [[ $rc -ne 0 && "$(bcount)" == 1 ]] && grep -q "$ph has already broadcast\|$ph may have sent" <<<"$out"; then
+    ok "ceremony C10: a $ph that fails after its broadcast sent once (setup)"
+  else
+    bad "ceremony C10: a $ph that fails after its broadcast sent once (setup) (exit $rc, sent $(bcount))" "$out"
+  fi
+  reset_calls
+  # shellcheck disable=SC2086
+  out=$("${C10ENV[@]}" $fault bash "$CE" --confirm --only "$ph" --account deployer 2>&1)
+  rc=$?
+  if [[ $rc -eq 3 ]] && grep -q "GATE FAIL at $ph: this run.s $ph broadcasts are already recorded" <<<"$out" && grep -q "do NOT re-run $ph" <<<"$out"; then
+    ok "ceremony C10: an identical $ph retry after a failure past its broadcast is refused"
+  else
+    bad "ceremony C10: an identical $ph retry after a failure past its broadcast is refused (exit $rc)" "$out"
+  fi
+  [[ "$(bcount)" == 0 ]] && ok "ceremony C10: the refused $ph retry calls no broadcasting forge" ||
+    bad "ceremony C10: the refused $ph retry calls no broadcasting forge ($(bcount) sent)" "$(calls)"
+done
+
+# A phase whose output the run manifest records is done: --only Pn is refused as done, at P0
+# while its book is in place (never "move it aside"), and by the guard once the book is gone.
+for c in "P1:governance:governance.json" "P3:teamVesting:team-vesting.json" "P4:dormantLedgers:dormant-ledgers.json"; do
+  IFS=: read -r ph key file <<<"$c"
+  c10_reset
+  gov_book "$C10D" "$DEP"
+  c10_record governance "$C10GOV"
+  [[ "$ph" == P1 ]] || {
+    printf '{"deployer":"%s","contracts":{"Out%s":"%s"}}' "$DEP" "$ph" "$(addr 700)" >"$C10D/$file"
+    c10_record "$key" "$(printf '{"Out%s":"%s"}' "$ph" "$(addr 700)")"
+  }
+  out=$("${C10ENV[@]}" bash "$CE" --confirm --only "$ph" --account deployer 2>&1)
+  rc=$?
+  if [[ $rc -eq 3 ]] && grep -q "GATE FAIL at P0: .*$file is this run.s $ph output: the run manifest records .*($key). $ph is done" <<<"$out" &&
+    grep -q "do NOT re-run $ph" <<<"$out" && not_moved_aside "$out" && ! grep -qE -- "--(only|from) $ph([^0-9]|$)" <<<"$out"; then
+    ok "ceremony C10: --only $ph after a recorded $ph is refused at P0 as done, never 'move it aside'"
+  else
+    bad "ceremony C10: --only $ph after a recorded $ph is refused at P0 as done, never 'move it aside' (exit $rc)" "$out"
+  fi
+  [[ "$(bcount)" == 0 ]] && ok "ceremony C10: the refused --only $ph sends nothing" || bad "ceremony C10: the refused --only $ph sends nothing" "$(calls)"
+  # Following the old advice (move the book aside) no longer sends the phase again.
+  mv "$C10D/$file" "$T/c10-aside.json"
+  reset_calls
+  out=$("${C10ENV[@]}" bash "$CE" --confirm --only "$ph" --account deployer 2>&1)
+  rc=$?
+  if [[ $rc -eq 3 ]] && grep -q "$ph is done" <<<"$out" && grep -q "do NOT re-run $ph" <<<"$out" && [[ "$(bcount)" == 0 ]]; then
+    ok "ceremony C10: with its book moved aside, a recorded $ph is still refused as done and sends nothing"
+  else
+    bad "ceremony C10: with its book moved aside, a recorded $ph is still refused as done and sends nothing (exit $rc, sent $(bcount))" "$out"
+  fi
+done
+# The broadcasts alone also make a book this run's: P0 says done, not "move it aside".
+c10_reset
+gov_book "$C10D" "$DEP"
+c10_record governance "$C10GOV"
+printf '{"deployer":"%s","contracts":{"OutP4":"%s"}}' "$DEP" "$(addr 700)" >"$C10D/dormant-ledgers.json"
+mkdir -p "$REPO/contracts/broadcast/DeployDormantLedgers.s.sol/40204"
+printf '{"timestamp":6000,"transactions":[]}' >"$REPO/contracts/broadcast/DeployDormantLedgers.s.sol/40204/run-latest.json"
+out=$("${C10ENV[@]}" bash "$CE" --confirm --only P4 --account deployer 2>&1)
+rc=$?
+if [[ $rc -eq 3 ]] && grep -q "is this run.s P4 output: this run.s P4 broadcasts are recorded (DeployDormantLedgers.s.sol). P4 is done" <<<"$out" && not_moved_aside "$out" && [[ "$(bcount)" == 0 ]]; then
+  ok "ceremony C10: a book this run's P4 broadcasts account for is done at P0, never 'move it aside'"
+else
+  bad "ceremony C10: a book this run's P4 broadcasts account for is done at P0, never 'move it aside' (exit $rc)" "$out"
+fi
+# Control: a book this run has no record of is still another run's output to move aside.
+c10_reset
+gov_book "$C10D" "$DEP"
+c10_record governance "$C10GOV"
+printf '{"deployer":"%s","contracts":{"OutP4":"%s"}}' "$DEP" "$(addr 700)" >"$C10D/dormant-ledgers.json"
+expect "ceremony C10: a book with no record in this run is still refused as another run's (control)" 3 'dormant-ledgers.json already exists and P4 would write it; move it aside' -- "${C10ENV[@]}" bash "$CE" --confirm --only P4 --account deployer
+# A recorded P1 whose governance.json is missing: P1 is done, put the book back; never "run P1".
+c10_reset
+c10_record governance "$C10GOV"
+out=$("${C10ENV[@]}" bash "$CE" --confirm --only P2 --account deployer 2>&1)
+if grep -q 'records P1.s governance: P1 is done' <<<"$out" && ! grep -q 'run P1 first' <<<"$out"; then
+  ok "ceremony C10: a missing governance.json after a recorded P1 says P1 is done, never 'run P1 first'"
+else
+  bad "ceremony C10: a missing governance.json after a recorded P1 says P1 is done, never 'run P1 first'" "$out"
+fi
+# The normal path still sends each phase once (control): P1 broadcasts, writes and records its
+# governance; the same --only P1 again is then done.
+c10_reset
+expect "ceremony C10: a first P1 sends and records its governance (control)" 0 'done \(mode=confirm\)' -- "${C10ENV[@]}" FAKE_P1_BOOK="$T/c10-gov.json" bash "$CE" --confirm --only P1 --account deployer
+[[ "$(bcount)" == 1 ]] && ok "ceremony C10: the first P1 broadcast once (control)" || bad "ceremony C10: the first P1 broadcast once (control)" "$(calls)"
+reset_calls
+expect "ceremony C10: --only P1 after a good P1 is refused as done" 3 'governance.json is this run.s P1 output: the run manifest records P1.s governance' -- "${C10ENV[@]}" FAKE_P1_BOOK="$T/c10-gov.json" bash "$CE" --confirm --only P1 --account deployer
+[[ "$(bcount)" == 0 ]] && ok "ceremony C10: the refused second P1 sends nothing" || bad "ceremony C10: the refused second P1 sends nothing" "$(calls)"
+
+# C10 tripwire, behaviour: with this run's broadcasts recorded for every script any phase
+# broadcasts, no phase of the ceremony (the PHASES list, read from the script) may call a
+# broadcasting forge or regenesis.sh. A new broadcasting phase that skips the guard, or a
+# guard that stops refusing, fails here.
+c10_sends() { # <ceremony script> -> "phase:count" for each phase that broadcast
+  local ce="$1" phases p s
+  phases=$(sed -n 's/^PHASES=(\(.*\))$/\1/p' "$ce")
+  for p in $phases; do
+    c10_reset
+    gov_book "$C10D" "$DEP"
+    c10_record governance "$C10GOV"
+    rm -f "$C10D/governance.json"
+    [[ "$p" == P1 ]] || gov_book "$C10D" "$DEP"
+    for s in DeployGenesisGovernance DeployTeamVesting DeployDormantLedgers DeployAll DeployValidatorRegistry DeployModelAccessControl \
+      DeployTEEAttestationRegistry DeployComputePoolTraining DeployEduStack DeployAIGateway DeployP256Verifier DeployAA DeployCoreMembership; do
+      mkdir -p "$REPO/contracts/broadcast/$s.s.sol/40204"
+      printf '{"timestamp":6000,"transactions":[]}' >"$REPO/contracts/broadcast/$s.s.sol/40204/run-latest.json"
+    done
+    # P1 itself must be guarded by its broadcasts, not by the recorded governance.
+    if [[ "$p" == P1 ]]; then python3 -c 'import json,sys; p=sys.argv[1]; m=json.load(open(p)); m.pop("governance"); json.dump(m, open(p, "w"))' "$C10D/ceremony-run.json"; fi
+    "${C10ENV[@]}" bash "$ce" --confirm --only "$p" --account deployer >/dev/null 2>&1
+    s=$(bcount)
+    [[ "$s" == 0 ]] || printf '%s:%s\n' "$p" "$s"
+  done
+}
+tw=$(c10_sends "$CE")
+[[ -z "$tw" ]] && ok "tripwire C10: no phase sends again over this run's broadcasts" || bad "tripwire C10: no phase sends again over this run's broadcasts" "$tw"
+# Negative control: the same ceremony with the guard disabled is caught, phase by phase.
+# (a copy of scripts/genesis in the temp dir; the source tree is not touched)
+rm -rf "$T/c10gen"
+cp -R "$G" "$T/c10gen"
+python3 - "$T/c10gen/genesis_ceremony.sh" <<'PY2'
+import sys
+p = sys.argv[1]; s = open(p).read()
+a = 'sends_once() {\n  local ph="$1" key\n'
+assert a in s
+s = s.replace(a, a + '  SENDS_ONCE_OK="$ph"; return 0\n', 1)
+open(p, "w").write(s)
+PY2
+tw=$(c10_sends "$T/c10gen/genesis_ceremony.sh")
+rm -rf "$T/c10gen"
+cp "$T/book.c9.orig" "$GBK" # the unguarded P2 above "wrote" the fake regenesis book over it
+if grep -q '^P1:' <<<"$tw" && grep -q '^P2:' <<<"$tw" && grep -q '^P3:' <<<"$tw" && grep -q '^P4:' <<<"$tw"; then
+  ok "tripwire C10: a ceremony without the guard is caught for P1, P2, P3 and P4 (negative control)"
+else
+  bad "tripwire C10: a ceremony without the guard is caught for P1, P2, P3 and P4 (negative control)" "$tw"
+fi
+# C10 tripwire, source: forge and regenesis.sh run only through run_broadcast (which needs the
+# guard), except the P5 checker, which reads. A new direct call is flagged.
+c10_direct() { # <ceremony script> -> the executable lines that run forge or regenesis.sh directly
+  # (continuation lines are joined first, so a call is judged with the command it belongs to)
+  sed -e ':a' -e '/\\$/N; s/\\\n//; ta' "$1" | grep -nE '"\$(FORGE|REGENESIS)"' | grep -vE '^[0-9]+:[[:space:]]*#' | grep -vE 'describe_cmd|run_broadcast P2 bash "\$REGENESIS"|^[0-9]+:forge_in_contracts\(\) \{ \(cd "\$CONTRACTS" && "\$FORGE" "\$@"\); \}$|-[xf] "\$REGENESIS"|CheckDeployedAdmins|FORGE="\$\{FORGE' || true
+}
+tw=$(c10_direct "$CE")
+[[ -z "$tw" ]] && ok "tripwire C10: the ceremony runs forge and regenesis.sh only through run_broadcast" || bad "tripwire C10: the ceremony runs forge and regenesis.sh only through run_broadcast" "$tw"
+{ cat "$CE"; echo '(cd "$CONTRACTS" && "$FORGE" script script/DeployNew.s.sol --broadcast)'; echo '  RPC_URL="$RPC_URL" bash "$REGENESIS" --broadcast'; } >"$T/c10-direct.sh"
+[[ $(c10_direct "$T/c10-direct.sh" | wc -l) -eq 2 ]] && ok "tripwire C10: a direct forge or regenesis.sh call is flagged (negative control)" ||
+  bad "tripwire C10: a direct forge or regenesis.sh call is flagged (negative control)" "$(c10_direct "$T/c10-direct.sh")"
+
+# A fresh --confirm run refuses a broadcast directory that already holds records for this chain
+# id (a rehearsal's would count as this run's); other chains' records and dry runs do not.
+c10_fresh() { rm -rf "$REPO/contracts/broadcast" "$C10D"; mkdir -p "$C10D"; reset_calls; }
+c10_fresh
+mkdir -p "$REPO/contracts/broadcast/DeployAll.s.sol/40204"
+printf '{"timestamp":9000,"transactions":[]}' >"$REPO/contracts/broadcast/DeployAll.s.sol/40204/run-latest.json"
+out=$("${C10ENV[@]}" bash "$CE" --confirm --account deployer 2>&1)
+rc=$?
+if [[ $rc -eq 3 ]] && grep -q 'GATE FAIL at P0: contracts/broadcast/ already holds chain 40204 broadcast records (DeployAll.s.sol) from before this run' <<<"$out" &&
+  [[ ! -e "$C10D/ceremony-run.json" && "$(bcount)" == 0 ]]; then
+  ok "ceremony C10: a fresh --confirm run refuses earlier 40204 broadcast records, before the manifest and any send"
+else
+  bad "ceremony C10: a fresh --confirm run refuses earlier 40204 broadcast records, before the manifest and any send (exit $rc)" "$out"
+fi
+c10_fresh
+mkdir -p "$REPO/contracts/broadcast/DeployAll.s.sol/31337" "$REPO/contracts/broadcast/DeployAll.s.sol/40204/dry-run"
+printf '{"timestamp":9000,"transactions":[]}' >"$REPO/contracts/broadcast/DeployAll.s.sol/31337/run-latest.json"
+printf '{"timestamp":9000,"transactions":[]}' >"$REPO/contracts/broadcast/DeployAll.s.sol/40204/dry-run/run-latest.json"
+out=$("${C10ENV[@]}" bash "$CE" --confirm --account deployer 2>&1)
+if grep -q 'P0 preflight PASS' <<<"$out" && ! grep -q 'already holds chain' <<<"$out"; then
+  ok "ceremony C10: another chain's records and a dry run do not block a fresh run (control)"
+else
+  bad "ceremony C10: another chain's records and a dry run do not block a fresh run (control)" "$out"
+fi
+rm -rf "$REPO/contracts/broadcast" "$C10D"
+
+# forge's own keystore variables: ETH_PASSWORD (its password-file variable) is refused by name;
+# ETH_KEYSTORE_ACCOUNT / ETH_KEYSTORE must be unset or name the --account keystore. The value
+# is never printed.
+expect "ceremony: ETH_PASSWORD in the environment is refused" 1 'ETH_PASSWORD is set in the environment' -- "${CEENV[@]}" ETH_PASSWORD="$T/c10-secret-value" bash "$CE" --account deployer
+out=$("${CEENV[@]}" ETH_PASSWORD="$T/c10-secret-value" bash "$CE" --account deployer 2>&1)
+grep -qF "c10-secret-value" <<<"$out" && bad "ceremony: the ETH_PASSWORD refusal does not print its value" "$out" || ok "ceremony: the ETH_PASSWORD refusal does not print its value"
+expect "ceremony: an ETH_KEYSTORE_ACCOUNT other than --account is refused" 1 'ETH_KEYSTORE_ACCOUNT is set in the environment and does not name the --account keystore' -- "${CEENV[@]}" ETH_KEYSTORE_ACCOUNT=other bash "$CE" --account deployer
+expect "ceremony: an ETH_KEYSTORE other than the --account keystore is refused" 1 'ETH_KEYSTORE is set in the environment and is not the --account keystore' -- "${CEENV[@]}" HOME="$T/kshome" ETH_KEYSTORE="$T/elsewhere/deployer" bash "$CE" --account deployer
+expect "ceremony: ETH_KEYSTORE without --account is refused" 1 'ETH_KEYSTORE is set in the environment without --account' -- "${CEENV[@]}" ETH_KEYSTORE="$T/elsewhere/deployer" bash "$CE"
+expect "ceremony: keystore variables that agree with --account pass (control)" 0 'done \(mode=dry\)' -- "${CEENV[@]}" HOME="$T/kshome" ETH_KEYSTORE_ACCOUNT=deployer ETH_KEYSTORE="$T/kshome/.foundry/keystores/deployer" bash "$CE" --account deployer
+
+# C9: P2 hands DeployAll GENESIS_TREASURY as the fee recipient. P0 checks it whenever P2 runs,
+# before anything is sent; a run that does not reach P2 does not need it.
+for c in "unset:GENESIS_TREASURY=:GENESIS_TREASURY is not set" "the deployer:GENESIS_TREASURY=$(addr 1):GENESIS_TREASURY is the deployer" \
+  "zero:GENESIS_TREASURY=0x0000000000000000000000000000000000000000:GENESIS_TREASURY is the zero address" "malformed:GENESIS_TREASURY=0x12:GENESIS_TREASURY \\(0x12\\) is not an address"; do
+  IFS=: read -r tn tv tp <<<"$c"
+  reset_calls
+  expect "ceremony C9: a GENESIS_TREASURY that is $tn stops P2 at P0" 3 "GATE FAIL at P0: $tp" -- "${CEENV[@]}" "$tv" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
+  calls | grep -q '^regenesis' && bad "ceremony C9: a refused GENESIS_TREASURY ($tn) runs no regenesis" "$(calls)" || ok "ceremony C9: a refused GENESIS_TREASURY ($tn) runs no regenesis"
+done
+mk_manifest "$GB" # a simulation run (the C9 cases above left a --confirm one)
+gov_book "$GB" "$DEP"
+expect "ceremony C9: --only P5 does not need GENESIS_TREASURY (control)" 0 'P0 preflight PASS' -- "${CEENV[@]}" GENESIS_TREASURY= RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+expect "ceremony C9: a dry run plans without GENESIS_TREASURY and names it" 0 'P0 plan: .*GENESIS_TREASURY is not set' -- "${CEENV[@]}" GENESIS_TREASURY= bash "$CE"
+reset_calls
+"${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2 >/dev/null 2>&1
+calls | grep -qx "regenesis-treasury $(addr 90)" && ok "ceremony C9: P2 hands regenesis.sh (DeployAll) GENESIS_TREASURY" || bad "ceremony C9: P2 hands regenesis.sh (DeployAll) GENESIS_TREASURY" "$(calls)"
+
+# The run manifest's temp file is created with O_EXCL: a symlink (or stale file) there is
+# refused, and what it points at is not written.
+MWD="$REPO/contracts/genesis/mw"
+rm -rf "$MWD"
+mkdir -p "$MWD"
+printf 'victim\n' >"$T/c10-victim"
+ln -s "$T/c10-victim" "$MWD/ceremony-run.json.tmp"
+out=$("${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$MWD" bash "$CE" --simulate 2>&1)
+rc=$?
+if [[ $rc -eq 3 ]] && grep -q 'cannot write the run manifest' <<<"$out" && [[ "$(cat "$T/c10-victim")" == victim && ! -e "$MWD/ceremony-run.json" ]]; then
+  ok "ceremony: a symlinked manifest temp file is refused and its target is not written"
+else
+  bad "ceremony: a symlinked manifest temp file is refused and its target is not written (exit $rc)" "$out"$'\n'"victim: $(cat "$T/c10-victim")"
+fi
+rm -rf "$MWD"
+
+# P5's DEPLOYER-ADMIN gate also counts a fee recipient that is the deployer.
+C9P5B="$T/c9-p5-book.json"
+printf '{"chainId":40204,"deployer":"%s","contracts":{"Alpha":"%s","X402Facilitator":"%s","ModelMarketplace":"%s","ComputeMarketplace":"%s"},"aaStack":{}}' "$DEP" "$A1" "$C9X" "$C9MM" "$C9CM" >"$C9P5B"
+mk_manifest "$GB"
+gov_book "$GB" "$DEP"
+p5_fees() { # x402 mm cm
+  rm -rf "$FAKE/call/$C9X" "$FAKE/call/$C9MM" "$FAKE/call/$C9CM"
+  fake_call "$C9X" treasury "$1"
+  fake_call "$C9MM" treasuryAddress "$2"
+  fake_call "$C9CM" treasury "$3"
+}
+p5_fees "$(addr 31)" "$(addr 31)" "$(addr 31)"
+expect "ceremony C9: P5 passes when no fee recipient is the deployer (control)" 0 'P5 PASS' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 ADDRESS_BOOK="$C9P5B" bash "$CE" --simulate --only P5
+p5_fees "$(addr 31)" "$DEP" "$(addr 31)"
+expect "ceremony C9: P5 fails DEPLOYER-ADMIN when a fee recipient is the deployer" 3 'DEPLOYER-ADMIN is not 0' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 ADDRESS_BOOK="$C9P5B" bash "$CE" --simulate --only P5
+expect "ceremony C9: P5 names the fee recipient held by the deployer" 3 'DEPLOYER-ADMIN ModelMarketplace: treasuryAddress\(\) is the deployer EOA' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 ADDRESS_BOOK="$C9P5B" bash "$CE" --simulate --only P5
+rm -f "$FAKE/call/$C9CM/treasury"
+expect "ceremony C9: P5 fails a fee recipient it cannot read" 3 'GATE FAIL at P5: fee recipients: cannot read ComputeMarketplace.treasury' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 ADDRESS_BOOK="$C9P5B" bash "$CE" --simulate --only P5
+rm -rf "$FAKE/call/$C9X" "$FAKE/call/$C9MM" "$FAKE/call/$C9CM"
+
 # The password file is re-checked right before each signing step and must still be the same
 # file the preflight accepted (device and inode), with the same private mode. A change between
 # the preflight and the first forge broadcast stops the run before anything is sent. The fake
@@ -1591,8 +1911,11 @@ dormant_book() { # file deployer [ledger] [governance timelock]
   printf '{"deployer":"%s","contracts":{"FederatedRoundLedger":"%s","PatronageLedger":"%s","GovernanceTimelock":"%s","GovernanceMultisig":"%s"},"governance":"%s"}\n' \
     "$2" "${3:-$FRLA}" "$PLA" "${4:-$(addr 31)}" "$(addr 33)" "${4:-$(addr 31)}" >"$1"
 }
+# bc_run stages the record the step's broadcast writes: the fake forge puts it under
+# contracts/broadcast/ when the step broadcasts (a record there before the step runs would be
+# this run's earlier send, which the step refuses, C10).
 bc_run() { # script timestamp "type:name:addr"...
-  local d="$BCD/$1/40204" ts="$2" tx="" e t n x
+  local d="$FAKE/bc-stage/$1/40204" ts="$2" tx="" e t n x
   shift 2
   for e in "$@"; do
     IFS=: read -r t n x <<<"$e"
@@ -1603,7 +1926,7 @@ bc_run() { # script timestamp "type:name:addr"...
 }
 ob_reset() { # [mode]
   rm -f "$GB/team-vesting.json" "$GB/dormant-ledgers.json"
-  rm -rf "$BCD"
+  rm -rf "$BCD" "$FAKE/bc-stage"
   echo "$GEN" >"$LRPC/block-0"
   echo 5000 >"$LRPC/block-0-timestamp"
   mk_manifest "$GB" "$DEP" "${1:-confirm}" "$([[ "${1:-confirm}" == confirm ]] && echo deployer)"
@@ -1695,7 +2018,7 @@ expect "ceremony #363: --confirm P5 refuses a dormant-ledger book P4 did not rec
 record_outputs "$GB"
 expect "ceremony #363: --confirm P5 accepts the books P3 and P4 recorded (control: stops later, at the registry)" 3 'has no ValidatorRegistry' -- "${OBENV[@]}" bash "$CE" --confirm --only P5 --account deployer
 ob_reset simulate
-rm -rf "$BCD"
+rm -rf "$BCD" "$FAKE/bc-stage"
 
 # ------------------------------------------------------------------ address-book generator
 # scripts/ops/emit-address-table.sh (what regenesis.sh runs and P2 verifies, C8) over synthetic
