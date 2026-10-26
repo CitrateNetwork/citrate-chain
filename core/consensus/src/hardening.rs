@@ -250,14 +250,16 @@ pub const R1006_ACTIVATIONS: GenesisActivations = GenesisActivations {
     supply_hardening: Some(0),
 };
 
-/// Per-genesis activations compiled into this release.
-pub const GENESIS_ACTIVATIONS: &[([u8; 32], GenesisActivations)] =
-    &[(R1006_GENESIS, R1006_ACTIVATIONS)];
+/// Per-genesis activations compiled into this release, keyed by (chain id, block-0 hash),
+/// beside [`RELEASE_GENESIS`]. The ONLY place a new rule gets a height: r1005's genesis has
+/// no entry, so every new rule stays unset there (replay-identical).
+pub const GENESIS_ACTIVATIONS: &[(u64, [u8; 32], GenesisActivations)] =
+    &[(40204, R1006_GENESIS, R1006_ACTIVATIONS)];
 
 /// The genesis-keyed rules for a node on `chain_id` whose loaded block 0 is `genesis`:
 ///
-/// * a genesis with compiled activations (r1006): `Some` of them, whatever the chain id
-///   (a per-chain pin never overrides them);
+/// * the (chain id, genesis) pair of a compiled entry (40204 + r1006's block 0): `Some`
+///   of its activations (a per-chain pin never overrides them);
 /// * any other genesis, including r1005's and an unknown one: `None`, explicitly. The
 ///   module then uses its per-chain pin table exactly as before, so an r1005 node rebuilt
 ///   from this release replays its chain unchanged.
@@ -268,16 +270,18 @@ pub const GENESIS_ACTIVATIONS: &[([u8; 32], GenesisActivations)] =
 /// `check_genesis_chain` binds the release geneses to their chain). A node that asks
 /// for the r1006 profile but loads another genesis IS refused, by the node at start-up.
 pub fn rules_for_genesis(chain_id: u64, genesis: &[u8; 32]) -> Option<GenesisActivations> {
-    let _ = chain_id;
-    genesis_activations(genesis)
+    GENESIS_ACTIVATIONS
+        .iter()
+        .find(|(c, g, _)| *c == chain_id && g == genesis)
+        .map(|(_, _, a)| *a)
 }
 
 /// The activations compiled for the chain whose block 0 is `genesis`, if any.
 pub fn genesis_activations(genesis: &[u8; 32]) -> Option<GenesisActivations> {
     GENESIS_ACTIVATIONS
         .iter()
-        .find(|(g, _)| g == genesis)
-        .map(|(_, a)| *a)
+        .find(|(_, g, _)| g == genesis)
+        .map(|(_, _, a)| *a)
 }
 
 /// Canonical blocks compiled into this release, by release genesis: at each
@@ -1011,8 +1015,8 @@ mod tests {
         assert_eq!(rules_for_genesis(40204, &[0x42; 32]), None, "unknown genesis");
         assert_eq!(
             rules_for_genesis(1337, &R1006_GENESIS),
-            Some(R1006_ACTIVATIONS),
-            "keyed by genesis, not chain id"
+            None,
+            "keyed by (chain id, genesis): r1006's block 0 under another chain id gets nothing"
         );
     }
 
