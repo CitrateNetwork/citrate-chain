@@ -114,11 +114,11 @@
 #      EMIT_DEPLOYER, when preset, must be DEPLOYER_ADDRESS byte for byte (an empty value, another
 #      address, case or spelling fails P0 before anything is sent); every phase then runs with
 #      CEREMONY_DEPLOYER_ADDRESS = DEPLOYER_ADDRESS. Fee recipients: P2 hands DeployAll the
-#      genesis treasury (GENESIS_TREASURY: an address, not zero, not the deployer; P0 checks it
-#      whenever P2 runs) and never sets a fee recipient itself. After a --confirm P2 the fee
+#      genesis treasury (TREASURY, a p0 input of P2 in phase_inputs.json: an address, not zero,
+#      not the deployer) and never sets a fee recipient itself. After a --confirm P2 the fee
 #      recipients DeployAll set (X402Facilitator.treasury, ModelMarketplace.treasuryAddress,
 #      ComputeMarketplace.treasury) are read from the chain for the contracts in the verified
-#      book and must be GENESIS_TREASURY, never the ceremony EOA; P5 counts a fee recipient that
+#      book and must be TREASURY, never the ceremony EOA; P5 counts a fee recipient that
 #      is the deployer as a DEPLOYER-ADMIN failure.
 #   C10 every broadcasting phase sends once (P1, P2, P3, P4: SENDS_ONCE_PHASES). One guard,
 #      sends_once, runs before a phase sends anything, and the only command that broadcasts
@@ -842,23 +842,24 @@ sends_once() {
 }
 
 # C9: DeployAll sets its fee recipients (treasury constructor arguments) at construction from
-# the genesis treasury P2 hands it (GENESIS_TREASURY); the ceremony never sets one. Block 0
+# the genesis treasury P2 hands it (TREASURY); the ceremony never sets one. Block 0
 # must route no revenue to the ceremony EOA, so after a --confirm P2 each fee recipient the
-# verified book lists is read from the chain and must be GENESIS_TREASURY, never the deployer.
+# verified book lists is read from the chain and must be TREASURY, never the deployer.
 FEE_RECIPIENT_GETTERS=("X402Facilitator:treasury" "ModelMarketplace:treasuryAddress" "ComputeMarketplace:treasury")
-# treasury_check: GENESIS_TREASURY is an address, not zero and not the deployer; prints the
-# reason and fails otherwise.
+# treasury_check: TREASURY is an address, not zero and not the deployer; prints the reason and
+# fails otherwise. P0 checks the same through phase_inputs.json (a p0 input of P2) before
+# anything is sent; this is the gate's own copy for the value it compares against.
 treasury_check() {
-  local t="${GENESIS_TREASURY:-}"
-  [[ -n "$t" ]] || { echo "GENESIS_TREASURY is not set (the fee recipient P2 hands DeployAll)"; return 1; }
-  is_addr "$t" || { echo "GENESIS_TREASURY ($t) is not an address"; return 1; }
-  [[ "$(lower "$t")" != 0x0000000000000000000000000000000000000000 ]] || { echo "GENESIS_TREASURY is the zero address"; return 1; }
-  [[ "$(lower "$t")" != "$(lower "${DEPLOYER_ADDRESS:-}")" ]] || { echo "GENESIS_TREASURY is the deployer: block 0 must route no revenue to the ceremony EOA"; return 1; }
+  local t="${TREASURY:-}"
+  [[ -n "$t" ]] || { echo "TREASURY is not set (the fee recipient P2 hands DeployAll)"; return 1; }
+  is_addr "$t" || { echo "TREASURY ($t) is not an address"; return 1; }
+  [[ "$(lower "$t")" != 0x0000000000000000000000000000000000000000 ]] || { echo "TREASURY is the zero address"; return 1; }
+  [[ "$(lower "$t")" != "$(lower "${DEPLOYER_ADDRESS:-}")" ]] || { echo "TREASURY is the deployer: block 0 must route no revenue to the ceremony EOA"; return 1; }
 }
 check_fee_recipients() {
   local e name fn a got seen="" want why
   why=$(treasury_check) || gate_fail P2 "$why"
-  want=$(lower "$GENESIS_TREASURY")
+  want=$(lower "$TREASURY")
   for e in "${FEE_RECIPIENT_GETTERS[@]}"; do
     name="${e%%:*}" fn="${e#*:}"
     a=$(book_addr "$book_abs" "$name") || continue
@@ -866,13 +867,13 @@ check_fee_recipients() {
     got=$(cast_read "$a" "$fn()(address)") && is_addr "$got" || gate_fail P2 "cannot read $name.$fn() at $a"
     got=$(lower "$got")
     [[ "$got" != "$RUN_DEPLOYER" ]] ||
-      gate_fail P2 "$name.$fn() is the deployer $RUN_DEPLOYER: the fee recipient must be GENESIS_TREASURY $want, never the ceremony EOA"
+      gate_fail P2 "$name.$fn() is the deployer $RUN_DEPLOYER: the fee recipient must be TREASURY $want, never the ceremony EOA"
     [[ "$got" == "$want" ]] ||
-      gate_fail P2 "$name.$fn() is $got, not GENESIS_TREASURY $want"
+      gate_fail P2 "$name.$fn() is $got, not TREASURY $want"
     seen+="${seen:+, }$name"
   done
   if [[ -n "$seen" ]]; then
-    log "P2 fee recipients are GENESIS_TREASURY: $seen"
+    log "P2 fee recipients are TREASURY: $seen"
   else
     log "P2 note: the book lists no contract with a DeployAll fee recipient"
   fi
@@ -1080,17 +1081,6 @@ if should P0 || [[ "$MODE" != dry ]]; then
   else
     gate_fail P0 "phase inputs: $inputs_why"
   fi
-  # C9: the genesis treasury P2 hands DeployAll as its fee recipient.
-  if should P2; then
-    if tw_why=$(treasury_check); then
-      export GENESIS_TREASURY
-      log "P0 genesis treasury (fee recipient P2 hands DeployAll): $(lower "$GENESIS_TREASURY")"
-    elif [[ "$MODE" == dry ]]; then
-      log "P0 plan: a --simulate/--confirm run that reaches P2 refuses until this is fixed: $tw_why"
-    else
-      gate_fail P0 "$tw_why"
-    fi
-  fi
   if [[ -n "${TEAM_VESTING_FILE:-}" ]]; then
     [[ -f "$TEAM_VESTING_FILE" || -f "$CONTRACTS/$TEAM_VESTING_FILE" ]] || gate_fail P0 "TEAM_VESTING_FILE not found (a path relative to contracts/, under genesis/)"
   fi
@@ -1211,6 +1201,8 @@ if should P2; then
       gate_fail P2 "EMIT_BROADCAST_SINCE is set to $EMIT_BROADCAST_SINCE, but this run's block 0 is at $RUN_G0TS"
     [[ -z "${EMIT_FRESH_GENESIS:-}" || "$EMIT_FRESH_GENESIS" == 1 ]] ||
       gate_fail P2 "EMIT_FRESH_GENESIS is set to $EMIT_FRESH_GENESIS; a genesis ceremony always regenerates a fresh book"
+    # C9: DeployAll takes its fee recipient from TREASURY (checked at P0); nothing here sets one.
+    export TREASURY
     export EMIT_FRESH_GENESIS=1 EMIT_DEPLOYER="$RUN_DEPLOYER" EMIT_BROADCAST_SINCE="$RUN_G0TS" EMIT_OUTPUT="$book_abs"
     if [[ "$RECORD_BOOK" == 1 ]]; then
       log "P2 record step: nothing is sent; the book is rebuilt from this run's broadcasts ($(printf '%s' "$sent" | paste -sd, -)) and checked against the chain"
