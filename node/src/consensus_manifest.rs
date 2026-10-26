@@ -251,7 +251,8 @@ impl ConsensusManifest {
         )
     }
 
-    /// Explicit PBA, agent-fork, supply and storage-root heights (chain#391/#392).
+    /// Explicit PBA, agent-fork, supply and storage-root heights (chain#391/#392 tests).
+    #[cfg(test)]
     pub fn for_supply_heights(
         pba_hardening_height: Option<u64>,
         agent_precompiles_height: Option<u64>,
