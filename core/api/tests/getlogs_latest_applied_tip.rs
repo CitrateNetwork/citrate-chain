@@ -473,3 +473,128 @@ fn tripwire_log_handlers_do_not_read_the_header_height() {
         vec!["eth_getLogs"]
     );
 }
+
+/// The JSON-RPC error of `v`, or a panic naming what came back instead.
+fn error_of(v: &Value) -> &Value {
+    v.get("error")
+        .unwrap_or_else(|| panic!("expected an error, got {v}"))
+}
+
+/// The producer commits the applied tip before it writes that block's
+/// receipts. A poll in that window must not move the filter past the block:
+/// it is a retryable -32002 (the code citrate_getLogs returns for the same
+/// block), the poll position stays, and once the receipt is written the next
+/// poll delivers the block. No log is lost across the polls.
+#[test]
+fn filter_changes_keep_a_block_whose_receipts_land_after_the_tip() {
+    let (storage, _tmp) = storage();
+    let a = chain(&storage, 6, 5);
+    let io = io(storage.clone());
+
+    let id = call(&io, "eth_newFilter", json!([{"fromBlock": "latest"}]))["result"].clone();
+    assert_eq!(
+        logs_of(&call(&io, "eth_getFilterChanges", json!([id]))["result"]),
+        vec![]
+    );
+
+    // Tip committed at 6, receipt not written yet.
+    tip(&storage, &a[6]);
+    let poll = call(&io, "eth_getFilterChanges", json!([id]));
+    let err = error_of(&poll);
+    assert_eq!(err["code"], -32002, "{poll}");
+    assert_eq!(err["data"]["retryable"], true, "{poll}");
+    assert_eq!(err["data"]["blockNumber"], "0x6", "{poll}");
+
+    // citrate_getLogs answers the same block with the same code.
+    let c = call(&io, GET_LOGS_METHOD, json!([{"fromBlock": "0x6", "toBlock": "0x6"}]));
+    assert_eq!(error_of(&c)["code"], err["code"], "{c}");
+
+    // Polling again in the window does not advance the filter either.
+    let again = call(&io, "eth_getFilterChanges", json!([id]));
+    assert_eq!(error_of(&again)["code"], -32002, "{again}");
+
+    // Receipt written: the next poll delivers block 6, then nothing.
+    write_receipt(&storage, &a[6]);
+    assert_eq!(
+        logs_of(&call(&io, "eth_getFilterChanges", json!([id]))["result"]),
+        vec![(6, hx(&a[6].hash()))],
+        "the block from the gap is delivered once its receipt is stored"
+    );
+    assert_eq!(
+        logs_of(&call(&io, "eth_getFilterChanges", json!([id]))["result"]),
+        vec![]
+    );
+}
+
+/// A tip that jumps over several heights, one of them still without its
+/// receipt, holds the whole poll (nothing before or after the gap is delivered
+/// out of order or skipped); once the receipt lands every height arrives once,
+/// in order.
+#[test]
+fn filter_changes_hold_a_window_with_a_missing_receipt_in_the_middle() {
+    let (storage, _tmp) = storage();
+    let a = chain(&storage, 8, 5);
+    let io = io(storage.clone());
+    let id = call(&io, "eth_newFilter", json!([{"fromBlock": "latest"}]))["result"].clone();
+    assert_eq!(
+        logs_of(&call(&io, "eth_getFilterChanges", json!([id]))["result"]),
+        vec![]
+    );
+
+    write_receipt(&storage, &a[7]);
+    write_receipt(&storage, &a[8]);
+    tip(&storage, &a[8]);
+    let poll = call(&io, "eth_getFilterChanges", json!([id]));
+    assert_eq!(error_of(&poll)["code"], -32002, "{poll}");
+    assert_eq!(error_of(&poll)["data"]["blockNumber"], "0x6", "{poll}");
+
+    write_receipt(&storage, &a[6]);
+    let mut seen = logs_of(&call(&io, "eth_getFilterChanges", json!([id]))["result"]);
+    seen.extend(logs_of(&call(&io, "eth_getFilterChanges", json!([id]))["result"]));
+    assert_eq!(
+        seen,
+        vec![
+            (6, hx(&a[6].hash())),
+            (7, hx(&a[7].hash())),
+            (8, hx(&a[8].hash()))
+        ],
+        "every applied height is delivered exactly once"
+    );
+}
+
+/// eth_getFilterLogs bounds its range the way eth_getLogs does: wider than
+/// 1,001 heights is -32005 with `maxBlockRange`, never a truncated list. A
+/// range at the limit is served in full.
+#[test]
+fn filter_logs_over_the_range_limit_is_32005_like_get_logs() {
+    let (storage, _tmp) = storage();
+    let a = chain(&storage, 1_001, 1_001);
+    let io = io(storage.clone());
+
+    for filter in [
+        json!({"fromBlock": "0x0", "toBlock": "latest"}),
+        json!({"fromBlock": "0x0"}),
+        json!({"fromBlock": "0x0", "toBlock": "0x3e9"}),
+    ] {
+        let id = call(&io, "eth_newFilter", json!([filter]))["result"].clone();
+        let v = call(&io, "eth_getFilterLogs", json!([id]));
+        let err = error_of(&v);
+        assert_eq!(err["code"], -32005, "{filter}: {v}");
+        assert_eq!(err["data"]["maxBlockRange"], 1_000, "{filter}: {v}");
+        let direct = call(&io, "eth_getLogs", json!([filter]));
+        assert_eq!(err["code"], error_of(&direct)["code"], "{filter}: {direct}");
+        assert_eq!(err["data"], error_of(&direct)["data"], "{filter}: {direct}");
+    }
+
+    // At the limit (1,001 heights) the whole range is served.
+    let id = call(
+        &io,
+        "eth_newFilter",
+        json!([{"fromBlock": "0x1", "toBlock": "latest"}]),
+    )["result"]
+        .clone();
+    let served = logs_of(&call(&io, "eth_getFilterLogs", json!([id]))["result"]);
+    assert_eq!(served.len(), 1_001);
+    assert_eq!(served.first(), Some(&(1, hx(&a[1].hash()))));
+    assert_eq!(served.last(), Some(&(1_001, hx(&a[1_001].hash()))));
+}
