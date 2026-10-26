@@ -327,21 +327,26 @@ impl RocksDB {
             .filter_map(move |item| Self::map_iter_item(&cipher, &cf_name, item)))
     }
 
-    /// The keys of `cf` that start with `prefix`, in key order. Unlike
-    /// [`Self::prefix_iter_cf`], a storage error ends the scan with `Err`
-    /// instead of being skipped, so a caller never mistakes a failed read for
-    /// a missing key. Values are not read.
-    pub fn prefix_keys_cf(&self, cf: &str, prefix: &[u8]) -> Result<Vec<Box<[u8]>>> {
+    /// Visit the keys of `cf` that start with `prefix`, in key order, without
+    /// collecting them. Unlike [`Self::prefix_iter_cf`], a storage error ends
+    /// the scan with `Err` instead of being skipped, so a caller never mistakes
+    /// a failed read for a missing key. An `Err` from `visit` also ends the scan
+    /// and is returned. Values are not read.
+    pub fn for_each_prefix_key_cf(
+        &self,
+        cf: &str,
+        prefix: &[u8],
+        mut visit: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
         let cf_handle = self.cf_handle(cf)?;
-        let mut keys = Vec::new();
         for item in self.db.prefix_iterator_cf(&cf_handle, prefix) {
             let (key, _) = item?;
             if !key.starts_with(prefix) {
                 break;
             }
-            keys.push(key);
+            visit(&key)?;
         }
-        Ok(keys)
+        Ok(())
     }
 
     /// Compact a column family
