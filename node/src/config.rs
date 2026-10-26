@@ -854,7 +854,7 @@ mod tests {
         let start = main.find("async fn start_node(").expect("start_node");
         let body = &main[start..];
         let init = body
-            .find("citrate_execution::exact_code::init_for_chain(")
+            .find("citrate_execution::exact_code::init_for_genesis(")
             .expect("start_node must publish the exact-created-code height");
         for ctor in [
             "GhostDag::new(",

@@ -516,7 +516,10 @@ async fn main() -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("{}", e))?
                 .0;
                 let exact = citrate_execution::exact_code::resolve(
-                    Some(a.exact_create_code),
+                    citrate_execution::exact_code::pin_for_genesis(
+                        chain_id,
+                        Some(&citrate_consensus::hardening::R1006_GENESIS),
+                    ),
                     std::env::var(citrate_execution::exact_code::EXACT_CREATE_CODE_ENV)
                         .ok()
                         .as_deref(),
@@ -526,8 +529,10 @@ async fn main() -> Result<()> {
                 .0;
                 (pba, exact)
             } else {
+                // No data directory here: the genesis is not known, so a release chain id
+                // resolves as its release genesis (unset), any other chain locally.
                 let (exact, _) =
-                    citrate_execution::exact_code::resolve_for_chain(chain_id, exact_configured)
+                    citrate_execution::exact_code::resolve_for_genesis(chain_id, None, exact_configured)
                         .map_err(|e| anyhow::anyhow!("{}", e))?;
                 (resolved.height, exact)
             };
@@ -1530,16 +1535,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // built. Unset by default on every chain (the padded legacy form, as the
     // previous binary); a new genesis sets 0 through `[chain]
     // exact_create_code_height` or the env override.
-    let (exact_code_height, exact_code_source) = match &genesis_acts {
-        Some(a) => citrate_execution::exact_code::init_with_genesis_pin(
-            a.exact_create_code,
-            config.chain.exact_create_code_height,
-        ),
-        None => citrate_execution::exact_code::init_for_chain(
-            config.chain.chain_id,
-            config.chain.exact_create_code_height,
-        ),
-    }
+    let (exact_code_height, exact_code_source) = citrate_execution::exact_code::init_for_genesis(
+        config.chain.chain_id,
+        running_genesis.as_ref(),
+        config.chain.exact_create_code_height,
+    )
     .map_err(|e| anyhow::anyhow!("{}", e))?;
     match exact_code_height {
         Some(h) => info!(

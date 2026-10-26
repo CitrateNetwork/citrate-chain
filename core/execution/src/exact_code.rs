@@ -29,20 +29,16 @@
 // else may keep a second copy (two stores can disagree, and a node whose
 // stores disagree forks at the height).
 //
-// RELEASE DEFAULT: NOT ACTIVATED
+// SCHEDULE: KEYED BY GENESIS (citrate_consensus::hardening::genesis_rule_pin)
 //
-//   * No chain has a release pin in this build, so every chain (40204
-//     included) resolves to `None` (the padded rule, byte-identical to the
-//     previous binary) unless `[chain] exact_create_code_height` or
-//     `CITRATE_EXACT_CREATE_CODE_HEIGHT` sets a height. Nothing in the shipped
-//     configs sets it.
-//   * The running 40204 chain was produced with the padded rule: a node that
-//     applied the exact rule to its history would fork. Do not set a height on
-//     a node that follows it.
-//   * A new genesis (a reroll or rehearsal profile) sets 0, so the chain runs
-//     the exact rule from block 1. Once a new 40204 genesis is cut, pin
-//     `(40204, Some(0))` in [`EXACT_CREATE_CODE_PINS`] in the same change that
-//     re-pins the genesis, so the height is no longer a per-node setting.
+//   * r1006's genesis (40204 + R1006_GENESIS) is 0 in the shared
+//     GENESIS_ACTIVATIONS table: the exact rule from block 1.
+//   * r1005's genesis (and 40204 with no genesis known) is unset and refuses a
+//     per-node height: the running r1005 chain was produced with the padded rule,
+//     and a node that applied the exact rule to its history would fork.
+//   * Any other genesis (the r1006 build devnet, a rehearsal) is local: the env or
+//     `[chain] exact_create_code_height` decides.
+//   * There is no per-chain pin table for this rule (a tripwire enforces it).
 //   * Genesis (height 0) is never re-judged.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -54,13 +50,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// compute different state roots for any block that creates a contract from
 /// inside a call.
 pub const EXACT_CREATE_CODE_ENV: &str = "CITRATE_EXACT_CREATE_CODE_HEIGHT";
-
-/// Activation heights compiled into this release, per release chain id.
-///
-/// Empty in this build (see the module header). An entry `(id, Some(h))` pins
-/// chain `id` to height `h`; `(id, None)` marks a release network on which the
-/// rule is not scheduled and per-node heights are refused.
-pub const EXACT_CREATE_CODE_PINS: &[(u64, Option<u64>)] = &[];
 
 const UNSET: u64 = u64::MAX;
 
@@ -91,15 +80,6 @@ pub fn active_at(activation: Option<u64>, height: u64) -> bool {
 /// Whether a block at `height` stores created code exactly, on this node.
 pub fn exact_create_code_active(height: u64) -> bool {
     active_at(exact_create_code_height(), height)
-}
-
-/// The release pin for `chain_id`: `None` = not a release network,
-/// `Some(None)` = release network, not scheduled, `Some(Some(h))` = pinned.
-pub fn pinned_for(chain_id: u64) -> Option<Option<u64>> {
-    EXACT_CREATE_CODE_PINS
-        .iter()
-        .find(|(id, _)| *id == chain_id)
-        .map(|(_, h)| *h)
 }
 
 /// Parse the env override: a decimal height, or `off` / `none`.
@@ -192,9 +172,15 @@ pub fn resolve(
     }
 }
 
-/// [`resolve`] with the release pin for `chain_id` and the process env.
-pub fn resolve_for_chain(
+/// The schedule for this rule on `chain_id` with block 0 `genesis` (the shared table).
+pub fn pin_for_genesis(chain_id: u64, genesis: Option<&[u8; 32]>) -> Option<Option<u64>> {
+    citrate_consensus::hardening::genesis_rule_pin(chain_id, genesis, |a| a.exact_create_code)
+}
+
+/// [`resolve`] with the genesis-keyed schedule and the process env.
+pub fn resolve_for_genesis(
     chain_id: u64,
+    genesis: Option<&[u8; 32]>,
     config_value: Option<u64>,
 ) -> Result<(Option<u64>, ExactCodeSource), String> {
     let env_raw = match std::env::var(EXACT_CREATE_CODE_ENV) {
@@ -202,33 +188,17 @@ pub fn resolve_for_chain(
         Err(std::env::VarError::NotPresent) => None,
         Err(e) => return Err(format!("{EXACT_CREATE_CODE_ENV}: {e}")),
     };
-    resolve(pinned_for(chain_id), env_raw.as_deref(), config_value)
+    resolve(pin_for_genesis(chain_id, genesis), env_raw.as_deref(), config_value)
 }
 
-/// Resolve and publish process-wide. The node calls this once at start-up,
-/// before any execution component exists.
-pub fn init_for_chain(
+/// Resolve and publish process-wide. The node calls this once at start-up, after it knows
+/// its block 0 and before any execution component exists.
+pub fn init_for_genesis(
     chain_id: u64,
+    genesis: Option<&[u8; 32]>,
     config_value: Option<u64>,
 ) -> Result<(Option<u64>, ExactCodeSource), String> {
-    let r = resolve_for_chain(chain_id, config_value)?;
-    set_exact_create_code_height(r.0);
-    Ok(r)
-}
-
-/// [`init_for_chain`] with a per-genesis pin (the node's compiled genesis activations,
-/// keyed by block 0) in place of the chain-id pin. `pin` is the genesis's height for this
-/// rule; a disagreeing env or config value is refused as for a release pin.
-pub fn init_with_genesis_pin(
-    pin: Option<u64>,
-    config_value: Option<u64>,
-) -> Result<(Option<u64>, ExactCodeSource), String> {
-    let env_raw = match std::env::var(EXACT_CREATE_CODE_ENV) {
-        Ok(raw) => Some(raw),
-        Err(std::env::VarError::NotPresent) => None,
-        Err(e) => return Err(format!("{EXACT_CREATE_CODE_ENV}: {e}")),
-    };
-    let r = resolve(Some(pin), env_raw.as_deref(), config_value)?;
+    let r = resolve_for_genesis(chain_id, genesis, config_value)?;
     set_exact_create_code_height(r.0);
     Ok(r)
 }
@@ -249,17 +219,28 @@ mod tests {
     }
 
     #[test]
-    fn no_chain_is_pinned_and_40204_defaults_to_the_padded_rule() {
-        assert_eq!(pinned_for(40204), None);
-        assert_eq!(pinned_for(1337), None);
+    fn r1005_keeps_the_padded_rule_r1006_is_exact_from_block_one() {
+        use citrate_consensus::hardening::{R1006_GENESIS, RELEASE_GENESIS};
+        let r1005 = RELEASE_GENESIS[0].1;
+        // r1005 + the new binary: unset, and a per-node height is refused.
         assert_eq!(
-            resolve(pinned_for(40204), None, None),
+            resolve(pin_for_genesis(40204, Some(&r1005)), None, None),
             Ok((None, ExactCodeSource::Unset))
         );
-        // A genesis/rehearsal profile can opt in from block 1.
+        assert!(resolve(pin_for_genesis(40204, Some(&r1005)), None, Some(0)).is_err());
+        // r1006: 0 from the shared table.
         assert_eq!(
-            resolve(pinned_for(40204), None, Some(0)),
+            resolve(pin_for_genesis(40204, Some(&R1006_GENESIS)), None, None),
+            Ok((Some(0), ExactCodeSource::ReleasePin))
+        );
+        // A build devnet / rehearsal genesis opts in from block 1 by config.
+        assert_eq!(
+            resolve(pin_for_genesis(40204, Some(&[0x42; 32])), None, Some(0)),
             Ok((Some(0), ExactCodeSource::Config))
+        );
+        assert_eq!(
+            resolve(pin_for_genesis(1337, None), None, None),
+            Ok((None, ExactCodeSource::Unset))
         );
     }
 
