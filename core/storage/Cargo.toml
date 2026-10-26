@@ -46,7 +46,7 @@ zeroize = { version = "1.7", features = ["derive"] }  # Secure memory zeroing + 
 argon2 = "0.5"                  # Real Argon2id password-based key derivation
 
 # Compression
-zstd = "0.13"                   # Zstandard compression for IPFS storage
+zstd = "0.14"                   # Zstandard compression for IPFS storage
 
 # IPFS daemon management
 dirs = "5.0"                    # Platform-specific directories
