@@ -674,7 +674,7 @@ CEENV=(env REPO_ROOT="$REPO" DEPLOYER_ADDRESS="$DEP"
   GRD_OWNERS="$(owners 21 22 23)" GRD_THRESHOLD=2 GRD_MIN_DELAY=3600
   SIGNER_1="$(addr 61)" SIGNER_2="$(addr 62)" SIGNER_3="$(addr 63)" RELAYER="$(addr 64)"
   CITRATE_AA_OWNER="$(addr 65)" CITRATE_AA_IDENTITY_SIGNER="$(addr 66)" CITRATE_AA_SPONSOR_SIGNER="$(addr 67)"
-  MEMBERSHIP_GRANTOR="$(addr 51)")
+  MEMBERSHIP_GRANTOR="$(addr 51)" EXPECTED_IPFS_V3="$(addr 91)")
 
 reset_calls
 expect "ceremony: dry run with genesis values passes" 0 'done \(mode=dry\)' -- "${CEENV[@]}" bash "$CE"
@@ -843,7 +843,7 @@ record_outputs() {
 import json, os, sys
 d = sys.argv[1]
 m = json.load(open(f"{d}/ceremony-run.json"))
-for key, f in (("teamVesting", "team-vesting.json"), ("dormantLedgers", "dormant-ledgers.json")):
+for key, f in (("teamVesting", "team-vesting.json"), ("dormantLedgers", "dormant-ledgers.json"), ("library", "library.json")):
     if os.path.exists(f"{d}/{f}"):
         m[key] = {k: v.lower() for k, v in json.load(open(f"{d}/{f}"))["contracts"].items()}
 json.dump(m, open(f"{d}/ceremony-run.json", "w"))
@@ -1569,12 +1569,13 @@ expect "ceremony C4: P5 fails when the registry cannot be read" 3 'cannot read V
 mk_manifest "$GB" "$DEP" confirm deployer
 printf '{"deployer":"%s","contracts":{"VestingAlice":"%s"}}' "$DEP" "$(addr 71)" >"$GB/team-vesting.json"
 printf '{"deployer":"%s","contracts":{"FederatedRoundLedger":"%s","PatronageLedger":"%s"}}' "$DEP" "$(addr 81)" "$(addr 82)" >"$GB/dormant-ledgers.json"
-record_outputs "$GB" # what --confirm P3/P4 record (#363)
+printf '{"deployer":"%s","contracts":{"SkillRegistry":"%s"}}' "$DEP" "$(addr 83)" >"$GB/library.json"
+record_outputs "$GB" # what --confirm P3/P4/P4L record (#363)
 expect "ceremony C4: --confirm P5 needs a ValidatorRegistry in the book" 3 'has no ValidatorRegistry' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1 bash "$CE" --confirm --only P5 --account deployer
 vr_chain "$(addr 31)" "$(addr 31)" "$Z40"
 expect "ceremony C8: --confirm P5 needs a stack book recorded by P2" 3 'records no stack book' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1 ADDRESS_BOOK="$T/book-vr.json" bash "$CE" --confirm --only P5 --account deployer
 rm -rf "$FAKE/call/$VR"
-rm "$GB/team-vesting.json" "$GB/dormant-ledgers.json"
+rm "$GB/team-vesting.json" "$GB/dormant-ledgers.json" "$GB/library.json"
 
 # C3: every gate reads both councils from the chain and holds them to the validated inputs
 # and the genesis floors.
@@ -1664,7 +1665,7 @@ mk_manifest "$GB"
 # GENESIS_OUT_DIR: one directory for every producer and consumer path.
 expect "ceremony: an output dir outside contracts/genesis is refused" 1 'GENESIS_OUT_DIR must be contracts/genesis' -- "${CEENV[@]}" GENESIS_OUT_DIR="$T/elsewhere" bash "$CE"
 expect "ceremony: an output dir that escapes contracts/genesis is refused" 1 'GENESIS_OUT_DIR must be' -- "${CEENV[@]}" GENESIS_OUT_DIR="$REPO/contracts/genesis/../addresses" bash "$CE"
-expect "ceremony: dry run reads the books from a nondefault dir" 0 'merge .* \+ genesis/run2/governance.json, genesis/run2/team-vesting.json, genesis/run2/dormant-ledgers.json → genesis/run2/p5-admin-book.json' -- "${CEENV[@]}" GENESIS_OUT_DIR="$REPO/contracts/genesis/run2" bash "$CE"
+expect "ceremony: dry run reads the books from a nondefault dir" 0 'merge .* \+ genesis/run2/governance.json, genesis/run2/team-vesting.json, genesis/run2/dormant-ledgers.json, genesis/run2/library.json → genesis/run2/p5-admin-book.json' -- "${CEENV[@]}" GENESIS_OUT_DIR="$REPO/contracts/genesis/run2" bash "$CE"
 RUN2="$REPO/contracts/genesis/run2"
 mkdir -p "$RUN2"
 mk_manifest "$RUN2"
@@ -1811,6 +1812,7 @@ expect "ceremony #363: a P4 book naming another governance than the run's fails"
 ob_reset
 cp "$VEST_OK" "$GB/team-vesting.json"
 cp "$DORM_OK" "$GB/dormant-ledgers.json"
+printf '{"deployer":"%s","governance":"%s","contracts":{"SkillRegistry":"%s"}}\n' "$DEP" "$(addr 31)" "$(addr 713)" >"$GB/library.json"
 expect "ceremony #363: --confirm P5 refuses a vesting book P3 did not record" 3 'GATE FAIL at P5: .*team-vesting.json was not recorded by P3' -- "${OBENV[@]}" bash "$CE" --confirm --only P5 --account deployer
 record_outputs "$GB"
 python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); del m["dormantLedgers"]; json.dump(m, open(sys.argv[1], "w"))' "$GB/ceremony-run.json"
@@ -1832,7 +1834,178 @@ rm -f "$GB/p5-admin-book.json"
 expect "ceremony: --confirm P5 passes over the real-shaped books (dormant ledgers repeat the governance names)" 0 'P5 PASS: FACTORY-ADMIN 0, DEPLOYER-ADMIN 0' -- "${OBENV[@]}" ADDRESS_BOOK="$T/book-vr.json" bash "$CE" --confirm --only P5 --account deployer
 python3 -c 'import json,sys; c=json.load(open(sys.argv[1]))["contracts"]; sys.exit(0 if {"ValidatorRegistry","GovernanceTimelock","GovernanceMultisig","GuardianTimelock","FederatedRoundLedger","PatronageLedger","TeamVesting_alice"} <= set(c) else 1)' "$GB/p5-admin-book.json" 2>/dev/null &&
   ok "ceremony: --confirm P5 merged every book once" || bad "ceremony: --confirm P5 merged every book once" "$(cat "$GB/p5-admin-book.json" 2>&1)"
-rm -rf "$FAKE/call/$VR" "$GB/p5-admin-book.json"
+rm -rf "$FAKE/call/$VR" "$GB/p5-admin-book.json" "$GB/library.json"
+ob_reset simulate
+rm -rf "$BCD"
+
+# ---------------------------------------------------------------- P4L: the rest of the library
+# P4L runs the existing forge scripts in library_book.py's order with every authority input
+# set to this run's GOVERNANCE, sends each script once, builds the library book from this
+# run's broadcasts (every expected name, nothing else) and records it; P5 sweeps it.
+LB="$G/library_book.py"
+LIBT="$T/lib"
+mkdir -p "$LIBT"
+# lib_bc <broadcast root> <timestamp> [skip book name] [extra contract name]: a broadcast per
+# library script as forge writes it (run-<ts>.json), every expected deployment at a distinct
+# address (0x...5000 + n), one name optionally left out, one unknown deployment optionally added.
+lib_bc() {
+  python3 - "$LB" "$@" <<'PY'
+import importlib.util, json, os, sys
+spec = importlib.util.spec_from_file_location("lb", sys.argv[1]); lb = importlib.util.module_from_spec(spec); spec.loader.exec_module(lb)
+root, ts = sys.argv[2], int(sys.argv[3])
+skip = sys.argv[4] if len(sys.argv) > 4 else ""
+extra = sys.argv[5] if len(sys.argv) > 5 else ""
+n = 0
+for script, rows in lb.LIBRARY:
+    txs = []
+    for cn, book in rows:
+        n += 1
+        if book != skip:
+            txs.append({"transactionType": "CREATE2", "contractName": cn, "contractAddress": "0x%040x" % (0x5000 + n)})
+    if extra and script == "DeployHupRegistries.s.sol":
+        txs.append({"transactionType": "CREATE2", "contractName": extra, "contractAddress": "0x%040x" % 0x5fff})
+    d = os.path.join(root, script, "40204"); os.makedirs(d, exist_ok=True)
+    json.dump({"timestamp": ts, "transactions": txs}, open(os.path.join(d, f"run-{ts}.json"), "w"))
+    json.dump({"timestamp": ts, "transactions": txs}, open(os.path.join(d, "run-latest.json"), "w"))
+PY
+}
+lib_build() { python3 "$LB" build --broadcast "$1" --chain 40204 --since 5000 --deployer "$DEP" --governance "$(addr 31)" --out "$2" "${@:3}"; }
+rm -rf "$LIBT/bc"; lib_bc "$LIBT/bc" 6000
+expect "library: build names every expected deployment from the broadcasts" 0 '17 library contract' -- lib_build "$LIBT/bc" "$LIBT/book.json"
+python3 - "$LB" "$LIBT/book.json" <<'PY' && ok "library: the book holds exactly the expected names (proxies, impls; no DPF, Quorum S6 or staking pool)" || bad "library: the book holds exactly the expected names" "$(cat "$LIBT/book.json")"
+import json, subprocess, sys
+want = subprocess.run([sys.executable, sys.argv[1], "expected"], capture_output=True, text=True).stdout.split()
+c = json.load(open(sys.argv[2]))["contracts"]
+assert sorted(c) == sorted(want) and len(want) == 17, (sorted(set(want) ^ set(c)), len(want))
+assert {"FacilitySBT", "FacilitySBTImpl", "NetworkSBT", "NetworkSBTImpl", "AnchorRegistry", "SkillRegistry", "IPFSIncentivesV3", "KYCRegistry"} <= set(c)
+assert c["FacilitySBTImpl"] != c["FacilitySBT"] and c["NetworkSBTImpl"] != c["NetworkSBT"]
+# owner 2026-10-26: no customer DPF contract, no Quorum S6 set, no LiquidStakingPool
+assert not {"TenantHierarchy", "MultiSigEnvelope", "AgentDecisionRegistryV2", "QuorumAnchorRegistry", "TripwireRegistry", "AppRegistry", "LiquidStakingPool"} & set(c)
+PY
+rm -rf "$LIBT/bc"; lib_bc "$LIBT/bc" 6000 SkillRegistry
+expect "library: a missing deployment fails, named" 1 'DeployHupRegistries.s.sol: SkillRegistry is missing' -- lib_build "$LIBT/bc" "$LIBT/b2.json"
+expect "library: --partial accepts a library in progress (P4L inputs)" 0 '16 library contract' -- lib_build "$LIBT/bc" "$LIBT/b2.json" --partial
+rm -rf "$LIBT/bc"; lib_bc "$LIBT/bc" 6000 "" CitAgentTimelockX
+expect "library: a deployment the table does not name fails" 1 'deployed CitAgentTimelockX at 0x0+5fff, which the library table does not name' -- lib_build "$LIBT/bc" "$LIBT/b3.json"
+rm -rf "$LIBT/bc"; lib_bc "$LIBT/bc" 4000
+expect "library: a broadcast from before block 0 is no evidence" 1 'no broadcast since this chain.s block 0' -- lib_build "$LIBT/bc" "$LIBT/b4.json"
+# Tripwire: the ceremony's LIBRARY_SCRIPTS is library_book.py's order (with a negative control).
+want_order=$(python3 "$LB" scripts)
+got_order=$(sed -n '/^  LIBRARY_SCRIPTS=(/,/^  )/p' "$CE" | sed -n 's#^ *script/\(.*\.s\.sol\)$#\1#p')
+[[ -n "$want_order" && "$got_order" == "$want_order" ]] && ok "library tripwire: the ceremony runs library_book.py's scripts in its order" ||
+  bad "library tripwire: the ceremony runs library_book.py's scripts in its order" "$(diff <(echo "$want_order") <(echo "$got_order"))"
+missing_s=""; for s in $want_order; do [[ -f "$G/../../contracts/script/$s" ]] || missing_s+=" $s"; done
+[[ -z "$missing_s" ]] && ok "library: every library script exists in contracts/script" || bad "library: every library script exists in contracts/script" "$missing_s"
+# Owner decision 2026-10-26: the customer DPF scripts and DeployQuorumS6 stay in the repo but are
+# not wired into the genesis ceremony (negative control: they do exist).
+if grep -qE 'DeployDpf[0-9]+|DeployQuorumS6' <<<"$want_order$(sed -n '/^# -* P4L$/,/^# -* P5$/p' "$CE" | grep -v '^ *#')"; then
+  bad "library: no DPF or Quorum S6 script is wired into the ceremony" "$want_order"
+elif [[ -f "$G/../../contracts/script/DeployDpf02Rbac.s.sol" && -f "$G/../../contracts/script/DeployQuorumS6.s.sol" ]]; then
+  ok "library: no DPF or Quorum S6 script is wired into the ceremony (the scripts stay in the repo)"
+else
+  bad "library: the DPF / Quorum S6 scripts stay in the repo" ""
+fi
+
+# The ceremony's P4L over a fake forge that writes each library script's broadcast.
+LIB_TOOLS="$T/libtools"
+mkdir -p "$LIB_TOOLS"
+cat >"$LIB_TOOLS/forge" <<EOF
+#!/usr/bin/env bash
+"$BIN/forge" "\$@" || exit \$?
+s=""; for x in "\$@"; do case "\$x" in script/*.s.sol) s="\${x#script/}" ;; esac; done
+echo "lib-env \$s rootgov=\${ROOT_GOVERNANCE:-} kyc=\${KYC_UPDATER:-} hup=\${HUP_REGISTRY_ADMIN:-} tee=\${TEE_REGISTRY:-} msbt=\${HUP_MEMBER_SBT:-} hupbook=\${HUP_BOOK_PATH:-}" >>"\$FAKE/calls.log"
+[[ -n "\${FAKE_LIB_BC:-}" && "\$*" == *--broadcast* && -n "\$s" ]] || exit 0
+[[ "\$s" == "\${FAKE_LIB_FAIL:-}" ]] && exit 1
+python3 - "$LB" "\$s" "\$FAKE_LIB_BC" <<'PY'
+import importlib.util, json, os, sys
+spec = importlib.util.spec_from_file_location("lb", sys.argv[1]); lb = importlib.util.module_from_spec(spec); spec.loader.exec_module(lb)
+n = 0
+for script, rows in lb.LIBRARY:
+    txs = []
+    for cn, book in rows:
+        n += 1
+        txs.append({"transactionType": "CREATE2", "contractName": cn, "contractAddress": "0x%040x" % (0x5000 + n)})
+    if script == sys.argv[2]:
+        d = os.path.join("broadcast", script, "40204"); os.makedirs(d, exist_ok=True)
+        json.dump({"timestamp": int(sys.argv[3]), "transactions": txs}, open(os.path.join(d, f"run-{sys.argv[3]}.json"), "w"))
+PY
+EOF
+chmod +x "$LIB_TOOLS/forge"
+lib_addr() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["contracts"][sys.argv[2]])' "$LIBT/book.json" "$1"; }
+TEEA=$(addr 401) MSBTA=$(addr 402)
+p4l_reset() { # [no-tee]
+  ob_reset
+  if [[ "${1:-}" == no-tee ]]; then
+    printf '{"chainId":40204,"deployer":"%s","contracts":{"CitrateMemberSBT":"%s"},"aaStack":{}}\n' "$DEP" "$MSBTA" >"$T/book-p4l.json"
+  else
+    printf '{"chainId":40204,"deployer":"%s","contracts":{"TEEAttestationRegistry":"%s","CitrateMemberSBT":"%s"},"aaStack":{}}\n' "$DEP" "$TEEA" "$MSBTA" >"$T/book-p4l.json"
+  fi
+  python3 - "$GB/ceremony-run.json" "$T/book-p4l.json" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1])); b = json.load(open(sys.argv[2]))
+m["stackBook"] = {"deployer": b["deployer"].lower(), "contracts": {k: v.lower() for k, v in b["contracts"].items()}, "aaStack": {}}
+json.dump(m, open(sys.argv[1], "w"))
+PY
+  local n
+  printf '0x60' >"$FAKE/code/$TEEA"; printf '0x60' >"$FAKE/code/$MSBTA"
+  for n in OrganizationSBT AgentSBT CapsuleRegistry; do fake_call "$(lib_addr $n)" owner "$(addr 31)"; done
+  rm -rf "$FAKE/call/$(lib_addr KYCRegistry)"
+  rm -f "$GB/library.json"
+}
+P4LENV=("${OBENV[@]}" ADDRESS_BOOK="$T/book-p4l.json" FORGE="$LIB_TOOLS/forge" FAKE_LIB_BC=6000)
+p4l_reset
+expect "ceremony P4L: a --confirm P4L deploys the library and records its book" 0 'P4L library.json recorded in the run manifest .*17 contract' -- "${P4LENV[@]}" bash "$CE" --confirm --only P4L --account deployer
+got=$(calls | sed -n 's/^lib-env \([^ ]*\) .*/\1/p' | paste -sd' ')
+[[ "$got" == "$(python3 "$LB" scripts | paste -sd' ')" ]] && ok "ceremony P4L: the scripts run in the library order" || bad "ceremony P4L: the scripts run in the library order" "$got"
+if calls | grep '^lib-env' | grep -v "rootgov=$(addr 31) kyc=$(addr 31) hup=$(addr 31) tee=$TEEA msbt=$MSBTA" | grep -q .; then
+  bad "ceremony P4L: every authority input is this run's GOVERNANCE" "$(calls | grep '^lib-env')"
+else
+  ok "ceremony P4L: every authority input is this run's GOVERNANCE"
+fi
+python3 -c 'import json,sys; c=json.load(open(sys.argv[1]))["contracts"]; sys.exit(0 if {"IPFSIncentivesV3","KYCRegistry","CitrateMemberSBT"} <= set(c) else 1)' "$GB/library-hup-book.json" &&
+  ok "ceremony P4L: the HUP book is the P2 book plus the library so far" || bad "ceremony P4L: the HUP book is the P2 book plus the library so far" "$(cat "$GB/library-hup-book.json" 2>&1)"
+[[ "$(manifest_key library | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')" == 17 ]] && ok "ceremony P4L: the manifest holds the 17 library contracts" || bad "ceremony P4L: the manifest holds the library" "$(manifest_key library)"
+# Sends once: a resume skips every script with a broadcast from this run.
+rm -f "$GB/library.json"
+reset_calls
+expect "ceremony P4L: a resume skips the scripts this run already sent" 0 'DeployHupRegistries.s.sol: this run.s broadcast exists; skipped' -- "${P4LENV[@]}" bash "$CE" --confirm --only P4L --account deployer
+if calls | grep -q -- '--broadcast'; then bad "ceremony P4L: a resume re-sends nothing" "$(calls | grep -- --broadcast)"; else ok "ceremony P4L: a resume re-sends nothing"; fi
+# A script that fails mid-run: P4L has sent, so the advice is the P4L resume, never P4 or P5.
+p4l_reset
+rm -rf "$BCD"
+out=$("${P4LENV[@]}" FAKE_LIB_FAIL=DeployFederatedLearning.s.sol bash "$CE" --confirm --only P4L --account deployer 2>&1)
+if grep -q 'STEP FAIL at P4L: DeployFederatedLearning.s.sol' <<<"$out" && grep -qF -- '--confirm --from P4L' <<<"$out" && ! grep -qE -- '--from P(4|5)( |$)' <<<"$out"; then
+  ok "ceremony P4L: a failed script resumes at P4L (the sent scripts are skipped)"
+else
+  bad "ceremony P4L: a failed script resumes at P4L" "$out"
+fi
+# Gates on the seats CheckDeployedAdmins does not read.
+p4l_reset
+rm -rf "$BCD"
+fake_call "$(lib_addr KYCRegistry)" "hasRole_$(printf '0x%s' "$(printf '%s' KYC_UPDATER_ROLE | sha256sum | cut -c1-64)")_$DEP" true
+expect "ceremony P4L: a deployer KYC updater fails" 3 'GATE FAIL at P4L: the deployer holds KYC_UPDATER_ROLE' -- "${P4LENV[@]}" bash "$CE" --confirm --only P4L --account deployer
+p4l_reset
+rm -rf "$BCD"
+fake_call "$(lib_addr AgentSBT)" owner "$STALE"
+expect "ceremony P4L: a HUP registry owned by another account fails" 3 'GATE FAIL at P4L: AgentSBT.owner\(\) is 0x0+63' -- "${P4LENV[@]}" bash "$CE" --confirm --only P4L --account deployer
+p4l_reset no-tee
+rm -rf "$BCD"
+expect "ceremony P4L: --confirm needs the recorded stack book's TEE registry" 3 'GATE FAIL at P4L: .*has no TEEAttestationRegistry' -- "${P4LENV[@]}" bash "$CE" --confirm --only P4L --account deployer
+if calls | grep -q -- '--broadcast'; then bad "ceremony P4L: a book without the TEE registry sends nothing" "$(calls | grep -- --broadcast)"; else ok "ceremony P4L: a book without the TEE registry sends nothing"; fi
+p4l_reset
+rm -rf "$BCD"
+expect "ceremony P4L: P0 requires EXPECTED_IPFS_V3 for a run that reaches P4L" 3 'GATE FAIL at P0: phase inputs: .*EXPECTED_IPFS_V3 is not set' -- "${P4LENV[@]}" EXPECTED_IPFS_V3= bash "$CE" --confirm --only P4L --account deployer
+expect "ceremony P4L: a preset HUP timelock owner is refused (no CitAgentTimelock)" 3 'HUP_TIMELOCK_OWNER_0 is set' -- "${P4LENV[@]}" HUP_TIMELOCK_OWNER_0="$(addr 5)" bash "$CE" --confirm --only P4L --account deployer
+# P5 sweeps the library book, and --confirm P5 refuses one P4L did not record.
+p4l_reset
+rm -rf "$BCD"
+cp "$VEST_OK" "$GB/team-vesting.json"; cp "$DORM_OK" "$GB/dormant-ledgers.json"; cp "$LIBT/book.json" "$GB/library.json"
+record_outputs "$GB"
+python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); del m["library"]; json.dump(m, open(sys.argv[1], "w"))' "$GB/ceremony-run.json"
+expect "ceremony P4L: --confirm P5 refuses a library book P4L did not record" 3 'GATE FAIL at P5: .*library.json was not recorded by P4L' -- "${OBENV[@]}" bash "$CE" --confirm --only P5 --account deployer
+rm -f "$GB/library.json"
+expect "ceremony P4L: --confirm P5 requires the library book" 3 'GATE FAIL at P5: .*library.json missing' -- "${OBENV[@]}" bash "$CE" --confirm --only P5 --account deployer
+rm -f "$GB/team-vesting.json" "$GB/dormant-ledgers.json" "$GB/library-hup-book.json" "$GB/library.partial.json"
 ob_reset simulate
 rm -rf "$BCD"
 
@@ -2296,7 +2469,7 @@ EOF
         for _ in $(seq 100); do fcast chain-id >/dev/null 2>&1 && break; sleep 0.1; done
         fcast rpc anvil_impersonateAccount "$FDEP" >/dev/null
         fcast rpc anvil_setBalance "$FDEP" 0x56bc75e2d63100000 >/dev/null
-        for a in 71 81 82; do fcast rpc anvil_setCode "$(addr "$a")" "$(gov_code "$FCODE_MSIG")" >/dev/null; done
+        for a in 71 81 82 85; do fcast rpc anvil_setCode "$(addr "$a")" "$(gov_code "$FCODE_MSIG")" >/dev/null; done
         # The checker needs the P-256 verifier, which regenesis.sh's aa/DeployP256Verifier step (not
         # in this temp project) provisions on a real chain.
         fcast rpc anvil_setCode 0xc2b78104907F722DABAc4C69f826a522B2754De4 0x600160005260206000f3 >/dev/null
@@ -2322,7 +2495,8 @@ EOF
         fi
         printf '{"deployer":"%s","contracts":{"VestingAlice":"%s"}}' "$dspell" "$(addr 71)" >"$FC/genesis/team-vesting.json"
         printf '{"deployer":"%s","contracts":{"FederatedRoundLedger":"%s","PatronageLedger":"%s"}}' "$dspell" "$(addr 81)" "$(addr 82)" >"$FC/genesis/dormant-ledgers.json"
-        record_outputs "$FC/genesis" # what --confirm P3/P4 record (#363)
+        printf '{"deployer":"%s","contracts":{"SkillRegistry":"%s"}}' "$dspell" "$(addr 85)" >"$FC/genesis/library.json"
+        record_outputs "$FC/genesis" # what --confirm P3/P4/P4L record (#363)
         if [[ "$label" == run1 ]]; then
           # A stale generator preset is refused before anything is broadcast (P1 already sent
           # its transactions, so "nothing" is: the deployer's nonce does not move).
