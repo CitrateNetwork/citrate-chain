@@ -428,6 +428,59 @@ message).
 
 ---
 
+### 8.5 Stage 2 implementation (tests only; finality still not running — both pins OFF)
+- **Adversarial + integration suite:** `node/src/finality_adversarial_tests.rs` (test-only module of
+  the node binary, because the driver and floor verifier live there). Each scenario runs 3–5
+  in-process nodes, each with its own RocksDB store, `CanonicalApplicator`,
+  `CheckpointManager` + `FinalityGadget` (switch forced ON in the test), the driver pass
+  (`finality_driver::run_pass` + `gate_outbound`) and the floor verifier in Enforced mode,
+  connected by an in-process gossip queue. Covers §8.2 (happy path, floor raise, RPC tag,
+  reorg-below-floor rejected), A1–A8 as listed in §8.3, the §4.5 safety stop and its recovery
+  through fork choice, and a restart mid-epoch (identical re-signed votes, floor re-raised at
+  boot). A1's literal "flagged slashable" part is not tested: D-5 is still "reject only".
+- **Ignored, with reasons:** three scenarios need late-joiner certificate sync (§11.10, C3-S1b):
+  a node that sat on a losing sibling, a node that restarted after the votes were gossiped, and
+  binding a certificate's committee to the governing epoch snapshot before certificates arrive
+  from peers (`verify_certificate` checks internal consistency only). One is an open finding,
+  below.
+- **Open finding (S2 window):** §5 S2 is stated against `latest_finalized_height()`. The
+  code raises the reorg floor only on the verifier's 5 s poll,
+  so between `finalize_checkpoint` and the next poll a reorg below the new certificate still
+  proceeds; the poll then halts finality (safety stop), never pins the wrong branch. Test:
+  `s2_strict_reorg_below_fresh_certificate_is_rejected` (ignored, "bug: …"); TLA+:
+  `CheckpointFinalitySafety_strict.cfg`. Decision for the owner: raise the floor at finalization
+  (after the same hash check) or restate S2 against the verified height.
+- **Open finding (S1 across sibling committees; review of #333 @ 0286eff):** the committee for
+  `(H, block)` is drawn by `FinalityGadget::committee_for` from the governing snapshot with the
+  CANDIDATE block's own VRF output as seed. Once the validator set is larger than
+  `committee_size`, two siblings at `H` get different committees, and the quorum bound
+  (`floor(2n/3)+1` of ONE committee) no longer forces two quorums to share an honest signer.
+  Under a partition along the fork, each committee can finalize its own sibling with no
+  equivocation and no Byzantine key. Tests: `open_finding_sibling_committees_finalize_conflicting_blocks`
+  (passes: pins the counterexample — 8 validators, committees of 4 overlapping in at most one
+  member, both siblings finalize) and `s1_sibling_committees_never_finalize_conflicting_blocks`
+  (ignored, "bug: …"). TLA+: committees are now modelled per candidate (`comm`, `CommitteeSize`);
+  `CheckpointFinalitySafety_committees.cfg` (5 voters, f = 1, committees of 4) must produce the
+  violation. The gating configs keep `CommitteeSize` = all voters, i.e. they verify S1 only
+  for a committee shared by every candidate. Decision for the owner (protocol change, before
+  voting is enabled): make the committee independent of the candidate (e.g. seed it from a
+  block every candidate at `H` shares, or use the whole snapshot set while it is small), or
+  require the quorum over a fixed set.
+- **TLA+:** `specs/tla/consensus/CheckpointFinalitySafety.tla` models S1/S2 across nodes
+  (actions Propose, SignVote, Finalize, VerifyFloor, Reorg, Restart). TLC runs in CI
+  (`.github/workflows/tla-finality.yml` → `scripts/ci/tla_finality.sh`, TLC 1.7.1 sha256-pinned):
+  the bounded gating config must pass, and four configs must produce counterexamples
+  (f ≥ n/3; no durable signed-vote record; strict S2; per-candidate committees). The two-height config
+  (`_deep.cfg`) runs on demand (`TLA_FINALITY_DEEP=1`; exhaustive local run 2026-10-19:
+  92.1M distinct states, no violation, 46 min). `CheckpointVoteSafety` now runs too,
+  with a submission bound and two invariants restated (errata in the spec: as first written they
+  were refuted by a valid vote followed by a rejected resubmission, and the unbounded sequence
+  never terminated).
+- **Conformance:** `core/consensus/tests/finality_tla_conformance.rs` checks the action and
+  invariant names, `MinCommittee`/`Quorum` against `MIN_FINALITY_COMMITTEE`/`derived_quorum`,
+  the 69-byte message layout, and runs seeded random walks of real gadgets through the TLA+
+  actions, checking the model invariants and the SignVote guard after every step.
+
 ## 9. Implementation stages (each its own PR, reviewed)
 
 - **Stage 0 — safe, non-consensus:** `finalized`/`safe` RPC tag (§4.6) + `CheckpointNodeConfig`
