@@ -7251,6 +7251,100 @@ mod producer_vrf_fail_closed {
         assert!(next_broadcast(&mut n.peer_rx).await.is_none());
     }
 
+    /// A prover that returns a proof which DOES verify for this header but reports
+    /// a different output than the proof commits to. The re-verify passes, so only
+    /// the output-match check stands between this and a sealed block whose header
+    /// output disagrees with its proof.
+    fn mismatched_output_prover() -> VrfProver {
+        Arc::new(|sk, alpha| {
+            let (proof, beta) = citrate_consensus::ecvrf::prove(sk, alpha)?;
+            let mut other = beta;
+            other[0] ^= 0xFF;
+            Ok((proof, other))
+        })
+    }
+
+    #[test]
+    fn generate_block_vrf_refuses_an_output_the_proof_does_not_commit_to() {
+        let sk = Ed25519SigningKey::from_bytes(&[42u8; 32]);
+        let pk = PublicKey::new(sk.verifying_key().to_bytes());
+        // Control: the proof itself is valid for this header's alpha.
+        let ok = generate_block_vrf(&real_vrf_prover(), &sk, &pk, &Hash::default(), 1)
+            .expect("the real prover proves");
+        let out = generate_block_vrf(&mismatched_output_prover(), &sk, &pk, &Hash::default(), 1);
+        match out {
+            Err(e) => assert!(
+                e.to_string().contains("output does not match"),
+                "the refusal must name the output mismatch, got: {e}"
+            ),
+            Ok(p) => panic!(
+                "a proof whose committed output differs from the reported one must not be \
+                 sealed (sealed output {:?}, proof output {:?})",
+                p.output, ok.output
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_proof_with_a_mismatched_output_is_not_sealed() {
+        let mut n = node(mismatched_output_prover()).await;
+        let err = n
+            .producer
+            .produce_block()
+            .await
+            .expect_err("a proof with a mismatched output must not be sealed");
+        assert!(
+            format!("{err:#}").contains("output does not match"),
+            "the skip must name the output mismatch, got: {err:#}"
+        );
+        assert_eq!(n.storage.blocks.get_block_by_height(1).expect("read"), None);
+        assert!(n.producer.dag_store.get_tips().await.is_empty());
+        assert!(next_broadcast(&mut n.peer_rx).await.is_none());
+    }
+
+    /// A pooled transaction that transaction selection removes from the pool
+    /// (its sender holds no committed balance, so it can never be included).
+    fn unpayable() -> Transaction {
+        Transaction {
+            hash: Hash::new([0x78; 32]),
+            from: embedded(Address([0x6B; 20])),
+            ..transfer()
+        }
+    }
+
+    /// The prove runs BEFORE transaction selection, and selection is the first step
+    /// that changes the pool. A skipped slot must therefore leave even a candidate
+    /// that selection would remove in the pool.
+    #[tokio::test]
+    async fn a_failed_prove_runs_before_selection_so_nothing_is_dropped_from_the_pool() {
+        // Control: with a working prover, selection really does drop this candidate.
+        let ok = node(real_vrf_prover()).await;
+        ok.mempool
+            .add_transaction(unpayable(), TxClass::Standard)
+            .await
+            .expect("admitted to the pool (no balance reader wired)");
+        ok.producer.produce_block().await.expect("block produced");
+        assert!(
+            !ok.mempool.contains(&unpayable().hash).await,
+            "control: selection removes an unpayable candidate from the pool"
+        );
+
+        let n = node(failing_prover()).await;
+        n.mempool
+            .add_transaction(unpayable(), TxClass::Standard)
+            .await
+            .expect("admitted to the pool (no balance reader wired)");
+        n.producer
+            .produce_block()
+            .await
+            .expect_err("a failed VRF prove must skip the slot");
+        assert!(
+            n.mempool.contains(&unpayable().hash).await,
+            "a skipped slot must not run transaction selection: the candidate it would \
+             drop is still pooled"
+        );
+    }
+
     #[test]
     fn generate_block_vrf_returns_an_error_instead_of_a_stub() {
         let sk = Ed25519SigningKey::from_bytes(&[42u8; 32]);

@@ -489,3 +489,41 @@ async fn the_rule_changes_the_state_root_only_through_created_code() {
         exact.executor.get_balance(&e2)
     );
 }
+
+/// A top-level deploy whose constructor CREATEs a child, all at `LEGACY`. The
+/// contract-creation entry point (not the call entry point) runs the
+/// constructor, so this pins that entry point's activation gate.
+async fn legacy_constructor_scenario() -> (Chain, Address) {
+    let mut chain = Chain::at(LEGACY);
+    let _probe = chain.deploy(&probe_runtime()).await;
+    let parent = chain
+        .deploy_init(parent_init(&init_for(&child_runtime())))
+        .await;
+    let child = chain.call_for_address(parent, vec![0x01]).await;
+    (chain, child)
+}
+
+/// The state root the previous binary (no exact-code rule) computes for
+/// `legacy_constructor_scenario`. Captured by running the same transactions
+/// on `main` before the rule existed.
+const LEGACY_CONSTRUCTOR_SCENARIO_ROOT: &str =
+    "ab68f3878933c60dbb57351d4c0d73d62a32755ac20ecfae531a0be2d9337290";
+
+#[tokio::test]
+async fn below_activation_a_constructor_create_keeps_the_padded_form_and_the_state_root() {
+    activate();
+    let (chain, child) = legacy_constructor_scenario().await;
+    let mut padded = child_runtime();
+    padded.extend_from_slice(&[0u8; REVM_PADDING]);
+    assert_eq!(
+        chain.stored_code(&child),
+        padded,
+        "a constructor-created child below the activation keeps the legacy padded form"
+    );
+    assert_eq!(chain.stored_code_hash(&child), keccak(&padded));
+    let root = hex::encode(chain.executor.calculate_state_root().as_bytes());
+    assert_eq!(
+        root, LEGACY_CONSTRUCTOR_SCENARIO_ROOT,
+        "below the activation the state root equals the previous binary's"
+    );
+}
