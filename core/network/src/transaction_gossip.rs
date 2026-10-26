@@ -751,4 +751,34 @@ mod tests {
             "peer_inventory must be pruned of hashes no longer in seen_txs"
         );
     }
+
+    /// The AI-transaction relay buffer is capped at the handler. The relay
+    /// task only drains it after `ai_tx_delay`, so with a long delay every
+    /// AI transaction a peer sends lands in the buffer; only the cap in
+    /// `handle_new_transaction` bounds it (`cleanup` trims it too, but is
+    /// never called on this path).
+    #[tokio::test]
+    async fn pending_ai_tx_buffer_is_capped_at_the_handler() {
+        let peer_manager = Arc::new(PeerManager::new(Default::default()));
+        let cfg = GossipConfig {
+            max_pending_ai_txs: 16,
+            ai_tx_delay: Duration::from_secs(3600),
+            ..Default::default()
+        };
+        let gossip = TransactionGossip::new(peer_manager, cfg);
+        let peer = PeerId::new("ai-flooder".to_string());
+        for i in 0..200u32 {
+            let mut tx = valid_tx(0, TransactionType::InferenceRequest);
+            let mut h = [0u8; 32];
+            h[..4].copy_from_slice(&i.to_le_bytes());
+            h[31] = 0xA1;
+            tx.hash = Hash::new(h);
+            let _ = gossip.handle_new_transaction(&peer, tx).await;
+        }
+        let pending = gossip.pending_ai_txs.read().await.len();
+        assert_eq!(
+            pending, 16,
+            "pending AI txs must stop at the cap; got {pending}"
+        );
+    }
 }
