@@ -59,7 +59,9 @@ impl Trie {
     /// Insert a key-value pair
     pub fn insert(&mut self, key: Vec<u8>, value: Vec<u8>) {
         let nibbles = to_nibbles(&key);
-        self.root = Self::insert_node(self.root.clone(), &nibbles, value.clone());
+        // Take the root by value instead of cloning the whole tree on every
+        // insert (the result replaces it either way).
+        self.root = Self::insert_node(std::mem::take(&mut self.root), &nibbles, value.clone());
         self.cache.insert(key, value);
     }
 
@@ -175,7 +177,7 @@ impl Trie {
     /// Remove a key
     pub fn remove(&mut self, key: &[u8]) {
         let nibbles = to_nibbles(key);
-        self.root = Self::remove_node(self.root.clone(), &nibbles);
+        self.root = Self::remove_node(std::mem::take(&mut self.root), &nibbles);
         self.cache.remove(key);
     }
 

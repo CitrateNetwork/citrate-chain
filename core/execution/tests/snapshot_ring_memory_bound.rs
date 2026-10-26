@@ -60,17 +60,16 @@ fn slot(k: u32) -> Vec<u8> {
 #[test]
 fn snapshot_ring_shares_unchanged_contract_storage() {
     let db = StateDB::new();
+    let before_state = live();
     for c in 0..CONTRACTS {
         for k in 0..SLOTS {
             db.set_storage(addr(c), slot(k), vec![c; 32]);
         }
     }
     db.commit();
-
-    let before_one = live();
-    let one = db.snapshot();
-    let one_cost = live() - before_one;
-    drop(one);
+    // The persist path drains the dirty set every block.
+    let _ = db.take_dirty_storage();
+    let state_cost = live() - before_state;
 
     // A ring of RING snapshots, one per "block", each block touching one slot
     // of one contract.
@@ -80,20 +79,21 @@ fn snapshot_ring_shares_unchanged_contract_storage() {
         let c = (b % CONTRACTS as usize) as u8;
         db.set_storage(addr(c), slot(0), vec![(b % 251) as u8; 32]);
         db.commit();
+        let _ = db.take_dirty_storage();
         ring.push(db.snapshot());
     }
     let ring_cost = live() - before_ring;
     eprintln!(
-        "one full snapshot = {one_cost} B; ring of {RING} = {ring_cost} B ({:.1}x one)",
-        ring_cost as f64 / one_cost.max(1) as f64
+        "contract state = {state_cost} B; ring of {RING} snapshots = {ring_cost} B ({:.1}x the state)",
+        ring_cost as f64 / state_cost.max(1) as f64
     );
-    // Each block changed one contract: the ring should cost about one state
-    // copy plus RING copies of one contract (1/CONTRACTS of the state), i.e.
-    // ~2-3x one snapshot. A deep-copy ring costs ~RINGx. Allow 10x.
+    // Each block changed one contract (1/CONTRACTS of the state), so a sharing
+    // ring costs about RING/CONTRACTS ~ 1.7 state copies. A deep-copy ring
+    // costs about RING state copies. Allow 4x.
     assert!(
-        ring_cost < one_cost * 10,
-        "ring of {RING} snapshots cost {ring_cost} B, {}x one snapshot ({one_cost} B)",
-        ring_cost / one_cost.max(1)
+        ring_cost < state_cost * 4,
+        "ring of {RING} snapshots cost {ring_cost} B = {}x the contract state ({state_cost} B)",
+        ring_cost / state_cost.max(1)
     );
 
     // Copy-on-write must never leak a later write into an earlier snapshot.

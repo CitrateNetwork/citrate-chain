@@ -16,8 +16,12 @@ pub struct StateDB {
     /// Account manager
     pub accounts: Arc<AccountManager>,
 
-    /// Storage tries for each account
-    storage_tries: Arc<DashMap<Address, Trie>>,
+    /// Storage tries for each account, copy-on-write: a `StateSnapshot` holds
+    /// another reference to each trie instead of a deep copy, and a write after
+    /// a snapshot copies only the one trie it touches (`Arc::make_mut`). The
+    /// reorg ring keeps 100 snapshots, so this is what keeps its cost
+    /// proportional to what changed rather than 100x the contract state.
+    storage_tries: Arc<DashMap<Address, Arc<Trie>>>,
 
     /// Contract code storage
     code_storage: Arc<DashMap<Hash, Vec<u8>>>,
@@ -28,8 +32,9 @@ pub struct StateDB {
     /// Training jobs
     training_jobs: Arc<DashMap<JobId, TrainingJob>>,
 
-    /// Global state trie
-    state_trie: Arc<parking_lot::RwLock<Trie>>,
+    /// Global state trie (rebuilt whole by `calculate_state_root`; shared, not
+    /// copied, by snapshots).
+    state_trie: Arc<parking_lot::RwLock<Arc<Trie>>>,
 
     /// C6 fix: Track dirty storage slots for persistence.
     /// Stores (address, key) pairs that have been modified since last commit.
@@ -51,7 +56,7 @@ impl StateDB {
             code_storage: Arc::new(DashMap::new()),
             models: Arc::new(DashMap::new()),
             training_jobs: Arc::new(DashMap::new()),
-            state_trie: Arc::new(parking_lot::RwLock::new(Trie::new())),
+            state_trie: Arc::new(parking_lot::RwLock::new(Arc::new(Trie::new()))),
             dirty_storage: Arc::new(DashSet::new()),
             dirty_code: Arc::new(DashSet::new()),
         }
@@ -71,7 +76,7 @@ impl StateDB {
             code_storage: self.code_storage.clone(),
             models: Arc::new(DashMap::new()),
             training_jobs: Arc::new(DashMap::new()),
-            state_trie: Arc::new(parking_lot::RwLock::new(Trie::new())),
+            state_trie: Arc::new(parking_lot::RwLock::new(Arc::new(Trie::new()))),
             dirty_storage: Arc::new(DashSet::new()),
             dirty_code: Arc::new(DashSet::new()),
         };
@@ -109,10 +114,8 @@ impl StateDB {
     /// Set storage value
     pub fn set_storage(&self, address: Address, key: Vec<u8>, value: Vec<u8>) {
         self.dirty_storage.insert((address, key.clone()));
-        self.storage_tries
-            .entry(address)
-            .or_default()
-            .insert(key, value);
+        let mut trie = self.storage_tries.entry(address).or_default();
+        Arc::make_mut(trie.value_mut()).insert(key, value);
     }
 
     /// PIL-13b: warm the in-memory storage cache from the persistent
@@ -121,17 +124,15 @@ impl StateDB {
     /// it would create a no-op flush at next commit. Used by the REVM
     /// Database adapter to hydrate cold-cache misses for view calls.
     pub fn cache_storage(&self, address: Address, key: Vec<u8>, value: Vec<u8>) {
-        self.storage_tries
-            .entry(address)
-            .or_default()
-            .insert(key, value);
+        let mut trie = self.storage_tries.entry(address).or_default();
+        Arc::make_mut(trie.value_mut()).insert(key, value);
     }
 
     /// Delete storage value
     pub fn delete_storage(&self, address: Address, key: &[u8]) {
         self.dirty_storage.insert((address, key.to_vec()));
         if let Some(mut trie) = self.storage_tries.get_mut(&address) {
-            trie.remove(key);
+            Arc::make_mut(trie.value_mut()).remove(key);
         }
     }
 
@@ -269,7 +270,8 @@ impl StateDB {
     ///    and its root — is identical across the fleet (see
     ///    `state_root_is_operation_order_independent`).
     pub fn calculate_state_root(&self) -> StateRoot {
-        let mut state_trie = self.state_trie.write();
+        let mut state_trie_slot = self.state_trie.write();
+        let mut state_trie = Trie::new();
 
         // SRP (ADR-2026-07-21-state-root-purity, Decision §1+§2): the consensus root MUST
         // be a PURE FUNCTION of committed state — identical whether a node produced,
@@ -288,7 +290,6 @@ impl StateDB {
         // class). The resident map is never evicted; a restarted node fully hydrates it
         // first (WP-2.2). Deterministic address-sorted insertion preserves the PR-#88
         // order-independence invariant.
-        *state_trie = Trie::new();
 
         let mut all = self.accounts.all_accounts();
         all.sort_unstable_by_key(|a| a.0 .0);
@@ -325,7 +326,9 @@ impl StateDB {
             state_trie.insert(address.0.to_vec(), encoded);
         }
 
-        state_trie.root_hash()
+        let root = state_trie.root_hash();
+        *state_trie_slot = Arc::new(state_trie);
+        root
     }
 
     /// SRP-S4 diagnostic — an INJECTIVE full-state fingerprint that DISTINGUISHES two
@@ -507,7 +510,8 @@ impl Default for StateDB {
 #[derive(Clone)]
 pub struct StateSnapshot {
     accounts: crate::state::account::AccountSnapshot,
-    storage_tries: Vec<(Address, Trie)>,
+    /// Shared with the live `StateDB` (copy-on-write; see `StateDB::storage_tries`).
+    storage_tries: Vec<(Address, Arc<Trie>)>,
     models: Vec<(ModelId, ModelState)>,
     training_jobs: Vec<(JobId, TrainingJob)>,
     dirty_storage: Vec<(Address, Vec<u8>)>,
@@ -519,7 +523,7 @@ pub struct StateSnapshot {
     /// rebuilt from scratch), so a snapshot that omitted it left the trie polluted after
     /// a restore — a rejected apply_block would then still report the (uncommitted)
     /// candidate root. Capturing + restoring it makes revert byte-exact.
-    state_trie: Trie,
+    state_trie: Arc<Trie>,
 }
 
 impl StateSnapshot {
