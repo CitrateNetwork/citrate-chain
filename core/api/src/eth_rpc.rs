@@ -217,6 +217,13 @@ fn pubkey_hex_opt_to_evm_address(hex_opt: Option<&String>) -> Option<String> {
     hex_opt.map(|s| pubkey_hex_to_evm_address(s))
 }
 
+/// `extraData` for a block. Block 0 of the r1006 genesis carries its genesis note (the
+/// same text block 0's state holds at `GENESIS_NOTE_ADDRESS`); every other block is `0x`.
+fn block_extra_data(height: u64, hash: &[u8; 32]) -> String {
+    let _ = (height, hash);
+    "0x".to_string()
+}
+
 fn eth_block_json(
     block: &crate::types::response::BlockResponse,
     transactions: Vec<Value>,
@@ -270,7 +277,7 @@ fn eth_block_json(
         "stateRoot": format!("0x{}", hex::encode(block.state_root.as_bytes())),
         "receiptsRoot": format!("0x{}", hex::encode(block.receipt_root.as_bytes())),
         "size": format!("0x{:x}", 1000),
-        "extraData": "0x",
+        "extraData": block_extra_data(block.height, block.hash.as_bytes()),
         "baseFeePerGas": format!("0x{:x}", block.base_fee_per_gas),
         "uncles": [],
         // PIL-50: GHOSTDAG fields (see explorer handoff RPC_DAG_FIELDS_HANDOFF.md).
@@ -3571,5 +3578,23 @@ mod tests {
                 input
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod genesis_extra_data_tests {
+    use super::block_extra_data;
+    use citrate_consensus::hardening::{R1006_GENESIS, RELEASE_GENESIS};
+    use citrate_economics::r1006::GENESIS_NOTE;
+
+    #[test]
+    fn r1006_block_zero_carries_the_genesis_note() {
+        assert_eq!(
+            block_extra_data(0, &R1006_GENESIS),
+            format!("0x{}", hex::encode(GENESIS_NOTE.as_bytes()))
+        );
+        // Only block 0 of r1006: r1005's block 0, and any other block, stay empty.
+        assert_eq!(block_extra_data(0, &RELEASE_GENESIS[0].1), "0x");
+        assert_eq!(block_extra_data(1, &R1006_GENESIS), "0x");
     }
 }
