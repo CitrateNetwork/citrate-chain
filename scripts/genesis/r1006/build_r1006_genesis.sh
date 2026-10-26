@@ -96,7 +96,11 @@ case "$cmd" in
     rc=0
     unshare --user --map-root-user --net bash "$HERE/build_r1006_genesis.sh" _inner \
       --node "$(readlink -f "$NODE")" --state-dump "$(readlink -f "$DUMP")" --work "$WORK" --solc "$SOLC_BIN" || rc=$?
-    git -C "$CHAIN_ROOT" worktree remove --force "$WORK/repo" >>"$WORK/worktree.log" 2>&1 || true
+    if [[ $rc -eq 0 ]]; then
+      git -C "$CHAIN_ROOT" worktree remove --force "$WORK/repo" >>"$WORK/worktree.log" 2>&1 || true
+    else
+      echo "build_r1006_genesis: failed (exit $rc); the ceremony worktree is kept at $WORK/repo" >&2
+    fi
     exit "$rc"
     ;;
   alloc)
@@ -124,7 +128,7 @@ c() { "$REAL_CAST" "$@" --rpc-url "$RPC"; }
 # Succeeds only on status 1.
 csend() {
   local h st
-  h=$(c send --async "$@") || return 1
+  h=$("$REAL_CAST" send --rpc-url "$RPC" --async "$@") || return 1
   for _ in $(seq 240); do
     st=$(c receipt --async "$h" status 2>/dev/null) && [[ -n "$st" ]] && break
     sleep 0.5
