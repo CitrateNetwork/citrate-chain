@@ -97,7 +97,32 @@ def vulnerable_parents(lock_text: str, where: str = "Cargo.lock") -> tuple[dict[
 def check(lockfiles: list[Path], ignore_files: list[Path], allowed: frozenset[str],
           today: dt.date) -> tuple[list[str], list[str]]:
     """Return (failures, parents seen). An empty failure list is a pass."""
-    return [], []
+    errors: list[str] = []
+    seen: set[str] = set()
+    any_vulnerable = False
+    floor = ".".join(map(str, PATCHED))
+    for lf in lockfiles:
+        parents, vuln = vulnerable_parents(lf.read_text(), str(lf))
+        any_vulnerable |= vuln
+        seen |= parents.keys()
+        for name in sorted(set(parents) - allowed):
+            errors.append(
+                f"{lf}: {name} -> crypto-bigint {', '.join(sorted(parents[name]))} "
+                f"(< {floor}) is not covered by the {ADVISORY} ignore"
+            )
+    present = [f for f in ignore_files if f.is_file() and ADVISORY in f.read_text()]
+    if present and today > EXPIRES:
+        errors.append(
+            f"the {ADVISORY} ignore expired on {EXPIRES} but is still in "
+            + ", ".join(str(p) for p in present)
+            + ": upgrade crypto-bigint, or renew the ignore and EXPIRES in a reviewed PR"
+        )
+    if present and not any_vulnerable:
+        errors.append(
+            f"no crypto-bigint below {floor} is left in any lockfile: the {ADVISORY} "
+            "ignore is stale, remove it (and this check)"
+        )
+    return errors, sorted(seen)
 
 
 def main(argv: list[str] | None = None) -> int:

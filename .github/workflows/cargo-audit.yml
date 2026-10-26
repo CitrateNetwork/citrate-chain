@@ -72,9 +72,17 @@ jobs:
         #   no_std feature that conflicts, so it is not bumpable from this
         #   lockfile. Low severity (flag-only correctness edge). Remove when
         #   alloy-primitives moves to a ruint >= 1.20 line.
+        #
+        # Time-boxed, EXPIRES 2027-01-31 (enforced by the guard step above):
+        #   RUSTSEC-2026-0387 — crypto-bigint < 0.7.6, library-level timing
+        #   variability in operations meant to be constant-time. 0.5.5 comes in
+        #   only through elliptic-curve 0.13 (k256 / p256 0.13); no patched 0.5.x
+        #   exists and no 0.13 curve release accepts 0.7. Blocked upstream: alloy
+        #   and revm still require k256 / p256 0.13. Upgrade tracked; see audit.toml.
         run: |
           cargo audit \
             --color always \
             --ignore RUSTSEC-2025-0137 \
             --ignore RUSTSEC-2025-0055 \
-            --ignore RUSTSEC-2026-0220
+            --ignore RUSTSEC-2026-0220 \
+            --ignore RUSTSEC-2026-0387

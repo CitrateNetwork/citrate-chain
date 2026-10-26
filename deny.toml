@@ -126,6 +126,12 @@ ignore = [
     # (RUSTSEC-2026-0258) was PATCHED via a Cargo.lock bump to h2 0.4.16
     # rather than ignored.
     "RUSTSEC-2026-0253",
+    # crypto-bigint < 0.7.6 timing advisory — time-boxed, EXPIRES 2027-01-31.
+    # 0.5.5 comes in only via elliptic-curve 0.13 (k256 / p256 0.13); no patched
+    # 0.5.x, and the 0.14 curve line is blocked on alloy / revm upstream. Upgrade
+    # tracked. Enforced by scripts/ci/check-crypto-bigint-users.py (allowlist,
+    # stale check, expiry). See audit.toml.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 via elliptic-curve 0.13 only; upstream-blocked; expires 2027-01-31" },
 ]
 
 [bans]
