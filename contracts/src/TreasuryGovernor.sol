@@ -168,7 +168,8 @@ contract TreasuryGovernor is ReentrancyGuard {
     /// @notice Guardian address for emergency cancellation
     address public guardian;
 
-    /// @notice Total supply of SALT for quorum calculation (1B SALT)
+    /// @notice Total supply of SALT for quorum calculation (DeployAll passes
+    ///         SaltSupply.TOTAL_SUPPLY, the 1T SALT canon)
     uint256 public totalSaltSupply;
 
     // ============================================================

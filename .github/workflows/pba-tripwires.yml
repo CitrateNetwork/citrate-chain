@@ -30,3 +30,7 @@ jobs:
         run: scripts/ci/check_pba_exec_tripwires.sh --self-test
       - name: CHAIN-EXEC tripwires (signature setting, node feature set, mempool expiry, metrics bind)
         run: scripts/ci/check_pba_exec_tripwires.sh
+      - name: SALT supply tripwire self-test
+        run: scripts/ci/salt_supply_tripwire.sh --self-test
+      - name: SALT supply basis (contracts constant = core/economics; no literal governor supply)
+        run: scripts/ci/salt_supply_tripwire.sh
