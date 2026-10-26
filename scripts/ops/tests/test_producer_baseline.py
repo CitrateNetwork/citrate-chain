@@ -497,6 +497,17 @@ class ApplyStepsTest(ShimTestCase):
         self.assertIn(f"install -d -o root -g citrate -m 0750 {self.sb.root}/var/lib/citrate", installs)
         self.assertIn(f"install -d -o citrate -g citrate -m 0700 {self.sb.root}/var/lib/citrate/data", installs)
 
+    def test_dir_changes_are_reported(self) -> None:
+        d = self.sb.root / "var/lib/citrate"
+        d.mkdir(parents=True)
+        d.chmod(0o755)  # the earlier layout
+        body = 'apply_user_dirs >/dev/null; printf "%s\\n" "${CHANGED[@]}"'
+        r = self.sb.run(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("/var/lib/citrate", r.stdout.splitlines())
+        r = self.sb.run(body)
+        self.assertEqual(r.stdout.strip(), "", "a converged run reports no change")  # negative control
+
     def test_dirs_refuse_symlinks(self) -> None:
         target = self.sb.root / "elsewhere"
         target.mkdir(mode=0o755)
