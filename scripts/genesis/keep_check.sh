@@ -25,7 +25,12 @@
 #     the gate also FAILS if an in-scope broadcast deploys a pinned address under another name
 #     than its row's (or under any name, for a `-` row), or if a named row has no in-scope
 #     deployment at its pinned address: a wrong name would otherwise make redeploy detection
-#     look for a contract name that never appears, and pass. Every broadcast record for this chain is read: contracts/
+#     look for a contract name that never appears, and pass. A deployment forge recorded
+#     without a contract name (the P-256 verifier, CREATE2 from vendored init code through the
+#     factory) is named "initcode:<keccak256(init code)>" in every mode, but only when its
+#     record proves its address (CREATE2 of its factory, salt and init code); a nameless
+#     deployment whose record does not is an input error (keys, pin) or a gate failure (verify).
+#     Every broadcast record for this chain is read: contracts/
 #     broadcast/<script>/<chain id>/run-latest.json AND every timestamped run-<ts>.json next
 #     to it (Foundry keeps one per run; run-latest.json only holds the newest, so an earlier
 #     run that moved a kept contract survives only in its timestamped copy). The chain id
@@ -145,14 +150,19 @@ print(v.lower() if isinstance(v, str) else ("MISSING" if v is None and sec != "<
 PY
 }
 
-# broadcast_names <dir> <chain id>: "address<TAB>contractName" for every CREATE/CREATE2 in every
+# broadcast_names <dir> <chain id>: "address<TAB>identity" for every CREATE/CREATE2 in every
 # run record (run-latest.json and run-<ts>.json) for that chain id under <dir>, one line per
-# address. Exits non-zero (reason on stderr) on an unreadable or malformed record, a
-# multi-chain broadcast, or one address recorded under two names.
+# address. The identity is the contract name forge recorded or, for a nameless CREATE2 whose
+# record proves its address, "initcode:<keccak256(init code)>" (broadcast_ident.py). Exits
+# non-zero (reason on stderr) on an unreadable or malformed record, a nameless deployment
+# whose record does not prove its address, a multi-chain broadcast, or one address recorded
+# under two identities.
 broadcast_names() {
-  "$PY" - "$1" "$2" <<'PY'
+  "$PY" - "$1" "$2" "$HERE" <<'PY'
 import json, pathlib, re, sys
 root, cid = pathlib.Path(sys.argv[1]), sys.argv[2]
+sys.path.insert(0, sys.argv[3])
+from broadcast_ident import identity
 if not root.is_dir():
     sys.exit(f"BROADCAST_DIR {root} is not a directory")
 if (root / "multi").exists():
@@ -174,8 +184,11 @@ for d in sorted(root.glob(f"*/{cid}")):
             if not isinstance(t, dict) or t.get("transactionType") not in ("CREATE", "CREATE2"):
                 continue
             n, a = t.get("contractName"), t.get("contractAddress")
-            if not isinstance(n, str) or not n or not isinstance(a, str) or not re.fullmatch(r"0x[0-9a-fA-F]{40}", a):
-                sys.exit(f"broadcast {f}: a deployment without a contract name or address")
+            if n is not None and not isinstance(n, str) or not isinstance(a, str) or not re.fullmatch(r"0x[0-9a-fA-F]{40}", a):
+                sys.exit(f"broadcast {f}: a deployment without a well-formed contract name or address")
+            n, why = identity(t)
+            if n is None:
+                sys.exit(f"broadcast {f}: {why}")
             names.setdefault(a.lower(), set()).add(n)
 for a in sorted(names):
     if len(names[a]) != 1:
@@ -364,10 +377,12 @@ if [[ -n "${BROADCAST_DIR:-}" && $DRY -eq 0 ]]; then
     # missing DONE, or a line of an unknown kind fails the gate: a crash part-way through
     # must never read as "nothing moved".
     scan_rc=0
-    bc=$("$PY" - "$BROADCAST_DIR" "$bcid" "${BROADCAST_SINCE:-0}" "$pins" "$rowsat" <<'PY'
+    bc=$("$PY" - "$BROADCAST_DIR" "$bcid" "${BROADCAST_SINCE:-0}" "$pins" "$rowsat" "$HERE" <<'PY'
 # keep_check broadcast scanner
 import json, re, sys, pathlib
 root, cid, since, pins_raw, rows_raw = pathlib.Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5]
+sys.path.insert(0, sys.argv[6])
+from broadcast_ident import identity
 pinned = {}
 for line in pins_raw.splitlines():
     if "\t" in line:
@@ -422,6 +437,12 @@ def scan(f, script):
         if not isinstance(kind, (str, type(None))) or not isinstance(name, (str, type(None))):
             print(f"BAD\t{script}\tbroadcast {f}: transaction {i} has a malformed type or contract name")
             continue
+        if kind in ("CREATE", "CREATE2") and not name:
+            # No recorded name: the init code identifies it, once the record proves its address.
+            name, why = identity(t)
+            if name is None:
+                print(f"BAD\t{script}\tbroadcast {f}: transaction {i} is {why}")
+                continue
         if kind in ("CREATE", "CREATE2") and isinstance(a, str) and a.lower() in rows_at:
             # A deployment at a pinned address must carry that row's contract name.
             for rname, rkey in rows_at[a.lower()]:

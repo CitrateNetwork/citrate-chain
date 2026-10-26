@@ -8,9 +8,9 @@ name: genesis-scripts
 on:
   push:
     branches: [main]
-    paths: ['scripts/genesis/**', 'scripts/ci/deployer_input_override_tripwire.sh', 'scripts/ops/regenesis.sh', 'scripts/ops/emit-address-table.sh', 'scripts/ci/check-create2-determinism.sh', 'contracts/script/DeployValidatorRegistry.s.sol', 'contracts/script/DeployCoreMembership.s.sol', 'contracts/script/ScriptEnv.sol', 'contracts/script/CheckDeployedAdmins.s.sol', 'contracts/script/lib/AdminChecks.sol', '.github/workflows/genesis-scripts.yml']
+    paths: ['contracts/script/**', 'scripts/genesis/**', 'scripts/ci/deployer_input_override_tripwire.sh', 'scripts/ops/regenesis.sh', 'scripts/ops/emit-address-table.sh', 'scripts/ci/check-create2-determinism.sh', 'contracts/script/DeployValidatorRegistry.s.sol', 'contracts/script/DeployCoreMembership.s.sol', 'contracts/script/ScriptEnv.sol', 'contracts/script/CheckDeployedAdmins.s.sol', 'contracts/script/lib/AdminChecks.sol', '.github/workflows/genesis-scripts.yml']
   pull_request:
-    paths: ['scripts/genesis/**', 'scripts/ci/deployer_input_override_tripwire.sh', 'scripts/ops/regenesis.sh', 'scripts/ops/emit-address-table.sh', 'scripts/ci/check-create2-determinism.sh', 'contracts/script/DeployValidatorRegistry.s.sol', 'contracts/script/DeployCoreMembership.s.sol', 'contracts/script/ScriptEnv.sol', 'contracts/script/CheckDeployedAdmins.s.sol', 'contracts/script/lib/AdminChecks.sol', '.github/workflows/genesis-scripts.yml']
+    paths: ['contracts/script/**', 'scripts/genesis/**', 'scripts/ci/deployer_input_override_tripwire.sh', 'scripts/ops/regenesis.sh', 'scripts/ops/emit-address-table.sh', 'scripts/ci/check-create2-determinism.sh', 'contracts/script/DeployValidatorRegistry.s.sol', 'contracts/script/DeployCoreMembership.s.sol', 'contracts/script/ScriptEnv.sol', 'contracts/script/CheckDeployedAdmins.s.sol', 'contracts/script/lib/AdminChecks.sol', '.github/workflows/genesis-scripts.yml']
   workflow_dispatch:
 
 permissions:
@@ -23,6 +23,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: shellcheck
         run: shellcheck -x -S warning scripts/genesis/*.sh scripts/genesis/tests/*.sh scripts/ops/regenesis.sh scripts/ops/emit-address-table.sh scripts/ci/deployer_input_override_tripwire.sh
+      # Every environment key a ceremony phase's scripts read is classified in
+      # scripts/genesis/phase_inputs.json, which P0 checks before anything is sent (the
+      # negative controls are in the suite below).
+      - name: phase-inputs tripwire
+        run: python3 -I scripts/genesis/phase_inputs.py check-spec
       - name: deployer-input tripwire (self-test, then the tree)
         run: scripts/ci/deployer_input_override_tripwire.sh --self-test && scripts/ci/deployer_input_override_tripwire.sh
       # The fresh-genesis end-to-end case compiles the real ValidatorRegistry and membership
