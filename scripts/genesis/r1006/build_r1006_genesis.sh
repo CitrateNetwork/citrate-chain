@@ -118,6 +118,19 @@ ln -sf "$HERE/forge_resume.sh" "$WORK/bin/forge"
 export R1006_REAL_FORGE="$REAL_FORGE" PATH="$WORK/bin:$PATH"
 RPC="http://127.0.0.1:$RPC_PORT"
 c() { "$REAL_CAST" "$@" --rpc-url "$RPC"; }
+# csend ARGS...: `cast send` without waiting in cast (on a Citrate node cast's own receipt
+# polling can give up on a mined transaction, R1006_GAPS G-11), then poll the receipt here.
+# Succeeds only on status 1.
+csend() {
+  local h st
+  h=$(c send --async "$@") || return 1
+  for _ in $(seq 240); do
+    st=$(c receipt --async "$h" status 2>/dev/null) && [[ -n "$st" ]] && break
+    sleep 0.5
+  done
+  echo "tx $h status ${st:-none}"
+  [[ "$st" == true || "$st" == 1 || "$st" == "1 (success)" ]]
+}
 
 cat >"$WORK/devnet.toml" <<EOF
 # r1006 ceremony devnet: chain 40204 (the contracts bind the chain id), the devnet
@@ -196,7 +209,7 @@ PWF="$HOME/keystore.pw"
 "$REAL_CAST" wallet import r1006-ceremony --private-key "$DEPLOYER_KEY" --unsafe-password "r1006-throwaway" >/dev/null
 unset DEPLOYER_KEY
 log "deployer $DEPLOYER (throwaway); funding $DEPLOYER_FUNDING"
-c send --private-key "$DEV_FUNDER_KEY" --legacy --gas-limit 21000 --value "$DEPLOYER_FUNDING" "$DEPLOYER" >"$WORK/fund.log" 2>&1 ||
+csend --private-key "$DEV_FUNDER_KEY" --legacy --gas-limit 21000 --value "$DEPLOYER_FUNDING" "$DEPLOYER" >"$WORK/fund.log" 2>&1 ||
   die "funding the deployer failed (see $WORK/fund.log)"
 [[ "$(c nonce "$DEPLOYER")" == 0 ]] || die "deployer nonce is not 0 after funding"
 
@@ -255,9 +268,9 @@ if [[ "$(jq -r .status "$WORK/validators.json")" == final ]]; then
   n=$(jq '.producers | length' "$WORK/validators.json")
   for i in $(seq 0 $((n - 1))); do
     read -r name staker pk sig stake < <(jq -r ".producers[$i] | [.name,.staker,.proposerPubkey,.registrationSig,.stake] | @tsv" "$WORK/validators.json")
-    c send --private-key "$DEV_FUNDER_KEY" --legacy --gas-limit 21000 --value "$(python3 -c "print($stake + 10**18)")" "$staker" >>"$WORK/pv.log" 2>&1 ||
+    csend --private-key "$DEV_FUNDER_KEY" --legacy --gas-limit 21000 --value "$(python3 -c "print($stake + 10**18)")" "$staker" >>"$WORK/pv.log" 2>&1 ||
       die "PV: funding $name's staker failed (see $WORK/pv.log)"
-    c send --unlocked --from "$staker" --legacy --gas-limit 2000000 --value "$stake" "$VR" "registerValidator(bytes32,bytes)" "$pk" "$sig" >>"$WORK/pv.log" 2>&1 ||
+    csend --unlocked --from "$staker" --legacy --gas-limit 2000000 --value "$stake" "$VR" "registerValidator(bytes32,bytes)" "$pk" "$sig" >>"$WORK/pv.log" 2>&1 ||
       die "PV: registering $name failed (see $WORK/pv.log)"
     [[ "$(c call "$VR" "isActive(bytes32)(bool)" "$pk")" == true ]] || die "PV: $name is not active after registering"
     log "PV: $name registered ($pk)"
