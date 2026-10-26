@@ -1869,6 +1869,8 @@ pub fn register_eth_methods_with_finality(
     // eth_getLogs - Get logs matching filter criteria
     let storage_logs = storage.clone();
     let finalized_logs = finalized_height.clone();
+    let executed_chain_logs = Arc::new(crate::canonical_logs::ExecutedChainIndex::new());
+    let legacy_clamp_logs = crate::canonical_logs::legacy_clamp_from_env();
     io_handler.add_sync_method("eth_getLogs", move |params: Params| {
         // WP-I.4: eth_getLogs costs 10 budget units
         crate::rate_limit::check_method_budget(10)?;
@@ -1920,9 +1922,11 @@ pub fn register_eth_methods_with_finality(
             },
         };
 
-        // Limit block range to prevent excessive queries
-        let max_block_range = 1000u64;
-        let effective_to = to_block.min(from_block.saturating_add(max_block_range));
+        // Limit the block range. Over the limit is a -32005 error, not a silent
+        // clamp (a clamped answer reads as "no logs after fromBlock+1000"); the
+        // legacy clamp is an operator opt-in (`canonical_logs::LEGACY_CLAMP_ENV`).
+        let effective_to =
+            crate::canonical_logs::bound_log_range(from_block, to_block, legacy_clamp_logs)?;
 
         // Parse address filter (single address or array)
         let address_filter: Vec<Address> = match filter.get("address") {
@@ -2012,35 +2016,41 @@ pub fn register_eth_methods_with_finality(
             _ => vec![],
         };
 
-        // Collect matching logs
+        // Collect matching logs from the EXECUTED chain, in execution order:
+        // ascending height along the applied tip's selected-parent chain, then
+        // `block.transactions` order, then receipt log order. The height index
+        // is last-writer-wins across DAG siblings and can name a block whose
+        // transactions never executed (see `canonical_logs`).
+        // The resolver names the blocks (hashes only); each body is loaded,
+        // scanned and dropped before the next, so a request holds one block.
+        let executed = executed_chain_logs
+            .executed_hashes(&storage_logs, from_block, effective_to)
+            .map_err(|e| e.to_rpc_error())?;
+
         let mut result_logs: Vec<Value> = Vec::new();
-        let mut log_index_global = 0usize;
+        for (_, executed_hash) in &executed {
+            let block = crate::canonical_logs::load_executed_block(&storage_logs, executed_hash)
+                .map_err(|e| e.to_rpc_error())?;
+            let block_hash = block.header.block_hash;
+            // logIndex is the log's position in its block (Ethereum semantics),
+            // counted over every log of the block, matched or not.
+            let mut log_index_in_block = 0usize;
 
-        for height in from_block..=effective_to {
-            // Get block hash at this height
-            let block_hash = match storage_logs.blocks.get_block_by_height(height) {
-                Ok(Some(hash)) => hash,
-                _ => continue,
-            };
-
-            // Get all transaction hashes in this block
-            let tx_hashes = match storage_logs
-                .transactions
-                .get_block_transactions(&block_hash)
-            {
-                Ok(hashes) => hashes,
-                Err(_) => continue,
-            };
-
-            for (tx_index, tx_hash) in tx_hashes.iter().enumerate() {
-                // Get receipt for this transaction
-                let receipt = match storage_logs.transactions.get_receipt(tx_hash) {
-                    Ok(Some(r)) => r,
+            for (tx_index, tx) in block.transactions.iter().enumerate() {
+                // Only a receipt recorded for THIS block describes this
+                // execution; a receipt naming another block (the same tx in a
+                // block this node produced and then lost) is not served here,
+                // which keeps blockHash/blockNumber identical to
+                // eth_getTransactionReceipt.
+                let receipt = match storage_logs.transactions.get_receipt(&tx.hash) {
+                    Ok(Some(r)) if r.block_hash == block_hash => r,
                     _ => continue,
                 };
 
-                // Filter and collect logs from this receipt
-                for (log_index_in_tx, log) in receipt.logs.iter().enumerate() {
+                for log in receipt.logs.iter() {
+                    let log_index = log_index_in_block;
+                    log_index_in_block = log_index_in_block.saturating_add(1);
+
                     // Check address filter
                     if !address_filter.is_empty() && !address_filter.contains(&log.address) {
                         continue;
@@ -2050,15 +2060,10 @@ pub fn register_eth_methods_with_finality(
                     let topics_match = topics_filter.iter().enumerate().all(|(i, topic_filter)| {
                         match topic_filter {
                             None => true, // null means any
-                            Some(allowed_topics) => {
-                                if i >= log.topics.len() {
-                                    false // Log doesn't have this topic position
-                                } else {
-                                    log.topics
-                                        .get(i)
-                                        .is_some_and(|t| allowed_topics.contains(t))
-                                }
-                            }
+                            Some(allowed_topics) => log
+                                .topics
+                                .get(i)
+                                .is_some_and(|t| allowed_topics.contains(t)),
                         }
                     });
 
@@ -2066,23 +2071,19 @@ pub fn register_eth_methods_with_finality(
                         continue;
                     }
 
-                    // Log matches all filters
                     result_logs.push(json!({
                         "address": format!("0x{}", hex::encode(log.address.0)),
                         "topics": log.topics.iter()
                             .map(|t| format!("0x{}", hex::encode(t.as_bytes())))
                             .collect::<Vec<_>>(),
                         "data": format!("0x{}", hex::encode(&log.data)),
-                        "blockNumber": format!("0x{:x}", height),
-                        "blockHash": format!("0x{}", hex::encode(block_hash.as_bytes())),
-                        "transactionHash": format!("0x{}", hex::encode(tx_hash.as_bytes())),
+                        "blockNumber": format!("0x{:x}", receipt.block_number),
+                        "blockHash": format!("0x{}", hex::encode(receipt.block_hash.as_bytes())),
+                        "transactionHash": format!("0x{}", hex::encode(tx.hash.as_bytes())),
                         "transactionIndex": format!("0x{:x}", tx_index),
-                        "logIndex": format!("0x{:x}", log_index_global),
+                        "logIndex": format!("0x{:x}", log_index),
                         "removed": false
                     }));
-
-                    log_index_global = log_index_global.saturating_add(1);
-                    let _ = log_index_in_tx; // Suppress unused warning
                 }
             }
         }
