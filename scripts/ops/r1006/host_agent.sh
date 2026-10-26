@@ -255,8 +255,22 @@ cmd_logs_scan() {
   all=$(printf '%s\n' "$text" | grep -E -i '(^|[^a-z])(conflict|fork)([^a-z]|$)' || true)
   benign='fork ACTIVE from height|converged to the fork-choice head|rebuilt applied state to the fork-choice head'
   hits=$(printf '%s\n' "$all" | grep -v -E "$benign" | grep . || true)
-  printf 'lines %s\nmatches %s\nexempt %s\n' "$(printf '%s\n' "$text" | grep -c . || true)" \
-    "$(printf '%s' "$hits" | grep -c . || true)" "$(printf '%s\n' "$all" | grep -c -E "$benign" || true)"
+  # Fork-choice reorgs: competing tips while several producers mine. One no deeper than
+  # R1006_MAX_REORG blocks (default 6, fleet_agree's LAG) is counted and shown, not
+  # failed; a deeper one is a hit like any other fork line.
+  local max="${R1006_MAX_REORG:-6}" shallow=0 deepest=0 line n keep=""
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    if [[ "$line" =~ fork-choice\ reorged\ to\ .*\(reverted\ ([0-9]+), ]]; then
+      n=${BASH_REMATCH[1]}
+      ((n > deepest)) && deepest=$n
+      if ((n <= max)); then shallow=$((shallow + 1)); continue; fi
+    fi
+    keep+="$line"$'\n'
+  done <<<"$hits"
+  hits="$keep"
+  printf 'lines %s\nmatches %s\nexempt %s\nshallow_reorgs %s\ndeepest_reorg %s\n' "$(printf '%s\n' "$text" | grep -c . || true)" \
+    "$(printf '%s' "$hits" | grep -c . || true)" "$(printf '%s\n' "$all" | grep -c -E "$benign" || true)" "$shallow" "$deepest"
   printf '%s\n' "$hits" | head -5 | sed 's/^/  | /'
 }
 

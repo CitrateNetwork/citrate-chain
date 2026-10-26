@@ -669,6 +669,10 @@ PY
       local scan
       scan=$(agent "$h" logs-scan "$since")
       if [[ "$(sed -n 's/^matches //p' <<<"$scan")" != 0 ]]; then bad=1; log "  $h:"; sed -n '/^  |/p' <<<"$scan"; fi
+      local sr dr
+      sr=$(sed -n 's/^shallow_reorgs //p' <<<"$scan")
+      dr=$(sed -n 's/^deepest_reorg //p' <<<"$scan")
+      [[ "${sr:-0}" != 0 ]] && log "  NOTE $h: $sr shallow fork-choice reorg(s), deepest $dr block(s)"
     done
     [[ $bad -eq 0 ]] && pass "no CONFLICT / fork lines in any node log" || fail "CONFLICT / fork lines in node logs"
   fi

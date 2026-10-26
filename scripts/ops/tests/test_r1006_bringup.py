@@ -373,6 +373,20 @@ class AgentTest(unittest.TestCase):
         r = self.env.agent(1, "logs-scan", "0")
         self.assertIn("matches 2", r.stdout, r.stdout)
 
+    def test_log_scan_counts_shallow_reorgs_and_fails_deep_ones(self):
+        log = self.root / "var/log/citrate-node.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        r_line = "INFO citrate::canonical_apply: execute-on-receive: fork-choice reorged to 0d77df1a @ {h} (reverted {n}, applied {n})\n"
+        log.write_text(r_line.format(h=3, n=3) + r_line.format(h=9, n=1))
+        r = self.env.agent(1, "logs-scan", "0")
+        self.assertIn("matches 0", r.stdout, r.stdout)
+        self.assertIn("shallow_reorgs 2", r.stdout)
+        self.assertIn("deepest_reorg 3", r.stdout)
+        with log.open("a") as f:
+            f.write(r_line.format(h=40, n=7))
+        r = self.env.agent(1, "logs-scan", "0")
+        self.assertIn("matches 1", r.stdout, r.stdout)
+
     def test_generated_config_has_no_contribution_recorder(self):
         tool = (REPO / "scripts/producers/gen_node_config.py").read_text().lower()
         self.assertNotIn("contribution", tool)
