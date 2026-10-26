@@ -6,7 +6,7 @@
 # checks the remote with `git ls-remote`, never the push's own output.
 #
 # The ssh transport is simulated: GIT_SSH_COMMAND points at a stand-in that
-# runs git-receive-pack locally under `timeout`, so the "server" drops the
+# runs git-receive-pack locally under an alarm, so the "server" drops the
 # connection once it has been open for FAKE_SSH_IDLE seconds. That is how a
 # remote behaves when a long pre-push hook keeps the connection idle: git
 # finishes the hook, writes the pack into a closed pipe, and dies of SIGPIPE
@@ -24,7 +24,7 @@ set -uo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/prepush-test.XXXXXX")"
-[ -n "$TMP" ] && [ -d "$TMP" ] || { echo "mktemp failed" >&2; exit 2; }
+if [ -z "$TMP" ] || [ ! -d "$TMP" ]; then echo "mktemp failed" >&2; exit 2; fi
 cleanup() { [ -n "${TMP:-}" ] && [ -d "$TMP" ] && rm -rf -- "$TMP"; }
 trap cleanup EXIT
 
@@ -53,7 +53,18 @@ while [ $# -gt 1 ]; do
   case "$1" in -*) shift ;; *) break ;; esac
 done
 shift                                  # host
-exec timeout "${FAKE_SSH_IDLE:-3600}" sh -c "$*"
+# Same as `timeout N sh -c ...` (SIGTERM at N seconds), without timeout(1),
+# which macOS lacks. A watchdog process, not alarm(): git's children may
+# inherit a signal mask that holds SIGALRM.
+# `exec` so the TERM hits git-receive-pack itself, not a shell that would
+# leave it running and holding the connection.
+bash -c "exec $*" <&0 &
+pid=$!
+( sleep "${FAKE_SSH_IDLE:-3600}"; kill -TERM "$pid" ) </dev/null >/dev/null 2>&1 &
+dog=$!
+wait "$pid"; rc=$?
+kill "$dog" 2>/dev/null
+exit "$rc"
 EOF
 chmod +x "$FAKE_SSH"
 export GIT_SSH_COMMAND="$FAKE_SSH"
@@ -187,16 +198,27 @@ if [ "$RC" -eq 0 ] && landed; then ok "push lands (hook is a no-op)"; else bad "
 
 new_case "hook: CI passes but outlasts the connection"
 FAKE_SSH_IDLE=2 LOCAL_CI_HOOK_MAX_SECS=1 STANDIN_SLEEP=4 STANDIN_RC=0 push origin main
-if [ "$RC" -ne 141 ] && [ "$RC" -ne 0 ] && ! landed && grep -q "re-run the push" <<<"$OUT"; then
-  ok "no silent SIGPIPE: the hook stops the push and says why (rc=$RC)"
+# git itself still dies writing to the dropped connection; what changes is
+# that the output says so and the retry is immediate.
+if [ "$RC" -ne 0 ] && ! landed && grep -q "NOTHING was pushed" <<<"$OUT" \
+   && grep -q "re-run the push" <<<"$OUT"; then
+  ok "dropped connection is explained, not silent (rc=$RC)"
 else
-  bad "rc=$RC landed=$(landed && echo y || echo n) (141 = the original bug)"
+  bad "rc=$RC landed=$(landed && echo y || echo n): no explanation printed"
 fi
 FAKE_SSH_IDLE=2 LOCAL_CI_HOOK_MAX_SECS=1 STANDIN_SLEEP=4 STANDIN_RC=0 push origin main
 if [ "$RC" -eq 0 ] && landed && [ "$(ci_runs)" -eq 1 ]; then
   ok "the re-push lands without re-running CI (pass recorded for this commit)"
 else
   bad "re-push: rc=$RC landed=$(landed && echo y || echo n) runs=$(ci_runs)"
+fi
+
+new_case "hook: slow CI, connection still open"
+FAKE_SSH_IDLE=60 LOCAL_CI_HOOK_MAX_SECS=1 STANDIN_SLEEP=3 STANDIN_RC=0 push origin main
+if [ "$RC" -eq 0 ] && landed; then
+  ok "the slow-CI note does not block a push that can still land"
+else
+  bad "rc=$RC landed=$(landed && echo y || echo n)"
 fi
 
 new_case "hook: a recorded pass does not cover a changed tree"
