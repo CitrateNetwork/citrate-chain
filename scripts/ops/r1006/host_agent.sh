@@ -185,7 +185,7 @@ cmd_start() {
     local extra=(${R1006_NODE_ENV_PASSTHRU:-})
     (
       cd "$DATA"
-      env "${envs[@]}" "${extra[@]}" setsid "$BIN" --config "$ETC/node.toml" >>"$LOGFILE" 2>&1 &
+      env "${envs[@]}" "${extra[@]}" setsid "$BIN" --config "$ETC/node.toml" </dev/null >>"$LOGFILE" 2>&1 &
       echo $! >"$PIDFILE"
     )
   fi

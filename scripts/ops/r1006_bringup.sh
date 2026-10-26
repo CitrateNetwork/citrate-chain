@@ -487,6 +487,7 @@ step_start() {
   else
     gh=$(fill_field genesis_hash)
   fi
+  [[ $DRY -eq 0 && ! -f "$STATE/started_at" ]] && date +%s >"$STATE/started_at"
   local first=1
   for h in "${HOSTS[@]}"; do
     log "start: $h"
@@ -639,7 +640,7 @@ PY
 
   # 6. logs: no CONFLICT / fork
   local since
-  since=$(python3 -c 'import os,sys; print(int(os.path.getmtime(sys.argv[1])))' "$STATE/r1006-producers.json")
+  since=$(cat "$STATE/started_at" 2>/dev/null || echo 0)
   if skipped logs; then
     log "SKIP  log scan (--skip logs)"
   else
@@ -696,6 +697,7 @@ step_wipe() {
     fi
   fi
   step_stop
+  [[ $DRY -eq 0 ]] && rm -f -- "$STATE/started_at" "$STATE/miners.seen"
   for h in "${HOSTS[@]}"; do
     log "wipe: $h"
     if [[ $WIPE_KEYS -eq 1 ]]; then agent "$h" wipe --wipe-keys; else agent "$h" wipe; fi
