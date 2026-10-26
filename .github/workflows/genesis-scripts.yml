@@ -2,15 +2,17 @@ name: genesis-scripts
 
 # scripts/genesis/: the ceremony tooling (keep_check, fleet_agree, reset_node, ceremony).
 # The tests use fake cast/forge/systemctl in a temp dir: no network, no chain, no keys. The
-# integration cases run the real admin checker, and a fresh-genesis P2/P5 through the real
-# regenesis.sh and address-book generator, against local anvil chains (Foundry, below).
+# integration cases run the real admin checker over councils the real DeployGenesisGovernance
+# deploys, and a fresh-genesis P1/P2/P5 through the real regenesis.sh and address-book
+# generator, against local anvil chains (Foundry, below). Their temp projects copy the import
+# closure solc resolves for those scripts, so the paths below cover that closure's roots.
 
 on:
   push:
     branches: [main]
-    paths: ['scripts/genesis/**', 'scripts/ci/deployer_input_override_tripwire.sh', 'scripts/ops/regenesis.sh', 'scripts/ops/emit-address-table.sh', 'scripts/ci/check-create2-determinism.sh', 'contracts/script/DeployValidatorRegistry.s.sol', 'contracts/script/DeployCoreMembership.s.sol', 'contracts/script/DeployGenesisMembership.s.sol', 'contracts/script/ScriptEnv.sol', 'contracts/script/CheckDeployedAdmins.s.sol', 'contracts/script/lib/AdminChecks.sol', '.github/workflows/genesis-scripts.yml']
+    paths: ['scripts/genesis/**', 'scripts/ci/deployer_input_override_tripwire.sh', 'scripts/ops/regenesis.sh', 'scripts/ops/emit-address-table.sh', 'scripts/ci/check-create2-determinism.sh', 'contracts/script/DeployValidatorRegistry.s.sol', 'contracts/script/DeployCoreMembership.s.sol', 'contracts/script/DeployGenesisMembership.s.sol', 'contracts/script/ScriptEnv.sol', 'contracts/script/CheckDeployedAdmins.s.sol', 'contracts/script/DeployGenesisGovernance.s.sol', 'contracts/script/Salts.sol', 'contracts/script/lib/**', 'contracts/src/genesis/**', 'contracts/src/lib/**', 'contracts/src/core_membership/**', 'contracts/src/ValidatorRegistry.sol', 'contracts/src/aa/lib/webauthn/P256.sol', 'contracts/foundry.toml', 'contracts/remappings.txt', '.github/workflows/genesis-scripts.yml']
   pull_request:
-    paths: ['scripts/genesis/**', 'scripts/ci/deployer_input_override_tripwire.sh', 'scripts/ops/regenesis.sh', 'scripts/ops/emit-address-table.sh', 'scripts/ci/check-create2-determinism.sh', 'contracts/script/DeployValidatorRegistry.s.sol', 'contracts/script/DeployCoreMembership.s.sol', 'contracts/script/DeployGenesisMembership.s.sol', 'contracts/script/ScriptEnv.sol', 'contracts/script/CheckDeployedAdmins.s.sol', 'contracts/script/lib/AdminChecks.sol', '.github/workflows/genesis-scripts.yml']
+    paths: ['scripts/genesis/**', 'scripts/ci/deployer_input_override_tripwire.sh', 'scripts/ops/regenesis.sh', 'scripts/ops/emit-address-table.sh', 'scripts/ci/check-create2-determinism.sh', 'contracts/script/DeployValidatorRegistry.s.sol', 'contracts/script/DeployCoreMembership.s.sol', 'contracts/script/DeployGenesisMembership.s.sol', 'contracts/script/ScriptEnv.sol', 'contracts/script/CheckDeployedAdmins.s.sol', 'contracts/script/DeployGenesisGovernance.s.sol', 'contracts/script/Salts.sol', 'contracts/script/lib/**', 'contracts/src/genesis/**', 'contracts/src/lib/**', 'contracts/src/core_membership/**', 'contracts/src/ValidatorRegistry.sol', 'contracts/src/aa/lib/webauthn/P256.sol', 'contracts/foundry.toml', 'contracts/remappings.txt', '.github/workflows/genesis-scripts.yml']
   workflow_dispatch:
 
 permissions:

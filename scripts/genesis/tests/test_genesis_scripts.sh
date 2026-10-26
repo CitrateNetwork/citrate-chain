@@ -1380,8 +1380,12 @@ rm -rf "$GR/contracts/broadcast/DeployGenesisMembership.s.sol"
 # contract that only the governance output lists, and whose governance() is still the
 # deployer, must fail the gate. Needs forge, cast and anvil (Foundry) and solc 0.8.36 in the
 # Foundry cache; without the tools it is skipped and says so (it is not counted as passed).
-# The temp project is the checker's own sources plus forge-std; its foundry.toml adds read
-# access to ./genesis, which the genesis contract set (chain#320) adds to contracts/.
+# The councils are the real P1 contracts: DeployGenesisGovernance broadcast on anvil (TimelockController
+# + MultisigProposer per council, the GuardianCanceller), never stand-ins, so #320's council checks
+# (CREATE2 provenance, sole role holders, the guardian veto) run against what the ceremony deploys.
+# The temp projects are the import closure of the scripts they run, as solc resolves it in this
+# tree (copy_closure), plus forge-std and OpenZeppelin; a tripwire (closure_problem) fails when a
+# copy misses or alters a file of that closure.
 REAL_FORGE=$(command -v forge || true)
 REAL_CAST=$(command -v cast || true)
 REAL_ANVIL=$(command -v anvil || true)
@@ -1395,55 +1399,98 @@ if [[ -z "$REAL_FORGE" || -z "$REAL_CAST" || -z "$REAL_ANVIL" || "${GENESIS_TEST
 else
   IR="$T/irepo"
   IC="$IR/contracts"
-  mkdir -p "$IC/script/lib" "$IC/src/aa/lib/webauthn" "$IC/lib" "$IC/genesis" "$IC/addresses" "$IR/scripts/ops"
-  sed 's|{ access = "read", path = "./addresses" }\]|{ access = "read", path = "./addresses" }, { access = "read", path = "./genesis" }]|' \
-    "$SRC/foundry.toml" >"$IC/foundry.toml"
-  cp "$SRC/remappings.txt" "$IC/"
+  mkdir -p "$IC/lib" "$IC/genesis/p1" "$IC/addresses" "$IR/scripts/ops"
+  cp "$SRC/foundry.toml" "$SRC/remappings.txt" "$IC/"
   ln -s "$SRC/lib/forge-std" "$IC/lib/forge-std"
-  # On-chain councils for the C3 checks (and a registry for C4): minimal contracts with the
-  # getters P5 reads. They exist only in this temp project.
+  ln -s "$SRC/lib/openzeppelin-contracts" "$IC/lib/openzeppelin-contracts"
+  # The temp projects hold the import closure of the scripts they run, as solc resolves it
+  # in this tree (sol_closure), never a hand list: a new import in the checker or a ceremony
+  # script reaches them by itself. closure_problem is the tripwire: a copied project must
+  # resolve every import of its entries on its own, from files byte-identical to this tree's.
+  find_solc() {
+    local s
+    for s in "${SOLC:-}" "$HOME/.svm/0.8.36/solc-0.8.36" "$HOME/Library/Application Support/svm/0.8.36/solc-0.8.36" \
+      "$(command -v solc || true)"; do
+      if [[ -n "$s" && -x "$s" ]] && "$s" --version 2>/dev/null | grep -q 'Version: 0\.8\.36+'; then
+        printf '%s\n' "$s"
+        return 0
+      fi
+    done
+    return 1
+  }
+  if ! SOLC_BIN=$(find_solc); then
+    # A fresh runner has no solc until forge first compiles: let forge install 0.8.36.
+    mkdir -p "$T/solcboot/src"
+    printf '// SPDX-License-Identifier: Apache-2.0\npragma solidity 0.8.36;\ncontract Boot {}\n' >"$T/solcboot/src/Boot.sol"
+    (cd "$T/solcboot" && "$REAL_FORGE" build --use 0.8.36 >/dev/null 2>&1) || true
+    SOLC_BIN=$(find_solc) || bad "integration: solc 0.8.36 found (SOLC, the Foundry svm cache or PATH)"
+  fi
+  # sol_closure <project> <entry...>: the sources outside lib/ that solc reads to analyse the
+  # entries in <project> (its remappings and lib/), sorted, one per line. Fails with solc's
+  # first errors when an import does not resolve.
+  sol_closure() {
+    local dir="$1" l json rm=()
+    shift
+    while IFS= read -r l; do [[ -n "$l" ]] && rm+=("$l"); done <"$dir/remappings.txt"
+    if ! json=$(cd "$dir" && "$SOLC_BIN" --base-path . --allow-paths "$SRC/lib" "${rm[@]}" --combined-json ast "$@" 2>"$T/solc.err"); then
+      grep -E -m3 'Error|not found' "$T/solc.err" >&2
+      return 1
+    fi
+    python3 -c 'import json, sys
+print("\n".join(sorted(s for s in json.load(sys.stdin)["sources"] if not s.startswith("lib/"))))' <<<"$json"
+  }
+  # copy_closure <project> <entry...>: copy the entries' closure from this tree's contracts/.
+  copy_closure() {
+    local dest="$1" f files
+    shift
+    files=$(sol_closure "$SRC" "$@") || return 1
+    for f in $files; do
+      mkdir -p "$dest/$(dirname "$f")" && cp "$SRC/$f" "$dest/$f" || return 1
+    done
+  }
+  # closure_problem <project> <entry...>: prints what the project misses or holds differently
+  # from this tree's closure of the entries, and fails; silent and 0 when it holds all of it.
+  closure_problem() {
+    local dir="$1" want got f diffs=""
+    shift
+    want=$(sol_closure "$SRC" "$@" 2>&1) || { printf 'this tree does not resolve: %s\n' "$want"; return 1; }
+    got=$(sol_closure "$dir" "$@" 2>&1) || { printf 'the copied project does not resolve: %s\n' "$got"; return 1; }
+    for f in $want; do
+      [[ -f "$dir/$f" ]] || { diffs+=" missing:$f"; continue; }
+      cmp -s "$SRC/$f" "$dir/$f" || diffs+=" differs:$f"
+    done
+    [[ "$got" == "$want" ]] || diffs+=" closure-set-differs"
+    [[ -z "$diffs" ]] || { printf '%s\n' "$diffs"; return 1; }
+  }
+  # P5 runs the real checker; P1 (deployed below on anvil) is the real DeployGenesisGovernance.
+  IENTRIES=(script/CheckDeployedAdmins.s.sol script/DeployGenesisGovernance.s.sol)
+  copy_closure "$IC" "${IENTRIES[@]}" || bad "P5 integration: the checker's import closure is copied"
+  if why=$(closure_problem "$IC" "${IENTRIES[@]}"); then
+    ok "P5 integration tripwire: the temp project holds the checker's and P1's whole import closure"
+  else
+    bad "P5 integration tripwire: the temp project holds the checker's and P1's whole import closure" "$why"
+  fi
+  # The tripwire fires: a copy that lost one file of the closure (GuardianCanceller, which only
+  # GenesisProfile imports) is refused and the file is named.
+  TRIP="$T/trip"
+  mkdir -p "$TRIP/lib"
+  cp -R "$IC/script" "$IC/src" "$IC/remappings.txt" "$TRIP/"
+  ln -s "$SRC/lib/forge-std" "$TRIP/lib/forge-std"
+  ln -s "$SRC/lib/openzeppelin-contracts" "$TRIP/lib/openzeppelin-contracts"
+  rm "$TRIP/src/genesis/GuardianCanceller.sol"
+  if why=$(closure_problem "$TRIP" "${IENTRIES[@]}"); then
+    bad "P5 integration tripwire: a copy missing one import of the closure is refused" "passed"
+  elif grep -q 'GuardianCanceller' <<<"$why"; then
+    ok "P5 integration tripwire: a copy missing one import of the closure is refused"
+  else
+    bad "P5 integration tripwire: a copy missing one import of the closure is refused" "does not name the file: $why"
+  fi
+  # A registry for the C4 checks: a minimal contract with the getters P5 reads. It exists only
+  # in this temp project. The councils are the real P1 contracts (below).
   mkdir -p "$IC/src/fixtures"
   cat >"$IC/src/fixtures/GenesisFixtures.sol" <<'SOL'
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
-
-contract FixtureTimelock {
-    uint256 internal immutable _delay;
-    address internal _proposer;
-
-    constructor(uint256 d) {
-        _delay = d;
-    }
-
-    function setProposer(address p) external {
-        require(_proposer == address(0), "set");
-        _proposer = p;
-    }
-
-    function getMinDelay() external view returns (uint256) {
-        return _delay;
-    }
-
-    function hasRole(bytes32 role, address a) external view returns (bool) {
-        return role == keccak256("PROPOSER_ROLE") && a == _proposer;
-    }
-}
-
-contract FixtureMultisig {
-    address public immutable timelock;
-    uint256 public immutable threshold;
-    address[] internal _owners;
-
-    constructor(address t, address[] memory o, uint256 th) {
-        timelock = t;
-        _owners = o;
-        threshold = th;
-    }
-
-    function owners() external view returns (address[] memory) {
-        return _owners;
-    }
-}
 
 contract FixtureRegistry {
     address public governance;
@@ -1456,11 +1503,8 @@ contract FixtureRegistry {
     }
 }
 SOL
-  cp "$SRC/script/CheckDeployedAdmins.s.sol" "$IC/script/"
-  cp "$SRC/script/lib/AdminChecks.sol" "$IC/script/lib/"
-  cp "$SRC/src/aa/lib/webauthn/P256.sol" "$IC/src/aa/lib/webauthn/"
   # P0 only checks that the other ceremony scripts exist.
-  for s in DeployGenesisGovernance DeployTeamVesting DeployDormantLedgers DeployGenesisMembership; do
+  for s in DeployTeamVesting DeployDormantLedgers DeployGenesisMembership; do
     printf '// SPDX-License-Identifier: Apache-2.0\npragma solidity ^0.8.26;\n' >"$IC/script/$s.s.sol"
   done
   printf '#!/usr/bin/env bash\nexit 0\n' >"$IR/scripts/ops/regenesis.sh"
@@ -1480,40 +1524,49 @@ SOL
     gov_code() { printf '0x60003560e01c635aa6e67514601357600080fd5b73%s60005260206000f3' "${1#0x}"; }
     set_code() { "$REAL_CAST" rpc anvil_setCode "$1" "$2" --rpc-url "$IRPC" >/dev/null; }
     MSIG=$(addr 209)
+    # anvil's first two accounts (its default test mnemonic), unlocked by anvil: no key is
+    # read or passed. IDEP is this section's ceremony deployer.
+    ANVIL0=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
+    ANVIL1=0x70997970C51812dc3A010C7d01b50e0d17dc79C8
+    IDEP="$ANVIL0"
     set_code 0xc2b78104907F722DABAc4C69f826a522B2754De4 0x600160005260206000f3 # the P-256 verifier
-    for i in 161 31 32 33; do set_code "$(addr "$i")" "$(gov_code "$MSIG")"; done
-    set_code "$(addr 34)" "$(gov_code "$DEP")"
-    ANVIL0=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 # anvil's first unlocked account
+    set_code "$A1" "$(gov_code "$MSIG")"
+    set_code "$(addr 34)" "$(gov_code "$IDEP")"
     fcreate() { # contract [constructor args...] -> deployed address
       (cd "$IC" && "$REAL_FORGE" create --rpc-url "$IRPC" --unlocked --from "$ANVIL0" --broadcast "src/fixtures/GenesisFixtures.sol:$1" ${2:+--constructor-args} "${@:2}" 2>&1) |
         sed -n 's/^Deployed to: //p'
     }
-    council_fixture() { # delay threshold owner ids... -> "timelock multisig"
-      local d="$1" t="$2" tl ms ids=""
-      shift 2
-      for i in "$@"; do ids+="${ids:+,}$(addr "$i")"; done
-      tl=$(fcreate FixtureTimelock "$d")
-      ms=$(fcreate FixtureMultisig "$tl" "[$ids]" "$t")
-      "$REAL_CAST" send "$tl" "setProposer(address)" "$ms" --unlocked --from "$ANVIL0" --rpc-url "$IRPC" >/dev/null 2>&1
-      printf '%s %s\n' "$tl" "$ms"
+    # deploy_gov <deployer> <GOV threshold> <book name> [VAR=value...]: P1 for real, the
+    # DeployGenesisGovernance script broadcast by an unlocked anvil account, with the councils
+    # CEENV validates (GOV 11..15, 48 h; GRD 21..23, 1 h; the 14-day proposal TTL). Writes
+    # genesis/p1/<book name>; prints forge's output.
+    deploy_gov() {
+      local dep="$1" t="$2" out="genesis/p1/$3"
+      shift 3
+      (cd "$IC" && env -u CEREMONY_DEPLOYER_ADDRESS -u GENESIS_PROFILE -u ALLOW_WEAK_GOVERNANCE -u ALLOW_SHARED_HOLDERS \
+        DEPLOYER_ADDRESS="$dep" GOV_OWNERS="$(owners 11 12 13 14 15)" GOV_THRESHOLD="$t" GOV_MIN_DELAY=172800 \
+        GRD_OWNERS="$(owners 21 22 23)" GRD_THRESHOLD=2 GRD_MIN_DELAY=3600 GENESIS_GOVERNANCE_OUT="$out" "$@" \
+        "$REAL_FORGE" script script/DeployGenesisGovernance.s.sol --rpc-url "$IRPC" --broadcast --unlocked --sender "$dep" --slow 2>&1)
     }
-    read -r GTL GMS < <(council_fixture 172800 3 11 12 13 14 15)
-    read -r RTL RMS < <(council_fixture 3600 2 21 22 23)
-    export GTL GMS RTL RMS
-    if is_addr_t() { [[ "$1" =~ ^0x[0-9a-fA-F]{40}$ ]]; }; is_addr_t "$GTL" && is_addr_t "$GMS" && is_addr_t "$RTL" && is_addr_t "$RMS"; then
-      ok "P5 integration: council fixtures deployed on anvil"
+    # p1_book <book name> [jq filter]: genesis/governance.json = that P1 output (through the filter).
+    p1_book() { jq -c "${2:-.}" "$IC/genesis/p1/$1" >"$IC/genesis/governance.json"; }
+    p1_addr() { jq -r ".contracts.$2" "$IC/genesis/p1/$1"; }
+    if out=$(deploy_gov "$IDEP" 3 governance.json) && [[ -f "$IC/genesis/p1/governance.json" ]] &&
+      [[ "$(jq -r '.contracts | [.GovernanceTimelock, .GovernanceMultisig, .GuardianTimelock, .GuardianMultisig, .GuardianCanceller] | map(test("^0x[0-9a-fA-F]{40}$")) | all' "$IC/genesis/p1/governance.json")" == true ]]; then
+      ok "P5 integration: the real DeployGenesisGovernance deploys both councils and the GuardianCanceller on anvil"
     else
-      bad "P5 integration: council fixtures deployed on anvil" "$GTL $GMS $RTL $RMS"
+      bad "P5 integration: the real DeployGenesisGovernance deploys both councils and the GuardianCanceller on anvil" "$out"
     fi
-    printf '{"chainId":31337,"deployer":"%s","contracts":{"Alpha":"%s"},"aaStack":{}}' "$DEP" "$A1" >"$IC/addresses/40204.json"
-    IENV=("${CEENV[@]}" REPO_ROOT="$IR" RPC_URL="$IRPC" EXPECTED_CHAIN_ID=31337 FORGE="$REAL_FORGE" CAST="$REAL_CAST")
+    GTL=$(p1_addr governance.json GovernanceTimelock)
+    printf '{"chainId":31337,"deployer":"%s","contracts":{"Alpha":"%s"},"aaStack":{}}' "$IDEP" "$A1" >"$IC/addresses/40204.json"
+    IENV=("${CEENV[@]}" REPO_ROOT="$IR" DEPLOYER_ADDRESS="$IDEP" RPC_URL="$IRPC" EXPECTED_CHAIN_ID=31337 FORGE="$REAL_FORGE" CAST="$REAL_CAST")
     ig0=$("$REAL_CAST" block 0 --field hash --rpc-url "$IRPC")
     ig0ts=$("$REAL_CAST" block 0 --field timestamp --rpc-url "$IRPC")
-    mk_manifest "$IC/genesis" "$DEP" simulate "" "$ig0" "$((ig0ts))"
+    mk_manifest "$IC/genesis" "$IDEP" simulate "" "$ig0" "$((ig0ts))"
     sed -i 's/"chainId":40204/"chainId":31337/' "$IC/genesis/ceremony-run.json"
-    gov_book "$IC/genesis" "$DEP"
+    p1_book governance.json
     expect "P5 integration: a handed-over governance output passes the real checker" 0 'P5 PASS' -- "${IENV[@]}" bash "$CE" --simulate --only P5
-    gov_book "$IC/genesis" "$DEP" "\"GenesisHeld\":\"$(addr 34)\""
+    p1_book governance.json ".contracts.GenesisHeld = \"$(addr 34)\""
     expect "P5 integration: a deployer role held only in the governance output fails the real checker" 3 'DEPLOYER-ADMIN GenesisHeld: governance\(\) is the deployer EOA' -- "${IENV[@]}" bash "$CE" --simulate --only P5
     # Binding: stale books that agree on the deployer while this run used another one never
     # reach the checker.
@@ -1521,22 +1574,28 @@ SOL
     sed -i 's/"chainId":40204/"chainId":31337/' "$IC/genesis/ceremony-run.json"
     expect "P5 integration: books naming another deployer than the run's are refused before the real checker" 3 "not this run's deployer 0x0+2" -- "${IENV[@]}" DEPLOYER_ADDRESS="$(addr 2)" bash "$CE" --simulate --only P5
     # C3 on a real chain: a council whose threshold differs from the validated input fails.
-    mk_manifest "$IC/genesis" "$DEP" simulate "" "$ig0" "$((ig0ts))"
+    mk_manifest "$IC/genesis" "$IDEP" simulate "" "$ig0" "$((ig0ts))"
     sed -i 's/"chainId":40204/"chainId":31337/' "$IC/genesis/ceremony-run.json"
-    gov_book "$IC/genesis" "$DEP"
+    p1_book governance.json
     expect "P5 integration: the real councils pass the on-chain floor check" 0 'P5 governance floors hold on chain' -- "${IENV[@]}" bash "$CE" --simulate --only P5
-    mk_manifest "$IC/genesis" "$DEP" simulate "" "$ig0" "$((ig0ts))"
+    mk_manifest "$IC/genesis" "$IDEP" simulate "" "$ig0" "$((ig0ts))"
     sed -i 's/"chainId":40204/"chainId":31337/' "$IC/genesis/ceremony-run.json"
-    read -r WTL WMS < <(council_fixture 172800 2 11 12 13 14 15)
-    GTL="$WTL" GMS="$WMS" gov_book "$IC/genesis" "$DEP"
+    # A real 2-of-5 GOVERNANCE council: below production strength, so only a rehearsal deploy
+    # with ALLOW_WEAK_GOVERNANCE=1 makes it, from the second anvil account (its own timelock).
+    if out=$(deploy_gov "$ANVIL1" 2 weak.json ALLOW_WEAK_GOVERNANCE=1) && [[ "$(jq -r '.params.governance.threshold' "$IC/genesis/p1/weak.json")" == 2 ]]; then
+      ok "P5 integration: a rehearsal DeployGenesisGovernance deploys a real 2-of-5 council"
+    else
+      bad "P5 integration: a rehearsal DeployGenesisGovernance deploys a real 2-of-5 council" "$out"
+    fi
+    p1_book governance.json ".contracts.GovernanceTimelock = \"$(p1_addr weak.json GovernanceTimelock)\" | .contracts.GovernanceMultisig = \"$(p1_addr weak.json GovernanceMultisig)\""
     expect "P5 integration: a 2-of-5 governance council on chain fails" 3 'GOV: threshold on chain is 2, the validated input is 3' -- "${IENV[@]}" bash "$CE" --simulate --only P5
     # C4 on a real chain (Codex r6): the registry's governance is a stale EOA. The real checker
     # alone does not see it (the EOA is neither the factory nor the deployer); P5 does.
-    mk_manifest "$IC/genesis" "$DEP" simulate "" "$ig0" "$((ig0ts))"
+    mk_manifest "$IC/genesis" "$IDEP" simulate "" "$ig0" "$((ig0ts))"
     sed -i 's/"chainId":40204/"chainId":31337/' "$IC/genesis/ceremony-run.json"
-    gov_book "$IC/genesis" "$DEP"
+    p1_book governance.json
     SVR=$(fcreate FixtureRegistry "$(addr 99)" "$GTL")
-    printf '{"chainId":31337,"deployer":"%s","contracts":{"Alpha":"%s","ValidatorRegistry":"%s"},"aaStack":{}}' "$DEP" "$A1" "$SVR" >"$IC/addresses/40204.json"
+    printf '{"chainId":31337,"deployer":"%s","contracts":{"Alpha":"%s","ValidatorRegistry":"%s"},"aaStack":{}}' "$IDEP" "$A1" "$SVR" >"$IC/addresses/40204.json"
     if (cd "$IC" && ADDRESS_BOOK=addresses/40204.json "$REAL_FORGE" script script/CheckDeployedAdmins.s.sol --rpc-url "$IRPC" 2>&1) | grep -q 'DEPLOYER-ADMIN failures: 0'; then
       ok "P5 integration: the real checker alone passes a registry governed by a stale EOA"
     else
@@ -1544,14 +1603,14 @@ SOL
     fi
     expect "P5 integration: P5 fails a registry governed by a stale EOA" 3 'ValidatorRegistry.governance\(\) is 0x0+63' -- "${IENV[@]}" bash "$CE" --simulate --only P5
     GVR=$(fcreate FixtureRegistry "$GTL" "$GTL")
-    printf '{"chainId":31337,"deployer":"%s","contracts":{"Alpha":"%s","ValidatorRegistry":"%s"},"aaStack":{}}' "$DEP" "$A1" "$GVR" >"$IC/addresses/40204.json"
+    printf '{"chainId":31337,"deployer":"%s","contracts":{"Alpha":"%s","ValidatorRegistry":"%s"},"aaStack":{}}' "$IDEP" "$A1" "$GVR" >"$IC/addresses/40204.json"
     expect "P5 integration: P5 passes a registry governed by this run's GOVERNANCE" 0 'governance and slasher are GOVERNANCE' -- "${IENV[@]}" bash "$CE" --simulate --only P5
     kill "$ANVIL_PID" 2>/dev/null
 
     # ---------------------------------------------------------- fresh genesis end to end (C8)
-    # P2 --confirm on a fresh anvil chain (id 40204) through the REAL regenesis.sh, the REAL
-    # emit-address-table.sh and the real DeployValidatorRegistry / DeployCoreMembership scripts,
-    # then P5 --confirm with the real checker over the book the generator wrote. The other
+    # P1 --confirm (the real DeployGenesisGovernance) and P2 --confirm on a fresh anvil chain
+    # (id 40204) through the REAL regenesis.sh, the REAL emit-address-table.sh and the real
+    # DeployValidatorRegistry / DeployGenesisMembership (#331) scripts, then P5 --confirm with the real checker over the book the generator wrote. The other
     # ceremonies regenesis.sh runs (DeployAll, AA, ...) are not in this temp project: a forge shim
     # on PATH says so and skips them, and stands in for the keystore (--account becomes anvil's
     # --unlocked for the impersonated deployer). Two runs on two fresh chains with a different
@@ -1567,63 +1626,27 @@ SOL
       FR="$T/frepo"
       FC="$FR/contracts"
       ROOT_SRC="$(cd "$G/../.." && pwd)"
-      mkdir -p "$FC/script/lib" "$FC/src/core_membership" "$FC/src/lib" "$FC/src/aa/lib/webauthn" "$FC/src/fixtures" "$FC/lib" \
-        "$FC/genesis" "$FC/addresses" "$FR/scripts/ops" "$FR/scripts/ci" "$T/fbin"
-      cp "$IC/foundry.toml" "$IC/remappings.txt" "$FC/"
+      mkdir -p "$FC/lib" "$FC/genesis" "$FC/addresses" "$FR/scripts/ops" "$FR/scripts/ci" "$T/fbin"
+      cp "$SRC/foundry.toml" "$SRC/remappings.txt" "$FC/"
       ln -s "$SRC/lib/forge-std" "$FC/lib/forge-std"
       ln -s "$SRC/lib/openzeppelin-contracts" "$FC/lib/openzeppelin-contracts"
-      for f in script/CheckDeployedAdmins.s.sol script/lib/AdminChecks.sol script/DeployValidatorRegistry.s.sol \
-        script/DeployCoreMembership.s.sol script/ScriptEnv.sol script/Salts.sol src/ValidatorRegistry.sol \
-        src/lib/ReentrancyGuard.sol src/lib/Governable.sol src/lib/InitialAdmin.sol src/aa/lib/webauthn/P256.sol \
-        src/core_membership/CitrateMemberSBT.sol src/core_membership/MemberBond.sol \
-        src/core_membership/MembershipStakeVault.sol src/core_membership/MemberEmblem.sol; do
-        cp "$SRC/$f" "$FC/$f"
-      done
-      cp "$IC/src/fixtures/GenesisFixtures.sol" "$FC/src/fixtures/"
-      for s in DeployGenesisGovernance DeployTeamVesting DeployDormantLedgers; do cp "$IC/script/$s.s.sol" "$FC/script/"; done
-      # Stand-in for #331's DeployGenesisMembership until that PR is in this tree: the same file,
-      # contract name, required env and broadcast shape (CitrateMemberSBT, MemberBond, the
-      # vault implementation and its ERC1967Proxy, owned by MEMBERSHIP_GRANTOR). It skips #331's
-      # on-chain governance provenance checks, which need the real P1 contracts. P2 must run it
-      # and not the r1005 DeployCoreMembership, which is in this project too.
-      cat >"$FC/script/DeployGenesisMembership.s.sol" <<'SOL'
-// SPDX-License-Identifier: Apache-2.0
-pragma solidity ^0.8.26;
-import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
-import "./ScriptEnv.sol";
-import "./Salts.sol";
-import {CitrateMemberSBT} from "../src/core_membership/CitrateMemberSBT.sol";
-import {MemberBond} from "../src/core_membership/MemberBond.sol";
-import {MembershipStakeVault} from "../src/core_membership/MembershipStakeVault.sol";
-import {ValidatorRegistry} from "../src/ValidatorRegistry.sol";
-contract DeployGenesisMembership is ScriptEnv {
-    function run() external {
-        address deployer = deployerAddress();
-        require(vm.envAddress("GOVERNANCE_TIMELOCK").code.length != 0, "GOVERNANCE_TIMELOCK has no code");
-        require(vm.envAddress("GOVERNANCE_MULTISIG").code.length != 0, "GOVERNANCE_MULTISIG has no code");
-        address grantor = vm.envAddress("MEMBERSHIP_GRANTOR");
-        require(grantor != address(0) && grantor != deployer, "MEMBERSHIP_GRANTOR");
-        address registry = vm.envAddress("VALIDATOR_REGISTRY");
-        require(registry.code.length != 0, "VALIDATOR_REGISTRY has no code");
-        vm.envString("GENESIS_MEMBERSHIP_OUT");
-        vm.envString("GENESIS_GOVERNANCE_BOOK");
-        vm.startBroadcast(deployer);
-        CitrateMemberSBT sbt = new CitrateMemberSBT{salt: Salts.salt("CitrateMemberSBT")}(grantor);
-        MemberBond bond = new MemberBond{salt: Salts.salt("MemberBond")}();
-        MembershipStakeVault impl = new MembershipStakeVault{salt: Salts.salt("MembershipStakeVault.impl")}();
-        new ERC1967Proxy{salt: Salts.salt("MembershipStakeVault")}(
-            address(impl),
-            abi.encodeCall(MembershipStakeVault.initialize, (grantor, ValidatorRegistry(payable(registry)), sbt, address(bond)))
-        );
-        vm.stopBroadcast();
-    }
-}
-SOL
+      # The real P1 (DeployGenesisGovernance), the P2 scripts regenesis.sh runs here
+      # (DeployValidatorRegistry, and #331's DeployGenesisMembership beside the r1005
+      # DeployCoreMembership P2 must not run) and the P5 checker, with their import closure.
+      FENTRIES=(script/CheckDeployedAdmins.s.sol script/DeployGenesisGovernance.s.sol script/DeployValidatorRegistry.s.sol
+        script/DeployCoreMembership.s.sol script/DeployGenesisMembership.s.sol script/ScriptEnv.sol)
+      copy_closure "$FC" "${FENTRIES[@]}" || bad "fresh genesis e2e: the ceremony scripts' import closure is copied"
+      if why=$(closure_problem "$FC" "${FENTRIES[@]}"); then
+        ok "fresh genesis e2e tripwire: the temp project holds the real P1, P2 and P5 scripts' whole import closure"
+      else
+        bad "fresh genesis e2e tripwire: the temp project holds the real P1, P2 and P5 scripts' whole import closure" "$why"
+      fi
+      for s in DeployTeamVesting DeployDormantLedgers; do cp "$IC/script/$s.s.sol" "$FC/script/"; done
       cp "$ROOT_SRC/scripts/ops/regenesis.sh" "$ROOT_SRC/scripts/ops/emit-address-table.sh" "$FR/scripts/ops/"
       cp "$ROOT_SRC/scripts/ci/check-create2-determinism.sh" "$FR/scripts/ci/"
       cat >"$T/fbin/forge" <<'EOF'
 #!/usr/bin/env bash
-# Test shim for regenesis.sh: --account NAME becomes --unlocked (anvil signs for the
+# Test shim for P1 and regenesis.sh: --account NAME becomes --unlocked (anvil signs for the
 # impersonated deployer); `forge script script/X` for a ceremony this temp project does not
 # hold is reported and skipped. Everything else is the real forge.
 args=()
@@ -1679,31 +1702,18 @@ EOF
       trap 'kill "$ANVIL_PID" ${FANVIL_PID:+"$FANVIL_PID"} 2>/dev/null; rm -rf "$T"' EXIT
       FDEP=0xd1e0000000000000000000000000000000000001 # the fresh deployer (impersonated)
       fcast() { "$REAL_CAST" "$@" --rpc-url "$FRPC"; }
-      ffcreate() { # contract [constructor args...] -> deployed address (deployed by anvil's first account)
-        (cd "$FC" && "$REAL_FORGE" create --rpc-url "$FRPC" --unlocked --from "$ANVIL0" --broadcast "src/fixtures/GenesisFixtures.sol:$1" ${2:+--constructor-args} "${@:2}" 2>&1) |
-          sed -n 's/^Deployed to: //p'
-      }
-      fcouncil() { # delay threshold owner ids... -> "timelock multisig"
-        local d="$1" t="$2" tl ms ids=""
-        shift 2
-        for i in "$@"; do ids+="${ids:+,}$(addr "$i")"; done
-        tl=$(ffcreate FixtureTimelock "$d")
-        ms=$(ffcreate FixtureMultisig "$tl" "[$ids]" "$t")
-        fcast send "$tl" "setProposer(address)" "$ms" --unlocked --from "$ANVIL0" >/dev/null 2>&1
-        printf '%s %s\n' "$tl" "$ms"
-      }
       FCODE_MSIG=$(addr 209)
-      # e2e_run <label> <membership owner> <extra txs before the councils>: a fresh chain, P2
-      # and P5 --confirm. Sets RUN_VR RUN_SBT RUN_VAULT RUN_VAULT_IMPL from the generated book.
+      # e2e_run <label> <membership owner> <GOVERNANCE delay>: a fresh chain, then P1, P2 and P5
+      # --confirm. P1 is the real DeployGenesisGovernance through genesis_ceremony.sh (the forge
+      # shim signs as the impersonated deployer); its timelock address follows the delay, so a
+      # second run with another delay moves the governance and the registry it governs. Sets
+      # RUN_VR RUN_SBT RUN_VAULT RUN_VAULT_IMPL from the generated book and GTL from P1's.
       e2e_run() {
-        local label="$1" owner="$2" i g0 g0ts book="$FC/addresses/40204.json"
+        local label="$1" owner="$2" g0 g0ts n1 book="$FC/addresses/40204.json"
         [[ -z "$FANVIL_PID" ]] || { kill "$FANVIL_PID" 2>/dev/null; wait "$FANVIL_PID" 2>/dev/null; }
         "$REAL_ANVIL" --port "$fport" --chain-id 40204 --silent >"$T/fanvil.log" 2>&1 &
         FANVIL_PID=$!
         for _ in $(seq 100); do fcast chain-id >/dev/null 2>&1 && break; sleep 0.1; done
-        for ((i = 0; i < $3; i++)); do fcast send "$(addr 77)" --value 1 --unlocked --from "$ANVIL0" >/dev/null 2>&1; done
-        read -r GTL GMS < <(fcouncil 172800 3 11 12 13 14 15)
-        read -r RTL RMS < <(fcouncil 3600 2 21 22 23)
         fcast rpc anvil_impersonateAccount "$FDEP" >/dev/null
         fcast rpc anvil_setBalance "$FDEP" 0x56bc75e2d63100000 >/dev/null
         for a in 71 81 82; do fcast rpc anvil_setCode "$(addr "$a")" "$(gov_code "$FCODE_MSIG")" >/dev/null; done
@@ -1714,20 +1724,28 @@ EOF
         g0ts=$(fcast block 0 --field timestamp)
         rm -f "$FC"/genesis/*.json
         mk_manifest "$FC/genesis" "$FDEP" confirm fixture "$g0" "$((g0ts))"
-        gov_book "$FC/genesis" "$FDEP"
+        FENV=("${CEENV[@]}" REPO_ROOT="$FR" DEPLOYER_ADDRESS="$FDEP" RPC_URL="$FRPC" EXPECTED_CHAIN_ID=40204
+          EXPECTED_GENESIS_HASH="$g0" FORGE="$REAL_FORGE" CAST="$REAL_CAST" PATH="$T/fbin:$PATH" MEMBERSHIP_GRANTOR="$owner"
+          GOV_MIN_DELAY="$3" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS="$FRPC")
+        expect "fresh genesis e2e ($label): P1 deploys the real governance and records it on chain" 0 'P1 governance floors hold on chain' -- "${FENV[@]}" FORGE="$T/fbin/forge" bash "$CE" --confirm --only P1 --account fixture
+        GTL=$(jq -r '.contracts.GovernanceTimelock' "$FC/genesis/governance.json" 2>/dev/null)
+        if [[ "$(jq -r '[.params.genesisProfile, .params.overrideUsed, .params.governance.minDelay, (.contracts.GuardianCanceller != null)] | join(" ")' "$FC/genesis/governance.json" 2>/dev/null)" == "true false $3 true" ]]; then
+          ok "fresh genesis e2e ($label): P1's book is the genesis profile, no override, this run's delay, with the guardian veto"
+        else
+          bad "fresh genesis e2e ($label): P1's book is the genesis profile, no override, this run's delay, with the guardian veto" "$(cat "$FC/genesis/governance.json" 2>&1)"
+        fi
         printf '{"deployer":"%s","contracts":{"VestingAlice":"%s"}}' "$FDEP" "$(addr 71)" >"$FC/genesis/team-vesting.json"
         printf '{"deployer":"%s","contracts":{"FederatedRoundLedger":"%s","PatronageLedger":"%s"}}' "$FDEP" "$(addr 81)" "$(addr 82)" >"$FC/genesis/dormant-ledgers.json"
         record_outputs "$FC/genesis" # what --confirm P3/P4 record (#363)
-        FENV=("${CEENV[@]}" REPO_ROOT="$FR" DEPLOYER_ADDRESS="$FDEP" RPC_URL="$FRPC" EXPECTED_CHAIN_ID=40204
-          EXPECTED_GENESIS_HASH="$g0" FORGE="$REAL_FORGE" CAST="$REAL_CAST" PATH="$T/fbin:$PATH" MEMBERSHIP_GRANTOR="$owner"
-          TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS="$FRPC")
         if [[ "$label" == run1 ]]; then
-          # A stale generator preset is refused before anything is broadcast.
+          # A stale generator preset is refused before anything is broadcast (P1 already sent
+          # its transactions, so "nothing" is: the deployer's nonce does not move).
+          n1=$(fcast nonce "$FDEP")
           expect "fresh genesis e2e: a stale EMIT_DEPLOYER stops P2 before any broadcast" 3 "EMIT_DEPLOYER is set to '0x0+63'" -- "${FENV[@]}" EMIT_DEPLOYER="$STALE" bash "$CE" --confirm --only P2 --account fixture
-          [[ "$(fcast nonce "$FDEP")" == 0 ]] && ok "fresh genesis e2e: the refused P2 sent nothing" || bad "fresh genesis e2e: the refused P2 sent nothing" "nonce $(fcast nonce "$FDEP")"
+          [[ "$(fcast nonce "$FDEP")" == "$n1" ]] && ok "fresh genesis e2e: the refused P2 sent nothing" || bad "fresh genesis e2e: the refused P2 sent nothing" "nonce $n1 -> $(fcast nonce "$FDEP")"
           # C9: the alias the deploy scripts prefer, stale, is refused the same way.
           expect "fresh genesis e2e: a stale CEREMONY_DEPLOYER_ADDRESS stops P2 before any broadcast" 3 "GATE FAIL at P0: CEREMONY_DEPLOYER_ADDRESS is set to '0x0+63'" -- "${FENV[@]}" CEREMONY_DEPLOYER_ADDRESS="$STALE" bash "$CE" --confirm --only P2 --account fixture
-          [[ "$(fcast nonce "$FDEP")" == 0 ]] && ok "fresh genesis e2e: the refused CEREMONY_DEPLOYER_ADDRESS sent nothing" || bad "fresh genesis e2e: the refused CEREMONY_DEPLOYER_ADDRESS sent nothing" "nonce $(fcast nonce "$FDEP")"
+          [[ "$(fcast nonce "$FDEP")" == "$n1" ]] && ok "fresh genesis e2e: the refused CEREMONY_DEPLOYER_ADDRESS sent nothing" || bad "fresh genesis e2e: the refused CEREMONY_DEPLOYER_ADDRESS sent nothing" "nonce $n1 -> $(fcast nonce "$FDEP")"
         fi
         expect "fresh genesis e2e ($label): P2 deploys through regenesis.sh and the generator, and the book is verified" 0 'P2 stack book = generator output for this run' -- "${FENV[@]}" bash "$CE" --confirm --only P2 --account fixture
         [[ -f "$FC/broadcast/DeployGenesisMembership.s.sol/40204/run-latest.json" && ! -e "$FC/broadcast/DeployCoreMembership.s.sol" ]] &&
@@ -1758,19 +1776,20 @@ EOF
         "$(addr 3001)" "$(addr 3002)" "$(addr 3003)" "$(addr 3004)" "$(addr 3005)" "$(addr 3006)" "$(addr 3002)" "$(addr 3005)" >"$FC/addresses/40204.json"
       OWNER1=0x0e1a000000000000000000000000000000000001
       OWNER2=0x0e1a000000000000000000000000000000000002
-      e2e_run run1 "$OWNER1" 0
+      e2e_run run1 "$OWNER1" 172800
       VR1=$RUN_VR SBT1=$RUN_SBT VAULT1=$RUN_VAULT
       # C8 on the consumer side: a book edited after P2 is not the one P5 sweeps.
       cp "$FC/addresses/40204.json" "$T/fbook.orig"
       jq --arg a "$(addr 3005)" '.MembershipStakeVault = $a' "$T/fbook.orig" >"$FC/addresses/40204.json"
       expect "fresh genesis e2e: P5 refuses a book edited after P2 (stale vault alias)" 3 "is not the stack book this run's P2 generated" -- "${FENV[@]}" bash "$CE" --confirm --only P5 --account fixture
       cp "$T/fbook.orig" "$FC/addresses/40204.json"
-      # Second genesis: another owner, another council (one extra tx moves the fixture
-      # addresses), and an earlier chain's broadcast left for a ceremony this run does not run.
+      # Second genesis: another owner, another council (a 72 h GOVERNANCE delay moves P1's
+      # timelock, so the registry it governs), and an earlier chain's broadcast left for a
+      # ceremony this run does not run.
       mkdir -p "$FC/broadcast/DeployEduStack.s.sol/40204"
       printf '{"timestamp":1000,"transactions":[{"transactionType":"CREATE2","contractName":"StaleEdu","contractAddress":"%s"}]}\n' "$(addr 2999)" \
         >"$FC/broadcast/DeployEduStack.s.sol/40204/run-latest.json"
-      e2e_run run2 "$OWNER2" 1
+      e2e_run run2 "$OWNER2" 259200
       if [[ "$RUN_VR" != "$VR1" && "$RUN_SBT" != "$SBT1" && "$RUN_VAULT" != "$VAULT1" ]]; then
         ok "fresh genesis e2e: a new owner and registry move the SBT, the vault and the registry, and the book follows"
       else
