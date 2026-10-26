@@ -405,6 +405,19 @@ class RenderProfileTest(unittest.TestCase):
             self.assertIn("@10.0.0.2:30303", toml)
             self.assertNotIn("@10.0.0.1:30303", toml)
 
+    def test_activation_zero_only_with_a_genesis_validator_set(self):
+        for at_genesis, want_rc in ((True, 0), (False, 2)):
+            with self.subTest(validators_at_genesis=at_genesis):
+                fill = dict(self.fill, validator_activation_height=0, validators_at_genesis=at_genesis)
+                prof = render_profile.render(self.template, self.prod, fill, "p1")
+                with tempfile.TemporaryDirectory(prefix="dgx-r1006p.") as d:
+                    pp = Path(d) / "p1.json"
+                    pp.write_text(json.dumps(prof))
+                    r = subprocess.run([sys.executable, str(REPO / "scripts/producers/gen_node_config.py"), "--profile",
+                                        str(pp), "--staker", self.prod["producers"][0]["staker_address"], "--out-dir", d],
+                                       capture_output=True, text=True)
+                    self.assertEqual(r.returncode, want_rc, r.stderr)
+
     def test_template_is_refused_until_rendered(self):
         r = subprocess.run([sys.executable, str(REPO / "scripts/producers/gen_node_config.py"), "--profile", "r1006",
                             "--staker", "0x" + "11" * 20, "--out-dir", "/nonexistent"], capture_output=True, text=True)

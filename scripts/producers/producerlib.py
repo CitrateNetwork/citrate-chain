@@ -150,9 +150,11 @@ def profile_problems(prof: Profile) -> list[str]:
         out.append("genesis_hash unset")
     if not ADDR_RE.match(str(r["validator_registry"])):
         out.append("validator_registry unset")
-    if not isinstance(r["validator_activation_height"], int) or r["validator_activation_height"] < (
-        EPOCH - SNAPSHOT_LAG
-    ):
+    h = r["validator_activation_height"]
+    # A validator set written into the genesis (r1006) is active from block 0. Every other
+    # network registers validators on chain, and they can't be active before S(1).
+    at_genesis = r.get("validators_at_genesis") is True
+    if not isinstance(h, int) or h < 0 or (h < EPOCH - SNAPSHOT_LAG and not at_genesis):
         out.append("validator_activation_height unset or below S(1)=800")
     if not str(r["public_rpc"]).startswith(("https://", "http://")):
         out.append("public_rpc unset")

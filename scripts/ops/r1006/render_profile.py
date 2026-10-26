@@ -29,6 +29,7 @@ between the genesis builder and this bring-up:
    "validator_registry": "0x<20 bytes>",
    "validator_activation_height": N,
    "validators": [{"proposer_pubkey", "staker", "stake_wei"}],
+   "validators_at_genesis": true | false,       true: the set is in block 0 (activation may be 0)
    "source": "<what produced it>"}
 """
 
@@ -114,6 +115,7 @@ def render(template: dict, producers: dict, fill: dict, host: str) -> dict:
     prof["genesis_profile"] = fill.get("genesis_profile")
     prof["validator_registry"] = fill["validator_registry"]
     prof["validator_activation_height"] = int(fill["validator_activation_height"])
+    prof["validators_at_genesis"] = fill.get("validators_at_genesis") is True
     prof["public_rpc"] = "http://127.0.0.1:8545"
     prof["bootstrap_nodes"] = [p["bootnode"] for p in producers["producers"] if p["name"] != host]
     src = dict(template.get("sources", {}))
