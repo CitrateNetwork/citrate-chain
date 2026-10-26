@@ -7,6 +7,7 @@ import {ComputeMarketplace} from "../../src/ComputeMarketplace.sol";
 import {ComputeVerifier} from "../../src/ComputeVerifier.sol";
 import {X402Facilitator} from "../../src/X402Facilitator.sol";
 import {ModelMarketplace} from "../../src/ModelMarketplace.sol";
+import {TreasuryGovernor} from "../../src/TreasuryGovernor.sol";
 import {AdminChecks} from "../../script/lib/AdminChecks.sol";
 import {CheckDeployedAdmins} from "../../script/CheckDeployedAdmins.s.sol";
 import {ScriptEnv} from "../../script/ScriptEnv.sol";
@@ -121,6 +122,13 @@ contract DeployAllPrivilegedSlotsTest is Test {
             d.computeMarketplace, d.computePool, d.heartbeat, d.dispute, d.oracle, d.treasury,
             d.gateway, d.farming, d.governor
         ];
+    }
+
+    /// LiquidStakingPool is not part of block 0: DeployAll deploys none and
+    /// TreasuryGovernor is born with the liquid-staking path disabled.
+    function test_liquidStakingPool_isNotDeployed() public view {
+        assertEq(d.stakingPool, address(0), "DeployAll deploys no LiquidStakingPool");
+        assertEq(address(TreasuryGovernor(payable(d.governor)).stakingPool()), address(0), "governor has no pool");
     }
 
     function test_verifierHandOver_isClosed() public view {
