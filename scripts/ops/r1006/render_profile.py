@@ -24,7 +24,10 @@ between the genesis builder and this bring-up:
    "genesis_profile": "r1006" | null,           compiled-in profile the node selects
    "genesis_file": "genesis.json" | null,       a genesis the hosts receive as a file
    "alloc_file": "genesis.json",                {"alloc": {addr: {"code": "0x.."}}}: smoke's code check
-   "address_book": "book.json" | null,          CheckDeployedAdmins input (DEPLOYER-ADMIN 0)
+   "address_book": "book.json" | null,          the address book the genesis builder wrote (the
+                                                contracts are in block 0, so it comes from the
+                                                builder's output, not deploy transactions);
+                                                CheckDeployedAdmins input (DEPLOYER-ADMIN 0)
    "orangeseed": "0x<20 bytes>" | null,
    "validator_registry": "0x<20 bytes>",
    "validator_activation_height": N,

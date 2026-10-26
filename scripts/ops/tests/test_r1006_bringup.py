@@ -210,6 +210,9 @@ class KeysStepReadsOnlyPublicOutputs(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             prod = json.loads((env.state / "r1006-producers.json").read_text())
             self.assertEqual(len(prod["producers"]), 3)
+            boot = json.loads((env.state / "r1006-public-bootnodes.json").read_text())
+            self.assertEqual(boot["bootstrap_nodes"], [p["bootnode"] for p in prod["producers"]])
+            self.assertTrue(all(re.match(r"^noise_[0-9a-f]{64}@10\.206\.0\.\d:30303$", b) for b in boot["bootstrap_nodes"]))
             secrets = env.secrets()
             self.assertEqual(len(secrets), 3 * len(SECRET_FILES), "every secret file was minted on its host")
             seen = tree_bytes(env.state) + r.stdout.encode() + r.stderr.encode()
@@ -342,6 +345,21 @@ class AgentTest(unittest.TestCase):
         self.assertIn("installed", r.stdout)
         r = self.env.agent(1, "install-bin", good)
         self.assertIn("unchanged", r.stdout)
+
+    def test_config_check_refuses_a_contribution_recorder(self):
+        etc = self.root / "etc/citrate"
+        (etc / "node.toml").write_text("[chain]\nchain_id = 40204\n")
+        (etc / "citrate-node.env").write_text("CITRATE_BLOCK_V2=1\n")
+        r = self.env.agent(1, "config-check")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        (etc / "citrate-node.env").write_text("CITRATE_BLOCK_V2=1\nCITRATE_CONTRIBUTION_ACCOUNTING=0x01\n")
+        r = self.env.agent(1, "config-check")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("CONFIG FAIL", r.stdout)
+
+    def test_generated_config_has_no_contribution_recorder(self):
+        tool = (REPO / "scripts/producers/gen_node_config.py").read_text().lower()
+        self.assertNotIn("contribution", tool)
 
     def test_write_config_refuses_another_hosts_staker(self):
         r = self.env.agent(1, "write-config", "0x" + "12" * 20, "on")

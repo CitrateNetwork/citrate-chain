@@ -8,7 +8,8 @@
 #   r1006_bringup.sh build        --sha SHA        build citrate-node from origin/main at SHA on the
 #                                                  x86_64 build host (own temp dir); record sha256
 #   r1006_bringup.sh keys                          mint each host's keys ON the host (as citrate);
-#                                                  collect ONLY the public parts -> r1006-producers.json
+#                                                  collect ONLY the public parts -> r1006-producers.json,
+#                                                  and r1006-public-bootnodes.json for the cutover profile
 #   r1006_bringup.sh genesis-fill --fill-cmd CMD   producers + stake allocations -> genesis fill
 #                                                  (genesis hash, profile, registry) -> fill-result.json
 #   r1006_bringup.sh distribute                    binary + genesis to every host, hashes checked;
@@ -17,7 +18,8 @@
 #   r1006_bringup.sh start                         start in inventory order with health gates
 #   r1006_bringup.sh smoke                         FLEET AGREE, chain id, code vs genesis alloc,
 #                                                  OrangeSeed story(), DEPLOYER-ADMIN 0, no CONFLICT/
-#                                                  fork in logs, finality status, memory per host
+#                                                  fork in logs, finality status, no contribution
+#                                                  recorder configured, memory per host
 #   r1006_bringup.sh stop                          stop every node (reverse order)
 #   r1006_bringup.sh wipe [--wipe-keys]            delete r1006 chain data only; keys kept unless
 #                                                  --wipe-keys (asks for the typed confirmation)
@@ -355,10 +357,11 @@ step_keys() {
     mv -f -- "$STATE/pub/$h.pub.json.part" "$STATE/pub/$h.pub.json"
   done
   if [[ $DRY -eq 1 ]]; then
-    echo "  [dry-run] collect.py -> $STATE/r1006-producers.json"
+    echo "  [dry-run] collect.py -> $STATE/r1006-producers.json + r1006-public-bootnodes.json (for the cutover profile)"
     return 0
   fi
-  python3 "$PY/collect.py" --inventory "$INVENTORY" --pub-dir "$STATE/pub" --out "$STATE/r1006-producers.json"
+  python3 "$PY/collect.py" --inventory "$INVENTORY" --pub-dir "$STATE/pub" --out "$STATE/r1006-producers.json" \
+    --bootnodes-out "$STATE/r1006-public-bootnodes.json"
 }
 
 # ---- genesis-fill --------------------------------------------------------------
@@ -552,6 +555,7 @@ step_smoke() {
     echo "  [dry-run] CheckDeployedAdmins.s.sol over the fill address_book: DEPLOYER-ADMIN failures: 0"
     echo "  [dry-run] host_agent logs-scan: no CONFLICT / fork line since start, every host"
     echo "  [dry-run] finality: eth_getBlockByNumber(finalized) answers (switch OFF: expect block 0)"
+    echo "  [dry-run] config: no contribution recorder in node.toml / env / unit drop-ins, every host"
     echo "  [dry-run] memory: node RSS < 3 GiB on every host (runbook alert line)"
     return 0
   fi
@@ -659,7 +663,12 @@ PY
   if [[ -n "$fin" ]]; then pass "finality: finalized block $fin (checkpoint finality switch OFF on 40204: 0 expected)"
   else fail "finality: eth_getBlockByNumber(finalized) did not answer"; fi
 
-  # 8. memory
+  # 8. no contribution recorder configured
+  bad=0
+  for h in "${HOSTS[@]}"; do agent "$h" config-check >/dev/null || { bad=1; agent "$h" config-check || true; }; done
+  [[ $bad -eq 0 ]] && pass "no contribution recorder configured on any host" || fail "a host configures a contribution recorder"
+
+  # 9. memory
   bad=0
   for h in "${HOSTS[@]}"; do
     local st rss

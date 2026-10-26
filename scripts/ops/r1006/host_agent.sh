@@ -29,6 +29,9 @@
 #                              namespace (loopback only), with a throwaway data dir and
 #                              mining off; read block 0; compare; delete the throwaway dir
 #   tcp-check IP PORT          can this host open a TCP connection to IP:PORT
+#   config-check               the node's config must configure no contribution recorder
+#                              (a configured one sends a heartbeat transaction to the zero
+#                              address every 100 blocks); prints the offending lines
 #
 # Env: R1006_ROOT ("") · R1006_SERVICE (systemd|proc) · R1006_RUN_AS (citrate; "" = no switch)
 #      R1006_NODE_ENV_PASSTHRU (proc mode only)
@@ -348,6 +351,16 @@ cmd_tcp_check() {
   if timeout 3 bash -c "</dev/tcp/$ip/$port" 2>/dev/null; then echo "open $ip:$port"; else echo "closed $ip:$port"; return 1; fi
 }
 
+cmd_config_check() {
+  local f hits=0
+  for f in "$ETC/node.toml" "$ETC/citrate-node.env" /etc/systemd/system/citrate-node.service.d/*.conf; do
+    [[ -f "$f" ]] || continue
+    if grep -n -i 'contribution' -- "$f" | sed "s|^|  $f:|"; then hits=1; fi
+  done
+  if [[ $hits -eq 1 ]]; then echo "CONFIG FAIL: a contribution recorder is configured"; return 1; fi
+  echo "config ok: no contribution recorder"
+}
+
 c="${1:-}"
 shift || true
 case "$c" in
@@ -364,5 +377,6 @@ case "$c" in
   sha) cmd_sha "$@" ;;
   probe-genesis) cmd_probe_genesis "$@" ;;
   tcp-check) cmd_tcp_check "$@" ;;
+  config-check) cmd_config_check ;;
   *) die "unknown command '$c'" ;;
 esac

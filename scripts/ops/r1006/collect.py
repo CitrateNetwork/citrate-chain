@@ -124,6 +124,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--chain-id", type=int, default=40204)
     ap.add_argument("--p2p-port", type=int, default=30303)
+    ap.add_argument("--bootnodes-out", type=Path,
+                    help="also write the public bootnode list (noise id @ ip:port) for the cutover network profile")
     a = ap.parse_args(argv)
     try:
         doc = collect(a.inventory, a.pub_dir, a.chain_id, a.p2p_port)
@@ -134,6 +136,15 @@ def main(argv: list[str] | None = None) -> int:
     tmp.write_text(json.dumps(doc, indent=2) + "\n")
     tmp.replace(a.out)
     print(f"collect: {len(doc['producers'])} producer(s) -> {a.out}")
+    if a.bootnodes_out:
+        b = {"schema": "r1006-public-bootnodes/1",
+             "note": "The r1006 producers as bootnodes, for the network profile at cutover. Before cutover "
+                     "they are only each other's bootnodes; boot1-3 do discovery only and rpc-1 joins at cutover.",
+             "bootstrap_nodes": [p["bootnode"] for p in doc["producers"]]}
+        t2 = a.bootnodes_out.with_suffix(a.bootnodes_out.suffix + ".tmp")
+        t2.write_text(json.dumps(b, indent=2) + "\n")
+        t2.replace(a.bootnodes_out)
+        print(f"collect: public bootnode list -> {a.bootnodes_out}")
     return 0
 
 
