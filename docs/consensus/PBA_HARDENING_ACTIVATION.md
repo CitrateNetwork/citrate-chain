@@ -3,8 +3,8 @@ title: "R2 block-validity hardening: activation runbook for chain 40204"
 created: 2026-09-25
 branch: fix/pba-r2-chain-consensus
 author: Larry Klosowski + Claude Opus 5.5
-status: READY. 40204 pinned to genesis (`Some(0)`) for the PANIC-S1 reroll (owner, 2026-10-01).
-updated: 2026-10-01
+status: READY. 40204 pinned to genesis (`Some(0)`) for the PANIC-S1 reroll (owner, 2026-10-01). Prepared r1006 reroll (not live): `Some(0)` again, together with every other new rule (owner, 2026-10-26).
+updated: 2026-10-26
 chain: 40204
 ---
 
@@ -58,6 +58,7 @@ The PANIC-S1 reroll pins 40204 to `Some(0)`. The rules apply to every block afte
 
 - **At every reroll, re-check the pin:** `Some(0)` to start hardened, or a height chosen for the new chain.
 - **A genesis-pinned release runs only on the new genesis.** On a data directory from the previous 40204 genesis it judges that chain's history from block 1 under the new rules and forks off. Ship it only together with the reroll's genesis and wiped data directories (producers, bootnodes, RPC nodes, and the citrate-core bundled node).
+- **r1006 (prepared, not live):** the pin stays `Some(0)` and every other new rule also starts at height 0, so the r1006 binary runs only on the r1006 genesis with wiped data directories. r1005 nodes keep their current binary until the cutover.
 - After the reroll, confirm every node logs `chain 40204 pba_hardening_height 0 (source: release pin)` and the same activation fingerprint.
 
 ## Nodes that upgrade late

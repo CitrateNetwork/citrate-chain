@@ -102,6 +102,13 @@ superseded. The canonical instance was confirmed from on-chain wiring
 row with `cast receipt <tx>` / `cast code <address>` against
 `https://rpc.citrate.ai`.
 
+**r1006 (prepared, not live).** On r1006 the contracts are part of the
+genesis state, so that chain has no deployer transactions to derive the
+book from, and the method above does not apply. The r1006 book and its
+provenance have to come from the ceremony run that produced the genesis
+state. Until the r1006 export lands, this file, `40204.json` and
+`40204.provenance.json` describe r1005.
+
 Where one contract type has several live instances, the book prefixes
 the key with its role. `AnchorRegistry` is the standalone instance that
 citrate-quorum's book test requires, and the others are
