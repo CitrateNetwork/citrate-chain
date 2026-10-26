@@ -68,3 +68,93 @@ impl KvStore for RocksDbKvStore {
         self.db.write_batch_sync(batch).map_err(|e| e.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use citrate_consensus::checkpoint::{CheckpointConfig, CheckpointManager};
+    use citrate_consensus::checkpoint_gadget::{FinalityGadget, SignRefusal};
+    use citrate_consensus::crypto::Ed25519SigningKey;
+    use citrate_consensus::types::{BlockBuilder, Hash, PublicKey};
+    use citrate_consensus::vrf::VrfProposerSelector;
+    use citrate_consensus::DagStore;
+
+    fn hash(b: u8) -> Hash {
+        Hash::new([b; 32])
+    }
+
+    /// Validator process over a real RocksDB at `path`; dropping it closes the DB.
+    async fn boot(
+        path: &std::path::Path,
+        keys: &[Ed25519SigningKey],
+    ) -> (FinalityGadget, Arc<RocksDB>) {
+        let db = Arc::new(RocksDB::open(path).expect("open rocksdb"));
+        let kv: Arc<dyn KvStore> = Arc::new(RocksDbKvStore::new(db.clone()));
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        // Height 9 parent, then two competing blocks at the boundary height 10.
+        let parent = BlockBuilder::new().hash(hash(9)).height(9).build_unhashed();
+        dag.store_block(parent).await.expect("store parent");
+        for h in [hash(0xA0), hash(0xB0)] {
+            let b = BlockBuilder::new()
+                .hash(h)
+                .height(10)
+                .parent(hash(9))
+                .build_unhashed();
+            dag.store_block(b).await.expect("store boundary block");
+        }
+        let cfg = CheckpointConfig {
+            interval: 2,
+            committee_size: 100,
+            quorum_threshold: 67,
+            chain_id: 40204,
+            vote_depth: 3,
+        };
+        let sel = VrfProposerSelector::new().with_snapshot_schedule(1000, 999);
+        let set: Vec<(PublicKey, u128)> = keys
+            .iter()
+            .map(|k| (PublicKey::new(k.verifying_key().to_bytes()), 32_000u128))
+            .collect();
+        sel.sync_active_set_at(1, set, 1).await;
+        let mgr = Arc::new(CheckpointManager::with_persistence(cfg, dag, kv));
+        (
+            FinalityGadget::with_switch(mgr, Some(Arc::new(sel)), true),
+            db,
+        )
+    }
+
+    /// PR #321 P2 on the production store: the signing decision is committed with
+    /// a synced (fsync'd) RocksDB write before the vote is emitted, survives a
+    /// close/reopen of the database, and blocks a different hash at that height.
+    #[tokio::test]
+    async fn signed_vote_record_is_synced_and_survives_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let keys: Vec<Ed25519SigningKey> = (1u8..=4)
+            .map(|i| Ed25519SigningKey::from_bytes(&[i; 32]))
+            .collect();
+        let me = keys.first().expect("validator key");
+        let seed = hash(0x77);
+        {
+            let (g, db) = boot(dir.path(), &keys).await;
+            let syncs_before = db.write_batch_sync_count();
+            let out = g
+                .on_buried_checkpoint(10, hash(0xA0), &seed, Some(me))
+                .await;
+            assert!(out.signed_own_vote);
+            assert!(
+                db.write_batch_sync_count() > syncs_before,
+                "record committed via write_batch_sync"
+            );
+        }
+        // Restart: the DB is closed and reopened; the canonical block at 10 is B.
+        let (g, _db) = boot(dir.path(), &keys).await;
+        assert_eq!(g.signed_vote_at(10), Some(hash(0xA0)));
+        let out = g
+            .on_buried_checkpoint(10, hash(0xB0), &seed, Some(me))
+            .await;
+        assert!(!out.signed_own_vote && out.outbound.is_empty());
+        assert_eq!(
+            out.sign_refused,
+            Some(SignRefusal::Conflicting { signed: hash(0xA0) })
+        );
+    }
+}

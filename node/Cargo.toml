@@ -84,8 +84,14 @@ console = "0.15"
 indicatif = "0.17"
 colored = "2.0"
 
+[target.'cfg(unix)'.dependencies]
+# Storage key file: open without following a link, check the owner via geteuid.
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3.15"
+# #310: paused-clock tests of the consensus timers (node/src/timing.rs).
+tokio = { version = "1.32", features = ["full", "test-util"] }
 # WS-5 ceremony fuzz: property-based coverage of proposer-key derivation,
 # Register-digest encoding, sign→verify_strict roundtrip, and calldata layout.
 proptest = { workspace = true }
