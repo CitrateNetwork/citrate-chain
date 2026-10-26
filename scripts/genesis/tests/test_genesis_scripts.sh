@@ -139,6 +139,7 @@ calls() { cat "$FAKE/calls.log" 2>/dev/null; }
 reset_calls() { : >"$FAKE/calls.log"; }
 
 addr() { printf '0x%040x' "$1"; }
+lower_t() { printf '%s' "$1" | tr 'A-F' 'a-f'; }
 A1=$(addr 161)
 A2=$(addr 162)
 A3=$(addr 163)
@@ -517,12 +518,18 @@ mkdir -p "$REPO/contracts/script" "$REPO/contracts/genesis" "$REPO/contracts/add
 for s in DeployGenesisGovernance DeployTeamVesting DeployDormantLedgers CheckDeployedAdmins; do : >"$REPO/contracts/script/$s.s.sol"; done
 # Fake regenesis.sh: logs what it was given. FAKE_REGEN_BOOK=<file>: also "deploy" by writing
 # that file as the generated book (EMIT_OUTPUT), as the real generator does after a broadcast.
+# FAKE_REGEN_BCAST=<dir>: and record that dir's forge broadcasts under contracts/broadcast/.
 cat >"$REPO/scripts/ops/regenesis.sh" <<'EOF'
 #!/usr/bin/env bash
 echo "regenesis $*" >>"$FAKE/calls.log"
 echo "regenesis-env vg=${VALIDATOR_GOVERNANCE:-} vs=${VALIDATOR_SLASHER:-} gov=${GOVERNANCE:-}" >>"$FAKE/calls.log"
 echo "regenesis-emit fresh=${EMIT_FRESH_GENESIS:-} dep=${EMIT_DEPLOYER:-} since=${EMIT_BROADCAST_SINCE:-} out=${EMIT_OUTPUT:-}" >>"$FAKE/calls.log"
 echo "regenesis-deployer dep=${DEPLOYER_ADDRESS-<unset>} ceremony=${CEREMONY_DEPLOYER_ADDRESS-<unset>}" >>"$FAKE/calls.log"
+if [[ -n "${FAKE_REGEN_BCAST:-}" ]]; then
+  mkdir -p "$(dirname "$0")/../../contracts/broadcast"
+  cp -R "$FAKE_REGEN_BCAST"/. "$(dirname "$0")/../../contracts/broadcast/"
+fi
+[[ "${FAKE_REGEN_FAIL:-}" != 1 ]] || exit 2
 if [[ -n "${FAKE_REGEN_BOOK:-}" ]]; then cp "$FAKE_REGEN_BOOK" "$EMIT_OUTPUT"; fi
 EOF
 DEP=$(addr 1)
@@ -805,21 +812,28 @@ C9VR=$(addr 401) C9SBT=$(addr 402) C9BOND=$(addr 403) C9VI=$(addr 404) C9VP=$(ad
 C9X=$(addr 411) C9MM=$(addr 412) C9CM=$(addr 413)
 printf '{"chainId":40204,"deployer":"%s","contracts":{"ValidatorRegistry":"%s","CitrateMemberSBT":"%s","MemberBond":"%s","MembershipStakeVaultImpl":"%s","MembershipStakeVault":"%s","X402Facilitator":"%s","ModelMarketplace":"%s","ComputeMarketplace":"%s"},"aaStack":{},"CitrateMemberSBT":"%s","MembershipStakeVault":"%s"}\n' \
   "$DEP" "$C9VR" "$C9SBT" "$C9BOND" "$C9VI" "$C9VP" "$C9X" "$C9MM" "$C9CM" "$C9SBT" "$C9VP" >"$C9B"
+# The generator the gate re-runs: FAKE_EMIT_BOOK (default FAKE_REGEN_BOOK) is what it emits.
 cat >"$T/fake-emit.sh" <<'EOF'
 #!/usr/bin/env bash
-cp "$FAKE_REGEN_BOOK" "$EMIT_OUTPUT"
+echo "emitter dep=${EMIT_DEPLOYER:-} out=${EMIT_OUTPUT:-}" >>"$FAKE/calls.log"
+[[ "${FAKE_EMIT_FAIL:-}" != 1 ]] || exit 1
+cp "${FAKE_EMIT_BOOK:-$FAKE_REGEN_BOOK}" "$EMIT_OUTPUT"
 EOF
-mkdir -p "$REPO/contracts/broadcast/DeployValidatorRegistry.s.sol/40204" "$REPO/contracts/broadcast/DeployCoreMembership.s.sol/40204"
+# This run's P2 broadcasts, recorded (by the fake regenesis) after block 0 (5000).
+C9BC="$T/c9-bcast"
+mkdir -p "$C9BC/DeployValidatorRegistry.s.sol/40204" "$C9BC/DeployCoreMembership.s.sol/40204"
 printf '{"timestamp":6000,"transactions":[{"transactionType":"CREATE2","contractName":"ValidatorRegistry","contractAddress":"%s"}]}' "$C9VR" \
-  >"$REPO/contracts/broadcast/DeployValidatorRegistry.s.sol/40204/run-latest.json"
+  >"$C9BC/DeployValidatorRegistry.s.sol/40204/run-latest.json"
 printf '{"timestamp":6001,"transactions":[{"transactionType":"CREATE2","contractName":"CitrateMemberSBT","contractAddress":"%s"},{"transactionType":"CREATE2","contractName":"MemberBond","contractAddress":"%s"},{"transactionType":"CREATE2","contractName":"MembershipStakeVault","contractAddress":"%s"},{"transactionType":"CREATE2","contractName":"ERC1967Proxy","contractAddress":"%s"}]}' \
-  "$C9SBT" "$C9BOND" "$C9VI" "$C9VP" >"$REPO/contracts/broadcast/DeployCoreMembership.s.sol/40204/run-latest.json"
+  "$C9SBT" "$C9BOND" "$C9VI" "$C9VP" >"$C9BC/DeployCoreMembership.s.sol/40204/run-latest.json"
 cp "$GBK" "$T/book.c9.orig"
 C9ENV=("${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1
-  FAKE_REGEN_BOOK="$C9B" EMITTER="$T/fake-emit.sh")
-c9_fee() { # name want-exit pattern [fake_call setup...]
-  local name="$1" want="$2" pat="$3"
-  shift 3
+  FAKE_REGEN_BOOK="$C9B" FAKE_REGEN_BCAST="$C9BC" EMITTER="$T/fake-emit.sh")
+# c9_setup: a --confirm run after P1 (manifest, governance on chain, fee recipients = the
+# deployer), before P2 has sent anything (no broadcast recorded yet).
+c9_setup() {
+  rm -rf "$REPO/contracts/broadcast"
+  cp "$T/book.c9.orig" "$GBK"
   mk_manifest "$GB" "$DEP" confirm deployer
   gov_book "$GB" "$DEP"
   gov_chain
@@ -827,6 +841,11 @@ c9_fee() { # name want-exit pattern [fake_call setup...]
   fake_call "$C9X" treasury "$DEP"
   fake_call "$C9MM" treasuryAddress "$DEP"
   fake_call "$C9CM" treasury "$DEP"
+}
+c9_fee() { # name want-exit pattern [fake_call setup...]
+  local name="$1" want="$2" pat="$3"
+  shift 3
+  c9_setup
   "$@"
   expect "ceremony C9: $name" "$want" "$pat" -- "${C9ENV[@]}" bash "$CE" --confirm --only P2 --account deployer
   cp "$T/book.c9.orig" "$GBK"
@@ -835,6 +854,93 @@ c9_fee "fee recipients equal to the run's deployer pass P2" 0 'P2 fee recipients
 c9_fee "an X402Facilitator fee recipient other than the run's deployer fails P2" 3 'X402Facilitator.treasury\(\) is 0x0+63, not the book.s deployer 0x0+1' fake_call "$C9X" treasury "$STALE"
 c9_fee "a ModelMarketplace fee recipient other than the run's deployer fails P2" 3 'ModelMarketplace.treasuryAddress\(\) is 0x0+63' fake_call "$C9MM" treasuryAddress "$STALE"
 c9_fee "an unreadable ComputeMarketplace fee recipient fails P2" 3 'cannot read ComputeMarketplace.treasury\(\)' rm -f "$FAKE/call/$C9CM/treasury"
+# One canonical spelling on the compare side: the gate compares canonical (lowercase) books, so
+# a book that spells an address in another case is the same book as the generator's.
+C9B_MIXED="$T/c9-book-mixed.json"
+python3 -c 'import json,sys; b=json.load(open(sys.argv[1])); b["contracts"]["X402Facilitator"]="0x"+b["contracts"]["X402Facilitator"][2:].upper(); json.dump(b,open(sys.argv[2],"w"))' "$C9B" "$C9B_MIXED"
+c9_setup
+expect "ceremony C8: P2 compares the books in one canonical spelling" 0 'P2 stack book = generator output for this run' -- "${C9ENV[@]}" FAKE_REGEN_BOOK="$C9B_MIXED" FAKE_EMIT_BOOK="$C9B" bash "$CE" --confirm --only P2 --account deployer
+python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); sys.exit(0 if m["stackBook"]["contracts"]["X402Facilitator"]==sys.argv[2] else 1)' "$GB/ceremony-run.json" "$C9X" &&
+  ok "ceremony C8: the recorded stack book is lowercase" || bad "ceremony C8: the recorded stack book is lowercase" "$(cat "$GB/ceremony-run.json")"
+cp "$T/book.c9.orig" "$GBK"
+
+# Recovery after a broadcast: P2 has sent its transactions when the gate after it runs, so a
+# failed gate must never send the operator back into P2. It names the step that records the
+# book from this run's broadcasts and the chain (and sends nothing); P2 itself refuses to run
+# again once this run's broadcasts exist or the book is recorded.
+# reruns_p2 <output>: the lines that would re-enter P2 (a --from P2 / --only P2 resume that is
+# not the record step).
+reruns_p2() { grep -E -- '--(from|only) P2([^0-9]|$)' <<<"$1" | grep -v -- '--record-stack-book' || true; }
+c9_setup
+fake_call "$C9X" treasury "$STALE"
+out=$("${C9ENV[@]}" bash "$CE" --confirm --only P2 --account deployer 2>&1)
+rc=$?
+if [[ $rc -eq 3 ]] && grep -q 'GATE FAIL at P2' <<<"$out" && grep -q 'P2 has already broadcast' <<<"$out" &&
+  grep -qF -- "--confirm --only P2 --record-stack-book --account deployer" <<<"$out" && [[ -z "$(reruns_p2 "$out")" ]]; then
+  ok "ceremony recovery: a gate failure after P2 broadcast names the record step, never a P2 re-run"
+else
+  bad "ceremony recovery: a gate failure after P2 broadcast names the record step, never a P2 re-run (exit $rc)" "$out"
+fi
+manifest_has_t() { python3 -c 'import json,sys; sys.exit(0 if sys.argv[2] in json.load(open(sys.argv[1])) else 1)' "$GB/ceremony-run.json" "$1"; }
+manifest_has_t stackBook && bad "ceremony recovery: the failed gate recorded no stack book" "$(cat "$GB/ceremony-run.json")" || ok "ceremony recovery: the failed gate recorded no stack book"
+for how in "--only P2" "--from P2"; do
+  reset_calls
+  # shellcheck disable=SC2086 # $how is two words on purpose
+  expect "ceremony recovery: $how is refused once this run's P2 broadcasts exist" 3 'GATE FAIL at P2: this run.s P2 broadcasts are already recorded' -- "${C9ENV[@]}" bash "$CE" --confirm $how --account deployer
+  if calls | grep -q '^regenesis'; then bad "ceremony recovery: $how after a broadcast runs no regenesis" "$(calls)"; else ok "ceremony recovery: $how after a broadcast runs no regenesis"; fi
+done
+fake_call "$C9X" treasury "$DEP"
+reset_calls
+expect "ceremony recovery: the record step verifies and records the book from this run's broadcasts" 0 'P2 stack book recorded' -- "${C9ENV[@]}" bash "$CE" --confirm --only P2 --record-stack-book --account deployer
+if calls | grep -q '^regenesis'; then bad "ceremony recovery: the record step sends nothing (no regenesis)" "$(calls)"; else ok "ceremony recovery: the record step sends nothing (no regenesis)"; fi
+calls | grep -q "^emitter dep=$DEP out=$GBK$" && ok "ceremony recovery: the record step regenerates the book with the run's deployer" ||
+  bad "ceremony recovery: the record step regenerates the book with the run's deployer" "$(calls)"
+manifest_has_t stackBook && ok "ceremony recovery: the record step records the stack book" || bad "ceremony recovery: the record step records the stack book" "$(cat "$GB/ceremony-run.json")"
+# Once the book is recorded, P2 is done: an explicit refusal, before anything is sent, whether
+# or not the broadcasts are still on disk.
+for keep in yes no; do
+  [[ "$keep" == yes ]] || rm -rf "$REPO/contracts/broadcast"
+  reset_calls
+  expect "ceremony recovery: P2 is refused once the stack book is recorded (broadcasts on disk: $keep)" 3 'GATE FAIL at P2: the run manifest already records the stack book: P2 is done' -- "${C9ENV[@]}" bash "$CE" --confirm --only P2 --account deployer
+  if calls | grep -q '^regenesis'; then bad "ceremony recovery: a refused P2 re-run runs no regenesis ($keep)" "$(calls)"; else ok "ceremony recovery: a refused P2 re-run runs no regenesis ($keep)"; fi
+done
+expect "ceremony recovery: the record step is refused once the book is recorded" 3 'already records the stack book: P2 is done' -- "${C9ENV[@]}" bash "$CE" --confirm --only P2 --record-stack-book --account deployer
+expect "ceremony recovery: --record-stack-book needs --only P2" 1 '--record-stack-book needs --confirm --only P2' -- "${C9ENV[@]}" bash "$CE" --confirm --from P2 --record-stack-book --account deployer
+expect "ceremony recovery: --record-stack-book needs --confirm" 1 '--record-stack-book needs --confirm --only P2' -- "${C9ENV[@]}" bash "$CE" --simulate --only P2 --record-stack-book
+# Negative control: a broadcast from an earlier chain (recorded before this block 0) is not
+# this run's and does not block P2.
+c9_setup
+mkdir -p "$REPO/contracts/broadcast/DeployAll.s.sol/40204"
+printf '{"timestamp":100,"transactions":[]}' >"$REPO/contracts/broadcast/DeployAll.s.sol/40204/run-latest.json"
+expect "ceremony recovery: an earlier chain's broadcast does not block P2" 0 'P2 stack book = generator output for this run' -- "${C9ENV[@]}" bash "$CE" --confirm --only P2 --account deployer
+cp "$T/book.c9.orig" "$GBK"
+# A P2 that fails part way (regenesis stops after sending some transactions): no advice to
+# re-run P2; inspect first, and the record step if everything reached the chain.
+c9_setup
+out=$("${C9ENV[@]}" FAKE_REGEN_FAIL=1 bash "$CE" --confirm --only P2 --account deployer 2>&1)
+rc=$?
+if [[ $rc -eq 2 ]] && grep -q 'STEP FAIL at P2' <<<"$out" && grep -q 'do NOT re-run P2' <<<"$out" && grep -qF -- '--record-stack-book' <<<"$out" && [[ -z "$(reruns_p2 "$out")" ]]; then
+  ok "ceremony recovery: a P2 step failure under --confirm never advises a P2 re-run"
+else
+  bad "ceremony recovery: a P2 step failure under --confirm never advises a P2 re-run (exit $rc)" "$out"
+fi
+# The same for P1: once it has broadcast, a failed gate points past it (every later phase
+# re-verifies P1's governance on chain), never back into it.
+P1D="$REPO/contracts/genesis/p1rec"
+mkdir -p "$P1D"
+mk_manifest "$P1D" "$DEP" confirm deployer
+out=$("${C9ENV[@]}" GENESIS_OUT_DIR="$P1D" bash "$CE" --confirm --only P1 --account deployer 2>&1)
+rc=$?
+if [[ $rc -eq 3 ]] && grep -q 'GATE FAIL at P1' <<<"$out" && grep -q 'P1 has already broadcast' <<<"$out" && grep -qF -- '--confirm --from P2 --account deployer' <<<"$out" &&
+  ! grep -qE -- '--(from|only) P1([^0-9]|$)' <<<"$out"; then
+  ok "ceremony recovery: a gate failure after P1 broadcast resumes after P1, never P1 again"
+else
+  bad "ceremony recovery: a gate failure after P1 broadcast resumes after P1, never P1 again (exit $rc)" "$out"
+fi
+rm -rf "$P1D"
+# A gate that fails before its phase sent anything still names that phase's resume (control).
+c9_setup
+expect "ceremony recovery: a gate failure before any broadcast resumes at that phase" 3 "fix it, then resume: .* --confirm --from P2 --account deployer" -- "${C9ENV[@]}" VALIDATOR_GOVERNANCE="$STALE" bash "$CE" --confirm --only P2 --account deployer
 rm -rf "$REPO/contracts/broadcast" "$FAKE/call/$C9X" "$FAKE/call/$C9MM" "$FAKE/call/$C9CM"
 mk_manifest "$GB"
 # C8 on P5/P6: once P2 recorded its book, a different book is refused; --confirm needs one.
@@ -1048,6 +1154,42 @@ expect "generator: an incremental regeneration still runs" 0 'wrote' -- "${GEMIT
 [[ "$(jqv '[.deployer, .contracts.MembershipStakeVault, .MembershipStakeVault, .CitrateMemberSBT, .contracts.AnchorRegistry] | join(" ")')" == "$FD $(addr 2105) $(addr 2105) $(addr 2102) $(addr 3006)" ]] &&
   ok "generator: an incremental book takes EMIT_DEPLOYER and the new membership, and keeps the rest" ||
   bad "generator: an incremental book takes EMIT_DEPLOYER and the new membership, and keeps the rest" "$(cat "$GBOOK")"
+# One canonical spelling: every address the generator writes is lowercase, whatever case its
+# input had. `cast wallet address` prints the EIP-55 checksummed form, so a checksummed
+# EMIT_DEPLOYER (what regenesis.sh passes as typed) is the likely input on the day; the
+# ceremony's P2 gate re-runs the generator with the manifest's lowercase deployer and needs
+# the same book.
+FD_CS=0x00000000000000000000000000000000000007D1 # addr 2001, checksummed
+GOV_MIXED=0xAbCdEf0123456789aBcDeF0123456789AbCdEf31
+GRD_MIXED=0xaBcDeF0123456789AbCdEf0123456789aBcDeF32
+bcast DeployCoreMembership.s.sol 9001 "CitrateMemberSBT:$(addr 2102)" "MemberBond:$(addr 2103)" "MembershipStakeVault:$(addr 2104)" "ERC1967Proxy:$(addr 2105)"
+expect "generator: a fresh genesis with mixed-case inputs still runs" 0 'wrote' -- "${GEMIT[@]}" GOVERNANCE="$GOV_MIXED" GUARDIAN="$GRD_MIXED" EMIT_FRESH_GENESIS=1 EMIT_DEPLOYER="$FD_CS" EMIT_BROADCAST_SINCE=5000 EMIT_OUTPUT="$T/fresh-cs.json" bash "$EMIT"
+[[ "$(jq -r .deployer "$T/fresh-cs.json")" == "$FD" ]] && ok "generator: a checksummed EMIT_DEPLOYER is written lowercase" ||
+  bad "generator: a checksummed EMIT_DEPLOYER is written lowercase" "$(jq -r .deployer "$T/fresh-cs.json")"
+[[ "$(jq -r '[.governance.GOVERNANCE, .governance.GUARDIAN] | join(" ")' "$T/fresh-cs.json")" == "$(lower_t "$GOV_MIXED") $(lower_t "$GRD_MIXED")" ]] &&
+  ok "generator: a mixed-case GOVERNANCE/GUARDIAN is written lowercase" ||
+  bad "generator: a mixed-case GOVERNANCE/GUARDIAN is written lowercase" "$(jq -c .governance "$T/fresh-cs.json")"
+expect "generator: the same run with a lowercase deployer still runs" 0 'wrote' -- "${GEMIT[@]}" GOVERNANCE="$(lower_t "$GOV_MIXED")" GUARDIAN="$(lower_t "$GRD_MIXED")" EMIT_FRESH_GENESIS=1 EMIT_DEPLOYER="$FD" EMIT_BROADCAST_SINCE=5000 EMIT_OUTPUT="$T/fresh-lc.json" bash "$EMIT"
+cmp -s "$T/fresh-cs.json" "$T/fresh-lc.json" && ok "generator: the book is the same byte for byte whatever case the inputs had" ||
+  bad "generator: the book is the same byte for byte whatever case the inputs had" "$(diff "$T/fresh-cs.json" "$T/fresh-lc.json")"
+# canonical_addrs <book>: every 0x-prefixed 20-byte string anywhere in the book is lowercase.
+canonical_addrs() {
+  jq -e '[.. | strings | select(test("^0x[0-9a-fA-F]{40}$")) | select(. != ascii_downcase)] | length == 0' "$1" >/dev/null
+}
+canonical_addrs "$T/fresh-cs.json" && ok "generator: every address in a fresh book is lowercase (static blocks included)" ||
+  bad "generator: every address in a fresh book is lowercase (static blocks included)" "$(jq -c '[.. | strings | select(test("^0x[0-9a-fA-F]{40}$")) | select(. != ascii_downcase)]' "$T/fresh-cs.json")"
+# Incremental mode: the .env.testnet pins (AA stack, deployer fallback) are canonicalised too.
+printf 'DEPLOYER_ADDRESS=%s\nCITRATE_AA_ENTRY_POINT=%s\n' "$FD_CS" 0x0000000071727De22E5E9d8BAf0edAc6f37da032 >"$T/env.mixed"
+stale_book
+expect "generator: an incremental regeneration with mixed-case pins runs" 0 'wrote' -- "${GEMIT[@]}" ENV_TESTNET="$T/env.mixed" bash "$EMIT"
+[[ "$(jqv '[.deployer, .aaStack.EntryPoint] | join(" ")')" == "$FD 0x0000000071727de22e5e9d8baf0edac6f37da032" ]] && canonical_addrs "$GBOOK" &&
+  ok "generator: mixed-case .env.testnet pins are written lowercase" ||
+  bad "generator: mixed-case .env.testnet pins are written lowercase" "$(cat "$GBOOK")"
+stale_book
+expect "generator: the historical default deployer is written lowercase" 0 'wrote' -- "${GEMIT[@]}" ENV_TESTNET=/dev/null bash "$EMIT"
+[[ "$(jqv .deployer)" == 0x4250675f9015e65fc866f3a373f82bb9dfc000c6 ]] && canonical_addrs "$GBOOK" &&
+  ok "generator: the default deployer and every other address are lowercase" ||
+  bad "generator: the default deployer and every other address are lowercase" "$(jqv .deployer)"
 bcast DeployCoreMembership.s.sol 9001 "CitrateMemberSBT:$(addr 2102)" "MemberBond:$(addr 2103)" "MembershipStakeVault:$(addr 2104)"
 expect "generator: a membership broadcast without the vault proxy is refused" 2 'expected CitrateMemberSBT, MemberBond, MembershipStakeVault and its ERC1967Proxy' -- "${GEMIT[@]}" EMIT_FRESH_GENESIS=1 EMIT_DEPLOYER="$FD" EMIT_BROADCAST_SINCE=5000 bash "$EMIT"
 
@@ -1317,6 +1459,8 @@ EOF
       FANVIL_PID=""
       trap 'kill "$ANVIL_PID" ${FANVIL_PID:+"$FANVIL_PID"} 2>/dev/null; rm -rf "$T"' EXIT
       FDEP=0xd1e0000000000000000000000000000000000001 # the fresh deployer (impersonated)
+      FDEP_CS=0xd1E0000000000000000000000000000000000001 # the same, EIP-55 (as `cast wallet address` prints it)
+      printf '#!/usr/bin/env bash\necho "generator re-run failed (test fault)" >&2\nexit 1\n' >"$T/fail-emit.sh"
       fcast() { "$REAL_CAST" "$@" --rpc-url "$FRPC"; }
       ffcreate() { # contract [constructor args...] -> deployed address (deployed by anvil's first account)
         (cd "$FC" && "$REAL_FORGE" create --rpc-url "$FRPC" --unlocked --from "$ANVIL0" --broadcast "src/fixtures/GenesisFixtures.sol:$1" ${2:+--constructor-args} "${@:2}" 2>&1) |
@@ -1332,10 +1476,14 @@ EOF
         printf '%s %s\n' "$tl" "$ms"
       }
       FCODE_MSIG=$(addr 209)
-      # e2e_run <label> <membership owner> <extra txs before the councils>: a fresh chain, P2
-      # and P5 --confirm. Sets RUN_VR RUN_SBT RUN_VAULT RUN_VAULT_IMPL from the generated book.
+      # e2e_run <label> <membership owner> <extra txs before the councils> <deployer spelling>
+      # [gate-fault]: a fresh chain, P2 and P5 --confirm. Sets RUN_VR RUN_SBT RUN_VAULT
+      # RUN_VAULT_IMPL from the generated book. The deployer spelling is what the operator types
+      # as DEPLOYER_ADDRESS (and in the councils' and outputs' inputs): the book is canonical
+      # (lowercase) either way. gate-fault: the gate after P2's broadcast fails once, and the
+      # run recovers through the record step without sending again.
       e2e_run() {
-        local label="$1" owner="$2" i g0 g0ts book="$FC/addresses/40204.json"
+        local label="$1" owner="$2" i g0 g0ts book="$FC/addresses/40204.json" dspell="$4" fault="${5:-}" n_sent out rc spelled=()
         [[ -z "$FANVIL_PID" ]] || { kill "$FANVIL_PID" 2>/dev/null; wait "$FANVIL_PID" 2>/dev/null; }
         "$REAL_ANVIL" --port "$fport" --chain-id 40204 --silent >"$T/fanvil.log" 2>&1 &
         FANVIL_PID=$!
@@ -1353,12 +1501,18 @@ EOF
         g0ts=$(fcast block 0 --field timestamp)
         rm -f "$FC"/genesis/*.json
         mk_manifest "$FC/genesis" "$FDEP" confirm fixture "$g0" "$((g0ts))"
-        gov_book "$FC/genesis" "$FDEP"
-        printf '{"deployer":"%s","contracts":{"VestingAlice":"%s"}}' "$FDEP" "$(addr 71)" >"$FC/genesis/team-vesting.json"
-        printf '{"deployer":"%s","contracts":{"FederatedRoundLedger":"%s","PatronageLedger":"%s"}}' "$FDEP" "$(addr 81)" "$(addr 82)" >"$FC/genesis/dormant-ledgers.json"
-        FENV=("${CEENV[@]}" REPO_ROOT="$FR" DEPLOYER_ADDRESS="$FDEP" RPC_URL="$FRPC" EXPECTED_CHAIN_ID=40204
+        gov_book "$FC/genesis" "$dspell"
+        printf '{"deployer":"%s","contracts":{"VestingAlice":"%s"}}' "$dspell" "$(addr 71)" >"$FC/genesis/team-vesting.json"
+        printf '{"deployer":"%s","contracts":{"FederatedRoundLedger":"%s","PatronageLedger":"%s"}}' "$dspell" "$(addr 81)" "$(addr 82)" >"$FC/genesis/dormant-ledgers.json"
+        if [[ "$dspell" != "$FDEP" ]]; then
+          # Mixed-case variants of the other address inputs: the council owners (upper-case
+          # hex) and a deployer alias spelled exactly as typed.
+          spelled=(GOV_OWNERS="$(owners 11 12 13 14 15 | tr 'a-f' 'A-F' | sed 's/0X/0x/g')" GRD_OWNERS="$(owners 21 22 23 | tr 'a-f' 'A-F' | sed 's/0X/0x/g')"
+            EMIT_DEPLOYER="$dspell")
+        fi
+        FENV=("${CEENV[@]}" REPO_ROOT="$FR" DEPLOYER_ADDRESS="$dspell" RPC_URL="$FRPC" EXPECTED_CHAIN_ID=40204
           EXPECTED_GENESIS_HASH="$g0" FORGE="$REAL_FORGE" CAST="$REAL_CAST" PATH="$T/fbin:$PATH" MEMBERSHIP_OWNER="$owner"
-          TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS="$FRPC")
+          TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS="$FRPC" "${spelled[@]}")
         if [[ "$label" == run1 ]]; then
           # A stale generator preset is refused before anything is broadcast.
           expect "fresh genesis e2e: a stale EMIT_DEPLOYER stops P2 before any broadcast" 3 "EMIT_DEPLOYER is set to '0x0+63'" -- "${FENV[@]}" EMIT_DEPLOYER="$STALE" bash "$CE" --confirm --only P2 --account fixture
@@ -1367,14 +1521,35 @@ EOF
           expect "fresh genesis e2e: a stale CEREMONY_DEPLOYER_ADDRESS stops P2 before any broadcast" 3 "GATE FAIL at P0: CEREMONY_DEPLOYER_ADDRESS is set to '0x0+63'" -- "${FENV[@]}" CEREMONY_DEPLOYER_ADDRESS="$STALE" bash "$CE" --confirm --only P2 --account fixture
           [[ "$(fcast nonce "$FDEP")" == 0 ]] && ok "fresh genesis e2e: the refused CEREMONY_DEPLOYER_ADDRESS sent nothing" || bad "fresh genesis e2e: the refused CEREMONY_DEPLOYER_ADDRESS sent nothing" "nonce $(fcast nonce "$FDEP")"
         fi
-        expect "fresh genesis e2e ($label): P2 deploys through regenesis.sh and the generator, and the book is verified" 0 'P2 stack book = generator output for this run' -- "${FENV[@]}" bash "$CE" --confirm --only P2 --account fixture
+        if [[ "$fault" == gate-fault ]]; then
+          out=$("${FENV[@]}" EMITTER="$T/fail-emit.sh" bash "$CE" --confirm --only P2 --account fixture 2>&1)
+          rc=$?
+          n_sent=$(fcast nonce "$FDEP")
+          if [[ $rc -eq 3 && "$n_sent" -gt 0 ]] && grep -q 'P2 has already broadcast' <<<"$out" &&
+            grep -qF -- '--confirm --only P2 --record-stack-book --account fixture' <<<"$out" && [[ -z "$(reruns_p2 "$out")" ]]; then
+            ok "fresh genesis e2e ($label): a gate failure after P2 broadcast names the record step, never a P2 re-run"
+          else
+            bad "fresh genesis e2e ($label): a gate failure after P2 broadcast names the record step, never a P2 re-run (exit $rc, nonce $n_sent)" "$out"
+          fi
+          expect "fresh genesis e2e ($label): --from P2 is refused after P2 broadcast" 3 'this run.s P2 broadcasts are already recorded' -- "${FENV[@]}" bash "$CE" --confirm --from P2 --account fixture
+          [[ "$(fcast nonce "$FDEP")" == "$n_sent" ]] && ok "fresh genesis e2e ($label): the refused P2 re-run sent nothing" ||
+            bad "fresh genesis e2e ($label): the refused P2 re-run sent nothing" "nonce $n_sent -> $(fcast nonce "$FDEP")"
+          expect "fresh genesis e2e ($label): the record step verifies and records the book from the broadcasts and the chain" 0 'P2 stack book recorded' -- "${FENV[@]}" bash "$CE" --confirm --only P2 --record-stack-book --account fixture
+          [[ "$(fcast nonce "$FDEP")" == "$n_sent" ]] && ok "fresh genesis e2e ($label): the record step sent nothing" ||
+            bad "fresh genesis e2e ($label): the record step sent nothing" "nonce $n_sent -> $(fcast nonce "$FDEP")"
+        else
+          expect "fresh genesis e2e ($label): P2 deploys through regenesis.sh and the generator, and the book is verified" 0 'P2 stack book = generator output for this run' -- "${FENV[@]}" bash "$CE" --confirm --only P2 --account fixture
+        fi
+        jq -e '[.. | strings | select(test("^0x[0-9a-fA-F]{40}$")) | select(. != ascii_downcase)] | length == 0' "$book" >/dev/null &&
+          ok "fresh genesis e2e ($label): every address in the book is lowercase" ||
+          bad "fresh genesis e2e ($label): every address in the book is lowercase" "$(cat "$book")"
         RUN_VR=$(jq -r '.contracts.ValidatorRegistry' "$book")
         RUN_SBT=$(jq -r '.contracts.CitrateMemberSBT' "$book")
         RUN_VAULT=$(jq -r '.contracts.MembershipStakeVault' "$book")
         RUN_VAULT_IMPL=$(jq -r '.contracts.MembershipStakeVaultImpl' "$book")
         if [[ "$(jq -r '.deployer' "$book")" == "$FDEP" && "$(jq -r '[.CitrateMemberSBT, .MembershipStakeVault] | join(" ")' "$book")" == "$RUN_SBT $RUN_VAULT" &&
           "$(jq -r '(.contracts | has("AnchorRegistry")) or (.contracts | has("StaleEdu"))' "$book")" == false &&
-          "$(jq -r '.governance.GOVERNANCE' "$book")" == "$GTL" && "$RUN_VAULT" != "$RUN_VAULT_IMPL" ]]; then
+          "$(jq -r '.governance.GOVERNANCE' "$book")" == "$(lower "$GTL")" && "$RUN_VAULT" != "$RUN_VAULT_IMPL" ]]; then
           ok "fresh genesis e2e ($label): the book names the run's deployer, membership (impl and proxy), root aliases and governance, nothing stale"
         else
           bad "fresh genesis e2e ($label): the book names the run's deployer, membership (impl and proxy), root aliases and governance, nothing stale" "$(cat "$book")"
@@ -1386,14 +1561,19 @@ EOF
           ok "fresh genesis e2e ($label): the booked SBT and registry are live with this run's owner and governance" ||
           bad "fresh genesis e2e ($label): the booked SBT and registry are live with this run's owner and governance" "sbt owner $sbt_owner, vr governance $vr_gov"
         expect "fresh genesis e2e ($label): P5 --confirm passes the real checker over the generated book" 0 'P5 PASS: FACTORY-ADMIN 0, DEPLOYER-ADMIN 0' -- "${FENV[@]}" bash "$CE" --confirm --only P5 --account fixture
+        # P2 is done once its book is recorded: a second P2 is refused before anything is sent.
+        n_sent=$(fcast nonce "$FDEP")
+        expect "fresh genesis e2e ($label): P2 is refused once the stack book is recorded" 3 'already records the stack book: P2 is done' -- "${FENV[@]}" bash "$CE" --confirm --only P2 --account fixture
+        [[ "$(fcast nonce "$FDEP")" == "$n_sent" ]] && ok "fresh genesis e2e ($label): the refused second P2 sent nothing" ||
+          bad "fresh genesis e2e ($label): the refused second P2 sent nothing" "nonce $n_sent -> $(fcast nonce "$FDEP")"
       }
       lower() { printf '%s' "$1" | tr 'A-F' 'a-f'; }
       # The committed book before the genesis: an earlier chain's deployer, membership and extras.
       printf '{"chainId":40204,"deployer":"0x4250675F9015E65fC866F3a373F82bb9DFc000c6","contracts":{"ValidatorRegistry":"%s","CitrateMemberSBT":"%s","MemberBond":"%s","MembershipStakeVaultImpl":"%s","MembershipStakeVault":"%s","AnchorRegistry":"%s"},"aaStack":{},"CitrateMemberSBT":"%s","MembershipStakeVault":"%s"}\n' \
         "$(addr 3001)" "$(addr 3002)" "$(addr 3003)" "$(addr 3004)" "$(addr 3005)" "$(addr 3006)" "$(addr 3002)" "$(addr 3005)" >"$FC/addresses/40204.json"
-      OWNER1=0x0e1a000000000000000000000000000000000001
+      OWNER1=0xAbCDEF0123456789AbCDeF0123456789aBcD0E11 # EIP-55 mixed case on purpose
       OWNER2=0x0e1a000000000000000000000000000000000002
-      e2e_run run1 "$OWNER1" 0
+      e2e_run run1 "$OWNER1" 0 "$FDEP_CS"
       VR1=$RUN_VR SBT1=$RUN_SBT VAULT1=$RUN_VAULT
       # C8 on the consumer side: a book edited after P2 is not the one P5 sweeps.
       cp "$FC/addresses/40204.json" "$T/fbook.orig"
@@ -1405,7 +1585,7 @@ EOF
       mkdir -p "$FC/broadcast/DeployEduStack.s.sol/40204"
       printf '{"timestamp":1000,"transactions":[{"transactionType":"CREATE2","contractName":"StaleEdu","contractAddress":"%s"}]}\n' "$(addr 2999)" \
         >"$FC/broadcast/DeployEduStack.s.sol/40204/run-latest.json"
-      e2e_run run2 "$OWNER2" 1
+      e2e_run run2 "$OWNER2" 1 "$FDEP" gate-fault
       if [[ "$RUN_VR" != "$VR1" && "$RUN_SBT" != "$SBT1" && "$RUN_VAULT" != "$VAULT1" ]]; then
         ok "fresh genesis e2e: a new owner and registry move the SBT, the vault and the registry, and the book follows"
       else
