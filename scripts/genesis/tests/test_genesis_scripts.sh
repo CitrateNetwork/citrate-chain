@@ -967,6 +967,9 @@ if [[ $rc -eq 3 ]] && grep -q 'GATE FAIL at P2' <<<"$out" && grep -q 'P2 has alr
 else
   bad "ceremony recovery: a gate failure after P2 broadcast names the record step, never a P2 re-run (exit $rc)" "$out"
 fi
+out=$("${C9ENV[@]}" bash "$CE" --confirm --only P2 --account deployer --password-file "$PW_FILE" 2>&1)
+grep -qF -- "--confirm --only P2 --record-stack-book --account deployer --password-file $PW_FILE" <<<"$out" &&
+  ok "ceremony recovery: the record-step hint carries --password-file" || bad "ceremony recovery: the record-step hint carries --password-file" "$out"
 manifest_has_t() { python3 -c 'import json,sys; sys.exit(0 if sys.argv[2] in json.load(open(sys.argv[1])) else 1)' "$GB/ceremony-run.json" "$1"; }
 manifest_has_t stackBook && bad "ceremony recovery: the failed gate recorded no stack book" "$(cat "$GB/ceremony-run.json")" || ok "ceremony recovery: the failed gate recorded no stack book"
 for how in "--only P2" "--from P2"; do
@@ -1245,6 +1248,12 @@ expect "ceremony #363: a --confirm P3 records the vesting book it wrote" 0 'P3 t
 ob_reset
 vest_bc
 expect "ceremony #363: a --confirm P3 that writes no book fails" 3 'GATE FAIL at P3: .*team-vesting.json missing after DeployTeamVesting' -- "${OBENV[@]}" bash "$CE" --confirm --only P3 --account deployer
+out=$("${OBENV[@]}" bash "$CE" --confirm --only P3 --account deployer 2>&1)
+if grep -q 'P3 has already broadcast' <<<"$out" && grep -q 'stop and escalate' <<<"$out" && ! grep -qE -- '--(from|only) P3([^0-9]|$)|--from P[0-9]' <<<"$out"; then
+  ok "ceremony recovery: a gate failure after P3 broadcast never resumes into or past P3 (escalate)"
+else
+  bad "ceremony recovery: a gate failure after P3 broadcast never resumes into or past P3 (escalate)" "$out"
+fi
 ob_reset
 vest_bc
 vest_book "$OBK/vest-stale.json" "$STALE"
@@ -1270,6 +1279,12 @@ expect "ceremony #363: a --confirm P4 records the dormant-ledger book it wrote" 
 ob_reset
 dorm_bc
 expect "ceremony #363: a --confirm P4 that writes no book fails" 3 'GATE FAIL at P4: .*dormant-ledgers.json missing after DeployDormantLedgers' -- "${OBENV[@]}" bash "$CE" --confirm --only P4 --account deployer
+out=$("${OBENV[@]}" bash "$CE" --confirm --only P4 --account deployer 2>&1)
+if grep -q 'P4 has already broadcast' <<<"$out" && grep -q 'stop and escalate' <<<"$out" && ! grep -qE -- '--(from|only) P4([^0-9]|$)|--from P[0-9]' <<<"$out"; then
+  ok "ceremony recovery: a gate failure after P4 broadcast never resumes into or past P4 (escalate)"
+else
+  bad "ceremony recovery: a gate failure after P4 broadcast never resumes into or past P4 (escalate)" "$out"
+fi
 ob_reset
 dorm_bc
 dormant_book "$OBK/dorm-stale.json" "$STALE"
