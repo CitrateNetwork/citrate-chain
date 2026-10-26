@@ -29,7 +29,7 @@ interface IValidatorRegistryGenesis {
 ///         Env:
 ///           GENESIS_VR             the ValidatorRegistry address
 ///           GENESIS_VR_STATE       JSON {"code":"0x…","balance":"0x…","storage":{"0x<slot>":"0x<value>"}}
-///           GENESIS_VALIDATORS     JSON {"validators":[{"proposer_pubkey":"0x…","staker":"0x…","stake_wei":"<dec>"}]}
+///           GENESIS_VALIDATORS     JSON {"count":N,"validators":[{"proposer_pubkey":"0x…","staker":"0x…","stake_wei":"<dec>"}]}
 ///           GENESIS_TIMESTAMP      block-0 timestamp (unix seconds)
 ///           GENESIS_VALIDATORS_OUT output path (under ./genesis)
 ///         Output: {"validatorRegistry":"0x…","balance":"<dec wei>","activationEpoch":E,
@@ -37,54 +37,62 @@ interface IValidatorRegistryGenesis {
 contract GenesisValidators is Script {
     function run() external {
         address vr = vm.envAddress("GENESIS_VR");
-        string memory st = vm.readFile(vm.envString("GENESIS_VR_STATE"));
-        string memory vs = vm.readFile(vm.envString("GENESIS_VALIDATORS"));
-        uint256 ts = vm.envUint("GENESIS_TIMESTAMP");
+        _load(vr, vm.readFile(vm.envString("GENESIS_VR_STATE")));
+        vm.roll(0);
+        vm.warp(vm.envUint("GENESIS_TIMESTAMP"));
+        uint256 n = _register(vr, vm.readFile(vm.envString("GENESIS_VALIDATORS")));
+        _emit(vr);
+        console.log("GenesisValidators: registered", n, "producers at block 0 in", vr);
+    }
 
+    /// The ceremony's registry: runtime code, balance and every storage slot.
+    function _load(address vr, string memory st) internal {
         vm.etch(vr, vm.parseJsonBytes(st, ".code"));
         vm.deal(vr, vm.parseJsonUint(st, ".balance"));
         string[] memory keys = vm.parseJsonKeys(st, ".storage");
         for (uint256 i = 0; i < keys.length; i++) {
-            bytes32 slot = vm.parseBytes32(keys[i]);
-            vm.store(vr, slot, vm.parseJsonBytes32(st, string.concat(".storage.", keys[i])));
+            vm.store(vr, vm.parseBytes32(keys[i]), vm.parseJsonBytes32(st, string.concat(".storage.", keys[i])));
         }
-        vm.roll(0);
-        vm.warp(ts);
+    }
+
+    /// Each producer's staker registers with its stake, through the registry's own code.
+    function _register(address vr, string memory vs) internal returns (uint256 n) {
         IValidatorRegistryGenesis reg = IValidatorRegistryGenesis(vr);
         vm.mockCall(reg.ED25519_VERIFY(), bytes(""), abi.encode(uint256(1)));
-
-        uint256 before = reg.activeCount();
-        require(before == 0, "GenesisValidators: the ceremony registry already has validators");
-        uint256 n = vm.parseJsonUint(vs, ".validators.length");
+        require(reg.activeCount() == 0, "GenesisValidators: the ceremony registry already has validators");
+        n = vm.parseJsonUint(vs, ".count");
         require(n > 0, "GenesisValidators: no validators");
         vm.record();
         for (uint256 i = 0; i < n; i++) {
-            string memory k = string.concat(".validators[", vm.toString(i), "]");
-            bytes32 pk = vm.parseJsonBytes32(vs, string.concat(k, ".proposer_pubkey"));
-            address staker = vm.parseJsonAddress(vs, string.concat(k, ".staker"));
-            uint256 stake = vm.parseUint(vm.parseJsonString(vs, string.concat(k, ".stake_wei")));
-            vm.deal(staker, stake);
-            vm.prank(staker);
-            reg.registerValidator{value: stake}(pk, new bytes(64));
-            require(reg.isActive(pk), "GenesisValidators: a producer is not active");
-            require(reg.stakeOf(pk) == stake, "GenesisValidators: stake mismatch");
-            require(reg.pubkeyOfStaker(staker) == pk, "GenesisValidators: staker binding mismatch");
+            _registerOne(reg, vs, string.concat(".validators[", vm.toString(i), "]"));
         }
         require(reg.activeCount() == n, "GenesisValidators: the active set is not the producer set");
-        (, bytes32[] memory writes) = vm.accesses(vr);
         vm.clearMockedCalls();
+    }
 
-        string memory obj = "storage";
+    function _registerOne(IValidatorRegistryGenesis reg, string memory vs, string memory k) internal {
+        bytes32 pk = vm.parseJsonBytes32(vs, string.concat(k, ".proposer_pubkey"));
+        address staker = vm.parseJsonAddress(vs, string.concat(k, ".staker"));
+        uint256 stake = vm.parseUint(vm.parseJsonString(vs, string.concat(k, ".stake_wei")));
+        vm.deal(staker, stake);
+        vm.prank(staker);
+        reg.registerValidator{value: stake}(pk, new bytes(64));
+        require(reg.isActive(pk), "GenesisValidators: a producer is not active");
+        require(reg.stakeOf(pk) == stake, "GenesisValidators: stake mismatch");
+        require(reg.pubkeyOfStaker(staker) == pk, "GenesisValidators: staker binding mismatch");
+    }
+
+    /// Every slot the registrations wrote, with its final value, plus the new balance.
+    function _emit(address vr) internal {
+        (, bytes32[] memory writes) = vm.accesses(vr);
         string memory sj = "{}";
         for (uint256 i = 0; i < writes.length; i++) {
-            sj = vm.serializeBytes32(obj, vm.toString(writes[i]), vm.load(vr, writes[i]));
+            sj = vm.serializeBytes32("storage", vm.toString(writes[i]), vm.load(vr, writes[i]));
         }
-        string memory out = "out";
-        vm.serializeAddress(out, "validatorRegistry", vr);
-        vm.serializeString(out, "balance", vm.toString(vr.balance));
-        vm.serializeUint(out, "activationEpoch", (uint256(0) + 200) / 1000 + 1);
-        string memory json = vm.serializeString(out, "storage", sj);
+        vm.serializeAddress("out", "validatorRegistry", vr);
+        vm.serializeString("out", "balance", vm.toString(vr.balance));
+        vm.serializeUint("out", "activationEpoch", uint256(200) / 1000 + 1);
+        string memory json = vm.serializeString("out", "storage", sj);
         vm.writeFile(vm.envString("GENESIS_VALIDATORS_OUT"), json);
-        console.log("GenesisValidators: registered", n, "producers at block 0 in", vr);
     }
 }

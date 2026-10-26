@@ -132,7 +132,7 @@ def registry_delta(alloc, validators, ts):
         (t / "remappings.txt").write_text("forge-std/=lib/forge-std/src/\n")
         state = {"code": acct["code"], "balance": acct["balance"], "storage": acct.get("storage", {})}
         (t / "genesis/vr.json").write_text(json.dumps(state))
-        (t / "genesis/validators.json").write_text(json.dumps({"validators": validators}))
+        (t / "genesis/validators.json").write_text(json.dumps({"count": len(validators), "validators": validators}))
         env = dict(os.environ, FOUNDRY_OFFLINE="true", GENESIS_VR=vr, GENESIS_VR_STATE="genesis/vr.json",
                    GENESIS_VALIDATORS="genesis/validators.json", GENESIS_TIMESTAMP=str(ts),
                    GENESIS_VALIDATORS_OUT="genesis/out.json")
