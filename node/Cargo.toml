@@ -78,6 +78,11 @@ once_cell = "1.19"
 parking_lot = "0.12"
 # SECREM-01 CFG-1: wipe Noise P2P key bytes after handoff to the network layer.
 zeroize = "1.8"
+# Producer bring-up (host_identity.rs): Web3 v3 staker keystore. Same versions the
+# lockfile already carries (aes-gcm, wallet), so no new crates.
+scrypt = { version = "0.11", default-features = false }
+aes = "0.8"
+ctr = "0.9"
 # Wallet interactive UI deps
 dialoguer = "0.11"
 console = "0.15"
