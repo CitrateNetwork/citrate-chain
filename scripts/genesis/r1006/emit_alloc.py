@@ -29,6 +29,33 @@ HEX = re.compile(r"^0x[0-9a-f]*$")
 ADDR = re.compile(r"^0x[0-9a-f]{40}$")
 WORD = re.compile(r"^0x[0-9a-f]{64}$")
 ORANGESEED_PROXY = "0x000000000000000000000000000000c17a7e5eed"
+ARACHNID_FACTORY = "0x4e59b44847b379578588920ca78fbf26c0b4956c"
+
+
+def holds(hexdata, addr):
+    """Whether `addr` (20 bytes) appears byte-aligned anywhere in `hexdata` (0x-hex):
+    left-padded in a word, or packed beside other fields."""
+    h, a = hexdata[2:].lower(), addr[2:].lower()
+    i = h.find(a)
+    while i >= 0:
+        if i % 2 == 0:
+            return True
+        i = h.find(a, i + 1)
+    return False
+
+
+def scan_privileged(accounts, deployer):
+    """Block 0 keeps no reference to the ceremony deployer (a public, throwaway key) or to
+    the CREATE2 factory in any account's storage, nor the deployer in any runtime code
+    (an immutable). The factory's own account is exempt from the code scan."""
+    for acc in accounts:
+        for k, v in (acc.get("storage") or {}).items():
+            for who, name in ((deployer, "the ceremony deployer"), (ARACHNID_FACTORY, "the CREATE2 factory")):
+                if holds(v, who):
+                    fail(f"{acc['address']}: storage slot {k} holds {name} ({v})")
+        code = acc.get("code") or "0x"
+        if holds(code, deployer):
+            fail(f"{acc['address']}: runtime code holds the ceremony deployer (an immutable)")
 ORANGESEED_IMPL = "0x000000000000000000000000000000c17a7e5ee0"
 # Pinned from chain#389's GenesisOrangeSeed output (its PR body lists the same hashes). The
 # code is taken from that script's output, never recompiled here.
@@ -194,6 +221,7 @@ def main():
             accounts.append(ent)
         orangeseed = {"proxy": ORANGESEED_PROXY, "implementation": ORANGESEED_IMPL}
     accounts.sort(key=lambda x: x["address"])
+    scan_privileged(accounts, deployer)
 
     alloc = {
         "format": "citrate-genesis-alloc-v1",
