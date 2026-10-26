@@ -1,0 +1,20 @@
+# Self-test fixture for check-crypto-bigint-users.py (not a real lockfile).
+version = 4
+
+[[package]]
+name = "crypto-bigint"
+version = "0.5.5"
+
+[[package]]
+name = "elliptic-curve"
+version = "0.13.8"
+dependencies = ["crypto-bigint", "subtle"]
+
+[[package]]
+name = "k256"
+version = "0.13.4"
+dependencies = ["ecdsa", "elliptic-curve"]
+
+[[package]]
+name = "subtle"
+version = "2.6.1"

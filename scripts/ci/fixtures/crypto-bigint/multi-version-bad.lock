@@ -1,0 +1,24 @@
+# Self-test fixture for check-crypto-bigint-users.py (not a real lockfile).
+version = 4
+
+[[package]]
+name = "crypto-bigint"
+version = "0.5.5"
+
+[[package]]
+name = "crypto-bigint"
+version = "0.7.3"
+
+[[package]]
+name = "crypto-bigint"
+version = "0.7.6"
+
+[[package]]
+name = "elliptic-curve"
+version = "0.13.8"
+dependencies = ["crypto-bigint 0.5.5"]
+
+[[package]]
+name = "sneaky"
+version = "0.2.0"
+dependencies = ["crypto-bigint 0.7.3 (registry+https://github.com/rust-lang/crates.io-index)"]

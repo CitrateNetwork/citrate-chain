@@ -46,6 +46,11 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
+      - name: RUSTSEC-2026-0387 ignore guard (blocking)
+        run: |
+          python3 scripts/ci/test_check_crypto_bigint_users.py
+          python3 scripts/ci/check-crypto-bigint-users.py
+
       - name: Run cargo audit
         # Documented ignores live in audit.toml (assessor-friendly).
         # When either of these closes upstream, REMOVE the --ignore
