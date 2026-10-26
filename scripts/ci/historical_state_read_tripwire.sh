@@ -34,8 +34,8 @@ FIXTURES="$HERE/fixtures/rpc-historical-state"
 scan() { # <root>
   (cd "$1" && tw_files . | grep -E '\.(rs|py|sh|bash|ts|tsx|js|mjs|cjs|sol|yml|yaml)$' \
      | grep -vE '^core/api/|^scripts/ci/historical_state_read_tripwire\.sh$' \
-     | xargs -r -d '\n' grep -lE 'eth_(getCode|call|getBalance|getStorageAt|getTransactionCount)|fork-block-number|createSelectFork|createFork|rollFork|cast[[:space:]]+(call|code|balance|storage|nonce)' 2>/dev/null \
-     | xargs -r -d '\n' perl -e '
+     | tw_xargs grep -lE 'eth_(getCode|call|getBalance|getStorageAt|getTransactionCount)|fork-block-number|createSelectFork|createFork|rollFork|cast[[:space:]]+(call|code|balance|storage|nonce)' 2>/dev/null \
+     | tw_xargs perl -e '
     for my $f (@ARGV) {
       open(my $fh, "<", $f) or next; my @L = <$fh>; close $fh;
       for my $i (0 .. $#L) {
@@ -74,6 +74,7 @@ self_test() {
   tw_selftest_marked "rpc-historical-state markers" "$d/pos" scan || rc=1
   tw_selftest_case "rpc-historical-state negative" clean scan "$d/neg" || rc=1
   tw_selftest_allow "rpc-historical-state allowlist" rpc-historical-state scan "$d/pos" || rc=1
+  tw_selftest_fail_closed "rpc-historical-state fail-closed" "$d/pos" scan || rc=1
   [ $rc -eq 0 ] && echo "rpc-historical-state tripwire self-test: ok"
   return $rc
 }

@@ -33,9 +33,9 @@ FIXTURES="$HERE/fixtures/signal-synthetic-pid"
 
 scan() { # <root> ; prints "path:line: text" per signal call aimed at a synthetic pid
   (cd "$1" && tw_files . | grep -E '\.(rs|ts|tsx|js|mjs|cjs|py|sh|bash)$' \
-     | xargs -r -d '\n' grep -lE 'kill|signal_pid|from_raw' 2>/dev/null \
-     | xargs -r -d '\n' grep -LE 'unshare\b.*(--pid\b|[[:space:]]-[a-zA-Z]*p[a-zA-Z]*\b)|CLONE_NEWPID' 2>/dev/null \
-     | xargs -r -d '\n' perl -ne '
+     | tw_xargs grep -lE 'kill|signal_pid|from_raw' 2>/dev/null \
+     | tw_xargs grep -LE 'unshare\b.*(--pid\b|[[:space:]]-[a-zA-Z]*p[a-zA-Z]*\b)|CLONE_NEWPID' 2>/dev/null \
+     | tw_xargs perl -ne '
     BEGIN {
       $NUM = qr/(?:-\s*)?\d[\d_]*(?:\s*as\s+[\w:]+)?/;
       $MAX = qr/(?:(?:libc::)?(?:u32|i32|u64|i64|pid_t|c_int)::MAX|Number\.MAX_SAFE_INTEGER)(?:\s*as\s+[\w:]+)?(?:\s*[-+]\s*\d[\d_]*)?(?:\s*as\s+[\w:]+)?/;
@@ -72,6 +72,7 @@ self_test() {
   tw_selftest_marked "signal-synthetic-pid markers" "$d/pos" scan || rc=1
   tw_selftest_case "signal-synthetic-pid negative" clean scan "$d/neg" || rc=1
   tw_selftest_allow "signal-synthetic-pid allowlist" signal-synthetic-pid scan "$d/pos" || rc=1
+  tw_selftest_fail_closed "signal-synthetic-pid fail-closed" "$d/pos" scan || rc=1
   [ $rc -eq 0 ] && echo "signal-synthetic-pid tripwire self-test: ok"
   return $rc
 }

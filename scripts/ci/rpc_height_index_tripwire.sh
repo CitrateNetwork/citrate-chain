@@ -41,7 +41,7 @@ FIXTURES="$HERE/fixtures/rpc-finality-height-index"
 
 scan() { # <root>
   (cd "$1" && tw_files . | grep -E '^core/api/src/.*\.rs$' | grep -vE '_tests?\.rs$' \
-     | xargs -r -d '\n' perl -e '
+     | tw_xargs perl -e '
     sub flush {
       my ($f) = @_;
       return unless @hits;
@@ -94,6 +94,7 @@ self_test() {
   tw_selftest_marked "rpc-finality-height-index markers" "$d/pos" scan || rc=1
   tw_selftest_case "rpc-finality-height-index negative" clean scan "$d/neg" || rc=1
   tw_selftest_allow "rpc-finality-height-index allowlist" rpc-finality-height-index scan "$d/pos" || rc=1
+  tw_selftest_fail_closed "rpc-finality-height-index fail-closed" "$d/pos" scan || rc=1
   [ $rc -eq 0 ] && echo "rpc-finality-height-index tripwire self-test: ok"
   return $rc
 }

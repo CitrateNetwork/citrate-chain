@@ -41,8 +41,8 @@ scan() { # <root> ; prints "path:line: text" per raw ECDSA signing call outside 
   (cd "$1" && tw_files . | grep -E '\.rs$' \
      | grep -vE '^wallet(-core|-sdk|-aa)?/' \
      | grep -vE '(^|/)(tests|benches|examples|fuzz)/|_tests?\.rs$' \
-     | xargs -r -d '\n' grep -lE 'sign_(prehash|recoverable|digest|ecdsa)' 2>/dev/null \
-     | xargs -r -d '\n' bash -c '. "$0"; tw_strip_c "$@"' "$HERE/lib/tripwire_common.sh" \
+     | tw_xargs grep -lE 'sign_(prehash|recoverable|digest|ecdsa)' 2>/dev/null \
+     | tw_xargs bash -c '. "$0"; tw_strip_c "$@"' "$HERE/lib/tripwire_common.sh" \
      | perl -ne '
     BEGIN { $M = qr/\.\s*(sign_prehash_recoverable|sign_prehash|sign_recoverable|sign_digest_recoverable|sign_digest|sign_ecdsa_recoverable|sign_ecdsa_low_r|sign_ecdsa)\s*(::<[^>]*>)?\s*\(/ }
     my ($f, $ln, $code) = /^([^:]+):(\d+): (.*)$/ or next;
@@ -73,6 +73,7 @@ self_test() {
   tw_selftest_marked "wallet-gate-signing markers" "$d/pos" scan || rc=1
   tw_selftest_case "wallet-gate-signing negative" clean scan "$d/neg" || rc=1
   tw_selftest_allow "wallet-gate-signing allowlist" wallet-gate-signing scan "$d/pos" || rc=1
+  tw_selftest_fail_closed "wallet-gate-signing fail-closed" "$d/pos" scan || rc=1
   [ $rc -eq 0 ] && echo "wallet-gate-signing tripwire self-test: ok"
   return $rc
 }

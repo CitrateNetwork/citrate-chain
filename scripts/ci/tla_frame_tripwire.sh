@@ -31,7 +31,7 @@ LINT="$HERE/tla_frame_lint.py"
 
 scan() { # <root> ; prints "path:line: [Action] ..." per clash
   (cd "$1" && tw_files . | grep -E '^specs/tla/.*\.tla$' \
-     | xargs -r -d '\n' python3 -I "$LINT") || true
+     | tw_xargs python3 -I "$LINT") || true
 }
 
 self_test() {
@@ -46,6 +46,7 @@ self_test() {
   tw_selftest_marked "tla-frame markers" "$d/pos" scan || rc=1
   tw_selftest_case "tla-frame negative" clean scan "$d/neg" || rc=1
   tw_selftest_allow "tla-frame allowlist" tla-frame scan "$d/pos" || rc=1
+  tw_selftest_fail_closed "tla-frame fail-closed" "$d/pos" scan || rc=1
   [ $rc -eq 0 ] && echo "tla-frame tripwire self-test: ok"
   return $rc
 }

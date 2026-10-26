@@ -40,8 +40,8 @@ FIXTURES="$HERE/fixtures/finalization-publish-order"
 
 scan() { # <root>
   (cd "$1" && tw_files . | grep -E '\.rs$' | grep -vE '_tests?\.rs$|(^|/)tests/' \
-     | xargs -r -d '\n' grep -lE 'impl[[:space:]]+([A-Za-z_:]+::)?FinalizationGuard[[:space:]]+for' 2>/dev/null \
-     | xargs -r -d '\n' perl -e '
+     | tw_xargs grep -lE 'impl[[:space:]]+([A-Za-z_:]+::)?FinalizationGuard[[:space:]]+for' 2>/dev/null \
+     | tw_xargs perl -e '
     my $PUB = qr/\b(?:verified_pairs|verified_height|finalized_pairs|rpc_finalized\w*)\s*\.\s*(?:record|store|fetch_max|set|insert)\s*\(/;
     for my $f (@ARGV) {
       open(my $fh, "<", $f) or next; my @raw = <$fh>; close $fh;
@@ -129,6 +129,7 @@ self_test() {
   tw_selftest_case "finalization-publish-order stale anchors" hit scan "$d/stale" || rc=1
   tw_selftest_case "finalization-publish-order negative" clean scan "$d/neg" || rc=1
   tw_selftest_allow "finalization-publish-order allowlist" finalization-publish-order scan "$d/pos" || rc=1
+  tw_selftest_fail_closed "finalization-publish-order fail-closed" "$d/pos" scan || rc=1
   [ $rc -eq 0 ] && echo "finalization-publish-order tripwire self-test: ok"
   return $rc
 }

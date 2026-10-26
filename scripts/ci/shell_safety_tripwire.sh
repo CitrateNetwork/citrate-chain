@@ -41,7 +41,7 @@ shell_files() { # <root>
 }
 
 scan_rm() { # <root> ; prints "path:line: text" for each unguarded recursive rm
-  (cd "$1" && shell_files . | xargs -r -d '\n' perl -ne '
+  (cd "$1" && shell_files . | tw_xargs perl -ne '
     if ($. == 1) { $hd = "" }
     if ($hd ne "") { $hd = "" if /^\s*\Q$hd\E\s*$/; next }   # inside a here-document: data
     next if /^\s*#/;
@@ -68,7 +68,7 @@ PIPEFAIL_SCOPE='(^|/)(ops|ceremony|installers?|deploy|release|genesis|provision|
 
 scan_pipefail() { # <root> ; prints "path:line: text" for each in-scope script without pipefail
   (cd "$1" && shell_files . | grep -E '\.(sh|bash)$|^[^.]*$' | grep -vE '^\.github/' \
-     | grep -iE "$PIPEFAIL_SCOPE" | xargs -r -d '\n' perl -ne '
+     | grep -iE "$PIPEFAIL_SCOPE" | tw_xargs perl -ne '
     if ($. == 1) { $hd = ""; $first = ""; $pf = 0 }
     if ($hd ne "") { $hd = "" if /^\s*\Q$hd\E\s*$/; goto END_LINE }
     $pf = 1 if /^\s*[^#]*\bset\s+(-[A-Za-z]*o\s+pipefail|-o\s+pipefail|.*\bpipefail\b)/ || /shopt\s+-so\s+pipefail/;
@@ -108,6 +108,8 @@ self_test() {
   [ "$(scan_pipefail "$d/a" | wc -l)" -eq 2 ] || { echo 'self-test: shell-pipefail missed a pipeline inside a command substitution'; rc=1; }
   tw_selftest_case "shell-pipefail negative" clean scan_pipefail "$d/c" || rc=1
   tw_selftest_allow "shell-pipefail allowlist" shell-pipefail scan_pipefail "$d/a" || rc=1
+  tw_selftest_fail_closed "shell-rm-guard fail-closed" "$d/a" scan_rm || rc=1
+  tw_selftest_fail_closed "shell-pipefail fail-closed" "$d/a" scan_pipefail || rc=1
   [ $rc -eq 0 ] && echo "shell-safety tripwire self-test: ok"
   return $rc
 }

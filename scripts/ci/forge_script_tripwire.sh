@@ -37,7 +37,7 @@ script_files() { tw_files "$1" | grep -E '^contracts/script/.*\.sol$' || true; }
 
 # Comment-stripped source, one output line per input line: "path:line: code".
 strip_comments() { # <root>
-  (cd "$1" && script_files . | xargs -r -d '\n' bash -c '. "$0"; tw_strip_c "$@"' "$HERE/lib/tripwire_common.sh") || true
+  (cd "$1" && script_files . | tw_xargs bash -c '. "$0"; tw_strip_c "$@"' "$HERE/lib/tripwire_common.sh") || true
 }
 
 scan_chainid() { # <root>
@@ -74,6 +74,8 @@ self_test() {
   tw_selftest_case "forge-script-address-this positive" hit scan_address_this "$d/q" || rc=1
   tw_selftest_case "forge-script-address-this negative" clean scan_address_this "$d/r" || rc=1
   tw_selftest_allow "forge-script-address-this allowlist" forge-script-address-this scan_address_this "$d/q" || rc=1
+  tw_selftest_fail_closed "forge-chainid-profile fail-closed" "$d/p" scan_chainid || rc=1
+  tw_selftest_fail_closed "forge-script-address-this fail-closed" "$d/q" scan_address_this || rc=1
   [ $rc -eq 0 ] && echo "forge-script tripwire self-test: ok"
   return $rc
 }

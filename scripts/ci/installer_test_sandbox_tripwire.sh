@@ -47,8 +47,8 @@ TEST_FILES='(^|/)tests?/.*\.(sh|bash|bats|py|ts|tsx|js|mjs|cjs|rs)$|(^|/)__tests
 
 scan() { # <root> ; prints "path:line: text" per unsandboxed execution of an in-scope script
   (cd "$1" && tw_files . | grep -E "$TEST_FILES" \
-     | xargs -r -d '\n' grep -liE '(install|deploy|ceremony|reroll|provision|bootstrap|release|genesis|packaging|/ops/|postinst|preinst|prerm|postrm)[^[:space:]"'\'']*\.(sh|bash)' 2>/dev/null \
-     | xargs -r -d '\n' perl -e '
+     | tw_xargs grep -liE '(install|deploy|ceremony|reroll|provision|bootstrap|release|genesis|packaging|/ops/|postinst|preinst|prerm|postrm)[^[:space:]"'\'']*\.(sh|bash)' 2>/dev/null \
+     | tw_xargs perl -e '
     my $SCOPE = qr{(?:^|/)(?:ops|ceremony|installers?|deploy|release|genesis|provision|packaging)/|(?:^|/)[^/]*(?:install|deploy|ceremony|regenesis|reroll|provision|bootstrap|release|postinst|preinst|prerm|postrm)[^/]*\.(?:sh|bash)$}i;
     my $PATH = qr{[\w.\/\$\{\}:?-]*\.(?:sh|bash)\b};
     my $ASSIGN = qr{[A-Za-z_]\w*=(?:"[^"]*"|\x27[^\x27]*\x27|[^\s;&|]*)\s+};
@@ -114,6 +114,7 @@ self_test() {
   tw_selftest_marked "installer-test-sandbox markers" "$d/pos" scan || rc=1
   tw_selftest_case "installer-test-sandbox negative" clean scan "$d/neg" || rc=1
   tw_selftest_allow "installer-test-sandbox allowlist" installer-test-sandbox scan "$d/pos" || rc=1
+  tw_selftest_fail_closed "installer-test-sandbox fail-closed" "$d/pos" scan || rc=1
   [ $rc -eq 0 ] && echo "installer-test-sandbox tripwire self-test: ok"
   return $rc
 }
