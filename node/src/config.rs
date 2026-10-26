@@ -755,8 +755,8 @@ mod tests {
         let start = main.find("async fn start_node(").expect("start_node");
         let body = &main[start..];
         let init = body
-            .find("citrate_consensus::hardening::init_pba_hardening_for_chain(")
-            .expect("start_node must publish via init_pba_hardening_for_chain");
+            .find("citrate_consensus::hardening::init_pba_hardening_for_genesis(")
+            .expect("start_node must publish via init_pba_hardening_for_genesis (the chain pin unless the loaded genesis has its own)");
         // The pin-unaware resolver would skip the release pin.
         assert!(!body.contains("hardening::init_pba_hardening_height("));
         // The chain id the pin keys on is checked against CITRATE_CHAIN_ID first.

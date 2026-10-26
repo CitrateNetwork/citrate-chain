@@ -1323,7 +1323,7 @@ pub(crate) mod tests {
     fn start_node_wiring() {
         let main = include_str!("main.rs");
         let body = &main[main.find("async fn start_node(").expect("start_node")..];
-        let init = body.find("init_pba_hardening_for_chain(").expect("init");
+        let init = body.find("init_pba_hardening_for_genesis(").expect("init");
         let purge = body
             .find("hardening_rejoin::purge_invalid_post_activation(")
             .expect("start-up check");
