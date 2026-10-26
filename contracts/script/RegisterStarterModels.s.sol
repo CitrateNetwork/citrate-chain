@@ -15,8 +15,9 @@ import {IModelRegistry} from "../src/interfaces/IModelRegistry.sol";
  *  1. Pin each artifact (full models and LoRAs) to the team's IPFS node
  *     and capture the resulting CIDs.
  *  2. Fill the CID strings into the MODELS / LORAS arrays below.
- *  3. Set REGISTRY_ADDR to the deployed ModelRegistry on the target chain
- *     (testnet-beta, post-2026-06-08-reroll: 0x11a5e6f57751d8fa1c5b58ad2bf13528160985f0).
+ *  3. The registry address is read from the address book
+ *     (`addresses/40204.json` → `.contracts.ModelRegistry`), so the script
+ *     follows rerolls without an edit.
  *  4. Fund the deployer with at least 0.1 tCTR per artifact (registration
  *     fee is 0.1 ether per registerModel call).
  *  5. Run:
@@ -33,13 +34,13 @@ import {IModelRegistry} from "../src/interfaces/IModelRegistry.sol";
  * registered model + its IPFS CID; users can then download via IPFS.
  */
 contract RegisterStarterModels is Script {
-    /// @notice ModelRegistry deployed at this address on chain id 40204.
-    /// Bumped here so we don't ask `vm.envAddress` and keep the script
-    /// runnable from CI without env wiring.
-    /// CREATE2 reroll-stable address book (#41): this is now fixed across
-    /// rerolls unless Salts.VERSION is bumped. Source of truth + verify:
+    /// @notice ModelRegistry on chain id 40204, read from the canonical
+    ///         address book so the script never pins a pre-reroll address.
     ///   jq -r '.contracts.ModelRegistry' contracts/addresses/40204.json
-    address public constant REGISTRY_ADDR = 0xba36fA0Da9327030Bd14351db968c8C43c5a67e4;
+    function registryAddr() public view returns (address) {
+        string memory book = vm.readFile(string.concat(vm.projectRoot(), "/addresses/40204.json"));
+        return vm.parseJsonAddress(book, ".contracts.ModelRegistry");
+    }
 
     /// @notice Per-call fee charged by ModelRegistry.registerModel.
     uint256 public constant REGISTRATION_FEE = 0.1 ether;
@@ -210,7 +211,7 @@ contract RegisterStarterModels is Script {
     function run() external {
         vm.startBroadcast();
 
-        IModelRegistry registry = IModelRegistry(REGISTRY_ADDR);
+        IModelRegistry registry = IModelRegistry(registryAddr());
 
         StarterModel[] memory models = _models();
         StarterModel[] memory loras  = _loras();

@@ -765,17 +765,20 @@ async fn get_dag_stats(config: &Config) -> Result<()> {
         .as_object()
     {
         println!("{}", "DAG Statistics:".bold());
-        println!(
-            "Total Blocks: {}",
-            stats["totalBlocks"].as_u64().unwrap_or(0)
-        );
-        println!("Blue Blocks: {}", stats["blueBlocks"].as_u64().unwrap_or(0));
-        println!("Red Blocks: {}", stats["redBlocks"].as_u64().unwrap_or(0));
-        println!("Tips Count: {}", stats["tipsCount"].as_u64().unwrap_or(0));
-        println!(
-            "Max Blue Score: {}",
-            stats["maxBlueScore"].as_u64().unwrap_or(0)
-        );
+        // A null field is one the node does not track (citrate_getDagStats);
+        // show it as such instead of as 0.
+        let field = |key: &str| {
+            stats
+                .get(key)
+                .and_then(|v| v.as_u64())
+                .map_or_else(|| "not tracked".to_string(), |n| n.to_string())
+        };
+        println!("Height: {}", field("height"));
+        println!("Total Blocks: {}", field("totalBlocks"));
+        println!("Blue Blocks: {}", field("blueBlocks"));
+        println!("Red Blocks: {}", field("redBlocks"));
+        println!("Tips Count: {}", field("tipsCount"));
+        println!("Max Blue Score: {}", field("maxBlueScore"));
 
         if let Some(tips) = stats["currentTips"].as_array() {
             if !tips.is_empty() {

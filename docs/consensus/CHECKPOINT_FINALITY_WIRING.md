@@ -143,6 +143,39 @@ outbound construct-sign-broadcast path does not exist today and is the primary n
 The validator signing key is the node's consensus key (same key registered in
 `ValidatorRegistry`); confirm availability in the producer context (D-4).
 
+**Signing protection (Stage 1a, PR #321 review P2).** A validator must never sign two
+hashes at one height, including across restarts (sign A at H, reorg onto a shorter
+branch, restart, that branch later buries B at H). Every signing decision is therefore
+recorded durably **before** the vote is signed, submitted locally or broadcast:
+`dag_metadata` key `checkpoint_signed:<chain_id>:<H>` → the 32-byte hash, plus
+`checkpoint_signed_meta:<chain_id>` → `floor ‖ highest` (u64 BE), written in one
+`KvStore::kv_write_batch` (RocksDB: `write_batch_sync`, WAL fsync before return). Each sign
+attempt consults the record: same hash → idempotent re-sign (deterministic ed25519, the
+identical vote); different hash → refused and logged at error level (safety stop for that
+height); height `<= floor` → refused. Write failure or no persistent store → no signature
+(fail closed). Records at/below the finalized height are deleted and the floor raised to it
+in one synced batch; records more than 1024 boundaries below `highest` are deleted the same
+way (floor raised past them), so the record is bounded and pruning never re-opens a height.
+This replaces the earlier "skip boundaries already buried at startup" driver heuristic.
+The record lives in the node's database: wiping the data dir while keeping `proposer.key`
+discards it, exactly like a slashing-protection DB — do not do that on a voting validator.
+
+**Own-vote retry (Stage 1a, PR #321 review).** A failed durable write leaves the checkpoint
+pending without this node's vote. A repeat report of the same `(H, hash)` therefore retries
+the own vote when it is not yet in the pending checkpoint, always through the durable
+record above (a record for a different hash at `H` is still refused). The driver keeps
+boundaries whose own vote failed for a transient reason (store unavailable) and re-reports
+them on later passes — bounded to 60 attempts, 16 boundaries and a 256-block horizon, on a
+separate canonical walk after the pass's new boundaries — until the vote is cast, refused
+permanently, or the checkpoint is finalized.
+
+**Early-vote admission before the governing snapshot (Stage 1a, PR #321 review).** When the
+snapshot that governs `H` is not on this node yet, an early vote is checked provisionally
+against the latest snapshot the node holds: voters in it use the unverified quota (64),
+everyone else a separate lower-priority quota (32) that cannot displace them. Both are
+re-checked against the governing snapshot when it appears. Buffer eviction ties break by
+arrival order, never by key bytes.
+
 ### 4.4 Aggregation & finalization
 Inbound votes are already handled (`main.rs:3328` → `submit_vote`). On reaching quorum,
 `finalize_checkpoint` marks the checkpoint finalized, persists it, and advances
