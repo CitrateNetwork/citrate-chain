@@ -358,7 +358,7 @@ At the cutover, the rows below replace the matching r1005 rows and this contract
 | Chain id | 40204 (`0x9d0c`), unchanged. The chain id alone can't tell r1006 from r1005; the genesis hash check (§6) does |
 | Genesis hash (§6.2) | `TBD-at-genesis(r1006.genesis_hash)` |
 | Canonical checkpoints (§6.3) | None at first. The r1005 checkpoints at 365,784 and 365,785 don't apply to r1006 |
-| Block 0 | The library contract set, deployed and configured in the genesis state (built from a tested ceremony run), plus a commemorative `OrangeSeed` proxy at `0x0000000000000000000000000000C17A7E5EED`, upgradeable only through the GOVERNANCE timelock |
+| Block 0 | The library contract set, deployed and configured in the genesis state (built from a tested ceremony run), plus a commemorative `OrangeSeed` proxy at `0x000000000000000000000000000000C17A7E5EED`, upgradeable only through the GOVERNANCE timelock |
 | LiquidStakingPool (§4) | Not part of r1006 |
 | Block production (§4) | Seven producers on separate hosts in seven regions, all run by Citrate Inc. That is one operator, so it doesn't meet the betanet bar of separate operators (C3) |
 | Hardening | Every new consensus and execution rule is active from height 0 |
