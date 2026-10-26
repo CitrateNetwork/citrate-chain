@@ -41,6 +41,7 @@ done
 if [[ "$cmd" != _inner ]]; then
   for f in "$NODE" "$DEVNODE"; do [[ -x "$f" ]] || die "not executable: $f"; done
   [[ -f "$WORK/dump.json" && -d "$WORK/devnet-data" && -f "$ALLOC" && -d "$REPO/contracts" ]] || die "missing inputs"
+  export FOUNDRY_SOLC="${FOUNDRY_SOLC:-$HOME/.svm/0.8.36/solc-0.8.36}" # HOME is replaced inside
   V=$(mktemp -d "${TMPDIR:-/tmp}/r1006-verify.XXXXXX")
   cp -a "$WORK/devnet-data" "$V/devnet-data"
   rc=0
@@ -117,7 +118,7 @@ echo "R1006_BLOCK0=$G" >"$V/result.env"
 python3 "$HERE/compare_rpc.py" --alloc "$ALLOC" --dump "$WORK/dump.json" --devnet "$DEV" --r1006 "$R06" | tee "$V/compare.log"
 
 if [[ -s "$WORK/KEEP_LIST.r1006.tsv" ]]; then
-  (cd "$REPO" && RPC="$R06" bash scripts/genesis/keep_check.sh verify "$WORK/KEEP_LIST.r1006.tsv") 2>&1 | tee "$V/keep.log" | tail -3
+  RPC="$R06" bash "$HERE/../keep_check.sh" verify "$WORK/KEEP_LIST.r1006.tsv" 2>&1 | tee "$V/keep.log" | tail -3
   grep -q 'KEEP gate PASS' "$V/keep.log" || die "keep_check verify failed against the r1006 node (see $V/keep.log)"
 else
   die "no KEEP list from the ceremony devnet"

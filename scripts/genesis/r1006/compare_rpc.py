@@ -15,22 +15,28 @@ import sys
 import urllib.request
 
 
-def rpc_batch(url, calls):
-    out = []
-    for i in range(0, len(calls), 200):
-        chunk = calls[i:i + 200]
-        body = json.dumps([{"jsonrpc": "2.0", "id": j, "method": m, "params": p} for j, (m, p) in enumerate(chunk)]).encode()
+def rpc_one(url, method, params):
+    """One call, retried: the node's RPC rate limiter may answer a burst with an error."""
+    import time
+    last = None
+    for attempt in range(30):
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
         req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-        res = json.load(urllib.request.urlopen(req, timeout=60))
-        if isinstance(res, dict):
-            res = [res]
-        by_id = {r["id"]: r for r in res}
-        for j in range(len(chunk)):
-            r = by_id.get(j, {})
-            if "error" in r or "result" not in r:
-                raise SystemExit(f"compare_rpc: {url} {chunk[j][0]} {chunk[j][1]}: {r.get('error')}")
-            out.append(r["result"])
-    return out
+        try:
+            r = json.load(urllib.request.urlopen(req, timeout=60))
+        except Exception as e:  # noqa: BLE001 - retried, then reported
+            last = repr(e)
+            time.sleep(0.2 * (attempt + 1))
+            continue
+        if isinstance(r, dict) and "result" in r and "error" not in r:
+            return r["result"]
+        last = r
+        time.sleep(0.2 * (attempt + 1))
+    raise SystemExit(f"compare_rpc: {url} {method} {params}: {last}")
+
+
+def rpc_batch(url, calls):
+    return [rpc_one(url, m, p) for m, p in calls]
 
 
 def q(v):
@@ -48,10 +54,13 @@ def main():
     dump = {x["address"].lower(): x for x in json.load(open(a.dump))["accounts"]}
     bad = []
     addrs = [x["address"] for x in alloc]
-    for node in ("devnet", "r1006"):
+    # Accounts the builder adds beside the ceremony state (OrangeSeed) are not on the devnet:
+    # they are checked against the alloc on the r1006 node only.
+    on_devnet = [x for x in alloc if x["address"] in dump]
+    for node, accts in (("devnet", on_devnet), ("r1006", alloc)):
         url = getattr(a, node)
-        codes = rpc_batch(url, [("eth_getCode", [ad, "latest"]) for ad in addrs])
-        for x, c in zip(alloc, codes):
+        codes = rpc_batch(url, [("eth_getCode", [x["address"], "latest"]) for x in accts])
+        for x, c in zip(accts, codes):
             if c.lower() != x.get("code", "0x"):
                 bad.append(f"{node} {x['address']}: code {len(c) // 2 - 1} bytes, alloc {len(x.get('code', '0x')) // 2 - 1}")
     bals = rpc_batch(a.r1006, [("eth_getBalance", [ad, "latest"]) for ad in addrs])
@@ -67,8 +76,9 @@ def main():
         keys = set((d.get("storage") or {}).keys()) | set((x.get("storage") or {}).keys())
         slots += [(x["address"], k, (x.get("storage") or {}).get(k, "0x" + "0" * 64)) for k in sorted(keys)]
     for node in ("devnet", "r1006"):
-        vals = rpc_batch(getattr(a, node), [("eth_getStorageAt", [ad, k, "latest"]) for ad, k, _ in slots])
-        for (ad, k, want), got in zip(slots, vals):
+        sl = [x for x in slots if node == "r1006" or x[0] in dump]
+        vals = rpc_batch(getattr(a, node), [("eth_getStorageAt", [ad, k, "latest"]) for ad, k, _ in sl])
+        for (ad, k, want), got in zip(sl, vals):
             if q(got) != q(want):
                 bad.append(f"{node} {ad} slot {k}: {got}, alloc {want}")
     n_code = sum(1 for x in alloc if x.get("code"))
@@ -76,8 +86,9 @@ def main():
         print("\n".join(bad[:200]))
         print(f"compare_rpc: FAIL, {len(bad)} mismatch(es)")
         sys.exit(1)
-    print(f"compare_rpc: PASS: {len(alloc)} accounts ({n_code} with code) and {len(slots)} storage slots "
-          f"identical on the devnet and the r1006 node; balances and nonces equal the alloc")
+    print(f"compare_rpc: PASS: {len(alloc)} accounts ({n_code} with code) and {len(slots)} storage slots; "
+          f"{len(on_devnet)} ceremony accounts identical on the devnet and the r1006 node, "
+          f"{len(alloc) - len(on_devnet)} builder-added (OrangeSeed) equal to the alloc; balances and nonces equal the alloc")
 
 
 if __name__ == "__main__":
