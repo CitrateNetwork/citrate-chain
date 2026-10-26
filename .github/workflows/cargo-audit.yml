@@ -73,11 +73,12 @@ jobs:
         #   lockfile. Low severity (flag-only correctness edge). Remove when
         #   alloy-primitives moves to a ruint >= 1.20 line.
         #
-        # RUSTSEC-2026-0387 (EXPIRES 2026-11-09; see audit.toml):
-        #   crypto-bigint < 0.7.6 timing variability. 0.5.5 comes in only
-        #   through elliptic-curve 0.13 (k256 / p256 0.13); no 0.13.x curve
-        #   release takes crypto-bigint 0.7. The guard step below fails if
-        #   another crate pulls it, if it leaves the lock, or after expiry.
+        # RUSTSEC-2026-0387 (crypto-bigint < 0.7.6): multiple timing
+        #   variability issues in operations intended to be constant-time.
+        #   EXPIRES 2026-11-09. elliptic-curve 0.13 requires crypto-bigint
+        #   ^0.5; the fix is in the 0.14 curve line, held back upstream
+        #   (revm-precompile, openmls_rust_crypto and bip32 still require the
+        #   0.13 line). Guard: the step above, scripts/ci/check_crypto_bigint_users.py.
         run: |
           cargo audit \
             --color always \

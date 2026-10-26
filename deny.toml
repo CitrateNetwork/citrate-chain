@@ -126,10 +126,11 @@ ignore = [
     # (RUSTSEC-2026-0258) was PATCHED via a Cargo.lock bump to h2 0.4.16
     # rather than ignored.
     "RUSTSEC-2026-0253",
-    # crypto-bigint < 0.7.6 timing variability (RUSTSEC-2026-0387). EXPIRES
-    # 2026-11-09. 0.5.5 comes in only through elliptic-curve 0.13 (k256 / p256
-    # 0.13); no 0.13.x curve release takes crypto-bigint 0.7, so the lock cannot
-    # move it. Guarded by scripts/ci/check_crypto_bigint_users.py. See audit.toml.
+    # RUSTSEC-2026-0387 — crypto-bigint < 0.7.6: multiple timing variability
+    # issues in operations intended to be constant-time. EXPIRES 2026-11-09.
+    # elliptic-curve 0.13 requires crypto-bigint ^0.5; the fix is in the 0.14
+    # curve line, held back upstream (revm-precompile, openmls_rust_crypto and
+    # bip32 still require the 0.13 line). Guard: scripts/ci/check_crypto_bigint_users.py.
     "RUSTSEC-2026-0387",
 ]
 
