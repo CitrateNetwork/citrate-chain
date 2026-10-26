@@ -147,5 +147,88 @@ class TripwireTest(unittest.TestCase):
         self.assertEqual(run("bogus").returncode, 2)
 
 
+GOOD_UFW = """Status: active
+Logging: on (low)
+Default: deny (incoming), allow (outgoing), disabled (routed)
+New profiles: skip
+
+To                         Action      From
+--                         ------      ----
+22/tcp                     ALLOW IN    Anywhere
+30303/tcp                  ALLOW IN    Anywhere
+30303/udp                  ALLOW IN    Anywhere
+22/tcp (v6)                ALLOW IN    Anywhere (v6)
+30303/tcp (v6)             ALLOW IN    Anywhere (v6)
+30303/udp (v6)             ALLOW IN    Anywhere (v6)
+"""
+
+
+class FirewallTest(unittest.TestCase):
+    def verdict(self, text: str) -> subprocess.CompletedProcess[str]:
+        e = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": tempfile.gettempdir()}
+        return subprocess.run(["bash", str(SCRIPT), "check-ufw-status"], input=text,
+                              capture_output=True, text=True, env=e, timeout=30)
+
+    def test_runbook_policy_passes(self) -> None:
+        r = self.verdict(GOOD_UFW)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_policy_violations_fail(self) -> None:  # negative controls
+        bad = {
+            "inactive": GOOD_UFW.replace("Status: active", "Status: inactive"),
+            "allow incoming": GOOD_UFW.replace("deny (incoming)", "allow (incoming)"),
+            "deny outgoing": GOOD_UFW.replace("allow (outgoing)", "deny (outgoing)"),
+            "no ssh": GOOD_UFW.replace("22/tcp                     ALLOW IN    Anywhere\n", ""),
+            "no p2p udp": GOOD_UFW.replace("30303/udp                  ALLOW IN    Anywhere\n", ""),
+            "rpc open": GOOD_UFW + "8545/tcp                   ALLOW IN    Anywhere\n",
+            "metrics open": GOOD_UFW + "9090                       ALLOW IN    Anywhere\n",
+            "extra port": GOOD_UFW + "80/tcp                     ALLOW IN    Anywhere\n",
+            "empty": "",
+        }
+        for name, text in bad.items():
+            r = self.verdict(text)
+            self.assertEqual(r.returncode, 1, f"{name}: {r.stdout}{r.stderr}")
+
+    def apply_firewall_body(self) -> list[str]:
+        src = SCRIPT.read_text()
+        m = re.search(r"^apply_firewall\(\) \{\n(.*?)^\}", src, re.S | re.M)
+        self.assertIsNotNone(m, "apply_firewall() not found")
+        assert m
+        return [l.strip() for l in m.group(1).splitlines() if l.strip() and not l.strip().startswith("#")]
+
+    @staticmethod
+    def allow_before_enable(lines: list[str]) -> bool:
+        def first(pat: str) -> int:
+            return next((i for i, l in enumerate(lines) if re.search(pat, l)), -1)
+        enable = first(r"\bufw\b.*\benable\b")
+        ssh = first(r"\bufw\b.*\ballow 22/tcp\b")
+        return enable >= 0 and 0 <= ssh < enable
+
+    def test_ssh_allowed_before_enable(self) -> None:
+        lines = self.apply_firewall_body()
+        self.assertTrue(self.allow_before_enable(lines), "ufw allow 22/tcp must come before ufw enable")
+        for rule in ("allow 22/tcp", "allow 30303/tcp", "allow 30303/udp", "default deny incoming",
+                     "default allow outgoing"):
+            self.assertTrue(any(f"ufw {rule}" in l for l in lines), rule)
+
+    def test_order_check_detects_enable_first(self) -> None:  # negative control
+        self.assertFalse(self.allow_before_enable(["ufw --force enable", "ufw allow 22/tcp"]))
+        self.assertFalse(self.allow_before_enable(["ufw allow 30303/tcp", "ufw --force enable"]))
+        self.assertTrue(self.allow_before_enable(["ufw allow 22/tcp", "ufw --force enable"]))
+
+
+class LayoutTest(unittest.TestCase):
+    def test_single_layout_no_opt_citrate_dirs_created(self) -> None:
+        src = SCRIPT.read_text()
+        self.assertNotRegex(src, r"install -d[^\n]*/opt/citrate")
+        self.assertNotRegex(src, r"mkdir[^\n]*/opt/citrate")
+
+    def test_legacy_cleanup_only_rmdir(self) -> None:
+        src = SCRIPT.read_text()
+        self.assertRegex(src, r"rmdir[^\n]*/opt/citrate")
+        # Nothing in the script deletes recursively or by glob.
+        self.assertEqual([l for l in src.splitlines() if re.search(r"\brm\s+-[a-zA-Z]*r", l)], [])
+
+
 if __name__ == "__main__":
     unittest.main()
