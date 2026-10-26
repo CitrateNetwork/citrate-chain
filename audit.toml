@@ -79,6 +79,26 @@ ignore = [
     # compatibility decision needing ZK-engineering review.
     # See: per-repo/citrate-chain/F-08_FP_CHECK.md
     "RUSTSEC-2025-0055",
+
+    # ─────────────────────────────────────────────────────────────────
+    # crypto-bigint < 0.7.6 (time-boxed) — EXPIRES 2026-11-09
+    # ─────────────────────────────────────────────────────────────────
+    # RUSTSEC-2026-0387 — operations meant to be constant-time could
+    # branch, depending on compiler and target (subtraction, zero
+    # counting, division, Montgomery multiplication; UintRef equality;
+    # BoxedMontyForm::invert). Patched only in 0.7.6.
+    # Path: crypto-bigint 0.5.5 <- elliptic-curve 0.13.8 <- k256 0.13.4
+    # (wallet-core, execution, node, revm-precompile 8, bip32 0.5) and
+    # p256 0.13.2 (consensus ECVRF). No 0.13.x curve release accepts
+    # crypto-bigint 0.7; the fix is the k256 / p256 0.14 line, which
+    # revm-precompile has not adopted (43.0.3 still requires k256 ^0.13).
+    # Not a lockfile change. UintRef, BoxedMontyForm and the 0.7
+    # borrowing_sub are not in 0.5.x; the 0.13 curve crates use only
+    # 0.5.x's fixed-width add/sub/compare/select on U256.
+    # Guard: scripts/ci/check_crypto_bigint_users.py fails if any crate
+    # other than elliptic-curve 0.13 pulls a crypto-bigint < 0.7.6, if
+    # none is left in Cargo.lock (stale ignore), or after the expiry.
+    "RUSTSEC-2026-0387",
 ]
 
 # ─── Unmaintained-warning ignores (REM-21 hygiene) ─────────────────
