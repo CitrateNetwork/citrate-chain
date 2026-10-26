@@ -74,10 +74,7 @@ impl EcvrfProof {
         let (c_bytes, s_bytes) = rest.split_at_checked(16).ok_or_else(bad_len)?;
         let pk_p256 = pk_part.to_vec();
 
-        let encoded_point =
-            EncodedPoint::from_bytes(gamma_bytes).map_err(|_| EcvrfError::InvalidPoint)?;
-        let gamma_opt: Option<AffinePoint> = AffinePoint::from_encoded_point(&encoded_point).into();
-        let gamma = gamma_opt.ok_or(EcvrfError::InvalidPoint)?;
+        let gamma = decode_point(gamma_bytes)?;
 
         let mut c = [0u8; C_LEN];
         c.copy_from_slice(c_bytes);
@@ -93,6 +90,43 @@ impl EcvrfProof {
             s,
         })
     }
+
+    /// Decode a proof whose curve points are in canonical form (RFC 9381
+    /// §5.5 `string_to_point` for P-256): both the key and Gamma must be the
+    /// exact SEC1 compressed bytes the point re-encodes to, tag 0x02/0x03.
+    /// Any other 33-byte SEC1 form of a point is rejected with
+    /// [`EcvrfError::NonCanonicalEncoding`], so one proof has one byte string.
+    ///
+    /// [`Self::to_bytes`] always emits this form, so every proof made by
+    /// [`prove`] decodes here. Consensus applies this decoder from the
+    /// `vrf_encoding` activation height; below it, [`Self::from_bytes`].
+    pub fn from_bytes_canonical(bytes: &[u8]) -> Result<Self, EcvrfError> {
+        let proof = Self::from_bytes(bytes)?;
+        let pk = decode_point(&proof.pk_p256)?;
+        if !is_canonical_compressed(&pk, &proof.pk_p256) {
+            return Err(EcvrfError::NonCanonicalEncoding);
+        }
+        let gamma_bytes = bytes
+            .get(33..66)
+            .ok_or(EcvrfError::InvalidProofLength(bytes.len()))?;
+        if !is_canonical_compressed(&proof.gamma, gamma_bytes) {
+            return Err(EcvrfError::NonCanonicalEncoding);
+        }
+        Ok(proof)
+    }
+}
+
+/// Decode a 33-byte SEC1 point. Accepts every form the SEC1 decoder accepts;
+/// [`is_canonical_compressed`] narrows that to the one canonical form.
+fn decode_point(bytes: &[u8]) -> Result<AffinePoint, EcvrfError> {
+    let encoded = EncodedPoint::from_bytes(bytes).map_err(|_| EcvrfError::InvalidPoint)?;
+    let point: Option<AffinePoint> = AffinePoint::from_encoded_point(&encoded).into();
+    point.ok_or(EcvrfError::InvalidPoint)
+}
+
+/// Whether `bytes` are exactly the SEC1 compressed encoding of `point`.
+fn is_canonical_compressed(point: &AffinePoint, bytes: &[u8]) -> bool {
+    point.to_encoded_point(true).as_bytes() == bytes
 }
 
 /// ECVRF errors.
@@ -112,6 +146,9 @@ pub enum EcvrfError {
 
     #[error("invalid secret key")]
     InvalidSecretKey,
+
+    #[error("curve point not in canonical compressed form")]
+    NonCanonicalEncoding,
 }
 
 /// Derive a P-256 scalar from 32 bytes of key material.
@@ -353,11 +390,7 @@ pub fn verify(alpha: &[u8], proof: &EcvrfProof) -> Result<[u8; 32], EcvrfError> 
     let pk_bytes_33 = &proof.pk_p256;
 
     // Decode public key
-    let encoded_point =
-        EncodedPoint::from_bytes(pk_bytes_33).map_err(|_| EcvrfError::InvalidPoint)?;
-    let pk_opt: Option<AffinePoint> = AffinePoint::from_encoded_point(&encoded_point).into();
-    let pk_affine = pk_opt.ok_or(EcvrfError::InvalidPoint)?;
-    let pk_proj = ProjectivePoint::from(pk_affine);
+    let pk_proj = ProjectivePoint::from(decode_point(pk_bytes_33)?);
 
     // Step 1: Hash to curve
     let h = hash_to_try_and_increment(pk_bytes_33, alpha)?;
@@ -398,6 +431,99 @@ pub fn derive_public_key(secret: &[u8; 32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Prove over an explicit key byte string (the prover's steps with the
+    /// key encoding chosen by the caller), for decoder tests.
+    fn prove_with_key_bytes(secret: &[u8; 32], pk_bytes: &[u8], alpha: &[u8]) -> EcvrfProof {
+        let sk = secret_to_scalar(secret);
+        let h = hash_to_try_and_increment(pk_bytes, alpha).expect("hash to curve");
+        let gamma = h * sk;
+        let k = nonce_generation(&sk, &h);
+        let c = hash_points(&[h, gamma, ProjectivePoint::GENERATOR * k, h * k]);
+        let s = k + challenge_to_scalar(&c) * sk;
+        EcvrfProof {
+            pk_p256: pk_bytes.to_vec(),
+            gamma: gamma.to_affine(),
+            c,
+            s,
+        }
+    }
+
+    /// The key carried in the proof is part of the hashed input, so a second
+    /// byte string for the same key yields a second, different VRF output
+    /// for one (key, alpha). The canonical decoder admits one key encoding.
+    #[test]
+    fn canonical_decoder_refuses_a_compact_key_encoding() {
+        let alpha = b"key encoding";
+        for i in 0u8..=255 {
+            let secret = [i; 32];
+            let canonical = derive_public_key(&secret);
+            let mut compact = canonical.clone();
+            compact[0] = 0x05;
+            let same_point = decode_point(&compact)
+                .ok()
+                .zip(decode_point(&canonical).ok())
+                .is_some_and(|(a, b)| a == b);
+            if !same_point {
+                continue;
+            }
+            let honest = prove_with_key_bytes(&secret, &canonical, alpha);
+            let twin = prove_with_key_bytes(&secret, &compact, alpha);
+            let beta_honest = verify(alpha, &honest).expect("honest verifies");
+            let decoded_twin = EcvrfProof::from_bytes(&twin.to_bytes()).expect("lenient decode");
+            let beta_twin = verify(alpha, &decoded_twin).expect("previous decoder accepts");
+            assert_ne!(beta_honest, beta_twin, "two outputs for one key and alpha");
+
+            assert!(EcvrfProof::from_bytes_canonical(&honest.to_bytes()).is_ok());
+            assert!(matches!(
+                EcvrfProof::from_bytes_canonical(&twin.to_bytes()),
+                Err(EcvrfError::NonCanonicalEncoding)
+            ));
+            return;
+        }
+        panic!("no secret in 0..=255 gave a compact key twin");
+    }
+
+    /// Point decode sites in the non-test part of `src` that are not one of
+    /// the allowed helpers. Every point taken from proof bytes must go
+    /// through `decode_point` so the canonical check covers it.
+    fn point_decode_sites_outside_helpers(src: &str) -> Vec<String> {
+        const ALLOWED: [&str; 2] = ["decode_point", "hash_to_try_and_increment"];
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let mut current_fn = String::new();
+        let mut out = Vec::new();
+        for line in prod.lines() {
+            let t = line.trim_start();
+            if t.starts_with("//") {
+                continue;
+            }
+            if let Some(rest) = t.strip_prefix("pub fn ").or_else(|| t.strip_prefix("fn ")) {
+                current_fn = rest.split('(').next().unwrap_or("").to_string();
+            }
+            if t.contains("from_encoded_point(") && !ALLOWED.contains(&current_fn.as_str()) {
+                out.push(format!("{current_fn}: {t}"));
+            }
+        }
+        out
+    }
+
+    /// Tripwire: no curve point is decoded outside the shared helper.
+    #[test]
+    fn point_decoding_goes_through_the_shared_helper() {
+        let sites = point_decode_sites_outside_helpers(include_str!("ecvrf.rs"));
+        assert!(sites.is_empty(), "inline point decode: {sites:?}");
+    }
+
+    /// Negative control: the scan flags an inline decode inside a decoder.
+    #[test]
+    fn point_decode_scan_flags_an_inline_decode() {
+        let inline = "impl EcvrfProof {\n    pub fn from_bytes(bytes: &[u8]) -> R {\n        \
+                      let p = AffinePoint::from_encoded_point(&e);\n    }\n}\n";
+        assert_eq!(point_decode_sites_outside_helpers(inline).len(), 1);
+        let helper =
+            "fn decode_point(b: &[u8]) -> R {\n    AffinePoint::from_encoded_point(&e)\n}\n";
+        assert!(point_decode_sites_outside_helpers(helper).is_empty());
+    }
 
     /// Soundness: a proof for a key must be impossible to build WITHOUT its secret.
     ///

@@ -62,6 +62,11 @@ pub struct ConsensusManifest {
     /// is stored in the legacy padded form). Part of the fingerprint only when
     /// set, so an unscheduled rule leaves the pre-image exactly as it was.
     pub exact_create_code_height: Option<u64>,
+    /// The canonical ECVRF proof encoding height this process resolved
+    /// (`citrate_consensus::vrf_encoding`; `None` = not activated). Part of
+    /// the fingerprint only when set, so an unscheduled rule leaves the
+    /// pre-image exactly as it was.
+    pub vrf_canonical_encoding_height: Option<u64>,
     /// Execution/consensus rules that switch on by height, as this process
     /// resolved them (compiled default or devnet env override). A node whose
     /// env overrides one of these computes different roots, so they are in the
@@ -100,7 +105,8 @@ impl ConsensusManifest {
     }
 
     /// The manifest under explicit PBA and agent-fork activation heights (the
-    /// exact-created-code height is read from the process store).
+    /// exact-created-code and canonical VRF encoding heights are read from
+    /// the process stores).
     pub fn for_heights(
         pba_hardening_height: Option<u64>,
         agent_precompiles_height: Option<u64>,
@@ -113,11 +119,27 @@ impl ConsensusManifest {
     }
 
     /// The manifest under explicit PBA, agent-fork and exact-created-code
-    /// activation heights.
+    /// activation heights (the canonical VRF encoding height is read from the
+    /// process store).
     pub fn for_activations(
         pba_hardening_height: Option<u64>,
         agent_precompiles_height: Option<u64>,
         exact_create_code_height: Option<u64>,
+    ) -> Self {
+        Self::for_all_heights(
+            pba_hardening_height,
+            agent_precompiles_height,
+            exact_create_code_height,
+            citrate_consensus::vrf_encoding::vrf_canonical_encoding_height(),
+        )
+    }
+
+    /// The manifest under every explicit activation height.
+    pub fn for_all_heights(
+        pba_hardening_height: Option<u64>,
+        agent_precompiles_height: Option<u64>,
+        exact_create_code_height: Option<u64>,
+        vrf_canonical_encoding_height: Option<u64>,
     ) -> Self {
         let version = env!("CARGO_PKG_VERSION");
         let git_sha = env!("CITRATE_GIT_SHA");
@@ -169,9 +191,14 @@ impl ConsensusManifest {
             Some(h) => format!("{preimage}agent_precompiles_height={h}\n"),
             None => preimage,
         };
-        // Likewise appended only when scheduled.
+        // Likewise appended only when scheduled. The order of these optional
+        // lines is part of the fingerprint and must stay fixed.
         let preimage = match exact_create_code_height {
             Some(h) => format!("{preimage}exact_create_code_height={h}\n"),
+            None => preimage,
+        };
+        let preimage = match vrf_canonical_encoding_height {
+            Some(h) => format!("{preimage}vrf_canonical_encoding_height={h}\n"),
             None => preimage,
         };
         let digest = Sha256::digest(preimage.as_bytes());
@@ -188,6 +215,7 @@ impl ConsensusManifest {
             pba_hardening_height,
             agent_precompiles_height,
             exact_create_code_height,
+            vrf_canonical_encoding_height,
             value_transfer_activation_height,
             create_nonce_fix_activation_height,
             merge_depth_activation_height,
@@ -230,6 +258,12 @@ impl ConsensusManifest {
             self.exact_create_code_height
                 .map(|h| format!("from height {h}"))
                 .unwrap_or_else(|| "not activated (legacy padded form)".to_string())
+        );
+        println!(
+            "  vrf encoding       {}",
+            self.vrf_canonical_encoding_height
+                .map(|h| format!("canonical from height {h}"))
+                .unwrap_or_else(|| "not scheduled".to_string())
         );
         println!(
             "  value transfer     from height {}",
@@ -325,9 +359,9 @@ mod tests {
     /// as before; a scheduled one is part of it.
     #[test]
     fn exact_create_code_height_enters_the_fingerprint_only_when_set() {
-        let unset = ConsensusManifest::for_activations(Some(10), None, None);
-        let a = ConsensusManifest::for_activations(Some(10), None, Some(0));
-        let b = ConsensusManifest::for_activations(Some(10), None, Some(1));
+        let unset = ConsensusManifest::for_all_heights(Some(10), None, None, None);
+        let a = ConsensusManifest::for_all_heights(Some(10), None, Some(0), None);
+        let b = ConsensusManifest::for_all_heights(Some(10), None, Some(1), None);
         assert_eq!(a.exact_create_code_height, Some(0));
         assert_ne!(a.fingerprint, unset.fingerprint);
         assert_ne!(a.fingerprint, b.fingerprint);
@@ -335,6 +369,23 @@ mod tests {
             unset.fingerprint,
             ConsensusManifest::for_heights(Some(10), None).fingerprint,
             "unset: byte-identical to the two-height form"
+        );
+    }
+
+    /// An unscheduled canonical VRF encoding rule leaves the fingerprint
+    /// exactly as before; a scheduled one is part of it.
+    #[test]
+    fn vrf_encoding_height_enters_the_fingerprint_only_when_set() {
+        let unset = ConsensusManifest::for_all_heights(Some(10), None, None, None);
+        let a = ConsensusManifest::for_all_heights(Some(10), None, None, Some(0));
+        let b = ConsensusManifest::for_all_heights(Some(10), None, None, Some(1));
+        assert_eq!(a.vrf_canonical_encoding_height, Some(0));
+        assert_ne!(a.fingerprint, unset.fingerprint);
+        assert_ne!(a.fingerprint, b.fingerprint);
+        assert_eq!(
+            unset.fingerprint,
+            ConsensusManifest::for_heights(Some(10), None).fingerprint,
+            "unset matches the two-height form (process store unset)"
         );
     }
 
