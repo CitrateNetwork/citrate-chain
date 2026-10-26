@@ -331,7 +331,7 @@ impl LegacyFormatPeers {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::admission::{AdmitOutcome, BlockAdmission};
     use crate::canonical_apply::{canonical_reward_config, AppliedTip, CanonicalApplicator};
@@ -388,7 +388,7 @@ mod tests {
 
     /// Seal an empty block on `exec` the way the producer does: block
     /// context, basic reward credits, then the state root.
-    fn produce(
+    pub(crate) fn produce(
         exec: &Executor,
         pba: PbaHardening,
         height: u64,
@@ -418,7 +418,7 @@ mod tests {
         template(pba, height, parent, coinbase, vrf, vec![], root)
     }
 
-    fn genesis() -> Block {
+    pub(crate) fn genesis() -> Block {
         let root = Executor::new(Arc::new(StateDB::new())).calculate_state_root();
         template(
             PbaHardening::off(),
@@ -434,15 +434,15 @@ mod tests {
     /// One node over a data directory, wired as `start_node` wires it:
     /// state loaded from the store, persistent DAG store, GhostDAG as fork
     /// choice, the applier, and the single admission path.
-    struct Node {
-        storage: Arc<StorageManager>,
-        exec: Arc<Executor>,
-        ghostdag: Arc<GhostDag>,
-        app: Arc<CanonicalApplicator>,
+    pub(crate) struct Node {
+        pub(crate) storage: Arc<StorageManager>,
+        pub(crate) exec: Arc<Executor>,
+        pub(crate) ghostdag: Arc<GhostDag>,
+        pub(crate) app: Arc<CanonicalApplicator>,
         adm: BlockAdmission,
     }
 
-    async fn open(path: &Path, pba: PbaHardening, purge: bool) -> (Node, RejoinReport) {
+    pub(crate) async fn open(path: &Path, pba: PbaHardening, purge: bool) -> (Node, RejoinReport) {
         let storage =
             Arc::new(StorageManager::new(path, PruningConfig::default()).expect("storage"));
         let report = if purge {
@@ -504,7 +504,7 @@ mod tests {
     }
 
     impl Node {
-        async fn receive(&self, b: &Block) -> AdmitOutcome {
+        pub(crate) async fn receive(&self, b: &Block) -> AdmitOutcome {
             self.adm.admit(b).await
         }
 
@@ -523,7 +523,7 @@ mod tests {
             }
         }
 
-        async fn tip(&self) -> AppliedTip {
+        pub(crate) async fn tip(&self) -> AppliedTip {
             self.app.applied_tip().await
         }
     }

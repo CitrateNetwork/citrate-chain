@@ -489,6 +489,13 @@ impl CanonicalApplicator {
         }
     }
 
+    /// Whether the applied tip lies on `head`'s selected-parent chain: the node
+    /// is only behind `head`, and the drain reaches it by applying forward.
+    pub async fn applied_tip_is_ancestor_of(&self, head: Hash) -> bool {
+        let tip = self.applied_tip().await;
+        self.head_descends_from(head, tip.hash, tip.height)
+    }
+
     /// The shared state-advance lock (applied tip + reorg snapshot ring). The
     /// producer acquires this across its execute→persist critical section so
     /// production never races the receive path, and records the sealed block via

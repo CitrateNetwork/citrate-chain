@@ -52,7 +52,7 @@ zstd = "0.13"                   # Zstandard compression for IPFS storage
 dirs = "5.0"                    # Platform-specific directories
 flate2 = "1.0"                  # Gzip decompression for tar.gz
 tar = "0.4"                     # Tar archive extraction
-zip = "2.0"                     # ZIP archive extraction (Windows)
+zip = { version = "9", default-features = false, features = ["deflate"] } # ZIP archive extraction (Windows)
 
 [dev-dependencies]
 tempfile = "3.8"
