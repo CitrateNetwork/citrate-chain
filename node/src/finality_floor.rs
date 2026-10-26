@@ -59,10 +59,12 @@
 // floor only followed at the next poll (up to FLOOR_POLL_SECS later), so a reorg
 // in between could revert the just-finalized block. In Enforced mode the
 // verifier is installed as the manager's `FinalizationGuard`
-// ([`FloorVerifier::install_finalization_guard`]), which runs BEFORE the
-// finalization becomes visible (DAG mark, persisted certificate, latest
-// finalized height) and does the same check as the poll under the same locks
-// ([`FloorVerifier::on_finalize`]):
+// ([`FloorVerifier::install_finalization_guard`]), which runs once the
+// certificate is durably written (synced; #362) and BEFORE the finalization
+// becomes visible (DAG mark, latest finalized height), and does the same check
+// as the poll under the same locks ([`FloorVerifier::on_finalize`]). A failed
+// certificate write finalizes nothing and never reaches the guard, so the
+// floor is never raised for a certificate a restart would not find:
 //
 //   * certified block canonical here -> the floor is raised in the advance-lock
 //     critical section that confirmed it (no reorg can slip between);
@@ -75,16 +77,14 @@
 // block or the gadget is halted (proposes / signs nothing).
 //
 // PUBLICATION AFTER PERSISTENCE (review of #335 @ db243a1). The guard raises
-// the floor but never PUBLISHES: it runs before the certificate is persisted,
-// and the floor is in memory only, so a block reported finalized there and then
-// lost to a crash before persistence could be reorged out after the restart.
-// The finalized/safe RPC pair (and the verified-height metric) advance only in
-// [`FloorVerifier::after_finalize`] — once the manager has written the
-// certificate, with the same (height, hash) re-confirmed under the advance
-// lock and no safety stop in force — or from the poll; and every publication
-// path first requires the exact certificate to be in the persistent store
-// (`CheckpointManager::is_certificate_persisted`), so a failed write is never
-// published either. In both non-matching
+// the floor but never PUBLISHES: the finalization is not visible yet when it
+// runs. The finalized/safe RPC pair (and the verified-height metric) advance
+// only in [`FloorVerifier::after_finalize`] — once the finalization is
+// visible, with the same (height, hash) re-confirmed under the advance lock and
+// no safety stop in force — or from the poll; and every publication path first
+// requires the exact certificate to be in the persistent store
+// (`CheckpointManager::is_certificate_persisted`), so an unpersisted
+// certificate is never published, whoever calls the hooks. In both non-matching
 // cases the pair is also registered with the applicator
 // (`CanonicalApplicator::register_certified`): every later reorg re-checks it
 // under the advance lock and raises the floor first if the certified block has
@@ -620,11 +620,13 @@ impl FloorVerifier {
     }
 
     /// The finalization-time check (Enforced; module docs, "FLOOR AT
-    /// FINALIZATION"). Runs from `CheckpointManager::finalize_checkpoint` before
-    /// the certificate is persisted or the latest finalized height moves. Same
+    /// FINALIZATION"). Runs from `CheckpointManager::finalize_checkpoint` once
+    /// the certificate is durably written and before the latest finalized
+    /// height moves (never for a certificate whose write failed). Same
     /// verification as [`Self::tick`]'s main path, under the same verifier
     /// state lock and advance lock, but it raises the floor WITHOUT publishing:
-    /// the RPC tags advance only after persistence ([`Self::after_finalize`]).
+    /// the RPC tags advance only once the finalization is visible
+    /// ([`Self::after_finalize`]).
     /// Returns `None` outside Enforced mode.
     pub async fn on_finalize(&self, cert: &Checkpoint) -> Option<FloorTick> {
         if !self.mode.raises_floor() {
@@ -655,7 +657,7 @@ impl FloorVerifier {
                     // until the poll clears it.
                     return Some(self.still_halted(&st).await);
                 }
-                // Not published here: the certificate is not persisted yet.
+                // Not published here: the finalization is not visible yet.
                 self.publish(false);
                 info!(
                     "checkpoint finality: finalized block {} @ {} is canonical on this node; \
@@ -694,7 +696,7 @@ impl FloorVerifier {
 
     /// Publication after finalization (Enforced; module docs, "PUBLICATION
     /// AFTER PERSISTENCE"). Runs from `CheckpointManager::finalize_checkpoint`
-    /// once the certificate write has been attempted and the finalization is
+    /// once the certificate is durably written and the finalization is
     /// visible. Publishes `cert`'s exact (height, hash) only if no safety stop
     /// is in force, the certificate still verifies, the pair is confirmed
     /// canonical with the floor at or above it under the advance lock (the
