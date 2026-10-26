@@ -22,6 +22,10 @@
 #           overflow FLAG (shifted values correct). Patched >= 1.20.0, not
 #           bumpable while alloy-primitives 0.7.7 pins ruint ^1.12. Premise
 #           fenced by scripts/ci/ruint_shift_advisory_premise_tripwire.sh.
+#   RUSTSEC-2026-0387  crypto-bigint < 0.7.6 timing variability, reached only
+#           through elliptic-curve 0.13 (no 0.13.x accepts crypto-bigint 0.7).
+#           Guard: scripts/ci/check_crypto_bigint_users.py (blocking step in
+#           cargo-audit.yml and security-audit.yml).
 #
 # Usage: audit_all_lockfiles.sh              # audit every tracked Cargo.lock
 #        audit_all_lockfiles.sh --self-test  # prove the gate still flags a
@@ -36,6 +40,7 @@ IGNORES=(
   RUSTSEC-2025-0137
   RUSTSEC-2025-0055
   RUSTSEC-2026-0220
+  RUSTSEC-2026-0387
 )
 
 if ! command -v cargo-audit >/dev/null 2>&1; then

@@ -9,9 +9,10 @@ name: cargo audit (tripwire)
 # Failure policy:
 #   * `cargo audit` fails on any unallowed advisory.
 #   * Known-deferred advisories listed in `audit.toml` with REM
-#     tracker references; actual ignores are passed inline below
-#     (cargo-audit reads only ~/.cargo/audit.toml, not project-local).
-#   * Adding a new --ignore here requires a deliberate PR that
+#     tracker references; the actual ignore list (with expiries) lives
+#     in scripts/ci/audit_all_lockfiles.sh (cargo-audit reads only
+#     ~/.cargo/audit.toml, not project-local).
+#   * Adding an ignore there requires a deliberate PR that
 #     points at an open REM tracker.
 
 on:
@@ -46,15 +47,25 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
+      - name: RUSTSEC-2026-0387 ignore guard (blocking)
+        # Fails when the reason for the 0387 ignore stops being true (a new
+        # crypto-bigint < 0.7.6 user, a stale ignore, or the expiry passing).
+        run: |
+          python3 scripts/ci/check_crypto_bigint_users.py --self-test
+          python3 scripts/ci/check_crypto_bigint_users.py
+
       - name: Lockfile audit self-test (negative + positive control)
         # Proves the gate still flags a lockfile pinned to a vulnerable
-        # version and passes the patched one. A blind audit is worse than none.
+        # version, passes the patched one, and fails on an expired ignore.
+        # A blind audit is worse than none.
         run: scripts/ci/audit_all_lockfiles.sh --self-test
 
       - name: Run cargo audit on every tracked Cargo.lock
-        # Audits the root lockfile AND every sub-lockfile (fuzz/, tests/load/,
-        # tools/citrate-bench/, core/federated/, standalone crates), enumerated
-        # from `git ls-files '*Cargo.lock'`. The accepted-advisory ignore list
-        # and its REM trackers live in that script (single source of truth),
-        # documented for assessors in audit.toml. Failure is the tripwire.
+        # The only cargo-audit invocation in CI. Audits the root lockfile AND
+        # every sub-lockfile (fuzz/, tests/load/, tools/citrate-bench/,
+        # core/federated/, standalone crates), enumerated from
+        # `git ls-files '*Cargo.lock'`. The accepted-advisory ignore list, with
+        # its REM trackers and expiries, lives in that script (single source of
+        # truth) and is documented for assessors in audit.toml. Failure is the
+        # tripwire.
         run: scripts/ci/audit_all_lockfiles.sh
