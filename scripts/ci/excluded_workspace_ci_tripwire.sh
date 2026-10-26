@@ -102,6 +102,58 @@ self_test() {
     echo "self-test: an un-invoked script was accepted as coverage"; rc=1
   fi
 
+  # Mentions that are not a run step do not count: a `paths:` filter entry, a
+  # YAML comment, a commented-out step, a shell comment inside a run block,
+  # and an invocation that only runs the script's own --self-test.
+  printf 'run_one crates/x\nrun_one crates/y\n' > "$tmp/scripts/ci/run.sh"
+  cat > "$tmp/.github/workflows/ci.yml" <<'YAML'
+on:
+  pull_request:
+    paths:
+      - 'scripts/ci/run.sh'
+# scripts/ci/run.sh
+jobs:
+  t:
+    steps:
+      - name: self-test only
+        run: scripts/ci/run.sh --self-test
+      # - run: scripts/ci/run.sh
+      # - run: cargo test --manifest-path crates/x/Cargo.toml --locked
+      - name: shell comment
+        run: |
+          # scripts/ci/run.sh
+          # cargo test --manifest-path crates/x/Cargo.toml
+          echo done
+YAML
+  out="$(scan "$tmp")"
+  if ! grep -q "'crates/x'" <<<"$out" || ! grep -q "'crates/y'" <<<"$out"; then
+    echo "self-test: a non-run mention of a script or --manifest-path was accepted as coverage"; rc=1
+  fi
+
+  # Negative control on the real tree: rust-ci.yml with the step that runs the
+  # commd suites deleted (paths: entries and the --self-test step left in
+  # place) must leave both commd crates uncovered; the unmodified copy passes.
+  local real="$REPO_ROOT"
+  if [ -f "$real/.github/workflows/rust-ci.yml" ] && [ -f "$real/scripts/ci/test_commd_workspaces.sh" ]; then
+    rm -f "$tmp"/.github/workflows/*.yml "$tmp"/scripts/ci/*.sh
+    cp "$real/Cargo.toml" "$tmp/Cargo.toml"
+    cp "$real/scripts/ci/test_commd_workspaces.sh" "$tmp/scripts/ci/"
+    cp "$real/.github/workflows/rust-ci.yml" "$tmp/.github/workflows/"
+    if out="$(scan "$tmp")"; then
+      echo "self-test: the real rust-ci.yml copy was flagged: $out"; rc=1
+    fi
+    perl -0pi -e 's/\n      - name: Test commd fold[^\n]*\n        run: scripts\/ci\/test_commd_workspaces\.sh\n/\n/' \
+      "$tmp/.github/workflows/rust-ci.yml"
+    if grep -q 'Test commd fold' "$tmp/.github/workflows/rust-ci.yml"; then
+      echo "self-test: could not delete the commd run step from the rust-ci.yml copy"; rc=1
+    fi
+    out="$(scan "$tmp")"
+    if ! grep -q "'crates/citrate-commd-fold'" <<<"$out" || ! grep -q "'crates/citrate-commd-verify'" <<<"$out"; then
+      echo "self-test: rust-ci.yml without the commd run step still counted as coverage"; rc=1
+    fi
+    printf '[workspace]\nmembers = ["a"]\nexclude = ["core/federated", "crates/x", "crates/y"]\n' > "$tmp/Cargo.toml"
+  fi
+
   # An unparseable exclude list must fail closed.
   printf '[workspace]\nmembers = ["a"]\n' > "$tmp/Cargo.toml"
   if ! scan "$tmp" >/dev/null; then
