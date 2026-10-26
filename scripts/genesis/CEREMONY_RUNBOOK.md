@@ -186,6 +186,7 @@ A failed phase prints the safe way on. Before a phase has broadcast, that is the
 - **P2 gate failed after the broadcast** (the book does not verify, a fee recipient is wrong, the book cannot be recorded). Fix the cause, then run `--confirm --only P2 --record-stack-book --account <name>`. It sends nothing: it rebuilds the book from this run's broadcasts, runs the P2 gate against the chain and records the book. Then resume with `--from P3`. A plain `--only P2` or `--from P2` is refused while this run's P2 broadcasts exist, and once the book is recorded.
 - **P2 step failed** (`regenesis.sh` stopped). Read `contracts/broadcast/` and the chain first. If every step reached the chain (only the book generation failed), use the record step above. If a step is missing on chain, stop and escalate: the ceremony has no partial-P2 resume.
 - **P1 gate failed after the broadcast.** Fix the cause, then resume with `--from P2`; P2 and every later gate re-verify P1's governance on chain before using it.
+- **P3 or P4 failed after the broadcast** (including its output book not recording). Stop and escalate: read `contracts/broadcast/` and the chain. The output book is recorded only by its own phase, and `--confirm` P5 refuses an unrecorded one, so there is no resume past it.
 - **Any other phase that failed after broadcasting part of its transactions** is never re-run blindly: read `contracts/broadcast/` and the chain first.
 
 ### 6.5 Validators and finality

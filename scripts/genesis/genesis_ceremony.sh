@@ -224,12 +224,10 @@ fi
 should() {
   if [[ -n "$ONLY" ]]; then [[ "$1" == "$ONLY" ]]; else [[ $(idx "$1") -ge $(idx "$FROM") ]]; fi
 }
-next_phase() { echo "${PHASES[$(($(idx "$1") + 1))]:-}"; }
 # after_broadcast <phase>: the safe way on once <phase> has broadcast (C10). Never a re-run of
 # that phase: a broadcast phase is re-entered only through a step that sends nothing.
 after_broadcast() {
-  local acct="${ACCOUNT:+ --account $ACCOUNT}" nx
-  nx=$(next_phase "$1")
+  local acct="${ACCOUNT:+ --account $ACCOUNT}${PASSWORD_FILE:+ --password-file $PASSWORD_FILE}"
   case "$1" in
     P1) err "fix the cause, then resume after P1: $0 --confirm --from P2$acct (P2 and every later gate re-verify P1's governance on chain before using it)" ;;
     P2)
@@ -239,7 +237,9 @@ after_broadcast() {
         err "fix the cause, then record P2's book from this run's broadcasts and the chain (this sends nothing): $0 --confirm --only P2 --record-stack-book$acct; then resume with --from P3"
       fi
       ;;
-    *) err "inspect contracts/broadcast/ and the chain; once $1's output book is in place, resume after it: $0 --confirm --from $nx$acct" ;;
+    # P3/P4 record their output book themselves, and --confirm P5 refuses an unrecorded one, so
+    # there is no safe resume past them without it.
+    *) err "stop and escalate (runbook §6.4): read contracts/broadcast/ and the chain. $1's output book is recorded only by $1, so no later phase can go on without it" ;;
   esac
 }
 gate_fail() {
@@ -257,7 +257,7 @@ step_fail() {
   if [[ "$MODE" == confirm && "$1" == "$SENT_PHASE" ]]; then
     err "$1 may have sent some or all of its transactions: do NOT re-run $1. Inspect contracts/broadcast/ and the chain first (runbook §6.4)"
     if [[ "$1" == P2 ]]; then
-      err "if every regenesis.sh step reached the chain, record the book (this sends nothing): $0 --confirm --only P2 --record-stack-book ${ACCOUNT:+--account $ACCOUNT}"
+      err "if every regenesis.sh step reached the chain, record the book (this sends nothing): $0 --confirm --only P2 --record-stack-book${ACCOUNT:+ --account $ACCOUNT}${PASSWORD_FILE:+ --password-file $PASSWORD_FILE}"
     else
       after_broadcast "$1"
     fi
