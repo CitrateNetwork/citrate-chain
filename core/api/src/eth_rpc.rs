@@ -220,7 +220,12 @@ fn pubkey_hex_opt_to_evm_address(hex_opt: Option<&String>) -> Option<String> {
 /// `extraData` for a block. Block 0 of the r1006 genesis carries its genesis note (the
 /// same text block 0's state holds at `GENESIS_NOTE_ADDRESS`); every other block is `0x`.
 fn block_extra_data(height: u64, hash: &[u8; 32]) -> String {
-    let _ = (height, hash);
+    if height == 0 && *hash == citrate_consensus::hardening::R1006_GENESIS {
+        return format!(
+            "0x{}",
+            hex::encode(citrate_economics::r1006::GENESIS_NOTE.as_bytes())
+        );
+    }
     "0x".to_string()
 }
 
