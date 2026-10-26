@@ -157,6 +157,10 @@ struct ValidatorEntry {
     stake_wei: String,
     /// The staker's liquid balance at genesis (gas), wei.
     liquid_wei: String,
+    /// The proposer key's signature over the registration digest (the proof of key
+    /// control the registry checked when the build registered this producer).
+    #[allow(dead_code)]
+    registration_sig: String,
 }
 
 #[derive(Deserialize)]

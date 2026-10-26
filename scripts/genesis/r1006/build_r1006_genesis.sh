@@ -49,14 +49,13 @@ log() { echo "[r1006 $(date -u +%H:%M:%S)] $*" >&2; }
 
 cmd="${1:-}"; shift || true
 NODE="" DUMP="" WORK="" INPUTS="$HERE/inputs.placeholder.env" REF=HEAD OUT=""
-VALIDATORS="$CHAIN_ROOT/core/economics/assets/r1006/validators.json" ORANGESEED="" ORANGESEED_TREE=""
+ORANGESEED="" ORANGESEED_TREE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --node) NODE="$2"; shift 2 ;;
     --state-dump) DUMP="$2"; shift 2 ;;
     --work) WORK="$2"; shift 2 ;;
     --inputs) INPUTS="$2"; shift 2 ;;
-    --validators) VALIDATORS="$2"; shift 2 ;;
     --ref) REF="$2"; shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
     --solc) SOLC_BIN="$2"; shift 2 ;;
@@ -98,7 +97,6 @@ case "$cmd" in
     SOLC_BIN="${SOLC_BIN:-$HOME/.svm/0.8.36/solc-0.8.36}"
     [[ -x "$SOLC_BIN" ]] || die "solc 0.8.36 not found at $SOLC_BIN (set SOLC_BIN)"
     cp "$INPUTS" "$WORK/inputs.env"
-    cp "$VALIDATORS" "$WORK/validators.json"
     rc=0
     unshare --user --map-root-user --net bash "$HERE/build_r1006_genesis.sh" _inner \
       --node "$(readlink -f "$NODE")" --state-dump "$(readlink -f "$DUMP")" --work "$WORK" --solc "$SOLC_BIN" || rc=$?
@@ -169,7 +167,13 @@ chain_id = 40204
 block_time = 2
 genesis_profile = "default"
 ghostdag_k = 18
+# Every rule r1006 schedules at 0 runs from block 1 here too, so the ceremony state is
+# produced under the rules the r1006 chain enforces (this genesis is unknown to the
+# shared table, so these are local settings).
 exact_create_code_height = 0
+vrf_canonical_encoding_height = 0
+supply_hardening_height = 0
+storage_root_hardening_height = 0
 
 [network]
 listen_addr = "127.0.0.1:$P2P_PORT"
@@ -180,8 +184,6 @@ max_peers = 4
 enabled = true
 listen_addr = "127.0.0.1:$RPC_PORT"
 ws_addr = "127.0.0.1:$((RPC_PORT + 1))"
-# PV sends each staker's registration with eth_sendTransaction (loopback only).
-allow_eth_send_transaction = true
 
 [storage]
 data_dir = "$WORK/devnet-data"
@@ -285,30 +287,6 @@ env PATRONAGE_MEMBERSHIP="$MSBT" "${CE[@]}" --from P4 >"$WORK/ceremony-2.log" 2>
 grep -q 'P5 PASS: FACTORY-ADMIN 0, DEPLOYER-ADMIN 0' "$WORK/ceremony-2.log" ||
   die "P5 did not pass (exit $rc; see $WORK/ceremony-2.log)"
 log "P5 PASS: FACTORY-ADMIN 0, DEPLOYER-ADMIN 0"
-
-# PV: the producer set, registered in the ValidatorRegistry so block 0 has it (only once
-# fill_producers.py has filled validators.json; a placeholder set registers nothing and
-# leaves the genesis not release-ready). The staker sends its own registration through the
-# devnet's loopback eth_sendTransaction; the bond is funded from the dev account.
-if [[ "$(jq -r .status "$WORK/validators.json")" == final ]]; then
-  VR=$(jq -r '.contracts.ValidatorRegistry' "$REPO/contracts/addresses/40204.json" | tr 'A-F' 'a-f')
-  [[ "$VR" == "$(jq -r .validatorRegistry "$WORK/validators.json")" ]] ||
-    die "validators.json was signed for registry $(jq -r .validatorRegistry "$WORK/validators.json"), the ceremony deployed $VR"
-  python3 "$HERE/fill_producers.py" check --path "$WORK/validators.json" >&2 || die "validators.json does not verify"
-  n=$(jq '.producers | length' "$WORK/validators.json")
-  for i in $(seq 0 $((n - 1))); do
-    read -r name staker pk sig stake < <(jq -r ".producers[$i] | [.name,.staker,.proposerPubkey,.registrationSig,.stake] | @tsv" "$WORK/validators.json")
-    csend --private-key "$DEV_FUNDER_KEY" --legacy --gas-limit 21000 --value "$(python3 -c "print($stake + 10**18)")" "$staker" >>"$WORK/pv.log" 2>&1 ||
-      die "PV: funding $name's staker failed (see $WORK/pv.log)"
-    csend --unlocked --from "$staker" --legacy --gas-limit 2000000 --value "$stake" "$VR" "registerValidator(bytes32,bytes)" "$pk" "$sig" >>"$WORK/pv.log" 2>&1 ||
-      die "PV: registering $name failed (see $WORK/pv.log)"
-    [[ "$(c call "$VR" "isActive(bytes32)(bool)" "$pk")" == true ]] || die "PV: $name is not active after registering"
-    log "PV: $name registered ($pk)"
-  done
-  [[ "$(c call "$VR" "activeCount()(uint256)")" == "$n" ]] || die "PV: the active set is not the $n producers"
-else
-  log "PV: producer set is a placeholder; none registered (the genesis is not release-ready)"
-fi
 
 # Books, broadcasts and the KEEP pin from this devnet (the r1006 node is verified against it).
 mkdir -p "$WORK/book"

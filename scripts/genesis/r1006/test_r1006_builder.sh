@@ -140,6 +140,39 @@ jq '.producers[0].proposer_pubkey |= ascii_upcase' "$T/producers.json" >"$T/p-ca
 expect "fill refuses a key not in its public form" 1 'not a 32-byte key' -- "${FP[@]}" validate "$T/p-case.json" "$T/stakes.json"
 jq '.stakes["0x" + ("dd" * 20)] = {"name":"x","stake_wei":"1","liquid_wei":"0"}' "$T/stakes.json" >"$T/s-extra.json"
 expect "fill refuses a stake for a non-producer" 1 'not producers' -- "${FP[@]}" validate "$T/producers.json" "$T/s-extra.json"
+# Registration proofs: real ed25519 signatures (throwaway test keys) over the registry's
+# digest; the digest is the golden vector the node's registration_proof test pins too.
+d=$(cd "$HERE" && python3 -c "import fill_producers as f; print(f.registration_digest('0x1111111111111111111111111111111111111111','0xa0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0','0x'+'01'*32).hex())")
+[[ "$d" == 9884befc29931c0e18cc170372c8131d32ec2a153ead11a49541014804569f23 ]] && ok "fill's registration digest equals the node's golden vector" || bad "fill's registration digest equals the node's golden vector" "$d"
+VR=0x1111111111111111111111111111111111111111
+python3 - "$T" "$VR" "$HERE" <<'PY'
+import json, sys
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+t, vr, here = sys.argv[1:4]
+sys.path.insert(0, here)
+import fill_producers as fp
+ps, proofs = [], []
+for i in range(7):
+    k = Ed25519PrivateKey.from_private_bytes(bytes([i + 1]) * 32)  # throwaway test keys
+    pk = "0x" + k.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
+    st = "0x" + f"{0xa0 + i:02x}" * 20
+    ps.append({"name": f"prod-{i}", "proposer_pubkey": pk, "staker_address": st, "coinbase_address": st})
+    proofs.append({"schema": "citrate-registration-proof/1", "chain_id": 40204, "registry": vr, "staker": st,
+                   "proposer_pubkey": pk, "registration_sig": "0x" + k.sign(fp.registration_digest(vr, st, pk)).hex()})
+json.dump({"schema": "r1006-producers/1", "chain_id": 40204, "producers": ps}, open(f"{t}/sp.json", "w"))
+json.dump({"schema": "r1006-stakes/1", "stakes": {p["staker_address"]: {"name": p["name"], "stake_wei": str(32000 * 10**18),
+           "liquid_wei": "0"} for p in ps}}, open(f"{t}/ss.json", "w"))
+json.dump({"proofs": proofs}, open(f"{t}/proofs.json", "w"))
+PY
+expect "fill verifies every producer's registration signature" 0 'registration proofs verify' -- "${FP[@]}" validate "$T/sp.json" "$T/ss.json" "$T/proofs.json" "$VR"
+expect "fill refuses proofs made for another registry" 1 'not 40204 / 0x2222' -- "${FP[@]}" validate "$T/sp.json" "$T/ss.json" "$T/proofs.json" 0x2222222222222222222222222222222222222222
+jq '.proofs[3].registration_sig |= (.[0:-2] + (if .[-2:] == "00" then "01" else "00" end))' "$T/proofs.json" >"$T/proofs-bad.json"
+expect "fill refuses a tampered registration signature" 1 'prod-3: the registration signature does not verify' -- "${FP[@]}" validate "$T/sp.json" "$T/ss.json" "$T/proofs-bad.json" "$VR"
+jq '.proofs |= .[0:6]' "$T/proofs.json" >"$T/proofs-six.json"
+expect "fill refuses a producer without a proof" 1 'prod-6: no registration proof' -- "${FP[@]}" validate "$T/sp.json" "$T/ss.json" "$T/proofs-six.json" "$VR"
+jq '.proofs[0].staker = "0x" + ("ee" * 20)' "$T/proofs.json" >"$T/proofs-st.json"
+expect "fill refuses a proof for another staker" 1 'names staker 0xeeee' -- "${FP[@]}" validate "$T/sp.json" "$T/ss.json" "$T/proofs-st.json" "$VR"
 printf '{"schema":"r1006-validators/1","status":"placeholder","validatorRegistry":null,"validators":[],"registry":null}\n' >"$T/validators.json"
 expect "check refuses the placeholder set" 1 'is a placeholder' -- "${FP[@]}" check --path "$T/validators.json"
 

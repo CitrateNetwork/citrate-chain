@@ -79,6 +79,7 @@ mod model_verifier;
 mod network_inference;
 mod persistent_dag;
 mod producer;
+mod registration_proof;
 mod registry_sync;
 mod rollback;
 mod startup_guards;
@@ -292,6 +293,18 @@ enum Commands {
         json: bool,
     },
 
+    /// Print this host's proof of key control for the r1006 genesis producer set: the
+    /// proposer key's signature over the ValidatorRegistry registration digest (chain id,
+    /// registry, staker, nonce 0). Public values only; the key is never printed.
+    RegistrationProof {
+        /// The ValidatorRegistry the genesis registers producers in.
+        #[arg(long)]
+        registry: String,
+        /// The staker (must be this node's coinbase; defaults to it).
+        #[arg(long)]
+        staker: Option<String>,
+    },
+
     /// Roll this node's stored chain back to a height. Run it with the node
     /// stopped. Removes every block above --to-height and any other block at
     /// it, keeps --keep there, and refuses the removed branch from peers from
@@ -467,6 +480,21 @@ async fn main() -> Result<()> {
                 cli.rpc_addr.clone(),
             )
             .await?;
+            return Ok(());
+        }
+        Some(Commands::RegistrationProof { registry, staker }) => {
+            let cfg_path = resolve_config_path(cli.config.clone())
+                .ok_or_else(|| anyhow::anyhow!("registration-proof needs the node config (--config)"))?;
+            let cfg = NodeConfig::from_file(&cfg_path)?;
+            let coinbase = format!("0x{}", cfg.mining.coinbase.trim().trim_start_matches("0x").to_lowercase());
+            let staker = staker.unwrap_or_else(|| coinbase.clone());
+            if staker.to_lowercase() != coinbase {
+                anyhow::bail!("the staker must be this node's coinbase {coinbase} (consensus requires coinbase == staker)");
+            }
+            let data_dir = cli.data_dir.clone().unwrap_or(cfg.storage.data_dir.clone());
+            let key = registration_proof::load_proposer_key(&data_dir.join("proposer.key"))?;
+            let p = registration_proof::proof(cfg.chain.chain_id, &registry, &staker, &key)?;
+            println!("{}", serde_json::to_string_pretty(&p)?);
             return Ok(());
         }
         Some(Commands::Keygen { ed25519 }) => {
