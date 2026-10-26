@@ -65,7 +65,10 @@ pub fn run(paths: &IdentityPaths, mint: bool) -> anyhow::Result<HostIdentity> {
     if !mint {
         for p in [&noise_path, &proposer_path, &paths.staker_keystore] {
             if !p.exists() {
-                bail!("{} does not exist (pass --mint to create the host identity)", p.display());
+                bail!(
+                    "{} does not exist (pass --mint to create the host identity)",
+                    p.display()
+                );
             }
         }
     }
@@ -80,7 +83,11 @@ pub fn run(paths: &IdentityPaths, mint: bool) -> anyhow::Result<HostIdentity> {
     let staker = if paths.staker_keystore.exists() {
         keystore_address(&paths.staker_keystore)?
     } else if mint {
-        mint_staker_keystore(&paths.staker_keystore, &paths.staker_password_file, SCRYPT_LOG_N)?
+        mint_staker_keystore(
+            &paths.staker_keystore,
+            &paths.staker_password_file,
+            SCRYPT_LOG_N,
+        )?
     } else {
         bail!("{} does not exist", paths.staker_keystore.display());
     };
@@ -102,7 +109,10 @@ pub fn write_public(path: &Path, id: &HostIdentity) -> anyhow::Result<()> {
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    let tmp = dir.join(format!(".identity.pub.{}.tmp", hex::encode(rand::random::<[u8; 8]>())));
+    let tmp = dir.join(format!(
+        ".identity.pub.{}.tmp",
+        hex::encode(rand::random::<[u8; 8]>())
+    ));
     let mut body = serde_json::to_vec_pretty(id)?;
     body.push(b'\n');
     let mut o = std::fs::OpenOptions::new();
@@ -137,7 +147,11 @@ fn owner_only(path: &Path) -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
-            bail!("{} has mode {:o}; it must be readable by its owner only", path.display(), mode);
+            bail!(
+                "{} has mode {:o}; it must be readable by its owner only",
+                path.display(),
+                mode
+            );
         }
     }
     Ok(())
@@ -169,7 +183,9 @@ fn create_new_0600(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         o.mode(0o600);
     }
-    let mut f = o.open(path).with_context(|| format!("create {}", path.display()))?;
+    let mut f = o
+        .open(path)
+        .with_context(|| format!("create {}", path.display()))?;
     f.write_all(bytes)?;
     f.sync_all()?;
     Ok(())
@@ -183,7 +199,11 @@ fn eth_address(key: &k256::ecdsa::SigningKey) -> [u8; 20] {
     out
 }
 
-fn mint_staker_keystore(keystore: &Path, password_file: &Path, log_n: u8) -> anyhow::Result<[u8; 20]> {
+fn mint_staker_keystore(
+    keystore: &Path,
+    password_file: &Path,
+    log_n: u8,
+) -> anyhow::Result<[u8; 20]> {
     let dir = keystore
         .parent()
         .filter(|d| d.is_dir())
@@ -193,7 +213,10 @@ fn mint_staker_keystore(keystore: &Path, password_file: &Path, log_n: u8) -> any
         let p = Zeroizing::new(std::fs::read_to_string(password_file)?);
         let line = Zeroizing::new(p.lines().next().unwrap_or("").to_string());
         if line.len() < 16 {
-            bail!("{} holds a password shorter than 16 characters", password_file.display());
+            bail!(
+                "{} holds a password shorter than 16 characters",
+                password_file.display()
+            );
         }
         line
     } else {
@@ -209,20 +232,26 @@ fn mint_staker_keystore(keystore: &Path, password_file: &Path, log_n: u8) -> any
 
     // Private temp file in the same dir, then a hard link: link(2) fails if the
     // keystore appeared meanwhile, so nothing is ever overwritten.
-    let tmp = dir.join(format!(".staker-keystore.{}.tmp", hex::encode(rand::random::<[u8; 8]>())));
+    let tmp = dir.join(format!(
+        ".staker-keystore.{}.tmp",
+        hex::encode(rand::random::<[u8; 8]>())
+    ));
     create_new_0600(&tmp, json.as_bytes())?;
     let linked = std::fs::hard_link(&tmp, keystore);
     let _ = std::fs::remove_file(&tmp);
-    linked.with_context(|| format!("{} already exists or cannot be created", keystore.display()))?;
+    linked
+        .with_context(|| format!("{} already exists or cannot be created", keystore.display()))?;
     Ok(address)
 }
 
 type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
 
 fn derive_key(password: &[u8], salt: &[u8], log_n: u8) -> anyhow::Result<Zeroizing<[u8; 32]>> {
-    let params = scrypt::Params::new(log_n, SCRYPT_R, SCRYPT_P, 32).map_err(|e| anyhow!("scrypt params: {e}"))?;
+    let params = scrypt::Params::new(log_n, SCRYPT_R, SCRYPT_P, 32)
+        .map_err(|e| anyhow!("scrypt params: {e}"))?;
     let mut dk = Zeroizing::new([0u8; 32]);
-    scrypt::scrypt(password, salt, &params, dk.as_mut_slice()).map_err(|e| anyhow!("scrypt: {e}"))?;
+    scrypt::scrypt(password, salt, &params, dk.as_mut_slice())
+        .map_err(|e| anyhow!("scrypt: {e}"))?;
     Ok(dk)
 }
 
@@ -234,13 +263,20 @@ fn mac(dk: &[u8; 32], ciphertext: &[u8]) -> [u8; 32] {
 }
 
 /// Web3 Secret Storage v3 (the format `cast wallet` and Geth read).
-fn encrypt_v3(secret: &[u8], password: &[u8], address: &[u8; 20], log_n: u8) -> anyhow::Result<String> {
+fn encrypt_v3(
+    secret: &[u8],
+    password: &[u8],
+    address: &[u8; 20],
+    log_n: u8,
+) -> anyhow::Result<String> {
     use ctr::cipher::{KeyIvInit, StreamCipher};
     let salt: [u8; 32] = rand::random();
     let iv: [u8; 16] = rand::random();
     let dk = derive_key(password, &salt, log_n)?;
     let mut ct = secret.to_vec();
-    let enc_key = dk.get(0..16).ok_or_else(|| anyhow!("derived key too short"))?;
+    let enc_key = dk
+        .get(0..16)
+        .ok_or_else(|| anyhow!("derived key too short"))?;
     let mut cipher = Aes128Ctr::new(enc_key.into(), &iv.into());
     cipher.apply_keystream(&mut ct);
     let id: [u8; 16] = {
@@ -326,7 +362,10 @@ mod tests {
         assert_eq!(v["address"], hex::encode(addr));
         assert_eq!(v["version"], 3);
         assert_eq!(v["crypto"]["cipher"], "aes-128-ctr");
-        assert!(decrypt_v3(&json, b"wrong-password-xxxx").is_err(), "a wrong password must fail the MAC");
+        assert!(
+            decrypt_v3(&json, b"wrong-password-xxxx").is_err(),
+            "a wrong password must fail the MAC"
+        );
     }
 
     #[test]
@@ -335,7 +374,10 @@ mod tests {
         let mut one = [0u8; 32];
         one[31] = 1;
         let key = k256::ecdsa::SigningKey::from_bytes((&one).into()).expect("key");
-        assert_eq!(hex::encode(eth_address(&key)), "7e5f4552091a69125d5dfcb7b8c2659029395bdf");
+        assert_eq!(
+            hex::encode(eth_address(&key)),
+            "7e5f4552091a69125d5dfcb7b8c2659029395bdf"
+        );
     }
 
     #[test]
@@ -355,11 +397,18 @@ mod tests {
         }
         assert_eq!(first.staker_address, first.coinbase_address);
         assert_eq!(first.peer_id, format!("noise_{}", first.noise_pubkey));
-        assert_ne!(first.vrf_pubkey, first.proposer_pubkey, "VRF key is the P-256 key, not the ed25519 one");
+        assert_ne!(
+            first.vrf_pubkey, first.proposer_pubkey,
+            "VRF key is the P-256 key, not the ed25519 one"
+        );
         let ks_before = std::fs::read(&p.staker_keystore).expect("ks");
         let second = run_with_cost(&p, true, 4).expect("re-run");
         assert_eq!(first, second, "a second run reports the same identity");
-        assert_eq!(std::fs::read(&p.staker_keystore).expect("ks"), ks_before, "keystore untouched");
+        assert_eq!(
+            std::fs::read(&p.staker_keystore).expect("ks"),
+            ks_before,
+            "keystore untouched"
+        );
         let third = run_with_cost(&p, false, 4).expect("read-only run");
         assert_eq!(first, third);
     }
@@ -400,7 +449,10 @@ mod tests {
         }
         // And the staker address really belongs to the minted secret.
         let key = k256::ecdsa::SigningKey::from_slice(&secret).expect("key");
-        assert_eq!(format!("0x{}", hex::encode(eth_address(&key))), id.staker_address);
+        assert_eq!(
+            format!("0x{}", hex::encode(eth_address(&key))),
+            id.staker_address
+        );
     }
 
     #[test]
@@ -410,7 +462,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tmp");
         let p = paths(dir.path());
         run_with_cost(&p, true, 4).expect("mint");
-        std::fs::set_permissions(&p.staker_keystore, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+        std::fs::set_permissions(&p.staker_keystore, std::fs::Permissions::from_mode(0o640))
+            .expect("chmod");
         let err = run_with_cost(&p, false, 4).expect_err("loose keystore");
         assert!(err.to_string().contains("owner only"), "{err}");
     }
@@ -424,7 +477,8 @@ mod tests {
         let out = dir.path().join("identity.pub.json");
         write_public(&out, &id).expect("write");
         assert_eq!(mode(&out), 0o644);
-        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&out).expect("read")).expect("json");
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&out).expect("read")).expect("json");
         assert_eq!(v["schema"], SCHEMA);
         assert_eq!(v["staker_address"], id.staker_address.as_str());
     }
