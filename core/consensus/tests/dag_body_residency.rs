@@ -1,3 +1,4 @@
+#![allow(clippy::type_complexity)]
 // Behaviour of the bounded body window in a persistent DagStore: the cap holds,
 // every body still reads back byte-identical (from memory or the backend), a
 // restart loads skeletons only, a missing backend body fails closed, and an
