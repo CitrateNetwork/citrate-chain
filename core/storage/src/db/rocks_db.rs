@@ -530,7 +530,8 @@ mod tests {
         for cf in &cfs {
             let mut batch = db.batch();
             for i in 0u64..1024 {
-                db.batch_put_cf(&mut batch, cf, &i.to_be_bytes(), &value).unwrap();
+                db.batch_put_cf(&mut batch, cf, &i.to_be_bytes(), &value)
+                    .unwrap();
             }
             db.write_batch(batch).unwrap();
         }
@@ -543,7 +544,11 @@ mod tests {
         let usage = db.memory_usage();
         let cap = RocksMemoryBudget::default().block_cache_bytes as u64;
         assert!(usage.block_cache > 0, "reads should populate the cache");
-        assert!(usage.block_cache <= cap, "block cache {} > cap {cap}", usage.block_cache);
+        assert!(
+            usage.block_cache <= cap,
+            "block cache {} > cap {cap}",
+            usage.block_cache
+        );
         // One cache: every CF reports the same usage figure.
         assert_eq!(
             usage.block_cache_sum_over_cfs,

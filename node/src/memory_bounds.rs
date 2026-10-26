@@ -92,7 +92,10 @@ mod tests {
     #[test]
     fn dag_resident_bodies_parses_with_default() {
         assert_eq!(parse_dag_resident_bodies(None), DEFAULT_RESIDENT_BODY_CAP);
-        assert_eq!(parse_dag_resident_bodies(Some("x")), DEFAULT_RESIDENT_BODY_CAP);
+        assert_eq!(
+            parse_dag_resident_bodies(Some("x")),
+            DEFAULT_RESIDENT_BODY_CAP
+        );
         assert_eq!(parse_dag_resident_bodies(Some(" 64 ")), 64);
         assert_eq!(parse_dag_resident_bodies(Some("0")), 0);
     }
@@ -132,5 +135,106 @@ mod tests {
         ] {
             assert!(line.contains(key), "{key} missing from {line}");
         }
+    }
+
+    /// Node-level soak of the bounded structures: a persistent DAG store on the
+    /// node's real RocksDB adapter, blocks and transactions written to the chain
+    /// store, and a state snapshot ring, driven for 1,500 blocks of 50
+    /// transactions. After warmup every bounded size stays within its bound at
+    /// every sample.
+    #[tokio::test]
+    async fn soak_bounded_structures_stay_bounded() {
+        use citrate_consensus::types::{BlockBuilder, Hash, PublicKey, Transaction};
+        use citrate_execution::state::StateDB;
+        use citrate_storage::db::RocksMemoryBudget;
+
+        let dir = tempfile::TempDir::new().expect("tmp");
+        let storage = Arc::new(
+            StorageManager::new(
+                dir.path(),
+                citrate_storage::pruning::PruningConfig::default(),
+            )
+            .expect("storage"),
+        );
+        let kv = Arc::new(crate::persistent_dag::RocksDbKvStore::new(
+            storage.db.clone(),
+        ));
+        const CAP: usize = 64;
+        let dag = DagStore::persistent_with_strict_vrf(kv, false)
+            .expect("dag")
+            .with_resident_body_cap(CAP);
+        let state = StateDB::new();
+        let mut ring = std::collections::VecDeque::new();
+        let memtable_bound = RocksMemoryBudget::default().memtable_bytes as u64 * 3 / 2;
+
+        let mut parent = Hash::default();
+        for h in 1u64..=1_500 {
+            let txs: Vec<Transaction> = (0..50u64)
+                .map(|i| {
+                    let mut th = [0u8; 32];
+                    th[..8].copy_from_slice(&h.to_be_bytes());
+                    th[8..16].copy_from_slice(&i.to_be_bytes());
+                    Transaction {
+                        hash: Hash::new(th),
+                        nonce: h,
+                        from: PublicKey::new([9u8; 32]),
+                        data: vec![(i % 251) as u8; 300],
+                        ..Default::default()
+                    }
+                })
+                .collect();
+            let mut hb = [0u8; 32];
+            hb[..8].copy_from_slice(&h.to_be_bytes());
+            hb[31] = 0x5A;
+            let block = BlockBuilder::new()
+                .hash(Hash::new(hb))
+                .height(h)
+                .parent(parent)
+                .transactions(txs)
+                .build_unhashed();
+            parent = block.hash();
+            storage.blocks.put_block(&block).expect("put block");
+            storage
+                .transactions
+                .put_transactions(&block.transactions)
+                .expect("put txs");
+            dag.store_block(block).await.expect("dag store");
+
+            // One storage write per block and a 100-deep snapshot ring.
+            let mut a = [0u8; 20];
+            a[0] = (h % 40) as u8;
+            state.set_storage(
+                citrate_execution::types::Address(a),
+                h.to_be_bytes().to_vec(),
+                vec![1; 32],
+            );
+            state.commit();
+            let _ = state.take_dirty_storage();
+            ring.push_back(state.snapshot());
+            if ring.len() > 100 {
+                ring.pop_front();
+            }
+
+            if h > 300 && h % 100 == 0 {
+                let rocks = storage.db.memory_usage();
+                assert!(
+                    dag.resident_body_count() <= CAP,
+                    "h={h}: resident bodies over cap"
+                );
+                assert!(
+                    rocks.memtables <= memtable_bound,
+                    "h={h}: memtables {} > {memtable_bound}",
+                    rocks.memtables
+                );
+                assert!(
+                    rocks.block_cache <= RocksMemoryBudget::default().block_cache_bytes as u64,
+                    "h={h}: block cache over budget"
+                );
+            }
+        }
+        // Every body still reads back after the soak.
+        let first = dag.get_blocks_at_height(1).await.pop().expect("block 1");
+        assert_eq!(first.transactions.len(), 50);
+        assert_eq!(ring.len(), 100);
     }
 }

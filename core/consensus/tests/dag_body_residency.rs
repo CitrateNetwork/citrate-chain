@@ -111,7 +111,11 @@ async fn cap_holds_and_every_body_reads_back_identical() {
         .expect("store")
         .with_resident_body_cap(8);
     let blocks = fill(&store, 50, 5).await;
-    assert_eq!(store.resident_body_count(), 8, "resident bodies exceed the cap");
+    assert_eq!(
+        store.resident_body_count(),
+        8,
+        "resident bodies exceed the cap"
+    );
     for b in &blocks {
         let got = store.get_block(&b.hash()).await.expect("get");
         assert_eq!(bytes(&got), bytes(b), "block {} changed", b.header.height);
@@ -121,7 +125,10 @@ async fn cap_holds_and_every_body_reads_back_identical() {
     }
     // Skeleton readers still see headers for stripped blocks.
     assert!(store.has_block(&blocks[0].hash()).await);
-    assert_eq!(store.get_parents(&blocks[1].hash()).await.expect("parents"), vec![blocks[0].hash()]);
+    assert_eq!(
+        store.get_parents(&blocks[1].hash()).await.expect("parents"),
+        vec![blocks[0].hash()]
+    );
 }
 
 #[tokio::test]
@@ -133,7 +140,10 @@ async fn cap_zero_strips_every_body_and_still_reads_back() {
     let blocks = fill(&store, 10, 3).await;
     assert_eq!(store.resident_body_count(), 0);
     for b in &blocks {
-        assert_eq!(bytes(&store.get_block(&b.hash()).await.expect("get")), bytes(b));
+        assert_eq!(
+            bytes(&store.get_block(&b.hash()).await.expect("get")),
+            bytes(b)
+        );
     }
 }
 
@@ -145,10 +155,17 @@ async fn restart_loads_skeletons_and_reloads_bodies() {
         fill(&store, 20, 4).await
     };
     let reopened = DagStore::persistent_with_strict_vrf(kv, false).expect("reopen");
-    assert_eq!(reopened.resident_body_count(), 0, "restart must not load bodies");
+    assert_eq!(
+        reopened.resident_body_count(),
+        0,
+        "restart must not load bodies"
+    );
     assert_eq!(reopened.get_stats().await.total_blocks, 20);
     for b in &blocks {
-        assert_eq!(bytes(&reopened.get_block(&b.hash()).await.expect("get")), bytes(b));
+        assert_eq!(
+            bytes(&reopened.get_block(&b.hash()).await.expect("get")),
+            bytes(b)
+        );
     }
 }
 
@@ -160,13 +177,27 @@ async fn missing_backend_body_fails_closed() {
         .with_resident_body_cap(2);
     let blocks = fill(&store, 6, 4).await;
     let victim = blocks[0].hash();
-    kv.kv_delete(cf::DAG_BLOCKS, victim.as_bytes()).expect("delete");
+    kv.kv_delete(cf::DAG_BLOCKS, victim.as_bytes())
+        .expect("delete");
     let r = store.get_block(&victim).await;
-    assert!(r.is_err(), "a stripped block with no backend body must be an error, got {:?}", r.map(|b| b.transactions.len()));
+    assert!(
+        r.is_err(),
+        "a stripped block with no backend body must be an error, got {:?}",
+        r.map(|b| b.transactions.len())
+    );
     // A resident (recent) block is unaffected.
     let recent = blocks[5].hash();
-    kv.kv_delete(cf::DAG_BLOCKS, recent.as_bytes()).expect("delete");
-    assert_eq!(store.get_block(&recent).await.expect("resident").transactions.len(), 4);
+    kv.kv_delete(cf::DAG_BLOCKS, recent.as_bytes())
+        .expect("delete");
+    assert_eq!(
+        store
+            .get_block(&recent)
+            .await
+            .expect("resident")
+            .transactions
+            .len(),
+        4
+    );
 }
 
 #[tokio::test]
@@ -195,7 +226,10 @@ async fn in_memory_store_never_strips() {
     let blocks = fill(&store, 10, 3).await;
     assert_eq!(store.resident_body_count(), 0);
     for b in &blocks {
-        assert_eq!(bytes(&store.get_block(&b.hash()).await.expect("get")), bytes(b));
+        assert_eq!(
+            bytes(&store.get_block(&b.hash()).await.expect("get")),
+            bytes(b)
+        );
     }
 }
 
@@ -214,5 +248,8 @@ async fn prune_forgets_residency() {
     assert_eq!(store.prune().await.expect("prune"), 10);
     assert_eq!(store.resident_body_count(), 2);
     assert!(store.get_block(&blocks[0].hash()).await.is_err());
-    assert_eq!(bytes(&store.get_block(&blocks[11].hash()).await.expect("get")), bytes(&blocks[11]));
+    assert_eq!(
+        bytes(&store.get_block(&blocks[11].hash()).await.expect("get")),
+        bytes(&blocks[11])
+    );
 }

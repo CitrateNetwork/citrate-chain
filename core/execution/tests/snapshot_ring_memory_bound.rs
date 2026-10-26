@@ -101,7 +101,11 @@ fn snapshot_ring_shares_unchanged_contract_storage() {
         .storage_map()
         .get(&addr(0))
         .and_then(|m| m.get(&slot(0)).cloned());
-    assert_eq!(first_val, Some(vec![0u8; 32]), "snapshot 0 sees its own write");
+    assert_eq!(
+        first_val,
+        Some(vec![0u8; 32]),
+        "snapshot 0 sees its own write"
+    );
     db.restore(ring[0].clone());
     assert_eq!(db.get_storage(&addr(0), &slot(0)), Some(vec![0u8; 32]));
     assert_eq!(db.get_storage(&addr(1), &slot(0)), Some(vec![1u8; 32]));
