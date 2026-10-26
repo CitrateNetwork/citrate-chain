@@ -2,7 +2,7 @@
 
 // Network protocol definitions
 use crate::learning_messages::LearningMessage;
-use citrate_consensus::types::{Block, BlockHeader, Hash, Transaction};
+use citrate_consensus::types::{Block, BlockHeader, Hash, PublicKey, Signature, Transaction};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -28,9 +28,10 @@ pub struct ProtocolVersion {
 }
 
 impl ProtocolVersion {
-    /// 1.1: verifies chain-bound (V2) native transaction signatures (see
-    /// [`Self::NATIVE_TX_V2`]).
-    pub const CURRENT: Self = Self::NATIVE_TX_V2;
+    /// 1.2: understands checkpoint certificate sync (see
+    /// [`Self::CHECKPOINT_CERT_SYNC`]); 1.1 and later also verify chain-bound
+    /// (V2) native transaction signatures (see [`Self::NATIVE_TX_V2`]).
+    pub const CURRENT: Self = Self::CHECKPOINT_CERT_SYNC;
 
     pub fn is_compatible(&self, other: &Self) -> bool {
         // Major version must match, minor/patch can differ
@@ -52,6 +53,25 @@ impl ProtocolVersion {
     /// transaction signatures.
     pub fn verifies_native_v2(&self) -> bool {
         self.major == Self::NATIVE_TX_V2.major && self.minor >= Self::NATIVE_TX_V2.minor
+    }
+
+    /// The first version whose nodes decode [`NetworkMessage::GetCheckpoint`]
+    /// and [`NetworkMessage::CheckpointCertificate`] (checkpoint finality
+    /// Stage 1b, late-joiner certificate sync). An older node fails to decode
+    /// an unknown message variant and drops the connection, so those two
+    /// messages are only ever sent to peers at or above it (`Peer::send`).
+    /// A minor bump: older nodes still accept this version's handshake.
+    pub const CHECKPOINT_CERT_SYNC: Self = Self {
+        major: 1,
+        minor: 2,
+        patch: 0,
+    };
+
+    /// Whether a peer that advertised this version understands checkpoint
+    /// certificate sync messages.
+    pub fn understands_checkpoint_sync(&self) -> bool {
+        self.major == Self::CHECKPOINT_CERT_SYNC.major
+            && self.minor >= Self::CHECKPOINT_CERT_SYNC.minor
     }
 }
 
@@ -308,6 +328,36 @@ pub enum NetworkMessage {
     LearningGossip {
         message: LearningMessage,
     },
+
+    // WP-S.3 Stage 1b: late-joiner checkpoint certificate sync
+    // (docs/consensus/CHECKPOINT_FINALITY_WIRING.md §11.10). Appended LAST so
+    // every existing variant keeps its wire discriminant. Sent only to peers
+    // that advertised [`ProtocolVersion::CHECKPOINT_CERT_SYNC`] (`Peer::send`).
+    /// Ask a peer for its highest finalized checkpoint certificate with
+    /// `above < height <= at_or_below` (the requester's finalized height and
+    /// applied tip). A peer with none in range does not answer.
+    GetCheckpoint {
+        above: u64,
+        at_or_below: u64,
+    },
+
+    /// A finalized checkpoint certificate: the `(height, block_hash)` it
+    /// certifies and the committee signatures over it. Carries NO committee:
+    /// the receiver derives the committee itself from its own epoch validator
+    /// snapshot and verifies every signature before using it.
+    CheckpointCertificate {
+        height: u64,
+        block_hash: Hash,
+        signatures: Vec<CheckpointSignature>,
+    },
+}
+
+/// One committee member's signature in a [`NetworkMessage::CheckpointCertificate`]:
+/// ed25519 by `voter` over the canonical 69-byte checkpoint vote message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointSignature {
+    pub voter: PublicKey,
+    pub signature: Signature,
 }
 
 /// Peer address information
@@ -392,6 +442,15 @@ impl NetworkMessage {
                 | Self::GetDagInfo { .. }
                 | Self::GetState { .. }
                 | Self::GetBlocksByHeight { .. }
+        )
+    }
+
+    /// Whether this is a checkpoint certificate sync message (Stage 1b), which
+    /// only peers at [`ProtocolVersion::CHECKPOINT_CERT_SYNC`] or above decode.
+    pub fn is_checkpoint_sync(&self) -> bool {
+        matches!(
+            self,
+            Self::GetCheckpoint { .. } | Self::CheckpointCertificate { .. }
         )
     }
 

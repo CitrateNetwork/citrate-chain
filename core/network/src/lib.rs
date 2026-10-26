@@ -95,7 +95,7 @@ pub use learning_messages::{
 pub use nat::{NatInfo, NatType};
 pub use noise::NoiseKeypair;
 pub use peer::{Peer, PeerId, PeerInfo, PeerManager, PeerManagerConfig};
-pub use protocol::{ModelMetadata, NetworkMessage, Protocol, ProtocolVersion};
+pub use protocol::{CheckpointSignature, ModelMetadata, NetworkMessage, Protocol, ProtocolVersion};
 pub use relay::{RelayError, RelayService};
 pub use sync::{SyncConfig, SyncManager, SyncState};
 pub use transaction_gossip::{GossipConfig as TxGossipConfig, TransactionGossip};

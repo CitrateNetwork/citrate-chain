@@ -223,6 +223,25 @@ impl Peer {
         }
     }
 
+    /// Withhold checkpoint certificate sync messages
+    /// ([`NetworkMessage::is_checkpoint_sync`]) from a peer that did not
+    /// advertise [`ProtocolVersion::CHECKPOINT_CERT_SYNC`] (or advertised
+    /// nothing): such a peer cannot decode those variants and would drop the
+    /// connection. Every other message passes unchanged. `None`: withheld.
+    async fn gate_checkpoint_sync(&self, message: NetworkMessage) -> Option<NetworkMessage> {
+        if !message.is_checkpoint_sync()
+            || self
+                .info
+                .read()
+                .await
+                .version
+                .is_some_and(|v| v.understands_checkpoint_sync())
+        {
+            return Some(message);
+        }
+        None
+    }
+
     /// Queue `message` for this peer. **Never blocks.**
     ///
     /// #149 — THE FLEET DEADLOCK. THIS FUNCTION USED TO `.await` A BOUNDED
@@ -263,6 +282,9 @@ impl Peer {
     /// so there is no call site where blocking is the right answer.
     pub async fn send(&self, message: NetworkMessage) -> Result<(), NetworkError> {
         let Some(message) = self.gate_native_v2(message).await else {
+            return Ok(());
+        };
+        let Some(message) = self.gate_checkpoint_sync(message).await else {
             return Ok(());
         };
         match self.send_tx.try_send(message) {
