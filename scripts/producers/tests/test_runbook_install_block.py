@@ -115,6 +115,22 @@ def make_tarball(fp: str, symlink: bool = False, behaviour: str = "", dir_link: 
     return buf.getvalue()
 
 
+def ran_and_installed(block: str) -> set:
+    """Tripwire: paths the block both executes (a `./path ...` command, after shell
+    variables are expanded from the block's own simple assignments) and passes to
+    `install` as the source. Must be empty: the installed file is a copy that never ran."""
+    env = dict(re.findall(r'^([A-Z_]+)="?([^"\n$]*(?:\$[A-Z_]+[^"\n$]*)*)"?$', block, flags=re.M))
+
+    def expand(s: str) -> str:
+        for _ in range(5):
+            s = re.sub(r"\$\{?([A-Z_]+)\}?", lambda m: env.get(m.group(1), m.group(0)), s)
+        return s.strip('"').removeprefix("./")
+
+    ran = {expand(m) for m in re.findall(r'(?:^|[\s(])"?\./([^\s"]+)"?\s', block)}
+    src = {expand(m) for m in re.findall(r"^\s*install\s+(?:-m\s+\S+\s+)?(\S+)\s", block, flags=re.M)}
+    return ran & src
+
+
 def sign(blob: bytes) -> bytes:
     return ("fixture-signature:" + hashlib.sha256(blob).hexdigest()).encode()
 
@@ -248,6 +264,16 @@ class InstallBlockTest(unittest.TestCase):
         deploy = (REPO / "scripts/deploy_testnet.sh").read_text()
         self.assertIn(f"COSIGN_IDENTITY_RE='{IDENTITY}'", deploy)
         self.assertIn(f"IDENTITY='{IDENTITY}'", block)
+
+    def test_tripwire_block_never_installs_the_file_it_ran(self):
+        # Negative control: a block that runs the unpacked binary and installs it is flagged.
+        bad = ('BIN="stage/rel/citrate-node"\n'
+               'FP="$(RUST_LOG=error "./$BIN" consensus --json)"\n'
+               'install -m 0755 "$BIN" "$INSTALL_DIR/citrate-node.new"\n')
+        self.assertEqual(ran_and_installed(bad), {"stage/rel/citrate-node"})
+        self.assertEqual(ran_and_installed(install_block()), set())
+        self.assertIn("install -m 0755 keep/citrate-node", install_block())
+        self.assertIn("./run/citrate-node consensus", install_block())
 
     def test_good_release_installs_the_verified_binary(self):
         p = self.run_block()

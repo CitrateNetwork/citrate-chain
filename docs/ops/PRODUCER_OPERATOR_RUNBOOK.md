@@ -123,9 +123,10 @@ refuse() { echo "REFUSED: $*. Nothing was installed. Tell the chain team." >&2; 
 if ! command -v cosign >/dev/null; then refuse "cosign is not installed"; fi
 
 # Download, verify, unpack and run from one fresh private directory (mode 0700).
-# The file that is installed is the file that was verified.
+# The file that is installed is a copy of the verified binary that never runs.
 WORK="$(mktemp -d)"
-trap 'rm -rf -- "${WORK:?}"' EXIT
+NEW=''
+trap 'rm -rf -- "${WORK:?}"; if [ -n "$NEW" ]; then rm -f -- "$NEW"; fi' EXIT
 cd "$WORK"
 for f in "$TARBALL" "$TARBALL.sig" "$TARBALL.pem"; do
   if ! curl -fsSL --proto '=https' -o "$f" "$BASE/$f"; then refuse "download of $f failed"; fi
@@ -143,20 +144,40 @@ if ! cosign verify-blob "$TARBALL" \
   refuse "cosign signature check failed"
 fi
 
-# 3. Unpack the verified tarball; check the unpacked binary's consensus fingerprint
+# 3. Unpack the verified tarball and hash its binary before anything runs. Two private
+#    copies are made: run/ is executed for the fingerprint check, keep/ never runs and is
+#    the one installed. Every later step compares against the hash taken here.
 mkdir stage
 tar -xzf "$TARBALL" -C stage --no-same-owner
-BIN="stage/citrate-chain-$ARCH/citrate-node"
+REL="stage/citrate-chain-$ARCH"
+if [ -L "$REL" ]; then refuse "the tarball's citrate-chain-$ARCH is a symlink"; fi
+if [ ! -d "$REL" ]; then refuse "the tarball has no citrate-chain-$ARCH directory"; fi
+BIN="$REL/citrate-node"
 if [ -L "$BIN" ]; then refuse "the tarball's citrate-node is a symlink"; fi
 if [ ! -f "$BIN" ]; then refuse "the tarball has no citrate-chain-$ARCH/citrate-node"; fi
-GOT_FINGERPRINT="$(RUST_LOG=error "./$BIN" consensus --json | python3 -c 'import json,sys; l=sys.stdin.read().splitlines(); print(json.loads("\n".join(l[l.index("{"):]))["fingerprint"])')"
+BIN_SHA256="$(sha256sum "$BIN" | cut -d' ' -f1)"
+sha_is() { [ "$(sha256sum "$1" | cut -d' ' -f1)" = "$BIN_SHA256" ]; }
+mkdir -m 0700 run keep
+cp -- "$BIN" run/citrate-node
+cp -- "$BIN" keep/citrate-node
+chmod 0700 run/citrate-node
+chmod 0400 keep/citrate-node
+if ! sha_is run/citrate-node; then refuse "the copy to run differs from the verified binary"; fi
+if ! sha_is keep/citrate-node; then refuse "the copy to install differs from the verified binary"; fi
+GOT_FINGERPRINT="$(RUST_LOG=error ./run/citrate-node consensus --json | python3 -c 'import json,sys; l=sys.stdin.read().splitlines(); print(json.loads("\n".join(l[l.index("{"):]))["fingerprint"])')"
 if [ "$GOT_FINGERPRINT" != "$EXPECTED_FINGERPRINT" ]; then refuse "consensus fingerprint is $GOT_FINGERPRINT, not the announced one"; fi
+if ! sha_is run/citrate-node; then refuse "the binary changed during the fingerprint check"; fi
+if ! sha_is keep/citrate-node; then refuse "the copy to install changed during the fingerprint check"; fi
 
-# 4. Install the verified file: keep the old binary as .prev, copy, compare, rename into place
-if [ -f "$INSTALL_DIR/citrate-node" ]; then cp -a "$INSTALL_DIR/citrate-node" "$INSTALL_DIR/citrate-node.prev"; fi
-install -m 0755 "$BIN" "$INSTALL_DIR/citrate-node.new"
-if ! cmp -s "$BIN" "$INSTALL_DIR/citrate-node.new"; then rm -f -- "$INSTALL_DIR/citrate-node.new"; refuse "the copied binary differs from the verified one"; fi
-mv -f -- "$INSTALL_DIR/citrate-node.new" "$INSTALL_DIR/citrate-node"
+# 4. Install the copy that never ran: into a fresh private file in the install dir, hash
+#    it there, keep the old binary as .prev (a hard link, so a symlink at .prev is replaced,
+#    never followed), and rename into place.
+NEW="$(mktemp "$INSTALL_DIR/.citrate-node.new.XXXXXX")"
+install -m 0755 keep/citrate-node "$NEW"
+if ! sha_is "$NEW"; then refuse "the installed copy differs from the verified binary"; fi
+if [ -f "$INSTALL_DIR/citrate-node" ]; then ln -f -- "$INSTALL_DIR/citrate-node" "$INSTALL_DIR/citrate-node.prev"; fi
+mv -f -- "$NEW" "$INSTALL_DIR/citrate-node"
+NEW=''
 echo "INSTALLED citrate-node $TAG ($ARCH): tarball SHA-256 $ACTUAL_SHA256, fingerprint $GOT_FINGERPRINT"
 INSTALL_CITRATE_NODE
 ```
@@ -168,10 +189,11 @@ The block checks these in order and stops at the first failure:
 3. The tarball's SHA-256 equals the announced value.
 4. The Sigstore signature and signer identity verify.
 5. The unpacked binary's `citrate-node consensus` fingerprint equals the announced one.
+6. No copy of the binary changed while it ran, and the installed file has the verified binary's hash.
 
-The binary runs only after the hash and the signature pass. That first run is the fingerprint check, from the private directory. The binary is installed only after all the checks pass. On any failure the block prints `REFUSED: …`, exits non-zero and leaves `/usr/local/bin` as it was. Don't work around a refusal. Tell the chain team.
+The binary runs only after the hash and the signature pass. That first run is the fingerprint check, from a private copy. The file installed is a second private copy that never runs, and every copy is compared with the hash of the binary as unpacked, before it ran. The binary is installed only after all the checks pass. On any failure the block prints `REFUSED: …`, exits non-zero and leaves `/usr/local/bin` as it was. Don't work around a refusal. Tell the chain team.
 
-Install `cosign` from the Sigstore project's own signed release. The identity regexp is the one `scripts/deploy_testnet.sh` enforces. `scripts/producers/tests/test_runbook_install_block.py` runs this exact block from this file against a bad hash, a bad signature, a bad fingerprint, a missing `cosign` and a failed download, and checks that each one refuses.
+Install `cosign` from the Sigstore project's own signed release. The identity regexp is the one `scripts/deploy_testnet.sh` enforces. `scripts/producers/tests/test_runbook_install_block.py` runs this exact block from this file against a bad hash, a bad signature, a bad fingerprint, a missing `cosign`, a failed download, a symlinked binary or release directory, and a binary that changes itself or its copies while it runs, and checks that each one refuses. It also checks that symlinks at `citrate-node.prev` or `citrate-node.new` are not followed and that the release file's mode and owner are not carried over.
 
 Then get the tools at the same tag. Set `TAG` in your shell to the announced tag first, because the block above ran in its own shell: `git clone --depth 1 --branch "$TAG" https://github.com/CitrateNetwork/citrate-chain /opt/citrate-chain`. The commands below run from `/opt/citrate-chain`.
 
