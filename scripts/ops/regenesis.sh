@@ -32,6 +32,11 @@
 #   --with-aa       also run the ERC-4337 AA stack (DeployAA) + P256 verifier
 #   --broadcast     actually send txs (omit = simulate only; safe dry-run)
 #   --account NAME  forge keystore account to sign with (passed through)
+#   --password-file PATH  the keystore password file for --account (passed through to
+#                   every forge step as a path; this script never reads or prints it).
+#                   It must be a regular file of this user, mode 0600/0400, not a symlink,
+#                   in a directory only its owner can change, and unchanged between steps.
+#                   A password on the command line (--password) is refused.
 #   --private-key K forge private key to sign with (passed through; devnet only)
 #
 # DEVNET SAFETY: without --broadcast nothing is sent. A broadcast to a non-local
@@ -53,16 +58,35 @@ REROLL=0
 WITH_AA=0
 BROADCAST=0
 SIGNER_ARGS=()
+ACCOUNT_SET=0
+PASSWORD_FILE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --reroll)      REROLL=1; shift ;;
     --with-aa)     WITH_AA=1; shift ;;
     --broadcast)   BROADCAST=1; shift ;;
-    --account)     SIGNER_ARGS+=(--account "$2"); shift 2 ;;
+    --account)     SIGNER_ARGS+=(--account "$2"); ACCOUNT_SET=1; shift 2 ;;
+    --password-file) PASSWORD_FILE="${2:-}"; shift 2 ;;
+    # Never echo the value: it is the password.
+    --password | --password=*) die "a keystore password on the command line is refused; pass --password-file PATH" ;;
     --private-key) SIGNER_ARGS+=(--private-key "$2"); shift 2 ;;
     *) die "unknown arg: $1" ;;
   esac
 done
+# The password file goes to forge as a path. Its value is not echoed on refusal: a caller
+# that passed the password itself in its place must not see it in the log. It must be private
+# to this user, by the genesis ceremony's shared check (scripts/genesis/secret_file_check.py:
+# a regular file, not a symlink, owned by this user, no group or world bits, in a directory
+# only its owner can change), and is re-checked, as the same file, before every forge step.
+PASSWORD_FILE_ID=""
+PW_CHECK="${REPO_ROOT}/scripts/genesis/secret_file_check.py"
+pw_check() { "${PYTHON:-python3}" -I "$PW_CHECK" --password-file "$@"; }
+if [[ -n "$PASSWORD_FILE" ]]; then
+  [[ "$ACCOUNT_SET" == 1 ]] || die "--password-file needs --account (it unlocks that keystore)"
+  [[ -f "$PW_CHECK" ]] || die "the password-file check $PW_CHECK is missing; run regenesis.sh from a full checkout"
+  PASSWORD_FILE_ID=$(pw_check "$PASSWORD_FILE") || die "$PASSWORD_FILE_ID"
+  SIGNER_ARGS+=(--password-file "$PASSWORD_FILE")
+fi
 
 command -v forge >/dev/null || die "forge not on PATH"
 command -v jq >/dev/null || die "jq is required"
@@ -108,7 +132,10 @@ log "Step 0: clean full forge build (compile-scope determinism)"
 ( cd "$CONTRACTS" && forge clean && forge build ) || die "clean build failed"
 
 run_step() {
-  local script="$1"; shift
+  local script="$1" why; shift
+  if [[ -n "$PASSWORD_FILE" ]]; then
+    why=$(pw_check "$PASSWORD_FILE" "$PASSWORD_FILE_ID") || { err "${why}; stopping before ${script}"; exit 2; }
+  fi
   log "→ ${script}"
   ( cd "$CONTRACTS" && forge script "script/${script}" \
       --rpc-url "$RPC_URL" --sender "$DEPLOYER_ADDRESS" \
