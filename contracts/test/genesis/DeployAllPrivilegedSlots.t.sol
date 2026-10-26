@@ -114,10 +114,10 @@ contract DeployAllPrivilegedSlotsTest is Test {
         assertTrue(feeTo != SENDER, "fee went to the deployer");
     }
 
-    function _all() internal view returns (address[28] memory) {
+    function _all() internal view returns (address[27] memory) {
         return [
             d.registry, d.wsalt, d.agentRegistry, d.specRegistry, d.ipfs, d.facilitator, d.paywall,
-            d.stakingPool, d.contributions, d.slashing, d.mmAlloc, d.modelMarketplace, d.router,
+            d.contributions, d.slashing, d.mmAlloc, d.modelMarketplace, d.router,
             d.loraFactory, d.learningPool, d.cycleManager, d.classroom, d.mentorMatcher, d.verifier,
             d.computeMarketplace, d.computePool, d.heartbeat, d.dispute, d.oracle, d.treasury,
             d.gateway, d.farming, d.governor
@@ -140,7 +140,7 @@ contract DeployAllPrivilegedSlotsTest is Test {
     /// they are the documented deployer-governed exception.
     function test_noDeployedContract_namesTheDeployerInAnySlot() public {
         SlotSweep s = new SlotSweep();
-        address[28] memory all = _all();
+        address[27] memory all = _all();
         for (uint256 i = 0; i < all.length; i++) {
             if (all[i] == d.agentRegistry || all[i] == d.specRegistry || all[i] == d.mmAlloc) continue;
             assertEq(s.problem(all[i], SENDER), "", string.concat("deployer slot on #", vm.toString(i)));
@@ -173,7 +173,7 @@ contract DeployAllPrivilegedSlotsTest is Test {
     /// registries excluded as above) reports DEPLOYER-ADMIN 0.
     function test_checkDeployedAdmins_overTheDeployAllBook_isClean() public {
         vm.etch(0xc2b78104907F722DABAc4C69f826a522B2754De4, hex"600160005260206000f3");
-        address[28] memory all = _all();
+        address[27] memory all = _all();
         string memory body;
         uint256 n;
         for (uint256 i = 0; i < all.length; i++) {

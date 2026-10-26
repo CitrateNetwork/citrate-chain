@@ -6,6 +6,7 @@ import {TreasuryGovernor} from "../../src/TreasuryGovernor.sol";
 import {StablecoinTreasury} from "../../src/StablecoinTreasury.sol";
 import {MockERC20Gov} from "../TreasuryGovernor.t.sol";
 import {SaltSupply} from "../../src/lib/SaltSupply.sol";
+import {LiquidStakingPool} from "../../src/LiquidStakingPool.sol";
 
 contract CallTarget {
     uint256 public hits;
@@ -96,5 +97,62 @@ contract GovernorWithoutStakingPoolTest is Test {
         vm.prank(guardian);
         governor.cancel(b);
         assertEq(uint256(governor.state(b)), uint256(TreasuryGovernor.ProposalState.Canceled));
+    }
+
+    function test_liquidStakingEnabled_isFalse() public view {
+        _deployed();
+        assertFalse(governor.liquidStakingEnabled());
+    }
+
+    /// Passed proposal (vote + timelock) calling the governor itself.
+    function _passCall(bytes memory data) internal returns (uint256 id) {
+        vm.deal(voter, QUORUM);
+        vm.prank(voter);
+        governor.lockVotes{value: QUORUM}();
+        vm.roll(++h);
+        vm.prank(voter);
+        id = governor.proposeCall("wire", "d", address(governor), 0, data);
+        vm.roll(++h);
+        vm.prank(voter);
+        governor.castVote(id, TreasuryGovernor.VoteType.For);
+        h += governor.VOTING_PERIOD() + 1;
+        vm.roll(h);
+        governor.queue(id);
+        h += governor.EXECUTION_DELAY();
+        vm.roll(h);
+    }
+
+    function test_setStakingPool_viaPassedProposal_wiresOnce() public {
+        _deployed();
+        LiquidStakingPool pool = new LiquidStakingPool(address(this));
+        uint256 id = _passCall(abi.encodeCall(TreasuryGovernor.setStakingPool, (address(pool))));
+        governor.execute(id);
+        assertEq(address(governor.stakingPool()), address(pool));
+        assertTrue(governor.liquidStakingEnabled());
+        // A second wiring is refused, even through the governor itself.
+        address another = address(new LiquidStakingPool(address(this)));
+        vm.prank(address(governor));
+        vm.expectRevert(bytes("TreasuryGovernor: staking pool already set"));
+        governor.setStakingPool(another);
+    }
+
+    function test_setStakingPool_directCall_isRefused() public {
+        _deployed();
+        LiquidStakingPool pool = new LiquidStakingPool(address(this));
+        vm.expectRevert(bytes("TreasuryGovernor: only via a passed proposal"));
+        governor.setStakingPool(address(pool));
+        vm.prank(guardian);
+        vm.expectRevert(bytes("TreasuryGovernor: only via a passed proposal"));
+        governor.setStakingPool(address(pool));
+    }
+
+    function test_setStakingPool_withoutCode_isRefused() public {
+        _deployed();
+        vm.prank(address(governor));
+        vm.expectRevert(bytes("TreasuryGovernor: staking pool has no code"));
+        governor.setStakingPool(address(0));
+        vm.prank(address(governor));
+        vm.expectRevert(bytes("TreasuryGovernor: staking pool has no code"));
+        governor.setStakingPool(makeAddr("eoa"));
     }
 }

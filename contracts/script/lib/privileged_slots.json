@@ -34,7 +34,6 @@
     "InferenceRouter.allProviders": "exempt: providers self-register (msg.sender); the list grants no authority",
     "InferenceRouter.modelRegistry": "checked",
     "LearningCycleManager.eligibleParticipant": "checked",
-    "LiquidStakingPool.isOracle": "checked",
     "LoRAFactory.modelRegistry": "checked",
     "MarketMakerAllocation.marketMaker": "checked",
     "MentorMatcher.authorizedMatcher": "checked",

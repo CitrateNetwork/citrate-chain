@@ -20,7 +20,6 @@ import "../src/LoRAFactory.sol";
 import "../src/IPFSIncentives.sol";
 
 // Economics
-import "../src/LiquidStakingPool.sol";
 import "../src/ContributionAccounting.sol";
 import "../src/NematocystSlashing.sol";
 import "../src/MarketMakerAllocation.sol";
@@ -56,13 +55,13 @@ import "../src/SpecRegistry.sol";
  *         Run: forge script script/DeployAll.s.sol --rpc-url http://localhost:8545 --broadcast -vvvv
  *
  *         This is one of six ceremony steps. The full reroll runs:
- *           1. DeployAll.s.sol                  (this script — 28 contracts)
+ *           1. DeployAll.s.sol                  (this script — 27 contracts)
  *           2. DeployModelAccessControl.s.sol   (1 contract — separated due to OZ deps)
  *           3. DeployTEEAttestationRegistry.s.sol (1 contract — CM-08)
  *           4. DeployComputePoolTraining.s.sol  (1 contract — CM-07)
  *           5. DeployEduStack.s.sol             (5 contracts — Learning Center)
  *           6. DeployAIGateway.s.sol            (3 contracts — edu/ai-gateway)
- *         Total: 39 contracts. See scripts/regenesis.sh for the orchestration.
+ *         Total: 38 contracts. See scripts/regenesis.sh for the orchestration.
  *
  *         PBA-L2-002 (pre-bounty audit 2026-09-24): every contract whose admin /
  *         owner / governance used to be `msg.sender` now receives it explicitly
@@ -87,7 +86,7 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         address ipfs;
         address facilitator;
         address paywall;
-        address stakingPool;
+        address stakingPool; // always address(0): not part of block 0
         address contributions;
         address slashing;
         address mmAlloc;
@@ -233,10 +232,11 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         // =====================================================================
         console.log("--- Layer 3: Economics ---");
 
-        LiquidStakingPool stakingPool = (_isLive("LiquidStakingPool", abi.encodePacked(type(LiquidStakingPool).creationCode, abi.encode(governance)))
-            ? LiquidStakingPool(payable(_create2Address("LiquidStakingPool", abi.encodePacked(type(LiquidStakingPool).creationCode, abi.encode(governance)))))
-            : new LiquidStakingPool{salt: Salts.salt("LiquidStakingPool")}(governance));
-        console.log("  LiquidStakingPool:", address(stakingPool));
+        // LiquidStakingPool is not part of block 0 (owner decision): none is
+        // deployed and TreasuryGovernor is born with the liquid-staking path
+        // disabled (address(0)). A later passed proposal can wire a pool
+        // through TreasuryGovernor.setStakingPool.
+        console.log("  LiquidStakingPool: not deployed (liquid staking disabled at genesis)");
 
         ContributionAccounting contributions =
             (_isLive("ContributionAccounting", abi.encodePacked(type(ContributionAccounting).creationCode, abi.encode(governance)))
@@ -485,19 +485,19 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         console.log("  TestnetFarmingAccounting:", address(farming));
 
         TreasuryGovernor governor = (_isLive("TreasuryGovernor", abi.encodePacked(type(TreasuryGovernor).creationCode, abi.encode(
-            address(stakingPool),
+            address(0), // no LiquidStakingPool at genesis (liquid staking disabled)
             address(treasury),
             guardian, // guardian (PBA-L2-001: set GUARDIAN to the multisig)
             SaltSupply.TOTAL_SUPPLY // canonical SALT supply (quorum basis)
         )))
             ? TreasuryGovernor(payable(_create2Address("TreasuryGovernor", abi.encodePacked(type(TreasuryGovernor).creationCode, abi.encode(
-            address(stakingPool),
+            address(0), // no LiquidStakingPool at genesis (liquid staking disabled)
             address(treasury),
             guardian, // guardian (PBA-L2-001: set GUARDIAN to the multisig)
             SaltSupply.TOTAL_SUPPLY // canonical SALT supply (quorum basis)
         )))))
             : new TreasuryGovernor{salt: Salts.salt("TreasuryGovernor")}(
-            address(stakingPool),
+            address(0), // no LiquidStakingPool at genesis (liquid staking disabled)
             address(treasury),
             guardian, // guardian (PBA-L2-001: set GUARDIAN to the multisig)
             SaltSupply.TOTAL_SUPPLY // canonical SALT supply (quorum basis)
@@ -514,7 +514,7 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
             ipfs: address(ipfs),
             facilitator: address(facilitator),
             paywall: address(paywall),
-            stakingPool: address(stakingPool),
+            stakingPool: address(0),
             contributions: address(contributions),
             slashing: address(slashing),
             mmAlloc: address(mmAlloc),
@@ -545,7 +545,7 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         console.log("");
         console.log("=== DEPLOYMENT COMPLETE ===");
         console.log("Chain ID:", block.chainid);
-        console.log("Total contracts deployed: 28");
+        console.log("Total contracts deployed: 27");
         console.log("");
         console.log("--- Contract Addresses ---");
         console.log("ModelRegistry         :", address(registry));
@@ -556,7 +556,7 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         console.log("X402Facilitator       :", address(facilitator));
         console.log("X402Paywall           :", address(paywall));
         console.log("ModelAccessControl    : separate ceremony step");
-        console.log("LiquidStakingPool     :", address(stakingPool));
+        console.log("LiquidStakingPool     : not deployed (liquid staking disabled)");
         console.log("ContributionAccounting:", address(contributions));
         console.log("NematocystSlashing    :", address(slashing));
         console.log("MarketMakerAllocation :", address(mmAlloc));
@@ -631,7 +631,8 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         _assertAdminRole("ModelMarketplace", d.modelMarketplace, governance);
         _assertAdminRole("InferenceRouter", d.router, governance);
         _assertAdminRole("LoRAFactory", d.loraFactory, governance);
-        _assertGovernance("LiquidStakingPool", d.stakingPool, governance);
+        require(d.stakingPool == address(0), "DeployAll: LiquidStakingPool is not part of block 0");
+        require(address(TreasuryGovernor(payable(d.governor)).stakingPool()) == address(0), "TreasuryGovernor: staking pool set");
         _assertGovernance("ContributionAccounting", d.contributions, governance);
         _assertGovernance("NematocystSlashing", d.slashing, governance);
         _assertGovernance("LearningCycleManager", d.cycleManager, governance);
@@ -665,9 +666,9 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         );
         require(ComputeVerifier(d.verifier).marketplaceLocked(), "ComputeVerifier: marketplace hand-over still open");
 
-        address[28] memory all = [
+        address[27] memory all = [
             d.registry, d.wsalt, d.agentRegistry, d.specRegistry, d.ipfs, d.facilitator, d.paywall,
-            d.stakingPool, d.contributions, d.slashing, d.mmAlloc, d.modelMarketplace, d.router,
+            d.contributions, d.slashing, d.mmAlloc, d.modelMarketplace, d.router,
             d.loraFactory, d.learningPool, d.cycleManager, d.classroom, d.mentorMatcher, d.verifier,
             d.computeMarketplace, d.computePool, d.heartbeat, d.dispute, d.oracle, d.treasury,
             d.gateway, d.farming, d.governor
