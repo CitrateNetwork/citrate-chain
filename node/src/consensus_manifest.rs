@@ -342,6 +342,210 @@ mod tests {
         );
     }
 
+    const SAMPLE_GATED: &[&str] = &["rule-a", "rule-b"];
+
+    /// Fixed inputs for the pure-function tests (independent of the build).
+    fn sample(feat_commd_fold_verify: bool) -> FingerprintInputs<'static> {
+        FingerprintInputs {
+            git_sha: "0123abc",
+            feat_halo2_verifier: false,
+            feat_commd_fold_verify,
+            activation_gated: SAMPLE_GATED,
+            pba_hardening_height: Some(1000),
+            agent_precompiles_height: None,
+            value_transfer_activation_height: 1,
+            create_nonce_fix_activation_height: 2,
+            merge_depth_activation_height: 3,
+            canonical_base_fee_per_gas: 1_000_000_000,
+            epoch: 1000,
+            snapshot_lag: 200,
+        }
+    }
+
+    /// The 0x0130 mode is part of the pre-image: the two modes are written out
+    /// and give different fingerprints. A build with and without
+    /// commd-fold-verify must never report the same fingerprint.
+    #[test]
+    fn commd_mode_enters_the_fingerprint() {
+        let gated = sample(true);
+        let absent = sample(false);
+        assert!(
+            fingerprint_preimage(&gated).contains("\ncommd_fold_verify=gated\n"),
+            "pre-image must name the 0x0130 mode when the feature is compiled in"
+        );
+        assert!(
+            fingerprint_preimage(&absent).contains("\ncommd_fold_verify=absent\n"),
+            "pre-image must name the 0x0130 mode when the feature is absent"
+        );
+        assert_ne!(
+            fingerprint_of(&gated),
+            fingerprint_of(&absent),
+            "the two 0x0130 modes must not share a fingerprint"
+        );
+    }
+
+    /// Golden vectors: the exact pre-image text and fingerprint for fixed inputs.
+    /// The expected digests were computed independently (python3 hashlib.sha256
+    /// over the literal pre-image below). Any change to what the fingerprint
+    /// covers, or how it is written, fails here and must be made on purpose.
+    #[test]
+    fn fingerprint_golden_vector_is_pinned() {
+        let expected_gated = "citrate-consensus-v3\ngit_sha=0123abc\nhalo2_verifier=false\n\
+            commd_fold_verify=gated\nactivation_gated=rule-a|rule-b\n\
+            pba_hardening_height=1000\nvalue_transfer_height=1\ncreate_nonce_fix_height=2\n\
+            merge_depth_height=3\nbase_fee=1000000000\nepoch=1000\nsnapshot_lag=200\n";
+        assert_eq!(fingerprint_preimage(&sample(true)), expected_gated);
+        assert_eq!(
+            fingerprint_of(&sample(true)),
+            "0x997452c0b05b6e1c5872e0735dade13b"
+        );
+        assert_eq!(
+            fingerprint_of(&sample(false)),
+            "0xf94e43b6bcacef7a0c72088f5cc57a49"
+        );
+    }
+
+    /// Every input moves the fingerprint, and no two single-field changes
+    /// collide with each other or with the base.
+    #[test]
+    fn every_fingerprint_input_changes_the_fingerprint() {
+        let base = sample(true);
+        let other_gated: &[&str] = &["rule-a"];
+        let variants: Vec<(&str, FingerprintInputs<'_>)> = vec![
+            (
+                "git_sha",
+                FingerprintInputs {
+                    git_sha: "0123abd",
+                    ..base
+                },
+            ),
+            (
+                "halo2",
+                FingerprintInputs {
+                    feat_halo2_verifier: true,
+                    ..base
+                },
+            ),
+            (
+                "commd mode",
+                FingerprintInputs {
+                    feat_commd_fold_verify: false,
+                    ..base
+                },
+            ),
+            (
+                "activation_gated",
+                FingerprintInputs {
+                    activation_gated: other_gated,
+                    ..base
+                },
+            ),
+            (
+                "pba height",
+                FingerprintInputs {
+                    pba_hardening_height: Some(1001),
+                    ..base
+                },
+            ),
+            (
+                "pba unset",
+                FingerprintInputs {
+                    pba_hardening_height: None,
+                    ..base
+                },
+            ),
+            (
+                "agent height",
+                FingerprintInputs {
+                    agent_precompiles_height: Some(5),
+                    ..base
+                },
+            ),
+            (
+                "value transfer",
+                FingerprintInputs {
+                    value_transfer_activation_height: 9,
+                    ..base
+                },
+            ),
+            (
+                "create nonce",
+                FingerprintInputs {
+                    create_nonce_fix_activation_height: 9,
+                    ..base
+                },
+            ),
+            (
+                "merge depth",
+                FingerprintInputs {
+                    merge_depth_activation_height: 9,
+                    ..base
+                },
+            ),
+            (
+                "base fee",
+                FingerprintInputs {
+                    canonical_base_fee_per_gas: 7,
+                    ..base
+                },
+            ),
+            ("epoch", FingerprintInputs { epoch: 999, ..base }),
+            (
+                "snapshot lag",
+                FingerprintInputs {
+                    snapshot_lag: 199,
+                    ..base
+                },
+            ),
+        ];
+        let mut seen = std::collections::HashMap::new();
+        seen.insert(fingerprint_of(&base), "base");
+        for (name, v) in &variants {
+            if let Some(prev) = seen.insert(fingerprint_of(v), name) {
+                panic!("changing `{name}` gives the same fingerprint as `{prev}`");
+            }
+        }
+    }
+
+    /// The manifest's own fingerprint is exactly the pure function over the
+    /// fields it reports, so the tests above cover the shipped value and a
+    /// field cannot be reported while a different value is hashed.
+    #[test]
+    fn manifest_fingerprint_is_the_pure_function_of_its_fields() {
+        for (p, a) in [(None, None), (Some(0), None), (Some(10), Some(500))] {
+            let m = ConsensusManifest::for_heights(p, a);
+            let inputs = FingerprintInputs {
+                git_sha: m.git_sha,
+                feat_halo2_verifier: m.feat_halo2_verifier,
+                feat_commd_fold_verify: m.feat_commd_fold_verify,
+                activation_gated: &m.activation_gated,
+                pba_hardening_height: m.pba_hardening_height,
+                agent_precompiles_height: m.agent_precompiles_height,
+                value_transfer_activation_height: m.value_transfer_activation_height,
+                create_nonce_fix_activation_height: m.create_nonce_fix_activation_height,
+                merge_depth_activation_height: m.merge_depth_activation_height,
+                canonical_base_fee_per_gas: m.canonical_base_fee_per_gas,
+                epoch: m.epoch,
+                snapshot_lag: m.snapshot_lag,
+            };
+            assert_eq!(
+                m.fingerprint,
+                fingerprint_of(&inputs),
+                "heights {p:?} {a:?}"
+            );
+            // Flipping only the reported 0x0130 mode must not reproduce it.
+            let flipped = FingerprintInputs {
+                feat_commd_fold_verify: !m.feat_commd_fold_verify,
+                ..inputs
+            };
+            assert_ne!(
+                m.fingerprint,
+                fingerprint_of(&flipped),
+                "heights {p:?} {a:?}"
+            );
+        }
+    }
+
     #[test]
     fn json_roundtrips_key_fields() {
         let m = ConsensusManifest::current();
