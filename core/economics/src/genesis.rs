@@ -709,6 +709,9 @@ pub fn initialize_shared_genesis_state(
         if let Some(code) = &account.code {
             executor.set_code(&account.address, code.clone());
         }
+        for (slot, value) in &account.storage {
+            executor.set_genesis_storage(&account.address, *slot, *value);
+        }
         tracing::info!(
             "Genesis account 0x{}: {} SALT",
             hex::encode(account.address.0),
