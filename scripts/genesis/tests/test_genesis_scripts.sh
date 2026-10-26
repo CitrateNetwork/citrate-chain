@@ -1129,6 +1129,29 @@ rm -rf "$P1D"
 # A gate that fails before its phase sent anything still names that phase's resume (control).
 c9_setup
 expect "ceremony recovery: a gate failure before any broadcast resumes at that phase" 3 "fix it, then resume: .* --confirm --from P2 --account deployer" -- "${C9ENV[@]}" VALIDATOR_GOVERNANCE="$STALE" bash "$CE" --confirm --only P2 --account deployer
+# C10 with the membership book P2 writes (G9): found before P2 has sent anything it is another
+# run's and P0 refuses it; once this run's P2 has broadcast it is this run's, so P2's own
+# refusal (naming the record step) speaks instead of "move it aside", and the record step,
+# which writes no membership book, goes on.
+c9_setup
+printf '{}' >"$GB/membership.json"
+reset_calls
+expect "ceremony C10: a membership book found before P2 sent anything is refused at P0" 3 'GATE FAIL at P0: .*membership.json already exists and P2 would write it' -- "${C9ENV[@]}" bash "$CE" --confirm --only P2 --account deployer
+if calls | grep -q '^regenesis'; then bad "ceremony C10: a refused stale membership book runs no regenesis" "$(calls)"; else ok "ceremony C10: a refused stale membership book runs no regenesis"; fi
+cp -R "$C9BC" "$REPO/contracts/broadcast"
+out=$("${C9ENV[@]}" bash "$CE" --confirm --only P2 --account deployer 2>&1)
+rc=$?
+if [[ $rc -eq 3 ]] && grep -q "GATE FAIL at P2: this run.s P2 broadcasts are already recorded" <<<"$out" && ! grep -q 'move it aside' <<<"$out" && [[ -z "$(reruns_p2 "$out")" ]]; then
+  ok "ceremony C10: after P2 broadcast, its membership book is not called stale; P2 refuses and names the record step"
+else
+  bad "ceremony C10: after P2 broadcast, its membership book is not called stale; P2 refuses and names the record step (exit $rc)" "$out"
+fi
+reset_calls
+expect "ceremony C10: the record step goes on with this run's membership book in place" 0 'P2 stack book recorded' -- "${C9ENV[@]}" bash "$CE" --confirm --only P2 --record-stack-book --account deployer
+if calls | grep -q '^regenesis'; then bad "ceremony C10: the record step with a membership book sends nothing" "$(calls)"; else ok "ceremony C10: the record step with a membership book sends nothing"; fi
+expect "ceremony C10: P2 with a recorded book is refused as done, not as a stale membership book" 3 'GATE FAIL at P2: the run manifest already records the stack book: P2 is done' -- "${C9ENV[@]}" bash "$CE" --confirm --only P2 --account deployer
+rm -f "$GB/membership.json"
+cp "$T/book.c9.orig" "$GBK"
 rm -rf "$REPO/contracts/broadcast" "$FAKE/call/$C9X" "$FAKE/call/$C9MM" "$FAKE/call/$C9CM"
 mk_manifest "$GB"
 # C8 on P5/P6: once P2 recorded its book, a different book is refused; --confirm needs one.
