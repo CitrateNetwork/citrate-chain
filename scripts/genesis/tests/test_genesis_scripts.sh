@@ -94,6 +94,18 @@ EOF
 cat >"$BIN/forge" <<'EOF'
 #!/usr/bin/env bash
 echo "forge $*" >>"$FAKE/calls.log"
+# FAKE_PW_SWAP=<path>: at the first call, change that password file the way FAKE_PW_SWAP_HOW
+# says (a new file at the path, a looser mode, a symlink, or another file renamed over it).
+if [[ -n "${FAKE_PW_SWAP:-}" && ! -e "$FAKE/pw-swapped" ]]; then
+  : >"$FAKE/pw-swapped"
+  d=$(dirname "$FAKE_PW_SWAP")
+  case "${FAKE_PW_SWAP_HOW:-}" in
+    replace) rm -f "$FAKE_PW_SWAP"; (umask 077 && printf 'other\n' >"$FAKE_PW_SWAP") ;;
+    chmod) chmod 644 "$FAKE_PW_SWAP" ;;
+    symlink) rm -f "$FAKE_PW_SWAP"; ln -s "$d/target" "$FAKE_PW_SWAP" ;;
+    rename) (umask 077 && printf 'other\n' >"$d/pw.new") && mv -f "$d/pw.new" "$FAKE_PW_SWAP" ;;
+  esac
+fi
 echo "forge-env gov=${GENESIS_GOVERNANCE_OUT:-} vest=${TEAM_VESTING_OUT:-} dormant=${DORMANT_LEDGERS_OUT:-} govbook=${GENESIS_GOVERNANCE_BOOK:-} extras=${EXTRA_ADDRESS_BOOKS:-}" >>"$FAKE/calls.log"
 echo "forge-deployer dep=${DEPLOYER_ADDRESS-<unset>} ceremony=${CEREMONY_DEPLOYER_ADDRESS-<unset>}" >>"$FAKE/calls.log"
 env >>"$FAKE/forge.env"
@@ -942,6 +954,38 @@ no_pw "regenesis #364: a refused --password=… is not echoed" "$T/rg-pw2.log" "
 expect "regenesis #364: a --password-file that is not a readable file is refused" 1 'password-file must name a readable file' -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" bash "$RG/scripts/ops/regenesis.sh" --account deployer --password-file "$PW_STR"
 expect "regenesis #364: --password-file without --account is refused" 1 'password-file needs --account' -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" bash "$RG/scripts/ops/regenesis.sh" --password-file "$PW_FILE"
 if calls | grep -q '^forge'; then bad "regenesis #364: a refused password input runs no forge" "$(calls)"; else ok "regenesis #364: a refused password input runs no forge"; fi
+# regenesis.sh runs the same shared check as the ceremony (it is also run on its own, from the
+# reroll runbooks), and re-checks the file before every forge step.
+mkdir -p "$RG/scripts/genesis"
+cp "$G/secret_file_check.py" "$RG/scripts/genesis/"
+RGPW="$PWD_DIR/rg"
+mkdir -m 700 "$RGPW"
+(umask 077 && printf '%s\n' "$PW_STR" >"$RGPW/ok" && printf '%s\n' "$PW_STR" >"$RGPW/loose" && printf 'y\n' >"$RGPW/target")
+chmod 644 "$RGPW/loose"
+ln -s "$RGPW/ok" "$RGPW/link"
+mkdir -m 777 "$RGPW/open"
+(umask 077 && printf '%s\n' "$PW_STR" >"$RGPW/open/pw")
+for c in "loose|must not be readable or writable by group or others" "link|must not be a symlink" "open/pw|must sit in a directory only its owner can change"; do
+  reset_calls
+  expect "regenesis: a password file that is not private (${c%%|*}) is refused" 1 "${c#*|}" -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" bash "$RG/scripts/ops/regenesis.sh" --account deployer --password-file "$RGPW/${c%%|*}"
+  if calls | grep -q '^forge'; then bad "regenesis: a non-private password file (${c%%|*}) runs no forge" "$(calls)"; else ok "regenesis: a non-private password file (${c%%|*}) runs no forge"; fi
+done
+chmod 700 "$RGPW/open"
+# The fake forge changes the file at its first call (the clean build): no forge script step runs.
+for how in replace chmod symlink; do
+  reset_calls
+  rm -f "$FAKE/pw-swapped" "$RGPW/pw"
+  rm -f "$RGPW/pw.new"
+  (umask 077 && printf '%s\n' "$PW_STR" >"$RGPW/pw")
+  out=$(env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" FAKE_PW_SWAP="$RGPW/pw" FAKE_PW_SWAP_HOW="$how" bash "$RG/scripts/ops/regenesis.sh" --account deployer --password-file "$RGPW/pw" 2>&1)
+  rc=$?
+  if [[ -f "$FAKE/pw-swapped" && $rc -eq 2 ]] && grep -q 'password-file changed since' <<<"$out" && ! calls | grep -q '^forge script '; then
+    ok "regenesis: a password file changed after its check ($how) stops before the first forge step"
+  else
+    bad "regenesis: a password file changed after its check ($how) stops before the first forge step (exit $rc)" "$(calls | grep '^forge' || true)"$'\n'"$out"
+  fi
+done
+rm -f "$FAKE/pw-swapped"
 # The ceremony refuses the same inputs before any phase, without echoing them.
 expect "ceremony #364: a password on the command line is refused" 1 'password on the command line is refused' -- "${CEENV[@]}" bash "$CE" --account deployer --password "$PW_STR"
 "${CEENV[@]}" bash "$CE" --account deployer "--password=$PW_STR" >"$T/ce-pw2.log" 2>&1
@@ -1027,6 +1071,24 @@ else
 fi
 no_pw "ceremony #364: the password is in no P2 argv, env or log" "$FAKE/calls.log" "$FAKE/regenesis.env" "$T/pw-p2.log"
 cp "$T/book.c9.orig" "$GBK"
+# P2 hands the password file to regenesis.sh: it is re-checked first and must still be the file
+# the preflight accepted (the fake cast changes it during the P0 preflight).
+for how in replace chmod symlink; do
+  c9_setup
+  reset_calls
+  rm -rf "$PWD_DIR/p2" "$FAKE/pw-swapped"
+  mkdir -m 700 "$PWD_DIR/p2"
+  (umask 077 && printf '%s\n' "$PW_STR" >"$PWD_DIR/p2/pw" && printf 'y\n' >"$PWD_DIR/p2/target")
+  out=$("${C9ENV[@]}" FAKE_PW_SWAP="$PWD_DIR/p2/pw" FAKE_PW_SWAP_HOW="$how" bash "$CE" --confirm --only P2 --account deployer --password-file "$PWD_DIR/p2/pw" 2>&1)
+  rc=$?
+  if [[ -f "$FAKE/pw-swapped" && $rc -eq 3 ]] && grep -q 'GATE FAIL at P2: --password-file' <<<"$out" && ! calls | grep -q '^regenesis '; then
+    ok "ceremony: a password file changed after the preflight ($how) stops P2 before regenesis.sh"
+  else
+    bad "ceremony: a password file changed after the preflight ($how) stops P2 before regenesis.sh (exit $rc)" "$(calls | grep -E '^(regenesis|forge) ' || true)"$'\n'"$out"
+  fi
+  cp "$T/book.c9.orig" "$GBK"
+done
+rm -rf "$PWD_DIR/p2" "$FAKE/pw-swapped"
 # One canonical spelling on the compare side: the gate compares canonical (lowercase) books, so
 # a book that spells an address in another case is the same book as the generator's.
 C9B_MIXED="$T/c9-book-mixed.json"
