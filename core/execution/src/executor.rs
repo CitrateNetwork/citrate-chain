@@ -1773,6 +1773,13 @@ impl Executor {
     ) -> Result<(), ExecutionError> {
         use crate::block_rewards as br;
 
+        // The world state now becomes the post-state of the block at `height`:
+        // its root (taken after settlement by the producer, block import and
+        // trusted replay alike) follows that height's storage-root rule. A
+        // rejected block restores the pre-block snapshot, which restores the
+        // previous height with it.
+        self.state_db.set_root_height(height);
+
         // (1) basic block reward — identical to the pre-§R' credit loop.
         for (addr, amount) in basic_credits {
             if *amount > U256::zero() {

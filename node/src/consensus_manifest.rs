@@ -60,6 +60,10 @@ pub struct ConsensusManifest {
     /// Supply hardening fork height (`citrate_execution::supply_hardening`);
     /// `None` = not activated. Part of the fingerprint only when set.
     pub supply_hardening_height: Option<u64>,
+    /// Storage-root hardening fork height
+    /// (`citrate_execution::storage_root_hardening`); `None` = not activated.
+    /// Part of the fingerprint only when set.
+    pub storage_root_hardening_height: Option<u64>,
     /// Execution/consensus rules that switch on by height, as this process
     /// resolved them (compiled default or devnet env override). A node whose
     /// env overrides one of these computes different roots, so they are in the
@@ -95,6 +99,7 @@ impl ConsensusManifest {
             pba_hardening_height,
             citrate_execution::agent_fork::agent_precompiles_height(),
             citrate_execution::supply_hardening::supply_hardening_height(),
+            citrate_execution::storage_root_hardening::storage_root_hardening_height(),
         )
     }
 
@@ -103,6 +108,7 @@ impl ConsensusManifest {
         pba_hardening_height: Option<u64>,
         agent_precompiles_height: Option<u64>,
         supply_hardening_height: Option<u64>,
+        storage_root_hardening_height: Option<u64>,
     ) -> Self {
         let version = env!("CARGO_PKG_VERSION");
         let git_sha = env!("CITRATE_GIT_SHA");
@@ -159,6 +165,11 @@ impl ConsensusManifest {
             Some(h) => format!("{preimage}supply_hardening_height={h}\n"),
             None => preimage,
         };
+        // And for the storage-root hardening fork.
+        let preimage = match storage_root_hardening_height {
+            Some(h) => format!("{preimage}storage_root_hardening_height={h}\n"),
+            None => preimage,
+        };
         let digest = Sha256::digest(preimage.as_bytes());
         let fingerprint = format!("0x{}", hex::encode(digest.get(..16).unwrap_or(&digest)));
 
@@ -173,6 +184,7 @@ impl ConsensusManifest {
             pba_hardening_height,
             agent_precompiles_height,
             supply_hardening_height,
+            storage_root_hardening_height,
             value_transfer_activation_height,
             create_nonce_fix_activation_height,
             merge_depth_activation_height,
@@ -214,6 +226,12 @@ impl ConsensusManifest {
             "  supply hardening   {}",
             self.supply_hardening_height
                 .map(|h| format!("from height {h}"))
+                .unwrap_or_else(|| "not activated".to_string())
+        );
+        println!(
+            "  storage root       {}",
+            self.storage_root_hardening_height
+                .map(|h| format!("hardened from height {h}"))
                 .unwrap_or_else(|| "not activated".to_string())
         );
         println!(
@@ -294,26 +312,41 @@ mod tests {
     /// before; a scheduled one is part of it.
     #[test]
     fn agent_fork_height_enters_the_fingerprint_only_when_set() {
-        let unset = ConsensusManifest::for_heights(Some(10), None, None);
-        let a = ConsensusManifest::for_heights(Some(10), Some(500), None);
-        let b = ConsensusManifest::for_heights(Some(10), Some(501), None);
+        let unset = ConsensusManifest::for_heights(Some(10), None, None, None);
+        let a = ConsensusManifest::for_heights(Some(10), Some(500), None, None);
+        let b = ConsensusManifest::for_heights(Some(10), Some(501), None, None);
         assert_eq!(a.agent_precompiles_height, Some(500));
         assert_ne!(a.fingerprint, unset.fingerprint);
         assert_ne!(a.fingerprint, b.fingerprint);
         assert_eq!(
             unset.fingerprint,
-            ConsensusManifest::for_heights(Some(10), None, None).fingerprint
+            ConsensusManifest::for_heights(Some(10), None, None, None).fingerprint
         );
     }
 
     #[test]
     fn supply_hardening_height_enters_the_fingerprint_only_when_scheduled() {
-        let unset = ConsensusManifest::for_heights(Some(10), None, None);
-        let a = ConsensusManifest::for_heights(Some(10), None, Some(700));
-        let b = ConsensusManifest::for_heights(Some(10), None, Some(701));
+        let unset = ConsensusManifest::for_heights(Some(10), None, None, None);
+        let a = ConsensusManifest::for_heights(Some(10), None, Some(700), None);
+        let b = ConsensusManifest::for_heights(Some(10), None, Some(701), None);
         assert_eq!(a.supply_hardening_height, Some(700));
         assert_ne!(a.fingerprint, unset.fingerprint);
         assert_ne!(a.fingerprint, b.fingerprint);
+    }
+
+    #[test]
+    fn storage_root_hardening_height_enters_the_fingerprint_only_when_scheduled() {
+        let unset = ConsensusManifest::for_heights(Some(10), None, None, None);
+        let zero = ConsensusManifest::for_heights(Some(10), None, None, Some(0));
+        let later = ConsensusManifest::for_heights(Some(10), None, None, Some(900));
+        assert_eq!(zero.storage_root_hardening_height, Some(0));
+        assert_ne!(zero.fingerprint, unset.fingerprint);
+        assert_ne!(zero.fingerprint, later.fingerprint);
+        // Distinct from the supply fork at the same height.
+        assert_ne!(
+            later.fingerprint,
+            ConsensusManifest::for_heights(Some(10), None, Some(900), None).fingerprint
+        );
     }
 
     #[test]

@@ -94,14 +94,30 @@ fn state_root_after_a_storage_delete_matches_a_restart_rebuild() {
     restarted.set_storage(gov, b, vec![1]);
     restarted.set_storage(gov, c, vec![2]);
 
+    // From the storage-root hardening height (here a new genesis, `Some(0)`,
+    // block 1) the roots agree.
+    let (activation, height) = (Some(0), 1);
     assert_eq!(
-        live.get_storage_root_recomputed(&gov),
-        restarted.get_storage_root_recomputed(&gov),
+        live.storage_root_with(activation, height, &gov),
+        restarted.storage_root_with(activation, height, &gov),
         "storage root depends on delete history"
     );
     assert_eq!(
-        live.calculate_state_root(),
-        restarted.calculate_state_root(),
+        live.calculate_state_root_with(activation, height),
+        restarted.calculate_state_root_with(activation, height),
         "state root depends on delete history"
+    );
+
+    // Below the height (and on a chain with no height scheduled) the legacy
+    // root is kept unchanged, so historical blocks replay to their roots.
+    assert_ne!(
+        live.calculate_state_root_with(None, height),
+        restarted.calculate_state_root_with(None, height),
+        "legacy root must stay the historical function"
+    );
+    assert_eq!(
+        live.calculate_state_root(),
+        live.calculate_state_root_with(None, 0),
+        "an unscheduled node keeps the legacy root"
     );
 }
