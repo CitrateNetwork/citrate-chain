@@ -497,6 +497,15 @@ async fn main() -> Result<()> {
             let (agent_height, _) =
                 citrate_execution::agent_fork::resolve_for_chain(chain_id, agent_configured)
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
+            // Same resolution as start_node for the canonical VRF encoding
+            // height; the manifest reads it from the process store.
+            citrate_consensus::vrf_encoding::init_for_chain(
+                chain_id,
+                file_cfg
+                    .as_ref()
+                    .and_then(|c| c.chain.vrf_canonical_encoding_height),
+            )
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
             let manifest =
                 consensus_manifest::ConsensusManifest::for_heights(resolved.height, agent_height);
             // The activation heights compiled into this release (a node on a
@@ -1415,6 +1424,26 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         None => info!(
             "Agent precompile fork not scheduled (source: {}); precompile set unchanged",
             agent_fork_source
+        ),
+    }
+    // Canonical ECVRF proof encoding height, published before the DAG store
+    // (whose VRF selector captures it) is built. 40204 leaves it unscheduled
+    // in this release; a disagreeing env or config value on a release network
+    // aborts start-up instead of forking this node at the height.
+    let (vrf_encoding_height, vrf_encoding_source) =
+        citrate_consensus::vrf_encoding::init_for_chain(
+            config.chain.chain_id,
+            config.chain.vrf_canonical_encoding_height,
+        )
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    match vrf_encoding_height {
+        Some(h) => info!(
+            "Canonical ECVRF proof encoding required from height {} (source: {})",
+            h, vrf_encoding_source
+        ),
+        None => info!(
+            "Canonical ECVRF proof encoding not scheduled (source: {}); proof decoding unchanged",
+            vrf_encoding_source
         ),
     }
 

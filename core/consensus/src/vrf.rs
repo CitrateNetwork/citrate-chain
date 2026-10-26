@@ -764,6 +764,30 @@ impl LeaderElection {
 mod tests {
     use super::*;
 
+    /// Tripwire: the ECVRF verify path picks the canonical decoder by the
+    /// activation height, and nowhere else in this module decodes a proof.
+    #[test]
+    fn ecvrf_verify_path_is_gated_on_the_canonical_decoder() {
+        let src = include_str!("vrf.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let start = prod
+            .find("fn verify_ecvrf_proof(")
+            .expect("verify_ecvrf_proof");
+        let body = prod.get(start..).unwrap_or("");
+        let end = body
+            .get(1..)
+            .and_then(|b| b.find("\n    fn "))
+            .unwrap_or(body.len());
+        let body = body.get(..end).unwrap_or(body);
+        assert!(body.contains("vrf_encoding::active_at(self.canonical_encoding_height, slot)"));
+        assert!(body.contains("EcvrfProof::from_bytes_canonical(&proof.proof)"));
+        assert_eq!(
+            prod.matches("EcvrfProof::from_bytes").count(),
+            2,
+            "one gated pair of decode sites"
+        );
+    }
+
     #[tokio::test]
     async fn panic_s1_update_stake_moves_the_total_exactly() {
         let sel = VrfProposerSelector::new();

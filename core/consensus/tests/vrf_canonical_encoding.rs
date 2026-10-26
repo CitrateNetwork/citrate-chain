@@ -145,25 +145,38 @@ fn selector_default_is_the_process_store() {
 // Decoder: every tag, every malformed variant
 // ---------------------------------------------------------------------------
 
-/// Sweep every tag byte for Gamma and for the key: the canonical decoder
-/// accepts only the tag the point actually re-encodes to.
+/// Sweep every tag byte for Gamma and for the key. The canonical decoder
+/// accepts only 0x02/0x03. The opposite parity tag is the canonical encoding
+/// of a DIFFERENT point (the negation), so it decodes but the proof no longer
+/// verifies; every other tag is refused at decode.
 #[test]
-fn canonical_decoder_accepts_only_the_canonical_tag() {
-    let (proof, _) = ecvrf::prove(&seed(7), b"tag sweep").expect("prove");
+fn canonical_decoder_accepts_only_compressed_tags() {
+    let alpha = b"tag sweep";
+    let (proof, _) = ecvrf::prove(&seed(7), alpha).expect("prove");
     let honest = proof.to_bytes();
     EcvrfProof::from_bytes_canonical(&honest).expect("honest bytes are canonical");
 
     for at in [PK_TAG, GAMMA_TAG] {
+        let own = *honest.get(at).expect("tag");
         for tag in 0u8..=255 {
-            if tag == honest[at] {
+            if tag == own {
                 continue;
             }
             let mut b = honest.clone();
-            b[at] = tag;
-            assert!(
-                EcvrfProof::from_bytes_canonical(&b).is_err(),
-                "tag {tag:#04x} at offset {at} must be rejected by the canonical decoder"
-            );
+            *b.get_mut(at).expect("tag") = tag;
+            match EcvrfProof::from_bytes_canonical(&b) {
+                Ok(d) => {
+                    assert_eq!(tag, own ^ 0x01, "only the opposite parity tag decodes");
+                    assert!(
+                        ecvrf::verify(alpha, &d).is_err(),
+                        "the negated point must not verify (offset {at})"
+                    );
+                }
+                Err(_) => assert!(
+                    tag != own ^ 0x01,
+                    "opposite parity names a valid point; it must decode"
+                ),
+            }
         }
     }
 }
@@ -223,7 +236,11 @@ fn every_honest_proof_passes_the_strict_path() {
             "honest proof {i} must verify under the strict rule"
         );
         let d = EcvrfProof::from_bytes_canonical(&p.proof).expect("canonical");
-        assert_eq!(d.to_bytes(), p.proof, "honest bytes are the canonical bytes");
+        assert_eq!(
+            d.to_bytes(),
+            p.proof,
+            "honest bytes are the canonical bytes"
+        );
 
         // Raw prover, arbitrary alpha.
         let alpha = seed(30_000 + i);
@@ -296,7 +313,9 @@ async fn store_block_refuses_non_canonical_proof_from_the_height() {
         &secret,
     )
     .await;
-    let r = strict.store_block(signed_child(&genesis(), &secret, twin.clone())).await;
+    let r = strict
+        .store_block(signed_child(&genesis(), &secret, twin.clone()))
+        .await;
     assert!(
         matches!(r, Err(DagStoreError::InvalidVrf(_))),
         "non-canonical proof must be refused from the activation height, got {r:?}"

@@ -238,6 +238,17 @@ pub struct ChainConfig {
     #[serde(default)]
     pub agent_precompiles_height: Option<u64>,
 
+    /// Canonical ECVRF proof encoding activation height
+    /// (`citrate_consensus::vrf_encoding`): from this height a block's ECVRF
+    /// proof must carry its curve points in canonical compressed form.
+    ///
+    /// A CONSENSUS PARAMETER. Absent = not activated. On a release network
+    /// (40204) only the release pin sets it (unscheduled in this release): a
+    /// value here, or `CITRATE_VRF_CANONICAL_ENCODING_HEIGHT`, refuses to start
+    /// unless it equals the pin. Dev profiles set `0` (active from genesis).
+    #[serde(default)]
+    pub vrf_canonical_encoding_height: Option<u64>,
+
     /// A local development chain. The activation height compiled into the
     /// release for this chain id (`citrate_consensus::hardening::
     /// PINNED_ACTIVATIONS`) is not applied, so dev profiles keep choosing
@@ -369,6 +380,7 @@ impl Default for NodeConfig {
                 genesis_profile: None,
                 pba_hardening_height: None,
                 agent_precompiles_height: None,
+                vrf_canonical_encoding_height: None,
                 dev_profile: false,
             },
             network: NetworkConfig {
@@ -436,6 +448,8 @@ impl NodeConfig {
         config.chain.genesis_profile = Some("default".to_string());
         // PBA-R2: dev profile enforces the hardened validity rules from genesis.
         config.chain.pba_hardening_height = Some(0);
+        // Canonical ECVRF proof encoding from genesis on dev profiles.
+        config.chain.vrf_canonical_encoding_height = Some(0);
         config.chain.dev_profile = true;
         config.mining.enabled = true;
         config.mining.target_block_time = 2; // Fast blocks for testing
@@ -861,6 +875,85 @@ mod tests {
             assert!(
                 !text.contains("agent_precompiles_height"),
                 "{name} must not schedule the agent precompile fork"
+            );
+        }
+    }
+
+    /// The canonical VRF encoding height is published in start_node before
+    /// the DAG store (which captures it through its selector) is built, from
+    /// one publication path. Release profiles leave it to the release pin;
+    /// the dev profiles schedule it from genesis.
+    #[test]
+    fn vrf_encoding_is_published_first_and_only_dev_profiles_set_it() {
+        let main = include_str!("main.rs");
+        let start = main.find("async fn start_node(").expect("start_node");
+        let body = &main[start..];
+        let init = body
+            .find("citrate_consensus::vrf_encoding::init_for_chain(")
+            .expect("start_node must publish the canonical VRF encoding height");
+        for ctor in ["DagStore::", "ConsensusManifest::for_height("] {
+            let at = body
+                .find(ctor)
+                .unwrap_or_else(|| panic!("{ctor} in start_node"));
+            assert!(
+                init < at,
+                "VRF encoding height must be published before {ctor}"
+            );
+        }
+        assert!(
+            !main.contains("set_vrf_canonical_encoding_height("),
+            "one publication path"
+        );
+        assert_eq!(
+            NodeConfig::default().chain.vrf_canonical_encoding_height,
+            None
+        );
+        assert_eq!(
+            NodeConfig::devnet().chain.vrf_canonical_encoding_height,
+            Some(0)
+        );
+        for (name, text) in [
+            (
+                "node/config/mainnet.toml",
+                include_str!("../config/mainnet.toml"),
+            ),
+            (
+                "node/config/testnet.toml",
+                include_str!("../config/testnet.toml"),
+            ),
+            (
+                "node/config/testnet-beta.toml",
+                include_str!("../config/testnet-beta.toml"),
+            ),
+            (
+                "node/config/team-testnet.toml",
+                include_str!("../config/team-testnet.toml"),
+            ),
+            (
+                "testnet-config.toml",
+                include_str!("../../testnet-config.toml"),
+            ),
+        ] {
+            assert!(
+                !text.contains("vrf_canonical_encoding_height"),
+                "{name} must not set the canonical VRF encoding height"
+            );
+        }
+        for (name, text) in [
+            (
+                "node/config/devnet.toml",
+                include_str!("../config/devnet.toml"),
+            ),
+            (
+                "devnet-config.toml",
+                include_str!("../../devnet-config.toml"),
+            ),
+        ] {
+            let cfg: NodeConfig = toml::from_str(text).expect("dev profile parses");
+            assert_eq!(
+                cfg.chain.vrf_canonical_encoding_height,
+                Some(0),
+                "{name} schedules canonical VRF encoding from genesis"
             );
         }
     }
