@@ -478,15 +478,17 @@ async fn main() -> Result<()> {
             // env override and the config file's `[chain].pba_hardening_height`.
             let file_cfg = resolve_config_path(cli.config.clone())
                 .and_then(|p| NodeConfig::from_file(&p).ok());
-            let (cfg_chain_id, configured, dev_profile, agent_configured) = match &file_cfg {
-                Some(c) => (
-                    c.chain.chain_id,
-                    c.chain.pba_hardening_height,
-                    c.chain.dev_profile,
-                    c.chain.agent_precompiles_height,
-                ),
-                None => (40204, None, false, None),
-            };
+            let (cfg_chain_id, configured, dev_profile, agent_configured, exact_configured) =
+                match &file_cfg {
+                    Some(c) => (
+                        c.chain.chain_id,
+                        c.chain.pba_hardening_height,
+                        c.chain.dev_profile,
+                        c.chain.agent_precompiles_height,
+                        c.chain.exact_create_code_height,
+                    ),
+                    None => (40204, None, false, None, None),
+                };
             let chain_id = cli.chain_id.unwrap_or(cfg_chain_id);
             let resolved = citrate_consensus::hardening::resolve_pba_hardening_for_chain(
                 chain_id,
@@ -497,8 +499,14 @@ async fn main() -> Result<()> {
             let (agent_height, _) =
                 citrate_execution::agent_fork::resolve_for_chain(chain_id, agent_configured)
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let manifest =
-                consensus_manifest::ConsensusManifest::for_heights(resolved.height, agent_height);
+            let (exact_height, _) =
+                citrate_execution::exact_code::resolve_for_chain(chain_id, exact_configured)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let manifest = consensus_manifest::ConsensusManifest::for_activations(
+                resolved.height,
+                agent_height,
+                exact_height,
+            );
             // The activation heights compiled into this release (a node on a
             // pinned chain runs that height; see the start-up banner for the
             // height a configured node resolved).
@@ -1415,6 +1423,26 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         None => info!(
             "Agent precompile fork not scheduled (source: {}); precompile set unchanged",
             agent_fork_source
+        ),
+    }
+    // The exact-created-code rule, published before any execution component is
+    // built. Unset by default on every chain (the padded legacy form, as the
+    // previous binary); a new genesis sets 0 through `[chain]
+    // exact_create_code_height` or the env override.
+    let (exact_code_height, exact_code_source) = citrate_execution::exact_code::init_for_chain(
+        config.chain.chain_id,
+        config.chain.exact_create_code_height,
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
+    match exact_code_height {
+        Some(h) => info!(
+            "Exact created-code rule ACTIVE from height {} (source: {}): contracts created \
+             inside a call store their original code bytes",
+            h, exact_code_source
+        ),
+        None => info!(
+            "Exact created-code rule not scheduled (source: {}); created code stored as before",
+            exact_code_source
         ),
     }
 
