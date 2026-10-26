@@ -1,0 +1,62 @@
+name: Genesis pipeline (anvil)
+
+# Runs scripts/ci/genesis-pipeline-anvil.sh: the C4 genesis ceremony scripts as real
+# `forge script --broadcast` runs against a throwaway anvil chain (chain id 40204), the
+# CheckDeployedAdmins gate over their books, and the negatives that must be refused
+# (simulated chain id != node chain id, a deployer-controlled timelock whose role-history
+# window starts after a hidden grant). Uses only anvil's public test mnemonic; no secret.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'contracts/script/**'
+      - 'contracts/src/genesis/**'
+      - 'contracts/test/genesis/anvil/**'
+      - 'scripts/ci/genesis-pipeline-anvil.sh'
+      - '.github/workflows/genesis-pipeline.yml'
+  pull_request:
+    paths:
+      - 'contracts/script/**'
+      - 'contracts/src/genesis/**'
+      - 'contracts/test/genesis/anvil/**'
+      - 'scripts/ci/genesis-pipeline-anvil.sh'
+      - '.github/workflows/genesis-pipeline.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: genesis-pipeline-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  genesis-pipeline-anvil:
+    runs-on: ubuntu-latest
+    env:
+      # Same via-IR memory bound as solidity-ci.yml (one solc job at a time).
+      FOUNDRY_THREADS: 1
+      FOUNDRY_DISABLE_NIGHTLY_WARNING: 1
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: recursive
+      - name: Add swap space
+        run: |
+          sudo swapoff -a || true
+          sudo rm -f /mnt/ci-swapfile
+          sudo fallocate -l 12G /mnt/ci-swapfile || \
+            sudo dd if=/dev/zero of=/mnt/ci-swapfile bs=1M count=12288
+          sudo chmod 600 /mnt/ci-swapfile
+          sudo mkswap /mnt/ci-swapfile
+          sudo swapon /mnt/ci-swapfile
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+        with:
+          version: v1.8.3
+      - name: Build (warm the compile cache)
+        working-directory: contracts
+        run: forge build
+      - name: Genesis pipeline + negatives on anvil 40204
+        run: bash scripts/ci/genesis-pipeline-anvil.sh
