@@ -109,6 +109,11 @@ class UnitTemplateTest(unittest.TestCase):
         ):
             self.assertIn(line + "\n", t)
 
+    def test_unit_caps_node_memory_for_an_8gb_host(self) -> None:
+        t = self.template()
+        for line in ("MemoryHigh=6G", "MemoryMax=6656M", "MemorySwapMax=1G"):
+            self.assertIn(line + "\n", t)
+
     def test_unit_matches_gen_node_config(self) -> None:
         if not GEN.exists():
             self.skipTest("scripts/producers/gen_node_config.py is not on this tree yet")
