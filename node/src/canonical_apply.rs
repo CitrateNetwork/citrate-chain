@@ -9544,4 +9544,204 @@ mod tests {
         c1r_receipts_consistent(&storage, Some(b3.header.block_hash), &all)
             .expect("receipts follow B");
     }
+
+    // ---------------------------------------------------------------------
+    // C1-R: the receipt index after the start-up hardening purge. The purge
+    // removes the invalid blocks (and their receipts) but leaves the applied-tip
+    // pointer on a removed block, so the old applied chain can no longer be
+    // walked from its tip. The blocks below the removed ones keep their
+    // receipts; once the node moves to another chain, those receipts must go.
+    // ---------------------------------------------------------------------
+
+    /// A follower that applied a1 ← a2, then restarted on a release whose block
+    /// rules start at height 2 (the purge removes a2), with a1 still stored.
+    async fn c1r_purged_follower(
+        dir: &std::path::Path,
+    ) -> (Arc<StorageManager>, Arc<Executor>, Block, Block) {
+        let storage =
+            Arc::new(StorageManager::new(dir, PruningConfig::default()).expect("storage"));
+        let exec = store_backed(&storage);
+        exec.set_balance(&Address(ALICE), U256::from(FUND));
+        exec.persist_state_changes().await.expect("persist genesis");
+        let (a1, a2, _, _) = v251_blocks().await;
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        drop(app);
+        c1r_startup_purge(&storage, &a1, &a2);
+        (storage, exec, a1, a2)
+    }
+
+    /// The real start-up purge with the rules active from height 2: a2 (and
+    /// anything above it) goes, a1 stays with its receipt, and the applied-tip
+    /// pointer stays on a2. Asserts that precondition.
+    fn c1r_startup_purge(storage: &StorageManager, a1: &Block, a2: &Block) {
+        let report = crate::hardening_rejoin::purge_invalid_post_activation(
+            storage,
+            citrate_consensus::hardening::PbaHardening::at(2),
+            40204,
+        )
+        .expect("purge");
+        assert!(report.purged.contains(&a2.header.block_hash), "a2 removed");
+        assert!(!report.purged.contains(&a1.header.block_hash), "a1 kept");
+        assert!(storage
+            .blocks
+            .get_block(&a2.header.block_hash)
+            .expect("read")
+            .is_none());
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt(&a1.transactions[0].hash)
+                .expect("read")
+                .map(|r| r.block_hash),
+            Some(a1.header.block_hash),
+            "a1 keeps its receipt through the purge"
+        );
+    }
+
+    /// After the purge, the start-up rebuild moves the node to branch C, which
+    /// forks off genesis and so excludes a1. a1's transaction is not on the
+    /// applied chain any more: `eth_getTransactionReceipt` must return null, and
+    /// a1 keeps no block marker. The walk down the old applied chain starts at
+    /// the removed a2 and cannot reach a1, so the rebuild has to find it another
+    /// way.
+    #[tokio::test]
+    async fn c1r_rebuild_after_startup_purge_leaves_no_receipt_off_the_spine() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (storage, exec, a1, a2) = c1r_purged_follower(dir.path()).await;
+        let (c1, c2) = c1r_fork_c().await;
+        // Sync fetches the canonical chain from upgraded peers.
+        persist(&storage, &c1);
+        persist(&storage, &c2);
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        assert_eq!(app.applied_tip().await.hash, a2.header.block_hash);
+        app.fork_choice = Some(fork_choice_returning(c2.header.block_hash));
+        let g = Executor::new(Arc::new(StateDB::new()));
+        g.set_balance(&Address(ALICE), U256::from(FUND));
+        assert!(app
+            .recover_to_head(g.state_snapshot(), Hash::default())
+            .await
+            .expect("recover"));
+        assert_eq!(app.applied_tip().await.hash, c2.header.block_hash);
+
+        let io = Arc::new(c1r_rpc(storage.clone(), exec.clone()));
+        let r = c1r_call(
+            &io,
+            "eth_getTransactionReceipt",
+            serde_json::json!([c1r_hex(&a1.transactions[0].hash)]),
+        )
+        .await;
+        assert!(
+            r["result"].is_null(),
+            "a1 is not on the applied chain: its receipt must be null, got {r}"
+        );
+        let r = c1r_call(
+            &io,
+            "eth_getTransactionReceipt",
+            serde_json::json!([c1r_hex(&c1.transactions[0].hash)]),
+        )
+        .await;
+        assert_eq!(
+            r["result"]["blockHash"],
+            serde_json::json!(c1r_hex(&c1.header.block_hash)),
+            "c1's receipt is served: {r}"
+        );
+        c1r_receipts_consistent(&storage, Some(c2.header.block_hash), &[&a1, &a2, &c1, &c2])
+            .expect("receipts follow C");
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt_reconcile_marker()
+                .expect("read"),
+            None,
+            "no rebuild marker after convergence"
+        );
+    }
+
+    /// The same rebuild, but it cannot converge (c1 was never fetched, so the
+    /// replay stops short of c2). The rollback must leave the receipt index
+    /// exactly as it was: the node is back on its old state, so a1's receipt
+    /// is restored together with it.
+    #[tokio::test]
+    async fn c1r_failed_rebuild_after_startup_purge_restores_receipts() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (storage, exec, a1, a2) = c1r_purged_follower(dir.path()).await;
+        let (c1, c2) = c1r_fork_c().await;
+        persist(&storage, &c2);
+        let all = [&a1, &a2, &c1, &c2];
+        let before = c1r_durable_view(&storage, &all);
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        let root_before = exec.calculate_state_root();
+        app.fork_choice = Some(fork_choice_returning(c2.header.block_hash));
+        let g = Executor::new(Arc::new(StateDB::new()));
+        g.set_balance(&Address(ALICE), U256::from(FUND));
+        let res = app
+            .recover_to_head(g.state_snapshot(), Hash::default())
+            .await;
+        assert!(matches!(res, Ok(false)), "must roll back, got {res:?}");
+        assert_eq!(app.applied_tip().await.hash, a2.header.block_hash, "tip");
+        assert_eq!(exec.calculate_state_root(), root_before, "memory");
+        assert_eq!(c1r_durable_view(&storage, &all), before, "durable state");
+
+        // c1 arrives; the retried rebuild converges and cleans up.
+        persist(&storage, &c1);
+        assert!(app
+            .recover_to_head(g.state_snapshot(), Hash::default())
+            .await
+            .expect("recover"));
+        c1r_receipts_consistent(&storage, Some(c2.header.block_hash), &all)
+            .expect("receipts follow C");
+    }
+
+    /// A rebuild A → B is interrupted right after its reset batch (durable tip
+    /// at genesis, a1 kept as shared prefix, rebuild marker on a2). The node
+    /// restarts on a release whose rules start at height 2: the purge removes
+    /// a2, b2 and b3, so the marker names a removed block. Fork choice then
+    /// picks C. The start-up cleanup can no longer walk down from the marker,
+    /// and must still remove a1's receipt instead of clearing the marker.
+    #[tokio::test]
+    async fn c1r_interrupted_rebuild_then_startup_purge_removes_the_prefix_receipt() {
+        if std::env::var(V251_DIR).is_ok() {
+            return;
+        }
+        let (a1, a2, b2, b3) = v251_blocks().await;
+        let (c1, c2) = c1r_fork_c().await;
+        let dir = tempfile::tempdir().expect("dir");
+        c1r_crash_after_rebuild_reset(dir.path(), &a1, &a2);
+        {
+            let storage =
+                StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen");
+            c1r_startup_purge(&storage, &a1, &a2);
+            for b in [&b2, &b3] {
+                assert!(storage
+                    .blocks
+                    .get_block(&b.header.block_hash)
+                    .expect("read")
+                    .is_none());
+            }
+        }
+        c1r_resume_and_check(dir.path(), &[&a1, &c1, &c2], &c2)
+            .await
+            .expect("restart converging on C leaves no receipt of a1");
+        let storage = StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen");
+        assert!(
+            storage
+                .transactions
+                .get_receipt(&a1.transactions[0].hash)
+                .expect("read")
+                .is_none(),
+            "a1 is not executed on C: its receipt is gone"
+        );
+        assert!(storage
+            .transactions
+            .get_block_transactions(&a1.header.block_hash)
+            .expect("read")
+            .is_empty());
+    }
 }
