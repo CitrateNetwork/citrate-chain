@@ -127,8 +127,8 @@ fn plain_account() -> Address {
 fn ecrecover_input() -> (Vec<u8>, [u8; 20]) {
     let key = SigningKey::from_slice(&[0x42u8; 32]).expect("valid scalar");
     let digest: [u8; 32] = Keccak256::digest(b"D3 top-level ecrecover").into();
-    let (sig, rec) = key.sign_prehash_recoverable(&digest).expect("signs");
-    let point = key.verifying_key().to_encoded_point(false);
+    let (sig, rec) = key.sign_prehash_recoverable(&digest);
+    let point = key.verifying_key().to_sec1_point(false);
     let pub_hash: [u8; 32] = Keccak256::digest(&point.as_bytes()[1..]).into();
     let mut signer = [0u8; 20];
     signer.copy_from_slice(&pub_hash[12..]);

@@ -28,7 +28,9 @@ impl SignerPool {
         max_inflight: usize,
     ) -> Result<Self> {
         if signers.is_empty() {
-            return Err(Error::Config("SignerPool requires at least one signer".into()));
+            return Err(Error::Config(
+                "SignerPool requires at least one signer".into(),
+            ));
         }
         if signers.len() != starting_nonces.len() {
             return Err(Error::Config(format!(

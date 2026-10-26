@@ -17,7 +17,8 @@ use aes_gcm::{
 use anyhow::{anyhow, Result};
 use hmac::Mac;
 use k256::elliptic_curve::zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
-use k256::{elliptic_curve::sec1::ToEncodedPoint, PublicKey, SecretKey};
+use k256::elliptic_curve::Generate;
+use k256::{elliptic_curve::sec1::ToSec1Point, PublicKey, SecretKey};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::Sha256;
@@ -61,7 +62,8 @@ pub struct ECIESMessage {
 impl ECIES {
     /// Generate new ECIES keypair using k256
     pub fn generate() -> Result<Self> {
-        let secret_key = SecretKey::random(&mut OsRng);
+        let secret_key = SecretKey::try_generate()
+            .map_err(|e| anyhow!("system RNG unavailable for ECIES key: {e}"))?;
         let public_key_point = secret_key.public_key();
 
         let mut private_key = [0u8; 32];
@@ -69,7 +71,7 @@ impl ECIES {
         private_key.copy_from_slice(&sk_bytes);
         sk_bytes.zeroize();
 
-        let compressed = public_key_point.to_encoded_point(true);
+        let compressed = public_key_point.to_sec1_point(true);
         let mut public_key = [0u8; 33];
         public_key.copy_from_slice(compressed.as_bytes());
 
@@ -229,7 +231,7 @@ impl ECIES {
         let sk = SecretKey::from_slice(private_key)
             .map_err(|e| anyhow!("Invalid private key for pubkey derivation: {}", e))?;
         let pk = sk.public_key();
-        let compressed = pk.to_encoded_point(true);
+        let compressed = pk.to_sec1_point(true);
         let mut public_key = [0u8; 33];
         public_key.copy_from_slice(compressed.as_bytes());
         Ok(public_key)

@@ -156,7 +156,10 @@ impl RunResult {
             println!("  included                 = {}", b.tracker_stats.included);
             println!("  reverted                 = {}", b.tracker_stats.reverted);
             println!("  inclusion_timeouts       = {}", b.tracker_stats.timeouts);
-            println!("  tracker_transport_errors = {}", b.tracker_stats.transport_errors);
+            println!(
+                "  tracker_transport_errors = {}",
+                b.tracker_stats.transport_errors
+            );
             println!(
                 "  avg_inclusion_latency_ms = {:.2}",
                 b.tracker_stats.avg_inclusion_latency_ms
@@ -164,9 +167,7 @@ impl RunResult {
             println!("  mined_nonce_delta_total  = {}", b.mined_nonce_delta_total);
             println!("  ground_truth_match       = {}", b.ground_truth_match);
             println!("  included_tps             = {:.2}", b.included_tps);
-            if b.tracker_stats.depth_finalized > 0
-                || b.tracker_stats.depth_finality_timeouts > 0
-            {
+            if b.tracker_stats.depth_finalized > 0 || b.tracker_stats.depth_finality_timeouts > 0 {
                 println!("-- depth finality --");
                 println!(
                     "  depth_finalized          = {}",
@@ -275,7 +276,9 @@ impl Runner {
         options: RunOptions,
     ) -> Result<Self> {
         if pool.is_empty() {
-            return Err(Error::Runner("runner requires a non-empty signer pool".into()));
+            return Err(Error::Runner(
+                "runner requires a non-empty signer pool".into(),
+            ));
         }
         if options.duration_secs == 0 {
             return Err(Error::Runner("duration_secs must be > 0".into()));
@@ -345,7 +348,10 @@ impl Runner {
             // tx and the concrete class name that produced it, so
             // `MixedWorkload` can report the effective mix.
             let (signed, class_name) =
-                match self.workload.build_with_class(&self.context, &signer, permit.nonce) {
+                match self
+                    .workload
+                    .build_with_class(&self.context, &signer, permit.nonce)
+                {
                     Ok(pair) => pair,
                     Err(_e) => {
                         state.signing_errors.fetch_add(1, Ordering::AcqRel);
@@ -371,7 +377,9 @@ impl Runner {
                     // Acquire a submission slot (bounded). This blocks
                     // the main loop if concurrency_cap would be
                     // exceeded, applying backpressure to target TPS.
-                    let sem = submission_sem.as_ref().expect("semaphore present in broadcast mode");
+                    let sem = submission_sem
+                        .as_ref()
+                        .expect("semaphore present in broadcast mode");
                     let submission_permit =
                         sem.clone().acquire_owned().await.map_err(|e| {
                             Error::Runner(format!("submission semaphore closed: {e}"))
@@ -428,12 +436,10 @@ impl Runner {
                     tokio::time::sleep(Duration::from_millis(200)).await;
                 }
                 let tracker = tracker.expect("tracker present in broadcast mode");
-                let stats = tokio::time::timeout(
-                    Duration::from_secs(cooldown_secs),
-                    tracker.drain(),
-                )
-                .await
-                .unwrap_or_default();
+                let stats =
+                    tokio::time::timeout(Duration::from_secs(cooldown_secs), tracker.drain())
+                        .await
+                        .unwrap_or_default();
 
                 // Ground truth: sum the per-signer nonce deltas.
                 let mut mined_delta: u64 = 0;
@@ -444,9 +450,8 @@ impl Runner {
                             .await
                         {
                             Ok(current) => {
-                                mined_delta = mined_delta.saturating_add(
-                                    current.saturating_sub(*start_nonce),
-                                );
+                                mined_delta = mined_delta
+                                    .saturating_add(current.saturating_sub(*start_nonce));
                             }
                             Err(_) => {}
                         }
@@ -591,8 +596,13 @@ mod tests {
     fn runner(pool: Arc<SignerPool>, target_tps: u64, duration_secs: u64) -> Runner {
         let ctx = Arc::new(WorkloadContext::for_dry_run(40204, 1_000_000_000));
         let workload: Arc<dyn WorkloadClass> = Arc::new(SimpleTransfer::default_bench());
-        Runner::new(pool, ctx, workload, RunOptions::for_dry_run(duration_secs, target_tps))
-            .expect("runner")
+        Runner::new(
+            pool,
+            ctx,
+            workload,
+            RunOptions::for_dry_run(duration_secs, target_tps),
+        )
+        .expect("runner")
     }
 
     #[tokio::test]
@@ -628,7 +638,11 @@ mod tests {
         let sum: u64 = result.per_signer_count.iter().sum();
         assert_eq!(sum, result.signed_ok);
         for (i, n) in result.per_signer_count.iter().enumerate() {
-            assert!(*n > 0, "signer {i} got zero work: {:?}", result.per_signer_count);
+            assert!(
+                *n > 0,
+                "signer {i} got zero work: {:?}",
+                result.per_signer_count
+            );
         }
     }
 
@@ -709,18 +723,12 @@ mod tests {
         let pool = pool_of(2);
         let ctx = Arc::new(WorkloadContext::for_dry_run(40204, 1_000_000_000));
         let workload: Arc<dyn WorkloadClass> = Arc::new(mix);
-        let runner = Runner::new(
-            pool,
-            ctx,
-            workload,
-            RunOptions::for_dry_run(1, 200),
-        )
-        .expect("runner");
+        let runner =
+            Runner::new(pool, ctx, workload, RunOptions::for_dry_run(1, 200)).expect("runner");
 
         let result = runner.run(RunMode::DryRun).await.expect("run");
         assert_eq!(result.effective_mix.len(), 2);
-        let class_names: Vec<&str> =
-            result.effective_mix.iter().map(|(n, _)| *n).collect();
+        let class_names: Vec<&str> = result.effective_mix.iter().map(|(n, _)| *n).collect();
         assert!(class_names.contains(&"simple_transfer"));
         assert!(class_names.contains(&"other_transfer"));
         let sum: u64 = result.effective_mix.iter().map(|(_, n)| *n).sum();
@@ -751,10 +759,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_zero_duration() {
-        let pool = Arc::new(
-            SignerPool::new(vec![signer_with_last_byte(1)], vec![0], 1)
-                .expect("pool"),
-        );
+        let pool =
+            Arc::new(SignerPool::new(vec![signer_with_last_byte(1)], vec![0], 1).expect("pool"));
         let ctx = Arc::new(WorkloadContext::for_dry_run(40204, 1));
         let workload: Arc<dyn WorkloadClass> = Arc::new(SimpleTransfer::default_bench());
         let bad = Runner::new(

@@ -237,7 +237,8 @@ mod tests {
             data: &[],
         };
         let call = encode_forwarder_execute(&req, &[]);
-        let sel = selector("execute((bytes32,uint256,uint256,uint256,bytes32,address,bytes),bytes)");
+        let sel =
+            selector("execute((bytes32,uint256,uint256,uint256,bytes32,address,bytes),bytes)");
         assert_eq!(&call[..4], &sel);
     }
 

@@ -39,8 +39,17 @@ const MNEMONIC_ACCOUNTS: [(u32, &str, &str, &str); 2] = [
 ];
 
 /// (prehash, r, s, recovery id) from `sign_recoverable` with mnemonic account 0.
-/// The all-0xff prehash is above the curve order n, which exercises the
-/// "reduce z mod n" step of RFC 6979.
+///
+/// The all-0xff prehash is above the curve order n, so it exercises RFC 6979
+/// section 3.2 step d, `bits2octets(h1)`, which reduces the hash mod n before
+/// it seeds the nonce. This row is the one INTENDED change of the 0.14 move:
+/// k256 0.13 / ecdsa 0.16 seeded the nonce with the unreduced hash and gave
+/// r = 98d88c61...b234, s = 0f4160bd...bcf2, v = 0. ecdsa 0.17 fixed that
+/// (RustCrypto/signatures#777), and the row below is the RFC 6979 value. An
+/// independent from-scratch RFC 6979 computation gives exactly these bytes
+/// for the reduced hash, and the old bytes for the unreduced one. Both
+/// signatures verify; only the nonce differs, and only for hashes >= n
+/// (about 2^-128 for a Keccak-256 output). The other rows are unchanged.
 const RECOVERABLE: [(&str, &str, &str, u8); 3] = [
     (
         "0000000000000000000000000000000000000000000000000000000000000000",
@@ -56,8 +65,8 @@ const RECOVERABLE: [(&str, &str, &str, u8); 3] = [
     ),
     (
         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-        "98d88c61484de4f8bedc1e95ecc3bdbbc2b27b554e2748e25dd05abb5feab234",
-        "0f4160bd780608aabb2c27c4ba757f7ba44c47ebeda91da44f703043f758bcf2",
+        "a1ab68da597520be3dca9008aec43fc1f40dc67d60fe9286152821f356c21101",
+        "13fbefdaacf915bbf3e4bbb789f715a18c31d69a1e6591a52c694de4ecbc4d3b",
         0,
     ),
 ];

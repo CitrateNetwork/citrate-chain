@@ -61,9 +61,7 @@ impl LegacyTx {
         let key = SigningKey::from_bytes(signer.key_bytes().into())
             .map_err(|e| Error::Signing(format!("invalid secp256k1 key: {e}")))?;
 
-        let (signature, recovery_id) = key
-            .sign_prehash_recoverable(&hash)
-            .map_err(|e| Error::Signing(format!("sign_prehash_recoverable: {e}")))?;
+        let (signature, recovery_id) = key.sign_prehash_recoverable(&hash);
 
         let sig_bytes = signature.to_bytes();
         let r = &sig_bytes[..32];
@@ -157,7 +155,8 @@ mod tests {
     // Ends with 80 (empty data) 01 (chain_id=1) 80 80 (two zeros).
     // This hashes to the canonical EIP-155 signing hash.
     const EIP155_SIGNING_PREIMAGE_HEX: &str = "ec098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a764000080018080";
-    const EIP155_SIGNING_HASH_HEX: &str = "daf5a779ae972f972197303d7b574746c7ef83eadac0f2791ad23db92e4c8e53";
+    const EIP155_SIGNING_HASH_HEX: &str =
+        "daf5a779ae972f972197303d7b574746c7ef83eadac0f2791ad23db92e4c8e53";
     // Signed transaction RLP: final form with [v=37, r, s] replacing [chainId, 0, 0].
     // v = 37 = 0x25 for chain_id=1 + recovery_id=0 (since 1*2+35+0 = 37).
     const EIP155_SIGNED_HEX: &str = "f86c098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a76400008025a028ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276a067cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83";
@@ -177,7 +176,10 @@ mod tests {
     #[test]
     fn signing_preimage_matches_eip155() {
         let tx = eip155_tx();
-        assert_eq!(hex::encode(tx.signing_preimage()), EIP155_SIGNING_PREIMAGE_HEX);
+        assert_eq!(
+            hex::encode(tx.signing_preimage()),
+            EIP155_SIGNING_PREIMAGE_HEX
+        );
     }
 
     #[test]

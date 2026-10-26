@@ -161,6 +161,16 @@ halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2", 
 # commitment, or hash changes — and removes the fragile build-time python3 + registry-write step.
 halo2curves = { version = "0.7.0", default-features = false, features = ["derive_serde"] }
 
+[patch.crates-io]
+# RUSTSEC-2026-0387: revm-precompile 8.0.0 vendored with k256/p256 0.14 (every
+# published revm-precompile still needs the 0.13 curve line). See the header of
+# each vendor/*/Cargo.toml for the exact diff and the exit condition.
+# The standalone workspaces that reach revm (fuzz, core/federated) carry the
+# same entry.
+revm-precompile = { path = "vendor/revm-precompile" }
+# Lockfile-only: alloy-primitives' optional k256 0.13 (see its header).
+alloy-primitives = { path = "vendor/alloy-primitives" }
+
 [profile.release]
 opt-level = 3
 lto = true

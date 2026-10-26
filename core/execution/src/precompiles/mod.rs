@@ -18,6 +18,7 @@ pub mod x402;
 
 use anyhow::Result;
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+use k256::elliptic_curve::scalar::IsHigh;
 use sha3::{Digest, Keccak256};
 
 // Precompile crypto imports
@@ -1063,11 +1064,12 @@ pub fn recover_address(hash: &[u8], r: &[u8], s: &[u8], recovery_id: u8) -> Opti
 
     let signature = Signature::from_bytes((&sig_bytes).into()).ok()?;
 
-    // M-01 fix: reject high-s signatures. `normalize_s` returns
-    // `Some(normalized)` iff the s-value was not already in low-s
-    // form; we treat any input that needed normalization as a
-    // malleability attempt and reject.
-    if signature.normalize_s().is_some() {
+    // M-01 fix: reject high-s signatures. Any s above n/2 would need
+    // normalization; we treat it as a malleability attempt and reject.
+    // This check must stay explicit: from ecdsa 0.17 on,
+    // `recover_from_prehash` no longer verifies, so it no longer rejects
+    // high-s for us.
+    if bool::from(signature.s().is_high()) {
         return None;
     }
 
@@ -1077,7 +1079,7 @@ pub fn recover_address(hash: &[u8], r: &[u8], s: &[u8], recovery_id: u8) -> Opti
     let recovered_key = VerifyingKey::recover_from_prehash(hash, &signature, recid).ok()?;
 
     // Get the uncompressed public key bytes (65 bytes: 0x04 prefix + 64 bytes)
-    let pubkey_bytes = recovered_key.to_encoded_point(false);
+    let pubkey_bytes = recovered_key.to_sec1_point(false);
     let pubkey_uncompressed = pubkey_bytes.as_bytes();
 
     // Skip the 0x04 prefix and hash the 64 bytes of the public key
@@ -1208,7 +1210,7 @@ mod tests {
         let executor = PrecompileExecutor::new();
 
         // Generate a random signing key
-        let signing_key = SigningKey::random(&mut rand::thread_rng());
+        let signing_key = <SigningKey as k256::elliptic_curve::Generate>::generate();
         let verifying_key = signing_key.verifying_key();
 
         // Create a message hash
@@ -1218,7 +1220,7 @@ mod tests {
         let hash: [u8; 32] = hasher.finalize().into();
 
         // Sign the hash
-        let (signature, recid) = signing_key.sign_prehash_recoverable(&hash).unwrap();
+        let (signature, recid) = signing_key.sign_prehash_recoverable(&hash);
         let sig_bytes = signature.to_bytes();
 
         // Build ecrecover input
@@ -1234,7 +1236,7 @@ mod tests {
         let result = executor.ecrecover(&input, 5000).unwrap();
 
         // Compute expected address from public key
-        let pubkey_bytes = verifying_key.to_encoded_point(false);
+        let pubkey_bytes = verifying_key.to_sec1_point(false);
         let pubkey_uncompressed = pubkey_bytes.as_bytes();
         let mut hasher = Keccak256::new();
         hasher.update(&pubkey_uncompressed[1..65]);
@@ -1258,15 +1260,17 @@ mod tests {
         use k256::ecdsa::SigningKey;
         let sk = SigningKey::from_bytes(&[0x42; 32].into()).expect("sk");
         let hash = [0xCD; 32];
-        let (sig, recid) = sk.sign_prehash_recoverable(&hash).expect("sign");
+        let (sig, recid) = sk.sign_prehash_recoverable(&hash);
         let sig_bytes = sig.to_bytes();
 
-        // Confirm sign output is low-s (post-normalize_s would return None).
+        // Confirm sign output is low-s.
         assert!(
-            Signature::from_bytes(&sig_bytes)
-                .expect("sig parse")
-                .normalize_s()
-                .is_none(),
+            !bool::from(
+                Signature::from_bytes(&sig_bytes)
+                    .expect("sig parse")
+                    .s()
+                    .is_high()
+            ),
             "signing output must already be low-s"
         );
 
@@ -1289,7 +1293,7 @@ mod tests {
 
         let sk = SigningKey::from_bytes(&[0x55; 32].into()).expect("sk");
         let hash = [0xAB; 32];
-        let (sig, recid) = sk.sign_prehash_recoverable(&hash).expect("sign");
+        let (sig, recid) = sk.sign_prehash_recoverable(&hash);
         let sig_bytes_low = sig.to_bytes();
 
         // Build the malleated high-s form: negate the s scalar mod n.

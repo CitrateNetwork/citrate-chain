@@ -310,7 +310,7 @@ fn encode_register_validator(proposer_pubkey: &[u8; 32], sig: &[u8; 64]) -> Vec<
 /// EVM address of a secp256k1 key: keccak256(uncompressed_pubkey[1..])[12..32].
 fn evm_address_of_secp256k1(key: &Secp256k1SigningKey) -> [u8; 20] {
     let vk = key.verifying_key();
-    let point = vk.to_encoded_point(false);
+    let point = vk.to_sec1_point(false);
     let hash = keccak256(point.as_bytes().get(1..).unwrap_or_default());
     let mut out = [0u8; 20];
     out.copy_from_slice(&hash[12..32]);

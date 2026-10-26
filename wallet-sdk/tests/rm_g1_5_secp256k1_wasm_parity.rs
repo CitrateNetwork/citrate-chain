@@ -18,7 +18,7 @@ use k256::ecdsa::{
     SigningKey, VerifyingKey,
 };
 #[allow(unused_imports)]
-use k256::elliptic_curve::sec1::ToEncodedPoint;
+use k256::elliptic_curve::scalar::IsHigh;
 use sha3::{Digest, Keccak256};
 
 const TEST_PRIVKEY: [u8; 32] = [
@@ -30,7 +30,7 @@ const TEST_MSG_HASH: [u8; 32] = [0xab; 32];
 
 /// Mirrors `wasm.rs::secp256k1_sign_hash`.
 fn wasm_recipe_sign(private_key: &[u8], msg_hash: &[u8]) -> Vec<u8> {
-    let sk = SigningKey::from_bytes(private_key.into()).expect("valid privkey");
+    let sk = SigningKey::from_slice(private_key).expect("valid privkey");
     let sig: Signature = sk.sign_prehash(msg_hash).expect("sign");
     let recovery = RecoveryId::trial_recovery_from_prehash(sk.verifying_key(), msg_hash, &sig)
         .expect("recovery");
@@ -58,7 +58,7 @@ fn test_rm_g1_5_signature_is_low_s_eip2() {
     // Reconstruct and check the s value is below half the curve order.
     let sig = Signature::from_slice(&sig_bytes[..64]).expect("64-byte sig");
     assert!(
-        sig.normalize_s().is_none(),
+        !bool::from(sig.s().is_high()),
         "EIP-2: s value must be in low-S form (already canonical)"
     );
 }
@@ -76,7 +76,7 @@ fn test_rm_g1_5_signature_verifies_under_recovered_key() {
 #[test]
 fn test_rm_g1_5_public_key_is_uncompressed_65_bytes() {
     let sk = SigningKey::from_bytes((&TEST_PRIVKEY).into()).unwrap();
-    let pk = sk.verifying_key().to_encoded_point(false);
+    let pk = sk.verifying_key().to_sec1_point(false);
     let bytes = pk.as_bytes();
     assert_eq!(bytes.len(), 65, "uncompressed = 0x04 || X || Y");
     assert_eq!(bytes[0], 0x04, "leading byte must be 0x04");
@@ -85,7 +85,7 @@ fn test_rm_g1_5_public_key_is_uncompressed_65_bytes() {
 #[test]
 fn test_rm_g1_5_address_matches_keccak256_last20_eip55() {
     let sk = SigningKey::from_bytes((&TEST_PRIVKEY).into()).unwrap();
-    let pk = sk.verifying_key().to_encoded_point(false);
+    let pk = sk.verifying_key().to_sec1_point(false);
     let mut hasher = Keccak256::new();
     hasher.update(&pk.as_bytes()[1..]);
     let hash = hasher.finalize();

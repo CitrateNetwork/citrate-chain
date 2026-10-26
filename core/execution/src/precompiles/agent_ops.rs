@@ -34,6 +34,7 @@
 
 use anyhow::{anyhow, Result};
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+use k256::elliptic_curve::scalar::IsHigh;
 use sha3::{Digest, Keccak256};
 
 use super::PrecompileResult;
@@ -134,7 +135,7 @@ fn recover(digest: &[u8; 32], sig: &[u8]) -> Option<[u8; 20]> {
         _ => return None,
     };
     let signature = Signature::from_slice(rs).ok()?;
-    if signature.normalize_s().is_some() {
+    if bool::from(signature.s().is_high()) {
         return None;
     }
     let v = match v {
@@ -144,7 +145,7 @@ fn recover(digest: &[u8; 32], sig: &[u8]) -> Option<[u8; 20]> {
     };
     let recid = RecoveryId::from_byte(v)?;
     let key = VerifyingKey::recover_from_prehash(digest, &signature, recid).ok()?;
-    let point = key.to_encoded_point(false);
+    let point = key.to_sec1_point(false);
     let hash: [u8; 32] = Keccak256::digest(point.as_bytes().get(1..)?).into();
     let [_, _, _, _, _, _, _, _, _, _, _, _, out @ ..] = hash;
     Some(out)
@@ -349,7 +350,7 @@ mod tests {
     }
 
     fn address(k: &SigningKey) -> [u8; 20] {
-        let point = k.verifying_key().to_encoded_point(false);
+        let point = k.verifying_key().to_sec1_point(false);
         let hash = Keccak256::digest(&point.as_bytes()[1..]);
         let mut out = [0u8; 20];
         out.copy_from_slice(&hash[12..]);
@@ -358,14 +359,15 @@ mod tests {
 
     fn sign(k: &SigningKey, message: &str) -> [u8; 65] {
         let digest = eip191_digest(message.as_bytes());
-        let (sig, recid) = k.sign_prehash_recoverable(&digest).expect("sign");
+        let (sig, recid) = k.sign_prehash_recoverable(&digest);
         // k256 signs low-s already; normalize defensively for the test vector.
-        let (sig, recid) = match sig.normalize_s() {
-            Some(n) => (
-                n,
+        let (sig, recid) = if bool::from(sig.s().is_high()) {
+            (
+                sig.normalize_s(),
                 RecoveryId::from_byte(recid.to_byte() ^ 1).expect("recid"),
-            ),
-            None => (sig, recid),
+            )
+        } else {
+            (sig, recid)
         };
         let mut out = [0u8; 65];
         out[..64].copy_from_slice(&sig.to_bytes());
@@ -613,9 +615,10 @@ mod tests {
     }
 
     /// The explicit low-s rule mirrors cluster-daemon. With k256 0.13 the
-    /// recovery itself also refuses high-s (it re-verifies, and k256 verification
-    /// rejects high-s), so this test passes with either guard; the explicit check
-    /// keeps the rule independent of the library version.
+    /// recovery itself also refused high-s (it re-verified, and k256 verification
+    /// rejects high-s). From k256 0.14 / ecdsa 0.17 on, recovery no longer
+    /// verifies, so the explicit check in `recover` is the only thing that
+    /// refuses high-s, and this test pins it.
     #[test]
     fn high_s_and_bad_v_are_refused() {
         let f = fixture("Studio Mac");

@@ -27,6 +27,12 @@ tokio = { version = "1", features = ["rt", "macros"] }
 [workspace]
 members = ["."]
 
+# RUSTSEC-2026-0387: same vendored crates as the root workspace (see the
+# [patch.crates-io] note in ../Cargo.toml).
+[patch.crates-io]
+revm-precompile = { path = "../vendor/revm-precompile" }
+alloy-primitives = { path = "../vendor/alloy-primitives" }
+
 # ── Existing targets ──────────────────────────────────────────────
 
 [[bin]]

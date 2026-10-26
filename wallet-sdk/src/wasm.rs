@@ -195,7 +195,7 @@ fn parse_secp256k1_secret(bytes: &[u8]) -> Result<k256::ecdsa::SigningKey, JsErr
             bytes.len()
         )));
     }
-    k256::ecdsa::SigningKey::from_bytes(bytes.into())
+    k256::ecdsa::SigningKey::from_slice(bytes)
         .map_err(|e| JsError::new(&format!("EXT-10: invalid secp256k1 secret: {}", e)))
 }
 
@@ -219,6 +219,7 @@ fn parse_secp256k1_secret(bytes: &[u8]) -> Result<k256::ecdsa::SigningKey, JsErr
 #[wasm_bindgen]
 pub fn secp256k1_sign_hash(private_key: &[u8], msg_hash: &[u8]) -> Result<Vec<u8>, JsError> {
     use k256::ecdsa::{signature::hazmat::PrehashSigner, RecoveryId, Signature};
+    use k256::elliptic_curve::scalar::IsHigh;
 
     if msg_hash.len() != 32 {
         return Err(JsError::new(&format!(
@@ -241,7 +242,7 @@ pub fn secp256k1_sign_hash(private_key: &[u8], msg_hash: &[u8]) -> Result<Vec<u8
 
     // k256's Signature is automatically normalized to low-S by
     // `sign_prehash` per EIP-2; assert defensively.
-    debug_assert!(signature.normalize_s().is_none());
+    debug_assert!(!bool::from(signature.s().is_high()));
 
     let r_bytes = signature.r().to_bytes();
     let s_bytes = signature.s().to_bytes();
@@ -260,11 +261,11 @@ pub fn secp256k1_sign_hash(private_key: &[u8], msg_hash: &[u8]) -> Result<Vec<u8
 #[wasm_bindgen]
 pub fn secp256k1_public_key(private_key: &[u8]) -> Result<Vec<u8>, JsError> {
     #[allow(unused_imports)]
-    use k256::elliptic_curve::sec1::ToEncodedPoint;
+    use k256::elliptic_curve::sec1::ToSec1Point;
 
     let signing_key = parse_secp256k1_secret(private_key)?;
     let verifying_key = signing_key.verifying_key();
-    let encoded = verifying_key.to_encoded_point(false); // uncompressed
+    let encoded = verifying_key.to_sec1_point(false); // uncompressed
     Ok(encoded.as_bytes().to_vec())
 }
 
@@ -275,11 +276,11 @@ pub fn secp256k1_public_key(private_key: &[u8]) -> Result<Vec<u8>, JsError> {
 #[wasm_bindgen]
 pub fn secp256k1_address(private_key: &[u8]) -> Result<String, JsError> {
     #[allow(unused_imports)]
-    use k256::elliptic_curve::sec1::ToEncodedPoint;
+    use k256::elliptic_curve::sec1::ToSec1Point;
     use sha3::{Digest, Keccak256};
 
     let signing_key = parse_secp256k1_secret(private_key)?;
-    let pk = signing_key.verifying_key().to_encoded_point(false);
+    let pk = signing_key.verifying_key().to_sec1_point(false);
     let pk_bytes = pk.as_bytes();
     // Skip the 0x04 prefix; hash the 64-byte X||Y.
     let mut hasher = Keccak256::new();

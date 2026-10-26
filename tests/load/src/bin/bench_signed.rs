@@ -48,9 +48,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
-const RECIPIENT: [u8; 20] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-];
+const RECIPIENT: [u8; 20] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 
 #[derive(Clone)]
 struct Signer {
@@ -72,7 +70,7 @@ impl Signer {
 
         // Derive EVM address: keccak256(uncompressed_pubkey[1..])[12..]
         let verifying_key = key.verifying_key();
-        let pubkey_point = verifying_key.to_encoded_point(false);
+        let pubkey_point = verifying_key.to_sec1_point(false);
         let pubkey_uncompressed = pubkey_point.as_bytes();
         let hash = Keccak256::digest(&pubkey_uncompressed[1..]);
         let mut address = [0u8; 20];
@@ -138,10 +136,7 @@ fn sign_legacy_tx(
     hash_bytes.copy_from_slice(&hash);
 
     // ---- Step 2: sign with secp256k1 (recoverable) ----
-    let (signature, recovery_id) = signer
-        .key
-        .sign_prehash_recoverable(&hash_bytes)
-        .map_err(|e| format!("sign failed: {e}"))?;
+    let (signature, recovery_id) = signer.key.sign_prehash_recoverable(&hash_bytes);
 
     let sig_bytes = signature.to_bytes();
     let r = &sig_bytes[..32];
@@ -163,7 +158,11 @@ fn sign_legacy_tx(
     Ok(signed.out().to_vec())
 }
 
-async fn get_latest_nonce(client: &Client, rpc_url: &str, address_hex: &str) -> Result<u64, String> {
+async fn get_latest_nonce(
+    client: &Client,
+    rpc_url: &str,
+    address_hex: &str,
+) -> Result<u64, String> {
     // Use "latest" (mined nonce), not "pending". The pending counter on this
     // node tracks the highest submitted nonce, which can run far ahead of
     // what is actually queued or mined when previous benchmark runs flooded
@@ -180,7 +179,10 @@ async fn get_latest_nonce(client: &Client, rpc_url: &str, address_hex: &str) -> 
         .send()
         .await
         .map_err(|e| format!("nonce req failed: {e}"))?;
-    let v: Value = resp.json().await.map_err(|e| format!("nonce parse failed: {e}"))?;
+    let v: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("nonce parse failed: {e}"))?;
     let hex_str = v["result"]
         .as_str()
         .ok_or("nonce result missing")?
@@ -193,7 +195,10 @@ async fn get_block_number(client: &Client, rpc_url: &str) -> u64 {
     match client.post(rpc_url).json(&body).send().await {
         Ok(resp) => match resp.json::<Value>().await {
             Ok(v) => {
-                let hex_str = v["result"].as_str().unwrap_or("0x0").trim_start_matches("0x");
+                let hex_str = v["result"]
+                    .as_str()
+                    .unwrap_or("0x0")
+                    .trim_start_matches("0x");
                 u64::from_str_radix(hex_str, 16).unwrap_or(0)
             }
             Err(_) => 0,
@@ -297,7 +302,11 @@ async fn main() {
     // the deadline for tx N as `start + (N / target_tps)` seconds and sleep
     // until that deadline before spawning. This produces a steady stream that
     // matches `target_tps` regardless of spawn overhead.
-    let tx_interval_ns: u64 = if target_tps > 0 { 1_000_000_000 / target_tps } else { 0 };
+    let tx_interval_ns: u64 = if target_tps > 0 {
+        1_000_000_000 / target_tps
+    } else {
+        0
+    };
 
     while start.elapsed() < duration {
         // Compute next deadline
@@ -309,7 +318,11 @@ async fn main() {
             }
         }
 
-        let permit = semaphore.clone().acquire_owned().await.expect("semaphore closed");
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore closed");
         let client = client.clone();
         let url = rpc_url.clone();
         let s = success.clone();
@@ -411,11 +424,19 @@ async fn main() {
         .unwrap_or(start_nonce);
     let mined = end_nonce.saturating_sub(start_nonce);
     let actual_tps = mined as f64 / elapsed.max(0.001);
-    let mined_rate = if sent > 0 { mined as f64 / sent as f64 * 100.0 } else { 0.0 };
+    let mined_rate = if sent > 0 {
+        mined as f64 / sent as f64 * 100.0
+    } else {
+        0.0
+    };
 
     let block_end = get_block_number(&client, &rpc_url).await;
     let blocks = block_end.saturating_sub(block_start);
-    let tx_per_block = if blocks > 0 { mined as f64 / blocks as f64 } else { 0.0 };
+    let tx_per_block = if blocks > 0 {
+        mined as f64 / blocks as f64
+    } else {
+        0.0
+    };
 
     println!();
     println!("━━━ Result ━━━");
@@ -430,13 +451,20 @@ async fn main() {
     println!("  Mined-of-sent rate   : {:.2}%", mined_rate);
     println!("  Actual mined TPS     : {:.2}", actual_tps);
     println!("  Avg latency          : {:.2}ms", avg_lat_ms);
-    println!("  Blocks               : {} (start {} -> end {})", blocks, block_start, block_end);
+    println!(
+        "  Blocks               : {} (start {} -> end {})",
+        blocks, block_start, block_end
+    );
     println!("  Tx/block             : {:.2}", tx_per_block);
     println!();
 
     // ---- Write report ----
     let timestamp = Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string();
-    let report_path = format!("{}/benchmark_signed_{}.md", out_dir.trim_end_matches('/'), timestamp);
+    let report_path = format!(
+        "{}/benchmark_signed_{}.md",
+        out_dir.trim_end_matches('/'),
+        timestamp
+    );
     let report = format!(
         "---\ncreated: {}\nbranch: quorum-execution-v1\nauthor: bench-signed (auto-generated)\nsprint: level-a\nstatus: active\nscope: Self-signed EIP-155 benchmark — production-correct path with ground-truth nonce delta\n---\n\n\
         # Citrate Self-Signed Benchmark — {}\n\n\

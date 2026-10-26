@@ -74,9 +74,7 @@ impl WorkloadClass for InferenceRouterRequest {
     fn build(&self, ctx: &WorkloadContext, signer: &Signer, nonce: u64) -> Result<SignedTx> {
         let to = ctx.resolve_contract("AIInferenceRouterPortable")?;
         let mut data = Vec::with_capacity(4 + 96);
-        data.extend_from_slice(&selector(
-            "requestInference(bytes32,bytes32,uint256)",
-        ));
+        data.extend_from_slice(&selector("requestInference(bytes32,bytes32,uint256)"));
         data.extend_from_slice(&encode_bytes32(&self.model_id));
         data.extend_from_slice(&encode_bytes32(&self.input_commitment));
         data.extend_from_slice(&encode_uint256_u128(self.max_price_wei));

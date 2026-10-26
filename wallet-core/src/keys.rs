@@ -134,7 +134,7 @@ impl UnifiedKey {
             UnifiedKey::Secp256k1(key) => {
                 let vk = key.verifying_key();
                 // Uncompressed public key (65 bytes: 0x04 || x || y)
-                vk.to_encoded_point(false).as_bytes().to_vec()
+                vk.to_sec1_point(false).as_bytes().to_vec()
             }
         }
     }
@@ -431,7 +431,9 @@ impl KeyManager {
             return Err(WalletError::InvalidPassword);
         }
 
-        let signing_key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let signing_key =
+            <k256::ecdsa::SigningKey as k256::elliptic_curve::Generate>::try_generate()
+                .map_err(|e| WalletError::KeyGeneration(format!("system RNG unavailable: {e}")))?;
         let address = derive_address_from_secp256k1(&signing_key);
         let public_key_hex =
             hex::encode(UnifiedKey::Secp256k1(signing_key.clone()).public_key_bytes());
@@ -669,7 +671,7 @@ pub fn derive_address_from_ed25519(pubkey_bytes: &[u8; 32]) -> String {
 /// Address = Keccak-256(uncompressed_pubkey_without_prefix)[12..32]
 pub fn derive_address_from_secp256k1(signing_key: &k256::ecdsa::SigningKey) -> String {
     let vk = signing_key.verifying_key();
-    let uncompressed = vk.to_encoded_point(false);
+    let uncompressed = vk.to_sec1_point(false);
     let pubkey_bytes = uncompressed.as_bytes().get(1..).unwrap_or_default(); // skip the 0x04 prefix
     let hash: [u8; 32] = Keccak256::digest(pubkey_bytes).into();
     let [_, _, _, _, _, _, _, _, _, _, _, _, address_bytes @ ..] = hash;
@@ -739,8 +741,8 @@ const BIP44_EVM_PATH_PREFIX: &str = "m/44'/60'/0'/0";
 /// WAL-04: the caller owns the seed's lifetime; this function does not
 /// copy it into any longer-lived buffer. The two SECRETS are erased: the
 /// 64-byte seed is held in `Zeroizing` by the mnemonic wrapper, and the
-/// returned leaf `SigningKey` zeroizes on drop via k256. NOTE: bip32 0.5.3
-/// does NOT implement Zeroize/Drop on `ExtendedKeyAttrs`, so the XPrv's
+/// returned leaf `SigningKey` zeroizes on drop via k256. NOTE: bip32 (0.5.3,
+/// and still 0.6.0) does NOT implement Zeroize/Drop on `ExtendedKeyAttrs`, so the XPrv's
 /// chain code is left as stack residue (not zeroized) — low impact, since
 /// the chain code is not the private scalar and the leaf key IS zeroized.
 pub fn secp256k1_from_seed(seed: &[u8], account_index: u32) -> Result<UnifiedKey, WalletError> {
@@ -768,7 +770,7 @@ pub fn secp256k1_from_seed(seed: &[u8], account_index: u32) -> Result<UnifiedKey
     // For the k256 backend, `bip32::PrivateKey` IS `k256::ecdsa::SigningKey`.
     // Clone the leaf out of the extended key; the leaf `SigningKey` zeroizes
     // via k256. The XPrv chain code is dropped here but NOT zeroized (bip32
-    // 0.5.3 lacks Zeroize on ExtendedKeyAttrs) — stack residue, low impact.
+    // 0.6.0 still lacks Zeroize on ExtendedKeyAttrs) — stack residue, low impact.
     let signing_key: k256::ecdsa::SigningKey = xprv.private_key().clone();
     Ok(UnifiedKey::Secp256k1(signing_key))
 }
@@ -1561,7 +1563,7 @@ mod tests {
 
     #[test]
     fn test_unified_key_secp256k1_sign() {
-        let key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let key = <k256::ecdsa::SigningKey as k256::elliptic_curve::Generate>::generate();
         let unified = UnifiedKey::Secp256k1(key);
         let sig = unified.sign(b"test data");
         assert_eq!(sig.len(), 64);
@@ -1576,7 +1578,7 @@ mod tests {
         assert!(ed_addr.starts_with("0x"));
         assert_eq!(ed_addr.len(), 42);
 
-        let secp_key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let secp_key = <k256::ecdsa::SigningKey as k256::elliptic_curve::Generate>::generate();
         let unified_secp = UnifiedKey::Secp256k1(secp_key);
         let secp_addr = unified_secp.derive_address();
         assert!(secp_addr.starts_with("0x"));
@@ -1702,7 +1704,7 @@ mod tests {
             .expect("recover verifying key");
 
         // Address of the recovered key.
-        let uncompressed = recovered_vk.to_encoded_point(false);
+        let uncompressed = recovered_vk.to_sec1_point(false);
         let recovered_hash = Keccak256::digest(&uncompressed.as_bytes()[1..]);
         let recovered_addr = format!("0x{}", hex::encode(&recovered_hash[12..32]));
 

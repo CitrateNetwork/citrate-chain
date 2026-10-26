@@ -27,7 +27,7 @@ rand = "0.8"
 futures = "0.3"
 chrono = "0.4"
 # bench-signed: self-sign EIP-155 legacy transactions
-k256 = { version = "0.13", features = ["ecdsa"] }
+k256 = { version = "0.14", features = ["ecdsa"] }
 sha3 = "0.10"
 rlp = "0.5"
 hex = "0.4"

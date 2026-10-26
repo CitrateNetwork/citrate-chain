@@ -67,7 +67,7 @@ async-trait = "0.1"
 # Enable TLS, multipart uploads (IPFS add), and JSON helpers used in node code
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "multipart", "json"] }
 rand = { workspace = true }
-k256 = { version = "0.13", features = ["ecdsa"] }
+k256 = { version = "0.14", features = ["ecdsa", "getrandom"] }
 # WS-5 ceremony: ed25519 proposer-key derivation + signing the Register digest.
 ed25519-dalek = { workspace = true }
 # Prometheus-style metrics

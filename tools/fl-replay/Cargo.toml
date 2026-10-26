@@ -22,5 +22,5 @@ serde_json = { workspace = true }
 sha2 = "0.10"
 sha3 = { workspace = true }
 hex = "0.4"
-k256 = { version = "0.13", features = ["ecdsa"] }
+k256 = { version = "0.14", features = ["ecdsa"] }
 anyhow = { workspace = true }

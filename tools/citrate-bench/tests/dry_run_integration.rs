@@ -35,8 +35,8 @@ fn make_keystores(dir: &std::path::Path, count: usize, passphrase: &str) -> Vec<
     for i in 1..=count {
         let name = format!("bench-{i:02}");
         let mut rng = OsRng;
-        let (raw, filename) = eth_keystore::new(dir, &mut rng, passphrase, Some(&name))
-            .expect("new keystore");
+        let (raw, filename) =
+            eth_keystore::new(dir, &mut rng, passphrase, Some(&name)).expect("new keystore");
         // Defensive: some eth-keystore versions ignore Some(name) and
         // use a uuid instead. Rename if needed.
         let target = dir.join(&name);
@@ -95,10 +95,7 @@ async fn dry_run_end_to_end_with_real_keystore() {
     }
 
     // Build the pool with identical starting nonces per signer.
-    let pool = Arc::new(
-        SignerPool::new(signers, vec![100, 200, 300], 64)
-            .expect("pool"),
-    );
+    let pool = Arc::new(SignerPool::new(signers, vec![100, 200, 300], 64).expect("pool"));
     assert_eq!(pool.len(), 3);
 
     // Build the workload + context.
@@ -120,7 +117,10 @@ async fn dry_run_end_to_end_with_real_keystore() {
         result.signed_ok
     );
     assert_eq!(result.signing_errors, 0);
-    assert_eq!(result.pool_saturated, 0, "pool should never saturate in dry-run with 64 slots");
+    assert_eq!(
+        result.pool_saturated, 0,
+        "pool should never saturate in dry-run with 64 slots"
+    );
 
     // Per-signer counts must sum to signed_ok.
     let sum: u64 = result.per_signer_count.iter().sum();
@@ -258,8 +258,7 @@ async fn dry_run_mix_exercises_every_workload_class() {
 
     let workload: Arc<dyn WorkloadClass> = Arc::new(mix);
     let ctx = Arc::new(
-        WorkloadContext::for_dry_run(40204, 1_000_000_000)
-            .with_address_table(Arc::new(table)),
+        WorkloadContext::for_dry_run(40204, 1_000_000_000).with_address_table(Arc::new(table)),
     );
 
     // 200 txs at 400 tps over 0.5s wall-clock (duration_secs=1 but
