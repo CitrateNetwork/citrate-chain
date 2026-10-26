@@ -1,0 +1,13 @@
+{
+ "_doc": "The r1006 producer set (7). Placeholder until filled by scripts/genesis/r1006/fill_producers.py; the r1006 profile is not release-ready (fails closed) while this says placeholder. Public values only: staker address, proposer public key, registration signature.",
+ "status": "placeholder",
+ "producers": [
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null
+ ]
+}

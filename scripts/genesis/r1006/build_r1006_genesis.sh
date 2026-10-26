@@ -238,9 +238,13 @@ grep -q 'P3 ' "$WORK/ceremony-1.log" && grep -q 'missing inputs: PATRONAGE_KYC_R
 # GOVERNANCE, deployed by the ceremony deployer in this fixed order.
 GOVERNANCE=$(jq -r '.contracts.GovernanceTimelock' "$REPO/contracts/genesis/governance.json")
 [[ "$GOVERNANCE" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "no GOVERNANCE in P1's book"
+# create TARGET ARGS...: forge create with the constructor args LAST (forge's
+# --constructor-args takes every argument after it).
 create() {
-  (cd "$REPO/contracts" && "$REAL_FORGE" create "$@" --rpc-url "$RPC" --account r1006-ceremony --password-file "$PWF" \
-    --legacy --gas-limit 8000000 --broadcast --json) | tee -a "$WORK/standins.log" | jq -r '.deployedTo'
+  local target="$1"
+  shift
+  (cd "$REPO/contracts" && "$REAL_FORGE" create "$target" --rpc-url "$RPC" --account r1006-ceremony --password-file "$PWF" \
+    --legacy --gas-limit 8000000 --broadcast --json --constructor-args "$@") 2>>"$WORK/standins.log" | tee -a "$WORK/standins.log" | jq -r '.deployedTo'
 }
 log "P4 stand-ins under GOVERNANCE $GOVERNANCE"
 KYC=$(create src/KYCRegistry.sol:KYCRegistry --constructor-args "$PATRONAGE_KYC_UPDATER" "$GOVERNANCE")

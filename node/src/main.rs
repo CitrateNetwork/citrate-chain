@@ -765,6 +765,9 @@ async fn main() -> Result<()> {
         };
 
         let genesis_profile = config.chain.genesis_profile.as_deref();
+        if genesis_profile == Some(genesis::R1006_PROFILE) {
+            genesis::check_r1006_bootable(genesis::r1006_rehearsal_from_env())?;
+        }
         genesis::initialize_genesis_state_with_profile(
             probe_storage,
             executor,
@@ -1404,6 +1407,50 @@ fn parse_storage_key_hex(hex_str: &str, source: &str) -> Result<zeroize::Zeroizi
 
 async fn start_node(config: NodeConfig) -> Result<()> {
     info!("Starting Citrate node...");
+    // Rules compiled for THIS chain's block 0 (keyed by genesis hash, not chain id: r1005
+    // and r1006 share 40204). Read before any consensus or execution component exists.
+    let running_genesis: Option<[u8; 32]> = {
+        let probe = StorageManager::with_config(
+            &config.storage.data_dir,
+            StorageConfig {
+                pruning: PruningConfig::default(),
+                encryption: at_rest_encryption_from_env()?,
+            },
+        )?;
+        let g = probe
+            .blocks
+            .get_block_by_height(0)
+            .ok()
+            .flatten()
+            .map(|h| *h.as_bytes());
+        drop(probe);
+        g
+    };
+    let genesis_acts =
+        running_genesis.and_then(|g| citrate_consensus::hardening::genesis_activations(&g));
+    if config.chain.genesis_profile.as_deref() == Some(genesis::R1006_PROFILE)
+        && genesis_acts.is_none()
+    {
+        anyhow::bail!(
+            "[chain] genesis_profile = \"r1006\" but this data directory's block 0 ({}) is not \
+             the r1006 genesis this build compiles ({}). Use a fresh data directory.",
+            running_genesis.map(hex::encode).unwrap_or_else(|| "missing".into()),
+            hex::encode(citrate_consensus::hardening::R1006_GENESIS)
+        );
+    }
+    if running_genesis == Some(citrate_consensus::hardening::R1006_GENESIS) {
+        genesis::check_r1006_bootable(genesis::r1006_rehearsal_from_env())?;
+    }
+    if let Some(a) = &genesis_acts {
+        for (name, h) in a.entries() {
+            let wired = citrate_consensus::hardening::GenesisActivations::WIRED.contains(&name);
+            info!(
+                "Genesis-pinned rule {name}: {} ({})",
+                h.map(|h| format!("from height {h}")).unwrap_or_else(|| "not scheduled".into()),
+                if wired { "enforced by this build" } else { "recorded; the rule is not in this build" }
+            );
+        }
+    }
     // HUP-S7.2: the agent precompile fork height, published before any
     // execution component is built. 40204 pins it at genesis (active from
     // block 1); other chains are off unless env or config sets a height. On a
@@ -1429,10 +1476,16 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // built. Unset by default on every chain (the padded legacy form, as the
     // previous binary); a new genesis sets 0 through `[chain]
     // exact_create_code_height` or the env override.
-    let (exact_code_height, exact_code_source) = citrate_execution::exact_code::init_for_chain(
-        config.chain.chain_id,
-        config.chain.exact_create_code_height,
-    )
+    let (exact_code_height, exact_code_source) = match &genesis_acts {
+        Some(a) => citrate_execution::exact_code::init_with_genesis_pin(
+            a.exact_create_code,
+            config.chain.exact_create_code_height,
+        ),
+        None => citrate_execution::exact_code::init_for_chain(
+            config.chain.chain_id,
+            config.chain.exact_create_code_height,
+        ),
+    }
     .map_err(|e| anyhow::anyhow!("{}", e))?;
     match exact_code_height {
         Some(h) => info!(
@@ -1492,13 +1545,19 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // ONE store, ONE resolution order (release pin for the chain, then
         // env override, then [chain] key): consensus, network and execution
         // (`citrate_execution::activation`) all read what this publishes.
-        let pba = citrate_consensus::hardening::init_pba_hardening_for_chain(
+        let pba = citrate_consensus::hardening::init_pba_hardening_for_genesis(
             config.chain.chain_id,
+            genesis_acts.as_ref(),
             config.chain.pba_hardening_height,
             config.chain.dev_profile,
         )
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-        let fp = consensus_manifest::ConsensusManifest::current().fingerprint;
+        let manifest = consensus_manifest::ConsensusManifest::current();
+        let manifest = match (running_genesis, config.chain.genesis_profile.as_deref()) {
+            (Some(g), profile) => manifest.bound(profile.unwrap_or("-"), &g),
+            (None, _) => manifest,
+        };
+        let fp = manifest.fingerprint;
         match pba.height {
             Some(h) => info!(
                 "Block-validity hardening ACTIVE from height {} [{}] (tx signature + \

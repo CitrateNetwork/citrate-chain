@@ -216,6 +216,23 @@ pub fn init_for_chain(
     Ok(r)
 }
 
+/// [`init_for_chain`] with a per-genesis pin (the node's compiled genesis activations,
+/// keyed by block 0) in place of the chain-id pin. `pin` is the genesis's height for this
+/// rule; a disagreeing env or config value is refused as for a release pin.
+pub fn init_with_genesis_pin(
+    pin: Option<u64>,
+    config_value: Option<u64>,
+) -> Result<(Option<u64>, ExactCodeSource), String> {
+    let env_raw = match std::env::var(EXACT_CREATE_CODE_ENV) {
+        Ok(raw) => Some(raw),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(e) => return Err(format!("{EXACT_CREATE_CODE_ENV}: {e}")),
+    };
+    let r = resolve(Some(pin), env_raw.as_deref(), config_value)?;
+    set_exact_create_code_height(r.0);
+    Ok(r)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

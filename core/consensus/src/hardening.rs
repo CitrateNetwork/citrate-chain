@@ -178,12 +178,90 @@ pub const RELEASE_GENESIS: &[(u64, [u8; 32])] = &[
         40204,
         hex32("90044175c36a6491309d769bd0fa684afbf7b90b64136446db8e2e6ff0927553"),
     ),
+    // r1006 (profile `r1006`: genesis from ceremony state)
+    (40204, R1006_GENESIS),
     // mainnet
     (
         40204,
         hex32("ba93d716ab8b005f1d7e61d369a65fc1d6a358d6a479e11b640815c74388ab01"),
     ),
 ];
+
+/// The r1006 genesis block (profile `r1006`: block 0 holds the ceremony's contracts).
+/// Pinned by `r1006_genesis_hash_is_pinned` in citrate-economics, which rebuilds it from
+/// the compiled profile; any change to the allocation moves it, on purpose.
+pub const R1006_GENESIS: [u8; 32] =
+    hex32("0000000000000000000000000000000000000000000000000000000000000000");
+
+/// Activation heights compiled into this release for ONE genesis, keyed by its block-0
+/// hash rather than by chain id. r1005 and r1006 share chain id 40204; a rule scheduled
+/// for r1006 must not reach a node still on r1005's genesis, and r1005's compiled
+/// constants must not reach r1006.
+///
+/// Each field is a rule's activation height (`None` = not scheduled). A field whose rule
+/// is not in this build yet is a typed slot: it records the owner's decision so the PR
+/// that adds the rule only has to read it (see `wired` below).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenesisActivations {
+    /// Block-validity hardening (this module).
+    pub pba_hardening: Option<u64>,
+    /// Exact created code (`citrate_execution::exact_code`).
+    pub exact_create_code: Option<u64>,
+    /// Canonical ECVRF point encoding. Typed slot: the rule is in a separate PR.
+    pub vrf_canonical_encoding: Option<u64>,
+    /// Storage-root hardening. Typed slot: the rule is in a separate PR.
+    pub storage_root_hardening: Option<u64>,
+    /// Journaled fee settlement. Typed slot: the rule is in a separate PR.
+    pub journaled_fee_settlement: Option<u64>,
+    /// Executed-state rewards. Typed slot: the rule is in a separate PR.
+    pub executed_state_rewards: Option<u64>,
+    /// Journaled in-transaction writes. Typed slot: the rule is in a separate PR.
+    pub journaled_in_tx_writes: Option<u64>,
+}
+
+impl GenesisActivations {
+    /// Every rule, by name, with its height, in a fixed order (for logs and the
+    /// consensus fingerprint).
+    pub fn entries(&self) -> [(&'static str, Option<u64>); 7] {
+        [
+            ("pba_hardening", self.pba_hardening),
+            ("exact_create_code", self.exact_create_code),
+            ("vrf_canonical_encoding", self.vrf_canonical_encoding),
+            ("storage_root_hardening", self.storage_root_hardening),
+            ("journaled_fee_settlement", self.journaled_fee_settlement),
+            ("executed_state_rewards", self.executed_state_rewards),
+            ("journaled_in_tx_writes", self.journaled_in_tx_writes),
+        ]
+    }
+
+    /// The rules this build enforces from these heights. The others are recorded only.
+    pub const WIRED: &'static [&'static str] = &["pba_hardening", "exact_create_code"];
+}
+
+/// r1006's rules: the owner's decision (2026-10-26) is EVERY new hardening rule active
+/// from the first block after genesis. ONE place: changing a rule's schedule for r1006 is
+/// a one-line change here (and moves the consensus fingerprint).
+pub const R1006_ACTIVATIONS: GenesisActivations = GenesisActivations {
+    pba_hardening: Some(0),
+    exact_create_code: Some(0),
+    vrf_canonical_encoding: Some(0),
+    storage_root_hardening: Some(0),
+    journaled_fee_settlement: Some(0),
+    executed_state_rewards: Some(0),
+    journaled_in_tx_writes: Some(0),
+};
+
+/// Per-genesis activations compiled into this release.
+pub const GENESIS_ACTIVATIONS: &[([u8; 32], GenesisActivations)] =
+    &[(R1006_GENESIS, R1006_ACTIVATIONS)];
+
+/// The activations compiled for the chain whose block 0 is `genesis`, if any.
+pub fn genesis_activations(genesis: &[u8; 32]) -> Option<GenesisActivations> {
+    GENESIS_ACTIVATIONS
+        .iter()
+        .find(|(g, _)| g == genesis)
+        .map(|(_, a)| *a)
+}
 
 /// Canonical blocks compiled into this release, by release genesis: at each
 /// listed height the listed hash is the only block a node admits, so any other
@@ -420,6 +498,36 @@ pub fn resolve_pba_hardening_for_chain(
         config_value,
         dev_profile,
     )?;
+    Ok(ResolvedActivation {
+        chain_id,
+        height,
+        source,
+        dev_profile,
+    })
+}
+
+/// [`init_pba_hardening_for_chain`], but a per-genesis pin ([`genesis_activations`])
+/// replaces the chain-id pin. The node calls this once it knows its block 0.
+pub fn init_pba_hardening_for_genesis(
+    chain_id: u64,
+    genesis: Option<&GenesisActivations>,
+    config_value: Option<u64>,
+    dev_profile: bool,
+) -> Result<ResolvedActivation, String> {
+    let Some(g) = genesis else {
+        return init_pba_hardening_for_chain(chain_id, config_value, dev_profile);
+    };
+    if dev_profile {
+        return Err(format!("chain {chain_id}: {}", dev_profile_refusal()));
+    }
+    let env_raw = match std::env::var(PBA_HARDENING_ENV) {
+        Ok(raw) => Some(raw),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(e) => return Err(format!("{PBA_HARDENING_ENV}: {e}")),
+    };
+    let (height, source) =
+        resolve_activation(g.pba_hardening, env_raw.as_deref(), config_value, false)?;
+    set_pba_hardening_height(height);
     Ok(ResolvedActivation {
         chain_id,
         height,
@@ -832,6 +940,48 @@ mod tests {
             ],
             "365,784 is the kept block of the 2026-10-15 rollback; 365,785 the first block on it"
         );
+    }
+
+    #[test]
+    fn r1006_rules_are_keyed_by_its_genesis_not_by_the_chain_id() {
+        let r1005 = RELEASE_GENESIS[0].1;
+        assert_ne!(R1006_GENESIS, r1005, "r1006 has its own block 0");
+        assert_eq!(genesis_activations(&R1006_GENESIS), Some(R1006_ACTIVATIONS));
+        assert_eq!(
+            genesis_activations(&r1005),
+            None,
+            "r1006's rules never reach r1005"
+        );
+        assert!(
+            canonical_checkpoints(&R1006_GENESIS).is_empty(),
+            "r1005's compiled checkpoints never reach r1006"
+        );
+        assert!(RELEASE_GENESIS.contains(&(40204, R1006_GENESIS)));
+        for (name, h) in R1006_ACTIVATIONS.entries() {
+            assert_eq!(h, Some(0), "{name}: the owner set every new rule to 0 on r1006");
+        }
+        for w in GenesisActivations::WIRED {
+            assert!(
+                R1006_ACTIVATIONS.entries().iter().any(|(n, _)| n == w),
+                "{w} is a field"
+            );
+        }
+    }
+
+    #[test]
+    fn a_genesis_pin_refuses_a_disagreeing_config() {
+        let g = R1006_ACTIVATIONS;
+        assert_eq!(
+            resolve_activation(g.pba_hardening, None, Some(5), false).map(|r| r.0),
+            Err(resolve_activation(Some(0), None, Some(5), false)
+                .err()
+                .unwrap_or_default())
+        );
+        assert_eq!(
+            resolve_activation(g.pba_hardening, None, Some(0), false),
+            Ok((Some(0), ActivationSource::ReleasePin))
+        );
+        assert!(init_pba_hardening_for_genesis(40204, Some(&g), None, true).is_err());
     }
 
     #[test]

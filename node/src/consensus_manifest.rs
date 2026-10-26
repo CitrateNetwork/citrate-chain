@@ -43,6 +43,21 @@ pub struct FingerprintInputs<'a> {
     pub canonical_base_fee_per_gas: u64,
     pub epoch: u64,
     pub snapshot_lag: u64,
+    /// The chain this process runs: `(genesis profile, block-0 hash hex, per-genesis rule
+    /// schedule)`. `None` for `citrate consensus` with no chain bound: the pre-image is
+    /// then exactly the v3 one. `Some` switches the tag to v4 and appends the binding, so
+    /// two binaries aligned on code but run against different genesis files (r1005 and
+    /// r1006 share chain id 40204) print different fingerprints.
+    pub genesis_binding: Option<GenesisBinding<'a>>,
+}
+
+/// See [`FingerprintInputs::genesis_binding`].
+#[derive(Debug, Clone, Copy)]
+pub struct GenesisBinding<'a> {
+    pub profile: &'a str,
+    pub genesis_hash: &'a str,
+    /// `name:height|...` from the genesis's compiled activations (`-` for none).
+    pub genesis_rules: &'a str,
 }
 
 /// Canonical, order-stable pre-image of the consensus-affecting surface.
@@ -88,9 +103,21 @@ pub fn fingerprint_preimage(i: &FingerprintInputs<'_>) -> String {
         None => preimage,
     };
     // Likewise appended only when scheduled.
-    match i.exact_create_code_height {
+    let preimage = match i.exact_create_code_height {
         Some(h) => format!("{preimage}exact_create_code_height={h}\n"),
         None => preimage,
+    };
+    match i.genesis_binding {
+        None => preimage,
+        Some(b) => format!(
+            "citrate-consensus-v4{}genesis_profile={}\ngenesis_hash={}\ngenesis_rules={}\n",
+            preimage
+                .strip_prefix("citrate-consensus-v3")
+                .unwrap_or(&preimage),
+            b.profile,
+            b.genesis_hash,
+            b.genesis_rules
+        ),
     }
 }
 
@@ -152,6 +179,12 @@ pub struct ConsensusManifest {
     pub epoch: u64,
     /// Validator-registry snapshot lag (blocks before the epoch boundary).
     pub snapshot_lag: u64,
+    /// The genesis profile this process runs (`None` = not bound to a chain).
+    pub genesis_profile: Option<String>,
+    /// Block-0 hash this process runs (`None` = not bound to a chain).
+    pub genesis_hash: Option<String>,
+    /// The genesis's compiled rule schedule (`name:height|...`), when bound.
+    pub genesis_rules: Option<String>,
     /// Stable hash over the consensus-affecting fields (NOT build_target). Two
     /// binaries with equal fingerprints compute equal state roots for equal input.
     pub fingerprint: String,
@@ -231,6 +264,7 @@ impl ConsensusManifest {
             canonical_base_fee_per_gas: CANONICAL_BASE_FEE_PER_GAS,
             epoch: EPOCH,
             snapshot_lag: SNAPSHOT_LAG,
+            genesis_binding: None,
         });
 
         Self {
@@ -250,8 +284,60 @@ impl ConsensusManifest {
             canonical_base_fee_per_gas: CANONICAL_BASE_FEE_PER_GAS,
             epoch: EPOCH,
             snapshot_lag: SNAPSHOT_LAG,
+            genesis_profile: None,
+            genesis_hash: None,
+            genesis_rules: None,
             fingerprint,
         }
+    }
+
+    /// The rule schedule string for a genesis (`-` when it has no compiled activations).
+    pub fn genesis_rules_of(genesis: &[u8; 32]) -> String {
+        match citrate_consensus::hardening::genesis_activations(genesis) {
+            None => "-".to_string(),
+            Some(a) => a
+                .entries()
+                .iter()
+                .map(|(n, h)| {
+                    format!(
+                        "{n}:{}",
+                        h.map(|h| h.to_string()).unwrap_or_else(|| "unset".into())
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("|"),
+        }
+    }
+
+    /// This manifest bound to a chain: the v4 fingerprint over the same fields plus the
+    /// genesis profile, block-0 hash and the genesis's compiled rule schedule.
+    pub fn bound(mut self, profile: &str, genesis: &[u8; 32]) -> Self {
+        let hash = format!("0x{}", hex::encode(genesis));
+        let rules = Self::genesis_rules_of(genesis);
+        self.fingerprint = fingerprint_of(&FingerprintInputs {
+            git_sha: self.git_sha,
+            feat_halo2_verifier: self.feat_halo2_verifier,
+            feat_commd_fold_verify: self.feat_commd_fold_verify,
+            activation_gated: &self.activation_gated,
+            pba_hardening_height: self.pba_hardening_height,
+            agent_precompiles_height: self.agent_precompiles_height,
+            exact_create_code_height: self.exact_create_code_height,
+            value_transfer_activation_height: self.value_transfer_activation_height,
+            create_nonce_fix_activation_height: self.create_nonce_fix_activation_height,
+            merge_depth_activation_height: self.merge_depth_activation_height,
+            canonical_base_fee_per_gas: self.canonical_base_fee_per_gas,
+            epoch: self.epoch,
+            snapshot_lag: self.snapshot_lag,
+            genesis_binding: Some(GenesisBinding {
+                profile,
+                genesis_hash: &hash,
+                genesis_rules: &rules,
+            }),
+        });
+        self.genesis_profile = Some(profile.to_string());
+        self.genesis_hash = Some(hash);
+        self.genesis_rules = Some(rules);
+        self
     }
 
     /// Human-readable stamp for `citrate consensus`.
@@ -412,6 +498,7 @@ mod tests {
             canonical_base_fee_per_gas: 1_000_000_000,
             epoch: 1000,
             snapshot_lag: 200,
+            genesis_binding: None,
         }
     }
 
@@ -588,6 +675,7 @@ mod tests {
                 canonical_base_fee_per_gas: m.canonical_base_fee_per_gas,
                 epoch: m.epoch,
                 snapshot_lag: m.snapshot_lag,
+                genesis_binding: None,
             };
             assert_eq!(
                 m.fingerprint,
@@ -605,6 +693,67 @@ mod tests {
                 "heights {p:?} {a:?}"
             );
         }
+    }
+
+    /// v4: a bound manifest names the genesis profile, block-0 hash and the genesis's
+    /// rule schedule; the unbound pre-image is byte-identical to v3 (golden vector above).
+    #[test]
+    fn genesis_binding_enters_the_fingerprint_as_v4() {
+        let b = GenesisBinding {
+            profile: "r1006",
+            genesis_hash: "0xabc",
+            genesis_rules: "pba_hardening:0",
+        };
+        let bound = FingerprintInputs {
+            genesis_binding: Some(b),
+            ..sample(true)
+        };
+        let pre = fingerprint_preimage(&bound);
+        assert!(pre.starts_with("citrate-consensus-v4\ngit_sha=0123abc\n"), "{pre}");
+        assert!(pre.ends_with(
+            "snapshot_lag=200\ngenesis_profile=r1006\ngenesis_hash=0xabc\n\
+             genesis_rules=pba_hardening:0\n"
+        ));
+        assert_eq!(
+            pre,
+            fingerprint_preimage(&sample(true)).replacen(
+                "citrate-consensus-v3",
+                "citrate-consensus-v4",
+                1
+            ) + "genesis_profile=r1006\ngenesis_hash=0xabc\ngenesis_rules=pba_hardening:0\n"
+        );
+        let base = fingerprint_of(&sample(true));
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(base.clone());
+        for v in [
+            b,
+            GenesisBinding { profile: "testnet_beta", ..b },
+            GenesisBinding { genesis_hash: "0xabd", ..b },
+            GenesisBinding { genesis_rules: "pba_hardening:1", ..b },
+        ] {
+            let f = fingerprint_of(&FingerprintInputs {
+                genesis_binding: Some(v),
+                ..sample(true)
+            });
+            assert!(seen.insert(f), "{v:?} collides");
+        }
+    }
+
+    /// r1005 and r1006 run on one chain id with the same binary: bound, they differ.
+    #[test]
+    fn r1005_and_r1006_bound_manifests_differ() {
+        use citrate_consensus::hardening::{R1006_GENESIS, RELEASE_GENESIS};
+        let m = ConsensusManifest::for_heights(Some(0), None);
+        let r1005 = m.clone().bound("testnet_beta", &RELEASE_GENESIS[0].1);
+        let r1006 = m.clone().bound("r1006", &R1006_GENESIS);
+        assert_ne!(r1005.fingerprint, r1006.fingerprint);
+        assert_ne!(r1005.fingerprint, m.fingerprint, "bound differs from unbound");
+        assert_eq!(r1005.genesis_rules.as_deref(), Some("-"));
+        assert!(r1006
+            .genesis_rules
+            .as_deref()
+            .is_some_and(|r| r.contains("exact_create_code:0")
+                && r.contains("vrf_canonical_encoding:0")));
     }
 
     #[test]

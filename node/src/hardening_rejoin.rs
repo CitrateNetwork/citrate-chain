@@ -1388,6 +1388,7 @@ pub(crate) mod tests {
             None,
             Some("team_testnet"),
             Some("mainnet"),
+            Some("r1006"),
         ] {
             let g = build(40204, profile).await;
             assert!(

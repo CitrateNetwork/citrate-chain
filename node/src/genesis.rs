@@ -77,6 +77,40 @@ impl Default for GenesisConfig {
     }
 }
 
+/// The genesis profile whose block 0 holds the ceremony's contracts (r1006).
+pub const R1006_PROFILE: &str = "r1006";
+
+/// Rehearsal opt-in: lets a node create or run an r1006 genesis that still has
+/// placeholders (ceremony inputs, producer set, OrangeSeed). Never set on a network node.
+pub const R1006_REHEARSAL_ENV: &str = "CITRATE_R1006_REHEARSAL";
+
+/// Fail closed on an r1006 genesis that is not release-ready. `allow_rehearsal` is the
+/// explicit opt-in (`CITRATE_R1006_REHEARSAL=1`); without it every missing piece is named
+/// and the node refuses to start.
+pub fn check_r1006_bootable(allow_rehearsal: bool) -> anyhow::Result<()> {
+    let r = citrate_economics::r1006::readiness()
+        .map_err(|e| anyhow::anyhow!("invalid r1006 genesis: {e}"))?;
+    if r.is_release_ready() {
+        return Ok(());
+    }
+    let missing = r.missing().join("; ");
+    if allow_rehearsal {
+        tracing::warn!(
+            "r1006 REHEARSAL genesis ({R1006_REHEARSAL_ENV}=1): not release-ready: {missing}"
+        );
+        return Ok(());
+    }
+    anyhow::bail!(
+        "the r1006 genesis in this build is not release-ready: {missing}. It must not start a \
+         network. For a local rehearsal only, set {R1006_REHEARSAL_ENV}=1."
+    )
+}
+
+/// Whether the rehearsal opt-in is set in the environment (exactly `1`).
+pub fn r1006_rehearsal_from_env() -> bool {
+    std::env::var(R1006_REHEARSAL_ENV).is_ok_and(|v| v == "1")
+}
+
 /// Create genesis block
 pub fn create_genesis_block(config: &GenesisConfig) -> Block {
     shared_genesis::create_canonical_genesis_block(config.timestamp)
@@ -124,6 +158,11 @@ pub async fn initialize_genesis_state_with_profile(
         Some("mainnet") => {
             tracing::info!("Using mainnet genesis profile");
             EconomicsGenesisConfig::mainnet()
+        }
+        Some(R1006_PROFILE) => {
+            tracing::info!("Using r1006 genesis profile (genesis from ceremony state)");
+            EconomicsGenesisConfig::r1006()
+                .map_err(|e| anyhow::anyhow!("invalid r1006 genesis: {e}"))?
         }
         _ => {
             // Backward compatible: infer from chain_id

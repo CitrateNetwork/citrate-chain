@@ -28,6 +28,7 @@ import sys
 HEX = re.compile(r"^0x[0-9a-f]*$")
 ADDR = re.compile(r"^0x[0-9a-f]{40}$")
 WORD = re.compile(r"^0x[0-9a-f]{64}$")
+ORANGESEED_PROXY = "0x000000000000000000000000000000c17a7e5eed"
 
 
 def fail(msg):
@@ -72,6 +73,7 @@ def main():
     ap.add_argument("--inputs", required=True)
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--validators", required=True)
+    ap.add_argument("--orangeseed", help="the OrangeSeed PR's GenesisOrangeSeed output (alloc JSON)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
@@ -114,6 +116,26 @@ def main():
         accounts.append(out)
     if not seen_deployer:
         fail(f"the deployer {deployer} is not in the dump")
+    orangeseed = None
+    if a.orangeseed:
+        o = json.load(open(a.orangeseed))
+        taken = {x["address"] for x in accounts}
+        addrs = sorted(k.lower() for k in o["alloc"])
+        if ORANGESEED_PROXY not in addrs or len(addrs) != 2:
+            fail(f"the OrangeSeed alloc must hold the proxy {ORANGESEED_PROXY} and one implementation, got {addrs}")
+        for k, v in o["alloc"].items():
+            addr = k.lower()
+            if addr in taken:
+                fail(f"OrangeSeed account {addr} collides with a ceremony account")
+            code = v["code"].lower()
+            if not HEX.match(code) or code == "0x":
+                fail(f"OrangeSeed {addr}: no code")
+            st = {kk.lower(): vv.lower() for kk, vv in (v.get("storage") or {}).items() if int(vv, 16) != 0}
+            ent = {"address": addr, "balance": norm_qty(v["balance"]), "nonce": int(v["nonce"], 0) if isinstance(v["nonce"], str) else int(v["nonce"]), "code": code}
+            if st:
+                ent["storage"] = dict(sorted(st.items()))
+            accounts.append(ent)
+        orangeseed = {"proxy": ORANGESEED_PROXY, "implementation": [x for x in addrs if x != ORANGESEED_PROXY][0]}
     accounts.sort(key=lambda x: x["address"])
 
     alloc = {
@@ -123,6 +145,7 @@ def main():
         "inputsSha256": inputs_sha,
         "validatorsStatus": v_status,
         "validatorsKeccak256": v_keccak,
+        "orangeseed": orangeseed,
         "deployer": deployer,
         "accounts": accounts,
     }

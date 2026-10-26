@@ -18,6 +18,7 @@ pub mod dynamic_pricing;
 pub mod enhanced_rewards;
 pub mod estimator;
 pub mod genesis;
+pub mod r1006;
 pub mod governance;
 pub mod institutional;
 pub mod revenue_sharing;
