@@ -357,6 +357,22 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("CONFIG FAIL", r.stdout)
 
+    def test_log_scan_exempts_only_known_notices(self):
+        log = self.root / "var/log/citrate-node.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(
+            "\x1b[32m INFO\x1b[0m citrate: Agent precompile fork ACTIVE from height 0 (source: release pin)\n"
+            "INFO citrate: runtime reorg: spine rebuild converged to the fork-choice head\n"
+            "INFO block 12 imported\n")
+        r = self.env.agent(1, "logs-scan", "0")
+        self.assertIn("matches 0", r.stdout, r.stdout)
+        self.assertIn("exempt 2", r.stdout)
+        with log.open("a") as f:
+            f.write("WARN citrate: runtime reorg: rebuilding applied state from genesis via the canonical spine (deep-fork self-heal)\n")
+            f.write("ERROR state root CONFLICT at 40\n")
+        r = self.env.agent(1, "logs-scan", "0")
+        self.assertIn("matches 2", r.stdout, r.stdout)
+
     def test_generated_config_has_no_contribution_recorder(self):
         tool = (REPO / "scripts/producers/gen_node_config.py").read_text().lower()
         self.assertNotIn("contribution", tool)

@@ -43,6 +43,8 @@
 #   distribute:   --mining on|off (on: the validator set is in the genesis)
 #   start:        --gate-minutes N (10) · --min-peers N (hosts-1) · --skip-producing-gate
 #   smoke:        --skip CHECK[,CHECK] (orangeseed, admins, code, logs) printed as SKIP, never PASS
+#                 · --min-height N (60): wait (up to --gate-minutes) until every head is past N, so
+#                   FLEET AGREE compares a real common block, not block 0
 #   wipe:         --wipe-keys (destroys noise.key, proposer.key and the staker keystore)
 #
 # Env: R1006_SSH_KEY (inventory ssh_key) · CAST, FORGE (cast, forge) · R1006_TUNNEL_BASE (18545)
@@ -73,6 +75,7 @@ GATE_MIN=10
 MIN_PEERS=""
 SKIP_PRODUCING=0
 SKIPS=""
+MIN_HEIGHT=60
 WIPE_KEYS=0
 
 die() { echo "r1006_bringup: $*" >&2; exit 2; }
@@ -101,6 +104,7 @@ while [[ $# -gt 0 ]]; do
     --min-peers) MIN_PEERS="$2"; shift 2 ;;
     --skip-producing-gate) SKIP_PRODUCING=1; shift ;;
     --skip) SKIPS="$2"; shift 2 ;;
+    --min-height) MIN_HEIGHT="$2"; shift 2 ;;
     --wipe-keys) WIPE_KEYS=1; shift ;;
     -h | --help) sed -n '2,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown option $1" ;;
@@ -548,6 +552,7 @@ skipped() { [[ ",$SKIPS," == *",$1,"* ]]; }
 step_smoke() {
   if [[ $DRY -eq 1 ]]; then
     for h in "${HOSTS[@]}"; do tunnel_up "$h"; done
+    echo "  [dry-run] wait until every head is past block $MIN_HEIGHT (up to $GATE_MIN min)"
     echo "  [dry-run] fleet_agree.sh over the ${#HOSTS[@]} tunnels, EXPECTED_GENESIS_HASH = fill genesis_hash"
     echo "  [dry-run] eth_chainId == 40204 on every host"
     echo "  [dry-run] eth_getCode(addr) == alloc[addr].code for every coded alloc entry (fill alloc_file), on every host"
@@ -562,6 +567,17 @@ step_smoke() {
   local gh urls=()
   gh=$(fill_field genesis_hash)
   for h in "${HOSTS[@]}"; do tunnel_up "$h"; urls+=("$(rpc_url "$h")"); done
+
+  # 0. every head past --min-height, so the agreement is about a real common block
+  heads_past() {
+    local h n
+    for h in "${HOSTS[@]}"; do
+      n=$(hexnum "$(rpc "$h" eth_blockNumber '[]')")
+      [[ -n "$n" && "$n" -ge "$MIN_HEIGHT" ]] || return 1
+    done
+  }
+  wait_until $((GATE_MIN * 60)) "every head past block $MIN_HEIGHT" heads_past ||
+    fail "a head is not past block $MIN_HEIGHT after $GATE_MIN min"
 
   # 1. FLEET AGREE
   local fa="$REPO/scripts/genesis/fleet_agree.sh"

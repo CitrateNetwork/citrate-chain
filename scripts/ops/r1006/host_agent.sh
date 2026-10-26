@@ -246,9 +246,17 @@ cmd_logs_scan() {
   else
     text=$(cat -- "$LOGFILE" 2>/dev/null || true)
   fi
-  local hits
-  hits=$(printf '%s\n' "$text" | grep -E -i '(^|[^a-z])(conflict|fork)([^a-z]|$)' || true)
-  printf 'lines %s\nmatches %s\n' "$(printf '%s\n' "$text" | grep -c . || true)" "$(printf '%s' "$hits" | grep -c . || true)"
+  # Colour codes off; then every CONFLICT / fork line counts except the known notices that
+  # only use the word: a fork ACTIVATION ("… fork ACTIVE from height …") and a converged
+  # fork choice ("… to the fork-choice head"). A real fork logs "deep-fork self-heal",
+  # "runtime reorg" or a state-root BOOT HALT, none of which is exempt.
+  text=$(printf '%s\n' "$text" | sed 's/\x1b\[[0-9;]*m//g')
+  local all hits benign
+  all=$(printf '%s\n' "$text" | grep -E -i '(^|[^a-z])(conflict|fork)([^a-z]|$)' || true)
+  benign='fork ACTIVE from height|converged to the fork-choice head|rebuilt applied state to the fork-choice head'
+  hits=$(printf '%s\n' "$all" | grep -v -E "$benign" | grep . || true)
+  printf 'lines %s\nmatches %s\nexempt %s\n' "$(printf '%s\n' "$text" | grep -c . || true)" \
+    "$(printf '%s' "$hits" | grep -c . || true)" "$(printf '%s\n' "$all" | grep -c -E "$benign" || true)"
   printf '%s\n' "$hits" | head -5 | sed 's/^/  | /'
 }
 
