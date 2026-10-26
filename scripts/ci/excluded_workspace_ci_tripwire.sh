@@ -6,8 +6,11 @@
 # workspace, so `cargo test --workspace` never reaches it. Unless a workflow runs
 # it explicitly, its tests (including load-bearing rejection tests) can break with
 # nothing noticing. This scan requires, for each excluded path P, that either
-#   - a workflow under .github/workflows/ contains `--manifest-path P/Cargo.toml`, or
-#   - a scripts/ci/*.sh script that a workflow invokes names P on a non-comment line,
+#   - a workflow step runs `cargo test ... --manifest-path P/Cargo.toml`, or
+#   - a workflow step runs a scripts/ci/*.sh script (not only its --self-test)
+#     that names P on a non-comment line,
+# where "a workflow step runs" means a jobs.<id>.steps[].run command, read by
+# scripts/ci/workflow_run_steps.py (a paths: filter or a comment never counts),
 # unless P is in ALLOW below with the reason it cannot run in CI.
 #
 # Usage: excluded_workspace_ci_tripwire.sh              # scan the tree
@@ -28,17 +31,28 @@ excluded_paths() { # <root> ; prints one excluded path per line
 
 is_allowed() {
   local p="$1" a
-  for a in "${ALLOW[@]}"; do [ "$a" = "$p" ] && return 0; done
+  for a in ${ALLOW[@]+"${ALLOW[@]}"}; do [ "$a" = "$p" ] && return 0; done
   return 1
 }
 
+SELF_NAME="${BASH_SOURCE[0]##*/}"
+RUN_STEPS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/workflow_run_steps.py"
+
 scan() { # <root> ; prints violations, returns 0 iff any found
-  local root="$1" p found=1 wf scripts=() s covered
+  local root="$1" p found=1 scripts=() s covered runs
   local wfs=("$root"/.github/workflows/*.yml)
-  # Scripts the workflows invoke.
+  # Only what a job step's `run:` executes counts. paths: filters, YAML
+  # comments, commented-out steps, shell comments and --self-test-only
+  # invocations are not coverage.
+  if ! runs="$(python3 "$RUN_STEPS" ${wfs[@]+"${wfs[@]}"})"; then
+    echo "$root/.github/workflows: could not read the workflow run steps"
+    return 0
+  fi
+  # This tripwire names excluded paths in its own fixtures; it never counts.
   while IFS= read -r s; do
-    [ -f "$root/$s" ] && scripts+=("$root/$s")
-  done < <(grep -ohE 'scripts/ci/[A-Za-z0-9_.-]+\.sh' "${wfs[@]}" 2>/dev/null | sort -u)
+    [ "${s##*/}" = "$SELF_NAME" ] && continue
+    [ -n "$s" ] && [ -f "$root/$s" ] && scripts+=("$root/$s")
+  done < <(python3 "$RUN_STEPS" --invocations ${wfs[@]+"${wfs[@]}"})
   local paths
   paths="$(excluded_paths "$root")"
   if [ -z "$paths" ]; then
@@ -48,10 +62,10 @@ scan() { # <root> ; prints violations, returns 0 iff any found
   while IFS= read -r p; do
     is_allowed "$p" && continue
     covered=0
-    if grep -qF -- "--manifest-path $p/Cargo.toml" "${wfs[@]}" 2>/dev/null; then
+    if grep -E 'cargo (\+[^ ]+ )?(test|nextest)' <<<"$runs" | grep -qF -- "--manifest-path $p/Cargo.toml"; then
       covered=1
     else
-      for s in "${scripts[@]}"; do
+      for s in ${scripts[@]+"${scripts[@]}"}; do
         if grep -vE '^\s*#' "$s" | grep -qF -- "$p"; then covered=1; break; fi
       done
     fi
@@ -65,6 +79,10 @@ scan() { # <root> ; prints violations, returns 0 iff any found
 
 self_test() {
   local tmp rc=0
+  # The run-step reader has its own fixture (both the PyYAML and built-in paths).
+  if ! python3 "$RUN_STEPS" --self-test >/dev/null; then
+    python3 "$RUN_STEPS" --self-test; rc=1
+  fi
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/excl-ws-tripwire.XXXXXX")"
   mkdir -p "$tmp/.github/workflows" "$tmp/scripts/ci"
   printf '[workspace]\nmembers = ["a"]\nexclude = ["core/federated", "crates/x", "crates/y"]\n' > "$tmp/Cargo.toml"
@@ -130,15 +148,16 @@ YAML
     echo "self-test: a non-run mention of a script or --manifest-path was accepted as coverage"; rc=1
   fi
 
-  # Negative control on the real tree: rust-ci.yml with the step that runs the
-  # commd suites deleted (paths: entries and the --self-test step left in
-  # place) must leave both commd crates uncovered; the unmodified copy passes.
+  # Negative control on a copy of the real tree (every workflow and every
+  # scripts/ci/*.sh): with the rust-ci.yml step that runs the commd suites
+  # deleted (paths: entries and the --self-test step left in place), both
+  # commd crates must be uncovered; the unmodified copy passes.
   local real="$REPO_ROOT"
   if [ -f "$real/.github/workflows/rust-ci.yml" ] && [ -f "$real/scripts/ci/test_commd_workspaces.sh" ]; then
     rm -f "$tmp"/.github/workflows/*.yml "$tmp"/scripts/ci/*.sh
     cp "$real/Cargo.toml" "$tmp/Cargo.toml"
-    cp "$real/scripts/ci/test_commd_workspaces.sh" "$tmp/scripts/ci/"
-    cp "$real/.github/workflows/rust-ci.yml" "$tmp/.github/workflows/"
+    cp "$real"/scripts/ci/*.sh "$tmp/scripts/ci/"
+    cp "$real"/.github/workflows/*.yml "$tmp/.github/workflows/"
     if out="$(scan "$tmp")"; then
       echo "self-test: the real rust-ci.yml copy was flagged: $out"; rc=1
     fi

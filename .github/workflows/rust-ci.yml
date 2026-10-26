@@ -11,6 +11,7 @@ on:
       - '.github/workflows/rust-ci.yml'
       - 'scripts/ci/test_commd_workspaces.sh'
       - 'scripts/ci/excluded_workspace_ci_tripwire.sh'
+      - 'scripts/ci/workflow_run_steps.py'
   pull_request:
     paths:
       - '**/Cargo.toml'
@@ -20,6 +21,7 @@ on:
       - '.github/workflows/rust-ci.yml'
       - 'scripts/ci/test_commd_workspaces.sh'
       - 'scripts/ci/excluded_workspace_ci_tripwire.sh'
+      - 'scripts/ci/workflow_run_steps.py'
 
 # RM-B1 / WP-F1.1 (audit CI-01): workflow-level minimum permissions.
 permissions:
