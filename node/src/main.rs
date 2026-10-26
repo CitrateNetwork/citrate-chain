@@ -499,6 +499,23 @@ async fn main() -> Result<()> {
             let (agent_height, _) =
                 citrate_execution::agent_fork::resolve_for_chain(chain_id, agent_configured)
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
+            // The canonical VRF encoding height, resolved like start_node: genesis-keyed
+            // (an r1006 config binds the compiled r1006 genesis; otherwise no genesis is
+            // known here).
+            citrate_consensus::vrf_encoding::init_for_genesis(
+                chain_id,
+                if file_cfg.as_ref().and_then(|c| c.chain.genesis_profile.as_deref())
+                    == Some(genesis::R1006_PROFILE)
+                {
+                    Some(&citrate_consensus::hardening::R1006_GENESIS)
+                } else {
+                    None
+                },
+                file_cfg
+                    .as_ref()
+                    .and_then(|c| c.chain.vrf_canonical_encoding_height),
+            )
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
             // A config on the r1006 profile is bound to the r1006 genesis this build
             // compiles: its genesis-pinned rules apply and the fingerprint is v4.
             let r1006 = file_cfg
@@ -1562,6 +1579,27 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         None => info!(
             "Exact created-code rule not scheduled (source: {}); created code stored as before",
             exact_code_source
+        ),
+    }
+    // Canonical ECVRF proof encoding height, published before the DAG store
+    // (whose VRF selector captures it) is built. 40204 leaves it unscheduled
+    // in this release; a disagreeing env or config value on a release network
+    // aborts start-up instead of forking this node at the height.
+    let (vrf_encoding_height, vrf_encoding_source) =
+        citrate_consensus::vrf_encoding::init_for_genesis(
+            config.chain.chain_id,
+            running_genesis.as_ref(),
+            config.chain.vrf_canonical_encoding_height,
+        )
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    match vrf_encoding_height {
+        Some(h) => info!(
+            "Canonical ECVRF proof encoding required from height {} (source: {})",
+            h, vrf_encoding_source
+        ),
+        None => info!(
+            "Canonical ECVRF proof encoding not scheduled (source: {}); proof decoding unchanged",
+            vrf_encoding_source
         ),
     }
 

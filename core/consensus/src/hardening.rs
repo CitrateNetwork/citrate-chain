@@ -236,7 +236,7 @@ impl GenesisActivations {
 
     /// The rules this build enforces from these heights. The others are recorded only,
     /// until their module (a separate PR) consults [`rules_for_genesis`].
-    pub const WIRED: &'static [&'static str] = &["pba_hardening", "exact_create_code"];
+    pub const WIRED: &'static [&'static str] = &["pba_hardening", "exact_create_code", "vrf_canonical_encoding"];
 }
 
 /// r1006's rules: the owner's decision (2026-10-26) is EVERY new hardening rule active

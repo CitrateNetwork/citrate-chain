@@ -8,6 +8,9 @@ ghostdag_k = 18
 # PBA-R2 block-validity hardening: active from genesis on dev profiles.
 # (Unset on every 40204 profile until the owner schedules it.)
 pba_hardening_height = 0
+# Canonical ECVRF proof encoding: active from genesis on dev profiles.
+# (Not scheduled on 40204 in this release; the release pin decides there.)
+vrf_canonical_encoding_height = 0
 # Local dev chain: the release-pinned activation height does not apply.
 dev_profile = true
 
