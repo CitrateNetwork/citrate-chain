@@ -27,6 +27,7 @@ What it does, in order (any failure exits non-zero and writes no fill-result.jso
 Then commit the two changed files and build the release binary: the node embeds the
 genesis, so the hosts select it by profile (genesis_profile "r1006", genesis_file null).
 
+  fill_producers.py validate PRODUCERS STAKES        step 1 only (no forge, no cargo)
   fill_producers.py check [--path validators.json]   re-check a filled set (exit 1 on a
                                                      placeholder or any problem)
 """
@@ -174,6 +175,10 @@ def write_json(p, d):
 
 
 def main(argv):
+    if argv[:1] == ["validate"] and len(argv) == 3:
+        v = check_inputs(load(argv[1]), load(argv[2]))
+        print(f"fill_producers: {len(v)} producers and their stakes are well formed")
+        return
     if argv[:1] == ["check"]:
         path = argv[2] if len(argv) > 2 and argv[1] == "--path" else ASSETS / "validators.json"
         v = load(path)

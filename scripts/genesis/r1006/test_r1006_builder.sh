@@ -60,39 +60,33 @@ jq '.accounts[3].code = "0x60"' "$T/dump.json" >"$T/dump-bad.json"
 expect "emit_alloc refuses a deployer with code" 1 'deployer has code' -- \
   python3 "$HERE/emit_alloc.py" --dump "$T/dump-bad.json" --manifest "$T/manifest.json" --inputs "$T/inputs.env" --book "$T/book40204.json" --out "$T/a3.json"
 
-# ------------------------------------------------------------ fill_producers
-VR=0x1111111111111111111111111111111111111111
-python3 - "$T" "$VR" "$HERE" <<'PY'
-import json, sys, subprocess
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-t, vr, here = sys.argv[1:4]
-sys.path.insert(0, here)
-import fill_producers as fp
-ps = []
-for i in range(7):
-    k = Ed25519PrivateKey.from_private_bytes(bytes([i + 1]) * 32)  # throwaway test keys
-    pk = "0x" + k.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
-    staker = "0x" + bytes([0xA0 + i]) .hex() * 20
-    sig = "0x" + k.sign(fp.digest(vr, staker, pk)).hex()
-    ps.append({"name": f"p{i}", "staker": staker, "proposerPubkey": pk, "registrationSig": sig, "stake": str(32000 * 10**18)})
-json.dump({"producers": ps}, open(f"{t}/producers.json", "w"))
+# ------------------------------------------------------------ fill_producers (input checks)
+python3 - "$T" <<'PY'
+import json, sys
+t = sys.argv[1]
+ps = [{"name": f"prod-{i}", "proposer_pubkey": "0x" + f"{i + 1:02x}" * 32,
+       "staker_address": "0x" + f"{0xa0 + i:02x}" * 20, "coinbase_address": "0x" + f"{0xa0 + i:02x}" * 20}
+      for i in range(7)]
+json.dump({"schema": "r1006-producers/1", "chain_id": 40204, "producers": ps}, open(f"{t}/producers.json", "w"))
+json.dump({"schema": "r1006-stakes/1", "stakes": {p["staker_address"]: {"name": p["name"], "stake_wei": str(32000 * 10**18),
+           "liquid_wei": str(100 * 10**18)} for p in ps}}, open(f"{t}/stakes.json", "w"))
 PY
 FP=(python3 "$HERE/fill_producers.py")
-expect "fill accepts 7 producers whose signatures verify" 0 '7 producers verified' -- "${FP[@]}" fill --registry "$VR" --from "$T/producers.json" --out "$T/v.json"
-expect "check re-verifies the filled file" 0 'OK' -- "${FP[@]}" check --path "$T/v.json"
-expect "fill refuses signatures made for another registry" 1 'does not verify' -- "${FP[@]}" fill --registry 0x2222222222222222222222222222222222222222 --from "$T/producers.json" --out "$T/x.json"
-jq '.producers[3].registrationSig |= (.[0:-2] + (if .[-2:] == "00" then "01" else "00" end))' "$T/producers.json" >"$T/p-badsig.json"
-expect "fill refuses a tampered signature" 1 'p3: registrationSig does not verify' -- "${FP[@]}" fill --registry "$VR" --from "$T/p-badsig.json" --out "$T/x.json"
-jq '.producers[1].staker = .producers[0].staker' "$T/producers.json" >"$T/p-dup.json"
-expect "fill refuses a duplicate staker" 1 'duplicate staker' -- "${FP[@]}" fill --registry "$VR" --from "$T/p-dup.json" --out "$T/x.json"
-jq '.producers |= .[0:6]' "$T/producers.json" >"$T/p-six.json"
-expect "fill refuses 6 producers" 1 '6 producers, want 7' -- "${FP[@]}" fill --registry "$VR" --from "$T/p-six.json" --out "$T/x.json"
-jq '.producers[2].stake = "1"' "$T/producers.json" >"$T/p-low.json"
-expect "fill refuses a stake under 32,000 SALT" 1 'below the 32,000 SALT minimum' -- "${FP[@]}" fill --registry "$VR" --from "$T/p-low.json" --out "$T/x.json"
+expect "fill validate accepts 7 well-formed producers and stakes" 0 '7 producers' -- "${FP[@]}" validate "$T/producers.json" "$T/stakes.json"
+jq '.producers[2].coinbase_address = "0x" + ("ee" * 20)' "$T/producers.json" >"$T/p-cb.json"
+expect "fill refuses a staker that is not the coinbase" 1 'consensus requires coinbase == staker' -- "${FP[@]}" validate "$T/p-cb.json" "$T/stakes.json"
+jq '.producers[1].proposer_pubkey = .producers[0].proposer_pubkey' "$T/producers.json" >"$T/p-dup.json"
+expect "fill refuses a duplicate proposer key" 1 'proposer_pubkey is the same as prod-0' -- "${FP[@]}" validate "$T/p-dup.json" "$T/stakes.json"
+jq '.producers |= .[0:3]' "$T/producers.json" >"$T/p-few.json"
+expect "fill refuses fewer than 4 producers" 1 'need at least 4' -- "${FP[@]}" validate "$T/p-few.json" "$T/stakes.json"
+jq '(.stakes[]) |= (.stake_wei = "1")' "$T/stakes.json" >"$T/s-low.json"
+expect "fill refuses a stake under 32,000 SALT" 1 'below the 32,000 SALT minimum' -- "${FP[@]}" validate "$T/producers.json" "$T/s-low.json"
+jq '.producers[0].proposer_pubkey |= ascii_upcase' "$T/producers.json" >"$T/p-case.json"
+expect "fill refuses a key not in its public form" 1 'not a 32-byte key' -- "${FP[@]}" validate "$T/p-case.json" "$T/stakes.json"
+jq '.stakes["0x" + ("dd" * 20)] = {"name":"x","stake_wei":"1","liquid_wei":"0"}' "$T/stakes.json" >"$T/s-extra.json"
+expect "fill refuses a stake for a non-producer" 1 'not producers' -- "${FP[@]}" validate "$T/producers.json" "$T/s-extra.json"
+printf '{"schema":"r1006-validators/1","status":"placeholder","validatorRegistry":null,"validators":[],"registry":null}\n' >"$T/validators.json"
 expect "check refuses the placeholder set" 1 'is a placeholder' -- "${FP[@]}" check --path "$T/validators.json"
-d1=$("${FP[@]}" digest --registry "$VR" --staker 0xa0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0 --pubkey "$(jq -r '.producers[0].proposerPubkey' "$T/producers.json")")
-[[ "$d1" =~ ^0x[0-9a-f]{64}$ ]] && ok "digest prints the 32-byte registration digest" || bad "digest prints the 32-byte registration digest" "$d1"
 
 # ------------------------------------------------------------ emit_book
 mkdir -p "$T/bw/book"
