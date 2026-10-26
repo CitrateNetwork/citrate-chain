@@ -205,7 +205,7 @@ start_node() {
   for _ in $(seq 240); do "$REAL_CAST" chain-id --rpc-url "$NODE_RPC" >/dev/null 2>&1 && break; sleep 0.5; done
   "$REAL_CAST" chain-id --rpc-url "$NODE_RPC" >/dev/null 2>&1 || die "devnet RPC did not come up (see $WORK/devnet.log)"
   if [[ -z "$PROXY_PID" ]]; then
-    python3 "$REPO/scripts/genesis/rpc_receipt_retry_proxy.py" --listen "$PROXY_PORT" --upstream "$NODE_RPC" \
+    python3 "$WORK/repo/scripts/genesis/rpc_receipt_retry_proxy.py" --listen "$PROXY_PORT" --upstream "$NODE_RPC" \
       >>"$WORK/proxy.log" 2>&1 &
     PROXY_PID=$!
   fi
