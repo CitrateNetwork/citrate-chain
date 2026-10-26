@@ -1,7 +1,9 @@
 [profile.default]
 # Read-only access to the param schemas, so RegisterSeedTemplates hashes the
 # file on disk rather than a constant transcribed beside it.
-fs_permissions = [{ access = "read", path = "./schemas" }, { access = "read", path = "./addresses" }]
+# ./genesis: C4 genesis ceremony inputs (TEAM_VESTING_FILE) and outputs (*_OUT paths).
+# Gitignored: allocation amounts and holder seats stay private until genesis (C2).
+fs_permissions = [{ access = "read", path = "./schemas" }, { access = "read", path = "./addresses" }, { access = "read-write", path = "./genesis" }]
 src = "src"
 out = "out"
 libs = ["lib"]
