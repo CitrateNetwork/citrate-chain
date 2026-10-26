@@ -362,8 +362,22 @@ if [[ "$FRESH" == "1" && -n "${GOVERNANCE:-}" && -n "${GUARDIAN:-}" ]]; then
   ROOT_ALIASES="$(jq -c --arg g "$GOVERNANCE" --arg r "$GUARDIAN" '. + {governance: {GOVERNANCE: $g, GUARDIAN: $r}}' <<<"$ROOT_ALIASES")"
 fi
 
+# genesis.P256Verifier: the vendored daimo verifier aa/DeployP256Verifier lands through the
+# Arachnid factory at a fixed address. Forge records that CREATE2 with no contract name, so
+# the generic merge above cannot see it; it is listed when this chain's (usable) broadcast
+# created it at that address.
+P256_VERIFIER_ADDR=0xc2b78104907f722dabac4c69f826a522b2754de4
+GENESIS_EXTRA='{}'
+p256_bc="${BROADCAST_ROOT}/DeployP256Verifier.s.sol/${CHAIN_ID}/run-latest.json"
+if [[ -f "$p256_bc" ]] && bc_usable "$p256_bc" &&
+  jq -e --arg a "$P256_VERIFIER_ADDR" '[.transactions[]? | select(.transactionType == "CREATE2" and ((.contractAddress // "") | ascii_downcase) == $a)] | length > 0' "$p256_bc" >/dev/null 2>&1; then
+  GENESIS_EXTRA="{\"P256Verifier\":\"$P256_VERIFIER_ADDR\"}"
+  log "merging DeployP256Verifier.s.sol (genesis.P256Verifier)"
+fi
+
 jq -n \
   --argjson prior_contracts "$PRIOR_CONTRACTS" \
+  --argjson genesis_extra "$GENESIS_EXTRA" \
   --argjson root_aliases "$ROOT_ALIASES" \
   --argjson prior_extra "$PRIOR_EXTRA" \
   --argjson contracts "$(cat "$contracts_jq")" \
@@ -382,7 +396,7 @@ jq -n \
     comment: "Canonical contract-address table for chain 40204 — the single source of truth the federation reads from. Regenerated from broadcast/*.s.sol/40204/run-latest.json + .env.testnet AA pins. See contracts/addresses/README.md.",
     contracts: ($prior_contracts + $contracts),
     aaStack: $aa,
-    genesis: { ArachnidDeterministicDeployer: "0x4e59b44847b379578588920ca78fbf26c0b4956c" },
+    genesis: ({ ArachnidDeterministicDeployer: "0x4e59b44847b379578588920ca78fbf26c0b4956c" } + $genesis_extra),
     precompiles: {
       ModelDeploy:            "0x0000000000000000000000000000000000000100",
       ModelInference:         "0x0000000000000000000000000000000000000101",

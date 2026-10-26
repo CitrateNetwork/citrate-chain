@@ -143,7 +143,10 @@ if [[ "$BROADCAST" == "1" ]]; then
   if [[ "$RPC_URL" != *localhost* && "$RPC_URL" != *127.0.0.1* && "${CITRATE_ALLOW_REMOTE:-0}" != "1" ]]; then
     die "refusing to --broadcast to a non-local RPC without CITRATE_ALLOW_REMOTE=1 (live-reroll two-key guard)"
   fi
-  BROADCAST_ARGS+=(--broadcast)
+  # --slow: one transaction at a time, each waited for, as the ceremony's own forge phases
+  # and the r1005 driver ran. A Citrate node answers null for a pending transaction, so a
+  # batched broadcast can give up on receipts of transactions that are later mined.
+  BROADCAST_ARGS+=(--broadcast --slow)
   log "BROADCAST enabled → $RPC_URL"
 else
   log "SIMULATE only (no --broadcast) → $RPC_URL"
