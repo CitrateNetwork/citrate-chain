@@ -9,6 +9,8 @@ on:
       - '**/*.rs'
       - '**/build.rs'
       - '.github/workflows/rust-ci.yml'
+      - '.github/workflows/fuzz.yml'
+      - 'scripts/ci/check_fuzz_targets.sh'
   pull_request:
     paths:
       - '**/Cargo.toml'
@@ -16,6 +18,8 @@ on:
       - '**/*.rs'
       - '**/build.rs'
       - '.github/workflows/rust-ci.yml'
+      - '.github/workflows/fuzz.yml'
+      - 'scripts/ci/check_fuzz_targets.sh'
 
 # RM-B1 / WP-F1.1 (audit CI-01): workflow-level minimum permissions.
 permissions:

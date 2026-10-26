@@ -26,6 +26,23 @@ set -uo pipefail
 
 ROOT="${CHECK_FUZZ_TARGETS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 
+# matrix_targets <fuzz.yml> : the items of the `matrix: target:` block list,
+# one per line. Comment lines, blank lines and trailing comments are skipped;
+# the list ends at the first line that is not an item indented under target:.
+matrix_targets() {
+  awk '
+    function indent(s) { match(s, /^ */); return RLENGTH }
+    /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+    inlist {
+      if (indent($0) > tcol && $1 == "-") { v = $2; sub(/#.*/, "", v); if (v != "") print v; next }
+      inlist = 0
+    }
+    /^[[:space:]]*target:[[:space:]]*(#.*)?$/ && inmatrix && indent($0) > mcol { inlist = 1; tcol = indent($0); next }
+    /^[[:space:]]*matrix:[[:space:]]*(#.*)?$/ { inmatrix = 1; mcol = indent($0); next }
+    inmatrix && indent($0) <= mcol { inmatrix = 0 }
+  ' "$1"
+}
+
 registration() {
   local root="$1" rc=0 f name
   local manifest="$root/fuzz/Cargo.toml" matrix="$root/.github/workflows/fuzz.yml"
@@ -44,8 +61,10 @@ registration() {
     [ -f "$root/fuzz/$f" ] || { echo "[[bin]] path does not exist: fuzz/$f"; rc=1; }
   done < <(sed -nE 's/^path = "([^"]+)"/\1/p' "$manifest")
 
+  local listed
+  listed="$(matrix_targets "$matrix")"
   while read -r name; do
-    if ! grep -qE "^[[:space:]]*-[[:space:]]+$name[[:space:]]*$" "$matrix"; then
+    if ! grep -qxF -- "$name" <<<"$listed"; then
       echo "fuzz target not in the fuzz.yml matrix: $name"; rc=1
     fi
   done < <(awk '/^\[\[bin\]\]/{b=1;next} b&&/^name = /{gsub(/"/,"",$3);print $3;b=0}' "$manifest")
