@@ -22,9 +22,9 @@ import "../src/SkillRegistry.sol";
 ///           AnchorRegistry, BenchmarkRegistry, SkillRegistry  (no admin)
 ///
 ///         and checks that the registries owned by the main ceremony (`DeployAll`,
-///         `DeployFederatedLearning`) are present in the book with code: ModelRegistry,
-///         InferenceRouter, LoRAFactory, X402Facilitator, IPFSIncentivesV3. This script never
-///         deploys those.
+///         `DeployDpf02Rbac`, `RedeployIPFSIncentivesV3`) are present in the book with
+///         code: ModelRegistry, InferenceRouter, LoRAFactory, X402Facilitator,
+///         IPFSIncentivesV3, AgentDecisionRegistryV2. This script never deploys those.
 ///
 ///         Every address is keccak256(0xff ++ 0x4e59… ++ Salts.salt(name) ++
 ///         keccak256(init_code))[12:], so a rerun over a chain where a registry already
@@ -85,10 +85,15 @@ contract DeployHupRegistries is ScriptEnv {
     }
 
     /// Registries the HUP features read that the main ceremony deploys.
-    /// AgentDecisionRegistryV2 (DeployDpf02Rbac) is not in the set: the owner keeps the DPF
-    /// scripts out of block 0 (2026-10-26), so a genesis book has no such entry.
-    function ceremonyOwnedNames() public pure returns (string[5] memory) {
-        return ["ModelRegistry", "InferenceRouter", "LoRAFactory", "X402Facilitator", "IPFSIncentivesV3"];
+    function ceremonyOwnedNames() public pure returns (string[6] memory) {
+        return [
+            "ModelRegistry",
+            "InferenceRouter",
+            "LoRAFactory",
+            "X402Facilitator",
+            "IPFSIncentivesV3",
+            "AgentDecisionRegistryV2"
+        ];
     }
 
     // ── init codes + projections (pure: the book tool and the tests share these) ──
@@ -303,7 +308,7 @@ contract DeployHupRegistries is ScriptEnv {
         require(bytes(bookPath).length != 0, "HUP_BOOK_PATH required on 40204");
         string memory json = vm.readFile(bookPath);
         require(vm.parseJsonUint(json, ".chainId") == 40204, "book is not the 40204 book");
-        string[5] memory names = ceremonyOwnedNames();
+        string[6] memory names = ceremonyOwnedNames();
         string memory missing;
         for (uint256 i = 0; i < names.length; i++) {
             address a = _bookAddress(json, names[i]);
@@ -318,7 +323,7 @@ contract DeployHupRegistries is ScriptEnv {
 
     function _reportCeremonySet(string memory bookPath) internal view {
         try vm.readFile(bookPath) returns (string memory json) {
-            string[5] memory names = ceremonyOwnedNames();
+            string[6] memory names = ceremonyOwnedNames();
             for (uint256 i = 0; i < names.length; i++) {
                 address a = _bookAddress(json, names[i]);
                 console.log(

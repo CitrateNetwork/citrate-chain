@@ -191,7 +191,7 @@ contract DeployHupRegistriesTest is Test {
     /// EVM is empty, so the real book's addresses double as fixtures).
     function _plantCeremonySet() internal {
         string memory json = vm.readFile("addresses/40204.json");
-        string[5] memory names = script.ceremonyOwnedNames();
+        string[6] memory names = script.ceremonyOwnedNames();
         for (uint256 i = 0; i < names.length; i++) {
             vm.etch(vm.parseJsonAddress(json, string.concat(".contracts.", names[i])), hex"00");
         }

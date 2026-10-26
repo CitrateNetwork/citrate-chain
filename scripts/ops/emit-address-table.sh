@@ -375,6 +375,21 @@ if [[ -f "$p256_bc" ]] && bc_usable "$p256_bc" &&
   log "merging DeployP256Verifier.s.sol (genesis.P256Verifier)"
 fi
 
+# genesis.OrangeSeed / genesis.OrangeSeedV0: the block-0 predeploy (chain#389) is a genesis
+# allocation, not a broadcast. With EMIT_ORANGESEED_ALLOC (the GenesisOrangeSeed output the
+# genesis build placed in block 0), the proxy and its V0 implementation are listed when that
+# allocation gives both predeploy addresses code. A file without them is an error.
+ORANGESEED_PROXY=0x000000000000000000000000000000c17a7e5eed
+ORANGESEED_IMPL=0x000000000000000000000000000000c17a7e5ee0
+if [[ -n "${EMIT_ORANGESEED_ALLOC:-}" ]]; then
+  jq -e --arg p "$ORANGESEED_PROXY" --arg i "$ORANGESEED_IMPL" \
+    '(.alloc // {}) | with_entries(.key |= ascii_downcase) | (.[$p].code // "0x") != "0x" and (.[$i].code // "0x") != "0x"' \
+    "$EMIT_ORANGESEED_ALLOC" >/dev/null 2>&1 ||
+    { err "EMIT_ORANGESEED_ALLOC ($EMIT_ORANGESEED_ALLOC) does not allocate code to the OrangeSeed proxy and implementation"; exit 1; }
+  GENESIS_EXTRA="$(jq -c --arg p "$ORANGESEED_PROXY" --arg i "$ORANGESEED_IMPL" '. + {OrangeSeed: $p, OrangeSeedV0: $i}' <<<"$GENESIS_EXTRA")"
+  log "genesis.OrangeSeed from the block-0 allocation ${EMIT_ORANGESEED_ALLOC}"
+fi
+
 jq -n \
   --argjson prior_contracts "$PRIOR_CONTRACTS" \
   --argjson genesis_extra "$GENESIS_EXTRA" \

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""library_book.py: the genesis library phase (P4L) of genesis_ceremony.sh.
+"""library_book.py: the genesis library phase (P3L) of genesis_ceremony.sh.
 
-P4L deploys the contracts of the r1005 address book that P1-P4 do not and that the owner
-keeps in block 0 (decision 2026-10-26: the customer DPF set, DeployDpf02Rbac..DeployDpf17Release,
-is out, and so is DeployQuorumS6, which needs DeployDpf02Rbac's TenantHierarchy), by running
-the EXISTING forge scripts below in a fixed order (the r1005 deploy driver's order). This file
-is the single source of that order and of the book name each deployment gets.
+P3L deploys the contracts of the r1005 address book that P1-P4 do not and that the owner
+keeps in block 0 (decisions 2026-10-26: the customer DPF set, DeployDpf02Rbac..DeployDpf17Release,
+is out, and so is DeployQuorumS6, which needs DeployDpf02Rbac's TenantHierarchy; the agent
+decision registry stays, through its own script), by running the forge scripts below in a
+fixed order (the r1005 deploy driver's order). P3L runs before P4, whose PatronageLedger takes
+the library's KYCRegistry. This file is the single source of that order and of the book name
+each deployment gets.
 
   scripts     print the scripts in order, one per line (the ceremony checks its own list
               against this one)
@@ -47,6 +49,9 @@ LIBRARY = [
         ("AggregationChallenge", "AggregationChallenge"),
         ("ComputePoolPipeline", "ComputePoolPipeline"),
     ]),
+    # AgentDecisionRegistryV2 alone (its other script, DeployDpf02Rbac, is customer RBAC and
+    # out of block 0); before HUP, whose 40204 ceremony-set check needs it in the book.
+    ("DeployAgentDecisionRegistryV2.s.sol", [("AgentDecisionRegistryV2", "AgentDecisionRegistryV2")]),
     # HUP_REGISTRY_ADMIN = GOVERNANCE, so the script deploys no CitAgentTimelock of its own.
     ("DeployHupRegistries.s.sol", [
         ("OrganizationSBT", "OrganizationSBT"),
@@ -137,7 +142,7 @@ def main():
     b.add_argument("--deployer", required=True)
     b.add_argument("--governance", required=True)
     b.add_argument("--out", required=True)
-    b.add_argument("--partial", action="store_true", help="the book so far (P4L inputs): no completeness check")
+    b.add_argument("--partial", action="store_true", help="the book so far (P3L inputs): no completeness check")
     a = ap.parse_args()
     if a.cmd == "scripts":
         print("\n".join(s for s, _ in LIBRARY))

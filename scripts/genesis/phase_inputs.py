@@ -247,8 +247,8 @@ def phase_scripts(repo):
     except OSError as e:
         die(f"cannot read the ceremony scripts: {e}", 1)
     marks = list(PHASE_MARK.finditer(ce))
-    if [m.group(1) for m in marks] != ["P0", "P1", "P2", "P3", "P4", "P4L", "P5", "P6", "P7"]:
-        die(f"{ce_path}: expected one '# ---- Pn' section marker per phase P0..P7 (and P4L)", 1)
+    if [m.group(1) for m in marks] != ["P0", "P1", "P2", "P3", "P3L", "P4", "P5", "P6", "P7"]:
+        die(f"{ce_path}: expected one '# ---- Pn' section marker per phase P0..P7 (and P3L after P3)", 1)
     gm = re.search(r'^GENESIS_MEMBERSHIP_SCRIPT=([\w./]+)\s*$', ce, re.M)
     out, problems, rg_phases = {}, [], []
     for i, m in enumerate(marks):
@@ -355,7 +355,7 @@ def check_spec(repo, spec):
                 problems.append(f"{k} is classed p0-bash but the P0 section of genesis_ceremony.sh never names it")
         if c == "set" and not re.search(r"(?:^|[\s;(])(?:export\s+)?(?:[A-Z_]+=\S*\s+)*" + re.escape(k) + r"=", ce + "\n" + rg, re.M):
             problems.append(f"{k} is classed set but neither genesis_ceremony.sh nor regenesis.sh assigns it")
-        if c == "late" and e.get("available_after") not in ("P1", "P2", "P3"):
+        if c == "late" and e.get("available_after") not in ("P1", "P2", "P3", "P3L"):
             problems.append(f"{k}: a late input needs available_after P1..P3")
         if c == "p0" and e.get("type") not in ("address", "uint", "path"):
             problems.append(f"{k}: a p0 input needs a type")
@@ -370,7 +370,7 @@ def check_spec(repo, spec):
 def preflight(spec, run_phases, started_after, deployer):
     """Problems with the environment for the phases this invocation runs."""
     inputs, env, problems = spec["inputs"], os.environ, []
-    order = ["P0", "P1", "P2", "P3", "P4", "P4L", "P5", "P6", "P7"]
+    order = ["P0", "P1", "P2", "P3", "P3L", "P4", "P5", "P6", "P7"]
     dep = (deployer or "").lower()
     seen_vals = {}
     for k, e in sorted(inputs.items()):

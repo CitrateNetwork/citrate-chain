@@ -16,11 +16,12 @@
 #                      (this run's deployer and broadcasts only) and, on --confirm, is
 #                      re-derived, checked against the broadcasts and recorded (C8)
 #   P3  vesting        DeployTeamVesting from the owner's TEAM_VESTING_FILE
-#   P4  dormant        DeployDormantLedgers (FederatedRoundLedger, PatronageLedger)
-#   P4L library        the rest of the contract library (the r1005 book's tail): the existing
-#                      forge scripts in library_book.py's fixed order, every role handed to
-#                      the P1 GOVERNANCE timelock; the library book is built from this run's
-#                      broadcasts and recorded (library)
+#   P3L library        the rest of the block-0 contract library (the r1005 book's tail): the
+#                      existing forge scripts in library_book.py's fixed order, every role
+#                      handed to the P1 GOVERNANCE timelock; the library book is built from
+#                      this run's broadcasts and recorded (library)
+#   P4  dormant        DeployDormantLedgers (FederatedRoundLedger, PatronageLedger, whose KYC
+#                      registry is the library's KYCRegistry)
 #   P5  admins         CheckDeployedAdmins over ONE merged book (the book + the P1/P3/P4
 #                      outputs' contracts), every book bound to the run manifest's deployer:
 #                      FACTORY-ADMIN 0 and DEPLOYER-ADMIN 0 (the handover gate)
@@ -57,7 +58,7 @@
 #   GOV_OWNERS, GOV_THRESHOLD, GOV_MIN_DELAY, GOV_PROPOSAL_TTL      (holders OPEN)
 #   GRD_OWNERS, GRD_THRESHOLD, GRD_MIN_DELAY, GRD_PROPOSAL_TTL      (holders OPEN)
 #   TEAM_VESTING_FILE (OPEN amounts/schedule; must sit under contracts/genesis/)
-#   PATRONAGE_KYC_REGISTRY, PATRONAGE_MEMBERSHIP, plus regenesis.sh's env
+#   PATRONAGE_MEMBERSHIP (PatronageLedger's KYC registry is P3L's KYCRegistry), plus regenesis.sh's env
 #   MEMBERSHIP_GRANTOR (the treasury-signer address that places membership grants; P2)
 #   KEEP_LIST (the rehearsal-1 freeze) · FLEET_RPCS (comma-separated)
 #   GENESIS_OUT_DIR (contracts/genesis) · ADDRESS_BOOK (contracts/addresses/40204.json)
@@ -163,7 +164,7 @@ GRD_MIN_OWNERS=3
 GRD_MIN_DELAY_SECS=3600 # the contract floor
 GENESIS_TTL_SECS=1209600 # 14 days, fixed on 40204
 
-PHASES=(P0 P1 P2 P3 P4 P4L P5 P6 P7)
+PHASES=(P0 P1 P2 P3 P3L P4 P5 P6 P7)
 MODE=dry
 FROM=P0
 ONLY=""
@@ -259,7 +260,7 @@ after_broadcast() {
         err "fix the cause, then record P2's book from this run's broadcasts and the chain (this sends nothing): $0 --confirm --only P2 --record-stack-book$acct; then resume with --from P3"
       fi
       ;;
-    P4L) err "P4L sends each library script once: resume with $0 --confirm --from P4L$acct. Every library script with a broadcast from this run is skipped (never re-sent), and the library book then requires every expected deployment; if a script stopped part-way, stop and escalate (runbook §6.4)" ;;
+    P3L) err "P3L sends each library script once: resume with $0 --confirm --from P3L$acct. Every library script with a broadcast from this run is skipped (never re-sent), and the library book then requires every expected deployment; if a script stopped part-way, stop and escalate (runbook §6.4)" ;;
     # P3/P4 record their output book themselves, and --confirm P5 refuses an unrecorded one, so
     # there is no safe resume past them without it.
     *) err "stop and escalate (runbook §6.4): read contracts/broadcast/ and the chain. $1's output book is recorded only by $1, so no later phase can go on without it" ;;
@@ -729,7 +730,7 @@ record_output_book() {
   rec=$("$PY" - "$book" "$RUN_DEPLOYER" "$CONTRACTS/broadcast" "$RUN_G0TS" "$MODE" "$gov" "$script" "$EXPECTED_CHAIN_ID" <<'PY' 2>&1
 import glob, json, re, sys
 book_p, dep, broot, since, mode, gov, script, chain = sys.argv[1:9]
-# <script> may name several scripts (comma-separated, P4L): their broadcasts are one evidence set.
+# <script> may name several scripts (comma-separated, P3L): their broadcasts are one evidence set.
 bdirs = [f"{broot}/{s}/{chain}" for s in script.split(",")]
 bdir = ", ".join(bdirs)
 since = int(since)
@@ -875,7 +876,7 @@ if should P0 || [[ "$MODE" != dry ]]; then
   if count_owners_list "$GOV_OWNERS,$GRD_OWNERS" | grep -qx "$(lower "$DEPLOYER_ADDRESS")"; then
     gate_fail P0 "the deployer must not hold a governance or guardian seat"
   fi
-  [[ -f "$LIBRARY_PY" ]] || gate_fail P0 "$LIBRARY_PY is missing (the P4L library table)"
+  [[ -f "$LIBRARY_PY" ]] || gate_fail P0 "$LIBRARY_PY is missing (the P3L library table)"
   for s in DeployGenesisGovernance.s.sol DeployTeamVesting.s.sol DeployDormantLedgers.s.sol CheckDeployedAdmins.s.sol; do
     [[ -f "$CONTRACTS/script/$s" ]] || gate_fail P0 "contracts/script/$s is missing (the genesis contract set, chain#320, must be merged)"
   done
@@ -930,7 +931,7 @@ if should P0 || [[ "$MODE" != dry ]]; then
     # A phase about to write a book must not find one already there: it would be an earlier
     # run's (or a simulation's) output, and later phases would read it as this run's.
     # P2's membership book is checked below, once the run manifest is bound (C10).
-    for pb in "P1:$GOV_BOOK" "P3:$VEST_BOOK" "P4:$DORMANT_BOOK" "P4L:$LIB_BOOK"; do
+    for pb in "P1:$GOV_BOOK" "P3:$VEST_BOOK" "P4:$DORMANT_BOOK" "P3L:$LIB_BOOK"; do
       if should "${pb%%:*}" && [[ -e "${pb#*:}" ]]; then
         gate_fail P0 "${pb#*:} already exists and ${pb%%:*} would write it; move it aside (it is not this ceremony's output) or resume after ${pb%%:*}"
       fi
@@ -1053,6 +1054,9 @@ if should P2; then
     done
     export EMIT_FRESH_GENESIS=1 EMIT_DEPLOYER="$RUN_DEPLOYER" EMIT_BROADCAST_SINCE="$RUN_G0TS" EMIT_OUTPUT="$book_abs"
     export EMIT_MEMBERSHIP_SCRIPT="$GENESIS_MEMBERSHIP_SCRIPT" MEMBERSHIP_GRANTOR
+    # OrangeSeed (chain#389) is in block 0 when the genesis build allocated it; its allocation
+    # artifact sits in this run's output directory, and the book lists it from there.
+    if [[ -f "$OUT/orangeseed.json" ]]; then export EMIT_ORANGESEED_ALLOC="$OUT/orangeseed.json"; else unset EMIT_ORANGESEED_ALLOC; fi
     if [[ "$RECORD_BOOK" == 1 ]]; then
       log "P2 record step: nothing is sent; the book is rebuilt from this run's broadcasts ($(printf '%s' "$sent" | paste -sd, -)) and checked against the chain"
       RPC_URL="$RPC_URL" bash "$EMITTER" >"$OUT/stack-book.record.log" 2>&1 ||
@@ -1084,26 +1088,7 @@ if should P3; then
   if [[ "$MODE" != dry ]]; then record_output_book P3 teamVesting "$VEST_BOOK" DeployTeamVesting.s.sol; fi
 fi
 
-# ---------------------------------------------------------------- P4
-if should P4; then
-  load_governance P4 "$([[ "$MODE" == confirm ]] && echo 1 || echo 0)"
-  export DORMANT_LEDGERS_OUT="$DORMANT_REL" GENESIS_GOVERNANCE_BOOK="$GOV_REL"
-  # P4's own inputs exist only after P1 (deployed under GOVERNANCE), so a fresh run checks them
-  # here, before P4 sends; the gate and its resume are P4's.
-  if [[ "$MODE" != dry ]]; then
-    need_env P4 PATRONAGE_KYC_REGISTRY PATRONAGE_MEMBERSHIP
-    why=$(phase_inputs P4 P3) || gate_fail P4 "phase inputs: $why"
-  fi
-  log "P4 dormant ledgers → $DORMANT_BOOK"
-  forge_phase P4 DeployDormantLedgers.s.sol
-  if [[ "$MODE" != dry ]]; then
-    # The book also names the governance it was deployed under: it must be this run's.
-    record_output_book P4 dormantLedgers "$DORMANT_BOOK" DeployDormantLedgers.s.sol \
-      "$(printf '{"GovernanceTimelock":"%s","GovernanceMultisig":"%s"}' "$(lower "$GOVERNANCE")" "$(lower "$GOVERNANCE_MULTISIG")")"
-  fi
-fi
-
-# ---------------------------------------------------------------- P4L
+# ---------------------------------------------------------------- P3L
 # The rest of the contract library that stays in block 0: every r1005 book entry P1-P4 do not
 # deploy, minus the owner's exclusions (2026-10-26: the customer DPF set DeployDpf02..17, and
 # DeployQuorumS6, which needs DeployDpf02Rbac's TenantHierarchy), through the EXISTING forge
@@ -1114,33 +1099,49 @@ fi
 # is skipped. After the last script, the library book is built from this run's broadcasts
 # (every expected name, nothing else), recorded (library), and the seats the checker does not
 # read are read from the chain.
-if should P4L; then
-  load_governance P4L "$([[ "$MODE" == confirm ]] && echo 1 || echo 0)"
+if should P3L; then
+  load_governance P3L "$([[ "$MODE" == confirm ]] && echo 1 || echo 0)"
   LIBRARY_SCRIPTS=(
     script/DeployComplianceRegistry.s.sol
     script/DeployScopedSBTs.s.sol
     script/DeployFederatedLearning.s.sol
+    script/DeployAgentDecisionRegistryV2.s.sol
     script/DeployHupRegistries.s.sol
   )
-  want_list=$("$PY" "$LIBRARY_PY" scripts) || gate_fail P4L "cannot read the library table"
+  want_list=$("$PY" "$LIBRARY_PY" scripts) || gate_fail P3L "cannot read the library table"
   [[ "$(printf '%s\n' "${LIBRARY_SCRIPTS[@]#script/}")" == "$want_list" ]] ||
-    gate_fail P4L "LIBRARY_SCRIPTS in genesis_ceremony.sh is not library_book.py's order"
+    gate_fail P3L "LIBRARY_SCRIPTS in genesis_ceremony.sh is not library_book.py's order"
   export ROOT_GOVERNANCE="$GOVERNANCE" KYC_UPDATER="$GOVERNANCE" HUP_REGISTRY_ADMIN="$GOVERNANCE"
   export HUP_BOOK_PATH="$LIB_HUP_REL"
+  # DeployFederatedLearning pins IPFSIncentivesV3 on 40204 (EXPECTED_IPFS_V3). The pin is the
+  # projection for this run's GOVERNANCE (KYC updater and admin), computed by the script's own
+  # projectIpfsV3; a preset other value is refused. The reviewed freeze is the KEEP list (C6).
+  if [[ "$MODE" == dry ]]; then
+    export EXPECTED_IPFS_V3='<projectIpfsV3(GOVERNANCE, GOVERNANCE)>'
+  else
+    v3=$(cd "$CONTRACTS" && "$FORGE" script script/DeployFederatedLearning.s.sol --sig 'projectIpfsV3(address,address)' "$GOVERNANCE" "$GOVERNANCE" 2>&1 |
+      sed -n 's/.*IPFSIncentivesV3 projection: *\(0x[0-9a-fA-F]\{40\}\).*/\1/p' | head -1) || v3=""
+    is_addr "$v3" || gate_fail P3L "cannot compute the IPFSIncentivesV3 projection (DeployFederatedLearning projectIpfsV3)"
+    if [[ -n "${EXPECTED_IPFS_V3:-}" && "$(lower "$EXPECTED_IPFS_V3")" != "$(lower "$v3")" ]]; then
+      gate_fail P3L "EXPECTED_IPFS_V3 is set to $EXPECTED_IPFS_V3, but this run's projection is $v3; unset it: the ceremony computes it from this run's GOVERNANCE"
+    fi
+    export EXPECTED_IPFS_V3="$v3"
+    log "P3L IPFSIncentivesV3 projection for this run's GOVERNANCE: $v3"
+  fi
   LIB_HUP_BOOK="$CONTRACTS/$LIB_HUP_REL"
   if [[ "$MODE" == dry ]]; then
     export TEE_REGISTRY='<TEEAttestationRegistry from the P2 book>' HUP_MEMBER_SBT='<CitrateMemberSBT from the P2 book>'
   else
-    is_addr "${RUN_DEPLOYER:-}" && [[ "${RUN_G0TS:-}" =~ ^[0-9]+$ ]] || gate_fail P4L "no run deployer or block-0 timestamp (the P0 run manifest did not load)"
-    why=$(phase_inputs P4L P4) || gate_fail P4L "phase inputs: $why"
+    is_addr "${RUN_DEPLOYER:-}" && [[ "${RUN_G0TS:-}" =~ ^[0-9]+$ ]] || gate_fail P3L "no run deployer or block-0 timestamp (the P0 run manifest did not load)"
+    why=$(phase_inputs P3L P3) || gate_fail P3L "phase inputs: $why"
     # The library reads P2's book (C8): the recorded stack book on --confirm.
-    stack_book_bound P4L "$([[ "$MODE" == confirm ]] && echo 1 || echo 0)"
+    stack_book_bound P3L "$([[ "$MODE" == confirm ]] && echo 1 || echo 0)"
     # A simulation may run over a book without them; the scripts that need them are skipped.
     TEE_REGISTRY=$(book_addr "$ADDRESS_BOOK" TEEAttestationRegistry) || TEE_REGISTRY=""
     HUP_MEMBER_SBT=$(book_addr "$ADDRESS_BOOK" CitrateMemberSBT) || HUP_MEMBER_SBT=""
     if [[ "$MODE" == confirm ]]; then
-      is_addr "$TEE_REGISTRY" || gate_fail P4L "$ADDRESS_BOOK has no TEEAttestationRegistry (ComputePoolPipeline needs it; run P2 first)"
-      is_addr "$HUP_MEMBER_SBT" || gate_fail P4L "$ADDRESS_BOOK has no CitrateMemberSBT (AgentSBT needs it; run P2 first)"
+      is_addr "$TEE_REGISTRY" || gate_fail P3L "$ADDRESS_BOOK has no TEEAttestationRegistry (ComputePoolPipeline needs it; run P2 first)"
+      is_addr "$HUP_MEMBER_SBT" || gate_fail P3L "$ADDRESS_BOOK has no CitrateMemberSBT (AgentSBT needs it; run P2 first)"
     fi
     export TEE_REGISTRY HUP_MEMBER_SBT
   fi
@@ -1162,12 +1163,12 @@ for p in glob.glob(os.path.join(d, "run-*.json")):
 sys.exit(1)
 PY
   }
-  log "P4L library: ${#LIBRARY_SCRIPTS[@]} scripts → $LIB_BOOK"
+  log "P3L library: ${#LIBRARY_SCRIPTS[@]} scripts → $LIB_BOOK"
   for ls in "${LIBRARY_SCRIPTS[@]}"; do
     ls="${ls#script/}"
     if [[ "$MODE" != dry ]]; then
       if [[ "$MODE" == confirm ]] && lib_sent "$ls"; then
-        log "P4L $ls: this run's broadcast exists; skipped (sent once)"
+        log "P3L $ls: this run's broadcast exists; skipped (sent once)"
         continue
       fi
       need=""
@@ -1178,16 +1179,16 @@ PY
       if [[ -n "$need" ]]; then
         v="${!need:-}"
         if ! is_addr "$v" || [[ "$("$CAST" code "$v" --rpc-url "$RPC_URL" 2>/dev/null)" == 0x ]]; then
-          [[ "$MODE" == confirm ]] && gate_fail P4L "$ls needs $need with code on chain (got '${v}')"
-          log "P4L note: $ls skipped in a simulation: $need ('${v}') has no code (an earlier step only simulated)"
+          [[ "$MODE" == confirm ]] && gate_fail P3L "$ls needs $need with code on chain (got '${v}')"
+          log "P3L note: $ls skipped in a simulation: $need ('${v}') has no code (an earlier step only simulated)"
           continue
         fi
       fi
       if [[ "$ls" == DeployHupRegistries.s.sol ]]; then
-        lib_partial "$OUT/library.partial.json" >/dev/null || gate_fail P4L "cannot read this run's library broadcasts"
+        lib_partial "$OUT/library.partial.json" >/dev/null || gate_fail P3L "cannot read this run's library broadcasts"
         # The HUP script checks, on 40204, that the main ceremony's registries are in a book with
         # code: the P2 book plus this run's library deployments so far.
-        "$PY" - "$ADDRESS_BOOK" "$OUT/library.partial.json" "$LIB_HUP_BOOK" <<'PY' || gate_fail P4L "cannot write $LIB_HUP_BOOK"
+        "$PY" - "$ADDRESS_BOOK" "$OUT/library.partial.json" "$LIB_HUP_BOOK" <<'PY' || gate_fail P3L "cannot write $LIB_HUP_BOOK"
 import json, sys
 book = json.load(open(sys.argv[1])); lib = json.load(open(sys.argv[2]))
 book.setdefault("contracts", {}).update(lib["contracts"])
@@ -1195,27 +1196,63 @@ json.dump(book, open(sys.argv[3], "w"), indent=2, sort_keys=True)
 PY
       fi
     fi
-    forge_phase P4L "$ls"
+    forge_phase P3L "$ls"
   done
   if [[ "$MODE" == confirm ]]; then
     lb=$("$PY" "$LIBRARY_PY" build --broadcast "$CONTRACTS/broadcast" --chain "$EXPECTED_CHAIN_ID" --since "$RUN_G0TS" \
-      --deployer "$RUN_DEPLOYER" --governance "$GOVERNANCE" --out "$LIB_BOOK" 2>&1) || gate_fail P4L "library book: $lb"
-    log "P4L $lb"
-    record_output_book P4L library "$LIB_BOOK" "$(printf '%s,' "${LIBRARY_SCRIPTS[@]#script/}" | sed 's/,$//')" \
+      --deployer "$RUN_DEPLOYER" --governance "$GOVERNANCE" --out "$LIB_BOOK" 2>&1) || gate_fail P3L "library book: $lb"
+    log "P3L $lb"
+    record_output_book P3L library "$LIB_BOOK" "$(printf '%s,' "${LIBRARY_SCRIPTS[@]#script/}" | sed 's/,$//')" \
       "$(printf '{"GovernanceTimelock":"%s"}' "$(lower "$GOVERNANCE")")"
     # Seats CheckDeployedAdmins does not read (it reads governance/owner/DEFAULT_ADMIN).
     kyc=$(book_addr "$LIB_BOOK" KYCRegistry)
-    role=$("$CAST" keccak KYC_UPDATER_ROLE 2>/dev/null) || gate_fail P4L "cannot hash KYC_UPDATER_ROLE"
-    got=$(cast_read "$kyc" "hasRole(bytes32,address)(bool)" "$role" "$RUN_DEPLOYER") || gate_fail P4L "cannot read KYCRegistry.hasRole at $kyc"
-    [[ "$got" == false ]] || gate_fail P4L "the deployer holds KYC_UPDATER_ROLE on KYCRegistry $kyc"
+    role=$("$CAST" keccak KYC_UPDATER_ROLE 2>/dev/null) || gate_fail P3L "cannot hash KYC_UPDATER_ROLE"
+    got=$(cast_read "$kyc" "hasRole(bytes32,address)(bool)" "$role" "$RUN_DEPLOYER") || gate_fail P3L "cannot read KYCRegistry.hasRole at $kyc"
+    [[ "$got" == false ]] || gate_fail P3L "the deployer holds KYC_UPDATER_ROLE on KYCRegistry $kyc"
     for n in OrganizationSBT AgentSBT CapsuleRegistry; do
       a=$(book_addr "$LIB_BOOK" "$n")
-      got=$(cast_read "$a" "owner()(address)") && is_addr "$got" || gate_fail P4L "cannot read $n.owner() at $a"
-      [[ "$(lower "$got")" == "$(lower "$GOVERNANCE")" ]] || gate_fail P4L "$n.owner() is $got, not this run's GOVERNANCE"
+      got=$(cast_read "$a" "owner()(address)") && is_addr "$got" || gate_fail P3L "cannot read $n.owner() at $a"
+      [[ "$(lower "$got")" == "$(lower "$GOVERNANCE")" ]] || gate_fail P3L "$n.owner() is $got, not this run's GOVERNANCE"
     done
-    log "P4L PASS: no deployer KYC updater, HUP registries owned by GOVERNANCE"
+    log "P3L PASS: no deployer KYC updater, HUP registries owned by GOVERNANCE"
   elif [[ "$MODE" == simulate ]]; then
-    log "P4L note: a simulation broadcasts nothing, so no library book is built"
+    log "P3L note: a simulation broadcasts nothing, so no library book is built"
+  fi
+fi
+
+# ---------------------------------------------------------------- P4
+if should P4; then
+  load_governance P4 "$([[ "$MODE" == confirm ]] && echo 1 || echo 0)"
+  export DORMANT_LEDGERS_OUT="$DORMANT_REL" GENESIS_GOVERNANCE_BOOK="$GOV_REL"
+  # P4's own inputs exist only after P1 (deployed under GOVERNANCE), so a fresh run checks them
+  # here, before P4 sends; the gate and its resume are P4's.
+  if [[ "$MODE" != dry ]]; then
+    need_env P4 PATRONAGE_MEMBERSHIP
+    why=$(phase_inputs P4 P3L) || gate_fail P4 "phase inputs: $why"
+    # PatronageLedger's KYC registry is the library's KYCRegistry (P3L, under GOVERNANCE); on
+    # --confirm the library book must be the one P3L recorded. A preset other value is refused.
+    [[ -f "$LIB_BOOK" ]] || gate_fail P4 "$LIB_BOOK missing (run P3L first): PatronageLedger's KYC registry is the library's KYCRegistry"
+    kyc=$(book_addr "$LIB_BOOK" KYCRegistry) && is_addr "$kyc" || gate_fail P4 "$LIB_BOOK has no KYCRegistry"
+    if [[ "$MODE" == confirm ]]; then
+      manifest_has "$RUN_MANIFEST" library || gate_fail P4 "$LIB_BOOK was not recorded by P3L in this run (the run manifest has no library)"
+      cj=$(book_contracts_json "$LIB_BOOK") || gate_fail P4 "$LIB_BOOK has no well-formed contracts"
+      why=$(manifest_bind check "$RUN_MANIFEST" library "$cj" 2>&1) || gate_fail P4 "$LIB_BOOK is not the library this run recorded: $why"
+    fi
+    if [[ -n "${PATRONAGE_KYC_REGISTRY:-}" && "$(lower "$PATRONAGE_KYC_REGISTRY")" != "$(lower "$kyc")" ]]; then
+      gate_fail P4 "PATRONAGE_KYC_REGISTRY is set to $PATRONAGE_KYC_REGISTRY, but this run's library KYCRegistry is $kyc; unset it: the ceremony sets it from the library book"
+    fi
+    PATRONAGE_KYC_REGISTRY="$kyc"
+    export PATRONAGE_KYC_REGISTRY
+    log "P4 PatronageLedger KYC registry = the library's KYCRegistry $kyc"
+  else
+    export PATRONAGE_KYC_REGISTRY='<KYCRegistry from the P3L library book>'
+  fi
+  log "P4 dormant ledgers → $DORMANT_BOOK"
+  forge_phase P4 DeployDormantLedgers.s.sol
+  if [[ "$MODE" != dry ]]; then
+    # The book also names the governance it was deployed under: it must be this run's.
+    record_output_book P4 dormantLedgers "$DORMANT_BOOK" DeployDormantLedgers.s.sol \
+      "$(printf '{"GovernanceTimelock":"%s","GovernanceMultisig":"%s"}' "$(lower "$GOVERNANCE")" "$(lower "$GOVERNANCE_MULTISIG")")"
   fi
 fi
 
@@ -1249,7 +1286,7 @@ if should P5; then
       if [[ -f "$b" ]]; then
         extras+=("$b")
       elif [[ "$MODE" == confirm ]]; then
-        gate_fail P5 "$b missing: the handover gate must cover every ceremony output (run P3/P4/P4L first)"
+        gate_fail P5 "$b missing: the handover gate must cover every ceremony output (run P3/P4/P3L first)"
       else
         log "P5 note: $b absent in a simulation; not swept"
       fi
@@ -1260,7 +1297,7 @@ if should P5; then
     # C5: the vesting and dormant-ledger outputs are the ones this run recorded. P3/P4 record
     # them when they write them; on --confirm a book its step did not record is refused (a
     # simulation still records one at first use here).
-    for kb in "teamVesting:P3:$VEST_BOOK" "dormantLedgers:P4:$DORMANT_BOOK" "library:P4L:$LIB_BOOK"; do
+    for kb in "teamVesting:P3:$VEST_BOOK" "dormantLedgers:P4:$DORMANT_BOOK" "library:P3L:$LIB_BOOK"; do
       IFS=: read -r k st b <<<"$kb"
       [[ -f "$b" ]] || continue
       cj=$(book_contracts_json "$b") || gate_fail P5 "$b has no well-formed contracts"
