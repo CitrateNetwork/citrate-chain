@@ -18,6 +18,7 @@
 pub mod block_sidecars;
 pub mod chain_selection;
 pub mod checkpoint;
+pub mod checkpoint_gadget;
 pub mod crypto;
 pub mod dag_store;
 pub mod ecvrf;

@@ -64,6 +64,7 @@
 // surface. With D2.2 a partial admission becomes impossible; with D2.3 alone
 // it becomes self-healing. Self-healing first, impossible second.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -271,7 +272,22 @@ pub struct BlockAdmission {
     repair_log: LogBudget,
     /// D4a: budget for the "re-delivered block below the pruning point" line.
     pruned_log: LogBudget,
+    /// Blocks withdrawn by an operator rollback (`citrate rollback`, see
+    /// `rollback.rs`), plus every block seen built on one. Refused before any
+    /// other check, so a peer still holding the removed branch cannot bring it
+    /// back. Loaded from the database at start; the descendants are kept in
+    /// memory only (they can never be admitted, as their parent never is).
+    withdrawn: std::sync::RwLock<HashSet<Hash>>,
+    /// The release's canonical checkpoints for this node's genesis
+    /// (`citrate_consensus::hardening::CANONICAL_CHECKPOINTS`), as
+    /// `(height, hash)`. Resolved once the genesis block is stored; a block at
+    /// a listed height with another hash is refused like a withdrawn one.
+    checkpoints: std::sync::OnceLock<Vec<(u64, Hash)>>,
 }
+
+/// Cap on withdrawn hashes held in memory; descendants past it are refused as
+/// missing-parent blocks instead (their parent is never admitted either).
+const MAX_WITHDRAWN: usize = 1_000_000;
 
 impl BlockAdmission {
     pub fn new(
@@ -280,6 +296,7 @@ impl BlockAdmission {
         ghostdag: Arc<GhostDag>,
         applicator: Option<Arc<CanonicalApplicator>>,
     ) -> Self {
+        let withdrawn = std::sync::RwLock::new(crate::rollback::load_withdrawn(&storage));
         Self {
             storage,
             dag_store,
@@ -287,7 +304,116 @@ impl BlockAdmission {
             applicator,
             repair_log: LogBudget::new(REPAIR_LOG_PER_WINDOW, LOG_WINDOW_SECS),
             pruned_log: LogBudget::new(PRUNED_LOG_PER_WINDOW, LOG_WINDOW_SECS),
+            withdrawn,
+            checkpoints: std::sync::OnceLock::new(),
         }
+        .log_withdrawn()
+    }
+
+    /// Use `list` as the canonical checkpoints instead of the release table
+    /// (tests; the release table is keyed by the real network genesis).
+    #[cfg(test)]
+    pub(crate) fn with_checkpoints(self, list: Vec<(u64, Hash)>) -> Self {
+        let cell = std::sync::OnceLock::new();
+        let _ = cell.set(list);
+        Self {
+            checkpoints: cell,
+            ..self
+        }
+    }
+
+    /// The canonical checkpoints for this node's genesis, once its genesis
+    /// block is stored (`None` before that, so a fresh node resolves them as
+    /// soon as genesis is seeded).
+    pub(crate) fn checkpoints(&self) -> Option<&[(u64, Hash)]> {
+        if let Some(c) = self.checkpoints.get() {
+            return Some(c.as_slice());
+        }
+        let genesis = self.storage.blocks.get_block_by_height(0).ok().flatten()?;
+        let list = citrate_consensus::hardening::canonical_checkpoints(genesis.as_bytes())
+            .into_iter()
+            .map(|(h, b)| (h, Hash::new(b)))
+            .collect();
+        Some(self.checkpoints.get_or_init(|| list).as_slice())
+    }
+
+    /// Why `block` is refused by a canonical checkpoint, if it is: it sits at a
+    /// checkpoint height with another hash.
+    ///
+    /// The refused hash is deliberately NOT remembered: this check runs before
+    /// any signature or VRF verification, so remembering it would let anyone
+    /// grow the refused set with headers that cost nothing to make. A block
+    /// built on a refused one is never admitted anyway: its parent is never
+    /// stored, so it is deferred as missing a parent and never applied.
+    fn checkpoint_reason(&self, block: &Block) -> Option<String> {
+        let height = block.header.height;
+        let hash = block.header.block_hash;
+        let want = self
+            .checkpoints()?
+            .iter()
+            .find(|(h, _)| *h == height)
+            .map(|(_, w)| *w)?;
+        if want == hash {
+            return None;
+        }
+        Some(format!(
+            "block {hash} @ {height} is not this network's canonical block at that height ({want})"
+        ))
+    }
+
+    /// Stored blocks that contradict a canonical checkpoint, as
+    /// `(height, stored, canonical)`. Non-empty means this database followed a
+    /// branch the network does not continue (for 40204, the branch withdrawn
+    /// by the 2026-10-15 rollback); the node stays on it until the chain data
+    /// is moved aside and resynced.
+    pub fn stored_checkpoint_conflicts(&self) -> Vec<(u64, Hash, Hash)> {
+        let Some(cps) = self.checkpoints() else {
+            return Vec::new();
+        };
+        cps.iter()
+            .filter_map(|(h, want)| {
+                let stored = self.storage.blocks.get_block_by_height(*h).ok().flatten()?;
+                (stored != *want).then_some((*h, stored, *want))
+            })
+            .collect()
+    }
+
+    fn log_withdrawn(self) -> Self {
+        let n = self.withdrawn.read().map(|w| w.len()).unwrap_or(0);
+        if n > 0 {
+            info!("admission: refusing {n} block(s) withdrawn by an operator rollback, and their descendants");
+        }
+        self
+    }
+
+    /// Why `block` is refused as withdrawn, if it is: it was withdrawn by an
+    /// operator rollback, or a parent was. A block built on a withdrawn one is
+    /// remembered too, so the whole removed branch is refused.
+    fn withdrawn_reason(&self, block: &Block) -> Option<String> {
+        let hash = block.header.block_hash;
+        let parents = block.parents();
+        {
+            let set = self.withdrawn.read().unwrap_or_else(|e| e.into_inner());
+            if set.is_empty() {
+                return None;
+            }
+            if set.contains(&hash) {
+                return Some(format!(
+                    "block {hash} was withdrawn by an operator rollback"
+                ));
+            }
+            if !parents.iter().any(|p| set.contains(p)) {
+                return None;
+            }
+        }
+        let mut set = self.withdrawn.write().unwrap_or_else(|e| e.into_inner());
+        if set.len() < MAX_WITHDRAWN {
+            set.insert(hash);
+        }
+        Some(format!(
+            "block {hash} @ {} is built on a block withdrawn by an operator rollback",
+            block.header.height
+        ))
     }
 
     /// D4a: the height below which DAG pruning has deliberately dropped
@@ -325,6 +451,18 @@ impl BlockAdmission {
     /// when a previous attempt was interrupted.
     pub async fn admit(&self, block: &Block) -> AdmitOutcome {
         let hash = block.header.block_hash;
+
+        // Operator rollback: a withdrawn branch never re-enters, from any peer.
+        if let Some(why) = self.withdrawn_reason(block) {
+            debug!("admission: {why}");
+            return AdmitOutcome::Rejected(why);
+        }
+        // Canonical checkpoint: the release names the only block at this
+        // height, on every node (see `hardening::CANONICAL_CHECKPOINTS`).
+        if let Some(why) = self.checkpoint_reason(block) {
+            debug!("admission: {why}");
+            return AdmitOutcome::Rejected(why);
+        }
 
         // R1: presence in each store is established INDEPENDENTLY. A single
         // `has_block` on either store is exactly the bug this module exists
@@ -706,8 +844,6 @@ pub const MAX_ORPHAN_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 /// first (those are the ones whose parents are most likely to arrive next and
 /// unblock them).
 pub fn bound_orphan_buffer(blocks: Vec<Block>) -> Vec<Block> {
-    use std::collections::HashSet;
-
     let mut seen: HashSet<Hash> = HashSet::with_capacity(blocks.len());
     let mut deduped: Vec<Block> = Vec::with_capacity(blocks.len());
     for b in blocks {
@@ -1249,6 +1385,164 @@ mod tests {
             bytes <= MAX_ORPHAN_BYTES,
             "orphan buffer must be byte-bounded; got {} bytes",
             bytes
+        );
+    }
+
+    /// A linear chain of `n` blocks above `root`, each sealed with `seed` so two
+    /// chains from the same root differ from their first block on.
+    fn chain_from(root: &Block, n: u64, seed: u8) -> Vec<Block> {
+        let mut out: Vec<Block> = Vec::new();
+        let mut parent = root.header.block_hash;
+        for h in 1..=n {
+            let b = mk(h, parent, h, [seed.wrapping_add(h as u8); 32]);
+            parent = b.header.block_hash;
+            out.push(b);
+        }
+        out
+    }
+
+    fn rejected(o: &AdmitOutcome) -> bool {
+        matches!(o, AdmitOutcome::Rejected(_))
+    }
+
+    /// Stored and applied (newly or already): anything else (refused or
+    /// deferred) keeps the block out of the node.
+    fn admitted(o: &AdmitOutcome) -> bool {
+        !matches!(o, AdmitOutcome::Rejected(_) | AdmitOutcome::Deferred { .. })
+    }
+
+    #[tokio::test]
+    async fn a_block_at_a_checkpoint_height_with_another_hash_is_refused_with_its_descendants() {
+        let (adm, storage, _dag, _d) = harness();
+        let g = root();
+        let canonical = chain_from(&g, 4, 0x10);
+        let other = {
+            // Shares blocks 1..=2, forks at 3.
+            let mut v = canonical[..2].to_vec();
+            let mut parent = canonical[1].header.block_hash;
+            for h in 3..=4 {
+                let b = mk(h, parent, h, [0xE0u8.wrapping_add(h as u8); 32]);
+                parent = b.header.block_hash;
+                v.push(b);
+            }
+            v
+        };
+        let adm = adm.with_checkpoints(vec![(3, canonical[2].header.block_hash)]);
+        assert!(!rejected(&adm.admit(&g).await));
+        for b in &canonical[..2] {
+            assert!(!rejected(&adm.admit(b).await));
+        }
+        // A peer serves the other branch first.
+        assert!(
+            rejected(&adm.admit(&other[2]).await),
+            "not the canonical block at 3"
+        );
+        assert!(
+            !admitted(&adm.admit(&other[3]).await),
+            "built on the refused block"
+        );
+        for b in &other[2..] {
+            assert!(!storage.blocks.has_block(&b.header.block_hash).unwrap());
+        }
+        // The canonical branch is admitted.
+        for b in &canonical[2..] {
+            assert!(
+                !rejected(&adm.admit(b).await),
+                "canonical block {}",
+                b.header.height
+            );
+            assert!(storage.blocks.has_block(&b.header.block_hash).unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_merge_block_with_a_refused_parent_is_refused() {
+        let (adm, storage, _dag, _d) = harness();
+        let g = root();
+        let canonical = chain_from(&g, 3, 0x10);
+        let sibling = mk(3, canonical[1].header.block_hash, 3, [0xEE; 32]);
+        let adm = adm.with_checkpoints(vec![(3, canonical[2].header.block_hash)]);
+        assert!(!rejected(&adm.admit(&g).await));
+        for b in &canonical {
+            assert!(!rejected(&adm.admit(b).await));
+        }
+        assert!(rejected(&adm.admit(&sibling).await));
+        let mut merge = BlockBuilder::new()
+            .version(2)
+            .height(4)
+            .parent(canonical[2].header.block_hash)
+            .merge_parents(vec![sibling.header.block_hash])
+            .coinbase(CB)
+            .timestamp(1000)
+            .vrf_reveal(VrfProof {
+                proof: vec![],
+                output: Hash::new([0x44; 32]),
+            })
+            .transactions(vec![])
+            .state_root(Hash::default())
+            .blue_score(5)
+            .blue_work(citrate_consensus::types::blue_work_for_score(5))
+            .build_unhashed();
+        merge.header.block_hash = merge.compute_hash();
+        assert!(
+            !admitted(&adm.admit(&merge).await),
+            "names the refused block as a parent"
+        );
+        assert!(!storage.blocks.has_block(&merge.header.block_hash).unwrap());
+    }
+
+    #[tokio::test]
+    async fn refused_checkpoint_headers_are_not_remembered() {
+        let (adm, _storage, _dag, _d) = harness();
+        let g = root();
+        let canonical = chain_from(&g, 3, 0x10);
+        let adm = adm.with_checkpoints(vec![(3, canonical[2].header.block_hash)]);
+        assert!(!rejected(&adm.admit(&g).await));
+        for b in &canonical[..2] {
+            assert!(!rejected(&adm.admit(b).await));
+        }
+        // Many unsigned headers at the checkpoint height, each with another hash.
+        for i in 0..64u8 {
+            let junk = mk(
+                3,
+                canonical[1].header.block_hash,
+                3,
+                [0xA0u8.wrapping_add(i); 32],
+            );
+            assert!(rejected(&adm.admit(&junk).await));
+        }
+        let n = adm.withdrawn.read().map(|w| w.len()).unwrap_or(usize::MAX);
+        assert_eq!(
+            n, 0,
+            "refused checkpoint headers must not grow the refused set"
+        );
+        // The canonical block is still admitted.
+        assert!(!rejected(&adm.admit(&canonical[2]).await));
+    }
+
+    #[tokio::test]
+    async fn checkpoints_follow_the_stored_genesis() {
+        // The test genesis is not a release genesis, so nothing is pinned and a
+        // block at 365,785 is judged by the ordinary rules only.
+        let (adm, _storage, _dag, _d) = harness();
+        assert!(!rejected(&adm.admit(&root()).await));
+        assert_eq!(adm.checkpoints().map(|c| c.len()), Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_stored_block_that_contradicts_a_checkpoint_is_reported() {
+        let (adm, _storage, _dag, _d) = harness();
+        let g = root();
+        let canonical = chain_from(&g, 3, 0x10);
+        assert!(!rejected(&adm.admit(&g).await));
+        for b in &canonical {
+            assert!(!rejected(&adm.admit(b).await));
+        }
+        let want = Hash::new([0xAB; 32]);
+        let adm = adm.with_checkpoints(vec![(2, canonical[1].header.block_hash), (3, want)]);
+        assert_eq!(
+            adm.stored_checkpoint_conflicts(),
+            vec![(3, canonical[2].header.block_hash, want)]
         );
     }
 }
