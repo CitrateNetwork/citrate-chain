@@ -506,7 +506,11 @@ fn filter_changes_keep_a_block_whose_receipts_land_after_the_tip() {
     assert_eq!(err["data"]["blockNumber"], "0x6", "{poll}");
 
     // citrate_getLogs answers the same block with the same code.
-    let c = call(&io, GET_LOGS_METHOD, json!([{"fromBlock": "0x6", "toBlock": "0x6"}]));
+    let c = call(
+        &io,
+        GET_LOGS_METHOD,
+        json!([{"fromBlock": "0x6", "toBlock": "0x6"}]),
+    );
     assert_eq!(error_of(&c)["code"], err["code"], "{c}");
 
     // Polling again in the window does not advance the filter either.
@@ -550,7 +554,9 @@ fn filter_changes_hold_a_window_with_a_missing_receipt_in_the_middle() {
 
     write_receipt(&storage, &a[6]);
     let mut seen = logs_of(&call(&io, "eth_getFilterChanges", json!([id]))["result"]);
-    seen.extend(logs_of(&call(&io, "eth_getFilterChanges", json!([id]))["result"]));
+    seen.extend(logs_of(
+        &call(&io, "eth_getFilterChanges", json!([id]))["result"],
+    ));
     assert_eq!(
         seen,
         vec![
@@ -597,4 +603,155 @@ fn filter_logs_over_the_range_limit_is_32005_like_get_logs() {
     assert_eq!(served.len(), 1_001);
     assert_eq!(served.first(), Some(&(1, hx(&a[1].hash()))));
     assert_eq!(served.last(), Some(&(1_001, hx(&a[1_001].hash()))));
+}
+
+/// `src` with `//` comments removed (line by line), so doc text naming an
+/// identifier does not count as a use.
+fn strip_comments(src: &str) -> String {
+    src.lines()
+        .map(|l| l.split("//").next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Ways a handler can bound a range, walk the executed chain or read receipts
+/// for logs. Only the shared guard `read_executed_logs` may use them.
+const GUARDED_CALLS: [&str; 6] = [
+    "push_block_logs(",
+    "bound_log_range(",
+    "MAX_LOG_BLOCK_RANGE",
+    "executed_hashes_under(",
+    "executed_after_under(",
+    "executed_hashes(",
+];
+
+/// The log-returning handlers, and whether their answer moves a cursor (a
+/// filter's poll position or a scanner's `through`). A cursor-moving read must
+/// fail on a missing receipt instead of skipping it.
+const LOG_HANDLERS: [(&str, &str, bool); 4] = [
+    ("eth_getLogs", "add_sync_method(\"eth_getLogs\"", false),
+    (
+        "citrate_getLogs",
+        "crate::canonical_logs::GET_LOGS_METHOD,",
+        true,
+    ),
+    (
+        "eth_getFilterChanges",
+        "add_sync_method(\"eth_getFilterChanges\"",
+        true,
+    ),
+    (
+        "eth_getFilterLogs",
+        "add_sync_method(\"eth_getFilterLogs\"",
+        false,
+    ),
+];
+
+/// Violations of "every log-returning handler reads through the shared
+/// range/receipt guard".
+fn log_guard_violations(src: &str) -> Vec<String> {
+    let code = strip_comments(src);
+    let mut out = Vec::new();
+
+    // 1. Outside the guard, nothing bounds a range, walks the executed chain
+    //    or reads a block's receipts for logs.
+    let guard_start = code
+        .find("fn read_executed_logs(")
+        .expect("guard read_executed_logs not found");
+    let guard_len = code[guard_start..]
+        .find("\n}\n")
+        .expect("end of read_executed_logs");
+    let outside = format!(
+        "{}{}",
+        &code[..guard_start],
+        &code[guard_start + guard_len..]
+    );
+    for call in GUARDED_CALLS {
+        let uses = outside.matches(call).count();
+        let defs = outside.matches(&format!("fn {call}")).count();
+        if uses > defs {
+            out.push(format!("{call} used outside read_executed_logs"));
+        }
+    }
+
+    // 2. Each log handler reads through the guard, with the receipt rule its
+    //    cursor needs.
+    for (name, marker, moves_cursor) in LOG_HANDLERS {
+        let body = handler_source(&code, marker);
+        let body = if name == "eth_getFilterChanges" {
+            body.split("FilterType::Log {").nth(1).unwrap_or("")
+        } else {
+            body
+        };
+        if !body.contains("read_executed_logs(") {
+            out.push(format!("{name} does not call read_executed_logs"));
+        }
+        if moves_cursor && !body.contains("ReceiptPolicy::RequireAll") {
+            out.push(format!("{name} moves a cursor without RequireAll"));
+        }
+        if moves_cursor && body.contains("ReceiptPolicy::SkipMissing") {
+            out.push(format!("{name} moves a cursor past missing receipts"));
+        }
+    }
+    out
+}
+
+/// Tripwire: every log-returning RPC handler goes through the shared
+/// range/receipt guard (`read_executed_logs`); a cursor-moving one fails on a
+/// missing receipt. Negative controls: the scan flags a handler that clamps
+/// its own range, one that reads receipts directly, and a filter poll that
+/// skips missing receipts.
+#[test]
+fn tripwire_log_handlers_go_through_the_shared_guard() {
+    let src = include_str!("../src/eth_rpc.rs");
+    assert_eq!(log_guard_violations(src), Vec::<String>::new());
+
+    // A private clamp in eth_getFilterLogs (the shape this replaced).
+    let clamp = src.replacen(
+        "let effective_to = to_block.unwrap_or(tip_height).min(tip_height);",
+        "let effective_to = to_block.unwrap_or(tip_height).min(tip_height)\n                    .min(effective_from.saturating_add(crate::canonical_logs::MAX_LOG_BLOCK_RANGE));",
+        1,
+    );
+    assert_ne!(clamp, src, "negative control (clamp) did not apply");
+    assert_eq!(
+        log_guard_violations(&clamp),
+        vec!["MAX_LOG_BLOCK_RANGE used outside read_executed_logs".to_string()]
+    );
+
+    // eth_getFilterLogs reading receipts itself instead of through the guard.
+    let direct = src.replacen(
+        "let read = read_executed_logs(\n                    \"eth_getFilterLogs\",",
+        "push_block_logs(\"eth_getFilterLogs\", &storage_filter_logs, &tip_hash, &criteria, ReceiptPolicy::SkipMissing, &mut Vec::new())?;\n                let read = read_executed_logs_bypassed(\n                    \"eth_getFilterLogs\",",
+        1,
+    );
+    assert_ne!(direct, src, "negative control (direct) did not apply");
+    assert_eq!(
+        log_guard_violations(&direct),
+        vec![
+            "push_block_logs( used outside read_executed_logs".to_string(),
+            "eth_getFilterLogs does not call read_executed_logs".to_string(),
+        ]
+    );
+
+    // A filter poll that skips missing receipts.
+    let start = src
+        .find("add_sync_method(\"eth_getFilterChanges\"")
+        .expect("eth_getFilterChanges");
+    let (head, tail) = src.split_at(start);
+    let skip = format!(
+        "{head}{}",
+        tail.replacen(
+            "receipts: ReceiptPolicy::RequireAll,",
+            "receipts: ReceiptPolicy::SkipMissing,",
+            1
+        )
+    );
+    assert_ne!(skip, src, "negative control (skip) did not apply");
+    assert_eq!(
+        log_guard_violations(&skip),
+        vec![
+            "eth_getFilterChanges moves a cursor without RequireAll".to_string(),
+            "eth_getFilterChanges moves a cursor past missing receipts".to_string(),
+        ]
+    );
 }

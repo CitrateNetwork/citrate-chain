@@ -1926,44 +1926,26 @@ pub fn register_eth_methods_with_finality(
         let finalized = finalized_logs.load(Ordering::SeqCst);
         let (from_block, to_block, criteria) = parse_log_filter(filter, current_height, finalized)?;
 
-        // Limit the block range. Over the limit is a -32005 error, not a silent
-        // clamp (a clamped answer reads as "no logs after fromBlock+1000"); the
-        // legacy clamp is an operator opt-in (`canonical_logs::LEGACY_CLAMP_ENV`).
-        let effective_to =
-            crate::canonical_logs::bound_log_range(from_block, to_block, legacy_clamp_logs)?;
-
-        // Collect matching logs from the EXECUTED chain, in execution order:
-        // ascending height along the applied tip's selected-parent chain, then
-        // `block.transactions` order, then receipt log order. The height index
-        // is last-writer-wins across DAG siblings and can name a block whose
-        // transactions never executed (see `canonical_logs`).
-        // The resolver names the blocks (hashes only); each body is loaded,
-        // scanned and dropped before the next, so a request holds one block.
-        let executed = match tip {
-            Some((tip_hash, tip_height)) => executed_chain_logs
-                .executed_hashes_under(
-                    &storage_logs,
-                    tip_hash,
-                    tip_height,
-                    from_block,
-                    effective_to,
-                )
-                .map_err(|e| e.to_rpc_error())?,
-            None => Vec::new(),
-        };
-
-        let mut result_logs: Vec<Value> = Vec::new();
-        for (_, executed_hash) in &executed {
-            push_block_logs(
-                &storage_logs,
-                executed_hash,
-                &criteria,
-                ReceiptPolicy::SkipMissing,
-                &mut result_logs,
-            )?;
-        }
-
-        Ok(Value::Array(result_logs))
+        // Over the range limit is a -32005 error, not a silent clamp (a clamped
+        // answer reads as "no logs after fromBlock+1000"); the legacy clamp is
+        // an operator opt-in (`canonical_logs::LEGACY_CLAMP_ENV`).
+        let read = read_executed_logs(
+            "eth_getLogs",
+            &storage_logs,
+            &executed_chain_logs,
+            Ok(tip),
+            LogRead {
+                from: from_block,
+                to: to_block,
+                after: None,
+                range: LogRange::Query {
+                    legacy_clamp: legacy_clamp_logs,
+                },
+                receipts: ReceiptPolicy::SkipMissing,
+            },
+            &criteria,
+        )?;
+        Ok(Value::Array(read.logs))
     });
 
     // citrate_getLogs - eth_getLogs plus `through`, the executed block the
@@ -2019,43 +2001,31 @@ pub fn register_eth_methods_with_finality(
                 }
             };
             // Never the legacy clamp: a clamped range is not complete through
-            // its toBlock.
-            let to = crate::canonical_logs::bound_log_range(from_block, to_block, false)?;
-            let (head_hash, head_height) = head
-                .map_err(|m| crate::canonical_logs::LogIndexError::Unavailable(m).to_rpc_error())?;
-            let blocks = match executed_chain_clogs
-                .executed_after_under(
-                    &storage_clogs,
-                    head_hash,
-                    head_height,
-                    from_block,
-                    to,
-                    after.as_ref(),
-                )
-                .map_err(|e| e.to_rpc_error())?
-            {
-                crate::canonical_logs::ExecutedRange::Blocks(b) => b,
-                crate::canonical_logs::ExecutedRange::CursorReplaced => {
-                    return Err(crate::canonical_logs::cursor_replaced_error(
-                        from_block.saturating_sub(1),
-                    ))
-                }
-            };
-            let mut logs = Vec::new();
-            for (_, h) in &blocks {
-                push_block_logs(
-                    &storage_clogs,
-                    h,
-                    &criteria,
-                    ReceiptPolicy::RequireAll,
-                    &mut logs,
-                )?;
-            }
-            let through = blocks
-                .last()
-                .map(|(n, h)| crate::canonical_logs::block_ref_json(*n, h))
+            // its toBlock. A missing tip is reported after the range check.
+            let head = head
+                .map(Some)
+                .map_err(|m| crate::canonical_logs::LogIndexError::Unavailable(m).to_rpc_error());
+            let read = read_executed_logs(
+                crate::canonical_logs::GET_LOGS_METHOD,
+                &storage_clogs,
+                &executed_chain_clogs,
+                head,
+                LogRead {
+                    from: from_block,
+                    to: to_block,
+                    after: after.as_ref(),
+                    range: LogRange::Query {
+                        legacy_clamp: false,
+                    },
+                    receipts: ReceiptPolicy::RequireAll,
+                },
+                &criteria,
+            )?;
+            let through = read
+                .through
+                .map(|(n, h)| crate::canonical_logs::block_ref_json(n, &h))
                 .unwrap_or(Value::Null);
-            Ok(json!({ "logs": logs, "through": through }))
+            Ok(json!({ "logs": read.logs, "through": through }))
         },
     );
 
@@ -2342,33 +2312,31 @@ pub fn register_eth_methods_with_finality(
                     // keep the poll position, so nothing is re-sent or skipped.
                     return Ok(Value::Array(vec![]));
                 }
-                // One window per poll; the rest is served by the next poll.
-                let end = end.min(start.saturating_add(crate::canonical_logs::MAX_LOG_BLOCK_RANGE));
                 let criteria = LogCriteria {
                     addresses: addresses.clone(),
                     topics: topics.clone(),
                 };
-                let executed = executed_chain_changes
-                    .executed_hashes_under(
-                        &storage_filter_changes,
-                        tip_hash,
-                        tip_height,
-                        start,
-                        end,
-                    )
-                    .map_err(|e| e.to_rpc_error())?;
-                let mut result_logs: Vec<Value> = Vec::new();
-                for (_, h) in &executed {
-                    push_block_logs(
-                        &storage_filter_changes,
-                        h,
-                        &criteria,
-                        ReceiptPolicy::SkipMissing,
-                        &mut result_logs,
-                    )?;
-                }
-                filter_registry_changes.update_last_poll_block(filter_id, end);
-                Ok(Value::Array(result_logs))
+                // One window per poll; the rest is served by the next poll. A
+                // block in the window without its receipts (the producer
+                // commits the tip just before it writes them) is a retryable
+                // -32002 and the filter does not move, so the next poll reads
+                // the same window again instead of skipping that block.
+                let read = read_executed_logs(
+                    "eth_getFilterChanges",
+                    &storage_filter_changes,
+                    &executed_chain_changes,
+                    Ok(Some((tip_hash, tip_height))),
+                    LogRead {
+                        from: start,
+                        to: end,
+                        after: None,
+                        range: LogRange::Poll,
+                        receipts: ReceiptPolicy::RequireAll,
+                    },
+                    &criteria,
+                )?;
+                filter_registry_changes.update_last_poll_block(filter_id, read.to);
+                Ok(Value::Array(read.logs))
             }
         }
     });
@@ -2377,6 +2345,7 @@ pub fn register_eth_methods_with_finality(
     let storage_filter_logs = storage.clone();
     let filter_registry_logs = filter_registry.clone();
     let executed_chain_filter_logs = executed_chain.clone();
+    let legacy_clamp_filter_logs = legacy_clamp_logs;
     io_handler.add_sync_method("eth_getFilterLogs", move |params: Params| {
         let params: Vec<Value> = match params.parse() {
             Ok(p) => p,
@@ -2428,32 +2397,29 @@ pub fn register_eth_methods_with_finality(
                 };
                 let effective_from = from_block.unwrap_or(0);
                 let effective_to = to_block.unwrap_or(tip_height).min(tip_height);
-                let effective_to = effective_to
-                    .min(effective_from.saturating_add(crate::canonical_logs::MAX_LOG_BLOCK_RANGE));
                 let criteria = LogCriteria {
                     addresses: addresses.clone(),
                     topics: topics.clone(),
                 };
-                let executed = executed_chain_filter_logs
-                    .executed_hashes_under(
-                        &storage_filter_logs,
-                        tip_hash,
-                        tip_height,
-                        effective_from,
-                        effective_to,
-                    )
-                    .map_err(|e| e.to_rpc_error())?;
-                let mut result_logs: Vec<Value> = Vec::new();
-                for (_, h) in &executed {
-                    push_block_logs(
-                        &storage_filter_logs,
-                        h,
-                        &criteria,
-                        ReceiptPolicy::SkipMissing,
-                        &mut result_logs,
-                    )?;
-                }
-                Ok(Value::Array(result_logs))
+                // The same range limit and receipt rule as eth_getLogs: wider
+                // than the limit is -32005, never a truncated list.
+                let read = read_executed_logs(
+                    "eth_getFilterLogs",
+                    &storage_filter_logs,
+                    &executed_chain_filter_logs,
+                    Ok(Some((tip_hash, tip_height))),
+                    LogRead {
+                        from: effective_from,
+                        to: effective_to,
+                        after: None,
+                        range: LogRange::Query {
+                            legacy_clamp: legacy_clamp_filter_logs,
+                        },
+                        receipts: ReceiptPolicy::SkipMissing,
+                    },
+                    &criteria,
+                )?;
+                Ok(Value::Array(read.logs))
             }
             _ => Err(jsonrpc_core::Error {
                 code: jsonrpc_core::ErrorCode::InvalidRequest,
@@ -3226,18 +3192,108 @@ fn parse_log_filter(
 /// recorded for that block.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReceiptPolicy {
-    /// Skip it (`eth_getLogs`).
+    /// Skip it (`eth_getLogs`, `eth_getFilterLogs`: stateless, the caller can
+    /// ask again).
     SkipMissing,
-    /// Fail with a retryable -32002 (`citrate_getLogs`): every transaction of
-    /// an executed block has a receipt once it is stored, so a missing one
-    /// means the range cannot be served in full yet.
+    /// Fail with a retryable -32002 (`citrate_getLogs`, `eth_getFilterChanges`:
+    /// the answer moves a cursor): every transaction of an executed block has a
+    /// receipt once it is stored, so a missing one means the range cannot be
+    /// served in full yet.
     RequireAll,
+}
+
+/// How a log read bounds its height range.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LogRange {
+    /// A one-shot query: a range wider than
+    /// [`crate::canonical_logs::MAX_LOG_BLOCK_RANGE`] is -32005 (unless the
+    /// operator enabled the legacy clamp).
+    Query { legacy_clamp: bool },
+    /// A filter poll: at most one window is read and the caller resumes after
+    /// [`ExecutedLogs::to`] on the next poll, so nothing is dropped.
+    Poll,
+}
+
+/// The range and rules of one log read.
+struct LogRead<'a> {
+    from: u64,
+    to: u64,
+    /// A scanner cursor that must be the executed block at `from - 1`.
+    after: Option<&'a Hash>,
+    range: LogRange,
+    receipts: ReceiptPolicy,
+}
+
+/// What a log read served.
+struct ExecutedLogs {
+    logs: Vec<Value>,
+    /// The last height the read covers (after bounding); a poll resumes above it.
+    to: u64,
+    /// The last executed block read, if any.
+    through: Option<(u64, Hash)>,
+}
+
+/// The one path every log-returning handler reads logs through: bound the
+/// range, walk the executed chain of the caller's single tip read, and collect
+/// matching logs in execution order (ascending height along the tip's
+/// selected-parent chain, then `block.transactions` order, then receipt log
+/// order) under the receipt rule. The height index is last-writer-wins across
+/// DAG siblings and can name a block whose transactions never executed (see
+/// `canonical_logs`). Each body is loaded, scanned and dropped before the next,
+/// so a request holds one block. `tip` is checked after the range, so an
+/// over-limit range is -32005 whatever the tip state. `Ok(None)` (no applied
+/// tip yet) serves nothing.
+fn read_executed_logs(
+    method: &'static str,
+    storage: &StorageManager,
+    index: &crate::canonical_logs::ExecutedChainIndex,
+    tip: Result<Option<(Hash, u64)>, jsonrpc_core::Error>,
+    read: LogRead<'_>,
+    criteria: &LogCriteria,
+) -> Result<ExecutedLogs, jsonrpc_core::Error> {
+    let to = match read.range {
+        LogRange::Query { legacy_clamp } => {
+            crate::canonical_logs::bound_log_range(read.from, read.to, legacy_clamp)?
+        }
+        LogRange::Poll => read.to.min(
+            read.from
+                .saturating_add(crate::canonical_logs::MAX_LOG_BLOCK_RANGE),
+        ),
+    };
+    let Some((tip_hash, tip_height)) = tip? else {
+        return Ok(ExecutedLogs {
+            logs: Vec::new(),
+            to,
+            through: None,
+        });
+    };
+    let blocks = match index
+        .executed_after_under(storage, tip_hash, tip_height, read.from, to, read.after)
+        .map_err(|e| e.to_rpc_error())?
+    {
+        crate::canonical_logs::ExecutedRange::Blocks(b) => b,
+        crate::canonical_logs::ExecutedRange::CursorReplaced => {
+            return Err(crate::canonical_logs::cursor_replaced_error(
+                read.from.saturating_sub(1),
+            ))
+        }
+    };
+    let mut logs = Vec::new();
+    for (_, h) in &blocks {
+        push_block_logs(method, storage, h, criteria, read.receipts, &mut logs)?;
+    }
+    Ok(ExecutedLogs {
+        logs,
+        to,
+        through: blocks.last().copied(),
+    })
 }
 
 /// Load executed block `hash` and append its logs that match `criteria` to
 /// `out`, in `block.transactions` order then receipt log order. `logIndex` is
 /// the log's position in its block, counted over every log of the block.
 fn push_block_logs(
+    method: &'static str,
     storage: &StorageManager,
     hash: &Hash,
     criteria: &LogCriteria,
@@ -3259,6 +3315,7 @@ fn push_block_logs(
             _ if policy == ReceiptPolicy::SkipMissing => continue,
             _ => {
                 return Err(crate::canonical_logs::receipts_not_stored_error(
+                    method,
                     block.header.height,
                     &block_hash,
                     &tx.hash,

@@ -114,6 +114,20 @@ executed chain too: `eth_getFilterChanges` delivers each applied height once,
 starting at `fromBlock` or the executed head at creation, at most 1,001 heights
 per poll (`tests/getlogs_latest_applied_tip.rs`).
 
+Every log-returning method reads through one shared guard
+(`read_executed_logs` in `src/eth_rpc.rs`; a tripwire test enforces it):
+
+- `eth_getLogs`, `eth_getFilterLogs` and `citrate_getLogs` answer a range wider
+  than 1,001 heights with `-32005` and `data.maxBlockRange`, never a truncated
+  list.
+- `eth_getFilterChanges` and `citrate_getLogs` move a cursor, so an executed
+  block in the range whose receipts are not stored yet (the producer commits
+  the tip just before it writes them) is a retryable `-32002`, and a filter's
+  poll position does not move: the next poll reads the same window again.
+  `eth_getLogs` and `eth_getFilterLogs` skip such a transaction.
+- Open: on a reorg below a filter's last poll, the replacement blocks at those
+  heights are not delivered and no `removed: true` entries are sent.
+
 When no applied tip is persisted, or it cannot be read, the method returns
 JSON-RPC error `-32603`. It never falls back to the height index.
 

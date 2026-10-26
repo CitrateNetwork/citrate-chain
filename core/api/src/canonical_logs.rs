@@ -645,15 +645,21 @@ pub const GET_LOGS_METHOD: &str = "citrate_getLogs";
 /// found", EIP-1474): the chain the caller scanned was replaced.
 pub const LOG_CURSOR_REORGED_CODE: i64 = -32001;
 
-/// The retryable -32002 `citrate_getLogs` returns when an executed block in the
-/// range has a transaction with no receipt recorded for that block (the
-/// producer writes receipts just after it commits the tip; a node that does not
-/// store peer-block receipts never has them).
-pub fn receipts_not_stored_error(height: u64, block: &Hash, tx: &Hash) -> jsonrpc_core::Error {
+/// The retryable -32002 `citrate_getLogs` and `eth_getFilterChanges` (`method`)
+/// return when an executed block in the range has a transaction with no
+/// receipt recorded for that block (the producer writes receipts just after it
+/// commits the tip; a node that does not store peer-block receipts never has
+/// them).
+pub fn receipts_not_stored_error(
+    method: &str,
+    height: u64,
+    block: &Hash,
+    tx: &Hash,
+) -> jsonrpc_core::Error {
     jsonrpc_core::Error {
         code: jsonrpc_core::ErrorCode::ServerError(LOG_INDEX_RETRY_CODE),
         message: format!(
-            "{GET_LOGS_METHOD}: receipts for executed block {block} at height {height} are not stored (transaction {tx}); retry the same request"
+            "{method}: receipts for executed block {block} at height {height} are not stored (transaction {tx}); retry the same request"
         ),
         data: Some(serde_json::json!({
             "retryable": true,
