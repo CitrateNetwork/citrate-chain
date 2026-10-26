@@ -85,6 +85,35 @@ self_test() {
     echo "self-test: target missing from the matrix was not flagged"; rc=1
   fi
 
+  # Only an item of the matrix `target:` list counts: not a commented-out
+  # item, and not a `- fuzz_c` line under another key or inside a run block.
+  cat > "$tmp/.github/workflows/fuzz.yml" <<'YAML'
+jobs:
+  fuzz:
+    strategy:
+      matrix:
+        target:
+          - fuzz_a
+          # - fuzz_c
+        exclude:
+          - fuzz_c
+    steps:
+      - run: |
+          echo targets:
+          - fuzz_c
+YAML
+  if out="$(registration "$tmp")"; then
+    echo "self-test: an item outside the matrix target list counted"; rc=1
+  elif ! grep -q 'not in the fuzz.yml matrix: fuzz_c' <<<"$out" || grep -q 'fuzz_a' <<<"$out"; then
+    echo "self-test: matrix check flagged the wrong targets: $out"; rc=1
+  fi
+  # The real target list form (two-space items under target:) still passes.
+  printf 'jobs:\n  fuzz:\n    strategy:\n      matrix:\n        target:\n          - fuzz_a\n\n          - fuzz_c # comment\n    steps: []\n' \
+    > "$tmp/.github/workflows/fuzz.yml"
+  if ! out="$(registration "$tmp")"; then
+    echo "self-test: matrix with a blank line and a trailing comment was flagged: $out"; rc=1
+  fi
+
   [ $rc -eq 0 ] && echo "self-test: ok"
   return $rc
 }
