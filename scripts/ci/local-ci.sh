@@ -34,7 +34,7 @@ while [ $# -gt 0 ]; do
     --fast) FAST=1; shift ;;
     --no-forge) NO_FORGE=1; shift ;;
     --list)
-      echo "gates: fmt-changed, clippy, panic-ratchet, consensus-tripwires, test-workspace, forge-build, forge-test"
+      echo "gates: fmt-changed, clippy, panic-ratchet, consensus-tripwires, git-rev-deps, test-workspace, forge-build, forge-test"
       exit 0 ;;
     -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 1 ;;
@@ -169,6 +169,18 @@ consensus_tripwires() {
   return "$rc"
 }
 gate "consensus-tripwires" consensus_tripwires
+
+# ── gate: git dependency pins resolve on their remotes ──────────────────────
+# A Cargo git pin can be stranded from outside this repo: the dependency's
+# history is rewritten and the pinned commit is no longer served. Warm
+# ~/.cargo/git caches hide it, so only a fresh fetch notices. Needs network
+# (git ls-remote + a shallow fetch per pinned commit). Runs in --fast.
+git_rev_deps() {
+  scripts/ci/git_rev_deps_tripwire.sh --self-test >/dev/null 2>&1 \
+    || { echo "git-rev-deps self-test FAILED (the check no longer detects a stranded pin)"; return 1; }
+  scripts/ci/git_rev_deps_tripwire.sh
+}
+gate "git-rev-deps" git_rev_deps
 
 if [ "$FAST" -eq 1 ]; then
   skip "test-workspace" "--fast"
