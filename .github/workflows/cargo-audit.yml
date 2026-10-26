@@ -46,11 +46,6 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
-      - name: RUSTSEC-2026-0387 ignore guard (blocking)
-        run: |
-          python3 scripts/ci/check_crypto_bigint_users.py --self-test
-          python3 scripts/ci/check_crypto_bigint_users.py
-
       - name: Run cargo audit
         # Documented ignores live in audit.toml (assessor-friendly).
         # When either of these closes upstream, REMOVE the --ignore
@@ -72,17 +67,9 @@ jobs:
         #   no_std feature that conflicts, so it is not bumpable from this
         #   lockfile. Low severity (flag-only correctness edge). Remove when
         #   alloy-primitives moves to a ruint >= 1.20 line.
-        #
-        # RUSTSEC-2026-0387 (crypto-bigint < 0.7.6): multiple timing
-        #   variability issues in operations intended to be constant-time.
-        #   EXPIRES 2026-11-09. elliptic-curve 0.13 requires crypto-bigint
-        #   ^0.5; the fix is in the 0.14 curve line, held back upstream
-        #   (revm-precompile, openmls_rust_crypto and bip32 still require the
-        #   0.13 line). Guard: the step above, scripts/ci/check_crypto_bigint_users.py.
         run: |
           cargo audit \
             --color always \
             --ignore RUSTSEC-2025-0137 \
             --ignore RUSTSEC-2025-0055 \
-            --ignore RUSTSEC-2026-0220 \
-            --ignore RUSTSEC-2026-0387
+            --ignore RUSTSEC-2026-0220

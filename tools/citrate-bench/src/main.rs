@@ -225,7 +225,14 @@ async fn run(cli: Cli) -> citrate_bench::Result<()> {
             chain_id,
             nonce,
             to,
-        } => cmd_sign_dry_run(&keystore_file, passphrase_file, prompt, chain_id, nonce, &to),
+        } => cmd_sign_dry_run(
+            &keystore_file,
+            passphrase_file,
+            prompt,
+            chain_id,
+            nonce,
+            &to,
+        ),
         Command::DryRun {
             keystore_dir,
             accounts,
@@ -431,7 +438,11 @@ async fn cmd_dry_run(args: DryRunArgs) -> citrate_bench::Result<()> {
 
     let recipient = parse_eth_address(&args.recipient)?;
     let address_table = load_address_table(args.address_table.as_deref())?;
-    let workload = build_workload(args.workload_mix.as_deref(), recipient, address_table.as_ref())?;
+    let workload = build_workload(
+        args.workload_mix.as_deref(),
+        recipient,
+        address_table.as_ref(),
+    )?;
     println!("  workload       = {}", workload.name());
     let roster = workload.class_roster();
     if roster.len() > 1 {
@@ -550,7 +561,11 @@ async fn cmd_bench(args: BenchArgs) -> citrate_bench::Result<()> {
     // Workload + context.
     let recipient = parse_eth_address(&args.recipient)?;
     let address_table = load_address_table(args.address_table.as_deref())?;
-    let workload = build_workload(args.workload_mix.as_deref(), recipient, address_table.as_ref())?;
+    let workload = build_workload(
+        args.workload_mix.as_deref(),
+        recipient,
+        address_table.as_ref(),
+    )?;
     println!("workload = {}", workload.name());
     let roster = workload.class_roster();
     if roster.len() > 1 {
@@ -690,11 +705,12 @@ fn build_workload(
         ));
     }
 
-    let needs_table = entries.iter().any(|(class, _)| !matches!(class.as_str(), "simple_transfer"));
+    let needs_table = entries
+        .iter()
+        .any(|(class, _)| !matches!(class.as_str(), "simple_transfer"));
     if needs_table && address_table.is_none() {
         return Err(citrate_bench::Error::Config(
-            "--workload-mix includes contract classes but --address-table was not provided"
-                .into(),
+            "--workload-mix includes contract classes but --address-table was not provided".into(),
         ));
     }
 
@@ -833,11 +849,7 @@ mod tests {
     #[test]
     fn build_workload_contract_class_without_table_errors() {
         let recipient = [0u8; 20];
-        let err = build_workload(
-            Some("simple_transfer:1,wrapped_salt:1"),
-            recipient,
-            None,
-        );
+        let err = build_workload(Some("simple_transfer:1,wrapped_salt:1"), recipient, None);
         assert!(err.is_err());
     }
 

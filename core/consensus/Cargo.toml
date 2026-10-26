@@ -28,7 +28,7 @@ sha2 = "0.10"
 # Audit M-05: p256 0.13 brings `zeroize` in transitively via the
 # `arithmetic` feature (elliptic-curve's `Scalar` Zeroize impl is
 # enabled when arithmetic is on). No explicit feature flag needed.
-p256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
+p256 = { version = "0.14", features = ["ecdsa", "arithmetic"] }
 hmac = "0.12"
 # PBA-R2: content-derived tx authentication (`tx_auth`): rebuild the EVM
 # signing payload and recover the signer on every path, including block import.

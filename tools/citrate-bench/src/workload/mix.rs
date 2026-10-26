@@ -173,9 +173,9 @@ impl WorkloadClass for MixedWorkload {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::address_table::AddressTable;
     use crate::workload::transfer::SimpleTransfer;
     use crate::workload::wrapped_salt::WrappedSaltTransfer;
-    use crate::address_table::AddressTable;
     use std::collections::HashMap;
 
     fn signer() -> Signer {
@@ -259,10 +259,8 @@ mod tests {
     fn dispatch_is_deterministic_across_instances() {
         let a = mix_two();
         let b = mix_two();
-        let picks_a: Vec<&str> =
-            (0..20).map(|_| a.pick_class().name()).collect();
-        let picks_b: Vec<&str> =
-            (0..20).map(|_| b.pick_class().name()).collect();
+        let picks_a: Vec<&str> = (0..20).map(|_| a.pick_class().name()).collect();
+        let picks_b: Vec<&str> = (0..20).map(|_| b.pick_class().name()).collect();
         assert_eq!(picks_a, picks_b);
     }
 

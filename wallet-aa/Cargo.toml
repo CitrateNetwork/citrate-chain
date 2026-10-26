@@ -12,7 +12,7 @@ hex = "0.4"
 
 # secp256k1 ECDSA — used to construct EIP-191 signatures over the
 # factory's permit digest from the operator wallet on auth.citrate.ai.
-k256 = { version = "0.13", features = ["ecdsa", "ecdsa-core"] }
+k256 = { version = "0.14", features = ["ecdsa", "ecdsa-core"] }
 rand = { workspace = true }
 
 # ABI helpers for the Kernel initialize() encoding + permit digest

@@ -394,7 +394,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// The standard EVM address of a secp256k1 key: keccak256(uncompressed_pubkey[1..65])[12..32].
 fn evm_address_of(key: &k256::ecdsa::SigningKey) -> Address {
     use sha3::{Digest, Keccak256};
-    let point = key.verifying_key().to_encoded_point(false);
+    let point = key.verifying_key().to_sec1_point(false);
     let hash: [u8; 32] = Keccak256::digest(point.as_bytes().get(1..).unwrap_or_default()).into();
     let [_, _, _, _, _, _, _, _, _, _, _, _, addr @ ..] = hash;
     Address(addr)
@@ -1106,9 +1106,7 @@ fn sign_drip_tx(
     sp.append(&0u8);
     let sighash = Keccak256::digest(sp.out());
 
-    let (sig, recid) = key
-        .sign_prehash_recoverable(&sighash)
-        .map_err(|e| e.to_string())?;
+    let (sig, recid) = key.sign_prehash_recoverable(&sighash);
     let r = sig.r().to_bytes();
     let s_ = sig.s().to_bytes();
     // chain_id is the faucet's own configured chain; saturation is unreachable for it.

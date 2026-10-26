@@ -87,7 +87,7 @@ fn key(n: u8) -> Option<SigningKey> {
 }
 
 fn address(k: &SigningKey) -> [u8; 20] {
-    let point = k.verifying_key().to_encoded_point(false);
+    let point = k.verifying_key().to_sec1_point(false);
     let hash = Keccak256::digest(&point.as_bytes()[1..]);
     let mut out = [0u8; 20];
     out.copy_from_slice(&hash[12..]);
@@ -97,10 +97,9 @@ fn address(k: &SigningKey) -> [u8; 20] {
 fn sign(k: &SigningKey, message: &str) -> [u8; 65] {
     let digest = agent_ops::eip191_digest(message.as_bytes());
     let mut out = [0u8; 65];
-    if let Ok((sig, recid)) = k.sign_prehash_recoverable(&digest) {
-        out[..64].copy_from_slice(&sig.to_bytes());
-        out[64] = 27 + recid.to_byte();
-    }
+    let (sig, recid) = k.sign_prehash_recoverable(&digest);
+    out[..64].copy_from_slice(&sig.to_bytes());
+    out[64] = 27 + recid.to_byte();
     out
 }
 
@@ -147,11 +146,10 @@ fn ecrecover_input() -> Vec<u8> {
     let digest = agent_ops::eip191_digest(b"reference");
     let mut out = digest.to_vec();
     let mut v = [0u8; 32];
-    if let Ok((sig, recid)) = mk.sign_prehash_recoverable(&digest) {
-        v[31] = 27 + recid.to_byte();
-        out.extend_from_slice(&v);
-        out.extend_from_slice(&sig.to_bytes());
-    }
+    let (sig, recid) = mk.sign_prehash_recoverable(&digest);
+    v[31] = 27 + recid.to_byte();
+    out.extend_from_slice(&v);
+    out.extend_from_slice(&sig.to_bytes());
     out
 }
 

@@ -149,7 +149,7 @@ mod tests {
     fn test_key() -> (SigningKey, Address) {
         let sk = SigningKey::from_bytes((&[7u8; 32]).into()).expect("key");
         let vk = sk.verifying_key();
-        let pubkey = vk.to_encoded_point(false);
+        let pubkey = vk.to_sec1_point(false);
         let digest = Keccak256::digest(&pubkey.as_bytes()[1..65]);
         let mut addr = [0u8; 20];
         addr.copy_from_slice(&digest[12..32]);
@@ -157,12 +157,12 @@ mod tests {
     }
 
     fn sign(sk: &SigningKey, msg: &[u8; 32]) -> String {
-        let (sig, recid): (Signature, _) = sk.sign_prehash_recoverable(msg).expect("sign");
+        let (sig, recid): (Signature, _) = sk.sign_prehash_recoverable(msg);
         // Normalize to low-s (recover_address rejects high-s per EIP-2).
-        let (sig, recid) = if let Some(normalized) = sig.normalize_s() {
+        let (sig, recid) = if bool::from(k256::elliptic_curve::scalar::IsHigh::is_high(&*sig.s())) {
             // Flipping s flips the recovery id parity.
             let flipped = k256::ecdsa::RecoveryId::from_byte(recid.to_byte() ^ 1).expect("recid");
-            (normalized, flipped)
+            (sig.normalize_s(), flipped)
         } else {
             (sig, recid)
         };

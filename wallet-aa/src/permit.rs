@@ -147,8 +147,8 @@ mod tests {
 
         let sig = sign_permit(&key, digest).expect("sign");
         // Re-build the signature object from r/s for verification.
-        let r = k256::FieldBytes::clone_from_slice(&sig[0..32]);
-        let s = k256::FieldBytes::clone_from_slice(&sig[32..64]);
+        let r = k256::FieldBytes::try_from(&sig[0..32]).expect("32-byte r");
+        let s = k256::FieldBytes::try_from(&sig[32..64]).expect("32-byte s");
         let recovered_sig = Signature::from_scalars(r, s).expect("scalars");
 
         // The signer hashed the EIP-191 envelope, so verification hashes

@@ -8,7 +8,7 @@ license = "Apache-2.0"
 [dependencies]
 # Key management (WASM-compatible — pure Rust)
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
-k256 = { version = "0.13", features = ["ecdsa", "ecdsa-core"] }
+k256 = { version = "0.14", features = ["ecdsa", "ecdsa-core", "getrandom"] }
 sha2 = "0.10"
 sha3 = "0.10"
 hmac = "0.12"
@@ -25,8 +25,10 @@ bip39 = { version = "1.2", features = ["rand", "std", "zeroize"] }
 # `secp256k1-ffi` feature, which we do NOT enable. Verified via
 # `cargo tree`: no `secp256k1-sys`/native crate enters the build graph,
 # so HD derivation stays WASM-compatible (pure Rust, matching the crate's
-# WASM posture). Pulls k256 0.13.4, matching our `k256 = "0.13"`.
-bip32 = { version = "0.5", default-features = false, features = ["secp256k1", "alloc"] }
+# WASM posture). bip32 0.6 pulls k256 0.14, matching our `k256 = "0.14"`.
+# (Its optional FFI `secp256k1` 0.33 shows up in Cargo.lock through a weak
+# `secp256k1-ffi?/alloc` feature, but is never built.)
+bip32 = { version = "0.6", default-features = false, features = ["secp256k1", "alloc"] }
 
 # Encryption — only used by the keystore encrypt/decrypt path
 # (`KeyManager`, `encrypt_key_raw`, `decrypt_key`). The lean crypto-only

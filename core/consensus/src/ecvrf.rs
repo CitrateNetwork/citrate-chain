@@ -5,9 +5,9 @@
 
 use hmac::{Hmac, Mac};
 use p256::elliptic_curve::ops::ReduceNonZero;
-use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
+use p256::elliptic_curve::sec1::{FromSec1Point, ToSec1Point};
 use p256::elliptic_curve::PrimeField;
-use p256::{AffinePoint, EncodedPoint, ProjectivePoint, Scalar};
+use p256::{AffinePoint, FieldBytes, ProjectivePoint, Scalar, Sec1Point};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -53,7 +53,7 @@ impl EcvrfProof {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(PROOF_LEN);
         buf.extend_from_slice(&self.pk_p256);
-        let gamma_compressed = self.gamma.to_encoded_point(true);
+        let gamma_compressed = self.gamma.to_sec1_point(true);
         buf.extend_from_slice(gamma_compressed.as_bytes());
         buf.extend_from_slice(&self.c);
         buf.extend_from_slice(&self.s.to_bytes());
@@ -75,15 +75,15 @@ impl EcvrfProof {
         let pk_p256 = pk_part.to_vec();
 
         let encoded_point =
-            EncodedPoint::from_bytes(gamma_bytes).map_err(|_| EcvrfError::InvalidPoint)?;
-        let gamma_opt: Option<AffinePoint> = AffinePoint::from_encoded_point(&encoded_point).into();
+            Sec1Point::from_bytes(gamma_bytes).map_err(|_| EcvrfError::InvalidPoint)?;
+        let gamma_opt: Option<AffinePoint> = AffinePoint::from_sec1_point(&encoded_point).into();
         let gamma = gamma_opt.ok_or(EcvrfError::InvalidPoint)?;
 
         let mut c = [0u8; C_LEN];
         c.copy_from_slice(c_bytes);
 
-        let s_field = p256::FieldBytes::from_slice(s_bytes);
-        let s_opt: Option<Scalar> = Scalar::from_repr(*s_field).into();
+        let s_field: [u8; 32] = s_bytes.try_into().map_err(|_| bad_len())?;
+        let s_opt: Option<Scalar> = Scalar::from_repr(FieldBytes::from(s_field)).into();
         let s = s_opt.ok_or(EcvrfError::InvalidScalar)?;
 
         Ok(Self {
@@ -121,10 +121,9 @@ fn secret_to_scalar(secret: &[u8; 32]) -> Scalar {
     let mut hasher = Sha256::new();
     hasher.update(b"ECVRF-P256-KEY-DERIVATION");
     hasher.update(secret);
-    let hash = hasher.finalize();
-    let field_bytes = p256::FieldBytes::from_slice(&hash);
-    // reduce_nonzero_bytes: reduce mod n and ensure non-zero
-    Scalar::reduce_nonzero_bytes(field_bytes)
+    let hash: [u8; 32] = hasher.finalize().into();
+    // reduce_nonzero: (hash mod (n - 1)) + 1, so never zero
+    Scalar::reduce_nonzero(&FieldBytes::from(hash))
 }
 
 /// Derive the P-256 public key (point) from a scalar.
@@ -150,12 +149,12 @@ fn hash_to_try_and_increment(pk_bytes: &[u8], alpha: &[u8]) -> Result<Projective
         compressed[0] = 0x02;
         compressed[1..33].copy_from_slice(&hash_result);
 
-        let encoded = match EncodedPoint::from_bytes(compressed) {
+        let encoded = match Sec1Point::from_bytes(compressed) {
             Ok(ep) => ep,
             Err(_) => continue,
         };
 
-        let point_opt: Option<AffinePoint> = AffinePoint::from_encoded_point(&encoded).into();
+        let point_opt: Option<AffinePoint> = AffinePoint::from_sec1_point(&encoded).into();
         if let Some(affine) = point_opt {
             return Ok(ProjectivePoint::from(affine));
         }
@@ -172,7 +171,7 @@ fn hash_points(points: &[ProjectivePoint]) -> [u8; C_LEN] {
     hasher.update([0x02]); // hash_points flag
     for p in points {
         let affine = p.to_affine();
-        let encoded = affine.to_encoded_point(true);
+        let encoded = affine.to_sec1_point(true);
         hasher.update(encoded.as_bytes());
     }
     hasher.update([0x00]); // trailing zero per RFC
@@ -187,8 +186,7 @@ fn challenge_to_scalar(c: &[u8; C_LEN]) -> Scalar {
     let mut padded = [0u8; 32];
     // Place c in the least significant bytes (big-endian)
     padded[32 - C_LEN..].copy_from_slice(c);
-    let field_bytes = p256::FieldBytes::from_slice(&padded);
-    let opt: Option<Scalar> = Scalar::from_repr(*field_bytes).into();
+    let opt: Option<Scalar> = Scalar::from_repr(FieldBytes::from(padded)).into();
     // RM-B1 / WP-B5.6 (audit L-03): pre-fix used `unwrap_or(Scalar::ZERO)`
     // here. The fallback to zero scalar in the verification equation
     // `c * pk` produces the identity element — a forger-passes case
@@ -213,8 +211,8 @@ fn challenge_to_scalar(c: &[u8; C_LEN]) -> Scalar {
 /// via the `zeroize` feature flag, so a stack drop also wipes).
 fn nonce_generation(sk: &Scalar, h_point: &ProjectivePoint) -> Scalar {
     // sk_bytes mirrors the secret scalar; wipe on scope exit.
-    let sk_bytes: Zeroizing<p256::FieldBytes> = Zeroizing::new(sk.to_bytes());
-    let h_encoded = h_point.to_affine().to_encoded_point(true);
+    let sk_bytes: Zeroizing<FieldBytes> = Zeroizing::new(sk.to_bytes());
+    let h_encoded = h_point.to_affine().to_sec1_point(true);
     let h_bytes = h_encoded.as_bytes();
 
     // HMAC-DRBG state `(k, v)` per RFC 6979 §3.2 — both wiped on drop.
@@ -253,8 +251,7 @@ fn nonce_generation(sk: &Scalar, h_point: &ProjectivePoint) -> Scalar {
         mac.update(v.as_ref());
         *v = mac.finalize().into_bytes().into();
 
-        let field_bytes = p256::FieldBytes::from_slice(v.as_ref());
-        let opt: Option<Scalar> = Scalar::from_repr(*field_bytes).into();
+        let opt: Option<Scalar> = Scalar::from_repr(FieldBytes::from(*v)).into();
         if let Some(scalar) = opt {
             if scalar != Scalar::ZERO {
                 return scalar;
@@ -277,7 +274,7 @@ fn nonce_generation(sk: &Scalar, h_point: &ProjectivePoint) -> Scalar {
 /// Converts Gamma to a 32-byte VRF output (beta string).
 pub fn proof_to_hash(gamma: &AffinePoint) -> [u8; 32] {
     // For P-256, cofactor h=1, so cofactor_mult is identity
-    let encoded = gamma.to_encoded_point(true);
+    let encoded = gamma.to_sec1_point(true);
     let mut hasher = Sha256::new();
     hasher.update([SUITE_STRING]);
     hasher.update([0x03]); // proof_to_hash flag
@@ -305,7 +302,7 @@ pub fn prove(secret: &[u8; 32], alpha: &[u8]) -> Result<(EcvrfProof, [u8; 32]), 
     let sk: Zeroizing<Scalar> = Zeroizing::new(secret_to_scalar(secret));
     let pk_point = scalar_to_pubkey_point(&sk);
     let pk_affine = pk_point.to_affine();
-    let pk_encoded = pk_affine.to_encoded_point(true);
+    let pk_encoded = pk_affine.to_sec1_point(true);
     let pk_bytes = pk_encoded.as_bytes();
 
     // Step 1: Hash to curve
@@ -353,9 +350,8 @@ pub fn verify(alpha: &[u8], proof: &EcvrfProof) -> Result<[u8; 32], EcvrfError> 
     let pk_bytes_33 = &proof.pk_p256;
 
     // Decode public key
-    let encoded_point =
-        EncodedPoint::from_bytes(pk_bytes_33).map_err(|_| EcvrfError::InvalidPoint)?;
-    let pk_opt: Option<AffinePoint> = AffinePoint::from_encoded_point(&encoded_point).into();
+    let encoded_point = Sec1Point::from_bytes(pk_bytes_33).map_err(|_| EcvrfError::InvalidPoint)?;
+    let pk_opt: Option<AffinePoint> = AffinePoint::from_sec1_point(&encoded_point).into();
     let pk_affine = pk_opt.ok_or(EcvrfError::InvalidPoint)?;
     let pk_proj = ProjectivePoint::from(pk_affine);
 
@@ -392,7 +388,7 @@ pub fn verify(alpha: &[u8], proof: &EcvrfProof) -> Result<[u8; 32], EcvrfError> 
 pub fn derive_public_key(secret: &[u8; 32]) -> Vec<u8> {
     let sk = secret_to_scalar(secret);
     let pk = scalar_to_pubkey_point(&sk).to_affine();
-    pk.to_encoded_point(true).as_bytes().to_vec()
+    pk.to_sec1_point(true).as_bytes().to_vec()
 }
 
 #[cfg(test)]

@@ -342,7 +342,7 @@ fn test_unified_ed25519_sign_consistency() {
 
 #[test]
 fn test_unified_secp256k1_sign_consistency() {
-    let key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+    let key = <k256::ecdsa::SigningKey as k256::elliptic_curve::Generate>::generate();
     let unified = UnifiedKey::Secp256k1(key);
 
     let data = b"test transaction data";

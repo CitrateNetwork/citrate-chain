@@ -86,7 +86,10 @@ pub fn load_from_private_keys_file(path: &Path) -> Result<Vec<Signer>> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let stripped = line.strip_prefix("0x").or_else(|| line.strip_prefix("0X")).unwrap_or(line);
+        let stripped = line
+            .strip_prefix("0x")
+            .or_else(|| line.strip_prefix("0X"))
+            .unwrap_or(line);
         if stripped.len() != 64 {
             return Err(Error::Keystore(format!(
                 "private-keys file line {}: expected 64 hex chars, got {}",
@@ -119,7 +122,7 @@ fn derive_eth_address(key_bytes: &[u8; 32]) -> Result<[u8; 20]> {
     let key = SigningKey::from_bytes(key_bytes.into())
         .map_err(|e| Error::Signing(format!("invalid secp256k1 key: {e}")))?;
     let verifying_key = key.verifying_key();
-    let point = verifying_key.to_encoded_point(false);
+    let point = verifying_key.to_sec1_point(false);
     let bytes = point.as_bytes();
     let hash = Keccak256::digest(&bytes[1..]);
     let mut address = [0u8; 20];
@@ -174,8 +177,7 @@ mod tests {
         )
         .expect("write");
         f.flush().expect("flush");
-        let signers =
-            load_from_private_keys_file(f.path()).expect("load_from_private_keys_file");
+        let signers = load_from_private_keys_file(f.path()).expect("load_from_private_keys_file");
         assert_eq!(signers.len(), 3);
         // Well-known address for private key = 1:
         assert_eq!(

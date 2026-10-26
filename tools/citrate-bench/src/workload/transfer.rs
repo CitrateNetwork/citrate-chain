@@ -86,7 +86,9 @@ mod tests {
 
     #[test]
     fn requires_no_contracts() {
-        assert!(SimpleTransfer::default_bench().required_contracts().is_empty());
+        assert!(SimpleTransfer::default_bench()
+            .required_contracts()
+            .is_empty());
     }
 
     #[test]

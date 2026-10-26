@@ -128,9 +128,8 @@ pub fn sign_recoverable(
     key: &SigningKey,
     prehash: &[u8; 32],
 ) -> Result<([u8; 32], [u8; 32], u8), WalletError> {
-    let (signature, recovery_id) = key
-        .sign_prehash_recoverable(prehash)
-        .map_err(|e| WalletError::SigningFailed(format!("secp256k1 sign failed: {}", e)))?;
+    // Infallible from ecdsa 0.17 on (RFC 6979 signing cannot fail).
+    let (signature, recovery_id) = key.sign_prehash_recoverable(prehash);
 
     let sig_bytes = signature.to_bytes();
     // A compact secp256k1 signature is exactly r(32) ‖ s(32).
@@ -249,7 +248,7 @@ mod tests {
             .expect("ecrecover must succeed");
 
         // EVM address = Keccak256(uncompressed_pubkey[1..])[12..32].
-        let point = recovered.to_encoded_point(false);
+        let point = recovered.to_sec1_point(false);
         let hash = keccak256(&point.as_bytes()[1..]);
         let mut out = [0u8; 20];
         out.copy_from_slice(&hash[12..32]);
@@ -259,7 +258,7 @@ mod tests {
     /// Derive the EVM address directly from the key (ground truth).
     fn evm_address_of_key(key: &SigningKey) -> [u8; 20] {
         let vk = key.verifying_key();
-        let point = vk.to_encoded_point(false);
+        let point = vk.to_sec1_point(false);
         let hash = keccak256(&point.as_bytes()[1..]);
         let mut out = [0u8; 20];
         out.copy_from_slice(&hash[12..32]);
@@ -314,8 +313,7 @@ mod tests {
 
     #[test]
     fn eip155_spec_vector_raw_bytes_match_reference() {
-        let key = SigningKey::from_bytes((&unhex(EIP155_PRIV)[..]).into())
-            .expect("valid EIP-155 example key");
+        let key = SigningKey::from_slice(&unhex(EIP155_PRIV)).expect("valid EIP-155 example key");
         let tx = eip155_example_tx();
 
         let signed = sign_eip155_legacy_tx(&key, &tx, 1).expect("sign EIP-155 example");
@@ -338,7 +336,7 @@ mod tests {
 
     #[test]
     fn eip155_spec_vector_hash_matches_reference() {
-        let key = SigningKey::from_bytes((&unhex(EIP155_PRIV)[..]).into()).expect("valid key");
+        let key = SigningKey::from_slice(&unhex(EIP155_PRIV)).expect("valid key");
         let tx = eip155_example_tx();
         let signed = sign_eip155_legacy_tx(&key, &tx, 1).expect("sign");
         // Keccak256 of the raw signed tx == the canonical tx hash.
@@ -356,7 +354,7 @@ mod tests {
 
     #[test]
     fn ecrecover_roundtrip_recovers_signer_40204() {
-        let key = SigningKey::from_bytes((&unhex(EIP155_PRIV)[..]).into()).expect("valid key");
+        let key = SigningKey::from_slice(&unhex(EIP155_PRIV)).expect("valid key");
         let tx = LegacyTxFields {
             nonce: 0,
             gas_price: 1_000_000_000,
@@ -382,7 +380,7 @@ mod tests {
 
     #[test]
     fn ecrecover_roundtrip_spec_vector_chain_1() {
-        let key = SigningKey::from_bytes((&unhex(EIP155_PRIV)[..]).into()).expect("valid key");
+        let key = SigningKey::from_slice(&unhex(EIP155_PRIV)).expect("valid key");
         let tx = eip155_example_tx();
         let signed = sign_eip155_legacy_tx(&key, &tx, 1).expect("sign");
         let recovered = recover_evm_address(&tx, 1, &signed);
@@ -398,7 +396,7 @@ mod tests {
     fn signing_is_deterministic() {
         // secp256k1 via k256 uses RFC-6979 deterministic nonces, so the
         // same (key, tx, chain_id) yields byte-identical output.
-        let key = SigningKey::from_bytes((&unhex(EIP155_PRIV)[..]).into()).expect("valid key");
+        let key = SigningKey::from_slice(&unhex(EIP155_PRIV)).expect("valid key");
         let tx = eip155_example_tx();
         let a = sign_eip155_legacy_tx(&key, &tx, 40204).expect("sign a");
         let b = sign_eip155_legacy_tx(&key, &tx, 40204).expect("sign b");
@@ -411,7 +409,7 @@ mod tests {
 
     #[test]
     fn distinct_tx_produces_distinct_bytes() {
-        let key = SigningKey::from_bytes((&unhex(EIP155_PRIV)[..]).into()).expect("valid key");
+        let key = SigningKey::from_slice(&unhex(EIP155_PRIV)).expect("valid key");
         let tx1 = eip155_example_tx();
         let mut tx2 = eip155_example_tx();
         tx2.nonce = 10; // one field differs
@@ -425,7 +423,7 @@ mod tests {
     #[test]
     fn different_chain_id_produces_different_signature() {
         // Replay protection: chain_id enters the signing hash.
-        let key = SigningKey::from_bytes((&unhex(EIP155_PRIV)[..]).into()).expect("valid key");
+        let key = SigningKey::from_slice(&unhex(EIP155_PRIV)).expect("valid key");
         let tx = eip155_example_tx();
         let a = sign_eip155_legacy_tx(&key, &tx, 1).expect("chain 1");
         let b = sign_eip155_legacy_tx(&key, &tx, 40204).expect("chain 40204");
@@ -437,7 +435,7 @@ mod tests {
     fn contract_creation_empty_to_is_handled() {
         // to == None → RLP-encodes the empty string (0x80), and ecrecover
         // still round-trips.
-        let key = SigningKey::from_bytes((&unhex(EIP155_PRIV)[..]).into()).expect("valid key");
+        let key = SigningKey::from_slice(&unhex(EIP155_PRIV)).expect("valid key");
         let tx = LegacyTxFields {
             nonce: 0,
             gas_price: 1_000_000_000,
@@ -457,7 +455,7 @@ mod tests {
     fn sign_recoverable_matches_full_signer() {
         // The low-level sign_recoverable over the signing hash yields the
         // same r/s the full signer embeds.
-        let key = SigningKey::from_bytes((&unhex(EIP155_PRIV)[..]).into()).expect("valid key");
+        let key = SigningKey::from_slice(&unhex(EIP155_PRIV)).expect("valid key");
         let tx = eip155_example_tx();
         let hash = eip155_signing_hash(&tx, 40204);
         let (r, s, recid) = sign_recoverable(&key, &hash).expect("recoverable");
@@ -476,7 +474,7 @@ mod tests {
         // geth/ethers reject ("Unexpected type flag. Got 0."). This test finds
         // a real leading-zero case (deterministic RFC-6979) and asserts the
         // RLP-encoded r/s are trimmed — it FAILS against the un-trimmed encoder.
-        let key = SigningKey::from_bytes((&unhex(EIP155_PRIV)[..]).into()).expect("valid key");
+        let key = SigningKey::from_slice(&unhex(EIP155_PRIV)).expect("valid key");
         let chain_id = 40204u64;
         let mut found = false;
         for nonce in 0u64..2000 {
@@ -533,7 +531,7 @@ mod tests {
     /// crash; the largest representable one still signs.
     #[test]
     fn panic_s1_eip155_v_overflow_is_an_error() {
-        let key = SigningKey::from_bytes((&unhex(EIP155_PRIV)[..]).into()).expect("valid key");
+        let key = SigningKey::from_slice(&unhex(EIP155_PRIV)).expect("valid key");
         let tx = eip155_example_tx();
         assert!(sign_eip155_legacy_tx(&key, &tx, u64::MAX).is_err());
         assert!(sign_eip155_legacy_tx(&key, &tx, (u64::MAX - 36) / 2).is_ok());

@@ -53,10 +53,8 @@ pub fn read_passphrase(source: &PassphraseSource) -> Result<String> {
                 .map_err(|e| Error::Keystore(format!("read passphrase file: {e}")))?;
             Ok(raw.trim().to_string())
         }
-        PassphraseSource::Prompt { prompt } => {
-            rpassword::prompt_password(prompt)
-                .map_err(|e| Error::Keystore(format!("tty passphrase prompt: {e}")))
-        }
+        PassphraseSource::Prompt { prompt } => rpassword::prompt_password(prompt)
+            .map_err(|e| Error::Keystore(format!("tty passphrase prompt: {e}"))),
     }
 }
 
@@ -107,8 +105,8 @@ mod tests {
         // the filename. We immediately rename the file to `name` so the
         // test can look it up by a stable account name.
         let mut rng = OsRng;
-        let (key_bytes, uuid_name) = eth_keystore::new(dir, &mut rng, passphrase, Some(name))
-            .expect("new keystore");
+        let (key_bytes, uuid_name) =
+            eth_keystore::new(dir, &mut rng, passphrase, Some(name)).expect("new keystore");
         // eth_keystore v0.5 honors `Some(name)` and writes to `dir/name`.
         // Defensive: if it used a uuid, rename. (Newer versions may differ.)
         let target = dir.join(name);
@@ -149,8 +147,7 @@ mod tests {
     fn read_file_passphrase_trims_whitespace() {
         let tmp = tempfile::NamedTempFile::new().expect("tmp");
         std::fs::write(tmp.path(), "  hunter2  \n").expect("write");
-        let pw = read_passphrase(&PassphraseSource::File(tmp.path().to_path_buf()))
-            .expect("file");
+        let pw = read_passphrase(&PassphraseSource::File(tmp.path().to_path_buf())).expect("file");
         assert_eq!(pw, "hunter2");
     }
 
@@ -158,8 +155,7 @@ mod tests {
     fn round_trip_encrypt_and_decrypt() {
         let dir = tempfile::tempdir().expect("dir");
         let key = make_keystore(dir.path(), "bench-01", "correct horse battery");
-        let signer = load(&dir.path().join("bench-01"), "correct horse battery")
-            .expect("decrypt");
+        let signer = load(&dir.path().join("bench-01"), "correct horse battery").expect("decrypt");
         // Address derivation should agree with a fresh signer built
         // from the raw key.
         let fresh = Signer::from_key_bytes(&key).expect("fresh");

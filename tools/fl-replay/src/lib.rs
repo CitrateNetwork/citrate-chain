@@ -235,13 +235,19 @@ pub fn recover(digest: &B32, sig: &[u8]) -> anyhow::Result<Addr> {
         _ => anyhow::bail!("signature is {} bytes", sig.len()),
     };
     let s = Signature::from_slice(rs)?;
+    // EIP-2 low-s, as the chain's precompiles require. This must be explicit:
+    // from ecdsa 0.17 on, `recover_from_prehash` no longer re-verifies, so it
+    // no longer refuses the high-s twin of a valid signature.
+    if bool::from(k256::elliptic_curve::scalar::IsHigh::is_high(&s.s())) {
+        anyhow::bail!("high-s signature (EIP-2)");
+    }
     let v = match v {
         27 | 28 => v.saturating_sub(27),
         v => v,
     };
     let id = RecoveryId::from_byte(v).ok_or_else(|| anyhow::anyhow!("bad recovery id {v}"))?;
     let vk = VerifyingKey::recover_from_prehash(digest, &s, id)?;
-    let point = vk.to_encoded_point(false);
+    let point = vk.to_sec1_point(false);
     let h = keccak(&[point.as_bytes().get(1..).unwrap_or_default()]);
     let [_, _, _, _, _, _, _, _, _, _, _, _, a @ ..] = h;
     Ok(a)
@@ -801,8 +807,8 @@ mod tests {
         seed[31] = 0x42;
         let sk = SigningKey::from_bytes(&seed.into()).expect("key");
         let digest = keccak(&[b"citrate-fl-replay test"]);
-        let (sig, id) = sk.sign_prehash_recoverable(&digest).expect("sign");
-        let point = sk.verifying_key().to_encoded_point(false);
+        let (sig, id) = sk.sign_prehash_recoverable(&digest);
+        let point = sk.verifying_key().to_sec1_point(false);
         let h = keccak(&[&point.as_bytes()[1..]]);
         let mut addr = [0u8; 20];
         addr.copy_from_slice(&h[12..]);
@@ -813,6 +819,31 @@ mod tests {
         raw[last] += 27;
         assert_eq!(recover(&digest, &raw).expect("recover"), addr);
         assert!(recover(&digest, &raw[..64]).is_err());
+    }
+
+    /// A high-s twin `(r, n - s)` with the parity flipped recovers the same key
+    /// mathematically. k256 0.13 refused it inside `recover_from_prehash` (it
+    /// re-verified, and k256 verification rejects high-s); k256 0.14 / ecdsa 0.17
+    /// no longer verify there, so `recover` must refuse it itself, as the
+    /// chain's precompiles do (EIP-2).
+    #[test]
+    fn recover_refuses_the_high_s_twin() {
+        use k256::ecdsa::{Signature, SigningKey};
+        let mut seed = [0u8; 32];
+        seed[31] = 0x42;
+        let sk = SigningKey::from_bytes(&seed.into()).expect("key");
+        let digest = keccak(&[b"citrate-fl-replay test"]);
+        let (sig, id) = sk.sign_prehash_recoverable(&digest);
+        let (r, s) = sig.split_scalars();
+        let high = Signature::from_scalars(r, -(*s)).expect("high-s twin");
+        for v in [id.to_byte() ^ 1, (id.to_byte() ^ 1) + 27, id.to_byte()] {
+            let mut raw = high.to_bytes().to_vec();
+            raw.push(v);
+            assert!(
+                recover(&digest, &raw).is_err(),
+                "high-s must be refused (v = {v})"
+            );
+        }
     }
 
     #[test]

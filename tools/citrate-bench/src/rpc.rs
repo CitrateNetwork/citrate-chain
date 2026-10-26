@@ -91,10 +91,7 @@ impl RpcClient {
             .await
             .map_err(|e| Error::RpcHttp(format!("{method} send: {e}")))?;
         if !resp.status().is_success() {
-            return Err(Error::RpcHttp(format!(
-                "{method}: HTTP {}",
-                resp.status()
-            )));
+            return Err(Error::RpcHttp(format!("{method}: HTTP {}", resp.status())));
         }
         let val: serde_json::Value = resp
             .json()
@@ -126,8 +123,7 @@ impl RpcClient {
         let s = v
             .as_str()
             .ok_or_else(|| Error::Rpc("eth_chainId: result not string".into()))?;
-        parse_hex_u64(s)
-            .ok_or_else(|| Error::Rpc(format!("eth_chainId: unparseable hex: {s}")))
+        parse_hex_u64(s).ok_or_else(|| Error::Rpc(format!("eth_chainId: unparseable hex: {s}")))
     }
 
     pub async fn block_number(&self) -> Result<u64> {
@@ -135,8 +131,7 @@ impl RpcClient {
         let s = v
             .as_str()
             .ok_or_else(|| Error::Rpc("eth_blockNumber: result not string".into()))?;
-        parse_hex_u64(s)
-            .ok_or_else(|| Error::Rpc(format!("eth_blockNumber: unparseable hex: {s}")))
+        parse_hex_u64(s).ok_or_else(|| Error::Rpc(format!("eth_blockNumber: unparseable hex: {s}")))
     }
 
     pub async fn get_transaction_count(&self, address_hex: &str, tag: &str) -> Result<u64> {
@@ -205,7 +200,10 @@ impl RpcClient {
                 "eth_getTransactionReceipt (code {code}): {msg}"
             )));
         }
-        let result = val.get("result").cloned().unwrap_or(serde_json::Value::Null);
+        let result = val
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         if result.is_null() {
             return Ok(None);
         }
@@ -215,7 +213,10 @@ impl RpcClient {
 }
 
 fn parse_hex_u64(s: &str) -> Option<u64> {
-    let stripped = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let stripped = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     if stripped.is_empty() {
         return Some(0);
     }
@@ -223,7 +224,10 @@ fn parse_hex_u64(s: &str) -> Option<u64> {
 }
 
 fn parse_hex_u128(s: &str) -> Option<u128> {
-    let stripped = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let stripped = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     if stripped.is_empty() {
         return Some(0);
     }
@@ -250,7 +254,9 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let _m = server
             .mock("POST", "/")
-            .match_body(mockito::Matcher::PartialJson(json!({"method": "eth_chainId"})))
+            .match_body(mockito::Matcher::PartialJson(
+                json!({"method": "eth_chainId"}),
+            ))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"jsonrpc":"2.0","id":1,"result":"0x9d0c"}"#)
@@ -265,7 +271,9 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let _m = server
             .mock("POST", "/")
-            .match_body(mockito::Matcher::PartialJson(json!({"method": "eth_blockNumber"})))
+            .match_body(mockito::Matcher::PartialJson(
+                json!({"method": "eth_blockNumber"}),
+            ))
             .with_status(200)
             .with_body(r#"{"jsonrpc":"2.0","id":1,"result":"0x2a"}"#)
             .create_async()
@@ -306,7 +314,11 @@ mod tests {
             .create_async()
             .await;
         let client = fresh_client(&server.url()).await;
-        match client.send_raw_transaction("0xdeadbeef").await.expect("send") {
+        match client
+            .send_raw_transaction("0xdeadbeef")
+            .await
+            .expect("send")
+        {
             SendRawOutcome::Accepted(h) => assert_eq!(h, "0xabcdef"),
             other => panic!("expected Accepted, got {other:?}"),
         }
@@ -324,7 +336,11 @@ mod tests {
             .create_async()
             .await;
         let client = fresh_client(&server.url()).await;
-        match client.send_raw_transaction("0xdeadbeef").await.expect("send") {
+        match client
+            .send_raw_transaction("0xdeadbeef")
+            .await
+            .expect("send")
+        {
             SendRawOutcome::Rejected { code, message } => {
                 assert_eq!(code, -32000);
                 assert!(message.contains("nonce too low"));
@@ -391,7 +407,10 @@ mod tests {
         assert_eq!(parse_hex_u64("1a"), Some(26));
         assert_eq!(parse_hex_u64("0x"), Some(0));
         assert_eq!(parse_hex_u64("0xzz"), None);
-        assert_eq!(parse_hex_u128("0xffffffffffffffffffffffffffffffff"), Some(u128::MAX));
+        assert_eq!(
+            parse_hex_u128("0xffffffffffffffffffffffffffffffff"),
+            Some(u128::MAX)
+        );
     }
 
     // Unused helper kept only to silence warnings if mockito versions change.

@@ -75,7 +75,10 @@ impl WorkloadContext {
 fn parse_eth_address(s: &str) -> std::result::Result<[u8; 20], String> {
     let stripped = s.strip_prefix("0x").unwrap_or(s);
     if stripped.len() != 40 {
-        return Err(format!("address must be 40 hex chars, got {}", stripped.len()));
+        return Err(format!(
+            "address must be 40 hex chars, got {}",
+            stripped.len()
+        ));
     }
     let bytes = hex::decode(stripped).map_err(|e| format!("hex: {e}"))?;
     let mut out = [0u8; 20];

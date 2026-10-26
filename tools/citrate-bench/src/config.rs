@@ -176,8 +176,7 @@ mod tests {
                 rpc_url: "https://rpc.citrate.ai".into(),
                 chain_id: 40204,
                 ceremony_bundle_sha256:
-                    "sha256:0000000000000000000000000000000000000000000000000000000000000001"
-                        .into(),
+                    "sha256:0000000000000000000000000000000000000000000000000000000000000001".into(),
                 address_table_path: PathBuf::from("/tmp/__nonexistent_addr_table__"),
                 manifest_path: PathBuf::from("/tmp/__nonexistent_manifest__"),
             },
@@ -213,14 +212,20 @@ mod tests {
     #[test]
     fn funding_floor_decimal() {
         let cfg = ok_config();
-        assert_eq!(cfg.funding_floor_u128().expect("parse"), 1_000_000_000_000_000_000u128);
+        assert_eq!(
+            cfg.funding_floor_u128().expect("parse"),
+            1_000_000_000_000_000_000u128
+        );
     }
 
     #[test]
     fn funding_floor_hex() {
         let mut cfg = ok_config();
         cfg.signers.funding_floor_wei = "0xde0b6b3a7640000".into();
-        assert_eq!(cfg.funding_floor_u128().expect("parse"), 1_000_000_000_000_000_000u128);
+        assert_eq!(
+            cfg.funding_floor_u128().expect("parse"),
+            1_000_000_000_000_000_000u128
+        );
     }
 
     #[test]
@@ -277,10 +282,8 @@ mod tests {
 
     #[test]
     fn sha256_shape_accepts_bare() {
-        validate_sha256_prefix(
-            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
-        )
-        .expect("accept");
+        validate_sha256_prefix("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789")
+            .expect("accept");
     }
 
     #[test]

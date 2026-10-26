@@ -85,9 +85,8 @@ impl AddressTable {
             if c.name.trim().is_empty() {
                 return Err(Error::AddressTable("contract with empty name".into()));
             }
-            validate_eth_address(&c.address).map_err(|e| {
-                Error::AddressTable(format!("{} has invalid address: {e}", c.name))
-            })?;
+            validate_eth_address(&c.address)
+                .map_err(|e| Error::AddressTable(format!("{} has invalid address: {e}", c.name)))?;
         }
         Ok(())
     }
@@ -157,8 +156,10 @@ mod tests {
         }"#;
         let f = write_tmp(json);
         let tbl = load(f.path()).expect("load");
-        assert_eq!(tbl.find("A").expect("A exists").address,
-                   "0x0000000000000000000000000000000000000001");
+        assert_eq!(
+            tbl.find("A").expect("A exists").address,
+            "0x0000000000000000000000000000000000000001"
+        );
         assert!(tbl.find("B").is_none());
     }
 

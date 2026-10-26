@@ -387,14 +387,13 @@ fn batch_payment_verify(input: &[u8], gas_limit: u64) -> Result<PrecompileResult
 mod tests {
     use super::*;
     use k256::ecdsa::SigningKey;
-    use k256::elliptic_curve::rand_core::OsRng;
 
     /// Helper: create a deterministic test key pair and sign an EIP-712 digest
     fn create_test_eip712_signature(
         domain_separator: &[u8; 32],
         struct_hash: &[u8; 32],
     ) -> (Vec<u8>, [u8; 20]) {
-        let signing_key = SigningKey::random(&mut OsRng);
+        let signing_key = <SigningKey as k256::elliptic_curve::Generate>::generate();
 
         // Compute EIP-712 digest
         let mut hasher = Keccak256::new();
@@ -404,16 +403,14 @@ mod tests {
         let digest: [u8; 32] = hasher.finalize().into();
 
         // Sign
-        let (signature, recid) = signing_key
-            .sign_prehash_recoverable(&digest)
-            .expect("signing should succeed");
+        let (signature, recid) = signing_key.sign_prehash_recoverable(&digest);
 
         let sig_bytes = signature.to_bytes();
         let v = recid.to_byte() + 27; // Ethereum convention
 
         // Derive expected address
         let verifying_key = signing_key.verifying_key();
-        let pubkey = verifying_key.to_encoded_point(false);
+        let pubkey = verifying_key.to_sec1_point(false);
         let pubkey_bytes = pubkey.as_bytes();
         let mut addr_hasher = Keccak256::new();
         addr_hasher.update(&pubkey_bytes[1..65]);
@@ -444,7 +441,7 @@ mod tests {
     ) -> Vec<u8> {
         // Derive from address
         let verifying_key = from_key.verifying_key();
-        let pubkey = verifying_key.to_encoded_point(false);
+        let pubkey = verifying_key.to_sec1_point(false);
         let pubkey_bytes = pubkey.as_bytes();
         let mut addr_hasher = Keccak256::new();
         addr_hasher.update(&pubkey_bytes[1..65]);
@@ -479,9 +476,7 @@ mod tests {
         let digest: [u8; 32] = digest_hasher.finalize().into();
 
         // Sign
-        let (signature, recid) = from_key
-            .sign_prehash_recoverable(&digest)
-            .expect("signing should succeed");
+        let (signature, recid) = from_key.sign_prehash_recoverable(&digest);
         let sig_bytes = signature.to_bytes();
         let v = recid.to_byte() + 27;
 
@@ -566,7 +561,7 @@ mod tests {
     #[test]
     fn test_transfer_auth_verify_valid() {
         let domain_separator = [0x11u8; 32];
-        let from_key = SigningKey::random(&mut OsRng);
+        let from_key = <SigningKey as k256::elliptic_curve::Generate>::generate();
         let to = [0x22u8; 20];
         let value = [0u8; 32]; // 0 value
         let valid_after = [0u8; 32]; // timestamp 0
@@ -596,7 +591,7 @@ mod tests {
     #[test]
     fn test_transfer_auth_verify_wrong_from() {
         let domain_separator = [0x11u8; 32];
-        let from_key = SigningKey::random(&mut OsRng);
+        let from_key = <SigningKey as k256::elliptic_curve::Generate>::generate();
         let to = [0x22u8; 20];
         let value = [0u8; 32];
         let valid_after = [0u8; 32];
@@ -639,7 +634,7 @@ mod tests {
 
         // Create 3 valid payment entries
         for i in 0..3u8 {
-            let from_key = SigningKey::random(&mut OsRng);
+            let from_key = <SigningKey as k256::elliptic_curve::Generate>::generate();
             let mut nonce = [0u8; 32];
             nonce[31] = i;
 
@@ -683,7 +678,7 @@ mod tests {
         input.extend_from_slice(&2u16.to_be_bytes()); // count = 2
 
         // Entry 1: valid
-        let from_key1 = SigningKey::random(&mut OsRng);
+        let from_key1 = <SigningKey as k256::elliptic_curve::Generate>::generate();
         let nonce1 = [0x01u8; 32];
         let full1 = create_test_transfer_auth(
             &domain_separator,
@@ -697,7 +692,7 @@ mod tests {
         input.extend_from_slice(&full1[32..]);
 
         // Entry 2: invalid (tamper from address)
-        let from_key2 = SigningKey::random(&mut OsRng);
+        let from_key2 = <SigningKey as k256::elliptic_curve::Generate>::generate();
         let nonce2 = [0x02u8; 32];
         let mut full2 = create_test_transfer_auth(
             &domain_separator,
@@ -738,7 +733,7 @@ mod tests {
     #[test]
     fn panic_s1_transfer_auth_and_batch_entry_agree() {
         let domain_separator = [0x11u8; 32];
-        let from_key = SigningKey::random(&mut OsRng);
+        let from_key = <SigningKey as k256::elliptic_curve::Generate>::generate();
         let to = [0x22u8; 20];
         let value = [0u8; 32];
         let valid_after = [0u8; 32];

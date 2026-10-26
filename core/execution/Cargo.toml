@@ -82,7 +82,7 @@ aes-gcm = "0.10"
 argon2 = "0.5"
 hmac = "0.12"
 rand = { workspace = true }
-k256 = { version = "0.13", features = ["ecdsa", "sha256", "ecdh"] }
+k256 = { version = "0.14", features = ["ecdsa", "sha256", "ecdh", "getrandom"] }
 ed25519-dalek = { workspace = true }   # 0x0120 Ed25519 verify precompile (is_weak + verify_strict)
 
 # Precompile implementations

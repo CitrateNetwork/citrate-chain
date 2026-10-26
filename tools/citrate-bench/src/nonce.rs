@@ -103,11 +103,12 @@ impl Drop for NoncePermit {
         // Release exactly one inflight slot. Underflow here would be a
         // logic bug; we saturate at 0 rather than panicking because a
         // panic in Drop would abort the process.
-        let _ = self.lane.inflight.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |n| Some(n.saturating_sub(1)),
-        );
+        let _ = self
+            .lane
+            .inflight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                Some(n.saturating_sub(1))
+            });
     }
 }
 
@@ -163,10 +164,7 @@ mod tests {
                         std::thread::yield_now();
                     }
                 }
-                collected
-                    .lock()
-                    .expect("mutex not poisoned")
-                    .extend(local);
+                collected.lock().expect("mutex not poisoned").extend(local);
             }));
         }
         for h in handles {

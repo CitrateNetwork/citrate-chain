@@ -470,7 +470,7 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some(Commands::Keygen { ed25519 }) => {
-            generate_keypair(ed25519);
+            generate_keypair(ed25519)?;
             return Ok(());
         }
         Some(Commands::Consensus { json }) => {
@@ -1096,7 +1096,7 @@ async fn run_devnet(
     start_node(config).await
 }
 
-fn generate_keypair(use_ed25519: bool) {
+fn generate_keypair(use_ed25519: bool) -> anyhow::Result<()> {
     if use_ed25519 {
         // Ed25519 — for P2P Noise identity and native Citrate operations
         let signing_key = crypto::generate_keypair();
@@ -1110,11 +1110,12 @@ fn generate_keypair(use_ed25519: bool) {
         use k256::ecdsa::SigningKey as K256SigningKey;
         use sha3::{Digest, Keccak256};
 
-        let secret_key = K256SigningKey::random(&mut rand::thread_rng());
+        let secret_key = <K256SigningKey as k256::elliptic_curve::Generate>::try_generate()
+            .map_err(|e| anyhow::anyhow!("system RNG unavailable for key generation: {e}"))?;
         let public_key = secret_key.verifying_key();
 
         // Uncompressed public key (65 bytes: 0x04 || x || y)
-        let pubkey_bytes = public_key.to_encoded_point(false);
+        let pubkey_bytes = public_key.to_sec1_point(false);
         // Ethereum address = last 20 bytes of Keccak256(pubkey_xy)
         // Skip the 0x04 prefix byte
         let mut hasher = Keccak256::new();
@@ -1131,6 +1132,7 @@ fn generate_keypair(use_ed25519: bool) {
         println!("Import the private key into MetaMask to use this account.");
         println!("The address above will match what MetaMask displays.");
     }
+    Ok(())
 }
 
 fn show_genesis_info() -> Result<()> {

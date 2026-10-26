@@ -173,7 +173,7 @@ impl TransactionBuilder {
 
         // Derive the EVM address from the public key (display only).
         let verifying_key = signing_key.verifying_key();
-        let pubkey_bytes = k256::EncodedPoint::from(verifying_key);
+        let pubkey_bytes = k256::Sec1Point::from(verifying_key);
         let pubkey_uncompressed = pubkey_bytes.as_bytes();
         // EVM address = Keccak256(pubkey[1..65])[12..32]
         let mut address_hasher = Keccak256::new();
@@ -927,7 +927,7 @@ mod tests {
 
     #[test]
     fn test_t0_02_secp256k1_rejects_non_20_byte_to_address() {
-        let key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let key = <k256::ecdsa::SigningKey as k256::elliptic_curve::Generate>::generate();
         let err = TransactionBuilder::new()
             .to("0xabc")
             .value(100)
@@ -939,7 +939,7 @@ mod tests {
 
     #[test]
     fn test_secp256k1_sign_produces_valid_tx() {
-        let key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let key = <k256::ecdsa::SigningKey as k256::elliptic_curve::Generate>::generate();
         let tx = TransactionBuilder::new()
             .to("0xdead000000000000000000000000000000000000")
             .value(1_000_000_000_000_000_000) // 1 SALT
@@ -958,7 +958,7 @@ mod tests {
 
     #[test]
     fn test_secp256k1_sign_deterministic() {
-        let key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let key = <k256::ecdsa::SigningKey as k256::elliptic_curve::Generate>::generate();
         let tx1 = TransactionBuilder::new()
             .to("0xdead000000000000000000000000000000000000")
             .value(100)
@@ -978,8 +978,8 @@ mod tests {
 
     #[test]
     fn test_secp256k1_different_keys_different_from() {
-        let key1 = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
-        let key2 = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let key1 = <k256::ecdsa::SigningKey as k256::elliptic_curve::Generate>::generate();
+        let key2 = <k256::ecdsa::SigningKey as k256::elliptic_curve::Generate>::generate();
 
         let tx1 = TransactionBuilder::new()
             .value(0)
@@ -995,7 +995,7 @@ mod tests {
 
     #[test]
     fn test_secp256k1_eip155_v_value() {
-        let key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let key = <k256::ecdsa::SigningKey as k256::elliptic_curve::Generate>::generate();
         let tx = TransactionBuilder::new()
             .chain_id(40204)
             .sign_secp256k1(&key, 0)
@@ -1015,7 +1015,7 @@ mod tests {
 
     #[test]
     fn test_secp256k1_rlp_encoded_output() {
-        let key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let key = <k256::ecdsa::SigningKey as k256::elliptic_curve::Generate>::generate();
         let tx = TransactionBuilder::new()
             .to("0xdead000000000000000000000000000000000000")
             .value(1000)
@@ -1035,7 +1035,7 @@ mod tests {
 
     #[test]
     fn test_secp256k1_from_address_is_keccak_derived() {
-        let key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let key = <k256::ecdsa::SigningKey as k256::elliptic_curve::Generate>::generate();
         let tx = TransactionBuilder::new()
             .value(0)
             .sign_secp256k1(&key, 0)
@@ -1043,7 +1043,7 @@ mod tests {
 
         // Independently derive the address
         let vk = key.verifying_key();
-        let pubkey_point = k256::EncodedPoint::from(vk);
+        let pubkey_point = k256::Sec1Point::from(vk);
         let pubkey_bytes = pubkey_point.as_bytes();
         let mut hasher = Keccak256::new();
         hasher.update(&pubkey_bytes[1..]); // Skip 0x04
@@ -1055,7 +1055,7 @@ mod tests {
 
     #[test]
     fn test_secp256k1_contract_creation_empty_to() {
-        let key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let key = <k256::ecdsa::SigningKey as k256::elliptic_curve::Generate>::generate();
         let tx = TransactionBuilder::new()
             .value(0)
             .data(vec![0x60, 0x60, 0x60, 0x40]) // Minimal bytecode

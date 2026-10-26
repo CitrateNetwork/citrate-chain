@@ -228,17 +228,17 @@ impl Tracker {
         let reverted = self.shared.reverted.load(Ordering::Acquire);
         let timeouts = self.shared.timeouts.load(Ordering::Acquire);
         let transport_errors = self.shared.transport_errors.load(Ordering::Acquire);
-        let total_lat_us = self.shared.inclusion_latency_us_total.load(Ordering::Acquire);
+        let total_lat_us = self
+            .shared
+            .inclusion_latency_us_total
+            .load(Ordering::Acquire);
         let avg_inclusion_latency_ms = if included > 0 {
             (total_lat_us as f64 / included as f64) / 1000.0
         } else {
             0.0
         };
         let depth_finalized = self.shared.depth_finalized.load(Ordering::Acquire);
-        let depth_finality_timeouts = self
-            .shared
-            .depth_finality_timeouts
-            .load(Ordering::Acquire);
+        let depth_finality_timeouts = self.shared.depth_finality_timeouts.load(Ordering::Acquire);
         let depth_lat_us = self
             .shared
             .depth_finality_latency_us_total
@@ -305,11 +305,7 @@ async fn worker_loop(
 /// This task loops forever; `Tracker::drain` calls `JoinHandle::abort`
 /// to shut it down cleanly. Aborting a task parked in `sleep` is a
 /// no-op from the task's perspective — the tokio runtime drops it.
-async fn head_watcher_loop(
-    client: RpcClient,
-    finality: FinalityOptions,
-    shared: Arc<SharedState>,
-) {
+async fn head_watcher_loop(client: RpcClient, finality: FinalityOptions, shared: Arc<SharedState>) {
     loop {
         if let Ok(head) = client.block_number().await {
             shared.latest_head.store(head, Ordering::Release);
@@ -471,7 +467,9 @@ mod tests {
 
         assert_eq!(shared.depth_finalized.load(Ordering::Acquire), 1);
         assert_eq!(shared.depth_finality_timeouts.load(Ordering::Acquire), 0);
-        let total = shared.depth_finality_latency_us_total.load(Ordering::Acquire);
+        let total = shared
+            .depth_finality_latency_us_total
+            .load(Ordering::Acquire);
         // Latency is elapsed since `submitted` and must be >= the 40ms
         // we waited for the head bump.
         assert!(total >= 40_000, "latency {total}us below 40ms floor");

@@ -156,9 +156,7 @@ mod tests {
 
     #[test]
     fn verify_manifest_rejects_wrong_bundle_hash() {
-        let f = write_bytes(
-            br#"{"chainId":40204,"bundleSha256":"aa"}"#,
-        );
+        let f = write_bytes(br#"{"chainId":40204,"bundleSha256":"aa"}"#);
         assert!(verify_manifest(f.path(), 40204, "bb").is_err());
     }
 }

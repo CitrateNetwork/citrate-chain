@@ -80,11 +80,9 @@ async fn funder_transfer(
     let signed = tx.sign(&funder)?;
     match client.send_raw_transaction(&signed.raw_hex()).await? {
         citrate_bench::rpc::SendRawOutcome::Accepted(h) => Ok(h),
-        citrate_bench::rpc::SendRawOutcome::Rejected { code, message } => {
-            Err(citrate_bench::Error::Rpc(format!(
-                "funder transfer rejected ({code}): {message}"
-            )))
-        }
+        citrate_bench::rpc::SendRawOutcome::Rejected { code, message } => Err(
+            citrate_bench::Error::Rpc(format!("funder transfer rejected ({code}): {message}")),
+        ),
     }
 }
 
@@ -101,24 +99,20 @@ async fn wait_for_receipt(client: &RpcClient, hash: &str, timeout_secs: u64) -> 
     }
 }
 
-fn make_keystores(
-    dir: &std::path::Path,
-    count: usize,
-    passphrase: &str,
-) -> Vec<[u8; 20]> {
+fn make_keystores(dir: &std::path::Path, count: usize, passphrase: &str) -> Vec<[u8; 20]> {
     use rand::rngs::OsRng;
     let mut addresses = Vec::with_capacity(count);
     for i in 1..=count {
         let name = format!("bench-{i:02}");
         let mut rng = OsRng;
-        let (key_bytes, filename) = eth_keystore::new(dir, &mut rng, passphrase, Some(&name))
-            .expect("new keystore");
+        let (key_bytes, filename) =
+            eth_keystore::new(dir, &mut rng, passphrase, Some(&name)).expect("new keystore");
         let target = dir.join(&name);
         if !target.exists() {
             std::fs::rename(dir.join(&filename), &target).expect("rename");
         }
-        let signer = citrate_bench::signers::Signer::from_key_bytes(&key_bytes)
-            .expect("signer from raw");
+        let signer =
+            citrate_bench::signers::Signer::from_key_bytes(&key_bytes).expect("signer from raw");
         addresses.push(signer.address);
     }
     addresses
@@ -172,7 +166,11 @@ async fn broadcast_against_live_anvil() {
     // 3. Load signers via the keystore public API.
     let signers = keystore::load_many(
         dir.path(),
-        &["bench-01".to_string(), "bench-02".to_string(), "bench-03".to_string()],
+        &[
+            "bench-01".to_string(),
+            "bench-02".to_string(),
+            "bench-03".to_string(),
+        ],
         &keystore::PassphraseSource::Literal(passphrase.to_string()),
     )
     .expect("load_many");
@@ -192,10 +190,7 @@ async fn broadcast_against_live_anvil() {
             .expect("nonce");
         starting_nonces.push(n);
     }
-    let pool = Arc::new(
-        SignerPool::new(signers, starting_nonces.clone(), 50)
-            .expect("pool"),
-    );
+    let pool = Arc::new(SignerPool::new(signers, starting_nonces.clone(), 50).expect("pool"));
 
     // 5. Build + run the broadcast loop.
     let workload: Arc<dyn WorkloadClass> = Arc::new(SimpleTransfer::default_bench());
@@ -229,7 +224,11 @@ async fn broadcast_against_live_anvil() {
     assert!(result.signed_ok > 0);
     assert_eq!(result.signing_errors, 0);
     let b = result.broadcast.expect("broadcast result");
-    assert_eq!(b.rpc_rejected, 0, "unexpected rejections: {:?}", b.rejected_reasons);
+    assert_eq!(
+        b.rpc_rejected, 0,
+        "unexpected rejections: {:?}",
+        b.rejected_reasons
+    );
     assert!(
         b.tracker_stats.included > 0,
         "no txs were included: {:?}",

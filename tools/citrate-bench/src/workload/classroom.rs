@@ -106,7 +106,10 @@ mod tests {
 
     #[test]
     fn name_is_stable() {
-        assert_eq!(ClassroomTransferStudent::default_bench().name(), "classroom");
+        assert_eq!(
+            ClassroomTransferStudent::default_bench().name(),
+            "classroom"
+        );
     }
 
     #[test]
