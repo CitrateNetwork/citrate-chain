@@ -4,6 +4,7 @@ pragma solidity ^0.8.26;
 import {Test} from "forge-std/Test.sol";
 import {DeployAll} from "../../script/DeployAll.s.sol";
 import {TreasuryGovernor} from "../../src/TreasuryGovernor.sol";
+import {SaltSupply} from "../../src/lib/SaltSupply.sol";
 
 /// TreasuryGovernor as deployed by DeployAll must count quorum against the
 /// canonical SALT supply: 1,000,000,000,000 SALT, 18 decimals, the value of
@@ -26,6 +27,12 @@ contract DeployAllGovernorSupplyTest is Test {
 
     function test_governorSupplyBasis_isCanonicalSupply() public view {
         assertEq(governor.totalSaltSupply(), CANON_SUPPLY, "governor supply basis = 1T SALT canon");
+    }
+
+    /// The shared constant is pinned to the canon here and to the Rust
+    /// constant by scripts/ci/salt_supply_tripwire.sh.
+    function test_saltSupplyConstant_isCanon() public pure {
+        assertEq(SaltSupply.TOTAL_SUPPLY, CANON_SUPPLY);
     }
 
     function test_governorQuorum_isTenPercentOfCanon() public view {

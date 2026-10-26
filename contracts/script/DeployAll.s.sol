@@ -38,6 +38,7 @@ import "../src/StablecoinTreasury.sol";
 import "../src/BulkComputeGateway.sol";
 import "../src/TestnetFarmingAccounting.sol";
 import "../src/TreasuryGovernor.sol";
+import {SaltSupply} from "../src/lib/SaltSupply.sol";
 
 // Learning
 import "../src/LearningPool.sol";
@@ -461,19 +462,19 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
             address(stakingPool),
             address(treasury),
             guardian, // guardian (PBA-L2-001: set GUARDIAN to the multisig)
-            1_000_000_000 ether // total SALT supply (1B)
+            SaltSupply.TOTAL_SUPPLY // canonical SALT supply (quorum basis)
         )))
             ? TreasuryGovernor(payable(_create2Address("TreasuryGovernor", abi.encodePacked(type(TreasuryGovernor).creationCode, abi.encode(
             address(stakingPool),
             address(treasury),
             guardian, // guardian (PBA-L2-001: set GUARDIAN to the multisig)
-            1_000_000_000 ether // total SALT supply (1B)
+            SaltSupply.TOTAL_SUPPLY // canonical SALT supply (quorum basis)
         )))))
             : new TreasuryGovernor{salt: Salts.salt("TreasuryGovernor")}(
             address(stakingPool),
             address(treasury),
             guardian, // guardian (PBA-L2-001: set GUARDIAN to the multisig)
-            1_000_000_000 ether // total SALT supply (1B)
+            SaltSupply.TOTAL_SUPPLY // canonical SALT supply (quorum basis)
         ));
         console.log("  TreasuryGovernor:", address(governor));
 
