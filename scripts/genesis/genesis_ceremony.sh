@@ -40,8 +40,11 @@
 #
 # Signing: --account NAME (Foundry keystore) and optionally --password-file PATH, which every
 # broadcasting phase gets, P2's regenesis.sh included (as the path; neither script reads or
-# prints the file). A raw key (--private-key, or PRIVATE_KEY/DEPLOYER_PRIVATE_KEY in the
-# environment) and a password on the command line (--password) are refused.
+# prints the file). The file must be a regular file of this user, mode 0600 or 0400, not a
+# symlink, in a directory only its owner can change; it is re-checked, and must be the same
+# file, before every signing step. A raw key (--private-key, or PRIVATE_KEY/
+# DEPLOYER_PRIVATE_KEY in the environment) and a password on the command line (--password)
+# are refused.
 #
 # Inputs (env). Values marked OPEN are owner decisions recorded in the runbook §2:
 #   RPC_URL, DEPLOYER_ADDRESS, EXPECTED_CHAIN_ID (40204), EXPECTED_GENESIS_HASH (from the cut)
@@ -182,10 +185,12 @@ done
 refuse_raw_keys
 # The keystore password reaches forge (P1/P3/P4) and regenesis.sh (P2) only as this path. The
 # value is not echoed on refusal: a caller that passed the password itself in its place must
-# not see it in the log.
+# not see it in the log. The file must be private to this user (lib.sh password_file_check);
+# its identity is kept so each signing step can require the very file accepted here.
+PASSWORD_FILE_ID=""
 if [[ -n "$PASSWORD_FILE" ]]; then
   [[ -n "$ACCOUNT" ]] || die "--password-file needs --account (it unlocks that keystore)" 1
-  [[ -f "$PASSWORD_FILE" && -r "$PASSWORD_FILE" ]] || die "--password-file must name a readable file (the path to the keystore password, not the password)" 1
+  PASSWORD_FILE_ID=$(password_file_check "$PASSWORD_FILE") || die "$PASSWORD_FILE_ID" 1
 fi
 
 # The one output directory, as forge sees it (relative to contracts/) and as this script
@@ -281,6 +286,10 @@ forge_phase() {
   if [[ "$MODE" == dry ]]; then
     describe_cmd "(cd contracts &&" "$FORGE" "${args[@]}" ")"
     return 0
+  fi
+  if [[ "$MODE" == confirm && -n "$PASSWORD_FILE" ]]; then
+    local why
+    why=$(password_file_check "$PASSWORD_FILE" "$PASSWORD_FILE_ID") || gate_fail "$phase" "$why"
   fi
   if [[ "$MODE" == confirm ]]; then SENT_PHASE="$phase"; fi
   (cd "$CONTRACTS" && "$FORGE" "${args[@]}") || step_fail "$phase" "$script"
@@ -944,6 +953,9 @@ if should P2; then
       RPC_URL="$RPC_URL" bash "$EMITTER" >"$OUT/stack-book.record.log" 2>&1 ||
         gate_fail P2 "the generator failed over this run's broadcasts (see $OUT/stack-book.record.log)"
     else
+      if [[ "$MODE" == confirm && -n "$PASSWORD_FILE" ]]; then
+        why=$(password_file_check "$PASSWORD_FILE" "$PASSWORD_FILE_ID") || gate_fail P2 "$why"
+      fi
       if [[ "$MODE" == confirm ]]; then SENT_PHASE=P2; fi
       RPC_URL="$RPC_URL" bash "$REGENESIS" "${rargs[@]}" || step_fail P2 regenesis.sh
     fi
