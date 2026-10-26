@@ -75,7 +75,7 @@ jobs:
         #
         # RUSTSEC-2026-0387 (crypto-bigint < 0.7.6): multiple timing
         #   variability issues in operations intended to be constant-time.
-        #   EXPIRES 2026-11-09. elliptic-curve 0.13 requires crypto-bigint
+        #   EXPIRES 2027-01-31 (owner-approved). elliptic-curve 0.13 requires crypto-bigint
         #   ^0.5; the fix is in the 0.14 curve line, held back upstream
         #   (revm-precompile, openmls_rust_crypto and bip32 still require the
         #   0.13 line). Guard: the step above, scripts/ci/check_crypto_bigint_users.py.

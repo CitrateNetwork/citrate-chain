@@ -28,7 +28,7 @@ import tomllib
 from datetime import date, timedelta
 
 ADVISORY = "RUSTSEC-2026-0387"
-EXPIRES = date(2026, 11, 9)
+EXPIRES = date(2027, 1, 31)
 FIXED = (0, 7, 6)
 ALLOWED_USER = "elliptic-curve"
 ALLOWED_USER_LINE = (0, 13)
@@ -66,8 +66,6 @@ def lock_users(lock: dict) -> tuple[list[str], bool]:
 
 def check_all(locks: dict[str, dict], today: date) -> list[str]:
     """Return the failures across every lockfile (path -> parsed lock); empty = pass."""
-    # RED STUB: today's behaviour, only the root Cargo.lock is read.
-    locks = {k: v for k, v in locks.items() if k == "Cargo.lock"}
     errors = []
     if today > EXPIRES:
         errors.append(f"the {ADVISORY} ignore expired on {EXPIRES}: decide again")
