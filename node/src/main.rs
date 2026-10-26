@@ -2219,23 +2219,21 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // enforces stake-gated proposer membership — a shared selector is attached to the DAG
     // store (admission gate) and rebuilt each epoch from the registry (registry_sync).
     // OFF by default (env unset) → no selector, no behavior change.
-    let validator_registry: Option<([u8; 20], u64)> = std::env::var("CITRATE_VALIDATOR_REGISTRY")
-        .ok()
-        .and_then(|reg_hex| match hex::decode(reg_hex.trim().trim_start_matches("0x")) {
-            Ok(bytes) if bytes.len() == 20 => {
-                let mut registry = [0u8; 20];
-                registry.copy_from_slice(&bytes);
-                let activation_height = std::env::var("CITRATE_VALIDATOR_ACTIVATION_HEIGHT")
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u64>().ok())
-                    .unwrap_or(0);
-                Some((registry, activation_height))
-            }
-            _ => {
-                warn!("CITRATE_VALIDATOR_REGISTRY set but not a valid 0x-hex 20-byte address; stake-gating DISABLED");
-                None
-            }
-        });
+    // On the r1006 genesis with its producer set filled, the registry and the activation
+    // height are compiled into the genesis profile (genesis::resolve_validator_registry);
+    // the env may only repeat them. On any other chain the env decides, as before.
+    let compiled_validator_set = if running_genesis == Some(citrate_consensus::hardening::R1006_GENESIS)
+    {
+        citrate_economics::r1006::validator_set_binding()
+            .map_err(|e| anyhow::anyhow!("invalid r1006 genesis: {e}"))?
+    } else {
+        None
+    };
+    let validator_registry: Option<([u8; 20], u64)> = genesis::resolve_validator_registry(
+        compiled_validator_set,
+        std::env::var("CITRATE_VALIDATOR_REGISTRY").ok().as_deref(),
+        std::env::var("CITRATE_VALIDATOR_ACTIVATION_HEIGHT").ok().as_deref(),
+    )?;
     // VALIDATOR-S1 §R': fail fast if the activation height is below the FIRST
     // materialized snapshot S(1) = EPOCH - SNAPSHOT_LAG (= 800). Below S(1) no epoch
     // policy is ever materialized, so — with the §R' hard-reject — every block at/above

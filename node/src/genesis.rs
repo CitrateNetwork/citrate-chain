@@ -152,6 +152,59 @@ pub fn r1006_boot_guard(
     )
 }
 
+/// The ValidatorRegistry and activation height a node enforces. On the r1006 genesis with
+/// its producer set filled, both are compiled (`compiled`): the env values
+/// `CITRATE_VALIDATOR_REGISTRY` / `CITRATE_VALIDATOR_ACTIVATION_HEIGHT` may only repeat
+/// them, and anything else refuses to start (a per-node value would split the fleet's
+/// view of who may propose). Otherwise (`compiled` = None) the env decides, as before.
+pub fn resolve_validator_registry(
+    compiled: Option<([u8; 20], u64)>,
+    env_registry: Option<&str>,
+    env_activation: Option<&str>,
+) -> anyhow::Result<Option<([u8; 20], u64)>> {
+    let parse_reg = |raw: &str| -> anyhow::Result<[u8; 20]> {
+        let b = hex::decode(raw.trim().trim_start_matches("0x"))
+            .map_err(|e| anyhow::anyhow!("CITRATE_VALIDATOR_REGISTRY {raw}: {e}"))?;
+        <[u8; 20]>::try_from(b.as_slice())
+            .map_err(|_| anyhow::anyhow!("CITRATE_VALIDATOR_REGISTRY {raw}: not 20 bytes"))
+    };
+    let parse_act = |raw: &str| -> anyhow::Result<u64> {
+        raw.trim()
+            .parse::<u64>()
+            .map_err(|e| anyhow::anyhow!("CITRATE_VALIDATOR_ACTIVATION_HEIGHT {raw}: {e}"))
+    };
+    match compiled {
+        Some((reg, act)) => {
+            if let Some(raw) = env_registry {
+                if parse_reg(raw)? != reg {
+                    anyhow::bail!(
+                        "CITRATE_VALIDATOR_REGISTRY={raw} is not the ValidatorRegistry the r1006 \
+                         genesis compiles (0x{}); remove it",
+                        hex::encode(reg)
+                    );
+                }
+            }
+            if let Some(raw) = env_activation {
+                if parse_act(raw)? != act {
+                    anyhow::bail!(
+                        "CITRATE_VALIDATOR_ACTIVATION_HEIGHT={raw} is not the r1006 genesis's \
+                         compiled activation height {act}; remove it"
+                    );
+                }
+            }
+            Ok(Some((reg, act)))
+        }
+        None => match env_registry {
+            None => Ok(None),
+            Some(raw) => {
+                let reg = parse_reg(raw)?;
+                let act = env_activation.map(parse_act).transpose()?.unwrap_or(0);
+                Ok(Some((reg, act)))
+            }
+        },
+    }
+}
+
 /// Whether the rehearsal opt-in is set in the environment (exactly `1`).
 pub fn r1006_rehearsal_from_env() -> bool {
     parse_r1006_rehearsal(std::env::var(R1006_REHEARSAL_ENV).ok().as_deref())
@@ -337,6 +390,28 @@ mod tests {
         assert!(g(Some("default"), Some(&unknown), &not_ready, false).is_ok());
         // The r1006 block 0 on another chain id: refused.
         assert!(r1006_boot_guard(1337, Some("r1006"), Some(&r1006), &ready, false).is_err());
+    }
+
+    #[test]
+    fn the_r1006_validator_set_is_compiled_not_per_node() {
+        let reg = [0xAB; 20];
+        let hex_reg = format!("0x{}", hex::encode(reg));
+        let c = Some((reg, 1_000));
+        assert_eq!(resolve_validator_registry(c, None, None).unwrap(), c);
+        assert_eq!(resolve_validator_registry(c, Some(&hex_reg), Some("1000")).unwrap(), c);
+        assert!(resolve_validator_registry(c, Some("0x".to_owned().as_str()), None).is_err());
+        let other = format!("0x{}", hex::encode([0xCD; 20]));
+        let e = resolve_validator_registry(c, Some(&other), None).unwrap_err().to_string();
+        assert!(e.contains("not the ValidatorRegistry the r1006"), "{e}");
+        let e = resolve_validator_registry(c, None, Some("800")).unwrap_err().to_string();
+        assert!(e.contains("compiled activation height 1000"), "{e}");
+        // Not compiled (another genesis, or a placeholder set): the env decides.
+        assert_eq!(resolve_validator_registry(None, None, None).unwrap(), None);
+        assert_eq!(
+            resolve_validator_registry(None, Some(&other), Some("2000")).unwrap(),
+            Some(([0xCD; 20], 2000))
+        );
+        assert!(resolve_validator_registry(None, Some("zz"), None).is_err());
     }
 
     #[test]

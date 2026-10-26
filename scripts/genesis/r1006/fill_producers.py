@@ -216,7 +216,7 @@ def main(argv):
         "address_book": "book.json" if BOOK.exists() else None,
         "orangeseed": ORANGESEED if alloc.get("orangeseed") else None,
         "validator_registry": alloc["validatorRegistry"],
-        "validator_activation_height": 0,
+        "validator_activation_height": 1000,  # R1006_VALIDATOR_ACTIVATION_HEIGHT (>= S(1)=800; the registrations' epoch 1)
         "validators": [{"proposer_pubkey": v["proposer_pubkey"], "staker": v["staker"], "stake_wei": v["stake_wei"]}
                        for v in validators],
         "validators_at_genesis": True,

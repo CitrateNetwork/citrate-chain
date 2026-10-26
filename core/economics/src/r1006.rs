@@ -288,6 +288,23 @@ fn parse_alloc() -> Result<(AllocFile, Vec<GenesisAccount>), GenesisError> {
     Ok((f, accounts))
 }
 
+/// The height from which r1006 enforces the stake-gated producer set: the start of epoch
+/// 1, which is the activation epoch the registry records for every producer registered at
+/// block 0 (`firstEpochAfterSnapshot(0)`), and at or above the first snapshot S(1)=800 the
+/// node requires. Compiled, never a per-node setting.
+pub const R1006_VALIDATOR_ACTIVATION_HEIGHT: u64 = 1_000;
+
+/// The ValidatorRegistry the compiled r1006 genesis registers its producers in, and the
+/// activation height, when the producer set is filled (`None` while it is a placeholder).
+pub fn validator_set_binding() -> Result<Option<([u8; 20], u64)>, GenesisError> {
+    let (f, _) = parse_alloc()?;
+    let v = parse_validators()?;
+    if v.status != "final" || v.registry.is_none() {
+        return Ok(None);
+    }
+    Ok(Some((address(&f.validator_registry)?.0, R1006_VALIDATOR_ACTIVATION_HEIGHT)))
+}
+
 /// What the compiled r1006 genesis still waits for.
 pub fn readiness() -> Result<Readiness, GenesisError> {
     let (f, accounts) = parse_alloc()?;
