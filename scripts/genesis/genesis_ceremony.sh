@@ -38,7 +38,9 @@
 #   --from and --only. Only the fresh-deployer nonce-0 check is limited to a new ceremony
 #   (no --from/--only).
 #
-# Signing: --account NAME (Foundry keystore) and optionally --password-file PATH. A raw key
+# Signing: --account NAME (Foundry keystore) and optionally --password-file PATH: a regular
+# file of this user, mode 0600 or 0400, not a symlink, in a directory only its owner can change;
+# it is re-checked, and must be the same file, before every signing step. A raw key
 # (--private-key, or PRIVATE_KEY/DEPLOYER_PRIVATE_KEY in the environment) is refused.
 #
 # Inputs (env). Values marked OPEN are owner decisions recorded in the runbook §2:
@@ -171,6 +173,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 refuse_raw_keys
+# The keystore password file must be private to this user (lib.sh password_file_check). Its
+# identity is kept so each signing step can require the very file accepted here.
+PASSWORD_FILE_ID=""
+if [[ -n "$PASSWORD_FILE" ]]; then
+  PASSWORD_FILE_ID=$(password_file_check "$PASSWORD_FILE") || die "$PASSWORD_FILE_ID" 1
+fi
 
 # The one output directory, as forge sees it (relative to contracts/) and as this script
 # sees it (absolute). Lexical normalisation only, so it works before the directory exists.
@@ -265,6 +273,10 @@ forge_phase() {
   if [[ "$MODE" == dry ]]; then
     describe_cmd "(cd contracts &&" "$FORGE" "${args[@]}" ")"
     return 0
+  fi
+  if [[ "$MODE" == confirm && -n "$PASSWORD_FILE" ]]; then
+    local why
+    why=$(password_file_check "$PASSWORD_FILE" "$PASSWORD_FILE_ID") || gate_fail "$phase" "$why"
   fi
   if [[ "$MODE" == confirm ]]; then SENT_PHASE="$phase"; fi
   (cd "$CONTRACTS" && "$FORGE" "${args[@]}") || step_fail "$phase" "$script"

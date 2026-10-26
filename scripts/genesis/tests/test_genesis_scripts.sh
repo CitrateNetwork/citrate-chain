@@ -642,6 +642,32 @@ expect "ceremony: a password file in a world-writable directory is refused" 1 '-
 expect "ceremony: a password file in a group-writable directory is refused" 1 '--password-file must sit in a directory only its owner can change' -- "${CEENV[@]}" bash "$CE" --account deployer --password-file "$PWD_DIR/grp/pw"
 expect "ceremony: a password file in a sticky world-writable directory is accepted" 0 'done \(mode=dry\)' -- "${CEENV[@]}" bash "$CE" --account deployer --password-file "$PWD_DIR/sticky/pw"
 chmod 700 "$PWD_DIR/open" "$PWD_DIR/sticky" "$PWD_DIR/grp"
+# Tripwire: every script under scripts/genesis/ and scripts/ops/ that takes --password-file runs
+# it through the shared check (password_file_check or secret_file_check.py). Negative control: a
+# script that takes the flag and only tests -f is flagged.
+pwfile_unchecked() { # <file...>: prints each file that parses --password-file without the check
+  local f
+  for f in "$@"; do
+    [[ -f "$f" ]] || continue
+    if grep -qE -- '--password-file\)' "$f" && ! grep -qE 'password_file_check|secret_file_check\.py' "$f"; then
+      printf '%s\n' "$f"
+    fi
+  done
+}
+mkdir -p "$T/tw"
+printf '#!/usr/bin/env bash\ncase "$1" in\n  --password-file) PF="$2"; shift 2 ;;\nesac\n[[ -f "$PF" ]] || exit 1\n' >"$T/tw/unchecked.sh"
+printf '#!/usr/bin/env bash\ncase "$1" in\n  --password-file) PF="$2"; shift 2 ;;\nesac\nPF_ID=$(password_file_check "$PF") || exit 1\n' >"$T/tw/checked.sh"
+if [[ "$(pwfile_unchecked "$T/tw/unchecked.sh" "$T/tw/checked.sh")" == "$T/tw/unchecked.sh" ]]; then
+  ok "tripwire: a script that takes --password-file without the shared check is flagged (negative control)"
+else
+  bad "tripwire: a script that takes --password-file without the shared check is flagged (negative control)" "$(pwfile_unchecked "$T/tw/unchecked.sh" "$T/tw/checked.sh")"
+fi
+tw=$(pwfile_unchecked "$G"/*.sh "$G/../ops"/*.sh)
+if [[ -z "$tw" ]]; then
+  ok "tripwire: every genesis/ops script that takes --password-file runs the shared check"
+else
+  bad "tripwire: every genesis/ops script that takes --password-file runs the shared check" "$tw"
+fi
 # A refusal names neither the path nor the content.
 out=$("${CEENV[@]}" bash "$CE" --account deployer --password-file "$(pwfile leak 644)" 2>&1)
 if grep -qF "$PWD_DIR" <<<"$out" || grep -qF 'not-a-real-password' <<<"$out"; then
