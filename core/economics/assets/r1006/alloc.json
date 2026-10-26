@@ -4,6 +4,7 @@
  "inputsStatus": "placeholder",
  "inputsSha256": "0a280d9e27c8d21683cc99d5710e5893affdd74bed9cad5bbfda02b0fe4e6a5b",
  "validatorRegistry": "0xf511327ef586908bc34990621e3624d5de4131cd",
+ "baseAllocations": null,
  "orangeseed": {
   "proxy": "0x000000000000000000000000000000c17a7e5eed",
   "implementation": "0x000000000000000000000000000000c17a7e5ee0"

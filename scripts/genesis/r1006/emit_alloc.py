@@ -48,15 +48,49 @@ def norm_qty(v):
     return hex(int(v, 16))
 
 
+VALUE_OK = re.compile(r"^(0x[0-9a-fA-F]{40}(,0x[0-9a-fA-F]{40})*|[0-9]{1,40}|placeholder|final)$")
+SALT = 10**18
+# r1006 base allocations when the inputs name fresh base accounts (owner decision
+# 2026-10-26: fresh keys, no account that transacted on an earlier 40204 chain is funded).
+# The amounts keep r1005's 585B pre-allocation: TREASURY takes r1005's treasury (500B),
+# reserve (50B), deployer (10B) and validator (5B) shares; FAUCET and TEAM keep 10B each.
+BASE_AMOUNTS = {"BASE_TREASURY": 565_000_000_000, "BASE_FAUCET": 10_000_000_000, "BASE_TEAM": 10_000_000_000}
+
+
+def check_inputs(path):
+    """The inputs file holds addresses and numbers only: never key material."""
+    vals = {}
+    for n, line in enumerate(open(path, encoding="utf-8").read().splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        k, eq, v = line.partition("=")
+        if not eq or not re.match(r"^[A-Z0-9_]+$", k):
+            fail(f"{path}:{n}: not KEY=VALUE")
+        if re.search(r"0x[0-9a-fA-F]{64}", v) or re.search(r"\b[0-9a-fA-F]{64}\b", v):
+            fail(f"{path}:{n}: {k} holds a 32-byte hex value; the inputs file must never hold key material")
+        if not VALUE_OK.match(v):
+            fail(f"{path}:{n}: {k} is not an address, an address list or a number")
+        vals[k] = v
+    return vals
+
+
 def read_inputs(path):
     raw = open(path, "rb").read()
-    status = None
-    for line in raw.decode().splitlines():
-        if line.startswith("R1006_INPUTS_STATUS="):
-            status = line.split("=", 1)[1].strip()
+    vals = check_inputs(path)
+    status = vals.get("R1006_INPUTS_STATUS")
     if status not in ("placeholder", "final"):
         fail("inputs file must set R1006_INPUTS_STATUS=placeholder|final")
-    return status, hashlib.sha256(raw).hexdigest()
+    base = None
+    if any(k in vals for k in BASE_AMOUNTS):
+        missing = [k for k in BASE_AMOUNTS if k not in vals]
+        if missing:
+            fail(f"inputs name some base accounts but not {missing}")
+        base = [{"role": k[5:].lower(), "address": vals[k].lower(), "balance": hex(BASE_AMOUNTS[k] * SALT)}
+                for k in BASE_AMOUNTS]
+    elif status == "final":
+        fail("final inputs must name the fresh base accounts (BASE_TREASURY, BASE_FAUCET, BASE_TEAM)")
+    return status, hashlib.sha256(raw).hexdigest(), base
 
 
 def keccak_hex(data):
@@ -66,6 +100,10 @@ def keccak_hex(data):
 
 
 def main():
+    if sys.argv[1:2] == ["--check-inputs"] and len(sys.argv) == 3:
+        check_inputs(sys.argv[2])
+        print(f"emit_alloc: {sys.argv[2]}: addresses and numbers only")
+        return
     ap = argparse.ArgumentParser()
     ap.add_argument("--dump", required=True)
     ap.add_argument("--inputs", required=True)
@@ -82,7 +120,7 @@ def main():
     deployer = json.load(open(a.manifest))["deployer"].lower()
     if not ADDR.match(deployer):
         fail(f"bad deployer {deployer!r} in the manifest")
-    status, inputs_sha = read_inputs(a.inputs)
+    status, inputs_sha, base = read_inputs(a.inputs)
     vr = json.load(open(a.book))["contracts"]["ValidatorRegistry"].lower()
     if not ADDR.match(vr):
         fail(f"bad ValidatorRegistry {vr!r} in the book")
@@ -163,6 +201,7 @@ def main():
         "inputsStatus": status,
         "inputsSha256": inputs_sha,
         "validatorRegistry": vr,
+        "baseAllocations": base,
         "orangeseed": orangeseed,
         "deployer": deployer,
         "accounts": accounts,

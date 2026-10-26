@@ -126,7 +126,17 @@ else
 fi
 
 mkdir -p "$REPO/contracts/genesis"
-cp "$WORK/book/p5-admin-book.json" "$REPO/contracts/genesis/p5-admin-book.json"
+# The P5 book plus the OrangeSeed accounts (in block 0 from the alloc, never in a P5 book):
+# both go through the same FACTORY-ADMIN / DEPLOYER-ADMIN sweep.
+python3 - "$WORK/book/p5-admin-book.json" "$ALLOC" "$REPO/contracts/genesis/p5-admin-book.json" <<'PY'
+import json, sys
+book, alloc = json.load(open(sys.argv[1])), json.load(open(sys.argv[2]))
+o = alloc.get("orangeseed")
+if o:
+    book.setdefault("contracts", {})["OrangeSeed"] = o["proxy"]
+    book["contracts"]["OrangeSeedV0"] = o["implementation"]
+json.dump(book, open(sys.argv[3], "w"), indent=2)
+PY
 # The admin sweep reads role STATE (hasRole, owner, admin slots) and role HISTORY (events).
 # A genesis chain has no events: its contracts were never deployed by a transaction, so the
 # history-based lines (TIMELOCK-HOLDERS, GENESIS-FLOOR's veto lookup) have nothing to read

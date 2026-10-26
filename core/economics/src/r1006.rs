@@ -19,7 +19,7 @@ use citrate_execution::types::Address;
 use primitive_types::U256;
 use serde::Deserialize;
 use sha3::{Digest, Keccak256};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// The ceremony-state allocation (see the module docs).
 pub const R1006_ALLOC_JSON: &str = include_str!("../assets/r1006/alloc.json");
@@ -89,6 +89,9 @@ struct AllocFile {
     inputs_sha256: String,
     /// The ceremony's ValidatorRegistry (the producer set is registered there).
     validator_registry: String,
+    /// The base allocations (fresh accounts, from final inputs). `null` for placeholder
+    /// inputs: the rehearsal then carries r1005's testnet_beta set.
+    base_allocations: Option<Vec<BaseAllocation>>,
     /// TYPED SLOT for the OrangeSeed accounts: `null` until the OrangeSeed artifacts
     /// (proxy + implementation code and storage, from its PR's GenesisOrangeSeed script)
     /// are merged in by `emit_alloc.py --orangeseed`. While `null` the genesis is not
@@ -97,6 +100,14 @@ struct AllocFile {
     #[allow(dead_code)]
     deployer: String,
     accounts: Vec<AllocAccount>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BaseAllocation {
+    role: String,
+    address: String,
+    balance: String,
 }
 
 #[derive(Deserialize)]
@@ -368,9 +379,35 @@ impl GenesisConfig {
             storage: solidity_string_slots(GENESIS_NOTE),
         });
         let taken: HashSet<[u8; 20]> = extra.iter().map(|a| a.address.0).collect();
-        let base = GenesisConfig::testnet_beta();
-        let mut accounts: Vec<GenesisAccount> = base
-            .accounts
+        let (base_accounts, treasury) = match &f.base_allocations {
+            // Final inputs: only the fresh base accounts (no account that transacted on an
+            // earlier 40204 chain is funded).
+            Some(b) => {
+                let mut v = Vec::with_capacity(b.len());
+                let mut treasury = None;
+                for e in b {
+                    let address = address(&e.address)?;
+                    if e.role == "treasury" {
+                        treasury = Some(address);
+                    }
+                    v.push(GenesisAccount {
+                        address,
+                        balance: quantity(&e.balance)?,
+                        nonce: 0,
+                        code: None,
+                        storage: vec![],
+                    });
+                }
+                let t = treasury.ok_or_else(|| invalid("base allocations name no treasury"))?;
+                (v, t)
+            }
+            // Placeholder inputs (rehearsal): r1005's testnet_beta set.
+            None => {
+                let b = GenesisConfig::testnet_beta();
+                (b.accounts, b.treasury_address)
+            }
+        };
+        let mut accounts: Vec<GenesisAccount> = base_accounts
             .into_iter()
             .filter(|a| !taken.contains(&a.address.0))
             .collect();
@@ -378,9 +415,9 @@ impl GenesisConfig {
         let mut cfg = GenesisConfig {
             chain_id: 40204,
             accounts,
-            treasury_address: base.treasury_address,
-            team_allocations: base.team_allocations,
-            ecosystem_fund: base.ecosystem_fund,
+            treasury_address: treasury,
+            team_allocations: HashMap::new(),
+            ecosystem_fund: treasury,
             mining_pool_max: U256::zero(),
         };
         let supply = U256::from(crate::TOTAL_SUPPLY)
@@ -500,6 +537,28 @@ mod tests {
             cfg.accounts.iter().all(|a| seen.insert(a.address.0)),
             "no duplicates"
         );
+    }
+
+    /// Final inputs fund only the fresh base accounts: none of r1005's testnet_beta
+    /// accounts (which transacted on an earlier 40204 chain) is in the genesis.
+    #[test]
+    fn final_base_allocations_replace_the_r1005_accounts() {
+        let (f, _) = parse_alloc().expect("alloc");
+        let cfg = GenesisConfig::r1006().expect("r1006");
+        let r1005: Vec<Address> = GenesisConfig::testnet_beta()
+            .accounts
+            .iter()
+            .map(|a| a.address)
+            .filter(|a| *a != crate::genesis::ARACHNID_DETERMINISTIC_DEPLOYER_ADDRESS)
+            .collect();
+        let has_r1005 = cfg.accounts.iter().any(|a| r1005.contains(&a.address));
+        match &f.base_allocations {
+            Some(b) => {
+                assert!(!has_r1005, "an r1005 account is funded in a final r1006 genesis");
+                assert_eq!(b.len(), 3);
+            }
+            None => assert!(has_r1005, "the rehearsal carries the testnet_beta set"),
+        }
     }
 
     #[test]

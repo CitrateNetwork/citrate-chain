@@ -36,6 +36,7 @@ DEPLOYER_LABEL="citrate-r1006-genesis-ceremony-deployer-v1 (throwaway, public)"
 DEV_FUNDER_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 DEPLOYER_FUNDING=5000ether
 RPC_PORT=18545
+PROXY_PORT=18555
 # Block rewards on the devnet go here (public, no code; not carried into the alloc).
 DEVNET_COINBASE=c17a7e0000000000000000000000000000de7e01
 P2P_PORT=30399
@@ -72,6 +73,7 @@ case "$cmd" in
     [[ -x "$NODE" && -x "$DUMP" ]] || die "--node and --state-dump must be executables"
     [[ -n "$WORK" && -d "$WORK" && -z "$(ls -A "$WORK")" ]] || die "--work must be an existing EMPTY directory (mktemp -d)"
     [[ -f "$INPUTS" ]] || die "inputs file $INPUTS not found"
+    python3 "$HERE/emit_alloc.py" --check-inputs "$INPUTS" >&2 || die "the inputs file must hold public addresses only"
     WORK="$(cd "$WORK" && pwd)"
     command -v unshare >/dev/null || die "unshare is required"
     for t in forge cast jq ip; do command -v "$t" >/dev/null || die "$t is required"; done
@@ -121,7 +123,11 @@ mkdir -p "$HOME" "$WORK/bin" "$WORK/devnet-data"
 chmod 700 "$HOME"
 ln -sf "$HERE/forge_resume.sh" "$WORK/bin/forge"
 export R1006_REAL_FORGE="$REAL_FORGE" PATH="$WORK/bin:$PATH"
-RPC="http://127.0.0.1:$RPC_PORT"
+NODE_RPC="http://127.0.0.1:$RPC_PORT"
+# Everything talks to the node through the receipt-retry proxy (G-11): a null
+# eth_getTransactionByHash / eth_getTransactionReceipt for a mined transaction is
+# re-asked instead of reaching forge. Loopback only.
+RPC="http://127.0.0.1:$PROXY_PORT"
 c() { "$REAL_CAST" "$@" --rpc-url "$RPC"; }
 # csend ARGS...: `cast send` without waiting in cast (on a Citrate node cast's own receipt
 # polling can give up on a mined transaction, R1006_GAPS G-11), then poll the receipt here.
@@ -180,7 +186,7 @@ committee_size = 100
 quorum_threshold = 67
 EOF
 
-NODE_PID=""
+NODE_PID="" PROXY_PID=""
 stop_node() {
   if [[ -n "$NODE_PID" ]] && kill -0 "$NODE_PID" 2>/dev/null; then
     kill -TERM "$NODE_PID"
@@ -190,14 +196,21 @@ stop_node() {
   fi
   NODE_PID=""
 }
-trap stop_node EXIT
+trap 'stop_node; [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null; true' EXIT
 start_node() {
   # Blocks only when a transaction is pending: each ceremony transaction lands at a height
   # fixed by its position, so block-number and timestamp state is the same on every run.
   (cd "$WORK" && CITRATE_DEVNET_MINE_ON_DEMAND=1 exec "$NODE" --config "$WORK/devnet.toml") >>"$WORK/devnet.log" 2>&1 &
   NODE_PID=$!
-  for _ in $(seq 240); do c chain-id >/dev/null 2>&1 && return 0; sleep 0.5; done
-  die "devnet RPC did not come up (see $WORK/devnet.log)"
+  for _ in $(seq 240); do "$REAL_CAST" chain-id --rpc-url "$NODE_RPC" >/dev/null 2>&1 && break; sleep 0.5; done
+  "$REAL_CAST" chain-id --rpc-url "$NODE_RPC" >/dev/null 2>&1 || die "devnet RPC did not come up (see $WORK/devnet.log)"
+  if [[ -z "$PROXY_PID" ]]; then
+    python3 "$REPO/scripts/genesis/rpc_receipt_retry_proxy.py" --listen "$PROXY_PORT" --upstream "$NODE_RPC" \
+      >>"$WORK/proxy.log" 2>&1 &
+    PROXY_PID=$!
+  fi
+  for _ in $(seq 60); do c chain-id >/dev/null 2>&1 && return 0; sleep 0.5; done
+  die "the receipt-retry proxy did not come up (see $WORK/proxy.log)"
 }
 log "starting the ceremony devnet"
 start_node
@@ -235,40 +248,22 @@ CE=(env DEPLOYER_ADDRESS="$DEPLOYER" RPC_URL="$RPC" EXPECTED_CHAIN_ID=40204 EXPE
   TEAM_VESTING_FILE=genesis/team-vesting.input.json KEEP_LIST="$WORK/keep.placeholder.tsv" FLEET_RPCS="$RPC"
   bash "$REPO/scripts/genesis/genesis_ceremony.sh" --confirm --account r1006-ceremony --password-file "$PWF")
 
-log "ceremony P0-P3 (P4 stops for its inputs, by design)"
+log "ceremony P0-P3L (P4 stops for PATRONAGE_MEMBERSHIP, by design)"
 rc=0
 "${CE[@]}" >"$WORK/ceremony-1.log" 2>&1 || rc=$?
-grep -q 'P3 ' "$WORK/ceremony-1.log" && grep -q 'missing inputs: PATRONAGE_KYC_REGISTRY' "$WORK/ceremony-1.log" ||
-  die "ceremony P0-P3 did not reach P4's input check (exit $rc; see $WORK/ceremony-1.log)"
+grep -q 'P3L' "$WORK/ceremony-1.log" && grep -qE 'missing inputs:.*PATRONAGE_MEMBERSHIP' "$WORK/ceremony-1.log" ||
+  die "ceremony P0-P3L did not reach P4's input check (exit $rc; see $WORK/ceremony-1.log)"
 
-# P4 stand-ins (A-5 open): KYCRegistry and the coop MembershipSBT, both administered by
-# GOVERNANCE, deployed by the ceremony deployer in this fixed order.
-GOVERNANCE=$(jq -r '.contracts.GovernanceTimelock' "$REPO/contracts/genesis/governance.json")
-[[ "$GOVERNANCE" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "no GOVERNANCE in P1's book"
-# create TARGET CTOR_SIG ARGS...: deploy TARGET's compiled bytecode from the deployer with a
-# plain create transaction (csend: receipt polled here), at the address its nonce fixes.
-create() {
-  local target="$1" sig="$2" bc args n addr
-  shift 2
-  bc=$(cd "$REPO/contracts" && "$REAL_FORGE" inspect "$target" bytecode 2>>"$WORK/standins.log") || return 1
-  args=$("$REAL_CAST" abi-encode "$sig" "$@") || return 1
-  n=$(c nonce "$DEPLOYER")
-  addr=$("$REAL_CAST" compute-address "$DEPLOYER" --nonce "$n" | awk '{print $NF}' | tr 'A-F' 'a-f')
-  csend --account r1006-ceremony --password-file "$PWF" --legacy --gas-limit 8000000 --create "${bc}${args#0x}" \
-    >>"$WORK/standins.log" 2>&1 || return 1
-  [[ "$(c code "$addr")" != 0x ]] || return 1
-  echo "$addr"
-}
-log "P4 stand-ins under GOVERNANCE $GOVERNANCE"
-KYC=$(create src/KYCRegistry.sol:KYCRegistry "constructor(address,address)" "$PATRONAGE_KYC_UPDATER" "$GOVERNANCE")
-[[ "$KYC" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "KYCRegistry stand-in failed (see $WORK/standins.log)"
-MSBT=$(create src/coop/MembershipSBT.sol:MembershipSBT "constructor(address,bytes32[],address,address)" "$KYC" "[]" "$GOVERNANCE" "$PATRONAGE_REGISTRAR")
-[[ "$MSBT" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "MembershipSBT stand-in failed (see $WORK/standins.log)"
-printf '{"KYCRegistry":"%s","MembershipSBT":"%s"}\n' "$KYC" "$MSBT" >"$WORK/standins.json"
+# P4: PatronageLedger's membership is #331's canonical membership SBT (CitrateMemberSBT from
+# this run's P2 book; lead decision). Its KYC registry is P3L's KYCRegistry, which the
+# ceremony sets itself.
+MSBT=$(jq -r '.contracts.CitrateMemberSBT' "$REPO/contracts/addresses/40204.json")
+[[ "$MSBT" =~ ^0x[0-9a-fA-F]{40}$ && "$(c code "$MSBT")" != 0x ]] || die "no CitrateMemberSBT with code in P2's book"
+printf '{"PatronageMembership":"%s"}\n' "$MSBT" >"$WORK/p4-inputs.json"
 
-log "ceremony P4-P5 (P6 refuses the placeholder KEEP list, by design)"
+log "ceremony P4-P5 (P6 refuses the placeholder KEEP list, by design); PATRONAGE_MEMBERSHIP=$MSBT"
 rc=0
-env PATRONAGE_KYC_REGISTRY="$KYC" PATRONAGE_MEMBERSHIP="$MSBT" "${CE[@]}" --from P4 >"$WORK/ceremony-2.log" 2>&1 || rc=$?
+env PATRONAGE_MEMBERSHIP="$MSBT" "${CE[@]}" --from P4 >"$WORK/ceremony-2.log" 2>&1 || rc=$?
 grep -q 'P5 PASS: FACTORY-ADMIN 0, DEPLOYER-ADMIN 0' "$WORK/ceremony-2.log" ||
   die "P5 did not pass (exit $rc; see $WORK/ceremony-2.log)"
 log "P5 PASS: FACTORY-ADMIN 0, DEPLOYER-ADMIN 0"

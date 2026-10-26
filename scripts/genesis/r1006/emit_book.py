@@ -83,17 +83,20 @@ def main():
         fail("--work and --out are required (or --check)")
     book = json.load(open(f"{a.work}/book/40204.json"))
     extra = {}
-    for name in ("team-vesting.json", "dormant-ledgers.json"):
+    for name in ("team-vesting.json", "dormant-ledgers.json", "library.json"):
         extra.update(contracts_of(f"{a.work}/book/{name}"))
-    stand = json.load(open(f"{a.work}/standins.json"))
-    extra["PatronageKYCRegistry"] = stand["KYCRegistry"]
-    extra["PatronageMembershipSBT"] = stand["MembershipSBT"]
     contracts = dict(book.get("contracts", {}))
     for k, v in extra.items():
         if k in contracts and contracts[k].lower() != v.lower():
             fail(f"{k}: the stack book says {contracts[k]}, a phase book says {v}")
         contracts[k] = v.lower()
     book["contracts"] = contracts
+    # The OrangeSeed predeploy is in block 0 from the alloc, not from a deploy transaction.
+    os_rec = json.load(open(a.alloc)).get("orangeseed")
+    if os_rec:
+        g = book.setdefault("genesis", {})
+        g["OrangeSeed"] = os_rec["proxy"]
+        g["OrangeSeedV0"] = os_rec["implementation"]
     book["$schema"] = "../schema.json"
     book["deployedAt"] = GENESIS_ISO
     book["regenerator"] = "scripts/genesis/r1006/emit_book.py"

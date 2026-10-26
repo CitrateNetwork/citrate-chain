@@ -60,6 +60,18 @@ jq '.accounts[3].code = "0x60"' "$T/dump.json" >"$T/dump-bad.json"
 expect "emit_alloc refuses a deployer with code" 1 'deployer has code' -- \
   python3 "$HERE/emit_alloc.py" --dump "$T/dump-bad.json" --manifest "$T/manifest.json" --inputs "$T/inputs.env" --book "$T/book40204.json" --out "$T/a3.json"
 
+# ------------------------------------------------------------ inputs hold no key material
+printf 'R1006_INPUTS_STATUS=placeholder\nRELAYER=0x%040x\n' 7 >"$T/in-ok.env"
+expect "inputs check accepts addresses and numbers" 0 'addresses and numbers only' -- python3 "$HERE/emit_alloc.py" --check-inputs "$T/in-ok.env"
+printf 'R1006_INPUTS_STATUS=placeholder\nRELAYER_KEY=0x%064x\n' 7 >"$T/in-key.env"
+expect "inputs check refuses a 32-byte hex value (key material)" 1 'never hold key material' -- python3 "$HERE/emit_alloc.py" --check-inputs "$T/in-key.env"
+printf 'R1006_INPUTS_STATUS=placeholder\nRELAYER=%064x\n' 7 >"$T/in-key2.env"
+expect "inputs check refuses bare 64-hex (key material without 0x)" 1 'never hold key material' -- python3 "$HERE/emit_alloc.py" --check-inputs "$T/in-key2.env"
+expect "the committed placeholder inputs hold no key material" 0 'addresses and numbers only' -- python3 "$HERE/emit_alloc.py" --check-inputs "$HERE/inputs.placeholder.env"
+printf 'R1006_INPUTS_STATUS=final\n' >"$T/in-final.env"
+expect "final inputs without fresh base accounts are refused" 1 'must name the fresh base accounts' -- \
+  "${EA[@]/$T\/inputs.env/$T/in-final.env}" --out "$T/x.json"
+
 # ------------------------------------------------------------ OrangeSeed binding
 GOV=0x00000000000000000000000000000000000000c1
 printf '{"contracts":{"GovernanceTimelock":"%s"}}\n' "$GOV" >"$T/gov.json"
@@ -112,7 +124,6 @@ expect "check refuses the placeholder set" 1 'is a placeholder' -- "${FP[@]}" ch
 # ------------------------------------------------------------ emit_book
 mkdir -p "$T/bw/book"
 printf '{"$schema":"./schema.json","chainId":40204,"deployer":"%s","contracts":{"A":"0x00000000000000000000000000000000000000c1"},"precompiles":{"P":"0x0000000000000000000000000000000000000100"}}\n' "$DEP" >"$T/bw/book/40204.json"
-printf '{"KYCRegistry":"0x00000000000000000000000000000000000000c1","MembershipSBT":"0x00000000000000000000000000000000000000c1"}\n' >"$T/bw/standins.json"
 expect "emit_book writes a book whose every address has code (deployer and precompiles exempt)" 0 'every one has code' -- \
   python3 "$HERE/emit_book.py" --work "$T/bw" --alloc "$T/a1.json" --out "$T/book.json"
 jq '.contracts.B = "0x00000000000000000000000000000000000000c2"' "$T/book.json" >"$T/book-bad.json"
