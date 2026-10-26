@@ -39,6 +39,10 @@ pub struct FingerprintInputs<'a> {
     pub exact_create_code_height: Option<u64>,
     /// Appended to the pre-image only when set (chain#384).
     pub vrf_canonical_encoding_height: Option<u64>,
+    /// Appended to the pre-image only when set (chain#391).
+    pub supply_hardening_height: Option<u64>,
+    /// Appended to the pre-image only when set (chain#392).
+    pub storage_root_hardening_height: Option<u64>,
     pub value_transfer_activation_height: u64,
     pub create_nonce_fix_activation_height: u64,
     pub merge_depth_activation_height: u64,
@@ -113,6 +117,14 @@ pub fn fingerprint_preimage(i: &FingerprintInputs<'_>) -> String {
         Some(h) => format!("{preimage}vrf_canonical_encoding_height={h}\n"),
         None => preimage,
     };
+    let preimage = match i.supply_hardening_height {
+        Some(h) => format!("{preimage}supply_hardening_height={h}\n"),
+        None => preimage,
+    };
+    let preimage = match i.storage_root_hardening_height {
+        Some(h) => format!("{preimage}storage_root_hardening_height={h}\n"),
+        None => preimage,
+    };
     match i.genesis_binding {
         None => preimage,
         Some(b) => format!(
@@ -177,6 +189,13 @@ pub struct ConsensusManifest {
     /// the fingerprint only when set, so an unscheduled rule leaves the
     /// pre-image exactly as it was.
     pub vrf_canonical_encoding_height: Option<u64>,
+    /// Supply hardening fork height (`citrate_execution::supply_hardening`);
+    /// `None` = not activated. Part of the fingerprint only when set.
+    pub supply_hardening_height: Option<u64>,
+    /// Storage-root hardening fork height
+    /// (`citrate_execution::storage_root_hardening`); `None` = not activated.
+    /// Part of the fingerprint only when set.
+    pub storage_root_hardening_height: Option<u64>,
     /// Execution/consensus rules that switch on by height, as this process
     /// resolved them (compiled default or devnet env override). A node whose
     /// env overrides one of these computes different roots, so they are in the
@@ -211,8 +230,8 @@ impl ConsensusManifest {
         Self::for_height(height)
     }
 
-    /// The manifest for this binary under a given activation height (the agent
-    /// precompile fork height is read from the process store).
+    /// The manifest for this binary under a given PBA height (every other height is
+    /// read from its process store).
     pub fn for_height(pba_hardening_height: Option<u64>) -> Self {
         Self::for_heights(
             pba_hardening_height,
@@ -220,8 +239,7 @@ impl ConsensusManifest {
         )
     }
 
-    /// The manifest under explicit PBA and agent-fork activation heights (the
-    /// exact-created-code height is read from the process store).
+    /// Explicit PBA and agent-fork heights; the rest from the process stores.
     pub fn for_heights(
         pba_hardening_height: Option<u64>,
         agent_precompiles_height: Option<u64>,
@@ -233,8 +251,24 @@ impl ConsensusManifest {
         )
     }
 
-    /// The manifest under explicit PBA, agent-fork and canonical-VRF heights (the
-    /// exact-created-code height is read from the process store).
+    /// Explicit PBA, agent-fork, supply and storage-root heights (chain#391/#392).
+    pub fn for_supply_heights(
+        pba_hardening_height: Option<u64>,
+        agent_precompiles_height: Option<u64>,
+        supply_hardening_height: Option<u64>,
+        storage_root_hardening_height: Option<u64>,
+    ) -> Self {
+        Self::for_all(
+            pba_hardening_height,
+            agent_precompiles_height,
+            citrate_execution::exact_code::exact_create_code_height(),
+            citrate_consensus::vrf_encoding::vrf_canonical_encoding_height(),
+            supply_hardening_height,
+            storage_root_hardening_height,
+        )
+    }
+
+    /// Explicit PBA, agent-fork and canonical-VRF heights (chain#384).
     pub fn for_all_heights(
         pba_hardening_height: Option<u64>,
         agent_precompiles_height: Option<u64>,
@@ -248,8 +282,7 @@ impl ConsensusManifest {
         )
     }
 
-    /// The manifest under explicit PBA, agent-fork and exact-created-code
-    /// activation heights (the canonical-VRF height from the process store).
+    /// Explicit PBA, agent-fork and exact-created-code heights.
     pub fn for_activations(
         pba_hardening_height: Option<u64>,
         agent_precompiles_height: Option<u64>,
@@ -263,12 +296,32 @@ impl ConsensusManifest {
         )
     }
 
-    /// The manifest under every explicit activation height.
+    /// Explicit PBA, agent, exact-code and VRF heights; supply and storage-root from
+    /// their process stores.
     pub fn for_every_height(
         pba_hardening_height: Option<u64>,
         agent_precompiles_height: Option<u64>,
         exact_create_code_height: Option<u64>,
         vrf_canonical_encoding_height: Option<u64>,
+    ) -> Self {
+        Self::for_all(
+            pba_hardening_height,
+            agent_precompiles_height,
+            exact_create_code_height,
+            vrf_canonical_encoding_height,
+            citrate_execution::supply_hardening::supply_hardening_height(),
+            citrate_execution::storage_root_hardening::storage_root_hardening_height(),
+        )
+    }
+
+    /// The manifest under every explicit activation height.
+    pub fn for_all(
+        pba_hardening_height: Option<u64>,
+        agent_precompiles_height: Option<u64>,
+        exact_create_code_height: Option<u64>,
+        vrf_canonical_encoding_height: Option<u64>,
+        supply_hardening_height: Option<u64>,
+        storage_root_hardening_height: Option<u64>,
     ) -> Self {
         let version = env!("CARGO_PKG_VERSION");
         let git_sha = env!("CITRATE_GIT_SHA");
@@ -300,6 +353,8 @@ impl ConsensusManifest {
             agent_precompiles_height,
             exact_create_code_height,
             vrf_canonical_encoding_height,
+            supply_hardening_height,
+            storage_root_hardening_height,
             value_transfer_activation_height,
             create_nonce_fix_activation_height,
             merge_depth_activation_height,
@@ -321,6 +376,8 @@ impl ConsensusManifest {
             agent_precompiles_height,
             exact_create_code_height,
             vrf_canonical_encoding_height,
+            supply_hardening_height,
+            storage_root_hardening_height,
             value_transfer_activation_height,
             create_nonce_fix_activation_height,
             merge_depth_activation_height,
@@ -366,6 +423,8 @@ impl ConsensusManifest {
             agent_precompiles_height: self.agent_precompiles_height,
             exact_create_code_height: self.exact_create_code_height,
             vrf_canonical_encoding_height: self.vrf_canonical_encoding_height,
+            supply_hardening_height: self.supply_hardening_height,
+            storage_root_hardening_height: self.storage_root_hardening_height,
             value_transfer_activation_height: self.value_transfer_activation_height,
             create_nonce_fix_activation_height: self.create_nonce_fix_activation_height,
             merge_depth_activation_height: self.merge_depth_activation_height,
@@ -422,6 +481,18 @@ impl ConsensusManifest {
             self.vrf_canonical_encoding_height
                 .map(|h| format!("canonical from height {h}"))
                 .unwrap_or_else(|| "not scheduled".to_string())
+        );
+        println!(
+            "  supply hardening   {}",
+            self.supply_hardening_height
+                .map(|h| format!("from height {h}"))
+                .unwrap_or_else(|| "not activated".to_string())
+        );
+        println!(
+            "  storage root       {}",
+            self.storage_root_hardening_height
+                .map(|h| format!("hardened from height {h}"))
+                .unwrap_or_else(|| "not activated".to_string())
         );
         println!(
             "  value transfer     from height {}",
@@ -507,15 +578,40 @@ mod tests {
     /// before; a scheduled one is part of it.
     #[test]
     fn agent_fork_height_enters_the_fingerprint_only_when_set() {
-        let unset = ConsensusManifest::for_heights(Some(10), None);
-        let a = ConsensusManifest::for_heights(Some(10), Some(500));
-        let b = ConsensusManifest::for_heights(Some(10), Some(501));
+        let unset = ConsensusManifest::for_supply_heights(Some(10), None, None, None);
+        let a = ConsensusManifest::for_supply_heights(Some(10), Some(500), None, None);
+        let b = ConsensusManifest::for_supply_heights(Some(10), Some(501), None, None);
         assert_eq!(a.agent_precompiles_height, Some(500));
         assert_ne!(a.fingerprint, unset.fingerprint);
         assert_ne!(a.fingerprint, b.fingerprint);
         assert_eq!(
             unset.fingerprint,
-            ConsensusManifest::for_heights(Some(10), None).fingerprint
+            ConsensusManifest::for_supply_heights(Some(10), None, None, None).fingerprint
+        );
+    }
+
+    #[test]
+    fn supply_hardening_height_enters_the_fingerprint_only_when_scheduled() {
+        let unset = ConsensusManifest::for_supply_heights(Some(10), None, None, None);
+        let a = ConsensusManifest::for_supply_heights(Some(10), None, Some(700), None);
+        let b = ConsensusManifest::for_supply_heights(Some(10), None, Some(701), None);
+        assert_eq!(a.supply_hardening_height, Some(700));
+        assert_ne!(a.fingerprint, unset.fingerprint);
+        assert_ne!(a.fingerprint, b.fingerprint);
+    }
+
+    #[test]
+    fn storage_root_hardening_height_enters_the_fingerprint_only_when_scheduled() {
+        let unset = ConsensusManifest::for_supply_heights(Some(10), None, None, None);
+        let zero = ConsensusManifest::for_supply_heights(Some(10), None, None, Some(0));
+        let later = ConsensusManifest::for_supply_heights(Some(10), None, None, Some(900));
+        assert_eq!(zero.storage_root_hardening_height, Some(0));
+        assert_ne!(zero.fingerprint, unset.fingerprint);
+        assert_ne!(zero.fingerprint, later.fingerprint);
+        // Distinct from the supply fork at the same height.
+        assert_ne!(
+            later.fingerprint,
+            ConsensusManifest::for_supply_heights(Some(10), None, Some(900), None).fingerprint
         );
     }
 
@@ -549,6 +645,8 @@ mod tests {
             agent_precompiles_height: None,
             exact_create_code_height: None,
             vrf_canonical_encoding_height: None,
+            supply_hardening_height: None,
+            storage_root_hardening_height: None,
             value_transfer_activation_height: 1,
             create_nonce_fix_activation_height: 2,
             merge_depth_activation_height: 3,
@@ -727,6 +825,8 @@ mod tests {
                 agent_precompiles_height: m.agent_precompiles_height,
                 exact_create_code_height: m.exact_create_code_height,
                 vrf_canonical_encoding_height: m.vrf_canonical_encoding_height,
+                supply_hardening_height: m.supply_hardening_height,
+                storage_root_hardening_height: m.storage_root_hardening_height,
                 value_transfer_activation_height: m.value_transfer_activation_height,
                 create_nonce_fix_activation_height: m.create_nonce_fix_activation_height,
                 merge_depth_activation_height: m.merge_depth_activation_height,

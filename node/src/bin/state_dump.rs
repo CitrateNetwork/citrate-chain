@@ -60,16 +60,15 @@ fn main() -> anyhow::Result<()> {
         by_addr.insert(address.0, o);
     }
 
-    let mut slots: BTreeMap<[u8; 20], BTreeMap<[u8; 32], [u8; 32]>> = BTreeMap::new();
+    // Keys and values are byte strings (32 bytes for an EVM slot); they are dumped as
+    // they are stored, and emit_alloc.py refuses anything it cannot place in a genesis.
+    let mut slots: BTreeMap<[u8; 20], BTreeMap<Vec<u8>, Vec<u8>>> = BTreeMap::new();
     for ((address, key), value) in storage.state.get_all_storage()? {
-        state_db.set_storage(address, key.as_bytes().to_vec(), value.as_bytes().to_vec());
-        if *value.as_bytes() == [0u8; 32] {
+        state_db.set_storage(address, key.0.clone(), value.0.clone());
+        if value.0.iter().all(|b| *b == 0) {
             continue;
         }
-        slots
-            .entry(address.0)
-            .or_default()
-            .insert(*key.as_bytes(), *value.as_bytes());
+        slots.entry(address.0).or_default().insert(key.0, value.0);
     }
     let _ = state_db.take_dirty_storage();
     for (addr, s) in slots {
