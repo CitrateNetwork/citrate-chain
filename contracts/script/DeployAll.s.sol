@@ -116,12 +116,27 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
 
     function deploy() public returns (Deployed memory d) {
         address deployer = deployerAddress();
-        return deployWith(deployer, requiredGovernance("GOVERNANCE", deployer), requiredGovernance("GUARDIAN", deployer));
+        address governance = requiredGovernance("GOVERNANCE", deployer);
+        return deployWith(
+            deployer, governance, requiredGovernance("GUARDIAN", deployer), requiredTreasury("TREASURY", deployer, governance)
+        );
+    }
+
+    /// @notice `deployWith` with the protocol fees paid to `governance`.
+    function deployWith(address deployer, address governance, address guardian) public returns (Deployed memory d) {
+        return deployWith(deployer, governance, guardian, governance);
     }
 
     /// @notice The ceremony with explicit keys (no environment reads), so a
     ///         caller or test is not affected by concurrently changing env.
-    function deployWith(address deployer, address governance, address guardian) public returns (Deployed memory d) {
+    ///         `feeTo` is the protocol fee recipient (the ceremony's TREASURY)
+    ///         of X402Facilitator, ModelMarketplace and ComputeMarketplace.
+    function deployWith(address deployer, address governance, address guardian, address feeTo)
+        public
+        returns (Deployed memory d)
+    {
+        require(feeTo != address(0), "DeployAll: zero fee recipient");
+        require(feeTo != deployer || governance == deployer, "DeployAll: fee recipient must not be the deployer");
 
         bool reroll = _isReroll();
         // Under the reroll switch the three otherwise-kept-live registries deploy
@@ -187,19 +202,19 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
 
         X402Facilitator facilitator = (_isLive("X402Facilitator", abi.encodePacked(type(X402Facilitator).creationCode, abi.encode(
             address(wsalt),
-            deployer,  // treasury
+            feeTo,     // fee recipient (TREASURY)
             100,       // 1% fee
             governance // admin + facilitator (PBA-L2-002)
         )))
             ? X402Facilitator(payable(_create2Address("X402Facilitator", abi.encodePacked(type(X402Facilitator).creationCode, abi.encode(
             address(wsalt),
-            deployer,  // treasury
+            feeTo,     // fee recipient (TREASURY)
             100,       // 1% fee
             governance // admin + facilitator (PBA-L2-002)
         )))))
             : new X402Facilitator{salt: Salts.salt("X402Facilitator")}(
             address(wsalt),
-            deployer,  // treasury
+            feeTo,     // fee recipient (TREASURY)
             100,       // 1% fee
             governance // admin + facilitator (PBA-L2-002)
         ));
@@ -258,17 +273,17 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
 
         ModelMarketplace modelMarketplace = (_isLive("ModelMarketplace", abi.encodePacked(type(ModelMarketplace).creationCode, abi.encode(
             address(registry),
-            deployer,  // treasury
+            feeTo,     // fee recipient (TREASURY)
             governance // admin (PBA-L2-002)
         )))
             ? ModelMarketplace(payable(_create2Address("ModelMarketplace", abi.encodePacked(type(ModelMarketplace).creationCode, abi.encode(
             address(registry),
-            deployer,  // treasury
+            feeTo,     // fee recipient (TREASURY)
             governance // admin (PBA-L2-002)
         )))))
             : new ModelMarketplace{salt: Salts.salt("ModelMarketplace")}(
             address(registry),
-            deployer,  // treasury
+            feeTo,     // fee recipient (TREASURY)
             governance // admin (PBA-L2-002)
         ));
         console.log("  ModelMarketplace:", address(modelMarketplace));
@@ -333,19 +348,30 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
 
         ComputeMarketplace computeMarketplace = (_isLive("ComputeMarketplace", abi.encodePacked(type(ComputeMarketplace).creationCode, abi.encode(
             address(verifier),
-            deployer,  // treasury
+            feeTo,     // fee recipient (TREASURY)
             governance // governance (PBA-L2-002)
         )))
             ? ComputeMarketplace(payable(_create2Address("ComputeMarketplace", abi.encodePacked(type(ComputeMarketplace).creationCode, abi.encode(
             address(verifier),
-            deployer,  // treasury
+            feeTo,     // fee recipient (TREASURY)
             governance // governance (PBA-L2-002)
         )))))
             : new ComputeMarketplace{salt: Salts.salt("ComputeMarketplace")}(
             address(verifier),
-            deployer,  // treasury
+            feeTo,     // fee recipient (TREASURY)
             governance // governance (PBA-L2-002)
         ));
+        // The marketplace's constructor takes the verifier, so the verifier is
+        // born with the deploy account as its provisional caller and hands the
+        // role to the marketplace here, before anything else can use it. On a
+        // re-run over a bound verifier this is a no-op.
+        if (verifier.marketplace() != address(computeMarketplace)) {
+            require(
+                !verifier.marketplaceLocked(),
+                "DeployAll: ComputeVerifier is bound to another ComputeMarketplace (re-run with the same TREASURY)"
+            );
+            verifier.handOverMarketplace(address(computeMarketplace));
+        }
         console.log("  ComputeMarketplace:", address(computeMarketplace));
 
         ComputePool computePool = (_isLive("ComputePool", abi.encodePacked(type(ComputePool).creationCode, abi.encode(governance)))
@@ -511,7 +537,7 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
             governor: address(governor)
         });
         // PBA-L2-002 tripwire: fail the run if any admin slot is orphaned.
-        _assertAdmins(d, deployer, governance);
+        _assertAdmins(d, deployer, governance, regGov, feeTo);
 
         // =====================================================================
         // Summary
@@ -595,7 +621,10 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
     /// @notice PBA-L2-002 post-deploy assertion: every admin / owner /
     ///         governance slot names the intended key and never the CREATE2
     ///         factory. Also sweeps every deployed address generically.
-    function _assertAdmins(Deployed memory d, address deployer, address governance) internal view {
+    function _assertAdmins(Deployed memory d, address deployer, address governance, address regGov, address feeTo)
+        internal
+        view
+    {
         _assertAdminRole("ModelRegistry", d.registry, governance);
         _assertAdminRole("IPFSIncentives", d.ipfs, governance);
         _assertAdminRole("X402Facilitator", d.facilitator, governance);
@@ -620,6 +649,21 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         _assertGovernance("TestnetFarmingAccounting", d.farming, governance);
         (bool ok, address provider) = _readAddress(d.paywall, abi.encodeWithSignature("provider()"));
         require(ok && provider == governance, "X402Paywall: provider is not the intended key");
+        // Fee recipients and the verifier's bound caller are the intended ones.
+        require(X402Facilitator(d.facilitator).treasury() == feeTo, "X402Facilitator: treasury is not the fee recipient");
+        require(
+            ModelMarketplace(payable(d.modelMarketplace)).treasuryAddress() == feeTo,
+            "ModelMarketplace: treasuryAddress is not the fee recipient"
+        );
+        require(
+            ComputeMarketplace(payable(d.computeMarketplace)).treasury() == feeTo,
+            "ComputeMarketplace: treasury is not the fee recipient"
+        );
+        require(
+            ComputeVerifier(d.verifier).marketplace() == d.computeMarketplace,
+            "ComputeVerifier: marketplace is not the deployed ComputeMarketplace"
+        );
+        require(ComputeVerifier(d.verifier).marketplaceLocked(), "ComputeVerifier: marketplace hand-over still open");
 
         address[28] memory all = [
             d.registry, d.wsalt, d.agentRegistry, d.specRegistry, d.ipfs, d.facilitator, d.paywall,
@@ -630,6 +674,19 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         ];
         for (uint256 i = 0; i < all.length; i++) {
             _assertNoFactoryAdmin("DeployAll", all[i]);
+        }
+        // With a real governance, the deploy account must end with no
+        // privileged slot anywhere (every getter AdminChecks reads). The three
+        // registries a live, non-reroll run keeps deployer-governed (regGov)
+        // are the documented exception on that path only.
+        if (governance != deployer) {
+            for (uint256 i = 0; i < all.length; i++) {
+                if (regGov == deployer && (all[i] == d.agentRegistry || all[i] == d.specRegistry || all[i] == d.mmAlloc)) {
+                    continue;
+                }
+                string memory p = _deployerAdminProblem(all[i], deployer);
+                require(bytes(p).length == 0, string.concat("DeployAll: ", p));
+            }
         }
     }
 }

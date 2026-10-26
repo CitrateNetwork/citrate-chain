@@ -64,4 +64,31 @@ abstract contract ScriptEnv is Script {
             return fallbackValue;
         }
     }
+    /// @notice The protocol fee recipient the ceremony names (`key`, the
+    ///         ceremony input TREASURY). Fee recipients are fixed at
+    ///         construction, and moving one later is a timelocked governance
+    ///         operation per contract, so the deploy account must never be it.
+    ///         - set: must be a non-zero address, and not the deployer unless
+    ///           governance is the deployer too (local dev);
+    ///         - unset: required on 40204; elsewhere it falls back to
+    ///           `governance` (governance-controlled, never the deployer when a
+    ///           real governance is configured).
+    function requiredTreasury(string memory key, address deployer, address governance)
+        internal
+        view
+        returns (address t)
+    {
+        if (vm.envExists(key)) {
+            try vm.envAddress(key) returns (address loaded) {
+                t = loaded;
+            } catch {
+                revert(string.concat(key, " is set but is not an address"));
+            }
+            require(t != address(0), string.concat(key, " is the zero address"));
+        } else {
+            require(block.chainid != 40204, string.concat(key, " must be set on 40204"));
+            t = governance;
+        }
+        require(t != deployer || governance == deployer, string.concat(key, " must not be the deployer"));
+    }
 }
