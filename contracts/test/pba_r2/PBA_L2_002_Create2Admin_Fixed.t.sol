@@ -65,10 +65,10 @@ contract PBA_L2_002_Fixed is Test {
         DeployAll script = new DeployAll();
         DeployAll.Deployed memory d = script.deployWith(sender, intended, intended);
         AdminChecksHarness h = new AdminChecksHarness();
-        assertEq(h.problem(d.stakingPool), "");
+        assertEq(h.problem(d.computePool), "");
         assertEq(h.problem(d.registry), "");
         assertEq(h.problem(d.paywall), "");
-        assertEq(LiquidStakingPool(payable(d.stakingPool)).governance(), intended);
+        assertEq(d.stakingPool, address(0), "no LiquidStakingPool at genesis");
         assertEq(Governable(d.computePool).governance(), intended);
         assertTrue(ModelRegistry(d.registry).hasRole(0x00, intended));
     }
@@ -117,7 +117,7 @@ contract PBA_L2_002_Fixed is Test {
         StillDeployerGoverned handed = new StillDeployerGoverned(intended);
 
         CheckDeployedAdmins c = new CheckDeployedAdmins();
-        vm.expectRevert(bytes("CheckDeployedAdmins: deployer EOA holds governance/owner/DEFAULT_ADMIN (see log)"));
+        vm.expectRevert(bytes("CheckDeployedAdmins: deployer EOA holds a privileged slot (see log)"));
         c.check(_book(string.concat('"Stale":"', vm.toString(address(stale)), '"')), false);
 
         CheckDeployedAdmins c2 = new CheckDeployedAdmins();

@@ -156,6 +156,7 @@ consensus_tripwires() {
     "scripts/ci/deployer_input_override_tripwire.sh" \
     "scripts/ci/salt_supply_tripwire.sh" \
     "scripts/ci/genesis_keyed_pins_tripwire.sh" \
+    "scripts/ci/privileged_slots_tripwire.sh" \
   ; do
     if [ ! -x "$t" ]; then
       echo "missing/!executable tripwire: $t"; rc=1; continue

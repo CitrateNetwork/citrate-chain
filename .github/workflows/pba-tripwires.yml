@@ -34,3 +34,7 @@ jobs:
         run: scripts/ci/salt_supply_tripwire.sh --self-test
       - name: SALT supply basis (contracts constant = core/economics; no literal governor supply)
         run: scripts/ci/salt_supply_tripwire.sh
+      - name: Privileged-slot tripwire self-test
+        run: scripts/ci/privileged_slots_tripwire.sh --self-test
+      - name: Privileged slots of DeployAll contracts are swept or exempt with a reason
+        run: scripts/ci/privileged_slots_tripwire.sh
