@@ -80,6 +80,17 @@ ignore = [
     # compatibility decision needing ZK-engineering review.
     # See: per-repo/citrate-chain/F-08_FP_CHECK.md
     "RUSTSEC-2025-0055",
+
+    # ─────────────────────────────────────────────────────────────────
+    # crypto-bigint < 0.7.6 (time-boxed) — EXPIRES 2026-11-09
+    # ─────────────────────────────────────────────────────────────────
+    # RUSTSEC-2026-0387 — crypto-bigint < 0.7.6: multiple timing
+    # variability issues in operations intended to be constant-time.
+    # elliptic-curve 0.13 requires crypto-bigint ^0.5; the fix is in the
+    # 0.14 curve line, held back upstream (revm-precompile,
+    # openmls_rust_crypto and bip32 still require the 0.13 line).
+    # Guard: scripts/ci/check_crypto_bigint_users.py.
+    "RUSTSEC-2026-0387",
 ]
 
 # ─── Unmaintained-warning ignores (REM-21 hygiene) ─────────────────

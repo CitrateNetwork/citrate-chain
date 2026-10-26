@@ -22,6 +22,16 @@
 #           overflow FLAG (shifted values correct). Patched >= 1.20.0, not
 #           bumpable while alloy-primitives 0.7.7 pins ruint ^1.12. Premise
 #           fenced by scripts/ci/ruint_shift_advisory_premise_tripwire.sh.
+#   RUSTSEC-2026-0387  crypto-bigint < 0.7.6 timing variability, reached only
+#           through elliptic-curve 0.13 (no 0.13.x accepts crypto-bigint 0.7).
+#           Guard: scripts/ci/check_crypto_bigint_users.py (blocking step in
+#           cargo-audit.yml and security-audit.yml). Expiry 2027-01-31 is the
+#           owner-approved window (#377). The guard enforces its own EXPIRES
+#           as well; whichever date is earlier fails first. On main the guard
+#           reads the root Cargo.lock only. Running it per sub-lockfile with
+#           --lock is not a fix: the two commd lockfiles hold no crypto-bigint,
+#           so a per-lockfile run reports them as a stale ignore. #377 makes
+#           the guard check every tracked lockfile with a repo-wide stale test.
 #
 # Usage: audit_all_lockfiles.sh              # audit every tracked Cargo.lock
 #        audit_all_lockfiles.sh --self-test  # prove the gate still flags a
@@ -32,10 +42,14 @@ set -uo pipefail
 REPO_ROOT="${AUDIT_ALL_LOCKFILES_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 FIXTURES="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fixtures"
 
+# Entry format: ID, or ID@YYYY-MM-DD for a time-boxed ignore. A time-boxed
+# ignore stops applying after that date (inclusive bound) and the gate fails
+# until someone decides again; do not renew by reflex.
 IGNORES=(
   RUSTSEC-2025-0137
   RUSTSEC-2025-0055
   RUSTSEC-2026-0220
+  RUSTSEC-2026-0387@2027-01-31
 )
 
 if ! command -v cargo-audit >/dev/null 2>&1; then
@@ -43,10 +57,27 @@ if ! command -v cargo-audit >/dev/null 2>&1; then
   exit 2
 fi
 
+# expired_ignores <today YYYY-MM-DD> <entry>... : print one line per entry
+# that is expired or malformed; status 1 if any.
+expired_ignores() {
+  local today="$1" e id until bad=0
+  shift
+  for e in "$@"; do
+    case "$e" in *@*) ;; *) continue ;; esac
+    id="${e%%@*}"; until="${e#*@}"
+    if ! [[ "$until" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+      echo "ignore $id: malformed expiry '$until' (want YYYY-MM-DD)"; bad=1
+    elif [[ "$today" > "$until" ]]; then
+      echo "ignore $id expired on $until"; bad=1
+    fi
+  done
+  return "$bad"
+}
+
 audit_one() { # <lockfile> ; returns cargo-audit's exit status
-  local args=() id
-  for id in "${IGNORES[@]}"; do args+=(--ignore "$id"); done
-  cargo audit --file "$1" "${args[@]}"
+  local args=() e
+  for e in "${IGNORES[@]}"; do args+=(--ignore "${e%%@*}"); done
+  cargo audit --file "$1" ${args[@]+"${args[@]}"}
 }
 
 self_test() {
@@ -63,18 +94,46 @@ self_test() {
   if ! out="$(audit_one "$FIXTURES/lockfile_audit_clean.lock" 2>&1)"; then
     echo "self-test: clean fixture FAILED the audit:"; echo "$out"; rc=1
   fi
+  # Expiry: a time-boxed ignore must stop applying after its date, apply on
+  # the date itself, and a malformed date must fail closed.
+  if out="$(expired_ignores 2027-02-01 RUSTSEC-2026-0387@2027-01-31 RUSTSEC-2025-0137)"; then
+    echo "self-test: an expired ignore was accepted"; rc=1
+  elif ! grep -q 'RUSTSEC-2026-0387' <<<"$out" || grep -q 'RUSTSEC-2025-0137' <<<"$out"; then
+    echo "self-test: expiry flagged the wrong entries: $out"; rc=1
+  fi
+  if ! out="$(expired_ignores 2027-01-31 RUSTSEC-2026-0387@2027-01-31)"; then
+    echo "self-test: an ignore was rejected on its expiry date: $out"; rc=1
+  fi
+  if expired_ignores 2026-10-26 RUSTSEC-2026-0387@2027-1-31 >/dev/null; then
+    echo "self-test: a malformed expiry was accepted"; rc=1
+  fi
+  if expired_ignores 2026-10-26 RUSTSEC-2026-0387@ >/dev/null; then
+    echo "self-test: an empty expiry was accepted"; rc=1
+  fi
+  # The real list must be in force today, or the run below fails anyway.
+  if ! out="$(expired_ignores "$(today)" "${IGNORES[@]}")"; then
+    echo "self-test: the configured ignore list has expired entries: $out"; rc=1
+  fi
   # Coverage: enumeration must see more than the root lockfile.
   local n
   n="$(git -C "$REPO_ROOT" ls-files '*Cargo.lock' | wc -l)"
   if [ "$n" -lt 2 ]; then
     echo "self-test: enumerated only $n Cargo.lock file(s); sub-lockfiles not covered"; rc=1
   fi
-  [ "$rc" -eq 0 ] && echo "self-test OK (vulnerable pin flagged, clean pin passes, $n lockfiles enumerated)"
+  [ "$rc" -eq 0 ] && echo "self-test OK (vulnerable pin flagged, clean pin passes, expired ignore rejected, $n lockfiles enumerated)"
   return "$rc"
 }
 
+today() { echo "${AUDIT_ALL_LOCKFILES_TODAY:-$(date -u +%Y-%m-%d)}"; }
+
 if [ "${1:-}" = "--self-test" ]; then
   self_test; exit $?
+fi
+
+if ! out="$(expired_ignores "$(today)" "${IGNORES[@]}")"; then
+  echo "$out" >&2
+  echo "cargo audit FAILED: time-boxed ignore(s) expired; decide again" >&2
+  exit 1
 fi
 
 rc=0; failed=()
@@ -87,7 +146,7 @@ while IFS= read -r lock; do
 done < <(git -C "$REPO_ROOT" ls-files '*Cargo.lock')
 
 if [ "$rc" -ne 0 ]; then
-  echo "cargo audit FAILED for: ${failed[*]}" >&2
+  echo "cargo audit FAILED for: ${failed[*]+"${failed[*]}"}" >&2
 else
   echo "cargo audit OK for every tracked Cargo.lock"
 fi
