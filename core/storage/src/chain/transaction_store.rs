@@ -272,6 +272,27 @@ fn encode_reconcile_marker(hash: &Hash, height: u64) -> Vec<u8> {
 }
 
 impl TransactionStore {
+    /// C1-R: every `(block_hash, tx_hash)` entry of the block→transaction index
+    /// (the `t‖block‖tx` markers written with each receipt). Used to reconcile
+    /// the receipt index against an applied chain when the old chain can no
+    /// longer be walked block by block. A read error is returned, never skipped.
+    pub fn receipt_index_entries(&self) -> Result<Vec<(Hash, Hash)>> {
+        let mut out = Vec::new();
+        for key in self.db.prefix_keys_cf(CF_METADATA, b"t")? {
+            let Some(rest) = key.strip_prefix(b"t".as_slice()) else {
+                continue;
+            };
+            if rest.len() != 64 {
+                continue; // another metadata key that happens to start with `t`
+            }
+            let (block, tx) = rest.split_at(32);
+            if let (Ok(block), Ok(tx)) = (<[u8; 32]>::try_from(block), <[u8; 32]>::try_from(tx)) {
+                out.push((Hash::new(block), Hash::new(tx)));
+            }
+        }
+        Ok(out)
+    }
+
     /// C1-R: the old applied tip recorded by an unfinished from-genesis rebuild
     /// (see [`ReceiptReconcileMarker`]), if any. A malformed value reads as absent.
     pub fn get_receipt_reconcile_marker(&self) -> Result<Option<(Hash, u64)>> {
@@ -385,6 +406,36 @@ mod tests {
         let block_txs = store.get_block_transactions(&block_hash).unwrap();
         assert_eq!(block_txs.len(), 1);
         assert_eq!(block_txs[0], tx_hash);
+    }
+
+    /// The full block→transaction index scan returns exactly the `t‖block‖tx`
+    /// entries, across blocks, and skips other metadata keys that start with
+    /// `t` (negative control: a key of a different length, and a `u` key).
+    #[test]
+    fn receipt_index_entries_lists_every_block_tx_marker_only() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(RocksDB::open(temp_dir.path()).unwrap());
+        let store = TransactionStore::new(db.clone());
+        let block_a = Hash::new([0xA; 32]);
+        let block_b = Hash::new([0xB; 32]);
+        let (t1, t2, t3) = (Hash::new([1; 32]), Hash::new([2; 32]), Hash::new([3; 32]));
+        store
+            .put_receipts(&[
+                (t1, create_test_receipt(t1, block_a)),
+                (t2, create_test_receipt(t2, block_a)),
+                (t3, create_test_receipt(t3, block_b)),
+            ])
+            .unwrap();
+        db.put_cf(CF_METADATA, b"tip_like_key", b"x").unwrap();
+        let mut long = block_tx_key(&block_a, &t1);
+        long.push(0);
+        db.put_cf(CF_METADATA, &long, &[]).unwrap();
+        db.put_cf(CF_METADATA, &[b'u'; 65], &[]).unwrap();
+        let mut got = store.receipt_index_entries().unwrap();
+        got.sort();
+        let mut want = vec![(block_a, t1), (block_a, t2), (block_b, t3)];
+        want.sort();
+        assert_eq!(got, want);
     }
 
     #[test]

@@ -136,6 +136,15 @@ fn read_reconcile_marker(storage: &StorageManager) -> anyhow::Result<Option<(Has
         .map_err(|e| anyhow::anyhow!("could not read the receipt rebuild marker: {e}"))
 }
 
+fn read_receipt_index(storage: &StorageManager) -> anyhow::Result<Vec<(Hash, Hash)>> {
+    #[cfg(test)]
+    read_faults::check(read_faults::Site::ReceiptIndex, None)?;
+    storage
+        .transactions
+        .receipt_index_entries()
+        .map_err(|e| anyhow::anyhow!("could not read the receipt index: {e}"))
+}
+
 fn read_applied_tip(storage: &StorageManager) -> anyhow::Result<Option<(Hash, u64)>> {
     #[cfg(test)]
     read_faults::check(read_faults::Site::AppliedTip, None)?;
@@ -159,6 +168,7 @@ pub(crate) mod read_faults {
         Receipt,
         Marker,
         AppliedTip,
+        ReceiptIndex,
     }
 
     /// Fail reads at `site` (of `key` only, when set) after letting `skip`
@@ -1799,9 +1809,28 @@ impl CanonicalApplicator {
                 b.header.height > 0 && !spine_set.contains(&b.header.block_hash)
             })
             .map_err(read_err)?;
-        // Without a known base (the old chain's walk ended at a purged block),
-        // every spine block is treated as possibly new; the receipt check below
-        // keeps the ones the old chain already had.
+        // Without a known base, the old chain's walk ended at a block that is not
+        // stored: the start-up hardening purge removed it (and its receipts) and
+        // left the applied tip on it. The old chain's blocks below it still hold
+        // receipts, but nothing links them to `pre_tip` any more, so the walk
+        // cannot find them. Reconcile the whole receipt index against the spine
+        // instead: every entry of a block that is not on the spine leaves in the
+        // reset batch, and every abort puts the receipts back.
+        let (abandon_index, restore_index) = match common {
+            Some(_) => (abandon_index, restore_index),
+            None => {
+                warn!(
+                    "canonical recovery: the applied chain from {} @ {} is not fully stored; reconciling the receipt index against the spine",
+                    pre_tip.hash, pre_tip.height
+                );
+                Self::off_chain_receipt_index(&self.storage, |block| {
+                    *block == genesis_hash || spine_set.contains(block)
+                })
+                .map_err(read_err)?
+            }
+        };
+        // Every spine block is then treated as possibly new; the receipt check
+        // below keeps the ones the old chain already had.
         let common_height = common.map(|c| c.height).unwrap_or(0);
         // The removals an abort needs: the receipts the replay writes fresh for
         // spine blocks above `common`, keyed by spine position. A receipt that
@@ -2127,6 +2156,31 @@ impl CanonicalApplicator {
         Ok((removals, restore, base))
     }
 
+    /// C1-R: the receipt-index changes that drop every indexed block for which
+    /// `keep` is false, for when the old applied chain cannot be walked. Scans
+    /// the block→transaction index once. Returns the removals and, for an abort,
+    /// the receipts currently stored for those blocks. Read-only; a read error
+    /// is an `Err`, so no caller commits a partial set.
+    fn off_chain_receipt_index(
+        storage: &StorageManager,
+        keep: impl Fn(&Hash) -> bool,
+    ) -> anyhow::Result<(ReceiptIndexBatch, ReceiptIndexBatch)> {
+        let mut removals = ReceiptIndexBatch::default();
+        let mut restore = ReceiptIndexBatch::default();
+        for (block, tx) in read_receipt_index(storage)? {
+            if keep(&block) {
+                continue;
+            }
+            removals.removals.push((block, tx));
+            if let Some(r) = read_receipt(storage, &tx)? {
+                if r.block_hash == block {
+                    restore.receipts.push(r);
+                }
+            }
+        }
+        Ok((removals, restore))
+    }
+
     /// C1-R: finish the receipt side of a from-genesis rebuild that stopped before
     /// it converged (see [`ReceiptReconcileMarker`]). No-op without a marker.
     ///
@@ -2146,7 +2200,10 @@ impl CanonicalApplicator {
     /// The durable applied tip is read from the store here, not taken from the
     /// caller: the receipts to keep are those of the chain the store says is
     /// applied. A marker with no durable tip is an error (the marker is only ever
-    /// set in the same batch as a tip).
+    /// set in the same batch as a tip). A durable tip that is not stored (the
+    /// start-up hardening purge removed it) leaves nothing to compare against:
+    /// this returns no batches and keeps the marker, and the rebuild that a
+    /// removed tip forces reconciles the index against its spine.
     fn interrupted_rebuild_cleanup(
         storage: &StorageManager,
     ) -> anyhow::Result<Vec<ReceiptIndexBatch>> {
@@ -2162,6 +2219,13 @@ impl CanonicalApplicator {
                 marker.1
             ),
         };
+        if durable.height > 0 && read_block(storage, &durable.hash)?.is_none() {
+            warn!(
+                "C1-R: unfinished rebuild from {} @ {}: the durable applied tip {} @ {} is not stored; the receipt cleanup waits for the rebuild",
+                marker.0, marker.1, durable.hash, durable.height
+            );
+            return Ok(Vec::new());
+        }
         let removals = Self::interrupted_rebuild_removals(storage, marker, durable)?;
         info!(
             "C1-R: unfinished rebuild from {} @ {}: removing {} receipt entr(y/ies) off the durable applied chain at {} @ {}",
@@ -2193,6 +2257,12 @@ impl CanonicalApplicator {
     /// is never cleared on a walk a failure cut short. A block that is not stored
     /// ends the walk on that side (the genesis sentinel, or a block the start-up
     /// hardening purge removed together with its receipts).
+    ///
+    /// When the purge removed a block of the old chain, the old chain's blocks
+    /// below it can no longer be reached from the marker, yet still hold
+    /// receipts. Then every index entry above the durable tip goes instead (see
+    /// [`Self::receipt_index_above`]); that is a superset of what the walk
+    /// would have found.
     fn interrupted_rebuild_removals(
         storage: &StorageManager,
         old: (Hash, u64),
@@ -2209,13 +2279,15 @@ impl CanonicalApplicator {
                 // Above the durable tip, or a different block at the same height:
                 // not on the durable applied chain.
                 let Some(b) = load(&old_hash)? else {
-                    // Not stored: the genesis sentinel, or a block the start-up
-                    // hardening purge removed together with its receipts. Nothing
-                    // below it can be identified.
+                    // Not stored: the genesis sentinel (the walk is done), or a
+                    // block the start-up hardening purge removed together with
+                    // its receipts. Its stored ancestors cannot be reached from
+                    // here, so fall back to the index scan.
                     if old_height > 0 {
                         warn!(
-                            "C1-R: receipt cleanup: old-chain block {old_hash} @ {old_height} is not stored; the walk ends there"
+                            "C1-R: receipt cleanup: old-chain block {old_hash} @ {old_height} is not stored; removing every receipt above the durable tip"
                         );
+                        return Self::receipt_index_above(storage, durable.height);
                     }
                     break;
                 };
@@ -2250,6 +2322,37 @@ impl CanonicalApplicator {
                 old.0,
                 steps
             );
+        }
+        Ok(out)
+    }
+
+    /// C1-R: every block→transaction index entry of a block above
+    /// `durable_height`, or of a block that is not stored. None of them can be
+    /// on the durable applied chain: it ends at `durable_height`, and its blocks
+    /// are stored. Entries at or below the tip are kept: the rebuild that set
+    /// the marker removed every receipt off its spine in its reset batch and
+    /// rewrote the spine up to the durable tip. Read-only; a read error is an
+    /// `Err`.
+    fn receipt_index_above(
+        storage: &StorageManager,
+        durable_height: u64,
+    ) -> anyhow::Result<Vec<(Hash, Hash)>> {
+        let mut above: std::collections::HashMap<Hash, bool> = std::collections::HashMap::new();
+        let mut out = Vec::new();
+        for (block, tx) in read_receipt_index(storage)? {
+            let remove = match above.get(&block) {
+                Some(r) => *r,
+                None => {
+                    let r = read_block(storage, &block)?
+                        .map(|b| b.header.height > durable_height)
+                        .unwrap_or(true);
+                    above.insert(block, r);
+                    r
+                }
+            };
+            if remove {
+                out.push((block, tx));
+            }
         }
         Ok(out)
     }
@@ -9743,5 +9846,102 @@ mod tests {
             .get_block_transactions(&a1.header.block_hash)
             .expect("read")
             .is_empty());
+    }
+
+    /// The index scan the purge cases fall back on is read like every other
+    /// rebuild input: a failed scan, or a failed receipt read during it, aborts
+    /// the rebuild before anything changes, and a failed scan in the start-up
+    /// cleanup keeps the marker. Once reads succeed, both complete.
+    #[tokio::test]
+    async fn c1r_receipt_index_scan_read_faults_change_nothing() {
+        if std::env::var(V251_DIR).is_ok() {
+            return;
+        }
+        let _g = FaultGuard;
+        // Rebuild after the purge.
+        let dir = tempfile::tempdir().expect("dir");
+        let (storage, exec, a1, a2) = c1r_purged_follower(dir.path()).await;
+        let (c1, c2) = c1r_fork_c().await;
+        persist(&storage, &c1);
+        persist(&storage, &c2);
+        let all = [&a1, &a2, &c1, &c2];
+        let before = c1r_durable_view(&storage, &all);
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        app.fork_choice = Some(fork_choice_returning(c2.header.block_hash));
+        let root_before = exec.calculate_state_root();
+        let g = Executor::new(Arc::new(StateDB::new()));
+        g.set_balance(&Address(ALICE), U256::from(FUND));
+        for (what, f) in [
+            ("index scan", fault(Site::ReceiptIndex, None, 0)),
+            (
+                "scanned receipt",
+                fault(Site::Receipt, Some(a1.transactions[0].hash), 0),
+            ),
+        ] {
+            read_faults::set(vec![f]);
+            let res = app
+                .recover_to_head(g.state_snapshot(), Hash::default())
+                .await;
+            assert!(read_faults::hits() > 0, "{what}: the fault was not reached");
+            read_faults::clear();
+            assert!(res.is_err(), "{what}: must abort with Err, got {res:?}");
+            assert_eq!(
+                app.applied_tip().await.hash,
+                a2.header.block_hash,
+                "{what}: tip"
+            );
+            assert_eq!(exec.calculate_state_root(), root_before, "{what}: memory");
+            assert_eq!(c1r_durable_view(&storage, &all), before, "{what}: durable");
+        }
+        assert!(app
+            .recover_to_head(g.state_snapshot(), Hash::default())
+            .await
+            .expect("recover"));
+        c1r_receipts_consistent(&storage, Some(c2.header.block_hash), &all)
+            .expect("receipts follow C");
+
+        // Start-up cleanup after an interrupted rebuild and a purge.
+        let (a1, a2, b2, b3) = v251_blocks().await;
+        let dir = tempfile::tempdir().expect("dir");
+        c1r_crash_after_rebuild_reset(dir.path(), &a1, &a2);
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen"));
+        c1r_startup_purge(&storage, &a1, &a2);
+        let exec = store_backed(&storage);
+        let all = [&a1, &a2, &b2, &b3];
+        let before = c1r_durable_view(&storage, &all);
+        read_faults::set(vec![fault(Site::ReceiptIndex, None, 0)]);
+        drop(CanonicalApplicator::new(exec.clone(), storage.clone()));
+        assert!(
+            read_faults::hits() > 0,
+            "cleanup scan: the fault was not reached"
+        );
+        read_faults::clear();
+        assert_eq!(
+            c1r_durable_view(&storage, &all),
+            before,
+            "cleanup scan: durable"
+        );
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt_reconcile_marker()
+                .expect("read"),
+            Some((a2.header.block_hash, 2)),
+            "the marker survives a failed scan"
+        );
+        drop(CanonicalApplicator::new(exec.clone(), storage.clone()));
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt_reconcile_marker()
+                .expect("read"),
+            None
+        );
+        assert!(storage
+            .transactions
+            .get_receipt(&a1.transactions[0].hash)
+            .expect("read")
+            .is_none());
     }
 }
