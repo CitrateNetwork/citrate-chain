@@ -1499,18 +1499,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     };
     let genesis_acts = running_genesis
         .and_then(|g| citrate_consensus::hardening::rules_for_genesis(config.chain.chain_id, &g));
-    if config.chain.genesis_profile.as_deref() == Some(genesis::R1006_PROFILE)
-        && genesis_acts.is_none()
-    {
-        anyhow::bail!(
-            "[chain] genesis_profile = \"r1006\" but this data directory's block 0 ({}) is not \
-             the r1006 genesis this build compiles ({}). Use a fresh data directory.",
-            running_genesis
-                .map(hex::encode)
-                .unwrap_or_else(|| "missing".into()),
-            hex::encode(citrate_consensus::hardening::R1006_GENESIS)
-        );
-    }
+    genesis::r1006_boot_guard(
+        config.chain.chain_id,
+        config.chain.genesis_profile.as_deref(),
+        running_genesis.as_ref(),
+        &citrate_economics::r1006::readiness()
+            .map_err(|e| anyhow::anyhow!("invalid r1006 genesis: {e}"))?,
+        genesis::r1006_rehearsal_from_env(),
+    )?;
     let on_demand = producer::check_mine_on_demand(
         std::env::var(producer::MINE_ON_DEMAND_ENV).ok().as_deref(),
         config.chain.genesis_profile.as_deref(),
@@ -1520,9 +1516,6 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     producer::set_mine_on_demand(on_demand);
     if on_demand {
         warn!("Build devnet: blocks are produced only when a transaction is pending");
-    }
-    if running_genesis == Some(citrate_consensus::hardening::R1006_GENESIS) {
-        genesis::check_r1006_bootable(genesis::r1006_rehearsal_from_env())?;
     }
     if let Some(a) = &genesis_acts {
         for (name, h) in a.entries() {
