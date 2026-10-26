@@ -163,7 +163,7 @@ chmod +x "$BIN"/*
 export FAKE CAST="$BIN/cast" FORGE="$BIN/forge" SYSTEMCTL="$BIN/systemctl"
 unset RPC RPC_URL ADDRESS_BOOK BROADCAST_DIR KEEP_LIST FLEET_RPCS EXPECTED_GENESIS_HASH PRIVATE_KEY DEPLOYER_PRIVATE_KEY \
   DEPLOYER_ADDRESS CEREMONY_DEPLOYER_ADDRESS DEPLOYER EMIT_DEPLOYER EMIT_OUTPUT EMIT_BROADCAST_SINCE EMIT_FRESH_GENESIS EMITTER \
-  GENESIS_TREASURY ETH_PASSWORD ETH_KEYSTORE ETH_KEYSTORE_ACCOUNT
+  TREASURY ETH_PASSWORD ETH_KEYSTORE ETH_KEYSTORE_ACCOUNT
 calls() { cat "$FAKE/calls.log" 2>/dev/null; }
 reset_calls() { : >"$FAKE/calls.log"; }
 
@@ -640,7 +640,7 @@ cat >"$REPO/scripts/ops/regenesis.sh" <<'EOF'
 #!/usr/bin/env bash
 echo "regenesis $*" >>"$FAKE/calls.log"
 echo "regenesis-env vg=${VALIDATOR_GOVERNANCE:-} vs=${VALIDATOR_SLASHER:-} gov=${GOVERNANCE:-}" >>"$FAKE/calls.log"
-echo "regenesis-treasury ${GENESIS_TREASURY-<unset>}" >>"$FAKE/calls.log"
+echo "regenesis-treasury ${TREASURY-<unset>}" >>"$FAKE/calls.log"
 echo "regenesis-emit fresh=${EMIT_FRESH_GENESIS:-} dep=${EMIT_DEPLOYER:-} since=${EMIT_BROADCAST_SINCE:-} out=${EMIT_OUTPUT:-}" >>"$FAKE/calls.log"
 echo "regenesis-deployer dep=${DEPLOYER_ADDRESS-<unset>} ceremony=${CEREMONY_DEPLOYER_ADDRESS-<unset>}" >>"$FAKE/calls.log"
 if [[ -n "${FAKE_REGEN_BCAST:-}" ]]; then
@@ -690,7 +690,7 @@ CEENV=(env REPO_ROOT="$REPO" DEPLOYER_ADDRESS="$DEP"
   GRD_OWNERS="$(owners 21 22 23)" GRD_THRESHOLD=2 GRD_MIN_DELAY=3600
   SIGNER_1="$(addr 61)" SIGNER_2="$(addr 62)" SIGNER_3="$(addr 63)" RELAYER="$(addr 64)"
   CITRATE_AA_OWNER="$(addr 65)" CITRATE_AA_IDENTITY_SIGNER="$(addr 66)" CITRATE_AA_SPONSOR_SIGNER="$(addr 67)"
-  MEMBERSHIP_OWNER="$(addr 68)" GENESIS_TREASURY="$(addr 90)")
+  MEMBERSHIP_OWNER="$(addr 68)" TREASURY="$(addr 90)")
 
 reset_calls
 expect "ceremony: dry run with genesis values passes" 0 'done \(mode=dry\)' -- "${CEENV[@]}" bash "$CE"
@@ -829,6 +829,21 @@ expect "phase inputs tripwire: a dynamic key is flagged" 1 'reads an environment
 cp "$T/edu.orig" "$TW/contracts/script/DeployEduStack.s.sol"
 jq '.inputs.OLD_INPUT = {"class": "default", "phases": ["P2"], "why": "x"}' "$G/phase_inputs.json" >"$T/pi-stale.json"
 expect "phase inputs tripwire: a spec entry no phase reads is flagged" 1 'OLD_INPUT is in phase_inputs.json but no phase reads it' -- pi_tw "$T/pi-stale.json"
+# TREASURY is read by DeployAll once chain#396 is in the tree; until then its entry names that
+# reader (pending_reader). Without the field the unread entry is stale; once the reader reads
+# it, the field itself is flagged so it is dropped.
+python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); del s["inputs"]["TREASURY"]["pending_reader"]; json.dump(s, open(sys.argv[2], "w"))' "$T/pi-spec.json" "$T/pi-nopending.json"
+if ! grep -q 'vm.env[A-Za-z]*("TREASURY"\|requiredTreasury("TREASURY"' "$TW/contracts/script/DeployAll.s.sol"; then
+  expect "phase inputs tripwire: an unread entry without pending_reader is stale (control)" 1 'TREASURY is in phase_inputs.json but no phase reads it' -- pi_tw "$T/pi-nopending.json"
+  cp "$TW/contracts/script/DeployAll.s.sol" "$T/deployall.orig"
+  sed -i '0,/^\(\s*\)address deployer = deployerAddress();/s//&\n\1address t0 = vm.envAddress("TREASURY");/' "$TW/contracts/script/DeployAll.s.sol"
+  grep -q 'vm.envAddress("TREASURY")' "$TW/contracts/script/DeployAll.s.sol" || bad "phase inputs tripwire: the TREASURY read was planted in the copied DeployAll (setup)"
+  expect "phase inputs tripwire: a pending_reader whose script now reads the key is flagged" 1 'TREASURY: pending_reader .* but the scripts now read it' -- pi_tw
+  expect "phase inputs tripwire: with the reader in place the entry needs no pending_reader (control)" 0 'phase_inputs: OK' -- pi_tw "$T/pi-nopending.json"
+  cp "$T/deployall.orig" "$TW/contracts/script/DeployAll.s.sol"
+else
+  ok "phase inputs tripwire: DeployAll reads TREASURY in this tree; pending_reader cases not applicable"
+fi
 jq '.inputs.SIGNER_1.phases = ["P3"]' "$G/phase_inputs.json" >"$T/pi-phase.json"
 expect "phase inputs tripwire: a wrong phase list is flagged" 1 "SIGNER_1: phase_inputs.json says phases \['P3'\], the scripts read it in \['P2'\]" -- pi_tw "$T/pi-phase.json"
 jq '.inputs.SIGNER_1.class = "p0-bash"' "$G/phase_inputs.json" >"$T/pi-bash.json"
@@ -1135,7 +1150,7 @@ p2_list_sync "$G/../ops/regenesis.sh" && ok "ceremony C10: P2_BROADCAST_SCRIPTS 
 p2_list_sync "$T/regenesis-extra.sh" && bad "ceremony C10: the list check catches a script added to regenesis.sh (negative control)" ||
   ok "ceremony C10: the list check catches a script added to regenesis.sh (negative control)"
 # After a --confirm P2, the fee recipients of the contracts in the book are read from the chain
-# and must be the GENESIS_TREASURY P2 handed DeployAll (0x..5a here), never the deployer:
+# and must be the TREASURY P2 handed DeployAll (0x..5a here), never the deployer:
 # block 0 routes no revenue to the ceremony EOA.
 C9B="$T/c9-book.json"
 C9VR=$(addr 401) C9SBT=$(addr 402) C9BOND=$(addr 403) C9VI=$(addr 404) C9VP=$(addr 405)
@@ -1160,7 +1175,7 @@ cp "$GBK" "$T/book.c9.orig"
 C9ENV=("${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1
   FAKE_REGEN_BOOK="$C9B" FAKE_REGEN_BCAST="$C9BC" EMITTER="$T/fake-emit.sh")
 # c9_setup: a --confirm run after P1 (manifest, governance on chain, fee recipients = the
-# GENESIS_TREASURY), before P2 has sent anything (no broadcast recorded yet).
+# TREASURY), before P2 has sent anything (no broadcast recorded yet).
 c9_setup() {
   rm -rf "$REPO/contracts/broadcast"
   cp "$T/book.c9.orig" "$GBK"
@@ -1180,13 +1195,13 @@ c9_fee() { # name want-exit pattern [fake_call setup...]
   expect "ceremony C9: $name" "$want" "$pat" -- "${C9ENV[@]}" bash "$CE" --confirm --only P2 --account deployer
   cp "$T/book.c9.orig" "$GBK"
 }
-c9_fee "fee recipients equal to GENESIS_TREASURY pass P2" 0 'P2 fee recipients are GENESIS_TREASURY: X402Facilitator, ModelMarketplace, ComputeMarketplace' true
-c9_fee "an X402Facilitator fee recipient other than GENESIS_TREASURY fails P2" 3 'X402Facilitator.treasury\(\) is 0x0+63, not GENESIS_TREASURY 0x0+5a' fake_call "$C9X" treasury "$STALE"
-c9_fee "a GOVERNANCE fee recipient is not GENESIS_TREASURY and fails P2" 3 'X402Facilitator.treasury\(\) is 0x0+1f, not GENESIS_TREASURY' fake_call "$C9X" treasury "$(addr 31)"
-c9_fee "a ModelMarketplace fee recipient other than GENESIS_TREASURY fails P2" 3 'ModelMarketplace.treasuryAddress\(\) is 0x0+63' fake_call "$C9MM" treasuryAddress "$STALE"
+c9_fee "fee recipients equal to TREASURY pass P2" 0 'P2 fee recipients are TREASURY: X402Facilitator, ModelMarketplace, ComputeMarketplace' true
+c9_fee "an X402Facilitator fee recipient other than TREASURY fails P2" 3 'X402Facilitator.treasury\(\) is 0x0+63, not TREASURY 0x0+5a' fake_call "$C9X" treasury "$STALE"
+c9_fee "a GOVERNANCE fee recipient is not TREASURY and fails P2" 3 'X402Facilitator.treasury\(\) is 0x0+1f, not TREASURY' fake_call "$C9X" treasury "$(addr 31)"
+c9_fee "a ModelMarketplace fee recipient other than TREASURY fails P2" 3 'ModelMarketplace.treasuryAddress\(\) is 0x0+63' fake_call "$C9MM" treasuryAddress "$STALE"
 for g in "X402Facilitator:$C9X:treasury" "ModelMarketplace:$C9MM:treasuryAddress" "ComputeMarketplace:$C9CM:treasury"; do
   IFS=: read -r gn ga gf <<<"$g"
-  c9_fee "a $gn fee recipient that is the deployer fails P2" 3 "$gn.$gf\\(\\) is the deployer 0x0+1: the fee recipient must be GENESIS_TREASURY" fake_call "$ga" "$gf" "$DEP"
+  c9_fee "a $gn fee recipient that is the deployer fails P2" 3 "$gn.$gf\\(\\) is the deployer 0x0+1: the fee recipient must be TREASURY" fake_call "$ga" "$gf" "$DEP"
 done
 c9_fee "an unreadable ComputeMarketplace fee recipient fails P2" 3 'cannot read ComputeMarketplace.treasury\(\)' rm -f "$FAKE/call/$C9CM/treasury"
 # One canonical spelling on the compare side: the gate compares canonical (lowercase) books, so
@@ -1493,22 +1508,22 @@ expect "ceremony: an ETH_KEYSTORE other than the --account keystore is refused" 
 expect "ceremony: ETH_KEYSTORE without --account is refused" 1 'ETH_KEYSTORE is set in the environment without --account' -- "${CEENV[@]}" ETH_KEYSTORE="$T/elsewhere/deployer" bash "$CE"
 expect "ceremony: keystore variables that agree with --account pass (control)" 0 'done \(mode=dry\)' -- "${CEENV[@]}" HOME="$T/kshome" ETH_KEYSTORE_ACCOUNT=deployer ETH_KEYSTORE="$T/kshome/.foundry/keystores/deployer" bash "$CE" --account deployer
 
-# C9: P2 hands DeployAll GENESIS_TREASURY as the fee recipient. P0 checks it whenever P2 runs,
+# C9: P2 hands DeployAll TREASURY as the fee recipient. P0 checks it whenever P2 runs,
 # before anything is sent; a run that does not reach P2 does not need it.
-for c in "unset:GENESIS_TREASURY=:GENESIS_TREASURY is not set" "the deployer:GENESIS_TREASURY=$(addr 1):GENESIS_TREASURY is the deployer" \
-  "zero:GENESIS_TREASURY=0x0000000000000000000000000000000000000000:GENESIS_TREASURY is the zero address" "malformed:GENESIS_TREASURY=0x12:GENESIS_TREASURY \\(0x12\\) is not an address"; do
+for c in "unset:TREASURY=:TREASURY is not set" "the deployer:TREASURY=$(addr 1):TREASURY \\(0x0+1\\) is the deployer" \
+  "zero:TREASURY=0x0000000000000000000000000000000000000000:TREASURY is the zero address" "malformed:TREASURY=0x12:TREASURY \\(0x12\\) is not an address"; do
   IFS=: read -r tn tv tp <<<"$c"
   reset_calls
-  expect "ceremony C9: a GENESIS_TREASURY that is $tn stops P2 at P0" 3 "GATE FAIL at P0: $tp" -- "${CEENV[@]}" "$tv" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
-  calls | grep -q '^regenesis' && bad "ceremony C9: a refused GENESIS_TREASURY ($tn) runs no regenesis" "$(calls)" || ok "ceremony C9: a refused GENESIS_TREASURY ($tn) runs no regenesis"
+  expect "ceremony C9: a TREASURY that is $tn stops P2 at P0" 3 "GATE FAIL at P0: phase inputs: .*$tp" -- "${CEENV[@]}" "$tv" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
+  calls | grep -q '^regenesis' && bad "ceremony C9: a refused TREASURY ($tn) runs no regenesis" "$(calls)" || ok "ceremony C9: a refused TREASURY ($tn) runs no regenesis"
 done
 mk_manifest "$GB" # a simulation run (the C9 cases above left a --confirm one)
 gov_book "$GB" "$DEP"
-expect "ceremony C9: --only P5 does not need GENESIS_TREASURY (control)" 0 'P0 preflight PASS' -- "${CEENV[@]}" GENESIS_TREASURY= RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
-expect "ceremony C9: a dry run plans without GENESIS_TREASURY and names it" 0 'P0 plan: .*GENESIS_TREASURY is not set' -- "${CEENV[@]}" GENESIS_TREASURY= bash "$CE"
+expect "ceremony C9: --only P5 does not need TREASURY (control)" 0 'P0 preflight PASS' -- "${CEENV[@]}" TREASURY= RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+expect "ceremony C9: a dry run plans without TREASURY and names it" 0 'P0 plan: .*TREASURY is not set' -- "${CEENV[@]}" TREASURY= bash "$CE"
 reset_calls
 "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2 >/dev/null 2>&1
-calls | grep -qx "regenesis-treasury $(addr 90)" && ok "ceremony C9: P2 hands regenesis.sh (DeployAll) GENESIS_TREASURY" || bad "ceremony C9: P2 hands regenesis.sh (DeployAll) GENESIS_TREASURY" "$(calls)"
+calls | grep -qx "regenesis-treasury $(addr 90)" && ok "ceremony C9: P2 hands regenesis.sh (DeployAll) TREASURY" || bad "ceremony C9: P2 hands regenesis.sh (DeployAll) TREASURY" "$(calls)"
 
 # The run manifest's temp file is created with O_EXCL: a symlink (or stale file) there is
 # refused, and what it points at is not written.
