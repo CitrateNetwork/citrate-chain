@@ -688,23 +688,32 @@ for s in scripts:
 PY
 }
 
-# C9: the fee recipients DeployAll derives from the deployer (treasury constructor arguments)
-# are read from the chain for every such contract the verified book lists, and must be the
-# book's deployer (= the run's, checked above), never a value only the environment supplied.
+# C9: the fee recipients DeployAll sets (treasury constructor arguments) are read from the
+# chain for every such contract the verified book lists. Since #396 DeployAll takes them from
+# the TREASURY input, which 40204 requires and which must not be the deployer (a P0 input,
+# checked before anything is sent); elsewhere, without TREASURY, they are the book's deployer.
 FEE_RECIPIENT_GETTERS=("X402Facilitator:treasury" "ModelMarketplace:treasuryAddress" "ComputeMarketplace:treasury")
 check_fee_recipients() {
-  local e name fn a got seen=""
+  local e name fn a got seen="" want who
+  if [[ -n "${TREASURY:-}" ]]; then
+    is_addr "$TREASURY" || gate_fail P2 "TREASURY is not an address"
+    [[ "$(lower "$TREASURY")" != "$RUN_DEPLOYER" ]] || gate_fail P2 "TREASURY is the deployer"
+    want=$(lower "$TREASURY") who="the TREASURY input"
+  else
+    [[ "$EXPECTED_CHAIN_ID" != 40204 ]] || gate_fail P2 "TREASURY must be set on 40204 (DeployAll's fee recipient)"
+    want="$RUN_DEPLOYER" who="the book's deployer"
+  fi
   for e in "${FEE_RECIPIENT_GETTERS[@]}"; do
     name="${e%%:*}" fn="${e#*:}"
     a=$(book_addr "$book_abs" "$name") || continue
     is_addr "$a" || gate_fail P2 "the book's $name ($a) is not an address"
     got=$(cast_read "$a" "$fn()(address)") && is_addr "$got" || gate_fail P2 "cannot read $name.$fn() at $a"
-    [[ "$(lower "$got")" == "$RUN_DEPLOYER" ]] ||
-      gate_fail P2 "$name.$fn() is $(lower "$got"), not the book's deployer $RUN_DEPLOYER"
+    [[ "$(lower "$got")" == "$want" ]] ||
+      gate_fail P2 "$name.$fn() is $(lower "$got"), not $who $want"
     seen+="${seen:+, }$name"
   done
   if [[ -n "$seen" ]]; then
-    log "P2 fee recipients are the run's deployer: $seen"
+    log "P2 fee recipients are $who $want: $seen"
   else
     log "P2 note: the book lists no contract with a deployer-derived fee recipient"
   fi

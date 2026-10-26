@@ -8,6 +8,7 @@
     "SIGNER_1": {"class": "p0", "type": "address", "phases": ["P2"], "why": "InstitutionalVault 2-of-3 signer (DeployEduStack); unset falls back to the deployer and the three must be distinct, which fails P2 after earlier steps broadcast"},
     "SIGNER_2": {"class": "p0", "type": "address", "phases": ["P2"], "why": "InstitutionalVault 2-of-3 signer (DeployEduStack)"},
     "SIGNER_3": {"class": "p0", "type": "address", "phases": ["P2"], "why": "InstitutionalVault 2-of-3 signer (DeployEduStack)"},
+    "TREASURY": {"class": "p0", "type": "address", "phases": ["P2"], "why": "DeployAll's fee recipient (#396); required on 40204 and never the deployer; P2's gate reads it back from the chain"},
     "RELAYER": {"class": "p0", "type": "address", "phases": ["P2"], "why": "the institutional relayer (DeployEduStack); unset falls back to the deployer, which must hold nothing after the handover"},
     "CITRATE_AA_OWNER": {"class": "p0", "type": "address", "phases": ["P2"], "why": "owner of the AA stack (aa/DeployAA requires it, mid-P2)"},
     "CITRATE_AA_IDENTITY_SIGNER": {"class": "p0", "type": "address", "phases": ["P2"], "why": "the deploy-permit signer (aa/DeployAA requires it, mid-P2)"},
