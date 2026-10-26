@@ -202,6 +202,47 @@ pub async fn initialize_genesis_with_dag(
 mod tests {
     use super::*;
 
+    async fn build_profile(chain_id: u64, profile: Option<&str>) -> anyhow::Result<[u8; 32]> {
+        use citrate_execution::StateDB;
+        use citrate_storage::pruning::PruningConfig;
+        let dir = tempfile::tempdir()?;
+        let st = Arc::new(StorageManager::new(dir.path(), PruningConfig::default())?);
+        let ex = Arc::new(Executor::with_storage_and_chain_id(
+            Arc::new(StateDB::new()),
+            Some(st.state.clone()),
+            chain_id,
+        ));
+        let cfg = GenesisConfig {
+            chain_id,
+            ..Default::default()
+        };
+        let h = initialize_genesis_state_with_profile(st, ex, &cfg, profile).await?;
+        Ok(*h.as_bytes())
+    }
+
+    /// r1006 must not reproduce r1005's block 0: the two networks are told apart by
+    /// genesis hash (K6, the UI truth contract, the handshake), and r1005's compiled
+    /// checkpoints are keyed by r1005's genesis, so they must not reach r1006.
+    #[tokio::test]
+    async fn r1006_profile_has_its_own_genesis_and_no_r1005_checkpoints() {
+        use citrate_consensus::hardening::{canonical_checkpoints, RELEASE_GENESIS};
+        let r1005 = RELEASE_GENESIS[0].1;
+        let g = build_profile(40204, Some("r1006"))
+            .await
+            .expect("the r1006 genesis builds (rehearsal mode)");
+        assert_ne!(
+            g,
+            r1005,
+            "the r1006 profile reproduced r1005's block 0 {}",
+            hex::encode(r1005)
+        );
+        assert!(
+            canonical_checkpoints(&g).is_empty(),
+            "r1005's checkpoints apply to r1006's genesis"
+        );
+        assert!(!canonical_checkpoints(&r1005).is_empty(), "negative control");
+    }
+
     #[test]
     fn test_genesis_block_height_zero() {
         let config = GenesisConfig::default();
