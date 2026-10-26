@@ -165,12 +165,28 @@ impl RocksDB {
         };
         db_opts.set_compression_type(compression);
 
+        // Memory budget (see `RocksMemoryBudget`): one database-wide memtable
+        // limit and one block cache shared by every column family, with index
+        // and filter blocks charged to that cache, so RocksDB's footprint does
+        // not scale with the number of column families or SST files.
+        let budget = RocksMemoryBudget::from_env();
+        db_opts.set_db_write_buffer_size(budget.memtable_bytes);
+        let block_cache = rocksdb::Cache::new_lru_cache(budget.block_cache_bytes);
+        let table_opts = || {
+            let mut t = rocksdb::BlockBasedOptions::default();
+            t.set_block_cache(&block_cache);
+            t.set_cache_index_and_filter_blocks(true);
+            t.set_pin_l0_filter_and_index_blocks_in_cache(true);
+            t
+        };
+
         // Performance optimizations
         db_opts.set_write_buffer_size(128 * 1024 * 1024); // 128MB
         db_opts.set_max_write_buffer_number(3);
         db_opts.set_target_file_size_base(64 * 1024 * 1024); // 64MB
         db_opts.set_max_bytes_for_level_base(512 * 1024 * 1024); // 512MB
         db_opts.increase_parallelism(num_cpus::get() as i32);
+        db_opts.set_block_based_table_factory(&table_opts());
 
         // Create column family descriptors
         let cfs: Vec<ColumnFamilyDescriptor> = all_column_families()
@@ -178,13 +194,18 @@ impl RocksDB {
             .map(|name| {
                 let mut cf_opts = Options::default();
                 cf_opts.set_compression_type(compression);
+                cf_opts.set_block_based_table_factory(&table_opts());
                 ColumnFamilyDescriptor::new(name, cf_opts)
             })
             .collect();
 
         let db = DB::open_cf_descriptors(&db_opts, path, cfs)?;
 
-        info!("RocksDB opened successfully");
+        info!(
+            "RocksDB opened successfully (memtable budget {} MiB, shared block cache {} MiB)",
+            budget.memtable_bytes / (1024 * 1024),
+            budget.block_cache_bytes / (1024 * 1024)
+        );
         Ok(Self {
             db: Arc::new(db),
             cipher,
@@ -483,6 +504,53 @@ impl Clone for RocksDB {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn memory_budget_overrides_parse_and_clamp() {
+        let d = RocksMemoryBudget::default();
+        assert_eq!(RocksMemoryBudget::from_values(None, None), d);
+        assert_eq!(RocksMemoryBudget::from_values(Some("junk"), Some("")), d);
+        let b = RocksMemoryBudget::from_values(Some(" 256 "), Some("32"));
+        assert_eq!(b.memtable_bytes, 256 * 1024 * 1024);
+        assert_eq!(b.block_cache_bytes, 32 * 1024 * 1024);
+        // Below the floor is raised, never honoured (0 would flush every write).
+        let tiny = RocksMemoryBudget::from_values(Some("0"), Some("1"));
+        assert_eq!(tiny.memtable_bytes, 8 * 1024 * 1024);
+        assert_eq!(tiny.block_cache_bytes, 8 * 1024 * 1024);
+    }
+
+    /// The shared block cache never grows past its capacity, however many
+    /// column families are read.
+    #[test]
+    fn block_cache_is_shared_and_bounded() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = RocksDB::open(temp_dir.path()).unwrap();
+        let value = vec![0x5Au8; 4096];
+        let cfs = all_column_families();
+        for cf in &cfs {
+            let mut batch = db.batch();
+            for i in 0u64..1024 {
+                db.batch_put_cf(&mut batch, cf, &i.to_be_bytes(), &value).unwrap();
+            }
+            db.write_batch(batch).unwrap();
+        }
+        db.flush().unwrap();
+        for cf in &cfs {
+            for i in 0u64..1024 {
+                assert!(db.get_cf(cf, &i.to_be_bytes()).unwrap().is_some());
+            }
+        }
+        let usage = db.memory_usage();
+        let cap = RocksMemoryBudget::default().block_cache_bytes as u64;
+        assert!(usage.block_cache > 0, "reads should populate the cache");
+        assert!(usage.block_cache <= cap, "block cache {} > cap {cap}", usage.block_cache);
+        // One cache: every CF reports the same usage figure.
+        assert_eq!(
+            usage.block_cache_sum_over_cfs,
+            usage.block_cache * cfs.len() as u64,
+            "column families are not sharing one block cache"
+        );
+    }
 
     /// Memtables are bounded in TOTAL, not just per column family. Writing a
     /// few MB into each of the ~22 column families stays under every per-CF
