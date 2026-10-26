@@ -47,3 +47,7 @@ jobs:
             echo "::endgroup::"
           done
           exit "$rc"
+      # The same scans run in the macOS pre-push hook: BSD xargs flags only, and a scan that
+      # lists no files for a non-empty tree must fail instead of reporting clean.
+      - name: Tripwire portability and fail-closed test
+        run: bash scripts/tests/test_tripwires_portable.sh
