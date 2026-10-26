@@ -36,6 +36,10 @@
 #                           - the root governance block is GOVERNANCE/GUARDIAN from the env
 #                             (the ceremony sets them from its P1 output), when both are set.
 #                         Re-running it over the same broadcasts and env gives the same file.
+#   EMIT_MEMBERSHIP_SCRIPT  the broadcast the membership entries come from:
+#                         DeployCoreMembership.s.sol (default, the reroll path) or
+#                         DeployGenesisMembership.s.sol (chain#331; regenesis.sh
+#                         --genesis-membership sets it). Only that one is read.
 #
 # Dependencies: jq (for JSON parsing).
 #
@@ -52,6 +56,7 @@ ENV_TESTNET="${ENV_TESTNET:-${REPO_ROOT}/../.env.testnet}"
 FRESH="${EMIT_FRESH_GENESIS:-0}"
 
 CHAIN_ID=40204
+MEMBERSHIP_SCRIPT="${EMIT_MEMBERSHIP_SCRIPT:-DeployCoreMembership.s.sol}"
 
 err() { echo "[emit-address-table] ERROR: $*" >&2; }
 log() { echo "[emit-address-table] $*"; }
@@ -76,6 +81,10 @@ elif [[ "$FRESH" != "0" ]]; then
   err "EMIT_FRESH_GENESIS must be 0 or 1"
   exit 1
 fi
+case "$MEMBERSHIP_SCRIPT" in
+  DeployCoreMembership.s.sol | DeployGenesisMembership.s.sol) ;;
+  *) err "EMIT_MEMBERSHIP_SCRIPT must be DeployCoreMembership.s.sol or DeployGenesisMembership.s.sol (got ${MEMBERSHIP_SCRIPT})"; exit 1 ;;
+esac
 
 # bc_usable <broadcast>: in a fresh genesis, only a broadcast recorded at or after
 # EMIT_BROADCAST_SINCE counts (forge writes .timestamp in seconds; older Foundry in ms).
@@ -113,10 +122,12 @@ CEREMONIES=(
   # table — the contract was live and unreachable for every consumer, and the
   # WO-1 handoff recorded it as "not delivered" as a result.
   "DeployValidatorRegistry.s.sol"
-  # Core membership (regenesis.sh runs it last): CitrateMemberSBT, MemberBond, the
+  # Membership (regenesis.sh runs it last): CitrateMemberSBT, MemberBond, the
   # MembershipStakeVault implementation and its ERC1967Proxy. The PROXY is the vault address
-  # the federation pins, so it is special-cased below like DeployScopedSBTs.
-  "DeployCoreMembership.s.sol"
+  # the federation pins, so it is special-cased below like DeployScopedSBTs. Which script
+  # deployed it is EMIT_MEMBERSHIP_SCRIPT (DeployCoreMembership, or DeployGenesisMembership in
+  # the genesis ceremony); the other one's broadcast is not read.
+  "$MEMBERSHIP_SCRIPT"
   # Homestead org-scoped SBTs (cit-agent hierarchy): FacilitySBT + NetworkSBT,
   # each deployed behind a UUPS ERC1967Proxy. The PROXY is the canonical,
   # frozen address-book entry (the impl is upgradeable behind it). Because both
@@ -180,8 +191,8 @@ for ceremony in "${CEREMONIES[@]}"; do
       | with_entries(select(.value != "") | .value |= ascii_downcase)
     ' "$bc")
     jq --argjson new "$pairs" '. + $new' "$contracts_jq" > "${contracts_jq}.tmp" && mv "${contracts_jq}.tmp" "$contracts_jq"
-  elif [[ "$ceremony" == "DeployCoreMembership.s.sol" ]]; then
-    # DeployCoreMembership.s.sol deploys CitrateMemberSBT, MemberBond, the MembershipStakeVault
+  elif [[ "$ceremony" == "$MEMBERSHIP_SCRIPT" ]]; then
+    # The membership script deploys CitrateMemberSBT, MemberBond, the MembershipStakeVault
     # implementation, then ERC1967Proxy(impl, initialize(...)). The book keeps the
     # implementation/proxy distinction: MembershipStakeVaultImpl is the implementation,
     # MembershipStakeVault is the proxy (THE vault address).

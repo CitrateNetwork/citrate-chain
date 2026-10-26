@@ -8,9 +8,9 @@ name: genesis-scripts
 on:
   push:
     branches: [main]
-    paths: ['scripts/genesis/**', 'scripts/ci/deployer_input_override_tripwire.sh', 'scripts/ops/regenesis.sh', 'scripts/ops/emit-address-table.sh', 'scripts/ci/check-create2-determinism.sh', 'contracts/script/DeployValidatorRegistry.s.sol', 'contracts/script/DeployCoreMembership.s.sol', 'contracts/script/ScriptEnv.sol', 'contracts/script/CheckDeployedAdmins.s.sol', 'contracts/script/lib/AdminChecks.sol', '.github/workflows/genesis-scripts.yml']
+    paths: ['scripts/genesis/**', 'scripts/ci/deployer_input_override_tripwire.sh', 'scripts/ops/regenesis.sh', 'scripts/ops/emit-address-table.sh', 'scripts/ci/check-create2-determinism.sh', 'contracts/script/DeployValidatorRegistry.s.sol', 'contracts/script/DeployCoreMembership.s.sol', 'contracts/script/DeployGenesisMembership.s.sol', 'contracts/script/ScriptEnv.sol', 'contracts/script/CheckDeployedAdmins.s.sol', 'contracts/script/lib/AdminChecks.sol', '.github/workflows/genesis-scripts.yml']
   pull_request:
-    paths: ['scripts/genesis/**', 'scripts/ci/deployer_input_override_tripwire.sh', 'scripts/ops/regenesis.sh', 'scripts/ops/emit-address-table.sh', 'scripts/ci/check-create2-determinism.sh', 'contracts/script/DeployValidatorRegistry.s.sol', 'contracts/script/DeployCoreMembership.s.sol', 'contracts/script/ScriptEnv.sol', 'contracts/script/CheckDeployedAdmins.s.sol', 'contracts/script/lib/AdminChecks.sol', '.github/workflows/genesis-scripts.yml']
+    paths: ['scripts/genesis/**', 'scripts/ci/deployer_input_override_tripwire.sh', 'scripts/ops/regenesis.sh', 'scripts/ops/emit-address-table.sh', 'scripts/ci/check-create2-determinism.sh', 'contracts/script/DeployValidatorRegistry.s.sol', 'contracts/script/DeployCoreMembership.s.sol', 'contracts/script/DeployGenesisMembership.s.sol', 'contracts/script/ScriptEnv.sol', 'contracts/script/CheckDeployedAdmins.s.sol', 'contracts/script/lib/AdminChecks.sol', '.github/workflows/genesis-scripts.yml']
   workflow_dispatch:
 
 permissions:

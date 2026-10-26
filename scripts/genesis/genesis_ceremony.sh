@@ -8,8 +8,10 @@
 #                      (written on a fresh run, re-verified on every resume)
 #   P1  governance     DeployGenesisGovernance: GOVERNANCE + GUARDIAN timelocks, each
 #                      fronted by an m-of-n MultisigProposer; deployer renounces in-run
-#   P2  stack          scripts/ops/regenesis.sh --reroll --with-aa (registries, VR, AA,
-#                      membership), with GOVERNANCE/GUARDIAN taken from P1's output; its
+#   P2  stack          scripts/ops/regenesis.sh --reroll --with-aa --genesis-membership
+#                      (registries, VR, AA, then membership through chain#331's
+#                      DeployGenesisMembership, never the r1005 DeployCoreMembership), with
+#                      GOVERNANCE/GUARDIAN taken from P1's output; its
 #                      address book comes from emit-address-table.sh in fresh-genesis mode
 #                      (this run's deployer and broadcasts only) and, on --confirm, is
 #                      re-derived, checked against the broadcasts and recorded (C8)
@@ -44,7 +46,8 @@
 #   GOV_OWNERS, GOV_THRESHOLD, GOV_MIN_DELAY, GOV_PROPOSAL_TTL      (holders OPEN)
 #   GRD_OWNERS, GRD_THRESHOLD, GRD_MIN_DELAY, GRD_PROPOSAL_TTL      (holders OPEN)
 #   TEAM_VESTING_FILE (OPEN amounts/schedule; must sit under contracts/genesis/)
-#   PATRONAGE_KYC_REGISTRY, PATRONAGE_MEMBERSHIP, MEMBERSHIP_OWNER, plus regenesis.sh's env
+#   PATRONAGE_KYC_REGISTRY, PATRONAGE_MEMBERSHIP, plus regenesis.sh's env
+#   MEMBERSHIP_GRANTOR (the treasury-signer address that places membership grants; P2)
 #   KEEP_LIST (the rehearsal-1 freeze) · FLEET_RPCS (comma-separated)
 #   GENESIS_OUT_DIR (contracts/genesis) · ADDRESS_BOOK (contracts/addresses/40204.json)
 #
@@ -93,7 +96,8 @@
 #      --confirm P2 the ceremony re-runs the generator into a scratch file and requires the
 #      same book byte for byte, requires the book's deployer, ValidatorRegistry and membership
 #      entries (SBT, MemberBond, vault implementation, vault proxy, root aliases) to be this
-#      run's broadcasts, and records the book in the manifest (stackBook). P5 and P6 read only
+#      run's broadcasts (membership: DeployGenesisMembership's), and records the book in the
+#      manifest (stackBook). P5 and P6 read only
 #      that book on --confirm (and check it whenever it is recorded).
 #   C9 one deployer: CEREMONY_DEPLOYER_ADDRESS (which the deploy scripts prefer), DEPLOYER and
 #      EMIT_DEPLOYER, when preset, must be DEPLOYER_ADDRESS byte for byte (an empty value, another
@@ -188,9 +192,14 @@ OUT="$out_abs"
 GOV_REL="$OUT_REL/governance.json"
 VEST_REL="$OUT_REL/team-vesting.json"
 DORMANT_REL="$OUT_REL/dormant-ledgers.json"
+MEMB_REL="$OUT_REL/membership.json"
 GOV_BOOK="$CONTRACTS/$GOV_REL"
 VEST_BOOK="$CONTRACTS/$VEST_REL"
 DORMANT_BOOK="$CONTRACTS/$DORMANT_REL"
+MEMB_BOOK="$CONTRACTS/$MEMB_REL"
+# G9: the genesis membership deploy (chain#331). P2 runs it through regenesis.sh
+# --genesis-membership, and the generator reads the membership from its broadcast.
+GENESIS_MEMBERSHIP_SCRIPT=DeployGenesisMembership.s.sol
 RUN_MANIFEST="$OUT/ceremony-run.json"
 EMITTER="${EMITTER:-$REPO_ROOT/scripts/ops/emit-address-table.sh}"
 book_abs=$(norm_path "$ADDRESS_BOOK") || die "cannot resolve ADDRESS_BOOK $ADDRESS_BOOK" 1
@@ -484,11 +493,11 @@ verify_stack_book() {
   check="$OUT/stack-book.check.json"
   rm -f "$check"
   EMIT_FRESH_GENESIS=1 EMIT_DEPLOYER="$RUN_DEPLOYER" EMIT_BROADCAST_SINCE="$RUN_G0TS" EMIT_OUTPUT="$check" \
-    bash "$EMITTER" >"$OUT/stack-book.check.log" 2>&1 ||
+    EMIT_MEMBERSHIP_SCRIPT="$GENESIS_MEMBERSHIP_SCRIPT" bash "$EMITTER" >"$OUT/stack-book.check.log" 2>&1 ||
     gate_fail P2 "re-running the generator failed (see $OUT/stack-book.check.log)"
-  why=$("$PY" - "$book_abs" "$check" "$RUN_DEPLOYER" "$CONTRACTS/broadcast" "$EXPECTED_CHAIN_ID" "$RUN_G0TS" <<'PY' 2>&1
+  why=$("$PY" - "$book_abs" "$check" "$RUN_DEPLOYER" "$CONTRACTS/broadcast" "$EXPECTED_CHAIN_ID" "$RUN_G0TS" "$GENESIS_MEMBERSHIP_SCRIPT" <<'PY' 2>&1
 import json, sys
-book_p, check_p, dep, bdir, cid, since = sys.argv[1:7]
+book_p, check_p, dep, bdir, cid, since, mscript = sys.argv[1:8]
 since = int(since)
 book, check = json.load(open(book_p)), json.load(open(check_p))
 if book != check:
@@ -514,7 +523,7 @@ def deployed(script, with_names):
     return got
 c = {k: v.lower() for k, v in book.get("contracts", {}).items()}
 vr = deployed("DeployValidatorRegistry.s.sol", {"ValidatorRegistry"})
-m = deployed("DeployCoreMembership.s.sol", {"CitrateMemberSBT", "MemberBond", "MembershipStakeVault", "ERC1967Proxy"})
+m = deployed(mscript, {"CitrateMemberSBT", "MemberBond", "MembershipStakeVault", "ERC1967Proxy"})
 want = {
     "ValidatorRegistry": vr.get("ValidatorRegistry"),
     "CitrateMemberSBT": m.get("CitrateMemberSBT"),
@@ -728,6 +737,8 @@ if should P0 || [[ "$MODE" != dry ]]; then
   for s in DeployGenesisGovernance.s.sol DeployTeamVesting.s.sol DeployDormantLedgers.s.sol CheckDeployedAdmins.s.sol; do
     [[ -f "$CONTRACTS/script/$s" ]] || gate_fail P0 "contracts/script/$s is missing (the genesis contract set, chain#320, must be merged)"
   done
+  [[ -f "$CONTRACTS/script/$GENESIS_MEMBERSHIP_SCRIPT" ]] ||
+    gate_fail P0 "contracts/script/$GENESIS_MEMBERSHIP_SCRIPT is missing (the genesis membership path, chain#331, must be merged)"
   [[ -x "$REGENESIS" || -f "$REGENESIS" ]] || gate_fail P0 "$REGENESIS is missing"
   if [[ -n "${TEAM_VESTING_FILE:-}" ]]; then
     [[ -f "$TEAM_VESTING_FILE" || -f "$CONTRACTS/$TEAM_VESTING_FILE" ]] || gate_fail P0 "TEAM_VESTING_FILE not found (a path relative to contracts/, under genesis/)"
@@ -735,7 +746,7 @@ if should P0 || [[ "$MODE" != dry ]]; then
   [[ -z "${KEEP_LIST:-}" || -f "$KEEP_LIST" ]] || gate_fail P0 "KEEP_LIST not found"
   if [[ "$MODE" == confirm ]]; then
     [[ -n "$ACCOUNT" ]] || gate_fail P0 "--confirm needs --account (Foundry keystore)"
-    need_env RPC_URL EXPECTED_GENESIS_HASH TEAM_VESTING_FILE KEEP_LIST FLEET_RPCS
+    need_env RPC_URL EXPECTED_GENESIS_HASH TEAM_VESTING_FILE KEEP_LIST FLEET_RPCS MEMBERSHIP_GRANTOR
     if ! is_local_rpc "$RPC_URL" && [[ "${CITRATE_ALLOW_REMOTE:-0}" != 1 ]]; then
       gate_fail P0 "RPC_URL is not loopback; a live broadcast needs CITRATE_ALLOW_REMOTE=1 as well"
     fi
@@ -760,7 +771,7 @@ if should P0 || [[ "$MODE" != dry ]]; then
   if [[ "$MODE" != dry ]]; then
     # A phase about to write a book must not find one already there: it would be an earlier
     # run's (or a simulation's) output, and later phases would read it as this run's.
-    for pb in "P1:$GOV_BOOK" "P3:$VEST_BOOK" "P4:$DORMANT_BOOK"; do
+    for pb in "P1:$GOV_BOOK" "P2:$MEMB_BOOK" "P3:$VEST_BOOK" "P4:$DORMANT_BOOK"; do
       if should "${pb%%:*}" && [[ -e "${pb#*:}" ]]; then
         gate_fail P0 "${pb#*:} already exists and ${pb%%:*} would write it; move it aside (it is not this ceremony's output) or resume after ${pb%%:*}"
       fi
@@ -813,14 +824,19 @@ fi
 if should P2; then
   # --confirm: the council the registry will be governed by is proven on chain first (C3).
   load_governance P2 "$([[ "$MODE" == confirm ]] && echo 1 || echo 0)"
-  rargs=(--reroll --with-aa)
+  rargs=(--reroll --with-aa --genesis-membership)
+  # G9: the membership deploy is chain#331's DeployGenesisMembership. It reads P1's governance
+  # (GOVERNANCE_TIMELOCK / GOVERNANCE_MULTISIG, from load_governance) and its book, the grantor,
+  # and writes its own book into this run's output directory.
+  export GENESIS_MEMBERSHIP_OUT="$MEMB_REL" GENESIS_GOVERNANCE_BOOK="$GOV_REL"
   # The keystore account and, when given, the password file (a path, never the password) go
   # through to every forge step regenesis.sh runs, as P1/P3/P4 get them (SIGN).
   if [[ "$MODE" == confirm ]]; then rargs+=(--broadcast "${SIGN[@]}"); fi
   log "P2 contract stack via regenesis.sh; address book → $ADDRESS_BOOK (fresh genesis)"
   if [[ "$MODE" == dry ]]; then
-    describe_cmd RPC_URL='$RPC_URL' DEPLOYER_ADDRESS='$DEPLOYER_ADDRESS' EMIT_FRESH_GENESIS=1 EMIT_DEPLOYER='<manifest deployer>' \
-      EMIT_BROADCAST_SINCE='<manifest block-0 timestamp>' EMIT_OUTPUT="$book_abs" bash "$REGENESIS" "${rargs[@]}"
+    describe_cmd RPC_URL='$RPC_URL' DEPLOYER_ADDRESS='$DEPLOYER_ADDRESS' MEMBERSHIP_GRANTOR='$MEMBERSHIP_GRANTOR' \
+      GENESIS_MEMBERSHIP_OUT="$MEMB_REL" GENESIS_GOVERNANCE_BOOK="$GOV_REL" EMIT_FRESH_GENESIS=1 EMIT_MEMBERSHIP_SCRIPT="$GENESIS_MEMBERSHIP_SCRIPT" \
+      EMIT_DEPLOYER='<manifest deployer>' EMIT_BROADCAST_SINCE='<manifest block-0 timestamp>' EMIT_OUTPUT="$book_abs" bash "$REGENESIS" "${rargs[@]}"
   else
     # C8: the generator gets this run's deployer, block 0 and book path; a preset that says
     # otherwise is refused before anything is sent.
@@ -836,7 +852,18 @@ if should P2; then
       gate_fail P2 "EMIT_BROADCAST_SINCE is set to $EMIT_BROADCAST_SINCE, but this run's block 0 is at $RUN_G0TS"
     [[ -z "${EMIT_FRESH_GENESIS:-}" || "$EMIT_FRESH_GENESIS" == 1 ]] ||
       gate_fail P2 "EMIT_FRESH_GENESIS is set to $EMIT_FRESH_GENESIS; a genesis ceremony always regenerates a fresh book"
+    [[ -z "${EMIT_MEMBERSHIP_SCRIPT:-}" || "$EMIT_MEMBERSHIP_SCRIPT" == "$GENESIS_MEMBERSHIP_SCRIPT" ]] ||
+      gate_fail P2 "EMIT_MEMBERSHIP_SCRIPT is set to $EMIT_MEMBERSHIP_SCRIPT; the genesis membership is $GENESIS_MEMBERSHIP_SCRIPT, unset it"
+    # G9: the grantor (the treasury signer that places grants) is a real, separate account.
+    [[ -n "${MEMBERSHIP_GRANTOR:-}" ]] || gate_fail P2 "MEMBERSHIP_GRANTOR is not set (the treasury-signer address that places membership grants)"
+    is_addr "$MEMBERSHIP_GRANTOR" || gate_fail P2 "MEMBERSHIP_GRANTOR ($MEMBERSHIP_GRANTOR) is not an address"
+    g=$(lower "$MEMBERSHIP_GRANTOR")
+    [[ "$g" != "$RUN_DEPLOYER" ]] || gate_fail P2 "MEMBERSHIP_GRANTOR ($MEMBERSHIP_GRANTOR) is the deployer; the grant signer is a separate account"
+    for a in "$GOVERNANCE" "$GOVERNANCE_MULTISIG" "$GUARDIAN" "$GUARDIAN_MULTISIG" 0x0000000000000000000000000000000000000000; do
+      [[ "$g" != "$(lower "$a")" ]] || gate_fail P2 "MEMBERSHIP_GRANTOR ($MEMBERSHIP_GRANTOR) is a governance contract or the zero address"
+    done
     export EMIT_FRESH_GENESIS=1 EMIT_DEPLOYER="$RUN_DEPLOYER" EMIT_BROADCAST_SINCE="$RUN_G0TS" EMIT_OUTPUT="$book_abs"
+    export EMIT_MEMBERSHIP_SCRIPT="$GENESIS_MEMBERSHIP_SCRIPT" MEMBERSHIP_GRANTOR
     RPC_URL="$RPC_URL" bash "$REGENESIS" "${rargs[@]}" || step_fail P2 regenesis.sh
     if [[ "$MODE" == confirm ]]; then
       verify_stack_book

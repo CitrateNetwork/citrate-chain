@@ -21,7 +21,15 @@
 #     scripts/ceremony/REROLL_FANOUT.md).
 #
 # The ValidatorRegistry address is captured from its broadcast and exported as
-# VALIDATOR_REGISTRY so DeployCoreMembership derives (never hardcodes) it.
+# VALIDATOR_REGISTRY so the membership step derives (never hardcodes) it.
+#
+# MEMBERSHIP: by default the last step is DeployCoreMembership (the r1005 path the reroll
+# runbooks use). `--genesis-membership` (the G5 genesis ceremony, scripts/genesis/
+# genesis_ceremony.sh P2) runs DeployGenesisMembership instead (chain#331, Track M: the vault's
+# upgrade authority is the GOVERNANCE timelock, the grant signer holds only the grant role). It
+# needs GOVERNANCE_TIMELOCK, GOVERNANCE_MULTISIG, MEMBERSHIP_GRANTOR and GENESIS_MEMBERSHIP_OUT
+# (GENESIS_GOVERNANCE_BOOK is passed through when set), refuses to start without them, and tells
+# the address-book generator which broadcast holds the membership (EMIT_MEMBERSHIP_SCRIPT).
 #
 # Usage:
 #   RPC_URL=http://localhost:8545 DEPLOYER_ADDRESS=0x.. \
@@ -29,6 +37,8 @@
 #
 # Flags:
 #   --reroll        fresh-keys reroll mode (CITRATE_REROLL=1)
+#   --genesis-membership  deploy membership with DeployGenesisMembership (chain#331), not
+#                   DeployCoreMembership (see MEMBERSHIP above)
 #   --with-aa       also run the ERC-4337 AA stack (DeployAA) + P256 verifier
 #   --broadcast     actually send txs (omit = simulate only; safe dry-run)
 #   --account NAME  forge keystore account to sign with (passed through)
@@ -54,6 +64,7 @@ die()  { err "$*"; exit 1; }
 
 REROLL=0
 WITH_AA=0
+GENESIS_MEMBERSHIP=0
 BROADCAST=0
 SIGNER_ARGS=()
 ACCOUNT_SET=0
@@ -62,6 +73,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --reroll)      REROLL=1; shift ;;
     --with-aa)     WITH_AA=1; shift ;;
+    --genesis-membership) GENESIS_MEMBERSHIP=1; shift ;;
     --broadcast)   BROADCAST=1; shift ;;
     --account)     SIGNER_ARGS+=(--account "$2"); ACCOUNT_SET=1; shift 2 ;;
     --password-file) PASSWORD_FILE="${2:-}"; shift 2 ;;
@@ -90,6 +102,23 @@ if [[ -n "${CEREMONY_DEPLOYER_ADDRESS+x}" && "${CEREMONY_DEPLOYER_ADDRESS}" != "
   die "CEREMONY_DEPLOYER_ADDRESS (${CEREMONY_DEPLOYER_ADDRESS:-<empty>}) is not exactly DEPLOYER_ADDRESS (${DEPLOYER_ADDRESS}); unset it or set it to the same value"
 fi
 export CEREMONY_DEPLOYER_ADDRESS="$DEPLOYER_ADDRESS"
+
+# Which membership deploy runs last, and which broadcast the generator reads it from. Checked
+# before the build, so a refused input sends nothing.
+MEMBERSHIP_SCRIPT="DeployCoreMembership.s.sol"
+if [[ "$GENESIS_MEMBERSHIP" == "1" ]]; then
+  MEMBERSHIP_SCRIPT="DeployGenesisMembership.s.sol"
+  [[ -f "${CONTRACTS}/script/${MEMBERSHIP_SCRIPT}" ]] ||
+    die "contracts/script/${MEMBERSHIP_SCRIPT} is missing (chain#331, the genesis membership path, must be merged)"
+  for v in GOVERNANCE_TIMELOCK GOVERNANCE_MULTISIG MEMBERSHIP_GRANTOR; do
+    [[ "${!v:-}" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "--genesis-membership needs $v (an address; got '${!v:-}')"
+  done
+  [[ -n "${GENESIS_MEMBERSHIP_OUT:-}" ]] || die "--genesis-membership needs GENESIS_MEMBERSHIP_OUT (the membership book path, relative to contracts/)"
+fi
+if [[ -n "${EMIT_MEMBERSHIP_SCRIPT:-}" && "$EMIT_MEMBERSHIP_SCRIPT" != "$MEMBERSHIP_SCRIPT" ]]; then
+  die "EMIT_MEMBERSHIP_SCRIPT is set to ${EMIT_MEMBERSHIP_SCRIPT}, but this run deploys membership with ${MEMBERSHIP_SCRIPT}; unset it"
+fi
+export EMIT_MEMBERSHIP_SCRIPT="$MEMBERSHIP_SCRIPT"
 
 if [[ "$REROLL" == "1" ]]; then
   export CITRATE_REROLL=1
@@ -137,16 +166,16 @@ run_step() {
 run_step "DeployAll.s.sol"
 run_step "DeployValidatorRegistry.s.sol"
 
-# Capture the just-deployed ValidatorRegistry so DeployCoreMembership derives it.
+# Capture the just-deployed ValidatorRegistry so the membership step derives it.
 VR_BROADCAST="${CONTRACTS}/broadcast/DeployValidatorRegistry.s.sol/${CHAIN_ID}/run-latest.json"
 if [[ -f "$VR_BROADCAST" ]]; then
   VR_ADDR="$(jq -r '[.transactions[] | select(.contractName=="ValidatorRegistry") | .contractAddress] | last // empty' "$VR_BROADCAST")"
   if [[ -n "$VR_ADDR" && "$VR_ADDR" != "null" ]]; then
     export VALIDATOR_REGISTRY="$VR_ADDR"
-    log "captured VALIDATOR_REGISTRY=$VALIDATOR_REGISTRY (fed to DeployCoreMembership)"
+    log "captured VALIDATOR_REGISTRY=$VALIDATOR_REGISTRY (fed to ${MEMBERSHIP_SCRIPT%.s.sol})"
   fi
 fi
-[[ -n "${VALIDATOR_REGISTRY:-}" ]] || log "WARN: VALIDATOR_REGISTRY not captured (simulate mode writes no broadcast); set it before DeployCoreMembership."
+[[ -n "${VALIDATOR_REGISTRY:-}" ]] || log "WARN: VALIDATOR_REGISTRY not captured (simulate mode writes no broadcast); set it before ${MEMBERSHIP_SCRIPT%.s.sol}."
 
 run_step "DeployModelAccessControl.s.sol"
 run_step "DeployTEEAttestationRegistry.s.sol"
@@ -162,11 +191,13 @@ if [[ "$WITH_AA" == "1" ]]; then
   run_step "aa/DeployAA.s.sol"
 fi
 
-# CoreMembership last — it derives VALIDATOR_REGISTRY (env) + MEMBERSHIP_OWNER (env).
+# Membership last: it derives VALIDATOR_REGISTRY (env). DeployCoreMembership reads
+# MEMBERSHIP_OWNER; DeployGenesisMembership reads GOVERNANCE_TIMELOCK, GOVERNANCE_MULTISIG,
+# MEMBERSHIP_GRANTOR, GENESIS_MEMBERSHIP_OUT and GENESIS_GOVERNANCE_BOOK (see MEMBERSHIP above).
 if [[ -n "${VALIDATOR_REGISTRY:-}" ]]; then
-  run_step "DeployCoreMembership.s.sol"
+  run_step "$MEMBERSHIP_SCRIPT"
 else
-  log "SKIP DeployCoreMembership (no VALIDATOR_REGISTRY captured — simulate mode)."
+  log "SKIP ${MEMBERSHIP_SCRIPT%.s.sol} (no VALIDATOR_REGISTRY captured — simulate mode)."
 fi
 
 # ---------------------------------------------------------------------------

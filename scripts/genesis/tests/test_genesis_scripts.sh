@@ -1460,7 +1460,7 @@ SOL
   cp "$SRC/script/lib/AdminChecks.sol" "$IC/script/lib/"
   cp "$SRC/src/aa/lib/webauthn/P256.sol" "$IC/src/aa/lib/webauthn/"
   # P0 only checks that the other ceremony scripts exist.
-  for s in DeployGenesisGovernance DeployTeamVesting DeployDormantLedgers; do
+  for s in DeployGenesisGovernance DeployTeamVesting DeployDormantLedgers DeployGenesisMembership; do
     printf '// SPDX-License-Identifier: Apache-2.0\npragma solidity ^0.8.26;\n' >"$IC/script/$s.s.sol"
   done
   printf '#!/usr/bin/env bash\nexit 0\n' >"$IR/scripts/ops/regenesis.sh"
