@@ -87,6 +87,61 @@ async fn concurrent_admission_and_selection_make_progress() {
     );
 }
 
+// The producer reconciles the per-sender nonce index after every block, while
+// RPC and gossip keep admitting. Same liveness requirement as above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_admission_and_reconcile_make_progress() {
+    let pool = Arc::new(
+        Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            min_gas_price: 0,
+            chain_id: 40204,
+            ..Default::default()
+        })
+        .with_state_balance_reader(Arc::new(|_: &PublicKey| u128::MAX)),
+    );
+
+    let work = {
+        let pool = pool.clone();
+        async move {
+            let reconciler = {
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    for _ in 0..2_000 {
+                        pool.reconcile_nonces().await;
+                        tokio::task::yield_now().await;
+                    }
+                })
+            };
+            let mut adders = Vec::new();
+            for s in 0..SENDERS {
+                let pool = pool.clone();
+                adders.push(tokio::spawn(async move {
+                    for n in 0..NONCES_PER_SENDER {
+                        let _ = pool.add_transaction(tx(s, n), TxClass::Standard).await;
+                    }
+                }));
+            }
+            for a in adders {
+                a.await.expect("adder task");
+            }
+            reconciler.await.expect("reconciler task");
+        }
+    };
+
+    let finished = tokio::time::timeout(Duration::from_secs(60), work).await;
+    assert!(
+        finished.is_ok(),
+        "admission + reconcile_nonces did not finish within 60s: the two take \
+         the pool's locks in different orders"
+    );
+    assert_eq!(
+        pool.stats().await.total_transactions,
+        usize::from(SENDERS) * NONCES_PER_SENDER as usize,
+        "every admitted transaction is still pooled"
+    );
+}
+
 // Every pool entry point at once: admission (with eviction from a full pool),
 // the producer's select / remove-included / reconcile cycle, and the periodic
 // expiry, ban and read paths, across many senders. Each path takes a different
@@ -95,7 +150,7 @@ async fn concurrent_admission_and_selection_make_progress() {
 
 const STRESS_SENDERS: u16 = 96;
 const STRESS_NONCES: u64 = 24;
-const STRESS_ROUNDS: usize = 400;
+const STRESS_ROUNDS: usize = 1_500;
 
 fn stress_tx(sender: u16, nonce: u64) -> Transaction {
     let mut h = [0u8; 32];
