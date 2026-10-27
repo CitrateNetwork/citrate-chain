@@ -87,8 +87,8 @@ case "${args[0]}" in
   chain-id) [[ -f "$d/chain-id" ]] || exit 1; cat "$d/chain-id" ;;
   block-number) [[ -f "$d/head" ]] || exit 1; cat "$d/head" ;;
   block)
-    if [[ "${field:-}" == timestamp ]]; then
-      [[ -f "$d/block-${args[1]}-timestamp" ]] || exit 1; cat "$d/block-${args[1]}-timestamp"
+    if [[ -n "${field:-}" && "$field" != hash ]]; then
+      [[ -f "$d/block-${args[1]}-$field" ]] || exit 1; cat "$d/block-${args[1]}-$field"
     else
       [[ -f "$d/block-${args[1]}" ]] || exit 1; cat "$d/block-${args[1]}"
     fi ;;
@@ -597,15 +597,25 @@ FA="$G/fleet_agree.sh"
 h64() { printf '%064d' 0 | tr 0 "$1"; }
 GEN=0x$(h64 a)
 TIP=0x$(h64 b)
-mk_node() { # url chain head genesis tiphash(at head-6)
-  local d
+mk_node() { # url chain head genesis tiphash(at head-6) [by-number answer at head-6]
+  # A canonical chain head-6..head: block-latest, and per block its number and parentHash.
+  local d i hb pb
   d=$(rpcdir "$1")
   mkdir -p "$d"
   echo "$2" >"$d/chain-id"
   echo "$3" >"$d/head"
   echo "$4" >"$d/block-0"
-  rm -f "$d"/block-[1-9]*
-  echo "$5" >"$d/block-$(($3 - 6))"
+  rm -f "$d"/block-[1-9]* "$d"/block-0x* "$d"/block-latest
+  pb="$5"
+  echo "$(($3 - 6))" >"$d/block-$5-number"
+  for i in 5 4 3 2 1 0; do
+    hb=$(printf '0x%064x' $(( ($3 - i) * 7 + ${#1} )))
+    echo "$(($3 - i))" >"$d/block-$hb-number"
+    echo "$pb" >"$d/block-$hb-parentHash"
+    pb="$hb"
+  done
+  echo "$pb" >"$d/block-latest"
+  echo "${6:-$5}" >"$d/block-$(($3 - 6))"
 }
 mk_node http://n1 40204 100 "$GEN" "$TIP"
 mk_node http://n2 40204 100 "$GEN" "$TIP"
@@ -617,6 +627,10 @@ mk_node http://n3 40204 100 "0x$(h64 d)" "$TIP"
 expect "fleet: a different genesis fails" 1 'n3 genesis .* differs' -- bash "$FA" http://n1 http://n2 http://n3
 mk_node http://n3 40204 100 "$GEN" "0x$(h64 e)"
 expect "fleet: a fork at the common height fails" 1 '\(fork\)' -- bash "$FA" http://n1 http://n2 http://n3
+# A stale height index (eth_getBlockByNumber names a replaced sibling) on a node whose
+# canonical chain agrees: a NOTE, not a fork (r1006 bring-up, 2026-10-27).
+mk_node http://n3 40204 100 "$GEN" "$TIP" "0x$(h64 e)"
+expect "fleet: a stale height index on an agreeing chain passes with a NOTE" 0 'height-index lag' -- bash "$FA" http://n1 http://n2 http://n3
 mk_node http://n3 1 100 "$GEN" "$TIP"
 expect "fleet: a wrong chain id fails" 1 'chain id 1, want 40204' -- bash "$FA" http://n1 http://n3
 expect "fleet: an unreachable node fails" 1 'unreachable' -- bash "$FA" http://n1 http://nowhere

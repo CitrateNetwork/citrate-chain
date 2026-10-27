@@ -1230,6 +1230,27 @@ class AgentTest(unittest.TestCase):
         r = self.env.agent(1, "logs-scan", "0")
         self.assertIn("matches 1", r.stdout, r.stdout)
 
+    def test_log_scan_counts_mp_s1_skipped_rounds(self):
+        # The producer's MP-S1 guard declines to seal on a fork-choice parent its executor has
+        # not applied (it would commit a state root no peer reproduces) and skips the round.
+        # That is the guard working, seen on the live r1006 fleet at start: counted and shown,
+        # not failed. Any other line naming a fork still fails.
+        log = self.root / "var/log/citrate-node.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        skip = ("ERROR citrate::producer: Failed to produce block: MP-S1: fork-choice selected parent 3539c0e1 "
+                "but this node's applied tip is 8dea4fea @ 35 \u2014 the executor holds the applied tip's state, "
+                "so sealing on 3539c0e1 would commit a state_root no peer can reproduce (the 2026-07-27 "
+                "concurrent-producer fork). Skipping this production round; the execute-on-receive "
+                "drain/reorg will converge the applied tip.\n")
+        log.write_text(skip + skip)
+        r = self.env.agent(1, "logs-scan", "0")
+        self.assertIn("matches 0", r.stdout, r.stdout)
+        self.assertIn("producer_skips 2", r.stdout)
+        with log.open("a") as f:
+            f.write("ERROR MP-S1: concurrent-producer fork detected, state root mismatch\n")
+        r = self.env.agent(1, "logs-scan", "0")
+        self.assertIn("matches 1", r.stdout, r.stdout)
+
     def test_generated_config_has_no_contribution_recorder(self):
         tool = (REPO / "scripts/producers/gen_node_config.py").read_text().lower()
         self.assertNotIn("contribution", tool)
