@@ -5,7 +5,8 @@ r1006's contracts are in block 0, so no deployer transaction on the live chain n
 and the usual export (emit-address-table.sh over broadcasts) has nothing to read. This
 writes the book in the same schema as contracts/addresses/40204.json directly from:
   * the ceremony's recorded stack book (P2, the generator's output; C8),
-  * the P1/P3/P4 books (governance, team vesting, dormant ledgers) and the P4 stand-ins,
+  * the P1/P3/P4 books (governance incl. the guardian council, team vesting, dormant
+    ledgers) and the P4 stand-ins,
   * the genesis alloc, which must hold CODE at every contract address the book names
     (checked; any address without code fails, exit 1).
 Not checked for code: `deployer` (an EOA) and `precompiles` (native, no EVM code).
@@ -83,7 +84,9 @@ def main():
         fail("--work and --out are required (or --check)")
     book = json.load(open(f"{a.work}/book/40204.json"))
     extra = {}
-    for name in ("team-vesting.json", "dormant-ledgers.json", "library.json"):
+    # governance.json (P1) is the only book that names the guardian council: GuardianTimelock,
+    # GuardianMultisig and GuardianCanceller (CheckDeployedAdmins GENESIS-FLOOR needs them).
+    for name in ("governance.json", "team-vesting.json", "dormant-ledgers.json", "library.json"):
         extra.update(contracts_of(f"{a.work}/book/{name}"))
     contracts = dict(book.get("contracts", {}))
     for k, v in extra.items():
