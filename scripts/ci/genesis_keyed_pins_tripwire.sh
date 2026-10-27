@@ -59,14 +59,52 @@ PY
 if [[ "${1:-}" == --self-test ]]; then
   T=$(mktemp -d "${TMPDIR:-/tmp}/gkp-tripwire.XXXXXX")
   trap 'rm -rf "${T:?}"' EXIT
-  rc=0
-  mkdir -p "$T/clean" "$T/table" "$T/height"
-  printf 'pub const PINNED_ACTIVATIONS: &[(u64, Option<u64>)] = &[(40204, Some(0))];\n' >"$T/clean/a.rs"
-  printf 'pub const EXACT_CREATE_CODE_PINS: &[(u64, Option<u64>)] = &[];\n' >"$T/table/a.rs"
-  printf 'pub const NEW_RULE_PINS: &[(u64, Option<u64>)] = &[\n    (40204, Some(0)),\n];\n' >"$T/height/a.rs"
-  scan "$T/clean" >/dev/null && echo "self-test ok: the allowed tables pass" || { echo "self-test FAIL: the allowed tables fail"; rc=1; }
-  scan "$T/table" >/dev/null && { echo "self-test FAIL: a per-module table passes"; rc=1; } || echo "self-test ok: a per-module table fails"
-  scan "$T/height" >/dev/null && { echo "self-test FAIL: a chain-id height passes"; rc=1; } || echo "self-test ok: a chain-id height fails"
+  rc=0 n=0 Q="'"
+  # must_fail NAME SOURCE: a tree holding only SOURCE must fail the scan.
+  must_fail() {
+    n=$((n + 1)); mkdir -p "$T/$n"; printf '%s\n' "$2" >"$T/$n/a.rs"
+    if scan "$T/$n" >/dev/null; then echo "self-test FAIL: $1 passes"; rc=1; else echo "self-test ok: $1 fails"; fi
+  }
+  # must_pass NAME SOURCE: a tree holding only SOURCE must pass (negative control).
+  must_pass() {
+    n=$((n + 1)); mkdir -p "$T/$n"; printf '%s\n' "$2" >"$T/$n/a.rs"
+    if scan "$T/$n" >/dev/null; then echo "self-test ok: $1 passes"; else echo "self-test FAIL: $1 fails"; rc=1; fi
+  }
+  must_pass "the allowed-table fixture" \
+    'pub const PINNED_ACTIVATIONS: &[(u64, Option<u64>)] = &[(40204, Some(0))];
+pub const AGENT_PRECOMPILES_PINS: &[(u64, Option<u64>)] = &[(40204, Some(0))];'
+  must_fail "a per-module table (const)" 'pub const EXACT_CREATE_CODE_PINS: &[(u64, Option<u64>)] = &[];'
+  must_fail "a per-module table (static)" 'pub static SUPPLY_HARDENING_PINS: &[(u64, Option<u64>)] = &[];'
+  must_fail "a chain-id height (const, multi-line)" 'pub const NEW_RULE_PINS: &[(u64, Option<u64>)] = &[
+    (40204, Some(0)),
+];'
+  must_fail "a chain-id height (static)" 'pub static NEW_RULE_PINS: &[(u64, Option<u64>)] = &[(40204, Some(0))];'
+  must_pass "a chain-id table without a height (static)" 'pub static NEW_RULE_PINS: &[(u64, Option<u64>)] = &[(40204, None)];'
+  must_fail "a chain-id height (&${Q}static)" "pub const NEW_RULE_PINS: &${Q}static [(u64, Option<u64>)] = &[(40204, Some(0))];"
+  must_pass "a chain-id table without a height (&${Q}static)" "pub const NEW_RULE_PINS: &${Q}static [(u64, Option<u64>)] = &[(40204, None)];"
+  must_fail "a chain-id height (fixed array)" 'pub const NEW_RULE_PINS: [(u64, Option<u64>); 1] = [(40204, Some(0))];'
+  must_pass "a chain-id table without a height (fixed array)" 'pub const NEW_RULE_PINS: [(u64, Option<u64>); 1] = [(40204, None)];'
+  must_fail "a chain-id height (match arm)" 'pub fn new_rule_pin(chain_id: u64) -> Option<Option<u64>> {
+    match chain_id {
+        40204 => Some(Some(0)),
+        _ => None,
+    }
+}'
+  must_fail "a chain-id height (match arm, bare Some)" 'fn new_rule_height(id: u64) -> Option<u64> {
+    match self.chain_id { 1337 | 40204 => Some(0), _ => None }
+}'
+  must_pass "a chain-id match without a height" 'pub fn new_rule_pin(chain_id: u64) -> Option<Option<u64>> {
+    match chain_id {
+        40204 => Some(None),
+        _ => None,
+    }
+}'
+  must_pass "a match on something other than a chain id" 'fn f(x: u64) -> Option<u64> {
+    match x {
+        1000 => Some(5),
+        _ => None,
+    }
+}'
   exit $rc
 fi
 ROOT="${1:-$HERE/../..}"
