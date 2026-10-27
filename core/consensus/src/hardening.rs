@@ -191,7 +191,7 @@ pub const RELEASE_GENESIS: &[(u64, [u8; 32])] = &[
 /// Pinned by `r1006_genesis_hash_is_pinned` in citrate-economics, which rebuilds it from
 /// the compiled profile; any change to the allocation moves it, on purpose.
 pub const R1006_GENESIS: [u8; 32] =
-    hex32("3c6190f374df1c1c2c973a587a331198f24d83249de22377bfc5f2555e6ea373");
+    hex32("6e0e9bbcd4500e56b73f8740b1c3e21bddea4fbfb7fd2f6d9941f311ec45e5e0");
 
 /// Activation heights compiled into this release for ONE genesis, keyed by its block-0
 /// hash rather than by chain id. r1005 and r1006 share chain id 40204, so a per-chain pin
