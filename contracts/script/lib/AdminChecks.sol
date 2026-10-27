@@ -587,6 +587,11 @@ abstract contract AdminChecks {
         if (_genesisChainMode(timelock)) return _timelockHolderStateProblem(timelock, council, extraCancellers);
         (bool ok, string memory why, RoleEvent[] memory events) = _timelockRoleHistory(timelock);
         if (!ok) return why;
+        // A timelock deployed by a transaction always logs its constructor's RoleGranted events,
+        // so a timelock with code and NO role history at all was placed in block 0.
+        if (events.length == 0 && !_genesisChainDisabled()) {
+            return _timelockHolderStateProblem(timelock, council, extraCancellers);
+        }
         (string memory problem, TimelockHolders memory h) = _timelockHolders(timelock, events);
         if (bytes(problem).length != 0) return problem;
         if (!_isExactly(h.admins, timelock)) return "DEFAULT_ADMIN_ROLE holders are not exactly the timelock itself";
@@ -625,24 +630,22 @@ abstract contract AdminChecks {
     //      chain, so the allocation must be this chain's state.
     //   For an AccessControlEnumerable timelock, the member lists are enumerated and compared
     //   exactly as well.
-    // Mode: GENESIS_CHAIN=1 forces it, =0 disables it; otherwise it is on when the node has
-    // code for the timelock at block 0 (eth_getCode at 0x0).
+    // Mode: GENESIS_CHAIN=1 forces it, =0 disables it; otherwise it is on for a timelock with
+    // code and no role history at all (a timelock deployed by a transaction always logs its
+    // constructor's RoleGranted events, so only a block-0 placement has none). Detection does
+    // not use eth_getCode at block 0: a Citrate node answers that with the latest code.
 
     /// Accounts the genesis-chain holder check sweeps for unexpected roles (see above).
     address[] internal genesisKnown;
 
     /// @dev Virtual only so `forge test` can set the mode and the allocation without the
     ///      process-wide environment; scripts never override them.
-    function _genesisChainMode(address target) internal virtual returns (bool) {
-        string memory flag = HISTORY_VM.envOr("GENESIS_CHAIN", string(""));
-        if (keccak256(bytes(flag)) == keccak256("1")) return true;
-        if (keccak256(bytes(flag)) == keccak256("0")) return false;
-        string memory params = string.concat('["', HISTORY_VM.toString(target), '","0x0"]');
-        try HISTORY_VM.rpc("eth_getCode", params) returns (bytes memory code) {
-            return code.length > 0;
-        } catch {
-            return false;
-        }
+    function _genesisChainMode(address) internal virtual returns (bool) {
+        return keccak256(bytes(HISTORY_VM.envOr("GENESIS_CHAIN", string("")))) == keccak256("1");
+    }
+
+    function _genesisChainDisabled() internal returns (bool) {
+        return keccak256(bytes(HISTORY_VM.envOr("GENESIS_CHAIN", string("")))) == keccak256("0");
     }
 
     function _genesisAllocPath() internal virtual returns (string memory) {

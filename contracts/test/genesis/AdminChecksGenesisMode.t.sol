@@ -32,6 +32,35 @@ contract GenesisModeHarness is AdminChecks {
     }
 }
 
+/// Auto-detection: no forced mode, and the node reports NO role history for the timelock (as
+/// for every timelock placed in block 0). The check must switch to the state proof.
+contract AutoDetectHarness is AdminChecks {
+    string public allocPath;
+    bool public historyEmpty;
+
+    function set(string memory p, bool empty) external {
+        allocPath = p;
+        historyEmpty = empty;
+    }
+
+    function _genesisChainMode(address) internal pure override returns (bool) {
+        return false;
+    }
+
+    function _genesisAllocPath() internal view override returns (string memory) {
+        return allocPath;
+    }
+
+    function _timelockRoleHistory(address) internal view override returns (bool, string memory, RoleEvent[] memory) {
+        if (historyEmpty) return (true, "", new RoleEvent[](0));
+        return (false, "history: a page could not be fetched", new RoleEvent[](0));
+    }
+
+    function holderProblem(address timelock, address council, address[] memory extra) external returns (string memory) {
+        return _timelockHolderProblem(timelock, council, extra);
+    }
+}
+
 /// Genesis-chain mode of the timelock holder check (r1006: contracts in block 0, no role-grant
 /// events). The holder sets are proved from state: hasRole for the expected holders and every
 /// known account, and every non-zero slot of the block-0 allocation accounted for.
@@ -155,5 +184,21 @@ contract AdminChecksGenesisModeTest is Test {
         assertEq(h.holderProblem(address(tl), council, allowed), "");
         // ...and is an unexpected canceller when it is not the allowed one.
         assertTrue(bytes(h.holderProblem(address(tl), council, new address[](0))).length != 0);
+    }
+
+    function test_no_role_history_auto_selects_the_state_proof() public {
+        AutoDetectHarness a = new AutoDetectHarness();
+        a.set("", true);
+        assertEq(
+            a.holderProblem(address(tl), council, new address[](0)),
+            "genesis-chain mode needs GENESIS_ALLOC (the block-0 allocation) to prove the holder sets complete",
+            "no history: the state proof runs (and needs the alloc)"
+        );
+        _writeAlloc("autodetect", new bytes32[](0));
+        a.set(allocPath, true);
+        assertEq(a.holderProblem(address(tl), council, new address[](0)), "");
+        // Control: a history that cannot be read is NOT taken for a genesis chain.
+        a.set(allocPath, false);
+        assertEq(a.holderProblem(address(tl), council, new address[](0)), "history: a page could not be fetched");
     }
 }

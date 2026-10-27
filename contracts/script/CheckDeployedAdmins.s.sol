@@ -58,7 +58,7 @@ import {P256} from "../src/aa/lib/webauthn/P256.sol";
 ///         (AdminChecks `_timelockHolderStateProblem`): expected holders hold, no other known
 ///         account (books, deployer, factory) does, and every non-zero storage slot of the
 ///         timelock in the block-0 allocation (env GENESIS_ALLOC) is accounted for. Auto-detected
-///         (code at block 0) or forced with GENESIS_CHAIN=1. The guardian veto check uses the same.
+///         (a timelock with no role history at all) or forced with GENESIS_CHAIN=1. The guardian veto check uses the same.
 ///
 ///         GENESIS-FLOOR (chain 40204, as reported by the node; GenesisProfile): every book's
 ///         C4 genesis councils are re-checked ON CHAIN against the genesis floors, from the

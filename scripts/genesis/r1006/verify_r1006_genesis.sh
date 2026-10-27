@@ -148,8 +148,6 @@ json.dump({"alloc": {x["address"]: {"code": x.get("code", "0x"), "storage": x.ge
                      for x in a["accounts"] if x.get("code")}}, open(sys.argv[2], "w"))
 PY
 cp "$V/genesis-alloc.json" "$REPO/contracts/genesis/genesis-alloc.json"
-CODE0=$(cast code "$(jq -r '.contracts.GovernanceTimelock' "$REPO/contracts/genesis/p5-admin-book.json")" --block 0 --rpc-url "$R06")
-[[ "$CODE0" != 0x && -n "$CODE0" ]] || die "the GovernanceTimelock has no code at block 0 (genesis-chain mode would not auto-detect)"
 (cd "$REPO/contracts" && FOUNDRY_OFFLINE=true ADDRESS_BOOK=genesis/p5-admin-book.json REQUIRE_ALL_CODE=true \
   GENESIS_ALLOC=genesis/genesis-alloc.json forge script script/CheckDeployedAdmins.s.sol --rpc-url "$R06") \
   >"$V/admins.log" 2>&1 || { grep -E 'failures|TIMELOCK-HOLDERS|GENESIS-FLOOR|DEPLOYER-ADMIN|FACTORY-ADMIN' "$V/admins.log" | tail -12; die "CheckDeployedAdmins failed against the r1006 node (see $V/admins.log)"; }
