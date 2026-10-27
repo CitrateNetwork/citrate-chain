@@ -118,7 +118,7 @@ class TestRender(unittest.TestCase):
     def test_unit_caps_node_memory_for_an_8gb_host(self):
         self.gen()
         unit = (self.out / "citrate-node.service").read_text()
-        for line in ("MemoryHigh=6G", "MemoryMax=6656M", "MemorySwapMax=1G"):
+        for line in ("MemoryHigh=6G", "MemoryMax=6656M", "MemorySwapMax=1G", "Environment=MALLOC_ARENA_MAX=2"):
             self.assertIn(line + "\n", unit)
 
     def test_refuses_to_overwrite_without_force(self):
