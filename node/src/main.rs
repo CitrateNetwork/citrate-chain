@@ -68,7 +68,10 @@ compile_error!(
 );
 mod contribution_recorder;
 mod dag_prune;
+#[cfg(test)]
+mod finality_adversarial_tests;
 mod finality_driver;
+mod finality_floor;
 mod genesis;
 mod hardening_rejoin;
 mod inference;
@@ -2084,11 +2087,18 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         validator_selector.clone(),
     ));
     let finality_voting_on = finality_gadget.enabled();
-    // Finalized height as OBSERVED (not enforced) while the producer path runs:
-    // backs the `finalized`/`safe` RPC tags without raising the reorg floor. Floor
-    // ENFORCEMENT needs the (height, hash) certificate check of spec §4.5 (Stage
-    // 1c); raising the floor on height alone could pin this node to a losing branch.
+    // Finalized height as VERIFIED by the Stage 1c floor verifier while the
+    // producer path runs; only ever advances to a certificate whose (height,
+    // hash) is this node's own canonical block (spec §4.5). Always reported as
+    // `citrate_finality_verified_height`; the reorg floor AND the
+    // `finalized`/`safe` RPC tags follow it only under the separate compiled
+    // enforcement pin (`finality_floor::FloorMode::Enforced`).
     let finality_observed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // The source the RPC `finalized`/`safe` tags read, chosen by the floor
+    // verifier for its mode (Enforced: verified (height, hash) pairs resolved
+    // by hash); stays `None` without a canonical applicator (tags then resolve
+    // to genesis).
+    let mut finality_rpc_handle: Option<citrate_api::FinalizedTagSource> = None;
 
     // EXECUTE-ON-RECEIVE (step 2): the fast-path applier. Active under v2 headers
     // (CITRATE_BLOCK_V2) — the flag that makes a block's state_root reproducible by a
@@ -2150,38 +2160,42 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 "EXECUTE-ON-RECEIVE: fast-path applier + reorg ENABLED (received blocks executed + state-root-verified); applied head = {} @ {}",
                 start.hash, start.height
             );
-            // I4: keep the reorg floor in sync with BFT finality so a reorg can
-            // never revert below a finalized checkpoint. Cheap poll (the applied
-            // height advances ~1/s); the floor is monotonic in the checkpoint mgr.
-            //
-            // WP-S.3 Stage 1a: when the producer path is ON, checkpoints really
-            // finalize, and raising the floor on HEIGHT alone is exactly what spec
-            // §4.5 forbids (it must first check the certified hash is this node's
-            // canonical block). So with the switch ON the poll publishes into the
-            // OBSERVED handle only (RPC tags) and leaves the reorg floor at its
-            // value; hash-checked enforcement is Stage 1c. With the switch OFF this
-            // is the unchanged pre-Stage-1a poll (nothing can finalize then).
-            let floor = if finality_voting_on {
-                info!(
-                    "checkpoint finality: finalized height is OBSERVED only (RPC tags); reorg \
-                     floor enforcement awaits the §4.5 certificate check"
-                );
-                finality_observed.clone()
-            } else {
-                app.finalized_height_handle()
-            };
-            let cp = checkpoint_manager.clone();
-            tokio::spawn(async move {
-                // #310: Skip — no burst of floor polls after a stall.
-                let mut tick = timing::cadence_interval(std::time::Duration::from_secs(5));
-                loop {
-                    tick.tick().await;
-                    let h = cp.latest_finalized_height().await;
-                    if h > floor.load(std::sync::atomic::Ordering::SeqCst) {
-                        floor.store(h, std::sync::atomic::Ordering::SeqCst);
-                    }
-                }
-            });
+            // I4 / WP-S.3 Stage 1c (spec §4.5): the reorg floor follows BFT
+            // finality only through a VERIFIED certificate whose (height, hash) is
+            // this node's own canonical block — never a height alone, which could
+            // pin the node to a losing branch. Mode from the two compiled pins:
+            //   Legacy   (voting OFF, this release): no floor poll at all. Nothing
+            //            can finalize with voting off, so the old height poll never
+            //            moved the floor on a node that never voted; a certificate
+            //            persisted by an earlier voting-ON run is logged and ignored.
+            //   Observed (voting ON, enforcement OFF): verified height -> metric
+            //            only; floor and RPC tags unchanged (genesis).
+            //   Enforced (both ON): verified height raises the floor and the
+            //            RPC tags — AT FINALIZATION (the verifier is installed as
+            //            the checkpoint manager's FinalizationGuard, so the floor
+            //            rises before the finalized height is visible; spec §5 S2),
+            //            with the 5 s poll as a backstop.
+            // Mismatch / invalid certificate: safety stop (gadget halted, floor and
+            // RPC tags frozen, CHECKPOINT FINALITY SAFETY STOP alarm + metrics).
+            // Same compiled voting pin and chain id as `finality_gadget` (whose
+            // manager was built with `config.chain.chain_id`).
+            let floor_mode = finality_floor::FloorMode::for_chain(config.chain.chain_id);
+            let floor_verifier = Arc::new(finality_floor::FloorVerifier::new(
+                floor_mode,
+                checkpoint_manager.clone(),
+                app.clone(),
+                finality_gadget.safety_stop(),
+                finality_observed.clone(),
+            ));
+            // Enforced only (no-op in Legacy / Observed): installed before the
+            // boot check and before the driver / vote handler can finalize.
+            let _ = floor_verifier.install_finalization_guard();
+            // Boot check BEFORE any block admission, drain or recovery (all set up
+            // below): a node restarting with a certificate for a branch it is not on
+            // halts finality before it does anything else.
+            let _ = floor_verifier.boot_check().await;
+            finality_rpc_handle = Some(floor_verifier.rpc_finalized_handle());
+            let _ = floor_verifier.spawn();
             Some(app)
         } else {
             None
@@ -2217,7 +2231,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         error!(
             "chain data holds block {stored} at height {height}, but this network's canonical \
              block there is {canonical}: this database is on a branch the network does not \
-             continue. Stop the node, move the chain data aside (keep the keys) and resync."
+             continue. Stop the node, move the chain data aside (keep the keys) and resync. \
+             {}",
+            citrate_storage::VOTING_VALIDATOR_WIPE_NOTE
         );
     }
 
@@ -4022,15 +4038,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // the same `finalized_height` handle the canonical applicator exposes and
             // the 5 s finality poll keeps current. None (no applicator) => tags resolve
             // to genesis (block 0), never error.
-            // WP-S.3 Stage 1a: with the producer path ON the tags read the OBSERVED
-            // finalized height (the floor itself is not raised until Stage 1c).
-            canonical_applicator.as_ref().map(|app| {
-                if finality_voting_on {
-                    finality_observed.clone()
-                } else {
-                    app.finalized_height_handle()
-                }
-            }),
+            // WP-S.3 Stage 1c: only in Enforced mode (voting + enforcement pins
+            // ON) do the tags read the VERIFIED finalized (height, hash) pairs,
+            // resolved by the certified block's hash, never a sibling through the
+            // height index (`FloorVerifier::rpc_finalized_handle`); Legacy and Observed keep
+            // the unchanged applicator handle, which neither raises.
+            finality_rpc_handle.clone(),
             // UI truth contract §9: the identity this process computed at start-up.
             // Version/git from the build stamp (node/build.rs), the consensus
             // fingerprint from ConsensusManifest (after the PBA + agent-fork heights
@@ -4480,13 +4493,44 @@ fn load_or_generate_proposer_key(
         let seed_bytes = Zeroizing::new(key.to_bytes().to_vec());
         write_secret_file_0600(proposer_key_path, &seed_bytes)?;
         info!(
-            "Minted a new persistent proposer identity at {:?} (pubkey {}). This key is NOT \
-             recoverable from public data — back it up alongside noise.key and preserve it \
-             across data-dir wipes, or the node must re-register before it can propose again.",
-            proposer_key_path,
-            hex::encode(key.verifying_key().to_bytes())
+            "{}",
+            proposer_key_minted_message(
+                proposer_key_path,
+                &hex::encode(key.verifying_key().to_bytes())
+            )
         );
         Ok(key)
+    }
+}
+
+/// Log line for a newly minted `proposer.key`. Carries the voting-validator
+/// wipe warning: the same key with a wiped data directory loses the durable
+/// checkpoint signed-vote record.
+fn proposer_key_minted_message(proposer_key_path: &std::path::Path, pubkey_hex: &str) -> String {
+    format!(
+        "Minted a new persistent proposer identity at {:?} (pubkey {}). This key is NOT \
+         recoverable from public data — back it up alongside noise.key and preserve it \
+         across data-dir wipes, or the node must re-register before it can propose again. \
+         {}",
+        proposer_key_path,
+        pubkey_hex,
+        citrate_storage::VOTING_VALIDATOR_WIPE_NOTE
+    )
+}
+
+#[cfg(test)]
+mod proposer_key_message_tests {
+    use super::proposer_key_minted_message;
+
+    #[test]
+    fn minted_proposer_key_message_carries_the_voting_validator_wipe_note() {
+        let msg = proposer_key_minted_message(std::path::Path::new("/data/proposer.key"), "ab12");
+        assert!(msg.contains("ab12"));
+        assert!(msg.contains("/data/proposer.key"));
+        assert!(
+            msg.contains(citrate_storage::VOTING_VALIDATOR_WIPE_NOTE),
+            "mint log must warn voting validators about wiping the data dir"
+        );
     }
 }
 

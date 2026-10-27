@@ -2,7 +2,11 @@
 
 use crate::eth_tx_decoder;
 use crate::filter::{FilterRegistry, FilterType};
+use crate::finalized_tag::{
+    is_finality_tag, range_block_hashes, FinalizedAnchor, FinalizedTagSource, RangeReadError,
+};
 use crate::methods::{mempool::PendingQuery, ChainApi, MempoolApi, StateApi};
+use crate::types::request::BlockId;
 // PIL-49: route block_on through a shared multi-threaded Tokio runtime so
 // futures awaiting tokio::sync::* / tokio::time::* / reqwest can wake.
 // `futures::executor::block_on` lacks a Tokio reactor, so any such future
@@ -191,6 +195,7 @@ fn simulation_block_context(storage: &Arc<StorageManager>) -> (u64, u64) {
         Ok(h) => h,
         Err(_) => return (0, 0),
     };
+    // height-index: latest height, simulation timestamp only.
     let timestamp = storage
         .blocks
         .get_block_by_height(height)
@@ -312,6 +317,51 @@ pub fn resolve_block_tag(
     }
 }
 
+/// JSON-RPC error for a log range [`range_block_hashes`] could not list.
+fn range_read_error(e: RangeReadError) -> jsonrpc_core::Error {
+    match e {
+        RangeReadError::TooDeep { .. } => jsonrpc_core::Error::invalid_params(e.to_string()),
+        RangeReadError::Storage(msg) => jsonrpc_core::Error {
+            code: jsonrpc_core::ErrorCode::InternalError,
+            message: format!("log range read failed: {msg}"),
+            data: None,
+        },
+    }
+}
+
+/// The block a block-LOOKUP endpoint reads for `tag`, given the resolved
+/// finalized anchor. `finalized`/`safe` name the certified block BY HASH when the
+/// source carries one: the height index keeps the LAST block written at a height,
+/// which can be an uncertified sibling of the certified block, so it is never
+/// consulted for them. Every other tag resolves as [`resolve_block_tag`].
+pub fn resolve_block_id(
+    tag: Option<&str>,
+    current_height: u64,
+    anchor: FinalizedAnchor,
+) -> Option<BlockId> {
+    if is_finality_tag(tag) {
+        return Some(match anchor.hash {
+            Some(hash) => BlockId::Hash(hash),
+            None => BlockId::Number(anchor.height),
+        });
+    }
+    resolve_block_tag(tag, current_height, anchor.height).map(BlockId::Number)
+}
+
+/// The finalized anchor for one request: resolved only for the finality tags
+/// (other tags never read it).
+fn anchor_for(
+    tag: Option<&str>,
+    finalized: &FinalizedTagSource,
+    storage: &StorageManager,
+) -> FinalizedAnchor {
+    if is_finality_tag(tag) {
+        finalized.resolve(storage)
+    } else {
+        FinalizedAnchor::GENESIS
+    }
+}
+
 /// Stage 0 finality guard for the account-STATE read endpoints
 /// (`eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`,
 /// `eth_getStorageAt`, `eth_call`, `eth_estimateGas`).
@@ -332,11 +382,63 @@ pub fn resolve_block_tag(
 /// unaffected and keeps its existing latest-state behaviour. Returns `Ok(())`
 /// when the read may proceed against latest state, or an `Err` to return to the
 /// client verbatim.
+///
+/// Stage 1c (enforcement): when the finalized anchor is a verified
+/// `(height, hash)` pair, "caught up" additionally requires the latest committed
+/// state to be THAT block's state — the applied tip
+/// (`BlockStore::get_applied_tip`, written by the canonical applicator) must be
+/// the certified hash. Equal heights alone are not enough: a sibling at the
+/// certified height is not the finalized block.
 fn require_serviceable_finality_tag(
     tag: Option<&str>,
-    finalized_height: u64,
+    finalized: &FinalizedTagSource,
+    storage: &StorageManager,
     latest_height: u64,
 ) -> Result<(), jsonrpc_core::Error> {
+    if !is_finality_tag(tag) {
+        return Ok(());
+    }
+    let anchor = finalized.resolve(storage);
+    finality_state_guard(tag, anchor, latest_height, || {
+        storage
+            .blocks
+            .get_applied_tip()
+            .ok()
+            .flatten()
+            .map(|(hash, _)| hash)
+    })
+}
+
+/// Decision half of [`require_serviceable_finality_tag`] (`applied_tip` = the
+/// hash whose post-state the state store holds, when known).
+fn finality_state_guard(
+    tag: Option<&str>,
+    anchor: FinalizedAnchor,
+    latest_height: u64,
+    applied_tip: impl FnOnce() -> Option<Hash>,
+) -> Result<(), jsonrpc_core::Error> {
+    let finalized_height = anchor.height;
+    if !is_finality_tag(tag) {
+        return Ok(());
+    }
+    if finalized_height >= latest_height {
+        if let Some(certified) = anchor.hash {
+            if applied_tip() != Some(certified) {
+                return Err(jsonrpc_core::Error {
+                    code: jsonrpc_core::ErrorCode::ServerError(-32000),
+                    message: format!(
+                        "state at the '{}' block tag is not available: the latest committed \
+                         state on this node is not the state of the finalized block {} at \
+                         height {finalized_height}, so returning it would mislabel \
+                         un-finalized state as finalized. Retry with 'latest'.",
+                        tag.unwrap_or("finalized"),
+                        certified,
+                    ),
+                    data: None,
+                });
+            }
+        }
+    }
     match tag {
         Some("finalized") | Some("safe") if finalized_height < latest_height => {
             Err(jsonrpc_core::Error {
@@ -389,11 +491,13 @@ pub fn register_eth_methods(
     );
 }
 
-/// Register the Ethereum-compatible RPC methods, threading a `finalized_height`
-/// handle so the `finalized`/`safe` block tags resolve to the real BFT-finalized
-/// height. The handle is the same `Arc<AtomicU64>` that `canonical_apply.rs`
-/// exposes via `finalized_height_handle()` and the node's 5 s finality poll keeps
-/// current. Stage 0: read-only surface — no change to block acceptance/validity.
+/// Register the Ethereum-compatible RPC methods, threading the source of the
+/// `finalized`/`safe` block tags. A height handle (`Arc<AtomicU64>`, e.g. the
+/// canonical applicator's `finalized_height_handle()`) resolves through the
+/// height index; a verified-pair source (`FinalizedTagSource::Verified`, the
+/// node's floor verifier in Enforced mode) resolves BY HASH so an uncertified
+/// sibling at the finalized height is never served. Read-only surface — no
+/// change to block acceptance/validity.
 #[allow(clippy::too_many_arguments)]
 pub fn register_eth_methods_with_finality(
     io_handler: &mut IoHandler,
@@ -403,8 +507,9 @@ pub fn register_eth_methods_with_finality(
     chain_id: u64,
     filter_registry: Arc<FilterRegistry>,
     pause_flag: Option<Arc<AtomicBool>>,
-    finalized_height: Arc<AtomicU64>,
+    finalized: impl Into<FinalizedTagSource>,
 ) {
+    let finalized: FinalizedTagSource = finalized.into();
     // eth_blockNumber - Returns the latest block number
     let storage_bn = storage.clone();
     io_handler.add_sync_method("eth_blockNumber", move |_params: Params| {
@@ -420,7 +525,7 @@ pub fn register_eth_methods_with_finality(
 
     // eth_getBlockByNumber - Returns block by number
     let storage_gbn = storage.clone();
-    let finalized_gbn = finalized_height.clone();
+    let finalized_gbn = finalized.clone();
     io_handler.add_sync_method("eth_getBlockByNumber", move |params: Params| {
         let api = ChainApi::new(storage_gbn.clone());
 
@@ -442,16 +547,18 @@ pub fn register_eth_methods_with_finality(
         // behaviour (fall back to Null when the height lookup errors); every
         // other tag (earliest / finalized / safe / hex) goes through the shared
         // resolver so `finalized`/`safe` are honoured uniformly (Stage 0).
+        // `finalized`/`safe` resolve to the certified block BY HASH when the
+        // source is a verified pair (never a sibling via the height index).
         let is_latest = arg(&params, 0).as_str() == Some("latest");
-        let block_number = match arg(&params, 0).as_str() {
+        let block_id = match arg(&params, 0).as_str() {
             Some("latest") | Some("pending") => match block_on(api.get_height()) {
-                Ok(h) => h,
+                Ok(h) => BlockId::Number(h),
                 Err(_) => return Ok(Value::Null),
             },
             other => {
-                let finalized = finalized_gbn.load(Ordering::SeqCst);
-                match resolve_block_tag(other, 0, finalized) {
-                    Some(n) => n,
+                let anchor = anchor_for(other, &finalized_gbn, &storage_gbn);
+                match resolve_block_id(other, 0, anchor) {
+                    Some(id) => id,
                     None => {
                         return Err(jsonrpc_core::Error::invalid_params(
                             "Invalid block number format",
@@ -464,16 +571,21 @@ pub fn register_eth_methods_with_finality(
         // Get block from storage.
         // For "latest", if the block at the reported height is missing (race
         // between height bookkeeping and block storage), fall back to height-1.
-        let mut try_height = block_number;
-        let block_result = loop {
-            match block_on(api.get_block(crate::types::request::BlockId::Number(try_height))) {
-                Ok(block) => break Ok(block),
-                Err(_) if is_latest && try_height > 0 => {
-                    try_height = try_height.saturating_sub(1);
-                    continue;
+        let block_result = match block_id {
+            BlockId::Number(block_number) => {
+                let mut try_height = block_number;
+                loop {
+                    match block_on(api.get_block(BlockId::Number(try_height))) {
+                        Ok(block) => break Ok(block),
+                        Err(_) if is_latest && try_height > 0 => {
+                            try_height = try_height.saturating_sub(1);
+                            continue;
+                        }
+                        Err(e) => break Err(e),
+                    }
                 }
-                Err(e) => break Err(e),
             }
+            other => block_on(api.get_block(other)),
         };
         match block_result {
             Ok(block) => {
@@ -833,7 +945,7 @@ pub fn register_eth_methods_with_finality(
     // eth_getBalance - Returns account balance
     let storage_bal = storage.clone();
     let executor_bal = executor.clone();
-    let finalized_bal = finalized_height.clone();
+    let finalized_bal = finalized.clone();
     io_handler.add_sync_method("eth_getBalance", move |params: Params| {
         let state_api = StateApi::new(storage_bal.clone(), executor_bal.clone());
 
@@ -850,7 +962,7 @@ pub fn register_eth_methods_with_finality(
         // finalized height is behind the tip rather than mislabel latest state.
         let tag = params.get(1).and_then(|v| v.as_str());
         let latest_height = block_on(ChainApi::new(storage_bal.clone()).get_height()).unwrap_or(0);
-        require_serviceable_finality_tag(tag, finalized_bal.load(Ordering::SeqCst), latest_height)?;
+        require_serviceable_finality_tag(tag, &finalized_bal, &storage_bal, latest_height)?;
 
         let addr_str = match arg(&params, 0).as_str() {
             Some(a) if a.starts_with("0x") => a.get(2..).unwrap_or_default(),
@@ -884,7 +996,7 @@ pub fn register_eth_methods_with_finality(
     // eth_getCode - Returns contract code
     let storage_code = storage.clone();
     let executor_code = executor.clone();
-    let finalized_code = finalized_height.clone();
+    let finalized_code = finalized.clone();
     io_handler.add_sync_method("eth_getCode", move |params: Params| {
         let state_api = StateApi::new(storage_code.clone(), executor_code.clone());
 
@@ -901,11 +1013,7 @@ pub fn register_eth_methods_with_finality(
         // finalized height is behind the tip rather than mislabel latest state.
         let tag = params.get(1).and_then(|v| v.as_str());
         let latest_height = block_on(ChainApi::new(storage_code.clone()).get_height()).unwrap_or(0);
-        require_serviceable_finality_tag(
-            tag,
-            finalized_code.load(Ordering::SeqCst),
-            latest_height,
-        )?;
+        require_serviceable_finality_tag(tag, &finalized_code, &storage_code, latest_height)?;
 
         let addr_str = match arg(&params, 0).as_str() {
             Some(a) if a.starts_with("0x") => a.get(2..).unwrap_or_default(),
@@ -940,7 +1048,7 @@ pub fn register_eth_methods_with_finality(
     let storage_nonce = storage.clone();
     let executor_nonce = executor.clone();
     let mempool_nonce = mempool.clone();
-    let finalized_nonce = finalized_height.clone();
+    let finalized_nonce = finalized.clone();
     io_handler.add_sync_method("eth_getTransactionCount", move |params: Params| {
         let state_api = StateApi::new(storage_nonce.clone(), executor_nonce.clone());
 
@@ -986,11 +1094,7 @@ pub fn register_eth_methods_with_finality(
         let raw_tag = params.get(1).and_then(|v| v.as_str());
         let latest_height =
             block_on(ChainApi::new(storage_nonce.clone()).get_height()).unwrap_or(0);
-        require_serviceable_finality_tag(
-            raw_tag,
-            finalized_nonce.load(Ordering::SeqCst),
-            latest_height,
-        )?;
+        require_serviceable_finality_tag(raw_tag, &finalized_nonce, &storage_nonce, latest_height)?;
         let tag = raw_tag.unwrap_or("latest");
 
         let base_nonce = block_on(state_api.get_nonce(Address(addr_bytes))).unwrap_or_default();
@@ -1159,7 +1263,7 @@ pub fn register_eth_methods_with_finality(
     // eth_call - Execute call without creating transaction
     let executor_call = executor.clone();
     let storage_call = storage.clone();
-    let finalized_call = finalized_height.clone();
+    let finalized_call = finalized.clone();
     io_handler.add_sync_method("eth_call", move |params: Params| {
         // WP-I.4: eth_call costs 10 budget units
         crate::rate_limit::check_method_budget(10)?;
@@ -1184,11 +1288,7 @@ pub fn register_eth_methods_with_finality(
         // state and label it finalized.
         let tag = params.get(1).and_then(|v| v.as_str());
         let latest_height = block_on(ChainApi::new(storage_call.clone()).get_height()).unwrap_or(0);
-        require_serviceable_finality_tag(
-            tag,
-            finalized_call.load(Ordering::SeqCst),
-            latest_height,
-        )?;
+        require_serviceable_finality_tag(tag, &finalized_call, &storage_call, latest_height)?;
 
         // call object
         let obj = match &arg(&params, 0) {
@@ -1379,7 +1479,7 @@ pub fn register_eth_methods_with_finality(
     // eth_estimateGas - Estimate gas for transaction by dry-running execution
     let executor_estimate = executor.clone();
     let storage_estimate = storage.clone();
-    let finalized_estimate = finalized_height.clone();
+    let finalized_estimate = finalized.clone();
     io_handler.add_sync_method("eth_estimateGas", move |params: Params| {
         // WP-I.4: eth_estimateGas costs 10 budget units
         crate::rate_limit::check_method_budget(10)?;
@@ -1411,7 +1511,8 @@ pub fn register_eth_methods_with_finality(
             block_on(ChainApi::new(storage_estimate.clone()).get_height()).unwrap_or(0);
         require_serviceable_finality_tag(
             tag,
-            finalized_estimate.load(Ordering::SeqCst),
+            &finalized_estimate,
+            &storage_estimate,
             latest_height,
         )?;
 
@@ -1655,7 +1756,7 @@ pub fn register_eth_methods_with_finality(
 
     // eth_feeHistory - Get fee history for EIP-1559
     let storage_fee = storage.clone();
-    let finalized_fee = finalized_height.clone();
+    let finalized_fee = finalized.clone();
     io_handler.add_sync_method("eth_feeHistory", move |params: Params| {
         // Parse params: [blockCount, newestBlock, rewardPercentiles]
         let params: Vec<Value> = match params.parse() {
@@ -1705,11 +1806,16 @@ pub fn register_eth_methods_with_finality(
         // latest committed height.
         let api = ChainApi::new(storage_fee.clone());
         let committed_height = block_on(api.get_height()).unwrap_or_default();
-        let current_height = match params.get(1).and_then(|v| v.as_str()) {
-            Some("finalized") | Some("safe") => {
-                finalized_fee.load(Ordering::SeqCst).min(committed_height)
-            }
-            _ => committed_height,
+        // A window ending at `finalized`/`safe` is read along the CERTIFIED
+        // CHAIN: every height at or below the certified height comes from the
+        // selected-parent ancestry of the certified block (`range_block_hashes`),
+        // never from the height index, which may hold a sibling at any of them.
+        let newest_tag = params.get(1).and_then(|v| v.as_str());
+        let (current_height, window_anchor) = if is_finality_tag(newest_tag) {
+            let anchor = finalized_fee.resolve(&storage_fee);
+            (anchor.height.min(committed_height), Some(anchor))
+        } else {
+            (committed_height, None)
         };
 
         if current_height == 0 {
@@ -1725,14 +1831,21 @@ pub fn register_eth_methods_with_finality(
         // block_count >= 1 (the zero case returned above).
         let start_height = current_height.saturating_sub(block_count.saturating_sub(1));
 
+        // The block read at each height of the window. A height the certified
+        // chain steps over has none and gets the empty-slot defaults below.
+        let window: std::collections::HashMap<u64, Hash> =
+            range_block_hashes(&storage_fee, window_anchor, start_height, current_height)
+                .map_err(range_read_error)?
+                .into_iter()
+                .collect();
+
         // Collect fee data from blocks
         let mut base_fees: Vec<String> = Vec::new();
         let mut gas_used_ratios: Vec<f64> = Vec::new();
         let mut rewards: Vec<Vec<String>> = Vec::new();
 
         for height in start_height..=current_height {
-            // Get block hash at height
-            if let Ok(Some(block_hash)) = storage_fee.blocks.get_block_by_height(height) {
+            if let Some(block_hash) = window.get(&height).copied() {
                 // Get block data
                 if let Ok(Some(block)) = storage_fee.blocks.get_block(&block_hash) {
                     // Use persisted gas_used and gas_limit from block header (EIP-1559 fields)
@@ -1868,7 +1981,7 @@ pub fn register_eth_methods_with_finality(
 
     // eth_getLogs - Get logs matching filter criteria
     let storage_logs = storage.clone();
-    let finalized_logs = finalized_height.clone();
+    let finalized_logs = finalized.clone();
     io_handler.add_sync_method("eth_getLogs", move |params: Params| {
         // WP-I.4: eth_getLogs costs 10 budget units
         crate::rate_limit::check_method_budget(10)?;
@@ -1889,7 +2002,17 @@ pub fn register_eth_methods_with_finality(
 
         // Get current height for "latest" resolution
         let current_height = storage_logs.blocks.get_latest_height().unwrap_or(0);
-        let finalized = finalized_logs.load(Ordering::SeqCst);
+        // A finality-tag bound resolves to the verified anchor: its HEIGHT
+        // bounds the range, and its HASH (Enforced mode) names the certified
+        // chain that heights at or below it are read from (`range_block_hashes`).
+        let anchor = if is_finality_tag(filter.get("fromBlock").and_then(|v| v.as_str()))
+            || is_finality_tag(filter.get("toBlock").and_then(|v| v.as_str()))
+        {
+            Some(finalized_logs.resolve(&storage_logs))
+        } else {
+            None
+        };
+        let finalized = anchor.map_or(0, |a| a.height);
 
         // Parse fromBlock (default to 0). Absent field keeps its default; a
         // present tag is resolved via the shared resolver (adds finalized/safe).
@@ -2016,13 +2139,9 @@ pub fn register_eth_methods_with_finality(
         let mut result_logs: Vec<Value> = Vec::new();
         let mut log_index_global = 0usize;
 
-        for height in from_block..=effective_to {
-            // Get block hash at this height
-            let block_hash = match storage_logs.blocks.get_block_by_height(height) {
-                Ok(Some(hash)) => hash,
-                _ => continue,
-            };
-
+        let blocks = range_block_hashes(&storage_logs, anchor, from_block, effective_to)
+            .map_err(range_read_error)?;
+        for (height, block_hash) in blocks {
             // Get all transaction hashes in this block
             let tx_hashes = match storage_logs
                 .transactions
@@ -2092,7 +2211,7 @@ pub fn register_eth_methods_with_finality(
 
     // eth_newFilter - Create a new log filter
     let storage_new_filter = storage.clone();
-    let finalized_new_filter = finalized_height.clone();
+    let finalized_new_filter = finalized.clone();
     let filter_registry_new = filter_registry.clone();
     io_handler.add_sync_method("eth_newFilter", move |params: Params| {
         let params: Vec<Value> = match params.parse() {
@@ -2109,7 +2228,16 @@ pub fn register_eth_methods_with_finality(
         crate::filter::validate_log_filter_criteria(filter)
             .map_err(jsonrpc_core::Error::invalid_params)?;
         let current_height = storage_new_filter.blocks.get_latest_height().unwrap_or(0);
-        let finalized = finalized_new_filter.load(Ordering::SeqCst);
+        // Anchor resolved once, at creation (see eth_getLogs); the filter keeps
+        // it so its range reads follow the certified chain.
+        let anchor = if is_finality_tag(filter.get("fromBlock").and_then(|v| v.as_str()))
+            || is_finality_tag(filter.get("toBlock").and_then(|v| v.as_str()))
+        {
+            Some(finalized_new_filter.resolve(&storage_new_filter))
+        } else {
+            None
+        };
+        let finalized = anchor.map_or(0, |a| a.height);
 
         // Parse fromBlock (None on absent/unrecognised, unchanged; adds finalized/safe).
         let from_block = resolve_block_tag(
@@ -2208,7 +2336,14 @@ pub fn register_eth_methods_with_finality(
         };
 
         let filter_id = filter_registry_new
-            .new_log_filter(from_block, to_block, addresses, topics, current_height)
+            .new_log_filter_anchored(
+                from_block,
+                to_block,
+                addresses,
+                topics,
+                current_height,
+                anchor,
+            )
             .ok_or_else(|| jsonrpc_core::Error {
                 // CHAIN-B-D003: registry at capacity — refuse rather than grow.
                 code: jsonrpc_core::ErrorCode::ServerError(-32005),
@@ -2324,6 +2459,7 @@ pub fn register_eth_methods_with_finality(
                 // Return new block hashes since last poll
                 let mut block_hashes = Vec::new();
                 for height in last_poll_block.saturating_add(1)..=current_height {
+                    // height-index: block filter, heights after the last poll up to latest.
                     if let Ok(Some(hash)) =
                         storage_filter_changes.blocks.get_block_by_height(height)
                     {
@@ -2344,6 +2480,7 @@ pub fn register_eth_methods_with_finality(
                 to_block,
                 ref addresses,
                 ref topics,
+                finalized_anchor,
             } => {
                 // Calculate effective block range
                 let effective_from = last_poll_block.saturating_add(1);
@@ -2362,13 +2499,14 @@ pub fn register_eth_methods_with_finality(
 
                 let mut result_logs: Vec<Value> = Vec::new();
 
-                for height in effective_from..=effective_to {
-                    let block_hash = match storage_filter_changes.blocks.get_block_by_height(height)
-                    {
-                        Ok(Some(hash)) => hash,
-                        _ => continue,
-                    };
-
+                let blocks = range_block_hashes(
+                    &storage_filter_changes,
+                    finalized_anchor,
+                    effective_from,
+                    effective_to,
+                )
+                .map_err(range_read_error)?;
+                for (height, block_hash) in blocks {
                     let tx_hashes = match storage_filter_changes
                         .transactions
                         .get_block_transactions(&block_hash)
@@ -2478,6 +2616,7 @@ pub fn register_eth_methods_with_finality(
                 to_block,
                 ref addresses,
                 ref topics,
+                finalized_anchor,
             } => {
                 let effective_from = from_block.unwrap_or(0);
                 let effective_to = to_block.unwrap_or(current_height).min(current_height);
@@ -2486,12 +2625,14 @@ pub fn register_eth_methods_with_finality(
 
                 let mut result_logs: Vec<Value> = Vec::new();
 
-                for height in effective_from..=effective_to {
-                    let block_hash = match storage_filter_logs.blocks.get_block_by_height(height) {
-                        Ok(Some(hash)) => hash,
-                        _ => continue,
-                    };
-
+                let blocks = range_block_hashes(
+                    &storage_filter_logs,
+                    finalized_anchor,
+                    effective_from,
+                    effective_to,
+                )
+                .map_err(range_read_error)?;
+                for (height, block_hash) in blocks {
                     let tx_hashes = match storage_filter_logs
                         .transactions
                         .get_block_transactions(&block_hash)
@@ -2698,7 +2839,7 @@ pub fn register_eth_methods_with_finality(
     // and re-reads "latest" each call.
     let storage_gsat = storage.clone();
     let executor_gsat = executor.clone();
-    let finalized_gsat = finalized_height.clone();
+    let finalized_gsat = finalized.clone();
     io_handler.add_sync_method("eth_getStorageAt", move |params: Params| {
         let state_api = StateApi::new(storage_gsat.clone(), executor_gsat.clone());
 
@@ -2715,11 +2856,7 @@ pub fn register_eth_methods_with_finality(
         // finalized height is behind the tip rather than mislabel latest state.
         let tag = parsed.get(2).and_then(|v| v.as_str());
         let latest_height = block_on(ChainApi::new(storage_gsat.clone()).get_height()).unwrap_or(0);
-        require_serviceable_finality_tag(
-            tag,
-            finalized_gsat.load(Ordering::SeqCst),
-            latest_height,
-        )?;
+        require_serviceable_finality_tag(tag, &finalized_gsat, &storage_gsat, latest_height)?;
 
         // address (required, 20 bytes)
         let addr_str = arg(&parsed, 0)
@@ -2779,7 +2916,7 @@ pub fn register_eth_methods_with_finality(
 
     // eth_getBlockTransactionCountByNumber(blockTag) — uint count.
     let storage_btcbn = storage.clone();
-    let finalized_btcbn = finalized_height.clone();
+    let finalized_btcbn = finalized.clone();
     io_handler.add_sync_method(
         "eth_getBlockTransactionCountByNumber",
         move |params: Params| {
@@ -2791,12 +2928,13 @@ pub fn register_eth_methods_with_finality(
                 return Err(jsonrpc_core::Error::invalid_params("missing block tag"));
             }
             let current = block_on(api.get_height()).unwrap_or(0);
-            let finalized = finalized_btcbn.load(Ordering::SeqCst);
-            let number = match resolve_block_tag(arg(&parsed, 0).as_str(), current, finalized) {
-                Some(n) => n,
+            let tag = arg(&parsed, 0).as_str();
+            let anchor = anchor_for(tag, &finalized_btcbn, &storage_btcbn);
+            let block_id = match resolve_block_id(tag, current, anchor) {
+                Some(id) => id,
                 None => return Err(jsonrpc_core::Error::invalid_params("bad block tag")),
             };
-            match block_on(api.get_block(crate::types::request::BlockId::Number(number))) {
+            match block_on(api.get_block(block_id)) {
                 Ok(block) => Ok(Value::String(format!("0x{:x}", block.transactions.len()))),
                 Err(_) => Ok(Value::Null),
             }
@@ -2838,7 +2976,7 @@ pub fn register_eth_methods_with_finality(
     // object at position `index` of the block. Used by `cast block --index`
     // and Foundry's broadcast verification.
     let storage_tbni = storage.clone();
-    let finalized_tbni = finalized_height.clone();
+    let finalized_tbni = finalized.clone();
     io_handler.add_sync_method(
         "eth_getTransactionByBlockNumberAndIndex",
         move |params: Params| {
@@ -2852,9 +2990,10 @@ pub fn register_eth_methods_with_finality(
                 ));
             }
             let current = block_on(api.get_height()).unwrap_or(0);
-            let finalized = finalized_tbni.load(Ordering::SeqCst);
-            let number = match resolve_block_tag(arg(&parsed, 0).as_str(), current, finalized) {
-                Some(n) => n,
+            let tag = arg(&parsed, 0).as_str();
+            let anchor = anchor_for(tag, &finalized_tbni, &storage_tbni);
+            let block_id = match resolve_block_id(tag, current, anchor) {
+                Some(id) => id,
                 None => return Err(jsonrpc_core::Error::invalid_params("bad block tag")),
             };
             let idx_str = arg(&parsed, 1)
@@ -2862,11 +3001,10 @@ pub fn register_eth_methods_with_finality(
                 .ok_or_else(|| jsonrpc_core::Error::invalid_params("index must be hex string"))?;
             let idx = usize::from_str_radix(idx_str.trim_start_matches("0x"), 16)
                 .map_err(|_| jsonrpc_core::Error::invalid_params("bad hex index"))?;
-            let block =
-                match block_on(api.get_block(crate::types::request::BlockId::Number(number))) {
-                    Ok(b) => b,
-                    Err(_) => return Ok(Value::Null),
-                };
+            let block = match block_on(api.get_block(block_id)) {
+                Ok(b) => b,
+                Err(_) => return Ok(Value::Null),
+            };
             if let Some(tx) = block.transactions.get(idx) {
                 Ok(json!({
                     "hash": format!("0x{}", hex::encode(tx.hash.as_bytes())),

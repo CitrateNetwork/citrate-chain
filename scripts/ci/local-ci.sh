@@ -169,6 +169,9 @@ consensus_tripwires() {
     "scripts/ci/wallet_gate_signing_tripwire.sh" \
     "scripts/ci/excluded_workspace_ci_tripwire.sh" \
     "scripts/ci/salt_supply_tripwire.sh" \
+    "scripts/ci/finality_range_height_index_tripwire.sh" \
+    "scripts/ci/finality_certificate_durable_write_tripwire.sh" \
+    "scripts/ci/finality_finalize_retry_wired_tripwire.sh" \
   ; do
     if [ ! -x "$t" ]; then
       echo "missing/!executable tripwire: $t"; rc=1; continue

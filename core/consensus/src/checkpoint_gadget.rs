@@ -30,14 +30,40 @@
 // refused and logged as a safety stop. If the write fails, or there is no
 // persistent store, nothing is signed. See [`SignRefusal`].
 //
-// NOT HERE (Stage 1c): floor ENFORCEMENT (§4.5). Finalizing a checkpoint advances
-// `CheckpointManager::latest_finalized_height()` only; nothing in this module
-// raises the reorg floor.
+// FLOOR ENFORCEMENT (Stage 1c, §4.5) is NOT in this module: finalizing a
+// checkpoint advances `CheckpointManager::latest_finalized_height()` only. The
+// node's `finality_floor::FloorVerifier` re-verifies the certificate and checks
+// its hash against the node's own applied chain before anything uses it, and is
+// gated by a SEPARATE compiled pin, [`CHECKPOINT_ENFORCEMENT_PINS`]. With that
+// pin ON it runs as the manager's `checkpoint::FinalizationGuard`, i.e. before
+// each finalization becomes visible (spec §5 S2), not only on its poll. When that
+// check fails (mismatch / invalid certificate) the verifier HALTS this gadget
+// ([`FinalityGadget::safety_stop`]): a halted gadget proposes and signs nothing
+// ([`SkipReason::Halted`]) until the verifier clears the halt.
+//
+// HALT / SIGN SERIALIZATION (PR #323 review, P2). The halt flag is a
+// [`SafetyStop`]: it is only ever set or cleared while holding its signing gate
+// (an async mutex), and the signing path holds that same gate across
+// halt-check -> durable authorization -> signature -> local submit -> queue for
+// broadcast, re-checking the flag under the gate before authorizing and again
+// before queueing. So a halt either completes before a signing decision begins
+// (that decision then sees it and signs nothing) or waits until an in-flight
+// decision has finished; a signer that read "not halted" earlier and then
+// suspended can never sign after the halt. Lock order (outermost first):
+//   CheckpointManager finalize serial -> FloorVerifier state -> SafetyStop gate
+//   -> GadgetState -> CheckpointManager RwLocks
+// (the persistent store is synchronous, below all of them; the node's advance
+// lock is taken under the verifier state). Finalization is never started while
+// holding the gate, GadgetState or a manager RwLock. The gate is
+// never awaited while holding GadgetState or any manager lock, and the verifier
+// state is never awaited while holding the gate.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 use tracing::{debug, error, info, warn};
 
 use crate::checkpoint::{
@@ -64,6 +90,24 @@ pub const CHECKPOINT_VOTING_PINS: &[(u64, bool)] = &[(40204, false)];
 /// `chain_id`. Data source: the compiled table [`CHECKPOINT_VOTING_PINS`].
 pub fn checkpoint_voting_pinned(chain_id: u64) -> bool {
     pinned_in(CHECKPOINT_VOTING_PINS, chain_id)
+}
+
+/// Compiled-in per-chain switch for checkpoint-finality floor ENFORCEMENT
+/// (spec §4.5, §6 step 4): whether a verified finalized certificate raises this
+/// node's reorg floor. SEPARATE from [`CHECKPOINT_VOTING_PINS`] so the producer
+/// path can run with the floor only observed first (§6 step 1). Enforcement
+/// requires voting: with voting OFF this pin is ignored. A chain that is not
+/// listed is OFF.
+///
+/// OWNER STEP (enable release): flip 40204 to `true` only after healthy
+/// finalization has been observed on the fleet with voting ON and late joiners
+/// can fetch certificates (spec §6, §11.10).
+pub const CHECKPOINT_ENFORCEMENT_PINS: &[(u64, bool)] = &[(40204, false)];
+
+/// Whether this release enforces the checkpoint-finality floor for `chain_id`.
+/// Data source: the compiled table [`CHECKPOINT_ENFORCEMENT_PINS`].
+pub fn checkpoint_enforcement_pinned(chain_id: u64) -> bool {
+    pinned_in(CHECKPOINT_ENFORCEMENT_PINS, chain_id)
 }
 
 fn pinned_in(table: &[(u64, bool)], chain_id: u64) -> bool {
@@ -120,6 +164,48 @@ pub const MAX_UNKNOWN_EARLY_VOTES: usize = 32;
 /// signed floor past them (see [`SignRefusal::BelowSignedFloor`]), so pruning
 /// above the finalized floor never re-opens a height for signing.
 pub const MAX_SIGNED_HEIGHTS: usize = 1024;
+
+/// Finalization retry (certificate write): delay before the first retry of a
+/// checkpoint whose finalization failed although it already has quorum (its
+/// certificate could not be written durably). Each further failure doubles
+/// the delay up to [`FINALIZE_RETRY_CAP`]. See
+/// [`FinalityGadget::retry_finalizations`].
+pub const FINALIZE_RETRY_BASE: Duration = Duration::from_secs(1);
+/// Upper bound on the finalization retry delay: a store that stays broken is
+/// retried at most once per this interval, for as long as the checkpoint is
+/// pending with quorum.
+pub const FINALIZE_RETRY_CAP: Duration = Duration::from_secs(30);
+
+/// Delay before the next finalization retry after `failures` failed attempts:
+/// [`FINALIZE_RETRY_BASE`] doubled per failure after the first, capped at
+/// [`FINALIZE_RETRY_CAP`] (`0` failures = the base delay).
+pub fn finalize_retry_delay(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(31);
+    let factor = 1u32.checked_shl(doublings).unwrap_or(u32::MAX);
+    FINALIZE_RETRY_BASE
+        .checked_mul(factor)
+        .map_or(FINALIZE_RETRY_CAP, |d| d.min(FINALIZE_RETRY_CAP))
+}
+
+/// What one [`FinalityGadget::retry_finalizations`] tick did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FinalizeRetryOutcome {
+    /// Heights finalized by this tick, ascending.
+    pub finalized: Vec<u64>,
+    /// Heights retried by this tick that still failed, ascending.
+    pub failed: Vec<u64>,
+    /// Checkpoints still waiting for a retry after this tick.
+    pub pending: usize,
+}
+
+/// Lifetime counters of the finalization retry (for the node's metrics).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FinalizeRetryStats {
+    /// Retry attempts made (each one a `finalize_checkpoint` call).
+    pub attempts: u64,
+    /// Retries that finalized their checkpoint.
+    pub recovered: u64,
+}
 
 /// `DAG_METADATA` key prefix of the durable signed-vote record:
 /// `checkpoint_signed:<chain_id>:<height>` -> the 32-byte block hash signed.
@@ -186,6 +272,81 @@ pub enum SignRefusal {
     BelowSignedFloor { floor: u64 },
     /// A stored record or watermark did not decode (fail closed).
     CorruptRecord(String),
+    /// The Stage 1c safety stop was engaged before this signing decision took
+    /// the signing gate: nothing was authorized, signed or queued.
+    Halted,
+}
+
+/// Stage 1c safety stop shared by the finality gadget (signer) and the node's
+/// finality floor verifier (which engages / clears it).
+///
+/// The flag is written ONLY while holding `gate`; the signing path holds `gate`
+/// across its whole check -> authorize -> sign -> queue sequence (see
+/// [`SafetyStop::signing_permit`]). An unlocked [`SafetyStop::is_engaged`] read
+/// is a fast-path / reporting hint only and never authorizes a signature.
+#[derive(Debug, Default)]
+pub struct SafetyStop {
+    gate: Mutex<()>,
+    engaged: AtomicBool,
+}
+
+/// Proof that the safety stop was NOT engaged when the signing gate was taken.
+/// While it is alive the stop cannot be engaged (engaging waits for the gate).
+pub struct SigningPermit<'a> {
+    stop: &'a SafetyStop,
+    _gate: MutexGuard<'a, ()>,
+}
+
+impl SigningPermit<'_> {
+    /// Re-check under the held gate. Always `false` while the permit is alive
+    /// (the flag only changes under the gate); kept as an explicit check at each
+    /// step so the invariant is local to the signing code, not only structural.
+    fn halted(&self) -> bool {
+        self.stop.engaged.load(Ordering::SeqCst)
+    }
+}
+
+impl SafetyStop {
+    /// Engage the stop. Waits for any in-flight signing decision to finish;
+    /// once this returns, no new signature is created until [`Self::clear`].
+    pub async fn engage(&self) {
+        let _gate = self.gate.lock().await;
+        self.engaged.store(true, Ordering::SeqCst);
+    }
+
+    /// Clear the stop (the verifier does this only when a mismatch resolved).
+    pub async fn clear(&self) {
+        let _gate = self.gate.lock().await;
+        self.engaged.store(false, Ordering::SeqCst);
+    }
+
+    /// Unlocked read of the flag: a hint for fast paths and reporting. A signing
+    /// decision must use [`Self::signing_permit`] instead.
+    pub fn is_engaged(&self) -> bool {
+        self.engaged.load(Ordering::SeqCst)
+    }
+
+    /// Take the signing gate. `None` if the stop is engaged. The returned permit
+    /// must be held across authorization, signing and queueing.
+    async fn signing_permit(&self) -> Option<SigningPermit<'_>> {
+        let gate = self.gate.lock().await;
+        if self.engaged.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(SigningPermit {
+            stop: self,
+            _gate: gate,
+        })
+    }
+}
+
+/// Test-only pause point in the signing path, after the unlocked pre-checks and
+/// before the signing gate is taken (the window PR #323's review identified).
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct SignPause {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) resume: tokio::sync::Notify,
 }
 
 impl SignRefusal {
@@ -293,6 +454,10 @@ pub struct BuriedOutcome {
 pub enum SkipReason {
     /// The compiled switch is OFF for this chain.
     Disabled,
+    /// The node's finality floor verifier found a finalized certificate that
+    /// does not match this node's chain (or does not verify) and halted the
+    /// gadget: nothing is proposed or signed until the halt clears.
+    Halted,
     /// No epoch validator-set snapshot is materialized for this height (no
     /// registry configured, or the governing S(E) has not been applied).
     NoCommittee,
@@ -503,6 +668,17 @@ struct GadgetState {
     /// (never at construction, so a switched-OFF gadget never touches the
     /// store) and updated only after a successful synced write.
     signed_meta: Option<SignedVoteMeta>,
+    /// Checkpoints pending WITH quorum whose finalization failed (the
+    /// certificate could not be written durably), by height: failures so far
+    /// and when the next retry is due. See [`FinalityGadget::retry_finalizations`].
+    finalize_retry: BTreeMap<u64, FinalizeRetry>,
+}
+
+/// Retry schedule of one checkpoint whose finalization failed.
+#[derive(Debug, Clone, Copy)]
+struct FinalizeRetry {
+    failures: u32,
+    next_at: Instant,
 }
 
 /// The producer/outbound half of checkpoint finality.
@@ -514,7 +690,17 @@ pub struct FinalityGadget {
     /// committee can be derived = nothing is proposed.
     committee_source: Option<Arc<VrfProposerSelector>>,
     enabled: bool,
+    /// Stage 1c safety stop, engaged and cleared ONLY by the node's finality
+    /// floor verifier. While engaged, nothing is proposed or signed; signing is
+    /// serialized against it through its gate (module docs, lock order).
+    safety_stop: Arc<SafetyStop>,
     state: Mutex<GadgetState>,
+    /// [`FinalizeRetryStats::attempts`].
+    retry_attempts: AtomicU64,
+    /// [`FinalizeRetryStats::recovered`].
+    retry_recovered: AtomicU64,
+    #[cfg(test)]
+    sign_pause: Option<Arc<SignPause>>,
 }
 
 impl FinalityGadget {
@@ -540,8 +726,32 @@ impl FinalityGadget {
             manager,
             committee_source,
             enabled,
+            safety_stop: Arc::new(SafetyStop::default()),
             state: Mutex::new(GadgetState::default()),
+            retry_attempts: AtomicU64::new(0),
+            retry_recovered: AtomicU64::new(0),
+            #[cfg(test)]
+            sign_pause: None,
         }
+    }
+
+    /// Install a pause point before the signing gate (tests only).
+    #[cfg(test)]
+    pub(crate) fn with_sign_pause(mut self, pause: Arc<SignPause>) -> Self {
+        self.sign_pause = Some(pause);
+        self
+    }
+
+    /// The safety stop shared with the node's finality floor verifier, which
+    /// engages it on a certificate mismatch / invalid certificate and clears it
+    /// (mismatch only) once the certified block is canonical on this node again.
+    pub fn safety_stop(&self) -> Arc<SafetyStop> {
+        self.safety_stop.clone()
+    }
+
+    /// Whether the gadget is halted (unlocked hint; see [`SafetyStop`]).
+    pub fn halted(&self) -> bool {
+        self.safety_stop.is_engaged()
     }
 
     /// Whether the producer path is switched on.
@@ -600,6 +810,10 @@ impl FinalityGadget {
             out.skipped = Some(SkipReason::Disabled);
             return out;
         }
+        if self.halted() {
+            out.skipped = Some(SkipReason::Halted);
+            return out;
+        }
         let Some(committee) = self.committee_for(height, seed).await else {
             out.skipped = Some(SkipReason::NoCommittee);
             return out;
@@ -653,39 +867,7 @@ impl FinalityGadget {
         // Own vote first (it is the one peers are most likely missing). The
         // signing decision is made durable BEFORE the vote exists.
         if let (Some(key), true) = (signer, in_committee) {
-            let authorized = {
-                let mut st = self.state.lock().await;
-                self.authorize_sign(&mut st, height, block_hash)
-            };
-            if let Err(refusal) = &authorized {
-                match refusal {
-                    SignRefusal::Conflicting { signed } => error!(
-                        "checkpoint {}: SAFETY STOP — this node already signed {} at this \
-                         height; refusing to sign {} (would be equivocation)",
-                        height, signed, block_hash
-                    ),
-                    other => error!(
-                        "checkpoint {}: not signing {}: {:?}",
-                        height, block_hash, other
-                    ),
-                }
-                out.own_vote_retryable = refusal.is_recoverable();
-                out.sign_refused = Some(refusal.clone());
-            }
-            if authorized.is_ok() {
-                let vote =
-                    sign_checkpoint_vote(self.manager.config().chain_id, height, block_hash, key);
-                match self.manager.submit_vote(vote.clone()).await {
-                    Ok(quorum) => {
-                        out.signed_own_vote = true;
-                        out.outbound.push(vote);
-                        if quorum {
-                            out.finalized |= self.finalize(height).await;
-                        }
-                    }
-                    Err(e) => warn!("checkpoint {}: own vote not accepted: {}", height, e),
-                }
-            }
+            self.sign_own_vote(height, block_hash, key, &mut out).await;
         }
 
         // §11.5 replay: votes that arrived before this proposal.
@@ -722,6 +904,83 @@ impl FinalityGadget {
 
         self.prune().await;
         out
+    }
+
+    /// Sign, submit and queue this node's own vote at `height`, serialized
+    /// against the safety stop: the signing gate is held from the halt check
+    /// through authorization, signature, local submit and queueing (lock order:
+    /// gate -> GadgetState, then gate -> manager; GadgetState is released before
+    /// any manager call). Finalization runs after the gate is released.
+    async fn sign_own_vote(
+        &self,
+        height: u64,
+        block_hash: Hash,
+        key: &Ed25519SigningKey,
+        out: &mut BuriedOutcome,
+    ) {
+        #[cfg(test)]
+        if let Some(pause) = &self.sign_pause {
+            pause.reached.notify_one();
+            pause.resume.notified().await;
+        }
+
+        let quorum = {
+            let Some(permit) = self.safety_stop.signing_permit().await else {
+                info!(
+                    "checkpoint {}: safety stop engaged; not signing {}",
+                    height, block_hash
+                );
+                out.sign_refused = Some(SignRefusal::Halted);
+                return;
+            };
+            // Re-check under the gate immediately before authorizing.
+            if permit.halted() {
+                out.sign_refused = Some(SignRefusal::Halted);
+                return;
+            }
+            let authorized = {
+                let mut st = self.state.lock().await;
+                self.authorize_sign(&mut st, height, block_hash)
+            };
+            if let Err(refusal) = authorized {
+                match &refusal {
+                    SignRefusal::Conflicting { signed } => error!(
+                        "checkpoint {}: SAFETY STOP — this node already signed {} at this \
+                         height; refusing to sign {} (would be equivocation)",
+                        height, signed, block_hash
+                    ),
+                    other => error!(
+                        "checkpoint {}: not signing {}: {:?}",
+                        height, block_hash, other
+                    ),
+                }
+                out.own_vote_retryable = refusal.is_recoverable();
+                out.sign_refused = Some(refusal);
+                return;
+            }
+            let vote =
+                sign_checkpoint_vote(self.manager.config().chain_id, height, block_hash, key);
+            // Re-check under the gate before the vote leaves this function.
+            if permit.halted() {
+                out.sign_refused = Some(SignRefusal::Halted);
+                return;
+            }
+            match self.manager.submit_vote(vote.clone()).await {
+                Ok(quorum) => {
+                    out.signed_own_vote = true;
+                    out.outbound.push(vote);
+                    quorum
+                }
+                Err(e) => {
+                    warn!("checkpoint {}: own vote not accepted: {}", height, e);
+                    return;
+                }
+            }
+            // `permit` (the gate) is released here.
+        };
+        if quorum {
+            out.finalized |= self.finalize(height).await;
+        }
     }
 
     /// Record the latest canonical tip this node has applied (bounds the
@@ -826,11 +1085,15 @@ impl FinalityGadget {
                 votes: cp.votes.len(),
                 relay,
             },
-            Err(error) => InboundOutcome::FinalizeFailed {
-                height,
-                error,
-                relay,
-            },
+            Err(error) => {
+                self.note_finalize_failure(height, &error, Instant::now())
+                    .await;
+                InboundOutcome::FinalizeFailed {
+                    height,
+                    error,
+                    relay,
+                }
+            }
         }
     }
 
@@ -926,8 +1189,121 @@ impl FinalityGadget {
             }
             Err(e) => {
                 warn!("checkpoint {}: finalize failed: {}", height, e);
+                self.note_finalize_failure(height, &e, Instant::now()).await;
                 false
             }
+        }
+    }
+
+    /// Retry the finalization of every checkpoint that is pending WITH quorum
+    /// but did not finalize (its certificate write failed), once its backoff
+    /// delay has passed at `now`. Called on the driver's periodic tick, so a
+    /// checkpoint whose certificate write failed finalizes once the store
+    /// recovers even if no further vote ever arrives.
+    ///
+    /// Idempotent and never double-publishes: each attempt is an ordinary
+    /// `finalize_checkpoint` (serialized by the manager), so a checkpoint that
+    /// finalized meanwhile — through a late vote, or a concurrent tick — is no
+    /// longer pending and is simply dropped. A checkpoint that leaves the
+    /// pending set without finalizing (pruned below a later finalized height,
+    /// evicted) is dropped too. A failed attempt is fail-closed exactly like the
+    /// first one (no floor, nothing published, votes kept) and schedules the
+    /// next after [`finalize_retry_delay`], capped at [`FINALIZE_RETRY_CAP`];
+    /// retries continue while the checkpoint is pending with quorum. Bounded by
+    /// the pending set ([`crate::checkpoint::MAX_PENDING_CHECKPOINTS`]).
+    pub async fn retry_finalizations(&self, now: Instant) -> FinalizeRetryOutcome {
+        let mut out = FinalizeRetryOutcome::default();
+        let ready = self.manager.quorum_pending_heights().await;
+        let due: Vec<u64> = {
+            let mut st = self.state.lock().await;
+            st.finalize_retry.retain(|h, _| ready.contains(h));
+            // A quorum checkpoint not yet tracked (its finalization may still be
+            // in flight on the vote path) gets one base delay before a retry.
+            let first = now.checked_add(FINALIZE_RETRY_BASE).unwrap_or(now);
+            for h in &ready {
+                st.finalize_retry.entry(*h).or_insert(FinalizeRetry {
+                    failures: 0,
+                    next_at: first,
+                });
+            }
+            st.finalize_retry
+                .iter()
+                .filter(|(_, r)| r.next_at <= now)
+                .map(|(h, _)| *h)
+                .collect()
+        };
+        // No gadget lock is held across a finalization (module docs, lock order).
+        for height in due {
+            self.retry_attempts.fetch_add(1, Ordering::Relaxed);
+            match self.manager.finalize_checkpoint(height).await {
+                Ok(cp) => {
+                    let failed_before = self
+                        .state
+                        .lock()
+                        .await
+                        .finalize_retry
+                        .remove(&height)
+                        .map_or(0, |r| r.failures);
+                    self.retry_recovered.fetch_add(1, Ordering::Relaxed);
+                    info!(
+                        "checkpoint {}: finalized on retry ({} votes) after {} failed attempt(s)",
+                        cp.height,
+                        cp.votes.len(),
+                        failed_before
+                    );
+                    out.finalized.push(height);
+                }
+                Err(CheckpointError::BlockNotFound(_)) => {
+                    // No longer pending: finalized meanwhile by another path,
+                    // or pruned. Nothing to retry.
+                    self.state.lock().await.finalize_retry.remove(&height);
+                    debug!("checkpoint {}: retry found nothing pending", height);
+                }
+                Err(e) => {
+                    let mut st = self.state.lock().await;
+                    if let Some(r) = st.finalize_retry.get_mut(&height) {
+                        r.failures = r.failures.saturating_add(1);
+                        let delay = finalize_retry_delay(r.failures);
+                        r.next_at = now.checked_add(delay).unwrap_or(now);
+                        warn!(
+                            "checkpoint {}: finalize retry failed ({}; {} failure(s)); \
+                             nothing finalized, next attempt in {:?}",
+                            height, e, r.failures, delay
+                        );
+                    }
+                    out.failed.push(height);
+                }
+            }
+        }
+        if !out.finalized.is_empty() {
+            self.prune().await;
+        }
+        out.pending = self.state.lock().await.finalize_retry.len();
+        out
+    }
+
+    /// Record a failed finalization of `height` at `now` (the certificate write
+    /// failed) so [`Self::retry_finalizations`] retries it after the backoff.
+    async fn note_finalize_failure(&self, height: u64, error: &CheckpointError, now: Instant) {
+        if !matches!(error, CheckpointError::StorageError(_)) {
+            return;
+        }
+        let mut st = self.state.lock().await;
+        let entry = st.finalize_retry.entry(height).or_insert(FinalizeRetry {
+            failures: 0,
+            next_at: now,
+        });
+        entry.failures = entry.failures.saturating_add(1);
+        entry.next_at = now
+            .checked_add(finalize_retry_delay(entry.failures))
+            .unwrap_or(now);
+    }
+
+    /// Lifetime counters of [`Self::retry_finalizations`].
+    pub fn finalize_retry_stats(&self) -> FinalizeRetryStats {
+        FinalizeRetryStats {
+            attempts: self.retry_attempts.load(Ordering::Relaxed),
+            recovered: self.retry_recovered.load(Ordering::Relaxed),
         }
     }
 
@@ -1164,6 +1540,10 @@ mod tests {
     struct MemKv {
         inner: std::sync::Mutex<MemMap>,
         fail_writes: AtomicBool,
+        /// Fail only writes of finalized certificates (`checkpoint:{height}`),
+        /// as a failed write or fsync of that record would; counts each one.
+        fail_certs: AtomicBool,
+        cert_failures: std::sync::atomic::AtomicUsize,
         batches: std::sync::atomic::AtomicUsize,
     }
 
@@ -1176,6 +1556,14 @@ mod tests {
         fn check_writable(&self) -> Result<(), String> {
             if self.fail_writes.load(Ordering::SeqCst) {
                 Err("injected write failure".to_string())
+            } else {
+                Ok(())
+            }
+        }
+        fn check_cert(&self, key: &[u8]) -> Result<(), String> {
+            if key.starts_with(b"checkpoint:") && self.fail_certs.load(Ordering::SeqCst) {
+                self.cert_failures.fetch_add(1, Ordering::SeqCst);
+                Err("injected: certificate fsync failed (EIO)".to_string())
             } else {
                 Ok(())
             }
@@ -1201,6 +1589,7 @@ mod tests {
         }
         fn kv_put(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), String> {
             self.check_writable()?;
+            self.check_cert(key)?;
             self.inner
                 .lock()
                 .map_err(|e| e.to_string())?
@@ -1231,6 +1620,11 @@ mod tests {
         /// Atomic: all ops or none.
         fn kv_write_batch(&self, ops: &[KvOp]) -> Result<(), String> {
             self.check_writable()?;
+            for op in ops {
+                if let KvOp::Put { key, .. } = op {
+                    self.check_cert(key)?;
+                }
+            }
             self.batches.fetch_add(1, Ordering::SeqCst);
             let mut m = self.inner.lock().map_err(|e| e.to_string())?;
             for op in ops {
@@ -2341,5 +2735,435 @@ mod tests {
             b"checkpoint_signed:40204:12".to_vec()
         );
         assert!(!signed_vote_key(1, 2).starts_with(b"checkpoint:"));
+    }
+
+    /// Stage 1c: the enforcement pin is separate from the voting pin and OFF for
+    /// every chain in this release.
+    #[test]
+    fn enforcement_pin_is_off_for_every_chain_in_this_release() {
+        assert!(!checkpoint_enforcement_pinned(40204));
+        assert!(!checkpoint_enforcement_pinned(1337));
+        assert!(!checkpoint_enforcement_pinned(0));
+        assert!(CHECKPOINT_ENFORCEMENT_PINS
+            .iter()
+            .any(|(id, _)| *id == 40204));
+    }
+
+    /// Stage 1c: a halted gadget proposes nothing, signs nothing, writes nothing
+    /// and broadcasts nothing; clearing the halt resumes normal operation.
+    #[tokio::test]
+    async fn halted_gadget_does_nothing_until_cleared() {
+        let ks = keys(4);
+        let kv = Arc::new(MemKv::default());
+        let g = gadget_over(&ks, true, kv.clone(), 40).await;
+        assert!(!g.halted());
+        g.safety_stop().engage().await;
+        assert!(g.halted());
+        let before = kv.batches.load(Ordering::SeqCst);
+        let seed = Hash::new([1; 32]);
+        let out = g
+            .on_buried_checkpoint(10, block_hash(10), &seed, ks.first())
+            .await;
+        assert_eq!(out.skipped, Some(SkipReason::Halted));
+        assert!(!out.proposed && !out.signed_own_vote && out.outbound.is_empty());
+        assert_eq!(g.manager().pending_hash(10).await, None, "nothing proposed");
+        assert_eq!(g.signed_vote_at(10), None, "nothing signed");
+        assert_eq!(kv.batches.load(Ordering::SeqCst), before, "nothing written");
+
+        g.safety_stop().clear().await;
+        let out = g
+            .on_buried_checkpoint(10, block_hash(10), &seed, ks.first())
+            .await;
+        assert!(out.proposed && out.signed_own_vote, "resumes once cleared");
+        assert_eq!(g.signed_vote_at(10), Some(block_hash(10)));
+    }
+
+    /// PR #323 review (P2): a signer that passed the unlocked halt check and is
+    /// suspended before the signing gate must NOT sign once the safety stop is
+    /// engaged from another task: no durable record, no local vote, no outbound.
+    #[tokio::test]
+    async fn halt_engaged_while_signer_suspended_prevents_signing() {
+        let ks = keys(4);
+        let kv = Arc::new(MemKv::default());
+        let pause = Arc::new(SignPause::default());
+        let g = Arc::new(
+            gadget_over(&ks, true, kv.clone(), 40)
+                .await
+                .with_sign_pause(pause.clone()),
+        );
+        let k0 = ks.first().expect("key 0").clone();
+        let seed = Hash::new([1; 32]);
+        let signer = {
+            let g = g.clone();
+            tokio::spawn(async move {
+                g.on_buried_checkpoint(10, block_hash(10), &seed, Some(&k0))
+                    .await
+            })
+        };
+        // The signer passed every unlocked pre-check and proposed; it is now
+        // paused just before the signing gate.
+        tokio::time::timeout(std::time::Duration::from_secs(5), pause.reached.notified())
+            .await
+            .expect("signer reached the pause point");
+        assert_eq!(g.manager().pending_hash(10).await, Some(block_hash(10)));
+        let batches_before = kv.batches.load(Ordering::SeqCst);
+
+        // The verifier engages the stop from another task; it must not wait on
+        // the paused signer (which holds no gate yet).
+        let stop = g.safety_stop();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::spawn(async move { stop.engage().await }),
+        )
+        .await
+        .expect("engage completes while the signer is suspended")
+        .expect("engage task");
+        assert!(g.halted());
+
+        pause.resume.notify_one();
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), signer)
+            .await
+            .expect("signer finishes")
+            .expect("signer task");
+        assert!(!out.signed_own_vote, "no signature after the stop");
+        assert!(out.outbound.is_empty(), "no outbound vote");
+        assert_eq!(out.sign_refused, Some(SignRefusal::Halted));
+        assert_eq!(g.signed_vote_at(10), None, "no durable signing record");
+        assert_eq!(
+            kv.batches.load(Ordering::SeqCst),
+            batches_before,
+            "nothing written"
+        );
+        assert_eq!(g.manager().pending_vote_count(10).await, Some(0));
+    }
+
+    /// Engaging the stop waits for an in-flight signing decision (the gate is
+    /// held), and once it returns no new signing permit is issued.
+    #[tokio::test]
+    async fn engage_waits_for_in_flight_signing_and_blocks_new_permits() {
+        let stop = Arc::new(SafetyStop::default());
+        let permit = stop.signing_permit().await.expect("not engaged");
+        let engaging = {
+            let stop = stop.clone();
+            tokio::spawn(async move { stop.engage().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!engaging.is_finished(), "engage waits for the held gate");
+        assert!(!permit.halted() && !stop.is_engaged());
+        drop(permit);
+        tokio::time::timeout(std::time::Duration::from_secs(5), engaging)
+            .await
+            .expect("engage completes once the gate is released")
+            .expect("engage task");
+        assert!(stop.is_engaged());
+        assert!(
+            stop.signing_permit().await.is_none(),
+            "no permit while engaged"
+        );
+        stop.clear().await;
+        assert!(
+            stop.signing_permit().await.is_some(),
+            "permits resume after clear"
+        );
+    }
+
+    /// Stage 1c: a finalized certificate survives a restart (a fresh manager over
+    /// the same store reloads it), still verifies, and is what
+    /// `latest_finalized_certificate` returns.
+    #[tokio::test]
+    async fn finalized_certificate_survives_restart_and_verifies() {
+        let ks = keys(4);
+        let kv = Arc::new(MemKv::default());
+        let g = gadget_over(&ks, true, kv.clone(), 40).await;
+        let seed = Hash::new([1; 32]);
+        let out = g
+            .on_buried_checkpoint(10, block_hash(10), &seed, ks.first())
+            .await;
+        assert!(out.signed_own_vote);
+        for k in ks.iter().skip(1) {
+            let _ = g
+                .on_inbound_vote(sign_checkpoint_vote(CHAIN, 10, block_hash(10), k))
+                .await;
+        }
+        let live = g
+            .manager()
+            .latest_finalized_certificate()
+            .await
+            .expect("finalized live");
+        assert_eq!((live.height, live.block_hash), (10, block_hash(10)));
+        live.verify_certificate(CHAIN)
+            .expect("live certificate verifies");
+        drop(g);
+
+        let kv_dyn: Arc<dyn KvStore> = kv;
+        let restarted = CheckpointManager::with_persistence(config(), dag_with(40).await, kv_dyn);
+        assert_eq!(restarted.latest_finalized_height().await, 10);
+        let cert = restarted
+            .latest_finalized_certificate()
+            .await
+            .expect("certificate reloaded after restart");
+        assert_eq!((cert.height, cert.block_hash), (10, block_hash(10)));
+        cert.verify_certificate(CHAIN)
+            .expect("reloaded certificate verifies");
+        assert!(
+            cert.verify_certificate(1337).is_err(),
+            "bound to its own chain id"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Finalization retry: a checkpoint that reached quorum but whose
+    // certificate could not be written is retried on the driver's tick, with
+    // capped backoff, even when no further vote arrives.
+    // -----------------------------------------------------------------------
+
+    /// Counts the guard's hooks: `after_finalize` is the publication point.
+    #[derive(Default)]
+    struct CountingGuard {
+        before: std::sync::atomic::AtomicUsize,
+        after: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::checkpoint::FinalizationGuard for CountingGuard {
+        async fn before_finalize(&self, _certificate: &crate::checkpoint::Checkpoint) {
+            self.before.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn after_finalize(&self, _certificate: &crate::checkpoint::Checkpoint) {
+            self.after.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A gadget over a store whose certificate writes fail, with checkpoint 4
+    /// pending and quorum (3 of 4) reached through the inbound path: the
+    /// finalization failed and nothing finalized.
+    async fn quorum_with_failed_certificate() -> (FinalityGadget, Arc<MemKv>, Vec<SigningKey>) {
+        let ks = keys(4);
+        let kv = Arc::new(MemKv::default());
+        kv.fail_certs.store(true, Ordering::SeqCst);
+        let g = gadget_over(&ks, true, kv.clone(), 40).await;
+        let committee: Vec<PublicKey> = ks.iter().map(pk).collect();
+        g.manager()
+            .ensure_proposed(4, block_hash(4), committee)
+            .await
+            .expect("propose");
+        for k in ks.iter().take(2) {
+            let out = g
+                .on_inbound_vote(sign_checkpoint_vote(CHAIN, 4, block_hash(4), k))
+                .await;
+            assert!(matches!(out, InboundOutcome::Accepted { .. }), "{out:?}");
+        }
+        let out = g
+            .on_inbound_vote(sign_checkpoint_vote(CHAIN, 4, block_hash(4), &ks[2]))
+            .await;
+        assert!(
+            matches!(
+                out,
+                InboundOutcome::FinalizeFailed {
+                    height: 4,
+                    error: CheckpointError::StorageError(_),
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+        assert_eq!(g.manager().latest_finalized_height().await, 0);
+        assert_eq!(g.manager().quorum_pending_heights().await, vec![4]);
+        (g, kv, ks)
+    }
+
+    #[test]
+    fn finalize_retry_delay_doubles_to_the_cap() {
+        assert_eq!(finalize_retry_delay(0), FINALIZE_RETRY_BASE);
+        assert_eq!(finalize_retry_delay(1), FINALIZE_RETRY_BASE);
+        assert_eq!(finalize_retry_delay(2), FINALIZE_RETRY_BASE * 2);
+        assert_eq!(finalize_retry_delay(3), FINALIZE_RETRY_BASE * 4);
+        assert_eq!(finalize_retry_delay(5), FINALIZE_RETRY_BASE * 16);
+        assert_eq!(finalize_retry_delay(6), FINALIZE_RETRY_CAP);
+        assert_eq!(finalize_retry_delay(64), FINALIZE_RETRY_CAP);
+        assert_eq!(finalize_retry_delay(u32::MAX), FINALIZE_RETRY_CAP);
+        for f in 0..100u32 {
+            assert!(finalize_retry_delay(f) <= FINALIZE_RETRY_CAP);
+            assert!(finalize_retry_delay(f) <= finalize_retry_delay(f.saturating_add(1)));
+        }
+    }
+
+    /// The store recovers and NO further vote arrives: the next tick after the
+    /// backoff delay finalizes the checkpoint; a tick before it does nothing.
+    #[tokio::test]
+    async fn failed_certificate_write_is_retried_on_the_tick_without_further_votes() {
+        let (g, kv, _ks) = quorum_with_failed_certificate().await;
+        kv.fail_certs.store(false, Ordering::SeqCst);
+
+        let start = Instant::now();
+        let early = g.retry_finalizations(start).await;
+        assert!(
+            early.finalized.is_empty() && early.failed.is_empty(),
+            "{early:?}"
+        );
+        assert_eq!(early.pending, 1, "tracked, waiting for its delay");
+        assert_eq!(g.manager().latest_finalized_height().await, 0);
+
+        let out = g.retry_finalizations(start + FINALIZE_RETRY_BASE).await;
+        assert_eq!(out.finalized, vec![4], "{out:?}");
+        assert_eq!(out.pending, 0);
+        assert_eq!(g.manager().latest_finalized_height().await, 4);
+        assert!(g.manager().is_certificate_persisted(4, &block_hash(4)));
+        let cp = g.manager().get_checkpoint(4).await.expect("finalized");
+        assert_eq!(cp.votes.len(), 3);
+        cp.verify_certificate(CHAIN).expect("certificate verifies");
+        assert_eq!(g.manager().pending_len().await, 0, "pruned after finality");
+        assert_eq!(
+            g.finalize_retry_stats(),
+            FinalizeRetryStats {
+                attempts: 1,
+                recovered: 1
+            }
+        );
+
+        // Idempotent: later ticks find nothing to do.
+        let again = g.retry_finalizations(start + FINALIZE_RETRY_CAP * 10).await;
+        assert_eq!(again, FinalizeRetryOutcome::default());
+        assert_eq!(g.finalize_retry_stats().attempts, 1);
+    }
+
+    /// The store never recovers: every retry fails, the checkpoint never
+    /// finalizes, and retries happen only when due — the delay doubles up to
+    /// the cap, so a broken store costs at most one write per cap interval.
+    #[tokio::test]
+    async fn permanent_certificate_failure_backs_off_and_never_finalizes() {
+        let (g, kv, _ks) = quorum_with_failed_certificate().await;
+        let failures_at_quorum = kv.cert_failures.load(Ordering::SeqCst);
+        assert_eq!(failures_at_quorum, 1);
+
+        let mut now = Instant::now() + FINALIZE_RETRY_BASE;
+        let mut failures: u32 = 1;
+        for round in 0..12 {
+            let before = kv.cert_failures.load(Ordering::SeqCst);
+            if round > 0 {
+                // Not due just before the delay (counted from the previous
+                // tick) ends: no write attempted.
+                let idle = g.retry_finalizations(now - Duration::from_millis(1)).await;
+                assert!(idle.failed.is_empty() && idle.finalized.is_empty());
+                assert_eq!(kv.cert_failures.load(Ordering::SeqCst), before);
+            }
+
+            let out = g.retry_finalizations(now).await;
+            assert_eq!(out.failed, vec![4], "{out:?}");
+            assert!(out.finalized.is_empty());
+            assert_eq!(out.pending, 1);
+            assert_eq!(kv.cert_failures.load(Ordering::SeqCst), before + 1);
+            assert_eq!(g.manager().latest_finalized_height().await, 0);
+            assert!(!g.manager().is_certificate_persisted(4, &block_hash(4)));
+            assert_eq!(g.manager().pending_vote_count(4).await, Some(3));
+            failures += 1;
+            now += finalize_retry_delay(failures);
+        }
+        assert_eq!(finalize_retry_delay(failures), FINALIZE_RETRY_CAP);
+        assert_eq!(
+            g.finalize_retry_stats(),
+            FinalizeRetryStats {
+                attempts: 12,
+                recovered: 0
+            }
+        );
+    }
+
+    /// A vote that arrives after the store recovers finalizes the checkpoint
+    /// first; the retry then has nothing to do and the guard publishes once.
+    /// And the other order: the retry finalizes, a later vote is refused.
+    #[tokio::test]
+    async fn retry_and_a_late_vote_never_finalize_twice() {
+        // Late vote first.
+        let (g, kv, ks) = quorum_with_failed_certificate().await;
+        let guard = Arc::new(CountingGuard::default());
+        assert!(g.manager().install_finalization_guard(guard.clone()));
+        kv.fail_certs.store(false, Ordering::SeqCst);
+        let out = g
+            .on_inbound_vote(sign_checkpoint_vote(CHAIN, 4, block_hash(4), &ks[3]))
+            .await;
+        assert!(
+            matches!(out, InboundOutcome::Finalized { height: 4, .. }),
+            "{out:?}"
+        );
+        let tick = g
+            .retry_finalizations(Instant::now() + FINALIZE_RETRY_CAP)
+            .await;
+        assert_eq!(tick, FinalizeRetryOutcome::default());
+        assert_eq!(guard.after.load(Ordering::SeqCst), 1, "published once");
+        assert_eq!(g.finalize_retry_stats().attempts, 0);
+
+        // Retry first.
+        let (g, kv, ks) = quorum_with_failed_certificate().await;
+        let guard = Arc::new(CountingGuard::default());
+        assert!(g.manager().install_finalization_guard(guard.clone()));
+        kv.fail_certs.store(false, Ordering::SeqCst);
+        let tick = g
+            .retry_finalizations(Instant::now() + FINALIZE_RETRY_BASE)
+            .await;
+        assert_eq!(tick.finalized, vec![4]);
+        let out = g
+            .on_inbound_vote(sign_checkpoint_vote(CHAIN, 4, block_hash(4), &ks[3]))
+            .await;
+        assert!(matches!(out, InboundOutcome::Rejected(_)), "{out:?}");
+        let tick = g
+            .retry_finalizations(Instant::now() + FINALIZE_RETRY_CAP * 4)
+            .await;
+        assert_eq!(tick, FinalizeRetryOutcome::default());
+        assert_eq!(guard.before.load(Ordering::SeqCst), 1);
+        assert_eq!(guard.after.load(Ordering::SeqCst), 1, "published once");
+    }
+
+    /// Concurrent ticks over the same failed checkpoint: exactly one
+    /// finalization, one publication.
+    #[tokio::test]
+    async fn concurrent_retry_ticks_finalize_once() {
+        let (g, kv, _ks) = quorum_with_failed_certificate().await;
+        let guard = Arc::new(CountingGuard::default());
+        assert!(g.manager().install_finalization_guard(guard.clone()));
+        kv.fail_certs.store(false, Ordering::SeqCst);
+        let g = Arc::new(g);
+        let at = Instant::now() + FINALIZE_RETRY_BASE;
+        let a = tokio::spawn({
+            let g = g.clone();
+            async move { g.retry_finalizations(at).await }
+        });
+        let b = tokio::spawn({
+            let g = g.clone();
+            async move { g.retry_finalizations(at).await }
+        });
+        let (a, b) = (a.await.expect("a"), b.await.expect("b"));
+        let total = a.finalized.len() + b.finalized.len();
+        assert_eq!(total, 1, "{a:?} {b:?}");
+        assert!(a.failed.is_empty() && b.failed.is_empty(), "{a:?} {b:?}");
+        assert_eq!(guard.after.load(Ordering::SeqCst), 1);
+        assert_eq!(g.manager().latest_finalized_height().await, 4);
+    }
+
+    /// A checkpoint that leaves the pending set without finalizing (pruned
+    /// below a later finalized height) is no longer retried.
+    #[tokio::test]
+    async fn pruned_checkpoint_is_no_longer_retried() {
+        let (g, kv, ks) = quorum_with_failed_certificate().await;
+        kv.fail_certs.store(false, Ordering::SeqCst);
+        // A later checkpoint finalizes through votes; 4 is pruned below it.
+        let committee: Vec<PublicKey> = ks.iter().map(pk).collect();
+        g.manager()
+            .ensure_proposed(6, block_hash(6), committee)
+            .await
+            .expect("propose 6");
+        for k in ks.iter().take(3) {
+            let _ = g
+                .on_inbound_vote(sign_checkpoint_vote(CHAIN, 6, block_hash(6), k))
+                .await;
+        }
+        assert_eq!(g.manager().latest_finalized_height().await, 6);
+        assert!(g.manager().quorum_pending_heights().await.is_empty());
+        let tick = g
+            .retry_finalizations(Instant::now() + FINALIZE_RETRY_CAP)
+            .await;
+        assert_eq!(tick, FinalizeRetryOutcome::default());
+        assert!(!g.manager().is_certificate_persisted(4, &block_hash(4)));
+        assert_eq!(g.finalize_retry_stats().attempts, 0);
     }
 }
