@@ -106,7 +106,7 @@ fi
 # (never its value), in every mode; on --broadcast the config forge resolves is checked too.
 FORGE_OUT_CHECK="${REPO_ROOT}/scripts/genesis/forge_output_check.py"
 [[ -f "$FORGE_OUT_CHECK" ]] || die "the forge output check $FORGE_OUT_CHECK is missing; run regenesis.sh from a full checkout"
-why=$("${PYTHON:-python3}" -I "$FORGE_OUT_CHECK" env 2>&1) || die "$why"
+why=$("${PYTHON:-python3}" -I "$FORGE_OUT_CHECK" env --dotenv "$CONTRACTS/.env" "$REPO_ROOT/.env" 2>&1) || die "$why"
 
 command -v forge >/dev/null || die "forge not on PATH"
 command -v jq >/dev/null || die "jq is required"

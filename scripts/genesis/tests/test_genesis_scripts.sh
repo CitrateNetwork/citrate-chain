@@ -1338,6 +1338,11 @@ cp "$G/../ops/regenesis.sh" "$T/rg-nocheck/scripts/ops/"
 reset_calls
 expect "regenesis: without the forge output check it refuses to run" 1 'forge output check .* is missing' -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" bash "$T/rg-nocheck/scripts/ops/regenesis.sh"
 if calls | grep -q '^forge'; then bad "regenesis: without the forge output check it runs no forge" "$(calls)"; else ok "regenesis: without the forge output check it runs no forge"; fi
+printf 'FOUNDRY_PROFILE=membership\n' >"$RG/contracts/.env"
+reset_calls
+expect "regenesis: a forge output variable in contracts/.env is refused before any forge step" 1 "FOUNDRY_PROFILE is set in $RG/contracts/.env, which forge loads" -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" bash "$RG/scripts/ops/regenesis.sh" --broadcast --account deployer
+if calls | grep -q '^forge'; then bad "regenesis: a refused contracts/.env runs no forge" "$(calls)"; else ok "regenesis: a refused contracts/.env runs no forge"; fi
+rm -f "$RG/contracts/.env"
 reset_calls
 expect "regenesis: --broadcast with forge recording broadcasts elsewhere is refused" 1 'forge writes its broadcast records to /srv/elsewhere' -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" FAKE_FORGE_CONFIG='{"broadcast":"/srv/elsewhere","cache":true,"cache_path":"cache"}' bash "$RG/scripts/ops/regenesis.sh" --broadcast --account deployer
 if calls | grep -q '^forge'; then bad "regenesis: a refused forge config runs no forge step" "$(calls)"; else ok "regenesis: a refused forge config runs no forge step"; fi
@@ -1516,7 +1521,11 @@ c9_fee "an unreadable ComputeMarketplace fee recipient fails P2" 3 'cannot read 
 c9_setup
 reset_calls
 expect "ceremony P2 code: a stack-book contract with no code on chain is not recorded" 3 "GATE FAIL at P2: .*ValidatorRegistry $C9VR has no code on chain" -- "${C9ENV[@]}" FAKE_NO_CODE="$C9VR" bash "$CE" --confirm --only P2 --account deployer
-python3 -c 'import json,sys; sys.exit(0 if "stackBook" in json.load(open(sys.argv[1])) else 1)' "$GB/ceremony-run.json" && bad "ceremony P2 code: a codeless stack book records nothing" || ok "ceremony P2 code: a codeless stack book records nothing"
+if python3 -c 'import json,sys; sys.exit(0 if "stackBook" in json.load(open(sys.argv[1])) else 1)' "$GB/ceremony-run.json"; then
+  bad "ceremony P2 code: a codeless stack book records nothing" "$(cat "$GB/ceremony-run.json")"
+else
+  ok "ceremony P2 code: a codeless stack book records nothing"
+fi
 cp "$T/book.c9.orig" "$GBK"
 # #364 on P2 (the password fixture is set up before the regenesis.sh cases above).
 c9_setup
@@ -1949,6 +1958,24 @@ for v in "${FORGE_OUT_VARS[@]}"; do
   fi
   rm -rf "$T/c10-forge-elsewhere"
 done
+# forge also loads .env from the project root and where it runs: the same names there are
+# refused too (contracts/.env and the repo root's .env), naming the file, never the value.
+for envf in "$REPO/contracts/.env" "$REPO/.env"; do
+  c10_reset
+  printf '# operator notes\nexport foundry_broadcast=%s/c10-dotenv-elsewhere\nOTHER=1\n' "$T" >"$envf"
+  out=$("${C10ENV[@]}" FAKE_P1_BOOK="$T/c10-gov.json" bash "$CE" --confirm --only P1 --account deployer 2>&1)
+  rc=$?
+  if [[ $rc -eq 1 && "$(bcount)" == 0 ]] && grep -qF "foundry_broadcast is set in $envf, which forge loads" <<<"$out" && ! grep -qF 'c10-dotenv-elsewhere' <<<"$out"; then
+    ok "ceremony C10: a forge output variable in $(basename "$(dirname "$envf")")/.env is refused before any send, value unprinted"
+  else
+    bad "ceremony C10: a forge output variable in $(basename "$(dirname "$envf")")/.env is refused before any send, value unprinted (exit $rc)" "$out"
+  fi
+  rm -f "$envf"
+done
+c10_reset
+printf 'ETHERSCAN_API_KEY_NAME_ONLY=1\n' >"$REPO/contracts/.env"
+expect "ceremony C10: a contracts/.env without forge output variables passes (control)" 0 'done \(mode=confirm\)' -- "${C10ENV[@]}" FAKE_P1_BOOK="$T/c10-gov.json" bash "$CE" --confirm --only P1 --account deployer
+rm -f "$REPO/contracts/.env"
 expect "ceremony C10: FOUNDRY_PROFILE is refused in a dry run too" 1 'FOUNDRY_PROFILE is set in the environment' -- "${CEENV[@]}" FOUNDRY_PROFILE=membership bash "$CE"
 grep -qF "$T/c10-forge-elsewhere" <<<"$("${CEENV[@]}" FOUNDRY_BROADCAST="$T/c10-forge-elsewhere" bash "$CE" 2>&1)" &&
   bad "ceremony C10: the refusal names the variable, not its value" || ok "ceremony C10: the refusal names the variable, not its value"

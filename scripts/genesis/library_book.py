@@ -13,9 +13,12 @@ each deployment gets.
               against this one)
   build       build the library book from this run's broadcasts of those scripts: every
               CREATE/CREATE2 with a contract name, named by (script, contract name, nth
-              occurrence) below. Fails when an expected deployment is missing, when a
-              broadcast has a deployment this table does not name, or when an address
-              repeats. Writes {"deployer", "governance", "contracts"}.
+              occurrence) below. Only a complete record counts (broadcast_run.py: every
+              transaction has a hash and a receipt with status 0x1, nothing pending). Fails
+              when a script stopped part-way (forge's partial record), even with --partial,
+              when an expected deployment is missing, when a broadcast has a deployment this
+              table does not name, or when an address repeats. Writes {"deployer",
+              "governance", "contracts"}.
   expected    print the expected book names, one per line
 
 Exit: 0 ok · 1 a check failed · 2 usage or unreadable input
@@ -26,6 +29,9 @@ import json
 import os
 import re
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from broadcast_run import confirmed_creates, run_status  # noqa: E402
 
 ADDR = re.compile(r"0x[0-9a-fA-F]{40}")
 
@@ -101,10 +107,11 @@ def build(broadcast, chain, since, deployer, governance, partial=False):
             continue
         creates = []
         for p, run in runs:
-            for tx in run.get("transactions") or []:
-                if tx.get("transactionType") not in ("CREATE", "CREATE2"):
-                    continue
-                n, a = tx.get("contractName"), tx.get("contractAddress")
+            done, why = run_status(run)
+            if not done:
+                problems.append(f"{script}: {os.path.basename(p)} stopped part-way ({why}); escalate (runbook §6.4), never re-send it")
+                continue
+            for n, a, _ in confirmed_creates(run):
                 if not isinstance(n, str) or not isinstance(a, str) or not ADDR.fullmatch(a):
                     problems.append(f"{script}: {os.path.basename(p)} has a deployment without a contract name or address")
                     continue

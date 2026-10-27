@@ -21,8 +21,10 @@ nor FOUNDRY_OUT and the other path keys, which move compiler artifacts, not the 
 A global ~/.foundry/foundry.toml can set the same keys and no variable names it, so `config`
 checks what forge actually resolves.
 
-  env                     exit 1 naming each listed variable that is set (even empty); its
-                          value is never printed
+  env [--dotenv FILE...]  exit 1 naming each listed variable that is set (even empty), in the
+                          environment or in a FILE (forge loads .env from the project root
+                          and from where it runs: the callers pass contracts/.env and the
+                          repo root's .env); values are never printed
   config --contracts DIR  read `forge config --json` (run in DIR) on stdin; exit 1 with the
                           reason unless broadcast is DIR/broadcast, cache_path is DIR/cache and
                           cache is on
@@ -43,18 +45,37 @@ FORGE_OUTPUT_ENV = (
 )
 
 
-def check_env():
-    hits = sorted(n for n in os.environ if n.upper() in FORGE_OUTPUT_ENV)
-    if not hits:
-        return 0
-    for n in hits:
-        print(
-            f"{n} is set in the environment: forge would take its broadcast or cache output "
-            "settings from it, and the sends-once guard reads this run's broadcasts only from "
-            "contracts/broadcast/; unset it",
-            file=sys.stderr,
-        )
-    return 1
+def dotenv_names(path):
+    """The variable names a dotenv file sets (NAME=..., export NAME=...); values are not kept."""
+    names = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k = line.split("=", 1)[0].strip()
+                if k.startswith("export "):
+                    k = k[len("export "):].strip()
+                names.append(k)
+    except FileNotFoundError:
+        pass
+    return names
+
+
+def check_env(dotenvs=()):
+    why = "forge would take its broadcast or cache output settings from it, and the sends-once guard reads this run's broadcasts only from contracts/broadcast/"
+    hits = [f"{n} is set in the environment: {why}; unset it" for n in sorted(os.environ) if n.upper() in FORGE_OUTPUT_ENV]
+    for p in dotenvs:
+        try:
+            names = dotenv_names(p)
+        except (OSError, UnicodeDecodeError) as e:
+            hits.append(f"cannot read {p} ({e.__class__.__name__}), which forge loads")
+            continue
+        hits += [f"{n} is set in {p}, which forge loads: {why}; remove it" for n in names if n.upper() in FORGE_OUTPUT_ENV]
+    for h in hits:
+        print(h, file=sys.stderr)
+    return 1 if hits else 0
 
 
 def check_config(contracts, raw):
@@ -83,15 +104,15 @@ def check_config(contracts, raw):
 
 
 def main(argv):
-    if argv[:1] == ["env"] and len(argv) == 1:
-        return check_env()
+    if argv[:1] == ["env"] and (len(argv) == 1 or argv[1] == "--dotenv"):
+        return check_env(argv[2:])
     if argv[:2] == ["config", "--contracts"] and len(argv) == 3:
         why = check_config(os.path.abspath(argv[2]), sys.stdin.read())
         if why:
             print(why, file=sys.stderr)
             return 1
         return 0
-    print("usage: forge_output_check.py env | config --contracts DIR < forge-config.json", file=sys.stderr)
+    print("usage: forge_output_check.py env [--dotenv FILE...] | config --contracts DIR < forge-config.json", file=sys.stderr)
     return 2
 
 

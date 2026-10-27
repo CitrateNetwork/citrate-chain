@@ -65,8 +65,10 @@
 # sends-once guard (C10) and the book checks read them. The variables that move forge's broadcast
 # or script-cache output (FOUNDRY_BROADCAST, FOUNDRY_CACHE_PATH, FOUNDRY_CACHE, FOUNDRY_PROFILE,
 # FOUNDRY_CONFIG and their DAPP_ forms, in any case; forge_output_check.py says why each) are
-# refused in every mode, and on --confirm P0 reads `forge config --json` in contracts/ and
-# refuses a resolved config (a global ~/.foundry/foundry.toml, say) that records elsewhere.
+# refused in every mode, in the environment and in the .env files forge loads (contracts/.env,
+# the repo root's .env), and on --confirm P0 reads `forge config --json` in contracts/ and
+# refuses a resolved config (a global ~/.foundry/foundry.toml, say) that records elsewhere. The
+# config is read once, at P0, for the whole invocation.
 #
 # Inputs (env). Values marked OPEN are owner decisions recorded in the runbook §2:
 #   RPC_URL, DEPLOYER_ADDRESS, EXPECTED_CHAIN_ID (40204), EXPECTED_GENESIS_HASH (from the cut)
@@ -151,7 +153,13 @@
 #      --record-book. A fresh --confirm run refuses a contracts/broadcast/ that already holds
 #      records for this chain id (a rehearsal's would count as this run's). Forge must record
 #      into contracts/broadcast/ (see "Forge output" above): a send recorded elsewhere would
-#      be invisible to the guard.
+#      be invisible to the guard. Only a COMPLETE record counts as sent or as evidence of a
+#      deployment (broadcast_run.py: every transaction a hash and a receipt with status 0x1,
+#      nothing pending). forge also writes a record when a script stops part-way, listing
+#      transactions it never sent; such a script is neither sent nor unsent: every guard,
+#      resume and record step refuses it and escalates, and none sends it again. Before any
+#      book is recorded (P2's stack book, P3, P3L, P4), every address in it must have code on
+#      chain.
 #
 # Output books: P1/P3/P4 write governance.json, team-vesting.json and dormant-ledgers.json
 # into GENESIS_OUT_DIR, and P2/P4/P5 read them from the same place; every producer and
@@ -225,7 +233,7 @@ while [[ $# -gt 0 ]]; do
 done
 refuse_raw_keys
 refuse_keystore_env "$ACCOUNT"
-refuse_forge_output_env
+refuse_forge_output_env "$CONTRACTS/.env" "$REPO_ROOT/.env"
 # The keystore password reaches forge (P1/P3/P4) and regenesis.sh (P2) only as this path. The
 # value is not echoed on refusal: a caller that passed the password itself in its place must
 # not see it in the log. The file must be private to this user (lib.sh password_file_check);
@@ -675,10 +683,12 @@ verify_stack_book() {
   EMIT_FRESH_GENESIS=1 EMIT_DEPLOYER="$RUN_DEPLOYER" EMIT_BROADCAST_SINCE="$RUN_G0TS" EMIT_OUTPUT="$check" \
     EMIT_MEMBERSHIP_SCRIPT="$GENESIS_MEMBERSHIP_SCRIPT" bash "$EMITTER" >"$OUT/stack-book.check.log" 2>&1 ||
     gate_fail P2 "re-running the generator failed (see $OUT/stack-book.check.log)"
-  why=$("$PY" - "$book_abs" "$check" "$RUN_DEPLOYER" "$CONTRACTS/broadcast" "$EXPECTED_CHAIN_ID" "$RUN_G0TS" "$GENESIS_MEMBERSHIP_SCRIPT" <<'PY' 2>&1
+  why=$("$PY" - "$book_abs" "$check" "$RUN_DEPLOYER" "$CONTRACTS/broadcast" "$EXPECTED_CHAIN_ID" "$RUN_G0TS" "$GENESIS_MEMBERSHIP_SCRIPT" "$HERE" <<'PY' 2>&1
 import json, sys
 import re
-book_p, check_p, dep, bdir, cid, since, mscript = sys.argv[1:8]
+book_p, check_p, dep, bdir, cid, since, mscript, here = sys.argv[1:9]
+sys.path.insert(0, here)
+from broadcast_run import confirmed_creates, run_status
 since = int(since)
 ADDR = re.compile(r"0x[0-9a-fA-F]{40}")
 def canon(x):  # one spelling for every address (lowercase), however it was written
@@ -706,10 +716,13 @@ def deployed(script, with_names):
         sys.exit(f"{p} has no timestamp")
     if (ts / 1000 if ts > 10**12 else ts) < since:
         sys.exit(f"{p} was recorded before this chain's block 0")
+    done, why = run_status(run)
+    if not done:
+        sys.exit(f"{script} stopped part-way ({why}): its deployments are not this run's; escalate (runbook §6.4)")
     got = {}
-    for tx in run.get("transactions") or []:
-        if tx.get("transactionType") in ("CREATE", "CREATE2") and tx.get("contractName") in with_names and tx.get("contractAddress"):
-            got[tx["contractName"]] = tx["contractAddress"].lower()
+    for n, a, _ in confirmed_creates(run):
+        if n in with_names and a:
+            got[n] = a.lower()
     return got
 c = {k: v.lower() for k, v in book.get("contracts", {}).items()}
 vr = deployed("DeployValidatorRegistry.s.sol", {"ValidatorRegistry"})
@@ -734,6 +747,7 @@ PY
   ) || gate_fail P2 "stack book: $why"
   log "P2 stack book = generator output for this run: $why"
   sb=$(stack_book_json "$book_abs") || gate_fail P2 "$ADDRESS_BOOK is not a well-formed address book"
+  book_code_check P2 "$book_abs"
   check_fee_recipients
   why=$(manifest_bind bind "$RUN_MANIFEST" stackBook "$sb" 2>&1) || gate_fail P2 "cannot record the stack book: $why"
   rm -f "$check"
@@ -780,8 +794,7 @@ phase_scripts() {
     *) return 1 ;;
   esac
 }
-# phase_sent <phase>: the phase's scripts with a broadcast record on this chain since this run's
-# block 0, one per line. A record that cannot be read counts as sent (fail closed).
+# phase_sent <phase>: the phase's scripts this run has sent (scripts_sent), one per line.
 phase_sent() {
   local scripts
   scripts=$(phase_scripts "$1") || return 1
@@ -789,23 +802,24 @@ phase_sent() {
   # shellcheck disable=SC2086 # one script name per word, none has a space
   scripts_sent $scripts
 }
-# scripts_sent <script...>: those with a broadcast record on this chain since this run's block 0.
+# scripts_sent <script...>: those this run has sent: a complete broadcast record on this chain
+# since this run's block 0 (broadcast_run.py: every transaction has a hash and a receipt with
+# status 0x1, nothing pending). A script whose record is partial (forge writes one when a script
+# stops part-way, listing transactions it never sent) or unreadable is neither sent nor unsent:
+# scripts_sent fails and prints why, and every caller stops (ESCALATE_PARTIAL), never re-sends.
+ESCALATE_PARTIAL="stop and escalate (runbook §6.4): read contracts/broadcast/ and the chain first. The ceremony never counts a script that stopped part-way as sent and never sends it again; do not re-run or record this phase"
 scripts_sent() {
-  "$PY" - "$CONTRACTS/broadcast" "$EXPECTED_CHAIN_ID" "$RUN_G0TS" "$@" <<'PY'
-import glob, json, sys
-bdir, cid, since, scripts = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4:]
-for s in scripts:
-    for f in sorted(glob.glob(f"{bdir}/{s}/{cid}/run-*.json")):
-        try:
-            ts = json.load(open(f)).get("timestamp")
-            ts = ts / 1000 if ts > 10**12 else ts
-            sent = ts >= since
-        except Exception:
-            sent = True
-        if sent:
-            print(s)
-            break
-PY
+  local out partial
+  out=$("$PY" -I "$HERE/broadcast_run.py" scripts --broadcast "$CONTRACTS/broadcast" --chain "$EXPECTED_CHAIN_ID" --since "$RUN_G0TS" "$@" 2>&1) || {
+    echo "cannot read this run's broadcast records under contracts/broadcast/: $out"
+    return 1
+  }
+  partial=$(sed -n 's/^partial \([^ ]*\) \(.*\)$/\1 stopped part-way (\2)/p' <<<"$out" | paste -sd';' -)
+  if [[ -n "$partial" ]]; then
+    printf '%s: its broadcast record lists transactions forge never confirmed\n' "$partial"
+    return 1
+  fi
+  sed -n 's/^sent //p' <<<"$out"
 }
 # phase_done <phase>: exit 0 and print why when this run has done <phase> (the manifest records
 # its output, or on --confirm this run's broadcasts of it exist); 1 when it has not; 2 (and the
@@ -819,7 +833,7 @@ phase_done() {
   fi
   [[ "$MODE" == confirm && "${RUN_G0TS:-}" =~ ^[0-9]+$ ]] || return 1
   if ! s=$(phase_sent "$ph"); then
-    printf "cannot read this run's broadcast records under contracts/broadcast/"
+    printf '%s' "$s"
     return 2
   fi
   [[ -n "$s" ]] || return 1
@@ -850,7 +864,7 @@ stale_books() {
       fi
       exit 3
     elif [[ $rc -eq 2 ]]; then
-      gate_fail P0 "$book exists and $why"
+      gate_fail P0 "$book exists and $why" "$ESCALATE_PARTIAL"
     fi
     gate_fail P0 "$book already exists and $ph would write it; move it aside (this run has no record of it, so it is not this ceremony's output) or resume after $ph"
   done
@@ -877,7 +891,10 @@ sends_once() {
     gate_fail "$ph" "the run manifest already records $(phase_record_desc "$ph"): $ph is done"
   fi
   if [[ "$MODE" == confirm ]]; then
-    sent=$(phase_sent "$ph") || gate_fail "$ph" "cannot read this run's broadcast records under contracts/broadcast/"
+    sent=$(phase_sent "$ph") || {
+      SENT_PHASE="" # a partial record is not a send to resume after: escalate, never the resume advice
+      gate_fail "$ph" "$sent" "$ESCALATE_PARTIAL"
+    }
     if [[ "$RECORD_BOOK" == 1 ]]; then
       [[ -n "$sent" ]] || gate_fail "$ph" "the record step: no $ph broadcast from this run is recorded, so there is no book to record (run $ph)"
       SENT_PHASE="$ph"
@@ -911,7 +928,10 @@ sends_once_script() {
     gate_fail "$ph" "the run manifest already records $(phase_record_desc "$ph"): $ph is done"
   fi
   if [[ "$MODE" == confirm ]]; then
-    s=$(scripts_sent "$script") || gate_fail "$ph" "cannot read this run's broadcast records under contracts/broadcast/"
+    s=$(scripts_sent "$script") || {
+      SENT_PHASE="" # a partial record is not a send to resume after: escalate, never the resume advice
+      gate_fail "$ph" "$s" "$ESCALATE_PARTIAL"
+    }
     if [[ -n "$s" ]]; then
       SENT_PHASE="$ph"
       return 1
@@ -973,6 +993,30 @@ fee_recipients_held_by_deployer() {
   return 0
 }
 
+# book_code_check <phase> <book>: before a book is recorded, every address in it (.contracts and,
+# for the stack book, .aaStack) must have code on chain. A record that names an address forge
+# never deployed (a script that stopped part-way) would otherwise be recorded as done.
+book_code_check() {
+  local ph="$1" rows name a code n=0
+  rows=$("$PY" -c '
+import json, sys
+b = json.load(open(sys.argv[1]))
+for sec in ("contracts", "aaStack"):
+    for k, v in sorted((b.get(sec) or {}).items()):
+        print(k, v)' "$2" 2>/dev/null) || gate_fail "$ph" "cannot read the addresses in $2"
+  while read -r name a; do
+    [[ -n "$name" ]] || continue
+    is_addr "$a" || gate_fail "$ph" "$2: $name ($a) is not an address"
+    code=$("$CAST" code "$a" --rpc-url "$RPC_URL" 2>/dev/null) || gate_fail "$ph" "cannot read the code at $name $a"
+    if [[ -z "$code" || "$code" == 0x ]]; then
+      SENT_PHASE="" # not a resume: an address the step never deployed is escalated
+      gate_fail "$ph" "$name $a has no code on chain: $(basename "$2") is not recorded" "$ESCALATE_PARTIAL"
+    fi
+    n=$((n + 1))
+  done <<<"$rows"
+  log "$ph every address in $(basename "$2") has code on chain ($n)"
+}
+
 # record_output_book <phase> <key> <book> <script> [governance json]: C5 + C9 for the book a
 # P3/P4 step writes, at the step that writes it. The book must name the run manifest's
 # deployer and list well-formed contracts; on --confirm it must exist, and every contract in
@@ -990,9 +1034,11 @@ record_output_book() {
     return 0
   fi
   is_addr "${RUN_DEPLOYER:-}" && [[ "${RUN_G0TS:-}" =~ ^[0-9]+$ ]] || gate_fail "$ph" "no run deployer or block-0 timestamp (the P0 run manifest did not load)"
-  rec=$("$PY" - "$book" "$RUN_DEPLOYER" "$CONTRACTS/broadcast" "$RUN_G0TS" "$MODE" "$gov" "$script" "$EXPECTED_CHAIN_ID" <<'PY' 2>&1
-import glob, json, re, sys
-book_p, dep, broot, since, mode, gov, script, chain = sys.argv[1:9]
+  rec=$("$PY" - "$book" "$RUN_DEPLOYER" "$CONTRACTS/broadcast" "$RUN_G0TS" "$MODE" "$gov" "$script" "$EXPECTED_CHAIN_ID" "$HERE" <<'PY' 2>&1
+import glob, json, os, re, sys
+book_p, dep, broot, since, mode, gov, script, chain, here = sys.argv[1:10]
+sys.path.insert(0, here)
+from broadcast_run import confirmed_creates, run_status
 # <script> may name several scripts (comma-separated, P3L): their broadcasts are one evidence set.
 bdirs = [f"{broot}/{s}/{chain}" for s in script.split(",")]
 bdir = ", ".join(bdirs)
@@ -1035,10 +1081,14 @@ for p in sorted(x for d in bdirs for x in glob.glob(f"{d}/run-*.json")):
         sys.exit(f"{p} has no timestamp")
     if (ts / 1000 if ts > 10**12 else ts) < since:
         continue
+    done, why = run_status(run)
+    if not done:
+        sname = os.path.basename(os.path.dirname(os.path.dirname(p)))
+        sys.exit(f"{sname} stopped part-way ({os.path.basename(p)}: {why}): its deployments are not this run's; escalate (runbook §6.4)")
     runs += 1
-    for tx in run.get("transactions") or []:
-        if tx.get("transactionType") in ("CREATE", "CREATE2") and isinstance(tx.get("contractAddress"), str):
-            created.add(tx["contractAddress"].lower())
+    for _, a, _ in confirmed_creates(run):
+        if isinstance(a, str):
+            created.add(a.lower())
 if not runs:
     sys.exit(f"no {script} broadcast since this chain's block 0 in {bdir}")
 for name, a in sorted(c.items()):
@@ -1047,6 +1097,7 @@ for name, a in sorted(c.items()):
 print(f"{len(c)} contract(s), deployer {dep}, each deployed by this run's {script} broadcasts" + (" or this run's governance" if refs else ""))
 PY
   ) || gate_fail "$ph" "$rec"
+  if [[ "$MODE" == confirm ]]; then book_code_check "$ph" "$book"; fi
   cj=$(book_contracts_json "$book") || gate_fail "$ph" "$book has no well-formed contracts"
   why=$(manifest_bind bind "$RUN_MANIFEST" "$key" "$cj" 2>&1) || gate_fail "$ph" "cannot record $book: $why"
   log "$ph $(basename "$book") recorded in the run manifest ($key): $rec"
@@ -1250,7 +1301,7 @@ print(", ".join(sorted({os.path.basename(os.path.dirname(os.path.dirname(f))) fo
     if should P2 && [[ -e "$MEMB_BOOK" && "$RECORD_BOOK" != 1 ]]; then
       rc=0
       why=$(phase_done P2) || rc=$?
-      [[ $rc -ne 2 ]] || gate_fail P0 "$MEMB_BOOK exists and $why"
+      [[ $rc -ne 2 ]] || gate_fail P0 "$MEMB_BOOK exists and $why" "$ESCALATE_PARTIAL"
       [[ $rc -eq 0 ]] ||
         gate_fail P0 "$MEMB_BOOK already exists and P2 would write it; move it aside (this run has no record of it, so it is not this ceremony's output) or resume after P2"
     fi
