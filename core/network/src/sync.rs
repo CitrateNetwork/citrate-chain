@@ -313,6 +313,14 @@ impl SyncManager {
         }
     }
 
+    /// A delivery from `peer` for `start..=end` never reached admission:
+    /// re-plan it without charging the peer.
+    pub fn range_dropped(&self, peer: &PeerId, start: u64, end: u64) {
+        if let Ok(mut r) = self.ranges.lock() {
+            r.on_dropped(peer, start, end);
+        }
+    }
+
     /// `peer` failed to take a request or went away: re-plan what it owed.
     pub fn release_peer(&self, peer: &PeerId) {
         if let Ok(mut r) = self.ranges.lock() {

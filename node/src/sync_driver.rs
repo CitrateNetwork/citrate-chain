@@ -73,6 +73,21 @@ pub struct ReceivedBlocks {
     pub validated: Vec<Block>,
 }
 
+/// How long the network loop waits for room in the admission queue before
+/// it drops a response (and re-plans its range). Far below the receive-loop
+/// stall detector's window, so a slow apply cannot stop the loop.
+pub const ADMIT_HANDOFF_WAIT: Duration = Duration::from_secs(2);
+
+/// What [`SyncDriver::hand_to_admission`] did with a response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Handoff {
+    Queued,
+    /// The queue stayed full: dropped, and its range (if any) re-planned.
+    Dropped,
+    /// The admission worker is gone.
+    Closed,
+}
+
 /// Bound on validated responses waiting for admission. The scheduler's
 /// lookahead (512 heights, 16 ranges) is the most that can legitimately be
 /// waiting; the rest is headroom for unsolicited answers.
@@ -284,6 +299,37 @@ impl SyncDriver {
             pid: pid.clone(),
             matched,
             validated,
+        }
+    }
+
+    /// Queue one received response for the admission worker, waiting at most
+    /// `wait` for room. The network loop calls this, so it must not block
+    /// for long: when the queue stays full the response is dropped and the
+    /// range it delivered goes back to the scheduler, uncharged.
+    pub async fn hand_to_admission(
+        &self,
+        tx: &tokio::sync::mpsc::Sender<ReceivedBlocks>,
+        received: ReceivedBlocks,
+        wait: Duration,
+    ) -> Handoff {
+        use tokio::sync::mpsc::error::SendTimeoutError;
+        match tx.send_timeout(received, wait).await {
+            Ok(()) => Handoff::Queued,
+            Err(SendTimeoutError::Timeout(r)) => {
+                if let BlocksMatch::Range {
+                    start,
+                    delivered_through,
+                    ..
+                } = r.matched
+                {
+                    if delivered_through >= start {
+                        self.sync.range_dropped(&r.pid, start, delivered_through);
+                    }
+                }
+                self.wake.notify_one();
+                Handoff::Dropped
+            }
+            Err(SendTimeoutError::Closed(_)) => Handoff::Closed,
         }
     }
 
@@ -978,6 +1024,58 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(default)
+    }
+
+    /// A full admission queue does not hold the caller: the response is
+    /// dropped after the bounded wait and its range is asked again.
+    #[tokio::test]
+    async fn a_full_admission_queue_drops_the_response_and_re_plans_its_range() {
+        let chain = build_chain(40).await;
+        let serve_dir = tempfile::tempdir().expect("tempdir");
+        let serving = store_with(&chain, serve_dir.path());
+        let node_dir = tempfile::tempdir().expect("tempdir");
+        let f = follower(&chain, node_dir.path()).await;
+        let (in_tx, mut in_rx) = mpsc::channel::<(PeerId, NetworkMessage)>(16);
+        let wire = Arc::new(std::sync::Mutex::new(Wire::default()));
+        let peer = spawn_peer("p", Behaviour::Honest, 40, serving, in_tx, wire.clone());
+        let peers = vec![peer];
+        f.driver.tick(&f.storage, 40, &peers).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let get_blocks_before = wire.lock().expect("wire").get_blocks;
+        assert_eq!(get_blocks_before, 1);
+        // Take the Blocks answer (headers may come first).
+        let blocks = loop {
+            let (_, msg) = in_rx.recv().await.expect("answer");
+            if let NetworkMessage::Blocks { blocks } = msg {
+                break blocks;
+            }
+        };
+        let r = f.driver.receive_blocks(&PeerId("p".into()), blocks).await;
+        assert!(matches!(r.matched, BlocksMatch::Range { .. }));
+        // A queue with no room.
+        let (tx, _rx) = mpsc::channel::<ReceivedBlocks>(1);
+        tx.try_send(ReceivedBlocks {
+            pid: PeerId("x".into()),
+            matched: BlocksMatch::Unsolicited,
+            validated: Vec::new(),
+        })
+        .expect("fill");
+        let t = Instant::now();
+        let out = f
+            .driver
+            .hand_to_admission(&tx, r, Duration::from_millis(50))
+            .await;
+        assert_eq!(out, Handoff::Dropped);
+        assert!(t.elapsed() < Duration::from_secs(2), "the caller was held");
+        // The dropped range is requested again.
+        f.driver.tick(&f.storage, 40, &peers).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            wire.lock().expect("wire").get_blocks,
+            get_blocks_before + 1,
+            "the dropped range was not asked again"
+        );
+        assert_eq!(f.driver.sync().range_counters().duplicate_requests, 0);
     }
 
     /// Catch-up floor, applied blocks per second. The old driver could not

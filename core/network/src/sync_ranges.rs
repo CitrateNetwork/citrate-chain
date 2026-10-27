@@ -826,6 +826,21 @@ impl RangeScheduler {
         }
     }
 
+    /// A delivery from `peer` for `start..=end` was dropped before admission
+    /// (the local admission queue stayed full): forget it so the range is
+    /// asked again. Not the peer's fault, so nothing is charged.
+    pub fn on_dropped(&mut self, peer: &PeerId, start: u64, end: u64) {
+        let hits: Vec<u64> = self
+            .delivered
+            .range(..=end)
+            .filter(|(s, (e, p))| *e >= start && **s <= end && p == peer)
+            .map(|(s, _)| *s)
+            .collect();
+        for s in hits {
+            self.delivered.remove(&s);
+        }
+    }
+
     /// `peer` is gone (or its send failed): release everything it owed.
     pub fn release_peer(&mut self, peer: &PeerId) {
         let starts: Vec<u64> = self
@@ -1489,5 +1504,24 @@ mod tests {
         let plan = s.plan(now, 0, h(0), &ps);
         assert_eq!(plan.misbehaved, vec![pid("a")]);
         assert_eq!(blocks_of(&plan.requests), vec![(pid("b"), 0, 1, 31)]);
+    }
+
+    /// A delivery dropped before admission is asked again, of the same peer
+    /// if it is still the best, with nothing charged.
+    #[test]
+    fn a_dropped_delivery_is_asked_again_without_a_charge() {
+        let mut s = RangeScheduler::new(RangeConfig {
+            max_in_flight: 1,
+            ..RangeConfig::default()
+        });
+        let now = Instant::now();
+        let ps = peers(&["a", "b"], 10_000);
+        s.plan(now, 0, h(0), &ps);
+        s.on_blocks(&pid("a"), Some(0), &chain(0, 31));
+        assert!(blocks_of(&s.plan(now, 0, h(0), &ps).requests).is_empty());
+        s.on_dropped(&pid("a"), 1, 31);
+        let plan = s.plan(now, 0, h(0), &ps);
+        assert!(plan.misbehaved.is_empty());
+        assert_eq!(blocks_of(&plan.requests), vec![(pid("a"), 0, 1, 31)]);
     }
 }

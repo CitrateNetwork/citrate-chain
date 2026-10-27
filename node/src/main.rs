@@ -3685,10 +3685,29 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // runs on the sync admission worker so a slow apply does
                         // not hold up this loop. See sync_driver.rs.
                         let received = driver_for_rx.receive_blocks(&pid, blocks).await;
-                        if sync_admit_tx.send(received).await.is_err() {
-                            tracing::warn!(
-                                "sync admission worker is gone; dropping a Blocks response"
-                            );
+                        // Bounded wait: a full queue (slow apply plus a burst of
+                        // answers) drops the response and re-plans its range
+                        // instead of holding this loop.
+                        match driver_for_rx
+                            .hand_to_admission(
+                                &sync_admit_tx,
+                                received,
+                                sync_driver::ADMIT_HANDOFF_WAIT,
+                            )
+                            .await
+                        {
+                            sync_driver::Handoff::Queued => {}
+                            sync_driver::Handoff::Dropped => {
+                                tracing::debug!(
+                                    "sync admission queue full; dropped a Blocks response from {}",
+                                    pid
+                                );
+                            }
+                            sync_driver::Handoff::Closed => {
+                                tracing::warn!(
+                                    "sync admission worker is gone; dropping a Blocks response"
+                                );
+                            }
                         }
                     }
                     NetworkMessage::Transactions { transactions } => {
