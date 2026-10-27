@@ -237,13 +237,13 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_genesis_profile_is_refused_not_inferred() {
         for p in ["r1006", "testnet-beta", "TESTNET_BETA", "", "default "] {
-            let r = build_with_profile(40204, Some(p)).await;
-            assert!(
-                r.is_err(),
-                "genesis_profile {p:?} built block 0 {:?} instead of being refused",
-                r.ok().map(|h| hex::encode(h.as_bytes()))
-            );
-            let e = format!("{:#}", r.err().expect("err"));
+            let e = match build_with_profile(40204, Some(p)).await {
+                Ok(h) => panic!(
+                    "genesis_profile {p:?} built block 0 {} instead of being refused",
+                    hex::encode(h.as_bytes())
+                ),
+                Err(e) => format!("{e:#}"),
+            };
             assert!(e.contains("genesis_profile"), "{e}");
         }
     }
@@ -251,8 +251,16 @@ mod tests {
     /// Negative control: the known profiles, and no profile at all, still build.
     #[tokio::test]
     async fn known_genesis_profiles_still_build() {
-        for p in [None, Some("default"), Some("testnet_beta"), Some("team_testnet"), Some("mainnet")] {
-            build_with_profile(40204, p).await.expect("known profile builds");
+        for p in [
+            None,
+            Some("default"),
+            Some("testnet_beta"),
+            Some("team_testnet"),
+            Some("mainnet"),
+        ] {
+            build_with_profile(40204, p)
+                .await
+                .expect("known profile builds");
         }
     }
 

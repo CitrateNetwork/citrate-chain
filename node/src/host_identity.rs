@@ -513,7 +513,10 @@ mod tests {
             .expect("32 bytes");
         assert_ne!(
             id.vrf_pubkey,
-            format!("0x{}", hex::encode(citrate_consensus::ecvrf::derive_public_key(&pk))),
+            format!(
+                "0x{}",
+                hex::encode(citrate_consensus::ecvrf::derive_public_key(&pk))
+            ),
             "derived from the public key"
         );
     }
