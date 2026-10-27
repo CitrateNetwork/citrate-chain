@@ -721,6 +721,11 @@ impl RangeScheduler {
             }
             let _ = self.anchors.split_off(&start);
             self.counters.anchor_evictions = self.counters.anchor_evictions.saturating_add(1);
+            // The failures were the anchor's, not the peers': forget them, and
+            // any hold, so the range (now on a new anchor, or the applied tip)
+            // can go to every peer again.
+            self.avoid.remove(&start);
+            self.retry.remove(&start);
         }
     }
 

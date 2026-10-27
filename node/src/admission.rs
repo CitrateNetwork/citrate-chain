@@ -302,8 +302,16 @@ struct AdmittingSlot<'a> {
 impl Drop for AdmittingSlot<'_> {
     fn drop(&mut self) {
         let mut map = self.map.lock();
-        // The map's reference plus ours: nobody else is waiting on it.
-        if Arc::strong_count(&self.slot) <= 2 {
+        // Release our reference under the map lock, then remove the entry if
+        // only the map holds it. Every clone and release happens under this
+        // lock, so two admissions ending together cannot both see the
+        // other's reference and leave the entry behind.
+        let ours = std::mem::replace(&mut self.slot, Arc::new(tokio::sync::Mutex::new(())));
+        drop(ours);
+        if map
+            .get(&self.hash)
+            .is_some_and(|slot| Arc::strong_count(slot) == 1)
+        {
             map.remove(&self.hash);
         }
     }
