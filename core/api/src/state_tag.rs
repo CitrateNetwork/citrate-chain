@@ -121,16 +121,6 @@ pub fn require_executed_head_state(
     tag: Option<&Value>,
     storage: &StorageManager,
 ) -> Result<(), jsonrpc_core::Error> {
-    // RED STUB (chain#425): the old behaviour, every tag served from latest state.
-    let _ = (tag, storage);
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn require_executed_head_state_impl(
-    tag: Option<&Value>,
-    storage: &StorageManager,
-) -> Result<(), jsonrpc_core::Error> {
     let pinned = parse_state_tag(tag)?;
     if pinned == StateTag::Unpinned {
         return Ok(());
