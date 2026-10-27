@@ -53,7 +53,7 @@ jobs:
       - name: RUSTSEC-2026-0220 ignore-premise tripwire (blocking)
         run: scripts/ci/ruint_shift_advisory_premise_tripwire.sh
       # Same for the RUSTSEC-2026-0387 ignore (crypto-bigint < 0.7.6 only via
-      # elliptic-curve 0.13; expires 2026-11-09).
+      # elliptic-curve 0.13, in every tracked Cargo.lock; expires 2027-01-31).
       - name: RUSTSEC-2026-0387 ignore guard (blocking)
         run: |
           python3 scripts/ci/check_crypto_bigint_users.py --self-test
