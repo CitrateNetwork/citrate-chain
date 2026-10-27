@@ -55,13 +55,31 @@ typed confirmation.
 | genesis-fill | the fill lists exactly the producers with their stakes; activation height ≥ 800 (r1006: 1000; the node refuses less, also for a genesis validator set); profile `r1006`; no genesis file; registry = the committed book's; block 0 = the `R1006_GENESIS` committed in `core/consensus/src/hardening.rs`, read at run time, which the build must also compile, and never a release network's (r1005 `0x1dcfc490…75f1`, team testnet, mainnet); otherwise the fill is discarded |
 | distribute | the same genesis checks, before any host is touched; staged and installed binary sha256 match; every host's isolated probe gives that block 0 (recorded on the host) |
 | start | the same genesis checks; every node starts with mining off and its block 0 must be the r1006 genesis (else every started node is stopped); only then, host by host, the host re-checks its own node's block 0 and switches mining on; ≥6 peers each; blocks from all 7 coinbases within 10 min |
-| smoke | every head past block 60; FLEET AGREE; chain id 40204; `eth_getCode` = genesis alloc; OrangeSeed `story()`; DEPLOYER-ADMIN 0; no CONFLICT / fork / deep reorg in logs; finality answers; no contribution recorder configured; RSS < 3 GiB |
+| smoke | every head past block 60; FLEET AGREE; chain id 40204; `eth_getCode` = genesis alloc; OrangeSeed `story()`; `CheckDeployedAdmins` passes (forge rc 0) with DEPLOYER-ADMIN 0 (the fill's book is staged under `contracts/addresses/` for forge); no CONFLICT / fork / deep reorg in logs; finality answers; no contribution recorder configured; RSS < 3 GiB |
 
 A node built without the r1006 profile refuses `genesis_profile = "r1006"` at start
 (node/src/genesis.rs) instead of falling back to the chain-id default (r1005's genesis).
 
 The keys step also writes `r1006-public-bootnodes.json` (the producers' `noise_<id>@<ip>:30303`
 list) for the network profile at cutover.
+
+## End-to-end with chain#398, 2026-10-27 (local; nothing on the fleet)
+
+This branch at `6b27b411` was merged with chain#398 at `80fbd6f8`, locally only; the combination was not pushed. The run used 5 hosts in separate network namespaces inside one unprivileged user namespace, throwaway keys minted on each host by the real `citrate host-identity`, and the real fill (`scripts/genesis/r1006/fill_producers.py`).
+
+| Step | Time | Result |
+|---|---|---|
+| build A (local aarch64, release, 4 jobs) | 356 s | records r1006 genesis `0xa8626a4f…6b55` (the pre-fill pin) |
+| keys (5 hosts) | 6.5–8.1 s | 5 identities and 5 `citrate-registration-proof/1` proofs for `0xf511327e…31cd` |
+| genesis-fill (first) | 27.1 s | 5 producers registered at block 0, re-pinned to `0x3353e70c…f67d`; **refused** against build A ("rebuild at the commit that pins it"), fill discarded |
+| build B (after committing the fill) | 350 s | records `0x3353e70c…f67d` |
+| genesis-fill | 6.1 s | accepted |
+| distribute (with per-host probes) | 14.5–15.0 s | ok |
+| start --mining on | 33.0 s | 5 × block 0 verified with mining off, then mining enabled host by host after each host re-checked its own block 0; ≥ 4 peers; all 5 coinbases produced blocks |
+| smoke | 25–68 s | FLEET AGREE (5 endpoints, block 59–60), chain id, code = alloc, OrangeSeed `story()`, no CONFLICT/fork (shallow 1-block reorgs as NOTE), finality answers (block 0, switch off), no contribution recorder, RSS: **PASS**. `CheckDeployedAdmins`: DEPLOYER-ADMIN 0, FACTORY-ADMIN 0, NO-CODE 0, VERIFIER present, but forge exits 1 on TIMELOCK-HOLDERS and GENESIS-FLOOR (role history empty / no GuardianCanceller in the books, which a genesis chain has no events for), so the check reports **FAIL** and smoke ends rc 1 |
+| status / stop / wipe | 2.1 / 4.6 / 3.7 s | ok; wipe kept `noise.key`, `proposer.key` and the keystore |
+
+No host key byte appears in the state dir or the run logs (70 needles, 0 hits).
 
 ## Dry run, 2026-10-26 (local; nothing on the fleet)
 
