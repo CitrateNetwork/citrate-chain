@@ -1,0 +1,8 @@
+{
+ "_doc": "The r1006 producer set, registered in the ValidatorRegistry at block 0. Placeholder until scripts/genesis/r1006/fill_producers.py fills it (public values only); the r1006 profile is not release-ready (fails closed) while status is placeholder.",
+ "schema": "r1006-validators/1",
+ "status": "placeholder",
+ "validatorRegistry": null,
+ "validators": [],
+ "registry": null
+}

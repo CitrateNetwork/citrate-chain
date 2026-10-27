@@ -48,38 +48,86 @@ abstract contract AdminChecks {
     /// @dev scripts/ci/privileged_slots_tripwire.sh requires every address slot
     ///      of a DeployAll contract to be read here or exempt with a reason
     ///      (contracts/script/lib/privileged_slots.json).
-    function _addressSlotGetters() internal pure returns (string[40] memory) {
-        return [
-            "governance()", "pendingGovernance()", "owner()", "pendingOwner()",
-            "admin()", "pendingAdmin()", "guardian()", "provider()",
-            "treasury()", "treasuryAddress()", "pendingTreasury()", "feeRecipient()",
-            "marketplace()", "verifier()", "operator()", "minter()",
-            "oracle()", "pricingOracle()", "signer()", "verifyingSigner()",
-            "relayer()", "slasher()", "facilitator()", "burner()",
-            "slashingContract()", "bulkGateway()", "jobRegistry()", "modelRegistry()",
-            "marketMaker()", "contributionAccounting()", "contributions()", "stakingPool()",
-            "distributionStablecoin()", "wSALT()", "registry()", "recorder()",
-            "keeper()", "manager()", "controller()", "beneficiary()"
-        ];
+    /// @dev Built element by element into a dynamic array: under via-IR, the equivalent
+    ///      `string[40]` array literal miscompiled DeployDormantLedgers (its first cheatcode
+    ///      call went to a garbage address) once this sweep and the genesis checks shared a
+    ///      contract. Keep the lists dynamic.
+    function _addressSlotGetters() internal pure returns (string[] memory g) {
+        g = new string[](40);
+        g[0] = "governance()";
+        g[1] = "pendingGovernance()";
+        g[2] = "owner()";
+        g[3] = "pendingOwner()";
+        g[4] = "admin()";
+        g[5] = "pendingAdmin()";
+        g[6] = "guardian()";
+        g[7] = "provider()";
+        g[8] = "treasury()";
+        g[9] = "treasuryAddress()";
+        g[10] = "pendingTreasury()";
+        g[11] = "feeRecipient()";
+        g[12] = "marketplace()";
+        g[13] = "verifier()";
+        g[14] = "operator()";
+        g[15] = "minter()";
+        g[16] = "oracle()";
+        g[17] = "pricingOracle()";
+        g[18] = "signer()";
+        g[19] = "verifyingSigner()";
+        g[20] = "relayer()";
+        g[21] = "slasher()";
+        g[22] = "facilitator()";
+        g[23] = "burner()";
+        g[24] = "slashingContract()";
+        g[25] = "bulkGateway()";
+        g[26] = "jobRegistry()";
+        g[27] = "modelRegistry()";
+        g[28] = "marketMaker()";
+        g[29] = "contributionAccounting()";
+        g[30] = "contributions()";
+        g[31] = "stakingPool()";
+        g[32] = "distributionStablecoin()";
+        g[33] = "wSALT()";
+        g[34] = "registry()";
+        g[35] = "recorder()";
+        g[36] = "keeper()";
+        g[37] = "manager()";
+        g[38] = "controller()";
+        g[39] = "beneficiary()";
     }
 
     /// @notice Every `mapping(address => bool)` membership the sweep reads.
-    function _addressSetGetters() internal pure returns (string[12] memory) {
-        return [
-            "authorizedRecorders(address)", "authorizedDisputers(address)", "authorizedSpenders(address)",
-            "authorizedActivityRecorders(address)", "authorizedMatcher(address)", "teeOracles(address)",
-            "isOracle(address)", "isOracleMember(address)", "isRecorder(address)",
-            "eligibleParticipant(address)", "isOperator(address)", "isMinter(address)"
-        ];
+    function _addressSetGetters() internal pure returns (string[] memory g) {
+        g = new string[](12);
+        g[0] = "authorizedRecorders(address)";
+        g[1] = "authorizedDisputers(address)";
+        g[2] = "authorizedSpenders(address)";
+        g[3] = "authorizedActivityRecorders(address)";
+        g[4] = "authorizedMatcher(address)";
+        g[5] = "teeOracles(address)";
+        g[6] = "isOracle(address)";
+        g[7] = "isOracleMember(address)";
+        g[8] = "isRecorder(address)";
+        g[9] = "eligibleParticipant(address)";
+        g[10] = "isOperator(address)";
+        g[11] = "isMinter(address)";
     }
 
     /// @notice Every role the sweep reads through `hasRole(bytes32,address)`.
-    function _probedRoleNames() internal pure returns (string[12] memory) {
-        return [
-            "DEFAULT_ADMIN_ROLE", "OPERATOR_ROLE", "VALIDATOR_ROLE", "REPORTER_ROLE",
-            "FACILITATOR_ROLE", "MINTER_ROLE", "PAUSER_ROLE", "UPGRADER_ROLE",
-            "PROPOSER_ROLE", "EXECUTOR_ROLE", "CANCELLER_ROLE", "TIMELOCK_ADMIN_ROLE"
-        ];
+    function _probedRoleNames() internal pure returns (string[] memory g) {
+        g = new string[](12);
+        g[0] = "DEFAULT_ADMIN_ROLE";
+        g[1] = "OPERATOR_ROLE";
+        g[2] = "VALIDATOR_ROLE";
+        g[3] = "REPORTER_ROLE";
+        g[4] = "FACILITATOR_ROLE";
+        g[5] = "MINTER_ROLE";
+        g[6] = "PAUSER_ROLE";
+        g[7] = "UPGRADER_ROLE";
+        g[8] = "PROPOSER_ROLE";
+        g[9] = "EXECUTOR_ROLE";
+        g[10] = "CANCELLER_ROLE";
+        g[11] = "TIMELOCK_ADMIN_ROLE";
     }
 
     function _roleId(string memory name) internal pure returns (bytes32) {
@@ -106,18 +154,18 @@ abstract contract AdminChecks {
         returns (string memory)
     {
         if (target.code.length == 0) return "no code at address";
-        string[40] memory getters = _addressSlotGetters();
+        string[] memory getters = _addressSlotGetters();
         for (uint256 i = 0; i < getters.length; i++) {
             (bool ok, address a) = _readAddress(target, abi.encodeWithSignature(getters[i]));
             if (ok && a == who) return string.concat(getters[i], " is ", noun);
         }
-        string[12] memory sets = _addressSetGetters();
+        string[] memory sets = _addressSetGetters();
         for (uint256 i = 0; i < sets.length; i++) {
             if (_holds(target, abi.encodeWithSignature(sets[i], who), abi.encodeWithSignature(sets[i], UNHELD))) {
                 return string.concat(subject, " is in ", sets[i]);
             }
         }
-        string[12] memory roles = _probedRoleNames();
+        string[] memory roles = _probedRoleNames();
         for (uint256 i = 0; i < roles.length; i++) {
             bytes32 r = _roleId(roles[i]);
             if (
@@ -534,8 +582,16 @@ abstract contract AdminChecks {
         if (timelock.codehash != keccak256(type(TimelockController).runtimeCode)) {
             return "runtime code is not this build's OZ TimelockController";
         }
+        // A chain whose contracts are in block 0 (r1006: genesis from ceremony state) has no
+        // role-grant events: the same invariant is proved from state instead.
+        if (_genesisChainMode(timelock)) return _timelockHolderStateProblem(timelock, council, extraCancellers);
         (bool ok, string memory why, RoleEvent[] memory events) = _timelockRoleHistory(timelock);
         if (!ok) return why;
+        // A timelock deployed by a transaction always logs its constructor's RoleGranted events,
+        // so a timelock with code and NO role history at all was placed in block 0.
+        if (events.length == 0 && !_genesisChainDisabled()) {
+            return _timelockHolderStateProblem(timelock, council, extraCancellers);
+        }
         (string memory problem, TimelockHolders memory h) = _timelockHolders(timelock, events);
         if (bytes(problem).length != 0) return problem;
         if (!_isExactly(h.admins, timelock)) return "DEFAULT_ADMIN_ROLE holders are not exactly the timelock itself";
@@ -556,6 +612,161 @@ abstract contract AdminChecks {
         }
         if (!councilCancels) return "the multisig lacks CANCELLER_ROLE";
         return "";
+    }
+
+    // ---- Genesis-chain mode: role holders from STATE (no event history at block 0) ----
+    //
+    // On a chain whose contracts were placed in block 0 (r1006's genesis from ceremony state)
+    // there are no RoleGranted / RoleRevoked logs to rebuild the holder sets from. The same
+    // invariant (each role held by exactly its expected accounts) is then proved from state:
+    //   1. every expected holder holds its role (hasRole);
+    //   2. no other KNOWN account does (every address in this run's books, the deployer, the
+    //      CREATE2 factory: `genesisKnown`, filled by the caller);
+    //   3. completeness: every non-zero storage slot of the timelock in the block-0 allocation
+    //      (GENESIS_ALLOC, `{"alloc":{"<addr>":{"storage":{...}}}}`) is accounted for: an
+    //      expected holder's `_roles[role].hasRole[holder]` slot, or `_minDelay` equal to
+    //      getMinDelay(); a holder outside the expected set, a changed role admin or a scheduled
+    //      operation leaves an unexplained slot and fails. Each allocation slot is also re-read
+    //      from the chain and must match it. This proves the allocation's slots are on this
+    //      chain; on its own it does not prove the chain holds no slot outside the allocation.
+    //   For an AccessControlEnumerable timelock, the member lists are enumerated and compared
+    //   exactly as well.
+    // Mode: GENESIS_CHAIN=1 forces it, =0 disables it; otherwise it is on for a timelock with
+    // code and no role history at all (a timelock deployed by a transaction always logs its
+    // constructor's RoleGranted events, so only a block-0 placement has none). Detection does
+    // not use eth_getCode at block 0: a Citrate node answers that with the latest code.
+
+    /// Accounts the genesis-chain holder check sweeps for unexpected roles (see above).
+    address[] internal genesisKnown;
+
+    /// @dev Virtual only so `forge test` can set the mode and the allocation without the
+    ///      process-wide environment; scripts never override them.
+    function _genesisChainMode(address) internal virtual returns (bool) {
+        return keccak256(bytes(HISTORY_VM.envOr("GENESIS_CHAIN", string("")))) == keccak256("1");
+    }
+
+    function _genesisChainDisabled() internal returns (bool) {
+        return keccak256(bytes(HISTORY_VM.envOr("GENESIS_CHAIN", string("")))) == keccak256("0");
+    }
+
+    function _genesisAllocPath() internal virtual returns (string memory) {
+        return HISTORY_VM.envOr("GENESIS_ALLOC", string(""));
+    }
+
+    function _contains(address[] memory set, address a) private pure returns (bool) {
+        for (uint256 i = 0; i < set.length; i++) {
+            if (set[i] == a) return true;
+        }
+        return false;
+    }
+
+    function _roleSlot(bytes32 role, address holder) private pure returns (bytes32) {
+        // OZ AccessControl: mapping(bytes32 => RoleData) _roles at slot 0; RoleData.hasRole first.
+        return keccak256(abi.encode(holder, keccak256(abi.encode(role, uint256(0)))));
+    }
+
+    function _timelockHolderStateProblem(address timelock, address council, address[] memory extraCancellers)
+        internal
+        returns (string memory)
+    {
+        bytes32[4] memory roles =
+            [DEFAULT_ADMIN_ROLE, TIMELOCK_PROPOSER_ROLE, TIMELOCK_EXECUTOR_ROLE, TIMELOCK_CANCELLER_ROLE];
+        string[4] memory names = ["DEFAULT_ADMIN_ROLE", "PROPOSER_ROLE", "EXECUTOR_ROLE", "CANCELLER_ROLE"];
+        address[] memory cancellers = new address[](1 + extraCancellers.length);
+        cancellers[0] = council;
+        for (uint256 i = 0; i < extraCancellers.length; i++) {
+            cancellers[i + 1] = extraCancellers[i];
+        }
+        for (uint256 r = 0; r < 4; r++) {
+            address[] memory want = _expectedHolders(r, timelock, council, cancellers);
+            for (uint256 i = 0; i < want.length; i++) {
+                (bool ok, bool has) =
+                    _readBool(timelock, abi.encodeWithSignature("hasRole(bytes32,address)", roles[r], want[i]));
+                if (!ok || !has) return string.concat(names[r], ": an expected holder does not hold it");
+            }
+            // AccessControlEnumerable: the member list must be exactly the expected set.
+            (bool okN, uint256 n) =
+                _readUint256(timelock, abi.encodeWithSignature("getRoleMemberCount(bytes32)", roles[r]));
+            if (okN) {
+                if (n != want.length) return string.concat(names[r], ": the enumerated member count is not the expected set's");
+                for (uint256 i = 0; i < n; i++) {
+                    (bool okM, address m) =
+                        _readAddress(timelock, abi.encodeWithSignature("getRoleMember(bytes32,uint256)", roles[r], i));
+                    if (!okM || !_contains(want, m)) return string.concat(names[r], ": an enumerated member is not expected");
+                }
+            }
+            address[] memory known = genesisKnown;
+            for (uint256 i = 0; i <= known.length; i++) {
+                address k = i < known.length ? known[i] : ARACHNID_FACTORY;
+                if (_contains(want, k)) continue;
+                (bool ok, bool has) =
+                    _readBool(timelock, abi.encodeWithSignature("hasRole(bytes32,address)", roles[r], k));
+                if (ok && has) return string.concat(names[r], " is held by an account other than the expected set");
+            }
+        }
+        return _timelockAllocCompleteness(timelock, council, cancellers);
+    }
+
+    function _expectedHolders(uint256 r, address timelock, address council, address[] memory cancellers)
+        private
+        pure
+        returns (address[] memory want)
+    {
+        if (r == 3) return cancellers;
+        want = new address[](1);
+        want[0] = r == 0 ? timelock : council;
+    }
+
+    function _timelockAllocCompleteness(address timelock, address council, address[] memory cancellers)
+        internal
+        returns (string memory)
+    {
+        string memory path = _genesisAllocPath();
+        if (bytes(path).length == 0) {
+            return "genesis-chain mode needs GENESIS_ALLOC (the block-0 allocation) to prove the holder sets complete";
+        }
+        string memory alloc = HISTORY_VM.readFile(path);
+        string memory key =
+            string.concat(".alloc.", HISTORY_VM.toLowercase(HISTORY_VM.toString(timelock)), ".storage");
+        if (!HISTORY_VM.keyExistsJson(alloc, key)) return "the timelock's storage is not in GENESIS_ALLOC";
+        string[] memory slots = HISTORY_VM.parseJsonKeys(alloc, key);
+        (bool okD, uint256 minDelay) = _readUint256(timelock, abi.encodeWithSignature("getMinDelay()"));
+        if (!okD) return "cannot read getMinDelay()";
+        for (uint256 i = 0; i < slots.length; i++) {
+            bytes32 k = HISTORY_VM.parseBytes32(slots[i]);
+            bytes32 v = HISTORY_VM.parseJsonBytes32(alloc, string.concat(key, ".", slots[i]));
+            if (HISTORY_VM.load(timelock, k) != v) return "GENESIS_ALLOC disagrees with the chain's state of the timelock";
+            if (v == bytes32(0)) continue;
+            if (!_slotExplained(k, v, timelock, council, cancellers, minDelay)) {
+                return "an unaccounted storage slot (a role holder outside the expected set, a changed role admin, or a scheduled operation)";
+            }
+        }
+        return "";
+    }
+
+    function _slotExplained(
+        bytes32 k,
+        bytes32 v,
+        address timelock,
+        address council,
+        address[] memory cancellers,
+        uint256 minDelay
+    ) private pure returns (bool) {
+        if (k == bytes32(uint256(2))) return uint256(v) == minDelay; // TimelockController._minDelay
+        if (uint256(v) != 1) return false;
+        if (k == _roleSlot(DEFAULT_ADMIN_ROLE, timelock)) return true;
+        if (k == _roleSlot(TIMELOCK_PROPOSER_ROLE, council)) return true;
+        if (k == _roleSlot(TIMELOCK_EXECUTOR_ROLE, council)) return true;
+        for (uint256 i = 0; i < cancellers.length; i++) {
+            if (k == _roleSlot(TIMELOCK_CANCELLER_ROLE, cancellers[i])) return true;
+        }
+        return false;
+    }
+
+    function _readUint256(address target, bytes memory cd) private view returns (bool ok, uint256 value) {
+        (bool success, bytes memory ret) = target.staticcall(cd);
+        if (!success || ret.length != 32) return (false, 0);
+        return (true, abi.decode(ret, (uint256)));
     }
 
     /// @notice Revert unless `_timelockHolderProblem` is empty (see there).

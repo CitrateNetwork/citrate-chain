@@ -1037,11 +1037,11 @@ contract GenesisAdminGateTest is Test {
         me[0] = deployer;
         TimelockController tl = new TimelockController(1 hours, me, new address[](0), address(0));
         GovAdminChecksHarness h = new GovAdminChecksHarness();
-        assertEq(h.deployerProblem(address(tl), deployer), "deployer EOA holds timelock PROPOSER_ROLE");
+        assertEq(h.deployerProblem(address(tl), deployer), "deployer EOA holds PROPOSER_ROLE");
 
         vm.etch(P256_VERIFIER, hex"600160005260206000f3");
         CheckDeployedAdmins c = new CheckDeployedAdmins();
-        vm.expectRevert(bytes("CheckDeployedAdmins: deployer EOA holds governance/owner/DEFAULT_ADMIN (see log)"));
+        vm.expectRevert(bytes("CheckDeployedAdmins: deployer EOA holds a privileged slot (see log)"));
         c.check(_book(string.concat('"Tl":"', vm.toString(address(tl)), '"')), false);
     }
 
@@ -1050,7 +1050,7 @@ contract GenesisAdminGateTest is Test {
         me[0] = deployer;
         TimelockController tl = new TimelockController(1 hours, new address[](0), me, address(0));
         GovAdminChecksHarness h = new GovAdminChecksHarness();
-        assertEq(h.deployerProblem(address(tl), deployer), "deployer EOA holds timelock EXECUTOR_ROLE");
+        assertEq(h.deployerProblem(address(tl), deployer), "deployer EOA holds EXECUTOR_ROLE");
     }
 
     function test_flags_deployer_as_multisig_owner() public {
@@ -1074,7 +1074,7 @@ contract GenesisAdminGateTest is Test {
         extras[0] = _book(string.concat('"Tl":"', vm.toString(address(bad)), '"'));
 
         CheckDeployedAdmins c = new CheckDeployedAdmins();
-        vm.expectRevert(bytes("CheckDeployedAdmins: deployer EOA holds governance/owner/DEFAULT_ADMIN (see log)"));
+        vm.expectRevert(bytes("CheckDeployedAdmins: deployer EOA holds a privileged slot (see log)"));
         c.checkAll(_book(""), extras, false);
 
         extras[0] = string.concat('{"deployer":"', vm.toString(makeAddr("someone")), '","contracts":{}}');

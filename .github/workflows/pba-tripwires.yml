@@ -47,3 +47,11 @@ jobs:
         run: |
           scripts/ci/mempool_lock_order_tripwire.sh --self-test
           scripts/ci/mempool_lock_order_tripwire.sh
+      - name: Genesis-keyed pins tripwire self-test
+        run: scripts/ci/genesis_keyed_pins_tripwire.sh --self-test
+      - name: New hardening rules are scheduled only by (chain id, genesis) (no chain-id pin table or match)
+        run: scripts/ci/genesis_keyed_pins_tripwire.sh
+      - name: Direct state-write tripwire self-test
+        run: scripts/ci/direct_state_write_tripwire.sh --self-test
+      - name: Execution writes state through the per-tx journal (or an allowed legacy/out-of-tx form)
+        run: scripts/ci/direct_state_write_tripwire.sh

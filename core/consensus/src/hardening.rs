@@ -178,12 +178,155 @@ pub const RELEASE_GENESIS: &[(u64, [u8; 32])] = &[
         40204,
         hex32("90044175c36a6491309d769bd0fa684afbf7b90b64136446db8e2e6ff0927553"),
     ),
+    // r1006 (profile `r1006`: genesis from ceremony state)
+    (40204, R1006_GENESIS),
     // mainnet
     (
         40204,
         hex32("ba93d716ab8b005f1d7e61d369a65fc1d6a358d6a479e11b640815c74388ab01"),
     ),
 ];
+
+/// The r1006 genesis block (profile `r1006`: block 0 holds the ceremony's contracts).
+/// Pinned by `r1006_genesis_hash_is_pinned` in citrate-economics, which rebuilds it from
+/// the compiled profile; any change to the allocation moves it, on purpose.
+pub const R1006_GENESIS: [u8; 32] =
+    hex32("a8626a4f5227baae399940bac24cd0187336c260d19f05cf619019f629736b55");
+
+/// Activation heights compiled into this release for ONE genesis, keyed by its block-0
+/// hash rather than by chain id. r1005 and r1006 share chain id 40204, so a per-chain pin
+/// `(40204, Some(0))` would also switch the rule on for an r1005 node rebuilt from this
+/// release and fork it off the live r1005 chain. Keying by genesis keeps r1005's rules
+/// exactly as they are (its genesis has no entry here) and gives r1006 its own.
+///
+/// ONE mechanism for every height-gated rule: a module resolves its height with
+/// [`rules_for_genesis`] for the genesis the node actually loaded, and only falls back to
+/// its per-chain pin table when that returns `None`. A field whose rule is not in this
+/// build is a typed slot: it records the owner's schedule, and the PR that adds the rule
+/// reads it from here (see [`GenesisActivations::WIRED`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenesisActivations {
+    /// Block-validity hardening (this module, `PINNED_ACTIVATIONS`).
+    pub pba_hardening: Option<u64>,
+    /// Exact created code (`citrate_execution::exact_code`).
+    pub exact_create_code: Option<u64>,
+    /// Canonical ECVRF point encoding (`crate::vrf_encoding`, resolved through its
+    /// `pin_for_genesis`).
+    pub vrf_canonical_encoding: Option<u64>,
+    /// Storage root from the slot set (`citrate_execution::storage_root_hardening`,
+    /// resolved through its `pin_for_genesis`).
+    pub storage_root_hardening: Option<u64>,
+    /// Journaled fee settlement, rewards from executed state and journaled in-tx writes,
+    /// one height (`citrate_execution::supply_hardening`, resolved through its
+    /// `pin_for_genesis`).
+    pub supply_hardening: Option<u64>,
+}
+
+impl GenesisActivations {
+    /// Every rule, by name, with its height, in a fixed order (for logs and the
+    /// consensus fingerprint).
+    pub fn entries(&self) -> [(&'static str, Option<u64>); 5] {
+        [
+            ("pba_hardening", self.pba_hardening),
+            ("exact_create_code", self.exact_create_code),
+            ("vrf_canonical_encoding", self.vrf_canonical_encoding),
+            ("storage_root_hardening", self.storage_root_hardening),
+            ("supply_hardening", self.supply_hardening),
+        ]
+    }
+
+    /// The rules this build enforces from these heights. The others are recorded only,
+    /// until their module (a separate PR) consults [`rules_for_genesis`].
+    pub const WIRED: &'static [&'static str] = &[
+        "pba_hardening",
+        "exact_create_code",
+        "vrf_canonical_encoding",
+        "storage_root_hardening",
+        "supply_hardening",
+    ];
+}
+
+/// r1006's rules: the owner's decision (2026-10-26) is EVERY new hardening rule active
+/// from the first block after genesis. ONE place: changing a rule's schedule for r1006 is
+/// a one-line change here (and moves the consensus fingerprint).
+pub const R1006_ACTIVATIONS: GenesisActivations = GenesisActivations {
+    pba_hardening: Some(0),
+    exact_create_code: Some(0),
+    vrf_canonical_encoding: Some(0),
+    storage_root_hardening: Some(0),
+    supply_hardening: Some(0),
+};
+
+/// Per-genesis activations compiled into this release, keyed by (chain id, block-0 hash),
+/// beside [`RELEASE_GENESIS`]. The ONLY place a new rule gets a height: r1005's genesis has
+/// no entry, so every new rule stays unset there (replay-identical).
+pub const GENESIS_ACTIVATIONS: &[(u64, [u8; 32], GenesisActivations)] =
+    &[(40204, R1006_GENESIS, R1006_ACTIVATIONS)];
+
+/// The genesis-keyed rules for a node on `chain_id` whose loaded block 0 is `genesis`:
+///
+/// * the (chain id, genesis) pair of a compiled entry (40204 + r1006's block 0): `Some`
+///   of its activations (a per-chain pin never overrides them);
+/// * any other genesis, including r1005's and an unknown one: `None`, explicitly. The
+///   module then uses its per-chain pin table exactly as before, so an r1005 node rebuilt
+///   from this release replays its chain unchanged.
+///
+/// An unknown genesis on 40204 gets `None` rather than a refusal: the r1006 ceremony
+/// devnet and every local rehearsal run 40204 with their own genesis, and such a node
+/// cannot pass for a release network (the handshake compares genesis hashes, and
+/// `check_genesis_chain` binds the release geneses to their chain). A node that asks
+/// for the r1006 profile but loads another genesis IS refused, by the node at start-up.
+pub fn rules_for_genesis(chain_id: u64, genesis: &[u8; 32]) -> Option<GenesisActivations> {
+    GENESIS_ACTIVATIONS
+        .iter()
+        .find(|(c, g, _)| *c == chain_id && g == genesis)
+        .map(|(_, _, a)| *a)
+}
+
+/// The schedule a genesis-keyed rule resolves with, as the `pin` its module's resolver
+/// takes (`Option<Option<u64>>`), from the ONE shared table [`GENESIS_ACTIVATIONS`]:
+///
+/// * `Some(h)` inside `Some`: the (chain id, genesis) pair has a compiled entry; the rule's
+///   height there is the pin, and a per-node env/config value must agree with it;
+/// * `Some(None)`: a release chain id on one of its release geneses without an entry
+///   (r1005), or with no genesis known yet: the rule is not scheduled and a per-node
+///   height is refused (it would fork the node off that chain);
+/// * `None`: any other genesis (the r1006 build devnet, a local rehearsal): not a release
+///   chain, so the env/config value decides.
+///
+/// There are no per-module chain-id pin tables for these rules; a tripwire
+/// (`scripts/ci/genesis_keyed_pins_tripwire.sh`) keeps it that way.
+pub fn genesis_rule_pin(
+    chain_id: u64,
+    genesis: Option<&[u8; 32]>,
+    rule: fn(&GenesisActivations) -> Option<u64>,
+) -> Option<Option<u64>> {
+    if let Some(g) = genesis {
+        if let Some(a) = rules_for_genesis(chain_id, g) {
+            return Some(rule(&a));
+        }
+    }
+    let on_release_genesis = match genesis {
+        None => true,
+        Some(g) => RELEASE_GENESIS
+            .iter()
+            .any(|(c, r)| *c == chain_id && r == g),
+    };
+    if is_release_network(chain_id) && on_release_genesis {
+        Some(None)
+    } else {
+        None
+    }
+}
+
+/// The activations compiled for `genesis` on any chain id (logs and the fingerprint).
+/// Rule resolution uses [`rules_for_genesis`] / [`genesis_rule_pin`], which also match the chain id.
+pub fn genesis_activations(genesis: &[u8; 32]) -> Option<GenesisActivations> {
+    GENESIS_ACTIVATIONS
+        .iter()
+        .find(|(_, g, _)| g == genesis)
+        .map(|(_, _, a)| *a)
+}
 
 /// Canonical blocks compiled into this release, by release genesis: at each
 /// listed height the listed hash is the only block a node admits, so any other
@@ -420,6 +563,36 @@ pub fn resolve_pba_hardening_for_chain(
         config_value,
         dev_profile,
     )?;
+    Ok(ResolvedActivation {
+        chain_id,
+        height,
+        source,
+        dev_profile,
+    })
+}
+
+/// [`init_pba_hardening_for_chain`], but a per-genesis pin ([`genesis_activations`])
+/// replaces the chain-id pin. The node calls this once it knows its block 0.
+pub fn init_pba_hardening_for_genesis(
+    chain_id: u64,
+    genesis: Option<&GenesisActivations>,
+    config_value: Option<u64>,
+    dev_profile: bool,
+) -> Result<ResolvedActivation, String> {
+    let Some(g) = genesis else {
+        return init_pba_hardening_for_chain(chain_id, config_value, dev_profile);
+    };
+    if dev_profile {
+        return Err(format!("chain {chain_id}: {}", dev_profile_refusal()));
+    }
+    let env_raw = match std::env::var(PBA_HARDENING_ENV) {
+        Ok(raw) => Some(raw),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(e) => return Err(format!("{PBA_HARDENING_ENV}: {e}")),
+    };
+    let (height, source) =
+        resolve_activation(g.pba_hardening, env_raw.as_deref(), config_value, false)?;
+    set_pba_hardening_height(height);
     Ok(ResolvedActivation {
         chain_id,
         height,
@@ -832,6 +1005,130 @@ mod tests {
             ],
             "365,784 is the kept block of the 2026-10-15 rollback; 365,785 the first block on it"
         );
+    }
+
+    #[test]
+    fn r1006_rules_are_keyed_by_its_genesis_not_by_the_chain_id() {
+        let r1005 = RELEASE_GENESIS[0].1;
+        assert_ne!(R1006_GENESIS, r1005, "r1006 has its own block 0");
+        assert_eq!(genesis_activations(&R1006_GENESIS), Some(R1006_ACTIVATIONS));
+        assert_eq!(
+            genesis_activations(&r1005),
+            None,
+            "r1006's rules never reach r1005"
+        );
+        assert!(
+            canonical_checkpoints(&R1006_GENESIS).is_empty(),
+            "r1005's compiled checkpoints never reach r1006"
+        );
+        assert!(RELEASE_GENESIS.contains(&(40204, R1006_GENESIS)));
+        for (name, h) in R1006_ACTIVATIONS.entries() {
+            assert_eq!(
+                h,
+                Some(0),
+                "{name}: the owner set every new rule to 0 on r1006"
+            );
+        }
+        let names: Vec<&str> = R1006_ACTIVATIONS.entries().iter().map(|e| e.0).collect();
+        assert_eq!(
+            names,
+            [
+                "pba_hardening",
+                "exact_create_code",
+                "vrf_canonical_encoding",
+                "storage_root_hardening",
+                "supply_hardening"
+            ]
+        );
+        for w in GenesisActivations::WIRED {
+            assert!(
+                R1006_ACTIVATIONS.entries().iter().any(|(n, _)| n == w),
+                "{w} is a field"
+            );
+        }
+    }
+
+    /// r1005's genesis on the new binary: no genesis-keyed rule, so every module keeps its
+    /// per-chain pin (the new rules stay unset: replay-identical). r1006's genesis: every
+    /// rule at 0. An unknown genesis on 40204: `None`, explicitly.
+    #[test]
+    fn genesis_keyed_rules_r1005_none_r1006_zero_unknown_none() {
+        let r1005 = RELEASE_GENESIS[0].1;
+        assert_eq!(rules_for_genesis(40204, &r1005), None);
+        for (_, g) in RELEASE_GENESIS.iter().filter(|(_, g)| *g != R1006_GENESIS) {
+            assert_eq!(rules_for_genesis(40204, g), None, "{}", hex::encode(g));
+        }
+        let r = rules_for_genesis(40204, &R1006_GENESIS).expect("r1006 has rules");
+        assert!(r.entries().iter().all(|(_, h)| *h == Some(0)), "{r:?}");
+        assert_eq!(
+            rules_for_genesis(40204, &[0x42; 32]),
+            None,
+            "unknown genesis"
+        );
+        assert_eq!(
+            rules_for_genesis(1337, &R1006_GENESIS),
+            None,
+            "keyed by (chain id, genesis): r1006's block 0 under another chain id gets nothing"
+        );
+    }
+
+    #[test]
+    fn genesis_rule_pin_r1005_refuses_r1006_zero_unknown_local() {
+        let exact = |a: &GenesisActivations| a.exact_create_code;
+        let r1005 = RELEASE_GENESIS[0].1;
+        assert_eq!(
+            genesis_rule_pin(40204, Some(&r1005), exact),
+            Some(None),
+            "r1005: unset, per-node refused"
+        );
+        assert_eq!(
+            genesis_rule_pin(40204, None, exact),
+            Some(None),
+            "no genesis known"
+        );
+        assert_eq!(
+            genesis_rule_pin(40204, Some(&R1006_GENESIS), exact),
+            Some(Some(0)),
+            "r1006: 0"
+        );
+        assert_eq!(
+            genesis_rule_pin(40204, Some(&[0x42; 32]), exact),
+            None,
+            "unknown: local"
+        );
+        assert_eq!(
+            genesis_rule_pin(1337, None, exact),
+            None,
+            "dev chain: local"
+        );
+        let picks: [fn(&GenesisActivations) -> Option<u64>; 3] = [
+            |a| a.vrf_canonical_encoding,
+            |a| a.storage_root_hardening,
+            |a| a.supply_hardening,
+        ];
+        for pick in picks {
+            assert_eq!(
+                genesis_rule_pin(40204, Some(&R1006_GENESIS), pick),
+                Some(Some(0))
+            );
+            assert_eq!(genesis_rule_pin(40204, Some(&r1005), pick), Some(None));
+        }
+    }
+
+    #[test]
+    fn a_genesis_pin_refuses_a_disagreeing_config() {
+        let g = R1006_ACTIVATIONS;
+        assert_eq!(
+            resolve_activation(g.pba_hardening, None, Some(5), false).map(|r| r.0),
+            Err(resolve_activation(Some(0), None, Some(5), false)
+                .err()
+                .unwrap_or_default())
+        );
+        assert_eq!(
+            resolve_activation(g.pba_hardening, None, Some(0), false),
+            Ok((Some(0), ActivationSource::ReleasePin))
+        );
+        assert!(init_pba_hardening_for_genesis(40204, Some(&g), None, true).is_err());
     }
 
     #[test]

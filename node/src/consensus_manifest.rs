@@ -35,9 +35,13 @@ pub struct FingerprintInputs<'a> {
     pub activation_gated: &'a [&'a str],
     pub pba_hardening_height: Option<u64>,
     pub agent_precompiles_height: Option<u64>,
+    /// Appended to the pre-image only when set (chain#387).
     pub exact_create_code_height: Option<u64>,
+    /// Appended to the pre-image only when set (chain#384).
     pub vrf_canonical_encoding_height: Option<u64>,
+    /// Appended to the pre-image only when set (chain#391).
     pub supply_hardening_height: Option<u64>,
+    /// Appended to the pre-image only when set (chain#392).
     pub storage_root_hardening_height: Option<u64>,
     pub value_transfer_activation_height: u64,
     pub create_nonce_fix_activation_height: u64,
@@ -45,6 +49,22 @@ pub struct FingerprintInputs<'a> {
     pub canonical_base_fee_per_gas: u64,
     pub epoch: u64,
     pub snapshot_lag: u64,
+    /// The chain this process runs: `(block-0 hash hex, per-genesis rule schedule)`, set
+    /// only for a genesis with compiled per-genesis rules (r1006). `None` otherwise (r1005,
+    /// any other genesis, or no chain bound): the pre-image is then exactly the v3 one,
+    /// byte-identical to the unbound form. `Some` switches the tag to v4 and appends the
+    /// binding, so two binaries aligned on code but run against r1005 and r1006 (which
+    /// share chain id 40204) print different fingerprints. The configured profile NAME is
+    /// never part of it: two nodes on the same block 0 agree whatever they call it.
+    pub genesis_binding: Option<GenesisBinding<'a>>,
+}
+
+/// See [`FingerprintInputs::genesis_binding`].
+#[derive(Debug, Clone, Copy)]
+pub struct GenesisBinding<'a> {
+    pub genesis_hash: &'a str,
+    /// `name:height|...` from the genesis's compiled activations (`-` for none).
+    pub genesis_rules: &'a str,
 }
 
 /// Canonical, order-stable pre-image of the consensus-affecting surface.
@@ -94,20 +114,28 @@ pub fn fingerprint_preimage(i: &FingerprintInputs<'_>) -> String {
         Some(h) => format!("{preimage}exact_create_code_height={h}\n"),
         None => preimage,
     };
-    // Appended only when scheduled, like the agent fork above.
     let preimage = match i.vrf_canonical_encoding_height {
         Some(h) => format!("{preimage}vrf_canonical_encoding_height={h}\n"),
         None => preimage,
     };
-    // Same rule for the supply hardening fork: unset keeps the fingerprint.
     let preimage = match i.supply_hardening_height {
         Some(h) => format!("{preimage}supply_hardening_height={h}\n"),
         None => preimage,
     };
-    // And for the storage-root hardening fork.
-    match i.storage_root_hardening_height {
+    let preimage = match i.storage_root_hardening_height {
         Some(h) => format!("{preimage}storage_root_hardening_height={h}\n"),
         None => preimage,
+    };
+    match i.genesis_binding {
+        None => preimage,
+        Some(b) => format!(
+            "citrate-consensus-v4{}genesis_hash={}\ngenesis_rules={}\n",
+            preimage
+                .strip_prefix("citrate-consensus-v3")
+                .unwrap_or(&preimage),
+            b.genesis_hash,
+            b.genesis_rules
+        ),
     }
 }
 
@@ -181,6 +209,14 @@ pub struct ConsensusManifest {
     pub epoch: u64,
     /// Validator-registry snapshot lag (blocks before the epoch boundary).
     pub snapshot_lag: u64,
+    /// The genesis profile named in this process's config. Display only: NOT part of the
+    /// fingerprint (see [`FingerprintInputs::genesis_binding`]).
+    pub genesis_profile: Option<String>,
+    /// Block-0 hash this process runs (`None` = not known). Part of the fingerprint only
+    /// when the genesis has compiled per-genesis rules (`genesis_rules` is then set).
+    pub genesis_hash: Option<String>,
+    /// The genesis's compiled rule schedule (`name:height|...`), when bound.
+    pub genesis_rules: Option<String>,
     /// Stable hash over the consensus-affecting fields (NOT build_target). Two
     /// binaries with equal fingerprints compute equal state roots for equal input.
     pub fingerprint: String,
@@ -196,8 +232,8 @@ impl ConsensusManifest {
         Self::for_height(height)
     }
 
-    /// The manifest for this binary under a given activation height (every
-    /// other activation height is read from the process store).
+    /// The manifest for this binary under a given PBA height (every other height is
+    /// read from its process store).
     pub fn for_height(pba_hardening_height: Option<u64>) -> Self {
         Self::for_heights(
             pba_hardening_height,
@@ -205,97 +241,70 @@ impl ConsensusManifest {
         )
     }
 
-    /// The manifest under explicit PBA and agent-fork activation heights (the
-    /// exact-created-code, canonical VRF encoding, supply hardening and
-    /// storage-root hardening heights are read from the process store).
+    /// Explicit PBA and agent-fork heights; the rest from the process stores.
     pub fn for_heights(
         pba_hardening_height: Option<u64>,
         agent_precompiles_height: Option<u64>,
     ) -> Self {
-        Self::for_all_heights(
+        Self::for_activations(
             pba_hardening_height,
             agent_precompiles_height,
-            citrate_consensus::vrf_encoding::vrf_canonical_encoding_height(),
+            citrate_execution::exact_code::exact_create_code_height(),
         )
     }
 
-    /// The manifest under explicit PBA, agent-fork and exact-created-code
-    /// activation heights (the others are read from the process store).
+    /// Explicit PBA, agent-fork, supply and storage-root heights (chain#391/#392 tests).
     #[cfg(test)]
+    pub fn for_supply_heights(
+        pba_hardening_height: Option<u64>,
+        agent_precompiles_height: Option<u64>,
+        supply_hardening_height: Option<u64>,
+        storage_root_hardening_height: Option<u64>,
+    ) -> Self {
+        Self::for_all(
+            pba_hardening_height,
+            agent_precompiles_height,
+            citrate_execution::exact_code::exact_create_code_height(),
+            citrate_consensus::vrf_encoding::vrf_canonical_encoding_height(),
+            supply_hardening_height,
+            storage_root_hardening_height,
+        )
+    }
+
+    /// Explicit PBA, agent-fork and exact-created-code heights.
     pub fn for_activations(
         pba_hardening_height: Option<u64>,
         agent_precompiles_height: Option<u64>,
         exact_create_code_height: Option<u64>,
     ) -> Self {
-        Self::for_every_activation(
+        Self::for_every_height(
             pba_hardening_height,
             agent_precompiles_height,
             exact_create_code_height,
             citrate_consensus::vrf_encoding::vrf_canonical_encoding_height(),
-            citrate_execution::supply_hardening::supply_hardening_height(),
-            citrate_execution::storage_root_hardening::storage_root_hardening_height(),
         )
     }
 
-    /// The manifest under explicit PBA, agent-fork and canonical VRF encoding
-    /// heights (the others are read from the process store).
-    pub fn for_all_heights(
+    /// Explicit PBA, agent, exact-code and VRF heights; supply and storage-root from
+    /// their process stores.
+    pub fn for_every_height(
         pba_hardening_height: Option<u64>,
         agent_precompiles_height: Option<u64>,
+        exact_create_code_height: Option<u64>,
         vrf_canonical_encoding_height: Option<u64>,
     ) -> Self {
-        Self::for_every_activation(
+        Self::for_all(
             pba_hardening_height,
             agent_precompiles_height,
-            citrate_execution::exact_code::exact_create_code_height(),
+            exact_create_code_height,
             vrf_canonical_encoding_height,
             citrate_execution::supply_hardening::supply_hardening_height(),
             citrate_execution::storage_root_hardening::storage_root_hardening_height(),
         )
     }
 
-    /// The manifest under explicit PBA, agent-fork, supply hardening and
-    /// storage-root hardening heights (the others are read from the process
-    /// store).
-    #[cfg(test)]
-    pub fn for_hardening_heights(
-        pba_hardening_height: Option<u64>,
-        agent_precompiles_height: Option<u64>,
-        supply_hardening_height: Option<u64>,
-        storage_root_hardening_height: Option<u64>,
-    ) -> Self {
-        Self::for_every_activation(
-            pba_hardening_height,
-            agent_precompiles_height,
-            citrate_execution::exact_code::exact_create_code_height(),
-            citrate_consensus::vrf_encoding::vrf_canonical_encoding_height(),
-            supply_hardening_height,
-            storage_root_hardening_height,
-        )
-    }
-
-    /// The manifest under the heights the `consensus` subcommand resolves for
-    /// a chain (the canonical VRF encoding height is read from the process
-    /// store, which that command initialises first).
-    pub fn for_release_heights(
-        pba_hardening_height: Option<u64>,
-        agent_precompiles_height: Option<u64>,
-        exact_create_code_height: Option<u64>,
-        supply_hardening_height: Option<u64>,
-        storage_root_hardening_height: Option<u64>,
-    ) -> Self {
-        Self::for_every_activation(
-            pba_hardening_height,
-            agent_precompiles_height,
-            exact_create_code_height,
-            citrate_consensus::vrf_encoding::vrf_canonical_encoding_height(),
-            supply_hardening_height,
-            storage_root_hardening_height,
-        )
-    }
-
     /// The manifest under every explicit activation height.
-    fn for_every_activation(
+    pub fn for_all(
         pba_hardening_height: Option<u64>,
         agent_precompiles_height: Option<u64>,
         exact_create_code_height: Option<u64>,
@@ -341,6 +350,7 @@ impl ConsensusManifest {
             canonical_base_fee_per_gas: CANONICAL_BASE_FEE_PER_GAS,
             epoch: EPOCH,
             snapshot_lag: SNAPSHOT_LAG,
+            genesis_binding: None,
         });
 
         Self {
@@ -363,8 +373,82 @@ impl ConsensusManifest {
             canonical_base_fee_per_gas: CANONICAL_BASE_FEE_PER_GAS,
             epoch: EPOCH,
             snapshot_lag: SNAPSHOT_LAG,
+            genesis_profile: None,
+            genesis_hash: None,
+            genesis_rules: None,
             fingerprint,
         }
+    }
+
+    /// THE manifest a node reports, in its boot log, its node-identity RPC and
+    /// `citrate consensus`: every height from its process store (published at start-up),
+    /// bound (v4) to the genesis the node runs when that genesis has compiled per-genesis
+    /// rules. The profile name and an unscheduled genesis's hash are recorded for display
+    /// only, so they never move the fingerprint.
+    pub fn for_node(profile: Option<&str>, genesis: Option<&[u8; 32]>) -> Self {
+        let mut m = match genesis {
+            Some(g) if citrate_consensus::hardening::genesis_activations(g).is_some() => {
+                Self::current().bound(g)
+            }
+            Some(g) => {
+                let mut m = Self::current();
+                m.genesis_hash = Some(format!("0x{}", hex::encode(g)));
+                m
+            }
+            None => Self::current(),
+        };
+        m.genesis_profile = profile.map(str::to_string);
+        m
+    }
+
+    /// The rule schedule string for a genesis (`-` when it has no compiled activations).
+    pub fn genesis_rules_of(genesis: &[u8; 32]) -> String {
+        match citrate_consensus::hardening::genesis_activations(genesis) {
+            None => "-".to_string(),
+            Some(a) => a
+                .entries()
+                .iter()
+                .map(|(n, h)| {
+                    format!(
+                        "{n}:{}",
+                        h.map(|h| h.to_string()).unwrap_or_else(|| "unset".into())
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("|"),
+        }
+    }
+
+    /// This manifest bound to a chain: the v4 fingerprint over the same fields plus the
+    /// block-0 hash and the genesis's compiled rule schedule.
+    pub fn bound(mut self, genesis: &[u8; 32]) -> Self {
+        let hash = format!("0x{}", hex::encode(genesis));
+        let rules = Self::genesis_rules_of(genesis);
+        self.fingerprint = fingerprint_of(&FingerprintInputs {
+            git_sha: self.git_sha,
+            feat_halo2_verifier: self.feat_halo2_verifier,
+            feat_commd_fold_verify: self.feat_commd_fold_verify,
+            activation_gated: &self.activation_gated,
+            pba_hardening_height: self.pba_hardening_height,
+            agent_precompiles_height: self.agent_precompiles_height,
+            exact_create_code_height: self.exact_create_code_height,
+            vrf_canonical_encoding_height: self.vrf_canonical_encoding_height,
+            supply_hardening_height: self.supply_hardening_height,
+            storage_root_hardening_height: self.storage_root_hardening_height,
+            value_transfer_activation_height: self.value_transfer_activation_height,
+            create_nonce_fix_activation_height: self.create_nonce_fix_activation_height,
+            merge_depth_activation_height: self.merge_depth_activation_height,
+            canonical_base_fee_per_gas: self.canonical_base_fee_per_gas,
+            epoch: self.epoch,
+            snapshot_lag: self.snapshot_lag,
+            genesis_binding: Some(GenesisBinding {
+                genesis_hash: &hash,
+                genesis_rules: &rules,
+            }),
+        });
+        self.genesis_hash = Some(hash);
+        self.genesis_rules = Some(rules);
+        self
     }
 
     /// Human-readable stamp for `citrate consensus`.
@@ -441,6 +525,13 @@ impl ConsensusManifest {
             "  epoch / lag        {} / {}",
             self.epoch, self.snapshot_lag
         );
+        if let Some(g) = &self.genesis_hash {
+            let p = self.genesis_profile.as_deref().unwrap_or("-");
+            println!("  genesis            {p} {g}");
+            if let Some(r) = &self.genesis_rules {
+                println!("  genesis rules      {r}");
+            }
+        }
         println!("  fingerprint        {}", self.fingerprint);
         if self.git_dirty {
             println!(
@@ -496,23 +587,23 @@ mod tests {
     /// before; a scheduled one is part of it.
     #[test]
     fn agent_fork_height_enters_the_fingerprint_only_when_set() {
-        let unset = ConsensusManifest::for_hardening_heights(Some(10), None, None, None);
-        let a = ConsensusManifest::for_hardening_heights(Some(10), Some(500), None, None);
-        let b = ConsensusManifest::for_hardening_heights(Some(10), Some(501), None, None);
+        let unset = ConsensusManifest::for_supply_heights(Some(10), None, None, None);
+        let a = ConsensusManifest::for_supply_heights(Some(10), Some(500), None, None);
+        let b = ConsensusManifest::for_supply_heights(Some(10), Some(501), None, None);
         assert_eq!(a.agent_precompiles_height, Some(500));
         assert_ne!(a.fingerprint, unset.fingerprint);
         assert_ne!(a.fingerprint, b.fingerprint);
         assert_eq!(
             unset.fingerprint,
-            ConsensusManifest::for_hardening_heights(Some(10), None, None, None).fingerprint
+            ConsensusManifest::for_supply_heights(Some(10), None, None, None).fingerprint
         );
     }
 
     #[test]
     fn supply_hardening_height_enters_the_fingerprint_only_when_scheduled() {
-        let unset = ConsensusManifest::for_hardening_heights(Some(10), None, None, None);
-        let a = ConsensusManifest::for_hardening_heights(Some(10), None, Some(700), None);
-        let b = ConsensusManifest::for_hardening_heights(Some(10), None, Some(701), None);
+        let unset = ConsensusManifest::for_supply_heights(Some(10), None, None, None);
+        let a = ConsensusManifest::for_supply_heights(Some(10), None, Some(700), None);
+        let b = ConsensusManifest::for_supply_heights(Some(10), None, Some(701), None);
         assert_eq!(a.supply_hardening_height, Some(700));
         assert_ne!(a.fingerprint, unset.fingerprint);
         assert_ne!(a.fingerprint, b.fingerprint);
@@ -520,16 +611,33 @@ mod tests {
 
     #[test]
     fn storage_root_hardening_height_enters_the_fingerprint_only_when_scheduled() {
-        let unset = ConsensusManifest::for_hardening_heights(Some(10), None, None, None);
-        let zero = ConsensusManifest::for_hardening_heights(Some(10), None, None, Some(0));
-        let later = ConsensusManifest::for_hardening_heights(Some(10), None, None, Some(900));
+        let unset = ConsensusManifest::for_supply_heights(Some(10), None, None, None);
+        let zero = ConsensusManifest::for_supply_heights(Some(10), None, None, Some(0));
+        let later = ConsensusManifest::for_supply_heights(Some(10), None, None, Some(900));
         assert_eq!(zero.storage_root_hardening_height, Some(0));
         assert_ne!(zero.fingerprint, unset.fingerprint);
         assert_ne!(zero.fingerprint, later.fingerprint);
         // Distinct from the supply fork at the same height.
         assert_ne!(
             later.fingerprint,
-            ConsensusManifest::for_hardening_heights(Some(10), None, Some(900), None).fingerprint
+            ConsensusManifest::for_supply_heights(Some(10), None, Some(900), None).fingerprint
+        );
+    }
+
+    /// An unscheduled exact-created-code rule leaves the fingerprint exactly
+    /// as before; a scheduled one is part of it.
+    #[test]
+    fn exact_create_code_height_enters_the_fingerprint_only_when_set() {
+        let unset = ConsensusManifest::for_activations(Some(10), None, None);
+        let a = ConsensusManifest::for_activations(Some(10), None, Some(0));
+        let b = ConsensusManifest::for_activations(Some(10), None, Some(1));
+        assert_eq!(a.exact_create_code_height, Some(0));
+        assert_ne!(a.fingerprint, unset.fingerprint);
+        assert_ne!(a.fingerprint, b.fingerprint);
+        assert_eq!(
+            unset.fingerprint,
+            ConsensusManifest::for_heights(Some(10), None).fingerprint,
+            "unset: byte-identical to the two-height form"
         );
     }
 
@@ -554,6 +662,7 @@ mod tests {
             canonical_base_fee_per_gas: 1_000_000_000,
             epoch: 1000,
             snapshot_lag: 200,
+            genesis_binding: None,
         }
     }
 
@@ -659,7 +768,7 @@ mod tests {
             (
                 "exact create code height",
                 FingerprintInputs {
-                    exact_create_code_height: Some(5),
+                    exact_create_code_height: Some(0),
                     ..base
                 },
             ),
@@ -754,6 +863,7 @@ mod tests {
                 canonical_base_fee_per_gas: m.canonical_base_fee_per_gas,
                 epoch: m.epoch,
                 snapshot_lag: m.snapshot_lag,
+                genesis_binding: None,
             };
             assert_eq!(
                 m.fingerprint,
@@ -773,30 +883,119 @@ mod tests {
         }
     }
 
-    /// An unscheduled exact-created-code rule leaves the fingerprint exactly
-    /// as before; a scheduled one is part of it.
+    /// v4: a bound manifest names the block-0 hash and the genesis's rule schedule (not the
+    /// profile name); the unbound pre-image is byte-identical to v3 (golden vector above).
     #[test]
-    fn exact_create_code_height_enters_the_fingerprint_only_when_set() {
-        let unset = ConsensusManifest::for_activations(Some(10), None, None);
-        let a = ConsensusManifest::for_activations(Some(10), None, Some(0));
-        let b = ConsensusManifest::for_activations(Some(10), None, Some(1));
-        assert_eq!(a.exact_create_code_height, Some(0));
-        assert_ne!(a.fingerprint, unset.fingerprint);
-        assert_ne!(a.fingerprint, b.fingerprint);
+    fn genesis_binding_enters_the_fingerprint_as_v4() {
+        let b = GenesisBinding {
+            genesis_hash: "0xabc",
+            genesis_rules: "pba_hardening:0",
+        };
+        let bound = FingerprintInputs {
+            genesis_binding: Some(b),
+            ..sample(true)
+        };
+        let pre = fingerprint_preimage(&bound);
+        assert!(
+            pre.starts_with("citrate-consensus-v4\ngit_sha=0123abc\n"),
+            "{pre}"
+        );
+        assert!(
+            pre.ends_with("snapshot_lag=200\ngenesis_hash=0xabc\ngenesis_rules=pba_hardening:0\n")
+        );
         assert_eq!(
-            unset.fingerprint,
-            ConsensusManifest::for_heights(Some(10), None).fingerprint,
-            "unset: byte-identical to the two-height form"
+            pre,
+            fingerprint_preimage(&sample(true)).replacen(
+                "citrate-consensus-v3",
+                "citrate-consensus-v4",
+                1
+            ) + "genesis_hash=0xabc\ngenesis_rules=pba_hardening:0\n"
+        );
+        let base = fingerprint_of(&sample(true));
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(base.clone());
+        for v in [
+            b,
+            GenesisBinding {
+                genesis_hash: "0xabd",
+                ..b
+            },
+            GenesisBinding {
+                genesis_rules: "pba_hardening:1",
+                ..b
+            },
+        ] {
+            let f = fingerprint_of(&FingerprintInputs {
+                genesis_binding: Some(v),
+                ..sample(true)
+            });
+            assert!(seen.insert(f), "{v:?} collides");
+        }
+    }
+
+    /// r1005 and r1006 run on one chain id with the same binary: they differ. r1006 (the
+    /// genesis with compiled rules) is bound; r1005 stays the unbound v3 manifest.
+    #[test]
+    fn r1005_and_r1006_bound_manifests_differ() {
+        use citrate_consensus::hardening::{R1006_GENESIS, RELEASE_GENESIS};
+        let m = ConsensusManifest::current();
+        let r1005 = ConsensusManifest::for_node(Some("testnet_beta"), Some(&RELEASE_GENESIS[0].1));
+        let r1006 = ConsensusManifest::for_node(Some("r1006"), Some(&R1006_GENESIS));
+        assert_ne!(r1005.fingerprint, r1006.fingerprint);
+        assert_eq!(r1005.fingerprint, m.fingerprint, "r1005 is unbound (v3)");
+        assert_ne!(r1006.fingerprint, m.fingerprint, "r1006 is bound (v4)");
+        assert_eq!(r1005.genesis_rules, None);
+        assert_eq!(
+            r1006.fingerprint,
+            m.clone().bound(&R1006_GENESIS).fingerprint
+        );
+        assert!(r1006.genesis_rules.as_deref().is_some_and(
+            |r| r.contains("exact_create_code:0") && r.contains("vrf_canonical_encoding:0")
+        ));
+        // A different block 0 under the same compiled rules would bind differently.
+        let other = m.clone().bound(&[7u8; 32]);
+        assert_ne!(other.fingerprint, r1006.fingerprint);
+    }
+
+    /// The fingerprint follows the chain a node runs, never what its config calls it:
+    /// naming the genesis profile or not gives the same fingerprint, on r1005 and on
+    /// r1006. On r1005 (no compiled per-genesis rules) it stays exactly the v3 one
+    /// (main's pre-image), so r1005 fleet comparisons are unchanged.
+    #[test]
+    fn fingerprint_does_not_depend_on_the_profile_name() {
+        use citrate_consensus::hardening::{R1006_GENESIS, RELEASE_GENESIS};
+        let r1005 = RELEASE_GENESIS[0].1;
+        for (named, g) in [("testnet_beta", r1005), ("r1006", R1006_GENESIS)] {
+            assert_eq!(
+                ConsensusManifest::for_node(Some(named), Some(&g)).fingerprint,
+                ConsensusManifest::for_node(None, Some(&g)).fingerprint,
+                "{named}: the profile name moved the fingerprint"
+            );
+            assert_eq!(
+                ConsensusManifest::for_node(Some(named), Some(&g)).fingerprint,
+                ConsensusManifest::for_node(Some("some-other-name"), Some(&g)).fingerprint,
+                "{named}: a renamed profile moved the fingerprint"
+            );
+        }
+        assert_eq!(
+            ConsensusManifest::for_node(Some("testnet_beta"), Some(&r1005)).fingerprint,
+            ConsensusManifest::current().fingerprint,
+            "r1005 keeps the unbound v3 fingerprint"
+        );
+        assert_ne!(
+            ConsensusManifest::for_node(None, Some(&R1006_GENESIS)).fingerprint,
+            ConsensusManifest::for_node(None, Some(&r1005)).fingerprint,
+            "r1006 still differs from r1005"
         );
     }
 
-    /// An unscheduled canonical VRF encoding rule leaves the fingerprint
-    /// exactly as before; a scheduled one is part of it.
+    /// An unscheduled canonical VRF encoding rule leaves the fingerprint exactly as
+    /// before; a scheduled one is part of it (chain#384).
     #[test]
     fn vrf_encoding_height_enters_the_fingerprint_only_when_set() {
-        let unset = ConsensusManifest::for_all_heights(Some(10), None, None);
-        let a = ConsensusManifest::for_all_heights(Some(10), None, Some(0));
-        let b = ConsensusManifest::for_all_heights(Some(10), None, Some(1));
+        let unset = ConsensusManifest::for_every_height(Some(10), None, None, None);
+        let a = ConsensusManifest::for_every_height(Some(10), None, None, Some(0));
+        let b = ConsensusManifest::for_every_height(Some(10), None, None, Some(1));
         assert_eq!(a.vrf_canonical_encoding_height, Some(0));
         assert_ne!(a.fingerprint, unset.fingerprint);
         assert_ne!(a.fingerprint, b.fingerprint);
@@ -804,6 +1003,55 @@ mod tests {
             unset.fingerprint,
             ConsensusManifest::for_heights(Some(10), None).fingerprint,
             "unset matches the two-height form (process store unset)"
+        );
+    }
+
+    /// The boot log, the node-identity RPC and `citrate consensus` report ONE fingerprint:
+    /// all three take it from `for_node`, and nothing else in those paths builds one.
+    #[test]
+    fn boot_log_identity_rpc_and_consensus_command_share_one_fingerprint() {
+        let main = include_str!("main.rs");
+        let start = main.find("async fn start_node(").expect("start_node");
+        let body = &main[start..];
+        let end = body.find("\nasync fn ").unwrap_or(body.len());
+        let body = &body[..end];
+        assert_eq!(
+            body.matches("ConsensusManifest::for_node(").count(),
+            2,
+            "start_node: the boot stamp and the identity fallback, both for_node"
+        );
+        assert!(
+            body.contains("let manifest = node_manifest.clone()"),
+            "the RPC reuses the boot manifest"
+        );
+        for other in [
+            "ConsensusManifest::current()",
+            "ConsensusManifest::for_height(",
+            "ConsensusManifest::for_all(",
+        ] {
+            assert!(
+                !body.contains(other),
+                "start_node builds a second manifest via {other}"
+            );
+        }
+        let cmd = &main[main
+            .find("Some(Commands::Consensus { json })")
+            .expect("consensus cmd")..];
+        let cmd = &cmd[..cmd.find("return Ok(());").expect("end")];
+        assert!(
+            cmd.contains("ConsensusManifest::for_node("),
+            "citrate consensus uses for_node"
+        );
+        assert!(!cmd.contains("ConsensusManifest::for_all("));
+        // for_node is the current manifest, bound to a scheduled genesis exactly as bound() does.
+        let g = citrate_consensus::hardening::R1006_GENESIS;
+        assert_eq!(
+            ConsensusManifest::for_node(Some("r1006"), Some(&g)).fingerprint,
+            ConsensusManifest::current().bound(&g).fingerprint
+        );
+        assert_eq!(
+            ConsensusManifest::for_node(None, None).fingerprint,
+            ConsensusManifest::current().fingerprint
         );
     }
 

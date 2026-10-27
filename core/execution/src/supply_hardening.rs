@@ -48,13 +48,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// height on.
 pub const SUPPLY_HARDENING_ENV: &str = "CITRATE_SUPPLY_HARDENING_HEIGHT";
 
-/// Activation heights compiled into this release, per release chain id.
-///
-/// 40204: `None`, a release network with no height scheduled. OWNER STEP
-/// (release PR): replace `None` with `Some(H)` for the height agreed for the
-/// fleet, or `Some(0)` when the fork ships with a reroll's new genesis.
-pub const SUPPLY_HARDENING_PINS: &[(u64, Option<u64>)] = &[(40204, None)];
-
 const UNSET: u64 = u64::MAX;
 
 static SUPPLY_HARDENING_HEIGHT: AtomicU64 = AtomicU64::new(UNSET);
@@ -86,13 +79,11 @@ pub fn supply_hardening_active(height: u64) -> bool {
     active_at(supply_hardening_height(), height)
 }
 
-/// The pinned height for `chain_id`: `None` when the chain is not a release
-/// network, `Some(None)` when it is one with no height scheduled.
-pub fn pinned_for(chain_id: u64) -> Option<Option<u64>> {
-    SUPPLY_HARDENING_PINS
-        .iter()
-        .find(|(id, _)| *id == chain_id)
-        .map(|(_, h)| *h)
+/// The schedule for this rule on `chain_id` with block 0 `genesis`, from the shared
+/// (chain id, genesis hash) table (`citrate_consensus::hardening::genesis_rule_pin`). There is no
+/// per-chain pin table for this rule (scripts/ci/genesis_keyed_pins_tripwire.sh).
+pub fn pin_for_genesis(chain_id: u64, genesis: Option<&[u8; 32]>) -> Option<Option<u64>> {
+    citrate_consensus::hardening::genesis_rule_pin(chain_id, genesis, |a| a.supply_hardening)
 }
 
 /// Parse an env/config override. `Ok(None)` = explicitly off.
@@ -196,10 +187,10 @@ pub fn resolve(
     }
 }
 
-/// Resolve for the running chain (release pin, env override, config value)
-/// without publishing.
-pub fn resolve_for_chain(
+/// `resolve` with the genesis-keyed schedule and the process env.
+pub fn resolve_for_genesis(
     chain_id: u64,
+    genesis: Option<&[u8; 32]>,
     config_value: Option<u64>,
 ) -> Result<(Option<u64>, SupplyHardeningSource), String> {
     let env_raw = match std::env::var(SUPPLY_HARDENING_ENV) {
@@ -207,16 +198,21 @@ pub fn resolve_for_chain(
         Err(std::env::VarError::NotPresent) => None,
         Err(e) => return Err(format!("{SUPPLY_HARDENING_ENV}: {e}")),
     };
-    resolve(pinned_for(chain_id), env_raw.as_deref(), config_value)
+    resolve(
+        pin_for_genesis(chain_id, genesis),
+        env_raw.as_deref(),
+        config_value,
+    )
 }
 
-/// Resolve for the running chain and publish process-wide. The node calls this
-/// once at start-up, before constructing any execution component.
-pub fn init_for_chain(
+/// Resolve and publish process-wide. The node calls this once at start-up, after it
+/// knows its block 0 and before any component that captures the height exists.
+pub fn init_for_genesis(
     chain_id: u64,
+    genesis: Option<&[u8; 32]>,
     config_value: Option<u64>,
 ) -> Result<(Option<u64>, SupplyHardeningSource), String> {
-    let r = resolve_for_chain(chain_id, config_value)?;
+    let r = resolve_for_genesis(chain_id, genesis, config_value)?;
     set_supply_hardening_height(r.0);
     Ok(r)
 }
@@ -224,6 +220,25 @@ pub fn init_for_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// r1006's genesis schedules the rule from block 1 in the shared table; r1005's
+    /// genesis keeps it unset and refuses a per-node height; an unknown genesis is local.
+    #[test]
+    fn genesis_keyed_schedule_r1006_zero_r1005_unset_unknown_local() {
+        use citrate_consensus::hardening::{R1006_GENESIS, RELEASE_GENESIS};
+        assert_eq!(pin_for_genesis(40204, Some(&R1006_GENESIS)), Some(Some(0)));
+        assert_eq!(
+            pin_for_genesis(40204, Some(&RELEASE_GENESIS[0].1)),
+            Some(None)
+        );
+        assert!(resolve(
+            pin_for_genesis(40204, Some(&RELEASE_GENESIS[0].1)),
+            None,
+            Some(0)
+        )
+        .is_err());
+        assert_eq!(pin_for_genesis(40204, Some(&[0x42; 32])), None);
+    }
 
     #[test]
     fn unset_never_activates_and_genesis_is_never_rejudged() {
@@ -239,20 +254,57 @@ mod tests {
     #[test]
     fn chain_40204_ships_unscheduled_and_refuses_per_node_heights() {
         assert_eq!(
-            pinned_for(40204),
+            pin_for_genesis(
+                40204,
+                Some(&citrate_consensus::hardening::RELEASE_GENESIS[0].1)
+            ),
             Some(None),
             "40204 is a release network with no height scheduled"
         );
-        assert_eq!(pinned_for(1337), None, "devnet is not a release network");
         assert_eq!(
-            resolve(pinned_for(40204), None, None),
+            pin_for_genesis(1337, None),
+            None,
+            "devnet is not a release network"
+        );
+        assert_eq!(
+            resolve(
+                pin_for_genesis(
+                    40204,
+                    Some(&citrate_consensus::hardening::RELEASE_GENESIS[0].1)
+                ),
+                None,
+                None
+            ),
             Ok((None, SupplyHardeningSource::Unset))
         );
         // A per-node height on 40204 would fork that node: refused.
-        assert!(resolve(pinned_for(40204), Some("100"), None).is_err());
-        assert!(resolve(pinned_for(40204), None, Some(1)).is_err());
+        assert!(resolve(
+            pin_for_genesis(
+                40204,
+                Some(&citrate_consensus::hardening::RELEASE_GENESIS[0].1)
+            ),
+            Some("100"),
+            None
+        )
+        .is_err());
+        assert!(resolve(
+            pin_for_genesis(
+                40204,
+                Some(&citrate_consensus::hardening::RELEASE_GENESIS[0].1)
+            ),
+            None,
+            Some(1)
+        )
+        .is_err());
         assert_eq!(
-            resolve(pinned_for(40204), Some("off"), None),
+            resolve(
+                pin_for_genesis(
+                    40204,
+                    Some(&citrate_consensus::hardening::RELEASE_GENESIS[0].1)
+                ),
+                Some("off"),
+                None
+            ),
             Ok((None, SupplyHardeningSource::Unset))
         );
     }

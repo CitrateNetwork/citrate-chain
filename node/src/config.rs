@@ -249,7 +249,6 @@ pub struct ChainConfig {
     /// overrides it.
     #[serde(default)]
     pub exact_create_code_height: Option<u64>,
-
     /// Canonical ECVRF proof encoding activation height
     /// (`citrate_consensus::vrf_encoding`): from this height a block's ECVRF
     /// proof must carry its curve points in canonical compressed form.
@@ -260,7 +259,6 @@ pub struct ChainConfig {
     /// unless it equals the pin. Dev profiles set `0` (active from genesis).
     #[serde(default)]
     pub vrf_canonical_encoding_height: Option<u64>,
-
     /// Supply-accounting hardening fork activation height
     /// (`citrate_execution::supply_hardening`): from this height model-access
     /// and provider fees move through the per-transaction journal, and the
@@ -798,8 +796,8 @@ mod tests {
         let start = main.find("async fn start_node(").expect("start_node");
         let body = &main[start..];
         let init = body
-            .find("citrate_consensus::hardening::init_pba_hardening_for_chain(")
-            .expect("start_node must publish via init_pba_hardening_for_chain");
+            .find("citrate_consensus::hardening::init_pba_hardening_for_genesis(")
+            .expect("start_node must publish via init_pba_hardening_for_genesis (the chain pin unless the loaded genesis has its own)");
         // The pin-unaware resolver would skip the release pin.
         assert!(!body.contains("hardening::init_pba_hardening_height("));
         // The chain id the pin keys on is checked against CITRATE_CHAIN_ID first.
@@ -897,12 +895,12 @@ mod tests {
         let start = main.find("async fn start_node(").expect("start_node");
         let body = &main[start..];
         let init = body
-            .find("citrate_execution::exact_code::init_for_chain(")
+            .find("citrate_execution::exact_code::init_for_genesis(")
             .expect("start_node must publish the exact-created-code height");
         for ctor in [
             "GhostDag::new(",
             "Executor::with_storage_and_chain_id(",
-            "ConsensusManifest::for_height(",
+            "ConsensusManifest::for_node(",
         ] {
             let at = body
                 .find(ctor)
@@ -944,7 +942,7 @@ mod tests {
         for ctor in [
             "GhostDag::new(",
             "Executor::with_storage_and_chain_id(",
-            "ConsensusManifest::for_height(",
+            "ConsensusManifest::for_node(",
         ] {
             let at = body
                 .find(ctor)
@@ -968,6 +966,153 @@ mod tests {
         }
     }
 
+    /// The supply hardening fork height is published through its one resolver
+    /// before any execution component exists, there is no second publication
+    /// path, no shipped profile schedules it, and the key parses.
+    #[test]
+    fn supply_hardening_is_published_first_and_unset_in_every_shipped_profile() {
+        let main = include_str!("main.rs");
+        let start = main.find("async fn start_node(").expect("start_node");
+        let body = &main[start..];
+        let init = body
+            .find("citrate_execution::supply_hardening::init_for_genesis(")
+            .expect("start_node must publish the supply hardening height");
+        for ctor in [
+            "GhostDag::new(",
+            "Executor::with_storage_and_chain_id(",
+            "ConsensusManifest::for_node(",
+        ] {
+            let at = body
+                .find(ctor)
+                .unwrap_or_else(|| panic!("{ctor} in start_node"));
+            assert!(init < at, "supply hardening height published before {ctor}");
+        }
+        assert!(
+            !main.contains("set_supply_hardening_height("),
+            "one publication path"
+        );
+        assert_eq!(NodeConfig::default().chain.supply_hardening_height, None);
+        assert_eq!(NodeConfig::devnet().chain.supply_hardening_height, None);
+        for (name, text) in [
+            (
+                "node/config/devnet.toml",
+                include_str!("../config/devnet.toml"),
+            ),
+            (
+                "node/config/mainnet.toml",
+                include_str!("../config/mainnet.toml"),
+            ),
+            (
+                "node/config/testnet.toml",
+                include_str!("../config/testnet.toml"),
+            ),
+            (
+                "node/config/testnet-beta.toml",
+                include_str!("../config/testnet-beta.toml"),
+            ),
+            (
+                "node/config/team-testnet.toml",
+                include_str!("../config/team-testnet.toml"),
+            ),
+            (
+                "devnet-config.toml",
+                include_str!("../../devnet-config.toml"),
+            ),
+            (
+                "testnet-config.toml",
+                include_str!("../../testnet-config.toml"),
+            ),
+        ] {
+            assert!(
+                !text.contains("supply_hardening_height"),
+                "{name} must not schedule the supply hardening fork"
+            );
+        }
+        let base = include_str!("../config/devnet.toml");
+        let with = base.replacen("[chain]", "[chain]\nsupply_hardening_height = 12", 1);
+        let cfg: NodeConfig = toml::from_str(&with).expect("key parses");
+        assert_eq!(cfg.chain.supply_hardening_height, Some(12));
+    }
+
+    /// The storage-root hardening height is published through its one resolver
+    /// before state is hydrated or any execution component exists, there is no
+    /// second publication path, no shipped profile schedules it, and the key
+    /// parses (including `0` for a new genesis).
+    #[test]
+    fn storage_root_hardening_is_published_first_and_unset_in_every_shipped_profile() {
+        let main = include_str!("main.rs");
+        let start = main.find("async fn start_node(").expect("start_node");
+        let body = &main[start..];
+        let init = body
+            .find("citrate_execution::storage_root_hardening::init_for_genesis(")
+            .expect("start_node must publish the storage root hardening height");
+        for marker in [
+            "GhostDag::new(",
+            "Executor::with_storage_and_chain_id(",
+            "ConsensusManifest::for_node(",
+            "storage.state.get_all_storage()",
+        ] {
+            let at = body
+                .find(marker)
+                .unwrap_or_else(|| panic!("{marker} in start_node"));
+            assert!(
+                init < at,
+                "storage root hardening height published before {marker}"
+            );
+        }
+        assert!(
+            !main.contains("set_storage_root_hardening_height("),
+            "one publication path"
+        );
+        assert_eq!(
+            NodeConfig::default().chain.storage_root_hardening_height,
+            None
+        );
+        assert_eq!(
+            NodeConfig::devnet().chain.storage_root_hardening_height,
+            None
+        );
+        for (name, text) in [
+            (
+                "node/config/devnet.toml",
+                include_str!("../config/devnet.toml"),
+            ),
+            (
+                "node/config/mainnet.toml",
+                include_str!("../config/mainnet.toml"),
+            ),
+            (
+                "node/config/testnet.toml",
+                include_str!("../config/testnet.toml"),
+            ),
+            (
+                "node/config/testnet-beta.toml",
+                include_str!("../config/testnet-beta.toml"),
+            ),
+            (
+                "node/config/team-testnet.toml",
+                include_str!("../config/team-testnet.toml"),
+            ),
+            (
+                "devnet-config.toml",
+                include_str!("../../devnet-config.toml"),
+            ),
+            (
+                "testnet-config.toml",
+                include_str!("../../testnet-config.toml"),
+            ),
+        ] {
+            assert!(
+                !text.contains("storage_root_hardening_height"),
+                "{name} must not schedule the storage root hardening fork"
+            );
+        }
+        let base = include_str!("../config/devnet.toml");
+        let with = base.replacen("[chain]", "[chain]\nstorage_root_hardening_height = 0", 1);
+        let cfg: NodeConfig = toml::from_str(&with).expect("key parses");
+        assert_eq!(cfg.chain.storage_root_hardening_height, Some(0));
+    }
+
     /// The canonical VRF encoding height is published in start_node before
     /// the DAG store (which captures it through its selector) is built, from
     /// one publication path. Release profiles leave it to the release pin;
@@ -978,9 +1123,9 @@ mod tests {
         let start = main.find("async fn start_node(").expect("start_node");
         let body = &main[start..];
         let init = body
-            .find("citrate_consensus::vrf_encoding::init_for_chain(")
+            .find("citrate_consensus::vrf_encoding::init_for_genesis(")
             .expect("start_node must publish the canonical VRF encoding height");
-        for ctor in ["DagStore::", "ConsensusManifest::for_height("] {
+        for ctor in ["DagStore::", "ConsensusManifest::for_node("] {
             let at = body
                 .find(ctor)
                 .unwrap_or_else(|| panic!("{ctor} in start_node"));
@@ -1045,153 +1190,6 @@ mod tests {
                 "{name} schedules canonical VRF encoding from genesis"
             );
         }
-    }
-
-    /// The supply hardening fork height is published through its one resolver
-    /// before any execution component exists, there is no second publication
-    /// path, no shipped profile schedules it, and the key parses.
-    #[test]
-    fn supply_hardening_is_published_first_and_unset_in_every_shipped_profile() {
-        let main = include_str!("main.rs");
-        let start = main.find("async fn start_node(").expect("start_node");
-        let body = &main[start..];
-        let init = body
-            .find("citrate_execution::supply_hardening::init_for_chain(")
-            .expect("start_node must publish the supply hardening height");
-        for ctor in [
-            "GhostDag::new(",
-            "Executor::with_storage_and_chain_id(",
-            "ConsensusManifest::for_height(",
-        ] {
-            let at = body
-                .find(ctor)
-                .unwrap_or_else(|| panic!("{ctor} in start_node"));
-            assert!(init < at, "supply hardening height published before {ctor}");
-        }
-        assert!(
-            !main.contains("set_supply_hardening_height("),
-            "one publication path"
-        );
-        assert_eq!(NodeConfig::default().chain.supply_hardening_height, None);
-        assert_eq!(NodeConfig::devnet().chain.supply_hardening_height, None);
-        for (name, text) in [
-            (
-                "node/config/devnet.toml",
-                include_str!("../config/devnet.toml"),
-            ),
-            (
-                "node/config/mainnet.toml",
-                include_str!("../config/mainnet.toml"),
-            ),
-            (
-                "node/config/testnet.toml",
-                include_str!("../config/testnet.toml"),
-            ),
-            (
-                "node/config/testnet-beta.toml",
-                include_str!("../config/testnet-beta.toml"),
-            ),
-            (
-                "node/config/team-testnet.toml",
-                include_str!("../config/team-testnet.toml"),
-            ),
-            (
-                "devnet-config.toml",
-                include_str!("../../devnet-config.toml"),
-            ),
-            (
-                "testnet-config.toml",
-                include_str!("../../testnet-config.toml"),
-            ),
-        ] {
-            assert!(
-                !text.contains("supply_hardening_height"),
-                "{name} must not schedule the supply hardening fork"
-            );
-        }
-        let base = include_str!("../config/devnet.toml");
-        let with = base.replacen("[chain]", "[chain]\nsupply_hardening_height = 12", 1);
-        let cfg: NodeConfig = toml::from_str(&with).expect("key parses");
-        assert_eq!(cfg.chain.supply_hardening_height, Some(12));
-    }
-
-    /// The storage-root hardening height is published through its one resolver
-    /// before state is hydrated or any execution component exists, there is no
-    /// second publication path, no shipped profile schedules it, and the key
-    /// parses (including `0` for a new genesis).
-    #[test]
-    fn storage_root_hardening_is_published_first_and_unset_in_every_shipped_profile() {
-        let main = include_str!("main.rs");
-        let start = main.find("async fn start_node(").expect("start_node");
-        let body = &main[start..];
-        let init = body
-            .find("citrate_execution::storage_root_hardening::init_for_chain(")
-            .expect("start_node must publish the storage root hardening height");
-        for marker in [
-            "GhostDag::new(",
-            "Executor::with_storage_and_chain_id(",
-            "ConsensusManifest::for_height(",
-            "storage.state.get_all_storage()",
-        ] {
-            let at = body
-                .find(marker)
-                .unwrap_or_else(|| panic!("{marker} in start_node"));
-            assert!(
-                init < at,
-                "storage root hardening height published before {marker}"
-            );
-        }
-        assert!(
-            !main.contains("set_storage_root_hardening_height("),
-            "one publication path"
-        );
-        assert_eq!(
-            NodeConfig::default().chain.storage_root_hardening_height,
-            None
-        );
-        assert_eq!(
-            NodeConfig::devnet().chain.storage_root_hardening_height,
-            None
-        );
-        for (name, text) in [
-            (
-                "node/config/devnet.toml",
-                include_str!("../config/devnet.toml"),
-            ),
-            (
-                "node/config/mainnet.toml",
-                include_str!("../config/mainnet.toml"),
-            ),
-            (
-                "node/config/testnet.toml",
-                include_str!("../config/testnet.toml"),
-            ),
-            (
-                "node/config/testnet-beta.toml",
-                include_str!("../config/testnet-beta.toml"),
-            ),
-            (
-                "node/config/team-testnet.toml",
-                include_str!("../config/team-testnet.toml"),
-            ),
-            (
-                "devnet-config.toml",
-                include_str!("../../devnet-config.toml"),
-            ),
-            (
-                "testnet-config.toml",
-                include_str!("../../testnet-config.toml"),
-            ),
-        ] {
-            assert!(
-                !text.contains("storage_root_hardening_height"),
-                "{name} must not schedule the storage root hardening fork"
-            );
-        }
-        let base = include_str!("../config/devnet.toml");
-        let with = base.replacen("[chain]", "[chain]\nstorage_root_hardening_height = 0", 1);
-        let cfg: NodeConfig = toml::from_str(&with).expect("key parses");
-        assert_eq!(cfg.chain.storage_root_hardening_height, Some(0));
     }
 
     /// The new key parses, and a TOML without it keeps the fork unset.

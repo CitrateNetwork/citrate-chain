@@ -21,10 +21,10 @@
 //
 // RELEASE DEFAULT
 //
-//   * Chain 40204: the release pin is `None` (release network, not
-//     scheduled). An upgraded binary changes nothing on 40204 by itself; an
-//     env or config height there refuses to start. The owner schedules it by
-//     setting the pin in a release (a fresh genesis can pin `Some(0)`).
+//   * Scheduled per genesis in the shared (chain id, genesis hash) table
+//     (`hardening::GENESIS_ACTIVATIONS`): r1006's genesis is 0 (active from
+//     block 1). r1005's genesis on 40204 (and 40204 with no genesis known) is
+//     not scheduled, and an env or config height there refuses to start.
 //   * Any other chain: unset unless `[chain] vrf_canonical_encoding_height` or
 //     `CITRATE_VRF_CANONICAL_ENCODING_HEIGHT` sets it. The shipped devnet
 //     profiles set `0` (active from genesis).
@@ -42,14 +42,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// values disagree about the validity of a block whose proof is not in
 /// canonical form.
 pub const VRF_CANONICAL_ENCODING_ENV: &str = "CITRATE_VRF_CANONICAL_ENCODING_HEIGHT";
-
-/// Activation heights compiled into this release, per release chain id.
-///
-/// 40204: `None` — release network, not scheduled.
-///
-/// OWNER STEP (release PR): set `Some(H)` for 40204 once the fleet agrees on
-/// H, or `Some(0)` for a release that starts a fresh genesis.
-pub const VRF_CANONICAL_ENCODING_PINS: &[(u64, Option<u64>)] = &[(40204, None)];
 
 const UNSET: u64 = u64::MAX;
 
@@ -77,13 +69,11 @@ pub fn active_at(activation: Option<u64>, height: u64) -> bool {
     }
 }
 
-/// The pinned height for `chain_id`: `None` when the chain is not a release
-/// network, `Some(None)` when it is one with no height scheduled.
-pub fn pinned_for(chain_id: u64) -> Option<Option<u64>> {
-    VRF_CANONICAL_ENCODING_PINS
-        .iter()
-        .find(|(id, _)| *id == chain_id)
-        .map(|(_, h)| *h)
+/// The schedule for this rule on `chain_id` with block 0 `genesis`, from the shared
+/// (chain id, genesis hash) table (`crate::hardening::genesis_rule_pin`). There is no
+/// per-chain pin table for this rule (scripts/ci/genesis_keyed_pins_tripwire.sh).
+pub fn pin_for_genesis(chain_id: u64, genesis: Option<&[u8; 32]>) -> Option<Option<u64>> {
+    crate::hardening::genesis_rule_pin(chain_id, genesis, |a| a.vrf_canonical_encoding)
 }
 
 /// Parse an env/config override. `Ok(None)` = explicitly off.
@@ -187,10 +177,10 @@ pub fn resolve(
     }
 }
 
-/// Resolve for the running chain (release pin, env override, config value)
-/// without publishing.
-pub fn resolve_for_chain(
+/// `resolve` with the genesis-keyed schedule and the process env.
+pub fn resolve_for_genesis(
     chain_id: u64,
+    genesis: Option<&[u8; 32]>,
     config_value: Option<u64>,
 ) -> Result<(Option<u64>, VrfEncodingSource), String> {
     let env_raw = match std::env::var(VRF_CANONICAL_ENCODING_ENV) {
@@ -198,16 +188,21 @@ pub fn resolve_for_chain(
         Err(std::env::VarError::NotPresent) => None,
         Err(e) => return Err(format!("{VRF_CANONICAL_ENCODING_ENV}: {e}")),
     };
-    resolve(pinned_for(chain_id), env_raw.as_deref(), config_value)
+    resolve(
+        pin_for_genesis(chain_id, genesis),
+        env_raw.as_deref(),
+        config_value,
+    )
 }
 
-/// Resolve for the running chain and publish process-wide. The node calls
-/// this once at start-up, before constructing any consensus component.
-pub fn init_for_chain(
+/// Resolve and publish process-wide. The node calls this once at start-up, after it
+/// knows its block 0 and before any component that captures the height exists.
+pub fn init_for_genesis(
     chain_id: u64,
+    genesis: Option<&[u8; 32]>,
     config_value: Option<u64>,
 ) -> Result<(Option<u64>, VrfEncodingSource), String> {
-    let r = resolve_for_chain(chain_id, config_value)?;
+    let r = resolve_for_genesis(chain_id, genesis, config_value)?;
     set_vrf_canonical_encoding_height(r.0);
     Ok(r)
 }
@@ -229,21 +224,48 @@ mod tests {
 
     #[test]
     fn chain_40204_ships_unscheduled() {
+        // r1006's genesis (the shared table) schedules it from block 1.
         assert_eq!(
-            pinned_for(40204),
+            pin_for_genesis(40204, Some(&crate::hardening::R1006_GENESIS)),
+            Some(Some(0))
+        );
+        assert_eq!(
+            pin_for_genesis(40204, Some(&crate::hardening::RELEASE_GENESIS[0].1)),
             Some(None),
             "40204 is a release network with no height scheduled"
         );
-        assert_eq!(pinned_for(1337), None, "devnet is not a release network");
         assert_eq!(
-            resolve(pinned_for(40204), None, None),
+            pin_for_genesis(1337, None),
+            None,
+            "devnet is not a release network"
+        );
+        assert_eq!(
+            resolve(
+                pin_for_genesis(40204, Some(&crate::hardening::RELEASE_GENESIS[0].1)),
+                None,
+                None
+            ),
             Ok((None, VrfEncodingSource::Unset))
         );
         // A per-node height on 40204 refuses to start; `off` is accepted.
-        assert!(resolve(pinned_for(40204), Some("0"), None).is_err());
-        assert!(resolve(pinned_for(40204), None, Some(0)).is_err());
+        assert!(resolve(
+            pin_for_genesis(40204, Some(&crate::hardening::RELEASE_GENESIS[0].1)),
+            Some("0"),
+            None
+        )
+        .is_err());
+        assert!(resolve(
+            pin_for_genesis(40204, Some(&crate::hardening::RELEASE_GENESIS[0].1)),
+            None,
+            Some(0)
+        )
+        .is_err());
         assert_eq!(
-            resolve(pinned_for(40204), Some("off"), None),
+            resolve(
+                pin_for_genesis(40204, Some(&crate::hardening::RELEASE_GENESIS[0].1)),
+                Some("off"),
+                None
+            ),
             Ok((None, VrfEncodingSource::Unset))
         );
     }

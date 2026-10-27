@@ -297,6 +297,18 @@ enum Commands {
         json: bool,
     },
 
+    /// Print this host's proof of key control for the r1006 genesis producer set: the
+    /// proposer key's signature over the ValidatorRegistry registration digest (chain id,
+    /// registry, staker, nonce 0). Public values only; the key is never printed.
+    RegistrationProof {
+        /// The ValidatorRegistry the genesis registers producers in.
+        #[arg(long)]
+        registry: String,
+        /// The staker (must be this node's coinbase; defaults to it).
+        #[arg(long)]
+        staker: Option<String>,
+    },
+
     /// Roll this node's stored chain back to a height. Run it with the node
     /// stopped. Removes every block above --to-height and any other block at
     /// it, keeps --keep there, and refuses the removed branch from peers from
@@ -319,25 +331,6 @@ enum Commands {
         /// node then rebuilds its state from genesis at the next start.
         #[arg(long)]
         rebuild_state: bool,
-    },
-
-    /// Producer onboarding: print this node's proposer pubkey and, with
-    /// --staker/--registry/--nonce, the ed25519 half of a ValidatorRegistry
-    /// registration (the signed Register digest and the registerValidator
-    /// calldata) as JSON. Reads <data_dir>/proposer.key read-only, never mints
-    /// or prints it, and never touches a staker key: the operator signs the
-    /// transaction with their own wallet. See scripts/producers/README.md.
-    RegistrationProof {
-        /// Staker address (msg.sender of registerValidator; must equal the
-        /// node's [mining] coinbase).
-        #[arg(long, value_name = "ADDR", requires_all = ["registry", "nonce"])]
-        staker: Option<String>,
-        /// ValidatorRegistry address for this network.
-        #[arg(long, value_name = "ADDR", requires = "staker")]
-        registry: Option<String>,
-        /// ValidatorRegistry.registrationNonce(staker), read from public RPC.
-        #[arg(long, value_name = "N", requires = "staker")]
-        nonce: Option<u64>,
     },
 
     /// Wallet management (accounts, balances, transfers)
@@ -493,6 +486,29 @@ async fn main() -> Result<()> {
             .await?;
             return Ok(());
         }
+        Some(Commands::RegistrationProof { registry, staker }) => {
+            let cfg_path = resolve_config_path(cli.config.clone()).ok_or_else(|| {
+                anyhow::anyhow!("registration-proof needs the node config (--config)")
+            })?;
+            let cfg = NodeConfig::from_file(&cfg_path)?;
+            let coinbase = format!(
+                "0x{}",
+                cfg.mining
+                    .coinbase
+                    .trim()
+                    .trim_start_matches("0x")
+                    .to_lowercase()
+            );
+            let staker = staker.unwrap_or_else(|| coinbase.clone());
+            if staker.to_lowercase() != coinbase {
+                anyhow::bail!("the staker must be this node's coinbase {coinbase} (consensus requires coinbase == staker)");
+            }
+            let data_dir = cli.data_dir.clone().unwrap_or(cfg.storage.data_dir.clone());
+            let key = registration_proof::load_proposer_key(&data_dir.join("proposer.key"))?;
+            let p = registration_proof::proof(cfg.chain.chain_id, &registry, &staker, &key)?;
+            println!("{}", serde_json::to_string_pretty(&p)?);
+            return Ok(());
+        }
         Some(Commands::Keygen { ed25519 }) => {
             generate_keypair(ed25519);
             return Ok(());
@@ -523,43 +539,55 @@ async fn main() -> Result<()> {
                 None => (40204, None, false, None, None, None, None),
             };
             let chain_id = cli.chain_id.unwrap_or(cfg_chain_id);
-            let resolved = citrate_consensus::hardening::resolve_pba_hardening_for_chain(
+            // The genesis this node runs: the data directory's block 0 when it can be read
+            // (not while the node holds the database), else the compiled r1006 genesis for
+            // an r1006 config, else unknown (a release chain id then resolves as its
+            // release genesis, every rule unset).
+            let profile = file_cfg
+                .as_ref()
+                .and_then(|c| c.chain.genesis_profile.clone());
+            let from_data_dir: Option<[u8; 32]> = file_cfg.as_ref().and_then(|c| {
+                StorageManager::new(&c.storage.data_dir, PruningConfig::default())
+                    .ok()
+                    .and_then(|st| st.blocks.get_block_by_height(0).ok().flatten())
+                    .map(|h| *h.as_bytes())
+            });
+            let cmd_genesis: Option<[u8; 32]> = from_data_dir.or_else(|| {
+                (profile.as_deref() == Some(genesis::R1006_PROFILE))
+                    .then_some(citrate_consensus::hardening::R1006_GENESIS)
+            });
+            let g = cmd_genesis.as_ref();
+            // Publish every height exactly as start_node does, then report the ONE
+            // manifest a node reports (ConsensusManifest::for_node).
+            let acts = g.and_then(|g| citrate_consensus::hardening::rules_for_genesis(chain_id, g));
+            citrate_consensus::hardening::init_pba_hardening_for_genesis(
                 chain_id,
+                acts.as_ref(),
                 configured,
                 dev_profile,
             )
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let (agent_height, _) =
-                citrate_execution::agent_fork::resolve_for_chain(chain_id, agent_configured)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let (exact_height, _) =
-                citrate_execution::exact_code::resolve_for_chain(chain_id, exact_configured)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-            // Same resolution as start_node for the canonical VRF encoding
-            // height; the manifest reads it from the process store.
-            citrate_consensus::vrf_encoding::init_for_chain(
+            citrate_execution::agent_fork::init_for_chain(chain_id, agent_configured)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            citrate_execution::exact_code::init_for_genesis(chain_id, g, exact_configured)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            citrate_consensus::vrf_encoding::init_for_genesis(
                 chain_id,
+                g,
                 file_cfg
                     .as_ref()
                     .and_then(|c| c.chain.vrf_canonical_encoding_height),
             )
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let (supply_height, _) =
-                citrate_execution::supply_hardening::resolve_for_chain(chain_id, supply_configured)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let (storage_root_height, _) =
-                citrate_execution::storage_root_hardening::resolve_for_chain(
-                    chain_id,
-                    storage_root_configured,
-                )
+            citrate_execution::supply_hardening::init_for_genesis(chain_id, g, supply_configured)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let manifest = consensus_manifest::ConsensusManifest::for_release_heights(
-                resolved.height,
-                agent_height,
-                exact_height,
-                supply_height,
-                storage_root_height,
-            );
+            citrate_execution::storage_root_hardening::init_for_genesis(
+                chain_id,
+                g,
+                storage_root_configured,
+            )
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let manifest = consensus_manifest::ConsensusManifest::for_node(profile.as_deref(), g);
             // The activation heights compiled into this release (a node on a
             // pinned chain runs that height; see the start-up banner for the
             // height a configured node resolved).
@@ -571,6 +599,13 @@ async fn main() -> Result<()> {
                 let mut v = serde_json::to_value(&manifest).unwrap_or_default();
                 if let Some(obj) = v.as_object_mut() {
                     obj.insert("pba_hardening_pins".into(), serde_json::Value::Array(pins));
+                    obj.insert(
+                        "r1006_genesis".into(),
+                        serde_json::Value::String(format!(
+                            "0x{}",
+                            hex::encode(citrate_consensus::hardening::R1006_GENESIS)
+                        )),
+                    );
                 }
                 println!(
                     "{}",
@@ -631,48 +666,6 @@ async fn main() -> Result<()> {
                 dry_run,
                 rebuild_state,
             )?;
-            return Ok(());
-        }
-        Some(Commands::RegistrationProof {
-            staker,
-            registry,
-            nonce,
-        }) => {
-            // The config is read only for what the flags don't give: the data dir,
-            // and the chain id when a proof is requested.
-            let need_chain = staker.is_some() && cli.chain_id.is_none();
-            let file_cfg = if cli.data_dir.is_none() || need_chain {
-                resolve_config_path(cli.config.clone())
-                    .map(|p| NodeConfig::from_file(&p))
-                    .transpose()?
-            } else {
-                None
-            };
-            let data_dir = cli
-                .data_dir
-                .clone()
-                .or_else(|| file_cfg.as_ref().map(|c| c.storage.data_dir.clone()))
-                .ok_or_else(|| {
-                    anyhow::anyhow!("no node config found; pass --config or --data-dir")
-                })?;
-            let key = registration_proof::read_proposer_key(&data_dir.join("proposer.key"))?;
-            let out = match (staker, registry, nonce) {
-                (Some(staker), Some(registry), Some(nonce)) => {
-                    let chain_id = cli
-                        .chain_id
-                        .or_else(|| file_cfg.as_ref().map(|c| c.chain.chain_id))
-                        .ok_or_else(|| anyhow::anyhow!("pass --chain-id or --config"))?;
-                    let staker = registration_proof::parse_address(&staker)?;
-                    let registry = registration_proof::parse_address(&registry)?;
-                    serde_json::to_value(registration_proof::build(
-                        chain_id, &registry, &staker, nonce, &key,
-                    )?)?
-                }
-                _ => serde_json::json!({
-                    "proposer_pubkey": registration_proof::pubkey_hex(&key),
-                }),
-            };
-            println!("{}", serde_json::to_string_pretty(&out)?);
             return Ok(());
         }
         Some(Commands::Wallet {
@@ -860,6 +853,9 @@ async fn main() -> Result<()> {
         };
 
         let genesis_profile = config.chain.genesis_profile.as_deref();
+        if genesis_profile == Some(genesis::R1006_PROFILE) {
+            genesis::check_r1006_bootable(genesis::r1006_rehearsal_from_env())?;
+        }
         genesis::initialize_genesis_state_with_profile(
             probe_storage,
             executor,
@@ -1499,6 +1495,60 @@ fn parse_storage_key_hex(hex_str: &str, source: &str) -> Result<zeroize::Zeroizi
 
 async fn start_node(config: NodeConfig) -> Result<()> {
     info!("Starting Citrate node...");
+    // Rules compiled for THIS chain's block 0 (keyed by genesis hash, not chain id: r1005
+    // and r1006 share 40204). Read before any consensus or execution component exists.
+    let running_genesis: Option<[u8; 32]> = {
+        let probe = StorageManager::with_config(
+            &config.storage.data_dir,
+            StorageConfig {
+                pruning: PruningConfig::default(),
+                encryption: at_rest_encryption_from_env()?,
+            },
+        )?;
+        let g = probe
+            .blocks
+            .get_block_by_height(0)
+            .ok()
+            .flatten()
+            .map(|h| *h.as_bytes());
+        drop(probe);
+        g
+    };
+    let genesis_acts = running_genesis
+        .and_then(|g| citrate_consensus::hardening::rules_for_genesis(config.chain.chain_id, &g));
+    genesis::r1006_boot_guard(
+        config.chain.chain_id,
+        config.chain.genesis_profile.as_deref(),
+        running_genesis.as_ref(),
+        &citrate_economics::r1006::readiness()
+            .map_err(|e| anyhow::anyhow!("invalid r1006 genesis: {e}"))?,
+        genesis::r1006_rehearsal_from_env(),
+    )?;
+    let on_demand = producer::check_mine_on_demand(
+        std::env::var(producer::MINE_ON_DEMAND_ENV).ok().as_deref(),
+        config.chain.genesis_profile.as_deref(),
+        config.rpc.listen_addr.ip().is_loopback(),
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
+    producer::set_mine_on_demand(on_demand);
+    if on_demand {
+        warn!("Build devnet: blocks are produced only when a transaction is pending");
+    }
+    if let Some(a) = &genesis_acts {
+        for (name, h) in a.entries() {
+            let wired = citrate_consensus::hardening::GenesisActivations::WIRED.contains(&name);
+            info!(
+                "Genesis-pinned rule {name}: {} ({})",
+                h.map(|h| format!("from height {h}"))
+                    .unwrap_or_else(|| "not scheduled".into()),
+                if wired {
+                    "enforced by this build"
+                } else {
+                    "recorded; the rule is not in this build"
+                }
+            );
+        }
+    }
     // HUP-S7.2: the agent precompile fork height, published before any
     // execution component is built. 40204 pins it at genesis (active from
     // block 1); other chains are off unless env or config sets a height. On a
@@ -1524,8 +1574,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // built. Unset by default on every chain (the padded legacy form, as the
     // previous binary); a new genesis sets 0 through `[chain]
     // exact_create_code_height` or the env override.
-    let (exact_code_height, exact_code_source) = citrate_execution::exact_code::init_for_chain(
+    let (exact_code_height, exact_code_source) = citrate_execution::exact_code::init_for_genesis(
         config.chain.chain_id,
+        running_genesis.as_ref(),
         config.chain.exact_create_code_height,
     )
     .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -1545,8 +1596,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // in this release; a disagreeing env or config value on a release network
     // aborts start-up instead of forking this node at the height.
     let (vrf_encoding_height, vrf_encoding_source) =
-        citrate_consensus::vrf_encoding::init_for_chain(
+        citrate_consensus::vrf_encoding::init_for_genesis(
             config.chain.chain_id,
+            running_genesis.as_ref(),
             config.chain.vrf_canonical_encoding_height,
         )
         .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -1563,8 +1615,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // Supply-accounting hardening fork height, published before any execution
     // component is built. Not scheduled on 40204 until a release pins it; on a
     // release network a disagreeing env or config value aborts start-up.
-    let (supply_height, supply_source) = citrate_execution::supply_hardening::init_for_chain(
+    let (supply_height, supply_source) = citrate_execution::supply_hardening::init_for_genesis(
         config.chain.chain_id,
+        running_genesis.as_ref(),
         config.chain.supply_hardening_height,
     )
     .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -1583,8 +1636,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // a release pins it; on a release network a disagreeing env or config value
     // aborts start-up.
     let (storage_root_height, storage_root_source) =
-        citrate_execution::storage_root_hardening::init_for_chain(
+        citrate_execution::storage_root_hardening::init_for_genesis(
             config.chain.chain_id,
+            running_genesis.as_ref(),
             config.chain.storage_root_hardening_height,
         )
         .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -1599,32 +1653,6 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         ),
     }
 
-    {
-        // Consensus-alignment stamp — logged at boot so field drift is diagnosable
-        // from the journal (the app node and fleet MUST share this fingerprint).
-        // The fingerprint covers the activation height this node will run
-        // with (release pin for the chain, env override, [chain] key).
-        let m = consensus_manifest::ConsensusManifest::for_height(
-            citrate_consensus::hardening::resolve_pba_hardening_for_chain(
-                config.chain.chain_id,
-                config.chain.pba_hardening_height,
-                config.chain.dev_profile,
-            )
-            .ok()
-            .and_then(|r| r.height),
-        );
-        info!(
-            "Consensus manifest: git={}{} halo2={} pba_hardening_height={:?} fingerprint={}",
-            m.git_sha,
-            if m.git_dirty { "(DIRTY)" } else { "" },
-            m.feat_halo2_verifier,
-            m.pba_hardening_height,
-            m.fingerprint
-        );
-        if m.git_dirty {
-            warn!("Node built from a DIRTY tree — not reproducibly aligned with the fleet");
-        }
-    }
     info!("Chain ID: {}", config.chain.chain_id);
     info!("Data directory: {:?}", config.storage.data_dir);
 
@@ -1641,17 +1669,38 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         std::env::var("CITRATE_CHAIN_ID").ok().as_deref(),
     )
     .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let node_manifest: Option<consensus_manifest::ConsensusManifest>;
     let pba_activation = {
         // ONE store, ONE resolution order (release pin for the chain, then
         // env override, then [chain] key): consensus, network and execution
         // (`citrate_execution::activation`) all read what this publishes.
-        let pba = citrate_consensus::hardening::init_pba_hardening_for_chain(
+        let pba = citrate_consensus::hardening::init_pba_hardening_for_genesis(
             config.chain.chain_id,
+            genesis_acts.as_ref(),
             config.chain.pba_hardening_height,
             config.chain.dev_profile,
         )
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-        let fp = consensus_manifest::ConsensusManifest::current().fingerprint;
+        // Consensus-alignment stamp. ONE manifest for the boot log, the node-identity RPC
+        // and `citrate consensus` (ConsensusManifest::for_node): every height is read from
+        // its process store, all published above, and it is bound to the loaded genesis.
+        let manifest = consensus_manifest::ConsensusManifest::for_node(
+            config.chain.genesis_profile.as_deref(),
+            running_genesis.as_ref(),
+        );
+        info!(
+            "Consensus manifest: git={}{} halo2={} pba_hardening_height={:?} fingerprint={}",
+            manifest.git_sha,
+            if manifest.git_dirty { "(DIRTY)" } else { "" },
+            manifest.feat_halo2_verifier,
+            manifest.pba_hardening_height,
+            manifest.fingerprint
+        );
+        if manifest.git_dirty {
+            warn!("Node built from a DIRTY tree — not reproducibly aligned with the fleet");
+        }
+        let fp = manifest.fingerprint.clone();
+        node_manifest = Some(manifest);
         match pba.height {
             Some(h) => info!(
                 "Block-validity hardening ACTIVE from height {} [{}] (tx signature + \
@@ -2176,23 +2225,23 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // enforces stake-gated proposer membership — a shared selector is attached to the DAG
     // store (admission gate) and rebuilt each epoch from the registry (registry_sync).
     // OFF by default (env unset) → no selector, no behavior change.
-    let validator_registry: Option<([u8; 20], u64)> = std::env::var("CITRATE_VALIDATOR_REGISTRY")
-        .ok()
-        .and_then(|reg_hex| match hex::decode(reg_hex.trim().trim_start_matches("0x")) {
-            Ok(bytes) if bytes.len() == 20 => {
-                let mut registry = [0u8; 20];
-                registry.copy_from_slice(&bytes);
-                let activation_height = std::env::var("CITRATE_VALIDATOR_ACTIVATION_HEIGHT")
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u64>().ok())
-                    .unwrap_or(0);
-                Some((registry, activation_height))
-            }
-            _ => {
-                warn!("CITRATE_VALIDATOR_REGISTRY set but not a valid 0x-hex 20-byte address; stake-gating DISABLED");
-                None
-            }
-        });
+    // On the r1006 genesis with its producer set filled, the registry and the activation
+    // height are compiled into the genesis profile (genesis::resolve_validator_registry);
+    // the env may only repeat them. On any other chain the env decides, as before.
+    let compiled_validator_set =
+        if running_genesis == Some(citrate_consensus::hardening::R1006_GENESIS) {
+            citrate_economics::r1006::validator_set_binding()
+                .map_err(|e| anyhow::anyhow!("invalid r1006 genesis: {e}"))?
+        } else {
+            None
+        };
+    let validator_registry: Option<([u8; 20], u64)> = genesis::resolve_validator_registry(
+        compiled_validator_set,
+        std::env::var("CITRATE_VALIDATOR_REGISTRY").ok().as_deref(),
+        std::env::var("CITRATE_VALIDATOR_ACTIVATION_HEIGHT")
+            .ok()
+            .as_deref(),
+    )?;
     // VALIDATOR-S1 §R': fail fast if the activation height is below the FIRST
     // materialized snapshot S(1) = EPOCH - SNAPSHOT_LAG (= 800). Below S(1) no epoch
     // policy is ever materialized, so — with the §R' hard-reject — every block at/above
@@ -4258,7 +4307,13 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // were published), the activation fingerprint from the resolved PBA
             // activation, and the GhostDAG params the shared GhostDag runs with.
             Some({
-                let manifest = consensus_manifest::ConsensusManifest::current();
+                // The same manifest the boot log printed (for_node, bound to this genesis).
+                let manifest = node_manifest.clone().unwrap_or_else(|| {
+                    consensus_manifest::ConsensusManifest::for_node(
+                        config.chain.genesis_profile.as_deref(),
+                        running_genesis.as_ref(),
+                    )
+                });
                 citrate_api::NodeIdentity {
                     version: manifest.version.to_string(),
                     git_sha: manifest.git_sha.to_string(),

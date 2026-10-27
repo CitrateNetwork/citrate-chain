@@ -77,6 +77,146 @@ impl Default for GenesisConfig {
     }
 }
 
+/// The genesis profile whose block 0 holds the ceremony's contracts (r1006).
+pub const R1006_PROFILE: &str = "r1006";
+
+/// Rehearsal opt-in: lets a node create or run an r1006 genesis that still has
+/// placeholders (ceremony inputs, producer set, OrangeSeed). Never set on a network node.
+pub const R1006_REHEARSAL_ENV: &str = "CITRATE_R1006_REHEARSAL";
+
+/// Fail closed on an r1006 genesis that is not release-ready. `allow_rehearsal` is the
+/// explicit opt-in (`CITRATE_R1006_REHEARSAL=1`); without it every missing piece is named
+/// and the node refuses to start.
+pub fn check_r1006_bootable(allow_rehearsal: bool) -> anyhow::Result<()> {
+    let r = citrate_economics::r1006::readiness()
+        .map_err(|e| anyhow::anyhow!("invalid r1006 genesis: {e}"))?;
+    if r.is_release_ready() {
+        return Ok(());
+    }
+    let missing = r.missing().join("; ");
+    if allow_rehearsal {
+        tracing::warn!(
+            "r1006 REHEARSAL genesis ({R1006_REHEARSAL_ENV}=1): not release-ready: {missing}"
+        );
+        return Ok(());
+    }
+    anyhow::bail!(
+        "the r1006 genesis in this build is not release-ready: {missing}. It must not start a \
+         network. For a local rehearsal only, set {R1006_REHEARSAL_ENV}=1."
+    )
+}
+
+/// The start-up guard for the genesis a node is about to run (pure, so it is unit
+/// tested): `running` is the data directory's block 0.
+///
+/// * profile `r1006` with another (or no) block 0: refused (a fresh data directory is
+///   needed; the r1006 rules would not apply to that genesis);
+/// * the r1006 block 0 on another chain id: refused;
+/// * the r1006 block 0 that is not release-ready: refused unless `rehearsal`;
+/// * any other genesis: not this guard's concern (an unknown genesis gets no
+///   genesis-keyed rule, see `citrate_consensus::hardening::genesis_rule_pin`).
+pub fn r1006_boot_guard(
+    chain_id: u64,
+    profile: Option<&str>,
+    running: Option<&[u8; 32]>,
+    readiness: &citrate_economics::r1006::Readiness,
+    rehearsal: bool,
+) -> anyhow::Result<()> {
+    let r1006 = citrate_consensus::hardening::R1006_GENESIS;
+    let is_r1006 = running == Some(&r1006);
+    if profile == Some(R1006_PROFILE) && !is_r1006 {
+        anyhow::bail!(
+            "[chain] genesis_profile = \"r1006\" but this data directory's block 0 ({}) is not \
+             the r1006 genesis this build compiles ({}). Use a fresh data directory.",
+            running.map(hex::encode).unwrap_or_else(|| "missing".into()),
+            hex::encode(r1006)
+        );
+    }
+    if !is_r1006 {
+        return Ok(());
+    }
+    if chain_id != 40204 {
+        anyhow::bail!("the r1006 genesis runs only on chain 40204 (configured: {chain_id})");
+    }
+    if readiness.is_release_ready() {
+        return Ok(());
+    }
+    let missing = readiness.missing().join("; ");
+    if rehearsal {
+        tracing::warn!(
+            "r1006 REHEARSAL genesis ({R1006_REHEARSAL_ENV}=1): not release-ready: {missing}"
+        );
+        return Ok(());
+    }
+    anyhow::bail!(
+        "the r1006 genesis in this build is not release-ready: {missing}. It must not start a \
+         network. For a local rehearsal only, set {R1006_REHEARSAL_ENV}=1."
+    )
+}
+
+/// The ValidatorRegistry and activation height a node enforces. On the r1006 genesis with
+/// its producer set filled, both are compiled (`compiled`): the env values
+/// `CITRATE_VALIDATOR_REGISTRY` / `CITRATE_VALIDATOR_ACTIVATION_HEIGHT` may only repeat
+/// them, and anything else refuses to start (a per-node value would split the fleet's
+/// view of who may propose). Otherwise (`compiled` = None) the env decides, as before.
+pub fn resolve_validator_registry(
+    compiled: Option<([u8; 20], u64)>,
+    env_registry: Option<&str>,
+    env_activation: Option<&str>,
+) -> anyhow::Result<Option<([u8; 20], u64)>> {
+    let parse_reg = |raw: &str| -> anyhow::Result<[u8; 20]> {
+        let b = hex::decode(raw.trim().trim_start_matches("0x"))
+            .map_err(|e| anyhow::anyhow!("CITRATE_VALIDATOR_REGISTRY {raw}: {e}"))?;
+        <[u8; 20]>::try_from(b.as_slice())
+            .map_err(|_| anyhow::anyhow!("CITRATE_VALIDATOR_REGISTRY {raw}: not 20 bytes"))
+    };
+    let parse_act = |raw: &str| -> anyhow::Result<u64> {
+        raw.trim()
+            .parse::<u64>()
+            .map_err(|e| anyhow::anyhow!("CITRATE_VALIDATOR_ACTIVATION_HEIGHT {raw}: {e}"))
+    };
+    match compiled {
+        Some((reg, act)) => {
+            if let Some(raw) = env_registry {
+                if parse_reg(raw)? != reg {
+                    anyhow::bail!(
+                        "CITRATE_VALIDATOR_REGISTRY={raw} is not the ValidatorRegistry the r1006 \
+                         genesis compiles (0x{}); remove it",
+                        hex::encode(reg)
+                    );
+                }
+            }
+            if let Some(raw) = env_activation {
+                if parse_act(raw)? != act {
+                    anyhow::bail!(
+                        "CITRATE_VALIDATOR_ACTIVATION_HEIGHT={raw} is not the r1006 genesis's \
+                         compiled activation height {act}; remove it"
+                    );
+                }
+            }
+            Ok(Some((reg, act)))
+        }
+        None => match env_registry {
+            None => Ok(None),
+            Some(raw) => {
+                let reg = parse_reg(raw)?;
+                let act = env_activation.map(parse_act).transpose()?.unwrap_or(0);
+                Ok(Some((reg, act)))
+            }
+        },
+    }
+}
+
+/// Whether the rehearsal opt-in is set in the environment (exactly `1`).
+pub fn r1006_rehearsal_from_env() -> bool {
+    parse_r1006_rehearsal(std::env::var(R1006_REHEARSAL_ENV).ok().as_deref())
+}
+
+/// The opt-in value: exactly `1`; anything else (unset, empty, `true`, ` 1`) is off.
+pub fn parse_r1006_rehearsal(v: Option<&str>) -> bool {
+    v == Some("1")
+}
+
 /// Create genesis block
 pub fn create_genesis_block(config: &GenesisConfig) -> Block {
     shared_genesis::create_canonical_genesis_block(config.timestamp)
@@ -124,6 +264,11 @@ pub async fn initialize_genesis_state_with_profile(
         Some("mainnet") => {
             tracing::info!("Using mainnet genesis profile");
             EconomicsGenesisConfig::mainnet()
+        }
+        Some(R1006_PROFILE) => {
+            tracing::info!("Using r1006 genesis profile (genesis from ceremony state)");
+            EconomicsGenesisConfig::r1006()
+                .map_err(|e| anyhow::anyhow!("invalid r1006 genesis: {e}"))?
         }
         _ => {
             // Backward compatible: infer from chain_id
@@ -201,6 +346,137 @@ pub async fn initialize_genesis_with_dag(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn build_profile(chain_id: u64, profile: Option<&str>) -> anyhow::Result<[u8; 32]> {
+        use citrate_execution::StateDB;
+        use citrate_storage::pruning::PruningConfig;
+        let dir = tempfile::tempdir()?;
+        let st = Arc::new(StorageManager::new(dir.path(), PruningConfig::default())?);
+        let ex = Arc::new(Executor::with_storage_and_chain_id(
+            Arc::new(StateDB::new()),
+            Some(st.state.clone()),
+            chain_id,
+        ));
+        let cfg = GenesisConfig {
+            chain_id,
+            ..Default::default()
+        };
+        let h = initialize_genesis_state_with_profile(st, ex, &cfg, profile).await?;
+        Ok(*h.as_bytes())
+    }
+
+    #[test]
+    fn r1006_boot_guard_cases() {
+        use citrate_economics::r1006::Readiness;
+        let r1006 = citrate_consensus::hardening::R1006_GENESIS;
+        let r1005 = citrate_consensus::hardening::RELEASE_GENESIS[0].1;
+        let unknown = [0x42u8; 32];
+        let ready = Readiness {
+            inputs_final: true,
+            validators_final: true,
+            orangeseed_present: true,
+        };
+        let not_ready = Readiness {
+            validators_final: false,
+            ..ready.clone()
+        };
+        let g =
+            |p, run: Option<&[u8; 32]>, r: &Readiness, reh| r1006_boot_guard(40204, p, run, r, reh);
+        // Release-ready r1006: boots without the opt-in.
+        assert!(g(Some("r1006"), Some(&r1006), &ready, false).is_ok());
+        // Not release-ready: refused, naming what is missing, unless it is a rehearsal.
+        let e = g(Some("r1006"), Some(&r1006), &not_ready, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("not release-ready") && e.contains("producer set"),
+            "{e}"
+        );
+        assert!(g(Some("r1006"), Some(&r1006), &not_ready, true).is_ok());
+        // The r1006 block 0 is guarded whatever the configured profile says.
+        assert!(g(None, Some(&r1006), &not_ready, false).is_err());
+        // Profile r1006 on another genesis (r1005's, an unknown one, none): refused.
+        for run in [Some(&r1005), Some(&unknown), None] {
+            let e = g(Some("r1006"), run, &ready, true).unwrap_err().to_string();
+            assert!(e.contains("is not the r1006 genesis"), "{e}");
+        }
+        // Another profile on another genesis: not this guard's concern.
+        assert!(g(Some("testnet_beta"), Some(&r1005), &not_ready, false).is_ok());
+        assert!(g(Some("default"), Some(&unknown), &not_ready, false).is_ok());
+        // The r1006 block 0 on another chain id: refused.
+        assert!(r1006_boot_guard(1337, Some("r1006"), Some(&r1006), &ready, false).is_err());
+    }
+
+    #[test]
+    fn the_r1006_validator_set_is_compiled_not_per_node() {
+        let reg = [0xAB; 20];
+        let hex_reg = format!("0x{}", hex::encode(reg));
+        let c = Some((reg, 1_000));
+        assert_eq!(resolve_validator_registry(c, None, None).unwrap(), c);
+        assert_eq!(
+            resolve_validator_registry(c, Some(&hex_reg), Some("1000")).unwrap(),
+            c
+        );
+        assert!(resolve_validator_registry(c, Some("0x".to_owned().as_str()), None).is_err());
+        let other = format!("0x{}", hex::encode([0xCD; 20]));
+        let e = resolve_validator_registry(c, Some(&other), None)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not the ValidatorRegistry the r1006"), "{e}");
+        let e = resolve_validator_registry(c, None, Some("800"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("compiled activation height 1000"), "{e}");
+        // Not compiled (another genesis, or a placeholder set): the env decides.
+        assert_eq!(resolve_validator_registry(None, None, None).unwrap(), None);
+        assert_eq!(
+            resolve_validator_registry(None, Some(&other), Some("2000")).unwrap(),
+            Some(([0xCD; 20], 2000))
+        );
+        assert!(resolve_validator_registry(None, Some("zz"), None).is_err());
+    }
+
+    #[test]
+    fn the_rehearsal_opt_in_is_exactly_one() {
+        assert!(parse_r1006_rehearsal(Some("1")));
+        for v in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("true"),
+            Some("yes"),
+            Some(" 1"),
+            Some("1 "),
+        ] {
+            assert!(!parse_r1006_rehearsal(v), "{v:?}");
+        }
+    }
+
+    /// r1006 must not reproduce r1005's block 0: the two networks are told apart by
+    /// genesis hash (K6, the UI truth contract, the handshake), and r1005's compiled
+    /// checkpoints are keyed by r1005's genesis, so they must not reach r1006.
+    #[tokio::test]
+    async fn r1006_profile_has_its_own_genesis_and_no_r1005_checkpoints() {
+        use citrate_consensus::hardening::{canonical_checkpoints, RELEASE_GENESIS};
+        let r1005 = RELEASE_GENESIS[0].1;
+        let g = build_profile(40204, Some("r1006"))
+            .await
+            .expect("the r1006 genesis builds (rehearsal mode)");
+        assert_ne!(
+            g,
+            r1005,
+            "the r1006 profile reproduced r1005's block 0 {}",
+            hex::encode(r1005)
+        );
+        assert!(
+            canonical_checkpoints(&g).is_empty(),
+            "r1005's checkpoints apply to r1006's genesis"
+        );
+        assert!(
+            !canonical_checkpoints(&r1005).is_empty(),
+            "negative control"
+        );
+    }
 
     #[test]
     fn test_genesis_block_height_zero() {

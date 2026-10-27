@@ -34,9 +34,16 @@ fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("chain id {raw}: {e}"))?,
         None => 40204,
     };
-    citrate_execution::storage_root_hardening::init_for_chain(chain_id, None)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let storage = StorageManager::new(&dir, PruningConfig::default())?;
+    // The storage-root rule is keyed by this data directory's block 0.
+    let genesis: Option<[u8; 32]> = storage
+        .blocks
+        .get_block_by_height(0)
+        .ok()
+        .flatten()
+        .map(|h| *h.as_bytes());
+    citrate_execution::storage_root_hardening::init_for_genesis(chain_id, genesis.as_ref(), None)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let state_db = StateDB::new();
     let tip_height = match storage.blocks.get_applied_tip()? {
         Some((_, h)) => h,

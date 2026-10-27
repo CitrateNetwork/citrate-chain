@@ -1422,6 +1422,24 @@ impl Executor {
         }
     }
 
+    /// Set one contract storage slot (genesis only: a ceremony state dump carries
+    /// storage). Persisted eagerly unless deferring, like [`Self::set_code`]. A zero
+    /// value is not written.
+    pub fn set_genesis_storage(&self, address: &Address, slot: [u8; 32], value: [u8; 32]) {
+        if value == [0u8; 32] {
+            return;
+        }
+        self.state_db
+            .set_storage(*address, slot.to_vec(), value.to_vec());
+        if !self.defer_persist() {
+            if let Some(store) = &self.state_store {
+                if let Err(e) = store.put_storage(address, &slot, &value) {
+                    error!("Failed to persist genesis storage: {}", e);
+                }
+            }
+        }
+    }
+
     /// Calculate state root
     pub fn calculate_state_root(&self) -> Hash {
         self.state_db.calculate_state_root()

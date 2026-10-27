@@ -11741,12 +11741,14 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn unset_supply_hardening_height_replays_the_legacy_range_byte_identically() {
         // The 40204 release default: a release network with no height scheduled.
+        let r1005 = citrate_consensus::hardening::RELEASE_GENESIS[0].1;
         assert_eq!(
-            citrate_execution::supply_hardening::pinned_for(40204),
+            citrate_execution::supply_hardening::pin_for_genesis(40204, Some(&r1005)),
             Some(None)
         );
-        let (height, _) = citrate_execution::supply_hardening::init_for_chain(40204, None)
-            .expect("40204 resolves with no override");
+        let (height, _) =
+            citrate_execution::supply_hardening::init_for_genesis(40204, Some(&r1005), None)
+                .expect("40204 resolves with no override");
         assert_eq!(height, None, "40204 ships with the height unset");
         let producer = rp_node();
         let follower = rp_node();

@@ -294,7 +294,7 @@ def self_test(root):
         reclass(d, "ComputeMarketplace.noSuchSlot", "checked")
         expect("stale classification", d, "ComputeMarketplace.noSuchSlot is classified")
         d = fresh()
-        edit(d, ADMIN_CHECKS, '"treasury()",', "")
+        edit(d, ADMIN_CHECKS, 'g[8] = "treasury()";', "")
         expect("probe removed from the sweep", d, "treasury() is not in AdminChecks._addressSlotGetters()")
         d = fresh()
         reclass(d, "ComputeVerifier.marketplace", None)
