@@ -631,6 +631,18 @@ expect "fleet: a fork at the common height fails" 1 '\(fork\)' -- bash "$FA" htt
 # canonical chain agrees: a NOTE, not a fork (r1006 bring-up, 2026-10-27).
 mk_node http://n3 40204 100 "$GEN" "$TIP" "0x$(h64 e)"
 expect "fleet: a stale height index on an agreeing chain passes with a NOTE" 0 'height-index lag' -- bash "$FA" http://n1 http://n2 http://n3
+# Every endpoint's head block is pinned in the first pass, before any walk: a walk that
+# started from a later `latest` grows with the run's duration and can exceed its step bound
+# (live r1006: "has no block 7047 on its canonical chain" on the 5th of 7 tunnels).
+reset_calls
+bash "$FA" http://n1 http://n2 http://n3 >/dev/null 2>&1
+last_latest=$(calls | grep -n 'block latest' | tail -1 | cut -d: -f1)
+first_walk=$(calls | grep -n 'parentHash' | head -1 | cut -d: -f1)
+if [[ -n "$last_latest" && -n "$first_walk" && "$last_latest" -lt "$first_walk" ]]; then
+  ok "fleet: every head is pinned before any parent walk"
+else
+  bad "fleet: every head is pinned before any parent walk" "$(calls | grep -E 'block latest|parentHash')"
+fi
 mk_node http://n3 1 100 "$GEN" "$TIP"
 expect "fleet: a wrong chain id fails" 1 'chain id 1, want 40204' -- bash "$FA" http://n1 http://n3
 expect "fleet: an unreachable node fails" 1 'unreachable' -- bash "$FA" http://n1 http://nowhere
