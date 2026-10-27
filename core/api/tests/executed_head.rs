@@ -418,9 +418,8 @@ fn executed_head_under_concurrent_apply_never_leads_get_logs() {
 }
 
 /// A sibling at the executed head's height, stored after the executed block:
-/// the height index names the sibling, the executed head names the executed
-/// block. eth_getBlockByNumber(head.number) returns the sibling, so a client
-/// confirms the head with eth_getBlockByHash(head.hash), never by number.
+/// the stored height index names the sibling, while the executed head and
+/// eth_getBlockByNumber(head.number) both name the executed block (chain#421).
 #[test]
 fn executed_head_names_the_executed_block_not_a_later_sibling() {
     let (storage, _tmp) = storage();
@@ -439,9 +438,14 @@ fn executed_head_names_the_executed_block_not_a_later_sibling() {
     assert_eq!(by_hash["result"]["number"], "0x3", "{by_hash}");
     assert_eq!(by_hash["result"]["hash"], hx(&a[3].hash()), "{by_hash}");
 
-    // The documented caveat: by number, the height index's last writer wins.
+    // By number names the executed block too, not the later-stored sibling.
     let by_number = call(&io, "eth_getBlockByNumber", json!(["0x3", false]));
-    assert_eq!(by_number["result"]["hash"], hx(&s3.hash()), "{by_number}");
+    assert_eq!(by_number["result"]["hash"], hx(&a[3].hash()), "{by_number}");
+    assert_eq!(
+        storage.blocks.get_block_by_height(3).expect("stored index"),
+        Some(s3.hash()),
+        "the stored index still names the sibling"
+    );
 
     // getLogs at the head height serves the executed block's logs.
     assert_eq!(logs_between(&io, 3, 3), vec![(3, hx(&a[3].hash()))]);
@@ -495,8 +499,8 @@ fn is_executed_true_on_the_tip_chain() {
 }
 
 /// (b) A sibling at an executed height, stored after the executed block: it
-/// is served by eth_getBlockByHash (and owns the height index), but it never
-/// executed.
+/// is served by eth_getBlockByHash (and owns the stored height index), but it
+/// never executed, and by number the height names the executed block.
 #[test]
 fn is_executed_false_for_a_stored_sibling_at_the_same_height() {
     let (storage, _tmp) = storage();
@@ -509,7 +513,7 @@ fn is_executed_false_for_a_stored_sibling_at_the_same_height() {
     assert_eq!(by_hash["result"]["hash"], hx(&s3.hash()), "{by_hash}");
     assert_eq!(by_hash["result"]["number"], "0x3", "{by_hash}");
     let by_number = call(&io, "eth_getBlockByNumber", json!(["0x3", false]));
-    assert_eq!(by_number["result"]["hash"], hx(&s3.hash()), "{by_number}");
+    assert_eq!(by_number["result"]["hash"], hx(&a[3].hash()), "{by_number}");
 
     assert_eq!(is_exec(&io, &s3.hash()), not_executed());
     assert_eq!(is_exec(&io, &a[3].hash()), executed_at(3));
