@@ -741,6 +741,23 @@ mod tests {
         /// Header requests: each header's hash replaced by the hash of the
         /// block 100 heights above it. Block requests: answered honestly.
         HeaderLiar,
+        /// DGX-REVIEW: blocks: first `k` blocks of each answer honest, the rest
+        /// re-sealed onto a parent nobody holds. Headers honest.
+        DivergeAfter(usize),
+        /// DGX-REVIEW: blocks: first `k` honest, then a self-linked fork
+        /// (first forged block's parent = last honest block). Headers honest.
+        ForkAfter(usize),
+        /// DGX-REVIEW: header answers alternate honest / hashes of h+100.
+        HeaderAlternating,
+        /// DGX-REVIEW: every odd-height header hash replaced by random bytes.
+        HeaderRandomOdd,
+        /// DGX-REVIEW: honest, but every answer delayed by `ms`.
+        Slow(u64),
+        /// DGX-REVIEW: answer after `ms` with only the first `keep` blocks.
+        SlowShort(u64, usize),
+        /// DGX-REVIEW: headers from a valid side branch (alt store); block
+        /// requests from an alt anchor answered from the alt store.
+        StaleBranch,
     }
 
     /// `block` moved onto a parent nobody holds and re-signed by `key`.
@@ -775,6 +792,18 @@ mod tests {
         inbound: mpsc::Sender<(PeerId, NetworkMessage)>,
         wire: Arc<std::sync::Mutex<Wire>>,
     ) -> TickPeer {
+        spawn_peer_alt(name, behaviour, head, storage, None, inbound, wire)
+    }
+
+    fn spawn_peer_alt(
+        name: &str,
+        behaviour: Behaviour,
+        head: u64,
+        storage: Arc<StorageManager>,
+        alt: Option<Arc<StorageManager>>,
+        inbound: mpsc::Sender<(PeerId, NetworkMessage)>,
+        wire: Arc<std::sync::Mutex<Wire>>,
+    ) -> TickPeer {
         let id = PeerId(name.to_string());
         let (tx, mut rx) = mpsc::channel::<NetworkMessage>(1024);
         let (_unused_tx, unused_rx) = mpsc::channel::<NetworkMessage>(1);
@@ -790,6 +819,7 @@ mod tests {
         tokio::spawn(async move {
             let forger_key = crypto::generate_keypair();
             let mut k = 0u64;
+            let mut hk = 0u64;
             while let Some(msg) = rx.recv().await {
                 match msg {
                     NetworkMessage::GetBlocks { from, count, .. } => {
@@ -818,6 +848,12 @@ mod tests {
                         }
                         // Serving cost of a real peer on a LAN.
                         tokio::time::sleep(Duration::from_millis(5)).await;
+                        match behaviour {
+                            Behaviour::Slow(ms) | Behaviour::SlowShort(ms, _) => {
+                                tokio::time::sleep(Duration::from_millis(ms)).await;
+                            }
+                            _ => {}
+                        }
                         let blocks = match behaviour {
                             Behaviour::Honest => block_serve::serve_blocks(&storage, &from, count),
                             Behaviour::EmptyOrSilent => {
@@ -831,8 +867,62 @@ mod tests {
                                 .iter()
                                 .map(|b| forge(b, &forger_key))
                                 .collect(),
-                            Behaviour::HeaderLiar => {
+                            Behaviour::HeaderLiar
+                            | Behaviour::HeaderAlternating
+                            | Behaviour::HeaderRandomOdd
+                            | Behaviour::Slow(_) => {
                                 block_serve::serve_blocks(&storage, &from, count)
+                            }
+                            Behaviour::SlowShort(_, keep) => {
+                                let mut v = block_serve::serve_blocks(&storage, &from, count);
+                                v.truncate(keep);
+                                v
+                            }
+                            Behaviour::DivergeAfter(keep) => {
+                                block_serve::serve_blocks(&storage, &from, count)
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, b)| {
+                                        if i < keep {
+                                            b.clone()
+                                        } else {
+                                            forge(b, &forger_key)
+                                        }
+                                    })
+                                    .collect()
+                            }
+                            Behaviour::ForkAfter(keep) => {
+                                let real = block_serve::serve_blocks(&storage, &from, count);
+                                let mut out: Vec<Block> = Vec::new();
+                                let mut prev: Option<Hash> = None;
+                                for (i, b) in real.iter().enumerate() {
+                                    if i < keep {
+                                        prev = Some(b.header.block_hash);
+                                        out.push(b.clone());
+                                    } else {
+                                        let mut f = b.clone();
+                                        if let Some(p) = prev {
+                                            f.header.selected_parent_hash = p;
+                                        }
+                                        f.header.proposer_pubkey =
+                                            PublicKey::new(forger_key.verifying_key().to_bytes());
+                                        f.header.block_hash = f.compute_hash();
+                                        f.signature =
+                                            crypto::sign_block(&f.header.block_hash, &forger_key);
+                                        prev = Some(f.header.block_hash);
+                                        out.push(f);
+                                    }
+                                }
+                                out
+                            }
+                            Behaviour::StaleBranch => {
+                                match alt
+                                    .as_ref()
+                                    .filter(|a| a.blocks.get_block(&from).ok().flatten().is_some())
+                                {
+                                    Some(a) => block_serve::serve_blocks(a, &from, count),
+                                    None => block_serve::serve_blocks(&storage, &from, count),
+                                }
                             }
                         };
                         {
@@ -853,8 +943,72 @@ mod tests {
                     NetworkMessage::GetHeaders { from, count } => {
                         wire.lock().expect("wire").get_headers += 1;
                         let headers = match behaviour {
-                            Behaviour::Honest | Behaviour::Forger => {
+                            Behaviour::Honest
+                            | Behaviour::Forger
+                            | Behaviour::DivergeAfter(_)
+                            | Behaviour::ForkAfter(_)
+                            | Behaviour::Slow(_)
+                            | Behaviour::SlowShort(_, _) => {
                                 block_serve::serve_headers(&storage, &from, count)
+                            }
+                            Behaviour::HeaderAlternating => {
+                                hk += 1;
+                                let mut hs = block_serve::serve_headers(&storage, &from, count);
+                                if hk % 2 == 1 {
+                                    for h in &mut hs {
+                                        if let Ok(Some(other)) =
+                                            storage.blocks.get_block_by_height(h.height + 100)
+                                        {
+                                            h.block_hash = other;
+                                        }
+                                    }
+                                }
+                                hs
+                            }
+                            Behaviour::HeaderRandomOdd => {
+                                let mut hs = block_serve::serve_headers(&storage, &from, count);
+                                for h in &mut hs {
+                                    if h.height % 2 == 1 {
+                                        let mut r = [0u8; 32];
+                                        r[..8].copy_from_slice(&h.height.to_be_bytes());
+                                        r[8..16].copy_from_slice(&hk.to_be_bytes());
+                                        r[31] = 0x77;
+                                        h.block_hash = Hash::new(r);
+                                    }
+                                }
+                                hk += 1;
+                                hs
+                            }
+                            Behaviour::StaleBranch => {
+                                // Height of `from` on either branch, then the alt
+                                // branch's headers above it.
+                                let a = alt.as_ref().expect("alt store");
+                                let fh = if from == Hash::new([0u8; 32]) {
+                                    Some(0)
+                                } else {
+                                    storage
+                                        .blocks
+                                        .get_block(&from)
+                                        .ok()
+                                        .flatten()
+                                        .or_else(|| a.blocks.get_block(&from).ok().flatten())
+                                        .map(|b| b.header.height)
+                                };
+                                let mut hs = Vec::new();
+                                if let Some(fh) = fh {
+                                    for h in fh + 1..=fh + u64::from(count) {
+                                        let Ok(Some(hash)) = a.blocks.get_block_by_height(h) else {
+                                            break;
+                                        };
+                                        if let Ok(Some(b)) = a.blocks.get_block(&hash) {
+                                            hs.push(b.header);
+                                        }
+                                    }
+                                }
+                                if hs.is_empty() {
+                                    hs = block_serve::serve_headers(&storage, &from, count);
+                                }
+                                hs
                             }
                             Behaviour::EmptyOrSilent => Vec::new(),
                             Behaviour::HeaderLiar => {
@@ -1186,6 +1340,122 @@ mod tests {
             Behaviour::HeaderLiar,
         )
         .await;
+    }
+
+    /// Run a sync for `secs` against `bad` peers (sorted first) and `honest`
+    /// honest ones, with the sync target at `target`; return the follower's
+    /// applied height and the GetBlocks the peers received per second.
+    async fn request_rate(
+        n: u64,
+        bad: &[Behaviour],
+        honest: usize,
+        alt_n: u64,
+        target: u64,
+        secs: u64,
+    ) -> (u64, f64) {
+        let chain = build_chain(n).await;
+        let serve_dir = tempfile::tempdir().expect("tempdir");
+        let serving = store_with(&chain, serve_dir.path());
+        let alt_dir = tempfile::tempdir().expect("tempdir");
+        let alt = if alt_n > 0 {
+            Some(store_with(&build_chain(alt_n).await, alt_dir.path()))
+        } else {
+            None
+        };
+        let node_dir = tempfile::tempdir().expect("tempdir");
+        let f = follower(&chain, node_dir.path()).await;
+        let (in_tx, in_rx) = mpsc::channel::<(PeerId, NetworkMessage)>(4096);
+        let wire = Arc::new(std::sync::Mutex::new(Wire::default()));
+        let mut peers = Vec::new();
+        for (i, b) in bad.iter().enumerate() {
+            peers.push(spawn_peer_alt(
+                &format!("peer-a{i}"),
+                *b,
+                n,
+                serving.clone(),
+                alt.clone(),
+                in_tx.clone(),
+                wire.clone(),
+            ));
+        }
+        for i in 0..honest {
+            peers.push(spawn_peer(
+                &format!("peer-z{i}"),
+                Behaviour::Honest,
+                n,
+                serving.clone(),
+                in_tx.clone(),
+                wire.clone(),
+            ));
+        }
+        let out = run_sync(&f, peers, in_rx, target, Duration::from_secs(secs)).await;
+        let w = wire.lock().expect("wire");
+        let rate = w.get_blocks as f64 / out.secs;
+        println!(
+            "SYNCRATE {bad:?}+{honest} n={n} target={target} applied={} secs={:.1} \
+             get_blocks={} get_headers={} get_blocks_per_sec={rate:.2} scheduler={:?}",
+            out.applied,
+            out.secs,
+            w.get_blocks,
+            w.get_headers,
+            f.driver.sync().range_counters()
+        );
+        (out.applied, rate)
+    }
+
+    /// The old driver asked at most once per 2 s tick (0.5/s). Answers that
+    /// bring nothing must not push the rate far above that.
+    const MAX_IDLE_GET_BLOCKS_PER_SEC: f64 = 1.0;
+
+    fn rate_secs() -> u64 {
+        env_u64("CITRATE_SYNC_TEST_RATE_SECS", 20)
+    }
+
+    /// At the tip, with the sync target above every peer's head (an
+    /// unverified height claim leaves it there), honest peers have nothing
+    /// more to give. Requests must stay at the idle rate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn at_the_tip_with_a_target_above_every_peer_requests_stay_at_the_idle_rate() {
+        let n = 64;
+        let (applied, rate) = request_rate(n, &[], 3, 0, n + 100, rate_secs()).await;
+        assert_eq!(applied, n);
+        assert!(
+            rate <= MAX_IDLE_GET_BLOCKS_PER_SEC,
+            "{rate:.1} GetBlocks/s at the tip"
+        );
+    }
+
+    /// A follower left on a forked continuation no honest peer serves: it
+    /// cannot advance, and must not hammer its peers either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn on_a_branch_no_peer_serves_requests_stay_at_the_idle_rate() {
+        let (applied, rate) = request_rate(
+            1_500,
+            &[Behaviour::ForkAfter(4)],
+            2,
+            0,
+            1_500,
+            // Past the 30 s stall valve, which is where the re-requests start.
+            rate_secs().max(60),
+        )
+        .await;
+        assert!(applied < 1_500, "expected the follower to stall");
+        assert!(
+            rate <= MAX_IDLE_GET_BLOCKS_PER_SEC,
+            "{rate:.1} GetBlocks/s on a forked branch"
+        );
+    }
+
+    /// Same, for a valid side branch fed through header anchors.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn on_a_side_branch_fed_by_headers_requests_stay_at_the_idle_rate() {
+        let (applied, rate) =
+            request_rate(1_500, &[Behaviour::StaleBranch], 2, 750, 1_500, rate_secs()).await;
+        assert!(applied < 1_500, "expected the follower to stall");
+        assert!(
+            rate <= MAX_IDLE_GET_BLOCKS_PER_SEC,
+            "{rate:.1} GetBlocks/s on a side branch"
+        );
     }
 
     async fn multi_peer_catch_up(n: u64) {
