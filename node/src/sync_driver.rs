@@ -655,6 +655,26 @@ mod tests {
         /// Block requests: alternately never answered and answered empty.
         /// Header requests: answered empty.
         EmptyOrSilent,
+        /// Block requests: the right heights, but every block re-sealed under
+        /// the peer's own key on a parent nobody holds (each passes the
+        /// receive-side checks; none links to our chain). Header requests:
+        /// answered honestly.
+        Forger,
+        /// Header requests: each header's hash replaced by the hash of the
+        /// block 100 heights above it. Block requests: answered honestly.
+        HeaderLiar,
+    }
+
+    /// `block` moved onto a parent nobody holds and re-signed by `key`.
+    fn forge(block: &Block, key: &ed25519_dalek::SigningKey) -> Block {
+        let mut b = block.clone();
+        let mut fake = [0xEEu8; 32];
+        fake[..8].copy_from_slice(&b.header.height.to_be_bytes());
+        b.header.selected_parent_hash = Hash::new(fake);
+        b.header.proposer_pubkey = PublicKey::new(key.verifying_key().to_bytes());
+        b.header.block_hash = b.compute_hash();
+        b.signature = crypto::sign_block(&b.header.block_hash, key);
+        b
     }
 
     #[derive(Default, Debug)]
@@ -690,6 +710,7 @@ mod tests {
         let peer = Arc::new(Peer::new(info, tx, unused_rx));
         let pid = id.clone();
         tokio::spawn(async move {
+            let forger_key = crypto::generate_keypair();
             let mut k = 0u64;
             while let Some(msg) = rx.recv().await {
                 match msg {
@@ -728,6 +749,13 @@ mod tests {
                                 }
                                 Vec::new()
                             }
+                            Behaviour::Forger => block_serve::serve_blocks(&storage, &from, count)
+                                .iter()
+                                .map(|b| forge(b, &forger_key))
+                                .collect(),
+                            Behaviour::HeaderLiar => {
+                                block_serve::serve_blocks(&storage, &from, count)
+                            }
                         };
                         {
                             let mut w = wire.lock().expect("wire");
@@ -747,8 +775,21 @@ mod tests {
                     NetworkMessage::GetHeaders { from, count } => {
                         wire.lock().expect("wire").get_headers += 1;
                         let headers = match behaviour {
-                            Behaviour::Honest => block_serve::serve_headers(&storage, &from, count),
+                            Behaviour::Honest | Behaviour::Forger => {
+                                block_serve::serve_headers(&storage, &from, count)
+                            }
                             Behaviour::EmptyOrSilent => Vec::new(),
+                            Behaviour::HeaderLiar => {
+                                let mut hs = block_serve::serve_headers(&storage, &from, count);
+                                for h in &mut hs {
+                                    if let Ok(Some(other)) =
+                                        storage.blocks.get_block_by_height(h.height + 100)
+                                    {
+                                        h.block_hash = other;
+                                    }
+                                }
+                                hs
+                            }
                         };
                         if inbound
                             .send((pid.clone(), NetworkMessage::Headers { headers }))
@@ -929,6 +970,92 @@ mod tests {
     #[ignore = "20k blocks: run in release (see doc comment)"]
     async fn catch_up_20k_blocks_from_three_peers_one_faulty() {
         multi_peer_catch_up(env_u64("CITRATE_SYNC_TEST_BLOCKS", 20_000)).await;
+    }
+
+    /// One misbehaving peer, sorted first, and two honest peers. Catch-up
+    /// must still complete, on the right tip and state, within the same
+    /// throughput bound as the faulty-peer run.
+    async fn adversarial_catch_up(n: u64, bad: Behaviour) {
+        let chain = build_chain(n).await;
+        let serve_dir = tempfile::tempdir().expect("tempdir");
+        let serving = store_with(&chain, serve_dir.path());
+        let node_dir = tempfile::tempdir().expect("tempdir");
+        let f = follower(&chain, node_dir.path()).await;
+        let (in_tx, in_rx) = mpsc::channel::<(PeerId, NetworkMessage)>(4096);
+        let wire = Arc::new(std::sync::Mutex::new(Wire::default()));
+        let peers = vec![
+            spawn_peer(
+                "peer-a",
+                bad,
+                n,
+                serving.clone(),
+                in_tx.clone(),
+                wire.clone(),
+            ),
+            spawn_peer(
+                "peer-b",
+                Behaviour::Honest,
+                n,
+                serving.clone(),
+                in_tx.clone(),
+                wire.clone(),
+            ),
+            spawn_peer(
+                "peer-c",
+                Behaviour::Honest,
+                n,
+                serving.clone(),
+                in_tx.clone(),
+                wire.clone(),
+            ),
+        ];
+        let floor = min_blocks_per_sec();
+        let deadline = Duration::from_secs_f64(n as f64 / floor * 1.5 + 10.0);
+        let out = run_sync(&f, peers, in_rx, n, deadline).await;
+        let w = wire.lock().expect("wire");
+        let c = f.driver.sync().range_counters();
+        println!(
+            "SYNCBENCH {bad:?} n={n} applied={} secs={:.1} get_blocks={} get_headers={} \
+             faulty_get_blocks={} scheduler={c:?}",
+            out.applied, out.secs, w.get_blocks, w.get_headers, w.faulty_get_blocks
+        );
+        assert_eq!(
+            out.applied, n,
+            "{bad:?}: follower stopped at {} of {n} after {:.0}s",
+            out.applied, out.secs
+        );
+        let tip = chain.blocks.last().expect("non-empty chain");
+        let (tip_hash, _) = f.storage.blocks.get_applied_tip().unwrap().unwrap();
+        assert_eq!(tip_hash, tip.header.block_hash);
+        assert_eq!(f.executor.calculate_state_root(), tip.state_root);
+        // Header requests stay proportional to the chain, not to time.
+        assert!(
+            w.get_headers <= n,
+            "{bad:?}: {} GetHeaders for {n} blocks",
+            w.get_headers
+        );
+    }
+
+    /// A peer that answers its ranges with blocks that do not link to our
+    /// chain (right heights, own key, unknown parent) must not hold catch-up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catch_up_completes_with_a_peer_serving_non_linking_blocks() {
+        adversarial_catch_up(
+            env_u64("CITRATE_SYNC_TEST_ADV_BLOCKS", 1_500),
+            Behaviour::Forger,
+        )
+        .await;
+    }
+
+    /// A header source whose hashes belong to other heights must not hold
+    /// catch-up or drive a header-request storm.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catch_up_completes_with_a_header_source_whose_hashes_are_for_other_heights() {
+        adversarial_catch_up(
+            env_u64("CITRATE_SYNC_TEST_ADV_BLOCKS", 1_500),
+            Behaviour::HeaderLiar,
+        )
+        .await;
     }
 
     async fn multi_peer_catch_up(n: u64) {
