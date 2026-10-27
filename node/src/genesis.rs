@@ -237,7 +237,12 @@ pub async fn initialize_genesis_state(
 /// - `Some("team_testnet")` — team testnet with 10 pre-funded validators
 /// - `Some("testnet_beta")` — public testnet beta
 /// - `Some("mainnet")` — mainnet genesis
-/// - `None` or `Some("default")` — infer from chain_id (backward compatible)
+/// - `Some("default")` — devnet accounts
+/// - `None` — infer from chain_id (backward compatible)
+///
+/// Any other name is refused. A profile this build does not compile (a typo, or a
+/// network whose genesis is not in this release) must never fall back to the chain-id
+/// default: on 40204 that default is another network's release genesis.
 pub async fn initialize_genesis_state_with_profile(
     storage: Arc<StorageManager>,
     executor: Arc<Executor>,
@@ -270,7 +275,14 @@ pub async fn initialize_genesis_state_with_profile(
             EconomicsGenesisConfig::r1006()
                 .map_err(|e| anyhow::anyhow!("invalid r1006 genesis: {e}"))?
         }
-        _ => {
+        Some(other) => {
+            anyhow::bail!(
+                "[chain] genesis_profile = {other:?} is not compiled into this build (known: \
+                 default, testnet_beta, team_testnet, mainnet, r1006); refusing to build a genesis \
+                 instead of falling back to the chain-id default"
+            );
+        }
+        None => {
             // Backward compatible: infer from chain_id
             if config.chain_id == 40204 {
                 EconomicsGenesisConfig::testnet_beta()
@@ -363,6 +375,10 @@ mod tests {
         };
         let h = initialize_genesis_state_with_profile(st, ex, &cfg, profile).await?;
         Ok(*h.as_bytes())
+    }
+
+    async fn build_with_profile(chain_id: u64, profile: Option<&str>) -> anyhow::Result<Hash> {
+        build_profile(chain_id, profile).await.map(Hash::new)
     }
 
     #[test]
@@ -476,6 +492,39 @@ mod tests {
             !canonical_checkpoints(&r1005).is_empty(),
             "negative control"
         );
+    }
+
+    /// A profile this build does not compile (for example `r1006` before its genesis
+    /// lands, or a typo) is refused. It must never fall back to the chain-id default,
+    /// which on 40204 is the release genesis of another network.
+    #[tokio::test]
+    async fn an_unknown_genesis_profile_is_refused_not_inferred() {
+        for p in ["R1006", "testnet-beta", "TESTNET_BETA", "", "default "] {
+            let e = match build_with_profile(40204, Some(p)).await {
+                Ok(h) => panic!(
+                    "genesis_profile {p:?} built block 0 {} instead of being refused",
+                    hex::encode(h.as_bytes())
+                ),
+                Err(e) => format!("{e:#}"),
+            };
+            assert!(e.contains("genesis_profile"), "{e}");
+        }
+    }
+
+    /// Negative control: the known profiles, and no profile at all, still build.
+    #[tokio::test]
+    async fn known_genesis_profiles_still_build() {
+        for p in [
+            None,
+            Some("default"),
+            Some("testnet_beta"),
+            Some("team_testnet"),
+            Some("mainnet"),
+        ] {
+            build_with_profile(40204, p)
+                .await
+                .expect("known profile builds");
+        }
     }
 
     #[test]

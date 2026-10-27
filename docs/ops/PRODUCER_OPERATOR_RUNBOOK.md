@@ -3,6 +3,7 @@ created: 2026-10-19T09:00:00Z
 branch: ops/c3p-producer-runbook
 author: Larry Klosowski (chain team; DGX session, Claude Opus 5.5)
 status: active
+updated: 2026-10-27 (`registration-proof` CLI of chain#398: `--registry`, nonce 0; branch ops/r1006-bringup)
 workstream: C3 Producers & finality (betanet board), item C3-P
 verified_against: citrate-chain origin/main c384fc98; live 40204 at block ~512,700; contracts/addresses/40204.json
 ---
@@ -236,10 +237,11 @@ On this first start the node mints `proposer.key` and `noise.key` in the data di
 Print your proposer public key and send it to the chain team:
 
 ```bash
-sudo -u citrate citrate-node --config /etc/citrate/node.toml registration-proof
+VR=$(python3 -c 'import json; print(json.load(open("contracts/addresses/40204.json"))["contracts"]["ValidatorRegistry"])')
+sudo -u citrate citrate-node --config /etc/citrate/node.toml registration-proof --registry "$VR"
 ```
 
-The command reads `proposer.key` read-only. It never prints the seed, and it refuses if the file is missing (it never mints one) or readable by anyone but its owner.
+It prints public values only (`citrate-registration-proof/1`): `proposer_pubkey`, the staker (your coinbase), the registry, the chain id and `registration_sig`, the proposer key's signature over the registration digest for nonce 0. The command reads `proposer.key` read-only. It never prints the seed, and it refuses if the file is missing (it never mints one) or is not a 32-byte seed. Keep it 0600 (the node mints it so).
 
 The node is synced when `eth_syncing` returns `false` and its head is within 5 blocks of the public RPC:
 
@@ -259,7 +261,7 @@ Registration needs two signatures: the proposer key signs a proof that you contr
      --config /etc/citrate/node.toml --out /tmp/register-tx.json
    ```
 
-   It checks the RPC is the right network (chain id **and** genesis hash). It reads `registrationNonce`, `minStake`, `activeCount`, your balance and your account nonce from public RPC. It refuses if your staker already has a validator, if this proposer key was ever registered (keys are single-use), or if the balance can't cover the stake plus gas. Then it prints the unsigned **legacy** transaction. This chain rejects EIP-1559 transactions.
+   It checks the RPC is the right network (chain id **and** genesis hash). It reads `registrationNonce`, `minStake`, `activeCount`, your balance and your account nonce from public RPC. `citrate-node registration-proof` signs registration nonce 0 only, so the builder refuses a staker whose `registrationNonce` is not 0 (its proof would be rejected; register from a fresh staker address). It builds the `registerValidator(bytes32,bytes)` calldata from the proof itself. It refuses if your staker already has a validator, if this proposer key was ever registered (keys are single-use), or if the balance can't cover the stake plus gas. Then it prints the unsigned **legacy** transaction. This chain rejects EIP-1559 transactions.
 
    The stake defaults to the registry's `minStake`. Pass `--stake-salt` to bond more. Use `--dry-run` to preview with no chain reads; its output is marked DO NOT SIGN.
 
@@ -295,7 +297,7 @@ Registration needs two signatures: the proposer key signs a proof that you contr
 > install -d -o citrate -g citrate -m 0700 $D
 > cp -a $D.pre-reset-$TS/{proposer.key,noise.key} $D/   # identity carried over
 > systemctl start citrate-node
-> sudo -u citrate citrate-node --config /etc/citrate/node.toml registration-proof   # same pubkey as before?
+> sudo -u citrate citrate-node --config /etc/citrate/node.toml registration-proof --registry "$VR"   # same proposer_pubkey as before?
 > ```
 >
 > Back-ups: two encrypted offline copies of `proposer.key` and `noise.key`, made right after the first start (`tar -C /var/lib/citrate/data -cf - proposer.key noise.key | gpg -c > identity-$(hostname).tar.gpg`). Restore one only to the same host, after the original host is gone for good and can never start again.
@@ -389,7 +391,7 @@ With `CITRATE_METRICS=1` (set by the generated env file) the node serves Prometh
 |---|---|---|
 | `preflight.py` | Host checks (§1–3) | Lists the checks |
 | `gen_node_config.py` | `node.toml`, consensus env, systemd unit for a profile (§5, §8) | Prints the files |
-| `citrate-node registration-proof` | Proposer public key; the signed registration proof and calldata (§5–6) | Read-only by design |
+| `citrate-node registration-proof --registry R` | Proposer public key and the signed registration proof for nonce 0 (§5–6); the builder makes the calldata | Read-only by design |
 | `build_registration_tx.py` | Unsigned `registerValidator` transaction (§6) | No chain reads; output marked DO NOT SIGN |
 | `verify_producer.py` | Registered / eligible / committee / producing, from public RPC (§6, §8, §9) | Lists the reads |
 | `citrate-watchdog-ctl.sh` | Pause / resume / status of the watchdog (§9); incident containment (§11) | `--dry-run pause …`, `--dry-run contain …` |

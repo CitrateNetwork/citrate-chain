@@ -15,7 +15,7 @@ Python 3.10+ standard library only. None of them reads a private key, signs a tr
 |---|---|---|---|
 | `preflight.py` | Host files and commands (stat only for key files); bootnodes and the public RPC | Nothing | Lists the checks |
 | `gen_node_config.py` | A profile | `node.toml`, `citrate-node.env`, `citrate-node.service` in `--out-dir` | Prints them |
-| `build_registration_tx.py` | Public RPC; `citrate-node registration-proof` (reads `proposer.key` read-only) | `--out` JSON | No chain reads; output marked DO NOT SIGN |
+| `build_registration_tx.py` | Public RPC; `citrate-node registration-proof --registry R --staker S` (chain#398; reads `proposer.key` read-only, signs nonce 0) | `--out` JSON | No chain reads; output marked DO NOT SIGN |
 | `verify_producer.py` | Public RPC only | Nothing | Lists the reads |
 
 `producerlib.py` holds the shared RPC client, ABI decoding, epoch math and profile loading. Selectors are pinned there and recomputed with a reference keccak in the tests.
@@ -31,7 +31,7 @@ Python 3.10+ standard library only. None of them reads a private key, signs a tr
 
 ```bash
 python3 -m unittest discover -s scripts/producers/tests -p 'test_*.py' -v
-# with a built node, also exercise the real registration-proof subcommand:
+# with a node built with chain#398's registration-proof, also exercise the real subcommand:
 CITRATE_NODE_BIN=target/debug/citrate python3 -m unittest discover -s scripts/producers/tests -p 'test_build*.py'
 ```
 

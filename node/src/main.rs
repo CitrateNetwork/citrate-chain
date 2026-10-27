@@ -74,6 +74,7 @@ mod finality_driver;
 mod finality_floor;
 mod genesis;
 mod hardening_rejoin;
+mod host_identity;
 mod inference;
 pub mod logging;
 mod memory_bounds;
@@ -331,6 +332,29 @@ enum Commands {
         /// node then rebuilds its state from genesis at the next start.
         #[arg(long)]
         rebuild_state: bool,
+    },
+
+    /// Producer bring-up: mint (with --mint) or read this host's identity and print
+    /// ONLY its public parts as JSON: Noise peer id, proposer (ed25519) and VRF
+    /// (P-256) public keys, and the staker = coinbase address from a v3 keystore.
+    /// The noise and proposer keys are minted by the node's own loaders (0600);
+    /// nothing secret is printed. See node/src/host_identity.rs.
+    HostIdentity {
+        /// The node's data dir (where noise.key and proposer.key live).
+        #[arg(long, value_name = "DIR")]
+        identity_dir: PathBuf,
+        /// Staker (= coinbase) Web3 v3 keystore path.
+        #[arg(long, value_name = "PATH")]
+        staker_keystore: PathBuf,
+        /// Keystore password file (made with a random password when minting).
+        #[arg(long, value_name = "PATH")]
+        staker_password_file: PathBuf,
+        /// Create whatever is missing. Without it, a missing file is an error.
+        #[arg(long)]
+        mint: bool,
+        /// Also write the public identity to this file (mode 0644).
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
     },
 
     /// Wallet management (accounts, balances, transfers)
@@ -666,6 +690,27 @@ async fn main() -> Result<()> {
                 dry_run,
                 rebuild_state,
             )?;
+            return Ok(());
+        }
+        Some(Commands::HostIdentity {
+            identity_dir,
+            staker_keystore,
+            staker_password_file,
+            mint,
+            out,
+        }) => {
+            let id = host_identity::run(
+                &host_identity::IdentityPaths {
+                    data_dir: identity_dir,
+                    staker_keystore,
+                    staker_password_file,
+                },
+                mint,
+            )?;
+            if let Some(out) = out {
+                host_identity::write_public(&out, &id)?;
+            }
+            println!("{}", serde_json::to_string_pretty(&id)?);
             return Ok(());
         }
         Some(Commands::Wallet {
