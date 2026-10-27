@@ -17,13 +17,31 @@
 #   producer_baseline.sh check-ufw-status < status   # verdict on `ufw status verbose`
 #
 #   ssh root@HOST 'bash -s -- apply' < scripts/ops/producer_baseline.sh
+#   ssh root@HOST 'bash -s -- apply --ssh-from 198.51.100.0/24' < scripts/ops/producer_baseline.sh
+#
+# SSH sources. By default the host firewall allows 22/tcp from Anywhere and
+# the provider firewall is the SSH source filter: on the r1006 producers that
+# is the DigitalOcean cloud firewall `citrate-producer-fw` (tag citrate-producer),
+# as in the runbook's section 2 ("restrict SSH ... at the provider firewall").
+# `check` reports this as `WARN ssh-source`. apply never widens SSH at the host:
+# when ufw already has any SSH allow rule (source-restricted or not), it adds
+# none. An optional host allowlist, `--ssh-from CIDR[,CIDR]` (or
+# CITRATE_SSH_ALLOW_FROM), installs `ufw allow from CIDR to any port 22 proto
+# tcp` rules, then removes the open SSH rules, and records the list in
+# /etc/citrate/ssh-allow-from so later runs and `check` keep that policy. It
+# refuses (exit 2, nothing changed) unless the current session's source address
+# (SSH_CONNECTION, else SSH_CLIENT) is inside the list; under sudo, keep
+# SSH_CONNECTION with --preserve-env. To go back to the default, delete
+# /etc/citrate/ssh-allow-from and the source rules by hand.
 #
 # What `apply` does:
 #   - preflight, before any change: refuse unless every port sshd listens on
 #     (`sshd -T`, and ssh.socket if active) is 22, the port the firewall allows;
 #     unless the account running this (root, or $SUDO_USER) has at least one
-#     usable authorized key; and when /var/lib/citrate, its data dir or
-#     /etc/citrate is a symlink.
+#     usable authorized key; when /var/lib/citrate, its data dir or
+#     /etc/citrate is a symlink; and when the SSH sources apply would leave in
+#     ufw (the allowlist, or existing source-restricted rules) do not include
+#     the current session's source.
 #   - apt update/upgrade; unattended-upgrades (security origins only, no auto-reboot)
 #   - `citrate` system user (no login shell), /var/lib/citrate (root:citrate 0750),
 #     /var/lib/citrate/data (0700, owned by citrate; the node mints its keys there)
@@ -35,9 +53,9 @@
 #   - chrony time sync
 #   - sshd: keys only, PermitRootLogin prohibit-password, no passwords; reloaded on
 #     every run once `sshd -t` accepts the config
-#   - ufw as runbook section 2: allow 22/tcp and 30303/tcp+udp first, then deny
-#     incoming / allow outgoing, then enable (only once the 22/tcp rule is
-#     confirmed). RPC/metrics stay closed.
+#   - ufw as runbook section 2: SSH (see "SSH sources" above) and 30303/tcp+udp
+#     first, then deny incoming / allow outgoing, then enable (only once an SSH
+#     rule, and every allowlist rule, is confirmed). RPC/metrics stay closed.
 #   - DigitalOcean monitoring agent, installed if missing from DO's apt repo; its
 #     signing key is checked against a pinned fingerprint before apt trusts it.
 #   - citrate-disk-alert.timer: every 5 min, logs at crit and fails its unit when
@@ -69,6 +87,12 @@ SWAP_SIZE_MIB=4096
 SWAPPINESS=10
 DISK_ALERT_PCT=80
 UNIT_PATH=/etc/systemd/system/citrate-node.service
+# Host SSH allowlist recorded by `apply --ssh-from`; read by later runs and `check`.
+SSH_POLICY_FILE=/etc/citrate/ssh-allow-from
+SSH_ALLOW_ARG=""
+SSH_ALLOW_GIVEN=0
+SSH_ALLOW=""          # canonical CIDRs, space separated; empty = no host allowlist
+SSH_ALLOW_ORIGIN=""
 CHANGED=()
 
 die() { echo "producer_baseline: $*" >&2; exit 2; }
@@ -180,6 +204,246 @@ apt_noninteractive() {
     -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@"
 }
 
+# ---- SSH source policy -----------------------------------------------------
+
+# Address and rule parsing for the SSH source policy (python3 ipaddress: IPv4,
+# IPv6 and IPv4-mapped IPv6 alike). Subcommands:
+#   norm LIST...          canonical CIDRs, one line; exit 2 on a bad or /0 entry
+#   covers ADDR CIDR...   exit 0 when ADDR is inside one of CIDR ("any" = all)
+#   added-rules           stdin `ufw show added`; per rule that admits tcp/22:
+#                         "SOURCE<TAB>ARG..." (SOURCE "any" or a canonical CIDR)
+#   status-verdict CIDR.. stdin `ufw status verbose`; one "STATUS detail" line
+SSH_POLICY_PY='
+import ipaddress, re, shlex, sys
+
+def net(s):
+    s = s.strip()
+    if s.lower() in ("any", "anywhere"):
+        return "any"
+    n = ipaddress.ip_network(s, strict=False)
+    if n.version == 6 and n.network_address.ipv4_mapped is not None and n.prefixlen >= 96:
+        n = ipaddress.ip_network("%s/%d" % (n.network_address.ipv4_mapped, n.prefixlen - 96))
+    return n
+
+def inside(a, n):
+    return n == "any" or (a.version == n.version and a in n)
+
+def port_hit(spec, proto):
+    if proto not in (None, "tcp", "any"):
+        return False
+    for part in spec.split(","):
+        if part in ("22", "ssh"):
+            return True
+        lo, sep, hi = part.partition(":")
+        if sep and lo.isdigit() and hi.isdigit() and int(lo) <= 22 <= int(hi):
+            return True
+    return False
+
+def simple_hit(tok):
+    if "/" in tok:
+        spec, _, proto = tok.partition("/")
+        return port_hit(spec, proto)
+    if re.fullmatch(r"[0-9,:]+|ssh", tok):
+        return port_hit(tok, None)
+    return re.search("ssh", tok, re.I) is not None
+
+def parse_added(line):
+    try:
+        t = shlex.split(line)
+    except ValueError:
+        return None
+    if len(t) < 3 or t[0] != "ufw" or t[1] not in ("allow", "limit"):
+        return None
+    args = t[1:]
+    if "comment" in args:
+        args = args[:args.index("comment")]
+    i = 1
+    if i < len(args) and args[i] in ("in", "out"):
+        if args[i] == "out":
+            return None
+        i += 1
+    if i + 1 < len(args) and args[i] == "on":
+        i += 2
+    if i < len(args) and args[i] in ("log", "log-all"):
+        i += 1
+    rest = args[i:]
+    if len(rest) == 1:
+        return ("any", args) if simple_hit(rest[0]) else None
+    kw, side, j = {}, None, 0
+    while j + 1 < len(rest):
+        k, v = rest[j], rest[j + 1]
+        if k in ("from", "to"):
+            side = k
+            kw[k] = v
+        elif k in ("port", "app") and side:
+            kw[side + k] = v
+        elif k == "proto":
+            kw["proto"] = v
+        else:
+            return None
+        j += 2
+    if j != len(rest):
+        return None
+    proto = kw.get("proto")
+    if "toapp" in kw:
+        hit = re.search("ssh", kw["toapp"], re.I) is not None
+    elif "toport" in kw:
+        hit = port_hit(kw["toport"], proto)
+    else:
+        hit = proto in (None, "tcp", "any")
+    if not hit:
+        return None
+    src = net(kw.get("from", "any"))
+    return (str(src), args)
+
+def status_sources(text):
+    out = []
+    for line in text.splitlines():
+        cols = re.split(r"\s{2,}", line.strip())
+        if len(cols) < 3 or not re.fullmatch(r"(ALLOW|LIMIT)( IN)?", cols[1]):
+            continue
+        to = re.sub(r"\s+on\s+\S+$", "", re.sub(r"\s*\(v6\)$", "", cols[0]))
+        if not (to == "Anywhere" or any(simple_hit(x) for x in to.split())):
+            continue
+        frm = re.sub(r"\s*\(v6\)$", "", cols[2].split("#")[0].strip()) or "Anywhere"
+        src = str(net(frm.split()[0]))
+        if src not in out:
+            out.append(src)
+    return out
+
+def verdict(srcs, allow):
+    shown = ", ".join("Anywhere" if s == "any" else s for s in srcs)
+    if not srcs:
+        return "FAIL no 22/tcp allow rule"
+    if allow:
+        nets = [net(s) for s in srcs if s != "any"]
+        wide = [s for s in srcs if s == "any"] + [str(n) for n in nets
+                if not any(n.version == a.version and n.subnet_of(a) for a in allow)]
+        missing = [str(a) for a in allow if a not in nets]
+        if wide or missing:
+            msg = "22/tcp from: %s; allowlist %s" % (shown, " ".join(map(str, allow)))
+            if wide:
+                msg += "; outside it: " + ", ".join("Anywhere" if w == "any" else w for w in wide)
+            if missing:
+                msg += "; no rule for: " + ", ".join(missing)
+            return "FAIL " + msg
+        return "PASS 22/tcp from: %s (host allowlist)" % shown
+    if "any" in srcs and len(srcs) > 1:
+        return ("FAIL 22/tcp from: %s; the open rule overrides the source-restricted ones "
+                "(widened); remove it or pass --ssh-from" % shown)
+    if "any" in srcs:
+        return ("WARN 22/tcp from Anywhere at the host; the provider firewall "
+                "(DO citrate-producer-fw) must restrict SSH sources, or pass --ssh-from")
+    return "PASS 22/tcp from: %s" % shown
+
+def main(argv):
+    cmd, args = argv[0], argv[1:]
+    if cmd == "norm":
+        out = []
+        for tok in re.split(r"[,\s]+", " ".join(args)):
+            if not tok:
+                continue
+            try:
+                n = net(tok)
+            except ValueError as e:
+                sys.stderr.write("bad address %r: %s\n" % (tok, e))
+                return 2
+            if n == "any" or n.prefixlen == 0:
+                sys.stderr.write("%r allows every source; that is not an allowlist\n" % tok)
+                return 2
+            if str(n) not in out:
+                out.append(str(n))
+        if not out:
+            sys.stderr.write("empty allowlist\n")
+            return 2
+        print(" ".join(out))
+        return 0
+    if cmd == "covers":
+        try:
+            a = ipaddress.ip_address(args[0].split("%")[0])
+        except (IndexError, ValueError):
+            return 2
+        if a.version == 6 and a.ipv4_mapped is not None:
+            a = a.ipv4_mapped
+        return 0 if any(inside(a, net(n)) for n in args[1:]) else 1
+    if cmd == "added-rules":
+        for line in sys.stdin.read().splitlines():
+            r = parse_added(line)
+            if r:
+                print("\t".join([r[0]] + r[1]))
+        return 0
+    if cmd == "status-verdict":
+        print(verdict(status_sources(sys.stdin.read()), [net(a) for a in args]))
+        return 0
+    return 2
+
+sys.exit(main(sys.argv[1:]))
+'
+
+sshpol() { python3 -I -c "$SSH_POLICY_PY" "$@"; }
+
+# The host SSH allowlist: --ssh-from, else CITRATE_SSH_ALLOW_FROM, else the
+# list a past `apply --ssh-from` recorded. Sets SSH_ALLOW (empty = none). Dies
+# (exit 2) on a bad or /0 entry, before any change.
+load_ssh_policy() {
+  local raw
+  if [ "$SSH_ALLOW_GIVEN" = 1 ]; then
+    raw="$SSH_ALLOW_ARG"; SSH_ALLOW_ORIGIN="--ssh-from"
+  elif [ -n "${CITRATE_SSH_ALLOW_FROM:-}" ]; then
+    raw="$CITRATE_SSH_ALLOW_FROM"; SSH_ALLOW_ORIGIN=CITRATE_SSH_ALLOW_FROM
+  elif [ -f "$R$SSH_POLICY_FILE" ]; then
+    raw="$(grep -v '^[[:space:]]*#' "$R$SSH_POLICY_FILE" | tr '\n' ' ')"; SSH_ALLOW_ORIGIN="$SSH_POLICY_FILE"
+  else
+    SSH_ALLOW=""; SSH_ALLOW_ORIGIN=""; return 0
+  fi
+  command -v python3 >/dev/null || die "python3 is needed to check the SSH allowlist"
+  SSH_ALLOW="$(sshpol norm "$raw")" \
+    || die "$SSH_ALLOW_ORIGIN: bad SSH allowlist '$raw' (want CIDR[,CIDR], not 0.0.0.0/0 or ::/0)"
+}
+
+# SSH allow rules ufw holds (active or not), as "SOURCE<TAB>ARG..." lines.
+ssh_rules_added() {
+  local added
+  command -v ufw >/dev/null || return 0
+  added="$(ufw show added 2>/dev/null)" || added=""
+  sshpol added-rules <<<"$added"
+}
+
+# Source address of the SSH session running this, or empty.
+session_source() {
+  local c="${SSH_CONNECTION:-${SSH_CLIENT:-}}"
+  echo "${c%% *}"
+}
+
+# The SSH sources apply leaves in ufw must include this session's source:
+# the allowlist when one is set (and the session must be placeable), else any
+# existing source-restricted rules, which apply keeps as they are.
+guard_ssh_source() {
+  local src srcs
+  load_ssh_policy
+  src="$(session_source)"
+  if [ -n "$SSH_ALLOW" ]; then
+    [ -n "$src" ] || die "SSH allowlist ($SSH_ALLOW) set, but this session's source is unknown (SSH_CONNECTION and SSH_CLIENT are empty; under sudo use --preserve-env=SSH_CONNECTION); refusing before any change"
+    sshpol covers "$src" $SSH_ALLOW \
+      || die "this SSH session comes from $src, outside the SSH allowlist ($SSH_ALLOW); refusing before any change"
+    note "SSH session $src is inside the allowlist ($SSH_ALLOW)"
+    return 0
+  fi
+  srcs="$(ssh_rules_added | cut -f1 | sort -u)"
+  if [ -z "$srcs" ] || grep -qx any <<<"$srcs"; then
+    note "SSH open at the host (no allowlist); the provider firewall filters sources"
+    return 0
+  fi
+  srcs="$(tr '\n' ' ' <<<"$srcs")"
+  if [ -z "$src" ]; then
+    note "ufw allows SSH only from $srcs(kept); no SSH session to check"
+    return 0
+  fi
+  sshpol covers "$src" $srcs \
+    || die "ufw allows SSH only from $srcs(apply keeps that), and this SSH session comes from $src; refusing before any change"
+  note "SSH session $src is inside the existing ufw SSH sources ($srcs)"
+}
+
 # ---- preflight (no changes) -------------------------------------------------
 
 # Every TCP port sshd listens on, one per line: `port` and `listenaddress` from
@@ -261,6 +525,7 @@ preflight() {
   guard_authorized_key
   refuse_symlinks
   note "no symlinked citrate dirs"
+  guard_ssh_source
 }
 
 # ---- apply -----------------------------------------------------------------
@@ -383,25 +648,25 @@ EOF
 apply_swap() {
   echo "[swap]"
   if ! grep -qx "$SWAP_FILE" <<<"$(swapon --show=NAME --noheadings)"; then
-    if [ ! -f "$SWAP_FILE" ]; then
-      fallocate -l "${SWAP_SIZE_MIB}M" "$SWAP_FILE"
-      chmod 0600 "$SWAP_FILE"
-      mkswap "$SWAP_FILE" >/dev/null
+    if [ ! -f "$R$SWAP_FILE" ]; then
+      fallocate -l "${SWAP_SIZE_MIB}M" "$R$SWAP_FILE"
+      chmod 0600 "$R$SWAP_FILE"
+      mkswap "$R$SWAP_FILE" >/dev/null
       CHANGED+=("$SWAP_FILE")
     fi
-    chmod 0600 "$SWAP_FILE"
-    swapon "$SWAP_FILE"
+    chmod 0600 "$R$SWAP_FILE"
+    swapon "$R$SWAP_FILE"
   fi
-  if ! grep -qE "^$SWAP_FILE[[:space:]]" /etc/fstab; then
-    echo "$SWAP_FILE none swap sw 0 0" >>/etc/fstab
+  if ! grep -qE "^$SWAP_FILE[[:space:]]" "$R/etc/fstab" 2>/dev/null; then
+    echo "$SWAP_FILE none swap sw 0 0" >>"$R/etc/fstab"
     CHANGED+=("/etc/fstab")
   fi
   put_file /etc/sysctl.d/60-citrate.conf 0644 root:root <<EOF
 # producer_baseline.sh: swap only under real memory pressure (OOM kills on 2 GB nodes).
 vm.swappiness=$SWAPPINESS
 EOF
-  sysctl -q -p /etc/sysctl.d/60-citrate.conf
-  note "$SWAP_FILE $(swapon --show=SIZE --noheadings "$SWAP_FILE" | tr -d ' '), swappiness $(cat /proc/sys/vm/swappiness)"
+  sysctl -q -p "$R/etc/sysctl.d/60-citrate.conf"
+  note "$SWAP_FILE $(swapon --show=SIZE --noheadings "$R$SWAP_FILE" | tr -d ' '), swappiness $(cat /proc/sys/vm/swappiness)"
 }
 
 apply_time() {
@@ -439,21 +704,53 @@ EOF
 # Runbook section 2. Allows first, then the defaults, then enable. On a host where
 # ufw is already active, `default deny incoming` bites at once, so it must not
 # run before the SSH allow exists (a failed allow stops the script under set -e).
-# preflight has already checked that sshd listens on SSH_FW_PORT only.
+# preflight has already checked that sshd listens on SSH_FW_PORT only, and that
+# this session's source is inside the SSH sources left in place below.
+#
+# SSH never gets wider here: with an allowlist, its source rules go in and the
+# open SSH rules come out once they are all present; without one, the open rule
+# is added only when ufw has no SSH allow rule at all.
 apply_firewall() {
   echo "[firewall]"
-  local before added
+  local before rules srcs c
+  local -a f
+  load_ssh_policy
   before="$(ufw status verbose 2>/dev/null || true)"
-  ufw allow 22/tcp >/dev/null
+  srcs="$(ssh_rules_added | cut -f1)"
+  if [ -n "$SSH_ALLOW" ]; then
+    for c in $SSH_ALLOW; do
+      grep -qxF -- "$c" <<<"$srcs" || ufw allow from "$c" to any port "$SSH_FW_PORT" proto tcp >/dev/null
+    done
+  elif [ -z "$srcs" ]; then
+    # Open at the host; the provider firewall (citrate-producer-fw) filters sources.
+    ufw allow 22/tcp >/dev/null
+  fi
   ufw allow 30303/tcp >/dev/null
   ufw allow 30303/udp >/dev/null
-  added="$(ufw show added)"
-  grep -qx "ufw allow ${SSH_FW_PORT}/tcp" <<<"$added" || die "ufw has no ${SSH_FW_PORT}/tcp rule; not enabling"
+  rules="$(ssh_rules_added)"
+  srcs="$(cut -f1 <<<"$rules")"
+  [ -n "$srcs" ] || die "ufw has no ${SSH_FW_PORT}/tcp allow rule; not enabling"
+  if [ -n "$SSH_ALLOW" ]; then
+    for c in $SSH_ALLOW; do
+      grep -qxF -- "$c" <<<"$srcs" || die "ufw has no SSH rule for $c; not enabling"
+    done
+    while IFS=$'\t' read -r -a f; do
+      [ "${f[0]:-}" = any ] || continue
+      ufw --force delete "${f[@]:1}" >/dev/null
+    done <<<"$rules"
+  fi
   ufw default deny incoming >/dev/null
   ufw default allow outgoing >/dev/null
   ufw --force enable >/dev/null
+  if [ -n "$SSH_ALLOW" ]; then
+    put_file "$SSH_POLICY_FILE" 0644 root:root <<EOF
+# producer_baseline.sh --ssh-from: the host SSH allowlist (22/tcp sources).
+# Later runs and \`check\` keep it. Delete this file to go back to the default.
+$(tr ' ' '\n' <<<"$SSH_ALLOW")
+EOF
+  fi
   if [ "$(ufw status verbose)" != "$before" ]; then CHANGED+=("ufw"); fi
-  note "ufw $(ufw status | head -1 | awk '{print $2}'): 22/tcp, 30303/tcp+udp in"
+  note "ufw $(ufw status | head -1 | awk '{print $2}'): SSH from $(cut -f1 <<<"$(ssh_rules_added)" | sort -u | sed 's/^any$/Anywhere/' | tr '\n' ' ')30303/tcp+udp in"
 }
 
 # Reads `ufw status verbose` on stdin. Exit 0 only for the runbook policy: active,
@@ -464,7 +761,8 @@ ufw_status_ok() {
   grep -qx 'Status: active' <<<"$text" || { echo "ufw not active"; return 1; }
   grep -qE '^Default: deny \(incoming\), allow \(outgoing\)' <<<"$text" \
     || { echo "defaults are not deny incoming / allow outgoing"; return 1; }
-  for want in 22/tcp 30303/tcp 30303/udp; do
+  grep -qE "^22/tcp[[:space:]]+(ALLOW|LIMIT) IN[[:space:]]" <<<"$text" || { echo "22/tcp not allowed in"; return 1; }
+  for want in 30303/tcp 30303/udp; do
     grep -qE "^${want}[[:space:]]+ALLOW IN[[:space:]]" <<<"$text" || { echo "$want not allowed in"; return 1; }
   done
   while IFS= read -r line; do
@@ -475,6 +773,25 @@ ufw_status_ok() {
     esac
   done < <(grep -E '[[:space:]](ALLOW|LIMIT)( IN)?[[:space:]]' <<<"$text")
   return 0
+}
+
+# The ssh-source checklist row for `ufw status verbose` on stdin, against the
+# loaded SSH_ALLOW. Returns 1 on FAIL.
+ssh_source_row() {
+  local v
+  v="$(sshpol status-verdict $SSH_ALLOW)" || v="FAIL cannot read ufw status"
+  row "${v%% *}" ssh-source "${v#* }"
+  [ "${v%% *}" != FAIL ]
+}
+
+# check-ufw-status: the firewall and ssh-source verdicts for a status table.
+check_ufw_status() {
+  local text v rc=0
+  text="$(cat)"
+  load_ssh_policy
+  if v="$(ufw_status_ok <<<"$text")"; then row PASS firewall "policy ok"; else row FAIL firewall "$v"; rc=1; fi
+  ssh_source_row <<<"$text" || rc=1
+  return "$rc"
 }
 
 # key_fpr_ok FILE FPR: FILE (armored or binary) holds exactly one OpenPGP primary
@@ -607,6 +924,7 @@ stat_is() { [ "$(stat -c '%U:%G %a' "$1" 2>/dev/null)" = "$2" ]; }
 
 do_check() {
   [ "$(id -u)" -eq 0 ] || die "check must run as root (sshd -T, stat)"
+  load_ssh_policy
   echo "== producer_baseline check on $(hostname) ($(. /etc/os-release; echo "$PRETTY_NAME"), $(uname -m)) =="
   local v
 
@@ -663,11 +981,14 @@ do_check() {
     row FAIL sshd "effective: $v"
   fi
 
-  if v="$(ufw status verbose 2>/dev/null | ufw_status_ok)"; then
+  local ufwst
+  ufwst="$(ufw status verbose 2>/dev/null || true)"
+  if v="$(ufw_status_ok <<<"$ufwst")"; then
     row PASS firewall "ufw active; deny in, allow out; 22/tcp 30303/tcp 30303/udp only"
   else
     row FAIL firewall "${v:-ufw status unreadable}"
   fi
+  ssh_source_row <<<"$ufwst" || true
   ok_if ufw-enabled "ufw.service enabled at boot" systemctl is-enabled --quiet ufw
 
   ok_if do-agent "DO monitoring agent active, enabled" \
@@ -716,15 +1037,28 @@ if [ "${PRODUCER_BASELINE_LIB:-0}" = 1 ]; then
   return 0 2>/dev/null || exit 0
 fi
 
-case "${1:-}" in
-  apply|check)
-    [ -z "$R" ] || die "PRODUCER_BASELINE_ROOT is for tests only; unset it to $1 a host" ;;
+CMD="${1:-}"
+if [ $# -gt 0 ]; then shift; fi
+case "$CMD" in
+  apply|check|check-ufw-status)
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --ssh-from) [ $# -ge 2 ] || die "--ssh-from needs CIDR[,CIDR]"; SSH_ALLOW_ARG="$2"; SSH_ALLOW_GIVEN=1; shift 2 ;;
+        --ssh-from=*) SSH_ALLOW_ARG="${1#*=}"; SSH_ALLOW_GIVEN=1; shift ;;
+        *) die "unknown option: $1" ;;
+      esac
+    done ;;
 esac
-case "${1:-}" in
+case "$CMD" in
+  apply|check)
+    [ -z "$R" ] || die "PRODUCER_BASELINE_ROOT is for tests only; unset it to $CMD a host"
+    load_ssh_policy ;;  # a bad allowlist stops here, before anything runs
+esac
+case "$CMD" in
   apply) do_apply ;;
   check) do_check ;;
   print-unit) unit_template ;;
   print-disk-alert) disk_alert_script ;;
-  check-ufw-status) ufw_status_ok ;;
-  *) echo "usage: $0 apply|check|print-unit|print-disk-alert|check-ufw-status" >&2; exit 2 ;;
+  check-ufw-status) check_ufw_status ;;
+  *) echo "usage: $0 apply|check [--ssh-from CIDR[,CIDR]] | print-unit | print-disk-alert | check-ufw-status [--ssh-from ...]" >&2; exit 2 ;;
 esac

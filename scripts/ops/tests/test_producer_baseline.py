@@ -215,6 +215,11 @@ class FirewallTest(unittest.TestCase):
             (RESTRICTED_UFW, "203.0.113.0/24", 1),                # source outside the allowlist
             (RESTRICTED_UFW, "198.51.100.7,203.0.113.9", 1),      # an allowlist entry has no rule
             (RESTRICTED_UFW.replace("198.51.100.7", "198.51.100.0/24"), "198.51.100.7/32", 1),  # wider
+            # every allowlist rule present, plus something more: still a FAIL
+            (RESTRICTED_UFW + "22/tcp                     ALLOW IN    Anywhere\n", "198.51.100.7", 1),
+            (RESTRICTED_UFW + "22/tcp                     ALLOW IN    198.51.100.0/24\n", "198.51.100.7", 1),
+            (RESTRICTED_UFW + "22/tcp                     ALLOW IN    198.51.100.8\n", "198.51.100.0/24,198.51.100.7", 1),
+            (RESTRICTED_UFW + "22/tcp                     ALLOW IN    198.51.100.0/24\n", "198.51.100.0/24,198.51.100.7", 0),
         ]
         for text, allow, rc in cases:
             r = self.verdict(text, "--ssh-from", allow)
@@ -341,6 +346,7 @@ case "$name" in
   id)
     if [ "$*" = "-u" ]; then echo 0; else echo 996; fi ;;
   curl) exit 7 ;;
+  fallocate) : >"${@: -1}" ;;  # an empty file at the given (sandbox) path
 esac
 exit 0
 """
@@ -650,19 +656,20 @@ class SshSourceTest(ShimTestCase):
         self.assertFalse((self.sb.root / "etc/citrate/ssh-allow-from").exists())
 
     def test_existing_restricted_rule_is_not_widened(self) -> None:
-        for existing in (RESTRICTED_RULE, "ufw limit 22/tcp", "ufw allow from 10.0.0.0/8",
+        for existing in (RESTRICTED_RULE, "ufw limit 22/tcp", "ufw allow from 10.0.0.0/8", "ufw allow OpenSSH",
                          "ufw allow in on eth1 from 198.51.100.0/24 to any port 22 proto tcp"):
             self.sb.log.write_text("")
             self.preset(existing)
             r = self.sb.run("apply_firewall")
             self.assertEqual(r.returncode, 0, f"{existing}: {r.stdout}{r.stderr}")
             self.assertNotIn("ufw allow 22/tcp", self.sb.calls(), existing)
-            self.assertEqual([l for l in self.added() if "22" in l or "from" in l], [existing])
+            self.assertEqual([l for l in self.added() if "22" in l or "from" in l or "SSH" in l], [existing])
             self.assertIn("ufw --force enable", self.sb.calls(), existing)
 
     def test_unrelated_rule_does_not_count_as_ssh(self) -> None:  # negative control
         for other in ("ufw allow 80/tcp", "ufw allow from 198.51.100.7 to any port 8545 proto tcp",
-                      "ufw allow 22/udp", "ufw allow out 22/tcp", "ufw deny from 198.51.100.7 to any port 22"):
+                      "ufw allow 22/udp", "ufw allow out 22/tcp", "ufw deny from 198.51.100.7 to any port 22",
+                      "ufw allow 'Nginx Full'", "ufw allow from 198.51.100.7 to any app 'Nginx Full'"):
             self.sb.log.write_text("")
             self.preset(other)
             r = self.sb.run("apply_firewall")
@@ -697,6 +704,14 @@ class SshSourceTest(ShimTestCase):
         self.assertEqual([c for c in self.ufw_mutations() if "22" in c], [])
         self.assertEqual([l for l in self.added() if "22" in l],
                          ["ufw allow from 198.51.100.0/24 to any port 22 proto tcp"])
+        # an open rule added by hand later is removed again by the recorded policy
+        self.preset(*self.added(), "ufw allow 22/tcp")
+        r = self.sb.run("apply_firewall")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("ufw allow 22/tcp", self.added())
+        self.sb.add_key()
+        r = self.sb.run("preflight", SSH_CONNECTION="203.0.113.5 50000 10.0.0.1 22")
+        self.assertEqual(r.returncode, 2, "recorded allowlist binds preflight too: " + r.stdout + r.stderr)
 
     def test_allowlist_not_enabled_when_a_source_rule_is_missing(self) -> None:
         self.preset("ufw allow 22/tcp")
@@ -774,6 +789,20 @@ class PreflightPortTest(ShimTestCase):
         r = self.sb.run("preflight")
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("port", r.stderr)
+
+
+class SwapTest(ShimTestCase):
+    def test_swap_writes_stay_under_the_root(self) -> None:
+        r = self.sb.run("apply_swap")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue((self.sb.root / "swapfile").is_file())
+        self.assertEqual((self.sb.root / "swapfile").stat().st_mode & 0o777, 0o600)
+        self.assertIn("/swapfile none swap sw 0 0", (self.sb.root / "etc/fstab").read_text().splitlines())
+        for prog in ("fallocate", "mkswap", "swapon", "sysctl"):
+            for c in self.sb.calls(prog):
+                paths = [a for a in c.split()[1:] if a.startswith("/")]
+                self.assertTrue(all(a.startswith(str(self.sb.root)) for a in paths), c)
+        self.assertTrue(self.sb.calls("fallocate"))
 
 
 class GitleaksConfigTest(unittest.TestCase):
