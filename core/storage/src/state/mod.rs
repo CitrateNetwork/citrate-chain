@@ -4,4 +4,4 @@ pub mod ai_state;
 pub mod state_store;
 
 pub use ai_state::{AIStateTree, InferenceResult, LoRAAdapter};
-pub use state_store::StateStore;
+pub use state_store::{legacy_hydration_view, StateStore, StorageBytes, StorageRecord};

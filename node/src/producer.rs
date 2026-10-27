@@ -2169,8 +2169,10 @@ impl BlockProducer {
         // and the enhanced branch are gone; block rewards NEVER read `economics_manager`.
         // (economics_manager remains for RPC/telemetry only.)
         //
-        // `calculate_reward` reads only header.height + transactions (never state_root), so
-        // this temp block is a safe reward-input carrier.
+        // The reward reads only header.height, the transactions and (at/after the
+        // supply-hardening height) their executed `receipts` — never state_root — so
+        // this temp block is a safe reward-input carrier. `canonical_block_reward` is
+        // the same rule selection every receive path applies.
         let temp_block = BlockBuilder::new()
             .header(header.clone())
             .tx_root(tx_root)
@@ -2180,10 +2182,12 @@ impl BlockProducer {
             .transactions(executed_transactions.clone())
             .build_unhashed();
         // PANIC-S1 D3: an uncomputable reward rejects the block (never panics/saturates).
-        let reward = self
-            .reward_calculator
-            .calculate_reward(&temp_block)
-            .map_err(|e| anyhow::anyhow!("block reward rejected: {e}"))?;
+        let reward = crate::canonical_apply::canonical_block_reward(
+            &self.reward_calculator,
+            &temp_block,
+            &receipts,
+        )
+        .map_err(|e| anyhow::anyhow!("block reward rejected: {e}"))?;
         // `basic_credits` mirrors `canonical_apply::reward_credits` exactly:
         // [(coinbase, validator_reward), (0x11..treasury, treasury_reward)]. Below the
         // VALIDATOR-S1 activation (or before a snapshot is materialized) this credits only
@@ -4794,7 +4798,11 @@ mod tests {
         ];
 
         let got = receiver
-            .apply_block(&sealed, sealed.header.coinbase, &basic_credits)
+            .apply_block(
+                &sealed,
+                sealed.header.coinbase,
+                &citrate_execution::executor::fixed_reward(&basic_credits),
+            )
             .await
             .expect(
                 "SRP-S2 INVARIANT: a fleet node re-applying the producer's block through the \
@@ -5048,7 +5056,8 @@ mod tests {
                 (Address(block.header.coinbase), reward.validator_reward),
                 (Address(TREASURY), reward.treasury_reward),
             ];
-            exec.apply_block(block, block.header.coinbase, &credits)
+            let reward = citrate_execution::executor::fixed_reward(&credits);
+            exec.apply_block(block, block.header.coinbase, &reward)
                 .await
         }
 

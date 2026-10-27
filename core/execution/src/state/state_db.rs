@@ -5,6 +5,7 @@ use crate::state::{AccountManager, Trie};
 use crate::types::{Address, ExecutionError, JobId, ModelId, ModelState, TrainingJob};
 use citrate_consensus::types::Hash;
 use dashmap::{DashMap, DashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -41,6 +42,15 @@ pub struct StateDB {
     /// re-apply a branch in-memory (`apply_block_no_persist`) with NO durable
     /// writes — an aborted reorg that deployed a contract leaves nothing on disk.
     dirty_code: Arc<DashSet<Hash>>,
+
+    /// Height of the block whose post-state this db holds. It selects the
+    /// storage-root rule (`crate::storage_root_hardening`) for
+    /// [`Self::calculate_state_root`]. Set by block reward settlement (the one
+    /// step the producer, block import and trusted replay all run, after
+    /// execution and before the root), by restart hydration to the applied tip,
+    /// and carried by snapshots so a revert restores it. `0` (genesis) until
+    /// then.
+    root_height: AtomicU64,
 }
 
 impl StateDB {
@@ -54,6 +64,7 @@ impl StateDB {
             state_trie: Arc::new(parking_lot::RwLock::new(Trie::new())),
             dirty_storage: Arc::new(DashSet::new()),
             dirty_code: Arc::new(DashSet::new()),
+            root_height: AtomicU64::new(0),
         }
     }
 
@@ -74,6 +85,7 @@ impl StateDB {
             state_trie: Arc::new(parking_lot::RwLock::new(Trie::new())),
             dirty_storage: Arc::new(DashSet::new()),
             dirty_code: Arc::new(DashSet::new()),
+            root_height: AtomicU64::new(0),
         };
         iso.restore(self.snapshot());
         iso
@@ -103,7 +115,54 @@ impl StateDB {
     /// SRP-S3b diagnostic: recompute an account's storage_root FRESH from its resident
     /// storage trie (what `calculate_state_root` folds), or `None` if no trie is resident.
     pub fn get_storage_root_recomputed(&self, address: &Address) -> Option<Hash> {
-        self.storage_tries.get(address).map(|t| t.root_hash())
+        let canonical = self.canonical_storage_roots_at(
+            crate::storage_root_hardening::storage_root_hardening_height(),
+            self.root_height(),
+        );
+        self.storage_root_with_rule(address, canonical)
+    }
+
+    /// An account's storage_root under an explicit activation and height (the
+    /// fold [`Self::calculate_state_root_with`] uses), or `None` if no trie is
+    /// resident.
+    pub fn storage_root_with(
+        &self,
+        activation: Option<u64>,
+        height: u64,
+        address: &Address,
+    ) -> Option<Hash> {
+        self.storage_root_with_rule(address, self.canonical_storage_roots_at(activation, height))
+    }
+
+    fn storage_root_with_rule(&self, address: &Address, canonical: bool) -> Option<Hash> {
+        self.storage_tries
+            .get(address)
+            .map(|t| Self::storage_root_of(&t, canonical))
+    }
+
+    /// The storage root of one trie: a function of its slot set from the
+    /// hardening height, the legacy structural hash below it.
+    fn storage_root_of(trie: &Trie, canonical: bool) -> Hash {
+        if canonical {
+            trie.root_hash()
+        } else {
+            trie.legacy_root_hash()
+        }
+    }
+
+    fn canonical_storage_roots_at(&self, activation: Option<u64>, height: u64) -> bool {
+        crate::storage_root_hardening::active_at(activation, height)
+    }
+
+    /// Record the height of the block whose post-state this db now holds.
+    pub fn set_root_height(&self, height: u64) {
+        self.root_height.store(height, Ordering::SeqCst);
+    }
+
+    /// The height of the block whose post-state this db holds (see
+    /// `root_height`).
+    pub fn root_height(&self) -> u64 {
+        self.root_height.load(Ordering::SeqCst)
     }
 
     /// Set storage value
@@ -236,6 +295,22 @@ impl StateDB {
         Ok(())
     }
 
+    /// Apply a model-registry entry recorded in a committed tx journal.
+    ///
+    /// Insert-or-replace: the executor already checked existence against the
+    /// journal-first view when the tx ran, and the MVCC check guarantees no
+    /// other committed tx changed the entry since. Only the journal drain calls
+    /// this; inside a tx, write through the journal.
+    pub(crate) fn apply_journaled_model(&self, model_id: ModelId, model: ModelState) {
+        self.models.insert(model_id, model);
+    }
+
+    /// Apply a training-job entry recorded in a committed tx journal
+    /// (see [`Self::apply_journaled_model`]).
+    pub(crate) fn apply_journaled_job(&self, job_id: JobId, job: TrainingJob) {
+        self.training_jobs.insert(job_id, job);
+    }
+
     /// Calculate state root.
     ///
     /// CONSENSUS-CRITICAL — must be IDEMPOTENT and a PURE function of the
@@ -268,7 +343,30 @@ impl StateDB {
     ///    marks the same accounts dirty per block), so the accumulated trie —
     ///    and its root — is identical across the fleet (see
     ///    `state_root_is_operation_order_independent`).
+    ///
+    /// The storage-root rule follows the process-wide storage-root hardening
+    /// height and this db's [`Self::root_height`]; see
+    /// [`Self::calculate_state_root_with`].
     pub fn calculate_state_root(&self) -> StateRoot {
+        self.calculate_state_root_at(self.root_height())
+    }
+
+    /// The state root of the post-state of the block at `height`, under the
+    /// process-wide storage-root hardening height.
+    pub fn calculate_state_root_at(&self, height: u64) -> StateRoot {
+        self.calculate_state_root_with(
+            crate::storage_root_hardening::storage_root_hardening_height(),
+            height,
+        )
+    }
+
+    /// The state root under an explicit storage-root hardening `activation`,
+    /// for the post-state of the block at `height`. At and after the activation
+    /// each account's `storage_root` is a function of its slot set only; below
+    /// it (and with no activation) it is the legacy structural hash, so every
+    /// historical root is reproduced byte for byte.
+    pub fn calculate_state_root_with(&self, activation: Option<u64>, height: u64) -> StateRoot {
+        let canonical = self.canonical_storage_roots_at(activation, height);
         let mut state_trie = self.state_trie.write();
 
         // SRP (ADR-2026-07-21-state-root-purity, Decision §1+§2): the consensus root MUST
@@ -298,7 +396,7 @@ impl StateDB {
             // trie — for EVERY account, not just dirty ones — so a slot change via any
             // path is reflected. (Recomputes identically each call → idempotent.)
             if let Some(storage_trie) = self.storage_tries.get(&address) {
-                account.storage_root = storage_trie.root_hash();
+                account.storage_root = Self::storage_root_of(&storage_trie, canonical);
                 // Keep the resident account consistent with what we hash.
                 self.accounts.set_account(address, account.clone());
             }
@@ -325,7 +423,9 @@ impl StateDB {
             state_trie.insert(address.0.to_vec(), encoded);
         }
 
-        state_trie.root_hash()
+        // Rebuilt by inserts only, so the structural hash is already a function
+        // of the account set.
+        state_trie.legacy_root_hash()
     }
 
     /// SRP-S4 diagnostic — an INJECTIVE full-state fingerprint that DISTINGUISHES two
@@ -338,13 +438,17 @@ impl StateDB {
     /// diff two nodes at a wedge height. DIAGNOSTIC ONLY — never a consensus value.
     pub fn full_state_fingerprint(&self) -> Hash {
         use sha3::{Digest, Keccak256};
+        let canonical = self.canonical_storage_roots_at(
+            crate::storage_root_hardening::storage_root_hardening_height(),
+            self.root_height(),
+        );
         let mut all = self.accounts.all_accounts();
         all.sort_unstable_by_key(|a| a.0 .0);
         let mut h = Keccak256::new();
         for (address, mut account) in all {
             let slots: Vec<(Vec<u8>, Vec<u8>)> = match self.storage_tries.get(&address) {
                 Some(t) => {
-                    account.storage_root = t.root_hash();
+                    account.storage_root = Self::storage_root_of(&t, canonical);
                     let mut s: Vec<(Vec<u8>, Vec<u8>)> = t.entries_map().into_iter().collect();
                     s.sort();
                     s
@@ -372,13 +476,17 @@ impl StateDB {
     /// SRP-S4 diagnostic — per-account lines for the injective fingerprint above, so a
     /// diff of two nodes' dumps at a wedge height NAMES the diverging account/slot-count.
     pub fn full_state_digest_lines(&self) -> Vec<String> {
+        let canonical = self.canonical_storage_roots_at(
+            crate::storage_root_hardening::storage_root_hardening_height(),
+            self.root_height(),
+        );
         let mut all = self.accounts.all_accounts();
         all.sort_unstable_by_key(|a| a.0 .0);
         all.into_iter()
             .map(|(address, mut account)| {
                 let nslots = match self.storage_tries.get(&address) {
                     Some(t) => {
-                        account.storage_root = t.root_hash();
+                        account.storage_root = Self::storage_root_of(&t, canonical);
                         t.entries_map().len()
                     }
                     None => 0,
@@ -439,6 +547,7 @@ impl StateDB {
                 .collect(),
             dirty_code: self.dirty_code.iter().map(|h| *h).collect(),
             state_trie: self.state_trie.read().clone(),
+            root_height: self.root_height(),
         }
     }
 
@@ -467,6 +576,7 @@ impl StateDB {
 
         // Restore the accumulating account trie (see StateSnapshot::state_trie).
         *self.state_trie.write() = snapshot.state_trie;
+        self.set_root_height(snapshot.root_height);
 
         // Restore models
         self.models.clear();
@@ -520,6 +630,9 @@ pub struct StateSnapshot {
     /// a restore — a rejected apply_block would then still report the (uncommitted)
     /// candidate root. Capturing + restoring it makes revert byte-exact.
     state_trie: Trie,
+    /// `StateDB::root_height` at snapshot time, so a revert also restores the
+    /// storage-root rule of the restored state.
+    root_height: u64,
 }
 
 impl StateSnapshot {

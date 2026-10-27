@@ -501,17 +501,26 @@ async fn main() -> Result<()> {
             // env override and the config file's `[chain].pba_hardening_height`.
             let file_cfg = resolve_config_path(cli.config.clone())
                 .and_then(|p| NodeConfig::from_file(&p).ok());
-            let (cfg_chain_id, configured, dev_profile, agent_configured, exact_configured) =
-                match &file_cfg {
-                    Some(c) => (
-                        c.chain.chain_id,
-                        c.chain.pba_hardening_height,
-                        c.chain.dev_profile,
-                        c.chain.agent_precompiles_height,
-                        c.chain.exact_create_code_height,
-                    ),
-                    None => (40204, None, false, None, None),
-                };
+            let (
+                cfg_chain_id,
+                configured,
+                dev_profile,
+                agent_configured,
+                exact_configured,
+                supply_configured,
+                storage_root_configured,
+            ) = match &file_cfg {
+                Some(c) => (
+                    c.chain.chain_id,
+                    c.chain.pba_hardening_height,
+                    c.chain.dev_profile,
+                    c.chain.agent_precompiles_height,
+                    c.chain.exact_create_code_height,
+                    c.chain.supply_hardening_height,
+                    c.chain.storage_root_hardening_height,
+                ),
+                None => (40204, None, false, None, None, None, None),
+            };
             let chain_id = cli.chain_id.unwrap_or(cfg_chain_id);
             let resolved = citrate_consensus::hardening::resolve_pba_hardening_for_chain(
                 chain_id,
@@ -534,10 +543,21 @@ async fn main() -> Result<()> {
                     .and_then(|c| c.chain.vrf_canonical_encoding_height),
             )
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let manifest = consensus_manifest::ConsensusManifest::for_activations(
+            let (supply_height, _) =
+                citrate_execution::supply_hardening::resolve_for_chain(chain_id, supply_configured)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let (storage_root_height, _) =
+                citrate_execution::storage_root_hardening::resolve_for_chain(
+                    chain_id,
+                    storage_root_configured,
+                )
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let manifest = consensus_manifest::ConsensusManifest::for_release_heights(
                 resolved.height,
                 agent_height,
                 exact_height,
+                supply_height,
+                storage_root_height,
             );
             // The activation heights compiled into this release (a node on a
             // pinned chain runs that height; see the start-up banner for the
@@ -1539,6 +1559,44 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             vrf_encoding_source
         ),
     }
+    // Supply-accounting hardening fork height, published before any execution
+    // component is built. Not scheduled on 40204 until a release pins it; on a
+    // release network a disagreeing env or config value aborts start-up.
+    let (supply_height, supply_source) = citrate_execution::supply_hardening::init_for_chain(
+        config.chain.chain_id,
+        config.chain.supply_hardening_height,
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
+    match supply_height {
+        Some(h) => info!(
+            "Supply hardening fork ACTIVE from height {} (source: {})",
+            h, supply_source
+        ),
+        None => info!(
+            "Supply hardening fork not scheduled (source: {}); legacy rules",
+            supply_source
+        ),
+    }
+    // Storage-root hardening fork height, published before state is hydrated
+    // and before any execution component is built. Not scheduled on 40204 until
+    // a release pins it; on a release network a disagreeing env or config value
+    // aborts start-up.
+    let (storage_root_height, storage_root_source) =
+        citrate_execution::storage_root_hardening::init_for_chain(
+            config.chain.chain_id,
+            config.chain.storage_root_hardening_height,
+        )
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    match storage_root_height {
+        Some(h) => info!(
+            "Storage root hardening fork ACTIVE from height {} (source: {})",
+            h, storage_root_source
+        ),
+        None => info!(
+            "Storage root hardening fork not scheduled (source: {}); legacy rules",
+            storage_root_source
+        ),
+    }
 
     {
         // Consensus-alignment stamp — logged at boot so field drift is diagnosable
@@ -1746,12 +1804,45 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         }
     }
 
-    // C6 fix: Also load contract storage slots from persistent storage
+    // The applied tip = the block whose committed state the store holds. Fall back to
+    // the latest block only when no applied-tip pointer exists (pre-S3b stores / fresh
+    // genesis), preserving the prior behavior for those.
+    let (boot_tip_hash, boot_tip_height) = storage
+        .blocks
+        .get_applied_tip()
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| {
+            let h = storage.blocks.get_latest_height().unwrap_or(0);
+            let hash = storage
+                .blocks
+                .get_block_by_height(h)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            (hash, h)
+        });
+
+    // C6 fix: Also load contract storage slots from persistent storage.
+    // From the storage-root hardening height (the next block this node executes)
+    // every persisted record is restored byte for byte; below it the legacy view
+    // (32-byte keys, values cut or padded to 32 bytes) is kept, so a restarted
+    // node rebuilds exactly the state it rebuilt before.
+    let full_hydration = citrate_execution::storage_root_hardening::active_at(
+        citrate_execution::storage_root_hardening::storage_root_hardening_height(),
+        boot_tip_height.saturating_add(1),
+    );
     match storage.state.get_all_storage() {
-        Ok(storage_slots) => {
+        Ok(records) => {
+            let storage_slots = boot_storage_view(
+                records,
+                citrate_execution::storage_root_hardening::storage_root_hardening_height(),
+                boot_tip_height,
+            );
             info!(
-                "Found {} storage slots in storage, loading into memory...",
-                storage_slots.len()
+                "Found {} storage slots in storage, loading into memory ({} hydration)...",
+                storage_slots.len(),
+                if full_hydration { "full" } else { "legacy" }
             );
             for ((address, storage_key), storage_value) in storage_slots {
                 state_db.set_storage(
@@ -1765,7 +1856,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             info!("Storage slots loaded successfully");
         }
         Err(e) => {
-            warn!("Failed to load storage slots from storage: {}", e);
+            // Starting without contract storage would execute and root against
+            // a state this node never committed. Refuse instead.
+            error!("Failed to load storage slots from storage: {}", e);
+            return Err(anyhow::anyhow!(
+                "refusing to start: contract storage could not be hydrated: {e}"
+            ));
         }
     }
 
@@ -1778,25 +1874,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // durable state are advanced ATOMICALLY (persist_state_changes_with_tip), so they must
     // always agree — a mismatch means a genuinely corrupt/divergent reconstruction.
     {
+        let (tip_hash, tip_height) = (boot_tip_hash, boot_tip_height);
+        // The hydrated state is the post-state of the applied tip: root it under
+        // that height's storage-root rule.
+        state_db.set_root_height(tip_height);
         let memory_root = state_db.calculate_state_root();
-        // The applied tip = the block whose committed state the store holds. Fall back to
-        // the latest block only when no applied-tip pointer exists (pre-S3b stores / fresh
-        // genesis), preserving the prior behavior for those.
-        let (tip_hash, tip_height) = storage
-            .blocks
-            .get_applied_tip()
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| {
-                let h = storage.blocks.get_latest_height().unwrap_or(0);
-                let hash = storage
-                    .blocks
-                    .get_block_by_height(h)
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-                (hash, h)
-            });
         if tip_height > 0 && tip_hash != citrate_consensus::types::Hash::default() {
             let committed_root = storage
                 .state
@@ -4461,6 +4543,80 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The storage records a node restarted at applied tip `tip_height` loads into
+/// memory. From the storage-root hardening height (`activation`; the next block
+/// the node executes is `tip_height + 1`) every persisted record is restored
+/// byte for byte. Below it the legacy view is kept, so a restarted node rebuilds
+/// exactly the state it rebuilt before the fork existed.
+fn boot_storage_view(
+    records: Vec<citrate_storage::state::StorageRecord>,
+    activation: Option<u64>,
+    tip_height: u64,
+) -> Vec<citrate_storage::state::StorageRecord> {
+    if citrate_execution::storage_root_hardening::active_at(
+        activation,
+        tip_height.saturating_add(1),
+    ) {
+        records
+    } else {
+        citrate_storage::state::legacy_hydration_view(records)
+    }
+}
+
+#[cfg(test)]
+mod boot_storage_view_tests {
+    use super::boot_storage_view;
+    use citrate_execution::types::Address;
+    use citrate_storage::state::StorageBytes;
+
+    fn records() -> Vec<citrate_storage::state::StorageRecord> {
+        let gov = {
+            let mut a = [0u8; 20];
+            a[18] = 0x10;
+            a[19] = 0x03;
+            Address(a)
+        };
+        vec![
+            (
+                (gov, StorageBytes(b"ADMIN".to_vec())),
+                StorageBytes(vec![0xA1; 20]),
+            ),
+            (
+                (Address([0xEE; 20]), StorageBytes(vec![1; 32])),
+                StorageBytes(b"v1".to_vec()),
+            ),
+        ]
+    }
+
+    #[test]
+    fn unscheduled_chain_keeps_the_legacy_view() {
+        let got = boot_storage_view(records(), None, 1_000_000);
+        assert_eq!(
+            got.len(),
+            1,
+            "only the 52-byte key is in the legacy view, as before the activation"
+        );
+        assert_eq!(
+            got[0].1,
+            StorageBytes(vec![0u8; 32]),
+            "short value padded, as before"
+        );
+    }
+
+    #[test]
+    fn new_genesis_hydrates_every_record_from_the_first_restart() {
+        assert_eq!(boot_storage_view(records(), Some(0), 0), records());
+        assert_eq!(boot_storage_view(records(), Some(0), 77), records());
+    }
+
+    #[test]
+    fn scheduled_height_switches_when_the_next_block_is_hardened() {
+        assert_eq!(boot_storage_view(records(), Some(100), 98).len(), 1);
+        assert_eq!(boot_storage_view(records(), Some(100), 99), records());
+        assert_eq!(boot_storage_view(records(), Some(100), 150), records());
+    }
 }
 
 #[allow(dead_code)]

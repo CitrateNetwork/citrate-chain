@@ -42,10 +42,24 @@ pub enum TrieNode {
 // Default now derived above with Empty
 
 /// Merkle Patricia Trie
+///
+/// SHAPE INVARIANT. A trie built by inserts alone has one shape per key/value
+/// set, whatever the insert order: a `Leaf` where exactly one key lies under a
+/// prefix, a `Branch` where two or more do, and no `Extension`. `remove` does
+/// not preserve that shape (it can leave an `Extension`, a single-child
+/// `Branch`, or an empty `Branch`), and `encode_node` hashes the shape, so the
+/// structural hash of a trie that has seen a remove depends on its history.
+///
+/// [`Trie::root_hash`] is therefore a function of the key/value set only: for a
+/// trie that has seen a remove it hashes the insert-only shape of the current
+/// set. [`Trie::legacy_root_hash`] is the structural hash, kept for state roots
+/// below the storage-root hardening height (`crate::storage_root_hardening`).
 #[derive(Clone)]
 pub struct Trie {
     root: TrieNode,
     cache: HashMap<Vec<u8>, Vec<u8>>,
+    /// Set by any `remove`: the shape may no longer be the insert-only shape.
+    removed: bool,
 }
 
 impl Trie {
@@ -53,6 +67,7 @@ impl Trie {
         Self {
             root: TrieNode::Empty,
             cache: HashMap::new(),
+            removed: false,
         }
     }
 
@@ -177,6 +192,8 @@ impl Trie {
         let nibbles = to_nibbles(key);
         self.root = Self::remove_node(self.root.clone(), &nibbles);
         self.cache.remove(key);
+        // Even a remove of an absent key can reshape a branch on its path.
+        self.removed = true;
     }
 
     fn remove_node(node: TrieNode, key: &[u8]) -> TrieNode {
@@ -231,8 +248,30 @@ impl Trie {
         }
     }
 
-    /// Calculate the root hash
+    /// The root hash, a function of the key/value set only.
+    ///
+    /// A trie that has never seen a remove already has the insert-only shape,
+    /// so this is its structural hash. Otherwise the insert-only shape of the
+    /// current set is rebuilt (keys sorted, for a fixed build sequence) and
+    /// hashed.
     pub fn root_hash(&self) -> Hash {
+        if !self.removed {
+            return self.legacy_root_hash();
+        }
+        let mut entries: Vec<(&Vec<u8>, &Vec<u8>)> = self.cache.iter().collect();
+        entries.sort_unstable();
+        let mut rebuilt = Trie::new();
+        for (k, v) in entries {
+            rebuilt.insert(k.clone(), v.clone());
+        }
+        rebuilt.legacy_root_hash()
+    }
+
+    /// The structural hash of the trie as built, which depends on its remove
+    /// history. Consensus uses it only for state roots below the storage-root
+    /// hardening height, so historical blocks keep the root they were produced
+    /// with.
+    pub fn legacy_root_hash(&self) -> Hash {
         let encoded = self.encode_node(&self.root);
         let mut hasher = Keccak256::new();
         hasher.update(&encoded);
@@ -688,6 +727,111 @@ mod trie_shuffle_probe {
         }
     }
 
+    mod canonical_root {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Build a trie from `ops` (`Some(v)` = insert, `None` = remove) and the
+        /// insert-only trie of the resulting map in the given key order.
+        fn replay_and_rebuild(
+            ops: &[(Vec<u8>, Option<Vec<u8>>)],
+            rebuild_order_seed: u64,
+        ) -> (Trie, Trie) {
+            let mut replayed = Trie::new();
+            for (k, v) in ops {
+                match v {
+                    Some(v) => replayed.insert(k.clone(), v.clone()),
+                    None => replayed.remove(k),
+                }
+            }
+            let mut entries: Vec<(Vec<u8>, Vec<u8>)> = replayed.entries_map().into_iter().collect();
+            entries.sort();
+            // A seeded rotation, so the rebuild order is not always sorted.
+            if !entries.is_empty() {
+                let n = entries.len();
+                entries.rotate_left((rebuild_order_seed as usize) % n);
+            }
+            let mut rebuilt = Trie::new();
+            for (k, v) in entries {
+                rebuilt.insert(k, v);
+            }
+            (replayed, rebuilt)
+        }
+
+        proptest! {
+            /// The root is a function of the final key/value map: any history of
+            /// inserts, updates and removes hashes like an insert-only build of the
+            /// same map, in any insert order.
+            #[test]
+            fn prop_root_is_a_function_of_the_final_map(
+                ops in prop::collection::vec(
+                    (
+                        prop::collection::vec(0u8..4, 0..4),
+                        prop::option::weighted(0.7, prop::collection::vec(any::<u8>(), 0..3)),
+                    ),
+                    0..24,
+                ),
+                seed in any::<u64>(),
+            ) {
+                let (replayed, rebuilt) = replay_and_rebuild(&ops, seed);
+                prop_assert_eq!(replayed.root_hash(), rebuilt.root_hash());
+                // Remove-free builds keep the structural hash: the two functions
+                // agree wherever no remove happened.
+                prop_assert_eq!(rebuilt.root_hash(), rebuilt.legacy_root_hash());
+            }
+
+            /// Insert-only builds have one shape per map whatever the order, so the
+            /// remove-free fast path in `root_hash` is sound.
+            #[test]
+            fn prop_insert_only_shape_is_order_independent(
+                keys in prop::collection::vec(prop::collection::vec(0u8..4, 0..4), 0..20),
+                seed in any::<u64>(),
+            ) {
+                let ops: Vec<(Vec<u8>, Option<Vec<u8>>)> = keys
+                    .iter()
+                    .enumerate()
+                    .map(|(i, k)| (k.clone(), Some(vec![i as u8])))
+                    .collect();
+                let (forward, rebuilt) = replay_and_rebuild(&ops, seed);
+                prop_assert_eq!(forward.legacy_root_hash(), rebuilt.legacy_root_hash());
+            }
+        }
+
+        #[test]
+        fn legacy_root_keeps_the_remove_history_shape() {
+            // The minimal review case. The legacy hash still differs (historical
+            // roots are preserved); `root_hash` does not.
+            let (a, b, c) = (vec![0u8, 1], vec![0u8, 3, 0], vec![3u8]);
+            let ops = vec![
+                (a.clone(), Some(vec![9])),
+                (b, Some(vec![1])),
+                (c, Some(vec![2])),
+                (a, None),
+            ];
+            let (replayed, rebuilt) = replay_and_rebuild(&ops, 0);
+            assert_ne!(replayed.legacy_root_hash(), rebuilt.legacy_root_hash());
+            assert_eq!(replayed.root_hash(), rebuilt.root_hash());
+            assert_eq!(rebuilt.root_hash(), rebuilt.legacy_root_hash());
+        }
+
+        #[test]
+        fn removing_every_key_hashes_like_an_empty_trie() {
+            let mut t = Trie::new();
+            t.insert(vec![1, 2], vec![3]);
+            t.insert(vec![1, 2, 3], vec![4]);
+            t.remove(&[1, 2, 3]);
+            t.remove(&[1, 2]);
+            assert_eq!(t.root_hash(), Trie::new().root_hash());
+            // Removing an absent key changes nothing in the canonical hash.
+            let mut u = Trie::new();
+            u.insert(vec![0x10], vec![1]);
+            u.insert(vec![0x11], vec![2]);
+            let before = u.root_hash();
+            u.remove(&[0x12]);
+            assert_eq!(u.root_hash(), before);
+        }
+    }
+
     /// PANIC-S1 golden vector: a deterministic mix of inserts and removes over
     /// variable-length keys that prefix one another (exercising branch values,
     /// extension splits and branch simplification). The digest folds the root after
@@ -719,7 +863,9 @@ mod trie_shuffle_probe {
                 assert_eq!(trie.get(&key), Some(value));
                 live.push(key);
             }
-            fold.update(trie.root_hash().as_bytes());
+            // The legacy structural hash is the state-root function below the
+            // storage-root hardening height: it must not move.
+            fold.update(trie.legacy_root_hash().as_bytes());
         }
         hex::encode(fold.finalize())
     }

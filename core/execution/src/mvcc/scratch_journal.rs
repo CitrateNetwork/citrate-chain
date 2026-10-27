@@ -12,9 +12,9 @@
 use crate::mvcc::read_set::ReadSet;
 use crate::mvcc::version::ReadVersion;
 use crate::mvcc::write_set::WriteSet;
-use crate::types::Address;
+use crate::types::{Address, JobId, ModelId, ModelState, TrainingJob};
 use primitive_types::U256;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// One entry in the journal: the pending post-state for a single account.
 ///
@@ -81,6 +81,14 @@ pub struct ScratchJournal {
     /// coordinator inspects this and falls back to serial commit
     /// rather than risk a stale-code read.
     requires_serial_commit: bool,
+    /// (address, slot-key-bytes) removed by this tx. Disjoint from
+    /// `pending_storage`: the later of a write and a delete to one slot wins.
+    pending_storage_deletes: HashSet<(Address, Vec<u8>)>,
+    /// Model-registry entries written by this tx (registration, update,
+    /// usage stats), applied over `state_db` on drain.
+    pending_models: HashMap<ModelId, ModelState>,
+    /// Training-job entries written by this tx, applied over `state_db` on drain.
+    pending_jobs: HashMap<JobId, TrainingJob>,
 }
 
 impl ScratchJournal {
@@ -98,6 +106,9 @@ impl ScratchJournal {
         self.write_set.clear();
         self.pending.clear();
         self.pending_storage.clear();
+        self.pending_storage_deletes.clear();
+        self.pending_models.clear();
+        self.pending_jobs.clear();
         // H-03: fresh attempt resets the serial-commit flag.
         self.requires_serial_commit = false;
     }
@@ -141,6 +152,12 @@ impl ScratchJournal {
     pub fn record_write(&mut self, address: Address, write: PendingWrite) {
         self.write_set.record_write(address);
         self.pending.insert(address, write);
+    }
+
+    /// Record that this tx writes `address` without a balance/nonce/code
+    /// change (a registry slot), so the commit bumps its version.
+    pub fn mark_written(&mut self, address: Address) {
+        self.write_set.record_write(address);
     }
 
     /// Get the pending write for an account, if any.
@@ -192,7 +209,71 @@ impl ScratchJournal {
     /// include accounts that only changed via storage (not balance/nonce).
     pub fn record_storage_write(&mut self, address: Address, key: Vec<u8>, value: Vec<u8>) {
         self.write_set.record_write(address);
+        self.pending_storage_deletes.remove(&(address, key.clone()));
         self.pending_storage.insert((address, key), value);
+    }
+
+    /// Record a pending storage-slot removal. Drained with
+    /// `state_db.delete_storage`, so a committed delete lands exactly as the
+    /// direct call would.
+    pub fn record_storage_delete(&mut self, address: Address, key: Vec<u8>) {
+        self.write_set.record_write(address);
+        self.pending_storage.remove(&(address, key.clone()));
+        self.pending_storage_deletes.insert((address, key));
+    }
+
+    /// This tx's own view of one slot: `None` when the tx has not touched it
+    /// (fall through to `state_db`), `Some(None)` when it deleted it, and
+    /// `Some(Some(v))` when it wrote `v`.
+    pub fn storage_entry(&self, address: &Address, key: &[u8]) -> Option<Option<&[u8]>> {
+        let k = (*address, key.to_vec());
+        if self.pending_storage_deletes.contains(&k) {
+            return Some(None);
+        }
+        self.pending_storage.get(&k).map(|v| Some(v.as_slice()))
+    }
+
+    /// Iterate over pending storage-slot removals in arbitrary order.
+    pub fn iter_storage_deletes(&self) -> impl Iterator<Item = &(Address, Vec<u8>)> {
+        self.pending_storage_deletes.iter()
+    }
+
+    // ------------------------------------------------------------------------
+    // Model registry / training jobs
+    // ------------------------------------------------------------------------
+    //
+    // These stores are not keyed by account. The executor records a read and
+    // a write of a per-entry slot address (see `Executor::registry_slot`) next
+    // to each call, so MVCC validation sees the conflict.
+
+    /// Record the post-tx state of one model-registry entry.
+    pub fn record_model(&mut self, id: ModelId, model: ModelState) {
+        self.pending_models.insert(id, model);
+    }
+
+    /// This tx's pending state for a model, if it wrote one.
+    pub fn pending_model(&self, id: &ModelId) -> Option<&ModelState> {
+        self.pending_models.get(id)
+    }
+
+    /// Iterate over pending model-registry entries in arbitrary order.
+    pub fn iter_models(&self) -> impl Iterator<Item = (&ModelId, &ModelState)> {
+        self.pending_models.iter()
+    }
+
+    /// Record the post-tx state of one training job.
+    pub fn record_job(&mut self, id: JobId, job: TrainingJob) {
+        self.pending_jobs.insert(id, job);
+    }
+
+    /// This tx's pending state for a training job, if it wrote one.
+    pub fn pending_job(&self, id: &JobId) -> Option<&TrainingJob> {
+        self.pending_jobs.get(id)
+    }
+
+    /// Iterate over pending training-job entries in arbitrary order.
+    pub fn iter_jobs(&self) -> impl Iterator<Item = (&JobId, &TrainingJob)> {
+        self.pending_jobs.iter()
     }
 
     /// Look up a pending storage-slot write made earlier in this same tx.
@@ -275,6 +356,9 @@ impl ScratchJournal {
         self.write_set.clear();
         self.pending.clear();
         self.pending_storage.clear();
+        self.pending_storage_deletes.clear();
+        self.pending_models.clear();
+        self.pending_jobs.clear();
     }
 
     /// Discard pending writes only — clear `pending` (balance/nonce/code)
@@ -290,12 +374,84 @@ impl ScratchJournal {
     pub fn discard_writes(&mut self) {
         self.pending.clear();
         self.pending_storage.clear();
+        self.pending_storage_deletes.clear();
+        self.pending_models.clear();
+        self.pending_jobs.clear();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_delete_and_write_last_one_wins() {
+        let mut j = ScratchJournal::new();
+        let a = Address([1; 20]);
+        assert_eq!(j.storage_entry(&a, b"k"), None, "untouched");
+        j.record_storage_write(a, b"k".to_vec(), b"v".to_vec());
+        assert_eq!(j.storage_entry(&a, b"k"), Some(Some(&b"v"[..])));
+        j.record_storage_delete(a, b"k".to_vec());
+        assert_eq!(j.storage_entry(&a, b"k"), Some(None), "deleted");
+        assert_eq!(j.pending_storage(&a, b"k"), None);
+        assert_eq!(j.iter_storage_deletes().count(), 1);
+        j.record_storage_write(a, b"k".to_vec(), b"w".to_vec());
+        assert_eq!(j.storage_entry(&a, b"k"), Some(Some(&b"w"[..])));
+        assert_eq!(j.iter_storage_deletes().count(), 0);
+        assert!(j.write_set().contains(&a));
+    }
+
+    #[test]
+    fn discard_pin_and_clear_drop_deletes_models_and_jobs() {
+        use crate::types::{JobStatus, ModelMetadata, UsageStats};
+        use citrate_consensus::types::Hash;
+        let fill = |j: &mut ScratchJournal| {
+            j.record_storage_delete(Address([1; 20]), b"k".to_vec());
+            j.record_model(
+                ModelId(Hash::new([2; 32])),
+                ModelState {
+                    owner: Address([3; 20]),
+                    model_hash: Hash::new([2; 32]),
+                    version: 1,
+                    metadata: ModelMetadata::default(),
+                    access_policy: crate::types::AccessPolicy::Public,
+                    usage_stats: UsageStats::default(),
+                },
+            );
+            j.record_job(
+                JobId(Hash::new([4; 32])),
+                TrainingJob {
+                    id: JobId(Hash::new([4; 32])),
+                    owner: Address([3; 20]),
+                    model_id: ModelId(Hash::new([2; 32])),
+                    dataset_hash: Hash::new([5; 32]),
+                    participants: vec![],
+                    gradients_submitted: 0,
+                    gradients_required: 1,
+                    reward_pool: U256::zero(),
+                    status: JobStatus::Active,
+                    created_at: 0,
+                    completed_at: None,
+                },
+            );
+        };
+        let empty = |j: &ScratchJournal| {
+            j.iter_storage_deletes().count() == 0
+                && j.iter_models().count() == 0
+                && j.iter_jobs().count() == 0
+        };
+        let mut j = ScratchJournal::new();
+        fill(&mut j);
+        assert!(!empty(&j));
+        j.discard_writes();
+        assert!(empty(&j), "a revert drops them");
+        fill(&mut j);
+        j.pin_at(ReadVersion::from_raw(1));
+        assert!(empty(&j), "a fresh attempt drops them");
+        fill(&mut j);
+        j.clear();
+        assert!(empty(&j));
+    }
 
     fn addr(n: u8) -> Address {
         let mut a = [0u8; 20];
