@@ -35,3 +35,7 @@ jobs:
       # string anywhere under scripts/. Runs unprivileged with a sandboxed HOME.
       - name: Deploy-testnet supply-chain test
         run: bash scripts/tests/test_deploy_testnet_supply_chain.sh
+      - name: SALT supply tripwire self-test
+        run: scripts/ci/salt_supply_tripwire.sh --self-test
+      - name: SALT supply basis (contracts constant = core/economics; no literal governor supply)
+        run: scripts/ci/salt_supply_tripwire.sh

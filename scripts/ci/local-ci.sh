@@ -168,6 +168,7 @@ consensus_tripwires() {
     "scripts/ci/installer_test_sandbox_tripwire.sh" \
     "scripts/ci/wallet_gate_signing_tripwire.sh" \
     "scripts/ci/excluded_workspace_ci_tripwire.sh" \
+    "scripts/ci/salt_supply_tripwire.sh" \
   ; do
     if [ ! -x "$t" ]; then
       echo "missing/!executable tripwire: $t"; rc=1; continue
