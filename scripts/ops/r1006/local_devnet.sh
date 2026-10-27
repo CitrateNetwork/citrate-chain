@@ -8,7 +8,11 @@
 # or the host's services, and every process dies with the rehearsal.
 #
 #   local_devnet.sh --nodes 7 --work DIR [--steps "keys genesis-fill distribute start smoke"]
-#                   [--gate-minutes N] [--skip CHECKS] [--keep]
+#                   [--gate-minutes N] [--skip CHECKS] [--fill-cmd CMD]
+#
+# --fill-cmd: the genesis-fill command ({producers} {stakes} {out} as in r1006_bringup.sh);
+# default: the rehearsal stand-in (tests/fixtures/rehearsal_fill.py). For the real fill:
+#   --fill-cmd 'python3 scripts/genesis/r1006/fill_producers.py {producers} {stakes} {out}' 
 #
 # DIR/state must already hold a build (r1006_bringup.sh build --local-repo … --state DIR/state).
 # Timings go to DIR/rehearsal-timings.txt; the orchestrator's own log to DIR/rehearsal.log.
@@ -23,6 +27,7 @@ WORK=""
 STEPS="keys genesis-fill distribute start smoke status"
 GATE=10
 SKIP="orangeseed,admins"
+FILL_CMD=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --nodes) NODES="$2"; shift 2 ;;
@@ -30,6 +35,7 @@ while [[ $# -gt 0 ]]; do
     --steps) STEPS="$2"; shift 2 ;;
     --gate-minutes) GATE="$2"; shift 2 ;;
     --skip) SKIP="$2"; shift 2 ;;
+    --fill-cmd) FILL_CMD="$2"; shift 2 ;;
     *) echo "local_devnet: unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -39,7 +45,8 @@ WORK="$(cd "$WORK" && pwd)"
 
 if [[ "${R1006_IN_NS:-}" != 1 ]]; then
   exec unshare --user --map-root-user --net --mount --pid --fork --mount-proc \
-    env R1006_IN_NS=1 bash "$0" --nodes "$NODES" --work "$WORK" --steps "$STEPS" --gate-minutes "$GATE" --skip "$SKIP"
+    env R1006_IN_NS=1 bash "$0" --nodes "$NODES" --work "$WORK" --steps "$STEPS" --gate-minutes "$GATE" --skip "$SKIP" \
+    --fill-cmd "$FILL_CMD"
 fi
 
 # ---- inside the namespaces ---------------------------------------------------
@@ -95,11 +102,13 @@ run_step() {
 for s in $STEPS; do
   case "$s" in
     genesis-fill)
-      run_step genesis-fill --fill-cmd "python3 $FILL --producers {producers} --stakes {stakes} --out {out} --bin $WORK/state/bin/citrate-node" ;;
+      run_step genesis-fill --fill-cmd "${FILL_CMD:-python3 $FILL --producers {producers} --stakes {stakes} --out {out} --bin $WORK/state/bin/citrate-node}" ;;
     distribute) run_step distribute ;;
     start) run_step start --mining on --gate-minutes "$GATE" ;;
     smoke) run_step smoke --skip "$SKIP" ;;
     wipe-keys-refused) run_step wipe --wipe-keys ;;
+    stop) run_step stop ;;
+    wipe) run_step wipe ;;
     *) run_step "$s" ;;
   esac
 done
