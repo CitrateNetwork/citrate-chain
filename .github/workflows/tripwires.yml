@@ -39,7 +39,8 @@ jobs:
           rc=0
           for t in forge_script historical_state_read rpc_height_index \
                    finalization_publish_order shell_safety synthetic_pid_signal \
-                   tla_frame installer_test_sandbox wallet_gate_signing; do
+                   tla_frame installer_test_sandbox wallet_gate_signing \
+                   rpc_by_number_canonical; do
             s="scripts/ci/${t}_tripwire.sh"
             echo "::group::$s"
             "$s" --self-test || rc=1

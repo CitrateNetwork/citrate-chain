@@ -96,9 +96,10 @@ pub fn pruning_point_height(applied_height: u64, retain: u64) -> Option<u64> {
 
 /// Run one pruning pass. Returns the number of blocks dropped from the DAG store.
 ///
-/// Reads the canonical height->hash mapping from the CHAIN store, so the pruning
-/// point is always a block on the applied chain rather than whichever sibling
-/// the DAG happens to hold at that height.
+/// Reads the canonical height->hash mapping from the CHAIN store
+/// (`get_canonical_block_by_height`, chain#421), so the pruning point is always
+/// a block on the applied chain rather than whichever sibling was stored last
+/// at that height.
 pub async fn prune_once(
     storage: &StorageManager,
     dag_store: &DagStore,
@@ -110,7 +111,7 @@ pub async fn prune_once(
         return 0;
     };
 
-    let hash = match storage.blocks.get_block_by_height(point) {
+    let hash = match storage.blocks.get_canonical_block_by_height(point) {
         Ok(Some(h)) => h,
         Ok(None) => {
             debug!("dag-prune: no canonical block at height {point}; skipping this pass");

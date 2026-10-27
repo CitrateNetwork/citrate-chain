@@ -157,18 +157,11 @@ impl StateStoreTrait for StateStore {
         }
         // C1-R: the block's RPC receipt index commits in this same batch.
         crate::chain::transaction_store::stage_receipt_index(&self.db, &mut batch, index)?;
-        if let Some((hash, height)) = applied_tip {
-            // Same key + layout as BlockStore::put_applied_tip (hash[32] || height_be[8]).
-            let mut buf = [0u8; 40];
-            buf[..32].copy_from_slice(hash.as_bytes());
-            buf[32..].copy_from_slice(&height.to_be_bytes());
-            self.db.batch_put_cf(
-                &mut batch,
-                CF_METADATA,
-                crate::chain::block_store::APPLIED_TIP_KEY,
-                &buf,
-            )?;
-        }
+        // chain#421: the canonical height index moves with the tip, in this batch.
+        let _index_guard = match applied_tip {
+            Some((hash, height)) => Some(self.stage_applied_tip(&mut batch, &hash, height)?),
+            None => None,
+        };
 
         self.db.write_batch_sync(batch)?;
         debug!(
@@ -236,18 +229,11 @@ impl StateStoreTrait for StateStore {
         }
         // C1-R: the block's RPC receipt index commits in this same batch.
         crate::chain::transaction_store::stage_receipt_index(&self.db, &mut batch, index)?;
-        if let Some((hash, height)) = applied_tip {
-            // Same key + layout as BlockStore::put_applied_tip (hash[32] || height_be[8]).
-            let mut buf = [0u8; 40];
-            buf[..32].copy_from_slice(hash.as_bytes());
-            buf[32..].copy_from_slice(&height.to_be_bytes());
-            self.db.batch_put_cf(
-                &mut batch,
-                CF_METADATA,
-                crate::chain::block_store::APPLIED_TIP_KEY,
-                &buf,
-            )?;
-        }
+        // chain#421: the canonical height index moves with the tip, in this batch.
+        let _index_guard = match applied_tip {
+            Some((hash, height)) => Some(self.stage_applied_tip(&mut batch, &hash, height)?),
+            None => None,
+        };
 
         self.db.write_batch_sync(batch)?;
         debug!(
@@ -264,14 +250,9 @@ impl StateStoreTrait for StateStore {
     /// SRP-S3b: persist the applied-tip pointer alone (non-atomic fallback path). The
     /// atomic [`Self::write_state_batch_with_applied_tip`] is preferred for the commit path.
     fn put_applied_tip_meta(&self, hash: &Hash, height: u64) -> Result<()> {
-        let mut buf = [0u8; 40];
-        buf[..32].copy_from_slice(hash.as_bytes());
-        buf[32..].copy_from_slice(&height.to_be_bytes());
-        self.db.put_cf(
-            CF_METADATA,
-            crate::chain::block_store::APPLIED_TIP_KEY,
-            &buf,
-        )
+        let mut batch = self.db.batch();
+        let _index_guard = self.stage_applied_tip(&mut batch, hash, height)?;
+        self.db.write_batch_sync(batch)
     }
 
     /// C1-R: the receipt index on its own, as one fsync'd batch. The commit paths
@@ -350,6 +331,27 @@ impl StateStoreTrait for StateStore {
 }
 
 impl StateStore {
+    /// Stage the applied-tip pointer and the canonical height index for it into
+    /// `batch` (same key + layout as `BlockStore::put_applied_tip`). The returned
+    /// guard must be held until `batch` is committed: staging reads the index it
+    /// rewrites, so two tip writers must not interleave.
+    fn stage_applied_tip(
+        &self,
+        batch: &mut rocksdb::WriteBatch,
+        hash: &Hash,
+        height: u64,
+    ) -> Result<std::sync::MutexGuard<'static, ()>> {
+        let guard = crate::chain::block_store::canonical_index_lock();
+        crate::chain::block_store::stage_canonical_index(&self.db, batch, hash, height)?;
+        self.db.batch_put_cf(
+            batch,
+            CF_METADATA,
+            crate::chain::block_store::APPLIED_TIP_KEY,
+            &crate::chain::block_store::applied_tip_bytes(hash, height),
+        )?;
+        Ok(guard)
+    }
+
     pub fn new(db: Arc<RocksDB>) -> Self {
         Self { db }
     }

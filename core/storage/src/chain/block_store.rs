@@ -204,14 +204,72 @@ impl BlockStore {
         }
     }
 
-    /// The block this node's executed (canonical) chain holds at `height`.
+    /// The block on this node's executed chain at `height`: the block reached
+    /// by following `selected_parent_hash` links down from the applied tip.
+    /// This is what a by-number RPC lookup must name.
+    ///
+    /// [`Self::get_block_by_height`] is NOT that: it keeps the last block
+    /// STORED at a height, which can be a sibling that never executed. The
+    /// answer here comes from the canonical height index, which every write of
+    /// the applied tip rewrites in the same batch (see
+    /// [`stage_canonical_index`]). One extra read checks that the index
+    /// describes the current applied tip; if it does not (a data dir written by
+    /// a binary without the index), it is rebuilt before answering.
+    ///
+    /// * No applied tip (nothing executed yet): the stored index answers.
+    /// * Above the applied tip: the stored index answers (admitted blocks that
+    ///   have not executed yet; there is no canonical answer there yet).
+    /// * Below a hole in the executed chain's stored ancestry: `None`, never a
+    ///   guess.
     pub fn get_canonical_block_by_height(&self, height: u64) -> Result<Option<Hash>> {
-        self.get_block_by_height(height)
+        let applied = match self.get_applied_tip()? {
+            Some(tip) => tip,
+            None => return self.get_block_by_height(height),
+        };
+        let mut marker = read_canonical_marker(&self.db)?;
+        if marker.map(|m| (m.hash, m.height)) != Some(applied) {
+            self.sync_canonical_index()?;
+            marker = read_canonical_marker(&self.db)?;
+        }
+        let Some(m) = marker else {
+            return self.get_block_by_height(height);
+        };
+        if height > m.height {
+            return self.get_block_by_height(height);
+        }
+        if height < m.floor {
+            return Ok(None);
+        }
+        read_canonical_entry(&self.db, height)
     }
 
-    /// The applied tip the canonical height index currently describes.
+    /// The applied tip `(hash, height)` the canonical height index describes,
+    /// or `None` before it has been built.
     pub fn canonical_index_tip(&self) -> Result<Option<(Hash, u64)>> {
-        Ok(None)
+        Ok(read_canonical_marker(&self.db)?.map(|m| (m.hash, m.height)))
+    }
+
+    /// Bring the canonical height index to the persisted applied tip. A no-op
+    /// when it already describes that tip. Called on the first read after an
+    /// upgrade and at node start; tip writes keep it current afterwards.
+    pub fn sync_canonical_index(&self) -> Result<()> {
+        let _guard = canonical_index_lock();
+        let Some((hash, height)) = self.get_applied_tip()? else {
+            return Ok(());
+        };
+        if read_canonical_marker(&self.db)?.map(|m| (m.hash, m.height)) == Some((hash, height)) {
+            return Ok(());
+        }
+        let mut batch = self.db.batch();
+        let rewritten = stage_canonical_index(&self.db, &mut batch, &hash, height)?;
+        self.db.write_batch_sync(batch)?;
+        if rewritten > 1 {
+            info!(
+                "canonical height index rebuilt to {} @ {} ({} height(s) rewritten)",
+                hash, height, rewritten
+            );
+        }
+        Ok(())
     }
 
     /// Enumerate `(height, hash)` for every stored block whose height is in
@@ -309,11 +367,22 @@ impl BlockStore {
     /// post-execution state the executor now reflects). Written after
     /// `apply_block` succeeds. A single 40-byte value keeps the hash and
     /// height mutually consistent (no torn read across two keys).
+    ///
+    /// The canonical height index is rewritten for the new tip in the same
+    /// batch ([`stage_canonical_index`]). When it already describes this tip
+    /// (the usual case: the state commit that moved the tip staged it), this is
+    /// the single point write it always was.
     pub fn put_applied_tip(&self, hash: &Hash, height: u64) -> Result<()> {
-        let mut buf = [0u8; 40];
-        buf[..32].copy_from_slice(hash.as_bytes());
-        buf[32..].copy_from_slice(&height.to_be_bytes());
-        self.db.put_cf(CF_METADATA, APPLIED_TIP_KEY, &buf)
+        let buf = applied_tip_bytes(hash, height);
+        let _guard = canonical_index_lock();
+        if read_canonical_marker(&self.db)?.map(|m| (m.hash, m.height)) == Some((*hash, height)) {
+            return self.db.put_cf(CF_METADATA, APPLIED_TIP_KEY, &buf);
+        }
+        let mut batch = self.db.batch();
+        stage_canonical_index(&self.db, &mut batch, hash, height)?;
+        self.db
+            .batch_put_cf(&mut batch, CF_METADATA, APPLIED_TIP_KEY, &buf)?;
+        self.db.write_batch_sync(batch)
     }
 
     /// VALIDATOR-S1 §R': durably persist the materialized epoch reward snapshot
@@ -584,6 +653,149 @@ impl BlockStore {
         self.db.compact_cf(CF_BLUE_SET)?;
         Ok(())
     }
+}
+
+/// Canonical height index entry prefix (`CF_METADATA`): the key is this prefix
+/// followed by the 8-byte big-endian height, the value the 32-byte hash of the
+/// block on the executed chain at that height. Separate from the stored index
+/// (`h` ‖ height), which keeps the last block stored at a height.
+const CANONICAL_HEIGHT_PREFIX: &[u8] = b"canonical_h:";
+
+/// The applied tip the canonical index describes, and the lowest height it
+/// covers: hash[32] ‖ height_be[8] ‖ floor_be[8]. Entries at `floor..=height`
+/// are the executed chain of that tip; entries above `height` are leftovers of
+/// an abandoned higher tip and are never read.
+const CANONICAL_MARKER_KEY: &[u8] = b"canonical_tip";
+
+/// Serialises every read-modify-write of the canonical index (staging reads
+/// the marker and the entries it then overwrites). Process-wide: the block
+/// store and the state store both write the applied tip.
+static CANONICAL_INDEX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`CANONICAL_INDEX_LOCK`]. A poisoned lock is recovered: every index
+/// write is one atomic batch, so a panic cannot leave a half-written index.
+pub(crate) fn canonical_index_lock() -> std::sync::MutexGuard<'static, ()> {
+    CANONICAL_INDEX_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// The 40-byte applied-tip value: hash[32] ‖ height_be[8].
+pub(crate) fn applied_tip_bytes(hash: &Hash, height: u64) -> [u8; 40] {
+    let mut buf = [0u8; 40];
+    buf[..32].copy_from_slice(hash.as_bytes());
+    buf[32..].copy_from_slice(&height.to_be_bytes());
+    buf
+}
+
+fn canonical_key(height: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(CANONICAL_HEIGHT_PREFIX.len().saturating_add(8));
+    key.extend_from_slice(CANONICAL_HEIGHT_PREFIX);
+    key.extend_from_slice(&height.to_be_bytes());
+    key
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CanonicalMarker {
+    hash: Hash,
+    height: u64,
+    floor: u64,
+}
+
+fn read_canonical_marker(db: &RocksDB) -> Result<Option<CanonicalMarker>> {
+    let Some(bytes) = db.get_cf(CF_METADATA, CANONICAL_MARKER_KEY)? else {
+        return Ok(None);
+    };
+    // A short or corrupt marker reads as "no index": the next sync rebuilds it.
+    let (Some(hash), Some(height), Some(floor)) = (
+        bytes.get(..32).and_then(Hash::try_from_bytes),
+        bytes
+            .get(32..40)
+            .and_then(|s| <[u8; 8]>::try_from(s).ok())
+            .map(u64::from_be_bytes),
+        bytes
+            .get(40..48)
+            .and_then(|s| <[u8; 8]>::try_from(s).ok())
+            .map(u64::from_be_bytes),
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(CanonicalMarker {
+        hash,
+        height,
+        floor,
+    }))
+}
+
+fn read_canonical_entry(db: &RocksDB, height: u64) -> Result<Option<Hash>> {
+    Ok(db
+        .get_cf(CF_METADATA, &canonical_key(height))?
+        .and_then(|v| Hash::try_from_bytes(&v)))
+}
+
+fn read_header(db: &RocksDB, hash: &Hash) -> Result<Option<BlockHeader>> {
+    match db.get_cf(CF_HEADERS, hash.as_bytes())? {
+        Some(bytes) => Ok(bincode::deserialize(&bytes).ok()),
+        None => Ok(None),
+    }
+}
+
+/// Stage, into `batch`, the canonical height index for the applied tip
+/// `(tip, tip_height)`; returns the number of heights written. The caller
+/// commits `batch` together with the applied-tip pointer while holding
+/// [`canonical_index_lock`], so the index and the tip never disagree on disk.
+///
+/// The walk follows `selected_parent_hash` down from the tip, writing one
+/// entry per height, and stops at the first height where the index of the
+/// previous tip already names the same block: the previous index is the
+/// executed chain of the previous tip, and the selected-parent chain below a
+/// shared block is shared, so everything under it is already right. An
+/// extension costs one step, a reorg its depth, and a store with no index (a
+/// data dir from before this index) one walk to genesis.
+///
+/// A header missing from the store (or whose height does not match its
+/// position) ends the walk early; the marker's floor then records the lowest
+/// height the index covers, and lookups below it answer `None`.
+pub(crate) fn stage_canonical_index(
+    db: &RocksDB,
+    batch: &mut rocksdb::WriteBatch,
+    tip: &Hash,
+    tip_height: u64,
+) -> Result<u64> {
+    let previous = read_canonical_marker(db)?;
+    if previous.map(|m| (m.hash, m.height)) == Some((*tip, tip_height)) {
+        return Ok(0);
+    }
+    let mut written = 0u64;
+    let mut cur = *tip;
+    let mut height = tip_height;
+    let floor = loop {
+        if let Some(p) = previous {
+            if height >= p.floor
+                && height <= p.height
+                && read_canonical_entry(db, height)? == Some(cur)
+            {
+                break p.floor;
+            }
+        }
+        let header = match read_header(db, &cur)? {
+            Some(h) if h.height == height => h,
+            // Not stored (or inconsistent): nothing at or below this height is known.
+            _ => break height.saturating_add(1),
+        };
+        db.batch_put_cf(batch, CF_METADATA, &canonical_key(height), cur.as_bytes())?;
+        written = written.saturating_add(1);
+        if height == 0 {
+            break 0;
+        }
+        cur = header.selected_parent_hash;
+        height -= 1; // loop guard: height > 0 checked above
+    };
+    let mut marker = [0u8; 48];
+    marker[..40].copy_from_slice(&applied_tip_bytes(tip, tip_height));
+    marker[40..].copy_from_slice(&floor.to_be_bytes());
+    db.batch_put_cf(batch, CF_METADATA, CANONICAL_MARKER_KEY, &marker)?;
+    Ok(written)
 }
 
 // Key generation helpers
