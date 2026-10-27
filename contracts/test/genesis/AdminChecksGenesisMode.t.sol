@@ -75,6 +75,10 @@ contract AdminChecksGenesisModeTest is Test {
     string allocPath;
 
     function setUp() public {
+        // `genesis/` is gitignored (ceremony inputs/outputs), so a clean checkout has no such
+        // directory; create it (foundry.toml grants ./genesis read-write) so this suite does
+        // not depend on another suite having run first.
+        vm.createDir("genesis", true);
         h = new GenesisModeHarness();
         address[] memory p = new address[](1);
         p[0] = council;

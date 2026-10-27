@@ -626,8 +626,9 @@ abstract contract AdminChecks {
     //      (GENESIS_ALLOC, `{"alloc":{"<addr>":{"storage":{...}}}}`) is accounted for: an
     //      expected holder's `_roles[role].hasRole[holder]` slot, or `_minDelay` equal to
     //      getMinDelay(); a holder outside the expected set, a changed role admin or a scheduled
-    //      operation leaves an unexplained slot and fails. Each slot is also re-read from the
-    //      chain, so the allocation must be this chain's state.
+    //      operation leaves an unexplained slot and fails. Each allocation slot is also re-read
+    //      from the chain and must match it. This proves the allocation's slots are on this
+    //      chain; on its own it does not prove the chain holds no slot outside the allocation.
     //   For an AccessControlEnumerable timelock, the member lists are enumerated and compared
     //   exactly as well.
     // Mode: GENESIS_CHAIN=1 forces it, =0 disables it; otherwise it is on for a timelock with
