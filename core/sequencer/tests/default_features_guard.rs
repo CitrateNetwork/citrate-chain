@@ -103,3 +103,34 @@ fn default_feature_parser_detects_devnet() {
     let good = "[features]\ndefault = []\ndevnet = []\n";
     assert!(default_features(good).is_empty());
 }
+
+/// Red-first: the manifest spellings below each enable `devnet` and must be
+/// flagged by the tripwire.
+#[test]
+fn tripwire_flags_every_devnet_spelling() {
+    let mut missed = Vec::new();
+    let multi_line_default = "[features]\ndefault = [\n    \"devnet\",\n]\ndevnet = []\n";
+    if !default_features(multi_line_default)
+        .iter()
+        .any(|f| f == "devnet")
+    {
+        missed.push("multi-line default list");
+    }
+    let table_form =
+        "[dependencies.citrate-sequencer]\npath = \"../core/sequencer\"\nfeatures = [\"devnet\"]\n";
+    if !table_form
+        .lines()
+        .filter(|l| l.contains("citrate-sequencer"))
+        .any(|l| l.contains("devnet"))
+    {
+        missed.push("table-form dependency");
+    }
+    let forwarded = "[dependencies]\ncitrate-sequencer = { path = \"../core/sequencer\" }\n\n[features]\ndefault = [\"dev\"]\ndev = [\"citrate-sequencer/devnet\"]\n";
+    if !default_features(forwarded)
+        .iter()
+        .any(|f| f.contains("citrate-sequencer/devnet"))
+    {
+        missed.push("forwarded alias");
+    }
+    assert!(missed.is_empty(), "tripwire missed: {missed:?}");
+}
