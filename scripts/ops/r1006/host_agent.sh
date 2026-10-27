@@ -29,6 +29,11 @@
 #                              host, never over ssh); then `pub`
 #   pub                        the public identity, re-serialised from the checked fields
 #                              of identity.pub.json (anything else in the file is refused)
+#   registration-proof REGISTRY  the staged keytool's `registration-proof --registry REGISTRY`
+#                              (chain 40204, this host's staker, nonce 0), run as the citrate
+#                              user against a throwaway config naming only the data dir and
+#                              coinbase; its stderr goes to the 0600 keytool log; the proof is
+#                              checked and re-serialised here (public fields only)
 #   install-bin SHA256         incoming/citrate-node -> /usr/local/bin/citrate-node (hash-checked)
 #   write-config STAKER MINING gen_node_config.py with the staged per-host profile
 #   start HASH                 start the node with mining OFF; HASH must be the block 0
@@ -200,6 +205,76 @@ cmd_keys() {
   [[ $rc -eq 0 ]] || die "keytool failed (rc=$rc); its stderr stays on this host in $KEYTOOL_LOG"
   chmod 0644 "$PUB"
   cmd_pub
+}
+
+# The strict registration-proof check, run on the host: exactly the public fields, for
+# this host's staker and proposer key, re-serialised.
+PROOF_CHECK='
+import json, re, sys
+raw, pub, registry = sys.argv[1], json.load(open(sys.argv[2])), sys.argv[3]
+F = ["schema", "chain_id", "registry", "staker", "proposer_pubkey", "registration_sig"]
+try:
+    d = json.loads(raw)
+    ok = (isinstance(d, dict) and sorted(d) == sorted(F) and d["schema"] == "citrate-registration-proof/1"
+          and d["chain_id"] == 40204 and d["registry"] == registry and d["staker"] == pub["staker_address"]
+          and d["proposer_pubkey"] == pub["proposer_pubkey"]
+          and isinstance(d["registration_sig"], str) and re.match(r"^0x[0-9a-f]{128}$", d["registration_sig"]))
+except Exception:
+    ok = False
+if not ok:
+    sys.exit("host_agent: the registration proof is not exactly the public proof for this host; nothing sent")
+print(json.dumps({k: d[k] for k in F}, indent=2))
+'
+
+cmd_registration_proof() {
+  local reg="${1:-}"
+  [[ "$reg" =~ ^0x[0-9a-f]{40}$ ]] || die "registration-proof needs the ValidatorRegistry (0x + 40 lowercase hex)"
+  ensure_layout
+  local tool="$LIB/citrate-keytool"
+  [[ -f "$tool" && -f "$PUB" ]] || die "no keytool or public identity (run keys first)"
+  local staker t
+  staker=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["staker_address"])' "$PUB")
+  t=$(mktemp -d "${TMPDIR:-/tmp}/r1006-proof.XXXXXX")
+  chmod 0700 "$t"
+  [[ -n "$RUN_AS" ]] && chown "$RUN_AS:$RUN_AS" "$t"
+  # A throwaway config: the proof reads only the chain id, the coinbase and the data dir.
+  cat >"$t/node.toml" <<EOF
+[chain]
+chain_id = 40204
+genesis_hash = ""
+block_time = 2
+ghostdag_k = 18
+
+[network]
+listen_addr = "127.0.0.1:30399"
+bootstrap_nodes = []
+max_peers = 4
+allowed_peers = []
+
+[rpc]
+enabled = false
+listen_addr = "127.0.0.1:8545"
+ws_addr = "127.0.0.1:8546"
+allow_eth_send_transaction = false
+
+[storage]
+data_dir = "$DATA"
+pruning = false
+keep_blocks = 100000
+
+[mining]
+enabled = false
+coinbase = "${staker#0x}"
+target_block_time = 2
+min_gas_price = 1000000000
+EOF
+  [[ -n "$RUN_AS" ]] && chown "$RUN_AS:$RUN_AS" "$t/node.toml"
+  local out proof_tool_rc=0
+  (umask 077; : >>"$KEYTOOL_LOG")
+  out=$(as_node_user "$tool" --config "$t/node.toml" registration-proof --registry "$reg" 2>>"$KEYTOOL_LOG") || proof_tool_rc=$?
+  [[ "$t" == "${TMPDIR:-/tmp}"/r1006-proof.* ]] && rm -rf -- "${t:?}"
+  [[ $proof_tool_rc -eq 0 ]] || die "registration-proof failed (rc=$proof_tool_rc); its stderr stays on this host in $KEYTOOL_LOG"
+  python3 -c "$PROOF_CHECK" "$out" "$PUB" "$reg"
 }
 
 cmd_pub() {
@@ -541,6 +616,7 @@ shift || true
 case "$c" in
   keys) cmd_keys "$@" ;;
   pub) cmd_pub ;;
+  registration-proof) cmd_registration_proof "$@" ;;
   install-bin) cmd_install_bin "$@" ;;
   write-config) cmd_write_config "$@" ;;
   start) cmd_start "$@" ;;

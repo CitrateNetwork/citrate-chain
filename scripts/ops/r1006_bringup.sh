@@ -10,6 +10,8 @@
 #                                                  the r1006 genesis the binary compiles
 #   r1006_bringup.sh keys                          mint each host's keys ON the host (as citrate);
 #                                                  collect ONLY the public parts -> r1006-producers.json,
+#                                                  each host's registration proof for the committed
+#                                                  r1006 ValidatorRegistry -> r1006-registration-proofs.json,
 #                                                  and r1006-public-bootnodes.json for the cutover profile
 #   r1006_bringup.sh genesis-fill --fill-cmd CMD   producers + stake allocations -> genesis fill
 #                                                  (genesis hash, profile, registry) -> fill-result.json,
@@ -37,8 +39,9 @@
 # which never runs a node or key action. Anything else is refused before connecting.
 #
 # Genesis: genesis-fill, distribute and start refuse a release network's block 0 (r1005
-# testnet, team testnet, mainnet) and any block 0 that is not the r1006 genesis compiled
-# into the recorded build; a build that compiles none is refused.
+# testnet, team testnet, mainnet) and any block 0 but the R1006_GENESIS pin committed in
+# this checkout's core/consensus/src/hardening.rs, read at run time (it is re-pinned after
+# the fill and after the final rebuild); the recorded build must compile that same genesis.
 #
 # Host output: every agent call's stdout and stderr are checked on the host and again
 # here, in memory, before anything is printed or written; a key or password pattern fails
@@ -57,7 +60,8 @@
 #                 rehearsal) · --allow-non-main (rehearsal only; distribute refuses such a
 #                 binary for an ssh inventory)
 #   genesis-fill: --fill-cmd 'CMD {producers} {stakes} {out}' (the genesis builder's
-#                 validator-set fill; must write {out}/fill-result.json, see
+#                 validator-set fill, scripts/genesis/r1006/fill_producers.py; it reads
+#                 r1006-registration-proofs.json next to {producers}; must write {out}/fill-result.json, see
 #                 scripts/ops/r1006/render_profile.py) · --stake-salt N (32000) · --liquid-salt N (100)
 #   start:        --mining on|off (on; on: the validator set is in the genesis) · --gate-minutes N (10)
 #                 · --min-peers N (hosts-1) · --skip-producing-gate
@@ -439,6 +443,9 @@ need_build() {
 # ---- keys --------------------------------------------------------------------
 step_keys() {
   need_build
+  local REGISTRY
+  REGISTRY=$(python3 "$GUARD" committed --repo "$REPO" | cut -d' ' -f2) || die "no committed r1006 genesis/registry (see REFUSED above)"
+  [[ -n "$REGISTRY" ]] || die "no committed r1006 ValidatorRegistry"
   local s256
   s256=$(build_field sha256)
   mkdir -p "$STATE/pub"
@@ -454,20 +461,31 @@ step_keys() {
     local rc=0
     agent_identity "$h" "$STATE/pub/$h.pub.json" keys "$s256" || rc=$?
     [[ $rc -eq 0 ]] || { log "keys: $h refused (rc=$rc); nothing written for it; stopping"; exit "$rc"; }
+    # The proof of key control for the committed registry, checked the same way and
+    # against this host's own checked identity.
+    local st pk
+    st=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["staker_address"])' "$STATE/pub/$h.pub.json")
+    pk=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["proposer_pubkey"])' "$STATE/pub/$h.pub.json")
+    agent_cmd "$h" registration-proof "$REGISTRY"
+    python3 "$GUARD" relay --host "$h" --proof-out "$STATE/pub/$h.proof.json" --expect-staker "$st" \
+      --expect-proposer "$pk" --expect-registry "$REGISTRY" -- "${AGENT_CMD[@]}" <"$AGENT" || rc=$?
+    [[ $rc -eq 0 ]] || { log "keys: $h registration proof refused (rc=$rc); nothing written for it; stopping"; exit "$rc"; }
   done
   if [[ $DRY -eq 1 ]]; then
-    echo "  [dry-run] collect.py -> $STATE/r1006-producers.json + r1006-public-bootnodes.json (for the cutover profile)"
+    echo "  [dry-run] registration-proof --registry $REGISTRY on each host (checked on the host and here)"
+    echo "  [dry-run] collect.py -> $STATE/r1006-producers.json + r1006-registration-proofs.json + r1006-public-bootnodes.json"
     return 0
   fi
   python3 "$PY/collect.py" --inventory "$INVENTORY" --pub-dir "$STATE/pub" --out "$STATE/r1006-producers.json" \
-    --bootnodes-out "$STATE/r1006-public-bootnodes.json"
+    --bootnodes-out "$STATE/r1006-public-bootnodes.json" \
+    --proofs-out "$STATE/r1006-registration-proofs.json" --registry "$REGISTRY"
 }
 
 # ---- genesis checks ---------------------------------------------------------------
 # check_genesis FILL: refuse a release network's block 0, any profile but the compiled
 # r1006 one, a genesis file, and any block 0 but the recorded build's r1006 genesis.
 check_genesis() {
-  python3 "$GUARD" check-genesis --fill "$1" --build "$BUILD_JSON" || die "genesis refused (see REFUSED above)"
+  python3 "$GUARD" check-genesis --fill "$1" --build "$BUILD_JSON" --repo "$REPO" || die "genesis refused (see REFUSED above)"
 }
 
 # ---- genesis-fill --------------------------------------------------------------
@@ -481,7 +499,7 @@ step_genesis_fill() {
     echo "  [dry-run] render_profile.py stakes ($STAKE_SALT SALT bonded + $LIQUID_SALT SALT liquid per staker) -> $stakes"
     echo "  [dry-run] $FILL_CMD   with {producers}=$prod {stakes}=$stakes {out}=$out"
     echo "  [dry-run] render_profile.py check-fill: the fill lists exactly these validators and stakes"
-    echo "  [dry-run] guard.py check-genesis: profile r1006, no genesis file, block 0 == the build's r1006 genesis,"
+    echo "  [dry-run] guard.py check-genesis: profile r1006, no genesis file, block 0 == the committed R1006_GENESIS (and the build's),"
     echo "            never a release network's; only then $out -> $final"
     return 0
   fi
@@ -499,7 +517,7 @@ step_genesis_fill() {
     rm -rf -- "${out:?}"
     gate_fail "the genesis fill does not match the producer set"
   fi
-  if ! python3 "$GUARD" check-genesis --fill "$out/fill-result.json" --build "$BUILD_JSON"; then
+  if ! python3 "$GUARD" check-genesis --fill "$out/fill-result.json" --build "$BUILD_JSON" --repo "$REPO"; then
     rm -rf -- "${out:?}"
     die "genesis refused (see REFUSED above); the fill was discarded"
   fi
@@ -523,7 +541,7 @@ step_distribute() {
     check_genesis "$fill"
     gh=$(fill_field genesis_hash)
   else
-    echo "  [dry-run] guard.py check-genesis on the fill (r1006 profile, build's r1006 genesis, no release genesis)"
+    echo "  [dry-run] guard.py check-genesis on the fill (r1006 profile, committed R1006_GENESIS = the build's, committed registry, no release genesis)"
     gh="<genesis hash from fill-result.json>"
   fi
   mkdir -p "$STATE/profiles"

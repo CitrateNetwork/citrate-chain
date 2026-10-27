@@ -127,8 +127,10 @@ class Env:
         return subprocess.run(["bash", str(script), *args, "--inventory", str(self.inv), *st],
                               capture_output=True, text=True, env=e, timeout=300, stdin=subprocess.DEVNULL)
 
-    def fill_cmd(self, genesis_hash: str, profile: str = "r1006", genesis_file: str | None = None) -> str:
+    def fill_cmd(self, genesis_hash: str, profile: str = "r1006", genesis_file: str | None = None,
+                 registry: str | None = None) -> str:
         gf = f" --genesis-file {genesis_file}" if genesis_file else ""
+        gf += f" --registry {registry}" if registry else ""
         return (f"python3 {FILL_FIXTURE} --producers {{producers}} --stakes {{stakes}} --out {{out}} "
                 f"--genesis-hash {genesis_hash} --profile {profile}{gf}")
 
@@ -624,22 +626,29 @@ class GenesisRefusal(unittest.TestCase):
 
     def test_check_genesis_unit(self):
         import guard  # noqa: E402
-        build = {"r1006_genesis": R1006_TEST}
-        ok = {"genesis_hash": R1006_TEST, "genesis_profile": "r1006", "genesis_file": None}
-        self.assertEqual(guard.check_genesis(ok, build), [])
-        for label, fill, b in (
-            ("r1005 hash", dict(ok, genesis_hash=R1005), build),
-            ("team_testnet hash", dict(ok, genesis_hash="0x90044175c36a6491309d769bd0fa684afbf7b90b64136446db8e2e6ff0927553"), build),
-            ("profile testnet_beta", dict(ok, genesis_profile="testnet_beta"), build),
-            ("profile null", dict(ok, genesis_profile=None), build),
-            ("profile default", dict(ok, genesis_profile="default"), build),
-            ("genesis file", dict(ok, genesis_file="genesis.json"), build),
-            ("not the build's r1006 genesis", dict(ok, genesis_hash="0x" + "07" * 32), build),
-            ("build has no r1006 genesis", ok, {}),
-            ("build's r1006 genesis is r1005", dict(ok, genesis_hash=R1005), {"r1006_genesis": R1005}),
-        ):
-            with self.subTest(label):
-                self.assertNotEqual(guard.check_genesis(fill, b), [], label)
+        env = Env(1)
+        try:
+            repo = env.repo
+            build = {"r1006_genesis": R1006_TEST}
+            ok = {"genesis_hash": R1006_TEST, "genesis_profile": "r1006", "genesis_file": None,
+                  "validator_registry": REG_TEST}
+            self.assertEqual(guard.check_genesis(ok, build, repo), [])
+            for label, fill, b in (
+                ("r1005 hash", dict(ok, genesis_hash=R1005), build),
+                ("team_testnet hash", dict(ok, genesis_hash="0x90044175c36a6491309d769bd0fa684afbf7b90b64136446db8e2e6ff0927553"), build),
+                ("profile testnet_beta", dict(ok, genesis_profile="testnet_beta"), build),
+                ("profile null", dict(ok, genesis_profile=None), build),
+                ("profile default", dict(ok, genesis_profile="default"), build),
+                ("genesis file", dict(ok, genesis_file="genesis.json"), build),
+                ("not the committed r1006 genesis", dict(ok, genesis_hash="0x" + "07" * 32), build),
+                ("another registry", dict(ok, validator_registry="0x" + "ee" * 20), build),
+                ("build has no r1006 genesis", ok, {}),
+                ("build compiles another r1006 genesis", ok, {"r1006_genesis": "0x" + "07" * 32}),
+            ):
+                with self.subTest(label):
+                    self.assertNotEqual(guard.check_genesis(fill, b, repo), [], label)
+        finally:
+            env.close()
 
     def _keys(self, n=2) -> Env:
         env = Env(n)
@@ -714,8 +723,7 @@ class GenesisRefusal(unittest.TestCase):
     def test_genesis_fill_refuses_a_fill_for_another_registry(self):
         env = self._keys()
         try:
-            env.set_committed(R1006_TEST, "0x" + "ee" * 20)
-            r = env.run("genesis-fill", "--fill-cmd", env.fill_cmd(R1006_TEST))
+            r = env.run("genesis-fill", "--fill-cmd", env.fill_cmd(R1006_TEST, registry="0x" + "ee" * 20))
             self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertIn("registry", r.stdout + r.stderr)
         finally:

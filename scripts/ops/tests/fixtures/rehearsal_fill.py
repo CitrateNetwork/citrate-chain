@@ -34,7 +34,8 @@ from pathlib import Path
 ARACHNID = "0x4e59b44847b379578588920ca78fbf26c0b4956c"
 ARACHNID_CODE = ("0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0"
                  "3601600081602082378035828234f58015156039578182fd5b8082525050506014600cf3")
-REHEARSAL_REGISTRY = "0x0000000000000000000000000000000000001006"  # no code: a stand-in value
+# The committed r1006 book's ValidatorRegistry (the bring-up runs the fill from the repo root).
+BOOK = Path("contracts/addresses/r1006/40204.json")
 
 
 def probe_block0(binary: str) -> str:
@@ -102,6 +103,7 @@ def main() -> int:
     ap.add_argument("--genesis-hash", help="write this block 0 instead of probing (tests)")
     ap.add_argument("--profile", default="r1006", help="genesis_profile to write (tests; 'null' = None)")
     ap.add_argument("--genesis-file", help="genesis_file to write (tests)")
+    ap.add_argument("--registry", help="validator_registry to write instead of the committed book's (tests)")
     a = ap.parse_args()
     if not a.genesis_hash and not a.bin:
         ap.error("--bin or --genesis-hash")
@@ -119,8 +121,9 @@ def main() -> int:
         "alloc_file": "alloc.json",
         "address_book": None,
         "orangeseed": None,
-        "validator_registry": REHEARSAL_REGISTRY,
-        "validator_activation_height": 800,
+        "validator_registry": a.registry or json.loads(BOOK.read_text())["contracts"]["ValidatorRegistry"].lower(),
+        "validator_activation_height": 1000,
+        "validators_at_genesis": True,
         "validators": [{"proposer_pubkey": p["proposer_pubkey"], "staker": p["staker_address"],
                         "stake_wei": stakes[p["staker_address"].lower()]["stake_wei"]} for p in prod["producers"]],
         "source": "REHEARSAL STAND-IN (scripts/ops/tests/fixtures/rehearsal_fill.py): compiled r1006 profile "

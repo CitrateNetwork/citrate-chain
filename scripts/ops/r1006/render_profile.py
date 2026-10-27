@@ -30,9 +30,9 @@ between the genesis builder and this bring-up:
                                                 CheckDeployedAdmins input (DEPLOYER-ADMIN 0)
    "orangeseed": "0x<20 bytes>" | null,
    "validator_registry": "0x<20 bytes>",
-   "validator_activation_height": N,
+   "validator_activation_height": N,             >= 800 (S(1)); r1006: 1000
    "validators": [{"proposer_pubkey", "staker", "stake_wei"}],
-   "validators_at_genesis": true | false,       true: the set is in block 0 (activation may be 0)
+   "validators_at_genesis": true | false,       true: the set is in block 0 (still activates at >= 800)
    "source": "<what produced it>"}
 """
 
@@ -47,6 +47,8 @@ from pathlib import Path
 B32 = re.compile(r"^0x[0-9a-fA-F]{64}$")
 ADDR = re.compile(r"^0x[0-9a-fA-F]{40}$")
 WEI_PER_SALT = 10**18
+# The node refuses a validator activation height below S(1) = EPOCH - SNAPSHOT_LAG = 800.
+MIN_ACTIVATION = 800
 
 
 class RenderError(Exception):
@@ -73,8 +75,9 @@ def check_fill(fill: dict, producers: dict, stakes: dict | None) -> list[str]:
     if not ADDR.match(str(fill.get("validator_registry", ""))):
         out.append("validator_registry is not an address")
     h = fill.get("validator_activation_height")
-    if not isinstance(h, int) or h < 0:
-        out.append("validator_activation_height is not a height")
+    if not isinstance(h, int) or isinstance(h, bool) or h < MIN_ACTIVATION:
+        out.append(f"validator_activation_height {h!r} is below S(1)={MIN_ACTIVATION}: the node refuses it "
+                   "(r1006 activates its genesis registrations at 1000)")
     if not fill.get("genesis_profile") and not fill.get("genesis_file"):
         out.append("neither genesis_profile nor genesis_file is set: the hosts cannot select this genesis")
     vals = fill.get("validators")

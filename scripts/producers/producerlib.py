@@ -151,10 +151,9 @@ def profile_problems(prof: Profile) -> list[str]:
     if not ADDR_RE.match(str(r["validator_registry"])):
         out.append("validator_registry unset")
     h = r["validator_activation_height"]
-    # A validator set written into the genesis (r1006) is active from block 0. Every other
-    # network registers validators on chain, and they can't be active before S(1).
-    at_genesis = r.get("validators_at_genesis") is True
-    if not isinstance(h, int) or h < 0 or (h < EPOCH - SNAPSHOT_LAG and not at_genesis):
+    # The node refuses an activation height below S(1) = 800, also for a validator set
+    # written into the genesis (r1006 activates its block-0 registrations at 1000).
+    if not isinstance(h, int) or h < EPOCH - SNAPSHOT_LAG:
         out.append("validator_activation_height unset or below S(1)=800")
     if not str(r["public_rpc"]).startswith(("https://", "http://")):
         out.append("public_rpc unset")

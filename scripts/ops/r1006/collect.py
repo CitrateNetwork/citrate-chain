@@ -12,7 +12,14 @@ a private key never has a place to hide in this file. Keys must be distinct acro
 hosts (one key on two hosts is equivocation) and the staker must be the coinbase
 (executor check 3c).
 
-  collect.py --inventory inv.json --pub-dir state/pub --out state/r1006-producers.json
+  collect.py --inventory inv.json --pub-dir state/pub --out state/r1006-producers.json \
+      [--proofs-out state/r1006-registration-proofs.json --registry 0x..]
+
+With --proofs-out, each host's `<name>.proof.json` (its `citrate registration-proof`
+output, already checked on the host and by guard.py) is checked again against that
+host's identity and the registry, and written in inventory order as
+{"schema": "r1006-registration-proofs/1", "proofs": [...]}, the input of
+scripts/genesis/r1006/fill_producers.py.
 """
 
 from __future__ import annotations
@@ -117,6 +124,26 @@ def collect(inventory: Path, pub_dir: Path, chain_id: int, p2p_port: int) -> dic
     }
 
 
+def collect_proofs(inventory: Path, pub_dir: Path, producers: dict, registry: str) -> dict:
+    import guard  # noqa: E402  (same directory; guard imports this module)
+    by_name = {p["name"]: p for p in producers["producers"]}
+    proofs = []
+    for h in load_inventory(inventory):
+        f = pub_dir / f"{h['name']}.proof.json"
+        if not f.is_file():
+            raise CollectError(f"{h['name']}: no registration proof at {f}")
+        p = by_name[h["name"]]
+        try:
+            proofs.append(guard.check_proof(h["name"], f.read_text(), p["staker_address"], p["proposer_pubkey"],
+                                            registry))
+        except guard.GuardError as e:
+            raise CollectError(str(e)) from None
+    return {"schema": "r1006-registration-proofs/1", "registry": registry.lower(),
+            "note": "Each producer's proposer-key signature over the registry's registration digest, made on "
+                    "its own host. Public values only.",
+            "proofs": proofs}
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--inventory", required=True, type=Path)
@@ -126,9 +153,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--p2p-port", type=int, default=30303)
     ap.add_argument("--bootnodes-out", type=Path,
                     help="also write the public bootnode list (noise id @ ip:port) for the cutover network profile")
+    ap.add_argument("--proofs-out", type=Path, help="also write r1006-registration-proofs.json")
+    ap.add_argument("--registry", help="the r1006 ValidatorRegistry the proofs must name (with --proofs-out)")
     a = ap.parse_args(argv)
     try:
         doc = collect(a.inventory, a.pub_dir, a.chain_id, a.p2p_port)
+        proofs = None
+        if a.proofs_out:
+            if not a.registry:
+                raise CollectError("--proofs-out needs --registry")
+            proofs = collect_proofs(a.inventory, a.pub_dir, doc, a.registry)
     except (CollectError, OSError, json.JSONDecodeError) as e:
         print(f"collect: {e}", file=sys.stderr)
         return 2
@@ -145,6 +179,11 @@ def main(argv: list[str] | None = None) -> int:
         t2.write_text(json.dumps(b, indent=2) + "\n")
         t2.replace(a.bootnodes_out)
         print(f"collect: public bootnode list -> {a.bootnodes_out}")
+    if proofs is not None:
+        t3 = a.proofs_out.with_suffix(a.proofs_out.suffix + ".tmp")
+        t3.write_text(json.dumps(proofs, indent=2) + "\n")
+        t3.replace(a.proofs_out)
+        print(f"collect: {len(proofs['proofs'])} registration proof(s) -> {a.proofs_out}")
     return 0
 
 
