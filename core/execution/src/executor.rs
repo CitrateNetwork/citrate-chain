@@ -222,6 +222,12 @@ pub struct Executor {
     /// as of Sprint P950-A-3 (2026-04-21). Design proven in
     /// `specs/tla/consensus/ExecutorMVCC.tla`.
     commit_coordinator: Arc<CommitCoordinator>,
+    /// Follower catch-up group commit: fsync only every Nth RECEIVED block's
+    /// state batch (0 or 1 = every one, the default). See
+    /// [`Executor::set_catchup_group_commit`].
+    catchup_group_commit: std::sync::atomic::AtomicU64,
+    /// Received-block state batches written unsynced since the last synced one.
+    unsynced_commits: std::sync::atomic::AtomicU64,
     /// EXECUTE-ON-RECEIVE: when true, the eager account/code/nonce setters
     /// (`set_balance`/`set_code`/`set_nonce`) DEFER durable persistence — they
     /// mutate in-memory state + dirty-tracking only, leaving the store write to
@@ -615,6 +621,20 @@ pub trait StateStoreTrait: Send + Sync {
     /// C1-R: `index` is the block's RPC receipt index, committed in the same batch
     /// (see [`ReceiptIndexBatch`]); the default writes it last via
     /// [`Self::put_receipt_index`].
+    /// Catch-up group commit: the same single atomic batch as
+    /// [`Self::write_state_batch_with_applied_tip`], without forcing an fsync
+    /// (see [`Executor::set_catchup_group_commit`]). Stores that cannot tell
+    /// the two apart fall back to the synced write.
+    fn write_state_batch_with_applied_tip_unsynced(
+        &self,
+        accounts: &[(Address, crate::types::AccountState)],
+        storage: &[StateStorageChange],
+        applied_tip: Option<(Hash, u64)>,
+        index: &ReceiptIndexBatch,
+    ) -> anyhow::Result<()> {
+        self.write_state_batch_with_applied_tip(accounts, storage, applied_tip, index)
+    }
+
     fn write_state_batch_with_applied_tip(
         &self,
         accounts: &[(Address, crate::types::AccountState)],
@@ -881,6 +901,8 @@ impl Executor {
             chain_id,
             block_context: std::sync::RwLock::new(crate::revm_adapter::BlockContext::default()),
             commit_coordinator: Arc::new(CommitCoordinator::new()),
+            catchup_group_commit: std::sync::atomic::AtomicU64::new(1),
+            unsynced_commits: std::sync::atomic::AtomicU64::new(0),
             defer_persist: std::sync::atomic::AtomicBool::new(false),
             reward_policy: crate::block_rewards::new_shared_reward_policy(),
             validator_activation_height: std::sync::atomic::AtomicU64::new(u64::MAX),
@@ -1027,6 +1049,8 @@ impl Executor {
             chain_id,
             block_context: std::sync::RwLock::new(crate::revm_adapter::BlockContext::default()),
             commit_coordinator,
+            catchup_group_commit: std::sync::atomic::AtomicU64::new(1),
+            unsynced_commits: std::sync::atomic::AtomicU64::new(0),
             defer_persist: std::sync::atomic::AtomicBool::new(false),
             reward_policy: crate::block_rewards::new_shared_reward_policy(),
             validator_activation_height: std::sync::atomic::AtomicU64::new(u64::MAX),
@@ -1197,6 +1221,61 @@ impl Executor {
         applied_tip: Option<(Hash, u64)>,
         index: &ReceiptIndexBatch,
     ) -> anyhow::Result<usize> {
+        self.persist_state_changes_inner(applied_tip, index, true)
+            .await
+    }
+
+    /// Follower catch-up group commit. While a node is far behind the network
+    /// it applies thousands of blocks it will never produce on, and an fsync
+    /// per block is most of the cost of applying one. With `every = N > 1`,
+    /// only every Nth RECEIVED block's state batch is fsynced; the others are
+    /// written as the same single atomic batch (state + applied tip + receipt
+    /// index) without one. Every column family shares one RocksDB write-ahead
+    /// log, so each synced batch also makes the unsynced ones before it
+    /// durable. A process crash keeps all of them; a power loss can roll the
+    /// store back by up to N - 1 blocks, to a complete earlier block boundary
+    /// (never torn), which the node then re-applies.
+    ///
+    /// Only the receive path (`apply_block`) honours this; the producer's
+    /// [`Self::persist_state_changes_with_tip`] always fsyncs. `every <= 1`
+    /// (the default) restores an fsync per block.
+    pub fn set_catchup_group_commit(&self, every: u64) {
+        self.catchup_group_commit
+            .store(every, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The current catch-up group-commit size (1 = fsync every block).
+    pub fn catchup_group_commit(&self) -> u64 {
+        self.catchup_group_commit
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Should the next received block's state batch be fsynced?
+    fn next_received_commit_syncs(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let every = self.catchup_group_commit.load(Ordering::SeqCst);
+        if every <= 1 {
+            self.unsynced_commits.store(0, Ordering::SeqCst);
+            return true;
+        }
+        let n = self
+            .unsynced_commits
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1);
+        if n >= every {
+            self.unsynced_commits.store(0, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn persist_state_changes_inner(
+        &self,
+        applied_tip: Option<(Hash, u64)>,
+        index: &ReceiptIndexBatch,
+        sync: bool,
+    ) -> anyhow::Result<usize> {
         let _guard = self.commit_coordinator.acquire_exec_lock().await;
         if let Some(store) = &self.state_store {
             let dirty_accounts = self.state_db.accounts.get_dirty_accounts();
@@ -1231,12 +1310,21 @@ impl Executor {
             // Write state + the applied-tip pointer ATOMICALLY. Always write when a tip
             // is supplied (even with 0 dirty changes — the tip must still advance).
             if count > 0 || applied_tip.is_some() || !index.is_empty() {
-                store.write_state_batch_with_applied_tip(
-                    &account_changes,
-                    &storage_changes,
-                    applied_tip,
-                    index,
-                )?;
+                if sync {
+                    store.write_state_batch_with_applied_tip(
+                        &account_changes,
+                        &storage_changes,
+                        applied_tip,
+                        index,
+                    )?;
+                } else {
+                    store.write_state_batch_with_applied_tip_unsynced(
+                        &account_changes,
+                        &storage_changes,
+                        applied_tip,
+                        index,
+                    )?;
+                }
             }
 
             // Commit state DB (clears dirty tracking)
@@ -1807,10 +1895,14 @@ impl Executor {
         // a block (not only its producer) can serve them, with no crash window between
         // "block applied" and "receipts stored".
         let index = ReceiptIndexBatch::for_block(block, &receipts);
+        // Receive path: honours the follower catch-up group commit (the
+        // producer's `persist_state_changes_with_tip` always fsyncs).
+        let sync = self.next_received_commit_syncs();
         if let Err(e) = self
-            .persist_state_changes_with_tip_and_index(
+            .persist_state_changes_inner(
                 Some((block.header.block_hash, block.header.height)),
                 &index,
+                sync,
             )
             .await
         {
@@ -2658,6 +2750,8 @@ impl Executor {
             // journal + WriteSet, so no version bumps escape — identical to the prior
             // in-place simulate, minus the shared-state mutation.
             commit_coordinator: self.commit_coordinator.clone(),
+            catchup_group_commit: std::sync::atomic::AtomicU64::new(1),
+            unsynced_commits: std::sync::atomic::AtomicU64::new(0),
             defer_persist: std::sync::atomic::AtomicBool::new(false),
             reward_policy: self.reward_policy.clone(),
             validator_activation_height: std::sync::atomic::AtomicU64::new(

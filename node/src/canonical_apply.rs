@@ -744,6 +744,12 @@ impl CanonicalApplicator {
         }
     }
 
+    /// Follower catch-up group commit for received blocks (see
+    /// `Executor::set_catchup_group_commit`). `every <= 1` fsyncs every block.
+    pub fn set_catchup_group_commit(&self, every: u64) {
+        self.executor.set_catchup_group_commit(every);
+    }
+
     /// Wire the genesis world state + block hash used by the RUNTIME reorg fallback
     /// (`drive_drain` → `recover_to_head`) for forks deeper than the retained ring.
     /// Idempotent: the first call wins (a second is ignored). Call once at startup,
