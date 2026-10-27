@@ -133,6 +133,15 @@ ExecStart=/usr/local/bin/citrate-node --config /etc/citrate/node.toml
 Restart=always
 RestartSec=5s
 LimitNOFILE=65536
+# Memory backstop sized for an 8 GB host: throttle reclaim at 6 GiB, kill at
+# 6.5 GiB (Restart=always brings the node back), and bound swap so a growing
+# node is restarted instead of thrashing the box.
+MemoryHigh=6G
+MemoryMax=6656M
+MemorySwapMax=1G
+# Two glibc malloc arenas: with the default (8 per core) the node's RSS kept
+# creeping under sustained load from arena fragmentation; capped, it is flat.
+Environment=MALLOC_ARENA_MAX=2
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
