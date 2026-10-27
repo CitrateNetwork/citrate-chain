@@ -139,6 +139,9 @@ LimitNOFILE=65536
 MemoryHigh=6G
 MemoryMax=6656M
 MemorySwapMax=1G
+# Two glibc malloc arenas: with the default (8 per core) the node's RSS kept
+# creeping under sustained load from arena fragmentation; capped, it is flat.
+Environment=MALLOC_ARENA_MAX=2
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
