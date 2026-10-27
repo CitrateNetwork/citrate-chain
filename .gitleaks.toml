@@ -1,4 +1,4 @@
-# gitleaks config: the default ruleset plus ONE narrow value allowlist.
+# gitleaks config: the default ruleset plus narrow exact-value allowlists.
 # Address books list public contract addresses under names such as
 # "ModelAccessControl", which the default generic-api-key rule misreads as a
 # credential. A value that is exactly an EVM address (0x + 40 hex) is public
@@ -11,3 +11,12 @@ useDefault = true
 description = "Public EVM addresses (0x + 40 hex) are not secrets"
 regexTarget = "secret"
 regexes = ['''^0x[0-9a-fA-F]{40}$''']
+
+[[allowlists]]
+description = "Public OpenPGP fingerprint of DigitalOcean's do-agent apt signing key"
+# scripts/ops/producer_baseline.sh pins this fingerprint (DO_AGENT_KEY_FPR) so a
+# swapped signing key is refused. A key fingerprint is public by definition: it
+# identifies the key and grants nothing. Only this exact value is allowed; any
+# other 40-hex string next to a key-like name is still reported.
+regexTarget = "secret"
+regexes = ['''^902C44B42EA9A17F8578510977B79B3FFAF7EF65$''']
