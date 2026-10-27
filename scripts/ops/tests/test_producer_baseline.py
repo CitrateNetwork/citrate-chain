@@ -111,7 +111,7 @@ class UnitTemplateTest(unittest.TestCase):
 
     def test_unit_caps_node_memory_for_an_8gb_host(self) -> None:
         t = self.template()
-        for line in ("MemoryHigh=6G", "MemoryMax=6656M", "MemorySwapMax=1G"):
+        for line in ("MemoryHigh=6G", "MemoryMax=6656M", "MemorySwapMax=1G", "Environment=MALLOC_ARENA_MAX=2"):
             self.assertIn(line + "\n", t)
 
     def test_unit_matches_gen_node_config(self) -> None:
