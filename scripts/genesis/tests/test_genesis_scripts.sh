@@ -2581,6 +2581,29 @@ rm -rf "$LIBT/bc"; lib_bc "$LIBT/bc" 6000 "" CitAgentTimelockX
 expect "library: a deployment the table does not name fails" 1 'deployed CitAgentTimelockX at 0x0+5fff, which the library table does not name' -- lib_build "$LIBT/bc" "$LIBT/b3.json"
 rm -rf "$LIBT/bc"; lib_bc "$LIBT/bc" 4000
 expect "library: a broadcast from before block 0 is no evidence" 1 'no broadcast since this chain.s block 0' -- lib_build "$LIBT/bc" "$LIBT/b4.json"
+# broadcast_run.py on its own: one fault per record, each enough to make it partial; a complete
+# record (and only that) is sent.
+BRT="$T/brun"
+br_case() { # <name> <want sent|partial> <json>
+  rm -rf "$BRT"; mkdir -p "$BRT/X.s.sol/40204"
+  printf '%s' "$3" >"$BRT/X.s.sol/40204/run-6000.json"
+  local got
+  got=$(python3 -I "$G/broadcast_run.py" scripts --broadcast "$BRT" --chain 40204 --since 5000 X.s.sol | awk '{print $1}')
+  [[ "$got" == "$2" ]] && ok "broadcast_run: $1 is ${2:-not a run of this chain}" || bad "broadcast_run: $1 is ${2:-not a run of this chain} (got '$got')" "$3"
+}
+H1=0x$(printf '%064d' 1) H2=0x$(printf '%064d' 2)
+TX1="{\"hash\":\"$H1\",\"transactionType\":\"CREATE\",\"contractName\":\"A\",\"contractAddress\":\"$(addr 5)\"}"
+TX2="{\"hash\":\"$H2\",\"transactionType\":\"CREATE\",\"contractName\":\"B\",\"contractAddress\":\"$(addr 6)\"}"
+R1="{\"transactionHash\":\"$H1\",\"status\":\"0x1\"}" R2="{\"transactionHash\":\"$H2\",\"status\":\"0x1\"}"
+br_case "a complete record (hashes, receipts 0x1, nothing pending)" sent "{\"timestamp\":6000,\"transactions\":[$TX1,$TX2],\"receipts\":[$R1,$R2],\"pending\":[]}"
+br_case "forge's partial record (a hash pending, one never sent, no receipts)" partial "{\"timestamp\":6000,\"transactions\":[$TX1,{\"hash\":null,\"transactionType\":\"CREATE\",\"contractName\":\"B\",\"contractAddress\":\"$(addr 6)\"}],\"receipts\":[],\"pending\":[\"$H1\"]}"
+br_case "a record with only a pending entry (every hash has a receipt)" partial "{\"timestamp\":6000,\"transactions\":[$TX1,$TX2],\"receipts\":[$R1,$R2],\"pending\":[\"$H2\"]}"
+br_case "a record with only a never-sent transaction (hash null, nothing pending)" partial "{\"timestamp\":6000,\"transactions\":[$TX1,{\"hash\":null,\"transactionType\":\"CREATE\",\"contractName\":\"B\",\"contractAddress\":\"$(addr 6)\"}],\"receipts\":[$R1],\"pending\":[]}"
+br_case "a record with a hash but no receipt" partial "{\"timestamp\":6000,\"transactions\":[$TX1,$TX2],\"receipts\":[$R1],\"pending\":[]}"
+br_case "a record with a reverted receipt (status 0x0)" partial "{\"timestamp\":6000,\"transactions\":[$TX1,$TX2],\"receipts\":[$R1,{\"transactionHash\":\"$H2\",\"status\":\"0x0\"}],\"pending\":[]}"
+br_case "an unreadable record" partial "{not json"
+br_case "a record from before block 0 (not this run's; control)" "" "{\"timestamp\":4000,\"transactions\":[$TX1],\"receipts\":[],\"pending\":[\"$H1\"]}"
+rm -rf "$BRT"
 # A script that stopped part-way: forge 1.8.3 still writes run-*.json, listing the deployments it
 # never sent (hash null) and the unconfirmed one in "pending", with no receipts. None of them
 # counts as deployed, so the book cannot be built from it (with or without --partial).
