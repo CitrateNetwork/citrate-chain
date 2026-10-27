@@ -169,12 +169,69 @@ To                         Action      From
 30303/udp (v6)             ALLOW IN    Anywhere (v6)
 """
 
+RESTRICTED_UFW = (GOOD_UFW
+                  .replace("22/tcp                     ALLOW IN    Anywhere\n",
+                           "22/tcp                     ALLOW IN    198.51.100.7\n")
+                  .replace("22/tcp (v6)                ALLOW IN    Anywhere (v6)\n", ""))
+
 
 class FirewallTest(unittest.TestCase):
-    def verdict(self, text: str) -> subprocess.CompletedProcess[str]:
+    def verdict(self, text: str, *args: str, **env: str) -> subprocess.CompletedProcess[str]:
         e = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": tempfile.gettempdir()}
-        return subprocess.run(["bash", str(SCRIPT), "check-ufw-status"], input=text,
+        e.update(env)
+        return subprocess.run(["bash", str(SCRIPT), "check-ufw-status", *args], input=text,
                               capture_output=True, text=True, env=e, timeout=30)
+
+    @staticmethod
+    def ssh_row(r: subprocess.CompletedProcess[str]) -> str:
+        rows = [l for l in r.stdout.splitlines() if re.match(r"^(PASS|WARN|FAIL)\s+ssh-source\s", l)]
+        return rows[0] if len(rows) == 1 else f"<{len(rows)} ssh-source rows>"
+
+    def test_ssh_source_restricted_passes(self) -> None:
+        r = self.verdict(RESTRICTED_UFW)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(self.ssh_row(r), r"^PASS\s+ssh-source\s.*198\.51\.100\.7/32")
+
+    def test_ssh_source_open_is_reported(self) -> None:
+        # No host allowlist configured: open 22/tcp is the documented default (the
+        # provider firewall filters sources), reported as WARN, not hidden.
+        r = self.verdict(GOOD_UFW)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        row = self.ssh_row(r)
+        self.assertRegex(row, r"^WARN\s+ssh-source\s.*Anywhere")
+        self.assertIn("citrate-producer-fw", row)
+
+    def test_ssh_source_restricted_plus_open_fails(self) -> None:
+        # A restriction with an open rule next to it is the widened state.
+        r = self.verdict(RESTRICTED_UFW + "22/tcp                     ALLOW IN    Anywhere\n")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertRegex(self.ssh_row(r), r"^FAIL\s+ssh-source\s")
+
+    def test_ssh_source_against_an_allowlist(self) -> None:
+        cases = [
+            (GOOD_UFW, "198.51.100.0/24", 1),                     # open to Anywhere
+            (RESTRICTED_UFW, "198.51.100.7/32", 0),
+            (RESTRICTED_UFW, "198.51.100.7", 0),                  # bare address = /32
+            (RESTRICTED_UFW, "203.0.113.0/24", 1),                # source outside the allowlist
+            (RESTRICTED_UFW, "198.51.100.7,203.0.113.9", 1),      # an allowlist entry has no rule
+            (RESTRICTED_UFW.replace("198.51.100.7", "198.51.100.0/24"), "198.51.100.7/32", 1),  # wider
+        ]
+        for text, allow, rc in cases:
+            r = self.verdict(text, "--ssh-from", allow)
+            self.assertEqual(r.returncode, rc, f"--ssh-from {allow}: {r.stdout}{r.stderr}")
+            self.assertRegex(self.ssh_row(r), "^PASS" if rc == 0 else "^FAIL", allow)
+            r = self.verdict(text, CITRATE_SSH_ALLOW_FROM=allow)
+            self.assertEqual(r.returncode, rc, f"env {allow}: {r.stdout}{r.stderr}")
+
+    def test_bad_allowlist_is_refused(self) -> None:
+        for bad in ("0.0.0.0/0", "::/0", "198.51.100.0/24,0.0.0.0/0", "not-an-ip", "", "198.51.100.7/33"):
+            r = self.verdict(RESTRICTED_UFW, "--ssh-from", bad)
+            self.assertEqual(r.returncode, 2, f"{bad!r}: {r.stdout}{r.stderr}")
+
+    def test_ssh_limit_rule_is_accepted(self) -> None:
+        text = GOOD_UFW.replace("22/tcp                     ALLOW IN", "22/tcp                     LIMIT IN")
+        r = self.verdict(text)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
     def test_runbook_policy_passes(self) -> None:
         r = self.verdict(GOOD_UFW)
@@ -254,11 +311,18 @@ case "$name" in
     fi
     if [ "${1:-}" = show ]; then echo "${SHIM_SOCKET_LISTEN:-}"; exit 0; fi ;;
   ufw)
+    [ "${1:-}" = --force ] && shift
     case "${1:-}" in
-      allow)
+      allow|limit)
         if [ -n "${SHIM_UFW_FAIL:-}" ] && [ "$2" = "$SHIM_UFW_FAIL" ]; then exit 1; fi
         if [ -z "${SHIM_UFW_DROP:-}" ] || [ "$2" != "$SHIM_UFW_DROP" ]; then
-          echo "ufw allow $2" >>"$SHIM_DIR/ufw_added"
+          grep -qxF "ufw $*" "$SHIM_DIR/ufw_added" 2>/dev/null || echo "ufw $*" >>"$SHIM_DIR/ufw_added"
+        fi ;;
+      delete)
+        shift
+        if [ -f "$SHIM_DIR/ufw_added" ]; then
+          grep -vxF "ufw $*" "$SHIM_DIR/ufw_added" >"$SHIM_DIR/ufw_added.new" || true
+          mv "$SHIM_DIR/ufw_added.new" "$SHIM_DIR/ufw_added"
         fi ;;
       show)
         echo "Added user rules (see 'ufw status' for running firewall):"
@@ -281,7 +345,8 @@ esac
 exit 0
 """
 SHIMMED = ("sshd", "systemctl", "ufw", "apt-get", "install", "chown", "getent", "id",
-           "useradd", "groupadd", "curl", "sysctl", "swapon", "timedatectl", "chronyc")
+           "useradd", "groupadd", "curl", "sysctl", "swapon", "timedatectl", "chronyc",
+           "fallocate", "mkswap")
 DEFAULT_SSHD_T = (
     "port 22\nlistenaddress [::]:22\nlistenaddress 0.0.0.0:22\n"
     "authorizedkeysfile .ssh/authorized_keys .ssh/authorized_keys2\n"
@@ -559,6 +624,186 @@ class ApplyStepsTest(ShimTestCase):
             r = subprocess.run(["bash", str(SCRIPT), mode], capture_output=True, text=True, env=e, timeout=30)
             self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
             self.assertIn("PRODUCER_BASELINE_ROOT", r.stderr)
+
+
+RESTRICTED_RULE = "ufw allow from 198.51.100.7 to any port 22 proto tcp"
+
+
+class SshSourceTest(ShimTestCase):
+    """apply never widens SSH at the host; an allowlist narrows it without lockout."""
+
+    def added(self) -> list[str]:
+        f = self.sb.tmp / "ufw_added"
+        return f.read_text().splitlines() if f.exists() else []
+
+    def preset(self, *rules: str) -> None:
+        (self.sb.tmp / "ufw_added").write_text("".join(r + "\n" for r in rules))
+
+    def ufw_mutations(self) -> list[str]:
+        return [c for c in self.sb.calls("ufw") if not c.startswith(("ufw status", "ufw show"))]
+
+    def test_default_adds_the_open_rule_once(self) -> None:
+        for _ in range(2):
+            r = self.sb.run("apply_firewall")
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.sb.calls().count("ufw allow 22/tcp"), 1, self.sb.calls("ufw"))
+        self.assertFalse((self.sb.root / "etc/citrate/ssh-allow-from").exists())
+
+    def test_existing_restricted_rule_is_not_widened(self) -> None:
+        for existing in (RESTRICTED_RULE, "ufw limit 22/tcp", "ufw allow from 10.0.0.0/8",
+                         "ufw allow in on eth1 from 198.51.100.0/24 to any port 22 proto tcp"):
+            self.sb.log.write_text("")
+            self.preset(existing)
+            r = self.sb.run("apply_firewall")
+            self.assertEqual(r.returncode, 0, f"{existing}: {r.stdout}{r.stderr}")
+            self.assertNotIn("ufw allow 22/tcp", self.sb.calls(), existing)
+            self.assertEqual([l for l in self.added() if "22" in l or "from" in l], [existing])
+            self.assertIn("ufw --force enable", self.sb.calls(), existing)
+
+    def test_unrelated_rule_does_not_count_as_ssh(self) -> None:  # negative control
+        for other in ("ufw allow 80/tcp", "ufw allow from 198.51.100.7 to any port 8545 proto tcp",
+                      "ufw allow 22/udp", "ufw allow out 22/tcp", "ufw deny from 198.51.100.7 to any port 22"):
+            self.sb.log.write_text("")
+            self.preset(other)
+            r = self.sb.run("apply_firewall")
+            self.assertEqual(r.returncode, 0, f"{other}: {r.stdout}{r.stderr}")
+            self.assertIn("ufw allow 22/tcp", self.sb.calls(), other)
+
+    def test_allowlist_installs_source_rules_and_drops_the_open_one(self) -> None:
+        self.preset("ufw allow 22/tcp")
+        r = self.sb.run("apply_firewall", CITRATE_SSH_ALLOW_FROM="198.51.100.0/24, 2001:db8::/32")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        muts = self.ufw_mutations()
+        a4 = "ufw allow from 198.51.100.0/24 to any port 22 proto tcp"
+        a6 = "ufw allow from 2001:db8::/32 to any port 22 proto tcp"
+        rm = "ufw --force delete allow 22/tcp"
+        for c in (a4, a6, rm, "ufw --force enable"):
+            self.assertIn(c, muts)
+        self.assertNotIn("ufw allow 22/tcp", muts)
+        # the open rule goes only after both source rules exist, and before enable
+        self.assertLess(max(muts.index(a4), muts.index(a6)), muts.index(rm))
+        self.assertLess(muts.index(rm), muts.index("ufw --force enable"))
+        self.assertEqual(sorted(l for l in self.added() if "22" in l), sorted([a4, a6]))
+        pol = (self.sb.root / "etc/citrate/ssh-allow-from").read_text()
+        self.assertEqual([l for l in pol.splitlines() if l and not l.startswith("#")],
+                         ["198.51.100.0/24", "2001:db8::/32"])
+
+    def test_allowlist_is_kept_on_a_rerun_without_it(self) -> None:
+        r = self.sb.run("apply_firewall", CITRATE_SSH_ALLOW_FROM="198.51.100.0/24")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.sb.log.write_text("")
+        r = self.sb.run("apply_firewall")  # no flag, no env: the recorded policy holds
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual([c for c in self.ufw_mutations() if "22" in c], [])
+        self.assertEqual([l for l in self.added() if "22" in l],
+                         ["ufw allow from 198.51.100.0/24 to any port 22 proto tcp"])
+
+    def test_allowlist_not_enabled_when_a_source_rule_is_missing(self) -> None:
+        self.preset("ufw allow 22/tcp")
+        r = self.sb.run("apply_firewall", CITRATE_SSH_ALLOW_FROM="198.51.100.0/24", SHIM_UFW_DROP="from")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertEqual([c for c in self.ufw_mutations()
+                          if "enable" in c or "default" in c or "delete" in c], [])
+        self.assertIn("ufw allow 22/tcp", self.added())  # open rule left as it was
+
+    def test_allowlist_needs_the_session_inside_it(self) -> None:
+        self.sb.add_key()
+        allow = {"CITRATE_SSH_ALLOW_FROM": "198.51.100.0/24,2001:db8::/32"}
+        cases = [
+            ({"SSH_CONNECTION": "203.0.113.5 50000 10.0.0.1 22"}, 2),
+            ({"SSH_CONNECTION": "198.51.100.20 50000 10.0.0.1 22"}, 0),
+            ({"SSH_CLIENT": "198.51.100.20 50000 22"}, 0),
+            ({"SSH_CLIENT": "203.0.113.5 50000 22"}, 2),
+            ({"SSH_CONNECTION": "::ffff:198.51.100.20 50000 ::ffff:10.0.0.1 22"}, 0),
+            ({"SSH_CONNECTION": "2001:db8::7 50000 2001:db8::1 22"}, 0),
+            ({"SSH_CONNECTION": "2001:db9::7 50000 2001:db8::1 22"}, 2),
+            ({}, 2),  # no SSH session to place: refuse rather than guess
+        ]
+        for sess, rc in cases:
+            r = self.sb.run("preflight", **allow, **sess)
+            self.assertEqual(r.returncode, rc, f"{sess}: {r.stdout}{r.stderr}")
+            if rc:
+                self.assertIn("SSH", r.stderr, sess)
+        r = self.sb.run("preflight", SSH_CONNECTION="203.0.113.5 50000 10.0.0.1 22")
+        self.assertEqual(r.returncode, 0, "no allowlist: no source check " + r.stdout + r.stderr)
+
+    def test_session_outside_existing_restricted_rules_is_refused(self) -> None:
+        self.sb.add_key()
+        self.preset(RESTRICTED_RULE)
+        r = self.sb.run("preflight", SSH_CONNECTION="203.0.113.5 50000 10.0.0.1 22")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("203.0.113.5", r.stderr)
+        r = self.sb.run("preflight", SSH_CONNECTION="198.51.100.7 50000 10.0.0.1 22")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        r = self.sb.run("preflight")  # console: nothing to lock out
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_apply_outside_the_allowlist_changes_nothing(self) -> None:
+        self.sb.add_key()
+        r = self.sb.run("do_apply", CITRATE_SSH_ALLOW_FROM="198.51.100.0/24",
+                        SSH_CONNECTION="203.0.113.5 50000 10.0.0.1 22")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        mutating = [c for c in self.sb.calls()
+                    if c.split(" ", 1)[0] in ("apt-get", "install", "chown", "useradd", "groupadd",
+                                              "fallocate", "mkswap")
+                    or c.startswith("ufw ") and not c.startswith(("ufw status", "ufw show"))
+                    or (c.startswith("systemctl ") and not c.startswith(("systemctl is-active", "systemctl show")))]
+        self.assertEqual(mutating, [])
+        written = sorted(str(p.relative_to(self.sb.root)) for p in self.sb.root.rglob("*") if p.is_file())
+        self.assertEqual(written, ["etc/logrotate.conf", "etc/os-release", "root/.ssh/authorized_keys"])
+
+    def test_dispatch_refuses_a_bad_allowlist_before_anything(self) -> None:
+        e = {"PATH": f"{self.sb.bin}:/usr/bin:/bin", "HOME": str(self.sb.tmp / "home"),
+             "SHIM_LOG": str(self.sb.log), "SHIM_DIR": str(self.sb.tmp)}
+        for args in (["apply", "--ssh-from", "0.0.0.0/0"], ["check", "--ssh-from", "bogus"],
+                     ["apply", "--ssh-from"], ["apply", "--bogus"]):
+            r = subprocess.run(["bash", str(SCRIPT), *args], capture_output=True, text=True, env=e, timeout=30)
+            self.assertEqual(r.returncode, 2, f"{args}: {r.stdout}{r.stderr}")
+        self.assertEqual(self.sb.calls(), [])
+
+    def test_header_documents_the_provider_firewall(self) -> None:
+        head = SCRIPT.read_text().split("set -euo pipefail", 1)[0]
+        self.assertIn("citrate-producer-fw", head)
+        self.assertIn("--ssh-from", head)
+
+
+class PreflightPortTest(ShimTestCase):
+    def test_refuses_when_sshd_reports_no_port_line(self) -> None:
+        self.sb.add_key()
+        (self.sb.tmp / "sshd_T").write_text("authorizedkeysfile .ssh/authorized_keys\npasswordauthentication no\n")
+        r = self.sb.run("preflight")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("port", r.stderr)
+
+
+class GitleaksConfigTest(unittest.TestCase):
+    """The scanner allowlist names exact public values only; it never loosens a rule."""
+
+    CFG = ROOT / ".gitleaks.toml"
+
+    @staticmethod
+    def loose(regexes: list[str]) -> list[str]:
+        # Each entry must be fully anchored, with no wildcard or alternation that
+        # could match a credential-shaped string beyond the reviewed value class.
+        return [r for r in regexes if not (r.startswith("^") and r.endswith("$")) or re.search(r"\.\*|\.\+|\|", r)]
+
+    def regexes(self) -> list[str]:
+        return re.findall(r"'''(.*?)'''", self.CFG.read_text())
+
+    def test_allowlist_entries_are_exact(self) -> None:
+        rx = self.regexes()
+        self.assertEqual(self.loose(rx), [])
+        # no path- or commit-wide exemptions
+        self.assertEqual([l for l in self.CFG.read_text().splitlines() if re.match(r"\s*(paths|commits)\s*=", l)], [])
+
+    def test_do_agent_fingerprint_is_allowed_exactly(self) -> None:
+        fpr = re.search(r"^DO_AGENT_KEY_FPR=([0-9A-F]{40})$", SCRIPT.read_text(), re.M)
+        assert fpr
+        self.assertIn(f"^{fpr.group(1)}$", self.regexes())
+
+    def test_loose_detects_wide_entries(self) -> None:  # negative control
+        self.assertEqual(self.loose(["^0x[0-9a-fA-F]{40}$", "^ABC$"]), [])
+        self.assertEqual(len(self.loose(["902C44", "^.*$", "^a|b$", "^[0-9A-F]+"])), 4)
 
 
 class DoAgentKeyTest(ShimTestCase):
