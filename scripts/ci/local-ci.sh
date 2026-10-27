@@ -310,6 +310,8 @@ else
     # Real `forge script --broadcast` run of the C4 genesis ceremony on anvil 40204: catches
     # script-only failures (e.g. `address(this)` on a run path) that `forge test` cannot.
     gate "genesis-pipeline" "$REPO_ROOT/scripts/ci/genesis-pipeline-anvil.sh"
+    # OrangeSeed genesis predeploy: storage-layout snapshot + ERC-7201 namespace (self-test first).
+    gate "orangeseed-layout" bash -c "'$REPO_ROOT/scripts/ci/orangeseed_storage_layout.sh' --self-test && '$REPO_ROOT/scripts/ci/orangeseed_storage_layout.sh'"
   fi
 fi
 
