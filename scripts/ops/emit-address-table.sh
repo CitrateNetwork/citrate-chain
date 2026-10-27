@@ -15,7 +15,34 @@
 #     for the EW-S1 ERC-4337 stack.
 #
 # Output:
-#   - contracts/addresses/40204.json — the canonical table.
+#   - contracts/addresses/40204.json — the canonical table (EMIT_OUTPUT overrides the path).
+#     Every address in it is written in one canonical spelling, lowercase, whatever case its
+#     source used (an EIP-55 checksummed EMIT_DEPLOYER, a .env.testnet pin, a static block), so
+#     the same inputs give the same book byte for byte.
+#
+# Optional inputs (env):
+#   EMIT_DEPLOYER         the deployer the book names. regenesis.sh passes the DEPLOYER_ADDRESS
+#                         it deployed with. Without it: DEPLOYER_ADDRESS from .env.testnet, then
+#                         the historical default.
+#   EMIT_OUTPUT           where to write the book (default contracts/addresses/40204.json).
+#   EMIT_FRESH_GENESIS=1  a fresh genesis (scripts/genesis/genesis_ceremony.sh P2). The book is
+#                         built from this run's broadcasts only:
+#                           - EMIT_DEPLOYER is required (no .env.testnet or default fallback);
+#                           - EMIT_BROADCAST_SINCE (unix seconds, the block-0 timestamp) is
+#                             required; a broadcast recorded before it belongs to another
+#                             chain and is skipped;
+#                           - .env.testnet is not read at all (no AA, coop or deployer pins
+#                             from an earlier chain);
+#                           - nothing is carried forward from the previous book: no stale
+#                             .contracts entry, no stale root alias or governance block (the
+#                             names it would have carried are logged instead);
+#                           - the root governance block is GOVERNANCE/GUARDIAN from the env
+#                             (the ceremony sets them from its P1 output), when both are set.
+#                         Re-running it over the same broadcasts and env gives the same file.
+#   EMIT_MEMBERSHIP_SCRIPT  the broadcast the membership entries come from:
+#                         DeployCoreMembership.s.sol (default, the reroll path) or
+#                         DeployGenesisMembership.s.sol (chain#331; regenesis.sh
+#                         --genesis-membership sets it). Only that one is read.
 #
 # Dependencies: jq (for JSON parsing).
 #
@@ -27,15 +54,53 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BROADCAST_ROOT="${REPO_ROOT}/contracts/broadcast"
-OUTPUT="${REPO_ROOT}/contracts/addresses/40204.json"
+OUTPUT="${EMIT_OUTPUT:-${REPO_ROOT}/contracts/addresses/40204.json}"
 ENV_TESTNET="${ENV_TESTNET:-${REPO_ROOT}/../.env.testnet}"
+FRESH="${EMIT_FRESH_GENESIS:-0}"
 
 CHAIN_ID=40204
+MEMBERSHIP_SCRIPT="${EMIT_MEMBERSHIP_SCRIPT:-DeployCoreMembership.s.sol}"
 
 err() { echo "[emit-address-table] ERROR: $*" >&2; }
 log() { echo "[emit-address-table] $*"; }
 
 command -v jq >/dev/null || { err "jq is required"; exit 1; }
+is_addr() { [[ "$1" =~ ^0x[0-9a-fA-F]{40}$ ]]; }
+
+if [[ -n "${EMIT_DEPLOYER:-}" ]] && ! is_addr "$EMIT_DEPLOYER"; then
+  err "EMIT_DEPLOYER is not an address: ${EMIT_DEPLOYER}"
+  exit 1
+fi
+# One canonical spelling (lowercase): a checksummed and a lowercase deployer are one book.
+EMIT_DEPLOYER="$(printf '%s' "${EMIT_DEPLOYER:-}" | tr 'A-F' 'a-f')"
+SINCE=0
+if [[ "$FRESH" == "1" ]]; then
+  [[ -n "${EMIT_DEPLOYER:-}" ]] || { err "EMIT_FRESH_GENESIS=1 needs EMIT_DEPLOYER (the run's deployer)"; exit 1; }
+  [[ "${EMIT_BROADCAST_SINCE:-}" =~ ^[0-9]+$ ]] ||
+    { err "EMIT_FRESH_GENESIS=1 needs EMIT_BROADCAST_SINCE (unix seconds: the block-0 timestamp)"; exit 1; }
+  SINCE="$EMIT_BROADCAST_SINCE"
+  # No pin from an earlier chain: .env.testnet is never read in a fresh genesis.
+  ENV_TESTNET=/dev/null
+  log "FRESH GENESIS: this run's broadcasts only (since ${SINCE}), deployer ${EMIT_DEPLOYER}, nothing carried from the previous book"
+elif [[ "$FRESH" != "0" ]]; then
+  err "EMIT_FRESH_GENESIS must be 0 or 1"
+  exit 1
+fi
+case "$MEMBERSHIP_SCRIPT" in
+  DeployCoreMembership.s.sol | DeployGenesisMembership.s.sol) ;;
+  *) err "EMIT_MEMBERSHIP_SCRIPT must be DeployCoreMembership.s.sol or DeployGenesisMembership.s.sol (got ${MEMBERSHIP_SCRIPT})"; exit 1 ;;
+esac
+
+# bc_usable <broadcast>: in a fresh genesis, only a broadcast recorded at or after
+# EMIT_BROADCAST_SINCE counts (forge writes .timestamp in seconds; older Foundry in ms).
+bc_usable() {
+  [[ "$FRESH" == "1" ]] || return 0
+  local ts
+  ts=$(jq -r '.timestamp // empty' "$1" 2>/dev/null) || return 1
+  [[ "$ts" =~ ^[0-9]+$ ]] || { err "$1 has no numeric timestamp"; return 1; }
+  if ((ts > 1000000000000)); then ts=$((ts / 1000)); fi
+  ((ts >= SINCE))
+}
 
 # The 7 ceremonies that produce chain-40204 broadcasts. Adding a new
 # ceremony? List it here so its CREATEs are included.
@@ -62,6 +127,12 @@ CEREMONIES=(
   # table — the contract was live and unreachable for every consumer, and the
   # WO-1 handoff recorded it as "not delivered" as a result.
   "DeployValidatorRegistry.s.sol"
+  # Membership (regenesis.sh runs it last): CitrateMemberSBT, MemberBond, the
+  # MembershipStakeVault implementation and its ERC1967Proxy. The PROXY is the vault address
+  # the federation pins, so it is special-cased below like DeployScopedSBTs. Which script
+  # deployed it is EMIT_MEMBERSHIP_SCRIPT (DeployCoreMembership, or DeployGenesisMembership in
+  # the genesis ceremony); the other one's broadcast is not read.
+  "$MEMBERSHIP_SCRIPT"
   # Homestead org-scoped SBTs (cit-agent hierarchy): FacilitySBT + NetworkSBT,
   # each deployed behind a UUPS ERC1967Proxy. The PROXY is the canonical,
   # frozen address-book entry (the impl is upgradeable behind it). Because both
@@ -80,6 +151,8 @@ trap 'rm -f "$contracts_jq" "$aa_jq"' EXIT
 
 echo "{}" > "$contracts_jq"
 echo "{}" > "$aa_jq"
+USED_BROADCASTS=()
+MEMBERSHIP_REGENERATED=0
 
 for ceremony in "${CEREMONIES[@]}"; do
   bc="${BROADCAST_ROOT}/${ceremony}/${CHAIN_ID}/run-latest.json"
@@ -87,6 +160,11 @@ for ceremony in "${CEREMONIES[@]}"; do
     log "skip ${ceremony} (no broadcast at ${bc})"
     continue
   fi
+  if ! bc_usable "$bc"; then
+    log "skip ${ceremony} (broadcast recorded before this genesis: ${bc})"
+    continue
+  fi
+  USED_BROADCASTS+=("$bc")
   log "merging ${ceremony}"
   # forge writes transactions with .transactionType = "CREATE" for new
   # deployments and a .contractName that names the Solidity contract.
@@ -118,6 +196,30 @@ for ceremony in "${CEREMONIES[@]}"; do
       | with_entries(select(.value != "") | .value |= ascii_downcase)
     ' "$bc")
     jq --argjson new "$pairs" '. + $new' "$contracts_jq" > "${contracts_jq}.tmp" && mv "${contracts_jq}.tmp" "$contracts_jq"
+  elif [[ "$ceremony" == "$MEMBERSHIP_SCRIPT" ]]; then
+    # The membership script deploys CitrateMemberSBT, MemberBond, the MembershipStakeVault
+    # implementation, then ERC1967Proxy(impl, initialize(...)). The book keeps the
+    # implementation/proxy distinction: MembershipStakeVaultImpl is the implementation,
+    # MembershipStakeVault is the proxy (THE vault address).
+    pairs=$(jq -c '
+      .transactions
+      | map(select((.transactionType == "CREATE" or .transactionType == "CREATE2") and .contractAddress != null))
+      | . as $txs
+      | def last_of(n): (($txs | map(select(.contractName == n)) | last | .contractAddress) // "");
+      {
+        CitrateMemberSBT:         last_of("CitrateMemberSBT"),
+        MemberBond:               last_of("MemberBond"),
+        MembershipStakeVaultImpl: last_of("MembershipStakeVault"),
+        MembershipStakeVault:     last_of("ERC1967Proxy")
+      }
+      | with_entries(select(.value != "") | .value |= ascii_downcase)
+    ' "$bc")
+    if [[ "$(jq 'length' <<<"$pairs")" != 4 ]]; then
+      err "${bc}: expected CitrateMemberSBT, MemberBond, MembershipStakeVault and its ERC1967Proxy; got ${pairs}"
+      exit 2
+    fi
+    MEMBERSHIP_REGENERATED=1
+    jq --argjson new "$pairs" '. + $new' "$contracts_jq" > "${contracts_jq}.tmp" && mv "${contracts_jq}.tmp" "$contracts_jq"
   elif [[ "$ceremony" == "DeployAA.s.sol" || "$ceremony" == "DeployAndPinAA.s.sol" ]]; then
     jq --argjson new "$pairs" '. + $new' "$aa_jq" > "${aa_jq}.tmp" && mv "${aa_jq}.tmp" "$aa_jq"
   else
@@ -135,7 +237,9 @@ rm -f "${contracts_jq}.orig"
 # AA stack: merge broadcast output with .env.testnet pins. EntryPoint v0.7
 # is vendored (from eth-infinitism) so it's not in DeployAA's broadcast as
 # a CREATE; pull it from .env.testnet.
-get_env() { grep -E "^${1}=" "$ENV_TESTNET" 2>/dev/null | head -1 | cut -d= -f2- | tr -d ' '; }
+# A missing file or key reads as empty (never a failure: under set -e + pipefail a failed grep
+# here used to end the script silently, e.g. with RPC_URL unset and no .env.testnet).
+get_env() { { grep -E "^${1}=" "$ENV_TESTNET" 2>/dev/null || true; } | head -1 | cut -d= -f2- | tr -d ' '; }
 
 # I64-S1 WP-B2: the co-op `CitrateCooperativeFactory` is deployed from the
 # SEPARATE citrate-coop repo (its own foundry project + "citrate.coop.v1."
@@ -187,16 +291,16 @@ aa_final=$(jq -n \
 # Deployer: pulled from .env.testnet (the canonical EOA). The broadcast
 # files' `.transactions[].from` is unreliable (DeployAll's first row is
 # `from: null` because forge fills it post-broadcast). We don't trust those.
-DEPLOYER=$(get_env "DEPLOYER_ADDRESS")
-DEPLOYER=${DEPLOYER:-0x4250675F9015E65fC866F3a373F82bb9DFc000c6}
+# EMIT_DEPLOYER (what regenesis.sh deployed with) wins over the .env.testnet pin.
+DEPLOYER="${EMIT_DEPLOYER:-}"
+DEPLOYER=${DEPLOYER:-$(get_env "DEPLOYER_ADDRESS")}
+DEPLOYER=${DEPLOYER:-0x4250675f9015e65fc866f3a373f82bb9dfc000c6}
 
 # Deployed-at: MAX timestamp across every broadcast (i.e. the most recent
 # ceremony) — that's the answer to "when was this table's youngest row?".
 # forge writes `.timestamp` as milliseconds since epoch.
 DEPLOYED_AT_MS=0
-for ceremony in "${CEREMONIES[@]}"; do
-  bc="${BROADCAST_ROOT}/${ceremony}/${CHAIN_ID}/run-latest.json"
-  [[ -f "$bc" ]] || continue
+for bc in "${USED_BROADCASTS[@]}"; do
   ts=$(jq -r '.timestamp // 0' "$bc" 2>/dev/null)
   if [[ -n "$ts" && "$ts" != "null" && "$ts" -gt "$DEPLOYED_AT_MS" ]]; then
     DEPLOYED_AT_MS=$ts
@@ -228,7 +332,16 @@ fi
 # only disappear if a human deletes it deliberately.
 PRIOR_CONTRACTS='{}'
 PRIOR_EXTRA='{}'
-if [[ -f "$OUTPUT" ]]; then
+if [[ "$FRESH" == "1" ]]; then
+  # A fresh genesis carries nothing: every address on the previous chain is gone. Say what is
+  # not carried, so a name that should have been redeployed is visible here (and the G5
+  # ceremony's admin and KEEP gates fail on it) instead of surviving as a dead address.
+  if [[ -f "$OUTPUT" ]]; then
+    dropped="$(jq -r --argjson new "$(cat "$contracts_jq")" \
+      '(.contracts // {} | keys) - ($new | keys) | join(", ")' "$OUTPUT" 2>/dev/null || true)"
+    [[ -z "$dropped" ]] || log "fresh genesis: not carried from the previous book: ${dropped}"
+  fi
+elif [[ -f "$OUTPUT" ]]; then
   PRIOR_CONTRACTS="$(jq -c '.contracts // {}' "$OUTPUT" 2>/dev/null || echo '{}')"
   # Top-level keys that are neither the fixed schema fields nor the blocks this
   # script rebuilds — e.g. the CitrateMemberSBT / MembershipStakeVault pins that
@@ -238,12 +351,24 @@ if [[ -f "$OUTPUT" ]]; then
                              .contracts, .aaStack, .genesis, .precompiles)' "$OUTPUT" 2>/dev/null || echo '{}')"
 fi
 
+# Root aliases: CitrateMemberSBT / MembershipStakeVault at the top level mirror .contracts.
+# When this run regenerated the membership entries they follow them (over any prior alias).
+ROOT_ALIASES='{}'
+if [[ "$MEMBERSHIP_REGENERATED" == "1" ]]; then
+  ROOT_ALIASES="$(jq -c '{CitrateMemberSBT, MembershipStakeVault}' "$contracts_jq")"
+fi
+if [[ "$FRESH" == "1" && -n "${GOVERNANCE:-}" && -n "${GUARDIAN:-}" ]]; then
+  is_addr "$GOVERNANCE" && is_addr "$GUARDIAN" || { err "GOVERNANCE/GUARDIAN must be addresses"; exit 1; }
+  ROOT_ALIASES="$(jq -c --arg g "$GOVERNANCE" --arg r "$GUARDIAN" '. + {governance: {GOVERNANCE: $g, GUARDIAN: $r}}' <<<"$ROOT_ALIASES")"
+fi
+
 jq -n \
   --argjson prior_contracts "$PRIOR_CONTRACTS" \
+  --argjson root_aliases "$ROOT_ALIASES" \
   --argjson prior_extra "$PRIOR_EXTRA" \
   --argjson contracts "$(cat "$contracts_jq")" \
   --argjson aa "$aa_final" \
-  --arg deployer "${DEPLOYER:-0x4250675F9015E65fC866F3a373F82bb9DFc000c6}" \
+  --arg deployer "$DEPLOYER" \
   --arg deployed_at "${DEPLOYED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
   '{
     "$schema": "./schema.json",
@@ -257,7 +382,7 @@ jq -n \
     comment: "Canonical contract-address table for chain 40204 — the single source of truth the federation reads from. Regenerated from broadcast/*.s.sol/40204/run-latest.json + .env.testnet AA pins. See contracts/addresses/README.md.",
     contracts: ($prior_contracts + $contracts),
     aaStack: $aa,
-    genesis: { ArachnidDeterministicDeployer: "0x4e59b44847b379578588920cA78FbF26c0B4956C" },
+    genesis: { ArachnidDeterministicDeployer: "0x4e59b44847b379578588920ca78fbf26c0b4956c" },
     precompiles: {
       ModelDeploy:            "0x0000000000000000000000000000000000000100",
       ModelInference:         "0x0000000000000000000000000000000000000101",
@@ -281,12 +406,13 @@ jq -n \
       X402TransferAuthVerify: "0x0000000000000000000000000000000000000201",
       X402BatchPaymentVerify: "0x0000000000000000000000000000000000000202"
     }
-   } * $prior_extra' > "$OUTPUT.tmp"
+   } * $prior_extra + $root_aliases
+   | walk(if type == "string" and test("^0x[0-9a-fA-F]{40}$") then ascii_downcase else . end)' > "$OUTPUT.tmp"
 
 # WP-9 GUARD: refuse to write a book that LOSES a key. Merging should make this
 # impossible, but the whole point is that silent loss is the failure mode — so
 # assert it rather than trust it.
-if [[ -f "$OUTPUT" ]]; then
+if [[ -f "$OUTPUT" && "$FRESH" != "1" ]]; then
   lost="$(jq -r -n --slurpfile a "$OUTPUT" --slurpfile b "$OUTPUT.tmp" \
     '($a[0].contracts // {} | keys) - ($b[0].contracts // {} | keys) | join(", ")')"
   if [[ -n "$lost" ]]; then
