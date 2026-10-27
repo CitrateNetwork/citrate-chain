@@ -210,14 +210,15 @@ pub struct GenesisActivations {
     pub pba_hardening: Option<u64>,
     /// Exact created code (`citrate_execution::exact_code`).
     pub exact_create_code: Option<u64>,
-    /// Canonical ECVRF point encoding (`VRF_CANONICAL_ENCODING_PINS`). Typed slot.
+    /// Canonical ECVRF point encoding (`crate::vrf_encoding`, resolved through its
+    /// `pin_for_genesis`).
     pub vrf_canonical_encoding: Option<u64>,
     /// Storage root from the slot set (`citrate_execution::storage_root_hardening`,
-    /// `STORAGE_ROOT_HARDENING_PINS`). Typed slot.
+    /// resolved through its `pin_for_genesis`).
     pub storage_root_hardening: Option<u64>,
     /// Journaled fee settlement, rewards from executed state and journaled in-tx writes,
-    /// one height (`citrate_execution::supply_hardening`, `SUPPLY_HARDENING_PINS`).
-    /// Typed slot.
+    /// one height (`citrate_execution::supply_hardening`, resolved through its
+    /// `pin_for_genesis`).
     pub supply_hardening: Option<u64>,
 }
 

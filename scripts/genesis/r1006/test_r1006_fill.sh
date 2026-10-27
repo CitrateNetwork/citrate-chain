@@ -13,7 +13,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 command -v forge >/dev/null || { echo "SKIP test_r1006_fill (no forge)"; exit 0; }
 T=$(mktemp -d "${TMPDIR:-/tmp}/r1006-fill-test.XXXXXX")
-trap 'rm -rf "$T"' EXIT
+trap 'rm -rf "${T:?}"' EXIT
 cd "$HERE" && python3 - "$T" <<'PY'
 import json, sys
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey

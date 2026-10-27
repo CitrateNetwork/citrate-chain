@@ -58,7 +58,7 @@ PY
 
 if [[ "${1:-}" == --self-test ]]; then
   T=$(mktemp -d "${TMPDIR:-/tmp}/gkp-tripwire.XXXXXX")
-  trap 'rm -rf "$T"' EXIT
+  trap 'rm -rf "${T:?}"' EXIT
   rc=0
   mkdir -p "$T/clean" "$T/table" "$T/height"
   printf 'pub const PINNED_ACTIVATIONS: &[(u64, Option<u64>)] = &[(40204, Some(0))];\n' >"$T/clean/a.rs"
