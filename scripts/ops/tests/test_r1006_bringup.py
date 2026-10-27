@@ -98,6 +98,30 @@ class Env:
         self.set_committed(R1006_TEST, REG_TEST)
         (self.repo / "contracts/script").mkdir(parents=True, exist_ok=True)
         (self.repo / "contracts/script/CheckDeployedAdmins.s.sol").write_text("// stub: tests use a fake forge\n")
+        self._git_history()
+
+    def _git_history(self) -> None:
+        """The repo is a git checkout with this history (empty commits; the tree stays
+        untracked): old -> floor -> new, and side branching off old. `floor` is the
+        reviewed MIN_CHAIN_REV; every host's fake binary reports `new` (12-char short
+        sha, like the real build stamp) unless a test writes another <root>/fake-git-sha."""
+        def git(*a: str) -> str:
+            return subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                                   "-c", "commit.gpgsign=false", *a], capture_output=True, text=True, check=True,
+                                  env=dict(self.env, GIT_CONFIG_NOSYSTEM="1")).stdout.strip()
+        git("init", "-q", "-b", "main")
+        self.rev = {}
+        for name in ("old", "floor", "new"):
+            git("commit", "-q", "--allow-empty", "-m", name)
+            self.rev[name] = git("rev-parse", "HEAD")
+        git("checkout", "-q", "-b", "side", self.rev["old"])
+        git("commit", "-q", "--allow-empty", "-m", "side")
+        self.rev["side"] = git("rev-parse", "HEAD")
+        git("checkout", "-q", "main")
+        self.min_rev_file = self.repo / "scripts/ops/r1006/min_chain_rev"
+        self.min_rev_file.write_text(f"# reviewed floor (test)\n{self.rev['floor']}\n")
+        for h in self.hosts:
+            (Path(h["root"]) / "fake-git-sha").write_text(self.rev["new"][:12])
 
     def set_committed(self, genesis: str | None, registry: str | None = REG_TEST) -> None:
         """Write the repo's committed r1006 pin (None: no R1006_GENESIS const) and book."""
@@ -804,8 +828,12 @@ class StartGateMiningOnlyOnTheR1006Genesis(unittest.TestCase):
     host's network). Mining is switched on only after EVERY host's block 0 is verified."""
 
     def _fleet(self, n: int, wrong_after_distribute: dict[int, str], after_start: str = "",
-               fill_extra: str = "") -> tuple[Env, subprocess.CompletedProcess]:
+               fill_extra: str = "", pre_start=None) -> tuple[Env, subprocess.CompletedProcess]:
+        """after_start / pre_start: shell snippets (a str, or a function of the Env)."""
         env = Env(n)
+        if callable(after_start):
+            after_start = after_start(env)
+        pre_start = pre_start(env) if callable(pre_start) else (pre_start or "")
         inner = env.tmp / "inner.sh"
         sets = "\n".join(f'printf %s {h} >"{env.host_root(i)}/fake-block0"' for i, h in wrong_after_distribute.items())
         inner.write_text(f"""set -u
@@ -830,6 +858,7 @@ B keys || exit 10
 B genesis-fill --fill-cmd "{env.fill_cmd(R1006_TEST)}{fill_extra}" || exit 11
 B distribute || exit 12
 {sets}
+{pre_start}
 B start --mining on --min-peers 0 --skip-producing-gate --gate-minutes 1
 rc=$?
 {after_start}
@@ -866,34 +895,138 @@ exit $rc
         finally:
             env.close()
 
-    def test_smoke_deployer_admin_reads_the_book_forge_may_read_and_needs_forge_rc_0(self):
-        """forge reads only under contracts/ (fs_permissions ./addresses), so the fill's book
-        (in the state dir, outside the checkout) must be staged there; and a checker that
-        exits non-zero fails the check even when it prints a 0."""
-        for label, rc, want in (("forge ok", 0, "PASS  DEPLOYER-ADMIN 0"), ("forge exits 1", 1, "FAIL  DEPLOYER-ADMIN")):
-            with self.subTest(label):
-                fake = Path(tempfile.mkdtemp(prefix="dgx-r1006f.")) / "forge"
-                # Mirrors fs_permissions: only a relative path under addresses/ may be read.
-                fake.write_text(f"""#!/bin/sh
-case "$ADDRESS_BOOK" in
-  addresses/*) [ -f "$ADDRESS_BOOK" ] || {{ echo "no such book $ADDRESS_BOOK"; exit 1; }} ;;
-  *) echo "vm.readFile: the path $ADDRESS_BOOK is not allowed to be accessed for read operations"; exit 1 ;;
-esac
+    # A fake forge that enforces chain#398's CheckDeployedAdmins env contract on r1006, where
+    # the GovernanceTimelock is in block 0 with no role history: genesis-chain mode (forced
+    # by GENESIS_CHAIN=1, auto-detected when unset) needs GENESIS_ALLOC, the block-0 alloc,
+    # or TIMELOCK-HOLDERS and GENESIS-FLOOR fail and the script reverts. forge reads only
+    # under contracts/ (fs_permissions ./addresses), so both files must be staged there.
+    # FAKE_FORGE_MODE (negative controls): th1rc0 = a TIMELOCK-HOLDERS failure with rc 0,
+    # nocode1 = one NO-CODE entry, nofloor = no GENESIS-FLOOR line, rc1 = all 0 but rc 1.
+    FAKE_FORGE = r"""#!/bin/sh
+log="$(dirname "$0")/forge.calls"
+echo "GENESIS_CHAIN=${GENESIS_CHAIN-<unset>} GENESIS_ALLOC=${GENESIS_ALLOC-<unset>} ADDRESS_BOOK=${ADDRESS_BOOK-<unset>}" >>"$log"
+readable() { case "$1" in addresses/*) [ -f "$1" ] ;; *) echo "vm.readFile: the path $1 is not allowed to be accessed for read operations"; exit 1 ;; esac; }
+readable "$ADDRESS_BOOK" || { echo "no such book $ADDRESS_BOOK"; exit 1; }
+th=0 floor=0
+if [ "${GENESIS_CHAIN:-}" != 0 ]; then
+  if [ -z "${GENESIS_ALLOC:-}" ]; then
+    echo "  TIMELOCK-HOLDERS GovernanceTimelock: genesis-chain mode needs GENESIS_ALLOC (the block-0 allocation) to prove the holder sets complete"
+    th=1 floor=1
+  else
+    readable "$GENESIS_ALLOC" || { echo "no such alloc $GENESIS_ALLOC"; exit 1; }
+    grep -q '"alloc"' "$GENESIS_ALLOC" || { echo "  TIMELOCK-HOLDERS the timelock's storage is not in GENESIS_ALLOC"; th=1; }
+    cp "$GENESIS_ALLOC" "$(dirname "$0")/alloc.seen"
+  fi
+fi
+nocode=0 rc=0
+case "${FAKE_FORGE_MODE:-}" in th1rc0) th=1 ;; nocode1) nocode=1 ;; rc1) rc=1 ;; esac
+echo "  FACTORY-ADMIN failures: 0"
 echo "  DEPLOYER-ADMIN failures: 0"
-exit {rc}
-""")
-                fake.chmod(0o755)
-                smoke = (f'FORGE={fake} B smoke --min-height 0 --gate-minutes 1 --skip code,orangeseed,logs '
-                         f'>"$(dirname {fake})/smoke.out" 2>&1')
-                env, r = self._fleet(2, {}, after_start=smoke, fill_extra=" --address-book")
-                try:
-                    out = (fake.parent / "smoke.out").read_text()
-                    self.assertIn(want, out, out[-2000:])
-                    self.assertEqual(list((env.repo / "contracts/addresses").glob(".r1006-smoke-*")), [],
-                                     "the staged book is removed after the check")
-                finally:
-                    env.close()
-                    shutil.rmtree(fake.parent)
+echo "  NO-CODE entries (reported): $nocode"
+echo "  VERIFIER present: true"
+echo "  TIMELOCK-HOLDERS failures: $th"
+[ "${FAKE_FORGE_MODE:-}" = nofloor ] || echo "  GENESIS-FLOOR failures: $floor"
+[ "${FAKE_FORGE_MODE:-}" = th1rc0 ] && exit 0
+[ $th -eq 0 ] && [ $floor -eq 0 ] && [ $nocode -eq 0 ] || exit 1
+exit $rc
+"""
+
+    def test_smoke_admins_run_in_genesis_chain_mode_with_the_staged_alloc_and_every_class_0(self):
+        """smoke passes GENESIS_CHAIN=1 and GENESIS_ALLOC (the fill's alloc staged under
+        contracts/addresses like the book), requires forge rc 0 and exactly one 0 for
+        FACTORY-ADMIN, DEPLOYER-ADMIN, NO-CODE, TIMELOCK-HOLDERS and GENESIS-FLOOR, and
+        removes both staged files afterwards."""
+        d = Path(tempfile.mkdtemp(prefix="dgx-r1006f."))
+        fake = d / "forge"
+        fake.write_text(self.FAKE_FORGE)
+        fake.chmod(0o755)
+        modes = ("ok", "th1rc0", "nocode1", "nofloor", "rc1")
+        smoke = "\n".join(f'FAKE_FORGE_MODE={m} FORGE={fake} B smoke --min-height 0 --gate-minutes 1 '
+                          f'--skip code,orangeseed,logs >"{d}/smoke-{m}.out" 2>&1' for m in modes)
+        env, r = self._fleet(2, {}, after_start=smoke, fill_extra=" --address-book")
+        try:
+            out = {m: (d / f"smoke-{m}.out").read_text() for m in modes}
+            self.assertIn("PASS  admins (genesis-chain mode): FACTORY-ADMIN, DEPLOYER-ADMIN, NO-CODE, TIMELOCK-HOLDERS, "
+                          "GENESIS-FLOOR all 0", out["ok"], out["ok"][-2500:])
+            calls = (d / "forge.calls").read_text().splitlines()
+            self.assertEqual(len(calls), len(modes), calls)
+            for c in calls:
+                self.assertRegex(c, r"^GENESIS_CHAIN=1 GENESIS_ALLOC=addresses/\.r1006-smoke-\S+\.json "
+                                    r"ADDRESS_BOOK=addresses/\.r1006-smoke-\S+\.json$")
+            self.assertEqual(json.loads((d / "alloc.seen").read_text()),
+                             json.loads((env.state / "genesis/alloc.json").read_text()),
+                             "forge read the fill's own genesis alloc")
+            for m in modes[1:]:
+                with self.subTest(negative_control=m):
+                    self.assertIn("FAIL  admins (genesis-chain mode)", out[m], out[m][-2500:])
+                    self.assertNotIn("PASS  admins", out[m])
+            self.assertEqual(list((env.repo / "contracts/addresses").glob(".r1006-smoke-*")), [],
+                             "the staged book and alloc are removed after the check")
+        finally:
+            env.close()
+            shutil.rmtree(d)
+
+    def test_smoke_admins_fail_closed_without_a_genesis_alloc_in_the_fill(self):
+        d = Path(tempfile.mkdtemp(prefix="dgx-r1006f."))
+        fake = d / "forge"
+        fake.write_text(self.FAKE_FORGE)
+        fake.chmod(0o755)
+        def smoke(e: Env) -> str:
+            drop = ("python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d[\"alloc_file\"]=None; "
+                    f"json.dump(d,open(p,\"w\"))' \"{e.state}/genesis/fill-result.json\"")
+            return (f'{drop}\nFORGE={fake} B smoke --min-height 0 --gate-minutes 1 --skip code,orangeseed,logs '
+                    f'>"{d}/smoke.out" 2>&1')
+        env, r = self._fleet(2, {}, after_start=smoke, fill_extra=" --address-book")
+        try:
+            out = (d / "smoke.out").read_text()
+            self.assertIn("FAIL  admins (genesis-chain mode)", out, out[-2500:])
+            self.assertFalse((d / "forge.calls").exists(), "forge is not run without the block-0 alloc")
+        finally:
+            env.close()
+            shutil.rmtree(d)
+
+    def test_start_refuses_a_host_binary_older_than_min_chain_rev_before_any_start(self):
+        """Pre-join guard: every host's installed binary must report a clean build rev that
+        is MIN_CHAIN_REV or a descendant of it in the local checkout (git merge-base
+        --is-ancestor). Anything else, or no MIN_CHAIN_REV at all, refuses before any host
+        is started. The final start (all hosts on a descendant) is the positive control."""
+        cases = {
+            "old": 'printf %s "$(git -C {repo} rev-parse --short=12 HEAD~2)" >{h2}/fake-git-sha',
+            "side": 'printf %s "$(git -C {repo} rev-parse --short=12 side)" >{h2}/fake-git-sha',
+            "unknown": 'printf unknown >{h2}/fake-git-sha',
+            "notinrepo": 'printf %s 0123456789ab >{h2}/fake-git-sha',
+            "dirty": 'touch {h2}/fake-git-dirty',
+            "unset": 'mv {minf} {minf}.off',
+            "badmin": 'printf "%s\\n" "$(git -C {repo} rev-parse --short=12 HEAD~1)" >{minf}',
+            "minnotinrepo": 'printf "%s\\n" 1111111111111111111111111111111111111111 >{minf}',
+            "lowerflag": "",
+        }
+        restore = ('printf %s "$(git -C {repo} rev-parse --short=12 HEAD)" >{h2}/fake-git-sha; rm -f {h2}/fake-git-dirty; '
+                   'printf "%s\\n" "$(git -C {repo} rev-parse HEAD~1)" >{minf}')
+        pre = []
+        for name, setup in cases.items():
+            extra = '--min-chain-rev "$(git -C {repo} rev-parse HEAD~2)"' if name == "lowerflag" else ""
+            pre.append(f'{setup}\nB start --mining on --min-peers 0 --skip-producing-gate --gate-minutes 1 {extra} '
+                       f'>"{{tmp}}/case-{name}.out" 2>&1; echo $? >"{{tmp}}/case-{name}.rc"\n'
+                       f'cat {{h1}}/fake-node.log {{h2}}/fake-node.log 2>/dev/null | grep -c "probe=0" >"{{tmp}}/case-{name}.starts"\n'
+                       f'{restore}')
+        def fmt(e: Env) -> str:
+            return "\n".join(pre).format(repo=e.repo, h1=e.host_root(1), h2=e.host_root(2), minf=e.min_rev_file,
+                                         tmp=e.tmp)
+        env, r = self._fleet(2, {}, pre_start=fmt)
+        try:
+            self.assertEqual(r.returncode, 0, "the final start (every host past the floor) passes: "
+                             + r.stdout[-3000:] + r.stderr[-3000:])
+            for name in cases:
+                with self.subTest(case=name):
+                    out = (env.tmp / f"case-{name}.out").read_text()
+                    self.assertEqual((env.tmp / f"case-{name}.rc").read_text().strip(), "2", out[-2500:])
+                    self.assertIn("MIN_CHAIN_REV", out, out[-2500:])
+                    self.assertEqual((env.tmp / f"case-{name}.starts").read_text().strip(), "0",
+                                     f"{name}: a node was started before the refusal: {out[-1500:]}")
+            self.assertTrue(self.starts(env, 1) and self.starts(env, 2), "the positive control started both hosts")
+        finally:
+            env.close()
 
     def test_mining_is_never_enabled_when_a_host_shows_r1005s_block0(self):
         env, r = self._fleet(3, {2: R1005})

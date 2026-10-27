@@ -16,6 +16,20 @@
 #
 # Set R1006_TEST_KEYTOOL to a real `citrate` binary to run the key tests against it.
 set -euo pipefail
+# `consensus --json`: the build stamp, like the real command (a log line, then the JSON).
+# git_sha is <root>/fake-git-sha ("unknown" when absent); git_dirty is true when
+# <root>/fake-git-dirty exists.
+if [[ "${1:-}" == consensus && "${2:-}" == --json && $# -eq 2 ]]; then
+  root="$(cd "$(dirname "$0")/../../.." && pwd)"
+  sha=unknown
+  [[ -f "$root/fake-git-sha" ]] && sha=$(tr -d '\n' <"$root/fake-git-sha")
+  dirty=false
+  [[ -e "$root/fake-git-dirty" ]] && dirty=true
+  echo "INFO fake_keytool: consensus manifest"
+  printf '{\n  "version": "0.0.0-test",\n  "git_sha": "%s",\n  "git_dirty": %s,\n  "fingerprint": "0x%s"\n}\n' \
+    "$sha" "$dirty" "$(printf '00%.0s' $(seq 1 16))"
+  exit 0
+fi
 if [[ "${1:-}" == --config && $# -eq 2 ]]; then
   exec python3 - "$0" "$2" <<'PY'
 import json, os, re, signal, sys, time
