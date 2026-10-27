@@ -49,18 +49,19 @@ pub struct FingerprintInputs<'a> {
     pub canonical_base_fee_per_gas: u64,
     pub epoch: u64,
     pub snapshot_lag: u64,
-    /// The chain this process runs: `(genesis profile, block-0 hash hex, per-genesis rule
-    /// schedule)`. `None` for `citrate consensus` with no chain bound: the pre-image is
-    /// then exactly the v3 one. `Some` switches the tag to v4 and appends the binding, so
-    /// two binaries aligned on code but run against different genesis files (r1005 and
-    /// r1006 share chain id 40204) print different fingerprints.
+    /// The chain this process runs: `(block-0 hash hex, per-genesis rule schedule)`, set
+    /// only for a genesis with compiled per-genesis rules (r1006). `None` otherwise (r1005,
+    /// any other genesis, or no chain bound): the pre-image is then exactly the v3 one,
+    /// byte-identical to the unbound form. `Some` switches the tag to v4 and appends the
+    /// binding, so two binaries aligned on code but run against r1005 and r1006 (which
+    /// share chain id 40204) print different fingerprints. The configured profile NAME is
+    /// never part of it: two nodes on the same block 0 agree whatever they call it.
     pub genesis_binding: Option<GenesisBinding<'a>>,
 }
 
 /// See [`FingerprintInputs::genesis_binding`].
 #[derive(Debug, Clone, Copy)]
 pub struct GenesisBinding<'a> {
-    pub profile: &'a str,
     pub genesis_hash: &'a str,
     /// `name:height|...` from the genesis's compiled activations (`-` for none).
     pub genesis_rules: &'a str,
@@ -128,11 +129,10 @@ pub fn fingerprint_preimage(i: &FingerprintInputs<'_>) -> String {
     match i.genesis_binding {
         None => preimage,
         Some(b) => format!(
-            "citrate-consensus-v4{}genesis_profile={}\ngenesis_hash={}\ngenesis_rules={}\n",
+            "citrate-consensus-v4{}genesis_hash={}\ngenesis_rules={}\n",
             preimage
                 .strip_prefix("citrate-consensus-v3")
                 .unwrap_or(&preimage),
-            b.profile,
             b.genesis_hash,
             b.genesis_rules
         ),
@@ -209,9 +209,11 @@ pub struct ConsensusManifest {
     pub epoch: u64,
     /// Validator-registry snapshot lag (blocks before the epoch boundary).
     pub snapshot_lag: u64,
-    /// The genesis profile this process runs (`None` = not bound to a chain).
+    /// The genesis profile named in this process's config. Display only: NOT part of the
+    /// fingerprint (see [`FingerprintInputs::genesis_binding`]).
     pub genesis_profile: Option<String>,
-    /// Block-0 hash this process runs (`None` = not bound to a chain).
+    /// Block-0 hash this process runs (`None` = not known). Part of the fingerprint only
+    /// when the genesis has compiled per-genesis rules (`genesis_rules` is then set).
     pub genesis_hash: Option<String>,
     /// The genesis's compiled rule schedule (`name:height|...`), when bound.
     pub genesis_rules: Option<String>,
@@ -380,13 +382,23 @@ impl ConsensusManifest {
 
     /// THE manifest a node reports, in its boot log, its node-identity RPC and
     /// `citrate consensus`: every height from its process store (published at start-up),
-    /// bound (v4) to the genesis the node runs when that is known.
+    /// bound (v4) to the genesis the node runs when that genesis has compiled per-genesis
+    /// rules. The profile name and an unscheduled genesis's hash are recorded for display
+    /// only, so they never move the fingerprint.
     pub fn for_node(profile: Option<&str>, genesis: Option<&[u8; 32]>) -> Self {
-        let m = Self::current();
-        match genesis {
-            Some(g) => m.bound(profile.unwrap_or("-"), g),
-            None => m,
-        }
+        let mut m = match genesis {
+            Some(g) if citrate_consensus::hardening::genesis_activations(g).is_some() => {
+                Self::current().bound(g)
+            }
+            Some(g) => {
+                let mut m = Self::current();
+                m.genesis_hash = Some(format!("0x{}", hex::encode(g)));
+                m
+            }
+            None => Self::current(),
+        };
+        m.genesis_profile = profile.map(str::to_string);
+        m
     }
 
     /// The rule schedule string for a genesis (`-` when it has no compiled activations).
@@ -408,8 +420,8 @@ impl ConsensusManifest {
     }
 
     /// This manifest bound to a chain: the v4 fingerprint over the same fields plus the
-    /// genesis profile, block-0 hash and the genesis's compiled rule schedule.
-    pub fn bound(mut self, profile: &str, genesis: &[u8; 32]) -> Self {
+    /// block-0 hash and the genesis's compiled rule schedule.
+    pub fn bound(mut self, genesis: &[u8; 32]) -> Self {
         let hash = format!("0x{}", hex::encode(genesis));
         let rules = Self::genesis_rules_of(genesis);
         self.fingerprint = fingerprint_of(&FingerprintInputs {
@@ -430,12 +442,10 @@ impl ConsensusManifest {
             epoch: self.epoch,
             snapshot_lag: self.snapshot_lag,
             genesis_binding: Some(GenesisBinding {
-                profile,
                 genesis_hash: &hash,
                 genesis_rules: &rules,
             }),
         });
-        self.genesis_profile = Some(profile.to_string());
         self.genesis_hash = Some(hash);
         self.genesis_rules = Some(rules);
         self
@@ -515,7 +525,8 @@ impl ConsensusManifest {
             "  epoch / lag        {} / {}",
             self.epoch, self.snapshot_lag
         );
-        if let (Some(p), Some(g)) = (&self.genesis_profile, &self.genesis_hash) {
+        if let Some(g) = &self.genesis_hash {
+            let p = self.genesis_profile.as_deref().unwrap_or("-");
             println!("  genesis            {p} {g}");
             if let Some(r) = &self.genesis_rules {
                 println!("  genesis rules      {r}");
@@ -851,12 +862,11 @@ mod tests {
         }
     }
 
-    /// v4: a bound manifest names the genesis profile, block-0 hash and the genesis's
-    /// rule schedule; the unbound pre-image is byte-identical to v3 (golden vector above).
+    /// v4: a bound manifest names the block-0 hash and the genesis's rule schedule (not the
+    /// profile name); the unbound pre-image is byte-identical to v3 (golden vector above).
     #[test]
     fn genesis_binding_enters_the_fingerprint_as_v4() {
         let b = GenesisBinding {
-            profile: "r1006",
             genesis_hash: "0xabc",
             genesis_rules: "pba_hardening:0",
         };
@@ -869,27 +879,22 @@ mod tests {
             pre.starts_with("citrate-consensus-v4\ngit_sha=0123abc\n"),
             "{pre}"
         );
-        assert!(pre.ends_with(
-            "snapshot_lag=200\ngenesis_profile=r1006\ngenesis_hash=0xabc\n\
-             genesis_rules=pba_hardening:0\n"
-        ));
+        assert!(
+            pre.ends_with("snapshot_lag=200\ngenesis_hash=0xabc\ngenesis_rules=pba_hardening:0\n")
+        );
         assert_eq!(
             pre,
             fingerprint_preimage(&sample(true)).replacen(
                 "citrate-consensus-v3",
                 "citrate-consensus-v4",
                 1
-            ) + "genesis_profile=r1006\ngenesis_hash=0xabc\ngenesis_rules=pba_hardening:0\n"
+            ) + "genesis_hash=0xabc\ngenesis_rules=pba_hardening:0\n"
         );
         let base = fingerprint_of(&sample(true));
         let mut seen = std::collections::HashSet::new();
         seen.insert(base.clone());
         for v in [
             b,
-            GenesisBinding {
-                profile: "testnet_beta",
-                ..b
-            },
             GenesisBinding {
                 genesis_hash: "0xabd",
                 ..b
@@ -907,22 +912,28 @@ mod tests {
         }
     }
 
-    /// r1005 and r1006 run on one chain id with the same binary: bound, they differ.
+    /// r1005 and r1006 run on one chain id with the same binary: they differ. r1006 (the
+    /// genesis with compiled rules) is bound; r1005 stays the unbound v3 manifest.
     #[test]
     fn r1005_and_r1006_bound_manifests_differ() {
         use citrate_consensus::hardening::{R1006_GENESIS, RELEASE_GENESIS};
-        let m = ConsensusManifest::for_heights(Some(0), None);
-        let r1005 = m.clone().bound("testnet_beta", &RELEASE_GENESIS[0].1);
-        let r1006 = m.clone().bound("r1006", &R1006_GENESIS);
+        let m = ConsensusManifest::current();
+        let r1005 = ConsensusManifest::for_node(Some("testnet_beta"), Some(&RELEASE_GENESIS[0].1));
+        let r1006 = ConsensusManifest::for_node(Some("r1006"), Some(&R1006_GENESIS));
         assert_ne!(r1005.fingerprint, r1006.fingerprint);
-        assert_ne!(
-            r1005.fingerprint, m.fingerprint,
-            "bound differs from unbound"
+        assert_eq!(r1005.fingerprint, m.fingerprint, "r1005 is unbound (v3)");
+        assert_ne!(r1006.fingerprint, m.fingerprint, "r1006 is bound (v4)");
+        assert_eq!(r1005.genesis_rules, None);
+        assert_eq!(
+            r1006.fingerprint,
+            m.clone().bound(&R1006_GENESIS).fingerprint
         );
-        assert_eq!(r1005.genesis_rules.as_deref(), Some("-"));
         assert!(r1006.genesis_rules.as_deref().is_some_and(
             |r| r.contains("exact_create_code:0") && r.contains("vrf_canonical_encoding:0")
         ));
+        // A different block 0 under the same compiled rules would bind differently.
+        let other = m.clone().bound(&[7u8; 32]);
+        assert_ne!(other.fingerprint, r1006.fingerprint);
     }
 
     /// The fingerprint follows the chain a node runs, never what its config calls it:
@@ -1006,11 +1017,11 @@ mod tests {
             "citrate consensus uses for_node"
         );
         assert!(!cmd.contains("ConsensusManifest::for_all("));
-        // for_node is the current manifest, bound to the genesis exactly as bound() does.
-        let g = [7u8; 32];
+        // for_node is the current manifest, bound to a scheduled genesis exactly as bound() does.
+        let g = citrate_consensus::hardening::R1006_GENESIS;
         assert_eq!(
             ConsensusManifest::for_node(Some("r1006"), Some(&g)).fingerprint,
-            ConsensusManifest::current().bound("r1006", &g).fingerprint
+            ConsensusManifest::current().bound(&g).fingerprint
         );
         assert_eq!(
             ConsensusManifest::for_node(None, None).fingerprint,
