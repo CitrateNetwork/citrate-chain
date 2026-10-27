@@ -31,7 +31,12 @@
 #   BIN=$CITRATE_HOME/bin/citrate-node  NEW_BIN=$BIN.new  SERVICE=citrate-node
 #   DROPIN=/etc/systemd/system/$SERVICE.service.d/reroll.conf  WATCHDOG_TIMER=citrate-height-watchdog.timer
 #   WATCHDOG_SERVICE=<timer name>.service  NODE_OWNER=citrate:citrate (empty = no chown)
-#   SYSTEMCTL=systemctl  EXPECTED_BIN_SHA256 (optional)
+#   BIN_OWNER=root:root (the installed binary's owner; empty = no chown)
+#   SYSTEMCTL=systemctl  CHOWN=chown  EXPECTED_BIN_SHA256 (optional)
+#
+# The installed binary is root-owned, mode 0755: the node's service account runs it but cannot
+# rewrite it. The new data dir is created mode 0700 (it holds the node's keys), then handed to
+# NODE_OWNER.
 #
 # Exit: 0 ok · 1 precondition failed · 2 usage
 set -euo pipefail
@@ -74,6 +79,8 @@ DROPIN="${DROPIN:-/etc/systemd/system/$SERVICE.service.d/reroll.conf}"
 WATCHDOG_TIMER="${WATCHDOG_TIMER:-citrate-height-watchdog.timer}"
 NODE_OWNER="${NODE_OWNER-citrate:citrate}"
 SYSTEMCTL="${SYSTEMCTL:-systemctl}"
+CHOWN="${CHOWN:-chown}"
+BIN_OWNER="${BIN_OWNER-root:root}"
 TS=$(date -u +%Y%m%dT%H%M%SZ)
 ARCHIVE="${DATA}.pregenesis-${TS}"
 
@@ -130,11 +137,11 @@ if [[ -e "$BIN" ]]; then
   cp -a "$BIN" "${BIN}.pregenesis-${TS}" || die "cannot back up $BIN; aborting before any file is changed (binary and data dir untouched)" 1
 fi
 install -m 0755 "$NEW" "$BIN"
-[[ -n "$NODE_OWNER" ]] && chown "$NODE_OWNER" "$BIN"
+[[ -n "$BIN_OWNER" ]] && "$CHOWN" "$BIN_OWNER" "$BIN"
 log "binary sha256=$(sha256sum "$BIN" | cut -c1-16)…"
 
 mv "$DATA" "$ARCHIVE"
-mkdir -p "$DATA"
+install -d -m 0700 "$DATA"
 for f in "${CARRY[@]}"; do
   [[ -e "$ARCHIVE/$f" ]] && cp -a "$ARCHIVE/$f" "$DATA/$f"
 done
@@ -143,7 +150,7 @@ done
 # node.toml stores the coinbase as bare lowercase hex (no 0x); keep that format.
 sed -i -E "s/^(\s*coinbase\s*=\s*\")(0x)?[0-9a-fA-F]{40}(\")/\1${CB_HEX}\3/" "$DATA/node.toml"
 grep -qE "^\s*coinbase\s*=\s*\"${CB_HEX}\"" "$DATA/node.toml" || die "coinbase remap failed"
-[[ -n "$NODE_OWNER" ]] && chown -R "$NODE_OWNER" "$DATA"
+[[ -n "$NODE_OWNER" ]] && "$CHOWN" -R "$NODE_OWNER" "$DATA"
 
 cp -a "$DROPIN" "${DROPIN}.bak-${TS}"
 set_env() { # NAME VALUE in the drop-in

@@ -21,6 +21,10 @@ anything is sent. The list of those inputs is not kept by hand:
               phase that produces it is behind this run, every "unset" input is unset, and
               the "distinct" groups hold. Prints the problems and exits 3.
 
+An entry may name a "pending_reader": the script that will read it once a change that is not
+in this tree yet lands. Until then the unread entry is not stale; once the scripts read the key
+the field itself is flagged, so it is dropped.
+
 Spec classes (phase_inputs.json, one entry per key):
   p0       P0 checks it here (presence, type, not the deployer).
   p0-bash  P0 checks it in genesis_ceremony.sh (governance councils, deployer, books).
@@ -341,7 +345,9 @@ def check_spec(repo, spec):
         c = e.get("class")
         if c not in CLASSES:
             problems.append(f"{k}: unknown class {c!r}")
-        if k not in reads and not set(e.get("phases", [])) <= pending:
+        if k in reads and e.get("pending_reader"):
+            problems.append(f"{k}: pending_reader {e['pending_reader']!r} is set, but the scripts now read it; drop the field")
+        elif k not in reads and not set(e.get("phases", [])) <= pending and not e.get("pending_reader"):
             problems.append(f"{k} is in phase_inputs.json but no phase reads it (stale entry)")
         if not e.get("why"):
             problems.append(f"{k}: no 'why'")
