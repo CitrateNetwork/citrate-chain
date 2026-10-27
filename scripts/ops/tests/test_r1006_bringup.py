@@ -96,6 +96,8 @@ class Env:
         shutil.copytree(REPO / "scripts" / "producers", self.repo / "scripts" / "producers",
                         ignore=shutil.ignore_patterns("tests", "__pycache__"))
         self.set_committed(R1006_TEST, REG_TEST)
+        (self.repo / "contracts/script").mkdir(parents=True, exist_ok=True)
+        (self.repo / "contracts/script/CheckDeployedAdmins.s.sol").write_text("// stub: tests use a fake forge\n")
 
     def set_committed(self, genesis: str | None, registry: str | None = REG_TEST) -> None:
         """Write the repo's committed r1006 pin (None: no R1006_GENESIS const) and book."""
@@ -801,7 +803,8 @@ class StartGateMiningOnlyOnTheR1006Genesis(unittest.TestCase):
     its own network namespace (inside one user + net + pid namespace: nothing reaches the
     host's network). Mining is switched on only after EVERY host's block 0 is verified."""
 
-    def _fleet(self, n: int, wrong_after_distribute: dict[int, str]) -> tuple[Env, subprocess.CompletedProcess]:
+    def _fleet(self, n: int, wrong_after_distribute: dict[int, str], after_start: str = "",
+               fill_extra: str = "") -> tuple[Env, subprocess.CompletedProcess]:
         env = Env(n)
         inner = env.tmp / "inner.sh"
         sets = "\n".join(f'printf %s {h} >"{env.host_root(i)}/fake-block0"' for i, h in wrong_after_distribute.items())
@@ -824,11 +827,12 @@ PY
 B() {{ s="$1"; shift; bash {env.bringup} "$s" --inventory {env.inv} --state {env.state} "$@"; }}
 for i in $(seq 1 {n}); do printf %s {R1006_TEST} >"{env.tmp}/h$i/fake-block0"; done
 B keys || exit 10
-B genesis-fill --fill-cmd "{env.fill_cmd(R1006_TEST)}" || exit 11
+B genesis-fill --fill-cmd "{env.fill_cmd(R1006_TEST)}{fill_extra}" || exit 11
 B distribute || exit 12
 {sets}
 B start --mining on --min-peers 0 --skip-producing-gate --gate-minutes 1
 rc=$?
+{after_start}
 B stop >/dev/null 2>&1
 exit $rc
 """)
@@ -861,6 +865,35 @@ exit $rc
                                "a host mined before every host's block 0 was verified")
         finally:
             env.close()
+
+    def test_smoke_deployer_admin_reads_the_book_forge_may_read_and_needs_forge_rc_0(self):
+        """forge reads only under contracts/ (fs_permissions ./addresses), so the fill's book
+        (in the state dir, outside the checkout) must be staged there; and a checker that
+        exits non-zero fails the check even when it prints a 0."""
+        for label, rc, want in (("forge ok", 0, "PASS  DEPLOYER-ADMIN 0"), ("forge exits 1", 1, "FAIL  DEPLOYER-ADMIN")):
+            with self.subTest(label):
+                fake = Path(tempfile.mkdtemp(prefix="dgx-r1006f.")) / "forge"
+                # Mirrors fs_permissions: only a relative path under addresses/ may be read.
+                fake.write_text(f"""#!/bin/sh
+case "$ADDRESS_BOOK" in
+  addresses/*) [ -f "$ADDRESS_BOOK" ] || {{ echo "no such book $ADDRESS_BOOK"; exit 1; }} ;;
+  *) echo "vm.readFile: the path $ADDRESS_BOOK is not allowed to be accessed for read operations"; exit 1 ;;
+esac
+echo "  DEPLOYER-ADMIN failures: 0"
+exit {rc}
+""")
+                fake.chmod(0o755)
+                smoke = (f'FORGE={fake} B smoke --min-height 0 --gate-minutes 1 --skip code,orangeseed,logs '
+                         f'>"$(dirname {fake})/smoke.out" 2>&1')
+                env, r = self._fleet(2, {}, after_start=smoke, fill_extra=" --address-book")
+                try:
+                    out = (fake.parent / "smoke.out").read_text()
+                    self.assertIn(want, out, out[-2000:])
+                    self.assertEqual(list((env.repo / "contracts/addresses").glob(".r1006-smoke-*")), [],
+                                     "the staged book is removed after the check")
+                finally:
+                    env.close()
+                    shutil.rmtree(fake.parent)
 
     def test_mining_is_never_enabled_when_a_host_shows_r1005s_block0(self):
         env, r = self._fleet(3, {2: R1005})

@@ -104,6 +104,7 @@ def main() -> int:
     ap.add_argument("--profile", default="r1006", help="genesis_profile to write (tests; 'null' = None)")
     ap.add_argument("--genesis-file", help="genesis_file to write (tests)")
     ap.add_argument("--registry", help="validator_registry to write instead of the committed book's (tests)")
+    ap.add_argument("--address-book", action="store_true", help="copy the committed book to OUT/book.json (tests)")
     a = ap.parse_args()
     if not a.genesis_hash and not a.bin:
         ap.error("--bin or --genesis-hash")
@@ -119,7 +120,7 @@ def main() -> int:
         "genesis_profile": profile if a.genesis_hash else "r1006",
         "genesis_file": a.genesis_file,
         "alloc_file": "alloc.json",
-        "address_book": None,
+        "address_book": "book.json" if a.address_book else None,
         "orangeseed": None,
         "validator_registry": a.registry or json.loads(BOOK.read_text())["contracts"]["ValidatorRegistry"].lower(),
         "validator_activation_height": 1000,
@@ -129,6 +130,8 @@ def main() -> int:
         "source": "REHEARSAL STAND-IN (scripts/ops/tests/fixtures/rehearsal_fill.py): compiled r1006 profile "
                   "genesis; its validator set is the build's, not these producers'",
     }
+    if a.address_book:
+        (a.out / "book.json").write_text(BOOK.read_text())
     (a.out / "fill-result.json").write_text(json.dumps(fill, indent=2) + "\n")
     print(f"rehearsal_fill: block 0 {gh} (profile {fill['genesis_profile']})")
     return 0
