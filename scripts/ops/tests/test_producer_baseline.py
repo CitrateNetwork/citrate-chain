@@ -639,6 +639,8 @@ class ApplyStepsTest(ShimTestCase):
 
 
 RESTRICTED_RULE = "ufw allow from 198.51.100.7 to any port 22 proto tcp"
+# A session from inside the test allowlist 198.51.100.0/24 to the host's eth0 address.
+INSIDE = "198.51.100.20 50000 192.0.2.10 22"
 
 
 class SshSourceTest(ShimTestCase):
@@ -686,7 +688,8 @@ class SshSourceTest(ShimTestCase):
 
     def test_allowlist_installs_source_rules_and_drops_the_open_one(self) -> None:
         self.preset("ufw allow 22/tcp")
-        r = self.sb.run("apply_firewall", CITRATE_SSH_ALLOW_FROM="198.51.100.0/24, 2001:db8::/32")
+        r = self.sb.run("apply_firewall", CITRATE_SSH_ALLOW_FROM="198.51.100.0/24, 2001:db8::/32",
+                        SSH_CONNECTION="198.51.100.20 50000 192.0.2.10 22")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         muts = self.ufw_mutations()
         a4 = "ufw allow from 198.51.100.0/24 to any port 22 proto tcp"
@@ -704,17 +707,17 @@ class SshSourceTest(ShimTestCase):
                          ["198.51.100.0/24", "2001:db8::/32"])
 
     def test_allowlist_is_kept_on_a_rerun_without_it(self) -> None:
-        r = self.sb.run("apply_firewall", CITRATE_SSH_ALLOW_FROM="198.51.100.0/24")
+        r = self.sb.run("apply_firewall", CITRATE_SSH_ALLOW_FROM="198.51.100.0/24", SSH_CONNECTION=INSIDE)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.sb.log.write_text("")
-        r = self.sb.run("apply_firewall")  # no flag, no env: the recorded policy holds
+        r = self.sb.run("apply_firewall", SSH_CONNECTION=INSIDE)  # no flag, no env: the recorded policy holds
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual([c for c in self.ufw_mutations() if "22" in c], [])
         self.assertEqual([l for l in self.added() if "22" in l],
                          ["ufw allow from 198.51.100.0/24 to any port 22 proto tcp"])
         # an open rule added by hand later is removed again by the recorded policy
         self.preset(*self.added(), "ufw allow 22/tcp")
-        r = self.sb.run("apply_firewall")
+        r = self.sb.run("apply_firewall", SSH_CONNECTION=INSIDE)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertNotIn("ufw allow 22/tcp", self.added())
         self.sb.add_key()
@@ -853,6 +856,25 @@ class SshScopeTest(ShimTestCase):
             if rc:
                 self.assertEqual(self.ufw_mutations(), [], f"{rules} / {sess}")
                 self.assertEqual(self.added(), list(rules))
+
+    def test_server_address_unknown_is_not_credited(self) -> None:
+        self.sb.add_key()
+        self.preset(RESTRICTED_RULE, "ufw allow to 10.0.0.5 port 22 proto tcp")
+        r = self.sb.run("preflight", SSH_CONNECTION="203.0.113.5 50000 10.0.0.5 22")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)  # control: address known
+        r = self.sb.run("preflight", SSH_CLIENT="203.0.113.5 50000 22")  # SSH_CLIENT has no server address
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+
+    def test_open_rule_being_deleted_is_not_credited(self) -> None:
+        self.sb.add_key()
+        self.preset("ufw allow 22/tcp")
+        env = dict(CITRATE_SSH_ALLOW_FROM="198.51.100.0/24", SSH_CONNECTION=SESSION_PUBLIC)
+        r = self.sb.run("preflight", **env)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        r = self.sb.run("apply_firewall", **env)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertEqual(self.ufw_mutations(), [])
+        self.assertEqual(self.added(), ["ufw allow 22/tcp"])
 
     def test_interface_unknown_is_not_credited(self) -> None:
         self.sb.add_key()

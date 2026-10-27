@@ -30,9 +30,23 @@
 # tcp` rules, then removes the open SSH rules, and records the list in
 # /etc/citrate/ssh-allow-from so later runs and `check` keep that policy. It
 # refuses (exit 2, nothing changed) unless the current session's source address
-# (SSH_CONNECTION, else SSH_CLIENT) is inside the list; under sudo, keep
-# SSH_CONNECTION with --preserve-env. To go back to the default, delete
-# /etc/citrate/ssh-allow-from and the source rules by hand.
+# (SSH_CONNECTION, else SSH_CLIENT) is inside the list. To go back to the
+# default, delete /etc/citrate/ssh-allow-from and the source rules by hand.
+#
+# Only a rule for every interface and every destination address counts as SSH
+# already allowed. Rules scoped to one interface (`ufw allow in on tailscale0`)
+# or one address are kept and never deleted, but they do not stand in for SSH,
+# and --ssh-from deletes only open rules that cover SSH alone (an open rule that
+# also covers other ports, such as 20:30/tcp, makes it refuse). Before any
+# change, apply refuses unless the rules it will leave admit this session's
+# path: its source, and its server address and that address's interface
+# (SSH_CONNECTION, `ip -o addr show`).
+#
+# sudo: `sudo -i` and plain sudo drop SSH_CONNECTION, so the session cannot be
+# checked. With --ssh-from that is refused; without it, it is refused when ufw
+# would admit SSH only from some sources or interfaces. Run as root over ssh,
+# or keep the variable with `sudo --preserve-env=SSH_CONNECTION`. A root console
+# (no sudo, no SSH session) has no session to lose and is not refused.
 #
 # What `apply` does:
 #   - preflight, before any change: refuse unless every port sshd listens on
@@ -209,12 +223,22 @@ apt_noninteractive() {
 # Address and rule parsing for the SSH source policy (python3 ipaddress: IPv4,
 # IPv6 and IPv4-mapped IPv6 alike). Subcommands:
 #   norm LIST...          canonical CIDRs, one line; exit 2 on a bad or /0 entry
-#   covers ADDR CIDR...   exit 0 when ADDR is inside one of CIDR ("any" = all)
-#   added-rules           stdin `ufw show added`; per rule that admits tcp/22:
-#                         "SOURCE<TAB>ARG..." (SOURCE "any" or a canonical CIDR)
+#   plan [CIDR...]        stdin `ufw show added`, args the allowlist. What apply
+#                         does to SSH, one action per line, tab separated:
+#                           ADD ARG...     a rule to add (`ufw ARG...`)
+#                           DEL ARG...     an open SSH-only rule to delete
+#                           REFUSE reason  stop: nothing may change
+#                           NOTE text
+#                         Reads SSH_CONNECTION/SSH_CLIENT, SUDO_USER, and
+#                         SSHPOL_IPADDR (`ip -o addr show`, for the interface
+#                         that holds the session's server address).
 #   status-verdict CIDR.. stdin `ufw status verbose`; one "STATUS detail" line
+#
+# Only a rule for every interface and every destination ("unscoped") counts as
+# SSH already allowed. Interface- or destination-scoped rules are kept, never
+# deleted, and credited only to a session whose path they match.
 SSH_POLICY_PY='
-import ipaddress, re, shlex, sys
+import ipaddress, os, re, shlex, sys
 
 def net(s):
     s = s.strip()
@@ -224,6 +248,18 @@ def net(s):
     if n.version == 6 and n.network_address.ipv4_mapped is not None and n.prefixlen >= 96:
         n = ipaddress.ip_network("%s/%d" % (n.network_address.ipv4_mapped, n.prefixlen - 96))
     return n
+
+def addr(s):
+    a = ipaddress.ip_address(s.split("%")[0])
+    if a.version == 6 and a.ipv4_mapped is not None:
+        a = a.ipv4_mapped
+    return a
+
+def is_addr(s):
+    try:
+        return net(s) != "any"
+    except ValueError:
+        return False
 
 def inside(a, n):
     return n == "any" or (a.version == n.version and a in n)
@@ -239,13 +275,29 @@ def port_hit(spec, proto):
             return True
     return False
 
-def simple_hit(tok):
+def simple(tok):
+    """(admits tcp/22, covers SSH only) for a short-form rule token."""
     if "/" in tok:
         spec, _, proto = tok.partition("/")
-        return port_hit(spec, proto)
+        return port_hit(spec, proto), spec in ("22", "ssh")
     if re.fullmatch(r"[0-9,:]+|ssh", tok):
-        return port_hit(tok, None)
-    return re.search("ssh", tok, re.I) is not None
+        return port_hit(tok, None), tok in ("22", "ssh")
+    hit = re.search("ssh", tok, re.I) is not None
+    return hit, hit
+
+class Rule:
+    def __init__(self, src, iface, dst, ssh_only, args):
+        self.src, self.iface, self.dst, self.ssh_only, self.args = src, iface, dst, ssh_only, args
+        self.unscoped = not iface and dst == "any"
+
+    def admits(self, src, dst, iface):
+        if self.src != "any" and not inside(src, self.src):
+            return False
+        if self.iface and self.iface != iface:
+            return False
+        if self.dst != "any" and (dst is None or not inside(dst, self.dst)):
+            return False
+        return True
 
 def parse_added(line):
     try:
@@ -257,18 +309,20 @@ def parse_added(line):
     args = t[1:]
     if "comment" in args:
         args = args[:args.index("comment")]
-    i = 1
+    i, iface = 1, ""
     if i < len(args) and args[i] in ("in", "out"):
         if args[i] == "out":
             return None
         i += 1
     if i + 1 < len(args) and args[i] == "on":
+        iface = args[i + 1]
         i += 2
     if i < len(args) and args[i] in ("log", "log-all"):
         i += 1
     rest = args[i:]
     if len(rest) == 1:
-        return ("any", args) if simple_hit(rest[0]) else None
+        hit, only = simple(rest[0])
+        return Rule("any", iface, "any", only, args) if hit else None
     kw, side, j = {}, None, 0
     while j + 1 < len(rest):
         k, v = rest[j], rest[j + 1]
@@ -286,15 +340,92 @@ def parse_added(line):
         return None
     proto = kw.get("proto")
     if "toapp" in kw:
-        hit = re.search("ssh", kw["toapp"], re.I) is not None
+        hit = only = re.search("ssh", kw["toapp"], re.I) is not None
     elif "toport" in kw:
-        hit = port_hit(kw["toport"], proto)
+        hit, only = port_hit(kw["toport"], proto), kw["toport"] in ("22", "ssh")
     else:
-        hit = proto in (None, "tcp", "any")
+        hit, only = proto in (None, "tcp", "any"), False
     if not hit:
         return None
-    src = net(kw.get("from", "any"))
-    return (str(src), args)
+    return Rule(net(kw.get("from", "any")), iface, net(kw.get("to", "any")), only, args)
+
+def show(r):
+    return "ufw " + " ".join(r.args)
+
+def session():
+    """(src, dst, iface) of the SSH session running this; src None when unknown."""
+    conn = os.environ.get("SSH_CONNECTION", "").split()
+    cli = os.environ.get("SSH_CLIENT", "").split()
+    if len(conn) >= 4:
+        src, dst = addr(conn[0]), addr(conn[2])
+    elif cli:
+        src, dst = addr(cli[0]), None
+    else:
+        return None, None, None
+    iface = None
+    if dst is not None:
+        for line in os.environ.get("SSHPOL_IPADDR", "").splitlines():
+            m = re.match(r"\s*\d+:\s+(\S+)\s+inet6?\s+([^/\s]+)", line)
+            if m:
+                try:
+                    if addr(m.group(2)) == dst:
+                        iface = m.group(1)
+                        break
+                except ValueError:
+                    pass
+    return src, dst, iface
+
+def plan(text, allow):
+    rules = [r for r in (parse_added(l) for l in text.splitlines()) if r]
+    uns = [r for r in rules if r.unscoped]
+    adds, dels, refuse = [], [], []
+    if allow:
+        have = {str(r.src) for r in uns if r.src != "any"}
+        for a in allow:
+            if str(a) not in have:
+                adds.append(["allow", "from", str(a), "to", "any", "port", "22", "proto", "tcp"])
+        for r in uns:
+            if r.src != "any":
+                continue
+            if r.ssh_only:
+                dels.append(r)
+            else:
+                refuse.append("ufw rule \"%s\" opens 22 to Anywhere along with other ports; --ssh-from "
+                              "deletes only SSH-only rules: narrow it by hand, or drop --ssh-from" % show(r))
+    elif not uns:
+        adds.append(["allow", "22/tcp"])
+    result = [r for r in rules if not any(r is d for d in dels)]
+    result += [parse_added("ufw " + " ".join(a)) for a in adds]
+    try:
+        src, dst, iface = session()
+    except ValueError as e:
+        refuse.append("cannot parse SSH_CONNECTION/SSH_CLIENT (%s)" % e)
+        src = dst = iface = None
+    if src is not None:
+        path = "%s -> %s on %s" % (src, dst if dst is not None else "unknown address",
+                                   iface or "unknown interface")
+        if any(r.admits(src, dst, iface) for r in result):
+            print("NOTE\tthis SSH session (%s) stays admitted" % path)
+        else:
+            refuse.append("after apply ufw would not admit this SSH session (%s); "
+                          "only rules for every interface and address, or ones matching this path, count" % path)
+    elif allow:
+        refuse.append("--ssh-from set, but this session has no SSH_CONNECTION or SSH_CLIENT (a console, or "
+                      "sudo -i / sudo without --preserve-env=SSH_CONNECTION), so it cannot be checked")
+    elif os.environ.get("SUDO_USER") and not any(r.unscoped and r.src == "any" for r in result):
+        refuse.append("running under sudo without SSH_CONNECTION, and ufw would admit SSH only from some "
+                      "sources or interfaces; use sudo --preserve-env=SSH_CONNECTION so the session can be checked")
+    else:
+        print("NOTE\tno SSH session to check (console)")
+    for a in adds:
+        print("ADD\t" + "\t".join(a))
+    for r in dels:
+        print("DEL\t" + "\t".join(r.args))
+    for r in rules:
+        if not r.unscoped:
+            print("NOTE\tkept scoped SSH rule (not counted as SSH allowed): " + show(r))
+    for x in refuse:
+        print("REFUSE\t" + x)
 
 def status_sources(text):
     out = []
@@ -302,8 +433,15 @@ def status_sources(text):
         cols = re.split(r"\s{2,}", line.strip())
         if len(cols) < 3 or not re.fullmatch(r"(ALLOW|LIMIT)( IN)?", cols[1]):
             continue
-        to = re.sub(r"\s+on\s+\S+$", "", re.sub(r"\s*\(v6\)$", "", cols[0]))
-        if not (to == "Anywhere" or any(simple_hit(x) for x in to.split())):
+        to = re.sub(r"\s*\(v6\)$", "", cols[0])
+        scoped = False
+        m = re.search(r"\s+on\s+\S+$", to)
+        if m:
+            scoped, to = True, to[:m.start()]
+        toks = to.split()
+        if toks and toks[0] != "Anywhere" and is_addr(toks[0]):
+            scoped, toks = True, toks[1:] or ["Anywhere"]
+        if scoped or not (toks == ["Anywhere"] or any(simple(x)[0] for x in toks)):
             continue
         frm = re.sub(r"\s*\(v6\)$", "", cols[2].split("#")[0].strip()) or "Anywhere"
         src = str(net(frm.split()[0]))
@@ -314,7 +452,7 @@ def status_sources(text):
 def verdict(srcs, allow):
     shown = ", ".join("Anywhere" if s == "any" else s for s in srcs)
     if not srcs:
-        return "FAIL no 22/tcp allow rule"
+        return "FAIL no 22/tcp allow rule for every interface and address"
     if allow:
         nets = [net(s) for s in srcs if s != "any"]
         wide = [s for s in srcs if s == "any"] + [str(n) for n in nets
@@ -358,19 +496,8 @@ def main(argv):
             return 2
         print(" ".join(out))
         return 0
-    if cmd == "covers":
-        try:
-            a = ipaddress.ip_address(args[0].split("%")[0])
-        except (IndexError, ValueError):
-            return 2
-        if a.version == 6 and a.ipv4_mapped is not None:
-            a = a.ipv4_mapped
-        return 0 if any(inside(a, net(n)) for n in args[1:]) else 1
-    if cmd == "added-rules":
-        for line in sys.stdin.read().splitlines():
-            r = parse_added(line)
-            if r:
-                print("\t".join([r[0]] + r[1]))
+    if cmd == "plan":
+        plan(sys.stdin.read(), [net(a) for a in args])
         return 0
     if cmd == "status-verdict":
         print(verdict(status_sources(sys.stdin.read()), [net(a) for a in args]))
@@ -401,47 +528,33 @@ load_ssh_policy() {
     || die "$SSH_ALLOW_ORIGIN: bad SSH allowlist '$raw' (want CIDR[,CIDR], not 0.0.0.0/0 or ::/0)"
 }
 
-# SSH allow rules ufw holds (active or not), as "SOURCE<TAB>ARG..." lines.
-ssh_rules_added() {
-  local added
-  command -v ufw >/dev/null || return 0
-  added="$(ufw show added 2>/dev/null)" || added=""
-  sshpol added-rules <<<"$added"
+# What apply would do to SSH in ufw now (see `plan` above). Reads the whole of
+# `ufw show added` and `ip -o addr show` before parsing them.
+ssh_plan() {
+  local added="" ipa=""
+  command -v python3 >/dev/null || die "python3 is needed to plan the SSH rules"
+  if command -v ufw >/dev/null; then added="$(ufw show added 2>/dev/null)" || added=""; fi
+  ipa="$(ip -o addr show 2>/dev/null)" || ipa=""
+  SSHPOL_IPADDR="$ipa" sshpol plan $SSH_ALLOW <<<"$added"
 }
 
-# Source address of the SSH session running this, or empty.
-session_source() {
-  local c="${SSH_CONNECTION:-${SSH_CLIENT:-}}"
-  echo "${c%% *}"
+# plan_refusal PLAN: print the first REFUSE reason, if any (exit 1 when none).
+plan_refusal() {
+  local line
+  line="$(grep -m1 '^REFUSE' <<<"$1")" || return 1
+  echo "${line#REFUSE$'\t'}"
 }
 
-# The SSH sources apply leaves in ufw must include this session's source:
-# the allowlist when one is set (and the session must be placeable), else any
-# existing source-restricted rules, which apply keeps as they are.
+# The SSH rules apply leaves in ufw must still admit this session's path.
 guard_ssh_source() {
-  local src srcs
+  local plan why line
   load_ssh_policy
-  src="$(session_source)"
-  if [ -n "$SSH_ALLOW" ]; then
-    [ -n "$src" ] || die "SSH allowlist ($SSH_ALLOW) set, but this session's source is unknown (SSH_CONNECTION and SSH_CLIENT are empty; under sudo use --preserve-env=SSH_CONNECTION); refusing before any change"
-    sshpol covers "$src" $SSH_ALLOW \
-      || die "this SSH session comes from $src, outside the SSH allowlist ($SSH_ALLOW); refusing before any change"
-    note "SSH session $src is inside the allowlist ($SSH_ALLOW)"
-    return 0
-  fi
-  srcs="$(ssh_rules_added | cut -f1 | sort -u)"
-  if [ -z "$srcs" ] || grep -qx any <<<"$srcs"; then
-    note "SSH open at the host (no allowlist); the provider firewall filters sources"
-    return 0
-  fi
-  srcs="$(tr '\n' ' ' <<<"$srcs")"
-  if [ -z "$src" ]; then
-    note "ufw allows SSH only from $srcs(kept); no SSH session to check"
-    return 0
-  fi
-  sshpol covers "$src" $srcs \
-    || die "ufw allows SSH only from $srcs(apply keeps that), and this SSH session comes from $src; refusing before any change"
-  note "SSH session $src is inside the existing ufw SSH sources ($srcs)"
+  plan="$(ssh_plan)"
+  if why="$(plan_refusal "$plan")"; then die "$why; refusing before any change"; fi
+  while IFS= read -r line; do
+    case "$line" in NOTE$'\t'*) note "${line#NOTE$'\t'}" ;; esac
+  done <<<"$plan"
+  return 0
 }
 
 # ---- preflight (no changes) -------------------------------------------------
@@ -704,53 +817,57 @@ EOF
 # Runbook section 2. Allows first, then the defaults, then enable. On a host where
 # ufw is already active, `default deny incoming` bites at once, so it must not
 # run before the SSH allow exists (a failed allow stops the script under set -e).
-# preflight has already checked that sshd listens on SSH_FW_PORT only, and that
-# this session's source is inside the SSH sources left in place below.
+# preflight has already checked that sshd listens on SSH_FW_PORT only.
 #
-# SSH never gets wider here: with an allowlist, its source rules go in and the
-# open SSH rules come out once they are all present; without one, the open rule
-# is added only when ufw has no SSH allow rule at all.
+# The SSH rules come from ssh_plan, the same plan preflight checked: SSH never
+# gets wider (the open rule is added only when ufw has no SSH rule for every
+# interface and address); with an allowlist, its source rules go in, and only
+# then do the open SSH-only rules come out. Interface- and destination-scoped
+# rules are never removed. The plan is re-read before enable: any refusal (for
+# example this session's path no longer admitted) or a missing rule stops
+# before the defaults and enable.
 apply_firewall() {
   echo "[firewall]"
-  local before rules srcs c
+  local before plan why line
   local -a f
   load_ssh_policy
   before="$(ufw status verbose 2>/dev/null || true)"
-  srcs="$(ssh_rules_added | cut -f1)"
-  if [ -n "$SSH_ALLOW" ]; then
-    for c in $SSH_ALLOW; do
-      grep -qxF -- "$c" <<<"$srcs" || ufw allow from "$c" to any port "$SSH_FW_PORT" proto tcp >/dev/null
-    done
-  elif [ -z "$srcs" ]; then
-    # Open at the host; the provider firewall (citrate-producer-fw) filters sources.
-    ufw allow 22/tcp >/dev/null
-  fi
+  plan="$(ssh_plan)"
+  if why="$(plan_refusal "$plan")"; then die "$why; ufw left as it was"; fi
+  while IFS=$'\t' read -r -a f; do
+    [ "${f[0]:-}" = ADD ] || continue
+    case "${f[*]:1}" in
+      # Open at the host; the provider firewall (citrate-producer-fw) filters sources.
+      "allow 22/tcp") ufw allow 22/tcp >/dev/null ;;
+      *) ufw "${f[@]:1}" >/dev/null ;;
+    esac
+  done <<<"$plan"
   ufw allow 30303/tcp >/dev/null
   ufw allow 30303/udp >/dev/null
-  rules="$(ssh_rules_added)"
-  srcs="$(cut -f1 <<<"$rules")"
-  [ -n "$srcs" ] || die "ufw has no ${SSH_FW_PORT}/tcp allow rule; not enabling"
-  if [ -n "$SSH_ALLOW" ]; then
-    for c in $SSH_ALLOW; do
-      grep -qxF -- "$c" <<<"$srcs" || die "ufw has no SSH rule for $c; not enabling"
-    done
-    while IFS=$'\t' read -r -a f; do
-      [ "${f[0]:-}" = any ] || continue
-      ufw --force delete "${f[@]:1}" >/dev/null
-    done <<<"$rules"
+  plan="$(ssh_plan)"
+  if why="$(plan_refusal "$plan")"; then die "$why; not enabling"; fi
+  if line="$(grep -m1 '^ADD' <<<"$plan")"; then
+    die "ufw has no rule for: ufw ${line#ADD$'\t'}; not enabling"
   fi
+  while IFS=$'\t' read -r -a f; do
+    [ "${f[0]:-}" = DEL ] || continue
+    ufw --force delete "${f[@]:1}" >/dev/null
+  done <<<"$plan"
   ufw default deny incoming >/dev/null
   ufw default allow outgoing >/dev/null
   ufw --force enable >/dev/null
   if [ -n "$SSH_ALLOW" ]; then
-    put_file "$SSH_POLICY_FILE" 0644 root:root <<EOF
+    put_file "$SSH_POLICY_FILE" 0644 root:root <<EOF2
 # producer_baseline.sh --ssh-from: the host SSH allowlist (22/tcp sources).
 # Later runs and \`check\` keep it. Delete this file to go back to the default.
 $(tr ' ' '\n' <<<"$SSH_ALLOW")
-EOF
+EOF2
   fi
   if [ "$(ufw status verbose)" != "$before" ]; then CHANGED+=("ufw"); fi
-  note "ufw $(ufw status | head -1 | awk '{print $2}'): SSH from $(cut -f1 <<<"$(ssh_rules_added)" | sort -u | sed 's/^any$/Anywhere/' | tr '\n' ' ')30303/tcp+udp in"
+  while IFS= read -r line; do
+    case "$line" in NOTE$'\t'*) note "${line#NOTE$'\t'}" ;; esac
+  done <<<"$plan"
+  note "ufw $(ufw status | head -1 | awk '{print $2}'): SSH as planned, 30303/tcp+udp in"
 }
 
 # Reads `ufw status verbose` on stdin. Exit 0 only for the runbook policy: active,
