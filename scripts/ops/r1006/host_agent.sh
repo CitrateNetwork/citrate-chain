@@ -537,7 +537,9 @@ cmd_sha() {
 cmd_build_rev() {
   [[ -x "$BIN" ]] || die "no installed binary at $BIN"
   local out
-  out=$(RUST_LOG=error "$BIN" consensus --json </dev/null 2>/dev/null) || die "the installed binary did not answer consensus --json"
+  # As the node user: `consensus --json` opens the data dir to read block 0 (chain#398);
+  # run as root it would leave root-owned RocksDB files the node then cannot lock.
+  out=$(RUST_LOG=error as_node_user "$BIN" consensus --json </dev/null 2>/dev/null) || die "the installed binary did not answer consensus --json"
   python3 -c 'import json, re, sys
 l = sys.argv[1].splitlines()
 try:
