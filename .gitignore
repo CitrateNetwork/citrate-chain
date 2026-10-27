@@ -127,3 +127,4 @@ contracts/cache-membership/
 
 # r1006 bring-up state (public data only; default ~/r1006-state, never in a checkout)
 r1006-state/
+contracts/addresses/.r1006-smoke-*.json

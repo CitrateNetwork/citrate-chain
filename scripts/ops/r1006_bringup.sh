@@ -713,7 +713,7 @@ step_smoke() {
     echo "  [dry-run] eth_chainId == 40204 on every host"
     echo "  [dry-run] eth_getCode(addr) == alloc[addr].code for every coded alloc entry (fill alloc_file), on every host"
     echo "  [dry-run] OrangeSeed (fill orangeseed): story() returns a non-empty string"
-    echo "  [dry-run] CheckDeployedAdmins.s.sol over the fill address_book: DEPLOYER-ADMIN failures: 0"
+    echo "  [dry-run] CheckDeployedAdmins.s.sol over the fill address_book (staged under contracts/addresses): forge rc 0 and DEPLOYER-ADMIN failures: 0"
     echo "  [dry-run] host_agent logs-scan: no CONFLICT / fork line since start, every host"
     echo "  [dry-run] finality: eth_getBlockByNumber(finalized) answers (switch OFF: expect block 0)"
     echo "  [dry-run] config: no contribution recorder in node.toml / env / unit drop-ins, every host"
@@ -806,12 +806,17 @@ PY
   elif [[ -z "$book" || ! -f "$REPO/contracts/script/CheckDeployedAdmins.s.sol" ]]; then
     fail "no address book in the fill result, or no CheckDeployedAdmins.s.sol in this checkout"
   else
-    local report da
-    report=$(cd "$REPO/contracts" && ADDRESS_BOOK="$STATE/genesis/$book" REQUIRE_ALL_CODE=true \
-      "$FORGE" script script/CheckDeployedAdmins.s.sol --rpc-url "${urls[0]}" 2>&1 || true)
+    # forge may read only under contracts/ (fs_permissions: ./addresses), and the state dir
+    # is outside the checkout: stage the fill's (public) book there for this run only.
+    local report da frc=0 staged="addresses/.r1006-smoke-$$.json"
+    cp -f -- "$STATE/genesis/$book" "$REPO/contracts/$staged"
+    report=$(cd "$REPO/contracts" && ADDRESS_BOOK="$staged" REQUIRE_ALL_CODE=true \
+      "$FORGE" script script/CheckDeployedAdmins.s.sol --rpc-url "${urls[0]}" 2>&1) || frc=$?
+    rm -f -- "$REPO/contracts/$staged"
     da=$(printf '%s\n' "$report" | sed -nE 's/.*DEPLOYER-ADMIN failures:[[:space:]]*([0-9]+)[[:space:]]*$/\1/p')
-    if [[ $(printf '%s' "$da" | grep -c .) -eq 1 && "$da" == 0 ]]; then pass "DEPLOYER-ADMIN 0"
-    else printf '%s\n' "$report" | tail -15 | sed 's/^/  | /'; fail "DEPLOYER-ADMIN is not a single 0"; fi
+    # The whole checker must pass (rc 0), and report exactly one DEPLOYER-ADMIN count of 0.
+    if [[ $frc -eq 0 && $(printf '%s' "$da" | grep -c .) -eq 1 && "$da" == 0 ]]; then pass "DEPLOYER-ADMIN 0"
+    else printf '%s\n' "$report" | tail -15 | sed 's/^/  | /'; fail "DEPLOYER-ADMIN is not a single 0 with the checker passing (forge rc=$frc)"; fi
   fi
 
   # 6. logs: no CONFLICT / fork
