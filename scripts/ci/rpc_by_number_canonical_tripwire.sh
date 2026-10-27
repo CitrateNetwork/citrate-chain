@@ -40,13 +40,13 @@ scan() { # <root>
     # the argument may sit on the next line (rustfmt splits long chains)
     if ($open) {
       $open = 0;
-      print "$f:$on: $ol\n" unless $code =~ /^\s*0\s*\)/;
+      print "$f:$on: $ol\n" unless $code =~ /^\s*0\s*,?\s*(\)|$)/;
     }
     while ($code =~ /\bget_block_by_height\s*\(([^)]*)(\)?)/g) {
       my ($argtxt, $closed) = ($1, $2);
       (my $s = $code) =~ s/^\s+|\s+$//g;
       if ($closed eq "" && $argtxt =~ /^\s*$/) { ($open, $on, $ol) = (1, $n, $s); next }
-      print "$f:$n: $s\n" unless $argtxt =~ /^\s*0\s*$/;
+      print "$f:$n: $s\n" unless $argtxt =~ /^\s*0\s*,?\s*$/;
     }
   ') || true
 }

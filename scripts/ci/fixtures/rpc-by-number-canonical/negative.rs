@@ -1,16 +1,23 @@
 // Fixture: by-number reads that follow the executed chain, and the genesis lookup.
 fn by_number(storage: &StorageManager, n: u64) -> Option<Hash> {
-    storage.blocks.get_canonical_block_by_height(n).ok().flatten()
+    storage
+        .blocks
+        .get_canonical_block_by_height(n)
+        .ok()
+        .flatten()
 }
 
 fn genesis(storage: &StorageManager) -> Option<Hash> {
     storage.blocks.get_block_by_height(0).ok().flatten()
 }
 
+#[rustfmt::skip]
 fn genesis_split(storage: &StorageManager) -> Option<Hash> {
     storage
         .blocks
-        .get_block_by_height(0)
+        .get_block_by_height(
+            0,
+        )
         .ok()
         .flatten()
 }
