@@ -95,7 +95,8 @@ pub use protocol::{ModelMetadata, NetworkMessage, Protocol, ProtocolVersion};
 pub use relay::{RelayError, RelayService};
 pub use sync::{SyncConfig, SyncManager, SyncState};
 pub use sync_ranges::{
-    BlocksMatch, Expired, PeerSlot, Plan, RangeConfig, RangeCounters, RangeScheduler, SyncRequest,
+    BlockLink, BlocksMatch, Expired, PeerSlot, Plan, RangeConfig, RangeCounters, RangeScheduler,
+    SyncRequest,
 };
 pub use transaction_gossip::{GossipConfig as TxGossipConfig, TransactionGossip};
 pub use transport::NetworkTransport;

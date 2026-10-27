@@ -227,6 +227,14 @@ impl SyncDriver {
         // One timeout per peer per round, however many of its ranges expired
         // together: they are one slow connection, not several failures.
         let mut charged: Vec<PeerId> = Vec::new();
+        // A peer whose header anchor a block answer proved wrong, or whose
+        // delivered range was refused or never applied, is charged like a
+        // timeout so it drops below the peers that serve.
+        for pid in plan.misbehaved {
+            let pf = sel.record_timeout(&pid.0);
+            charged.push(pid.clone());
+            report.timed_out.push((pid, pf));
+        }
         for e in plan.expired {
             if charged.contains(&e.peer) {
                 continue;
@@ -311,6 +319,7 @@ impl SyncDriver {
         // (buffered), never dropped; a parent arriving later unblocks it.
         let mut newly_admitted: usize = 0;
         let mut highest_admitted: u64 = 0;
+        let mut rejected_fresh: usize = 0;
         loop {
             let mut progressed = false;
             let mut deferred: Vec<Block> = Vec::new();
@@ -344,6 +353,9 @@ impl SyncDriver {
                         deferred.push(block);
                     }
                     AdmitOutcome::Rejected(why) => {
+                        if fresh.contains(&block.header.block_hash) {
+                            rejected_fresh = rejected_fresh.saturating_add(1);
+                        }
                         tracing::warn!(
                             "Rejected inconsistent synced block {} @ {}: {}",
                             hex::encode(block.header.block_hash.as_bytes().get(..8).unwrap_or(&[])),
@@ -359,12 +371,32 @@ impl SyncDriver {
             }
         }
         // Blocks from THIS response still waiting on a parent: a range that
-        // arrived ahead of an earlier one. They are new to us and count as
-        // service; they are admitted when the earlier range lands.
+        // arrived ahead of an earlier one. They count as service only inside
+        // the run the scheduler accepted as linked to the range's anchor; a
+        // block on a parent nobody can resolve is not service.
+        let linked_run = match &matched {
+            BlocksMatch::Range {
+                start,
+                delivered_through,
+                ..
+            } => Some((*start, *delivered_through)),
+            BlocksMatch::Unsolicited => None,
+        };
         let deferred_fresh = pending
             .iter()
             .filter(|b| fresh.contains(&b.header.block_hash))
+            .filter(|b| {
+                linked_run.is_some_and(|(s, t)| b.header.height >= s && b.header.height <= t)
+            })
             .count();
+        // Admission refused part of a delivered range: ask someone else.
+        if rejected_fresh > 0 {
+            if let Some((s, t)) = linked_run {
+                if t >= s {
+                    self.sync.range_rejected(pid, s, t);
+                }
+            }
+        }
         if reprocessed_orphans {
             *orphans = admission::bound_orphan_buffer(std::mem::take(&mut pending));
         }

@@ -3,7 +3,9 @@
 // Synchronization manager for block and header downloads
 use crate::{
     peer::{Peer, PeerId},
-    sync_ranges::{BlocksMatch, PeerSlot, Plan, RangeConfig, RangeCounters, RangeScheduler},
+    sync_ranges::{
+        BlockLink, BlocksMatch, PeerSlot, Plan, RangeConfig, RangeCounters, RangeScheduler,
+    },
     NetworkError, NetworkMessage,
 };
 use citrate_consensus::crypto;
@@ -303,6 +305,14 @@ impl SyncManager {
         }
     }
 
+    /// Admission refused blocks `peer` delivered for `start..=end`: re-plan
+    /// that range on someone else.
+    pub fn range_rejected(&self, peer: &PeerId, start: u64, end: u64) {
+        if let Ok(mut r) = self.ranges.lock() {
+            r.on_rejected(peer, start, end);
+        }
+    }
+
     /// `peer` failed to take a request or went away: re-plan what it owed.
     pub fn release_peer(&self, peer: &PeerId) {
         if let Ok(mut r) = self.ranges.lock() {
@@ -562,8 +572,15 @@ impl SyncManager {
             warn!("Sync validation: {}/{} blocks rejected", rejected, total);
         }
 
-        let validated_heights: Vec<u64> = validated.iter().map(|b| b.header.height).collect();
-        let matched = self.match_range(from_peer, raw_first_height, &validated_heights);
+        let links: Vec<BlockLink> = validated
+            .iter()
+            .map(|b| BlockLink {
+                height: b.header.height,
+                hash: b.header.block_hash,
+                parent: b.header.selected_parent_hash,
+            })
+            .collect();
+        let matched = self.match_range(from_peer, raw_first_height, &links);
 
         if validated.is_empty() {
             return Ok(matched);
@@ -638,7 +655,12 @@ impl SyncManager {
         Ok(matched)
     }
 
-    fn match_range(&self, peer: &PeerId, first: Option<u64>, validated: &[u64]) -> BlocksMatch {
+    fn match_range(
+        &self,
+        peer: &PeerId,
+        first: Option<u64>,
+        validated: &[BlockLink],
+    ) -> BlocksMatch {
         match self.ranges.lock() {
             Ok(mut r) => r.on_blocks(peer, first, validated),
             Err(_) => BlocksMatch::Unsolicited,
@@ -991,7 +1013,10 @@ mod tests {
             .await
             .expect("handle empty headers");
         let _ = sync.handle_blocks(&PeerId("p".into()), vec![]).await;
-        let after = sync.plan_ranges(now, 0, Hash::default(), &peers);
+        // An answer with nothing new backs header requests off briefly; past
+        // the backoff the next one goes out, and nothing ever expired.
+        let past_backoff = Instant::now() + RangeConfig::default().header_backoff;
+        let after = sync.plan_ranges(past_backoff, 0, Hash::default(), &peers);
         assert!(
             after.expired.is_empty() && !header_requests(&after).is_empty(),
             "an empty header response must retire the pending request"
