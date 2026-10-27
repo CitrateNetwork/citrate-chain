@@ -13,7 +13,7 @@ contract UsageReceiptsTest is AmcTestBase {
 
     function setUp() public {
         vm.warp(T0);
-        ur = new UsageReceipts();
+        ur = new UsageReceipts(90);
         today = uint32(T0 / 1 days);
     }
 
@@ -107,6 +107,31 @@ contract UsageReceiptsTest is AmcTestBase {
         assertEq(ur.daysOf(member, type(uint256).max, type(uint256).max).length, 0);
     }
 
+    /// Backfill cap (owner, 2026-10-26): 90 days in the deploy profile, a bounded deploy-time
+    /// parameter.
+    function test_backfillIsCapped() public {
+        vm.startPrank(member);
+        ur.commit(today - 90, keccak256("oldest allowed"), 1);
+        vm.expectRevert(abi.encodeWithSelector(UsageReceipts.DayTooOld.selector, today - 90));
+        ur.commit(today - 91, keccak256("too old"), 1);
+        vm.stopPrank();
+        assertEq(ur.maxBackfillDays(), ur.DEFAULT_MAX_BACKFILL_DAYS());
+        assertEq(ur.DEFAULT_MAX_BACKFILL_DAYS(), 90);
+    }
+
+    function test_backfillBounds() public {
+        vm.expectRevert(UsageReceipts.BadBackfill.selector);
+        new UsageReceipts(0);
+        vm.expectRevert(UsageReceipts.BadBackfill.selector);
+        new UsageReceipts(367);
+        UsageReceipts one = new UsageReceipts(1);
+        vm.prank(member);
+        vm.expectRevert(abi.encodeWithSelector(UsageReceipts.DayTooOld.selector, today - 1));
+        one.commit(today - 2, keccak256("r"), 1);
+        vm.prank(member);
+        one.commit(today - 1, keccak256("r"), 1);
+    }
+
     function test_holdsNoValue() public {
         _assertRejectsValue(address(ur));
     }
@@ -114,7 +139,12 @@ contract UsageReceiptsTest is AmcTestBase {
     function testFuzz_closedDayRule(uint32 day, bytes32 root, uint8 schema) public {
         vm.assume(root != bytes32(0) && schema != 0);
         vm.prank(member);
-        if (uint256(day) >= T0 / 1 days) vm.expectRevert(UsageReceipts.DayNotClosed.selector);
+        uint256 t = T0 / 1 days;
+        if (uint256(day) >= t) {
+            vm.expectRevert(UsageReceipts.DayNotClosed.selector);
+        } else if (uint256(day) + 90 < t) {
+            vm.expectRevert(abi.encodeWithSelector(UsageReceipts.DayTooOld.selector, uint32(t - 90)));
+        }
         ur.commit(day, root, schema);
     }
 }
@@ -158,7 +188,7 @@ contract UsageReceiptsInvariantTest is Test {
 
     function setUp() public {
         vm.warp(1_800_000_000);
-        ur = new UsageReceipts();
+        ur = new UsageReceipts(90);
         handler = new UsageReceiptsHandler(ur);
         targetContract(address(handler));
     }

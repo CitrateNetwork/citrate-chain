@@ -17,6 +17,10 @@ pragma solidity ^0.8.26;
 ///         sealed local salts file; the tree and inclusion proofs are RFC 6962, the same code as
 ///         citrate-agent-anchor. A reveal is {record, salt, proof}, checked against `rootOf`.
 ///
+///         Backfill is bounded: a day older than `maxBackfillDays` before today is refused
+///         (deploy profile 90, matching the local history retention; owner, 2026-10-26). This
+///         limits what a stolen key can pre-empt for days the member has not committed.
+///
 ///         Layout follows AnchorRegistry (committer namespacing, tail-clamped paging). Holds no
 ///         value; no governance; no external calls.
 contract UsageReceipts {
@@ -31,6 +35,15 @@ contract UsageReceipts {
     /// own schema table; 0 is never valid.
     uint8 public constant SCHEMA_V1 = 1;
 
+    /// Bounds on the backfill limit chosen at deployment; DEFAULT_MAX_BACKFILL_DAYS is the
+    /// deploy-profile value (history retention).
+    uint32 public constant DEFAULT_MAX_BACKFILL_DAYS = 90;
+    uint32 public constant MIN_BACKFILL_DAYS = 1;
+    uint32 public constant MAX_BACKFILL_DAYS = 366;
+
+    /// @notice How many days back from today a closed day may still be committed.
+    uint32 public immutable maxBackfillDays;
+
     mapping(address => mapping(uint32 => Receipt)) private _receipts;
     mapping(address => uint32[]) private _days;
 
@@ -40,10 +53,19 @@ contract UsageReceipts {
     error DayNotClosed();
     error BadSchema();
     error ZeroRoot();
+    error DayTooOld(uint32 oldestAllowed);
+    error BadBackfill();
+
+    constructor(uint32 maxBackfillDays_) {
+        if (maxBackfillDays_ < MIN_BACKFILL_DAYS || maxBackfillDays_ > MAX_BACKFILL_DAYS) revert BadBackfill();
+        maxBackfillDays = maxBackfillDays_;
+    }
 
     /// @param day UTC day number (unix seconds / 86400). Only a closed day may be committed.
     function commit(uint32 day, bytes32 root, uint8 schema) external {
-        if (uint256(day) >= block.timestamp / 1 days) revert DayNotClosed();
+        uint256 today = block.timestamp / 1 days;
+        if (uint256(day) >= today) revert DayNotClosed();
+        if (uint256(day) + maxBackfillDays < today) revert DayTooOld(uint32(today - maxBackfillDays));
         if (root == bytes32(0)) revert ZeroRoot();
         if (schema == 0) revert BadSchema();
         Receipt storage r = _receipts[msg.sender][day];

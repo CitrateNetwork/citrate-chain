@@ -17,7 +17,6 @@ import {InitialAdmin} from "../lib/InitialAdmin.sol";
 ///
 ///         State machine:
 ///           Unlisted | Delisted | EmergencyDelisted  --proposeListing (GOVERNANCE)-->  PendingListing
-///           Listed                                   --updateCommitments (GOVERNANCE)-> PendingListing
 ///           PendingListing --finalizeListing (anyone, at or after vetoEndsAt)-->     Listed
 ///           PendingListing --veto (GUARDIAN)-->                                      Unlisted
 ///           Listed | PendingListing | EmergencyDelisted --delist (GOVERNANCE)-->     Delisted
@@ -25,9 +24,18 @@ import {InitialAdmin} from "../lib/InitialAdmin.sol";
 ///         Every path back to Listed passes PendingListing, so it waits the GOVERNANCE timelock
 ///         and then the registry's own veto window.
 ///
+///         Commitment updates (owner decision 2026-10-26, no outage): `updateCommitments` on a
+///         Listed provider queues new commitments beside the old ones. The provider stays Listed
+///         on the OLD commitments until the new ones clear the veto window, then
+///         `finalizeUpdate` swaps them atomically. A guardian `veto` drops the queued update and
+///         leaves the listing as it was; `emergencyDelist` and `delist` still act at once and
+///         discard any queued update.
+///
 ///         Guardian (RT-15, X-6): its veto is local to this registry's listing queue. It holds no
 ///         timelock role, cannot cancel `setGuardian` (that is not a listing), cannot list or
-///         restore anything, and has no path to governance.
+///         restore anything, and has no path to governance. Owner decision Q-8(b) (2026-10-26):
+///         the guardian seat is a direct 2-of-3 with no delay (`RegistryGuardian2of3`), limited
+///         to `emergencyDelist`, `veto` and `pause`.
 contract ProviderRegistry is Governable {
     enum Kind {
         Vendor, // serves models through an API key held by the member (BYOK)
@@ -48,11 +56,16 @@ contract ProviderRegistry is Governable {
         bytes32 hostsCommitment; // keccak256 of the canonical JSON of core's VENDORS entry
         bytes32 policyCommitment; // keccak256 of the governance policy doc for this listing
         uint64 listedAt; // last time it became Listed (0 if never)
-        uint64 vetoEndsAt; // PendingListing only; 0 otherwise
+        uint64 vetoEndsAt; // PendingListing, or Listed with an update queued; 0 otherwise
         uint16 reasonCode; // last veto / delist reason (registry-defined codes, no free text)
+        bool updatePending; // Listed only: new commitments queued, waiting for vetoEndsAt
+        bytes32 pendingHostsCommitment;
+        bytes32 pendingPolicyCommitment;
     }
 
-    /// Bounds on the veto window chosen at deployment (owner question on delist timing pending).
+    /// Bounds on the veto window chosen at deployment. The planset default, used by the deploy
+    /// profile, is DEFAULT_VETO_WINDOW (owner, 2026-10-26: no other value decided).
+    uint64 public constant DEFAULT_VETO_WINDOW = 24 hours;
     uint64 public constant MIN_VETO_WINDOW = 1 hours;
     uint64 public constant MAX_VETO_WINDOW = 7 days;
 
@@ -60,6 +73,9 @@ contract ProviderRegistry is Governable {
     uint64 public immutable vetoWindow;
     /// @notice The GUARDIAN seat. Replaceable only by governance.
     address public guardian;
+    /// @notice While true, nothing is usable (`isListedWith` is false) and nothing finalizes.
+    ///         Set by the guardian, cleared only by governance.
+    bool public paused;
 
     mapping(bytes32 => Provider) private _providers;
     bytes32[] private _ids;
@@ -72,8 +88,14 @@ contract ProviderRegistry is Governable {
     event Listed(bytes32 indexed providerId);
     event Delisted(bytes32 indexed providerId, uint16 reasonCode);
     event EmergencyDelisted(bytes32 indexed providerId, uint16 reasonCode, address indexed guardian);
+    event UpdateProposed(
+        bytes32 indexed providerId, bytes32 hostsCommitment, bytes32 policyCommitment, uint64 vetoEndsAt
+    );
+    event UpdateVetoed(bytes32 indexed providerId, uint16 reasonCode);
     event CommitmentsUpdated(bytes32 indexed providerId, bytes32 hostsCommitment, bytes32 policyCommitment);
     event GuardianSet(address indexed previous, address indexed next);
+    event Paused(address indexed guardian, uint16 reasonCode);
+    event Unpaused();
 
     error NotGuardian();
     error GuardianIsGovernance();
@@ -82,6 +104,9 @@ contract ProviderRegistry is Governable {
     error ZeroProviderId();
     error WrongStatus(Status status);
     error VetoWindowOpen(uint64 vetoEndsAt);
+    error IsPaused();
+    error NotPaused();
+    error NoPendingUpdate();
 
     constructor(address governance_, address guardian_, uint64 vetoWindow_) Governable(governance_) {
         if (vetoWindow_ < MIN_VETO_WINDOW || vetoWindow_ > MAX_VETO_WINDOW) revert BadVetoWindow();
@@ -111,14 +136,18 @@ contract ProviderRegistry is Governable {
         emit ListingProposed(providerId, kind, hostsC, policyC, p.vetoEndsAt);
     }
 
-    /// @notice Change a Listed provider's commitments. It goes back through PendingListing, so
-    ///         core stops using it until the new commitments clear the veto window.
+    /// @notice Queue new commitments for a Listed provider. It stays Listed on the current ones
+    ///         until `finalizeUpdate`. A second call replaces the queued update and restarts the
+    ///         window.
     function updateCommitments(bytes32 providerId, bytes32 hostsC, bytes32 policyC) external onlyGovernance {
         Provider storage p = _providers[providerId];
         if (p.status != Status.Listed) revert WrongStatus(p.status);
-        _queue(p, hostsC, policyC);
-        emit CommitmentsUpdated(providerId, hostsC, policyC);
-        emit ListingProposed(providerId, p.kind, hostsC, policyC, p.vetoEndsAt);
+        if (hostsC == bytes32(0) || policyC == bytes32(0)) revert ZeroCommitment();
+        p.updatePending = true;
+        p.pendingHostsCommitment = hostsC;
+        p.pendingPolicyCommitment = policyC;
+        p.vetoEndsAt = uint64(block.timestamp) + vetoWindow;
+        emit UpdateProposed(providerId, hostsC, policyC, p.vetoEndsAt);
     }
 
     function delist(bytes32 providerId, uint16 reasonCode) external onlyGovernance {
@@ -128,6 +157,7 @@ contract ProviderRegistry is Governable {
         p.status = Status.Delisted;
         p.vetoEndsAt = 0;
         p.reasonCode = reasonCode;
+        _dropUpdate(p);
         emit Delisted(providerId, reasonCode);
     }
 
@@ -135,11 +165,19 @@ contract ProviderRegistry is Governable {
         _setGuardian(next);
     }
 
+    /// @notice Lift a guardian pause. Governance only, so the guardian can stop but never resume.
+    function unpause() external onlyGovernance {
+        if (!paused) revert NotPaused();
+        paused = false;
+        emit Unpaused();
+    }
+
     // ------------------------------------------------------------------ anyone
 
     /// @notice Complete a listing once its veto window has passed (permissionless liveness).
     function finalizeListing(bytes32 providerId) external {
         Provider storage p = _providers[providerId];
+        if (paused) revert IsPaused();
         if (p.status != Status.PendingListing) revert WrongStatus(p.status);
         if (block.timestamp < p.vetoEndsAt) revert VetoWindowOpen(p.vetoEndsAt);
         p.status = Status.Listed;
@@ -148,16 +186,46 @@ contract ProviderRegistry is Governable {
         emit Listed(providerId);
     }
 
+    /// @notice Swap in a queued commitment update once its veto window has passed. Atomic: the
+    ///         provider is Listed on the old commitments before and on the new ones after.
+    function finalizeUpdate(bytes32 providerId) external {
+        Provider storage p = _providers[providerId];
+        if (paused) revert IsPaused();
+        if (p.status != Status.Listed) revert WrongStatus(p.status);
+        if (!p.updatePending) revert NoPendingUpdate();
+        if (block.timestamp < p.vetoEndsAt) revert VetoWindowOpen(p.vetoEndsAt);
+        p.hostsCommitment = p.pendingHostsCommitment;
+        p.policyCommitment = p.pendingPolicyCommitment;
+        p.vetoEndsAt = 0;
+        _dropUpdate(p);
+        emit CommitmentsUpdated(providerId, p.hostsCommitment, p.policyCommitment);
+    }
+
     // ------------------------------------------------------------------ guardian (narrow only)
 
-    /// @notice Reject a pending listing or commitment update. PendingListing -> Unlisted.
+    /// @notice Stop every provider at once (for example a suspected core-side compromise).
+    function pause(uint16 reasonCode) external onlyGuardian {
+        if (paused) revert IsPaused();
+        paused = true;
+        emit Paused(msg.sender, reasonCode);
+    }
+
+    /// @notice Reject a pending listing (PendingListing -> Unlisted) or a queued commitment
+    ///         update (the update is dropped; the provider stays Listed on its current ones).
     function veto(bytes32 providerId, uint16 reasonCode) external onlyGuardian {
         Provider storage p = _providers[providerId];
-        if (p.status != Status.PendingListing) revert WrongStatus(p.status);
-        p.status = Status.Unlisted;
-        p.vetoEndsAt = 0;
         p.reasonCode = reasonCode;
-        emit ListingVetoed(providerId, reasonCode);
+        if (p.status == Status.PendingListing) {
+            p.status = Status.Unlisted;
+            p.vetoEndsAt = 0;
+            emit ListingVetoed(providerId, reasonCode);
+        } else if (p.status == Status.Listed && p.updatePending) {
+            p.vetoEndsAt = 0;
+            _dropUpdate(p);
+            emit UpdateVetoed(providerId, reasonCode);
+        } else {
+            revert WrongStatus(p.status);
+        }
     }
 
     /// @notice Take a Listed provider out of use at once. Sticky: only a new proposal relists it.
@@ -166,6 +234,8 @@ contract ProviderRegistry is Governable {
         if (p.status != Status.Listed) revert WrongStatus(p.status);
         p.status = Status.EmergencyDelisted;
         p.reasonCode = reasonCode;
+        p.vetoEndsAt = 0;
+        _dropUpdate(p);
         emit EmergencyDelisted(providerId, reasonCode, msg.sender);
     }
 
@@ -189,7 +259,7 @@ contract ProviderRegistry is Governable {
     ///         host commitment equals the hash of core's own compiled entry.
     function isListedWith(bytes32 providerId, bytes32 compiledHostsCommitment) external view returns (bool) {
         Provider storage p = _providers[providerId];
-        return p.status == Status.Listed && p.hostsCommitment == compiledHostsCommitment;
+        return !paused && p.status == Status.Listed && p.hostsCommitment == compiledHostsCommitment;
     }
 
     function providerCount() external view returns (uint256) {
@@ -218,6 +288,12 @@ contract ProviderRegistry is Governable {
         p.policyCommitment = policyC;
         p.vetoEndsAt = uint64(block.timestamp) + vetoWindow;
         p.reasonCode = 0;
+    }
+
+    function _dropUpdate(Provider storage p) internal {
+        p.updatePending = false;
+        p.pendingHostsCommitment = bytes32(0);
+        p.pendingPolicyCommitment = bytes32(0);
     }
 
     function _setGuardian(address next) internal {

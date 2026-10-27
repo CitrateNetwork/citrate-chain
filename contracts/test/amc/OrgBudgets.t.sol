@@ -14,12 +14,13 @@ contract OrgBudgetsTest is AmcTestBase {
     OrgBudgets.Unit internal constant TOK = OrgBudgets.Unit.TOKENS;
     OrgBudgets.Period internal constant DAY = OrgBudgets.Period.Day;
     OrgBudgets.Period internal constant MONTH = OrgBudgets.Period.Month;
+    OrgBudgets.Payment internal constant KEY = OrgBudgets.Payment.VendorKey;
+    OrgBudgets.Payment internal constant SALT_PAID = OrgBudgets.Payment.SaltPaid;
 
     OrganizationSBT internal orgSbt;
     OrgBudgets internal ob;
     address internal sbtAdmin = makeAddr("sbtAdmin");
     address internal holder = makeAddr("holder");
-    address internal admin = makeAddr("orgAdmin");
     address internal member = makeAddr("member");
     uint256 internal orgId;
 
@@ -29,7 +30,7 @@ contract OrgBudgetsTest is AmcTestBase {
         orgSbt = new OrganizationSBT(sbtAdmin);
         vm.prank(sbtAdmin);
         orgId = orgSbt.mintOrg(holder, keccak256("did:citrate:org:acme"), holder, new bytes32[](0));
-        ob = new OrgBudgets(address(timelock), IOrganizationSBT(address(orgSbt)), RAISE);
+        ob = new OrgBudgets(address(timelock), IOrganizationSBT(address(orgSbt)));
     }
 
     function _set(address who, address m, OrgBudgets.Unit u, OrgBudgets.Period p, uint128 amount) internal {
@@ -45,14 +46,10 @@ contract OrgBudgetsTest is AmcTestBase {
 
     function test_constructorChecks() public {
         vm.expectRevert(Governable.Governable_ZeroAddress.selector);
-        new OrgBudgets(address(0), IOrganizationSBT(address(orgSbt)), RAISE);
+        new OrgBudgets(address(0), IOrganizationSBT(address(orgSbt)));
         vm.expectRevert(OrgBudgets.OrgsHasNoCode.selector);
-        new OrgBudgets(address(timelock), IOrganizationSBT(makeAddr("eoa")), RAISE);
-        vm.expectRevert(OrgBudgets.BadRaiseDelay.selector);
-        new OrgBudgets(address(timelock), IOrganizationSBT(address(orgSbt)), 1 hours - 1);
-        vm.expectRevert(OrgBudgets.BadRaiseDelay.selector);
-        new OrgBudgets(address(timelock), IOrganizationSBT(address(orgSbt)), 7 days + 1);
-        assertEq(ob.raiseDelay(), RAISE);
+        new OrgBudgets(address(timelock), IOrganizationSBT(makeAddr("eoa")));
+        assertEq(ob.RAISE_DELAY(), 24 hours, "owner decision: raises wait 24 h");
         assertEq(address(ob.orgs()), address(orgSbt));
     }
 
@@ -168,33 +165,30 @@ contract OrgBudgetsTest is AmcTestBase {
 
     // ------------------------------------------------------------------ who may set
 
-    function test_holderAppointsOneAdmin() public {
-        vm.prank(stranger);
-        vm.expectRevert(OrgBudgets.NotOrgAdmin.selector);
-        ob.setCeiling(orgId, address(0), USD, DAY, 1);
+    /// Owner decision Q-10: only the OrganizationSBT holder sets budgets. There is no admin seat.
+    function test_onlyTheHolderSetsBudgets() public {
+        address[3] memory others = [stranger, sbtAdmin, address(timelock)];
+        for (uint256 i = 0; i < others.length; i++) {
+            vm.startPrank(others[i]);
+            vm.expectRevert(OrgBudgets.NotOrgHolder.selector);
+            ob.setCeiling(orgId, address(0), USD, DAY, 1);
+            vm.expectRevert(OrgBudgets.NotOrgHolder.selector);
+            ob.clearCeiling(orgId, address(0), USD, DAY);
+            vm.stopPrank();
+        }
+        assertTrue(ob.isOrgHolder(orgId, holder));
+        assertFalse(ob.isOrgHolder(orgId, stranger));
+        assertFalse(ob.isOrgHolder(orgId, address(0)));
+        _set(holder, member, USD, DAY, 7);
+        (, uint128 a) = _ceiling(member, USD, DAY);
+        assertEq(a, 7);
+    }
 
-        vm.prank(admin);
+    function testFuzz_nonHolderNeverSets(address who, uint128 amount) public {
+        vm.assume(who != holder);
+        vm.prank(who);
         vm.expectRevert(OrgBudgets.NotOrgHolder.selector);
-        ob.setOrgAdmin(orgId, admin);
-
-        vm.prank(holder);
-        ob.setOrgAdmin(orgId, admin);
-        assertEq(ob.orgAdminOf(orgId), admin);
-        assertTrue(ob.isOrgAdmin(orgId, admin));
-        assertTrue(ob.isOrgAdmin(orgId, holder));
-        _set(admin, member, USD, DAY, 7);
-
-        vm.prank(admin);
-        vm.expectRevert(OrgBudgets.NotOrgHolder.selector);
-        ob.setOrgAdmin(orgId, stranger); // an admin cannot appoint
-
-        vm.prank(holder);
-        ob.setOrgAdmin(orgId, address(0));
-        assertFalse(ob.isOrgAdmin(orgId, admin));
-        assertFalse(ob.isOrgAdmin(orgId, address(0)));
-        vm.prank(admin);
-        vm.expectRevert(OrgBudgets.NotOrgAdmin.selector);
-        ob.setCeiling(orgId, member, USD, DAY, 1);
+        ob.setCeiling(orgId, address(0), USD, DAY, amount);
     }
 
     function test_unknownOrgReverts() public {
@@ -213,8 +207,6 @@ contract OrgBudgetsTest is AmcTestBase {
         ob.setCeiling(orgId, address(0), USD, DAY, 50);
         vm.expectRevert(OrgBudgets.OrgNotActive.selector);
         ob.clearCeiling(orgId, address(0), USD, DAY);
-        vm.expectRevert(OrgBudgets.OrgNotActive.selector);
-        ob.setOrgAdmin(orgId, admin);
         vm.stopPrank();
     }
 
@@ -236,33 +228,59 @@ contract OrgBudgetsTest is AmcTestBase {
         ob.setCeiling(orgId, address(0), USD, DAY, 20_000_001);
 
         // A ceiling set before the max is clamped in the effective value.
-        (bool set, uint128 eff) = ob.effectiveCeilingOf(orgId, address(0), USD, DAY);
+        (bool set, uint128 eff) = ob.effectiveCeilingOf(orgId, address(0), KEY, USD, DAY);
         assertTrue(set);
         assertEq(eff, 20_000_000);
         // An org with no ceiling of its own still gets the global max.
-        (set, eff) = ob.effectiveCeilingOf(orgId + 7, address(0), USD, DAY);
+        (set, eff) = ob.effectiveCeilingOf(orgId + 7, address(0), KEY, USD, DAY);
         assertTrue(set);
         assertEq(eff, 20_000_000);
 
         _govCall(address(ob), abi.encodeCall(OrgBudgets.clearGlobalMax, (USD, DAY)));
-        (set, eff) = ob.effectiveCeilingOf(orgId, address(0), USD, DAY);
+        (set, eff) = ob.effectiveCeilingOf(orgId, address(0), KEY, USD, DAY);
         assertEq(eff, 30_000_000);
     }
 
     function test_effectiveIsTheMinimumOfMemberDefaultAndGlobal() public {
-        (bool set, uint128 eff) = ob.effectiveCeilingOf(orgId, member, USD, DAY);
+        (bool set, uint128 eff) = ob.effectiveCeilingOf(orgId, member, KEY, USD, DAY);
         assertFalse(set);
         assertEq(eff, 0);
         _set(holder, member, USD, DAY, 3);
-        (set, eff) = ob.effectiveCeilingOf(orgId, member, USD, DAY);
+        (set, eff) = ob.effectiveCeilingOf(orgId, member, KEY, USD, DAY);
         assertEq(eff, 3);
         _set(holder, address(0), USD, DAY, 2);
-        (set, eff) = ob.effectiveCeilingOf(orgId, member, USD, DAY);
+        (set, eff) = ob.effectiveCeilingOf(orgId, member, KEY, USD, DAY);
         assertEq(eff, 2, "the org default narrows a looser member ceiling");
-        (set, eff) = ob.effectiveCeilingOf(orgId, address(0), USD, DAY);
+        (set, eff) = ob.effectiveCeilingOf(orgId, address(0), KEY, USD, DAY);
         assertEq(eff, 2);
-        (set, eff) = ob.effectiveCeilingOf(orgId, stranger, USD, DAY);
+        (set, eff) = ob.effectiveCeilingOf(orgId, stranger, KEY, USD, DAY);
         assertEq(eff, 2, "default applies to members without their own");
+    }
+
+    // ------------------------------------------------------------------ Q-3: split by what is paid
+
+    /// A SALT ceiling never binds BYO vendor-key spend, and a USD / token ceiling never binds
+    /// SALT-paid work: the read reverts rather than answer across the split.
+    function test_saltCeilingCannotApplyToVendorKeySpend() public {
+        _set(holder, address(0), SALT, DAY, 1 ether);
+        _set(holder, address(0), USD, DAY, 5_000_000);
+        vm.expectRevert(abi.encodeWithSelector(OrgBudgets.UnitNotForPayment.selector, SALT, KEY));
+        ob.effectiveCeilingOf(orgId, member, KEY, SALT, DAY);
+        vm.expectRevert(abi.encodeWithSelector(OrgBudgets.UnitNotForPayment.selector, USD, SALT_PAID));
+        ob.effectiveCeilingOf(orgId, member, SALT_PAID, USD, DAY);
+        vm.expectRevert(abi.encodeWithSelector(OrgBudgets.UnitNotForPayment.selector, TOK, SALT_PAID));
+        ob.effectiveCeilingOf(orgId, member, SALT_PAID, TOK, DAY);
+        (, uint128 salt) = ob.effectiveCeilingOf(orgId, member, SALT_PAID, SALT, DAY);
+        assertEq(salt, 1 ether);
+        (, uint128 usd) = ob.effectiveCeilingOf(orgId, member, KEY, USD, DAY);
+        assertEq(usd, 5_000_000);
+    }
+
+    function testFuzz_unitPaymentSplit(uint8 u, uint8 pay) public view {
+        OrgBudgets.Unit unit = OrgBudgets.Unit(bound(u, 0, 2));
+        OrgBudgets.Payment payment = OrgBudgets.Payment(bound(pay, 0, 1));
+        bool applies = ob.unitAppliesTo(unit, payment);
+        assertEq(applies, (unit == SALT) == (payment == SALT_PAID));
     }
 
     function test_holdsNoValue() public {
@@ -285,7 +303,7 @@ contract OrgBudgetsTest is AmcTestBase {
         _set(holder, address(0), TOK, MONTH, c);
         vm.prank(address(timelock));
         ob.setGlobalMax(TOK, MONTH, g);
-        (bool set, uint128 eff) = ob.effectiveCeilingOf(orgId, member, TOK, MONTH);
+        (bool set, uint128 eff) = ob.effectiveCeilingOf(orgId, member, KEY, TOK, MONTH);
         assertTrue(set);
         assertLe(eff, g);
         assertLe(eff, c);
@@ -316,7 +334,7 @@ contract OrgBudgetsHandler is Test {
         orgId = orgId_;
         holder = holder_;
         gov = gov_;
-        delay = ob_.raiseDelay();
+        delay = ob_.RAISE_DELAY();
     }
 
     function _modelNow() public view returns (bool, uint128) {
@@ -399,7 +417,7 @@ contract OrgBudgetsInvariantTest is Test {
         OrganizationSBT orgSbt = new OrganizationSBT(sbtAdmin);
         vm.prank(sbtAdmin);
         orgId = orgSbt.mintOrg(holder, keccak256("did:org"), holder, new bytes32[](0));
-        ob = new OrgBudgets(gov, IOrganizationSBT(address(orgSbt)), 24 hours);
+        ob = new OrgBudgets(gov, IOrganizationSBT(address(orgSbt)));
         handler = new OrgBudgetsHandler(ob, orgId, holder, gov);
         targetContract(address(handler));
     }
@@ -416,8 +434,13 @@ contract OrgBudgetsInvariantTest is Test {
 
     /// No effective ceiling exceeds the global max when one is set.
     function invariant_effectiveNeverAboveGlobalMax() public view {
-        (bool s, uint128 a) =
-            ob.effectiveCeilingOf(orgId, address(0), OrgBudgets.Unit.VENDOR_LIST_MICRO_USD, OrgBudgets.Period.Day);
+        (bool s, uint128 a) = ob.effectiveCeilingOf(
+            orgId,
+            address(0),
+            OrgBudgets.Payment.VendorKey,
+            OrgBudgets.Unit.VENDOR_LIST_MICRO_USD,
+            OrgBudgets.Period.Day
+        );
         if (handler.gSet()) {
             assertTrue(s);
             assertLe(a, handler.gAmount());

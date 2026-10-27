@@ -60,6 +60,8 @@ contract ProviderRegistryTest is AmcTestBase {
         vm.expectRevert(ProviderRegistry.BadVetoWindow.selector);
         new ProviderRegistry(address(timelock), guardian, 7 days + 1);
         assertEq(reg.vetoWindow(), VETO);
+        assertEq(reg.DEFAULT_VETO_WINDOW(), 24 hours, "planset default; deploy profile uses it");
+        assertEq(VETO, reg.DEFAULT_VETO_WINDOW());
         assertEq(reg.governance(), address(timelock));
         assertEq(reg.guardian(), guardian);
     }
@@ -166,16 +168,91 @@ contract ProviderRegistryTest is AmcTestBase {
         reg.emergencyDelist(openai, 1);
     }
 
-    function test_updateCommitmentsGoesBackThroughPending() public {
+    /// Owner decision 2026-10-26: no outage. The old commitment stays in use until the new one
+    /// clears the timelock and the veto window, then swaps atomically.
+    function test_updateCommitmentsHasNoOutageAndSwapsAtomically() public {
         _list(openai);
         bytes32 newHosts = keccak256("openai-v2-hosts");
-        _govCall(address(reg), abi.encodeCall(ProviderRegistry.updateCommitments, (openai, newHosts, POLICY)));
-        assertEq(_status(openai), uint8(ProviderRegistry.Status.PendingListing));
+        bytes32 newPolicy = keccak256("policy-openai-r2");
+        _govCall(address(reg), abi.encodeCall(ProviderRegistry.updateCommitments, (openai, newHosts, newPolicy)));
+        assertEq(_status(openai), uint8(ProviderRegistry.Status.Listed));
+        assertTrue(reg.isListedWith(openai, HOSTS), "old commitment still in use");
+        assertFalse(reg.isListedWith(openai, newHosts), "new one not yet");
+        ProviderRegistry.Provider memory p = reg.get(openai);
+        assertTrue(p.updatePending);
+        assertEq(p.pendingHostsCommitment, newHosts);
+        assertEq(p.vetoEndsAt, uint64(vm.getBlockTimestamp()) + VETO);
+
+        vm.warp(vm.getBlockTimestamp() + VETO - 1);
+        vm.expectRevert(abi.encodeWithSelector(ProviderRegistry.VetoWindowOpen.selector, p.vetoEndsAt));
+        reg.finalizeUpdate(openai);
+        assertTrue(reg.isListedWith(openai, HOSTS));
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.prank(stranger);
+        reg.finalizeUpdate(openai);
         assertFalse(reg.isListedWith(openai, HOSTS));
-        assertFalse(reg.isListedWith(openai, newHosts));
+        assertTrue(reg.isListedWith(openai, newHosts));
+        p = reg.get(openai);
+        assertEq(p.policyCommitment, newPolicy);
+        assertFalse(p.updatePending);
+        assertEq(p.pendingHostsCommitment, bytes32(0));
+        assertEq(p.vetoEndsAt, 0);
+        vm.expectRevert(ProviderRegistry.NoPendingUpdate.selector);
+        reg.finalizeUpdate(openai);
+    }
+
+    function test_vetoOfAnUpdateKeepsTheListing() public {
+        _list(openai);
+        _govCall(address(reg), abi.encodeCall(ProviderRegistry.updateCommitments, (openai, keccak256("v2"), POLICY)));
         vm.prank(guardian);
         reg.veto(openai, 3);
-        assertEq(_status(openai), uint8(ProviderRegistry.Status.Unlisted));
+        assertEq(_status(openai), uint8(ProviderRegistry.Status.Listed));
+        assertTrue(reg.isListedWith(openai, HOSTS));
+        assertFalse(reg.get(openai).updatePending);
+        vm.warp(vm.getBlockTimestamp() + VETO);
+        vm.expectRevert(ProviderRegistry.NoPendingUpdate.selector);
+        reg.finalizeUpdate(openai);
+        vm.prank(guardian);
+        vm.expectRevert(abi.encodeWithSelector(ProviderRegistry.WrongStatus.selector, ProviderRegistry.Status.Listed));
+        reg.veto(openai, 3); // nothing left to veto
+    }
+
+    function test_emergencyDelistDuringAnUpdateDropsIt() public {
+        _list(openai);
+        _govCall(address(reg), abi.encodeCall(ProviderRegistry.updateCommitments, (openai, keccak256("v2"), POLICY)));
+        vm.prank(guardian);
+        reg.emergencyDelist(openai, 1);
+        assertFalse(reg.isListedWith(openai, HOSTS));
+        ProviderRegistry.Provider memory p = reg.get(openai);
+        assertFalse(p.updatePending);
+        assertEq(p.vetoEndsAt, 0);
+        vm.warp(vm.getBlockTimestamp() + VETO);
+        vm.expectRevert(
+            abi.encodeWithSelector(ProviderRegistry.WrongStatus.selector, ProviderRegistry.Status.EmergencyDelisted)
+        );
+        reg.finalizeUpdate(openai);
+    }
+
+    function test_updateRules() public {
+        vm.startPrank(address(timelock));
+        vm.expectRevert(abi.encodeWithSelector(ProviderRegistry.WrongStatus.selector, ProviderRegistry.Status.Unlisted));
+        reg.updateCommitments(openai, HOSTS, POLICY);
+        vm.stopPrank();
+        _list(openai);
+        vm.startPrank(address(timelock));
+        vm.expectRevert(ProviderRegistry.ZeroCommitment.selector);
+        reg.updateCommitments(openai, bytes32(0), POLICY);
+        reg.updateCommitments(openai, keccak256("v2"), POLICY);
+        vm.warp(vm.getBlockTimestamp() + VETO - 1);
+        reg.updateCommitments(openai, keccak256("v3"), POLICY); // replaces and restarts the window
+        vm.stopPrank();
+        vm.warp(vm.getBlockTimestamp() + 1);
+        uint64 ends = reg.get(openai).vetoEndsAt;
+        vm.expectRevert(abi.encodeWithSelector(ProviderRegistry.VetoWindowOpen.selector, ends));
+        reg.finalizeUpdate(openai);
+        vm.warp(ends);
+        reg.finalizeUpdate(openai);
+        assertTrue(reg.isListedWith(openai, keccak256("v3")));
     }
 
     function test_delistTransitions() public {
@@ -269,6 +346,8 @@ contract ProviderRegistryTest is AmcTestBase {
             reg.emergencyDelist(openai, 1);
             vm.expectRevert(ProviderRegistry.NotGuardian.selector);
             reg.veto(openai, 1);
+            vm.expectRevert(ProviderRegistry.NotGuardian.selector);
+            reg.pause(1);
             vm.stopPrank();
         }
     }
@@ -377,6 +456,10 @@ contract ProviderRegistryHandler is Test {
 
     mapping(bytes32 => ProviderRegistry.Status) public model;
     mapping(bytes32 => uint64) public modelVetoEnds;
+    mapping(bytes32 => bool) public modelUpd;
+    mapping(bytes32 => bytes32) public modelHosts;
+    mapping(bytes32 => bytes32) public modelPendingHosts;
+    uint256 internal salt;
     bool public violation;
     string public why;
 
@@ -406,6 +489,7 @@ contract ProviderRegistryHandler is Test {
             }
             model[id] = ProviderRegistry.Status.PendingListing;
             modelVetoEnds[id] = uint64(vm.getBlockTimestamp()) + reg.vetoWindow();
+            modelHosts[id] = keccak256("h");
         } catch {
             if (s != ProviderRegistry.Status.PendingListing && s != ProviderRegistry.Status.Listed) {
                 _flag("propose refused from an allowed state");
@@ -416,13 +500,33 @@ contract ProviderRegistryHandler is Test {
     function update(uint256 i) external {
         bytes32 id = ids[i % 3];
         ProviderRegistry.Status s = model[id];
+        bytes32 h = keccak256(abi.encode("h2", ++salt));
         vm.prank(gov);
-        try reg.updateCommitments(id, keccak256("h2"), keccak256("p2")) {
+        try reg.updateCommitments(id, h, keccak256("p2")) {
             if (s != ProviderRegistry.Status.Listed) _flag("update from non-listed");
-            model[id] = ProviderRegistry.Status.PendingListing;
+            modelUpd[id] = true;
+            modelPendingHosts[id] = h;
             modelVetoEnds[id] = uint64(vm.getBlockTimestamp()) + reg.vetoWindow();
         } catch {
             if (s == ProviderRegistry.Status.Listed) _flag("update refused while listed");
+        }
+    }
+
+    function finalizeUpdate(uint256 i, address anyone) external {
+        bytes32 id = ids[i % 3];
+        vm.prank(anyone);
+        try reg.finalizeUpdate(id) {
+            if (model[id] != ProviderRegistry.Status.Listed || !modelUpd[id]) _flag("swap without a queued update");
+            if (vm.getBlockTimestamp() < modelVetoEnds[id]) _flag("swapped inside the veto window");
+            modelUpd[id] = false;
+            modelHosts[id] = modelPendingHosts[id];
+        } catch {
+            if (
+                model[id] == ProviderRegistry.Status.Listed && modelUpd[id]
+                    && vm.getBlockTimestamp() >= modelVetoEnds[id]
+            ) {
+                _flag("swap refused after the window");
+            }
         }
     }
 
@@ -445,11 +549,17 @@ contract ProviderRegistryHandler is Test {
         bytes32 id = ids[i % 3];
         ProviderRegistry.Status s = model[id];
         vm.prank(grd);
+        bool upd = s == ProviderRegistry.Status.Listed && modelUpd[id];
         try reg.veto(id, 1) {
-            if (s != ProviderRegistry.Status.PendingListing) _flag("veto from non-pending");
-            model[id] = ProviderRegistry.Status.Unlisted;
+            if (s == ProviderRegistry.Status.PendingListing) {
+                model[id] = ProviderRegistry.Status.Unlisted;
+            } else if (upd) {
+                modelUpd[id] = false; // stays Listed on its current commitment
+            } else {
+                _flag("veto with nothing pending");
+            }
         } catch {
-            if (s == ProviderRegistry.Status.PendingListing) _flag("veto refused while pending");
+            if (s == ProviderRegistry.Status.PendingListing || upd) _flag("veto refused while pending");
         }
     }
 
@@ -460,6 +570,7 @@ contract ProviderRegistryHandler is Test {
         try reg.emergencyDelist(id, 1) {
             if (s != ProviderRegistry.Status.Listed) _flag("emergency delist from non-listed");
             model[id] = ProviderRegistry.Status.EmergencyDelisted;
+            modelUpd[id] = false;
         } catch {
             if (s == ProviderRegistry.Status.Listed) _flag("emergency delist refused while listed");
         }
@@ -474,6 +585,7 @@ contract ProviderRegistryHandler is Test {
                 _flag("delist from unlisted/delisted");
             }
             model[id] = ProviderRegistry.Status.Delisted;
+            modelUpd[id] = false;
         } catch {
             if (s != ProviderRegistry.Status.Unlisted && s != ProviderRegistry.Status.Delisted) {
                 _flag("delist refused");
@@ -516,11 +628,18 @@ contract ProviderRegistryInvariantTest is Test {
         assertFalse(handler.violation(), handler.why());
         for (uint256 i = 0; i < 3; i++) {
             bytes32 id = handler.ids(i);
-            assertEq(uint8(reg.statusOf(id)), uint8(handler.model(id)));
-            if (reg.statusOf(id) == ProviderRegistry.Status.PendingListing) {
-                assertEq(reg.get(id).vetoEndsAt, handler.modelVetoEnds(id));
+            ProviderRegistry.Provider memory p = reg.get(id);
+            assertEq(uint8(p.status), uint8(handler.model(id)));
+            assertEq(p.updatePending, handler.modelUpd(id));
+            if (p.status == ProviderRegistry.Status.PendingListing || p.updatePending) {
+                assertEq(p.vetoEndsAt, handler.modelVetoEnds(id));
             } else {
-                assertEq(reg.get(id).vetoEndsAt, 0);
+                assertEq(p.vetoEndsAt, 0);
+            }
+            // No outage: a Listed provider always answers on its current (model) commitment.
+            if (p.status == ProviderRegistry.Status.Listed) {
+                assertEq(p.hostsCommitment, handler.modelHosts(id));
+                assertTrue(reg.isListedWith(id, handler.modelHosts(id)));
             }
         }
     }
