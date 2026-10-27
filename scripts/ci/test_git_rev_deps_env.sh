@@ -13,7 +13,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 T="$(mktemp -d "${TMPDIR:-/tmp}/git-rev-deps-env-XXXX")"
-trap 'rm -rf -- "$T"' EXIT
+trap 'rm -rf -- "${T:?}"' EXIT
 export HOME="$T/home" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
 mkdir -p "$HOME"
 fail() { echo "FAIL: $*" >&2; exit 1; }
