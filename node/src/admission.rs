@@ -930,6 +930,59 @@ mod tests {
         storage.blocks.has_block(&b.header.block_hash).unwrap() && dag_has
     }
 
+    /// The sync admission worker and the gossip path admit concurrently. Two
+    /// admissions of the same block must not both write it: only one reports
+    /// `Admitted`, the rest `AlreadyAdmitted`, and the block's children
+    /// recorded in between survive (a second `GhostDag::add_block` of the
+    /// parent would reset them).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_admissions_of_one_block_write_it_once() {
+        for round in 0..20u8 {
+            let (adm, _storage, dag, _d) = harness();
+            let adm = Arc::new(adm);
+            let g = root();
+            adm.admit(&g).await;
+            let p = mk(1, g.header.block_hash, 1, [round; 32]);
+            let c = mk(2, p.header.block_hash, 2, [round; 32]);
+            let mut tasks = Vec::new();
+            for _ in 0..16 {
+                let adm = adm.clone();
+                let p = p.clone();
+                tasks.push(tokio::spawn(async move { adm.admit(&p).await }));
+            }
+            // The child, as soon as the parent is in.
+            let child = {
+                let adm = adm.clone();
+                let dag = dag.clone();
+                let (p, c) = (p.header.block_hash, c.clone());
+                tokio::spawn(async move {
+                    while !dag.has_block(&p).await {
+                        tokio::task::yield_now().await;
+                    }
+                    adm.admit(&c).await
+                })
+            };
+            let mut admitted = 0;
+            for t in tasks {
+                match t.await.expect("join") {
+                    AdmitOutcome::Admitted { .. } => admitted += 1,
+                    AdmitOutcome::AlreadyAdmitted => {}
+                    other => panic!("round {round}: unexpected {other:?}"),
+                }
+            }
+            child.await.expect("join");
+            assert_eq!(
+                admitted, 1,
+                "round {round}: {admitted} admissions wrote the block"
+            );
+            let tips = adm.ghostdag.get_tips().await;
+            assert!(
+                !tips.contains(&p.header.block_hash),
+                "round {round}: the parent is a tip again after its child landed"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn admits_a_fresh_block_into_both_stores() {
         let (adm, storage, dag, _d) = harness();
