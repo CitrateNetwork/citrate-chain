@@ -10,6 +10,8 @@
 #       mention is the calldata argument of the pure `providerIdOf`.
 #   A3  RT-4: UsageReceipts keeps no count / total / provider on chain. Its Receipt struct is
 #       exactly {root, committedAt, blockNumber, schema}.
+#   A4  Q-8(b): the direct guardian (RegistryGuardian2of3) can only remove or pause. The interface
+#       it calls declares exactly emergencyDelist, veto and pause, nothing that lists or restores.
 #
 # Usage: amc_surface_tripwire.sh             # scan the tree
 #        amc_surface_tripwire.sh --self-test # prove each scan detects its class
@@ -49,6 +51,16 @@ scan_receipt_fields() { # <UsageReceipts.sol> ; prints the struct body, returns 
   return 1
 }
 
+scan_guardian_actions() { # <RegistryGuardian2of3.sol> ; prints drift, returns 0 iff it drifted
+  local f="$1" fns expected
+  [ -e "$f" ] || { echo "missing $f"; return 0; }
+  fns=$(code_only "$f" | awk '/interface IProviderRegistryGuardianActions[[:space:]]*\{/{on=1;next} on&&/^\}/{exit} on' \
+        | grep -oE 'function [A-Za-z0-9_]+' | awk '{print $2}' | sort | tr '\n' ' ' | sed -E 's/ $//')
+  expected='emergencyDelist pause veto'
+  [ "$fns" != "$expected" ] && { echo "guardian actions are '$fns', expected '$expected'"; return 0; }
+  return 1
+}
+
 run_scan() { # <root>
   local root="$1" amc="$1/contracts/src/amc" fail=0 out
   if out=$(scan_value_paths "$amc"); then echo "A1 FAIL: value path in src/amc:"; echo "$out"; fail=1; fi
@@ -56,7 +68,8 @@ run_scan() { # <root>
     echo "A2 FAIL (RT-3): ProviderRegistry mentions a string beyond providerIdOf:"; echo "$out"; fail=1
   fi
   if out=$(scan_receipt_fields "$amc/UsageReceipts.sol"); then echo "A3 FAIL (RT-4): $out"; fail=1; fi
-  [ "$fail" -eq 0 ] && echo "amc tripwires: A1 A2 A3 clean"
+  if out=$(scan_guardian_actions "$amc/RegistryGuardian2of3.sol"); then echo "A4 FAIL (Q-8b): $out"; fail=1; fi
+  [ "$fail" -eq 0 ] && echo "amc tripwires: A1 A2 A3 A4 clean"
   return "$fail"
 }
 
@@ -81,8 +94,12 @@ self_test() {
   sed -i.bak -E 's/uint8 schema;/uint8 schema;\n        uint32 count;/' "$tmp/contracts/src/amc/UsageReceipts.sol"
   scan_receipt_fields "$tmp/contracts/src/amc/UsageReceipts.sol" >/dev/null || { echo "self-test: A3 missed a count field"; rc=1; }
 
+  sed -i.bak -E 's/function pause\(uint16 reasonCode\) external;/function pause(uint16 reasonCode) external;\
+    function proposeListing(bytes32 id, uint8 kind, bytes32 h, bytes32 p) external;/' "$tmp/contracts/src/amc/RegistryGuardian2of3.sol"
+  scan_guardian_actions "$tmp/contracts/src/amc/RegistryGuardian2of3.sol" >/dev/null || { echo "self-test: A4 missed an added action"; rc=1; }
+
   rm -r "$tmp"
-  [ "$rc" -eq 0 ] && echo "amc tripwire self-test: A1 A2 A3 detect their class"
+  [ "$rc" -eq 0 ] && echo "amc tripwire self-test: A1 A2 A3 A4 detect their class"
   return "$rc"
 }
 

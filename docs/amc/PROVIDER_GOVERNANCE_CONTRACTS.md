@@ -2,7 +2,7 @@
 created: 2026-10-26T19:30:00-07:00
 branch: feat/amc-provider-governance-contracts
 author: Larry Klosowski (owner) + Claude Opus 5.5 (MAC lane, contracts)
-status: spec + implementation (not deployed; audit required)
+status: spec + implementation (not deployed; audit required); owner decisions of 2026-10-26 applied
 planset: amc053 (0.5.3), 06_CONTRACTS.md
 adr: ADR-2026-10-26-byok-provider-governance (P-12, P-13, P-14, P-15)
 ---
@@ -10,7 +10,8 @@ adr: ADR-2026-10-26-byok-provider-governance (P-12, P-13, P-14, P-15)
 # AMC provider-governance contracts
 
 **Status: not deployed. Not part of r1006 or the 12-01 genesis set.** These four contracts are deployed after genesis by
-the GOVERNANCE timelock (ADR P-13), and only after an audit (planset Q-11). No existing contract, deploy script, genesis
+the GOVERNANCE timelock (ADR P-13), and only after an audit: internal Agentile-Audit with a cross-model quorum, no
+external firm (owner decision Q-11, 2026-10-26). No existing contract, deploy script, genesis
 or ceremony script or address book is changed by this work.
 
 | Contract | Source | Tests |
@@ -19,6 +20,7 @@ or ceremony script or address book is changed by this work.
 | UsageReceipts | `contracts/src/amc/UsageReceipts.sol` | `contracts/test/amc/UsageReceipts.t.sol` |
 | OrgBudgets | `contracts/src/amc/OrgBudgets.sol` | `contracts/test/amc/OrgBudgets.t.sol` |
 | WorkAttestations | `contracts/src/amc/WorkAttestations.sol` | `contracts/test/amc/WorkAttestations.t.sol` |
+| RegistryGuardian2of3 | `contracts/src/amc/RegistryGuardian2of3.sol` | `contracts/test/amc/RegistryGuardian2of3.t.sol` |
 | Source fences | `scripts/ci/amc_surface_tripwire.sh` | `--self-test`; `.github/workflows/amc-tripwires.yml` |
 
 ## 1. Source of truth
@@ -42,16 +44,21 @@ Principles the code holds to, from 06 section 1:
 | Contract | Decision | Why |
 |---|---|---|
 | all | Governance is `Governable` (two-step), seeded with the GOVERNANCE `TimelockController`. Constructor admins go through `InitialAdmin.check`. | Reuse. It also keeps PBA-L2-002 (the CREATE2-factory admin) and the pba-r2 semgrep rules satisfied. |
-| ProviderRegistry | `vetoWindow` is a constructor argument bounded to 1 h to 7 d. The planset value is 24 h. | The owner question on delist timing is still open, so the value is set at deployment rather than in code. |
+| ProviderRegistry | `vetoWindow` is a constructor argument bounded to 1 h to 7 d. The deploy profile uses `DEFAULT_VETO_WINDOW` = 24 h, the planset default. | Owner, 2026-10-26: no other value decided, so it stays a bounded deploy-time parameter. |
+| ProviderRegistry | `updateCommitments` queues the new commitments beside the old ones. The provider stays `Listed` on the old ones until the new ones clear the timelock and the veto window; then `finalizeUpdate` (anyone) swaps them atomically. A guardian `veto` drops the queued update and keeps the listing; `emergencyDelist` and `delist` still act at once and drop it. | Owner decision 2026-10-26: no outage on a commitment update. Invariant: a `Listed` provider always answers `isListedWith` on its current commitment. |
+| ProviderRegistry | The guardian can also `pause` the whole registry: `isListedWith` answers false and nothing finalizes. Only governance can `unpause`. | Owner decision Q-8(b): the guardian can remove or pause, never add. |
 | ProviderRegistry | `guardian` is set in the constructor and replaced only by `setGuardian` (governance). It cannot equal governance. | 06 section 7 step 4. RT-15. |
 | ProviderRegistry | `delist` also applies to `PendingListing` (withdrawing a proposal) and `EmergencyDelisted` (confirming one). | It gives governance a way to withdraw or confirm. It opens no path to `Listed`. |
 | ProviderRegistry | `isListedWith(id, compiledHostsCommitment)` is the single check core makes before it reads a key. | It returns true only when the provider is `Listed` and its commitment equals core's compiled entry. |
 | UsageReceipts | `schema` must be nonzero. `SCHEMA_V1 = 1`. A zero root is refused. | Verifiers read the schema byte from their own table. There is no on-chain schema registry and no governance. |
-| OrgBudgets | `raiseDelay` is a constructor argument bounded to 1 h to 7 d. The planset value is 24 h. | The owner question is pending. |
-| OrgBudgets | Removing a ceiling (`clearCeiling`) counts as a raise and waits `raiseDelay`. A new write always cancels an unmatured raise. | Without this, a stolen admin key could open spend at once through removal, or through a stale queued raise. |
+| OrgBudgets | Only the OrganizationSBT holder sets or clears ceilings. There is no appointed admin. `RAISE_DELAY` is a constant 24 h. | Owner decision Q-10, 2026-10-26. |
+| OrgBudgets | Removing a ceiling (`clearCeiling`) counts as a raise and waits `RAISE_DELAY`. A new write always cancels an unmatured raise. | Without this, a stolen holder key could open spend at once through removal, or through a stale queued raise. |
+| OrgBudgets | `effectiveCeilingOf` takes the payment kind (`SaltPaid` or `VendorKey`) and reverts `UnitNotForPayment` across the split: `SALT_WEI` binds only SALT-paid work, `VENDOR_LIST_MICRO_USD` and `TOKENS` only vendor-key spend. | Owner decision Q-3, 2026-10-26: a SALT ceiling can never apply to BYO vendor spend, and no rate exists. |
 | OrgBudgets | `effectiveCeilingOf(org, member)` is the minimum of the member ceiling, the org default and the global max, each counted only when set. `ceilingOf` returns one slot's own value. | Narrowing only. A member ceiling can never loosen the org default. |
 | OrgBudgets | `setCeiling` above a set global max reverts. A later, lower global max clamps `effectiveCeilingOf`. | Invariant: no effective ceiling exceeds the global max. |
-| OrgBudgets | A deactivated org (OrganizationSBT `isActive == false`) may only lower. The admin seat lapses if the holder changes. | Fail closed. |
+| OrgBudgets | A deactivated org (OrganizationSBT `isActive == false`) may only lower. | Fail closed. |
+| UsageReceipts | `maxBackfillDays` is a constructor argument bounded to 1 to 366. The deploy profile uses `DEFAULT_MAX_BACKFILL_DAYS` = 90. A closed day older than that is refused with `DayTooOld`. | Owner, 2026-10-26: cap backfill at 90 days to match history retention, as a bounded deploy-time parameter. |
+| RegistryGuardian2of3 | The guardian seat is a direct 2-of-3 with no delay, bound to one registry. It can only call `emergencyDelist`, `veto` and `pause`. Its owners are fixed; a proposal expires after 1 day and runs once. Rotation is a new instance plus `ProviderRegistry.setGuardian`, which it cannot block. | Owner decision Q-8(b), 2026-10-26. Tripwire A4 pins the three actions. |
 | WorkAttestations | `id = keccak256(abi.encode(a))`. Only the AgentSBT owner may attest, and not while the agent is quarantined. Revocation is sticky. A counterparty may acknowledge once, and never its own attestation or a revoked one. | 06 section 5 and RT-17. |
 | WorkAttestations | Benchmarks link by the shared AgentSBT id and are never copied or written. | `BenchmarkRegistry` series are keyed by `msg.sender` (PBA-L2-061), so a write from this contract would merge every member into one committer. The join is `byAgent(agentId)` next to `BenchmarkRegistry.getMetric(attester, agentId, ...)` (see `test_benchmarkJoinByAgentId`). |
 
@@ -64,6 +71,7 @@ Principles the code holds to, from 06 section 1:
 | OrgBudgets: SALT budgets with spend attested by the org's nodes | RT-1: there is no SALT/USD rate, and the UI truth contract forbids pairing them. RT-5: a client-enforced ceiling is not a security boundary | A unit per ceiling (`SALT_WEI`, `VENDOR_LIST_MICRO_USD`, `TOKENS`) and no rate. No on-chain spend ledger; evidence comes from revealed receipts. |
 | WorkAttestations: hash, model id, cost and signer | 06 section 5: no model or provider name | The model class (0 to 4) and verifier bits. No cost. |
 | Guardian veto through the timelock canceller | RT-15: a timelock-wide veto can block the guardian's own replacement | A registry-local veto over the listing queue. The guardian holds no timelock role in the tests (`test_guardianCannotBlockItsReplacement`). |
+| Spend attested against the budget by the org's nodes; org admins | RT-5, owner Q-10 | Holder-only ceilings; no node or admin roles. |
 
 ## 4. Threat model
 
@@ -88,7 +96,7 @@ The attackers considered:
 - Mitigation: records are namespaced by committer (the AnchorRegistry layout), so spam never touches another member's days. There is one record per day, so a committer's own series is bounded at one entry a day. Reads are paged and clamp at the tail.
 
 **OrgBudgets**
-- Exposure: writes need the OrganizationSBT holder or the admin it appointed.
+- Exposure: writes need the OrganizationSBT holder.
 - Mitigation: none needed beyond that gate.
 
 **WorkAttestations**
@@ -98,15 +106,15 @@ The attackers considered:
 ### Griefing
 
 **ProviderRegistry**
-- Exposure: a compromised guardian can veto every listing or emergency-delist every provider. The result is denial of service, not exfiltration.
+- Exposure: a compromised guardian (2 of 3 keys) can veto every listing, emergency-delist every provider or pause the registry. The result is denial of service, not exfiltration: no guardian action adds anything.
 - Mitigation: governance replaces the guardian with `setGuardian`, and the guardian cannot block that call (RT-15). Relisting waits the 48 h timelock plus the veto window. A lying RPC can likewise only report a false delist (RT-3).
 
 **UsageReceipts**
 - Exposure: none across members.
 
 **OrgBudgets**
-- Exposure: a stolen admin key can lower a ceiling to 0 at once, which blocks the org's cloud calls.
-- Mitigation: the holder removes the admin with `setOrgAdmin(0)` and raises again after `raiseDelay`. A stolen key cannot raise at once.
+- Exposure: a stolen holder key can lower a ceiling to 0 at once, which blocks the org's cloud calls.
+- Mitigation: a stolen key cannot raise at once (`RAISE_DELAY`, 24 h). The OrganizationSBT owner can `deactivate` the org, which blocks raises; the org's own root of trust is the holder.
 
 **WorkAttestations**
 - Exposure: acknowledgements by strangers.
@@ -136,11 +144,10 @@ The attackers considered:
 
 **UsageReceipts**
 - Exposure: a compromised wallet can commit false roots for days not yet committed.
-- Mitigation: a later honest commit for that day is impossible, but a reveal against a false root fails for the honest record. Members commit daily, so the gap is short.
-- Still open: whether to bound how far back a day may be backfilled (§5 Q-U1).
+- Mitigation: a later honest commit for that day is impossible, but a reveal against a false root fails for the honest record. Backfill is capped (90 days in the deploy profile), so a stolen key can pre-empt only that window.
 
 **OrgBudgets**
-- Exposure: see Griefing. A compromised OrganizationSBT holder is the org's own root of trust.
+- Exposure: see Griefing. The OrganizationSBT holder is the org's only budget authority and its own root of trust.
 - Mitigation: OrganizationSBT `deactivate` (its owner) blocks raises and admin changes.
 
 **WorkAttestations**
@@ -170,31 +177,41 @@ The attackers considered:
 - Exposure: none. No contract holds or moves value.
 - Mitigation: tripwire A1, `_assertRejectsValue` in every suite, and an invariant `balance == 0`.
 
-## 5. Open design questions (for the owner and DGX)
+## 5. Owner decisions (2026-10-26) and what stays open
 
-- **Q-8(b): latency of an emergency delist.** The registry acts at once when the guardian calls it. If the guardian seat
-  is the GUARDIAN `TimelockController`, its own 1 h delay applies; if it is a direct 2-of-3 path, the delist is
-  immediate. The contract works either way. The question is which address is installed as `guardian`. The genesis
-  `MultisigProposer` can target only its own timelock (#324), so a direct path needs a new 2-of-3 or a second allowed
-  target.
-- **Q-8(a): coexistence with the genesis canceller.** Chain #324 gives `GuardianCanceller` the `CANCELLER_ROLE` on the
-  GOVERNANCE timelock, which is a timelock-wide veto that excludes only operations that remove the guardian. RT-15
-  (X-6) asks for a veto local to the registry. These contracts implement the local veto and hold no timelock role. Two
-  decisions need DGX agreement with C2 D5: whether the timelock-wide canceller stays, and whether `setGuardian` on the
-  registry belongs in `GuardianCanceller`'s non-cancellable class.
-- **Parameter values.** `vetoWindow` and `raiseDelay` are constructor arguments bounded to 1 h to 7 d; the planset
-  suggests 24 h for each. Delist timing is an open owner question.
-- **Q-3: units.** `SALT_WEI` applies to SALT-paid work only; BYOK spend uses `VENDOR_LIST_MICRO_USD` and `TOKENS`. Owner
-  answer pending. The contract stores no rate in any case.
-- **Q-10: who administers an org.** The OrganizationSBT holder plus one appointed admin is implemented. An admin set, or
-  the org's `signing_authority`, would be a small change.
-- **Commitment updates.** `updateCommitments` moves a `Listed` provider back to `PendingListing`, so core stops using it
-  for the 48 h timelock plus the veto window, as 06 section 2 specifies. The alternative keeps the old commitment
-  active until the new one finalizes: more state, no outage. It needs a decision before the interfaces freeze.
-- **Q-U1: backfill bound.** UsageReceipts accepts any closed day. Bounding it (for example to the last 30 days) limits
-  what a compromised wallet can pre-empt, at the cost of a member who was offline longer.
-- **RT-2 / Q-9: the deploy batch.** WorkAttestations needs AgentSBT and OrganizationSBT, and OrgBudgets needs
-  OrganizationSBT. Neither is in the genesis set. The benchmark join needs BenchmarkRegistry. All three join the
-  post-genesis batch, or their surfaces stay "not available yet".
-- **Q-11: audit.** The planset recommends an external audit scoped to these four contracts and the deploy script.
-- **Deploy script.** Not included: it is WP-S4-DEPLOY (DGX), and nothing here deploys.
+Decided and implemented:
+
+- **Q-3, split by what is paid.** `SALT_WEI` ceilings bind only SALT-paid work. Vendor-key ceilings are in vendor
+  list-price micro-USD and in tokens. There is no rate. `effectiveCeilingOf` refuses to answer across the split
+  (`UnitNotForPayment`), so a SALT ceiling can never be applied to BYO vendor spend.
+- **Q-8(b), a direct guardian with no delay.** `RegistryGuardian2of3` is the guardian seat: 2 of 3 fixed owners, no
+  delay, and only `emergencyDelist`, `veto` and `pause`. It cannot list, restore, unpause or touch a role.
+- **Q-8(a), coexistence with #324's `GuardianCanceller`.** This PR does not change #324. The two veto paths are separate:
+  - `GuardianCanceller` (#324) holds `CANCELLER_ROLE` on the GOVERNANCE timelock. The GUARDIAN council can cancel any
+    queued GOVERNANCE operation except one that only removes or replaces the guardian. That covers a queued
+    `ProviderRegistry.proposeListing` or `updateCommitments` before it executes.
+  - The registry's own veto (`veto`, through `RegistryGuardian2of3`) acts after the timelock has executed, inside the
+    registry's veto window, and only on that registry's listing queue.
+  - The registry seat holds no timelock role, so it cannot cancel `ProviderRegistry.setGuardian` (RT-15).
+    `GuardianCanceller` could, because `setGuardian` on the registry is not in its non-cancellable class. **Flag for DGX
+    to reconcile with C2 D5:** either add `ProviderRegistry.setGuardian` to `GuardianCanceller`'s guardian-removal
+    class, or accept that the GUARDIAN council can delay a rotation of the registry seat. The owners of the two seats
+    may be the same people; their keys and contracts are distinct.
+- **Q-9, post-genesis deploy batch: all of them.** The batch is these five contracts (`ProviderRegistry`,
+  `RegistryGuardian2of3`, `UsageReceipts`, `OrgBudgets`, `WorkAttestations`) plus `BenchmarkRegistry`, `AnchorRegistry`,
+  `AgentSBT` and `OrganizationSBT`. `InferenceRouter` joins only once its held CHAIN-B items close.
+- **Q-10, holder only.** Only the OrganizationSBT holder administers an org's budgets. Lowering is immediate; raising
+  waits 24 h (`RAISE_DELAY`).
+- **Q-11, audit.** An internal Agentile-Audit with a cross-model quorum, scoped to these contracts and the deploy
+  script. No external firm.
+- **Commitment updates, no outage.** The old commitment stays active until the new one clears the timelock and the
+  veto window, then swaps atomically (`finalizeUpdate`). The guardian can still delist at once.
+- **Veto window and backfill, not decided by the owner.** Both are bounded deploy-time parameters. The deploy profile
+  uses the planset's 24 h veto window and a 90-day backfill cap (matching history retention).
+
+Still open:
+
+- **Deploy script.** Not included: it is WP-S4-DEPLOY (DGX), and nothing here deploys. It must deploy
+  `RegistryGuardian2of3` and pass it to `ProviderRegistry` (or install it with `setGuardian`), and use the
+  deploy-profile values above.
+- **GuardianCanceller class (Q-8(a)).** As above, for DGX with C2 D5.
