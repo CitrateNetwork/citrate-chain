@@ -41,14 +41,15 @@ class TestBuild(unittest.TestCase):
         os.environ.pop("FAKE_NODE_FAIL", None)
         self.c = FakeChain()
         self.c.balances[STAKER] = MIN + 10**18
-        self.c.nonces[STAKER] = 2
+        self.c.nonces[STAKER] = 0
         self.c.tx_counts[STAKER] = 5
 
     def tearDown(self):
         self.tmp.cleanup()
         os.environ.pop("FAKE_NODE_LOG", None)
         os.environ.pop("FAKE_NODE_FAIL", None)
-        os.environ.pop("FAKE_NODE_CHAIN_ID", None)
+        for k in ("FAKE_NODE_CHAIN_ID", "FAKE_NODE_STAKER", "FAKE_NODE_EXTRA"):
+            os.environ.pop(k, None)
 
     def build(self, url, *extra):
         return run("--profile", "40204-r1005", "--rpc", url, "--staker", STAKER, "--config", "/x/node.toml",
@@ -65,12 +66,40 @@ class TestBuild(unittest.TestCase):
         self.assertEqual(int(tx["value"], 16), MIN)
         self.assertEqual(int(tx["nonce"], 16), 5)
         self.assertEqual(int(tx["gasPrice"], 16), 1_000_000_000)
-        self.assertTrue(tx["data"].startswith("0x10f53ba1"))
+        # registerValidator(bytes32 pk, bytes sig): selector, pk, offset 0x40, length 64, sig
+        self.assertEqual(tx["data"], "0x10f53ba1" + "5e" * 32 + f"{64:064x}" + f"{64:064x}" + "77" * 64)
         self.assertFalse(body["dry_run"])
         self.assertIn("cast mktx --legacy", text)
         argv = json.loads(self.log.read_text().splitlines()[0])
-        self.assertEqual(argv[argv.index("--nonce") + 1], "2")  # registrationNonce from chain
+        # chain#398's CLI: the proof is for nonce 0; no --nonce argument exists
+        self.assertEqual(argv, ["--config", "/x/node.toml", "registration-proof", "--registry", REGISTRY,
+                                "--staker", STAKER])
+        self.assertEqual(body["summary"]["registration_nonce"], 0)
+        self.assertEqual(body["proof"], {"registration_sig": "0x" + "77" * 64, "schema": "citrate-registration-proof/1"})
         self.assertNotIn("sendRawTransaction", " ".join(s.requests))
+
+    def test_refuses_a_nonzero_registration_nonce_before_signing(self):
+        """registrationNonce comes from RPC. The CLI signs nonce 0 only, so any other
+        nonce would give a proof the registry rejects: refuse, and never run the CLI."""
+        self.c.nonces[STAKER] = 2
+        with RpcStub(self.c) as s:
+            rc, _, _, err = self.build(s.url)
+        self.assertEqual(rc, 2, err)
+        self.assertIn("registrationNonce", err)
+        self.assertFalse(self.log.exists(), "the proof CLI must not run")
+
+    def test_refuses_a_proof_that_is_not_exactly_the_public_object(self):
+        for label, env in (("another staker", {"FAKE_NODE_STAKER": "0x" + "99" * 20}),
+                           ("extra field", {"FAKE_NODE_EXTRA": "1"})):
+            with self.subTest(label):
+                os.environ.update(env)
+                try:
+                    with RpcStub(self.c) as s:
+                        rc, _, _, err = self.build(s.url)
+                    self.assertEqual(rc, 2, err)
+                finally:
+                    for k in env:
+                        os.environ.pop(k, None)
 
     def test_never_sends_a_transaction(self):
         with RpcStub(self.c) as s:
@@ -146,13 +175,19 @@ class TestBuild(unittest.TestCase):
         with RpcStub(self.c) as s:
             rc, body, text, _ = run("--profile", "rehearsal-1", "--rpc", s.url, "--staker", STAKER,
                                     "--config", "/x", "--citrate-bin", FAKE_BIN, "--dry-run",
-                                    "--registration-nonce", "4", "--account-nonce", "9")
+                                    "--registration-nonce", "0", "--account-nonce", "9")
             self.assertEqual(s.requests, [])
         self.assertEqual(rc, 0)
         self.assertTrue(body["dry_run"])
         self.assertEqual(int(body["unsigned_tx"]["nonce"], 16), 9)
         self.assertIn("DO NOT SIGN", text)
         self.assertTrue(body["warnings"])
+
+    def test_dry_run_refuses_a_nonzero_registration_nonce(self):
+        rc, _, _, err = run("--profile", "rehearsal-1", "--staker", STAKER, "--config", "/x",
+                            "--citrate-bin", FAKE_BIN, "--dry-run", "--registration-nonce", "4")
+        self.assertEqual(rc, 2, err)
+        self.assertIn("registrationNonce", err)
 
     def test_live_mode_rejects_dry_run_nonces_and_pending_profile(self):
         with RpcStub(self.c) as s:
@@ -195,15 +230,10 @@ class TestWithRealBinary(unittest.TestCase):
                                        "--config", str(etc / "node.toml"), "--citrate-bin", binary)
             self.assertEqual(rc, 0, err)
             pk = body["summary"]["proposer_pubkey"]
-            sig = body["proof"]["ed25519_signature"]
+            sig = body["proof"]["registration_sig"]
             self.assertEqual(body["unsigned_tx"]["data"],
                              "0x10f53ba1" + pk[2:] + f"{64:064x}" + f"{64:064x}" + sig[2:])
-            # pubkey-only mode prints the same key
-            cp = subprocess.run([binary, "--config", str(etc / "node.toml"), "registration-proof"],
-                                capture_output=True, text=True, env=dict(os.environ, RUST_LOG="error"))
-            self.assertEqual(cp.returncode, 0, cp.stderr)
-            self.assertIn(pk, cp.stdout)
-            self.assertNotIn(bytes(range(32)).hex(), cp.stdout + body.__repr__())
+            self.assertNotIn(bytes(range(32)).hex(), json.dumps(body))
 
 
 if __name__ == "__main__":
