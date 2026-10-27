@@ -137,6 +137,9 @@ These addresses handle runtime AI operations (inference, ZK proofs):
 | Method | Description |
 |--------|-------------|
 | `citrate_getDagStats` | DAG statistics (tips, blue/red blocks, height) |
+| `citrate_executedHead` | Persisted applied tip `{number, hash}`, the tip `eth_getLogs` serves up to; `-32603` when none is persisted |
+| `citrate_isExecuted` | `{executed, number}`: whether a block hash is on the executed chain of the applied tip |
+| `citrate_getLogs` | `eth_getLogs` plus `through` (the executed block it is complete through); `afterBlockHash` cursor, `-32001` when replaced |
 | `citrate_getDagBlock` | Block with DAG-specific fields (merge parents, blue score) |
 | `citrate_getModel` | AI model metadata by ID |
 | `citrate_listModels` | List registered models (alias: `citrate_getModels`) |
