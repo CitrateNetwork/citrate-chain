@@ -7,9 +7,14 @@ proposer.key, which it never prints or copies). It:
   1. checks the public RPC is the profile's network (chain id AND genesis hash);
   2. reads, from public RPC: registrationNonce(staker), pubkeyOfStaker(staker),
      minStake(), activeCount(), the staker's balance and account nonce;
-  3. runs `citrate-node registration-proof`, which signs the Register digest with
-     proposer.key (the ed25519 proof-of-control the contract checks);
-  4. checks the proposer pubkey is not already registered;
+  3. runs `citrate-node registration-proof --registry R --staker S` (chain#398), which
+     signs the Register digest (chain id, registry, staker, proposer key, nonce 0) with
+     proposer.key: the ed25519 proof-of-control the contract checks. That CLI signs
+     registration nonce 0 only, so a staker whose registrationNonce is not 0 is refused
+     before it runs (its proof would be rejected on chain);
+  4. checks the proof is exactly the public object for this staker, registry and chain,
+     builds the registerValidator(bytes32,bytes) calldata from it, and checks the
+     proposer pubkey is not already registered;
   5. prints the unsigned legacy transaction (to, value, data, nonce, gas, gasPrice,
      chainId) and writes it to --out.
 
@@ -37,9 +42,23 @@ import producerlib as pl  # noqa: E402
 DEFAULT_STAKE_SALT = 32_000  # used only in --dry-run when minStake can't be read
 
 
-def run_registration_proof(
-    binary: str, config: str, staker: str, registry: str, nonce: int, chain_id: int
-) -> dict:
+PROOF_SCHEMA = "citrate-registration-proof/1"
+PROOF_FIELDS = {"schema", "chain_id", "registry", "staker", "proposer_pubkey", "registration_sig"}
+SIG64_RE = pl.re.compile(r"^0x[0-9a-f]{128}$")
+
+
+def register_calldata(pubkey: str, sig: str) -> str:
+    """registerValidator(bytes32 proposerPubkey, bytes ed25519Sig): selector, the pubkey,
+    the offset of the bytes argument (0x40), its length (64) and the 64 signature bytes
+    (exactly two words, so no padding)."""
+    pk = pl.norm_b32(pubkey)[2:]
+    s = sig.lower()
+    if not SIG64_RE.match(s):
+        raise pl.ToolError("registration_sig is not 64 bytes of 0x-hex")
+    return "0x" + pl.SELECTORS["registerValidator(bytes32,bytes)"] + pk + f"{0x40:064x}" + f"{64:064x}" + s[2:]
+
+
+def run_registration_proof(binary: str, config: str, staker: str, registry: str, chain_id: int) -> dict:
     exe = shutil.which(binary) or (binary if os.path.isfile(binary) else None)
     if exe is None:
         raise pl.ToolError(f"node binary {binary!r} not found (pass --citrate-bin)")
@@ -48,12 +67,10 @@ def run_registration_proof(
         "--config",
         config,
         "registration-proof",
-        "--staker",
-        staker,
         "--registry",
         registry,
-        "--nonce",
-        str(nonce),
+        "--staker",
+        staker,
     ]
     env = dict(os.environ, RUST_LOG="error", LOG_FORMAT="compact")
     try:
@@ -70,21 +87,10 @@ def run_registration_proof(
         proof = json.loads("\n".join(lines[start:]))
     except (ValueError, json.JSONDecodeError) as e:
         raise pl.ToolError(f"registration-proof printed no JSON: {cp.stdout[:400]!r}") from e
-    for k in (
-        "proposer_pubkey",
-        "ed25519_signature",
-        "calldata",
-        "staker",
-        "registry",
-        "registration_nonce",
-        "chain_id",
-    ):
-        if k not in proof:
-            raise pl.ToolError(f"registration-proof output lacks {k}")
-    if proof["staker"].lower() != staker or proof["registry"].lower() != registry.lower():
+    if not isinstance(proof, dict) or set(proof) != PROOF_FIELDS or proof.get("schema") != PROOF_SCHEMA:
+        raise pl.ToolError(f"registration-proof output is not exactly a {PROOF_SCHEMA} object")
+    if str(proof["staker"]).lower() != staker or str(proof["registry"]).lower() != registry.lower():
         raise pl.ToolError("registration-proof bound a different staker or registry")
-    if int(proof["registration_nonce"]) != nonce:
-        raise pl.ToolError("registration-proof bound a different nonce")
     # The proof is signed over the node config's chain id; the transaction uses the profile's.
     # A mismatch would produce a transaction the registry rejects, so stop here.
     try:
@@ -164,6 +170,12 @@ def build(args: argparse.Namespace) -> dict:
                 "the active set is full: registration needs a stake 25% above the smallest member"
             )
 
+    # The proof CLI signs registration nonce 0 only (a first registration of this staker).
+    if chain["registration_nonce"] != 0:
+        raise pl.ToolError(
+            f"registrationNonce({staker}) is {chain['registration_nonce']}: `citrate registration-proof` signs "
+            "nonce 0 only, so the registry would reject this proof. Register from a fresh staker address."
+        )
     stake_wei = pl.salt_to_wei(args.stake_salt) if args.stake_salt else chain["min_stake"]
     if stake_wei < chain["min_stake"]:
         raise pl.ToolError(f"stake {pl.salt(stake_wei)} is below minStake {pl.salt(chain['min_stake'])}")
@@ -174,9 +186,8 @@ def build(args: argparse.Namespace) -> dict:
             f"{pl.salt(stake_wei + max_fee)}; fund the staker first"
         )
 
-    proof = run_registration_proof(
-        args.citrate_bin, args.config, staker, reg, chain["registration_nonce"], int(prof["chain_id"])
-    )
+    proof = run_registration_proof(args.citrate_bin, args.config, staker, reg, int(prof["chain_id"]))
+    data = register_calldata(proof["proposer_pubkey"], proof["registration_sig"])
     if not args.dry_run:
         check_pubkey_free(rpc, reg, proof["proposer_pubkey"])
 
@@ -189,7 +200,7 @@ def build(args: argparse.Namespace) -> dict:
         "value": pl.qty(stake_wei),
         "gas": pl.qty(gas_limit),
         "gasPrice": pl.qty(gas_price),
-        "data": proof["calldata"],
+        "data": data,
     }
     return {
         "dry_run": bool(args.dry_run),
@@ -203,7 +214,7 @@ def build(args: argparse.Namespace) -> dict:
             "account_nonce": chain["account_nonce"],
             "max_gas_cost": pl.salt(max_fee),
         },
-        "proof": {k: proof[k] for k in ("register_digest", "ed25519_signature")},
+        "proof": {k: proof[k] for k in ("schema", "registration_sig")},
         "warnings": warnings,
     }
 
@@ -211,7 +222,7 @@ def build(args: argparse.Namespace) -> dict:
 def signing_help(out: dict, rpc_url: str) -> str:
     tx = out["unsigned_tx"]
     s = out["summary"]
-    sig = out["proof"]["ed25519_signature"]
+    sig = out["proof"]["registration_sig"]
     return f"""
 Sign this with YOUR staker wallet, on the machine that holds it. Example with Foundry
 and a Ledger (use --trezor, or --keystore <file>, for other wallets):

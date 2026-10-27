@@ -72,8 +72,8 @@ class TestBuild(unittest.TestCase):
         self.assertIn("cast mktx --legacy", text)
         argv = json.loads(self.log.read_text().splitlines()[0])
         # chain#398's CLI: the proof is for nonce 0; no --nonce argument exists
-        self.assertEqual(argv, ["--config", "/x/node.toml", "registration-proof", "--registry", REGISTRY,
-                                "--staker", STAKER])
+        self.assertEqual([a.lower() for a in argv], ["--config", "/x/node.toml", "registration-proof", "--registry",
+                                                     REGISTRY, "--staker", STAKER])
         self.assertEqual(body["summary"]["registration_nonce"], 0)
         self.assertEqual(body["proof"], {"registration_sig": "0x" + "77" * 64, "schema": "citrate-registration-proof/1"})
         self.assertNotIn("sendRawTransaction", " ".join(s.requests))
@@ -154,7 +154,7 @@ class TestBuild(unittest.TestCase):
         with RpcStub(self.c) as s:
             rc, _, _, err = self.build(s.url)
         self.assertEqual(rc, 2)
-        self.assertIn("proposer.key does not exist", err)
+        self.assertIn("no proposer key", err)
 
     def test_refuses_a_proof_for_another_chain(self):
         # node.toml from another network: the proof is signed for its chain id, the profile is
