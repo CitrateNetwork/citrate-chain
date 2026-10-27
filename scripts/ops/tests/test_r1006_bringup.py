@@ -1333,5 +1333,39 @@ class DryRunTest(unittest.TestCase):
             env.close()
 
 
+
+class BuildRevRunsAsNodeUser(unittest.TestCase):
+    """build-rev runs the installed binary as the node user. `consensus --json` reads the
+    data dir's block 0 (chain#398), so run as root it leaves root-owned RocksDB files in the
+    node's data dir and the node (User=citrate) then fails on LOCK: Permission denied
+    (r1006 bring-up, citrate-prod-1, 2026-10-27)."""
+
+    def test_build_rev_goes_through_runuser(self):
+        with tempfile.TemporaryDirectory() as td:
+            t = Path(td)
+            root, shim = t / "root", t / "shim"
+            (root / "usr/local/bin").mkdir(parents=True)
+            shim.mkdir()
+            log = t / "calls.log"
+            node = root / "usr/local/bin/citrate-node"
+            node.write_text("#!/usr/bin/env bash\n"
+                            f'echo "node uid-switched=${{RUNUSER_SHIM:-no}} $*" >>"{log}"\n'
+                            'echo \'{"git_sha":"9a32147e2aac","git_dirty":false}\'\n')
+            node.chmod(0o755)
+            (shim / "runuser").write_text("#!/usr/bin/env bash\n"
+                                          f'echo "runuser $*" >>"{log}"\n'
+                                          '[[ "$1" == -u && "$3" == -- ]] || exit 9\n'
+                                          'shift 3; RUNUSER_SHIM="$RUNUSER_U" exec "$@"\n')
+            (shim / "runuser").chmod(0o755)
+            env = dict(os.environ, R1006_ROOT=str(root), R1006_SERVICE="proc", R1006_RUN_AS="citrate",
+                       RUNUSER_U="citrate", PATH=f"{shim}:{os.environ['PATH']}", HOME=str(t))
+            r = subprocess.run(["bash", str(AGENT), "build-rev"], env=env, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual(r.stdout.strip(), "9a32147e2aac false")
+            calls = log.read_text()
+            self.assertIn("runuser -u citrate -- ", calls)
+            self.assertIn("node uid-switched=citrate consensus --json", calls)
+            self.assertNotIn("uid-switched=no", calls)
+
 if __name__ == "__main__":
     unittest.main()
