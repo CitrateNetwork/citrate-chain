@@ -9,9 +9,15 @@ import {P256} from "../src/aa/lib/webauthn/P256.sol";
 /// @title CheckDeployedAdmins — read-only post-deploy gate (PBA-L2-002, PBA-L2-011)
 /// @notice Reads every address in the canonical address book and classifies it:
 ///
-///   FACTORY-ADMIN  governance / pendingGovernance / owner / provider /
-///                  DEFAULT_ADMIN_ROLE is the CREATE2 factory (0x4e59…956C).
-///                  This is the PBA-L2-002 defect. GATE: must be 0.
+///   FACTORY-ADMIN  a privileged slot (see DEPLOYER-ADMIN) is the CREATE2
+///                  factory (0x4e59…956C). This is the PBA-L2-002 defect.
+///                  GATE: must be 0.
+///   DEPLOYER-ADMIN a privileged slot names the book's deployer EOA: every
+///                  getter in AdminChecks._addressSlotGetters (governance,
+///                  owner and admin slots and their pending forms, fee
+///                  recipients, bound callers, operators, oracles, signers,
+///                  wired dependencies), every set in _addressSetGetters and
+///                  every role in _probedRoleNames. GATE: must be 0.
 ///   VERIFIER       the P-256 verifier the passkey validator hard-codes has no
 ///                  code (PBA-L2-011). GATE: must be present.
 ///   NO-CODE        address-book entry with no code (not yet deployed on this
@@ -131,7 +137,7 @@ contract CheckDeployedAdmins is GenesisProfile {
         console.log("TIMELOCK-HOLDERS failures:", timelockHolders);
         console.log("GENESIS-FLOOR failures:", genesisFloor);
         require(factoryAdmin == 0, "CheckDeployedAdmins: CREATE2 factory holds an admin slot (see log)");
-        require(deployerAdmin == 0, "CheckDeployedAdmins: deployer EOA holds governance/owner/DEFAULT_ADMIN (see log)");
+        require(deployerAdmin == 0, "CheckDeployedAdmins: deployer EOA holds a privileged slot (see log)");
         require(!verifierMissing, "CheckDeployedAdmins: P-256 verifier not provisioned");
         require(genesisFloor == 0, "CheckDeployedAdmins: genesis governance floor not met (see log)");
         require(

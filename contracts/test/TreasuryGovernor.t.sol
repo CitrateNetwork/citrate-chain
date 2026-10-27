@@ -176,9 +176,18 @@ contract TreasuryGovernorTest is Test {
         assertEq(address(governor.treasury()), address(treasury));
     }
 
-    function test_deploy_zero_staking_pool_reverts() public {
-        vm.expectRevert("TreasuryGovernor: zero staking pool");
-        new TreasuryGovernor(address(0), address(treasury), guardianAddr, TOTAL_SUPPLY);
+    /// address(0) is the disabled liquid-staking path (the genesis set has no
+    /// pool); a non-zero pool must be a contract.
+    function test_deploy_zero_staking_pool_isDisabledPath() public {
+        TreasuryGovernor g = new TreasuryGovernor(address(0), address(treasury), guardianAddr, TOTAL_SUPPLY);
+        assertEq(address(g.stakingPool()), address(0));
+        assertFalse(g.liquidStakingEnabled());
+        assertTrue(governor.liquidStakingEnabled());
+    }
+
+    function test_deploy_staking_pool_without_code_reverts() public {
+        vm.expectRevert("TreasuryGovernor: staking pool has no code");
+        new TreasuryGovernor(address(0xBEEF), address(treasury), guardianAddr, TOTAL_SUPPLY);
     }
 
     function test_deploy_zero_treasury_reverts() public {

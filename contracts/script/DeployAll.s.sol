@@ -20,7 +20,6 @@ import "../src/LoRAFactory.sol";
 import "../src/IPFSIncentives.sol";
 
 // Economics
-import "../src/LiquidStakingPool.sol";
 import "../src/ContributionAccounting.sol";
 import "../src/NematocystSlashing.sol";
 import "../src/MarketMakerAllocation.sol";
@@ -56,13 +55,13 @@ import "../src/SpecRegistry.sol";
  *         Run: forge script script/DeployAll.s.sol --rpc-url http://localhost:8545 --broadcast -vvvv
  *
  *         This is one of six ceremony steps. The full reroll runs:
- *           1. DeployAll.s.sol                  (this script — 28 contracts)
+ *           1. DeployAll.s.sol                  (this script — 27 contracts)
  *           2. DeployModelAccessControl.s.sol   (1 contract — separated due to OZ deps)
  *           3. DeployTEEAttestationRegistry.s.sol (1 contract — CM-08)
  *           4. DeployComputePoolTraining.s.sol  (1 contract — CM-07)
  *           5. DeployEduStack.s.sol             (5 contracts — Learning Center)
  *           6. DeployAIGateway.s.sol            (3 contracts — edu/ai-gateway)
- *         Total: 39 contracts. See scripts/regenesis.sh for the orchestration.
+ *         Total: 38 contracts. See scripts/regenesis.sh for the orchestration.
  *
  *         PBA-L2-002 (pre-bounty audit 2026-09-24): every contract whose admin /
  *         owner / governance used to be `msg.sender` now receives it explicitly
@@ -87,7 +86,7 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         address ipfs;
         address facilitator;
         address paywall;
-        address stakingPool;
+        address stakingPool; // always address(0): not part of block 0
         address contributions;
         address slashing;
         address mmAlloc;
@@ -116,12 +115,27 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
 
     function deploy() public returns (Deployed memory d) {
         address deployer = deployerAddress();
-        return deployWith(deployer, requiredGovernance("GOVERNANCE", deployer), requiredGovernance("GUARDIAN", deployer));
+        address governance = requiredGovernance("GOVERNANCE", deployer);
+        return deployWith(
+            deployer, governance, requiredGovernance("GUARDIAN", deployer), requiredTreasury("TREASURY", deployer, governance)
+        );
+    }
+
+    /// @notice `deployWith` with the protocol fees paid to `governance`.
+    function deployWith(address deployer, address governance, address guardian) public returns (Deployed memory d) {
+        return deployWith(deployer, governance, guardian, governance);
     }
 
     /// @notice The ceremony with explicit keys (no environment reads), so a
     ///         caller or test is not affected by concurrently changing env.
-    function deployWith(address deployer, address governance, address guardian) public returns (Deployed memory d) {
+    ///         `feeTo` is the protocol fee recipient (the ceremony's TREASURY)
+    ///         of X402Facilitator, ModelMarketplace and ComputeMarketplace.
+    function deployWith(address deployer, address governance, address guardian, address feeTo)
+        public
+        returns (Deployed memory d)
+    {
+        require(feeTo != address(0), "DeployAll: zero fee recipient");
+        require(feeTo != deployer || governance == deployer, "DeployAll: fee recipient must not be the deployer");
 
         bool reroll = _isReroll();
         // Under the reroll switch the three otherwise-kept-live registries deploy
@@ -187,19 +201,19 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
 
         X402Facilitator facilitator = (_isLive("X402Facilitator", abi.encodePacked(type(X402Facilitator).creationCode, abi.encode(
             address(wsalt),
-            deployer,  // treasury
+            feeTo,     // fee recipient (TREASURY)
             100,       // 1% fee
             governance // admin + facilitator (PBA-L2-002)
         )))
             ? X402Facilitator(payable(_create2Address("X402Facilitator", abi.encodePacked(type(X402Facilitator).creationCode, abi.encode(
             address(wsalt),
-            deployer,  // treasury
+            feeTo,     // fee recipient (TREASURY)
             100,       // 1% fee
             governance // admin + facilitator (PBA-L2-002)
         )))))
             : new X402Facilitator{salt: Salts.salt("X402Facilitator")}(
             address(wsalt),
-            deployer,  // treasury
+            feeTo,     // fee recipient (TREASURY)
             100,       // 1% fee
             governance // admin + facilitator (PBA-L2-002)
         ));
@@ -218,10 +232,11 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         // =====================================================================
         console.log("--- Layer 3: Economics ---");
 
-        LiquidStakingPool stakingPool = (_isLive("LiquidStakingPool", abi.encodePacked(type(LiquidStakingPool).creationCode, abi.encode(governance)))
-            ? LiquidStakingPool(payable(_create2Address("LiquidStakingPool", abi.encodePacked(type(LiquidStakingPool).creationCode, abi.encode(governance)))))
-            : new LiquidStakingPool{salt: Salts.salt("LiquidStakingPool")}(governance));
-        console.log("  LiquidStakingPool:", address(stakingPool));
+        // LiquidStakingPool is not part of block 0 (owner decision): none is
+        // deployed and TreasuryGovernor is born with the liquid-staking path
+        // disabled (address(0)). A later passed proposal can wire a pool
+        // through TreasuryGovernor.setStakingPool.
+        console.log("  LiquidStakingPool: not deployed (liquid staking disabled at genesis)");
 
         ContributionAccounting contributions =
             (_isLive("ContributionAccounting", abi.encodePacked(type(ContributionAccounting).creationCode, abi.encode(governance)))
@@ -258,17 +273,17 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
 
         ModelMarketplace modelMarketplace = (_isLive("ModelMarketplace", abi.encodePacked(type(ModelMarketplace).creationCode, abi.encode(
             address(registry),
-            deployer,  // treasury
+            feeTo,     // fee recipient (TREASURY)
             governance // admin (PBA-L2-002)
         )))
             ? ModelMarketplace(payable(_create2Address("ModelMarketplace", abi.encodePacked(type(ModelMarketplace).creationCode, abi.encode(
             address(registry),
-            deployer,  // treasury
+            feeTo,     // fee recipient (TREASURY)
             governance // admin (PBA-L2-002)
         )))))
             : new ModelMarketplace{salt: Salts.salt("ModelMarketplace")}(
             address(registry),
-            deployer,  // treasury
+            feeTo,     // fee recipient (TREASURY)
             governance // admin (PBA-L2-002)
         ));
         console.log("  ModelMarketplace:", address(modelMarketplace));
@@ -333,19 +348,30 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
 
         ComputeMarketplace computeMarketplace = (_isLive("ComputeMarketplace", abi.encodePacked(type(ComputeMarketplace).creationCode, abi.encode(
             address(verifier),
-            deployer,  // treasury
+            feeTo,     // fee recipient (TREASURY)
             governance // governance (PBA-L2-002)
         )))
             ? ComputeMarketplace(payable(_create2Address("ComputeMarketplace", abi.encodePacked(type(ComputeMarketplace).creationCode, abi.encode(
             address(verifier),
-            deployer,  // treasury
+            feeTo,     // fee recipient (TREASURY)
             governance // governance (PBA-L2-002)
         )))))
             : new ComputeMarketplace{salt: Salts.salt("ComputeMarketplace")}(
             address(verifier),
-            deployer,  // treasury
+            feeTo,     // fee recipient (TREASURY)
             governance // governance (PBA-L2-002)
         ));
+        // The marketplace's constructor takes the verifier, so the verifier is
+        // born with the deploy account as its provisional caller and hands the
+        // role to the marketplace here, before anything else can use it. On a
+        // re-run over a bound verifier this is a no-op.
+        if (verifier.marketplace() != address(computeMarketplace)) {
+            require(
+                !verifier.marketplaceLocked(),
+                "DeployAll: ComputeVerifier is bound to another ComputeMarketplace (re-run with the same TREASURY)"
+            );
+            verifier.handOverMarketplace(address(computeMarketplace));
+        }
         console.log("  ComputeMarketplace:", address(computeMarketplace));
 
         ComputePool computePool = (_isLive("ComputePool", abi.encodePacked(type(ComputePool).creationCode, abi.encode(governance)))
@@ -459,19 +485,19 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         console.log("  TestnetFarmingAccounting:", address(farming));
 
         TreasuryGovernor governor = (_isLive("TreasuryGovernor", abi.encodePacked(type(TreasuryGovernor).creationCode, abi.encode(
-            address(stakingPool),
+            address(0), // no LiquidStakingPool at genesis (liquid staking disabled)
             address(treasury),
             guardian, // guardian (PBA-L2-001: set GUARDIAN to the multisig)
             SaltSupply.TOTAL_SUPPLY // canonical SALT supply (quorum basis)
         )))
             ? TreasuryGovernor(payable(_create2Address("TreasuryGovernor", abi.encodePacked(type(TreasuryGovernor).creationCode, abi.encode(
-            address(stakingPool),
+            address(0), // no LiquidStakingPool at genesis (liquid staking disabled)
             address(treasury),
             guardian, // guardian (PBA-L2-001: set GUARDIAN to the multisig)
             SaltSupply.TOTAL_SUPPLY // canonical SALT supply (quorum basis)
         )))))
             : new TreasuryGovernor{salt: Salts.salt("TreasuryGovernor")}(
-            address(stakingPool),
+            address(0), // no LiquidStakingPool at genesis (liquid staking disabled)
             address(treasury),
             guardian, // guardian (PBA-L2-001: set GUARDIAN to the multisig)
             SaltSupply.TOTAL_SUPPLY // canonical SALT supply (quorum basis)
@@ -488,7 +514,7 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
             ipfs: address(ipfs),
             facilitator: address(facilitator),
             paywall: address(paywall),
-            stakingPool: address(stakingPool),
+            stakingPool: address(0),
             contributions: address(contributions),
             slashing: address(slashing),
             mmAlloc: address(mmAlloc),
@@ -511,7 +537,7 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
             governor: address(governor)
         });
         // PBA-L2-002 tripwire: fail the run if any admin slot is orphaned.
-        _assertAdmins(d, deployer, governance);
+        _assertAdmins(d, deployer, governance, regGov, feeTo);
 
         // =====================================================================
         // Summary
@@ -519,7 +545,7 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         console.log("");
         console.log("=== DEPLOYMENT COMPLETE ===");
         console.log("Chain ID:", block.chainid);
-        console.log("Total contracts deployed: 28");
+        console.log("Total contracts deployed: 27");
         console.log("");
         console.log("--- Contract Addresses ---");
         console.log("ModelRegistry         :", address(registry));
@@ -530,7 +556,7 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         console.log("X402Facilitator       :", address(facilitator));
         console.log("X402Paywall           :", address(paywall));
         console.log("ModelAccessControl    : separate ceremony step");
-        console.log("LiquidStakingPool     :", address(stakingPool));
+        console.log("LiquidStakingPool     : not deployed (liquid staking disabled)");
         console.log("ContributionAccounting:", address(contributions));
         console.log("NematocystSlashing    :", address(slashing));
         console.log("MarketMakerAllocation :", address(mmAlloc));
@@ -595,14 +621,18 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
     /// @notice PBA-L2-002 post-deploy assertion: every admin / owner /
     ///         governance slot names the intended key and never the CREATE2
     ///         factory. Also sweeps every deployed address generically.
-    function _assertAdmins(Deployed memory d, address deployer, address governance) internal view {
+    function _assertAdmins(Deployed memory d, address deployer, address governance, address regGov, address feeTo)
+        internal
+        view
+    {
         _assertAdminRole("ModelRegistry", d.registry, governance);
         _assertAdminRole("IPFSIncentives", d.ipfs, governance);
         _assertAdminRole("X402Facilitator", d.facilitator, governance);
         _assertAdminRole("ModelMarketplace", d.modelMarketplace, governance);
         _assertAdminRole("InferenceRouter", d.router, governance);
         _assertAdminRole("LoRAFactory", d.loraFactory, governance);
-        _assertGovernance("LiquidStakingPool", d.stakingPool, governance);
+        require(d.stakingPool == address(0), "DeployAll: LiquidStakingPool is not part of block 0");
+        require(address(TreasuryGovernor(payable(d.governor)).stakingPool()) == address(0), "TreasuryGovernor: staking pool set");
         _assertGovernance("ContributionAccounting", d.contributions, governance);
         _assertGovernance("NematocystSlashing", d.slashing, governance);
         _assertGovernance("LearningCycleManager", d.cycleManager, governance);
@@ -620,16 +650,44 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         _assertGovernance("TestnetFarmingAccounting", d.farming, governance);
         (bool ok, address provider) = _readAddress(d.paywall, abi.encodeWithSignature("provider()"));
         require(ok && provider == governance, "X402Paywall: provider is not the intended key");
+        // Fee recipients and the verifier's bound caller are the intended ones.
+        require(X402Facilitator(d.facilitator).treasury() == feeTo, "X402Facilitator: treasury is not the fee recipient");
+        require(
+            ModelMarketplace(payable(d.modelMarketplace)).treasuryAddress() == feeTo,
+            "ModelMarketplace: treasuryAddress is not the fee recipient"
+        );
+        require(
+            ComputeMarketplace(payable(d.computeMarketplace)).treasury() == feeTo,
+            "ComputeMarketplace: treasury is not the fee recipient"
+        );
+        require(
+            ComputeVerifier(d.verifier).marketplace() == d.computeMarketplace,
+            "ComputeVerifier: marketplace is not the deployed ComputeMarketplace"
+        );
+        require(ComputeVerifier(d.verifier).marketplaceLocked(), "ComputeVerifier: marketplace hand-over still open");
 
-        address[28] memory all = [
+        address[27] memory all = [
             d.registry, d.wsalt, d.agentRegistry, d.specRegistry, d.ipfs, d.facilitator, d.paywall,
-            d.stakingPool, d.contributions, d.slashing, d.mmAlloc, d.modelMarketplace, d.router,
+            d.contributions, d.slashing, d.mmAlloc, d.modelMarketplace, d.router,
             d.loraFactory, d.learningPool, d.cycleManager, d.classroom, d.mentorMatcher, d.verifier,
             d.computeMarketplace, d.computePool, d.heartbeat, d.dispute, d.oracle, d.treasury,
             d.gateway, d.farming, d.governor
         ];
         for (uint256 i = 0; i < all.length; i++) {
             _assertNoFactoryAdmin("DeployAll", all[i]);
+        }
+        // With a real governance, the deploy account must end with no
+        // privileged slot anywhere (every getter AdminChecks reads). The three
+        // registries a live, non-reroll run keeps deployer-governed (regGov)
+        // are the documented exception on that path only.
+        if (governance != deployer) {
+            for (uint256 i = 0; i < all.length; i++) {
+                if (regGov == deployer && (all[i] == d.agentRegistry || all[i] == d.specRegistry || all[i] == d.mmAlloc)) {
+                    continue;
+                }
+                string memory p = _deployerAdminProblem(all[i], deployer);
+                require(bytes(p).length == 0, string.concat("DeployAll: ", p));
+            }
         }
     }
 }
