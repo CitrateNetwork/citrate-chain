@@ -82,6 +82,7 @@ mod model_verifier;
 mod network_inference;
 mod persistent_dag;
 mod producer;
+mod registration_proof;
 mod registry_sync;
 mod rollback;
 mod startup_guards;
@@ -317,6 +318,25 @@ enum Commands {
         /// node then rebuilds its state from genesis at the next start.
         #[arg(long)]
         rebuild_state: bool,
+    },
+
+    /// Producer onboarding: print this node's proposer pubkey and, with
+    /// --staker/--registry/--nonce, the ed25519 half of a ValidatorRegistry
+    /// registration (the signed Register digest and the registerValidator
+    /// calldata) as JSON. Reads <data_dir>/proposer.key read-only, never mints
+    /// or prints it, and never touches a staker key: the operator signs the
+    /// transaction with their own wallet. See scripts/producers/README.md.
+    RegistrationProof {
+        /// Staker address (msg.sender of registerValidator; must equal the
+        /// node's [mining] coinbase).
+        #[arg(long, value_name = "ADDR", requires_all = ["registry", "nonce"])]
+        staker: Option<String>,
+        /// ValidatorRegistry address for this network.
+        #[arg(long, value_name = "ADDR", requires = "staker")]
+        registry: Option<String>,
+        /// ValidatorRegistry.registrationNonce(staker), read from public RPC.
+        #[arg(long, value_name = "N", requires = "staker")]
+        nonce: Option<u64>,
     },
 
     /// Wallet management (accounts, balances, transfers)
@@ -573,6 +593,48 @@ async fn main() -> Result<()> {
                 dry_run,
                 rebuild_state,
             )?;
+            return Ok(());
+        }
+        Some(Commands::RegistrationProof {
+            staker,
+            registry,
+            nonce,
+        }) => {
+            // The config is read only for what the flags don't give: the data dir,
+            // and the chain id when a proof is requested.
+            let need_chain = staker.is_some() && cli.chain_id.is_none();
+            let file_cfg = if cli.data_dir.is_none() || need_chain {
+                resolve_config_path(cli.config.clone())
+                    .map(|p| NodeConfig::from_file(&p))
+                    .transpose()?
+            } else {
+                None
+            };
+            let data_dir = cli
+                .data_dir
+                .clone()
+                .or_else(|| file_cfg.as_ref().map(|c| c.storage.data_dir.clone()))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("no node config found; pass --config or --data-dir")
+                })?;
+            let key = registration_proof::read_proposer_key(&data_dir.join("proposer.key"))?;
+            let out = match (staker, registry, nonce) {
+                (Some(staker), Some(registry), Some(nonce)) => {
+                    let chain_id = cli
+                        .chain_id
+                        .or_else(|| file_cfg.as_ref().map(|c| c.chain.chain_id))
+                        .ok_or_else(|| anyhow::anyhow!("pass --chain-id or --config"))?;
+                    let staker = registration_proof::parse_address(&staker)?;
+                    let registry = registration_proof::parse_address(&registry)?;
+                    serde_json::to_value(registration_proof::build(
+                        chain_id, &registry, &staker, nonce, &key,
+                    )?)?
+                }
+                _ => serde_json::json!({
+                    "proposer_pubkey": registration_proof::pubkey_hex(&key),
+                }),
+            };
+            println!("{}", serde_json::to_string_pretty(&out)?);
             return Ok(());
         }
         Some(Commands::Wallet {

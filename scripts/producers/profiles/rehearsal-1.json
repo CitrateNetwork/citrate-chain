@@ -1,0 +1,33 @@
+{
+  "name": "rehearsal-1",
+  "status": "pending-genesis",
+  "description": "Betanet rehearsal 1 (2026-11-13). The genesis (C2 G1 profile), the ValidatorRegistry address and the bootnode identities are fixed by the chain team when the rehearsal genesis is cut. Until then every tool refuses this profile except in --dry-run. Fill the empty fields, set status to \"ready\", and record each value's source below.",
+  "sources": {
+    "genesis_hash": "",
+    "bootstrap_nodes": "",
+    "validator_registry": "",
+    "validator_activation_height": "",
+    "env": "",
+    "checkpoint": ""
+  },
+  "chain_id": 40204,
+  "genesis_hash": "",
+  "genesis_profile": null,
+  "public_rpc": "https://rpc.citrate.ai",
+  "block_time": 2,
+  "ghostdag_k": 18,
+  "bootstrap_nodes": [],
+  "validator_registry": "",
+  "validator_activation_height": 0,
+  "env": {
+    "CITRATE_BLOCK_V2": "1",
+    "CITRATE_DAG_PRUNE_RETAIN": "10000"
+  },
+  "checkpoint": {
+    "interval": 50,
+    "committee_size": 100,
+    "quorum_threshold": 67
+  },
+  "gas_price_wei": 1000000000,
+  "registration_gas_limit": 600000
+}
