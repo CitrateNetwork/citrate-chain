@@ -32,6 +32,7 @@ pub mod rate_limit;
 pub mod rpc_limits;
 pub mod rpc_runtime;
 pub mod server;
+pub mod state_tag;
 pub mod types;
 pub mod websocket;
 

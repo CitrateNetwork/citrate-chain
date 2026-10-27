@@ -406,8 +406,9 @@ fn anchor_for(
 ///   * otherwise there is no way to serve true finalized-height state, so the
 ///     read is refused with a clear error rather than silently returning latest.
 ///
-/// Every other tag (`latest` / `pending` / `earliest` / hex / absent) is
-/// unaffected and keeps its existing latest-state behaviour. Returns `Ok(())`
+/// Every other tag is left to `state_tag::require_executed_head_state`, which
+/// each state read also calls: a number, `earliest` or hash is served only when
+/// it names the executed head (chain#425). Returns `Ok(())`
 /// when the read may proceed against latest state, or an `Err` to return to the
 /// client verbatim.
 ///
@@ -991,6 +992,7 @@ pub fn register_eth_methods_with_finality(
         let tag = params.get(1).and_then(|v| v.as_str());
         let latest_height = block_on(ChainApi::new(storage_bal.clone()).get_height()).unwrap_or(0);
         require_serviceable_finality_tag(tag, &finalized_bal, &storage_bal, latest_height)?;
+        crate::state_tag::require_executed_head_state(params.get(1), &storage_bal)?;
 
         let addr_str = match arg(&params, 0).as_str() {
             Some(a) if a.starts_with("0x") => a.get(2..).unwrap_or_default(),
@@ -1042,6 +1044,7 @@ pub fn register_eth_methods_with_finality(
         let tag = params.get(1).and_then(|v| v.as_str());
         let latest_height = block_on(ChainApi::new(storage_code.clone()).get_height()).unwrap_or(0);
         require_serviceable_finality_tag(tag, &finalized_code, &storage_code, latest_height)?;
+        crate::state_tag::require_executed_head_state(params.get(1), &storage_code)?;
 
         let addr_str = match arg(&params, 0).as_str() {
             Some(a) if a.starts_with("0x") => a.get(2..).unwrap_or_default(),
@@ -1123,6 +1126,7 @@ pub fn register_eth_methods_with_finality(
         let latest_height =
             block_on(ChainApi::new(storage_nonce.clone()).get_height()).unwrap_or(0);
         require_serviceable_finality_tag(raw_tag, &finalized_nonce, &storage_nonce, latest_height)?;
+        crate::state_tag::require_executed_head_state(params.get(1), &storage_nonce)?;
         let tag = raw_tag.unwrap_or("latest");
 
         let base_nonce = block_on(state_api.get_nonce(Address(addr_bytes))).unwrap_or_default();
@@ -1317,6 +1321,7 @@ pub fn register_eth_methods_with_finality(
         let tag = params.get(1).and_then(|v| v.as_str());
         let latest_height = block_on(ChainApi::new(storage_call.clone()).get_height()).unwrap_or(0);
         require_serviceable_finality_tag(tag, &finalized_call, &storage_call, latest_height)?;
+        crate::state_tag::require_executed_head_state(params.get(1), &storage_call)?;
 
         // call object
         let obj = match &arg(&params, 0) {
@@ -1543,6 +1548,7 @@ pub fn register_eth_methods_with_finality(
             &storage_estimate,
             latest_height,
         )?;
+        crate::state_tag::require_executed_head_state(params.get(1), &storage_estimate)?;
 
         // call object
         let obj = match &arg(&params, 0) {
@@ -2727,10 +2733,10 @@ pub fn register_eth_methods_with_finality(
     // diffs before broadcast. Returns a left-padded 32-byte hex value;
     // cast call decodes a `uint256` from it directly.
     //
-    // We currently only serve "latest" semantics; historical state
-    // requires pruning-point-aware storage that we don't have yet.
-    // forge tolerates this because it caches the block height itself
-    // and re-reads "latest" each call.
+    // Only the executed head's state is served; a tag naming any other
+    // block is refused (`state_tag::require_executed_head_state`, chain#425).
+    // Historical state requires pruning-point-aware storage that we don't
+    // have yet.
     let storage_gsat = storage.clone();
     let executor_gsat = executor.clone();
     let finalized_gsat = finalized.clone();
@@ -2751,6 +2757,7 @@ pub fn register_eth_methods_with_finality(
         let tag = parsed.get(2).and_then(|v| v.as_str());
         let latest_height = block_on(ChainApi::new(storage_gsat.clone()).get_height()).unwrap_or(0);
         require_serviceable_finality_tag(tag, &finalized_gsat, &storage_gsat, latest_height)?;
+        crate::state_tag::require_executed_head_state(parsed.get(2), &storage_gsat)?;
 
         // address (required, 20 bytes)
         let addr_str = arg(&parsed, 0)
@@ -2790,8 +2797,8 @@ pub fn register_eth_methods_with_finality(
         let mut slot_key = vec![0u8; 32usize.saturating_sub(slot_bytes.len())];
         slot_key.append(&mut slot_bytes);
 
-        // The 3rd param (blockTag) is parsed for forwards-compat with the
-        // standard signature but we always serve latest.
+        // The 3rd param (blockTag) was checked above: only a tag naming the
+        // executed head is served (chain#425).
 
         match block_on(state_api.get_storage(address, slot_key)) {
             Ok(value) => {
