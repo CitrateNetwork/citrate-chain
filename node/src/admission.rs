@@ -64,7 +64,7 @@
 // surface. With D2.2 a partial admission becomes impossible; with D2.3 alone
 // it becomes self-healing. Self-healing first, impossible second.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -283,6 +283,30 @@ pub struct BlockAdmission {
     /// `(height, hash)`. Resolved once the genesis block is stored; a block at
     /// a listed height with another hash is refused like a withdrawn one.
     checkpoints: std::sync::OnceLock<Vec<(u64, Hash)>>,
+    /// One admission per block hash at a time. The sync admission worker and
+    /// the gossip path admit concurrently; two admissions of the same block
+    /// would both pass the presence checks and both write it, and a second
+    /// `GhostDag::add_block` resets the block's recorded children. Entries
+    /// exist only while an admission of that hash is running.
+    admitting: parking_lot::Mutex<HashMap<Hash, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+/// Removes a hash's entry from `BlockAdmission::admitting` when the last
+/// admission holding it ends (also on cancellation).
+struct AdmittingSlot<'a> {
+    map: &'a parking_lot::Mutex<HashMap<Hash, Arc<tokio::sync::Mutex<()>>>>,
+    hash: Hash,
+    slot: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Drop for AdmittingSlot<'_> {
+    fn drop(&mut self) {
+        let mut map = self.map.lock();
+        // The map's reference plus ours: nobody else is waiting on it.
+        if Arc::strong_count(&self.slot) <= 2 {
+            map.remove(&self.hash);
+        }
+    }
 }
 
 /// Cap on withdrawn hashes held in memory; descendants past it are refused as
@@ -306,6 +330,7 @@ impl BlockAdmission {
             pruned_log: LogBudget::new(PRUNED_LOG_PER_WINDOW, LOG_WINDOW_SECS),
             withdrawn,
             checkpoints: std::sync::OnceLock::new(),
+            admitting: parking_lot::Mutex::new(HashMap::new()),
         }
         .log_withdrawn()
     }
@@ -451,6 +476,13 @@ impl BlockAdmission {
     /// when a previous attempt was interrupted.
     pub async fn admit(&self, block: &Block) -> AdmitOutcome {
         let hash = block.header.block_hash;
+        // Serialize admissions of THIS block (other blocks are unaffected).
+        let slot = AdmittingSlot {
+            map: &self.admitting,
+            hash,
+            slot: self.admitting.lock().entry(hash).or_default().clone(),
+        };
+        let _one_at_a_time = slot.slot.lock().await;
 
         // Operator rollback: a withdrawn branch never re-enters, from any peer.
         if let Some(why) = self.withdrawn_reason(block) {
@@ -979,6 +1011,10 @@ mod tests {
             assert!(
                 !tips.contains(&p.header.block_hash),
                 "round {round}: the parent is a tip again after its child landed"
+            );
+            assert!(
+                adm.admitting.lock().is_empty(),
+                "round {round}: per-block guards outlived their admissions"
             );
         }
     }
