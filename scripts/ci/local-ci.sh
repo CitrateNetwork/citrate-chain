@@ -27,6 +27,10 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
+# Run from the pre-push hook, git has exported GIT_DIR (and from a worktree GIT_INDEX_FILE
+# etc.). Drop every repository-local variable so no gate's fixture repo can resolve to
+# this repository; git finds it again from the cwd above.
+unset $(git rev-parse --local-env-vars)
 
 FAST=0; NO_FORGE=0
 while [ $# -gt 0 ]; do
@@ -201,6 +205,8 @@ gate "consensus-tripwires" consensus_tripwires
 # ~/.cargo/git caches hide it, so only a fresh fetch notices. Needs network
 # (git ls-remote + a shallow fetch per pinned commit). Runs in --fast.
 git_rev_deps() {
+  scripts/ci/test_git_rev_deps_env.sh >/dev/null 2>&1 \
+    || { echo "git-rev-deps env test FAILED (a git call can reach the caller's repo)"; return 1; }
   scripts/ci/git_rev_deps_tripwire.sh --self-test >/dev/null 2>&1 \
     || { echo "git-rev-deps self-test FAILED (the check no longer detects a stranded pin)"; return 1; }
   scripts/ci/git_rev_deps_tripwire.sh

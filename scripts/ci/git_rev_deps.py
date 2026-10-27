@@ -45,8 +45,22 @@ HEX = re.compile(r"^[0-9a-f]{4,40}$")
 TIMEOUT = int(os.environ.get("GIT_REV_DEPS_TIMEOUT", "120"))
 
 
+# `git rev-parse --local-env-vars`: the variables that pick a repository. git exports
+# GIT_DIR (and, from a worktree, GIT_INDEX_FILE and more) to hooks, so under the pre-push
+# hook an inherited one would aim every git call here, fixture init/commit/gc included, at
+# the developer's own repository. Every call locates its repository by -C/cwd instead.
+LOCAL_GIT_ENV = (
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT", "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE", "GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE", "GIT_PREFIX", "GIT_SHALLOW_FILE", "GIT_COMMON_DIR",
+)
+
+
 def git_env() -> dict:
-    env = dict(os.environ)
+    env = {k: v for k, v in os.environ.items()
+           if k not in LOCAL_GIT_ENV and not k.startswith("GIT_CONFIG_KEY_")
+           and not k.startswith("GIT_CONFIG_VALUE_")}
     env["GIT_TERMINAL_PROMPT"] = "0"  # never hang on a credential prompt
     return env
 
@@ -235,7 +249,8 @@ def self_test():
     rc = 0
 
     def g(*args, cwd=None):
-        r = subprocess.run(["git", *ident, *args], cwd=cwd, capture_output=True, text=True)
+        r = subprocess.run(["git", *ident, *args], cwd=cwd, env=git_env(),
+                           capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError(f"fixture git {args} failed: {r.stderr}")
         return r.stdout.strip()
