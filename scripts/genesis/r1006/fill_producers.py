@@ -285,8 +285,22 @@ def main(argv):
     if h2 != h:
         fail(f"the genesis hash moved after pinning ({h} -> {h2})")
     out.mkdir(parents=True, exist_ok=True)
-    write_json(out / "genesis-alloc.json",
-               {"alloc": {a["address"]: {"code": a["code"]} for a in alloc["accounts"] if a.get("code")}})
+    # The block-0 contract state, as {"alloc": {addr: {"code", "storage"}}}: smoke's code check
+    # reads `code`; CheckDeployedAdmins' genesis-chain mode (GENESIS_ALLOC) reads `storage` to
+    # prove the timelocks' role holder sets complete. The registry carries its filled state.
+    galloc = {}
+    for a in alloc["accounts"]:
+        if not a.get("code"):
+            continue
+        st = dict(a.get("storage", {}))
+        if a["address"] == alloc["validatorRegistry"]:
+            for k, v in reg["storage"].items():
+                if int(v, 16) == 0:
+                    st.pop(k, None)
+                else:
+                    st[k] = v
+        galloc[a["address"]] = {"code": a["code"], "storage": dict(sorted(st.items()))}
+    write_json(out / "genesis-alloc.json", {"alloc": galloc})
     if BOOK.exists():
         shutil.copy(BOOK, out / "book.json")
     write_json(out / "fill-result.json", {

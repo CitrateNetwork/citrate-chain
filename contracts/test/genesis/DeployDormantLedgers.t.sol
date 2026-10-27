@@ -379,11 +379,11 @@ contract DeployDormantLedgersTest is Test {
         // Admin renounced, deployer still proposer / executor: refused.
         vm.startPrank(SENDER);
         weak.renounceRole(weak.DEFAULT_ADMIN_ROLE(), SENDER);
-        _expectRevert(bytes("GOVERNANCE_TIMELOCK: deployer EOA holds timelock PROPOSER_ROLE"));
+        _expectRevert(bytes("GOVERNANCE_TIMELOCK: deployer EOA holds PROPOSER_ROLE"));
         s.deployWith(SENDER, address(weak), address(ms), address(kyc), address(membership));
         weak.renounceRole(weak.PROPOSER_ROLE(), SENDER);
         weak.renounceRole(weak.CANCELLER_ROLE(), SENDER);
-        _expectRevert(bytes("GOVERNANCE_TIMELOCK: deployer EOA holds timelock EXECUTOR_ROLE"));
+        _expectRevert(bytes("GOVERNANCE_TIMELOCK: deployer EOA holds EXECUTOR_ROLE"));
         s.deployWith(SENDER, address(weak), address(ms), address(kyc), address(membership));
         weak.renounceRole(weak.EXECUTOR_ROLE(), SENDER);
         vm.stopPrank();
@@ -526,7 +526,7 @@ contract DeployDormantLedgersTest is Test {
         DeployDormantLedgers s = _dormant();
         string memory book = s.bookJson(SENDER, address(weak), gov.governanceMultisig, d);
         CheckDeployedAdmins c = _gate();
-        _expectRevert(bytes("CheckDeployedAdmins: deployer EOA holds governance/owner/DEFAULT_ADMIN (see log)"));
+        _expectRevert(bytes("CheckDeployedAdmins: deployer EOA holds a privileged slot (see log)"));
         c.check(book, false);
     }
 
@@ -1056,7 +1056,7 @@ contract DeployDormantLedgersTest is Test {
             '"},"aaStack":{}}'
         );
         CheckDeployedAdmins c = _gate();
-        _expectRevert(bytes("CheckDeployedAdmins: deployer EOA holds governance/owner/DEFAULT_ADMIN (see log)"));
+        _expectRevert(bytes("CheckDeployedAdmins: deployer EOA holds a privileged slot (see log)"));
         c.check(book, false);
     }
 

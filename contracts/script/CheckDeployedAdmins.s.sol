@@ -53,6 +53,13 @@ import {P256} from "../src/aa/lib/webauthn/P256.sol";
 ///         / proposalTtl, at its CREATE2 address under the salt "Genesis.<P>Multisig"
 ///         (AdminChecks `_multisigProposerProblem`). GATE: must be 0.
 ///
+///         GENESIS-CHAIN MODE (r1006: the contracts are in block 0, so there is no role-grant
+///         event history): the TIMELOCK-HOLDERS invariant is proved from state instead
+///         (AdminChecks `_timelockHolderStateProblem`): expected holders hold, no other known
+///         account (books, deployer, factory) does, and every non-zero storage slot of the
+///         timelock in the block-0 allocation (env GENESIS_ALLOC) is accounted for. Auto-detected
+///         (code at block 0) or forced with GENESIS_CHAIN=1. The guardian veto check uses the same.
+///
 ///         GENESIS-FLOOR (chain 40204, as reported by the node; GenesisProfile): every book's
 ///         C4 genesis councils are re-checked ON CHAIN against the genesis floors, from the
 ///         deployed contracts, not from the book's params: GovernanceTimelock minDelay >= 48 h,
@@ -107,6 +114,13 @@ contract CheckDeployedAdmins is GenesisProfile {
         // from the book(s) that list it, verified on chain before any timelock is swept.
         delete cancellerTimelocks;
         delete cancellerOf;
+        // Genesis-chain mode's known accounts: every address in this run's books, the deployer.
+        delete genesisKnown;
+        genesisKnown.push(deployer);
+        _collectKnown(json);
+        for (uint256 i = 0; i < extras.length; i++) {
+            _collectKnown(extras[i]);
+        }
         _registerGuardianCanceller(json);
         for (uint256 i = 0; i < extras.length; i++) {
             _registerGuardianCanceller(extras[i]);
@@ -325,6 +339,17 @@ contract CheckDeployedAdmins is GenesisProfile {
             }
         }
         return new address[](0);
+    }
+
+    function _collectKnown(string memory json) internal {
+        string[2] memory sections = [".contracts", ".aaStack"];
+        for (uint256 s = 0; s < 2; s++) {
+            if (!vm.keyExistsJson(json, sections[s])) continue;
+            string[] memory names = vm.parseJsonKeys(json, sections[s]);
+            for (uint256 i = 0; i < names.length; i++) {
+                genesisKnown.push(vm.parseJsonAddress(json, string.concat(sections[s], ".", names[i])));
+            }
+        }
     }
 
     function _holderFail(string memory problem) internal {

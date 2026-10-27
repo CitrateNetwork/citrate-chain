@@ -137,19 +137,27 @@ if o:
     book["contracts"]["OrangeSeedV0"] = o["implementation"]
 json.dump(book, open(sys.argv[3], "w"), indent=2)
 PY
-# The admin sweep reads role STATE (hasRole, owner, admin slots) and role HISTORY (events).
-# A genesis chain has no events: its contracts were never deployed by a transaction, so the
-# history-based lines (TIMELOCK-HOLDERS, GENESIS-FLOOR's veto lookup) have nothing to read
-# here. They passed at P5 on the devnet, and compare_rpc above proved every storage slot of
-# every contract identical to that devnet, so the role state they protect is the same. The
-# gate here is the state-based handover: FACTORY-ADMIN 0 and DEPLOYER-ADMIN 0 on the r1006 node.
+# The admin sweep, in genesis-chain mode: the contracts are in block 0, so the timelock role
+# holder sets are proved from state (CheckDeployedAdmins / AdminChecks genesis-chain mode)
+# against the block-0 allocation in GENESIS_ALLOC. Every class must be 0 and the script must
+# pass: nothing is waived.
+python3 - "$ALLOC" "$V/genesis-alloc.json" <<'PY'
+import json, sys
+a = json.load(open(sys.argv[1]))
+json.dump({"alloc": {x["address"]: {"code": x.get("code", "0x"), "storage": x.get("storage", {})}
+                     for x in a["accounts"] if x.get("code")}}, open(sys.argv[2], "w"))
+PY
+cp "$V/genesis-alloc.json" "$REPO/contracts/genesis/genesis-alloc.json"
+CODE0=$(cast code "$(jq -r '.contracts.GovernanceTimelock' "$REPO/contracts/genesis/p5-admin-book.json")" --block 0 --rpc-url "$R06")
+[[ "$CODE0" != 0x && -n "$CODE0" ]] || die "the GovernanceTimelock has no code at block 0 (genesis-chain mode would not auto-detect)"
 (cd "$REPO/contracts" && FOUNDRY_OFFLINE=true ADDRESS_BOOK=genesis/p5-admin-book.json REQUIRE_ALL_CODE=true \
-  forge script script/CheckDeployedAdmins.s.sol --rpc-url "$R06") >"$V/admins.log" 2>&1 || true
-grep -E 'FACTORY-ADMIN failures|DEPLOYER-ADMIN failures|NO-CODE entries|TIMELOCK-HOLDERS failures|GENESIS-FLOOR failures' "$V/admins.log" | sed 's/^ */  /'
-grep -q 'FACTORY-ADMIN failures: 0' "$V/admins.log" || die "FACTORY-ADMIN is not 0 on the r1006 node (see $V/admins.log)"
-grep -q 'DEPLOYER-ADMIN failures: 0' "$V/admins.log" || die "DEPLOYER-ADMIN is not 0 on the r1006 node (see $V/admins.log)"
-grep -q 'NO-CODE entries (reported): 0' "$V/admins.log" || die "a book entry has no code on the r1006 node (see $V/admins.log)"
-log "admins: FACTORY-ADMIN 0, DEPLOYER-ADMIN 0, NO-CODE 0 on the r1006 node (history-based lines: no events at genesis, see the comment)"
+  GENESIS_ALLOC=genesis/genesis-alloc.json forge script script/CheckDeployedAdmins.s.sol --rpc-url "$R06") \
+  >"$V/admins.log" 2>&1 || { grep -E 'failures|TIMELOCK-HOLDERS|GENESIS-FLOOR|DEPLOYER-ADMIN|FACTORY-ADMIN' "$V/admins.log" | tail -12; die "CheckDeployedAdmins failed against the r1006 node (see $V/admins.log)"; }
+grep -E '^  (FACTORY-ADMIN|DEPLOYER-ADMIN|TIMELOCK-HOLDERS|GENESIS-FLOOR) failures|NO-CODE entries' "$V/admins.log" | sed 's/^ */  /'
+for c in FACTORY-ADMIN DEPLOYER-ADMIN TIMELOCK-HOLDERS GENESIS-FLOOR; do
+  grep -q "$c failures: 0" "$V/admins.log" || die "$c is not 0 on the r1006 node (see $V/admins.log)"
+done
+log "admins (genesis-chain mode): FACTORY-ADMIN 0, DEPLOYER-ADMIN 0, TIMELOCK-HOLDERS 0, GENESIS-FLOOR 0 on the r1006 node"
 
 NOTE_LEN=$(cast storage 0x000000000000000000000000000000c17a7e1006 0 --rpc-url "$R06")
 log "genesis note slot 0 = $NOTE_LEN"

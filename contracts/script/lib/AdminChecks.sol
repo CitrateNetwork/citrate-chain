@@ -582,6 +582,9 @@ abstract contract AdminChecks {
         if (timelock.codehash != keccak256(type(TimelockController).runtimeCode)) {
             return "runtime code is not this build's OZ TimelockController";
         }
+        // A chain whose contracts are in block 0 (r1006: genesis from ceremony state) has no
+        // role-grant events: the same invariant is proved from state instead.
+        if (_genesisChainMode(timelock)) return _timelockHolderStateProblem(timelock, council, extraCancellers);
         (bool ok, string memory why, RoleEvent[] memory events) = _timelockRoleHistory(timelock);
         if (!ok) return why;
         (string memory problem, TimelockHolders memory h) = _timelockHolders(timelock, events);
@@ -604,6 +607,162 @@ abstract contract AdminChecks {
         }
         if (!councilCancels) return "the multisig lacks CANCELLER_ROLE";
         return "";
+    }
+
+    // ---- Genesis-chain mode: role holders from STATE (no event history at block 0) ----
+    //
+    // On a chain whose contracts were placed in block 0 (r1006's genesis from ceremony state)
+    // there are no RoleGranted / RoleRevoked logs to rebuild the holder sets from. The same
+    // invariant (each role held by exactly its expected accounts) is then proved from state:
+    //   1. every expected holder holds its role (hasRole);
+    //   2. no other KNOWN account does (every address in this run's books, the deployer, the
+    //      CREATE2 factory: `genesisKnown`, filled by the caller);
+    //   3. completeness: every non-zero storage slot of the timelock in the block-0 allocation
+    //      (GENESIS_ALLOC, `{"alloc":{"<addr>":{"storage":{...}}}}`) is accounted for: an
+    //      expected holder's `_roles[role].hasRole[holder]` slot, or `_minDelay` equal to
+    //      getMinDelay(); a holder outside the expected set, a changed role admin or a scheduled
+    //      operation leaves an unexplained slot and fails. Each slot is also re-read from the
+    //      chain, so the allocation must be this chain's state.
+    //   For an AccessControlEnumerable timelock, the member lists are enumerated and compared
+    //   exactly as well.
+    // Mode: GENESIS_CHAIN=1 forces it, =0 disables it; otherwise it is on when the node has
+    // code for the timelock at block 0 (eth_getCode at 0x0).
+
+    /// Accounts the genesis-chain holder check sweeps for unexpected roles (see above).
+    address[] internal genesisKnown;
+
+    /// @dev Virtual only so `forge test` can set the mode and the allocation without the
+    ///      process-wide environment; scripts never override them.
+    function _genesisChainMode(address target) internal virtual returns (bool) {
+        string memory flag = HISTORY_VM.envOr("GENESIS_CHAIN", string(""));
+        if (keccak256(bytes(flag)) == keccak256("1")) return true;
+        if (keccak256(bytes(flag)) == keccak256("0")) return false;
+        string memory params = string.concat('["', HISTORY_VM.toString(target), '","0x0"]');
+        try HISTORY_VM.rpc("eth_getCode", params) returns (bytes memory code) {
+            return code.length > 0;
+        } catch {
+            return false;
+        }
+    }
+
+    function _genesisAllocPath() internal virtual returns (string memory) {
+        return HISTORY_VM.envOr("GENESIS_ALLOC", string(""));
+    }
+
+    function _contains(address[] memory set, address a) private pure returns (bool) {
+        for (uint256 i = 0; i < set.length; i++) {
+            if (set[i] == a) return true;
+        }
+        return false;
+    }
+
+    function _roleSlot(bytes32 role, address holder) private pure returns (bytes32) {
+        // OZ AccessControl: mapping(bytes32 => RoleData) _roles at slot 0; RoleData.hasRole first.
+        return keccak256(abi.encode(holder, keccak256(abi.encode(role, uint256(0)))));
+    }
+
+    function _timelockHolderStateProblem(address timelock, address council, address[] memory extraCancellers)
+        internal
+        returns (string memory)
+    {
+        bytes32[4] memory roles =
+            [DEFAULT_ADMIN_ROLE, TIMELOCK_PROPOSER_ROLE, TIMELOCK_EXECUTOR_ROLE, TIMELOCK_CANCELLER_ROLE];
+        string[4] memory names = ["DEFAULT_ADMIN_ROLE", "PROPOSER_ROLE", "EXECUTOR_ROLE", "CANCELLER_ROLE"];
+        address[] memory cancellers = new address[](1 + extraCancellers.length);
+        cancellers[0] = council;
+        for (uint256 i = 0; i < extraCancellers.length; i++) {
+            cancellers[i + 1] = extraCancellers[i];
+        }
+        for (uint256 r = 0; r < 4; r++) {
+            address[] memory want = _expectedHolders(r, timelock, council, cancellers);
+            for (uint256 i = 0; i < want.length; i++) {
+                (bool ok, bool has) =
+                    _readBool(timelock, abi.encodeWithSignature("hasRole(bytes32,address)", roles[r], want[i]));
+                if (!ok || !has) return string.concat(names[r], ": an expected holder does not hold it");
+            }
+            // AccessControlEnumerable: the member list must be exactly the expected set.
+            (bool okN, uint256 n) =
+                _readUint256(timelock, abi.encodeWithSignature("getRoleMemberCount(bytes32)", roles[r]));
+            if (okN) {
+                if (n != want.length) return string.concat(names[r], ": the enumerated member count is not the expected set's");
+                for (uint256 i = 0; i < n; i++) {
+                    (bool okM, address m) =
+                        _readAddress(timelock, abi.encodeWithSignature("getRoleMember(bytes32,uint256)", roles[r], i));
+                    if (!okM || !_contains(want, m)) return string.concat(names[r], ": an enumerated member is not expected");
+                }
+            }
+            address[] memory known = genesisKnown;
+            for (uint256 i = 0; i <= known.length; i++) {
+                address k = i < known.length ? known[i] : ARACHNID_FACTORY;
+                if (_contains(want, k)) continue;
+                (bool ok, bool has) =
+                    _readBool(timelock, abi.encodeWithSignature("hasRole(bytes32,address)", roles[r], k));
+                if (ok && has) return string.concat(names[r], " is held by an account other than the expected set");
+            }
+        }
+        return _timelockAllocCompleteness(timelock, council, cancellers);
+    }
+
+    function _expectedHolders(uint256 r, address timelock, address council, address[] memory cancellers)
+        private
+        pure
+        returns (address[] memory want)
+    {
+        if (r == 3) return cancellers;
+        want = new address[](1);
+        want[0] = r == 0 ? timelock : council;
+    }
+
+    function _timelockAllocCompleteness(address timelock, address council, address[] memory cancellers)
+        internal
+        returns (string memory)
+    {
+        string memory path = _genesisAllocPath();
+        if (bytes(path).length == 0) {
+            return "genesis-chain mode needs GENESIS_ALLOC (the block-0 allocation) to prove the holder sets complete";
+        }
+        string memory alloc = HISTORY_VM.readFile(path);
+        string memory key =
+            string.concat(".alloc.", HISTORY_VM.toLowercase(HISTORY_VM.toString(timelock)), ".storage");
+        if (!HISTORY_VM.keyExistsJson(alloc, key)) return "the timelock's storage is not in GENESIS_ALLOC";
+        string[] memory slots = HISTORY_VM.parseJsonKeys(alloc, key);
+        (bool okD, uint256 minDelay) = _readUint256(timelock, abi.encodeWithSignature("getMinDelay()"));
+        if (!okD) return "cannot read getMinDelay()";
+        for (uint256 i = 0; i < slots.length; i++) {
+            bytes32 k = HISTORY_VM.parseBytes32(slots[i]);
+            bytes32 v = HISTORY_VM.parseJsonBytes32(alloc, string.concat(key, ".", slots[i]));
+            if (HISTORY_VM.load(timelock, k) != v) return "GENESIS_ALLOC disagrees with the chain's state of the timelock";
+            if (v == bytes32(0)) continue;
+            if (!_slotExplained(k, v, timelock, council, cancellers, minDelay)) {
+                return "an unaccounted storage slot (a role holder outside the expected set, a changed role admin, or a scheduled operation)";
+            }
+        }
+        return "";
+    }
+
+    function _slotExplained(
+        bytes32 k,
+        bytes32 v,
+        address timelock,
+        address council,
+        address[] memory cancellers,
+        uint256 minDelay
+    ) private pure returns (bool) {
+        if (k == bytes32(uint256(2))) return uint256(v) == minDelay; // TimelockController._minDelay
+        if (uint256(v) != 1) return false;
+        if (k == _roleSlot(DEFAULT_ADMIN_ROLE, timelock)) return true;
+        if (k == _roleSlot(TIMELOCK_PROPOSER_ROLE, council)) return true;
+        if (k == _roleSlot(TIMELOCK_EXECUTOR_ROLE, council)) return true;
+        for (uint256 i = 0; i < cancellers.length; i++) {
+            if (k == _roleSlot(TIMELOCK_CANCELLER_ROLE, cancellers[i])) return true;
+        }
+        return false;
+    }
+
+    function _readUint256(address target, bytes memory cd) private view returns (bool ok, uint256 value) {
+        (bool success, bytes memory ret) = target.staticcall(cd);
+        if (!success || ret.length != 32) return (false, 0);
+        return (true, abi.decode(ret, (uint256)));
     }
 
     /// @notice Revert unless `_timelockHolderProblem` is empty (see there).
