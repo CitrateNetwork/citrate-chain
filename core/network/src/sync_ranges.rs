@@ -1644,4 +1644,68 @@ mod tests {
         assert_eq!(p.first().map(|r| r.0.clone()), Some(pid("b")));
         assert_eq!(s.counters().backoffs, 0);
     }
+
+    /// A range two peers failed because its anchor was bad: once the anchor
+    /// is dropped, the peers that failed it on that anchor are not held
+    /// against it, so it is asked again at once and reaches the other peer.
+    #[test]
+    fn dropping_a_bad_anchor_forgets_who_failed_the_range() {
+        let mut s = RangeScheduler::new(RangeConfig {
+            max_in_flight: 1,
+            ..RangeConfig::default()
+        });
+        let now = Instant::now();
+        let ps = peers(&["liar", "honest"], 10_000);
+        s.plan(now, 10, h(10), &ps);
+        s.in_flight.clear();
+        let bogus: Vec<(u64, Hash)> = (11..=200).map(|n| (n, Hash::new([n as u8; 32]))).collect();
+        s.on_headers(&pid("liar"), &bogus);
+        // Both peers answer the range anchored on the bad header with nothing.
+        for expect in ["liar", "honest"] {
+            let p = blocks_of(&s.plan(now, 10, h(10), &ps).requests);
+            assert_eq!(p, vec![(pid(expect), 11, 11, 42)]);
+            s.on_blocks(&pid(expect), None, &[]);
+        }
+        assert_eq!(s.counters().anchor_evictions, 1);
+        // The range falls back to the tip and is asked again at once ...
+        let p = blocks_of(&s.plan(now, 10, h(10), &ps).requests);
+        assert_eq!(
+            p,
+            vec![(pid("liar"), 10, 11, 41)],
+            "held after the anchor drop"
+        );
+        s.on_blocks(&pid("liar"), None, &[]);
+        // ... and, the liar having failed it again, the honest peer gets it.
+        let p = blocks_of(&s.plan(now, 10, h(10), &ps).requests);
+        assert_eq!(p, vec![(pid("honest"), 10, 11, 41)]);
+        assert_eq!(s.counters().backoffs, 0);
+    }
+
+    /// While the front range is held, nothing above it is planned.
+    #[test]
+    fn nothing_above_a_held_range_is_planned() {
+        let mut s = RangeScheduler::new(RangeConfig {
+            max_in_flight: 1,
+            ..RangeConfig::default()
+        });
+        let now = Instant::now();
+        let ps = peers(&["a", "b"], 10_000);
+        s.plan(now, 0, h(0), &ps);
+        s.in_flight.clear();
+        // Anchors above the front range only, so the front range is
+        // tip-anchored and its failures never evict an anchor.
+        s.on_headers(&pid("a"), &headers(32, 300));
+        for expect in ["a", "b"] {
+            let p = blocks_of(&s.plan(now, 0, h(0), &ps).requests);
+            assert_eq!(p, vec![(pid(expect), 0, 1, 31)]);
+            s.on_blocks(&pid(expect), None, &[]);
+        }
+        let plan = s.plan(now, 0, h(0), &ps);
+        assert_eq!(s.counters().backoffs, 1, "the front range is held");
+        assert!(
+            blocks_of(&plan.requests).is_empty(),
+            "planned above a held range: {:?}",
+            blocks_of(&plan.requests)
+        );
+    }
 }

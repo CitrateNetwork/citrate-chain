@@ -770,6 +770,8 @@ mod tests {
         /// DGX-REVIEW: headers from a valid side branch (alt store); block
         /// requests from an alt anchor answered from the alt store.
         StaleBranch,
+        /// DGX-REVIEW-2: random hash for every header; every GetBlocks empty.
+        AnchorLiarEmpty,
     }
 
     /// `block` moved onto a parent nobody holds and re-signed by `key`.
@@ -927,6 +929,7 @@ mod tests {
                                 }
                                 out
                             }
+                            Behaviour::AnchorLiarEmpty => Vec::new(),
                             Behaviour::StaleBranch => {
                                 match alt
                                     .as_ref()
@@ -1023,6 +1026,18 @@ mod tests {
                                 hs
                             }
                             Behaviour::EmptyOrSilent => Vec::new(),
+                            Behaviour::AnchorLiarEmpty => {
+                                let mut hs = block_serve::serve_headers(&storage, &from, count);
+                                for h in &mut hs {
+                                    let mut r = [0u8; 32];
+                                    r[..8].copy_from_slice(&h.height.to_be_bytes());
+                                    r[8..16].copy_from_slice(&hk.to_be_bytes());
+                                    r[31] = 0x55;
+                                    h.block_hash = Hash::new(r);
+                                }
+                                hk += 1;
+                                hs
+                            }
                             Behaviour::HeaderLiar => {
                                 let mut hs = block_serve::serve_headers(&storage, &from, count);
                                 for h in &mut hs {
@@ -1625,5 +1640,179 @@ mod tests {
             c.retries > 0,
             "faulty peer's ranges were never re-requested"
         );
+    }
+    /// Did the request side get woken since the last check?
+    async fn woken(wake: &Notify) -> bool {
+        tokio::time::timeout(Duration::from_millis(100), wake.notified())
+            .await
+            .is_ok()
+    }
+
+    /// The request side is woken when an answer delivers part of a range or
+    /// admission admits a block, and only then: an empty answer, or one that
+    /// admits nothing, waits for the tick.
+    #[tokio::test]
+    async fn the_request_side_wakes_only_on_progress() {
+        let chain = build_chain(40).await;
+        let node_dir = tempfile::tempdir().expect("tempdir");
+        let f = follower(&chain, node_dir.path()).await;
+        let wake = f.driver.wake_handle();
+        let pid = PeerId("p".into());
+        let g = chain.genesis.header.block_hash;
+        let slot = [PeerSlot::new(pid.clone(), 40)];
+        // A range in flight to p, anchored on the applied tip (genesis).
+        let plan = f.driver.sync().plan_ranges(Instant::now(), 0, g, &slot);
+        assert!(plan
+            .requests
+            .iter()
+            .any(|r| matches!(r, SyncRequest::Blocks { .. })));
+        assert!(!woken(&wake).await);
+
+        // Empty answer: no wake, and admitting it admits nothing: no wake.
+        let r = f.driver.receive_blocks(&pid, Vec::new()).await;
+        assert!(!woken(&wake).await, "woken by an empty answer");
+        let mut orphans = Vec::new();
+        f.driver
+            .admit_received(&f.admission, &f.storage, &mut orphans, r, 40, |_| {})
+            .await;
+        assert!(
+            !woken(&wake).await,
+            "woken by an admission that admitted nothing"
+        );
+
+        // A delivering answer (from q, which has not failed the range) wakes
+        // it, and so does admitting it.
+        let q = PeerId("q".into());
+        let both = [PeerSlot::new(pid.clone(), 40), PeerSlot::new(q.clone(), 40)];
+        f.driver.sync().plan_ranges(Instant::now(), 0, g, &both);
+        let mut blocks = vec![chain.genesis.clone()];
+        blocks.extend(chain.blocks[..31].iter().cloned());
+        let r = f.driver.receive_blocks(&q, blocks).await;
+        assert!(matches!(
+            r.matched,
+            BlocksMatch::Range {
+                delivered_through: 31,
+                ..
+            }
+        ));
+        assert!(woken(&wake).await, "not woken by a delivery");
+        f.driver
+            .admit_received(&f.admission, &f.storage, &mut orphans, r, 40, |_| {})
+            .await;
+        assert!(woken(&wake).await, "not woken by an admission");
+    }
+
+    /// `bad` peers first, then `honest` honest ones, for at most `secs`.
+    /// With `pin_first`, peer-a0's standing is held at the top of the ranking
+    /// (as for a peer that earns credit some other way), so it is always the
+    /// first choice. Returns (applied, secs).
+    async fn catch_up_against(
+        n: u64,
+        bad: &[Behaviour],
+        honest: usize,
+        pin_first: bool,
+        secs: u64,
+    ) -> (u64, f64) {
+        let chain = build_chain(n).await;
+        let serve_dir = tempfile::tempdir().expect("tempdir");
+        let serving = store_with(&chain, serve_dir.path());
+        let node_dir = tempfile::tempdir().expect("tempdir");
+        let f = follower(&chain, node_dir.path()).await;
+        let (in_tx, in_rx) = mpsc::channel::<(PeerId, NetworkMessage)>(4096);
+        let wire = Arc::new(std::sync::Mutex::new(Wire::default()));
+        let mut peers = Vec::new();
+        for (i, b) in bad.iter().enumerate() {
+            peers.push(spawn_peer_alt(
+                &format!("peer-a{i}"),
+                *b,
+                n,
+                serving.clone(),
+                None,
+                in_tx.clone(),
+                wire.clone(),
+            ));
+        }
+        for i in 0..honest {
+            peers.push(spawn_peer(
+                &format!("peer-z{i}"),
+                Behaviour::Honest,
+                n,
+                serving.clone(),
+                in_tx.clone(),
+                wire.clone(),
+            ));
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pinner = pin_first.then(|| {
+            let sel = f.driver.selector.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    for _ in 0..4 {
+                        sel.lock()
+                            .await
+                            .record_serve("peer-a0", 32, 1_000_000, 1, 32, false);
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+        });
+        let out = run_sync(&f, peers, in_rx, n, Duration::from_secs(secs)).await;
+        stop.store(true, Ordering::Relaxed);
+        if let Some(p) = pinner {
+            let _ = p.await;
+        }
+        let w = wire.lock().expect("wire");
+        println!(
+            "SYNCBENCH {bad:?}+{honest} pin={pin_first} n={n} applied={} secs={:.1} \
+             get_blocks={} get_headers={} faulty_get_blocks={} scheduler={:?}",
+            out.applied,
+            out.secs,
+            w.get_blocks,
+            w.get_headers,
+            w.faulty_get_blocks,
+            f.driver.sync().range_counters()
+        );
+        if out.applied == n {
+            let tip = chain.blocks.last().expect("non-empty chain");
+            assert_eq!(f.executor.calculate_state_root(), tip.state_root);
+        }
+        (out.applied, out.secs)
+    }
+
+    fn adversarial_deadline(n: u64) -> u64 {
+        (n as f64 / min_blocks_per_sec() * 1.5 + 10.0) as u64
+    }
+
+    /// The top-ranked peer answers headers with hashes nobody holds and block
+    /// requests with nothing. After its anchors are dropped, the honest peer
+    /// must be asked for those ranges again, and catch-up completes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catch_up_completes_when_the_top_ranked_peer_sends_bad_anchors_and_no_blocks() {
+        let n = env_u64("CITRATE_SYNC_TEST_ADV_BLOCKS", 1_500);
+        let (applied, secs) = catch_up_against(
+            n,
+            &[Behaviour::AnchorLiarEmpty],
+            1,
+            true,
+            adversarial_deadline(n),
+        )
+        .await;
+        assert_eq!(applied, n, "stopped at {applied} of {n} after {secs:.0}s");
+    }
+
+    /// Two such peers, ranking left alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catch_up_completes_past_two_peers_sending_bad_anchors_and_no_blocks() {
+        let n = env_u64("CITRATE_SYNC_TEST_ADV_BLOCKS", 1_500);
+        let (applied, secs) = catch_up_against(
+            n,
+            &[Behaviour::AnchorLiarEmpty, Behaviour::AnchorLiarEmpty],
+            1,
+            false,
+            adversarial_deadline(n),
+        )
+        .await;
+        assert_eq!(applied, n, "stopped at {applied} of {n} after {secs:.0}s");
     }
 }
