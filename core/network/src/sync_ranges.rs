@@ -54,6 +54,12 @@
 // Peers whose answers proved a wrong anchor, or whose delivered range never
 // applied, are reported in `Plan::misbehaved` for the caller to charge.
 //
+// BACKOFF. A range that every eligible peer has failed (empty, nothing new,
+// non-linking, timed out) is not asked again at once: it waits
+// `retry_backoff`, doubling on each further round up to `retry_backoff_max`.
+// At the tip, or on a branch no peer serves, every answer brings nothing, and
+// without this the request rate is bounded only by the peers' round trip.
+//
 // NOTHING HERE DECIDES VALIDITY. The scheduler only decides what to ask for and
 // from whom. Every block still goes through `SyncManager::handle_blocks`
 // (hash, signature, tx_root, timestamp) and then admission and execution,
@@ -92,6 +98,11 @@ pub struct RangeConfig {
     /// After a header answer that adds no anchor (or a header request that
     /// timed out), wait this long before the next `GetHeaders`.
     pub header_backoff: Duration,
+    /// Once every eligible peer has failed a range, wait this long before
+    /// asking again; doubles per further round.
+    pub retry_backoff: Duration,
+    /// Cap on the per-range backoff.
+    pub retry_backoff_max: Duration,
 }
 
 impl Default for RangeConfig {
@@ -105,6 +116,8 @@ impl Default for RangeConfig {
             header_count: 128,
             stall_timeout: Duration::from_secs(30),
             header_backoff: Duration::from_secs(1),
+            retry_backoff: Duration::from_millis(500),
+            retry_backoff_max: Duration::from_secs(8),
         }
     }
 }
@@ -238,6 +251,8 @@ pub struct RangeCounters {
     pub anchor_evictions: u64,
     /// Delivered ranges dropped because admission refused their blocks.
     pub rejected_ranges: u64,
+    /// Times a range was held back because every eligible peer had failed it.
+    pub backoffs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +286,9 @@ pub struct RangeScheduler {
     delivered: BTreeMap<u64, (u64, PeerId)>,
     /// start -> peers that failed that range.
     avoid: HashMap<u64, Vec<PeerId>>,
+    /// start -> (not before, current backoff) for a range every eligible
+    /// peer has failed. See `RangeConfig::retry_backoff`.
+    retry: HashMap<u64, (Option<Instant>, Duration)>,
     /// Ranges requested at least once (for the retry counter).
     requested_once: BTreeSet<u64>,
     header_req: Option<HeaderReq>,
@@ -299,6 +317,7 @@ impl RangeScheduler {
             in_flight: BTreeMap::new(),
             delivered: BTreeMap::new(),
             avoid: HashMap::new(),
+            retry: HashMap::new(),
             requested_once: BTreeSet::new(),
             header_req: None,
             header_avoid: Vec::new(),
@@ -350,6 +369,7 @@ impl RangeScheduler {
             self.in_flight.clear();
             self.delivered.clear();
             self.avoid.clear();
+            self.retry.clear();
             self.requested_once.clear();
             self.header_req = None;
             self.last_progress = Some(now);
@@ -372,6 +392,7 @@ impl RangeScheduler {
             .map(|(start, d)| (start.max(keep_from), d))
             .collect();
         self.avoid.retain(|start, _| *start > applied);
+        self.retry.retain(|start, _| *start > applied);
         self.requested_once = self.requested_once.split_off(&keep_from);
         // In-flight ranges below the tip are left to resolve (or time out) on
         // their own: their answer is harmless and dropping them here would
@@ -580,6 +601,7 @@ impl RangeScheduler {
             // Peer: preference order, head at or above `start`, under the
             // per-peer cap, not one that already failed this range.
             let mut pick = None;
+            let mut repeat = false;
             for pass in 0..2 {
                 let avoid: &[PeerId] = if pass == 0 {
                     self.avoid.get(&start).map(Vec::as_slice).unwrap_or(&[])
@@ -596,10 +618,17 @@ impl RangeScheduler {
                         && self.in_flight_to(&p.id) < cap
                 });
                 if pick.is_some() {
+                    repeat = pass == 1;
                     break;
                 }
             }
             let Some(peer) = pick else { break };
+            // Every eligible peer has already failed this range: back off,
+            // and plan nothing above it meanwhile (blocks above a range nobody
+            // can serve cannot be applied anyway).
+            if repeat && !self.retry_due(start, now) {
+                break;
+            }
 
             if self.overlaps_existing(start, end) {
                 self.counters.duplicate_requests =
@@ -636,6 +665,33 @@ impl RangeScheduler {
         }
         plan.misbehaved = std::mem::take(&mut self.misbehaved);
         plan
+    }
+
+    /// May the range at `start`, which every eligible peer has failed, be
+    /// asked again now? The first time it is not: a backoff starts (or
+    /// doubles, up to the cap). Once the backoff has passed it may, once; the
+    /// next failure starts the next, longer backoff.
+    fn retry_due(&mut self, start: u64, now: Instant) -> bool {
+        let base = self.cfg.retry_backoff;
+        let max = self.cfg.retry_backoff_max;
+        let entry = self.retry.entry(start).or_insert((None, Duration::ZERO));
+        match entry.0 {
+            Some(at) if now >= at => {
+                entry.0 = None;
+                true
+            }
+            Some(_) => false,
+            None => {
+                let next = if entry.1.is_zero() {
+                    base
+                } else {
+                    entry.1.saturating_mul(2).min(max)
+                };
+                *entry = (now.checked_add(next), next);
+                self.counters.backoffs = self.counters.backoffs.saturating_add(1);
+                false
+            }
+        }
     }
 
     /// Queue `peer` for the next `Plan::misbehaved` (bounded, de-duplicated).
@@ -785,6 +841,7 @@ impl RangeScheduler {
             through = through.saturating_add(1);
         }
         if through >= start {
+            self.retry.remove(&start);
             self.delivered.insert(start, (through, peer.clone()));
             if through < req.end {
                 self.counters.short_responses = self.counters.short_responses.saturating_add(1);
@@ -1211,10 +1268,17 @@ mod tests {
         let ps = peers(&["a"], 10_000);
         s.plan(t0, 0, h(0), &ps);
         s.on_blocks(&pid("a"), Some(0), &chain(1, 31));
-        // Applied tip never moves: after the stall timeout 1..=31 is asked again.
-        let b = blocks_of(&s.plan(t0 + Duration::from_secs(31), 0, h(0), &ps).requests);
-        assert_eq!(b, vec![(pid("a"), 0, 1, 31)]);
+        // Applied tip never moves: after the stall timeout 1..=31 is asked
+        // again. The only peer is the one whose delivery stalled, so it is
+        // asked after the retry hold.
+        let stalled = t0 + Duration::from_secs(31);
+        assert!(blocks_of(&s.plan(stalled, 0, h(0), &ps).requests).is_empty());
         assert_eq!(s.counters().stall_resets, 1);
+        let b = blocks_of(
+            &s.plan(stalled + RangeConfig::default().retry_backoff, 0, h(0), &ps)
+                .requests,
+        );
+        assert_eq!(b, vec![(pid("a"), 0, 1, 31)]);
     }
 
     #[test]
@@ -1523,5 +1587,61 @@ mod tests {
         let plan = s.plan(now, 0, h(0), &ps);
         assert!(plan.misbehaved.is_empty());
         assert_eq!(blocks_of(&plan.requests), vec![(pid("a"), 0, 1, 31)]);
+    }
+
+    /// Once every eligible peer has failed a range it is held back, the hold
+    /// doubles each round up to the cap, and nothing above it is planned
+    /// meanwhile. A delivery clears it.
+    #[test]
+    fn a_range_every_peer_failed_backs_off_doubling_to_the_cap() {
+        let cfg = RangeConfig::default();
+        let mut s = RangeScheduler::new(cfg.clone());
+        let t0 = Instant::now();
+        let ps = peers(&["a", "b"], 10_000);
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        // Both peers answer the tip-anchored range with nothing.
+        let p = blocks_of(&s.plan(t0, 0, h(0), &ps).requests);
+        assert_eq!(p, vec![(pid("a"), 0, 1, 31)]);
+        s.on_blocks(&pid("a"), None, &[]);
+        let p = blocks_of(&s.plan(t0, 0, h(0), &ps).requests);
+        assert_eq!(p, vec![(pid("b"), 0, 1, 31)]);
+        s.on_blocks(&pid("b"), None, &[]);
+        // Everyone failed it: held for retry_backoff, then asked once.
+        let mut at = 0u64;
+        let mut hold = cfg.retry_backoff.as_millis() as u64;
+        let cap = cfg.retry_backoff_max.as_millis() as u64;
+        for round in 0..8 {
+            assert!(
+                blocks_of(&s.plan(ms(at), 0, h(0), &ps).requests).is_empty(),
+                "round {round}: asked again without a hold"
+            );
+            assert!(blocks_of(&s.plan(ms(at + hold - 1), 0, h(0), &ps).requests).is_empty());
+            let p = blocks_of(&s.plan(ms(at + hold), 0, h(0), &ps).requests);
+            assert_eq!(p.len(), 1, "round {round}: one request after the hold");
+            s.on_blocks(&p[0].0, None, &[]);
+            at += hold;
+            hold = (hold * 2).min(cap);
+        }
+        assert_eq!(hold, cap);
+        assert_eq!(s.counters().backoffs, 8);
+        // A delivery clears the hold.
+        assert!(blocks_of(&s.plan(ms(at), 0, h(0), &ps).requests).is_empty());
+        let p = blocks_of(&s.plan(ms(at + cap), 0, h(0), &ps).requests);
+        s.on_blocks(&p[0].0, Some(0), &chain(0, 31));
+        assert!(!s.retry.contains_key(&1));
+    }
+
+    /// Only the range everyone failed is held: a range another peer has not
+    /// tried yet is reassigned at once.
+    #[test]
+    fn a_range_with_an_untried_peer_is_reassigned_without_a_hold() {
+        let mut s = RangeScheduler::new(RangeConfig::default());
+        let now = Instant::now();
+        let ps = peers(&["a", "b", "c"], 10_000);
+        s.plan(now, 0, h(0), &ps);
+        s.on_blocks(&pid("a"), None, &[]);
+        let p = blocks_of(&s.plan(now, 0, h(0), &ps).requests);
+        assert_eq!(p.first().map(|r| r.0.clone()), Some(pid("b")));
+        assert_eq!(s.counters().backoffs, 0);
     }
 }

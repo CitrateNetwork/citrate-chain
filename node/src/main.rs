@@ -3265,6 +3265,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 let attested = attested_for_rx.clone();
                 tokio::spawn(async move {
                     let mut orphan_blocks: Vec<citrate_consensus::types::Block> = Vec::new();
+                    // At most 10 SYNCSCORE lines a minute: an idle node whose
+                    // peers have nothing new answers every request this way.
+                    let score_log = admission::LogBudget::new(10, 60);
                     while let Some(received) = sync_admit_rx.recv().await {
                         let pid = received.pid.clone();
                         let target = max_seen.load(std::sync::atomic::Ordering::Relaxed);
@@ -3285,6 +3288,17 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // #155: INFO, only for non-Material responses, so a
                         // healthy node is silent and a misbehaving one is loud.
                         if report.quality != sync_peer::ServeQuality::Material {
+                            let d = score_log.check();
+                            if d.suppressed_in_previous_window > 0 {
+                                tracing::info!(
+                                    "SYNCSCORE: {} more non-material response(s) in the previous \
+                                     60s (lines suppressed)",
+                                    d.suppressed_in_previous_window
+                                );
+                            }
+                            if !d.emit {
+                                continue;
+                            }
                             tracing::info!(
                                 "SYNCSCORE peer={} {:?} new={} anchor={} applied={} gap={} score={}",
                                 pid.0.get(..14).unwrap_or(&pid.0),

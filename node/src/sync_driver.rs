@@ -294,7 +294,16 @@ impl SyncDriver {
             .unwrap_or(BlocksMatch::Unsolicited);
         // Same task as handle_blocks, so this drains exactly its output.
         let validated = self.sync.drain_validated_blocks().await;
-        self.wake.notify_one();
+        // Wake the request side only when the answer delivered part of a
+        // range (a slot is free and the next one can be planned). An empty or
+        // nothing-new answer waits for the tick: re-planning it at once is
+        // what turned "nothing to give" into a request per round trip.
+        if matches!(
+            matched,
+            BlocksMatch::Range { start, delivered_through, .. } if delivered_through >= start
+        ) {
+            self.wake.notify_one();
+        }
         ReceivedBlocks {
             pid: pid.clone(),
             matched,
@@ -446,7 +455,10 @@ impl SyncDriver {
         if reprocessed_orphans {
             *orphans = admission::bound_orphan_buffer(std::mem::take(&mut pending));
         }
-        self.wake.notify_one();
+        // The applied tip moved: ranges below it are free.
+        if newly_admitted > 0 {
+            self.wake.notify_one();
+        }
 
         // #153/#155/#156: credit the peer on what it delivered, relative to
         // what the range asked for and to the gap. A response that answers no
@@ -1344,7 +1356,8 @@ mod tests {
 
     /// Run a sync for `secs` against `bad` peers (sorted first) and `honest`
     /// honest ones, with the sync target at `target`; return the follower's
-    /// applied height and the GetBlocks the peers received per second.
+    /// applied height and the GetBlocks per second the peers received beyond
+    /// those needed to reach it.
     async fn request_rate(
         n: u64,
         bad: &[Behaviour],
@@ -1390,10 +1403,13 @@ mod tests {
         }
         let out = run_sync(&f, peers, in_rx, target, Duration::from_secs(secs)).await;
         let w = wire.lock().expect("wire");
-        let rate = w.get_blocks as f64 / out.secs;
+        // Requests beyond the one per 32-block range that reaching `applied`
+        // needed: what was asked while there was nothing to get.
+        let idle = w.get_blocks.saturating_sub(out.applied.div_ceil(32));
+        let rate = idle as f64 / out.secs;
         println!(
             "SYNCRATE {bad:?}+{honest} n={n} target={target} applied={} secs={:.1} \
-             get_blocks={} get_headers={} get_blocks_per_sec={rate:.2} scheduler={:?}",
+             get_blocks={} get_headers={} idle_get_blocks_per_sec={rate:.2} scheduler={:?}",
             out.applied,
             out.secs,
             w.get_blocks,
@@ -1449,13 +1465,61 @@ mod tests {
     /// Same, for a valid side branch fed through header anchors.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn on_a_side_branch_fed_by_headers_requests_stay_at_the_idle_rate() {
-        let (applied, rate) =
-            request_rate(1_500, &[Behaviour::StaleBranch], 2, 750, 1_500, rate_secs()).await;
+        let (applied, rate) = request_rate(
+            1_500,
+            &[Behaviour::StaleBranch],
+            2,
+            750,
+            1_500,
+            rate_secs().max(60),
+        )
+        .await;
         assert!(applied < 1_500, "expected the follower to stall");
         assert!(
             rate <= MAX_IDLE_GET_BLOCKS_PER_SEC,
             "{rate:.1} GetBlocks/s on a side branch"
         );
+    }
+
+    /// Several misbehaving peers at once (slow and short, alternating header
+    /// liar, diverging after one block), one honest peer: catch-up still
+    /// completes within the throughput bound, holds and all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catch_up_completes_past_three_mixed_misbehaving_peers() {
+        let n = env_u64("CITRATE_SYNC_TEST_ADV_BLOCKS", 1_500);
+        let deadline = (n as f64 / min_blocks_per_sec() * 1.5 + 10.0) as u64;
+        let (applied, _) = request_rate(
+            n,
+            &[
+                Behaviour::SlowShort(9_500, 1),
+                Behaviour::HeaderAlternating,
+                Behaviour::DivergeAfter(1),
+            ],
+            1,
+            0,
+            n,
+            deadline,
+        )
+        .await;
+        assert_eq!(applied, n, "stopped at {applied} of {n}");
+    }
+
+    /// A peer answering just inside the timeout and a header source with
+    /// random hashes at every odd height, one honest peer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catch_up_completes_past_a_slow_peer_and_random_odd_anchors() {
+        let n = env_u64("CITRATE_SYNC_TEST_ADV_BLOCKS", 1_500);
+        let deadline = (n as f64 / min_blocks_per_sec() * 1.5 + 10.0) as u64;
+        let (applied, _) = request_rate(
+            n,
+            &[Behaviour::Slow(9_500), Behaviour::HeaderRandomOdd],
+            1,
+            0,
+            n,
+            deadline,
+        )
+        .await;
+        assert_eq!(applied, n, "stopped at {applied} of {n}");
     }
 
     async fn multi_peer_catch_up(n: u64) {
