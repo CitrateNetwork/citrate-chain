@@ -76,6 +76,7 @@ mod genesis;
 mod hardening_rejoin;
 mod inference;
 pub mod logging;
+mod memory_bounds;
 pub mod metrics;
 mod model_manager;
 mod model_verifier;
@@ -2235,7 +2236,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         .with_enforcement_activation_height(*activation),
                     _ => store,
                 };
-                info!("DAG store created with strict_vrf={}", strict_vrf);
+                let resident_bodies = memory_bounds::dag_resident_bodies();
+                let store = store.with_resident_body_cap(resident_bodies);
+                info!(
+                    "DAG store created with strict_vrf={} resident_bodies={}",
+                    strict_vrf, resident_bodies
+                );
                 Arc::new(store)
             }
             Err(e) => {
@@ -2445,6 +2451,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // (no-op when unset). Merge blocks are scored from a bounded window
     // (MS-BOUND, ghostdag::MERGE_SCORE_WINDOW), so pruning no longer breaks them.
     dag_prune::spawn(storage.clone(), shared_dag_store.clone());
+    memory_bounds::spawn_report(storage.clone(), shared_dag_store.clone());
 
     // D2.4: repair partial admissions already on disk. Any node that ran a
     // pre-D2 binary can be carrying a chain-store hole with the block sitting
