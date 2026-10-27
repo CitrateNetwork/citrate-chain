@@ -20,11 +20,18 @@
 #                                                  host (genesis_profile r1006, mining OFF, bootnodes =
 #                                                  the other producers, RPC on loopback); block 0
 #                                                  probed on every host
-#   r1006_bringup.sh start                         start in inventory order, mining off, with health
-#                                                  gates; then (--mining on) switch mining on, host by
-#                                                  host, only once EVERY host shows the r1006 block 0
+#   r1006_bringup.sh start                         pre-join: every host's installed binary must be a
+#                                                  clean build at or after MIN_CHAIN_REV (refused
+#                                                  before any host starts); then start in inventory
+#                                                  order, mining off, with health gates; then
+#                                                  (--mining on) switch mining on, host by host, only
+#                                                  once EVERY host shows the r1006 block 0
 #   r1006_bringup.sh smoke                         FLEET AGREE, chain id, code vs genesis alloc,
-#                                                  OrangeSeed story(), DEPLOYER-ADMIN 0, no CONFLICT/
+#                                                  OrangeSeed story(), CheckDeployedAdmins in
+#                                                  genesis-chain mode (GENESIS_CHAIN=1, GENESIS_ALLOC
+#                                                  = the fill's block-0 alloc): FACTORY-ADMIN,
+#                                                  DEPLOYER-ADMIN, NO-CODE, TIMELOCK-HOLDERS and
+#                                                  GENESIS-FLOOR all 0, no CONFLICT/
 #                                                  fork in logs, finality status, no contribution
 #                                                  recorder configured, memory per host
 #   r1006_bringup.sh stop                          stop every node (reverse order)
@@ -65,6 +72,14 @@
 #                 scripts/ops/r1006/render_profile.py) · --stake-salt N (32000) · --liquid-salt N (100)
 #   start:        --mining on|off (on; on: the validator set is in the genesis) · --gate-minutes N (10)
 #                 · --min-peers N (hosts-1) · --skip-producing-gate
+#                 · --min-chain-rev SHA: the oldest chain commit a producer binary may be built
+#                   from (40 hex). Also read from the reviewed one-line file
+#                   scripts/ops/r1006/min_chain_rev (comment lines start with #); when both are
+#                   set they must be equal; when neither is set, start refuses. A binary built
+#                   before the r1006 genesis rules (chain#398) runs the r1006 data dir with those
+#                   rules off, so each host's `citrate-node consensus --json` git_sha must be
+#                   clean, resolve in this checkout, and have MIN_CHAIN_REV as an ancestor
+#                   (git merge-base --is-ancestor). Fetch origin first.
 #   smoke:        --skip CHECK[,CHECK] (orangeseed, admins, code, logs) printed as SKIP, never PASS
 #                 · --min-height N (60): wait (up to --gate-minutes) until every head is past N, so
 #                   FLEET AGREE compares a real common block, not block 0
@@ -103,6 +118,7 @@ SKIP_PRODUCING=0
 SKIPS=""
 MIN_HEIGHT=60
 WIPE_KEYS=0
+MIN_CHAIN_REV_OPT=""
 
 die() { echo "r1006_bringup: $*" >&2; exit 2; }
 log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*"; }
@@ -132,6 +148,7 @@ while [[ $# -gt 0 ]]; do
     --skip) SKIPS="$2"; shift 2 ;;
     --min-height) MIN_HEIGHT="$2"; shift 2 ;;
     --wipe-keys) WIPE_KEYS=1; shift ;;
+    --min-chain-rev) MIN_CHAIN_REV_OPT="$2"; shift 2 ;;
     -h | --help) sed -n '2,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown option $1" ;;
   esac
@@ -619,6 +636,46 @@ stop_started() { # stop every host in HOSTS up to and including $1
   for s in "${HOSTS[@]}"; do agent "$s" stop || true; [[ "$s" == "$1" ]] && break; done
 }
 
+# ---- pre-join: build rev at or after MIN_CHAIN_REV ----------------------------
+MIN_REV_FILE="$HERE/r1006/min_chain_rev"
+
+# min_chain_rev: the floor from --min-chain-rev and/or the reviewed file; refuses when
+# neither is set, when they differ, or when it is not a full commit in this checkout.
+min_chain_rev() {
+  local v="" f=""
+  if [[ -f "$MIN_REV_FILE" ]]; then
+    f=$(grep -vE '^[[:space:]]*(#|$)' "$MIN_REV_FILE" | tr -d '[:space:]' || true)
+    [[ -n "$f" ]] || die "MIN_CHAIN_REV: $MIN_REV_FILE names no commit"
+  fi
+  if [[ -n "$MIN_CHAIN_REV_OPT" && -n "$f" && "$MIN_CHAIN_REV_OPT" != "$f" ]]; then
+    die "MIN_CHAIN_REV: --min-chain-rev $MIN_CHAIN_REV_OPT differs from the reviewed $MIN_REV_FILE ($f); refusing"
+  fi
+  v="${MIN_CHAIN_REV_OPT:-$f}"
+  [[ -n "$v" ]] || die "MIN_CHAIN_REV is not set (--min-chain-rev SHA or $MIN_REV_FILE); refusing to start nodes without a binary floor"
+  [[ "$v" =~ ^[0-9a-f]{40}$ ]] || die "MIN_CHAIN_REV must be a full 40-hex commit, got '$v'"
+  git -C "$REPO" cat-file -e "$v^{commit}" 2>/dev/null ||
+    die "MIN_CHAIN_REV $v is not a commit in this checkout ($REPO); fetch origin and retry"
+  printf '%s' "$v"
+}
+
+# check_build_revs: every host in HOSTS runs a clean binary built from MIN_CHAIN_REV or a
+# descendant of it. Runs before any host is started; any doubt refuses.
+check_build_revs() {
+  local min h out sha dirty full
+  min=$(min_chain_rev) || exit 2
+  for h in "${HOSTS[@]}"; do
+    out=$(agent "$h" build-rev) || die "MIN_CHAIN_REV: $h did not report its binary's build rev; refusing"
+    read -r sha dirty <<<"$out"
+    [[ "$sha" =~ ^[0-9a-f]{7,40}$ ]] || die "MIN_CHAIN_REV: $h's binary reports build rev '${sha:-}' (no commit); refusing"
+    [[ "$dirty" == false ]] || die "MIN_CHAIN_REV: $h's binary was built from a dirty tree ($sha); refusing"
+    full=$(git -C "$REPO" rev-parse --verify -q "$sha^{commit}" 2>/dev/null) ||
+      die "MIN_CHAIN_REV: $h's build rev $sha does not resolve to one commit in this checkout (fetch origin); refusing"
+    git -C "$REPO" merge-base --is-ancestor "$min" "$full" ||
+      die "MIN_CHAIN_REV: $h's binary is built from $sha, which does not contain $min; refusing"
+    log "  ok: $h binary $sha contains MIN_CHAIN_REV ${min:0:12}"
+  done
+}
+
 step_start() {
   local n=${#HOSTS[@]} gh
   [[ -z "$MIN_PEERS" ]] && MIN_PEERS=$((${#ALL_HOSTS[@]} - 1))
@@ -630,6 +687,13 @@ step_start() {
     [[ -f "$STATE/genesis/fill-result.json" ]] || die "no fill; run genesis-fill first"
     check_genesis "$STATE/genesis/fill-result.json"
     gh=$(fill_field genesis_hash)
+  fi
+  if [[ $DRY -eq 1 ]]; then
+    echo "  [dry-run] pre-join: each host's citrate-node consensus --json git_sha is clean and contains MIN_CHAIN_REV"
+    echo "            (--min-chain-rev / $MIN_REV_FILE; unset refuses) per git merge-base --is-ancestor; else no host starts"
+  else
+    log "start: pre-join build-rev check (MIN_CHAIN_REV)"
+    check_build_revs
   fi
   [[ $DRY -eq 0 && ! -f "$STATE/started_at" ]] && date +%s >"$STATE/started_at"
   local first=1
@@ -713,7 +777,9 @@ step_smoke() {
     echo "  [dry-run] eth_chainId == 40204 on every host"
     echo "  [dry-run] eth_getCode(addr) == alloc[addr].code for every coded alloc entry (fill alloc_file), on every host"
     echo "  [dry-run] OrangeSeed (fill orangeseed): story() returns a non-empty string"
-    echo "  [dry-run] CheckDeployedAdmins.s.sol over the fill address_book (staged under contracts/addresses): forge rc 0 and DEPLOYER-ADMIN failures: 0"
+    echo "  [dry-run] CheckDeployedAdmins.s.sol, GENESIS_CHAIN=1, over the fill address_book with GENESIS_ALLOC = the fill alloc_file"
+    echo "            (both staged under contracts/addresses, removed after): forge rc 0 and FACTORY-ADMIN, DEPLOYER-ADMIN,"
+    echo "            NO-CODE, TIMELOCK-HOLDERS, GENESIS-FLOOR each reported once as 0"
     echo "  [dry-run] host_agent logs-scan: no CONFLICT / fork line since start, every host"
     echo "  [dry-run] finality: eth_getBlockByNumber(finalized) answers (switch OFF: expect block 0)"
     echo "  [dry-run] config: no contribution recorder in node.toml / env / unit drop-ins, every host"
@@ -798,25 +864,41 @@ PY
     [[ -n "$story" && "$story" != '""' ]] && pass "OrangeSeed $seed story(): ${story:0:80}" || fail "OrangeSeed $seed story() returned nothing"
   fi
 
-  # 5. DEPLOYER-ADMIN 0 (the ceremony's P5 checker over the genesis book)
-  local book
+  # 5. admins: the ceremony's P5 checker over the genesis book, in chain#398's genesis-chain
+  #    mode. r1006's contracts are in block 0, so the timelock has no role history: the
+  #    holder sets are proved from state against the block-0 alloc (GENESIS_ALLOC), forced
+  #    with GENESIS_CHAIN=1. Without the alloc that mode fails closed, so a fill with no
+  #    alloc fails here without running forge.
+  local book admins_alloc
   book=$(fill_field address_book)
+  admins_alloc=$(fill_field alloc_file)
   if skipped admins; then
-    log "SKIP  DEPLOYER-ADMIN (--skip admins)"
-  elif [[ -z "$book" || ! -f "$REPO/contracts/script/CheckDeployedAdmins.s.sol" ]]; then
-    fail "no address book in the fill result, or no CheckDeployedAdmins.s.sol in this checkout"
+    log "SKIP  admins (--skip admins)"
+  elif [[ -z "$book" || ! -f "$STATE/genesis/$book" || ! -f "$REPO/contracts/script/CheckDeployedAdmins.s.sol" ]]; then
+    fail "admins (genesis-chain mode): no address book in the fill result, or no CheckDeployedAdmins.s.sol in this checkout"
+  elif [[ -z "$admins_alloc" || ! -f "$STATE/genesis/$admins_alloc" ]]; then
+    fail "admins (genesis-chain mode): no block-0 alloc in the fill result (GENESIS_ALLOC is required)"
   else
     # forge may read only under contracts/ (fs_permissions: ./addresses), and the state dir
-    # is outside the checkout: stage the fill's (public) book there for this run only.
-    local report da frc=0 staged="addresses/.r1006-smoke-$$.json"
+    # is outside the checkout: stage the fill's (public) book and alloc there for this run only.
+    local report frc=0 c n bad_classes="" staged="addresses/.r1006-smoke-$$.json" staged_alloc="addresses/.r1006-smoke-$$-alloc.json"
     cp -f -- "$STATE/genesis/$book" "$REPO/contracts/$staged"
-    report=$(cd "$REPO/contracts" && ADDRESS_BOOK="$staged" REQUIRE_ALL_CODE=true \
-      "$FORGE" script script/CheckDeployedAdmins.s.sol --rpc-url "${urls[0]}" 2>&1) || frc=$?
-    rm -f -- "$REPO/contracts/$staged"
-    da=$(printf '%s\n' "$report" | sed -nE 's/.*DEPLOYER-ADMIN failures:[[:space:]]*([0-9]+)[[:space:]]*$/\1/p')
-    # The whole checker must pass (rc 0), and report exactly one DEPLOYER-ADMIN count of 0.
-    if [[ $frc -eq 0 && $(printf '%s' "$da" | grep -c .) -eq 1 && "$da" == 0 ]]; then pass "DEPLOYER-ADMIN 0"
-    else printf '%s\n' "$report" | tail -15 | sed 's/^/  | /'; fail "DEPLOYER-ADMIN is not a single 0 with the checker passing (forge rc=$frc)"; fi
+    cp -f -- "$STATE/genesis/$admins_alloc" "$REPO/contracts/$staged_alloc"
+    report=$(cd "$REPO/contracts" && ADDRESS_BOOK="$staged" REQUIRE_ALL_CODE=true GENESIS_CHAIN=1 \
+      GENESIS_ALLOC="$staged_alloc" "$FORGE" script script/CheckDeployedAdmins.s.sol --rpc-url "${urls[0]}" 2>&1) || frc=$?
+    rm -f -- "$REPO/contracts/$staged" "$REPO/contracts/$staged_alloc"
+    # The whole checker must pass (rc 0), and report each class exactly once, as 0.
+    for c in "FACTORY-ADMIN failures" "DEPLOYER-ADMIN failures" "NO-CODE entries (reported)" \
+      "TIMELOCK-HOLDERS failures" "GENESIS-FLOOR failures"; do
+      n=$(printf '%s\n' "$report" | grep -F -- "$c:" | sed -nE 's/.*:[[:space:]]*([0-9]+)[[:space:]]*$/\1/p' || true)
+      [[ $(printf '%s' "$n" | grep -c .) -eq 1 && "$n" == 0 ]] || bad_classes+=" ${c%% *}=${n:-missing}"
+    done
+    if [[ $frc -eq 0 && -z "$bad_classes" ]]; then
+      pass "admins (genesis-chain mode): FACTORY-ADMIN, DEPLOYER-ADMIN, NO-CODE, TIMELOCK-HOLDERS, GENESIS-FLOOR all 0"
+    else
+      printf '%s\n' "$report" | tail -15 | sed 's/^/  | /'
+      fail "admins (genesis-chain mode): forge rc=$frc;${bad_classes:- every class 0}"
+    fi
   fi
 
   # 6. logs: no CONFLICT / fork

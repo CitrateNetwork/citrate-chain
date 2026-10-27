@@ -8,7 +8,9 @@
 # or the host's services, and every process dies with the rehearsal.
 #
 #   local_devnet.sh --nodes 7 --work DIR [--steps "keys genesis-fill distribute start smoke"]
-#                   [--gate-minutes N] [--skip CHECKS] [--fill-cmd CMD]
+#                   [--gate-minutes N] [--skip CHECKS] [--fill-cmd CMD] [--min-chain-rev SHA]
+#
+# --min-chain-rev: passed to `start` (its pre-join build-rev floor; see r1006_bringup.sh).
 #
 # --fill-cmd: the genesis-fill command ({producers} {stakes} {out} as in r1006_bringup.sh);
 # default: the rehearsal stand-in (tests/fixtures/rehearsal_fill.py). For the real fill:
@@ -28,6 +30,7 @@ STEPS="keys genesis-fill distribute start smoke status"
 GATE=10
 SKIP="orangeseed,admins"
 FILL_CMD=""
+MIN_REV=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --nodes) NODES="$2"; shift 2 ;;
@@ -36,6 +39,7 @@ while [[ $# -gt 0 ]]; do
     --gate-minutes) GATE="$2"; shift 2 ;;
     --skip) SKIP="$2"; shift 2 ;;
     --fill-cmd) FILL_CMD="$2"; shift 2 ;;
+    --min-chain-rev) MIN_REV=(--min-chain-rev "$2"); shift 2 ;;
     *) echo "local_devnet: unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -106,7 +110,7 @@ for s in $STEPS; do
       [[ -n "$fc" ]] || fc="python3 $FILL --producers {producers} --stakes {stakes} --out {out} --bin $WORK/state/bin/citrate-node"
       run_step genesis-fill --fill-cmd "$fc" ;;
     distribute) run_step distribute ;;
-    start) run_step start --mining on --gate-minutes "$GATE" ;;
+    start) run_step start --mining on --gate-minutes "$GATE" "${MIN_REV[@]}" ;;
     smoke) run_step smoke --skip "$SKIP" ;;
     wipe-keys-refused) run_step wipe --wipe-keys ;;
     stop) run_step stop ;;

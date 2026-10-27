@@ -3,7 +3,7 @@ created: 2026-10-26T20:45:00Z
 branch: ops/r1006-bringup
 author: Larry Klosowski (chain team; DGX session, Claude Opus 5.5)
 status: active
-updated: 2026-10-27 (host allowlist, release-genesis refusal, mining gate, output containment)
+updated: 2026-10-27 (host allowlist, release-genesis refusal, mining gate, output containment; MIN_CHAIN_REV pre-join, smoke admins in genesis-chain mode)
 supersedes: the fleet steps (S1, S3, S5-S7) of citrate-federation R1006_REROLL_RUNBOOK.md (fed#399) for r1006
 ---
 
@@ -39,7 +39,9 @@ SHA=$(git rev-parse origin/main); $B build --sha "$SHA"
 $B genesis-fill --fill-cmd 'python3 scripts/genesis/r1006/fill_producers.py {producers} {stakes} {out}'
 #   kept only if its block 0 is the R1006_GENESIS committed in this checkout AND the build's
 $B distribute                              # binary hash-checked; node.toml (r1006 profile, mining off); block 0 probed per host
-$B start --mining on                       # all nodes up with mining off; block 0 checked on every host; then mining on
+#   MIN_CHAIN_REV: the full sha of chain#398's merge commit on main (or later), in the
+#   reviewed one-line file scripts/ops/r1006/min_chain_rev or passed as --min-chain-rev
+$B start --mining on                       # pre-join build-rev check; all nodes up with mining off; block 0 checked on every host; then mining on
 $B smoke                                   # must end SMOKE PASS
 ```
 
@@ -54,8 +56,8 @@ typed confirmation.
 | keys | each host also runs `citrate registration-proof --registry <the committed r1006 book's ValidatorRegistry>`; the proof must be exactly the public object for that host's staker and proposer key, and goes into `r1006-registration-proofs.json` (the fill's input). Each host re-serialises its checked public identity; the orchestrator checks it again in memory and writes only that object; any key or password pattern in the host's stdout or stderr fails the step (rc 3) with nothing written or echoed |
 | genesis-fill | the fill lists exactly the producers with their stakes; activation height ≥ 800 (r1006: 1000; the node refuses less, also for a genesis validator set); profile `r1006`; no genesis file; registry = the committed book's; block 0 = the `R1006_GENESIS` committed in `core/consensus/src/hardening.rs`, read at run time, which the build must also compile, and never a release network's (r1005 `0x1dcfc490…75f1`, team testnet, mainnet); otherwise the fill is discarded |
 | distribute | the same genesis checks, before any host is touched; staged and installed binary sha256 match; every host's isolated probe gives that block 0 (recorded on the host) |
-| start | the same genesis checks; every node starts with mining off and its block 0 must be the r1006 genesis (else every started node is stopped); only then, host by host, the host re-checks its own node's block 0 and switches mining on; ≥6 peers each; blocks from all 7 coinbases within 10 min |
-| smoke | every head past block 60; FLEET AGREE; chain id 40204; `eth_getCode` = genesis alloc; OrangeSeed `story()`; `CheckDeployedAdmins` passes (forge rc 0) with DEPLOYER-ADMIN 0 (the fill's book is staged under `contracts/addresses/` for forge); no CONFLICT / fork / deep reorg in logs; finality answers; no contribution recorder configured; RSS < 3 GiB |
+| start | pre-join, before any host starts: MIN_CHAIN_REV is set (`--min-chain-rev` or the reviewed `scripts/ops/r1006/min_chain_rev`; both set must agree; a full sha in this checkout), and each host's installed binary reports (`consensus --json`) a clean `git_sha` that resolves in this checkout and contains MIN_CHAIN_REV (`git merge-base --is-ancestor`). A binary from before chain#398 does not know the r1006 genesis and would run it with every rule off, so it is refused here. Then the same genesis checks; every node starts with mining off and its block 0 must be the r1006 genesis (else every started node is stopped); only then, host by host, the host re-checks its own node's block 0 and switches mining on; ≥6 peers each; blocks from all 7 coinbases within 10 min |
+| smoke | every head past block 60; FLEET AGREE; chain id 40204; `eth_getCode` = genesis alloc; OrangeSeed `story()`; `CheckDeployedAdmins` in chain#398's genesis-chain mode (`GENESIS_CHAIN=1`, `GENESIS_ALLOC` = the fill's block-0 alloc) passes (forge rc 0) with FACTORY-ADMIN, DEPLOYER-ADMIN, NO-CODE, TIMELOCK-HOLDERS and GENESIS-FLOOR each reported once as 0 (the fill's book and alloc are staged under `contracts/addresses/` for forge and removed after; a fill without an alloc fails); no CONFLICT / fork / deep reorg in logs; finality answers; no contribution recorder configured; RSS < 3 GiB |
 
 A node built without the r1006 profile refuses `genesis_profile = "r1006"` at start
 (node/src/genesis.rs) instead of falling back to the chain-id default (r1005's genesis).

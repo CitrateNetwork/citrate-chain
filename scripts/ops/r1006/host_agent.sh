@@ -46,6 +46,8 @@
 #   wipe [--wipe-keys]         stopped node only: delete the r1006 chain data, keep the keys
 #                              (with --wipe-keys, the keys and keystore too)
 #   sha FILE                   sha256 of a staged file (for the orchestrator's checks)
+#   build-rev                  the installed binary's build stamp (`consensus --json`):
+#                              "<git_sha> <git_dirty>", for the MIN_CHAIN_REV pre-join check
 #   probe-genesis HASH         start the installed binary + config in an ISOLATED network
 #                              namespace (loopback only), with a throwaway data dir and
 #                              mining off; read block 0; compare; delete the throwaway dir;
@@ -529,6 +531,25 @@ cmd_sha() {
   sha_of "$f"
 }
 
+# build-rev: the installed binary's build stamp from `citrate consensus --json`, printed as
+# "<git_sha> <true|false>" (git_sha is the short commit or "unknown"; the second field is
+# git_dirty). The orchestrator compares it with MIN_CHAIN_REV before any node starts.
+cmd_build_rev() {
+  [[ -x "$BIN" ]] || die "no installed binary at $BIN"
+  local out
+  out=$(RUST_LOG=error "$BIN" consensus --json </dev/null 2>/dev/null) || die "the installed binary did not answer consensus --json"
+  python3 -c 'import json, re, sys
+l = sys.argv[1].splitlines()
+try:
+    d = json.loads("\n".join(l[l.index(next(x for x in l if x.startswith("{"))):]))
+except Exception:
+    sys.exit("host_agent: no build stamp in consensus --json")
+sha, dirty = d.get("git_sha"), d.get("git_dirty")
+if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{7,40}|unknown", sha) or not isinstance(dirty, bool):
+    sys.exit("host_agent: malformed build stamp in consensus --json")
+print(sha, "true" if dirty else "false")' "$out"
+}
+
 cmd_probe_genesis() {
   local want="${1:-}"
   need_r1006_hash "$want"
@@ -626,6 +647,7 @@ case "$c" in
   logs-scan) cmd_logs_scan "$@" ;;
   wipe) cmd_wipe "$@" ;;
   sha) cmd_sha "$@" ;;
+  build-rev) cmd_build_rev ;;
   probe-genesis) cmd_probe_genesis "$@" ;;
   tcp-check) cmd_tcp_check "$@" ;;
   config-check) cmd_config_check ;;
