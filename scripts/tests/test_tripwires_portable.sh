@@ -20,7 +20,7 @@ mkdir -p "$HOME"
 
 TRIPWIRES="forge_script historical_state_read rpc_height_index finalization_publish_order
   shell_safety synthetic_pid_signal tla_frame installer_test_sandbox wallet_gate_signing
-  rpc_state_tag_guard"
+  rpc_state_tag_guard rpc_by_number_canonical"
 
 fail=0
 pass() { echo "ok   - $1"; }

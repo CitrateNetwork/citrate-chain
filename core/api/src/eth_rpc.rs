@@ -195,10 +195,10 @@ fn simulation_block_context(storage: &Arc<StorageManager>) -> (u64, u64) {
         Ok(h) => h,
         Err(_) => return (0, 0),
     };
-    // height-index: latest height, simulation timestamp only.
+    // Latest height, simulation timestamp only.
     let timestamp = storage
         .blocks
-        .get_block_by_height(height)
+        .get_canonical_block_by_height(height)
         .ok()
         .flatten()
         .and_then(|hash| storage.blocks.get_block(&hash).ok().flatten())
@@ -2464,7 +2464,8 @@ pub fn register_eth_methods_with_options(
 
         match filter.filter_type {
             FilterType::Block => {
-                // A block filter announces stored blocks (the height index).
+                // A block filter announces stored blocks, named by the executed chain
+                // at and below the applied tip (chain#421).
                 let current_height = storage_filter_changes
                     .blocks
                     .get_latest_height()
@@ -2472,9 +2473,9 @@ pub fn register_eth_methods_with_options(
                 // Return new block hashes since last poll
                 let mut block_hashes = Vec::new();
                 for height in last_poll_block.saturating_add(1)..=current_height {
-                    // height-index: block filter, heights after the last poll up to latest.
-                    if let Ok(Some(hash)) =
-                        storage_filter_changes.blocks.get_block_by_height(height)
+                    if let Ok(Some(hash)) = storage_filter_changes
+                        .blocks
+                        .get_canonical_block_by_height(height)
                     {
                         block_hashes
                             .push(Value::String(format!("0x{}", hex::encode(hash.as_bytes()))));

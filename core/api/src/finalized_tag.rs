@@ -230,8 +230,9 @@ pub fn range_block_hashes(
     if let Some(start) = index_from {
         if start <= to {
             for height in start..=to {
-                // height-index: heights above the certified height, or no certified hash.
-                if let Ok(Some(hash)) = storage.blocks.get_block_by_height(height) {
+                // Heights above the certified height, or no certified hash: the
+                // executed chain's block at each height (chain#421).
+                if let Ok(Some(hash)) = storage.blocks.get_canonical_block_by_height(height) {
                     out.push((height, hash));
                 }
             }

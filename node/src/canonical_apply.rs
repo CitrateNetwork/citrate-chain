@@ -698,6 +698,13 @@ impl CanonicalApplicator {
             "execute-on-receive: applied tip seeded at {} @ height {}",
             tip.hash, tip.height
         );
+        // chain#421: bring the canonical height index (by-number RPC reads) to the
+        // durable applied tip before serving. Tip writes keep it current from here;
+        // a data dir from a binary without the index is rebuilt once, here. A
+        // failure only delays that: the first by-number read retries it.
+        if let Err(e) = storage.blocks.sync_canonical_index() {
+            warn!("execute-on-receive: canonical height index not synced at start: {e}");
+        }
         // C1-R: a from-genesis rebuild that stopped mid-replay may have left the
         // receipts of its old applied chain above the durable tip. Make the receipt
         // index match the durable applied chain before anything reads or extends it.
@@ -11845,5 +11852,176 @@ pub(crate) mod tests {
             got, recorded,
             "with the height unset, the range must replay to the recorded roots"
         );
+    }
+
+    /// chain#421: by-number lookups name the block this applicator executed at
+    /// each height, through apply, catch-up drain, reorg and restart — never a
+    /// sibling stored after it.
+    mod by_number {
+        use super::*;
+
+        fn canonical(storage: &StorageManager, h: u64) -> Option<Hash> {
+            storage
+                .blocks
+                .get_canonical_block_by_height(h)
+                .expect("by-number read")
+        }
+
+        /// Two producers race at height 2; the losing producer's blocks reach
+        /// this node after its own are applied, then fork choice reorgs onto
+        /// them, then a third sibling arrives late.
+        #[tokio::test]
+        async fn two_producer_race_names_the_applied_block_through_reorg() {
+            let (exec, storage, _dir) = fresh();
+            let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            let (a1, a2, b2, b3) = setup_fork(&app, &storage).await; // tip a2; b2, b3 stored after
+            assert_eq!(canonical(&storage, 1), Some(a1.header.block_hash));
+            assert_eq!(
+                canonical(&storage, 2),
+                Some(a2.header.block_hash),
+                "the applied a2, not the later-stored b2"
+            );
+
+            app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+            app.apply_received(&b2).await;
+            assert_eq!(app.applied_tip().await.hash, b3.header.block_hash);
+            assert_eq!(canonical(&storage, 2), Some(b2.header.block_hash));
+            assert_eq!(canonical(&storage, 3), Some(b3.header.block_hash));
+
+            let c2 = mk_block_vrf(2, a1.header.block_hash, b2.state_root, [0x5C; 32]);
+            persist(&storage, &c2);
+            assert_eq!(
+                canonical(&storage, 2),
+                Some(b2.header.block_hash),
+                "a sibling stored after the reorg does not take the height"
+            );
+        }
+
+        /// A follower catching up: every block of the range is stored first,
+        /// with a losing sibling stored after the winner at every height, and
+        /// one delivery drains the whole range.
+        #[tokio::test]
+        async fn follower_catch_up_drain_names_the_applied_chain_at_every_height() {
+            let (exec, storage, _dir) = fresh();
+            let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            let c = chain(40);
+            for (i, b) in c.iter().enumerate() {
+                persist(&storage, b);
+                let parent = if i == 0 {
+                    Hash::default()
+                } else {
+                    c[i - 1].header.block_hash
+                };
+                persist(&storage, &mk_block_b(b.header.height, parent, b.state_root));
+            }
+            // Every height has two children of the tip; fork choice names the chain.
+            app.fork_choice = Some(fork_choice_returning(c[39].header.block_hash));
+            app.apply_received(&c[39]).await;
+            assert_eq!(
+                app.applied_tip().await,
+                AppliedTip {
+                    hash: c[39].header.block_hash,
+                    height: 40
+                }
+            );
+            let wrong: Vec<u64> = (1..=40u64)
+                .filter(|h| canonical(&storage, *h) != Some(c[*h as usize - 1].header.block_hash))
+                .collect();
+            assert!(wrong.is_empty(), "heights naming a sibling: {wrong:?}");
+        }
+
+        /// Store-backed (the production commit path: the tip and the index are
+        /// written in the state batch), across a reorg and a restart.
+        #[tokio::test]
+        async fn store_backed_reorg_then_restart_keeps_the_applied_chain() {
+            let dir = tempfile::tempdir().expect("dir");
+            let storage = Arc::new(
+                StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
+            );
+            let follower = store_backed(&storage);
+            follower.set_balance(&Address(ALICE), U256::from(FUND));
+            follower.persist_state_changes().await.expect("genesis");
+            let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+
+            let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
+            pa.set_balance(&Address(ALICE), U256::from(FUND));
+            let a1 = produce(
+                &pa,
+                Hash::default(),
+                1,
+                VRF_OUT,
+                vec![transfer(ALICE, DAVE, 1_000, 0)],
+            )
+            .await;
+            let a2 = produce(
+                &pa,
+                a1.header.block_hash,
+                2,
+                VRF_OUT,
+                vec![transfer(ALICE, BOB, 1_000, 1)],
+            )
+            .await;
+            let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+            pb.set_balance(&Address(ALICE), U256::from(FUND));
+            let _ = produce(
+                &pb,
+                Hash::default(),
+                1,
+                VRF_OUT,
+                vec![transfer(ALICE, DAVE, 1_000, 0)],
+            )
+            .await;
+            let b2 = produce(
+                &pb,
+                a1.header.block_hash,
+                2,
+                [0x5B; 32],
+                vec![transfer(ALICE, CAROL, 1_000, 1)],
+            )
+            .await;
+            let b3 = produce(
+                &pb,
+                b2.header.block_hash,
+                3,
+                [0x5B; 32],
+                vec![transfer(ALICE, CAROL, 1_000, 2)],
+            )
+            .await;
+
+            // The winner b2 is stored BEFORE the loser a2; a2 is applied first.
+            persist(&storage, &a1);
+            app.apply_received(&a1).await;
+            persist(&storage, &b2);
+            persist(&storage, &a2);
+            app.fork_choice = Some(fork_choice_returning(a2.header.block_hash));
+            app.apply_received(&a2).await;
+            assert_eq!(app.applied_tip().await.hash, a2.header.block_hash);
+            assert_eq!(canonical(&storage, 2), Some(a2.header.block_hash));
+
+            persist(&storage, &b3);
+            app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+            app.apply_received(&b3).await;
+            assert_eq!(app.applied_tip().await.height, 3, "reorged to B");
+            assert_eq!(
+                canonical(&storage, 2),
+                Some(b2.header.block_hash),
+                "the reorg rewrote height 2 (the stored index still names a2)"
+            );
+            assert_eq!(canonical(&storage, 3), Some(b3.header.block_hash));
+
+            drop(app);
+            drop(follower);
+            let storage = Arc::into_inner(storage).expect("sole owner");
+            drop(storage);
+            let reopened =
+                StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen");
+            assert_eq!(
+                reopened.blocks.get_applied_tip().expect("tip"),
+                Some((b3.header.block_hash, 3))
+            );
+            assert_eq!(canonical(&reopened, 1), Some(a1.header.block_hash));
+            assert_eq!(canonical(&reopened, 2), Some(b2.header.block_hash));
+            assert_eq!(canonical(&reopened, 3), Some(b3.header.block_hash));
+        }
     }
 }

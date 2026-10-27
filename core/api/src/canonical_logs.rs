@@ -769,11 +769,12 @@ fn applied_anchor(storage: &StorageManager) -> Result<Option<(Hash, u64)>, Strin
         .blocks
         .get_latest_height()
         .map_err(|e| format!("latest height: {e}"))?;
-    // height-index: fallback for a store that never wrote an applied tip (the
-    // stored head, `latest` only); a finality tag never resolves through here.
+    // Fallback for a store that never wrote an applied tip (the stored head,
+    // `latest` only; with no applied tip the lookup reads the stored index); a
+    // finality tag never resolves through here.
     Ok(storage
         .blocks
-        .get_block_by_height(head)
+        .get_canonical_block_by_height(head)
         .map_err(|e| format!("height index: {e}"))?
         .map(|hash| (hash, head)))
 }
