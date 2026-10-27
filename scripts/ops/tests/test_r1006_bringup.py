@@ -33,6 +33,9 @@ HARDENING = REPO / "core" / "consensus" / "src" / "hardening.rs"
 # r1005's block 0 (RELEASE_GENESIS[0]) and the r1006 genesis the test "build" compiles.
 R1005 = "0x1dcfc4909dd9fdcb0f03c823d627e4b2032cc86bef5fc4561030d6c64b9775f1"
 R1006_TEST = "0x" + "06" * 32
+# The ValidatorRegistry the test repo's committed r1006 book names.
+REG_TEST = "0x" + "f5" * 20
+R1006_CONST = re.compile(r"pub const R1006_GENESIS: \[u8; 32\] =\s*hex32\(\"[0-9a-f]{64}\"\);")
 PINNED_INV = json.loads((OPS / "r1006" / "inventory.r1006.json").read_text())
 sys.path.insert(0, str(OPS / "r1006"))
 import collect  # noqa: E402
@@ -84,19 +87,42 @@ class Env:
         (self.state / "build.json").write_text(json.dumps({"sha": "0" * 40, "sha256": s256, "fingerprint": "0x",
                                                            "arch": "test", "built_on": "test", "from_main": False,
                                                            "r1006_genesis": R1006_TEST}))
-        self.env = dict(os.environ, HOME=str(self.tmp), TMPDIR=str(self.tmp), CANARY="CANARY-7f3a9c")
+        self.env = dict(os.environ, HOME=str(self.tmp), TMPDIR=str(self.tmp), CANARY="CANARY-7f3a9c",
+                        PYTHONDONTWRITEBYTECODE="1")
+        # A repo tree the orchestrator runs from: the real scripts, plus the committed r1006
+        # genesis pin (core/consensus/src/hardening.rs) and address book this test controls.
+        self.repo = self.tmp / "repo"
+        shutil.copytree(OPS, self.repo / "scripts" / "ops", ignore=shutil.ignore_patterns("tests", "__pycache__"))
+        shutil.copytree(REPO / "scripts" / "producers", self.repo / "scripts" / "producers",
+                        ignore=shutil.ignore_patterns("tests", "__pycache__"))
+        self.set_committed(R1006_TEST, REG_TEST)
+
+    def set_committed(self, genesis: str | None, registry: str | None = REG_TEST) -> None:
+        """Write the repo's committed r1006 pin (None: no R1006_GENESIS const) and book."""
+        h = self.repo / "core/consensus/src/hardening.rs"
+        h.parent.mkdir(parents=True, exist_ok=True)
+        src = R1006_CONST.sub("", HARDENING.read_text())
+        if genesis is not None:
+            src += f'\npub const R1006_GENESIS: [u8; 32] =\n    hex32("{genesis[2:]}");\n'
+        h.write_text(src)
+        b = self.repo / "contracts/addresses/r1006/40204.json"
+        b.parent.mkdir(parents=True, exist_ok=True)
+        if registry is None:
+            b.unlink(missing_ok=True)
+        else:
+            b.write_text(json.dumps({"chainId": 40204, "contracts": {"ValidatorRegistry": registry}}))
+
+    @property
+    def bringup(self) -> Path:
+        return self.repo / "scripts/ops/r1006_bringup.sh"
 
     def run(self, *args: str, env: dict | None = None, agent: Path | None = None,
             state: bool = True) -> subprocess.CompletedProcess:
         e = dict(self.env, **(env or {}))
-        script = BRINGUP
+        script = self.bringup
         if agent is not None:
-            # Run a copy of the orchestrator next to a mutated agent.
-            d = self.tmp / "mut"
-            if not d.exists():
-                shutil.copytree(OPS, d, ignore=shutil.ignore_patterns("tests"))
-            shutil.copy(agent, d / "r1006" / "host_agent.sh")
-            script = d / "r1006_bringup.sh"
+            # The orchestrator next to a mutated agent.
+            shutil.copy(agent, self.repo / "scripts/ops/r1006/host_agent.sh")
         st = ["--state", str(self.state)] if state else []
         return subprocess.run(["bash", str(script), *args, "--inventory", str(self.inv), *st],
                               capture_output=True, text=True, env=e, timeout=300, stdin=subprocess.DEVNULL)
@@ -113,7 +139,7 @@ class Env:
         (self.state / "genesis" / "fill-result.json").write_text(json.dumps({
             "schema": "r1006-genesis-fill/1", "genesis_hash": genesis_hash, "genesis_profile": profile,
             "genesis_file": None, "alloc_file": None, "address_book": None, "orangeseed": None,
-            "validator_registry": "0x" + "00" * 18 + "1006", "validator_activation_height": 0,
+            "validator_registry": REG_TEST, "validator_activation_height": 1000,
             "validators_at_genesis": True,
             "validators": [{"proposer_pubkey": p["proposer_pubkey"], "staker": p["staker_address"],
                             "stake_wei": str(32000 * 10**18)} for p in prod["producers"]],
@@ -641,6 +667,60 @@ class GenesisRefusal(unittest.TestCase):
         finally:
             env.close()
 
+    def test_the_expected_hash_is_the_committed_r1006_pin_read_at_run_time(self):
+        """Re-pinning (after the fill, after the final rebuild) moves the expected hash: it is
+        read from core/consensus/src/hardening.rs at run time, never from a constant."""
+        env = self._keys()
+        try:
+            new = "0x" + "a8" * 32
+            env.set_committed(new)
+            # the recorded build still compiles the old pin: refused until it is rebuilt
+            r = env.run("genesis-fill", "--fill-cmd", env.fill_cmd(new))
+            self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("rebuild", r.stdout + r.stderr)
+            b = json.loads((env.state / "build.json").read_text())
+            (env.state / "build.json").write_text(json.dumps(dict(b, r1006_genesis=new)))
+            r = env.run("genesis-fill", "--fill-cmd", env.fill_cmd(new))
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            # a fill of the OLD pin is now refused, though the old pin was valid before
+            r = env.run("genesis-fill", "--fill-cmd", env.fill_cmd(R1006_TEST))
+            self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        finally:
+            env.close()
+
+    def test_no_committed_r1006_pin_fails_closed(self):
+        env = self._keys()
+        try:
+            env.set_committed(None)
+            r = env.run("genesis-fill", "--fill-cmd", env.fill_cmd(R1006_TEST))
+            self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("R1006_GENESIS", r.stdout + r.stderr)
+            self.assertFalse((env.state / "genesis" / "fill-result.json").exists())
+        finally:
+            env.close()
+
+    def test_a_committed_pin_equal_to_r1005_is_refused(self):
+        env = self._keys()
+        try:
+            env.set_committed(R1005)
+            b = json.loads((env.state / "build.json").read_text())
+            (env.state / "build.json").write_text(json.dumps(dict(b, r1006_genesis=R1005)))
+            r = env.run("genesis-fill", "--fill-cmd", env.fill_cmd(R1005))
+            self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertFalse((env.state / "genesis" / "fill-result.json").exists())
+        finally:
+            env.close()
+
+    def test_genesis_fill_refuses_a_fill_for_another_registry(self):
+        env = self._keys()
+        try:
+            env.set_committed(R1006_TEST, "0x" + "ee" * 20)
+            r = env.run("genesis-fill", "--fill-cmd", env.fill_cmd(R1006_TEST))
+            self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("registry", r.stdout + r.stderr)
+        finally:
+            env.close()
+
     def test_genesis_fill_refuses_a_build_without_the_r1006_genesis(self):
         env = self._keys()
         try:
@@ -733,7 +813,7 @@ hosts = [{{"name": f"p{{i}}", "region": "lo", "ip": f"10.206.0.{{i}}", "root": f
 json.dump({{"schema": "r1006-inventory/1", "transport": "local", "build_host": {{"name": "none", "ip": "127.0.0.1"}},
            "hosts": hosts}}, open(inv, "w"))
 PY
-B() {{ s="$1"; shift; bash {BRINGUP} "$s" --inventory {env.inv} --state {env.state} "$@"; }}
+B() {{ s="$1"; shift; bash {env.bringup} "$s" --inventory {env.inv} --state {env.state} "$@"; }}
 for i in $(seq 1 {n}); do printf %s {R1006_TEST} >"{env.tmp}/h$i/fake-block0"; done
 B keys || exit 10
 B genesis-fill --fill-cmd "{env.fill_cmd(R1006_TEST)}" || exit 11
@@ -785,6 +865,85 @@ exit $rc
                                  f"p{i} was started with mining on: {self.starts(env, i)}")
         finally:
             env.close()
+
+
+class RegistrationProofs(unittest.TestCase):
+    """keys also collects each host's `citrate registration-proof --registry <committed
+    ValidatorRegistry>` into r1006-registration-proofs.json, through the same on-host and
+    in-memory checks as the identities."""
+
+    def test_keys_collects_one_checked_proof_per_host(self):
+        env = Env(3)
+        try:
+            r = env.run("keys")
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertTrue((env.state / "r1006-registration-proofs.json").exists(), "keys wrote no proofs file")
+            doc = json.loads((env.state / "r1006-registration-proofs.json").read_text())
+            prod = json.loads((env.state / "r1006-producers.json").read_text())["producers"]
+            self.assertEqual(len(doc["proofs"]), 3)
+            for p, v in zip(doc["proofs"], prod):
+                self.assertEqual(sorted(p), ["chain_id", "proposer_pubkey", "registration_sig", "registry", "schema",
+                                             "staker"])
+                self.assertEqual(p["schema"], "citrate-registration-proof/1")
+                self.assertEqual(p["chain_id"], 40204)
+                self.assertEqual(p["registry"], REG_TEST)
+                self.assertEqual(p["staker"], v["staker_address"])
+                self.assertEqual(p["proposer_pubkey"], v["proposer_pubkey"])
+                self.assertRegex(p["registration_sig"], r"^0x[0-9a-f]{128}$")
+            seen = tree_bytes(env.state) + r.stdout.encode() + r.stderr.encode()
+            for n in (n for s_ in env.secrets() for n in leak_needles(s_)):
+                self.assertNotIn(n, seen)
+        finally:
+            env.close()
+
+    def test_a_proof_for_another_staker_or_registry_is_refused(self):
+        if os.environ.get("R1006_TEST_KEYTOOL"):
+            self.skipTest("fake-keytool control")
+        for label, extra in (("staker", {"FAKE_PROOF_STAKER": "0x" + "77" * 20}),
+                             ("registry", {"FAKE_PROOF_REGISTRY": "0x" + "ee" * 20}),
+                             ("extra field", {"FAKE_PROOF_EXTRA": '"seed": "00"'})):
+            with self.subTest(label):
+                env = Env(2)
+                try:
+                    r = env.run("keys", env=extra)
+                    self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+                    self.assertFalse((env.state / "r1006-registration-proofs.json").exists())
+                    self.assertEqual(list((env.state / "pub").glob("*.proof.json")), [])
+                finally:
+                    env.close()
+
+    def test_a_proof_step_that_leaks_the_proposer_key_is_contained(self):
+        for scan in (True, False):
+            with self.subTest(host_scan=scan):
+                env = Env(2)
+                try:
+                    src = mutate(AGENT.read_text(), [(PROOF_ANCHOR, PROOF_ANCHOR + '\n  cat -- "$DATA/proposer.key" >&2')])
+                    if not scan:
+                        src = mutate(src, NO_HOST_SCAN)
+                    m = env.tmp / "agent.mut.sh"
+                    m.write_text(src)
+                    r = env.run("keys", agent=m)
+                    self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+                    self.assertFalse((env.state / "r1006-registration-proofs.json").exists())
+                    seen = tree_bytes(env.state) + r.stdout.encode() + r.stderr.encode()
+                    for n in (n for s_ in env.secrets() for n in leak_needles(s_)):
+                        self.assertNotIn(n, seen)
+                finally:
+                    env.close()
+
+    def test_no_committed_registry_fails_closed(self):
+        env = Env(2)
+        try:
+            env.set_committed(R1006_TEST, None)
+            r = env.run("keys")
+            self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("ValidatorRegistry", r.stdout + r.stderr)
+        finally:
+            env.close()
+
+
+# The line in host_agent.sh after which a mutation leaks from the proof step.
+PROOF_ANCHOR = 'proof_tool_rc=0'
 
 
 class AgentTest(unittest.TestCase):
@@ -914,7 +1073,7 @@ class RenderProfileTest(unittest.TestCase):
             for i in (1, 2, 3)]}
         self.stakes = render_profile.stakes_doc(self.prod, 32000, 100)
         self.fill = {"schema": "r1006-genesis-fill/1", "genesis_hash": "0x" + "ab" * 32, "genesis_profile": "r1006",
-                     "validator_registry": "0x" + "cd" * 20, "validator_activation_height": 0,
+                     "validator_registry": "0x" + "cd" * 20, "validator_activation_height": 1000,
                      "validators": [{"proposer_pubkey": p["proposer_pubkey"], "staker": p["staker_address"],
                                      "stake_wei": str(32000 * 10**18)} for p in self.prod["producers"]]}
         self.template = json.loads((REPO / "scripts/producers/profiles/r1006.json").read_text())
@@ -963,10 +1122,12 @@ class RenderProfileTest(unittest.TestCase):
             self.assertIn("@10.0.0.2:30303", toml)
             self.assertNotIn("@10.0.0.1:30303", toml)
 
-    def test_activation_zero_only_with_a_genesis_validator_set(self):
-        for at_genesis, want_rc in ((True, 0), (False, 2)):
-            with self.subTest(validators_at_genesis=at_genesis):
-                fill = dict(self.fill, validator_activation_height=0, validators_at_genesis=at_genesis)
+    def test_activation_below_s1_is_refused_even_with_a_genesis_validator_set(self):
+        """The node refuses a validator activation height below S(1)=800 (r1006: 1000)."""
+        for h, at_genesis, want_rc in ((0, True, 2), (799, True, 2), (0, False, 2), (800, True, 0), (1000, True, 0)):
+            with self.subTest(height=h, validators_at_genesis=at_genesis):
+                fill = dict(self.fill, validator_activation_height=h, validators_at_genesis=at_genesis)
+                self.assertEqual(render_profile.check_fill(fill, self.prod, None) == [], want_rc == 0)
                 prof = render_profile.render(self.template, self.prod, fill, "p1")
                 with tempfile.TemporaryDirectory(prefix="dgx-r1006p.") as d:
                     pp = Path(d) / "p1.json"

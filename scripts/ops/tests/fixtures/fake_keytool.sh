@@ -16,7 +16,7 @@
 #
 # Set R1006_TEST_KEYTOOL to a real `citrate` binary to run the key tests against it.
 set -euo pipefail
-if [[ "${1:-}" == --config ]]; then
+if [[ "${1:-}" == --config && $# -eq 2 ]]; then
   exec python3 - "$0" "$2" <<'PY'
 import json, os, re, signal, sys, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -73,7 +73,30 @@ signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
 srv.serve_forever()
 PY
 fi
-[[ "${1:-}" == host-identity ]] || { echo "fake_keytool: only host-identity or --config" >&2; exit 2; }
+# `--config FILE registration-proof --registry R`: the public proof for the identity
+# minted in FILE's data_dir (staker = coinbase). FAKE_PROOF_STAKER / FAKE_PROOF_REGISTRY
+# override a field and FAKE_PROOF_EXTRA adds one (negative controls).
+if [[ "${1:-}" == --config && "${3:-}" == registration-proof ]]; then
+  cfg="$2"; shift 3
+  reg=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in --registry) reg="$2"; shift 2 ;; *) echo "fake_keytool: unknown $1" >&2; exit 2 ;; esac
+  done
+  dir=$(python3 -c 'import json,re,sys
+for l in open(sys.argv[1]):
+    if l.startswith("data_dir ="): print(json.loads(l.split("=",1)[1].strip()))' "$cfg")
+  cb=$(python3 -c 'import json,sys
+for l in open(sys.argv[1]):
+    if l.startswith("coinbase ="): print(json.loads(l.split("=",1)[1].strip()))' "$cfg")
+  [[ -f "$dir/proposer.key" ]] || { echo "no proposer key" >&2; exit 1; }
+  p=$(sha256sum <<<"p$dir" | cut -d' ' -f1)
+  s1=$(sha256sum <<<"s1$dir$reg" | cut -d' ' -f1)
+  s2=$(sha256sum <<<"s2$dir$reg" | cut -d' ' -f1)
+  printf '{"schema":"citrate-registration-proof/1","chain_id":40204,"registry":"%s","staker":"%s","proposer_pubkey":"0x%s","registration_sig":"0x%s%s"%s}\n' \
+    "${FAKE_PROOF_REGISTRY:-$reg}" "${FAKE_PROOF_STAKER:-0x$cb}" "$p" "$s1" "$s2" "${FAKE_PROOF_EXTRA:+,$FAKE_PROOF_EXTRA}"
+  exit 0
+fi
+[[ "${1:-}" == host-identity ]] || { echo "fake_keytool: only host-identity, registration-proof or --config" >&2; exit 2; }
 shift
 dir="" ks="" pw="" out="" mint=0
 while [[ $# -gt 0 ]]; do
