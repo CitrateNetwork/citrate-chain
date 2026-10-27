@@ -34,7 +34,7 @@ while [ $# -gt 0 ]; do
     --fast) FAST=1; shift ;;
     --no-forge) NO_FORGE=1; shift ;;
     --list)
-      echo "gates: fmt-changed, clippy, panic-ratchet, consensus-tripwires, git-rev-deps, audit-lockfiles, fuzz-targets-compile, ci-scripts, test-workspace, test-commd, forge-build, forge-test, genesis-pipeline"
+      echo "gates: fmt-changed, clippy, panic-ratchet, consensus-tripwires, git-rev-deps, audit-lockfiles, fuzz-targets-compile, ci-scripts, test-workspace, wallet-sdk-wasm, test-commd, forge-build, forge-test, genesis-pipeline"
       exit 0 ;;
     -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 1 ;;
@@ -246,6 +246,7 @@ fi
 if [ "$FAST" -eq 1 ]; then
   skip "test-workspace" "--fast"
   skip "test-commd" "--fast"
+  skip "wallet-sdk-wasm" "--fast"
   skip "forge-build" "--fast"
   skip "forge-test" "--fast"
   skip "genesis-pipeline" "--fast"
@@ -286,6 +287,16 @@ else
   # ── gate: commd fold/verify workspaces (mirrors rust-ci.yml commd-workspaces)
   # Own Cargo workspaces, so test-workspace above never reaches them.
   gate "test-commd" bash -c "'$REPO_ROOT/scripts/ci/test_commd_workspaces.sh' --self-test && '$REPO_ROOT/scripts/ci/test_commd_workspaces.sh'"
+  # ── gate: wallet-sdk builds for wasm32 (mirrors rust-ci.yml wallet-sdk-wasm) ─
+  # The extension's worker loads wallet-sdk/src/wasm.rs as a wasm-pack
+  # no-modules bundle; a native-only dependency in that build breaks it.
+  # Skipped if the wasm32 target is not installed; the wasm-pack step inside
+  # is skipped (and says so) unless the pinned wasm-pack is installed.
+  if ! rustup target list --installed 2>/dev/null | grep -qx wasm32-unknown-unknown; then
+    skip "wallet-sdk-wasm" "rustup target add wasm32-unknown-unknown"
+  else
+    gate "wallet-sdk-wasm" scripts/ci/wallet_sdk_wasm_gate.sh
+  fi
 
   # ── gates: solidity ──────────────────────────────────────────────────────
   if [ "$NO_FORGE" -eq 1 ]; then
