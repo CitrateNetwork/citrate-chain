@@ -90,6 +90,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.15"
+# C1-R: drive the real eth_* IoHandler against a follower's store in canonical_apply tests.
+jsonrpc-core = "18.0"
 # #310: paused-clock tests of the consensus timers (node/src/timing.rs).
 tokio = { version = "1.32", features = ["full", "test-util"] }
 # WS-5 ceremony fuzz: property-based coverage of proposer-key derivation,

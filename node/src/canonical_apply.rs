@@ -54,9 +54,11 @@ use std::sync::OnceLock;
 use citrate_consensus::ghostdag::GhostDag;
 use citrate_consensus::types::{Block, Hash};
 use citrate_economics::{RewardCalculator, RewardConfig};
+use citrate_execution::executor::{ReceiptIndexBatch, ReceiptReconcileMarker};
 use citrate_execution::state::StateSnapshot;
 use citrate_execution::types::ExecutionError;
 use citrate_execution::Executor;
+use citrate_storage::chain::StoredReceipt;
 use citrate_storage::StorageManager;
 use primitive_types::U256;
 use tokio::sync::Mutex;
@@ -85,10 +87,191 @@ const MAX_REORG_DEPTH: u64 = 100;
 /// the 2026-08-09 wedge (winning branch 513) sits well inside it.
 const MAX_REORG_FORWARD: u64 = 10_000;
 
+/// Upper bound on the blocks a from-genesis spine rebuild (`recover_to_head`)
+/// walks, and on the blocks the interrupted-rebuild receipt cleanup walks.
+const MAX_RECOVERY_SPINE: usize = 20_000_000;
+
+/// Receipt removals committed per batch by the interrupted-rebuild cleanup and
+/// by the spine rebuild's reset, so a long abandoned span never becomes one
+/// unbounded write batch. Each chunk is idempotent; the cleanup clears the
+/// marker only with the last one.
+const RECEIPT_RECONCILE_CHUNK: usize = 100_000;
+
+/// [`RECEIPT_RECONCILE_CHUNK`], or a test's override on this thread.
+fn receipt_reconcile_chunk() -> usize {
+    #[cfg(test)]
+    if let Some(n) = test_receipt_chunk::get() {
+        return n.max(1);
+    }
+    RECEIPT_RECONCILE_CHUNK
+}
+
+/// Test-only per-thread override of the receipt removal chunk size, so tests
+/// can drive the multi-chunk paths with a handful of transactions.
+#[cfg(test)]
+pub(crate) mod test_receipt_chunk {
+    use std::cell::Cell;
+    thread_local! {
+        static CHUNK: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+    pub(crate) fn set(n: Option<usize>) {
+        CHUNK.with(|c| c.set(n));
+    }
+    pub(crate) fn get() -> Option<usize> {
+        CHUNK.with(|c| c.get())
+    }
+}
+
 /// Treasury address that receives the treasury slice of each block reward.
 /// Mirrors the producer's `settle_block_rewards` basic-credit list and
 /// `RewardConfig.treasury_address`.
 const TREASURY_ADDR: [u8; 20] = [0x11; 20];
+
+// C1-R: the storage reads of the reorg, rebuild and receipt-index paths. Each one
+// returns the store's error to its caller; none of them turns a read error into
+// "absent", because "absent" decides what gets removed, restored or skipped.
+// The one exception is a stored receipt that does not DECODE (see
+// `read_receipt`): the receipt index is RPC data, so it must never decide
+// whether the node follows fork choice.
+// Under `cfg(test)` each read first consults the fault-injection table in
+// `read_faults`, so tests can fail any one of these reads.
+
+fn read_block(storage: &StorageManager, h: &Hash) -> anyhow::Result<Option<Block>> {
+    #[cfg(test)]
+    read_faults::check(read_faults::Site::Block, Some(h))?;
+    storage
+        .blocks
+        .get_block(h)
+        .map_err(|e| anyhow::anyhow!("could not read block {h}: {e}"))
+}
+
+/// The stored receipt of `tx`, for the receipt-index reconcile of a reorg or
+/// rebuild. A value that does not decode reads as `None` with a `warn!`: the
+/// caller still removes the `(block, tx)` entry (the store deletes an
+/// undecodable receipt with its marker) and leaves it out of any abort's restore
+/// set, so the reorg or rebuild proceeds. A storage READ error stays an `Err`:
+/// the same operation reads and writes state on that store, so it cannot
+/// proceed safely on a failing store anyway, and it is retried on the next
+/// fork-choice trigger or start.
+fn read_receipt(
+    storage: &StorageManager,
+    tx: &Hash,
+) -> anyhow::Result<Option<citrate_execution::types::TransactionReceipt>> {
+    #[cfg(test)]
+    read_faults::check(read_faults::Site::Receipt, Some(tx))?;
+    match storage.transactions.get_stored_receipt(tx) {
+        Ok(StoredReceipt::Decoded(r)) => Ok(Some(r)),
+        Ok(StoredReceipt::Absent) => Ok(None),
+        Ok(StoredReceipt::Undecodable(e)) => {
+            warn!("C1-R: the stored receipt of {tx} does not decode ({e}); it is dropped from the receipt index");
+            Ok(None)
+        }
+        Err(e) => Err(anyhow::anyhow!("could not read the receipt of {tx}: {e}")),
+    }
+}
+
+fn read_reconcile_marker(storage: &StorageManager) -> anyhow::Result<Option<(Hash, u64)>> {
+    #[cfg(test)]
+    read_faults::check(read_faults::Site::Marker, None)?;
+    storage
+        .transactions
+        .get_receipt_reconcile_marker()
+        .map_err(|e| anyhow::anyhow!("could not read the receipt rebuild marker: {e}"))
+}
+
+/// Visit every block→transaction index entry, streamed in key order (the
+/// entries of one block arrive together). A read error, or an `Err` from
+/// `visit`, ends the scan with that error.
+fn read_receipt_index(
+    storage: &StorageManager,
+    visit: impl FnMut(Hash, Hash) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    #[cfg(test)]
+    read_faults::check(read_faults::Site::ReceiptIndex, None)?;
+    storage
+        .transactions
+        .for_each_receipt_index_entry(visit)
+        .map_err(|e| anyhow::anyhow!("could not read the receipt index: {e}"))
+}
+
+fn read_applied_tip(storage: &StorageManager) -> anyhow::Result<Option<(Hash, u64)>> {
+    #[cfg(test)]
+    read_faults::check(read_faults::Site::AppliedTip, None)?;
+    storage
+        .blocks
+        .get_applied_tip()
+        .map_err(|e| anyhow::anyhow!("could not read the applied tip: {e}"))
+}
+
+/// Test-only read-fault table for the reads above. Per thread (each test runs on
+/// its own thread and the applicator's reads run on it), so parallel tests do not
+/// see each other's faults.
+#[cfg(test)]
+pub(crate) mod read_faults {
+    use super::Hash;
+    use std::cell::RefCell;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Site {
+        Block,
+        Receipt,
+        Marker,
+        AppliedTip,
+        ReceiptIndex,
+    }
+
+    /// Fail reads at `site` (of `key` only, when set) after letting `skip`
+    /// matching reads through.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct Fault {
+        pub site: Site,
+        pub key: Option<Hash>,
+        pub skip: u32,
+    }
+
+    thread_local! {
+        static FAULTS: RefCell<Vec<Fault>> = const { RefCell::new(Vec::new()) };
+        static HITS: RefCell<u32> = const { RefCell::new(0) };
+    }
+
+    pub(crate) fn set(faults: Vec<Fault>) {
+        FAULTS.with(|f| *f.borrow_mut() = faults);
+        HITS.with(|h| *h.borrow_mut() = 0);
+    }
+
+    pub(crate) fn clear() {
+        set(Vec::new());
+    }
+
+    /// How many reads failed since the last `set`.
+    pub(crate) fn hits() -> u32 {
+        HITS.with(|h| *h.borrow())
+    }
+
+    pub(crate) fn check(site: Site, key: Option<&Hash>) -> anyhow::Result<()> {
+        let hit = FAULTS.with(|f| {
+            for fault in f.borrow_mut().iter_mut() {
+                if fault.site != site || (fault.key.is_some() && fault.key.as_ref() != key) {
+                    continue;
+                }
+                if fault.skip > 0 {
+                    fault.skip = fault.skip.saturating_sub(1);
+                    continue;
+                }
+                return true;
+            }
+            false
+        });
+        if hit {
+            HITS.with(|h| {
+                let mut n = h.borrow_mut();
+                *n = n.saturating_add(1);
+            });
+            anyhow::bail!("injected read fault at {site:?} {key:?}");
+        }
+        Ok(())
+    }
+}
 
 /// Canonical block-reward parameters. **Single source of truth** shared by the
 /// producer (basic reward path) and the receive-side driver, so both credit
@@ -454,11 +637,14 @@ impl CanonicalApplicator {
     /// through `latest_height`" is the correct default. A pure receiver that has
     /// only genesis seeds to (genesis_hash, 0).
     pub fn new(executor: Arc<Executor>, storage: Arc<StorageManager>) -> Self {
-        let tip = storage
-            .blocks
-            .get_applied_tip()
-            .ok()
-            .flatten()
+        let durable_tip = read_applied_tip(&storage).unwrap_or_else(|e| {
+            // Seeding falls back to the latest stored block (as for a store with
+            // no pointer). The receipt cleanup below re-reads the pointer itself
+            // and does not run on this guess.
+            warn!("execute-on-receive: {e}; seeding the applied tip from the latest block");
+            None
+        });
+        let tip = durable_tip
             .map(|(hash, height)| AppliedTip { hash, height })
             .unwrap_or_else(|| {
                 let height = storage.blocks.get_latest_height().unwrap_or(0);
@@ -474,6 +660,28 @@ impl CanonicalApplicator {
             "execute-on-receive: applied tip seeded at {} @ height {}",
             tip.hash, tip.height
         );
+        // C1-R: a from-genesis rebuild that stopped mid-replay may have left the
+        // receipts of its old applied chain above the durable tip. Make the receipt
+        // index match the durable applied chain before anything reads or extends it.
+        // A failure (a read or a write) keeps the marker; the cleanup repeats on
+        // the next start or before the next from-genesis rebuild (which refuses
+        // to run until it completes).
+        let cleaned = Self::interrupted_rebuild_cleanup(&storage).and_then(|batches| {
+            batches.iter().enumerate().try_for_each(|(i, b)| {
+                executor.persist_receipt_index_at_startup(b).map_err(|e| {
+                    anyhow::anyhow!(
+                        "write {} of {} failed (the rebuild marker is kept): {e}",
+                        i.saturating_add(1),
+                        batches.len()
+                    )
+                })
+            })
+        });
+        if let Err(e) = cleaned {
+            warn!(
+                "C1-R: receipt cleanup after an unfinished rebuild did not complete: {e}; it is retried on the next start or rebuild"
+            );
+        }
         // Seed the reorg ring with the current state as-of the seeded tip: the
         // executor reflects this tip's state at construction, so it is the base a
         // reorg can revert to before any new block is applied.
@@ -816,16 +1024,21 @@ impl CanonicalApplicator {
     /// Walk `start`'s selected-parent ancestry down to `target` height and return the hash of
     /// the ancestor at that height (`None` if a block is missing or `target` is above `start`).
     /// Used by the I4 finality guard on the spine-rebuild path (CHAIN-B-A002).
-    fn ancestor_hash_at_height(&self, start: Hash, target: u64) -> Option<Hash> {
+    ///
+    /// A storage read error is returned, never read as "missing": the caller is a
+    /// finality guard, and a skipped guard is not a passed one.
+    fn ancestor_hash_at_height(&self, start: Hash, target: u64) -> anyhow::Result<Option<Hash>> {
         let mut cursor = start;
         loop {
-            let block = self.storage.blocks.get_block(&cursor).ok().flatten()?;
+            let Some(block) = read_block(&self.storage, &cursor)? else {
+                return Ok(None);
+            };
             let h = block.header.height;
             if h == target {
-                return Some(cursor);
+                return Ok(Some(cursor));
             }
             if h < target || h == 0 {
-                return None;
+                return Ok(None);
             }
             cursor = block.selected_parent();
         }
@@ -834,29 +1047,40 @@ impl CanonicalApplicator {
     /// Whether `head`'s selected-parent ancestry passes through `ancestor` (at
     /// `ancestor_height`). Used by the I4 finality guard (CHAIN-B-A002) to confirm a
     /// spine-rebuild target still contains the currently-finalized block.
-    fn head_descends_from(&self, head: Hash, ancestor: Hash, ancestor_height: u64) -> bool {
+    /// A storage read error is returned (never read as "does not descend").
+    fn head_descends_from(
+        &self,
+        head: Hash,
+        ancestor: Hash,
+        ancestor_height: u64,
+    ) -> anyhow::Result<bool> {
         let mut cursor = head;
         loop {
             if cursor == ancestor {
-                return true;
+                return Ok(true);
             }
-            let block = match self.storage.blocks.get_block(&cursor).ok().flatten() {
-                Some(b) => b,
-                None => return false,
+            let Some(block) = read_block(&self.storage, &cursor)? else {
+                return Ok(false);
             };
             if block.header.height <= ancestor_height {
                 // Reached (or passed) the finalized height without hitting `ancestor`.
-                return cursor == ancestor;
+                return Ok(cursor == ancestor);
             }
             cursor = block.selected_parent();
         }
     }
 
     /// Whether the applied tip lies on `head`'s selected-parent chain: the node
-    /// is only behind `head`, and the drain reaches it by applying forward.
+    /// is only behind `head`, and the drain reaches it by applying forward. A
+    /// storage read error answers `false` (logged): the caller then takes the
+    /// rebuild path, which reads the same blocks and aborts on the same error.
     pub async fn applied_tip_is_ancestor_of(&self, head: Hash) -> bool {
         let tip = self.applied_tip().await;
         self.head_descends_from(head, tip.hash, tip.height)
+            .unwrap_or_else(|e| {
+                warn!("execute-on-receive: ancestry check toward {head} failed: {e}");
+                false
+            })
     }
 
     /// The shared state-advance lock (applied tip + reorg snapshot ring). The
@@ -963,14 +1187,25 @@ impl CanonicalApplicator {
                 return Ok(None);
             }
         };
-        let mut extensions: Vec<Block> = children
-            .into_iter()
-            .filter_map(|h| self.storage.blocks.get_block(&h).ok().flatten())
-            .filter(|b| {
-                b.selected_parent() == tip.hash
-                    && Some(b.header.height) == tip.height.checked_add(1)
-            })
-            .collect();
+        // A child that cannot be read is not "no child": skipping it could make a
+        // fork look like a unique extension. Do not advance on this pass.
+        let mut extensions: Vec<Block> = Vec::new();
+        for h in children {
+            match read_block(&self.storage, &h) {
+                Ok(Some(b)) => {
+                    if b.selected_parent() == tip.hash
+                        && Some(b.header.height) == tip.height.checked_add(1)
+                    {
+                        extensions.push(b);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("execute-on-receive: {e}; not advancing past {}", tip.hash);
+                    return Ok(None);
+                }
+            }
+        }
         match extensions.len() {
             0 => Ok(None),
             1 => Ok(extensions.pop()),
@@ -1109,7 +1344,15 @@ impl CanonicalApplicator {
         // producer's sealed state root (every subsequent block re-sealed the fork-point root
         // while balances advanced) and wedging the fleet (block-174). If the block's height
         // is unknown (not persisted), fall through to the normal fork-point walk.
-        if let Ok(Some(nb)) = self.storage.blocks.get_block(&new_tip) {
+        // A read ERROR is not "not persisted": decline the reorg (nothing changed yet).
+        let new_tip_block = match read_block(&self.storage, &new_tip) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("execute-on-receive: reorg to {new_tip} declined: {e}");
+                return ReorgOutcome::Rejected(format!("reorg to {new_tip}: {e}"));
+            }
+        };
+        if let Some(nb) = new_tip_block {
             if self.on_applied_chain(state, new_tip, nb.header.height) {
                 debug!(
                     "execute-on-receive: fork-choice tip {} @ {} is already on the applied chain (ancestor of tip {} @ {}) — declining backwards reorg",
@@ -1147,9 +1390,14 @@ impl CanonicalApplicator {
         let mut branch: Vec<Block> = Vec::new(); // new_tip .. fork_point+1
         let mut cursor = new_tip;
         let fork = loop {
-            let block = match self.storage.blocks.get_block(&cursor).ok().flatten() {
-                Some(b) => b,
-                None => {
+            let block = match read_block(&self.storage, &cursor) {
+                Ok(Some(b)) => b,
+                Err(e) => {
+                    // Nothing has changed yet; a read error is never a missing block
+                    // (which could pass for the genesis sentinel).
+                    return ReorgOutcome::Rejected(format!("reorg to {new_tip}: {e}"));
+                }
+                Ok(None) => {
                     // The genesis base is a sentinel (`Hash::default` @ height 0)
                     // seeded into the ring at construction with no stored block. A
                     // branch that forks at genesis walks down to it — that is the
@@ -1214,6 +1462,32 @@ impl CanonicalApplicator {
             ));
         }
 
+        // C1-R: the receipts of the abandoned applied blocks (fork point, pre_tip]
+        // leave the receipt index in the SAME batch that moves the durable tip to the
+        // fork point; every abort below puts them back with the tip it restores.
+        // Both are prepared in full BEFORE anything is changed: a read error (or an
+        // incomplete walk) declines the reorg with memory, store, receipts and tip
+        // untouched, so no abort below can ever restore from a partial copy.
+        let fork_height = fork.height;
+        let (abandon_index, restore_index) = match self.abandoned_receipt_index(
+            pre_tip.hash,
+            pre_tip.height,
+            usize::try_from(MAX_REORG_DEPTH).unwrap_or(usize::MAX),
+            |b| b.header.height > fork_height,
+        ) {
+            Ok((abandon, restore, Some(base))) if base == fork => (abandon, restore),
+            Ok((_, _, base)) => {
+                return ReorgOutcome::Rejected(format!(
+                    "reorg to {new_tip}: the applied chain from {} does not reach the fork point {} @ {} (walk ended at {base:?})",
+                    pre_tip.hash, fork.hash, fork.height
+                ));
+            }
+            Err(e) => {
+                warn!("execute-on-receive: reorg to {new_tip} declined: {e}");
+                return ReorgOutcome::Rejected(format!("reorg to {new_tip}: {e}"));
+            }
+        };
+
         // Revert IN-MEMORY state to the fork point. `base_snapshot` is RETAINED
         // (cloned into `state_restore`) because it is also the reconcile baseline for
         // both the success (forward) and abort (restore) store writes below.
@@ -1257,19 +1531,27 @@ impl CanonicalApplicator {
         // state, so a crash during the (in-memory-only) reapply below leaves durable
         // state and durable tip both AT THE FORK POINT — never torn. On success the tip
         // advances to the winning tip (below); on abort it is restored to pre_tip.
-        if let Err(e) = self
-            .executor
-            .reconcile_store_from(&pre_state, Some((fork.hash, fork.height)))
-        {
+        if let Err(e) = self.executor.reconcile_store_from_with_index(
+            &pre_state,
+            Some((fork.hash, fork.height)),
+            &abandon_index,
+        ) {
             // The reconcile is a single atomic batch (unchanged on failure).
             // Restore in-memory state + the §R' policy cell and best-effort re-reconcile
             // the store back to pre_state (with pre_tip), then decline the reorg — world
             // state is left as before the attempt (invariant I3).
             self.executor.state_restore(pre_state.clone());
             self.executor.restore_reward_policy(pre_policy.clone());
-            let _ = self
-                .executor
-                .reconcile_store_from(&base_snapshot, Some((pre_tip.hash, pre_tip.height)));
+            if let Err(re) = self.executor.reconcile_store_from_with_index(
+                &base_snapshot,
+                Some((pre_tip.hash, pre_tip.height)),
+                &restore_index,
+            ) {
+                warn!(
+                    "execute-on-receive: reorg to {} abort — store restore failed: {re}",
+                    new_tip
+                );
+            }
             warn!(
                 "execute-on-receive: reorg to {} aborted — could not revert store to fork point {} @ {}: {} (reverted to {})",
                 new_tip, fork.hash, fork.height, e, pre_tip.hash
@@ -1322,10 +1604,11 @@ impl CanonicalApplicator {
                 if let Err(e) = hook(gov).await {
                     self.executor.state_restore(pre_state.clone());
                     self.executor.restore_reward_policy(pre_policy.clone());
-                    if let Err(re) = self
-                        .executor
-                        .reconcile_store_from(&base_snapshot, Some((pre_tip.hash, pre_tip.height)))
-                    {
+                    if let Err(re) = self.executor.reconcile_store_from_with_index(
+                        &base_snapshot,
+                        Some((pre_tip.hash, pre_tip.height)),
+                        &restore_index,
+                    ) {
                         warn!(
                             "execute-on-receive: reorg to {} abort — store restore failed: {re}",
                             new_tip
@@ -1342,17 +1625,24 @@ impl CanonicalApplicator {
             }
         }
 
+        // C1-R: the winning branch's receipts, committed with its state + tip below.
+        let mut win_index = ReceiptIndexBatch::default();
         for block in &branch {
             let apply_result = match self.reward_credits(block) {
                 Ok(credits) => {
                     self.executor
-                        .apply_block_no_persist(block, block.header.coinbase, &credits)
+                        .apply_block_no_persist_with_receipts(
+                            block,
+                            block.header.coinbase,
+                            &credits,
+                        )
                         .await
                 }
                 Err(e) => Err(ExecutionError::RewardSettlement(e.to_string())),
             };
             match apply_result {
-                Ok(_) => {
+                Ok((_, receipts)) => {
+                    win_index.extend(ReceiptIndexBatch::for_block(block, &receipts));
                     let h = block.header.height;
                     let hh = block.header.block_hash;
                     tip = AppliedTip {
@@ -1376,9 +1666,10 @@ impl CanonicalApplicator {
                                 // atomic batch) so the abort leaves the durable store AND
                                 // durable tip byte-identical to before the reorg (I2).
                                 // memory == pre_state, store == fork point (== base_snapshot).
-                                if let Err(re) = self.executor.reconcile_store_from(
+                                if let Err(re) = self.executor.reconcile_store_from_with_index(
                                     &base_snapshot,
                                     Some((pre_tip.hash, pre_tip.height)),
+                                    &restore_index,
                                 ) {
                                     warn!(
                                         "execute-on-receive: reorg to {} abort — store restore to pre_state failed: {re}",
@@ -1407,10 +1698,11 @@ impl CanonicalApplicator {
                     self.executor.state_restore(pre_state);
                     self.executor.restore_reward_policy(pre_policy.clone());
                     // memory == pre_state, store == fork point (== base_snapshot).
-                    if let Err(re) = self
-                        .executor
-                        .reconcile_store_from(&base_snapshot, Some((pre_tip.hash, pre_tip.height)))
-                    {
+                    if let Err(re) = self.executor.reconcile_store_from_with_index(
+                        &base_snapshot,
+                        Some((pre_tip.hash, pre_tip.height)),
+                        &restore_index,
+                    ) {
                         warn!(
                             "execute-on-receive: reorg to {} abort — store restore to pre_state failed: {re}",
                             new_tip
@@ -1441,22 +1733,47 @@ impl CanonicalApplicator {
         // reconcile (and came AFTER a state batch that OMITTED the tip) was the bug. The
         // `put_applied_tip` below is kept only as a redundant idempotent re-write (and as
         // the durable write for store-less test executors); see its comment.
-        if let Err(e) = self
-            .executor
-            .reconcile_store_from(&base_snapshot, Some((tip.hash, tip.height)))
-        {
+        if let Err(e) = self.executor.reconcile_store_from_with_index(
+            &base_snapshot,
+            Some((tip.hash, tip.height)),
+            &win_index,
+        ) {
+            // The batch is atomic, so the store (and its receipts and tip) is still
+            // at the fork point. Adopting the winning branch in memory only would
+            // leave memory ahead of a store that never received it; abort exactly
+            // like a failed reapply instead: memory back to pre_state, store back
+            // to pre_state with pre_tip and the abandoned receipts restored.
+            self.executor.state_restore(pre_state);
+            self.executor.restore_reward_policy(pre_policy);
+            if let Err(re) = self.executor.reconcile_store_from_with_index(
+                &base_snapshot,
+                Some((pre_tip.hash, pre_tip.height)),
+                &restore_index,
+            ) {
+                warn!(
+                    "execute-on-receive: reorg to {} abort — store restore to pre_state failed: {re}",
+                    new_tip
+                );
+            }
             warn!(
-                "execute-on-receive: reorg to {} applied in-memory but store reconcile failed: {}",
-                new_tip, e
+                "execute-on-receive: reorg to {} aborted — store commit of the winning branch failed: {} (reverted to {})",
+                new_tip, e, pre_tip.hash
             );
+            return ReorgOutcome::Rejected(format!("reorg store commit to {new_tip} failed: {e}"));
         }
         // Persist the new branch's state roots + re-sync the selector at any S(E)
         // the reorg crossed (deferred to here so an abort writes nothing durable).
         for block in &branch {
-            let _ = self
+            if let Err(e) = self
                 .storage
                 .state
-                .put_state_root(&block.header.block_hash, &block.state_root);
+                .put_state_root(&block.header.block_hash, &block.state_root)
+            {
+                warn!(
+                    "execute-on-receive: failed to persist state root for {}: {}",
+                    block.header.block_hash, e
+                );
+            }
             self.maybe_sync_registry(block.header.height).await;
         }
 
@@ -1799,6 +2116,26 @@ impl CanonicalApplicator {
             None => return Ok(false),
         };
         let mut state = self.lock.lock().await;
+        // C1-R: settle any receipts an earlier, unfinished rebuild left above the
+        // durable tip before this rebuild records its own marker. The writes go
+        // through the executor's store (the same fsync'd path as the rebuild). If
+        // the cleanup does not complete, ABORT before changing anything: recording
+        // this rebuild's marker would overwrite the earlier one, and the receipts
+        // only that marker reaches would stay visible for good.
+        let batches = Self::interrupted_rebuild_cleanup(&self.storage).map_err(|e| {
+            anyhow::anyhow!(
+                "C1-R: receipt cleanup before the rebuild failed (rebuild aborted): {e}"
+            )
+        })?;
+        for (i, batch) in batches.iter().enumerate() {
+            self.executor.persist_receipt_index(batch).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "C1-R: receipt cleanup write {} of {} failed (the rebuild marker is kept; rebuild aborted): {e}",
+                    i.saturating_add(1),
+                    batches.len()
+                )
+            })?;
+        }
         if state.tip.hash == head {
             return Ok(false);
         }
@@ -1814,8 +2151,15 @@ impl CanonicalApplicator {
         // honest-traffic outcome today; it is the floor the guard needs once finality wires.)
         let floor = self.effective_floor(&state, true);
         if floor > 0 && floor <= state.tip.height {
-            if let Some(finalized_hash) = self.ancestor_hash_at_height(state.tip.hash, floor) {
-                if !self.head_descends_from(head, finalized_hash, floor) {
+            // A read error aborts the rebuild: the guard is never skipped on one.
+            let finalized = self
+                .ancestor_hash_at_height(state.tip.hash, floor)
+                .map_err(|e| anyhow::anyhow!("I4 guard: {e} (rebuild aborted)"))?;
+            if let Some(finalized_hash) = finalized {
+                let descends = self
+                    .head_descends_from(head, finalized_hash, floor)
+                    .map_err(|e| anyhow::anyhow!("I4 guard: {e} (rebuild aborted)"))?;
+                if !descends {
                     warn!(
                         "CONSENSUS ALARM (I4/CHAIN-B-A002): refusing spine rebuild to head {} — \
                          it does not descend from the finalized block {} @ {} (applied tip {} @ {}). \
@@ -1831,12 +2175,117 @@ impl CanonicalApplicator {
              rebuilding state from genesis (same-height-sibling wedge remediation)",
             state.tip.hash, state.tip.height, head
         );
-        // Capture the pre-recovery world state + applied pointer + ring so the whole
-        // operation is ATOMIC: it either fully converges on the head and commits, or
-        // it aborts leaving the node byte-identical to how it started. The store
-        // currently reflects `pre` (the losing applied tip).
-        let pre = self.executor.state_snapshot();
+        // C1-R: every read the rebuild and its rollback depend on happens HERE,
+        // before anything is changed. A read error returns `Err` with memory, store,
+        // receipts, tip and ring untouched; no abort below reads storage to decide
+        // what to restore.
+        let read_err = |e: anyhow::Error| anyhow::anyhow!("C1-R: {e} (rebuild aborted)");
+        let genesis_block = read_block(&self.storage, &genesis_hash).map_err(read_err)?;
+
+        // The canonical spine to replay (see the replay loop below for why the head's
+        // own ancestry is used), ascending. A block that is not stored ends the walk
+        // (the replay then cannot reach the head and rolls back); a read error aborts.
+        let mut spine: Vec<Hash> = Vec::new();
+        let mut spine_heights: Vec<u64> = Vec::new();
+        let mut cursor = head;
+        while let Some(block) = read_block(&self.storage, &cursor).map_err(read_err)? {
+            if block.header.height == 0 {
+                break; // reached genesis (the reset base) — do not re-apply it
+            }
+            spine.push(cursor);
+            spine_heights.push(block.header.height);
+            cursor = block.selected_parent();
+            if spine.len() >= MAX_RECOVERY_SPINE {
+                break;
+            }
+        }
+        spine.reverse(); // ascending height: genesis+1 .. head
+        spine_heights.reverse();
+
+        // C1-R: the receipts of the applied blocks NOT on the spine (the losing
+        // segment above the common ancestor) leave the receipt index in the SAME
+        // batch as the genesis reset; the spine replay re-writes the spine's own
+        // receipts per block. `common` is the highest pre-recovery block that is also
+        // on the spine; every abort removes the receipts the replay wrote above it
+        // and puts the losing segment's back.
+        //
+        // The shared prefix (genesis, common] keeps its receipts while the durable
+        // tip is below it. The reset batch therefore also records `pre_tip` as the
+        // rebuild marker: if the process stops before the replay passes the prefix,
+        // the next start removes every receipt of that old chain that is not on the
+        // durable applied chain (`interrupted_rebuild_cleanup`), whatever
+        // branch fork choice picks then. Success and every abort clear the marker.
         let pre_tip = state.tip;
+        let spine_set: std::collections::HashSet<Hash> = spine.iter().copied().collect();
+        let (abandon_index, restore_index, common) = self
+            .abandoned_receipt_index(pre_tip.hash, pre_tip.height, MAX_RECOVERY_SPINE, |b| {
+                b.header.height > 0 && !spine_set.contains(&b.header.block_hash)
+            })
+            .map_err(read_err)?;
+        // Without a known base, the old chain's walk ended at a block that is not
+        // stored: the start-up hardening purge removed it (and its receipts) and
+        // left the applied tip on it. The old chain's blocks below it still hold
+        // receipts, but nothing links them to `pre_tip` any more, so the walk
+        // cannot find them. Reconcile the whole receipt index against the spine
+        // instead: every entry of a block that is not on the spine leaves in the
+        // reset batch, and every abort puts the receipts back.
+        let (abandon_index, restore_index) = match common {
+            Some(_) => (abandon_index, restore_index),
+            None => {
+                warn!(
+                    "canonical recovery: the applied chain from {} @ {} is not fully stored; reconciling the receipt index against the spine",
+                    pre_tip.hash, pre_tip.height
+                );
+                Self::off_chain_receipt_index(&self.storage, |block| {
+                    *block == genesis_hash || spine_set.contains(block)
+                })
+                .map_err(read_err)?
+            }
+        };
+        // Every spine block is then treated as possibly new; the receipt check
+        // below keeps the ones the old chain already had.
+        let common_height = common.map(|c| c.height).unwrap_or(0);
+        // The removals an abort needs: the receipts the replay writes fresh for
+        // spine blocks above `common`, keyed by spine position. A receipt that
+        // already names its spine block was there before the rebuild (the replay
+        // rewrites it identically), so the abort keeps it.
+        let mut new_removals: Vec<(usize, Vec<(Hash, Hash)>)> = Vec::new();
+        for (i, (h, height)) in spine.iter().zip(&spine_heights).enumerate() {
+            if *height <= common_height {
+                continue;
+            }
+            let block = read_block(&self.storage, h)
+                .map_err(read_err)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "C1-R: spine block {h} vanished during preparation (rebuild aborted)"
+                    )
+                })?;
+            let mut removals = Vec::new();
+            for tx in &block.transactions {
+                let existing = read_receipt(&self.storage, &tx.hash).map_err(read_err)?;
+                if existing.map(|r| r.block_hash) != Some(*h) {
+                    removals.push((*h, tx.hash));
+                }
+            }
+            new_removals.push((i, removals));
+        }
+        let rollback_index = |applied_through: usize| {
+            let mut idx = ReceiptIndexBatch::default();
+            for (_, removals) in new_removals.iter().filter(|(i, _)| *i < applied_through) {
+                idx.removals.extend(removals.iter().copied());
+            }
+            idx.extend(restore_index.clone());
+            // Back on pre_tip with its receipts restored: nothing is left above the
+            // durable tip, so the rebuild marker goes in the same batch.
+            idx.with_marker(ReceiptReconcileMarker::Clear)
+        };
+
+        // Capture the pre-recovery world state + ring so the whole operation is
+        // ATOMIC: it either fully converges on the head and commits, or it aborts
+        // leaving the node byte-identical to how it started. The store currently
+        // reflects `pre` (the losing applied tip).
+        let pre = self.executor.state_snapshot();
         let pre_snapshots = std::mem::take(&mut state.snapshots);
 
         // Reset BOTH in-memory world state AND the durable store to genesis. The
@@ -1853,21 +2302,61 @@ impl CanonicalApplicator {
         // tip both AT GENESIS (consistent — the node just re-syncs from genesis) rather
         // than a genesis store under a stale higher tip (torn → fork on restart). The
         // forward spine replay below re-advances the tip atomically per block.
-        self.executor
-            .reconcile_store_from(&pre, Some((genesis_hash, 0)))?;
+        //
+        // C1-R: the reset batch carries at most one chunk of the losing segment's
+        // receipt removals (all of them, for any losing segment of up to
+        // RECEIPT_RECONCILE_CHUNK transactions), so it stays bounded however deep
+        // the fork is. The rest are written in chunks right after it. That is
+        // safe across a crash: the reset batch records `pre_tip` as the rebuild
+        // marker, and the cleanup a restart runs for it removes every receipt of
+        // the old chain that is not on the durable applied chain, a superset of
+        // the removals still pending.
+        let mut removal_chunks = abandon_index
+            .removals
+            .chunks(receipt_reconcile_chunk())
+            .map(<[(Hash, Hash)]>::to_vec);
+        let reset_index = ReceiptIndexBatch {
+            removals: removal_chunks.next().unwrap_or_default(),
+            ..ReceiptIndexBatch::default()
+        }
+        .with_marker(ReceiptReconcileMarker::Set(pre_tip.hash, pre_tip.height));
+        let residual_removals: Vec<Vec<(Hash, Hash)>> = removal_chunks.collect();
+        drop(abandon_index);
+        if let Err(e) = self.executor.reconcile_store_from_with_index(
+            &pre,
+            Some((genesis_hash, 0)),
+            &reset_index,
+        ) {
+            // The reset batch is atomic: the store is still at `pre`. Put memory and
+            // the ring back with it.
+            self.executor.state_restore(pre);
+            state.snapshots = pre_snapshots;
+            return Err(anyhow::anyhow!(
+                "canonical recovery: genesis reset failed (nothing changed): {e}"
+            ));
+        }
         // VALIDATE the reconstructed genesis against the persisted genesis block. A
         // wrong reconstruction (chain-id / genesis-profile drift) aborts here; restore
         // both memory and store to the pre-recovery state first.
-        if let Ok(Some(g0)) = self.storage.blocks.get_block(&genesis_hash) {
+        if let Some(g0) = &genesis_block {
             let rebuilt_root = self.executor.calculate_state_root();
             if rebuilt_root != g0.state_root {
                 let genesis_now = self.executor.state_snapshot();
                 self.executor.state_restore(pre);
-                // #126: restore the durable tip to pre_tip alongside the reverse reconcile.
-                let _ = self
-                    .executor
-                    .reconcile_store_from(&genesis_now, Some((pre_tip.hash, pre_tip.height)));
                 state.snapshots = pre_snapshots;
+                // #126: restore the durable tip to pre_tip alongside the reverse reconcile.
+                self.executor
+                    .reconcile_store_from_with_index(
+                        &genesis_now,
+                        Some((pre_tip.hash, pre_tip.height)),
+                        &rollback_index(0),
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "canonical recovery: genesis root mismatch, and restoring the store to {} failed: {e}",
+                            pre_tip.hash
+                        )
+                    })?;
                 warn!(
                     "canonical recovery: reconstructed genesis root {} != persisted block-0 root {} — \
                      aborting without changes (genesis config drift?)",
@@ -1876,6 +2365,41 @@ impl CanonicalApplicator {
                 return Ok(false);
             }
         }
+        // C1-R: the losing segment's remaining receipt removals, one bounded
+        // batch each. A failed write rolls back to `pre_tip` exactly like a
+        // genesis mismatch: memory, store, receipts (the restore set puts back
+        // whatever the reset or an earlier chunk removed) and tip.
+        for (i, chunk) in residual_removals.iter().enumerate() {
+            let batch = ReceiptIndexBatch {
+                removals: chunk.clone(),
+                ..ReceiptIndexBatch::default()
+            };
+            if let Err(e) = self.executor.persist_receipt_index(&batch).await {
+                let genesis_now = self.executor.state_snapshot();
+                self.executor.state_restore(pre);
+                state.snapshots = pre_snapshots;
+                self.executor
+                    .reconcile_store_from_with_index(
+                        &genesis_now,
+                        Some((pre_tip.hash, pre_tip.height)),
+                        &rollback_index(0),
+                    )
+                    .map_err(|e2| {
+                        anyhow::anyhow!(
+                            "canonical recovery: receipt removal write {} failed ({e}), and restoring the store to {} failed: {e2}",
+                            i.saturating_add(2),
+                            pre_tip.hash
+                        )
+                    })?;
+                return Err(anyhow::anyhow!(
+                    "canonical recovery: receipt removal write {} failed (rolled back to {} @ {}): {e}",
+                    i.saturating_add(2),
+                    pre_tip.hash,
+                    pre_tip.height
+                ));
+            }
+        }
+        drop(residual_removals);
         state.tip = AppliedTip {
             hash: genesis_hash,
             height: 0,
@@ -1893,24 +2417,15 @@ impl CanonicalApplicator {
         // reproduces canonical state with no reorg and no depth limit. `state.record`
         // keeps the ring bounded to the last MAX_REORG_DEPTH heights, so the rebuilt
         // ring ends populated across the recent window (future live reorgs work).
-        const MAX_RECOVERY_SPINE: usize = 20_000_000;
-        let mut spine: Vec<Hash> = Vec::new();
-        let mut cursor = head;
-        while let Some(block) = self.storage.blocks.get_block(&cursor).ok().flatten() {
-            if block.header.height == 0 {
-                break; // reached genesis (the reset base) — do not re-apply it
-            }
-            spine.push(cursor);
-            cursor = block.selected_parent();
-            if spine.len() >= MAX_RECOVERY_SPINE {
-                break;
-            }
-        }
-        spine.reverse(); // ascending height: genesis+1 .. head
+        let mut replayed: usize = 0;
         for h in &spine {
-            let block = match self.storage.blocks.get_block(h).ok().flatten() {
-                Some(b) => b,
-                None => break, // missing block — reach check below rolls back
+            let block = match read_block(&self.storage, h) {
+                Ok(Some(b)) => b,
+                Ok(None) => break, // missing block — reach check below rolls back
+                Err(e) => {
+                    warn!("canonical recovery: {e} — aborting rebuild");
+                    break; // the reach check below rolls back
+                }
             };
             // TRUSTED replay: skip the per-block full-trie root recompute (the ~O(N^2)
             // wall that made a from-genesis rebuild take hours). Correctness is
@@ -1925,6 +2440,7 @@ impl CanonicalApplicator {
             };
             match apply_result {
                 Ok(_) => {
+                    replayed = replayed.saturating_add(1);
                     // Record the block's CLAIMED root (trusted) in the ring; the ring
                     // snapshot is the executor state, which is correct regardless.
                     let snap = self.executor.state_snapshot();
@@ -1950,15 +2466,21 @@ impl CanonicalApplicator {
         // rebuild with a SINGLE final root check: a wrong block anywhere in the spine
         // yields a wrong final state root. Converged iff we reached the head AND its
         // state root reproduces.
-        let head_root_ok = state.tip.hash == head
-            && self
-                .storage
-                .blocks
-                .get_block(&head)
-                .ok()
-                .flatten()
-                .map(|hb| self.executor.calculate_state_root() == hb.state_root)
-                .unwrap_or(false);
+        let head_block = if state.tip.hash == head {
+            match read_block(&self.storage, &head) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!("canonical recovery: {e} — cannot verify the head root");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let head_root_ok = head_block
+            .as_ref()
+            .map(|hb| self.executor.calculate_state_root() == hb.state_root)
+            .unwrap_or(false);
         if !head_root_ok {
             // Did not converge — exceptional after the genesis validation above (would
             // require a corrupt/missing stored block or a divergent replay). Roll the
@@ -1968,12 +2490,20 @@ impl CanonicalApplicator {
             let partial = self.executor.state_snapshot();
             self.executor.state_restore(pre);
             // #126: restore the durable tip to pre_tip alongside the reverse reconcile.
-            let _ = self
-                .executor
-                .reconcile_store_from(&partial, Some((pre_tip.hash, pre_tip.height)));
+            let restored = self.executor.reconcile_store_from_with_index(
+                &partial,
+                Some((pre_tip.hash, pre_tip.height)),
+                &rollback_index(replayed),
+            );
             state.tip = pre_tip;
             state.snapshots = pre_snapshots;
             self.publish_applied_height(&state);
+            restored.map_err(|e| {
+                anyhow::anyhow!(
+                    "canonical recovery: did not reach head {head}, and restoring the store to {} failed: {e}",
+                    pre_tip.hash
+                )
+            })?;
             warn!(
                 "canonical recovery: did not reach head {} (stopped at {} @ {}) — rolled back to prior state",
                 head, pre_tip.hash, pre_tip.height
@@ -1985,8 +2515,20 @@ impl CanonicalApplicator {
         // reset to genesis before replay, and each spine block's `apply_block`
         // persisted its changes forward — so no losing-branch residue remains and no
         // final reconcile is needed.
-        if let Ok(Some(head_block)) = self.storage.blocks.get_block(&state.tip.hash) {
+        if let Some(head_block) = &head_block {
             self.persist_applied(&state.tip.hash, state.tip.height, &head_block.state_root);
+        }
+        // C1-R: the replay rewrote the whole shared prefix, so the receipt index
+        // matches the applied chain again; drop the rebuild marker. If this write is
+        // lost, the next start's cleanup finds nothing left to remove and clears it.
+        if let Err(e) = self
+            .executor
+            .persist_receipt_index(
+                &ReceiptIndexBatch::default().with_marker(ReceiptReconcileMarker::Clear),
+            )
+            .await
+        {
+            warn!("canonical recovery: could not clear the receipt rebuild marker: {e}");
         }
         self.publish_applied_height(&state);
         info!(
@@ -2005,6 +2547,285 @@ impl CanonicalApplicator {
                 .get(&height)
                 .map(|(h, _)| *h == hash)
                 .unwrap_or(false)
+    }
+
+    /// C1-R: the receipt-index changes for blocks that stop being executed. Walks
+    /// `from`'s selected-parent ancestry (`from` sits at `from_height`) while
+    /// `abandoned(block)` holds and returns:
+    /// - `removals`: every `(block, tx)` of those blocks, for the batch that moves
+    ///   the durable applied tip off them;
+    /// - `restore`: the receipts currently stored for them, for an abort that
+    ///   moves the tip back onto them;
+    /// - the first ancestor that is NOT abandoned (the common base), or `None`
+    ///   when an unstored block above height 0 ended the walk. An unstored block
+    ///   at height 0 is the genesis sentinel and is the base.
+    ///
+    /// Read-only. A storage read error, or more than `max_blocks` abandoned
+    /// blocks, is an `Err`, so no caller ever commits a partial removal set or
+    /// rolls back with a partial restore set because a read failed. An unstored
+    /// block is not an error here: the start-up hardening purge removes invalid
+    /// blocks together with their receipts, and the applied tip can sit on them.
+    /// A caller that needs the walk to reach a known base checks `base`.
+    fn abandoned_receipt_index(
+        &self,
+        from: Hash,
+        from_height: u64,
+        max_blocks: usize,
+        abandoned: impl Fn(&Block) -> bool,
+    ) -> anyhow::Result<(ReceiptIndexBatch, ReceiptIndexBatch, Option<AppliedTip>)> {
+        let mut removals = ReceiptIndexBatch::default();
+        let mut restore = ReceiptIndexBatch::default();
+        let mut cursor = from;
+        let mut expected_height = from_height;
+        let mut walked: usize = 0;
+        let base = loop {
+            let Some(block) = read_block(&self.storage, &cursor)? else {
+                if expected_height == 0 {
+                    break Some(AppliedTip {
+                        hash: cursor,
+                        height: 0,
+                    });
+                }
+                warn!(
+                    "C1-R: abandoned-receipt walk from {from} ended at unstored block {cursor} @ {expected_height}"
+                );
+                break None;
+            };
+            if !abandoned(&block) {
+                break Some(AppliedTip {
+                    hash: cursor,
+                    height: block.header.height,
+                });
+            }
+            if walked >= max_blocks {
+                anyhow::bail!(
+                    "C1-R: abandoned-receipt walk from {from} passed {walked} blocks without reaching a kept ancestor"
+                );
+            }
+            if block.header.height == 0 {
+                anyhow::bail!(
+                    "C1-R: abandoned-receipt walk from {from} reached genesis without a kept ancestor"
+                );
+            }
+            walked = walked.saturating_add(1);
+            for tx in &block.transactions {
+                removals.removals.push((cursor, tx.hash));
+                if let Some(r) = read_receipt(&self.storage, &tx.hash)? {
+                    if r.block_hash == cursor {
+                        restore.receipts.push(r);
+                    }
+                }
+            }
+            expected_height = block.header.height.saturating_sub(1);
+            cursor = block.selected_parent();
+        };
+        Ok((removals, restore, base))
+    }
+
+    /// C1-R: the receipt-index changes that drop every indexed block for which
+    /// `keep` is false, for when the old applied chain cannot be walked. Scans
+    /// the block→transaction index once. Returns the removals and, for an abort,
+    /// the receipts currently stored for those blocks. Read-only; a read error
+    /// is an `Err`, so no caller commits a partial set.
+    fn off_chain_receipt_index(
+        storage: &StorageManager,
+        keep: impl Fn(&Hash) -> bool,
+    ) -> anyhow::Result<(ReceiptIndexBatch, ReceiptIndexBatch)> {
+        let mut removals = ReceiptIndexBatch::default();
+        let mut restore = ReceiptIndexBatch::default();
+        read_receipt_index(storage, |block, tx| {
+            if keep(&block) {
+                return Ok(());
+            }
+            removals.removals.push((block, tx));
+            if let Some(r) = read_receipt(storage, &tx)? {
+                if r.block_hash == block {
+                    restore.receipts.push(r);
+                }
+            }
+            Ok(())
+        })?;
+        Ok((removals, restore))
+    }
+
+    /// C1-R: finish the receipt side of a from-genesis rebuild that stopped before
+    /// it converged (see [`ReceiptReconcileMarker`]). No-op without a marker.
+    ///
+    /// Removes the receipts and block markers of every block on the marked old
+    /// chain that is not on the durable applied chain ending at `durable`, then
+    /// clears the marker. The walk descends both chains from their tips to their
+    /// common ancestor, so it costs the span the rebuild had left to replay, never
+    /// a scan of all stored receipts. This returns the batches to commit, in
+    /// order: bounded, idempotent removal chunks, each written as one fsync'd
+    /// batch, with the marker clear in the SAME batch as the last chunk, so the
+    /// clear becomes durable only together with the cleanup's final write. A
+    /// caller stops at the first failed write and leaves the rest unwritten: the
+    /// marker is then still in place and the cleanup runs again on the next start
+    /// or rebuild. A storage READ failure is returned as `Err` (no batches), for
+    /// the same reason. Blocks re-applied later rewrite their receipts as usual.
+    ///
+    /// The durable applied tip is read from the store here, not taken from the
+    /// caller: the receipts to keep are those of the chain the store says is
+    /// applied. A marker with no durable tip is an error (the marker is only ever
+    /// set in the same batch as a tip). A durable tip that is not stored (the
+    /// start-up hardening purge removed it) leaves nothing to compare against:
+    /// this returns no batches and keeps the marker, and the rebuild that a
+    /// removed tip forces reconciles the index against its spine.
+    fn interrupted_rebuild_cleanup(
+        storage: &StorageManager,
+    ) -> anyhow::Result<Vec<ReceiptIndexBatch>> {
+        let marker = match read_reconcile_marker(storage)? {
+            Some(m) => m,
+            None => return Ok(Vec::new()),
+        };
+        let durable = match read_applied_tip(storage)? {
+            Some((hash, height)) => AppliedTip { hash, height },
+            None => anyhow::bail!(
+                "the receipt rebuild marker is set ({} @ {}) but no applied tip is stored",
+                marker.0,
+                marker.1
+            ),
+        };
+        if durable.height > 0 && read_block(storage, &durable.hash)?.is_none() {
+            warn!(
+                "C1-R: unfinished rebuild from {} @ {}: the durable applied tip {} @ {} is not stored; the receipt cleanup waits for the rebuild",
+                marker.0, marker.1, durable.hash, durable.height
+            );
+            return Ok(Vec::new());
+        }
+        let removals = Self::interrupted_rebuild_removals(storage, marker, durable)?;
+        info!(
+            "C1-R: unfinished rebuild from {} @ {}: removing {} receipt entr(y/ies) off the durable applied chain at {} @ {}",
+            marker.0,
+            marker.1,
+            removals.len(),
+            durable.hash,
+            durable.height
+        );
+        let mut batches: Vec<ReceiptIndexBatch> = removals
+            .chunks(receipt_reconcile_chunk())
+            .map(|chunk| ReceiptIndexBatch {
+                removals: chunk.to_vec(),
+                ..ReceiptIndexBatch::default()
+            })
+            .collect();
+        match batches.pop() {
+            Some(last) => batches.push(last.with_marker(ReceiptReconcileMarker::Clear)),
+            None => batches
+                .push(ReceiptIndexBatch::default().with_marker(ReceiptReconcileMarker::Clear)),
+        }
+        Ok(batches)
+    }
+
+    /// The `(block, tx)` removals for [`Self::interrupted_rebuild_cleanup`]:
+    /// every transaction of every block on the chain ending at `old` that is not on
+    /// the chain ending at `durable`. Read-only. A storage read error, or a walk
+    /// longer than `MAX_RECOVERY_SPINE`, is returned as an error, so the marker
+    /// is never cleared on a walk a failure cut short. A block that is not stored
+    /// ends the walk on that side (the genesis sentinel, or a block the start-up
+    /// hardening purge removed together with its receipts).
+    ///
+    /// When the purge removed a block of the old chain, the old chain's blocks
+    /// below it can no longer be reached from the marker, yet still hold
+    /// receipts. Then every index entry above the durable tip goes instead (see
+    /// [`Self::receipt_index_above`]); that is a superset of what the walk
+    /// would have found.
+    fn interrupted_rebuild_removals(
+        storage: &StorageManager,
+        old: (Hash, u64),
+        durable: AppliedTip,
+    ) -> anyhow::Result<Vec<(Hash, Hash)>> {
+        let load = |h: &Hash| read_block(storage, h);
+        let mut out = Vec::new();
+        let (mut old_hash, mut old_height) = old;
+        let (mut cur_hash, mut cur_height) = (durable.hash, durable.height);
+        let mut steps: usize = 0;
+        while old_hash != cur_hash && steps < MAX_RECOVERY_SPINE {
+            steps = steps.saturating_add(1);
+            if old_height >= cur_height {
+                // Above the durable tip, or a different block at the same height:
+                // not on the durable applied chain.
+                let Some(b) = load(&old_hash)? else {
+                    // Not stored: the genesis sentinel (the walk is done), or a
+                    // block the start-up hardening purge removed together with
+                    // its receipts. Its stored ancestors cannot be reached from
+                    // here, so fall back to the index scan.
+                    if old_height > 0 {
+                        warn!(
+                            "C1-R: receipt cleanup: old-chain block {old_hash} @ {old_height} is not stored; removing every receipt above the durable tip"
+                        );
+                        return Self::receipt_index_above(storage, durable.height);
+                    }
+                    break;
+                };
+                out.extend(b.transactions.iter().map(|tx| (old_hash, tx.hash)));
+                if b.header.height == 0 {
+                    break;
+                }
+                old_hash = b.selected_parent();
+                // Consensus: a block's height is its selected parent's plus one.
+                old_height = b.header.height.saturating_sub(1);
+            } else {
+                let Some(b) = load(&cur_hash)? else {
+                    if cur_height > 0 {
+                        warn!(
+                            "C1-R: receipt cleanup: applied-chain block {cur_hash} @ {cur_height} is not stored; the walk ends there"
+                        );
+                    }
+                    break;
+                };
+                if b.header.height == 0 {
+                    break;
+                }
+                cur_hash = b.selected_parent();
+                cur_height = b.header.height.saturating_sub(1);
+            }
+        }
+        if old_hash != cur_hash && steps >= MAX_RECOVERY_SPINE {
+            // A partial walk must not clear the marker: it would leave the rest
+            // of the old chain's receipts out of reach for good.
+            anyhow::bail!(
+                "C1-R: receipt cleanup walk from {} stopped after {} blocks before the common ancestor",
+                old.0,
+                steps
+            );
+        }
+        Ok(out)
+    }
+
+    /// C1-R: every block→transaction index entry of a block above
+    /// `durable_height`, or of a block that is not stored. None of them can be
+    /// on the durable applied chain: it ends at `durable_height`, and its blocks
+    /// are stored. Entries at or below the tip are kept: the rebuild that set
+    /// the marker removed every receipt off its spine in its reset batch and
+    /// rewrote the spine up to the durable tip. Read-only; a read error is an
+    /// `Err`.
+    fn receipt_index_above(
+        storage: &StorageManager,
+        durable_height: u64,
+    ) -> anyhow::Result<Vec<(Hash, Hash)>> {
+        // The scan is in key order, so one block's entries are contiguous:
+        // remembering the last block's verdict reads each block once without
+        // a chain-wide cache.
+        let mut last: Option<(Hash, bool)> = None;
+        let mut out = Vec::new();
+        read_receipt_index(storage, |block, tx| {
+            let remove = match last {
+                Some((b, r)) if b == block => r,
+                _ => {
+                    let r = read_block(storage, &block)?
+                        .map(|b| b.header.height > durable_height)
+                        .unwrap_or(true);
+                    last = Some((block, r));
+                    r
+                }
+            };
+            if remove {
+                out.push((block, tx));
+            }
+            Ok(())
+        })?;
+        Ok(out)
     }
 }
 
@@ -7570,6 +8391,14 @@ pub(crate) mod tests {
         inner: Arc<citrate_storage::state::StateStore>,
         writes: AtomicU64,
         abort_at: u64,
+        /// C1-R failure injection: while set, `put_receipt_index` returns a
+        /// storage error without writing (a transient disk / I/O failure).
+        fail_receipt_index: AtomicBool,
+        /// Failure injection: `write_reorg_batch_sync` call number N (1-based,
+        /// counted in `reorg_batches`) returns a storage error without writing.
+        /// 0 = never.
+        fail_reorg_batch_at: AtomicU64,
+        reorg_batches: AtomicU64,
     }
 
     impl V251AbortStore {
@@ -7628,9 +8457,10 @@ pub(crate) mod tests {
             a: &[(Address, V251Acct)],
             s: &[V251Change],
             t: Option<(Hash, u64)>,
+            i: &citrate_execution::executor::ReceiptIndexBatch,
         ) -> anyhow::Result<()> {
             self.w("write_state_batch_with_applied_tip");
-            V251Trait::write_state_batch_with_applied_tip(&*self.inner, a, s, t)
+            V251Trait::write_state_batch_with_applied_tip(&*self.inner, a, s, t, i)
         }
         // V251_REORG_OVERRIDE_BEGIN
         fn write_reorg_batch_sync(
@@ -7640,14 +8470,29 @@ pub(crate) mod tests {
             d: &[Address],
             c: &[(Hash, Vec<u8>)],
             t: Option<(Hash, u64)>,
+            i: &citrate_execution::executor::ReceiptIndexBatch,
         ) -> anyhow::Result<()> {
             self.w("write_reorg_batch_sync");
-            V251Trait::write_reorg_batch_sync(&*self.inner, a, s, d, c, t)
+            let n = self.reorg_batches.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == self.fail_reorg_batch_at.load(Ordering::SeqCst) {
+                anyhow::bail!("injected storage failure (write_reorg_batch_sync #{n})");
+            }
+            V251Trait::write_reorg_batch_sync(&*self.inner, a, s, d, c, t, i)
         }
         // V251_REORG_OVERRIDE_END
         fn put_applied_tip_meta(&self, h: &Hash, n: u64) -> anyhow::Result<()> {
             self.w("put_applied_tip_meta");
             V251Trait::put_applied_tip_meta(&*self.inner, h, n)
+        }
+        fn put_receipt_index(
+            &self,
+            i: &citrate_execution::executor::ReceiptIndexBatch,
+        ) -> anyhow::Result<()> {
+            self.w("put_receipt_index");
+            if self.fail_receipt_index.load(Ordering::SeqCst) {
+                anyhow::bail!("injected storage failure (put_receipt_index)");
+            }
+            V251Trait::put_receipt_index(&*self.inner, i)
         }
         fn put_account_version(&self, a: &Address, v: u64) -> anyhow::Result<()> {
             self.w("put_account_version");
@@ -7678,8 +8523,241 @@ pub(crate) mod tests {
     /// A scenario transfer at the sender's CURRENT account nonce in the producing
     /// executor (read from its state, not hard-coded), so each block's txs carry the
     /// exact sequence the producer will accept: 0, 1 on branch A; 0, 1, 2 on branch B.
+    ///
+    /// C1-R: each transfer also gets a distinct hash (from, to, nonce), so the
+    /// receipt index (keyed by tx hash) can be checked at every crash point.
     fn v251_transfer(exec: &Executor, from: [u8; 20], to: [u8; 20], value: u128) -> Transaction {
-        transfer(from, to, value, exec.get_nonce(&Address(from)))
+        let nonce = exec.get_nonce(&Address(from));
+        c1r_hashed(transfer(from, to, value, nonce), from, to, nonce)
+    }
+
+    /// C1-R: stamp a deterministic, distinct hash on a test transaction.
+    fn c1r_hashed(mut tx: Transaction, from: [u8; 20], to: [u8; 20], nonce: u64) -> Transaction {
+        let mut h = [0u8; 32];
+        h[0] = from[0];
+        h[1] = to[0];
+        h[2..10].copy_from_slice(&nonce.to_be_bytes());
+        h[31] = 0xC1;
+        tx.hash = Hash::new(h);
+        tx
+    }
+
+    /// C1-R receipt-index invariant over a store: every transaction of every
+    /// block on the applied chain (walked down from `tip`) has a receipt naming
+    /// that block and height plus its `t‖block‖tx` marker, and no block of
+    /// `all` that is OFF the applied chain has a marker or a receipt naming it.
+    /// Returns `Err(detail)` on the first violation.
+    ///
+    /// `rebuild_prefix`: blocks a from-genesis rebuild (`recover_to_head`) is
+    /// re-executing because they are on BOTH the old applied chain and the target
+    /// spine. While the durable tip is below them mid-rebuild they keep their
+    /// (identical, about-to-be-rewritten) receipts — only the losing segment's
+    /// receipts are removed. They must still name their own block, AND the rebuild
+    /// marker must be durable, so a restart that converges elsewhere removes them.
+    fn c1r_receipts_consistent_with(
+        storage: &StorageManager,
+        tip: Option<Hash>,
+        all: &[&Block],
+        rebuild_prefix: &[Hash],
+    ) -> Result<(), String> {
+        let mut applied: Vec<Hash> = Vec::new();
+        let mut cursor = tip;
+        while let Some(h) = cursor {
+            match all.iter().find(|b| b.header.block_hash == h) {
+                Some(b) => {
+                    applied.push(h);
+                    cursor = Some(b.selected_parent());
+                }
+                None => cursor = None,
+            }
+        }
+        for b in all {
+            let h = b.header.block_hash;
+            let markers = storage
+                .transactions
+                .get_block_transactions(&h)
+                .map_err(|e| e.to_string())?;
+            if applied.contains(&h) {
+                for tx in &b.transactions {
+                    let r = storage
+                        .transactions
+                        .get_receipt(&tx.hash)
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| {
+                            format!("GAP: no receipt for tx {} of applied {}", tx.hash, h)
+                        })?;
+                    if r.block_hash != h || r.block_number != b.header.height {
+                        return Err(format!(
+                            "receipt for {} names {}@{} not applied {}@{}",
+                            tx.hash, r.block_hash, r.block_number, h, b.header.height
+                        ));
+                    }
+                    if !markers.contains(&tx.hash) {
+                        return Err(format!("GAP: no block marker for tx {} in {}", tx.hash, h));
+                    }
+                }
+            } else if rebuild_prefix.contains(&h) {
+                let marked = storage
+                    .transactions
+                    .get_receipt_reconcile_marker()
+                    .map_err(|e| e.to_string())?
+                    .is_some();
+                if !markers.is_empty() && !marked {
+                    return Err(format!(
+                        "STALE: prefix block {} above the tip keeps markers with no rebuild marker",
+                        h
+                    ));
+                }
+                for tx in &b.transactions {
+                    if let Ok(Some(r)) = storage.transactions.get_receipt(&tx.hash) {
+                        if r.block_hash != h {
+                            return Err(format!(
+                                "prefix receipt for {} names {}",
+                                tx.hash, r.block_hash
+                            ));
+                        }
+                        if !marked {
+                            return Err(format!(
+                                "STALE: prefix receipt for {} above the tip with no rebuild marker",
+                                tx.hash
+                            ));
+                        }
+                    }
+                }
+            } else {
+                if !markers.is_empty() {
+                    return Err(format!(
+                        "STALE: unexecuted block {} keeps {} marker(s)",
+                        h,
+                        markers.len()
+                    ));
+                }
+                for tx in &b.transactions {
+                    if let Ok(Some(r)) = storage.transactions.get_receipt(&tx.hash) {
+                        if r.block_hash == h {
+                            return Err(format!(
+                                "STALE: receipt for {} names unexecuted {}",
+                                tx.hash, h
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn c1r_receipts_consistent(
+        storage: &StorageManager,
+        tip: Option<Hash>,
+        all: &[&Block],
+    ) -> Result<(), String> {
+        c1r_receipts_consistent_with(storage, tip, all, &[])
+    }
+
+    /// C1-R: after a crash, a restarted node must be able to finish converging and
+    /// end with a complete receipt index (no permanent gap). Reopens `dir`, seeds the
+    /// genesis tip if the crash preceded the first block, then drains / rebuilds to
+    /// `head` (fork choice on restart). `blocks` are every block of the scenario,
+    /// re-delivered as peers would; the check covers all of them, so a receipt kept
+    /// for a block that is NOT on `head`'s chain fails it.
+    async fn c1r_resume_and_check(
+        dir: &std::path::Path,
+        blocks: &[&Block],
+        head: &Block,
+    ) -> Result<(), String> {
+        let storage = Arc::new(StorageManager::new(dir, PruningConfig::default()).expect("reopen"));
+        let n_accounts = storage
+            .state
+            .get_all_accounts()
+            .map(|v| v.len())
+            .unwrap_or(0);
+        if n_accounts == 0 {
+            return Ok(()); // crashed before genesis was persisted: a fresh start
+        }
+        if storage.blocks.get_applied_tip().ok().flatten().is_none() {
+            // Genesis state is durable but no block applied yet: production writes
+            // the genesis tip at startup; mirror that.
+            storage
+                .blocks
+                .put_applied_tip(&Hash::default(), 0)
+                .map_err(|e| e.to_string())?;
+        }
+        // Hydrate exactly as `start_node` does (bulk reload of the durable state).
+        let sdb = StateDB::new();
+        for (addr, acct) in storage
+            .state
+            .get_all_accounts()
+            .map_err(|e| e.to_string())?
+        {
+            sdb.accounts.load_account(addr, acct);
+        }
+        for ((addr, key), val) in storage.state.get_all_storage().map_err(|e| e.to_string())? {
+            sdb.set_storage(addr, key.as_bytes().to_vec(), val.as_bytes().to_vec());
+        }
+        let exec = Arc::new(Executor::with_storage(
+            Arc::new(sdb),
+            Some(storage.state.clone()),
+        ));
+        // The crash may have preceded receipt of later blocks; a restarted node
+        // gets them again from peers (sync / gossip). `put_block` is idempotent.
+        for b in blocks {
+            persist(&storage, b);
+        }
+        let mut app = CanonicalApplicator::new(exec, storage.clone());
+        app.fork_choice = Some(fork_choice_returning(head.header.block_hash));
+        let g = Executor::new(Arc::new(StateDB::new()));
+        g.set_balance(&Address(ALICE), U256::from(FUND));
+        app.set_genesis(g.state_snapshot(), Hash::default());
+        app.drive_drain().await;
+        if app.applied_tip().await.hash != head.header.block_hash {
+            // A restart on the losing sibling: the startup recovery path.
+            app.recover_to_head(g.state_snapshot(), Hash::default())
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        let tip = app.applied_tip().await;
+        if tip.hash != head.header.block_hash {
+            return Err(format!(
+                "resume did not reach {} (tip @ {})",
+                head.header.block_hash, tip.height
+            ));
+        }
+        if storage
+            .transactions
+            .get_receipt_reconcile_marker()
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            return Err("rebuild marker still set after convergence".to_string());
+        }
+        c1r_receipts_consistent(&storage, Some(tip.hash), blocks)
+    }
+
+    /// C1-R: a third branch C (c1 ← c2) forking off GENESIS, below the rebuild's
+    /// shared prefix a1. Fork choice moving to it after a crash abandons a1 too.
+    /// Transaction hashes are distinct from every A/B transaction.
+    async fn c1r_fork_c() -> (Block, Block) {
+        let pc = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pc.set_balance(&Address(ALICE), U256::from(FUND));
+        let vrf_c = [0x7C; 32];
+        let c1 = produce(
+            &pc,
+            Hash::default(),
+            1,
+            vrf_c,
+            vec![v251_transfer(&pc, ALICE, CAROL, 1_000)],
+        )
+        .await;
+        let c2 = produce(
+            &pc,
+            c1.header.block_hash,
+            2,
+            vrf_c,
+            vec![v251_transfer(&pc, ALICE, DAVE, 1_000)],
+        )
+        .await;
+        (c1, c2)
     }
 
     /// The deterministic blocks of the scenario (independent in-memory producers).
@@ -7741,6 +8819,9 @@ pub(crate) mod tests {
             inner: storage.state.clone(),
             writes: AtomicU64::new(0),
             abort_at,
+            fail_receipt_index: AtomicBool::new(false),
+            fail_reorg_batch_at: AtomicU64::new(0),
+            reorg_batches: AtomicU64::new(0),
         });
         let exec = Arc::new(Executor::with_storage(
             Arc::new(StateDB::new()),
@@ -7786,6 +8867,7 @@ pub(crate) mod tests {
         a2: &Block,
         b2: &Block,
         b3: &Block,
+        prefix: &[Hash],
     ) -> (Option<u64>, bool, String) {
         let storage = StorageManager::new(dir, PruningConfig::default()).expect("reopen");
         let sdb = StateDB::new();
@@ -7848,14 +8930,25 @@ pub(crate) mod tests {
         .find(|(_, r)| *r == root)
         .map(|(n, _)| n.to_string())
         .unwrap_or_else(|| "UNKNOWN".to_string());
+        // C1-R: the receipt index must describe exactly the durable applied chain.
+        let receipts =
+            c1r_receipts_consistent_with(&storage, tip.map(|t| t.0), &[a1, a2, b2, b3], prefix);
         let detail = format!(
-            "tip={} durable_state_is={} ok={}",
+            "tip={} durable_state_is={} ok={} receipts={}",
             tip.map(|(h, n)| format!("{}@{n}", label(&h)))
                 .unwrap_or_else(|| "none".into()),
             which_root,
-            root == expected
+            root == expected,
+            match &receipts {
+                Ok(()) => "consistent".to_string(),
+                Err(e) => e.clone(),
+            }
         );
-        (tip.map(|t| t.1), root == expected, detail)
+        (
+            tip.map(|t| t.1),
+            root == expected && receipts.is_ok(),
+            detail,
+        )
     }
 
     fn v251_spawn(test: &str, envs: &[(&str, String)]) -> std::process::Child {
@@ -7912,6 +9005,14 @@ pub(crate) mod tests {
         }
         let test = "canonical_apply::tests::verify251_child";
         let (a1, a2, b2, b3) = v251_blocks().await;
+        let (c1, c2) = c1r_fork_c().await;
+        // C1-R: in the `recover` scenario a1 is the rebuild's common prefix (see
+        // `c1r_receipts_consistent_with`); the `reorg` scenario allows nothing ahead.
+        let prefix: Vec<Hash> = if scenario == "recover" {
+            vec![a1.header.block_hash]
+        } else {
+            Vec::new()
+        };
         // Dry run: count writes.
         let dry = tempfile::tempdir().expect("dir");
         let out = v251_spawn(
@@ -7937,7 +9038,7 @@ pub(crate) mod tests {
                     String::from_utf8_lossy(&out.stderr)
                 )
             });
-        let (_, ok, d) = v251_check(dry.path(), &a1, &a2, &b2, &b3);
+        let (_, ok, d) = v251_check(dry.path(), &a1, &a2, &b2, &b3, &prefix);
         println!("V251 [{scenario}] dry run: total_writes={total} final: {d}");
         assert!(ok);
         let mut torn = Vec::new();
@@ -7959,16 +9060,240 @@ pub(crate) mod tests {
                 .find(|l| l.contains("V251 ABORT"))
                 .unwrap_or("?")
                 .to_string();
-            let (_, ok, d) = v251_check(dir.path(), &a1, &a2, &b2, &b3);
+            let (_, ok, d) = v251_check(dir.path(), &a1, &a2, &b2, &b3, &prefix);
             println!("V251 [{scenario}] abort k={k:>2} [{what}] -> {d}");
             if !ok {
                 torn.push(format!("k={k} {what} {d}"));
+            }
+            // C1-R: the restarted node converges with no receipt gap — toward the
+            // same head, and (on a copy of the crashed store) toward branch C,
+            // which forks below the rebuild's shared prefix.
+            let other = tempfile::tempdir().expect("dir");
+            c1r_copy_dir(dir.path(), other.path());
+            if let Err(e) = c1r_resume_and_check(dir.path(), &[&a1, &a2, &b2, &b3], &b3).await {
+                torn.push(format!("k={k} {what} resume: {e}"));
+            }
+            if let Err(e) =
+                c1r_resume_and_check(other.path(), &[&a1, &a2, &b2, &b3, &c1, &c2], &c2).await
+            {
+                torn.push(format!("k={k} {what} resume toward C: {e}"));
             }
         }
         assert!(
             torn.is_empty(),
             "TORN durable state/tip after crash: {torn:#?}"
         );
+    }
+
+    /// C1-R (Codex re-check on #336): a from-genesis rebuild A→B keeps the shared
+    /// prefix a1's receipts while the durable tip sits at genesis. Crash right
+    /// after that reset batch, then restart with fork choice on branch C (forks
+    /// below a1): a1's receipt and block marker must be gone once C is applied.
+    /// Before the rebuild marker, nothing ever revisited a1 and its receipt stayed
+    /// (`eth_getTransactionReceipt` reported an abandoned transaction as mined).
+    #[tokio::test]
+    async fn c1r_crash_after_rebuild_reset_then_fork_choice_below_prefix() {
+        if std::env::var(V251_DIR).is_ok() {
+            return;
+        }
+        let (a1, a2, b2, b3) = v251_blocks().await;
+        let (c1, c2) = c1r_fork_c().await;
+        let dir = tempfile::tempdir().expect("dir");
+        c1r_crash_after_rebuild_reset(dir.path(), &a1, &a2);
+        c1r_resume_and_check(dir.path(), &[&a1, &a2, &b2, &b3, &c1, &c2], &c2)
+            .await
+            .expect("restart converging on C leaves no receipt of the abandoned prefix");
+        let storage = StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen");
+        assert!(
+            storage
+                .transactions
+                .get_receipt(&a1.transactions[0].hash)
+                .expect("read")
+                .is_none(),
+            "a1 is not executed on C: its receipt is gone"
+        );
+        assert!(storage
+            .transactions
+            .get_block_transactions(&a1.header.block_hash)
+            .expect("read")
+            .is_empty());
+    }
+
+    /// C1-R: run the `recover` scenario in a child and crash it right after the
+    /// rebuild's reset batch (before the first replayed block), leaving the durable
+    /// tip at genesis, a1's receipt above it and the rebuild marker at a2. Asserts
+    /// that precondition.
+    fn c1r_crash_after_rebuild_reset(dir: &std::path::Path, a1: &Block, a2: &Block) {
+        let test = "canonical_apply::tests::verify251_child";
+        // Find the rebuild's reset batch: the first reorg batch of the `recover`
+        // scenario (the linear a1/a2 applies use the applied-tip batch).
+        let dry = tempfile::tempdir().expect("dir");
+        let out = v251_spawn(
+            test,
+            &[
+                (V251_DIR, dry.path().to_string_lossy().into()),
+                ("V251_SCENARIO", "recover".to_string()),
+                ("V251_TRACE", "1".to_string()),
+            ],
+        )
+        .wait_with_output()
+        .expect("dry");
+        let trace = String::from_utf8_lossy(&out.stderr);
+        let reset_at: u64 = trace
+            .lines()
+            .find(|l| l.contains("write_reorg_batch_sync"))
+            .and_then(|l| l.split("write#").nth(1))
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no reset batch in trace:\n{trace}"));
+        // Crash before the write that follows the reset (the first replay block).
+        let out = v251_spawn(
+            test,
+            &[
+                (V251_DIR, dir.to_string_lossy().into()),
+                ("V251_SCENARIO", "recover".to_string()),
+                (V251_ABORT_AT, (reset_at + 1).to_string()),
+            ],
+        )
+        .wait_with_output()
+        .expect("child");
+        assert!(!out.status.success(), "child must have crashed");
+        // Precondition: the crash left exactly the state Codex described.
+        let storage = StorageManager::new(dir, PruningConfig::default()).expect("reopen");
+        let tip = storage.blocks.get_applied_tip().expect("tip");
+        assert_eq!(tip.map(|t| t.1), Some(0), "durable tip reset to genesis");
+        let r = storage
+            .transactions
+            .get_receipt(&a1.transactions[0].hash)
+            .expect("read");
+        assert_eq!(
+            r.map(|r| r.block_hash),
+            Some(a1.header.block_hash),
+            "shared prefix a1 keeps its receipt above the durable tip"
+        );
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt_reconcile_marker()
+                .expect("read"),
+            Some((a2.header.block_hash, 2)),
+            "the reset batch recorded the old applied tip"
+        );
+    }
+
+    /// C1-R: the interrupted-rebuild cleanup hits a STORAGE FAILURE. The marker
+    /// must survive it, and the next rebuild (toward branch C, which forks below
+    /// the old prefix a1) must not record its own marker over it: before this, the
+    /// cleanup logged the error and the rebuild went on, replacing the marker with
+    /// its own lower `pre_tip`, so a1's receipt was out of the cleanup's reach and
+    /// `eth_getTransactionReceipt` reported the abandoned transaction as mined for
+    /// good. Once the store recovers, the retried cleanup removes it and the
+    /// rebuild converges on C with a consistent receipt index.
+    #[tokio::test]
+    async fn c1r_failed_cleanup_keeps_marker_and_blocks_rebuild_until_it_succeeds() {
+        if std::env::var(V251_DIR).is_ok() {
+            return;
+        }
+        let (a1, a2, b2, b3) = v251_blocks().await;
+        let (c1, c2) = c1r_fork_c().await;
+        let dir = tempfile::tempdir().expect("dir");
+        c1r_crash_after_rebuild_reset(dir.path(), &a1, &a2);
+
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen"));
+        let sdb = StateDB::new();
+        for (addr, acct) in storage.state.get_all_accounts().expect("accounts") {
+            sdb.accounts.load_account(addr, acct);
+        }
+        for ((addr, key), val) in storage.state.get_all_storage().expect("storage") {
+            sdb.set_storage(addr, key.as_bytes().to_vec(), val.as_bytes().to_vec());
+        }
+        let store = Arc::new(V251AbortStore {
+            inner: storage.state.clone(),
+            writes: AtomicU64::new(0),
+            abort_at: u64::MAX,
+            fail_receipt_index: AtomicBool::new(true),
+            fail_reorg_batch_at: AtomicU64::new(0),
+            reorg_batches: AtomicU64::new(0),
+        });
+        let exec = Arc::new(Executor::with_storage(Arc::new(sdb), Some(store.clone())));
+        let all = [&a1, &a2, &b2, &b3, &c1, &c2];
+        for b in all {
+            persist(&storage, b);
+        }
+        let marker =
+            |s: &StorageManager| s.transactions.get_receipt_reconcile_marker().expect("read");
+        let a1_receipt = |s: &StorageManager| {
+            s.transactions
+                .get_receipt(&a1.transactions[0].hash)
+                .expect("read")
+                .map(|r| r.block_hash)
+        };
+
+        // Startup cleanup fails: the marker and a1's receipt are untouched.
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        assert_eq!(
+            marker(&storage),
+            Some((a2.header.block_hash, 2)),
+            "startup failure keeps the marker"
+        );
+        assert_eq!(a1_receipt(&storage), Some(a1.header.block_hash));
+
+        // A rebuild toward C while the store still fails: refused, nothing changed.
+        app.fork_choice = Some(fork_choice_returning(c2.header.block_hash));
+        let g = Executor::new(Arc::new(StateDB::new()));
+        g.set_balance(&Address(ALICE), U256::from(FUND));
+        app.set_genesis(g.state_snapshot(), Hash::default());
+        let res = app
+            .recover_to_head(g.state_snapshot(), Hash::default())
+            .await;
+        assert!(
+            res.is_err(),
+            "the rebuild must abort when the cleanup cannot commit: {res:?}"
+        );
+        assert_eq!(
+            marker(&storage),
+            Some((a2.header.block_hash, 2)),
+            "the original marker is not replaced by the rebuild's own"
+        );
+        assert_eq!(app.applied_tip().await.height, 0, "applied tip unchanged");
+        assert_eq!(a1_receipt(&storage), Some(a1.header.block_hash));
+
+        // The store recovers: the retried cleanup and the rebuild both complete.
+        store.fail_receipt_index.store(false, Ordering::SeqCst);
+        let ok = app
+            .recover_to_head(g.state_snapshot(), Hash::default())
+            .await
+            .expect("rebuild after the store recovers");
+        assert!(ok, "rebuild converged");
+        let tip = app.applied_tip().await;
+        assert_eq!(tip.hash, c2.header.block_hash, "converged on C");
+        assert_eq!(
+            marker(&storage),
+            None,
+            "marker cleared once the cleanup is durable"
+        );
+        assert_eq!(
+            a1_receipt(&storage),
+            None,
+            "a1 is not executed on C: its receipt is gone"
+        );
+        c1r_receipts_consistent(&storage, Some(tip.hash), &all).expect("receipt index matches C");
+    }
+
+    /// Copy a (closed) RocksDB directory, so one crashed store can be resumed
+    /// along two different fork choices.
+    fn c1r_copy_dir(from: &std::path::Path, to: &std::path::Path) {
+        for entry in std::fs::read_dir(from).expect("read_dir") {
+            let entry = entry.expect("entry");
+            let dst = to.join(entry.file_name());
+            if entry.file_type().expect("type").is_dir() {
+                std::fs::create_dir_all(&dst).expect("mkdir");
+                c1r_copy_dir(&entry.path(), &dst);
+            } else {
+                std::fs::copy(entry.path(), &dst).expect("copy");
+            }
+        }
     }
 
     /// Random wall-clock SIGKILL of a child looping the scenario.
@@ -8003,7 +9328,7 @@ pub(crate) mod tests {
                 println!("V251 sigkill r={r}: child had not started a run");
                 continue;
             }
-            let (_, ok, d) = v251_check(std::path::Path::new(&current), &a1, &a2, &b2, &b3);
+            let (_, ok, d) = v251_check(std::path::Path::new(&current), &a1, &a2, &b2, &b3, &[]);
             println!("V251 sigkill r={r} after {wait_ms} ms -> {d}");
             if !ok {
                 torn.push(format!("r={r} {d}"));
@@ -8046,6 +9371,1634 @@ pub(crate) mod tests {
             assert!(flag.load(Ordering::SeqCst), "flag held during the rebuild");
         }
         assert!(!flag.load(Ordering::SeqCst), "flag cleared on normal drop");
+    }
+
+    // =====================================================================
+    // C1-R (betanet): a node that APPLIES a block it did not produce must store
+    // that block's receipts (same store + format as the producer), atomically
+    // with the apply, and a reorg must move them to the winning branch.
+    // =====================================================================
+
+    const C1R_TOPIC: [u8; 32] = [0xC1; 32];
+
+    /// A deploy whose init code emits `LOG1(C1R_TOPIC)` over empty data and
+    /// deploys empty runtime code: `PUSH32 topic; PUSH1 0; PUSH1 0; LOG1; STOP`.
+    fn c1r_log_deploy(from: [u8; 20], nonce: u64) -> Transaction {
+        let mut code = vec![0x7f];
+        code.extend_from_slice(&C1R_TOPIC);
+        code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0xa1, 0x00]);
+        let tx = Transaction {
+            nonce,
+            from: embedded(from),
+            to: None,
+            value: 0,
+            gas_limit: 200_000,
+            gas_price: 1_000_000_000,
+            data: code,
+            signature: Signature::new([1; 64]),
+            chain_id: Some(40204),
+            ..Default::default()
+        };
+        c1r_hashed(tx, from, [0xDE; 20], nonce)
+    }
+
+    fn c1r_rpc(storage: Arc<StorageManager>, exec: Arc<Executor>) -> jsonrpc_core::IoHandler {
+        std::env::set_var("CITRATE_ALLOW_ANONYMOUS_RATE_LIMIT", "1");
+        let mut io = jsonrpc_core::IoHandler::new();
+        citrate_api::eth_rpc::register_eth_methods_with_finality(
+            &mut io,
+            storage,
+            Arc::new(citrate_sequencer::mempool::Mempool::new(
+                citrate_sequencer::mempool::MempoolConfig::default(),
+            )),
+            exec,
+            40204,
+            Arc::new(citrate_api::FilterRegistry::new()),
+            None,
+            Arc::new(AtomicU64::new(0)),
+        );
+        io
+    }
+
+    /// One JSON-RPC call, off the async runtime (the handlers `block_on`).
+    async fn c1r_call(
+        io: &Arc<jsonrpc_core::IoHandler>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        let io = io.clone();
+        let req =
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}).to_string();
+        let resp = tokio::task::spawn_blocking(move || io.handle_request_sync(&req))
+            .await
+            .expect("rpc task")
+            .expect("rpc response");
+        serde_json::from_str(&resp).expect("rpc json")
+    }
+
+    fn c1r_hex(h: &Hash) -> String {
+        format!("0x{}", hex::encode(h.as_bytes()))
+    }
+
+    /// C1-R: a FOLLOWER (store-backed, produces nothing) that applies a peer's
+    /// block serves `eth_getTransactionReceipt` and `eth_getLogs` for it from the
+    /// real RPC handlers. Before the block is applied, the receipt is null (the
+    /// block bytes alone carry no receipts) — the gap followers had for every
+    /// block they did not produce.
+    #[tokio::test]
+    async fn c1r_follower_serves_receipt_and_logs_for_applied_peer_block() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let follower = store_backed(&storage);
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        follower
+            .persist_state_changes()
+            .await
+            .expect("persist genesis");
+        let app = CanonicalApplicator::new(follower.clone(), storage.clone());
+
+        // The peer (an independent producer) builds block 1: a transfer and a
+        // deploy that emits one log.
+        let peer = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        peer.set_balance(&Address(ALICE), U256::from(FUND));
+        let xfer = c1r_hashed(transfer(ALICE, BOB, 1_000, 0), ALICE, BOB, 0);
+        let deploy = c1r_log_deploy(ALICE, 1);
+        let block = produce(
+            &peer,
+            Hash::default(),
+            1,
+            VRF_OUT,
+            vec![xfer.clone(), deploy.clone()],
+        )
+        .await;
+        let bh = block.header.block_hash;
+
+        let io = Arc::new(c1r_rpc(storage.clone(), follower.clone()));
+        persist(&storage, &block);
+        let before = c1r_call(
+            &io,
+            "eth_getTransactionReceipt",
+            serde_json::json!([c1r_hex(&deploy.hash)]),
+        )
+        .await;
+        assert!(
+            before["result"].is_null(),
+            "not yet applied: no receipt ({before})"
+        );
+
+        assert!(matches!(
+            app.apply_received(&block).await,
+            ApplyOutcome::Applied { height: 1, .. }
+        ));
+
+        // Same store + format as the producer: CF_RECEIPTS by tx hash, block marker.
+        for tx in [&xfer, &deploy] {
+            let r = storage
+                .transactions
+                .get_receipt(&tx.hash)
+                .expect("read receipt")
+                .expect("follower stored the receipt");
+            assert_eq!(r.block_hash, bh);
+            assert_eq!(r.block_number, 1);
+            assert!(r.status, "tx {} succeeded", tx.hash);
+            assert!(storage
+                .transactions
+                .get_transaction(&tx.hash)
+                .expect("read tx")
+                .is_some());
+        }
+        let mut marked = storage
+            .transactions
+            .get_block_transactions(&bh)
+            .expect("markers");
+        marked.sort();
+        let mut want = vec![xfer.hash, deploy.hash];
+        want.sort();
+        assert_eq!(marked, want);
+
+        let rcpt = c1r_call(
+            &io,
+            "eth_getTransactionReceipt",
+            serde_json::json!([c1r_hex(&deploy.hash)]),
+        )
+        .await;
+        let rcpt = &rcpt["result"];
+        assert_eq!(rcpt["blockHash"], c1r_hex(&bh), "{rcpt}");
+        assert_eq!(rcpt["blockNumber"], "0x1");
+        assert_eq!(rcpt["status"], "0x1");
+        assert_eq!(
+            rcpt["logs"][0]["topics"][0],
+            c1r_hex(&Hash::new(C1R_TOPIC)),
+            "{rcpt}"
+        );
+
+        let logs = c1r_call(
+            &io,
+            "eth_getLogs",
+            serde_json::json!([{"fromBlock": "0x1", "toBlock": "0x1"}]),
+        )
+        .await;
+        let logs = logs["result"].as_array().cloned().unwrap_or_default();
+        assert_eq!(logs.len(), 1, "one log in block 1: {logs:?}");
+        assert_eq!(logs[0]["blockHash"], c1r_hex(&bh));
+        assert_eq!(logs[0]["transactionHash"], c1r_hex(&deploy.hash));
+        assert_eq!(logs[0]["topics"][0], c1r_hex(&Hash::new(C1R_TOPIC)));
+    }
+
+    /// C1-R: receipts are not consensus data — storing them must not move the
+    /// state root. The follower's applied root equals the peer's sealed root and
+    /// equals the root of an executor that applied the same block without a
+    /// receipt-indexing store.
+    #[tokio::test]
+    async fn c1r_receipt_index_does_not_change_state_root() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let indexed = store_backed(&storage);
+        indexed.set_balance(&Address(ALICE), U256::from(FUND));
+        indexed
+            .persist_state_changes()
+            .await
+            .expect("persist genesis");
+        let plain = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        plain.set_balance(&Address(ALICE), U256::from(FUND));
+
+        let peer = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        peer.set_balance(&Address(ALICE), U256::from(FUND));
+        let block = produce(
+            &peer,
+            Hash::default(),
+            1,
+            VRF_OUT,
+            vec![
+                c1r_hashed(transfer(ALICE, BOB, 7, 0), ALICE, BOB, 0),
+                c1r_log_deploy(ALICE, 1),
+            ],
+        )
+        .await;
+        let (validator, treasury) = reward_for(&block);
+        let credits = [(Address(CB), validator), (Address(TREASURY_ADDR), treasury)];
+        let r_indexed = indexed
+            .apply_block(&block, CB, &credits)
+            .await
+            .expect("indexed apply");
+        let r_plain = plain
+            .apply_block(&block, CB, &credits)
+            .await
+            .expect("plain apply");
+        assert_eq!(r_indexed, block.state_root);
+        assert_eq!(r_plain, block.state_root);
+        assert_eq!(indexed.calculate_state_root(), plain.calculate_state_root());
+        assert!(storage
+            .transactions
+            .get_receipt(&block.transactions[0].hash)
+            .expect("read")
+            .is_some());
+    }
+
+    /// C1-R: a reorg REPLACES receipts. A tx included on both branches ends with
+    /// the winning block's receipt; the abandoned block keeps no marker and no
+    /// receipt names it. A reorg that ABORTS (bad block on the winning branch)
+    /// leaves the original branch's receipts exactly in place.
+    #[tokio::test]
+    async fn c1r_reorg_replaces_receipts_and_abort_restores_them() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let follower = store_backed(&storage);
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        follower
+            .persist_state_changes()
+            .await
+            .expect("persist genesis");
+        let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+
+        let shared = c1r_hashed(transfer(ALICE, DAVE, 1_000, 0), ALICE, DAVE, 0);
+        let both = c1r_hashed(transfer(ALICE, BOB, 1_000, 1), ALICE, BOB, 1);
+        let only_b = c1r_hashed(transfer(ALICE, CAROL, 1_000, 2), ALICE, CAROL, 2);
+
+        let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pa.set_balance(&Address(ALICE), U256::from(FUND));
+        let a1 = produce(&pa, Hash::default(), 1, VRF_OUT, vec![shared.clone()]).await;
+        let a2 = produce(&pa, a1.header.block_hash, 2, VRF_OUT, vec![both.clone()]).await;
+
+        let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pb.set_balance(&Address(ALICE), U256::from(FUND));
+        let _b1 = produce(&pb, Hash::default(), 1, VRF_OUT, vec![shared.clone()]).await;
+        let vrf_b = [0x5B; 32];
+        let b2 = produce(&pb, a1.header.block_hash, 2, vrf_b, vec![both.clone()]).await;
+        let b3 = produce(&pb, b2.header.block_hash, 3, vrf_b, vec![only_b.clone()]).await;
+        let b3_bad = mk_block_txs(
+            3,
+            b2.header.block_hash,
+            Hash::new([0xEE; 32]),
+            [0x5C; 32],
+            vec![only_b.clone()],
+        );
+
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        let all = [&a1, &a2, &b2, &b3, &b3_bad];
+        c1r_receipts_consistent(&storage, Some(a2.header.block_hash), &all).expect("A applied");
+
+        // Aborted reorg: b2 reapplies in memory, b3_bad fails its root check.
+        persist(&storage, &b2);
+        persist(&storage, &b3_bad);
+        app.fork_choice = Some(fork_choice_returning(b3_bad.header.block_hash));
+        app.apply_received(&b3_bad).await;
+        assert_eq!(
+            app.applied_tip().await.hash,
+            a2.header.block_hash,
+            "abort keeps A"
+        );
+        c1r_receipts_consistent(&storage, Some(a2.header.block_hash), &all)
+            .expect("abort restored A's receipts");
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt(&both.hash)
+                .expect("read")
+                .map(|r| r.block_hash),
+            Some(a2.header.block_hash)
+        );
+
+        // Successful reorg to the heavier B branch.
+        persist(&storage, &b3);
+        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        app.apply_received(&b3).await;
+        assert_eq!(
+            app.applied_tip().await.hash,
+            b3.header.block_hash,
+            "reorged to B"
+        );
+        c1r_receipts_consistent(&storage, Some(b3.header.block_hash), &all)
+            .expect("receipts follow the executed chain");
+        let r = storage
+            .transactions
+            .get_receipt(&both.hash)
+            .expect("read")
+            .expect("tx on both branches keeps a receipt");
+        assert_eq!((r.block_hash, r.block_number), (b2.header.block_hash, 2));
+        assert!(storage
+            .transactions
+            .get_block_transactions(&a2.header.block_hash)
+            .expect("markers")
+            .is_empty());
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt(&only_b.hash)
+                .expect("read")
+                .map(|r| r.block_hash),
+            Some(b3.header.block_hash)
+        );
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt(&shared.hash)
+                .expect("read")
+                .map(|r| r.block_hash),
+            Some(a1.header.block_hash),
+            "the common ancestor's receipt is untouched"
+        );
+    }
+
+    /// C1-R: the from-genesis spine rebuild (startup / deep-fork recovery) also
+    /// leaves the receipt index describing exactly the rebuilt chain.
+    #[tokio::test]
+    async fn c1r_recover_to_head_moves_receipts_to_the_spine() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let exec = store_backed(&storage);
+        exec.set_balance(&Address(ALICE), U256::from(FUND));
+        exec.persist_state_changes().await.expect("persist genesis");
+        let (a1, a2, b2, b3) = v251_blocks().await;
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        persist(&storage, &b2);
+        persist(&storage, &b3);
+        drop(app);
+        // Restart on the losing sibling: a fresh ring cannot reorg; recover.
+        let mut app2 = CanonicalApplicator::new(exec.clone(), storage.clone());
+        app2.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        let g = Executor::new(Arc::new(StateDB::new()));
+        g.set_balance(&Address(ALICE), U256::from(FUND));
+        assert!(app2
+            .recover_to_head(g.state_snapshot(), Hash::default())
+            .await
+            .expect("recover"));
+        assert_eq!(app2.applied_tip().await.hash, b3.header.block_hash);
+        c1r_receipts_consistent(&storage, Some(b3.header.block_hash), &[&a1, &a2, &b2, &b3])
+            .expect("receipts follow the rebuilt spine");
+    }
+
+    // ---------------------------------------------------------------------
+    // C1-R: the receipt index is RPC data, not consensus data. A stored receipt
+    // that does not decode (a damaged value, or one written by a binary with a
+    // different receipt layout) must never stop the node from following fork
+    // choice: the reorg / rebuild proceeds, and the unreadable receipt goes with
+    // the block it was indexed under.
+    // ---------------------------------------------------------------------
+
+    /// Replace the stored receipt of `tx` with its own encoding minus the last
+    /// byte, so it no longer decodes. Asserts that it no longer does.
+    fn c1r_corrupt_receipt(storage: &StorageManager, tx: &Hash) {
+        use citrate_storage::db::column_families::CF_RECEIPTS;
+        let mut bytes = storage
+            .db
+            .get_cf(CF_RECEIPTS, tx.as_bytes())
+            .expect("read")
+            .expect("a stored receipt to corrupt");
+        bytes.pop();
+        storage
+            .db
+            .put_cf(CF_RECEIPTS, tx.as_bytes(), &bytes)
+            .expect("write");
+        assert!(
+            storage.transactions.get_receipt(tx).is_err(),
+            "precondition: the receipt of {tx} no longer decodes"
+        );
+    }
+
+    /// The follower scenario: A = a1 ← a2 (a2 carries `both`, also on B, and
+    /// `only_a`), B = a1 ← b2 ← b3 (heavier). Returns the blocks and the txs.
+    async fn c1r_corrupt_scenario() -> (Block, Block, Block, Block, Transaction, Transaction) {
+        let shared = c1r_hashed(transfer(ALICE, DAVE, 1_000, 0), ALICE, DAVE, 0);
+        let both = c1r_hashed(transfer(ALICE, BOB, 1_000, 1), ALICE, BOB, 1);
+        let only_a = c1r_hashed(transfer(ALICE, CAROL, 2_000, 2), ALICE, CAROL, 2);
+        let only_b = c1r_hashed(transfer(ALICE, DAVE, 3_000, 2), ALICE, DAVE, 2);
+        let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pa.set_balance(&Address(ALICE), U256::from(FUND));
+        let a1 = produce(&pa, Hash::default(), 1, VRF_OUT, vec![shared.clone()]).await;
+        let a2 = produce(
+            &pa,
+            a1.header.block_hash,
+            2,
+            VRF_OUT,
+            vec![both.clone(), only_a.clone()],
+        )
+        .await;
+        let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pb.set_balance(&Address(ALICE), U256::from(FUND));
+        let _b1 = produce(&pb, Hash::default(), 1, VRF_OUT, vec![shared.clone()]).await;
+        let vrf_b = [0x5B; 32];
+        let b2 = produce(&pb, a1.header.block_hash, 2, vrf_b, vec![both.clone()]).await;
+        let b3 = produce(&pb, b2.header.block_hash, 3, vrf_b, vec![only_b]).await;
+        (a1, a2, b2, b3, both, only_a)
+    }
+
+    /// The corrupt receipts are gone and the index matches the B chain.
+    fn c1r_assert_corrupt_receipts_replaced(
+        storage: &StorageManager,
+        blocks: &[&Block],
+        a2: &Block,
+        b2: &Block,
+        b3: &Block,
+        both: &Transaction,
+        only_a: &Transaction,
+    ) {
+        let r = storage
+            .transactions
+            .get_receipt(&both.hash)
+            .expect("the receipt of the tx on both branches decodes again")
+            .expect("and is stored");
+        assert_eq!((r.block_hash, r.block_number), (b2.header.block_hash, 2));
+        assert!(
+            storage
+                .transactions
+                .get_receipt(&only_a.hash)
+                .expect("no undecodable receipt is left")
+                .is_none(),
+            "the corrupt receipt of the abandoned-only tx is removed"
+        );
+        assert!(storage
+            .transactions
+            .get_block_transactions(&a2.header.block_hash)
+            .expect("markers")
+            .is_empty());
+        c1r_receipts_consistent(storage, Some(b3.header.block_hash), blocks)
+            .expect("receipts follow the executed chain");
+    }
+
+    /// `reorg_to`: an undecodable stored receipt in the abandoned block does not
+    /// decline the reorg. Negative control: the same scenario without the
+    /// corruption reorgs too (`c1r_reorg_replaces_receipts_and_abort_restores_them`).
+    #[tokio::test]
+    async fn c1r_undecodable_receipt_does_not_block_reorg() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let follower = store_backed(&storage);
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        follower
+            .persist_state_changes()
+            .await
+            .expect("persist genesis");
+        let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+        let (a1, a2, b2, b3, both, only_a) = c1r_corrupt_scenario().await;
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        c1r_corrupt_receipt(&storage, &both.hash);
+        c1r_corrupt_receipt(&storage, &only_a.hash);
+        persist(&storage, &b2);
+        persist(&storage, &b3);
+        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        app.apply_received(&b3).await;
+        assert_eq!(
+            app.applied_tip().await.hash,
+            b3.header.block_hash,
+            "the node follows the heavier branch"
+        );
+        assert_eq!(
+            storage.blocks.get_applied_tip().expect("tip"),
+            Some((b3.header.block_hash, 3)),
+            "the durable tip follows it too"
+        );
+        c1r_assert_corrupt_receipts_replaced(
+            &storage,
+            &[&a1, &a2, &b2, &b3],
+            &a2,
+            &b2,
+            &b3,
+            &both,
+            &only_a,
+        );
+    }
+
+    /// An aborted reorg with an undecodable receipt in the abandoned block: the
+    /// node stays on A, nothing it could read is lost, and the abort does not
+    /// fail on the receipt it could not read.
+    #[tokio::test]
+    async fn c1r_undecodable_receipt_aborted_reorg_keeps_the_tip() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let follower = store_backed(&storage);
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        follower
+            .persist_state_changes()
+            .await
+            .expect("persist genesis");
+        let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+        let (a1, a2, b2, _b3, both, only_a) = c1r_corrupt_scenario().await;
+        let b3_bad = mk_block_txs(
+            3,
+            b2.header.block_hash,
+            Hash::new([0xEE; 32]),
+            [0x5C; 32],
+            vec![],
+        );
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        c1r_corrupt_receipt(&storage, &only_a.hash);
+        persist(&storage, &b2);
+        persist(&storage, &b3_bad);
+        app.fork_choice = Some(fork_choice_returning(b3_bad.header.block_hash));
+        app.apply_received(&b3_bad).await;
+        assert_eq!(app.applied_tip().await.hash, a2.header.block_hash);
+        assert_eq!(
+            storage.blocks.get_applied_tip().expect("tip"),
+            Some((a2.header.block_hash, 2))
+        );
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt(&both.hash)
+                .expect("read")
+                .map(|r| r.block_hash),
+            Some(a2.header.block_hash),
+            "the readable receipt of the abandoned block is restored"
+        );
+        let markers = storage
+            .transactions
+            .get_block_transactions(&a2.header.block_hash)
+            .expect("markers");
+        assert!(markers.contains(&both.hash), "its marker is restored");
+    }
+
+    /// `recover_to_head`: the same corruption must not abort the from-genesis
+    /// rebuild onto the heavier branch.
+    #[tokio::test]
+    async fn c1r_undecodable_receipt_does_not_block_rebuild() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let exec = store_backed(&storage);
+        exec.set_balance(&Address(ALICE), U256::from(FUND));
+        exec.persist_state_changes().await.expect("persist genesis");
+        let (a1, a2, b2, b3, both, only_a) = c1r_corrupt_scenario().await;
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        persist(&storage, &b2);
+        persist(&storage, &b3);
+        drop(app);
+        c1r_corrupt_receipt(&storage, &both.hash);
+        c1r_corrupt_receipt(&storage, &only_a.hash);
+        let mut app2 = CanonicalApplicator::new(exec.clone(), storage.clone());
+        app2.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        let g = Executor::new(Arc::new(StateDB::new()));
+        g.set_balance(&Address(ALICE), U256::from(FUND));
+        let res = app2
+            .recover_to_head(g.state_snapshot(), Hash::default())
+            .await;
+        assert!(
+            matches!(res, Ok(true)),
+            "the rebuild converges on the heavier branch: {res:?}"
+        );
+        assert_eq!(app2.applied_tip().await.hash, b3.header.block_hash);
+        assert!(storage
+            .transactions
+            .get_receipt_reconcile_marker()
+            .expect("marker")
+            .is_none());
+        c1r_assert_corrupt_receipts_replaced(
+            &storage,
+            &[&a1, &a2, &b2, &b3],
+            &a2,
+            &b2,
+            &b3,
+            &both,
+            &only_a,
+        );
+    }
+
+    /// Resets this thread's receipt chunk override when a test ends.
+    struct ChunkGuard;
+    impl ChunkGuard {
+        fn set(n: usize) -> Self {
+            super::test_receipt_chunk::set(Some(n));
+            ChunkGuard
+        }
+    }
+    impl Drop for ChunkGuard {
+        fn drop(&mut self) {
+            super::test_receipt_chunk::set(None);
+        }
+    }
+
+    /// A follower on A (a1 ← a2, a2 with two txs) whose executor writes through
+    /// a `V251AbortStore`, with B (b2 ← b3) stored. Returns the abort store too.
+    async fn c1r_chunk_follower(
+        dir: &std::path::Path,
+    ) -> (
+        Arc<StorageManager>,
+        Arc<V251AbortStore>,
+        Arc<Executor>,
+        [Block; 4],
+        Transaction,
+        Transaction,
+    ) {
+        let storage =
+            Arc::new(StorageManager::new(dir, PruningConfig::default()).expect("storage"));
+        let store = Arc::new(V251AbortStore {
+            inner: storage.state.clone(),
+            writes: AtomicU64::new(0),
+            abort_at: u64::MAX,
+            fail_receipt_index: AtomicBool::new(false),
+            fail_reorg_batch_at: AtomicU64::new(0),
+            reorg_batches: AtomicU64::new(0),
+        });
+        let exec = Arc::new(Executor::with_storage(
+            Arc::new(StateDB::new()),
+            Some(store.clone()),
+        ));
+        exec.set_balance(&Address(ALICE), U256::from(FUND));
+        exec.persist_state_changes().await.expect("persist genesis");
+        let (a1, a2, b2, b3, both, only_a) = c1r_corrupt_scenario().await;
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        persist(&storage, &b2);
+        persist(&storage, &b3);
+        (storage, store, exec, [a1, a2, b2, b3], both, only_a)
+    }
+
+    fn c1r_genesis() -> StateSnapshot {
+        let g = Executor::new(Arc::new(StateDB::new()));
+        g.set_balance(&Address(ALICE), U256::from(FUND));
+        g.state_snapshot()
+    }
+
+    /// The spine rebuild with the losing segment's removals split over several
+    /// batches (chunk size 1: one in the reset batch, one after it), one of
+    /// them on an undecodable receipt: it converges and the index matches B.
+    #[tokio::test]
+    async fn c1r_rebuild_chunked_removals_converge() {
+        if std::env::var(V251_DIR).is_ok() {
+            return;
+        }
+        let _chunk = ChunkGuard::set(1);
+        let dir = tempfile::tempdir().expect("dir");
+        let (storage, _store, exec, [a1, a2, b2, b3], both, only_a) =
+            c1r_chunk_follower(dir.path()).await;
+        c1r_corrupt_receipt(&storage, &only_a.hash);
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        let res = app.recover_to_head(c1r_genesis(), Hash::default()).await;
+        assert!(matches!(res, Ok(true)), "{res:?}");
+        assert_eq!(app.applied_tip().await.hash, b3.header.block_hash);
+        c1r_assert_corrupt_receipts_replaced(
+            &storage,
+            &[&a1, &a2, &b2, &b3],
+            &a2,
+            &b2,
+            &b3,
+            &both,
+            &only_a,
+        );
+    }
+
+    /// A removal chunk written after the reset batch fails: the rebuild rolls
+    /// back to a2 with memory, store, receipts, marker and tip as before, and
+    /// a retry once the store recovers converges.
+    #[tokio::test]
+    async fn c1r_rebuild_failed_removal_chunk_rolls_back() {
+        if std::env::var(V251_DIR).is_ok() {
+            return;
+        }
+        let _chunk = ChunkGuard::set(1);
+        let dir = tempfile::tempdir().expect("dir");
+        let (storage, store, exec, [a1, a2, b2, b3], _both, _only_a) =
+            c1r_chunk_follower(dir.path()).await;
+        let all = [&a1, &a2, &b2, &b3];
+        let before = c1r_durable_view(&storage, &all);
+        let root_before = exec.calculate_state_root();
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        store.fail_receipt_index.store(true, Ordering::SeqCst);
+        let res = app.recover_to_head(c1r_genesis(), Hash::default()).await;
+        assert!(res.is_err(), "a failed removal write aborts: {res:?}");
+        assert_eq!(app.applied_tip().await.hash, a2.header.block_hash, "tip");
+        assert_eq!(exec.calculate_state_root(), root_before, "memory");
+        assert_eq!(c1r_durable_view(&storage, &all), before, "durable state");
+
+        store.fail_receipt_index.store(false, Ordering::SeqCst);
+        let res = app.recover_to_head(c1r_genesis(), Hash::default()).await;
+        assert!(matches!(res, Ok(true)), "{res:?}");
+        c1r_receipts_consistent(&storage, Some(b3.header.block_hash), &all)
+            .expect("receipts follow B");
+    }
+
+    /// The node stops between the reset batch and the removal chunk after it
+    /// (emulated: the chunk write fails and so does the rollback). The losing
+    /// segment keeps a receipt above the durable tip, but the reset batch's
+    /// marker covers it: the next start removes it, and the rebuild converges.
+    #[tokio::test]
+    async fn c1r_stop_after_reset_before_removal_chunk_is_cleaned_on_restart() {
+        if std::env::var(V251_DIR).is_ok() {
+            return;
+        }
+        let _chunk = ChunkGuard::set(1);
+        let dir = tempfile::tempdir().expect("dir");
+        let (storage, store, exec, [a1, a2, b2, b3], both, only_a) =
+            c1r_chunk_follower(dir.path()).await;
+        let all = [&a1, &a2, &b2, &b3];
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        store.fail_receipt_index.store(true, Ordering::SeqCst);
+        // Reorg batch +1 is the reset; +2 is the rollback, which fails too.
+        store.fail_reorg_batch_at.store(
+            store.reorg_batches.load(Ordering::SeqCst) + 2,
+            Ordering::SeqCst,
+        );
+        let res = app.recover_to_head(c1r_genesis(), Hash::default()).await;
+        assert!(res.is_err(), "{res:?}");
+        drop(app);
+        // The emulated stop: tip at genesis, the marker names a2, and one of
+        // a2's two receipts is still stored.
+        assert_eq!(
+            storage.blocks.get_applied_tip().expect("tip").map(|t| t.1),
+            Some(0)
+        );
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt_reconcile_marker()
+                .expect("marker"),
+            Some((a2.header.block_hash, 2))
+        );
+        let left = [&both, &only_a]
+            .iter()
+            .filter(|t| {
+                storage
+                    .transactions
+                    .get_receipt(&t.hash)
+                    .expect("read")
+                    .map(|r| r.block_hash)
+                    == Some(a2.header.block_hash)
+            })
+            .count();
+        assert_eq!(left, 1, "precondition: one removal was still pending");
+
+        // Restart: a fresh executor over the durable store.
+        let sdb = StateDB::new();
+        for (addr, acct) in storage.state.get_all_accounts().expect("accounts") {
+            sdb.accounts.load_account(addr, acct);
+        }
+        for ((addr, key), val) in storage.state.get_all_storage().expect("storage") {
+            sdb.set_storage(addr, key.as_bytes().to_vec(), val.as_bytes().to_vec());
+        }
+        let exec2 = Arc::new(Executor::with_storage(
+            Arc::new(sdb),
+            Some(storage.state.clone()),
+        ));
+        let mut app2 = CanonicalApplicator::new(exec2.clone(), storage.clone());
+        assert!(
+            storage
+                .transactions
+                .get_block_transactions(&a2.header.block_hash)
+                .expect("markers")
+                .is_empty(),
+            "the start-up cleanup removed the pending entry"
+        );
+        for t in [&both, &only_a] {
+            assert_ne!(
+                storage
+                    .transactions
+                    .get_receipt(&t.hash)
+                    .expect("read")
+                    .map(|r| r.block_hash),
+                Some(a2.header.block_hash)
+            );
+        }
+        app2.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        app2.set_genesis(c1r_genesis(), Hash::default());
+        let res = app2.recover_to_head(c1r_genesis(), Hash::default()).await;
+        assert!(matches!(res, Ok(true)), "{res:?}");
+        c1r_receipts_consistent(&storage, Some(b3.header.block_hash), &all)
+            .expect("receipts follow B");
+    }
+
+    /// The interrupted-rebuild cleanup and the purge-fallback scan
+    /// (`receipt_index_above`) never include the durable tip's own block: its
+    /// receipts are on the applied chain. Pins the `>` boundary; also covers a
+    /// block above the tip and an index entry whose block is not stored.
+    #[tokio::test]
+    async fn c1r_receipt_index_above_keeps_the_durable_tips_receipts() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let exec = store_backed(&storage);
+        exec.set_balance(&Address(ALICE), U256::from(FUND));
+        exec.persist_state_changes().await.expect("persist genesis");
+        let (a1, a2, _, _) = v251_blocks().await;
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        let ghost_block = Hash::new([0xAB; 32]);
+        let ghost_tx = Hash::new([0xAC; 32]);
+        let mut ghost = storage
+            .transactions
+            .get_receipt(&a1.transactions[0].hash)
+            .expect("read")
+            .expect("a1 receipt");
+        ghost.tx_hash = ghost_tx;
+        ghost.block_hash = ghost_block;
+        storage
+            .transactions
+            .put_receipts(&[(ghost_tx, ghost)])
+            .expect("ghost entry");
+        let a1_entries: Vec<(Hash, Hash)> = a1
+            .transactions
+            .iter()
+            .map(|t| (a1.header.block_hash, t.hash))
+            .collect();
+        let a2_entries: Vec<(Hash, Hash)> = a2
+            .transactions
+            .iter()
+            .map(|t| (a2.header.block_hash, t.hash))
+            .collect();
+        let sorted = |mut v: Vec<(Hash, Hash)>| {
+            v.sort();
+            v
+        };
+
+        // Durable tip a1 @ 1: a1 stays; a2 (above) and the unstored block go.
+        let got = CanonicalApplicator::receipt_index_above(&storage, 1).expect("scan");
+        let mut want = a2_entries.clone();
+        want.push((ghost_block, ghost_tx));
+        assert_eq!(sorted(got.clone()), sorted(want));
+        for e in &a1_entries {
+            assert!(!got.contains(e), "the durable tip's own receipt is kept");
+        }
+        // Durable tip a2 @ 2: only the unstored block goes.
+        let got = CanonicalApplicator::receipt_index_above(&storage, 2).expect("scan");
+        assert_eq!(got, vec![(ghost_block, ghost_tx)]);
+        // Negative control: below a1 both blocks are above the tip.
+        let got = CanonicalApplicator::receipt_index_above(&storage, 0).expect("scan");
+        let mut want = a1_entries;
+        want.extend(a2_entries);
+        want.push((ghost_block, ghost_tx));
+        assert_eq!(sorted(got), sorted(want));
+    }
+
+    // ---------------------------------------------------------------------
+    // C1-R read-fault injection: every storage read on the reorg, rebuild and
+    // receipt-index paths fails in turn. A failing read must abort the operation
+    // with memory, store, receipts, rebuild marker, tip and ring unchanged; it is
+    // never read as "absent".
+    // ---------------------------------------------------------------------
+
+    use super::read_faults::{self, Fault, Site};
+
+    fn fault(site: Site, key: Option<Hash>, skip: u32) -> Fault {
+        Fault { site, key, skip }
+    }
+
+    /// Clears the thread's fault table when a test ends (also on panic).
+    struct FaultGuard;
+    impl Drop for FaultGuard {
+        fn drop(&mut self) {
+            read_faults::clear();
+        }
+    }
+
+    /// Everything durable the receipt index, the reorg and the rebuild touch:
+    /// applied tip, rebuild marker, accounts, storage slots, and for every block
+    /// in `blocks` its `t‖block‖tx` markers and the receipt stored for each tx.
+    fn c1r_durable_view(storage: &StorageManager, blocks: &[&Block]) -> String {
+        let mut out = format!(
+            "tip={:?} marker={:?}\n",
+            storage.blocks.get_applied_tip().expect("tip"),
+            storage
+                .transactions
+                .get_receipt_reconcile_marker()
+                .expect("marker")
+        );
+        let mut accounts = storage.state.get_all_accounts().expect("accounts");
+        accounts.sort_by_key(|(a, _)| a.0);
+        out.push_str(&format!("accounts={accounts:?}\n"));
+        let mut slots = storage.state.get_all_storage().expect("storage");
+        slots.sort_by_key(|((a, k), _)| (a.0, *k.as_bytes()));
+        out.push_str(&format!("storage={slots:?}\n"));
+        for b in blocks {
+            let mut markers = storage
+                .transactions
+                .get_block_transactions(&b.header.block_hash)
+                .expect("markers");
+            markers.sort_by_key(|h| *h.as_bytes());
+            out.push_str(&format!(
+                "block {} markers={markers:?}\n",
+                b.header.block_hash
+            ));
+            for tx in &b.transactions {
+                let r = storage.transactions.get_receipt(&tx.hash).expect("receipt");
+                out.push_str(&format!("  tx {} receipt={r:?}\n", tx.hash));
+            }
+        }
+        out
+    }
+
+    /// Reorg: a read error at each site (the new tip's lookup, the branch walk,
+    /// the abandoned blocks and the abandoned receipts) declines the reorg before
+    /// anything moves. Before this, an abandoned-receipt read error dropped that
+    /// receipt from the abort's restore set, and a block read error ended the
+    /// abandoned walk early. With the faults cleared, the same reorg succeeds.
+    #[tokio::test]
+    async fn c1r_reorg_read_faults_change_nothing() {
+        let _g = FaultGuard;
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let exec = store_backed(&storage);
+        exec.set_balance(&Address(ALICE), U256::from(FUND));
+        exec.persist_state_changes().await.expect("persist genesis");
+        let (a1, a2, b2, b3) = v251_blocks().await;
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        persist(&storage, &b2);
+        persist(&storage, &b3);
+        let all = [&a1, &a2, &b2, &b3];
+        let before = c1r_durable_view(&storage, &all);
+        let root_before = exec.calculate_state_root();
+        let ring_before: Vec<(u64, Hash)> = app
+            .lock
+            .lock()
+            .await
+            .snapshots
+            .iter()
+            .map(|(h, (hh, _))| (*h, *hh))
+            .collect();
+        let a2_tx = a2.transactions[0].hash;
+
+        let cases = [
+            (
+                "new-tip lookup",
+                fault(Site::Block, Some(b3.header.block_hash), 0),
+            ),
+            (
+                "branch walk",
+                fault(Site::Block, Some(b3.header.block_hash), 1),
+            ),
+            (
+                "branch walk (fork point)",
+                fault(Site::Block, Some(a1.header.block_hash), 0),
+            ),
+            (
+                "abandoned block",
+                fault(Site::Block, Some(a2.header.block_hash), 0),
+            ),
+            (
+                "abandoned walk base",
+                fault(Site::Block, Some(a1.header.block_hash), 1),
+            ),
+            ("abandoned receipt", fault(Site::Receipt, Some(a2_tx), 0)),
+        ];
+        for (what, f) in cases {
+            read_faults::set(vec![f]);
+            let outcome = {
+                let mut st = app.lock.lock().await;
+                app.reorg_to(&mut st, b3.header.block_hash).await
+            };
+            assert!(read_faults::hits() > 0, "{what}: the fault was not reached");
+            read_faults::clear();
+            assert!(
+                matches!(outcome, ReorgOutcome::Rejected(_)),
+                "{what}: a read error must decline the reorg, got {outcome:?}"
+            );
+            assert_eq!(
+                app.applied_tip().await.hash,
+                a2.header.block_hash,
+                "{what}: tip"
+            );
+            assert_eq!(exec.calculate_state_root(), root_before, "{what}: memory");
+            let ring: Vec<(u64, Hash)> = app
+                .lock
+                .lock()
+                .await
+                .snapshots
+                .iter()
+                .map(|(h, (hh, _))| (*h, *hh))
+                .collect();
+            assert_eq!(ring, ring_before, "{what}: ring");
+            assert_eq!(
+                c1r_durable_view(&storage, &all),
+                before,
+                "{what}: durable state"
+            );
+        }
+
+        // No fault: the same reorg goes through and the index follows B.
+        let outcome = {
+            let mut st = app.lock.lock().await;
+            app.reorg_to(&mut st, b3.header.block_hash).await
+        };
+        assert!(
+            matches!(outcome, ReorgOutcome::Reorged { .. }),
+            "{outcome:?}"
+        );
+        c1r_receipts_consistent(&storage, Some(b3.header.block_hash), &all)
+            .expect("receipts follow B");
+    }
+
+    /// The setup of the rebuild fault tests: A (a1 ← a2) applied, B (b2 ← b3)
+    /// stored, and a restarted applicator whose fork choice names b3.
+    async fn c1r_rebuild_setup(
+        dir: &std::path::Path,
+    ) -> (
+        Arc<StorageManager>,
+        Arc<Executor>,
+        CanonicalApplicator,
+        [Block; 4],
+        StateSnapshot,
+    ) {
+        let storage =
+            Arc::new(StorageManager::new(dir, PruningConfig::default()).expect("storage"));
+        let exec = store_backed(&storage);
+        exec.set_balance(&Address(ALICE), U256::from(FUND));
+        exec.persist_state_changes().await.expect("persist genesis");
+        let (a1, a2, b2, b3) = v251_blocks().await;
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        persist(&storage, &b2);
+        persist(&storage, &b3);
+        drop(app);
+        let mut app2 = CanonicalApplicator::new(exec.clone(), storage.clone());
+        app2.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        let g = Executor::new(Arc::new(StateDB::new()));
+        g.set_balance(&Address(ALICE), U256::from(FUND));
+        (storage, exec, app2, [a1, a2, b2, b3], g.state_snapshot())
+    }
+
+    /// Rebuild: a read error in the preparation (marker, genesis block, spine,
+    /// abandoned blocks and receipts, the rollback removals) aborts with `Err`
+    /// before anything changes. A read error during the replay or the final head
+    /// check rolls back, and the rollback restores the receipt index exactly:
+    /// it was prepared in full beforehand and reads nothing itself.
+    #[tokio::test]
+    async fn c1r_rebuild_read_faults_change_nothing() {
+        let _g = FaultGuard;
+        let dir = tempfile::tempdir().expect("dir");
+        let (storage, exec, app, [a1, a2, b2, b3], genesis) = c1r_rebuild_setup(dir.path()).await;
+        let all = [&a1, &a2, &b2, &b3];
+        let before = c1r_durable_view(&storage, &all);
+        let root_before = exec.calculate_state_root();
+        let tip_before = app.applied_tip().await;
+        let ring_len_before = app.lock.lock().await.snapshots.len();
+        let b3h = b3.header.block_hash;
+
+        // (what, fault, aborts with Err before any change)
+        let cases = [
+            ("rebuild marker", fault(Site::Marker, None, 0), true),
+            (
+                "genesis block",
+                fault(Site::Block, Some(Hash::default()), 0),
+                true,
+            ),
+            (
+                "spine walk",
+                fault(Site::Block, Some(b2.header.block_hash), 0),
+                true,
+            ),
+            (
+                "spine walk end",
+                fault(Site::Block, Some(Hash::default()), 1),
+                true,
+            ),
+            (
+                "abandoned block",
+                fault(Site::Block, Some(a2.header.block_hash), 0),
+                true,
+            ),
+            (
+                "abandoned receipt",
+                fault(Site::Receipt, Some(a2.transactions[0].hash), 0),
+                true,
+            ),
+            ("rollback removals", fault(Site::Block, Some(b3h), 1), true),
+            ("replay", fault(Site::Block, Some(b3h), 2), false),
+            ("head-root check", fault(Site::Block, Some(b3h), 3), false),
+        ];
+        for (what, f, early) in cases {
+            read_faults::set(vec![f]);
+            let res = app.recover_to_head(genesis.clone(), Hash::default()).await;
+            assert!(read_faults::hits() > 0, "{what}: the fault was not reached");
+            read_faults::clear();
+            if early {
+                assert!(res.is_err(), "{what}: must abort with Err, got {res:?}");
+            } else {
+                assert!(
+                    matches!(res, Ok(false)),
+                    "{what}: must roll back (Ok(false)), got {res:?}"
+                );
+            }
+            assert_eq!(app.applied_tip().await, tip_before, "{what}: tip");
+            assert_eq!(exec.calculate_state_root(), root_before, "{what}: memory");
+            assert_eq!(
+                app.lock.lock().await.snapshots.len(),
+                ring_len_before,
+                "{what}: ring"
+            );
+            assert_eq!(
+                c1r_durable_view(&storage, &all),
+                before,
+                "{what}: durable state"
+            );
+        }
+
+        assert!(app
+            .recover_to_head(genesis.clone(), Hash::default())
+            .await
+            .expect("recover"));
+        assert_eq!(app.applied_tip().await.hash, b3h);
+        c1r_receipts_consistent(&storage, Some(b3h), &all).expect("receipts follow B");
+    }
+
+    /// Interrupted-rebuild cleanup: a read error on the marker, the durable tip or
+    /// an old-chain block keeps the marker and every receipt, at startup and
+    /// before a rebuild (which then refuses to run). Once reads succeed, the
+    /// cleanup completes and the marker is cleared.
+    #[tokio::test]
+    async fn c1r_interrupted_cleanup_read_faults_keep_the_marker() {
+        if std::env::var(V251_DIR).is_ok() {
+            return;
+        }
+        let _g = FaultGuard;
+        let (a1, a2, b2, b3) = v251_blocks().await;
+        let dir = tempfile::tempdir().expect("dir");
+        c1r_crash_after_rebuild_reset(dir.path(), &a1, &a2);
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen"));
+        for b in [&a1, &a2, &b2, &b3] {
+            persist(&storage, b);
+        }
+        let exec = store_backed(&storage);
+        let all = [&a1, &a2, &b2, &b3];
+        let before = c1r_durable_view(&storage, &all);
+        let g = Executor::new(Arc::new(StateDB::new()));
+        g.set_balance(&Address(ALICE), U256::from(FUND));
+
+        let cases = [
+            ("marker", fault(Site::Marker, None, 0)),
+            ("durable tip", fault(Site::AppliedTip, None, 0)),
+            (
+                "old-chain block",
+                fault(Site::Block, Some(a2.header.block_hash), 0),
+            ),
+        ];
+        for (what, f) in cases {
+            read_faults::set(vec![f]);
+            let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            assert!(
+                read_faults::hits() > 0,
+                "{what}: startup did not reach the fault"
+            );
+            assert_eq!(
+                c1r_durable_view(&storage, &all),
+                before,
+                "{what}: startup cleanup must change nothing"
+            );
+            app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+            let res = app
+                .recover_to_head(g.state_snapshot(), Hash::default())
+                .await;
+            read_faults::clear();
+            assert!(res.is_err(), "{what}: the rebuild must refuse: {res:?}");
+            assert_eq!(
+                c1r_durable_view(&storage, &all),
+                before,
+                "{what}: a refused rebuild must change nothing"
+            );
+        }
+
+        let _app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt_reconcile_marker()
+                .expect("read"),
+            None,
+            "marker cleared once the cleanup reads succeed"
+        );
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt(&a2.transactions[0].hash)
+                .expect("read")
+                .map(|r| r.block_hash),
+            None,
+            "a2 is above the durable tip: its receipt is gone"
+        );
+    }
+
+    /// Reorg: the winning branch's store commit (one atomic batch) fails. The
+    /// store, receipts and tip are still at the fork point; the reorg must abort
+    /// and put everything back to pre_tip, not adopt the winning branch in memory
+    /// over a store that never received it (before: it logged and committed the
+    /// new tip in memory anyway).
+    #[tokio::test]
+    async fn c1r_reorg_winning_commit_failure_aborts_and_restores() {
+        if std::env::var(V251_DIR).is_ok() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let store = Arc::new(V251AbortStore {
+            inner: storage.state.clone(),
+            writes: AtomicU64::new(0),
+            abort_at: u64::MAX,
+            fail_receipt_index: AtomicBool::new(false),
+            fail_reorg_batch_at: AtomicU64::new(0),
+            reorg_batches: AtomicU64::new(0),
+        });
+        let exec = Arc::new(Executor::with_storage(
+            Arc::new(StateDB::new()),
+            Some(store.clone()),
+        ));
+        exec.set_balance(&Address(ALICE), U256::from(FUND));
+        exec.persist_state_changes().await.expect("persist genesis");
+        let (a1, a2, b2, b3) = v251_blocks().await;
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        persist(&storage, &b2);
+        persist(&storage, &b3);
+        let all = [&a1, &a2, &b2, &b3];
+        let before = c1r_durable_view(&storage, &all);
+        let root_before = exec.calculate_state_root();
+
+        // Reorg batch 1 reverts to the fork point; batch 2 commits the winner.
+        store.fail_reorg_batch_at.store(
+            store.reorg_batches.load(Ordering::SeqCst) + 2,
+            Ordering::SeqCst,
+        );
+        let outcome = {
+            let mut st = app.lock.lock().await;
+            app.reorg_to(&mut st, b3.header.block_hash).await
+        };
+        assert!(
+            matches!(outcome, ReorgOutcome::Rejected(_)),
+            "a failed winning commit must abort the reorg: {outcome:?}"
+        );
+        assert_eq!(app.applied_tip().await.hash, a2.header.block_hash, "tip");
+        assert_eq!(exec.calculate_state_root(), root_before, "memory");
+        assert_eq!(c1r_durable_view(&storage, &all), before, "durable state");
+
+        store.fail_reorg_batch_at.store(0, Ordering::SeqCst);
+        let outcome = {
+            let mut st = app.lock.lock().await;
+            app.reorg_to(&mut st, b3.header.block_hash).await
+        };
+        assert!(
+            matches!(outcome, ReorgOutcome::Reorged { .. }),
+            "{outcome:?}"
+        );
+        c1r_receipts_consistent(&storage, Some(b3.header.block_hash), &all)
+            .expect("receipts follow B");
+    }
+
+    // ---------------------------------------------------------------------
+    // C1-R: the receipt index after the start-up hardening purge. The purge
+    // removes the invalid blocks (and their receipts) but leaves the applied-tip
+    // pointer on a removed block, so the old applied chain can no longer be
+    // walked from its tip. The blocks below the removed ones keep their
+    // receipts; once the node moves to another chain, those receipts must go.
+    // ---------------------------------------------------------------------
+
+    /// A follower that applied a1 ← a2, then restarted on a release whose block
+    /// rules start at height 2 (the purge removes a2), with a1 still stored.
+    async fn c1r_purged_follower(
+        dir: &std::path::Path,
+    ) -> (Arc<StorageManager>, Arc<Executor>, Block, Block) {
+        let storage =
+            Arc::new(StorageManager::new(dir, PruningConfig::default()).expect("storage"));
+        let exec = store_backed(&storage);
+        exec.set_balance(&Address(ALICE), U256::from(FUND));
+        exec.persist_state_changes().await.expect("persist genesis");
+        let (a1, a2, _, _) = v251_blocks().await;
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        drop(app);
+        c1r_startup_purge(&storage, &a1, &a2);
+        (storage, exec, a1, a2)
+    }
+
+    /// The real start-up purge with the rules active from height 2: a2 (and
+    /// anything above it) goes, a1 stays with its receipt, and the applied-tip
+    /// pointer stays on a2. Asserts that precondition.
+    fn c1r_startup_purge(storage: &StorageManager, a1: &Block, a2: &Block) {
+        let report = crate::hardening_rejoin::purge_invalid_post_activation(
+            storage,
+            citrate_consensus::hardening::PbaHardening::at(2),
+            40204,
+        )
+        .expect("purge");
+        assert!(report.purged.contains(&a2.header.block_hash), "a2 removed");
+        assert!(!report.purged.contains(&a1.header.block_hash), "a1 kept");
+        assert!(storage
+            .blocks
+            .get_block(&a2.header.block_hash)
+            .expect("read")
+            .is_none());
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt(&a1.transactions[0].hash)
+                .expect("read")
+                .map(|r| r.block_hash),
+            Some(a1.header.block_hash),
+            "a1 keeps its receipt through the purge"
+        );
+    }
+
+    /// After the purge, the start-up rebuild moves the node to branch C, which
+    /// forks off genesis and so excludes a1. a1's transaction is not on the
+    /// applied chain any more: `eth_getTransactionReceipt` must return null, and
+    /// a1 keeps no block marker. The walk down the old applied chain starts at
+    /// the removed a2 and cannot reach a1, so the rebuild has to find it another
+    /// way.
+    #[tokio::test]
+    async fn c1r_rebuild_after_startup_purge_leaves_no_receipt_off_the_spine() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (storage, exec, a1, a2) = c1r_purged_follower(dir.path()).await;
+        let (c1, c2) = c1r_fork_c().await;
+        // Sync fetches the canonical chain from upgraded peers.
+        persist(&storage, &c1);
+        persist(&storage, &c2);
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        assert_eq!(app.applied_tip().await.hash, a2.header.block_hash);
+        app.fork_choice = Some(fork_choice_returning(c2.header.block_hash));
+        let g = Executor::new(Arc::new(StateDB::new()));
+        g.set_balance(&Address(ALICE), U256::from(FUND));
+        assert!(app
+            .recover_to_head(g.state_snapshot(), Hash::default())
+            .await
+            .expect("recover"));
+        assert_eq!(app.applied_tip().await.hash, c2.header.block_hash);
+
+        let io = Arc::new(c1r_rpc(storage.clone(), exec.clone()));
+        let r = c1r_call(
+            &io,
+            "eth_getTransactionReceipt",
+            serde_json::json!([c1r_hex(&a1.transactions[0].hash)]),
+        )
+        .await;
+        assert!(
+            r["result"].is_null(),
+            "a1 is not on the applied chain: its receipt must be null, got {r}"
+        );
+        let r = c1r_call(
+            &io,
+            "eth_getTransactionReceipt",
+            serde_json::json!([c1r_hex(&c1.transactions[0].hash)]),
+        )
+        .await;
+        assert_eq!(
+            r["result"]["blockHash"],
+            serde_json::json!(c1r_hex(&c1.header.block_hash)),
+            "c1's receipt is served: {r}"
+        );
+        c1r_receipts_consistent(&storage, Some(c2.header.block_hash), &[&a1, &a2, &c1, &c2])
+            .expect("receipts follow C");
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt_reconcile_marker()
+                .expect("read"),
+            None,
+            "no rebuild marker after convergence"
+        );
+    }
+
+    /// The same rebuild, but it cannot converge (c1 was never fetched, so the
+    /// replay stops short of c2). The rollback must leave the receipt index
+    /// exactly as it was: the node is back on its old state, so a1's receipt
+    /// is restored together with it.
+    #[tokio::test]
+    async fn c1r_failed_rebuild_after_startup_purge_restores_receipts() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (storage, exec, a1, a2) = c1r_purged_follower(dir.path()).await;
+        let (c1, c2) = c1r_fork_c().await;
+        persist(&storage, &c2);
+        let all = [&a1, &a2, &c1, &c2];
+        let before = c1r_durable_view(&storage, &all);
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        let root_before = exec.calculate_state_root();
+        app.fork_choice = Some(fork_choice_returning(c2.header.block_hash));
+        let g = Executor::new(Arc::new(StateDB::new()));
+        g.set_balance(&Address(ALICE), U256::from(FUND));
+        let res = app
+            .recover_to_head(g.state_snapshot(), Hash::default())
+            .await;
+        assert!(matches!(res, Ok(false)), "must roll back, got {res:?}");
+        assert_eq!(app.applied_tip().await.hash, a2.header.block_hash, "tip");
+        assert_eq!(exec.calculate_state_root(), root_before, "memory");
+        assert_eq!(c1r_durable_view(&storage, &all), before, "durable state");
+
+        // c1 arrives; the retried rebuild converges and cleans up.
+        persist(&storage, &c1);
+        assert!(app
+            .recover_to_head(g.state_snapshot(), Hash::default())
+            .await
+            .expect("recover"));
+        c1r_receipts_consistent(&storage, Some(c2.header.block_hash), &all)
+            .expect("receipts follow C");
+    }
+
+    /// A rebuild A → B is interrupted right after its reset batch (durable tip
+    /// at genesis, a1 kept as shared prefix, rebuild marker on a2). The node
+    /// restarts on a release whose rules start at height 2: the purge removes
+    /// a2, b2 and b3, so the marker names a removed block. Fork choice then
+    /// picks C. The start-up cleanup can no longer walk down from the marker,
+    /// and must still remove a1's receipt instead of clearing the marker.
+    #[tokio::test]
+    async fn c1r_interrupted_rebuild_then_startup_purge_removes_the_prefix_receipt() {
+        if std::env::var(V251_DIR).is_ok() {
+            return;
+        }
+        let (a1, a2, b2, b3) = v251_blocks().await;
+        let (c1, c2) = c1r_fork_c().await;
+        let dir = tempfile::tempdir().expect("dir");
+        c1r_crash_after_rebuild_reset(dir.path(), &a1, &a2);
+        {
+            let storage =
+                StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen");
+            c1r_startup_purge(&storage, &a1, &a2);
+            for b in [&b2, &b3] {
+                assert!(storage
+                    .blocks
+                    .get_block(&b.header.block_hash)
+                    .expect("read")
+                    .is_none());
+            }
+        }
+        c1r_resume_and_check(dir.path(), &[&a1, &c1, &c2], &c2)
+            .await
+            .expect("restart converging on C leaves no receipt of a1");
+        let storage = StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen");
+        assert!(
+            storage
+                .transactions
+                .get_receipt(&a1.transactions[0].hash)
+                .expect("read")
+                .is_none(),
+            "a1 is not executed on C: its receipt is gone"
+        );
+        assert!(storage
+            .transactions
+            .get_block_transactions(&a1.header.block_hash)
+            .expect("read")
+            .is_empty());
+    }
+
+    /// The index scan the purge cases fall back on is read like every other
+    /// rebuild input: a failed scan, or a failed receipt read during it, aborts
+    /// the rebuild before anything changes, and a failed scan in the start-up
+    /// cleanup keeps the marker. Once reads succeed, both complete.
+    #[tokio::test]
+    async fn c1r_receipt_index_scan_read_faults_change_nothing() {
+        if std::env::var(V251_DIR).is_ok() {
+            return;
+        }
+        let _g = FaultGuard;
+        // Rebuild after the purge.
+        let dir = tempfile::tempdir().expect("dir");
+        let (storage, exec, a1, a2) = c1r_purged_follower(dir.path()).await;
+        let (c1, c2) = c1r_fork_c().await;
+        persist(&storage, &c1);
+        persist(&storage, &c2);
+        let all = [&a1, &a2, &c1, &c2];
+        let before = c1r_durable_view(&storage, &all);
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        app.fork_choice = Some(fork_choice_returning(c2.header.block_hash));
+        let root_before = exec.calculate_state_root();
+        let g = Executor::new(Arc::new(StateDB::new()));
+        g.set_balance(&Address(ALICE), U256::from(FUND));
+        for (what, f) in [
+            ("index scan", fault(Site::ReceiptIndex, None, 0)),
+            (
+                "scanned receipt",
+                fault(Site::Receipt, Some(a1.transactions[0].hash), 0),
+            ),
+        ] {
+            read_faults::set(vec![f]);
+            let res = app
+                .recover_to_head(g.state_snapshot(), Hash::default())
+                .await;
+            assert!(read_faults::hits() > 0, "{what}: the fault was not reached");
+            read_faults::clear();
+            assert!(res.is_err(), "{what}: must abort with Err, got {res:?}");
+            assert_eq!(
+                app.applied_tip().await.hash,
+                a2.header.block_hash,
+                "{what}: tip"
+            );
+            assert_eq!(exec.calculate_state_root(), root_before, "{what}: memory");
+            assert_eq!(c1r_durable_view(&storage, &all), before, "{what}: durable");
+        }
+        assert!(app
+            .recover_to_head(g.state_snapshot(), Hash::default())
+            .await
+            .expect("recover"));
+        c1r_receipts_consistent(&storage, Some(c2.header.block_hash), &all)
+            .expect("receipts follow C");
+
+        // Start-up cleanup after an interrupted rebuild and a purge.
+        let (a1, a2, b2, b3) = v251_blocks().await;
+        let dir = tempfile::tempdir().expect("dir");
+        c1r_crash_after_rebuild_reset(dir.path(), &a1, &a2);
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen"));
+        c1r_startup_purge(&storage, &a1, &a2);
+        let exec = store_backed(&storage);
+        let all = [&a1, &a2, &b2, &b3];
+        let before = c1r_durable_view(&storage, &all);
+        read_faults::set(vec![fault(Site::ReceiptIndex, None, 0)]);
+        drop(CanonicalApplicator::new(exec.clone(), storage.clone()));
+        assert!(
+            read_faults::hits() > 0,
+            "cleanup scan: the fault was not reached"
+        );
+        read_faults::clear();
+        assert_eq!(
+            c1r_durable_view(&storage, &all),
+            before,
+            "cleanup scan: durable"
+        );
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt_reconcile_marker()
+                .expect("read"),
+            Some((a2.header.block_hash, 2)),
+            "the marker survives a failed scan"
+        );
+        drop(CanonicalApplicator::new(exec.clone(), storage.clone()));
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt_reconcile_marker()
+                .expect("read"),
+            None
+        );
+        assert!(storage
+            .transactions
+            .get_receipt(&a1.transactions[0].hash)
+            .expect("read")
+            .is_none());
     }
 
     /// Stage 1c §4.5: the floor is raised only for the certified hash that IS
