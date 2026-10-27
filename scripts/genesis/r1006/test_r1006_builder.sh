@@ -224,5 +224,12 @@ jq '.contracts.B = "0x00000000000000000000000000000000000000c2"' "$T/book.json" 
 expect "emit_book --check refuses a book address without code in block 0" 1 'contracts.B = 0x0+c2 has no code' -- \
   python3 "$HERE/emit_book.py" --check "$T/book-bad.json" --alloc "$T/a1.json"
 
+# The guardian council (GuardianTimelock, GuardianMultisig, GuardianCanceller) is only in the
+# P1 governance book; CheckDeployedAdmins' GENESIS-FLOOR needs it in the r1006 book.
+printf '{"contracts":{"GuardianCanceller":"0x00000000000000000000000000000000000000c1"}}\n' >"$T/bw/book/governance.json"
+python3 "$HERE/emit_book.py" --work "$T/bw" --alloc "$T/a1.json" --out "$T/book-gov.json" >/dev/null 2>&1
+expect "emit_book carries the P1 governance book (GuardianCanceller) into the r1006 book" 0 '0x0+c1' -- \
+  jq -er '.contracts.GuardianCanceller' "$T/book-gov.json"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
