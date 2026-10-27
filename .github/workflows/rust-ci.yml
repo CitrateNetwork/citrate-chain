@@ -9,6 +9,8 @@ on:
       - '**/*.rs'
       - '**/build.rs'
       - '.github/workflows/rust-ci.yml'
+      - '.github/workflows/fuzz.yml'
+      - 'scripts/ci/check_fuzz_targets.sh'
   pull_request:
     paths:
       - '**/Cargo.toml'
@@ -16,6 +18,8 @@ on:
       - '**/*.rs'
       - '**/build.rs'
       - '.github/workflows/rust-ci.yml'
+      - '.github/workflows/fuzz.yml'
+      - 'scripts/ci/check_fuzz_targets.sh'
 
 # RM-B1 / WP-F1.1 (audit CI-01): workflow-level minimum permissions.
 permissions:
@@ -116,6 +120,36 @@ jobs:
         run: cargo build --locked -p citrate-api
       - name: Run citrate-api tests (default features)
         run: cargo test --locked -p citrate-api -- --nocapture
+
+  # fuzz/ is a separate workspace that `cargo test --workspace` never builds,
+  # and fuzz.yml only runs on a schedule. Two targets once stopped compiling
+  # against current APIs unnoticed; this makes that a PR failure.
+  fuzz-targets-compile:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config
+      - name: Cache cargo registry
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: fuzz-targets-${{ runner.os }}-${{ hashFiles('fuzz/Cargo.lock') }}
+          restore-keys: fuzz-targets-${{ runner.os }}-
+      - name: Tripwire self-test (negative control)
+        run: scripts/ci/check_fuzz_targets.sh --self-test
+      - name: Every fuzz target is registered and compiles (--locked)
+        run: scripts/ci/check_fuzz_targets.sh
 
   standalone-benchmarks:
     runs-on: ubuntu-latest

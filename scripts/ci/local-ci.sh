@@ -34,7 +34,7 @@ while [ $# -gt 0 ]; do
     --fast) FAST=1; shift ;;
     --no-forge) NO_FORGE=1; shift ;;
     --list)
-      echo "gates: fmt-changed, clippy, panic-ratchet, consensus-tripwires, audit-lockfiles, test-workspace, forge-build, forge-test"
+      echo "gates: fmt-changed, clippy, panic-ratchet, consensus-tripwires, audit-lockfiles, fuzz-targets-compile, test-workspace, forge-build, forge-test"
       exit 0 ;;
     -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 1 ;;
@@ -199,6 +199,20 @@ elif ! command -v cargo-audit >/dev/null 2>&1; then
   skip "audit-lockfiles" "cargo-audit not installed"
 else
   gate "audit-lockfiles" audit_lockfiles
+fi
+
+# ── gate: every fuzz target is registered and compiles ──────────────────────
+# fuzz/ is its own workspace; nothing else builds it. Full mode only (it is a
+# full compile of the fuzz crate). Self-test first (negative control).
+fuzz_targets_compile() {
+  local t="scripts/ci/check_fuzz_targets.sh"
+  "$t" --self-test || return 1
+  "$t"
+}
+if [ "$FAST" -eq 1 ]; then
+  skip "fuzz-targets-compile" "--fast"
+else
+  gate "fuzz-targets-compile" fuzz_targets_compile
 fi
 
 if [ "$FAST" -eq 1 ]; then
