@@ -68,7 +68,13 @@ while [[ $# -gt 0 ]]; do
 done
 d="$FAKE/rpc/$(printf '%s' "$rpc" | tr -c 'A-Za-z0-9' '_')"
 case "${args[0]}" in
-  code) a=$(printf '%s' "${args[1]}" | tr 'A-F' 'a-f'); cat "$FAKE/code/$a" 2>/dev/null || echo 0x ;;
+  code)
+    # FAKE_CODE_ALL=1: a chain where every deployed address has code, except those listed in
+    # FAKE_NO_CODE (space-separated); otherwise $FAKE/code/<addr>, default none (0x).
+    a=$(printf '%s' "${args[1]}" | tr 'A-F' 'a-f')
+    if [[ " $(printf '%s' "${FAKE_NO_CODE:-}" | tr 'A-F' 'a-f') " == *" $a "* ]]; then echo 0x
+    elif [[ -n "${FAKE_CODE_ALL:-}" ]]; then echo 0x6080
+    else cat "$FAKE/code/$a" 2>/dev/null || echo 0x; fi ;;
   keccak) [[ -z "${FAKE_KECCAK_FAIL:-}" ]] || exit 1; printf '0x%s\n' "$(printf '%s' "${args[1]}" | sha256sum | cut -c1-64)" ;;
   storage) a=$(printf '%s' "${args[1]}" | tr 'A-F' 'a-f'); cat "$FAKE/impl/$a" 2>/dev/null || printf '0x%064d\n' 0 ;;
   chain-id) [[ -f "$d/chain-id" ]] || exit 1; cat "$d/chain-id" ;;
@@ -93,6 +99,16 @@ esac
 EOF
 cat >"$BIN/forge" <<'EOF'
 #!/usr/bin/env bash
+# `forge config --json` reads the resolved config and sends nothing: answered from
+# FAKE_FORGE_CONFIG (a JSON object; "fail" exits 1), default forge's own defaults, and logged to
+# config.log (not calls.log, whose forge lines are the steps that compile or send).
+if [[ "${1:-}" == config ]]; then
+  echo "forge $* (cwd $PWD)" >>"$FAKE/config.log"
+  [[ "${FAKE_FORGE_CONFIG:-}" != fail ]] || exit 1
+  dflt='{"broadcast":"broadcast","cache":true,"cache_path":"cache","out":"out"}'
+  printf '%s\n' "${FAKE_FORGE_CONFIG:-$dflt}"
+  exit 0
+fi
 echo "forge $*" >>"$FAKE/calls.log"
 # FAKE_PW_SWAP=<path>: at the first call, change that password file the way FAKE_PW_SWAP_HOW
 # says (a new file at the path, a looser mode, a symlink, or another file renamed over it).
@@ -123,10 +139,11 @@ if [[ "$*" == *DeployDormantLedgers* && -n "${FAKE_P4_BOOK:-}" ]]; then cp "$FAK
 if [[ "$*" == *--broadcast* && -n "${FAKE_FORGE_BCAST:-}" ]]; then
   fs=""
   for a in "$@"; do [[ "$a" == script/* ]] && fs="${a#script/}"; done
-  fd="broadcast/$fs/40204"
+  fd="${FOUNDRY_BROADCAST:-broadcast}/$fs/40204"
   mkdir -p "$fd"
   fn=$(find "$fd" -name 'run-[0-9]*.json' | wc -l)
-  printf '{"timestamp":%s,"transactions":[{"transactionType":"CREATE","contractName":"Fake","contractAddress":"0x%040x"}]}\n' "${FAKE_FORGE_TS:-6000}" "$((fn + 4096))" >"$fd/run-$((${FAKE_FORGE_TS:-6000} + fn)).json"
+  fh=$(printf '0x%064x' "$((fn + 4096))")
+  printf '{"timestamp":%s,"transactions":[{"hash":"%s","transactionType":"CREATE","contractName":"Fake","contractAddress":"0x%040x"}],"receipts":[{"transactionHash":"%s","status":"0x1"}],"pending":[]}\n' "${FAKE_FORGE_TS:-6000}" "$fh" "$((fn + 4096))" "$fh" >"$fd/run-$((${FAKE_FORGE_TS:-6000} + fn)).json"
   cp "$fd/run-$((${FAKE_FORGE_TS:-6000} + fn)).json" "$fd/run-latest.json"
 fi
 if [[ "$*" == *DeployGenesisGovernance* && "$*" == *--broadcast* && -n "${FAKE_P1_BOOK:-}" ]]; then cp "$FAKE_P1_BOOK" "$GENESIS_GOVERNANCE_OUT"; fi
@@ -193,8 +210,56 @@ export FAKE CAST="$BIN/cast" FORGE="$BIN/forge" SYSTEMCTL="$BIN/systemctl"
 unset RPC RPC_URL ADDRESS_BOOK BROADCAST_DIR KEEP_LIST FLEET_RPCS EXPECTED_GENESIS_HASH PRIVATE_KEY DEPLOYER_PRIVATE_KEY \
   DEPLOYER_ADDRESS CEREMONY_DEPLOYER_ADDRESS DEPLOYER EMIT_DEPLOYER EMIT_OUTPUT EMIT_BROADCAST_SINCE EMIT_FRESH_GENESIS EMITTER \
   TREASURY ETH_PASSWORD ETH_KEYSTORE ETH_KEYSTORE_ACCOUNT
+# forge's broadcast/cache output variables (any case, as forge reads them) from the caller's shell
+# would be refused by every ceremony run; the cases that need one set it themselves.
+for v in $(compgen -e); do
+  case "$(printf '%s' "$v" | tr 'a-z' 'A-Z')" in
+    FOUNDRY_BROADCAST | DAPP_BROADCAST | FOUNDRY_CACHE | DAPP_CACHE | FOUNDRY_CACHE_PATH | DAPP_CACHE_PATH | FOUNDRY_PROFILE | FOUNDRY_CONFIG) unset "$v" ;;
+  esac
+done
 calls() { cat "$FAKE/calls.log" 2>/dev/null; }
 reset_calls() { : >"$FAKE/calls.log"; }
+# mine_runs <path...>: give every broadcast record under the paths that has no "pending" key the
+# shape forge writes for a completed send: each transaction a hash, each hash a receipt with
+# status 0x1, nothing pending. Records that already carry "pending" (a partial shape) are left.
+mine_runs() {
+  python3 - "$@" <<'PY2'
+import glob, json, os, sys
+fs = []
+for p in sys.argv[1:]:
+    fs += [p] if os.path.isfile(p) else glob.glob(os.path.join(p, "**", "*.json"), recursive=True)
+n = 0
+for f in fs:
+    try:
+        r = json.load(open(f))
+    except ValueError:
+        continue
+    if not isinstance(r, dict) or "transactions" not in r or "pending" in r:
+        continue
+    rec = []
+    for tx in r["transactions"]:
+        n += 1
+        tx.setdefault("hash", "0x%064x" % (0xA000 + n + (abs(hash(f)) % 4096) * 64))
+        rec.append({"transactionHash": tx["hash"], "status": "0x1"})
+    r["receipts"], r["pending"] = rec, []
+    json.dump(r, open(f, "w"))
+PY2
+}
+# partial_run <file> <timestamp> <type:name:addr>...: the record forge 1.8.3 writes when a script
+# stops part-way (the RPC dropped after the first transaction was mined): the first transaction
+# has a hash and is still in "pending", every later one was never sent ("hash": null), and there
+# are no receipts.
+partial_run() {
+  local f="$1" ts="$2" tx="" e t n x h=0x00000000000000000000000000000000000000000000000000000000dbcaff38 first=1
+  shift 2
+  for e in "$@"; do
+    IFS=: read -r t n x <<<"$e"
+    if [[ $first == 1 ]]; then tx+="{\"hash\":\"$h\",\"transactionType\":\"$t\",\"contractName\":\"$n\",\"contractAddress\":\"$x\"}"; first=0
+    else tx+=",{\"hash\":null,\"transactionType\":\"$t\",\"contractName\":\"$n\",\"contractAddress\":\"$x\"}"; fi
+  done
+  mkdir -p "$(dirname "$f")"
+  printf '{"timestamp":%s,"transactions":[%s],"receipts":[],"pending":["%s"]}\n' "$ts" "$tx" "$h" >"$f"
+}
 
 addr() { printf '0x%040x' "$1"; }
 lower_t() { printf '%s' "$1" | tr 'A-F' 'a-f'; }
@@ -1217,6 +1282,7 @@ cp "$G/../ops/regenesis.sh" "$RG/scripts/ops/"
 # regenesis.sh runs the genesis ceremony's shared password-file check from the same tree.
 mkdir -p "$RG/scripts/genesis"
 cp "$G/secret_file_check.py" "$RG/scripts/genesis/"
+[[ -f "$G/forge_output_check.py" ]] && cp "$G/forge_output_check.py" "$RG/scripts/genesis/"
 for preset in "$STALE" "" "$(printf '%s' "$MIXED" | tr 'a-f' 'A-F' | sed 's/^0X/0x/')"; do
   reset_calls
   expect "regenesis: CEREMONY_DEPLOYER_ADDRESS='$preset' with DEPLOYER_ADDRESS=$MIXED is refused" 1 'CEREMONY_DEPLOYER_ADDRESS .*is not exactly DEPLOYER_ADDRESS' -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" CEREMONY_DEPLOYER_ADDRESS="$preset" bash "$RG/scripts/ops/regenesis.sh"
@@ -1258,6 +1324,36 @@ for c in "loose|must not be readable or writable by group or others" "link|must 
   expect "regenesis: a password file that is not private (${c%%|*}) is refused" 1 "${c#*|}" -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" bash "$RG/scripts/ops/regenesis.sh" --account deployer --password-file "$RGPW/${c%%|*}"
   if calls | grep -q '^forge'; then bad "regenesis: a non-private password file (${c%%|*}) runs no forge" "$(calls)"; else ok "regenesis: a non-private password file (${c%%|*}) runs no forge"; fi
 done
+# regenesis.sh on its own refuses the same forge output variables (any mode), and on --broadcast
+# reads `forge config --json` in contracts/ first: a config that records broadcasts elsewhere is
+# refused before any forge step (the ceremony's guard and the generator read contracts/broadcast/).
+for v in FOUNDRY_BROADCAST DAPP_BROADCAST FOUNDRY_CACHE_PATH FOUNDRY_CACHE FOUNDRY_PROFILE FOUNDRY_CONFIG foundry_broadcast; do
+  reset_calls
+  expect "regenesis: $v in the environment is refused before any forge step" 1 "$v is set in the environment" -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" "$v=$T/rg-elsewhere" bash "$RG/scripts/ops/regenesis.sh" --broadcast --account deployer
+  if calls | grep -q '^forge'; then bad "regenesis: a refused $v runs no forge" "$(calls)"; else ok "regenesis: a refused $v runs no forge"; fi
+done
+# Fail closed: a tree without the shared check refuses before any forge step.
+mkdir -p "$T/rg-nocheck/scripts/ops" "$T/rg-nocheck/contracts"
+cp "$G/../ops/regenesis.sh" "$T/rg-nocheck/scripts/ops/"
+reset_calls
+expect "regenesis: without the forge output check it refuses to run" 1 'forge output check .* is missing' -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" bash "$T/rg-nocheck/scripts/ops/regenesis.sh"
+if calls | grep -q '^forge'; then bad "regenesis: without the forge output check it runs no forge" "$(calls)"; else ok "regenesis: without the forge output check it runs no forge"; fi
+printf 'FOUNDRY_PROFILE=membership\n' >"$RG/contracts/.env"
+reset_calls
+expect "regenesis: a forge output variable in contracts/.env is refused before any forge step" 1 "FOUNDRY_PROFILE is set in $RG/contracts/.env, which forge loads" -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" bash "$RG/scripts/ops/regenesis.sh" --broadcast --account deployer
+if calls | grep -q '^forge'; then bad "regenesis: a refused contracts/.env runs no forge" "$(calls)"; else ok "regenesis: a refused contracts/.env runs no forge"; fi
+rm -f "$RG/contracts/.env"
+reset_calls
+expect "regenesis: --broadcast with forge recording broadcasts elsewhere is refused" 1 'forge writes its broadcast records to /srv/elsewhere' -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" FAKE_FORGE_CONFIG='{"broadcast":"/srv/elsewhere","cache":true,"cache_path":"cache"}' bash "$RG/scripts/ops/regenesis.sh" --broadcast --account deployer
+if calls | grep -q '^forge'; then bad "regenesis: a refused forge config runs no forge step" "$(calls)"; else ok "regenesis: a refused forge config runs no forge step"; fi
+reset_calls
+rm -f "$FAKE/config.log"
+env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" bash "$RG/scripts/ops/regenesis.sh" --broadcast --account deployer >"$T/rg-cfg.log" 2>&1
+if calls | grep -q '^forge clean' && grep -qF "forge config --json (cwd $RG/contracts)" "$FAKE/config.log" 2>/dev/null; then
+  ok "regenesis: --broadcast reads forge's config in contracts/, and the default goes on to the build (control)"
+else
+  bad "regenesis: --broadcast reads forge's config in contracts/, and the default goes on to the build (control)" "$(cat "$T/rg-cfg.log" "$FAKE/config.log" 2>&1 | tail -8)"
+fi
 chmod 700 "$RGPW/open"
 # The fake forge changes the file at its first call (the clean build): no forge script step runs.
 for how in replace chmod symlink; do
@@ -1387,9 +1483,10 @@ printf '{"timestamp":6000,"transactions":[{"transactionType":"CREATE2","contract
   >"$C9BC/DeployValidatorRegistry.s.sol/40204/run-latest.json"
 printf '{"timestamp":6001,"transactions":[{"transactionType":"CREATE2","contractName":"CitrateMemberSBT","contractAddress":"%s"},{"transactionType":"CREATE2","contractName":"MemberBond","contractAddress":"%s"},{"transactionType":"CREATE2","contractName":"MembershipStakeVault","contractAddress":"%s"},{"transactionType":"CREATE2","contractName":"ERC1967Proxy","contractAddress":"%s"}]}' \
   "$C9SBT" "$C9BOND" "$C9VI" "$C9VP" >"$C9BC/DeployGenesisMembership.s.sol/40204/run-latest.json"
+mine_runs "$C9BC"
 cp "$GBK" "$T/book.c9.orig"
 C9ENV=("${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1
-  FAKE_REGEN_BOOK="$C9B" FAKE_REGEN_BCAST="$C9BC" EMITTER="$T/fake-emit.sh")
+  FAKE_REGEN_BOOK="$C9B" FAKE_REGEN_BCAST="$C9BC" EMITTER="$T/fake-emit.sh" FAKE_CODE_ALL=1)
 # c9_setup: a --confirm run after P1 (manifest, governance on chain, fee recipients = the
 # TREASURY), before P2 has sent anything (no broadcast recorded yet).
 c9_setup() {
@@ -1420,6 +1517,16 @@ for g in "X402Facilitator:$C9X:treasury" "ModelMarketplace:$C9MM:treasuryAddress
   c9_fee "a $gn fee recipient that is the deployer fails P2" 3 "$gn.$gf\\(\\) is the deployer 0x0+1: the fee recipient must be TREASURY" fake_call "$ga" "$gf" "$DEP"
 done
 c9_fee "an unreadable ComputeMarketplace fee recipient fails P2" 3 'cannot read ComputeMarketplace.treasury\(\)' rm -f "$FAKE/call/$C9CM/treasury"
+# P2's stack book: before it is recorded, every address in it must have code on chain.
+c9_setup
+reset_calls
+expect "ceremony P2 code: a stack-book contract with no code on chain is not recorded" 3 "GATE FAIL at P2: .*ValidatorRegistry $C9VR has no code on chain" -- "${C9ENV[@]}" FAKE_NO_CODE="$C9VR" bash "$CE" --confirm --only P2 --account deployer
+if python3 -c 'import json,sys; sys.exit(0 if "stackBook" in json.load(open(sys.argv[1])) else 1)' "$GB/ceremony-run.json"; then
+  bad "ceremony P2 code: a codeless stack book records nothing" "$(cat "$GB/ceremony-run.json")"
+else
+  ok "ceremony P2 code: a codeless stack book records nothing"
+fi
+cp "$T/book.c9.orig" "$GBK"
 # #364 on P2 (the password fixture is set up before the regenesis.sh cases above).
 c9_setup
 reset_calls
@@ -1742,13 +1849,59 @@ fi
 # guard), except the P5 checker, which reads. A new direct call is flagged.
 c10_direct() { # <ceremony script> -> the executable lines that run forge or regenesis.sh directly
   # (continuation lines are joined first, so a call is judged with the command it belongs to)
-  sed -e ':a' -e '/\\$/N; s/\\\n//; ta' "$1" | grep -nE '"\$(FORGE|REGENESIS)"' | grep -vE '^[0-9]+:[[:space:]]*#' | grep -vE 'describe_cmd|run_broadcast P2 bash "\$REGENESIS"|^[0-9]+:forge_in_contracts\(\) \{ \(cd "\$CONTRACTS" && "\$FORGE" "\$@"\); \}$|-[xf] "\$REGENESIS"|CheckDeployedAdmins|projectIpfsV3\(address,address\)|FORGE="\$\{FORGE' || true
+  sed -e ':a' -e '/\\$/N; s/\\\n//; ta' "$1" | grep -nE '"\$(FORGE|REGENESIS)"|forge_in_contracts' | grep -vE '^[0-9]+:[[:space:]]*#' | grep -vE 'describe_cmd|run_broadcast P2 bash "\$REGENESIS"|run_broadcast "\$phase" forge_in_contracts "\$\{args\[@\]\}"|forge_output_config_check "\$CONTRACTS" "\$FORGE"\)|^[0-9]+:forge_in_contracts\(\) \{ \(cd "\$CONTRACTS" && "\$FORGE" "\$@"\); \}$|-[xf] "\$REGENESIS"|CheckDeployedAdmins|projectIpfsV3\(address,address\)|FORGE="\$\{FORGE' || true
 }
 tw=$(c10_direct "$CE")
 [[ -z "$tw" ]] && ok "tripwire C10: the ceremony runs forge and regenesis.sh only through run_broadcast" || bad "tripwire C10: the ceremony runs forge and regenesis.sh only through run_broadcast" "$tw"
-{ cat "$CE"; echo '(cd "$CONTRACTS" && "$FORGE" script script/DeployNew.s.sol --broadcast)'; echo '  RPC_URL="$RPC_URL" bash "$REGENESIS" --broadcast'; } >"$T/c10-direct.sh"
-[[ $(c10_direct "$T/c10-direct.sh" | wc -l) -eq 2 ]] && ok "tripwire C10: a direct forge or regenesis.sh call is flagged (negative control)" ||
-  bad "tripwire C10: a direct forge or regenesis.sh call is flagged (negative control)" "$(c10_direct "$T/c10-direct.sh")"
+{ cat "$CE"; echo '(cd "$CONTRACTS" && "$FORGE" script script/DeployNew.s.sol --broadcast)'; echo '  RPC_URL="$RPC_URL" bash "$REGENESIS" --broadcast'; echo '  forge_in_contracts script script/DeployNew.s.sol --broadcast'; } >"$T/c10-direct.sh"
+[[ $(c10_direct "$T/c10-direct.sh" | wc -l) -eq 3 ]] && ok "tripwire C10: a direct forge, forge_in_contracts or regenesis.sh call is flagged (negative control)" ||
+  bad "tripwire C10: a direct forge, forge_in_contracts or regenesis.sh call is flagged (negative control)" "$(c10_direct "$T/c10-direct.sh")"
+# run_broadcast's own check, on its own: the only command that broadcasts refuses a phase the
+# guard has not cleared in this invocation, whatever the caller did before it. Unit: the function,
+# taken from the ceremony, over a marker command.
+rb_unit() { # <SENDS_ONCE_OK> <phase>: run_broadcast <phase> touch <marker>
+  rm -f "$T/rb-marker"
+  bash -c 'set -euo pipefail; . "$1/lib.sh"; eval "$(sed -n "/^run_broadcast() {/,/^}/p" "$2")"; MODE=confirm SENT_PHASE=""; SENDS_ONCE_OK="$3"; run_broadcast "$4" touch "$5"; echo "sent=$SENT_PHASE"' \
+    _ "$G" "$CE" "$1" "$2" "$T/rb-marker" 2>&1
+}
+for c in ":P1" "P2:P1" "P3:P3L"; do
+  out=$(rb_unit "${c%%:*}" "${c#*:}")
+  rc=$?
+  if [[ $rc -eq 1 && ! -e "$T/rb-marker" ]] && grep -q "internal: ${c#*:} would run a broadcasting step without the sends-once guard" <<<"$out"; then
+    ok "run_broadcast: a ${c#*:} step the guard cleared for '${c%%:*}' is refused and does not run"
+  else
+    bad "run_broadcast: a ${c#*:} step the guard cleared for '${c%%:*}' is refused and does not run (exit $rc)" "$out"
+  fi
+done
+out=$(rb_unit P1 P1)
+[[ $? -eq 0 && -e "$T/rb-marker" ]] && grep -q '^sent=P1$' <<<"$out" && ok "run_broadcast: a step the guard cleared runs and marks its phase sent (control)" ||
+  bad "run_broadcast: a step the guard cleared runs and marks its phase sent (control)" "$out"
+# The same check in the whole ceremony: with the guard skipped (it clears nothing and returns),
+# every broadcasting phase stops at run_broadcast and sends nothing (a copy of scripts/genesis).
+rm -rf "$T/rbgen"
+cp -R "$G" "$T/rbgen"
+python3 - "$T/rbgen/genesis_ceremony.sh" <<'PY2'
+import sys
+p = sys.argv[1]; s = open(p).read()
+for a in ('sends_once() {\n  local ph="$1" key\n', 'sends_once_script() {\n  local ph="$1" script="$2" key s\n'):
+    assert a in s
+    s = s.replace(a, a + '  SENDS_ONCE_OK=""; return 0\n', 1)
+open(p, "w").write(s)
+PY2
+for ph in P1 P3 P4; do
+  c10_reset
+  gov_book "$C10D" "$DEP"
+  c10_record governance "$C10GOV"
+  [[ "$ph" == P1 ]] && { rm -f "$C10D/governance.json"; python3 -c 'import json,sys; p=sys.argv[1]; m=json.load(open(p)); m.pop("governance"); json.dump(m, open(p, "w"))' "$C10D/ceremony-run.json"; }
+  out=$("${C10ENV[@]}" FAKE_P1_BOOK="$T/c10-gov.json" bash "$T/rbgen/genesis_ceremony.sh" --confirm --only "$ph" --account deployer 2>&1)
+  rc=$?
+  if [[ $rc -eq 1 && "$(bcount)" == 0 ]] && grep -q "internal: $ph would run a broadcasting step without the sends-once guard" <<<"$out"; then
+    ok "run_broadcast: with the guard skipped, $ph stops at run_broadcast and sends nothing"
+  else
+    bad "run_broadcast: with the guard skipped, $ph stops at run_broadcast and sends nothing (exit $rc, sent $(bcount))" "$out"
+  fi
+done
+rm -rf "$T/rbgen" "$REPO/contracts/broadcast" "$C10D"
 
 # A fresh --confirm run refuses a broadcast directory that already holds records for this chain
 # id (a rehearsal's would count as this run's); other chains' records and dry runs do not.
@@ -1786,6 +1939,84 @@ expect "ceremony: an ETH_KEYSTORE_ACCOUNT other than --account is refused" 1 'ET
 expect "ceremony: an ETH_KEYSTORE other than the --account keystore is refused" 1 'ETH_KEYSTORE is set in the environment and is not the --account keystore' -- "${CEENV[@]}" HOME="$T/kshome" ETH_KEYSTORE="$T/elsewhere/deployer" bash "$CE" --account deployer
 expect "ceremony: ETH_KEYSTORE without --account is refused" 1 'ETH_KEYSTORE is set in the environment without --account' -- "${CEENV[@]}" ETH_KEYSTORE="$T/elsewhere/deployer" bash "$CE"
 expect "ceremony: keystore variables that agree with --account pass (control)" 0 'done \(mode=dry\)' -- "${CEENV[@]}" HOME="$T/kshome" ETH_KEYSTORE_ACCOUNT=deployer ETH_KEYSTORE="$T/kshome/.foundry/keystores/deployer" bash "$CE" --account deployer
+
+# forge's broadcast and cache output. C10's guard reads this run's broadcast records from
+# contracts/broadcast/; forge takes that directory (and its per-run script cache) from its
+# config, which these variables change (forge reads the names in any case). Each is refused by
+# name, in every mode, before anything is sent: a send recorded elsewhere would be invisible to
+# the guard, and a retry would send again.
+FORGE_OUT_VARS=(FOUNDRY_BROADCAST DAPP_BROADCAST FOUNDRY_CACHE_PATH DAPP_CACHE_PATH FOUNDRY_CACHE DAPP_CACHE FOUNDRY_PROFILE FOUNDRY_CONFIG
+  foundry_broadcast Foundry_Profile)
+for v in "${FORGE_OUT_VARS[@]}"; do
+  c10_reset
+  out=$("${C10ENV[@]}" "$v=$T/c10-forge-elsewhere" FAKE_P1_BOOK="$T/c10-gov.json" bash "$CE" --confirm --only P1 --account deployer 2>&1)
+  rc=$?
+  if [[ $rc -eq 1 ]] && grep -qF "$v is set in the environment" <<<"$out" && [[ "$(bcount)" == 0 && ! -e "$T/c10-forge-elsewhere" ]] && ! calls | grep -q '^forge'; then
+    ok "ceremony C10: $v in the environment is refused before any send"
+  else
+    bad "ceremony C10: $v in the environment is refused before any send (exit $rc, sent $(bcount))" "$out"
+  fi
+  rm -rf "$T/c10-forge-elsewhere"
+done
+# forge also loads .env from the project root and where it runs: the same names there are
+# refused too (contracts/.env and the repo root's .env), naming the file, never the value.
+for envf in "$REPO/contracts/.env" "$REPO/.env"; do
+  c10_reset
+  printf '# operator notes\nexport foundry_broadcast=%s/c10-dotenv-elsewhere\nOTHER=1\n' "$T" >"$envf"
+  out=$("${C10ENV[@]}" FAKE_P1_BOOK="$T/c10-gov.json" bash "$CE" --confirm --only P1 --account deployer 2>&1)
+  rc=$?
+  if [[ $rc -eq 1 && "$(bcount)" == 0 ]] && grep -qF "foundry_broadcast is set in $envf, which forge loads" <<<"$out" && ! grep -qF 'c10-dotenv-elsewhere' <<<"$out"; then
+    ok "ceremony C10: a forge output variable in $(basename "$(dirname "$envf")")/.env is refused before any send, value unprinted"
+  else
+    bad "ceremony C10: a forge output variable in $(basename "$(dirname "$envf")")/.env is refused before any send, value unprinted (exit $rc)" "$out"
+  fi
+  rm -f "$envf"
+done
+c10_reset
+printf 'ETHERSCAN_API_KEY_NAME_ONLY=1\n' >"$REPO/contracts/.env"
+expect "ceremony C10: a contracts/.env without forge output variables passes (control)" 0 'done \(mode=confirm\)' -- "${C10ENV[@]}" FAKE_P1_BOOK="$T/c10-gov.json" bash "$CE" --confirm --only P1 --account deployer
+rm -f "$REPO/contracts/.env"
+expect "ceremony C10: FOUNDRY_PROFILE is refused in a dry run too" 1 'FOUNDRY_PROFILE is set in the environment' -- "${CEENV[@]}" FOUNDRY_PROFILE=membership bash "$CE"
+grep -qF "$T/c10-forge-elsewhere" <<<"$("${CEENV[@]}" FOUNDRY_BROADCAST="$T/c10-forge-elsewhere" bash "$CE" 2>&1)" &&
+  bad "ceremony C10: the refusal names the variable, not its value" || ok "ceremony C10: the refusal names the variable, not its value"
+# The bypass itself: a first P1 whose records forge wrote elsewhere (FOUNDRY_BROADCAST) fails
+# after its broadcast; the identical retry without the variable must not send P1 a second time.
+c10_reset
+"${C10ENV[@]}" FOUNDRY_BROADCAST="$T/c10-forge-elsewhere" FAKE_FORGE_FAIL=1 bash "$CE" --confirm --only P1 --account deployer >/dev/null 2>&1
+n1=$(bcount)
+"${C10ENV[@]}" FAKE_FORGE_FAIL=1 bash "$CE" --confirm --only P1 --account deployer >/dev/null 2>&1
+[[ "$(bcount)" -le 1 && "$n1" == 0 ]] && ok "ceremony C10: a P1 redirected by FOUNDRY_BROADCAST and then retried is sent at most once" ||
+  bad "ceremony C10: a P1 redirected by FOUNDRY_BROADCAST and then retried is sent at most once (sent $n1, then $(bcount) in all)" "$(calls)"
+rm -rf "$T/c10-forge-elsewhere"
+# Unrelated forge and Foundry variables pass (control): FOUNDRY_BIN is the ceremony's own tool
+# path, FOUNDRY_OUT moves compiler artifacts only.
+c10_reset
+expect "ceremony C10: FOUNDRY_BIN and FOUNDRY_OUT do not stop a run (control)" 0 'done \(mode=confirm\)' -- "${C10ENV[@]}" FOUNDRY_BIN="$BIN" FOUNDRY_OUT=out FAKE_P1_BOOK="$T/c10-gov.json" bash "$CE" --confirm --only P1 --account deployer
+# What forge resolves can move them too (a global ~/.foundry/foundry.toml, a profile in
+# foundry.toml): --confirm reads `forge config --json` in contracts/ at P0 and refuses, before the
+# run sends anything, unless broadcast is contracts/broadcast, cache_path contracts/cache, cache on.
+for c in 'broadcast elsewhere|{"broadcast":"/srv/elsewhere","cache":true,"cache_path":"cache"}|forge writes its broadcast records to /srv/elsewhere' \
+  'a relative broadcast elsewhere|{"broadcast":"../broadcast","cache":true,"cache_path":"cache"}|forge writes its broadcast records to .*/repo/broadcast' \
+  'cache_path elsewhere|{"broadcast":"broadcast","cache":true,"cache_path":"cache-membership"}|forge writes its script cache to .*cache-membership' \
+  'cache off|{"broadcast":"broadcast","cache":false,"cache_path":"cache"}|forge.s cache is off' \
+  'no broadcast key|{"cache":true,"cache_path":"cache"}|forge.s config has no broadcast' \
+  'unparsable|not json|cannot parse' \
+  'unreadable|fail|cannot read forge.s config'; do
+  IFS='|' read -r cn cj cp <<<"$c"
+  c10_reset
+  out=$("${C10ENV[@]}" FAKE_FORGE_CONFIG="$cj" FAKE_P1_BOOK="$T/c10-gov.json" bash "$CE" --confirm --only P1 --account deployer 2>&1)
+  rc=$?
+  if [[ $rc -eq 3 ]] && grep -qE "GATE FAIL at P0: .*$cp" <<<"$out" && [[ "$(bcount)" == 0 ]]; then
+    ok "ceremony C10: a forge config with $cn is refused at P0, before any send"
+  else
+    bad "ceremony C10: a forge config with $cn is refused at P0, before any send (exit $rc, sent $(bcount))" "$out"
+  fi
+done
+c10_reset
+rm -f "$FAKE/config.log"
+expect "ceremony C10: absolute paths that are contracts/broadcast and contracts/cache pass (control)" 0 'done \(mode=confirm\)' -- "${C10ENV[@]}" FAKE_FORGE_CONFIG="{\"broadcast\":\"$REPO/contracts/broadcast\",\"cache\":true,\"cache_path\":\"$REPO/contracts/cache\"}" FAKE_P1_BOOK="$T/c10-gov.json" bash "$CE" --confirm --only P1 --account deployer
+grep -qF "forge config --json (cwd $REPO/contracts)" "$FAKE/config.log" 2>/dev/null && ok "ceremony C10: --confirm reads forge's config in contracts/" || bad "ceremony C10: --confirm reads forge's config in contracts/" "$(cat "$FAKE/config.log" 2>&1)"
+rm -rf "$REPO/contracts/broadcast" "$C10D"
 
 # C9: P2 hands DeployAll TREASURY as the fee recipient. P0 checks it whenever P2 runs,
 # before anything is sent; a run that does not reach P2 does not need it.
@@ -2077,6 +2308,7 @@ bc_run() { # script timestamp "type:name:addr"...
   done
   mkdir -p "$d"
   printf '{"timestamp":%s,"transactions":[%s]}\n' "$ts" "$tx" >"$d/run-latest.json"
+  mine_runs "$d/run-latest.json"
 }
 ob_reset() { # [mode]
   rm -f "$GB/team-vesting.json" "$GB/dormant-ledgers.json" "$GB/library.json"
@@ -2092,7 +2324,7 @@ manifest_key() { # key -> its JSON in the run manifest (null if absent)
   python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(json.dumps(m.get(sys.argv[2]), sort_keys=True, separators=(",",":")))' "$GB/ceremony-run.json" "$1"
 }
 OBENV=("${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1
-  PATRONAGE_MEMBERSHIP="$(addr 52)")
+  PATRONAGE_MEMBERSHIP="$(addr 52)" FAKE_CODE_ALL=1)
 VEST_OK="$OBK/vest.json"
 vest_book "$VEST_OK" "$DEP"
 DORM_OK="$OBK/dormant.json"
@@ -2216,9 +2448,47 @@ for c in "P3:teamVesting:team-vesting.json:$VEST_OK:vest_bc" "P4:dormantLedgers:
   expect "ceremony recovery: the $ph record step needs this run's $ph broadcast" 3 "GATE FAIL at $ph: the record step: no $ph broadcast from this run is recorded" -- "${OBENV[@]}" bash "$CE" --confirm --only "$ph" --record-book --account deployer
   [[ "$(manifest_key "$key")" == null ]] && ok "ceremony recovery: a $ph record step without a broadcast records nothing" || bad "ceremony recovery: a $ph record step without a broadcast records nothing" "$(manifest_key "$key")"
 done
-expect "ceremony recovery: --record-book needs --confirm" 1 '--record-book needs --confirm --only P2, P3 or P4' -- "${OBENV[@]}" bash "$CE" --simulate --only P3 --record-book
-expect "ceremony recovery: --record-book needs --only" 1 '--record-book needs --confirm --only P2, P3 or P4' -- "${OBENV[@]}" bash "$CE" --confirm --from P3 --record-book --account deployer
-expect "ceremony recovery: --record-book is refused for a phase that writes no book" 1 '--record-book needs --confirm --only P2, P3 or P4' -- "${OBENV[@]}" bash "$CE" --confirm --only P1 --record-book --account deployer
+# P3/P4 with forge's partial record (the step stopped part-way: a deployment never sent, one
+# pending, no receipts): the record step refuses it (the book's contracts are not deployments),
+# and so does the retry, which escalates instead of re-sending. Before, the record step
+# counted every listed CREATE. Then: a complete record but a book address without code.
+for c in "P3:teamVesting:team-vesting.json:$VEST_OK:DeployTeamVesting.s.sol:CREATE2:TeamVestingWallet:$V1:CREATE2:TeamVestingWallet:$V2" \
+  "P4:dormantLedgers:dormant-ledgers.json:$DORM_OK:DeployDormantLedgers.s.sol:CREATE2:FederatedRoundLedger:$FRLA:CREATE:PatronageLedger:$PLA"; do
+  IFS=: read -r ph key file okbook script t1 n1 a1 t2 n2 a2 <<<"$c"
+  ob_reset
+  [[ "$ph" == P4 ]] && dorm_bc && rm -rf "$FAKE/bc-stage"
+  partial_run "$BCD/$script/40204/run-6000.json" 6000 "$t1:$n1:$a1" "$t2:$n2:$a2"
+  cp "$okbook" "$GB/$file"
+  reset_calls
+  out=$("${OBENV[@]}" bash "$CE" --confirm --only "$ph" --record-book --account deployer 2>&1)
+  rc=$?
+  if [[ $rc -eq 3 && "$(manifest_key "$key")" == null && "$(bcount)" == 0 ]] && grep -q "GATE FAIL at $ph: .*$script stopped part-way" <<<"$out" && grep -q 'escalate' <<<"$out"; then
+    ok "ceremony $ph partial: --record-book refuses forge's partial record, records and sends nothing"
+  else
+    bad "ceremony $ph partial: --record-book refuses forge's partial record, records and sends nothing (exit $rc)" "$out"
+  fi
+  rm -f "$GB/$file"
+  reset_calls
+  out=$("${OBENV[@]}" bash "$CE" --confirm --only "$ph" --account deployer 2>&1)
+  rc=$?
+  if [[ $rc -eq 3 && "$(bcount)" == 0 ]] && grep -q "GATE FAIL at $ph: .*$script stopped part-way" <<<"$out" && grep -q 'escalate' <<<"$out" && [[ -z "$(reruns_ph "$ph" "$out")" ]]; then
+    ok "ceremony $ph partial: the retry refuses a step that stopped part-way and escalates, sending nothing"
+  else
+    bad "ceremony $ph partial: the retry refuses a step that stopped part-way and escalates, sending nothing (exit $rc, sent $(bcount))" "$out"
+  fi
+  # A complete record, but a book address with no code on chain: not recorded.
+  ob_reset
+  if [[ "$ph" == P3 ]]; then vest_bc; else dorm_bc; fi
+  mkdir -p "$BCD" && cp -R "$FAKE/bc-stage/." "$BCD/" && rm -rf "$FAKE/bc-stage"
+  cp "$okbook" "$GB/$file"
+  expect "ceremony $ph code: --record-book refuses a book address with no code on chain" 3 "GATE FAIL at $ph: .*$n1 .*$a1 has no code on chain|GATE FAIL at $ph: .* $a1 has no code on chain" -- "${OBENV[@]}" FAKE_NO_CODE="$a1" bash "$CE" --confirm --only "$ph" --record-book --account deployer
+  [[ "$(manifest_key "$key")" == null ]] && ok "ceremony $ph code: a codeless address records nothing" || bad "ceremony $ph code: a codeless address records nothing" "$(manifest_key "$key")"
+  expect "ceremony $ph code: with code everywhere the record step records (control)" 0 "$ph $file recorded in the run manifest" -- "${OBENV[@]}" bash "$CE" --confirm --only "$ph" --record-book --account deployer
+done
+rm -f "$GB/team-vesting.json" "$GB/dormant-ledgers.json"
+expect "ceremony recovery: --record-book needs --confirm" 1 '--record-book needs --confirm --only P2, P3, P3L or P4' -- "${OBENV[@]}" bash "$CE" --simulate --only P3 --record-book
+expect "ceremony recovery: --record-book needs --only" 1 '--record-book needs --confirm --only P2, P3, P3L or P4' -- "${OBENV[@]}" bash "$CE" --confirm --from P3 --record-book --account deployer
+expect "ceremony recovery: --record-book is refused for a phase that writes no book" 1 '--record-book needs --confirm --only P2, P3, P3L or P4' -- "${OBENV[@]}" bash "$CE" --confirm --only P1 --record-book --account deployer
 expect "ceremony recovery: --record-stack-book stays P2's" 1 '--record-stack-book needs --confirm --only P2' -- "${OBENV[@]}" bash "$CE" --confirm --only P3 --record-stack-book --account deployer
 
 # P5 on --confirm: a book its step did not record is refused; recorded books pass this check.
@@ -2268,18 +2538,27 @@ spec = importlib.util.spec_from_file_location("lb", sys.argv[1]); lb = importlib
 root, ts = sys.argv[2], int(sys.argv[3])
 skip = sys.argv[4] if len(sys.argv) > 4 else ""
 extra = sys.argv[5] if len(sys.argv) > 5 else ""
+partial = os.environ.get("LIB_BC_PARTIAL", "")
 n = 0
 for script, rows in lb.LIBRARY:
     txs = []
     for cn, book in rows:
         n += 1
         if book != skip:
-            txs.append({"transactionType": "CREATE2", "contractName": cn, "contractAddress": "0x%040x" % (0x5000 + n)})
+            txs.append({"hash": "0x%064x" % (0xB000 + n), "transactionType": "CREATE2", "contractName": cn, "contractAddress": "0x%040x" % (0x5000 + n)})
     if extra and script == "DeployHupRegistries.s.sol":
-        txs.append({"transactionType": "CREATE2", "contractName": extra, "contractAddress": "0x%040x" % 0x5fff})
+        txs.append({"hash": "0x%064x" % 0xBfff, "transactionType": "CREATE2", "contractName": extra, "contractAddress": "0x%040x" % 0x5fff})
+    if script == partial:
+        # forge's record of a script that stopped part-way: the first transaction still pending,
+        # the rest never sent (hash null), no receipts
+        for tx in txs[1:]:
+            tx["hash"] = None
+        run = {"timestamp": ts, "transactions": txs, "receipts": [], "pending": [txs[0]["hash"]]}
+    else:
+        run = {"timestamp": ts, "transactions": txs, "receipts": [{"transactionHash": t["hash"], "status": "0x1"} for t in txs], "pending": []}
     d = os.path.join(root, script, "40204"); os.makedirs(d, exist_ok=True)
-    json.dump({"timestamp": ts, "transactions": txs}, open(os.path.join(d, f"run-{ts}.json"), "w"))
-    json.dump({"timestamp": ts, "transactions": txs}, open(os.path.join(d, "run-latest.json"), "w"))
+    json.dump(run, open(os.path.join(d, f"run-{ts}.json"), "w"))
+    json.dump(run, open(os.path.join(d, "run-latest.json"), "w"))
 PY
 }
 lib_build() { python3 "$LB" build --broadcast "$1" --chain 40204 --since 5000 --deployer "$DEP" --governance "$(addr 31)" --out "$2" "${@:3}"; }
@@ -2302,6 +2581,36 @@ rm -rf "$LIBT/bc"; lib_bc "$LIBT/bc" 6000 "" CitAgentTimelockX
 expect "library: a deployment the table does not name fails" 1 'deployed CitAgentTimelockX at 0x0+5fff, which the library table does not name' -- lib_build "$LIBT/bc" "$LIBT/b3.json"
 rm -rf "$LIBT/bc"; lib_bc "$LIBT/bc" 4000
 expect "library: a broadcast from before block 0 is no evidence" 1 'no broadcast since this chain.s block 0' -- lib_build "$LIBT/bc" "$LIBT/b4.json"
+# broadcast_run.py on its own: one fault per record, each enough to make it partial; a complete
+# record (and only that) is sent.
+BRT="$T/brun"
+br_case() { # <name> <want sent|partial> <json>
+  rm -rf "$BRT"; mkdir -p "$BRT/X.s.sol/40204"
+  printf '%s' "$3" >"$BRT/X.s.sol/40204/run-6000.json"
+  local got
+  got=$(python3 -I "$G/broadcast_run.py" scripts --broadcast "$BRT" --chain 40204 --since 5000 X.s.sol | awk '{print $1}')
+  [[ "$got" == "$2" ]] && ok "broadcast_run: $1 is ${2:-not a run of this chain}" || bad "broadcast_run: $1 is ${2:-not a run of this chain} (got '$got')" "$3"
+}
+H1=0x$(printf '%064d' 1) H2=0x$(printf '%064d' 2)
+TX1="{\"hash\":\"$H1\",\"transactionType\":\"CREATE\",\"contractName\":\"A\",\"contractAddress\":\"$(addr 5)\"}"
+TX2="{\"hash\":\"$H2\",\"transactionType\":\"CREATE\",\"contractName\":\"B\",\"contractAddress\":\"$(addr 6)\"}"
+R1="{\"transactionHash\":\"$H1\",\"status\":\"0x1\"}" R2="{\"transactionHash\":\"$H2\",\"status\":\"0x1\"}"
+br_case "a complete record (hashes, receipts 0x1, nothing pending)" sent "{\"timestamp\":6000,\"transactions\":[$TX1,$TX2],\"receipts\":[$R1,$R2],\"pending\":[]}"
+br_case "forge's partial record (a hash pending, one never sent, no receipts)" partial "{\"timestamp\":6000,\"transactions\":[$TX1,{\"hash\":null,\"transactionType\":\"CREATE\",\"contractName\":\"B\",\"contractAddress\":\"$(addr 6)\"}],\"receipts\":[],\"pending\":[\"$H1\"]}"
+br_case "a record with only a pending entry (every hash has a receipt)" partial "{\"timestamp\":6000,\"transactions\":[$TX1,$TX2],\"receipts\":[$R1,$R2],\"pending\":[\"$H2\"]}"
+br_case "a record with only a never-sent transaction (hash null, nothing pending)" partial "{\"timestamp\":6000,\"transactions\":[$TX1,{\"hash\":null,\"transactionType\":\"CREATE\",\"contractName\":\"B\",\"contractAddress\":\"$(addr 6)\"}],\"receipts\":[$R1],\"pending\":[]}"
+br_case "a record with a hash but no receipt" partial "{\"timestamp\":6000,\"transactions\":[$TX1,$TX2],\"receipts\":[$R1],\"pending\":[]}"
+br_case "a record with a reverted receipt (status 0x0)" partial "{\"timestamp\":6000,\"transactions\":[$TX1,$TX2],\"receipts\":[$R1,{\"transactionHash\":\"$H2\",\"status\":\"0x0\"}],\"pending\":[]}"
+br_case "an unreadable record" partial "{not json"
+br_case "a record from before block 0 (not this run's; control)" "" "{\"timestamp\":4000,\"transactions\":[$TX1],\"receipts\":[],\"pending\":[\"$H1\"]}"
+rm -rf "$BRT"
+# A script that stopped part-way: forge 1.8.3 still writes run-*.json, listing the deployments it
+# never sent (hash null) and the unconfirmed one in "pending", with no receipts. None of them
+# counts as deployed, so the book cannot be built from it (with or without --partial).
+rm -rf "$LIBT/bc"; LIB_BC_PARTIAL=DeployHupRegistries.s.sol lib_bc "$LIBT/bc" 6000
+expect "library: a script that stopped part-way (forge's partial record) fails the build, named" 1 'DeployHupRegistries.s.sol: .*stopped part-way' -- lib_build "$LIBT/bc" "$LIBT/b5.json"
+expect "library: a partial record fails a --partial build too" 1 'DeployHupRegistries.s.sol: .*stopped part-way' -- lib_build "$LIBT/bc" "$LIBT/b5.json" --partial
+[[ ! -e "$LIBT/b5.json" ]] && ok "library: no book is written from a partial record" || bad "library: no book is written from a partial record" "$(cat "$LIBT/b5.json")"
 # Tripwire: the ceremony's LIBRARY_SCRIPTS is library_book.py's order (with a negative control).
 want_order=$(python3 "$LB" scripts)
 got_order=$(sed -n '/^  LIBRARY_SCRIPTS=(/,/^  )/p' "$CE" | sed -n 's#^ *script/\(.*\.s\.sol\)$#\1#p')
@@ -2331,12 +2640,15 @@ mkdir -p "$LIB_TOOLS"
 cat >"$LIB_TOOLS/forge" <<EOF
 #!/usr/bin/env bash
 "$BIN/forge" "\$@" || exit \$?
+[[ "\${1:-}" == config ]] && exit 0
 [[ "\$*" == *projectIpfsV3* ]] && exit 0
 s=""; for x in "\$@"; do case "\$x" in script/*.s.sol) s="\${x#script/}" ;; esac; done
 echo "lib-env \$s rootgov=\${ROOT_GOVERNANCE:-} kyc=\${KYC_UPDATER:-} hup=\${HUP_REGISTRY_ADMIN:-} v3=\${EXPECTED_IPFS_V3:-} tee=\${TEE_REGISTRY:-} msbt=\${HUP_MEMBER_SBT:-} hupbook=\${HUP_BOOK_PATH:-}" >>"\$FAKE/calls.log"
 [[ -n "\${FAKE_LIB_BC:-}" && "\$*" == *--broadcast* && -n "\$s" ]] || exit 0
 [[ "\$s" == "\${FAKE_LIB_FAIL:-}" ]] && exit 1
-python3 - "$LB" "\$s" "\$FAKE_LIB_BC" <<'PY'
+# FAKE_LIB_PARTIAL=<script>: that script stops part-way (the RPC drops after its first
+# transaction): forge writes its partial record, then fails.
+python3 - "$LB" "\$s" "\$FAKE_LIB_BC" "\${FAKE_LIB_PARTIAL:-}" <<'PY'
 import importlib.util, json, os, sys
 spec = importlib.util.spec_from_file_location("lb", sys.argv[1]); lb = importlib.util.module_from_spec(spec); spec.loader.exec_module(lb)
 n = 0
@@ -2344,11 +2656,18 @@ for script, rows in lb.LIBRARY:
     txs = []
     for cn, book in rows:
         n += 1
-        txs.append({"transactionType": "CREATE2", "contractName": cn, "contractAddress": "0x%040x" % (0x5000 + n)})
+        txs.append({"hash": "0x%064x" % (0xB000 + n), "transactionType": "CREATE2", "contractName": cn, "contractAddress": "0x%040x" % (0x5000 + n)})
     if script == sys.argv[2]:
+        if script == sys.argv[4]:
+            for tx in txs[1:]:
+                tx["hash"] = None
+            run = {"timestamp": int(sys.argv[3]), "transactions": txs, "receipts": [], "pending": [txs[0]["hash"]]}
+        else:
+            run = {"timestamp": int(sys.argv[3]), "transactions": txs, "receipts": [{"transactionHash": t["hash"], "status": "0x1"} for t in txs], "pending": []}
         d = os.path.join("broadcast", script, "40204"); os.makedirs(d, exist_ok=True)
-        json.dump({"timestamp": int(sys.argv[3]), "transactions": txs}, open(os.path.join(d, f"run-{sys.argv[3]}.json"), "w"))
+        json.dump(run, open(os.path.join(d, f"run-{sys.argv[3]}.json"), "w"))
 PY
+[[ "\$s" != "\${FAKE_LIB_PARTIAL:-}" ]] || exit 1
 EOF
 chmod +x "$LIB_TOOLS/forge"
 lib_addr() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["contracts"][sys.argv[2]])' "$LIBT/book.json" "$1"; }
@@ -2432,6 +2751,108 @@ reset_calls
 [[ "$(lib_bsent)" == *DeployComplianceRegistry.s.sol* ]] && ok "ceremony P3L C10: without the guard the retry re-sends an already broadcast script (negative control)" ||
   bad "ceremony P3L C10: without the guard the retry re-sends an already broadcast script (negative control)" "$(lib_bsent)"
 rm -rf "$T/c10lib"
+# P3L's record step. A P3L that sent every script and built its library book, but whose book did
+# not record (forced here: the manifest's record temp file is in the way), must not loop: the
+# retry was refused at P0 as "P3L is done" and advised --from P3L, which P0 refused again. The
+# way on is --confirm --only P3L --record-book, which sends nothing, builds the book from this
+# run's broadcasts, records it and runs P3L's gates; then P4 goes on.
+reruns_p3l() { grep -E -- '--(from|only) P3L([^0-9]|$)' <<<"$1" | grep -v -- '--record-book' || true; }
+p4l_reset
+rm -rf "$BCD"
+# (governance is recorded first, as a P3L after P1-P3 finds it: only the library's record is in the way)
+python3 -c 'import json,sys; p=sys.argv[1]; m=json.load(open(p)); m["governance"]=json.loads(sys.argv[2]); json.dump(m, open(p, "w"))' "$GB/ceremony-run.json" "$C10GOV"
+: >"$GB/ceremony-run.json.bind.tmp"
+out=$("${P3LENV[@]}" bash "$CE" --confirm --only P3L --account deployer 2>&1)
+rc=$?
+if [[ $rc -eq 3 && -f "$GB/library.json" && "$(manifest_key library)" == null && "$(lib_bsent)" == "$(python3 "$LB" scripts | paste -sd' ')" ]] &&
+  grep -q 'GATE FAIL at P3L: cannot record' <<<"$out" && grep -qF -- '--confirm --only P3L --record-book --account deployer' <<<"$out" && [[ -z "$(reruns_p3l "$out")" ]]; then
+  ok "ceremony P3L record: a record failure after every send names the record step, never a P3L re-run"
+else
+  bad "ceremony P3L record: a record failure after every send names the record step, never a P3L re-run (exit $rc)" "$out"
+fi
+rm -f "$GB/ceremony-run.json.bind.tmp"
+reset_calls
+out=$("${P3LENV[@]}" bash "$CE" --confirm --only P3L --account deployer 2>&1)
+rc=$?
+if [[ $rc -eq 3 ]] && grep -q 'P3L is done' <<<"$out" && grep -qF -- '--confirm --only P3L --record-book --account deployer' <<<"$out" &&
+  [[ -z "$(reruns_p3l "$out")" && -z "$(lib_bsent)" ]]; then
+  ok "ceremony P3L record: the retry is refused at P0 and names the record step (no loop), sending nothing"
+else
+  bad "ceremony P3L record: the retry is refused at P0 and names the record step (no loop), sending nothing (exit $rc)" "$out"
+fi
+reset_calls
+expect "ceremony P3L record: the record step records the library book from this run's broadcasts" 0 'P3L library.json recorded in the run manifest \(library\): 18 contract' -- "${P3LENV[@]}" bash "$CE" --confirm --only P3L --record-book --account deployer
+if calls | grep -q '^forge script'; then bad "ceremony P3L record: the record step runs no forge script (no broadcast)" "$(calls | grep '^forge script')"; else ok "ceremony P3L record: the record step runs no forge script (no broadcast)"; fi
+[[ "$(manifest_key library | python3 -c 'import json,sys; print(len(json.load(sys.stdin) or {}))')" == 18 ]] && ok "ceremony P3L record: the manifest holds the 18 library contracts" || bad "ceremony P3L record: the manifest holds the 18 library contracts" "$(manifest_key library)"
+expect "ceremony P3L record: the record step is refused once the library is recorded" 3 'P3L is done' -- "${P3LENV[@]}" bash "$CE" --confirm --only P3L --record-book --account deployer
+# P4 goes on from the recorded library: PatronageLedger's KYC registry is its KYCRegistry.
+bc_run DeployDormantLedgers.s.sol 6000 "CREATE2:FederatedRoundLedger:$FRLA" "CREATE:PatronageLedger:$PLA"
+reset_calls
+rm -f "$FAKE/forge.env"
+expect "ceremony P3L record: after the record step, P4 proceeds and records its book" 0 'P4 dormant-ledgers.json recorded in the run manifest' -- "${OBENV[@]}" FAKE_P4_BOOK="$DORM_OK" bash "$CE" --confirm --only P4 --account deployer
+calls | grep -q "^forge script script/DeployDormantLedgers.s.sol .*--broadcast" && grep -q "^PATRONAGE_KYC_REGISTRY=$(lib_addr KYCRegistry)$" "$FAKE/forge.env" &&
+  ok "ceremony P3L record: P4 sends once with the recorded library's KYCRegistry" || bad "ceremony P3L record: P4 sends once with the recorded library's KYCRegistry" "$(calls | grep -E '^forge script|P4 ' )"
+rm -f "$GB/dormant-ledgers.json"
+# The record step builds and checks; it never completes a library. A P3L stopped part-way has
+# no complete library to record: the record step fails and sends nothing.
+p4l_reset
+rm -rf "$BCD"
+"${P3LENV[@]}" FAKE_LIB_FAIL=DeployFederatedLearning.s.sol bash "$CE" --confirm --only P3L --account deployer >/dev/null 2>&1
+reset_calls
+expect "ceremony P3L record: the record step refuses a library that stopped part-way" 3 'GATE FAIL at P3L: the record step: this run has no broadcast of DeployFederatedLearning.s.sol,DeployAgentDecisionRegistryV2.s.sol,DeployHupRegistries.s.sol' -- "${P3LENV[@]}" bash "$CE" --confirm --only P3L --record-book --account deployer
+[[ -z "$(lib_bsent)" && "$(manifest_key library)" == null ]] && ok "ceremony P3L record: a refused record step sends and records nothing" || bad "ceremony P3L record: a refused record step sends and records nothing" "$(calls)"
+p4l_reset
+rm -rf "$BCD"
+expect "ceremony P3L record: the record step needs this run's P3L broadcasts" 3 'GATE FAIL at P3L: the record step: no P3L broadcast from this run is recorded' -- "${P3LENV[@]}" bash "$CE" --confirm --only P3L --record-book --account deployer
+# A library script that stopped part-way (forge's partial record: hash null, "pending" non-empty)
+# is not sent: neither the record step nor the --from P3L resume may count it, skip it or send it
+# again. Both stop and escalate; nothing is sent or recorded. Before, the resume skipped it as
+# sent and recorded a book naming the addresses it never deployed.
+p4l_reset
+rm -rf "$BCD"
+LIB_BC_PARTIAL=DeployHupRegistries.s.sol lib_bc "$BCD" 6000
+python3 -c 'import json,sys; p=sys.argv[1]; m=json.load(open(p)); m["governance"]=json.loads(sys.argv[2]); json.dump(m, open(p, "w"))' "$GB/ceremony-run.json" "$C10GOV"
+reset_calls
+out=$("${P3LENV[@]}" bash "$CE" --confirm --only P3L --record-book --account deployer 2>&1)
+rc=$?
+if [[ $rc -eq 3 && "$(manifest_key library)" == null && ! -e "$GB/library.json" ]] && grep -q 'GATE FAIL at P3L: .*DeployHupRegistries.s.sol stopped part-way' <<<"$out" && grep -q 'escalate' <<<"$out" && ! calls | grep -q '^forge script'; then
+  ok "ceremony P3L partial: the record step refuses a script that stopped part-way, records and sends nothing"
+else
+  bad "ceremony P3L partial: the record step refuses a script that stopped part-way, records and sends nothing (exit $rc)" "$out"
+fi
+p4l_reset
+rm -rf "$BCD"
+LIB_BC_PARTIAL=DeployHupRegistries.s.sol lib_bc "$BCD" 6000
+python3 -c 'import json,sys; p=sys.argv[1]; m=json.load(open(p)); m["governance"]=json.loads(sys.argv[2]); json.dump(m, open(p, "w"))' "$GB/ceremony-run.json" "$C10GOV"
+reset_calls
+out=$("${P3LENV[@]}" bash "$CE" --confirm --only P3L --account deployer 2>&1)
+rc=$?
+if [[ $rc -eq 3 && "$(manifest_key library)" == null && -z "$(lib_bsent)" ]] && grep -q 'GATE FAIL at P3L: .*DeployHupRegistries.s.sol stopped part-way' <<<"$out" && grep -q 'escalate' <<<"$out" && [[ -z "$(reruns_p3l "$out")" ]]; then
+  ok "ceremony P3L partial: the --from P3L resume refuses a script that stopped part-way, never re-sends or skips it"
+else
+  bad "ceremony P3L partial: the --from P3L resume refuses a script that stopped part-way, never re-sends or skips it (exit $rc)" "$out"
+fi
+# The same, the way it happens: the run itself stops in DeployHupRegistries (forge writes the
+# partial record and fails); the identical retry refuses and sends nothing.
+p4l_reset
+rm -rf "$BCD"
+"${P3LENV[@]}" FAKE_LIB_PARTIAL=DeployHupRegistries.s.sol bash "$CE" --confirm --only P3L --account deployer >/dev/null 2>&1
+reset_calls
+out=$("${P3LENV[@]}" bash "$CE" --confirm --only P3L --account deployer 2>&1)
+rc=$?
+if [[ $rc -eq 3 && -z "$(lib_bsent)" && "$(manifest_key library)" == null ]] && grep -q 'DeployHupRegistries.s.sol stopped part-way' <<<"$out"; then
+  ok "ceremony P3L partial: a retry after a script stopped part-way sends nothing and records nothing"
+else
+  bad "ceremony P3L partial: a retry after a script stopped part-way sends nothing and records nothing (exit $rc, sent $(lib_bsent))" "$out"
+fi
+# Before it records the library book, the record step requires code at every address in it.
+p4l_reset
+rm -rf "$BCD"
+lib_bc "$BCD" 6000
+python3 -c 'import json,sys; p=sys.argv[1]; m=json.load(open(p)); m["governance"]=json.loads(sys.argv[2]); json.dump(m, open(p, "w"))' "$GB/ceremony-run.json" "$C10GOV"
+expect "ceremony P3L code: a library contract with no code on chain is not recorded" 3 'GATE FAIL at P3L: .*SkillRegistry 0x0+5012 has no code on chain' -- "${P3LENV[@]}" FAKE_NO_CODE="$(lib_addr SkillRegistry)" bash "$CE" --confirm --only P3L --record-book --account deployer
+[[ "$(manifest_key library)" == null ]] && ok "ceremony P3L code: a book with a codeless address records nothing" || bad "ceremony P3L code: a book with a codeless address records nothing" "$(manifest_key library)"
+expect "ceremony P3L code: with code at every address the record step records (control)" 0 'P3L library.json recorded in the run manifest' -- "${P3LENV[@]}" bash "$CE" --confirm --only P3L --record-book --account deployer
 # Gates on the seats CheckDeployedAdmins does not read.
 p4l_reset
 rm -rf "$BCD"
@@ -2860,6 +3281,9 @@ SOL
       fi
       for s in DeployTeamVesting DeployDormantLedgers; do cp "$IC/script/$s.s.sol" "$FC/script/"; done
       cp "$ROOT_SRC/scripts/ops/regenesis.sh" "$ROOT_SRC/scripts/ops/emit-address-table.sh" "$FR/scripts/ops/"
+      # regenesis.sh runs the ceremony's shared forge output check from the same tree.
+      mkdir -p "$FR/scripts/genesis"
+      cp "$G/forge_output_check.py" "$FR/scripts/genesis/"
       cp "$ROOT_SRC/scripts/ci/check-create2-determinism.sh" "$FR/scripts/ci/"
       cat >"$T/fbin/forge" <<'EOF'
 #!/usr/bin/env bash
@@ -2976,6 +3400,16 @@ EOF
           # C9: the alias the deploy scripts prefer, stale, is refused the same way.
           expect "fresh genesis e2e: a stale CEREMONY_DEPLOYER_ADDRESS stops P2 before any broadcast" 3 "GATE FAIL at P0: CEREMONY_DEPLOYER_ADDRESS is set to '0x0+63'" -- "${FENV[@]}" CEREMONY_DEPLOYER_ADDRESS="$STALE" bash "$CE" --confirm --only P2 --account fixture
           [[ "$(fcast nonce "$FDEP")" == "$n1" ]] && ok "fresh genesis e2e: the refused CEREMONY_DEPLOYER_ADDRESS sent nothing" || bad "fresh genesis e2e: the refused CEREMONY_DEPLOYER_ADDRESS sent nothing" "nonce $n1 -> $(fcast nonce "$FDEP")"
+          # forge's output, with the real forge: FOUNDRY_BROADCAST is refused by name, and a global
+          # ~/.foundry/foundry.toml that moves the broadcast directory (no variable names it) is
+          # what `forge config --json` resolves, refused at P0. Neither sends anything.
+          expect "fresh genesis e2e: FOUNDRY_BROADCAST stops P2 before any broadcast" 1 'FOUNDRY_BROADCAST is set in the environment' -- "${FENV[@]}" FOUNDRY_BROADCAST="$T/fbroadcast-elsewhere" bash "$CE" --confirm --only P2 --account fixture
+          mkdir -p "$T/fhome/.foundry"
+          [[ -d "$HOME/.svm" && ! -e "$T/fhome/.svm" ]] && ln -s "$HOME/.svm" "$T/fhome/.svm"
+          printf '[profile.default]\nbroadcast = "broadcast-elsewhere"\n' >"$T/fhome/.foundry/foundry.toml"
+          expect "fresh genesis e2e: a global foundry.toml that moves the broadcasts stops P2 at P0 (real forge config)" 3 'GATE FAIL at P0: forge writes its broadcast records to .*/broadcast-elsewhere' -- "${FENV[@]}" HOME="$T/fhome" bash "$CE" --confirm --only P2 --account fixture
+          [[ "$(fcast nonce "$FDEP")" == "$n1" && ! -e "$FC/broadcast-elsewhere" && ! -e "$T/fbroadcast-elsewhere" ]] && ok "fresh genesis e2e: the refused forge output settings sent nothing" ||
+            bad "fresh genesis e2e: the refused forge output settings sent nothing" "nonce $n1 -> $(fcast nonce "$FDEP")"
         fi
         if [[ "$fault" == gate-fault ]]; then
           out=$("${FENV[@]}" EMITTER="$T/fail-emit.sh" bash "$CE" --confirm --only P2 --account fixture 2>&1)
