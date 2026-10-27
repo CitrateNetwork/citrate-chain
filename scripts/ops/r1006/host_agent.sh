@@ -480,9 +480,14 @@ cmd_logs_scan() {
   # Fork-choice reorgs: competing tips while several producers mine. One no deeper than
   # R1006_MAX_REORG blocks (default 6, fleet_agree's LAG) is counted and shown, not
   # failed; a deeper one is a hit like any other fork line.
-  local max="${R1006_MAX_REORG:-6}" shallow=0 deepest=0 line n keep=""
+  # MP-S1 skipped rounds: the producer declines to seal on a fork-choice parent its executor
+  # has not applied yet (that would commit a state root no peer reproduces) and skips the
+  # round. The guard working, not a fork: counted and shown. Only its exact form is exempt.
+  local mp='MP-S1: fork-choice selected parent [0-9a-f]+ but this node.s applied tip is [0-9a-f]+ @ [0-9]+ .*Skipping this production round; the execute-on-receive drain/reorg will converge the applied tip\.$'
+  local max="${R1006_MAX_REORG:-6}" shallow=0 deepest=0 skips=0 line n keep=""
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
+    if [[ "$line" =~ $mp ]]; then skips=$((skips + 1)); continue; fi
     if [[ "$line" =~ fork-choice\ reorged\ to\ .*\(reverted\ ([0-9]+), ]]; then
       n=${BASH_REMATCH[1]}
       ((n > deepest)) && deepest=$n
@@ -491,8 +496,8 @@ cmd_logs_scan() {
     keep+="$line"$'\n'
   done <<<"$hits"
   hits="$keep"
-  printf 'lines %s\nmatches %s\nexempt %s\nshallow_reorgs %s\ndeepest_reorg %s\n' "$(printf '%s\n' "$text" | grep -c . || true)" \
-    "$(printf '%s' "$hits" | grep -c . || true)" "$(printf '%s\n' "$all" | grep -c -E "$benign" || true)" "$shallow" "$deepest"
+  printf 'lines %s\nmatches %s\nexempt %s\nshallow_reorgs %s\ndeepest_reorg %s\nproducer_skips %s\n' "$(printf '%s\n' "$text" | grep -c . || true)" \
+    "$(printf '%s' "$hits" | grep -c . || true)" "$(printf '%s\n' "$all" | grep -c -E "$benign" || true)" "$shallow" "$deepest" "$skips"
   printf '%s\n' "$hits" | head -5 | sed 's/^/  | /'
 }
 

@@ -916,6 +916,9 @@ PY
       sr=$(sed -n 's/^shallow_reorgs //p' <<<"$scan")
       dr=$(sed -n 's/^deepest_reorg //p' <<<"$scan")
       [[ "${sr:-0}" != 0 ]] && log "  NOTE $h: $sr shallow fork-choice reorg(s), deepest $dr block(s)"
+      local ps
+      ps=$(sed -n 's/^producer_skips //p' <<<"$scan")
+      [[ "${ps:-0}" != 0 ]] && log "  NOTE $h: $ps production round(s) skipped by the MP-S1 guard (parent not yet applied)"
     done
     [[ $bad -eq 0 ]] && pass "no CONFLICT / fork lines in any node log" || fail "CONFLICT / fork lines in node logs"
   fi

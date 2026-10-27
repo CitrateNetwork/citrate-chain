@@ -2,8 +2,12 @@
 # fleet_agree.sh: do all producers and RPC nodes report the same chain? Read-only.
 #
 # For every RPC endpoint given, reads eth_chainId, the hash of block 0 and the head height.
-# Then it picks a common height H = (lowest head) - LAG and compares the block hash at H on
-# every endpoint. It FAILS if:
+# Then it picks a common height H = (lowest head) - LAG and compares, on every endpoint, the
+# block at H on that endpoint's CANONICAL chain: found by walking parentHash down from its
+# `latest` block, not from `eth_getBlockByNumber(H)`. The node's height index keeps the last
+# block written at a height, which after a shallow fork-choice reorg can be the replaced
+# sibling (scripts/ci/rpc_height_index_tripwire.sh); a by-number answer that differs from the
+# walked block is reported as a NOTE (an RPC height-index lag), not as a fork. It FAILS if:
 #   * an endpoint is unreachable;
 #   * a chain id differs from EXPECTED_CHAIN_ID (default 40204);
 #   * the block-0 hashes differ from each other, or from EXPECTED_GENESIS_HASH when set;
@@ -60,7 +64,7 @@ if [[ $DRY -eq 1 ]]; then
     describe_cmd "$CAST" block 0 --field hash --rpc-url "$r"
     describe_cmd "$CAST" block-number --rpc-url "$r"
   done
-  log "then: $CAST block <min head - $LAG> --field hash on every endpoint, compared"
+  log "then: walk parentHash from $CAST block latest to <min head - $LAG> on every endpoint, compared"
   exit 0
 fi
 
@@ -118,14 +122,32 @@ if ((max - min > MAX_SPREAD)); then
   fail=1
 fi
 H=$((min > LAG ? min - LAG : 0))
+# canonical_at URL H: the hash at height H on URL's canonical chain, by walking parentHash
+# from its latest block (bounded by MAX_SPREAD + LAG steps). Empty on any failed read.
+canonical_at() {
+  local r="$1" want="$2" b n steps=0
+  b=$("$CAST" block latest --field hash --rpc-url "$r" 2>/dev/null) || return 0
+  n=$("$CAST" block "$b" --field number --rpc-url "$r" 2>/dev/null) || return 0
+  [[ "$n" =~ ^[0-9]+$ ]] || return 0
+  while ((n > want)); do
+    ((steps++ > MAX_SPREAD + LAG + 64)) && return 0
+    b=$("$CAST" block "$b" --field parentHash --rpc-url "$r" 2>/dev/null) || return 0
+    n=$((n - 1))
+  done
+  ((n == want)) && lower "$b"
+}
 first=""
 for r in "${!HEAD[@]}"; do
-  bh=$("$CAST" block "$H" --field hash --rpc-url "$r" 2>/dev/null) || bh=""
-  bh=$(lower "$bh")
+  bh=$(canonical_at "$r" "$H")
   if [[ -z "$bh" ]]; then
-    log "FAIL  $r has no block $H"
+    log "FAIL  $r has no block $H on its canonical chain"
     fail=1
     continue
+  fi
+  idx=$("$CAST" block "$H" --field hash --rpc-url "$r" 2>/dev/null) || idx=""
+  idx=$(lower "$idx")
+  if [[ -n "$idx" && "$idx" != "$bh" ]]; then
+    log "NOTE  $r eth_getBlockByNumber($H) = $idx, its canonical chain has $bh (RPC height-index lag)"
   fi
   [[ -z "$first" ]] && first="$bh"
   if [[ "$bh" != "$first" ]]; then
