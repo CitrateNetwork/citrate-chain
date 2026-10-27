@@ -27,6 +27,13 @@ OPS = REPO / "scripts" / "ops"
 BRINGUP = OPS / "r1006_bringup.sh"
 AGENT = OPS / "r1006" / "host_agent.sh"
 FAKE = OPS / "tests" / "fixtures" / "fake_keytool.sh"
+FILL_FIXTURE = OPS / "tests" / "fixtures" / "rehearsal_fill.py"
+GUARD = OPS / "r1006" / "guard.py"
+HARDENING = REPO / "core" / "consensus" / "src" / "hardening.rs"
+# r1005's block 0 (RELEASE_GENESIS[0]) and the r1006 genesis the test "build" compiles.
+R1005 = "0x1dcfc4909dd9fdcb0f03c823d627e4b2032cc86bef5fc4561030d6c64b9775f1"
+R1006_TEST = "0x" + "06" * 32
+PINNED_INV = json.loads((OPS / "r1006" / "inventory.r1006.json").read_text())
 sys.path.insert(0, str(OPS / "r1006"))
 import collect  # noqa: E402
 import render_profile  # noqa: E402
@@ -75,10 +82,12 @@ class Env:
         s256 = subprocess.run(["sha256sum", str(self.state / "bin" / "citrate-node")], capture_output=True,
                               text=True, check=True).stdout.split()[0]
         (self.state / "build.json").write_text(json.dumps({"sha": "0" * 40, "sha256": s256, "fingerprint": "0x",
-                                                           "arch": "test", "built_on": "test", "from_main": False}))
+                                                           "arch": "test", "built_on": "test", "from_main": False,
+                                                           "r1006_genesis": R1006_TEST}))
         self.env = dict(os.environ, HOME=str(self.tmp), CANARY="CANARY-7f3a9c")
 
-    def run(self, *args: str, env: dict | None = None, agent: Path | None = None) -> subprocess.CompletedProcess:
+    def run(self, *args: str, env: dict | None = None, agent: Path | None = None,
+            state: bool = True) -> subprocess.CompletedProcess:
         e = dict(self.env, **(env or {}))
         script = BRINGUP
         if agent is not None:
@@ -88,8 +97,30 @@ class Env:
                 shutil.copytree(OPS, d, ignore=shutil.ignore_patterns("tests"))
             shutil.copy(agent, d / "r1006" / "host_agent.sh")
             script = d / "r1006_bringup.sh"
-        return subprocess.run(["bash", str(script), *args, "--inventory", str(self.inv), "--state", str(self.state)],
+        st = ["--state", str(self.state)] if state else []
+        return subprocess.run(["bash", str(script), *args, "--inventory", str(self.inv), *st],
                               capture_output=True, text=True, env=e, timeout=300, stdin=subprocess.DEVNULL)
+
+    def fill_cmd(self, genesis_hash: str, profile: str = "r1006", genesis_file: str | None = None) -> str:
+        gf = f" --genesis-file {genesis_file}" if genesis_file else ""
+        return (f"python3 {FILL_FIXTURE} --producers {{producers}} --stakes {{stakes}} --out {{out}} "
+                f"--genesis-hash {genesis_hash} --profile {profile}{gf}")
+
+    def plant_fill(self, genesis_hash: str, profile: str | None = "r1006") -> None:
+        """A fill-result.json in the state dir as if genesis-fill had accepted it."""
+        prod = json.loads((self.state / "r1006-producers.json").read_text())
+        (self.state / "genesis").mkdir(exist_ok=True)
+        (self.state / "genesis" / "fill-result.json").write_text(json.dumps({
+            "schema": "r1006-genesis-fill/1", "genesis_hash": genesis_hash, "genesis_profile": profile,
+            "genesis_file": None, "alloc_file": None, "address_book": None, "orangeseed": None,
+            "validator_registry": "0x" + "00" * 18 + "1006", "validator_activation_height": 0,
+            "validators_at_genesis": True,
+            "validators": [{"proposer_pubkey": p["proposer_pubkey"], "staker": p["staker_address"],
+                            "stake_wei": str(32000 * 10**18)} for p in prod["producers"]],
+            "source": "test plant"}))
+
+    def host_root(self, i: int) -> Path:
+        return Path(self.hosts[i - 1]["root"])
 
     def agent(self, host: int, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
         e = dict(self.env, R1006_ROOT=self.hosts[host - 1]["root"], R1006_SERVICE="proc", R1006_RUN_AS="", **(env or {}))
@@ -232,23 +263,6 @@ class KeysStepReadsOnlyPublicOutputs(unittest.TestCase):
         finally:
             env.close()
 
-    def test_negative_control_an_agent_that_reads_the_keystore_is_caught(self):
-        """Mutate the agent so `pub` also prints the keystore; the leak check must fire."""
-        env = Env(2)
-        try:
-            src = AGENT.read_text()
-            mutated = src.replace('cat -- "$PUB"', 'cat -- "$PUB" "$KEYSTORE"')
-            self.assertNotEqual(src, mutated, "the agent's pub command is a single cat of the public file")
-            m = env.tmp / "host_agent.mut.sh"
-            m.write_text(mutated)
-            r = env.run("keys", agent=m)
-            seen = tree_bytes(env.state) + r.stdout.encode() + r.stderr.encode()
-            leaked = any(n in seen for s in env.secrets() for n in leak_needles(s))
-            self.assertTrue(leaked, "the leak check must see the keystore when the agent prints it")
-            self.assertFalse((env.state / "r1006-producers.json").exists(), "the collector must refuse that output")
-        finally:
-            env.close()
-
     def test_extra_field_in_the_public_file_stops_the_step(self):
         if os.environ.get("R1006_TEST_KEYTOOL"):
             self.skipTest("fake-keytool control")
@@ -275,6 +289,499 @@ class KeysStepReadsOnlyPublicOutputs(unittest.TestCase):
         body = re.search(r"cmd_pub\(\) \{(.*?)\n\}", agent, re.S).group(1)
         self.assertEqual(re.findall(r"\bcat\b[^\n]*", body), ['cat -- "$PUB"'])
         self.assertIn('PUB="$RDIR/identity.pub.json"', agent)
+
+
+def mutate(src: str, options: list[tuple[str, str]]) -> str:
+    """Apply the first (anchor, replacement) whose anchor is in src."""
+    for old, new in options:
+        if old in src:
+            return src.replace(old, new, 1)
+    raise AssertionError(f"no mutation anchor found among {[o for o, _ in options]}")
+
+
+# The reviewer's three leak modes, as agent mutations. Each list covers the agent before
+# and after the containment change, so the same test runs red on the old agent.
+LEAK_MODES = {
+    "pub prints proposer.key after the JSON": [
+        ('python3 -c "$PUB_CHECK" "$PUB"', 'python3 -c "$PUB_CHECK" "$PUB"; cat -- "$DATA/proposer.key"'),
+        ('cat -- "$PUB"', 'cat -- "$PUB" "$DATA/proposer.key"'),
+    ],
+    "pub prints noise.key before the JSON": [
+        ('python3 -c "$PUB_CHECK" "$PUB"', 'cat -- "$DATA/noise.key"; python3 -c "$PUB_CHECK" "$PUB"'),
+        ('cat -- "$PUB"', 'cat -- "$DATA/noise.key" "$PUB"'),
+    ],
+    "keys cats the password file to stderr": [
+        ('  chmod 0644 "$PUB"\n', '  chmod 0644 "$PUB"\n  cat -- "$PASSWORD" >&2\n'),
+    ],
+}
+# Disables the on-host output check, to prove the orchestrator's own check holds alone.
+NO_HOST_SCAN = [('withhold_secrets "$out" "$err"', 'true')]
+
+
+class KeyLeakContainment(unittest.TestCase):
+    """A host whose agent leaks key material: the step fails, nothing is written under the
+    state dir, and nothing secret is echoed. Checked with the on-host output check and,
+    separately, with it disabled (the orchestrator's in-memory check alone)."""
+
+    def _run(self, mode: str, host_scan: bool):
+        env = Env(2)
+        try:
+            src = mutate(AGENT.read_text(), LEAK_MODES[mode])
+            if not host_scan and 'withhold_secrets "$out" "$err"' in src:
+                src = mutate(src, NO_HOST_SCAN)
+            m = env.tmp / "host_agent.mut.sh"
+            m.write_text(src)
+            before = {p.relative_to(env.state) for p in env.state.rglob("*") if p.is_file()}
+            r = env.run("keys", agent=m)
+            secrets = env.secrets()
+            self.assertTrue(secrets, "the hosts minted keys")
+            self.assertNotEqual(r.returncode, 0, f"{mode}: the step must fail\n{r.stdout}{r.stderr}")
+            after = {p.relative_to(env.state) for p in env.state.rglob("*") if p.is_file()}
+            self.assertEqual(sorted(str(p) for p in after - before if p.name != "timings.log"), [],
+                             f"{mode}: files written under the state dir")
+            needles = [n for s_ in secrets for n in leak_needles(s_)]
+            state_bytes = tree_bytes(env.state)
+            for n in needles:
+                self.assertNotIn(n, state_bytes, f"{mode}: a secret is on the orchestrator's disk")
+                self.assertNotIn(n, r.stdout.encode(), f"{mode}: a secret was echoed (stdout)")
+                self.assertNotIn(n, r.stderr.encode(), f"{mode}: a secret was echoed (stderr)")
+            self.assertFalse((env.state / "r1006-producers.json").exists())
+        finally:
+            env.close()
+
+    def test_pub_prints_proposer_key_after_the_json(self):
+        for scan in (True, False):
+            with self.subTest(host_scan=scan):
+                self._run("pub prints proposer.key after the JSON", scan)
+
+    def test_pub_prints_noise_key_before_the_json(self):
+        for scan in (True, False):
+            with self.subTest(host_scan=scan):
+                self._run("pub prints noise.key before the JSON", scan)
+
+    def test_keys_cats_the_password_file_to_stderr(self):
+        for scan in (True, False):
+            with self.subTest(host_scan=scan):
+                self._run("keys cats the password file to stderr", scan)
+
+    def test_the_host_withholds_its_own_secrets(self):
+        """The agent alone (no orchestrator): a leaking command's output never leaves the host."""
+        env = Env(1)
+        try:
+            r = env.run("keys")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            src = AGENT.read_text()
+            for mode, opts in LEAK_MODES.items():
+                with self.subTest(mode=mode):
+                    m = env.tmp / "agent.mut.sh"
+                    m.write_text(mutate(src, opts))
+                    e = dict(env.env, R1006_ROOT=env.hosts[0]["root"], R1006_SERVICE="proc", R1006_RUN_AS="")
+                    cmd = "pub" if mode.startswith("pub") else "keys"
+                    args = [cmd] + ([json.loads((env.state / "build.json").read_text())["sha256"]]
+                                    if cmd == "keys" else [])
+                    rr = subprocess.run(["bash", str(m), *args], capture_output=True, env=e, timeout=120,
+                                        stdin=subprocess.DEVNULL)
+                    self.assertEqual(rr.returncode, 3, rr.stderr)
+                    for n in (n for s_ in env.secrets() for n in leak_needles(s_)):
+                        self.assertNotIn(n, rr.stdout + rr.stderr)
+                    self.assertIn(b"withheld", rr.stderr)
+        finally:
+            env.close()
+
+    def test_negative_control_clean_keys_still_pass_through(self):
+        env = Env(2)
+        try:
+            r = env.run("keys")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(len(list((env.state / "pub").glob("*.pub.json"))), 2)
+        finally:
+            env.close()
+
+    def test_guard_relay_patterns(self):
+        import guard  # noqa: E402
+        h = b"ab" * 32
+        self.assertEqual(guard.find_leak(b"PROBE OK block 0 0x" + h + b"\n", b""), None, "hashes on stdout are fine")
+        self.assertEqual(guard.find_leak(b"", b"host_agent: staged sha256 abababababab... differs\n"), None)
+        self.assertEqual(guard.find_leak(b"", h + b"\n"), "stderr", "a bare 32-byte hex value on stderr")
+        self.assertEqual(guard.find_leak(b"", b"0x" + h), "stderr")
+        self.assertEqual(guard.find_leak(b"", b"\x8f\x01raw"), "stderr", "raw key bytes")
+        self.assertEqual(guard.find_leak(b'{"crypto": {"ciphertext": "00"}}', b""), "stdout", "a keystore")
+        self.assertEqual(guard.find_leak(b"-----BEGIN PRIVATE KEY-----", b""), "stdout")
+        self.assertEqual(guard.find_leak(b"", b"password=hunter2"), "stderr")
+
+
+class DefaultStateDir(unittest.TestCase):
+    def test_default_state_is_home_r1006_state_0700(self):
+        env = Env(1)
+        try:
+            r = env.run("status", "--dry-run", state=False)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            d = env.tmp / "r1006-state"
+            self.assertTrue(d.is_dir(), "default state dir is ~/r1006-state")
+            self.assertEqual(os.stat(d).st_mode & 0o777, 0o700)
+            self.assertFalse((Path.cwd() / "r1006-state").exists() and Path.cwd() == REPO)
+        finally:
+            env.close()
+
+    def test_repo_gitignore_covers_in_repo_state_dirs(self):
+        for rel in ("r1006-state/pub/x.pub.json", "scripts/ops/r1006-state/genesis/fill-result.json"):
+            r = subprocess.run(["git", "-C", str(REPO), "check-ignore", "-q", "--no-index", rel])
+            self.assertEqual(r.returncode, 0, f"{rel} is not gitignored")
+
+    def test_state_dir_inside_the_repo_must_be_ignored(self):
+        env = Env(1)
+        try:
+            d = REPO / "scripts" / "ops" / "tests" / f"not-ignored-state-{os.getpid()}"
+            r = subprocess.run(["bash", str(BRINGUP), "status", "--dry-run", "--inventory", str(env.inv),
+                                "--state", str(d)], capture_output=True, text=True, env=env.env,
+                               stdin=subprocess.DEVNULL)
+            try:
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("gitignore", r.stderr)
+            finally:
+                if d.exists():
+                    shutil.rmtree(d)
+        finally:
+            env.close()
+
+
+class FakeFleet:
+    """PATH shims for ssh, scp and doctl that record every call and connect nowhere."""
+
+    def __init__(self, tmp: Path, doctl_pairs: list[tuple[str, str]] | None = None, doctl_rc: int = 0):
+        self.bin = tmp / "fakebin"
+        self.bin.mkdir(exist_ok=True)
+        self.calls = tmp / "calls.log"
+        for tool in ("ssh", "scp"):
+            p = self.bin / tool
+            p.write_text(f'#!/bin/sh\necho "{tool} $*" >>"{self.calls}"\ncat >/dev/null 2>&1 || true\nexit 0\n')
+            p.chmod(0o755)
+        pairs = doctl_pairs if doctl_pairs is not None else \
+            [(h["name"], h["ip"]) for h in PINNED_INV["hosts"]] + [("citrate-rpc-1", "142.93.58.145"),
+                                                                  ("citrate-core-linux-build", "167.99.155.183")]
+        (tmp / "doctl-all.txt").write_text("".join(f"{n}    {ip}\n" for n, ip in pairs))
+        (tmp / "doctl-tag.txt").write_text("".join(f"{n}    {ip}\n" for n, ip in pairs if n.startswith("citrate-prod-")))
+        d = self.bin / "doctl"
+        d.write_text(f'#!/bin/sh\necho "doctl $*" >>"{self.calls}"\n'
+                     f'case "$*" in *--tag-name*) cat "{tmp}/doctl-tag.txt" ;; *) cat "{tmp}/doctl-all.txt" ;; esac\n'
+                     f'exit {doctl_rc}\n')
+        d.chmod(0o755)
+
+    def env(self) -> dict:
+        return {"PATH": f"{self.bin}:{os.environ['PATH']}"}
+
+    def ssh_calls(self) -> list[str]:
+        if not self.calls.exists():
+            return []
+        return [l for l in self.calls.read_text().splitlines() if l.startswith(("ssh ", "scp "))]
+
+
+SSH_STEPS = (["build", "--sha", "a" * 40], ["keys"], ["genesis-fill", "--fill-cmd", "true"], ["distribute"],
+             ["start"], ["smoke"], ["stop"], ["wipe"], ["status"], ["tunnels", "up"], ["tunnels", "down"])
+
+
+class HostAllowlist(unittest.TestCase):
+    """Only citrate-prod-1..7 at their pinned IPs; the build host only for `build`."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="dgx-r1006a."))
+        self.state = self.tmp / "state"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def inv(self, hosts: list[tuple[str, str]], build=("citrate-core-linux-build", "167.99.155.183")) -> Path:
+        p = self.tmp / "inv.json"
+        d = dict(PINNED_INV, hosts=[{"name": n, "region": "x", "ip": ip} for n, ip in hosts],
+                 build_host={"name": build[0], "ip": build[1], "arch": "x86_64-unknown-linux-gnu"})
+        d.pop("ssh_key", None)
+        p.write_text(json.dumps(d))
+        return p
+
+    def bring(self, inv: Path, *args: str, fleet: FakeFleet) -> subprocess.CompletedProcess:
+        e = dict(os.environ, HOME=str(self.tmp), **fleet.env())
+        return subprocess.run(["bash", str(BRINGUP), *args, "--inventory", str(inv), "--state", str(self.state)],
+                              capture_output=True, text=True, env=e, timeout=120, stdin=subprocess.DEVNULL)
+
+    def pinned(self) -> list[tuple[str, str]]:
+        return [(h["name"], h["ip"]) for h in PINNED_INV["hosts"]]
+
+    def test_pinned_table_matches_the_committed_inventory(self):
+        import guard  # noqa: E402
+        self.assertEqual(dict(self.pinned()), guard.PRODUCERS)
+        self.assertEqual(sorted(guard.PRODUCERS), [f"citrate-prod-{i}" for i in range(1, 8)])
+        self.assertEqual((PINNED_INV["build_host"]["name"], PINNED_INV["build_host"]["ip"]), guard.BUILD_HOST)
+        self.assertNotIn(guard.BUILD_HOST[1], guard.PRODUCERS.values())
+
+    def test_a_non_producer_host_is_refused_for_every_subcommand_before_connecting(self):
+        bad = {
+            "rpc-1": ("citrate-rpc-1", "142.93.58.145"),
+            "unknown host": ("citrate-prod-8", "10.20.30.40"),
+            "producer name at another IP": ("citrate-prod-3", "142.93.58.145"),
+            "build host as a node": ("citrate-core-linux-build", "167.99.155.183"),
+        }
+        for label, pair in bad.items():
+            hosts = self.pinned()[:2] + [pair] if pair[0] != "citrate-prod-3" else \
+                [p for p in self.pinned() if p[0] != "citrate-prod-3"] + [pair]
+            inv = self.inv(hosts)
+            for step in SSH_STEPS:
+                for dry in ((), ("--dry-run",)):
+                    with self.subTest(host=label, step=step[0], dry=bool(dry)):
+                        fleet = FakeFleet(self.tmp)
+                        if fleet.calls.exists():
+                            fleet.calls.unlink()
+                        r = self.bring(inv, *step, *dry, fleet=fleet)
+                        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                        self.assertIn("REFUSED", r.stderr)
+                        self.assertEqual(fleet.ssh_calls(), [], "connected to a host before refusing")
+
+    def test_build_refuses_any_build_host_but_the_approved_one(self):
+        for b in (("citrate-rpc-1", "142.93.58.145"), ("citrate-core-linux-build", "142.93.58.145"),
+                  ("citrate-prod-1", "206.189.35.49")):
+            with self.subTest(build_host=b):
+                fleet = FakeFleet(self.tmp)
+                if fleet.calls.exists():
+                    fleet.calls.unlink()
+                r = self.bring(self.inv(self.pinned(), build=b), "build", "--sha", "a" * 40, fleet=fleet)
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertEqual(fleet.ssh_calls(), [])
+
+    def test_positive_control_status_reaches_exactly_the_pinned_producers(self):
+        fleet = FakeFleet(self.tmp)
+        r = self.bring(self.inv(self.pinned()), "status", fleet=fleet)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        targets = sorted({re.search(r"@([0-9.]+)", c).group(1) for c in fleet.ssh_calls()})
+        self.assertEqual(targets, sorted(ip for _, ip in self.pinned()))
+        self.assertTrue(any("--tag-name citrate-producer" in l for l in fleet.calls.read_text().splitlines()),
+                        "live doctl cross-check ran")
+
+    def test_positive_control_build_reaches_only_the_build_host(self):
+        fleet = FakeFleet(self.tmp)
+        r = self.bring(self.inv(self.pinned()), "build", "--sha", "a" * 40, fleet=fleet)
+        # the fake ssh prints no build record, so the step fails after connecting
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        targets = {re.search(r"@([0-9.]+)", c).group(1) for c in fleet.ssh_calls()}
+        self.assertEqual(targets, {"167.99.155.183"})
+
+    def test_live_cross_check_mismatch_or_failure_refuses(self):
+        moved = [(n, "10.9.9.9" if n == "citrate-prod-3" else ip) for n, ip in self.pinned()]
+        for label, fleet in (("prod-3 moved", FakeFleet(self.tmp, doctl_pairs=moved)),
+                             ("doctl fails", FakeFleet(self.tmp, doctl_rc=1))):
+            with self.subTest(label):
+                if fleet.calls.exists():
+                    fleet.calls.unlink()
+                r = self.bring(self.inv(self.pinned()), "status", fleet=fleet)
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("live cross-check", r.stderr)
+                self.assertEqual(fleet.ssh_calls(), [])
+
+
+class GenesisRefusal(unittest.TestCase):
+    """r1005's block 0 (or any release network's, or anything but the build's compiled
+    r1006 genesis) is refused at genesis-fill, distribute and start."""
+
+    def test_release_genesis_mirror_matches_hardening_rs(self):
+        import guard  # noqa: E402
+        src = HARDENING.read_text()
+        block = src[src.index("pub const RELEASE_GENESIS"):]
+        block = block[:block.index("];")]
+        pinned = {"0x" + h for h in re.findall(r'hex32\("([0-9a-f]{64})"\)', block)}
+        self.assertEqual(len(pinned), 3)
+        self.assertEqual(set(guard.RELEASE_GENESIS), pinned)
+        self.assertIn(R1005, pinned)
+        agent = re.search(r"RELEASE_GENESIS_HASHES=\(([^)]*)\)", AGENT.read_text())
+        self.assertIsNotNone(agent, "the host agent carries the release genesis list")
+        self.assertEqual(set(agent.group(1).split()), pinned)
+
+    def test_check_genesis_unit(self):
+        import guard  # noqa: E402
+        build = {"r1006_genesis": R1006_TEST}
+        ok = {"genesis_hash": R1006_TEST, "genesis_profile": "r1006", "genesis_file": None}
+        self.assertEqual(guard.check_genesis(ok, build), [])
+        for label, fill, b in (
+            ("r1005 hash", dict(ok, genesis_hash=R1005), build),
+            ("team_testnet hash", dict(ok, genesis_hash="0x90044175c36a6491309d769bd0fa684afbf7b90b64136446db8e2e6ff0927553"), build),
+            ("profile testnet_beta", dict(ok, genesis_profile="testnet_beta"), build),
+            ("profile null", dict(ok, genesis_profile=None), build),
+            ("profile default", dict(ok, genesis_profile="default"), build),
+            ("genesis file", dict(ok, genesis_file="genesis.json"), build),
+            ("not the build's r1006 genesis", dict(ok, genesis_hash="0x" + "07" * 32), build),
+            ("build has no r1006 genesis", ok, {}),
+            ("build's r1006 genesis is r1005", dict(ok, genesis_hash=R1005), {"r1006_genesis": R1005}),
+        ):
+            with self.subTest(label):
+                self.assertNotEqual(guard.check_genesis(fill, b), [], label)
+
+    def _keys(self, n=2) -> Env:
+        env = Env(n)
+        r = env.run("keys")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return env
+
+    def test_genesis_fill_refuses_r1005_and_anything_but_the_r1006_genesis(self):
+        env = self._keys()
+        try:
+            for label, cmd in (("r1005, testnet_beta", env.fill_cmd(R1005, "testnet_beta")),
+                               ("r1005 under the r1006 name", env.fill_cmd(R1005, "r1006")),
+                               ("profile null", env.fill_cmd(R1005, "null")),
+                               ("another hash", env.fill_cmd("0x" + "07" * 32, "r1006")),
+                               ("genesis file", env.fill_cmd(R1006_TEST, "r1006", "genesis.json"))):
+                with self.subTest(label):
+                    r = env.run("genesis-fill", "--fill-cmd", cmd)
+                    self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+                    self.assertIn("REFUSED", r.stdout + r.stderr)
+                    self.assertFalse((env.state / "genesis" / "fill-result.json").exists(),
+                                     "a refused fill must not be kept for distribute")
+            r = env.run("genesis-fill", "--fill-cmd", env.fill_cmd(R1006_TEST))
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertTrue((env.state / "genesis" / "fill-result.json").exists())
+        finally:
+            env.close()
+
+    def test_genesis_fill_refuses_a_build_without_the_r1006_genesis(self):
+        env = self._keys()
+        try:
+            b = json.loads((env.state / "build.json").read_text())
+            b.pop("r1006_genesis")
+            (env.state / "build.json").write_text(json.dumps(b))
+            r = env.run("genesis-fill", "--fill-cmd", env.fill_cmd(R1006_TEST))
+            self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("no r1006 genesis", r.stdout + r.stderr)
+        finally:
+            env.close()
+
+    def test_distribute_and_start_refuse_a_planted_r1005_fill_before_touching_a_host(self):
+        for profile in ("testnet_beta", "r1006", None):
+            with self.subTest(profile=profile):
+                env = self._keys()
+                try:
+                    env.plant_fill(R1005, profile)
+                    for step in (["distribute"], ["start"]):
+                        r = env.run(*step)
+                        self.assertEqual(r.returncode, 2, f"{step}: {r.stdout}{r.stderr}")
+                        self.assertIn("REFUSED", r.stderr)
+                    for i in (1, 2):
+                        root = env.host_root(i)
+                        self.assertFalse((root / "usr/local/bin/citrate-node").exists(), "binary installed")
+                        self.assertEqual(list((root / "usr/local/lib/citrate-r1006/incoming").glob("*")), [])
+                        self.assertFalse((root / "fake-node.log").exists(), "a node was started")
+                finally:
+                    env.close()
+
+    def test_host_agent_refuses_release_genesis_hashes(self):
+        env = self._keys(1)
+        try:
+            for args in (["probe-genesis", R1005], ["start", R1005], ["enable-mining", R1005]):
+                with self.subTest(cmd=args[0]):
+                    r = env.agent(1, *args)
+                    self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                    self.assertIn("release", r.stderr)
+            lib = env.host_root(1) / "usr/local/lib/citrate-r1006"
+            (lib / "tools").mkdir(parents=True, exist_ok=True)
+            shutil.copy(REPO / "scripts/producers/gen_node_config.py", lib / "tools")
+            shutil.copy(REPO / "scripts/producers/producerlib.py", lib / "tools")
+            tmpl = json.loads((REPO / "scripts/producers/profiles/r1006.json").read_text())
+            pub = json.loads((env.state / "pub" / "p1.pub.json").read_text())
+            for label, gh, gp in (("r1005 hash", R1005, "r1006"), ("testnet_beta profile", R1006_TEST, "testnet_beta"),
+                                  ("no profile", R1006_TEST, None)):
+                with self.subTest(label):
+                    prof = dict(tmpl, status="ready", genesis_hash=gh, genesis_profile=gp,
+                                validator_registry="0x" + "00" * 18 + "1006", validators_at_genesis=True,
+                                bootstrap_nodes=[])
+                    (lib / "profile.json").write_text(json.dumps(prof))
+                    r = env.agent(1, "write-config", pub["staker_address"], "off")
+                    self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                    self.assertFalse((env.host_root(1) / "etc/citrate/node.toml").exists())
+        finally:
+            env.close()
+
+
+def _unshare_ok() -> bool:
+    try:
+        return subprocess.run(["unshare", "--user", "--map-root-user", "--net", "true"],
+                              capture_output=True, timeout=10).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+@unittest.skipUnless(_unshare_ok(), "needs unprivileged user + network namespaces")
+class StartGateMiningOnlyOnTheR1006Genesis(unittest.TestCase):
+    """keys -> genesis-fill -> distribute -> start --mining on, each host a fake node in
+    its own network namespace (inside one user + net + pid namespace: nothing reaches the
+    host's network). Mining is switched on only after EVERY host's block 0 is verified."""
+
+    def _fleet(self, n: int, wrong_after_distribute: dict[int, str]) -> tuple[Env, subprocess.CompletedProcess]:
+        env = Env(n)
+        inner = env.tmp / "inner.sh"
+        sets = "\n".join(f'printf %s {h} >"{env.host_root(i)}/fake-block0"' for i, h in wrong_after_distribute.items())
+        inner.write_text(f"""set -u
+ip link set lo up
+pids=""
+for i in $(seq 1 {n}); do
+  unshare --net sleep 600 &
+  p=$!; pids="$pids $p"; sleep 0.2
+  nsenter --net=/proc/$p/ns/net ip link set lo up
+done
+python3 - "{env.inv}" "{env.tmp}" $pids <<'PY'
+import json, sys
+inv, tmp, pids = sys.argv[1], sys.argv[2], sys.argv[3:]
+hosts = [{{"name": f"p{{i}}", "region": "lo", "ip": f"10.206.0.{{i}}", "root": f"{{tmp}}/h{{i}}", "netns_pid": p}}
+         for i, p in enumerate(pids, 1)]
+json.dump({{"schema": "r1006-inventory/1", "transport": "local", "build_host": {{"name": "none", "ip": "127.0.0.1"}},
+           "hosts": hosts}}, open(inv, "w"))
+PY
+B() {{ s="$1"; shift; bash {BRINGUP} "$s" --inventory {env.inv} --state {env.state} "$@"; }}
+for i in $(seq 1 {n}); do printf %s {R1006_TEST} >"{env.tmp}/h$i/fake-block0"; done
+B keys || exit 10
+B genesis-fill --fill-cmd "{env.fill_cmd(R1006_TEST)}" || exit 11
+B distribute || exit 12
+{sets}
+B start --mining on --min-peers 0 --skip-producing-gate --gate-minutes 1
+rc=$?
+B stop >/dev/null 2>&1
+exit $rc
+""")
+        r = subprocess.run(["unshare", "--user", "--map-root-user", "--net", "--mount", "--pid", "--fork",
+                            "--mount-proc", "sh", "-c", f"bash {inner}"],
+                           capture_output=True, text=True, env=env.env, timeout=600, stdin=subprocess.DEVNULL)
+        return env, r
+
+    @staticmethod
+    def starts(env: Env, i: int) -> list[tuple[bool, str, float]]:
+        p = env.host_root(i) / "fake-node.log"
+        out = []
+        for line in (p.read_text().splitlines() if p.exists() else []):
+            m = re.match(r"start mining=(true|false) block0=(\S+) t=([0-9.]+) probe=(\d)", line)
+            if m and m.group(4) == "0":
+                out.append((m.group(1) == "true", m.group(2), float(m.group(3))))
+        return out
+
+    def test_mining_is_enabled_only_after_every_host_shows_the_r1006_block0(self):
+        env, r = self._fleet(3, {})
+        try:
+            self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
+            for i in (1, 2, 3):
+                self.assertTrue(self.starts(env, i), f"p{i} was started")
+                self.assertFalse(self.starts(env, i)[0][0], f"p{i}: the first start must have mining off")
+            mining_on = [t for i in (1, 2, 3) for (m, _, t) in self.starts(env, i) if m]
+            verified_starts = [max(t for (m, _, t) in self.starts(env, i) if not m) for i in (1, 2, 3)]
+            self.assertEqual(len(mining_on), 3, "each host restarted once with mining on")
+            self.assertGreater(min(mining_on), max(verified_starts),
+                               "a host mined before every host's block 0 was verified")
+        finally:
+            env.close()
+
+    def test_mining_is_never_enabled_when_a_host_shows_r1005s_block0(self):
+        env, r = self._fleet(3, {2: R1005})
+        try:
+            self.assertNotEqual(r.returncode, 0, r.stdout[-3000:])
+            self.assertNotIn(r.returncode, (10, 11, 12), "keys/genesis-fill/distribute must pass: " + r.stdout[-3000:])
+            self.assertTrue(self.starts(env, 1), "p1 was started (the gate ran)")
+            for i in (1, 2, 3):
+                self.assertFalse(any(m for (m, _, _) in self.starts(env, i)),
+                                 f"p{i} was started with mining on: {self.starts(env, i)}")
+        finally:
+            env.close()
 
 
 class AgentTest(unittest.TestCase):

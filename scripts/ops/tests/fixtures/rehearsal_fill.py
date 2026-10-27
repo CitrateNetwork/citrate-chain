@@ -6,7 +6,8 @@ r1006 genesis. Until it lands, the local dry run of r1006_bringup.sh uses this s
 so every later step can run. It does NOT put the validators in the genesis: it selects
 the compiled `default` devnet genesis profile, measures that genesis's block 0 with the
 real binary in an isolated network namespace, and writes a fill-result.json whose
-`source` says so. The validator list echoes the producer set so the bring-up's
+`source` says so. With --genesis-hash it skips the probe and writes that hash with
+--profile (default r1006): the unit tests use it to plant a fill. The validator list echoes the producer set so the bring-up's
 consistency check has something to compare; the genesis does not contain it.
 
   rehearsal_fill.py --producers P --stakes S --out DIR --bin CITRATE_BINARY
@@ -95,18 +96,24 @@ def main() -> int:
     ap.add_argument("--producers", required=True, type=Path)
     ap.add_argument("--stakes", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
-    ap.add_argument("--bin", required=True)
+    ap.add_argument("--bin")
+    ap.add_argument("--genesis-hash", help="write this block 0 instead of probing (tests)")
+    ap.add_argument("--profile", default="r1006", help="genesis_profile to write (tests; 'null' = None)")
+    ap.add_argument("--genesis-file", help="genesis_file to write (tests)")
     a = ap.parse_args()
+    if not a.genesis_hash and not a.bin:
+        ap.error("--bin or --genesis-hash")
     prod = json.loads(a.producers.read_text())
     stakes = json.loads(a.stakes.read_text())["stakes"]
-    gh = probe_block0(a.bin)
+    gh = a.genesis_hash or probe_block0(a.bin)
+    profile = None if a.profile == "null" else a.profile
     a.out.mkdir(parents=True, exist_ok=True)
     (a.out / "alloc.json").write_text(json.dumps({"alloc": {ARACHNID: {"code": ARACHNID_CODE}}}, indent=2))
     fill = {
         "schema": "r1006-genesis-fill/1",
         "genesis_hash": gh,
-        "genesis_profile": "default",
-        "genesis_file": None,
+        "genesis_profile": profile if a.genesis_hash else "default",
+        "genesis_file": a.genesis_file,
         "alloc_file": "alloc.json",
         "address_book": None,
         "orangeseed": None,
