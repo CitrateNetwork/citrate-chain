@@ -1,0 +1,52 @@
+# Reviewed exceptions for the scripts/ci/*_tripwire.sh scans that read this file
+# (format and matching rules: scripts/ci/lib/tripwire_common.sh).
+#
+#   <tripwire-id> | <path or glob> | <key> | <ref> | <reason>
+#
+# Every entry names the board item / PR that removes it. An entry that stops matching is
+# reported as stale: delete it in the PR that fixes the code.
+
+# ── forge-chainid-profile: legacy deploy scripts branch on forge's simulated chain id ─────────
+# The shared node check (GenesisProfile._resolveChainProfile) arrives with chain#320. These
+# scripts predate it; each must adopt it or be retired with the legacy address book.
+forge-chainid-profile | contracts/script/LegacyDeployGuard.sol | block.chainid | board:QA-T, chain#320 | the shared "not on 40204" refusal for legacy scripts is itself a bare block.chainid test; it needs the node chain-id check once GenesisProfile lands
+forge-chainid-profile | contracts/script/DeployAll.s.sol | block.chainid | board:QA-T, chain#320 | legacy full deploy; 40204-only branch picks an address, adopt GenesisProfile or retire with the legacy book
+forge-chainid-profile | contracts/script/DeployComplianceRegistry.s.sol | block.chainid | board:QA-T, chain#320 | dev-seed refusal on 40204 is a bare block.chainid test; adopt GenesisProfile or retire
+forge-chainid-profile | contracts/script/DeployCoreMembership.s.sol | block.chainid | board:QA-T, chain#320 | "only on 40204" guard is a bare block.chainid test; Track M genesis path replaces it (chain#331)
+forge-chainid-profile | contracts/script/DeployDpf08Refresh.s.sol | block.chainid | board:QA-T, chain#320 | "never on 40204" guard is a bare block.chainid test; adopt GenesisProfile or retire
+forge-chainid-profile | contracts/script/DeployDpf09AppsContracts.s.sol | block.chainid | board:QA-T, chain#320 | 40204-only envelope requirement keyed on block.chainid; adopt GenesisProfile or retire
+forge-chainid-profile | contracts/script/DeployFederatedLearning.s.sol | block.chainid | board:QA-T, chain#320 | 40204-only branch; the genesis FL ledgers ship through the C4 set (board:FL dormant ledgers)
+forge-chainid-profile | contracts/script/DeployHupRegistries.s.sol | block.chainid | board:QA-T, chain#320 | `live` flag keyed on block.chainid; adopt GenesisProfile or retire
+forge-chainid-profile | contracts/script/DeployValidatorRegistry.s.sol | block.chainid | board:QA-T, chain#320 | 40204 guard keyed on block.chainid; adopt GenesisProfile or retire
+forge-chainid-profile | contracts/script/ProvisionWithMultisig.s.sol | block.chainid | board:QA-T, chain#320 | 40204-only envelope requirement keyed on block.chainid; adopt GenesisProfile or retire
+forge-chainid-profile | contracts/script/ScriptEnv.sol | block.chainid | board:QA-T, chain#320 | governance != deployer requirement keyed on block.chainid; shared by legacy scripts, adopt GenesisProfile
+forge-chainid-profile | contracts/script/WireDpfOperators.s.sol | block.chainid | board:QA-T, chain#320 | 40204-only envelope requirement keyed on block.chainid; adopt GenesisProfile or retire
+forge-chainid-profile | contracts/script/aa/DeployAA.s.sol | block.chainid | board:QA-T, chain#320 | dev P256 verifier only on the anvil chain id; a mis-set --chain-id could install the dev verifier, adopt the node check
+forge-chainid-profile | contracts/script/aa/RotateFactoryPaymaster.s.sol | block.chainid | board:QA-T, chain#320 | "only on 40204" guard is a bare block.chainid test; adopt GenesisProfile or retire
+
+# ── rpc-historical-state: reads that ask for state at a past block ───────────────────────────
+rpc-historical-state | crates/citrate-fork/** | * | board:QA-T | the dry-run fork pins every read to one block by design; a Citrate node answers with latest state, so the tool must verify head == pinned block (or state latest-only) before this entry goes
+rpc-historical-state | tools/citrate-bench/src/rpc.rs | * | board:QA-T | get_balance / get_transaction_count take a tag parameter; every caller passes "latest" (main.rs, runner.rs). Drop the parameter when the bench is next touched
+rpc-historical-state | scripts/ci/srp_coldsync_gate.sh | eth_get | board:QA-T | balance/storage rows compare producer and follower "at H" while the producer keeps mining; both answer latest, so those rows can compare different heads. The stateRoot row (block lookup by number) is the authoritative check; stop the producer before the balance rows
+
+# ── rpc-finality-height-index: finalized/safe and log ranges through the height index ────────
+rpc-finality-height-index | core/api/src/eth_rpc.rs | [eth_getBlockByNumber] | chain#328 (board:C3-L) | finalized/safe resolve to a height, then the height index; chain#328 resolves them by certified hash
+rpc-finality-height-index | core/api/src/eth_rpc.rs | [eth_getBlockTransactionCountByNumber] | chain#328 (board:C3-L) | same finalized/safe-by-height lookup; fixed by chain#328
+rpc-finality-height-index | core/api/src/eth_rpc.rs | [eth_getTransactionByBlockNumberAndIndex] | chain#328 (board:C3-L) | same finalized/safe-by-height lookup; fixed by chain#328
+rpc-finality-height-index | core/api/src/eth_rpc.rs | [eth_getLogs] | chain#334 (board:C1-L), chain#328 | the log range walks the height index (one block per height); chain#334 walks every executed block and chain#328 follows the certified chain for finalized/safe
+rpc-finality-height-index | core/api/src/eth_rpc.rs | [eth_getFilterChanges] | board:C1-L | filter ranges share the getLogs height walk and are not changed by chain#328 or chain#334; follow-up needed
+rpc-finality-height-index | core/api/src/eth_rpc.rs | [eth_getFilterLogs] | board:C1-L | filter ranges share the getLogs height walk and are not changed by chain#328 or chain#334; follow-up needed
+rpc-finality-height-index | core/api/src/eth_rpc.rs | [eth_feeHistory] | board:C3-L | newestBlock=finalized resolves through the height index (fee data only); still present after chain#328, follow-up needed
+
+# ── shell-pipefail ────────────────────────────────────────────────────────────────────────────
+shell-pipefail | scripts/ops/watchdog/citrate-height-watchdog.sh | * | chain#330 (board:C3-P) | the watchdog is being rewritten with a test suite in chain#330; add pipefail there rather than conflict with it. Its pipelines only feed sed/grep extraction under set -u
+
+# ── tla-frame: actions that prime a variable a sibling conjunct keeps UNCHANGED ──────────────
+# Found on main when the tripwire landed; reported to the owner, spec fix tracked separately.
+tla-frame | specs/tla/gui/OnboardingFlow.tla | [ChooseHomeUser] | board:QA-T (owner report 2026-10-19) | persona' is set beside UNCHANGED persona, so the persona choice never fires (guard persona = "none"); fix the frame in the spec, then re-run TLC
+tla-frame | specs/tla/gui/OnboardingFlow.tla | [ChooseTeacher] | board:QA-T (owner report 2026-10-19) | same frame clash as ChooseHomeUser; fix together
+tla-frame | specs/tla/gui/OnboardingFlow.tla | [ChooseDeveloper] | board:QA-T (owner report 2026-10-19) | same frame clash as ChooseHomeUser; fix together
+
+# ── wallet-gate-signing: raw ECDSA signing outside the wallet crates ──────────────────────────
+wallet-gate-signing | faucet/src/main.rs | .sign_prehash_recoverable(&sighash) | board:QA-T | sign_drip_tx hand-rolls the EIP-155 legacy encoding (it strips leading zeros from r/s correctly); move it onto citrate_wallet_core::sign_eip155_legacy_tx with a vector test in a faucet PR rather than change the live faucet here
+wallet-gate-signing | tools/citrate-bench/src/tx/legacy.rs | .sign_prehash_recoverable(&hash) | board:QA-T | load-test signer for devnet/throwaway keys, kept byte-identical to tests/load bench_signed.rs for drift cross-checks; switch both to wallet-core together

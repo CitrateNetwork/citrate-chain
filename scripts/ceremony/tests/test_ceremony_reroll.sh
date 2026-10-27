@@ -33,6 +33,13 @@
 # ============================================================================
 set -euo pipefail
 
+# Sandbox: the script under test must never see the real HOME. Every other write goes to the
+# per-test mktemp workspaces through CITRATE_REPO_ROOT / CEREMONY_DATA_DIR.
+SANDBOX="$(mktemp -d)"
+trap 'rm -rf "${SANDBOX:?}"' EXIT
+export HOME="$SANDBOX/home"
+mkdir -p "$HOME"
+
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 REROLL_SCRIPT="$SCRIPT_DIR/../ceremony-reroll.sh"
 
@@ -86,7 +93,7 @@ else
 fi
 check "data dir untouched" file_contains "$t1_root/.citrate-testnet-beta/marker" "OLDSTATE"
 check "broadcast untouched" file_contains "$t1_root/contracts/broadcast/run-latest.json" "stale-deploy"
-rm -rf "$t1_root"
+rm -rf "${t1_root:?}"
 echo
 
 # ---- Test 2: real-mode gate ----
@@ -103,7 +110,7 @@ else
 fi
 check "data dir untouched (real-mode guard)" \
     file_contains "$t2_root/.citrate-testnet-beta/marker" "OLDSTATE"
-rm -rf "$t2_root"
+rm -rf "${t2_root:?}"
 echo
 
 # ---- Test 3: archive + recreate empty + clear forge dirs ----
@@ -135,7 +142,7 @@ check "cache dir cleared" path_missing "$t3_root/contracts/cache"
 # Recovery roundtrip: the archive should contain the original marker.
 check "archive preserved old marker" \
     file_contains "$archive_dir_probe/marker" "$old_marker_content"
-rm -rf "$t3_root" /tmp/reroll-t3.out
+rm -rf "${t3_root:?}" /tmp/reroll-t3.out
 echo
 
 # ---- Test 4: listener stop ----
@@ -181,7 +188,7 @@ else
     fi
     check "listener received SIGTERM" grep -q "got SIGTERM" "$t4_root/listener.log"
 fi
-rm -rf "$t4_root" /tmp/reroll-t4.out
+rm -rf "${t4_root:?}" /tmp/reroll-t4.out
 echo
 
 # ---- Test 5: repo-root guard — refuses non-workspace dirs ----
@@ -198,7 +205,7 @@ else
     check "exit code is 1 (got $rc)" [ "$rc" = "1" ]
 fi
 check "data dir untouched (workspace guard)" [ -d "$t5_root/.citrate-testnet-beta" ]
-rm -rf "$t5_root"
+rm -rf "${t5_root:?}"
 echo
 
 # ---- Summary ----

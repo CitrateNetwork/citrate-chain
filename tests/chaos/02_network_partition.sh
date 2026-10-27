@@ -22,7 +22,7 @@ cleanup() {
       wait "$pid" 2>/dev/null || true
     fi
   done
-  rm -rf "$DATA_DIR_1" "$DATA_DIR_2"
+  rm -rf "${DATA_DIR_1:?}" "${DATA_DIR_2:?}"
 }
 trap cleanup EXIT
 

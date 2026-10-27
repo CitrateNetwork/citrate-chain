@@ -145,6 +145,11 @@ fi
 # we have already been burned by. They run in --fast too: a wedge-the-chain
 # regression is exactly what you want caught before push, and they cost ~0s.
 # Append-only — never delete a tripwire "to make room"; add the new one here.
+# The 2026-10-19 set (forge script chain id / address(this), historical state reads, finality
+# tags via the height index, finalization publish order, shell rm/pipefail, synthetic-pid
+# signals, TLA+ frame clashes, installer tests without a sandboxed HOME, signing outside the
+# wallet crates) shares scripts/ci/tripwire-allowlist.txt for reviewed exceptions; CI runs the
+# same list in .github/workflows/tripwires.yml.
 consensus_tripwires() {
   local rc=0 t
   for t in \
@@ -153,6 +158,15 @@ consensus_tripwires() {
     "scripts/ci/panic_invariant_tripwire.sh" \
     "scripts/ci/double_lock_tripwire.sh" \
     "scripts/ci/prod_assert_ratchet.sh" \
+    "scripts/ci/forge_script_tripwire.sh" \
+    "scripts/ci/historical_state_read_tripwire.sh" \
+    "scripts/ci/rpc_height_index_tripwire.sh" \
+    "scripts/ci/finalization_publish_order_tripwire.sh" \
+    "scripts/ci/shell_safety_tripwire.sh" \
+    "scripts/ci/synthetic_pid_signal_tripwire.sh" \
+    "scripts/ci/tla_frame_tripwire.sh" \
+    "scripts/ci/installer_test_sandbox_tripwire.sh" \
+    "scripts/ci/wallet_gate_signing_tripwire.sh" \
   ; do
     if [ ! -x "$t" ]; then
       echo "missing/!executable tripwire: $t"; rc=1; continue
