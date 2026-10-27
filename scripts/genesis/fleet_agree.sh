@@ -62,18 +62,23 @@ if [[ $DRY -eq 1 ]]; then
   for r in "${RPCS[@]}"; do
     describe_cmd "$CAST" chain-id --rpc-url "$r"
     describe_cmd "$CAST" block 0 --field hash --rpc-url "$r"
-    describe_cmd "$CAST" block-number --rpc-url "$r"
+    describe_cmd "$CAST" block latest --field hash --rpc-url "$r"
   done
   log "then: walk parentHash from $CAST block latest to <min head - $LAG> on every endpoint, compared"
   exit 0
 fi
 
 fail=0
-declare -A HEAD G0
+declare -A HEAD G0 TIPH
 for r in "${RPCS[@]}"; do
   cid=$("$CAST" chain-id --rpc-url "$r" 2>/dev/null) || cid=""
   g0=$("$CAST" block 0 --field hash --rpc-url "$r" 2>/dev/null) || g0=""
-  h=$("$CAST" block-number --rpc-url "$r" 2>/dev/null) || h=""
+  # The head is pinned here, as a block (hash, and the number read for that hash): the walk
+  # below starts from it, so its length is bounded by the spread + LAG however long the run
+  # takes. A walk from a later `latest` grows with every endpoint checked before it.
+  tip=$("$CAST" block latest --field hash --rpc-url "$r" 2>/dev/null) || tip=""
+  h=""
+  [[ -n "$tip" ]] && { h=$("$CAST" block "$tip" --field number --rpc-url "$r" 2>/dev/null) || h=""; }
   if [[ -z "$cid" || -z "$g0" || ! "$h" =~ ^[0-9]+$ ]]; then
     log "FAIL  $r unreachable or incomplete answer"
     fail=1
@@ -81,6 +86,7 @@ for r in "${RPCS[@]}"; do
   fi
   g0=$(lower "$g0")
   HEAD[$r]=$h
+  TIPH[$r]=$tip
   G0[$r]=$g0
   log "      $r chain=$cid head=$h genesis=$g0"
   if [[ "$cid" != "$EXPECTED_CHAIN_ID" ]]; then
@@ -122,13 +128,11 @@ if ((max - min > MAX_SPREAD)); then
   fail=1
 fi
 H=$((min > LAG ? min - LAG : 0))
-# canonical_at URL H: the hash at height H on URL's canonical chain, by walking parentHash
-# from its latest block (bounded by MAX_SPREAD + LAG steps). Empty on any failed read.
+# canonical_at URL H: the hash at height H on URL's chain, by walking parentHash down from
+# the head pinned for URL above (at most MAX_SPREAD + LAG steps). Empty on any failed read.
 canonical_at() {
-  local r="$1" want="$2" b n steps=0
-  b=$("$CAST" block latest --field hash --rpc-url "$r" 2>/dev/null) || return 0
-  n=$("$CAST" block "$b" --field number --rpc-url "$r" 2>/dev/null) || return 0
-  [[ "$n" =~ ^[0-9]+$ ]] || return 0
+  local r="$1" want="$2" b="${TIPH[$1]}" n="${HEAD[$1]}" steps=0
+  [[ -n "$b" && "$n" =~ ^[0-9]+$ ]] || return 0
   while ((n > want)); do
     ((steps++ > MAX_SPREAD + LAG + 64)) && return 0
     b=$("$CAST" block "$b" --field parentHash --rpc-url "$r" 2>/dev/null) || return 0
