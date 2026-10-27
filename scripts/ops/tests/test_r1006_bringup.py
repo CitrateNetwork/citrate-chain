@@ -84,7 +84,7 @@ class Env:
         (self.state / "build.json").write_text(json.dumps({"sha": "0" * 40, "sha256": s256, "fingerprint": "0x",
                                                            "arch": "test", "built_on": "test", "from_main": False,
                                                            "r1006_genesis": R1006_TEST}))
-        self.env = dict(os.environ, HOME=str(self.tmp), CANARY="CANARY-7f3a9c")
+        self.env = dict(os.environ, HOME=str(self.tmp), TMPDIR=str(self.tmp), CANARY="CANARY-7f3a9c")
 
     def run(self, *args: str, env: dict | None = None, agent: Path | None = None,
             state: bool = True) -> subprocess.CompletedProcess:
@@ -270,7 +270,8 @@ class KeysStepReadsOnlyPublicOutputs(unittest.TestCase):
         try:
             r = env.run("keys", env={"FAKE_PUB_EXTRA": '"note": "x"'})
             self.assertNotEqual(r.returncode, 0)
-            self.assertIn("unexpected field", r.stderr)
+            # refused on the host already (strict re-serialisation), else by the collector
+            self.assertRegex(r.stderr, "unexpected field|not exactly a public host identity")
             self.assertFalse((env.state / "r1006-producers.json").exists())
         finally:
             env.close()
@@ -284,10 +285,12 @@ class KeysStepReadsOnlyPublicOutputs(unittest.TestCase):
                 continue
             for name in ("noise.key", "proposer.key", "keystore", "password", "KEYSTORE", "PASSWORD"):
                 self.assertNotIn(name, line, f"r1006_bringup.sh:{n} moves/reads data and names {name}")
-        # The agent's pub command reads exactly one file: the public identity.
+        # The agent's pub command reads exactly one file, the public identity, and prints
+        # only its re-serialised checked fields.
         agent = AGENT.read_text()
         body = re.search(r"cmd_pub\(\) \{(.*?)\n\}", agent, re.S).group(1)
-        self.assertEqual(re.findall(r"\bcat\b[^\n]*", body), ['cat -- "$PUB"'])
+        self.assertEqual(re.findall(r"\bcat\b[^\n]*", body), [])
+        self.assertEqual(sorted(set(re.findall(r"\$\{?([A-Z_]+)", body))), ["PUB", "PUB_CHECK"])
         self.assertIn('PUB="$RDIR/identity.pub.json"', agent)
 
 
@@ -629,7 +632,7 @@ class GenesisRefusal(unittest.TestCase):
                 with self.subTest(label):
                     r = env.run("genesis-fill", "--fill-cmd", cmd)
                     self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
-                    self.assertIn("REFUSED", r.stdout + r.stderr)
+                    self.assertRegex(r.stdout + r.stderr, r"REFUSED|FAIL ")
                     self.assertFalse((env.state / "genesis" / "fill-result.json").exists(),
                                      "a refused fill must not be kept for distribute")
             r = env.run("genesis-fill", "--fill-cmd", env.fill_cmd(R1006_TEST))

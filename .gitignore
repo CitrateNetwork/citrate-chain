@@ -124,3 +124,6 @@ handoffs/
 # closure-scoped frozen-projection profile (contracts/foundry.toml [profile.membership])
 contracts/out-membership/
 contracts/cache-membership/
+
+# r1006 bring-up state (public data only; default ~/r1006-state, never in a checkout)
+r1006-state/

@@ -82,7 +82,9 @@ run_step() {
   t0=$(date +%s%N)
   echo "===== $step $* =====" | tee -a "$LOG"
   set +e
-  bash "$BRINGUP" "$step" --inventory "$INV" --state "$WORK/state" "$@" 2>&1 | tee -a "$LOG"
+  # The rehearsal r1006 genesis is not release-ready; the nodes need the explicit opt-in.
+  R1006_NODE_ENV_PASSTHRU="CITRATE_R1006_REHEARSAL=1" \
+    bash "$BRINGUP" "$step" --inventory "$INV" --state "$WORK/state" "$@" 2>&1 | tee -a "$LOG"
   rc=${PIPESTATUS[0]}
   set -e
   local ms=$((($(date +%s%N) - t0) / 1000000))
@@ -94,8 +96,8 @@ for s in $STEPS; do
   case "$s" in
     genesis-fill)
       run_step genesis-fill --fill-cmd "python3 $FILL --producers {producers} --stakes {stakes} --out {out} --bin $WORK/state/bin/citrate-node" ;;
-    distribute) run_step distribute --mining on ;;
-    start) run_step start --gate-minutes "$GATE" ;;
+    distribute) run_step distribute ;;
+    start) run_step start --mining on --gate-minutes "$GATE" ;;
     smoke) run_step smoke --skip "$SKIP" ;;
     wipe-keys-refused) run_step wipe --wipe-keys ;;
     *) run_step "$s" ;;

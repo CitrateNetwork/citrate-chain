@@ -7,34 +7,51 @@
 #   $R1006_ROOT/etc/citrate                 node.toml, citrate-node.env, citrate-node.service
 #   $R1006_ROOT/etc/citrate/r1006           (0700, citrate) staker keystore + password,
 #                                           identity.pub.json (the ONLY file read back),
-#                                           genesis.json when the genesis is a file, DEPLOYED
+#                                           keytool.log (0600), DEPLOYED, PROBED
 #   $R1006_ROOT/var/lib/citrate/data        (0700, citrate) noise.key, proposer.key, chain db
 #   $R1006_ROOT/usr/local/bin/citrate-node  the release binary
 #   $R1006_ROOT/usr/local/lib/citrate-r1006 keytool, incoming/, tools/ (gen_node_config.py), profile.json
 # R1006_ROOT is empty on a real host. The local devnet rehearsal sets it to a per-host dir.
 #
+# Output containment: every command runs with stdout and stderr held on the host. They
+# are released only if neither contains this host's own key material (the bytes of
+# noise.key, proposer.key, the staker keystore or its password, raw, hex or base64);
+# otherwise both are dropped and the command exits 3. Hashes are shortened on stderr.
+#
+# Genesis: a release network's block 0 (r1005 testnet, team testnet, mainnet; mirror of
+# core/consensus/src/hardening.rs RELEASE_GENESIS) is refused by write-config,
+# probe-genesis, start and enable-mining, and the profile must select the compiled
+# `r1006` genesis.
+#
 # Commands
 #   keys SHA256                mint the host identity (if missing) with the staged keytool
-#                              as the citrate user; prints nothing secret; then `pub`
-#   pub                        cat identity.pub.json, and nothing else
+#                              as the citrate user (its stderr goes to a 0600 log on the
+#                              host, never over ssh); then `pub`
+#   pub                        the public identity, re-serialised from the checked fields
+#                              of identity.pub.json (anything else in the file is refused)
 #   install-bin SHA256         incoming/citrate-node -> /usr/local/bin/citrate-node (hash-checked)
-#   install-genesis SHA256     incoming/genesis.json -> etc/citrate/r1006/genesis.json (hash-checked)
 #   write-config STAKER MINING gen_node_config.py with the staged per-host profile
-#   start | stop | status      the node service (systemd, or a plain process when R1006_SERVICE=proc)
+#   start HASH                 start the node with mining OFF; HASH must be the block 0
+#                              probe-genesis recorded for the installed binary + config
+#   enable-mining HASH         the running node's own block 0 (local RPC) must be HASH;
+#                              then the config is regenerated with mining on and the node
+#                              restarted
+#   stop | status              the node service (systemd, or a plain process when R1006_SERVICE=proc)
 #   logs-scan SINCE_EPOCH      count CONFLICT / fork lines in the node log since a unix time
 #   wipe [--wipe-keys]         stopped node only: delete the r1006 chain data, keep the keys
 #                              (with --wipe-keys, the keys and keystore too)
 #   sha FILE                   sha256 of a staged file (for the orchestrator's checks)
 #   probe-genesis HASH         start the installed binary + config in an ISOLATED network
 #                              namespace (loopback only), with a throwaway data dir and
-#                              mining off; read block 0; compare; delete the throwaway dir
+#                              mining off; read block 0; compare; delete the throwaway dir;
+#                              on a match record HASH in etc/citrate/r1006/PROBED
 #   tcp-check IP PORT          can this host open a TCP connection to IP:PORT
 #   config-check               the node's config must configure no contribution recorder
 #                              (a configured one sends a heartbeat transaction to the zero
 #                              address every 100 blocks); prints the offending lines
 #
 # Env: R1006_ROOT ("") · R1006_SERVICE (systemd|proc) · R1006_RUN_AS (citrate; "" = no switch)
-#      R1006_NODE_ENV_PASSTHRU (proc mode only)
+#      R1006_NODE_ENV_PASSTHRU (proc mode only) · R1006_NODE_RPC (http://127.0.0.1:8545)
 set -euo pipefail
 
 ROOT="${R1006_ROOT:-}"
@@ -49,6 +66,12 @@ PUB="$RDIR/identity.pub.json"
 KEYSTORE="$RDIR/staker.keystore.json"
 PASSWORD="$RDIR/staker.password"
 MARKER="$RDIR/DEPLOYED"
+PROBED="$RDIR/PROBED"
+KEYTOOL_LOG="$RDIR/keytool.log"
+NODE_RPC="${R1006_NODE_RPC:-http://127.0.0.1:8545}"
+R1006_PROFILE=r1006
+# Mirror of core/consensus/src/hardening.rs RELEASE_GENESIS (a test keeps them equal).
+RELEASE_GENESIS_HASHES=(0x1dcfc4909dd9fdcb0f03c823d627e4b2032cc86bef5fc4561030d6c64b9775f1 0x90044175c36a6491309d769bd0fa684afbf7b90b64136446db8e2e6ff0927553 0xba93d716ab8b005f1d7e61d369a65fc1d6a358d6a479e11b640815c74388ab01)
 LOGFILE="$ROOT/var/log/citrate-node.log"
 PIDFILE="$ROOT/run/citrate-node.pid"
 # The only files `wipe` (without --wipe-keys) keeps in the data dir.
@@ -56,6 +79,68 @@ KEEP_IN_DATA=(noise.key proposer.key)
 
 die() { echo "host_agent: $*" >&2; exit 2; }
 say() { echo "$*"; }
+short() { local v="${1:-}"; if ((${#v} > 18)); then printf '%s…' "${v:0:14}"; else printf '%s' "$v"; fi; }
+
+# need_r1006_hash HASH: a 32-byte block hash that is not a release network's genesis.
+need_r1006_hash() {
+  local h="${1,,}"
+  [[ "$h" =~ ^0x[0-9a-f]{64}$ ]] || die "expected a block-0 hash (0x + 64 hex), got '$(short "${1:-}")'"
+  local r
+  for r in "${RELEASE_GENESIS_HASHES[@]}"; do
+    [[ "$h" == "$r" ]] && die "block 0 $(short "$h") is a release network's genesis (r1005 testnet, team testnet or mainnet); refusing"
+  done
+  return 0
+}
+
+# The strict public-identity check, run on the host: exactly the public fields, each in
+# its public form, re-serialised. Nothing else in the file is ever printed.
+PUB_CHECK='
+import json, re, sys
+F = {"schema": r"^citrate-host-identity/1$", "peer_id": r"^noise_[0-9a-f]{64}$",
+     "noise_pubkey": r"^[0-9a-f]{64}$", "proposer_pubkey": r"^0x[0-9a-f]{64}$",
+     "vrf_pubkey": r"^0x0[23][0-9a-f]{64}$", "staker_address": r"^0x[0-9a-f]{40}$",
+     "coinbase_address": r"^0x[0-9a-f]{40}$"}
+try:
+    d = json.load(open(sys.argv[1]))
+    ok = isinstance(d, dict) and set(d) == set(F) and all(
+        isinstance(d[k], str) and re.match(rx, d[k]) for k, rx in F.items())
+except Exception:
+    ok = False
+if not ok:
+    sys.exit("host_agent: identity.pub.json is not exactly a public host identity; nothing sent")
+print(json.dumps({k: d[k] for k in F}, indent=2))
+'
+
+# withhold_secrets OUT_FILE ERR_FILE: fail when either holds this host key material.
+withhold_secrets() {
+  python3 - "$1" "$2" "$DATA/noise.key" "$DATA/proposer.key" "$KEYSTORE" "$PASSWORD" <<'PY'
+import base64, json, sys
+out, err, *secrets = sys.argv[1:]
+needles = set()
+def add(b):
+    if len(b) >= 8:
+        needles.update({b, b.hex().encode(), b.hex().upper().encode(), base64.b64encode(b)})
+for p in secrets:
+    try:
+        raw = open(p, "rb").read()
+    except OSError:
+        continue
+    add(raw)
+    add(raw.strip())
+    try:
+        ks = json.loads(raw)
+        c = ks.get("crypto") or ks.get("Crypto") or {}
+        for v in (c.get("ciphertext"), c.get("mac"), (c.get("kdfparams") or {}).get("salt"),
+                  (c.get("cipherparams") or {}).get("iv")):
+            if isinstance(v, str) and len(v) >= 16:
+                needles.add(v.encode())
+                needles.add(v.lower().encode())
+    except (ValueError, AttributeError):
+        pass
+data = open(out, "rb").read() + b"\n" + open(err, "rb").read()
+sys.exit(1 if any(n in data for n in needles) else 0)
+PY
+}
 
 as_node_user() {
   if [[ -n "$RUN_AS" ]]; then runuser -u "$RUN_AS" -- "$@"; else "$@"; fi
@@ -69,7 +154,7 @@ own() { # path mode: owned by the node user (when there is one) with this mode
 sha_of() { sha256sum -- "$1" | cut -d' ' -f1; }
 
 need_sha() {
-  [[ "${1:-}" =~ ^[0-9a-f]{64}$ ]] || die "expected a sha256 (64 lowercase hex), got '${1:-}'"
+  [[ "${1:-}" =~ ^[0-9a-f]{64}$ ]] || die "expected a sha256 (64 lowercase hex), got '$(short "${1:-}")'"
 }
 
 ensure_layout() {
@@ -107,16 +192,19 @@ cmd_keys() {
   chmod 0755 "$tool"
   # stdout is the public identity, which `pub` prints next; drop it here so this
   # command's output is exactly one copy of the public file.
+  local rc=0
+  (umask 077; : >>"$KEYTOOL_LOG")
   as_node_user "$tool" host-identity \
     --identity-dir "$DATA" --staker-keystore "$KEYSTORE" --staker-password-file "$PASSWORD" \
-    --mint --out "$PUB" >/dev/null
+    --mint --out "$PUB" >/dev/null 2>>"$KEYTOOL_LOG" || rc=$?
+  [[ $rc -eq 0 ]] || die "keytool failed (rc=$rc); its stderr stays on this host in $KEYTOOL_LOG"
   chmod 0644 "$PUB"
   cmd_pub
 }
 
 cmd_pub() {
   [[ -f "$PUB" ]] || die "no public identity at $PUB (run keys first)"
-  cat -- "$PUB"
+  python3 -c "$PUB_CHECK" "$PUB"
 }
 
 install_staged() { # incoming-name dest sha mode
@@ -126,7 +214,7 @@ install_staged() { # incoming-name dest sha mode
     return 0
   fi
   [[ -f "$src" ]] || die "$src not staged"
-  [[ "$(sha_of "$src")" == "$want" ]] || die "staged $1 sha256 $(sha_of "$src") is not $want"
+  [[ "$(sha_of "$src")" == "$want" ]] || die "staged $1 sha256 $(short "$(sha_of "$src")") is not $(short "$want")"
   local tmp
   tmp=$(mktemp "$(dirname "$dest")/.r1006.new.XXXXXX")
   install -m "$mode" -- "$src" "$tmp"
@@ -143,11 +231,34 @@ cmd_install_bin() {
   install_staged citrate-node "$BIN" "$1" 0755
 }
 
-cmd_install_genesis() {
-  need_sha "${1:-}"
-  ensure_layout
-  install_staged genesis.json "$RDIR/genesis.json" "$1" 0644
-  own "$RDIR/genesis.json" 0644
+# The staged profile must select the compiled r1006 genesis, and not a release network's.
+check_profile() {
+  [[ -f "$LIB/profile.json" && -f "$LIB/tools/gen_node_config.py" ]] || die "profile/tools not staged"
+  local gp gh
+  gp=$(python3 -c 'import json,sys; v=json.load(open(sys.argv[1])).get("genesis_profile"); print("" if v is None else v)' "$LIB/profile.json")
+  gh=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("genesis_hash",""))' "$LIB/profile.json")
+  [[ "$gp" == "$R1006_PROFILE" ]] || die "the profile selects genesis_profile '$gp', not the compiled '$R1006_PROFILE'; refusing"
+  need_r1006_hash "$gh"
+}
+
+gen_config() { # MINING: regenerate node.toml / env / unit for this host's own staker
+  local mine
+  mine=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["staker_address"])' "$PUB")
+  python3 "$LIB/tools/gen_node_config.py" --profile "$LIB/profile.json" --staker "$mine" \
+    --out-dir "$ETC" --data-dir "$DATA" --binary "$BIN" --mining "$1" --force
+}
+
+mining_configured() { python3 - "$ETC/node.toml" <<'PY'
+import re, sys
+sec = ""
+for line in open(sys.argv[1]):
+    m = re.match(r"^\[(\w+)\]", line)
+    if m:
+        sec = m.group(1)
+    if sec == "mining" and line.startswith("enabled ="):
+        sys.exit(0 if line.split("=", 1)[1].strip() == "true" else 1)
+sys.exit(1)
+PY
 }
 
 cmd_write_config() {
@@ -155,13 +266,13 @@ cmd_write_config() {
   [[ "$staker" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "write-config needs the staker address"
   [[ "$mining" == on || "$mining" == off ]] || die "write-config needs mining on|off"
   ensure_layout
-  [[ -f "$LIB/profile.json" && -f "$LIB/tools/gen_node_config.py" ]] || die "profile/tools not staged"
+  check_profile
   # The staker in the config must be this host's own minted staker.
   local mine
   mine=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["staker_address"])' "$PUB")
   [[ "${mine,,}" == "${staker,,}" ]] || die "staker $staker is not this host's ($mine)"
-  python3 "$LIB/tools/gen_node_config.py" --profile "$LIB/profile.json" --staker "$staker" \
-    --out-dir "$ETC" --data-dir "$DATA" --binary "$BIN" --mining "$mining" --force
+  gen_config "$mining"
+  rm -f -- "$PROBED"
   if [[ "$SERVICE" == systemd ]]; then
     if ! cmp -s "$ETC/citrate-node.service" /etc/systemd/system/citrate-node.service; then
       install -m 0644 "$ETC/citrate-node.service" /etc/systemd/system/citrate-node.service
@@ -171,12 +282,7 @@ cmd_write_config() {
   date -u +%Y-%m-%dT%H:%M:%SZ >"$MARKER"
 }
 
-cmd_start() {
-  [[ -f "$MARKER" && -x "$BIN" && -f "$ETC/node.toml" ]] || die "not distributed (no marker, binary or node.toml)"
-  if is_running; then
-    say "already running"
-    return 0
-  fi
+launch() {
   if [[ "$SERVICE" == systemd ]]; then
     systemctl enable --now citrate-node
   else
@@ -192,7 +298,46 @@ cmd_start() {
       echo $! >"$PIDFILE"
     )
   fi
-  say "started"
+}
+
+cmd_start() {
+  local want="${1:-}"
+  need_r1006_hash "$want"
+  [[ -f "$MARKER" && -x "$BIN" && -f "$ETC/node.toml" ]] || die "not distributed (no marker, binary or node.toml)"
+  [[ -f "$PROBED" && "$(cat -- "$PROBED")" == "${want,,}" ]] ||
+    die "block 0 of the installed binary + config was not probed as $(short "$want") (run distribute)"
+  if is_running; then
+    say "already running"
+    return 0
+  fi
+  # Every start begins with mining off; enable-mining turns it on after the block-0 check.
+  if mining_configured; then
+    check_profile
+    gen_config off >/dev/null
+  fi
+  launch
+  say "started (mining off)"
+}
+
+node_block0() {
+  curl -s -m 5 -H 'content-type: application/json' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["0x0",false]}' "$NODE_RPC" |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["hash"].lower())' 2>/dev/null || true
+}
+
+cmd_enable_mining() {
+  local want="${1:-}"
+  need_r1006_hash "$want"
+  check_profile
+  is_running || die "the node is not running; start it first"
+  local got
+  got=$(node_block0)
+  [[ -n "$got" ]] || die "the running node did not answer eth_getBlockByNumber(0) on $NODE_RPC"
+  [[ "$got" == "${want,,}" ]] || die "the running node's block 0 is $(short "$got"), not $(short "$want"); mining stays off"
+  gen_config on >/dev/null
+  cmd_stop >/dev/null
+  launch
+  say "mining enabled (block 0 $(short "$got") verified on this host)"
 }
 
 cmd_stop() {
@@ -311,8 +456,9 @@ cmd_sha() {
 
 cmd_probe_genesis() {
   local want="${1:-}"
-  [[ "$want" =~ ^0x[0-9a-fA-F]{64}$ ]] || die "probe-genesis needs the expected block-0 hash"
+  need_r1006_hash "$want"
   [[ -x "$BIN" && -f "$ETC/node.toml" ]] || die "not distributed"
+  rm -f -- "$PROBED"
   mkdir -p "$ROOT/var/tmp"
   local t
   t=$(mktemp -d "$ROOT/var/tmp/r1006-probe.XXXXXX")
@@ -336,6 +482,10 @@ PY
   while IFS='=' read -r k v; do
     [[ "$k" =~ ^CITRATE_[A-Z0-9_]+$ && "$k" != CITRATE_METRICS ]] && envs+=("$k=$v")
   done <"$ETC/citrate-node.env"
+  if [[ "$SERVICE" == proc ]]; then
+    # shellcheck disable=SC2206
+    envs+=(${R1006_NODE_ENV_PASSTHRU:-})
+  fi
   local runas=""
   [[ -n "$RUN_AS" ]] && runas="runuser -u $RUN_AS --"
   local got
@@ -356,7 +506,8 @@ PY
     printf "%s" "$h"
   ' probe "$t" "$BIN" "${envs[@]}") || true
   if [[ -z "$got" ]]; then
-    tail -5 "$t/probe.log" | sed 's/^/  probe| /' >&2
+    # Diagnostic tail, with every long hex run shortened (stderr carries no full hash).
+    tail -5 "$t/probe.log" | sed -E 's/[0-9a-fA-F]{24,}/<hex>/g; s/^/  probe| /' >&2
   fi
   [[ "$t" == "$ROOT"/var/tmp/r1006-probe.* ]] && rm -rf -- "${t:?}"
   if [[ -z "$got" ]]; then die "probe node never answered"; fi
@@ -364,6 +515,7 @@ PY
     echo "PROBE FAIL block 0 $got, want $want"
     exit 1
   fi
+  printf '%s' "${got,,}" >"$PROBED"
   echo "PROBE OK block 0 $got"
 }
 
@@ -383,15 +535,16 @@ cmd_config_check() {
   echo "config ok: no contribution recorder"
 }
 
+dispatch() {
 c="${1:-}"
 shift || true
 case "$c" in
   keys) cmd_keys "$@" ;;
   pub) cmd_pub ;;
   install-bin) cmd_install_bin "$@" ;;
-  install-genesis) cmd_install_genesis "$@" ;;
   write-config) cmd_write_config "$@" ;;
-  start) cmd_start ;;
+  start) cmd_start "$@" ;;
+  enable-mining) cmd_enable_mining "$@" ;;
   stop) cmd_stop ;;
   status) cmd_status ;;
   logs-scan) cmd_logs_scan "$@" ;;
@@ -402,3 +555,24 @@ case "$c" in
   config-check) cmd_config_check ;;
   *) die "unknown command '$c'" ;;
 esac
+}
+
+# Run the command with both streams held on the host; release them only when they hold
+# none of this host's key material. Otherwise drop both and exit 3.
+held=$(mktemp -d "${TMPDIR:-/tmp}/r1006-agent.XXXXXX")
+chmod 0700 "$held"
+out="$held/out"
+err="$held/err"
+set +e
+(set -e; dispatch "$@") >"$out" 2>"$err"
+rc=$?
+set -e
+if ! withhold_secrets "$out" "$err"; then
+  rm -rf -- "${held:?}"
+  echo "host_agent: output withheld: it contained this host's key material" >&2
+  exit 3
+fi
+cat -- "$out"
+cat -- "$err" >&2
+rm -rf -- "${held:?}"
+exit "$rc"

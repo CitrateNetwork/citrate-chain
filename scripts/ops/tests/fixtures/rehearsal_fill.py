@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """REHEARSAL STAND-IN for the genesis builder's validator-set fill. Test fixture only.
 
-The real fill (a PR stacked on chain#375) writes the producers' validator set into the
-r1006 genesis. Until it lands, the local dry run of r1006_bringup.sh uses this stand-in
-so every later step can run. It does NOT put the validators in the genesis: it selects
-the compiled `default` devnet genesis profile, measures that genesis's block 0 with the
-real binary in an isolated network namespace, and writes a fill-result.json whose
-`source` says so. With --genesis-hash it skips the probe and writes that hash with
---profile (default r1006): the unit tests use it to plant a fill. The validator list echoes the producer set so the bring-up's
-consistency check has something to compare; the genesis does not contain it.
+The real fill (chain#398's scripts/genesis/r1006/fill_producers.py) writes the
+producers' validator set into the r1006 genesis. For the local rehearsal this stand-in
+measures the block 0 that the binary's compiled `r1006` profile builds (with
+CITRATE_R1006_REHEARSAL=1, in an isolated network namespace) and writes a
+fill-result.json selecting that profile. A binary without the r1006 profile refuses it,
+so the stand-in fails closed. The validator list echoes the producer set so the bring-up's
+consistency check has something to compare; this stand-in does not change the genesis.
+With --genesis-hash it skips the probe and writes that hash with --profile (default
+r1006): the unit tests use it to plant a fill.
 
   rehearsal_fill.py --producers P --stakes S --out DIR --bin CITRATE_BINARY
 """
@@ -44,7 +45,7 @@ chain_id = 40204
 genesis_hash = ""
 block_time = 2
 ghostdag_k = 18
-genesis_profile = "default"
+genesis_profile = "r1006"
 
 [network]
 listen_addr = "127.0.0.1:30399"
@@ -82,7 +83,8 @@ done
 kill $p; wait $p 2>/dev/null
 printf '%s' "$h"
 """
-        out = subprocess.run(["unshare", "--net", "bash", "-c", script], capture_output=True, text=True, timeout=120)
+        out = subprocess.run(["unshare", "--net", "bash", "-c", script], capture_output=True, text=True, timeout=120,
+                             env=dict(os.environ, CITRATE_R1006_REHEARSAL="1"))
         h = out.stdout.strip()
         if not h.startswith("0x"):
             sys.exit(f"rehearsal_fill: probe gave no block 0 ({out.stderr.strip()[-300:]}; {(t / 'log').read_text()[-500:] if (t / 'log').exists() else ''})")
@@ -112,7 +114,7 @@ def main() -> int:
     fill = {
         "schema": "r1006-genesis-fill/1",
         "genesis_hash": gh,
-        "genesis_profile": profile if a.genesis_hash else "default",
+        "genesis_profile": profile if a.genesis_hash else "r1006",
         "genesis_file": a.genesis_file,
         "alloc_file": "alloc.json",
         "address_book": None,
@@ -121,11 +123,11 @@ def main() -> int:
         "validator_activation_height": 800,
         "validators": [{"proposer_pubkey": p["proposer_pubkey"], "staker": p["staker_address"],
                         "stake_wei": stakes[p["staker_address"].lower()]["stake_wei"]} for p in prod["producers"]],
-        "source": "REHEARSAL STAND-IN (scripts/ops/tests/fixtures/rehearsal_fill.py): compiled default devnet "
-                  "genesis; the validator set is NOT in this genesis",
+        "source": "REHEARSAL STAND-IN (scripts/ops/tests/fixtures/rehearsal_fill.py): compiled r1006 profile "
+                  "genesis; its validator set is the build's, not these producers'",
     }
     (a.out / "fill-result.json").write_text(json.dumps(fill, indent=2) + "\n")
-    print(f"rehearsal_fill: block 0 {gh} (default profile; validators NOT in genesis)")
+    print(f"rehearsal_fill: block 0 {gh} (profile {fill['genesis_profile']})")
     return 0
 
 

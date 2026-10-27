@@ -6,16 +6,21 @@
 # per-host work is scripts/ops/r1006/host_agent.sh, streamed over ssh as root.
 #
 #   r1006_bringup.sh build        --sha SHA        build citrate-node from origin/main at SHA on the
-#                                                  x86_64 build host (own temp dir); record sha256
+#                                                  x86_64 build host (own temp dir); record sha256 and
+#                                                  the r1006 genesis the binary compiles
 #   r1006_bringup.sh keys                          mint each host's keys ON the host (as citrate);
 #                                                  collect ONLY the public parts -> r1006-producers.json,
 #                                                  and r1006-public-bootnodes.json for the cutover profile
 #   r1006_bringup.sh genesis-fill --fill-cmd CMD   producers + stake allocations -> genesis fill
-#                                                  (genesis hash, profile, registry) -> fill-result.json
-#   r1006_bringup.sh distribute                    binary + genesis to every host, hashes checked;
-#                                                  node.toml per host (bootnodes = the other producers,
-#                                                  RPC on loopback); block 0 probed on every host
-#   r1006_bringup.sh start                         start in inventory order with health gates
+#                                                  (genesis hash, profile, registry) -> fill-result.json,
+#                                                  kept only if it is the build's compiled r1006 genesis
+#   r1006_bringup.sh distribute                    binary to every host, hash checked; node.toml per
+#                                                  host (genesis_profile r1006, mining OFF, bootnodes =
+#                                                  the other producers, RPC on loopback); block 0
+#                                                  probed on every host
+#   r1006_bringup.sh start                         start in inventory order, mining off, with health
+#                                                  gates; then (--mining on) switch mining on, host by
+#                                                  host, only once EVERY host shows the r1006 block 0
 #   r1006_bringup.sh smoke                         FLEET AGREE, chain id, code vs genesis alloc,
 #                                                  OrangeSeed story(), DEPLOYER-ADMIN 0, no CONFLICT/
 #                                                  fork in logs, finality status, no contribution
@@ -26,10 +31,24 @@
 #   r1006_bringup.sh status                        one line per host
 #   r1006_bringup.sh tunnels up|down               loopback tunnels to every host's RPC
 #
+# Hosts: only citrate-prod-1..7 at their pinned IPs (scripts/ops/r1006/guard.py), cross-
+# checked live with `doctl compute droplet list --tag-name citrate-producer` (read-only)
+# before any ssh. `build` may ssh only to the build-only host citrate-core-linux-build,
+# which never runs a node or key action. Anything else is refused before connecting.
+#
+# Genesis: genesis-fill, distribute and start refuse a release network's block 0 (r1005
+# testnet, team testnet, mainnet) and any block 0 that is not the r1006 genesis compiled
+# into the recorded build; a build that compiles none is refused.
+#
+# Host output: every agent call's stdout and stderr are checked on the host and again
+# here, in memory, before anything is printed or written; a key or password pattern fails
+# the step (rc 3) without echoing it. Only checked public identities reach the state dir.
+#
 # Common options
 #   --inventory FILE   hosts (default scripts/ops/r1006/inventory.r1006.json)
-#   --state DIR        local state (default ./r1006-state): build record, binary, public
-#                      identities, r1006-producers.json, genesis, rendered profiles, timings
+#   --state DIR        local state (default ~/r1006-state, 0700; a dir inside a git checkout
+#                      must be gitignored): build record, binary, public identities,
+#                      r1006-producers.json, genesis fill, rendered profiles, timings
 #   --only NAMES       comma-separated subset of hosts (re-run a step on some hosts)
 #   --dry-run          plan only
 #
@@ -40,14 +59,15 @@
 #   genesis-fill: --fill-cmd 'CMD {producers} {stakes} {out}' (the genesis builder's
 #                 validator-set fill; must write {out}/fill-result.json, see
 #                 scripts/ops/r1006/render_profile.py) · --stake-salt N (32000) · --liquid-salt N (100)
-#   distribute:   --mining on|off (on: the validator set is in the genesis)
-#   start:        --gate-minutes N (10) · --min-peers N (hosts-1) · --skip-producing-gate
+#   start:        --mining on|off (on; on: the validator set is in the genesis) · --gate-minutes N (10)
+#                 · --min-peers N (hosts-1) · --skip-producing-gate
 #   smoke:        --skip CHECK[,CHECK] (orangeseed, admins, code, logs) printed as SKIP, never PASS
 #                 · --min-height N (60): wait (up to --gate-minutes) until every head is past N, so
 #                   FLEET AGREE compares a real common block, not block 0
 #   wipe:         --wipe-keys (destroys noise.key, proposer.key and the staker keystore)
 #
 # Env: R1006_SSH_KEY (inventory ssh_key) · CAST, FORGE (cast, forge) · R1006_TUNNEL_BASE (18545)
+#      DOCTL (doctl)
 #
 # Exit: 0 ok · 1 a gate failed · 2 usage or refused
 set -euo pipefail
@@ -56,12 +76,13 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 AGENT="$HERE/r1006/host_agent.sh"
 PY="$HERE/r1006"
+GUARD="$HERE/r1006/guard.py"
 CAST="${CAST:-cast}"
 FORGE="${FORGE:-forge}"
 TUNNEL_BASE="${R1006_TUNNEL_BASE:-18545}"
 
 INVENTORY="$HERE/r1006/inventory.r1006.json"
-STATE="./r1006-state"
+STATE="$HOME/r1006-state"
 DRY=0
 ONLY=""
 SHA=""
@@ -71,6 +92,7 @@ FILL_CMD=""
 STAKE_SALT=32000
 LIQUID_SALT=100
 MINING=on
+MINING_SET=0
 GATE_MIN=10
 MIN_PEERS=""
 SKIP_PRODUCING=0
@@ -99,7 +121,7 @@ while [[ $# -gt 0 ]]; do
     --fill-cmd) FILL_CMD="$2"; shift 2 ;;
     --stake-salt) STAKE_SALT="$2"; shift 2 ;;
     --liquid-salt) LIQUID_SALT="$2"; shift 2 ;;
-    --mining) MINING="$2"; shift 2 ;;
+    --mining) MINING="$2"; MINING_SET=1; shift 2 ;;
     --gate-minutes) GATE_MIN="$2"; shift 2 ;;
     --min-peers) MIN_PEERS="$2"; shift 2 ;;
     --skip-producing-gate) SKIP_PRODUCING=1; shift ;;
@@ -112,8 +134,19 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -f "$INVENTORY" ]] || die "no inventory at $INVENTORY"
-mkdir -p "$STATE"
-STATE="$(cd "$STATE" && pwd)"
+# Names, IPs and the host allowlist, before anything reads a host name.
+python3 "$GUARD" check-inventory --inventory "$INVENTORY" || die "inventory refused (see REFUSED above)"
+
+# The state dir holds public data only, and never inside a checkout unless gitignored.
+STATE="$(realpath -m -- "$STATE")"
+state_anc="$STATE"
+while [[ ! -d "$state_anc" ]]; do state_anc="$(dirname -- "$state_anc")"; done
+if state_top=$(git -C "$state_anc" rev-parse --show-toplevel 2>/dev/null) &&
+  ! git -C "$state_top" check-ignore -q --no-index -- "$STATE/"; then
+  die "--state $STATE is inside the checkout $state_top and not gitignored; use ~/r1006-state or an ignored path"
+fi
+(umask 077; mkdir -p -- "$STATE")
+chmod 0700 -- "$STATE"
 TIMINGS="$STATE/timings.log"
 
 # ---- inventory --------------------------------------------------------------
@@ -135,34 +168,86 @@ if [[ -n "$ONLY" ]]; then
 else
   HOSTS=("${ALL_HOSTS[@]}")
 fi
-host_field() { inv "[h for h in d[\"hosts\"] if h[\"name\"]==\"$1\"][0].get(\"$2\",\"\")"; }
+host_field() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print([h for h in d["hosts"] if h["name"]==sys.argv[2]][0].get(sys.argv[3],""))' "$INVENTORY" "$1" "$2"; }
 host_index() { local i=0; for h in "${ALL_HOSTS[@]}"; do [[ "$h" == "$1" ]] && { echo "$i"; return; }; i=$((i + 1)); done; die "unknown host $1"; }
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 -o StrictHostKeyChecking=accept-new)
 [[ -n "$SSH_KEY" ]] && SSH_OPTS+=(-i "$SSH_KEY")
 
+# ---- host allowlist (compiled into guard.py, not the inventory) ----------------
+declare -A PROD_IP=()
+BUILD_NAME="" BUILD_IP=""
+while read -r n ip role; do
+  case "$role" in
+    producer) PROD_IP[$n]=$ip ;;
+    build) BUILD_NAME=$n; BUILD_IP=$ip ;;
+  esac
+done < <(python3 "$GUARD" hosts)
+[[ ${#PROD_IP[@]} -eq 7 && -n "$BUILD_IP" ]] || die "the pinned host table did not load"
+
+# target_ip HOST: the address a node/key action on HOST may connect to. Only a pinned
+# producer at its pinned IP; the build host and everything else are refused.
+target_ip() {
+  local h="$1" ip
+  ip=$(host_field "$h" ip)
+  if [[ "$TRANSPORT" == ssh ]]; then
+    [[ -n "${PROD_IP[$h]:-}" && "${PROD_IP[$h]}" == "$ip" ]] ||
+      die "REFUSED $h ($ip) is not an approved r1006 producer; not connecting"
+  fi
+  printf '%s' "$ip"
+}
+
+# Live cross-check (read-only doctl) before the first connection of a real ssh run.
+if [[ "$TRANSPORT" == ssh && $DRY -eq 0 ]]; then
+  case "$STEP" in
+    build) [[ -n "$LOCAL_REPO" ]] || python3 "$GUARD" live-check --build || die "build host refused" ;;
+    genesis-fill) ;;
+    *) python3 "$GUARD" live-check --names "$(IFS=,; echo "${HOSTS[*]}")" || die "hosts refused" ;;
+  esac
+fi
+
 # ---- transport ---------------------------------------------------------------
-# agent HOST CMD ARGS...: run host_agent.sh CMD on HOST (as root).
-agent() {
+# agent_cmd HOST CMD ARGS...: the transport command line for host_agent.sh CMD on HOST.
+agent_cmd() {
   local h="$1"
   shift
-  if [[ $DRY -eq 1 ]]; then
-    echo "  [dry-run] $h: host_agent.sh $*"
-    return 0
-  fi
+  AGENT_CMD=()
   if [[ "$TRANSPORT" == ssh ]]; then
-    local q
+    local q ip
+    ip=$(target_ip "$h") || exit 2
     q=$(printf '%q ' "$@")
-    ssh "${SSH_OPTS[@]}" "$SSH_USER@$(host_field "$h" ip)" "bash -s -- $q" <"$AGENT"
+    AGENT_CMD=(ssh "${SSH_OPTS[@]}" "$SSH_USER@$ip" "bash -s -- $q")
   else
     local pid root
     pid=$(host_field "$h" netns_pid)
     root=$(host_field "$h" root)
-    local ns=()
-    [[ -n "$pid" ]] && ns=(nsenter --net="/proc/$pid/ns/net")
-    "${ns[@]}" env R1006_ROOT="$root" R1006_SERVICE=proc R1006_RUN_AS= \
-      R1006_NODE_ENV_PASSTHRU="${R1006_NODE_ENV_PASSTHRU:-}" bash -s -- "$@" <"$AGENT"
+    [[ -n "$pid" ]] && AGENT_CMD=(nsenter --net="/proc/$pid/ns/net")
+    AGENT_CMD+=(env R1006_ROOT="$root" R1006_SERVICE=proc R1006_RUN_AS=
+      R1006_NODE_ENV_PASSTHRU="${R1006_NODE_ENV_PASSTHRU:-}" bash -s -- "$@")
   fi
+}
+
+# agent HOST CMD ARGS...: run host_agent.sh CMD on HOST (as root). Its stdout and stderr
+# pass guard.py's in-memory check before either is shown (rc 3 on a key pattern).
+agent() {
+  local h="$1"
+  shift
+  if [[ $DRY -eq 1 ]]; then
+    [[ "$TRANSPORT" == ssh ]] && target_ip "$h" >/dev/null
+    echo "  [dry-run] $h: host_agent.sh $*"
+    return 0
+  fi
+  agent_cmd "$h" "$@"
+  python3 "$GUARD" relay --host "$h" -- "${AGENT_CMD[@]}" <"$AGENT"
+}
+
+# agent_identity HOST OUT CMD ARGS...: like agent, but stdout must be exactly one public
+# host identity; only the checked, re-serialised object is written to OUT.
+agent_identity() {
+  local h="$1" out="$2"
+  shift 2
+  agent_cmd "$h" "$@"
+  python3 "$GUARD" relay --host "$h" --identity-out "$out" -- "${AGENT_CMD[@]}" <"$AGENT"
 }
 
 # put HOST LOCAL_FILE NAME: stage a file as usr/local/lib/citrate-r1006/<NAME> on HOST.
@@ -170,12 +255,13 @@ put() {
   local h="$1" src="$2" name="$3"
   local dest="/usr/local/lib/citrate-r1006/$name"
   if [[ $DRY -eq 1 ]]; then
+    [[ "$TRANSPORT" == ssh ]] && target_ip "$h" >/dev/null
     echo "  [dry-run] $h: copy $src -> $dest"
     return 0
   fi
   if [[ "$TRANSPORT" == ssh ]]; then
     local ip
-    ip=$(host_field "$h" ip)
+    ip=$(target_ip "$h") || exit 2
     ssh "${SSH_OPTS[@]}" "$SSH_USER@$ip" "mkdir -p '$(dirname "$dest")'"
     scp -q "${SSH_OPTS[@]}" -- "$src" "$SSH_USER@$ip:$dest.part"
     ssh "${SSH_OPTS[@]}" "$SSH_USER@$ip" "mv -f '$dest.part' '$dest'"
@@ -194,15 +280,17 @@ tunnel_up() {
   local h="$1" port
   port=$((TUNNEL_BASE + $(host_index "$h")))
   if [[ $DRY -eq 1 ]]; then
+    [[ "$TRANSPORT" == ssh ]] && target_ip "$h" >/dev/null
     echo "  [dry-run] tunnel 127.0.0.1:$port -> $h 127.0.0.1:8545"
     return 0
   fi
   mkdir -p "$STATE/tunnels"
   if [[ "$TRANSPORT" == ssh ]]; then
-    local sock="$STATE/tunnels/$h.sock"
+    local sock="$STATE/tunnels/$h.sock" ip
+    ip=$(target_ip "$h") || exit 2
     if [[ -S "$sock" ]] && ssh -S "$sock" -O check x 2>/dev/null; then return 0; fi
     ssh "${SSH_OPTS[@]}" -M -S "$sock" -f -N -o ExitOnForwardFailure=yes \
-      -L "127.0.0.1:$port:127.0.0.1:8545" "$SSH_USER@$(host_field "$h" ip)"
+      -L "127.0.0.1:$port:127.0.0.1:8545" "$SSH_USER@$ip"
   else
     local pidf="$STATE/tunnels/$h.pid"
     if [[ -f "$pidf" ]] && kill -0 "$(cat "$pidf")" 2>/dev/null; then return 0; fi
@@ -278,7 +366,9 @@ fi
 CARGO_TARGET_DIR="$T/target" CARGO_PROFILE_RELEASE_DEBUG=0 cargo build --release --locked -p citrate-node --bin citrate >&2
 B="$T/target/release/citrate"
 echo "SHA256=$(sha256sum "$B" | cut -d' ' -f1)"
-echo "FINGERPRINT=$(RUST_LOG=error "$B" consensus --json | python3 -c 'import json,sys; l=sys.stdin.read().splitlines(); print(json.loads("\n".join(l[l.index("{"):]))["fingerprint"])')"
+CONS=$(RUST_LOG=error "$B" consensus --json)
+echo "FINGERPRINT=$(python3 -c 'import json,sys; l=sys.argv[1].splitlines(); print(json.loads("\n".join(l[l.index("{"):]))["fingerprint"])' "$CONS")"
+echo "R1006_GENESIS=$(python3 -c 'import json,sys; l=sys.argv[1].splitlines(); print(json.loads("\n".join(l[l.index("{"):])).get("r1006_genesis",""))' "$CONS")"
 echo "ARCH=$(uname -m)"
 BUILD
 )
@@ -291,9 +381,10 @@ BUILD
     fi
     out=$(bash -c "$script" build "$SHA" "$LOCAL_REPO" "$ALLOW_NON_MAIN" "${TMPDIR:-/tmp}")
   else
-    local bip
-    bip=$(inv 'd["build_host"]["ip"]')
-    where="$(inv 'd["build_host"]["name"]') ($bip)"
+    # Only the pinned build-only host (guard.py); check-inventory already refused an
+    # inventory whose build_host is anything else.
+    local bip="$BUILD_IP"
+    where="$BUILD_NAME ($bip)"
     if [[ $DRY -eq 1 ]]; then
       echo "  [dry-run] ssh $SSH_USER@$bip: clone https://github.com/CitrateNetwork/citrate-chain into mktemp /root/r1006-build.*,"
       echo "            checkout $SHA (must be on origin/main), cargo build --release --locked -p citrate-node --bin citrate,"
@@ -302,7 +393,8 @@ BUILD
     fi
     out=$(ssh "${SSH_OPTS[@]}" "$SSH_USER@$bip" "bash -s -- $SHA https://github.com/CitrateNetwork/citrate-chain $ALLOW_NON_MAIN /root" <<<"$script")
   fi
-  local dir sha fp arch
+  local dir sha fp arch g6
+  g6=$(sed -n 's/^R1006_GENESIS=//p' <<<"$out")
   dir=$(sed -n 's/^BUILD_DIR=//p' <<<"$out")
   sha=$(sed -n 's/^SHA256=//p' <<<"$out")
   fp=$(sed -n 's/^FINGERPRINT=//p' <<<"$out")
@@ -319,15 +411,15 @@ BUILD
   [[ "$(sha256sum "$STATE/bin/citrate-node.part" | cut -d' ' -f1)" == "$sha" ]] || gate_fail "copied binary differs from the build's sha256"
   mv -f -- "$STATE/bin/citrate-node.part" "$STATE/bin/citrate-node"
   chmod 0755 "$STATE/bin/citrate-node"
-  python3 - "$BUILD_JSON" "$SHA" "$sha" "$fp" "$arch" "$where" "$ALLOW_NON_MAIN" <<'PY'
+  python3 - "$BUILD_JSON" "$SHA" "$sha" "$fp" "$arch" "$where" "$ALLOW_NON_MAIN" "$g6" <<'PY'
 import json, sys, datetime
-p, sha, s256, fp, arch, where, nm = sys.argv[1:]
+p, sha, s256, fp, arch, where, nm, g6 = sys.argv[1:]
 json.dump({"sha": sha, "sha256": s256, "fingerprint": fp, "arch": arch, "built_on": where,
-           "from_main": nm != "1",
+           "from_main": nm != "1", "r1006_genesis": g6.lower(),
            "built_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")},
           open(p, "w"), indent=2)
 PY
-  log "built $SHA on $where: sha256 $sha fingerprint $fp arch $arch"
+  log "built $SHA on $where: sha256 $sha fingerprint $fp arch $arch r1006 genesis ${g6:-NONE (genesis steps will refuse this build)}"
 }
 
 need_build() {
@@ -341,6 +433,7 @@ need_build() {
   if [[ "$TRANSPORT" == ssh && "$(build_field from_main)" != True ]]; then
     die "the recorded build is not from origin/main; producers run main builds only"
   fi
+  return 0
 }
 
 # ---- keys --------------------------------------------------------------------
@@ -356,9 +449,11 @@ step_keys() {
       agent "$h" keys "$s256"
       continue
     fi
-    # The agent prints exactly the public file. It is validated before it is kept.
-    agent "$h" keys "$s256" >"$STATE/pub/$h.pub.json.part"
-    mv -f -- "$STATE/pub/$h.pub.json.part" "$STATE/pub/$h.pub.json"
+    # The host re-serialises its checked public file; guard.py checks it again in memory
+    # and writes only that object. On any refusal nothing is written and the step stops.
+    local rc=0
+    agent_identity "$h" "$STATE/pub/$h.pub.json" keys "$s256" || rc=$?
+    [[ $rc -eq 0 ]] || { log "keys: $h refused (rc=$rc); nothing written for it; stopping"; exit "$rc"; }
   done
   if [[ $DRY -eq 1 ]]; then
     echo "  [dry-run] collect.py -> $STATE/r1006-producers.json + r1006-public-bootnodes.json (for the cutover profile)"
@@ -368,18 +463,30 @@ step_keys() {
     --bootnodes-out "$STATE/r1006-public-bootnodes.json"
 }
 
+# ---- genesis checks ---------------------------------------------------------------
+# check_genesis FILL: refuse a release network's block 0, any profile but the compiled
+# r1006 one, a genesis file, and any block 0 but the recorded build's r1006 genesis.
+check_genesis() {
+  python3 "$GUARD" check-genesis --fill "$1" --build "$BUILD_JSON" || die "genesis refused (see REFUSED above)"
+}
+
 # ---- genesis-fill --------------------------------------------------------------
 step_genesis_fill() {
-  local prod="$STATE/r1006-producers.json" stakes="$STATE/r1006-stakes.json" out="$STATE/genesis"
+  local prod="$STATE/r1006-producers.json" stakes="$STATE/r1006-stakes.json"
+  local final="$STATE/genesis" out="$STATE/genesis.incoming"
   [[ -f "$prod" || $DRY -eq 1 ]] || die "no $prod; run keys first"
   [[ -n "$FILL_CMD" ]] || die "genesis-fill needs --fill-cmd (the genesis builder's validator-set fill)"
+  need_build
   if [[ $DRY -eq 1 ]]; then
     echo "  [dry-run] render_profile.py stakes ($STAKE_SALT SALT bonded + $LIQUID_SALT SALT liquid per staker) -> $stakes"
     echo "  [dry-run] $FILL_CMD   with {producers}=$prod {stakes}=$stakes {out}=$out"
     echo "  [dry-run] render_profile.py check-fill: the fill lists exactly these validators and stakes"
+    echo "  [dry-run] guard.py check-genesis: profile r1006, no genesis file, block 0 == the build's r1006 genesis,"
+    echo "            never a release network's; only then $out -> $final"
     return 0
   fi
   python3 "$PY/render_profile.py" stakes --producers "$prod" --stake-salt "$STAKE_SALT" --liquid-salt "$LIQUID_SALT" --out "$stakes"
+  rm -rf -- "${out:?}"
   mkdir -p "$out"
   local cmd="$FILL_CMD"
   cmd=${cmd//\{producers\}/$(printf '%q' "$prod")}
@@ -387,10 +494,18 @@ step_genesis_fill() {
   cmd=${cmd//\{out\}/$(printf '%q' "$out")}
   log "genesis-fill: $cmd"
   (cd "$REPO" && bash -c "$cmd")
-  [[ -f "$out/fill-result.json" ]] || gate_fail "the fill command wrote no $out/fill-result.json"
-  python3 "$PY/render_profile.py" check-fill --producers "$prod" --stakes "$stakes" --fill "$out/fill-result.json" ||
+  [[ -f "$out/fill-result.json" ]] || { rm -rf -- "${out:?}"; gate_fail "the fill command wrote no $out/fill-result.json"; }
+  if ! python3 "$PY/render_profile.py" check-fill --producers "$prod" --stakes "$stakes" --fill "$out/fill-result.json"; then
+    rm -rf -- "${out:?}"
     gate_fail "the genesis fill does not match the producer set"
-  log "genesis: $(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["genesis_hash"], "profile", d.get("genesis_profile"), "registry", d["validator_registry"])' "$out/fill-result.json")"
+  fi
+  if ! python3 "$GUARD" check-genesis --fill "$out/fill-result.json" --build "$BUILD_JSON"; then
+    rm -rf -- "${out:?}"
+    die "genesis refused (see REFUSED above); the fill was discarded"
+  fi
+  rm -rf -- "${final:?}"
+  mv -- "$out" "$final"
+  log "genesis: $(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["genesis_hash"], "profile", d.get("genesis_profile"), "registry", d["validator_registry"])' "$final/fill-result.json")"
 }
 
 fill_field() { python3 -c 'import json,sys; v=json.load(open(sys.argv[1])).get(sys.argv[2]); print("" if v is None else v)' "$STATE/genesis/fill-result.json" "$1"; }
@@ -400,17 +515,16 @@ step_distribute() {
   need_build
   local fill="$STATE/genesis/fill-result.json"
   [[ -f "$fill" || $DRY -eq 1 ]] || die "no $fill; run genesis-fill first"
-  [[ "$MINING" == on || "$MINING" == off ]] || die "--mining on|off"
-  local s256 gh gfile gsha=""
+  [[ $MINING_SET -eq 0 ]] || die "--mining is a start option: distribute always configures mining OFF"
+  local s256 gh
   s256=$(build_field sha256)
   log "distribute: binary $(build_field sha) sha256 $s256"
   if [[ $DRY -eq 0 ]]; then
+    check_genesis "$fill"
     gh=$(fill_field genesis_hash)
-    gfile=$(fill_field genesis_file)
-    if [[ -n "$gfile" ]]; then gsha=$(sha256sum "$STATE/genesis/$gfile" | cut -d' ' -f1); fi
   else
+    echo "  [dry-run] guard.py check-genesis on the fill (r1006 profile, build's r1006 genesis, no release genesis)"
     gh="<genesis hash from fill-result.json>"
-    gfile=""
   fi
   mkdir -p "$STATE/profiles"
   for h in "${HOSTS[@]}"; do
@@ -428,16 +542,12 @@ step_distribute() {
       [[ "$got" == "$s256" ]] || gate_fail "$h: staged binary sha256 $got, want $s256"
     fi
     agent "$h" install-bin "$s256"
-    if [[ -n "$gfile" ]]; then
-      put "$h" "$STATE/genesis/$gfile" incoming/genesis.json
-      agent "$h" install-genesis "$gsha"
-    fi
     put "$h" "$REPO/scripts/producers/gen_node_config.py" tools/gen_node_config.py
     put "$h" "$REPO/scripts/producers/producerlib.py" tools/producerlib.py
     put "$h" "$STATE/profiles/$h.json" profile.json
     local staker="<staker of $h>"
     [[ $DRY -eq 0 ]] && staker=$(python3 -c 'import json,sys; print([p for p in json.load(open(sys.argv[1]))["producers"] if p["name"]==sys.argv[2]][0]["staker_address"])' "$STATE/r1006-producers.json" "$h")
-    agent "$h" write-config "$staker" "$MINING"
+    agent "$h" write-config "$staker" off
     agent "$h" probe-genesis "$gh" || gate_fail "$h: the installed binary + config do not give block 0 $gh"
   done
 }
@@ -486,33 +596,61 @@ print(sum(1 for m in seen["miners"] if m in want))
 PY
 }
 
+stop_started() { # stop every host in HOSTS up to and including $1
+  local s
+  for s in "${HOSTS[@]}"; do agent "$s" stop || true; [[ "$s" == "$1" ]] && break; done
+}
+
 step_start() {
   local n=${#HOSTS[@]} gh
   [[ -z "$MIN_PEERS" ]] && MIN_PEERS=$((${#ALL_HOSTS[@]} - 1))
+  [[ "$MINING" == on || "$MINING" == off ]] || die "--mining on|off"
   if [[ $DRY -eq 1 ]]; then
     gh="<fill genesis_hash>"
   else
+    need_build
+    [[ -f "$STATE/genesis/fill-result.json" ]] || die "no fill; run genesis-fill first"
+    check_genesis "$STATE/genesis/fill-result.json"
     gh=$(fill_field genesis_hash)
   fi
   [[ $DRY -eq 0 && ! -f "$STATE/started_at" ]] && date +%s >"$STATE/started_at"
   local first=1
   for h in "${HOSTS[@]}"; do
-    log "start: $h"
-    agent "$h" start
+    log "start: $h (mining off)"
+    if ! agent "$h" start "$gh"; then stop_started "$h"; gate_fail "$h did not start"; fi
     tunnel_up "$h"
     if [[ $DRY -eq 1 ]]; then
       echo "  [dry-run] gate: $h RPC answers within 120 s and block 0 == $gh${first:+ (the first node starts ALONE)}"
       first=""
       continue
     fi
-    wait_until 120 "$h RPC answers" node_answers "$h" || { agent "$h" stop; gate_fail "$h RPC did not answer in 120 s (stopped it)"; }
+    wait_until 120 "$h RPC answers" node_answers "$h" || { stop_started "$h"; gate_fail "$h RPC did not answer in 120 s (stopped)"; }
     if ! block0_is "$h" "$gh"; then
       log "  $h block 0 differs from $gh: stopping every started node"
-      for s in "${HOSTS[@]}"; do agent "$s" stop || true; [[ "$s" == "$h" ]] && break; done
+      stop_started "$h"
       gate_fail "$h block 0 is not the r1006 genesis $gh"
     fi
     log "  ok: $h block 0 = $gh"
   done
+  # Mining: only now that EVERY host shows the r1006 block 0. Each host checks its own
+  # node's block 0 again before switching, and the result is checked from here after.
+  local last="${HOSTS[-1]}"
+  if [[ "$MINING" == on ]]; then
+    for h in "${HOSTS[@]}"; do
+      if [[ $DRY -eq 1 ]]; then
+        echo "  [dry-run] $h: enable-mining $gh (host re-checks its node's block 0 first), then block 0 == $gh again"
+        continue
+      fi
+      log "start: $h enable mining"
+      if ! agent "$h" enable-mining "$gh"; then stop_started "$last"; gate_fail "$h refused to enable mining"; fi
+      if ! wait_until 120 "$h RPC answers (mining on)" node_answers "$h" || ! block0_is "$h" "$gh"; then
+        stop_started "$last"
+        gate_fail "$h block 0 is not $gh after enabling mining (every node stopped)"
+      fi
+    done
+  else
+    log "mining stays off (--mining off)"
+  fi
   if [[ $DRY -eq 1 ]]; then
     echo "  [dry-run] gate: every node net_peerCount >= $MIN_PEERS within $GATE_MIN min (tcp-check 30303 between producers on failure)"
     echo "  [dry-run] gate: blocks with each of the ${#ALL_HOSTS[@]} producers' coinbases within $GATE_MIN min"

@@ -97,7 +97,12 @@ pub async fn initialize_genesis_state(
 /// - `Some("team_testnet")` — team testnet with 10 pre-funded validators
 /// - `Some("testnet_beta")` — public testnet beta
 /// - `Some("mainnet")` — mainnet genesis
-/// - `None` or `Some("default")` — infer from chain_id (backward compatible)
+/// - `Some("default")` — devnet accounts
+/// - `None` — infer from chain_id (backward compatible)
+///
+/// Any other name is refused. A profile this build does not compile (a typo, or a
+/// network whose genesis is not in this release) must never fall back to the chain-id
+/// default: on 40204 that default is another network's release genesis.
 pub async fn initialize_genesis_state_with_profile(
     storage: Arc<StorageManager>,
     executor: Arc<Executor>,
@@ -125,7 +130,14 @@ pub async fn initialize_genesis_state_with_profile(
             tracing::info!("Using mainnet genesis profile");
             EconomicsGenesisConfig::mainnet()
         }
-        _ => {
+        Some(other) => {
+            anyhow::bail!(
+                "[chain] genesis_profile = {other:?} is not compiled into this build (known: \
+                 default, testnet_beta, team_testnet, mainnet); refusing to build a genesis \
+                 instead of falling back to the chain-id default"
+            );
+        }
+        None => {
             // Backward compatible: infer from chain_id
             if config.chain_id == 40204 {
                 EconomicsGenesisConfig::testnet_beta()

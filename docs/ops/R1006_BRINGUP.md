@@ -3,6 +3,7 @@ created: 2026-10-26T20:45:00Z
 branch: ops/r1006-bringup
 author: Larry Klosowski (chain team; DGX session, Claude Opus 5.5)
 status: active
+updated: 2026-10-27 (host allowlist, release-genesis refusal, mining gate, output containment)
 supersedes: the fleet steps (S1, S3, S5-S7) of citrate-federation R1006_REROLL_RUNBOOK.md (fed#399) for r1006
 ---
 
@@ -27,16 +28,17 @@ From a citrate-chain checkout of `main` on the DGX, after the genesis builder's
 validator-set fill has merged:
 
 ```bash
-B=scripts/ops/r1006_bringup.sh; ST=~/r1006-state
+B=scripts/ops/r1006_bringup.sh             # state defaults to ~/r1006-state (0700)
 SHA=$(git rev-parse origin/main)
-$B build --sha "$SHA" --state "$ST"        # on citrate-core-linux-build, ~13 min (aarch64 local: 774 s)
-$B keys --state "$ST"                       # mints on each host as citrate; public parts only
-$B genesis-fill --state "$ST" --fill-cmd '<fill command> {producers} {stakes} {out}'
-#   -> commit the fill's genesis (compiled r1006 profile) to main, then rebuild at that sha:
-SHA=$(git rev-parse origin/main); $B build --sha "$SHA" --state "$ST"
-$B distribute --state "$ST" --mining on     # binary + genesis hash-checked; node.toml; block 0 probed per host
-$B start --state "$ST"                      # prod-1 alone first; block 0 gate; peers; all 7 produce
-$B smoke --state "$ST"                      # must end SMOKE PASS
+$B build --sha "$SHA"                      # on citrate-core-linux-build, ~13 min (aarch64 local: 774 s)
+$B keys                                    # mints on each host as citrate; public parts only
+#   run the genesis builder's fill (chain#398 fill_producers.py) on r1006-producers.json and
+#   commit its genesis (compiled r1006 profile) to main, then rebuild at that sha:
+SHA=$(git rev-parse origin/main); $B build --sha "$SHA"
+$B genesis-fill --fill-cmd '<fill command> {producers} {stakes} {out}'   # kept only if it is this build's r1006 genesis
+$B distribute                              # binary hash-checked; node.toml (r1006 profile, mining off); block 0 probed per host
+$B start --mining on                       # all nodes up with mining off; block 0 checked on every host; then mining on
+$B smoke                                   # must end SMOKE PASS
 ```
 
 Rollback at any point before cutover: `$B stop --state "$ST"`, then `$B wipe --state "$ST"`
@@ -45,12 +47,16 @@ typed confirmation.
 
 | Step | Gate (fails closed) |
 |---|---|
-| build | the commit is on `origin/main`; sha256 and consensus fingerprint recorded |
-| keys | every `identity.pub.json` passes the public schema; keys distinct; staker = coinbase |
-| genesis-fill | the fill lists exactly the 7 producers with their stakes |
-| distribute | staged and installed binary sha256 match; every host's isolated probe gives the fill's block 0 |
-| start | each node's block 0 = the fill's (else every started node is stopped); ≥6 peers each; blocks from all 7 coinbases within 10 min |
+| every step | every host is one of citrate-prod-1..7 at its pinned IP (`scripts/ops/r1006/guard.py`, not the inventory), and the live `doctl --tag-name citrate-producer` list agrees, before any connection; `build` reaches only the build-only host `citrate-core-linux-build` |
+| build | the commit is on `origin/main`; sha256, consensus fingerprint and the compiled r1006 genesis recorded |
+| keys | each host re-serialises its checked public identity; the orchestrator checks it again in memory and writes only that object; any key or password pattern in the host's stdout or stderr fails the step (rc 3) with nothing written or echoed |
+| genesis-fill | the fill lists exactly the producers with their stakes; profile `r1006`; no genesis file; block 0 = the build's compiled r1006 genesis and never a release network's (r1005 `0x1dcfc490…75f1`, team testnet, mainnet); otherwise the fill is discarded |
+| distribute | the same genesis checks, before any host is touched; staged and installed binary sha256 match; every host's isolated probe gives that block 0 (recorded on the host) |
+| start | the same genesis checks; every node starts with mining off and its block 0 must be the r1006 genesis (else every started node is stopped); only then, host by host, the host re-checks its own node's block 0 and switches mining on; ≥6 peers each; blocks from all 7 coinbases within 10 min |
 | smoke | every head past block 60; FLEET AGREE; chain id 40204; `eth_getCode` = genesis alloc; OrangeSeed `story()`; DEPLOYER-ADMIN 0; no CONFLICT / fork / deep reorg in logs; finality answers; no contribution recorder configured; RSS < 3 GiB |
+
+A node built without the r1006 profile refuses `genesis_profile = "r1006"` at start
+(node/src/genesis.rs) instead of falling back to the chain-id default (r1005's genesis).
 
 The keys step also writes `r1006-public-bootnodes.json` (the producers' `noise_<id>@<ip>:30303`
 list) for the network profile at cutover.
