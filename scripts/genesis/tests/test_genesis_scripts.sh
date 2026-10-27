@@ -674,7 +674,7 @@ owners() { local i out=""; for i in "$@"; do out+="${out:+,}$(addr "$i")"; done;
 CEENV=(env REPO_ROOT="$REPO" DEPLOYER_ADDRESS="$DEP"
   GOV_OWNERS="$(owners 11 12 13 14 15)" GOV_THRESHOLD=3 GOV_MIN_DELAY=172800
   GRD_OWNERS="$(owners 21 22 23)" GRD_THRESHOLD=2 GRD_MIN_DELAY=3600
-  SIGNER_1="$(addr 61)" SIGNER_2="$(addr 62)" SIGNER_3="$(addr 63)" RELAYER="$(addr 64)"
+  SIGNER_1="$(addr 61)" SIGNER_2="$(addr 62)" SIGNER_3="$(addr 63)" RELAYER="$(addr 64)" TREASURY="$(addr 66)"
   CITRATE_AA_OWNER="$(addr 65)" CITRATE_AA_IDENTITY_SIGNER="$(addr 66)" CITRATE_AA_SPONSOR_SIGNER="$(addr 67)"
   MEMBERSHIP_GRANTOR="$(addr 51)")
 
@@ -1331,7 +1331,8 @@ cp "$GBK" "$T/book.c9.orig"
 C9ENV=("${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1
   FAKE_REGEN_BOOK="$C9B" FAKE_REGEN_BCAST="$C9BC" EMITTER="$T/fake-emit.sh")
 # c9_setup: a --confirm run after P1 (manifest, governance on chain, fee recipients = the
-# deployer), before P2 has sent anything (no broadcast recorded yet).
+# TREASURY input, #396), before P2 has sent anything (no broadcast recorded yet).
+C9TREAS="$(addr 66)"
 c9_setup() {
   rm -rf "$REPO/contracts/broadcast"
   cp "$T/book.c9.orig" "$GBK"
@@ -1339,9 +1340,9 @@ c9_setup() {
   gov_book "$GB" "$DEP"
   gov_chain
   rm -rf "$FAKE/call/$C9X" "$FAKE/call/$C9MM" "$FAKE/call/$C9CM"
-  fake_call "$C9X" treasury "$DEP"
-  fake_call "$C9MM" treasuryAddress "$DEP"
-  fake_call "$C9CM" treasury "$DEP"
+  fake_call "$C9X" treasury "$C9TREAS"
+  fake_call "$C9MM" treasuryAddress "$C9TREAS"
+  fake_call "$C9CM" treasury "$C9TREAS"
 }
 c9_fee() { # name want-exit pattern [fake_call setup...]
   local name="$1" want="$2" pat="$3"
@@ -1351,9 +1352,10 @@ c9_fee() { # name want-exit pattern [fake_call setup...]
   expect "ceremony C9: $name" "$want" "$pat" -- "${C9ENV[@]}" bash "$CE" --confirm --only P2 --account deployer
   cp "$T/book.c9.orig" "$GBK"
 }
-c9_fee "fee recipients equal to the run's deployer pass P2" 0 'P2 fee recipients are the run.s deployer: X402Facilitator, ModelMarketplace, ComputeMarketplace' true
-c9_fee "an X402Facilitator fee recipient other than the run's deployer fails P2" 3 'X402Facilitator.treasury\(\) is 0x0+63, not the book.s deployer 0x0+1' fake_call "$C9X" treasury "$STALE"
-c9_fee "a ModelMarketplace fee recipient other than the run's deployer fails P2" 3 'ModelMarketplace.treasuryAddress\(\) is 0x0+63' fake_call "$C9MM" treasuryAddress "$STALE"
+c9_fee "fee recipients equal to the TREASURY input pass P2" 0 'P2 fee recipients are the TREASURY input 0x0+42: X402Facilitator, ModelMarketplace, ComputeMarketplace' true
+c9_fee "an X402Facilitator fee recipient other than TREASURY fails P2" 3 'X402Facilitator.treasury\(\) is 0x0+63, not the TREASURY input 0x0+42' fake_call "$C9X" treasury "$STALE"
+c9_fee "a ModelMarketplace fee recipient other than TREASURY fails P2" 3 'ModelMarketplace.treasuryAddress\(\) is 0x0+63' fake_call "$C9MM" treasuryAddress "$STALE"
+c9_fee "a fee recipient left on the deployer fails P2 (#396)" 3 'ComputeMarketplace.treasury\(\) is 0x0+1, not the TREASURY input' fake_call "$C9CM" treasury "$DEP"
 c9_fee "an unreadable ComputeMarketplace fee recipient fails P2" 3 'cannot read ComputeMarketplace.treasury\(\)' rm -f "$FAKE/call/$C9CM/treasury"
 # #364 on P2 (the password fixture is set up before the regenesis.sh cases above).
 c9_setup
@@ -1424,7 +1426,7 @@ for how in "--only P2" "--from P2"; do
   expect "ceremony recovery: $how is refused once this run's P2 broadcasts exist" 3 'GATE FAIL at P2: this run.s P2 broadcasts are already recorded' -- "${C9ENV[@]}" bash "$CE" --confirm $how --account deployer
   if calls | grep -q '^regenesis'; then bad "ceremony recovery: $how after a broadcast runs no regenesis" "$(calls)"; else ok "ceremony recovery: $how after a broadcast runs no regenesis"; fi
 done
-fake_call "$C9X" treasury "$DEP"
+fake_call "$C9X" treasury "$C9TREAS"
 reset_calls
 expect "ceremony recovery: the record step verifies and records the book from this run's broadcasts" 0 'P2 stack book recorded' -- "${C9ENV[@]}" bash "$CE" --confirm --only P2 --record-stack-book --account deployer
 if calls | grep -q '^regenesis'; then bad "ceremony recovery: the record step sends nothing (no regenesis)" "$(calls)"; else ok "ceremony recovery: the record step sends nothing (no regenesis)"; fi
