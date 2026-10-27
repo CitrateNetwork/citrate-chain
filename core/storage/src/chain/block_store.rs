@@ -204,6 +204,16 @@ impl BlockStore {
         }
     }
 
+    /// The block this node's executed (canonical) chain holds at `height`.
+    pub fn get_canonical_block_by_height(&self, height: u64) -> Result<Option<Hash>> {
+        self.get_block_by_height(height)
+    }
+
+    /// The applied tip the canonical height index currently describes.
+    pub fn canonical_index_tip(&self) -> Result<Option<(Hash, u64)>> {
+        Ok(None)
+    }
+
     /// Enumerate `(height, hash)` for every stored block whose height is in
     /// `[start, end]` inclusive, scanning headers (cheaper than full blocks).
     ///
