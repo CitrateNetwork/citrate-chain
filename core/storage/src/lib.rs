@@ -35,6 +35,14 @@ pub mod pruning;
 pub mod state;
 pub mod state_manager;
 
+/// Operator note appended to every "wipe / move the data directory aside and
+/// resync" instruction: the data directory holds the checkpoint-finality
+/// signed-vote record (docs/consensus/CHECKPOINT_FINALITY_WIRING.md §4.3).
+pub const VOTING_VALIDATOR_WIPE_NOTE: &str =
+    "Voting validators: wiping the data directory while keeping proposer.key discards the \
+     durable checkpoint signed-vote record (dag_metadata checkpoint_signed:*) and can lead to \
+     double-signing; keep that record, or rotate and re-register the key after the wipe.";
+
 use anyhow::Result;
 use cache::Cache;
 use chain::{BlockStore, TransactionStore};

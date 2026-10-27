@@ -1,0 +1,33 @@
+{
+  "name": "r1006",
+  "status": "pending-genesis",
+  "description": "RC52 testnet r1006 (chain 40204), private bring-up on the 7 Citrate Inc. producers (citrate-prod-1..7). This file is the TEMPLATE: scripts/ops/r1006/render_profile.py fills the genesis hash, genesis profile, ValidatorRegistry, activation height and bootnodes (the other producers) per host from r1006-producers.json and the genesis fill, and marks the rendered copy ready. The template itself stays pending-genesis, so the tools refuse it outside --dry-run.",
+  "sources": {
+    "genesis_hash": "",
+    "bootstrap_nodes": "",
+    "validator_registry": "",
+    "validator_activation_height": "",
+    "env": "RC52 plan (fed#394): CITRATE_BLOCK_V2 and DAG prune retain as on r1005",
+    "checkpoint": "node/config/testnet-beta.toml [checkpoint]"
+  },
+  "chain_id": 40204,
+  "genesis_hash": "",
+  "genesis_profile": null,
+  "public_rpc": "http://127.0.0.1:8545",
+  "block_time": 2,
+  "ghostdag_k": 18,
+  "bootstrap_nodes": [],
+  "validator_registry": "",
+  "validator_activation_height": 0,
+  "env": {
+    "CITRATE_BLOCK_V2": "1",
+    "CITRATE_DAG_PRUNE_RETAIN": "10000"
+  },
+  "checkpoint": {
+    "interval": 50,
+    "committee_size": 100,
+    "quorum_threshold": 67
+  },
+  "gas_price_wei": 1000000000,
+  "registration_gas_limit": 600000
+}

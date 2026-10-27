@@ -1,0 +1,48 @@
+name: genesis-scripts
+
+# scripts/genesis/: the ceremony tooling (keep_check, fleet_agree, reset_node, ceremony).
+# The tests use fake cast/forge/systemctl in a temp dir: no network, no chain, no keys. The
+# integration cases run the real admin checker over councils the real DeployGenesisGovernance
+# deploys, and a fresh-genesis P1/P2/P5 through the real regenesis.sh and address-book
+# generator, against local anvil chains (Foundry, below). Their temp projects copy the import
+# closure solc resolves for those scripts, so the paths below cover that closure's roots.
+
+on:
+  push:
+    branches: [main]
+    paths: ['contracts/script/**', 'scripts/genesis/**', 'scripts/ci/deployer_input_override_tripwire.sh', 'scripts/ops/regenesis.sh', 'scripts/ops/emit-address-table.sh', 'scripts/ci/check-create2-determinism.sh', 'contracts/script/DeployValidatorRegistry.s.sol', 'contracts/script/DeployCoreMembership.s.sol', 'contracts/script/DeployGenesisMembership.s.sol', 'contracts/script/ScriptEnv.sol', 'contracts/script/CheckDeployedAdmins.s.sol', 'contracts/script/DeployGenesisGovernance.s.sol', 'contracts/script/Salts.sol', 'contracts/script/lib/**', 'contracts/src/genesis/**', 'contracts/src/lib/**', 'contracts/src/core_membership/**', 'contracts/src/ValidatorRegistry.sol', 'contracts/src/aa/lib/webauthn/P256.sol', 'contracts/foundry.toml', 'contracts/remappings.txt', '.github/workflows/genesis-scripts.yml']
+  pull_request:
+    paths: ['contracts/script/**', 'scripts/genesis/**', 'scripts/ci/deployer_input_override_tripwire.sh', 'scripts/ops/regenesis.sh', 'scripts/ops/emit-address-table.sh', 'scripts/ci/check-create2-determinism.sh', 'contracts/script/DeployValidatorRegistry.s.sol', 'contracts/script/DeployCoreMembership.s.sol', 'contracts/script/DeployGenesisMembership.s.sol', 'contracts/script/ScriptEnv.sol', 'contracts/script/CheckDeployedAdmins.s.sol', 'contracts/script/DeployGenesisGovernance.s.sol', 'contracts/script/Salts.sol', 'contracts/script/lib/**', 'contracts/src/genesis/**', 'contracts/src/lib/**', 'contracts/src/core_membership/**', 'contracts/src/ValidatorRegistry.sol', 'contracts/src/aa/lib/webauthn/P256.sol', 'contracts/foundry.toml', 'contracts/remappings.txt', '.github/workflows/genesis-scripts.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: shellcheck
+        run: shellcheck -x -S warning scripts/genesis/*.sh scripts/genesis/tests/*.sh scripts/ops/regenesis.sh scripts/ops/emit-address-table.sh scripts/ci/deployer_input_override_tripwire.sh
+      # Every environment key a ceremony phase's scripts read is classified in
+      # scripts/genesis/phase_inputs.json, which P0 checks before anything is sent (the
+      # negative controls are in the suite below).
+      - name: phase-inputs tripwire
+        run: python3 -I scripts/genesis/phase_inputs.py check-spec
+      - name: deployer-input tripwire (self-test, then the tree)
+        run: scripts/ci/deployer_input_override_tripwire.sh --self-test && scripts/ci/deployer_input_override_tripwire.sh
+      # The fresh-genesis end-to-end case compiles the real ValidatorRegistry and membership
+      # contracts, which import OpenZeppelin (a submodule); without it that case is skipped.
+      - name: openzeppelin submodule
+        run: git submodule update --init --depth 1 contracts/lib/openzeppelin-contracts
+      # The P5 integration case runs the real CheckDeployedAdmins under forge against a local
+      # anvil; without Foundry it is skipped.
+      - name: foundry
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+        with:
+          version: v1.8.3
+      - name: tests (offline + anvil integration)
+        env:
+          GENESIS_E2E_REQUIRED: "1" # a skipped integration case fails the job here
+        run: bash scripts/genesis/tests/test_genesis_scripts.sh

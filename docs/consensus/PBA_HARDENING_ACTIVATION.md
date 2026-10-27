@@ -48,7 +48,7 @@ This is a consensus parameter. Two nodes with different values disagree about bl
 
 **Rollback before `H`:** unset the height (or set `off`) on every node and restart.
 
-**After `H`:** don't unset it. A node without the setting forks off. Don't downgrade a node past `H` either; if one was run on an older release after `H`, move its data directory aside before starting the new release again, so it resyncs from peers.
+**After `H`:** don't unset it. A node without the setting forks off. Don't downgrade a node past `H` either; if one was run on an older release after `H`, move its data directory aside before starting the new release again, so it resyncs from peers. Voting validators: see the note on data-directory wipes in [`CHECKPOINT_FINALITY_WIRING.md` §4.3](CHECKPOINT_FINALITY_WIRING.md#43-vote-the-missing-outbound-path) first.
 
 ## Rerolls (a new 40204 genesis)
 
@@ -68,7 +68,7 @@ A node that is still on an older release at `H` keeps producing and accepting bl
 - If its applied state was built on those blocks, the start-up recovery rebuilds state from genesis along the remaining chain, then the node syncs the canonical chain from upgraded peers. No data-directory wipe is needed. The rebuild replays the chain from genesis up to the last valid block. Measured with `hardening_rejoin::tests::rebuild_time` (debug build, MacBook, blocks without transactions): 150,000 blocks rebuilt in 87 s (about 1,700 blocks/s); the full start-up adds loading those blocks into the DAG store. Blocks with transactions take longer in proportion to their execution. The replay needs the block bodies back to genesis (leave `CITRATE_DAG_PRUNE_RETAIN` unset).
 - Transactions carried by the removed blocks are offered to the mempool again once the state is rebuilt.
 - If the node stops after removing the blocks but before the rebuild finishes, the next start rebuilds as usual; the transactions from the removed blocks are then not offered again, so their senders resubmit them.
-- A node running with `CITRATE_BLOCK_V2=0` cannot rebuild state by itself. It stops with instructions: move the data directory aside and restart to resync from peers.
+- A node running with `CITRATE_BLOCK_V2=0` cannot rebuild state by itself. It stops with instructions: move the data directory aside and restart to resync from peers. Voting validators: see the note on data-directory wipes in [`CHECKPOINT_FINALITY_WIRING.md` §4.3](CHECKPOINT_FINALITY_WIRING.md#43-vote-the-missing-outbound-path) first.
 
 Upgraded nodes count, per peer, blocks received in the pre-activation format at or after `H` that carry a valid block hash and proposer signature: metric `citrate_legacy_format_blocks_total{peer="..."}` (the first 4096 peers by id, the rest under `peer="other"`) and gauge `citrate_legacy_format_peers`, plus an info log line per peer. Use them to find nodes that have not upgraded.
 

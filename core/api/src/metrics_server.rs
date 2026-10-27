@@ -182,6 +182,29 @@ pub static PRODUCER_CATCHUP_STATE: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
     )
 });
 
+/// Slots the producer skipped because ECVRF proving failed. A non-zero rate means the
+/// node holds a key it cannot prove with: it produces nothing until that is fixed.
+pub static PRODUCER_VRF_PROVE_FAILURES: Lazy<prometheus::CounterVec> = Lazy::new(|| {
+    crate::metrics::must(
+        register_counter_vec!(
+            "citrate_producer_vrf_prove_failures_total",
+            "Block production slots skipped because ECVRF proving failed",
+            &[]
+        ),
+        "Failed to register producer VRF prove failure metric",
+    )
+});
+
+/// Count one slot skipped because ECVRF proving failed.
+pub fn record_producer_vrf_prove_failure() {
+    PRODUCER_VRF_PROVE_FAILURES.with_label_values(&[]).inc();
+}
+
+/// Total slots skipped because ECVRF proving failed (read side of the counter).
+pub fn producer_vrf_prove_failures() -> f64 {
+    PRODUCER_VRF_PROVE_FAILURES.with_label_values(&[]).get()
+}
+
 pub static PRODUCER_CATCHUP_HEIGHTS: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
     crate::metrics::must(
         register_gauge_vec!(

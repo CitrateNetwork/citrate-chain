@@ -3,10 +3,47 @@
 use crate::db::{column_families::*, RocksDB};
 use anyhow::Result;
 use citrate_consensus::types::Hash;
-use citrate_execution::executor::{StateStorageChange, StateStoreTrait};
+use citrate_execution::executor::{ReceiptIndexBatch, StateStorageChange, StateStoreTrait};
 use citrate_execution::types::{AccountState, Address, JobId, ModelId, ModelState, TrainingJob};
 use std::sync::Arc;
 use tracing::{debug, info};
+
+/// A storage key or value as persisted: raw bytes of any length.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StorageBytes(pub Vec<u8>);
+
+impl StorageBytes {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn into_vec(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+/// One persisted contract-storage record: `((address, key), value)`.
+pub type StorageRecord = ((Address, StorageBytes), StorageBytes);
+
+/// The hydration view a node had before the storage-root hardening fork: only
+/// records whose key is a 32-byte slot survive, and each value is cut or
+/// zero-padded to 32 bytes. Kept bit for bit, because a restarted node below
+/// the activation height must rebuild exactly the state it rebuilt before.
+pub fn legacy_hydration_view(records: Vec<StorageRecord>) -> Vec<StorageRecord> {
+    records
+        .into_iter()
+        .filter_map(|((address, key), value)| {
+            if key.0.len() != 32 {
+                return None;
+            }
+            let mut word = [0u8; 32];
+            if let Some(head) = value.0.first_chunk::<32>() {
+                word = *head;
+            }
+            Some(((address, key), StorageBytes(word.to_vec())))
+        })
+        .collect()
+}
 
 /// State storage manager
 pub struct StateStore {
@@ -75,7 +112,12 @@ impl StateStoreTrait for StateStore {
         accounts: &[(Address, AccountState)],
         storage: &[StateStorageChange],
     ) -> Result<()> {
-        self.write_state_batch_with_applied_tip(accounts, storage, None)
+        self.write_state_batch_with_applied_tip(
+            accounts,
+            storage,
+            None,
+            &ReceiptIndexBatch::default(),
+        )
     }
 
     /// SRP-S3b: atomically persist the state batch AND the applied-tip pointer in ONE
@@ -88,8 +130,9 @@ impl StateStoreTrait for StateStore {
         accounts: &[(Address, AccountState)],
         storage: &[StateStorageChange],
         applied_tip: Option<(Hash, u64)>,
+        index: &ReceiptIndexBatch,
     ) -> Result<()> {
-        if accounts.is_empty() && storage.is_empty() && applied_tip.is_none() {
+        if accounts.is_empty() && storage.is_empty() && applied_tip.is_none() && index.is_empty() {
             return Ok(());
         }
 
@@ -112,6 +155,8 @@ impl StateStoreTrait for StateStore {
                 }
             }
         }
+        // C1-R: the block's RPC receipt index commits in this same batch.
+        crate::chain::transaction_store::stage_receipt_index(&self.db, &mut batch, index)?;
         if let Some((hash, height)) = applied_tip {
             // Same key + layout as BlockStore::put_applied_tip (hash[32] || height_be[8]).
             let mut buf = [0u8; 40];
@@ -150,12 +195,14 @@ impl StateStoreTrait for StateStore {
         account_dels: &[Address],
         code: &[(Hash, Vec<u8>)],
         applied_tip: Option<(Hash, u64)>,
+        index: &ReceiptIndexBatch,
     ) -> Result<()> {
         if accounts.is_empty()
             && storage.is_empty()
             && account_dels.is_empty()
             && code.is_empty()
             && applied_tip.is_none()
+            && index.is_empty()
         {
             return Ok(());
         }
@@ -187,6 +234,8 @@ impl StateStoreTrait for StateStore {
             self.db
                 .batch_put_cf(&mut batch, CF_CODE, code_hash.as_bytes(), code)?;
         }
+        // C1-R: the block's RPC receipt index commits in this same batch.
+        crate::chain::transaction_store::stage_receipt_index(&self.db, &mut batch, index)?;
         if let Some((hash, height)) = applied_tip {
             // Same key + layout as BlockStore::put_applied_tip (hash[32] || height_be[8]).
             let mut buf = [0u8; 40];
@@ -223,6 +272,18 @@ impl StateStoreTrait for StateStore {
             crate::chain::block_store::APPLIED_TIP_KEY,
             &buf,
         )
+    }
+
+    /// C1-R: the receipt index on its own, as one fsync'd batch. The commit paths
+    /// stage it inside their state batch instead; this override keeps the
+    /// standalone trait method honest for any caller of the default fallback.
+    fn put_receipt_index(&self, index: &ReceiptIndexBatch) -> Result<()> {
+        if index.is_empty() {
+            return Ok(());
+        }
+        let mut batch = self.db.batch();
+        crate::chain::transaction_store::stage_receipt_index(&self.db, &mut batch, index)?;
+        self.db.write_batch_sync(batch)
     }
 
     // Sprint P950-A-4 WP-A.4.3: persist MVCC per-account versions.
@@ -327,30 +388,33 @@ impl StateStore {
         Ok(accounts)
     }
 
-    /// Get all storage (for state root calculation)
-    pub fn get_all_storage(&self) -> Result<Vec<((Address, Hash), Hash)>> {
+    /// Every persisted contract-storage record, with its exact key and value
+    /// bytes: the node's restart-hydration source.
+    ///
+    /// The executor writes 32-byte EVM slots and also its own variable-length
+    /// records (the governance admin, pending and applied parameters, model CID
+    /// and artifact indexes), so no key or value shape is assumed beyond the
+    /// 20-byte address prefix every writer puts first. A record shorter than
+    /// that cannot have come from a writer here and is an error, never skipped.
+    ///
+    /// Below the storage-root hardening height a restarted node applies
+    /// [`legacy_hydration_view`] to this result, so legacy roots are unchanged.
+    pub fn get_all_storage(&self) -> Result<Vec<StorageRecord>> {
         let mut storage = Vec::new();
         let iter = self.db.iter_cf(CF_STORAGE)?;
 
         for (key, value) in iter {
-            // Key format: address(20) + storage_key(32) = 52 bytes
-            if key.len() == 52 {
-                let (addr_part, key_part) = key.split_at(20);
-                let (Ok(addr_bytes), Ok(storage_key)) = (
-                    <[u8; 20]>::try_from(addr_part),
-                    <[u8; 32]>::try_from(key_part),
-                ) else {
-                    continue;
-                };
-                let address = Address(addr_bytes);
-
-                let mut storage_value = [0u8; 32];
-                if let Some(head) = value.first_chunk::<32>() {
-                    storage_value = *head;
-                }
-
-                storage.push(((address, Hash::new(storage_key)), Hash::new(storage_value)));
-            }
+            let Some((addr_part, key_part)) = key.split_first_chunk::<20>() else {
+                anyhow::bail!(
+                    "storage record with a {}-byte key: shorter than the 20-byte address \
+                     prefix (corrupt store)",
+                    key.len()
+                );
+            };
+            storage.push((
+                (Address(*addr_part), StorageBytes(key_part.to_vec())),
+                StorageBytes(value.to_vec()),
+            ));
         }
 
         Ok(storage)

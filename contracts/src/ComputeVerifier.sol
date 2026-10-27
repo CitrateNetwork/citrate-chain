@@ -80,6 +80,12 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
     /// @notice The ComputeMarketplace contract (only caller for verification actions)
     address public marketplace;
 
+    /// @notice True once the marketplace role has been used, handed over, or
+    ///         set by governance. Until then the account the constructor named
+    ///         may hand the role over once (see `handOverMarketplace`).
+    /// @dev Packed with `marketplace`, so the modifier reads it for free.
+    bool public marketplaceLocked;
+
     // Governance state lives in Governable mixin (audit SOL-21).
 
     /// @notice Trusted TEE attestation oracles
@@ -197,6 +203,8 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
 
     modifier onlyMarketplace() {
         require(msg.sender == marketplace, "ComputeVerifier: caller is not marketplace");
+        // Using the role ends the one-shot hand-over window.
+        if (!marketplaceLocked) marketplaceLocked = true;
         _;
     }
 
@@ -642,7 +650,26 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
         require(newMarketplace != address(0), "ComputeVerifier: zero address");
         address old = marketplace;
         marketplace = newMarketplace;
+        marketplaceLocked = true;
         emit MarketplaceUpdated(old, newMarketplace);
+    }
+
+    /// @notice One-shot hand-over of the marketplace role by the account the
+    ///         constructor named, to the deployed marketplace contract.
+    /// @dev The marketplace's constructor takes this verifier's address, so the
+    ///      verifier is deployed first with the deploy account as a provisional
+    ///      holder, which hands the role to the marketplace in the same deploy
+    ///      script. Allowed only before the role has been used (any
+    ///      marketplace call locks it) and only to a contract; afterwards only
+    ///      governance can move it (`setMarketplace`).
+    function handOverMarketplace(address newMarketplace) external {
+        require(msg.sender == marketplace, "ComputeVerifier: caller is not marketplace");
+        require(!marketplaceLocked, "ComputeVerifier: marketplace locked");
+        require(newMarketplace != msg.sender, "ComputeVerifier: same marketplace");
+        require(newMarketplace.code.length != 0, "ComputeVerifier: marketplace has no code");
+        marketplace = newMarketplace;
+        marketplaceLocked = true;
+        emit MarketplaceUpdated(msg.sender, newMarketplace);
     }
 
     // transferGovernance / acceptGovernance are inherited from Governable.

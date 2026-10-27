@@ -1,0 +1,39 @@
+name: Git dependency pins resolve
+
+# Every git dependency pin in a tracked Cargo.toml / Cargo.lock must still be
+# served by its remote. A rewrite of the dependency's history can strand a pin
+# without any change in this repo, so this also runs on a daily schedule.
+# Prove the check still detects a stranded pin (self-test), then scan the tree.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 5 * * *'   # daily 05:30 UTC
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - 'scripts/ci/git_rev_deps.py'
+      - 'scripts/ci/git_rev_deps_tripwire.sh'
+      - '.github/workflows/git-rev-deps.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: git-rev-deps-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  git-rev-deps:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Self-test (stranded rev / lock SHA / tag / remote must fail)
+        run: scripts/ci/git_rev_deps_tripwire.sh --self-test
+      - name: Every git pin resolves on its remote
+        run: scripts/ci/git_rev_deps_tripwire.sh

@@ -56,6 +56,8 @@ fn test_wp_a1_5_argon2_v2_different_password_different_key() {
     assert_ne!(k1, k2, "Password must propagate through the derivation");
 }
 
+// Compares against wallet-core, which only the `native` feature pulls in.
+#[cfg(feature = "native")]
 #[test]
 fn test_wp_a1_5_kdf_version_constant_matches_desktop_wallet() {
     // The browser's wasm bundle stamps `kdf_version: KDF_VERSION_CURRENT`
@@ -75,6 +77,8 @@ fn test_wp_a1_5_kdf_version_constant_matches_desktop_wallet() {
     );
 }
 
+// Compares against wallet-core, which only the `native` feature pulls in.
+#[cfg(feature = "native")]
 #[test]
 fn test_wp_a1_5_recipe_matches_wallet_core_dispatcher_output() {
     // Strongest parity check: derive a key via wasm_recipe and via

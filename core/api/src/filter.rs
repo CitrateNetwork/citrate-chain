@@ -1,5 +1,6 @@
 // citrate/core/api/src/filter.rs
 
+use crate::finalized_tag::FinalizedAnchor;
 use citrate_consensus::types::Hash;
 use citrate_execution::types::Address;
 use std::collections::HashMap;
@@ -15,6 +16,11 @@ pub enum FilterType {
         to_block: Option<u64>,
         addresses: Vec<Address>,
         topics: Vec<Option<Vec<Hash>>>,
+        /// The finalized anchor resolved at creation when `from_block` or
+        /// `to_block` came from a finality tag (`None` otherwise). Range reads
+        /// pass it to [`crate::finalized_tag::range_block_hashes`] so heights at
+        /// or below a certified height follow the certified chain.
+        finalized_anchor: Option<FinalizedAnchor>,
     },
     /// Block filter - returns new block hashes
     Block,
@@ -146,6 +152,20 @@ impl FilterRegistry {
         topics: Vec<Option<Vec<Hash>>>,
         current_block: u64,
     ) -> Option<u64> {
+        self.new_log_filter_anchored(from_block, to_block, addresses, topics, current_block, None)
+    }
+
+    /// [`Self::new_log_filter`] carrying the finalized anchor a finality-tag
+    /// bound resolved to.
+    pub fn new_log_filter_anchored(
+        &self,
+        from_block: Option<u64>,
+        to_block: Option<u64>,
+        addresses: Vec<Address>,
+        topics: Vec<Option<Vec<Hash>>>,
+        current_block: u64,
+        finalized_anchor: Option<FinalizedAnchor>,
+    ) -> Option<u64> {
         let now = Instant::now();
         let mut filters = self.filters.write().unwrap_or_else(|e| e.into_inner());
         // CHAIN-B-D003: refuse creation past the cap.
@@ -160,6 +180,7 @@ impl FilterRegistry {
                 to_block,
                 addresses,
                 topics,
+                finalized_anchor,
             },
             last_poll_block: current_block,
             created_at: now,

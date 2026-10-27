@@ -242,8 +242,10 @@ pub fn manual_resync_instructions(data_dir: &std::path::Path, activation: u64) -
         "This node's database holds blocks at or above the activation height {activation} that \
          are invalid under this release, and the node cannot rebuild its state automatically in \
          this mode. To rejoin: stop the node, move the data directory {} aside (keep it until \
-         the node has resynced), and start the node again; it will sync the chain from peers.",
-        data_dir.display()
+         the node has resynced), and start the node again; it will sync the chain from peers. \
+         {}",
+        data_dir.display(),
+        citrate_storage::VOTING_VALIDATOR_WIPE_NOTE
     )
 }
 
@@ -1323,7 +1325,7 @@ pub(crate) mod tests {
     fn start_node_wiring() {
         let main = include_str!("main.rs");
         let body = &main[main.find("async fn start_node(").expect("start_node")..];
-        let init = body.find("init_pba_hardening_for_chain(").expect("init");
+        let init = body.find("init_pba_hardening_for_genesis(").expect("init");
         let purge = body
             .find("hardening_rejoin::purge_invalid_post_activation(")
             .expect("start-up check");
@@ -1388,6 +1390,7 @@ pub(crate) mod tests {
             None,
             Some("team_testnet"),
             Some("mainnet"),
+            Some("r1006"),
         ] {
             let g = build(40204, profile).await;
             assert!(
@@ -1512,5 +1515,6 @@ pub(crate) mod tests {
     fn resync_message_is_actionable() {
         let m = manual_resync_instructions(Path::new("/data/citrate"), 42);
         assert!(m.contains("42") && m.contains("/data/citrate") && m.contains("move"));
+        assert!(m.contains("checkpoint_signed:") && m.contains("double-signing"));
     }
 }

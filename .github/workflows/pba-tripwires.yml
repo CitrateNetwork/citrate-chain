@@ -30,3 +30,28 @@ jobs:
         run: scripts/ci/check_pba_exec_tripwires.sh --self-test
       - name: CHAIN-EXEC tripwires (signature setting, node feature set, mempool expiry, metrics bind)
         run: scripts/ci/check_pba_exec_tripwires.sh
+      # The testnet deploy script installs only pinned, verified releases. The test greps
+      # all of scripts/ (test fixtures included), so it fails on any new unpinned-download
+      # string anywhere under scripts/. Runs unprivileged with a sandboxed HOME.
+      - name: Deploy-testnet supply-chain test
+        run: bash scripts/tests/test_deploy_testnet_supply_chain.sh
+      - name: SALT supply tripwire self-test
+        run: scripts/ci/salt_supply_tripwire.sh --self-test
+      - name: SALT supply basis (contracts constant = core/economics; no literal governor supply)
+        run: scripts/ci/salt_supply_tripwire.sh
+      - name: Privileged-slot tripwire self-test
+        run: scripts/ci/privileged_slots_tripwire.sh --self-test
+      - name: Privileged slots of DeployAll contracts are swept or exempt with a reason
+        run: scripts/ci/privileged_slots_tripwire.sh
+      - name: Mempool lock-order tripwire (self-test, then scan)
+        run: |
+          scripts/ci/mempool_lock_order_tripwire.sh --self-test
+          scripts/ci/mempool_lock_order_tripwire.sh
+      - name: Genesis-keyed pins tripwire self-test
+        run: scripts/ci/genesis_keyed_pins_tripwire.sh --self-test
+      - name: New hardening rules are scheduled only by (chain id, genesis) (no chain-id pin table or match)
+        run: scripts/ci/genesis_keyed_pins_tripwire.sh
+      - name: Direct state-write tripwire self-test
+        run: scripts/ci/direct_state_write_tripwire.sh --self-test
+      - name: Execution writes state through the per-tx journal (or an allowed legacy/out-of-tx form)
+        run: scripts/ci/direct_state_write_tripwire.sh

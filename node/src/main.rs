@@ -68,17 +68,23 @@ compile_error!(
 );
 mod contribution_recorder;
 mod dag_prune;
+#[cfg(test)]
+mod finality_adversarial_tests;
 mod finality_driver;
+mod finality_floor;
 mod genesis;
 mod hardening_rejoin;
+mod host_identity;
 mod inference;
 pub mod logging;
+mod memory_bounds;
 pub mod metrics;
 mod model_manager;
 mod model_verifier;
 mod network_inference;
 mod persistent_dag;
 mod producer;
+mod registration_proof;
 mod registry_sync;
 mod rollback;
 mod startup_guards;
@@ -293,6 +299,18 @@ enum Commands {
         json: bool,
     },
 
+    /// Print this host's proof of key control for the r1006 genesis producer set: the
+    /// proposer key's signature over the ValidatorRegistry registration digest (chain id,
+    /// registry, staker, nonce 0). Public values only; the key is never printed.
+    RegistrationProof {
+        /// The ValidatorRegistry the genesis registers producers in.
+        #[arg(long)]
+        registry: String,
+        /// The staker (must be this node's coinbase; defaults to it).
+        #[arg(long)]
+        staker: Option<String>,
+    },
+
     /// Roll this node's stored chain back to a height. Run it with the node
     /// stopped. Removes every block above --to-height and any other block at
     /// it, keeps --keep there, and refuses the removed branch from peers from
@@ -315,6 +333,29 @@ enum Commands {
         /// node then rebuilds its state from genesis at the next start.
         #[arg(long)]
         rebuild_state: bool,
+    },
+
+    /// Producer bring-up: mint (with --mint) or read this host's identity and print
+    /// ONLY its public parts as JSON: Noise peer id, proposer (ed25519) and VRF
+    /// (P-256) public keys, and the staker = coinbase address from a v3 keystore.
+    /// The noise and proposer keys are minted by the node's own loaders (0600);
+    /// nothing secret is printed. See node/src/host_identity.rs.
+    HostIdentity {
+        /// The node's data dir (where noise.key and proposer.key live).
+        #[arg(long, value_name = "DIR")]
+        identity_dir: PathBuf,
+        /// Staker (= coinbase) Web3 v3 keystore path.
+        #[arg(long, value_name = "PATH")]
+        staker_keystore: PathBuf,
+        /// Keystore password file (made with a random password when minting).
+        #[arg(long, value_name = "PATH")]
+        staker_password_file: PathBuf,
+        /// Create whatever is missing. Without it, a missing file is an error.
+        #[arg(long)]
+        mint: bool,
+        /// Also write the public identity to this file (mode 0644).
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
     },
 
     /// Wallet management (accounts, balances, transfers)
@@ -470,6 +511,29 @@ async fn main() -> Result<()> {
             .await?;
             return Ok(());
         }
+        Some(Commands::RegistrationProof { registry, staker }) => {
+            let cfg_path = resolve_config_path(cli.config.clone()).ok_or_else(|| {
+                anyhow::anyhow!("registration-proof needs the node config (--config)")
+            })?;
+            let cfg = NodeConfig::from_file(&cfg_path)?;
+            let coinbase = format!(
+                "0x{}",
+                cfg.mining
+                    .coinbase
+                    .trim()
+                    .trim_start_matches("0x")
+                    .to_lowercase()
+            );
+            let staker = staker.unwrap_or_else(|| coinbase.clone());
+            if staker.to_lowercase() != coinbase {
+                anyhow::bail!("the staker must be this node's coinbase {coinbase} (consensus requires coinbase == staker)");
+            }
+            let data_dir = cli.data_dir.clone().unwrap_or(cfg.storage.data_dir.clone());
+            let key = registration_proof::load_proposer_key(&data_dir.join("proposer.key"))?;
+            let p = registration_proof::proof(cfg.chain.chain_id, &registry, &staker, &key)?;
+            println!("{}", serde_json::to_string_pretty(&p)?);
+            return Ok(());
+        }
         Some(Commands::Keygen { ed25519 }) => {
             generate_keypair(ed25519);
             return Ok(());
@@ -479,27 +543,76 @@ async fn main() -> Result<()> {
             // env override and the config file's `[chain].pba_hardening_height`.
             let file_cfg = resolve_config_path(cli.config.clone())
                 .and_then(|p| NodeConfig::from_file(&p).ok());
-            let (cfg_chain_id, configured, dev_profile, agent_configured) = match &file_cfg {
+            let (
+                cfg_chain_id,
+                configured,
+                dev_profile,
+                agent_configured,
+                exact_configured,
+                supply_configured,
+                storage_root_configured,
+            ) = match &file_cfg {
                 Some(c) => (
                     c.chain.chain_id,
                     c.chain.pba_hardening_height,
                     c.chain.dev_profile,
                     c.chain.agent_precompiles_height,
+                    c.chain.exact_create_code_height,
+                    c.chain.supply_hardening_height,
+                    c.chain.storage_root_hardening_height,
                 ),
-                None => (40204, None, false, None),
+                None => (40204, None, false, None, None, None, None),
             };
             let chain_id = cli.chain_id.unwrap_or(cfg_chain_id);
-            let resolved = citrate_consensus::hardening::resolve_pba_hardening_for_chain(
+            // The genesis this node runs: the data directory's block 0 when it can be read
+            // (not while the node holds the database), else the compiled r1006 genesis for
+            // an r1006 config, else unknown (a release chain id then resolves as its
+            // release genesis, every rule unset).
+            let profile = file_cfg
+                .as_ref()
+                .and_then(|c| c.chain.genesis_profile.clone());
+            let from_data_dir: Option<[u8; 32]> = file_cfg.as_ref().and_then(|c| {
+                StorageManager::new(&c.storage.data_dir, PruningConfig::default())
+                    .ok()
+                    .and_then(|st| st.blocks.get_block_by_height(0).ok().flatten())
+                    .map(|h| *h.as_bytes())
+            });
+            let cmd_genesis: Option<[u8; 32]> = from_data_dir.or_else(|| {
+                (profile.as_deref() == Some(genesis::R1006_PROFILE))
+                    .then_some(citrate_consensus::hardening::R1006_GENESIS)
+            });
+            let g = cmd_genesis.as_ref();
+            // Publish every height exactly as start_node does, then report the ONE
+            // manifest a node reports (ConsensusManifest::for_node).
+            let acts = g.and_then(|g| citrate_consensus::hardening::rules_for_genesis(chain_id, g));
+            citrate_consensus::hardening::init_pba_hardening_for_genesis(
                 chain_id,
+                acts.as_ref(),
                 configured,
                 dev_profile,
             )
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let (agent_height, _) =
-                citrate_execution::agent_fork::resolve_for_chain(chain_id, agent_configured)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let manifest =
-                consensus_manifest::ConsensusManifest::for_heights(resolved.height, agent_height);
+            citrate_execution::agent_fork::init_for_chain(chain_id, agent_configured)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            citrate_execution::exact_code::init_for_genesis(chain_id, g, exact_configured)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            citrate_consensus::vrf_encoding::init_for_genesis(
+                chain_id,
+                g,
+                file_cfg
+                    .as_ref()
+                    .and_then(|c| c.chain.vrf_canonical_encoding_height),
+            )
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+            citrate_execution::supply_hardening::init_for_genesis(chain_id, g, supply_configured)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            citrate_execution::storage_root_hardening::init_for_genesis(
+                chain_id,
+                g,
+                storage_root_configured,
+            )
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let manifest = consensus_manifest::ConsensusManifest::for_node(profile.as_deref(), g);
             // The activation heights compiled into this release (a node on a
             // pinned chain runs that height; see the start-up banner for the
             // height a configured node resolved).
@@ -511,6 +624,13 @@ async fn main() -> Result<()> {
                 let mut v = serde_json::to_value(&manifest).unwrap_or_default();
                 if let Some(obj) = v.as_object_mut() {
                     obj.insert("pba_hardening_pins".into(), serde_json::Value::Array(pins));
+                    obj.insert(
+                        "r1006_genesis".into(),
+                        serde_json::Value::String(format!(
+                            "0x{}",
+                            hex::encode(citrate_consensus::hardening::R1006_GENESIS)
+                        )),
+                    );
                 }
                 println!(
                     "{}",
@@ -571,6 +691,27 @@ async fn main() -> Result<()> {
                 dry_run,
                 rebuild_state,
             )?;
+            return Ok(());
+        }
+        Some(Commands::HostIdentity {
+            identity_dir,
+            staker_keystore,
+            staker_password_file,
+            mint,
+            out,
+        }) => {
+            let id = host_identity::run(
+                &host_identity::IdentityPaths {
+                    data_dir: identity_dir,
+                    staker_keystore,
+                    staker_password_file,
+                },
+                mint,
+            )?;
+            if let Some(out) = out {
+                host_identity::write_public(&out, &id)?;
+            }
+            println!("{}", serde_json::to_string_pretty(&id)?);
             return Ok(());
         }
         Some(Commands::Wallet {
@@ -758,6 +899,9 @@ async fn main() -> Result<()> {
         };
 
         let genesis_profile = config.chain.genesis_profile.as_deref();
+        if genesis_profile == Some(genesis::R1006_PROFILE) {
+            genesis::check_r1006_bootable(genesis::r1006_rehearsal_from_env())?;
+        }
         genesis::initialize_genesis_state_with_profile(
             probe_storage,
             executor,
@@ -1397,6 +1541,60 @@ fn parse_storage_key_hex(hex_str: &str, source: &str) -> Result<zeroize::Zeroizi
 
 async fn start_node(config: NodeConfig) -> Result<()> {
     info!("Starting Citrate node...");
+    // Rules compiled for THIS chain's block 0 (keyed by genesis hash, not chain id: r1005
+    // and r1006 share 40204). Read before any consensus or execution component exists.
+    let running_genesis: Option<[u8; 32]> = {
+        let probe = StorageManager::with_config(
+            &config.storage.data_dir,
+            StorageConfig {
+                pruning: PruningConfig::default(),
+                encryption: at_rest_encryption_from_env()?,
+            },
+        )?;
+        let g = probe
+            .blocks
+            .get_block_by_height(0)
+            .ok()
+            .flatten()
+            .map(|h| *h.as_bytes());
+        drop(probe);
+        g
+    };
+    let genesis_acts = running_genesis
+        .and_then(|g| citrate_consensus::hardening::rules_for_genesis(config.chain.chain_id, &g));
+    genesis::r1006_boot_guard(
+        config.chain.chain_id,
+        config.chain.genesis_profile.as_deref(),
+        running_genesis.as_ref(),
+        &citrate_economics::r1006::readiness()
+            .map_err(|e| anyhow::anyhow!("invalid r1006 genesis: {e}"))?,
+        genesis::r1006_rehearsal_from_env(),
+    )?;
+    let on_demand = producer::check_mine_on_demand(
+        std::env::var(producer::MINE_ON_DEMAND_ENV).ok().as_deref(),
+        config.chain.genesis_profile.as_deref(),
+        config.rpc.listen_addr.ip().is_loopback(),
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
+    producer::set_mine_on_demand(on_demand);
+    if on_demand {
+        warn!("Build devnet: blocks are produced only when a transaction is pending");
+    }
+    if let Some(a) = &genesis_acts {
+        for (name, h) in a.entries() {
+            let wired = citrate_consensus::hardening::GenesisActivations::WIRED.contains(&name);
+            info!(
+                "Genesis-pinned rule {name}: {} ({})",
+                h.map(|h| format!("from height {h}"))
+                    .unwrap_or_else(|| "not scheduled".into()),
+                if wired {
+                    "enforced by this build"
+                } else {
+                    "recorded; the rule is not in this build"
+                }
+            );
+        }
+    }
     // HUP-S7.2: the agent precompile fork height, published before any
     // execution component is built. 40204 pins it at genesis (active from
     // block 1); other chains are off unless env or config sets a height. On a
@@ -1418,33 +1616,89 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             agent_fork_source
         ),
     }
-
-    {
-        // Consensus-alignment stamp — logged at boot so field drift is diagnosable
-        // from the journal (the app node and fleet MUST share this fingerprint).
-        // The fingerprint covers the activation height this node will run
-        // with (release pin for the chain, env override, [chain] key).
-        let m = consensus_manifest::ConsensusManifest::for_height(
-            citrate_consensus::hardening::resolve_pba_hardening_for_chain(
-                config.chain.chain_id,
-                config.chain.pba_hardening_height,
-                config.chain.dev_profile,
-            )
-            .ok()
-            .and_then(|r| r.height),
-        );
-        info!(
-            "Consensus manifest: git={}{} halo2={} pba_hardening_height={:?} fingerprint={}",
-            m.git_sha,
-            if m.git_dirty { "(DIRTY)" } else { "" },
-            m.feat_halo2_verifier,
-            m.pba_hardening_height,
-            m.fingerprint
-        );
-        if m.git_dirty {
-            warn!("Node built from a DIRTY tree — not reproducibly aligned with the fleet");
-        }
+    // The exact-created-code rule, published before any execution component is
+    // built. Unset by default on every chain (the padded legacy form, as the
+    // previous binary); a new genesis sets 0 through `[chain]
+    // exact_create_code_height` or the env override.
+    let (exact_code_height, exact_code_source) = citrate_execution::exact_code::init_for_genesis(
+        config.chain.chain_id,
+        running_genesis.as_ref(),
+        config.chain.exact_create_code_height,
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
+    match exact_code_height {
+        Some(h) => info!(
+            "Exact created-code rule ACTIVE from height {} (source: {}): contracts created \
+             inside a call store their original code bytes",
+            h, exact_code_source
+        ),
+        None => info!(
+            "Exact created-code rule not scheduled (source: {}); created code stored as before",
+            exact_code_source
+        ),
     }
+    // Canonical ECVRF proof encoding height, published before the DAG store
+    // (whose VRF selector captures it) is built. 40204 leaves it unscheduled
+    // in this release; a disagreeing env or config value on a release network
+    // aborts start-up instead of forking this node at the height.
+    let (vrf_encoding_height, vrf_encoding_source) =
+        citrate_consensus::vrf_encoding::init_for_genesis(
+            config.chain.chain_id,
+            running_genesis.as_ref(),
+            config.chain.vrf_canonical_encoding_height,
+        )
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    match vrf_encoding_height {
+        Some(h) => info!(
+            "Canonical ECVRF proof encoding required from height {} (source: {})",
+            h, vrf_encoding_source
+        ),
+        None => info!(
+            "Canonical ECVRF proof encoding not scheduled (source: {}); proof decoding unchanged",
+            vrf_encoding_source
+        ),
+    }
+    // Supply-accounting hardening fork height, published before any execution
+    // component is built. Not scheduled on 40204 until a release pins it; on a
+    // release network a disagreeing env or config value aborts start-up.
+    let (supply_height, supply_source) = citrate_execution::supply_hardening::init_for_genesis(
+        config.chain.chain_id,
+        running_genesis.as_ref(),
+        config.chain.supply_hardening_height,
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
+    match supply_height {
+        Some(h) => info!(
+            "Supply hardening fork ACTIVE from height {} (source: {})",
+            h, supply_source
+        ),
+        None => info!(
+            "Supply hardening fork not scheduled (source: {}); legacy rules",
+            supply_source
+        ),
+    }
+    // Storage-root hardening fork height, published before state is hydrated
+    // and before any execution component is built. Not scheduled on 40204 until
+    // a release pins it; on a release network a disagreeing env or config value
+    // aborts start-up.
+    let (storage_root_height, storage_root_source) =
+        citrate_execution::storage_root_hardening::init_for_genesis(
+            config.chain.chain_id,
+            running_genesis.as_ref(),
+            config.chain.storage_root_hardening_height,
+        )
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    match storage_root_height {
+        Some(h) => info!(
+            "Storage root hardening fork ACTIVE from height {} (source: {})",
+            h, storage_root_source
+        ),
+        None => info!(
+            "Storage root hardening fork not scheduled (source: {}); legacy rules",
+            storage_root_source
+        ),
+    }
+
     info!("Chain ID: {}", config.chain.chain_id);
     info!("Data directory: {:?}", config.storage.data_dir);
 
@@ -1461,17 +1715,38 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         std::env::var("CITRATE_CHAIN_ID").ok().as_deref(),
     )
     .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let node_manifest: Option<consensus_manifest::ConsensusManifest>;
     let pba_activation = {
         // ONE store, ONE resolution order (release pin for the chain, then
         // env override, then [chain] key): consensus, network and execution
         // (`citrate_execution::activation`) all read what this publishes.
-        let pba = citrate_consensus::hardening::init_pba_hardening_for_chain(
+        let pba = citrate_consensus::hardening::init_pba_hardening_for_genesis(
             config.chain.chain_id,
+            genesis_acts.as_ref(),
             config.chain.pba_hardening_height,
             config.chain.dev_profile,
         )
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-        let fp = consensus_manifest::ConsensusManifest::current().fingerprint;
+        // Consensus-alignment stamp. ONE manifest for the boot log, the node-identity RPC
+        // and `citrate consensus` (ConsensusManifest::for_node): every height is read from
+        // its process store, all published above, and it is bound to the loaded genesis.
+        let manifest = consensus_manifest::ConsensusManifest::for_node(
+            config.chain.genesis_profile.as_deref(),
+            running_genesis.as_ref(),
+        );
+        info!(
+            "Consensus manifest: git={}{} halo2={} pba_hardening_height={:?} fingerprint={}",
+            manifest.git_sha,
+            if manifest.git_dirty { "(DIRTY)" } else { "" },
+            manifest.feat_halo2_verifier,
+            manifest.pba_hardening_height,
+            manifest.fingerprint
+        );
+        if manifest.git_dirty {
+            warn!("Node built from a DIRTY tree — not reproducibly aligned with the fleet");
+        }
+        let fp = manifest.fingerprint.clone();
+        node_manifest = Some(manifest);
         match pba.height {
             Some(h) => info!(
                 "Block-validity hardening ACTIVE from height {} [{}] (tx signature + \
@@ -1625,12 +1900,45 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         }
     }
 
-    // C6 fix: Also load contract storage slots from persistent storage
+    // The applied tip = the block whose committed state the store holds. Fall back to
+    // the latest block only when no applied-tip pointer exists (pre-S3b stores / fresh
+    // genesis), preserving the prior behavior for those.
+    let (boot_tip_hash, boot_tip_height) = storage
+        .blocks
+        .get_applied_tip()
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| {
+            let h = storage.blocks.get_latest_height().unwrap_or(0);
+            let hash = storage
+                .blocks
+                .get_block_by_height(h)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            (hash, h)
+        });
+
+    // C6 fix: Also load contract storage slots from persistent storage.
+    // From the storage-root hardening height (the next block this node executes)
+    // every persisted record is restored byte for byte; below it the legacy view
+    // (32-byte keys, values cut or padded to 32 bytes) is kept, so a restarted
+    // node rebuilds exactly the state it rebuilt before.
+    let full_hydration = citrate_execution::storage_root_hardening::active_at(
+        citrate_execution::storage_root_hardening::storage_root_hardening_height(),
+        boot_tip_height.saturating_add(1),
+    );
     match storage.state.get_all_storage() {
-        Ok(storage_slots) => {
+        Ok(records) => {
+            let storage_slots = boot_storage_view(
+                records,
+                citrate_execution::storage_root_hardening::storage_root_hardening_height(),
+                boot_tip_height,
+            );
             info!(
-                "Found {} storage slots in storage, loading into memory...",
-                storage_slots.len()
+                "Found {} storage slots in storage, loading into memory ({} hydration)...",
+                storage_slots.len(),
+                if full_hydration { "full" } else { "legacy" }
             );
             for ((address, storage_key), storage_value) in storage_slots {
                 state_db.set_storage(
@@ -1644,7 +1952,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             info!("Storage slots loaded successfully");
         }
         Err(e) => {
-            warn!("Failed to load storage slots from storage: {}", e);
+            // Starting without contract storage would execute and root against
+            // a state this node never committed. Refuse instead.
+            error!("Failed to load storage slots from storage: {}", e);
+            return Err(anyhow::anyhow!(
+                "refusing to start: contract storage could not be hydrated: {e}"
+            ));
         }
     }
 
@@ -1657,25 +1970,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // durable state are advanced ATOMICALLY (persist_state_changes_with_tip), so they must
     // always agree — a mismatch means a genuinely corrupt/divergent reconstruction.
     {
+        let (tip_hash, tip_height) = (boot_tip_hash, boot_tip_height);
+        // The hydrated state is the post-state of the applied tip: root it under
+        // that height's storage-root rule.
+        state_db.set_root_height(tip_height);
         let memory_root = state_db.calculate_state_root();
-        // The applied tip = the block whose committed state the store holds. Fall back to
-        // the latest block only when no applied-tip pointer exists (pre-S3b stores / fresh
-        // genesis), preserving the prior behavior for those.
-        let (tip_hash, tip_height) = storage
-            .blocks
-            .get_applied_tip()
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| {
-                let h = storage.blocks.get_latest_height().unwrap_or(0);
-                let hash = storage
-                    .blocks
-                    .get_block_by_height(h)
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-                (hash, h)
-            });
         if tip_height > 0 && tip_hash != citrate_consensus::types::Hash::default() {
             let committed_root = storage
                 .state
@@ -1972,23 +2271,23 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // enforces stake-gated proposer membership — a shared selector is attached to the DAG
     // store (admission gate) and rebuilt each epoch from the registry (registry_sync).
     // OFF by default (env unset) → no selector, no behavior change.
-    let validator_registry: Option<([u8; 20], u64)> = std::env::var("CITRATE_VALIDATOR_REGISTRY")
-        .ok()
-        .and_then(|reg_hex| match hex::decode(reg_hex.trim().trim_start_matches("0x")) {
-            Ok(bytes) if bytes.len() == 20 => {
-                let mut registry = [0u8; 20];
-                registry.copy_from_slice(&bytes);
-                let activation_height = std::env::var("CITRATE_VALIDATOR_ACTIVATION_HEIGHT")
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u64>().ok())
-                    .unwrap_or(0);
-                Some((registry, activation_height))
-            }
-            _ => {
-                warn!("CITRATE_VALIDATOR_REGISTRY set but not a valid 0x-hex 20-byte address; stake-gating DISABLED");
-                None
-            }
-        });
+    // On the r1006 genesis with its producer set filled, the registry and the activation
+    // height are compiled into the genesis profile (genesis::resolve_validator_registry);
+    // the env may only repeat them. On any other chain the env decides, as before.
+    let compiled_validator_set =
+        if running_genesis == Some(citrate_consensus::hardening::R1006_GENESIS) {
+            citrate_economics::r1006::validator_set_binding()
+                .map_err(|e| anyhow::anyhow!("invalid r1006 genesis: {e}"))?
+        } else {
+            None
+        };
+    let validator_registry: Option<([u8; 20], u64)> = genesis::resolve_validator_registry(
+        compiled_validator_set,
+        std::env::var("CITRATE_VALIDATOR_REGISTRY").ok().as_deref(),
+        std::env::var("CITRATE_VALIDATOR_ACTIVATION_HEIGHT")
+            .ok()
+            .as_deref(),
+    )?;
     // VALIDATOR-S1 §R': fail fast if the activation height is below the FIRST
     // materialized snapshot S(1) = EPOCH - SNAPSHOT_LAG (= 800). Below S(1) no epoch
     // policy is ever materialized, so — with the §R' hard-reject — every block at/above
@@ -2032,7 +2331,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         .with_enforcement_activation_height(*activation),
                     _ => store,
                 };
-                info!("DAG store created with strict_vrf={}", strict_vrf);
+                let resident_bodies = memory_bounds::dag_resident_bodies();
+                let store = store.with_resident_body_cap(resident_bodies);
+                info!(
+                    "DAG store created with strict_vrf={} resident_bodies={}",
+                    strict_vrf, resident_bodies
+                );
                 Arc::new(store)
             }
             Err(e) => {
@@ -2085,11 +2389,18 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         validator_selector.clone(),
     ));
     let finality_voting_on = finality_gadget.enabled();
-    // Finalized height as OBSERVED (not enforced) while the producer path runs:
-    // backs the `finalized`/`safe` RPC tags without raising the reorg floor. Floor
-    // ENFORCEMENT needs the (height, hash) certificate check of spec §4.5 (Stage
-    // 1c); raising the floor on height alone could pin this node to a losing branch.
+    // Finalized height as VERIFIED by the Stage 1c floor verifier while the
+    // producer path runs; only ever advances to a certificate whose (height,
+    // hash) is this node's own canonical block (spec §4.5). Always reported as
+    // `citrate_finality_verified_height`; the reorg floor AND the
+    // `finalized`/`safe` RPC tags follow it only under the separate compiled
+    // enforcement pin (`finality_floor::FloorMode::Enforced`).
     let finality_observed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // The source the RPC `finalized`/`safe` tags read, chosen by the floor
+    // verifier for its mode (Enforced: verified (height, hash) pairs resolved
+    // by hash); stays `None` without a canonical applicator (tags then resolve
+    // to genesis).
+    let mut finality_rpc_handle: Option<citrate_api::FinalizedTagSource> = None;
 
     // EXECUTE-ON-RECEIVE (step 2): the fast-path applier. Active under v2 headers
     // (CITRATE_BLOCK_V2) — the flag that makes a block's state_root reproducible by a
@@ -2151,38 +2462,42 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 "EXECUTE-ON-RECEIVE: fast-path applier + reorg ENABLED (received blocks executed + state-root-verified); applied head = {} @ {}",
                 start.hash, start.height
             );
-            // I4: keep the reorg floor in sync with BFT finality so a reorg can
-            // never revert below a finalized checkpoint. Cheap poll (the applied
-            // height advances ~1/s); the floor is monotonic in the checkpoint mgr.
-            //
-            // WP-S.3 Stage 1a: when the producer path is ON, checkpoints really
-            // finalize, and raising the floor on HEIGHT alone is exactly what spec
-            // §4.5 forbids (it must first check the certified hash is this node's
-            // canonical block). So with the switch ON the poll publishes into the
-            // OBSERVED handle only (RPC tags) and leaves the reorg floor at its
-            // value; hash-checked enforcement is Stage 1c. With the switch OFF this
-            // is the unchanged pre-Stage-1a poll (nothing can finalize then).
-            let floor = if finality_voting_on {
-                info!(
-                    "checkpoint finality: finalized height is OBSERVED only (RPC tags); reorg \
-                     floor enforcement awaits the §4.5 certificate check"
-                );
-                finality_observed.clone()
-            } else {
-                app.finalized_height_handle()
-            };
-            let cp = checkpoint_manager.clone();
-            tokio::spawn(async move {
-                // #310: Skip — no burst of floor polls after a stall.
-                let mut tick = timing::cadence_interval(std::time::Duration::from_secs(5));
-                loop {
-                    tick.tick().await;
-                    let h = cp.latest_finalized_height().await;
-                    if h > floor.load(std::sync::atomic::Ordering::SeqCst) {
-                        floor.store(h, std::sync::atomic::Ordering::SeqCst);
-                    }
-                }
-            });
+            // I4 / WP-S.3 Stage 1c (spec §4.5): the reorg floor follows BFT
+            // finality only through a VERIFIED certificate whose (height, hash) is
+            // this node's own canonical block — never a height alone, which could
+            // pin the node to a losing branch. Mode from the two compiled pins:
+            //   Legacy   (voting OFF, this release): no floor poll at all. Nothing
+            //            can finalize with voting off, so the old height poll never
+            //            moved the floor on a node that never voted; a certificate
+            //            persisted by an earlier voting-ON run is logged and ignored.
+            //   Observed (voting ON, enforcement OFF): verified height -> metric
+            //            only; floor and RPC tags unchanged (genesis).
+            //   Enforced (both ON): verified height raises the floor and the
+            //            RPC tags — AT FINALIZATION (the verifier is installed as
+            //            the checkpoint manager's FinalizationGuard, so the floor
+            //            rises before the finalized height is visible; spec §5 S2),
+            //            with the 5 s poll as a backstop.
+            // Mismatch / invalid certificate: safety stop (gadget halted, floor and
+            // RPC tags frozen, CHECKPOINT FINALITY SAFETY STOP alarm + metrics).
+            // Same compiled voting pin and chain id as `finality_gadget` (whose
+            // manager was built with `config.chain.chain_id`).
+            let floor_mode = finality_floor::FloorMode::for_chain(config.chain.chain_id);
+            let floor_verifier = Arc::new(finality_floor::FloorVerifier::new(
+                floor_mode,
+                checkpoint_manager.clone(),
+                app.clone(),
+                finality_gadget.safety_stop(),
+                finality_observed.clone(),
+            ));
+            // Enforced only (no-op in Legacy / Observed): installed before the
+            // boot check and before the driver / vote handler can finalize.
+            let _ = floor_verifier.install_finalization_guard();
+            // Boot check BEFORE any block admission, drain or recovery (all set up
+            // below): a node restarting with a certificate for a branch it is not on
+            // halts finality before it does anything else.
+            let _ = floor_verifier.boot_check().await;
+            finality_rpc_handle = Some(floor_verifier.rpc_finalized_handle());
+            let _ = floor_verifier.spawn();
             Some(app)
         } else {
             None
@@ -2218,7 +2533,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         error!(
             "chain data holds block {stored} at height {height}, but this network's canonical \
              block there is {canonical}: this database is on a branch the network does not \
-             continue. Stop the node, move the chain data aside (keep the keys) and resync."
+             continue. Stop the node, move the chain data aside (keep the keys) and resync. \
+             {}",
+            citrate_storage::VOTING_VALIDATOR_WIPE_NOTE
         );
     }
 
@@ -2229,6 +2546,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // (no-op when unset). Merge blocks are scored from a bounded window
     // (MS-BOUND, ghostdag::MERGE_SCORE_WINDOW), so pruning no longer breaks them.
     dag_prune::spawn(storage.clone(), shared_dag_store.clone());
+    memory_bounds::spawn_report(storage.clone(), shared_dag_store.clone());
 
     // D2.4: repair partial admissions already on disk. Any node that ran a
     // pre-D2 binary can be carrying a chain-store hole with the block sitting
@@ -3719,22 +4037,25 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // the same `finalized_height` handle the canonical applicator exposes and
             // the 5 s finality poll keeps current. None (no applicator) => tags resolve
             // to genesis (block 0), never error.
-            // WP-S.3 Stage 1a: with the producer path ON the tags read the OBSERVED
-            // finalized height (the floor itself is not raised until Stage 1c).
-            canonical_applicator.as_ref().map(|app| {
-                if finality_voting_on {
-                    finality_observed.clone()
-                } else {
-                    app.finalized_height_handle()
-                }
-            }),
+            // WP-S.3 Stage 1c: only in Enforced mode (voting + enforcement pins
+            // ON) do the tags read the VERIFIED finalized (height, hash) pairs,
+            // resolved by the certified block's hash, never a sibling through the
+            // height index (`FloorVerifier::rpc_finalized_handle`); Legacy and Observed keep
+            // the unchanged applicator handle, which neither raises.
+            finality_rpc_handle.clone(),
             // UI truth contract §9: the identity this process computed at start-up.
             // Version/git from the build stamp (node/build.rs), the consensus
             // fingerprint from ConsensusManifest (after the PBA + agent-fork heights
             // were published), the activation fingerprint from the resolved PBA
             // activation, and the GhostDAG params the shared GhostDag runs with.
             Some({
-                let manifest = consensus_manifest::ConsensusManifest::current();
+                // The same manifest the boot log printed (for_node, bound to this genesis).
+                let manifest = node_manifest.clone().unwrap_or_else(|| {
+                    consensus_manifest::ConsensusManifest::for_node(
+                        config.chain.genesis_profile.as_deref(),
+                        running_genesis.as_ref(),
+                    )
+                });
                 citrate_api::NodeIdentity {
                     version: manifest.version.to_string(),
                     git_sha: manifest.git_sha.to_string(),
@@ -4028,6 +4349,80 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     Ok(())
 }
 
+/// The storage records a node restarted at applied tip `tip_height` loads into
+/// memory. From the storage-root hardening height (`activation`; the next block
+/// the node executes is `tip_height + 1`) every persisted record is restored
+/// byte for byte. Below it the legacy view is kept, so a restarted node rebuilds
+/// exactly the state it rebuilt before the fork existed.
+fn boot_storage_view(
+    records: Vec<citrate_storage::state::StorageRecord>,
+    activation: Option<u64>,
+    tip_height: u64,
+) -> Vec<citrate_storage::state::StorageRecord> {
+    if citrate_execution::storage_root_hardening::active_at(
+        activation,
+        tip_height.saturating_add(1),
+    ) {
+        records
+    } else {
+        citrate_storage::state::legacy_hydration_view(records)
+    }
+}
+
+#[cfg(test)]
+mod boot_storage_view_tests {
+    use super::boot_storage_view;
+    use citrate_execution::types::Address;
+    use citrate_storage::state::StorageBytes;
+
+    fn records() -> Vec<citrate_storage::state::StorageRecord> {
+        let gov = {
+            let mut a = [0u8; 20];
+            a[18] = 0x10;
+            a[19] = 0x03;
+            Address(a)
+        };
+        vec![
+            (
+                (gov, StorageBytes(b"ADMIN".to_vec())),
+                StorageBytes(vec![0xA1; 20]),
+            ),
+            (
+                (Address([0xEE; 20]), StorageBytes(vec![1; 32])),
+                StorageBytes(b"v1".to_vec()),
+            ),
+        ]
+    }
+
+    #[test]
+    fn unscheduled_chain_keeps_the_legacy_view() {
+        let got = boot_storage_view(records(), None, 1_000_000);
+        assert_eq!(
+            got.len(),
+            1,
+            "only the 52-byte key is in the legacy view, as before the activation"
+        );
+        assert_eq!(
+            got[0].1,
+            StorageBytes(vec![0u8; 32]),
+            "short value padded, as before"
+        );
+    }
+
+    #[test]
+    fn new_genesis_hydrates_every_record_from_the_first_restart() {
+        assert_eq!(boot_storage_view(records(), Some(0), 0), records());
+        assert_eq!(boot_storage_view(records(), Some(0), 77), records());
+    }
+
+    #[test]
+    fn scheduled_height_switches_when_the_next_block_is_hardened() {
+        assert_eq!(boot_storage_view(records(), Some(100), 98).len(), 1);
+        assert_eq!(boot_storage_view(records(), Some(100), 99), records());
+        assert_eq!(boot_storage_view(records(), Some(100), 150), records());
+    }
+}
+
 #[allow(dead_code)]
 fn load_or_create_peer_id(
     data_dir: &std::path::Path,
@@ -4177,13 +4572,44 @@ fn load_or_generate_proposer_key(
         let seed_bytes = Zeroizing::new(key.to_bytes().to_vec());
         write_secret_file_0600(proposer_key_path, &seed_bytes)?;
         info!(
-            "Minted a new persistent proposer identity at {:?} (pubkey {}). This key is NOT \
-             recoverable from public data — back it up alongside noise.key and preserve it \
-             across data-dir wipes, or the node must re-register before it can propose again.",
-            proposer_key_path,
-            hex::encode(key.verifying_key().to_bytes())
+            "{}",
+            proposer_key_minted_message(
+                proposer_key_path,
+                &hex::encode(key.verifying_key().to_bytes())
+            )
         );
         Ok(key)
+    }
+}
+
+/// Log line for a newly minted `proposer.key`. Carries the voting-validator
+/// wipe warning: the same key with a wiped data directory loses the durable
+/// checkpoint signed-vote record.
+fn proposer_key_minted_message(proposer_key_path: &std::path::Path, pubkey_hex: &str) -> String {
+    format!(
+        "Minted a new persistent proposer identity at {:?} (pubkey {}). This key is NOT \
+         recoverable from public data — back it up alongside noise.key and preserve it \
+         across data-dir wipes, or the node must re-register before it can propose again. \
+         {}",
+        proposer_key_path,
+        pubkey_hex,
+        citrate_storage::VOTING_VALIDATOR_WIPE_NOTE
+    )
+}
+
+#[cfg(test)]
+mod proposer_key_message_tests {
+    use super::proposer_key_minted_message;
+
+    #[test]
+    fn minted_proposer_key_message_carries_the_voting_validator_wipe_note() {
+        let msg = proposer_key_minted_message(std::path::Path::new("/data/proposer.key"), "ab12");
+        assert!(msg.contains("ab12"));
+        assert!(msg.contains("/data/proposer.key"));
+        assert!(
+            msg.contains(citrate_storage::VOTING_VALIDATOR_WIPE_NOTE),
+            "mint log must warn voting validators about wiping the data dir"
+        );
     }
 }
 

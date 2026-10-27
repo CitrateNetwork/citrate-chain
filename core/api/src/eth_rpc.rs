@@ -2,7 +2,11 @@
 
 use crate::eth_tx_decoder;
 use crate::filter::{FilterRegistry, FilterType};
+use crate::finalized_tag::{
+    is_finality_tag, range_block_hashes, FinalizedAnchor, FinalizedTagSource, RangeReadError,
+};
 use crate::methods::{mempool::PendingQuery, ChainApi, MempoolApi, StateApi};
+use crate::types::request::BlockId;
 // PIL-49: route block_on through a shared multi-threaded Tokio runtime so
 // futures awaiting tokio::sync::* / tokio::time::* / reqwest can wake.
 // `futures::executor::block_on` lacks a Tokio reactor, so any such future
@@ -191,6 +195,7 @@ fn simulation_block_context(storage: &Arc<StorageManager>) -> (u64, u64) {
         Ok(h) => h,
         Err(_) => return (0, 0),
     };
+    // height-index: latest height, simulation timestamp only.
     let timestamp = storage
         .blocks
         .get_block_by_height(height)
@@ -215,6 +220,18 @@ fn pubkey_hex_to_evm_address(hex_str: &str) -> String {
 /// Same as pubkey_hex_to_evm_address but returns None when input is None (for `to` field).
 fn pubkey_hex_opt_to_evm_address(hex_opt: Option<&String>) -> Option<String> {
     hex_opt.map(|s| pubkey_hex_to_evm_address(s))
+}
+
+/// `extraData` for a block. Block 0 of the r1006 genesis carries its genesis note (the
+/// same text block 0's state holds at `GENESIS_NOTE_ADDRESS`); every other block is `0x`.
+fn block_extra_data(height: u64, hash: &[u8; 32]) -> String {
+    if height == 0 && *hash == citrate_consensus::hardening::R1006_GENESIS {
+        return format!(
+            "0x{}",
+            hex::encode(citrate_economics::r1006::GENESIS_NOTE.as_bytes())
+        );
+    }
+    "0x".to_string()
 }
 
 fn eth_block_json(
@@ -270,7 +287,7 @@ fn eth_block_json(
         "stateRoot": format!("0x{}", hex::encode(block.state_root.as_bytes())),
         "receiptsRoot": format!("0x{}", hex::encode(block.receipt_root.as_bytes())),
         "size": format!("0x{:x}", 1000),
-        "extraData": "0x",
+        "extraData": block_extra_data(block.height, block.hash.as_bytes()),
         "baseFeePerGas": format!("0x{:x}", block.base_fee_per_gas),
         "uncles": [],
         // PIL-50: GHOSTDAG fields (see explorer handoff RPC_DAG_FIELDS_HANDOFF.md).
@@ -312,6 +329,67 @@ pub fn resolve_block_tag(
     }
 }
 
+/// JSON-RPC error for a log range [`range_block_hashes`] could not list.
+fn range_read_error(e: RangeReadError) -> jsonrpc_core::Error {
+    match e {
+        RangeReadError::TooDeep { .. } => jsonrpc_core::Error::invalid_params(e.to_string()),
+        RangeReadError::Storage(msg) => jsonrpc_core::Error {
+            code: jsonrpc_core::ErrorCode::InternalError,
+            message: format!("log range read failed: {msg}"),
+            data: None,
+        },
+    }
+}
+
+/// The block a block-LOOKUP endpoint reads for `tag`, given the resolved
+/// finalized anchor. `finalized`/`safe` name the certified block BY HASH when the
+/// source carries one: the height index keeps the LAST block written at a height,
+/// which can be an uncertified sibling of the certified block, so it is never
+/// consulted for them. Every other tag resolves as [`resolve_block_tag`].
+pub fn resolve_block_id(
+    tag: Option<&str>,
+    current_height: u64,
+    anchor: FinalizedAnchor,
+) -> Option<BlockId> {
+    if is_finality_tag(tag) {
+        return Some(match anchor.hash {
+            Some(hash) => BlockId::Hash(hash),
+            None => BlockId::Number(anchor.height),
+        });
+    }
+    resolve_block_tag(tag, current_height, anchor.height).map(BlockId::Number)
+}
+
+/// The finalized anchor a log range is bounded by: `Some` only when its
+/// `fromBlock` or `toBlock` is a finality tag (resolved once per request).
+fn finality_range_anchor(
+    filter: &Value,
+    finalized: &FinalizedTagSource,
+    storage: &StorageManager,
+) -> Option<FinalizedAnchor> {
+    if is_finality_tag(filter.get("fromBlock").and_then(|v| v.as_str()))
+        || is_finality_tag(filter.get("toBlock").and_then(|v| v.as_str()))
+    {
+        Some(finalized.resolve(storage))
+    } else {
+        None
+    }
+}
+
+/// The finalized anchor for one request: resolved only for the finality tags
+/// (other tags never read it).
+fn anchor_for(
+    tag: Option<&str>,
+    finalized: &FinalizedTagSource,
+    storage: &StorageManager,
+) -> FinalizedAnchor {
+    if is_finality_tag(tag) {
+        finalized.resolve(storage)
+    } else {
+        FinalizedAnchor::GENESIS
+    }
+}
+
 /// Stage 0 finality guard for the account-STATE read endpoints
 /// (`eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`,
 /// `eth_getStorageAt`, `eth_call`, `eth_estimateGas`).
@@ -332,11 +410,63 @@ pub fn resolve_block_tag(
 /// unaffected and keeps its existing latest-state behaviour. Returns `Ok(())`
 /// when the read may proceed against latest state, or an `Err` to return to the
 /// client verbatim.
+///
+/// Stage 1c (enforcement): when the finalized anchor is a verified
+/// `(height, hash)` pair, "caught up" additionally requires the latest committed
+/// state to be THAT block's state — the applied tip
+/// (`BlockStore::get_applied_tip`, written by the canonical applicator) must be
+/// the certified hash. Equal heights alone are not enough: a sibling at the
+/// certified height is not the finalized block.
 fn require_serviceable_finality_tag(
     tag: Option<&str>,
-    finalized_height: u64,
+    finalized: &FinalizedTagSource,
+    storage: &StorageManager,
     latest_height: u64,
 ) -> Result<(), jsonrpc_core::Error> {
+    if !is_finality_tag(tag) {
+        return Ok(());
+    }
+    let anchor = finalized.resolve(storage);
+    finality_state_guard(tag, anchor, latest_height, || {
+        storage
+            .blocks
+            .get_applied_tip()
+            .ok()
+            .flatten()
+            .map(|(hash, _)| hash)
+    })
+}
+
+/// Decision half of [`require_serviceable_finality_tag`] (`applied_tip` = the
+/// hash whose post-state the state store holds, when known).
+fn finality_state_guard(
+    tag: Option<&str>,
+    anchor: FinalizedAnchor,
+    latest_height: u64,
+    applied_tip: impl FnOnce() -> Option<Hash>,
+) -> Result<(), jsonrpc_core::Error> {
+    let finalized_height = anchor.height;
+    if !is_finality_tag(tag) {
+        return Ok(());
+    }
+    if finalized_height >= latest_height {
+        if let Some(certified) = anchor.hash {
+            if applied_tip() != Some(certified) {
+                return Err(jsonrpc_core::Error {
+                    code: jsonrpc_core::ErrorCode::ServerError(-32000),
+                    message: format!(
+                        "state at the '{}' block tag is not available: the latest committed \
+                         state on this node is not the state of the finalized block {} at \
+                         height {finalized_height}, so returning it would mislabel \
+                         un-finalized state as finalized. Retry with 'latest'.",
+                        tag.unwrap_or("finalized"),
+                        certified,
+                    ),
+                    data: None,
+                });
+            }
+        }
+    }
     match tag {
         Some("finalized") | Some("safe") if finalized_height < latest_height => {
             Err(jsonrpc_core::Error {
@@ -389,11 +519,13 @@ pub fn register_eth_methods(
     );
 }
 
-/// Register the Ethereum-compatible RPC methods, threading a `finalized_height`
-/// handle so the `finalized`/`safe` block tags resolve to the real BFT-finalized
-/// height. The handle is the same `Arc<AtomicU64>` that `canonical_apply.rs`
-/// exposes via `finalized_height_handle()` and the node's 5 s finality poll keeps
-/// current. Stage 0: read-only surface — no change to block acceptance/validity.
+/// Register the Ethereum-compatible RPC methods, threading the source of the
+/// `finalized`/`safe` block tags. A height handle (`Arc<AtomicU64>`, e.g. the
+/// canonical applicator's `finalized_height_handle()`) resolves through the
+/// height index; a verified-pair source (`FinalizedTagSource::Verified`, the
+/// node's floor verifier in Enforced mode) resolves BY HASH so an uncertified
+/// sibling at the finalized height is never served. Read-only surface — no
+/// change to block acceptance/validity.
 #[allow(clippy::too_many_arguments)]
 pub fn register_eth_methods_with_finality(
     io_handler: &mut IoHandler,
@@ -403,8 +535,9 @@ pub fn register_eth_methods_with_finality(
     chain_id: u64,
     filter_registry: Arc<FilterRegistry>,
     pause_flag: Option<Arc<AtomicBool>>,
-    finalized_height: Arc<AtomicU64>,
+    finalized: impl Into<FinalizedTagSource>,
 ) {
+    let finalized: FinalizedTagSource = finalized.into();
     // eth_blockNumber - Returns the latest block number
     let storage_bn = storage.clone();
     io_handler.add_sync_method("eth_blockNumber", move |_params: Params| {
@@ -420,7 +553,7 @@ pub fn register_eth_methods_with_finality(
 
     // eth_getBlockByNumber - Returns block by number
     let storage_gbn = storage.clone();
-    let finalized_gbn = finalized_height.clone();
+    let finalized_gbn = finalized.clone();
     io_handler.add_sync_method("eth_getBlockByNumber", move |params: Params| {
         let api = ChainApi::new(storage_gbn.clone());
 
@@ -442,16 +575,18 @@ pub fn register_eth_methods_with_finality(
         // behaviour (fall back to Null when the height lookup errors); every
         // other tag (earliest / finalized / safe / hex) goes through the shared
         // resolver so `finalized`/`safe` are honoured uniformly (Stage 0).
+        // `finalized`/`safe` resolve to the certified block BY HASH when the
+        // source is a verified pair (never a sibling via the height index).
         let is_latest = arg(&params, 0).as_str() == Some("latest");
-        let block_number = match arg(&params, 0).as_str() {
+        let block_id = match arg(&params, 0).as_str() {
             Some("latest") | Some("pending") => match block_on(api.get_height()) {
-                Ok(h) => h,
+                Ok(h) => BlockId::Number(h),
                 Err(_) => return Ok(Value::Null),
             },
             other => {
-                let finalized = finalized_gbn.load(Ordering::SeqCst);
-                match resolve_block_tag(other, 0, finalized) {
-                    Some(n) => n,
+                let anchor = anchor_for(other, &finalized_gbn, &storage_gbn);
+                match resolve_block_id(other, 0, anchor) {
+                    Some(id) => id,
                     None => {
                         return Err(jsonrpc_core::Error::invalid_params(
                             "Invalid block number format",
@@ -464,16 +599,21 @@ pub fn register_eth_methods_with_finality(
         // Get block from storage.
         // For "latest", if the block at the reported height is missing (race
         // between height bookkeeping and block storage), fall back to height-1.
-        let mut try_height = block_number;
-        let block_result = loop {
-            match block_on(api.get_block(crate::types::request::BlockId::Number(try_height))) {
-                Ok(block) => break Ok(block),
-                Err(_) if is_latest && try_height > 0 => {
-                    try_height = try_height.saturating_sub(1);
-                    continue;
+        let block_result = match block_id {
+            BlockId::Number(block_number) => {
+                let mut try_height = block_number;
+                loop {
+                    match block_on(api.get_block(BlockId::Number(try_height))) {
+                        Ok(block) => break Ok(block),
+                        Err(_) if is_latest && try_height > 0 => {
+                            try_height = try_height.saturating_sub(1);
+                            continue;
+                        }
+                        Err(e) => break Err(e),
+                    }
                 }
-                Err(e) => break Err(e),
             }
+            other => block_on(api.get_block(other)),
         };
         match block_result {
             Ok(block) => {
@@ -833,7 +973,7 @@ pub fn register_eth_methods_with_finality(
     // eth_getBalance - Returns account balance
     let storage_bal = storage.clone();
     let executor_bal = executor.clone();
-    let finalized_bal = finalized_height.clone();
+    let finalized_bal = finalized.clone();
     io_handler.add_sync_method("eth_getBalance", move |params: Params| {
         let state_api = StateApi::new(storage_bal.clone(), executor_bal.clone());
 
@@ -850,7 +990,7 @@ pub fn register_eth_methods_with_finality(
         // finalized height is behind the tip rather than mislabel latest state.
         let tag = params.get(1).and_then(|v| v.as_str());
         let latest_height = block_on(ChainApi::new(storage_bal.clone()).get_height()).unwrap_or(0);
-        require_serviceable_finality_tag(tag, finalized_bal.load(Ordering::SeqCst), latest_height)?;
+        require_serviceable_finality_tag(tag, &finalized_bal, &storage_bal, latest_height)?;
 
         let addr_str = match arg(&params, 0).as_str() {
             Some(a) if a.starts_with("0x") => a.get(2..).unwrap_or_default(),
@@ -884,7 +1024,7 @@ pub fn register_eth_methods_with_finality(
     // eth_getCode - Returns contract code
     let storage_code = storage.clone();
     let executor_code = executor.clone();
-    let finalized_code = finalized_height.clone();
+    let finalized_code = finalized.clone();
     io_handler.add_sync_method("eth_getCode", move |params: Params| {
         let state_api = StateApi::new(storage_code.clone(), executor_code.clone());
 
@@ -901,11 +1041,7 @@ pub fn register_eth_methods_with_finality(
         // finalized height is behind the tip rather than mislabel latest state.
         let tag = params.get(1).and_then(|v| v.as_str());
         let latest_height = block_on(ChainApi::new(storage_code.clone()).get_height()).unwrap_or(0);
-        require_serviceable_finality_tag(
-            tag,
-            finalized_code.load(Ordering::SeqCst),
-            latest_height,
-        )?;
+        require_serviceable_finality_tag(tag, &finalized_code, &storage_code, latest_height)?;
 
         let addr_str = match arg(&params, 0).as_str() {
             Some(a) if a.starts_with("0x") => a.get(2..).unwrap_or_default(),
@@ -940,7 +1076,7 @@ pub fn register_eth_methods_with_finality(
     let storage_nonce = storage.clone();
     let executor_nonce = executor.clone();
     let mempool_nonce = mempool.clone();
-    let finalized_nonce = finalized_height.clone();
+    let finalized_nonce = finalized.clone();
     io_handler.add_sync_method("eth_getTransactionCount", move |params: Params| {
         let state_api = StateApi::new(storage_nonce.clone(), executor_nonce.clone());
 
@@ -986,11 +1122,7 @@ pub fn register_eth_methods_with_finality(
         let raw_tag = params.get(1).and_then(|v| v.as_str());
         let latest_height =
             block_on(ChainApi::new(storage_nonce.clone()).get_height()).unwrap_or(0);
-        require_serviceable_finality_tag(
-            raw_tag,
-            finalized_nonce.load(Ordering::SeqCst),
-            latest_height,
-        )?;
+        require_serviceable_finality_tag(raw_tag, &finalized_nonce, &storage_nonce, latest_height)?;
         let tag = raw_tag.unwrap_or("latest");
 
         let base_nonce = block_on(state_api.get_nonce(Address(addr_bytes))).unwrap_or_default();
@@ -1159,7 +1291,7 @@ pub fn register_eth_methods_with_finality(
     // eth_call - Execute call without creating transaction
     let executor_call = executor.clone();
     let storage_call = storage.clone();
-    let finalized_call = finalized_height.clone();
+    let finalized_call = finalized.clone();
     io_handler.add_sync_method("eth_call", move |params: Params| {
         // WP-I.4: eth_call costs 10 budget units
         crate::rate_limit::check_method_budget(10)?;
@@ -1184,11 +1316,7 @@ pub fn register_eth_methods_with_finality(
         // state and label it finalized.
         let tag = params.get(1).and_then(|v| v.as_str());
         let latest_height = block_on(ChainApi::new(storage_call.clone()).get_height()).unwrap_or(0);
-        require_serviceable_finality_tag(
-            tag,
-            finalized_call.load(Ordering::SeqCst),
-            latest_height,
-        )?;
+        require_serviceable_finality_tag(tag, &finalized_call, &storage_call, latest_height)?;
 
         // call object
         let obj = match &arg(&params, 0) {
@@ -1379,7 +1507,7 @@ pub fn register_eth_methods_with_finality(
     // eth_estimateGas - Estimate gas for transaction by dry-running execution
     let executor_estimate = executor.clone();
     let storage_estimate = storage.clone();
-    let finalized_estimate = finalized_height.clone();
+    let finalized_estimate = finalized.clone();
     io_handler.add_sync_method("eth_estimateGas", move |params: Params| {
         // WP-I.4: eth_estimateGas costs 10 budget units
         crate::rate_limit::check_method_budget(10)?;
@@ -1411,7 +1539,8 @@ pub fn register_eth_methods_with_finality(
             block_on(ChainApi::new(storage_estimate.clone()).get_height()).unwrap_or(0);
         require_serviceable_finality_tag(
             tag,
-            finalized_estimate.load(Ordering::SeqCst),
+            &finalized_estimate,
+            &storage_estimate,
             latest_height,
         )?;
 
@@ -1655,7 +1784,7 @@ pub fn register_eth_methods_with_finality(
 
     // eth_feeHistory - Get fee history for EIP-1559
     let storage_fee = storage.clone();
-    let finalized_fee = finalized_height.clone();
+    let finalized_fee = finalized.clone();
     io_handler.add_sync_method("eth_feeHistory", move |params: Params| {
         // Parse params: [blockCount, newestBlock, rewardPercentiles]
         let params: Vec<Value> = match params.parse() {
@@ -1705,11 +1834,16 @@ pub fn register_eth_methods_with_finality(
         // latest committed height.
         let api = ChainApi::new(storage_fee.clone());
         let committed_height = block_on(api.get_height()).unwrap_or_default();
-        let current_height = match params.get(1).and_then(|v| v.as_str()) {
-            Some("finalized") | Some("safe") => {
-                finalized_fee.load(Ordering::SeqCst).min(committed_height)
-            }
-            _ => committed_height,
+        // A window ending at `finalized`/`safe` is read along the CERTIFIED
+        // CHAIN: every height at or below the certified height comes from the
+        // selected-parent ancestry of the certified block (`range_block_hashes`),
+        // never from the height index, which may hold a sibling at any of them.
+        let newest_tag = params.get(1).and_then(|v| v.as_str());
+        let (current_height, window_anchor) = if is_finality_tag(newest_tag) {
+            let anchor = finalized_fee.resolve(&storage_fee);
+            (anchor.height.min(committed_height), Some(anchor))
+        } else {
+            (committed_height, None)
         };
 
         if current_height == 0 {
@@ -1725,14 +1859,21 @@ pub fn register_eth_methods_with_finality(
         // block_count >= 1 (the zero case returned above).
         let start_height = current_height.saturating_sub(block_count.saturating_sub(1));
 
+        // The block read at each height of the window. A height the certified
+        // chain steps over has none and gets the empty-slot defaults below.
+        let window: std::collections::HashMap<u64, Hash> =
+            range_block_hashes(&storage_fee, window_anchor, start_height, current_height)
+                .map_err(range_read_error)?
+                .into_iter()
+                .collect();
+
         // Collect fee data from blocks
         let mut base_fees: Vec<String> = Vec::new();
         let mut gas_used_ratios: Vec<f64> = Vec::new();
         let mut rewards: Vec<Vec<String>> = Vec::new();
 
         for height in start_height..=current_height {
-            // Get block hash at height
-            if let Ok(Some(block_hash)) = storage_fee.blocks.get_block_by_height(height) {
+            if let Some(block_hash) = window.get(&height).copied() {
                 // Get block data
                 if let Ok(Some(block)) = storage_fee.blocks.get_block(&block_hash) {
                     // Use persisted gas_used and gas_limit from block header (EIP-1559 fields)
@@ -1866,9 +2007,40 @@ pub fn register_eth_methods_with_finality(
         Ok(Value::String("0x3b9aca00".to_string()))
     });
 
+    // The executed-chain resolver (and its settled-checkpoint cache), shared by
+    // eth_getLogs and citrate_isExecuted so both answer from the same walk.
+    let executed_chain = Arc::new(crate::canonical_logs::ExecutedChainIndex::new());
+
+    // citrate_isExecuted - Whether a block hash is on the persisted applied
+    // (executed selected-parent) chain eth_getLogs serves:
+    // {"executed": bool, "number": "0x…" | null}. eth_getBlockByHash serves any
+    // stored block, including ones a reorg abandoned, so it only proves storage.
+    let storage_is_exec = storage.clone();
+    let executed_chain_is_exec = executed_chain.clone();
+    io_handler.add_sync_method(
+        crate::canonical_logs::IS_EXECUTED_METHOD,
+        move |params: Params| {
+            // Walks up to SETTLED_DEPTH + CHECKPOINT_STRIDE headers: priced like eth_getLogs.
+            crate::rate_limit::check_method_budget(10)?;
+            let params: Vec<Value> = match params {
+                Params::None => Vec::new(),
+                p => p
+                    .parse()
+                    .map_err(|e| jsonrpc_core::Error::invalid_params(e.to_string()))?,
+            };
+            crate::canonical_logs::is_executed_json(
+                &executed_chain_is_exec,
+                &storage_is_exec,
+                &params,
+            )
+        },
+    );
+
     // eth_getLogs - Get logs matching filter criteria
     let storage_logs = storage.clone();
-    let finalized_logs = finalized_height.clone();
+    let finalized_logs = finalized.clone();
+    let executed_chain_logs = executed_chain.clone();
+    let legacy_clamp_logs = crate::canonical_logs::legacy_clamp_from_env();
     io_handler.add_sync_method("eth_getLogs", move |params: Params| {
         // WP-I.4: eth_getLogs costs 10 budget units
         crate::rate_limit::check_method_budget(10)?;
@@ -1887,212 +2059,127 @@ pub fn register_eth_methods_with_finality(
         crate::filter::validate_log_filter_criteria(filter)
             .map_err(jsonrpc_core::Error::invalid_params)?;
 
-        // Get current height for "latest" resolution
-        let current_height = storage_logs.blocks.get_latest_height().unwrap_or(0);
-        let finalized = finalized_logs.load(Ordering::SeqCst);
+        // ONE read of the tip the walk follows; `latest`/`pending` resolve to
+        // its height, never to the stored-header height (which can be ahead of
+        // execution and put `latest..latest` above every executed block).
+        let tip = crate::canonical_logs::log_tip(&storage_logs).map_err(|e| e.to_rpc_error())?;
+        let current_height = tip.map_or(0, |(_, h)| h);
+        // A finality-tag bound resolves to the verified anchor: its HEIGHT
+        // bounds the range, and its HASH (Enforced mode) names the certified
+        // chain that heights at or below it are read from.
+        let anchor = finality_range_anchor(filter, &finalized_logs, &storage_logs);
+        let finalized = anchor.map_or(0, |a| a.height);
+        let (from_block, to_block, criteria) = parse_log_filter(filter, current_height, finalized)?;
 
-        // Parse fromBlock (default to 0). Absent field keeps its default; a
-        // present tag is resolved via the shared resolver (adds finalized/safe).
-        let from_block = match filter.get("fromBlock").and_then(|v| v.as_str()) {
-            None => 0,
-            Some(tag) => match resolve_block_tag(Some(tag), current_height, finalized) {
-                Some(h) => h,
-                None => {
-                    return Err(jsonrpc_core::Error::invalid_params(format!(
-                        "Invalid fromBlock: {}",
-                        tag
-                    )))
-                }
+        // Over the range limit is a -32005 error, not a silent clamp (a clamped
+        // answer reads as "no logs after fromBlock+1000"); the legacy clamp is
+        // an operator opt-in (`canonical_logs::LEGACY_CLAMP_ENV`).
+        let read = read_executed_logs(
+            "eth_getLogs",
+            &storage_logs,
+            &executed_chain_logs,
+            Ok(tip),
+            LogRead {
+                from: from_block,
+                to: to_block,
+                after: None,
+                range: LogRange::Query {
+                    legacy_clamp: legacy_clamp_logs,
+                },
+                receipts: ReceiptPolicy::SkipMissing,
+                anchor,
             },
-        };
-
-        // Parse toBlock (default to latest). Same handling as fromBlock.
-        let to_block = match filter.get("toBlock").and_then(|v| v.as_str()) {
-            None => current_height,
-            Some(tag) => match resolve_block_tag(Some(tag), current_height, finalized) {
-                Some(h) => h,
-                None => {
-                    return Err(jsonrpc_core::Error::invalid_params(format!(
-                        "Invalid toBlock: {}",
-                        tag
-                    )))
-                }
-            },
-        };
-
-        // Limit block range to prevent excessive queries
-        let max_block_range = 1000u64;
-        let effective_to = to_block.min(from_block.saturating_add(max_block_range));
-
-        // Parse address filter (single address or array)
-        let address_filter: Vec<Address> = match filter.get("address") {
-            Some(Value::String(addr_str)) => {
-                let addr_hex = addr_str.trim_start_matches("0x");
-                if let Ok(bytes) = hex::decode(addr_hex) {
-                    if bytes.len() == 20 {
-                        let mut arr = [0u8; 20];
-                        arr.copy_from_slice(&bytes);
-                        vec![Address(arr)]
-                    } else {
-                        vec![]
-                    }
-                } else {
-                    vec![]
-                }
-            }
-            Some(Value::Array(addrs)) => addrs
-                .iter()
-                .filter_map(|v| v.as_str())
-                .filter_map(|addr_str| {
-                    let addr_hex = addr_str.trim_start_matches("0x");
-                    hex::decode(addr_hex).ok().and_then(|bytes| {
-                        if bytes.len() == 20 {
-                            let mut arr = [0u8; 20];
-                            arr.copy_from_slice(&bytes);
-                            Some(Address(arr))
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .collect(),
-            _ => vec![],
-        };
-
-        // Parse topics filter (array of arrays, each position can be null or array of hashes)
-        let topics_filter: Vec<Option<Vec<Hash>>> = match filter.get("topics") {
-            Some(Value::Array(topics)) => {
-                topics
-                    .iter()
-                    .map(|topic_entry| {
-                        match topic_entry {
-                            Value::Null => None, // null means "any"
-                            Value::String(hash_str) => {
-                                // Single topic hash
-                                let hash_hex = hash_str.trim_start_matches("0x");
-                                hex::decode(hash_hex).ok().and_then(|bytes| {
-                                    if bytes.len() == 32 {
-                                        let mut arr = [0u8; 32];
-                                        arr.copy_from_slice(&bytes);
-                                        Some(vec![Hash::new(arr)])
-                                    } else {
-                                        None
-                                    }
-                                })
-                            }
-                            Value::Array(hashes) => {
-                                // Array of topic hashes (OR logic)
-                                let parsed: Vec<Hash> = hashes
-                                    .iter()
-                                    .filter_map(|v| v.as_str())
-                                    .filter_map(|hash_str| {
-                                        let hash_hex = hash_str.trim_start_matches("0x");
-                                        hex::decode(hash_hex).ok().and_then(|bytes| {
-                                            if bytes.len() == 32 {
-                                                let mut arr = [0u8; 32];
-                                                arr.copy_from_slice(&bytes);
-                                                Some(Hash::new(arr))
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                    })
-                                    .collect();
-                                if parsed.is_empty() {
-                                    None
-                                } else {
-                                    Some(parsed)
-                                }
-                            }
-                            _ => None,
-                        }
-                    })
-                    .collect()
-            }
-            _ => vec![],
-        };
-
-        // Collect matching logs
-        let mut result_logs: Vec<Value> = Vec::new();
-        let mut log_index_global = 0usize;
-
-        for height in from_block..=effective_to {
-            // Get block hash at this height
-            let block_hash = match storage_logs.blocks.get_block_by_height(height) {
-                Ok(Some(hash)) => hash,
-                _ => continue,
-            };
-
-            // Get all transaction hashes in this block
-            let tx_hashes = match storage_logs
-                .transactions
-                .get_block_transactions(&block_hash)
-            {
-                Ok(hashes) => hashes,
-                Err(_) => continue,
-            };
-
-            for (tx_index, tx_hash) in tx_hashes.iter().enumerate() {
-                // Get receipt for this transaction
-                let receipt = match storage_logs.transactions.get_receipt(tx_hash) {
-                    Ok(Some(r)) => r,
-                    _ => continue,
-                };
-
-                // Filter and collect logs from this receipt
-                for (log_index_in_tx, log) in receipt.logs.iter().enumerate() {
-                    // Check address filter
-                    if !address_filter.is_empty() && !address_filter.contains(&log.address) {
-                        continue;
-                    }
-
-                    // Check topics filter
-                    let topics_match = topics_filter.iter().enumerate().all(|(i, topic_filter)| {
-                        match topic_filter {
-                            None => true, // null means any
-                            Some(allowed_topics) => {
-                                if i >= log.topics.len() {
-                                    false // Log doesn't have this topic position
-                                } else {
-                                    log.topics
-                                        .get(i)
-                                        .is_some_and(|t| allowed_topics.contains(t))
-                                }
-                            }
-                        }
-                    });
-
-                    if !topics_match {
-                        continue;
-                    }
-
-                    // Log matches all filters
-                    result_logs.push(json!({
-                        "address": format!("0x{}", hex::encode(log.address.0)),
-                        "topics": log.topics.iter()
-                            .map(|t| format!("0x{}", hex::encode(t.as_bytes())))
-                            .collect::<Vec<_>>(),
-                        "data": format!("0x{}", hex::encode(&log.data)),
-                        "blockNumber": format!("0x{:x}", height),
-                        "blockHash": format!("0x{}", hex::encode(block_hash.as_bytes())),
-                        "transactionHash": format!("0x{}", hex::encode(tx_hash.as_bytes())),
-                        "transactionIndex": format!("0x{:x}", tx_index),
-                        "logIndex": format!("0x{:x}", log_index_global),
-                        "removed": false
-                    }));
-
-                    log_index_global = log_index_global.saturating_add(1);
-                    let _ = log_index_in_tx; // Suppress unused warning
-                }
-            }
-        }
-
-        Ok(Value::Array(result_logs))
+            &criteria,
+        )?;
+        Ok(Value::Array(read.logs))
     });
+
+    // citrate_getLogs - eth_getLogs plus `through`, the executed block the
+    // answer is complete through, both from ONE read of the applied tip. With
+    // `afterBlockHash` (the caller's previous `through`) the range must sit on
+    // a chain holding it at fromBlock-1, else -32001. A transaction with no
+    // receipt for its executed block is a retryable -32002, never an answer
+    // that claims completeness. See core/api/README.md, "Log scanner protocol".
+    let storage_clogs = storage.clone();
+    let finalized_clogs = finalized.clone();
+    let executed_chain_clogs = executed_chain.clone();
+    io_handler.add_sync_method(
+        crate::canonical_logs::GET_LOGS_METHOD,
+        move |params: Params| {
+            // The same walk and per-block reads as eth_getLogs.
+            crate::rate_limit::check_method_budget(10)?;
+            let params: Vec<Value> = match params {
+                Params::None => Vec::new(),
+                p => p
+                    .parse()
+                    .map_err(|e| jsonrpc_core::Error::invalid_params(e.to_string()))?,
+            };
+            let filter = arg(&params, 0);
+            if !filter.is_object() {
+                return Err(jsonrpc_core::Error::invalid_params(format!(
+                    "{}: expected params [filter]",
+                    crate::canonical_logs::GET_LOGS_METHOD
+                )));
+            }
+            crate::filter::validate_log_filter_criteria(filter)
+                .map_err(jsonrpc_core::Error::invalid_params)?;
+            // ONE read of the executed head: `latest`/`pending` resolve to it
+            // and the walk follows it, so `latest..latest` is never above the
+            // tip served. A missing tip is reported after the params check.
+            let head = crate::canonical_logs::executed_head(&storage_clogs);
+            let current_height = head.as_ref().map_or(0, |(_, h)| *h);
+            let anchor = finality_range_anchor(filter, &finalized_clogs, &storage_clogs);
+            let finalized = anchor.map_or(0, |a| a.height);
+            let (from_block, to_block, criteria) =
+                parse_log_filter(filter, current_height, finalized)?;
+            let after = match filter.get("afterBlockHash") {
+                None | Some(Value::Null) => None,
+                Some(v) => {
+                    if from_block == 0 {
+                        return Err(jsonrpc_core::Error::invalid_params(format!(
+                            "{}: afterBlockHash needs fromBlock >= 1",
+                            crate::canonical_logs::GET_LOGS_METHOD
+                        )));
+                    }
+                    Some(crate::canonical_logs::parse_block_hash_for(
+                        crate::canonical_logs::GET_LOGS_METHOD,
+                        Some(v),
+                    )?)
+                }
+            };
+            // Never the legacy clamp: a clamped range is not complete through
+            // its toBlock. A missing tip is reported after the range check.
+            let head = head
+                .map(Some)
+                .map_err(|m| crate::canonical_logs::LogIndexError::Unavailable(m).to_rpc_error());
+            let read = read_executed_logs(
+                crate::canonical_logs::GET_LOGS_METHOD,
+                &storage_clogs,
+                &executed_chain_clogs,
+                head,
+                LogRead {
+                    from: from_block,
+                    to: to_block,
+                    after: after.as_ref(),
+                    range: LogRange::Query {
+                        legacy_clamp: false,
+                    },
+                    receipts: ReceiptPolicy::RequireAll,
+                    anchor,
+                },
+                &criteria,
+            )?;
+            let through = read
+                .through
+                .map(|(n, h)| crate::canonical_logs::block_ref_json(n, &h))
+                .unwrap_or(Value::Null);
+            Ok(json!({ "logs": read.logs, "through": through }))
+        },
+    );
 
     // eth_newFilter - Create a new log filter
     let storage_new_filter = storage.clone();
-    let finalized_new_filter = finalized_height.clone();
+    let finalized_new_filter = finalized.clone();
     let filter_registry_new = filter_registry.clone();
     io_handler.add_sync_method("eth_newFilter", move |params: Params| {
         let params: Vec<Value> = match params.parse() {
@@ -2108,8 +2195,15 @@ pub fn register_eth_methods_with_finality(
         // PBA-L1a-010: bound the criteria before parsing or retaining them.
         crate::filter::validate_log_filter_criteria(filter)
             .map_err(jsonrpc_core::Error::invalid_params)?;
-        let current_height = storage_new_filter.blocks.get_latest_height().unwrap_or(0);
-        let finalized = finalized_new_filter.load(Ordering::SeqCst);
+        // `latest` (and the first poll's start) is the applied tip the filter's
+        // log reads walk, not the stored-header height (see `log_tip`).
+        let current_height = crate::canonical_logs::log_tip(&storage_new_filter)
+            .map_err(|e| e.to_rpc_error())?
+            .map_or(0, |(_, h)| h);
+        // Anchor resolved once, at creation (see eth_getLogs); the filter keeps
+        // it so its range reads follow the certified chain.
+        let anchor = finality_range_anchor(filter, &finalized_new_filter, &storage_new_filter);
+        let finalized = anchor.map_or(0, |a| a.height);
 
         // Parse fromBlock (None on absent/unrecognised, unchanged; adds finalized/safe).
         let from_block = resolve_block_tag(
@@ -2208,7 +2302,14 @@ pub fn register_eth_methods_with_finality(
         };
 
         let filter_id = filter_registry_new
-            .new_log_filter(from_block, to_block, addresses, topics, current_height)
+            .new_log_filter_anchored(
+                from_block,
+                to_block,
+                addresses,
+                topics,
+                current_height,
+                anchor,
+            )
             .ok_or_else(|| jsonrpc_core::Error {
                 // CHAIN-B-D003: registry at capacity — refuse rather than grow.
                 code: jsonrpc_core::ErrorCode::ServerError(-32005),
@@ -2279,6 +2380,7 @@ pub fn register_eth_methods_with_finality(
     // eth_getFilterChanges - Get changes since last poll
     let storage_filter_changes = storage.clone();
     let filter_registry_changes = filter_registry.clone();
+    let executed_chain_changes = executed_chain.clone();
     io_handler.add_sync_method("eth_getFilterChanges", move |params: Params| {
         let params: Vec<Value> = match params.parse() {
             Ok(p) => p,
@@ -2313,17 +2415,19 @@ pub fn register_eth_methods_with_finality(
             }
         };
 
-        let current_height = storage_filter_changes
-            .blocks
-            .get_latest_height()
-            .unwrap_or(0);
         let last_poll_block = filter.last_poll_block;
 
         match filter.filter_type {
             FilterType::Block => {
+                // A block filter announces stored blocks (the height index).
+                let current_height = storage_filter_changes
+                    .blocks
+                    .get_latest_height()
+                    .unwrap_or(0);
                 // Return new block hashes since last poll
                 let mut block_hashes = Vec::new();
                 for height in last_poll_block.saturating_add(1)..=current_height {
+                    // height-index: block filter, heights after the last poll up to latest.
                     if let Ok(Some(hash)) =
                         storage_filter_changes.blocks.get_block_by_height(height)
                     {
@@ -2344,91 +2448,56 @@ pub fn register_eth_methods_with_finality(
                 to_block,
                 ref addresses,
                 ref topics,
+                finalized_anchor,
             } => {
-                // Calculate effective block range
-                let effective_from = last_poll_block.saturating_add(1);
-                let effective_to = match to_block {
-                    Some(t) => t.min(current_height),
-                    None => current_height,
+                // Logs come from the EXECUTED chain of ONE read of the applied
+                // tip, like eth_getLogs; the height index can name a sibling
+                // whose transactions never executed, and the stored-header
+                // height can be ahead of execution.
+                let Some((tip_hash, tip_height)) =
+                    crate::canonical_logs::log_tip(&storage_filter_changes)
+                        .map_err(|e| e.to_rpc_error())?
+                else {
+                    return Ok(Value::Array(vec![]));
                 };
-
-                // Skip if from_block was set and we haven't reached it yet
-                if let Some(fb) = from_block {
-                    if effective_from < fb {
-                        filter_registry_changes.update_last_poll_block(filter_id, current_height);
-                        return Ok(Value::Array(vec![]));
-                    }
+                // Next unseen height, but never below the filter's fromBlock
+                // (a tip that jumps past fromBlock between polls must not skip
+                // the heights from fromBlock up to the jump).
+                let start = last_poll_block
+                    .saturating_add(1)
+                    .max(from_block.unwrap_or(0));
+                let end = to_block.map_or(tip_height, |t| t.min(tip_height));
+                if start > end {
+                    // Nothing new (or the tip rewound below the last poll):
+                    // keep the poll position, so nothing is re-sent or skipped.
+                    return Ok(Value::Array(vec![]));
                 }
-
-                let mut result_logs: Vec<Value> = Vec::new();
-
-                for height in effective_from..=effective_to {
-                    let block_hash = match storage_filter_changes.blocks.get_block_by_height(height)
-                    {
-                        Ok(Some(hash)) => hash,
-                        _ => continue,
-                    };
-
-                    let tx_hashes = match storage_filter_changes
-                        .transactions
-                        .get_block_transactions(&block_hash)
-                    {
-                        Ok(hashes) => hashes,
-                        Err(_) => continue,
-                    };
-
-                    for (tx_index, tx_hash) in tx_hashes.iter().enumerate() {
-                        let receipt = match storage_filter_changes.transactions.get_receipt(tx_hash)
-                        {
-                            Ok(Some(r)) => r,
-                            _ => continue,
-                        };
-
-                        for (log_index, log) in receipt.logs.iter().enumerate() {
-                            // Check address filter
-                            if !addresses.is_empty() && !addresses.contains(&log.address) {
-                                continue;
-                            }
-
-                            // Check topics filter
-                            let topics_match = topics.iter().enumerate().all(
-                                |(i, topic_filter)| match topic_filter {
-                                    None => true,
-                                    Some(allowed_topics) => {
-                                        if i >= log.topics.len() {
-                                            false
-                                        } else {
-                                            log.topics
-                                                .get(i)
-                                                .is_some_and(|t| allowed_topics.contains(t))
-                                        }
-                                    }
-                                },
-                            );
-
-                            if !topics_match {
-                                continue;
-                            }
-
-                            result_logs.push(json!({
-                                "address": format!("0x{}", hex::encode(log.address.0)),
-                                "topics": log.topics.iter()
-                                    .map(|t| format!("0x{}", hex::encode(t.as_bytes())))
-                                    .collect::<Vec<_>>(),
-                                "data": format!("0x{}", hex::encode(&log.data)),
-                                "blockNumber": format!("0x{:x}", height),
-                                "blockHash": format!("0x{}", hex::encode(block_hash.as_bytes())),
-                                "transactionHash": format!("0x{}", hex::encode(tx_hash.as_bytes())),
-                                "transactionIndex": format!("0x{:x}", tx_index),
-                                "logIndex": format!("0x{:x}", log_index),
-                                "removed": false
-                            }));
-                        }
-                    }
-                }
-
-                filter_registry_changes.update_last_poll_block(filter_id, current_height);
-                Ok(Value::Array(result_logs))
+                let criteria = LogCriteria {
+                    addresses: addresses.clone(),
+                    topics: topics.clone(),
+                };
+                // One window per poll; the rest is served by the next poll. A
+                // block in the window without its receipts (the producer
+                // commits the tip just before it writes them) is a retryable
+                // -32002 and the filter does not move, so the next poll reads
+                // the same window again instead of skipping that block.
+                let read = read_executed_logs(
+                    "eth_getFilterChanges",
+                    &storage_filter_changes,
+                    &executed_chain_changes,
+                    Ok(Some((tip_hash, tip_height))),
+                    LogRead {
+                        from: start,
+                        to: end,
+                        after: None,
+                        range: LogRange::Poll,
+                        receipts: ReceiptPolicy::RequireAll,
+                        anchor: finalized_anchor,
+                    },
+                    &criteria,
+                )?;
+                filter_registry_changes.update_last_poll_block(filter_id, read.to);
+                Ok(Value::Array(read.logs))
             }
         }
     });
@@ -2436,6 +2505,8 @@ pub fn register_eth_methods_with_finality(
     // eth_getFilterLogs - Get all logs matching filter (for log filters only)
     let storage_filter_logs = storage.clone();
     let filter_registry_logs = filter_registry.clone();
+    let executed_chain_filter_logs = executed_chain.clone();
+    let legacy_clamp_filter_logs = legacy_clamp_logs;
     io_handler.add_sync_method("eth_getFilterLogs", move |params: Params| {
         let params: Vec<Value> = match params.parse() {
             Ok(p) => p,
@@ -2470,84 +2541,48 @@ pub fn register_eth_methods_with_finality(
             }
         };
 
-        let current_height = storage_filter_logs.blocks.get_latest_height().unwrap_or(0);
-
         match filter.filter_type {
             FilterType::Log {
                 from_block,
                 to_block,
                 ref addresses,
                 ref topics,
+                finalized_anchor,
             } => {
+                // The executed chain of ONE read of the applied tip, as in
+                // eth_getLogs and eth_getFilterChanges.
+                let Some((tip_hash, tip_height)) =
+                    crate::canonical_logs::log_tip(&storage_filter_logs)
+                        .map_err(|e| e.to_rpc_error())?
+                else {
+                    return Ok(Value::Array(vec![]));
+                };
                 let effective_from = from_block.unwrap_or(0);
-                let effective_to = to_block.unwrap_or(current_height).min(current_height);
-                let max_range = 1000u64;
-                let effective_to = effective_to.min(effective_from.saturating_add(max_range));
-
-                let mut result_logs: Vec<Value> = Vec::new();
-
-                for height in effective_from..=effective_to {
-                    let block_hash = match storage_filter_logs.blocks.get_block_by_height(height) {
-                        Ok(Some(hash)) => hash,
-                        _ => continue,
-                    };
-
-                    let tx_hashes = match storage_filter_logs
-                        .transactions
-                        .get_block_transactions(&block_hash)
-                    {
-                        Ok(hashes) => hashes,
-                        Err(_) => continue,
-                    };
-
-                    for (tx_index, tx_hash) in tx_hashes.iter().enumerate() {
-                        let receipt = match storage_filter_logs.transactions.get_receipt(tx_hash) {
-                            Ok(Some(r)) => r,
-                            _ => continue,
-                        };
-
-                        for (log_index, log) in receipt.logs.iter().enumerate() {
-                            if !addresses.is_empty() && !addresses.contains(&log.address) {
-                                continue;
-                            }
-
-                            let topics_match = topics.iter().enumerate().all(
-                                |(i, topic_filter)| match topic_filter {
-                                    None => true,
-                                    Some(allowed_topics) => {
-                                        if i >= log.topics.len() {
-                                            false
-                                        } else {
-                                            log.topics
-                                                .get(i)
-                                                .is_some_and(|t| allowed_topics.contains(t))
-                                        }
-                                    }
-                                },
-                            );
-
-                            if !topics_match {
-                                continue;
-                            }
-
-                            result_logs.push(json!({
-                                "address": format!("0x{}", hex::encode(log.address.0)),
-                                "topics": log.topics.iter()
-                                    .map(|t| format!("0x{}", hex::encode(t.as_bytes())))
-                                    .collect::<Vec<_>>(),
-                                "data": format!("0x{}", hex::encode(&log.data)),
-                                "blockNumber": format!("0x{:x}", height),
-                                "blockHash": format!("0x{}", hex::encode(block_hash.as_bytes())),
-                                "transactionHash": format!("0x{}", hex::encode(tx_hash.as_bytes())),
-                                "transactionIndex": format!("0x{:x}", tx_index),
-                                "logIndex": format!("0x{:x}", log_index),
-                                "removed": false
-                            }));
-                        }
-                    }
-                }
-
-                Ok(Value::Array(result_logs))
+                let effective_to = to_block.unwrap_or(tip_height).min(tip_height);
+                let criteria = LogCriteria {
+                    addresses: addresses.clone(),
+                    topics: topics.clone(),
+                };
+                // The same range limit and receipt rule as eth_getLogs: wider
+                // than the limit is -32005, never a truncated list.
+                let read = read_executed_logs(
+                    "eth_getFilterLogs",
+                    &storage_filter_logs,
+                    &executed_chain_filter_logs,
+                    Ok(Some((tip_hash, tip_height))),
+                    LogRead {
+                        from: effective_from,
+                        to: effective_to,
+                        after: None,
+                        range: LogRange::Query {
+                            legacy_clamp: legacy_clamp_filter_logs,
+                        },
+                        receipts: ReceiptPolicy::SkipMissing,
+                        anchor: finalized_anchor,
+                    },
+                    &criteria,
+                )?;
+                Ok(Value::Array(read.logs))
             }
             _ => Err(jsonrpc_core::Error {
                 code: jsonrpc_core::ErrorCode::InvalidRequest,
@@ -2698,7 +2733,7 @@ pub fn register_eth_methods_with_finality(
     // and re-reads "latest" each call.
     let storage_gsat = storage.clone();
     let executor_gsat = executor.clone();
-    let finalized_gsat = finalized_height.clone();
+    let finalized_gsat = finalized.clone();
     io_handler.add_sync_method("eth_getStorageAt", move |params: Params| {
         let state_api = StateApi::new(storage_gsat.clone(), executor_gsat.clone());
 
@@ -2715,11 +2750,7 @@ pub fn register_eth_methods_with_finality(
         // finalized height is behind the tip rather than mislabel latest state.
         let tag = parsed.get(2).and_then(|v| v.as_str());
         let latest_height = block_on(ChainApi::new(storage_gsat.clone()).get_height()).unwrap_or(0);
-        require_serviceable_finality_tag(
-            tag,
-            finalized_gsat.load(Ordering::SeqCst),
-            latest_height,
-        )?;
+        require_serviceable_finality_tag(tag, &finalized_gsat, &storage_gsat, latest_height)?;
 
         // address (required, 20 bytes)
         let addr_str = arg(&parsed, 0)
@@ -2779,7 +2810,7 @@ pub fn register_eth_methods_with_finality(
 
     // eth_getBlockTransactionCountByNumber(blockTag) — uint count.
     let storage_btcbn = storage.clone();
-    let finalized_btcbn = finalized_height.clone();
+    let finalized_btcbn = finalized.clone();
     io_handler.add_sync_method(
         "eth_getBlockTransactionCountByNumber",
         move |params: Params| {
@@ -2791,12 +2822,13 @@ pub fn register_eth_methods_with_finality(
                 return Err(jsonrpc_core::Error::invalid_params("missing block tag"));
             }
             let current = block_on(api.get_height()).unwrap_or(0);
-            let finalized = finalized_btcbn.load(Ordering::SeqCst);
-            let number = match resolve_block_tag(arg(&parsed, 0).as_str(), current, finalized) {
-                Some(n) => n,
+            let tag = arg(&parsed, 0).as_str();
+            let anchor = anchor_for(tag, &finalized_btcbn, &storage_btcbn);
+            let block_id = match resolve_block_id(tag, current, anchor) {
+                Some(id) => id,
                 None => return Err(jsonrpc_core::Error::invalid_params("bad block tag")),
             };
-            match block_on(api.get_block(crate::types::request::BlockId::Number(number))) {
+            match block_on(api.get_block(block_id)) {
                 Ok(block) => Ok(Value::String(format!("0x{:x}", block.transactions.len()))),
                 Err(_) => Ok(Value::Null),
             }
@@ -2838,7 +2870,7 @@ pub fn register_eth_methods_with_finality(
     // object at position `index` of the block. Used by `cast block --index`
     // and Foundry's broadcast verification.
     let storage_tbni = storage.clone();
-    let finalized_tbni = finalized_height.clone();
+    let finalized_tbni = finalized.clone();
     io_handler.add_sync_method(
         "eth_getTransactionByBlockNumberAndIndex",
         move |params: Params| {
@@ -2852,9 +2884,10 @@ pub fn register_eth_methods_with_finality(
                 ));
             }
             let current = block_on(api.get_height()).unwrap_or(0);
-            let finalized = finalized_tbni.load(Ordering::SeqCst);
-            let number = match resolve_block_tag(arg(&parsed, 0).as_str(), current, finalized) {
-                Some(n) => n,
+            let tag = arg(&parsed, 0).as_str();
+            let anchor = anchor_for(tag, &finalized_tbni, &storage_tbni);
+            let block_id = match resolve_block_id(tag, current, anchor) {
+                Some(id) => id,
                 None => return Err(jsonrpc_core::Error::invalid_params("bad block tag")),
             };
             let idx_str = arg(&parsed, 1)
@@ -2862,11 +2895,10 @@ pub fn register_eth_methods_with_finality(
                 .ok_or_else(|| jsonrpc_core::Error::invalid_params("index must be hex string"))?;
             let idx = usize::from_str_radix(idx_str.trim_start_matches("0x"), 16)
                 .map_err(|_| jsonrpc_core::Error::invalid_params("bad hex index"))?;
-            let block =
-                match block_on(api.get_block(crate::types::request::BlockId::Number(number))) {
-                    Ok(b) => b,
-                    Err(_) => return Ok(Value::Null),
-                };
+            let block = match block_on(api.get_block(block_id)) {
+                Ok(b) => b,
+                Err(_) => return Ok(Value::Null),
+            };
             if let Some(tx) = block.transactions.get(idx) {
                 Ok(json!({
                     "hash": format!("0x{}", hex::encode(tx.hash.as_bytes())),
@@ -2991,6 +3023,15 @@ pub fn register_eth_methods_with_finality(
         let hash = Keccak256::digest(&bytes);
         Ok(Value::String(format!("0x{}", hex::encode(hash))))
     });
+
+    // citrate_executedHead - The persisted applied tip `{number, hash}`: the tip
+    // eth_getLogs serves up to. eth_blockNumber can be ahead of it (stored
+    // headers). Errors (-32603) when no applied tip is persisted; never a guess.
+    let storage_exec_head = storage.clone();
+    io_handler.add_sync_method(
+        crate::canonical_logs::EXECUTED_HEAD_METHOD,
+        move |_params: Params| crate::canonical_logs::executed_head_json(&storage_exec_head),
+    );
 
     // citrate_getDagStats is registered by `crate::node_rpc::register_node_methods`
     // (it reports the running GhostDAG parameters, which the node supplies).
@@ -3213,6 +3254,296 @@ pub fn register_eth_methods_with_finality(
 pub(crate) fn arg(params: &[Value], i: usize) -> &Value {
     static NULL: Value = Value::Null;
     params.get(i).unwrap_or(&NULL)
+}
+
+/// Address and topic criteria of a log filter (`eth_getLogs`, `citrate_getLogs`).
+struct LogCriteria {
+    addresses: Vec<Address>,
+    topics: Vec<Option<Vec<Hash>>>,
+}
+
+impl LogCriteria {
+    fn matches(&self, log: &citrate_execution::types::Log) -> bool {
+        if !self.addresses.is_empty() && !self.addresses.contains(&log.address) {
+            return false;
+        }
+        self.topics
+            .iter()
+            .enumerate()
+            .all(|(i, topic_filter)| match topic_filter {
+                None => true, // null means any
+                Some(allowed) => log.topics.get(i).is_some_and(|t| allowed.contains(t)),
+            })
+    }
+}
+
+/// A 20-byte address from `0x`-prefixed (or bare) hex; `None` otherwise.
+fn parse_filter_address(s: &str) -> Option<Address> {
+    let bytes = hex::decode(s.trim_start_matches("0x")).ok()?;
+    let arr: [u8; 20] = bytes.try_into().ok()?;
+    Some(Address(arr))
+}
+
+/// A 32-byte topic from `0x`-prefixed (or bare) hex; `None` otherwise.
+fn parse_filter_topic(s: &str) -> Option<Hash> {
+    let bytes = hex::decode(s.trim_start_matches("0x")).ok()?;
+    let arr: [u8; 32] = bytes.try_into().ok()?;
+    Some(Hash::new(arr))
+}
+
+/// `fromBlock` (default 0), `toBlock` (default the stored head) and the
+/// address/topic criteria of a log filter. A present block tag is resolved via
+/// the shared resolver (adds finalized/safe); an unparseable one is -32602.
+/// Unparseable addresses and topics are ignored, as `eth_getLogs` always did.
+fn parse_log_filter(
+    filter: &Value,
+    current_height: u64,
+    finalized: u64,
+) -> Result<(u64, u64, LogCriteria), jsonrpc_core::Error> {
+    let block = |field: &str, default: u64| -> Result<u64, jsonrpc_core::Error> {
+        match filter.get(field).and_then(|v| v.as_str()) {
+            None => Ok(default),
+            Some(tag) => resolve_block_tag(Some(tag), current_height, finalized).ok_or_else(|| {
+                jsonrpc_core::Error::invalid_params(format!("Invalid {field}: {tag}"))
+            }),
+        }
+    };
+    let from_block = block("fromBlock", 0)?;
+    let to_block = block("toBlock", current_height)?;
+
+    // Single address or array.
+    let addresses: Vec<Address> = match filter.get("address") {
+        Some(Value::String(a)) => parse_filter_address(a).into_iter().collect(),
+        Some(Value::Array(addrs)) => addrs
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter_map(parse_filter_address)
+            .collect(),
+        _ => vec![],
+    };
+
+    // Array of positions; each null (any), one topic, or an array (OR).
+    let topics: Vec<Option<Vec<Hash>>> = match filter.get("topics") {
+        Some(Value::Array(entries)) => entries
+            .iter()
+            .map(|entry| match entry {
+                Value::String(t) => parse_filter_topic(t).map(|h| vec![h]),
+                Value::Array(hashes) => {
+                    let parsed: Vec<Hash> = hashes
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .filter_map(parse_filter_topic)
+                        .collect();
+                    if parsed.is_empty() {
+                        None
+                    } else {
+                        Some(parsed)
+                    }
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => vec![],
+    };
+    Ok((from_block, to_block, LogCriteria { addresses, topics }))
+}
+
+/// What to do with a transaction of an executed block that has no receipt
+/// recorded for that block.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReceiptPolicy {
+    /// Skip it (`eth_getLogs`, `eth_getFilterLogs`: stateless, the caller can
+    /// ask again).
+    SkipMissing,
+    /// Fail with a retryable -32002 (`citrate_getLogs`, `eth_getFilterChanges`:
+    /// the answer moves a cursor): every transaction of an executed block has a
+    /// receipt once it is stored, so a missing one means the range cannot be
+    /// served in full yet.
+    RequireAll,
+}
+
+/// How a log read bounds its height range.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LogRange {
+    /// A one-shot query: a range wider than
+    /// [`crate::canonical_logs::MAX_LOG_BLOCK_RANGE`] is -32005 (unless the
+    /// operator enabled the legacy clamp).
+    Query { legacy_clamp: bool },
+    /// A filter poll: at most one window is read and the caller resumes after
+    /// [`ExecutedLogs::to`] on the next poll, so nothing is dropped.
+    Poll,
+}
+
+/// The range and rules of one log read.
+struct LogRead<'a> {
+    from: u64,
+    to: u64,
+    /// A scanner cursor that must be the executed block at `from - 1`.
+    after: Option<&'a Hash>,
+    range: LogRange,
+    receipts: ReceiptPolicy,
+    /// `Some` only when a bound of the request came from a finality tag. With a
+    /// certified hash (Enforced mode), heights at or below the certified height
+    /// are read from the certified chain (the selected-parent chain ending at the
+    /// certified block), the rest from the executed chain of the tip.
+    anchor: Option<FinalizedAnchor>,
+}
+
+/// What a log read served.
+struct ExecutedLogs {
+    logs: Vec<Value>,
+    /// The last height the read covers (after bounding); a poll resumes above it.
+    to: u64,
+    /// The last executed block read, if any.
+    through: Option<(u64, Hash)>,
+}
+
+/// The one path every log-returning handler reads logs through: bound the
+/// range, walk the executed chain of the caller's single tip read, and collect
+/// matching logs in execution order (ascending height along the tip's
+/// selected-parent chain, then `block.transactions` order, then receipt log
+/// order) under the receipt rule. The height index is last-writer-wins across
+/// DAG siblings and can name a block whose transactions never executed (see
+/// `canonical_logs`). Each body is loaded, scanned and dropped before the next,
+/// so a request holds one block. `tip` is checked after the range, so an
+/// over-limit range is -32005 whatever the tip state. `Ok(None)` (no applied
+/// tip yet) serves nothing.
+fn read_executed_logs(
+    method: &'static str,
+    storage: &StorageManager,
+    index: &crate::canonical_logs::ExecutedChainIndex,
+    tip: Result<Option<(Hash, u64)>, jsonrpc_core::Error>,
+    read: LogRead<'_>,
+    criteria: &LogCriteria,
+) -> Result<ExecutedLogs, jsonrpc_core::Error> {
+    // A finality-bounded range may start at most FINALIZED_RANGE_MAX_WALK below
+    // the certified block (checked first: it is the request's own bound).
+    if let Some(FinalizedAnchor {
+        height,
+        hash: Some(_),
+    }) = read.anchor
+    {
+        let depth = height.saturating_sub(read.from);
+        if read.from <= height && depth > crate::finalized_tag::FINALIZED_RANGE_MAX_WALK {
+            return Err(range_read_error(RangeReadError::TooDeep {
+                depth,
+                max: crate::finalized_tag::FINALIZED_RANGE_MAX_WALK,
+            }));
+        }
+    }
+    let to = match read.range {
+        LogRange::Query { legacy_clamp } => {
+            crate::canonical_logs::bound_log_range(read.from, read.to, legacy_clamp)?
+        }
+        LogRange::Poll => read.to.min(
+            read.from
+                .saturating_add(crate::canonical_logs::MAX_LOG_BLOCK_RANGE),
+        ),
+    };
+    let Some((tip_hash, tip_height)) = tip? else {
+        return Ok(ExecutedLogs {
+            logs: Vec::new(),
+            to,
+            through: None,
+        });
+    };
+    // The certified part of a finality-bounded range: heights `from..=certified`
+    // follow the certified block's selected-parent chain (never the tip's, which
+    // may hold an uncertified sibling there). A broken walk is an error, as on the
+    // executed chain (see `canonical_logs`, "MISSING ANCESTORS: ERROR WINS").
+    let certified = match read.anchor {
+        Some(FinalizedAnchor {
+            height,
+            hash: Some(hash),
+        }) if read.from <= height => Some((hash, height)),
+        _ => None,
+    };
+    let walk = |start: (Hash, u64), from: u64, to: u64, after: Option<&Hash>| match index
+        .executed_after_under(storage, start.0, start.1, from, to, after)
+        .map_err(|e| e.to_rpc_error())?
+    {
+        crate::canonical_logs::ExecutedRange::Blocks(b) => Ok(b),
+        crate::canonical_logs::ExecutedRange::CursorReplaced => Err(
+            crate::canonical_logs::cursor_replaced_error(from.saturating_sub(1)),
+        ),
+    };
+    let blocks = match certified {
+        None => walk((tip_hash, tip_height), read.from, to, read.after)?,
+        Some((hash, height)) => {
+            let mut b = walk((hash, height), read.from, to.min(height), read.after)?;
+            if let Some(above) = height.checked_add(1).filter(|a| *a <= to) {
+                b.extend(walk((tip_hash, tip_height), above, to, None)?);
+            }
+            b
+        }
+    };
+    let mut logs = Vec::new();
+    for (_, h) in &blocks {
+        push_block_logs(method, storage, h, criteria, read.receipts, &mut logs)?;
+    }
+    Ok(ExecutedLogs {
+        logs,
+        to,
+        through: blocks.last().copied(),
+    })
+}
+
+/// Load executed block `hash` and append its logs that match `criteria` to
+/// `out`, in `block.transactions` order then receipt log order. `logIndex` is
+/// the log's position in its block, counted over every log of the block.
+fn push_block_logs(
+    method: &'static str,
+    storage: &StorageManager,
+    hash: &Hash,
+    criteria: &LogCriteria,
+    policy: ReceiptPolicy,
+    out: &mut Vec<Value>,
+) -> Result<(), jsonrpc_core::Error> {
+    let block =
+        crate::canonical_logs::load_executed_block(storage, hash).map_err(|e| e.to_rpc_error())?;
+    let block_hash = block.header.block_hash;
+    let mut log_index_in_block = 0usize;
+
+    for (tx_index, tx) in block.transactions.iter().enumerate() {
+        // Only a receipt recorded for THIS block describes this execution; a
+        // receipt naming another block (the same tx in a block this node
+        // produced and then lost) is not served here, which keeps
+        // blockHash/blockNumber identical to eth_getTransactionReceipt.
+        let receipt = match storage.transactions.get_receipt(&tx.hash) {
+            Ok(Some(r)) if r.block_hash == block_hash => r,
+            _ if policy == ReceiptPolicy::SkipMissing => continue,
+            _ => {
+                return Err(crate::canonical_logs::receipts_not_stored_error(
+                    method,
+                    block.header.height,
+                    &block_hash,
+                    &tx.hash,
+                ))
+            }
+        };
+
+        for log in receipt.logs.iter() {
+            let log_index = log_index_in_block;
+            log_index_in_block = log_index_in_block.saturating_add(1);
+            if !criteria.matches(log) {
+                continue;
+            }
+            out.push(json!({
+                "address": format!("0x{}", hex::encode(log.address.0)),
+                "topics": log.topics.iter()
+                    .map(|t| format!("0x{}", hex::encode(t.as_bytes())))
+                    .collect::<Vec<_>>(),
+                "data": format!("0x{}", hex::encode(&log.data)),
+                "blockNumber": format!("0x{:x}", receipt.block_number),
+                "blockHash": format!("0x{}", hex::encode(receipt.block_hash.as_bytes())),
+                "transactionHash": format!("0x{}", hex::encode(tx.hash.as_bytes())),
+                "transactionIndex": format!("0x{:x}", tx_index),
+                "logIndex": format!("0x{:x}", log_index),
+                "removed": false
+            }));
+        }
+    }
+    Ok(())
 }
 
 /// Where a mined transaction landed: its block hash, block number and index in
@@ -3571,5 +3902,23 @@ mod tests {
                 input
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod genesis_extra_data_tests {
+    use super::block_extra_data;
+    use citrate_consensus::hardening::{R1006_GENESIS, RELEASE_GENESIS};
+    use citrate_economics::r1006::GENESIS_NOTE;
+
+    #[test]
+    fn r1006_block_zero_carries_the_genesis_note() {
+        assert_eq!(
+            block_extra_data(0, &R1006_GENESIS),
+            format!("0x{}", hex::encode(GENESIS_NOTE.as_bytes()))
+        );
+        // Only block 0 of r1006: r1005's block 0, and any other block, stay empty.
+        assert_eq!(block_extra_data(0, &RELEASE_GENESIS[0].1), "0x");
+        assert_eq!(block_extra_data(1, &R1006_GENESIS), "0x");
     }
 }

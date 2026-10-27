@@ -238,6 +238,54 @@ pub struct ChainConfig {
     #[serde(default)]
     pub agent_precompiles_height: Option<u64>,
 
+    /// Exact-created-code activation height (`citrate_execution::exact_code`):
+    /// from this height a contract created by CREATE/CREATE2 from inside a
+    /// call is stored with its original code bytes instead of the padded form.
+    ///
+    /// A CONSENSUS PARAMETER. Absent (the default, and every shipped profile)
+    /// = not activated, byte-identical to the previous binary. A new genesis
+    /// (reroll or rehearsal profile) sets 0. Never set it on a node that
+    /// follows a chain produced without it. `CITRATE_EXACT_CREATE_CODE_HEIGHT`
+    /// overrides it.
+    #[serde(default)]
+    pub exact_create_code_height: Option<u64>,
+    /// Canonical ECVRF proof encoding activation height
+    /// (`citrate_consensus::vrf_encoding`): from this height a block's ECVRF
+    /// proof must carry its curve points in canonical compressed form.
+    ///
+    /// A CONSENSUS PARAMETER. Absent = not activated. On a release network
+    /// (40204) only the release pin sets it (unscheduled in this release): a
+    /// value here, or `CITRATE_VRF_CANONICAL_ENCODING_HEIGHT`, refuses to start
+    /// unless it equals the pin. Dev profiles set `0` (active from genesis).
+    #[serde(default)]
+    pub vrf_canonical_encoding_height: Option<u64>,
+    /// Supply-accounting hardening fork activation height
+    /// (`citrate_execution::supply_hardening`): from this height model-access
+    /// and provider fees move through the per-transaction journal, and the
+    /// block reward's bonus arms are computed from executed receipts, halved
+    /// with the base subsidy and capped at it.
+    ///
+    /// A CONSENSUS PARAMETER. Absent (the default, and every shipped profile)
+    /// = not activated. On a release network (40204) only the release pin
+    /// sets it: a value here, or `CITRATE_SUPPLY_HARDENING_HEIGHT`, refuses to
+    /// start unless it equals the pin. Local dev chains may set it.
+    #[serde(default)]
+    pub supply_hardening_height: Option<u64>,
+
+    /// Storage-root hardening fork activation height
+    /// (`citrate_execution::storage_root_hardening`): for the post-state of a
+    /// block at or after this height a contract's `storage_root` is a function
+    /// of its slot set only, and restart hydration restores every persisted
+    /// storage record byte for byte.
+    ///
+    /// A CONSENSUS PARAMETER. Absent (the default, and every shipped profile)
+    /// = not activated. On a release network (40204) only the release pin
+    /// sets it: a value here, or `CITRATE_STORAGE_ROOT_HARDENING_HEIGHT`,
+    /// refuses to start unless it equals the pin. A new genesis sets `0`
+    /// (active from block 1).
+    #[serde(default)]
+    pub storage_root_hardening_height: Option<u64>,
+
     /// A local development chain. The activation height compiled into the
     /// release for this chain id (`citrate_consensus::hardening::
     /// PINNED_ACTIVATIONS`) is not applied, so dev profiles keep choosing
@@ -369,6 +417,10 @@ impl Default for NodeConfig {
                 genesis_profile: None,
                 pba_hardening_height: None,
                 agent_precompiles_height: None,
+                exact_create_code_height: None,
+                vrf_canonical_encoding_height: None,
+                supply_hardening_height: None,
+                storage_root_hardening_height: None,
                 dev_profile: false,
             },
             network: NetworkConfig {
@@ -436,6 +488,8 @@ impl NodeConfig {
         config.chain.genesis_profile = Some("default".to_string());
         // PBA-R2: dev profile enforces the hardened validity rules from genesis.
         config.chain.pba_hardening_height = Some(0);
+        // Canonical ECVRF proof encoding from genesis on dev profiles.
+        config.chain.vrf_canonical_encoding_height = Some(0);
         config.chain.dev_profile = true;
         config.mining.enabled = true;
         config.mining.target_block_time = 2; // Fast blocks for testing
@@ -742,8 +796,8 @@ mod tests {
         let start = main.find("async fn start_node(").expect("start_node");
         let body = &main[start..];
         let init = body
-            .find("citrate_consensus::hardening::init_pba_hardening_for_chain(")
-            .expect("start_node must publish via init_pba_hardening_for_chain");
+            .find("citrate_consensus::hardening::init_pba_hardening_for_genesis(")
+            .expect("start_node must publish via init_pba_hardening_for_genesis (the chain pin unless the loaded genesis has its own)");
         // The pin-unaware resolver would skip the release pin.
         assert!(!body.contains("hardening::init_pba_hardening_height("));
         // The chain id the pin keys on is checked against CITRATE_CHAIN_ID first.
@@ -770,37 +824,9 @@ mod tests {
         );
     }
 
-    /// HUP-S7.2: the agent precompile fork height is published through its one
-    /// resolver before any execution or consensus component exists, there is
-    /// no second publication path, and no shipped profile schedules it.
-    #[test]
-    fn agent_fork_is_published_first_and_unset_in_every_shipped_profile() {
-        let main = include_str!("main.rs");
-        let start = main.find("async fn start_node(").expect("start_node");
-        let body = &main[start..];
-        let init = body
-            .find("citrate_execution::agent_fork::init_for_chain(")
-            .expect("start_node must publish the agent fork height");
-        for ctor in [
-            "GhostDag::new(",
-            "Executor::with_storage_and_chain_id(",
-            "ConsensusManifest::for_height(",
-        ] {
-            let at = body
-                .find(ctor)
-                .unwrap_or_else(|| panic!("{ctor} in start_node"));
-            assert!(
-                init < at,
-                "agent fork height must be published before {ctor}"
-            );
-        }
-        assert!(
-            !main.contains("set_agent_precompiles_height("),
-            "one publication path"
-        );
-        assert_eq!(NodeConfig::default().chain.agent_precompiles_height, None);
-        assert_eq!(NodeConfig::devnet().chain.agent_precompiles_height, None);
-        for (name, text) in [
+    /// Every node profile shipped in the repository, with its path.
+    fn shipped_profiles() -> [(&'static str, &'static str); 14] {
+        [
             (
                 "node/config/devnet.toml",
                 include_str!("../config/devnet.toml"),
@@ -857,10 +883,311 @@ mod tests {
                 "testnet-config.toml",
                 include_str!("../../testnet-config.toml"),
             ),
+        ]
+    }
+
+    /// The exact-created-code height is published through its one resolver
+    /// before any execution or consensus component exists, and no shipped
+    /// profile schedules it.
+    #[test]
+    fn exact_code_is_published_first_and_unset_in_every_shipped_profile() {
+        let main = include_str!("main.rs");
+        let start = main.find("async fn start_node(").expect("start_node");
+        let body = &main[start..];
+        let init = body
+            .find("citrate_execution::exact_code::init_for_genesis(")
+            .expect("start_node must publish the exact-created-code height");
+        for ctor in [
+            "GhostDag::new(",
+            "Executor::with_storage_and_chain_id(",
+            "ConsensusManifest::for_node(",
         ] {
+            let at = body
+                .find(ctor)
+                .unwrap_or_else(|| panic!("{ctor} in start_node"));
+            assert!(
+                init < at,
+                "exact-created-code height must be published before {ctor}"
+            );
+        }
+        assert!(
+            !main.contains("set_exact_create_code_height("),
+            "one publication path"
+        );
+        assert_eq!(NodeConfig::default().chain.exact_create_code_height, None);
+        assert_eq!(NodeConfig::devnet().chain.exact_create_code_height, None);
+        for (name, text) in shipped_profiles() {
+            assert!(
+                !text.contains("exact_create_code_height"),
+                "{name} must not schedule the exact-created-code rule"
+            );
+        }
+        let base = include_str!("../config/devnet.toml");
+        let with = base.replacen("[chain]", "[chain]\nexact_create_code_height = 0", 1);
+        let cfg: NodeConfig = toml::from_str(&with).expect("key parses");
+        assert_eq!(cfg.chain.exact_create_code_height, Some(0));
+    }
+
+    /// HUP-S7.2: the agent precompile fork height is published through its one
+    /// resolver before any execution or consensus component exists, there is
+    /// no second publication path, and no shipped profile schedules it.
+    #[test]
+    fn agent_fork_is_published_first_and_unset_in_every_shipped_profile() {
+        let main = include_str!("main.rs");
+        let start = main.find("async fn start_node(").expect("start_node");
+        let body = &main[start..];
+        let init = body
+            .find("citrate_execution::agent_fork::init_for_chain(")
+            .expect("start_node must publish the agent fork height");
+        for ctor in [
+            "GhostDag::new(",
+            "Executor::with_storage_and_chain_id(",
+            "ConsensusManifest::for_node(",
+        ] {
+            let at = body
+                .find(ctor)
+                .unwrap_or_else(|| panic!("{ctor} in start_node"));
+            assert!(
+                init < at,
+                "agent fork height must be published before {ctor}"
+            );
+        }
+        assert!(
+            !main.contains("set_agent_precompiles_height("),
+            "one publication path"
+        );
+        assert_eq!(NodeConfig::default().chain.agent_precompiles_height, None);
+        assert_eq!(NodeConfig::devnet().chain.agent_precompiles_height, None);
+        for (name, text) in shipped_profiles() {
             assert!(
                 !text.contains("agent_precompiles_height"),
                 "{name} must not schedule the agent precompile fork"
+            );
+        }
+    }
+
+    /// The supply hardening fork height is published through its one resolver
+    /// before any execution component exists, there is no second publication
+    /// path, no shipped profile schedules it, and the key parses.
+    #[test]
+    fn supply_hardening_is_published_first_and_unset_in_every_shipped_profile() {
+        let main = include_str!("main.rs");
+        let start = main.find("async fn start_node(").expect("start_node");
+        let body = &main[start..];
+        let init = body
+            .find("citrate_execution::supply_hardening::init_for_genesis(")
+            .expect("start_node must publish the supply hardening height");
+        for ctor in [
+            "GhostDag::new(",
+            "Executor::with_storage_and_chain_id(",
+            "ConsensusManifest::for_node(",
+        ] {
+            let at = body
+                .find(ctor)
+                .unwrap_or_else(|| panic!("{ctor} in start_node"));
+            assert!(init < at, "supply hardening height published before {ctor}");
+        }
+        assert!(
+            !main.contains("set_supply_hardening_height("),
+            "one publication path"
+        );
+        assert_eq!(NodeConfig::default().chain.supply_hardening_height, None);
+        assert_eq!(NodeConfig::devnet().chain.supply_hardening_height, None);
+        for (name, text) in [
+            (
+                "node/config/devnet.toml",
+                include_str!("../config/devnet.toml"),
+            ),
+            (
+                "node/config/mainnet.toml",
+                include_str!("../config/mainnet.toml"),
+            ),
+            (
+                "node/config/testnet.toml",
+                include_str!("../config/testnet.toml"),
+            ),
+            (
+                "node/config/testnet-beta.toml",
+                include_str!("../config/testnet-beta.toml"),
+            ),
+            (
+                "node/config/team-testnet.toml",
+                include_str!("../config/team-testnet.toml"),
+            ),
+            (
+                "devnet-config.toml",
+                include_str!("../../devnet-config.toml"),
+            ),
+            (
+                "testnet-config.toml",
+                include_str!("../../testnet-config.toml"),
+            ),
+        ] {
+            assert!(
+                !text.contains("supply_hardening_height"),
+                "{name} must not schedule the supply hardening fork"
+            );
+        }
+        let base = include_str!("../config/devnet.toml");
+        let with = base.replacen("[chain]", "[chain]\nsupply_hardening_height = 12", 1);
+        let cfg: NodeConfig = toml::from_str(&with).expect("key parses");
+        assert_eq!(cfg.chain.supply_hardening_height, Some(12));
+    }
+
+    /// The storage-root hardening height is published through its one resolver
+    /// before state is hydrated or any execution component exists, there is no
+    /// second publication path, no shipped profile schedules it, and the key
+    /// parses (including `0` for a new genesis).
+    #[test]
+    fn storage_root_hardening_is_published_first_and_unset_in_every_shipped_profile() {
+        let main = include_str!("main.rs");
+        let start = main.find("async fn start_node(").expect("start_node");
+        let body = &main[start..];
+        let init = body
+            .find("citrate_execution::storage_root_hardening::init_for_genesis(")
+            .expect("start_node must publish the storage root hardening height");
+        for marker in [
+            "GhostDag::new(",
+            "Executor::with_storage_and_chain_id(",
+            "ConsensusManifest::for_node(",
+            "storage.state.get_all_storage()",
+        ] {
+            let at = body
+                .find(marker)
+                .unwrap_or_else(|| panic!("{marker} in start_node"));
+            assert!(
+                init < at,
+                "storage root hardening height published before {marker}"
+            );
+        }
+        assert!(
+            !main.contains("set_storage_root_hardening_height("),
+            "one publication path"
+        );
+        assert_eq!(
+            NodeConfig::default().chain.storage_root_hardening_height,
+            None
+        );
+        assert_eq!(
+            NodeConfig::devnet().chain.storage_root_hardening_height,
+            None
+        );
+        for (name, text) in [
+            (
+                "node/config/devnet.toml",
+                include_str!("../config/devnet.toml"),
+            ),
+            (
+                "node/config/mainnet.toml",
+                include_str!("../config/mainnet.toml"),
+            ),
+            (
+                "node/config/testnet.toml",
+                include_str!("../config/testnet.toml"),
+            ),
+            (
+                "node/config/testnet-beta.toml",
+                include_str!("../config/testnet-beta.toml"),
+            ),
+            (
+                "node/config/team-testnet.toml",
+                include_str!("../config/team-testnet.toml"),
+            ),
+            (
+                "devnet-config.toml",
+                include_str!("../../devnet-config.toml"),
+            ),
+            (
+                "testnet-config.toml",
+                include_str!("../../testnet-config.toml"),
+            ),
+        ] {
+            assert!(
+                !text.contains("storage_root_hardening_height"),
+                "{name} must not schedule the storage root hardening fork"
+            );
+        }
+        let base = include_str!("../config/devnet.toml");
+        let with = base.replacen("[chain]", "[chain]\nstorage_root_hardening_height = 0", 1);
+        let cfg: NodeConfig = toml::from_str(&with).expect("key parses");
+        assert_eq!(cfg.chain.storage_root_hardening_height, Some(0));
+    }
+
+    /// The canonical VRF encoding height is published in start_node before
+    /// the DAG store (which captures it through its selector) is built, from
+    /// one publication path. Release profiles leave it to the release pin;
+    /// the dev profiles schedule it from genesis.
+    #[test]
+    fn vrf_encoding_is_published_first_and_only_dev_profiles_set_it() {
+        let main = include_str!("main.rs");
+        let start = main.find("async fn start_node(").expect("start_node");
+        let body = &main[start..];
+        let init = body
+            .find("citrate_consensus::vrf_encoding::init_for_genesis(")
+            .expect("start_node must publish the canonical VRF encoding height");
+        for ctor in ["DagStore::", "ConsensusManifest::for_node("] {
+            let at = body
+                .find(ctor)
+                .unwrap_or_else(|| panic!("{ctor} in start_node"));
+            assert!(
+                init < at,
+                "VRF encoding height must be published before {ctor}"
+            );
+        }
+        assert!(
+            !main.contains("set_vrf_canonical_encoding_height("),
+            "one publication path"
+        );
+        assert_eq!(
+            NodeConfig::default().chain.vrf_canonical_encoding_height,
+            None
+        );
+        assert_eq!(
+            NodeConfig::devnet().chain.vrf_canonical_encoding_height,
+            Some(0)
+        );
+        for (name, text) in [
+            (
+                "node/config/mainnet.toml",
+                include_str!("../config/mainnet.toml"),
+            ),
+            (
+                "node/config/testnet.toml",
+                include_str!("../config/testnet.toml"),
+            ),
+            (
+                "node/config/testnet-beta.toml",
+                include_str!("../config/testnet-beta.toml"),
+            ),
+            (
+                "node/config/team-testnet.toml",
+                include_str!("../config/team-testnet.toml"),
+            ),
+            (
+                "testnet-config.toml",
+                include_str!("../../testnet-config.toml"),
+            ),
+        ] {
+            assert!(
+                !text.contains("vrf_canonical_encoding_height"),
+                "{name} must not set the canonical VRF encoding height"
+            );
+        }
+        for (name, text) in [
+            (
+                "node/config/devnet.toml",
+                include_str!("../config/devnet.toml"),
+            ),
+            (
+                "devnet-config.toml",
+                include_str!("../../devnet-config.toml"),
+            ),
+        ] {
+            let cfg: NodeConfig = toml::from_str(text).expect("dev profile parses");
+            assert_eq!(
+                cfg.chain.vrf_canonical_encoding_height,
+                Some(0),
+                "{name} schedules canonical VRF encoding from genesis"
             );
         }
     }

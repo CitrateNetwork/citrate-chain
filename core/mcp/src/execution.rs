@@ -2,6 +2,7 @@
 
 // Model executor for running AI models
 use crate::cache::ModelCache;
+use crate::chunk_assembly::ChunkAssembler;
 use crate::gguf_engine::{GGUFEngine, GGUFEngineConfig, ModelType as GGUFModelType};
 use crate::registry::ModelRegistry;
 use crate::types::{ExecutionProof, ModelId};
@@ -188,17 +189,19 @@ impl ModelExecutor {
             let cid = Cid(weight_cid.clone());
             let raw = ipfs.retrieve_model(&cid).await?;
             if let Ok(manifest) = serde_json::from_slice::<chunking::ChunkManifest>(&raw) {
-                let mut assembled = Vec::with_capacity(manifest.total_size as usize);
-                for chunk_cid in manifest.chunks {
-                    match ipfs.fetch_raw(&chunk_cid).await {
-                        Ok(bytes) => assembled.extend(bytes),
+                // Sizes in the manifest are input data: validate them before
+                // reserving anything and check each fetched chunk against them.
+                let mut assembler = ChunkAssembler::new(&manifest)?;
+                for chunk_cid in &manifest.chunks {
+                    match ipfs.fetch_raw(chunk_cid).await {
+                        Ok(bytes) => assembler.push(bytes)?,
                         Err(err) => {
                             warn!("Failed to fetch chunk {}: {}", chunk_cid.0, err);
                             return Err(err);
                         }
                     }
                 }
-                assembled
+                assembler.finish()?
             } else {
                 raw
             }

@@ -160,6 +160,10 @@ contract TreasuryGovernor is ReentrancyGuard {
 
     /// @notice LiquidStakingPool reference. Retained for configuration/ABI; it is
     ///         NOT a voting-power source (unsnapshotted shares, PBA-L2-001).
+    ///         Optional: address(0) means the liquid-staking path is disabled
+    ///         (the genesis set ships without a pool). No function of this
+    ///         contract calls the pool; a later passed proposal can wire one
+    ///         once through `setStakingPool`.
     LiquidStakingPool public stakingPool;
 
     /// @notice StablecoinTreasury for TreasurySpend execution
@@ -168,7 +172,8 @@ contract TreasuryGovernor is ReentrancyGuard {
     /// @notice Guardian address for emergency cancellation
     address public guardian;
 
-    /// @notice Total supply of SALT for quorum calculation (1B SALT)
+    /// @notice Total supply of SALT for quorum calculation (DeployAll passes
+    ///         SaltSupply.TOTAL_SUPPLY, the 1T SALT canon)
     uint256 public totalSaltSupply;
 
     // ============================================================
@@ -245,7 +250,8 @@ contract TreasuryGovernor is ReentrancyGuard {
     // ============================================================
 
     /// @notice Deploy the governor
-    /// @param _stakingPool LiquidStakingPool reference (not a vote source)
+    /// @param _stakingPool LiquidStakingPool reference (not a vote source), or
+    ///        address(0) to deploy with the liquid-staking path disabled
     /// @param _treasury StablecoinTreasury for spend execution
     /// @param _guardian Emergency guardian address
     /// @param _totalSaltSupply Total SALT supply for quorum calculation
@@ -255,7 +261,7 @@ contract TreasuryGovernor is ReentrancyGuard {
         address _guardian,
         uint256 _totalSaltSupply
     ) {
-        require(_stakingPool != address(0), "TreasuryGovernor: zero staking pool");
+        require(_stakingPool == address(0) || _stakingPool.code.length != 0, "TreasuryGovernor: staking pool has no code");
         require(_treasury != address(0), "TreasuryGovernor: zero treasury");
         require(_guardian != address(0), "TreasuryGovernor: zero guardian");
         // PBA-L2-001/-002: the guardian (cancel power) must be a real key, never
@@ -746,6 +752,29 @@ contract TreasuryGovernor is ReentrancyGuard {
             }
             revert("TreasuryGovernor: call failed");
         }
+    }
+
+    // ============================================================
+    // Liquid staking (optional)
+    // ============================================================
+
+    event StakingPoolSet(address indexed stakingPool);
+
+    /// @notice False while the governor has no LiquidStakingPool.
+    function liquidStakingEnabled() external view returns (bool) {
+        return address(stakingPool) != address(0);
+    }
+
+    /// @notice Wire a LiquidStakingPool into a governor deployed without one.
+    /// @dev Only the governor itself, i.e. a Call proposal that passed vote and
+    ///      timelock (`proposeCall(target = this, setStakingPool(pool))`); only
+    ///      while no pool is set; only a contract.
+    function setStakingPool(address pool) external {
+        require(msg.sender == address(this), "TreasuryGovernor: only via a passed proposal");
+        require(address(stakingPool) == address(0), "TreasuryGovernor: staking pool already set");
+        require(pool.code.length != 0, "TreasuryGovernor: staking pool has no code");
+        stakingPool = LiquidStakingPool(payable(pool));
+        emit StakingPoolSet(pool);
     }
 
     // ============================================================

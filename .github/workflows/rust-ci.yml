@@ -9,6 +9,11 @@ on:
       - '**/*.rs'
       - '**/build.rs'
       - '.github/workflows/rust-ci.yml'
+      - '.github/workflows/fuzz.yml'
+      - 'scripts/ci/check_fuzz_targets.sh'
+      - 'scripts/ci/test_commd_workspaces.sh'
+      - 'scripts/ci/excluded_workspace_ci_tripwire.sh'
+      - 'scripts/ci/workflow_run_steps.py'
   pull_request:
     paths:
       - '**/Cargo.toml'
@@ -16,6 +21,11 @@ on:
       - '**/*.rs'
       - '**/build.rs'
       - '.github/workflows/rust-ci.yml'
+      - '.github/workflows/fuzz.yml'
+      - 'scripts/ci/check_fuzz_targets.sh'
+      - 'scripts/ci/test_commd_workspaces.sh'
+      - 'scripts/ci/excluded_workspace_ci_tripwire.sh'
+      - 'scripts/ci/workflow_run_steps.py'
 
 # RM-B1 / WP-F1.1 (audit CI-01): workflow-level minimum permissions.
 permissions:
@@ -117,6 +127,65 @@ jobs:
       - name: Run citrate-api tests (default features)
         run: cargo test --locked -p citrate-api -- --nocapture
 
+  # fuzz/ is a separate workspace that `cargo test --workspace` never builds,
+  # and fuzz.yml only runs on a schedule. Two targets once stopped compiling
+  # against current APIs unnoticed; this makes that a PR failure.
+  fuzz-targets-compile:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config
+      - name: Cache cargo registry
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: fuzz-targets-${{ runner.os }}-${{ hashFiles('fuzz/Cargo.lock') }}
+          restore-keys: fuzz-targets-${{ runner.os }}-
+      - name: Tripwire self-test (negative control)
+        run: scripts/ci/check_fuzz_targets.sh --self-test
+      - name: Every fuzz target is registered and compiles (--locked)
+        run: scripts/ci/check_fuzz_targets.sh
+
+  # The extension's background worker loads wallet-sdk/src/wasm.rs as a
+  # wasm-pack `no-modules` bundle. This job builds it from this crate as-is
+  # (no wrapper crate) at the pins in citrate-wallet-extension
+  # vendor/wasm/BUILD_PINS, and fails if a native-only dependency (tokio/mio,
+  # reqwest, wallet-core `native`) enters the wasm build.
+  wallet-sdk-wasm:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Rust (rust-toolchain.toml) + wasm32 target
+        run: |
+          rustup toolchain install
+          rustup target add wasm32-unknown-unknown
+          rustc -V
+      - name: Cache cargo registry
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: wallet-sdk-wasm-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: wallet-sdk-wasm-${{ runner.os }}-
+      - name: Install wasm-pack 0.14.0
+        run: cargo install wasm-pack --version 0.14.0 --locked
+      - name: wallet-sdk wasm32 gate (tree, cargo check, wasm-pack no-modules)
+        run: scripts/ci/wallet_sdk_wasm_gate.sh --require-pack
+
   standalone-benchmarks:
     runs-on: ubuntu-latest
     permissions:
@@ -139,3 +208,35 @@ jobs:
         run: cargo test --manifest-path tests/load/Cargo.toml --all-targets --locked
       - name: Test canonical benchmark workspace
         run: cargo test --manifest-path tools/citrate-bench/Cargo.toml --all-targets --locked
+
+  # crates/citrate-commd-fold and crates/citrate-commd-verify are their own Cargo
+  # workspaces (root Cargo.toml `exclude`), so core-workspace never runs them.
+  # The tripwire step fails if any other excluded crate is left without a job.
+  commd-workspaces:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Excluded-workspace coverage tripwire (self-test, then scan)
+        run: |
+          scripts/ci/excluded_workspace_ci_tripwire.sh --self-test
+          scripts/ci/excluded_workspace_ci_tripwire.sh
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - name: Show toolchain
+        run: rustc -Vv && cargo -V
+      - name: Cache cargo registry
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: commd-workspaces-${{ runner.os }}-${{ hashFiles('crates/citrate-commd-fold/Cargo.lock', 'crates/citrate-commd-verify/Cargo.lock') }}
+          restore-keys: commd-workspaces-${{ runner.os }}-
+      - name: Pinned-test check self-test
+        run: scripts/ci/test_commd_workspaces.sh --self-test
+      - name: Test commd fold + verify workspaces (--release --locked, pinned tests by name)
+        run: scripts/ci/test_commd_workspaces.sh

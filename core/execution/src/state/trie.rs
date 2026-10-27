@@ -87,14 +87,30 @@ impl Clone for TrieNode {
 }
 
 /// Merkle Patricia Trie
+///
+/// SHAPE INVARIANT. A trie built by inserts alone has one shape per key/value
+/// set, whatever the insert order: a `Leaf` where exactly one key lies under a
+/// prefix, a `Branch` where two or more do, and no `Extension`. `remove` does
+/// not preserve that shape (it can leave an `Extension`, a single-child
+/// `Branch`, or an empty `Branch`), and `encode_node` hashes the shape, so the
+/// structural hash of a trie that has seen a remove depends on its history.
+///
+/// [`Trie::root_hash`] is therefore a function of the key/value set only: for a
+/// trie that has seen a remove it hashes the insert-only shape of the current
+/// set. [`Trie::legacy_root_hash`] is the structural hash, kept for state roots
+/// below the storage-root hardening height (`crate::storage_root_hardening`).
 #[derive(Clone)]
 pub struct Trie {
     root: TrieNode,
     cache: HashMap<Vec<u8>, Vec<u8>>,
-    /// `root_hash()` of `root`, remembered until the next `insert`/`remove`.
-    /// A pure function of `root`, so remembering it cannot change any result;
-    /// it only stops re-encoding storage tries that did not change, which the
-    /// per-block state root otherwise does for every contract.
+    /// Set by any `remove`: the shape may no longer be the insert-only shape.
+    removed: bool,
+    /// `legacy_root_hash()` and `root_hash()`, remembered until the next
+    /// `insert`/`remove`. Each is a pure function of the trie, so remembering
+    /// it cannot change any result; it only stops re-encoding storage tries
+    /// that did not change, which the per-block state root otherwise does for
+    /// every contract.
+    legacy_memo: std::sync::OnceLock<Hash>,
     root_memo: std::sync::OnceLock<Hash>,
 }
 
@@ -103,6 +119,8 @@ impl Trie {
         Self {
             root: TrieNode::Empty,
             cache: HashMap::new(),
+            removed: false,
+            legacy_memo: std::sync::OnceLock::new(),
             root_memo: std::sync::OnceLock::new(),
         }
     }
@@ -110,12 +128,11 @@ impl Trie {
     /// Insert a key-value pair
     pub fn insert(&mut self, key: Vec<u8>, value: Vec<u8>) {
         let nibbles = to_nibbles(&key);
-        // Move the root out rather than deep-copying it: `insert_node` consumes
-        // the old root and returns the new one, so nothing else observes it.
-        let root = std::mem::take(&mut self.root);
-        self.root = Self::insert_node(root, &nibbles, value.clone());
+        // Take the root by value instead of cloning the whole tree on every
+        // insert (the result replaces it either way).
+        self.root = Self::insert_node(std::mem::take(&mut self.root), &nibbles, value.clone());
         self.cache.insert(key, value);
-        self.root_memo = std::sync::OnceLock::new();
+        self.forget_roots();
     }
 
     fn insert_node(node: TrieNode, key: &[u8], value: Vec<u8>) -> TrieNode {
@@ -230,9 +247,16 @@ impl Trie {
     /// Remove a key
     pub fn remove(&mut self, key: &[u8]) {
         let nibbles = to_nibbles(key);
-        let root = std::mem::take(&mut self.root);
-        self.root = Self::remove_node(root, &nibbles);
+        self.root = Self::remove_node(std::mem::take(&mut self.root), &nibbles);
         self.cache.remove(key);
+        // Even a remove of an absent key can reshape a branch on its path.
+        self.removed = true;
+        self.forget_roots();
+    }
+
+    /// Drop the remembered roots; every mutation calls this.
+    fn forget_roots(&mut self) {
+        self.legacy_memo = std::sync::OnceLock::new();
         self.root_memo = std::sync::OnceLock::new();
     }
 
@@ -288,23 +312,54 @@ impl Trie {
         }
     }
 
-    /// The root, computed from the nodes (bypassing any remembered value).
-    #[cfg(test)]
-    pub(crate) fn recompute_root_hash(&self) -> Hash {
+    /// The root hash, a function of the key/value set only.
+    ///
+    /// A trie that has never seen a remove already has the insert-only shape,
+    /// so this is its structural hash. Otherwise the insert-only shape of the
+    /// current set is rebuilt (keys sorted, for a fixed build sequence) and
+    /// hashed. Remembered until the next mutation.
+    pub fn root_hash(&self) -> Hash {
+        if !self.removed {
+            return self.legacy_root_hash();
+        }
+        *self.root_memo.get_or_init(|| self.set_root_hash())
+    }
+
+    fn set_root_hash(&self) -> Hash {
+        let mut entries: Vec<(&Vec<u8>, &Vec<u8>)> = self.cache.iter().collect();
+        entries.sort_unstable();
+        let mut rebuilt = Trie::new();
+        for (k, v) in entries {
+            rebuilt.insert(k.clone(), v.clone());
+        }
+        rebuilt.legacy_root_hash()
+    }
+
+    /// The structural hash of the trie as built, which depends on its remove
+    /// history. Consensus uses it only for state roots below the storage-root
+    /// hardening height, so historical blocks keep the root they were produced
+    /// with. Remembered until the next mutation.
+    pub fn legacy_root_hash(&self) -> Hash {
+        *self.legacy_memo.get_or_init(|| self.structural_hash())
+    }
+
+    fn structural_hash(&self) -> Hash {
         let encoded = self.encode_node(&self.root);
         let mut hasher = Keccak256::new();
         hasher.update(&encoded);
         Hash::new(hasher.finalize().into())
     }
 
-    /// Calculate the root hash
-    pub fn root_hash(&self) -> Hash {
-        *self.root_memo.get_or_init(|| {
-            let encoded = self.encode_node(&self.root);
-            let mut hasher = Keccak256::new();
-            hasher.update(&encoded);
-            Hash::new(hasher.finalize().into())
-        })
+    /// `root_hash()` and `legacy_root_hash()` computed from the nodes,
+    /// bypassing any remembered value.
+    #[cfg(test)]
+    pub(crate) fn recompute_root_hashes(&self) -> (Hash, Hash) {
+        let root = if self.removed {
+            self.set_root_hash()
+        } else {
+            self.structural_hash()
+        };
+        (root, self.structural_hash())
     }
 
     #[allow(clippy::only_used_in_recursion)]
@@ -653,7 +708,10 @@ mod tests {
         assert_ne!(second, first);
         assert!(op_counters::encodes() > 0);
         t.remove(&k32(9999));
-        assert_eq!(t.root_hash(), t.recompute_root_hash());
+        assert_eq!(
+            (t.root_hash(), t.legacy_root_hash()),
+            t.recompute_root_hashes()
+        );
     }
 
     proptest::proptest! {
@@ -670,7 +728,10 @@ mod tests {
                 } else {
                     t.remove(&k32(key));
                 }
-                proptest::prop_assert_eq!(t.root_hash(), t.recompute_root_hash());
+                proptest::prop_assert_eq!(
+                    (t.root_hash(), t.legacy_root_hash()),
+                    t.recompute_root_hashes()
+                );
             }
         }
     }
@@ -843,6 +904,111 @@ mod trie_shuffle_probe {
         }
     }
 
+    mod canonical_root {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Build a trie from `ops` (`Some(v)` = insert, `None` = remove) and the
+        /// insert-only trie of the resulting map in the given key order.
+        fn replay_and_rebuild(
+            ops: &[(Vec<u8>, Option<Vec<u8>>)],
+            rebuild_order_seed: u64,
+        ) -> (Trie, Trie) {
+            let mut replayed = Trie::new();
+            for (k, v) in ops {
+                match v {
+                    Some(v) => replayed.insert(k.clone(), v.clone()),
+                    None => replayed.remove(k),
+                }
+            }
+            let mut entries: Vec<(Vec<u8>, Vec<u8>)> = replayed.entries_map().into_iter().collect();
+            entries.sort();
+            // A seeded rotation, so the rebuild order is not always sorted.
+            if !entries.is_empty() {
+                let n = entries.len();
+                entries.rotate_left((rebuild_order_seed as usize) % n);
+            }
+            let mut rebuilt = Trie::new();
+            for (k, v) in entries {
+                rebuilt.insert(k, v);
+            }
+            (replayed, rebuilt)
+        }
+
+        proptest! {
+            /// The root is a function of the final key/value map: any history of
+            /// inserts, updates and removes hashes like an insert-only build of the
+            /// same map, in any insert order.
+            #[test]
+            fn prop_root_is_a_function_of_the_final_map(
+                ops in prop::collection::vec(
+                    (
+                        prop::collection::vec(0u8..4, 0..4),
+                        prop::option::weighted(0.7, prop::collection::vec(any::<u8>(), 0..3)),
+                    ),
+                    0..24,
+                ),
+                seed in any::<u64>(),
+            ) {
+                let (replayed, rebuilt) = replay_and_rebuild(&ops, seed);
+                prop_assert_eq!(replayed.root_hash(), rebuilt.root_hash());
+                // Remove-free builds keep the structural hash: the two functions
+                // agree wherever no remove happened.
+                prop_assert_eq!(rebuilt.root_hash(), rebuilt.legacy_root_hash());
+            }
+
+            /// Insert-only builds have one shape per map whatever the order, so the
+            /// remove-free fast path in `root_hash` is sound.
+            #[test]
+            fn prop_insert_only_shape_is_order_independent(
+                keys in prop::collection::vec(prop::collection::vec(0u8..4, 0..4), 0..20),
+                seed in any::<u64>(),
+            ) {
+                let ops: Vec<(Vec<u8>, Option<Vec<u8>>)> = keys
+                    .iter()
+                    .enumerate()
+                    .map(|(i, k)| (k.clone(), Some(vec![i as u8])))
+                    .collect();
+                let (forward, rebuilt) = replay_and_rebuild(&ops, seed);
+                prop_assert_eq!(forward.legacy_root_hash(), rebuilt.legacy_root_hash());
+            }
+        }
+
+        #[test]
+        fn legacy_root_keeps_the_remove_history_shape() {
+            // The minimal review case. The legacy hash still differs (historical
+            // roots are preserved); `root_hash` does not.
+            let (a, b, c) = (vec![0u8, 1], vec![0u8, 3, 0], vec![3u8]);
+            let ops = vec![
+                (a.clone(), Some(vec![9])),
+                (b, Some(vec![1])),
+                (c, Some(vec![2])),
+                (a, None),
+            ];
+            let (replayed, rebuilt) = replay_and_rebuild(&ops, 0);
+            assert_ne!(replayed.legacy_root_hash(), rebuilt.legacy_root_hash());
+            assert_eq!(replayed.root_hash(), rebuilt.root_hash());
+            assert_eq!(rebuilt.root_hash(), rebuilt.legacy_root_hash());
+        }
+
+        #[test]
+        fn removing_every_key_hashes_like_an_empty_trie() {
+            let mut t = Trie::new();
+            t.insert(vec![1, 2], vec![3]);
+            t.insert(vec![1, 2, 3], vec![4]);
+            t.remove(&[1, 2, 3]);
+            t.remove(&[1, 2]);
+            assert_eq!(t.root_hash(), Trie::new().root_hash());
+            // Removing an absent key changes nothing in the canonical hash.
+            let mut u = Trie::new();
+            u.insert(vec![0x10], vec![1]);
+            u.insert(vec![0x11], vec![2]);
+            let before = u.root_hash();
+            u.remove(&[0x12]);
+            assert_eq!(u.root_hash(), before);
+        }
+    }
+
     /// PANIC-S1 golden vector: a deterministic mix of inserts and removes over
     /// variable-length keys that prefix one another (exercising branch values,
     /// extension splits and branch simplification). The digest folds the root after
@@ -874,7 +1040,9 @@ mod trie_shuffle_probe {
                 assert_eq!(trie.get(&key), Some(value));
                 live.push(key);
             }
-            fold.update(trie.root_hash().as_bytes());
+            // The legacy structural hash is the state-root function below the
+            // storage-root hardening height: it must not move.
+            fold.update(trie.legacy_root_hash().as_bytes());
         }
         hex::encode(fold.finalize())
     }

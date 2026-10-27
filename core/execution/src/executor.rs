@@ -35,6 +35,30 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
+/// The basic block-reward credits for a block, as a function of the block and
+/// its EXECUTED receipts (positionally aligned with `block.transactions`).
+///
+/// The node injects its reward policy here, so this crate stays free of
+/// economics while the reward can depend on what actually executed. The
+/// producer and every receiver run the same function over the same
+/// deterministic receipts, so they credit byte-identical mints. Returns e.g.
+/// `[(beneficiary, validator_reward), (treasury, treasury_reward)]`; an error
+/// rejects the block (`ExecutionError::RewardSettlement`).
+pub type RewardFn<'a> = &'a (dyn Fn(&Block, &[TransactionReceipt]) -> Result<Vec<(Address, U256)>, ExecutionError>
+         + Send
+         + Sync);
+
+/// A [`RewardFn`] that credits a fixed, receipt-independent list. For callers
+/// whose credits do not depend on execution (tests, and reward-free blocks).
+pub fn fixed_reward(
+    credits: &[(Address, U256)],
+) -> impl Fn(&Block, &[TransactionReceipt]) -> Result<Vec<(Address, U256)>, ExecutionError>
+       + Send
+       + Sync
+       + '_ {
+    move |_block, _receipts| Ok(credits.to_vec())
+}
+
 /// Execution context for a transaction
 /// Extract a human-readable message from a caught panic payload
 /// (`Box<dyn Any + Send>` from `catch_unwind`). Panics carry either a
@@ -408,6 +432,104 @@ pub struct StateStorageChange {
     pub value: Option<Vec<u8>>,
 }
 
+/// C1-R: the RPC receipt index (NOT consensus data) committed in the SAME write
+/// batch as a block's state + applied-tip pointer, so a node that applies a block
+/// it did not produce can serve `eth_getTransactionReceipt` / `eth_getLogs` for it,
+/// and a crash can never leave the applied tip ahead of its receipts (or receipts
+/// ahead of the tip).
+///
+/// Storage layout is the producer's (`TransactionStore::put_receipts` /
+/// `put_transactions`): `CF_RECEIPTS[tx_hash] = receipt`, a `t‖block_hash‖tx_hash`
+/// marker in `CF_METADATA`, `CF_TRANSACTIONS[tx_hash] = tx` and the `s‖sender‖nonce`
+/// sender index. The store applies `removals` BEFORE the puts, so a tx that sits on
+/// both an abandoned and a winning branch ends with the winning receipt.
+///
+/// Nothing here feeds a state root: receipts are written next to state, never into it.
+#[derive(Debug, Clone, Default)]
+pub struct ReceiptIndexBatch {
+    /// `(block_hash, tx_hash)` pairs of blocks that are no longer executed (a reorg
+    /// or rebuild abandoned them). The store deletes the block→tx marker, and the
+    /// receipt itself only when the stored receipt still names that block.
+    pub removals: Vec<(Hash, Hash)>,
+    /// Receipts to write, keyed by `receipt.tx_hash` and indexed under
+    /// `receipt.block_hash`.
+    pub receipts: Vec<TransactionReceipt>,
+    /// Transaction bodies to index (by hash, and by sender + nonce).
+    pub transactions: Vec<Transaction>,
+    /// Rebuild bookkeeping committed with the same batch (see
+    /// [`ReceiptReconcileMarker`]). `None` leaves the stored marker unchanged.
+    pub reconcile_marker: Option<ReceiptReconcileMarker>,
+}
+
+/// C1-R: durable note that receipts of an older applied chain may still sit
+/// ABOVE the durable applied tip.
+///
+/// A from-genesis rebuild resets the durable tip to genesis but keeps the receipts
+/// of blocks shared by the old applied chain and the rebuild target (they are
+/// rewritten, identically, as the replay reaches them). If the process stops
+/// before the replay gets there and the next run converges on a different branch,
+/// nothing else would ever name those blocks again. The rebuild therefore records
+/// the old applied tip in the reset batch (`Set`) and drops the note once the
+/// receipt index matches the applied chain again (`Clear`); a restart that finds
+/// the note removes every receipt of the old chain that is not on the durable
+/// applied chain, walking only from the old tip down to the common ancestor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiptReconcileMarker {
+    /// Record `(hash, height)`: the applied tip whose chain may keep receipts
+    /// above the durable tip.
+    Set(Hash, u64),
+    /// Remove the record.
+    Clear,
+}
+
+impl ReceiptIndexBatch {
+    /// No index writes.
+    pub fn is_empty(&self) -> bool {
+        self.removals.is_empty()
+            && self.receipts.is_empty()
+            && self.transactions.is_empty()
+            && self.reconcile_marker.is_none()
+    }
+
+    /// The index entries for one executed block: its transactions and their
+    /// receipts, each receipt stamped with the block's hash and height (the same
+    /// fields the producer stamps after sealing).
+    pub fn for_block(block: &Block, receipts: &[TransactionReceipt]) -> Self {
+        let receipts = receipts
+            .iter()
+            .map(|r| {
+                let mut r = r.clone();
+                r.block_hash = block.header.block_hash;
+                r.block_number = block.header.height;
+                r
+            })
+            .collect();
+        Self {
+            removals: Vec::new(),
+            receipts,
+            transactions: block.transactions.clone(),
+            reconcile_marker: None,
+        }
+    }
+
+    /// Append another batch's entries (removals stay ahead of puts at commit time).
+    /// A marker change in `other` replaces this batch's.
+    pub fn extend(&mut self, other: ReceiptIndexBatch) {
+        self.removals.extend(other.removals);
+        self.receipts.extend(other.receipts);
+        self.transactions.extend(other.transactions);
+        if other.reconcile_marker.is_some() {
+            self.reconcile_marker = other.reconcile_marker;
+        }
+    }
+
+    /// This batch with its marker change set to `marker`.
+    pub fn with_marker(mut self, marker: ReceiptReconcileMarker) -> Self {
+        self.reconcile_marker = Some(marker);
+        self
+    }
+}
+
 /// Trait for state storage to avoid circular dependency
 pub trait StateStoreTrait: Send + Sync {
     fn put_account(
@@ -489,13 +611,21 @@ pub trait StateStoreTrait: Send + Sync {
     /// `StateStore` overrides this with a single cross-CF `WriteBatch`; the default here
     /// writes state then tip (non-atomic — only used by in-memory test stores, where a
     /// crash mid-write is not modeled). `applied_tip = None` means "state only".
+    ///
+    /// C1-R: `index` is the block's RPC receipt index, committed in the same batch
+    /// (see [`ReceiptIndexBatch`]); the default writes it last via
+    /// [`Self::put_receipt_index`].
     fn write_state_batch_with_applied_tip(
         &self,
         accounts: &[(Address, crate::types::AccountState)],
         storage: &[StateStorageChange],
         applied_tip: Option<(Hash, u64)>,
+        index: &ReceiptIndexBatch,
     ) -> anyhow::Result<()> {
         self.write_state_batch_sync(accounts, storage)?;
+        if !index.is_empty() {
+            self.put_receipt_index(index)?;
+        }
         if let Some((hash, height)) = applied_tip {
             self.put_applied_tip_meta(&hash, height)?;
         }
@@ -532,6 +662,9 @@ pub trait StateStoreTrait: Send + Sync {
     /// (a faithful single-batch one, or a delegating one) rather than inherit a default.
     /// The real RocksDB-backed `StateStore` implements it with a single cross-CF
     /// `WriteBatch` fsync'd once via `write_batch_sync`.
+    ///
+    /// C1-R: `index` carries the receipt-index changes of the reorg (abandoned
+    /// blocks' receipts removed, the winning branch's written) in the same batch.
     fn write_reorg_batch_sync(
         &self,
         accounts: &[(Address, crate::types::AccountState)],
@@ -539,12 +672,21 @@ pub trait StateStoreTrait: Send + Sync {
         account_dels: &[Address],
         code: &[(Hash, Vec<u8>)],
         applied_tip: Option<(Hash, u64)>,
+        index: &ReceiptIndexBatch,
     ) -> anyhow::Result<()>;
 
     /// Persist the applied-tip pointer (block hash + height). Default no-op for test
     /// stores; the real `StateStore` writes it to `CF_METADATA`. Used by the atomic
     /// [`Self::write_state_batch_with_applied_tip`] default fallback.
     fn put_applied_tip_meta(&self, _hash: &Hash, _height: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// C1-R: persist a receipt index on its own (non-atomic fallback used only by
+    /// the default [`Self::write_state_batch_with_applied_tip`]). Default no-op for
+    /// in-memory test stores, which keep no receipt index; the real RocksDB
+    /// `StateStore` overrides the batch methods and writes the index inside them.
+    fn put_receipt_index(&self, _index: &ReceiptIndexBatch) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -1010,6 +1152,51 @@ impl Executor {
         &self,
         applied_tip: Option<(Hash, u64)>,
     ) -> anyhow::Result<usize> {
+        self.persist_state_changes_with_tip_and_index(applied_tip, &ReceiptIndexBatch::default())
+            .await
+    }
+
+    /// C1-R: commit receipt-index changes on their own (no state, no tip) as one
+    /// fsync'd batch. Used for rebuild bookkeeping that has no state change to ride
+    /// with. A store-less executor keeps no receipt index, so this is a no-op there.
+    pub async fn persist_receipt_index(&self, index: &ReceiptIndexBatch) -> anyhow::Result<()> {
+        if index.is_empty() {
+            return Ok(());
+        }
+        let _guard = self.commit_coordinator.acquire_exec_lock().await;
+        match &self.state_store {
+            Some(store) => store.put_receipt_index(index),
+            None => Ok(()),
+        }
+    }
+
+    /// C1-R: [`Self::persist_receipt_index`] for a startup path that cannot await
+    /// (the canonical applicator's constructor settling an unfinished rebuild).
+    /// Same store, same single fsync'd batch, but it does NOT take the exec lock:
+    /// call it only before the executor runs blocks concurrently.
+    pub fn persist_receipt_index_at_startup(
+        &self,
+        index: &ReceiptIndexBatch,
+    ) -> anyhow::Result<()> {
+        if index.is_empty() {
+            return Ok(());
+        }
+        match &self.state_store {
+            Some(store) => store.put_receipt_index(index),
+            None => Ok(()),
+        }
+    }
+
+    /// C1-R: [`Self::persist_state_changes_with_tip`] plus the block's RPC receipt
+    /// index, all in the ONE atomic state batch: after a crash either the block's
+    /// state, tip AND receipts are durable, or none of them are (and the block is
+    /// re-applied on restart). The index never touches `state_db`, so it cannot move
+    /// a state root.
+    pub async fn persist_state_changes_with_tip_and_index(
+        &self,
+        applied_tip: Option<(Hash, u64)>,
+        index: &ReceiptIndexBatch,
+    ) -> anyhow::Result<usize> {
         let _guard = self.commit_coordinator.acquire_exec_lock().await;
         if let Some(store) = &self.state_store {
             let dirty_accounts = self.state_db.accounts.get_dirty_accounts();
@@ -1043,11 +1230,12 @@ impl Executor {
             let count = account_changes.len().saturating_add(storage_changes.len());
             // Write state + the applied-tip pointer ATOMICALLY. Always write when a tip
             // is supplied (even with 0 dirty changes — the tip must still advance).
-            if count > 0 || applied_tip.is_some() {
+            if count > 0 || applied_tip.is_some() || !index.is_empty() {
                 store.write_state_batch_with_applied_tip(
                     &account_changes,
                     &storage_changes,
                     applied_tip,
+                    index,
                 )?;
             }
 
@@ -1234,6 +1422,24 @@ impl Executor {
         }
     }
 
+    /// Set one contract storage slot (genesis only: a ceremony state dump carries
+    /// storage). Persisted eagerly unless deferring, like [`Self::set_code`]. A zero
+    /// value is not written.
+    pub fn set_genesis_storage(&self, address: &Address, slot: [u8; 32], value: [u8; 32]) {
+        if value == [0u8; 32] {
+            return;
+        }
+        self.state_db
+            .set_storage(*address, slot.to_vec(), value.to_vec());
+        if !self.defer_persist() {
+            if let Some(store) = &self.state_store {
+                if let Err(e) = store.put_storage(address, &slot, &value) {
+                    error!("Failed to persist genesis storage: {}", e);
+                }
+            }
+        }
+    }
+
     /// Calculate state root
     pub fn calculate_state_root(&self) -> Hash {
         self.state_db.calculate_state_root()
@@ -1307,6 +1513,19 @@ impl Executor {
         baseline: &crate::state::StateSnapshot,
         applied_tip: Option<(Hash, u64)>,
     ) -> anyhow::Result<()> {
+        self.reconcile_store_from_with_index(baseline, applied_tip, &ReceiptIndexBatch::default())
+    }
+
+    /// C1-R: [`Self::reconcile_store_from`] plus receipt-index changes (abandoned
+    /// blocks' receipts removed, the newly executed branch's written) in the SAME
+    /// fsync'd reorg batch, so the durable receipts always describe the blocks
+    /// executed up to the durable applied tip.
+    pub fn reconcile_store_from_with_index(
+        &self,
+        baseline: &crate::state::StateSnapshot,
+        applied_tip: Option<(Hash, u64)>,
+        index: &ReceiptIndexBatch,
+    ) -> anyhow::Result<()> {
         use std::collections::{HashMap, HashSet};
         let store = match &self.state_store {
             Some(s) => s,
@@ -1372,7 +1591,8 @@ impl Executor {
             || !storage_changes.is_empty()
             || !account_dels.is_empty()
             || !code.is_empty()
-            || applied_tip.is_some();
+            || applied_tip.is_some()
+            || !index.is_empty();
         if must_commit {
             store.write_reorg_batch_sync(
                 &account_puts,
@@ -1380,6 +1600,7 @@ impl Executor {
                 &account_dels,
                 &code,
                 applied_tip,
+                index,
             )?;
         }
         Ok(())
@@ -1395,9 +1616,10 @@ impl Executor {
     ///
     /// `coinbase` feeds the EVM COINBASE opcode + block context (recovered from
     /// `block.header.coinbase` for v>=2 blocks — the field that makes state_root
-    /// reproducible by receivers). `reward_credits` are the post-execution mints the
-    /// producer applied, e.g. `[(beneficiary, validator_reward), (treasury, treasury_reward)]`
-    /// — supplied by the caller so this atom stays free of reward/economics policy (and so
+    /// reproducible by receivers). `reward` computes the post-execution mints the
+    /// producer applied, e.g. `[(beneficiary, validator_reward), (treasury, treasury_reward)]`,
+    /// from the executed receipts (see [`RewardFn`]) — supplied by the caller so this atom
+    /// stays free of reward/economics policy (and so
     /// the VALIDATOR-S1 §R' on-chain reward path can slot in as just another credit list).
     ///
     /// Revert safety: `execute_transaction` drains its journal into `state_db` on commit
@@ -1411,10 +1633,11 @@ impl Executor {
         &self,
         block: &Block,
         coinbase: [u8; 20],
-        reward_credits: &[(Address, U256)],
+        reward: RewardFn<'_>,
     ) -> Result<Hash, ExecutionError> {
-        self.apply_block_inner(block, coinbase, reward_credits, true, true)
+        self.apply_block_inner(block, coinbase, reward, true, true)
             .await
+            .map(|(root, _)| root)
     }
 
     /// TRUSTED LOCAL REPLAY (canonical recovery): like [`Self::apply_block`]
@@ -1430,10 +1653,11 @@ impl Executor {
         &self,
         block: &Block,
         coinbase: [u8; 20],
-        reward_credits: &[(Address, U256)],
+        reward: RewardFn<'_>,
     ) -> Result<Hash, ExecutionError> {
-        self.apply_block_inner(block, coinbase, reward_credits, true, false)
+        self.apply_block_inner(block, coinbase, reward, true, false)
             .await
+            .map(|(root, _)| root)
     }
 
     /// EXECUTE-ON-RECEIVE (reorg): like [`Self::apply_block`], but advances only
@@ -1446,20 +1670,37 @@ impl Executor {
         &self,
         block: &Block,
         coinbase: [u8; 20],
-        reward_credits: &[(Address, U256)],
+        reward: RewardFn<'_>,
     ) -> Result<Hash, ExecutionError> {
-        self.apply_block_inner(block, coinbase, reward_credits, false, true)
+        self.apply_block_inner(block, coinbase, reward, false, true)
+            .await
+            .map(|(root, _)| root)
+    }
+
+    /// C1-R: [`Self::apply_block_no_persist`] that also returns the block's
+    /// receipts (positionally aligned with `block.transactions`), so the reorg
+    /// driver can commit them with the winning branch's store reconcile.
+    pub async fn apply_block_no_persist_with_receipts(
+        &self,
+        block: &Block,
+        coinbase: [u8; 20],
+        reward: RewardFn<'_>,
+    ) -> Result<(Hash, Vec<TransactionReceipt>), ExecutionError> {
+        self.apply_block_inner(block, coinbase, reward, false, true)
             .await
     }
 
+    /// Returns the verified (or, for a trusted replay, claimed) state root and the
+    /// block's receipts. With `persist`, the receipts are committed to the RPC
+    /// receipt index in the same atomic batch as the state and applied tip (C1-R).
     async fn apply_block_inner(
         &self,
         block: &Block,
         coinbase: [u8; 20],
-        reward_credits: &[(Address, U256)],
+        reward: RewardFn<'_>,
         persist: bool,
         verify_root: bool,
-    ) -> Result<Hash, ExecutionError> {
+    ) -> Result<(Hash, Vec<TransactionReceipt>), ExecutionError> {
         // Defer eager persistence for the whole apply (execution + reward
         // crediting + contract deploys): set_balance/set_code/set_nonce mutate
         // in-memory + dirty-tracking only, so a `no_persist` apply writes nothing
@@ -1498,6 +1739,21 @@ impl Executor {
                 }
             }
         }
+
+        // The basic block-reward credits are derived HERE, after execution, from
+        // the executed receipts, via the caller-injected reward function. The
+        // producer runs the same function over the same deterministic receipts,
+        // so both credit byte-identical mints. An uncomputable reward rejects
+        // the block (world state reverted).
+        let reward_credits = match reward(block, &receipts) {
+            Ok(c) => c,
+            Err(e) => {
+                self.state_db.restore(snapshot);
+                self.set_block_context(prev_ctx);
+                return Err(e);
+            }
+        };
+        let reward_credits: &[(Address, U256)] = &reward_credits;
 
         // Post-execution reward settlement — the SINGLE shared entrypoint the
         // PRODUCER also calls (node/src/producer.rs). It applies the basic block
@@ -1542,13 +1798,20 @@ impl Executor {
         };
 
         if !persist {
-            return Ok(got);
+            return Ok((got, receipts));
         }
 
         // SRP-S3b: persist state AND advance the applied-tip to THIS block atomically, so
         // the durable state and the committed applied tip can never diverge on a crash.
+        // C1-R: the block's receipts ride in the same batch, so every node that applies
+        // a block (not only its producer) can serve them, with no crash window between
+        // "block applied" and "receipts stored".
+        let index = ReceiptIndexBatch::for_block(block, &receipts);
         if let Err(e) = self
-            .persist_state_changes_with_tip(Some((block.header.block_hash, block.header.height)))
+            .persist_state_changes_with_tip_and_index(
+                Some((block.header.block_hash, block.header.height)),
+                &index,
+            )
             .await
         {
             // HIGH-1: a durable-write failure must NOT leave in-memory state
@@ -1564,7 +1827,7 @@ impl Executor {
                 "persist after apply_block: {e}"
             )));
         }
-        Ok(got)
+        Ok((got, receipts))
     }
 
     /// VALIDATOR-S1 §R': the shared handle to the FINALIZED epoch reward policy.
@@ -1732,6 +1995,13 @@ impl Executor {
         basic_credits: &[(Address, U256)],
     ) -> Result<(), ExecutionError> {
         use crate::block_rewards as br;
+
+        // The world state now becomes the post-state of the block at `height`:
+        // its root (taken after settlement by the producer, block import and
+        // trusted replay alike) follows that height's storage-root rule. A
+        // rejected block restores the pre-block snapshot, which restores the
+        // previous height with it.
+        self.state_db.set_root_height(height);
 
         // (1) basic block reward — identical to the pre-§R' credit loop.
         for (addr, amount) in basic_credits {
@@ -2294,6 +2564,15 @@ impl Executor {
         if let Some(to) = receipt.to {
             writes.record_write(to);
         }
+        // From the activation height precompile storage and the model / job
+        // registries are journaled under their own slot addresses; carry
+        // those into the version bump the serial fallback commits with.
+        if Self::tx_writes_journaled(context) {
+            let j = context.journal.lock();
+            for addr in j.write_set().iter() {
+                writes.record_write(*addr);
+            }
+        }
 
         Ok((receipt, writes))
     }
@@ -2309,6 +2588,11 @@ impl Executor {
         for ((addr, key), value) in journal.iter_storage_writes() {
             self.state_db.set_storage(*addr, key.clone(), value.clone());
         }
+        // Disjoint from the writes above (the later of a write and a delete to
+        // one slot wins inside the journal), so the order is immaterial.
+        for (addr, key) in journal.iter_storage_deletes() {
+            self.state_db.delete_storage(*addr, key);
+        }
         for (addr, pending) in journal.iter_writes() {
             if let Some(new_balance) = pending.new_balance {
                 self.state_db.accounts.set_balance(*addr, new_balance);
@@ -2320,6 +2604,12 @@ impl Executor {
                 self.state_db.accounts.create_account_if_not_exists(*addr);
                 self.set_code(addr, code.clone());
             }
+        }
+        for (id, model) in journal.iter_models() {
+            self.state_db.apply_journaled_model(*id, model.clone());
+        }
+        for (id, job) in journal.iter_jobs() {
+            self.state_db.apply_journaled_job(*id, job.clone());
         }
     }
 
@@ -2706,6 +2996,199 @@ impl Executor {
 
         debug!("Transfer: {} -> {} : {}", from, to, value);
         Ok(())
+    }
+
+    // ─────────────── in-tx state access (journal routing) ───────────────
+    //
+    // From `supply_hardening_height` every state write a transaction makes
+    // goes into its journal: governance-precompile storage, the model
+    // registry and its artifact / proof index, training jobs and the rewards
+    // they pay. The journal is drained over `state_db` only when the tx
+    // commits; a revert discards it (keeping gas burn + nonce) and a lost
+    // MVCC check drops it, so neither leaves anything behind. Reads are
+    // journal-first so a tx sees its own writes, and are recorded in the read
+    // set so a concurrent commit to the same entry forces a retry.
+    //
+    // Below the height each helper is exactly the legacy direct call, so
+    // historical blocks replay to the roots they were produced with.
+
+    /// Whether this tx's writes go through its journal.
+    fn tx_writes_journaled(context: &ExecutionContext) -> bool {
+        crate::supply_hardening::supply_hardening_active(context.block_number)
+    }
+
+    /// The MVCC slot address standing for one model-registry or training-job
+    /// entry (those stores are not keyed by account). Derived by hashing, so it
+    /// cannot coincide with a real account in practice; it never holds state.
+    fn registry_slot(tag: &[u8], id: &Hash) -> Address {
+        use sha3::{Digest, Keccak256};
+        let mut h = Keccak256::new();
+        h.update(b"citrate.exec.registry-slot:");
+        h.update(tag);
+        h.update(id.as_bytes());
+        let d: [u8; 32] = h.finalize().into();
+        let mut a = [0u8; 20];
+        a.copy_from_slice(&d[12..]);
+        Address(a)
+    }
+
+    fn tx_get_storage(
+        &self,
+        context: &ExecutionContext,
+        addr: &Address,
+        key: &[u8],
+    ) -> Option<Vec<u8>> {
+        if Self::tx_writes_journaled(context) {
+            let mut j = context.journal.lock();
+            j.record_read(*addr);
+            if let Some(entry) = j.storage_entry(addr, key) {
+                return entry.map(|v| v.to_vec());
+            }
+        }
+        self.state_db.get_storage(addr, key)
+    }
+
+    fn tx_set_storage(
+        &self,
+        context: &ExecutionContext,
+        addr: Address,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) {
+        if Self::tx_writes_journaled(context) {
+            context
+                .journal
+                .lock()
+                .record_storage_write(addr, key, value);
+        } else {
+            // LEGACY-PRE-SUPPLY-HARDENING
+            self.state_db.set_storage(addr, key, value);
+        }
+    }
+
+    fn tx_delete_storage(&self, context: &ExecutionContext, addr: Address, key: &[u8]) {
+        if Self::tx_writes_journaled(context) {
+            context
+                .journal
+                .lock()
+                .record_storage_delete(addr, key.to_vec());
+        } else {
+            // LEGACY-PRE-SUPPLY-HARDENING
+            self.state_db.delete_storage(addr, key);
+        }
+    }
+
+    fn tx_get_model(&self, context: &ExecutionContext, id: &ModelId) -> Option<ModelState> {
+        if Self::tx_writes_journaled(context) {
+            let mut j = context.journal.lock();
+            j.record_read(Self::registry_slot(b"model", &id.0));
+            if let Some(m) = j.pending_model(id) {
+                return Some(m.clone());
+            }
+        }
+        self.state_db.get_model(id)
+    }
+
+    /// Register a new model. Same error as `StateDB::register_model` when the
+    /// id is already taken, judged on this tx's journal-first view.
+    fn tx_register_model(
+        &self,
+        context: &ExecutionContext,
+        id: ModelId,
+        model: ModelState,
+    ) -> Result<(), ExecutionError> {
+        if Self::tx_writes_journaled(context) {
+            if self.tx_get_model(context, &id).is_some() {
+                return Err(ExecutionError::Reverted("Model already exists".to_string()));
+            }
+            let mut j = context.journal.lock();
+            j.mark_written(Self::registry_slot(b"model", &id.0));
+            j.record_model(id, model);
+            Ok(())
+        } else {
+            // LEGACY-PRE-SUPPLY-HARDENING
+            self.state_db.register_model(id, model)
+        }
+    }
+
+    /// Replace an existing model. Same error as `StateDB::update_model` when
+    /// the id is unknown, judged on this tx's journal-first view.
+    fn tx_update_model(
+        &self,
+        context: &ExecutionContext,
+        id: ModelId,
+        model: ModelState,
+    ) -> Result<(), ExecutionError> {
+        if Self::tx_writes_journaled(context) {
+            if self.tx_get_model(context, &id).is_none() {
+                return Err(ExecutionError::ModelNotFound(id));
+            }
+            let mut j = context.journal.lock();
+            j.mark_written(Self::registry_slot(b"model", &id.0));
+            j.record_model(id, model);
+            Ok(())
+        } else {
+            // LEGACY-PRE-SUPPLY-HARDENING
+            self.state_db.update_model(id, model)
+        }
+    }
+
+    fn tx_get_job(
+        &self,
+        context: &ExecutionContext,
+        id: &JobId,
+    ) -> Option<crate::types::TrainingJob> {
+        if Self::tx_writes_journaled(context) {
+            let mut j = context.journal.lock();
+            j.record_read(Self::registry_slot(b"job", &id.0));
+            if let Some(job) = j.pending_job(id) {
+                return Some(job.clone());
+            }
+        }
+        self.state_db.get_training_job(id)
+    }
+
+    /// Replace an existing training job (same error as
+    /// `StateDB::update_training_job` when it is unknown).
+    fn tx_update_job(
+        &self,
+        context: &ExecutionContext,
+        id: JobId,
+        job: crate::types::TrainingJob,
+    ) -> Result<(), ExecutionError> {
+        if Self::tx_writes_journaled(context) {
+            if self.tx_get_job(context, &id).is_none() {
+                return Err(ExecutionError::Reverted("Job not found".to_string()));
+            }
+            let mut j = context.journal.lock();
+            j.mark_written(Self::registry_slot(b"job", &id.0));
+            j.record_job(id, job);
+            Ok(())
+        } else {
+            // LEGACY-PRE-SUPPLY-HARDENING
+            self.state_db.update_training_job(id, job)
+        }
+    }
+
+    /// An account balance as this tx sees it.
+    fn tx_get_balance(&self, context: &ExecutionContext, addr: &Address) -> U256 {
+        if Self::tx_writes_journaled(context) {
+            let mut j = context.journal.lock();
+            j.record_read(*addr);
+            if let Some(b) = j.pending_balance(addr) {
+                return b;
+            }
+        }
+        self.state_db.accounts.get_balance(addr)
+    }
+
+    fn tx_set_balance(&self, context: &ExecutionContext, addr: Address, balance: U256) {
+        if Self::tx_writes_journaled(context) {
+            context.journal.lock().record_balance(addr, balance);
+        } else {
+            // LEGACY-PRE-SUPPLY-HARDENING
+            self.state_db.accounts.set_balance(addr, balance);
+        }
     }
 
     /// Journal-routed value transfer for REVM-adjacent paths (precompile
@@ -3107,8 +3590,7 @@ impl Executor {
         // chain.
         let admin_key = b"ADMIN".to_vec();
         let current_admin: Option<Address> = self
-            .state_db
-            .get_storage(&gov_addr, &admin_key)
+            .tx_get_storage(context, &gov_addr, &admin_key)
             .and_then(|v| v.first_chunk::<20>().map(|a| Address(*a)));
 
         if selector == sel_set_admin {
@@ -3130,8 +3612,7 @@ impl Executor {
             }
             let mut addr = [0u8; 20];
             addr.copy_from_slice(args.get(12..32).ok_or(ExecutionError::InvalidInput)?);
-            self.state_db
-                .set_storage(gov_addr, admin_key, addr.to_vec());
+            self.tx_set_storage(context, gov_addr, admin_key, addr.to_vec());
             return Ok(());
         }
 
@@ -3195,7 +3676,7 @@ impl Executor {
             pending_key.extend_from_slice(key);
             let mut stored = eta.to_le_bytes().to_vec();
             stored.extend_from_slice(value);
-            self.state_db.set_storage(gov_addr, pending_key, stored);
+            self.tx_set_storage(context, gov_addr, pending_key, stored);
             return Ok(());
         }
 
@@ -3209,7 +3690,7 @@ impl Executor {
             let key = args.get(0..32).ok_or(ExecutionError::InvalidInput)?;
             let mut pending_key = b"PENDING:".to_vec();
             pending_key.extend_from_slice(key);
-            if let Some(stored) = self.state_db.get_storage(&gov_addr, &pending_key) {
+            if let Some(stored) = self.tx_get_storage(context, &gov_addr, &pending_key) {
                 if stored.len() < 8 {
                     return Err(ExecutionError::InvalidInput);
                 }
@@ -3222,9 +3703,8 @@ impl Executor {
                 let value = stored.get(8..).ok_or(ExecutionError::InvalidInput)?;
                 let mut param_key = b"PARAM:".to_vec();
                 param_key.extend_from_slice(key);
-                self.state_db
-                    .set_storage(gov_addr, param_key, value.to_vec());
-                self.state_db.delete_storage(gov_addr, &pending_key);
+                self.tx_set_storage(context, gov_addr, param_key, value.to_vec());
+                self.tx_delete_storage(context, gov_addr, &pending_key);
                 return Ok(());
             } else {
                 return Err(ExecutionError::Reverted("No such pending param".into()));
@@ -3238,7 +3718,7 @@ impl Executor {
             let key = args.get(0..32).ok_or(ExecutionError::InvalidInput)?;
             let mut param_key = b"PARAM:".to_vec();
             param_key.extend_from_slice(key);
-            if let Some(value) = self.state_db.get_storage(&gov_addr, &param_key) {
+            if let Some(value) = self.tx_get_storage(context, &gov_addr, &param_key) {
                 context.output = value;
             } else {
                 context.output = Vec::new();
@@ -3524,6 +4004,31 @@ impl Executor {
         k
     }
 
+    /// Append `cid` to a model's artifact list inside a transaction.
+    fn tx_add_model_artifact(&self, context: &ExecutionContext, model_hash: &Hash, cid: &str) {
+        self.tx_append_index(context, Self::artifact_index_key(model_hash), cid);
+    }
+
+    /// Append `cid` to the JSON list at `key` under the artifact precompile
+    /// address (no-op when already present). Same bytes as the legacy
+    /// `add_model_artifact` / `add_model_proof_artifact`.
+    fn tx_append_index(&self, context: &ExecutionContext, key: Vec<u8>, cid: &str) {
+        let addr = Self::artifact_precompile_address();
+        let mut list: Vec<String> = if let Some(bytes) = self.tx_get_storage(context, &addr, &key) {
+            serde_json::from_slice(&bytes).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if !list.iter().any(|c| c == cid) {
+            list.push(cid.to_string());
+        }
+        if let Ok(bytes) = serde_json::to_vec(&list) {
+            self.tx_set_storage(context, addr, key, bytes);
+        }
+    }
+
+    /// Append `cid` to a model's artifact list outside any transaction (API
+    /// path). Never call this from transaction execution.
     pub fn add_model_artifact(&self, model_hash: &Hash, cid: &str) {
         let addr = Self::artifact_precompile_address();
         let key = Self::artifact_index_key(model_hash);
@@ -3556,20 +4061,13 @@ impl Executor {
         k
     }
 
-    fn add_model_proof_artifact(&self, model_hash: &Hash, cid: &str) {
-        let addr = Self::artifact_precompile_address();
-        let key = Self::proof_index_key(model_hash);
-        let mut list: Vec<String> = if let Some(bytes) = self.state_db.get_storage(&addr, &key) {
-            serde_json::from_slice(&bytes).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        if !list.iter().any(|c| c == cid) {
-            list.push(cid.to_string());
-        }
-        if let Ok(bytes) = serde_json::to_vec(&list) {
-            self.state_db.set_storage(addr, key, bytes);
-        }
+    fn tx_add_model_proof_artifact(
+        &self,
+        context: &ExecutionContext,
+        model_hash: &Hash,
+        cid: &str,
+    ) {
+        self.tx_append_index(context, Self::proof_index_key(model_hash), cid);
     }
 
     pub fn list_model_proofs(&self, model_hash: &Hash) -> Vec<String> {
@@ -3700,16 +4198,15 @@ impl Executor {
         };
         let persisted_state = model_state.clone();
 
-        self.state_db.register_model(model_id, model_state)?;
+        self.tx_register_model(context, model_id, model_state)?;
 
         if let Some(cid) = artifact_cid.clone() {
             let art_addr = Self::artifact_precompile_address();
             let mut key = b"MODEL_CID:".to_vec();
             key.extend_from_slice(model_hash.as_bytes());
-            self.state_db
-                .set_storage(art_addr, key, cid.clone().into_bytes());
+            self.tx_set_storage(context, art_addr, key, cid.clone().into_bytes());
 
-            self.add_model_artifact(&model_hash, &cid);
+            self.tx_add_model_artifact(context, &model_hash, &cid);
             // Note: artifact pinning is handled by the IPFS add call (add?pin=true)
             // or by the caller. We skip explicit pin here to avoid deadlocking
             // when execute_register_model is called via futures::executor::block_on
@@ -3780,8 +4277,7 @@ impl Executor {
         context.use_gas(self.gas_schedule.model_update)?;
 
         let mut model = self
-            .state_db
-            .get_model(&model_id)
+            .tx_get_model(context, &model_id)
             .ok_or(ExecutionError::ModelNotFound(model_id))?;
 
         // Check ownership
@@ -3797,10 +4293,10 @@ impl Executor {
             .ok_or(ExecutionError::Overflow("model version"))?;
         let updated_model = model.clone();
 
-        self.state_db.update_model(model_id, model)?;
+        self.tx_update_model(context, model_id, model)?;
 
         if let Some(cid) = artifact_cid.clone() {
-            self.add_model_artifact(&updated_model.model_hash, &cid);
+            self.tx_add_model_artifact(context, &updated_model.model_hash, &cid);
             if let Some(art) = &self.artifact_service {
                 let replicas = self.default_artifact_replicas();
                 if let Err(err) = art.pin(&cid, replicas).await {
@@ -3845,6 +4341,30 @@ impl Executor {
     }
 
     /// Execute inference request
+    /// Move a model-access or provider fee inside a transaction.
+    ///
+    /// At/after `supply_hardening_height` the fee moves through the per-tx
+    /// journal ([`Self::journal_transfer`]), like every other value movement:
+    /// the payer debit and the credit commit together when the transaction
+    /// succeeds and are discarded together when it reverts. Below the height
+    /// the legacy direct state write is kept so historical blocks replay to
+    /// the roots they were produced with.
+    fn model_fee_transfer(
+        &self,
+        from: Address,
+        to: Address,
+        value: U256,
+        context: &mut ExecutionContext,
+    ) -> Result<(), ExecutionError> {
+        if crate::supply_hardening::supply_hardening_active(context.block_number) {
+            self.journal_transfer(from, to, value, context)
+        } else {
+            // LEGACY-PRE-SUPPLY-HARDENING
+            self.state_db.accounts.transfer(&from, &to, value)?;
+            Ok(())
+        }
+    }
+
     async fn execute_inference(
         &self,
         from: Address,
@@ -3882,8 +4402,7 @@ impl Executor {
         }
 
         let mut model = self
-            .state_db
-            .get_model(&model_id)
+            .tx_get_model(context, &model_id)
             .ok_or(ExecutionError::ModelNotFound(model_id))?;
 
         // Check access policy
@@ -3899,14 +4418,10 @@ impl Executor {
                     .ok_or(ExecutionError::Overflow("treasury cut"))?;
                 // treasury_cut <= fee, so this cannot saturate.
                 let owner_cut = fee.saturating_sub(treasury_cut);
-                // Perform transfers
-                self.state_db
-                    .accounts
-                    .transfer(&from, &model.owner, owner_cut)?;
+                let owner = model.owner;
+                self.model_fee_transfer(from, owner, owner_cut, context)?;
                 if treasury_cut > U256::zero() {
-                    self.state_db
-                        .accounts
-                        .transfer(&from, &treasury_address, treasury_cut)?;
+                    self.model_fee_transfer(from, treasury_address, treasury_cut, context)?;
                 }
                 // Lifetime accumulator (CHAIN-B-B010 convention): saturate, never panic.
                 model.usage_stats.total_fees_earned =
@@ -3927,16 +4442,14 @@ impl Executor {
             }
             // Pay provider
             if provider_fee > U256::zero() {
-                self.state_db
-                    .accounts
-                    .transfer(&from, &provider_addr, provider_fee)?;
+                self.model_fee_transfer(from, provider_addr, provider_fee, context)?;
             }
             // Store proof artifact if provided
             if let Some(proof_bytes) = proof_bytes_opt {
                 if let Some(art) = &self.artifact_service {
                     // Add to first provider, then pin across others via pin()
                     if let Ok(cid) = art.add(&proof_bytes).await {
-                        self.add_model_proof_artifact(&model_id.0, &cid);
+                        self.tx_add_model_proof_artifact(context, &model_id.0, &cid);
                         let _ = art.pin(&cid, self.default_artifact_replicas()).await;
                     }
                 }
@@ -3956,7 +4469,7 @@ impl Executor {
             .total_gas_used
             .saturating_add(context.gas_used);
         model.usage_stats.last_used = context.timestamp;
-        self.state_db.update_model(model_id, model)?;
+        self.tx_update_model(context, model_id, model)?;
 
         info!("Inference executed: model={:?}, from={}", model_id, from);
         Ok(())
@@ -3974,8 +4487,7 @@ impl Executor {
         context.use_gas(self.gas_schedule.training_submit)?;
 
         let mut job = self
-            .state_db
-            .get_training_job(&job_id)
+            .tx_get_job(context, &job_id)
             .ok_or(ExecutionError::Reverted("Job not found".to_string()))?;
 
         // Check job status
@@ -4010,25 +4522,27 @@ impl Executor {
                 .participants
                 .iter()
                 .map(|participant| {
-                    self.state_db
-                        .accounts
-                        .get_balance(participant)
+                    self.tx_get_balance(context, participant)
                         .checked_add(reward_per_participant)
                         .map(|balance| (*participant, balance))
                         .ok_or(ExecutionError::Overflow("participant reward"))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             for (participant, balance) in credits {
-                self.state_db.accounts.set_balance(participant, balance);
+                self.tx_set_balance(context, participant, balance);
             }
         }
 
-        self.state_db.update_training_job(job_id, job)?;
+        self.tx_update_job(context, job_id, job)?;
 
         info!("Gradient submitted: job={:?}, from={}", job_id, from);
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "executor_journal_routing_tests.rs"]
+mod journal_routing_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4231,7 +4745,7 @@ mod tests {
         let blk = block_with(vec![tx], expected);
 
         let got = exec
-            .apply_block(&blk, CB, &[(cb_addr, reward)])
+            .apply_block(&blk, CB, &fixed_reward(&[(cb_addr, reward)]))
             .await
             .expect("valid block must apply");
         assert_eq!(
@@ -4265,7 +4779,7 @@ mod tests {
         let blk = block_with(vec![tx], Hash::new([0xFF; 32]));
 
         let err = exec
-            .apply_block(&blk, CB, &[(cb_addr, U256::from(500u64))])
+            .apply_block(&blk, CB, &fixed_reward(&[(cb_addr, U256::from(500u64))]))
             .await
             .expect_err("bad state_root must be rejected");
         assert!(

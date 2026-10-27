@@ -78,6 +78,7 @@ fn internal_error(message: String) -> jsonrpc_core::Error {
 /// Hash of the block stored at height 0, or `None` when the store has no
 /// genesis yet. Source: `BlockStore::get_block_by_height(0)`.
 fn genesis_hash(storage: &StorageManager) -> Result<Option<String>, jsonrpc_core::Error> {
+    // height-index: genesis (height 0) only, never a finality tag.
     storage
         .blocks
         .get_block_by_height(0)

@@ -2,7 +2,7 @@
 # Citrate Release Build Script
 # Builds release binaries for multiple platforms
 
-set -e
+set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
@@ -158,7 +158,8 @@ check_toolchain() {
     local linker=${LINKERS[$target]}
 
     # Check if target is installed
-    if ! rustup target list --installed | grep -q "$target"; then
+    # grep without -q reads to EOF, so rustup never sees SIGPIPE under pipefail.
+    if ! rustup target list --installed | grep -- "$target" >/dev/null; then
         log_warn "Rust target $target not installed. Installing..."
         rustup target add "$target" 2>/dev/null || {
             log_error "Failed to install target $target"

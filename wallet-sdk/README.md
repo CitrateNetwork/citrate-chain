@@ -17,8 +17,23 @@ sharing across async tasks.
 
 ## Features
 
-- Default (no features) -- Native Rust library
-- `wasm` -- Enables `wasm-bindgen`, `js-sys`, `serde-wasm-bindgen`, `web-sys`, and `getrandom/js`
+- `native` (default) -- the `wallet` module: `Wallet`, the on-disk keystore and
+  the RPC client. Pulls `citrate-wallet-core` with its `native` feature and
+  tokio, so it does not build for wasm32.
+- `wasm` -- the `wasm` module (Argon2id KDF, constant-time secp256k1) via
+  `wasm-bindgen`, `js-sys`, `serde-wasm-bindgen` and `web-sys`. On
+  wasm32-unknown-unknown, `getrandom/js` is always on.
+
+Build the browser bundle with `native` off:
+
+```bash
+wasm-pack build wallet-sdk --target no-modules --release --no-opt \
+  -- --no-default-features --features wasm
+```
+
+`scripts/ci/wallet_sdk_wasm_gate.sh` runs this at the pinned wasm-pack and
+wasm-bindgen versions (local-ci and the `wallet-sdk-wasm` CI job), and fails if
+a native-only crate enters the wasm build.
 
 ## Usage
 

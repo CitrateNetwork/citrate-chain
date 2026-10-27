@@ -2,7 +2,8 @@
 // deterministic per-account digest + the reloaded state root. Run against two nodes' data dirs and
 // diff to name the account/slot whose persisted representation diverges. Read-only.
 //
-// Usage: state-digest /path/to/.citrate
+// Usage: state-digest /path/to/.citrate [chain-id]   (chain id defaults to 40204; the
+// storage-root hardening height resolves as the node resolves it for that chain)
 
 // PANIC-S1 G2: production code in this crate may not panic (tests excepted).
 #![cfg_attr(
@@ -27,8 +28,31 @@ fn main() -> anyhow::Result<()> {
     let dir = std::env::args()
         .nth(1)
         .ok_or_else(|| anyhow::anyhow!("usage: state-digest <data-dir>"))?;
+    let chain_id: u64 = match std::env::args().nth(2) {
+        Some(raw) => raw
+            .parse()
+            .map_err(|e| anyhow::anyhow!("chain id {raw}: {e}"))?,
+        None => 40204,
+    };
     let storage = StorageManager::new(&dir, PruningConfig::default())?;
+    // The storage-root rule is keyed by this data directory's block 0.
+    let genesis: Option<[u8; 32]> = storage
+        .blocks
+        .get_block_by_height(0)
+        .ok()
+        .flatten()
+        .map(|h| *h.as_bytes());
+    citrate_execution::storage_root_hardening::init_for_genesis(chain_id, genesis.as_ref(), None)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let state_db = StateDB::new();
+    let tip_height = match storage.blocks.get_applied_tip()? {
+        Some((_, h)) => h,
+        None => storage.blocks.get_latest_height().unwrap_or(0),
+    };
+    state_db.set_root_height(tip_height);
+    let full_hydration = citrate_execution::storage_root_hardening::storage_root_hardening_active(
+        tip_height.saturating_add(1),
+    );
 
     // Mirror node/src/main.rs:1020-1046 exactly.
     let accts = storage.state.get_all_accounts()?;
@@ -36,7 +60,12 @@ fn main() -> anyhow::Result<()> {
     for (address, account) in accts {
         state_db.accounts.load_account(address, account);
     }
-    let slots = storage.state.get_all_storage()?;
+    let records = storage.state.get_all_storage()?;
+    let slots = if full_hydration {
+        records
+    } else {
+        citrate_storage::state::legacy_hydration_view(records)
+    };
     let n_slots = slots.len();
     // Count slots per address (incl. zero-valued rows) for the digest.
     let mut slot_count: BTreeMap<[u8; 20], usize> = BTreeMap::new();

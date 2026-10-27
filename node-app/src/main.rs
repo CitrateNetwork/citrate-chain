@@ -167,6 +167,29 @@ async fn main() -> Result<()> {
             agent_fork_source
         ),
     }
+    // The rules are keyed by the chain's block 0 (citrate_consensus::hardening::
+    // genesis_rule_pin), read from this data directory like the node does.
+    let genesis: Option<[u8; 32]> = storage
+        .blocks
+        .get_block_by_height(0)
+        .ok()
+        .flatten()
+        .map(|h| *h.as_bytes());
+    // Supply hardening fork height, same resolver as the node, so eth_call
+    // applies the same fee accounting as block execution.
+    let (supply_height, supply_source) =
+        citrate_execution::supply_hardening::init_for_genesis(chain_id, genesis.as_ref(), None)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+    match supply_height {
+        Some(h) => info!(
+            "Supply hardening fork active from height {} (source: {})",
+            h, supply_source
+        ),
+        None => info!(
+            "Supply hardening fork not scheduled (source: {})",
+            supply_source
+        ),
+    }
     let state_db = Arc::new(StateDB::new());
     let executor = Arc::new(Executor::with_chain_id_and_inference_mode(
         state_db,
@@ -263,6 +286,14 @@ mod tests {
             !body.contains("set_agent_precompiles_height("),
             "one publication path"
         );
+        let supply = body
+            .find("citrate_execution::supply_hardening::init_for_genesis(chain_id, genesis.as_ref(), None)")
+            .unwrap_or(usize::MAX);
+        assert!(
+            supply < exec,
+            "supply hardening height published before the executor"
+        );
+        assert!(!body.contains("set_supply_hardening_height("));
     }
 
     #[test]

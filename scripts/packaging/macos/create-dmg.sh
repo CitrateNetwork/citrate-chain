@@ -42,7 +42,7 @@ esac
 
 DMG_NAME="Citrate-${VERSION}-${ARCH_LABEL}.dmg"
 STAGING_DIR="$(mktemp -d)"
-trap 'rm -rf "$STAGING_DIR"' EXIT
+trap 'rm -rf "${STAGING_DIR:?}"' EXIT
 
 echo "=== Citrate macOS DMG Packager ==="
 echo "  Version:  $VERSION"

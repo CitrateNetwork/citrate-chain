@@ -1,0 +1,17 @@
+{
+  "schema": "r1006-inventory/1",
+  "note": "The 7 r1006 producers (Citrate Inc. DigitalOcean, tag citrate-producer, firewall citrate-producer-fw: SSH from the allowlist + DGX, 30303 tcp/udp open). Start order is the list order.",
+  "transport": "ssh",
+  "ssh_user": "root",
+  "ssh_key": "~/.ssh/citrate-do",
+  "build_host": {"name": "citrate-core-linux-build", "ip": "167.99.155.183", "arch": "x86_64-unknown-linux-gnu"},
+  "hosts": [
+    {"name": "citrate-prod-1", "region": "sgp1", "ip": "206.189.35.49"},
+    {"name": "citrate-prod-2", "region": "nyc3", "ip": "174.138.78.16"},
+    {"name": "citrate-prod-3", "region": "tor1", "ip": "137.184.174.123"},
+    {"name": "citrate-prod-4", "region": "sfo2", "ip": "134.209.61.197"},
+    {"name": "citrate-prod-5", "region": "lon1", "ip": "68.183.40.230"},
+    {"name": "citrate-prod-6", "region": "ams3", "ip": "159.223.14.97"},
+    {"name": "citrate-prod-7", "region": "fra1", "ip": "207.154.238.90"}
+  ]
+}

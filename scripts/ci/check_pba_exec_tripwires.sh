@@ -12,7 +12,8 @@
 #   T3  PBA-L1a-017  node/src/main.rs keeps the periodic Mempool::clear_expired.
 #   T4  PBA-L1a-024  the metrics server never defaults to 0.0.0.0.
 #   T5  PBA-R2       node/src/main.rs publishes the activation height from
-#                    citrate_consensus::hardening::init_pba_hardening_for_chain
+#                    citrate_consensus::hardening::init_pba_hardening_for_chain (or _for_genesis,
+#                    which uses the chain pin unless the loaded genesis has its own)
 #                    (config + env override), never from the raw config field.
 #
 # Usage: check_pba_exec_tripwires.sh            # scan the tree
@@ -67,7 +68,7 @@ metrics_wildcard() { # <node main.rs>
 }
 
 activation_resolved() { # <node main.rs>
-  grep -qE 'init_pba_hardening_(height|for_chain)\(' "$1" 2>/dev/null \
+  grep -qE 'init_pba_hardening_(height|for_chain|for_genesis)\(' "$1" 2>/dev/null \
     && ! grep -qE 'set_pba_hardening_height\([[:space:]]*config\.chain\.pba_hardening_height' "$1" 2>/dev/null
 }
 
@@ -96,7 +97,7 @@ run_scan() { # <root>
 
 self_test() {
   local tmp; tmp=$(mktemp -d)
-  trap 'rm -rf "$tmp"' RETURN
+  trap 'rm -rf "${tmp:?}"' RETURN
   mkdir -p "$tmp/scripts" "$tmp/node/src" "$tmp/node/config" "$tmp/.github" "$tmp/docker" "$tmp/config" "$tmp/homebrew"
   # A clean tree must pass...
   printf '[features]\ndefault = ["commd-fold-verify"]\n' > "$tmp/node/Cargo.toml"

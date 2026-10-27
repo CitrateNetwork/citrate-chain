@@ -14,6 +14,9 @@
 //! shapes, and that the legacy methods still document the caller
 //! contract via their docstrings.
 
+// Uses the native `Wallet`, which is behind the default `native` feature.
+#![cfg(feature = "native")]
+
 use citrate_wallet_sdk::Wallet;
 use zeroize::Zeroizing;
 

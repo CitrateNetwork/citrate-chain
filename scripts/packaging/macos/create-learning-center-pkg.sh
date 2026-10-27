@@ -48,7 +48,7 @@ if [[ ! -x "$BINARY" ]]; then
 fi
 
 STAGING_DIR="$(mktemp -d /tmp/citrate-learning-center-pkg.XXXXXX)"
-trap 'rm -rf "$STAGING_DIR"' EXIT
+trap 'rm -rf "${STAGING_DIR:?}"' EXIT
 DOC_DIR="$STAGING_DIR/usr/local/share/doc/citrate-learning-center"
 AI_INSTALL_DIR="usr/local/share/citrate-learning-center/ai/bundles"
 RESOLVED_AI_BUNDLE_DIR=""
