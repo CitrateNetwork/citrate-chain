@@ -1,4 +1,28 @@
 // citrate/core/sequencer/src/mempool.rs
+//
+// LOCK ORDER (every `Mempool` method must follow it):
+//
+//   LOCK-ORDER: transactions, by_sender, priority_queue, sender_nonces, total_size, evicted, banned
+//
+// 1. A method that holds a guard on one of these locks while acquiring another
+//    must acquire them in the order above. Skipping entries is fine; going
+//    back is not. All of them are `tokio::sync::RwLock`, which is fair: a
+//    queued writer blocks new readers. Two tasks that take two locks in
+//    opposite orders therefore wedge each other as soon as writers queue on
+//    both locks, even if both tasks only read.
+// 2. Never call another `Mempool` method, a state reader (`state_nonce`,
+//    `state_balance`, the tip reader) or anything else that awaits while
+//    holding a guard. Take a snapshot, drop the guard, then call.
+// 3. A write guard is the last lock taken and is dropped before the next
+//    acquisition (write a short statement, or drop it explicitly).
+//
+// The GUI's outer `Arc<RwLock<Mempool>>` (see `MempoolAccess`) always comes
+// before all of these: it is taken first and released last.
+//
+// `scripts/ci/mempool_lock_order_tripwire.sh` reads the LOCK-ORDER line above
+// and checks every method in this file against it. Add a new lock to that line
+// before using it. The liveness tests in `tests/mempool_lock_order_liveness.rs`
+// drive every path concurrently under a deadline.
 
 use citrate_consensus::{Hash, PublicKey, Transaction};
 use priority_queue::PriorityQueue;
@@ -681,18 +705,16 @@ impl Mempool {
             let balance = read_balance(&sender);
             let incoming_cost = Self::tx_max_cost(&tx);
             let pooled_cost: u128 = {
+                let txs = self.transactions.read().await;
                 let by_sender = self.by_sender.read().await;
                 match by_sender.get(&sender) {
-                    Some(hashes) => {
-                        let txs = self.transactions.read().await;
-                        hashes.iter().fold(0u128, |acc, h| {
-                            acc.saturating_add(
-                                txs.get(h)
-                                    .map(|mtx| Self::tx_max_cost(&mtx.tx))
-                                    .unwrap_or(0),
-                            )
-                        })
-                    }
+                    Some(hashes) => hashes.iter().fold(0u128, |acc, h| {
+                        acc.saturating_add(
+                            txs.get(h)
+                                .map(|mtx| Self::tx_max_cost(&mtx.tx))
+                                .unwrap_or(0),
+                        )
+                    }),
                     None => 0,
                 }
             };
@@ -1093,8 +1115,8 @@ impl Mempool {
     /// `by_sender`/`transactions`, correcting any drift (which
     /// should only happen if someone bypassed `remove_transaction`).
     pub async fn reconcile_nonces(&self) {
-        let by_sender = self.by_sender.read().await;
         let txs = self.transactions.read().await;
+        let by_sender = self.by_sender.read().await;
         let mut sender_nonces = self.sender_nonces.write().await;
 
         let mut rebuilt: HashMap<PublicKey, BTreeSet<u64>> = HashMap::new();
@@ -1265,45 +1287,36 @@ impl Mempool {
         selected
     }
 
-    /// Check if transaction has the next expected nonce for sender
-    #[allow(dead_code)]
+    /// Check if transaction has the next expected nonce for sender. Test-only:
+    /// selection computes this inline from one snapshot.
+    #[cfg(test)]
     async fn is_next_nonce(&self, tx: &Transaction, included: &HashSet<Hash>) -> bool {
+        let txs = self.transactions.read().await;
         let by_sender = self.by_sender.read().await;
 
-        if let Some(sender_txs) = by_sender.get(&tx.from) {
-            // Find the highest nonce already included
-            let mut highest_included_nonce = None;
+        let Some(sender_txs) = by_sender.get(&tx.from) else {
+            return true; // First tx from this sender
+        };
 
-            for tx_hash in sender_txs {
-                if included.contains(tx_hash) {
-                    if let Some(mempool_tx) = self.transactions.read().await.get(tx_hash) {
-                        highest_included_nonce = Some(
-                            highest_included_nonce
-                                .map_or(mempool_tx.tx.nonce, |n: u64| n.max(mempool_tx.tx.nonce)),
-                        );
-                    }
-                }
-            }
+        // Find the highest nonce already included
+        let highest_included_nonce = sender_txs
+            .iter()
+            .filter(|h| included.contains(h))
+            .filter_map(|h| txs.get(h).map(|t| t.tx.nonce))
+            .max();
 
-            // Check if this tx has the next nonce
-            match highest_included_nonce {
-                Some(nonce) => nonce.checked_add(1) == Some(tx.nonce),
-                None => {
-                    // No txs from this sender included yet, allow contiguous sequence starting at the minimal nonce
-                    let txs_guard = self.transactions.read().await;
-                    let nonces: Vec<u64> = sender_txs
-                        .iter()
-                        .filter_map(|h| txs_guard.get(h).map(|t| t.tx.nonce))
-                        .collect();
-                    if nonces.is_empty() {
-                        return true;
-                    }
-                    // If the minimal nonce is n0, allow n0, n0+1, n0+2,... as we include them in one selection pass
-                    nonces.iter().min().is_none_or(|&min| tx.nonce >= min)
-                }
+        // Check if this tx has the next nonce
+        match highest_included_nonce {
+            Some(nonce) => nonce.checked_add(1) == Some(tx.nonce),
+            None => {
+                // No txs from this sender included yet: allow a contiguous run
+                // from the minimal pending nonce.
+                sender_txs
+                    .iter()
+                    .filter_map(|h| txs.get(h).map(|t| t.tx.nonce))
+                    .min()
+                    .is_none_or(|min| tx.nonce >= min)
             }
-        } else {
-            true // First tx from this sender
         }
     }
 
@@ -1394,11 +1407,13 @@ impl Mempool {
             *n = n.saturating_add(1);
         }
 
+        let unique_senders = self.by_sender.read().await.len();
+        let total_size = *self.total_size.read().await;
         MempoolStats {
             total_transactions: txs.len(),
-            total_size: *self.total_size.read().await,
+            total_size,
             by_class,
-            unique_senders: self.by_sender.read().await.len(),
+            unique_senders,
         }
     }
 

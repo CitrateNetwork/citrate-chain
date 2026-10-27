@@ -43,3 +43,7 @@ jobs:
         run: scripts/ci/privileged_slots_tripwire.sh --self-test
       - name: Privileged slots of DeployAll contracts are swept or exempt with a reason
         run: scripts/ci/privileged_slots_tripwire.sh
+      - name: Mempool lock-order tripwire (self-test, then scan)
+        run: |
+          scripts/ci/mempool_lock_order_tripwire.sh --self-test
+          scripts/ci/mempool_lock_order_tripwire.sh
