@@ -525,6 +525,15 @@ async fn main() -> Result<()> {
             let (exact_height, _) =
                 citrate_execution::exact_code::resolve_for_chain(chain_id, exact_configured)
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
+            // Same resolution as start_node for the canonical VRF encoding
+            // height; the manifest reads it from the process store.
+            citrate_consensus::vrf_encoding::init_for_chain(
+                chain_id,
+                file_cfg
+                    .as_ref()
+                    .and_then(|c| c.chain.vrf_canonical_encoding_height),
+            )
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
             let manifest = consensus_manifest::ConsensusManifest::for_activations(
                 resolved.height,
                 agent_height,
@@ -1508,6 +1517,26 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         None => info!(
             "Exact created-code rule not scheduled (source: {}); created code stored as before",
             exact_code_source
+        ),
+    }
+    // Canonical ECVRF proof encoding height, published before the DAG store
+    // (whose VRF selector captures it) is built. 40204 leaves it unscheduled
+    // in this release; a disagreeing env or config value on a release network
+    // aborts start-up instead of forking this node at the height.
+    let (vrf_encoding_height, vrf_encoding_source) =
+        citrate_consensus::vrf_encoding::init_for_chain(
+            config.chain.chain_id,
+            config.chain.vrf_canonical_encoding_height,
+        )
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    match vrf_encoding_height {
+        Some(h) => info!(
+            "Canonical ECVRF proof encoding required from height {} (source: {})",
+            h, vrf_encoding_source
+        ),
+        None => info!(
+            "Canonical ECVRF proof encoding not scheduled (source: {}); proof decoding unchanged",
+            vrf_encoding_source
         ),
     }
 
