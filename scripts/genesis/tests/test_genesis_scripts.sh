@@ -68,7 +68,13 @@ while [[ $# -gt 0 ]]; do
 done
 d="$FAKE/rpc/$(printf '%s' "$rpc" | tr -c 'A-Za-z0-9' '_')"
 case "${args[0]}" in
-  code) a=$(printf '%s' "${args[1]}" | tr 'A-F' 'a-f'); cat "$FAKE/code/$a" 2>/dev/null || echo 0x ;;
+  code)
+    # FAKE_CODE_ALL=1: a chain where every deployed address has code, except those listed in
+    # FAKE_NO_CODE (space-separated); otherwise $FAKE/code/<addr>, default none (0x).
+    a=$(printf '%s' "${args[1]}" | tr 'A-F' 'a-f')
+    if [[ " $(printf '%s' "${FAKE_NO_CODE:-}" | tr 'A-F' 'a-f') " == *" $a "* ]]; then echo 0x
+    elif [[ -n "${FAKE_CODE_ALL:-}" ]]; then echo 0x6080
+    else cat "$FAKE/code/$a" 2>/dev/null || echo 0x; fi ;;
   keccak) [[ -z "${FAKE_KECCAK_FAIL:-}" ]] || exit 1; printf '0x%s\n' "$(printf '%s' "${args[1]}" | sha256sum | cut -c1-64)" ;;
   storage) a=$(printf '%s' "${args[1]}" | tr 'A-F' 'a-f'); cat "$FAKE/impl/$a" 2>/dev/null || printf '0x%064d\n' 0 ;;
   chain-id) [[ -f "$d/chain-id" ]] || exit 1; cat "$d/chain-id" ;;
@@ -136,7 +142,8 @@ if [[ "$*" == *--broadcast* && -n "${FAKE_FORGE_BCAST:-}" ]]; then
   fd="${FOUNDRY_BROADCAST:-broadcast}/$fs/40204"
   mkdir -p "$fd"
   fn=$(find "$fd" -name 'run-[0-9]*.json' | wc -l)
-  printf '{"timestamp":%s,"transactions":[{"transactionType":"CREATE","contractName":"Fake","contractAddress":"0x%040x"}]}\n' "${FAKE_FORGE_TS:-6000}" "$((fn + 4096))" >"$fd/run-$((${FAKE_FORGE_TS:-6000} + fn)).json"
+  fh=$(printf '0x%064x' "$((fn + 4096))")
+  printf '{"timestamp":%s,"transactions":[{"hash":"%s","transactionType":"CREATE","contractName":"Fake","contractAddress":"0x%040x"}],"receipts":[{"transactionHash":"%s","status":"0x1"}],"pending":[]}\n' "${FAKE_FORGE_TS:-6000}" "$fh" "$((fn + 4096))" "$fh" >"$fd/run-$((${FAKE_FORGE_TS:-6000} + fn)).json"
   cp "$fd/run-$((${FAKE_FORGE_TS:-6000} + fn)).json" "$fd/run-latest.json"
 fi
 if [[ "$*" == *DeployGenesisGovernance* && "$*" == *--broadcast* && -n "${FAKE_P1_BOOK:-}" ]]; then cp "$FAKE_P1_BOOK" "$GENESIS_GOVERNANCE_OUT"; fi
@@ -212,6 +219,47 @@ for v in $(compgen -e); do
 done
 calls() { cat "$FAKE/calls.log" 2>/dev/null; }
 reset_calls() { : >"$FAKE/calls.log"; }
+# mine_runs <path...>: give every broadcast record under the paths that has no "pending" key the
+# shape forge writes for a completed send: each transaction a hash, each hash a receipt with
+# status 0x1, nothing pending. Records that already carry "pending" (a partial shape) are left.
+mine_runs() {
+  python3 - "$@" <<'PY2'
+import glob, json, os, sys
+fs = []
+for p in sys.argv[1:]:
+    fs += [p] if os.path.isfile(p) else glob.glob(os.path.join(p, "**", "*.json"), recursive=True)
+n = 0
+for f in fs:
+    try:
+        r = json.load(open(f))
+    except ValueError:
+        continue
+    if not isinstance(r, dict) or "transactions" not in r or "pending" in r:
+        continue
+    rec = []
+    for tx in r["transactions"]:
+        n += 1
+        tx.setdefault("hash", "0x%064x" % (0xA000 + n + (abs(hash(f)) % 4096) * 64))
+        rec.append({"transactionHash": tx["hash"], "status": "0x1"})
+    r["receipts"], r["pending"] = rec, []
+    json.dump(r, open(f, "w"))
+PY2
+}
+# partial_run <file> <timestamp> <type:name:addr>...: the record forge 1.8.3 writes when a script
+# stops part-way (the RPC dropped after the first transaction was mined): the first transaction
+# has a hash and is still in "pending", every later one was never sent ("hash": null), and there
+# are no receipts.
+partial_run() {
+  local f="$1" ts="$2" tx="" e t n x h=0x00000000000000000000000000000000000000000000000000000000dbcaff38 first=1
+  shift 2
+  for e in "$@"; do
+    IFS=: read -r t n x <<<"$e"
+    if [[ $first == 1 ]]; then tx+="{\"hash\":\"$h\",\"transactionType\":\"$t\",\"contractName\":\"$n\",\"contractAddress\":\"$x\"}"; first=0
+    else tx+=",{\"hash\":null,\"transactionType\":\"$t\",\"contractName\":\"$n\",\"contractAddress\":\"$x\"}"; fi
+  done
+  mkdir -p "$(dirname "$f")"
+  printf '{"timestamp":%s,"transactions":[%s],"receipts":[],"pending":["%s"]}\n' "$ts" "$tx" "$h" >"$f"
+}
 
 addr() { printf '0x%040x' "$1"; }
 lower_t() { printf '%s' "$1" | tr 'A-F' 'a-f'; }
@@ -1430,9 +1478,10 @@ printf '{"timestamp":6000,"transactions":[{"transactionType":"CREATE2","contract
   >"$C9BC/DeployValidatorRegistry.s.sol/40204/run-latest.json"
 printf '{"timestamp":6001,"transactions":[{"transactionType":"CREATE2","contractName":"CitrateMemberSBT","contractAddress":"%s"},{"transactionType":"CREATE2","contractName":"MemberBond","contractAddress":"%s"},{"transactionType":"CREATE2","contractName":"MembershipStakeVault","contractAddress":"%s"},{"transactionType":"CREATE2","contractName":"ERC1967Proxy","contractAddress":"%s"}]}' \
   "$C9SBT" "$C9BOND" "$C9VI" "$C9VP" >"$C9BC/DeployGenesisMembership.s.sol/40204/run-latest.json"
+mine_runs "$C9BC"
 cp "$GBK" "$T/book.c9.orig"
 C9ENV=("${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1
-  FAKE_REGEN_BOOK="$C9B" FAKE_REGEN_BCAST="$C9BC" EMITTER="$T/fake-emit.sh")
+  FAKE_REGEN_BOOK="$C9B" FAKE_REGEN_BCAST="$C9BC" EMITTER="$T/fake-emit.sh" FAKE_CODE_ALL=1)
 # c9_setup: a --confirm run after P1 (manifest, governance on chain, fee recipients = the
 # TREASURY), before P2 has sent anything (no broadcast recorded yet).
 c9_setup() {
@@ -1463,6 +1512,12 @@ for g in "X402Facilitator:$C9X:treasury" "ModelMarketplace:$C9MM:treasuryAddress
   c9_fee "a $gn fee recipient that is the deployer fails P2" 3 "$gn.$gf\\(\\) is the deployer 0x0+1: the fee recipient must be TREASURY" fake_call "$ga" "$gf" "$DEP"
 done
 c9_fee "an unreadable ComputeMarketplace fee recipient fails P2" 3 'cannot read ComputeMarketplace.treasury\(\)' rm -f "$FAKE/call/$C9CM/treasury"
+# P2's stack book: before it is recorded, every address in it must have code on chain.
+c9_setup
+reset_calls
+expect "ceremony P2 code: a stack-book contract with no code on chain is not recorded" 3 "GATE FAIL at P2: .*ValidatorRegistry $C9VR has no code on chain" -- "${C9ENV[@]}" FAKE_NO_CODE="$C9VR" bash "$CE" --confirm --only P2 --account deployer
+python3 -c 'import json,sys; sys.exit(0 if "stackBook" in json.load(open(sys.argv[1])) else 1)' "$GB/ceremony-run.json" && bad "ceremony P2 code: a codeless stack book records nothing" || ok "ceremony P2 code: a codeless stack book records nothing"
+cp "$T/book.c9.orig" "$GBK"
 # #364 on P2 (the password fixture is set up before the regenesis.sh cases above).
 c9_setup
 reset_calls
@@ -2226,6 +2281,7 @@ bc_run() { # script timestamp "type:name:addr"...
   done
   mkdir -p "$d"
   printf '{"timestamp":%s,"transactions":[%s]}\n' "$ts" "$tx" >"$d/run-latest.json"
+  mine_runs "$d/run-latest.json"
 }
 ob_reset() { # [mode]
   rm -f "$GB/team-vesting.json" "$GB/dormant-ledgers.json" "$GB/library.json"
@@ -2241,7 +2297,7 @@ manifest_key() { # key -> its JSON in the run manifest (null if absent)
   python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(json.dumps(m.get(sys.argv[2]), sort_keys=True, separators=(",",":")))' "$GB/ceremony-run.json" "$1"
 }
 OBENV=("${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1
-  PATRONAGE_MEMBERSHIP="$(addr 52)")
+  PATRONAGE_MEMBERSHIP="$(addr 52)" FAKE_CODE_ALL=1)
 VEST_OK="$OBK/vest.json"
 vest_book "$VEST_OK" "$DEP"
 DORM_OK="$OBK/dormant.json"
@@ -2365,6 +2421,44 @@ for c in "P3:teamVesting:team-vesting.json:$VEST_OK:vest_bc" "P4:dormantLedgers:
   expect "ceremony recovery: the $ph record step needs this run's $ph broadcast" 3 "GATE FAIL at $ph: the record step: no $ph broadcast from this run is recorded" -- "${OBENV[@]}" bash "$CE" --confirm --only "$ph" --record-book --account deployer
   [[ "$(manifest_key "$key")" == null ]] && ok "ceremony recovery: a $ph record step without a broadcast records nothing" || bad "ceremony recovery: a $ph record step without a broadcast records nothing" "$(manifest_key "$key")"
 done
+# P3/P4 with forge's partial record (the step stopped part-way: a deployment never sent, one
+# pending, no receipts): the record step refuses it (the book's contracts are not deployments),
+# and so does the retry, which escalates instead of re-sending. Before, the record step
+# counted every listed CREATE. Then: a complete record but a book address without code.
+for c in "P3:teamVesting:team-vesting.json:$VEST_OK:DeployTeamVesting.s.sol:CREATE2:TeamVestingWallet:$V1:CREATE2:TeamVestingWallet:$V2" \
+  "P4:dormantLedgers:dormant-ledgers.json:$DORM_OK:DeployDormantLedgers.s.sol:CREATE2:FederatedRoundLedger:$FRLA:CREATE:PatronageLedger:$PLA"; do
+  IFS=: read -r ph key file okbook script t1 n1 a1 t2 n2 a2 <<<"$c"
+  ob_reset
+  [[ "$ph" == P4 ]] && dorm_bc && rm -rf "$FAKE/bc-stage"
+  partial_run "$BCD/$script/40204/run-6000.json" 6000 "$t1:$n1:$a1" "$t2:$n2:$a2"
+  cp "$okbook" "$GB/$file"
+  reset_calls
+  out=$("${OBENV[@]}" bash "$CE" --confirm --only "$ph" --record-book --account deployer 2>&1)
+  rc=$?
+  if [[ $rc -eq 3 && "$(manifest_key "$key")" == null && "$(bcount)" == 0 ]] && grep -q "GATE FAIL at $ph: .*$script stopped part-way" <<<"$out" && grep -q 'escalate' <<<"$out"; then
+    ok "ceremony $ph partial: --record-book refuses forge's partial record, records and sends nothing"
+  else
+    bad "ceremony $ph partial: --record-book refuses forge's partial record, records and sends nothing (exit $rc)" "$out"
+  fi
+  rm -f "$GB/$file"
+  reset_calls
+  out=$("${OBENV[@]}" bash "$CE" --confirm --only "$ph" --account deployer 2>&1)
+  rc=$?
+  if [[ $rc -eq 3 && "$(bcount)" == 0 ]] && grep -q "GATE FAIL at $ph: .*$script stopped part-way" <<<"$out" && grep -q 'escalate' <<<"$out" && [[ -z "$(reruns_ph "$ph" "$out")" ]]; then
+    ok "ceremony $ph partial: the retry refuses a step that stopped part-way and escalates, sending nothing"
+  else
+    bad "ceremony $ph partial: the retry refuses a step that stopped part-way and escalates, sending nothing (exit $rc, sent $(bcount))" "$out"
+  fi
+  # A complete record, but a book address with no code on chain: not recorded.
+  ob_reset
+  if [[ "$ph" == P3 ]]; then vest_bc; else dorm_bc; fi
+  mkdir -p "$BCD" && cp -R "$FAKE/bc-stage/." "$BCD/" && rm -rf "$FAKE/bc-stage"
+  cp "$okbook" "$GB/$file"
+  expect "ceremony $ph code: --record-book refuses a book address with no code on chain" 3 "GATE FAIL at $ph: .*$n1 .*$a1 has no code on chain|GATE FAIL at $ph: .* $a1 has no code on chain" -- "${OBENV[@]}" FAKE_NO_CODE="$a1" bash "$CE" --confirm --only "$ph" --record-book --account deployer
+  [[ "$(manifest_key "$key")" == null ]] && ok "ceremony $ph code: a codeless address records nothing" || bad "ceremony $ph code: a codeless address records nothing" "$(manifest_key "$key")"
+  expect "ceremony $ph code: with code everywhere the record step records (control)" 0 "$ph $file recorded in the run manifest" -- "${OBENV[@]}" bash "$CE" --confirm --only "$ph" --record-book --account deployer
+done
+rm -f "$GB/team-vesting.json" "$GB/dormant-ledgers.json"
 expect "ceremony recovery: --record-book needs --confirm" 1 '--record-book needs --confirm --only P2, P3, P3L or P4' -- "${OBENV[@]}" bash "$CE" --simulate --only P3 --record-book
 expect "ceremony recovery: --record-book needs --only" 1 '--record-book needs --confirm --only P2, P3, P3L or P4' -- "${OBENV[@]}" bash "$CE" --confirm --from P3 --record-book --account deployer
 expect "ceremony recovery: --record-book is refused for a phase that writes no book" 1 '--record-book needs --confirm --only P2, P3, P3L or P4' -- "${OBENV[@]}" bash "$CE" --confirm --only P1 --record-book --account deployer
@@ -2417,18 +2511,27 @@ spec = importlib.util.spec_from_file_location("lb", sys.argv[1]); lb = importlib
 root, ts = sys.argv[2], int(sys.argv[3])
 skip = sys.argv[4] if len(sys.argv) > 4 else ""
 extra = sys.argv[5] if len(sys.argv) > 5 else ""
+partial = os.environ.get("LIB_BC_PARTIAL", "")
 n = 0
 for script, rows in lb.LIBRARY:
     txs = []
     for cn, book in rows:
         n += 1
         if book != skip:
-            txs.append({"transactionType": "CREATE2", "contractName": cn, "contractAddress": "0x%040x" % (0x5000 + n)})
+            txs.append({"hash": "0x%064x" % (0xB000 + n), "transactionType": "CREATE2", "contractName": cn, "contractAddress": "0x%040x" % (0x5000 + n)})
     if extra and script == "DeployHupRegistries.s.sol":
-        txs.append({"transactionType": "CREATE2", "contractName": extra, "contractAddress": "0x%040x" % 0x5fff})
+        txs.append({"hash": "0x%064x" % 0xBfff, "transactionType": "CREATE2", "contractName": extra, "contractAddress": "0x%040x" % 0x5fff})
+    if script == partial:
+        # forge's record of a script that stopped part-way: the first transaction still pending,
+        # the rest never sent (hash null), no receipts
+        for tx in txs[1:]:
+            tx["hash"] = None
+        run = {"timestamp": ts, "transactions": txs, "receipts": [], "pending": [txs[0]["hash"]]}
+    else:
+        run = {"timestamp": ts, "transactions": txs, "receipts": [{"transactionHash": t["hash"], "status": "0x1"} for t in txs], "pending": []}
     d = os.path.join(root, script, "40204"); os.makedirs(d, exist_ok=True)
-    json.dump({"timestamp": ts, "transactions": txs}, open(os.path.join(d, f"run-{ts}.json"), "w"))
-    json.dump({"timestamp": ts, "transactions": txs}, open(os.path.join(d, "run-latest.json"), "w"))
+    json.dump(run, open(os.path.join(d, f"run-{ts}.json"), "w"))
+    json.dump(run, open(os.path.join(d, "run-latest.json"), "w"))
 PY
 }
 lib_build() { python3 "$LB" build --broadcast "$1" --chain 40204 --since 5000 --deployer "$DEP" --governance "$(addr 31)" --out "$2" "${@:3}"; }
@@ -2451,6 +2554,13 @@ rm -rf "$LIBT/bc"; lib_bc "$LIBT/bc" 6000 "" CitAgentTimelockX
 expect "library: a deployment the table does not name fails" 1 'deployed CitAgentTimelockX at 0x0+5fff, which the library table does not name' -- lib_build "$LIBT/bc" "$LIBT/b3.json"
 rm -rf "$LIBT/bc"; lib_bc "$LIBT/bc" 4000
 expect "library: a broadcast from before block 0 is no evidence" 1 'no broadcast since this chain.s block 0' -- lib_build "$LIBT/bc" "$LIBT/b4.json"
+# A script that stopped part-way: forge 1.8.3 still writes run-*.json, listing the deployments it
+# never sent (hash null) and the unconfirmed one in "pending", with no receipts. None of them
+# counts as deployed, so the book cannot be built from it (with or without --partial).
+rm -rf "$LIBT/bc"; LIB_BC_PARTIAL=DeployHupRegistries.s.sol lib_bc "$LIBT/bc" 6000
+expect "library: a script that stopped part-way (forge's partial record) fails the build, named" 1 'DeployHupRegistries.s.sol: .*stopped part-way' -- lib_build "$LIBT/bc" "$LIBT/b5.json"
+expect "library: a partial record fails a --partial build too" 1 'DeployHupRegistries.s.sol: .*stopped part-way' -- lib_build "$LIBT/bc" "$LIBT/b5.json" --partial
+[[ ! -e "$LIBT/b5.json" ]] && ok "library: no book is written from a partial record" || bad "library: no book is written from a partial record" "$(cat "$LIBT/b5.json")"
 # Tripwire: the ceremony's LIBRARY_SCRIPTS is library_book.py's order (with a negative control).
 want_order=$(python3 "$LB" scripts)
 got_order=$(sed -n '/^  LIBRARY_SCRIPTS=(/,/^  )/p' "$CE" | sed -n 's#^ *script/\(.*\.s\.sol\)$#\1#p')
@@ -2486,7 +2596,9 @@ s=""; for x in "\$@"; do case "\$x" in script/*.s.sol) s="\${x#script/}" ;; esac
 echo "lib-env \$s rootgov=\${ROOT_GOVERNANCE:-} kyc=\${KYC_UPDATER:-} hup=\${HUP_REGISTRY_ADMIN:-} v3=\${EXPECTED_IPFS_V3:-} tee=\${TEE_REGISTRY:-} msbt=\${HUP_MEMBER_SBT:-} hupbook=\${HUP_BOOK_PATH:-}" >>"\$FAKE/calls.log"
 [[ -n "\${FAKE_LIB_BC:-}" && "\$*" == *--broadcast* && -n "\$s" ]] || exit 0
 [[ "\$s" == "\${FAKE_LIB_FAIL:-}" ]] && exit 1
-python3 - "$LB" "\$s" "\$FAKE_LIB_BC" <<'PY'
+# FAKE_LIB_PARTIAL=<script>: that script stops part-way (the RPC drops after its first
+# transaction): forge writes its partial record, then fails.
+python3 - "$LB" "\$s" "\$FAKE_LIB_BC" "\${FAKE_LIB_PARTIAL:-}" <<'PY'
 import importlib.util, json, os, sys
 spec = importlib.util.spec_from_file_location("lb", sys.argv[1]); lb = importlib.util.module_from_spec(spec); spec.loader.exec_module(lb)
 n = 0
@@ -2494,11 +2606,18 @@ for script, rows in lb.LIBRARY:
     txs = []
     for cn, book in rows:
         n += 1
-        txs.append({"transactionType": "CREATE2", "contractName": cn, "contractAddress": "0x%040x" % (0x5000 + n)})
+        txs.append({"hash": "0x%064x" % (0xB000 + n), "transactionType": "CREATE2", "contractName": cn, "contractAddress": "0x%040x" % (0x5000 + n)})
     if script == sys.argv[2]:
+        if script == sys.argv[4]:
+            for tx in txs[1:]:
+                tx["hash"] = None
+            run = {"timestamp": int(sys.argv[3]), "transactions": txs, "receipts": [], "pending": [txs[0]["hash"]]}
+        else:
+            run = {"timestamp": int(sys.argv[3]), "transactions": txs, "receipts": [{"transactionHash": t["hash"], "status": "0x1"} for t in txs], "pending": []}
         d = os.path.join("broadcast", script, "40204"); os.makedirs(d, exist_ok=True)
-        json.dump({"timestamp": int(sys.argv[3]), "transactions": txs}, open(os.path.join(d, f"run-{sys.argv[3]}.json"), "w"))
+        json.dump(run, open(os.path.join(d, f"run-{sys.argv[3]}.json"), "w"))
 PY
+[[ "\$s" != "\${FAKE_LIB_PARTIAL:-}" ]] || exit 1
 EOF
 chmod +x "$LIB_TOOLS/forge"
 lib_addr() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["contracts"][sys.argv[2]])' "$LIBT/book.json" "$1"; }
@@ -2635,6 +2754,55 @@ expect "ceremony P3L record: the record step refuses a library that stopped part
 p4l_reset
 rm -rf "$BCD"
 expect "ceremony P3L record: the record step needs this run's P3L broadcasts" 3 'GATE FAIL at P3L: the record step: no P3L broadcast from this run is recorded' -- "${P3LENV[@]}" bash "$CE" --confirm --only P3L --record-book --account deployer
+# A library script that stopped part-way (forge's partial record: hash null, "pending" non-empty)
+# is not sent: neither the record step nor the --from P3L resume may count it, skip it or send it
+# again. Both stop and escalate; nothing is sent or recorded. Before, the resume skipped it as
+# sent and recorded a book naming the addresses it never deployed.
+p4l_reset
+rm -rf "$BCD"
+LIB_BC_PARTIAL=DeployHupRegistries.s.sol lib_bc "$BCD" 6000
+python3 -c 'import json,sys; p=sys.argv[1]; m=json.load(open(p)); m["governance"]=json.loads(sys.argv[2]); json.dump(m, open(p, "w"))' "$GB/ceremony-run.json" "$C10GOV"
+reset_calls
+out=$("${P3LENV[@]}" bash "$CE" --confirm --only P3L --record-book --account deployer 2>&1)
+rc=$?
+if [[ $rc -eq 3 && "$(manifest_key library)" == null && ! -e "$GB/library.json" ]] && grep -q 'GATE FAIL at P3L: .*DeployHupRegistries.s.sol stopped part-way' <<<"$out" && grep -q 'escalate' <<<"$out" && ! calls | grep -q '^forge script'; then
+  ok "ceremony P3L partial: the record step refuses a script that stopped part-way, records and sends nothing"
+else
+  bad "ceremony P3L partial: the record step refuses a script that stopped part-way, records and sends nothing (exit $rc)" "$out"
+fi
+p4l_reset
+rm -rf "$BCD"
+LIB_BC_PARTIAL=DeployHupRegistries.s.sol lib_bc "$BCD" 6000
+python3 -c 'import json,sys; p=sys.argv[1]; m=json.load(open(p)); m["governance"]=json.loads(sys.argv[2]); json.dump(m, open(p, "w"))' "$GB/ceremony-run.json" "$C10GOV"
+reset_calls
+out=$("${P3LENV[@]}" bash "$CE" --confirm --only P3L --account deployer 2>&1)
+rc=$?
+if [[ $rc -eq 3 && "$(manifest_key library)" == null && -z "$(lib_bsent)" ]] && grep -q 'GATE FAIL at P3L: .*DeployHupRegistries.s.sol stopped part-way' <<<"$out" && grep -q 'escalate' <<<"$out" && [[ -z "$(reruns_p3l "$out")" ]]; then
+  ok "ceremony P3L partial: the --from P3L resume refuses a script that stopped part-way, never re-sends or skips it"
+else
+  bad "ceremony P3L partial: the --from P3L resume refuses a script that stopped part-way, never re-sends or skips it (exit $rc)" "$out"
+fi
+# The same, the way it happens: the run itself stops in DeployHupRegistries (forge writes the
+# partial record and fails); the identical retry refuses and sends nothing.
+p4l_reset
+rm -rf "$BCD"
+"${P3LENV[@]}" FAKE_LIB_PARTIAL=DeployHupRegistries.s.sol bash "$CE" --confirm --only P3L --account deployer >/dev/null 2>&1
+reset_calls
+out=$("${P3LENV[@]}" bash "$CE" --confirm --only P3L --account deployer 2>&1)
+rc=$?
+if [[ $rc -eq 3 && -z "$(lib_bsent)" && "$(manifest_key library)" == null ]] && grep -q 'DeployHupRegistries.s.sol stopped part-way' <<<"$out"; then
+  ok "ceremony P3L partial: a retry after a script stopped part-way sends nothing and records nothing"
+else
+  bad "ceremony P3L partial: a retry after a script stopped part-way sends nothing and records nothing (exit $rc, sent $(lib_bsent))" "$out"
+fi
+# Before it records the library book, the record step requires code at every address in it.
+p4l_reset
+rm -rf "$BCD"
+lib_bc "$BCD" 6000
+python3 -c 'import json,sys; p=sys.argv[1]; m=json.load(open(p)); m["governance"]=json.loads(sys.argv[2]); json.dump(m, open(p, "w"))' "$GB/ceremony-run.json" "$C10GOV"
+expect "ceremony P3L code: a library contract with no code on chain is not recorded" 3 'GATE FAIL at P3L: .*SkillRegistry 0x0+5012 has no code on chain' -- "${P3LENV[@]}" FAKE_NO_CODE="$(lib_addr SkillRegistry)" bash "$CE" --confirm --only P3L --record-book --account deployer
+[[ "$(manifest_key library)" == null ]] && ok "ceremony P3L code: a book with a codeless address records nothing" || bad "ceremony P3L code: a book with a codeless address records nothing" "$(manifest_key library)"
+expect "ceremony P3L code: with code at every address the record step records (control)" 0 'P3L library.json recorded in the run manifest' -- "${P3LENV[@]}" bash "$CE" --confirm --only P3L --record-book --account deployer
 # Gates on the seats CheckDeployedAdmins does not read.
 p4l_reset
 rm -rf "$BCD"
