@@ -789,7 +789,7 @@ pub(crate) fn stage_canonical_index(
             break 0;
         }
         cur = header.selected_parent_hash;
-        height -= 1; // loop guard: height > 0 checked above
+        height = height.saturating_sub(1); // height > 0 checked above
     };
     let mut marker = [0u8; 48];
     marker[..40].copy_from_slice(&applied_tip_bytes(tip, tip_height));
