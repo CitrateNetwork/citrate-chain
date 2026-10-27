@@ -340,6 +340,7 @@ impl VrfProposerSelector {
         let (ecvrf_proof, beta) = crate::ecvrf::prove(secret_key, &alpha)
             .map_err(|e| VrfError::CryptoError(format!("ECVRF prove: {}", e)))?;
 
+        // VRF-PROOF-SOURCE: ecvrf::prove output (RFC 9381).
         Ok(VrfProof {
             proof: ecvrf_proof.to_bytes(), // 81 bytes
             output: Hash::from_bytes(&beta),

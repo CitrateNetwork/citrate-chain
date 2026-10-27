@@ -626,6 +626,7 @@ pub fn create_canonical_genesis_block(timestamp: u64) -> Block {
         blue_work: 0,
         pruning_point: zero,
         proposer_pubkey: PublicKey::new([0u8; 32]),
+        // VRF-PROOF-SOURCE: none. Genesis has no proposer and is never VRF-verified.
         vrf_reveal: VrfProof {
             proof: vec![],
             output: Hash::default(),
