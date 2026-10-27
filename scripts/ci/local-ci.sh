@@ -34,7 +34,7 @@ while [ $# -gt 0 ]; do
     --fast) FAST=1; shift ;;
     --no-forge) NO_FORGE=1; shift ;;
     --list)
-      echo "gates: fmt-changed, clippy, panic-ratchet, consensus-tripwires, audit-lockfiles, fuzz-targets-compile, test-workspace, test-commd, forge-build, forge-test"
+      echo "gates: fmt-changed, clippy, panic-ratchet, consensus-tripwires, audit-lockfiles, fuzz-targets-compile, ci-scripts, test-workspace, test-commd, forge-build, forge-test"
       exit 0 ;;
     -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 1 ;;
@@ -214,6 +214,16 @@ if [ "$FAST" -eq 1 ]; then
   skip "fuzz-targets-compile" "--fast"
 else
   gate "fuzz-targets-compile" fuzz_targets_compile
+fi
+
+# ── gate: the CI scripts' own tests ─────────────────────────────────────────
+# The pre-push hook and push.sh are the only gate between a branch and the
+# remote; test them end to end against a throwaway bare remote. ~20s of
+# deliberate sleeps (it simulates a slow CI run), so full mode only.
+if [ "$FAST" -eq 1 ]; then
+  skip "ci-scripts" "--fast"
+else
+  gate "ci-scripts" scripts/ci/test_pre_push_hook.sh
 fi
 
 if [ "$FAST" -eq 1 ]; then
