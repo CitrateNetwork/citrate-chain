@@ -999,6 +999,10 @@ expect "ceremony P0 inputs: a malformed relayer is refused" 3 'RELAYER \(0x12\) 
 expect "ceremony P0 inputs: a zero AA owner is refused" 3 'CITRATE_AA_OWNER is the zero address' -- "${CEENV[@]}" CITRATE_AA_OWNER=0x0000000000000000000000000000000000000000 RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
 expect "ceremony P0 inputs: an EntryPoint pin is refused (deployed at its projected address)" 3 'CITRATE_AA_ENTRY_POINT is set; a genesis ceremony runs without it' -- "${CEENV[@]}" CITRATE_AA_ENTRY_POINT="$(addr 70)" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
 expect "ceremony P0 inputs: a P-256 init-code override is refused" 3 'P256_VERIFIER_INITCODE is set' -- "${CEENV[@]}" P256_VERIFIER_INITCODE=0x00 RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
+# The admin checks' genesis-chain mode inputs never apply to a ceremony (its devnet has role
+# history, which the checks scan): set, P0 refuses before anything is sent.
+expect "ceremony P0 inputs: GENESIS_CHAIN is refused" 3 'GENESIS_CHAIN is set; a genesis ceremony runs without it' -- "${CEENV[@]}" GENESIS_CHAIN=1 RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+expect "ceremony P0 inputs: GENESIS_ALLOC is refused" 3 'GENESIS_ALLOC is set; a genesis ceremony runs without it' -- "${CEENV[@]}" GENESIS_ALLOC=genesis/genesis-alloc.json RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
 expect "ceremony P0 inputs: a malformed optional cap is refused" 3 'CITRATE_AA_DAILY_CAP \(lots\) is not an unsigned integer' -- "${CEENV[@]}" CITRATE_AA_DAILY_CAP=lots RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
 # Negative controls: a run that does not reach P2 does not need P2's inputs, and a dry run
 # plans without them, naming what a real run will refuse.
