@@ -36,11 +36,13 @@
 #   --confirm          broadcasts. A non-loopback RPC_URL also needs CITRATE_ALLOW_REMOTE=1.
 #   --from Pn          resume at phase n after a fix (no phase is re-run blindly).
 #   --only Pn          run a single phase.
-#   --record-book      with --confirm --only P3 or P4 (or P2): the phase has broadcast but its
-#                      book did not record (the gate after the step failed). Sends nothing:
+#   --record-book      with --confirm --only P3, P3L or P4 (or P2): the phase has broadcast but
+#                      its book did not record (the gate after the step failed). Sends nothing:
 #                      runs the phase's book checks against this run's broadcasts of that step
-#                      and records the book the step wrote (C5). The only way back into P3/P4
-#                      once they sent.
+#                      and records the book the step wrote (C5; P3L builds the library book from
+#                      this run's broadcasts of every library script, then runs its gates). The
+#                      only way back into P3/P4 once they sent, and into P3L once every library
+#                      script has sent.
 #   --record-stack-book  with --confirm --only P2: P2 has broadcast but its gate failed (or
 #                      regenesis.sh stopped after the last broadcast). Sends nothing: rebuilds
 #                      the book from this run's P2 broadcasts, runs the P2 gate against the
@@ -58,6 +60,13 @@
 # DEPLOYER_PRIVATE_KEY in the environment) and a password on the command line (--password)
 # are refused, and so is ETH_PASSWORD (forge's password-file variable, which would bypass that
 # check); ETH_KEYSTORE and ETH_KEYSTORE_ACCOUNT must be unset or name the --account keystore.
+#
+# Forge output: forge must record this run's broadcasts in contracts/broadcast/, where the
+# sends-once guard (C10) and the book checks read them. The variables that move forge's broadcast
+# or script-cache output (FOUNDRY_BROADCAST, FOUNDRY_CACHE_PATH, FOUNDRY_CACHE, FOUNDRY_PROFILE,
+# FOUNDRY_CONFIG and their DAPP_ forms, in any case; forge_output_check.py says why each) are
+# refused in every mode, and on --confirm P0 reads `forge config --json` in contracts/ and
+# refuses a resolved config (a global ~/.foundry/foundry.toml, say) that records elsewhere.
 #
 # Inputs (env). Values marked OPEN are owner decisions recorded in the runbook §2:
 #   RPC_URL, DEPLOYER_ADDRESS, EXPECTED_CHAIN_ID (40204), EXPECTED_GENESIS_HASH (from the cut)
@@ -138,8 +147,11 @@
 #      stale-book check names a book the run manifest or this run's broadcasts account for as
 #      done, never as another run's output to move aside. After a phase has broadcast, no
 #      failure message says to re-run it: a P2 gate failure names --record-stack-book, a P1
-#      gate failure resumes at P2. A fresh --confirm run refuses a contracts/broadcast/ that
-#      already holds records for this chain id (a rehearsal's would count as this run's).
+#      gate failure resumes at P2, a P3L whose library book is built but not recorded names
+#      --record-book. A fresh --confirm run refuses a contracts/broadcast/ that already holds
+#      records for this chain id (a rehearsal's would count as this run's). Forge must record
+#      into contracts/broadcast/ (see "Forge output" above): a send recorded elsewhere would
+#      be invisible to the guard.
 #
 # Output books: P1/P3/P4 write governance.json, team-vesting.json and dormant-ledgers.json
 # into GENESIS_OUT_DIR, and P2/P4/P5 read them from the same place; every producer and
@@ -213,6 +225,7 @@ while [[ $# -gt 0 ]]; do
 done
 refuse_raw_keys
 refuse_keystore_env "$ACCOUNT"
+refuse_forge_output_env
 # The keystore password reaches forge (P1/P3/P4) and regenesis.sh (P2) only as this path. The
 # value is not echoed on refusal: a caller that passed the password itself in its place must
 # not see it in the log. The file must be private to this user (lib.sh password_file_check);
@@ -265,8 +278,8 @@ idx() {
 if [[ "$RECORD_FLAG" == --record-stack-book && ( "$MODE" != confirm || "$ONLY" != P2 ) ]]; then
   die "--record-stack-book needs --confirm --only P2 (it records the book of a P2 that has broadcast)" 1
 fi
-if [[ "$RECORD_FLAG" == --record-book && ( "$MODE" != confirm || ! " P2 P3 P4 " == *" ${ONLY:-none} "* ) ]]; then
-  die "--record-book needs --confirm --only P2, P3 or P4 (it records the book of a phase that has broadcast)" 1
+if [[ "$RECORD_FLAG" == --record-book && ( "$MODE" != confirm || ! " P2 P3 P3L P4 " == *" ${ONLY:-none} "* ) ]]; then
+  die "--record-book needs --confirm --only P2, P3, P3L or P4 (it records the book of a phase that has broadcast)" 1
 fi
 should() {
   if [[ -n "$ONLY" ]]; then [[ "$1" == "$ONLY" ]]; else [[ $(idx "$1") -ge $(idx "$FROM") ]]; fi
@@ -285,7 +298,18 @@ after_broadcast() {
         err "fix the cause, then record P2's book from this run's broadcasts and the chain (this sends nothing): $0 --confirm --only P2 --record-stack-book$acct; then resume with --from P3"
       fi
       ;;
-    P3L) err "P3L sends each library script once: resume with $0 --confirm --from P3L$acct. Every library script with a broadcast from this run is skipped (never re-sent), and the library book then requires every expected deployment; if a script stopped part-way, stop and escalate (runbook §6.4)" ;;
+    P3L)
+      # The library book is written only once every library script has this run's broadcast and
+      # every expected deployment is in them; a resume would skip every script and stop at P0 on
+      # that very book, so the way on is the record step.
+      if [[ -f "${RUN_MANIFEST:-}" ]] && manifest_has "$RUN_MANIFEST" library; then
+        err "P3L's book is recorded; resume after P3L: $0 --confirm --from P4$acct"
+      elif [[ -f "${LIB_BOOK:-}" ]]; then
+        err "every library script has sent and the library book is built but not recorded: fix the cause, then record it from this run's broadcasts (this sends nothing): $0 --confirm --only P3L --record-book$acct; then resume with --from P4"
+      else
+        err "P3L sends each library script once: resume with $0 --confirm --from P3L$acct. Every library script with a broadcast from this run is skipped (never re-sent), and the library book then requires every expected deployment; if a script stopped part-way, stop and escalate (runbook §6.4)"
+      fi
+      ;;
     # P3/P4 record their output book themselves, and --confirm P5 refuses an unrecorded one, so
     # the way on is the record step (it sends nothing), never past the phase without it.
     P3 | P4)
@@ -1149,6 +1173,8 @@ if should P0 || [[ "$MODE" != dry ]]; then
   [[ -z "${KEEP_LIST:-}" || -f "$KEEP_LIST" ]] || gate_fail P0 "KEEP_LIST not found"
   if [[ "$MODE" == confirm ]]; then
     [[ -n "$ACCOUNT" ]] || gate_fail P0 "--confirm needs --account (Foundry keystore)"
+    # C10: forge records this run's broadcasts where the guard reads them (see "Forge output").
+    why=$(forge_output_config_check "$CONTRACTS" "$FORGE") || gate_fail P0 "$why"
     need_env P0 RPC_URL EXPECTED_GENESIS_HASH TEAM_VESTING_FILE KEEP_LIST FLEET_RPCS MEMBERSHIP_GRANTOR
     if ! is_local_rpc "$RPC_URL" && [[ "${CITRATE_ALLOW_REMOTE:-0}" != 1 ]]; then
       gate_fail P0 "RPC_URL is not loopback; a live broadcast needs CITRATE_ALLOW_REMOTE=1 as well"
@@ -1362,6 +1388,8 @@ if should P3L; then
   # projectIpfsV3; a preset other value is refused. The reviewed freeze is the KEEP list (C6).
   if [[ "$MODE" == dry ]]; then
     export EXPECTED_IPFS_V3='<projectIpfsV3(GOVERNANCE, GOVERNANCE)>'
+  elif [[ "$RECORD_BOOK" == 1 ]]; then
+    : # the record step sends nothing, so no library script needs the pin
   else
     v3=$(cd "$CONTRACTS" && "$FORGE" script script/DeployFederatedLearning.s.sol --sig 'projectIpfsV3(address,address)' "$GOVERNANCE" "$GOVERNANCE" 2>&1 |
       sed -n 's/.*IPFSIncentivesV3 projection: *\(0x[0-9a-fA-F]\{40\}\).*/\1/p' | head -1) || v3=""
@@ -1393,8 +1421,22 @@ if should P3L; then
     "$PY" "$LIBRARY_PY" build --partial --broadcast "$CONTRACTS/broadcast" --chain "$EXPECTED_CHAIN_ID" --since "$RUN_G0TS" \
       --deployer "$RUN_DEPLOYER" --governance "$GOVERNANCE" --out "$1"
   }
-  log "P3L library: ${#LIBRARY_SCRIPTS[@]} scripts → $LIB_BOOK"
-  for ls in "${LIBRARY_SCRIPTS[@]}"; do
+  if [[ "$RECORD_BOOK" == 1 ]]; then
+    # The record step (--confirm --only P3L --record-book): every library script has sent but the
+    # book did not record. The phase guard refuses it once the library is recorded and needs this
+    # run's library broadcasts; it clears nothing for run_broadcast, so nothing here can send.
+    sends_once P3L
+    unsent=""
+    for ls in "${LIBRARY_SCRIPTS[@]#script/}"; do grep -qxF -- "$ls" <<<"$sent" || unsent+="${unsent:+,}$ls"; done
+    [[ -z "$unsent" ]] ||
+      gate_fail P3L "the record step: this run has no broadcast of $unsent, so P3L stopped part-way and has no library book to record; the P3L resume (--from P3L) sends only those"
+    log "P3L record step: nothing is sent; the library book is built from this run's broadcasts ($(printf '%s' "$sent" | paste -sd, -)), checked and recorded"
+    LIBRARY_LOOP=()
+  else
+    log "P3L library: ${#LIBRARY_SCRIPTS[@]} scripts → $LIB_BOOK"
+    LIBRARY_LOOP=("${LIBRARY_SCRIPTS[@]}")
+  fi
+  for ls in ${LIBRARY_LOOP[@]+"${LIBRARY_LOOP[@]}"}; do
     ls="${ls#script/}"
     # C10, per script: refused once the library is recorded; a script this run has broadcast
     # is never sent again (a resume goes on with the next one).

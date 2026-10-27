@@ -99,6 +99,14 @@ if [[ -n "$PASSWORD_FILE" ]]; then
   PASSWORD_FILE_ID=$(pw_check "$PASSWORD_FILE") || die "$PASSWORD_FILE_ID"
   SIGNER_ARGS+=(--password-file "$PASSWORD_FILE")
 fi
+# Forge output, by the genesis ceremony's shared check (scripts/genesis/forge_output_check.py,
+# which lists the settings and why): forge must record this run's broadcasts in
+# contracts/broadcast/, where the address-book generator and the ceremony's sends-once guard
+# read them. A variable that moves forge's broadcast or script-cache output is refused by name
+# (never its value), in every mode; on --broadcast the config forge resolves is checked too.
+FORGE_OUT_CHECK="${REPO_ROOT}/scripts/genesis/forge_output_check.py"
+[[ -f "$FORGE_OUT_CHECK" ]] || die "the forge output check $FORGE_OUT_CHECK is missing; run regenesis.sh from a full checkout"
+why=$("${PYTHON:-python3}" -I "$FORGE_OUT_CHECK" env 2>&1) || die "$why"
 
 command -v forge >/dev/null || die "forge not on PATH"
 command -v jq >/dev/null || die "jq is required"
@@ -143,6 +151,10 @@ if [[ "$BROADCAST" == "1" ]]; then
   if [[ "$RPC_URL" != *localhost* && "$RPC_URL" != *127.0.0.1* && "${CITRATE_ALLOW_REMOTE:-0}" != "1" ]]; then
     die "refusing to --broadcast to a non-local RPC without CITRATE_ALLOW_REMOTE=1 (live-reroll two-key guard)"
   fi
+  # What forge resolves (foundry.toml, its profiles, a global ~/.foundry/foundry.toml) must
+  # record into contracts/broadcast/ as well; read before the first forge step.
+  cfg=$(cd "$CONTRACTS" && forge config --json 2>/dev/null) || die "cannot read forge's config (forge config --json in $CONTRACTS)"
+  why=$(printf '%s' "$cfg" | "${PYTHON:-python3}" -I "$FORGE_OUT_CHECK" config --contracts "$CONTRACTS" 2>&1) || die "$why"
   # --slow: one transaction at a time, each waited for, as the ceremony's own forge phases
   # and the r1005 driver ran. A Citrate node answers null for a pending transaction, so a
   # batched broadcast can give up on receipts of transactions that are later mined.

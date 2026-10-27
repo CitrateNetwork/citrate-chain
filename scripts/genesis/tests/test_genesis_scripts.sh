@@ -1234,6 +1234,7 @@ cp "$G/../ops/regenesis.sh" "$RG/scripts/ops/"
 # regenesis.sh runs the genesis ceremony's shared password-file check from the same tree.
 mkdir -p "$RG/scripts/genesis"
 cp "$G/secret_file_check.py" "$RG/scripts/genesis/"
+[[ -f "$G/forge_output_check.py" ]] && cp "$G/forge_output_check.py" "$RG/scripts/genesis/"
 for preset in "$STALE" "" "$(printf '%s' "$MIXED" | tr 'a-f' 'A-F' | sed 's/^0X/0x/')"; do
   reset_calls
   expect "regenesis: CEREMONY_DEPLOYER_ADDRESS='$preset' with DEPLOYER_ADDRESS=$MIXED is refused" 1 'CEREMONY_DEPLOYER_ADDRESS .*is not exactly DEPLOYER_ADDRESS' -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" CEREMONY_DEPLOYER_ADDRESS="$preset" bash "$RG/scripts/ops/regenesis.sh"
@@ -1278,12 +1279,17 @@ done
 # regenesis.sh on its own refuses the same forge output variables (any mode), and on --broadcast
 # reads `forge config --json` in contracts/ first: a config that records broadcasts elsewhere is
 # refused before any forge step (the ceremony's guard and the generator read contracts/broadcast/).
-[[ -f "$G/forge_output_check.py" ]] && cp "$G/forge_output_check.py" "$RG/scripts/genesis/"
 for v in FOUNDRY_BROADCAST DAPP_BROADCAST FOUNDRY_CACHE_PATH FOUNDRY_CACHE FOUNDRY_PROFILE FOUNDRY_CONFIG foundry_broadcast; do
   reset_calls
   expect "regenesis: $v in the environment is refused before any forge step" 1 "$v is set in the environment" -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" "$v=$T/rg-elsewhere" bash "$RG/scripts/ops/regenesis.sh" --broadcast --account deployer
   if calls | grep -q '^forge'; then bad "regenesis: a refused $v runs no forge" "$(calls)"; else ok "regenesis: a refused $v runs no forge"; fi
 done
+# Fail closed: a tree without the shared check refuses before any forge step.
+mkdir -p "$T/rg-nocheck/scripts/ops" "$T/rg-nocheck/contracts"
+cp "$G/../ops/regenesis.sh" "$T/rg-nocheck/scripts/ops/"
+reset_calls
+expect "regenesis: without the forge output check it refuses to run" 1 'forge output check .* is missing' -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" bash "$T/rg-nocheck/scripts/ops/regenesis.sh"
+if calls | grep -q '^forge'; then bad "regenesis: without the forge output check it runs no forge" "$(calls)"; else ok "regenesis: without the forge output check it runs no forge"; fi
 reset_calls
 expect "regenesis: --broadcast with forge recording broadcasts elsewhere is refused" 1 'forge writes its broadcast records to /srv/elsewhere' -- env PATH="$BIN:$PATH" RPC_URL=http://127.0.0.1:8545 DEPLOYER_ADDRESS="$MIXED" FAKE_FORGE_CONFIG='{"broadcast":"/srv/elsewhere","cache":true,"cache_path":"cache"}' bash "$RG/scripts/ops/regenesis.sh" --broadcast --account deployer
 if calls | grep -q '^forge'; then bad "regenesis: a refused forge config runs no forge step" "$(calls)"; else ok "regenesis: a refused forge config runs no forge step"; fi
@@ -2624,7 +2630,7 @@ p4l_reset
 rm -rf "$BCD"
 "${P3LENV[@]}" FAKE_LIB_FAIL=DeployFederatedLearning.s.sol bash "$CE" --confirm --only P3L --account deployer >/dev/null 2>&1
 reset_calls
-expect "ceremony P3L record: the record step refuses a library that stopped part-way" 3 'GATE FAIL at P3L: library book: .*missing' -- "${P3LENV[@]}" bash "$CE" --confirm --only P3L --record-book --account deployer
+expect "ceremony P3L record: the record step refuses a library that stopped part-way" 3 'GATE FAIL at P3L: the record step: this run has no broadcast of DeployFederatedLearning.s.sol,DeployAgentDecisionRegistryV2.s.sol,DeployHupRegistries.s.sol' -- "${P3LENV[@]}" bash "$CE" --confirm --only P3L --record-book --account deployer
 [[ -z "$(lib_bsent)" && "$(manifest_key library)" == null ]] && ok "ceremony P3L record: a refused record step sends and records nothing" || bad "ceremony P3L record: a refused record step sends and records nothing" "$(calls)"
 p4l_reset
 rm -rf "$BCD"
@@ -3057,6 +3063,9 @@ SOL
       fi
       for s in DeployTeamVesting DeployDormantLedgers; do cp "$IC/script/$s.s.sol" "$FC/script/"; done
       cp "$ROOT_SRC/scripts/ops/regenesis.sh" "$ROOT_SRC/scripts/ops/emit-address-table.sh" "$FR/scripts/ops/"
+      # regenesis.sh runs the ceremony's shared forge output check from the same tree.
+      mkdir -p "$FR/scripts/genesis"
+      cp "$G/forge_output_check.py" "$FR/scripts/genesis/"
       cp "$ROOT_SRC/scripts/ci/check-create2-determinism.sh" "$FR/scripts/ci/"
       cat >"$T/fbin/forge" <<'EOF'
 #!/usr/bin/env bash

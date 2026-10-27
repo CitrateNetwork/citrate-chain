@@ -68,6 +68,29 @@ refuse_keystore_env() {
 GENESIS_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 password_file_check() { "${PY:-python3}" -I "$GENESIS_LIB_DIR/secret_file_check.py" --password-file "$@"; }
 
+# refuse_forge_output_env: the sends-once guard (C10) and the book checks read this run's
+# broadcast records from contracts/broadcast/. forge takes that directory and its script cache
+# from its config, which FOUNDRY_BROADCAST, FOUNDRY_CACHE_PATH, FOUNDRY_CACHE, FOUNDRY_PROFILE,
+# FOUNDRY_CONFIG (and DAPP_ forms, any case) change: a send recorded elsewhere is invisible to
+# the guard. Each is refused by name (forge_output_check.py lists them and why); values are
+# never printed.
+refuse_forge_output_env() {
+  local why
+  why=$("${PY:-python3}" -I "$GENESIS_LIB_DIR/forge_output_check.py" env 2>&1) || die "$why" 1
+}
+# forge_output_config_check <contracts dir> <forge>: what forge resolves (`forge config --json`
+# in that directory, so a global ~/.foundry/foundry.toml or a profile counts too) records
+# broadcasts in <dir>/broadcast and its script cache in <dir>/cache. Prints the reason and fails
+# otherwise. Reads only; sends nothing.
+forge_output_config_check() {
+  local cfg
+  cfg=$(cd "$1" && "$2" config --json 2>/dev/null) || {
+    echo "cannot read forge's config (forge config --json in $1)"
+    return 1
+  }
+  printf '%s' "$cfg" | "${PY:-python3}" -I "$GENESIS_LIB_DIR/forge_output_check.py" config --contracts "$1" 2>&1
+}
+
 # describe_cmd <argv...>: print a command for a dry-run plan. Arguments that follow
 # --password-file are shown as given (a path), never read.
 describe_cmd() {
