@@ -925,6 +925,38 @@ mod tests {
         ));
     }
 
+    /// The fingerprint follows the chain a node runs, never what its config calls it:
+    /// naming the genesis profile or not gives the same fingerprint, on r1005 and on
+    /// r1006. On r1005 (no compiled per-genesis rules) it stays exactly the v3 one
+    /// (main's pre-image), so r1005 fleet comparisons are unchanged.
+    #[test]
+    fn fingerprint_does_not_depend_on_the_profile_name() {
+        use citrate_consensus::hardening::{R1006_GENESIS, RELEASE_GENESIS};
+        let r1005 = RELEASE_GENESIS[0].1;
+        for (named, g) in [("testnet_beta", r1005), ("r1006", R1006_GENESIS)] {
+            assert_eq!(
+                ConsensusManifest::for_node(Some(named), Some(&g)).fingerprint,
+                ConsensusManifest::for_node(None, Some(&g)).fingerprint,
+                "{named}: the profile name moved the fingerprint"
+            );
+            assert_eq!(
+                ConsensusManifest::for_node(Some(named), Some(&g)).fingerprint,
+                ConsensusManifest::for_node(Some("some-other-name"), Some(&g)).fingerprint,
+                "{named}: a renamed profile moved the fingerprint"
+            );
+        }
+        assert_eq!(
+            ConsensusManifest::for_node(Some("testnet_beta"), Some(&r1005)).fingerprint,
+            ConsensusManifest::current().fingerprint,
+            "r1005 keeps the unbound v3 fingerprint"
+        );
+        assert_ne!(
+            ConsensusManifest::for_node(None, Some(&R1006_GENESIS)).fingerprint,
+            ConsensusManifest::for_node(None, Some(&r1005)).fingerprint,
+            "r1006 still differs from r1005"
+        );
+    }
+
     /// An unscheduled canonical VRF encoding rule leaves the fingerprint exactly as
     /// before; a scheduled one is part of it (chain#384).
     #[test]
