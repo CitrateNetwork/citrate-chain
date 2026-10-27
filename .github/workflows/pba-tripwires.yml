@@ -30,3 +30,7 @@ jobs:
         run: scripts/ci/check_pba_exec_tripwires.sh --self-test
       - name: CHAIN-EXEC tripwires (signature setting, node feature set, mempool expiry, metrics bind)
         run: scripts/ci/check_pba_exec_tripwires.sh
+      - name: Sequencer devnet tripwire self-test
+        run: scripts/ci/sequencer_devnet_tripwire.py --self-test
+      - name: Sequencer devnet tripwire (no in-repo build enables citrate-sequencer/devnet)
+        run: scripts/ci/sequencer_devnet_tripwire.py
