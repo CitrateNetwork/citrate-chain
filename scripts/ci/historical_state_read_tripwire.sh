@@ -2,10 +2,11 @@
 # historical_state_read_tripwire.sh — no client code that relies on reading PAST state.
 #
 # The Citrate node serves account-state reads (eth_getCode, eth_call, eth_getBalance,
-# eth_getStorageAt, eth_getTransactionCount) from its latest committed state: a block-number or
-# block-hash tag is accepted but not honoured (only `finalized`/`safe` are checked, and refused
-# when they are behind the tip). A script or tool that asks for state "at block N" therefore gets
-# the state at the tip and silently compares, forks or verifies against the wrong snapshot.
+# eth_getStorageAt, eth_getTransactionCount) from its executed head's state only. Older nodes
+# accepted a block-number or block-hash tag and answered with the tip's state; nodes with
+# chain#425 refuse a tag that is not the executed head ("historical state not available on this
+# node"). A script or tool that asks for state "at block N" therefore either silently compares,
+# forks or verifies against the wrong snapshot (older nodes) or fails once the head moves on.
 #
 #   R1  A JSON-RPC state read whose parameters (the call line, the 3 lines before it and the 6
 #       after it) do not pass the literal tag "latest" or "pending". Server-side dispatch (a
