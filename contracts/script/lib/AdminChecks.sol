@@ -48,38 +48,86 @@ abstract contract AdminChecks {
     /// @dev scripts/ci/privileged_slots_tripwire.sh requires every address slot
     ///      of a DeployAll contract to be read here or exempt with a reason
     ///      (contracts/script/lib/privileged_slots.json).
-    function _addressSlotGetters() internal pure returns (string[40] memory) {
-        return [
-            "governance()", "pendingGovernance()", "owner()", "pendingOwner()",
-            "admin()", "pendingAdmin()", "guardian()", "provider()",
-            "treasury()", "treasuryAddress()", "pendingTreasury()", "feeRecipient()",
-            "marketplace()", "verifier()", "operator()", "minter()",
-            "oracle()", "pricingOracle()", "signer()", "verifyingSigner()",
-            "relayer()", "slasher()", "facilitator()", "burner()",
-            "slashingContract()", "bulkGateway()", "jobRegistry()", "modelRegistry()",
-            "marketMaker()", "contributionAccounting()", "contributions()", "stakingPool()",
-            "distributionStablecoin()", "wSALT()", "registry()", "recorder()",
-            "keeper()", "manager()", "controller()", "beneficiary()"
-        ];
+    /// @dev Built element by element into a dynamic array: under via-IR, the equivalent
+    ///      `string[40]` array literal miscompiled DeployDormantLedgers (its first cheatcode
+    ///      call went to a garbage address) once this sweep and the genesis checks shared a
+    ///      contract. Keep the lists dynamic.
+    function _addressSlotGetters() internal pure returns (string[] memory g) {
+        g = new string[](40);
+        g[0] = "governance()";
+        g[1] = "pendingGovernance()";
+        g[2] = "owner()";
+        g[3] = "pendingOwner()";
+        g[4] = "admin()";
+        g[5] = "pendingAdmin()";
+        g[6] = "guardian()";
+        g[7] = "provider()";
+        g[8] = "treasury()";
+        g[9] = "treasuryAddress()";
+        g[10] = "pendingTreasury()";
+        g[11] = "feeRecipient()";
+        g[12] = "marketplace()";
+        g[13] = "verifier()";
+        g[14] = "operator()";
+        g[15] = "minter()";
+        g[16] = "oracle()";
+        g[17] = "pricingOracle()";
+        g[18] = "signer()";
+        g[19] = "verifyingSigner()";
+        g[20] = "relayer()";
+        g[21] = "slasher()";
+        g[22] = "facilitator()";
+        g[23] = "burner()";
+        g[24] = "slashingContract()";
+        g[25] = "bulkGateway()";
+        g[26] = "jobRegistry()";
+        g[27] = "modelRegistry()";
+        g[28] = "marketMaker()";
+        g[29] = "contributionAccounting()";
+        g[30] = "contributions()";
+        g[31] = "stakingPool()";
+        g[32] = "distributionStablecoin()";
+        g[33] = "wSALT()";
+        g[34] = "registry()";
+        g[35] = "recorder()";
+        g[36] = "keeper()";
+        g[37] = "manager()";
+        g[38] = "controller()";
+        g[39] = "beneficiary()";
     }
 
     /// @notice Every `mapping(address => bool)` membership the sweep reads.
-    function _addressSetGetters() internal pure returns (string[12] memory) {
-        return [
-            "authorizedRecorders(address)", "authorizedDisputers(address)", "authorizedSpenders(address)",
-            "authorizedActivityRecorders(address)", "authorizedMatcher(address)", "teeOracles(address)",
-            "isOracle(address)", "isOracleMember(address)", "isRecorder(address)",
-            "eligibleParticipant(address)", "isOperator(address)", "isMinter(address)"
-        ];
+    function _addressSetGetters() internal pure returns (string[] memory g) {
+        g = new string[](12);
+        g[0] = "authorizedRecorders(address)";
+        g[1] = "authorizedDisputers(address)";
+        g[2] = "authorizedSpenders(address)";
+        g[3] = "authorizedActivityRecorders(address)";
+        g[4] = "authorizedMatcher(address)";
+        g[5] = "teeOracles(address)";
+        g[6] = "isOracle(address)";
+        g[7] = "isOracleMember(address)";
+        g[8] = "isRecorder(address)";
+        g[9] = "eligibleParticipant(address)";
+        g[10] = "isOperator(address)";
+        g[11] = "isMinter(address)";
     }
 
     /// @notice Every role the sweep reads through `hasRole(bytes32,address)`.
-    function _probedRoleNames() internal pure returns (string[12] memory) {
-        return [
-            "DEFAULT_ADMIN_ROLE", "OPERATOR_ROLE", "VALIDATOR_ROLE", "REPORTER_ROLE",
-            "FACILITATOR_ROLE", "MINTER_ROLE", "PAUSER_ROLE", "UPGRADER_ROLE",
-            "PROPOSER_ROLE", "EXECUTOR_ROLE", "CANCELLER_ROLE", "TIMELOCK_ADMIN_ROLE"
-        ];
+    function _probedRoleNames() internal pure returns (string[] memory g) {
+        g = new string[](12);
+        g[0] = "DEFAULT_ADMIN_ROLE";
+        g[1] = "OPERATOR_ROLE";
+        g[2] = "VALIDATOR_ROLE";
+        g[3] = "REPORTER_ROLE";
+        g[4] = "FACILITATOR_ROLE";
+        g[5] = "MINTER_ROLE";
+        g[6] = "PAUSER_ROLE";
+        g[7] = "UPGRADER_ROLE";
+        g[8] = "PROPOSER_ROLE";
+        g[9] = "EXECUTOR_ROLE";
+        g[10] = "CANCELLER_ROLE";
+        g[11] = "TIMELOCK_ADMIN_ROLE";
     }
 
     function _roleId(string memory name) internal pure returns (bytes32) {
@@ -106,18 +154,18 @@ abstract contract AdminChecks {
         returns (string memory)
     {
         if (target.code.length == 0) return "no code at address";
-        string[40] memory getters = _addressSlotGetters();
+        string[] memory getters = _addressSlotGetters();
         for (uint256 i = 0; i < getters.length; i++) {
             (bool ok, address a) = _readAddress(target, abi.encodeWithSignature(getters[i]));
             if (ok && a == who) return string.concat(getters[i], " is ", noun);
         }
-        string[12] memory sets = _addressSetGetters();
+        string[] memory sets = _addressSetGetters();
         for (uint256 i = 0; i < sets.length; i++) {
             if (_holds(target, abi.encodeWithSignature(sets[i], who), abi.encodeWithSignature(sets[i], UNHELD))) {
                 return string.concat(subject, " is in ", sets[i]);
             }
         }
-        string[12] memory roles = _probedRoleNames();
+        string[] memory roles = _probedRoleNames();
         for (uint256 i = 0; i < roles.length; i++) {
             bytes32 r = _roleId(roles[i]);
             if (
