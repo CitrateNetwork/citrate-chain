@@ -1,4 +1,5 @@
 // Fixture: state-read handlers that read the node's state without checking the block tag.
+#[rustfmt::skip]
 fn register(io_handler: &mut IoHandler) {
     io_handler.add_sync_method("eth_getBalance", move |params: Params| { // FLAG
         let tag = params.get(1).and_then(|v| v.as_str());
