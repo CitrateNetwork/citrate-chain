@@ -1,136 +1,143 @@
 //! Build-profile tripwire: the relaxed `devnet` validation branch of the
-//! mempool must never be part of a default build.
+//! mempool must never be part of an in-repo build.
 //!
 //! Turning `devnet` on compiles out the production signature gate in
 //! `Mempool::validate_transaction` and the tests that exercise it. The rest of
 //! this suite stays green when `devnet` becomes a default feature, because the
 //! unconditional sender-recovery check still rejects the forged inputs it
-//! uses. So the build profile itself is pinned here: the crate's default
-//! feature list, and every in-repo dependent, must leave `devnet` off.
+//! uses. So the build profile itself is pinned here.
 //!
-//! The check reads manifests (not `cfg!`), so it holds under any
-//! `--features` selection of this test run.
+//! The check lives in `scripts/ci/sequencer_devnet_tripwire.py`: it parses
+//! every Cargo.toml as TOML and resolves features across the in-repo crates
+//! (default lists, inline and table-form dependency specs, `workspace = true`
+//! inheritance, renames, and features forwarded through other features). These
+//! tests run it on the tree, run its self-test, and feed it each manifest
+//! spelling that a line-based reader missed. It reads manifests (not `cfg!`),
+//! so it holds under any `--features` selection of this test run.
 
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 
-fn manifest_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// Entries of `default = [...]` in the `[features]` table of `manifest`.
-fn default_features(manifest: &str) -> Vec<String> {
-    let mut in_features = false;
-    for line in manifest.lines() {
-        let t = line.trim();
-        if t.starts_with('[') {
-            in_features = t == "[features]";
-            continue;
-        }
-        if in_features && t.starts_with("default") {
-            let rhs = t.split_once('=').map(|(_, r)| r).unwrap_or("");
-            return rhs
-                .trim()
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .split(',')
-                .map(|s| s.trim().trim_matches('"').to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-        }
+fn tripwire(args: &[&str], root: Option<&Path>) -> Output {
+    let script = repo_root().join("scripts/ci/sequencer_devnet_tripwire.py");
+    let mut cmd = Command::new("python3");
+    cmd.arg(script).args(args);
+    match root {
+        Some(r) => cmd.env("SEQ_DEVNET_TRIPWIRE_ROOT", r),
+        None => cmd.env_remove("SEQ_DEVNET_TRIPWIRE_ROOT"),
+    };
+    cmd.output()
+        .expect("python3 must be available to run the tripwire")
+}
+
+fn describe(out: &Output) -> String {
+    format!(
+        "status {:?}\nstdout:\n{}\nstderr:\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// Writes a two-crate fixture workspace (sequencer + one dependent) under this
+/// test binary's scratch dir and returns its root.
+fn fixture(name: &str, seq_features: &str, app_tail: &str) -> PathBuf {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("seq-devnet-guard")
+        .join(name);
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("clear stale fixture");
     }
-    Vec::new()
+    std::fs::create_dir_all(root.join("seq")).expect("mkdir seq");
+    std::fs::create_dir_all(root.join("app")).expect("mkdir app");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"seq\", \"app\"]\n",
+    )
+    .expect("write root");
+    std::fs::write(
+        root.join("seq/Cargo.toml"),
+        format!(
+            "[package]\nname = \"citrate-sequencer\"\nversion = \"0.1.0\"\n\n[features]\n{seq_features}"
+        ),
+    )
+    .expect("write seq");
+    std::fs::write(
+        root.join("app/Cargo.toml"),
+        format!("[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n{app_tail}"),
+    )
+    .expect("write app");
+    root
 }
 
 #[test]
-fn devnet_is_not_a_default_feature() {
-    let manifest = std::fs::read_to_string(manifest_dir().join("Cargo.toml")).unwrap();
-    assert!(
-        manifest.contains("[features]") && manifest.contains("devnet"),
-        "the sequencer manifest must still declare its features"
-    );
-    let defaults = default_features(&manifest);
-    assert!(
-        !defaults.iter().any(|f| f == "devnet"),
-        "citrate-sequencer must not enable `devnet` by default, got default = {defaults:?}"
-    );
+fn no_in_repo_build_enables_devnet() {
+    let out = tripwire(&[], None);
+    assert!(out.status.success(), "{}", describe(&out));
 }
 
 #[test]
-fn no_in_repo_dependent_enables_devnet() {
-    let root = manifest_dir().join("../..");
-    let dependents = [
-        "node/Cargo.toml",
-        "node-app/Cargo.toml",
-        "core/api/Cargo.toml",
-        "core/network/Cargo.toml",
-    ];
-    let mut checked = 0;
-    for rel in dependents {
-        let path: PathBuf = root.join(rel);
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        for line in text.lines().filter(|l| l.contains("citrate-sequencer")) {
-            checked += 1;
-            assert!(
-                !line.contains("devnet"),
-                "{} enables the sequencer `devnet` feature: {line}",
-                Path::new(rel).display()
-            );
-        }
-        // A forwarding feature like `devnet = ["citrate-sequencer/devnet"]` in a
-        // DEFAULT list would do the same thing indirectly.
-        let defaults = default_features(&text);
-        assert!(
-            !defaults
-                .iter()
-                .any(|f| f.contains("citrate-sequencer/devnet")),
-            "{rel} turns on citrate-sequencer/devnet by default"
-        );
-    }
-    assert!(
-        checked >= 3,
-        "expected the node, api and network dependents, saw {checked}"
-    );
+fn tripwire_self_test_passes() {
+    let out = tripwire(&["--self-test"], None);
+    assert!(out.status.success(), "{}", describe(&out));
 }
 
-/// Negative control for the parser: a manifest with `devnet` in its defaults
-/// is detected.
-#[test]
-fn default_feature_parser_detects_devnet() {
-    let bad = "[package]\nname = \"x\"\n\n[features]\ndefault = [\"devnet\"]\ndevnet = []\n";
-    assert_eq!(default_features(bad), vec!["devnet".to_string()]);
-    let good = "[features]\ndefault = []\ndevnet = []\n";
-    assert!(default_features(good).is_empty());
-}
-
-/// Red-first: the manifest spellings below each enable `devnet` and must be
-/// flagged by the tripwire.
+/// Each manifest spelling below enables `devnet`; every one must be flagged,
+/// and the clean control must pass.
 #[test]
 fn tripwire_flags_every_devnet_spelling() {
+    let clean = "default = []\ndevnet = []\n";
+    let cases = [
+        (
+            "multi-line default list",
+            "default = [\n    \"devnet\",\n]\ndevnet = []\n",
+            String::new(),
+        ),
+        (
+            "table-form dependency",
+            clean,
+            "[dependencies.citrate-sequencer]\npath = \"../seq\"\nfeatures = [\"devnet\"]\n"
+                .to_string(),
+        ),
+        (
+            "forwarded alias",
+            clean,
+            "[dependencies]\ncitrate-sequencer = { path = \"../seq\" }\n\n[features]\ndefault = [\"dev\"]\ndev = [\"citrate-sequencer/devnet\"]\n"
+                .to_string(),
+        ),
+    ];
     let mut missed = Vec::new();
-    let multi_line_default = "[features]\ndefault = [\n    \"devnet\",\n]\ndevnet = []\n";
-    if !default_features(multi_line_default)
-        .iter()
-        .any(|f| f == "devnet")
-    {
-        missed.push("multi-line default list");
+    for (i, (label, seq, app)) in cases.iter().enumerate() {
+        let root = fixture(&format!("bad{i}"), seq, app);
+        let out = tripwire(&[], Some(&root));
+        if out.status.code() != Some(1) {
+            missed.push(format!("{label}: {}", describe(&out)));
+        }
     }
-    let table_form =
-        "[dependencies.citrate-sequencer]\npath = \"../core/sequencer\"\nfeatures = [\"devnet\"]\n";
-    if !table_form
-        .lines()
-        .filter(|l| l.contains("citrate-sequencer"))
-        .any(|l| l.contains("devnet"))
-    {
-        missed.push("table-form dependency");
-    }
-    let forwarded = "[dependencies]\ncitrate-sequencer = { path = \"../core/sequencer\" }\n\n[features]\ndefault = [\"dev\"]\ndev = [\"citrate-sequencer/devnet\"]\n";
-    if !default_features(forwarded)
-        .iter()
-        .any(|f| f.contains("citrate-sequencer/devnet"))
-    {
-        missed.push("forwarded alias");
-    }
-    assert!(missed.is_empty(), "tripwire missed: {missed:?}");
+    assert!(missed.is_empty(), "tripwire missed: {missed:#?}");
+
+    let root = fixture(
+        "clean",
+        clean,
+        "[dependencies]\ncitrate-sequencer = { path = \"../seq\" }\n",
+    );
+    let out = tripwire(&[], Some(&root));
+    assert!(
+        out.status.success(),
+        "clean control flagged: {}",
+        describe(&out)
+    );
+}
+
+/// A renamed feature would make the check vacuous, so the tripwire refuses a
+/// tree where citrate-sequencer no longer declares `devnet`.
+#[test]
+fn tripwire_fails_closed_without_devnet_feature() {
+    let root = fixture("undeclared", "default = []\n", "");
+    let out = tripwire(&[], Some(&root));
+    assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
 }

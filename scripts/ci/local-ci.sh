@@ -153,6 +153,7 @@ consensus_tripwires() {
     "scripts/ci/panic_invariant_tripwire.sh" \
     "scripts/ci/double_lock_tripwire.sh" \
     "scripts/ci/prod_assert_ratchet.sh" \
+    "scripts/ci/sequencer_devnet_tripwire.py" \
   ; do
     if [ ! -x "$t" ]; then
       echo "missing/!executable tripwire: $t"; rc=1; continue
