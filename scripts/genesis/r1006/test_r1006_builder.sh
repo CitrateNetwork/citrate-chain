@@ -60,6 +60,45 @@ jq '.accounts[3].code = "0x60"' "$T/dump.json" >"$T/dump-bad.json"
 expect "emit_alloc refuses a deployer with code" 1 'deployer has code' -- \
   python3 "$HERE/emit_alloc.py" --dump "$T/dump-bad.json" --manifest "$T/manifest.json" --inputs "$T/inputs.env" --book "$T/book40204.json" --out "$T/a3.json"
 
+# ------------------------------------------------------------ new_role_keys.sh (stub cast)
+# A stub `cast` stands in for `cast wallet new --json` with FAKE values: cast >= 1.8 wraps the
+# output in {"data": ...}, older versions print the list itself. Both must give 13 keys in
+# 0600 files and addresses only on stdout.
+for shape in envelope list; do
+  mkdir -p "$T/kb-$shape/bin" "$T/kh-$shape"
+  cat >"$T/kb-$shape/bin/cast" <<STUB
+#!/usr/bin/env bash
+[[ "\$1 \$2 \$3" == "wallet new --json" ]] || { echo "stub cast: unexpected \$*" >&2; exit 9; }
+n=\$(( \$(cat "$T/kb-$shape/n" 2>/dev/null || echo 0) + 1 )); echo \$n >"$T/kb-$shape/n"
+a=\$(printf '0x%040x' \$((0x1000 + n))); k=\$(printf 'fa%062x' \$n)
+w="[{\"address\":\"\$a\",\"private_key\":\"0x\$k\"}]"
+if [[ "$shape" == envelope ]]; then echo "{\"data\":\$w}"; else echo "\$w"; fi
+STUB
+  chmod +x "$T/kb-$shape/bin/cast"
+  out=$(PATH="$T/kb-$shape/bin:$PATH" bash "$HERE/new_role_keys.sh" --dir "$T/kh-$shape/keys" 2>&1)
+  rc=$?
+  n_keys=$(ls "$T/kh-$shape/keys"/*.key 2>/dev/null | wc -l)
+  perms=$(stat -c '%a' "$T/kh-$shape/keys"/*.key 2>/dev/null | sort -u | tr '\n' ' ')
+  dperm=$(stat -c '%a' "$T/kh-$shape/keys" 2>/dev/null)
+  n_addr=$(grep -cE '^[A-Z0-9_]+=0x[0-9a-f]{40}$' "$T/kh-$shape/keys/addresses.env" 2>/dev/null)
+  if [[ $rc -eq 0 && $n_keys -eq 13 && "$perms" == "600 " && "$dperm" == 700 && $n_addr -eq 13 ]] && ! grep -q '0xfa0' <<<"$out" &&
+    grep -q '^0xfa' "$T/kh-$shape/keys/TREASURY.key"; then
+    ok "new_role_keys ($shape output): 13 keys in 0600 files (dir 0700), addresses only on stdout"
+  else
+    bad "new_role_keys ($shape output): 13 keys in 0600 files (dir 0700), addresses only on stdout" "rc=$rc keys=$n_keys perms=$perms dir=$dperm addrs=$n_addr out=$out"
+  fi
+  out2=$(PATH="$T/kb-$shape/bin:$PATH" bash "$HERE/new_role_keys.sh" --dir "$T/kh-$shape/keys" 2>&1)
+  if [[ $(grep -c '^keep ' <<<"$out2") -eq 13 && $(wc -l <"$T/kh-$shape/keys/addresses.env") -eq 13 ]]; then
+    ok "new_role_keys ($shape): a second run keeps every existing key (never overwrites)"
+  else
+    bad "new_role_keys ($shape): a second run keeps every existing key (never overwrites)" "$out2"
+  fi
+done
+python3 "$HERE/make_inputs.py" --addresses "$T/kh-envelope/keys/addresses.env" >"$T/in-made.env" 2>&1 &&
+  python3 "$HERE/emit_alloc.py" --check-inputs "$T/in-made.env" >/dev/null 2>&1 && grep -qx 'R1006_INPUTS_STATUS=final' "$T/in-made.env" &&
+  ok "make_inputs: the minted addresses give a final inputs file with addresses and numbers only" ||
+  bad "make_inputs: the minted addresses give a final inputs file with addresses and numbers only" "$(cat "$T/in-made.env")"
+
 # ------------------------------------------------------------ inputs hold no key material
 printf 'R1006_INPUTS_STATUS=placeholder\nRELAYER=0x%040x\n' 7 >"$T/in-ok.env"
 expect "inputs check accepts addresses and numbers" 0 'addresses and numbers only' -- python3 "$HERE/emit_alloc.py" --check-inputs "$T/in-ok.env"

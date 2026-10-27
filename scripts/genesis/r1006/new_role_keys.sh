@@ -48,6 +48,8 @@ for role in "${ROLES[@]}"; do
 import json, os, sys
 d, role = sys.argv[1], sys.argv[2]
 w = json.load(sys.stdin)
+if isinstance(w, dict) and "data" in w:  # cast >= 1.8 wraps output in an envelope
+    w = w["data"]
 w = w[0] if isinstance(w, list) else w
 addr, key = w["address"], w["private_key"]
 fd = os.open(os.path.join(d, role + ".key"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
