@@ -238,6 +238,18 @@ pub struct ChainConfig {
     #[serde(default)]
     pub agent_precompiles_height: Option<u64>,
 
+    /// Exact-created-code activation height (`citrate_execution::exact_code`):
+    /// from this height a contract created by CREATE/CREATE2 from inside a
+    /// call is stored with its original code bytes instead of the padded form.
+    ///
+    /// A CONSENSUS PARAMETER. Absent (the default, and every shipped profile)
+    /// = not activated, byte-identical to the previous binary. A new genesis
+    /// (reroll or rehearsal profile) sets 0. Never set it on a node that
+    /// follows a chain produced without it. `CITRATE_EXACT_CREATE_CODE_HEIGHT`
+    /// overrides it.
+    #[serde(default)]
+    pub exact_create_code_height: Option<u64>,
+
     /// A local development chain. The activation height compiled into the
     /// release for this chain id (`citrate_consensus::hardening::
     /// PINNED_ACTIVATIONS`) is not applied, so dev profiles keep choosing
@@ -369,6 +381,7 @@ impl Default for NodeConfig {
                 genesis_profile: None,
                 pba_hardening_height: None,
                 agent_precompiles_height: None,
+                exact_create_code_height: None,
                 dev_profile: false,
             },
             network: NetworkConfig {
@@ -770,37 +783,9 @@ mod tests {
         );
     }
 
-    /// HUP-S7.2: the agent precompile fork height is published through its one
-    /// resolver before any execution or consensus component exists, there is
-    /// no second publication path, and no shipped profile schedules it.
-    #[test]
-    fn agent_fork_is_published_first_and_unset_in_every_shipped_profile() {
-        let main = include_str!("main.rs");
-        let start = main.find("async fn start_node(").expect("start_node");
-        let body = &main[start..];
-        let init = body
-            .find("citrate_execution::agent_fork::init_for_chain(")
-            .expect("start_node must publish the agent fork height");
-        for ctor in [
-            "GhostDag::new(",
-            "Executor::with_storage_and_chain_id(",
-            "ConsensusManifest::for_height(",
-        ] {
-            let at = body
-                .find(ctor)
-                .unwrap_or_else(|| panic!("{ctor} in start_node"));
-            assert!(
-                init < at,
-                "agent fork height must be published before {ctor}"
-            );
-        }
-        assert!(
-            !main.contains("set_agent_precompiles_height("),
-            "one publication path"
-        );
-        assert_eq!(NodeConfig::default().chain.agent_precompiles_height, None);
-        assert_eq!(NodeConfig::devnet().chain.agent_precompiles_height, None);
-        for (name, text) in [
+    /// Every node profile shipped in the repository, with its path.
+    fn shipped_profiles() -> [(&'static str, &'static str); 14] {
+        [
             (
                 "node/config/devnet.toml",
                 include_str!("../config/devnet.toml"),
@@ -857,7 +842,82 @@ mod tests {
                 "testnet-config.toml",
                 include_str!("../../testnet-config.toml"),
             ),
+        ]
+    }
+
+    /// The exact-created-code height is published through its one resolver
+    /// before any execution or consensus component exists, and no shipped
+    /// profile schedules it.
+    #[test]
+    fn exact_code_is_published_first_and_unset_in_every_shipped_profile() {
+        let main = include_str!("main.rs");
+        let start = main.find("async fn start_node(").expect("start_node");
+        let body = &main[start..];
+        let init = body
+            .find("citrate_execution::exact_code::init_for_chain(")
+            .expect("start_node must publish the exact-created-code height");
+        for ctor in [
+            "GhostDag::new(",
+            "Executor::with_storage_and_chain_id(",
+            "ConsensusManifest::for_height(",
         ] {
+            let at = body
+                .find(ctor)
+                .unwrap_or_else(|| panic!("{ctor} in start_node"));
+            assert!(
+                init < at,
+                "exact-created-code height must be published before {ctor}"
+            );
+        }
+        assert!(
+            !main.contains("set_exact_create_code_height("),
+            "one publication path"
+        );
+        assert_eq!(NodeConfig::default().chain.exact_create_code_height, None);
+        assert_eq!(NodeConfig::devnet().chain.exact_create_code_height, None);
+        for (name, text) in shipped_profiles() {
+            assert!(
+                !text.contains("exact_create_code_height"),
+                "{name} must not schedule the exact-created-code rule"
+            );
+        }
+        let base = include_str!("../config/devnet.toml");
+        let with = base.replacen("[chain]", "[chain]\nexact_create_code_height = 0", 1);
+        let cfg: NodeConfig = toml::from_str(&with).expect("key parses");
+        assert_eq!(cfg.chain.exact_create_code_height, Some(0));
+    }
+
+    /// HUP-S7.2: the agent precompile fork height is published through its one
+    /// resolver before any execution or consensus component exists, there is
+    /// no second publication path, and no shipped profile schedules it.
+    #[test]
+    fn agent_fork_is_published_first_and_unset_in_every_shipped_profile() {
+        let main = include_str!("main.rs");
+        let start = main.find("async fn start_node(").expect("start_node");
+        let body = &main[start..];
+        let init = body
+            .find("citrate_execution::agent_fork::init_for_chain(")
+            .expect("start_node must publish the agent fork height");
+        for ctor in [
+            "GhostDag::new(",
+            "Executor::with_storage_and_chain_id(",
+            "ConsensusManifest::for_height(",
+        ] {
+            let at = body
+                .find(ctor)
+                .unwrap_or_else(|| panic!("{ctor} in start_node"));
+            assert!(
+                init < at,
+                "agent fork height must be published before {ctor}"
+            );
+        }
+        assert!(
+            !main.contains("set_agent_precompiles_height("),
+            "one publication path"
+        );
+        assert_eq!(NodeConfig::default().chain.agent_precompiles_height, None);
+        assert_eq!(NodeConfig::devnet().chain.agent_precompiles_height, None);
+        for (name, text) in shipped_profiles() {
             assert!(
                 !text.contains("agent_precompiles_height"),
                 "{name} must not schedule the agent precompile fork"

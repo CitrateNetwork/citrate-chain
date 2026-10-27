@@ -35,6 +35,7 @@ pub struct FingerprintInputs<'a> {
     pub activation_gated: &'a [&'a str],
     pub pba_hardening_height: Option<u64>,
     pub agent_precompiles_height: Option<u64>,
+    pub exact_create_code_height: Option<u64>,
     pub value_transfer_activation_height: u64,
     pub create_nonce_fix_activation_height: u64,
     pub merge_depth_activation_height: u64,
@@ -81,8 +82,13 @@ pub fn fingerprint_preimage(i: &FingerprintInputs<'_>) -> String {
     );
     // HUP-S7.2: appended only when scheduled, so an unset fork keeps the
     // pre-image (and the fingerprint) byte-identical to the previous form.
-    match i.agent_precompiles_height {
+    let preimage = match i.agent_precompiles_height {
         Some(h) => format!("{preimage}agent_precompiles_height={h}\n"),
+        None => preimage,
+    };
+    // Likewise appended only when scheduled.
+    match i.exact_create_code_height {
+        Some(h) => format!("{preimage}exact_create_code_height={h}\n"),
         None => preimage,
     }
 }
@@ -127,6 +133,11 @@ pub struct ConsensusManifest {
     /// fingerprint only when set, so an unscheduled fork leaves the pre-image
     /// exactly as it was.
     pub agent_precompiles_height: Option<u64>,
+    /// The exact-created-code height this process resolved
+    /// (`citrate_execution::exact_code`; `None` = not activated, created code
+    /// is stored in the legacy padded form). Part of the fingerprint only when
+    /// set, so an unscheduled rule leaves the pre-image exactly as it was.
+    pub exact_create_code_height: Option<u64>,
     /// Execution/consensus rules that switch on by height, as this process
     /// resolved them (compiled default or devnet env override). A node whose
     /// env overrides one of these computes different roots, so they are in the
@@ -164,10 +175,25 @@ impl ConsensusManifest {
         )
     }
 
-    /// The manifest under explicit PBA and agent-fork activation heights.
+    /// The manifest under explicit PBA and agent-fork activation heights (the
+    /// exact-created-code height is read from the process store).
     pub fn for_heights(
         pba_hardening_height: Option<u64>,
         agent_precompiles_height: Option<u64>,
+    ) -> Self {
+        Self::for_activations(
+            pba_hardening_height,
+            agent_precompiles_height,
+            citrate_execution::exact_code::exact_create_code_height(),
+        )
+    }
+
+    /// The manifest under explicit PBA, agent-fork and exact-created-code
+    /// activation heights.
+    pub fn for_activations(
+        pba_hardening_height: Option<u64>,
+        agent_precompiles_height: Option<u64>,
+        exact_create_code_height: Option<u64>,
     ) -> Self {
         let version = env!("CARGO_PKG_VERSION");
         let git_sha = env!("CITRATE_GIT_SHA");
@@ -197,6 +223,7 @@ impl ConsensusManifest {
             activation_gated: &activation_gated,
             pba_hardening_height,
             agent_precompiles_height,
+            exact_create_code_height,
             value_transfer_activation_height,
             create_nonce_fix_activation_height,
             merge_depth_activation_height,
@@ -215,6 +242,7 @@ impl ConsensusManifest {
             activation_gated,
             pba_hardening_height,
             agent_precompiles_height,
+            exact_create_code_height,
             value_transfer_activation_height,
             create_nonce_fix_activation_height,
             merge_depth_activation_height,
@@ -251,6 +279,12 @@ impl ConsensusManifest {
             self.agent_precompiles_height
                 .map(|h| format!("from height {h} (0x0112 0x0113 0x0121 0x0122)"))
                 .unwrap_or_else(|| "not activated".to_string())
+        );
+        println!(
+            "  exact create code  {}",
+            self.exact_create_code_height
+                .map(|h| format!("from height {h}"))
+                .unwrap_or_else(|| "not activated (legacy padded form)".to_string())
         );
         println!(
             "  value transfer     from height {}",
@@ -353,6 +387,7 @@ mod tests {
             activation_gated: SAMPLE_GATED,
             pba_hardening_height: Some(1000),
             agent_precompiles_height: None,
+            exact_create_code_height: None,
             value_transfer_activation_height: 1,
             create_nonce_fix_activation_height: 2,
             merge_depth_activation_height: 3,
@@ -462,6 +497,13 @@ mod tests {
                 },
             ),
             (
+                "exact create code height",
+                FingerprintInputs {
+                    exact_create_code_height: Some(5),
+                    ..base
+                },
+            ),
+            (
                 "value transfer",
                 FingerprintInputs {
                     value_transfer_activation_height: 9,
@@ -521,6 +563,7 @@ mod tests {
                 activation_gated: &m.activation_gated,
                 pba_hardening_height: m.pba_hardening_height,
                 agent_precompiles_height: m.agent_precompiles_height,
+                exact_create_code_height: m.exact_create_code_height,
                 value_transfer_activation_height: m.value_transfer_activation_height,
                 create_nonce_fix_activation_height: m.create_nonce_fix_activation_height,
                 merge_depth_activation_height: m.merge_depth_activation_height,
@@ -544,6 +587,23 @@ mod tests {
                 "heights {p:?} {a:?}"
             );
         }
+    }
+
+    /// An unscheduled exact-created-code rule leaves the fingerprint exactly
+    /// as before; a scheduled one is part of it.
+    #[test]
+    fn exact_create_code_height_enters_the_fingerprint_only_when_set() {
+        let unset = ConsensusManifest::for_activations(Some(10), None, None);
+        let a = ConsensusManifest::for_activations(Some(10), None, Some(0));
+        let b = ConsensusManifest::for_activations(Some(10), None, Some(1));
+        assert_eq!(a.exact_create_code_height, Some(0));
+        assert_ne!(a.fingerprint, unset.fingerprint);
+        assert_ne!(a.fingerprint, b.fingerprint);
+        assert_eq!(
+            unset.fingerprint,
+            ConsensusManifest::for_heights(Some(10), None).fingerprint,
+            "unset: byte-identical to the two-height form"
+        );
     }
 
     #[test]
