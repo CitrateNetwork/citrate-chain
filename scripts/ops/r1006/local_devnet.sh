@@ -102,7 +102,9 @@ run_step() {
 for s in $STEPS; do
   case "$s" in
     genesis-fill)
-      run_step genesis-fill --fill-cmd "${FILL_CMD:-python3 $FILL --producers {producers} --stakes {stakes} --out {out} --bin $WORK/state/bin/citrate-node}" ;;
+      fc="$FILL_CMD"
+      [[ -n "$fc" ]] || fc="python3 $FILL --producers {producers} --stakes {stakes} --out {out} --bin $WORK/state/bin/citrate-node"
+      run_step genesis-fill --fill-cmd "$fc" ;;
     distribute) run_step distribute ;;
     start) run_step start --mining on --gate-minutes "$GATE" ;;
     smoke) run_step smoke --skip "$SKIP" ;;
