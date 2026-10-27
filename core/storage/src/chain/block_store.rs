@@ -85,6 +85,21 @@ impl BlockStore {
 
     /// Store a complete block
     pub fn put_block(&self, block: &Block) -> Result<()> {
+        self.put_block_inner(block, true)
+    }
+
+    /// Store a RECEIVED block during catch-up without forcing an fsync of its
+    /// own. The batch is the same and just as atomic; the block becomes
+    /// durable with the next synced write (every column family shares one
+    /// RocksDB write-ahead log), which on the receive path is the applied
+    /// state commit that follows it. A block lost to a power loss before that
+    /// is simply fetched again. Producer and finality paths use
+    /// [`Self::put_block`].
+    pub fn put_block_unsynced(&self, block: &Block) -> Result<()> {
+        self.put_block_inner(block, false)
+    }
+
+    fn put_block_inner(&self, block: &Block, sync: bool) -> Result<()> {
         // FUA-CHAIN-01: hold the put lock across the read-modify-writes
         // (children lists + latest height) and the batch commit so
         // concurrent ingest cannot lose DAG child links or regress the
@@ -158,7 +173,12 @@ impl BlockStore {
         // as the OS page cache accepts the write — a power loss between
         // RPC ack and OS flush silently rolled back finalised state.
         // `write_batch_sync` forces RocksDB::WriteOptions::set_sync(true).
-        self.db.write_batch_sync(batch)?;
+        // (`put_block_unsynced` is the catch-up receive path; see there.)
+        if sync {
+            self.db.write_batch_sync(batch)?;
+        } else {
+            self.db.write_batch(batch)?;
+        }
 
         // Update the in-memory cache only after the batch commits.
         if new_height > prior_height {
