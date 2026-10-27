@@ -23,6 +23,76 @@ use sha2::{Digest, Sha256};
 use crate::registry_sync::{EPOCH, SNAPSHOT_LAG};
 use citrate_execution::block_rewards::CANONICAL_BASE_FEE_PER_GAS;
 
+/// Every value the consensus fingerprint is computed from. The fingerprint is a
+/// pure function of these fields (see [`fingerprint_preimage`]), so tests can vary
+/// one input at a time, including the compile-time feature flags.
+#[derive(Debug, Clone, Copy)]
+pub struct FingerprintInputs<'a> {
+    pub git_sha: &'a str,
+    pub feat_halo2_verifier: bool,
+    /// Rendered as the 0x0130 mode: `gated` when compiled in, else `absent`.
+    pub feat_commd_fold_verify: bool,
+    pub activation_gated: &'a [&'a str],
+    pub pba_hardening_height: Option<u64>,
+    pub agent_precompiles_height: Option<u64>,
+    pub value_transfer_activation_height: u64,
+    pub create_nonce_fix_activation_height: u64,
+    pub merge_depth_activation_height: u64,
+    pub canonical_base_fee_per_gas: u64,
+    pub epoch: u64,
+    pub snapshot_lag: u64,
+}
+
+/// Canonical, order-stable pre-image of the consensus-affecting surface.
+/// Deliberately EXCLUDES build_target (arch must not change consensus) and
+/// git_dirty (provenance, surfaced separately as a hard blocker).
+///
+/// v2 pre-image: v1's fields, with 0x0130 reported as activation-gated and the
+/// gated rule set listed, so a diff against a v1 (fleet) manifest shows exactly
+/// which differences wait for the height. Changing this text changes every
+/// fingerprint: `fingerprint_golden_vector_is_pinned` fails until it is updated
+/// on purpose.
+pub fn fingerprint_preimage(i: &FingerprintInputs<'_>) -> String {
+    let commd_mode = if i.feat_commd_fold_verify {
+        "gated"
+    } else {
+        "absent"
+    };
+    let preimage = format!(
+        "citrate-consensus-v3\ngit_sha={}\nhalo2_verifier={}\n\
+         commd_fold_verify={commd_mode}\nactivation_gated={}\n\
+         pba_hardening_height={}\n\
+         value_transfer_height={}\n\
+         create_nonce_fix_height={}\n\
+         merge_depth_height={}\n\
+         base_fee={}\nepoch={}\nsnapshot_lag={}\n",
+        i.git_sha,
+        i.feat_halo2_verifier,
+        i.activation_gated.join("|"),
+        i.pba_hardening_height
+            .map(|h| h.to_string())
+            .unwrap_or_else(|| "unset".to_string()),
+        i.value_transfer_activation_height,
+        i.create_nonce_fix_activation_height,
+        i.merge_depth_activation_height,
+        i.canonical_base_fee_per_gas,
+        i.epoch,
+        i.snapshot_lag,
+    );
+    // HUP-S7.2: appended only when scheduled, so an unset fork keeps the
+    // pre-image (and the fingerprint) byte-identical to the previous form.
+    match i.agent_precompiles_height {
+        Some(h) => format!("{preimage}agent_precompiles_height={h}\n"),
+        None => preimage,
+    }
+}
+
+/// `0x` + the first 16 bytes of sha256 over [`fingerprint_preimage`].
+pub fn fingerprint_of(i: &FingerprintInputs<'_>) -> String {
+    let digest = Sha256::digest(fingerprint_preimage(i).as_bytes());
+    format!("0x{}", hex::encode(digest.get(..16).unwrap_or(&digest)))
+}
+
 /// The compile-time consensus surface of this binary.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConsensusManifest {
@@ -111,46 +181,29 @@ impl ConsensusManifest {
         let feat_commd_fold_verify = env!("CITRATE_FEAT_COMMD_FOLD") == "1"
             || citrate_execution::build_features::COMMD_FOLD_VERIFY;
 
-        // Canonical, order-stable pre-image of the consensus-affecting surface.
-        // Deliberately EXCLUDES build_target (arch must not change consensus) and
-        // git_dirty (provenance, surfaced separately as a hard blocker).
+        // The pre-image is built by `fingerprint_preimage` from these values only.
         let activation_gated: Vec<&'static str> =
             citrate_execution::build_features::ACTIVATION_GATED.to_vec();
-        // v2 pre-image: v1's fields, with 0x0130 reported as activation-gated
-        // and the gated rule set listed, so a diff against a v1 (fleet)
-        // manifest shows exactly which differences wait for the height.
         let value_transfer_activation_height =
             citrate_execution::executor::value_transfer_activation_height();
         let create_nonce_fix_activation_height =
             citrate_execution::executor::create_nonce_fix_activation_height();
         let merge_depth_activation_height =
             citrate_consensus::ghostdag::merge_depth_activation_height();
-        let commd_mode = if feat_commd_fold_verify {
-            "gated"
-        } else {
-            "absent"
-        };
-        let preimage = format!(
-            "citrate-consensus-v3\ngit_sha={git_sha}\nhalo2_verifier={feat_halo2_verifier}\n\
-             commd_fold_verify={commd_mode}\nactivation_gated={}\n\
-             pba_hardening_height={}\n\
-             value_transfer_height={value_transfer_activation_height}\n\
-             create_nonce_fix_height={create_nonce_fix_activation_height}\n\
-             merge_depth_height={merge_depth_activation_height}\n\
-             base_fee={CANONICAL_BASE_FEE_PER_GAS}\nepoch={EPOCH}\nsnapshot_lag={SNAPSHOT_LAG}\n",
-            activation_gated.join("|"),
-            pba_hardening_height
-                .map(|h| h.to_string())
-                .unwrap_or_else(|| "unset".to_string()),
-        );
-        // HUP-S7.2: appended only when scheduled, so an unset fork keeps the
-        // pre-image (and the fingerprint) byte-identical to the previous form.
-        let preimage = match agent_precompiles_height {
-            Some(h) => format!("{preimage}agent_precompiles_height={h}\n"),
-            None => preimage,
-        };
-        let digest = Sha256::digest(preimage.as_bytes());
-        let fingerprint = format!("0x{}", hex::encode(digest.get(..16).unwrap_or(&digest)));
+        let fingerprint = fingerprint_of(&FingerprintInputs {
+            git_sha,
+            feat_halo2_verifier,
+            feat_commd_fold_verify,
+            activation_gated: &activation_gated,
+            pba_hardening_height,
+            agent_precompiles_height,
+            value_transfer_activation_height,
+            create_nonce_fix_activation_height,
+            merge_depth_activation_height,
+            canonical_base_fee_per_gas: CANONICAL_BASE_FEE_PER_GAS,
+            epoch: EPOCH,
+            snapshot_lag: SNAPSHOT_LAG,
+        });
 
         Self {
             version,
@@ -287,6 +340,210 @@ mod tests {
             unset.fingerprint,
             ConsensusManifest::for_heights(Some(10), None).fingerprint
         );
+    }
+
+    const SAMPLE_GATED: &[&str] = &["rule-a", "rule-b"];
+
+    /// Fixed inputs for the pure-function tests (independent of the build).
+    fn sample(feat_commd_fold_verify: bool) -> FingerprintInputs<'static> {
+        FingerprintInputs {
+            git_sha: "0123abc",
+            feat_halo2_verifier: false,
+            feat_commd_fold_verify,
+            activation_gated: SAMPLE_GATED,
+            pba_hardening_height: Some(1000),
+            agent_precompiles_height: None,
+            value_transfer_activation_height: 1,
+            create_nonce_fix_activation_height: 2,
+            merge_depth_activation_height: 3,
+            canonical_base_fee_per_gas: 1_000_000_000,
+            epoch: 1000,
+            snapshot_lag: 200,
+        }
+    }
+
+    /// The 0x0130 mode is part of the pre-image: the two modes are written out
+    /// and give different fingerprints. A build with and without
+    /// commd-fold-verify must never report the same fingerprint.
+    #[test]
+    fn commd_mode_enters_the_fingerprint() {
+        let gated = sample(true);
+        let absent = sample(false);
+        assert!(
+            fingerprint_preimage(&gated).contains("\ncommd_fold_verify=gated\n"),
+            "pre-image must name the 0x0130 mode when the feature is compiled in"
+        );
+        assert!(
+            fingerprint_preimage(&absent).contains("\ncommd_fold_verify=absent\n"),
+            "pre-image must name the 0x0130 mode when the feature is absent"
+        );
+        assert_ne!(
+            fingerprint_of(&gated),
+            fingerprint_of(&absent),
+            "the two 0x0130 modes must not share a fingerprint"
+        );
+    }
+
+    /// Golden vectors: the exact pre-image text and fingerprint for fixed inputs.
+    /// The expected digests were computed independently (python3 hashlib.sha256
+    /// over the literal pre-image below). Any change to what the fingerprint
+    /// covers, or how it is written, fails here and must be made on purpose.
+    #[test]
+    fn fingerprint_golden_vector_is_pinned() {
+        let expected_gated = "citrate-consensus-v3\ngit_sha=0123abc\nhalo2_verifier=false\n\
+            commd_fold_verify=gated\nactivation_gated=rule-a|rule-b\n\
+            pba_hardening_height=1000\nvalue_transfer_height=1\ncreate_nonce_fix_height=2\n\
+            merge_depth_height=3\nbase_fee=1000000000\nepoch=1000\nsnapshot_lag=200\n";
+        assert_eq!(fingerprint_preimage(&sample(true)), expected_gated);
+        assert_eq!(
+            fingerprint_of(&sample(true)),
+            "0x997452c0b05b6e1c5872e0735dade13b"
+        );
+        assert_eq!(
+            fingerprint_of(&sample(false)),
+            "0xf94e43b6bcacef7a0c72088f5cc57a49"
+        );
+    }
+
+    /// Every input moves the fingerprint, and no two single-field changes
+    /// collide with each other or with the base.
+    #[test]
+    fn every_fingerprint_input_changes_the_fingerprint() {
+        let base = sample(true);
+        let other_gated: &[&str] = &["rule-a"];
+        let variants: Vec<(&str, FingerprintInputs<'_>)> = vec![
+            (
+                "git_sha",
+                FingerprintInputs {
+                    git_sha: "0123abd",
+                    ..base
+                },
+            ),
+            (
+                "halo2",
+                FingerprintInputs {
+                    feat_halo2_verifier: true,
+                    ..base
+                },
+            ),
+            (
+                "commd mode",
+                FingerprintInputs {
+                    feat_commd_fold_verify: false,
+                    ..base
+                },
+            ),
+            (
+                "activation_gated",
+                FingerprintInputs {
+                    activation_gated: other_gated,
+                    ..base
+                },
+            ),
+            (
+                "pba height",
+                FingerprintInputs {
+                    pba_hardening_height: Some(1001),
+                    ..base
+                },
+            ),
+            (
+                "pba unset",
+                FingerprintInputs {
+                    pba_hardening_height: None,
+                    ..base
+                },
+            ),
+            (
+                "agent height",
+                FingerprintInputs {
+                    agent_precompiles_height: Some(5),
+                    ..base
+                },
+            ),
+            (
+                "value transfer",
+                FingerprintInputs {
+                    value_transfer_activation_height: 9,
+                    ..base
+                },
+            ),
+            (
+                "create nonce",
+                FingerprintInputs {
+                    create_nonce_fix_activation_height: 9,
+                    ..base
+                },
+            ),
+            (
+                "merge depth",
+                FingerprintInputs {
+                    merge_depth_activation_height: 9,
+                    ..base
+                },
+            ),
+            (
+                "base fee",
+                FingerprintInputs {
+                    canonical_base_fee_per_gas: 7,
+                    ..base
+                },
+            ),
+            ("epoch", FingerprintInputs { epoch: 999, ..base }),
+            (
+                "snapshot lag",
+                FingerprintInputs {
+                    snapshot_lag: 199,
+                    ..base
+                },
+            ),
+        ];
+        let mut seen = std::collections::HashMap::new();
+        seen.insert(fingerprint_of(&base), "base");
+        for (name, v) in &variants {
+            if let Some(prev) = seen.insert(fingerprint_of(v), name) {
+                panic!("changing `{name}` gives the same fingerprint as `{prev}`");
+            }
+        }
+    }
+
+    /// The manifest's own fingerprint is exactly the pure function over the
+    /// fields it reports, so the tests above cover the shipped value and a
+    /// field cannot be reported while a different value is hashed.
+    #[test]
+    fn manifest_fingerprint_is_the_pure_function_of_its_fields() {
+        for (p, a) in [(None, None), (Some(0), None), (Some(10), Some(500))] {
+            let m = ConsensusManifest::for_heights(p, a);
+            let inputs = FingerprintInputs {
+                git_sha: m.git_sha,
+                feat_halo2_verifier: m.feat_halo2_verifier,
+                feat_commd_fold_verify: m.feat_commd_fold_verify,
+                activation_gated: &m.activation_gated,
+                pba_hardening_height: m.pba_hardening_height,
+                agent_precompiles_height: m.agent_precompiles_height,
+                value_transfer_activation_height: m.value_transfer_activation_height,
+                create_nonce_fix_activation_height: m.create_nonce_fix_activation_height,
+                merge_depth_activation_height: m.merge_depth_activation_height,
+                canonical_base_fee_per_gas: m.canonical_base_fee_per_gas,
+                epoch: m.epoch,
+                snapshot_lag: m.snapshot_lag,
+            };
+            assert_eq!(
+                m.fingerprint,
+                fingerprint_of(&inputs),
+                "heights {p:?} {a:?}"
+            );
+            // Flipping only the reported 0x0130 mode must not reproduce it.
+            let flipped = FingerprintInputs {
+                feat_commd_fold_verify: !m.feat_commd_fold_verify,
+                ..inputs
+            };
+            assert_ne!(
+                m.fingerprint,
+                fingerprint_of(&flipped),
+                "heights {p:?} {a:?}"
+            );
+        }
     }
 
     #[test]
