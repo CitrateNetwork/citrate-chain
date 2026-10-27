@@ -78,24 +78,6 @@ pub struct ReceivedBlocks {
 /// waiting; the rest is headroom for unsolicited answers.
 pub const ADMIT_QUEUE: usize = 64;
 
-/// A follower this far behind the best known network height is catching up:
-/// it uses the catch-up group commit (see `BlockAdmission::
-/// set_catchup_group_commit`). Far above the reorg window (100) and the
-/// finality depth, so a node near the tip always fsyncs every block.
-pub const CATCHUP_GAP: u64 = 1_024;
-
-/// Received blocks per fsync while catching up.
-pub const CATCHUP_GROUP_COMMIT: u64 = 64;
-
-/// The group-commit size for a node `gap` blocks behind.
-pub fn catchup_group_commit_for_gap(gap: u64) -> u64 {
-    if gap > CATCHUP_GAP {
-        CATCHUP_GROUP_COMMIT
-    } else {
-        1
-    }
-}
-
 /// What one `Blocks` response did.
 #[derive(Debug, Clone)]
 pub struct IngestReport {
@@ -316,10 +298,6 @@ impl SyncDriver {
             validated: mut pending,
         } = received;
         let pid = &pid;
-        let (_, applied_before) = applied_tip(storage);
-        admission.set_catchup_group_commit(catchup_group_commit_for_gap(
-            target.saturating_sub(applied_before),
-        ));
         let fresh: HashSet<Hash> = pending.iter().map(|b| b.header.block_hash).collect();
         // CHAIN-B-A005: only re-scan the orphan buffer when this batch
         // actually delivered something new.
@@ -927,19 +905,6 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(default)
-    }
-
-    #[test]
-    fn group_commit_only_while_far_behind() {
-        assert_eq!(catchup_group_commit_for_gap(0), 1);
-        assert_eq!(catchup_group_commit_for_gap(CATCHUP_GAP), 1);
-        assert_eq!(
-            catchup_group_commit_for_gap(CATCHUP_GAP + 1),
-            CATCHUP_GROUP_COMMIT
-        );
-        // Near the tip a node must fsync every block: well clear of the reorg
-        // window and the finality depth.
-        const { assert!(CATCHUP_GAP > 10 * 100) };
     }
 
     /// Catch-up floor, applied blocks per second. The old driver could not

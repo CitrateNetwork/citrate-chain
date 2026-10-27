@@ -283,9 +283,6 @@ pub struct BlockAdmission {
     /// `(height, hash)`. Resolved once the genesis block is stored; a block at
     /// a listed height with another hash is refused like a withdrawn one.
     checkpoints: std::sync::OnceLock<Vec<(u64, Hash)>>,
-    /// Follower catch-up: received blocks are stored without an fsync of their
-    /// own (see `BlockStore::put_block_unsynced`). Set by the sync driver.
-    catching_up: std::sync::atomic::AtomicBool,
 }
 
 /// Cap on withdrawn hashes held in memory; descendants past it are refused as
@@ -309,7 +306,6 @@ impl BlockAdmission {
             pruned_log: LogBudget::new(PRUNED_LOG_PER_WINDOW, LOG_WINDOW_SECS),
             withdrawn,
             checkpoints: std::sync::OnceLock::new(),
-            catching_up: std::sync::atomic::AtomicBool::new(false),
         }
         .log_withdrawn()
     }
@@ -323,19 +319,6 @@ impl BlockAdmission {
         Self {
             checkpoints: cell,
             ..self
-        }
-    }
-
-    /// Follower catch-up durability. `every > 1` while the node is far behind
-    /// the network: received blocks are stored without their own fsync and the
-    /// applied state is fsynced every `every` blocks (each block is still one
-    /// atomic state + tip batch). `every <= 1` restores an fsync per write.
-    /// Validity is untouched: this only changes when bytes reach the disk.
-    pub fn set_catchup_group_commit(&self, every: u64) {
-        self.catching_up
-            .store(every > 1, std::sync::atomic::Ordering::SeqCst);
-        if let Some(app) = &self.applicator {
-            app.set_catchup_group_commit(every);
         }
     }
 
@@ -633,14 +616,7 @@ impl BlockAdmission {
         if !in_chain {
             // R3: never `let _ =`. A discarded error here is indistinguishable
             // from a crash and produces the identical permanent hole.
-            // Catch-up: no fsync of its own; durable with the applied state
-            // commit that follows (see `set_catchup_group_commit`).
-            let put = if self.catching_up.load(std::sync::atomic::Ordering::SeqCst) {
-                self.storage.blocks.put_block_unsynced(block)
-            } else {
-                self.storage.blocks.put_block(block)
-            };
-            if let Err(e) = put {
+            if let Err(e) = self.storage.blocks.put_block(block) {
                 return AdmitOutcome::Rejected(format!("chain put_block: {e}"));
             }
         }
@@ -952,51 +928,6 @@ mod tests {
 
     fn fully_admitted(storage: &StorageManager, dag_has: bool, b: &Block) -> bool {
         storage.blocks.has_block(&b.header.block_hash).unwrap() && dag_has
-    }
-
-    /// Catch-up: a received block is stored without its own fsync; outside
-    /// catch-up (the default) it keeps one.
-    #[tokio::test]
-    async fn catchup_stores_received_blocks_without_their_own_fsync() {
-        let (adm, storage, _dag, _d) = harness();
-        let chain = [root(), mk(1, root().header.block_hash, 1, [0x5A; 32])];
-        let b2 = mk(2, chain[1].header.block_hash, 2, [0x5A; 32]);
-        adm.admit(&chain[0]).await;
-
-        let (s0, n0) = (
-            storage.db.write_batch_sync_count(),
-            storage.db.write_batch_count(),
-        );
-        adm.admit(&chain[1]).await;
-        assert_eq!(
-            (
-                storage.db.write_batch_sync_count() - s0,
-                storage.db.write_batch_count() - n0
-            ),
-            (1, 0),
-            "default: the block write is fsynced"
-        );
-
-        adm.set_catchup_group_commit(64);
-        let (s1, n1) = (
-            storage.db.write_batch_sync_count(),
-            storage.db.write_batch_count(),
-        );
-        assert_eq!(
-            adm.admit(&b2).await,
-            AdmitOutcome::Admitted {
-                completed_partial: false
-            }
-        );
-        assert_eq!(
-            (
-                storage.db.write_batch_sync_count() - s1,
-                storage.db.write_batch_count() - n1
-            ),
-            (0, 1),
-            "catch-up: the block write skips its own fsync"
-        );
-        assert!(storage.blocks.has_block(&b2.header.block_hash).unwrap());
     }
 
     #[tokio::test]
