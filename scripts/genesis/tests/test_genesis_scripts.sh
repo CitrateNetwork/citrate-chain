@@ -11,7 +11,14 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 G="$(cd "$HERE/.." && pwd)"
 T="$(mktemp -d)"
-trap 'rm -rf "$T"' EXIT
+trap 'rm -rf "${T:?}"' EXIT
+# Sandboxed HOME: nothing under test writes the real home. Only the compiler cache (solc
+# under ~/.svm, read by forge and find_solc) is shared; ~/.foundry (keystores) is not.
+REAL_HOME="$HOME"
+export HOME="$T/home"
+mkdir -p "$HOME"
+[[ -d "$REAL_HOME/.svm" ]] && ln -s "$REAL_HOME/.svm" "$HOME/.svm"
+export RUSTUP_HOME="${RUSTUP_HOME:-$REAL_HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$REAL_HOME/.cargo}"
 
 PASS=0
 FAIL=0
@@ -339,7 +346,7 @@ run_json 2000 Alpha "$(addr 777)" >"$T/broadcast/DeployX.s.sol/31337/run-latest.
 expect "keep: another chain's broadcast is ignored" 0 'no chain-40204 broadcast' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST"
 rm "$BC/run-latest.json"
 expect "keep: only another chain's broadcasts is no evidence" 1 'no chain-40204 broadcast run in scope' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST"
-rm -r "$T/broadcast/DeployX.s.sol/31337"
+rm -r "${T:?}/broadcast/DeployX.s.sol/31337"
 expect "keep: a BROADCAST_DIR that does not exist fails" 1 'is not a directory; no broadcast evidence' -- env RPC=http://r1 BROADCAST_DIR="$T/no-such-broadcast" bash "$KC" verify "$LIST"
 # A run from an earlier chain on the same chain id (before block 0) is ignored with BROADCAST_SINCE.
 run_json 1000 Alpha "$(addr 777)" >"$BC/run-1000.json"
@@ -377,7 +384,7 @@ mkdir -p "$T/broadcast/multi/DeployX.s.sol-latest"
 printf '{}' >"$T/broadcast/multi/DeployX.s.sol-latest/run.json"
 run_json 2000 Other "$(addr 777)" >"$BC/run-latest.json"
 expect "keep: a multi-chain broadcast is not accepted as evidence" 1 'multi-chain broadcasts' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST"
-rm -r "$T/broadcast/multi"
+rm -r "${T:?}/broadcast/multi"
 printf '{not json' >"$BC/run-latest.json"
 expect "keep: an unreadable broadcast fails" 1 'unreadable broadcast' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" bash "$KC" verify "$LIST"
 printf '{"transactions":[{"transactionType":"CREATE","contractName":"Alpha"}]}' >"$BC/run-latest.json"
@@ -412,13 +419,13 @@ schema_case "a non-string contract address" '{"timestamp":2000,"transactions":[{
 printf '{"transactions":[]}' >"$T/broadcast/AAA.s.sol/40204/run-latest.json"
 run_json 2000 Other "$(addr 777)" >"$T/broadcast/ZZZ.s.sol/40204/run-latest.json"
 expect "keep: a run with no timestamp fails when BROADCAST_SINCE scopes the evidence" 1 'no timestamp to compare' -- env RPC=http://r1 BROADCAST_DIR="$T/broadcast" BROADCAST_SINCE=1500 bash "$KC" verify "$LIST"
-rm -r "$T/broadcast/AAA.s.sol" "$T/broadcast/ZZZ.s.sol"
+rm -r "${T:?}/broadcast/AAA.s.sol" "${T:?}/broadcast/ZZZ.s.sol"
 # Other helper failures fail the gate too.
 printf '{not json' >"$T/badbook.json"
 expect "keep: an unreadable address book fails" 1 'book.contracts moved: want 0x[0-9a-f]+ got BOOK-ERROR' -- env RPC=http://r1 ADDRESS_BOOK="$T/badbook.json" bash "$KC" verify "$LIST"
 expect "keep: a failing keccak fails" 1 'code changed: .* got KECCAK-ERROR' -- env RPC=http://r1 FAKE_KECCAK_FAIL=1 bash "$KC" verify "$LIST"
 expect "keep: keys on an unreadable book is an input error" 2 'cannot read sections' -- env ADDRESS_BOOK="$T/badbook.json" BROADCAST_DIR="$T/broadcast" bash "$KC" keys contracts
-rm -r "$T/broadcast"
+rm -r "${T:?}/broadcast"
 
 # Contract names come from the broadcasts, never from the book key (Codex r6 on chain#329).
 # emit-address-table.sh renames the EduStack Forwarder to EduForwarder in the book, so a KEEP
@@ -469,7 +476,7 @@ expect "keep: a KEEP row name with no deployment at its pin fails" 1 'no in-scop
 # A - row (Beta, no deployment at pin time) that the genesis broadcasts DO deploy: fail.
 printf '{"timestamp":1500,"transactions":[{"transactionType":"CREATE2","contractName":"Beta","contractAddress":"%s"}]}' "$A2" >"$GBC/Later.s.sol/40204/run-latest.json"
 expect "keep: a deployment at a - row's pinned address fails" 1 'deploys Beta at 0x0+a2, the pinned address of Beta whose KEEP row names -' -- env RPC=http://r1 ADDRESS_BOOK="$ABOOK" BROADCAST_DIR="$GBC" bash "$KC" verify "$APIN"
-rm -r "$RBC" "$GBC"
+rm -r "${RBC:?}" "${GBC:?}"
 
 # A deployment forge records without a contract name: the P-256 verifier, which
 # aa/DeployP256Verifier.s.sol deploys from vendored init code through the CREATE2 factory
@@ -541,7 +548,7 @@ expect "keep nameless: verify fails a nameless record that does not prove its ad
 # A nameless plain CREATE (no factory) cannot prove its address from the record either.
 printf '{"timestamp":1791264990000,"transactions":[{"hash":"0x33","transactionType":"CREATE","contractName":null,"contractAddress":"%s","transaction":{"to":null,"input":"0x6001"}}]}' "$(addr 4321)" >"$PBC/Later.s.sol/40204/run-latest.json"
 expect "keep nameless: verify fails a nameless plain CREATE" 1 'not a CREATE2 factory call' -- env RPC=http://r1 ADDRESS_BOOK="$PBOOK" BROADCAST_DIR="$PBC" bash "$KC" verify "$PPIN"
-rm -r "$PBC" "$FAKE/code/$P256"
+rm -r "${PBC:?}" "${FAKE:?}/code/$P256"
 
 reset_calls
 expect "keep: --dry-run needs no RPC" 0 'KEEP dry run OK \(3 entries' -- bash "$KC" verify --dry-run "$LIST"
@@ -623,7 +630,7 @@ expect "fleet: no endpoints is a usage error" 2 'at least one RPC' -- bash "$FA"
 # ------------------------------------------------------------------ reset_node
 RN="$G/reset_node.sh"
 setup_node() {
-  rm -rf "$T/node"
+  rm -rf "${T:?}/node"
   mkdir -p "$T/node/home/.citrate/models" "$T/node/home/bin" "$T/node/dropin" "$T/node/home/.citrate/chaindata"
   local d="$T/node/home/.citrate"
   printf 'n' >"$d/noise.key"
@@ -766,7 +773,7 @@ council_chain() {
   local tl="$1" ms="$2" d="$3" t="$4" i list=""
   shift 4
   for i in "$@"; do list+="${list:+, }$(addr "$i")"; done
-  rm -rf "$FAKE/call/$(printf '%s' "$tl" | tr 'A-F' 'a-f')" "$FAKE/call/$(printf '%s' "$ms" | tr 'A-F' 'a-f')"
+  rm -rf "${FAKE:?}/call/$(printf '%s' "${tl:?}" | tr 'A-F' 'a-f')" "$FAKE/call/$(printf '%s' "$ms" | tr 'A-F' 'a-f')"
   fake_call "$tl" getMinDelay "$d [1e5]"
   fake_call "$tl" "hasRole_${PROPOSER}_$(printf '%s' "$ms" | tr 'A-F' 'a-f')" true
   fake_call "$ms" timelock "$tl"
@@ -948,7 +955,7 @@ expect "phase inputs tripwire: a set key nothing assigns is flagged" 1 'SIGNER_1
 mv "$TW/contracts/script/DeployAIGateway.s.sol" "$T/aig.aside"
 expect "phase inputs tripwire: a P2 step whose script is missing is flagged" 1 'P2 runs contracts/script/DeployAIGateway.s.sol, which is missing' -- pi_tw
 mv "$T/aig.aside" "$TW/contracts/script/DeployAIGateway.s.sol"
-rm -r "$TW"
+rm -r "${TW:?}"
 
 # simulate: P5 reads the admin report
 mkdir -p "$(rpcdir http://127.0.0.1:8545)"
@@ -1101,7 +1108,7 @@ else
   bad "ceremony P0 inputs: a missing P2 input stops a fresh run at P0, before P1 (no forge, no manifest) (exit $rc)" "$out
 $(calls)"
 fi
-rm -rf "$P0FRESH"
+rm -rf "${P0FRESH:?}"
 for v in SIGNER_1 SIGNER_2 SIGNER_3 RELAYER CITRATE_AA_OWNER CITRATE_AA_IDENTITY_SIGNER CITRATE_AA_SPONSOR_SIGNER MEMBERSHIP_GRANTOR; do
   expect "ceremony P0 inputs: P2 without $v is refused at P0" 3 "GATE FAIL at P0: phase inputs: .*$v is not set" -- "${CEENV[@]}" "$v=" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P2
 done
@@ -1149,7 +1156,7 @@ if grep -q 'P0 preflight PASS' <<<"$out" && ! grep -q 'GATE FAIL at P0' <<<"$out
 else
   bad "ceremony P0 inputs: a fresh run does not need P4's late inputs at P0" "$out"
 fi
-rm -rf "$P0FRESH"
+rm -rf "${P0FRESH:?}"
 # A fresh run refuses to start over an earlier run's manifest, and writes its own at P0.
 expect "ceremony: a fresh run refuses an existing run manifest" 3 'ceremony-run.json already exists' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$GB" bash -c "mv '$GB/governance.json' '$T/gov.aside'; bash '$CE' --simulate; rc=\$?; mv '$T/gov.aside' '$GB/governance.json'; exit \$rc"
 FRESH="$REPO/contracts/genesis/fresh"
@@ -1160,7 +1167,7 @@ if python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); sys.exit(0 if (m
 else
   bad "ceremony: the manifest records the run's deployer, chain and block 0" "$(cat "$FRESH/ceremony-run.json" 2>&1)"
 fi
-rm -r "$FRESH"
+rm -r "${FRESH:?}"
 
 # P6 integration: the genesis replay's own broadcasts (deployments at the pinned addresses,
 # recorded after block 0) pass; a stale run from an earlier chain on the same id is ignored.
@@ -1262,7 +1269,7 @@ reset_calls
 expect "ceremony C9: P1 runs with no deployer alias preset" 0 'done \(mode=simulate\)' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$C9D" bash "$CE" --simulate --only P1
 calls | grep -q "^forge-deployer dep=$DEP ceremony=$DEP$" && ok "ceremony C9: forge phases get CEREMONY_DEPLOYER_ADDRESS = the run's deployer" ||
   bad "ceremony C9: forge phases get CEREMONY_DEPLOYER_ADDRESS = the run's deployer" "$(calls)"
-rm -rf "$C9D"
+rm -rf "${C9D:?}"
 # --password-file reaches P2 (regenesis.sh, then forge) as a path: the password itself never
 # appears in a child's argv, in its environment or in the ceremony's output. The password is a
 # throwaway string in a file under this test's temp dir.
@@ -1449,7 +1456,7 @@ expect "ceremony G9: the dry run plans P2 with --genesis-membership" 0 'DRYRUN .
 mv "$REPO/contracts/script/DeployGenesisMembership.s.sol" "$T/dgm.moved"
 expect "ceremony G9: P0 refuses a tree without #331's DeployGenesisMembership" 3 'DeployGenesisMembership.s.sol is missing .*chain#331' -- "${CEENV[@]}" bash "$CE" --only P0
 mv "$T/dgm.moved" "$REPO/contracts/script/DeployGenesisMembership.s.sol"
-rm -rf "$RG"
+rm -rf "${RG:?}"
 # C10 tripwire: the ceremony refuses a second P2 by finding this run's broadcasts of the scripts
 # in P2_BROADCAST_SCRIPTS, so that list must be every script regenesis.sh broadcasts. A
 # run_step added to regenesis.sh without the list fails here (negative control below).
@@ -1494,12 +1501,12 @@ C9ENV=("${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" 
 # c9_setup: a --confirm run after P1 (manifest, governance on chain, fee recipients = the
 # TREASURY), before P2 has sent anything (no broadcast recorded yet).
 c9_setup() {
-  rm -rf "$REPO/contracts/broadcast"
+  rm -rf "${REPO:?}/contracts/broadcast"
   cp "$T/book.c9.orig" "$GBK"
   mk_manifest "$GB" "$DEP" confirm deployer
   gov_book "$GB" "$DEP"
   gov_chain
-  rm -rf "$FAKE/call/$C9X" "$FAKE/call/$C9MM" "$FAKE/call/$C9CM"
+  rm -rf "${FAKE:?}/call/$C9X" "${FAKE:?}/call/$C9MM" "${FAKE:?}/call/$C9CM"
   fake_call "$C9X" treasury "$(addr 90)"
   fake_call "$C9MM" treasuryAddress "$(addr 90)"
   fake_call "$C9CM" treasury "$(addr 90)"
@@ -1549,7 +1556,7 @@ cp "$T/book.c9.orig" "$GBK"
 for how in replace chmod symlink; do
   c9_setup
   reset_calls
-  rm -rf "$PWD_DIR/p2" "$FAKE/pw-swapped"
+  rm -rf "${PWD_DIR:?}/p2" "${FAKE:?}/pw-swapped"
   mkdir -m 700 "$PWD_DIR/p2"
   (umask 077 && printf '%s\n' "$PW_STR" >"$PWD_DIR/p2/pw" && printf 'y\n' >"$PWD_DIR/p2/target")
   out=$("${C9ENV[@]}" FAKE_PW_SWAP="$PWD_DIR/p2/pw" FAKE_PW_SWAP_HOW="$how" bash "$CE" --confirm --only P2 --account deployer --password-file "$PWD_DIR/p2/pw" 2>&1)
@@ -1561,7 +1568,7 @@ for how in replace chmod symlink; do
   fi
   cp "$T/book.c9.orig" "$GBK"
 done
-rm -rf "$PWD_DIR/p2" "$FAKE/pw-swapped"
+rm -rf "${PWD_DIR:?}/p2" "${FAKE:?}/pw-swapped"
 # One canonical spelling on the compare side: the gate compares canonical (lowercase) books, so
 # a book that spells an address in another case is the same book as the generator's.
 C9B_MIXED="$T/c9-book-mixed.json"
@@ -1610,7 +1617,7 @@ manifest_has_t stackBook && ok "ceremony recovery: the record step records the s
 # Once the book is recorded, P2 is done: an explicit refusal, before anything is sent, whether
 # or not the broadcasts are still on disk.
 for keep in yes no; do
-  [[ "$keep" == yes ]] || rm -rf "$REPO/contracts/broadcast"
+  [[ "$keep" == yes ]] || rm -rf "${REPO:?}/contracts/broadcast"
   reset_calls
   expect "ceremony recovery: P2 is refused once the stack book is recorded (broadcasts on disk: $keep)" 3 'GATE FAIL at P2: the run manifest already records the stack book: P2 is done' -- "${C9ENV[@]}" bash "$CE" --confirm --only P2 --account deployer
   if calls | grep -q '^regenesis'; then bad "ceremony recovery: a refused P2 re-run runs no regenesis ($keep)" "$(calls)"; else ok "ceremony recovery: a refused P2 re-run runs no regenesis ($keep)"; fi
@@ -1648,7 +1655,7 @@ if [[ $rc -eq 3 ]] && grep -q 'GATE FAIL at P1' <<<"$out" && grep -q 'P1 has alr
 else
   bad "ceremony recovery: a gate failure after P1 broadcast resumes after P1, never P1 again (exit $rc)" "$out"
 fi
-rm -rf "$P1D"
+rm -rf "${P1D:?}"
 # A gate that fails before its phase sent anything still names that phase's resume (control).
 c9_setup
 expect "ceremony recovery: a gate failure before any broadcast resumes at that phase" 3 "fix it, then resume: .* --confirm --from P2 --account deployer" -- "${C9ENV[@]}" VALIDATOR_GOVERNANCE="$STALE" bash "$CE" --confirm --only P2 --account deployer
@@ -1684,7 +1691,7 @@ bcount() { calls | grep -cE '^(forge script .*--broadcast|regenesis .*--broadcas
 C10D="$REPO/contracts/genesis/c10"
 C10ENV=("${C9ENV[@]}" GENESIS_OUT_DIR="$C10D" PATRONAGE_KYC_REGISTRY="$(addr 51)" PATRONAGE_MEMBERSHIP="$(addr 52)" FAKE_FORGE_BCAST=1)
 c10_reset() { # a --confirm run bound to its manifest, nothing sent yet (P3L recorded: P4 needs its library)
-  rm -rf "$REPO/contracts/broadcast" "$C10D"
+  rm -rf "${REPO:?}/contracts/broadcast" "${C10D:?}"
   mkdir -p "$C10D"
   mk_manifest "$C10D" "$DEP" confirm deployer
   printf '{"deployer":"%s","contracts":{"KYCRegistry":"%s"}}\n' "$DEP" "$(addr 51)" >"$C10D/library.json"
@@ -1828,7 +1835,7 @@ tw=$(c10_sends "$CE")
 [[ -z "$tw" ]] && ok "tripwire C10: no phase sends again over this run's broadcasts" || bad "tripwire C10: no phase sends again over this run's broadcasts" "$tw"
 # Negative control: the same ceremony with the guard disabled is caught, phase by phase.
 # (a copy of scripts/genesis in the temp dir; the source tree is not touched)
-rm -rf "$T/c10gen"
+rm -rf "${T:?}/c10gen"
 cp -R "$G" "$T/c10gen"
 python3 - "$T/c10gen/genesis_ceremony.sh" <<'PY2'
 import sys
@@ -1842,7 +1849,7 @@ s = s.replace(b, b + '  SENDS_ONCE_OK="$ph"; return 0\n', 1)
 open(p, "w").write(s)
 PY2
 tw=$(c10_sends "$T/c10gen/genesis_ceremony.sh")
-rm -rf "$T/c10gen"
+rm -rf "${T:?}/c10gen"
 cp "$T/book.c9.orig" "$GBK" # the unguarded P2 above "wrote" the fake regenesis book over it
 if grep -q '^P1:' <<<"$tw" && grep -q '^P2:' <<<"$tw" && grep -q '^P3:' <<<"$tw" && grep -q '^P4:' <<<"$tw"; then
   ok "tripwire C10: a ceremony without the guard is caught for P1, P2, P3 and P4 (negative control)"
@@ -1882,7 +1889,7 @@ out=$(rb_unit P1 P1)
   bad "run_broadcast: a step the guard cleared runs and marks its phase sent (control)" "$out"
 # The same check in the whole ceremony: with the guard skipped (it clears nothing and returns),
 # every broadcasting phase stops at run_broadcast and sends nothing (a copy of scripts/genesis).
-rm -rf "$T/rbgen"
+rm -rf "${T:?}/rbgen"
 cp -R "$G" "$T/rbgen"
 python3 - "$T/rbgen/genesis_ceremony.sh" <<'PY2'
 import sys
@@ -1905,11 +1912,11 @@ for ph in P1 P3 P4; do
     bad "run_broadcast: with the guard skipped, $ph stops at run_broadcast and sends nothing (exit $rc, sent $(bcount))" "$out"
   fi
 done
-rm -rf "$T/rbgen" "$REPO/contracts/broadcast" "$C10D"
+rm -rf "${T:?}/rbgen" "${REPO:?}/contracts/broadcast" "${C10D:?}"
 
 # A fresh --confirm run refuses a broadcast directory that already holds records for this chain
 # id (a rehearsal's would count as this run's); other chains' records and dry runs do not.
-c10_fresh() { rm -rf "$REPO/contracts/broadcast" "$C10D"; mkdir -p "$C10D"; reset_calls; }
+c10_fresh() { rm -rf "${REPO:?}/contracts/broadcast" "${C10D:?}"; mkdir -p "$C10D"; reset_calls; }
 c10_fresh
 mkdir -p "$REPO/contracts/broadcast/DeployAll.s.sol/40204"
 printf '{"timestamp":9000,"transactions":[]}' >"$REPO/contracts/broadcast/DeployAll.s.sol/40204/run-latest.json"
@@ -1931,7 +1938,7 @@ if grep -q 'P0 preflight PASS' <<<"$out" && ! grep -q 'already holds chain' <<<"
 else
   bad "ceremony C10: another chain's records and a dry run do not block a fresh run (control)" "$out"
 fi
-rm -rf "$REPO/contracts/broadcast" "$C10D"
+rm -rf "${REPO:?}/contracts/broadcast" "${C10D:?}"
 
 # forge's own keystore variables: ETH_PASSWORD (its password-file variable) is refused by name;
 # ETH_KEYSTORE_ACCOUNT / ETH_KEYSTORE must be unset or name the --account keystore. The value
@@ -1960,7 +1967,7 @@ for v in "${FORGE_OUT_VARS[@]}"; do
   else
     bad "ceremony C10: $v in the environment is refused before any send (exit $rc, sent $(bcount))" "$out"
   fi
-  rm -rf "$T/c10-forge-elsewhere"
+  rm -rf "${T:?}/c10-forge-elsewhere"
 done
 # forge also loads .env from the project root and where it runs: the same names there are
 # refused too (contracts/.env and the repo root's .env), naming the file, never the value.
@@ -1991,7 +1998,7 @@ n1=$(bcount)
 "${C10ENV[@]}" FAKE_FORGE_FAIL=1 bash "$CE" --confirm --only P1 --account deployer >/dev/null 2>&1
 [[ "$(bcount)" -le 1 && "$n1" == 0 ]] && ok "ceremony C10: a P1 redirected by FOUNDRY_BROADCAST and then retried is sent at most once" ||
   bad "ceremony C10: a P1 redirected by FOUNDRY_BROADCAST and then retried is sent at most once (sent $n1, then $(bcount) in all)" "$(calls)"
-rm -rf "$T/c10-forge-elsewhere"
+rm -rf "${T:?}/c10-forge-elsewhere"
 # Unrelated forge and Foundry variables pass (control): FOUNDRY_BIN is the ceremony's own tool
 # path, FOUNDRY_OUT moves compiler artifacts only.
 c10_reset
@@ -2020,7 +2027,7 @@ c10_reset
 rm -f "$FAKE/config.log"
 expect "ceremony C10: absolute paths that are contracts/broadcast and contracts/cache pass (control)" 0 'done \(mode=confirm\)' -- "${C10ENV[@]}" FAKE_FORGE_CONFIG="{\"broadcast\":\"$REPO/contracts/broadcast\",\"cache\":true,\"cache_path\":\"$REPO/contracts/cache\"}" FAKE_P1_BOOK="$T/c10-gov.json" bash "$CE" --confirm --only P1 --account deployer
 grep -qF "forge config --json (cwd $REPO/contracts)" "$FAKE/config.log" 2>/dev/null && ok "ceremony C10: --confirm reads forge's config in contracts/" || bad "ceremony C10: --confirm reads forge's config in contracts/" "$(cat "$FAKE/config.log" 2>&1)"
-rm -rf "$REPO/contracts/broadcast" "$C10D"
+rm -rf "${REPO:?}/contracts/broadcast" "${C10D:?}"
 
 # C9: P2 hands DeployAll TREASURY as the fee recipient. P0 checks it whenever P2 runs,
 # before anything is sent; a run that does not reach P2 does not need it.
@@ -2042,7 +2049,7 @@ calls | grep -qx "regenesis-treasury $(addr 90)" && ok "ceremony C9: P2 hands re
 # The run manifest's temp file is created with O_EXCL: a symlink (or stale file) there is
 # refused, and what it points at is not written.
 MWD="$REPO/contracts/genesis/mw"
-rm -rf "$MWD"
+rm -rf "${MWD:?}"
 mkdir -p "$MWD"
 printf 'victim\n' >"$T/c10-victim"
 ln -s "$T/c10-victim" "$MWD/ceremony-run.json.tmp"
@@ -2053,7 +2060,7 @@ if [[ $rc -eq 3 ]] && grep -q 'cannot write the run manifest' <<<"$out" && [[ "$
 else
   bad "ceremony: a symlinked manifest temp file is refused and its target is not written (exit $rc)" "$out"$'\n'"victim: $(cat "$T/c10-victim")"
 fi
-rm -rf "$MWD"
+rm -rf "${MWD:?}"
 
 # P5's DEPLOYER-ADMIN gate also counts a fee recipient that is the deployer.
 C9P5B="$T/c9-p5-book.json"
@@ -2061,7 +2068,7 @@ printf '{"chainId":40204,"deployer":"%s","contracts":{"Alpha":"%s","X402Facilita
 mk_manifest "$GB"
 gov_book "$GB" "$DEP"
 p5_fees() { # x402 mm cm
-  rm -rf "$FAKE/call/$C9X" "$FAKE/call/$C9MM" "$FAKE/call/$C9CM"
+  rm -rf "${FAKE:?}/call/$C9X" "${FAKE:?}/call/$C9MM" "${FAKE:?}/call/$C9CM"
   fake_call "$C9X" treasury "$1"
   fake_call "$C9MM" treasuryAddress "$2"
   fake_call "$C9CM" treasury "$3"
@@ -2073,7 +2080,7 @@ expect "ceremony C9: P5 fails DEPLOYER-ADMIN when a fee recipient is the deploye
 expect "ceremony C9: P5 names the fee recipient held by the deployer" 3 'DEPLOYER-ADMIN ModelMarketplace: treasuryAddress\(\) is the deployer EOA' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 ADDRESS_BOOK="$C9P5B" bash "$CE" --simulate --only P5
 rm -f "$FAKE/call/$C9CM/treasury"
 expect "ceremony C9: P5 fails a fee recipient it cannot read" 3 'GATE FAIL at P5: fee recipients: cannot read ComputeMarketplace.treasury' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 ADDRESS_BOOK="$C9P5B" bash "$CE" --simulate --only P5
-rm -rf "$FAKE/call/$C9X" "$FAKE/call/$C9MM" "$FAKE/call/$C9CM"
+rm -rf "${FAKE:?}/call/$C9X" "${FAKE:?}/call/$C9MM" "${FAKE:?}/call/$C9CM"
 
 # The password file is re-checked right before each signing step and must still be the same
 # file the preflight accepted (device and inode), with the same private mode. A change between
@@ -2084,7 +2091,7 @@ mkdir -p "$PWD_RUN"
 chmod 700 "$PWD_RUN"
 P1D="$REPO/contracts/genesis/p1pw"
 pw_run() { # <how|""> -> runs --confirm --only P1 with a fresh private password file
-  rm -rf "$P1D" "$PWD_RUN/pw" "$PWD_RUN/pw.new" "$PWD_RUN/target" "$FAKE/pw-swapped"
+  rm -rf "${P1D:?}" "${PWD_RUN:?}/pw" "${PWD_RUN:?}/pw.new" "${PWD_RUN:?}/target" "${FAKE:?}/pw-swapped"
   mkdir -p "$P1D"
   mk_manifest "$P1D" "$DEP" confirm deployer
   (umask 077 && printf 'x\n' >"$PWD_RUN/pw" && printf 'y\n' >"$PWD_RUN/target")
@@ -2106,8 +2113,8 @@ for how in replace chmod symlink rename; do
     bad "ceremony: a password file changed after the preflight ($how) stops P1 before forge runs (exit $rc)" "$(calls)"$'\n'"$out"
   fi
 done
-rm -rf "$P1D" "$PWD_RUN"
-rm -rf "$REPO/contracts/broadcast" "$FAKE/call/$C9X" "$FAKE/call/$C9MM" "$FAKE/call/$C9CM"
+rm -rf "${P1D:?}" "${PWD_RUN:?}"
+rm -rf "${REPO:?}/contracts/broadcast" "${FAKE:?}/call/$C9X" "${FAKE:?}/call/$C9MM" "${FAKE:?}/call/$C9CM"
 mk_manifest "$GB"
 # C8 on P5/P6: once P2 recorded its book, a different book is refused; --confirm needs one.
 cp "$GBK" "$T/book.orig"
@@ -2142,7 +2149,7 @@ vr_chain "$(addr 31)" "$STALE" "$Z40"
 expect "ceremony C4: P5 fails a registry with another slasher" 3 'ValidatorRegistry.slasher\(\) is 0x0+63' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 ADDRESS_BOOK="$T/book-vr.json" bash "$CE" --simulate --only P5
 vr_chain "$(addr 31)" "$(addr 31)" "$STALE"
 expect "ceremony C4: P5 fails a registry with a pending governance transfer" 3 'pendingGovernance\(\) is 0x0+63' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 ADDRESS_BOOK="$T/book-vr.json" bash "$CE" --simulate --only P5
-rm -rf "$FAKE/call/$VR"
+rm -rf "${FAKE:?}/call/$VR"
 expect "ceremony C4: P5 fails when the registry cannot be read" 3 'cannot read ValidatorRegistry.governance' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 ADDRESS_BOOK="$T/book-vr.json" bash "$CE" --simulate --only P5
 mk_manifest "$GB" "$DEP" confirm deployer
 printf '{"deployer":"%s","contracts":{"VestingAlice":"%s"}}' "$DEP" "$(addr 71)" >"$GB/team-vesting.json"
@@ -2152,7 +2159,7 @@ record_outputs "$GB" # what --confirm P3/P4/P3L record (#363)
 expect "ceremony C4: --confirm P5 needs a ValidatorRegistry in the book" 3 'has no ValidatorRegistry' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1 bash "$CE" --confirm --only P5 --account deployer
 vr_chain "$(addr 31)" "$(addr 31)" "$Z40"
 expect "ceremony C8: --confirm P5 needs a stack book recorded by P2" 3 'records no stack book' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 EXPECTED_GENESIS_HASH="$GEN" TEAM_VESTING_FILE="$BOOK" KEEP_LIST="$LIST" FLEET_RPCS=http://n1 ADDRESS_BOOK="$T/book-vr.json" bash "$CE" --confirm --only P5 --account deployer
-rm -rf "$FAKE/call/$VR"
+rm -rf "${FAKE:?}/call/$VR"
 rm "$GB/team-vesting.json" "$GB/dormant-ledgers.json" "$GB/library.json"
 
 # C3: every gate reads both councils from the chain and holds them to the validated inputs
@@ -2194,7 +2201,7 @@ gov_chain
 expect "ceremony C3: a rehearsal chain holds the councils to its own inputs" 3 "GOV: the multisig.s owners on chain are not the GOV_OWNERS" -- "${REHENV[@]}" bash "$CE" --simulate --only P5
 council_chain "$(addr 31)" "$(addr 33)" 7200 2 11 12 13
 expect "ceremony C3: a rehearsal council matching its inputs passes" 0 'P5 PASS' -- "${REHENV[@]}" bash "$CE" --simulate --only P5
-rm -r "$REH"
+rm -r "${REH:?}"
 gov_chain
 # P6 and P7 are gates too: a council that fails on chain fails them.
 mk_manifest "$GB"
@@ -2237,7 +2244,7 @@ cp "$LIST" "$T/keep-other.tsv"
 printf '# edited after the run started\n' >>"$T/keep-other.tsv"
 expect "ceremony C6: P6 refuses another KEEP list than the recorded one (P0 stops it first)" 3 'GATE FAIL at P0: KEEP list: .* records keepListSha256' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 KEEP_LIST="$T/keep-other.tsv" bash "$CE" --simulate --only P6
 expect "ceremony C6: a resume's P0 refuses another KEEP list" 3 'GATE FAIL at P0: KEEP list: ' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 KEEP_LIST="$T/keep-other.tsv" bash "$CE" --simulate --only P7
-rm -r "$REPO/contracts/broadcast"
+rm -r "${REPO:?}/contracts/broadcast"
 mk_manifest "$GB"
 
 # GENESIS_OUT_DIR: one directory for every producer and consumer path.
@@ -2281,7 +2288,7 @@ calls | grep -q 'forge-env gov=[^ ]* vest=[^ ]* dormant=genesis/run2/dormant-led
 reset_calls
 expect "ceremony: P5 checks the nondefault dir's books" 0 'P5 PASS' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$RUN2" bash "$CE" --simulate --only P5
 calls | grep -q '^forge-book genesis/run2/p5-admin-book.json$' && grep -q "$(addr 41)" "$RUN2/p5-admin-book.json" && ok "ceremony: P5 merges the nondefault dir's books" || bad "ceremony: P5 merges the nondefault dir's books" "$(calls)"
-rm -r "$RUN2"
+rm -r "${RUN2:?}"
 
 # ---------------------------------------------------------------- #363: P3/P4 books recorded when written
 # A --confirm P3/P4 must leave its output book recorded in the run manifest (teamVesting /
@@ -2316,7 +2323,7 @@ bc_run() { # script timestamp "type:name:addr"...
 }
 ob_reset() { # [mode]
   rm -f "$GB/team-vesting.json" "$GB/dormant-ledgers.json" "$GB/library.json"
-  rm -rf "$BCD" "$FAKE/bc-stage"
+  rm -rf "${BCD:?}" "${FAKE:?}/bc-stage"
   echo "$GEN" >"$LRPC/block-0"
   echo 5000 >"$LRPC/block-0-timestamp"
   mk_manifest "$GB" "$DEP" "${1:-confirm}" "$([[ "${1:-confirm}" == confirm ]] && echo deployer)"
@@ -2460,7 +2467,7 @@ for c in "P3:teamVesting:team-vesting.json:$VEST_OK:DeployTeamVesting.s.sol:CREA
   "P4:dormantLedgers:dormant-ledgers.json:$DORM_OK:DeployDormantLedgers.s.sol:CREATE2:FederatedRoundLedger:$FRLA:CREATE:PatronageLedger:$PLA"; do
   IFS=: read -r ph key file okbook script t1 n1 a1 t2 n2 a2 <<<"$c"
   ob_reset
-  [[ "$ph" == P4 ]] && dorm_bc && rm -rf "$FAKE/bc-stage"
+  [[ "$ph" == P4 ]] && dorm_bc && rm -rf "${FAKE:?}/bc-stage"
   partial_run "$BCD/$script/40204/run-6000.json" 6000 "$t1:$n1:$a1" "$t2:$n2:$a2"
   cp "$okbook" "$GB/$file"
   reset_calls
@@ -2483,7 +2490,7 @@ for c in "P3:teamVesting:team-vesting.json:$VEST_OK:DeployTeamVesting.s.sol:CREA
   # A complete record, but a book address with no code on chain: not recorded.
   ob_reset
   if [[ "$ph" == P3 ]]; then vest_bc; else dorm_bc; fi
-  mkdir -p "$BCD" && cp -R "$FAKE/bc-stage/." "$BCD/" && rm -rf "$FAKE/bc-stage"
+  mkdir -p "$BCD" && cp -R "$FAKE/bc-stage/." "$BCD/" && rm -rf "${FAKE:?}/bc-stage"
   cp "$okbook" "$GB/$file"
   expect "ceremony $ph code: --record-book refuses a book address with no code on chain" 3 "GATE FAIL at $ph: .*$n1 .*$a1 has no code on chain|GATE FAIL at $ph: .* $a1 has no code on chain" -- "${OBENV[@]}" FAKE_NO_CODE="$a1" bash "$CE" --confirm --only "$ph" --record-book --account deployer
   [[ "$(manifest_key "$key")" == null ]] && ok "ceremony $ph code: a codeless address records nothing" || bad "ceremony $ph code: a codeless address records nothing" "$(manifest_key "$key")"
@@ -2521,9 +2528,9 @@ rm -f "$GB/p5-admin-book.json"
 expect "ceremony: --confirm P5 passes over the real-shaped books (dormant ledgers repeat the governance names)" 0 'P5 PASS: FACTORY-ADMIN 0, DEPLOYER-ADMIN 0' -- "${OBENV[@]}" ADDRESS_BOOK="$T/book-vr.json" bash "$CE" --confirm --only P5 --account deployer
 python3 -c 'import json,sys; c=json.load(open(sys.argv[1]))["contracts"]; sys.exit(0 if {"ValidatorRegistry","GovernanceTimelock","GovernanceMultisig","GuardianTimelock","FederatedRoundLedger","PatronageLedger","TeamVesting_alice"} <= set(c) else 1)' "$GB/p5-admin-book.json" 2>/dev/null &&
   ok "ceremony: --confirm P5 merged every book once" || bad "ceremony: --confirm P5 merged every book once" "$(cat "$GB/p5-admin-book.json" 2>&1)"
-rm -rf "$FAKE/call/$VR" "$GB/p5-admin-book.json" "$GB/library.json"
+rm -rf "${FAKE:?}/call/$VR" "${GB:?}/p5-admin-book.json" "${GB:?}/library.json"
 ob_reset simulate
-rm -rf "$BCD"
+rm -rf "${BCD:?}"
 
 # ---------------------------------------------------------------- P3L: the rest of the library
 # P3L runs the existing forge scripts in library_book.py's order with every authority input
@@ -2566,7 +2573,7 @@ for script, rows in lb.LIBRARY:
 PY
 }
 lib_build() { python3 "$LB" build --broadcast "$1" --chain 40204 --since 5000 --deployer "$DEP" --governance "$(addr 31)" --out "$2" "${@:3}"; }
-rm -rf "$LIBT/bc"; lib_bc "$LIBT/bc" 6000
+rm -rf "${LIBT:?}/bc"; lib_bc "$LIBT/bc" 6000
 expect "library: build names every expected deployment from the broadcasts" 0 '18 library contract' -- lib_build "$LIBT/bc" "$LIBT/book.json"
 python3 - "$LB" "$LIBT/book.json" <<'PY' && ok "library: the book holds exactly the expected names (proxies, impls, the agent decision registry; no DPF, Quorum S6 or staking pool)" || bad "library: the book holds exactly the expected names" "$(cat "$LIBT/book.json")"
 import json, subprocess, sys
@@ -2578,18 +2585,18 @@ assert c["FacilitySBTImpl"] != c["FacilitySBT"] and c["NetworkSBTImpl"] != c["Ne
 # owner 2026-10-26: no customer DPF contract, no Quorum S6 set, no LiquidStakingPool
 assert not {"TenantHierarchy", "MultiSigEnvelope", "QuorumAnchorRegistry", "TripwireRegistry", "AppRegistry", "LiquidStakingPool"} & set(c)
 PY
-rm -rf "$LIBT/bc"; lib_bc "$LIBT/bc" 6000 SkillRegistry
+rm -rf "${LIBT:?}/bc"; lib_bc "$LIBT/bc" 6000 SkillRegistry
 expect "library: a missing deployment fails, named" 1 'DeployHupRegistries.s.sol: SkillRegistry is missing' -- lib_build "$LIBT/bc" "$LIBT/b2.json"
 expect "library: --partial accepts a library in progress (P3L inputs)" 0 '17 library contract' -- lib_build "$LIBT/bc" "$LIBT/b2.json" --partial
-rm -rf "$LIBT/bc"; lib_bc "$LIBT/bc" 6000 "" CitAgentTimelockX
+rm -rf "${LIBT:?}/bc"; lib_bc "$LIBT/bc" 6000 "" CitAgentTimelockX
 expect "library: a deployment the table does not name fails" 1 'deployed CitAgentTimelockX at 0x0+5fff, which the library table does not name' -- lib_build "$LIBT/bc" "$LIBT/b3.json"
-rm -rf "$LIBT/bc"; lib_bc "$LIBT/bc" 4000
+rm -rf "${LIBT:?}/bc"; lib_bc "$LIBT/bc" 4000
 expect "library: a broadcast from before block 0 is no evidence" 1 'no broadcast since this chain.s block 0' -- lib_build "$LIBT/bc" "$LIBT/b4.json"
 # broadcast_run.py on its own: one fault per record, each enough to make it partial; a complete
 # record (and only that) is sent.
 BRT="$T/brun"
 br_case() { # <name> <want sent|partial> <json>
-  rm -rf "$BRT"; mkdir -p "$BRT/X.s.sol/40204"
+  rm -rf "${BRT:?}"; mkdir -p "$BRT/X.s.sol/40204"
   printf '%s' "$3" >"$BRT/X.s.sol/40204/run-6000.json"
   local got
   got=$(python3 -I "$G/broadcast_run.py" scripts --broadcast "$BRT" --chain 40204 --since 5000 X.s.sol | awk '{print $1}')
@@ -2607,11 +2614,11 @@ br_case "a record with a hash but no receipt" partial "{\"timestamp\":6000,\"tra
 br_case "a record with a reverted receipt (status 0x0)" partial "{\"timestamp\":6000,\"transactions\":[$TX1,$TX2],\"receipts\":[$R1,{\"transactionHash\":\"$H2\",\"status\":\"0x0\"}],\"pending\":[]}"
 br_case "an unreadable record" partial "{not json"
 br_case "a record from before block 0 (not this run's; control)" "" "{\"timestamp\":4000,\"transactions\":[$TX1],\"receipts\":[],\"pending\":[\"$H1\"]}"
-rm -rf "$BRT"
+rm -rf "${BRT:?}"
 # A script that stopped part-way: forge 1.8.3 still writes run-*.json, listing the deployments it
 # never sent (hash null) and the unconfirmed one in "pending", with no receipts. None of them
 # counts as deployed, so the book cannot be built from it (with or without --partial).
-rm -rf "$LIBT/bc"; LIB_BC_PARTIAL=DeployHupRegistries.s.sol lib_bc "$LIBT/bc" 6000
+rm -rf "${LIBT:?}/bc"; LIB_BC_PARTIAL=DeployHupRegistries.s.sol lib_bc "$LIBT/bc" 6000
 expect "library: a script that stopped part-way (forge's partial record) fails the build, named" 1 'DeployHupRegistries.s.sol: .*stopped part-way' -- lib_build "$LIBT/bc" "$LIBT/b5.json"
 expect "library: a partial record fails a --partial build too" 1 'DeployHupRegistries.s.sol: .*stopped part-way' -- lib_build "$LIBT/bc" "$LIBT/b5.json" --partial
 [[ ! -e "$LIBT/b5.json" ]] && ok "library: no book is written from a partial record" || bad "library: no book is written from a partial record" "$(cat "$LIBT/b5.json")"
@@ -2692,7 +2699,7 @@ PY
   local n
   printf '0x60' >"$FAKE/code/$TEEA"; printf '0x60' >"$FAKE/code/$MSBTA"
   for n in OrganizationSBT AgentSBT CapsuleRegistry; do fake_call "$(lib_addr $n)" owner "$(addr 31)"; done
-  rm -rf "$FAKE/call/$(lib_addr KYCRegistry)"
+  rm -rf "${FAKE:?}/call/$(lib_addr KYCRegistry)"
   rm -f "$GB/library.json"
 }
 P3LENV=("${OBENV[@]}" ADDRESS_BOOK="$T/book-p4l.json" FORGE="$LIB_TOOLS/forge" FAKE_LIB_BC=6000)
@@ -2718,7 +2725,7 @@ expect "ceremony P3L: a resume skips the scripts this run already sent" 0 'Deplo
 if calls | grep -q -- '--broadcast'; then bad "ceremony P3L: a resume re-sends nothing" "$(calls | grep -- --broadcast)"; else ok "ceremony P3L: a resume re-sends nothing"; fi
 # A script that fails mid-run: P3L has sent, so the advice is the P3L resume, never P4 or P5.
 p4l_reset
-rm -rf "$BCD"
+rm -rf "${BCD:?}"
 out=$("${P3LENV[@]}" FAKE_LIB_FAIL=DeployFederatedLearning.s.sol bash "$CE" --confirm --only P3L --account deployer 2>&1)
 if grep -q 'STEP FAIL at P3L: DeployFederatedLearning.s.sol' <<<"$out" && grep -qF -- '--confirm --from P3L' <<<"$out" && ! grep -qE -- '--from P(4|5)( |$)' <<<"$out"; then
   ok "ceremony P3L: a failed script resumes at P3L (the sent scripts are skipped)"
@@ -2738,7 +2745,7 @@ expect "ceremony P3L C10: once the library is recorded, P3L is done" 3 'library.
 [[ -z "$(lib_bsent)" ]] && ok "ceremony P3L C10: a done P3L sends nothing" || bad "ceremony P3L C10: a done P3L sends nothing" "$(lib_bsent)"
 # Negative control: with the per-script guard disabled, the same retry re-sends the scripts the
 # run had already broadcast (a copy of scripts/genesis; the source tree is not touched).
-rm -rf "$T/c10lib"; cp -R "$G" "$T/c10lib"
+rm -rf "${T:?}/c10lib"; cp -R "$G" "$T/c10lib"
 python3 - "$T/c10lib/genesis_ceremony.sh" <<'PY2'
 import sys
 p = sys.argv[1]; s = open(p).read()
@@ -2748,13 +2755,13 @@ s = s.replace(b, b + '  SENDS_ONCE_OK="$ph"; return 0\n', 1)
 open(p, "w").write(s)
 PY2
 p4l_reset
-rm -rf "$BCD"
+rm -rf "${BCD:?}"
 "${P3LENV[@]}" FAKE_LIB_FAIL=DeployFederatedLearning.s.sol bash "$T/c10lib/genesis_ceremony.sh" --confirm --only P3L --account deployer >/dev/null 2>&1
 reset_calls
 "${P3LENV[@]}" bash "$T/c10lib/genesis_ceremony.sh" --confirm --only P3L --account deployer >/dev/null 2>&1
 [[ "$(lib_bsent)" == *DeployComplianceRegistry.s.sol* ]] && ok "ceremony P3L C10: without the guard the retry re-sends an already broadcast script (negative control)" ||
   bad "ceremony P3L C10: without the guard the retry re-sends an already broadcast script (negative control)" "$(lib_bsent)"
-rm -rf "$T/c10lib"
+rm -rf "${T:?}/c10lib"
 # P3L's record step. A P3L that sent every script and built its library book, but whose book did
 # not record (forced here: the manifest's record temp file is in the way), must not loop: the
 # retry was refused at P0 as "P3L is done" and advised --from P3L, which P0 refused again. The
@@ -2762,7 +2769,7 @@ rm -rf "$T/c10lib"
 # run's broadcasts, records it and runs P3L's gates; then P4 goes on.
 reruns_p3l() { grep -E -- '--(from|only) P3L([^0-9]|$)' <<<"$1" | grep -v -- '--record-book' || true; }
 p4l_reset
-rm -rf "$BCD"
+rm -rf "${BCD:?}"
 # (governance is recorded first, as a P3L after P1-P3 finds it: only the library's record is in the way)
 python3 -c 'import json,sys; p=sys.argv[1]; m=json.load(open(p)); m["governance"]=json.loads(sys.argv[2]); json.dump(m, open(p, "w"))' "$GB/ceremony-run.json" "$C10GOV"
 : >"$GB/ceremony-run.json.bind.tmp"
@@ -2800,20 +2807,20 @@ rm -f "$GB/dormant-ledgers.json"
 # The record step builds and checks; it never completes a library. A P3L stopped part-way has
 # no complete library to record: the record step fails and sends nothing.
 p4l_reset
-rm -rf "$BCD"
+rm -rf "${BCD:?}"
 "${P3LENV[@]}" FAKE_LIB_FAIL=DeployFederatedLearning.s.sol bash "$CE" --confirm --only P3L --account deployer >/dev/null 2>&1
 reset_calls
 expect "ceremony P3L record: the record step refuses a library that stopped part-way" 3 'GATE FAIL at P3L: the record step: this run has no broadcast of DeployFederatedLearning.s.sol,DeployAgentDecisionRegistryV2.s.sol,DeployHupRegistries.s.sol' -- "${P3LENV[@]}" bash "$CE" --confirm --only P3L --record-book --account deployer
 [[ -z "$(lib_bsent)" && "$(manifest_key library)" == null ]] && ok "ceremony P3L record: a refused record step sends and records nothing" || bad "ceremony P3L record: a refused record step sends and records nothing" "$(calls)"
 p4l_reset
-rm -rf "$BCD"
+rm -rf "${BCD:?}"
 expect "ceremony P3L record: the record step needs this run's P3L broadcasts" 3 'GATE FAIL at P3L: the record step: no P3L broadcast from this run is recorded' -- "${P3LENV[@]}" bash "$CE" --confirm --only P3L --record-book --account deployer
 # A library script that stopped part-way (forge's partial record: hash null, "pending" non-empty)
 # is not sent: neither the record step nor the --from P3L resume may count it, skip it or send it
 # again. Both stop and escalate; nothing is sent or recorded. Before, the resume skipped it as
 # sent and recorded a book naming the addresses it never deployed.
 p4l_reset
-rm -rf "$BCD"
+rm -rf "${BCD:?}"
 LIB_BC_PARTIAL=DeployHupRegistries.s.sol lib_bc "$BCD" 6000
 python3 -c 'import json,sys; p=sys.argv[1]; m=json.load(open(p)); m["governance"]=json.loads(sys.argv[2]); json.dump(m, open(p, "w"))' "$GB/ceremony-run.json" "$C10GOV"
 reset_calls
@@ -2825,7 +2832,7 @@ else
   bad "ceremony P3L partial: the record step refuses a script that stopped part-way, records and sends nothing (exit $rc)" "$out"
 fi
 p4l_reset
-rm -rf "$BCD"
+rm -rf "${BCD:?}"
 LIB_BC_PARTIAL=DeployHupRegistries.s.sol lib_bc "$BCD" 6000
 python3 -c 'import json,sys; p=sys.argv[1]; m=json.load(open(p)); m["governance"]=json.loads(sys.argv[2]); json.dump(m, open(p, "w"))' "$GB/ceremony-run.json" "$C10GOV"
 reset_calls
@@ -2839,7 +2846,7 @@ fi
 # The same, the way it happens: the run itself stops in DeployHupRegistries (forge writes the
 # partial record and fails); the identical retry refuses and sends nothing.
 p4l_reset
-rm -rf "$BCD"
+rm -rf "${BCD:?}"
 "${P3LENV[@]}" FAKE_LIB_PARTIAL=DeployHupRegistries.s.sol bash "$CE" --confirm --only P3L --account deployer >/dev/null 2>&1
 reset_calls
 out=$("${P3LENV[@]}" bash "$CE" --confirm --only P3L --account deployer 2>&1)
@@ -2851,7 +2858,7 @@ else
 fi
 # Before it records the library book, the record step requires code at every address in it.
 p4l_reset
-rm -rf "$BCD"
+rm -rf "${BCD:?}"
 lib_bc "$BCD" 6000
 python3 -c 'import json,sys; p=sys.argv[1]; m=json.load(open(p)); m["governance"]=json.loads(sys.argv[2]); json.dump(m, open(p, "w"))' "$GB/ceremony-run.json" "$C10GOV"
 expect "ceremony P3L code: a library contract with no code on chain is not recorded" 3 'GATE FAIL at P3L: .*SkillRegistry 0x0+5012 has no code on chain' -- "${P3LENV[@]}" FAKE_NO_CODE="$(lib_addr SkillRegistry)" bash "$CE" --confirm --only P3L --record-book --account deployer
@@ -2859,28 +2866,28 @@ expect "ceremony P3L code: a library contract with no code on chain is not recor
 expect "ceremony P3L code: with code at every address the record step records (control)" 0 'P3L library.json recorded in the run manifest' -- "${P3LENV[@]}" bash "$CE" --confirm --only P3L --record-book --account deployer
 # Gates on the seats CheckDeployedAdmins does not read.
 p4l_reset
-rm -rf "$BCD"
+rm -rf "${BCD:?}"
 fake_call "$(lib_addr KYCRegistry)" "hasRole_$(printf '0x%s' "$(printf '%s' KYC_UPDATER_ROLE | sha256sum | cut -c1-64)")_$DEP" true
 expect "ceremony P3L: a deployer KYC updater fails" 3 'GATE FAIL at P3L: the deployer holds KYC_UPDATER_ROLE' -- "${P3LENV[@]}" bash "$CE" --confirm --only P3L --account deployer
 p4l_reset
-rm -rf "$BCD"
+rm -rf "${BCD:?}"
 fake_call "$(lib_addr AgentSBT)" owner "$STALE"
 expect "ceremony P3L: a HUP registry owned by another account fails" 3 'GATE FAIL at P3L: AgentSBT.owner\(\) is 0x0+63' -- "${P3LENV[@]}" bash "$CE" --confirm --only P3L --account deployer
 p4l_reset no-tee
-rm -rf "$BCD"
+rm -rf "${BCD:?}"
 expect "ceremony P3L: --confirm needs the recorded stack book's TEE registry" 3 'GATE FAIL at P3L: .*has no TEEAttestationRegistry' -- "${P3LENV[@]}" bash "$CE" --confirm --only P3L --account deployer
 if calls | grep -q -- '--broadcast'; then bad "ceremony P3L: a book without the TEE registry sends nothing" "$(calls | grep -- --broadcast)"; else ok "ceremony P3L: a book without the TEE registry sends nothing"; fi
 p4l_reset
-rm -rf "$BCD"
+rm -rf "${BCD:?}"
 p4l_reset
-rm -rf "$BCD"
+rm -rf "${BCD:?}"
 expect "ceremony P3L: a preset EXPECTED_IPFS_V3 other than the run's projection is refused" 3 'GATE FAIL at P3L: EXPECTED_IPFS_V3 is set to 0x0+5, but this run.s projection is 0x0+91' -- "${P3LENV[@]}" EXPECTED_IPFS_V3="$(addr 5)" bash "$CE" --confirm --only P3L --account deployer
 expect "ceremony P3L: no projection, no library (fail closed)" 3 'GATE FAIL at P3L: cannot compute the IPFSIncentivesV3 projection' -- "${P3LENV[@]}" FAKE_IPFS_V3=none bash "$CE" --confirm --only P3L --account deployer
 if calls | grep -q -- '--broadcast'; then bad "ceremony P3L: a refused projection sends nothing" "$(calls | grep -- --broadcast)"; else ok "ceremony P3L: a refused projection sends nothing"; fi
 expect "ceremony P3L: a preset HUP timelock owner is refused (no CitAgentTimelock)" 3 'HUP_TIMELOCK_OWNER_0 is set' -- "${P3LENV[@]}" HUP_TIMELOCK_OWNER_0="$(addr 5)" bash "$CE" --confirm --only P3L --account deployer
 # P5 sweeps the library book, and --confirm P5 refuses one P3L did not record.
 p4l_reset
-rm -rf "$BCD"
+rm -rf "${BCD:?}"
 cp "$VEST_OK" "$GB/team-vesting.json"; cp "$DORM_OK" "$GB/dormant-ledgers.json"; cp "$LIBT/book.json" "$GB/library.json"
 record_outputs "$GB"
 python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); del m["library"]; json.dump(m, open(sys.argv[1], "w"))' "$GB/ceremony-run.json"
@@ -2889,7 +2896,7 @@ rm -f "$GB/library.json"
 expect "ceremony P3L: --confirm P5 requires the library book" 3 'GATE FAIL at P5: .*library.json missing' -- "${OBENV[@]}" bash "$CE" --confirm --only P5 --account deployer
 rm -f "$GB/team-vesting.json" "$GB/dormant-ledgers.json" "$GB/library-hup-book.json" "$GB/library.partial.json"
 ob_reset simulate
-rm -rf "$BCD" "$FAKE/bc-stage"
+rm -rf "${BCD:?}" "${FAKE:?}/bc-stage"
 
 # ------------------------------------------------------------------ address-book generator
 # scripts/ops/emit-address-table.sh (what regenesis.sh runs and P2 verifies, C8) over synthetic
@@ -2951,7 +2958,7 @@ expect "generator: a fresh genesis with the P256 broadcast and the OrangeSeed al
   ok "generator: genesis lists P256Verifier and OrangeSeed (proxy and V0), lowercase" || bad "generator: genesis lists P256Verifier and OrangeSeed (proxy and V0), lowercase" "$(jq -c .genesis "$T/fresh-os.json")"
 printf '{"alloc":{"0x000000000000000000000000000000c17a7e5eed":{"code":"0x6001"}}}\n' >"$OSA"
 expect "generator: an OrangeSeed allocation without the implementation is refused" 1 'does not allocate code to the OrangeSeed proxy and implementation' -- "${GEMIT[@]}" EMIT_FRESH_GENESIS=1 EMIT_DEPLOYER="$FD" EMIT_BROADCAST_SINCE=5000 EMIT_ORANGESEED_ALLOC="$OSA" EMIT_OUTPUT="$T/fresh-os2.json" bash "$EMIT"
-rm -rf "$GR/contracts/broadcast/DeployP256Verifier.s.sol"
+rm -rf "${GR:?}/contracts/broadcast/DeployP256Verifier.s.sol"
 # Not fresh: EMIT_DEPLOYER (what regenesis.sh passes) wins over .env.testnet, the regenerated
 # membership entries replace the old ones and their root aliases follow; other keys carry over.
 stale_book
@@ -3014,7 +3021,7 @@ expect "generator G9: without EMIT_MEMBERSHIP_SCRIPT the reroll path reads Deplo
   ok "generator G9: the default membership broadcast is still DeployCoreMembership's" ||
   bad "generator G9: the default membership broadcast is still DeployCoreMembership's" "$(cat "$GBOOK")"
 expect "generator G9: an unknown EMIT_MEMBERSHIP_SCRIPT is refused" 1 'EMIT_MEMBERSHIP_SCRIPT must be DeployCoreMembership.s.sol or DeployGenesisMembership.s.sol' -- "${GEMIT[@]}" EMIT_FRESH_GENESIS=1 EMIT_DEPLOYER="$FD" EMIT_BROADCAST_SINCE=5000 EMIT_MEMBERSHIP_SCRIPT=DeployOther.s.sol bash "$EMIT"
-rm -rf "$GR/contracts/broadcast/DeployGenesisMembership.s.sol"
+rm -rf "${GR:?}/contracts/broadcast/DeployGenesisMembership.s.sol"
 
 # ------------------------------------------------------------------ P5 with the real checker
 # Integration: the real CheckDeployedAdmins (this tree's script and AdminChecks) under real
@@ -3051,7 +3058,7 @@ else
   # resolve every import of its entries on its own, from files byte-identical to this tree's.
   find_solc() {
     local s
-    for s in "${SOLC:-}" "$HOME/.svm/0.8.36/solc-0.8.36" "$HOME/Library/Application Support/svm/0.8.36/solc-0.8.36" \
+    for s in "${SOLC:-}" "$REAL_HOME/.svm/0.8.36/solc-0.8.36" "$REAL_HOME/Library/Application Support/svm/0.8.36/solc-0.8.36" \
       "$(command -v solc || true)"; do
       if [[ -n "$s" && -x "$s" ]] && "$s" --version 2>/dev/null | grep -q 'Version: 0\.8\.36+'; then
         printf '%s\n' "$s"
@@ -3157,7 +3164,7 @@ SOL
     IRPC="http://127.0.0.1:$port"
     "$REAL_ANVIL" --port "$port" --silent >"$T/anvil.log" 2>&1 &
     ANVIL_PID=$!
-    trap 'kill "$ANVIL_PID" 2>/dev/null; rm -rf "$T"' EXIT
+    trap 'kill "$ANVIL_PID" 2>/dev/null; rm -rf "${T:?}"' EXIT
     for _ in $(seq 100); do
       "$REAL_CAST" chain-id --rpc-url "$IRPC" >/dev/null 2>&1 && break
       sleep 0.1
@@ -3344,7 +3351,7 @@ EOF
       fport=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
       FRPC="http://127.0.0.1:$fport"
       FANVIL_PID=""
-      trap 'kill "$ANVIL_PID" ${FANVIL_PID:+"$FANVIL_PID"} 2>/dev/null; rm -rf "$T"' EXIT
+      trap 'kill "$ANVIL_PID" ${FANVIL_PID:+"$FANVIL_PID"} 2>/dev/null; rm -rf "${T:?}"' EXIT
       FDEP=0xd1e0000000000000000000000000000000000001 # the fresh deployer (impersonated)
       FDEP_CS=0xd1E0000000000000000000000000000000000001 # the same, EIP-55 (as `cast wallet address` prints it)
       printf '#!/usr/bin/env bash\necho "generator re-run failed (test fault)" >&2\nexit 1\n' >"$T/fail-emit.sh"

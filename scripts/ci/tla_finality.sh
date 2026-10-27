@@ -58,7 +58,7 @@ run_tlc() {
     tmp="$(mktemp -d)"
     (cd "$tmp" && timeout "$TIMEOUT" java "-Xmx${HEAP}" -XX:+UseParallelGC -cp "$JAR" \
         tlc2.TLC -config "$SPECS/$cfg" "$SPECS/$spec.tla" -workers "$WORKERS" -deadlock 2>&1) || true
-    rm -rf "$tmp"
+    rm -rf "${tmp:?}"
 }
 
 states() { grep -oE '[0-9,]+ distinct states found' | tail -1 | tr -d ','; }

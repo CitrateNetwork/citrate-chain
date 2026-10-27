@@ -181,7 +181,7 @@ pub const FINALIZE_RETRY_CAP: Duration = Duration::from_secs(30);
 /// [`FINALIZE_RETRY_CAP`] (`0` failures = the base delay).
 pub fn finalize_retry_delay(failures: u32) -> Duration {
     let doublings = failures.saturating_sub(1).min(31);
-    let factor = 1u32.checked_shl(doublings).unwrap_or(u32::MAX);
+    let factor = 2u32.checked_pow(doublings).unwrap_or(u32::MAX);
     FINALIZE_RETRY_BASE
         .checked_mul(factor)
         .map_or(FINALIZE_RETRY_CAP, |d| d.min(FINALIZE_RETRY_CAP))

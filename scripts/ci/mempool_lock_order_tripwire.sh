@@ -149,7 +149,7 @@ PY
 
 self_test() {
   local d rc=0
-  d="$(mktemp -d)"; trap 'rm -rf "$d"' RETURN
+  d="$(mktemp -d)"; trap 'rm -rf "${d:?}"' RETURN
   local hdr='// LOCK-ORDER: transactions, by_sender, sender_nonces
 pub struct Mempool {
     transactions: Arc<RwLock<A>>,

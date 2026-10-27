@@ -110,7 +110,7 @@ fi
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/wallet-sdk-wasm.XXXXXX")"
 case "$work" in "${TMPDIR:-/tmp}"/wallet-sdk-wasm.*) ;; *) echo "unexpected temp dir $work"; exit 1 ;; esac
-trap 'rm -rf -- "$work"' EXIT
+trap 'rm -rf -- "${work:?}"' EXIT
 cargo_home="${CARGO_HOME:-$HOME/.cargo}"
 rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
 # Own target subdir: the remap RUSTFLAGS would otherwise invalidate the

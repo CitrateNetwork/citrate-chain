@@ -25,7 +25,7 @@ set -uo pipefail
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/prepush-test.XXXXXX")"
 if [ -z "$TMP" ] || [ ! -d "$TMP" ]; then echo "mktemp failed" >&2; exit 2; fi
-cleanup() { [ -n "${TMP:-}" ] && [ -d "$TMP" ] && rm -rf -- "$TMP"; }
+cleanup() { [ -n "${TMP:-}" ] && [ -d "$TMP" ] && rm -rf -- "${TMP:?}"; }
 trap cleanup EXIT
 
 export HOME="$TMP/home"

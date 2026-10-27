@@ -54,7 +54,7 @@ ANVIL_PID=$!
 cleanup() {
   kill "$ANVIL_PID" 2>/dev/null || true
   wait "$ANVIL_PID" 2>/dev/null || true
-  [ "${KEEP_OUTPUT:-0}" = 1 ] || rm -rf "$OUT"
+  [ "${KEEP_OUTPUT:-0}" = 1 ] || rm -rf "${OUT:?}"
 }
 trap cleanup EXIT
 for _ in $(seq 1 50); do

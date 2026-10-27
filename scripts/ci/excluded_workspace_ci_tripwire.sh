@@ -179,7 +179,7 @@ YAML
     echo "self-test: an unparseable exclude list passed"; rc=1
   fi
 
-  case "$tmp" in "${TMPDIR:-/tmp}"/excl-ws-tripwire.*) rm -rf -- "$tmp" ;; esac
+  case "$tmp" in "${TMPDIR:-/tmp}"/excl-ws-tripwire.*) rm -rf -- "${tmp:?}" ;; esac
   [ "$rc" -eq 0 ] && echo "excluded_workspace_ci_tripwire self-test OK"
   return "$rc"
 }

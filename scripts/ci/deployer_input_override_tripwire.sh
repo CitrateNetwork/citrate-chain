@@ -40,7 +40,7 @@ scan() { # root -> prints violations, exit 1 if any
 
 if [[ "${1:-}" == --self-test ]]; then
   t=$(mktemp -d) || exit 1
-  trap 'rm -rf "$t"' EXIT
+  trap 'rm -rf "${t:?}"' EXIT
   fixture() { # dir: a clean tree
     mkdir -p "$1/contracts/script" "$1/scripts/ops"
     printf '%s\n' '// "CEREMONY_DEPLOYER_ADDRESS and DEPLOYER_ADDRESS name different deployers"' \

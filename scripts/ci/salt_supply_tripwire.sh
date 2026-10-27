@@ -63,7 +63,7 @@ scan() { local rc=0; check_constant "$1" || rc=1; check_literals "$1" || rc=1; r
 
 self_test() {
   local d rc=0
-  d="$(mktemp -d)"; trap 'rm -rf "$d"' RETURN
+  d="$(mktemp -d)"; trap 'rm -rf "${d:?}"' RETURN
   mkdir -p "$d/core/economics/src" "$d/contracts/src/lib" "$d/contracts/script"
   printf 'pub const TOTAL_SUPPLY: u128 = 1_000_000_000_000;\n' > "$d/core/economics/src/lib.rs"
   printf 'library SaltSupply {\n    uint256 internal constant TOTAL_SUPPLY = 1_000_000_000_000 ether;\n}\n' > "$d/contracts/src/lib/SaltSupply.sol"

@@ -22,11 +22,14 @@ forge-chainid-profile | contracts/script/ProvisionWithMultisig.s.sol | block.cha
 forge-chainid-profile | contracts/script/ScriptEnv.sol | block.chainid | board:QA-T, chain#320 | governance != deployer requirement keyed on block.chainid; shared by legacy scripts, adopt GenesisProfile
 forge-chainid-profile | contracts/script/WireDpfOperators.s.sol | block.chainid | board:QA-T, chain#320 | 40204-only envelope requirement keyed on block.chainid; adopt GenesisProfile or retire
 forge-chainid-profile | contracts/script/aa/DeployAA.s.sol | block.chainid | board:QA-T, chain#320 | dev P256 verifier only on the anvil chain id; a mis-set --chain-id could install the dev verifier, adopt the node check
+forge-chainid-profile | contracts/script/DeployOrangeSeed.s.sol | block.chainid != CITRATE_CHAIN_ID | chain#389 | rehearsal deploy of the OrangeSeed predeploy; on 40204 it is placed in the genesis allocation, so the script refuses there. A bare block.chainid refusal; adopt GenesisProfile's node check with the other legacy scripts
+forge-chainid-profile | contracts/script/DeployAgentDecisionRegistryV2.s.sol | block.chainid != 40204 || | chain#394 | P4L library deploy: the governance-is-not-the-deployer and governance-has-code checks are keyed on block.chainid like ScriptEnv's; adopt GenesisProfile's node check with the other legacy scripts
 forge-chainid-profile | contracts/script/aa/RotateFactoryPaymaster.s.sol | block.chainid | board:QA-T, chain#320 | "only on 40204" guard is a bare block.chainid test; adopt GenesisProfile or retire
 
 # ── rpc-historical-state: reads that ask for state at a past block ───────────────────────────
 rpc-historical-state | crates/citrate-fork/** | * | board:QA-T | the dry-run fork pins every read to one block by design; a Citrate node answers with latest state, so the tool must verify head == pinned block (or state latest-only) before this entry goes
 rpc-historical-state | tools/citrate-bench/src/rpc.rs | * | board:QA-T | get_balance / get_transaction_count take a tag parameter; every caller passes "latest" (main.rs, runner.rs). Drop the parameter when the bench is next touched
+rpc-historical-state | scripts/producers/tests/test_verify_producer.py | fail_methods.add("eth_call") | chain#330 (board:C3-P) | the test makes its RPC stub fail eth_call to prove a failed registry read reports unknown; no state is read at a past block
 rpc-historical-state | scripts/ci/srp_coldsync_gate.sh | eth_get | board:QA-T | balance/storage rows compare producer and follower "at H" while the producer keeps mining; both answer latest, so those rows can compare different heads. The stateRoot row (block lookup by number) is the authoritative check; stop the producer before the balance rows
 
 # ── rpc-finality-height-index: finalized/safe and log ranges through the height index ────────
@@ -39,6 +42,7 @@ rpc-finality-height-index | core/api/src/eth_rpc.rs | [eth_getFilterLogs] | boar
 rpc-finality-height-index | core/api/src/eth_rpc.rs | [eth_feeHistory] | board:C3-L | newestBlock=finalized resolves through the height index (fee data only); still present after chain#328, follow-up needed
 
 # ── shell-pipefail ────────────────────────────────────────────────────────────────────────────
+shell-pipefail | scripts/genesis/lib.sh | * | chain#329 (board:C4) | a sourced function library with no top-level pipelines; every script that sources it (keep_check, reset_node, genesis_ceremony, fleet_agree) sets pipefail itself, and setting it here would change the caller's shell options
 shell-pipefail | scripts/ops/watchdog/citrate-height-watchdog.sh | * | chain#330 (board:C3-P) | the watchdog is being rewritten with a test suite in chain#330; add pipefail there rather than conflict with it. Its pipelines only feed sed/grep extraction under set -u
 
 # ── tla-frame: actions that prime a variable a sibling conjunct keeps UNCHANGED ──────────────

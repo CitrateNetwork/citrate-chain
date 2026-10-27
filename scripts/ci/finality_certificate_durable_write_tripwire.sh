@@ -39,7 +39,7 @@ scan() { # <dir>... ; prints violations, returns 0 iff any found
 
 self_test() {
   local d rc=0
-  d="$(mktemp -d)"; trap 'rm -rf "$d"' RETURN
+  d="$(mktemp -d)"; trap 'rm -rf "${d:?}"' RETURN
   # Positive: a certificate record written with the buffered kv_put.
   printf 'fn persist(kv: &K, h: u64, b: &[u8]) {\n    let key = format!("checkpoint:{}", h);\n    if let Err(e) = kv.kv_put(cf::DAG_METADATA, key.as_bytes(), b) {\n        warn!("{}", e);\n    }\n}\n' > "$d/a.rs"
   scan "$d" >/dev/null || { echo "self-test: did not detect a buffered certificate write"; rc=1; }

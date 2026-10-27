@@ -78,7 +78,7 @@ scan_executor() { # <file> ; prints violations, returns 0 iff any found
 
 self_test() {
   local d rc=0
-  d="$(mktemp -d)"; trap 'rm -rf "$d"' RETURN
+  d="$(mktemp -d)"; trap 'rm -rf "${d:?}"' RETURN
   # rule 1
   printf 'fn f(&self) {\n    self.state_db.accounts.transfer(&a, &b, v)?;\n}\n' > "$d/a.rs"
   scan_transfers "$d" >/dev/null || { echo "self-test: did not detect a direct transfer"; rc=1; }

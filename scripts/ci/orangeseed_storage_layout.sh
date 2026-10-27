@@ -62,7 +62,7 @@ check_namespace() { # <solidity file>
 
 self_test() {
   local d rc=0
-  d="$(mktemp -d)"; trap 'rm -rf "$d"' RETURN
+  d="$(mktemp -d)"; trap 'rm -rf "${d:?}"' RETURN
   echo '{"storage":[],"types":{}}' > "$d/empty.json"
   echo '{"storage":[{"astId":1,"contract":"x","label":"owner","offset":0,"slot":"0","type":"t_address"}],"types":{}}' > "$d/drift.json"
   echo '{"storage":[],"types":{"t_x":{}}}' > "$d/types-only.json"
@@ -83,7 +83,7 @@ self_test() {
 
 run() {
   local d rc=0
-  d="$(mktemp -d)"; trap 'rm -rf "$d"' RETURN
+  d="$(mktemp -d)"; trap 'rm -rf "${d:?}"' RETURN
   (cd "$CONTRACTS" && forge inspect "$TARGET" storageLayout --json) > "$d/actual.json" \
     || { echo "forge inspect failed"; return 1; }
   if [ "${1:-}" = "--update" ]; then

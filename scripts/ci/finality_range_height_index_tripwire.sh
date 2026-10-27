@@ -33,7 +33,7 @@ scan() { # <dir> ; prints violations, returns 0 iff any found
 
 self_test() {
   local d rc=0
-  d="$(mktemp -d)"; trap 'rm -rf "$d"' RETURN
+  d="$(mktemp -d)"; trap 'rm -rf "${d:?}"' RETURN
   printf 'fn f(s: &S, h: u64) {\n    for h in 0..=h {\n        let x = s.blocks.get_block_by_height(h);\n    }\n}\n' > "$d/a.rs"
   scan "$d" >/dev/null || { echo "self-test: did not detect an unmarked height-index read"; rc=1; }
   printf 'fn f(s: &S, h: u64) {\n    // height-index: latest only, never a finality tag.\n    let x = s\n        .blocks\n        .get_block_by_height(h);\n}\n' > "$d/a.rs"

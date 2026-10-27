@@ -35,7 +35,7 @@ wired() { # <file> ; returns 0 iff spawn's body calls retry_finalizations(
 
 self_test() {
   local d rc=0
-  d="$(mktemp -d)"; trap 'rm -rf "$d"' RETURN
+  d="$(mktemp -d)"; trap 'rm -rf "${d:?}"' RETURN
   # Positive (wired): the loop calls the retry step.
   printf 'pub fn spawn(g: G) -> H {\n    tokio::spawn(async move {\n        loop {\n            tick.tick().await;\n            retry_finalizations(&g, Instant::now()).await;\n        }\n    })\n}\n' > "$d/a.rs"
   wired "$d/a.rs" || { echo "self-test: missed a wired retry"; rc=1; }

@@ -80,7 +80,7 @@ scan() { # <root> ; prints violations, returns 0 iff any found
 
 self_test() {
   local d rc=0
-  d="$(mktemp -d)"; trap 'rm -rf "$d"' RETURN
+  d="$(mktemp -d)"; trap 'rm -rf "${d:?}"' RETURN
   mkdir -p "$d/node/src" "$d/node/tests"
   # R2 positive (negative control): the old SHA3 fallback shape must be caught, even annotated.
   cat > "$d/node/src/a.rs" <<'EOF'

@@ -12,7 +12,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WD="$HERE/../watchdog/citrate-height-watchdog.sh"
 CTL="$HERE/../watchdog/citrate-watchdog-ctl.sh"
-T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+T="$(mktemp -d)"; trap 'rm -rf "${T:?}"' EXIT
 mkdir -p "$T/bin" "$T/rpc"
 export STATE_DIR="$T/state" ALERT="$T/bin/alert" NODE_LABEL=test-node STALL_SECS=180
 export PATH="$T/bin:$PATH"
@@ -62,7 +62,7 @@ pass=0; fail=0
 ok()  { pass=$((pass+1)); echo "ok   - $1"; }
 bad() { fail=$((fail+1)); echo "FAIL - $1"; }
 restarts() { if [ -f "$T/systemctl.log" ]; then grep -c '^restart' "$T/systemctl.log" || true; else echo 0; fi; }
-reset() { rm -rf "$STATE_DIR" "$T"/*.log; arm; }
+reset() { rm -rf "${STATE_DIR:?}" "${T:?}"/*.log; arm; }
 # arm: the state a resume leaves (restarts allowed). Written directly so it logs nothing.
 arm() { mkdir -p "$STATE_DIR"; printf 'armed=1\n' > "$STATE_DIR/ARMED"; }
 head_is() { printf '{"jsonrpc":"2.0","id":1,"result":"%s"}' "$1" > "$T/rpc/eth_blockNumber"; }
@@ -163,7 +163,7 @@ wait_for() { # file, tenths of a second
 H="$T/hold"
 poll_in_flight() { # where (rpc|restart): leaves a stalled poll held there; pid in $T/poll.pid
   reset; synced; head_is 0x70; bash "$WD"; age_baseline 900
-  rm -rf "$H"; mkdir -p "$H"
+  rm -rf "${H:?}"; mkdir -p "$H"
   # Own process group, so a test can kill the whole poll the way systemd stops the service.
   if [ "$1" = rpc ]; then CURL_HOLD="$H" setsid bash "$WD" & else SYSTEMCTL_HOLD="$H" setsid bash "$WD" & fi
   echo $! > "$T/poll.pid"
@@ -318,11 +318,11 @@ paused_then "PAUSE deleted and ARMED planted as a directory" eval 'rm -f "$STATE
 paused_then "poll lock file deleted" rm -f "$STATE_DIR/.poll.lock"
 paused_then "poll lock replaced by a directory, PAUSE deleted" eval 'rm -f "$STATE_DIR/.poll.lock" "$STATE_DIR/PAUSE"; mkdir "$STATE_DIR/.poll.lock"'
 paused_then "control lock deleted" rm -f "$STATE_DIR/.ctl.lock"
-paused_then "state dir wiped" rm -rf "$STATE_DIR"
-paused_then "state dir replaced by a file" eval 'rm -rf "$STATE_DIR"; : > "$STATE_DIR"'
+paused_then "state dir wiped" rm -rf "${STATE_DIR:?}"
+paused_then "state dir replaced by a file" eval 'rm -rf "${STATE_DIR:?}"; : > "$STATE_DIR"'
 rm -f "$STATE_DIR"
 # A fresh install is disarmed until the first resume; release after containment stays disarmed.
-rm -rf "$STATE_DIR" "$T"/*.log; synced; head_is 0xa0; bash "$WD"; age_baseline 900; bash "$WD"
+rm -rf "${STATE_DIR:?}" "${T:?}"/*.log; synced; head_is 0xa0; bash "$WD"; age_baseline 900; bash "$WD"
 [ "$(restarts)" = 0 ] && ok "fresh install (no ARMED) restarts nothing" || bad "fresh install restarted"
 bash "$CTL" resume >/dev/null; bash "$WD"; age_baseline 900; bash "$WD"
 [ "$(restarts)" = 1 ] && ok "resume arms a fresh install" || bad "resume did not arm ($(restarts))"
