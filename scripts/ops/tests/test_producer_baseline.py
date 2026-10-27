@@ -347,12 +347,13 @@ case "$name" in
     if [ "$*" = "-u" ]; then echo 0; else echo 996; fi ;;
   curl) exit 7 ;;
   fallocate) : >"${@: -1}" ;;  # an empty file at the given (sandbox) path
+  ip) cat "$SHIM_DIR/ip_addr" 2>/dev/null ;;
 esac
 exit 0
 """
 SHIMMED = ("sshd", "systemctl", "ufw", "apt-get", "install", "chown", "getent", "id",
            "useradd", "groupadd", "curl", "sysctl", "swapon", "timedatectl", "chronyc",
-           "fallocate", "mkswap")
+           "fallocate", "mkswap", "ip")
 DEFAULT_SSHD_T = (
     "port 22\nlistenaddress [::]:22\nlistenaddress 0.0.0.0:22\n"
     "authorizedkeysfile .ssh/authorized_keys .ssh/authorized_keys2\n"
@@ -385,6 +386,11 @@ class Sandbox:
         (self.root / "etc").mkdir()
         (self.root / "etc/os-release").write_text("ID=ubuntu\nPRETTY_NAME=test\n")
         (self.root / "etc/logrotate.conf").write_text("weekly\ninclude /etc/logrotate.d\n")
+        (self.tmp / "ip_addr").write_text(
+            "1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever\n"
+            "2: eth0    inet 192.0.2.10/24 brd 192.0.2.255 scope global eth0\\       valid_lft forever\n"
+            "3: eth1    inet 10.0.0.5/24 brd 10.0.0.255 scope global eth1\\       valid_lft forever\n"
+            "4: tailscale0    inet 100.64.0.5/32 scope global tailscale0\\       valid_lft forever\n")
         self.log.write_text("")
 
     def add_key(self, user_home: str = "root", name: str = "authorized_keys") -> None:
@@ -657,19 +663,21 @@ class SshSourceTest(ShimTestCase):
 
     def test_existing_restricted_rule_is_not_widened(self) -> None:
         for existing in (RESTRICTED_RULE, "ufw limit 22/tcp", "ufw allow from 10.0.0.0/8", "ufw allow OpenSSH",
-                         "ufw allow in on eth1 from 198.51.100.0/24 to any port 22 proto tcp"):
+                         "ufw allow 20:30/tcp", "ufw allow 22,2222/tcp"):
             self.sb.log.write_text("")
             self.preset(existing)
             r = self.sb.run("apply_firewall")
             self.assertEqual(r.returncode, 0, f"{existing}: {r.stdout}{r.stderr}")
             self.assertNotIn("ufw allow 22/tcp", self.sb.calls(), existing)
-            self.assertEqual([l for l in self.added() if "22" in l or "from" in l or "SSH" in l], [existing])
+            self.assertEqual([l for l in self.added() if "2" in l.replace("30303", "") or "from" in l or "SSH" in l],
+                             [existing])
             self.assertIn("ufw --force enable", self.sb.calls(), existing)
 
     def test_unrelated_rule_does_not_count_as_ssh(self) -> None:  # negative control
         for other in ("ufw allow 80/tcp", "ufw allow from 198.51.100.7 to any port 8545 proto tcp",
                       "ufw allow 22/udp", "ufw allow out 22/tcp", "ufw deny from 198.51.100.7 to any port 22",
-                      "ufw allow 'Nginx Full'", "ufw allow from 198.51.100.7 to any app 'Nginx Full'"):
+                      "ufw allow 'Nginx Full'", "ufw allow from 198.51.100.7 to any app 'Nginx Full'",
+                      "ufw allow 23:30/tcp", "ufw allow 10:21/tcp"):
             self.sb.log.write_text("")
             self.preset(other)
             r = self.sb.run("apply_firewall")
@@ -780,6 +788,152 @@ class SshSourceTest(ShimTestCase):
         head = SCRIPT.read_text().split("set -euo pipefail", 1)[0]
         self.assertIn("citrate-producer-fw", head)
         self.assertIn("--ssh-from", head)
+
+
+SESSION_PUBLIC = "203.0.113.5 50000 192.0.2.10 22"
+SCOPED_RULES = ("ufw allow in on tailscale0",
+                "ufw allow in on eth1 to any port 22 proto tcp",
+                "ufw allow to 10.0.0.5 port 22 proto tcp",
+                "ufw allow in on eth1 from 198.51.100.0/24 to any port 22 proto tcp")
+
+
+class SshScopeTest(ShimTestCase):
+    """Only a rule for every interface and destination counts as SSH already allowed,
+    and the session's own path must survive the resulting rule set."""
+
+    def added(self) -> list[str]:
+        f = self.sb.tmp / "ufw_added"
+        return f.read_text().splitlines() if f.exists() else []
+
+    def preset(self, *rules: str) -> None:
+        (self.sb.tmp / "ufw_added").write_text("".join(r + "\n" for r in rules))
+
+    def ufw_mutations(self) -> list[str]:
+        return [c for c in self.sb.calls("ufw") if not c.startswith(("ufw status", "ufw show"))]
+
+    def test_scoped_rule_does_not_stand_in_for_ssh(self) -> None:
+        self.sb.add_key()
+        for rule in SCOPED_RULES:
+            self.sb.log.write_text("")
+            self.preset(rule)
+            r = self.sb.run("preflight && apply_firewall", SSH_CONNECTION=SESSION_PUBLIC)
+            self.assertEqual(r.returncode, 0, f"{rule}: {r.stdout}{r.stderr}")
+            self.assertIn("ufw allow 22/tcp", self.ufw_mutations(), rule)
+            self.assertIn(rule, self.added(), "scoped rules are kept")
+
+    def test_unscoped_rule_present_adds_nothing(self) -> None:  # negative control
+        self.sb.add_key()
+        for rule in SCOPED_RULES:
+            self.sb.log.write_text("")
+            self.preset(rule, "ufw allow 22/tcp")
+            r = self.sb.run("preflight && apply_firewall", SSH_CONNECTION=SESSION_PUBLIC)
+            self.assertEqual(r.returncode, 0, f"{rule}: {r.stdout}{r.stderr}")
+            self.assertEqual([c for c in self.ufw_mutations() if "22" in c], [], rule)
+
+    def test_session_path_must_be_admitted(self) -> None:
+        self.sb.add_key()
+        dst_rule = "ufw allow to 10.0.0.5 port 22 proto tcp"
+        ts_rule = "ufw allow in on tailscale0 to any port 22 proto tcp"
+        cases = [
+            # (rules, SSH_CONNECTION, rc)
+            ((RESTRICTED_RULE, dst_rule), "203.0.113.5 50000 10.0.0.5 22", 0),
+            ((RESTRICTED_RULE, dst_rule), SESSION_PUBLIC, 2),
+            ((RESTRICTED_RULE, ts_rule), "100.100.1.1 50000 100.64.0.5 22", 0),
+            ((RESTRICTED_RULE, ts_rule), "100.100.1.1 50000 192.0.2.10 22", 2),
+            ((RESTRICTED_RULE, "ufw allow in on eth1 to any port 22 proto tcp"), "100.100.1.1 50000 100.64.0.5 22", 2),
+            ((RESTRICTED_RULE,), "198.51.100.7 50000 192.0.2.10 22", 0),
+        ]
+        for rules, sess, rc in cases:
+            self.sb.log.write_text("")
+            self.preset(*rules)
+            r = self.sb.run("preflight", SSH_CONNECTION=sess)
+            self.assertEqual(r.returncode, rc, f"{rules} / {sess}: {r.stdout}{r.stderr}")
+            r = self.sb.run("apply_firewall", SSH_CONNECTION=sess)
+            self.assertEqual(r.returncode, rc, f"apply_firewall {rules} / {sess}: {r.stdout}{r.stderr}")
+            if rc:
+                self.assertEqual(self.ufw_mutations(), [], f"{rules} / {sess}")
+                self.assertEqual(self.added(), list(rules))
+
+    def test_interface_unknown_is_not_credited(self) -> None:
+        self.sb.add_key()
+        self.preset(RESTRICTED_RULE, "ufw allow in on tailscale0 to any port 22 proto tcp")
+        r = self.sb.run("preflight", SSH_CONNECTION="100.100.1.1 50000 100.64.0.5 22")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)  # control: interface known
+        (self.sb.tmp / "ip_addr").write_text("")
+        r = self.sb.run("preflight", SSH_CONNECTION="100.100.1.1 50000 100.64.0.5 22")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+
+    def test_allowlist_never_deletes_interface_or_destination_rules(self) -> None:
+        self.preset("ufw allow in on tailscale0", "ufw allow to 10.0.0.5 port 22 proto tcp", "ufw allow 22/tcp")
+        r = self.sb.run("apply_firewall", CITRATE_SSH_ALLOW_FROM="198.51.100.0/24",
+                        SSH_CONNECTION="198.51.100.20 50000 192.0.2.10 22")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        deletes = [c for c in self.ufw_mutations() if "delete" in c]
+        self.assertEqual(deletes, ["ufw --force delete allow 22/tcp"])
+        self.assertIn("ufw allow in on tailscale0", self.added())
+        self.assertIn("ufw allow to 10.0.0.5 port 22 proto tcp", self.added())
+
+    def test_allowlist_refuses_an_open_rule_wider_than_ssh(self) -> None:
+        self.sb.add_key()
+        for rule in ("ufw allow 20:30/tcp", "ufw allow 22,80/tcp", "ufw allow from any to any proto tcp"):
+            self.sb.log.write_text("")
+            self.preset(rule)
+            env = dict(CITRATE_SSH_ALLOW_FROM="198.51.100.0/24", SSH_CONNECTION="198.51.100.20 50000 192.0.2.10 22")
+            r = self.sb.run("preflight", **env)
+            self.assertEqual(r.returncode, 2, f"{rule}: {r.stdout}{r.stderr}")
+            r = self.sb.run("apply_firewall", **env)
+            self.assertEqual(r.returncode, 2, f"{rule}: {r.stdout}{r.stderr}")
+            self.assertEqual(self.ufw_mutations(), [], rule)
+            self.assertEqual(self.added(), [rule])
+
+    def test_sudo_without_a_session_source(self) -> None:
+        self.sb.add_key(user_home="home/alice")
+        # --ssh-from under sudo without SSH_CONNECTION: refused, nothing changed
+        r = self.sb.run("preflight", SUDO_USER="alice", CITRATE_SSH_ALLOW_FROM="198.51.100.0/24")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("preserve-env", r.stderr)
+        # only source-restricted SSH would remain: refused under sudo
+        self.preset(RESTRICTED_RULE)
+        r = self.sb.run("preflight", SUDO_USER="alice")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        r = self.sb.run("preflight", SUDO_USER="alice", SSH_CONNECTION="198.51.100.7 50000 192.0.2.10 22")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        # open SSH remains: nothing to lock out
+        self.preset("ufw allow 22/tcp")
+        r = self.sb.run("preflight", SUDO_USER="alice")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        # a root console without sudo: no session to lose
+        self.sb.add_key()
+        self.preset(RESTRICTED_RULE)
+        r = self.sb.run("preflight")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_header_documents_sudo(self) -> None:
+        head = SCRIPT.read_text().split("set -euo pipefail", 1)[0]
+        self.assertIn("sudo -i", head)
+
+
+class SshScopeStatusTest(unittest.TestCase):
+    def verdict(self, text: str, *args: str) -> subprocess.CompletedProcess[str]:
+        e = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": tempfile.gettempdir()}
+        return subprocess.run(["bash", str(SCRIPT), "check-ufw-status", *args], input=text,
+                              capture_output=True, text=True, env=e, timeout=30)
+
+    def test_scoped_rows_are_not_ssh_sources(self) -> None:
+        base = RESTRICTED_UFW.replace("22/tcp                     ALLOW IN    198.51.100.7\n", "")
+        for row in ("22/tcp on eth1             ALLOW IN    Anywhere\n",
+                    "10.0.0.5 22/tcp            ALLOW IN    Anywhere\n",
+                    "Anywhere on tailscale0     ALLOW IN    Anywhere\n"):
+            r = self.verdict(base + row)
+            ssh = [l for l in r.stdout.splitlines() if " ssh-source " in l]
+            self.assertTrue(ssh and ssh[0].startswith("FAIL"), f"{row!r}: {r.stdout}{r.stderr}")
+
+    def test_port_range_row_counts(self) -> None:
+        text = GOOD_UFW.replace("22/tcp                     ALLOW IN    Anywhere\n",
+                                "20:30/tcp                  ALLOW IN    198.51.100.7\n")
+        r = self.verdict(text)
+        ssh = [l for l in r.stdout.splitlines() if " ssh-source " in l]
+        self.assertTrue(ssh and "198.51.100.7/32" in ssh[0] and "Anywhere" in ssh[0], r.stdout)
 
 
 class PreflightPortTest(ShimTestCase):
