@@ -362,8 +362,37 @@ if [[ "$FRESH" == "1" && -n "${GOVERNANCE:-}" && -n "${GUARDIAN:-}" ]]; then
   ROOT_ALIASES="$(jq -c --arg g "$GOVERNANCE" --arg r "$GUARDIAN" '. + {governance: {GOVERNANCE: $g, GUARDIAN: $r}}' <<<"$ROOT_ALIASES")"
 fi
 
+# genesis.P256Verifier: the vendored daimo verifier aa/DeployP256Verifier lands through the
+# Arachnid factory at a fixed address. Forge records that CREATE2 with no contract name, so
+# the generic merge above cannot see it; it is listed when this chain's (usable) broadcast
+# created it at that address.
+P256_VERIFIER_ADDR=0xc2b78104907f722dabac4c69f826a522b2754de4
+GENESIS_EXTRA='{}'
+p256_bc="${BROADCAST_ROOT}/DeployP256Verifier.s.sol/${CHAIN_ID}/run-latest.json"
+if [[ -f "$p256_bc" ]] && bc_usable "$p256_bc" &&
+  jq -e --arg a "$P256_VERIFIER_ADDR" '[.transactions[]? | select(.transactionType == "CREATE2" and ((.contractAddress // "") | ascii_downcase) == $a)] | length > 0' "$p256_bc" >/dev/null 2>&1; then
+  GENESIS_EXTRA="{\"P256Verifier\":\"$P256_VERIFIER_ADDR\"}"
+  log "merging DeployP256Verifier.s.sol (genesis.P256Verifier)"
+fi
+
+# genesis.OrangeSeed / genesis.OrangeSeedV0: the block-0 predeploy (chain#389) is a genesis
+# allocation, not a broadcast. With EMIT_ORANGESEED_ALLOC (the GenesisOrangeSeed output the
+# genesis build placed in block 0), the proxy and its V0 implementation are listed when that
+# allocation gives both predeploy addresses code. A file without them is an error.
+ORANGESEED_PROXY=0x000000000000000000000000000000c17a7e5eed
+ORANGESEED_IMPL=0x000000000000000000000000000000c17a7e5ee0
+if [[ -n "${EMIT_ORANGESEED_ALLOC:-}" ]]; then
+  jq -e --arg p "$ORANGESEED_PROXY" --arg i "$ORANGESEED_IMPL" \
+    '(.alloc // {}) | with_entries(.key |= ascii_downcase) | (.[$p].code // "0x") != "0x" and (.[$i].code // "0x") != "0x"' \
+    "$EMIT_ORANGESEED_ALLOC" >/dev/null 2>&1 ||
+    { err "EMIT_ORANGESEED_ALLOC ($EMIT_ORANGESEED_ALLOC) does not allocate code to the OrangeSeed proxy and implementation"; exit 1; }
+  GENESIS_EXTRA="$(jq -c --arg p "$ORANGESEED_PROXY" --arg i "$ORANGESEED_IMPL" '. + {OrangeSeed: $p, OrangeSeedV0: $i}' <<<"$GENESIS_EXTRA")"
+  log "genesis.OrangeSeed from the block-0 allocation ${EMIT_ORANGESEED_ALLOC}"
+fi
+
 jq -n \
   --argjson prior_contracts "$PRIOR_CONTRACTS" \
+  --argjson genesis_extra "$GENESIS_EXTRA" \
   --argjson root_aliases "$ROOT_ALIASES" \
   --argjson prior_extra "$PRIOR_EXTRA" \
   --argjson contracts "$(cat "$contracts_jq")" \
@@ -382,7 +411,7 @@ jq -n \
     comment: "Canonical contract-address table for chain 40204 — the single source of truth the federation reads from. Regenerated from broadcast/*.s.sol/40204/run-latest.json + .env.testnet AA pins. See contracts/addresses/README.md.",
     contracts: ($prior_contracts + $contracts),
     aaStack: $aa,
-    genesis: { ArachnidDeterministicDeployer: "0x4e59b44847b379578588920ca78fbf26c0b4956c" },
+    genesis: ({ ArachnidDeterministicDeployer: "0x4e59b44847b379578588920ca78fbf26c0b4956c" } + $genesis_extra),
     precompiles: {
       ModelDeploy:            "0x0000000000000000000000000000000000000100",
       ModelInference:         "0x0000000000000000000000000000000000000101",
