@@ -34,7 +34,7 @@ while [ $# -gt 0 ]; do
     --fast) FAST=1; shift ;;
     --no-forge) NO_FORGE=1; shift ;;
     --list)
-      echo "gates: fmt-changed, clippy, panic-ratchet, consensus-tripwires, git-rev-deps, audit-lockfiles, fuzz-targets-compile, ci-scripts, test-workspace, test-commd, forge-build, forge-test"
+      echo "gates: fmt-changed, clippy, panic-ratchet, consensus-tripwires, git-rev-deps, audit-lockfiles, fuzz-targets-compile, ci-scripts, test-workspace, test-commd, forge-build, forge-test, genesis-pipeline"
       exit 0 ;;
     -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 1 ;;
@@ -244,6 +244,7 @@ if [ "$FAST" -eq 1 ]; then
   skip "test-commd" "--fast"
   skip "forge-build" "--fast"
   skip "forge-test" "--fast"
+  skip "genesis-pipeline" "--fast"
 else
   # ── gate: workspace tests (mirrors rust-ci.yml core-workspace) ────────────
   # Failures already on main are tracked in known-test-failures.txt so this gate
@@ -284,12 +285,16 @@ else
 
   # ── gates: solidity ──────────────────────────────────────────────────────
   if [ "$NO_FORGE" -eq 1 ]; then
-    skip "forge-build" "--no-forge"; skip "forge-test" "--no-forge"
+    skip "forge-build" "--no-forge"; skip "forge-test" "--no-forge"; skip "genesis-pipeline" "--no-forge"
   elif ! command -v forge >/dev/null 2>&1; then
     skip "forge-build" "forge not installed"; skip "forge-test" "forge not installed"
+    skip "genesis-pipeline" "forge not installed"
   else
     gate "forge-build" bash -c "cd '$REPO_ROOT/contracts' && forge build"
     gate "forge-test"  bash -c "cd '$REPO_ROOT/contracts' && forge test"
+    # Real `forge script --broadcast` run of the C4 genesis ceremony on anvil 40204: catches
+    # script-only failures (e.g. `address(this)` on a run path) that `forge test` cannot.
+    gate "genesis-pipeline" "$REPO_ROOT/scripts/ci/genesis-pipeline-anvil.sh"
   fi
 fi
 
