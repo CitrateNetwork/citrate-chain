@@ -202,6 +202,48 @@ pub async fn initialize_genesis_with_dag(
 mod tests {
     use super::*;
 
+    async fn build_with_profile(chain_id: u64, profile: Option<&str>) -> anyhow::Result<Hash> {
+        use citrate_execution::StateDB;
+        use citrate_storage::pruning::PruningConfig;
+        let dir = tempfile::tempdir().expect("dir");
+        let st = Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("st"));
+        let ex = Arc::new(Executor::with_storage_and_chain_id(
+            Arc::new(StateDB::new()),
+            Some(st.state.clone()),
+            chain_id,
+        ));
+        let cfg = GenesisConfig {
+            chain_id,
+            ..Default::default()
+        };
+        initialize_genesis_state_with_profile(st, ex, &cfg, profile).await
+    }
+
+    /// A profile this build does not compile (for example `r1006` before its genesis
+    /// lands, or a typo) is refused. It must never fall back to the chain-id default,
+    /// which on 40204 is the release genesis of another network.
+    #[tokio::test]
+    async fn an_unknown_genesis_profile_is_refused_not_inferred() {
+        for p in ["r1006", "testnet-beta", "TESTNET_BETA", "", "default "] {
+            let r = build_with_profile(40204, Some(p)).await;
+            assert!(
+                r.is_err(),
+                "genesis_profile {p:?} built block 0 {:?} instead of being refused",
+                r.ok().map(|h| hex::encode(h.as_bytes()))
+            );
+            let e = format!("{:#}", r.err().expect("err"));
+            assert!(e.contains("genesis_profile"), "{e}");
+        }
+    }
+
+    /// Negative control: the known profiles, and no profile at all, still build.
+    #[tokio::test]
+    async fn known_genesis_profiles_still_build() {
+        for p in [None, Some("default"), Some("testnet_beta"), Some("team_testnet"), Some("mainnet")] {
+            build_with_profile(40204, p).await.expect("known profile builds");
+        }
+    }
+
     #[test]
     fn test_genesis_block_height_zero() {
         let config = GenesisConfig::default();

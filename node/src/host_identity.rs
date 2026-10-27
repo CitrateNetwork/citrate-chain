@@ -483,6 +483,41 @@ mod tests {
         assert_eq!(v["staker_address"], id.staker_address.as_str());
     }
 
+    /// Pins the VRF key's derivation input: it is the P-256 key of the proposer SEED, the
+    /// key `producer.rs` proves block VRFs with, so peers verify this host's proofs with
+    /// it. Deriving it from anything else (the ed25519 public key, the noise key) makes
+    /// every VRF proof this producer signs disagree with its registered key.
+    #[test]
+    fn vrf_pubkey_is_the_key_block_vrf_proofs_carry() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let p = paths(dir.path());
+        let id = run_with_cost(&p, true, 4).expect("mint");
+        let seed: [u8; 32] = std::fs::read(p.data_dir.join("proposer.key"))
+            .expect("proposer.key")
+            .get(..32)
+            .and_then(|b| b.try_into().ok())
+            .expect("32-byte seed");
+        let (proof, _beta) =
+            citrate_consensus::ecvrf::prove(&seed, b"r1006 vrf pin").expect("prove");
+        let carried = format!("0x{}", hex::encode(&proof.to_bytes()[..33]));
+        assert_eq!(
+            id.vrf_pubkey, carried,
+            "vrf_pubkey is not the key the producer's VRF proofs carry"
+        );
+        citrate_consensus::ecvrf::verify(b"r1006 vrf pin", &proof).expect("verifies");
+        // Negative control: the same derivation over the ed25519 PUBLIC key differs.
+        let pk_hex = id.proposer_pubkey.trim_start_matches("0x");
+        let pk: [u8; 32] = hex::decode(pk_hex)
+            .expect("hex")
+            .try_into()
+            .expect("32 bytes");
+        assert_ne!(
+            id.vrf_pubkey,
+            format!("0x{}", hex::encode(citrate_consensus::ecvrf::derive_public_key(&pk))),
+            "derived from the public key"
+        );
+    }
+
     /// `run` with a cheap scrypt cost so tests stay fast; the CLI always uses 2^18.
     fn run_with_cost(p: &IdentityPaths, mint: bool, log_n: u8) -> anyhow::Result<HostIdentity> {
         if mint && !p.staker_keystore.exists() {
