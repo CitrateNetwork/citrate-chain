@@ -33,13 +33,14 @@ REPO_ROOT="${DIRECT_STATE_WRITE_TRIPWIRE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]
 # Functions allowed to write `state_db` directly, and why. Adding a name here
 # needs a reason that it can never run inside a transaction.
 #   set_balance / set_nonce / set_code     public setters: genesis, admin, tests, drain
+#   set_genesis_storage                    genesis only: an alloc's contract storage (r1006)
 #   register_genesis_model_from_bytes      genesis construction
 #   settle_block_rewards                   end-of-block, after every tx committed
 #   credit_validator_reward                end-of-block reward credit
 #   drain_journal                          applies a COMMITTED tx's journal
 #   simulate_transaction                   writes a throwaway simulation copy
 #   add_model_artifact                     API path, never called from a tx
-OUT_OF_TX="set_balance set_nonce set_code register_genesis_model_from_bytes settle_block_rewards credit_validator_reward drain_journal simulate_transaction add_model_artifact"
+OUT_OF_TX="set_balance set_nonce set_code set_genesis_storage register_genesis_model_from_bytes settle_block_rewards credit_validator_reward drain_journal simulate_transaction add_model_artifact"
 
 scan_transfers() { # <dir> ; prints violations, returns 0 iff any found
   local out

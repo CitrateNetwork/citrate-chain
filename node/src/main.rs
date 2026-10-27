@@ -483,10 +483,18 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some(Commands::RegistrationProof { registry, staker }) => {
-            let cfg_path = resolve_config_path(cli.config.clone())
-                .ok_or_else(|| anyhow::anyhow!("registration-proof needs the node config (--config)"))?;
+            let cfg_path = resolve_config_path(cli.config.clone()).ok_or_else(|| {
+                anyhow::anyhow!("registration-proof needs the node config (--config)")
+            })?;
             let cfg = NodeConfig::from_file(&cfg_path)?;
-            let coinbase = format!("0x{}", cfg.mining.coinbase.trim().trim_start_matches("0x").to_lowercase());
+            let coinbase = format!(
+                "0x{}",
+                cfg.mining
+                    .coinbase
+                    .trim()
+                    .trim_start_matches("0x")
+                    .to_lowercase()
+            );
             let staker = staker.unwrap_or_else(|| coinbase.clone());
             if staker.to_lowercase() != coinbase {
                 anyhow::bail!("the staker must be this node's coinbase {coinbase} (consensus requires coinbase == staker)");
@@ -2216,17 +2224,19 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // On the r1006 genesis with its producer set filled, the registry and the activation
     // height are compiled into the genesis profile (genesis::resolve_validator_registry);
     // the env may only repeat them. On any other chain the env decides, as before.
-    let compiled_validator_set = if running_genesis == Some(citrate_consensus::hardening::R1006_GENESIS)
-    {
-        citrate_economics::r1006::validator_set_binding()
-            .map_err(|e| anyhow::anyhow!("invalid r1006 genesis: {e}"))?
-    } else {
-        None
-    };
+    let compiled_validator_set =
+        if running_genesis == Some(citrate_consensus::hardening::R1006_GENESIS) {
+            citrate_economics::r1006::validator_set_binding()
+                .map_err(|e| anyhow::anyhow!("invalid r1006 genesis: {e}"))?
+        } else {
+            None
+        };
     let validator_registry: Option<([u8; 20], u64)> = genesis::resolve_validator_registry(
         compiled_validator_set,
         std::env::var("CITRATE_VALIDATOR_REGISTRY").ok().as_deref(),
-        std::env::var("CITRATE_VALIDATOR_ACTIVATION_HEIGHT").ok().as_deref(),
+        std::env::var("CITRATE_VALIDATOR_ACTIVATION_HEIGHT")
+            .ok()
+            .as_deref(),
     )?;
     // VALIDATOR-S1 §R': fail fast if the activation height is below the FIRST
     // materialized snapshot S(1) = EPOCH - SNAPSHOT_LAG (= 800). Below S(1) no epoch

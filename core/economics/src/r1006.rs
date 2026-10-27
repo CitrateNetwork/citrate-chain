@@ -306,7 +306,10 @@ pub fn validator_set_binding() -> Result<Option<([u8; 20], u64)>, GenesisError> 
     if v.status != "final" || v.registry.is_none() {
         return Ok(None);
     }
-    Ok(Some((address(&f.validator_registry)?.0, R1006_VALIDATOR_ACTIVATION_HEIGHT)))
+    Ok(Some((
+        address(&f.validator_registry)?.0,
+        R1006_VALIDATOR_ACTIVATION_HEIGHT,
+    )))
 }
 
 /// What the compiled r1006 genesis still waits for.
@@ -575,7 +578,10 @@ mod tests {
         let has_r1005 = cfg.accounts.iter().any(|a| r1005.contains(&a.address));
         match &f.base_allocations {
             Some(b) => {
-                assert!(!has_r1005, "an r1005 account is funded in a final r1006 genesis");
+                assert!(
+                    !has_r1005,
+                    "an r1005 account is funded in a final r1006 genesis"
+                );
                 assert_eq!(b.len(), 3);
             }
             None => assert!(has_r1005, "the rehearsal carries the testnet_beta set"),

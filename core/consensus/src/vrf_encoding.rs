@@ -43,7 +43,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// canonical form.
 pub const VRF_CANONICAL_ENCODING_ENV: &str = "CITRATE_VRF_CANONICAL_ENCODING_HEIGHT";
 
-
 const UNSET: u64 = u64::MAX;
 
 static VRF_CANONICAL_ENCODING_HEIGHT: AtomicU64 = AtomicU64::new(UNSET);
@@ -189,7 +188,11 @@ pub fn resolve_for_genesis(
         Err(std::env::VarError::NotPresent) => None,
         Err(e) => return Err(format!("{VRF_CANONICAL_ENCODING_ENV}: {e}")),
     };
-    resolve(pin_for_genesis(chain_id, genesis), env_raw.as_deref(), config_value)
+    resolve(
+        pin_for_genesis(chain_id, genesis),
+        env_raw.as_deref(),
+        config_value,
+    )
 }
 
 /// Resolve and publish process-wide. The node calls this once at start-up, after it
@@ -231,16 +234,38 @@ mod tests {
             Some(None),
             "40204 is a release network with no height scheduled"
         );
-        assert_eq!(pin_for_genesis(1337, None), None, "devnet is not a release network");
         assert_eq!(
-            resolve(pin_for_genesis(40204, Some(&crate::hardening::RELEASE_GENESIS[0].1)), None, None),
+            pin_for_genesis(1337, None),
+            None,
+            "devnet is not a release network"
+        );
+        assert_eq!(
+            resolve(
+                pin_for_genesis(40204, Some(&crate::hardening::RELEASE_GENESIS[0].1)),
+                None,
+                None
+            ),
             Ok((None, VrfEncodingSource::Unset))
         );
         // A per-node height on 40204 refuses to start; `off` is accepted.
-        assert!(resolve(pin_for_genesis(40204, Some(&crate::hardening::RELEASE_GENESIS[0].1)), Some("0"), None).is_err());
-        assert!(resolve(pin_for_genesis(40204, Some(&crate::hardening::RELEASE_GENESIS[0].1)), None, Some(0)).is_err());
+        assert!(resolve(
+            pin_for_genesis(40204, Some(&crate::hardening::RELEASE_GENESIS[0].1)),
+            Some("0"),
+            None
+        )
+        .is_err());
+        assert!(resolve(
+            pin_for_genesis(40204, Some(&crate::hardening::RELEASE_GENESIS[0].1)),
+            None,
+            Some(0)
+        )
+        .is_err());
         assert_eq!(
-            resolve(pin_for_genesis(40204, Some(&crate::hardening::RELEASE_GENESIS[0].1)), Some("off"), None),
+            resolve(
+                pin_for_genesis(40204, Some(&crate::hardening::RELEASE_GENESIS[0].1)),
+                Some("off"),
+                None
+            ),
             Ok((None, VrfEncodingSource::Unset))
         );
     }

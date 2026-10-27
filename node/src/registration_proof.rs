@@ -10,7 +10,9 @@
 //! line. The genesis fill (`scripts/genesis/r1006/fill_producers.py`) verifies each
 //! signature and the build replays the registration with it.
 
-use citrate_consensus::crypto::{block_signing_key_from_seed, sign_registration, Ed25519SigningKey};
+use citrate_consensus::crypto::{
+    block_signing_key_from_seed, sign_registration, Ed25519SigningKey,
+};
 use serde_json::{json, Value};
 use std::path::Path;
 use zeroize::Zeroizing;
@@ -21,24 +23,33 @@ pub const SCHEMA: &str = "citrate-registration-proof/1";
 /// mints an identity.
 pub fn load_proposer_key(path: &Path) -> anyhow::Result<Ed25519SigningKey> {
     if !path.exists() {
-        anyhow::bail!("no proposer key at {path:?}: run the node (or `citrate host-identity`) first");
+        anyhow::bail!(
+            "no proposer key at {path:?}: run the node (or `citrate host-identity`) first"
+        );
     }
-    let seed = Zeroizing::new(std::fs::read(path).map_err(|e| anyhow::anyhow!("read {path:?}: {e}"))?);
-    let arr: Zeroizing<[u8; 32]> = Zeroizing::new(
-        <[u8; 32]>::try_from(seed.as_slice())
-            .map_err(|_| anyhow::anyhow!("{path:?} is {} bytes, expected a 32-byte seed", seed.len()))?,
-    );
+    let seed =
+        Zeroizing::new(std::fs::read(path).map_err(|e| anyhow::anyhow!("read {path:?}: {e}"))?);
+    let arr: Zeroizing<[u8; 32]> =
+        Zeroizing::new(<[u8; 32]>::try_from(seed.as_slice()).map_err(|_| {
+            anyhow::anyhow!("{path:?} is {} bytes, expected a 32-byte seed", seed.len())
+        })?);
     Ok(block_signing_key_from_seed(&arr))
 }
 
 fn addr(raw: &str, what: &str) -> anyhow::Result<[u8; 20]> {
-    let b = hex::decode(raw.trim().trim_start_matches("0x")).map_err(|e| anyhow::anyhow!("{what} {raw}: {e}"))?;
+    let b = hex::decode(raw.trim().trim_start_matches("0x"))
+        .map_err(|e| anyhow::anyhow!("{what} {raw}: {e}"))?;
     <[u8; 20]>::try_from(b.as_slice()).map_err(|_| anyhow::anyhow!("{what} {raw}: not 20 bytes"))
 }
 
 /// The public proof for `key`: the registration digest signed for (chain id, registry,
 /// staker, nonce 0).
-pub fn proof(chain_id: u64, registry: &str, staker: &str, key: &Ed25519SigningKey) -> anyhow::Result<Value> {
+pub fn proof(
+    chain_id: u64,
+    registry: &str,
+    staker: &str,
+    key: &Ed25519SigningKey,
+) -> anyhow::Result<Value> {
     let reg = addr(registry, "registry")?;
     let st = addr(staker, "staker")?;
     let pk = key.verifying_key().to_bytes();
@@ -66,7 +77,8 @@ mod tests {
         let st = "0xa0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0";
         let p = proof(40204, reg, st, &key).expect("proof");
         let sig_hex = p["registration_sig"].as_str().expect("sig");
-        let sig = Signature::from_slice(&hex::decode(&sig_hex[2..]).expect("hex")).expect("64 bytes");
+        let sig =
+            Signature::from_slice(&hex::decode(&sig_hex[2..]).expect("hex")).expect("64 bytes");
         let digest = citrate_consensus::crypto::registration_digest(
             40204,
             &[0x11; 20],
@@ -74,21 +86,41 @@ mod tests {
             &key.verifying_key().to_bytes(),
             0,
         );
-        key.verifying_key().verify(&digest, &sig).expect("the proof verifies");
+        key.verifying_key()
+            .verify(&digest, &sig)
+            .expect("the proof verifies");
         // Another registry or chain id does not verify.
-        let other = citrate_consensus::crypto::registration_digest(1, &[0x11; 20], &[0xa0; 20], &key.verifying_key().to_bytes(), 0);
+        let other = citrate_consensus::crypto::registration_digest(
+            1,
+            &[0x11; 20],
+            &[0xa0; 20],
+            &key.verifying_key().to_bytes(),
+            0,
+        );
         assert!(key.verifying_key().verify(&other, &sig).is_err());
         let text = p.to_string();
         assert!(!text.contains(&hex::encode(seed)), "the seed never appears");
-        assert_eq!(p["proposer_pubkey"], format!("0x{}", hex::encode(key.verifying_key().to_bytes())));
+        assert_eq!(
+            p["proposer_pubkey"],
+            format!("0x{}", hex::encode(key.verifying_key().to_bytes()))
+        );
     }
 
     /// The digest the fill (scripts/genesis/r1006/fill_producers.py) verifies against is
     /// the one this signs: a golden vector shared by both (the shell suite pins the same).
     #[test]
     fn the_registration_digest_matches_the_fill_golden_vector() {
-        let d = citrate_consensus::crypto::registration_digest(40204, &[0x11; 20], &[0xa0; 20], &[0x01; 32], 0);
-        assert_eq!(hex::encode(d), "9884befc29931c0e18cc170372c8131d32ec2a153ead11a49541014804569f23");
+        let d = citrate_consensus::crypto::registration_digest(
+            40204,
+            &[0x11; 20],
+            &[0xa0; 20],
+            &[0x01; 32],
+            0,
+        );
+        assert_eq!(
+            hex::encode(d),
+            "9884befc29931c0e18cc170372c8131d32ec2a153ead11a49541014804569f23"
+        );
     }
 
     #[test]

@@ -143,7 +143,9 @@ pub fn r1006_boot_guard(
     }
     let missing = readiness.missing().join("; ");
     if rehearsal {
-        tracing::warn!("r1006 REHEARSAL genesis ({R1006_REHEARSAL_ENV}=1): not release-ready: {missing}");
+        tracing::warn!(
+            "r1006 REHEARSAL genesis ({R1006_REHEARSAL_ENV}=1): not release-ready: {missing}"
+        );
         return Ok(());
     }
     anyhow::bail!(
@@ -369,14 +371,27 @@ mod tests {
         let r1006 = citrate_consensus::hardening::R1006_GENESIS;
         let r1005 = citrate_consensus::hardening::RELEASE_GENESIS[0].1;
         let unknown = [0x42u8; 32];
-        let ready = Readiness { inputs_final: true, validators_final: true, orangeseed_present: true };
-        let not_ready = Readiness { validators_final: false, ..ready.clone() };
-        let g = |p, run: Option<&[u8; 32]>, r: &Readiness, reh| r1006_boot_guard(40204, p, run, r, reh);
+        let ready = Readiness {
+            inputs_final: true,
+            validators_final: true,
+            orangeseed_present: true,
+        };
+        let not_ready = Readiness {
+            validators_final: false,
+            ..ready.clone()
+        };
+        let g =
+            |p, run: Option<&[u8; 32]>, r: &Readiness, reh| r1006_boot_guard(40204, p, run, r, reh);
         // Release-ready r1006: boots without the opt-in.
         assert!(g(Some("r1006"), Some(&r1006), &ready, false).is_ok());
         // Not release-ready: refused, naming what is missing, unless it is a rehearsal.
-        let e = g(Some("r1006"), Some(&r1006), &not_ready, false).unwrap_err().to_string();
-        assert!(e.contains("not release-ready") && e.contains("producer set"), "{e}");
+        let e = g(Some("r1006"), Some(&r1006), &not_ready, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("not release-ready") && e.contains("producer set"),
+            "{e}"
+        );
         assert!(g(Some("r1006"), Some(&r1006), &not_ready, true).is_ok());
         // The r1006 block 0 is guarded whatever the configured profile says.
         assert!(g(None, Some(&r1006), &not_ready, false).is_err());
@@ -398,12 +413,19 @@ mod tests {
         let hex_reg = format!("0x{}", hex::encode(reg));
         let c = Some((reg, 1_000));
         assert_eq!(resolve_validator_registry(c, None, None).unwrap(), c);
-        assert_eq!(resolve_validator_registry(c, Some(&hex_reg), Some("1000")).unwrap(), c);
+        assert_eq!(
+            resolve_validator_registry(c, Some(&hex_reg), Some("1000")).unwrap(),
+            c
+        );
         assert!(resolve_validator_registry(c, Some("0x".to_owned().as_str()), None).is_err());
         let other = format!("0x{}", hex::encode([0xCD; 20]));
-        let e = resolve_validator_registry(c, Some(&other), None).unwrap_err().to_string();
+        let e = resolve_validator_registry(c, Some(&other), None)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("not the ValidatorRegistry the r1006"), "{e}");
-        let e = resolve_validator_registry(c, None, Some("800")).unwrap_err().to_string();
+        let e = resolve_validator_registry(c, None, Some("800"))
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("compiled activation height 1000"), "{e}");
         // Not compiled (another genesis, or a placeholder set): the env decides.
         assert_eq!(resolve_validator_registry(None, None, None).unwrap(), None);
@@ -417,7 +439,15 @@ mod tests {
     #[test]
     fn the_rehearsal_opt_in_is_exactly_one() {
         assert!(parse_r1006_rehearsal(Some("1")));
-        for v in [None, Some(""), Some("0"), Some("true"), Some("yes"), Some(" 1"), Some("1 ")] {
+        for v in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("true"),
+            Some("yes"),
+            Some(" 1"),
+            Some("1 "),
+        ] {
             assert!(!parse_r1006_rehearsal(v), "{v:?}");
         }
     }

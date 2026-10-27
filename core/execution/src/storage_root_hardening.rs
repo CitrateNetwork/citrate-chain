@@ -38,7 +38,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// compute different state roots once a storage slot has been deleted.
 pub const STORAGE_ROOT_HARDENING_ENV: &str = "CITRATE_STORAGE_ROOT_HARDENING_HEIGHT";
 
-
 const UNSET: u64 = u64::MAX;
 
 static STORAGE_ROOT_HARDENING_HEIGHT: AtomicU64 = AtomicU64::new(UNSET);
@@ -190,7 +189,11 @@ pub fn resolve_for_genesis(
         Err(std::env::VarError::NotPresent) => None,
         Err(e) => return Err(format!("{STORAGE_ROOT_HARDENING_ENV}: {e}")),
     };
-    resolve(pin_for_genesis(chain_id, genesis), env_raw.as_deref(), config_value)
+    resolve(
+        pin_for_genesis(chain_id, genesis),
+        env_raw.as_deref(),
+        config_value,
+    )
 }
 
 /// Resolve and publish process-wide. The node calls this once at start-up, after it
@@ -215,8 +218,16 @@ mod tests {
     fn genesis_keyed_schedule_r1006_zero_r1005_unset_unknown_local() {
         use citrate_consensus::hardening::{R1006_GENESIS, RELEASE_GENESIS};
         assert_eq!(pin_for_genesis(40204, Some(&R1006_GENESIS)), Some(Some(0)));
-        assert_eq!(pin_for_genesis(40204, Some(&RELEASE_GENESIS[0].1)), Some(None));
-        assert!(resolve(pin_for_genesis(40204, Some(&RELEASE_GENESIS[0].1)), None, Some(0)).is_err());
+        assert_eq!(
+            pin_for_genesis(40204, Some(&RELEASE_GENESIS[0].1)),
+            Some(None)
+        );
+        assert!(resolve(
+            pin_for_genesis(40204, Some(&RELEASE_GENESIS[0].1)),
+            None,
+            Some(0)
+        )
+        .is_err());
         assert_eq!(pin_for_genesis(40204, Some(&[0x42; 32])), None);
     }
 
@@ -233,17 +244,65 @@ mod tests {
 
     #[test]
     fn chain_40204_ships_unscheduled_and_refuses_per_node_heights() {
-        assert_eq!(pin_for_genesis(40204, Some(&citrate_consensus::hardening::RELEASE_GENESIS[0].1)), Some(None));
-        assert_eq!(pin_for_genesis(1337, None), None, "devnet is not a release network");
         assert_eq!(
-            resolve(pin_for_genesis(40204, Some(&citrate_consensus::hardening::RELEASE_GENESIS[0].1)), None, None),
+            pin_for_genesis(
+                40204,
+                Some(&citrate_consensus::hardening::RELEASE_GENESIS[0].1)
+            ),
+            Some(None)
+        );
+        assert_eq!(
+            pin_for_genesis(1337, None),
+            None,
+            "devnet is not a release network"
+        );
+        assert_eq!(
+            resolve(
+                pin_for_genesis(
+                    40204,
+                    Some(&citrate_consensus::hardening::RELEASE_GENESIS[0].1)
+                ),
+                None,
+                None
+            ),
             Ok((None, StorageRootHardeningSource::Unset))
         );
-        assert!(resolve(pin_for_genesis(40204, Some(&citrate_consensus::hardening::RELEASE_GENESIS[0].1)), Some("100"), None).is_err());
-        assert!(resolve(pin_for_genesis(40204, Some(&citrate_consensus::hardening::RELEASE_GENESIS[0].1)), Some("0"), None).is_err());
-        assert!(resolve(pin_for_genesis(40204, Some(&citrate_consensus::hardening::RELEASE_GENESIS[0].1)), None, Some(0)).is_err());
+        assert!(resolve(
+            pin_for_genesis(
+                40204,
+                Some(&citrate_consensus::hardening::RELEASE_GENESIS[0].1)
+            ),
+            Some("100"),
+            None
+        )
+        .is_err());
+        assert!(resolve(
+            pin_for_genesis(
+                40204,
+                Some(&citrate_consensus::hardening::RELEASE_GENESIS[0].1)
+            ),
+            Some("0"),
+            None
+        )
+        .is_err());
+        assert!(resolve(
+            pin_for_genesis(
+                40204,
+                Some(&citrate_consensus::hardening::RELEASE_GENESIS[0].1)
+            ),
+            None,
+            Some(0)
+        )
+        .is_err());
         assert_eq!(
-            resolve(pin_for_genesis(40204, Some(&citrate_consensus::hardening::RELEASE_GENESIS[0].1)), Some("off"), None),
+            resolve(
+                pin_for_genesis(
+                    40204,
+                    Some(&citrate_consensus::hardening::RELEASE_GENESIS[0].1)
+                ),
+                Some("off"),
+                None
+            ),
             Ok((None, StorageRootHardeningSource::Unset))
         );
     }

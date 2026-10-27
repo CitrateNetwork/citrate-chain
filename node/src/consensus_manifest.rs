@@ -951,13 +951,28 @@ mod tests {
             2,
             "start_node: the boot stamp and the identity fallback, both for_node"
         );
-        assert!(body.contains("let manifest = node_manifest.clone()"), "the RPC reuses the boot manifest");
-        for other in ["ConsensusManifest::current()", "ConsensusManifest::for_height(", "ConsensusManifest::for_all("] {
-            assert!(!body.contains(other), "start_node builds a second manifest via {other}");
+        assert!(
+            body.contains("let manifest = node_manifest.clone()"),
+            "the RPC reuses the boot manifest"
+        );
+        for other in [
+            "ConsensusManifest::current()",
+            "ConsensusManifest::for_height(",
+            "ConsensusManifest::for_all(",
+        ] {
+            assert!(
+                !body.contains(other),
+                "start_node builds a second manifest via {other}"
+            );
         }
-        let cmd = &main[main.find("Some(Commands::Consensus { json })").expect("consensus cmd")..];
+        let cmd = &main[main
+            .find("Some(Commands::Consensus { json })")
+            .expect("consensus cmd")..];
         let cmd = &cmd[..cmd.find("return Ok(());").expect("end")];
-        assert!(cmd.contains("ConsensusManifest::for_node("), "citrate consensus uses for_node");
+        assert!(
+            cmd.contains("ConsensusManifest::for_node("),
+            "citrate consensus uses for_node"
+        );
         assert!(!cmd.contains("ConsensusManifest::for_all("));
         // for_node is the current manifest, bound to the genesis exactly as bound() does.
         let g = [7u8; 32];
