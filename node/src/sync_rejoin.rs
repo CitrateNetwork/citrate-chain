@@ -1644,7 +1644,7 @@ mod tests {
             .await;
         assert_eq!(fx.newly_admitted, 1, "fixture: the sibling admits");
         let watch = TipWatch::start(n.storage.clone());
-        n.app.maybe_runtime_rebuild(h(&sibling)).await;
+        n.app.maybe_runtime_rebuild(h(&sibling), true).await;
         let lowest = watch.finish();
         assert!(
             lowest >= tip_height,
@@ -1669,7 +1669,7 @@ mod tests {
         assert_eq!(fx.newly_admitted, net.main.len(), "fixture: main admits");
         let main_tip = net.main.last().expect("main");
         let watch = TipWatch::start(n.storage.clone());
-        n.app.maybe_runtime_rebuild(h(main_tip)).await;
+        n.app.maybe_runtime_rebuild(h(main_tip), true).await;
         let lowest = watch.finish();
         assert!(lowest >= fork + 1, "rebuilt on a pruned node: {lowest}");
         assert_eq!(n.applied(), Some((h(&net.side[0]), fork + 1)));
