@@ -4607,6 +4607,85 @@ pub(crate) mod tests {
         assert_eq!(app.applied_tip().await.hash, loser.header.block_hash);
     }
 
+    /// rvHH: a restarted tie-loser whose applied tip is STORED in the DAG but
+    /// not registered in GhostDAG `relations` (a restart registers tips only)
+    /// refuses the rebuild at equal weight, and rebuilds once the winner gains
+    /// a child. Pins "rejoins one block later" on real GhostDAG scoring: with
+    /// registered-only scoring the tip is unscored and the second step would
+    /// refuse as well (the node would never rejoin).
+    #[tokio::test]
+    async fn unregistered_tie_loser_refuses_then_rejoins_one_block_later() {
+        use citrate_consensus::dag_store::DagStore;
+        use citrate_consensus::types::GhostDagParams;
+        let (exec, storage, _dir) = fresh();
+        let (gs, genesis, winner, loser) = restarted_on_tie_loser(&exec, &storage).await;
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+        dag.store_block(genesis.clone()).await.expect("genesis");
+        ghostdag.add_block(&genesis).await.expect("genesis");
+        dag.store_block(loser.clone()).await.expect("loser stored");
+        dag.store_block(winner.clone())
+            .await
+            .expect("winner stored");
+        ghostdag
+            .add_block(&winner)
+            .await
+            .expect("winner registered");
+        assert!(
+            ghostdag
+                .get_blue_score(&loser.header.block_hash)
+                .await
+                .is_err(),
+            "fixture: the applied tip is stored but not registered"
+        );
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone())
+            .with_fork_choice(ghostdag.clone());
+        let loser_tip = AppliedTip {
+            hash: loser.header.block_hash,
+            height: 1,
+        };
+
+        // Equal weight: refused.
+        let rebuilt = app
+            .recover_automatic(
+                gs.clone(),
+                genesis.header.block_hash,
+                winner.header.block_hash,
+            )
+            .await
+            .expect("recovery");
+        assert!(!rebuilt, "rebuilt toward an equal-weight sibling");
+        assert_eq!(app.applied_tip().await, loser_tip);
+
+        // The winner gains a child: strictly heavier, rebuilt onto.
+        let r = roots(2);
+        let child = mk_block_scored(2, winner.header.block_hash, r[1], 2, VRF_OUT);
+        dag.store_block(child.clone()).await.expect("child stored");
+        ghostdag.add_block(&child).await.expect("child registered");
+        persist(&storage, &child);
+        let head = ghostdag.select_tip().await.expect("tip");
+        assert_eq!(head, child.header.block_hash);
+        let rebuilt = app
+            .recover_automatic(gs, genesis.header.block_hash, head)
+            .await
+            .expect("recovery");
+        assert!(rebuilt, "the strictly heavier branch was not rebuilt onto");
+        assert_eq!(
+            app.applied_tip().await,
+            AppliedTip {
+                hash: child.header.block_hash,
+                height: 2
+            }
+        );
+        assert!(
+            ghostdag
+                .get_blue_score(&loser.header.block_hash)
+                .await
+                .is_err(),
+            "the loser was scored without being registered"
+        );
+    }
+
     /// The 2026-08-06 shape through the node's OWN triggers (start-up recovery
     /// and the drain fallback, `recover_automatic`): restarted on the losing
     /// one of two equal-score siblings, the node does not rebuild from genesis
