@@ -1408,9 +1408,9 @@ class OperatorEndpoint(unittest.TestCase):
     """[rpc] serve_recent_state_tags: one designated operator host (inventory field), whose
     tunnel smoke uses for forge; every other host stays strict (chain#425)."""
 
-    def test_committed_inventory_designates_only_prod1_at_64(self):
+    def test_committed_inventory_designates_only_prod1_at_512(self):
         got = [(h["name"], h["serve_recent_state_tags"]) for h in PINNED_INV["hosts"] if "serve_recent_state_tags" in h]
-        self.assertEqual(got, [("citrate-prod-1", 64)])
+        self.assertEqual(got, [("citrate-prod-1", 512)])
 
     def test_guard_checks_the_window_value(self):
         import guard
