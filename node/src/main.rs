@@ -3267,9 +3267,16 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             send_failed = true;
                         } else {
                             let pid = peer.info.read().await.id.clone();
-                            rejoin_for_loop
+                            let gave_up = rejoin_for_loop
                                 .lock()
                                 .note_asked(&pid.0, (block_from, block_height));
+                            if let Some(t) = gave_up {
+                                tracing::info!(
+                                    "SYNCREJOIN {:?} (no matching answer to {} requests)",
+                                    t,
+                                    sync_rejoin::MAX_UNANSWERED
+                                );
+                            }
                         }
                     }
                     if send_failed {
@@ -3425,6 +3432,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // the contract-deploy region). Bounded to cap memory if a parent never
             // arrives; the sync loop independently re-requests missing parents.
             let mut orphan_blocks: Vec<citrate_consensus::types::Block> = Vec::new();
+            // sync_rejoin.rs: bound on SYNCREJOIN info lines.
+            let mut rejoin_log = sync_rejoin::RejoinLogBudget::new();
             while let Some((pid, msg)) = in_rx.recv().await {
                 // #149 liveness heartbeat. Bumped BEFORE the message is handled,
                 // so a loop that is stuck inside a handler stops advancing this
@@ -3806,18 +3815,27 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                 b,
                             );
                         }
-                        // sync_rejoin.rs: is this the answer to the anchor the
-                        // sync tick asked for? Judged on the blocks as received.
+                        // sync_rejoin.rs: the answer's hashes as received (only
+                        // for "was it empty"); matching uses the validated set.
                         let answer_hashes: Vec<citrate_consensus::types::Hash> =
                             blocks.iter().map(|b| b.header.block_hash).collect();
-                        let answers_rejoin =
-                            rejoin_for_rx.lock().take_answer(&pid.0, &answer_hashes);
                         // WP-H.4: handle_blocks now validates each block
                         let _ = sync_for_rx.handle_blocks(&pid, blocks).await;
                         // WP-H.5: Drain validated blocks and persist to chain store.
                         // Without this, synced blocks live only in SyncManager memory
                         // and are never integrated into the DAG.
                         let mut pending = sync_for_rx.drain_validated_blocks().await;
+                        // sync_rejoin.rs: is this the asked peer's answer to the
+                        // anchor the sync tick asked for? Judged on the blocks that
+                        // passed validation (their hashes recompute).
+                        let verified_hashes: std::collections::HashSet<
+                            citrate_consensus::types::Hash,
+                        > = pending.iter().map(|b| b.header.block_hash).collect();
+                        let answers_rejoin = rejoin_for_rx.lock().take_answer(
+                            &pid.0,
+                            &answer_hashes,
+                            &verified_hashes,
+                        );
                         // #85 (deep bulk-sync wedge): admit in topological
                         // (height-ascending) order — every parent (selected OR
                         // merge) has strictly lower height than its child, and the
@@ -3882,7 +3900,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         let deferred_from_answer = fixpoint
                             .deferred
                             .iter()
-                            .filter(|b| answer_hashes.contains(&b.header.block_hash))
+                            .filter(|b| verified_hashes.contains(&b.header.block_hash))
                             .count();
                         let mut pending = fixpoint.deferred;
                         // Buffer unresolved orphans for the next Blocks batch (their
@@ -3951,14 +3969,21 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                         .lock()
                                         .on_answer(answer, gap > 0, anchor_height);
                                 if let Some(t) = transition {
-                                    tracing::info!(
-                                        "SYNCREJOIN {:?} (peer={} anchor={} applied={} gap={})",
-                                        t,
-                                        pid.0.get(..14).unwrap_or(&pid.0),
-                                        anchor_height,
-                                        applied_now,
-                                        gap
-                                    );
+                                    // Bounded: a budget of lines per window,
+                                    // the rest counted (see RejoinLogBudget).
+                                    if let Some(suppressed) =
+                                        rejoin_log.allow(std::time::Instant::now())
+                                    {
+                                        tracing::info!(
+                                            "SYNCREJOIN {:?} (peer={} anchor={} applied={} gap={} suppressed_before={})",
+                                            t,
+                                            pid.0.get(..14).unwrap_or(&pid.0),
+                                            anchor_height,
+                                            applied_now,
+                                            gap,
+                                            suppressed
+                                        );
+                                    }
                                 }
                             }
                             let mut sel = sync_peers_for_rx.lock().await;

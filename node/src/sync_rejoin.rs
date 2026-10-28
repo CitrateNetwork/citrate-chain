@@ -63,6 +63,9 @@
     )
 )]
 
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
+
 use citrate_consensus::types::Hash;
 use citrate_storage::StorageManager;
 
@@ -70,6 +73,24 @@ use citrate_storage::StorageManager;
 /// driver starts looking for the fork point. Two, so a single answer that raced
 /// a parent still on the wire does not start a search.
 pub const PROBE_AFTER_STRIKES: u32 = 2;
+
+/// After a search gives up, this many unconnected tip answers are ignored
+/// before strikes count again; doubled per consecutive give-up, up to
+/// [`BACKOFF_MAX_ANSWERS`]. With one request per 2 s tick, 4 is ~8 s and the
+/// cap is ~8.5 min.
+pub const BACKOFF_BASE_ANSWERS: u32 = 4;
+/// Cap on the post-give-up backoff, in answers.
+pub const BACKOFF_MAX_ANSWERS: u32 = 256;
+
+/// Requests in a row without a matching answer before a search or follow gives
+/// up (see [`RejoinTracker::note_asked`]).
+pub const MAX_UNANSWERED: u32 = 8;
+
+/// `SYNCREJOIN` info lines allowed per [`REJOIN_LOG_WINDOW`]; the rest are
+/// counted and reported on the next line that is allowed.
+pub const REJOIN_LOG_PER_WINDOW: u32 = 8;
+/// See [`REJOIN_LOG_PER_WINDOW`].
+pub const REJOIN_LOG_WINDOW: Duration = Duration::from_secs(600);
 
 /// What an answer to the tracker's anchor did, judged after admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +159,12 @@ pub struct RejoinTracker {
     mode: Mode,
     /// The anchor `(hash, height)` the last request was sent with, and to whom.
     asked: Option<(String, Hash, u64)>,
+    /// Consecutive searches that gave up without finding the fork point.
+    give_ups: u32,
+    /// Unconnected tip answers still to ignore before strikes count again.
+    cooldown: u32,
+    /// Requests in a row, during a search, that got no matching answer.
+    unanswered: u32,
 }
 
 impl Default for RejoinTracker {
@@ -151,6 +178,9 @@ impl RejoinTracker {
         Self {
             mode: Mode::Tip { strikes: 0 },
             asked: None,
+            give_ups: 0,
+            cooldown: 0,
+            unanswered: 0,
         }
     }
 
@@ -173,7 +203,8 @@ impl RejoinTracker {
             Mode::Probe { height, .. } => match lookup(*height) {
                 Some(h) => (h, *height),
                 None => {
-                    self.mode = Mode::Tip { strikes: 0 };
+                    let at = *height;
+                    let _ = self.give_up(at);
                     applied
                 }
             },
@@ -181,27 +212,52 @@ impl RejoinTracker {
         }
     }
 
-    /// Record that a `GetBlocks` anchored at `anchor` went to `peer`.
-    pub fn note_asked(&mut self, peer: &str, anchor: (Hash, u64)) {
+    /// Record that a `GetBlocks` anchored at `anchor` went to `peer`. A search
+    /// whose requests go [`MAX_UNANSWERED`] ticks without a matching answer
+    /// gives up (with the usual backoff), so it can never hang on a peer that
+    /// stops answering or always answers something else.
+    pub fn note_asked(&mut self, peer: &str, anchor: (Hash, u64)) -> Option<Transition> {
+        let out = None; // RED STUB: no unanswered give-up
         self.asked = Some((peer.to_string(), anchor.0, anchor.1));
+        out
     }
 
-    /// Whether a `Blocks` message from `peer` carrying `hashes` answers the
-    /// outstanding request; if so, the anchor height it answers. Consumes the
-    /// request, so one request moves the tracker at most once.
-    pub fn take_answer(&mut self, peer: &str, hashes: &[Hash]) -> Option<u64> {
+    /// Whether a `Blocks` message from `peer` answers the outstanding request;
+    /// if so, the anchor height it answers. `received` is the answer as it
+    /// arrived (only its emptiness is used); `verified` holds the hashes of
+    /// its blocks that passed `handle_blocks` (their hashes recompute). Only
+    /// the asked peer can answer: empty, or with the anchor block among the
+    /// verified ones. Consumes the request, so one request moves the tracker at
+    /// most once.
+    pub fn take_answer(
+        &mut self,
+        peer: &str,
+        received: &[Hash],
+        verified: &HashSet<Hash>,
+    ) -> Option<u64> {
         let (asked_peer, anchor, height) = self.asked.as_ref()?;
-        let answers = if hashes.is_empty() {
+        // Genesis carries no proposer signature, so it never passes
+        // `handle_blocks`; a probe anchored there is matched on the received
+        // hash, still only from the asked peer.
+        // RED STUB: the reviewed behaviour (any peer, received hashes).
+        let _ = verified;
+        let answers = if received.is_empty() {
             asked_peer == peer
         } else {
-            hashes.contains(anchor)
+            received.contains(anchor)
         };
         if !answers {
             return None;
         }
         let height = *height;
         self.asked = None;
+        self.unanswered = 0;
         Some(height)
+    }
+
+    #[cfg(test)]
+    pub fn cooldown(&self) -> u32 {
+        self.cooldown
     }
 
     /// Fold in the verdict on an answer. `behind` is whether the node has
@@ -214,6 +270,8 @@ impl RejoinTracker {
         anchor_height: u64,
     ) -> Option<Transition> {
         if !behind {
+            self.give_ups = 0;
+            self.cooldown = 0;
             return self.reset("caught up");
         }
         match (self.mode.clone(), answer) {
@@ -222,6 +280,10 @@ impl RejoinTracker {
                 None
             }
             (Mode::Tip { strikes }, Answer::Unconnected) => {
+                if self.cooldown > 0 {
+                    self.cooldown = self.cooldown.saturating_sub(1);
+                    return None;
+                }
                 let strikes = strikes.saturating_add(1);
                 if strikes < PROBE_AFTER_STRIKES || anchor_height == 0 {
                     self.mode = Mode::Tip { strikes };
@@ -244,6 +306,8 @@ impl RejoinTracker {
                     _ => highest,
                 };
                 let was_following = matches!(self.mode, Mode::Follow { .. });
+                // The search found the fork point: no backoff owed.
+                self.give_ups = 0;
                 self.mode = Mode::Follow { cursor };
                 if was_following {
                     None
@@ -313,7 +377,41 @@ impl RejoinTracker {
 
     fn give_up(&mut self, at: u64) -> Option<Transition> {
         self.mode = Mode::Tip { strikes: 0 };
+        // RED STUB: no backoff
+        self.give_ups = self.give_ups.saturating_add(1);
         Some(Transition::GaveUp { at })
+    }
+}
+
+/// Bound on `SYNCREJOIN` info lines: [`REJOIN_LOG_PER_WINDOW`] per
+/// [`REJOIN_LOG_WINDOW`]; the rest are counted.
+#[derive(Debug)]
+pub struct RejoinLogBudget {
+    window_start: Option<Instant>,
+    used: u32,
+    suppressed: u64,
+}
+
+impl Default for RejoinLogBudget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RejoinLogBudget {
+    pub fn new() -> Self {
+        Self {
+            window_start: None,
+            used: 0,
+            suppressed: 0,
+        }
+    }
+
+    /// `Some(n)` when a line may be logged now, `n` being the lines
+    /// suppressed since the last one logged; `None` when over budget.
+    pub fn allow(&mut self, now: Instant) -> Option<u64> {
+        let _ = now; // RED STUB: unbounded
+        Some(std::mem::take(&mut self.suppressed))
     }
 }
 
@@ -585,21 +683,68 @@ mod tests {
         modes: Vec<Mode>,
     }
 
+    /// One `Blocks` message through the steps the node's `Blocks` handler
+    /// runs: `handle_blocks`, match against the asked anchor on the validated
+    /// blocks, admission to a fixpoint (orphans buffered), the periodic drain,
+    /// then the tracker judges the answer if it was ours.
+    async fn deliver(
+        node: &Node,
+        tracker: &mut RejoinTracker,
+        orphans: &mut Vec<Block>,
+        from: &str,
+        answer: Vec<Block>,
+        network_height: u64,
+    ) {
+        let received: Vec<Hash> = answer.iter().map(h).collect();
+        node.sync
+            .handle_blocks(&PeerId(from.to_string()), answer)
+            .await
+            .expect("validate");
+        let mut pending = node.sync.drain_validated_blocks().await;
+        let verified: HashSet<Hash> = pending.iter().map(h).collect();
+        let answered = tracker.take_answer(from, &received, &verified);
+        let reprocessed = !pending.is_empty();
+        if reprocessed {
+            pending.append(orphans);
+            pending = bound_orphan_buffer(pending);
+        }
+        let fx = node.admission.admit_to_fixpoint(pending, |_, _| {}).await;
+        let deferred = fx
+            .deferred
+            .iter()
+            .filter(|b| verified.contains(&h(b)))
+            .count();
+        if reprocessed {
+            *orphans = bound_orphan_buffer(fx.deferred);
+        }
+        node.app.drive_drain().await;
+        let applied_now = node.applied().expect("applied tip").1;
+        if let Some(ah) = answered {
+            let verdict = classify(
+                received.is_empty(),
+                fx.newly_admitted,
+                fx.highest_admitted,
+                deferred,
+            );
+            tracker.on_answer(verdict, network_height > applied_now, ah);
+        }
+    }
+
     /// Drive the node's sync against one peer the way the 2 s tick and the
-    /// `Blocks` handler do: anchor from the tracker, `serve_blocks` on the
-    /// peer, `handle_blocks` + admission to a fixpoint (orphans buffered), the
-    /// periodic drain, then the tracker judges the answer.
-    async fn drive(
+    /// `Blocks` handler do. `interfere(anchor)` yields messages from other
+    /// peers that arrive after the request and before the asked peer's answer.
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_with(
         node: &Node,
         tracker: &mut RejoinTracker,
         peer: &StorageManager,
         target: Hash,
         network_height: u64,
         max_rounds: usize,
+        interfere: impl Fn(&Node, (Hash, u64)) -> Vec<(String, Vec<Block>)>,
     ) -> Run {
         let mut run = Run::default();
         let mut orphans: Vec<Block> = Vec::new();
-        let pid = PeerId(PEER.to_string());
         while run.rounds < max_rounds {
             let applied = node.applied().expect("applied tip");
             if applied.0 == target {
@@ -609,42 +754,145 @@ mod tests {
             let anchor = tracker.anchor(applied, |ht| anchor_at_height(&node.storage, ht));
             tracker.note_asked(PEER, anchor);
             run.anchors.push(anchor.1);
+            for (from, msg) in interfere(node, anchor) {
+                deliver(node, tracker, &mut orphans, &from, msg, network_height).await;
+            }
             let answer = block_serve::serve_blocks(peer, &anchor.0, 32);
-            let hashes: Vec<Hash> = answer.iter().map(h).collect();
-            let answered = tracker.take_answer(PEER, &hashes);
-            node.sync
-                .handle_blocks(&pid, answer)
-                .await
-                .expect("validate");
-            let mut pending = node.sync.drain_validated_blocks().await;
-            let reprocessed = !pending.is_empty();
-            if reprocessed {
-                pending.append(&mut orphans);
-                pending = bound_orphan_buffer(pending);
-            }
-            let fx = node.admission.admit_to_fixpoint(pending, |_, _| {}).await;
-            let deferred = fx
-                .deferred
-                .iter()
-                .filter(|b| hashes.contains(&h(b)))
-                .count();
-            if reprocessed {
-                orphans = bound_orphan_buffer(fx.deferred);
-            }
-            node.app.drive_drain().await;
-            let applied_now = node.applied().expect("applied tip").1;
-            if let Some(ah) = answered {
-                let verdict = classify(
-                    hashes.is_empty(),
-                    fx.newly_admitted,
-                    fx.highest_admitted,
-                    deferred,
-                );
-                tracker.on_answer(verdict, network_height > applied_now, ah);
-            }
+            deliver(node, tracker, &mut orphans, PEER, answer, network_height).await;
             run.modes.push(tracker.mode().clone());
         }
         run
+    }
+
+    async fn drive(
+        node: &Node,
+        tracker: &mut RejoinTracker,
+        peer: &StorageManager,
+        target: Hash,
+        network_height: u64,
+        max_rounds: usize,
+    ) -> Run {
+        drive_with(
+            node,
+            tracker,
+            peer,
+            target,
+            network_height,
+            max_rounds,
+            |_, _| Vec::new(),
+        )
+        .await
+    }
+
+    /// A block whose `block_hash` field names `anchor` but whose contents are
+    /// another block's: it does not survive `handle_blocks`.
+    fn tagged(anchor: Hash, body: &Block) -> Block {
+        let mut b = body.clone();
+        b.header.block_hash = anchor;
+        b
+    }
+
+    /// Another peer's message arriving before the asked peer's answer, carrying
+    /// a block tagged with the anchor hash and the genuine anchor block, must
+    /// not consume the request: the side-branch node still rejoins.
+    #[tokio::test]
+    async fn another_peers_message_does_not_consume_the_request() {
+        let net = net(6, 14, 48);
+        let pdir = tempfile::tempdir().expect("tempdir");
+        let peer = peer_store(&net, true, pdir.path());
+        let ndir = tempfile::tempdir().expect("tempdir");
+        let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
+        let n = node(&net, &own, ndir.path()).await;
+        let main_tip = net.main.last().expect("main");
+        let body = net.prefix[0].clone();
+        let mut tracker = RejoinTracker::new();
+        let run = drive_with(
+            &n,
+            &mut tracker,
+            &peer,
+            h(main_tip),
+            48,
+            60,
+            |node, anchor| {
+                let mut msg = vec![tagged(anchor.0, &body)];
+                if let Ok(Some(real)) = node.storage.blocks.get_block(&anchor.0) {
+                    msg.push(real);
+                }
+                vec![("peer-other".to_string(), msg)]
+            },
+        )
+        .await;
+        assert_eq!(
+            n.applied(),
+            Some((h(main_tip), 48)),
+            "another peer's message steered the search: anchors {:?}",
+            run.anchors
+        );
+    }
+
+    /// The same message plus one real block far ahead (unconnectable) must not
+    /// push a node that is merely behind on the same chain into a search.
+    #[tokio::test]
+    async fn another_peers_unconnected_message_does_not_start_a_search() {
+        let net = net(6, 6, 200);
+        let pdir = tempfile::tempdir().expect("tempdir");
+        let peer = peer_store(&net, false, pdir.path());
+        let ndir = tempfile::tempdir().expect("tempdir");
+        let n = node(&net, &net.prefix, ndir.path()).await;
+        let main_tip = net.main.last().expect("main");
+        let body = net.prefix[0].clone();
+        let far = net.main[180].clone();
+        let mut tracker = RejoinTracker::new();
+        let run = drive_with(
+            &n,
+            &mut tracker,
+            &peer,
+            h(main_tip),
+            200,
+            200,
+            |node, anchor| {
+                let mut msg = vec![tagged(anchor.0, &body)];
+                if let Ok(Some(real)) = node.storage.blocks.get_block(&anchor.0) {
+                    msg.push(real);
+                }
+                msg.push(far.clone());
+                vec![("peer-other".to_string(), msg)]
+            },
+        )
+        .await;
+        assert_eq!(n.applied(), Some((h(main_tip), 200)));
+        assert!(
+            run.modes
+                .iter()
+                .all(|m| matches!(m, Mode::Tip { strikes: 0 })),
+            "{:?}",
+            run.modes
+        );
+    }
+
+    /// `anchor_at_height` names the EXECUTED chain's block, not whatever the
+    /// raw height index last stored at that height (a sibling that never
+    /// executed and that peers may not hold).
+    #[tokio::test]
+    async fn probe_anchor_is_the_executed_block_not_the_last_stored() {
+        let net = net(6, 14, 48);
+        let ndir = tempfile::tempdir().expect("tempdir");
+        let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
+        let n = node(&net, &own, ndir.path()).await;
+        // Store (not execute) main-chain siblings at heights 7..=14: the raw
+        // height index now names them; the executed chain is still the side.
+        for b in &net.main[..8] {
+            n.storage.blocks.put_block(b).expect("put");
+        }
+        for (i, side) in net.side.iter().enumerate() {
+            let height = side.header.height;
+            assert_eq!(
+                n.storage.blocks.get_block_by_height(height).expect("read"),
+                Some(h(&net.main[i])),
+                "fixture: the raw index must disagree at {height}"
+            );
+            assert_eq!(anchor_at_height(&n.storage, height), Some(h(side)));
+        }
     }
 
     /// The r1006 shape, scaled down: a node sealed its own blocks from height
@@ -786,12 +1034,22 @@ mod tests {
             out.push("sync tick: a GetBlocks still anchored on the applied tip directly");
         }
         let arm = src.find("NetworkMessage::Blocks { blocks } => {");
-        let take = src.find(".take_answer(&pid.0, &answer_hashes)");
         let handle = arm.and_then(|a| src[a..].find(".handle_blocks(&pid, blocks)").map(|i| a + i));
+        let take = src.find(".take_answer(");
         let judge = src.find(".on_answer(answer, gap > 0, anchor_height)");
-        match (arm, take, handle, judge) {
-            (Some(a), Some(t), Some(hb), Some(j)) if a < t && t < hb && hb < j => {}
+        match (arm, handle, take, judge) {
+            // Matched AFTER validation, on the validated set.
+            (Some(a), Some(hb), Some(t), Some(j)) if a < hb && hb < t && t < j => {}
             _ => out.push("Blocks handler: answers must reach RejoinTracker::on_answer"),
+        }
+        if let Some(t) = take {
+            if !src[t..]
+                .get(..200)
+                .unwrap_or("")
+                .contains("&verified_hashes")
+            {
+                out.push("Blocks handler: take_answer must match on the validated hashes");
+            }
         }
         if !src.contains(".admit_to_fixpoint(pending,") {
             out.push("Blocks handler: admission must use BlockAdmission::admit_to_fixpoint");
@@ -925,16 +1183,46 @@ mod tests {
     /// not count, and one request is consumed at most once.
     #[test]
     fn only_the_answer_to_our_anchor_counts() {
+        let set = |hs: &[Hash]| hs.iter().copied().collect::<HashSet<Hash>>();
         let mut t = RejoinTracker::new();
-        assert_eq!(t.take_answer(PEER, &[]), None, "nothing asked yet");
+        assert_eq!(
+            t.take_answer(PEER, &[], &set(&[])),
+            None,
+            "nothing asked yet"
+        );
         t.note_asked(PEER, (hx(3), 40));
-        assert_eq!(t.take_answer("other", &[]), None, "empty, other peer");
-        assert_eq!(t.take_answer(PEER, &[hx(4), hx(5)]), None, "anchor absent");
-        assert_eq!(t.take_answer("other", &[hx(4), hx(3)]), Some(40));
-        assert_eq!(t.take_answer(PEER, &[hx(3)]), None, "consumed");
+        assert_eq!(
+            t.take_answer("other", &[], &set(&[])),
+            None,
+            "empty, other peer"
+        );
+        assert_eq!(
+            t.take_answer(PEER, &[hx(4), hx(5)], &set(&[hx(4), hx(5)])),
+            None,
+            "anchor absent"
+        );
+        assert_eq!(
+            t.take_answer("other", &[hx(4), hx(3)], &set(&[hx(4), hx(3)])),
+            None,
+            "the anchor block from another peer"
+        );
+        assert_eq!(
+            t.take_answer(PEER, &[hx(3)], &set(&[])),
+            None,
+            "the anchor hash on a block that failed validation"
+        );
+        assert_eq!(
+            t.take_answer(PEER, &[hx(4), hx(3)], &set(&[hx(4), hx(3)])),
+            Some(40)
+        );
+        assert_eq!(
+            t.take_answer(PEER, &[hx(3)], &set(&[hx(3)])),
+            None,
+            "consumed"
+        );
         t.note_asked(PEER, (hx(3), 41));
         assert_eq!(
-            t.take_answer(PEER, &[]),
+            t.take_answer(PEER, &[], &set(&[])),
             Some(41),
             "empty from the asked peer"
         );
@@ -1044,5 +1332,126 @@ mod tests {
         t.on_answer(Answer::Unconnected, true, 10);
         assert_eq!(t.on_answer(progress(), true, 10), None);
         assert_eq!(t.mode(), &Mode::Tip { strikes: 0 });
+    }
+
+    /// After a search gives up, the next one waits out a backoff that doubles
+    /// per consecutive give-up and is capped; catching up clears it.
+    #[test]
+    fn a_search_that_gives_up_backs_off_before_the_next() {
+        let mut t = RejoinTracker::new();
+        let mut waits = Vec::new();
+        for _ in 0..10 {
+            // Answers until a search starts.
+            let mut answers = 0u32;
+            loop {
+                answers += 1;
+                assert!(answers < 10_000, "never searched again");
+                if let Some(Transition::StartedProbe { .. }) =
+                    t.on_answer(Answer::Unconnected, true, 1_000)
+                {
+                    break;
+                }
+            }
+            waits.push(answers);
+            // A peer that never connects: the search walks to genesis.
+            loop {
+                let (_, at) = t.anchor((hx(1), 1_000), |_| Some(hx(2)));
+                if let Some(Transition::GaveUp { .. }) = t.on_answer(Answer::Unconnected, true, at)
+                {
+                    break;
+                }
+            }
+        }
+        let p = PROBE_AFTER_STRIKES;
+        assert_eq!(waits[0], p, "first search needs only the strikes");
+        assert_eq!(waits[1], p + BACKOFF_BASE_ANSWERS);
+        assert_eq!(waits[2], p + 2 * BACKOFF_BASE_ANSWERS);
+        assert!(waits.windows(2).all(|w| w[1] >= w[0]), "{waits:?}");
+        assert_eq!(
+            *waits.last().expect("waits"),
+            p + BACKOFF_MAX_ANSWERS,
+            "{waits:?}"
+        );
+        // Caught up: no backoff owed.
+        t.on_answer(Answer::Unconnected, false, 1_000);
+        assert_eq!(t.cooldown(), 0);
+    }
+
+    /// A search that finds the fork point clears the backoff.
+    #[test]
+    fn finding_the_fork_point_clears_the_backoff() {
+        let mut t = RejoinTracker::new();
+        t.on_answer(Answer::Unconnected, true, 10);
+        t.on_answer(Answer::Unconnected, true, 10);
+        loop {
+            let (_, at) = t.anchor((hx(1), 10), |_| Some(hx(2)));
+            if t.on_answer(Answer::Unconnected, true, at).is_some() {
+                break;
+            }
+        }
+        assert_eq!(t.cooldown(), BACKOFF_BASE_ANSWERS);
+        for _ in 0..BACKOFF_BASE_ANSWERS + PROBE_AFTER_STRIKES {
+            t.on_answer(Answer::Unconnected, true, 10);
+        }
+        assert!(matches!(t.mode(), Mode::Probe { .. }));
+        let (_, at) = t.anchor((hx(1), 10), |_| Some(hx(2)));
+        t.on_answer(
+            Answer::Progress {
+                highest: (hx(5), 12),
+            },
+            true,
+            at,
+        );
+        t.on_answer(Answer::Known, true, 12);
+        // Next trouble: searched again after just the strikes.
+        t.on_answer(Answer::Unconnected, true, 10);
+        assert!(t.on_answer(Answer::Unconnected, true, 10).is_some());
+    }
+
+    #[test]
+    fn rejoin_log_lines_are_budgeted() {
+        let mut b = RejoinLogBudget::new();
+        let t0 = Instant::now();
+        for _ in 0..REJOIN_LOG_PER_WINDOW {
+            assert_eq!(b.allow(t0), Some(0));
+        }
+        for _ in 0..5 {
+            assert_eq!(b.allow(t0 + Duration::from_secs(1)), None);
+        }
+        assert_eq!(
+            b.allow(t0 + REJOIN_LOG_WINDOW),
+            Some(5),
+            "reports the suppressed count"
+        );
+        assert_eq!(b.allow(t0 + REJOIN_LOG_WINDOW), Some(0));
+    }
+
+    /// A search whose requests never get a matching answer gives up after
+    /// MAX_UNANSWERED ticks instead of holding its anchor forever.
+    #[test]
+    fn a_search_without_answers_gives_up() {
+        let mut t = RejoinTracker::new();
+        t.on_answer(Answer::Unconnected, true, 10);
+        t.on_answer(Answer::Unconnected, true, 10);
+        let mut ticks = 0;
+        let last = loop {
+            ticks += 1;
+            assert!(ticks <= MAX_UNANSWERED + 1, "never gave up");
+            let a = t.anchor((hx(1), 10), |_| Some(hx(2)));
+            if let Some(tr) = t.note_asked(PEER, a) {
+                break tr;
+            }
+            // An answer from the asked peer that is not for this anchor.
+            assert_eq!(
+                t.take_answer(PEER, &[hx(8)], &[hx(8)].into_iter().collect()),
+                None
+            );
+        };
+        assert!(matches!(last, Transition::GaveUp { .. }));
+        assert_eq!(t.mode(), &Mode::Tip { strikes: 0 });
+        // In Tip mode unanswered requests are the ordinary penalty box's job.
+        for _ in 0..3 * MAX_UNANSWERED {
+            assert_eq!(t.note_asked(PEER, (hx(1), 10)), None);
+        }
     }
 }
