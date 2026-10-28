@@ -5055,6 +5055,150 @@ mod tests {
         );
     }
 
+    /// PARENT-RULE PARITY (r1006 7-way split, height 16,509). Fork choice ranks tips
+    /// by the RECOMPUTED blue score (selected parent's score + 1 + blue merge
+    /// parents). The header carries the producer's `parent + 1` approximation, and the
+    /// receive-side linkage rule compares HEADER scores: no merge parent may out-score
+    /// the selected parent. The two metrics disagree as soon as a block merges, so
+    /// fork choice can pick a tip whose header score is LOWER than another tip's. The
+    /// producer then listed that other tip as a merge parent and sealed a block every
+    /// peer rejected ("selected parent must be the heaviest parent"). It kept
+    /// extending that block, peers kept rejecting its branch, and when several
+    /// producers did it in the same round every node ended up on its own branch.
+    ///
+    /// INVARIANT: the parents the producer picks must satisfy the receiver's linkage
+    /// rule, i.e. the block it would seal passes `validate_block_consistency`. A tip
+    /// whose header score does not exceed the selected parent's must still be merged.
+    #[tokio::test]
+    async fn producer_never_merges_a_parent_heavier_than_its_selected_parent() {
+        use citrate_execution::StateDB;
+
+        let dir = TempDir::new().expect("tempdir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let executor = Arc::new(Executor::with_storage_and_chain_id(
+            Arc::new(StateDB::new()),
+            Some(storage.state.clone()),
+            40204,
+        ));
+        let mempool = Arc::new(Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        }));
+        let producer = BlockProducer::new(
+            storage.clone(),
+            executor,
+            mempool,
+            embedded_pubkey(Address([0x44; 20])),
+            Ed25519SigningKey::from_bytes(&[42; 32]),
+            2,
+        )
+        .with_v2_headers(true);
+        let dag = producer.dag_store();
+        let ghostdag = producer.ghostdag();
+        let genesis = seed_test_genesis(&storage, &dag, &ghostdag).await;
+
+        // A peer block as the live producers write it: header blue_score is the
+        // selected parent's header score + 1, whatever it merges.
+        async fn admit(
+            dag: &DagStore,
+            ghostdag: &GhostDag,
+            tag: u8,
+            parent: &Block,
+            merges: &[&Block],
+        ) -> Block {
+            let score = parent.header.blue_score + 1;
+            let mut blk = BlockBuilder::new()
+                .version(2)
+                .height(parent.header.height + 1)
+                .parent(parent.header.block_hash)
+                .merge_parents(merges.iter().map(|m| m.header.block_hash).collect())
+                .coinbase([tag; 20])
+                .timestamp(parent.header.timestamp + 1)
+                .vrf_reveal(VrfProof {
+                    proof: vec![],
+                    output: Hash::new([tag; 32]),
+                })
+                .transactions(vec![])
+                .state_root(Hash::default())
+                .blue_score(score)
+                .blue_work(citrate_consensus::types::blue_work_for_score(score))
+                .build_unhashed();
+            blk.header.block_hash = blk.compute_hash();
+            dag.store_block(blk.clone()).await.expect("store peer block");
+            ghostdag.add_block(&blk).await.expect("admit peer block");
+            blk
+        }
+
+        // Three siblings at height 1.
+        let a1 = admit(&dag, &ghostdag, 0xA1, &genesis, &[]).await;
+        let a2 = admit(&dag, &ghostdag, 0xA2, &genesis, &[]).await;
+        let a3 = admit(&dag, &ghostdag, 0xA3, &genesis, &[]).await;
+        // X @ 2 merges both siblings: header score 2, recomputed score +2 higher.
+        let x = admit(&dag, &ghostdag, 0xB1, &a1, &[&a2, &a3]).await;
+        // Y @ 3 is a plain chain A1 -> B -> Y: header score 3, recomputed lower than X.
+        let b = admit(&dag, &ghostdag, 0xB2, &a1, &[]).await;
+        let y = admit(&dag, &ghostdag, 0xC1, &b, &[]).await;
+        // Z @ 2: a sibling of X with an equal header score (a legitimate merge).
+        let z = admit(&dag, &ghostdag, 0xB3, &a1, &[]).await;
+
+        // Preconditions: fork choice prefers X while Y carries the higher header score.
+        assert_eq!(
+            ghostdag.select_tip().await.expect("select_tip"),
+            x.header.block_hash,
+            "fork choice must prefer X (more blue merges) for this scenario to apply"
+        );
+        assert!(y.header.blue_score > x.header.blue_score);
+
+        let tips = dag.get_tips().await;
+        let (sp, merges) = producer
+            .select_parents_with_ghostdag(&tips, None)
+            .await
+            .expect("parent selection");
+        assert_eq!(sp, x.header.block_hash, "selected parent follows fork choice");
+
+        let sp_block = dag.get_block(&sp).await.expect("selected parent stored");
+        for m in &merges {
+            let mb = dag.get_block(m).await.expect("merge parent stored");
+            assert!(
+                mb.header.blue_score <= sp_block.header.blue_score,
+                "merge parent {} has header blue_score {} above the selected parent's {}: \
+                 every peer rejects this block (selected parent must be the heaviest parent)",
+                m,
+                mb.header.blue_score,
+                sp_block.header.blue_score
+            );
+        }
+        assert!(
+            merges.contains(&z.header.block_hash),
+            "a tip whose header score equals the selected parent's must still be merged"
+        );
+
+        // The receiver's verdict on the header the producer would seal.
+        let score = sp_block.header.blue_score + 1;
+        let mut candidate = BlockBuilder::new()
+            .version(2)
+            .height(sp_block.header.height + 1)
+            .parent(sp)
+            .merge_parents(merges.clone())
+            .coinbase([0x44; 20])
+            .timestamp(sp_block.header.timestamp + 1)
+            .vrf_reveal(VrfProof {
+                proof: vec![],
+                output: Hash::new([0xEE; 32]),
+            })
+            .transactions(vec![])
+            .state_root(Hash::default())
+            .blue_score(score)
+            .blue_work(citrate_consensus::types::blue_work_for_score(score))
+            .build_unhashed();
+        candidate.header.block_hash = candidate.compute_hash();
+        ghostdag
+            .validate_block_consistency(&candidate)
+            .await
+            .expect("a block built on the producer's parent choice must pass the receiver's rule");
+    }
+
     /// REGRESSION (chain 40204 reroll wedge @ height 101, 2026-08-12). `produce_block`
     /// stores each produced block in the DAG store (so `dag_store.get_tips()`, the
     /// PARENT source, advances and the chain grows) but never registered it into
