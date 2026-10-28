@@ -184,6 +184,7 @@ impl SyncDriver {
                     id: p.id.clone(),
                     head_height: p.head_height,
                     max_in_flight: *cap,
+                    bad_standing: *cap == 1,
                 })
             })
             .collect();
