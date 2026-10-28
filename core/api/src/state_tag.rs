@@ -26,6 +26,19 @@
 //     hash that is not the head, likewise.
 //   * anything else is an invalid-params error (it used to read as `latest`).
 //
+// OPERATOR OPT-OUT (`[rpc] serve_recent_state_tags = N`, default 0 = strict)
+//
+// Foundry's fork mode (`forge script`, `anvil --fork-url`) reads the latest
+// block once and pins every later state read to its hash, so a strict node
+// refuses a script as soon as one more block executes. With N > 0 a number, or
+// a hash on the executed head's selected-parent chain, at most N blocks below
+// the head is answered from the head's state; so is a stored block at most N
+// above the head whose chain reaches the head. Everything else (further back,
+// off the chain, unknown, finality tags) still fails closed. The answer is the
+// head's state, not the named block's: a JSON-RPC response has no field to say
+// so, so the node logs it at debug and the setting is for a private deploy node
+// only (docs/ops/RPC_STATE_BLOCK_TAGS.md); the public RPC stays strict.
+//
 // The head is read once per request, before the state read. A block applied
 // between the check and the read can make the answer one block newer than the
 // tag, the same window a `latest` read has.
@@ -147,9 +160,40 @@ impl StateTagPolicy {
     }
 }
 
-/// The tag string the finality guard must see (RED STUB: string form only).
+/// The tag string the finality guard (`eth_rpc::require_serviceable_finality_tag`)
+/// must see: the string itself, or the `blockNumber` string of an EIP-1898 object
+/// (`{"blockNumber": "finalized"}` is the same request as `"finalized"`). An
+/// object naming a `blockHash` pins a block by hash and has no finality tag.
 pub fn finality_tag_str(tag: Option<&Value>) -> Option<&str> {
-    tag.and_then(|v| v.as_str())
+    match tag? {
+        Value::String(s) => Some(s.as_str()),
+        Value::Object(o) if !o.contains_key("blockHash") => {
+            o.get("blockNumber").and_then(|v| v.as_str())
+        }
+        _ => None,
+    }
+}
+
+/// Whether following `selected_parent_hash` links `steps` times down from
+/// `from` reaches `target` (each step one header read).
+fn reaches(storage: &StorageManager, from: Hash, steps: u64, target: Hash) -> bool {
+    let mut cur = from;
+    for _ in 0..steps {
+        match storage.blocks.get_header(&cur).ok().flatten() {
+            Some(h) => cur = h.selected_parent_hash,
+            None => return false,
+        }
+    }
+    cur == target
+}
+
+/// Log a pinned tag served from the head's state under the operator window.
+fn served_recent(requested: &str, head_height: u64) -> Result<(), jsonrpc_core::Error> {
+    tracing::debug!(
+        "state read pinned to {requested} served from the executed head {head_height} \
+         (rpc.serve_recent_state_tags)"
+    );
+    Ok(())
 }
 
 /// Refuse a state read whose block tag does not name the executed head (see
@@ -160,7 +204,7 @@ pub fn require_executed_head_state(
     storage: &StorageManager,
     policy: StateTagPolicy,
 ) -> Result<(), jsonrpc_core::Error> {
-    let _ = policy;
+    let window = policy.recent_window.min(MAX_RECENT_STATE_TAGS);
     let pinned = parse_state_tag(tag)?;
     if pinned == StateTag::Unpinned {
         return Ok(());
@@ -183,6 +227,17 @@ pub fn require_executed_head_state(
     match pinned {
         StateTag::Unpinned => Ok(()),
         StateTag::Number(n) if n == head_height => Ok(()),
+        // Operator window: a recent height names a canonical block by definition.
+        StateTag::Number(n) if n < head_height && head_height - n <= window => {
+            served_recent(&format!("block {n}"), head_height)
+        }
+        StateTag::Number(n)
+            if n > head_height
+                && n - head_height <= window
+                && n <= storage.blocks.get_latest_height().unwrap_or(0) =>
+        {
+            served_recent(&format!("stored block {n}"), head_height)
+        }
         StateTag::Number(n) if n < head_height => Err(refuse(
             format!("block {n} is below the executed head {head_height}"),
             json!({ "requested": format!("0x{n:x}"), "executedHead": head_json }),
@@ -193,7 +248,26 @@ pub fn require_executed_head_state(
         )),
         StateTag::Hash(h) if h == head_hash => Ok(()),
         StateTag::Hash(h) => {
-            let detail = match storage.blocks.get_header(&h).ok().flatten() {
+            let header = storage.blocks.get_header(&h).ok().flatten();
+            if window > 0 {
+                if let Some(hd) = &header {
+                    // Below the head: on the head's selected-parent chain.
+                    if hd.height < head_height
+                        && head_height - hd.height <= window
+                        && reaches(storage, head_hash, head_height - hd.height, h)
+                    {
+                        return served_recent(&format!("block {h}"), head_height);
+                    }
+                    // Stored above the head: its selected-parent chain reaches the head.
+                    if hd.height > head_height
+                        && hd.height - head_height <= window
+                        && reaches(storage, h, hd.height - head_height, head_hash)
+                    {
+                        return served_recent(&format!("stored block {h}"), head_height);
+                    }
+                }
+            }
+            let detail = match header {
                 Some(header) => format!(
                     "block {h} at height {} is not the executed head {head_height}",
                     header.height
@@ -240,6 +314,23 @@ mod tests {
             assert_eq!(parse_state_tag(Some(&tag)).expect("parses"), want, "{tag}");
         }
         assert_eq!(parse_state_tag(None).expect("absent"), StateTag::Unpinned);
+    }
+
+    #[test]
+    fn finality_tag_str_unwraps_the_eip1898_block_number() {
+        let h = format!("0x{}", "ab".repeat(32));
+        for (tag, want) in [
+            (json!("finalized"), Some("finalized")),
+            (json!({"blockNumber": "finalized"}), Some("finalized")),
+            (json!({"blockNumber": "safe"}), Some("safe")),
+            (json!({"blockNumber": "0x5"}), Some("0x5")),
+            (json!({"blockHash": h.clone(), "blockNumber": "safe"}), None),
+            (json!({"blockHash": h}), None),
+            (json!(5), None),
+        ] {
+            assert_eq!(finality_tag_str(Some(&tag)), want, "{tag}");
+        }
+        assert_eq!(finality_tag_str(None), None);
     }
 
     #[test]
