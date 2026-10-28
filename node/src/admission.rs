@@ -1027,6 +1027,87 @@ mod tests {
         }
     }
 
+    /// While one admission of a block runs and a second waits for it, the
+    /// first ending must leave the guard in place: removing it would let a
+    /// third admission of the same block start alongside the second.
+    /// Single-threaded runtime, so the interleaving is exact.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_admission_guard_stays_while_another_admission_waits() {
+        let (adm, _storage, _dag, _d) = harness();
+        let adm = Arc::new(adm);
+        let g = root();
+        adm.admit(&g).await;
+        let p = mk(1, g.header.block_hash, 1, [0x11; 32]);
+        let h = p.header.block_hash;
+        // "First admission": holds the block's guard.
+        let first = AdmittingSlot {
+            map: &adm.admitting,
+            hash: h,
+            slot: adm.admitting.lock().entry(h).or_default().clone(),
+        };
+        let held = first.slot.clone().lock_owned().await;
+        // Second admission: takes the guard and waits on it.
+        let second = {
+            let adm = adm.clone();
+            let p = p.clone();
+            tokio::spawn(async move { adm.admit(&p).await })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(
+            adm.admitting.lock().get(&h).map(Arc::strong_count),
+            Some(4),
+            "map, first (slot + held lock), second"
+        );
+        // The first ends.
+        drop(held);
+        drop(first);
+        assert!(
+            adm.admitting.lock().contains_key(&h),
+            "guard removed while another admission still waits on it"
+        );
+        assert!(matches!(
+            second.await.expect("join"),
+            AdmitOutcome::Admitted { .. }
+        ));
+        assert!(adm.admitting.lock().is_empty());
+    }
+
+    /// Two admissions of one block ending at the same moment, on two
+    /// threads, must not leave the guard entry behind (each releases its
+    /// reference and checks the count in one step under the map lock).
+    #[test]
+    fn admissions_ending_together_leave_no_guard_behind() {
+        let map: parking_lot::Mutex<HashMap<Hash, Arc<tokio::sync::Mutex<()>>>> =
+            parking_lot::Mutex::new(HashMap::new());
+        let h = Hash::new([7; 32]);
+        for round in 0..2_000 {
+            let (a, b) = {
+                let s = map.lock().entry(h).or_default().clone();
+                (
+                    AdmittingSlot {
+                        map: &map,
+                        hash: h,
+                        slot: s.clone(),
+                    },
+                    AdmittingSlot {
+                        map: &map,
+                        hash: h,
+                        slot: s,
+                    },
+                )
+            };
+            // Both drops queue on the map lock, then run back to back.
+            let gate = map.lock();
+            std::thread::scope(|sc| {
+                sc.spawn(move || drop(a));
+                sc.spawn(move || drop(b));
+                std::thread::sleep(std::time::Duration::from_micros(200));
+                drop(gate);
+            });
+            assert!(map.lock().is_empty(), "round {round}: guard left behind");
+        }
+    }
+
     #[tokio::test]
     async fn admits_a_fresh_block_into_both_stores() {
         let (adm, storage, dag, _d) = harness();
