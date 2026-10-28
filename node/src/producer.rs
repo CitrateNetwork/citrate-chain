@@ -197,6 +197,11 @@ struct CatchupBehindState {
     /// Set once a >`stall_alert_after` no-progress stall is detected; only the
     /// human-in-command override clears it (NEVER auto-resume after a stall).
     stalled_latch: bool,
+    /// Since when deferred (heard-but-unadmitted) evidence alone has been the reason to
+    /// refuse; `None` outside such an episode. Bounded by [`DEFERRED_ONLY_REFUSE_MAX`].
+    deferred_only_since: Option<Instant>,
+    /// Last time the "sealing despite deferred evidence" warning was logged.
+    deferred_only_warned: Option<Instant>,
 }
 
 impl Default for CatchupBehindState {
@@ -206,6 +211,8 @@ impl Default for CatchupBehindState {
             last_applied_tip: 0,
             last_progress: Instant::now(),
             stalled_latch: false,
+            deferred_only_since: None,
+            deferred_only_warned: None,
         }
     }
 }
@@ -274,8 +281,25 @@ pub struct AttestedInner {
 pub const DEFERRED_EVIDENCE_TTL: Duration = Duration::from_secs(30);
 /// Deferred evidence counts only when at least this many DISTINCT known proposers
 /// vouch for a height, so one proposer (stranded on a side branch, or misbehaving)
-/// cannot make the rest of the fleet stop producing.
+/// cannot make the rest of the fleet stop producing. The quorum also scales with the
+/// producer set (see [`deferred_quorum_size`]).
 pub const DEFERRED_EVIDENCE_MIN_PROPOSERS: usize = 2;
+/// Longest a producer refuses on deferred evidence ALONE (no held, chained evidence
+/// says it is behind). Past it the producer seals anyway and warns, until that
+/// evidence stops being the only reason to refuse.
+pub const DEFERRED_ONLY_REFUSE_MAX: Duration = Duration::from_secs(60);
+/// Spacing of the warning logged while sealing despite deferred evidence.
+pub const DEFERRED_ONLY_WARN_EVERY: Duration = Duration::from_secs(60);
+
+/// Distinct proposers that must vouch for deferred evidence, given `known` other
+/// proposers this node has seen: more than a third of the producer set (`known` plus
+/// this node), and never fewer than [`DEFERRED_EVIDENCE_MIN_PROPOSERS`]. With 7
+/// producers that is 3, so 2 cannot hold the others off.
+pub fn deferred_quorum_size(known: usize) -> usize {
+    // RED STUB: old behaviour, a fixed quorum.
+    let _ = known;
+    DEFERRED_EVIDENCE_MIN_PROPOSERS
+}
 /// Deferred evidence counts only when its header timestamp is within the TTL plus this
 /// clock allowance of local wall time (and not more than this allowance in the future),
 /// so an old block cannot be presented as evidence.
@@ -461,10 +485,8 @@ impl AttestedInner {
             .map(|(h, _)| *h)
             .collect();
         heights.sort_unstable_by(|a, b| b.cmp(a));
-        heights
-            .get(DEFERRED_EVIDENCE_MIN_PROPOSERS.saturating_sub(1))
-            .copied()
-            .unwrap_or(0)
+        let quorum = deferred_quorum_size(self.known_proposers.lock().len());
+        heights.get(quorum.saturating_sub(1)).copied().unwrap_or(0)
     }
 }
 
@@ -689,6 +711,46 @@ impl ProduceCatchupGate {
             .unwrap_or(0)
     }
 
+    /// The deferred watermark this round may use. While deferred evidence ALONE would
+    /// make the producer refuse, that is allowed for [`DEFERRED_ONLY_REFUSE_MAX`]; after
+    /// it the evidence is ignored (the producer seals) with a rate-limited warning, until
+    /// it stops being the only reason to refuse.
+    fn deferred_for_round(&self, st: &mut CatchupBehindState, local_tip: u64, held: u64) -> u64 {
+        let raw = self.deferred_watermark();
+        // RED STUB: old behaviour, no time cap.
+        if raw > 0 || held > 0 || local_tip > 0 || st.stalled_latch || !st.stalled_latch {
+            return raw;
+        }
+        let deferred_only = raw.saturating_sub(local_tip) > CATCHUP_RESUME_GAP
+            && held.saturating_sub(local_tip) <= CATCHUP_RESUME_GAP;
+        if !deferred_only {
+            st.deferred_only_since = None;
+            return raw;
+        }
+        let now = self
+            .attested_observed
+            .as_ref()
+            .map(|o| o.now_instant())
+            .unwrap_or_else(Instant::now);
+        let since = *st.deferred_only_since.get_or_insert(now);
+        if now.saturating_duration_since(since) < DEFERRED_ONLY_REFUSE_MAX {
+            return raw;
+        }
+        let due = st
+            .deferred_only_warned
+            .is_none_or(|t| now.saturating_duration_since(t) >= DEFERRED_ONLY_WARN_EVERY);
+        if due {
+            st.deferred_only_warned = Some(now);
+            warn!(
+                "F2/#126: signed blocks this node cannot admit have said it is behind \
+                 (evidence at {raw}, applied tip {local_tip}) for over {}s with nothing it \
+                 holds agreeing; sealing anyway. Check this node's peers and sync.",
+                DEFERRED_ONLY_REFUSE_MAX.as_secs()
+            );
+        }
+        0
+    }
+
     /// F2: decide whether the node is too far BEHIND its peers to seal this slot.
     /// `local_tip` is the node's applied-tip height (read under the same advance lock
     /// the producer holds for its build). Returns `Err` to make the producer REFRAIN.
@@ -703,10 +765,10 @@ impl ProduceCatchupGate {
         // Held (chained) evidence, or heard-but-unadmitted evidence; only the held
         // kind can latch the stall alert (see `deferred_watermark`).
         let held = attested.load(Ordering::SeqCst);
-        let attested = held.max(self.deferred_watermark());
+        let mut st = self.behind.lock();
+        let attested = held.max(self.deferred_for_round(&mut st, local_tip, held));
         let gap = attested.saturating_sub(local_tip);
         let held_behind = held.saturating_sub(local_tip) > CATCHUP_RESUME_GAP;
-        let mut st = self.behind.lock();
 
         // Human-in-command override always wins: clear the stall latch and resume.
         //
@@ -7498,6 +7560,89 @@ mod tests {
             fn drop(&mut self) {
                 set_mine_on_demand(false);
             }
+        }
+
+        /// A copy of `blk` signed by node `i` at `height`, with a parent nobody holds and
+        /// a header time `skew_secs` after real time (matching the test clock).
+        fn unadmittable(blk: &Block, i: u8, height: u64, skew_secs: u64) -> Block {
+            let mut x = blk.clone();
+            x.header.height = height;
+            x.header.selected_parent_hash = Hash::new([0xEE; 32]);
+            x.header.timestamp =
+                (chrono::Utc::now().timestamp().max(0) as u64).saturating_add(skew_secs);
+            resign(x, i)
+        }
+
+        /// Two proposers that keep sending fresh, ever-higher blocks nobody can admit
+        /// hold a producer off for at most the cap (60 s), then it seals every round.
+        #[tokio::test(flavor = "current_thread")]
+        async fn unadmittable_evidence_holds_sealing_off_at_most_the_cap() {
+            let (_a1, _a2, b, t1, t2) = behind_fixture().await;
+            let mut sealed_at = None;
+            for step in 0..=18u64 {
+                let t = step * 10;
+                let tip = applied(&b).1;
+                for (blk, i) in [(&t1, 1u8), (&t2, 2u8)] {
+                    let x = unadmittable(blk, i, tip + 50 + step, t);
+                    assert!(b.attested.observe_deferred(&x), "t={t}s: evidence counted");
+                }
+                let r = b.producer.produce_block().await;
+                if t == 0 {
+                    assert!(r.is_err(), "fresh evidence must hold sealing off at first");
+                }
+                // Literal on purpose: the bound is 60 s (+ one 10 s round of slack).
+                if t >= 70 {
+                    assert!(r.is_ok(), "t={t}s: still held off: {:?}", r.err());
+                }
+                if r.is_ok() && sealed_at.is_none() {
+                    sealed_at = Some(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            let at = sealed_at.expect("sealed within the cap");
+            assert!(
+                at >= 60,
+                "the cap must not cut the refusal short (sealed at {at}s)"
+            );
+        }
+
+        /// With 7 producers, 2 proposers' unadmittable evidence cannot hold the
+        /// others off; 3 (more than a third) can, until the cap.
+        #[tokio::test(flavor = "current_thread")]
+        async fn two_of_seven_cannot_hold_sealing_off() {
+            let mut others = Vec::new();
+            for i in 1..=6u8 {
+                others.push(node(i, false).await);
+            }
+            let mut b = node(7, true).await;
+            let mut last = Vec::new();
+            for r in 0..12usize {
+                let p = r % 6;
+                let blk = produce(&others[p]).await;
+                for (q, o) in others.iter_mut().enumerate() {
+                    if q != p {
+                        assert_eq!(gossip(o, None, &blk).await, "admitted");
+                    }
+                }
+                assert_eq!(gossip(&mut b, None, &blk).await, "admitted");
+                last.push(blk);
+            }
+            let tip = applied(&b).1;
+            for (k, blk) in last.iter().take(2).enumerate() {
+                let x = unadmittable(blk, k as u8 + 1, tip + 50, 0);
+                assert!(b.attested.observe_deferred(&x));
+            }
+            let r = b.producer.produce_block().await;
+            assert!(r.is_ok(), "2 of 7 held sealing off: {:?}", r.err());
+            let tip = applied(&b).1;
+            for (k, blk) in last.iter().take(3).enumerate() {
+                let x = unadmittable(blk, k as u8 + 1, tip + 60, 0);
+                assert!(b.attested.observe_deferred(&x));
+            }
+            assert!(
+                b.producer.produce_block().await.is_err(),
+                "3 of 7 (more than a third) count"
+            );
         }
 
         /// The same evidence, re-delivered, counts for at most 30 s from when it was

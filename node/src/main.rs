@@ -4020,18 +4020,24 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             if let Some((parent, parent_height)) =
                                 parent_walk.next(lowest_deferred, !orphan_blocks.is_empty())
                             {
-                                if let Some(peer) = pm_for_rx.get_peer(&pid) {
-                                    if let Err(e) = sync_for_rx
+                                let sent = match pm_for_rx.get_peer(&pid) {
+                                    Some(peer) => sync_for_rx
                                         .request_blocks(&peer, parent, parent_height)
                                         .await
-                                    {
-                                        tracing::debug!(
-                                            "missing-parent request to {} for {} failed: {}",
-                                            pid,
-                                            hex::encode(&parent.as_bytes()[..8]),
-                                            e
-                                        );
-                                    }
+                                        .unwrap_or_else(|e| {
+                                            tracing::debug!(
+                                                "missing-parent request to {} for {} failed: {}",
+                                                pid,
+                                                hex::encode(&parent.as_bytes()[..8]),
+                                                e
+                                            );
+                                            false
+                                        }),
+                                    None => false,
+                                };
+                                // Only a request that went on the wire spends a step.
+                                if !sent {
+                                    parent_walk.unsent();
                                 }
                             }
                             // sync_rejoin.rs: steer the next anchor on this answer.

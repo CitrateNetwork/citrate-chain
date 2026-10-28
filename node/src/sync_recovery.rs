@@ -54,6 +54,8 @@ pub const INITIAL_SYNC_LEAD: u64 = crate::producer::CATCHUP_REFUSE_GAP;
 pub struct ParentWalk {
     steps: u32,
     last_height: Option<u64>,
+    /// `last_height` before the most recent step, so an unsent request can be undone.
+    prev_height: Option<u64>,
 }
 
 impl ParentWalk {
@@ -81,8 +83,16 @@ impl ParentWalk {
             return None;
         }
         self.steps = self.steps.saturating_add(1);
+        self.prev_height = self.last_height;
         self.last_height = Some(parent_height);
         Some((parent, parent_height))
+    }
+
+    /// The request for the last step was not sent (already pending, or the in-flight
+    /// cap): give the step back so the same parent is asked for on a later answer.
+    pub fn unsent(&mut self) {
+        // RED STUB: old behaviour, the step stays spent.
+        let _ = self.prev_height;
     }
 }
 
@@ -175,6 +185,18 @@ mod tests {
         assert_eq!(w.next(Some((500, h(3))), true), Some((h(3), 499)));
     }
 
+    #[test]
+    fn an_unsent_step_is_given_back() {
+        let mut w = ParentWalk::new();
+        assert_eq!(w.next(Some((100, h(1))), true), Some((h(1), 99)));
+        w.unsent();
+        assert_eq!(w.next(Some((100, h(1))), true), Some((h(1), 99)));
+        for _ in 0..(MAX_PARENT_WALK_STEPS * 2) {
+            w.unsent();
+            assert!(w.next(Some((100, h(1))), true).is_some());
+        }
+    }
+
     /// Tripwire: the receive loop, sync tick and producer stay wired to these.
     #[test]
     fn main_loop_stays_wired() {
@@ -183,6 +205,7 @@ mod tests {
             "sync_recovery::answer_anchor_was_stale(",
             "sync_recovery::lowest_deferred(",
             "parent_walk.next(",
+            "parent_walk.unsent()",
             "attested_for_rx.observe_deferred(&block)",
             "with_initial_sync_gate(initial_sync_done.clone())",
             "sync_recovery::initial_sync_complete(",
