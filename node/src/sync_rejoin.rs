@@ -217,7 +217,14 @@ impl RejoinTracker {
     /// gives up (with the usual backoff), so it can never hang on a peer that
     /// stops answering or always answers something else.
     pub fn note_asked(&mut self, peer: &str, anchor: (Hash, u64)) -> Option<Transition> {
-        let out = None; // RED STUB: no unanswered give-up
+        let mut out = None;
+        if self.asked.is_some() && !matches!(self.mode, Mode::Tip { .. }) {
+            self.unanswered = self.unanswered.saturating_add(1);
+            if self.unanswered >= MAX_UNANSWERED {
+                self.unanswered = 0;
+                out = self.give_up(anchor.1);
+            }
+        }
         self.asked = Some((peer.to_string(), anchor.0, anchor.1));
         out
     }
@@ -239,13 +246,9 @@ impl RejoinTracker {
         // Genesis carries no proposer signature, so it never passes
         // `handle_blocks`; a probe anchored there is matched on the received
         // hash, still only from the asked peer.
-        // RED STUB: the reviewed behaviour (any peer, received hashes).
-        let _ = verified;
-        let answers = if received.is_empty() {
-            asked_peer == peer
-        } else {
-            received.contains(anchor)
-        };
+        let genesis_anchor = *height == 0 && received.contains(anchor);
+        let answers = asked_peer == peer
+            && (received.is_empty() || verified.contains(anchor) || genesis_anchor);
         if !answers {
             return None;
         }
@@ -377,7 +380,10 @@ impl RejoinTracker {
 
     fn give_up(&mut self, at: u64) -> Option<Transition> {
         self.mode = Mode::Tip { strikes: 0 };
-        // RED STUB: no backoff
+        let shift = self.give_ups.min(31);
+        self.cooldown = BACKOFF_BASE_ANSWERS
+            .saturating_mul(1u32.checked_shl(shift).unwrap_or(u32::MAX))
+            .min(BACKOFF_MAX_ANSWERS);
         self.give_ups = self.give_ups.saturating_add(1);
         Some(Transition::GaveUp { at })
     }
@@ -410,7 +416,19 @@ impl RejoinLogBudget {
     /// `Some(n)` when a line may be logged now, `n` being the lines
     /// suppressed since the last one logged; `None` when over budget.
     pub fn allow(&mut self, now: Instant) -> Option<u64> {
-        let _ = now; // RED STUB: unbounded
+        let fresh = match self.window_start {
+            Some(start) => now.saturating_duration_since(start) >= REJOIN_LOG_WINDOW,
+            None => true,
+        };
+        if fresh {
+            self.window_start = Some(now);
+            self.used = 0;
+        }
+        if self.used >= REJOIN_LOG_PER_WINDOW {
+            self.suppressed = self.suppressed.saturating_add(1);
+            return None;
+        }
+        self.used = self.used.saturating_add(1);
         Some(std::mem::take(&mut self.suppressed))
     }
 }
