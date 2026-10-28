@@ -28,7 +28,7 @@
 )]
 
 use crate::admission::{self, AdmitOutcome, BlockAdmission};
-use crate::sync_peer::{self, ServeQuality, SyncCandidate, SyncPeerSelector};
+use crate::sync_peer::{ServeQuality, SyncCandidate, SyncPeerSelector};
 use citrate_consensus::types::{Block, BlockHeader, Hash};
 use citrate_network::peer::{Peer, PeerId};
 use citrate_network::{BlocksMatch, NetworkMessage, PeerSlot, SyncManager, SyncRequest};
@@ -92,6 +92,10 @@ pub enum Handoff {
 /// lookahead (512 heights, 16 ranges) is the most that can legitimately be
 /// waiting; the rest is headroom for unsolicited answers.
 pub const ADMIT_QUEUE: usize = 64;
+
+/// Ranges a peer in bad standing (see `SyncPeerSelector::bad_standing`) may
+/// hold at once.
+pub const BAD_STANDING_RANGES: usize = 1;
 
 /// What one `Blocks` response did.
 #[derive(Debug, Clone)]
@@ -165,26 +169,23 @@ impl SyncDriver {
             .collect();
         // Best first; a peer in bad standing (de-preferred by timeouts, or a
         // negative usefulness score) may hold only one range at a time.
-        let ranked: Vec<(String, usize)> = {
+        let ranked: Vec<(String, bool)> = {
             let sel = self.selector.lock().await;
             sel.rank(&candidates, applied_height)
                 .into_iter()
-                .map(|c| {
-                    let bad = sel.failures(&c.id) >= sync_peer::DEPREFER_AT_FAILURES
-                        || sel.score(&c.id) < 0;
-                    (c.id.clone(), usize::from(bad))
-                })
+                .map(|c| (c.id.clone(), sel.bad_standing(&c.id)))
                 .collect()
         };
         report.chosen = ranked.first().map(|(id, _)| id.clone());
         let mut slots: Vec<PeerSlot> = ranked
             .iter()
-            .filter_map(|(id, cap)| {
+            .filter_map(|(id, bad)| {
                 peers.iter().find(|p| p.id.0 == *id).map(|p| PeerSlot {
                     id: p.id.clone(),
                     head_height: p.head_height,
-                    max_in_flight: *cap,
-                    bad_standing: *cap == 1,
+                    // 0 = the scheduler's per-peer default.
+                    max_in_flight: if *bad { BAD_STANDING_RANGES } else { 0 },
+                    bad_standing: *bad,
                 })
             })
             .collect();
@@ -465,14 +466,22 @@ impl SyncDriver {
         // what the range asked for and to the gap. A response that answers no
         // range of ours (ancestry recovery, or a late answer to a range
         // already reassigned) is our question, not the peer's failure: neutral
-        // when it brings nothing.
+        // when it brings nothing. So is an empty answer to a range anchored on
+        // ANOTHER peer's header: the anchor may be made up, and its source is
+        // charged when the anchor is dropped (the scheduler reports it).
+        // Neither clears the peer's timeout count: only a delivery does.
         let (_, applied_now) = applied_tip(storage);
         let gap = target.saturating_sub(applied_now);
         let (anchor, batch, stale_anchor) = match matched {
-            BlocksMatch::Range { start, end, .. } => (
+            BlocksMatch::Range {
+                start,
+                end,
+                foreign_anchor,
+                ..
+            } => (
                 start,
                 usize::try_from(end.saturating_sub(start).saturating_add(1)).unwrap_or(usize::MAX),
-                false,
+                foreign_anchor,
             ),
             BlocksMatch::Unsolicited => (self.sync.last_block_anchor_height(), 32, true),
         };
@@ -777,6 +786,12 @@ mod tests {
         /// answer is a fresh fabricated run above `from` (random hashes, the
         /// height encoded in the hash); every GetBlocks answered empty.
         TipLiar,
+        /// Made-up headers like `TipLiar`; every GetBlocks answered with
+        /// nothing, only after `ms` (past the range timeout), so each answer
+        /// arrives after its range expired.
+        LateEmptyTip(u64),
+        /// Honest headers; every GetBlocks answered with nothing after `ms`.
+        LateEmptyHonestHdr(u64),
     }
 
     /// `block` moved onto a parent nobody holds and re-signed by `key`.
@@ -873,7 +888,23 @@ mod tests {
                             }
                             _ => {}
                         }
+                        if let Behaviour::LateEmptyTip(ms) | Behaviour::LateEmptyHonestHdr(ms) =
+                            behaviour
+                        {
+                            let inbound = inbound.clone();
+                            let pid = pid.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_millis(ms)).await;
+                                let _ = inbound
+                                    .send((pid, NetworkMessage::Blocks { blocks: Vec::new() }))
+                                    .await;
+                            });
+                            continue;
+                        }
                         let blocks = match behaviour {
+                            Behaviour::LateEmptyTip(_) | Behaviour::LateEmptyHonestHdr(_) => {
+                                Vec::new()
+                            }
                             Behaviour::Honest => block_serve::serve_blocks(&storage, &from, count),
                             Behaviour::EmptyOrSilent => {
                                 k += 1;
@@ -964,6 +995,7 @@ mod tests {
                         wire.lock().expect("wire").get_headers += 1;
                         let headers = match behaviour {
                             Behaviour::Honest
+                            | Behaviour::LateEmptyHonestHdr(_)
                             | Behaviour::Forger
                             | Behaviour::DivergeAfter(_)
                             | Behaviour::ForkAfter(_)
@@ -1031,7 +1063,7 @@ mod tests {
                                 hs
                             }
                             Behaviour::EmptyOrSilent => Vec::new(),
-                            Behaviour::TipLiar => {
+                            Behaviour::TipLiar | Behaviour::LateEmptyTip(_) => {
                                 let base = if from == Hash::new([0u8; 32]) {
                                     Some(0)
                                 } else {
@@ -1748,6 +1780,67 @@ mod tests {
         assert!(woken(&wake).await, "not woken by an admission");
     }
 
+    /// An empty answer to a range anchored on ANOTHER peer's header is
+    /// neutral for the answering peer (the anchor may be made up); the same
+    /// answer to a range on the applied tip is Barren.
+    #[tokio::test]
+    async fn an_empty_answer_on_another_peers_anchor_does_not_cost_standing() {
+        let chain = build_chain(80).await;
+        let node_dir = tempfile::tempdir().expect("tempdir");
+        let f = follower(&chain, node_dir.path()).await;
+        let g = chain.genesis.header.block_hash;
+        let src = PeerId("src".into());
+        let q = PeerId("q".into());
+        let mut orphans = Vec::new();
+        // Range 1 on the applied tip, and a header request, both to src.
+        let plan =
+            f.driver
+                .sync()
+                .plan_ranges(Instant::now(), 0, g, &[PeerSlot::new(src.clone(), 80)]);
+        assert!(plan
+            .requests
+            .iter()
+            .any(|r| matches!(r, SyncRequest::Headers { .. })));
+        let headers: Vec<BlockHeader> = chain.blocks.iter().map(|b| b.header.clone()).collect();
+        f.driver.ingest_headers(&src, headers).await;
+        // q is asked for a range anchored on src's header, answers empty.
+        let both = [PeerSlot::new(q.clone(), 80), PeerSlot::new(src.clone(), 80)];
+        let plan = f.driver.sync().plan_ranges(Instant::now(), 0, g, &both);
+        assert!(plan.requests.iter().any(|r| matches!(
+            r,
+            SyncRequest::Blocks { peer, .. } if *peer == q
+        )));
+        let r = f.driver.receive_blocks(&q, Vec::new()).await;
+        assert!(matches!(
+            r.matched,
+            BlocksMatch::Range {
+                foreign_anchor: true,
+                ..
+            }
+        ));
+        let rep = f
+            .driver
+            .admit_received(&f.admission, &f.storage, &mut orphans, r, 80, |_| {})
+            .await;
+        assert_eq!(rep.quality, ServeQuality::Redundant);
+        assert_eq!(rep.score, 0, "charged for another peer's anchor");
+        // src answers its tip-anchored range empty: Barren.
+        let r = f.driver.receive_blocks(&src, Vec::new()).await;
+        assert!(matches!(
+            r.matched,
+            BlocksMatch::Range {
+                start: 1,
+                foreign_anchor: false,
+                ..
+            }
+        ));
+        let rep = f
+            .driver
+            .admit_received(&f.admission, &f.storage, &mut orphans, r, 80, |_| {})
+            .await;
+        assert_eq!(rep.quality, ServeQuality::Barren);
+    }
+
     /// `bad` peers first, then `honest` honest ones, for at most `secs`.
     /// With `pin_first`, peer-a0's standing is held at the top of the ranking
     /// (as for a peer that earns credit some other way), so it is always the
@@ -2006,5 +2099,50 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn catch_up_completes_past_eight_made_up_header_peers() {
         catch_up_past_tip_liars(8).await;
+    }
+    /// Past the range timeout (10 s).
+    const LATE_MS: u64 = 10_500;
+
+    /// Peers with made-up headers that answer every GetBlocks with nothing,
+    /// after the range expired, plus one honest peer. The late answers must
+    /// not clear their timeouts, and the honest peer's empty answers to ranges
+    /// anchored on their headers must not cost it its standing: catch-up
+    /// completes, on the right state root. (At 187c3f5b: 127 and 93 of 1,500.)
+    async fn catch_up_past_late_empty_peers(k: usize, honest_headers: bool) {
+        let n = env_u64("CITRATE_SYNC_TEST_ADV_BLOCKS", 1_500);
+        let b = if honest_headers {
+            Behaviour::LateEmptyHonestHdr(LATE_MS)
+        } else {
+            Behaviour::LateEmptyTip(LATE_MS)
+        };
+        let deadline = adversarial_deadline(n);
+        let (applied, _, _) = against_tip_liars(n, n, 0, &vec![b; k], 1, deadline).await;
+        // against_tip_liars checks the tip hash and state root on completion.
+        assert_eq!(
+            applied, n,
+            "{k} late empty peers: stopped at {applied} of {n}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catch_up_completes_past_one_late_empty_peer_with_made_up_headers() {
+        catch_up_past_late_empty_peers(1, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catch_up_completes_past_two_late_empty_peers_with_made_up_headers() {
+        catch_up_past_late_empty_peers(2, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catch_up_completes_past_two_late_empty_peers_with_honest_headers() {
+        catch_up_past_late_empty_peers(2, true).await;
+    }
+
+    /// At the tip, two late empty peers with made-up headers stay at the
+    /// idle rate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn at_the_tip_two_late_empty_peers_stay_at_the_idle_rate() {
+        tip_liar_rates(0, &[Behaviour::LateEmptyTip(LATE_MS); 2]).await;
     }
 }

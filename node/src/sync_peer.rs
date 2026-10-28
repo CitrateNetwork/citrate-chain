@@ -396,22 +396,19 @@ impl SyncPeerSelector {
                 self.failures.remove(id);
                 -1
             }
-            // Nothing admissible. Liveness is real but standing drops faster:
-            // serving back only blocks we already hold is the strongest evidence
-            // a peer is at or behind us.
-            ServeQuality::Barren => {
-                self.failures.remove(id);
-                -2
-            }
+            // Nothing admissible. Standing drops faster: serving back only
+            // blocks we already hold is the strongest evidence a peer is at
+            // or behind us. The timeout count stays: an empty answer delivers
+            // nothing, so it cannot undo a timeout (a peer that times out and
+            // then answers empty would otherwise never be de-preferred).
+            ServeQuality::Barren => -2,
             // #156: the peer answered the question we asked; the question was
-            // stale. Liveness is proven (so the timeout penalty clears) but
-            // standing must not move — crediting it would let a genuinely
-            // useless peer launder duplicates into a positive score, and
-            // debiting it is what drove a healthy sole source to -8.
-            ServeQuality::Redundant => {
-                self.failures.remove(id);
-                0
-            }
+            // stale (or anchored on another peer's header). Standing must not
+            // move — crediting it would let a genuinely useless peer launder
+            // duplicates into a positive score, and debiting it is what drove
+            // a healthy sole source to -8. The timeout count stays, as for
+            // Barren: a late empty answer to an expired range lands here.
+            ServeQuality::Redundant => 0,
         };
         let e = self.score.entry(id.to_string()).or_insert(0);
         *e = e.saturating_add(delta).clamp(SCORE_MIN, SCORE_MAX);
@@ -433,6 +430,13 @@ impl SyncPeerSelector {
     /// Highest height `id` has actually delivered (0 if it never has).
     pub fn served(&self, id: &str) -> u64 {
         self.served.get(id).copied().unwrap_or(0)
+    }
+
+    /// Whether `id` is in bad standing: de-preferred by timeouts, or a
+    /// negative usefulness score. Such a peer is still asked (I2), but holds
+    /// at most one range and its header anchors drop on any failure.
+    pub fn bad_standing(&self, id: &str) -> bool {
+        self.failures(id) >= DEPREFER_AT_FAILURES || self.score(id) < 0
     }
 
     /// Current failure count for `id` (0 when never seen).
@@ -1024,5 +1028,48 @@ mod pba_l1b_006_network_height {
         );
         assert!(src.contains("sync_peer::record_verified_height(&max_seen_for_rx"));
         assert!(src.contains("sync_peer::record_unverified_height("));
+    }
+
+    /// Only a delivery clears the timeout count. A peer that times out and
+    /// then answers empty (late, to an expired range, or on time with
+    /// nothing) keeps counting toward de-preference and bad standing.
+    #[test]
+    fn an_empty_or_late_answer_does_not_clear_timeouts_only_a_delivery_does() {
+        let mut sel = SyncPeerSelector::new();
+        for i in 1..=DEPREFER_AT_FAILURES {
+            assert_eq!(sel.record_timeout("late"), i);
+            // The late empty answer (unsolicited: stale_anchor) ...
+            sel.record_serve("late", 0, 0, 1_000, 32, true);
+            // ... or an on-time empty one.
+            sel.record_serve("late", 0, 0, 1_000, 32, false);
+        }
+        assert_eq!(sel.failures("late"), DEPREFER_AT_FAILURES);
+        assert!(sel.bad_standing("late"));
+        sel.record_serve("late", 1, 1, 1_000, 32, false);
+        assert_eq!(sel.failures("late"), 0, "a trickle is a delivery");
+        sel.record_timeout("late");
+        sel.record_serve("late", 32, 32, 1_000, 32, false);
+        assert_eq!(sel.failures("late"), 0, "a full delivery clears");
+    }
+
+    /// Bad standing: de-preferred by timeouts, or a negative score.
+    #[test]
+    fn bad_standing_is_timeouts_or_a_negative_score() {
+        let mut sel = SyncPeerSelector::new();
+        assert!(!sel.bad_standing("p"));
+        sel.record_serve("p", 0, 0, 1_000, 32, true);
+        assert!(
+            !sel.bad_standing("p"),
+            "a neutral answer is not bad standing"
+        );
+        sel.record_serve("p", 0, 0, 1_000, 32, false);
+        assert!(sel.bad_standing("p"), "negative score");
+        let mut sel = SyncPeerSelector::new();
+        for _ in 1..DEPREFER_AT_FAILURES {
+            sel.record_timeout("q");
+        }
+        assert!(!sel.bad_standing("q"));
+        sel.record_timeout("q");
+        assert!(sel.bad_standing("q"));
     }
 }
