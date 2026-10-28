@@ -359,22 +359,34 @@ impl AttestedNetworkHead {
         if !self.inner.known_proposers.lock().contains(&proposer) {
             return false;
         }
+        // The header must be recent by local wall time: an old block is not evidence.
+        let wall = self.inner.wall_now_secs();
+        let ts = block.header.timestamp;
+        let max_age = DEFERRED_EVIDENCE_TTL
+            .saturating_add(DEFERRED_EVIDENCE_CLOCK_DRIFT)
+            .as_secs();
+        if ts.saturating_add(max_age) < wall
+            || ts > wall.saturating_add(DEFERRED_EVIDENCE_CLOCK_DRIFT.as_secs())
+        {
+            return false;
+        }
         let now = self.inner.now_instant();
         let mut deferred = self.inner.deferred.lock();
+        // Entries are never pruned on expiry: an expired entry is the record that this
+        // height was already heard, so re-delivering it cannot count again. The map is
+        // bounded by the known-proposer set (itself capped).
         if deferred.len() >= PROPOSER_RECORD_CAP && !deferred.contains_key(&proposer) {
-            deferred
-                .retain(|_, (_, at)| now.saturating_duration_since(*at) < DEFERRED_EVIDENCE_TTL);
-            if deferred.len() >= PROPOSER_RECORD_CAP {
-                return false;
+            return false;
+        }
+        // Only a HIGHER height is new evidence; a repeat or a lower height never renews
+        // the first-heard time.
+        match deferred.get_mut(&proposer) {
+            Some(entry) if block.header.height <= entry.0 => {}
+            Some(entry) => *entry = (block.header.height, now),
+            None => {
+                deferred.insert(proposer, (block.header.height, now));
             }
         }
-        let entry = deferred.entry(proposer).or_insert((0, now));
-        if block.header.height >= entry.0
-            || now.saturating_duration_since(entry.1) >= DEFERRED_EVIDENCE_TTL
-        {
-            entry.0 = block.header.height;
-        }
-        entry.1 = now;
         true
     }
 
@@ -441,9 +453,13 @@ impl AttestedInner {
     /// The deferred-evidence height at least [`DEFERRED_EVIDENCE_MIN_PROPOSERS`] fresh,
     /// distinct proposers vouch for (0 when fewer do).
     fn deferred_quorum_height(&self, now: Instant) -> u64 {
-        let mut deferred = self.deferred.lock();
-        deferred.retain(|_, (_, at)| now.saturating_duration_since(*at) < DEFERRED_EVIDENCE_TTL);
-        let mut heights: Vec<u64> = deferred.values().map(|(h, _)| *h).collect();
+        // Expired entries are kept (see `observe_deferred`) and simply not counted.
+        let deferred = self.deferred.lock();
+        let mut heights: Vec<u64> = deferred
+            .values()
+            .filter(|(_, at)| now.saturating_duration_since(*at) < DEFERRED_EVIDENCE_TTL)
+            .map(|(h, _)| *h)
+            .collect();
         heights.sort_unstable_by(|a, b| b.cmp(a));
         heights
             .get(DEFERRED_EVIDENCE_MIN_PROPOSERS.saturating_sub(1))
