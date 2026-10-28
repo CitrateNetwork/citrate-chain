@@ -182,6 +182,7 @@ consensus_tripwires() {
     "scripts/ci/privileged_slots_tripwire.sh" \
     "scripts/ci/vrf_proof_source_tripwire.sh" \
     "scripts/ci/mempool_lock_order_tripwire.sh" \
+    "scripts/ci/rpc_state_tag_guard_tripwire.sh" \
   ; do
     if [ ! -x "$t" ]; then
       echo "missing/!executable tripwire: $t"; rc=1; continue

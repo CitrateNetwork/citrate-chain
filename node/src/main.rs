@@ -4040,6 +4040,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             allow_eth_send_transaction: config.rpc.allow_eth_send_transaction,
             // PBA-L1a-023: Host allowlist (DNS-rebinding defence).
             allowed_hosts: config.rpc.allowed_hosts.clone(),
+            // chain#425: operator opt-out for pinned recent state tags (0 = strict).
+            serve_recent_state_tags: config.rpc.serve_recent_state_tags,
             rate_limit: citrate_api::rate_limit::RateLimitConfig {
                 operator_token,
                 api_key,
