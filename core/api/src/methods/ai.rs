@@ -970,7 +970,6 @@ fn model_search_dirs(home_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     vec![
         PathBuf::from("./models"),
         PathBuf::from("../../../models"),
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models"),
         home_dir.join("Models"),
         home_dir.join(".citrate/models"),
         home_dir.join(".ipfs/models"),
