@@ -355,6 +355,15 @@ impl SyncPeerSelector {
         *e
     }
 
+    /// A fork-point search against `id` gave up (sync_rejoin.rs). De-prefer it
+    /// as if it had reached the timeout threshold, so the next tick asks a
+    /// different useful peer if there is one (I2 still selects it when it is the
+    /// only one). Its next answer clears the count, like any answer does.
+    pub fn record_give_up(&mut self, id: &str) {
+        // RED STUB: old behaviour.
+        let _ = id;
+    }
+
     /// Clear `id`'s TIMEOUT count because it is being dropped and will
     /// re-handshake — the reconnection starts from a clean slate.
     ///
@@ -524,6 +533,29 @@ impl SyncPeerSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// After a fork-point search gives up against the preferred peer, the next
+    /// tick asks a different useful peer; with no alternative it keeps the one.
+    #[test]
+    fn a_give_up_switches_to_another_useful_peer() {
+        let cands = vec![
+            SyncCandidate {
+                id: "a".into(),
+                head_height: 100,
+            },
+            SyncCandidate {
+                id: "b".into(),
+                head_height: 100,
+            },
+        ];
+        let mut sel = SyncPeerSelector::new();
+        sel.record_serve("a", 32, 60, 40, 32, false);
+        assert_eq!(sel.select(&cands, 50).map(|c| c.id.as_str()), Some("a"));
+        sel.record_give_up("a");
+        assert_eq!(sel.select(&cands, 50).map(|c| c.id.as_str()), Some("b"));
+        let only_a = vec![cands[0].clone()];
+        assert_eq!(sel.select(&only_a, 50).map(|c| c.id.as_str()), Some("a"));
+    }
 
     fn cand(id: &str, head_height: u64) -> SyncCandidate {
         SyncCandidate {

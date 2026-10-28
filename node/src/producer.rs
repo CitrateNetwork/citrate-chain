@@ -300,6 +300,12 @@ impl AttestedNetworkHead {
         }
     }
 
+    /// Deferred ("heard but not admitted") evidence. RED STUB: keeps the old behaviour
+    /// (a block whose parent this node lacks is never evidence).
+    pub fn observe_deferred(&self, _block: &Block) -> bool {
+        false
+    }
+
     /// The signature + ancestry check. `Some(height)` iff the block is attested-ahead
     /// evidence per the rules on [`AttestedNetworkHead`]; `None` otherwise.
     fn attested_height(storage: &StorageManager, block: &Block) -> Option<u64> {
@@ -1629,6 +1635,11 @@ impl BlockProducer {
             gate.attested_ahead = Some(Arc::new(AtomicU64::new(0)));
             gate.attested_observed = Some(attested.handle());
         }
+        self
+    }
+
+    /// Initial-sync condition. RED STUB: keeps the old behaviour (no condition).
+    pub fn with_initial_sync_gate(self, _flag: Arc<AtomicBool>) -> Self {
         self
     }
 
@@ -7020,6 +7031,351 @@ mod tests {
             memoized_best, 9,
             "only the genuine extension counts; the watermark tracks the selected chain to 9"
         );
+    }
+    // ── Producer seal gate and missing-parent walk. The harness drives the real
+    // admission/serve/apply path and the same calls main.rs makes on gossip and
+    // on a `Blocks` answer, with an in-process "network". ──
+    mod seal_gate_and_parent_walk {
+        use super::*;
+        use crate::admission::{AdmitOutcome, BlockAdmission};
+        use crate::canonical_apply::CanonicalApplicator;
+        use crate::sync_recovery::ParentWalk;
+        use citrate_execution::StateDB;
+
+        pub(super) struct N {
+            pub storage: Arc<StorageManager>,
+            pub app: Arc<CanonicalApplicator>,
+            pub adm: BlockAdmission,
+            pub producer: BlockProducer,
+            pub orphans: Vec<Block>,
+            pub attested: AttestedNetworkHead,
+            pub walk: ParentWalk,
+            pub initial_sync: Arc<AtomicBool>,
+            _dir: TempDir,
+        }
+
+        pub(super) async fn node(i: u8, gated: bool) -> N {
+            let dir = TempDir::new().expect("tempdir");
+            let storage = Arc::new(
+                StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
+            );
+            let executor = Arc::new(Executor::with_storage_and_chain_id(
+                Arc::new(StateDB::new()),
+                Some(storage.state.clone()),
+                40204,
+            ));
+            let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+            let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+            seed_test_genesis(&storage, &dag, &ghostdag).await;
+            let app = Arc::new(
+                CanonicalApplicator::new(executor.clone(), storage.clone())
+                    .with_fork_choice(ghostdag.clone()),
+            );
+            let adm = BlockAdmission::new(
+                storage.clone(),
+                dag.clone(),
+                ghostdag.clone(),
+                Some(app.clone()),
+            );
+            let mempool = Arc::new(Mempool::new(MempoolConfig {
+                require_valid_signature: false,
+                ..Default::default()
+            }));
+            let attested = AttestedNetworkHead::new();
+            let initial_sync = Arc::new(AtomicBool::new(true));
+            let mut producer = BlockProducer::with_shared_dag(
+                storage.clone(),
+                executor,
+                mempool,
+                None,
+                embedded_pubkey(Address([0x10 + i; 20])),
+                Ed25519SigningKey::from_bytes(&[0x60 + i; 32]),
+                2,
+                Arc::new(citrate_economics::UnifiedEconomicsManager::new(
+                    citrate_economics::UnifiedEconomicsConfig::default(),
+                )),
+                dag,
+                ghostdag,
+            )
+            .await
+            .with_v2_headers(true)
+            .with_applied_tip_lock(app.advance_lock());
+            if gated {
+                // Same chain as main.rs.
+                producer = producer
+                    .with_produce_catchup_gate(&app)
+                    .with_network_height_gate(&attested)
+                    .with_initial_sync_gate(initial_sync.clone());
+            }
+            N {
+                storage,
+                app,
+                adm,
+                producer,
+                orphans: Vec::new(),
+                attested,
+                walk: ParentWalk::new(),
+                initial_sync,
+                _dir: dir,
+            }
+        }
+
+        pub(super) async fn produce(n: &N) -> Block {
+            let h = n.producer.produce_block().await.expect("produce");
+            n.storage
+                .blocks
+                .get_block(&h)
+                .expect("read")
+                .expect("stored")
+        }
+
+        pub(super) fn applied(n: &N) -> (Hash, u64) {
+            n.storage
+                .blocks
+                .get_applied_tip()
+                .expect("read tip")
+                .expect("tip")
+        }
+
+        /// The gossip `NewBlock` arm of main.rs: admit; on Deferred record the
+        /// deferred evidence and run SYNC-S3 against `server` (when given).
+        pub(super) async fn gossip(n: &mut N, server: Option<&N>, b: &Block) -> &'static str {
+            match n.adm.admit(b).await {
+                AdmitOutcome::Admitted { .. } => {
+                    n.attested.observe(&n.storage, b);
+                    "admitted"
+                }
+                AdmitOutcome::AlreadyAdmitted => "already",
+                AdmitOutcome::Deferred { missing_parent } => {
+                    n.attested.observe_deferred(b);
+                    if let Some(server) = server {
+                        if crate::sync_peer::should_attempt_ancestry_recovery(
+                            b.header.height,
+                            applied(n).1,
+                        ) {
+                            let resp = crate::block_serve::serve_blocks(
+                                &server.storage,
+                                &missing_parent,
+                                32,
+                            );
+                            on_blocks(n, server, resp).await;
+                        }
+                    }
+                    "deferred"
+                }
+                AdmitOutcome::Rejected(_) => "rejected",
+            }
+        }
+
+        /// One `Blocks` answer through main.rs's receive arm (the shared fixpoint,
+        /// the bounded orphan buffer, then the parent walk). Returns the newly
+        /// admitted count and the walk's follow-up request.
+        async fn admit_answer(n: &mut N, blocks: Vec<Block>) -> (usize, Option<(Hash, u64)>) {
+            let answer: std::collections::HashSet<Hash> =
+                blocks.iter().map(|b| b.header.block_hash).collect();
+            let mut pending = blocks;
+            let reprocess = !pending.is_empty();
+            if reprocess {
+                pending.append(&mut n.orphans);
+                pending = crate::admission::bound_orphan_buffer(pending);
+            }
+            let attested = n.attested.clone();
+            let storage = n.storage.clone();
+            let fixpoint = n
+                .adm
+                .admit_to_fixpoint(pending, |b, _| {
+                    attested.observe(&storage, b);
+                })
+                .await;
+            let from_answer: Vec<&Block> = fixpoint
+                .deferred
+                .iter()
+                .filter(|b| answer.contains(&b.header.block_hash))
+                .collect();
+            let lowest = crate::sync_recovery::lowest_deferred(&n.storage, &from_answer);
+            if reprocess {
+                n.orphans = crate::admission::bound_orphan_buffer(fixpoint.deferred);
+            }
+            n.app.drive_drain().await;
+            let walk = n.walk.next(lowest, !n.orphans.is_empty());
+            (fixpoint.newly_admitted, walk)
+        }
+
+        /// A `Blocks` answer plus every missing-parent request it triggers, each
+        /// served by the same peer (main.rs sends them to the answering peer).
+        pub(super) async fn on_blocks(n: &mut N, server: &N, blocks: Vec<Block>) -> usize {
+            let mut total = 0usize;
+            let mut next = Some(blocks);
+            while let Some(bs) = next.take() {
+                let (newly, walk) = admit_answer(n, bs).await;
+                total += newly;
+                if let Some((parent, _)) = walk {
+                    next = Some(crate::block_serve::serve_blocks(
+                        &server.storage,
+                        &parent,
+                        32,
+                    ));
+                }
+            }
+            total
+        }
+
+        /// Plain tip-anchored sync (the node is behind on the same chain).
+        pub(super) async fn sync_from_tip(n: &mut N, server: &N) -> usize {
+            let (anchor, _) = applied(n);
+            let resp = crate::block_serve::serve_blocks(&server.storage, &anchor, 32);
+            on_blocks(n, server, resp).await
+        }
+
+        /// A deferred-evidence fixture: A1 and A2 (two known proposers) share the
+        /// common prefix with B, then extend to 46 without B hearing it.
+        async fn behind_fixture() -> (N, N, N, Block, Block) {
+            let mut a1 = node(1, false).await;
+            let mut a2 = node(2, false).await;
+            let mut b = node(7, true).await;
+            for i in 0..39 {
+                let (p, q) = if i % 2 == 0 {
+                    (&mut a1, &mut a2)
+                } else {
+                    (&mut a2, &mut a1)
+                };
+                let blk = produce(p).await;
+                assert_eq!(gossip(q, None, &blk).await, "admitted");
+                assert_eq!(gossip(&mut b, None, &blk).await, "admitted");
+            }
+            let mut last = [None, None];
+            for i in 0..7 {
+                let (p, q, k) = if i % 2 == 0 {
+                    (&mut a1, &mut a2, 0)
+                } else {
+                    (&mut a2, &mut a1, 1)
+                };
+                let blk = produce(p).await;
+                assert_eq!(gossip(q, None, &blk).await, "admitted");
+                last[k] = Some(blk);
+            }
+            let [l1, l2] = last;
+            (a1, a2, b, l1.expect("A1 block"), l2.expect("A2 block"))
+        }
+
+        /// The seal gate refuses while the node is behind: B at 39 has heard signed
+        /// tips from two known proposers above it that it cannot admit (their
+        /// parents are missing). Before, the gate counted only blocks whose parent
+        /// B holds (none), read a gap of 0, and sealed height 40.
+        #[tokio::test(flavor = "current_thread")]
+        async fn producer_refuses_while_behind_on_deferred_evidence() {
+            let (a1, _a2, mut b, t1, t2) = behind_fixture().await;
+            assert_eq!(gossip(&mut b, None, &t1).await, "deferred");
+            assert_eq!(gossip(&mut b, None, &t2).await, "deferred");
+            assert_eq!(applied(&b).1, 39, "B still behind");
+            let r = b.producer.produce_block().await;
+            assert!(
+                r.is_err(),
+                "producer sealed {:?} at height 40 while 7 behind the network (A@46)",
+                r.ok()
+            );
+            // Catching up clears it: B syncs, then seals on top of the majority.
+            for _ in 0..4 {
+                sync_from_tip(&mut b, &a1).await;
+            }
+            assert_eq!(applied(&b), applied(&a1));
+            let sealed = produce(&b).await;
+            assert_eq!(sealed.header.height, 47);
+        }
+
+        /// Halt safety: one proposer's deferred blocks never stop a producer (a
+        /// single stranded or misbehaving proposer cannot idle the fleet), nor do
+        /// blocks signed by a key this node never saw on an admitted block.
+        #[tokio::test(flavor = "current_thread")]
+        async fn single_or_unknown_proposer_deferred_evidence_does_not_block_sealing() {
+            let (_a1, _a2, mut b, t1, _t2) = behind_fixture().await;
+            assert_eq!(gossip(&mut b, None, &t1).await, "deferred");
+            let stranger = node(9, false).await;
+            for _ in 0..45 {
+                produce(&stranger).await;
+            }
+            let far = produce(&stranger).await;
+            assert!(!b.attested.observe_deferred(&far), "unknown proposer");
+            gossip(&mut b, None, &far).await;
+            assert!(b.producer.produce_block().await.is_ok());
+        }
+
+        /// Deferred evidence alone never latches the stall alert: B keeps refusing
+        /// while behind, but after the stall window it is not latched OFF (an
+        /// override is not needed once the evidence expires or is admitted).
+        #[tokio::test(flavor = "current_thread")]
+        async fn deferred_evidence_never_latches_the_stall_alert() {
+            let (_a1, _a2, mut b, t1, t2) = behind_fixture().await;
+            b.producer = b
+                .producer
+                .with_catchup_stall_alert_after(Duration::from_millis(1));
+            gossip(&mut b, None, &t1).await;
+            gossip(&mut b, None, &t2).await;
+            for _ in 0..3 {
+                assert!(b.producer.produce_block().await.is_err());
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let alert = b.producer.catchup_alert_handle().expect("gate wired");
+            assert!(
+                !alert.load(Ordering::SeqCst),
+                "deferred-only refusal latched"
+            );
+        }
+
+        /// Initial sync: a gated producer refuses until the sync driver reports
+        /// initial sync complete, then seals.
+        #[tokio::test(flavor = "current_thread")]
+        async fn producer_waits_for_initial_sync() {
+            let b = node(7, true).await;
+            b.initial_sync.store(false, Ordering::SeqCst);
+            let refused = b.producer.produce_block().await;
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|e| e.to_string().contains("initial sync")),
+                "sealed before initial sync completed: {refused:?}"
+            );
+            b.initial_sync.store(true, Ordering::SeqCst);
+            assert!(b.producer.produce_block().await.is_ok());
+        }
+
+        /// A deferred gossip block whose ancestry is several heights deep is
+        /// recovered by walking back by hash (no sync tick involved).
+        #[tokio::test(flavor = "current_thread")]
+        async fn deferred_gossip_walks_back_to_a_held_ancestor() {
+            let a = node(1, false).await;
+            let mut b = node(7, false).await;
+            for _ in 0..39 {
+                let blk = produce(&a).await;
+                assert_eq!(gossip(&mut b, None, &blk).await, "admitted");
+            }
+            let mut tip = None;
+            for _ in 0..8 {
+                tip = Some(produce(&a).await);
+            }
+            let tip = tip.expect("tip");
+            assert_eq!(gossip(&mut b, Some(&a), &tip).await, "deferred");
+            assert_eq!(applied(&b), applied(&a), "walked back 8 heights to 39");
+        }
+
+        /// The walk is bounded: a gap deeper than the budget is left to sync.
+        #[tokio::test(flavor = "current_thread")]
+        async fn parent_walk_stops_at_its_budget() {
+            let a = node(1, false).await;
+            let mut b = node(7, false).await;
+            let mut tip = None;
+            for _ in 0..(crate::sync_recovery::MAX_PARENT_WALK_STEPS as u64 + 40) {
+                tip = Some(produce(&a).await);
+            }
+            let tip = tip.expect("tip");
+            gossip(&mut b, Some(&a), &tip).await;
+            assert_eq!(applied(&b).1, 0, "nothing below the budget connects");
+            // The tip-anchored sync owns the rest.
+            for _ in 0..10 {
+                sync_from_tip(&mut b, &a).await;
+            }
+            assert_eq!(applied(&b), applied(&a));
+        }
     }
 }
 
