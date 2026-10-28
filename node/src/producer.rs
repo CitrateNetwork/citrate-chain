@@ -7520,7 +7520,8 @@ mod tests {
                     b.attested.observe_deferred(x);
                 }
                 let r = b.producer.produce_block().await;
-                if t < DEFERRED_EVIDENCE_TTL.as_secs() {
+                // Literal on purpose: the spec is 30 s, not whatever the constant says.
+                if t < 30 {
                     assert!(
                         r.is_err(),
                         "t={t}s: sealed while fresh evidence says behind"
@@ -7541,9 +7542,8 @@ mod tests {
         #[tokio::test(flavor = "current_thread")]
         async fn old_header_timestamp_is_not_evidence() {
             let (_a1, _a2, mut b, t1, t2) = behind_fixture().await;
-            b.attested.advance_clock_for_test(
-                DEFERRED_EVIDENCE_TTL + DEFERRED_EVIDENCE_CLOCK_DRIFT + Duration::from_secs(1),
-            );
+            // 30 s window + 15 s clock allowance, plus one: literal on purpose.
+            b.attested.advance_clock_for_test(Duration::from_secs(46));
             assert!(!b.attested.observe_deferred(&t1));
             assert!(!b.attested.observe_deferred(&t2));
             gossip(&mut b, None, &t1).await;
