@@ -7260,7 +7260,11 @@ mod tests {
             // Genesis stamped with the current time, as on a live chain, so produced
             // headers carry recent timestamps (the deferred-evidence check reads them).
             let mut genesis = test_genesis();
-            genesis.header.timestamp = chrono::Utc::now().timestamp().max(0) as u64;
+            // One timestamp for every node in the process, or nodes created across
+            // a second boundary would get different genesis hashes.
+            static GENESIS_TS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            genesis.header.timestamp =
+                *GENESIS_TS.get_or_init(|| chrono::Utc::now().timestamp().max(0) as u64);
             genesis.header.block_hash = genesis.compute_hash();
             storage.blocks.put_block(&genesis).expect("persist genesis");
             storage
