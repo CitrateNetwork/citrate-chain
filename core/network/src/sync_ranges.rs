@@ -1,0 +1,2228 @@
+// citrate/core/network/src/sync_ranges.rs
+//
+// Range scheduler for catch-up block download.
+//
+// WHY THIS EXISTS
+//
+// The previous driver anchored every `GetBlocks` at the node's applied tip at
+// the moment the request was sent, and retired ALL of a peer's outstanding
+// requests whenever any response from that peer was processed. The two
+// together meant the node forgot about requests whose answers were still on
+// the wire, and kept issuing new ones from nearly the same height. With the
+// in-flight cap at 8, about 8 requests covering almost the same 32 heights
+// stayed outstanding to ONE peer, and each 32-block answer carried about
+// 32 / 8 = 4 blocks the node did not already have. A capacity run measured
+// exactly that shape: ~4 new blocks per 32-block response, one peer, ~56
+// blocks/min against a tip growing ~30/min, CPU mostly idle.
+//
+// THE MODEL
+//
+// Heights above the applied tip are split into non-overlapping ranges of
+// `range_len` heights, keyed by their first height. A range is in exactly one
+// of three states: unrequested, in flight (to one peer, with a deadline), or
+// delivered (validated blocks handed to admission, waiting to be applied).
+// Requests are only ever issued for unrequested heights, so two outstanding
+// requests never cover the same height.
+//
+// The wire protocol is unchanged. `GetBlocks { from }` serves from the height
+// of `from` inclusive, so a range starting at height `s` is requested with the
+// hash of a block at height `s` as its anchor. Those hashes come from
+// `GetHeaders`, which the scheduler requests ahead of the applied tip (bounded
+// by `lookahead`). The first range above the applied tip can always fall back
+// to the applied tip itself as the anchor, which is what the old driver did, so
+// a missing or bad header source can slow the pipeline down to the old rate
+// but never stall it.
+//
+// Several ranges are in flight at once, spread over every peer that claims a
+// head at or above the range (per-peer and total caps). A range that times
+// out, comes back empty, or comes back short is released and re-planned; the
+// peer that failed it is avoided for that range while another can serve it.
+//
+// LINKAGE. Header anchors are claims: a header's hash cannot be recomputed
+// without the block body, so an anchor is only confirmed when blocks come
+// back. A range counts as delivered only through the blocks that LINK to its
+// anchor: the anchor block itself (or a sibling with the same parent), then
+// each block whose selected parent is an already linked block. Blocks at the
+// right heights that do not link (re-sealed on another parent) deliver
+// nothing, so the range is re-planned elsewhere instead of waiting for a
+// stall. An answer that contains a range's anchor at ANOTHER height proves the
+// anchor wrong: the anchor and every anchor from the same header source are
+// dropped, and that source is asked for headers again only when no other peer
+// can be. A range that fails twice (any mix of timeouts, empty, non-linking
+// answers, from two peers) drops its anchor too, so the first range falls
+// back to the applied tip. Header requests that bring nothing new back off.
+// Peers whose answers proved a wrong anchor, or whose delivered range never
+// applied, are reported in `Plan::misbehaved` for the caller to charge.
+//
+// BACKOFF. Every failure of a range (empty, nothing new, non-linking, timed
+// out, peer gone) is counted against its first HEIGHT, whatever the anchor
+// and whichever peer: re-anchoring, a new header run or another peer does not
+// reset the count; only a delivery at that height (or the applied tip passing
+// it) does. From the second failure on, the range waits `retry_backoff`
+// before each further attempt, doubling up to `retry_backoff_max`. While a
+// range has failures, nothing above it is planned (blocks above a range nobody
+// has served cannot be applied anyway). So the request rate when peers have
+// nothing to give is bounded by the backoff, not by the number of peers or how
+// fast they can make up headers. Header requests have a matching backoff:
+// each dropped anchor without a delivery since doubles the wait before the
+// next `GetHeaders` (up to 8 x `header_backoff`).
+//
+// A retry first goes to a peer that has not failed the range (spaced a
+// constant 2 x `retry_backoff` once the range has failed twice); when all
+// have, to the one whose failure is oldest, with the doubling hold. So every
+// peer, the honest one included, is tried in turn, and re-anchoring (which
+// keeps the list of peers that failed the height) cannot make them all
+// "untried" again.
+//
+// NOTHING HERE DECIDES VALIDITY. The scheduler only decides what to ask for and
+// from whom. Every block still goes through `SyncManager::handle_blocks`
+// (hash, signature, tx_root, timestamp) and then admission and execution,
+// exactly as before.
+
+use crate::peer::PeerId;
+use citrate_consensus::types::Hash;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::time::{Duration, Instant};
+
+/// Tunables for [`RangeScheduler`].
+#[derive(Debug, Clone)]
+pub struct RangeConfig {
+    /// Heights per range. Matches `SyncConfig::block_batch_size` so a full
+    /// response stays inside the transport's per-message budget.
+    pub range_len: u64,
+    /// Block ranges in flight across all peers.
+    pub max_in_flight: usize,
+    /// Block ranges in flight to any one peer.
+    pub max_in_flight_per_peer: usize,
+    /// How long a range (or header request) may stay unanswered before it is
+    /// released and re-planned on another peer.
+    pub request_timeout: Duration,
+    /// How far above the applied tip ranges and header anchors are planned.
+    /// Bounds the anchor map and the out-of-order blocks admission has to
+    /// buffer while an earlier range is still in flight.
+    pub lookahead: u64,
+    /// Headers requested per `GetHeaders`.
+    pub header_count: u32,
+    /// If delivered ranges sit above the applied tip for this long without the
+    /// applied tip moving, they are forgotten and re-requested. Covers blocks
+    /// that admission later refused or that fell out of its bounded orphan
+    /// buffer: the scheduler cannot see either, but it can see that nothing
+    /// advanced.
+    pub stall_timeout: Duration,
+    /// After a header answer that adds no anchor (or a header request that
+    /// timed out), wait this long before the next `GetHeaders`.
+    pub header_backoff: Duration,
+    /// Once every eligible peer has failed a range, wait this long before
+    /// asking again; doubles per further round.
+    pub retry_backoff: Duration,
+    /// Cap on the per-range backoff.
+    pub retry_backoff_max: Duration,
+}
+
+impl Default for RangeConfig {
+    fn default() -> Self {
+        Self {
+            range_len: 32,
+            max_in_flight: 12,
+            max_in_flight_per_peer: 4,
+            request_timeout: Duration::from_secs(10),
+            lookahead: 32 * 16,
+            header_count: 128,
+            stall_timeout: Duration::from_secs(30),
+            header_backoff: Duration::from_secs(1),
+            retry_backoff: Duration::from_millis(500),
+            retry_backoff_max: Duration::from_secs(8),
+        }
+    }
+}
+
+/// A peer that may be asked for blocks, in the caller's preference order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerSlot {
+    pub id: PeerId,
+    /// The head height the peer advertises. Only a necessary condition: a peer
+    /// is never asked for a range that starts above it.
+    pub head_height: u64,
+    /// Ranges this peer may hold at once; `0` means the configured
+    /// `max_in_flight_per_peer`. The caller lowers it for a peer in bad
+    /// standing, so overflow from good peers does not pile onto a peer that
+    /// has been timing out or answering empty (a silent peer holding a range
+    /// near the front stalls apply for a whole timeout).
+    pub max_in_flight: usize,
+    /// The caller's verdict that this peer is in bad standing (timing out,
+    /// or answering with nothing). Its failures do not count toward dropping
+    /// another source's anchor: otherwise peers that answer every request
+    /// with nothing could get honest anchors dropped.
+    pub bad_standing: bool,
+}
+
+impl PeerSlot {
+    pub fn new(id: PeerId, head_height: u64) -> Self {
+        Self {
+            id,
+            head_height,
+            max_in_flight: 0,
+            bad_standing: false,
+        }
+    }
+}
+
+/// What the scheduler needs to know about one validated block in a `Blocks`
+/// answer: enough to check that it links to the range's anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockLink {
+    pub height: u64,
+    pub hash: Hash,
+    /// The block's selected parent.
+    pub parent: Hash,
+}
+
+/// One request the caller should send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncRequest {
+    Headers {
+        peer: PeerId,
+        from: Hash,
+        from_height: u64,
+        count: u32,
+    },
+    Blocks {
+        peer: PeerId,
+        /// Anchor hash; the server serves from its height inclusive.
+        from: Hash,
+        /// Height of `from`.
+        anchor_height: u64,
+        /// First height this range needs (== `anchor_height`, except for the
+        /// applied-tip fallback where it is `anchor_height + 1`).
+        start: u64,
+        /// Last height this range needs.
+        end: u64,
+        /// Blocks to ask for: covers `anchor_height..=end` and no further, so
+        /// the answer cannot spill into the next range.
+        count: u32,
+    },
+}
+
+/// A request that went unanswered past its deadline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Expired {
+    pub peer: PeerId,
+    /// First height of the expired block range, or the anchor height of an
+    /// expired header request.
+    pub height: u64,
+    pub headers: bool,
+}
+
+/// What [`RangeScheduler::plan`] decided this round.
+#[derive(Debug, Default)]
+pub struct Plan {
+    pub requests: Vec<SyncRequest>,
+    pub expired: Vec<Expired>,
+    /// Peers that, since the last plan, sent a header anchor that a block
+    /// answer proved wrong, or delivered a range that never applied. The
+    /// caller charges them.
+    pub misbehaved: Vec<PeerId>,
+}
+
+/// How a `Blocks` response related to what was asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlocksMatch {
+    /// Answered one of our ranges.
+    Range {
+        start: u64,
+        end: u64,
+        /// Last height of the contiguous run delivered from `start`
+        /// (`start - 1` when nothing usable came back).
+        delivered_through: u64,
+        /// The range was anchored on a header from a peer OTHER than the one
+        /// that answered. When nothing came back, the question may have been
+        /// wrong, not the answerer: the caller does not charge it (the
+        /// anchor's source is charged when the anchor is dropped).
+        foreign_anchor: bool,
+    },
+    /// Not an answer to any range in flight to this peer: an ancestry request,
+    /// or a late answer to a range that already timed out and was reassigned.
+    Unsolicited,
+}
+
+/// Counters, for tests and diagnostics.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RangeCounters {
+    /// `GetBlocks` issued by the scheduler.
+    pub block_requests: u64,
+    /// `GetHeaders` issued by the scheduler.
+    pub header_requests: u64,
+    /// Block requests issued for a height that was already in flight,
+    /// delivered, or applied. The scheduler never does this; the counter is
+    /// the check.
+    pub duplicate_requests: u64,
+    /// Block requests for a range that had been requested before (after a
+    /// timeout, an empty answer or a short answer).
+    pub retries: u64,
+    pub timeouts: u64,
+    pub empty_responses: u64,
+    pub short_responses: u64,
+    pub unsolicited_responses: u64,
+    /// Ranges anchored on the applied tip because no header anchor was known.
+    pub tip_anchored: u64,
+    /// Times delivered ranges were forgotten because the applied tip stalled.
+    pub stall_resets: u64,
+    /// Non-empty answers in which nothing linked to the range's anchor.
+    pub unlinked_responses: u64,
+    /// Answers that carried a range's anchor at another height.
+    pub wrong_anchors: u64,
+    /// Times anchors were dropped because a range failed on two peers or an
+    /// anchor was proved wrong.
+    pub anchor_evictions: u64,
+    /// Delivered ranges dropped because admission refused their blocks.
+    pub rejected_ranges: u64,
+    /// Times a range was held back because every eligible peer had failed it.
+    pub backoffs: u64,
+}
+
+#[derive(Debug, Clone)]
+struct InFlight {
+    anchor: Hash,
+    anchor_height: u64,
+    end: u64,
+    peer: PeerId,
+    sent_at: Instant,
+    /// Peer whose header gave the anchor (`None`: the applied tip).
+    anchor_src: Option<PeerId>,
+}
+
+#[derive(Debug, Clone)]
+struct HeaderReq {
+    peer: PeerId,
+    sent_at: Instant,
+}
+
+/// See the module docs.
+#[derive(Debug)]
+pub struct RangeScheduler {
+    cfg: RangeConfig,
+    applied: u64,
+    applied_hash: Hash,
+    last_progress: Option<Instant>,
+    /// Known block hashes above the applied tip (height -> (hash, source)).
+    anchors: BTreeMap<u64, (Hash, PeerId)>,
+    /// start -> request.
+    in_flight: BTreeMap<u64, InFlight>,
+    /// start -> (end, peer that delivered it), validated, linked and handed
+    /// to admission, not yet applied.
+    delivered: BTreeMap<u64, (u64, PeerId)>,
+    /// start -> peers that failed that range.
+    avoid: HashMap<u64, Vec<PeerId>>,
+    /// start -> (peer, anchor source): peers that ANSWERED that range with
+    /// nothing usable while it was anchored on another peer's header. If that
+    /// source's anchor is dropped, the failure was the anchor's, and the peer
+    /// leaves `avoid` (the height's failure count and hold stay).
+    excusable: BTreeMap<u64, Vec<(PeerId, PeerId)>>,
+    /// First height -> failures since its last delivery, and the hold they
+    /// earned. Survives re-anchoring. See the BACKOFF note above.
+    streak: BTreeMap<u64, Streak>,
+    /// Ranges requested at least once (for the retry counter).
+    requested_once: BTreeSet<u64>,
+    header_req: Option<HeaderReq>,
+    header_avoid: Vec<PeerId>,
+    /// Header sources whose anchors were proved wrong; asked only when no
+    /// other peer can be. Bounded by `MAX_BAD_HEADER_SOURCES`.
+    bad_header_sources: Vec<PeerId>,
+    /// No `GetHeaders` before this instant (see `RangeConfig::header_backoff`).
+    header_retry_at: Option<Instant>,
+    /// Anchors dropped (two failures, or proved wrong) since the last
+    /// delivery; each doubles the wait between header requests.
+    header_strikes: u32,
+    /// When the last `GetHeaders` was sent.
+    last_header_at: Option<Instant>,
+    /// Peers to report in the next `Plan::misbehaved`.
+    misbehaved: Vec<PeerId>,
+    /// Peers the caller marked in bad standing at the last plan.
+    bad_standing: Vec<PeerId>,
+    counters: RangeCounters,
+}
+
+/// Failures a range may have before each further attempt waits out a hold.
+const FREE_FAILURES: u32 = 2;
+
+/// Failures of one range since its last delivery (see the BACKOFF note).
+#[derive(Debug, Clone, Default)]
+struct Streak {
+    failures: u32,
+    /// `failures` when the current hold was armed.
+    armed_at: u32,
+    not_before: Option<Instant>,
+    hold: Duration,
+}
+
+/// Bound on remembered bad header sources (and pending misbehaviour reports).
+const MAX_BAD_HEADER_SOURCES: usize = 64;
+
+impl RangeScheduler {
+    pub fn new(cfg: RangeConfig) -> Self {
+        Self {
+            cfg,
+            applied: 0,
+            applied_hash: Hash::default(),
+            last_progress: None,
+            anchors: BTreeMap::new(),
+            in_flight: BTreeMap::new(),
+            delivered: BTreeMap::new(),
+            avoid: HashMap::new(),
+            excusable: BTreeMap::new(),
+            streak: BTreeMap::new(),
+            requested_once: BTreeSet::new(),
+            header_req: None,
+            header_avoid: Vec::new(),
+            bad_header_sources: Vec::new(),
+            header_retry_at: None,
+            header_strikes: 0,
+            last_header_at: None,
+            misbehaved: Vec::new(),
+            bad_standing: Vec::new(),
+            counters: RangeCounters::default(),
+        }
+    }
+
+    pub fn config(&self) -> &RangeConfig {
+        &self.cfg
+    }
+
+    pub fn counters(&self) -> &RangeCounters {
+        &self.counters
+    }
+
+    /// Block ranges currently in flight.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    /// Block ranges in flight to `peer`.
+    pub fn in_flight_to(&self, peer: &PeerId) -> usize {
+        self.in_flight.values().filter(|r| r.peer == *peer).count()
+    }
+
+    /// Known header anchors (bounded by `lookahead`).
+    pub fn anchor_count(&self) -> usize {
+        self.anchors.len()
+    }
+
+    fn window_top(&self) -> u64 {
+        self.applied.saturating_add(self.cfg.lookahead)
+    }
+
+    /// Advance to the node's applied height, dropping everything at or below it.
+    pub fn on_applied(&mut self, applied: u64, applied_hash: Hash, now: Instant) {
+        // The applied tip moved DOWN, or sideways to another block at the same
+        // height (a fork-choice reorg): every plan above it was made against a
+        // chain we are no longer on. Start over from the new tip; whatever is
+        // still in flight answers as unsolicited and is admitted normally.
+        if applied < self.applied || (applied == self.applied && applied_hash != self.applied_hash)
+        {
+            self.applied = applied;
+            self.applied_hash = applied_hash;
+            self.anchors.clear();
+            self.in_flight.clear();
+            self.delivered.clear();
+            self.avoid.clear();
+            self.excusable.clear();
+            self.streak.clear();
+            self.requested_once.clear();
+            self.header_req = None;
+            self.last_progress = Some(now);
+            return;
+        }
+        self.applied_hash = applied_hash;
+        if self.last_progress.is_none() || applied > self.applied {
+            self.last_progress = Some(now);
+        }
+        if applied <= self.applied {
+            return;
+        }
+        self.applied = applied;
+        let keep_from = applied.saturating_add(1);
+        self.anchors = self.anchors.split_off(&keep_from);
+        // A range that straddles the tip keeps only its unapplied tail.
+        self.delivered = std::mem::take(&mut self.delivered)
+            .into_iter()
+            .filter(|(_, (end, _))| *end > applied)
+            .map(|(start, d)| (start.max(keep_from), d))
+            .collect();
+        self.avoid.retain(|start, _| *start > applied);
+        self.excusable = self.excusable.split_off(&keep_from);
+        self.streak = self.streak.split_off(&keep_from);
+        self.requested_once = self.requested_once.split_off(&keep_from);
+        // In-flight ranges below the tip are left to resolve (or time out) on
+        // their own: their answer is harmless and dropping them here would
+        // re-open the same heights to a second request.
+    }
+
+    /// True when `height` is in flight or delivered.
+    fn covered(&self, height: u64) -> Option<u64> {
+        // The range containing `height`, if any, returns its end.
+        if let Some(end) = self
+            .delivered
+            .range(..=height)
+            .next_back()
+            .and_then(|(_, (end, _))| (*end >= height).then_some(*end))
+        {
+            return Some(end);
+        }
+        self.in_flight
+            .range(..=height)
+            .next_back()
+            .and_then(|(_, r)| (r.end >= height).then_some(r.end))
+    }
+
+    /// First covered height strictly above `height`, if any.
+    fn next_covered_after(&self, height: u64) -> Option<u64> {
+        let from = height.saturating_add(1);
+        let a = self.delivered.range(from..).next().map(|(s, _)| *s);
+        let b = self.in_flight.range(from..).next().map(|(s, _)| *s);
+        match (a, b) {
+            (Some(x), Some(y)) => Some(x.min(y)),
+            (x, y) => x.or(y),
+        }
+    }
+
+    /// Does `[start, end]` intersect anything in flight, delivered or applied?
+    fn overlaps_existing(&self, start: u64, end: u64) -> bool {
+        if start <= self.applied {
+            return true;
+        }
+        let mut h = start;
+        while h <= end {
+            if self.covered(h).is_some() {
+                return true;
+            }
+            match self.next_covered_after(h) {
+                Some(n) if n <= end => h = n,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// Highest `h` such that every height in `applied+1..=h` has an anchor.
+    fn anchor_frontier(&self) -> u64 {
+        let mut h = self.applied;
+        for (height, _) in self.anchors.range(self.applied.saturating_add(1)..) {
+            if *height == h.saturating_add(1) {
+                h = *height;
+            } else {
+                break;
+            }
+        }
+        h
+    }
+
+    fn expire(&mut self, now: Instant) -> Vec<Expired> {
+        let timeout = self.cfg.request_timeout;
+        let late: Vec<u64> = self
+            .in_flight
+            .iter()
+            .filter(|(_, r)| now.saturating_duration_since(r.sent_at) > timeout)
+            .map(|(s, _)| *s)
+            .collect();
+        let mut out = Vec::new();
+        for start in late {
+            if let Some(r) = self.in_flight.remove(&start) {
+                self.counters.timeouts = self.counters.timeouts.saturating_add(1);
+                self.note_failure(start, &r.peer);
+                out.push(Expired {
+                    peer: r.peer,
+                    height: start,
+                    headers: false,
+                });
+            }
+        }
+        if let Some(h) = &self.header_req {
+            if now.saturating_duration_since(h.sent_at) > timeout {
+                let peer = h.peer.clone();
+                self.header_req = None;
+                self.header_avoid.push(peer.clone());
+                self.header_retry_at = now.checked_add(self.cfg.header_backoff);
+                out.push(Expired {
+                    peer,
+                    height: self.anchor_frontier(),
+                    headers: true,
+                });
+            }
+        }
+        out
+    }
+
+    /// Decide what to request now. `peers` is in the caller's preference
+    /// order; `applied_hash` is the hash of the applied tip (or the all-zero
+    /// genesis sentinel when nothing is applied).
+    pub fn plan(
+        &mut self,
+        now: Instant,
+        applied: u64,
+        applied_hash: Hash,
+        peers: &[PeerSlot],
+    ) -> Plan {
+        self.on_applied(applied, applied_hash, now);
+        self.bad_standing = peers
+            .iter()
+            .filter(|p| p.bad_standing)
+            .map(|p| p.id.clone())
+            .collect();
+        let mut plan = Plan {
+            expired: self.expire(now),
+            ..Plan::default()
+        };
+
+        // Stall valve: delivered blocks that never got applied (refused by
+        // admission, or evicted from its orphan buffer) are re-requested.
+        if !self.delivered.is_empty() {
+            if let Some(t) = self.last_progress {
+                if now.saturating_duration_since(t) > self.cfg.stall_timeout {
+                    // The range at the front is the one that did not apply:
+                    // its deliverer is avoided for it and reported.
+                    let front = self.applied.saturating_add(1);
+                    if let Some((_, peer)) = self.delivered.get(&front).cloned() {
+                        self.note_failure(front, &peer);
+                        self.report(peer);
+                    }
+                    self.delivered.clear();
+                    self.anchors.clear();
+                    self.counters.stall_resets = self.counters.stall_resets.saturating_add(1);
+                    self.last_progress = Some(now);
+                }
+            }
+        }
+
+        // Header anchors, one request at a time, kept `lookahead` ahead.
+        let struck = self.header_strikes > 0
+            && self.last_header_at.is_some_and(|t| {
+                let wait = self
+                    .cfg
+                    .header_backoff
+                    .saturating_mul(1u32 << self.header_strikes.min(3));
+                t.checked_add(wait).is_some_and(|until| now < until)
+            });
+        let backing_off = struck || self.header_retry_at.is_some_and(|t| now < t);
+        if self.header_req.is_none() && !backing_off {
+            let frontier = self.anchor_frontier();
+            if frontier < self.window_top() {
+                let from = if frontier == self.applied {
+                    Some(applied_hash)
+                } else {
+                    self.anchors.get(&frontier).map(|(h, _)| *h)
+                };
+                let bad = &self.bad_header_sources;
+                let eligible = |p: &&PeerSlot, avoid: &[PeerId]| {
+                    p.head_height > frontier && !avoid.contains(&p.id)
+                };
+                let mut pick = peers
+                    .iter()
+                    .find(|p| eligible(p, &self.header_avoid) && !bad.contains(&p.id));
+                if pick.is_none() && !self.header_avoid.is_empty() {
+                    self.header_avoid.clear();
+                    pick = peers
+                        .iter()
+                        .find(|p| eligible(p, &[]) && !bad.contains(&p.id));
+                }
+                // A source that sent a wrong anchor is the last resort.
+                if pick.is_none() {
+                    pick = peers.iter().find(|p| eligible(p, &[]));
+                }
+                if let (Some(peer), Some(from)) = (pick, from) {
+                    self.header_req = Some(HeaderReq {
+                        peer: peer.id.clone(),
+                        sent_at: now,
+                    });
+                    self.last_header_at = Some(now);
+                    self.counters.header_requests = self.counters.header_requests.saturating_add(1);
+                    plan.requests.push(SyncRequest::Headers {
+                        peer: peer.id.clone(),
+                        from,
+                        from_height: frontier,
+                        count: self.cfg.header_count,
+                    });
+                }
+            }
+        }
+
+        // Block ranges. Nothing above the lowest range with failures since its
+        // last delivery.
+        let gate = self
+            .streak
+            .iter()
+            .find(|(s, st)| st.failures > 0 && **s > self.applied)
+            .map(|(s, _)| *s);
+        let mut cursor = self.applied.saturating_add(1);
+        while self.in_flight.len() < self.cfg.max_in_flight {
+            // Skip covered heights.
+            while let Some(end) = self.covered(cursor) {
+                cursor = end.saturating_add(1);
+            }
+            let start = cursor;
+            if start > self.window_top() || gate.is_some_and(|g| start > g) {
+                break;
+            }
+            // Anchor: a header hash at `start`, or the applied tip for the
+            // first range above it.
+            let (from, anchor_height, anchor_src) = match self.anchors.get(&start) {
+                Some((h, src)) => (*h, start, Some(src.clone())),
+                None if start == self.applied.saturating_add(1) => {
+                    (applied_hash, self.applied, None)
+                }
+                None => break,
+            };
+            let mut end = anchor_height
+                .saturating_add(self.cfg.range_len)
+                .saturating_sub(1)
+                .max(start);
+            if let Some(next) = self.next_covered_after(start) {
+                end = end.min(next.saturating_sub(1));
+            }
+            // Peer: preference order, head at or above `start`, under the
+            // per-peer cap, not one that already failed this range; if every
+            // such peer has, the one whose failure is oldest (rotation).
+            let usable = |p: &PeerSlot| {
+                let cap = match p.max_in_flight {
+                    0 => self.cfg.max_in_flight_per_peer,
+                    n => n.min(self.cfg.max_in_flight_per_peer),
+                };
+                p.head_height >= start && self.in_flight_to(&p.id) < cap
+            };
+            let failed: &[PeerId] = self.avoid.get(&start).map(Vec::as_slice).unwrap_or(&[]);
+            let fresh = peers.iter().find(|p| usable(p) && !failed.contains(&p.id));
+            let pick = match fresh {
+                Some(p) => Some(p.clone()),
+                None => failed
+                    .iter()
+                    .find_map(|id| peers.iter().find(|p| p.id == *id && usable(p)))
+                    .cloned(),
+            };
+            let Some(peer) = pick else { break };
+            // A range with failures since its last delivery waits out its
+            // hold first.
+            if !self.hold_passed(start, now, fresh.is_some()) {
+                break;
+            }
+            if fresh.is_none() {
+                // Rotate: the peer asked now goes to the back of the line.
+                if let Some(list) = self.avoid.get_mut(&start) {
+                    list.retain(|id| *id != peer.id);
+                    list.push(peer.id.clone());
+                }
+            }
+
+            if self.overlaps_existing(start, end) {
+                self.counters.duplicate_requests =
+                    self.counters.duplicate_requests.saturating_add(1);
+            }
+            if !self.requested_once.insert(start) {
+                self.counters.retries = self.counters.retries.saturating_add(1);
+            }
+            if anchor_height < start {
+                self.counters.tip_anchored = self.counters.tip_anchored.saturating_add(1);
+            }
+            self.counters.block_requests = self.counters.block_requests.saturating_add(1);
+            let count = u32::try_from(end.saturating_sub(anchor_height).saturating_add(1))
+                .unwrap_or(u32::MAX);
+            self.in_flight.insert(
+                start,
+                InFlight {
+                    anchor: from,
+                    anchor_height,
+                    end,
+                    peer: peer.id.clone(),
+                    sent_at: now,
+                    anchor_src,
+                },
+            );
+            plan.requests.push(SyncRequest::Blocks {
+                peer: peer.id.clone(),
+                from,
+                anchor_height,
+                start,
+                end,
+                count,
+            });
+            cursor = end.saturating_add(1);
+        }
+        plan.misbehaved = std::mem::take(&mut self.misbehaved);
+        plan
+    }
+
+    /// May the range at `start` be asked now? After its second failure
+    /// since a delivery, each new failure first arms a hold (`retry_backoff`,
+    /// doubling up to `retry_backoff_max`); the range may be asked once the
+    /// hold has passed.
+    ///
+    /// `untried`: the next attempt goes to a peer that has not failed this
+    /// range yet. Those attempts are spaced a constant `2 x retry_backoff`
+    /// and do not raise the hold, so a peer ranked below many failing ones
+    /// (the honest one among peers that inflate their head) is reached
+    /// within that spacing per peer ahead of it; repeats to peers that
+    /// already failed it double the hold.
+    fn hold_passed(&mut self, start: u64, now: Instant, untried: bool) -> bool {
+        let base = self.cfg.retry_backoff;
+        let max = self.cfg.retry_backoff_max;
+        let Some(st) = self.streak.get_mut(&start) else {
+            return true;
+        };
+        if st.failures < FREE_FAILURES {
+            return true;
+        }
+        if st.armed_at != st.failures {
+            let wait = if untried {
+                base.saturating_mul(2).min(max)
+            } else {
+                st.hold = if st.hold.is_zero() {
+                    base
+                } else {
+                    st.hold.saturating_mul(2).min(max)
+                };
+                st.hold
+            };
+            st.not_before = now.checked_add(wait);
+            st.armed_at = st.failures;
+            self.counters.backoffs = self.counters.backoffs.saturating_add(1);
+            return false;
+        }
+        st.not_before.is_none_or(|t| now >= t)
+    }
+
+    /// Queue `peer` for the next `Plan::misbehaved` (bounded, de-duplicated).
+    fn report(&mut self, peer: PeerId) {
+        if !self.misbehaved.contains(&peer) && self.misbehaved.len() < MAX_BAD_HEADER_SOURCES {
+            self.misbehaved.push(peer);
+        }
+    }
+
+    /// `peer` failed the range at `start` (timeout, empty or non-linking
+    /// answer). Once two different peers have failed it, its anchor is the
+    /// likelier fault: drop it and every anchor above it, and avoid its
+    /// header source, so the anchors are fetched again (or, for the first
+    /// range, the applied tip is used).
+    fn note_failure(&mut self, start: u64, peer: &PeerId) {
+        let st = self.streak.entry(start).or_default();
+        st.failures = st.failures.saturating_add(1);
+        let failed = self.avoid.entry(start).or_default();
+        if !failed.contains(peer) {
+            failed.push(peer.clone());
+        }
+        let Some((_, src)) = self.anchors.get(&start) else {
+            return;
+        };
+        let src = src.clone();
+        // Drop the anchor when its own source failed it, when its source is
+        // in bad standing and anyone failed it, or when two peers in good
+        // standing failed it. Failures from peers in bad standing alone never
+        // drop another source's anchor.
+        let bad = &self.bad_standing;
+        let good_failures = failed.iter().filter(|p| !bad.contains(p)).count();
+        let drop_it = failed.contains(&src) || bad.contains(&src) || good_failures >= 2;
+        if drop_it {
+            // The anchor's source answers for it: a range other peers failed
+            // on its header is charged to the source, not to them.
+            if src != *peer {
+                self.report(src.clone());
+            }
+            if !self.header_avoid.contains(&src) {
+                self.header_avoid.push(src.clone());
+            }
+            let _ = self.anchors.split_off(&start);
+            self.excuse(&src, start);
+            self.counters.anchor_evictions = self.counters.anchor_evictions.saturating_add(1);
+            self.header_strikes = self.header_strikes.saturating_add(1);
+            // The failure count, the hold and the list of peers that failed
+            // the range all stay: they belong to the height, so a fresh run
+            // of made-up anchors cannot make every peer "untried" again.
+            // Retries rotate through those peers, oldest failure first.
+        }
+    }
+
+    /// `src`'s anchors from `from` up were dropped: peers that failed a range
+    /// only by answering on one of them are no longer avoided for it. They
+    /// answered what they were asked; the question was wrong.
+    fn excuse(&mut self, src: &PeerId, from: u64) {
+        for (h, list) in self.excusable.range_mut(from..) {
+            let mut cleared: Vec<PeerId> = Vec::new();
+            list.retain(|(p, s)| {
+                if s == src {
+                    cleared.push(p.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            if let Some(avoid) = self.avoid.get_mut(h) {
+                avoid.retain(|p| !cleared.contains(p));
+            }
+        }
+        self.excusable.retain(|_, l| !l.is_empty());
+    }
+
+    /// An answer proved the anchor `anchor` wrong (that hash is a block at
+    /// another height). Drop every anchor `src` gave us and stop preferring
+    /// it as a header source.
+    fn evict_header_source(&mut self, src: &PeerId) {
+        self.anchors.retain(|_, (_, from)| from != src);
+        self.excuse(src, 0);
+        if !self.bad_header_sources.contains(src) {
+            if self.bad_header_sources.len() >= MAX_BAD_HEADER_SOURCES {
+                self.bad_header_sources.remove(0);
+            }
+            self.bad_header_sources.push(src.clone());
+        }
+        self.counters.anchor_evictions = self.counters.anchor_evictions.saturating_add(1);
+        self.header_strikes = self.header_strikes.saturating_add(1);
+        self.report(src.clone());
+    }
+
+    /// A `Headers` response from `peer`, as `(height, hash)` ascending.
+    pub fn on_headers(&mut self, peer: &PeerId, headers: &[(u64, Hash)]) {
+        self.on_headers_at(peer, headers, Instant::now());
+    }
+
+    /// [`Self::on_headers`] at a given instant (for the backoff).
+    pub fn on_headers_at(&mut self, peer: &PeerId, headers: &[(u64, Hash)], now: Instant) {
+        let solicited = self.header_req.as_ref().is_some_and(|h| h.peer == *peer);
+        if !solicited {
+            return;
+        }
+        self.header_req = None;
+        let top = self.window_top();
+        let mut added = 0usize;
+        for (height, hash) in headers {
+            if *height <= self.applied || *height > top {
+                continue;
+            }
+            // First writer wins; a bad anchor is evicted by `on_blocks`, by
+            // two failures of its range, or with its whole source.
+            self.anchors.entry(*height).or_insert_with(|| {
+                added = added.saturating_add(1);
+                (*hash, peer.clone())
+            });
+        }
+        if added == 0 {
+            self.header_avoid.push(peer.clone());
+            self.header_retry_at = now.checked_add(self.cfg.header_backoff);
+        } else {
+            self.header_avoid.retain(|p| p != peer);
+        }
+    }
+
+    /// A `Blocks` response from `peer`. `first_height` is the height of the
+    /// first block in the response as received (before validation); `blocks`
+    /// the blocks that passed validation, in the order received.
+    pub fn on_blocks(
+        &mut self,
+        peer: &PeerId,
+        first_height: Option<u64>,
+        blocks: &[BlockLink],
+    ) -> BlocksMatch {
+        // A server answers `GetBlocks` from its anchor's height inclusive, so
+        // the answer to a range carries the range's anchor block.
+        let by_anchor = self
+            .in_flight
+            .iter()
+            .filter(|(_, r)| r.peer == *peer)
+            .find_map(|(s, r)| {
+                blocks
+                    .iter()
+                    .find(|b| b.hash == r.anchor)
+                    .map(|b| (*s, b.height != r.anchor_height))
+            });
+        if let Some((start, true)) = by_anchor {
+            // The anchor is a block at another height: the header that gave
+            // it was wrong. The peer answered what it was asked; release the
+            // range without holding it against the peer.
+            self.in_flight.remove(&start);
+            self.counters.wrong_anchors = self.counters.wrong_anchors.saturating_add(1);
+            if let Some((_, src)) = self.anchors.get(&start).cloned() {
+                self.evict_header_source(&src);
+            }
+            self.counters.unsolicited_responses =
+                self.counters.unsolicited_responses.saturating_add(1);
+            return BlocksMatch::Unsolicited;
+        }
+        let start = match (by_anchor, first_height) {
+            (Some((start, _)), _) => Some(start),
+            // An empty answer carries no height; servers answer in order, so
+            // it answers the oldest range in flight to this peer.
+            (None, None) => self
+                .in_flight
+                .iter()
+                .filter(|(_, r)| r.peer == *peer)
+                .min_by_key(|(_, r)| r.sent_at)
+                .map(|(s, _)| *s),
+            (None, Some(first)) => self
+                .in_flight
+                .iter()
+                .find(|(_, r)| r.peer == *peer && r.anchor_height == first)
+                .or_else(|| {
+                    self.in_flight.iter().find(|(_, r)| {
+                        r.peer == *peer && r.anchor_height <= first && first <= r.end
+                    })
+                })
+                .map(|(s, _)| *s),
+        };
+        let Some(start) = start else {
+            self.counters.unsolicited_responses =
+                self.counters.unsolicited_responses.saturating_add(1);
+            return BlocksMatch::Unsolicited;
+        };
+        let Some(req) = self.in_flight.remove(&start) else {
+            return BlocksMatch::Unsolicited;
+        };
+        let linked = linked_heights(&req, blocks);
+        let mut through = start.saturating_sub(1);
+        while linked.contains(&through.saturating_add(1)) && through < req.end {
+            through = through.saturating_add(1);
+        }
+        if through >= start {
+            // A delivery: the heights it covers start over, and so do header
+            // requests.
+            let covered: Vec<u64> = self
+                .streak
+                .range(start..=through)
+                .map(|(s, _)| *s)
+                .collect();
+            for s in covered {
+                self.streak.remove(&s);
+            }
+            self.header_strikes = 0;
+            self.delivered.insert(start, (through, peer.clone()));
+            if through < req.end {
+                self.counters.short_responses = self.counters.short_responses.saturating_add(1);
+            }
+        } else {
+            let in_range = blocks
+                .iter()
+                .any(|b| b.height >= start && b.height <= req.end);
+            if in_range {
+                self.counters.unlinked_responses =
+                    self.counters.unlinked_responses.saturating_add(1);
+            } else {
+                self.counters.empty_responses = self.counters.empty_responses.saturating_add(1);
+            }
+            if let Some(src) = req.anchor_src.as_ref().filter(|src| *src != peer) {
+                let list = self.excusable.entry(start).or_default();
+                if !list.iter().any(|(p, _)| p == peer) && list.len() < MAX_BAD_HEADER_SOURCES {
+                    list.push((peer.clone(), src.clone()));
+                }
+            }
+            self.note_failure(start, peer);
+        }
+        BlocksMatch::Range {
+            start,
+            end: req.end,
+            delivered_through: through,
+            foreign_anchor: req.anchor_src.as_ref().is_some_and(|src| src != peer),
+        }
+    }
+
+    /// Admission refused blocks that `peer` delivered for the range starting
+    /// at `start`: forget the delivery so the range is asked of someone else,
+    /// and report the peer.
+    pub fn on_rejected(&mut self, peer: &PeerId, start: u64, end: u64) {
+        let hits: Vec<u64> = self
+            .delivered
+            .range(..=end)
+            .filter(|(s, (e, p))| *e >= start && **s <= end && p == peer)
+            .map(|(s, _)| *s)
+            .collect();
+        for s in hits {
+            self.delivered.remove(&s);
+            self.avoid.entry(s).or_default().push(peer.clone());
+            self.counters.rejected_ranges = self.counters.rejected_ranges.saturating_add(1);
+            self.report(peer.clone());
+        }
+    }
+
+    /// A delivery from `peer` for `start..=end` was dropped before admission
+    /// (the local admission queue stayed full): forget it so the range is
+    /// asked again. Not the peer's fault, so nothing is charged.
+    pub fn on_dropped(&mut self, peer: &PeerId, start: u64, end: u64) {
+        let hits: Vec<u64> = self
+            .delivered
+            .range(..=end)
+            .filter(|(s, (e, p))| *e >= start && **s <= end && p == peer)
+            .map(|(s, _)| *s)
+            .collect();
+        for s in hits {
+            self.delivered.remove(&s);
+        }
+    }
+
+    /// `peer` is gone (or its send failed): release everything it owed.
+    pub fn release_peer(&mut self, peer: &PeerId) {
+        let starts: Vec<u64> = self
+            .in_flight
+            .iter()
+            .filter(|(_, r)| r.peer == *peer)
+            .map(|(s, _)| *s)
+            .collect();
+        for s in starts {
+            self.in_flight.remove(&s);
+            self.note_failure(s, peer);
+        }
+        if self.header_req.as_ref().is_some_and(|h| h.peer == *peer) {
+            self.header_req = None;
+            self.header_avoid.push(peer.clone());
+        }
+    }
+}
+
+/// Heights in `blocks` that hold a block linking to `req`'s anchor: the
+/// anchor itself, a sibling of it with the same parent, or a block whose
+/// selected parent is already linked.
+fn linked_heights(req: &InFlight, blocks: &[BlockLink]) -> BTreeSet<u64> {
+    let mut sorted: Vec<&BlockLink> = blocks.iter().collect();
+    sorted.sort_by_key(|b| b.height);
+    let anchor_parent = sorted
+        .iter()
+        .find(|b| b.hash == req.anchor && b.height == req.anchor_height)
+        .map(|b| b.parent);
+    let mut linked: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+    linked.insert(req.anchor);
+    let mut heights = BTreeSet::new();
+    for b in sorted {
+        let links = b.hash == req.anchor
+            || linked.contains(&b.parent)
+            || (b.height == req.anchor_height && Some(b.parent) == anchor_parent);
+        if links {
+            linked.insert(b.hash);
+            heights.insert(b.height);
+        }
+    }
+    heights
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn h(n: u64) -> Hash {
+        let mut b = [0u8; 32];
+        b[..8].copy_from_slice(&n.to_be_bytes());
+        b[31] = 1;
+        Hash::new(b)
+    }
+
+    fn pid(s: &str) -> PeerId {
+        PeerId(s.to_string())
+    }
+
+    fn peers(ids: &[&str], head: u64) -> Vec<PeerSlot> {
+        ids.iter().map(|i| PeerSlot::new(pid(i), head)).collect()
+    }
+
+    /// A fork-choice reorg that lowers the applied tip (or swaps it for a
+    /// sibling at the same height) discards the plan made on the old branch:
+    /// the next range is anchored on the NEW tip, so its answer matches.
+    #[test]
+    fn an_applied_tip_that_moves_down_or_sideways_restarts_the_plan() {
+        let mut s = RangeScheduler::new(RangeConfig::default());
+        let now = Instant::now();
+        let ps = peers(&["a"], 10_000);
+        s.plan(now, 100, h(100), &ps);
+        s.on_headers(&pid("a"), &headers(101, 300));
+        s.plan(now, 100, h(100), &ps);
+        assert!(s.in_flight() > 1);
+
+        // Down: tip back to 90 on another branch.
+        let other = Hash::new([0xEE; 32]);
+        let plan = s.plan(now, 90, other, &ps);
+        let b = blocks_of(&plan.requests);
+        assert_eq!(b.first().map(|r| (r.1, r.2)), Some((90, 91)));
+        assert!(plan.requests.iter().any(|r| matches!(
+            r,
+            SyncRequest::Blocks { from, .. } if *from == other
+        )));
+        assert_eq!(s.anchor_count(), 0, "old-branch anchors dropped");
+        // The answer to that range matches it.
+        let m = s.on_blocks(&pid("a"), Some(90), &chain_on(other, 91, 121));
+        assert!(matches!(m, BlocksMatch::Range { start: 91, .. }));
+
+        // Sideways: same height, different hash.
+        let sibling = Hash::new([0xDD; 32]);
+        let plan = s.plan(now, 90, sibling, &ps);
+        assert!(plan.requests.iter().any(|r| matches!(
+            r,
+            SyncRequest::Blocks { from, start: 91, .. } if *from == sibling
+        )));
+    }
+
+    #[test]
+    fn a_peer_in_bad_standing_holds_at_most_its_own_cap() {
+        let mut s = RangeScheduler::new(RangeConfig::default());
+        let now = Instant::now();
+        let mut ps = peers(&["bad", "good"], 10_000);
+        ps[0].max_in_flight = 1;
+        s.plan(now, 0, h(0), &ps);
+        s.on_headers(&pid("bad"), &headers(1, 512));
+        s.plan(now, 0, h(0), &ps);
+        assert_eq!(s.in_flight_to(&pid("bad")), 1);
+        assert_eq!(
+            s.in_flight_to(&pid("good")),
+            RangeConfig::default().max_in_flight_per_peer
+        );
+    }
+
+    /// Blocks `from..=to` of the test chain (`h(n)` on parent `h(n - 1)`).
+    fn chain(from: u64, to: u64) -> Vec<BlockLink> {
+        (from..=to)
+            .map(|n| BlockLink {
+                height: n,
+                hash: h(n),
+                parent: h(n.saturating_sub(1)),
+            })
+            .collect()
+    }
+
+    /// Blocks `from..=to` of another branch, the first on `parent`.
+    fn chain_on(parent: Hash, from: u64, to: u64) -> Vec<BlockLink> {
+        let mut prev = parent;
+        (from..=to)
+            .map(|n| {
+                let mut b = [0xEEu8; 32];
+                b[..8].copy_from_slice(&n.to_be_bytes());
+                let link = BlockLink {
+                    height: n,
+                    hash: Hash::new(b),
+                    parent: prev,
+                };
+                prev = link.hash;
+                link
+            })
+            .collect()
+    }
+
+    fn headers(from: u64, to: u64) -> Vec<(u64, Hash)> {
+        (from..=to).map(|n| (n, h(n))).collect()
+    }
+
+    fn blocks_of(reqs: &[SyncRequest]) -> Vec<(PeerId, u64, u64, u64)> {
+        reqs.iter()
+            .filter_map(|r| match r {
+                SyncRequest::Blocks {
+                    peer,
+                    anchor_height,
+                    start,
+                    end,
+                    ..
+                } => Some((peer.clone(), *anchor_height, *start, *end)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn without_anchors_only_the_tip_anchored_range_is_requested() {
+        let mut s = RangeScheduler::new(RangeConfig::default());
+        let now = Instant::now();
+        let plan = s.plan(now, 100, h(100), &peers(&["a", "b", "c"], 10_000));
+        let b = blocks_of(&plan.requests);
+        assert_eq!(b, vec![(pid("a"), 100, 101, 131)]);
+        assert!(plan.requests.iter().any(|r| matches!(
+            r,
+            SyncRequest::Headers {
+                from_height: 100,
+                ..
+            }
+        )));
+        // Planning again before anything answers asks for nothing new.
+        let again = s.plan(now, 100, h(100), &peers(&["a", "b", "c"], 10_000));
+        assert!(blocks_of(&again.requests).is_empty());
+        assert_eq!(s.counters().duplicate_requests, 0);
+    }
+
+    #[test]
+    fn with_anchors_ranges_are_disjoint_and_spread_over_peers() {
+        let cfg = RangeConfig::default();
+        let mut s = RangeScheduler::new(cfg.clone());
+        let now = Instant::now();
+        let ps = peers(&["a", "b", "c"], 10_000);
+        s.plan(now, 0, h(0), &ps);
+        s.on_headers(&pid("a"), &headers(1, 512));
+        let plan = s.plan(now, 0, h(0), &ps);
+        let b = blocks_of(&plan.requests);
+        // The first range (tip-anchored) is already in flight; the rest fill
+        // the window up to the total cap.
+        assert_eq!(s.in_flight(), cfg.max_in_flight);
+        let mut covered = BTreeSet::new();
+        for (_, _, start, end) in &b {
+            for x in *start..=*end {
+                assert!(covered.insert(x), "height {x} requested twice");
+            }
+        }
+        for p in ["a", "b", "c"] {
+            assert!(s.in_flight_to(&pid(p)) <= cfg.max_in_flight_per_peer);
+            assert!(s.in_flight_to(&pid(p)) > 0, "peer {p} unused");
+        }
+        assert_eq!(s.counters().duplicate_requests, 0);
+    }
+
+    #[test]
+    fn an_empty_answer_moves_the_range_to_another_peer() {
+        let mut s = RangeScheduler::new(RangeConfig {
+            max_in_flight: 1,
+            ..RangeConfig::default()
+        });
+        let now = Instant::now();
+        let ps = peers(&["bad", "good"], 10_000);
+        let p1 = blocks_of(&s.plan(now, 0, h(0), &ps).requests);
+        assert_eq!(p1[0].0, pid("bad"));
+        assert_eq!(
+            s.on_blocks(&pid("bad"), None, &[]),
+            BlocksMatch::Range {
+                start: 1,
+                end: 31,
+                delivered_through: 0,
+                foreign_anchor: false
+            }
+        );
+        let p2 = blocks_of(&s.plan(now, 0, h(0), &ps).requests);
+        assert_eq!(p2, vec![(pid("good"), 0, 1, 31)]);
+        assert_eq!(s.counters().retries, 1);
+        assert_eq!(s.counters().empty_responses, 1);
+    }
+
+    #[test]
+    fn a_slow_peer_times_out_and_its_range_is_reassigned() {
+        let mut s = RangeScheduler::new(RangeConfig {
+            max_in_flight: 1,
+            request_timeout: Duration::from_secs(5),
+            ..RangeConfig::default()
+        });
+        let t0 = Instant::now();
+        let ps = peers(&["slow", "fast"], 10_000);
+        s.plan(t0, 0, h(0), &ps);
+        let later = t0 + Duration::from_secs(6);
+        let plan = s.plan(later, 0, h(0), &ps);
+        let blocks_expired: Vec<Expired> = plan
+            .expired
+            .iter()
+            .filter(|e| !e.headers)
+            .cloned()
+            .collect();
+        assert_eq!(
+            blocks_expired,
+            vec![Expired {
+                peer: pid("slow"),
+                height: 1,
+                headers: false
+            }]
+        );
+        assert_eq!(blocks_of(&plan.requests)[0].0, pid("fast"));
+        // The slow peer's late answer is not mistaken for the fast one's.
+        assert_eq!(
+            s.on_blocks(&pid("slow"), Some(0), &chain(1, 31)),
+            BlocksMatch::Unsolicited
+        );
+        assert_eq!(s.in_flight(), 1);
+    }
+
+    #[test]
+    fn a_short_answer_re_plans_only_the_missing_tail() {
+        let mut s = RangeScheduler::new(RangeConfig {
+            max_in_flight: 1,
+            ..RangeConfig::default()
+        });
+        let now = Instant::now();
+        let ps = peers(&["a"], 10_000);
+        s.plan(now, 0, h(0), &ps);
+        s.on_headers(&pid("a"), &headers(1, 200));
+        // Answer covers 1..=10 of 1..=31.
+        let m = s.on_blocks(&pid("a"), Some(0), &chain(1, 10));
+        assert_eq!(
+            m,
+            BlocksMatch::Range {
+                start: 1,
+                end: 31,
+                delivered_through: 10,
+                foreign_anchor: false
+            }
+        );
+        let b = blocks_of(&s.plan(now, 0, h(0), &ps).requests);
+        assert_eq!(b, vec![(pid("a"), 11, 11, 42)]);
+        assert_eq!(s.counters().duplicate_requests, 0);
+    }
+
+    #[test]
+    fn a_gap_before_a_covered_range_is_requested_without_spilling_into_it() {
+        let mut s = RangeScheduler::new(RangeConfig {
+            max_in_flight: 2,
+            ..RangeConfig::default()
+        });
+        let now = Instant::now();
+        let ps = peers(&["a", "b"], 10_000);
+        s.plan(now, 0, h(0), &ps);
+        s.on_headers(&pid("a"), &headers(1, 200));
+        s.plan(now, 0, h(0), &ps); // 1..=31 (a), 32..=63 (b)
+                                   // a answers 1..=20 only.
+        s.on_blocks(&pid("a"), Some(0), &chain(1, 20));
+        let reqs = s.plan(now, 0, h(0), &ps).requests;
+        let b: Vec<(u64, u64, u64, u32)> = reqs
+            .iter()
+            .filter_map(|r| match r {
+                SyncRequest::Blocks {
+                    anchor_height,
+                    start,
+                    end,
+                    count,
+                    ..
+                } => Some((*anchor_height, *start, *end, *count)),
+                _ => None,
+            })
+            .collect();
+        // 21..=31 only, and asked for exactly 11 blocks so the answer cannot
+        // run into 32..=63, which b already owns.
+        assert_eq!(b, vec![(21, 21, 31, 11)]);
+    }
+
+    #[test]
+    fn a_peer_is_never_asked_above_its_head() {
+        let mut s = RangeScheduler::new(RangeConfig::default());
+        let now = Instant::now();
+        let ps = vec![
+            PeerSlot::new(pid("low"), 40),
+            PeerSlot::new(pid("high"), 10_000),
+        ];
+        s.plan(now, 0, h(0), &ps);
+        s.on_headers(&pid("low"), &headers(1, 40));
+        let plan = s.plan(now, 0, h(0), &ps);
+        for (peer, _, start, _) in blocks_of(&plan.requests) {
+            if peer == pid("low") {
+                assert!(start <= 40);
+            }
+        }
+    }
+
+    #[test]
+    fn anchors_stay_bounded_under_a_header_flood() {
+        let cfg = RangeConfig::default();
+        let mut s = RangeScheduler::new(cfg.clone());
+        let now = Instant::now();
+        let ps = peers(&["a"], u64::MAX);
+        for round in 0..50u64 {
+            s.plan(now, 0, h(0), &ps);
+            s.on_headers(&pid("a"), &headers(1 + round * 1000, 1000 + round * 1000));
+        }
+        assert!(s.anchor_count() as u64 <= cfg.lookahead);
+        // Unsolicited headers are ignored outright.
+        s.on_headers(&pid("stranger"), &headers(1, 512));
+        assert!(s.anchor_count() as u64 <= cfg.lookahead);
+    }
+
+    #[test]
+    fn delivered_but_never_applied_ranges_are_re_requested_after_a_stall() {
+        let mut s = RangeScheduler::new(RangeConfig {
+            max_in_flight: 1,
+            stall_timeout: Duration::from_secs(30),
+            ..RangeConfig::default()
+        });
+        let t0 = Instant::now();
+        let ps = peers(&["a"], 10_000);
+        s.plan(t0, 0, h(0), &ps);
+        s.on_blocks(&pid("a"), Some(0), &chain(1, 31));
+        // Applied tip never moves: after the stall timeout 1..=31 is asked
+        // again. The stall counts as the range's first failure, so there is
+        // no hold yet; the only peer is asked again.
+        let stalled = t0 + Duration::from_secs(31);
+        let b = blocks_of(&s.plan(stalled, 0, h(0), &ps).requests);
+        assert_eq!(b, vec![(pid("a"), 0, 1, 31)]);
+        assert_eq!(s.counters().stall_resets, 1);
+    }
+
+    #[test]
+    fn applied_progress_frees_slots_and_never_re_requests_applied_heights() {
+        let mut s = RangeScheduler::new(RangeConfig::default());
+        let now = Instant::now();
+        let ps = peers(&["a", "b", "c"], 100_000);
+        let mut applied = 0u64;
+        let mut asked = BTreeSet::new();
+        for _ in 0..400 {
+            let plan = s.plan(now, applied, h(applied), &ps);
+            for r in &plan.requests {
+                match r {
+                    SyncRequest::Blocks {
+                        peer, start, end, ..
+                    } => {
+                        for x in *start..=*end {
+                            assert!(asked.insert(x), "height {x} requested twice");
+                        }
+                        let first = if *start == applied + 1 && !s.anchors.contains_key(start) {
+                            applied
+                        } else {
+                            *start
+                        };
+                        s.on_blocks(peer, Some(first), &chain(*start, *end));
+                    }
+                    SyncRequest::Headers {
+                        peer, from_height, ..
+                    } => {
+                        let top = from_height + 128;
+                        s.on_headers(peer, &headers(from_height + 1, top));
+                    }
+                }
+            }
+            // Apply everything delivered contiguously.
+            while s.covered(applied + 1).is_some() && s.delivered.contains_key(&(applied + 1)) {
+                applied = s.delivered.get(&(applied + 1)).map_or(applied, |(e, _)| *e);
+            }
+        }
+        assert!(applied > 5_000, "applied only {applied}");
+        assert_eq!(s.counters().duplicate_requests, 0);
+        assert_eq!(s.counters().retries, 0);
+    }
+
+    fn pending_misbehaved(s: &mut RangeScheduler, now: Instant, ps: &[PeerSlot]) -> Vec<PeerId> {
+        let applied = s.applied;
+        let hash = s.applied_hash;
+        s.plan(now, applied, hash, ps).misbehaved
+    }
+
+    /// Blocks at the right heights that do not link to the range's anchor
+    /// deliver nothing: the range goes to another peer at once.
+    #[test]
+    fn a_non_linking_answer_delivers_nothing_and_moves_the_range() {
+        let mut s = RangeScheduler::new(RangeConfig {
+            max_in_flight: 1,
+            ..RangeConfig::default()
+        });
+        let now = Instant::now();
+        let ps = peers(&["forger", "good"], 10_000);
+        let p1 = blocks_of(&s.plan(now, 0, h(0), &ps).requests);
+        assert_eq!(p1, vec![(pid("forger"), 0, 1, 31)]);
+        let fake = Hash::new([0xAB; 32]);
+        assert_eq!(
+            s.on_blocks(&pid("forger"), Some(1), &chain_on(fake, 1, 31)),
+            BlocksMatch::Range {
+                start: 1,
+                end: 31,
+                delivered_through: 0,
+                foreign_anchor: false
+            }
+        );
+        assert_eq!(s.counters().unlinked_responses, 1);
+        let p2 = blocks_of(&s.plan(now, 0, h(0), &ps).requests);
+        assert_eq!(p2, vec![(pid("good"), 0, 1, 31)]);
+        // A linking answer is delivered, up to where the links stop.
+        let mut answer = chain(0, 20);
+        answer.extend(chain_on(fake, 21, 31));
+        assert_eq!(
+            s.on_blocks(&pid("good"), Some(0), &answer),
+            BlocksMatch::Range {
+                start: 1,
+                end: 31,
+                delivered_through: 20,
+                foreign_anchor: false
+            }
+        );
+    }
+
+    /// On a multi-producer DAG the anchor's height group carries siblings:
+    /// one with the anchor's parent links (and so do its children); one on
+    /// another parent does not.
+    #[test]
+    fn a_sibling_of_the_anchor_links_only_through_the_same_parent() {
+        let mut s = RangeScheduler::new(RangeConfig {
+            max_in_flight: 2,
+            ..RangeConfig::default()
+        });
+        let now = Instant::now();
+        let ps = peers(&["a"], 10_000);
+        s.plan(now, 0, h(0), &ps);
+        s.on_headers(&pid("a"), &headers(1, 200));
+        let b = blocks_of(&s.plan(now, 0, h(0), &ps).requests);
+        assert!(b.contains(&(pid("a"), 32, 32, 63)));
+        let sibling = BlockLink {
+            height: 32,
+            hash: Hash::new([0x51; 32]),
+            parent: h(31),
+        };
+        let child = BlockLink {
+            height: 33,
+            hash: Hash::new([0x52; 32]),
+            parent: sibling.hash,
+        };
+        // Answer: the anchor's sibling and its child only (the anchor block's
+        // own line stops at 32).
+        let answer = vec![chain(32, 32)[0], sibling, child];
+        assert_eq!(
+            s.on_blocks(&pid("a"), Some(32), &answer),
+            BlocksMatch::Range {
+                start: 32,
+                end: 63,
+                delivered_through: 33,
+                foreign_anchor: false
+            }
+        );
+        // The same shape on a parent the anchor does not have links nothing
+        // past the anchor itself.
+        let mut s2 = RangeScheduler::new(RangeConfig {
+            max_in_flight: 2,
+            ..RangeConfig::default()
+        });
+        s2.plan(now, 0, h(0), &ps);
+        s2.on_headers(&pid("a"), &headers(1, 200));
+        s2.plan(now, 0, h(0), &ps);
+        let stranger = BlockLink {
+            height: 32,
+            hash: Hash::new([0x61; 32]),
+            parent: Hash::new([0x60; 32]),
+        };
+        let its_child = BlockLink {
+            height: 33,
+            hash: Hash::new([0x62; 32]),
+            parent: stranger.hash,
+        };
+        assert_eq!(
+            s2.on_blocks(
+                &pid("a"),
+                Some(32),
+                &[chain(32, 32)[0], stranger, its_child]
+            ),
+            BlocksMatch::Range {
+                start: 32,
+                end: 63,
+                delivered_through: 32,
+                foreign_anchor: false
+            }
+        );
+    }
+
+    /// Headers whose hashes are blocks at other heights: the first block
+    /// answer that carries such an anchor at its real height drops every
+    /// anchor from that source, reports it, and the next header request goes
+    /// to another peer.
+    #[test]
+    fn an_answer_carrying_the_anchor_at_another_height_drops_that_sources_anchors() {
+        let mut s = RangeScheduler::new(RangeConfig::default());
+        let now = Instant::now();
+        let ps = peers(&["liar", "a"], 10_000);
+        s.plan(now, 0, h(0), &ps);
+        let lies: Vec<(u64, Hash)> = (1..=512).map(|n| (n, h(n + 100))).collect();
+        s.on_headers(&pid("liar"), &lies);
+        assert_eq!(s.anchor_count(), 512);
+        let b = blocks_of(&s.plan(now, 0, h(0), &ps).requests);
+        let (peer, _, start, _) = b
+            .iter()
+            .find(|(_, a, st, _)| a == st)
+            .cloned()
+            .expect("a header-anchored range");
+        // The server resolved the anchor to its real height and served from
+        // there.
+        let m = s.on_blocks(&peer, Some(start + 100), &chain(start + 100, start + 131));
+        assert_eq!(m, BlocksMatch::Unsolicited);
+        assert_eq!(s.counters().wrong_anchors, 1);
+        assert_eq!(s.anchor_count(), 0, "every anchor from the liar dropped");
+        let plan = s.plan(now, 0, h(0), &ps);
+        assert_eq!(plan.misbehaved, vec![pid("liar")]);
+        // The range is free again, and headers come from someone else.
+        let headers_to: Vec<PeerId> = plan
+            .requests
+            .iter()
+            .filter_map(|r| match r {
+                SyncRequest::Headers { peer, .. } => Some(peer.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(!headers_to.contains(&pid("liar")));
+        assert_eq!(s.counters().duplicate_requests, 0);
+    }
+
+    /// A range that fails on two peers (here a timeout and an empty answer)
+    /// drops its anchor, so the first range falls back to the applied tip.
+    #[test]
+    fn a_range_failing_on_two_peers_drops_its_anchor_and_falls_back_to_the_tip() {
+        let mut s = RangeScheduler::new(RangeConfig {
+            max_in_flight: 1,
+            request_timeout: Duration::from_secs(5),
+            ..RangeConfig::default()
+        });
+        let t0 = Instant::now();
+        // Anchors from 11 up, from "a", name blocks nobody has; "a" ranks
+        // last for blocks, so two OTHER peers fail the range.
+        s.plan(t0, 10, h(10), &peers(&["a", "b", "c"], 10_000));
+        s.in_flight.clear();
+        let bogus: Vec<(u64, Hash)> = (11..=200).map(|n| (n, Hash::new([n as u8; 32]))).collect();
+        s.on_headers(&pid("a"), &bogus);
+        let ps = peers(&["b", "c", "a"], 10_000);
+        let p = blocks_of(&s.plan(t0, 10, h(10), &ps).requests);
+        assert_eq!(p, vec![(pid("b"), 11, 11, 42)], "anchored on the header");
+        // b times out.
+        let t1 = t0 + Duration::from_secs(6);
+        let p = blocks_of(&s.plan(t1, 10, h(10), &ps).requests);
+        assert_eq!(p, vec![(pid("c"), 11, 11, 42)]);
+        assert_eq!(s.counters().anchor_evictions, 0);
+        // c answers empty: two peers in good standing failed it.
+        s.on_blocks(&pid("c"), None, &[]);
+        assert_eq!(s.counters().anchor_evictions, 1);
+        // Two failures at this height: it waits (2 x retry_backoff, the
+        // untried spacing), then falls back to the applied tip. c only
+        // answered on a's dropped anchor, so it is excused and asked first;
+        // b timed out, which is never excused.
+        assert!(blocks_of(&s.plan(t1, 10, h(10), &ps).requests).is_empty());
+        let t2 = t1 + RangeConfig::default().retry_backoff * 2;
+        let p = blocks_of(&s.plan(t2, 10, h(10), &ps).requests);
+        assert_eq!(
+            p,
+            vec![(pid("c"), 10, 11, 41)],
+            "falls back to the applied tip"
+        );
+        s.on_blocks(&pid("c"), None, &[]);
+        assert!(blocks_of(&s.plan(t2, 10, h(10), &ps).requests).is_empty());
+        let t3 = t2 + RangeConfig::default().retry_backoff * 2;
+        let p = blocks_of(&s.plan(t3, 10, h(10), &ps).requests);
+        assert_eq!(p, vec![(pid("a"), 10, 11, 41)], "b was not excused");
+    }
+
+    /// A header answer with nothing new is not followed by another header
+    /// request until the backoff has passed.
+    #[test]
+    fn header_requests_back_off_after_an_answer_with_nothing_new() {
+        let cfg = RangeConfig::default();
+        let mut s = RangeScheduler::new(cfg.clone());
+        let t0 = Instant::now();
+        let ps = peers(&["a", "b"], 10_000);
+        let count_headers = |plan: &Plan| {
+            plan.requests
+                .iter()
+                .filter(|r| matches!(r, SyncRequest::Headers { .. }))
+                .count()
+        };
+        let p = s.plan(t0, 0, h(0), &ps);
+        assert_eq!(count_headers(&p), 1);
+        s.on_headers_at(&pid("a"), &[], t0);
+        let soon = t0 + cfg.header_backoff / 2;
+        assert_eq!(count_headers(&s.plan(soon, 0, h(0), &ps)), 0);
+        let later = t0 + cfg.header_backoff + Duration::from_millis(1);
+        assert_eq!(count_headers(&s.plan(later, 0, h(0), &ps)), 1);
+        assert_eq!(s.counters().header_requests, 2);
+    }
+
+    /// When delivered blocks never apply, the deliverer of the front range is
+    /// reported and that range goes to another peer.
+    #[test]
+    fn a_stalled_front_range_reports_its_deliverer_and_moves() {
+        let mut s = RangeScheduler::new(RangeConfig {
+            max_in_flight: 1,
+            stall_timeout: Duration::from_secs(30),
+            ..RangeConfig::default()
+        });
+        let t0 = Instant::now();
+        let ps = peers(&["a", "b"], 10_000);
+        s.plan(t0, 0, h(0), &ps);
+        s.on_blocks(&pid("a"), Some(0), &chain(0, 31));
+        let plan = s.plan(t0 + Duration::from_secs(31), 0, h(0), &ps);
+        assert_eq!(plan.misbehaved, vec![pid("a")]);
+        assert_eq!(blocks_of(&plan.requests), vec![(pid("b"), 0, 1, 31)]);
+        assert!(pending_misbehaved(&mut s, t0 + Duration::from_secs(31), &ps).is_empty());
+    }
+
+    /// Admission refusing a delivered range frees it for another peer.
+    #[test]
+    fn a_refused_delivery_is_asked_of_another_peer() {
+        let mut s = RangeScheduler::new(RangeConfig {
+            max_in_flight: 1,
+            ..RangeConfig::default()
+        });
+        let now = Instant::now();
+        let ps = peers(&["a", "b"], 10_000);
+        s.plan(now, 0, h(0), &ps);
+        s.on_blocks(&pid("a"), Some(0), &chain(0, 31));
+        assert!(blocks_of(&s.plan(now, 0, h(0), &ps).requests).is_empty());
+        // Another peer's refusal report does not touch a's delivery.
+        s.on_rejected(&pid("b"), 1, 31);
+        assert_eq!(s.counters().rejected_ranges, 0);
+        s.on_rejected(&pid("a"), 1, 31);
+        assert_eq!(s.counters().rejected_ranges, 1);
+        let plan = s.plan(now, 0, h(0), &ps);
+        assert_eq!(plan.misbehaved, vec![pid("a")]);
+        assert_eq!(blocks_of(&plan.requests), vec![(pid("b"), 0, 1, 31)]);
+    }
+
+    /// A delivery dropped before admission is asked again, of the same peer
+    /// if it is still the best, with nothing charged.
+    #[test]
+    fn a_dropped_delivery_is_asked_again_without_a_charge() {
+        let mut s = RangeScheduler::new(RangeConfig {
+            max_in_flight: 1,
+            ..RangeConfig::default()
+        });
+        let now = Instant::now();
+        let ps = peers(&["a", "b"], 10_000);
+        s.plan(now, 0, h(0), &ps);
+        s.on_blocks(&pid("a"), Some(0), &chain(0, 31));
+        assert!(blocks_of(&s.plan(now, 0, h(0), &ps).requests).is_empty());
+        s.on_dropped(&pid("a"), 1, 31);
+        let plan = s.plan(now, 0, h(0), &ps);
+        assert!(plan.misbehaved.is_empty());
+        assert_eq!(blocks_of(&plan.requests), vec![(pid("a"), 0, 1, 31)]);
+    }
+
+    /// Once every eligible peer has failed a range it is held back, the hold
+    /// doubles each round up to the cap, and nothing above it is planned
+    /// meanwhile. A delivery clears it.
+    #[test]
+    fn a_range_every_peer_failed_backs_off_doubling_to_the_cap() {
+        let cfg = RangeConfig::default();
+        let mut s = RangeScheduler::new(cfg.clone());
+        let t0 = Instant::now();
+        let ps = peers(&["a", "b"], 10_000);
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        // Both peers answer the tip-anchored range with nothing.
+        let p = blocks_of(&s.plan(t0, 0, h(0), &ps).requests);
+        assert_eq!(p, vec![(pid("a"), 0, 1, 31)]);
+        s.on_blocks(&pid("a"), None, &[]);
+        let p = blocks_of(&s.plan(t0, 0, h(0), &ps).requests);
+        assert_eq!(p, vec![(pid("b"), 0, 1, 31)]);
+        s.on_blocks(&pid("b"), None, &[]);
+        // Everyone failed it: held for retry_backoff, then asked once.
+        let mut at = 0u64;
+        let mut hold = cfg.retry_backoff.as_millis() as u64;
+        let cap = cfg.retry_backoff_max.as_millis() as u64;
+        for round in 0..8 {
+            assert!(
+                blocks_of(&s.plan(ms(at), 0, h(0), &ps).requests).is_empty(),
+                "round {round}: asked again without a hold"
+            );
+            assert!(blocks_of(&s.plan(ms(at + hold - 1), 0, h(0), &ps).requests).is_empty());
+            let p = blocks_of(&s.plan(ms(at + hold), 0, h(0), &ps).requests);
+            assert_eq!(p.len(), 1, "round {round}: one request after the hold");
+            s.on_blocks(&p[0].0, None, &[]);
+            at += hold;
+            hold = (hold * 2).min(cap);
+        }
+        assert_eq!(hold, cap);
+        assert_eq!(s.counters().backoffs, 8);
+        // A delivery clears the hold.
+        assert!(blocks_of(&s.plan(ms(at), 0, h(0), &ps).requests).is_empty());
+        let p = blocks_of(&s.plan(ms(at + cap), 0, h(0), &ps).requests);
+        s.on_blocks(&p[0].0, Some(0), &chain(0, 31));
+        assert!(!s.streak.contains_key(&1));
+    }
+
+    /// Only the range everyone failed is held: a range another peer has not
+    /// tried yet is reassigned at once.
+    #[test]
+    fn a_range_with_an_untried_peer_is_reassigned_without_a_hold() {
+        let mut s = RangeScheduler::new(RangeConfig::default());
+        let now = Instant::now();
+        let ps = peers(&["a", "b", "c"], 10_000);
+        s.plan(now, 0, h(0), &ps);
+        s.on_blocks(&pid("a"), None, &[]);
+        let p = blocks_of(&s.plan(now, 0, h(0), &ps).requests);
+        assert_eq!(p.first().map(|r| r.0.clone()), Some(pid("b")));
+        assert_eq!(s.counters().backoffs, 0);
+    }
+
+    /// The source of an anchor answering its own anchor with nothing drops
+    /// it at once; the range goes to the other peer on the applied tip.
+    #[test]
+    fn a_source_failing_its_own_anchor_drops_it_at_once() {
+        let mut s = RangeScheduler::new(RangeConfig {
+            max_in_flight: 1,
+            ..RangeConfig::default()
+        });
+        let now = Instant::now();
+        let ps = peers(&["liar", "honest"], 10_000);
+        s.plan(now, 10, h(10), &ps);
+        s.in_flight.clear();
+        let bogus: Vec<(u64, Hash)> = (11..=200).map(|n| (n, Hash::new([n as u8; 32]))).collect();
+        s.on_headers(&pid("liar"), &bogus);
+        let p = blocks_of(&s.plan(now, 10, h(10), &ps).requests);
+        assert_eq!(p, vec![(pid("liar"), 11, 11, 42)]);
+        s.on_blocks(&pid("liar"), None, &[]);
+        assert_eq!(s.counters().anchor_evictions, 1);
+        let p = blocks_of(&s.plan(now, 10, h(10), &ps).requests);
+        assert_eq!(p, vec![(pid("honest"), 10, 11, 41)]);
+    }
+
+    /// Peers in bad standing answering an honest source's anchor with nothing
+    /// do not get it dropped; the source itself is asked and the anchor stays.
+    #[test]
+    fn failures_from_peers_in_bad_standing_do_not_drop_anothers_anchor() {
+        let mut s = RangeScheduler::new(RangeConfig {
+            max_in_flight: 1,
+            ..RangeConfig::default()
+        });
+        let now = Instant::now();
+        let mut ps = peers(&["e1", "e2", "honest"], 10_000);
+        s.plan(now, 10, h(10), &peers(&["honest"], 10_000));
+        s.in_flight.clear();
+        s.on_headers(&pid("honest"), &headers(11, 200));
+        ps[0].bad_standing = true;
+        ps[1].bad_standing = true;
+        for expect in ["e1", "e2"] {
+            let p = blocks_of(&s.plan(now, 10, h(10), &ps).requests);
+            assert_eq!(p, vec![(pid(expect), 11, 11, 42)]);
+            s.on_blocks(&pid(expect), None, &[]);
+        }
+        assert_eq!(s.counters().anchor_evictions, 0, "honest anchor dropped");
+        assert!(blocks_of(&s.plan(now, 10, h(10), &ps).requests).is_empty());
+        let later = now + RangeConfig::default().retry_backoff * 2;
+        let p = blocks_of(&s.plan(later, 10, h(10), &ps).requests);
+        assert_eq!(p, vec![(pid("honest"), 11, 11, 42)]);
+    }
+
+    /// A range two peers failed because its anchor was bad. Dropping the
+    /// anchor does NOT reset the range's failure count or hold (they belong
+    /// to the height, so re-anchoring cannot lift them). The two peers only
+    /// answered on the dropped anchor, so they are excused: asked again, on
+    /// the applied tip, at the untried spacing. Peers that then fail on the
+    /// tip stay avoided, and once every peer has, retries rotate through them,
+    /// oldest failure first, on the doubling hold.
+    #[test]
+    fn dropping_a_bad_anchor_keeps_the_hold_and_the_honest_peer_is_asked_again() {
+        let cfg = RangeConfig {
+            max_in_flight: 1,
+            ..RangeConfig::default()
+        };
+        let b = cfg.retry_backoff;
+        let mut s = RangeScheduler::new(cfg.clone());
+        let now = Instant::now();
+        // Anchors from "src"; "x" and "y" answer the range empty on them.
+        s.plan(now, 10, h(10), &peers(&["src"], 10_000));
+        s.in_flight.clear();
+        let bogus: Vec<(u64, Hash)> = (11..=200).map(|n| (n, Hash::new([n as u8; 32]))).collect();
+        s.on_headers(&pid("src"), &bogus);
+        let ps = peers(&["x", "y", "src"], 10_000);
+        for expect in ["x", "y"] {
+            let p = blocks_of(&s.plan(now, 10, h(10), &ps).requests);
+            assert_eq!(p, vec![(pid(expect), 11, 11, 42)]);
+            s.on_blocks(&pid(expect), None, &[]);
+        }
+        assert_eq!(s.counters().anchor_evictions, 1);
+        // Held: the drop did not reset it (untried spacing: 2 x backoff).
+        assert!(
+            blocks_of(&s.plan(now, 10, h(10), &ps).requests).is_empty(),
+            "the anchor drop lifted the hold"
+        );
+        // x and y are excused: x first again, now on the applied tip.
+        let mut at = now + b * 2;
+        let p = blocks_of(&s.plan(at, 10, h(10), &ps).requests);
+        assert_eq!(p, vec![(pid("x"), 10, 11, 41)]);
+        // Failures on the tip anchor are not excused.
+        for expect in ["y", "src"] {
+            s.on_blocks(&holder(&s), None, &[]);
+            assert!(blocks_of(&s.plan(at, 10, h(10), &ps).requests).is_empty());
+            at += b * 2;
+            let p = blocks_of(&s.plan(at, 10, h(10), &ps).requests);
+            assert_eq!(p, vec![(pid(expect), 10, 11, 41)]);
+        }
+        s.on_blocks(&pid("src"), None, &[]);
+        // Everyone failed on the tip: rotation after the doubling hold, x
+        // (the oldest failure) first.
+        assert!(blocks_of(&s.plan(at, 10, h(10), &ps).requests).is_empty());
+        let p = blocks_of(&s.plan(at + b, 10, h(10), &ps).requests);
+        assert_eq!(p, vec![(pid("x"), 10, 11, 41)]);
+    }
+
+    /// The peer holding the one range in flight.
+    fn holder(s: &RangeScheduler) -> PeerId {
+        s.in_flight
+            .values()
+            .next()
+            .expect("a range in flight")
+            .peer
+            .clone()
+    }
+
+    /// New anchors for the same heights (a fresh made-up header run) do not
+    /// reset the count either: each further failure doubles the hold.
+    #[test]
+    fn re_anchoring_does_not_reset_a_ranges_hold() {
+        let cfg = RangeConfig {
+            max_in_flight: 1,
+            ..RangeConfig::default()
+        };
+        let mut s = RangeScheduler::new(cfg.clone());
+        let t0 = Instant::now();
+        let ps = peers(&["l1", "l2", "l3", "l4"], 10_000);
+        let mut at = t0;
+        let mut asked = 0u32;
+        for round in 0..6u8 {
+            // Plan until the range is held: every header answer is a fresh
+            // made-up run, every block answer is empty.
+            loop {
+                let plan = s.plan(at, 10, h(10), &ps);
+                let mut sent = false;
+                for r in &plan.requests {
+                    match r {
+                        SyncRequest::Headers { peer, .. } => {
+                            let run: Vec<(u64, Hash)> = (11..=200)
+                                .map(|n| (n, Hash::new([round.wrapping_add(n as u8); 32])))
+                                .collect();
+                            s.on_headers_at(peer, &run, at);
+                        }
+                        SyncRequest::Blocks { peer, .. } => {
+                            asked += 1;
+                            sent = true;
+                            s.on_blocks(peer, None, &[]);
+                        }
+                    }
+                }
+                if !sent {
+                    break;
+                }
+            }
+            let hold = s.streak.get(&11).map(|st| st.hold).unwrap_or_default();
+            at += hold + Duration::from_secs(10);
+        }
+        // 2 free attempts, then one per round: at most 2 + 5, whatever the
+        // anchors. The two untried peers are spaced without raising the hold;
+        // after that it doubles each round (0.5, 1, 2 s) through re-anchoring.
+        assert!(asked <= 7, "asked {asked} times in 6 rounds");
+        let hold = s.streak.get(&11).map(|st| st.hold).unwrap_or_default();
+        assert!(
+            hold >= cfg.retry_backoff * 4,
+            "the hold did not double through re-anchoring: {hold:?}"
+        );
+    }
+
+    /// While the front range is held, nothing above it is planned.
+    #[test]
+    fn nothing_above_a_held_range_is_planned() {
+        let mut s = RangeScheduler::new(RangeConfig {
+            max_in_flight: 1,
+            ..RangeConfig::default()
+        });
+        let now = Instant::now();
+        let ps = peers(&["a", "b"], 10_000);
+        s.plan(now, 0, h(0), &ps);
+        s.in_flight.clear();
+        // Anchors above the front range only, so the front range is
+        // tip-anchored and its failures never evict an anchor.
+        s.on_headers(&pid("a"), &headers(32, 300));
+        for expect in ["a", "b"] {
+            let p = blocks_of(&s.plan(now, 0, h(0), &ps).requests);
+            assert_eq!(p, vec![(pid(expect), 0, 1, 31)]);
+            s.on_blocks(&pid(expect), None, &[]);
+        }
+        let plan = s.plan(now, 0, h(0), &ps);
+        assert_eq!(s.counters().backoffs, 1, "the front range is held");
+        assert!(
+            blocks_of(&plan.requests).is_empty(),
+            "planned above a held range: {:?}",
+            blocks_of(&plan.requests)
+        );
+    }
+
+    /// A range with a failure since its last delivery stops planning above
+    /// it at once, before any hold: its retry goes out, nothing new above.
+    #[test]
+    fn a_failed_range_stops_planning_above_it_before_any_hold() {
+        let mut s = RangeScheduler::new(RangeConfig {
+            max_in_flight: 4,
+            ..RangeConfig::default()
+        });
+        let now = Instant::now();
+        let ps = peers(&["a", "b"], 10_000);
+        s.plan(now, 0, h(0), &ps);
+        s.in_flight.clear();
+        s.on_headers(&pid("a"), &headers(32, 300));
+        let p = blocks_of(&s.plan(now, 0, h(0), &ps).requests);
+        assert_eq!(p.len(), 4);
+        // The front range fails once (no hold yet); the next one delivers,
+        // which frees two slots.
+        s.on_blocks(&pid("a"), None, &[]);
+        s.on_blocks(&pid("a"), Some(32), &chain(32, 63));
+        let p = blocks_of(&s.plan(now, 0, h(0), &ps).requests);
+        assert_eq!(
+            p,
+            vec![(pid("b"), 0, 1, 31)],
+            "only the failed range is asked"
+        );
+        assert_eq!(s.counters().backoffs, 0);
+    }
+
+    /// After a dropped anchor, header requests wait twice the backoff; a
+    /// delivery lifts that.
+    #[test]
+    fn a_dropped_anchor_slows_header_requests_until_a_delivery() {
+        let cfg = RangeConfig {
+            max_in_flight: 1,
+            ..RangeConfig::default()
+        };
+        let mut s = RangeScheduler::new(cfg.clone());
+        let t0 = Instant::now();
+        let ps = peers(&["a", "b"], 10_000);
+        let headers_in = |plan: &Plan| {
+            plan.requests
+                .iter()
+                .filter(|r| matches!(r, SyncRequest::Headers { .. }))
+                .count()
+        };
+        let p = s.plan(t0, 10, h(10), &ps);
+        assert_eq!(headers_in(&p), 1);
+        s.in_flight.clear();
+        let bogus: Vec<(u64, Hash)> = (11..=200).map(|n| (n, Hash::new([n as u8; 32]))).collect();
+        s.on_headers_at(&pid("a"), &bogus, t0);
+        for _ in 0..2 {
+            let r = blocks_of(&s.plan(t0, 10, h(10), &ps).requests);
+            s.on_blocks(&r[0].0, None, &[]);
+        }
+        assert_eq!(s.counters().anchor_evictions, 1);
+        // (Drop the header request the failure rounds sent at t0, unanswered.)
+        s.header_req = None;
+        // One drop: no header request for 2 x header_backoff after the last.
+        let almost = t0 + cfg.header_backoff * 2 - Duration::from_millis(1);
+        assert_eq!(headers_in(&s.plan(almost, 10, h(10), &ps)), 0);
+        let due = t0 + cfg.header_backoff * 2;
+        assert_eq!(headers_in(&s.plan(due, 10, h(10), &ps)), 1);
+        // A delivery resets it.
+        s.header_req = None;
+        let t = due + cfg.retry_backoff * 4;
+        let r = blocks_of(&s.plan(t, 10, h(10), &ps).requests);
+        s.on_blocks(&r[0].0, Some(10), &chain(10, 41));
+        assert_eq!(s.header_strikes, 0);
+    }
+
+    /// When every peer has failed a range, the retry goes to the one whose
+    /// failure is oldest, not always to the top-ranked one.
+    #[test]
+    fn retries_rotate_through_the_peers_that_failed_a_range() {
+        let cfg = RangeConfig {
+            max_in_flight: 1,
+            ..RangeConfig::default()
+        };
+        let mut s = RangeScheduler::new(cfg.clone());
+        let mut at = Instant::now();
+        let b_first = vec![
+            PeerSlot::new(pid("b"), 10_000),
+            PeerSlot::new(pid("a"), 10_000),
+        ];
+        let a_first = peers(&["a", "b"], 10_000);
+        for expect in ["b", "a"] {
+            let p = blocks_of(&s.plan(at, 0, h(0), &b_first).requests);
+            assert_eq!(p[0].0, pid(expect));
+            s.on_blocks(&p[0].0, None, &[]);
+        }
+        // Ranking now puts a first; b failed longest ago, so b is next, then a.
+        for expect in ["b", "a", "b"] {
+            assert!(blocks_of(&s.plan(at, 0, h(0), &a_first).requests).is_empty());
+            at += s.streak.get(&1).map(|st| st.hold).unwrap_or_default();
+            let p = blocks_of(&s.plan(at, 0, h(0), &a_first).requests);
+            assert_eq!(p[0].0, pid(expect), "rotation");
+            s.on_blocks(&p[0].0, None, &[]);
+        }
+    }
+
+    /// Eight failing peers ranked above the honest one: the honest one is
+    /// still asked within a constant spacing per peer ahead of it (untried
+    /// peers do not raise the hold), not after the doubling hold climbs.
+    #[test]
+    fn the_honest_peer_below_many_failing_ones_is_reached_quickly() {
+        let cfg = RangeConfig {
+            max_in_flight: 1,
+            ..RangeConfig::default()
+        };
+        let mut s = RangeScheduler::new(cfg.clone());
+        let t0 = Instant::now();
+        let mut ps = peers(&["l0", "l1", "l2", "l3", "l4", "l5", "l6", "l7"], 10_000);
+        ps.push(PeerSlot::new(pid("honest"), 10_000));
+        let step = Duration::from_millis(100);
+        let mut at = t0;
+        let reached = loop {
+            assert!(at - t0 < Duration::from_secs(60), "never reached");
+            let p = blocks_of(&s.plan(at, 0, h(0), &ps).requests);
+            if let Some(r) = p.first() {
+                if r.0 == pid("honest") {
+                    break at - t0;
+                }
+                s.on_blocks(&r.0, None, &[]);
+            }
+            at += step;
+        };
+        // 2 free attempts, then 7 untried peers (l2..l7, honest) at
+        // 2 x retry_backoff each, plus one planning step of slack per peer.
+        assert!(
+            reached <= cfg.retry_backoff * 2 * 7 + step * 8,
+            "honest peer reached after {reached:?}"
+        );
+    }
+
+    /// A source in bad standing loses its anchor on the first failure by any
+    /// other peer, and is reported (charged) for it; the range falls back to
+    /// the applied tip at once, on the peer that failed only on the anchor.
+    #[test]
+    fn a_bad_standing_sources_anchor_drops_on_one_failure_by_another_peer() {
+        let mut s = RangeScheduler::new(RangeConfig {
+            max_in_flight: 1,
+            ..RangeConfig::default()
+        });
+        let now = Instant::now();
+        let mut ps = peers(&["honest", "liar"], 10_000);
+        ps[1].bad_standing = true;
+        s.plan(now, 10, h(10), &peers(&["liar"], 10_000));
+        s.in_flight.clear();
+        let bogus: Vec<(u64, Hash)> = (11..=200).map(|n| (n, Hash::new([n as u8; 32]))).collect();
+        s.on_headers(&pid("liar"), &bogus);
+        let p = blocks_of(&s.plan(now, 10, h(10), &ps).requests);
+        assert_eq!(p, vec![(pid("honest"), 11, 11, 42)]);
+        assert_eq!(
+            s.on_blocks(&pid("honest"), None, &[]),
+            BlocksMatch::Range {
+                start: 11,
+                end: 42,
+                delivered_through: 10,
+                foreign_anchor: true
+            }
+        );
+        assert_eq!(s.counters().anchor_evictions, 1, "anchor kept");
+        let plan = s.plan(now, 10, h(10), &ps);
+        assert_eq!(plan.misbehaved, vec![pid("liar")], "source not charged");
+        // The honest peer only failed on the dropped anchor: it is asked
+        // again at once, on the applied tip, ahead of the liar.
+        assert_eq!(blocks_of(&plan.requests), vec![(pid("honest"), 10, 11, 41)]);
+    }
+
+    /// A source in good standing keeps its anchor after one other peer's
+    /// failure, and is not charged.
+    #[test]
+    fn a_good_sources_anchor_survives_one_failure_by_another_peer() {
+        let mut s = RangeScheduler::new(RangeConfig {
+            max_in_flight: 1,
+            ..RangeConfig::default()
+        });
+        let now = Instant::now();
+        let ps = peers(&["other", "src"], 10_000);
+        s.plan(now, 10, h(10), &peers(&["src"], 10_000));
+        s.in_flight.clear();
+        s.on_headers(&pid("src"), &headers(11, 200));
+        let p = blocks_of(&s.plan(now, 10, h(10), &ps).requests);
+        assert_eq!(p, vec![(pid("other"), 11, 11, 42)]);
+        s.on_blocks(&pid("other"), None, &[]);
+        assert_eq!(s.counters().anchor_evictions, 0);
+        let plan = s.plan(now, 10, h(10), &ps);
+        assert!(plan.misbehaved.is_empty());
+        assert_eq!(blocks_of(&plan.requests), vec![(pid("src"), 11, 11, 42)]);
+    }
+
+    /// Past the free failures, a peer that has not tried the range is asked
+    /// exactly 2 x retry_backoff after the hold is armed: not sooner (that
+    /// would let many failing peers drive the rate up) and not later.
+    #[test]
+    fn an_untried_peer_waits_exactly_twice_the_retry_backoff() {
+        let cfg = RangeConfig {
+            max_in_flight: 1,
+            ..RangeConfig::default()
+        };
+        let mut s = RangeScheduler::new(cfg.clone());
+        let t0 = Instant::now();
+        let ps = peers(&["a", "b", "c"], 10_000);
+        for expect in ["a", "b"] {
+            let p = blocks_of(&s.plan(t0, 0, h(0), &ps).requests);
+            assert_eq!(p, vec![(pid(expect), 0, 1, 31)]);
+            s.on_blocks(&pid(expect), None, &[]);
+        }
+        let b = cfg.retry_backoff;
+        assert!(blocks_of(&s.plan(t0, 0, h(0), &ps).requests).is_empty());
+        let almost = t0 + b * 2 - Duration::from_millis(1);
+        assert!(blocks_of(&s.plan(t0 + b, 0, h(0), &ps).requests).is_empty());
+        assert!(blocks_of(&s.plan(almost, 0, h(0), &ps).requests).is_empty());
+        let p = blocks_of(&s.plan(t0 + b * 2, 0, h(0), &ps).requests);
+        assert_eq!(p, vec![(pid("c"), 0, 1, 31)]);
+    }
+}

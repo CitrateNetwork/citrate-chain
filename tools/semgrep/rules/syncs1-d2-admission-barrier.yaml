@@ -35,6 +35,7 @@ rules:
     paths:
       include:
         - "node/src/main.rs"
+        - "node/src/sync_driver.rs"
     patterns:
       - pattern-either:
           - pattern: $DAG.store_block($BLK).await

@@ -88,6 +88,7 @@ mod registration_proof;
 mod registry_sync;
 mod rollback;
 mod startup_guards;
+mod sync_driver;
 mod sync_peer;
 mod timing;
 
@@ -3022,20 +3023,25 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let storage_for_sync = storage.clone();
         let max_seen_for_sync = max_seen_height.clone();
         let sync_peers_for_loop = sync_peers.clone();
+        let sync_driver = Arc::new(sync_driver::SyncDriver::new(
+            sync.clone(),
+            sync_peers.clone(),
+        ));
+        let driver_for_loop = sync_driver.clone();
+        let wake_for_loop = sync_driver.wake_handle();
         tokio::spawn(async move {
-            // #150: `attempt_counts` (an unpruned HashMap keyed by every anchor
-            // ever timed out — also a slow leak) and `pending_retries` are gone
-            // with the stale-anchor retry queue. See the note at `check_timeouts`.
-            // Round-robin index for rotating request peers when we are behind but no
-            // peer qualified as "best" (forward-sync liveness fix).
-            let mut rotate_idx: u64 = 0;
             // #155: last peer we logged choosing, so SYNCPEER only fires on change.
             let mut last_logged_choice: Option<String> = None;
             // #310: Skip — a slow sync round must not be followed by a burst
             // of back-to-back block requests to peers.
-            let mut interval = timing::cadence_interval(std::time::Duration::from_secs(2));
+            let mut interval = timing::cadence_interval(sync_driver::TICK_INTERVAL);
             loop {
-                interval.tick().await;
+                // Every response wakes the tick so a freed range slot is
+                // refilled at once; the interval bounds timeout detection.
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = wake_for_loop.notified() => {}
+                }
                 // Snapshot every CONNECTED peer with the head it advertises. The
                 // scan is split from the choice deliberately: `best_h` (the sync
                 // TARGET) is the highest head anyone advertises, whereas the peer
@@ -3047,7 +3053,6 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     Arc<citrate_network::peer::Peer>,
                 )> = Vec::new();
                 let mut best_h: u64 = 0;
-                let mut best_hash = citrate_consensus::types::Hash::new([0u8; 32]);
                 for p in pm_for_sync.get_all_peers() {
                     let info = p.info.read().await;
                     if info.state != citrate_network::peer::PeerState::Connected {
@@ -3055,7 +3060,6 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     }
                     if info.head_height > best_h {
                         best_h = info.head_height;
-                        best_hash = info.head_hash;
                     }
                     connected_peers.push((
                         sync_peer::SyncCandidate {
@@ -3099,33 +3103,24 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 if target > 0 {
                     sync_for_loop.set_target(target).await;
                 }
-                // Choose a peer to pull from — see node/src/sync_peer.rs for the
-                // policy and the two live wedges it closes. In short: only peers
-                // whose advertised head is ABOVE our applied tip are candidates
-                // (a same-height peer serves back our own anchor and we re-import
-                // it forever), and the timeout penalty de-prefers a peer without
-                // ever vetoing the last one that could actually serve us.
-                let candidates: Vec<sync_peer::SyncCandidate> =
-                    connected_peers.iter().map(|(c, _)| c.clone()).collect();
-                let chosen_id = {
-                    let sel = sync_peers_for_loop.lock().await;
-                    sel.select(&candidates, applied_height)
-                        .map(|c| c.id.clone())
-                };
-                // #155: log WHICH PEER WE ARE PULLING FROM — but only when it
-                // CHANGES.
-                //
-                // Every sync bug this week came down to "we were asking the wrong
-                // peer", and answering that took SSH onto the fleet and grepping
-                // the SERVER's journal for our own peer id, because the node never
-                // said who it had chosen. That is the single most valuable line
-                // the sync driver can emit and it did not exist.
-                //
-                // Change-triggered, so volume is near zero on a converged node and
-                // rises exactly when selection is thrashing — which is the thing
-                // worth seeing. A per-tick log would be 30 lines/minute of noise
-                // that nobody reads, and the interesting event would be invisible
-                // inside it.
+                // The request side lives in sync_driver.rs (shared with the
+                // multi-peer sync test). This loop only gathers the peers and
+                // acts on what the driver reports: SYNCPEER logging, eviction of
+                // closed connections, and drop-and-re-handshake after repeated
+                // timeouts.
+                let tick_peers: Vec<sync_driver::TickPeer> = connected_peers
+                    .iter()
+                    .map(|(c, p)| sync_driver::TickPeer {
+                        id: citrate_network::peer::PeerId(c.id.clone()),
+                        head_height: c.head_height,
+                        peer: p.clone(),
+                    })
+                    .collect();
+                let report = driver_for_loop
+                    .tick(&storage_for_sync, target, &tick_peers)
+                    .await;
+                // #155: log WHICH PEER WE ARE PULLING FROM, only when it changes.
+                let chosen_id = report.chosen.clone();
                 if chosen_id != last_logged_choice {
                     match (&chosen_id, &last_logged_choice) {
                         (Some(now), Some(before)) => tracing::info!(
@@ -3133,196 +3128,52 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             before.get(..14).unwrap_or(before),
                             now.get(..14).unwrap_or(now),
                             applied_height,
-                            candidates.len()
+                            tick_peers.len()
                         ),
                         (Some(now), None) => tracing::info!(
                             "SYNCPEER selected {} (applied={} candidates={})",
                             now.get(..14).unwrap_or(now),
                             applied_height,
-                            candidates.len()
+                            tick_peers.len()
                         ),
                         (None, Some(before)) => tracing::info!(
                             "SYNCPEER lost source (was {}, applied={} candidates={})",
                             before.get(..14).unwrap_or(before),
                             applied_height,
-                            candidates.len()
+                            tick_peers.len()
                         ),
                         (None, None) => {}
                     }
-                    last_logged_choice = chosen_id.clone();
+                    last_logged_choice = chosen_id;
                 }
-                let request_peer: Option<Arc<citrate_network::peer::Peer>> =
-                    if let Some(id) = chosen_id {
-                        connected_peers
-                            .iter()
-                            .find(|(c, _)| c.id == id)
-                            .map(|(_, p)| p.clone())
-                    } else if applied_height < target {
-                        // We have EVIDENCE we are behind (a gossiped block, a Hello,
-                        // a rejected far-ahead block) but no connected peer admits to
-                        // a head above ours — their advertisements are stale or were
-                        // never updated. Rotate across all connected peers so we keep
-                        // asking rather than parking idle; rotation (not a fixed pick)
-                        // so we don't spin forever on one that only serves a side
-                        // branch.
-                        if connected_peers.is_empty() {
-                            None
-                        } else {
-                            let i = (rotate_idx as usize)
-                                .checked_rem(connected_peers.len())
-                                .unwrap_or(0);
-                            rotate_idx = rotate_idx.wrapping_add(1);
-                            connected_peers.get(i).map(|p| p.1.clone())
-                        }
+                // #151: a request that fails to send counts against the peer; a
+                // closed channel is terminal, so evict it for re-dial (#149).
+                for (pid, fails) in report.send_failed {
+                    let Some(peer) = pm_for_sync.get_peer(&pid) else {
+                        continue;
+                    };
+                    if peer.is_closed() {
+                        pm_for_sync.remove_peer(&pid).await;
+                        sync_peers_for_loop.lock().await.reset(&pid.0);
+                        tracing::warn!(
+                            "Sync peer {} has a closed connection — evicted so it can \
+                             re-handshake (it was being selected and silently failing)",
+                            pid.0
+                        );
                     } else {
-                        None
-                    };
-                if let Some(peer) = request_peer {
-                    let _ = best_hash; // anchor uses the applied tip, not best_hash
-                                       // Anchor every request on our current PERSISTED tip so sync
-                                       // walks forward batch by batch. The pre-fix logic preferred
-                                       // `last_requested_header`, which latched onto the first anchor
-                                       // (the genesis zero-hash) and never advanced — so any chain
-                                       // longer than one batch stalled at the first batch forever
-                                       // even once pending-clearing let requests complete. The tip
-                                       // advances as synced blocks persist (Blocks handler →
-                                       // put_block), so this drives forward progress to the head.
-                                       // Anchor sync on the APPLIED (execute-on-receive selected)
-                                       // tip — NOT the height index. `get_latest_height` /
-                                       // `get_block_by_height` return the highest STORED block,
-                                       // which on a follower that is behind is a gossiped tip
-                                       // stored far ahead of the applied chain (with the whole
-                                       // range below it missing), or a non-selected sibling
-                                       // (`put_block` is last-writer-wins per height). Anchoring
-                                       // there made the node request blocks AFTER a gap it had
-                                       // never filled: the server resolves that unknown/ahead
-                                       // anchor to nothing servable and replies "Sending 0 blocks",
-                                       // so the applied tip never advanced — the exact boot stall at
-                                       // 5580 while the stored height silently tracked the
-                                       // producer's tip. The applied tip is the last block we truly
-                                       // extended state with, so requesting ITS children is the gap
-                                       // we actually need. Genesis sentinel when nothing is applied.
-                    let (start_from, start_height) = storage_for_sync
-                        .blocks
-                        .get_applied_tip()
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| (citrate_consensus::types::Hash::new([0u8; 32]), 0));
-                    // Request next headers and blocks from our last known point only if not saturated
-                    let (ph, pb) = sync_for_loop.pending_counts().await;
-                    // #151: a request that FAILS TO SEND must count against this peer.
-                    //
-                    // Both calls below were `let _ = ...`. A failed send records no
-                    // pending request, so it can never time out — and the penalty box
-                    // (#136) is driven ENTIRELY by timeouts. So a peer whose channel had
-                    // closed was never de-preferred and never dropped, while the selector
-                    // kept choosing it on the stale advertised head a dead peer still
-                    // carries. Every request evaporated, silently, forever.
-                    //
-                    // Instrumented on chain 40204 after a 150s network interruption:
-                    //
-                    //   TICKTRACE 481 F1 ph=0 pb=0 anchor=f15e3524 peer=noise_2b492467
-                    //   TICKTRACE 481 F2 req_headers=false
-                    //   TICKTRACE 481 F3 req_blocks=false
-                    //
-                    // every 2s indefinitely — pending maps EMPTY (so neither saturation
-                    // nor dedup), four peers connected, correct target, zero timeouts
-                    // logged. The node was retrying a corpse.
-                    //
-                    // Crediting a send failure as a timeout is the right equivalence:
-                    // both mean "this peer did not give us blocks", which is exactly what
-                    // the penalty box acts on. That feeds the EXISTING escalation rather
-                    // than adding a second policy that could disagree with it.
-                    let mut send_failed = false;
-                    if ph < 8
-                        && sync_for_loop
-                            .request_headers(&peer, start_from)
-                            .await
-                            .is_err()
-                    {
-                        send_failed = true;
-                    }
-                    if pb < 8
-                        && sync_for_loop
-                            .request_blocks(&peer, start_from, start_height)
-                            .await
-                            .is_err()
-                    {
-                        send_failed = true;
-                    }
-                    if send_failed {
-                        let pid = peer.info.read().await.id.clone();
-                        let fails = {
-                            let mut sel = sync_peers_for_loop.lock().await;
-                            sel.record_timeout(&pid.0)
-                        };
-                        // A closed channel is terminal, not slow: the writer task is gone
-                        // and no future send can succeed. Evict now so the discovery
-                        // re-dial (#149) replaces it, rather than waiting out a penalty
-                        // count that a corpse can never earn.
-                        if peer.is_closed() {
-                            pm_for_sync.remove_peer(&pid).await;
-                            sync_peers_for_loop.lock().await.reset(&pid.0);
-                            tracing::warn!(
-                                "Sync peer {} has a closed connection — evicted so it can \
-                                 re-handshake (it was being selected and silently failing)",
-                                pid.0
-                            );
-                        } else {
-                            tracing::warn!(
-                                "Sync request to {} failed to send ({} consecutive) — \
-                                 de-preferring it as a source",
-                                pid.0,
-                                fails
-                            );
-                        }
+                        tracing::warn!(
+                            "Sync request to {} failed to send ({} consecutive) — \
+                             de-preferring it as a source",
+                            pid.0,
+                            fails
+                        );
                     }
                 }
-                // Retire timed-out requests and penalize the peer that owed them.
-                //
-                // #150 — THERE IS NO SEPARATE RETRY QUEUE ANY MORE, ON PURPOSE.
-                //
-                // A timed-out request was anchored at the applied tip AT THE TIME
-                // IT WAS SENT. By the time any retry fires (2-32s later under the
-                // old backoff) the tip has moved, so re-requesting that anchor asks
-                // for a range the node has already applied. Measured live on a
-                // cold-syncing node: the same four ranges re-imported 30, 25, 24 and
-                // 22 times each, all at or below the applied tip, while forward
-                // progress collapsed from ~700 blocks/min to ~15/min. The retries
-                // also consumed the in-flight budget (`pending_counts() < 8`) that
-                // the ONE useful request needs, and were issued to
-                // `get_all_peers().first()` — an arbitrary peer, not the selected
-                // sync source — so they frequently timed out again and re-queued.
-                //
-                // The 2s tick at the top of this loop already re-issues a request
-                // anchored at the CURRENT applied tip to the CURRENTLY SELECTED
-                // peer. That is the retry, and unlike a queued one it can never be
-                // stale. The old machinery was a second, worse retry path racing
-                // the good one, plus an `attempt_counts` map that was never pruned.
-                //
-                // Timeouts still do their real job below: they penalize the peer.
-                for (_h, pid) in sync_for_loop.check_timeouts().await {
-                    // Penalize the peer that timed out. This DE-PREFERS it as a
-                    // sync source; it can never veto the last peer able to serve
-                    // us (sync_peer.rs invariant I2).
-                    let pf = {
-                        let mut sel = sync_peers_for_loop.lock().await;
-                        sel.record_timeout(&pid.0)
-                    };
-                    // Lower peer score
+                // Timeouts de-prefer the peer (sync_peer.rs I2) and, after
+                // repeated ones, drop it (never ban) so it re-handshakes — unless
+                // it is our only peer, which would strand a fresh node.
+                for (pid, pf) in report.timed_out {
                     pm_for_sync.update_peer_score(&pid, -5).await;
-                    // Drop (do NOT ban) a peer after repeated sync timeouts.
-                    // A sync timeout is not evidence of malice, and permanently
-                    // banning a pinned bootstrap/producer for one is exactly how
-                    // the fleet split-brained: a bootnode banned its only block
-                    // source and could never re-sync. Removing the peer lets it
-                    // re-handshake fresh; we reset the failure counter so the
-                    // reconnection starts from a clean slate.
-                    // Never drop a peer if it is our ONLY one — doing so strands a
-                    // fresh node with zero peers and it wedges permanently (observed:
-                    // a follower syncing a deep chain hit a few timeouts, dropped its
-                    // sole source, and never recovered). Only prune when another peer
-                    // can take over; otherwise keep retrying against the one we have.
                     let (total_peers, _, _) = pm_for_sync.get_peer_counts().await;
                     if pf >= 5 && total_peers > 1 && pm_for_sync.get_peer(&pid).is_some() {
                         pm_for_sync.remove_peer(&pid).await;
@@ -3332,8 +3183,6 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             pid.0
                         );
                     } else if pf >= 5 {
-                        // Sole peer: reset the counter so we keep trying it rather
-                        // than freezing after 5 timeouts.
                         sync_peers_for_loop.lock().await.reset(&pid.0);
                     }
                 }
@@ -3378,8 +3227,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let finality_gadget_for_net = finality_gadget.clone();
         // #85: the success half of the sync-peer accounting (invariant I3) —
         // the tick task can only ever observe timeouts, so the peer that
-        // actually answers has to be credited from the receive side.
-        let sync_peers_for_rx = sync_peers.clone();
+        // actually answers is credited from the receive side, inside
+        // `SyncDriver::ingest_blocks`.
+        let driver_for_rx = sync_driver.clone();
 
         // #149: how many inbound messages the loop has taken off the channel.
         // Read by the stall detector; see it for why this exists.
@@ -3402,7 +3252,67 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // wedging a cold node at the first out-of-order block (observed live in
             // the contract-deploy region). Bounded to cap memory if a parent never
             // arrives; the sync loop independently re-requests missing parents.
-            let mut orphan_blocks: Vec<citrate_consensus::types::Block> = Vec::new();
+            // Sync admission worker: admits validated sync responses in order,
+            // executing each block (execute-on-receive) and scoring the peer.
+            // Owns the orphan buffer of blocks whose parent is still on the way.
+            let (sync_admit_tx, mut sync_admit_rx) =
+                tokio::sync::mpsc::channel::<sync_driver::ReceivedBlocks>(sync_driver::ADMIT_QUEUE);
+            {
+                let driver = driver_for_rx.clone();
+                let admission = admission_for_net.clone();
+                let storage = storage_for_handler.clone();
+                let max_seen = max_seen_for_rx.clone();
+                let attested = attested_for_rx.clone();
+                tokio::spawn(async move {
+                    let mut orphan_blocks: Vec<citrate_consensus::types::Block> = Vec::new();
+                    // At most 10 SYNCSCORE lines a minute: an idle node whose
+                    // peers have nothing new answers every request this way.
+                    let score_log = admission::LogBudget::new(10, 60);
+                    while let Some(received) = sync_admit_rx.recv().await {
+                        let pid = received.pid.clone();
+                        let target = max_seen.load(std::sync::atomic::Ordering::Relaxed);
+                        let report = driver
+                            .admit_received(
+                                &admission,
+                                &storage,
+                                &mut orphan_blocks,
+                                received,
+                                target,
+                                // F2: record each signed, genesis-linked synced
+                                // block as an attested candidate.
+                                |block| {
+                                    attested.observe(&storage, block);
+                                },
+                            )
+                            .await;
+                        // #155: INFO, only for non-Material responses, so a
+                        // healthy node is silent and a misbehaving one is loud.
+                        if report.quality != sync_peer::ServeQuality::Material {
+                            let d = score_log.check();
+                            if d.suppressed_in_previous_window > 0 {
+                                tracing::info!(
+                                    "SYNCSCORE: {} more non-material response(s) in the previous \
+                                     60s (lines suppressed)",
+                                    d.suppressed_in_previous_window
+                                );
+                            }
+                            if !d.emit {
+                                continue;
+                            }
+                            tracing::info!(
+                                "SYNCSCORE peer={} {:?} new={} anchor={} applied={} gap={} score={}",
+                                pid.0.get(..14).unwrap_or(&pid.0),
+                                report.quality,
+                                report.newly_admitted,
+                                report.anchor,
+                                report.applied_now,
+                                report.gap,
+                                report.score
+                            );
+                        }
+                    }
+                });
+            }
             while let Some((pid, msg)) = in_rx.recv().await {
                 // #149 liveness heartbeat. Bumped BEFORE the message is handled,
                 // so a loop that is stuck inside a handler stops advancing this
@@ -3517,7 +3427,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             .await;
                     }
                     NetworkMessage::Headers { headers } => {
-                        let _ = sync_for_rx.handle_headers(&pid, headers).await;
+                        driver_for_rx.ingest_headers(&pid, headers).await;
                     }
                     NetworkMessage::GetTransactions { hashes } => {
                         let mut txs = Vec::new();
@@ -3784,212 +3694,32 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                 b,
                             );
                         }
-                        // WP-H.4: handle_blocks now validates each block
-                        let _ = sync_for_rx.handle_blocks(&pid, blocks).await;
-                        // WP-H.5: Drain validated blocks and persist to chain store.
-                        // Without this, synced blocks live only in SyncManager memory
-                        // and are never integrated into the DAG.
-                        let mut pending = sync_for_rx.drain_validated_blocks().await;
-                        // #85 (deep bulk-sync wedge): admit in topological
-                        // (height-ascending) order — every parent (selected OR
-                        // merge) has strictly lower height than its child, and the
-                        // header-height check enforces child = parent + 1, so a
-                        // height sort is a valid topological order. Retry any
-                        // orphans buffered from earlier batches alongside the fresh
-                        // drain: a parent delivered now can unblock a child that
-                        // arrived (and was buffered) in a prior, out-of-order batch.
-                        // CHAIN-B-A005: only re-scan the orphan buffer when this
-                        // batch actually delivered something new. An empty (or
-                        // duplicate-only) `Blocks` message used to trigger a full
-                        // O(buffer) pass — append + fixpoint loop, each entry a
-                        // chain has_block + DAG has_block + validate — on the
-                        // single inbound task, at up to 200 msg/s. When the fresh
-                        // drain is empty, nothing can have become admissible, so
-                        // leave the buffer untouched and skip the scan (the
-                        // peer-credit logic below still runs with newly_admitted=0).
-                        let reprocessed_orphans = !pending.is_empty();
-                        if reprocessed_orphans {
-                            pending.append(&mut orphan_blocks);
-                            // CHAIN-B-A005: de-duplicate by HASH (interleaving-
-                            // proof) and bound by BOTH count and serialized bytes.
-                            // The old `sort_by_key(height)+dedup_by_key(hash)` only
-                            // collapsed adjacent equal hashes and bounded by count
-                            // alone (20_000 × ~1 MiB ≈ 20 GB).
-                            pending = admission::bound_orphan_buffer(pending);
-                        }
-
-                        // Fixpoint: a block that fails admission ONLY because its
-                        // parent isn't applied yet is DEFERRED (buffered), never
-                        // dropped. The pre-fix code dropped it, so a re-requested
-                        // child was re-dropped forever whenever its parent rode a
-                        // separate not-yet-arrived batch — the live cold-sync wedge.
-                        // #153: how much of this response was genuinely NEW. A
-                        // response that admits nothing is not service, however
-                        // well-formed it was — see the credit call after the loop.
-                        let mut newly_admitted: usize = 0;
-                        let mut highest_admitted: u64 = 0;
-                        loop {
-                            let mut progressed = false;
-                            let mut deferred: Vec<citrate_consensus::types::Block> = Vec::new();
-                            for block in std::mem::take(&mut pending) {
-                                // SYNC-S1 / D2: one call, idempotent and
-                                // crash-safe. The pre-D2 body open-coded
-                                // store_block -> add_block -> put_block and
-                                // began with `if has_block(chain) { continue }`
-                                // — a chain-store-only check that skipped a
-                                // block whose DAG half was already written,
-                                // and whose `Err(BlockExists) => {}` arm then
-                                // dropped the block without ever reaching
-                                // put_block. An OOM kill between those two
-                                // writes therefore froze the applied tip
-                                // permanently (boot-3 @ 10944). Presence is
-                                // now established per-store inside `admit`.
-                                match admission_for_net.admit(&block).await {
-                                    admission::AdmitOutcome::Admitted { completed_partial } => {
-                                        progressed = true;
-                                        // #153: this block was NEW. Only this arm
-                                        // counts — `AlreadyAdmitted` is a block we
-                                        // already had, which is exactly what a peer
-                                        // at our own height serves back forever.
-                                        newly_admitted = newly_admitted.saturating_add(1);
-                                        if block.header.height > highest_admitted {
-                                            highest_admitted = block.header.height;
-                                        }
-                                        // F2: record the signed, genesis-linked synced block
-                                        // as an attested candidate (see the H1 note above).
-                                        attested_for_rx.observe(&storage_for_handler, &block);
-                                        if completed_partial {
-                                            // D4a: admission.rs already warns (budgeted); a
-                                            // per-block warn here doubled the storm.
-                                            tracing::debug!(
-                                                "Completed a partial admission of synced block {} @ {}",
-                                                hex::encode(&block.header.block_hash.as_bytes()[..8]),
-                                                block.header.height
-                                            );
-                                        }
-                                    }
-                                    // Fully present already: no progress, but
-                                    // not an orphan either — drop it from the
-                                    // fixpoint set.
-                                    admission::AdmitOutcome::AlreadyAdmitted => {}
-                                    // Parent not admitted yet — DEFER, never
-                                    // drop. A parent riding a later batch can
-                                    // still unblock this child.
-                                    admission::AdmitOutcome::Deferred { missing_parent } => {
-                                        tracing::debug!(
-                                            "Deferred synced block {} @ {}: missing parent {}",
-                                            hex::encode(&block.header.block_hash.as_bytes()[..8]),
-                                            block.header.height,
-                                            hex::encode(&missing_parent.as_bytes()[..8])
-                                        );
-                                        deferred.push(block);
-                                    }
-                                    admission::AdmitOutcome::Rejected(why) => {
-                                        tracing::warn!(
-                                            "Rejected inconsistent synced block {} @ {}: {}",
-                                            hex::encode(&block.header.block_hash.as_bytes()[..8]),
-                                            block.header.height,
-                                            why
-                                        );
-                                    }
-                                }
-                            }
-                            pending = deferred;
-                            if !progressed {
-                                break;
-                            }
-                        }
-                        // Buffer unresolved orphans for the next Blocks batch (their
-                        // parents are still en route). CHAIN-B-A005: bound the
-                        // buffer by BOTH count and serialized bytes, de-duplicated
-                        // by hash, so a parent that never arrives can't grow it.
-                        // Only touch the buffer when we actually reprocessed it;
-                        // otherwise the fresh drain was empty and `orphan_blocks`
-                        // already holds the (bounded) buffer unchanged.
-                        if reprocessed_orphans {
-                            orphan_blocks =
-                                admission::bound_orphan_buffer(std::mem::take(&mut pending));
-                        }
-
-                        // #153 — CREDIT THE PEER ON WHAT IT ACTUALLY DELIVERED.
-                        //
-                        // Live on chain 40204: our node and boot3 both sat at height
-                        // 177,771. Gossip had inflated boot3's advertised head to the
-                        // network tip (~213k), so it passed invariant I1 and — every
-                        // peer being tied at the inflated head — won the peer-id
-                        // tie-break, being the lowest of the four. It answered
-                        // "Sending 1 blocks" thirty times in three minutes: our own
-                        // anchor group, nothing new. Each of those replies called
-                        // `record_success`, clearing its penalty and confirming it as
-                        // our preferred source. We sent it 63 of 66 requests while
-                        // rpc-1 (at the tip) and boot1/boot2 (17k ahead) went unasked,
-                        // and throughput fell from 445 to 18 blocks/min — losing
-                        // ground to a chain growing at 30.
-                        //
-                        // The distinction the loop above already computes, and used to
-                        // throw away, is the whole fix: `Admitted` is service,
-                        // `AlreadyAdmitted` is not.
-                        // #155: ONE call, and it needs the GAP. The same block count
-                        // means opposite things at different distances from the tip:
-                        // one block when we are one behind is a complete answer, one
-                        // block when we are 36,000 behind is a peer that cannot carry
-                        // us. Judging it absolutely is what produced two successive
-                        // dead bands; the gap is the yardstick.
+                        // Validate here (and stop the range's timer); admission,
+                        // which executes each block and verifies its state root,
+                        // runs on the sync admission worker so a slow apply does
+                        // not hold up this loop. See sync_driver.rs.
+                        let received = driver_for_rx.receive_blocks(&pid, blocks).await;
+                        // Bounded wait: a full queue (slow apply plus a burst of
+                        // answers) drops the response and re-plans its range
+                        // instead of holding this loop.
+                        match driver_for_rx
+                            .hand_to_admission(
+                                &sync_admit_tx,
+                                received,
+                                sync_driver::ADMIT_HANDOFF_WAIT,
+                            )
+                            .await
                         {
-                            let applied_now = storage_for_handler
-                                .blocks
-                                .get_applied_tip()
-                                .ok()
-                                .flatten()
-                                .map(|(_, h)| h)
-                                .unwrap_or(0);
-                            let target = max_seen_for_rx.load(std::sync::atomic::Ordering::Relaxed);
-                            let gap = target.saturating_sub(applied_now);
-                            // #156: did our own applied tip pass the anchor we
-                            // asked from before this answer came back? If so the
-                            // duplicate is ours, not the peer's. Measured live:
-                            // rpc-1 serving a full 32/32 at 0.66s was scored
-                            // Barren 191 times and driven to the -8 floor for
-                            // answering exactly what we asked.
-                            let stale_anchor = sync_for_rx.last_block_anchor_height() < applied_now;
-                            let mut sel = sync_peers_for_rx.lock().await;
-                            let quality = sel.record_serve(
-                                &pid.0,
-                                newly_admitted,
-                                highest_admitted,
-                                gap,
-                                32, // SyncConfig::block_batch_size
-                                stale_anchor,
-                            );
-                            // #155: INFO, not debug. This is the only external
-                            // evidence of how the selector is scoring peers, and
-                            // having it at `debug!` meant it never appeared under
-                            // the `RUST_LOG=info` every node actually runs — a
-                            // score-based model whose scores were unobservable.
-                            //
-                            // Rate is bounded by construction: only non-Material
-                            // responses log, so a healthy converged node is silent
-                            // and a misbehaving one is loud. That is the ratio we
-                            // want in production, not the reverse.
-                            if quality != sync_peer::ServeQuality::Material {
-                                // #156: anchor and applied tip printed WITH the
-                                // verdict. A duplicate whose anchor equals our
-                                // applied tip is a different defect from one
-                                // whose anchor is behind it — the first means
-                                // the server resolved our anchor to nothing
-                                // above it, the second means we asked a stale
-                                // question. Both look identical without these
-                                // two numbers, which is why six runs could not
-                                // separate them.
-                                tracing::info!(
-                                    "SYNCSCORE peer={} {:?} new={} anchor={} applied={} gap={} score={}",
-                                    pid.0.get(..14).unwrap_or(&pid.0),
-                                    quality,
-                                    newly_admitted,
-                                    sync_for_rx.last_block_anchor_height(),
-                                    applied_now,
-                                    gap,
-                                    sel.score(&pid.0)
+                            sync_driver::Handoff::Queued => {}
+                            sync_driver::Handoff::Dropped => {
+                                tracing::debug!(
+                                    "sync admission queue full; dropped a Blocks response from {}",
+                                    pid
+                                );
+                            }
+                            sync_driver::Handoff::Closed => {
+                                tracing::warn!(
+                                    "sync admission worker is gone; dropping a Blocks response"
                                 );
                             }
                         }

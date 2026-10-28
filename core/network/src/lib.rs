@@ -13,14 +13,11 @@
 //     sync.rs          SyncManager.state              (Arc<RwLock<SyncState>>)
 //     sync.rs          SyncManager.current_height     (Arc<RwLock<u64>>)
 //     sync.rs          SyncManager.target_height      (Arc<RwLock<u64>>)
-//     sync.rs          SyncManager.downloaded_headers (Arc<RwLock<Vec>>)
 //     sync.rs          SyncManager.downloaded_blocks  (Arc<RwLock<Vec>>)
-//     sync.rs          SyncManager.block_queue        (Arc<RwLock<VecDeque>>)
-//     sync.rs          SyncManager.header_queue       (Arc<RwLock<VecDeque>>)
-//     sync.rs          SyncManager.pending_headers    (Arc<RwLock<HashMap>>)
 //     sync.rs          SyncManager.pending_blocks     (Arc<RwLock<HashMap>>)
 //     sync.rs          SyncManager.last_header_hash   (Arc<RwLock<Option<Hash>>>)
-//     sync.rs          SyncManager.last_requested_header (Arc<RwLock<Option<Hash>>>)
+//     sync.rs          SyncManager.ranges             (Arc<std::sync::Mutex<RangeScheduler>>,
+//                      never held across an await or while taking another lock)
 //
 //   Level 3:
 //     block_propagation.rs  BlockPropagation.block_sources     (Arc<RwLock<HashMap>>)
@@ -50,8 +47,6 @@
 //   - peer.rs remove_peer holds Peer.info.read() + stats.write() simultaneously — safe
 //     because info is Level 1 and stats is Level 1 (same level, but info is read-only
 //     and always acquired before stats in every path).
-//   - sync.rs start_block_download holds downloaded_headers.read() + block_queue.write()
-//     simultaneously — safe because no reverse ordering exists.
 //   - discovery.rs find_peers holds connected_peers.read() while calling
 //     peer_manager.get_peer_counts() which acquires stats.read() — safe (Level 1 read-read).
 
@@ -80,6 +75,7 @@ pub mod peer;
 pub mod protocol;
 pub mod relay;
 pub mod sync;
+pub mod sync_ranges;
 pub mod transaction_gossip;
 pub mod transport;
 pub mod types;
@@ -98,6 +94,10 @@ pub use peer::{Peer, PeerId, PeerInfo, PeerManager, PeerManagerConfig};
 pub use protocol::{ModelMetadata, NetworkMessage, Protocol, ProtocolVersion};
 pub use relay::{RelayError, RelayService};
 pub use sync::{SyncConfig, SyncManager, SyncState};
+pub use sync_ranges::{
+    BlockLink, BlocksMatch, Expired, PeerSlot, Plan, RangeConfig, RangeCounters, RangeScheduler,
+    SyncRequest,
+};
 pub use transaction_gossip::{GossipConfig as TxGossipConfig, TransactionGossip};
 pub use transport::NetworkTransport;
 pub use types::{NetworkConfig, NetworkError};

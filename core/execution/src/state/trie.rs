@@ -21,7 +21,7 @@ use sha3::{Digest, Keccak256};
 use std::collections::HashMap;
 
 /// Merkle Patricia Trie node
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub enum TrieNode {
     #[default]
     Empty,
@@ -40,6 +40,51 @@ pub enum TrieNode {
 }
 
 // Default now derived above with Empty
+
+/// Test-only operation counters: how many nodes were cloned and how many
+/// were encoded, so tests can pin the cost of `insert`/`remove`/`root_hash`
+/// rather than time it.
+#[cfg(test)]
+pub(crate) mod op_counters {
+    use std::cell::Cell;
+    thread_local! {
+        pub static NODE_CLONES: Cell<u64> = const { Cell::new(0) };
+        pub static NODE_ENCODES: Cell<u64> = const { Cell::new(0) };
+    }
+    pub fn reset() {
+        NODE_CLONES.with(|c| c.set(0));
+        NODE_ENCODES.with(|c| c.set(0));
+    }
+    pub fn clones() -> u64 {
+        NODE_CLONES.with(|c| c.get())
+    }
+    pub fn encodes() -> u64 {
+        NODE_ENCODES.with(|c| c.get())
+    }
+}
+
+// Written out (not derived) only so tests can count node copies.
+impl Clone for TrieNode {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        op_counters::NODE_CLONES.with(|c| c.set(c.get() + 1));
+        match self {
+            TrieNode::Empty => TrieNode::Empty,
+            TrieNode::Leaf { key, value } => TrieNode::Leaf {
+                key: key.clone(),
+                value: value.clone(),
+            },
+            TrieNode::Branch { children, value } => TrieNode::Branch {
+                children: children.clone(),
+                value: value.clone(),
+            },
+            TrieNode::Extension { prefix, node } => TrieNode::Extension {
+                prefix: prefix.clone(),
+                node: node.clone(),
+            },
+        }
+    }
+}
 
 /// Merkle Patricia Trie
 ///
@@ -60,6 +105,13 @@ pub struct Trie {
     cache: HashMap<Vec<u8>, Vec<u8>>,
     /// Set by any `remove`: the shape may no longer be the insert-only shape.
     removed: bool,
+    /// `legacy_root_hash()` and `root_hash()`, remembered until the next
+    /// `insert`/`remove`. Each is a pure function of the trie, so remembering
+    /// it cannot change any result; it only stops re-encoding storage tries
+    /// that did not change, which the per-block state root otherwise does for
+    /// every contract.
+    legacy_memo: std::sync::OnceLock<Hash>,
+    root_memo: std::sync::OnceLock<Hash>,
 }
 
 impl Trie {
@@ -68,6 +120,8 @@ impl Trie {
             root: TrieNode::Empty,
             cache: HashMap::new(),
             removed: false,
+            legacy_memo: std::sync::OnceLock::new(),
+            root_memo: std::sync::OnceLock::new(),
         }
     }
 
@@ -78,6 +132,7 @@ impl Trie {
         // insert (the result replaces it either way).
         self.root = Self::insert_node(std::mem::take(&mut self.root), &nibbles, value.clone());
         self.cache.insert(key, value);
+        self.forget_roots();
     }
 
     fn insert_node(node: TrieNode, key: &[u8], value: Vec<u8>) -> TrieNode {
@@ -196,6 +251,13 @@ impl Trie {
         self.cache.remove(key);
         // Even a remove of an absent key can reshape a branch on its path.
         self.removed = true;
+        self.forget_roots();
+    }
+
+    /// Drop the remembered roots; every mutation calls this.
+    fn forget_roots(&mut self) {
+        self.legacy_memo = std::sync::OnceLock::new();
+        self.root_memo = std::sync::OnceLock::new();
     }
 
     fn remove_node(node: TrieNode, key: &[u8]) -> TrieNode {
@@ -255,11 +317,15 @@ impl Trie {
     /// A trie that has never seen a remove already has the insert-only shape,
     /// so this is its structural hash. Otherwise the insert-only shape of the
     /// current set is rebuilt (keys sorted, for a fixed build sequence) and
-    /// hashed.
+    /// hashed. Remembered until the next mutation.
     pub fn root_hash(&self) -> Hash {
         if !self.removed {
             return self.legacy_root_hash();
         }
+        *self.root_memo.get_or_init(|| self.set_root_hash())
+    }
+
+    fn set_root_hash(&self) -> Hash {
         let mut entries: Vec<(&Vec<u8>, &Vec<u8>)> = self.cache.iter().collect();
         entries.sort_unstable();
         let mut rebuilt = Trie::new();
@@ -272,16 +338,34 @@ impl Trie {
     /// The structural hash of the trie as built, which depends on its remove
     /// history. Consensus uses it only for state roots below the storage-root
     /// hardening height, so historical blocks keep the root they were produced
-    /// with.
+    /// with. Remembered until the next mutation.
     pub fn legacy_root_hash(&self) -> Hash {
+        *self.legacy_memo.get_or_init(|| self.structural_hash())
+    }
+
+    fn structural_hash(&self) -> Hash {
         let encoded = self.encode_node(&self.root);
         let mut hasher = Keccak256::new();
         hasher.update(&encoded);
         Hash::new(hasher.finalize().into())
     }
 
+    /// `root_hash()` and `legacy_root_hash()` computed from the nodes,
+    /// bypassing any remembered value.
+    #[cfg(test)]
+    pub(crate) fn recompute_root_hashes(&self) -> (Hash, Hash) {
+        let root = if self.removed {
+            self.set_root_hash()
+        } else {
+            self.structural_hash()
+        };
+        (root, self.structural_hash())
+    }
+
     #[allow(clippy::only_used_in_recursion)]
     fn encode_node(&self, node: &TrieNode) -> Vec<u8> {
+        #[cfg(test)]
+        op_counters::NODE_ENCODES.with(|c| c.set(c.get() + 1));
         match node {
             TrieNode::Empty => vec![],
 
@@ -560,6 +644,97 @@ fn default_children() -> [Box<TrieNode>; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn k32(i: u32) -> Vec<u8> {
+        // Spread keys like hashed addresses so the trie branches.
+        let mut k = Keccak256::digest(i.to_be_bytes()).to_vec();
+        k.truncate(32);
+        k
+    }
+
+    fn filled(n: u32) -> Trie {
+        let mut t = Trie::new();
+        for i in 0..n {
+            t.insert(k32(i), vec![(i % 251) as u8; 8]);
+        }
+        t
+    }
+
+    /// One insert into a populated trie must touch the path to the key, not
+    /// copy the whole trie. Pre-fix `insert` began with `self.root.clone()`,
+    /// a deep copy of every node, so building an n-key trie was O(n^2) — and
+    /// the account trie is rebuilt from scratch for every block's state root.
+    #[test]
+    fn insert_does_not_copy_the_existing_trie() {
+        let mut t = filled(1000);
+        op_counters::reset();
+        t.insert(k32(5000), vec![1; 8]);
+        let clones = op_counters::clones();
+        assert!(
+            clones < 64,
+            "one insert into a 1000-key trie cloned {clones} nodes"
+        );
+    }
+
+    #[test]
+    fn remove_does_not_copy_the_existing_trie() {
+        let mut t = filled(1000);
+        op_counters::reset();
+        t.remove(&k32(7));
+        let clones = op_counters::clones();
+        assert!(
+            clones < 64,
+            "one remove from a 1000-key trie cloned {clones} nodes"
+        );
+    }
+
+    /// The root of an unchanged trie is not re-derived. Every block's state
+    /// root folds every contract's storage root, most of which did not change.
+    #[test]
+    fn root_hash_of_an_unchanged_trie_is_not_recomputed() {
+        let mut t = filled(1000);
+        let first = t.root_hash();
+        op_counters::reset();
+        assert_eq!(t.root_hash(), first);
+        assert_eq!(op_counters::encodes(), 0, "unchanged trie was re-encoded");
+        // A clone (state snapshot) carries the root with it.
+        let c = t.clone();
+        op_counters::reset();
+        assert_eq!(c.root_hash(), first);
+        assert_eq!(op_counters::encodes(), 0, "snapshot copy re-encoded");
+        // Any change invalidates it.
+        t.insert(k32(9999), vec![2; 8]);
+        let second = t.root_hash();
+        assert_ne!(second, first);
+        assert!(op_counters::encodes() > 0);
+        t.remove(&k32(9999));
+        assert_eq!(
+            (t.root_hash(), t.legacy_root_hash()),
+            t.recompute_root_hashes()
+        );
+    }
+
+    proptest::proptest! {
+        /// The remembered root always equals a fresh computation over the
+        /// current nodes, after any sequence of inserts and removes.
+        #[test]
+        fn prop_remembered_root_matches_recomputed(
+            ops in proptest::collection::vec((proptest::bool::ANY, 0u32..24, proptest::num::u8::ANY), 1..60),
+        ) {
+            let mut t = Trie::new();
+            for (insert, key, val) in ops {
+                if insert {
+                    t.insert(k32(key), vec![val; 4]);
+                } else {
+                    t.remove(&k32(key));
+                }
+                proptest::prop_assert_eq!(
+                    (t.root_hash(), t.legacy_root_hash()),
+                    t.recompute_root_hashes()
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_trie_insert_get() {
