@@ -228,12 +228,12 @@ pub fn require_executed_head_state(
         StateTag::Unpinned => Ok(()),
         StateTag::Number(n) if n == head_height => Ok(()),
         // Operator window: a recent height names a canonical block by definition.
-        StateTag::Number(n) if n < head_height && head_height - n <= window => {
+        StateTag::Number(n) if n < head_height && head_height.abs_diff(n) <= window => {
             served_recent(&format!("block {n}"), head_height)
         }
         StateTag::Number(n)
             if n > head_height
-                && n - head_height <= window
+                && n.abs_diff(head_height) <= window
                 && n <= storage.blocks.get_latest_height().unwrap_or(0) =>
         {
             served_recent(&format!("stored block {n}"), head_height)
@@ -253,15 +253,15 @@ pub fn require_executed_head_state(
                 if let Some(hd) = &header {
                     // Below the head: on the head's selected-parent chain.
                     if hd.height < head_height
-                        && head_height - hd.height <= window
-                        && reaches(storage, head_hash, head_height - hd.height, h)
+                        && head_height.abs_diff(hd.height) <= window
+                        && reaches(storage, head_hash, head_height.abs_diff(hd.height), h)
                     {
                         return served_recent(&format!("block {h}"), head_height);
                     }
                     // Stored above the head: its selected-parent chain reaches the head.
                     if hd.height > head_height
-                        && hd.height - head_height <= window
-                        && reaches(storage, h, hd.height - head_height, head_hash)
+                        && hd.height.abs_diff(head_height) <= window
+                        && reaches(storage, h, hd.height.abs_diff(head_height), head_hash)
                     {
                         return served_recent(&format!("stored block {h}"), head_height);
                     }
@@ -269,10 +269,14 @@ pub fn require_executed_head_state(
             }
             let detail = match header {
                 Some(header) => format!(
-                    "block {h} at height {} is not the executed head {head_height}",
+                    "block 0x{} at height {} is not the executed head {head_height}",
+                    hex::encode(h.as_bytes()),
                     header.height
                 ),
-                None => format!("block {h} is not known to this node"),
+                None => format!(
+                    "block 0x{} is not known to this node",
+                    hex::encode(h.as_bytes())
+                ),
             };
             Err(refuse(
                 detail,
