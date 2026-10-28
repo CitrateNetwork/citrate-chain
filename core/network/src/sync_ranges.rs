@@ -1827,4 +1827,104 @@ mod tests {
             blocks_of(&plan.requests)
         );
     }
+
+    /// A range with a failure since its last delivery stops planning above
+    /// it at once, before any hold: its retry goes out, nothing new above.
+    #[test]
+    fn a_failed_range_stops_planning_above_it_before_any_hold() {
+        let mut s = RangeScheduler::new(RangeConfig {
+            max_in_flight: 4,
+            ..RangeConfig::default()
+        });
+        let now = Instant::now();
+        let ps = peers(&["a", "b"], 10_000);
+        s.plan(now, 0, h(0), &ps);
+        s.in_flight.clear();
+        s.on_headers(&pid("a"), &headers(32, 300));
+        let p = blocks_of(&s.plan(now, 0, h(0), &ps).requests);
+        assert_eq!(p.len(), 4);
+        // The front range fails once (no hold yet); the next one delivers,
+        // which frees two slots.
+        s.on_blocks(&pid("a"), None, &[]);
+        s.on_blocks(&pid("a"), Some(32), &chain(32, 63));
+        let p = blocks_of(&s.plan(now, 0, h(0), &ps).requests);
+        assert_eq!(
+            p,
+            vec![(pid("b"), 0, 1, 31)],
+            "only the failed range is asked"
+        );
+        assert_eq!(s.counters().backoffs, 0);
+    }
+
+    /// After a dropped anchor, header requests wait twice the backoff; a
+    /// delivery lifts that.
+    #[test]
+    fn a_dropped_anchor_slows_header_requests_until_a_delivery() {
+        let cfg = RangeConfig {
+            max_in_flight: 1,
+            ..RangeConfig::default()
+        };
+        let mut s = RangeScheduler::new(cfg.clone());
+        let t0 = Instant::now();
+        let ps = peers(&["a", "b"], 10_000);
+        let headers_in = |plan: &Plan| {
+            plan.requests
+                .iter()
+                .filter(|r| matches!(r, SyncRequest::Headers { .. }))
+                .count()
+        };
+        let p = s.plan(t0, 10, h(10), &ps);
+        assert_eq!(headers_in(&p), 1);
+        s.in_flight.clear();
+        let bogus: Vec<(u64, Hash)> = (11..=200).map(|n| (n, Hash::new([n as u8; 32]))).collect();
+        s.on_headers_at(&pid("a"), &bogus, t0);
+        for _ in 0..2 {
+            let r = blocks_of(&s.plan(t0, 10, h(10), &ps).requests);
+            s.on_blocks(&r[0].0, None, &[]);
+        }
+        assert_eq!(s.counters().anchor_evictions, 1);
+        // (Drop the header request the failure rounds sent at t0, unanswered.)
+        s.header_req = None;
+        // One drop: no header request for 2 x header_backoff after the last.
+        let almost = t0 + cfg.header_backoff * 2 - Duration::from_millis(1);
+        assert_eq!(headers_in(&s.plan(almost, 10, h(10), &ps)), 0);
+        let due = t0 + cfg.header_backoff * 2;
+        assert_eq!(headers_in(&s.plan(due, 10, h(10), &ps)), 1);
+        // A delivery resets it.
+        s.header_req = None;
+        let t = due + cfg.retry_backoff * 4;
+        let r = blocks_of(&s.plan(t, 10, h(10), &ps).requests);
+        s.on_blocks(&r[0].0, Some(10), &chain(10, 41));
+        assert_eq!(s.header_strikes, 0);
+    }
+
+    /// When every peer has failed a range, the retry goes to the one whose
+    /// failure is oldest, not always to the top-ranked one.
+    #[test]
+    fn retries_rotate_through_the_peers_that_failed_a_range() {
+        let cfg = RangeConfig {
+            max_in_flight: 1,
+            ..RangeConfig::default()
+        };
+        let mut s = RangeScheduler::new(cfg.clone());
+        let mut at = Instant::now();
+        let b_first = vec![
+            PeerSlot::new(pid("b"), 10_000),
+            PeerSlot::new(pid("a"), 10_000),
+        ];
+        let a_first = peers(&["a", "b"], 10_000);
+        for expect in ["b", "a"] {
+            let p = blocks_of(&s.plan(at, 0, h(0), &b_first).requests);
+            assert_eq!(p[0].0, pid(expect));
+            s.on_blocks(&p[0].0, None, &[]);
+        }
+        // Ranking now puts a first; b failed longest ago, so b is next, then a.
+        for expect in ["b", "a", "b"] {
+            assert!(blocks_of(&s.plan(at, 0, h(0), &a_first).requests).is_empty());
+            at += s.streak.get(&1).map(|st| st.hold).unwrap_or_default();
+            let p = blocks_of(&s.plan(at, 0, h(0), &a_first).requests);
+            assert_eq!(p[0].0, pid(expect), "rotation");
+            s.on_blocks(&p[0].0, None, &[]);
+        }
+    }
 }
