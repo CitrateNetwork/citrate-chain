@@ -83,6 +83,13 @@
 #   smoke:        --skip CHECK[,CHECK] (orangeseed, admins, code, logs) printed as SKIP, never PASS
 #                 · --min-height N (60): wait (up to --gate-minutes) until every head is past N, so
 #                   FLEET AGREE compares a real common block, not block 0
+#                 · --logs-since EPOCH: the log scan's window start (unix seconds; default the
+#                   start record $STATE/started_at); the PASS/FAIL line always names the window
+#                 forge (admins) reads through the OPERATOR host's tunnel: the first inventory
+#                 host with "serve_recent_state_tags": N (r1006: citrate-prod-1, 64), whose
+#                 node.toml distribute writes with [rpc] serve_recent_state_tags = N. forge pins
+#                 every read to the block it started at, which a strict node (chain#425, the
+#                 default 0) refuses once the head moves. No such host: admins FAILs, naming the key.
 #   wipe:         --wipe-keys (destroys noise.key, proposer.key and the staker keystore)
 #
 # Env: R1006_SSH_KEY (inventory ssh_key) · CAST, FORGE (cast, forge) · R1006_TUNNEL_BASE (18545)
@@ -119,6 +126,8 @@ SKIPS=""
 MIN_HEIGHT=60
 WIPE_KEYS=0
 MIN_CHAIN_REV_OPT=""
+LOGS_SINCE=""
+LOGS_SINCE_SET=0
 
 die() { echo "r1006_bringup: $*" >&2; exit 2; }
 log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*"; }
@@ -149,11 +158,13 @@ while [[ $# -gt 0 ]]; do
     --min-height) MIN_HEIGHT="$2"; shift 2 ;;
     --wipe-keys) WIPE_KEYS=1; shift ;;
     --min-chain-rev) MIN_CHAIN_REV_OPT="$2"; shift 2 ;;
+    --logs-since) LOGS_SINCE="$2"; LOGS_SINCE_SET=1; shift 2 ;;
     -h | --help) sed -n '2,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown option $1" ;;
   esac
 done
 
+[[ $LOGS_SINCE_SET -eq 0 || "$LOGS_SINCE" =~ ^[0-9]{1,12}$ ]] || die "--logs-since needs a unix time in seconds, got '$LOGS_SINCE'"
 [[ -f "$INVENTORY" ]] || die "no inventory at $INVENTORY"
 # Names, IPs and the host allowlist, before anything reads a host name.
 python3 "$GUARD" check-inventory --inventory "$INVENTORY" || die "inventory refused (see REFUSED above)"
@@ -190,6 +201,11 @@ else
   HOSTS=("${ALL_HOSTS[@]}")
 fi
 host_field() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print([h for h in d["hosts"] if h["name"]==sys.argv[2]][0].get(sys.argv[3],""))' "$INVENTORY" "$1" "$2"; }
+# The operator endpoint: the first host whose inventory entry sets serve_recent_state_tags
+# above 0 (guard.py check-inventory has checked the value: an integer 0-1024). Empty: none.
+OPERATOR_HOST=$(inv 'next((h["name"] for h in d["hosts"] if h.get("serve_recent_state_tags", 0) > 0), "")')
+OPERATOR_WINDOW=""
+[[ -n "$OPERATOR_HOST" ]] && OPERATOR_WINDOW=$(host_field "$OPERATOR_HOST" serve_recent_state_tags)
 host_index() { local i=0; for h in "${ALL_HOSTS[@]}"; do [[ "$h" == "$1" ]] && { echo "$i"; return; }; i=$((i + 1)); done; die "unknown host $1"; }
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 -o StrictHostKeyChecking=accept-new)
@@ -564,11 +580,17 @@ step_distribute() {
   mkdir -p "$STATE/profiles"
   for h in "${HOSTS[@]}"; do
     log "distribute: $h"
+    local window
+    window=$(host_field "$h" serve_recent_state_tags)
     if [[ $DRY -eq 0 ]]; then
       python3 "$PY/render_profile.py" profile --template "$REPO/scripts/producers/profiles/r1006.json" \
-        --producers "$STATE/r1006-producers.json" --fill "$fill" --host "$h" --out "$STATE/profiles/$h.json" >/dev/null
+        --producers "$STATE/r1006-producers.json" --fill "$fill" --host "$h" --out "$STATE/profiles/$h.json" \
+        --serve-recent-state-tags "${window:-0}" >/dev/null
     else
       echo "  [dry-run] render_profile.py profile --host $h -> $STATE/profiles/$h.json"
+    fi
+    if [[ "${window:-0}" != 0 ]]; then
+      log "  $h: [rpc] serve_recent_state_tags = $window (the operator endpoint; every other host stays strict)"
     fi
     put "$h" "$STATE/bin/citrate-node" incoming/citrate-node
     if [[ $DRY -eq 0 ]]; then
@@ -765,6 +787,18 @@ step_start() {
 
 # ---- smoke -------------------------------------------------------------------
 SMOKE_FAIL=0
+OPERATOR_KEY_MSG="no inventory host sets \"serve_recent_state_tags\": N (node.toml [rpc] serve_recent_state_tags, chain#425); forge's pinned reads need that window on the host it reads from (r1006: citrate-prod-1, 64; then distribute + start that host)"
+# The log scan's window: --logs-since, else the start record. Printed with its source.
+logs_window() { # -> "EPOCH SOURCE"
+  if [[ $LOGS_SINCE_SET -eq 1 ]]; then echo "$LOGS_SINCE --logs-since"
+  else echo "$(cat "$STATE/started_at" 2>/dev/null || echo 0) start"; fi
+}
+logs_window_text() { # EPOCH SOURCE
+  local when src
+  when=$(date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "?")
+  [[ "$2" == start ]] && src="the start record" || src="--logs-since"
+  echo "since $when (epoch $1, from $src)"
+}
 pass() { log "PASS  $*"; }
 fail() { log "FAIL  $*"; SMOKE_FAIL=1; }
 skipped() { [[ ",$SKIPS," == *",$1,"* ]]; }
@@ -780,7 +814,17 @@ step_smoke() {
     echo "  [dry-run] CheckDeployedAdmins.s.sol, GENESIS_CHAIN=1, over the fill address_book with GENESIS_ALLOC = the fill alloc_file"
     echo "            (both staged under contracts/addresses, removed after): forge rc 0 and FACTORY-ADMIN, DEPLOYER-ADMIN,"
     echo "            NO-CODE, TIMELOCK-HOLDERS, GENESIS-FLOOR each reported once as 0"
-    echo "  [dry-run] host_agent logs-scan: no CONFLICT / fork line since start, every host"
+    if [[ -n "$OPERATOR_HOST" ]]; then
+      tunnel_up "$OPERATOR_HOST"
+      echo "            forge via $OPERATOR_HOST (serve_recent_state_tags = $OPERATOR_WINDOW): $(rpc_url "$OPERATOR_HOST")"
+    else
+      echo "            FAIL: $OPERATOR_KEY_MSG"
+    fi
+    if [[ $LOGS_SINCE_SET -eq 1 ]]; then
+      echo "  [dry-run] host_agent logs-scan: no CONFLICT / fork line $(logs_window_text "$LOGS_SINCE" --logs-since), every host"
+    else
+      echo "  [dry-run] host_agent logs-scan: no CONFLICT / fork line since the start record (\$STATE/started_at), every host"
+    fi
     echo "  [dry-run] finality: eth_getBlockByNumber(finalized) answers (switch OFF: expect block 0)"
     echo "  [dry-run] config: no contribution recorder in node.toml / env / unit drop-ins, every host"
     echo "  [dry-run] memory: node RSS < 3 GiB on every host (runbook alert line)"
@@ -878,14 +922,21 @@ PY
     fail "admins (genesis-chain mode): no address book in the fill result, or no CheckDeployedAdmins.s.sol in this checkout"
   elif [[ -z "$admins_alloc" || ! -f "$STATE/genesis/$admins_alloc" ]]; then
     fail "admins (genesis-chain mode): no block-0 alloc in the fill result (GENESIS_ALLOC is required)"
+  elif [[ -z "$OPERATOR_HOST" ]]; then
+    fail "admins (genesis-chain mode): $OPERATOR_KEY_MSG"
   else
+    # forge pins its reads to the block it started at: only the operator host serves them.
+    tunnel_up "$OPERATOR_HOST"
+    local op_url
+    op_url=$(rpc_url "$OPERATOR_HOST")
+    log "  admins: forge via $OPERATOR_HOST ($op_url, serve_recent_state_tags = $OPERATOR_WINDOW)"
     # forge may read only under contracts/ (fs_permissions: ./addresses), and the state dir
     # is outside the checkout: stage the fill's (public) book and alloc there for this run only.
     local report frc=0 c n bad_classes="" staged="addresses/.r1006-smoke-$$.json" staged_alloc="addresses/.r1006-smoke-$$-alloc.json"
     cp -f -- "$STATE/genesis/$book" "$REPO/contracts/$staged"
     cp -f -- "$STATE/genesis/$admins_alloc" "$REPO/contracts/$staged_alloc"
     report=$(cd "$REPO/contracts" && ADDRESS_BOOK="$staged" REQUIRE_ALL_CODE=true GENESIS_CHAIN=1 \
-      GENESIS_ALLOC="$staged_alloc" "$FORGE" script script/CheckDeployedAdmins.s.sol --rpc-url "${urls[0]}" 2>&1) || frc=$?
+      GENESIS_ALLOC="$staged_alloc" "$FORGE" script script/CheckDeployedAdmins.s.sol --rpc-url "$op_url" 2>&1) || frc=$?
     rm -f -- "$REPO/contracts/$staged" "$REPO/contracts/$staged_alloc"
     # The whole checker must pass (rc 0), and report each class exactly once, as 0.
     for c in "FACTORY-ADMIN failures" "DEPLOYER-ADMIN failures" "NO-CODE entries (reported)" \
@@ -894,16 +945,21 @@ PY
       [[ $(printf '%s' "$n" | grep -c .) -eq 1 && "$n" == 0 ]] || bad_classes+=" ${c%% *}=${n:-missing}"
     done
     if [[ $frc -eq 0 && -z "$bad_classes" ]]; then
-      pass "admins (genesis-chain mode): FACTORY-ADMIN, DEPLOYER-ADMIN, NO-CODE, TIMELOCK-HOLDERS, GENESIS-FLOOR all 0"
+      pass "admins (genesis-chain mode): FACTORY-ADMIN, DEPLOYER-ADMIN, NO-CODE, TIMELOCK-HOLDERS, GENESIS-FLOOR all 0 (via $OPERATOR_HOST)"
     else
       printf '%s\n' "$report" | tail -15 | sed 's/^/  | /'
-      fail "admins (genesis-chain mode): forge rc=$frc;${bad_classes:- every class 0}"
+      if grep -q 'historical state not available' <<<"$report"; then
+        log "  $OPERATOR_HOST refused forge's pinned reads: check that its running node.toml has [rpc] serve_recent_state_tags = $OPERATOR_WINDOW"
+        log "  (else: stop, distribute, start --only $OPERATOR_HOST); a forge run longer than $OPERATOR_WINDOW blocks also ends here"
+      fi
+      fail "admins (genesis-chain mode) via $OPERATOR_HOST: forge rc=$frc;${bad_classes:- every class 0}"
     fi
   fi
 
   # 6. logs: no CONFLICT / fork
-  local since
-  since=$(cat "$STATE/started_at" 2>/dev/null || echo 0)
+  local since window
+  read -r since window < <(logs_window)
+  window=$(logs_window_text "$since" "$window")
   if skipped logs; then
     log "SKIP  log scan (--skip logs)"
   else
@@ -920,7 +976,7 @@ PY
       ps=$(sed -n 's/^producer_skips //p' <<<"$scan")
       [[ "${ps:-0}" != 0 ]] && log "  NOTE $h: $ps production round(s) skipped by the MP-S1 guard (parent not yet applied)"
     done
-    [[ $bad -eq 0 ]] && pass "no CONFLICT / fork lines in any node log" || fail "CONFLICT / fork lines in node logs"
+    [[ $bad -eq 0 ]] && pass "no CONFLICT / fork lines in any node log $window" || fail "CONFLICT / fork lines in node logs $window"
   fi
 
   # 7. finality status

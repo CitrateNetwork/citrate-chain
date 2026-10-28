@@ -1446,7 +1446,7 @@ class OperatorEndpoint(unittest.TestCase):
             r = env.run("smoke", "--dry-run")
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertIn("serve_recent_state_tags", r.stdout)
-            self.assertIn("no host", r.stdout)
+            self.assertIn("no inventory host sets", r.stdout)
             self.assertIn("since the start record", r.stdout)
             inv = json.loads(env.inv.read_text())
             inv["hosts"][1]["serve_recent_state_tags"] = 64

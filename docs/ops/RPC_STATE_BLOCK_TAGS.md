@@ -82,6 +82,8 @@ use it for indexing, accounting or audits.
 1. Run `forge script`, `regenesis.sh` and `hup-redeploy-dryrun.sh` against an **operator node**
    that has `serve_recent_state_tags` set (64 is enough for a script of a few minutes at 2 s blocks).
    Bind it to loopback or a private network.
+   r1006: the bring-up's smoke uses `citrate-prod-1` (inventory `serve_recent_state_tags`,
+   `docs/ops/R1006_BRINGUP.md`); the other producers stay strict.
 2. Keep public endpoints (rpc.citrate.ai and the bootnodes) strict.
 3. A script that runs longer than N blocks still fails closed. Raise N on the operator node, or
    split the script.
