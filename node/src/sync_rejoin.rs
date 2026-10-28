@@ -2575,6 +2575,26 @@ mod tests {
         assert_eq!(n.applied(), Some((h(&tip), 30)));
     }
 
+    /// Tripwire: no header-claimed blue score reaches the rebuild decision
+    /// (SECREM-01 CONS-2; DGX P1 at 14afe643). The applicator's production code
+    /// never reads `header.blue_score`; weights come only from fork choice.
+    #[test]
+    fn the_rebuild_decision_never_reads_a_header_score() {
+        let src = include_str!("canonical_apply.rs");
+        let prod = src
+            .split("#[cfg(test)]\npub(crate) mod tests {")
+            .next()
+            .expect("production part");
+        assert!(
+            !prod.contains("header.blue_score"),
+            "canonical_apply.rs production code reads a header blue score"
+        );
+        assert!(
+            prod.contains("g.fork_choice_score(&h)"),
+            "weights come from fork choice"
+        );
+    }
+
     /// Tripwire: the guards stay on the paths that move the applied tip down.
     #[test]
     fn rewind_guards_stay_wired() {

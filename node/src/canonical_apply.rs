@@ -3504,14 +3504,17 @@ pub(crate) mod tests {
             nh(Some(10), Some(10)),
             "the forward-cap arm is weight-checked too"
         );
-        // An unscored head fails closed; an applied tip that is not held at
-        // all (dropped at start-up) has nothing to protect.
+        // A weight fork choice cannot give, for either side, fails closed.
         assert_eq!(
             rebuild_decision(true, 0, None, Some(10)),
             nh(None, Some(10))
         );
         assert_eq!(rebuild_decision(true, 0, None, None), nh(None, None));
-        assert_eq!(rebuild_decision(true, 0, Some(11), None), Rebuild);
+        assert_eq!(
+            rebuild_decision(true, 0, Some(11), None),
+            nh(Some(11), None),
+            "an applied tip fork choice cannot score never loses to a rival"
+        );
         // Pruned: below the window refuses; the forward cap alone does not.
         assert_eq!(
             rebuild_decision(true, 500, Some(11), Some(10)),
@@ -4497,6 +4500,118 @@ pub(crate) mod tests {
     /// tick. `recover_to_head` rebuilds deterministically from the node's own stored
     /// blocks (reset to genesis, re-apply the canonical chain forward, repopulating
     /// the ring) and lands on the fork-choice winner.
+    /// Two equal-score siblings at height 1 off genesis; the node applied the
+    /// one with the LARGER hash (the tie-break loser) and restarted (ring =
+    /// tip only). Returns (genesis state, genesis, winner, loser, app) with
+    /// fork choice naming the winner. Headers claim score 1 (`mk_block_scored`),
+    /// the relation score GhostDAG recomputes is 2 (genesis 1 + 1).
+    async fn restarted_on_tie_loser(
+        exec: &Arc<Executor>,
+        storage: &Arc<StorageManager>,
+    ) -> (StateSnapshot, Block, Block, Block) {
+        let genesis_state = exec.state_snapshot();
+        let genesis = mk_block(0, Hash::default(), exec.calculate_state_root());
+        persist(storage, &genesis);
+        let r = roots(1);
+        let s_a = mk_block_scored(1, genesis.header.block_hash, r[0], 1, VRF_OUT);
+        let s_b = mk_block_scored(1, genesis.header.block_hash, r[0], 1, [0x5B; 32]);
+        let (winner, loser) = if s_a.header.block_hash < s_b.header.block_hash {
+            (s_a, s_b)
+        } else {
+            (s_b, s_a)
+        };
+        let app1 = CanonicalApplicator::new(exec.clone(), storage.clone());
+        persist(storage, &loser);
+        assert!(matches!(
+            app1.apply_received(&loser).await,
+            ApplyOutcome::Applied { .. }
+        ));
+        persist(storage, &winner);
+        (genesis_state, genesis, winner, loser)
+    }
+
+    /// DGX P1 at 14afe643: fork choice scores the rival (relation score 2) but
+    /// not the applied tip, whose stored header claims 1. Comparing the
+    /// rival's relation score with the tip's header score let an
+    /// equal-weight sibling pass "strictly heavier". An applied tip fork
+    /// choice cannot score must refuse.
+    #[tokio::test]
+    async fn automatic_rebuild_refuses_when_the_tip_is_unscored() {
+        let (exec, storage, _dir) = fresh();
+        let (gs, genesis, winner, loser) = restarted_on_tie_loser(&exec, &storage).await;
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        app.fork_choice = Some(fork_choice_returning(winner.header.block_hash));
+        app.fork_weight = Some(weights(&[(winner.header.block_hash, 2)]));
+        let rebuilt = app
+            .recover_automatic(gs, genesis.header.block_hash, winner.header.block_hash)
+            .await
+            .expect("recovery");
+        assert!(
+            !rebuilt,
+            "rebuilt against an applied tip fork choice did not score"
+        );
+        assert_eq!(app.applied_tip().await.hash, loser.header.block_hash);
+    }
+
+    /// The mirror: the applied tip is scored, the rival is not. Refused.
+    #[tokio::test]
+    async fn automatic_rebuild_refuses_when_the_rival_is_unscored() {
+        let (exec, storage, _dir) = fresh();
+        let (gs, genesis, winner, loser) = restarted_on_tie_loser(&exec, &storage).await;
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        app.fork_choice = Some(fork_choice_returning(winner.header.block_hash));
+        app.fork_weight = Some(weights(&[(loser.header.block_hash, 1)]));
+        let rebuilt = app
+            .recover_automatic(gs, genesis.header.block_hash, winner.header.block_hash)
+            .await
+            .expect("recovery");
+        assert!(!rebuilt, "rebuilt toward a head fork choice did not score");
+        assert_eq!(app.applied_tip().await.hash, loser.header.block_hash);
+    }
+
+    /// Like with like, on real GhostDAG: the rival is registered (relation
+    /// score 2), the applied tip is in the DAG store but not in `relations`
+    /// (a restart registers tips only). The tip must be scored the way fork
+    /// choice scores the rival (recomputed: 2), so the equal-weight rival is
+    /// refused.
+    #[tokio::test]
+    async fn automatic_rebuild_scores_an_unregistered_tip_like_fork_choice() {
+        use citrate_consensus::dag_store::DagStore;
+        use citrate_consensus::types::GhostDagParams;
+        let (exec, storage, _dir) = fresh();
+        let (gs, genesis, winner, loser) = restarted_on_tie_loser(&exec, &storage).await;
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+        dag.store_block(genesis.clone()).await.expect("genesis");
+        ghostdag.add_block(&genesis).await.expect("genesis");
+        dag.store_block(loser.clone())
+            .await
+            .expect("loser into DAG");
+        dag.store_block(winner.clone())
+            .await
+            .expect("winner into DAG");
+        ghostdag
+            .add_block(&winner)
+            .await
+            .expect("winner registered");
+        assert_eq!(
+            ghostdag.select_tip().await.expect("tip"),
+            winner.header.block_hash
+        );
+        assert!(ghostdag
+            .get_blue_score(&loser.header.block_hash)
+            .await
+            .is_err());
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone())
+            .with_fork_choice(ghostdag.clone());
+        let rebuilt = app
+            .recover_automatic(gs, genesis.header.block_hash, winner.header.block_hash)
+            .await
+            .expect("recovery");
+        assert!(!rebuilt, "an equal-weight rival was rebuilt onto");
+        assert_eq!(app.applied_tip().await.hash, loser.header.block_hash);
+    }
+
     /// The 2026-08-06 shape through the node's OWN triggers (start-up recovery
     /// and the drain fallback, `recover_automatic`): restarted on the losing
     /// one of two equal-score siblings, the node does not rebuild from genesis
