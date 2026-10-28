@@ -87,6 +87,31 @@ const MAX_REORG_DEPTH: u64 = 100;
 /// the 2026-08-09 wedge (winning branch 513) sits well inside it.
 const MAX_REORG_FORWARD: u64 = 10_000;
 
+/// [`MAX_REORG_FORWARD`], or a test's override on this thread.
+fn reorg_forward_cap() -> u64 {
+    #[cfg(test)]
+    if let Some(n) = test_reorg_forward::get() {
+        return n.max(1);
+    }
+    MAX_REORG_FORWARD
+}
+
+/// Test-only per-thread override of the forward branch cap, so tests can reach
+/// the far-ahead paths with a few hundred blocks.
+#[cfg(test)]
+pub(crate) mod test_reorg_forward {
+    use std::cell::Cell;
+    thread_local! {
+        static CAP: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+    pub(crate) fn set(n: Option<u64>) {
+        CAP.with(|c| c.set(n));
+    }
+    pub(crate) fn get() -> Option<u64> {
+        CAP.with(|c| c.get())
+    }
+}
+
 /// Upper bound on the blocks a from-genesis spine rebuild (`recover_to_head`)
 /// walks, and on the blocks the interrupted-rebuild receipt cleanup walks.
 const MAX_RECOVERY_SPINE: usize = 20_000_000;
@@ -1487,7 +1512,7 @@ impl CanonicalApplicator {
             // Memory guard: bound the forward branch Vec. A far-ahead fork-choice
             // head (huge drain lag / long outage) is rebuilt via the hash-only
             // spine path instead of collecting tens of thousands of full blocks.
-            if branch.len() as u64 >= MAX_REORG_FORWARD {
+            if branch.len() as u64 >= reorg_forward_cap() {
                 return ReorgOutcome::BeyondReorgWindow {
                     new_tip,
                     stopped_at: h,

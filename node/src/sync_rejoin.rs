@@ -467,7 +467,7 @@ mod tests {
     use super::*;
     use crate::admission::{bound_orphan_buffer, BlockAdmission};
     use crate::block_serve;
-    use crate::canonical_apply::{canonical_reward_config, CanonicalApplicator};
+    use crate::canonical_apply::{canonical_reward_config, ApplyOutcome, CanonicalApplicator};
     use citrate_consensus::crypto;
     use citrate_consensus::dag_store::DagStore;
     use citrate_consensus::ghostdag::GhostDag;
@@ -1601,5 +1601,396 @@ mod tests {
         for _ in 0..3 * MAX_UNANSWERED {
             assert_eq!(t.note_asked(PEER, (hx(1), 10)), None);
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // No rewind below a verified tip after a restart (r1006, 2026-10-28).
+    //
+    // A producer restarted at applied height 99,591 with DAG pruning on.
+    // Within a second of its first sync answer its applied tip started over
+    // from genesis and climbed at ~27 blocks/s; the stall watchdog killed the
+    // process at 2,331 and that height was durable. After a restart the reorg
+    // snapshot ring holds only the applied tip, so ANY fork-choice head that is
+    // not a descendant of it (a same-height sibling, an ancestor, a branch one
+    // block below) walked past the ring and was reported `BeyondReorgWindow`,
+    // and the runtime fallback rebuilt the applied state from genesis. That
+    // rebuild resets the durable tip to genesis first and holds the advance
+    // lock for the whole replay, so the receive path stalls behind it.
+    // ---------------------------------------------------------------------
+
+    /// Applied height at or above which the restarted fixtures sit.
+    const RESTART_TIP: u64 = 1_200;
+    /// DAG retention the restarted fixtures prune to (`dag_prune` floor).
+    const RESTART_RETAIN: u64 = 1_000;
+
+    /// One chain `1..=n` sealed by `key` on `genesis`, with its roots.
+    fn chain(key: &ed25519_dalek::SigningKey, g: &Block, n: u64, r: &[Hash]) -> Vec<Block> {
+        extend(key, h(g), 1, n, r)
+    }
+
+    /// A block at `height` on `parent` sealed by `key` whose hash sorts on the
+    /// `below` side of `than` (fork choice breaks equal-score ties toward the
+    /// SMALLEST hash). Same transactions and coinbase as the chain, so the
+    /// same state root.
+    fn sibling(
+        key: &ed25519_dalek::SigningKey,
+        height: u64,
+        parent: Hash,
+        root: Hash,
+        than: Hash,
+        below: bool,
+    ) -> Block {
+        for salt in 1..=u16::MAX {
+            let mut b = seal(key, height, parent, root);
+            // Vary the VRF output (no transactions read it) rather than the
+            // timestamp, which must stay parent-monotonic for its children.
+            let mut out = [0x5A; 32];
+            out[..2].copy_from_slice(&salt.to_be_bytes());
+            b.header.vrf_reveal.output = Hash::new(out);
+            b.header.block_hash = b.compute_hash();
+            b.signature = crypto::sign_block(&b.header.block_hash, key);
+            if (b.header.block_hash < than) == below {
+                return b;
+            }
+        }
+        panic!("no sibling hash on the requested side");
+    }
+
+    /// The node after a restart, built the way `start_node` builds one over an
+    /// existing data dir: the SAME executor and store (state as of the applied
+    /// tip), a fresh `CanonicalApplicator` (its reorg ring holds only the
+    /// applied tip), a fresh DAG store holding only the range DAG pruning
+    /// retains (`[tip - retain, tip]`, pruning point set), GhostDAG rehydrated
+    /// from the chain store block by block and reconciled (marks hydration),
+    /// and genesis wired for the runtime rebuild.
+    async fn restart(
+        before: &Node,
+        g: &Block,
+        retain: u64,
+    ) -> (Node, Arc<GhostDag>, Arc<DagStore>) {
+        let (tip_hash, tip_height) = before.applied().expect("applied tip");
+        let point = tip_height.saturating_sub(retain);
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        dag.set_configured_genesis(h(g));
+        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+        // Producer rehydration: every stored height is registered with GhostDAG;
+        // only the retained range is in the DAG store (below the pruning point
+        // the store write fails in production: no parent for the VRF check).
+        let mut walk = Vec::new();
+        let mut cursor = tip_hash;
+        while let Some(b) = before.storage.blocks.get_block(&cursor).expect("read") {
+            cursor = b.selected_parent();
+            let at_genesis = b.header.height == 0;
+            walk.push(b);
+            if at_genesis {
+                break;
+            }
+        }
+        walk.reverse();
+        for b in &walk {
+            if b.header.height >= point {
+                dag.store_block(b.clone()).await.expect("retained block");
+            }
+            ghostdag.register_existing_block(b).await.expect("register");
+        }
+        let point_hash = walk
+            .iter()
+            .find(|b| b.header.height == point)
+            .map(h)
+            .expect("pruning point");
+        dag.update_pruning_point(point_hash).await.expect("point");
+        ghostdag.reconcile_tips_from_dag_store().await;
+        let app = Arc::new(
+            CanonicalApplicator::new(before.executor.clone(), before.storage.clone())
+                .with_fork_choice(ghostdag.clone()),
+        );
+        app.set_genesis(
+            Executor::new(Arc::new(StateDB::new())).state_snapshot(),
+            h(g),
+        );
+        assert_eq!(
+            app.applied_tip().await.height,
+            tip_height,
+            "restart seeds the applied tip"
+        );
+        let admission = Arc::new(BlockAdmission::new(
+            before.storage.clone(),
+            dag.clone(),
+            ghostdag.clone(),
+            Some(app.clone()),
+        ));
+        let sync = SyncManager::new(SyncConfig::default())
+            .with_local_height(app.applied_height_handle())
+            .with_pba_hardening(PbaHardening::off());
+        (
+            Node {
+                storage: before.storage.clone(),
+                executor: before.executor.clone(),
+                app,
+                admission,
+                sync,
+            },
+            ghostdag,
+            dag,
+        )
+    }
+
+    /// Lowest DURABLE applied height seen while `f` runs, sampled from a
+    /// separate OS thread (a crash at any moment leaves exactly that height).
+    async fn lowest_durable_tip_during<F: std::future::Future>(
+        storage: &Arc<StorageManager>,
+        f: F,
+    ) -> (F::Output, u64) {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let stop = Arc::new(AtomicBool::new(false));
+        let low = Arc::new(AtomicU64::new(u64::MAX));
+        let sampler = {
+            let (stop, low, storage) = (stop.clone(), low.clone(), storage.clone());
+            std::thread::spawn(move || loop {
+                if let Ok(Some((_, height))) = storage.blocks.get_applied_tip() {
+                    low.fetch_min(height, Ordering::SeqCst);
+                }
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::yield_now();
+            })
+        };
+        let out = f.await;
+        stop.store(true, Ordering::SeqCst);
+        sampler.join().expect("sampler");
+        (out, low.load(Ordering::SeqCst))
+    }
+
+    /// RED (r1006 2026-10-28), the incident end to end. A node on the
+    /// canonical chain restarts at height N with DAG pruning on. One peer
+    /// advertises a higher head and answers the tip anchor with nothing (it
+    /// never held the node's tip); when the fork-point search probes below the
+    /// tip it serves a validly signed sibling of the tip that fork choice ranks
+    /// first (equal score, smaller hash). The reorg ring cannot reach the fork
+    /// point after a restart, so the switch is a from-genesis rebuild. While it
+    /// runs another block arrives: the receive path must not wait for it. If it
+    /// does, the P2P stall watchdog exits the process, and the durable applied
+    /// tip it leaves behind is wherever the replay had got to.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restarted_node_keeps_its_verified_height_through_a_rebuild() {
+        use std::sync::atomic::Ordering;
+        let key = crypto::generate_keypair();
+        let other = crypto::generate_keypair();
+        let r = roots(RESTART_TIP, &key);
+        let g = genesis();
+        let own = chain(&key, &g, RESTART_TIP, &r);
+        let tip = own.last().expect("tip").clone();
+        let parent = own[own.len() - 2].header.block_hash;
+        // Validly signed by another proposer, same height and parent, smaller hash.
+        let rival = sibling(
+            &other,
+            RESTART_TIP,
+            parent,
+            r[RESTART_TIP as usize],
+            h(&tip),
+            true,
+        );
+        let late = sibling(
+            &other,
+            RESTART_TIP,
+            parent,
+            r[RESTART_TIP as usize],
+            h(&rival),
+            false,
+        );
+        let net = Net {
+            genesis: g.clone(),
+            prefix: own[..own.len() - 1].to_vec(),
+            main: vec![rival.clone()],
+            side: Vec::new(),
+        };
+        // The peer holds the common prefix and the rival, not the node's tip.
+        let pdir = tempfile::tempdir().expect("tempdir");
+        let peer = Arc::new(peer_store(&net, false, pdir.path()));
+        let ndir = tempfile::tempdir().expect("tempdir");
+        let before = node(&net, &own, ndir.path()).await;
+        let (n, _, _) = restart(&before, &g, RESTART_RETAIN).await;
+        let n = Arc::new(n);
+        let flag = n.app.rebuild_in_progress_handle();
+        let lock = n.app.advance_lock();
+
+        let driver = {
+            let (n, peer, target) = (n.clone(), peer.clone(), h(&rival));
+            tokio::spawn(async move {
+                let mut tracker = RejoinTracker::new();
+                drive_advertised(&n, &mut tracker, &peer, target, RESTART_TIP + 89, 24).await
+            })
+        };
+        // The P2P handler: once a rebuild holds the advance lock, a block
+        // arrives and goes through the receive path.
+        let mut stalled_at = None;
+        let mut saw_rebuild = false;
+        while !driver.is_finished() {
+            if flag.load(Ordering::SeqCst) && lock.try_lock().is_err() {
+                saw_rebuild = true;
+                let answer = tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    n.app.apply_received(&late),
+                )
+                .await;
+                if answer.is_err() {
+                    // The stall watchdog's exit: this is the durable tip left.
+                    stalled_at = n.applied().map(|(_, height)| height);
+                }
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let run = driver.await.expect("driver");
+        assert!(
+            saw_rebuild,
+            "fixture: the restart episode must go through a rebuild: anchors {:?}",
+            run.anchors
+        );
+        assert_eq!(
+            stalled_at, None,
+            "the receive path stalled behind the rebuild; the watchdog exit would leave the \
+             durable applied tip at {stalled_at:?} (verified height {RESTART_TIP})"
+        );
+        assert_eq!(
+            n.applied(),
+            Some((h(&rival), RESTART_TIP)),
+            "the node ends on the fork-choice winner at its verified height"
+        );
+    }
+
+    /// RED. After a restart with pruned DAG history, a fork-choice head that is
+    /// an ANCESTOR of the applied tip (below the DAG pruning point, so nothing
+    /// but the chain store knows it) is not a fork: the applied chain already
+    /// contains it. The drain must leave the applied tip where it is.
+    #[tokio::test]
+    async fn a_pruned_applied_ancestor_is_never_a_rebuild_target() {
+        let key = crypto::generate_keypair();
+        let r = roots(RESTART_TIP, &key);
+        let g = genesis();
+        let own = chain(&key, &g, RESTART_TIP, &r);
+        let net = Net {
+            genesis: g.clone(),
+            prefix: own.clone(),
+            main: Vec::new(),
+            side: Vec::new(),
+        };
+        let ndir = tempfile::tempdir().expect("tempdir");
+        let before = node(&net, &own, ndir.path()).await;
+        let (n, _, _) = restart(&before, &g, RESTART_RETAIN).await;
+        let ancestor = &own[149]; // height 150, below the pruning point (200)
+        let head = Arc::new(parking_lot::Mutex::new(Some(h(ancestor))));
+        let app = CanonicalApplicator::new(n.executor.clone(), n.storage.clone())
+            .with_fork_choice_cell(head);
+        app.set_genesis(
+            Executor::new(Arc::new(StateDB::new())).state_snapshot(),
+            h(&g),
+        );
+        app.drive_drain().await;
+        assert_eq!(
+            n.applied(),
+            Some((h(own.last().expect("tip")), RESTART_TIP)),
+            "the applied chain was rewound to its own ancestor"
+        );
+    }
+
+    /// RED. While a rebuild holds the advance lock, the receive path (block
+    /// admission -> `apply_received`) must not wait for it: the P2P handler
+    /// stalled behind the rebuild and the stall watchdog exited the node
+    /// mid-replay, which is how the rewound height became durable.
+    #[tokio::test]
+    async fn the_receive_path_does_not_wait_on_a_rebuild() {
+        let key = crypto::generate_keypair();
+        let r = roots(40, &key);
+        let g = genesis();
+        let own = chain(&key, &g, 40, &r);
+        let net = Net {
+            genesis: g.clone(),
+            prefix: own[..30].to_vec(),
+            main: Vec::new(),
+            side: Vec::new(),
+        };
+        let ndir = tempfile::tempdir().expect("tempdir");
+        let n = node(&net, &own[..30], ndir.path()).await;
+        let flag = n.app.rebuild_in_progress_handle();
+        let lock = n.app.advance_lock();
+        // A rebuild in progress: flag set, advance lock held.
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let held = lock.lock().await;
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            n.app.apply_received(&own[30]),
+        )
+        .await;
+        drop(held);
+        flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            matches!(answered, Ok(ApplyOutcome::Deferred)),
+            "the receive path waited on the rebuild: {answered:?}"
+        );
+        // Once the rebuild is over, the drain applies what was deferred.
+        n.storage.blocks.put_block(&own[30]).expect("put");
+        n.app.drive_drain().await;
+        assert_eq!(n.applied(), Some((h(&own[30]), 31)));
+    }
+
+    /// RED. A fork-choice head that DESCENDS from the applied tip but sits
+    /// beyond the forward cap (the drain stopped on an ambiguous child) is
+    /// reached by applying forward in bounded steps, never by a from-genesis
+    /// rebuild of a chain the node already executed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_far_ahead_descendant_is_applied_forward_not_rebuilt() {
+        let key = crypto::generate_keypair();
+        let other = crypto::generate_keypair();
+        let top = 400u64;
+        let r = roots(top, &key);
+        let g = genesis();
+        let all = chain(&key, &g, top, &r);
+        let net = Net {
+            genesis: g.clone(),
+            prefix: all.clone(),
+            main: Vec::new(),
+            side: Vec::new(),
+        };
+        let ndir = tempfile::tempdir().expect("tempdir");
+        let applied_to = 250usize;
+        let n = node(&net, &all[..applied_to], ndir.path()).await;
+        // Stored, not applied: the rest of the chain plus a sibling of the next
+        // block (two stored children make the linear drain stop).
+        let next = &all[applied_to];
+        let rival = sibling(
+            &other,
+            next.header.height,
+            next.selected_parent(),
+            next.state_root,
+            h(next),
+            false,
+        );
+        n.storage.blocks.put_block(&rival).expect("put");
+        for b in &all[applied_to..] {
+            n.storage.blocks.put_block(b).expect("put");
+        }
+        let head = Arc::new(parking_lot::Mutex::new(Some(h(all.last().expect("top")))));
+        let app = CanonicalApplicator::new(n.executor.clone(), n.storage.clone())
+            .with_fork_choice_cell(head);
+        app.set_genesis(
+            Executor::new(Arc::new(StateDB::new())).state_snapshot(),
+            h(&g),
+        );
+        crate::canonical_apply::test_reorg_forward::set(Some(50));
+        let storage = n.storage.clone();
+        let ((), lowest) = lowest_durable_tip_during(&storage, async {
+            for _ in 0..10 {
+                app.drive_drain().await;
+            }
+        })
+        .await;
+        crate::canonical_apply::test_reorg_forward::set(None);
+        assert!(
+            lowest >= applied_to as u64,
+            "durable applied tip fell to {lowest} below the verified {applied_to}"
+        );
+        assert_eq!(n.applied(), Some((h(all.last().expect("top")), top)));
     }
 }
