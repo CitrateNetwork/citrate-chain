@@ -613,7 +613,7 @@ fn executed_chain_index_bounds_a_cold_walk_and_progresses_on_retry() {
 /// request completes within the same number of tries as with no churn.
 #[test]
 fn executed_chain_index_cold_fill_survives_tip_churn() {
-    cold_fill_under_churn(0);
+    cold_fill_under_churn(0, std::time::Duration::ZERO);
 }
 
 /// The same with several concurrent near-tip readers. A reader can read the
@@ -622,10 +622,20 @@ fn executed_chain_index_cold_fill_survives_tip_churn() {
 /// the anchor, so neither the cache nor an in-flight fill may be dropped.
 #[test]
 fn executed_chain_index_cold_fill_survives_concurrent_readers() {
-    cold_fill_under_churn(8);
+    cold_fill_under_churn(8, std::time::Duration::ZERO);
 }
 
-fn cold_fill_under_churn(readers: usize) {
+/// The same when each commit takes longer than a whole cold fill. On a CI
+/// runner the two fsyncs of a commit (block write + applied-tip write with the
+/// canonical height index) can outlast every retry of the deep request; the
+/// test must still drive the fill and the commits to interleave, not depend on
+/// commits being fast.
+#[test]
+fn executed_chain_index_cold_fill_survives_slow_tip_commits() {
+    cold_fill_under_churn(8, std::time::Duration::from_millis(1_000));
+}
+
+fn cold_fill_under_churn(readers: usize, commit_pause: std::time::Duration) {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let (storage, _tmp) = storage();
@@ -651,6 +661,7 @@ fn cold_fill_under_churn(readers: usize) {
             let mut parent = parent;
             let mut h = top;
             while !stop.load(Ordering::Acquire) {
+                std::thread::sleep(commit_pause);
                 h += 1;
                 let b = block(hash_of(0xA0, h), parent, vec![], h, vec![]);
                 storage.blocks.put_block(&b).expect("block");
