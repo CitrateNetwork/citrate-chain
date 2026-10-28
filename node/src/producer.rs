@@ -2785,12 +2785,38 @@ impl BlockProducer {
             .await
             .map(|h| h.saturating_add(1));
 
+        // HEAVIEST-PARENT RULE: never list a merge parent whose HEADER blue_score
+        // exceeds the selected parent's. Receivers enforce exactly that comparison
+        // (`validate_block_consistency`), but fork choice above ranks tips by the
+        // RECOMPUTED score, which also counts blue merge parents, while headers carry
+        // `parent + 1`. Once blocks merge, the two orderings can disagree: fork choice
+        // picks a tip whose header score is below another tip's. Merging that other tip
+        // seals a block every peer rejects, and the producer then builds on it alone.
+        // Like MP-DEPTH this is a filter: the skipped tip stays in the tip set and is
+        // merged once a selected parent at least as heavy exists.
+        let sp_header_score = self
+            .dag_store
+            .get_block(&selected_parent)
+            .await
+            .ok()
+            .map(|b| b.header.blue_score);
+
         let max_parents = self.ghostdag.params().max_parents;
         let mut dropped_deep = 0usize;
+        let mut dropped_heavier = 0usize;
         let mut merge_parents: Vec<Hash> = Vec::new();
         for h in tip_hashes.into_iter().filter(|h| *h != selected_parent) {
             if merge_parents.len() >= max_parents.saturating_sub(1) {
                 break; // Leave room for the selected parent.
+            }
+            match (sp_header_score, self.dag_store.get_block(&h).await.ok()) {
+                (Some(sp_score), Some(tip)) if tip.header.blue_score <= sp_score => {}
+                _ => {
+                    // Heavier than the selected parent, or not readable here (a
+                    // receiver would reject it as a missing parent): do not merge.
+                    dropped_heavier = dropped_heavier.saturating_add(1);
+                    continue;
+                }
             }
             if let (Some(child_h), Some(tip_h)) =
                 (child_height, self.ghostdag.get_block_height(&h).await)
@@ -2803,6 +2829,13 @@ impl BlockProducer {
                 }
             }
             merge_parents.push(h);
+        }
+        if dropped_heavier > 0 {
+            debug!(
+                "producer: left {} tip(s) unmerged whose header blue_score exceeds the selected \
+                 parent's ({:?}); merging them would make our block invalid for every peer",
+                dropped_heavier, sp_header_score
+            );
         }
         if dropped_deep > 0 {
             debug!(
@@ -5125,7 +5158,9 @@ mod tests {
                 .blue_work(citrate_consensus::types::blue_work_for_score(score))
                 .build_unhashed();
             blk.header.block_hash = blk.compute_hash();
-            dag.store_block(blk.clone()).await.expect("store peer block");
+            dag.store_block(blk.clone())
+                .await
+                .expect("store peer block");
             ghostdag.add_block(&blk).await.expect("admit peer block");
             blk
         }
@@ -5155,7 +5190,10 @@ mod tests {
             .select_parents_with_ghostdag(&tips, None)
             .await
             .expect("parent selection");
-        assert_eq!(sp, x.header.block_hash, "selected parent follows fork choice");
+        assert_eq!(
+            sp, x.header.block_hash,
+            "selected parent follows fork choice"
+        );
 
         let sp_block = dag.get_block(&sp).await.expect("selected parent stored");
         for m in &merges {
