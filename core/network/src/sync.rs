@@ -370,21 +370,26 @@ impl SyncManager {
     ///
     /// `from_height` is the height of `from`, recorded so a response can be
     /// judged against the anchor that produced it (#156).
+    ///
+    /// `Ok(true)` when a `GetBlocks` was sent; `Ok(false)` when it was not
+    /// because a request for `from` is already pending or the in-flight cap is
+    /// reached. Callers that track "what did I ask, and whom" must act only on
+    /// `Ok(true)`.
     pub async fn request_blocks(
         &self,
         peer: &Peer,
         from: Hash,
         from_height: u64,
-    ) -> Result<(), NetworkError> {
+    ) -> Result<bool, NetworkError> {
         let peer_id = peer.info.read().await.id.clone();
 
         // Check if already pending
         if self.pending_blocks.read().await.contains_key(&from) {
-            return Ok(());
+            return Ok(false);
         }
 
         if self.pending_blocks.read().await.len() >= self.config.max_concurrent_downloads {
-            return Ok(());
+            return Ok(false);
         }
 
         // Send request
@@ -408,7 +413,7 @@ impl SyncManager {
         self.last_block_anchor_height
             .store(from_height, Ordering::Relaxed);
 
-        Ok(())
+        Ok(true)
     }
 
     /// Handle received headers
@@ -875,6 +880,49 @@ impl SyncManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_peer(id: &str) -> (Peer, tokio::sync::mpsc::Receiver<NetworkMessage>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let (_in_tx, in_rx) = tokio::sync::mpsc::channel(1);
+        let info = crate::peer::PeerInfo::new(
+            PeerId::new(id.to_string()),
+            "127.0.0.1:1".parse().expect("addr"),
+            crate::peer::Direction::Outbound,
+        );
+        (Peer::new(info, tx, in_rx), rx)
+    }
+
+    /// `request_blocks` says whether it actually sent: a second request for a
+    /// pending anchor, or one past the in-flight cap, is not sent and reports
+    /// `Ok(false)`, so the caller does not record it as asked.
+    #[tokio::test]
+    async fn request_blocks_reports_whether_it_sent() {
+        let sync = SyncManager::new(SyncConfig {
+            max_concurrent_downloads: 2,
+            ..SyncConfig::default()
+        });
+        let (a, mut a_rx) = test_peer("peer-a");
+        let (b, mut b_rx) = test_peer("peer-b");
+        let h = |n: u8| Hash::new([n; 32]);
+        assert!(sync.request_blocks(&a, h(1), 1).await.expect("send"));
+        assert!(matches!(
+            a_rx.try_recv(),
+            Ok(NetworkMessage::GetBlocks { .. })
+        ));
+        // Same anchor, other peer: suppressed, nothing on the wire.
+        assert!(!sync.request_blocks(&b, h(1), 1).await.expect("send"));
+        assert!(b_rx.try_recv().is_err());
+        assert!(sync.request_blocks(&b, h(2), 2).await.expect("send"));
+        assert!(b_rx.try_recv().is_ok());
+        // In-flight cap (2) reached.
+        assert!(!sync.request_blocks(&a, h(3), 3).await.expect("send"));
+        assert!(a_rx.try_recv().is_err());
+        assert_eq!(
+            sync.last_block_anchor_height(),
+            2,
+            "a suppressed request records nothing"
+        );
+    }
 
     #[tokio::test]
     async fn test_sync_state_transitions() {
