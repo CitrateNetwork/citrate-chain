@@ -8,24 +8,62 @@
 //! configured block time. The loops below must not do that, so they build
 //! their timers here instead of calling `interval` directly.
 
-use tokio::time::{interval, Duration, Interval, MissedTickBehavior};
+use tokio::time::{interval, interval_at, Duration, Interval, MissedTickBehavior};
 
-/// Block-production timer: one tick per `target_block_time_secs`, and after a
-/// delay it resumes on the next cadence boundary without replaying the ticks
-/// it missed (`Skip`). This is the timer `BlockProducer::start` runs on.
+/// Block-production timer: one tick per `target_block_time_secs`, on the
+/// wall-clock slot grid (multiples of the block time since the UNIX epoch),
+/// and after a delay it resumes on the next slot boundary without replaying
+/// the ticks it missed (`Skip`). This is the timer `BlockProducer::start` runs
+/// on.
+///
+/// Why the wall clock: every producer seals once per slot. A timer anchored at
+/// process start gives each producer its own phase within the slot, fixed for
+/// its whole uptime. A producer whose phase falls just after another's seal,
+/// inside the propagation delay, then always builds a sibling of a block it
+/// has not yet received, while producers nearer the first one extend that
+/// block. Its blocks never get a child, are only ever merged, and earn
+/// nothing. Anchoring every producer to the same NTP-synced grid makes them
+/// all build on the previous slot's blocks and compete on equal terms.
 pub(crate) fn production_interval(target_block_time_secs: u64) -> Interval {
     production_interval_at(target_block_time_secs, wall_clock_since_epoch())
 }
 
 /// [`production_interval`] for a given wall-clock reading (time since the
 /// UNIX epoch), so tests can place a producer anywhere in the slot.
-pub(crate) fn production_interval_at(target_block_time_secs: u64, _wall_now: Duration) -> Interval {
-    cadence_interval(Duration::from_secs(target_block_time_secs))
+///
+/// The interval runs on tokio's monotonic clock from the first aligned tick.
+/// On Linux NTP slews the monotonic clock along with the wall clock, so the
+/// two stay together; only a wall-clock step (which needs a restart to pick
+/// up) would move the grid.
+pub(crate) fn production_interval_at(target_block_time_secs: u64, wall_now: Duration) -> Interval {
+    let period = Duration::from_secs(target_block_time_secs);
+    let now = tokio::time::Instant::now();
+    let first = now
+        .checked_add(delay_to_next_slot(wall_now, period))
+        .unwrap_or(now);
+    let mut timer = interval_at(first, period);
+    timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    timer
 }
 
-/// Time until the next multiple of `period` on the wall clock.
-pub(crate) fn delay_to_next_slot(_wall_now: Duration, _period: Duration) -> Duration {
-    Duration::ZERO
+/// Time until the next multiple of `period` on the wall clock: zero when
+/// `wall_now` is already on a boundary, and zero for a zero period.
+pub(crate) fn delay_to_next_slot(wall_now: Duration, period: Duration) -> Duration {
+    let period_ns = period.as_nanos();
+    let Some(into_slot) = wall_now.as_nanos().checked_rem(period_ns) else {
+        return Duration::ZERO; // zero period
+    };
+    if into_slot == 0 {
+        return Duration::ZERO;
+    }
+    // 0 < remaining < period_ns, so it fits back into a Duration.
+    let remaining = period_ns.saturating_sub(into_slot);
+    let secs = remaining.checked_div(1_000_000_000).unwrap_or(0);
+    let nanos = remaining.checked_rem(1_000_000_000).unwrap_or(0);
+    Duration::new(
+        u64::try_from(secs).unwrap_or(u64::MAX),
+        u32::try_from(nanos).unwrap_or(0),
+    )
 }
 
 fn wall_clock_since_epoch() -> Duration {
