@@ -254,3 +254,36 @@ fn a_malformed_tag_is_invalid_params_not_latest() {
         }
     }
 }
+
+/// The EIP-1898 object form of `finalized` / `safe` goes through the finality
+/// guard exactly like the string form: here the finalized height (0) is behind
+/// the executed head (5), so both are refused with the same error.
+#[test]
+fn finality_tags_wrapped_in_an_eip1898_object_get_the_finality_guard() {
+    let f = fixture();
+    for tag in ["finalized", "safe"] {
+        let plain: Vec<Value> = requests(Some(json!(tag)))
+            .into_iter()
+            .map(|(m, p)| call(&f.io, m, &p))
+            .collect();
+        let wrapped: Vec<(&str, Value)> = requests(Some(json!({ "blockNumber": tag })))
+            .into_iter()
+            .map(|(m, p)| (m, call(&f.io, m, &p)))
+            .collect();
+        for ((m, w), p) in wrapped.iter().zip(&plain) {
+            assert!(
+                p.get("result").is_none(),
+                "{m}: string '{tag}' must be refused: {p}"
+            );
+            assert!(
+                w.get("result").is_none(),
+                "{m}: {{\"blockNumber\":\"{tag}\"}} must be refused like the string form, \
+                 not answered from head state: {w}"
+            );
+            assert_eq!(
+                w["error"], p["error"],
+                "{m}: same refusal as the string form"
+            );
+        }
+    }
+}

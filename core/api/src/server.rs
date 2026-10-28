@@ -503,6 +503,13 @@ pub struct RpcConfig {
     /// configured trusted proxy answers loopback `Host`s only (DNS-rebinding
     /// defence); every other deployment keeps accepting any `Host`.
     pub allowed_hosts: Vec<String>,
+    /// chain#425 operator opt-out: serve account-state reads whose block tag
+    /// names a canonical block at most this many blocks from the executed head
+    /// (below it, or stored above it) from the head's state. `0` (default) is
+    /// strict: only the executed head. For a private deploy node that runs
+    /// Foundry fork-mode scripts; never on a public RPC. Clamped to
+    /// `state_tag::MAX_RECENT_STATE_TAGS`.
+    pub serve_recent_state_tags: u64,
 }
 
 /// PBA-L1a-023: the `Host` allowlist the HTTP RPC server enforces, or `None`
@@ -553,6 +560,7 @@ impl Default for RpcConfig {
             rate_limit: RateLimitConfig::default(),
             allow_eth_send_transaction: false, // Secure default: reject unsigned tx
             allowed_hosts: Vec::new(),
+            serve_recent_state_tags: 0, // strict (chain#425)
         }
     }
 }
@@ -669,7 +677,7 @@ impl RpcServer {
 
         // Register Ethereum-compatible RPC methods
         // WP-I.3: Pass pause_flag so emergency methods are actually registered
-        eth_rpc::register_eth_methods_with_finality(
+        eth_rpc::register_eth_methods_with_options(
             &mut io_handler,
             storage.clone(),
             mempool.clone(),
@@ -678,6 +686,11 @@ impl RpcServer {
             filter_registry,
             pause_flag,
             finalized.unwrap_or_default(),
+            eth_rpc::EthRpcOptions {
+                state_tags: crate::state_tag::StateTagPolicy::from_config(
+                    config.serve_recent_state_tags,
+                ),
+            },
         );
 
         // Truthful eth_syncing OVERRIDE (last registration wins): report progress
