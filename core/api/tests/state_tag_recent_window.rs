@@ -60,6 +60,8 @@ struct Fx {
     /// A sibling of a95 (parent a94) and a sibling of the head (parent a99).
     side95: Block,
     side100: Block,
+    /// Stored above the head on the side100 fork (does not reach the head).
+    side101: Block,
     _tmp: TempDir,
 }
 
@@ -77,6 +79,7 @@ fn fixture(window: u64) -> Fx {
     }
     let side95 = put(&storage, 0xC0, 95, a[94].hash());
     let side100 = put(&storage, 0xC0, 100, a[99].hash());
+    let side101 = put(&storage, 0xC0, 101, side100.hash());
     storage
         .blocks
         .put_applied_tip(&a[HEAD as usize].hash(), HEAD)
@@ -88,6 +91,7 @@ fn fixture(window: u64) -> Fx {
         a,
         side95,
         side100,
+        side101,
         _tmp: tmp,
     }
 }
@@ -226,6 +230,11 @@ fn window_still_refuses_old_off_chain_unknown_and_unstored_tags() {
         "a pinned sibling",
     );
     refused(&f.io, json!(hx(&f.side100.hash())), "a sibling of the head");
+    refused(
+        &f.io,
+        json!(hx(&f.side101.hash())),
+        "a stored block above the head on a fork that does not reach it",
+    );
     refused(&f.io, json!(hx(&hash_of(0xEE, 7))), "an unknown hash");
     refused(
         &f.io,
