@@ -1145,6 +1145,335 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // Restart with a pruned DAG store (r1006 prod-5, 2026-10-28): a node on
+    // the canonical chain whose DAG store holds only the retained window
+    // restarts, hears one answer it cannot connect, and then syncs. Its
+    // applied tip must never move below where it restarted.
+    // ---------------------------------------------------------------------
+
+    /// Wire a node over `storage` as `start_node` does after a restart: the
+    /// DAG store loaded from its persistent column families, genesis seeded,
+    /// GhostDAG tips reconciled (hydration complete), the applicator seeded
+    /// from the persisted applied tip with genesis wired.
+    ///
+    /// `boot_state`, when given, stands in for `start_node`'s world-state boot
+    /// hydration (it loads every persisted account into the trie).
+    async fn wire_persistent(
+        storage: Arc<StorageManager>,
+        g: &Block,
+        boot_state: Option<citrate_execution::state::StateSnapshot>,
+    ) -> (Node, Arc<DagStore>) {
+        use crate::persistent_dag::RocksDbKvStore;
+        let kv = Arc::new(RocksDbKvStore::new(storage.db.clone()));
+        let dag = Arc::new(DagStore::persistent_with_strict_vrf(kv, false).expect("dag load"));
+        dag.set_configured_genesis(g.header.block_hash);
+        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+        let executor = Arc::new(Executor::with_storage_and_chain_id(
+            Arc::new(StateDB::new()),
+            Some(storage.state.clone()),
+            CHAIN_ID,
+        ));
+        executor.set_pba_hardening(PbaHardening::off());
+        if let Some(state) = boot_state {
+            executor.state_restore(state);
+        }
+        let app = Arc::new(
+            CanonicalApplicator::new(executor.clone(), storage.clone())
+                .with_fork_choice(ghostdag.clone())
+                .with_dag_prune_floor(dag.clone()),
+        );
+        app.set_genesis(
+            Executor::new(Arc::new(StateDB::new())).state_snapshot(),
+            g.header.block_hash,
+        );
+        let admission = Arc::new(BlockAdmission::new(
+            storage.clone(),
+            dag.clone(),
+            ghostdag.clone(),
+            Some(app.clone()),
+        ));
+        admission.seed_genesis().await;
+        ghostdag.reconcile_tips_from_dag_store().await;
+        let sync = SyncManager::new(SyncConfig::default())
+            .with_local_height(app.applied_height_handle())
+            .with_pba_hardening(PbaHardening::off());
+        (
+            Node {
+                storage,
+                executor,
+                app,
+                admission,
+                sync,
+            },
+            dag,
+        )
+    }
+
+    /// A node on the canonical chain `1..=tip` (prefix), DAG store pruned to
+    /// the last `dag_prune::MIN_RETAIN_BLOCKS`, restarted. Returns the
+    /// restarted node and its storage dir.
+    async fn pruned_restarted_node(net: &Net, own: &[Block]) -> (Node, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let g = &net.genesis;
+        storage.blocks.put_block(g).expect("genesis");
+        storage
+            .blocks
+            .put_applied_tip(&g.header.block_hash, 0)
+            .expect("tip");
+        let tip = own.last().expect("own blocks");
+        let tip_height = tip.header.height;
+        let boot_state = {
+            let (n, dag) = wire_persistent(storage.clone(), g, None).await;
+            let fx = n.admission.admit_to_fixpoint(own.to_vec(), |_, _| {}).await;
+            assert_eq!(fx.newly_admitted, own.len(), "own blocks admit");
+            n.app.drive_drain().await;
+            assert_eq!(n.applied(), Some((h(tip), tip_height)), "fixture: applied");
+            let dropped = crate::dag_prune::prune_once(
+                &storage,
+                &dag,
+                tip_height,
+                crate::dag_prune::MIN_RETAIN_BLOCKS,
+            )
+            .await;
+            assert!(dropped > 0, "fixture: the DAG store was pruned");
+            n.executor.state_snapshot()
+        };
+        // Restart: everything in memory is rebuilt from the stores.
+        let (n, _dag) = wire_persistent(storage, g, Some(boot_state)).await;
+        assert_eq!(
+            n.applied(),
+            Some((h(tip), tip_height)),
+            "fixture: the restart seeds the applied tip"
+        );
+        assert_eq!(
+            n.executor.calculate_state_root(),
+            tip.state_root,
+            "fixture: state root verified at restart"
+        );
+        (n, dir)
+    }
+
+    /// Records the lowest durable applied height seen while it runs: a
+    /// from-genesis rebuild resets the durable tip to genesis and replays, so
+    /// a poller sees it even though the rebuild finishes inside one drain.
+    struct TipWatch {
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        lowest: Arc<std::sync::atomic::AtomicU64>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl TipWatch {
+        fn start(storage: Arc<StorageManager>) -> Self {
+            use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+            let stop = Arc::new(AtomicBool::new(false));
+            let lowest = Arc::new(AtomicU64::new(u64::MAX));
+            let (s, l) = (stop.clone(), lowest.clone());
+            let handle = std::thread::spawn(move || {
+                while !s.load(Ordering::SeqCst) {
+                    if let Ok(Some((_, h))) = storage.blocks.get_applied_tip() {
+                        l.fetch_min(h, Ordering::SeqCst);
+                    }
+                }
+            });
+            Self {
+                stop,
+                lowest,
+                handle: Some(handle),
+            }
+        }
+
+        fn finish(mut self) -> u64 {
+            use std::sync::atomic::Ordering;
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(h) = self.handle.take() {
+                h.join().expect("watch thread");
+            }
+            self.lowest.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Sync after the restart, as [`drive`] does, recording the applied height
+    /// after every delivered answer. `first` is delivered before the loop as an
+    /// answer from `PEER` to a request the tracker did not make (the r1006
+    /// missing-parent request: anchored above the applied tip).
+    async fn drive_recording(
+        node: &Node,
+        tracker: &mut RejoinTracker,
+        peer: &StorageManager,
+        first: Vec<Block>,
+        target: Hash,
+        network_height: u64,
+        max_rounds: usize,
+    ) -> (Run, Vec<u64>) {
+        let mut run = Run::default();
+        let mut applied = Vec::new();
+        let mut orphans: Vec<Block> = Vec::new();
+        deliver(node, tracker, &mut orphans, PEER, first, network_height).await;
+        applied.push(node.applied().expect("applied tip").1);
+        while run.rounds < max_rounds {
+            let tip = node.applied().expect("applied tip");
+            if tip.0 == target {
+                break;
+            }
+            run.rounds += 1;
+            tracker.note_sync_target(network_height, tip.1);
+            let anchor = tracker.anchor(tip, |ht| anchor_at_height(&node.storage, ht));
+            tracker.note_asked(PEER, anchor);
+            run.anchors.push(anchor.1);
+            let answer = block_serve::serve_blocks(peer, &anchor.0, 32);
+            deliver(node, tracker, &mut orphans, PEER, answer, network_height).await;
+            applied.push(node.applied().expect("applied tip").1);
+            run.modes.push(tracker.mode().clone());
+        }
+        (run, applied)
+    }
+
+    /// r1006 prod-5: restarted at its applied tip on the canonical chain with
+    /// the DAG store pruned below the retained window, one barren answer
+    /// (anchored above the applied tip), then ordinary sync. The applied tip
+    /// never moves below the restart tip, and the node reaches the network tip.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pruned_restart_then_barren_answer_never_rewinds() {
+        let tip_height = 1_200u64;
+        let network_tip = tip_height + 89;
+        let net = net(tip_height, tip_height, network_tip);
+        let pdir = tempfile::tempdir().expect("tempdir");
+        let peer = peer_store(&net, false, pdir.path());
+        let (n, _ndir) = pruned_restarted_node(&net, &net.prefix).await;
+        let main_tip = net.main.last().expect("main");
+        // The barren answer: what the peer serves for an anchor 87 above the
+        // applied tip (nothing in it connects).
+        let barren_anchor = &net.main[86];
+        let barren = block_serve::serve_blocks(&peer, &h(barren_anchor), 32);
+        assert!(!barren.is_empty(), "fixture: the peer serves that range");
+        let mut tracker = RejoinTracker::new();
+        let (run, applied) = drive_recording(
+            &n,
+            &mut tracker,
+            &peer,
+            barren,
+            h(main_tip),
+            network_tip,
+            200,
+        )
+        .await;
+        let lowest = applied.iter().copied().min().unwrap_or(0);
+        assert!(
+            lowest >= tip_height,
+            "the applied tip moved below the restart tip {tip_height}: lowest {lowest}; \
+             applied {applied:?}; anchors {:?}; modes {:?}",
+            run.anchors,
+            run.modes
+        );
+        assert!(
+            applied.windows(2).all(|w| w[1] >= w[0]),
+            "the applied tip moved backwards: {applied:?}"
+        );
+        assert_eq!(
+            n.applied(),
+            Some((h(main_tip), network_tip)),
+            "the node reaches the network tip: anchors {:?}",
+            run.anchors
+        );
+    }
+
+    /// The same restart, but the node's last block (its own, sealed before it
+    /// stopped) never reached the network: the restart tip is one block off
+    /// the heavier chain, and the fork point is below the only state snapshot
+    /// a restart keeps. Reaching the heavier chain from there takes a replay
+    /// from genesis, which on a pruned node is refused: the durable applied
+    /// tip never goes below the fork point (it stays on its own tip, as before
+    /// the fork-point search existed; an operator resync moves it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pruned_restart_one_block_off_never_rewinds_below_the_fork_point() {
+        let fork = 1_199u64;
+        let network_tip = fork + 90;
+        let net = net(fork, fork + 1, network_tip);
+        let pdir = tempfile::tempdir().expect("tempdir");
+        let peer = peer_store(&net, false, pdir.path());
+        let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
+        let (n, _ndir) = pruned_restarted_node(&net, &own).await;
+        let main_tip = net.main.last().expect("main");
+        let barren = block_serve::serve_blocks(&peer, &h(&net.main[87]), 32);
+        let watch = TipWatch::start(n.storage.clone());
+        let mut tracker = RejoinTracker::new();
+        let (run, applied) = drive_recording(
+            &n,
+            &mut tracker,
+            &peer,
+            barren,
+            h(main_tip),
+            network_tip,
+            200,
+        )
+        .await;
+        let lowest = watch
+            .finish()
+            .min(applied.iter().copied().min().unwrap_or(0));
+        assert!(
+            lowest >= fork,
+            "the durable applied tip went below the fork point {fork}: lowest {lowest}; \
+             applied {applied:?}; anchors {:?}",
+            run.anchors
+        );
+        assert_eq!(
+            n.applied(),
+            Some((h(&net.side[0]), fork + 1)),
+            "the node keeps its own tip: anchors {:?}",
+            run.anchors
+        );
+    }
+
+    /// A restarted node on the canonical chain hears of a sibling of its tip
+    /// (same height, same score, smaller hash: the fork-choice tie-break
+    /// prefers it until the tip's children arrive). The durable applied tip
+    /// must never go below the restart tip's parent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pruned_restart_tip_sibling_never_rewinds() {
+        let tip_height = 1_200u64;
+        let network_tip = tip_height + 89;
+        let net = net(tip_height, tip_height, network_tip);
+        let tip = net.prefix.last().expect("prefix");
+        let parent = h(&net.prefix[net.prefix.len() - 2]);
+        let sibling = loop {
+            let k = crypto::generate_keypair();
+            let b = seal(&k, tip_height, parent, tip.state_root);
+            if h(&b) < h(tip) {
+                break b;
+            }
+        };
+        let pdir = tempfile::tempdir().expect("tempdir");
+        let peer = peer_store(&net, false, pdir.path());
+        let (n, _ndir) = pruned_restarted_node(&net, &net.prefix).await;
+        let main_tip = net.main.last().expect("main");
+        let watch = TipWatch::start(n.storage.clone());
+        let mut tracker = RejoinTracker::new();
+        let (run, applied) = drive_recording(
+            &n,
+            &mut tracker,
+            &peer,
+            vec![sibling],
+            h(main_tip),
+            network_tip,
+            200,
+        )
+        .await;
+        let lowest = watch
+            .finish()
+            .min(applied.iter().copied().min().unwrap_or(0));
+        assert!(
+            lowest >= tip_height - 1,
+            "the durable applied tip went below {}: lowest {lowest}; applied {applied:?}; \
+             anchors {:?}",
+            tip_height - 1,
+            run.anchors
+        );
+        assert_eq!(n.applied(), Some((h(main_tip), network_tip)));
+    }
+
+    // ---------------------------------------------------------------------
     // Wiring: the node's GetBlocks anchor comes from the tracker, and the
     // Blocks handler feeds it every answer it recognises.
     // ---------------------------------------------------------------------

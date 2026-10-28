@@ -428,19 +428,11 @@ impl BlockAdmission {
     }
 
     /// D4a: the height below which DAG pruning has deliberately dropped
-    /// blocks from the DAG store (`DagStore::prune` removes everything
-    /// strictly below the pruning point's height). 0 when pruning has never
-    /// run, or the pruning point block cannot be read, which keeps the
-    /// pre-D4a behaviour (repair) as the fallback.
+    /// blocks from the DAG store (see [`crate::dag_prune::pruned_below`]). 0
+    /// when pruning has never run, which keeps the pre-D4a behaviour (repair)
+    /// as the fallback.
     async fn dag_pruned_below(&self) -> u64 {
-        let point = self.dag_store.get_pruning_point().await;
-        if point == Hash::default() {
-            return 0;
-        }
-        match self.dag_store.get_block(&point).await {
-            Ok(b) => b.header.height,
-            Err(_) => 0,
-        }
+        crate::dag_prune::pruned_below(&self.dag_store).await
     }
 
     /// Whether `hash` is present in BOTH stores.

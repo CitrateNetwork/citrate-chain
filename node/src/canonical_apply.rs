@@ -51,6 +51,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
+use citrate_consensus::dag_store::DagStore;
 use citrate_consensus::ghostdag::GhostDag;
 use citrate_consensus::types::{Block, Hash};
 use citrate_economics::{RewardCalculator, RewardConfig};
@@ -664,6 +665,9 @@ pub struct CanonicalApplicator {
     /// the rebuild forever and wedged the miner. `None` (tests without fork-choice, or
     /// a fixed-tip stub) means "treat as hydrated" so the rebuild is not gated.
     dag_hydrated: Option<Arc<AtomicBool>>,
+    /// The DAG store whose pruning floor bounds the runtime from-genesis
+    /// rebuild (see [`Self::with_dag_prune_floor`]). `None`: not wired.
+    dag_prune_floor: Option<Arc<DagStore>>,
 }
 
 impl CanonicalApplicator {
@@ -748,6 +752,7 @@ impl CanonicalApplicator {
             genesis: OnceLock::new(),
             rebuild_in_progress: Arc::new(AtomicBool::new(false)),
             dag_hydrated: None,
+            dag_prune_floor: None,
         }
     }
 
@@ -785,6 +790,13 @@ impl CanonicalApplicator {
             let g = ghostdag.clone();
             Box::pin(async move { g.select_tip().await.ok() })
         }));
+        self
+    }
+
+    /// Wire the DAG store whose pruning floor bounds the runtime from-genesis
+    /// rebuild.
+    pub fn with_dag_prune_floor(mut self, dag_store: Arc<DagStore>) -> Self {
+        self.dag_prune_floor = Some(dag_store);
         self
     }
 

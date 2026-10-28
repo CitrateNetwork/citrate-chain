@@ -94,6 +94,25 @@ pub fn pruning_point_height(applied_height: u64, retain: u64) -> Option<u64> {
     Some(point)
 }
 
+/// The height below which DAG pruning has dropped blocks from `dag_store`
+/// (`DagStore::prune` removes everything strictly below the pruning point's
+/// height). 0 when pruning has never run, or the pruning point block cannot be
+/// read.
+///
+/// Readers: admission (a re-delivered block below it is already held) and the
+/// applicator (it never rebuilds the applied chain from genesis on a pruned
+/// node; see `CanonicalApplicator::with_dag_prune_floor`).
+pub async fn pruned_below(dag_store: &DagStore) -> u64 {
+    let point = dag_store.get_pruning_point().await;
+    if point == citrate_consensus::types::Hash::default() {
+        return 0;
+    }
+    match dag_store.get_block(&point).await {
+        Ok(b) => b.header.height,
+        Err(_) => 0,
+    }
+}
+
 /// Run one pruning pass. Returns the number of blocks dropped from the DAG store.
 ///
 /// Reads the canonical height->hash mapping from the CHAIN store
