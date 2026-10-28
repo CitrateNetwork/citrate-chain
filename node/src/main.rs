@@ -89,6 +89,7 @@ mod registry_sync;
 mod rollback;
 mod startup_guards;
 mod sync_peer;
+mod sync_rejoin;
 mod timing;
 
 use citrate_consensus::dag_store::DagStore;
@@ -3015,6 +3016,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // the tick task alone only ever observes failures, which is how a peer
         // could accumulate penalties it had no way to shed.
         let sync_peers = Arc::new(tokio::sync::Mutex::new(sync_peer::SyncPeerSelector::new()));
+        // sync_rejoin.rs: the GetBlocks anchor policy (applied tip, or a search
+        // for the fork point when this node is on a side branch). Shared with
+        // the message handler, which judges the answers.
+        let rejoin = Arc::new(parking_lot::Mutex::new(sync_rejoin::RejoinTracker::new()));
+        let rejoin_for_rx = rejoin.clone();
 
         // Periodic sync tick: request headers/blocks and check timeouts
         let pm_for_sync = pm_for_rx.clone();
@@ -3022,6 +3028,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let storage_for_sync = storage.clone();
         let max_seen_for_sync = max_seen_height.clone();
         let sync_peers_for_loop = sync_peers.clone();
+        let rejoin_for_loop = rejoin.clone();
         tokio::spawn(async move {
             // #150: `attempt_counts` (an unpruned HashMap keyed by every anchor
             // ever timed out — also a slow leak) and `pending_retries` are gone
@@ -3202,12 +3209,27 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                        // producer's tip. The applied tip is the last block we truly
                                        // extended state with, so requesting ITS children is the gap
                                        // we actually need. Genesis sentinel when nothing is applied.
-                    let (start_from, start_height) = storage_for_sync
+                    let applied_tip = storage_for_sync
                         .blocks
                         .get_applied_tip()
                         .ok()
                         .flatten()
                         .unwrap_or_else(|| (citrate_consensus::types::Hash::new([0u8; 32]), 0));
+                    // sync_rejoin.rs: the BLOCK anchor is the applied tip unless
+                    // answers to it show this node is on a branch the network
+                    // does not extend; then it walks down to the fork point and
+                    // follows the heavier branch up. Headers stay on the tip.
+                    let start_from = applied_tip.0;
+                    // "Behind" for the tracker: the clamped sync target this
+                    // tick pulls toward (advertised heads included), not only
+                    // gossip evidence.
+                    rejoin_for_loop
+                        .lock()
+                        .note_sync_target(target, applied_tip.1);
+                    let (block_from, block_height) =
+                        rejoin_for_loop.lock().anchor(applied_tip, |h| {
+                            sync_rejoin::anchor_at_height(&storage_for_sync, h)
+                        });
                     // Request next headers and blocks from our last known point only if not saturated
                     let (ph, pb) = sync_for_loop.pending_counts().await;
                     // #151: a request that FAILS TO SEND must count against this peer.
@@ -3242,13 +3264,28 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     {
                         send_failed = true;
                     }
-                    if pb < 8
-                        && sync_for_loop
-                            .request_blocks(&peer, start_from, start_height)
-                            .await
-                            .is_err()
-                    {
-                        send_failed = true;
+                    if pb < 8 {
+                        // Only a request that was actually SENT is recorded as
+                        // asked (Ok(false): anchor already pending, or the
+                        // in-flight cap; nothing went on the wire).
+                        let sent = sync_for_loop
+                            .request_blocks(&peer, block_from, block_height)
+                            .await;
+                        if sent.is_err() {
+                            send_failed = true;
+                        } else if matches!(sent, Ok(true)) {
+                            let pid = peer.info.read().await.id.clone();
+                            let gave_up = rejoin_for_loop
+                                .lock()
+                                .note_asked(&pid.0, (block_from, block_height));
+                            if let Some(t) = gave_up {
+                                tracing::info!(
+                                    "SYNCREJOIN {:?} (no matching answer to {} requests)",
+                                    t,
+                                    sync_rejoin::MAX_UNANSWERED
+                                );
+                            }
+                        }
                     }
                     if send_failed {
                         let pid = peer.info.read().await.id.clone();
@@ -3403,6 +3440,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // the contract-deploy region). Bounded to cap memory if a parent never
             // arrives; the sync loop independently re-requests missing parents.
             let mut orphan_blocks: Vec<citrate_consensus::types::Block> = Vec::new();
+            // sync_rejoin.rs: bound on SYNCREJOIN info lines.
+            let mut rejoin_log = sync_rejoin::RejoinLogBudget::new();
             while let Some((pid, msg)) = in_rx.recv().await {
                 // #149 liveness heartbeat. Bumped BEFORE the message is handled,
                 // so a loop that is stuck inside a handler stops advancing this
@@ -3784,12 +3823,27 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                 b,
                             );
                         }
+                        // sync_rejoin.rs: the answer's hashes as received (only
+                        // for "was it empty"); matching uses the validated set.
+                        let answer_hashes: Vec<citrate_consensus::types::Hash> =
+                            blocks.iter().map(|b| b.header.block_hash).collect();
                         // WP-H.4: handle_blocks now validates each block
                         let _ = sync_for_rx.handle_blocks(&pid, blocks).await;
                         // WP-H.5: Drain validated blocks and persist to chain store.
                         // Without this, synced blocks live only in SyncManager memory
                         // and are never integrated into the DAG.
                         let mut pending = sync_for_rx.drain_validated_blocks().await;
+                        // sync_rejoin.rs: is this the asked peer's answer to the
+                        // anchor the sync tick asked for? Judged on the blocks that
+                        // passed validation (their hashes recompute).
+                        let verified_hashes: std::collections::HashSet<
+                            citrate_consensus::types::Hash,
+                        > = pending.iter().map(|b| b.header.block_hash).collect();
+                        let answers_rejoin = rejoin_for_rx.lock().take_answer(
+                            &pid.0,
+                            &answer_hashes,
+                            &verified_hashes,
+                        );
                         // #85 (deep bulk-sync wedge): admit in topological
                         // (height-ascending) order — every parent (selected OR
                         // merge) has strictly lower height than its child, and the
@@ -3826,79 +3880,37 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // #153: how much of this response was genuinely NEW. A
                         // response that admits nothing is not service, however
                         // well-formed it was — see the credit call after the loop.
-                        let mut newly_admitted: usize = 0;
-                        let mut highest_admitted: u64 = 0;
-                        loop {
-                            let mut progressed = false;
-                            let mut deferred: Vec<citrate_consensus::types::Block> = Vec::new();
-                            for block in std::mem::take(&mut pending) {
-                                // SYNC-S1 / D2: one call, idempotent and
-                                // crash-safe. The pre-D2 body open-coded
-                                // store_block -> add_block -> put_block and
-                                // began with `if has_block(chain) { continue }`
-                                // — a chain-store-only check that skipped a
-                                // block whose DAG half was already written,
-                                // and whose `Err(BlockExists) => {}` arm then
-                                // dropped the block without ever reaching
-                                // put_block. An OOM kill between those two
-                                // writes therefore froze the applied tip
-                                // permanently (boot-3 @ 10944). Presence is
-                                // now established per-store inside `admit`.
-                                match admission_for_net.admit(&block).await {
-                                    admission::AdmitOutcome::Admitted { completed_partial } => {
-                                        progressed = true;
-                                        // #153: this block was NEW. Only this arm
-                                        // counts — `AlreadyAdmitted` is a block we
-                                        // already had, which is exactly what a peer
-                                        // at our own height serves back forever.
-                                        newly_admitted = newly_admitted.saturating_add(1);
-                                        if block.header.height > highest_admitted {
-                                            highest_admitted = block.header.height;
-                                        }
-                                        // F2: record the signed, genesis-linked synced block
-                                        // as an attested candidate (see the H1 note above).
-                                        attested_for_rx.observe(&storage_for_handler, &block);
-                                        if completed_partial {
-                                            // D4a: admission.rs already warns (budgeted); a
-                                            // per-block warn here doubled the storm.
-                                            tracing::debug!(
-                                                "Completed a partial admission of synced block {} @ {}",
-                                                hex::encode(&block.header.block_hash.as_bytes()[..8]),
-                                                block.header.height
-                                            );
-                                        }
-                                    }
-                                    // Fully present already: no progress, but
-                                    // not an orphan either — drop it from the
-                                    // fixpoint set.
-                                    admission::AdmitOutcome::AlreadyAdmitted => {}
-                                    // Parent not admitted yet — DEFER, never
-                                    // drop. A parent riding a later batch can
-                                    // still unblock this child.
-                                    admission::AdmitOutcome::Deferred { missing_parent } => {
-                                        tracing::debug!(
-                                            "Deferred synced block {} @ {}: missing parent {}",
-                                            hex::encode(&block.header.block_hash.as_bytes()[..8]),
-                                            block.header.height,
-                                            hex::encode(&missing_parent.as_bytes()[..8])
-                                        );
-                                        deferred.push(block);
-                                    }
-                                    admission::AdmitOutcome::Rejected(why) => {
-                                        tracing::warn!(
-                                            "Rejected inconsistent synced block {} @ {}: {}",
-                                            hex::encode(&block.header.block_hash.as_bytes()[..8]),
-                                            block.header.height,
-                                            why
-                                        );
-                                    }
+                        // SYNC-S1 / D2: `admit` is the one idempotent, crash-safe
+                        // path; the fixpoint loop around it is shared with the sync
+                        // tests (`BlockAdmission::admit_to_fixpoint`).
+                        let fixpoint = admission_for_net
+                            .admit_to_fixpoint(pending, |block, completed_partial| {
+                                // F2: record the signed, genesis-linked synced block
+                                // as an attested candidate (see the H1 note above).
+                                attested_for_rx.observe(&storage_for_handler, block);
+                                if completed_partial {
+                                    // D4a: admission.rs already warns (budgeted); a
+                                    // per-block warn here doubled the storm.
+                                    tracing::debug!(
+                                        "Completed a partial admission of synced block {} @ {}",
+                                        hex::encode(&block.header.block_hash.as_bytes()[..8]),
+                                        block.header.height
+                                    );
                                 }
-                            }
-                            pending = deferred;
-                            if !progressed {
-                                break;
-                            }
-                        }
+                            })
+                            .await;
+                        let newly_admitted = fixpoint.newly_admitted;
+                        let fixpoint_highest = fixpoint.highest_admitted;
+                        let highest_admitted = fixpoint_highest.map(|(_, h)| h).unwrap_or(0);
+                        // Blocks of THIS answer still waiting for a parent: the
+                        // signal that we are on a branch the peer's chain does not
+                        // extend (see sync_rejoin.rs).
+                        let deferred_from_answer = fixpoint
+                            .deferred
+                            .iter()
+                            .filter(|b| verified_hashes.contains(&b.header.block_hash))
+                            .count();
+                        let mut pending = fixpoint.deferred;
                         // Buffer unresolved orphans for the next Blocks batch (their
                         // parents are still en route). CHAIN-B-A005: bound the
                         // buffer by BOTH count and serialized bytes, de-duplicated
@@ -3952,6 +3964,36 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             // Barren 191 times and driven to the -8 floor for
                             // answering exactly what we asked.
                             let stale_anchor = sync_for_rx.last_block_anchor_height() < applied_now;
+                            // sync_rejoin.rs: steer the next anchor on this answer.
+                            if let Some(anchor_height) = answers_rejoin {
+                                let answer = sync_rejoin::classify(
+                                    answer_hashes.is_empty(),
+                                    newly_admitted,
+                                    fixpoint_highest,
+                                    deferred_from_answer,
+                                );
+                                let transition =
+                                    rejoin_for_rx
+                                        .lock()
+                                        .on_answer(answer, gap > 0, anchor_height);
+                                if let Some(t) = transition {
+                                    // Bounded: a budget of lines per window,
+                                    // the rest counted (see RejoinLogBudget).
+                                    if let Some(suppressed) =
+                                        rejoin_log.allow(std::time::Instant::now())
+                                    {
+                                        tracing::info!(
+                                            "SYNCREJOIN {:?} (peer={} anchor={} applied={} gap={} suppressed_before={})",
+                                            t,
+                                            pid.0.get(..14).unwrap_or(&pid.0),
+                                            anchor_height,
+                                            applied_now,
+                                            gap,
+                                            suppressed
+                                        );
+                                    }
+                                }
+                            }
                             let mut sel = sync_peers_for_rx.lock().await;
                             let quality = sel.record_serve(
                                 &pid.0,

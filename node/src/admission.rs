@@ -214,6 +214,17 @@ const REPAIR_LOG_PER_WINDOW: u64 = 20;
 const PRUNED_LOG_PER_WINDOW: u64 = 1;
 const LOG_WINDOW_SECS: u64 = 60;
 
+/// What [`BlockAdmission::admit_to_fixpoint`] did with a batch.
+#[derive(Debug, Default)]
+pub struct FixpointOutcome {
+    /// Blocks admitted for the first time.
+    pub newly_admitted: usize,
+    /// The highest newly admitted block, `(hash, height)`.
+    pub highest_admitted: Option<(Hash, u64)>,
+    /// Blocks still waiting for a parent.
+    pub deferred: Vec<Block>,
+}
+
 /// Result of an admission attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdmitOutcome {
@@ -649,6 +660,68 @@ impl BlockAdmission {
         }
 
         AdmitOutcome::Admitted { completed_partial }
+    }
+
+    /// Admit a batch of synced blocks to a fixpoint: a block deferred only
+    /// because its parent is later in the same batch is retried once the parent
+    /// is in, until a pass admits nothing. `on_admitted` runs for each newly
+    /// admitted block with its `completed_partial` flag.
+    ///
+    /// This is the `Blocks` handler's loop, shared with the sync tests so they
+    /// exercise the code the node runs. Blocks still deferred at the end are
+    /// returned for the caller's bounded orphan buffer.
+    pub async fn admit_to_fixpoint(
+        &self,
+        mut pending: Vec<Block>,
+        mut on_admitted: impl FnMut(&Block, bool),
+    ) -> FixpointOutcome {
+        let mut out = FixpointOutcome::default();
+        loop {
+            let mut progressed = false;
+            let mut deferred: Vec<Block> = Vec::new();
+            for block in std::mem::take(&mut pending) {
+                match self.admit(&block).await {
+                    AdmitOutcome::Admitted { completed_partial } => {
+                        progressed = true;
+                        // #153: only this arm is NEW. `AlreadyAdmitted` is a
+                        // block we already had, which is exactly what a peer at
+                        // our own height serves back forever.
+                        out.newly_admitted = out.newly_admitted.saturating_add(1);
+                        let h = block.header.height;
+                        if out.highest_admitted.is_none_or(|(_, best)| h > best) {
+                            out.highest_admitted = Some((block.header.block_hash, h));
+                        }
+                        on_admitted(&block, completed_partial);
+                    }
+                    // Fully present already: no progress, not an orphan.
+                    AdmitOutcome::AlreadyAdmitted => {}
+                    // Parent not admitted yet: DEFER, never drop.
+                    AdmitOutcome::Deferred { missing_parent } => {
+                        debug!(
+                            "Deferred synced block {} @ {}: missing parent {}",
+                            hex::encode(&block.header.block_hash.as_bytes()[..8]),
+                            block.header.height,
+                            hex::encode(&missing_parent.as_bytes()[..8])
+                        );
+                        deferred.push(block);
+                    }
+                    AdmitOutcome::Rejected(why) => {
+                        warn!(
+                            "Rejected inconsistent synced block {} @ {}: {}",
+                            hex::encode(&block.header.block_hash.as_bytes()[..8]),
+                            block.header.height,
+                            why
+                        );
+                    }
+                }
+            }
+            pending = deferred;
+            if !progressed {
+                break;
+            }
+        }
+        out.deferred = pending;
+        out
     }
 
     /// PIL-42: make genesis the DAG's height-0 root if it is only in the chain
