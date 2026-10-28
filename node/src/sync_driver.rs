@@ -772,6 +772,10 @@ mod tests {
         StaleBranch,
         /// DGX-REVIEW-2: random hash for every header; every GetBlocks empty.
         AnchorLiarEmpty,
+        /// DGX-REVIEW-4: claims a head far above the chain; every header
+        /// answer is a fresh fabricated run above `from` (random hashes, the
+        /// height encoded in the hash); every GetBlocks answered empty.
+        TipLiar,
     }
 
     /// `block` moved onto a parent nobody holds and re-signed by `key`.
@@ -929,7 +933,7 @@ mod tests {
                                 }
                                 out
                             }
-                            Behaviour::AnchorLiarEmpty => Vec::new(),
+                            Behaviour::AnchorLiarEmpty | Behaviour::TipLiar => Vec::new(),
                             Behaviour::StaleBranch => {
                                 match alt
                                     .as_ref()
@@ -1026,6 +1030,47 @@ mod tests {
                                 hs
                             }
                             Behaviour::EmptyOrSilent => Vec::new(),
+                            Behaviour::TipLiar => {
+                                let base = if from == Hash::new([0u8; 32]) {
+                                    Some(0)
+                                } else {
+                                    storage
+                                        .blocks
+                                        .get_block(&from)
+                                        .ok()
+                                        .flatten()
+                                        .map(|b| b.header.height)
+                                };
+                                let fh = base.unwrap_or_else(|| {
+                                    let b = from.as_bytes();
+                                    let mut a = [0u8; 8];
+                                    a.copy_from_slice(&b[..8]);
+                                    u64::from_be_bytes(a)
+                                });
+                                // Template: a real header (height 1), re-numbered.
+                                let tmpl = storage
+                                    .blocks
+                                    .get_block_by_height(1)
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|h| storage.blocks.get_block(&h).ok().flatten())
+                                    .map(|b| b.header);
+                                let mut hs = Vec::new();
+                                if let Some(t) = tmpl {
+                                    for h in fh + 1..=fh + u64::from(count) {
+                                        let mut x = t.clone();
+                                        x.height = h;
+                                        let mut r = [0u8; 32];
+                                        r[..8].copy_from_slice(&h.to_be_bytes());
+                                        r[8..16].copy_from_slice(&hk.to_be_bytes());
+                                        r[31] = 0x66;
+                                        x.block_hash = Hash::new(r);
+                                        hs.push(x);
+                                    }
+                                }
+                                hk += 1;
+                                hs
+                            }
                             Behaviour::AnchorLiarEmpty => {
                                 let mut hs = block_serve::serve_headers(&storage, &from, count);
                                 for h in &mut hs {
@@ -1814,5 +1859,151 @@ mod tests {
         )
         .await;
         assert_eq!(applied, n, "stopped at {applied} of {n} after {secs:.0}s");
+    }
+    /// `liars` peers that claim a head far above the chain, answer every
+    /// GetHeaders with a fresh made-up run above `from` and every GetBlocks
+    /// with nothing (sorted first); then `extra_bad`; then `honest` honest
+    /// peers at head `n`. Sync from genesis toward `target` for at most
+    /// `secs`. Returns (applied, idle GetBlocks/s, GetHeaders/s).
+    async fn against_tip_liars(
+        n: u64,
+        target: u64,
+        liars: usize,
+        extra_bad: &[Behaviour],
+        honest: usize,
+        secs: u64,
+    ) -> (u64, f64, f64) {
+        let chain = build_chain(n).await;
+        let serve_dir = tempfile::tempdir().expect("tempdir");
+        let serving = store_with(&chain, serve_dir.path());
+        let node_dir = tempfile::tempdir().expect("tempdir");
+        let f = follower(&chain, node_dir.path()).await;
+        let (in_tx, in_rx) = mpsc::channel::<(PeerId, NetworkMessage)>(4096);
+        let wire = Arc::new(std::sync::Mutex::new(Wire::default()));
+        let mut peers = Vec::new();
+        for i in 0..liars {
+            peers.push(spawn_peer_alt(
+                &format!("peer-l{i}"),
+                Behaviour::TipLiar,
+                n + 1000,
+                serving.clone(),
+                None,
+                in_tx.clone(),
+                wire.clone(),
+            ));
+        }
+        for (i, b) in extra_bad.iter().enumerate() {
+            peers.push(spawn_peer_alt(
+                &format!("peer-a{i}"),
+                *b,
+                n + 1000,
+                serving.clone(),
+                None,
+                in_tx.clone(),
+                wire.clone(),
+            ));
+        }
+        for i in 0..honest {
+            peers.push(spawn_peer(
+                &format!("peer-z{i}"),
+                Behaviour::Honest,
+                n,
+                serving.clone(),
+                in_tx.clone(),
+                wire.clone(),
+            ));
+        }
+        let out = run_sync(&f, peers, in_rx, target, Duration::from_secs(secs)).await;
+        let w = wire.lock().expect("wire");
+        let idle = w.get_blocks.saturating_sub(out.applied.div_ceil(32));
+        let rb = idle as f64 / out.secs;
+        let rh = w.get_headers as f64 / out.secs;
+        println!(
+            "SYNCRATE tip-liars={liars} extra={extra_bad:?} honest={honest} n={n} applied={} \
+             secs={:.1} get_blocks={} get_headers={} idle_get_blocks_per_sec={rb:.2} \
+             get_headers_per_sec={rh:.2} scheduler={:?}",
+            out.applied,
+            out.secs,
+            w.get_blocks,
+            w.get_headers,
+            f.driver.sync().range_counters()
+        );
+        if out.applied == n {
+            let tip = chain.blocks.last().expect("non-empty");
+            let (tip_hash, _) = f.storage.blocks.get_applied_tip().unwrap().unwrap();
+            assert_eq!(tip_hash, tip.header.block_hash);
+            assert_eq!(f.executor.calculate_state_root(), tip.state_root);
+        }
+        (out.applied, rb, rh)
+    }
+
+    /// Header requests are paced like block requests.
+    const MAX_IDLE_GET_HEADERS_PER_SEC: f64 = 1.0;
+
+    async fn tip_liar_rates(liars: usize, extra_bad: &[Behaviour]) {
+        let (applied, rb, rh) =
+            // Target above every honest head: the node idles at the tip.
+            against_tip_liars(64, 164, liars, extra_bad, 1, rate_secs().max(30)).await;
+        assert_eq!(applied, 64);
+        assert!(
+            rb <= MAX_IDLE_GET_BLOCKS_PER_SEC,
+            "{liars} made-up-header peers: {rb:.2} idle GetBlocks/s"
+        );
+        assert!(
+            rh <= MAX_IDLE_GET_HEADERS_PER_SEC,
+            "{liars} made-up-header peers: {rh:.2} GetHeaders/s"
+        );
+    }
+
+    /// At the tip, with peers that claim a higher head, answer headers with
+    /// made-up runs and blocks with nothing: re-anchoring on each new run
+    /// must not raise the request rate. Two such peers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn at_the_tip_two_made_up_header_peers_stay_at_the_idle_rate() {
+        tip_liar_rates(2, &[]).await;
+    }
+
+    /// Same, eight such peers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn at_the_tip_eight_made_up_header_peers_stay_at_the_idle_rate() {
+        tip_liar_rates(8, &[]).await;
+    }
+
+    /// Same, one such peer plus an empty-or-silent one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn at_the_tip_a_made_up_header_peer_and_a_silent_one_stay_at_the_idle_rate() {
+        tip_liar_rates(1, &[Behaviour::EmptyOrSilent]).await;
+    }
+
+    async fn catch_up_past_tip_liars(liars: usize) {
+        let n = env_u64("CITRATE_SYNC_TEST_ADV_BLOCKS", 1_500);
+        let (applied, rb, rh) =
+            against_tip_liars(n, n, liars, &[], 1, adversarial_deadline(n)).await;
+        assert_eq!(
+            applied, n,
+            "{liars} made-up-header peers: stopped at {applied} of {n}"
+        );
+        // Wasted block requests stay within the idle budget during catch-up
+        // too, and header requests near a clean run's (about 3/s).
+        assert!(
+            rb <= MAX_IDLE_GET_BLOCKS_PER_SEC,
+            "{liars} made-up-header peers: {rb:.2} wasted GetBlocks/s during catch-up"
+        );
+        assert!(
+            rh <= 4.0,
+            "{liars} made-up-header peers: {rh:.2} GetHeaders/s during catch-up"
+        );
+    }
+
+    /// Catch-up completes, on the right tip and state, past two such peers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catch_up_completes_past_two_made_up_header_peers() {
+        catch_up_past_tip_liars(2).await;
+    }
+
+    /// ... and past eight.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catch_up_completes_past_eight_made_up_header_peers() {
+        catch_up_past_tip_liars(8).await;
     }
 }
