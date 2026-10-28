@@ -140,6 +140,12 @@ def check_inventory(inv: dict) -> list[str]:
         if name in seen:
             out.append(f"{name} listed twice")
         seen.add(name)
+        if "serve_recent_state_tags" in h:
+            # The operator endpoint's [rpc] window (smoke's forge reads go there). The node
+            # clamps above 1024 (core/api/src/state_tag.rs MAX_RECENT_STATE_TAGS).
+            n = h["serve_recent_state_tags"]
+            if not isinstance(n, int) or isinstance(n, bool) or not 0 <= n <= 1024:
+                out.append(f"{name}: serve_recent_state_tags {n!r} is not an integer 0-1024")
         m = collect.IP_RE.match(ip)
         if not m or any(int(x) > 255 for x in m.groups()):
             out.append(f"{name}: {ip!r} is not an IPv4 address")

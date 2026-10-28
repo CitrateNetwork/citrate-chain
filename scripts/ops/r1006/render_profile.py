@@ -13,7 +13,9 @@ The profile is the template (status pending-genesis) with the values that only e
 after the keys and the genesis: the genesis hash and profile, the ValidatorRegistry and
 activation height from the fill, and the bootnodes, which are the OTHER producers
 (private bring-up: the public bootnodes are not used). RPC stays on loopback
-(gen_node_config.py always binds it there). The result is what gen_node_config.py
+(gen_node_config.py always binds it there). --serve-recent-state-tags N (from the host's
+inventory entry; only the designated operator host has one) adds
+{"rpc": {"serve_recent_state_tags": N}}; without it the host's RPC stays strict. The result is what gen_node_config.py
 --profile <path> reads on the host.
 
 The fill result (written by the genesis builder's validator-set fill) is the contract
@@ -49,6 +51,8 @@ ADDR = re.compile(r"^0x[0-9a-fA-F]{40}$")
 WEI_PER_SALT = 10**18
 # The node refuses a validator activation height below S(1) = EPOCH - SNAPSHOT_LAG = 800.
 MIN_ACTIVATION = 800
+# [rpc] serve_recent_state_tags: the node clamps above this (core/api/src/state_tag.rs).
+MAX_RECENT_STATE_TAGS = 1024
 
 
 class RenderError(Exception):
@@ -109,10 +113,13 @@ def check_fill(fill: dict, producers: dict, stakes: dict | None) -> list[str]:
     return out
 
 
-def render(template: dict, producers: dict, fill: dict, host: str) -> dict:
+def render(template: dict, producers: dict, fill: dict, host: str, serve_recent_state_tags: int = 0) -> dict:
     names = [p["name"] for p in producers["producers"]]
     if host not in names:
         raise RenderError(f"{host} is not in the producer set ({', '.join(names)})")
+    n = serve_recent_state_tags
+    if not isinstance(n, int) or isinstance(n, bool) or not 0 <= n <= MAX_RECENT_STATE_TAGS:
+        raise RenderError(f"serve_recent_state_tags {n!r} is not an integer 0-{MAX_RECENT_STATE_TAGS}")
     prof = dict(template)
     prof["name"] = f"r1006-{host}"
     prof["status"] = "ready"
@@ -124,6 +131,11 @@ def render(template: dict, producers: dict, fill: dict, host: str) -> dict:
     prof["validators_at_genesis"] = fill.get("validators_at_genesis") is True
     prof["public_rpc"] = "http://127.0.0.1:8545"
     prof["bootstrap_nodes"] = [p["bootnode"] for p in producers["producers"] if p["name"] != host]
+    prof.pop("rpc", None)
+    if n:
+        # The operator endpoint (inventory serve_recent_state_tags): its loopback RPC serves
+        # forge's pinned reads for smoke. Every other host stays strict (absent = 0).
+        prof["rpc"] = {"serve_recent_state_tags": n}
     src = dict(template.get("sources", {}))
     src.update(
         {
@@ -133,6 +145,8 @@ def render(template: dict, producers: dict, fill: dict, host: str) -> dict:
             "validator_activation_height": "genesis fill",
         }
     )
+    if n:
+        src["rpc"] = "inventory serve_recent_state_tags: the operator endpoint for smoke/forge reads"
     prof["sources"] = src
     return prof
 
@@ -168,6 +182,8 @@ def main(argv: list[str] | None = None) -> int:
     a1.add_argument("--fill", required=True, type=Path)
     a1.add_argument("--host", required=True)
     a1.add_argument("--out", required=True, type=Path)
+    a1.add_argument("--serve-recent-state-tags", type=int, default=0,
+                    help="[rpc] window for the designated operator host (inventory field; 0 = strict)")
     a2 = sub.add_parser("check-fill")
     a2.add_argument("--producers", required=True, type=Path)
     a2.add_argument("--stakes", type=Path)
@@ -196,7 +212,7 @@ def main(argv: list[str] | None = None) -> int:
             probs = check_fill(fill, producers, None)
             if probs:
                 raise RenderError("fill result is not usable: " + "; ".join(probs))
-            write(a.out, render(load(a.template), producers, fill, a.host))
+            write(a.out, render(load(a.template), producers, fill, a.host, a.serve_recent_state_tags))
             print(f"profile -> {a.out}")
         return 0
     except RenderError as e:

@@ -828,9 +828,12 @@ class StartGateMiningOnlyOnTheR1006Genesis(unittest.TestCase):
     host's network). Mining is switched on only after EVERY host's block 0 is verified."""
 
     def _fleet(self, n: int, wrong_after_distribute: dict[int, str], after_start: str = "",
-               fill_extra: str = "", pre_start=None) -> tuple[Env, subprocess.CompletedProcess]:
-        """after_start / pre_start: shell snippets (a str, or a function of the Env)."""
+               fill_extra: str = "", pre_start=None,
+               inv_extra: dict[str, dict] | None = None) -> tuple[Env, subprocess.CompletedProcess]:
+        """after_start / pre_start: shell snippets (a str, or a function of the Env).
+        inv_extra: extra inventory fields per host name (e.g. serve_recent_state_tags)."""
         env = Env(n)
+        (env.tmp / "inv_extra.json").write_text(json.dumps(inv_extra or {}))
         if callable(after_start):
             after_start = after_start(env)
         pre_start = pre_start(env) if callable(pre_start) else (pre_start or "")
@@ -849,6 +852,9 @@ import json, sys
 inv, tmp, pids = sys.argv[1], sys.argv[2], sys.argv[3:]
 hosts = [{{"name": f"p{{i}}", "region": "lo", "ip": f"10.206.0.{{i}}", "root": f"{{tmp}}/h{{i}}", "netns_pid": p}}
          for i, p in enumerate(pids, 1)]
+extra = json.load(open(f"{{tmp}}/inv_extra.json"))
+for h in hosts:
+    h.update(extra.get(h["name"], {{}}))
 json.dump({{"schema": "r1006-inventory/1", "transport": "local", "build_host": {{"name": "none", "ip": "127.0.0.1"}},
            "hosts": hosts}}, open(inv, "w"))
 PY
@@ -905,6 +911,7 @@ exit $rc
     FAKE_FORGE = r"""#!/bin/sh
 log="$(dirname "$0")/forge.calls"
 echo "GENESIS_CHAIN=${GENESIS_CHAIN-<unset>} GENESIS_ALLOC=${GENESIS_ALLOC-<unset>} ADDRESS_BOOK=${ADDRESS_BOOK-<unset>}" >>"$log"
+echo "$*" >>"$(dirname "$0")/forge.args"
 readable() { case "$1" in addresses/*) [ -f "$1" ] ;; *) echo "vm.readFile: the path $1 is not allowed to be accessed for read operations"; exit 1 ;; esac; }
 readable "$ADDRESS_BOOK" || { echo "no such book $ADDRESS_BOOK"; exit 1; }
 th=0 floor=0
@@ -943,7 +950,8 @@ exit $rc
         modes = ("ok", "th1rc0", "nocode1", "nofloor", "rc1")
         smoke = "\n".join(f'FAKE_FORGE_MODE={m} FORGE={fake} B smoke --min-height 0 --gate-minutes 1 '
                           f'--skip code,orangeseed,logs >"{d}/smoke-{m}.out" 2>&1' for m in modes)
-        env, r = self._fleet(2, {}, after_start=smoke, fill_extra=" --address-book")
+        env, r = self._fleet(2, {}, after_start=smoke, fill_extra=" --address-book",
+                             inv_extra={"p1": {"serve_recent_state_tags": 64}})
         try:
             out = {m: (d / f"smoke-{m}.out").read_text() for m in modes}
             self.assertIn("PASS  admins (genesis-chain mode): FACTORY-ADMIN, DEPLOYER-ADMIN, NO-CODE, TIMELOCK-HOLDERS, "
@@ -976,11 +984,68 @@ exit $rc
                     f"json.dump(d,open(p,\"w\"))' \"{e.state}/genesis/fill-result.json\"")
             return (f'{drop}\nFORGE={fake} B smoke --min-height 0 --gate-minutes 1 --skip code,orangeseed,logs '
                     f'>"{d}/smoke.out" 2>&1')
-        env, r = self._fleet(2, {}, after_start=smoke, fill_extra=" --address-book")
+        env, r = self._fleet(2, {}, after_start=smoke, fill_extra=" --address-book",
+                             inv_extra={"p1": {"serve_recent_state_tags": 64}})
         try:
             out = (d / "smoke.out").read_text()
             self.assertIn("FAIL  admins (genesis-chain mode)", out, out[-2500:])
             self.assertFalse((d / "forge.calls").exists(), "forge is not run without the block-0 alloc")
+        finally:
+            env.close()
+            shutil.rmtree(d)
+
+    def test_smoke_forge_reads_use_the_operator_host_and_the_log_window_is_reported(self):
+        """Since chain#425 a node refuses a state read pinned to a block that is no longer
+        its executed head, and forge pins every read to the block it started at. So smoke
+        runs forge only against the host whose inventory entry sets
+        serve_recent_state_tags (distribute writes it into that host's [rpc] section, and
+        only that host's), never blindly the first tunnel; with no such host the admins
+        check fails naming the key, without running forge. The log window (--logs-since,
+        default the recorded start) is printed in the log check's PASS/FAIL line."""
+        d = Path(tempfile.mkdtemp(prefix="dgx-r1006o."))
+        fake = d / "forge"
+        fake.write_text(self.FAKE_FORGE)
+        fake.chmod(0o755)
+        common = "--min-height 0 --gate-minutes 1 --skip code,orangeseed"
+        def smoke(e: Env) -> str:
+            undesignate = ("python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); "
+                           "[h.pop(\"serve_recent_state_tags\", None) for h in d[\"hosts\"]]; "
+                           f"json.dump(d,open(p,\"w\"))' \"{e.inv}\"")
+            return "\n".join([
+                f'FORGE={fake} B smoke {common} >"{d}/smoke-p2.out" 2>&1',
+                f'FORGE={fake} B smoke {common} --only p1 >"{d}/smoke-only-p1.out" 2>&1',
+                f'FORGE={fake} B smoke {common} --logs-since 1234567890 >"{d}/smoke-since.out" 2>&1',
+                f'B smoke {common} --logs-since 12x >"{d}/smoke-badsince.out" 2>&1; echo $? >"{d}/badsince.rc"',
+                f'cp "{e.host_root(1)}/etc/citrate/node.toml" "{d}/p1.toml"',
+                f'cp "{e.host_root(2)}/etc/citrate/node.toml" "{d}/p2.toml"',
+                undesignate,
+                f'mv "{d}/forge.args" "{d}/forge.args.designated" 2>/dev/null',
+                f'FORGE={fake} B smoke {common} >"{d}/smoke-none.out" 2>&1',
+            ])
+        env, r = self._fleet(2, {}, after_start=smoke, fill_extra=" --address-book",
+                             inv_extra={"p2": {"serve_recent_state_tags": 64}})
+        try:
+            p2_url = "--rpc-url http://127.0.0.1:18546"
+            out = {k: (d / f"smoke-{k}.out").read_text() for k in ("p2", "only-p1", "since", "none")}
+            # distribute: the window is in the designated host's node.toml only
+            self.assertRegex((d / "p2.toml").read_text(), r"(?m)^serve_recent_state_tags = 64$")
+            self.assertNotIn("serve_recent_state_tags", (d / "p1.toml").read_text())
+            # smoke: forge goes to p2's tunnel (the second, not urls[0]), also with --only p1
+            args = (d / "forge.args.designated").read_text().splitlines() if (d / "forge.args.designated").exists() else []
+            self.assertEqual(len(args), 3, args)
+            for a in args:
+                self.assertIn(p2_url, a)
+            self.assertIn("PASS  admins (genesis-chain mode)", out["p2"], out["p2"][-2500:])
+            self.assertIn("PASS  admins (genesis-chain mode)", out["only-p1"], out["only-p1"][-2500:])
+            self.assertIn("via p2", out["p2"])
+            # no designated host: a clear failure naming the key, and forge is not run
+            self.assertFalse((d / "forge.args").exists(), "forge ran with no operator host")
+            self.assertRegex(out["none"], r"FAIL  admins.*serve_recent_state_tags")
+            # the log window is printed in the log check's line
+            started = (env.state / "started_at").read_text().strip()
+            self.assertRegex(out["p2"], rf"(PASS|FAIL)  .*CONFLICT / fork.*epoch {started}, from the start record")
+            self.assertRegex(out["since"], r"(PASS|FAIL)  .*CONFLICT / fork.*epoch 1234567890, from --logs-since")
+            self.assertEqual((d / "badsince.rc").read_text().strip(), "2", (d / "smoke-badsince.out").read_text())
         finally:
             env.close()
             shutil.rmtree(d)
@@ -1337,6 +1402,69 @@ class RenderProfileTest(unittest.TestCase):
                             "--staker", "0x" + "11" * 20, "--out-dir", "/nonexistent"], capture_output=True, text=True)
         self.assertEqual(r.returncode, 2)
         self.assertIn("not ready", r.stderr)
+
+
+class OperatorEndpoint(unittest.TestCase):
+    """[rpc] serve_recent_state_tags: one designated operator host (inventory field), whose
+    tunnel smoke uses for forge; every other host stays strict (chain#425)."""
+
+    def test_committed_inventory_designates_only_prod1_at_512(self):
+        got = [(h["name"], h["serve_recent_state_tags"]) for h in PINNED_INV["hosts"] if "serve_recent_state_tags" in h]
+        self.assertEqual(got, [("citrate-prod-1", 512)])
+
+    def test_guard_checks_the_window_value(self):
+        import guard
+        base = {"transport": "local", "hosts": [{"name": "p1", "ip": "10.0.0.1"}, {"name": "p2", "ip": "10.0.0.2"}]}
+        for v in (0, 1, 64, 1024):
+            with self.subTest(ok=v):
+                inv = json.loads(json.dumps(base))
+                inv["hosts"][1]["serve_recent_state_tags"] = v
+                self.assertEqual(guard.check_inventory(inv), [])
+        for v in (1025, -1, True, "64", 1.5, None, 10**30):
+            with self.subTest(bad=v):
+                inv = json.loads(json.dumps(base))
+                inv["hosts"][1]["serve_recent_state_tags"] = v
+                probs = guard.check_inventory(inv)
+                self.assertTrue(any("serve_recent_state_tags" in p for p in probs), probs)
+
+    def test_render_profile_sets_the_window_only_when_asked(self):
+        rp = RenderProfileTest("test_consistent_fill")
+        rp.setUp()
+        prof = render_profile.render(rp.template, rp.prod, rp.fill, "p1")
+        self.assertNotIn("rpc", prof)
+        prof = render_profile.render(rp.template, rp.prod, rp.fill, "p1", serve_recent_state_tags=0)
+        self.assertNotIn("rpc", prof)
+        prof = render_profile.render(rp.template, rp.prod, rp.fill, "p1", serve_recent_state_tags=64)
+        self.assertEqual(prof["rpc"], {"serve_recent_state_tags": 64})
+        for bad in (1025, -1, True):
+            with self.subTest(bad=bad), self.assertRaises(render_profile.RenderError):
+                render_profile.render(rp.template, rp.prod, rp.fill, "p1", serve_recent_state_tags=bad)
+
+    def test_smoke_dry_run_names_the_operator_endpoint_and_the_log_window(self):
+        env = Env(2)
+        try:
+            r = env.run("smoke", "--dry-run")
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("serve_recent_state_tags", r.stdout)
+            self.assertIn("no inventory host sets", r.stdout)
+            self.assertIn("since the start record", r.stdout)
+            inv = json.loads(env.inv.read_text())
+            inv["hosts"][1]["serve_recent_state_tags"] = 64
+            env.inv.write_text(json.dumps(inv))
+            r = env.run("smoke", "--dry-run", "--logs-since", "1234567890")
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("forge via p2 (serve_recent_state_tags = 64)", r.stdout)
+            self.assertIn("epoch 1234567890, from --logs-since", r.stdout)
+            for bad in ("12x", "", "-5"):
+                with self.subTest(logs_since=bad):
+                    r = env.run("smoke", "--dry-run", "--logs-since", bad)
+                    self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            inv["hosts"][1]["serve_recent_state_tags"] = 4096
+            env.inv.write_text(json.dumps(inv))
+            r = env.run("smoke", "--dry-run")
+            self.assertEqual(r.returncode, 2, "an out-of-range window is refused before any step")
+        finally:
+            env.close()
 
 
 class DryRunTest(unittest.TestCase):

@@ -1,12 +1,12 @@
 {
   "schema": "r1006-inventory/1",
-  "note": "The 7 r1006 producers (Citrate Inc. DigitalOcean, tag citrate-producer, firewall citrate-producer-fw: SSH from the allowlist + DGX, 30303 tcp/udp open). Start order is the list order.",
+  "note": "The 7 r1006 producers (Citrate Inc. DigitalOcean, tag citrate-producer, firewall citrate-producer-fw: SSH from the allowlist + DGX, 30303 tcp/udp open). Start order is the list order. serve_recent_state_tags (one host only): the operator endpoint; distribute writes [rpc] serve_recent_state_tags = N into that host's node.toml (RPC still loopback-only, reached over the ssh tunnel) so smoke's forge reads, pinned to the block forge started at, are served; every other host stays strict (chain#425).",
   "transport": "ssh",
   "ssh_user": "root",
   "ssh_key": "~/.ssh/citrate-do",
   "build_host": {"name": "citrate-core-linux-build", "ip": "167.99.155.183", "arch": "x86_64-unknown-linux-gnu"},
   "hosts": [
-    {"name": "citrate-prod-1", "region": "sgp1", "ip": "206.189.35.49"},
+    {"name": "citrate-prod-1", "region": "sgp1", "ip": "206.189.35.49", "serve_recent_state_tags": 512},
     {"name": "citrate-prod-2", "region": "nyc3", "ip": "174.138.78.16"},
     {"name": "citrate-prod-3", "region": "tor1", "ip": "137.184.174.123"},
     {"name": "citrate-prod-4", "region": "sfo2", "ip": "134.209.61.197"},

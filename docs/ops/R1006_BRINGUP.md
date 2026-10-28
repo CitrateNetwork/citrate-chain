@@ -3,7 +3,7 @@ created: 2026-10-26T20:45:00Z
 branch: ops/r1006-bringup
 author: Larry Klosowski (chain team; DGX session, Claude Opus 5.5)
 status: active
-updated: 2026-10-27 (host allowlist, release-genesis refusal, mining gate, output containment; MIN_CHAIN_REV pre-join, smoke admins in genesis-chain mode)
+updated: 2026-10-27 (host allowlist, release-genesis refusal, mining gate, output containment; MIN_CHAIN_REV pre-join, smoke admins in genesis-chain mode; operator endpoint for forge reads, smoke --logs-since)
 supersedes: the fleet steps (S1, S3, S5-S7) of citrate-federation R1006_REROLL_RUNBOOK.md (fed#399) for r1006
 ---
 
@@ -57,7 +57,33 @@ typed confirmation.
 | genesis-fill | the fill lists exactly the producers with their stakes; activation height ≥ 800 (r1006: 1000; the node refuses less, also for a genesis validator set); profile `r1006`; no genesis file; registry = the committed book's; block 0 = the `R1006_GENESIS` committed in `core/consensus/src/hardening.rs`, read at run time, which the build must also compile, and never a release network's (r1005 `0x1dcfc490…75f1`, team testnet, mainnet); otherwise the fill is discarded |
 | distribute | the same genesis checks, before any host is touched; staged and installed binary sha256 match; every host's isolated probe gives that block 0 (recorded on the host) |
 | start | pre-join, before any host starts: MIN_CHAIN_REV is set (`--min-chain-rev` or the reviewed `scripts/ops/r1006/min_chain_rev`; both set must agree; a full sha in this checkout), and each host's installed binary reports (`consensus --json`) a clean `git_sha` that resolves in this checkout and contains MIN_CHAIN_REV (`git merge-base --is-ancestor`). A binary from before chain#398 does not know the r1006 genesis and would run it with every rule off, so it is refused here. Then the same genesis checks; every node starts with mining off and its block 0 must be the r1006 genesis (else every started node is stopped); only then, host by host, the host re-checks its own node's block 0 and switches mining on; ≥6 peers each; blocks from all 7 coinbases within 10 min |
-| smoke | every head past block 60; FLEET AGREE; chain id 40204; `eth_getCode` = genesis alloc; OrangeSeed `story()`; `CheckDeployedAdmins` in chain#398's genesis-chain mode (`GENESIS_CHAIN=1`, `GENESIS_ALLOC` = the fill's block-0 alloc) passes (forge rc 0) with FACTORY-ADMIN, DEPLOYER-ADMIN, NO-CODE, TIMELOCK-HOLDERS and GENESIS-FLOOR each reported once as 0 (the fill's book and alloc are staged under `contracts/addresses/` for forge and removed after; a fill without an alloc fails); no CONFLICT / fork / deep reorg in logs; finality answers; no contribution recorder configured; RSS < 3 GiB |
+| smoke | every head past block 60; FLEET AGREE; chain id 40204; `eth_getCode` = genesis alloc; OrangeSeed `story()`; `CheckDeployedAdmins` in chain#398's genesis-chain mode (`GENESIS_CHAIN=1`, `GENESIS_ALLOC` = the fill's block-0 alloc) passes (forge rc 0) with FACTORY-ADMIN, DEPLOYER-ADMIN, NO-CODE, TIMELOCK-HOLDERS and GENESIS-FLOOR each reported once as 0 (the fill's book and alloc are staged under `contracts/addresses/` for forge and removed after; a fill without an alloc fails; forge reads through the operator endpoint, see below, and with no operator host the check fails naming `serve_recent_state_tags`); no CONFLICT / fork / deep reorg in logs since the start record or `--logs-since EPOCH` (the window is printed in the PASS/FAIL line); finality answers; no contribution recorder configured; RSS < 3 GiB |
+
+## Operator endpoint for forge reads
+
+`forge script` pins every state read to the block it started at. Since chain#425 a node
+refuses such a read once its executed head moves (`historical state not available on this
+node`), which at 2 s blocks is almost at once, so smoke's `CheckDeployedAdmins` needs a node
+with the operator window (`docs/ops/RPC_STATE_BLOCK_TAGS.md`). The inventory designates one
+host for that: `citrate-prod-1` has `"serve_recent_state_tags": 512`. `distribute` writes
+`[rpc] serve_recent_state_tags = 512` into that host's `node.toml` only (its RPC stays on
+loopback, reached through the ssh tunnel); every other host stays strict. Smoke runs forge
+against that host's tunnel, also under `--only`. `guard.py check-inventory` refuses a value
+that is not an integer 0-1024 (the node clamps above 1024).
+
+Sizing: on r1006 the checker's forge run takes about 45 s, about 65 blocks at the observed
+~1.4 blocks/s, so a 64-block window ran out mid-run (2026-10-28). 512 gives about six
+minutes of headroom; it widens only the operator host's answers, never the public RPC.
+
+To roll the window onto a running fleet (`distribute` replaces the binary, so the node must be
+stopped; the binary is the same build and its hash is checked again):
+
+```bash
+$B stop --only citrate-prod-1
+$B distribute --only citrate-prod-1        # profile + node.toml with the window; block 0 probed
+$B start --only citrate-prod-1 --mining on --skip-producing-gate
+$B smoke                                   # admins: "forge via citrate-prod-1 ..."
+```
 
 A node built without the r1006 profile refuses `genesis_profile = "r1006"` at start
 (node/src/genesis.rs) instead of falling back to the chain-id default (r1005's genesis).
