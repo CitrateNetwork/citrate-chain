@@ -1993,4 +1993,179 @@ mod tests {
         );
         assert_eq!(n.applied(), Some((h(all.last().expect("top")), top)));
     }
+
+    /// Control for the red tests above: after the same restart, a STRICTLY
+    /// heavier branch forking one block below the tip still wins. The reorg
+    /// ring cannot reach its fork point, so the switch goes through the
+    /// from-genesis rebuild, which the precondition allows.
+    #[tokio::test]
+    async fn restarted_node_on_a_losing_sibling_rejoins_a_heavier_branch() {
+        let key = crypto::generate_keypair();
+        let other = crypto::generate_keypair();
+        let top = RESTART_TIP + 5;
+        let r = roots(top, &key);
+        let g = genesis();
+        let own = chain(&key, &g, RESTART_TIP, &r);
+        let tip = own.last().expect("tip").clone();
+        let parent = own[own.len() - 2].header.block_hash;
+        let rival = sibling(
+            &other,
+            RESTART_TIP,
+            parent,
+            r[RESTART_TIP as usize],
+            h(&tip),
+            false,
+        );
+        let mut heavier = vec![rival.clone()];
+        heavier.extend(extend(&other, h(&rival), RESTART_TIP + 1, top, &r));
+        let net = Net {
+            genesis: g.clone(),
+            prefix: own[..own.len() - 1].to_vec(),
+            main: heavier.clone(),
+            side: Vec::new(),
+        };
+        let pdir = tempfile::tempdir().expect("tempdir");
+        let peer = peer_store(&net, false, pdir.path());
+        let ndir = tempfile::tempdir().expect("tempdir");
+        let before = node(&net, &own, ndir.path()).await;
+        let (n, _, _) = restart(&before, &g, RESTART_RETAIN).await;
+        let head = heavier.last().expect("head");
+        let mut tracker = RejoinTracker::new();
+        let run = drive_advertised(&n, &mut tracker, &peer, h(head), top, 40).await;
+        assert_eq!(
+            n.applied(),
+            Some((h(head), top)),
+            "the restarted node did not switch to the heavier branch: anchors {:?}",
+            run.anchors
+        );
+        assert_eq!(n.executor.calculate_state_root(), head.state_root);
+    }
+
+    /// The rebuild precondition, case by case, on a node restarted at 30 with
+    /// blocks stored beyond it. Every refusal leaves the applied tip alone.
+    #[tokio::test]
+    async fn rebuild_target_refuses_everything_but_an_outranking_connected_branch() {
+        use crate::canonical_apply::RebuildRefusal;
+        let key = crypto::generate_keypair();
+        let other = crypto::generate_keypair();
+        let r = roots(40, &key);
+        let g = genesis();
+        let all = chain(&key, &g, 40, &r);
+        let net = Net {
+            genesis: g.clone(),
+            prefix: all[..30].to_vec(),
+            main: Vec::new(),
+            side: Vec::new(),
+        };
+        let ndir = tempfile::tempdir().expect("tempdir");
+        let before = node(&net, &all[..30], ndir.path()).await;
+        let (n, ghostdag, dag) = restart(&before, &g, RESTART_RETAIN).await;
+        let tip = all[29].clone();
+        // Stored, not applied: the chain's continuation, and a block whose
+        // parent this node never had.
+        for b in &all[30..] {
+            n.storage.blocks.put_block(b).expect("put");
+        }
+        let orphan = seal(&other, 33, Hash::new([0xEE; 32]), r[33]);
+        n.storage.blocks.put_block(&orphan).expect("put");
+        // Known to fork choice (stored + scored), not applied: the tip's
+        // equal-score siblings on both sides of the hash tie-break, and a
+        // heavier branch on the losing one.
+        let wins = sibling(&other, 30, tip.selected_parent(), r[30], h(&tip), true);
+        let loses = sibling(&other, 30, tip.selected_parent(), r[30], h(&tip), false);
+        let heavier = extend(&other, h(&loses), 31, 32, &r);
+        for b in [&wins, &loses].into_iter().chain(heavier.iter()) {
+            n.storage.blocks.put_block(b).expect("put");
+            dag.store_block(b.clone()).await.expect("dag");
+            ghostdag.add_block(b).await.expect("scored");
+        }
+        let lock = n.app.advance_lock();
+        let state = lock.lock().await;
+        let verdict = |head: Hash| n.app.rebuild_target(&state, head, h(&g));
+        assert_eq!(
+            verdict(h(&all[10])).await,
+            Err(RebuildRefusal::OnAppliedChain { height: 11 }),
+            "an applied ancestor"
+        );
+        assert_eq!(
+            verdict(h(&tip)).await,
+            Err(RebuildRefusal::OnAppliedChain { height: 30 })
+        );
+        assert_eq!(
+            verdict(h(&all[39])).await,
+            Err(RebuildRefusal::DescendsFromTip)
+        );
+        assert_eq!(
+            verdict(h(&orphan)).await,
+            Err(RebuildRefusal::MissingAncestor {
+                missing: Hash::new([0xEE; 32])
+            }),
+            "a missing ancestor is not divergence"
+        );
+        assert!(
+            matches!(
+                verdict(h(&loses)).await,
+                Err(RebuildRefusal::NotHeavier { .. })
+            ),
+            "an equal-score sibling that loses the tie-break"
+        );
+        for head in [h(&wins), h(heavier.last().expect("heavier"))] {
+            let plan = verdict(head).await.expect("outranks the tip");
+            assert_eq!(plan.fork.hash, tip.selected_parent());
+            assert_eq!((plan.fork.height, plan.abandoned), (29, 1));
+        }
+        drop(state);
+        assert_eq!(n.applied(), Some((h(&tip), 30)));
+    }
+
+    /// Tripwire: the guards stay on the paths that move the applied tip down.
+    #[test]
+    fn rewind_guards_stay_wired() {
+        let src = include_str!("canonical_apply.rs");
+        let body = |name: &str| -> &str {
+            let start = src.find(name).unwrap_or_else(|| panic!("{name} is gone"));
+            let rest = &src[start..];
+            let end = rest[1..]
+                .find("\n    pub async fn ")
+                .map_or(rest.len(), |e| e + 1);
+            let end = rest[1..]
+                .find("\n    async fn ")
+                .map_or(end, |e| end.min(e + 1));
+            &rest[..end]
+        };
+        // The rebuild checks its target before the reset that moves the durable
+        // tip to genesis, and refuses a spine that does not reach genesis.
+        let rebuild = body("async fn recover_to_head_inner(");
+        let gate = rebuild.find("self.rebuild_target(&state, head, genesis_hash)");
+        let complete = rebuild.find("if !reached_genesis {");
+        let reset = rebuild.find("Some((genesis_hash, 0)),");
+        assert!(
+            matches!((gate, complete, reset), (Some(g), Some(c), Some(r)) if g < c && c < r),
+            "recover_to_head must check rebuild_target and the spine before the genesis reset"
+        );
+        // Both callers go through the flag-owning wrapper.
+        let outer = body("pub async fn recover_to_head(");
+        assert!(outer.contains("self.rebuild_in_progress.swap(true"));
+        // `reorg_to` asks the applied chain, not only the ring, before walking.
+        let reorg = body("pub async fn reorg_to(");
+        let applied = reorg.find("self.is_applied(state, new_tip, nb.header.height)");
+        let walk = reorg.find("let revert_floor =");
+        assert!(
+            matches!((applied, walk), (Some(a), Some(w)) if a < w),
+            "reorg_to must check is_applied before the fork-point walk"
+        );
+        // The receive path never waits behind a rebuild.
+        let recv = body("pub async fn apply_received(");
+        let flag = recv.find("self.rebuild_in_progress.load(");
+        let lock = recv.find("self.lock.lock()");
+        assert!(
+            matches!((flag, lock), (Some(f), Some(l)) if f < l),
+            "apply_received must check the rebuild flag before waiting for the lock"
+        );
+        assert!(recv.contains("tokio::time::timeout(RECEIVE_LOCK_POLL"));
+        // A far-ahead descendant is stepped forward, not rebuilt.
+        assert!(
+            body("pub async fn drive_drain(").contains("self.forward_step_toward(&state, new_tip)")
+        );
+    }
 }

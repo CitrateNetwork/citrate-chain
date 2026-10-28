@@ -28,8 +28,11 @@
 // SAFETY BOUNDS (why a window of 1_000 is a hard floor)
 //
 //   * `canonical_apply::MAX_REORG_DEPTH` = 100 — a fork older than this is
-//     already refused, so a block more than 100 below the applied tip can never
-//     be reorged onto.
+//     never reverted in memory. A deeper switch is the from-genesis spine
+//     rebuild, which reads the CHAIN store and is allowed only toward a branch
+//     fork choice ranks above the applied tip whose ancestry meets the applied
+//     chain (`CanonicalApplicator::rebuild_target`). A block pruned from the
+//     DAG store is never read as divergence there.
 //   * `GhostDagParams::finality_depth` = 100 — same order.
 //   * `block_serve` reads the CHAIN store exclusively (verified), so serving
 //     peers is completely unaffected by DAG-store pruning. This is the reason
