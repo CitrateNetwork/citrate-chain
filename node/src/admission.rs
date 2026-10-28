@@ -688,7 +688,7 @@ impl BlockAdmission {
                         // our own height serves back forever.
                         out.newly_admitted = out.newly_admitted.saturating_add(1);
                         let h = block.header.height;
-                        if out.highest_admitted.map_or(true, |(_, best)| h > best) {
+                        if out.highest_admitted.is_none_or(|(_, best)| h > best) {
                             out.highest_admitted = Some((block.header.block_hash, h));
                         }
                         on_admitted(&block, completed_partial);

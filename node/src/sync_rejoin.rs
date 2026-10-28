@@ -166,10 +166,19 @@ impl RejoinTracker {
     pub fn anchor(
         &mut self,
         applied: (Hash, u64),
-        _lookup: impl Fn(u64) -> Option<Hash>,
+        lookup: impl Fn(u64) -> Option<Hash>,
     ) -> (Hash, u64) {
-        // RED STUB: the pre-fix policy, always the applied tip.
-        applied
+        match &self.mode {
+            Mode::Tip { .. } => applied,
+            Mode::Probe { height, .. } => match lookup(*height) {
+                Some(h) => (h, *height),
+                None => {
+                    self.mode = Mode::Tip { strikes: 0 };
+                    applied
+                }
+            },
+            Mode::Follow { cursor } => *cursor,
+        }
     }
 
     /// Record that a `GetBlocks` anchored at `anchor` went to `peer`.
@@ -200,12 +209,98 @@ impl RejoinTracker {
     /// is the height the answered request was anchored at.
     pub fn on_answer(
         &mut self,
-        _answer: Answer,
-        _behind: bool,
-        _anchor_height: u64,
+        answer: Answer,
+        behind: bool,
+        anchor_height: u64,
     ) -> Option<Transition> {
-        // RED STUB: answers do not steer the anchor.
-        None
+        if !behind {
+            return self.reset("caught up");
+        }
+        match (self.mode.clone(), answer) {
+            (Mode::Tip { .. }, Answer::Progress { .. }) | (Mode::Tip { .. }, Answer::Known) => {
+                self.mode = Mode::Tip { strikes: 0 };
+                None
+            }
+            (Mode::Tip { strikes }, Answer::Unconnected) => {
+                let strikes = strikes.saturating_add(1);
+                if strikes < PROBE_AFTER_STRIKES || anchor_height == 0 {
+                    self.mode = Mode::Tip { strikes };
+                    return None;
+                }
+                let top = anchor_height;
+                self.mode = Mode::Probe {
+                    top,
+                    unconnected: top,
+                    known: None,
+                    step: 1,
+                    height: top.saturating_sub(1),
+                };
+                Some(Transition::StartedProbe { top })
+            }
+            (Mode::Probe { .. }, Answer::Progress { highest })
+            | (Mode::Follow { .. }, Answer::Progress { highest }) => {
+                let cursor = match &self.mode {
+                    Mode::Follow { cursor } if cursor.1 > highest.1 => *cursor,
+                    _ => highest,
+                };
+                let was_following = matches!(self.mode, Mode::Follow { .. });
+                self.mode = Mode::Follow { cursor };
+                if was_following {
+                    None
+                } else {
+                    Some(Transition::Following {
+                        cursor_height: cursor.1,
+                    })
+                }
+            }
+            (Mode::Follow { .. }, _) => self.reset("follow"),
+            (
+                Mode::Probe {
+                    top,
+                    unconnected,
+                    known,
+                    step,
+                    height,
+                },
+                verdict,
+            ) => {
+                // An answer for a height other than the one being probed is
+                // stale (the probe moved since it was sent): ignore it.
+                if anchor_height != height {
+                    return None;
+                }
+                let (unconnected, known, step) = match verdict {
+                    Answer::Unconnected => (height, known, step.saturating_mul(2)),
+                    // Progress is handled above; this arm is Known.
+                    _ => (unconnected, Some(height), step),
+                };
+                let next = match known {
+                    // Still expanding: the next doubling below the top.
+                    None => {
+                        if height == 0 {
+                            return self.give_up(0);
+                        }
+                        top.saturating_sub(step)
+                    }
+                    // Bisect between the known-good and unconnected heights.
+                    Some(k) => {
+                        let span = unconnected.saturating_sub(k);
+                        if span <= 1 {
+                            return self.give_up(k);
+                        }
+                        k.saturating_add(span / 2)
+                    }
+                };
+                self.mode = Mode::Probe {
+                    top,
+                    unconnected,
+                    known,
+                    step,
+                    height: next,
+                };
+                None
+            }
+        }
     }
 
     fn reset(&mut self, from: &'static str) -> Option<Transition> {
@@ -312,7 +407,9 @@ mod tests {
                 output: Hash::new([0x5A; 32]),
             })
             .transactions(vec![])
-            .state_root(Hash::default())
+            // The empty genesis state's root, so the deep-fork rebuild (which
+            // checks it) can replay from genesis.
+            .state_root(Executor::new(Arc::new(StateDB::new())).calculate_state_root())
             .blue_score(0)
             .blue_work(blue_work_for_score(0))
             .build_unhashed();
@@ -441,6 +538,13 @@ mod tests {
             CanonicalApplicator::new(executor.clone(), storage.clone())
                 .with_fork_choice(ghostdag.clone()),
         );
+        // As start_node: genesis wired for the deep-fork rebuild, and the DAG
+        // marked hydrated.
+        app.set_genesis(
+            Executor::new(Arc::new(StateDB::new())).state_snapshot(),
+            g.header.block_hash,
+        );
+        ghostdag.reconcile_tips_from_dag_store().await;
         let admission = Arc::new(BlockAdmission::new(
             storage.clone(),
             dag,
@@ -581,6 +685,37 @@ mod tests {
         );
     }
 
+    /// A side branch deeper than the in-memory reorg window (100 blocks): the
+    /// switch goes through the applicator's rebuild from genesis, which the
+    /// periodic drain triggers. The search itself is unchanged.
+    #[tokio::test]
+    async fn side_branch_deeper_than_the_reorg_window_rejoins() {
+        let net = net(6, 150, 400);
+        let pdir = tempfile::tempdir().expect("tempdir");
+        let peer = peer_store(&net, true, pdir.path());
+        let ndir = tempfile::tempdir().expect("tempdir");
+        let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
+        let n = node(&net, &own, ndir.path()).await;
+        let main_tip = net.main.last().expect("main");
+        let mut tracker = RejoinTracker::new();
+        let run = drive(&n, &mut tracker, &peer, h(main_tip), 400, 200).await;
+        assert_eq!(
+            n.applied(),
+            Some((h(main_tip), 400)),
+            "the node stayed on its side branch after {} rounds: anchors {:?}",
+            run.rounds,
+            run.anchors
+        );
+        assert_eq!(n.executor.calculate_state_root(), main_tip.state_root);
+        // ~log2(144) probes, then one request per 32-block batch up to 400.
+        assert!(
+            run.rounds <= 40,
+            "took {} rounds: {:?}",
+            run.rounds,
+            run.anchors
+        );
+    }
+
     /// Same, but the peer never received the node's blocks (the node sealed its
     /// first block before any peer connected), so every tip-anchored request
     /// comes back empty.
@@ -629,6 +764,58 @@ mod tests {
             "an anchor went below the previous one: {:?}",
             run.anchors
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Wiring: the node's GetBlocks anchor comes from the tracker, and the
+    // Blocks handler feeds it every answer it recognises.
+    // ---------------------------------------------------------------------
+
+    /// The problems with `src`'s wiring, if any.
+    fn wiring_problems(src: &str) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        let tick = src.find("let applied_tip = storage_for_sync");
+        let anchor = src.find(".anchor(applied_tip,");
+        let request = src.find(".request_blocks(&peer, block_from, block_height)");
+        let asked = src.find(".note_asked(&pid.0, (block_from, block_height))");
+        match (tick, anchor, request, asked) {
+            (Some(t), Some(a), Some(r), Some(n)) if t < a && a < r && r < n => {}
+            _ => out.push("sync tick: GetBlocks anchor must come from RejoinTracker::anchor"),
+        }
+        if src.contains(".request_blocks(&peer, start_from, start_height)") {
+            out.push("sync tick: a GetBlocks still anchored on the applied tip directly");
+        }
+        let arm = src.find("NetworkMessage::Blocks { blocks } => {");
+        let take = src.find(".take_answer(&pid.0, &answer_hashes)");
+        let handle = arm.and_then(|a| src[a..].find(".handle_blocks(&pid, blocks)").map(|i| a + i));
+        let judge = src.find(".on_answer(answer, gap > 0, anchor_height)");
+        match (arm, take, handle, judge) {
+            (Some(a), Some(t), Some(hb), Some(j)) if a < t && t < hb && hb < j => {}
+            _ => out.push("Blocks handler: answers must reach RejoinTracker::on_answer"),
+        }
+        if !src.contains(".admit_to_fixpoint(pending,") {
+            out.push("Blocks handler: admission must use BlockAdmission::admit_to_fixpoint");
+        }
+        out
+    }
+
+    #[test]
+    fn start_node_wiring() {
+        assert_eq!(wiring_problems(include_str!("main.rs")), Vec::<&str>::new());
+    }
+
+    /// Negative control: the pre-fix tick (anchored on the applied tip) and a
+    /// handler that never judges answers are both caught.
+    #[test]
+    fn wiring_check_catches_the_old_tick() {
+        let main = include_str!("main.rs");
+        let old_tick = main.replace(
+            ".request_blocks(&peer, block_from, block_height)",
+            ".request_blocks(&peer, start_from, start_height)",
+        );
+        assert!(!wiring_problems(&old_tick).is_empty());
+        let no_judge = main.replace(".on_answer(answer, gap > 0, anchor_height)", ".ignore()");
+        assert!(!wiring_problems(&no_judge).is_empty());
     }
 
     // ---------------------------------------------------------------------
