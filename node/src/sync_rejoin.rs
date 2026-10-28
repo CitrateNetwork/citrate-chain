@@ -1209,10 +1209,10 @@ mod tests {
         )
     }
 
-    /// A node on the canonical chain `1..=tip` (prefix), DAG store pruned to
-    /// the last `dag_prune::MIN_RETAIN_BLOCKS`, restarted. Returns the
+    /// A node that applied `own`, its DAG store pruned to the last
+    /// `dag_prune::MIN_RETAIN_BLOCKS` when `prune`, restarted. Returns the
     /// restarted node and its storage dir.
-    async fn pruned_restarted_node(net: &Net, own: &[Block]) -> (Node, tempfile::TempDir) {
+    async fn restarted_node(net: &Net, own: &[Block], prune: bool) -> (Node, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage =
             Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
@@ -1230,14 +1230,16 @@ mod tests {
             assert_eq!(fx.newly_admitted, own.len(), "own blocks admit");
             n.app.drive_drain().await;
             assert_eq!(n.applied(), Some((h(tip), tip_height)), "fixture: applied");
-            let dropped = crate::dag_prune::prune_once(
-                &storage,
-                &dag,
-                tip_height,
-                crate::dag_prune::MIN_RETAIN_BLOCKS,
-            )
-            .await;
-            assert!(dropped > 0, "fixture: the DAG store was pruned");
+            if prune {
+                let dropped = crate::dag_prune::prune_once(
+                    &storage,
+                    &dag,
+                    tip_height,
+                    crate::dag_prune::MIN_RETAIN_BLOCKS,
+                )
+                .await;
+                assert!(dropped > 0, "fixture: the DAG store was pruned");
+            }
             n.executor.state_snapshot()
         };
         // Restart: everything in memory is rebuilt from the stores.
@@ -1341,7 +1343,7 @@ mod tests {
         let net = net(tip_height, tip_height, network_tip);
         let pdir = tempfile::tempdir().expect("tempdir");
         let peer = peer_store(&net, false, pdir.path());
-        let (n, _ndir) = pruned_restarted_node(&net, &net.prefix).await;
+        let (n, _ndir) = restarted_node(&net, &net.prefix, true).await;
         let main_tip = net.main.last().expect("main");
         // The barren answer: what the peer serves for an anchor 87 above the
         // applied tip (nothing in it connects).
@@ -1394,7 +1396,7 @@ mod tests {
         let pdir = tempfile::tempdir().expect("tempdir");
         let peer = peer_store(&net, false, pdir.path());
         let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
-        let (n, _ndir) = pruned_restarted_node(&net, &own).await;
+        let (n, _ndir) = restarted_node(&net, &own, true).await;
         let main_tip = net.main.last().expect("main");
         let barren = block_serve::serve_blocks(&peer, &h(&net.main[87]), 32);
         let watch = TipWatch::start(n.storage.clone());
@@ -1446,7 +1448,7 @@ mod tests {
         };
         let pdir = tempfile::tempdir().expect("tempdir");
         let peer = peer_store(&net, false, pdir.path());
-        let (n, _ndir) = pruned_restarted_node(&net, &net.prefix).await;
+        let (n, _ndir) = restarted_node(&net, &net.prefix, true).await;
         let main_tip = net.main.last().expect("main");
         let watch = TipWatch::start(n.storage.clone());
         let mut tracker = RejoinTracker::new();
@@ -1531,6 +1533,146 @@ mod tests {
     #[test]
     fn start_node_wiring() {
         assert_eq!(wiring_problems(include_str!("main.rs")), Vec::<&str>::new());
+    }
+
+    /// A same-height sibling of `tip` sealed by a fresh key whose hash is
+    /// smaller: equal blue score, so the fork-choice tie-break prefers it.
+    fn tie_winning_sibling(tip: &Block, parent: Hash) -> Block {
+        loop {
+            let k = crypto::generate_keypair();
+            let b = seal(&k, tip.header.height, parent, tip.state_root);
+            if h(&b) < h(tip) {
+                break b;
+            }
+        }
+    }
+
+    /// Every node, pruned or not: a restarted node on the canonical chain
+    /// hears one same-height sibling of its restart tip that wins the
+    /// tie-break. An equal-weight head never triggers a rebuild from genesis:
+    /// the durable applied tip never drops, and the node converges as the
+    /// tip's children arrive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unpruned_restart_tip_sibling_never_rewinds() {
+        let tip_height = 1_200u64;
+        let network_tip = tip_height + 89;
+        let net = net(tip_height, tip_height, network_tip);
+        let tip = net.prefix.last().expect("prefix");
+        let sibling = tie_winning_sibling(tip, h(&net.prefix[net.prefix.len() - 2]));
+        let pdir = tempfile::tempdir().expect("tempdir");
+        let peer = peer_store(&net, false, pdir.path());
+        let (n, _ndir) = restarted_node(&net, &net.prefix, false).await;
+        let main_tip = net.main.last().expect("main");
+        let watch = TipWatch::start(n.storage.clone());
+        let mut tracker = RejoinTracker::new();
+        let (run, applied) = drive_recording(
+            &n,
+            &mut tracker,
+            &peer,
+            vec![sibling],
+            h(main_tip),
+            network_tip,
+            200,
+        )
+        .await;
+        let lowest = watch
+            .finish()
+            .min(applied.iter().copied().min().unwrap_or(0));
+        assert!(
+            lowest >= tip_height,
+            "the durable applied tip dropped below the restart tip {tip_height}: lowest \
+             {lowest}; applied {applied:?}; anchors {:?}",
+            run.anchors
+        );
+        assert_eq!(n.applied(), Some((h(main_tip), network_tip)));
+        assert_eq!(n.executor.calculate_state_root(), main_tip.state_root);
+    }
+
+    /// Control: an unpruned node restarted one block off a genuinely heavier
+    /// chain still rebuilds onto it (the from-genesis rebuild is kept for a
+    /// strictly heavier head).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unpruned_restart_one_block_off_still_rebuilds_onto_the_heavier_chain() {
+        let fork = 1_199u64;
+        let network_tip = fork + 90;
+        let net = net(fork, fork + 1, network_tip);
+        let pdir = tempfile::tempdir().expect("tempdir");
+        let peer = peer_store(&net, false, pdir.path());
+        let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
+        let (n, _ndir) = restarted_node(&net, &own, false).await;
+        let main_tip = net.main.last().expect("main");
+        let barren = block_serve::serve_blocks(&peer, &h(&net.main[87]), 32);
+        let watch = TipWatch::start(n.storage.clone());
+        let mut tracker = RejoinTracker::new();
+        let (run, _applied) = drive_recording(
+            &n,
+            &mut tracker,
+            &peer,
+            barren,
+            h(main_tip),
+            network_tip,
+            200,
+        )
+        .await;
+        let lowest = watch.finish();
+        assert_eq!(
+            n.applied(),
+            Some((h(main_tip), network_tip)),
+            "the node rebuilds onto the heavier chain: anchors {:?}",
+            run.anchors
+        );
+        assert_eq!(n.executor.calculate_state_root(), main_tip.state_root);
+        assert!(
+            lowest < fork,
+            "control: the switch went through the from-genesis rebuild (lowest {lowest})"
+        );
+    }
+
+    /// The rebuild itself re-checks the weight: asked to rebuild toward an
+    /// equal-weight sibling (bypassing the drain's check), an unpruned node
+    /// keeps its tip.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_rebuild_refuses_an_equal_weight_head() {
+        let tip_height = 1_200u64;
+        let net = net(tip_height, tip_height, tip_height + 1);
+        let tip = net.prefix.last().expect("prefix");
+        let sibling = tie_winning_sibling(tip, h(&net.prefix[net.prefix.len() - 2]));
+        let (n, _ndir) = restarted_node(&net, &net.prefix, false).await;
+        let fx = n
+            .admission
+            .admit_to_fixpoint(vec![sibling.clone()], |_, _| {})
+            .await;
+        assert_eq!(fx.newly_admitted, 1, "fixture: the sibling admits");
+        let watch = TipWatch::start(n.storage.clone());
+        n.app.maybe_runtime_rebuild(h(&sibling)).await;
+        let lowest = watch.finish();
+        assert!(
+            lowest >= tip_height,
+            "rebuilt toward an equal-weight head: {lowest}"
+        );
+        assert_eq!(n.applied(), Some((h(tip), tip_height)));
+    }
+
+    /// The rebuild itself re-checks the prune floor: asked to rebuild toward
+    /// a heavier head (bypassing the drain's check), a pruned node keeps its
+    /// tip.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_rebuild_refuses_on_a_pruned_node() {
+        let fork = 1_199u64;
+        let net = net(fork, fork + 1, fork + 40);
+        let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
+        let (n, _ndir) = restarted_node(&net, &own, true).await;
+        let fx = n
+            .admission
+            .admit_to_fixpoint(net.main.clone(), |_, _| {})
+            .await;
+        assert_eq!(fx.newly_admitted, net.main.len(), "fixture: main admits");
+        let main_tip = net.main.last().expect("main");
+        let watch = TipWatch::start(n.storage.clone());
+        n.app.maybe_runtime_rebuild(h(main_tip)).await;
+        let lowest = watch.finish();
+        assert!(lowest >= fork + 1, "rebuilt on a pruned node: {lowest}");
+        assert_eq!(n.applied(), Some((h(&net.side[0]), fork + 1)));
     }
 
     /// The node's applicator is built with the DAG prune floor wired, on the

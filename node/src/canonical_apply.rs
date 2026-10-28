@@ -2124,7 +2124,7 @@ impl CanonicalApplicator {
         );
     }
 
-    async fn maybe_runtime_rebuild(&self, head: Hash) {
+    pub(crate) async fn maybe_runtime_rebuild(&self, head: Hash) {
         // HYDRATION GUARD (rewritten 2026-08-11). The DAG store hydrates its in-memory
         // tips ASYNCHRONOUSLY after boot, so for the first seconds fork-choice surfaces
         // a partial tip set; rebuilding toward a partially-loaded head would REGRESS
@@ -2976,6 +2976,40 @@ pub fn record_produced(
     }
 }
 
+/// Whether the runtime from-genesis rebuild may run toward a fork-choice head
+/// that `reorg_to` reported as `BeyondReorgWindow`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RebuildDecision {
+    Rebuild,
+    /// The DAG store is pruned below `floor` and the fork point is below the
+    /// snapshot window.
+    RefusePruned {
+        floor: u64,
+    },
+    /// The head is not strictly heavier than the applied tip (or a weight is
+    /// unknown).
+    RefuseNotHeavier {
+        head: Option<u64>,
+        tip: Option<u64>,
+    },
+}
+
+/// The rebuild policy. `below_ring`: the fork point is below the snapshot
+/// window (not only the forward-branch memory cap); `prune_floor`: the DAG
+/// pruning floor (0 = unpruned); `head`/`tip`: blue scores.
+pub(crate) fn rebuild_decision(
+    _below_ring: bool,
+    prune_floor: u64,
+    _head: Option<u64>,
+    _tip: Option<u64>,
+) -> RebuildDecision {
+    if prune_floor > 0 {
+        RebuildDecision::RefusePruned { floor: prune_floor }
+    } else {
+        RebuildDecision::Rebuild
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2988,6 +3022,54 @@ pub(crate) mod tests {
 
     const CB: [u8; 20] = [0x33; 20];
     const VRF_OUT: [u8; 32] = [0x5A; 32];
+
+    /// Rebuild policy: only toward a STRICTLY heavier head, on every node; on
+    /// a pruned node, never when the fork point is below the snapshot window,
+    /// but the forward-branch memory cap alone does not refuse.
+    #[test]
+    fn rebuild_decision_requires_a_strictly_heavier_head() {
+        use RebuildDecision::*;
+        let nh = |head, tip| RefuseNotHeavier { head, tip };
+        // Unpruned.
+        assert_eq!(rebuild_decision(true, 0, Some(11), Some(10)), Rebuild);
+        assert_eq!(
+            rebuild_decision(true, 0, Some(10), Some(10)),
+            nh(Some(10), Some(10)),
+            "an equal-weight head (tie-break winner) never rebuilds"
+        );
+        assert_eq!(
+            rebuild_decision(true, 0, Some(9), Some(10)),
+            nh(Some(9), Some(10))
+        );
+        assert_eq!(
+            rebuild_decision(false, 0, Some(10), Some(10)),
+            nh(Some(10), Some(10)),
+            "the forward-cap arm is weight-checked too"
+        );
+        // Unknown weights fail closed.
+        assert_eq!(
+            rebuild_decision(true, 0, None, Some(10)),
+            nh(None, Some(10))
+        );
+        assert_eq!(
+            rebuild_decision(true, 0, Some(11), None),
+            nh(Some(11), None)
+        );
+        // Pruned: below the window refuses; the forward cap alone does not.
+        assert_eq!(
+            rebuild_decision(true, 500, Some(11), Some(10)),
+            RefusePruned { floor: 500 }
+        );
+        assert_eq!(
+            rebuild_decision(false, 500, Some(11), Some(10)),
+            Rebuild,
+            "the MAX_REORG_FORWARD arm is not a reorg below the floor"
+        );
+        assert_eq!(
+            rebuild_decision(false, 500, Some(10), Some(10)),
+            nh(Some(10), Some(10))
+        );
+    }
 
     /// Build an empty (reward-only) v2 block with an explicit VRF output.
     /// `vrf` only distinguishes block HASHES (it feeds prevrandao, which
