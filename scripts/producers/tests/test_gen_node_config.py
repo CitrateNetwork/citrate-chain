@@ -2,6 +2,7 @@
 env, the coinbase == staker rule, dry run, and refusal paths."""
 
 import io
+import json
 import re
 import sys
 import tempfile
@@ -142,6 +143,55 @@ class TestRender(unittest.TestCase):
         rc, out, _ = run(["--profile", "rehearsal-1", "--staker", STAKER, "--out-dir", str(self.out), "--dry-run"])
         self.assertEqual(rc, 0)
         self.assertIn("NOT usable", out)
+
+    # [rpc] serve_recent_state_tags (chain#425 operator window): a profile may set it for a
+    # private operator node; absent means strict 0. The node clamps above 1024, so the
+    # generator refuses such a value instead of writing one the node silently changes.
+    def gen_with_rpc(self, rpc, *extra):
+        raw = json.loads((HERE.parent / "profiles" / "40204-r1005.json").read_text())
+        raw["rpc"] = rpc
+        p = Path(self.tmp.name) / "prof-rpc.json"
+        p.write_text(json.dumps(raw))
+        return run(["--profile", str(p), "--staker", STAKER, "--out-dir", str(self.out), "--force", *extra])
+
+    def test_serve_recent_state_tags_absent_stays_strict(self):
+        rc, _, err = self.gen()
+        self.assertEqual(rc, 0, err)
+        cfg = tomllib.loads((self.out / "node.toml").read_text())
+        self.assertNotIn("serve_recent_state_tags", cfg["rpc"])
+        for rpc in ({}, {"serve_recent_state_tags": 0}):
+            with self.subTest(rpc=rpc):
+                rc, _, err = self.gen_with_rpc(rpc)
+                self.assertEqual(rc, 0, err)
+                cfg = tomllib.loads((self.out / "node.toml").read_text())
+                self.assertEqual(cfg["rpc"].get("serve_recent_state_tags", 0), 0)
+
+    def test_serve_recent_state_tags_from_the_profile(self):
+        src = (REPO / "node/src/config.rs").read_text()
+        self.assertIn("serve_recent_state_tags", struct_fields(src, "RpcConfig"))
+        for n in (1, 64, 1024):
+            with self.subTest(n=n):
+                rc, _, err = self.gen_with_rpc({"serve_recent_state_tags": n})
+                self.assertEqual(rc, 0, err)
+                cfg = tomllib.loads((self.out / "node.toml").read_text())
+                self.assertEqual(cfg["rpc"].get("serve_recent_state_tags"), n)
+                self.assertEqual(cfg["rpc"]["listen_addr"], "127.0.0.1:8545", "the window never opens the RPC bind")
+
+    def test_serve_recent_state_tags_bad_values_are_refused(self):
+        for rpc in ({"serve_recent_state_tags": 1025}, {"serve_recent_state_tags": -1},
+                    {"serve_recent_state_tags": True}, {"serve_recent_state_tags": "64"},
+                    {"serve_recent_state_tags": 1.5}, {"serve_recent_state_tags": None},
+                    {"listen_addr": "0.0.0.0:8545"}, [64]):
+            with self.subTest(rpc=rpc):
+                rc, _, err = self.gen_with_rpc(rpc)
+                self.assertEqual(rc, 2, f"accepted {rpc!r}")
+                self.assertIn("rpc", err)
+
+    def test_window_cap_mirrors_the_node_clamp(self):
+        src = (REPO / "core/api/src/state_tag.rs").read_text()
+        m = re.search(r"pub const MAX_RECENT_STATE_TAGS: u64 = ([0-9_]+);", src)
+        self.assertIsNotNone(m)
+        self.assertEqual(int(m.group(1).replace("_", "")), getattr(g, "MAX_RECENT_STATE_TAGS", None))
 
     def test_bad_inputs(self):
         for extra in (["--staker", "0x1234"], ["--data-dir", "relative/dir"], ["--p2p-port", "80"]):
