@@ -2575,6 +2575,106 @@ mod tests {
         assert_eq!(n.applied(), Some((h(&tip), 30)));
     }
 
+    /// Tripwire for the one fail-open case of the rebuild weight check: an
+    /// applied-tip pointer to a block this node no longer stores. Peers must
+    /// not be able to cause it. In the code this binary runs, a chain-store
+    /// block is deleted only by
+    /// - the start-up purge of invalid blocks (`hardening_rejoin`, run in
+    ///   `start_node` before the peer manager exists), and
+    /// - the operator's offline `rollback` subcommand.
+    /// The chain-store pruner (`Pruner`) exists but is never started (no
+    /// caller of `start_services` / `start_auto_pruning` outside the storage
+    /// crate). A storage read error is never taken as "not stored".
+    #[test]
+    fn the_applied_tip_can_vanish_only_through_local_purges() {
+        use std::path::{Path, PathBuf};
+        fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if name != "tests" && name != "target" && name != "benches" {
+                        rust_files(&p, out);
+                    }
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        /// The production part of a source file: everything before its
+        /// `#[cfg(test)]` test module, and nothing from `*_tests.rs` files.
+        fn production(path: &Path) -> String {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.ends_with("_tests.rs") || name == "tests.rs" {
+                return String::new();
+            }
+            let src = std::fs::read_to_string(path).unwrap_or_default();
+            let cut = [
+                "#[cfg(test)]\nmod tests",
+                "#[cfg(test)]\npub(crate) mod tests",
+                "#[cfg(test)]\npub mod tests",
+            ]
+            .iter()
+            .filter_map(|m| src.find(m))
+            .min()
+            .unwrap_or(src.len());
+            src[..cut].to_string()
+        }
+        let node = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = node.parent().expect("workspace root");
+        let mut files = Vec::new();
+        rust_files(&node.join("src"), &mut files);
+        rust_files(&root.join("core"), &mut files);
+        assert!(files.len() > 50, "fixture: source files found");
+        let rel = |p: &Path| {
+            p.strip_prefix(root)
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default()
+        };
+        let allowed = [
+            "node/src/hardening_rejoin.rs",
+            "node/src/rollback.rs",
+            "core/storage/src/pruning/pruner.rs",
+        ];
+        for f in &files {
+            let code = production(f);
+            let r = rel(f);
+            for call in [".purge_blocks(", ".delete_block("] {
+                assert!(
+                    !code.contains(call) || allowed.contains(&r.as_str()),
+                    "{r} deletes chain-store blocks ({call}); a peer-reachable deletion would \
+                     open the rebuild's not-stored exception"
+                );
+            }
+            if !r.starts_with("core/storage/src/") {
+                for call in ["start_services(", "start_auto_pruning("] {
+                    assert!(
+                        !code.contains(call),
+                        "{r} starts the chain-store pruner ({call}), which can delete an \
+                         applied tip that lags the stored height"
+                    );
+                }
+            }
+        }
+        // The start-up purge runs before any peer exists.
+        let main = include_str!("main.rs");
+        let purge = main.find("hardening_rejoin::purge_invalid_post_activation(");
+        let peers = main.find("PeerManager::new(");
+        assert!(
+            matches!((purge, peers), (Some(a), Some(b)) if a < b),
+            "the start-up purge must run before the peer manager is created"
+        );
+        // A read error is never "not stored".
+        let apply = include_str!("canonical_apply.rs");
+        assert!(
+            apply.contains(".has_block(&state.tip.hash)\n                .unwrap_or(true);"),
+            "the tip-held read must treat a storage error as held"
+        );
+    }
+
     /// Tripwire: no header-claimed blue score reaches the rebuild decision
     /// (SECREM-01 CONS-2; DGX P1 at 14afe643). The applicator's production code
     /// never reads `header.blue_score`; weights come only from fork choice.
