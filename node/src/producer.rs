@@ -182,7 +182,7 @@ pub struct ProduceCatchupGate {
     /// blocks, see [`AttestedNetworkHead::observe_deferred`]). Wired with the F2 gate.
     deferred_ahead: Option<Arc<AtomicU64>>,
     /// Set by the sync driver once this node's initial sync after start has completed
-    /// (`sync_fork_point::initial_sync_complete`). `None` ⇒ no initial-sync condition.
+    /// (`sync_recovery::initial_sync_complete`). `None` ⇒ no initial-sync condition.
     initial_sync_done: Option<Arc<AtomicBool>>,
 }
 
@@ -258,11 +258,16 @@ pub struct AttestedInner {
     /// Only these proposers' deferred blocks count as "behind" evidence. Bounded.
     known_proposers: Mutex<HashSet<PublicKey>>,
     /// Signed blocks heard from known proposers that could not be admitted yet (their
-    /// parent is missing): `proposer -> (highest such height, when last heard)`. A node
-    /// that is behind receives only such blocks, so without this the gate read a gap
-    /// of 0 exactly when the node was behind. Bounded; entries expire after
-    /// [`DEFERRED_EVIDENCE_TTL`].
+    /// parent is missing): `proposer -> (highest such height, when THAT height was first
+    /// heard)`. A node that is behind receives only such blocks, so without this the gate
+    /// read a gap of 0 exactly when the node was behind. Only a higher height from the
+    /// proposer resets the time; a repeat or a lower height never does, so the same
+    /// evidence counts for at most [`DEFERRED_EVIDENCE_TTL`]. Bounded.
     deferred: Mutex<HashMap<PublicKey, (u64, Instant)>>,
+    /// Test clock offset (both the monotonic and the wall clock), so tests can age
+    /// evidence without sleeping.
+    #[cfg(test)]
+    clock_skew: Mutex<Duration>,
 }
 
 /// Deferred ("heard but not admitted") evidence counts only while this fresh.
@@ -271,6 +276,10 @@ pub const DEFERRED_EVIDENCE_TTL: Duration = Duration::from_secs(30);
 /// vouch for a height, so one proposer (stranded on a side branch, or misbehaving)
 /// cannot make the rest of the fleet stop producing.
 pub const DEFERRED_EVIDENCE_MIN_PROPOSERS: usize = 2;
+/// Deferred evidence counts only when its header timestamp is within the TTL plus this
+/// clock allowance of local wall time (and not more than this allowance in the future),
+/// so an old block cannot be presented as evidence.
+pub const DEFERRED_EVIDENCE_CLOCK_DRIFT: Duration = Duration::from_secs(15);
 /// Deferred evidence is clamped to this far above the selected head.
 pub const DEFERRED_EVIDENCE_MAX_LEAD: u64 = crate::sync_peer::ANCESTRY_RECOVERY_WINDOW;
 /// Cap on the known-proposer and deferred-evidence records.
@@ -350,7 +359,7 @@ impl AttestedNetworkHead {
         if !self.inner.known_proposers.lock().contains(&proposer) {
             return false;
         }
-        let now = Instant::now();
+        let now = self.inner.now_instant();
         let mut deferred = self.inner.deferred.lock();
         if deferred.len() >= PROPOSER_RECORD_CAP && !deferred.contains_key(&proposer) {
             deferred
@@ -367,6 +376,14 @@ impl AttestedNetworkHead {
         }
         entry.1 = now;
         true
+    }
+
+    /// Advance this record's clock (tests only): ages deferred evidence and moves the
+    /// wall clock its timestamp check uses.
+    #[cfg(test)]
+    pub fn advance_clock_for_test(&self, by: Duration) {
+        let mut skew = self.inner.clock_skew.lock();
+        *skew = skew.saturating_add(by);
     }
 
     /// The signature + ancestry check. `Some(height)` iff the block is attested-ahead
@@ -396,8 +413,33 @@ impl AttestedNetworkHead {
 }
 
 impl AttestedInner {
+    /// Monotonic now (plus the test offset under `cfg(test)`).
+    fn now_instant(&self) -> Instant {
+        #[cfg(test)]
+        {
+            Instant::now() + *self.clock_skew.lock()
+        }
+        #[cfg(not(test))]
+        {
+            Instant::now()
+        }
+    }
+
+    /// Wall-clock seconds since the epoch (plus the test offset under `cfg(test)`).
+    fn wall_now_secs(&self) -> u64 {
+        let wall = chrono::Utc::now().timestamp().max(0) as u64;
+        #[cfg(test)]
+        {
+            wall.saturating_add(self.clock_skew.lock().as_secs())
+        }
+        #[cfg(not(test))]
+        {
+            wall
+        }
+    }
+
     /// The deferred-evidence height at least [`DEFERRED_EVIDENCE_MIN_PROPOSERS`] fresh,
-    /// distinct proposers vouch for (0 when fewer do). Expired entries are pruned.
+    /// distinct proposers vouch for (0 when fewer do).
     fn deferred_quorum_height(&self, now: Instant) -> u64 {
         let mut deferred = self.deferred.lock();
         deferred.retain(|_, (_, at)| now.saturating_duration_since(*at) < DEFERRED_EVIDENCE_TTL);
@@ -476,7 +518,7 @@ impl ProduceCatchupGate {
         // node heard but cannot admit (it lacks their ancestry). Clamped above the
         // selected head; a stale or single-proposer claim never counts.
         if let Some(d) = self.deferred_ahead.as_ref() {
-            let quorum = observed.deferred_quorum_height(Instant::now());
+            let quorum = observed.deferred_quorum_height(observed.now_instant());
             let bounded = quorum.min(sel_height.saturating_add(DEFERRED_EVIDENCE_MAX_LEAD));
             d.store(
                 if bounded > sel_height { bounded } else { 0 },
@@ -7199,7 +7241,24 @@ mod tests {
             ));
             let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
             let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
-            seed_test_genesis(&storage, &dag, &ghostdag).await;
+            // Genesis stamped with the current time, as on a live chain, so produced
+            // headers carry recent timestamps (the deferred-evidence check reads them).
+            let mut genesis = test_genesis();
+            genesis.header.timestamp = chrono::Utc::now().timestamp().max(0) as u64;
+            genesis.header.block_hash = genesis.compute_hash();
+            storage.blocks.put_block(&genesis).expect("persist genesis");
+            storage
+                .blocks
+                .put_applied_tip(&genesis.header.block_hash, 0)
+                .expect("genesis applied tip");
+            dag.set_configured_genesis(genesis.header.block_hash);
+            dag.store_block(genesis.clone())
+                .await
+                .expect("genesis in DAG");
+            ghostdag
+                .add_block(&genesis)
+                .await
+                .expect("genesis in GhostDAG");
             let app = Arc::new(
                 CanonicalApplicator::new(executor.clone(), storage.clone())
                     .with_fork_choice(ghostdag.clone()),
@@ -7391,6 +7450,147 @@ mod tests {
             (a1, a2, b, l1.expect("A1 block"), l2.expect("A2 block"))
         }
 
+        /// The deferred-evidence watermark the gate computed in its last round.
+        fn deferred_watermark(n: &N) -> u64 {
+            n.producer
+                .produce_gate
+                .as_ref()
+                .and_then(|g| g.deferred_ahead.as_ref())
+                .map(|d| d.load(Ordering::SeqCst))
+                .expect("gate wired")
+        }
+
+        /// Re-sign `b` by node `i`'s proposer key after editing its header.
+        fn resign(mut b: Block, i: u8) -> Block {
+            b.header.block_hash = b.compute_hash();
+            b.signature = crypto::sign_block(
+                &b.header.block_hash,
+                &Ed25519SigningKey::from_bytes(&[0x60 + i; 32]),
+            );
+            b
+        }
+
+        /// Serializes the tests that read or set the process-wide mine-on-demand
+        /// switch, and clears it again even if a test fails.
+        static MINE_ON_DEMAND_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        struct MineOnDemandOff;
+        impl Drop for MineOnDemandOff {
+            fn drop(&mut self) {
+                set_mine_on_demand(false);
+            }
+        }
+
+        /// The same evidence, re-delivered, counts for at most 30 s from when it was
+        /// first heard: the same two blocks (and lower ones from the same proposers)
+        /// re-sent every 10 s for 5 minutes stop the producer only for the first 30 s.
+        #[tokio::test(flavor = "current_thread")]
+        async fn redelivered_deferred_evidence_expires_30s_after_first_heard() {
+            let (_a1, _a2, mut b, t1, t2) = behind_fixture().await;
+            // Lower-height evidence from the same two proposers (validly signed,
+            // parent missing): must not renew either.
+            let lower: Vec<Block> = [(&t1, 1u8), (&t2, 2u8)]
+                .into_iter()
+                .map(|(blk, i)| {
+                    let mut x = blk.clone();
+                    x.header.height -= 2;
+                    resign(x, i)
+                })
+                .collect();
+            for step in 0..=30u64 {
+                let t = step * 10;
+                gossip(&mut b, None, &t1).await;
+                gossip(&mut b, None, &t2).await;
+                for x in &lower {
+                    b.attested.observe_deferred(x);
+                }
+                let r = b.producer.produce_block().await;
+                if t < DEFERRED_EVIDENCE_TTL.as_secs() {
+                    assert!(
+                        r.is_err(),
+                        "t={t}s: sealed while fresh evidence says behind"
+                    );
+                } else {
+                    assert!(
+                        r.is_ok(),
+                        "t={t}s: re-delivered evidence still stops sealing: {:?}",
+                        r.err()
+                    );
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+        }
+
+        /// A block whose header timestamp is old is not evidence, even heard for the
+        /// first time from a known proposer.
+        #[tokio::test(flavor = "current_thread")]
+        async fn old_header_timestamp_is_not_evidence() {
+            let (_a1, _a2, mut b, t1, t2) = behind_fixture().await;
+            b.attested.advance_clock_for_test(
+                DEFERRED_EVIDENCE_TTL + DEFERRED_EVIDENCE_CLOCK_DRIFT + Duration::from_secs(1),
+            );
+            assert!(!b.attested.observe_deferred(&t1));
+            assert!(!b.attested.observe_deferred(&t2));
+            gossip(&mut b, None, &t1).await;
+            gossip(&mut b, None, &t2).await;
+            assert!(b.producer.produce_block().await.is_ok());
+        }
+
+        /// A known proposer's block with a broken signature is not evidence (anyone
+        /// can put a known key in a header).
+        #[tokio::test(flavor = "current_thread")]
+        async fn bad_signature_on_a_known_key_is_not_evidence() {
+            let (_a1, _a2, mut b, t1, mut t2) = behind_fixture().await;
+            let mut sig = *t2.signature.as_bytes();
+            sig[0] ^= 0x01;
+            t2.signature = citrate_consensus::types::Signature::new(sig);
+            assert!(
+                !b.attested.observe_deferred(&t2),
+                "forged signature counted"
+            );
+            gossip(&mut b, None, &t1).await;
+            gossip(&mut b, None, &t2).await;
+            assert!(b.producer.produce_block().await.is_ok());
+        }
+
+        /// A block whose header no longer binds its hash (height edited, signature
+        /// over the original hash still valid) is not evidence.
+        #[tokio::test(flavor = "current_thread")]
+        async fn tampered_header_is_not_evidence() {
+            let (_a1, _a2, mut b, t1, mut t2) = behind_fixture().await;
+            t2.header.height += 100;
+            assert!(matches!(crypto::verify_block_signature(&t2), Ok(true)));
+            assert!(!b.attested.observe_deferred(&t2), "tampered header counted");
+            gossip(&mut b, None, &t1).await;
+            assert!(b.producer.produce_block().await.is_ok());
+        }
+
+        /// Deferred evidence is clamped to the selected head + 512.
+        #[tokio::test(flavor = "current_thread")]
+        async fn deferred_watermark_is_capped_above_the_head() {
+            let (_a1, _a2, b, t1, t2) = behind_fixture().await;
+            for (blk, i) in [(t1, 1u8), (t2, 2u8)] {
+                let mut far = blk;
+                far.header.height = 1_000_000;
+                let far = resign(far, i);
+                assert!(b.attested.observe_deferred(&far));
+            }
+            assert!(b.producer.produce_block().await.is_err());
+            assert_eq!(deferred_watermark(&b), 39 + DEFERRED_EVIDENCE_MAX_LEAD);
+        }
+
+        /// The genesis-build devnet (mine-on-demand) seals without waiting for
+        /// initial sync.
+        #[tokio::test(flavor = "current_thread")]
+        async fn devnet_mine_on_demand_skips_the_initial_sync_wait() {
+            let _serial = MINE_ON_DEMAND_TESTS.lock().await;
+            let _reset = MineOnDemandOff;
+            let b = node(7, true).await;
+            b.initial_sync.store(false, Ordering::SeqCst);
+            set_mine_on_demand(true);
+            let r = b.producer.produce_block().await;
+            assert!(r.is_ok(), "devnet waited for initial sync: {:?}", r.err());
+        }
+
         /// The seal gate refuses while the node is behind: B at 39 has heard signed
         /// tips from two known proposers above it that it cannot admit (their
         /// parents are missing). Before, the gate counted only blocks whose parent
@@ -7459,6 +7659,7 @@ mod tests {
         /// initial sync complete, then seals.
         #[tokio::test(flavor = "current_thread")]
         async fn producer_waits_for_initial_sync() {
+            let _serial = MINE_ON_DEMAND_TESTS.lock().await;
             let b = node(7, true).await;
             b.initial_sync.store(false, Ordering::SeqCst);
             let refused = b.producer.produce_block().await;

@@ -186,12 +186,24 @@ mod tests {
             "attested_for_rx.observe_deferred(&block)",
             "with_initial_sync_gate(initial_sync_done.clone())",
             "sync_recovery::initial_sync_complete(",
-            ".record_give_up(&pid.0)",
+            // Both give-up sites: the sync tick (no answer) and the receive loop
+            // (after the serve credit, which would otherwise clear the count).
+            "sync_peers_for_loop.lock().await.record_give_up(&pid.0)",
+            "sel.record_give_up(&pid.0)",
         ] {
             assert!(
                 main.contains(needle),
                 "main.rs no longer contains `{needle}`"
             );
         }
+        // The receive-loop give-up must follow the serve credit.
+        let serve = main
+            .find("let quality = sel.record_serve(")
+            .expect("serve credit");
+        let give_up = main.find("sel.record_give_up(&pid.0)").expect("give-up");
+        assert!(
+            give_up > serve,
+            "give-up must be applied after record_serve"
+        );
     }
 }
