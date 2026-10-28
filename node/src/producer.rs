@@ -866,6 +866,10 @@ pub(crate) struct PanicBreaker {
     quarantine_order: std::collections::VecDeque<Hash>,
     #[cfg(test)]
     fault: Option<(Hash, TestFault)>,
+    /// Test-only: alter the candidate block just before it is hashed, to stand in
+    /// for a producer rule that has drifted from a peer rule.
+    #[cfg(test)]
+    seal_tamper: Option<fn(&mut Block)>,
 }
 
 /// Test-only fault injected after a round has executed its transactions.
@@ -2342,6 +2346,11 @@ impl BlockProducer {
         {
             let learning_root = self.compute_checkpoint_learning_root(block_height).await;
             block.learning_root = learning_root;
+        }
+
+        #[cfg(test)]
+        if let Some(tamper) = self.panic_breaker.lock().seal_tamper {
+            tamper(&mut block);
         }
 
         // C-05: Compute canonical block hash from ALL fields including commitment roots.
@@ -5237,6 +5246,336 @@ mod tests {
             .expect("a block built on the producer's parent choice must pass the receiver's rule");
     }
 
+    /// The heaviest-parent filter's two unreadable arms. A tip whose header this
+    /// node cannot read is not merged (a receiver may lack it), and when the
+    /// selected parent's own header cannot be read there is nothing to compare
+    /// against, so nothing is merged. Readable tips with an equal header score are
+    /// still merged in the first case (negative control).
+    #[tokio::test]
+    async fn heaviest_parent_filter_never_merges_on_an_unreadable_header() {
+        use citrate_execution::StateDB;
+
+        let dir = TempDir::new().expect("tempdir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let executor = Arc::new(Executor::with_storage_and_chain_id(
+            Arc::new(StateDB::new()),
+            Some(storage.state.clone()),
+            40204,
+        ));
+        let mempool = Arc::new(Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        }));
+        let producer = BlockProducer::new(
+            storage.clone(),
+            executor,
+            mempool,
+            embedded_pubkey(Address([0x44; 20])),
+            Ed25519SigningKey::from_bytes(&[42; 32]),
+            2,
+        )
+        .with_v2_headers(true);
+        let dag = producer.dag_store();
+        let ghostdag = producer.ghostdag();
+        let genesis = seed_test_genesis(&storage, &dag, &ghostdag).await;
+
+        fn peer_block(tag: u8, parent: &Block, merges: &[&Block]) -> Block {
+            let score = parent.header.blue_score + 1;
+            let mut blk = BlockBuilder::new()
+                .version(2)
+                .height(parent.header.height + 1)
+                .parent(parent.header.block_hash)
+                .merge_parents(merges.iter().map(|m| m.header.block_hash).collect())
+                .coinbase([tag; 20])
+                .timestamp(parent.header.timestamp + 1)
+                .vrf_reveal(VrfProof {
+                    proof: vec![],
+                    output: Hash::new([tag; 32]),
+                })
+                .transactions(vec![])
+                .state_root(Hash::default())
+                .blue_score(score)
+                .blue_work(citrate_consensus::types::blue_work_for_score(score))
+                .build_unhashed();
+            blk.header.block_hash = blk.compute_hash();
+            blk
+        }
+        async fn admit(dag: &DagStore, ghostdag: &GhostDag, b: &Block) {
+            dag.store_block(b.clone()).await.expect("store peer block");
+            ghostdag.add_block(b).await.expect("admit peer block");
+        }
+
+        let a = peer_block(0xA1, &genesis, &[]);
+        let b = peer_block(0xA2, &genesis, &[]);
+        admit(&dag, &ghostdag, &a).await;
+        admit(&dag, &ghostdag, &b).await;
+
+        // 1. An unreadable tip is not merged; the readable equal-score sibling is.
+        let unknown = Hash::new([0xEE; 32]);
+        let mut tips = dag.get_tips().await;
+        tips.push(citrate_consensus::types::Tip {
+            hash: unknown,
+            ..tips[0].clone()
+        });
+        let (sp, merges) = producer
+            .select_parents_with_ghostdag(&tips, None)
+            .await
+            .expect("parent selection");
+        assert!(
+            !merges.contains(&unknown),
+            "a tip with no readable header must not be merged"
+        );
+        let sibling = if sp == a.header.block_hash { &b } else { &a };
+        assert_eq!(
+            merges,
+            vec![sibling.header.block_hash],
+            "the readable equal-score sibling is still merged"
+        );
+
+        // 2. Fork choice selects a block whose header this DAG store does not hold
+        //    (registered with GhostDAG only): no merge parent can be judged.
+        let ghost = peer_block(0xB1, &a, &[&b]);
+        ghostdag
+            .add_block(&ghost)
+            .await
+            .expect("register with GhostDAG only");
+        assert!(dag.get_block(&ghost.header.block_hash).await.is_err());
+        let c = peer_block(0xC1, &b, &[]);
+        admit(&dag, &ghostdag, &c).await;
+        assert_eq!(
+            ghostdag.select_tip().await.expect("select_tip"),
+            ghost.header.block_hash,
+            "precondition: fork choice prefers the block with an unreadable header"
+        );
+        let tips = dag.get_tips().await;
+        let (sp, merges) = producer
+            .select_parents_with_ghostdag(&tips, None)
+            .await
+            .expect("parent selection");
+        assert_eq!(sp, ghost.header.block_hash);
+        assert!(
+            merges.is_empty(),
+            "with the selected parent's header unreadable nothing may be merged, got {merges:?}"
+        );
+    }
+
+    /// SEVEN CONCURRENT PRODUCERS, ~150 SLOTS (compact form of the #430 review soak).
+    /// Each node has its own stores and runs the real `produce_block`; every sealed
+    /// block reaches the other six through the real admission path
+    /// (`BlockAdmission::admit`, i.e. `validate_block_consistency` and the body
+    /// rules) after a random delay of 0, 1 or 2 slots, then execute-on-receive and
+    /// the drain. This is the shape that split r1006 into one branch per producer at
+    /// height 16,509; before #430 it fails here within the run.
+    ///
+    /// INVARIANTS: no block is ever rejected by a peer; after a quiet period every
+    /// node's selected chain agrees at a common height; every producer has blocks on
+    /// that selected chain.
+    #[tokio::test(flavor = "current_thread")]
+    async fn seven_producers_with_delivery_delay_never_split() {
+        use crate::admission::{AdmitOutcome, BlockAdmission};
+        use crate::canonical_apply::{ApplyOutcome, CanonicalApplicator};
+        use citrate_execution::StateDB;
+        use std::collections::HashMap;
+
+        const PRODUCERS: usize = 7;
+        const SLOTS: u64 = 150;
+        const QUIET_SLOTS: u64 = 10;
+
+        // Fixed-seed xorshift: the delay pattern is reproducible.
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        struct Node {
+            storage: Arc<StorageManager>,
+            app: Arc<CanonicalApplicator>,
+            adm: BlockAdmission,
+            producer: BlockProducer,
+            pending: Vec<Block>,
+            _dir: TempDir,
+        }
+        let mut nodes: Vec<Node> = Vec::new();
+        for i in 0..PRODUCERS {
+            let dir = TempDir::new().expect("tempdir");
+            let storage = Arc::new(
+                StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
+            );
+            let executor = Arc::new(Executor::with_storage_and_chain_id(
+                Arc::new(StateDB::new()),
+                Some(storage.state.clone()),
+                40204,
+            ));
+            let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+            let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+            seed_test_genesis(&storage, &dag, &ghostdag).await;
+            let app = Arc::new(
+                CanonicalApplicator::new(executor.clone(), storage.clone())
+                    .with_fork_choice(ghostdag.clone()),
+            );
+            let adm = BlockAdmission::new(storage.clone(), dag.clone(), ghostdag.clone(), None);
+            let mempool = Arc::new(Mempool::new(MempoolConfig {
+                require_valid_signature: false,
+                ..Default::default()
+            }));
+            let producer = BlockProducer::with_shared_dag(
+                storage.clone(),
+                executor,
+                mempool,
+                None,
+                embedded_pubkey(Address([0x10 + i as u8; 20])),
+                Ed25519SigningKey::from_bytes(&[0x60 + i as u8; 32]),
+                2,
+                Arc::new(citrate_economics::UnifiedEconomicsManager::new(
+                    citrate_economics::UnifiedEconomicsConfig::default(),
+                )),
+                dag,
+                ghostdag,
+            )
+            .await
+            .with_v2_headers(true)
+            .with_applied_tip_lock(app.advance_lock());
+            nodes.push(Node {
+                storage,
+                app,
+                adm,
+                producer,
+                pending: Vec::new(),
+                _dir: dir,
+            });
+        }
+
+        async fn deliver(n: &mut Node, b: Block, rejections: &mut Vec<String>) {
+            match n.adm.admit(&b).await {
+                AdmitOutcome::Admitted { .. } | AdmitOutcome::AlreadyAdmitted => {
+                    if let ApplyOutcome::Rejected(why) = n.app.apply_received(&b).await {
+                        rejections.push(format!(
+                            "execute {} @ {}: {why}",
+                            b.header.block_hash, b.header.height
+                        ));
+                    }
+                }
+                AdmitOutcome::Deferred { .. } => n.pending.push(b),
+                AdmitOutcome::Rejected(why) => rejections.push(format!(
+                    "admit {} @ {}: {why}",
+                    b.header.block_hash, b.header.height
+                )),
+            }
+        }
+        async fn retry_pending(n: &mut Node, rejections: &mut Vec<String>) {
+            loop {
+                let before = n.pending.len();
+                for b in std::mem::take(&mut n.pending) {
+                    deliver(n, b, rejections).await;
+                }
+                if n.pending.len() >= before {
+                    break;
+                }
+            }
+            n.app.drive_drain().await;
+        }
+
+        let mut rejections: Vec<String> = Vec::new();
+        let mut inflight: Vec<(u64, usize, Block)> = Vec::new();
+        for slot in 0..SLOTS + QUIET_SLOTS {
+            let quiet = slot >= SLOTS;
+            let mut order: Vec<usize> = (0..PRODUCERS).collect();
+            for k in (1..order.len()).rev() {
+                order.swap(k, (next() % (k as u64 + 1)) as usize);
+            }
+            for &i in &order {
+                // An Err is a deliberate skip (MP-S1 or the pre-seal check).
+                let Ok(h) = nodes[i].producer.produce_block().await else {
+                    continue;
+                };
+                let b = nodes[i]
+                    .storage
+                    .blocks
+                    .get_block(&h)
+                    .expect("read produced block")
+                    .expect("produced block stored");
+                for j in (0..PRODUCERS).filter(|j| *j != i) {
+                    let r = next() % 100;
+                    let delay = if quiet || r < 60 {
+                        0
+                    } else if r < 90 {
+                        1
+                    } else {
+                        2
+                    };
+                    inflight.push((slot + delay, j, b.clone()));
+                }
+            }
+            let (due, rest): (Vec<_>, Vec<_>) =
+                inflight.into_iter().partition(|(at, _, _)| *at <= slot);
+            inflight = rest;
+            for (_, j, b) in due {
+                deliver(&mut nodes[j], b, &mut rejections).await;
+            }
+            for n in nodes.iter_mut() {
+                retry_pending(n, &mut rejections).await;
+            }
+        }
+        assert!(
+            rejections.is_empty(),
+            "{} peer rejection(s), first: {:?}",
+            rejections.len(),
+            rejections.iter().take(3).collect::<Vec<_>>()
+        );
+
+        // Each node's selected chain, walked from its applied tip.
+        let mut chains: Vec<HashMap<u64, Hash>> = Vec::new();
+        for n in &nodes {
+            let mut chain = HashMap::new();
+            let mut cur = n.app.applied_tip().await.hash;
+            loop {
+                let b = n
+                    .storage
+                    .blocks
+                    .get_block(&cur)
+                    .expect("read")
+                    .expect("selected chain block stored");
+                chain.insert(b.header.height, cur);
+                if b.header.height == 0 {
+                    break;
+                }
+                cur = b.header.selected_parent_hash;
+            }
+            chains.push(chain);
+        }
+        let min_height = chains.iter().map(|c| c.len() as u64 - 1).min().unwrap_or(0);
+        assert!(min_height >= SLOTS / 2, "chain too short: {min_height}");
+        let common = min_height.saturating_sub(2);
+        let reference = chains[0][&common];
+        for (i, c) in chains.iter().enumerate() {
+            assert_eq!(
+                c.get(&common),
+                Some(&reference),
+                "node {i} is on a different branch at common height {common}"
+            );
+        }
+        let mut share: HashMap<[u8; 20], usize> = HashMap::new();
+        for h in chains[0].values() {
+            let b = nodes[0]
+                .storage
+                .blocks
+                .get_block(h)
+                .expect("read")
+                .expect("stored");
+            *share.entry(b.header.coinbase).or_default() += 1;
+        }
+        for i in 0..PRODUCERS {
+            assert!(
+                share.get(&[0x10 + i as u8; 20]).copied().unwrap_or(0) > 0,
+                "producer {i} has no block on the selected chain: {share:?}"
+            );
+        }
+    }
+
     /// REGRESSION (chain 40204 reroll wedge @ height 101, 2026-08-12). `produce_block`
     /// stores each produced block in the DAG store (so `dag_store.get_tips()`, the
     /// PARENT source, advances and the chain grows) but never registered it into
@@ -7599,6 +7938,89 @@ mod producer_vrf_fail_closed {
         );
         assert_eq!(block.transactions.len(), 1, "the pending tx is included");
         assert_real_ecvrf(&block, &Hash::default());
+        match next_broadcast(&mut n.peer_rx).await {
+            Some(NetworkMessage::NewBlock { block: sent }) => {
+                assert_eq!(sent.header.block_hash, hash)
+            }
+            other => panic!("the produced block must be broadcast, got {other:?}"),
+        }
+    }
+
+    /// PRE-SEAL PEER CHECK. A candidate that fails a rule peers apply on admission
+    /// must never be sealed, applied or broadcast: the slot is skipped instead. The
+    /// tamper hook stands in for any producer rule that drifts from a peer rule (the
+    /// r1006 split was one: a merge parent heavier than the selected parent). Before
+    /// the check the tampered block was persisted as the applied tip and broadcast,
+    /// and the peer verdict only surfaced afterwards as a warning.
+    #[tokio::test]
+    async fn a_candidate_failing_a_peer_rule_is_not_sealed_applied_or_broadcast() {
+        let mut n = node(super::real_vrf_prover()).await;
+
+        // Height 1 on the parentless bring-up path, then a normal block on it.
+        let first = n.producer.produce_block().await.expect("height 1");
+        assert!(matches!(
+            next_broadcast(&mut n.peer_rx).await,
+            Some(NetworkMessage::NewBlock { .. })
+        ));
+        let tip_before = n
+            .storage
+            .blocks
+            .get_applied_tip()
+            .expect("read applied tip");
+
+        // Stand-in for drift: a header blue_score above the band peers accept.
+        fn out_of_band_score(b: &mut Block) {
+            b.header.blue_score = b.header.blue_score.saturating_add(5);
+            b.header.blue_work = citrate_consensus::types::blue_work_for_score(b.header.blue_score);
+        }
+        n.producer.panic_breaker.lock().seal_tamper = Some(out_of_band_score);
+        let skipped_before = citrate_api::metrics_server::producer_preseal_rejects();
+
+        let out = n.producer.produce_block().await;
+        assert!(
+            out.is_err(),
+            "a candidate peers would reject must not be sealed (got {out:?})"
+        );
+        assert!(
+            next_broadcast(&mut n.peer_rx).await.is_none(),
+            "nothing may be broadcast for a skipped slot"
+        );
+        assert_eq!(
+            n.storage
+                .blocks
+                .get_applied_tip()
+                .expect("read applied tip"),
+            tip_before,
+            "the applied tip must not move to a block peers reject"
+        );
+        assert!(
+            n.storage
+                .blocks
+                .get_block_by_height(2)
+                .expect("read height index")
+                .is_none(),
+            "no block may be persisted at the skipped height"
+        );
+        assert!(
+            citrate_api::metrics_server::producer_preseal_rejects() >= skipped_before + 1.0,
+            "the skip must be counted on citrate_producer_preseal_rejects_total"
+        );
+
+        // The next slot, with producer and peer rules agreeing again, seals normally.
+        n.producer.panic_breaker.lock().seal_tamper = None;
+        let hash = n
+            .producer
+            .produce_block()
+            .await
+            .expect("next slot produces");
+        let block = n
+            .storage
+            .blocks
+            .get_block(&hash)
+            .expect("read")
+            .expect("stored");
+        assert_eq!(block.header.height, 2);
+        assert_eq!(block.header.selected_parent_hash, first);
         match next_broadcast(&mut n.peer_rx).await {
             Some(NetworkMessage::NewBlock { block: sent }) => {
                 assert_eq!(sent.header.block_hash, hash)
