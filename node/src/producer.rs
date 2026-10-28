@@ -852,6 +852,14 @@ impl<T> RoundOutcome<T> {
 /// whichever transaction the halving isolates; that needs an existing panic
 /// bug and only affects what this producer proposes. Block validity is
 /// unchanged.
+/// Log budget for slots skipped by the pre-seal peer check: a persistent rule
+/// mismatch would otherwise log once per slot.
+fn preseal_reject_log() -> &'static crate::admission::LogBudget {
+    static BUDGET: once_cell::sync::Lazy<crate::admission::LogBudget> =
+        once_cell::sync::Lazy::new(|| crate::admission::LogBudget::new(5, 60));
+    &BUDGET
+}
+
 #[derive(Default)]
 pub(crate) struct PanicBreaker {
     /// Candidate ids handed to the builder in the current round.
@@ -2380,6 +2388,35 @@ impl BlockProducer {
             }
         }
 
+        // PRE-SEAL PEER CHECK: judge the candidate with the rules a peer applies on
+        // admission BEFORE anything is persisted, applied or broadcast. A block that
+        // fails them would be rejected by every peer while this node built on it
+        // alone (the r1006 split). Failing here ends the round: `round_state` is
+        // dropped uncommitted, so the executor rolls back, and the slot is skipped.
+        // Any future drift between producer and peer rules then costs one slot.
+        if let Err(rule) = self.peer_admission_verdict(&block).await {
+            citrate_api::metrics_server::record_producer_preseal_reject();
+            let d = preseal_reject_log().check();
+            if d.suppressed_in_previous_window > 0 {
+                warn!(
+                    "producer: {} more slot(s) skipped by the pre-seal peer check in the \
+                     previous window (lines suppressed)",
+                    d.suppressed_in_previous_window
+                );
+            }
+            if d.emit {
+                warn!(
+                    "producer: skipping slot — candidate {} @ {} fails a peer admission rule: {}",
+                    block.header.block_hash, block.header.height, rule
+                );
+            }
+            return Err(anyhow::anyhow!(
+                "pre-seal peer check failed for candidate @ {}: {}",
+                block.header.height,
+                rule
+            ));
+        }
+
         // SRP-S3b (restart/crash consistency): persist the BLOCK first, then the state +
         // applied-tip pointer ATOMICALLY. Durable order = BLOCK → (STATE + TIP atomic). A
         // crash after the block but before the atomic commit leaves the block stored AHEAD
@@ -2672,6 +2709,27 @@ impl BlockProducer {
     /// returns false so the drain's reorg still governs. The walk is bounded — a
     /// gap wider than `SUPERSEDE_WALK_CAP` is treated as "not the restart-lag case"
     /// and left to the drain, so this never masks a deep legitimate reorg.
+    /// The verdict a peer's admission path (`BlockAdmission::admit`) would reach on
+    /// `block`, minus node-local operator state (rollback withdrawals and canonical
+    /// checkpoints, which name historical blocks): the GhostDAG consistency rules,
+    /// then the body rules, then sidecar ingest. `Err` carries the failed rule.
+    ///
+    /// A parentless block is only built on the legacy path where no genesis was
+    /// seeded; there is no parent to judge it against, so it is not checked here.
+    async fn peer_admission_verdict(&self, block: &Block) -> Result<(), String> {
+        if block.header.selected_parent_hash == Hash::default() {
+            return Ok(());
+        }
+        self.ghostdag
+            .validate_block_consistency(block)
+            .await
+            .map_err(|e| format!("consistency: {e}"))?;
+        let hardening = self.ghostdag.pba_hardening();
+        crate::admission::verify_block_body(hardening, block)?;
+        crate::admission::sidecar_ingest(hardening, block)?;
+        Ok(())
+    }
+
     async fn applied_tip_supersedes(
         &self,
         candidate: Hash,
@@ -2813,24 +2871,27 @@ impl BlockProducer {
         let max_parents = self.ghostdag.params().max_parents;
         let mut dropped_deep = 0usize;
         let mut dropped_heavier = 0usize;
+        let mut dropped_unreadable = 0usize;
         let mut merge_parents: Vec<Hash> = Vec::new();
         for h in tip_hashes.into_iter().filter(|h| *h != selected_parent) {
             if merge_parents.len() >= max_parents.saturating_sub(1) {
                 break; // Leave room for the selected parent.
             }
-            match (sp_header_score, self.dag_store.get_block(&h).await.ok()) {
-                (Some(sp_score), Some(tip)) if tip.header.blue_score <= sp_score => {}
-                _ => {
-                    // Heavier than the selected parent, or not readable here (a
-                    // receiver would reject it as a missing parent): do not merge.
-                    dropped_heavier = dropped_heavier.saturating_add(1);
-                    continue;
-                }
+            // Without the selected parent's header there is nothing to compare
+            // against, and a tip whose header we cannot read is one a receiver may
+            // lack: merge neither. Counted apart from "heavier" so the log says why.
+            let (Some(sp_score), Some(tip)) =
+                (sp_header_score, self.dag_store.get_block(&h).await.ok())
+            else {
+                dropped_unreadable = dropped_unreadable.saturating_add(1);
+                continue;
+            };
+            if tip.header.blue_score > sp_score {
+                dropped_heavier = dropped_heavier.saturating_add(1);
+                continue;
             }
-            if let (Some(child_h), Some(tip_h)) =
-                (child_height, self.ghostdag.get_block_height(&h).await)
-            {
-                if child_h.saturating_sub(tip_h)
+            if let Some(child_h) = child_height {
+                if child_h.saturating_sub(tip.header.height)
                     > citrate_consensus::ghostdag::MERGE_PARENT_MAX_DEPTH
                 {
                     dropped_deep = dropped_deep.saturating_add(1);
@@ -2844,6 +2905,14 @@ impl BlockProducer {
                 "producer: left {} tip(s) unmerged whose header blue_score exceeds the selected \
                  parent's ({:?}); merging them would make our block invalid for every peer",
                 dropped_heavier, sp_header_score
+            );
+        }
+        if dropped_unreadable > 0 {
+            debug!(
+                "producer: left {} tip(s) unmerged because a header could not be read \
+                 (selected parent header readable: {})",
+                dropped_unreadable,
+                sp_header_score.is_some()
             );
         }
         if dropped_deep > 0 {
