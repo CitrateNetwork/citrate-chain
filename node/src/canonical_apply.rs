@@ -2635,11 +2635,12 @@ impl CanonicalApplicator {
             let floor = self.dag_prune_floor().await;
             let head_w = self.weight(head).await;
             let tip_w = self.weight(state.tip.hash).await;
-            let tip_held = match self.storage.blocks.has_block(&state.tip.hash) {
-                Ok(held) => held,
-                // A read error is never "not held".
-                Err(_) => true,
-            };
+            // A read error is never "not held".
+            let tip_held = self
+                .storage
+                .blocks
+                .has_block(&state.tip.hash)
+                .unwrap_or(true);
             match rebuild_decision(below_ring, floor, head_w, tip_w, tip_held) {
                 RebuildDecision::Rebuild => {}
                 refused => {
