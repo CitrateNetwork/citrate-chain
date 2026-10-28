@@ -517,9 +517,10 @@ pub(crate) mod tests {
             if head != self.app.applied_tip().await.hash {
                 let _ = self
                     .app
-                    .recover_to_head(
+                    .recover_automatic(
                         Executor::new(Arc::new(StateDB::new())).state_snapshot(),
                         genesis().header.block_hash,
+                        head,
                     )
                     .await;
             }

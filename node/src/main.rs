@@ -2797,8 +2797,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             );
                             return;
                         }
+                        // `recover_automatic`: only toward a strictly heavier
+                        // head, never below a pruned DAG floor, and only toward
+                        // the head checked here.
                         match app
-                            .recover_to_head(genesis_snapshot.clone(), genesis_hash)
+                            .recover_automatic(genesis_snapshot.clone(), genesis_hash, head)
                             .await
                         {
                             Ok(true) => {

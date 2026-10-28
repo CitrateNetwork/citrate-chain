@@ -88,6 +88,35 @@ const MAX_REORG_DEPTH: u64 = 100;
 /// the 2026-08-09 wedge (winning branch 513) sits well inside it.
 const MAX_REORG_FORWARD: u64 = 10_000;
 
+/// [`MAX_REORG_FORWARD`], or a test's override on this thread.
+fn reorg_forward_cap() -> u64 {
+    #[cfg(test)]
+    if let Some(n) = test_reorg_forward::get() {
+        return n.max(1);
+    }
+    MAX_REORG_FORWARD
+}
+
+/// Test-only per-thread override of the forward branch cap, so tests can reach
+/// the far-ahead paths with a few hundred blocks.
+#[cfg(test)]
+pub(crate) mod test_reorg_forward {
+    use std::cell::Cell;
+    thread_local! {
+        static CAP: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+    pub(crate) fn set(n: Option<u64>) {
+        CAP.with(|c| c.set(n));
+    }
+    pub(crate) fn get() -> Option<u64> {
+        CAP.with(|c| c.get())
+    }
+}
+
+/// How long the receive path waits for the advance lock before it re-checks
+/// whether a rebuild has started (see [`CanonicalApplicator::apply_received`]).
+const RECEIVE_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Upper bound on the blocks a from-genesis spine rebuild (`recover_to_head`)
 /// walks, and on the blocks the interrupted-rebuild receipt cleanup walks.
 const MAX_RECOVERY_SPINE: usize = 20_000_000;
@@ -369,9 +398,64 @@ impl AppliedState {
 /// A boxed async closure so production wires `GhostDag::select_tip` while tests
 /// inject a fixed tip — avoiding an async-trait dependency.
 type ForkChoice = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Option<Hash>> + Send>> + Send + Sync>;
-/// Fork-choice weight (blue score) of a block, `None` when unknown.
+
+/// Fork-choice weight of a block (GhostDAG blue score in production), `None`
+/// when fork choice does not know the block. See
+/// [`CanonicalApplicator::rebuild_target`].
 type ForkWeight =
     Arc<dyn Fn(Hash) -> Pin<Box<dyn Future<Output = Option<u64>> + Send>> + Send + Sync>;
+
+/// Why [`CanonicalApplicator::rebuild_target`] refused a from-genesis rebuild.
+/// Every refusal leaves the node exactly as it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RebuildRefusal {
+    /// The head is a block of the applied chain (the tip or an ancestor): there
+    /// is no fork, whatever the reorg ring or the DAG store still holds.
+    OnAppliedChain { height: u64 },
+    /// The head descends from the applied tip: the drain reaches it forward.
+    DescendsFromTip,
+    /// The head's ancestry has a block this node does not hold before it meets
+    /// the applied chain. A missing (or pruned) ancestor is not divergence.
+    MissingAncestor { missing: Hash },
+    /// Fork choice does not rank the head above the applied tip (higher score;
+    /// equal scores to the smaller hash), or does not score the head at all:
+    /// nothing justifies abandoning the tip.
+    NotHeavier { head: u64, tip: u64 },
+    /// A storage read failed; nothing was concluded.
+    Unreadable(String),
+}
+
+impl std::fmt::Display for RebuildRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OnAppliedChain { height } => {
+                write!(
+                    f,
+                    "the head is the applied chain's own block at height {height}"
+                )
+            }
+            Self::DescendsFromTip => write!(f, "the head descends from the applied tip"),
+            Self::MissingAncestor { missing } => write!(
+                f,
+                "the head's ancestry is missing block {missing} before it meets the applied chain"
+            ),
+            Self::NotHeavier { head, tip } => write!(
+                f,
+                "the head (weight {head}) does not outrank the applied tip (weight {tip})"
+            ),
+            Self::Unreadable(e) => write!(f, "storage read failed: {e}"),
+        }
+    }
+}
+
+/// What a from-genesis rebuild would do, established before anything changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RebuildPlan {
+    /// The highest block shared by the applied chain and the head's ancestry.
+    pub fork: AppliedTip,
+    /// Applied blocks the switch abandons (`tip.height - fork.height`).
+    pub abandoned: u64,
+}
 
 /// Registry snapshot-sync hook: given a snapshot-boundary height, rebuild the
 /// proposer selector and return the validator count (or an error string). A boxed
@@ -416,9 +500,6 @@ pub enum ReorgOutcome {
         /// The height at which the downward walk fell below the retained window
         /// (or where the forward cap tripped) — for diagnostics.
         stopped_at: u64,
-        /// True when the fork point is below the retained window; false when
-        /// only the `MAX_REORG_FORWARD` memory cap tripped.
-        below_ring: bool,
     },
     /// Refused or failed: fork point below the finalized floor, a missing block,
     /// or a bad block on the winning branch. World state is left byte-identical to
@@ -589,6 +670,10 @@ pub struct CanonicalApplicator {
     /// drain the driver reorgs the applied tip toward the selected tip. `None`
     /// disables reorg (steps 2–3 behavior only). Wired under `CITRATE_BLOCK_V2`.
     fork_choice: Option<ForkChoice>,
+    /// Fork-choice weight source (GhostDAG blue score), wired with
+    /// `with_fork_choice`. `None` (a fixed fork-choice cell) leaves the ranking
+    /// to fork choice itself; see [`Self::rebuild_target`].
+    fork_weight: Option<ForkWeight>,
     /// Last finalized height — the reorg floor (I4: never revert below finality).
     /// Defaults to 0 (genesis). Raised only under the advance lock, and only to a
     /// certified height whose certified hash is this node's block there:
@@ -674,9 +759,6 @@ pub struct CanonicalApplicator {
     /// The DAG store whose pruning floor bounds the runtime from-genesis
     /// rebuild (see [`Self::with_dag_prune_floor`]). `None`: not wired.
     dag_prune_floor: Option<Arc<DagStore>>,
-    /// Fork-choice weight (GhostDAG blue score) of a block, wired with the fork
-    /// choice in [`Self::with_fork_choice`]; see [`Self::fork_weight`].
-    fork_weight: Option<ForkWeight>,
     /// The last fork-choice head a from-genesis rebuild was refused for, so the
     /// refusal is logged once per head rather than on every 1 s drain tick.
     refused_rebuild_head: parking_lot::Mutex<Option<Hash>>,
@@ -755,6 +837,7 @@ impl CanonicalApplicator {
             reward_calculator: RewardCalculator::new(canonical_reward_config()),
             lock: Arc::new(Mutex::new(AppliedState { tip, snapshots })),
             fork_choice: None,
+            fork_weight: None,
             finalized_height: Arc::new(AtomicU64::new(0)),
             certified_pending: parking_lot::Mutex::new(BTreeSet::new()),
             applied_height: Arc::new(AtomicU64::new(seeded_height)),
@@ -765,7 +848,6 @@ impl CanonicalApplicator {
             rebuild_in_progress: Arc::new(AtomicBool::new(false)),
             dag_hydrated: None,
             dag_prune_floor: None,
-            fork_weight: None,
             refused_rebuild_head: parking_lot::Mutex::new(None),
         }
     }
@@ -800,9 +882,9 @@ impl CanonicalApplicator {
 
     pub fn with_fork_choice(mut self, ghostdag: Arc<GhostDag>) -> Self {
         self.dag_hydrated = Some(ghostdag.dag_hydrated_handle());
-        let g = ghostdag.clone();
+        let weights = ghostdag.clone();
         self.fork_weight = Some(Arc::new(move |h: Hash| {
-            let g = g.clone();
+            let g = weights.clone();
             Box::pin(async move { g.get_blue_score(&h).await.ok() })
         }));
         self.fork_choice = Some(Arc::new(move || {
@@ -1176,6 +1258,160 @@ impl CanonicalApplicator {
             })
     }
 
+    /// The block at `height` on the applied chain ending at `state.tip`, or
+    /// `None` above the tip or where the chain steps over `height`.
+    ///
+    /// The reorg ring answers the last `MAX_REORG_DEPTH` heights, but only for
+    /// blocks applied since this process started: after a restart it holds the
+    /// tip alone. Below it the canonical height index answers (rewritten with
+    /// every durable tip write) when it describes this very tip; otherwise the
+    /// stored headers are walked. A block being absent from the ring, or from
+    /// the (pruned) DAG store, never makes it "not applied".
+    fn applied_block_at(&self, state: &AppliedState, height: u64) -> Result<Option<Hash>, String> {
+        if height > state.tip.height {
+            return Ok(None);
+        }
+        if let Some((h, _)) = state.snapshots.get(&height) {
+            return Ok(Some(*h));
+        }
+        let index_tip = self
+            .storage
+            .blocks
+            .canonical_index_tip()
+            .map_err(|e| format!("canonical index: {e}"))?;
+        if index_tip == Some((state.tip.hash, state.tip.height)) {
+            return self
+                .storage
+                .blocks
+                .get_canonical_block_by_height(height)
+                .map_err(|e| format!("canonical index at {height}: {e}"));
+        }
+        self.applied_hash_at_height(state.tip, height)
+    }
+
+    /// Whether `hash` (at `height`) is a block of the applied chain.
+    fn is_applied(&self, state: &AppliedState, hash: Hash, height: u64) -> Result<bool, String> {
+        Ok(self.applied_block_at(state, height)? == Some(hash))
+    }
+
+    /// Whether fork choice ranks `head` above the applied `tip`, in its own
+    /// total order (`GhostDag::select_tip`: higher blue score, equal scores to
+    /// the SMALLEST hash). Fork choice already picked `head` among every block
+    /// it scores, so a tip it does not score (a dropped stale branch, a sibling
+    /// the by-height rehydration never registered) is ranked below it, as is
+    /// every tip when no weight source is wired (a fixed fork-choice cell).
+    /// Header-claimed scores are never used (SECREM-01 CONS-2).
+    async fn outranks_tip(&self, head: Hash, tip: Hash) -> Result<(), RebuildRefusal> {
+        let Some(weight) = &self.fork_weight else {
+            return Ok(());
+        };
+        let Some(h) = weight(head).await else {
+            return Err(RebuildRefusal::NotHeavier { head: 0, tip: 0 });
+        };
+        let Some(t) = weight(tip).await else {
+            return Ok(());
+        };
+        // The tie-break is what converges a node restarted on the losing one of
+        // two equal-score siblings (2026-08-06).
+        if h > t || (h == t && head < tip) {
+            Ok(())
+        } else {
+            Err(RebuildRefusal::NotHeavier { head: h, tip: t })
+        }
+    }
+
+    /// The precondition of every from-genesis rebuild, checked under the
+    /// advance lock BEFORE anything is changed (the rebuild's first write moves
+    /// the durable applied tip to genesis, and a process that stops mid-replay
+    /// keeps whatever height the replay reached).
+    ///
+    /// A rebuild toward `head` is allowed only when `head`'s ancestry is fully
+    /// stored down to a block of the applied chain (the fork point), that fork
+    /// point is BELOW the applied tip (otherwise there is nothing to abandon; a
+    /// genesis tip is the exception, where the replay is a plain forward apply),
+    /// and `head` outranks the applied tip in fork choice's order. The depth of
+    /// the switch is NOT capped at `MAX_REORG_DEPTH`: a node that sealed a long
+    /// branch of its own (r1006, 3,300+ blocks) must still be able to rejoin a
+    /// heavier chain. The finality floor (I4) bounds it in `recover_to_head`.
+    pub(crate) async fn rebuild_target(
+        &self,
+        state: &AppliedState,
+        head: Hash,
+        genesis_hash: Hash,
+    ) -> Result<RebuildPlan, RebuildRefusal> {
+        let unreadable = RebuildRefusal::Unreadable;
+        let tip = state.tip;
+        let mut cursor = head;
+        let fork = loop {
+            // Genesis (stored, or the unstored `Hash::default` sentinel) is the
+            // base of every chain this node can rebuild.
+            if cursor == genesis_hash {
+                break AppliedTip {
+                    hash: cursor,
+                    height: 0,
+                };
+            }
+            let header = match self.storage.blocks.get_header(&cursor) {
+                Ok(Some(h)) => h,
+                Ok(None) => return Err(RebuildRefusal::MissingAncestor { missing: cursor }),
+                Err(e) => return Err(unreadable(format!("header {cursor}: {e}"))),
+            };
+            let height = header.height;
+            if self.is_applied(state, cursor, height).map_err(unreadable)? {
+                break AppliedTip {
+                    hash: cursor,
+                    height,
+                };
+            }
+            if height == 0 {
+                // A height-0 block that is not this chain's genesis.
+                return Err(RebuildRefusal::MissingAncestor { missing: cursor });
+            }
+            cursor = header.selected_parent_hash;
+        };
+        if fork.hash == head {
+            return Err(RebuildRefusal::OnAppliedChain {
+                height: fork.height,
+            });
+        }
+        // From a genesis tip the replay abandons nothing (it is the forward
+        // apply, trusted); above it, the drain reaches a descendant forward.
+        if fork.hash == tip.hash && tip.height > 0 {
+            return Err(RebuildRefusal::DescendsFromTip);
+        }
+        self.outranks_tip(head, tip.hash).await?;
+        Ok(RebuildPlan {
+            fork,
+            abandoned: tip.height.saturating_sub(fork.height),
+        })
+    }
+
+    /// For a fork-choice head that DESCENDS from the applied tip but lies past
+    /// the forward cap: the block on its ancestry at most `reorg_forward_cap()
+    /// - 1` above the tip, which `reorg_to` reaches by applying forward from the
+    /// tip (no revert). `Ok(None)` when `head` does not descend from the tip.
+    fn forward_step_toward(
+        &self,
+        state: &AppliedState,
+        head: Hash,
+    ) -> anyhow::Result<Option<Hash>> {
+        let tip = state.tip;
+        if !self.head_descends_from(head, tip.hash, tip.height)? {
+            return Ok(None);
+        }
+        let limit = tip
+            .height
+            .saturating_add(reorg_forward_cap().saturating_sub(1));
+        let mut cursor = head;
+        while let Some(block) = read_block(&self.storage, &cursor)? {
+            if block.header.height <= limit {
+                return Ok((cursor != tip.hash).then_some(cursor));
+            }
+            cursor = block.selected_parent();
+        }
+        Ok(None)
+    }
+
     /// The shared state-advance lock (applied tip + reorg snapshot ring). The
     /// producer acquires this across its execute→persist critical section so
     /// production never races the receive path, and records the sealed block via
@@ -1445,8 +1681,19 @@ impl CanonicalApplicator {
                 return ReorgOutcome::Rejected(format!("reorg to {new_tip}: {e}"));
             }
         };
+        // The ring alone cannot answer this: after a restart it holds only the
+        // tip, so an older applied block (or one below the DAG pruning point)
+        // would read as a fork and walk past the ring into `BeyondReorgWindow`
+        // and a from-genesis rebuild TOWARD THE NODE'S OWN ANCESTOR (r1006,
+        // 2026-10-28). `is_applied` falls back to the canonical height index.
         if let Some(nb) = new_tip_block {
-            if self.on_applied_chain(state, new_tip, nb.header.height) {
+            let applied = match self.is_applied(state, new_tip, nb.header.height) {
+                Ok(a) => a,
+                Err(e) => {
+                    return ReorgOutcome::Rejected(format!("reorg to {new_tip}: {e}"));
+                }
+            };
+            if applied {
                 debug!(
                     "execute-on-receive: fork-choice tip {} @ {} is already on the applied chain (ancestor of tip {} @ {}) — declining backwards reorg",
                     new_tip, nb.header.height, state.tip.hash, state.tip.height
@@ -1530,17 +1777,15 @@ impl CanonicalApplicator {
                 return ReorgOutcome::BeyondReorgWindow {
                     new_tip,
                     stopped_at: h,
-                    below_ring: true,
                 };
             }
             // Memory guard: bound the forward branch Vec. A far-ahead fork-choice
             // head (huge drain lag / long outage) is rebuilt via the hash-only
             // spine path instead of collecting tens of thousands of full blocks.
-            if branch.len() as u64 >= MAX_REORG_FORWARD {
+            if branch.len() as u64 >= reorg_forward_cap() {
                 return ReorgOutcome::BeyondReorgWindow {
                     new_tip,
                     stopped_at: h,
-                    below_ring: false,
                 };
             }
             cursor = block.selected_parent();
@@ -1929,7 +2174,23 @@ impl CanonicalApplicator {
     /// on the applied chain (via drain or reorg); `Rejected` iff it was reached and
     /// rejected; otherwise `Deferred`.
     pub async fn apply_received(&self, block: &Block) -> ApplyOutcome {
-        let mut state = self.lock.lock().await;
+        // The receive path runs inside the P2P message handler. A from-genesis
+        // rebuild holds the advance lock for its whole replay; waiting for it
+        // here stalled the handler until the stall watchdog exited the node
+        // mid-replay (r1006, 2026-10-28). The block is already stored, so it is
+        // deferred to the drain, which applies it once the rebuild is over.
+        let mut state = loop {
+            if self.rebuild_in_progress.load(Ordering::SeqCst) {
+                return ApplyOutcome::Deferred;
+            }
+            match tokio::time::timeout(RECEIVE_LOCK_POLL, self.lock.lock()).await {
+                Ok(guard) => break guard,
+                Err(_) => continue,
+            }
+        };
+        if self.rebuild_in_progress.load(Ordering::SeqCst) {
+            return ApplyOutcome::Deferred;
+        }
 
         let block_hash = block.header.block_hash;
         let height = block.header.height;
@@ -1967,7 +2228,6 @@ impl CanonicalApplicator {
                         ReorgOutcome::BeyondReorgWindow {
                             new_tip,
                             stopped_at,
-                            ..
                         } => {
                             // Too deep for an in-memory revert on the receive path.
                             // Do NOT rebuild inline (it would hold the receive lock
@@ -2041,7 +2301,7 @@ impl CanonicalApplicator {
         // by an in-memory revert; the runtime fallback rebuilds from genesis via the
         // canonical spine. That rebuild re-locks `self.lock`, so it MUST run after
         // this scope drops the guard — record the trigger and act below.
-        let mut rebuild_toward: Option<(Hash, bool)> = None;
+        let mut rebuild_toward: Option<Hash> = None;
         let applied_count = {
             let mut state = self.lock.lock().await;
             let out = self.drain_forward(&mut state).await;
@@ -2063,22 +2323,31 @@ impl CanonicalApplicator {
                             ReorgOutcome::BeyondReorgWindow {
                                 new_tip,
                                 stopped_at,
-                                below_ring,
-                            } => {
-                                // Only toward a strictly heavier head, and never
-                                // below the floor of a pruned DAG store (see
-                                // `rebuild_policy`).
-                                match self.rebuild_policy(new_tip, below_ring, state.tip).await {
-                                    RebuildDecision::Rebuild => {
-                                        warn!(
-                                            "periodic drain: fork-choice head {new_tip} is beyond the in-memory reorg window (stopped at {stopped_at}, applied tip {} @ {}) — scheduling a from-genesis spine rebuild",
-                                            state.tip.hash, state.tip.height
-                                        );
-                                        rebuild_toward = Some((new_tip, below_ring));
-                                    }
-                                    refused => self.refuse_rebuild(new_tip, refused, state.tip),
+                            } => match self.forward_step_toward(&state, new_tip) {
+                                // The head extends the applied chain: apply
+                                // forward in bounded steps. A from-genesis rebuild
+                                // would first move the durable tip to genesis.
+                                Ok(Some(step)) => {
+                                    let out = self.reorg_to(&mut state, step).await;
+                                    info!(
+                                        "periodic drain: fork-choice head {new_tip} extends the applied chain beyond the forward cap; stepped toward it via {step}: {out:?}"
+                                    );
                                 }
-                            }
+                                // Every precondition of the rebuild (strictly
+                                // heavier head, a real fork, the prune floor) is
+                                // checked under the advance lock before the reset
+                                // (`recover_guarded`).
+                                Ok(None) => {
+                                    debug!(
+                                        "periodic drain: fork-choice head {new_tip} is beyond the in-memory reorg window (stopped at {stopped_at}, applied tip {} @ {}) — considering a from-genesis spine rebuild",
+                                        state.tip.hash, state.tip.height
+                                    );
+                                    rebuild_toward = Some(new_tip);
+                                }
+                                Err(e) => warn!(
+                                    "periodic drain: fork-choice head {new_tip} is beyond the in-memory reorg window and its ancestry could not be read: {e}"
+                                ),
+                            },
                             ReorgOutcome::Rejected(why) => {
                                 debug!(
                                     "periodic drain: fork-choice reorg to {best} declined: {why}"
@@ -2103,8 +2372,8 @@ impl CanonicalApplicator {
         // RUNTIME REORG FALLBACK (2026-08-09). The lock is released; a deep fork now
         // self-heals without a manual restart by rebuilding the applied state along
         // the fork-choice head's canonical spine (same machinery as startup recovery).
-        if let Some((head, below_ring)) = rebuild_toward {
-            self.maybe_runtime_rebuild(head, below_ring).await;
+        if let Some(head) = rebuild_toward {
+            self.maybe_runtime_rebuild(head).await;
         }
         applied_count
     }
@@ -2118,63 +2387,51 @@ impl CanonicalApplicator {
         }
     }
 
-    /// The fork-choice weight (blue score) of `hash`: GhostDAG's score when
-    /// fork choice is wired and knows the block, else the stored header's
-    /// `blue_score` (bounded at admission by the consistency gate). `None`
-    /// when neither is available.
-    async fn fork_weight(&self, hash: Hash) -> Option<u64> {
+    /// The head's weight for [`rebuild_decision`]: fork choice's own score
+    /// (GhostDAG blue score); `None` when fork choice does not score it (a
+    /// header-claimed score never stands in for it, SECREM-01 CONS-2). With no
+    /// weight source wired (a fixed fork-choice cell in tests), the stored
+    /// header's score.
+    async fn head_weight(&self, head: Hash) -> Option<u64> {
+        match &self.fork_weight {
+            Some(w) => w(head).await,
+            None => self.header_score(head),
+        }
+    }
+
+    /// The applied tip's weight for [`rebuild_decision`]: fork choice's score,
+    /// else the stored header's score (used here only to REFUSE a rebuild),
+    /// else `None` when the tip block is not held at all (a branch dropped at
+    /// start-up), which leaves nothing on the tip to protect.
+    async fn tip_weight(&self, tip: Hash) -> Option<u64> {
         if let Some(w) = &self.fork_weight {
-            if let Some(score) = w(hash).await {
+            if let Some(score) = w(tip).await {
                 return Some(score);
             }
         }
+        self.header_score(tip)
+    }
+
+    fn header_score(&self, hash: Hash) -> Option<u64> {
         read_block(&self.storage, &hash)
             .ok()
             .flatten()
             .map(|b| b.header.blue_score)
     }
 
-    /// The runtime from-genesis rebuild policy for `head` against the applied
-    /// `tip` (see [`rebuild_decision`]).
-    async fn rebuild_policy(
-        &self,
-        head: Hash,
-        below_ring: bool,
-        tip: AppliedTip,
-    ) -> RebuildDecision {
-        let floor = self.dag_prune_floor().await;
-        let head_w = self.fork_weight(head).await;
-        let tip_w = self.fork_weight(tip.hash).await;
-        rebuild_decision(below_ring, floor, head_w, tip_w)
-    }
-
     /// Log a refused from-genesis rebuild, once per fork-choice head.
-    fn refuse_rebuild(&self, head: Hash, why: RebuildDecision, tip: AppliedTip) {
+    fn refuse_rebuild(&self, head: Hash, why: &str, tip: AppliedTip) {
         let mut last = self.refused_rebuild_head.lock();
         if *last == Some(head) {
-            debug!("runtime reorg: from-genesis rebuild toward {head} still refused ({why:?})");
+            debug!("canonical recovery: from-genesis rebuild toward {head} still refused: {why}");
             return;
         }
         *last = Some(head);
-        match why {
-            RebuildDecision::RefusePruned { floor } => warn!(
-                "runtime reorg: fork-choice head {head} is beyond the in-memory reorg window \
-                 (applied tip {} @ {}); NOT rebuilding from genesis on a node whose DAG store \
-                 is pruned below height {floor}. The applied tip is kept. If this node stays \
-                 off the network's chain, resync it from a snapshot or an empty data dir.",
-                tip.hash, tip.height
-            ),
-            RebuildDecision::RefuseNotHeavier {
-                head: head_w,
-                tip: tip_w,
-            } => warn!(
-                "runtime reorg: fork-choice head {head} (blue score {head_w:?}) is not strictly \
-                 heavier than the applied tip {} @ {} (blue score {tip_w:?}); NOT rebuilding \
-                 from genesis. The applied tip is kept and sync continues forward.",
-                tip.hash, tip.height
-            ),
-            RebuildDecision::Rebuild => {}
-        }
+        warn!(
+            "canonical recovery: NOT rebuilding from genesis toward {head} (applied tip {} @ {}): \
+             {why}. The applied tip is kept and sync continues forward.",
+            tip.hash, tip.height
+        );
     }
 
     /// Runtime fallback for a fork-choice head that `reorg_to` reported as
@@ -2185,8 +2442,7 @@ impl CanonicalApplicator {
     /// was never wired via `set_genesis` (a restart-time recovery still covers it).
     ///
     /// Must be called WITHOUT the advance lock held (`recover_to_head` re-locks).
-    /// `below_ring`: as reported by `reorg_to` (see [`rebuild_decision`]).
-    pub(crate) async fn maybe_runtime_rebuild(&self, head: Hash, below_ring: bool) {
+    pub(crate) async fn maybe_runtime_rebuild(&self, head: Hash) {
         // HYDRATION GUARD (rewritten 2026-08-11). The DAG store hydrates its in-memory
         // tips ASYNCHRONOUSLY after boot, so for the first seconds fork-choice surfaces
         // a partial tip set; rebuilding toward a partially-loaded head would REGRESS
@@ -2213,19 +2469,6 @@ impl CanonicalApplicator {
                 return;
             }
         }
-        // The rebuild policy (strictly heavier head; never below a pruned DAG
-        // floor). The drain checks it before scheduling; checked again here,
-        // the one runtime entry to the rebuild, because the floor or the
-        // weights may have moved since. The rebuild then runs only toward this
-        // exact head (`recover_toward`).
-        let tip = self.applied_tip().await;
-        match self.rebuild_policy(head, below_ring, tip).await {
-            RebuildDecision::Rebuild => {}
-            refused => {
-                self.refuse_rebuild(head, refused, tip);
-                return;
-            }
-        }
         let (genesis_state, genesis_hash) = match self.genesis.get() {
             Some(g) => g.clone(),
             None => {
@@ -2235,23 +2478,12 @@ impl CanonicalApplicator {
                 return;
             }
         };
-        // One rebuild at a time. A rebuild holds the advance lock for its whole
-        // replay, so subsequent 1s drain ticks already serialize behind it; this
-        // flag also prevents a second trigger from re-entering after the lock frees.
-        if self.rebuild_in_progress.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        // F3: clear `rebuild_in_progress` on EVERY exit path via an RAII guard. This flag
-        // gates block production (the #126 catch-up gate refuses while it is set), so a
-        // PANIC or future cancellation inside `recover_to_head` used to leave it stuck
-        // true and wedge production until a node restart. The guard's `Drop` runs on a
-        // normal return AND during unwind, so a panic mid-rebuild now clears it.
-        let _rebuild_guard = RebuildInProgressGuard {
-            flag: self.rebuild_in_progress.clone(),
-        };
+        // One rebuild at a time, and the `rebuild_in_progress` flag (with its F3
+        // RAII guard): both are owned by `recover_to_head` now, so the startup
+        // recovery is covered too.
         warn!("runtime reorg: rebuilding applied state from genesis via the canonical spine (deep-fork self-heal)");
         match self
-            .recover_toward(genesis_state, genesis_hash, Some(head))
+            .recover_automatic(genesis_state, genesis_hash, head)
             .await
         {
             Ok(true) => info!("runtime reorg: spine rebuild converged to the fork-choice head"),
@@ -2260,7 +2492,6 @@ impl CanonicalApplicator {
             }
             Err(e) => warn!("runtime reorg: spine rebuild failed (continuing on current tip): {e}"),
         }
-        // `_rebuild_guard` clears `rebuild_in_progress` here as it drops.
     }
 
     /// STARTUP RECOVERY for the same-height-sibling wedge (2026-08-06; chain 40204
@@ -2293,13 +2524,58 @@ impl CanonicalApplicator {
         genesis_state: StateSnapshot,
         genesis_hash: Hash,
     ) -> anyhow::Result<bool> {
-        self.recover_toward(genesis_state, genesis_hash, None).await
+        self.recover_guarded(genesis_state, genesis_hash, None)
+            .await
     }
 
-    /// [`Self::recover_to_head`], but when `expected` is given only toward that
-    /// head: if fork choice has moved since the caller checked it, nothing is
-    /// done (`Ok(false)`).
-    async fn recover_toward(
+    /// The from-genesis rebuild as the node triggers it on its own: the
+    /// runtime drain fallback (`maybe_runtime_rebuild`) and the start-up
+    /// recovery in `start_node`. On top of [`Self::recover_to_head`]'s
+    /// preconditions ([`Self::rebuild_target`]):
+    /// - fork choice must still name `expected`;
+    /// - the head must be STRICTLY heavier than the applied tip
+    ///   ([`rebuild_decision`]): a sibling that wins only the smaller-hash
+    ///   tie-break never resets the applied chain to genesis; the node keeps its
+    ///   tip and converges forward (or rebuilds once the other branch is
+    ///   heavier);
+    /// - on a DAG-pruned node, never when the fork point is below the snapshot
+    ///   window (see [`Self::with_dag_prune_floor`]).
+    ///
+    /// Refusals are logged once per head.
+    pub(crate) async fn recover_automatic(
+        &self,
+        genesis_state: StateSnapshot,
+        genesis_hash: Hash,
+        expected: Hash,
+    ) -> anyhow::Result<bool> {
+        self.recover_guarded(genesis_state, genesis_hash, Some(expected))
+            .await
+    }
+
+    /// `expected`: `None` for [`Self::recover_to_head`], `Some(head)` for
+    /// [`Self::recover_automatic`].
+    async fn recover_guarded(
+        &self,
+        genesis_state: StateSnapshot,
+        genesis_hash: Hash,
+        expected: Option<Hash>,
+    ) -> anyhow::Result<bool> {
+        // One rebuild at a time. A rebuild holds the advance lock for its whole
+        // replay; the flag also tells the producer not to seal (#126) and the
+        // receive path not to wait for the lock (`apply_received`).
+        if self.rebuild_in_progress.swap(true, Ordering::SeqCst) {
+            return Ok(false);
+        }
+        // F3: clear `rebuild_in_progress` on EVERY exit path via an RAII guard, on a
+        // normal return AND during a panic unwind or task cancellation.
+        let _rebuild_guard = RebuildInProgressGuard {
+            flag: self.rebuild_in_progress.clone(),
+        };
+        self.recover_to_head_inner(genesis_state, genesis_hash, expected)
+            .await
+    }
+
+    async fn recover_to_head_inner(
         &self,
         genesis_state: StateSnapshot,
         genesis_hash: Hash,
@@ -2313,7 +2589,7 @@ impl CanonicalApplicator {
             None => return Ok(false),
         };
         if expected.is_some_and(|e| e != head) {
-            debug!("runtime reorg: fork-choice head moved to {head} since the rebuild was checked; not rebuilding");
+            debug!("canonical recovery: fork-choice head moved to {head} since the rebuild was scheduled; not rebuilding");
             return Ok(false);
         }
         let mut state = self.lock.lock().await;
@@ -2340,6 +2616,49 @@ impl CanonicalApplicator {
         if state.tip.hash == head {
             return Ok(false);
         }
+        // NO REWIND BELOW A VERIFIED TIP (r1006, 2026-10-28). The reset below moves
+        // the durable applied tip to genesis; a process that stops mid-replay keeps
+        // the height the replay reached. Before anything changes, establish that
+        // the head outranks the tip in fork choice, really forks off the applied chain,
+        // and has an ancestry this node holds — not its own ancestor, not a descendant
+        // the drain reaches forward, not a branch whose missing (or pruned) ancestor
+        // only looks like divergence, and not a branch fork choice ranks below it.
+        let plan = match self.rebuild_target(&state, head, genesis_hash).await {
+            Ok(plan) => plan,
+            Err(why) => {
+                if expected.is_some() {
+                    self.refuse_rebuild(head, &why.to_string(), state.tip);
+                } else {
+                    warn!(
+                        "canonical recovery: not rebuilding toward {head} (applied tip {} @ {}): {why}",
+                        state.tip.hash, state.tip.height
+                    );
+                }
+                return Ok(false);
+            }
+        };
+        if expected.is_some() {
+            // The node's own triggers: strictly heavier, and never below the
+            // floor of a pruned DAG store (see `recover_automatic`). "Below the
+            // snapshot window" is the fork point having no ring snapshot, which
+            // is what forces the from-genesis path; a fork point inside the ring
+            // under a branch past the forward cap is not refused for pruning.
+            let below_ring = !state.snapshots.contains_key(&plan.fork.height);
+            let floor = self.dag_prune_floor().await;
+            let head_w = self.head_weight(head).await;
+            let tip_w = self.tip_weight(state.tip.hash).await;
+            match rebuild_decision(below_ring, floor, head_w, tip_w) {
+                RebuildDecision::Rebuild => {}
+                refused => {
+                    self.refuse_rebuild(head, &refused.to_string(), state.tip);
+                    return Ok(false);
+                }
+            }
+        }
+        info!(
+            "canonical recovery: fork-choice head {head} outranks the applied tip {} @ {}; fork point {} @ {} ({} applied block(s) abandoned)",
+            state.tip.hash, state.tip.height, plan.fork.hash, plan.fork.height, plan.abandoned
+        );
         // I4 (CHAIN-B-A002): NEVER revert past finality on the spine-rebuild path either.
         // `reorg_to` checks `fork.height < finalized_height()`, but the deep-reorg escape
         // hatch (`BeyondReorgWindow` → `maybe_runtime_rebuild` → here) reset world state to
@@ -2389,8 +2708,10 @@ impl CanonicalApplicator {
         let mut spine: Vec<Hash> = Vec::new();
         let mut spine_heights: Vec<u64> = Vec::new();
         let mut cursor = head;
+        let mut reached_genesis = false;
         while let Some(block) = read_block(&self.storage, &cursor).map_err(read_err)? {
             if block.header.height == 0 {
+                reached_genesis = cursor == genesis_hash;
                 break; // reached genesis (the reset base) — do not re-apply it
             }
             spine.push(cursor);
@@ -2399,6 +2720,16 @@ impl CanonicalApplicator {
             if spine.len() >= MAX_RECOVERY_SPINE {
                 break;
             }
+        }
+        // An unstored genesis is the ring's sentinel base (`Hash::default`).
+        reached_genesis = reached_genesis || (cursor == genesis_hash && genesis_block.is_none());
+        if !reached_genesis {
+            // The replay could not reach the head from this genesis. Refuse BEFORE
+            // the reset rather than reset, replay part of it and roll back.
+            warn!(
+                "canonical recovery: the spine of {head} does not reach genesis {genesis_hash} (stopped at {cursor}); not rebuilding"
+            );
+            return Ok(false);
         }
         spine.reverse(); // ascending height: genesis+1 .. head
         spine_heights.reverse();
@@ -3064,8 +3395,8 @@ pub fn record_produced(
     }
 }
 
-/// Whether the runtime from-genesis rebuild may run toward a fork-choice head
-/// that `reorg_to` reported as `BeyondReorgWindow`.
+/// Whether a from-genesis rebuild the node triggers itself
+/// ([`CanonicalApplicator::recover_automatic`]) may run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RebuildDecision {
     Rebuild,
@@ -3074,17 +3405,39 @@ pub(crate) enum RebuildDecision {
     RefusePruned {
         floor: u64,
     },
-    /// The head is not strictly heavier than the applied tip (or a weight is
-    /// unknown).
+    /// The head is not strictly heavier than the applied tip, or fork choice
+    /// does not score the head.
     RefuseNotHeavier {
         head: Option<u64>,
         tip: Option<u64>,
     },
 }
 
+impl std::fmt::Display for RebuildDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rebuild => write!(f, "rebuild allowed"),
+            Self::RefusePruned { floor } => write!(
+                f,
+                "the fork point is below the snapshot window on a node whose DAG store is \
+                 pruned below height {floor}; if this node stays off the network's chain, \
+                 resync it from a snapshot or an empty data dir"
+            ),
+            Self::RefuseNotHeavier { head, tip } => write!(
+                f,
+                "the head (blue score {head:?}) is not strictly heavier than the applied tip \
+                 (blue score {tip:?})"
+            ),
+        }
+    }
+}
+
 /// The rebuild policy. `below_ring`: the fork point is below the snapshot
 /// window (not only the forward-branch memory cap); `prune_floor`: the DAG
-/// pruning floor (0 = unpruned); `head`/`tip`: blue scores.
+/// pruning floor (0 = unpruned); `head`/`tip`: blue scores. `head: None`
+/// (fork choice does not score it) refuses; `tip: None` means the applied tip
+/// block is not held at all (a branch dropped at start-up), which leaves
+/// nothing on the tip to protect.
 ///
 /// Weight is the blue score: GhostDAG fork choice (`select_tip`) ranks tips by
 /// blue score and breaks ties by the smaller hash, and a header's blue work is
@@ -3100,6 +3453,7 @@ pub(crate) fn rebuild_decision(
 ) -> RebuildDecision {
     match (head, tip) {
         (Some(hw), Some(tw)) if hw > tw => {}
+        (Some(_), None) => {}
         _ => return RebuildDecision::RefuseNotHeavier { head, tip },
     }
     if below_ring && prune_floor > 0 {
@@ -3144,15 +3498,14 @@ pub(crate) mod tests {
             nh(Some(10), Some(10)),
             "the forward-cap arm is weight-checked too"
         );
-        // Unknown weights fail closed.
+        // An unscored head fails closed; an applied tip that is not held at
+        // all (dropped at start-up) has nothing to protect.
         assert_eq!(
             rebuild_decision(true, 0, None, Some(10)),
             nh(None, Some(10))
         );
-        assert_eq!(
-            rebuild_decision(true, 0, Some(11), None),
-            nh(Some(11), None)
-        );
+        assert_eq!(rebuild_decision(true, 0, None, None), nh(None, None));
+        assert_eq!(rebuild_decision(true, 0, Some(11), None), Rebuild);
         // Pruned: below the window refuses; the forward cap alone does not.
         assert_eq!(
             rebuild_decision(true, 500, Some(11), Some(10)),
@@ -4138,6 +4491,84 @@ pub(crate) mod tests {
     /// tick. `recover_to_head` rebuilds deterministically from the node's own stored
     /// blocks (reset to genesis, re-apply the canonical chain forward, repopulating
     /// the ring) and lands on the fork-choice winner.
+    /// The 2026-08-06 shape through the node's OWN triggers (start-up recovery
+    /// and the drain fallback, `recover_automatic`): restarted on the losing
+    /// one of two equal-score siblings, the node does not rebuild from genesis
+    /// toward the tie-break winner (equal weight). It converges once the
+    /// winner's branch is strictly heavier.
+    #[tokio::test]
+    async fn automatic_recovery_waits_for_a_strictly_heavier_winner() {
+        use citrate_consensus::dag_store::DagStore;
+        use citrate_consensus::types::GhostDagParams;
+
+        let (exec, storage, _dir) = fresh();
+        let genesis_state = exec.state_snapshot();
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+        let genesis = mk_block(0, Hash::default(), exec.calculate_state_root());
+        seed_genesis(&storage, &dag, &ghostdag, &genesis).await;
+
+        let r = roots(2);
+        let s_a = mk_block_scored(1, genesis.header.block_hash, r[0], 1, VRF_OUT);
+        let s_b = mk_block_scored(1, genesis.header.block_hash, r[0], 1, [0x5B; 32]);
+        let (winner, loser) = if s_a.header.block_hash < s_b.header.block_hash {
+            (s_a, s_b)
+        } else {
+            (s_b, s_a)
+        };
+        {
+            let app1 = CanonicalApplicator::new(exec.clone(), storage.clone());
+            persist(&storage, &loser);
+            assert!(matches!(
+                app1.apply_received(&loser).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        for blk in [&winner, &loser] {
+            dag.store_block(blk.clone()).await.expect("into DAG");
+            ghostdag.add_block(blk).await.expect("admit");
+        }
+        persist(&storage, &winner);
+        let app2 = CanonicalApplicator::new(exec.clone(), storage.clone())
+            .with_fork_choice(ghostdag.clone());
+        let loser_tip = AppliedTip {
+            hash: loser.header.block_hash,
+            height: 1,
+        };
+
+        // Equal weight: refused, the applied tip is kept.
+        let rebuilt = app2
+            .recover_automatic(
+                genesis_state.clone(),
+                genesis.header.block_hash,
+                winner.header.block_hash,
+            )
+            .await
+            .expect("recovery");
+        assert!(!rebuilt, "an equal-weight tie-break winner never rebuilds");
+        assert_eq!(app2.applied_tip().await, loser_tip);
+
+        // The winner's branch grows: strictly heavier, so the rebuild runs.
+        let child = mk_block_scored(2, winner.header.block_hash, r[1], 2, VRF_OUT);
+        dag.store_block(child.clone()).await.expect("into DAG");
+        ghostdag.add_block(&child).await.expect("admit");
+        persist(&storage, &child);
+        let head = ghostdag.select_tip().await.expect("select_tip");
+        assert_eq!(head, child.header.block_hash);
+        let rebuilt = app2
+            .recover_automatic(genesis_state, genesis.header.block_hash, head)
+            .await
+            .expect("recovery");
+        assert!(rebuilt, "a strictly heavier winner is rebuilt onto");
+        assert_eq!(
+            app2.applied_tip().await,
+            AppliedTip {
+                hash: child.header.block_hash,
+                height: 2
+            }
+        );
+    }
+
     #[tokio::test]
     async fn recover_to_head_converges_a_restarted_node_off_the_losing_sibling() {
         use citrate_consensus::dag_store::DagStore;
@@ -4549,10 +4980,8 @@ pub(crate) mod tests {
             ReorgOutcome::BeyondReorgWindow {
                 new_tip,
                 stopped_at,
-                below_ring,
             } => {
                 assert_eq!(new_tip, b_tip);
-                assert!(below_ring, "the fork point is below the window");
                 assert!(
                     stopped_at <= state.tip.height.saturating_sub(MAX_REORG_DEPTH),
                     "stopped at/below the retained floor (stopped_at={stopped_at})"
