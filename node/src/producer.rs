@@ -296,9 +296,8 @@ pub const DEFERRED_ONLY_WARN_EVERY: Duration = Duration::from_secs(60);
 /// this node), and never fewer than [`DEFERRED_EVIDENCE_MIN_PROPOSERS`]. With 7
 /// producers that is 3, so 2 cannot hold the others off.
 pub fn deferred_quorum_size(known: usize) -> usize {
-    // RED STUB: old behaviour, a fixed quorum.
-    let _ = known;
-    DEFERRED_EVIDENCE_MIN_PROPOSERS
+    let producers = known.saturating_add(1);
+    DEFERRED_EVIDENCE_MIN_PROPOSERS.max(producers.checked_div(3).unwrap_or(0).saturating_add(1))
 }
 /// Deferred evidence counts only when its header timestamp is within the TTL plus this
 /// clock allowance of local wall time (and not more than this allowance in the future),
@@ -717,10 +716,6 @@ impl ProduceCatchupGate {
     /// it stops being the only reason to refuse.
     fn deferred_for_round(&self, st: &mut CatchupBehindState, local_tip: u64, held: u64) -> u64 {
         let raw = self.deferred_watermark();
-        // RED STUB: old behaviour, no time cap.
-        if raw > 0 || held > 0 || local_tip > 0 || st.stalled_latch || !st.stalled_latch {
-            return raw;
-        }
         let deferred_only = raw.saturating_sub(local_tip) > CATCHUP_RESUME_GAP
             && held.saturating_sub(local_tip) <= CATCHUP_RESUME_GAP;
         if !deferred_only {

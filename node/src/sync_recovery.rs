@@ -91,8 +91,8 @@ impl ParentWalk {
     /// The request for the last step was not sent (already pending, or the in-flight
     /// cap): give the step back so the same parent is asked for on a later answer.
     pub fn unsent(&mut self) {
-        // RED STUB: old behaviour, the step stays spent.
-        let _ = self.prev_height;
+        self.steps = self.steps.saturating_sub(1);
+        self.last_height = self.prev_height;
     }
 }
 
