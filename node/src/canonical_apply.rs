@@ -2519,6 +2519,12 @@ impl CanonicalApplicator {
     /// rebuild ran and reached the head. `genesis_state`/`genesis_hash` are the
     /// world state and block hash at height 0, supplied by the caller (which owns
     /// the genesis config); the executor is reset to exactly this before replay.
+    ///
+    /// Test-only since 2026-10-28: the node's own triggers go through
+    /// [`Self::recover_automatic`], which adds the strictly-heavier and prune-floor
+    /// rules. This entry keeps fork choice's own order (equal scores to the
+    /// smaller hash), so tests can pin the rebuild mechanics directly.
+    #[cfg(test)]
     pub async fn recover_to_head(
         &self,
         genesis_state: StateSnapshot,
