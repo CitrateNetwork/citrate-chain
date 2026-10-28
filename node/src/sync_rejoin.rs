@@ -2582,6 +2582,7 @@ mod tests {
     /// - the start-up purge of invalid blocks (`hardening_rejoin`, run in
     ///   `start_node` before the peer manager exists), and
     /// - the operator's offline `rollback` subcommand.
+    ///
     /// The chain-store pruner (`Pruner`) exists but is never started (no
     /// caller of `start_services` / `start_auto_pruning` outside the storage
     /// crate). A storage read error is never taken as "not stored".
