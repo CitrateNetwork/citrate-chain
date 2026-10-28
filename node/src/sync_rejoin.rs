@@ -2634,7 +2634,7 @@ mod tests {
         }
         // The node's own triggers apply the strictly-heavier / prune-floor
         // policy before the reset.
-        let policy = rebuild.find("rebuild_decision(below_ring, floor, head_w, tip_w)");
+        let policy = rebuild.find("rebuild_decision(below_ring, floor, head_w, tip_w, tip_held)");
         assert!(
             matches!((policy, reset), (Some(p), Some(r)) if p < r),
             "the automatic rebuild policy must run before the genesis reset"

@@ -1544,6 +1544,15 @@ impl GhostDag {
         self.tips.read().await.iter().copied().collect()
     }
 
+    /// Fork choice's score for a block this node holds, computed the way
+    /// fork choice computes it: `relations`, else the durable score anchor,
+    /// else recomputed along the selected-parent chain from the nearest known
+    /// score (genesis = 1). Never a header-claimed score (SECREM-01 CONS-2).
+    /// `None` when the block is not in the DAG store and no score is known.
+    pub async fn fork_choice_score(&self, hash: &Hash) -> Option<u64> {
+        self.score_of(hash).await.ok()
+    }
+
     /// Get blue score for a block
     pub async fn get_blue_score(&self, hash: &Hash) -> Result<u64, GhostDagError> {
         self.relations

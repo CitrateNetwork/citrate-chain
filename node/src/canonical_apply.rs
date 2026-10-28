@@ -670,9 +670,11 @@ pub struct CanonicalApplicator {
     /// drain the driver reorgs the applied tip toward the selected tip. `None`
     /// disables reorg (steps 2–3 behavior only). Wired under `CITRATE_BLOCK_V2`.
     fork_choice: Option<ForkChoice>,
-    /// Fork-choice weight source (GhostDAG blue score), wired with
-    /// `with_fork_choice`. `None` (a fixed fork-choice cell) leaves the ranking
-    /// to fork choice itself; see [`Self::rebuild_target`].
+    /// Fork-choice weight source (`GhostDag::fork_choice_score`), wired with
+    /// `with_fork_choice`. `None` (a fixed fork-choice cell) leaves the explicit
+    /// `recover_to_head` ranking to fork choice itself (see
+    /// [`Self::rebuild_target`]); the node's own triggers then refuse (see
+    /// [`Self::weight`]).
     fork_weight: Option<ForkWeight>,
     /// Last finalized height — the reorg floor (I4: never revert below finality).
     /// Defaults to 0 (genesis). Raised only under the advance lock, and only to a
@@ -885,7 +887,7 @@ impl CanonicalApplicator {
         let weights = ghostdag.clone();
         self.fork_weight = Some(Arc::new(move |h: Hash| {
             let g = weights.clone();
-            Box::pin(async move { g.get_blue_score(&h).await.ok() })
+            Box::pin(async move { g.fork_choice_score(&h).await })
         }));
         self.fork_choice = Some(Arc::new(move || {
             let g = ghostdag.clone();
@@ -2387,36 +2389,16 @@ impl CanonicalApplicator {
         }
     }
 
-    /// The head's weight for [`rebuild_decision`]: fork choice's own score
-    /// (GhostDAG blue score); `None` when fork choice does not score it (a
-    /// header-claimed score never stands in for it, SECREM-01 CONS-2). With no
-    /// weight source wired (a fixed fork-choice cell in tests), the stored
-    /// header's score.
-    async fn head_weight(&self, head: Hash) -> Option<u64> {
+    /// A block's weight for [`rebuild_decision`], for the head and the applied
+    /// tip alike: fork choice's own score ([`GhostDag::fork_choice_score`]),
+    /// so both sides are compared on the same scale. `None` when fork choice
+    /// cannot score it, or no weight source is wired; the decision then
+    /// refuses. A header-claimed score is never used (SECREM-01 CONS-2).
+    async fn weight(&self, hash: Hash) -> Option<u64> {
         match &self.fork_weight {
-            Some(w) => w(head).await,
-            None => self.header_score(head),
+            Some(w) => w(hash).await,
+            None => None,
         }
-    }
-
-    /// The applied tip's weight for [`rebuild_decision`]: fork choice's score,
-    /// else the stored header's score (used here only to REFUSE a rebuild),
-    /// else `None` when the tip block is not held at all (a branch dropped at
-    /// start-up), which leaves nothing on the tip to protect.
-    async fn tip_weight(&self, tip: Hash) -> Option<u64> {
-        if let Some(w) = &self.fork_weight {
-            if let Some(score) = w(tip).await {
-                return Some(score);
-            }
-        }
-        self.header_score(tip)
-    }
-
-    fn header_score(&self, hash: Hash) -> Option<u64> {
-        read_block(&self.storage, &hash)
-            .ok()
-            .flatten()
-            .map(|b| b.header.blue_score)
     }
 
     /// Log a refused from-genesis rebuild, once per fork-choice head.
@@ -2651,9 +2633,14 @@ impl CanonicalApplicator {
             // under a branch past the forward cap is not refused for pruning.
             let below_ring = !state.snapshots.contains_key(&plan.fork.height);
             let floor = self.dag_prune_floor().await;
-            let head_w = self.head_weight(head).await;
-            let tip_w = self.tip_weight(state.tip.hash).await;
-            match rebuild_decision(below_ring, floor, head_w, tip_w) {
+            let head_w = self.weight(head).await;
+            let tip_w = self.weight(state.tip.hash).await;
+            let tip_held = match self.storage.blocks.has_block(&state.tip.hash) {
+                Ok(held) => held,
+                // A read error is never "not held".
+                Err(_) => true,
+            };
+            match rebuild_decision(below_ring, floor, head_w, tip_w, tip_held) {
                 RebuildDecision::Rebuild => {}
                 refused => {
                     self.refuse_rebuild(head, &refused.to_string(), state.tip);
@@ -3412,7 +3399,7 @@ pub(crate) enum RebuildDecision {
         floor: u64,
     },
     /// The head is not strictly heavier than the applied tip, or fork choice
-    /// does not score the head.
+    /// cannot score one of them.
     RefuseNotHeavier {
         head: Option<u64>,
         tip: Option<u64>,
@@ -3440,10 +3427,9 @@ impl std::fmt::Display for RebuildDecision {
 
 /// The rebuild policy. `below_ring`: the fork point is below the snapshot
 /// window (not only the forward-branch memory cap); `prune_floor`: the DAG
-/// pruning floor (0 = unpruned); `head`/`tip`: blue scores. `head: None`
-/// (fork choice does not score it) refuses; `tip: None` means the applied tip
-/// block is not held at all (a branch dropped at start-up), which leaves
-/// nothing on the tip to protect.
+/// pruning floor (0 = unpruned); `head`/`tip`: fork choice's blue scores,
+/// both from the same source. Either one unknown refuses (fails closed),
+/// except an applied tip that is not held at all (`tip_held == false`).
 ///
 /// Weight is the blue score: GhostDAG fork choice (`select_tip`) ranks tips by
 /// blue score and breaks ties by the smaller hash, and a header's blue work is
@@ -3456,10 +3442,15 @@ pub(crate) fn rebuild_decision(
     prune_floor: u64,
     head: Option<u64>,
     tip: Option<u64>,
+    tip_held: bool,
 ) -> RebuildDecision {
     match (head, tip) {
         (Some(hw), Some(tw)) if hw > tw => {}
-        (Some(_), None) => {}
+        // The applied-tip pointer names a block this node no longer holds at
+        // all: the start-up hardening purge removed it (a local action; no
+        // peer can remove a stored block). There is no applied branch left to
+        // weigh or protect, and the rebuild is the only way back.
+        (Some(_), None) if !tip_held => {}
         _ => return RebuildDecision::RefuseNotHeavier { head, tip },
     }
     if below_ring && prune_floor > 0 {
@@ -3489,44 +3480,47 @@ pub(crate) mod tests {
         use RebuildDecision::*;
         let nh = |head, tip| RefuseNotHeavier { head, tip };
         // Unpruned.
-        assert_eq!(rebuild_decision(true, 0, Some(11), Some(10)), Rebuild);
+        assert_eq!(rebuild_decision(true, 0, Some(11), Some(10), true), Rebuild);
         assert_eq!(
-            rebuild_decision(true, 0, Some(10), Some(10)),
+            rebuild_decision(true, 0, Some(10), Some(10), true),
             nh(Some(10), Some(10)),
             "an equal-weight head (tie-break winner) never rebuilds"
         );
         assert_eq!(
-            rebuild_decision(true, 0, Some(9), Some(10)),
+            rebuild_decision(true, 0, Some(9), Some(10), true),
             nh(Some(9), Some(10))
         );
         assert_eq!(
-            rebuild_decision(false, 0, Some(10), Some(10)),
+            rebuild_decision(false, 0, Some(10), Some(10), true),
             nh(Some(10), Some(10)),
             "the forward-cap arm is weight-checked too"
         );
         // A weight fork choice cannot give, for either side, fails closed.
         assert_eq!(
-            rebuild_decision(true, 0, None, Some(10)),
+            rebuild_decision(true, 0, None, Some(10), true),
             nh(None, Some(10))
         );
-        assert_eq!(rebuild_decision(true, 0, None, None), nh(None, None));
+        assert_eq!(rebuild_decision(true, 0, None, None, true), nh(None, None));
         assert_eq!(
-            rebuild_decision(true, 0, Some(11), None),
+            rebuild_decision(true, 0, Some(11), None, true),
             nh(Some(11), None),
             "an applied tip fork choice cannot score never loses to a rival"
         );
+        // A dangling applied-tip pointer (the block was purged at start-up).
+        assert_eq!(rebuild_decision(true, 0, Some(11), None, false), Rebuild);
+        assert_eq!(rebuild_decision(true, 0, None, None, false), nh(None, None));
         // Pruned: below the window refuses; the forward cap alone does not.
         assert_eq!(
-            rebuild_decision(true, 500, Some(11), Some(10)),
+            rebuild_decision(true, 500, Some(11), Some(10), true),
             RefusePruned { floor: 500 }
         );
         assert_eq!(
-            rebuild_decision(false, 500, Some(11), Some(10)),
+            rebuild_decision(false, 500, Some(11), Some(10), true),
             Rebuild,
             "the MAX_REORG_FORWARD arm is not a reorg below the floor"
         );
         assert_eq!(
-            rebuild_decision(false, 500, Some(10), Some(10)),
+            rebuild_decision(false, 500, Some(10), Some(10), true),
             nh(Some(10), Some(10))
         );
     }
