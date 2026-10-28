@@ -1533,6 +1533,29 @@ mod tests {
         assert_eq!(wiring_problems(include_str!("main.rs")), Vec::<&str>::new());
     }
 
+    /// The node's applicator is built with the DAG prune floor wired, on the
+    /// same DAG store fork choice reads: without it a pruned node rebuilds
+    /// from genesis after a restart (see the `pruned_restart_*` tests).
+    #[test]
+    fn start_node_wires_the_dag_prune_floor() {
+        let src = include_str!("main.rs");
+        let build = src
+            .find("canonical_apply::CanonicalApplicator::new(executor.clone(), storage.clone())")
+            .expect("applicator construction");
+        let tail = src.get(build..).expect("slice");
+        let end = tail.find(';').expect("end of statement");
+        let stmt = tail.get(..end).expect("statement");
+        assert!(
+            stmt.contains(".with_fork_choice(shared_ghostdag.clone())")
+                && stmt.contains(".with_dag_prune_floor(shared_dag_store.clone())"),
+            "the applicator must be built with the DAG prune floor: {stmt}"
+        );
+        assert!(
+            src.contains("GhostDag::new(\n        GhostDagParams::default(),\n        shared_dag_store.clone(),"),
+            "fork choice and the prune floor must read the same DAG store"
+        );
+    }
+
     /// Negative control: the pre-fix tick (anchored on the applied tip) and a
     /// handler that never judges answers are both caught.
     #[test]

@@ -2423,7 +2423,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // depth + finalized floor guard reverts inside the applicator.
             let mut app_builder =
                 canonical_apply::CanonicalApplicator::new(executor.clone(), storage.clone())
-                    .with_fork_choice(shared_ghostdag.clone());
+                    .with_fork_choice(shared_ghostdag.clone())
+                    // Never rebuild from genesis once the DAG store is pruned.
+                    .with_dag_prune_floor(shared_dag_store.clone());
             // VALIDATOR-S1 (step 5): attach the registry snapshot-sync so a node
             // that RECEIVES or REORGS to a snapshot block S(E) rebuilds its
             // proposer selector from the registry — not only the producer.

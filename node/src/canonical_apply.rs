@@ -668,6 +668,9 @@ pub struct CanonicalApplicator {
     /// The DAG store whose pruning floor bounds the runtime from-genesis
     /// rebuild (see [`Self::with_dag_prune_floor`]). `None`: not wired.
     dag_prune_floor: Option<Arc<DagStore>>,
+    /// The last fork-choice head a from-genesis rebuild was refused for, so the
+    /// refusal is logged once per head rather than on every 1 s drain tick.
+    refused_rebuild_head: parking_lot::Mutex<Option<Hash>>,
 }
 
 impl CanonicalApplicator {
@@ -753,6 +756,7 @@ impl CanonicalApplicator {
             rebuild_in_progress: Arc::new(AtomicBool::new(false)),
             dag_hydrated: None,
             dag_prune_floor: None,
+            refused_rebuild_head: parking_lot::Mutex::new(None),
         }
     }
 
@@ -794,6 +798,23 @@ impl CanonicalApplicator {
     }
 
     /// Wire the DAG store whose pruning floor bounds the runtime from-genesis
+    /// rebuild.
+    ///
+    /// The rebuild (`maybe_runtime_rebuild` -> `recover_to_head`) resets the
+    /// durable applied tip and world state to GENESIS, then replays the head's
+    /// spine under the advance lock. After a restart the reorg ring holds only
+    /// the tip's snapshot, so ANY fork-choice head whose fork point is below
+    /// the restart tip (even one block) lands here. On a long chain the replay
+    /// cannot finish before the P2P-stall watchdog exits the process, and the
+    /// node restarts from whatever height the replay had reached (r1006 prod-5,
+    /// 2026-10-28: tip 99,591, restarted at 2,331).
+    ///
+    /// On a node whose DAG store has been pruned (`dag_prune`), the rebuild is
+    /// refused: moving the applied tip below the pruning floor contradicts the
+    /// premise pruning rests on (nothing more than `MAX_REORG_DEPTH` below the
+    /// applied tip is ever reorged onto). The node keeps its applied tip and
+    /// logs the refusal once per head; an operator resync is the recovery for
+    /// a pruned node genuinely stranded on a fork. Unpruned nodes keep the
     /// rebuild.
     pub fn with_dag_prune_floor(mut self, dag_store: Arc<DagStore>) -> Self {
         self.dag_prune_floor = Some(dag_store);
@@ -2025,11 +2046,18 @@ impl CanonicalApplicator {
                                 new_tip,
                                 stopped_at,
                             } => {
-                                warn!(
-                                    "periodic drain: fork-choice head {new_tip} is beyond the in-memory reorg window (stopped at {stopped_at}, applied tip {} @ {}) — scheduling a from-genesis spine rebuild",
-                                    state.tip.hash, state.tip.height
-                                );
-                                rebuild_toward = Some(new_tip);
+                                // Never rebuild from genesis on a pruned node
+                                // (see `with_dag_prune_floor`).
+                                let floor = self.dag_prune_floor().await;
+                                if floor > 0 {
+                                    self.refuse_rebuild(new_tip, stopped_at, floor, state.tip);
+                                } else {
+                                    warn!(
+                                        "periodic drain: fork-choice head {new_tip} is beyond the in-memory reorg window (stopped at {stopped_at}, applied tip {} @ {}) — scheduling a from-genesis spine rebuild",
+                                        state.tip.hash, state.tip.height
+                                    );
+                                    rebuild_toward = Some(new_tip);
+                                }
                             }
                             ReorgOutcome::Rejected(why) => {
                                 debug!(
@@ -2069,6 +2097,33 @@ impl CanonicalApplicator {
     /// was never wired via `set_genesis` (a restart-time recovery still covers it).
     ///
     /// Must be called WITHOUT the advance lock held (`recover_to_head` re-locks).
+    /// The DAG pruning floor, or 0 when no DAG store is wired or it has never
+    /// been pruned (see [`Self::with_dag_prune_floor`]).
+    async fn dag_prune_floor(&self) -> u64 {
+        match &self.dag_prune_floor {
+            Some(dag) => crate::dag_prune::pruned_below(dag).await,
+            None => 0,
+        }
+    }
+
+    /// Log a refused from-genesis rebuild, once per fork-choice head.
+    fn refuse_rebuild(&self, head: Hash, stopped_at: u64, floor: u64, tip: AppliedTip) {
+        let mut last = self.refused_rebuild_head.lock();
+        if *last == Some(head) {
+            debug!("periodic drain: from-genesis rebuild toward {head} still refused (DAG pruned below {floor})");
+            return;
+        }
+        *last = Some(head);
+        warn!(
+            "periodic drain: fork-choice head {head} is beyond the in-memory reorg window \
+             (stopped at {stopped_at}, applied tip {} @ {}); NOT rebuilding from genesis on a \
+             node whose DAG store is pruned below height {floor}. The applied tip is kept. If \
+             this node stays off the network's chain, resync it from a snapshot or an empty \
+             data dir.",
+            tip.hash, tip.height
+        );
+    }
+
     async fn maybe_runtime_rebuild(&self, head: Hash) {
         // HYDRATION GUARD (rewritten 2026-08-11). The DAG store hydrates its in-memory
         // tips ASYNCHRONOUSLY after boot, so for the first seconds fork-choice surfaces
@@ -2095,6 +2150,12 @@ impl CanonicalApplicator {
                 );
                 return;
             }
+        }
+        // Never on a pruned node (see `with_dag_prune_floor`). The drain checks
+        // this before scheduling; checked again here, the one runtime caller of
+        // `recover_to_head`, in case the floor was raised in between.
+        if self.dag_prune_floor().await > 0 {
+            return;
         }
         let (genesis_state, genesis_hash) = match self.genesis.get() {
             Some(g) => g.clone(),
