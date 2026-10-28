@@ -384,13 +384,12 @@ impl SyncManager {
         let peer_id = peer.info.read().await.id.clone();
 
         // Check if already pending
-        // RED STUB: suppressed requests still report Ok(true).
         if self.pending_blocks.read().await.contains_key(&from) {
-            return Ok(true);
+            return Ok(false);
         }
 
         if self.pending_blocks.read().await.len() >= self.config.max_concurrent_downloads {
-            return Ok(true);
+            return Ok(false);
         }
 
         // Send request

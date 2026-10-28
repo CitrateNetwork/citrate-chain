@@ -224,8 +224,7 @@ impl RejoinTracker {
     /// search. An inflated advertised head can only start a bounded search,
     /// which the give-up backoff caps.
     pub fn note_sync_target(&mut self, target: u64, applied: u64) {
-        // RED STUB: gossip-only "behind".
-        let _ = (target, applied);
+        self.target_behind = target > applied;
     }
 
     /// Record that a `GetBlocks` anchored at `anchor` went to `peer`. A search
@@ -399,7 +398,7 @@ impl RejoinTracker {
         self.mode = Mode::Tip { strikes: 0 };
         let shift = self.give_ups.min(31);
         self.cooldown = BACKOFF_BASE_ANSWERS
-            .saturating_mul(1u32.checked_shl(shift).unwrap_or(u32::MAX))
+            .saturating_mul(2u32.saturating_pow(shift))
             .min(BACKOFF_MAX_ANSWERS);
         self.give_ups = self.give_ups.saturating_add(1);
         Some(Transition::GaveUp { at })
