@@ -114,13 +114,53 @@ fn refuse(detail: String, data: Value) -> jsonrpc_core::Error {
     }
 }
 
+/// Upper bound on [`StateTagPolicy::recent_window`]: a pinned hash is checked by
+/// walking that many selected-parent links, so the window bounds per-request work.
+pub const MAX_RECENT_STATE_TAGS: u64 = 1_024;
+
+/// Which pinned block tags a state read serves from the executed head's state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StateTagPolicy {
+    /// `0` (default): strict, only the executed head itself.
+    pub recent_window: u64,
+}
+
+impl StateTagPolicy {
+    /// The policy for the node's `[rpc] serve_recent_state_tags` value, clamped
+    /// to [`MAX_RECENT_STATE_TAGS`].
+    pub fn from_config(serve_recent_state_tags: u64) -> Self {
+        if serve_recent_state_tags > MAX_RECENT_STATE_TAGS {
+            tracing::warn!(
+                "rpc.serve_recent_state_tags = {serve_recent_state_tags} clamped to {MAX_RECENT_STATE_TAGS}"
+            );
+        }
+        if serve_recent_state_tags > 0 {
+            tracing::warn!(
+                "rpc.serve_recent_state_tags = {}: state reads pinned to a recent canonical block \
+                 are answered from the executed head's state (operator deploy node only)",
+                serve_recent_state_tags.min(MAX_RECENT_STATE_TAGS)
+            );
+        }
+        Self {
+            recent_window: serve_recent_state_tags.min(MAX_RECENT_STATE_TAGS),
+        }
+    }
+}
+
+/// The tag string the finality guard must see (RED STUB: string form only).
+pub fn finality_tag_str(tag: Option<&Value>) -> Option<&str> {
+    tag.and_then(|v| v.as_str())
+}
+
 /// Refuse a state read whose block tag does not name the executed head (see
 /// the module doc). `Ok(())` means the read may proceed against the node's
 /// current state.
 pub fn require_executed_head_state(
     tag: Option<&Value>,
     storage: &StorageManager,
+    policy: StateTagPolicy,
 ) -> Result<(), jsonrpc_core::Error> {
+    let _ = policy;
     let pinned = parse_state_tag(tag)?;
     if pinned == StateTag::Unpinned {
         return Ok(());

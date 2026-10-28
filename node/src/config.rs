@@ -365,6 +365,16 @@ pub struct RpcConfig {
     /// names when RPC is loopback-bound and not proxied; any Host otherwise.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+
+    /// chain#425 operator opt-out (default 0 = strict). When N > 0, an account
+    /// state read (eth_call, eth_estimateGas, eth_getBalance, eth_getCode,
+    /// eth_getStorageAt, eth_getTransactionCount) whose block tag names a
+    /// canonical block at most N blocks from the executed head is answered from
+    /// the head's state, so Foundry fork-mode scripts that pin reads to the block
+    /// they started at keep working. Only for a private deploy node; the public
+    /// RPC stays strict. See docs/ops/RPC_STATE_BLOCK_TAGS.md.
+    #[serde(default)]
+    pub serve_recent_state_tags: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -439,6 +449,7 @@ impl Default for NodeConfig {
                 rest_api_key: None,
                 trusted_proxies: vec![],
                 allowed_hosts: vec![],
+                serve_recent_state_tags: 0, // strict (chain#425)
             },
             storage: StorageConfig {
                 data_dir: dirs::home_dir()
