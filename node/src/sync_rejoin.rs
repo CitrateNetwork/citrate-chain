@@ -165,6 +165,9 @@ pub struct RejoinTracker {
     cooldown: u32,
     /// Requests in a row, during a search, that got no matching answer.
     unanswered: u32,
+    /// Whether the sync tick's clamped target is above the applied tip (see
+    /// [`RejoinTracker::note_sync_target`]).
+    target_behind: bool,
 }
 
 impl Default for RejoinTracker {
@@ -181,6 +184,7 @@ impl RejoinTracker {
             give_ups: 0,
             cooldown: 0,
             unanswered: 0,
+            target_behind: false,
         }
     }
 
@@ -210,6 +214,18 @@ impl RejoinTracker {
             },
             Mode::Follow { cursor } => *cursor,
         }
+    }
+
+    /// The sync tick's clamped target and the applied height. A target above
+    /// the applied tip counts as "behind" for [`Self::on_answer`] in addition
+    /// to the caller's gossip evidence: the tick pulls toward peers' advertised
+    /// heads too, and a node that hears no new-block gossip (a quiet network, or
+    /// one whose only height evidence is the handshake) must still be able to
+    /// search. An inflated advertised head can only start a bounded search,
+    /// which the give-up backoff caps.
+    pub fn note_sync_target(&mut self, target: u64, applied: u64) {
+        // RED STUB: gossip-only "behind".
+        let _ = (target, applied);
     }
 
     /// Record that a `GetBlocks` anchored at `anchor` went to `peer`. A search
@@ -272,6 +288,7 @@ impl RejoinTracker {
         behind: bool,
         anchor_height: u64,
     ) -> Option<Transition> {
+        let behind = behind || self.target_behind;
         if !behind {
             self.give_ups = 0;
             self.cooldown = 0;
@@ -802,6 +819,102 @@ mod tests {
         .await
     }
 
+    /// Like [`drive`], with the tracker's "behind" signal coming only from the
+    /// sync tick's target: peers advertise `advertised` (Hello/HelloAck) and no
+    /// new-block gossip ever arrives, so gossip evidence is 0 throughout.
+    async fn drive_advertised(
+        node: &Node,
+        tracker: &mut RejoinTracker,
+        peer: &StorageManager,
+        target: Hash,
+        advertised: u64,
+        max_rounds: usize,
+    ) -> Run {
+        let mut run = Run::default();
+        let mut orphans: Vec<Block> = Vec::new();
+        while run.rounds < max_rounds {
+            let applied = node.applied().expect("applied tip");
+            if applied.0 == target {
+                break;
+            }
+            run.rounds += 1;
+            // As the tick: clamped target from the advertised head.
+            tracker.note_sync_target(advertised, applied.1);
+            let anchor = tracker.anchor(applied, |ht| anchor_at_height(&node.storage, ht));
+            tracker.note_asked(PEER, anchor);
+            run.anchors.push(anchor.1);
+            let answer = block_serve::serve_blocks(peer, &anchor.0, 32);
+            deliver(node, tracker, &mut orphans, PEER, answer, 0).await;
+            run.modes.push(tracker.mode().clone());
+        }
+        run
+    }
+
+    /// A side-branch node whose only height evidence is a peer's advertised
+    /// head (no new-block gossip) still searches and rejoins: 10 blocks deep.
+    /// (A 1-deep branch needs no search: the tip anchor's own height group
+    /// carries the heavier sibling; that case is pinned too.)
+    #[tokio::test]
+    async fn advertised_head_without_gossip_rejoins_shallow() {
+        for side_tip in [7u64, 16] {
+            advertised_rejoin(side_tip).await;
+        }
+    }
+
+    async fn advertised_rejoin(side_tip: u64) {
+        let net = net(6, side_tip, 48);
+        let pdir = tempfile::tempdir().expect("tempdir");
+        let peer = peer_store(&net, true, pdir.path());
+        let ndir = tempfile::tempdir().expect("tempdir");
+        let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
+        let n = node(&net, &own, ndir.path()).await;
+        let main_tip = net.main.last().expect("main");
+        let mut tracker = RejoinTracker::new();
+        let run = drive_advertised(&n, &mut tracker, &peer, h(main_tip), 48, 60).await;
+        assert_eq!(
+            n.applied(),
+            Some((h(main_tip), 48)),
+            "no gossip: the node stayed on its side branch: anchors {:?}",
+            run.anchors
+        );
+    }
+
+    /// Same, side branch deeper than the reorg window.
+    #[tokio::test]
+    async fn advertised_head_without_gossip_rejoins_deep() {
+        let net = net(6, 150, 400);
+        let pdir = tempfile::tempdir().expect("tempdir");
+        let peer = peer_store(&net, true, pdir.path());
+        let ndir = tempfile::tempdir().expect("tempdir");
+        let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
+        let n = node(&net, &own, ndir.path()).await;
+        let main_tip = net.main.last().expect("main");
+        let mut tracker = RejoinTracker::new();
+        let run = drive_advertised(&n, &mut tracker, &peer, h(main_tip), 400, 200).await;
+        assert_eq!(
+            n.applied(),
+            Some((h(main_tip), 400)),
+            "no gossip: the node stayed on its side branch after {} rounds: anchors {:?}",
+            run.rounds,
+            run.anchors
+        );
+    }
+
+    /// The tick target only adds evidence: with the target at the applied tip
+    /// and no gossip, a node is not behind and never searches.
+    #[test]
+    fn a_target_at_the_tip_is_not_behind() {
+        let mut t = RejoinTracker::new();
+        t.note_sync_target(50, 50);
+        for _ in 0..5 {
+            t.on_answer(Answer::Unconnected, false, 50);
+        }
+        assert_eq!(t.mode(), &Mode::Tip { strikes: 0 });
+        t.note_sync_target(60, 50);
+        t.on_answer(Answer::Unconnected, false, 50);
+        assert_eq!(t.mode(), &Mode::Tip { strikes: 1 });
+    }
+
     /// A block whose `block_hash` field names `anchor` but whose contents are
     /// another block's: it does not survive `handle_blocks`.
     fn tagged(anchor: Hash, body: &Block) -> Block {
@@ -1048,6 +1161,18 @@ mod tests {
             (Some(t), Some(a), Some(r), Some(n)) if t < a && a < r && r < n => {}
             _ => out.push("sync tick: GetBlocks anchor must come from RejoinTracker::anchor"),
         }
+        match (src.find("} else if matches!(sent, Ok(true)) {"), asked) {
+            (Some(g), Some(n)) if g < n && src[g..n].lines().count() < 6 => {}
+            _ => {
+                out.push("sync tick: note_asked must run only when request_blocks sent (Ok(true))")
+            }
+        }
+        match (src.find(".note_sync_target(target, applied_tip.1)"), anchor) {
+            (Some(t), Some(a)) if t < a => {}
+            _ => {
+                out.push("sync tick: the tracker must get the clamped sync target before anchor()")
+            }
+        }
         if src.contains(".request_blocks(&peer, start_from, start_height)") {
             out.push("sync tick: a GetBlocks still anchored on the applied tip directly");
         }
@@ -1092,6 +1217,12 @@ mod tests {
         assert!(!wiring_problems(&old_tick).is_empty());
         let no_judge = main.replace(".on_answer(answer, gap > 0, anchor_height)", ".ignore()");
         assert!(!wiring_problems(&no_judge).is_empty());
+        // note_asked on any Ok (a suppressed request counted as asked).
+        let any_ok = main.replace("} else if matches!(sent, Ok(true)) {", "} else {");
+        assert!(!wiring_problems(&any_ok).is_empty());
+        // Gossip-only "behind".
+        let gossip_only = main.replace(".note_sync_target(target, applied_tip.1)", ".len()");
+        assert!(!wiring_problems(&gossip_only).is_empty());
     }
 
     // ---------------------------------------------------------------------

@@ -3220,6 +3220,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     // does not extend; then it walks down to the fork point and
                     // follows the heavier branch up. Headers stay on the tip.
                     let start_from = applied_tip.0;
+                    // "Behind" for the tracker: the clamped sync target this
+                    // tick pulls toward (advertised heads included), not only
+                    // gossip evidence.
+                    rejoin_for_loop
+                        .lock()
+                        .note_sync_target(target, applied_tip.1);
                     let (block_from, block_height) =
                         rejoin_for_loop.lock().anchor(applied_tip, |h| {
                             sync_rejoin::anchor_at_height(&storage_for_sync, h)
@@ -3259,13 +3265,15 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         send_failed = true;
                     }
                     if pb < 8 {
-                        if sync_for_loop
+                        // Only a request that was actually SENT is recorded as
+                        // asked (Ok(false): anchor already pending, or the
+                        // in-flight cap; nothing went on the wire).
+                        let sent = sync_for_loop
                             .request_blocks(&peer, block_from, block_height)
-                            .await
-                            .is_err()
-                        {
+                            .await;
+                        if sent.is_err() {
                             send_failed = true;
-                        } else {
+                        } else if matches!(sent, Ok(true)) {
                             let pid = peer.info.read().await.id.clone();
                             let gave_up = rejoin_for_loop
                                 .lock()
