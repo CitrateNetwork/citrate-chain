@@ -31,7 +31,7 @@ use citrate_network::{GossipProtocol, NetworkMessage, PeerManager};
 use citrate_sequencer::mempool::Mempool;
 use citrate_storage::{state_manager::StateManager as AIStateManager, StorageManager};
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -178,6 +178,12 @@ pub struct ProduceCatchupGate {
     /// VERIFY-255-F2-H1: the finalized-reorg floor. A candidate at/below it can never be
     /// "ahead" of the canonical head, so recompute prunes it. `None` ⇒ floor 0.
     finalized_floor: Option<Arc<AtomicU64>>,
+    /// Per-round scratch: the deferred-evidence watermark (heard-but-unadmitted signed
+    /// blocks, see [`AttestedNetworkHead::observe_deferred`]). Wired with the F2 gate.
+    deferred_ahead: Option<Arc<AtomicU64>>,
+    /// Set by the sync driver once this node's initial sync after start has completed
+    /// (`sync_fork_point::initial_sync_complete`). `None` ⇒ no initial-sync condition.
+    initial_sync_done: Option<Arc<AtomicBool>>,
 }
 
 /// F2: hysteresis + stall bookkeeping for [`ProduceCatchupGate`].
@@ -248,7 +254,27 @@ pub struct AttestedInner {
     /// "ahead" only while it still descends from the live fork-choice head. Bounded to
     /// [`ATTESTED_OBSERVED_CAP`] by evicting the lowest-height entry.
     observed: Mutex<BTreeMap<Hash, u64>>,
+    /// Proposer keys seen on attested blocks (signed AND chained to a block we hold).
+    /// Only these proposers' deferred blocks count as "behind" evidence. Bounded.
+    known_proposers: Mutex<HashSet<PublicKey>>,
+    /// Signed blocks heard from known proposers that could not be admitted yet (their
+    /// parent is missing): `proposer -> (highest such height, when last heard)`. A node
+    /// that is behind receives only such blocks, so without this the gate read a gap
+    /// of 0 exactly when the node was behind. Bounded; entries expire after
+    /// [`DEFERRED_EVIDENCE_TTL`].
+    deferred: Mutex<HashMap<PublicKey, (u64, Instant)>>,
 }
+
+/// Deferred ("heard but not admitted") evidence counts only while this fresh.
+pub const DEFERRED_EVIDENCE_TTL: Duration = Duration::from_secs(30);
+/// Deferred evidence counts only when at least this many DISTINCT known proposers
+/// vouch for a height, so one proposer (stranded on a side branch, or misbehaving)
+/// cannot make the rest of the fleet stop producing.
+pub const DEFERRED_EVIDENCE_MIN_PROPOSERS: usize = 2;
+/// Deferred evidence is clamped to this far above the selected head.
+pub const DEFERRED_EVIDENCE_MAX_LEAD: u64 = crate::sync_peer::ANCESTRY_RECOVERY_WINDOW;
+/// Cap on the known-proposer and deferred-evidence records.
+const PROPOSER_RECORD_CAP: usize = 1024;
 
 /// Cap on retained attested candidates (a few reorg windows of headroom; the gate prunes
 /// entries at/below the finalized floor on every recompute, so this only bounds a burst).
@@ -283,6 +309,12 @@ impl AttestedNetworkHead {
         match Self::attested_height(storage, block) {
             Some(h) => {
                 self.inner.best.fetch_max(h, Ordering::SeqCst);
+                {
+                    let mut known = self.inner.known_proposers.lock();
+                    if known.len() < PROPOSER_RECORD_CAP {
+                        known.insert(block.header.proposer_pubkey);
+                    }
+                }
                 let mut obs = self.inner.observed.lock();
                 obs.insert(block.header.block_hash, h);
                 // Stay bounded: evict the lowest-height candidate on overflow. The gate
@@ -300,10 +332,41 @@ impl AttestedNetworkHead {
         }
     }
 
-    /// Deferred ("heard but not admitted") evidence. RED STUB: keeps the old behaviour
-    /// (a block whose parent this node lacks is never evidence).
-    pub fn observe_deferred(&self, _block: &Block) -> bool {
-        false
+    /// Fold a signed block that could NOT be admitted yet (its parent is missing) into
+    /// the deferred "behind" evidence. Counts only when the header binds its own hash,
+    /// the proposer signature verifies, and the proposer is KNOWN (it signed an attested
+    /// block on this node before). Returns true when it counted. Whether the evidence
+    /// makes the producer refrain is decided per round by the gate
+    /// ([`ProduceCatchupGate::recompute_attested_ahead`]): fresh, from at least
+    /// [`DEFERRED_EVIDENCE_MIN_PROPOSERS`] proposers, clamped above the selected head.
+    pub fn observe_deferred(&self, block: &Block) -> bool {
+        if !block.verify_hash_for(PbaHardening::from_process()) {
+            return false;
+        }
+        if !matches!(crypto::verify_block_signature(block), Ok(true)) {
+            return false;
+        }
+        let proposer = block.header.proposer_pubkey;
+        if !self.inner.known_proposers.lock().contains(&proposer) {
+            return false;
+        }
+        let now = Instant::now();
+        let mut deferred = self.inner.deferred.lock();
+        if deferred.len() >= PROPOSER_RECORD_CAP && !deferred.contains_key(&proposer) {
+            deferred
+                .retain(|_, (_, at)| now.saturating_duration_since(*at) < DEFERRED_EVIDENCE_TTL);
+            if deferred.len() >= PROPOSER_RECORD_CAP {
+                return false;
+            }
+        }
+        let entry = deferred.entry(proposer).or_insert((0, now));
+        if block.header.height >= entry.0
+            || now.saturating_duration_since(entry.1) >= DEFERRED_EVIDENCE_TTL
+        {
+            entry.0 = block.header.height;
+        }
+        entry.1 = now;
+        true
     }
 
     /// The signature + ancestry check. `Some(height)` iff the block is attested-ahead
@@ -329,6 +392,21 @@ impl AttestedNetworkHead {
             return None;
         }
         Some(block.header.height)
+    }
+}
+
+impl AttestedInner {
+    /// The deferred-evidence height at least [`DEFERRED_EVIDENCE_MIN_PROPOSERS`] fresh,
+    /// distinct proposers vouch for (0 when fewer do). Expired entries are pruned.
+    fn deferred_quorum_height(&self, now: Instant) -> u64 {
+        let mut deferred = self.deferred.lock();
+        deferred.retain(|_, (_, at)| now.saturating_duration_since(*at) < DEFERRED_EVIDENCE_TTL);
+        let mut heights: Vec<u64> = deferred.values().map(|(h, _)| *h).collect();
+        heights.sort_unstable_by(|a, b| b.cmp(a));
+        heights
+            .get(DEFERRED_EVIDENCE_MIN_PROPOSERS.saturating_sub(1))
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -388,9 +466,23 @@ impl ProduceCatchupGate {
             None => {
                 // No selected tip ⇒ we have no fork-choice line to be "behind" on.
                 scratch.store(0, Ordering::SeqCst);
+                if let Some(d) = self.deferred_ahead.as_ref() {
+                    d.store(0, Ordering::SeqCst);
+                }
                 return;
             }
         };
+        // Deferred evidence: signed blocks from at least two known proposers that this
+        // node heard but cannot admit (it lacks their ancestry). Clamped above the
+        // selected head; a stale or single-proposer claim never counts.
+        if let Some(d) = self.deferred_ahead.as_ref() {
+            let quorum = observed.deferred_quorum_height(Instant::now());
+            let bounded = quorum.min(sel_height.saturating_add(DEFERRED_EVIDENCE_MAX_LEAD));
+            d.store(
+                if bounded > sel_height { bounded } else { 0 },
+                Ordering::SeqCst,
+            );
+        }
         let mut best = sel_height;
         let mut obs = observed.observed.lock();
         // Prune anything the finalized floor has passed — it can never be ahead again.
@@ -528,6 +620,17 @@ impl ProduceCatchupGate {
         }
     }
 
+    /// The deferred-evidence watermark of the last recompute (0 when not wired). It
+    /// never latches the stall alert on its own: a refusal driven by blocks whose
+    /// ancestry this node cannot verify always ends when that evidence expires or
+    /// is admitted.
+    fn deferred_watermark(&self) -> u64 {
+        self.deferred_ahead
+            .as_ref()
+            .map(|d| d.load(Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+
     /// F2: decide whether the node is too far BEHIND its peers to seal this slot.
     /// `local_tip` is the node's applied-tip height (read under the same advance lock
     /// the producer holds for its build). Returns `Err` to make the producer REFRAIN.
@@ -539,8 +642,12 @@ impl ProduceCatchupGate {
         let Some(attested) = self.attested_ahead.as_ref() else {
             return Ok(()); // F2 disabled ⇒ plain #126 gate.
         };
-        let attested = attested.load(Ordering::SeqCst);
+        // Held (chained) evidence, or heard-but-unadmitted evidence; only the held
+        // kind can latch the stall alert (see `deferred_watermark`).
+        let held = attested.load(Ordering::SeqCst);
+        let attested = held.max(self.deferred_watermark());
         let gap = attested.saturating_sub(local_tip);
+        let held_behind = held.saturating_sub(local_tip) > CATCHUP_RESUME_GAP;
         let mut st = self.behind.lock();
 
         // Human-in-command override always wins: clear the stall latch and resume.
@@ -600,8 +707,8 @@ impl ProduceCatchupGate {
         }
 
         // Refusing: raise the stall alert + latch after `stall_alert_after` with no
-        // applied-tip progress.
-        if st.last_progress.elapsed() >= self.stall_alert_after {
+        // applied-tip progress (held evidence only, see above).
+        if held_behind && st.last_progress.elapsed() >= self.stall_alert_after {
             st.stalled_latch = true;
             self.stall_alert.store(true, Ordering::SeqCst);
             error!(
@@ -1615,6 +1722,8 @@ impl BlockProducer {
             // VERIFY-255-F2-H1: the reorg floor is the applicator's finalized height, so a
             // candidate below finality is never treated as "ahead".
             finalized_floor: Some(app.finalized_height_handle()),
+            deferred_ahead: None,
+            initial_sync_done: None,
         });
         self
     }
@@ -1634,12 +1743,18 @@ impl BlockProducer {
         if let Some(gate) = self.produce_gate.as_mut() {
             gate.attested_ahead = Some(Arc::new(AtomicU64::new(0)));
             gate.attested_observed = Some(attested.handle());
+            gate.deferred_ahead = Some(Arc::new(AtomicU64::new(0)));
         }
         self
     }
 
-    /// Initial-sync condition. RED STUB: keeps the old behaviour (no condition).
-    pub fn with_initial_sync_gate(self, _flag: Arc<AtomicBool>) -> Self {
+    /// Refuse to seal until the sync driver reports that initial sync after start has
+    /// completed (`flag` set true, one-way). Extends the #126 gate; must be chained AFTER
+    /// [`Self::with_produce_catchup_gate`]. No-op if the #126 gate is not wired.
+    pub fn with_initial_sync_gate(mut self, flag: Arc<AtomicBool>) -> Self {
+        if let Some(gate) = self.produce_gate.as_mut() {
+            gate.initial_sync_done = Some(flag);
+        }
         self
     }
 
@@ -1926,6 +2041,17 @@ impl BlockProducer {
                     ));
                 }
             }
+            // The genesis-build devnet (mine-on-demand, loopback only) has no network to
+            // sync from and must seal each ceremony transaction as it arrives.
+            if let Some(done) = &gate.initial_sync_done {
+                if !done.load(Ordering::SeqCst) && !mine_on_demand() {
+                    return Err(anyhow::anyhow!(
+                        "#126: refusing to produce — initial sync since start has not completed \
+                         (the applied tip is not yet within the refuse band of the network). \
+                         Skipping this slot until it does."
+                    ));
+                }
+            }
             // F2 — NETWORK-HEIGHT CATCH-UP. Refuse to seal while this node is BEHIND its
             // peers, judged ONLY from the best VALIDLY-SIGNED, CHAIN-DESCENDING peer head
             // (never a self-reported Hello height / sync target). `local_tip` is read from
@@ -1947,7 +2073,9 @@ impl BlockProducer {
             // the watermark + applied tip), so the fleet monitor can see WHY a producer is
             // skipping slots. Only while F2 is wired.
             if let Some(scratch) = gate.attested_ahead.as_ref() {
-                let attested_now = scratch.load(Ordering::SeqCst);
+                let attested_now = scratch
+                    .load(Ordering::SeqCst)
+                    .max(gate.deferred_watermark());
                 citrate_api::metrics_server::update_producer_catchup_status(
                     gate_result.is_err(),
                     gate.stall_alert.load(Ordering::SeqCst),
@@ -6362,6 +6490,8 @@ mod tests {
             stall_alert_after: stall_after,
             attested_observed: None,
             finalized_floor: None,
+            deferred_ahead: None,
+            initial_sync_done: None,
         }
     }
 
@@ -6879,6 +7009,8 @@ mod tests {
             stall_alert_after: Duration::from_secs(3600),
             attested_observed: Some(att.handle()),
             finalized_floor: floor.map(|f| Arc::new(AtomicU64::new(f))),
+            deferred_ahead: None,
+            initial_sync_done: None,
         }
     }
 
@@ -7032,6 +7164,7 @@ mod tests {
             "only the genuine extension counts; the watermark tracks the selected chain to 9"
         );
     }
+
     // ── Producer seal gate and missing-parent walk. The harness drives the real
     // admission/serve/apply path and the same calls main.rs makes on gossip and
     // on a `Blocks` answer, with an in-process "network". ──

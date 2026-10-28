@@ -70,14 +70,19 @@ impl ParentWalk {
         lowest_deferred: Option<(u64, Hash)>,
         orphans_remaining: bool,
     ) -> Option<(Hash, u64)> {
-        // RED STUB: old behaviour, no walk.
-        let _ = (
-            lowest_deferred,
-            orphans_remaining,
-            self.steps,
-            self.last_height,
-        );
-        None
+        if !orphans_remaining {
+            self.steps = 0;
+            self.last_height = None;
+        }
+        let (height, parent) = lowest_deferred?;
+        let parent_height = height.saturating_sub(1);
+        let lower = self.last_height.is_none_or(|last| parent_height < last);
+        if !lower || self.steps >= MAX_PARENT_WALK_STEPS || parent == Hash::new([0u8; 32]) {
+            return None;
+        }
+        self.steps = self.steps.saturating_add(1);
+        self.last_height = Some(parent_height);
+        Some((parent, parent_height))
     }
 }
 
@@ -99,9 +104,7 @@ pub fn lowest_deferred(storage: &StorageManager, deferred: &[&Block]) -> Option<
 /// anchor (a stale question) rather than by the peer? Only a NON-EMPTY answer
 /// can be stale.
 pub fn answer_anchor_was_stale(anchor_height: u64, applied_now: u64, served: usize) -> bool {
-    // RED STUB: old behaviour.
-    let _ = served;
-    anchor_height < applied_now
+    served > 0 && anchor_height < applied_now
 }
 
 /// The producer's one-time initial-sync condition, evaluated on every sync tick
@@ -112,9 +115,13 @@ pub fn initial_sync_complete(
     connected_peers: usize,
     since_start: Duration,
 ) -> bool {
-    // RED STUB: old behaviour, no condition.
-    let _ = (applied, target, connected_peers, since_start);
-    true
+    if since_start >= INITIAL_SYNC_MAX_WAIT {
+        return true;
+    }
+    if connected_peers == 0 {
+        return since_start >= INITIAL_SYNC_SOLO_GRACE;
+    }
+    applied.saturating_add(INITIAL_SYNC_LEAD) >= target
 }
 
 #[cfg(test)]

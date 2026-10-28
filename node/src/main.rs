@@ -2644,6 +2644,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // claims for sync-target purposes) and never derived from `PeerInfo.head_height` or
     // `SyncManager.target_height`. Updated at both block-receive sites below.
     let attested_network_head = producer::AttestedNetworkHead::new();
+    // Set once by the sync tick when initial sync since start has completed
+    // (`sync_recovery::initial_sync_complete`); the producer gate waits for it.
+    let initial_sync_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let node_started_at = std::time::Instant::now();
 
     // Start P2P listener and connect to bootstrap nodes
     {
@@ -3030,6 +3034,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let max_seen_for_sync = max_seen_height.clone();
         let sync_peers_for_loop = sync_peers.clone();
         let rejoin_for_loop = rejoin.clone();
+        let initial_sync_for_sync = initial_sync_done.clone();
         tokio::spawn(async move {
             // #150: `attempt_counts` (an unpruned HashMap keyed by every anchor
             // ever timed out — also a slow leak) and `pending_retries` are gone
@@ -3106,6 +3111,24 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     .min(applied_height.saturating_add(MAX_SYNC_LOOKAHEAD));
                 if target > 0 {
                     sync_for_loop.set_target(target).await;
+                }
+                // One-time initial-sync condition for the producer gate.
+                if !initial_sync_for_sync.load(std::sync::atomic::Ordering::Relaxed)
+                    && sync_recovery::initial_sync_complete(
+                        applied_height,
+                        target,
+                        connected_peers.len(),
+                        node_started_at.elapsed(),
+                    )
+                {
+                    initial_sync_for_sync.store(true, std::sync::atomic::Ordering::Relaxed);
+                    tracing::info!(
+                        "Initial sync complete (applied={} target={} peers={}); block production \
+                         may start",
+                        applied_height,
+                        target,
+                        connected_peers.len()
+                    );
                 }
                 // Choose a peer to pull from — see node/src/sync_peer.rs for the
                 // policy and the two live wedges it closes. In short: only peers
@@ -3277,6 +3300,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                     t,
                                     sync_rejoin::MAX_UNANSWERED
                                 );
+                                // Ask a different useful peer next (sync_peer.rs).
+                                if matches!(t, sync_rejoin::Transition::GaveUp { .. }) {
+                                    sync_peers_for_loop.lock().await.record_give_up(&pid.0);
+                                }
                             }
                         }
                     }
@@ -3435,6 +3462,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             let mut orphan_blocks: Vec<citrate_consensus::types::Block> = Vec::new();
             // sync_rejoin.rs: bound on SYNCREJOIN info lines.
             let mut rejoin_log = sync_rejoin::RejoinLogBudget::new();
+            // sync_recovery.rs: missing-parent walk (bounded per orphan episode).
+            let mut parent_walk = sync_recovery::ParentWalk::new();
             while let Some((pid, msg)) = in_rx.recv().await {
                 // #149 liveness heartbeat. Bumped BEFORE the message is handled,
                 // so a loop that is stuck inside a handler stops advancing this
@@ -3673,6 +3702,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                         }
                                         admission::AdmitOutcome::AlreadyAdmitted => {}
                                         admission::AdmitOutcome::Deferred { missing_parent } => {
+                                            // Heard-but-unadmitted signed block: "behind"
+                                            // evidence for the producer gate (counted only
+                                            // from known proposers, see observe_deferred).
+                                            attested_for_rx.observe_deferred(&block);
                                             // A block we can't admit because its parent is
                                             // missing is still PROOF the network is at least
                                             // at block.height. Rejecting it is correct, but
@@ -3903,6 +3936,16 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             .iter()
                             .filter(|b| verified_hashes.contains(&b.header.block_hash))
                             .count();
+                        // sync_recovery.rs: the lowest block of THIS answer still
+                        // deferred, and the parent it lacks (the walk's next step).
+                        let lowest_deferred = {
+                            let from_answer: Vec<&citrate_consensus::types::Block> = fixpoint
+                                .deferred
+                                .iter()
+                                .filter(|b| verified_hashes.contains(&b.header.block_hash))
+                                .collect();
+                            sync_recovery::lowest_deferred(&storage_for_handler, &from_answer)
+                        };
                         let mut pending = fixpoint.deferred;
                         // Buffer unresolved orphans for the next Blocks batch (their
                         // parents are still en route). CHAIN-B-A005: bound the
@@ -3956,8 +3999,35 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             // rpc-1 serving a full 32/32 at 0.66s was scored
                             // Barren 191 times and driven to the -8 floor for
                             // answering exactly what we asked.
-                            let stale_anchor = sync_for_rx.last_block_anchor_height() < applied_now;
+                            // An EMPTY answer is never stale: on a sealing node the tip
+                            // moves between request and answer, and calling "the peer has
+                            // nothing for my anchor" Redundant hid that signal.
+                            let stale_anchor = sync_recovery::answer_anchor_was_stale(
+                                sync_for_rx.last_block_anchor_height(),
+                                applied_now,
+                                answer_hashes.len(),
+                            );
+                            // Missing-parent recovery continues by hash, one height
+                            // per answer, within the walk budget (sync_recovery.rs).
+                            if let Some((parent, parent_height)) =
+                                parent_walk.next(lowest_deferred, !orphan_blocks.is_empty())
+                            {
+                                if let Some(peer) = pm_for_rx.get_peer(&pid) {
+                                    if let Err(e) = sync_for_rx
+                                        .request_blocks(&peer, parent, parent_height)
+                                        .await
+                                    {
+                                        tracing::debug!(
+                                            "missing-parent request to {} for {} failed: {}",
+                                            pid,
+                                            hex::encode(&parent.as_bytes()[..8]),
+                                            e
+                                        );
+                                    }
+                                }
+                            }
                             // sync_rejoin.rs: steer the next anchor on this answer.
+                            let mut search_gave_up = false;
                             if let Some(anchor_height) = answers_rejoin {
                                 let answer = sync_rejoin::classify(
                                     answer_hashes.is_empty(),
@@ -3969,6 +4039,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                     rejoin_for_rx
                                         .lock()
                                         .on_answer(answer, gap > 0, anchor_height);
+                                search_gave_up = matches!(
+                                    transition,
+                                    Some(sync_rejoin::Transition::GaveUp { .. })
+                                );
                                 if let Some(t) = transition {
                                     // Bounded: a budget of lines per window,
                                     // the rest counted (see RejoinLogBudget).
@@ -3996,6 +4070,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                 32, // SyncConfig::block_batch_size
                                 stale_anchor,
                             );
+                            // A search that gave up on this peer's answers: ask a
+                            // different useful peer next (after the serve credit,
+                            // which clears timeout counts).
+                            if search_gave_up {
+                                sel.record_give_up(&pid.0);
+                            }
                             // #155: INFO, not debug. This is the only external
                             // evidence of how the selector is scoring peers, and
                             // having it at `debug!` meant it never appeared under
@@ -4654,6 +4734,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // its peers — measured only from validly-signed, chain-descending peer heads
             // (`attested_network_head`), never a self-reported Hello height / sync target.
             producer_instance = producer_instance.with_network_height_gate(&attested_network_head);
+            // Refuse to seal until initial sync since start has completed (set by the
+            // sync tick; see `sync_recovery::initial_sync_complete`).
+            producer_instance = producer_instance.with_initial_sync_gate(initial_sync_done.clone());
             // VERIFY-255-F2-M1: share the catch-up override with the gate so the loopback
             // admin RPC (`citrate_producerCatchupResume`) can resume a latched producer. The
             // gate consumes it (auto-clears) on the next resume.

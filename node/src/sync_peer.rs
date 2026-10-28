@@ -360,8 +360,8 @@ impl SyncPeerSelector {
     /// different useful peer if there is one (I2 still selects it when it is the
     /// only one). Its next answer clears the count, like any answer does.
     pub fn record_give_up(&mut self, id: &str) {
-        // RED STUB: old behaviour.
-        let _ = id;
+        let e = self.failures.entry(id.to_string()).or_insert(0);
+        *e = (*e).max(DEPREFER_AT_FAILURES);
     }
 
     /// Clear `id`'s TIMEOUT count because it is being dropped and will
