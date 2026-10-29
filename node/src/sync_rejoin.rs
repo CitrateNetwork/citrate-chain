@@ -140,6 +140,13 @@ pub const REJOIN_LOG_PER_WINDOW: u32 = 8;
 /// See [`REJOIN_LOG_PER_WINDOW`].
 pub const REJOIN_LOG_WINDOW: Duration = Duration::from_secs(600);
 
+/// How long a pinned search may go without verified progress from its peer
+/// (an answer that admitted a block) before a peer ahead of it can take the
+/// tick (DGX review of 49465b5e, P1-2). The producer's no-progress stall bound.
+/// An advertised head alone never ends a pin: it is self-reported and is
+/// raised by gossip before the block is validated.
+pub const PIN_STALL_TIMEOUT: Duration = crate::producer::CATCHUP_STALL_ALERT;
+
 /// What an answer to the tracker's anchor did, judged after admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Answer {
@@ -254,6 +261,11 @@ pub struct RejoinTracker {
     request_cap: u32,
     /// Trickling follow answers in a row ([`FOLLOW_TRICKLE_ADVANCE`]).
     trickles: u32,
+    /// When the running search's peer last made verified progress (or the
+    /// search was first seen by [`choose_source`]); see [`PIN_STALL_TIMEOUT`].
+    pin_progress_at: Option<Instant>,
+    /// The pinned peer made verified progress since `pin_progress_at`.
+    pin_progressed: bool,
 }
 
 impl Default for RejoinTracker {
@@ -279,6 +291,8 @@ impl RejoinTracker {
             requests: 0,
             request_cap: 0,
             trickles: 0,
+            pin_progress_at: None,
+            pin_progressed: false,
         }
     }
 
@@ -287,6 +301,27 @@ impl RejoinTracker {
         self.requests = 0;
         self.request_cap = search_request_cap(top);
         self.trickles = 0;
+        self.clear_pin_clock();
+    }
+
+    fn clear_pin_clock(&mut self) {
+        self.pin_progress_at = None;
+        self.pin_progressed = false;
+    }
+
+    /// How long the running search's peer has gone without verified progress,
+    /// as of `now`. The clock starts the first time it is read for a search
+    /// and restarts at the first read after an answer from the pinned peer
+    /// that admitted a block (at most one tick late, which only favours the
+    /// pin).
+    fn pin_stalled_for(&mut self, now: Instant) -> Duration {
+        let since = match self.pin_progress_at {
+            Some(at) if !self.pin_progressed => at,
+            _ => now,
+        };
+        self.pin_progress_at = Some(since);
+        self.pin_progressed = false;
+        now.saturating_duration_since(since)
     }
 
     /// The peer the running search is pinned to; `None` in `Tip` mode.
@@ -516,6 +551,9 @@ impl RejoinTracker {
             }
             (Mode::Probe { .. }, Answer::Progress { highest })
             | (Mode::Follow { .. }, Answer::Progress { highest }) => {
+                if from.is_some() && from == self.peer {
+                    self.pin_progressed = true;
+                }
                 let previous = match &self.mode {
                     Mode::Follow { cursor } => Some(cursor.1),
                     _ => None,
@@ -607,6 +645,7 @@ impl RejoinTracker {
 
     fn reset(&mut self, from: &'static str) -> Option<Transition> {
         self.peer = None;
+        self.clear_pin_clock();
         self.split = false;
         self.strike_peer = None;
         let was = std::mem::replace(&mut self.mode, Mode::Tip { strikes: 0 });
@@ -620,6 +659,7 @@ impl RejoinTracker {
         self.mode = Mode::Tip { strikes: 0 };
         self.peer = None;
         self.strike_peer = None;
+        self.clear_pin_clock();
         if std::mem::take(&mut self.split) {
             // The split gate rate-limits pulls; an ordinary search later
             // must not wait behind this one.
@@ -674,9 +714,12 @@ pub fn choose_source(
     if let Some(p) = tracker.search_peer().map(str::to_string) {
         match candidates.iter().find(|c| c.id == p) {
             Some(pinned) => {
-                // Another peer more than the catch-up gap ahead of the pinned
-                // one ends the pin: the selector asks the peer that can carry
-                // us (DGX review of 49465b5e, P1-2).
+                // A pinned peer that has made no verified progress for
+                // PIN_STALL_TIMEOUT, while another peer is more than the
+                // catch-up gap ahead of it, ends the pin: the selector asks
+                // the peer that can carry us (DGX review of 49465b5e, P1-2).
+                // The lead alone never does: advertised heads are unverified.
+                let stalled = tracker.pin_stalled_for(now) >= PIN_STALL_TIMEOUT;
                 let lead = candidates
                     .iter()
                     .filter(|c| c.id != p)
@@ -684,10 +727,10 @@ pub fn choose_source(
                     .max()
                     .unwrap_or(0);
                 let gap = crate::producer::CATCHUP_REFUSE_GAP;
-                if lead <= pinned.head_height.saturating_add(gap) {
+                if !stalled || lead <= pinned.head_height.saturating_add(gap) {
                     return (Source::Pinned(p), None);
                 }
-                transition = tracker.reset("a peer is ahead");
+                transition = tracker.reset("pinned peer stalled, a peer is ahead");
             }
             None => transition = tracker.abandon(),
         }
@@ -3842,11 +3885,12 @@ mod tests {
 
     /// A split pull is a search against one peer: while it runs, the tick
     /// keeps asking that peer even when the selector would pick another, an
-    /// equal-height answer does not end it as "caught up", and a peer that
-    /// stops answering ends it after `MAX_UNANSWERED` requests without
-    /// throttling the next ordinary search.
+    /// equal-height answer does not end it as "caught up", a peer ahead takes
+    /// the tick only once the pinned peer has stalled for
+    /// `PIN_STALL_TIMEOUT`, and a peer that stops answering ends it after
+    /// `MAX_UNANSWERED` requests without throttling the next ordinary search.
     #[test]
-    fn a_split_pull_is_pinned_bounded_and_does_not_throttle_rejoin() {
+    fn a_split_pull_is_pinned_bounded_and_yields_only_when_its_peer_stalls() {
         let mut t = RejoinTracker::new();
         let sel = SyncPeerSelector::new();
         let mut gate = SplitPullGate::new();
@@ -3883,7 +3927,8 @@ mod tests {
             "{:?}",
             t.mode()
         );
-        // A peer now ahead does not take over the running pull.
+        // A peer now ahead does not take over the running pull on its
+        // advertised head alone.
         let ahead = [
             SyncCandidate {
                 id: "sib".into(),
@@ -3904,9 +3949,21 @@ mod tests {
             |_| false,
             now,
         );
-        // P1-2: a peer more than the catch-up gap ahead of the pinned one ends
-        // the pin; the selector's peer is asked instead.
+        assert_eq!(src, Source::Pinned("sib".into()));
+        // P1-2: once the pinned peer has gone PIN_STALL_TIMEOUT without
+        // verified progress, the peer ahead takes the tick.
+        let (src, tr) = choose_source(
+            &mut t,
+            &sel,
+            &mut gate,
+            &ahead,
+            &split,
+            (hx(1), 50),
+            |_| false,
+            now + PIN_STALL_TIMEOUT,
+        );
         assert_eq!(src, Source::Ahead("aaa".into()));
+        assert!(matches!(tr, Some(Transition::Finished { .. })), "{tr:?}");
         let _ = t.start_split_pull("sib", 50);
         // No answers: bounded, then over, with no rejoin cooldown owed.
         let mut gave_up = false;
@@ -4183,6 +4240,61 @@ mod tests {
                 "liar@{liar_head}: the search never found the fork"
             );
         }
+    }
+
+    /// The stall clock restarts on the first tick after an answer from the
+    /// pinned peer that admitted a block, and runs from the last such tick.
+    #[test]
+    fn verified_progress_restarts_the_pin_stall_clock() {
+        let mut t = RejoinTracker::new();
+        let sel = SyncPeerSelector::new();
+        let mut gate = SplitPullGate::new();
+        let t0 = Instant::now();
+        let _ = t.start_split_pull("sib", 50);
+        let cands = [
+            SyncCandidate {
+                id: "sib".into(),
+                head_height: 50,
+            },
+            SyncCandidate {
+                id: "aaa".into(),
+                head_height: 90,
+            },
+        ];
+        let tick = |t: &mut RejoinTracker, gate: &mut SplitPullGate, at: Duration| {
+            choose_source(t, &sel, gate, &cands, &[], (hx(1), 50), |_| false, t0 + at).0
+        };
+        assert_eq!(
+            tick(&mut t, &mut gate, Duration::ZERO),
+            Source::Pinned("sib".into())
+        );
+        let half = PIN_STALL_TIMEOUT / 2;
+        assert_eq!(tick(&mut t, &mut gate, half), Source::Pinned("sib".into()));
+        // The pinned peer serves a block that admission accepts.
+        let a = t.anchor((hx(1), 50), |_| Some(hx(2)));
+        t.note_asked("sib", a);
+        let ah = t
+            .take_answer("sib", &[a.0], &[a.0].into_iter().collect())
+            .expect("answer");
+        t.on_answer(
+            Answer::Progress {
+                highest: (hx(7), 52),
+            },
+            false,
+            ah,
+        );
+        // Past the timeout from the start: the progress restarted the clock.
+        let after = PIN_STALL_TIMEOUT + Duration::from_secs(1);
+        assert_eq!(tick(&mut t, &mut gate, after), Source::Pinned("sib".into()));
+        let almost = after + PIN_STALL_TIMEOUT - Duration::from_secs(1);
+        assert_eq!(
+            tick(&mut t, &mut gate, almost),
+            Source::Pinned("sib".into())
+        );
+        assert_eq!(
+            tick(&mut t, &mut gate, after + PIN_STALL_TIMEOUT),
+            Source::Ahead("aaa".into())
+        );
     }
 
     /// Strikes count unconnected answers from ONE peer. An answer from a peer
