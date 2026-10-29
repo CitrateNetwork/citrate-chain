@@ -2040,7 +2040,7 @@ impl BlockProducer {
     }
 
     /// Produce a single block
-    async fn produce_block(&self) -> anyhow::Result<Hash> {
+    pub(crate) async fn produce_block(&self) -> anyhow::Result<Hash> {
         // VERIFY-255-P1 (perf): RE-DERIVE the F2 attested-ahead watermark BEFORE acquiring
         // the applied-tip lock. The recompute reads only the fork-choice-selected head, the
         // shared candidate record, and storage — none of which require that lock — and its

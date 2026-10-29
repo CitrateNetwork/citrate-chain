@@ -79,6 +79,7 @@ pub mod noise;
 pub mod peer;
 pub mod protocol;
 pub mod relay;
+pub mod shed_log;
 pub mod sync;
 pub mod transaction_gossip;
 pub mod transport;

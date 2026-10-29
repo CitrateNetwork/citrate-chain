@@ -87,6 +87,9 @@ mod producer;
 mod registration_proof;
 mod registry_sync;
 mod rollback;
+mod serve_lane;
+#[cfg(test)]
+mod split_heal_tests;
 mod startup_guards;
 mod sync_peer;
 mod sync_recovery;

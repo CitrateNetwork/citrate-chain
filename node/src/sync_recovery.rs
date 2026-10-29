@@ -36,6 +36,9 @@ use citrate_storage::StorageManager;
 /// one height; anything deeper is the fork-point search's job (`sync_rejoin`).
 pub const MAX_PARENT_WALK_STEPS: u32 = 64;
 
+/// One walk step comes back to a spent peer budget per this interval.
+pub const WALK_REFILL_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// A producer with no connected peer for this long after start treats its
 /// initial sync as complete (a solo or bootstrap node must still produce).
 pub const INITIAL_SYNC_SOLO_GRACE: Duration = Duration::from_secs(30);
@@ -93,6 +96,41 @@ impl ParentWalk {
     pub fn unsent(&mut self) {
         self.steps = self.steps.saturating_sub(1);
         self.last_height = self.prev_height;
+    }
+}
+
+/// Missing-parent walks, one per answering peer (see the fix notes in the
+/// module docs once it lands). For now a single shared walk, as before.
+#[derive(Debug, Default)]
+pub struct ParentWalks {
+    shared: ParentWalk,
+}
+
+impl ParentWalks {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// After `peer`'s answer: the parent to ask `peer` for next, if any.
+    /// `progressed`: the answer admitted a new block; `applied`: the applied
+    /// height; `now`: the time of the answer.
+    pub fn next(
+        &mut self,
+        peer: &str,
+        lowest_deferred: Option<(u64, Hash)>,
+        orphans_remaining: bool,
+        progressed: bool,
+        applied: u64,
+        now: std::time::Instant,
+    ) -> Option<(Hash, u64)> {
+        let _ = (peer, progressed, applied, now);
+        self.shared.next(lowest_deferred, orphans_remaining)
+    }
+
+    /// The request for `peer`'s last step was not sent.
+    pub fn unsent(&mut self, peer: &str) {
+        let _ = peer;
+        self.shared.unsent();
     }
 }
 
@@ -195,6 +233,52 @@ mod tests {
             w.unsent();
             assert!(w.next(Some((100, h(1))), true).is_some());
         }
+    }
+
+    /// (c) Each answering peer has its own walk budget: after the walk against
+    /// one peer has spent everything, a missing parent from another peer is
+    /// still asked for. And a peer's budget comes back: with time, and at once
+    /// when its answers admit blocks again.
+    #[test]
+    fn walk_budget_is_per_peer_and_refills() {
+        let t0 = std::time::Instant::now();
+        let mut w = ParentWalks::new();
+        let mut steps = 0u32;
+        for d in 0..1_000u64 {
+            if w.next("a", Some((10_000 - d, h(1))), true, false, 10_000, t0)
+                .is_some()
+            {
+                steps += 1;
+            }
+        }
+        assert!(steps > 0, "the walk against peer a starts");
+        assert_eq!(
+            w.next("a", Some((5_000, h(1))), true, false, 10_000, t0),
+            None,
+            "peer a's budget is spent"
+        );
+        assert_eq!(
+            w.next("b", Some((10_000, h(2))), true, false, 10_000, t0),
+            Some((h(2), 9_999)),
+            "another peer's missing parent is still asked for"
+        );
+        // Progress from peer a refunds its budget.
+        assert!(
+            w.next("a", Some((9_990, h(3))), true, true, 10_000, t0)
+                .is_some(),
+            "an answer that admitted blocks refills the peer's budget"
+        );
+        // Time refills it too.
+        let mut w = ParentWalks::new();
+        for d in 0..1_000u64 {
+            let _ = w.next("a", Some((10_000 - d, h(1))), true, false, 10_000, t0);
+        }
+        let later = t0 + WALK_REFILL_EVERY * 4;
+        assert!(
+            w.next("a", Some((10_000, h(4))), true, false, 10_000, later)
+                .is_some(),
+            "a spent budget refills with time"
+        );
     }
 
     /// Tripwire: the receive loop, sync tick and producer stay wired to these.

@@ -227,6 +227,12 @@ impl RejoinTracker {
         self.target_behind = target > applied;
     }
 
+    /// Whether this tick's request goes to a peer whose tip this node does not
+    /// hold at about its own height. No effect for now.
+    pub fn note_diverged(&mut self, diverged: bool) {
+        let _ = diverged;
+    }
+
     /// Record that a `GetBlocks` anchored at `anchor` went to `peer`. A search
     /// whose requests go [`MAX_UNANSWERED`] ticks without a matching answer
     /// gives up (with the usual backoff), so it can never hang on a peer that
@@ -847,6 +853,38 @@ mod tests {
             run.modes.push(tracker.mode().clone());
         }
         run
+    }
+
+    /// Equal-height divergence: a peer at our height whose tip we do not hold
+    /// answers our tip anchor with nothing. Nothing says we are behind, yet the
+    /// tracker must still look for the fork point so that peer's branch gets
+    /// fetched (fetching is not rebuilding: fork choice decides what to apply).
+    #[test]
+    fn diverged_peer_at_equal_height_starts_the_fork_point_search() {
+        let mut t = RejoinTracker::new();
+        t.note_sync_target(50, 50);
+        t.note_diverged(true);
+        let tip = (Hash::new([1; 32]), 50);
+        let mut started = false;
+        for _ in 0..PROBE_AFTER_STRIKES {
+            let a = t.anchor(tip, |_| Some(Hash::new([2; 32])));
+            t.note_asked("p", a);
+            let _ = t.take_answer("p", &[], &HashSet::new());
+            if let Some(Transition::StartedProbe { .. }) =
+                t.on_answer(Answer::Unconnected, false, a.1)
+            {
+                started = true;
+            }
+        }
+        assert!(started, "the search did not start: {:?}", t.mode());
+        // Not diverged and not behind: the tracker stays on the tip.
+        let mut t = RejoinTracker::new();
+        t.note_sync_target(50, 50);
+        t.note_diverged(false);
+        for _ in 0..PROBE_AFTER_STRIKES {
+            assert_eq!(t.on_answer(Answer::Unconnected, false, 50), None);
+        }
+        assert_eq!(t.mode(), &Mode::Tip { strikes: 0 });
     }
 
     /// A side-branch node whose only height evidence is a peer's advertised

@@ -197,6 +197,26 @@ pub struct SyncCandidate {
     pub head_height: u64,
 }
 
+/// A connected peer as the divergence check sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadView {
+    /// The head this peer advertises.
+    pub head_height: u64,
+    /// Whether this node holds that head block.
+    pub head_held: bool,
+}
+
+/// A peer whose tip this node does not hold, at about our height, to pull its
+/// branch from (when no peer is ahead). `None` for now.
+/// How far below our applied tip a peer's head may be and still count as
+/// "about our height" for [`diverged_source`].
+pub const DIVERGENCE_BAND: u64 = 32;
+
+pub fn diverged_source(peers: &[HeadView], applied_height: u64, rotate: &mut u64) -> Option<usize> {
+    let _ = (peers, applied_height, rotate);
+    None
+}
+
 /// Bounds on a peer's usefulness score. Clamped so no peer can accumulate an
 /// unrecoverable deficit (a permanent ban in all but name) or an unassailable
 /// lead (which would let a peer that HAS gone bad coast on old credit).
@@ -533,6 +553,48 @@ impl SyncPeerSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Equal-height divergence: no peer is ahead, but a peer's tip is one this
+    /// node does not hold. That peer is a source (to fetch, not to rebuild).
+    /// Peers whose tip we hold, or that are far below us, are not; several
+    /// diverged peers are taken in turn.
+    #[test]
+    fn a_peer_on_another_branch_at_our_height_is_a_source() {
+        let v = |head_height, head_held| HeadView {
+            head_height,
+            head_held,
+        };
+        let mut r = 0u64;
+        assert_eq!(
+            diverged_source(&[v(100, true), v(100, true)], 100, &mut r),
+            None
+        );
+        assert_eq!(
+            diverged_source(&[v(100, true), v(100, false)], 100, &mut r),
+            Some(1),
+            "equal height, tip not held"
+        );
+        assert_eq!(
+            diverged_source(&[v(99, false)], 100, &mut r),
+            Some(0),
+            "one below"
+        );
+        assert_eq!(
+            diverged_source(&[v(100 - DIVERGENCE_BAND - 1, false)], 100, &mut r),
+            None,
+            "far below our tip is not about our height"
+        );
+        let peers = [v(100, false), v(100, true), v(101, false)];
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..4 {
+            seen.insert(diverged_source(&peers, 100, &mut r).expect("a source"));
+        }
+        assert_eq!(
+            seen,
+            [0usize, 2].into_iter().collect(),
+            "diverged peers in turn"
+        );
+    }
 
     /// After a fork-point search gives up against the preferred peer, the next
     /// tick asks a different useful peer; with no alternative it keeps the one.

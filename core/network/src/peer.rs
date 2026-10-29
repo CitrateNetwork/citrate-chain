@@ -354,6 +354,8 @@ pub struct PeerManager {
     pub(crate) incoming: Arc<RwLock<Option<IncomingTx>>>,
     /// Inbound messages shed because the message loop was behind (#149).
     pub(crate) inbound_drops: Arc<AtomicU64>,
+    /// Rate limit on the "inbound messages shed" warning.
+    inbound_shed_log: Arc<crate::shed_log::ShedLog>,
 }
 
 #[derive(Debug, Clone)]
@@ -379,6 +381,9 @@ impl Default for PeerManagerConfig {
     }
 }
 
+/// At most one "inbound messages shed" warning per this interval.
+pub const INBOUND_SHED_WARN_EVERY: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Default)]
 struct PeerStats {
     total_connected: usize,
@@ -398,6 +403,7 @@ impl PeerManager {
             stats: Arc::new(RwLock::new(PeerStats::default())),
             incoming: Arc::new(RwLock::new(None)),
             inbound_drops: Arc::new(AtomicU64::new(0)),
+            inbound_shed_log: Arc::new(crate::shed_log::ShedLog::new(INBOUND_SHED_WARN_EVERY)),
         }
     }
 
@@ -435,6 +441,11 @@ impl PeerManager {
     /// deadlock this counter exists to make visible instead of silent.
     pub fn inbound_drops(&self) -> u64 {
         self.inbound_drops.load(Ordering::Relaxed)
+    }
+
+    /// The rate limit behind the "inbound messages shed" warning.
+    pub fn inbound_shed_log(&self) -> &crate::shed_log::ShedLog {
+        &self.inbound_shed_log
     }
 
     /// Get max peers configuration
@@ -1361,6 +1372,27 @@ mod tests {
             "the peer must mark itself closed so the sync driver can evict it — \
              without this it keeps winning selection on a stale advertised head and \
              every request evaporates with no timeout to trigger the penalty box"
+        );
+    }
+
+    /// Shed inbound messages are counted AND said: the first shed of a quiet
+    /// period warns, later ones are folded into the next warning (at most one per
+    /// `INBOUND_SHED_WARN_EVERY`). A node shedding peers' blocks while its loop is
+    /// slow, not stopped, used to log nothing at all.
+    #[tokio::test]
+    async fn shed_inbound_messages_are_counted_and_warned() {
+        let pm = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+        let (tx, _rx_held_open) = mpsc::channel(1);
+        pm.set_incoming(tx).await;
+        pm.forward_incoming(PeerId::new("p".into()), ping()).await;
+        for _ in 0..50 {
+            pm.forward_incoming(PeerId::new("p".into()), ping()).await;
+        }
+        assert_eq!(pm.inbound_drops(), 50, "every shed message is counted");
+        assert_eq!(
+            pm.inbound_shed_log().warnings(),
+            1,
+            "a burst of shedding warns once, not never and not per message"
         );
     }
 
