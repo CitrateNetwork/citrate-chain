@@ -50,7 +50,10 @@
 // THE INVARIANTS
 //
 //   I1. Only a peer whose advertised head is ABOVE our applied height is a
-//       candidate. Nothing else can move us forward.
+//       candidate. Nothing else can move us forward. (A peer at our height
+//       on a sibling branch is not a forward source either; pulling its
+//       branch so fork choice can merge it is split healing, a separate and
+//       rate-limited path: `SplitPullGate` below and `sync_rejoin::choose_source`.)
 //   I2. The failure count is a PREFERENCE among useful peers, never a veto on
 //       all of them. If penalties would empty a non-empty useful set, the set is
 //       used anyway. Being behind is present-tense evidence; a stale timeout is
@@ -126,6 +129,9 @@
 )]
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use citrate_consensus::types::Hash;
 
 /// How far above our applied tip a gossiped block may be and still trigger
 /// SYNC-S3 depth-1 ancestry recovery.
@@ -195,26 +201,6 @@ pub struct SyncCandidate {
     pub id: String,
     /// The head height this peer advertises (Hello/HelloAck/gossip).
     pub head_height: u64,
-}
-
-/// A connected peer as the divergence check sees it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HeadView {
-    /// The head this peer advertises.
-    pub head_height: u64,
-    /// Whether this node holds that head block.
-    pub head_held: bool,
-}
-
-/// A peer whose tip this node does not hold, at about our height, to pull its
-/// branch from (when no peer is ahead). `None` for now.
-/// How far below our applied tip a peer's head may be and still count as
-/// "about our height" for [`diverged_source`].
-pub const DIVERGENCE_BAND: u64 = 32;
-
-pub fn diverged_source(peers: &[HeadView], applied_height: u64, rotate: &mut u64) -> Option<usize> {
-    let _ = (peers, applied_height, rotate);
-    None
 }
 
 /// Bounds on a peer's usefulness score. Clamped so no peer can accumulate an
@@ -550,51 +536,94 @@ impl SyncPeerSelector {
     }
 }
 
+/// SPLIT HEALING: how far BELOW our applied height a peer's advertised head
+/// may sit and still be treated as a sibling branch worth pulling. A peer above
+/// us is a forward source ([`SyncPeerSelector::select`], I1) and is never a
+/// split candidate.
+pub const SPLIT_PULL_HEIGHT_BAND: u64 = 8;
+/// One split pull per peer per this window.
+pub const SPLIT_PULL_PEER_BACKOFF: Duration = Duration::from_secs(60);
+/// At most one split pull, against any peer, per this window.
+pub const SPLIT_PULL_MIN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// A connected peer's advertised tip, considered for a split pull.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitCandidate {
+    pub id: String,
+    pub head_height: u64,
+    pub head_hash: Hash,
+}
+
+/// Rate limits on split pulls: one per peer per [`SPLIT_PULL_PEER_BACKOFF`],
+/// one in total per [`SPLIT_PULL_MIN_INTERVAL`].
+#[derive(Debug, Default)]
+pub struct SplitPullGate {
+    last_by_peer: HashMap<String, Instant>,
+    last_any: Option<Instant>,
+}
+
+impl SplitPullGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The peer to pull a sibling branch from now, if any; recorded as pulled.
+    ///
+    /// A candidate advertises a head at most [`SPLIT_PULL_HEIGHT_BAND`] below
+    /// our applied height and not above it, a known hash other than our tip,
+    /// and a block `holds` says we do not store (a tip we store is a branch we
+    /// already have, or our own chain). Among those not pulled within
+    /// [`SPLIT_PULL_PEER_BACKOFF`]: the highest head, then the smallest id.
+    /// Nothing at all within [`SPLIT_PULL_MIN_INTERVAL`] of the last pull.
+    ///
+    /// Advertised heads are unauthenticated hints (I4). A peer that lies about
+    /// its tip gets at most one bounded fork-point search per window, and the
+    /// blocks it serves still go through admission like any others.
+    pub fn pick<'a>(
+        &mut self,
+        candidates: &'a [SplitCandidate],
+        applied: (Hash, u64),
+        holds: impl Fn(&Hash) -> bool,
+        now: Instant,
+    ) -> Option<&'a SplitCandidate> {
+        // Bounded: an entry lives for one backoff window.
+        self.last_by_peer
+            .retain(|_, t| now.saturating_duration_since(*t) < SPLIT_PULL_PEER_BACKOFF);
+        if let Some(t) = self.last_any {
+            if now.saturating_duration_since(t) < SPLIT_PULL_MIN_INTERVAL {
+                return None;
+            }
+        }
+        let unknown = Hash::new([0u8; 32]);
+        let pick = candidates
+            .iter()
+            .filter(|c| {
+                c.head_height <= applied.1
+                    && applied.1.saturating_sub(c.head_height) <= SPLIT_PULL_HEIGHT_BAND
+                    && c.head_hash != applied.0
+                    && c.head_hash != unknown
+                    && !self.last_by_peer.contains_key(&c.id)
+            })
+            .filter(|c| !holds(&c.head_hash))
+            .max_by(|a, b| {
+                a.head_height
+                    .cmp(&b.head_height)
+                    .then_with(|| b.id.cmp(&a.id))
+            })?;
+        self.last_by_peer.insert(pick.id.clone(), now);
+        self.last_any = Some(now);
+        Some(pick)
+    }
+
+    #[cfg(test)]
+    pub fn tracked_peers(&self) -> usize {
+        self.last_by_peer.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Equal-height divergence: no peer is ahead, but a peer's tip is one this
-    /// node does not hold. That peer is a source (to fetch, not to rebuild).
-    /// Peers whose tip we hold, or that are far below us, are not; several
-    /// diverged peers are taken in turn.
-    #[test]
-    fn a_peer_on_another_branch_at_our_height_is_a_source() {
-        let v = |head_height, head_held| HeadView {
-            head_height,
-            head_held,
-        };
-        let mut r = 0u64;
-        assert_eq!(
-            diverged_source(&[v(100, true), v(100, true)], 100, &mut r),
-            None
-        );
-        assert_eq!(
-            diverged_source(&[v(100, true), v(100, false)], 100, &mut r),
-            Some(1),
-            "equal height, tip not held"
-        );
-        assert_eq!(
-            diverged_source(&[v(99, false)], 100, &mut r),
-            Some(0),
-            "one below"
-        );
-        assert_eq!(
-            diverged_source(&[v(100 - DIVERGENCE_BAND - 1, false)], 100, &mut r),
-            None,
-            "far below our tip is not about our height"
-        );
-        let peers = [v(100, false), v(100, true), v(101, false)];
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..4 {
-            seen.insert(diverged_source(&peers, 100, &mut r).expect("a source"));
-        }
-        assert_eq!(
-            seen,
-            [0usize, 2].into_iter().collect(),
-            "diverged peers in turn"
-        );
-    }
 
     /// After a fork-point search gives up against the preferred peer, the next
     /// tick asks a different useful peer; with no alternative it keeps the one.
@@ -1066,6 +1095,111 @@ mod tests {
             !should_attempt_ancestry_recovery(159_001, 0),
             "a fresh node has the whole chain to fetch; chasing tip ancestry is pure waste"
         );
+    }
+}
+
+#[cfg(test)]
+mod split_pull_gate {
+    use super::*;
+
+    fn hx(n: u8) -> Hash {
+        Hash::new([n; 32])
+    }
+
+    fn sc(id: &str, head_height: u64, hash: u8) -> SplitCandidate {
+        SplitCandidate {
+            id: id.into(),
+            head_height,
+            head_hash: hx(hash),
+        }
+    }
+
+    fn tip() -> (Hash, u64) {
+        (hx(1), 100)
+    }
+
+    fn pick_id(
+        g: &mut SplitPullGate,
+        c: &[SplitCandidate],
+        held: &[u8],
+        now: Instant,
+    ) -> Option<String> {
+        g.pick(c, tip(), |h| held.iter().any(|n| hx(*n) == *h), now)
+            .map(|c| c.id.clone())
+    }
+
+    /// Only a sibling at or within the band below our height, with a known
+    /// tip that is neither ours nor stored here, is pulled.
+    #[test]
+    fn only_an_unheld_sibling_tip_in_the_band_is_pulled() {
+        let now = Instant::now();
+        let band = 100 - SPLIT_PULL_HEIGHT_BAND;
+        for (c, held, want) in [
+            (sc("p", 100, 9), vec![], true),
+            (sc("p", band, 9), vec![], true),
+            (sc("p", band - 1, 9), vec![], false),
+            (sc("p", 101, 9), vec![], false), // ahead: the selector's
+            (sc("p", 100, 1), vec![], false), // our own tip
+            (sc("p", 100, 0), vec![], false), // unknown hash
+            (sc("p", 97, 9), vec![9], false), // a tip we store
+        ] {
+            let mut g = SplitPullGate::new();
+            assert_eq!(
+                pick_id(&mut g, std::slice::from_ref(&c), &held, now).is_some(),
+                want,
+                "{c:?} held={held:?}"
+            );
+        }
+    }
+
+    /// One pull per peer per backoff window, one in total per interval;
+    /// deterministic among eligible peers (highest head, then smallest id).
+    #[test]
+    fn pulls_are_rate_limited_per_peer_and_in_total() {
+        let t0 = Instant::now();
+        let mut g = SplitPullGate::new();
+        let c = [sc("b", 100, 9), sc("a", 100, 8), sc("z", 99, 7)];
+        assert_eq!(pick_id(&mut g, &c, &[], t0).as_deref(), Some("a"));
+        assert_eq!(pick_id(&mut g, &c, &[], t0), None, "total interval");
+        let t1 = t0 + SPLIT_PULL_MIN_INTERVAL;
+        assert_eq!(pick_id(&mut g, &c, &[], t1).as_deref(), Some("b"));
+        let t2 = t1 + SPLIT_PULL_MIN_INTERVAL;
+        assert_eq!(pick_id(&mut g, &c, &[], t2).as_deref(), Some("z"));
+        let t3 = t2 + SPLIT_PULL_MIN_INTERVAL;
+        assert_eq!(
+            pick_id(&mut g, &c, &[], t3),
+            None,
+            "each peer once per window"
+        );
+        let t4 = t0 + SPLIT_PULL_PEER_BACKOFF;
+        assert_eq!(pick_id(&mut g, &c, &[], t4).as_deref(), Some("a"));
+    }
+
+    /// Adversarial: a peer that advertises a new unheld tip every tick still
+    /// gets one pull per window, and the gate's memory stays bounded by the
+    /// peers pulled within one window.
+    #[test]
+    fn a_peer_flipping_its_tip_gets_one_pull_per_window() {
+        let t0 = Instant::now();
+        let mut g = SplitPullGate::new();
+        let mut pulls = 0;
+        for tick in 0..300u64 {
+            let now = t0 + Duration::from_secs(2 * tick);
+            let c = [sc("liar", 100, (tick % 200) as u8 + 2)];
+            if pick_id(&mut g, &c, &[], now).is_some() {
+                pulls += 1;
+            }
+        }
+        // 600 s of ticks against a 60 s window.
+        assert!(pulls <= 10, "{pulls} pulls");
+        for n in 0..1_000u64 {
+            let now = t0 + Duration::from_secs(10_000) + SPLIT_PULL_MIN_INTERVAL * n as u32;
+            let c = [sc(&format!("p{n}"), 100, 9)];
+            let _ = pick_id(&mut g, &c, &[], now);
+        }
+        let per_window =
+            (SPLIT_PULL_PEER_BACKOFF.as_secs() / SPLIT_PULL_MIN_INTERVAL.as_secs()) as usize;
+        assert!(g.tracked_peers() <= per_window + 1, "{}", g.tracked_peers());
     }
 }
 
