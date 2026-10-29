@@ -140,11 +140,15 @@ pub const REJOIN_LOG_PER_WINDOW: u32 = 8;
 /// See [`REJOIN_LOG_PER_WINDOW`].
 pub const REJOIN_LOG_WINDOW: Duration = Duration::from_secs(600);
 
-/// How long a pinned search may go without verified progress from its peer
-/// (an answer that admitted a block) before a peer ahead of it can take the
-/// tick (DGX review of 49465b5e, P1-2). The producer's no-progress stall bound.
-/// An advertised head alone never ends a pin: it is self-reported and is
-/// raised by gossip before the block is validated.
+/// How long a pinned search may go without a consumed answer from its peer
+/// before a peer ahead of it can take the tick (DGX review of 49465b5e, P1-2).
+/// The producer's no-progress stall bound. A consumed answer is one
+/// [`RejoinTracker::take_answer`] matched (only the asked peer, with the
+/// anchor among the hash-verified blocks, or empty) that moved the search: a
+/// probe step (unconnected or known) or admitted blocks. A stale probe answer
+/// does not count. An advertised head alone never ends a pin: it is
+/// self-reported and is raised by gossip before the block is validated. An
+/// answering probe stays bounded by its request cap and [`MAX_UNANSWERED`].
 pub const PIN_STALL_TIMEOUT: Duration = crate::producer::CATCHUP_STALL_ALERT;
 
 /// What an answer to the tracker's anchor did, judged after admission.
@@ -261,11 +265,11 @@ pub struct RejoinTracker {
     request_cap: u32,
     /// Trickling follow answers in a row ([`FOLLOW_TRICKLE_ADVANCE`]).
     trickles: u32,
-    /// When the running search's peer last made verified progress (or the
+    /// When the running search's peer last gave a consumed answer (or the
     /// search was first seen by [`choose_source`]); see [`PIN_STALL_TIMEOUT`].
-    pin_progress_at: Option<Instant>,
-    /// The pinned peer made verified progress since `pin_progress_at`.
-    pin_progressed: bool,
+    pin_live_at: Option<Instant>,
+    /// The pinned peer gave a consumed answer since `pin_live_at`.
+    pin_answered: bool,
 }
 
 impl Default for RejoinTracker {
@@ -291,8 +295,8 @@ impl RejoinTracker {
             requests: 0,
             request_cap: 0,
             trickles: 0,
-            pin_progress_at: None,
-            pin_progressed: false,
+            pin_live_at: None,
+            pin_answered: false,
         }
     }
 
@@ -305,22 +309,21 @@ impl RejoinTracker {
     }
 
     fn clear_pin_clock(&mut self) {
-        self.pin_progress_at = None;
-        self.pin_progressed = false;
+        self.pin_live_at = None;
+        self.pin_answered = false;
     }
 
-    /// How long the running search's peer has gone without verified progress,
+    /// How long the running search's peer has gone without a consumed answer,
     /// as of `now`. The clock starts the first time it is read for a search
-    /// and restarts at the first read after an answer from the pinned peer
-    /// that admitted a block (at most one tick late, which only favours the
-    /// pin).
+    /// and restarts at the first read after a consumed answer from the pinned
+    /// peer (at most one tick late, which only favours the pin).
     fn pin_stalled_for(&mut self, now: Instant) -> Duration {
-        let since = match self.pin_progress_at {
-            Some(at) if !self.pin_progressed => at,
+        let since = match self.pin_live_at {
+            Some(at) if !self.pin_answered => at,
             _ => now,
         };
-        self.pin_progress_at = Some(since);
-        self.pin_progressed = false;
+        self.pin_live_at = Some(since);
+        self.pin_answered = false;
         now.saturating_duration_since(since)
     }
 
@@ -551,9 +554,7 @@ impl RejoinTracker {
             }
             (Mode::Probe { .. }, Answer::Progress { highest })
             | (Mode::Follow { .. }, Answer::Progress { highest }) => {
-                if from.is_some() && from == self.peer {
-                    self.pin_progressed = true;
-                }
+                self.note_pin_answer(&from);
                 let previous = match &self.mode {
                     Mode::Follow { cursor } => Some(cursor.1),
                     _ => None,
@@ -609,6 +610,7 @@ impl RejoinTracker {
                 if anchor_height != height {
                     return None;
                 }
+                self.note_pin_answer(&from);
                 let (unconnected, known, step) = match verdict {
                     Answer::Unconnected => (height, known, step.saturating_mul(2)),
                     // Progress is handled above; this arm is Known.
@@ -640,6 +642,13 @@ impl RejoinTracker {
                 };
                 None
             }
+        }
+    }
+
+    /// The pinned peer's answer was consumed by the search: it is live.
+    fn note_pin_answer(&mut self, from: &Option<String>) {
+        if from.is_some() && *from == self.peer {
+            self.pin_answered = true;
         }
     }
 
@@ -714,7 +723,7 @@ pub fn choose_source(
     if let Some(p) = tracker.search_peer().map(str::to_string) {
         match candidates.iter().find(|c| c.id == p) {
             Some(pinned) => {
-                // A pinned peer that has made no verified progress for
+                // A pinned peer that has given no consumed answer for
                 // PIN_STALL_TIMEOUT, while another peer is more than the
                 // catch-up gap ahead of it, ends the pin: the selector asks
                 // the peer that can carry us (DGX review of 49465b5e, P1-2).
@@ -3950,8 +3959,8 @@ mod tests {
             now,
         );
         assert_eq!(src, Source::Pinned("sib".into()));
-        // P1-2: once the pinned peer has gone PIN_STALL_TIMEOUT without
-        // verified progress, the peer ahead takes the tick.
+        // P1-2: once the pinned peer has gone PIN_STALL_TIMEOUT without a
+        // consumed answer, the peer ahead takes the tick.
         let (src, tr) = choose_source(
             &mut t,
             &sel,
@@ -4328,10 +4337,11 @@ mod tests {
         }
     }
 
-    /// The stall clock restarts on the first tick after an answer from the
-    /// pinned peer that admitted a block, and runs from the last such tick.
+    /// The stall clock restarts on the first tick after a consumed answer
+    /// from the pinned peer (here, admitted blocks), and runs from the last
+    /// such tick.
     #[test]
-    fn verified_progress_restarts_the_pin_stall_clock() {
+    fn a_consumed_answer_restarts_the_pin_stall_clock() {
         let mut t = RejoinTracker::new();
         let sel = SyncPeerSelector::new();
         let mut gate = SplitPullGate::new();
