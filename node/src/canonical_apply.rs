@@ -13903,6 +13903,25 @@ pub(crate) mod tests {
             );
         }
 
+        /// Fail-safe seeding: a record that names no parent is not used either
+        /// (the walk only reverts to the block a record says it reverts to).
+        #[tokio::test]
+        async fn a_record_naming_no_parent_ends_the_restored_window() {
+            let (storage, _dir, main) = rsr_stopped_at_30().await;
+            let tip = main.last().expect("tip").clone();
+            let h = 20u64;
+            let original = storage.state.get_reorg_undo(h).expect("read").expect("rec");
+            assert!(original.parent.is_some(), "fixture: a parent is recorded");
+            let mut no_parent = original.clone();
+            no_parent.parent = None;
+            rsr_put_record(&storage, &tip, no_parent);
+            assert_eq!(
+                rsr_restart_ring(&storage).await,
+                (h..=30).collect::<Vec<u64>>(),
+                "a record at {h} naming no parent ends the window there"
+            );
+        }
+
         /// A model registered BEFORE the window (height 10, tip 130) and updated
         /// inside it (120), across a real restart (state hydrated from the store)
         /// and a reorg forking at 125 onto a branch that leaves it alone: the
