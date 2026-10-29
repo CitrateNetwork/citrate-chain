@@ -25,7 +25,8 @@
 //! ```
 
 use metrics::{
-    counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram, Unit,
+    absolute_counter, counter, describe_counter, describe_gauge, describe_histogram, gauge,
+    histogram, Unit,
 };
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use once_cell::sync::OnceCell;
@@ -61,6 +62,7 @@ pub const METRIC_PEER_COUNT: &str = "citrate_peer_count";
 pub const METRIC_PEER_CONNECTIONS_TOTAL: &str = "citrate_peer_connections_total";
 pub const METRIC_PEER_DISCONNECTIONS_TOTAL: &str = "citrate_peer_disconnections_total";
 pub const METRIC_PEER_LATENCY: &str = "citrate_peer_latency_seconds";
+pub const METRIC_P2P_INBOUND_DROPPED_TOTAL: &str = "citrate_p2p_inbound_dropped_total";
 
 // Mempool
 pub const METRIC_MEMPOOL_SIZE: &str = "citrate_mempool_size";
@@ -196,6 +198,10 @@ fn register_metric_descriptions() {
     describe_counter!(
         METRIC_PEER_DISCONNECTIONS_TOTAL,
         "Total peer disconnection events"
+    );
+    describe_counter!(
+        METRIC_P2P_INBOUND_DROPPED_TOTAL,
+        "Inbound P2P messages shed because the inbound queue was full, by message type"
     );
     describe_histogram!(
         METRIC_PEER_LATENCY,
@@ -382,6 +388,15 @@ pub fn record_peer_connected(peer_id: &str) {
 pub fn record_peer_disconnected(peer_id: &str) {
     let labels = [("peer_id", peer_id.to_string())];
     counter!(METRIC_PEER_DISCONNECTIONS_TOTAL, 1, &labels);
+}
+
+/// Publish the inbound drop counters (`PeerManager::inbound_drops_by_kind`).
+/// Absolute: the source counters are monotone and owned by the peer manager.
+pub fn record_inbound_drops(by_kind: &[(&'static str, u64)]) {
+    for (kind, count) in by_kind {
+        let labels = [("type", kind.to_string())];
+        absolute_counter!(METRIC_P2P_INBOUND_DROPPED_TOTAL, *count, &labels);
+    }
 }
 
 /// Record peer latency
@@ -596,6 +611,7 @@ mod tests {
         record_peer_count(5);
         record_block_height(100);
         record_mempool_size(10, 1000);
+        record_inbound_drops(&[("NewBlock", 2), ("GetBlocks", 7)]);
     }
 
     /// PIL-13 WP-13.5: the RSS sampler reads a real, plausible value from the

@@ -1,6 +1,7 @@
 // citrate/core/network/src/peer.rs
 
 // Peer connection and management
+use crate::inbound::InboundDrops;
 use crate::protocol::MAX_INBOUND_MESSAGE_BYTES;
 use crate::{NetworkError, NetworkMessage, ProtocolVersion};
 use citrate_consensus::types::Hash;
@@ -354,8 +355,8 @@ pub struct PeerManager {
     pub(crate) incoming: Arc<RwLock<Option<IncomingTx>>>,
     /// Inbound messages shed because the message loop was behind (#149).
     pub(crate) inbound_drops: Arc<AtomicU64>,
-    /// Rate limit on the "inbound messages shed" warning.
-    inbound_shed_log: Arc<crate::shed_log::ShedLog>,
+    /// The same drops by message type, with a rate-limited warning.
+    inbound_drops_by_kind: Arc<InboundDrops>,
 }
 
 #[derive(Debug, Clone)]
@@ -381,9 +382,6 @@ impl Default for PeerManagerConfig {
     }
 }
 
-/// At most one "inbound messages shed" warning per this interval.
-pub const INBOUND_SHED_WARN_EVERY: Duration = Duration::from_secs(10);
-
 #[derive(Debug, Default)]
 struct PeerStats {
     total_connected: usize,
@@ -403,7 +401,7 @@ impl PeerManager {
             stats: Arc::new(RwLock::new(PeerStats::default())),
             incoming: Arc::new(RwLock::new(None)),
             inbound_drops: Arc::new(AtomicU64::new(0)),
-            inbound_shed_log: Arc::new(crate::shed_log::ShedLog::new(INBOUND_SHED_WARN_EVERY)),
+            inbound_drops_by_kind: Arc::new(InboundDrops::default()),
         }
     }
 
@@ -428,8 +426,15 @@ impl PeerManager {
     /// costs a round trip. Blocking cost the entire fleet thirty hours.
     pub async fn forward_incoming(&self, peer_id: PeerId, message: NetworkMessage) {
         if let Some(tx) = self.incoming.read().await.clone() {
-            if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send((peer_id, message)) {
+            let kind = message.kind();
+            if let Err(mpsc::error::TrySendError::Full((peer_id, _))) =
+                tx.try_send((peer_id, message))
+            {
                 self.inbound_drops.fetch_add(1, Ordering::Relaxed);
+                // Shedding stays silent no longer: counted by type, warned
+                // about at most once per window.
+                self.inbound_drops_by_kind
+                    .record(kind, &peer_id, Instant::now());
             }
         }
     }
@@ -443,9 +448,9 @@ impl PeerManager {
         self.inbound_drops.load(Ordering::Relaxed)
     }
 
-    /// The rate limit behind the "inbound messages shed" warning.
-    pub fn inbound_shed_log(&self) -> &crate::shed_log::ShedLog {
-        &self.inbound_shed_log
+    /// The same drops as `(message type, count)`, sorted by type.
+    pub fn inbound_drops_by_kind(&self) -> Vec<(&'static str, u64)> {
+        self.inbound_drops_by_kind.by_kind()
     }
 
     /// Get max peers configuration
@@ -1375,27 +1380,6 @@ mod tests {
         );
     }
 
-    /// Shed inbound messages are counted AND said: the first shed of a quiet
-    /// period warns, later ones are folded into the next warning (at most one per
-    /// `INBOUND_SHED_WARN_EVERY`). A node shedding peers' blocks while its loop is
-    /// slow, not stopped, used to log nothing at all.
-    #[tokio::test]
-    async fn shed_inbound_messages_are_counted_and_warned() {
-        let pm = Arc::new(PeerManager::new(PeerManagerConfig::default()));
-        let (tx, _rx_held_open) = mpsc::channel(1);
-        pm.set_incoming(tx).await;
-        pm.forward_incoming(PeerId::new("p".into()), ping()).await;
-        for _ in 0..50 {
-            pm.forward_incoming(PeerId::new("p".into()), ping()).await;
-        }
-        assert_eq!(pm.inbound_drops(), 50, "every shed message is counted");
-        assert_eq!(
-            pm.inbound_shed_log().warnings(),
-            1,
-            "a burst of shedding warns once, not never and not per message"
-        );
-    }
-
     /// RED TEST — #149 link 4. `forward_incoming` used to `.await` the bounded
     /// inbound channel. Every peer has its own reader task calling this, so once
     /// the message loop stopped draining, EVERY reader parked here and the node
@@ -1425,6 +1409,31 @@ mod tests {
             1,
             "shed messages are counted so the stall detector can see a loop that is not draining"
         );
+    }
+
+    /// RED. Shed messages are counted by message type, so a full inbound
+    /// queue says WHAT it shed (block gossip versus serve requests).
+    #[tokio::test]
+    async fn inbound_drops_are_counted_by_type() {
+        let pm = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+        let (tx, _rx_held_open) = mpsc::channel(1);
+        pm.set_incoming(tx).await;
+        let get_blocks = NetworkMessage::GetBlocks {
+            from: Hash::default(),
+            count: 32,
+            step: 1,
+        };
+        pm.forward_incoming(PeerId::new("p".into()), ping()).await;
+        for _ in 0..3 {
+            pm.forward_incoming(PeerId::new("syncer".into()), get_blocks.clone())
+                .await;
+        }
+        pm.forward_incoming(PeerId::new("p".into()), ping()).await;
+        assert_eq!(
+            pm.inbound_drops_by_kind(),
+            vec![("GetBlocks", 3), ("GetPeers", 1)]
+        );
+        assert_eq!(pm.inbound_drops(), 4, "the total the stall detector reads");
     }
 
     /// CONNECTION DEDUP (fleet incident 2026-07-29).

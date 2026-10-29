@@ -87,7 +87,6 @@ mod producer;
 mod registration_proof;
 mod registry_sync;
 mod rollback;
-mod serve_lane;
 #[cfg(test)]
 mod split_heal_tests;
 mod startup_guards;
@@ -4470,6 +4469,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 interval.tick().await;
                 let processed = msgs_processed.load(std::sync::atomic::Ordering::Relaxed);
                 let drops = pm_for_stall.inbound_drops();
+                metrics::record_inbound_drops(&pm_for_stall.inbound_drops_by_kind());
                 let shed_this_window = drops.saturating_sub(last_drops);
                 let starved = shed_this_window > 0 && processed == last_processed;
                 last_processed = processed;

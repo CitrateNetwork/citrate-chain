@@ -356,6 +356,55 @@ pub enum MessagePriority {
 }
 
 impl NetworkMessage {
+    /// The variant name, for logs and metric labels. Exhaustive on purpose: a
+    /// new variant cannot be added without giving it a label.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Hello { .. } => "Hello",
+            Self::HelloAck { .. } => "HelloAck",
+            Self::Disconnect { .. } => "Disconnect",
+            Self::Ping { .. } => "Ping",
+            Self::Pong { .. } => "Pong",
+            Self::NewBlock { .. } => "NewBlock",
+            Self::GetBlocks { .. } => "GetBlocks",
+            Self::Blocks { .. } => "Blocks",
+            Self::GetHeaders { .. } => "GetHeaders",
+            Self::Headers { .. } => "Headers",
+            Self::NewTransaction { .. } => "NewTransaction",
+            Self::GetTransactions { .. } => "GetTransactions",
+            Self::Transactions { .. } => "Transactions",
+            Self::ModelAnnounce { .. } => "ModelAnnounce",
+            Self::GetModel { .. } => "GetModel",
+            Self::ModelData { .. } => "ModelData",
+            Self::InferenceRequest { .. } => "InferenceRequest",
+            Self::InferenceResponse { .. } => "InferenceResponse",
+            Self::TrainingJobAnnounce { .. } => "TrainingJobAnnounce",
+            Self::GradientSubmission { .. } => "GradientSubmission",
+            Self::LoraAdapterAnnounce { .. } => "LoraAdapterAnnounce",
+            Self::GetLoraAdapter { .. } => "GetLoraAdapter",
+            Self::WeightSync { .. } => "WeightSync",
+            Self::GetAIState { .. } => "GetAIState",
+            Self::AIStateUpdate { .. } => "AIStateUpdate",
+            Self::GetMempool => "GetMempool",
+            Self::Mempool { .. } => "Mempool",
+            Self::GetBlocksByHeight { .. } => "GetBlocksByHeight",
+            Self::GetState { .. } => "GetState",
+            Self::StateData { .. } => "StateData",
+            Self::GetPeers => "GetPeers",
+            Self::Peers { .. } => "Peers",
+            Self::GetBlueSet { .. } => "GetBlueSet",
+            Self::BlueSet { .. } => "BlueSet",
+            Self::GetDagInfo { .. } => "GetDagInfo",
+            Self::DagInfo { .. } => "DagInfo",
+            Self::CheckpointVote { .. } => "CheckpointVote",
+            Self::RelayRequest { .. } => "RelayRequest",
+            Self::RelayData { .. } => "RelayData",
+            Self::HolePunchRequest { .. } => "HolePunchRequest",
+            Self::HolePunchNotify { .. } => "HolePunchNotify",
+            Self::LearningGossip { .. } => "LearningGossip",
+        }
+    }
+
     /// Get the priority of this message
     pub fn priority(&self) -> MessagePriority {
         match self {
