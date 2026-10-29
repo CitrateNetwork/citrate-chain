@@ -65,15 +65,18 @@ typed confirmation.
 refuses such a read once its executed head moves (`historical state not available on this
 node`), which at 2 s blocks is almost at once, so smoke's `CheckDeployedAdmins` needs a node
 with the operator window (`docs/ops/RPC_STATE_BLOCK_TAGS.md`). The inventory designates one
-host for that: `citrate-prod-1` has `"serve_recent_state_tags": 512`. `distribute` writes
-`[rpc] serve_recent_state_tags = 512` into that host's `node.toml` only (its RPC stays on
+host for that: `citrate-prod-1` has `"serve_recent_state_tags": 1024`. `distribute` writes
+`[rpc] serve_recent_state_tags = 1024` into that host's `node.toml` only (its RPC stays on
 loopback, reached through the ssh tunnel); every other host stays strict. Smoke runs forge
 against that host's tunnel, also under `--only`. `guard.py check-inventory` refuses a value
 that is not an integer 0-1024 (the node clamps above 1024).
 
 Sizing: on r1006 the checker's forge run takes about 45 s, about 65 blocks at the observed
-~1.4 blocks/s, so a 64-block window ran out mid-run (2026-10-28). 512 gives about six
-minutes of headroom; it widens only the operator host's answers, never the public RPC.
+~1.4 blocks/s, so a 64-block window ran out mid-run (2026-10-28). 512 then also ran out:
+on the chain rerolled 2026-10-29 the same run took about 4 min 20 s (forge's RPC cache was
+cold for the new chain) at ~1.9 blocks/s, and the last pinned read was 513 blocks behind.
+1024, the node's maximum, gives about nine minutes; it widens only the operator host's
+answers, never the public RPC.
 
 To roll the window onto a running fleet (`distribute` replaces the binary, so the node must be
 stopped; the binary is the same build and its hash is checked again):
