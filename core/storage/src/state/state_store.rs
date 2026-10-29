@@ -53,6 +53,11 @@ pub fn legacy_hydration_view(records: Vec<StorageRecord>) -> Vec<StorageRecord> 
 /// every height `t-100..=t` after a restart.
 pub const REORG_UNDO_DEPTH: u64 = 100;
 
+/// Largest undo record kept, encoded. A bigger one is skipped (the block is
+/// left without a record): it would only shorten the window a restart can
+/// rebuild, and it keeps one oversized block from bloating every commit.
+pub const MAX_UNDO_RECORD_BYTES: usize = 8 * 1024 * 1024;
+
 /// `CF_METADATA` key prefix of the undo records (big-endian height follows).
 /// Metadata, not a column family of its own, so a binary without it still
 /// opens the database.
@@ -73,6 +78,21 @@ fn reorg_undo_height(key: &[u8]) -> Option<u64> {
 /// Whether height `h` is inside the kept window at tip height `tip`.
 fn in_undo_window(h: u64, tip: u64) -> bool {
     h <= tip && h > tip.saturating_sub(REORG_UNDO_DEPTH)
+}
+
+/// Test-only fault injection for undo-record staging, per thread.
+#[cfg(test)]
+pub(crate) mod test_undo_faults {
+    use std::cell::Cell;
+    thread_local! {
+        static FAIL: Cell<bool> = const { Cell::new(false) };
+    }
+    pub(crate) fn set_fail_staging(on: bool) {
+        FAIL.with(|c| c.set(on));
+    }
+    pub(crate) fn fail_staging() -> bool {
+        FAIL.with(|c| c.get())
+    }
 }
 
 /// State storage manager
@@ -552,6 +572,10 @@ impl StateStore {
 
     /// Delete, in `batch`, every kept record outside the window at `tip`.
     fn stage_undo_window(&self, batch: &mut rocksdb::WriteBatch, tip: u64) -> Result<()> {
+        #[cfg(test)]
+        if test_undo_faults::fail_staging() {
+            anyhow::bail!("injected undo staging failure");
+        }
         for height in self.reorg_undo_heights()? {
             if !in_undo_window(height, tip) {
                 self.db
@@ -1129,6 +1153,156 @@ mod tests {
             store.get_reorg_undo(140).unwrap().map(|r| r.hash),
             Some(block_hash(140)),
             "the shared chain's records stay"
+        );
+    }
+
+    /// Undo records are local metadata: a failure while staging one (a read,
+    /// an encode, a window scan) never fails the consensus commit. The state
+    /// and the tip commit, and the block is left without a record (a shorter
+    /// window a restart can rebuild, never a wrong one). The same for a reorg
+    /// commit carrying the winning branch's records.
+    #[test]
+    fn an_undo_staging_failure_never_fails_the_commit() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let store = StateStore::new(Arc::new(RocksDB::open(temp_dir.path()).expect("open")));
+        let a = Address([1; 20]);
+        let none = ReceiptIndexBatch::default();
+        store
+            .write_state_batch_with_applied_tip(
+                &[(a, acct(1))],
+                &[],
+                Some((block_hash(1), 1)),
+                &none,
+            )
+            .expect("block 1");
+        assert!(store.get_reorg_undo(1).expect("read").is_some(), "fixture");
+
+        test_undo_faults::set_fail_staging(true);
+        let linear = store.write_state_batch_with_applied_tip(
+            &[(a, acct(2))],
+            &[slot(a, b"k", Some(b"v"))],
+            Some((block_hash(2), 2)),
+            &none,
+        );
+        let winner = [BlockUndo {
+            height: 3,
+            hash: block_hash(3),
+            parent: Some((block_hash(2), 2)),
+            accounts: vec![(a, Some(acct(2)))],
+            storage: vec![],
+            models_jobs: Some(Default::default()),
+        }];
+        let reorg = store.write_reorg_batch_sync(
+            &[(a, acct(3))],
+            &[],
+            &[],
+            &[],
+            Some((block_hash(3), 3)),
+            &none,
+            &winner,
+        );
+        test_undo_faults::set_fail_staging(false);
+
+        assert!(
+            linear.is_ok(),
+            "a linear commit must not fail on its undo record: {linear:?}"
+        );
+        assert!(
+            reorg.is_ok(),
+            "a reorg commit must not fail on its undo records: {reorg:?}"
+        );
+        assert_eq!(store.durable_tip().expect("tip"), Some((block_hash(3), 3)));
+        assert_eq!(
+            store.get_account(&a).expect("account").map(|s| s.balance),
+            Some(U256::from(3u64))
+        );
+        assert_eq!(
+            store.get_storage(&a, b"k").expect("slot"),
+            Some(b"v".to_vec())
+        );
+        assert!(
+            store.get_reorg_undo(2).expect("read").is_none(),
+            "no record for the linear block"
+        );
+        assert!(
+            store.get_reorg_undo(3).expect("read").is_none(),
+            "no record for the reorg block"
+        );
+        assert!(
+            store.get_reorg_undo(1).expect("read").is_some(),
+            "records already kept stay"
+        );
+    }
+
+    /// An undo record larger than the cap is not kept (a warning, no record
+    /// at that height); the commit itself goes through. Linear and reorg alike.
+    #[test]
+    fn an_oversized_undo_record_is_skipped() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let store = StateStore::new(Arc::new(RocksDB::open(temp_dir.path()).expect("open")));
+        let a = Address([1; 20]);
+        let none = ReceiptIndexBatch::default();
+        let big = vec![0xAB; MAX_UNDO_RECORD_BYTES + 1];
+        store
+            .write_state_batch_with_applied_tip(
+                &[(a, acct(1))],
+                &[slot(a, b"big", Some(&big))],
+                Some((block_hash(1), 1)),
+                &none,
+            )
+            .expect("block 1");
+        // Block 2 overwrites the big slot: its pre-image is over the cap.
+        store
+            .write_state_batch_with_applied_tip(
+                &[(a, acct(2))],
+                &[slot(a, b"big", Some(b"small"))],
+                Some((block_hash(2), 2)),
+                &none,
+            )
+            .expect("block 2 commits");
+        assert_eq!(store.durable_tip().expect("tip"), Some((block_hash(2), 2)));
+        assert!(
+            store.get_reorg_undo(2).expect("read").is_none(),
+            "an oversized record is not kept"
+        );
+        assert!(store.get_reorg_undo(1).expect("read").is_some());
+        // A reorg's winning record over the cap is skipped; the others are kept.
+        let records = [
+            BlockUndo {
+                height: 3,
+                hash: block_hash(3),
+                parent: Some((block_hash(2), 2)),
+                accounts: vec![(a, Some(acct(2)))],
+                storage: vec![(a, b"big".to_vec(), Some(big.clone()))],
+                models_jobs: Some(Default::default()),
+            },
+            BlockUndo {
+                height: 4,
+                hash: block_hash(4),
+                parent: Some((block_hash(3), 3)),
+                accounts: vec![(a, Some(acct(3)))],
+                storage: vec![],
+                models_jobs: Some(Default::default()),
+            },
+        ];
+        store
+            .write_reorg_batch_sync(
+                &[(a, acct(4))],
+                &[],
+                &[],
+                &[],
+                Some((block_hash(4), 4)),
+                &none,
+                &records,
+            )
+            .expect("reorg commits");
+        assert!(
+            store.get_reorg_undo(3).expect("read").is_none(),
+            "an oversized winning record is not kept"
+        );
+        assert_eq!(
+            store.get_reorg_undo(4).expect("read").map(|r| r.hash),
+            Some(block_hash(4))
         );
     }
 
