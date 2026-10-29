@@ -36,10 +36,17 @@ impl DropLog {
 
     /// One drop at `now`. `Some(n)`: write a line now; `n` drops were not
     /// logged since the previous line. `None`: counted, not logged.
-    pub fn admit(&mut self, _now: Instant) -> Option<u64> {
-        // Red stub: the old behaviour (no drop warning at all).
-        let _ = (self.window, self.last_line, self.suppressed);
-        None
+    pub fn admit(&mut self, now: Instant) -> Option<u64> {
+        let due = self
+            .last_line
+            .is_none_or(|t| now.saturating_duration_since(t) >= self.window);
+        if due {
+            self.last_line = Some(now);
+            Some(std::mem::take(&mut self.suppressed))
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+            None
+        }
     }
 }
 
@@ -62,16 +69,32 @@ impl Default for InboundDrops {
 impl InboundDrops {
     /// Count one shed message of type `kind` from `peer` and, at most once per
     /// [`DROP_LOG_WINDOW`], warn. Returns whether a line was written.
-    pub fn record(&self, _kind: &'static str, _peer: &PeerId, now: Instant) -> bool {
-        // Red stub: the old behaviour (drops neither counted by type nor logged).
-        let _ = self.log.lock().admit(now);
-        false
+    pub fn record(&self, kind: &'static str, peer: &PeerId, now: Instant) -> bool {
+        {
+            let mut n = self.by_kind.entry(kind).or_insert(0);
+            *n = n.saturating_add(1);
+        }
+        let Some(suppressed) = self.log.lock().admit(now) else {
+            return false;
+        };
+        warn!(
+            "inbound queue full, message dropped: type={} peer={} \
+             ({} more dropped since the last report; totals: {})",
+            kind,
+            peer.0.get(..14).unwrap_or(&peer.0),
+            suppressed,
+            self.summary()
+        );
+        true
     }
 
     /// Every counter as `(message type, drops)`, sorted by type.
     pub fn by_kind(&self) -> Vec<(&'static str, u64)> {
-        let mut rows: Vec<(&'static str, u64)> =
-            self.by_kind.iter().map(|e| (*e.key(), *e.value())).collect();
+        let mut rows: Vec<(&'static str, u64)> = self
+            .by_kind
+            .iter()
+            .map(|e| (*e.key(), *e.value()))
+            .collect();
         rows.sort_unstable();
         rows
     }
