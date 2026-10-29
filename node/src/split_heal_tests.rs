@@ -162,10 +162,13 @@ struct Node {
     dir: TempDir,
 }
 
+/// A node's handle on a peer, and the queue of what it sent that peer.
+type PeerLink = (Arc<Peer>, mpsc::Receiver<NetworkMessage>);
+
 pub(crate) struct Fleet {
     nodes: Vec<Node>,
     /// peers[i][j]: node i's handle on node j, and the queue of what i sent j.
-    peers: Vec<Vec<Option<(Arc<Peer>, mpsc::Receiver<NetworkMessage>)>>>,
+    peers: Vec<Vec<Option<PeerLink>>>,
     /// links[i][j]: messages from i reach j.
     links: Vec<Vec<bool>>,
     /// Nodes not running.
@@ -220,6 +223,7 @@ fn policy(n: usize) -> citrate_execution::block_rewards::EpochRewardPolicy {
 impl Node {
     /// A node process as `start_node` wires one, on `storage` (fresh, or the
     /// store of a stopped process with its hydrated state `boot`).
+    #[allow(clippy::too_many_arguments)]
     async fn start(
         i: usize,
         n: usize,
