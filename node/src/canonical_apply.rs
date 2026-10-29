@@ -76,7 +76,7 @@ use tracing::{debug, info, warn};
 /// NOT bound the FORWARD reapply length — a shallow fork point beneath a long
 /// winning branch (the drain lagged the fork-choice tip) is cheap to revert and
 /// must reorg, not wedge. See `MAX_REORG_FORWARD` and `reorg_to`.
-const MAX_REORG_DEPTH: u64 = 100;
+pub(crate) const MAX_REORG_DEPTH: u64 = 100;
 
 /// Memory guard on a single in-memory reorg's FORWARD reapply: the winning branch
 /// (fork point → new tip) is collected into a `Vec<Block>` and re-executed under

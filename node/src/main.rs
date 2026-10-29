@@ -3478,8 +3478,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             let mut orphan_blocks: Vec<citrate_consensus::types::Block> = Vec::new();
             // sync_rejoin.rs: bound on SYNCREJOIN info lines.
             let mut rejoin_log = sync_rejoin::RejoinLogBudget::new();
-            // sync_recovery.rs: missing-parent walk (bounded per orphan episode).
-            let mut parent_walk = sync_recovery::ParentWalk::new();
+            // sync_recovery.rs: missing-parent walks, one per peer, each with a
+            // budget that refills, under a node-wide budget and in-flight cap.
+            let mut parent_walks = sync_recovery::ParentWalks::new(std::time::Instant::now());
             while let Some((pid, msg)) = in_rx.recv().await {
                 // #149 liveness heartbeat. Bumped BEFORE the message is handled,
                 // so a loop that is stuck inside a handler stops advancing this
@@ -3808,23 +3809,65 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                                 block.header.height.saturating_sub(applied_now),
                                                 applied_now
                                             );
-                                            } else if let Some(peer) = pm_for_rx.get_peer(&pid) {
-                                                if let Err(e) = sync_for_rx
-                                                    .request_blocks(
-                                                        &peer,
-                                                        missing_parent,
-                                                        // The selected parent sits exactly one
-                                                        // height below the block that deferred.
-                                                        block.header.height.saturating_sub(1),
-                                                    )
-                                                    .await
-                                                {
-                                                    tracing::debug!(
-                                                    "SYNC-S3: ancestry request to {} for {} failed: {}",
-                                                    pid,
-                                                    hex::encode(&missing_parent.as_bytes()[..8]),
-                                                    e
+                                            } else {
+                                                // Starts (or resumes) this peer's missing-parent
+                                                // walk, within its budget (sync_recovery.rs).
+                                                let now = std::time::Instant::now();
+                                                let step = parent_walks.begin(
+                                                    &pid.0,
+                                                    missing_parent,
+                                                    // The selected parent sits exactly one
+                                                    // height below the block that deferred.
+                                                    block.header.height.saturating_sub(1),
+                                                    applied_now,
+                                                    now,
                                                 );
+                                                sync_recovery::send_step(
+                                                    &mut parent_walks,
+                                                    &pm_for_rx,
+                                                    &sync_for_rx,
+                                                    &pid.0,
+                                                    step,
+                                                    applied_now,
+                                                )
+                                                .await;
+                                                // Stuck parents get a fetch by their own hash.
+                                                let (refetch, gave_up) = parent_walks
+                                                    .refetch_stuck(
+                                                        |p| {
+                                                            storage_for_handler
+                                                                .blocks
+                                                                .has_block(p)
+                                                                .unwrap_or(false)
+                                                        },
+                                                        applied_now,
+                                                        now,
+                                                    );
+                                                for r in refetch {
+                                                    let step = sync_recovery::Step::Ask {
+                                                        parent: r.parent,
+                                                        height: r.height,
+                                                    };
+                                                    sync_recovery::send_step(
+                                                        &mut parent_walks,
+                                                        &pm_for_rx,
+                                                        &sync_for_rx,
+                                                        &r.peer,
+                                                        step,
+                                                        applied_now,
+                                                    )
+                                                    .await;
+                                                }
+                                                for (peer, step) in gave_up {
+                                                    sync_recovery::send_step(
+                                                        &mut parent_walks,
+                                                        &pm_for_rx,
+                                                        &sync_for_rx,
+                                                        &peer,
+                                                        step,
+                                                        applied_now,
+                                                    )
+                                                    .await;
                                                 }
                                             }
                                         }
@@ -3953,14 +3996,26 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             .filter(|b| verified_hashes.contains(&b.header.block_hash))
                             .count();
                         // sync_recovery.rs: the lowest block of THIS answer still
-                        // deferred, and the parent it lacks (the walk's next step).
+                        // deferred, followed down the buffered orphans, and the
+                        // parent it lacks (the walk's next step).
                         let lowest_deferred = {
                             let from_answer: Vec<&citrate_consensus::types::Block> = fixpoint
                                 .deferred
                                 .iter()
                                 .filter(|b| verified_hashes.contains(&b.header.block_hash))
                                 .collect();
-                            sync_recovery::lowest_deferred(&storage_for_handler, &from_answer)
+                            sync_recovery::lowest_deferred(
+                                &storage_for_handler,
+                                &from_answer,
+                                &fixpoint.deferred,
+                            )
+                        };
+                        // The missing parents at the bottom of the orphan buffer
+                        // (counted per re-deferral; a repeated one is fetched by hash).
+                        let stuck_roots = if reprocessed_orphans {
+                            sync_recovery::deferred_roots(&storage_for_handler, &fixpoint.deferred)
+                        } else {
+                            Vec::new()
                         };
                         let mut pending = fixpoint.deferred;
                         // Buffer unresolved orphans for the next Blocks batch (their
@@ -4023,29 +4078,60 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                 applied_now,
                                 answer_hashes.len(),
                             );
-                            // Missing-parent recovery continues by hash, one height
-                            // per answer, within the walk budget (sync_recovery.rs).
-                            if let Some((parent, parent_height)) =
-                                parent_walk.next(lowest_deferred, !orphan_blocks.is_empty())
+                            // Missing-parent recovery continues by hash, within this
+                            // peer's walk budget (sync_recovery.rs).
                             {
-                                let sent = match pm_for_rx.get_peer(&pid) {
-                                    Some(peer) => sync_for_rx
-                                        .request_blocks(&peer, parent, parent_height)
-                                        .await
-                                        .unwrap_or_else(|e| {
-                                            tracing::debug!(
-                                                "missing-parent request to {} for {} failed: {}",
-                                                pid,
-                                                hex::encode(&parent.as_bytes()[..8]),
-                                                e
-                                            );
-                                            false
-                                        }),
-                                    None => false,
-                                };
-                                // Only a request that went on the wire spends a step.
-                                if !sent {
-                                    parent_walk.unsent();
+                                let now = std::time::Instant::now();
+                                let step = parent_walks.next(
+                                    &pid.0,
+                                    sync_recovery::WalkAnswer {
+                                        lowest_deferred,
+                                        admitted: newly_admitted,
+                                        orphans_remaining: !orphan_blocks.is_empty(),
+                                        applied: applied_now,
+                                    },
+                                    now,
+                                );
+                                sync_recovery::send_step(
+                                    &mut parent_walks,
+                                    &pm_for_rx,
+                                    &sync_for_rx,
+                                    &pid.0,
+                                    step,
+                                    applied_now,
+                                )
+                                .await;
+                                parent_walks.note_stuck(&stuck_roots, &pid.0, now);
+                                let (refetch, gave_up) = parent_walks.refetch_stuck(
+                                    |p| storage_for_handler.blocks.has_block(p).unwrap_or(false),
+                                    applied_now,
+                                    now,
+                                );
+                                for r in refetch {
+                                    let step = sync_recovery::Step::Ask {
+                                        parent: r.parent,
+                                        height: r.height,
+                                    };
+                                    sync_recovery::send_step(
+                                        &mut parent_walks,
+                                        &pm_for_rx,
+                                        &sync_for_rx,
+                                        &r.peer,
+                                        step,
+                                        applied_now,
+                                    )
+                                    .await;
+                                }
+                                for (peer, step) in gave_up {
+                                    sync_recovery::send_step(
+                                        &mut parent_walks,
+                                        &pm_for_rx,
+                                        &sync_for_rx,
+                                        &peer,
+                                        step,
+                                        applied_now,
+                                    )
+                                    .await;
                                 }
                             }
                             // sync_rejoin.rs: steer the next anchor on this answer.
