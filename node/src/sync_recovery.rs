@@ -58,9 +58,17 @@ use std::time::{Duration, Instant};
 use citrate_consensus::types::{Block, Hash};
 use citrate_storage::StorageManager;
 
-/// Steps one peer's walk budget holds. Each recovers one height; a full budget
-/// covers the whole reorg window ([`MAX_WALK_DEPTH`]) with room for repeats.
-pub const MAX_PARENT_WALK_STEPS: u32 = 128;
+/// Steps one peer's walk budget holds. Each recovers one height. Derived, not
+/// picked: gossip ancestry recovery starts from a block at most
+/// [`crate::sync_peer::ANCESTRY_RECOVERY_WINDOW`] above the applied tip, and a
+/// walk goes at most [`MAX_WALK_DEPTH`] below it, so one full budget walks a
+/// branch that forked inside the reorg window while the network moved on as far
+/// as recovery reaches. With 128, a node forked 35 below its tip and ~250
+/// behind (DGX devnet phase 3) never reconnected
+/// (`split_heal_tests::four_three_partition_far_behind_heals`). Steps go only
+/// to the peer whose answer asked for them, one per answer.
+pub const MAX_PARENT_WALK_STEPS: u32 =
+    (crate::sync_peer::ANCESTRY_RECOVERY_WINDOW + MAX_WALK_DEPTH) as u32;
 
 /// One step comes back to a peer's spent budget per this interval (one 2 s sync
 /// tick).
@@ -79,8 +87,8 @@ pub const WALK_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_WALKS_IN_FLIGHT: usize = 8;
 
 /// Node-wide step budget, shared by every peer (bounds peers that reconnect
-/// under new identities to get a fresh per-peer budget).
-pub const NODE_WALK_BURST: u32 = 512;
+/// under new identities to get a fresh per-peer budget): two peer budgets.
+pub const NODE_WALK_BURST: u32 = MAX_PARENT_WALK_STEPS * 2;
 
 /// One step comes back to the node-wide budget per this interval.
 pub const NODE_WALK_REFILL_EVERY: Duration = Duration::from_millis(250);

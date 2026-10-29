@@ -91,25 +91,51 @@ fn short(h: &Hash) -> String {
 }
 
 /// What the run looks like.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Scenario {
     pub producers: usize,
     /// Slots before the partition (everyone connected).
     pub warmup: u64,
-    /// Slots of the partition into singletons (one slot = one 2 s tick).
-    pub partition: u64,
-    /// Slots allowed after the heal for the fleet to agree.
-    pub heal_rounds: u64,
     /// Before the partition, one gossip block per producer reaches nobody, and
     /// one `Blocks` answer carries a block whose parent no peer will ever serve:
     /// the state of a node that has been running for a while (its orphan
     /// buffer is never empty again).
     pub long_running: bool,
+    /// The partition: groups that still reach each other (empty: singletons).
+    pub groups: Vec<Vec<usize>>,
+    /// Slots of the partition (one slot = one 2 s tick).
+    pub partition: u64,
+    /// Every producer restarts at the end of the partition.
+    pub restart_all: bool,
+    /// After the restart, only this producer comes up, for this many slots;
+    /// the others then start (fresh processes) and every link is up.
+    pub solo: Option<(usize, u64)>,
+    /// After the heal, the producer with the lowest tip seals nothing (its seal
+    /// gate holds it, or its gossip is shed), so nothing it sends announces its
+    /// branch and no peer ever sees it ahead.
+    pub quiet_after_heal: bool,
+    /// The heal is a reconnect: the transport handshake gives each side the
+    /// other's head, as `transport.rs` does on connect.
+    pub reconnect: bool,
+    /// Slots allowed after the heal.
+    pub heal_rounds: u64,
+    /// Every producer's partition blocks must end up in the agreed past.
+    pub require_merged: bool,
+    /// Every producer must be sealing again (a block in the last
+    /// [`PRODUCING_WINDOW`] slots).
+    pub require_producing: bool,
 }
+
+/// See [`Scenario::require_producing`].
+const PRODUCING_WINDOW: u64 = 3;
+
+/// One slot of simulated time.
+const SLOT: std::time::Duration = std::time::Duration::from_secs(2);
 
 struct Node {
     name: String,
     storage: Arc<StorageManager>,
+    executor: Arc<Executor>,
     app: Arc<CanonicalApplicator>,
     adm: Arc<BlockAdmission>,
     producer: BlockProducer,
@@ -117,22 +143,39 @@ struct Node {
     rejoin: parking_lot::Mutex<sync_rejoin::RejoinTracker>,
     sel: sync_peer::SyncPeerSelector,
     walk: sync_recovery::ParentWalks,
+    /// This process's peer table (the walk sends through it).
+    pm: Arc<citrate_network::PeerManager>,
     orphans: Vec<Block>,
     attested: AttestedNetworkHead,
     max_seen: AtomicU64,
-    /// This node's handle on each remote (None for itself), with the queue of
-    /// messages it sent that way.
-    peers: Vec<Option<(Arc<Peer>, mpsc::Receiver<NetworkMessage>)>>,
+    /// The producer's initial-sync gate (`with_initial_sync_gate`).
+    initial_sync: Arc<std::sync::atomic::AtomicBool>,
+    /// Slot this process started at (the tick's `node_started_at`).
+    started_slot: u64,
+    /// Simulated monotonic time (one slot = [`SLOT`]), for every clock the
+    /// recovery and pull paths read.
+    clock: std::time::Instant,
     rotate_idx: u64,
-    diverge_idx: u64,
-    _dir: TempDir,
+    split_gate: sync_peer::SplitPullGate,
+    /// Blocks this process has relayed (the gossip seen-cache).
+    relayed: HashSet<Hash>,
+    dir: TempDir,
 }
 
 pub(crate) struct Fleet {
     nodes: Vec<Node>,
+    /// peers[i][j]: node i's handle on node j, and the queue of what i sent j.
+    peers: Vec<Vec<Option<(Arc<Peer>, mpsc::Receiver<NetworkMessage>)>>>,
     /// links[i][j]: messages from i reach j.
     links: Vec<Vec<bool>>,
+    /// Nodes not running.
+    down: HashSet<usize>,
+    /// Producers that seal nothing.
+    quiet: HashSet<usize>,
     genesis: Block,
+    /// Simulated time, in slots, from `epoch`.
+    epoch: std::time::Instant,
+    slot_no: u64,
     /// Messages lost on down links (diagnostics).
     pub lost: usize,
 }
@@ -174,143 +217,185 @@ fn policy(n: usize) -> citrate_execution::block_rewards::EpochRewardPolicy {
     }
 }
 
+impl Node {
+    /// A node process as `start_node` wires one, on `storage` (fresh, or the
+    /// store of a stopped process with its hydrated state `boot`).
+    async fn start(
+        i: usize,
+        n: usize,
+        genesis: &Block,
+        storage: Arc<StorageManager>,
+        dir: TempDir,
+        boot: Option<citrate_execution::state::StateSnapshot>,
+        slot_no: u64,
+        clock: std::time::Instant,
+    ) -> Self {
+        if boot.is_none() {
+            storage.blocks.put_block(genesis).expect("genesis");
+            storage
+                .blocks
+                .put_applied_tip(&genesis.header.block_hash, 0)
+                .expect("genesis tip");
+        }
+        let executor = Arc::new(Executor::with_storage_and_chain_id(
+            Arc::new(StateDB::new()),
+            Some(storage.state.clone()),
+            CHAIN_ID,
+        ));
+        if let Some(state) = boot {
+            executor.state_restore(state);
+        }
+        executor.set_validator_activation_height(ACT);
+        *executor.reward_policy_handle().write() = Some(policy(n));
+        // The production selector over the producers' stake, strict VRF, and
+        // the activation height on a persistent DAG store.
+        let selector = Arc::new(VrfProposerSelector::production());
+        selector
+            .sync_active_set(
+                (0..n)
+                    .map(|j| (PublicKey::new(proposer(j)), STAKE))
+                    .collect(),
+                MIN_STAKE,
+            )
+            .await;
+        let kv = Arc::new(crate::persistent_dag::RocksDbKvStore::new(
+            storage.db.clone(),
+        ));
+        let dag = Arc::new(
+            DagStore::persistent_with_strict_vrf(kv, true)
+                .expect("dag load")
+                .with_proposer_selector(selector)
+                .with_enforcement_activation_height(ACT),
+        );
+        dag.set_configured_genesis(genesis.header.block_hash);
+        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+        let app = Arc::new(
+            CanonicalApplicator::new(executor.clone(), storage.clone())
+                .with_fork_choice(ghostdag.clone())
+                .with_dag_prune_floor(dag.clone()),
+        );
+        app.set_genesis(
+            Executor::new(Arc::new(StateDB::new())).state_snapshot(),
+            genesis.header.block_hash,
+        );
+        let adm = Arc::new(BlockAdmission::new(
+            storage.clone(),
+            dag.clone(),
+            ghostdag.clone(),
+            Some(app.clone()),
+        ));
+        adm.seed_genesis().await;
+        let _ = adm.reconcile().await;
+        ghostdag.reconcile_tips_from_dag_store().await;
+        let mempool = Arc::new(Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        }));
+        let attested = AttestedNetworkHead::new();
+        let initial_sync = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let producer = BlockProducer::with_shared_dag(
+            storage.clone(),
+            executor.clone(),
+            mempool,
+            None,
+            embedded(coinbase(i)),
+            key(i),
+            2,
+            Arc::new(citrate_economics::UnifiedEconomicsManager::new(
+                citrate_economics::UnifiedEconomicsConfig::default(),
+            )),
+            dag,
+            ghostdag,
+        )
+        .await
+        .with_v2_headers(true)
+        .with_applied_tip_lock(app.advance_lock())
+        .with_equivocation_vote_config(EquivocationVoteConfig {
+            chain_id: CHAIN_ID,
+            registry: REG,
+            activation_height: ACT,
+        })
+        .with_produce_catchup_gate(&app)
+        .with_network_height_gate(&attested)
+        .with_initial_sync_gate(initial_sync.clone());
+        let sync =
+            SyncManager::new(SyncConfig::default()).with_local_height(app.applied_height_handle());
+        Self {
+            name: format!("p{i}"),
+            storage,
+            executor,
+            app,
+            adm,
+            producer,
+            sync,
+            rejoin: parking_lot::Mutex::new(sync_rejoin::RejoinTracker::new()),
+            sel: sync_peer::SyncPeerSelector::new(),
+            walk: sync_recovery::ParentWalks::new(clock),
+            pm: Arc::new(citrate_network::PeerManager::new(
+                citrate_network::PeerManagerConfig::default(),
+            )),
+            orphans: Vec::new(),
+            attested,
+            max_seen: AtomicU64::new(0),
+            initial_sync,
+            started_slot: slot_no,
+            clock,
+            rotate_idx: 0,
+            split_gate: sync_peer::SplitPullGate::new(),
+            relayed: HashSet::new(),
+            dir,
+        }
+    }
+}
+
 impl Fleet {
     pub(crate) async fn new(n: usize) -> Self {
         let empty_root = Executor::new(Arc::new(StateDB::new())).calculate_state_root();
         let genesis = genesis_block(empty_root);
+        let epoch = std::time::Instant::now();
         let mut nodes = Vec::new();
         for i in 0..n {
             let dir = TempDir::new().expect("tempdir");
             let storage = Arc::new(
                 StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
             );
-            let executor = Arc::new(Executor::with_storage_and_chain_id(
-                Arc::new(StateDB::new()),
-                Some(storage.state.clone()),
-                CHAIN_ID,
-            ));
-            executor.set_validator_activation_height(ACT);
-            *executor.reward_policy_handle().write() = Some(policy(n));
-            // As start_node: the production selector, the activation height on
-            // the DAG store, strict VRF.
-            let selector = Arc::new(VrfProposerSelector::production());
-            selector
-                .sync_active_set(
-                    (0..n)
-                        .map(|j| (PublicKey::new(proposer(j)), STAKE))
-                        .collect(),
-                    MIN_STAKE,
-                )
-                .await;
-            let dag = Arc::new(
-                DagStore::with_strict_vrf(true)
-                    .with_proposer_selector(selector)
-                    .with_enforcement_activation_height(ACT),
-            );
-            let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
-            storage.blocks.put_block(&genesis).expect("genesis");
-            storage
-                .blocks
-                .put_applied_tip(&genesis.header.block_hash, 0)
-                .expect("genesis tip");
-            dag.set_configured_genesis(genesis.header.block_hash);
-            dag.store_block(genesis.clone()).await.expect("genesis dag");
-            ghostdag
-                .add_block(&genesis)
-                .await
-                .expect("genesis ghostdag");
-            let app = Arc::new(
-                CanonicalApplicator::new(executor.clone(), storage.clone())
-                    .with_fork_choice(ghostdag.clone()),
-            );
-            app.set_genesis(
-                Executor::new(Arc::new(StateDB::new())).state_snapshot(),
-                genesis.header.block_hash,
-            );
-            ghostdag.reconcile_tips_from_dag_store().await;
-            let adm = Arc::new(BlockAdmission::new(
-                storage.clone(),
-                dag.clone(),
-                ghostdag.clone(),
-                Some(app.clone()),
-            ));
-            let mempool = Arc::new(Mempool::new(MempoolConfig {
-                require_valid_signature: false,
-                ..Default::default()
-            }));
-            let attested = AttestedNetworkHead::new();
-            let producer = BlockProducer::with_shared_dag(
-                storage.clone(),
-                executor,
-                mempool,
-                None,
-                embedded(coinbase(i)),
-                key(i),
-                2,
-                Arc::new(citrate_economics::UnifiedEconomicsManager::new(
-                    citrate_economics::UnifiedEconomicsConfig::default(),
-                )),
-                dag,
-                ghostdag,
-            )
-            .await
-            .with_v2_headers(true)
-            .with_applied_tip_lock(app.advance_lock())
-            .with_equivocation_vote_config(EquivocationVoteConfig {
-                chain_id: CHAIN_ID,
-                registry: REG,
-                activation_height: ACT,
-            })
-            .with_produce_catchup_gate(&app)
-            .with_network_height_gate(&attested);
-            let sync = SyncManager::new(SyncConfig::default())
-                .with_local_height(app.applied_height_handle());
-            nodes.push(Node {
-                name: format!("p{i}"),
-                storage,
-                app,
-                adm,
-                producer,
-                sync,
-                rejoin: parking_lot::Mutex::new(sync_rejoin::RejoinTracker::new()),
-                sel: sync_peer::SyncPeerSelector::new(),
-                walk: sync_recovery::ParentWalks::new(),
-                orphans: Vec::new(),
-                attested,
-                max_seen: AtomicU64::new(0),
-                peers: Vec::new(),
-                rotate_idx: 0,
-                diverge_idx: 0,
-                _dir: dir,
-            });
+            nodes.push(Node::start(i, n, &genesis, storage, dir, None, 0, epoch).await);
         }
-        let names: Vec<String> = nodes.iter().map(|n| n.name.clone()).collect();
-        for (i, node) in nodes.iter_mut().enumerate() {
-            for (j, name) in names.iter().enumerate() {
+        let mut peers = Vec::new();
+        for i in 0..n {
+            let mut row = Vec::new();
+            for j in 0..n {
                 if i == j {
-                    node.peers.push(None);
+                    row.push(None);
                     continue;
                 }
                 let (tx, rx) = mpsc::channel(1 << 16);
                 let (_in_tx, in_rx) = mpsc::channel(1);
                 let mut info = PeerInfo::new(
-                    PeerId::new(name.clone()),
+                    PeerId::new(format!("p{j}")),
                     "127.0.0.1:1".parse().expect("addr"),
                     Direction::Outbound,
                 );
                 info.state = PeerState::Connected;
-                node.peers
-                    .push(Some((Arc::new(Peer::new(info, tx, in_rx)), rx)));
+                row.push(Some((Arc::new(Peer::new(info, tx, in_rx)), rx)));
             }
+            peers.push(row);
         }
         let mut fleet = Self {
-            links: Vec::new(),
             nodes,
+            peers,
+            links: vec![vec![false; n]; n],
+            down: HashSet::new(),
+            quiet: HashSet::new(),
             genesis,
+            epoch,
+            slot_no: 0,
             lost: 0,
         };
-        fleet.links = vec![vec![false; n]; n];
         fleet.set_links(|_, _| true);
+        for i in 0..n {
+            fleet.attach_peers(i).await;
+        }
         fleet
     }
 
@@ -323,30 +408,84 @@ impl Fleet {
         }
     }
 
-    fn index_of(&self, name: &str) -> usize {
-        self.nodes
-            .iter()
-            .position(|n| n.name == name)
-            .expect("known peer")
+    fn now(&self) -> std::time::Instant {
+        self.epoch + SLOT * u32::try_from(self.slot_no).expect("slots")
+    }
+
+    fn up(&self, i: usize, j: usize) -> bool {
+        self.links[i][j] && !self.down.contains(&i) && !self.down.contains(&j)
     }
 
     fn peer(&self, at: usize, remote: usize) -> Arc<Peer> {
-        self.nodes[at].peers[remote]
+        self.peers[at][remote]
             .as_ref()
             .map(|(p, _)| p.clone())
             .expect("peer handle")
     }
 
-    /// Everything node `i` has sent, as (from, to, message); lost on down links.
+    /// Node `i`'s peer table holds its handles on every other node.
+    async fn attach_peers(&mut self, i: usize) {
+        for j in 0..self.nodes.len() {
+            if let Some((p, _)) = self.peers[i][j].as_ref() {
+                self.nodes[i]
+                    .pm
+                    .add_peer(p.clone())
+                    .await
+                    .expect("add peer");
+            }
+        }
+    }
+
+    /// Stop node `i` and start a new process on its store. Messages in flight
+    /// to or from it are lost.
+    async fn restart(&mut self, i: usize) {
+        self.pump().await;
+        let n = self.nodes.len();
+        let old = self.nodes.remove(i);
+        let boot = old.executor.state_snapshot();
+        let Node { storage, dir, .. } = old;
+        let node = Node::start(
+            i,
+            n,
+            &self.genesis,
+            storage,
+            dir,
+            Some(boot),
+            self.slot_no,
+            self.now(),
+        )
+        .await;
+        self.nodes.insert(i, node);
+        self.attach_peers(i).await;
+    }
+
+    /// Every link reconnects: each node's view of each peer's head becomes that
+    /// peer's applied tip, as the transport handshake sets it.
+    async fn handshake(&mut self) {
+        let n = self.nodes.len();
+        for j in 0..n {
+            let (hash, height) = self.nodes[j].applied();
+            for i in (0..n).filter(|i| *i != j) {
+                let peer = self.peer(i, j);
+                let mut info = peer.info.write().await;
+                info.head_height = height;
+                info.head_hash = hash;
+            }
+        }
+    }
+
+    /// Everything sent so far, as (from, to, message); lost on down links.
     fn outbox(&mut self) -> Vec<(usize, usize, NetworkMessage)> {
         let mut out = Vec::new();
-        for i in 0..self.nodes.len() {
-            for j in 0..self.nodes.len() {
-                let Some((_, rx)) = self.nodes[i].peers[j].as_mut() else {
+        let n = self.nodes.len();
+        for i in 0..n {
+            for j in 0..n {
+                let up = self.up(i, j);
+                let Some((_, rx)) = self.peers[i][j].as_mut() else {
                     continue;
                 };
                 while let Ok(m) = rx.try_recv() {
-                    if self.links[i][j] {
+                    if up {
                         out.push((i, j, m));
                     } else {
                         self.lost += 1;
@@ -396,17 +535,43 @@ impl Fleet {
             NetworkMessage::Headers { headers } => {
                 let _ = node.sync.handle_headers(&pid, headers).await;
             }
-            NetworkMessage::NewBlock { block } => node.on_new_block(&peer, block).await,
+            NetworkMessage::NewBlock { block } => {
+                // Gossip validation relays a block once to every other peer
+                // (`GossipProtocol::handle_new_block`), before admission.
+                let hash = block.header.block_hash;
+                let relay = !node.adm.is_fully_admitted(&hash).await && node.relayed.insert(hash);
+                node.on_new_block(&peer, &pid, block.clone()).await;
+                if relay {
+                    let n = self.nodes.len();
+                    for j in (0..n).filter(|j| *j != at && *j != from) {
+                        let _ = self
+                            .peer(at, j)
+                            .send(NetworkMessage::NewBlock {
+                                block: block.clone(),
+                            })
+                            .await;
+                    }
+                }
+            }
             NetworkMessage::Blocks { blocks } => node.on_blocks(&peer, &pid, blocks).await,
             _ => {}
         }
     }
 
-    /// One slot: every producer tries to seal (random order), its block is
-    /// gossiped, then each node runs its sync tick and its drain.
+    /// One slot: every running producer tries to seal (random order), its
+    /// block is gossiped, then each running node runs its sync tick and drain.
     pub(crate) async fn slot(&mut self, order: &[usize]) -> Vec<(usize, Block)> {
+        self.slot_no += 1;
+        let now = self.now();
+        for node in &mut self.nodes {
+            node.clock = now;
+        }
+        let n = self.nodes.len();
         let mut produced = Vec::new();
         for &i in order {
+            if self.quiet.contains(&i) || self.down.contains(&i) {
+                continue;
+            }
             let Ok(h) = self.nodes[i].producer.produce_block().await else {
                 continue;
             };
@@ -416,27 +581,26 @@ impl Fleet {
                 .get_block(&h)
                 .expect("read produced")
                 .expect("produced stored");
-            for j in 0..self.nodes.len() {
-                if j != i {
-                    let _ = self
-                        .peer(i, j)
-                        .send(NetworkMessage::NewBlock { block: b.clone() })
-                        .await;
-                }
+            for j in (0..n).filter(|j| *j != i) {
+                let _ = self
+                    .peer(i, j)
+                    .send(NetworkMessage::NewBlock { block: b.clone() })
+                    .await;
             }
             produced.push((i, b));
             self.pump().await;
         }
-        for i in 0..self.nodes.len() {
-            let linked: Vec<usize> = (0..self.nodes.len())
-                .filter(|&j| self.links[i][j] && self.links[j][i])
-                .collect();
+        let running: Vec<usize> = (0..n).filter(|i| !self.down.contains(i)).collect();
+        for i in running.iter().copied() {
+            let linked: Vec<usize> = (0..n).filter(|&j| self.up(i, j) && self.up(j, i)).collect();
             let peers: Vec<Arc<Peer>> = linked.iter().map(|&j| self.peer(i, j)).collect();
-            self.nodes[i].tick(&peers).await;
+            let since =
+                SLOT * u32::try_from(self.slot_no - self.nodes[i].started_slot).expect("slots");
+            self.nodes[i].tick(&peers, since).await;
             self.pump().await;
         }
-        for n in &self.nodes {
-            n.app.drive_drain().await;
+        for i in running {
+            self.nodes[i].app.drive_drain().await;
         }
         produced
     }
@@ -463,31 +627,23 @@ impl Fleet {
     }
 
     /// Every block in the past of node `i`'s applied tip (selected and merge
-    /// parents), as proposer index -> count.
-    pub(crate) async fn past_by_producer(&self, i: usize) -> HashMap<usize, usize> {
+    /// parents).
+    pub(crate) async fn past(&self, i: usize) -> HashSet<Hash> {
         let n = &self.nodes[i];
-        let by_cb: HashMap<[u8; 20], usize> =
-            (0..self.nodes.len()).map(|j| (coinbase(j), j)).collect();
         let mut seen: HashSet<Hash> = HashSet::new();
         let mut stack = vec![n.app.applied_tip().await.hash];
-        let mut out: HashMap<usize, usize> = HashMap::new();
         while let Some(h) = stack.pop() {
-            if !seen.insert(h) {
+            if seen.contains(&h) {
                 continue;
             }
             let Some(b) = n.storage.blocks.get_block(&h).expect("read") else {
                 continue;
             };
-            if b.header.height == 0 {
-                continue;
-            }
-            if let Some(&j) = by_cb.get(&b.header.coinbase) {
-                *out.entry(j).or_default() += 1;
-            }
+            seen.insert(h);
             stack.push(b.header.selected_parent_hash);
             stack.extend(b.header.merge_parent_hashes.iter().copied());
         }
-        out
+        seen
     }
 
     /// Whether all nodes' selected chains agree at `height`.
@@ -514,12 +670,14 @@ impl Fleet {
         for n in &self.nodes {
             let t = n.app.applied_tip().await;
             s.push_str(&format!(
-                "{}: applied {}@{} orphans={} stored_tip={:?}; ",
+                "{}: applied {}@{} orphans={} stored_tip={:?} initial_sync={} rejoin={:?}; ",
                 n.name,
                 short(&t.hash),
                 t.height,
                 n.orphans.len(),
-                n.storage.blocks.get_latest_height().ok()
+                n.storage.blocks.get_latest_height().ok(),
+                n.initial_sync.load(Ordering::Relaxed),
+                n.rejoin.lock().mode(),
             ));
         }
         s
@@ -538,7 +696,7 @@ impl Node {
 
     /// main.rs `NetworkMessage::NewBlock` arm (gossip validation and relay
     /// aside: the harness is a full mesh and its blocks are honest).
-    async fn on_new_block(&mut self, peer: &Arc<Peer>, block: Block) {
+    async fn on_new_block(&mut self, peer: &Arc<Peer>, pid: &PeerId, block: Block) {
         {
             let mut info = peer.info.write().await;
             if block.header.height > info.head_height {
@@ -564,11 +722,26 @@ impl Node {
                     applied_now,
                 );
                 if sync_peer::should_attempt_ancestry_recovery(block.header.height, applied_now) {
-                    let _ = self
-                        .sync
-                        .request_blocks(peer, missing_parent, block.header.height.saturating_sub(1))
-                        .await;
+                    let now = self.clock;
+                    let step = self.walk.begin(
+                        &pid.0,
+                        missing_parent,
+                        block.header.height.saturating_sub(1),
+                        applied_now,
+                        now,
+                    );
+                    sync_recovery::send_step(
+                        &mut self.walk,
+                        &self.pm,
+                        &self.sync,
+                        &pid.0,
+                        step,
+                        applied_now,
+                    )
+                    .await;
+                    self.refetch(applied_now, now).await;
                 }
+                let _ = peer;
             }
             AdmitOutcome::Rejected(why) => {
                 panic!(
@@ -578,6 +751,43 @@ impl Node {
                     block.header.height
                 );
             }
+        }
+    }
+
+    /// main.rs: stuck parents get a fetch by their own hash, and give-ups are
+    /// carried out (both call sites run this after a walk step).
+    async fn refetch(&mut self, applied_now: u64, now: std::time::Instant) {
+        let storage = self.storage.clone();
+        let (refetch, gave_up) = self.walk.refetch_stuck(
+            |p| storage.blocks.has_block(p).unwrap_or(false),
+            applied_now,
+            now,
+        );
+        for r in refetch {
+            let step = sync_recovery::Step::Ask {
+                parent: r.parent,
+                height: r.height,
+            };
+            sync_recovery::send_step(
+                &mut self.walk,
+                &self.pm,
+                &self.sync,
+                &r.peer,
+                step,
+                applied_now,
+            )
+            .await;
+        }
+        for (peer, step) in gave_up {
+            sync_recovery::send_step(
+                &mut self.walk,
+                &self.pm,
+                &self.sync,
+                &peer,
+                step,
+                applied_now,
+            )
+            .await;
         }
     }
 
@@ -617,7 +827,12 @@ impl Node {
                 .iter()
                 .filter(|b| verified.contains(&b.header.block_hash))
                 .collect();
-            sync_recovery::lowest_deferred(&self.storage, &from_answer)
+            sync_recovery::lowest_deferred(&self.storage, &from_answer, &fx.deferred)
+        };
+        let stuck_roots = if reprocessed {
+            sync_recovery::deferred_roots(&self.storage, &fx.deferred)
+        } else {
+            Vec::new()
         };
         if reprocessed {
             self.orphans = admission::bound_orphan_buffer(fx.deferred);
@@ -630,23 +845,31 @@ impl Node {
             applied_now,
             answer_hashes.len(),
         );
-        if let Some((parent, parent_height)) = self.walk.next(
-            &pid.0,
-            lowest_deferred,
-            !self.orphans.is_empty(),
-            newly_admitted > 0,
-            applied_now,
-            std::time::Instant::now(),
-        ) {
-            let sent = self
-                .sync
-                .request_blocks(peer, parent, parent_height)
-                .await
-                .unwrap_or(false);
-            if !sent {
-                self.walk.unsent(&pid.0);
-            }
+        {
+            let now = self.clock;
+            let step = self.walk.next(
+                &pid.0,
+                sync_recovery::WalkAnswer {
+                    lowest_deferred,
+                    admitted: newly_admitted,
+                    orphans_remaining: !self.orphans.is_empty(),
+                    applied: applied_now,
+                },
+                now,
+            );
+            sync_recovery::send_step(
+                &mut self.walk,
+                &self.pm,
+                &self.sync,
+                &pid.0,
+                step,
+                applied_now,
+            )
+            .await;
+            self.walk.note_stuck(&stuck_roots, &pid.0, now);
+            self.refetch(applied_now, now).await;
         }
+        let _ = peer;
         let mut gave_up = false;
         if let Some(anchor_height) = answers_rejoin {
             let answer = sync_rejoin::classify(
@@ -671,11 +894,12 @@ impl Node {
         }
     }
 
-    /// main.rs periodic sync tick, over the peers this node is connected to.
-    async fn tick(&mut self, connected: &[Arc<Peer>]) {
+    /// main.rs periodic sync tick, over the peers this node is connected to;
+    /// `since_start` is how long this process has run.
+    async fn tick(&mut self, connected: &[Arc<Peer>], since_start: std::time::Duration) {
         let mut best_h = 0u64;
         let mut candidates = Vec::new();
-        let mut heads = Vec::new();
+        let mut split = Vec::new();
         for p in connected {
             let info = p.info.read().await;
             best_h = best_h.max(info.head_height);
@@ -683,14 +907,10 @@ impl Node {
                 id: info.id.0.clone(),
                 head_height: info.head_height,
             });
-            heads.push(sync_peer::HeadView {
+            split.push(sync_peer::SplitCandidate {
+                id: info.id.0.clone(),
                 head_height: info.head_height,
-                head_held: info.head_hash == Hash::default()
-                    || self
-                        .storage
-                        .blocks
-                        .has_block(&info.head_hash)
-                        .unwrap_or(false),
+                head_hash: info.head_hash,
             });
         }
         let seen = self.max_seen.load(Ordering::Relaxed);
@@ -702,11 +922,27 @@ impl Node {
         if target > 0 {
             self.sync.set_target(target).await;
         }
-        let chosen = self
-            .sel
-            .select(&candidates, applied_height)
-            .map(|c| c.id.clone());
-        let mut diverged = false;
+        if !self.initial_sync.load(Ordering::Relaxed)
+            && sync_recovery::initial_sync_complete(
+                applied_height,
+                target,
+                connected.len(),
+                since_start,
+            )
+        {
+            self.initial_sync.store(true, Ordering::Relaxed);
+        }
+        let (source, _transition) = sync_rejoin::choose_source(
+            &mut self.rejoin.lock(),
+            &self.sel,
+            &mut self.split_gate,
+            &candidates,
+            &split,
+            applied_tip,
+            |h| self.storage.blocks.has_block(h).unwrap_or(true),
+            self.clock,
+        );
+        let chosen = source.peer().map(str::to_string);
         let request_peer = if let Some(id) = chosen {
             connected
                 .iter()
@@ -717,17 +953,11 @@ impl Node {
             let i = (self.rotate_idx as usize) % connected.len();
             self.rotate_idx = self.rotate_idx.wrapping_add(1);
             connected.get(i).cloned()
-        } else if let Some(i) =
-            sync_peer::diverged_source(&heads, applied_height, &mut self.diverge_idx)
-        {
-            diverged = true;
-            connected.get(i).cloned()
         } else {
             None
         };
         if let Some(peer) = request_peer {
             self.rejoin.lock().note_sync_target(target, applied_tip.1);
-            self.rejoin.lock().note_diverged(diverged);
             let (from, height) = self.rejoin.lock().anchor(applied_tip, |h| {
                 sync_rejoin::anchor_at_height(&self.storage, h)
             });
@@ -772,19 +1002,20 @@ impl Rng {
 /// What a run ended with.
 #[derive(Debug)]
 pub(crate) struct Outcome {
-    /// Slots after the heal until the fleet agreed (None: never).
-    pub agreed_after: Option<u64>,
+    /// Slots after the heal until the run's conditions held (None: never).
+    pub healed_after: Option<u64>,
     pub detail: String,
 }
 
-/// Warm up connected, partition into singletons, heal, and count the slots
-/// until every node's selected chain agrees at a height above the partition
-/// and every producer's partition blocks are in the agreed past.
+/// Warm up connected, partition, optionally restart (and run one producer
+/// alone), heal, and count the slots until every node's selected chain agrees
+/// at a height above the split, plus the scenario's extra conditions.
 pub(crate) async fn run(s: Scenario) -> Outcome {
-    let mut fleet = Fleet::new(s.producers).await;
+    let n = s.producers;
+    let mut fleet = Fleet::new(n).await;
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     for _ in 0..s.warmup {
-        let o = rng.order(s.producers);
+        let o = rng.order(n);
         fleet.slot(&o).await;
     }
     let warm = fleet.applied_heights().await;
@@ -796,10 +1027,11 @@ pub(crate) async fn run(s: Scenario) -> Outcome {
     if s.long_running {
         long_running_history(&mut fleet).await;
     }
-    fleet.set_links(|_, _| false);
+    let group_of = |i: usize| -> Option<usize> { s.groups.iter().position(|g| g.contains(&i)) };
+    fleet.set_links(|i, j| group_of(i).is_some() && group_of(i) == group_of(j));
     let mut partition_blocks: HashMap<usize, HashSet<Hash>> = HashMap::new();
     for _ in 0..s.partition {
-        let o = rng.order(s.producers);
+        let o = rng.order(n);
         for (i, b) in fleet.slot(&o).await {
             partition_blocks
                 .entry(i)
@@ -807,11 +1039,48 @@ pub(crate) async fn run(s: Scenario) -> Outcome {
                 .insert(b.header.block_hash);
         }
     }
+    if s.restart_all {
+        for i in 0..n {
+            fleet.restart(i).await;
+        }
+    }
+    if let Some((alone, slots)) = s.solo {
+        fleet.down = (0..n).filter(|i| *i != alone).collect();
+        for _ in 0..slots {
+            let o = rng.order(n);
+            for (i, b) in fleet.slot(&o).await {
+                partition_blocks
+                    .entry(i)
+                    .or_default()
+                    .insert(b.header.block_hash);
+            }
+        }
+        // The others start now: fresh processes.
+        let others: Vec<usize> = fleet.down.drain().collect();
+        for i in others {
+            fleet.restart(i).await;
+        }
+    }
     let split_top = *fleet.applied_heights().await.iter().max().expect("nodes");
+    let split_heights = fleet.applied_heights().await;
     fleet.set_links(|_, _| true);
+    if s.reconnect || s.restart_all || s.solo.is_some() {
+        fleet.handshake().await;
+    }
+    if s.quiet_after_heal {
+        // The lowest producer goes quiet, so no peer ever sees it ahead.
+        let heights = fleet.applied_heights().await;
+        let low = (0..n)
+            .min_by_key(|i| (heights[*i], std::cmp::Reverse(*i)))
+            .expect("producers");
+        fleet.quiet.insert(low);
+    }
+    let mut last_sealed: HashMap<usize, u64> = HashMap::new();
     for round in 1..=s.heal_rounds {
-        let o = rng.order(s.producers);
-        fleet.slot(&o).await;
+        let o = rng.order(n);
+        for (i, _) in fleet.slot(&o).await {
+            last_sealed.insert(i, round);
+        }
         let heights = fleet.applied_heights().await;
         let min_h = *heights.iter().min().expect("nodes");
         if min_h < split_top + 3 {
@@ -820,32 +1089,57 @@ pub(crate) async fn run(s: Scenario) -> Outcome {
         let Some(_) = fleet.agree_at(min_h - 2).await else {
             continue;
         };
-        let past = fleet.past_by_producer(0).await;
-        let merged_all = (0..s.producers).all(|i| {
-            partition_blocks
-                .get(&i)
-                .is_none_or(|own| !own.is_empty() && past.get(&i).copied().unwrap_or(0) > 0)
-        });
-        if merged_all {
-            return Outcome {
-                agreed_after: Some(round),
-                detail: format!("pre={pre} split_top={split_top} {}", fleet.describe().await),
-            };
+        if s.require_merged {
+            let past = fleet.past(0).await;
+            let merged_all = (0..n).all(|i| {
+                partition_blocks
+                    .get(&i)
+                    .is_some_and(|own| own.iter().any(|h| past.contains(h)))
+            });
+            if !merged_all {
+                continue;
+            }
         }
+        if s.require_producing {
+            let producing = (0..n).filter(|i| !fleet.quiet.contains(i)).all(|i| {
+                last_sealed
+                    .get(&i)
+                    .is_some_and(|r| r + PRODUCING_WINDOW > round)
+            });
+            if !producing {
+                continue;
+            }
+        }
+        println!("SPLITHEAL {s:?}: healed {round} slot(s) after the heal");
+        return Outcome {
+            healed_after: Some(round),
+            detail: format!(
+                "pre={pre} split={split_heights:?} {}",
+                fleet.describe().await
+            ),
+        };
     }
     let mut detail = format!(
-        "pre={pre} split_top={split_top} lost={} {}",
+        "pre={pre} split={split_heights:?} lost={} last_sealed={last_sealed:?} {}",
         fleet.lost,
         fleet.describe().await
     );
-    for i in 0..s.producers {
+    for i in 0..n {
+        let past = fleet.past(i).await;
+        let merged: Vec<usize> = (0..n)
+            .map(|j| {
+                partition_blocks
+                    .get(&j)
+                    .map(|own| own.iter().filter(|h| past.contains(h)).count())
+                    .unwrap_or(0)
+            })
+            .collect();
         detail.push_str(&format!(
-            "past[{i}]={:?}; ",
-            fleet.past_by_producer(i).await
+            "node {i} holds partition blocks per producer {merged:?}; "
         ));
     }
     Outcome {
-        agreed_after: None,
+        healed_after: None,
         detail,
     }
 }
@@ -856,10 +1150,8 @@ pub(crate) async fn run(s: Scenario) -> Outcome {
 async fn long_running_history(fleet: &mut Fleet) {
     let n = fleet.nodes.len();
     for i in 0..n {
-        let Ok(h) = fleet.nodes[i].producer.produce_block().await else {
-            continue;
-        };
-        let _ = h; // lost: never gossiped
+        // Sealed but never gossiped.
+        let _ = fleet.nodes[i].producer.produce_block().await;
         fleet.pump().await;
         let o: Vec<usize> = (0..n).collect();
         fleet.slot(&o).await;
@@ -900,8 +1192,6 @@ async fn long_running_history(fleet: &mut Fleet) {
             "the unservable block stays in the orphan buffer"
         );
     }
-    let _ = fleet.genesis.header.height;
-    let _ = fleet.index_of("p0");
 }
 
 /// Child-process switch: the block-validity hardening is process-wide, so the
@@ -935,20 +1225,35 @@ fn in_child() -> bool {
 mod tests {
     use super::*;
 
-    fn seven_singletons() -> Scenario {
+    fn base(producers: usize) -> Scenario {
         Scenario {
-            producers: 7,
+            producers,
             warmup: ACT + 4,
-            partition: 30,
-            heal_rounds: 40,
             long_running: false,
+            groups: Vec::new(),
+            partition: 30,
+            restart_all: false,
+            solo: None,
+            quiet_after_heal: false,
+            reconnect: false,
+            heal_rounds: 40,
+            require_merged: true,
+            require_producing: true,
         }
     }
 
-    /// (a) Seven producers past activation, a 60 s partition into seven
-    /// singletons (30 slots of 2 s), then the links come back. Every node must
-    /// agree on one selected chain within 40 slots, with every producer's
-    /// partition blocks merged into its past. No operator action.
+    async fn assert_heals(name: &str, s: Scenario) {
+        let out = run(s).await;
+        assert!(
+            out.healed_after.is_some(),
+            "{name}: the fleet did not heal: {}",
+            out.detail
+        );
+    }
+
+    /// Control: seven fresh producers past activation, a 60 s partition into
+    /// seven singletons (30 slots of 2 s), then the links come back. A fresh
+    /// fleet healed before the fix too (as DGX's devnet phase 2).
     #[tokio::test(flavor = "current_thread")]
     async fn seven_producers_partitioned_into_singletons_heal() {
         if !in_child() {
@@ -956,15 +1261,13 @@ mod tests {
                 "split_heal_tests::tests::seven_producers_partitioned_into_singletons_heal",
             );
         }
-        let out = run(seven_singletons()).await;
-        assert!(
-            out.agreed_after.is_some(),
-            "seven producers did not re-merge after the partition: {}",
-            out.detail
-        );
+        assert_heals("seven fresh singletons", base(7)).await;
     }
 
-    /// Same, on nodes that have been up for a while (see `long_running`).
+    /// (a) The same on producers that have been running for a while (see
+    /// `long_running`): every node agrees on one selected chain within 40
+    /// slots, every producer's partition blocks are merged into its past, and
+    /// every producer is sealing again. No operator action.
     #[tokio::test(flavor = "current_thread")]
     async fn seven_long_running_producers_partitioned_into_singletons_heal() {
         if !in_child() {
@@ -972,54 +1275,61 @@ mod tests {
                 "split_heal_tests::tests::seven_long_running_producers_partitioned_into_singletons_heal",
             );
         }
-        let out = run(Scenario {
-            long_running: true,
-            ..seven_singletons()
-        })
+        assert_heals(
+            "seven long-running singletons",
+            Scenario {
+                long_running: true,
+                ..base(7)
+            },
+        )
         .await;
-        assert!(
-            out.agreed_after.is_some(),
-            "long-running producers did not re-merge after the partition: {}",
-            out.detail
-        );
     }
 
-    /// Tripwire: the harness mirrors main.rs's receive loop and sync tick. If
-    /// main.rs stops making one of these calls, the harness no longer tests
-    /// what the node runs.
-    #[test]
-    fn main_loop_mirrors_the_harness() {
-        let main = include_str!("main.rs");
-        for needle in [
-            // Inbound routing: serve requests leave the receive loop.
-            "serve_lane.route(",
-            // NewBlock arm.
-            "admission_for_net.admit(&block)",
-            "attested_for_rx.observe_deferred(&block)",
-            "sync_peer::should_attempt_ancestry_recovery(",
-            // Blocks arm.
-            "sync_for_rx.handle_blocks(&pid, blocks)",
-            ".take_answer(",
-            "admission::bound_orphan_buffer(",
-            ".admit_to_fixpoint(pending,",
-            "sync_recovery::lowest_deferred(",
-            "parent_walks.next(",
-            "parent_walks.unsent(&pid.0)",
-            "sync_rejoin::classify(",
-            "sel.record_serve(",
-            // Sync tick.
-            "sel.select(&candidates, applied_height)",
-            "sync_peer::diverged_source(",
-            ".note_diverged(",
-            ".note_sync_target(target, applied_tip.1)",
-            "rejoin_for_loop.lock().anchor(",
-            ".note_asked(&pid.0, (block_from, block_height))",
-        ] {
-            assert!(
-                main.contains(needle),
-                "main.rs no longer contains `{needle}`"
+    /// DGX devnet phase 3: a 4v3 partition, every producer restarted during
+    /// it, then one producer of the three running alone for about 2 minutes
+    /// before the other six start. The four end up forked below their tip and
+    /// far behind; they must rejoin and seal again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn four_three_partition_with_restarts_and_a_lone_producer_heals() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::four_three_partition_with_restarts_and_a_lone_producer_heals",
             );
         }
+        assert_heals(
+            "4v3 + restarts + lone producer",
+            Scenario {
+                groups: vec![vec![0, 1, 2, 3], vec![4, 5, 6]],
+                partition: 9,
+                restart_all: true,
+                solo: Some((4, 60)),
+                require_merged: false,
+                ..base(7)
+            },
+        )
+        .await;
+    }
+
+    /// The same with the lone producer running long enough that the four are
+    /// forked below their tip and ~250 behind (DGX's stuck devnet): the
+    /// missing-parent walk carries them back within one budget.
+    #[tokio::test(flavor = "current_thread")]
+    async fn four_three_partition_far_behind_heals() {
+        if !in_child() {
+            return run_in_child("split_heal_tests::tests::four_three_partition_far_behind_heals");
+        }
+        assert_heals(
+            "4v3 + restarts + lone producer, far behind",
+            Scenario {
+                groups: vec![vec![0, 1, 2, 3], vec![4, 5, 6]],
+                partition: 9,
+                restart_all: true,
+                solo: Some((4, 250)),
+                require_merged: false,
+                ..base(7)
+            },
+        )
+        .await;
     }
 
     /// (b) Two producers split at equal height, each with 10 blocks of its
@@ -1031,18 +1341,77 @@ mod tests {
                 "split_heal_tests::tests::two_producers_equal_height_split_converge",
             );
         }
-        let out = run(Scenario {
-            producers: 2,
-            warmup: ACT + 4,
-            partition: 10,
-            heal_rounds: 30,
-            long_running: true,
-        })
+        assert_heals(
+            "two producers",
+            Scenario {
+                long_running: true,
+                partition: 10,
+                heal_rounds: 30,
+                ..base(2)
+            },
+        )
         .await;
-        assert!(
-            out.agreed_after.is_some(),
-            "two producers did not converge: {}",
-            out.detail
-        );
+    }
+
+    /// A producer that stays quiet after a reconnect (nothing it sends
+    /// announces its branch) still has its branch fetched: the peers see a
+    /// head at their height that they do not hold and pull it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn quiet_producer_branch_is_fetched_after_reconnect() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::quiet_producer_branch_is_fetched_after_reconnect",
+            );
+        }
+        assert_heals(
+            "quiet producer",
+            Scenario {
+                long_running: true,
+                partition: 10,
+                heal_rounds: 30,
+                quiet_after_heal: true,
+                reconnect: true,
+                ..base(2)
+            },
+        )
+        .await;
+    }
+    /// Tripwire: the harness mirrors main.rs's receive loop and sync tick. If
+    /// main.rs stops making one of these calls, the harness no longer tests
+    /// what the node runs.
+    #[test]
+    fn main_loop_mirrors_the_harness() {
+        let main = include_str!("main.rs");
+        for needle in [
+            // NewBlock arm.
+            "gossip_for_rx.handle_new_block(block.clone(), &pid)",
+            "admission_for_net.admit(&block)",
+            "attested_for_rx.observe_deferred(&block)",
+            "sync_peer::should_attempt_ancestry_recovery(",
+            // Blocks arm.
+            "sync_for_rx.handle_blocks(&pid, blocks)",
+            ".take_answer(",
+            "admission::bound_orphan_buffer(",
+            ".admit_to_fixpoint(pending,",
+            "sync_recovery::lowest_deferred(",
+            "parent_walks.begin(",
+            "parent_walks.next(",
+            "sync_recovery::send_step(",
+            "parent_walks.note_stuck(&stuck_roots, &pid.0, now)",
+            ".refetch_stuck(",
+            "sync_recovery::deferred_roots(",
+            "sync_rejoin::classify(",
+            "sel.record_serve(",
+            // Sync tick.
+            "sync_rejoin::choose_source(",
+            ".note_sync_target(target, applied_tip.1)",
+            "rejoin_for_loop.lock().anchor(",
+            ".note_asked(&pid.0, (block_from, block_height))",
+        ] {
+            assert!(
+                main.contains(needle),
+                "main.rs no longer contains `{needle}`"
+            );
+        }
     }
 }

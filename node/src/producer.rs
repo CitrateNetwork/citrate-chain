@@ -7920,8 +7920,8 @@ mod tests {
             let tip = tip.expect("tip");
             gossip(&mut b, Some(&a), &tip).await;
             assert_eq!(applied(&b).1, 0, "nothing below the budget connects");
-            // The tip-anchored sync owns the rest.
-            for _ in 0..10 {
+            // The tip-anchored sync owns the rest (32 blocks per answer).
+            for _ in 0..(crate::sync_recovery::MAX_PARENT_WALK_STEPS / 32 + 4) {
                 sync_from_tip(&mut b, &a).await;
             }
             assert_eq!(applied(&b), applied(&a));
@@ -8066,7 +8066,11 @@ mod tests {
             // Peer `a` (same id) first serves a branch nobody can connect, which
             // spends nearly all of its walk budget.
             let a_fake = node(1, false).await;
-            let fake = unconnected_chain(&branch[0], 1, 125);
+            let fake = unconnected_chain(
+                &branch[0],
+                1,
+                u64::from(crate::sync_recovery::MAX_PARENT_WALK_STEPS) - 3,
+            );
             for blk in &fake {
                 a_fake.storage.blocks.put_block(blk).expect("put");
             }
