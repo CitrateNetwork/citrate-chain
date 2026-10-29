@@ -120,13 +120,18 @@ pub const MAX_UNANSWERED: u32 = 8;
 /// trickles: a quarter of one 32-block answer (`sync_peer::MATERIAL_FRACTION`).
 pub const FOLLOW_TRICKLE_ADVANCE: u64 = 8;
 
-/// The trickle window, in follow answers: a follow ends once its last this
-/// many answers moved the cursor by less than [`FOLLOW_TRICKLE_ADVANCE`] each
-/// on average. A peer that keeps delivering one admissible block per answer
-/// can otherwise hold the tick for as long as it has blocks (DGX review of
-/// 49465b5e, P1-2). It is a rolling window, not a counter that one larger
-/// answer resets, so mixing trickles with an occasional larger answer does
-/// not hold it either (DGX review of 017cdbe6, P2).
+/// The trickle window, in follow entries: a follow ends once its last this
+/// many entries moved the cursor by less than [`FOLLOW_TRICKLE_ADVANCE`] each
+/// on average. An entry is an answer's cursor advance, or a zero for a sync
+/// tick on which the pinned peer kept a request waiting and gave no answer,
+/// so the window averages per tick and a peer cannot hold the pin by
+/// answering rarely (re-review of 5a1f8a80, P2'). A tick on which nothing was
+/// outstanding (the tick's own pending gate sent nothing) is no entry. A peer
+/// that keeps delivering one admissible block per answer can otherwise hold
+/// the tick for as long as it has blocks (DGX review of 49465b5e, P1-2). It is
+/// a rolling window, not a counter that one larger answer resets, so mixing
+/// trickles with an occasional larger answer does not hold it either (DGX
+/// review of 017cdbe6, P2).
 pub const MAX_TRICKLE_ANSWERS: u32 = MAX_UNANSWERED;
 
 /// Requests one fork-point search (the probe) may send before it gives up:
@@ -270,6 +275,11 @@ pub struct RejoinTracker {
     /// How far each of the running follow's last [`MAX_TRICKLE_ANSWERS`]
     /// answers moved the cursor, oldest first.
     follow_advances: VecDeque<u64>,
+    /// The running follow got an answer from its peer since the last tick.
+    follow_answered: bool,
+    /// A re-send to the running follow's peer was skipped since the last
+    /// tick (its anchor still pending).
+    follow_unsent: bool,
     /// When the running search's peer last gave a consumed answer (or the
     /// search was first seen by [`choose_source`]); see [`PIN_STALL_TIMEOUT`].
     pin_live_at: Option<Instant>,
@@ -300,6 +310,8 @@ impl RejoinTracker {
             requests: 0,
             request_cap: 0,
             follow_advances: VecDeque::new(),
+            follow_answered: false,
+            follow_unsent: false,
             pin_live_at: None,
             pin_answered: false,
         }
@@ -310,6 +322,8 @@ impl RejoinTracker {
         self.requests = 0;
         self.request_cap = search_request_cap(top);
         self.follow_advances.clear();
+        self.follow_answered = false;
+        self.follow_unsent = false;
         self.clear_pin_clock();
     }
 
@@ -462,6 +476,9 @@ impl RejoinTracker {
             return None;
         }
         let at = self.asked.as_ref().map(|a| a.2).unwrap_or(0);
+        if matches!(self.mode, Mode::Follow { .. }) {
+            self.follow_unsent = true;
+        }
         self.unanswered = self.unanswered.saturating_add(1);
         if self.unanswered >= MAX_UNANSWERED {
             self.unanswered = 0;
@@ -581,6 +598,7 @@ impl RejoinTracker {
                     // The probe found the fork point: a consumed probe answer.
                     None => self.note_pin_answer(&from),
                     Some(prev) => {
+                        self.follow_answered = true;
                         let advance = cursor.1.saturating_sub(prev);
                         // In Follow only a material advance is liveness for
                         // the pin stall clock (DGX review of 017cdbe6, P2).
@@ -654,8 +672,31 @@ impl RejoinTracker {
         }
     }
 
-    /// Record one follow answer's cursor advance; whether the last
-    /// [`MAX_TRICKLE_ANSWERS`] answers averaged less than
+    /// One sync tick of the running follow, called by [`choose_source`]
+    /// before the tick's request: if the pinned peer gave no answer since the
+    /// last tick while a request to it was waiting (sent and unanswered, or
+    /// its re-send skipped as pending), that tick is a zero in the trickle
+    /// window. Ends the follow if the window trickles.
+    fn follow_tick(&mut self) -> Option<Transition> {
+        let answered = std::mem::take(&mut self.follow_answered);
+        let unsent = std::mem::take(&mut self.follow_unsent);
+        let cursor = match &self.mode {
+            Mode::Follow { cursor } => cursor.1,
+            _ => return None,
+        };
+        let waiting = unsent
+            || matches!(
+                (&self.asked, &self.peer),
+                (Some((asked, _, _)), Some(pinned)) if asked == pinned
+            );
+        if !answered && waiting && self.follow_trickles(0) {
+            return self.give_up(cursor);
+        }
+        None
+    }
+
+    /// Record one follow entry's cursor advance; whether the last
+    /// [`MAX_TRICKLE_ANSWERS`] entries averaged less than
     /// [`FOLLOW_TRICKLE_ADVANCE`].
     fn follow_trickles(&mut self, advance: u64) -> bool {
         let window = MAX_TRICKLE_ANSWERS as usize;
@@ -749,23 +790,29 @@ pub fn choose_source(
     if let Some(p) = tracker.search_peer().map(str::to_string) {
         match candidates.iter().find(|c| c.id == p) {
             Some(pinned) => {
-                // A pinned peer that has given no consumed answer for
-                // PIN_STALL_TIMEOUT, while another peer is more than the
-                // catch-up gap ahead of it, ends the pin: the selector asks
-                // the peer that can carry us (DGX review of 49465b5e, P1-2).
-                // The lead alone never does: advertised heads are unverified.
-                let stalled = tracker.pin_stalled_for(now) >= PIN_STALL_TIMEOUT;
-                let lead = candidates
-                    .iter()
-                    .filter(|c| c.id != p)
-                    .map(|c| c.head_height)
-                    .max()
-                    .unwrap_or(0);
-                let gap = crate::producer::CATCHUP_REFUSE_GAP;
-                if !stalled || lead <= pinned.head_height.saturating_add(gap) {
-                    return (Source::Pinned(p), None);
+                // A follow whose peer keeps it waiting ends here (see
+                // MAX_TRICKLE_ANSWERS).
+                if let Some(t) = tracker.follow_tick() {
+                    transition = Some(t);
+                } else {
+                    // A pinned peer that has given no consumed answer for
+                    // PIN_STALL_TIMEOUT, while another peer is more than the
+                    // catch-up gap ahead of it, ends the pin: the selector asks
+                    // the peer that can carry us (DGX review of 49465b5e, P1-2).
+                    // The lead alone never does: advertised heads are unverified.
+                    let stalled = tracker.pin_stalled_for(now) >= PIN_STALL_TIMEOUT;
+                    let lead = candidates
+                        .iter()
+                        .filter(|c| c.id != p)
+                        .map(|c| c.head_height)
+                        .max()
+                        .unwrap_or(0);
+                    let gap = crate::producer::CATCHUP_REFUSE_GAP;
+                    if !stalled || lead <= pinned.head_height.saturating_add(gap) {
+                        return (Source::Pinned(p), None);
+                    }
+                    transition = tracker.reset("pinned peer stalled, a peer is ahead");
                 }
-                transition = tracker.reset("pinned peer stalled, a peer is ahead");
             }
             None => transition = tracker.abandon(),
         }
@@ -4649,7 +4696,8 @@ mod tests {
     /// the ticks between (which is no fault of the peer).
     #[test]
     fn an_honest_follow_with_one_tick_latency_keeps_its_pin() {
-        let plans: [(&str, fn(u64) -> Vec<Step>); 3] = [
+        type Plan = fn(u64) -> Vec<Step>;
+        let plans: [(&str, Plan); 3] = [
             ("waits a tick", |tick| match tick {
                 0 => vec![Step::Send],
                 _ if tick.is_multiple_of(2) => vec![Step::Answer(32), Step::Send],
