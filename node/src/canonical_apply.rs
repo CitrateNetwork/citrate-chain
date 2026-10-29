@@ -3532,6 +3532,9 @@ fn restore_reorg_window(
     if tip.height == 0 {
         return out;
     }
+    // The budget covers the whole restore, the tip's own root check included.
+    let started = std::time::Instant::now();
+    let budget = restore_budget();
     let mut block = match read_block(storage, &tip.hash) {
         Ok(Some(b)) => b,
         Ok(None) => return out,
@@ -3550,8 +3553,6 @@ fn restore_reorg_window(
     let activation = storage_root_hardening_height();
     let full = active_at(activation, tip.height.saturating_add(1));
     let floor = tip.height.saturating_sub(MAX_REORG_DEPTH);
-    let started = std::time::Instant::now();
-    let budget = restore_budget();
     let mut above = at_tip.clone();
     while block.header.height > floor {
         let height = block.header.height;

@@ -232,7 +232,7 @@ impl StateStoreTrait for StateStore {
         let _index_guard = match applied_tip {
             Some((hash, height)) => {
                 let guard = crate::chain::block_store::canonical_index_lock();
-                self.stage_block_undo(&mut batch, accounts, storage, models_jobs, (hash, height))?;
+                self.stage_block_undo(&mut batch, accounts, storage, models_jobs, (hash, height));
                 self.stage_applied_tip_locked(&mut batch, &hash, height)?;
                 Some(guard)
             }
@@ -309,7 +309,7 @@ impl StateStoreTrait for StateStore {
         crate::chain::transaction_store::stage_receipt_index(&self.db, &mut batch, index)?;
         // The winning branch's undo records replace the kept window, in this batch.
         if let (Some((_, height)), false) = (applied_tip, undo.is_empty()) {
-            self.stage_branch_undo(&mut batch, undo, height)?;
+            self.stage_branch_undo(&mut batch, undo, height);
         }
         // chain#421: the canonical height index moves with the tip, in this batch.
         let _index_guard = match applied_tip {
@@ -470,10 +470,12 @@ impl StateStore {
     /// rewrite at the tip already durable adds the pre-images of keys its
     /// record does not hold yet, so the record keeps reverting to the parent.
     ///
-    /// A read that fails leaves the block without a record (and removes any
-    /// stale one at its height) instead of failing the commit: the records are
-    /// local metadata, and a missing one only shortens the window a restart
-    /// can rebuild.
+    /// Fail-soft: the records are local metadata, and a missing one only
+    /// shortens the window a restart can rebuild, so nothing here can fail the
+    /// commit. Any error (a read, an encode, a staging write, the window scan)
+    /// is logged and leaves the block without a record (a delete of its height
+    /// is staged last); a record over [`MAX_UNDO_RECORD_BYTES`] is skipped the
+    /// same way.
     fn stage_block_undo(
         &self,
         batch: &mut rocksdb::WriteBatch,
@@ -481,34 +483,59 @@ impl StateStore {
         storage: &[StateStorageChange],
         models_jobs: Option<&ModelJobUndo>,
         tip: (Hash, u64),
-    ) -> Result<()> {
+    ) {
         let (hash, height) = tip;
-        match self.block_undo(accounts, storage, models_jobs, tip) {
-            Ok(Some(record)) => {
-                self.db.batch_put_cf(
-                    batch,
-                    CF_METADATA,
-                    &reorg_undo_key(height),
-                    &bincode::serialize(&record)?,
-                )?;
+        let staged = self
+            .block_undo(accounts, storage, models_jobs, tip)
+            .and_then(|record| {
+                match record {
+                    Some(record) => self.stage_undo_record(batch, &record)?,
+                    // A rewrite at the durable tip whose record names another
+                    // block (or none): it cannot be rebuilt from here, so drop it.
+                    None => self
+                        .db
+                        .batch_delete_cf(batch, CF_METADATA, &reorg_undo_key(height))?,
+                }
                 self.stage_undo_window(batch, height)
-            }
-            Ok(None) => {
-                // A rewrite at the durable tip whose record names another block
-                // (or none): it cannot be rebuilt from here, so drop it.
-                self.db
-                    .batch_delete_cf(batch, CF_METADATA, &reorg_undo_key(height))?;
-                self.stage_undo_window(batch, height)
-            }
-            Err(e) => {
-                warn!(
-                    "reorg window: no undo record for block {hash} @ {height} ({e}); a restart \
-                     can revert no further than this height"
-                );
-                self.db
-                    .batch_delete_cf(batch, CF_METADATA, &reorg_undo_key(height))?;
-                self.stage_undo_window(batch, height)
-            }
+            });
+        if let Err(e) = staged {
+            warn!(
+                "reorg window: no undo record for block {hash} @ {height} ({e}); a restart \
+                 can revert no further than this height"
+            );
+            self.drop_undo_record(batch, height);
+        }
+    }
+
+    /// Stage `record`, or, over [`MAX_UNDO_RECORD_BYTES`] encoded, skip it
+    /// (a warning, and a delete of its height so no stale record stays).
+    fn stage_undo_record(&self, batch: &mut rocksdb::WriteBatch, record: &BlockUndo) -> Result<()> {
+        let key = reorg_undo_key(record.height);
+        let bytes = bincode::serialize(record)?;
+        if bytes.len() > MAX_UNDO_RECORD_BYTES {
+            warn!(
+                "reorg window: undo record of block {} @ {} is {} bytes (cap {}); not kept, a \
+                 restart can revert no further than this height",
+                record.hash,
+                record.height,
+                bytes.len(),
+                MAX_UNDO_RECORD_BYTES
+            );
+            return self.db.batch_delete_cf(batch, CF_METADATA, &key);
+        }
+        self.db.batch_put_cf(batch, CF_METADATA, &key, &bytes)
+    }
+
+    /// Best effort: stage the removal of the record at `height` (after a
+    /// staging failure). If even that cannot be staged, a record left there
+    /// names another block or another state, and the restart walk, which
+    /// checks every record against the block and its root, stops at it.
+    fn drop_undo_record(&self, batch: &mut rocksdb::WriteBatch, height: u64) {
+        if let Err(e) = self
+            .db
+            .batch_delete_cf(batch, CF_METADATA, &reorg_undo_key(height))
+        {
+            warn!("reorg window: could not drop the undo record at {height}: {e}");
         }
     }
 
@@ -586,21 +613,25 @@ impl StateStore {
     /// Stage a reorg's undo records (the winning branch's, computed by the
     /// node from its in-memory states) and drop every other record outside the
     /// window at the new tip `tip`, including the abandoned branch's above it.
-    fn stage_branch_undo(
-        &self,
-        batch: &mut rocksdb::WriteBatch,
-        undo: &[BlockUndo],
-        tip: u64,
-    ) -> Result<()> {
-        for record in undo.iter().filter(|r| in_undo_window(r.height, tip)) {
-            self.db.batch_put_cf(
-                batch,
-                CF_METADATA,
-                &reorg_undo_key(record.height),
-                &bincode::serialize(record)?,
-            )?;
+    /// A record over [`MAX_UNDO_RECORD_BYTES`] is skipped.
+    ///
+    /// Fail-soft, as [`Self::stage_block_undo`]: an error is logged and the
+    /// branch's heights are left without records; the reorg commit goes on.
+    fn stage_branch_undo(&self, batch: &mut rocksdb::WriteBatch, undo: &[BlockUndo], tip: u64) {
+        let staged = undo
+            .iter()
+            .filter(|r| in_undo_window(r.height, tip))
+            .try_for_each(|record| self.stage_undo_record(batch, record))
+            .and_then(|()| self.stage_undo_window(batch, tip));
+        if let Err(e) = staged {
+            warn!(
+                "reorg window: no undo records for the branch to {tip} ({e}); a restart can \
+                 revert no further than {tip}"
+            );
+            for record in undo {
+                self.drop_undo_record(batch, record.height);
+            }
         }
-        self.stage_undo_window(batch, tip)
     }
 
     /// Delete, in `batch`, every kept record outside the window at `tip`.
@@ -1260,6 +1291,34 @@ mod tests {
             store.get_reorg_undo(1).expect("read").is_some(),
             "records already kept stay"
         );
+    }
+
+    /// Tripwire: undo staging stays fail-soft. Its entry points return
+    /// nothing (an error cannot reach the commit with `?`), and the commit
+    /// paths call them as statements.
+    #[test]
+    fn undo_staging_cannot_fail_a_commit() {
+        let src = include_str!("state_store.rs");
+        for name in ["fn stage_block_undo(", "fn stage_branch_undo("] {
+            let at = src.find(name).expect("staging fn");
+            let sig = src
+                .get(at..)
+                .and_then(|t| t.find('{').and_then(|end| t.get(..end)))
+                .expect("signature");
+            assert!(
+                !sig.contains("->"),
+                "{name} must not return a Result: {sig}"
+            );
+        }
+        for call in ["self.stage_block_undo(", "self.stage_branch_undo("] {
+            for (at, _) in src.match_indices(call) {
+                let stmt = src
+                    .get(at..)
+                    .and_then(|t| t.find(';').and_then(|end| t.get(..end)))
+                    .expect("call");
+                assert!(!stmt.ends_with('?'), "{call} propagates an error: {stmt}");
+            }
+        }
     }
 
     /// An undo record larger than the cap is not kept (a warning, no record
