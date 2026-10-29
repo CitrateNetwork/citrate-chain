@@ -2705,8 +2705,14 @@ impl CanonicalApplicator {
                 }
             }
             // A fork point inside the ring is reverted in place, as the drain
-            // does: the durable tip never goes below it. Only a winning branch
-            // past the forward cap goes on to the rebuild.
+            // does: the durable tip never goes below it. A winning branch past
+            // the forward cap goes on to the rebuild. So does a rejected
+            // in-place reorg on an unpruned node (a reapply that does not
+            // reproduce a root, a failed commit, a gap in the receipt walk:
+            // `reorg_to` leaves state as it was), as before the ring was
+            // rebuilt from undo records; the rebuild keeps its own guards. A
+            // rejection stops here on a pruned node (no rebuild from genesis)
+            // and when the fork point is below the finalized floor.
             if !below_ring {
                 match self.reorg_to(&mut state, head).await {
                     ReorgOutcome::Reorged { .. } => {
@@ -2716,8 +2722,17 @@ impl CanonicalApplicator {
                     ReorgOutcome::BeyondReorgWindow { .. } => {}
                     ReorgOutcome::NoChange => return Ok(false),
                     ReorgOutcome::Rejected(why) => {
-                        warn!("canonical recovery: bounded reorg toward {head} declined: {why}");
-                        return Ok(false);
+                        let finalized = self.effective_floor(&state, false);
+                        if floor > 0 || plan.fork.height < finalized {
+                            warn!(
+                                "canonical recovery: bounded reorg toward {head} declined: {why}"
+                            );
+                            return Ok(false);
+                        }
+                        warn!(
+                            "canonical recovery: bounded reorg toward {head} declined ({why}); \
+                             falling back to the rebuild"
+                        );
                     }
                 }
             }
@@ -13738,16 +13753,28 @@ pub(crate) mod tests {
             );
         }
 
-        /// An UNPRUNED node whose in-place reorg toward a strictly heavier head is
-        /// rejected for a reason other than finality (here the winning branch's
-        /// store commit fails once) falls back to the from-genesis rebuild and
-        /// converges, as it did before the window was rebuilt from undo records.
-        /// A rejection must never leave it on its tip for good.
-        #[tokio::test]
-        async fn unpruned_node_heals_by_rebuild_when_the_in_place_reorg_is_rejected() {
-            if std::env::var(RSR_DIR).is_ok() || std::env::var(V251_DIR).is_ok() {
-                return;
-            }
+        /// The outcome of [`rsr_rejected_reorg`].
+        struct RejectedReorg {
+            healed: bool,
+            tip: AppliedTip,
+            lowest: u64,
+            head: Block,
+            fork: u64,
+            root: Hash,
+            durable_root: Hash,
+            _dir: tempfile::TempDir,
+        }
+
+        /// A node at tip 30 (optionally with its DAG store pruned below
+        /// `prune_at`) meets a strictly heavier branch forking at 25, inside its
+        /// ring. `recover_automatic` runs while the in-place reorg's winning
+        /// commit fails once, so `reorg_to` is rejected (not for finality), or,
+        /// with `finalized` above the fork point, for finality.
+        async fn rsr_rejected_reorg(
+            prune_at: Option<u64>,
+            finalized: Option<u64>,
+        ) -> RejectedReorg {
+            use citrate_consensus::dag_store::DagStore;
             let (main, snaps) = rsr_main(30).await;
             let fork = 25u64;
             let side = rsr_fork(&main, &snaps, fork, 10, [0x5B; 32], CAROL).await;
@@ -13773,6 +13800,15 @@ pub(crate) mod tests {
             exec.set_balance(&Address(ALICE), U256::from(FUND));
             exec.persist_state_changes().await.expect("persist genesis");
             let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            if let Some(at) = prune_at {
+                let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+                let point = &main[usize::try_from(at - 1).expect("i")];
+                dag.store_block(point.clone()).await.expect("into DAG");
+                dag.update_pruning_point(point.header.block_hash)
+                    .await
+                    .expect("pruning point");
+                app = app.with_dag_prune_floor(dag);
+            }
             for b in &main {
                 persist(&storage, b);
                 assert!(matches!(
@@ -13790,38 +13826,102 @@ pub(crate) mod tests {
                 app.lock.lock().await.snapshots.contains_key(&fork),
                 "fixture: the fork point is inside the ring"
             );
-
             // Reorg batch 1 reverts to the fork point; batch 2 (the winner's
             // commit) fails once, so the in-place reorg is rejected.
             store.fail_reorg_batch_at.store(
                 store.reorg_batches.load(Ordering::SeqCst) + 2,
                 Ordering::SeqCst,
             );
+            if let Some(f) = finalized {
+                app.finalized_height_handle().store(f, Ordering::SeqCst);
+            }
+            let watch = LowestTip::start(storage.clone());
             let healed = app
                 .recover_automatic(rsr_genesis(), Hash::default(), head.header.block_hash)
                 .await
                 .expect("recovery");
+            let lowest = watch.finish();
             assert!(
-                store.reorg_batches.load(Ordering::SeqCst) >= 2,
+                finalized.is_some() || store.reorg_batches.load(Ordering::SeqCst) >= 2,
                 "fixture: the in-place reorg was attempted"
             );
-            assert!(
+            RejectedReorg {
                 healed,
+                tip: app.applied_tip().await,
+                lowest,
+                head,
+                fork,
+                root: exec.calculate_state_root(),
+                durable_root: rsr_hydrated(&storage).calculate_state_root(),
+                _dir: dir,
+            }
+        }
+
+        /// An UNPRUNED node whose in-place reorg toward a strictly heavier head is
+        /// rejected for a reason other than finality (here the winning branch's
+        /// store commit fails once) falls back to the from-genesis rebuild and
+        /// converges, as it did before the window was rebuilt from undo records.
+        /// A rejection must never leave it on its tip for good.
+        #[tokio::test]
+        async fn unpruned_node_heals_by_rebuild_when_the_in_place_reorg_is_rejected() {
+            if std::env::var(RSR_DIR).is_ok() || std::env::var(V251_DIR).is_ok() {
+                return;
+            }
+            let r = rsr_rejected_reorg(None, None).await;
+            assert!(
+                r.healed,
                 "an unpruned node falls back to the rebuild when the in-place reorg is rejected"
             );
             assert_eq!(
-                app.applied_tip().await,
+                r.tip,
                 AppliedTip {
-                    hash: head.header.block_hash,
-                    height: head.header.height
+                    hash: r.head.header.block_hash,
+                    height: r.head.header.height
                 }
             );
-            assert_eq!(exec.calculate_state_root(), head.state_root);
+            assert_eq!(r.root, r.head.state_root);
             assert_eq!(
-                rsr_hydrated(&storage).calculate_state_root(),
-                head.state_root,
+                r.durable_root, r.head.state_root,
                 "durable state on the heavier branch"
             );
+        }
+
+        /// The same rejection on a PRUNED node does not fall back: no rebuild
+        /// from genesis (the durable tip never goes below the fork point), and
+        /// the node keeps its tip and state.
+        #[tokio::test]
+        async fn pruned_node_never_rebuilds_after_a_rejected_in_place_reorg() {
+            if std::env::var(RSR_DIR).is_ok() || std::env::var(V251_DIR).is_ok() {
+                return;
+            }
+            let r = rsr_rejected_reorg(Some(10), None).await;
+            assert!(!r.healed, "a pruned node never rebuilds from genesis");
+            assert_eq!(r.tip.height, 30, "the applied tip is kept");
+            assert!(
+                r.lowest >= r.fork,
+                "no rewind below the fork point (lowest durable tip {})",
+                r.lowest
+            );
+            assert_eq!(r.root, r.durable_root, "memory == store");
+        }
+
+        /// An unpruned node whose in-place reorg is rejected because the fork
+        /// point is below the finalized floor does not fall back to the
+        /// rebuild either: it keeps its tip.
+        #[tokio::test]
+        async fn a_reorg_rejected_for_finality_never_falls_back_to_the_rebuild() {
+            if std::env::var(RSR_DIR).is_ok() || std::env::var(V251_DIR).is_ok() {
+                return;
+            }
+            let r = rsr_rejected_reorg(None, Some(27)).await;
+            assert!(!r.healed, "no rebuild across the finalized floor");
+            assert_eq!(r.tip.height, 30, "the applied tip is kept");
+            assert!(
+                r.lowest >= r.fork,
+                "no rewind below the fork point (lowest durable tip {})",
+                r.lowest
+            );
+            assert_eq!(r.root, r.durable_root, "memory == store");
         }
 
         // -- crash consistency --------------------------------------------
