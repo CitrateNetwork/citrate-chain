@@ -3598,8 +3598,8 @@ fn restore_reorg_window(
             ));
             break;
         }
-        if record.parent.is_some_and(|p| p != (parent_hash, below)) {
-            stop("the record names another parent".into());
+        if record.parent != Some((parent_hash, below)) {
+            stop("the record names another parent, or none".into());
             break;
         }
         if active_at(activation, height) != full {
