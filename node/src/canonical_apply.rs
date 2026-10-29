@@ -1630,9 +1630,7 @@ impl CanonicalApplicator {
                 .await;
             match apply_result {
                 Ok(_root) => {
-                    let after = self.executor.state_snapshot();
-                    complete_block_undo(&self.storage, state, &block, &after);
-                    state.record(block_hash, height, after);
+                    state.record(block_hash, height, self.executor.state_snapshot());
                     self.persist_applied(&block_hash, height, &block.state_root);
                     applied.push(block_hash);
                     info!(
@@ -2707,8 +2705,14 @@ impl CanonicalApplicator {
                 }
             }
             // A fork point inside the ring is reverted in place, as the drain
-            // does: the durable tip never goes below it. Only a winning branch
-            // past the forward cap goes on to the rebuild.
+            // does: the durable tip never goes below it. A winning branch past
+            // the forward cap goes on to the rebuild. So does a rejected
+            // in-place reorg on an unpruned node (a reapply that does not
+            // reproduce a root, a failed commit, a gap in the receipt walk:
+            // `reorg_to` leaves state as it was), as before the ring was
+            // rebuilt from undo records; the rebuild keeps its own guards. A
+            // rejection stops here on a pruned node (no rebuild from genesis)
+            // and when the fork point is below the finalized floor.
             if !below_ring {
                 match self.reorg_to(&mut state, head).await {
                     ReorgOutcome::Reorged { .. } => {
@@ -2718,8 +2722,17 @@ impl CanonicalApplicator {
                     ReorgOutcome::BeyondReorgWindow { .. } => {}
                     ReorgOutcome::NoChange => return Ok(false),
                     ReorgOutcome::Rejected(why) => {
-                        warn!("canonical recovery: bounded reorg toward {head} declined: {why}");
-                        return Ok(false);
+                        let finalized = self.effective_floor(&state, false);
+                        if floor > 0 || plan.fork.height < finalized {
+                            warn!(
+                                "canonical recovery: bounded reorg toward {head} declined: {why}"
+                            );
+                            return Ok(false);
+                        }
+                        warn!(
+                            "canonical recovery: bounded reorg toward {head} declined ({why}); \
+                             falling back to the rebuild"
+                        );
                     }
                 }
             }
@@ -3019,12 +3032,7 @@ impl CanonicalApplicator {
         // keeps the ring bounded to the last MAX_REORG_DEPTH heights, so the rebuilt
         // ring ends populated across the recent window (future live reorgs work).
         let mut replayed: usize = 0;
-        // Model and job pre-images are added only where the rebuilt ring keeps
-        // the window: the spine's last MAX_REORG_DEPTH blocks.
-        let window_from = spine
-            .len()
-            .saturating_sub(usize::try_from(MAX_REORG_DEPTH).unwrap_or(usize::MAX));
-        for (i, h) in spine.iter().enumerate() {
+        for h in &spine {
             let block = match read_block(&self.storage, h) {
                 Ok(Some(b)) => b,
                 Ok(None) => break, // missing block — reach check below rolls back
@@ -3049,9 +3057,6 @@ impl CanonicalApplicator {
                     // Record the block's CLAIMED root (trusted) in the ring; the ring
                     // snapshot is the executor state, which is correct regardless.
                     let snap = self.executor.state_snapshot();
-                    if i >= window_from {
-                        complete_block_undo(&self.storage, &state, &block, &snap);
-                    }
                     state.record(block.header.block_hash, block.header.height, snap);
                     self.persist_applied(
                         &block.header.block_hash,
@@ -3458,9 +3463,7 @@ pub fn record_produced(
 ) {
     let hash = block.header.block_hash;
     let height = block.header.height;
-    let after = executor.state_snapshot();
-    complete_block_undo(storage, state, block, &after);
-    state.record(hash, height, after);
+    state.record(hash, height, executor.state_snapshot());
     // SRP-S3b: the durable applied-tip is advanced ATOMICALLY with the state batch by the
     // producer's `persist_state_changes_with_tip` (see produce_block) — the crash-consistency
     // guarantee. This re-writes the SAME tip value: idempotent in production (right after the
@@ -3471,41 +3474,6 @@ pub fn record_produced(
             "execute-on-receive: produced block {} @ {} but failed to persist applied tip: {}",
             hash, height, e
         );
-    }
-}
-
-/// Add the model and training-job pre-images of `block`, just applied with
-/// post-state `after`, to its undo record. The pre-state is the ring's entry
-/// for the parent (the applied tip before `block`); without it nothing is
-/// written, and the record is then never used to revert (fail-safe). Call it
-/// before `AppliedState::record`.
-fn complete_block_undo(
-    storage: &StorageManager,
-    state: &AppliedState,
-    block: &Block,
-    after: &StateSnapshot,
-) {
-    let Some(below) = block.header.height.checked_sub(1) else {
-        return;
-    };
-    let before = match state.snapshots.get(&below) {
-        Some((hash, snap)) if *hash == block.selected_parent() => snap,
-        _ => return,
-    };
-    let undo = after.model_job_pre_images_since(before);
-    match storage
-        .state
-        .complete_reorg_undo(block.header.height, block.header.block_hash, undo)
-    {
-        Ok(true) => {}
-        Ok(false) => debug!(
-            "reorg window: no undo record for {} @ {} to add model/job pre-images to",
-            block.header.block_hash, block.header.height
-        ),
-        Err(e) => warn!(
-            "reorg window: model/job pre-images of {} @ {} not recorded: {e}",
-            block.header.block_hash, block.header.height
-        ),
     }
 }
 
@@ -3554,6 +3522,16 @@ fn hydrated_pre_images(storage: &[StoragePreImage], full: bool) -> Vec<StoragePr
 /// where the storage-root hydration rule changes, or `MAX_REORG_DEPTH` below
 /// the tip. Nothing is rebuilt unless `at_tip` reproduces the tip's own root.
 /// Returned highest first.
+///
+/// LIMIT (models and training jobs): they are outside the state root, are not
+/// persisted to the flat store and are not loaded at start-up, so `at_tip`
+/// holds none after a restart. The records' model/job pre-images then only
+/// restore what changed inside the window: a model created inside it reverts
+/// correctly, but one created before it is absent at every rebuilt height
+/// where it was not changed (and present, with its earlier value, below a
+/// height that changed it). The root check cannot see this. Model/job parity
+/// across a restart needs the start-up load (tracked separately; see
+/// `pre_window_model_updated_in_the_window_survives_a_restart_reorg`).
 fn restore_reorg_window(
     storage: &StorageManager,
     tip: AppliedTip,
@@ -3564,6 +3542,9 @@ fn restore_reorg_window(
     if tip.height == 0 {
         return out;
     }
+    // The budget covers the whole restore, the tip's own root check included.
+    let started = std::time::Instant::now();
+    let budget = restore_budget();
     let mut block = match read_block(storage, &tip.hash) {
         Ok(Some(b)) => b,
         Ok(None) => return out,
@@ -3582,8 +3563,6 @@ fn restore_reorg_window(
     let activation = storage_root_hardening_height();
     let full = active_at(activation, tip.height.saturating_add(1));
     let floor = tip.height.saturating_sub(MAX_REORG_DEPTH);
-    let started = std::time::Instant::now();
-    let budget = restore_budget();
     let mut above = at_tip.clone();
     while block.header.height > floor {
         let height = block.header.height;
@@ -3619,8 +3598,8 @@ fn restore_reorg_window(
             ));
             break;
         }
-        if record.parent.is_some_and(|p| p != (parent_hash, below)) {
-            stop("the record names another parent".into());
+        if record.parent != Some((parent_hash, below)) {
+            stop("the record names another parent, or none".into());
             break;
         }
         if active_at(activation, height) != full {
@@ -9799,8 +9778,13 @@ pub(crate) mod tests {
         reorg_batches: AtomicU64,
     }
 
+    /// Env: abort the process right AFTER write `k` commits (`V251_ABORT_AFTER=k`),
+    /// for the batch writes: a kill between a commit and whatever the caller
+    /// does next.
+    const V251_ABORT_AFTER: &str = "V251_ABORT_AFTER";
+
     impl V251AbortStore {
-        fn w(&self, what: &str) {
+        fn w(&self, what: &str) -> u64 {
             let n = self.writes.fetch_add(1, Ordering::SeqCst) + 1;
             if std::env::var("V251_TRACE").is_ok() {
                 eprintln!("V251 write#{n} {what}");
@@ -9809,6 +9793,19 @@ pub(crate) mod tests {
                 eprintln!("V251 ABORT before write#{n} {what}");
                 std::process::abort();
             }
+            n
+        }
+
+        /// After write `n` committed: abort if it is the `V251_ABORT_AFTER` one.
+        fn after(&self, n: u64, what: &str, result: anyhow::Result<()>) -> anyhow::Result<()> {
+            let at = std::env::var(V251_ABORT_AFTER)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok());
+            if result.is_ok() && at == Some(n) {
+                eprintln!("V251 ABORT after write#{n} {what}");
+                std::process::abort();
+            }
+            result
         }
     }
 
@@ -9856,9 +9853,11 @@ pub(crate) mod tests {
             s: &[V251Change],
             t: Option<(Hash, u64)>,
             i: &citrate_execution::executor::ReceiptIndexBatch,
+            m: Option<&citrate_execution::executor::ModelJobUndo>,
         ) -> anyhow::Result<()> {
-            self.w("write_state_batch_with_applied_tip");
-            V251Trait::write_state_batch_with_applied_tip(&*self.inner, a, s, t, i)
+            let n = self.w("write_state_batch_with_applied_tip");
+            let r = V251Trait::write_state_batch_with_applied_tip(&*self.inner, a, s, t, i, m);
+            self.after(n, "write_state_batch_with_applied_tip", r)
         }
         // V251_REORG_OVERRIDE_BEGIN
         fn write_reorg_batch_sync(
@@ -9871,12 +9870,13 @@ pub(crate) mod tests {
             i: &citrate_execution::executor::ReceiptIndexBatch,
             u: &[citrate_execution::executor::BlockUndo],
         ) -> anyhow::Result<()> {
-            self.w("write_reorg_batch_sync");
+            let k = self.w("write_reorg_batch_sync");
             let n = self.reorg_batches.fetch_add(1, Ordering::SeqCst) + 1;
             if n == self.fail_reorg_batch_at.load(Ordering::SeqCst) {
                 anyhow::bail!("injected storage failure (write_reorg_batch_sync #{n})");
             }
-            V251Trait::write_reorg_batch_sync(&*self.inner, a, s, d, c, t, i, u)
+            let r = V251Trait::write_reorg_batch_sync(&*self.inner, a, s, d, c, t, i, u);
+            self.after(k, "write_reorg_batch_sync", r)
         }
         // V251_REORG_OVERRIDE_END
         fn put_applied_tip_meta(&self, h: &Hash, n: u64) -> anyhow::Result<()> {
@@ -13295,6 +13295,37 @@ pub(crate) mod tests {
             c1r_hashed(tx, ALICE, [model[0]; 20], nonce)
         }
 
+        /// A model-update transaction (new metadata for `model`) from ALICE.
+        fn rsr_update(model: [u8; 32], nonce: u64) -> Transaction {
+            let meta = serde_json::to_vec(&serde_json::json!({
+                "name": "window model",
+                "version": "2.0.0",
+                "description": "updated inside the reorg window",
+                "framework": "onnx",
+                "input_shape": [1, 4],
+                "output_shape": [1],
+                "size_bytes": 2048
+            }))
+            .expect("metadata");
+            let mut data = vec![0x03, 0x00, 0x00, 0x00];
+            data.extend_from_slice(&model);
+            data.extend_from_slice(&(meta.len() as u32).to_be_bytes());
+            data.extend_from_slice(&meta);
+            let tx = Transaction {
+                nonce,
+                from: embedded(ALICE),
+                to: Some(embedded(BOB)),
+                value: 0,
+                gas_limit: 400_000,
+                gas_price: 1_000_000_000,
+                data,
+                signature: Signature::new([1; 64]),
+                chain_id: Some(40204),
+                ..Default::default()
+            };
+            c1r_hashed(tx, ALICE, [0xD0; 20], nonce)
+        }
+
         /// [`rsr_extend`], with a model registered at `model_at`'s height.
         async fn rsr_extend_registering(
             start: StateSnapshot,
@@ -13305,6 +13336,25 @@ pub(crate) mod tests {
             to: [u8; 20],
             model_at: Option<(u64, [u8; 32])>,
         ) -> (Vec<Block>, Vec<StateSnapshot>) {
+            let register = |h: u64, nonce: u64| {
+                model_at
+                    .filter(|(at, _)| *at == h)
+                    .map(|(_, model)| rsr_register(model, nonce))
+            };
+            rsr_extend_with(start, parent, first, n, vrf, to, &register).await
+        }
+
+        /// [`rsr_extend`], plus `extra(height, nonce)`'s transaction (if any)
+        /// after each block's transfer.
+        async fn rsr_extend_with(
+            start: StateSnapshot,
+            parent: Hash,
+            first: u64,
+            n: u64,
+            vrf: [u8; 32],
+            to: [u8; 20],
+            extra: &(dyn Fn(u64, u64) -> Option<Transaction> + Sync),
+        ) -> (Vec<Block>, Vec<StateSnapshot>) {
             let exec = Executor::new(Arc::new(StateDB::new()));
             exec.state_restore(start);
             let mut blocks = Vec::new();
@@ -13312,10 +13362,9 @@ pub(crate) mod tests {
             let mut parent = parent;
             for h in first..first + n {
                 let mut txs = vec![v251_transfer(&exec, ALICE, to, 1_000)];
-                if let Some((_, model)) = model_at.filter(|(at, _)| *at == h) {
-                    // The nonce after the transfer: the producer executes in order.
-                    let nonce = exec.get_nonce(&Address(ALICE)) + 1;
-                    txs.push(rsr_register(model, nonce));
+                // The nonce after the transfer: the producer executes in order.
+                if let Some(tx) = extra(h, exec.get_nonce(&Address(ALICE)) + 1) {
+                    txs.push(tx);
                 }
                 let b = produce(&exec, parent, h, vrf, txs).await;
                 parent = b.header.block_hash;
@@ -13743,6 +13792,203 @@ pub(crate) mod tests {
             assert_eq!(restarted.calculate_state_root(), head.state_root);
         }
 
+        /// A node with 30 blocks applied and stopped: its store and the blocks.
+        async fn rsr_stopped_at_30() -> (Arc<StorageManager>, tempfile::TempDir, Vec<Block>) {
+            let (main, _) = rsr_main(30).await;
+            let (storage, dir) = rsr_node().await;
+            let exec = rsr_hydrated(&storage);
+            rsr_apply(&storage, &exec, &main).await;
+            (storage, dir, main)
+        }
+
+        /// Replace the kept undo record at its height with `record`, through the
+        /// store's own reorg commit (tip unchanged).
+        fn rsr_put_record(
+            storage: &StorageManager,
+            tip: &Block,
+            record: citrate_execution::executor::BlockUndo,
+        ) {
+            use citrate_execution::executor::StateStoreTrait;
+            storage
+                .state
+                .write_reorg_batch_sync(
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    Some((tip.header.block_hash, tip.header.height)),
+                    &ReceiptIndexBatch::default(),
+                    &[record],
+                )
+                .expect("put record");
+        }
+
+        /// The ring a node restarted on `storage` rebuilds.
+        async fn rsr_restart_ring(storage: &Arc<StorageManager>) -> Vec<u64> {
+            ring_heights(&CanonicalApplicator::new(
+                rsr_hydrated(storage),
+                storage.clone(),
+            ))
+            .await
+        }
+
+        /// Fail-safe seeding: a record without model/job pre-images (an older
+        /// binary's, a corrupt one) is never used. At the tip, the restart keeps
+        /// the tip alone; mid-window, the window ends at that height. Never
+        /// treated as "no model changed".
+        #[tokio::test]
+        async fn a_record_without_model_job_pre_images_ends_the_restored_window() {
+            let (storage, _dir, main) = rsr_stopped_at_30().await;
+            let tip = main.last().expect("tip").clone();
+            assert_eq!(
+                rsr_restart_ring(&storage).await,
+                (1..=30).collect::<Vec<u64>>(),
+                "fixture: the whole chain"
+            );
+            for (h, want) in [(30u64, vec![30u64]), (20, (20..=30).collect())] {
+                let original = storage.state.get_reorg_undo(h).expect("read").expect("rec");
+                assert!(original.models_jobs.is_some(), "fixture: complete record");
+                let mut stripped = original.clone();
+                stripped.models_jobs = None;
+                rsr_put_record(&storage, &tip, stripped);
+                assert_eq!(
+                    rsr_restart_ring(&storage).await,
+                    want,
+                    "a record at {h} without model/job pre-images ends the window there"
+                );
+                rsr_put_record(&storage, &tip, original);
+                assert_eq!(
+                    rsr_restart_ring(&storage).await,
+                    (1..=30).collect::<Vec<u64>>()
+                );
+            }
+        }
+
+        /// Fail-safe seeding: a record whose pre-images were tampered with, or
+        /// that names another block, ends the window at its height: the rebuilt
+        /// root (or the block check) rejects it. Each case keeps every other
+        /// field right, so each check is the only one that can catch it.
+        #[tokio::test]
+        async fn a_tampered_or_misnamed_record_ends_the_restored_window() {
+            let (storage, _dir, main) = rsr_stopped_at_30().await;
+            let tip = main.last().expect("tip").clone();
+            let h = 20u64;
+            let original = storage.state.get_reorg_undo(h).expect("read").expect("rec");
+            let mut tampered = original.clone();
+            let Some((_, Some(acct))) = tampered.accounts.iter_mut().find(|(_, s)| s.is_some())
+            else {
+                panic!("fixture: an account pre-image");
+            };
+            acct.balance = acct.balance.saturating_add(U256::from(1u64));
+            let mut misnamed = original.clone();
+            misnamed.hash = Hash::new([0xEE; 32]);
+            let mut wrong_parent = original.clone();
+            wrong_parent.parent = Some((Hash::new([0xEF; 32]), h - 1));
+            for (what, record) in [
+                ("a tampered account pre-image", tampered),
+                ("a record naming another block", misnamed),
+                ("a record naming another parent", wrong_parent),
+            ] {
+                rsr_put_record(&storage, &tip, record);
+                assert_eq!(
+                    rsr_restart_ring(&storage).await,
+                    (h..=30).collect::<Vec<u64>>(),
+                    "{what} at {h} ends the window there"
+                );
+                rsr_put_record(&storage, &tip, original.clone());
+            }
+            assert_eq!(
+                rsr_restart_ring(&storage).await,
+                (1..=30).collect::<Vec<u64>>()
+            );
+        }
+
+        /// Fail-safe seeding: a record that names no parent is not used either
+        /// (the walk only reverts to the block a record says it reverts to).
+        #[tokio::test]
+        async fn a_record_naming_no_parent_ends_the_restored_window() {
+            let (storage, _dir, main) = rsr_stopped_at_30().await;
+            let tip = main.last().expect("tip").clone();
+            let h = 20u64;
+            let original = storage.state.get_reorg_undo(h).expect("read").expect("rec");
+            assert!(original.parent.is_some(), "fixture: a parent is recorded");
+            let mut no_parent = original.clone();
+            no_parent.parent = None;
+            rsr_put_record(&storage, &tip, no_parent);
+            assert_eq!(
+                rsr_restart_ring(&storage).await,
+                (h..=30).collect::<Vec<u64>>(),
+                "a record at {h} naming no parent ends the window there"
+            );
+        }
+
+        /// A model registered BEFORE the window (height 10, tip 130) and updated
+        /// inside it (120), across a real restart (state hydrated from the store)
+        /// and a reorg forking at 125 onto a branch that leaves it alone: the
+        /// restarted node must hold the same model as a node that never stopped.
+        ///
+        /// It cannot today. Models and training jobs live in memory only: they
+        /// are not persisted to the flat store and not loaded at start-up, so a
+        /// restarted node holds none at its tip, and the window rebuilt from the
+        /// undo records only knows the pre-images of what changed inside it. See
+        /// `restore_reorg_window` (the limit), tracked as its own item.
+        #[tokio::test]
+        #[ignore = "tracked: startup model/job load"]
+        async fn pre_window_model_updated_in_the_window_survives_a_restart_reorg() {
+            let model = [0x4F; 32];
+            let ops = |h: u64, nonce: u64| match h {
+                10 => Some(rsr_register(model, nonce)),
+                120 => Some(rsr_update(model, nonce)),
+                _ => None,
+            };
+            let (main, snaps) =
+                rsr_extend_with(rsr_genesis(), Hash::default(), 1, 130, VRF_OUT, BOB, &ops).await;
+            let fork = 125u64;
+            let side = rsr_fork(&main, &snaps, fork, 10, [0x5B; 32], CAROL).await;
+            let head = side.last().expect("side").clone();
+            let version = |exec: &Executor| {
+                exec.state_db()
+                    .get_model(&citrate_execution::types::ModelId(Hash::new(model)))
+                    .map(|m| m.version)
+            };
+
+            // A node that never stopped.
+            let (s1, _d1) = rsr_node().await;
+            let live = rsr_hydrated(&s1);
+            let mut app1 = CanonicalApplicator::new(live.clone(), s1.clone());
+            for b in &main {
+                persist(&s1, b);
+                app1.apply_received(b).await;
+            }
+            assert_eq!(version(&live), Some(2), "fixture: registered, then updated");
+            for b in &side {
+                persist(&s1, b);
+            }
+            app1.fork_choice = Some(fork_choice_returning(head.header.block_hash));
+            app1.drive_drain().await;
+            assert_eq!(app1.applied_tip().await.hash, head.header.block_hash);
+
+            // A node that stopped at 130 and restarted from its durable store.
+            let (s2, _d2) = rsr_node().await;
+            let before = rsr_hydrated(&s2);
+            rsr_apply(&s2, &before, &main).await;
+            drop(before);
+            let restarted = rsr_hydrated(&s2);
+            let mut app2 = CanonicalApplicator::new(restarted.clone(), s2.clone());
+            for b in &side {
+                persist(&s2, b);
+            }
+            app2.fork_choice = Some(fork_choice_returning(head.header.block_hash));
+            app2.drive_drain().await;
+            assert_eq!(app2.applied_tip().await.hash, head.header.block_hash);
+            assert_eq!(restarted.calculate_state_root(), head.state_root);
+            assert_eq!(
+                version(&restarted),
+                version(&live),
+                "the restarted node's model matches the node that never stopped"
+            );
+        }
+
         /// Rebuilding the window at start-up stops at its time budget: a shorter
         /// window (here the tip alone), never a wrong one.
         #[tokio::test]
@@ -13762,6 +14008,177 @@ pub(crate) mod tests {
                 (0..=30).filter(|h| *h >= 1).collect::<Vec<u64>>(),
                 "with the budget, the whole chain (genesis has no stored block)"
             );
+        }
+
+        /// The outcome of [`rsr_rejected_reorg`].
+        struct RejectedReorg {
+            healed: bool,
+            tip: AppliedTip,
+            lowest: u64,
+            head: Block,
+            fork: u64,
+            root: Hash,
+            durable_root: Hash,
+            _dir: tempfile::TempDir,
+        }
+
+        /// A node at tip 30 (optionally with its DAG store pruned below
+        /// `prune_at`) meets a strictly heavier branch forking at 25, inside its
+        /// ring. `recover_automatic` runs while the in-place reorg's winning
+        /// commit fails once, so `reorg_to` is rejected (not for finality), or,
+        /// with `finalized` above the fork point, for finality.
+        async fn rsr_rejected_reorg(
+            prune_at: Option<u64>,
+            finalized: Option<u64>,
+        ) -> RejectedReorg {
+            use citrate_consensus::dag_store::DagStore;
+            let (main, snaps) = rsr_main(30).await;
+            let fork = 25u64;
+            let side = rsr_fork(&main, &snaps, fork, 10, [0x5B; 32], CAROL).await;
+            let head = side.last().expect("side").clone();
+
+            let dir = tempfile::tempdir().expect("dir");
+            let storage = Arc::new(
+                StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
+            );
+            let store = Arc::new(V251AbortStore {
+                inner: storage.state.clone(),
+                writes: AtomicU64::new(0),
+                abort_at: u64::MAX,
+                fail_receipt_index: AtomicBool::new(false),
+                fail_reorg_batch_at: AtomicU64::new(0),
+                reorg_batches: AtomicU64::new(0),
+            });
+            let exec = Arc::new(Executor::with_storage(
+                Arc::new(StateDB::new()),
+                Some(store.clone()),
+            ));
+            exec.state_restore(rsr_genesis());
+            exec.set_balance(&Address(ALICE), U256::from(FUND));
+            exec.persist_state_changes().await.expect("persist genesis");
+            let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            if let Some(at) = prune_at {
+                let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+                let point = &main[usize::try_from(at - 1).expect("i")];
+                dag.store_block(point.clone()).await.expect("into DAG");
+                dag.update_pruning_point(point.header.block_hash)
+                    .await
+                    .expect("pruning point");
+                app = app.with_dag_prune_floor(dag);
+            }
+            for b in &main {
+                persist(&storage, b);
+                assert!(matches!(
+                    app.apply_received(b).await,
+                    ApplyOutcome::Applied { .. }
+                ));
+            }
+            for b in &side {
+                persist(&storage, b);
+            }
+            let tip = main.last().expect("main").header.block_hash;
+            app.fork_choice = Some(fork_choice_returning(head.header.block_hash));
+            app.fork_weight = Some(weights(&[(head.header.block_hash, 1_000), (tip, 30)]));
+            assert!(
+                app.lock.lock().await.snapshots.contains_key(&fork),
+                "fixture: the fork point is inside the ring"
+            );
+            // Reorg batch 1 reverts to the fork point; batch 2 (the winner's
+            // commit) fails once, so the in-place reorg is rejected.
+            store.fail_reorg_batch_at.store(
+                store.reorg_batches.load(Ordering::SeqCst) + 2,
+                Ordering::SeqCst,
+            );
+            if let Some(f) = finalized {
+                app.finalized_height_handle().store(f, Ordering::SeqCst);
+            }
+            let watch = LowestTip::start(storage.clone());
+            let healed = app
+                .recover_automatic(rsr_genesis(), Hash::default(), head.header.block_hash)
+                .await
+                .expect("recovery");
+            let lowest = watch.finish();
+            assert!(
+                finalized.is_some() || store.reorg_batches.load(Ordering::SeqCst) >= 2,
+                "fixture: the in-place reorg was attempted"
+            );
+            RejectedReorg {
+                healed,
+                tip: app.applied_tip().await,
+                lowest,
+                head,
+                fork,
+                root: exec.calculate_state_root(),
+                durable_root: rsr_hydrated(&storage).calculate_state_root(),
+                _dir: dir,
+            }
+        }
+
+        /// An UNPRUNED node whose in-place reorg toward a strictly heavier head is
+        /// rejected for a reason other than finality (here the winning branch's
+        /// store commit fails once) falls back to the from-genesis rebuild and
+        /// converges, as it did before the window was rebuilt from undo records.
+        /// A rejection must never leave it on its tip for good.
+        #[tokio::test]
+        async fn unpruned_node_heals_by_rebuild_when_the_in_place_reorg_is_rejected() {
+            if std::env::var(RSR_DIR).is_ok() || std::env::var(V251_DIR).is_ok() {
+                return;
+            }
+            let r = rsr_rejected_reorg(None, None).await;
+            assert!(
+                r.healed,
+                "an unpruned node falls back to the rebuild when the in-place reorg is rejected"
+            );
+            assert_eq!(
+                r.tip,
+                AppliedTip {
+                    hash: r.head.header.block_hash,
+                    height: r.head.header.height
+                }
+            );
+            assert_eq!(r.root, r.head.state_root);
+            assert_eq!(
+                r.durable_root, r.head.state_root,
+                "durable state on the heavier branch"
+            );
+        }
+
+        /// The same rejection on a PRUNED node does not fall back: no rebuild
+        /// from genesis (the durable tip never goes below the fork point), and
+        /// the node keeps its tip and state.
+        #[tokio::test]
+        async fn pruned_node_never_rebuilds_after_a_rejected_in_place_reorg() {
+            if std::env::var(RSR_DIR).is_ok() || std::env::var(V251_DIR).is_ok() {
+                return;
+            }
+            let r = rsr_rejected_reorg(Some(10), None).await;
+            assert!(!r.healed, "a pruned node never rebuilds from genesis");
+            assert_eq!(r.tip.height, 30, "the applied tip is kept");
+            assert!(
+                r.lowest >= r.fork,
+                "no rewind below the fork point (lowest durable tip {})",
+                r.lowest
+            );
+            assert_eq!(r.root, r.durable_root, "memory == store");
+        }
+
+        /// An unpruned node whose in-place reorg is rejected because the fork
+        /// point is below the finalized floor does not fall back to the
+        /// rebuild either: it keeps its tip.
+        #[tokio::test]
+        async fn a_reorg_rejected_for_finality_never_falls_back_to_the_rebuild() {
+            if std::env::var(RSR_DIR).is_ok() || std::env::var(V251_DIR).is_ok() {
+                return;
+            }
+            let r = rsr_rejected_reorg(None, Some(27)).await;
+            assert!(!r.healed, "no rebuild across the finalized floor");
+            assert_eq!(r.tip.height, 30, "the applied tip is kept");
+            assert!(
+                r.lowest >= r.fork,
+                "no rewind below the fork point (lowest durable tip {})",
+                r.lowest
+            );
+            assert_eq!(r.root, r.durable_root, "memory == store");
         }
 
         // -- crash consistency --------------------------------------------
@@ -13929,9 +14346,34 @@ pub(crate) mod tests {
             let linear = body(store, "fn write_state_batch_with_applied_tip(");
             assert!(
                 linear.contains("self.stage_block_undo(")
+                    && linear.contains("models_jobs,")
                     && linear.contains("stage_applied_tip_locked("),
-                "a linear tip commit stages its undo record under the index lock"
+                "a linear tip commit stages its whole undo record (model/job pre-images \
+                 included) under the index lock"
             );
+            // The whole record commits in the block's batch: nothing completes it
+            // after the commit (a crash in between would lose the window).
+            let exec = include_str!("../../core/execution/src/executor.rs");
+            let inner = body(exec, "async fn apply_block_inner(");
+            assert!(
+                inner.contains(".persist_state_changes_with_undo(")
+                    && inner.contains("model_job_pre_images(&snapshot"),
+                "block import commits the block's model/job pre-images in its batch"
+            );
+            let producer = include_str!("producer.rs");
+            let produce = body(producer, "async fn produce_block(&self)");
+            assert!(
+                produce.contains("round_state.model_job_undo()")
+                    && produce.contains(".persist_state_changes_with_undo("),
+                "the producer commits the block's model/job pre-images in its batch"
+            );
+            for (name, src) in [("canonical_apply.rs", apply), ("state_store.rs", store)] {
+                let completion = ["complete_", "reorg_undo("].concat();
+                assert!(
+                    !src.contains(&completion),
+                    "{name}: an undo record must not be completed after its commit"
+                );
+            }
             assert!(body(store, "fn write_reorg_batch_sync(").contains("self.stage_branch_undo("));
             assert_eq!(
                 store.matches("self.stage_applied_tip(").count()
@@ -13999,6 +14441,77 @@ pub(crate) mod tests {
             assert!(
                 bad.is_empty(),
                 "crash points that lose or corrupt the window: {bad:#?}"
+            );
+        }
+
+        /// kill -9 right AFTER every state commit (the fsync'd linear batch or
+        /// a reorg batch) and before anything the caller writes next: the
+        /// restarted node still keeps the whole window. A block's undo record is
+        /// complete when its batch commits; nothing written after the commit is
+        /// needed to revert it.
+        #[tokio::test]
+        async fn crash_right_after_every_commit_keeps_the_reorg_window() {
+            if std::env::var(RSR_DIR).is_ok() {
+                return;
+            }
+            let test = "canonical_apply::tests::restart_safe_reorg::rsr_crash_child";
+            let (main, side, third) = rsr_crash_blocks().await;
+            let dry = tempfile::tempdir().expect("dir");
+            let out = v251_spawn(
+                test,
+                &[
+                    (RSR_DIR, dry.path().to_string_lossy().into()),
+                    ("V251_TRACE", "1".into()),
+                ],
+            )
+            .wait_with_output()
+            .expect("dry");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let commits: Vec<(u64, String)> = stderr
+                .lines()
+                .filter_map(|l| {
+                    let rest = l.strip_prefix("V251 write#")?;
+                    let (n, what) = rest.split_once(' ')?;
+                    let what = what.trim();
+                    (what == "write_state_batch_with_applied_tip"
+                        || what == "write_reorg_batch_sync")
+                        .then(|| Some((n.parse().ok()?, what.to_string())))
+                        .flatten()
+                })
+                .collect();
+            assert!(
+                commits
+                    .iter()
+                    .filter(|(_, w)| w == "write_state_batch_with_applied_tip")
+                    .count()
+                    >= usize::try_from(RSR_MAIN).expect("n"),
+                "fixture: every linear block commits through the store: {commits:?}\n{stderr}"
+            );
+            let mut bad = Vec::new();
+            for (k, what) in &commits {
+                let dir = tempfile::tempdir().expect("dir");
+                let out = v251_spawn(
+                    test,
+                    &[
+                        (RSR_DIR, dir.path().to_string_lossy().into()),
+                        (V251_ABORT_AFTER, k.to_string()),
+                    ],
+                )
+                .wait_with_output()
+                .expect("child");
+                let err = String::from_utf8_lossy(&out.stderr);
+                if !err.contains("V251 ABORT after") {
+                    bad.push(format!("k={k} [{what}]: the child did not abort"));
+                    continue;
+                }
+                match rsr_check_crashed(dir.path(), &main, &side, &third).await {
+                    Ok(d) => println!("RSR abort after k={k} [{what}] -> {d}"),
+                    Err(e) => bad.push(format!("after k={k} [{what}] {e}")),
+                }
+            }
+            assert!(
+                bad.is_empty(),
+                "crash points right after a commit that lose or corrupt the window: {bad:#?}"
             );
         }
     }

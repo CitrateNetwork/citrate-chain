@@ -98,6 +98,7 @@ impl Node {
                 &[],
                 Some((hash, height)),
                 &ReceiptIndexBatch::default(),
+                None,
             )
             .expect("commit");
     }

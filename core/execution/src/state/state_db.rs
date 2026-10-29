@@ -56,6 +56,12 @@ pub struct StateDB {
     /// and carried by snapshots so a revert restores it. `0` (genesis) until
     /// then.
     root_height: AtomicU64,
+
+    /// Bumped on every change to `models` or `training_jobs` (and on every
+    /// restore). Never decreases, so an equal value read twice from the same
+    /// db means neither registry changed in between: the undo record of a
+    /// block that touches neither needs no model/job comparison.
+    model_job_generation: AtomicU64,
 }
 
 impl StateDB {
@@ -70,6 +76,7 @@ impl StateDB {
             dirty_storage: Arc::new(DashSet::new()),
             dirty_code: Arc::new(DashSet::new()),
             root_height: AtomicU64::new(0),
+            model_job_generation: AtomicU64::new(0),
         }
     }
 
@@ -91,6 +98,7 @@ impl StateDB {
             dirty_storage: Arc::new(DashSet::new()),
             dirty_code: Arc::new(DashSet::new()),
             root_height: AtomicU64::new(0),
+            model_job_generation: AtomicU64::new(0),
         };
         iso.restore(self.snapshot());
         iso
@@ -238,6 +246,7 @@ impl StateDB {
         }
 
         self.models.insert(model_id, model);
+        self.bump_model_job_generation();
         info!("Registered model: {:?}", model_id);
         Ok(())
     }
@@ -254,6 +263,7 @@ impl StateDB {
         }
 
         self.models.insert(model_id, model);
+        self.bump_model_job_generation();
         Ok(())
     }
 
@@ -273,6 +283,7 @@ impl StateDB {
         }
 
         self.training_jobs.insert(job_id, job);
+        self.bump_model_job_generation();
         info!("Created training job: {:?}", job_id);
         Ok(())
     }
@@ -293,6 +304,7 @@ impl StateDB {
         }
 
         self.training_jobs.insert(job_id, job);
+        self.bump_model_job_generation();
         Ok(())
     }
 
@@ -304,12 +316,49 @@ impl StateDB {
     /// this; inside a tx, write through the journal.
     pub(crate) fn apply_journaled_model(&self, model_id: ModelId, model: ModelState) {
         self.models.insert(model_id, model);
+        self.bump_model_job_generation();
     }
 
     /// Apply a training-job entry recorded in a committed tx journal
     /// (see [`Self::apply_journaled_model`]).
     pub(crate) fn apply_journaled_job(&self, job_id: JobId, job: TrainingJob) {
         self.training_jobs.insert(job_id, job);
+        self.bump_model_job_generation();
+    }
+
+    fn bump_model_job_generation(&self) {
+        self.model_job_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The model/job change counter (see the field). Pair it with a
+    /// [`Self::snapshot`] taken at the same moment and pass both to
+    /// [`Self::model_job_pre_images`].
+    pub fn model_job_generation(&self) -> u64 {
+        self.model_job_generation.load(Ordering::SeqCst)
+    }
+
+    /// The model and training-job pre-images, in `prev`, of every entry that
+    /// differs now (`None`: absent in `prev`). `prev` must be a snapshot of
+    /// this db taken when [`Self::model_job_generation`] read `generation`;
+    /// when it still reads the same, neither registry changed and the answer
+    /// is empty without comparing anything.
+    pub fn model_job_pre_images(
+        &self,
+        prev: &StateSnapshot,
+        generation: u64,
+    ) -> crate::executor::ModelJobUndo {
+        if self.model_job_generation() == generation {
+            return crate::executor::ModelJobUndo::default();
+        }
+        let jobs: Vec<(JobId, TrainingJob)> = self
+            .training_jobs
+            .iter()
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect();
+        crate::executor::ModelJobUndo {
+            models: pre_images_by_encoding(&prev.models, &self.all_models()),
+            jobs: pre_images_by_encoding(&prev.training_jobs, &jobs),
+        }
     }
 
     /// Calculate state root.
@@ -592,6 +641,7 @@ impl StateDB {
         for (id, job) in snapshot.training_jobs {
             self.training_jobs.insert(id, job);
         }
+        self.bump_model_job_generation();
 
         debug!("State restored from snapshot");
     }
@@ -904,6 +954,55 @@ mod tests {
 
         assert_eq!(db.get_code(&code_hash), Some(code));
         assert_eq!(db.accounts.get_code_hash(&addr), code_hash);
+    }
+
+    /// A block's model/job pre-images, from the db and a snapshot taken with
+    /// its generation: empty when neither registry changed (no comparison),
+    /// otherwise exactly the entries that changed, with their earlier value.
+    /// A restore counts as a change.
+    #[test]
+    fn model_job_pre_images_track_every_registry_change() {
+        use crate::types::{ModelMetadata, UsageStats};
+        let model = |version: u32| ModelState {
+            owner: Address([1; 20]),
+            model_hash: Hash::new([0x77; 32]),
+            version,
+            metadata: ModelMetadata::default(),
+            access_policy: crate::types::AccessPolicy::Public,
+            usage_stats: UsageStats::default(),
+        };
+        let (m1, m2) = (ModelId(Hash::new([1; 32])), ModelId(Hash::new([2; 32])));
+        let db = StateDB::new();
+        db.register_model(m1, model(1)).expect("register");
+        let gen = db.model_job_generation();
+        let before = db.snapshot();
+        db.accounts.set_balance(Address([9; 20]), U256::from(5));
+        assert_eq!(
+            db.model_job_pre_images(&before, gen),
+            crate::executor::ModelJobUndo::default(),
+            "no registry change: empty"
+        );
+        db.update_model(m1, model(2)).expect("update");
+        db.register_model(m2, model(1)).expect("register");
+        let undo = db.model_job_pre_images(&before, gen);
+        let mut got: Vec<(ModelId, Option<u32>)> = undo
+            .models
+            .iter()
+            .map(|(id, m)| (*id, m.as_ref().map(|m| m.version)))
+            .collect();
+        got.sort_by_key(|(id, _)| id.0);
+        assert_eq!(got, vec![(m1, Some(1)), (m2, None)]);
+        assert!(undo.jobs.is_empty());
+        // Applied back, the pre-images give the earlier registry.
+        let back = db.snapshot().with_model_job_pre_images(&undo);
+        let restored = StateDB::new();
+        restored.restore(back);
+        assert_eq!(restored.get_model(&m1).map(|m| m.version), Some(1));
+        assert!(restored.get_model(&m2).is_none());
+        // A restore moves the generation: a stale pairing never reads "unchanged".
+        let gen2 = db.model_job_generation();
+        db.restore(before.clone());
+        assert_ne!(db.model_job_generation(), gen2);
     }
 
     /// The pre-images of a change, applied back, give the earlier state: the
