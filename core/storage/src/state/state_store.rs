@@ -1006,8 +1006,8 @@ mod tests {
     /// durable tip as parent.
     #[test]
     fn a_tip_commit_records_the_pre_images_it_overwrites() {
-        let temp_dir = TempDir::new().unwrap();
-        let store = StateStore::new(Arc::new(RocksDB::open(temp_dir.path()).unwrap()));
+        let temp_dir = TempDir::new().expect("tempdir");
+        let store = StateStore::new(Arc::new(RocksDB::open(temp_dir.path()).expect("open")));
         let (a, b) = (Address([1; 20]), Address([2; 20]));
         let none = ReceiptIndexBatch::default();
         store
@@ -1018,7 +1018,7 @@ mod tests {
                 &none,
                 None,
             )
-            .unwrap();
+            .expect("commit");
         store
             .write_state_batch_with_applied_tip(
                 &[(a, acct(20)), (b, acct(5))],
@@ -1027,8 +1027,8 @@ mod tests {
                 &none,
                 None,
             )
-            .unwrap();
-        let rec = store.get_reorg_undo(2).unwrap().expect("record");
+            .expect("commit");
+        let rec = store.get_reorg_undo(2).expect("read").expect("record");
         assert_eq!(rec.hash, block_hash(2));
         assert_eq!(rec.parent, Some((block_hash(1), 1)));
         assert_eq!(rec.accounts, vec![(a, Some(acct(10))), (b, None)]);
@@ -1049,8 +1049,8 @@ mod tests {
                 &none,
                 None,
             )
-            .unwrap();
-        let rec = store.get_reorg_undo(2).unwrap().expect("record");
+            .expect("commit");
+        let rec = store.get_reorg_undo(2).expect("read").expect("record");
         assert_eq!(
             rec.accounts,
             vec![(a, Some(acct(10))), (b, None), (Address([3; 20]), None)]
@@ -1148,8 +1148,8 @@ mod tests {
     /// to the fork point, an abort) leaves them all.
     #[test]
     fn undo_records_keep_exactly_the_window() {
-        let temp_dir = TempDir::new().unwrap();
-        let store = StateStore::new(Arc::new(RocksDB::open(temp_dir.path()).unwrap()));
+        let temp_dir = TempDir::new().expect("tempdir");
+        let store = StateStore::new(Arc::new(RocksDB::open(temp_dir.path()).expect("open")));
         let a = Address([1; 20]);
         let none = ReceiptIndexBatch::default();
         for h in 1..=150u64 {
@@ -1161,18 +1161,18 @@ mod tests {
                     &none,
                     None,
                 )
-                .unwrap();
+                .expect("commit");
         }
         assert_eq!(
-            store.reorg_undo_heights().unwrap(),
+            store.reorg_undo_heights().expect("heights"),
             (51..=150).collect::<Vec<u64>>()
         );
         // Revert to a fork point at 140: no records passed, nothing changes.
         store
             .write_reorg_batch_sync(&[], &[], &[], &[], Some((block_hash(140), 140)), &none, &[])
-            .unwrap();
+            .expect("commit");
         assert_eq!(
-            store.reorg_undo_heights().unwrap(),
+            store.reorg_undo_heights().expect("heights"),
             (51..=150).collect::<Vec<u64>>()
         );
         // The winning branch 141..=145 commits with its records.
@@ -1196,18 +1196,18 @@ mod tests {
                 &none,
                 &winner,
             )
-            .unwrap();
+            .expect("commit");
         assert_eq!(
-            store.reorg_undo_heights().unwrap(),
+            store.reorg_undo_heights().expect("heights"),
             (46..=145).filter(|h| *h >= 51).collect::<Vec<u64>>(),
             "abandoned 146..=150 dropped; nothing below the window"
         );
         assert_eq!(
-            store.get_reorg_undo(143).unwrap().map(|r| r.hash),
+            store.get_reorg_undo(143).expect("read").map(|r| r.hash),
             Some(Hash::new([143; 32]))
         );
         assert_eq!(
-            store.get_reorg_undo(140).unwrap().map(|r| r.hash),
+            store.get_reorg_undo(140).expect("read").map(|r| r.hash),
             Some(block_hash(140)),
             "the shared chain's records stay"
         );
