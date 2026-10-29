@@ -4337,6 +4337,161 @@ mod tests {
         }
     }
 
+    /// A tracker following `peer` from `top`: two unconnected tip answers
+    /// start the probe, and an answer admitting `top` ends it in Follow.
+    fn following(peer: &str, top: u64) -> RejoinTracker {
+        let mut t = RejoinTracker::new();
+        for _ in 0..PROBE_AFTER_STRIKES {
+            t.note_asked(peer, (hx(1), top));
+            let ah = t.take_answer(peer, &[], &HashSet::new()).expect("answer");
+            t.on_answer(Answer::Unconnected, true, ah);
+        }
+        let a = t.anchor((hx(1), top), |_| Some(hx(2)));
+        t.note_asked(peer, a);
+        let ah = t
+            .take_answer(peer, &[a.0], &[a.0].into_iter().collect())
+            .expect("answer");
+        t.on_answer(
+            Answer::Progress {
+                highest: (hx(7), top),
+            },
+            true,
+            ah,
+        );
+        assert!(matches!(t.mode(), Mode::Follow { .. }), "{:?}", t.mode());
+        t
+    }
+
+    /// One follow tick against `peer`: ask, and take an answer that admitted
+    /// blocks up to `highest`.
+    fn follow_answer(t: &mut RejoinTracker, peer: &str, highest: u64) {
+        let a = t.anchor((hx(1), 0), |_| Some(hx(2)));
+        t.note_asked(peer, a);
+        let ah = t
+            .take_answer(peer, &[a.0], &[a.0].into_iter().collect())
+            .expect("answer");
+        t.on_answer(
+            Answer::Progress {
+                highest: (hx(8), highest),
+            },
+            true,
+            ah,
+        );
+    }
+
+    /// A pinned follow peer that drips (seven answers that admit blocks
+    /// without moving the cursor, then one that moves it by
+    /// `FOLLOW_TRICKLE_ADVANCE`) averages about one block per answer and
+    /// never lets the node catch up. Whether it advertises its own low head
+    /// or the true one, the pin yields to the peer far ahead within a bounded
+    /// number of answers (DGX review of 017cdbe6, P2).
+    #[test]
+    fn a_dripping_follow_peer_cannot_hold_the_pin() {
+        let top = 500u64;
+        let honest = 1_000_000u64;
+        for true_head in [false, true] {
+            let mut t = following("drip", top);
+            let sel = SyncPeerSelector::new();
+            let mut gate = SplitPullGate::new();
+            let t0 = Instant::now();
+            let mut cursor = top;
+            let mut answers = 0u64;
+            let mut yielded = None;
+            for tick in 0..5_000u64 {
+                let now = t0 + Duration::from_secs(2 * tick);
+                let cands = [
+                    SyncCandidate {
+                        id: "drip".into(),
+                        head_height: if true_head { honest } else { cursor + 1 },
+                    },
+                    SyncCandidate {
+                        id: "honest".into(),
+                        head_height: honest,
+                    },
+                ];
+                let (src, _) = choose_source(
+                    &mut t,
+                    &sel,
+                    &mut gate,
+                    &cands,
+                    &[],
+                    (hx(1), top),
+                    |_| true,
+                    now,
+                );
+                if src != Source::Pinned("drip".into()) {
+                    yielded = Some((tick, src));
+                    break;
+                }
+                answers += 1;
+                let highest = if answers.is_multiple_of(8) {
+                    cursor += FOLLOW_TRICKLE_ADVANCE;
+                    cursor
+                } else {
+                    cursor.saturating_sub(1)
+                };
+                follow_answer(&mut t, "drip", highest);
+            }
+            let (tick, src) = yielded.unwrap_or_else(|| {
+                panic!("true_head={true_head}: the drip held the pin for 10000s, cursor {cursor}")
+            });
+            assert!(
+                answers <= 2 * u64::from(MAX_TRICKLE_ANSWERS),
+                "true_head={true_head}: the drip held the pin for {answers} answers \
+                 ({tick} ticks), then {src:?}"
+            );
+        }
+    }
+
+    /// In Follow, only an answer that moves the cursor by at least
+    /// `FOLLOW_TRICKLE_ADVANCE` keeps the pin live: slow answers that admit
+    /// blocks without moving it let a peer far ahead take the tick once
+    /// `PIN_STALL_TIMEOUT` passes, before the trickle window fills.
+    #[test]
+    fn a_follow_answer_below_the_trickle_advance_is_not_liveness() {
+        let top = 500u64;
+        let mut t = following("drip", top);
+        let sel = SyncPeerSelector::new();
+        let mut gate = SplitPullGate::new();
+        let t0 = Instant::now();
+        let cands = [
+            SyncCandidate {
+                id: "drip".into(),
+                head_height: top + 1,
+            },
+            SyncCandidate {
+                id: "honest".into(),
+                head_height: 1_000_000,
+            },
+        ];
+        // Seven answers below the advance, 13 s apart, leave the trickle
+        // window one short of full; the eighth tick is 91 s in.
+        let step = Duration::from_secs(13);
+        let drips = MAX_TRICKLE_ANSWERS - 1;
+        let mut src = Source::Nobody;
+        for tick in 0..=drips {
+            src = choose_source(
+                &mut t,
+                &sel,
+                &mut gate,
+                &cands,
+                &[],
+                (hx(1), top),
+                |_| true,
+                t0 + step * tick,
+            )
+            .0;
+            if src != Source::Pinned("drip".into()) {
+                break;
+            }
+            if tick < drips {
+                follow_answer(&mut t, "drip", top - 1);
+            }
+        }
+        assert!(step * drips > PIN_STALL_TIMEOUT);
+        assert_eq!(src, Source::Ahead("honest".into()), "mode={:?}", t.mode());
+    }
+
     /// The stall clock restarts on the first tick after a consumed answer
     /// from the pinned peer (here, admitted blocks), and runs from the last
     /// such tick.
