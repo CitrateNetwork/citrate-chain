@@ -4094,6 +4094,97 @@ mod tests {
         assert_eq!(t.mode(), &Mode::Tip { strikes: 0 });
     }
 
+    /// An advertised head is self-reported and is raised by gossip before the
+    /// block is validated, so it is no evidence that its peer can carry us.
+    /// A search pinned to an honest leader that keeps answering stays pinned
+    /// while another peer advertises any height, however large, and serves
+    /// nothing.
+    #[test]
+    fn an_advertised_lead_alone_never_ends_a_pinned_search() {
+        for liar_head in [1_000_000_000u64, u64::MAX / 2, u64::MAX] {
+            let mut t = RejoinTracker::new();
+            let sel = SyncPeerSelector::new();
+            let mut gate = SplitPullGate::new();
+            let top = 500u64;
+            let fork = 450u64;
+            // Two unconnected tip answers from the leader start the search,
+            // pinned to it.
+            let mut tr = None;
+            for _ in 0..PROBE_AFTER_STRIKES {
+                t.note_asked("leader", (hx(1), top));
+                let ah = t
+                    .take_answer("leader", &[], &HashSet::new())
+                    .expect("answer");
+                tr = t.on_answer(Answer::Unconnected, true, ah);
+            }
+            assert_eq!(tr, Some(Transition::StartedProbe { top }));
+            let t0 = Instant::now();
+            let mut leader_head = 600u64;
+            let mut followed = false;
+            // Well past any stall bound, one tick per second.
+            for tick in 0..240u64 {
+                let now = t0 + Duration::from_secs(tick);
+                let cands = [
+                    SyncCandidate {
+                        id: "leader".into(),
+                        head_height: leader_head,
+                    },
+                    SyncCandidate {
+                        id: "liar".into(),
+                        head_height: liar_head,
+                    },
+                ];
+                let (src, tr) = choose_source(
+                    &mut t,
+                    &sel,
+                    &mut gate,
+                    &cands,
+                    &[],
+                    (hx(1), top),
+                    |_| true,
+                    now,
+                );
+                assert_eq!(
+                    src,
+                    Source::Pinned("leader".into()),
+                    "liar@{liar_head} tick {tick}: {tr:?} mode={:?}",
+                    t.mode()
+                );
+                assert!(
+                    !matches!(tr, Some(Transition::Finished { .. })),
+                    "liar@{liar_head} tick {tick}: {tr:?}"
+                );
+                // The leader answers this tick's request.
+                let a = t.anchor((hx(1), top), |_| Some(hx(2)));
+                t.note_asked("leader", a);
+                let ah = t
+                    .take_answer("leader", &[a.0], &[a.0].into_iter().collect())
+                    .expect("the leader answers");
+                let answer = match t.mode() {
+                    Mode::Follow { cursor } => Answer::Progress {
+                        highest: (hx(7), cursor.1 + FOLLOW_TRICKLE_ADVANCE),
+                    },
+                    _ => model(fork, 64, a.1),
+                };
+                if let Answer::Progress { highest } = answer {
+                    leader_head = leader_head.max(highest.1);
+                }
+                t.on_answer(answer, true, ah);
+                followed |= matches!(t.mode(), Mode::Follow { .. });
+                assert_eq!(
+                    t.search_peer(),
+                    Some("leader"),
+                    "liar@{liar_head} tick {tick}: the search ended: {:?}",
+                    t.mode()
+                );
+            }
+            assert!(
+                followed,
+                "liar@{liar_head}: the search never found the fork"
+            );
+        }
+    }
+
     /// Strikes count unconnected answers from ONE peer. An answer from a peer
     /// on our own branch (it holds our tip, nothing above) says nothing about
     /// whether the striking peer extends us and must not reset them; the
