@@ -611,6 +611,13 @@ impl Default for StateDB {
     }
 }
 
+/// An account's value before a change (`None`: absent).
+pub type AccountPreImage = (Address, Option<crate::types::AccountState>);
+
+/// A storage slot's value before a change: `(address, slot key, value)`
+/// (`None`: absent).
+pub type StoragePreImage = (Address, Vec<u8>, Option<Vec<u8>>);
+
 /// State snapshot for rollback.
 ///
 /// `Clone` supports the execute-on-receive reorg snapshot ring
@@ -645,6 +652,143 @@ impl StateSnapshot {
         self.accounts.entries()
     }
 
+    /// The pre-images, in `prev`, of every account and storage slot whose
+    /// value differs in `self`: applying them to `self` with
+    /// [`Self::with_pre_images`] gives `prev`'s accounts and storage. `None`
+    /// means the key is absent in `prev`. Storage tries `self` still shares
+    /// with `prev` (the same `Arc`: copy-on-write leaves an unchanged trie
+    /// shared while `prev` holds it) are skipped without being read.
+    pub fn pre_images_since(
+        &self,
+        prev: &StateSnapshot,
+    ) -> (Vec<AccountPreImage>, Vec<StoragePreImage>) {
+        use std::collections::HashMap;
+        let before: HashMap<&Address, &crate::types::AccountState> =
+            prev.account_entries().iter().map(|(a, s)| (a, s)).collect();
+        let after: HashMap<&Address, &crate::types::AccountState> =
+            self.account_entries().iter().map(|(a, s)| (a, s)).collect();
+        let mut accounts = Vec::new();
+        for (addr, state) in &after {
+            let old = before.get(addr).copied();
+            if old != Some(*state) {
+                accounts.push((**addr, old.cloned()));
+            }
+        }
+        for (addr, state) in &before {
+            if !after.contains_key(addr) {
+                accounts.push((**addr, Some((*state).clone())));
+            }
+        }
+
+        let before_tries: HashMap<&Address, &Arc<Trie>> =
+            prev.storage_tries.iter().map(|(a, t)| (a, t)).collect();
+        let after_tries: HashMap<&Address, &Arc<Trie>> =
+            self.storage_tries.iter().map(|(a, t)| (a, t)).collect();
+        let mut storage = Vec::new();
+        for (addr, trie) in &after_tries {
+            let old = before_tries.get(addr).copied();
+            if old.is_some_and(|o| Arc::ptr_eq(o, trie)) {
+                continue;
+            }
+            let now = trie.entries_map();
+            let was = old.map(|o| o.entries_map()).unwrap_or_default();
+            for (key, value) in &now {
+                if was.get(key) != Some(value) {
+                    storage.push((**addr, key.clone(), was.get(key).cloned()));
+                }
+            }
+            for (key, value) in &was {
+                if !now.contains_key(key) {
+                    storage.push((**addr, key.clone(), Some(value.clone())));
+                }
+            }
+        }
+        for (addr, trie) in &before_tries {
+            if !after_tries.contains_key(addr) {
+                for (key, value) in trie.entries_map() {
+                    storage.push((**addr, key, Some(value)));
+                }
+            }
+        }
+        (accounts, storage)
+    }
+
+    /// The pre-images, in `prev`, of every model and training job that differs
+    /// in `self` (compared by their encoding; `None`: absent in `prev`).
+    pub fn model_job_pre_images_since(
+        &self,
+        prev: &StateSnapshot,
+    ) -> crate::executor::ModelJobUndo {
+        crate::executor::ModelJobUndo {
+            models: pre_images_by_encoding(&prev.models, &self.models),
+            jobs: pre_images_by_encoding(&prev.training_jobs, &self.training_jobs),
+        }
+    }
+
+    /// This snapshot with model and training-job pre-images applied (`Some`
+    /// is written, `None` removes the entry).
+    pub fn with_model_job_pre_images(mut self, undo: &crate::executor::ModelJobUndo) -> Self {
+        self.models = apply_pre_images(std::mem::take(&mut self.models), &undo.models);
+        self.training_jobs = apply_pre_images(std::mem::take(&mut self.training_jobs), &undo.jobs);
+        self
+    }
+
+    /// This snapshot with `accounts` and `storage` pre-images applied (a
+    /// `Some` value is written, `None` removes the key; a contract left with
+    /// no slots keeps no trie, as a node hydrated from the store has none),
+    /// nothing dirty, and `root_height` as given. Models, training jobs and
+    /// shared tries are carried over unchanged. The inverse of
+    /// [`Self::pre_images_since`] for accounts and storage.
+    pub fn with_pre_images(
+        &self,
+        accounts: &[AccountPreImage],
+        storage: &[StoragePreImage],
+        root_height: u64,
+    ) -> StateSnapshot {
+        use std::collections::{HashMap, HashSet};
+        let mut account_map: HashMap<Address, crate::types::AccountState> =
+            self.account_entries().iter().cloned().collect();
+        for (addr, state) in accounts {
+            match state {
+                Some(s) => {
+                    account_map.insert(*addr, s.clone());
+                }
+                None => {
+                    account_map.remove(addr);
+                }
+            }
+        }
+        let mut tries: HashMap<Address, Arc<Trie>> = self.storage_tries.iter().cloned().collect();
+        let mut shrunk: HashSet<Address> = HashSet::new();
+        for (addr, key, value) in storage {
+            let trie = tries.entry(*addr).or_insert_with(|| Arc::new(Trie::new()));
+            match value {
+                Some(v) => Arc::make_mut(trie).insert(key.clone(), v.clone()),
+                None => {
+                    Arc::make_mut(trie).remove(key);
+                    shrunk.insert(*addr);
+                }
+            }
+        }
+        for addr in shrunk {
+            if tries.get(&addr).is_some_and(|t| t.entries_map().is_empty()) {
+                tries.remove(&addr);
+            }
+        }
+        StateSnapshot {
+            accounts: crate::state::account::AccountSnapshot::from_entries(
+                account_map.into_iter().collect(),
+            ),
+            storage_tries: tries.into_iter().collect(),
+            models: self.models.clone(),
+            training_jobs: self.training_jobs.clone(),
+            dirty_storage: Vec::new(),
+            dirty_code: Vec::new(),
+            state_trie: self.state_trie.clone(),
+            root_height,
+        }
+    }
+
     /// All captured contract storage as address → (slot key → value). Enumerated
     /// from each contract's storage trie. For reorg store reconciliation.
     pub fn storage_map(
@@ -655,6 +799,52 @@ impl StateSnapshot {
             .map(|(addr, trie)| (*addr, trie.entries_map()))
             .collect()
     }
+}
+
+/// The entries of `before` that differ in `after` (by encoding), with their
+/// `before` value; `None` for entries `after` added.
+fn pre_images_by_encoding<K, V>(before: &[(K, V)], after: &[(K, V)]) -> Vec<(K, Option<V>)>
+where
+    K: Copy + Eq + std::hash::Hash,
+    V: Clone + serde::Serialize,
+{
+    use std::collections::HashMap;
+    let enc = |v: &V| bincode::serialize(v).ok();
+    let was: HashMap<K, &V> = before.iter().map(|(k, v)| (*k, v)).collect();
+    let now: HashMap<K, &V> = after.iter().map(|(k, v)| (*k, v)).collect();
+    let mut out = Vec::new();
+    for (k, v) in &now {
+        match was.get(k) {
+            Some(old) if enc(old).is_some() && enc(old) == enc(v) => {}
+            old => out.push((*k, old.map(|o| (*o).clone()))),
+        }
+    }
+    for (k, v) in &was {
+        if !now.contains_key(k) {
+            out.push((*k, Some((*v).clone())));
+        }
+    }
+    out
+}
+
+/// `entries` with `pre_images` applied: `Some` is written, `None` removed.
+fn apply_pre_images<K, V>(entries: Vec<(K, V)>, pre_images: &[(K, Option<V>)]) -> Vec<(K, V)>
+where
+    K: Copy + Eq + std::hash::Hash,
+    V: Clone,
+{
+    let mut map: std::collections::HashMap<K, V> = entries.into_iter().collect();
+    for (k, v) in pre_images {
+        match v {
+            Some(v) => {
+                map.insert(*k, v.clone());
+            }
+            None => {
+                map.remove(k);
+            }
+        }
+    }
+    map.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -714,6 +904,63 @@ mod tests {
 
         assert_eq!(db.get_code(&code_hash), Some(code));
         assert_eq!(db.accounts.get_code_hash(&addr), code_hash);
+    }
+
+    /// The pre-images of a change, applied back, give the earlier state: the
+    /// same accounts, the same slots, the same root. A trie the change never
+    /// touched is not read.
+    #[test]
+    fn pre_images_since_and_with_pre_images_are_inverse() {
+        let db = StateDB::new();
+        let (a, b, c, d) = (
+            Address([1; 20]),
+            Address([2; 20]),
+            Address([3; 20]),
+            Address([4; 20]),
+        );
+        db.accounts.set_balance(a, U256::from(1000));
+        db.accounts.set_balance(b, U256::from(7));
+        db.set_storage(a, b"k1".to_vec(), b"v1".to_vec());
+        db.set_storage(a, b"k2".to_vec(), b"v2".to_vec());
+        db.set_storage(d, b"same".to_vec(), b"untouched".to_vec());
+        let prev_root = db.calculate_state_root();
+        let prev = db.snapshot();
+
+        db.accounts.set_balance(a, U256::from(900)); // changed
+        db.accounts.set_balance(c, U256::from(100)); // created
+        db.set_storage(a, b"k1".to_vec(), b"v1b".to_vec()); // slot changed
+        db.delete_storage(a, b"k2"); // slot removed
+        db.set_storage(c, b"n".to_vec(), b"new".to_vec()); // new contract storage
+        db.set_root_height(9);
+        let _ = db.calculate_state_root();
+        let cur = db.snapshot();
+
+        let (accounts, storage) = cur.pre_images_since(&prev);
+        assert!(
+            storage.iter().all(|(addr, _, _)| *addr != d),
+            "a shared, untouched trie is skipped: {storage:?}"
+        );
+        assert!(
+            accounts.contains(&(c, None)),
+            "a created account reverts to absent"
+        );
+        assert!(storage.contains(&(a, b"k2".to_vec(), Some(b"v2".to_vec()))));
+        assert!(storage.contains(&(c, b"n".to_vec(), None)));
+
+        let back = cur.with_pre_images(&accounts, &storage, prev.root_height);
+        let restored = StateDB::new();
+        restored.restore(back);
+        assert_eq!(restored.calculate_state_root(), prev_root);
+        assert_eq!(restored.accounts.get_balance(&a), U256::from(1000));
+        assert!(!restored.accounts.exists(&c));
+        assert_eq!(restored.get_storage(&a, b"k1"), Some(b"v1".to_vec()));
+        assert_eq!(restored.get_storage(&a, b"k2"), Some(b"v2".to_vec()));
+        assert_eq!(restored.get_storage(&c, b"n"), None);
+        assert!(
+            !restored.storage_tries.contains_key(&c),
+            "a contract left with no slots keeps no trie, as after hydration"
+        );
+        assert_eq!(restored.root_height(), prev.root_height);
     }
 
     #[test]

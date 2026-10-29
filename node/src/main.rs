@@ -2696,12 +2696,13 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // path that forgot to call it.
         // SAME-HEIGHT-SIBLING WEDGE RECOVERY (2026-08-06; chain 40204 halted at
         // 90,998 then 91,109). Before the periodic drain or the producer starts,
-        // converge a node whose persisted applied tip is a NON-canonical sibling. A
-        // plain restart cannot self-heal this — `CanonicalApplicator::new` seeds the
-        // reorg ring with only the tip's snapshot, so `reorg_to(head)` can never
-        // reach the fork point. `recover_to_head` rebuilds the executor from genesis
-        // and re-applies the canonical chain from the node's OWN stored blocks
-        // (repopulating the ring so the reorg at each fork converges). Atomic + a
+        // converge a node whose persisted applied tip is a NON-canonical sibling.
+        // `CanonicalApplicator::new` rebuilds the reorg ring for the last
+        // MAX_REORG_DEPTH heights from the store's undo records, so a fork point
+        // inside it is reverted in place (`recover_automatic` reorgs; the durable
+        // tip never goes below the fork point). Below the ring, `recover_automatic`
+        // rebuilds the executor from genesis and re-applies the canonical chain from
+        // the node's OWN stored blocks (refused on a pruned DAG store). Atomic + a
         // no-op on a healthy node (tip already == fork-choice head).
         if let Some(app) = canonical_applicator.clone() {
             // Reconstruct the genesis world-state deterministically via the same

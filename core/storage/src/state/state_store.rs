@@ -3,10 +3,12 @@
 use crate::db::{column_families::*, RocksDB};
 use anyhow::Result;
 use citrate_consensus::types::Hash;
-use citrate_execution::executor::{ReceiptIndexBatch, StateStorageChange, StateStoreTrait};
+use citrate_execution::executor::{
+    BlockUndo, ReceiptIndexBatch, StateStorageChange, StateStoreTrait,
+};
 use citrate_execution::types::{AccountState, Address, JobId, ModelId, ModelState, TrainingJob};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// A storage key or value as persisted: raw bytes of any length.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -43,6 +45,34 @@ pub fn legacy_hydration_view(records: Vec<StorageRecord>) -> Vec<StorageRecord> 
             Some(((address, key), StorageBytes(word.to_vec())))
         })
         .collect()
+}
+
+/// Undo records are kept for this many applied heights: the node's reorg
+/// window (`canonical_apply::MAX_REORG_DEPTH`, which asserts it is equal). With
+/// the records of heights `t-99..=t` a node at tip `t` can rebuild the state of
+/// every height `t-100..=t` after a restart.
+pub const REORG_UNDO_DEPTH: u64 = 100;
+
+/// `CF_METADATA` key prefix of the undo records (big-endian height follows).
+/// Metadata, not a column family of its own, so a binary without it still
+/// opens the database.
+const REORG_UNDO_PREFIX: &[u8] = b"reorg_undo:";
+
+fn reorg_undo_key(height: u64) -> Vec<u8> {
+    let mut key = REORG_UNDO_PREFIX.to_vec();
+    key.extend_from_slice(&height.to_be_bytes());
+    key
+}
+
+fn reorg_undo_height(key: &[u8]) -> Option<u64> {
+    let rest = key.strip_prefix(REORG_UNDO_PREFIX)?;
+    let bytes = <[u8; 8]>::try_from(rest).ok()?;
+    Some(u64::from_be_bytes(bytes))
+}
+
+/// Whether height `h` is inside the kept window at tip height `tip`.
+fn in_undo_window(h: u64, tip: u64) -> bool {
+    h <= tip && h > tip.saturating_sub(REORG_UNDO_DEPTH)
 }
 
 /// State storage manager
@@ -157,9 +187,16 @@ impl StateStoreTrait for StateStore {
         }
         // C1-R: the block's RPC receipt index commits in this same batch.
         crate::chain::transaction_store::stage_receipt_index(&self.db, &mut batch, index)?;
-        // chain#421: the canonical height index moves with the tip, in this batch.
+        // chain#421: the canonical height index moves with the tip, in this batch,
+        // and so does the block's undo record (the pre-images read here, before
+        // the batch overwrites them).
         let _index_guard = match applied_tip {
-            Some((hash, height)) => Some(self.stage_applied_tip(&mut batch, &hash, height)?),
+            Some((hash, height)) => {
+                let guard = crate::chain::block_store::canonical_index_lock();
+                self.stage_block_undo(&mut batch, accounts, storage, (hash, height))?;
+                self.stage_applied_tip_locked(&mut batch, &hash, height)?;
+                Some(guard)
+            }
             None => None,
         };
 
@@ -189,6 +226,7 @@ impl StateStoreTrait for StateStore {
         code: &[(Hash, Vec<u8>)],
         applied_tip: Option<(Hash, u64)>,
         index: &ReceiptIndexBatch,
+        undo: &[BlockUndo],
     ) -> Result<()> {
         if accounts.is_empty()
             && storage.is_empty()
@@ -196,6 +234,7 @@ impl StateStoreTrait for StateStore {
             && code.is_empty()
             && applied_tip.is_none()
             && index.is_empty()
+            && undo.is_empty()
         {
             return Ok(());
         }
@@ -229,6 +268,10 @@ impl StateStoreTrait for StateStore {
         }
         // C1-R: the block's RPC receipt index commits in this same batch.
         crate::chain::transaction_store::stage_receipt_index(&self.db, &mut batch, index)?;
+        // The winning branch's undo records replace the kept window, in this batch.
+        if let (Some((_, height)), false) = (applied_tip, undo.is_empty()) {
+            self.stage_branch_undo(&mut batch, undo, height)?;
+        }
         // chain#421: the canonical height index moves with the tip, in this batch.
         let _index_guard = match applied_tip {
             Some((hash, height)) => Some(self.stage_applied_tip(&mut batch, &hash, height)?),
@@ -342,31 +385,231 @@ impl StateStore {
         height: u64,
     ) -> Result<std::sync::MutexGuard<'static, ()>> {
         let guard = crate::chain::block_store::canonical_index_lock();
+        self.stage_applied_tip_locked(batch, hash, height)?;
+        Ok(guard)
+    }
+
+    /// [`Self::stage_applied_tip`] for a caller that already holds the
+    /// canonical index lock.
+    fn stage_applied_tip_locked(
+        &self,
+        batch: &mut rocksdb::WriteBatch,
+        hash: &Hash,
+        height: u64,
+    ) -> Result<()> {
         crate::chain::block_store::stage_canonical_index(&self.db, batch, hash, height)?;
         self.db.batch_put_cf(
             batch,
             CF_METADATA,
             crate::chain::block_store::APPLIED_TIP_KEY,
             &crate::chain::block_store::applied_tip_bytes(hash, height),
-        )?;
-        Ok(guard)
+        )
+    }
+
+    /// The durable applied tip, read the way `BlockStore::get_applied_tip`
+    /// reads it.
+    fn durable_tip(&self) -> Result<Option<(Hash, u64)>> {
+        let Some(bytes) = self
+            .db
+            .get_cf(CF_METADATA, crate::chain::block_store::APPLIED_TIP_KEY)?
+        else {
+            return Ok(None);
+        };
+        let hash = Hash::try_from_bytes(&bytes);
+        let height = bytes
+            .get(32..40)
+            .and_then(|s| <[u8; 8]>::try_from(s).ok())
+            .map(u64::from_be_bytes);
+        Ok(hash.zip(height))
+    }
+
+    /// Stage the undo record of the block a linear commit applies at `tip`:
+    /// the stored value of every account and slot the batch writes, read
+    /// before the batch commits, with the previous durable tip as parent.
+    /// Records outside the kept window are deleted in the same batch. A
+    /// rewrite at the tip already durable adds the pre-images of keys its
+    /// record does not hold yet, so the record keeps reverting to the parent.
+    ///
+    /// A read that fails leaves the block without a record (and removes any
+    /// stale one at its height) instead of failing the commit: the records are
+    /// local metadata, and a missing one only shortens the window a restart
+    /// can rebuild.
+    fn stage_block_undo(
+        &self,
+        batch: &mut rocksdb::WriteBatch,
+        accounts: &[(Address, AccountState)],
+        storage: &[StateStorageChange],
+        tip: (Hash, u64),
+    ) -> Result<()> {
+        let (hash, height) = tip;
+        match self.block_undo(accounts, storage, tip) {
+            Ok(Some(record)) => {
+                self.db.batch_put_cf(
+                    batch,
+                    CF_METADATA,
+                    &reorg_undo_key(height),
+                    &bincode::serialize(&record)?,
+                )?;
+                self.stage_undo_window(batch, height)
+            }
+            Ok(None) => {
+                // A rewrite at the durable tip whose record names another block
+                // (or none): it cannot be rebuilt from here, so drop it.
+                self.db
+                    .batch_delete_cf(batch, CF_METADATA, &reorg_undo_key(height))?;
+                self.stage_undo_window(batch, height)
+            }
+            Err(e) => {
+                warn!(
+                    "reorg window: no undo record for block {hash} @ {height} ({e}); a restart \
+                     can revert no further than this height"
+                );
+                self.db
+                    .batch_delete_cf(batch, CF_METADATA, &reorg_undo_key(height))?;
+                self.stage_undo_window(batch, height)
+            }
+        }
+    }
+
+    /// The record [`Self::stage_block_undo`] stages: a new one (replacing any
+    /// record at the height, e.g. an abandoned branch's), or, at the tip that
+    /// is already durable, its own record extended. `None` when the tip is
+    /// already durable and the record at its height names another block or
+    /// parent (or there is none).
+    fn block_undo(
+        &self,
+        accounts: &[(Address, AccountState)],
+        storage: &[StateStorageChange],
+        tip: (Hash, u64),
+    ) -> Result<Option<BlockUndo>> {
+        let (hash, height) = tip;
+        let parent = self.durable_tip()?;
+        let mut record = if parent == Some(tip) {
+            match self.get_reorg_undo(height)? {
+                Some(r) if r.hash == hash && r.height == height => r,
+                _ => return Ok(None),
+            }
+        } else {
+            BlockUndo {
+                height,
+                hash,
+                parent,
+                accounts: Vec::new(),
+                storage: Vec::new(),
+                models_jobs: None,
+            }
+        };
+        let held_accounts: std::collections::HashSet<Address> =
+            record.accounts.iter().map(|(a, _)| *a).collect();
+        for (address, _) in accounts {
+            if held_accounts.contains(address) {
+                continue;
+            }
+            let before = match self.db.get_cf(CF_ACCOUNTS, &address.0)? {
+                Some(bytes) => Some(bincode::deserialize::<AccountState>(&bytes)?),
+                None => None,
+            };
+            record.accounts.push((*address, before));
+        }
+        let held_slots: std::collections::HashSet<(Address, Vec<u8>)> = record
+            .storage
+            .iter()
+            .map(|(a, k, _)| (*a, k.clone()))
+            .collect();
+        for change in storage {
+            if held_slots.contains(&(change.address, change.key.clone())) {
+                continue;
+            }
+            let before = self
+                .db
+                .get_cf(CF_STORAGE, &storage_key(&change.address, &change.key))?;
+            record
+                .storage
+                .push((change.address, change.key.clone(), before));
+        }
+        Ok(Some(record))
+    }
+
+    /// Stage a reorg's undo records (the winning branch's, computed by the
+    /// node from its in-memory states) and drop every other record outside the
+    /// window at the new tip `tip`, including the abandoned branch's above it.
+    fn stage_branch_undo(
+        &self,
+        batch: &mut rocksdb::WriteBatch,
+        undo: &[BlockUndo],
+        tip: u64,
+    ) -> Result<()> {
+        for record in undo.iter().filter(|r| in_undo_window(r.height, tip)) {
+            self.db.batch_put_cf(
+                batch,
+                CF_METADATA,
+                &reorg_undo_key(record.height),
+                &bincode::serialize(record)?,
+            )?;
+        }
+        self.stage_undo_window(batch, tip)
+    }
+
+    /// Delete, in `batch`, every kept record outside the window at `tip`.
+    fn stage_undo_window(&self, batch: &mut rocksdb::WriteBatch, tip: u64) -> Result<()> {
+        for height in self.reorg_undo_heights()? {
+            if !in_undo_window(height, tip) {
+                self.db
+                    .batch_delete_cf(batch, CF_METADATA, &reorg_undo_key(height))?;
+            }
+        }
+        Ok(())
     }
 
     pub fn new(db: Arc<RocksDB>) -> Self {
         Self { db }
     }
 
-    /// Heights that hold an undo record.
-    pub fn reorg_undo_heights(&self) -> Result<Vec<u64>> {
-        Ok(Vec::new())
+    /// Add the model and training-job pre-images to the record of the block
+    /// `hash` at `height` (see [`BlockUndo::models_jobs`]). `Ok(false)` when no
+    /// record names that block (nothing is written). A lost write only leaves
+    /// the record unusable for a revert, so it is not fsync'd.
+    pub fn complete_reorg_undo(
+        &self,
+        height: u64,
+        hash: Hash,
+        models_jobs: citrate_execution::executor::ModelJobUndo,
+    ) -> Result<bool> {
+        let _guard = crate::chain::block_store::canonical_index_lock();
+        match self.get_reorg_undo(height)? {
+            Some(mut record) if record.hash == hash => {
+                record.models_jobs = Some(models_jobs);
+                self.db.put_cf(
+                    CF_METADATA,
+                    &reorg_undo_key(height),
+                    &bincode::serialize(&record)?,
+                )?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
-    /// The undo record of the block applied at `height`, if one is kept.
-    pub fn get_reorg_undo(
-        &self,
-        _height: u64,
-    ) -> Result<Option<citrate_execution::executor::BlockUndo>> {
-        Ok(None)
+    /// Heights that hold an undo record, ascending.
+    pub fn reorg_undo_heights(&self) -> Result<Vec<u64>> {
+        let mut heights = Vec::new();
+        self.db
+            .for_each_prefix_key_cf(CF_METADATA, REORG_UNDO_PREFIX, |key| {
+                if let Some(h) = reorg_undo_height(key) {
+                    heights.push(h);
+                }
+                Ok(())
+            })?;
+        Ok(heights)
+    }
+
+    /// The undo record of the block applied at `height`, if one is kept. A
+    /// record that does not decode is an error, never "absent".
+    pub fn get_reorg_undo(&self, height: u64) -> Result<Option<BlockUndo>> {
+        match self.db.get_cf(CF_METADATA, &reorg_undo_key(height))? {
+            Some(bytes) => Ok(Some(bincode::deserialize(&bytes)?)),
+            None => Ok(None),
+        }
     }
 
     /// Store account state
@@ -668,6 +911,225 @@ mod tests {
         let retrieved = store.get_account(&address).unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().nonce, 10);
+    }
+
+    fn acct(balance: u64) -> AccountState {
+        AccountState {
+            nonce: 0,
+            balance: U256::from(balance),
+            storage_root: Hash::default(),
+            code_hash: Hash::default(),
+            model_permissions: vec![],
+        }
+    }
+
+    fn block_hash(height: u64) -> Hash {
+        let mut b = [0u8; 32];
+        b[..8].copy_from_slice(&height.to_be_bytes());
+        b[31] = 0xB1;
+        Hash::new(b)
+    }
+
+    fn slot(address: Address, key: &[u8], value: Option<&[u8]>) -> StateStorageChange {
+        StateStorageChange {
+            address,
+            key: key.to_vec(),
+            value: value.map(|v| v.to_vec()),
+        }
+    }
+
+    /// A linear commit stages its block's undo record in the same batch: the
+    /// stored values it overwrites (absent ones as `None`) and the previous
+    /// durable tip as parent.
+    #[test]
+    fn a_tip_commit_records_the_pre_images_it_overwrites() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = StateStore::new(Arc::new(RocksDB::open(temp_dir.path()).unwrap()));
+        let (a, b) = (Address([1; 20]), Address([2; 20]));
+        let none = ReceiptIndexBatch::default();
+        store
+            .write_state_batch_with_applied_tip(
+                &[(a, acct(10))],
+                &[slot(a, b"k", Some(b"v1"))],
+                Some((block_hash(1), 1)),
+                &none,
+            )
+            .unwrap();
+        store
+            .write_state_batch_with_applied_tip(
+                &[(a, acct(20)), (b, acct(5))],
+                &[slot(a, b"k", None), slot(a, b"j", Some(b"x"))],
+                Some((block_hash(2), 2)),
+                &none,
+            )
+            .unwrap();
+        let rec = store.get_reorg_undo(2).unwrap().expect("record");
+        assert_eq!(rec.hash, block_hash(2));
+        assert_eq!(rec.parent, Some((block_hash(1), 1)));
+        assert_eq!(rec.accounts, vec![(a, Some(acct(10))), (b, None)]);
+        assert_eq!(
+            rec.storage,
+            vec![
+                (a, b"k".to_vec(), Some(b"v1".to_vec())),
+                (a, b"j".to_vec(), None)
+            ]
+        );
+        // A second write at the same tip extends the record with new keys only:
+        // the pre-images still describe the parent.
+        store
+            .write_state_batch_with_applied_tip(
+                &[(a, acct(30)), (Address([3; 20]), acct(1))],
+                &[],
+                Some((block_hash(2), 2)),
+                &none,
+            )
+            .unwrap();
+        let rec = store.get_reorg_undo(2).unwrap().expect("record");
+        assert_eq!(
+            rec.accounts,
+            vec![(a, Some(acct(10))), (b, None), (Address([3; 20]), None)]
+        );
+        assert_eq!(rec.parent, Some((block_hash(1), 1)));
+    }
+
+    /// A record at the height of a new block that names another block (an
+    /// abandoned branch's, left after a crash between a reorg's revert and its
+    /// commit) is replaced, not extended; a rewrite at the durable tip whose
+    /// record names another block drops it. Model pre-images are added to the
+    /// record of the named block only.
+    #[test]
+    fn a_stale_record_at_the_height_is_replaced_not_merged() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = StateStore::new(Arc::new(RocksDB::open(temp_dir.path()).unwrap()));
+        let (a, b) = (Address([1; 20]), Address([2; 20]));
+        let none = ReceiptIndexBatch::default();
+        let commit = |accts: &[(Address, AccountState)], tip: (Hash, u64)| {
+            store
+                .write_state_batch_with_applied_tip(accts, &[], Some(tip), &none)
+                .unwrap()
+        };
+        commit(&[(a, acct(1))], (block_hash(1), 1));
+        commit(&[(a, acct(2)), (b, acct(9))], (block_hash(2), 2));
+        // Back to the fork point at 1 (a reorg's revert): record 2 stays.
+        store
+            .write_reorg_batch_sync(&[], &[], &[], &[], Some((block_hash(1), 1)), &none, &[])
+            .unwrap();
+        // The other branch's block at 2: a new record, nothing of the stale one.
+        let other = Hash::new([0xEE; 32]);
+        commit(&[(a, acct(3))], (other, 2));
+        let rec = store.get_reorg_undo(2).unwrap().expect("record");
+        assert_eq!(rec.hash, other);
+        assert_eq!(rec.parent, Some((block_hash(1), 1)));
+        assert_eq!(
+            rec.accounts,
+            vec![(a, Some(acct(2)))],
+            "pre-image from the store"
+        );
+        assert!(rec.models_jobs.is_none());
+        // Model pre-images go to the named block's record only.
+        let mj = citrate_execution::executor::ModelJobUndo::default();
+        assert!(!store
+            .complete_reorg_undo(2, block_hash(2), mj.clone())
+            .unwrap());
+        assert!(store.complete_reorg_undo(2, other, mj.clone()).unwrap());
+        assert_eq!(
+            store.get_reorg_undo(2).unwrap().unwrap().models_jobs,
+            Some(mj)
+        );
+        // A rewrite at the durable tip (other @ 2) keeps and extends its record...
+        commit(&[(Address([5; 20]), acct(1))], (other, 2));
+        let rec = store.get_reorg_undo(2).unwrap().expect("record");
+        assert_eq!(rec.accounts.len(), 2);
+        assert!(
+            rec.models_jobs.is_some(),
+            "the completed record stays usable"
+        );
+        // ...but a record that names another block at the durable tip is dropped.
+        let stale = BlockUndo {
+            height: 2,
+            hash: block_hash(2),
+            ..Default::default()
+        };
+        store
+            .db
+            .put_cf(
+                CF_METADATA,
+                &reorg_undo_key(2),
+                &bincode::serialize(&stale).unwrap(),
+            )
+            .unwrap();
+        commit(&[(Address([6; 20]), acct(1))], (other, 2));
+        assert!(store.get_reorg_undo(2).unwrap().is_none());
+    }
+
+    /// Records are kept for exactly the last REORG_UNDO_DEPTH heights; a reorg
+    /// commit replaces the window with the winning branch's records and drops
+    /// the abandoned ones above its tip; a commit without records (the revert
+    /// to the fork point, an abort) leaves them all.
+    #[test]
+    fn undo_records_keep_exactly_the_window() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = StateStore::new(Arc::new(RocksDB::open(temp_dir.path()).unwrap()));
+        let a = Address([1; 20]);
+        let none = ReceiptIndexBatch::default();
+        for h in 1..=150u64 {
+            store
+                .write_state_batch_with_applied_tip(
+                    &[(a, acct(h))],
+                    &[],
+                    Some((block_hash(h), h)),
+                    &none,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store.reorg_undo_heights().unwrap(),
+            (51..=150).collect::<Vec<u64>>()
+        );
+        // Revert to a fork point at 140: no records passed, nothing changes.
+        store
+            .write_reorg_batch_sync(&[], &[], &[], &[], Some((block_hash(140), 140)), &none, &[])
+            .unwrap();
+        assert_eq!(
+            store.reorg_undo_heights().unwrap(),
+            (51..=150).collect::<Vec<u64>>()
+        );
+        // The winning branch 141..=145 commits with its records.
+        let winner: Vec<BlockUndo> = (141..=145u64)
+            .map(|h| BlockUndo {
+                height: h,
+                hash: Hash::new([h as u8; 32]),
+                parent: None,
+                accounts: vec![(a, Some(acct(h - 1)))],
+                storage: vec![],
+                models_jobs: None,
+            })
+            .collect();
+        store
+            .write_reorg_batch_sync(
+                &[],
+                &[],
+                &[],
+                &[],
+                Some((Hash::new([145; 32]), 145)),
+                &none,
+                &winner,
+            )
+            .unwrap();
+        assert_eq!(
+            store.reorg_undo_heights().unwrap(),
+            (46..=145).filter(|h| *h >= 51).collect::<Vec<u64>>(),
+            "abandoned 146..=150 dropped; nothing below the window"
+        );
+        assert_eq!(
+            store.get_reorg_undo(143).unwrap().map(|r| r.hash),
+            Some(Hash::new([143; 32]))
+        );
+        assert_eq!(
+            store.get_reorg_undo(140).unwrap().map(|r| r.hash),
+            Some(block_hash(140)),
+            "the shared chain's records stay"
+        );
     }
 
     #[test]

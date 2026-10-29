@@ -447,9 +447,34 @@ pub struct BlockUndo {
     /// The applied block the record reverts to, when known.
     pub parent: Option<(Hash, u64)>,
     /// Account pre-images.
-    pub accounts: Vec<(Address, Option<crate::types::AccountState>)>,
+    pub accounts: Vec<crate::state::state_db::AccountPreImage>,
     /// Storage pre-images: `(address, slot key, value)`.
-    pub storage: Vec<(Address, Vec<u8>, Option<Vec<u8>>)>,
+    pub storage: Vec<crate::state::state_db::StoragePreImage>,
+    /// Model and training-job pre-images. They live in memory only (not in
+    /// the flat store), so the node adds them after the block's commit from
+    /// the states before and after it; `None` until then, and a record
+    /// without them is never used to revert (the window stops above it).
+    pub models_jobs: Option<ModelJobUndo>,
+}
+
+/// The model and training-job pre-images of one block (see [`BlockUndo`]).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ModelJobUndo {
+    /// Model pre-images (`None`: the model did not exist).
+    pub models: Vec<(crate::types::ModelId, Option<crate::types::ModelState>)>,
+    /// Training-job pre-images (`None`: the job did not exist).
+    pub jobs: Vec<(crate::types::JobId, Option<crate::types::TrainingJob>)>,
+}
+
+impl PartialEq for ModelJobUndo {
+    /// Equal when both encode to the same bytes (`ModelState` and
+    /// `TrainingJob` have no `PartialEq` of their own).
+    fn eq(&self, other: &Self) -> bool {
+        matches!(
+            (bincode::serialize(self), bincode::serialize(other)),
+            (Ok(a), Ok(b)) if a == b
+        )
+    }
 }
 
 /// C1-R: the RPC receipt index (NOT consensus data) committed in the SAME write
@@ -685,6 +710,12 @@ pub trait StateStoreTrait: Send + Sync {
     ///
     /// C1-R: `index` carries the receipt-index changes of the reorg (abandoned
     /// blocks' receipts removed, the winning branch's written) in the same batch.
+    ///
+    /// `undo`: the undo records of the winning branch's last reorg-window blocks,
+    /// committed in the same batch (the store keeps one per applied height for
+    /// the last window; see [`BlockUndo`]). Empty leaves the kept records as
+    /// they are (the revert to the fork point, and every abort).
+    #[allow(clippy::too_many_arguments)]
     fn write_reorg_batch_sync(
         &self,
         accounts: &[(Address, crate::types::AccountState)],
@@ -693,6 +724,7 @@ pub trait StateStoreTrait: Send + Sync {
         code: &[(Hash, Vec<u8>)],
         applied_tip: Option<(Hash, u64)>,
         index: &ReceiptIndexBatch,
+        undo: &[BlockUndo],
     ) -> anyhow::Result<()>;
 
     /// Persist the applied-tip pointer (block hash + height). Default no-op for test
@@ -1546,6 +1578,19 @@ impl Executor {
         applied_tip: Option<(Hash, u64)>,
         index: &ReceiptIndexBatch,
     ) -> anyhow::Result<()> {
+        self.reconcile_store_from_with_undo(baseline, applied_tip, index, &[])
+    }
+
+    /// [`Self::reconcile_store_from_with_index`] plus the undo records of the
+    /// newly executed branch (see [`BlockUndo`]) in the same fsync'd batch, so
+    /// the kept records always describe the durable applied chain.
+    pub fn reconcile_store_from_with_undo(
+        &self,
+        baseline: &crate::state::StateSnapshot,
+        applied_tip: Option<(Hash, u64)>,
+        index: &ReceiptIndexBatch,
+        undo: &[BlockUndo],
+    ) -> anyhow::Result<()> {
         use std::collections::{HashMap, HashSet};
         let store = match &self.state_store {
             Some(s) => s,
@@ -1612,7 +1657,8 @@ impl Executor {
             || !account_dels.is_empty()
             || !code.is_empty()
             || applied_tip.is_some()
-            || !index.is_empty();
+            || !index.is_empty()
+            || !undo.is_empty();
         if must_commit {
             store.write_reorg_batch_sync(
                 &account_puts,
@@ -1621,6 +1667,7 @@ impl Executor {
                 &code,
                 applied_tip,
                 index,
+                undo,
             )?;
         }
         Ok(())

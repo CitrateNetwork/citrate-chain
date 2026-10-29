@@ -112,6 +112,7 @@ impl Node {
                 &[],
                 Some((hash, height)),
                 &ReceiptIndexBatch::default(),
+                &[],
             )
             .expect("reorg commit");
     }

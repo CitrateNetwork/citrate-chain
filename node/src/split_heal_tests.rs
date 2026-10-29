@@ -469,7 +469,8 @@ impl Fleet {
                     .update_pruning_point(at)
                     .await
                     .expect("pruning point");
-                old.dag.prune().await.expect("prune");
+                let dropped = old.dag.prune().await.expect("prune");
+                assert!(dropped > 0, "fixture: {} pruned below {point}", old.name);
             }
         }
         let boot = old.executor.state_snapshot();
@@ -1364,10 +1365,12 @@ mod tests {
         .await;
     }
 
-    /// DGX devnet C2/D1/D2: the 4v3 restart scenario on producers that run
-    /// with a DAG prune window (a small one here). The four restart forked
-    /// below their tip on a pruned DAG store, where a replay from genesis is
-    /// refused; they must switch by a bounded reorg, rejoin and seal again.
+    /// DGX devnet C2/D1/D2: the 4v3 restart scenario past the DAG prune
+    /// retention. The producers run with a 1000-block retain window (the
+    /// node's minimum, as on the devnet), the split and the restarts happen
+    /// past height 1000, so the four restart forked below their tip on a
+    /// pruned DAG store, where a replay from genesis is refused. They must
+    /// switch by a bounded reorg, rejoin and seal again.
     #[tokio::test(flavor = "current_thread")]
     async fn four_three_partition_with_restarts_past_prune_retention_heals() {
         if !in_child() {
@@ -1378,13 +1381,13 @@ mod tests {
         assert_heals(
             "4v3 + restarts + lone producer, pruned DAG stores",
             Scenario {
-                warmup: ACT + 30,
+                warmup: ACT + 152,
                 groups: vec![vec![0, 1, 2, 3], vec![4, 5, 6]],
                 partition: 9,
                 restart_all: true,
                 solo: Some((4, 60)),
                 require_merged: false,
-                prune_retain: Some(60),
+                prune_retain: Some(crate::dag_prune::MIN_RETAIN_BLOCKS),
                 ..base(7)
             },
         )

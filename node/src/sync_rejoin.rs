@@ -1770,9 +1770,11 @@ mod tests {
 
     /// Every node, pruned or not: a restarted node on the canonical chain
     /// hears one same-height sibling of its restart tip that wins the
-    /// tie-break. An equal-weight head never triggers a rebuild from genesis:
-    /// the durable applied tip never drops, and the node converges as the
-    /// tip's children arrive.
+    /// tie-break. An equal-weight head never triggers a rebuild from genesis.
+    /// The restart keeps the reorg window, so the node follows the tie-break
+    /// as a running node does (a one-block reorg): the durable applied tip
+    /// never goes below the fork point, the restart tip's parent, and the
+    /// node converges as the tip's children arrive.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unpruned_restart_tip_sibling_never_rewinds() {
         let tip_height = 1_200u64;
@@ -1800,9 +1802,10 @@ mod tests {
             .finish()
             .min(applied.iter().copied().min().unwrap_or(0));
         assert!(
-            lowest >= tip_height,
-            "the durable applied tip dropped below the restart tip {tip_height}: lowest \
-             {lowest}; applied {applied:?}; anchors {:?}",
+            lowest >= tip_height - 1,
+            "the durable applied tip went below the fork point {}: lowest {lowest}; \
+             applied {applied:?}; anchors {:?}",
+            tip_height - 1,
             run.anchors
         );
         assert_eq!(n.applied(), Some((h(main_tip), network_tip)));
@@ -1855,24 +1858,33 @@ mod tests {
     /// keeps its tip.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn runtime_rebuild_refuses_an_equal_weight_head() {
-        let tip_height = 1_200u64;
-        let net = net(tip_height, tip_height, tip_height + 1);
-        let tip = net.prefix.last().expect("prefix");
-        let sibling = tie_winning_sibling(tip, h(&net.prefix[net.prefix.len() - 2]));
-        let (n, _ndir) = restarted_node(&net, &net.prefix, false).await;
+        // An equal-length rival branch forking deeper than the reorg window:
+        // only a rebuild from genesis could switch to it.
+        let fork = 1_200u64 - crate::canonical_apply::MAX_REORG_DEPTH - 5;
+        let net = net(fork, 1_200, 1_200);
+        let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
+        let (n, _ndir) = restarted_node(&net, &own, false).await;
         let fx = n
             .admission
-            .admit_to_fixpoint(vec![sibling.clone()], |_, _| {})
+            .admit_to_fixpoint(net.main.clone(), |_, _| {})
             .await;
-        assert_eq!(fx.newly_admitted, 1, "fixture: the sibling admits");
+        assert_eq!(
+            fx.newly_admitted,
+            net.main.len(),
+            "fixture: the rival admits"
+        );
+        let rival = net.main.last().expect("main");
         let watch = TipWatch::start(n.storage.clone());
-        n.app.maybe_runtime_rebuild(h(&sibling)).await;
+        n.app.maybe_runtime_rebuild(h(rival)).await;
         let lowest = watch.finish();
         assert!(
-            lowest >= tip_height,
+            lowest >= 1_200,
             "rebuilt toward an equal-weight head: {lowest}"
         );
-        assert_eq!(n.applied(), Some((h(tip), tip_height)));
+        assert_eq!(
+            n.applied(),
+            Some((h(net.side.last().expect("side")), 1_200))
+        );
     }
 
     /// The rebuild itself re-checks the prune floor: asked to rebuild toward
@@ -1880,8 +1892,10 @@ mod tests {
     /// tip.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn runtime_rebuild_refuses_on_a_pruned_node() {
+        // The node's own branch is deeper than the reorg window.
         let fork = 1_199u64;
-        let net = net(fork, fork + 1, fork + 40);
+        let side_tip = fork + crate::canonical_apply::MAX_REORG_DEPTH + 5;
+        let net = net(fork, side_tip, side_tip + 40);
         let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
         let (n, _ndir) = restarted_node(&net, &own, true).await;
         let fx = n
@@ -1894,7 +1908,10 @@ mod tests {
         n.app.maybe_runtime_rebuild(h(main_tip)).await;
         let lowest = watch.finish();
         assert!(lowest > fork, "rebuilt on a pruned node: {lowest}");
-        assert_eq!(n.applied(), Some((h(&net.side[0]), fork + 1)));
+        assert_eq!(
+            n.applied(),
+            Some((h(net.side.last().expect("side")), side_tip))
+        );
     }
 
     /// A restarted node whose DAG store is pruned to a small window (50
@@ -2541,12 +2558,12 @@ mod tests {
     /// advertises a higher head and answers the tip anchor with nothing (it
     /// never held the node's tip); when the fork-point search probes below the
     /// tip it serves a validly signed sibling of the tip that fork choice ranks
-    /// first (equal score, smaller hash). The reorg ring cannot reach the fork
-    /// point after a restart, so switching would be a from-genesis rebuild.
-    /// An equal-weight head never starts one (owner decision 2026-10-28): the
-    /// durable applied tip never drops and the node keeps its verified tip
-    /// until a strictly heavier branch exists. (A legitimate rebuild must not
-    /// stall the receive path: `the_receive_path_does_not_wait_on_a_rebuild`.)
+    /// first (equal score, smaller hash). The restart keeps the reorg window,
+    /// so the node follows the tie-break as a running node does: a one-block
+    /// reorg. An equal-weight head never starts a from-genesis rebuild (owner
+    /// decision 2026-10-28): the durable applied tip never goes below the fork
+    /// point and no rebuild runs. (A legitimate rebuild must not stall the
+    /// receive path: `the_receive_path_does_not_wait_on_a_rebuild`.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restarted_node_keeps_its_verified_height_through_a_rebuild() {
         let key = crypto::generate_keypair();
@@ -2584,16 +2601,17 @@ mod tests {
         })
         .await;
         assert!(
-            lowest >= RESTART_TIP,
-            "the durable applied tip dropped to {lowest} (verified height {RESTART_TIP}): \
+            lowest >= RESTART_TIP - 1,
+            "the durable applied tip dropped to {lowest}, below the fork point {}: \
              anchors {:?}",
+            RESTART_TIP - 1,
             run.anchors
         );
         assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(
             n.applied(),
-            Some((h(&tip), RESTART_TIP)),
-            "an equal-weight sibling never moves the node off its verified tip"
+            Some((h(&rival), RESTART_TIP)),
+            "the node follows the tie-break by a one-block reorg, as a running node does"
         );
     }
 
