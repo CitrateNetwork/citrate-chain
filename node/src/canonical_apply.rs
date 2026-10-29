@@ -13792,6 +13792,117 @@ pub(crate) mod tests {
             assert_eq!(restarted.calculate_state_root(), head.state_root);
         }
 
+        /// A node with 30 blocks applied and stopped: its store and the blocks.
+        async fn rsr_stopped_at_30() -> (Arc<StorageManager>, tempfile::TempDir, Vec<Block>) {
+            let (main, _) = rsr_main(30).await;
+            let (storage, dir) = rsr_node().await;
+            let exec = rsr_hydrated(&storage);
+            rsr_apply(&storage, &exec, &main).await;
+            (storage, dir, main)
+        }
+
+        /// Replace the kept undo record at its height with `record`, through the
+        /// store's own reorg commit (tip unchanged).
+        fn rsr_put_record(
+            storage: &StorageManager,
+            tip: &Block,
+            record: citrate_execution::executor::BlockUndo,
+        ) {
+            use citrate_execution::executor::StateStoreTrait;
+            storage
+                .state
+                .write_reorg_batch_sync(
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    Some((tip.header.block_hash, tip.header.height)),
+                    &ReceiptIndexBatch::default(),
+                    &[record],
+                )
+                .expect("put record");
+        }
+
+        /// The ring a node restarted on `storage` rebuilds.
+        async fn rsr_restart_ring(storage: &Arc<StorageManager>) -> Vec<u64> {
+            ring_heights(&CanonicalApplicator::new(
+                rsr_hydrated(storage),
+                storage.clone(),
+            ))
+            .await
+        }
+
+        /// Fail-safe seeding: a record without model/job pre-images (an older
+        /// binary's, a corrupt one) is never used. At the tip, the restart keeps
+        /// the tip alone; mid-window, the window ends at that height. Never
+        /// treated as "no model changed".
+        #[tokio::test]
+        async fn a_record_without_model_job_pre_images_ends_the_restored_window() {
+            let (storage, _dir, main) = rsr_stopped_at_30().await;
+            let tip = main.last().expect("tip").clone();
+            assert_eq!(
+                rsr_restart_ring(&storage).await,
+                (1..=30).collect::<Vec<u64>>(),
+                "fixture: the whole chain"
+            );
+            for (h, want) in [(30u64, vec![30u64]), (20, (20..=30).collect())] {
+                let original = storage.state.get_reorg_undo(h).expect("read").expect("rec");
+                assert!(original.models_jobs.is_some(), "fixture: complete record");
+                let mut stripped = original.clone();
+                stripped.models_jobs = None;
+                rsr_put_record(&storage, &tip, stripped);
+                assert_eq!(
+                    rsr_restart_ring(&storage).await,
+                    want,
+                    "a record at {h} without model/job pre-images ends the window there"
+                );
+                rsr_put_record(&storage, &tip, original);
+                assert_eq!(
+                    rsr_restart_ring(&storage).await,
+                    (1..=30).collect::<Vec<u64>>()
+                );
+            }
+        }
+
+        /// Fail-safe seeding: a record whose pre-images were tampered with, or
+        /// that names another block, ends the window at its height: the rebuilt
+        /// root (or the block check) rejects it. Each case keeps every other
+        /// field right, so each check is the only one that can catch it.
+        #[tokio::test]
+        async fn a_tampered_or_misnamed_record_ends_the_restored_window() {
+            let (storage, _dir, main) = rsr_stopped_at_30().await;
+            let tip = main.last().expect("tip").clone();
+            let h = 20u64;
+            let original = storage.state.get_reorg_undo(h).expect("read").expect("rec");
+            let mut tampered = original.clone();
+            let Some((_, Some(acct))) = tampered.accounts.iter_mut().find(|(_, s)| s.is_some())
+            else {
+                panic!("fixture: an account pre-image");
+            };
+            acct.balance = acct.balance.saturating_add(U256::from(1u64));
+            let mut misnamed = original.clone();
+            misnamed.hash = Hash::new([0xEE; 32]);
+            let mut wrong_parent = original.clone();
+            wrong_parent.parent = Some((Hash::new([0xEF; 32]), h - 1));
+            for (what, record) in [
+                ("a tampered account pre-image", tampered),
+                ("a record naming another block", misnamed),
+                ("a record naming another parent", wrong_parent),
+            ] {
+                rsr_put_record(&storage, &tip, record);
+                assert_eq!(
+                    rsr_restart_ring(&storage).await,
+                    (h..=30).collect::<Vec<u64>>(),
+                    "{what} at {h} ends the window there"
+                );
+                rsr_put_record(&storage, &tip, original.clone());
+            }
+            assert_eq!(
+                rsr_restart_ring(&storage).await,
+                (1..=30).collect::<Vec<u64>>()
+            );
+        }
+
         /// A model registered BEFORE the window (height 10, tip 130) and updated
         /// inside it (120), across a real restart (state hydrated from the store)
         /// and a reorg forking at 125 onto a branch that leaves it alone: the
