@@ -60,7 +60,7 @@ use citrate_storage::StorageManager;
 
 /// Steps one peer's walk budget holds. Each recovers one height; a full budget
 /// covers the whole reorg window ([`MAX_WALK_DEPTH`]) with room for repeats.
-pub const MAX_PARENT_WALK_STEPS: u32 = 64;
+pub const MAX_PARENT_WALK_STEPS: u32 = 128;
 
 /// One step comes back to a peer's spent budget per this interval (one 2 s sync
 /// tick).
@@ -179,101 +179,387 @@ pub struct Refetch {
     pub height: u64,
 }
 
-/// Missing-parent walk state (one per node, shared by every peer).
-#[derive(Debug, Default)]
-struct ParentWalk {
-    steps: u32,
+/// A token bucket: `tokens` of `cap`, one more per `every`.
+#[derive(Debug, Clone, Copy)]
+struct Bucket {
+    tokens: u32,
+    cap: u32,
+    every: Duration,
+    at: Instant,
+}
+
+impl Bucket {
+    fn full(cap: u32, every: Duration, now: Instant) -> Self {
+        Self {
+            tokens: cap,
+            cap,
+            every,
+            at: now,
+        }
+    }
+
+    fn refill(&mut self, now: Instant) {
+        if self.tokens >= self.cap {
+            self.at = now;
+            return;
+        }
+        let every = self.every.as_millis().max(1);
+        let elapsed = now.saturating_duration_since(self.at).as_millis();
+        let add = elapsed.checked_div(every).unwrap_or(0);
+        if add == 0 {
+            return;
+        }
+        self.add(u32::try_from(add).unwrap_or(u32::MAX));
+        self.at = now;
+    }
+
+    fn add(&mut self, n: u32) {
+        self.tokens = self.tokens.saturating_add(n).min(self.cap);
+    }
+
+    fn take(&mut self) -> bool {
+        match self.tokens.checked_sub(1) {
+            Some(t) => {
+                self.tokens = t;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// One peer's missing-parent walk.
+#[derive(Debug)]
+struct PeerWalk {
+    budget: Bucket,
+    /// Height of the last parent asked in this episode.
     last_height: Option<u64>,
-    /// `last_height` before the most recent step, so an unsent request can be undone.
+    /// `last_height` before the most recent step, so an unsent step can be undone.
     prev_height: Option<u64>,
+    last_step: Option<Instant>,
+    /// When the outstanding walk request to this peer was sent.
+    in_flight: Option<Instant>,
+    /// A give-up was already reported in this episode.
+    gave_up_reported: bool,
+    touched: Instant,
 }
 
-impl ParentWalk {
-    fn next(
-        &mut self,
-        lowest_deferred: Option<(u64, Hash)>,
-        orphans_remaining: bool,
-    ) -> Option<(Hash, u64)> {
-        if !orphans_remaining {
-            self.steps = 0;
-            self.last_height = None;
+impl PeerWalk {
+    fn new(now: Instant) -> Self {
+        Self {
+            budget: Bucket::full(MAX_PARENT_WALK_STEPS, WALK_REFILL_EVERY, now),
+            last_height: None,
+            prev_height: None,
+            last_step: None,
+            in_flight: None,
+            gave_up_reported: false,
+            touched: now,
         }
-        let (height, parent) = lowest_deferred?;
-        let parent_height = height.saturating_sub(1);
-        let lower = self.last_height.is_none_or(|last| parent_height < last);
-        if !lower || self.steps >= MAX_PARENT_WALK_STEPS || parent == Hash::new([0u8; 32]) {
-            return None;
-        }
-        self.steps = self.steps.saturating_add(1);
-        self.prev_height = self.last_height;
-        self.last_height = Some(parent_height);
-        Some((parent, parent_height))
     }
 
-    fn unsent(&mut self) {
-        self.steps = self.steps.saturating_sub(1);
-        self.last_height = self.prev_height;
+    /// The episode is over (the walk reached a held block, made progress, or
+    /// went idle): the next deferral starts a new descent.
+    fn end_episode(&mut self) {
+        self.resume();
+        self.gave_up_reported = false;
+    }
+
+    /// Descend again from the next deferral, keeping the give-up report state
+    /// (a walk that stopped short resumes; its answer is chased down the orphan
+    /// buffer by [`lowest_deferred`], so it does not re-walk what it holds).
+    fn resume(&mut self) {
+        self.last_height = None;
+        self.prev_height = None;
+    }
+
+    fn in_flight_at(&self, now: Instant) -> bool {
+        self.in_flight
+            .is_some_and(|t| now.saturating_duration_since(t) < WALK_REQUEST_TIMEOUT)
     }
 }
 
-/// Missing-parent walks (see the module docs). Owned by the receive loop.
-#[derive(Debug, Default)]
+#[derive(Debug)]
+struct Stuck {
+    height: u64,
+    deferrals: u32,
+    source: String,
+    last_seen: Instant,
+    last_fetch: Option<Instant>,
+}
+
+/// Rate limit for give-up lines: a budget per window, the rest counted.
+#[derive(Debug)]
+struct GiveUpLog {
+    window_start: Instant,
+    lines: u32,
+    suppressed: u64,
+}
+
+impl GiveUpLog {
+    fn allow(&mut self, now: Instant) -> Option<u64> {
+        if now.saturating_duration_since(self.window_start) >= GIVE_UP_LOG_WINDOW {
+            self.window_start = now;
+            self.lines = 0;
+        }
+        if self.lines < GIVE_UP_LOGS_PER_WINDOW {
+            self.lines = self.lines.saturating_add(1);
+            Some(std::mem::take(&mut self.suppressed))
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+            None
+        }
+    }
+}
+
+/// Missing-parent walks, one per peer (see the module docs). Owned by the
+/// receive loop.
+#[derive(Debug)]
 pub struct ParentWalks {
-    walk: ParentWalk,
+    peers: HashMap<String, PeerWalk>,
+    node_budget: Bucket,
+    stuck: HashMap<Hash, Stuck>,
+    log: GiveUpLog,
 }
 
 impl ParentWalks {
-    pub fn new(_now: Instant) -> Self {
-        Self::default()
+    pub fn new(now: Instant) -> Self {
+        Self {
+            peers: HashMap::new(),
+            node_budget: Bucket::full(NODE_WALK_BURST, NODE_WALK_REFILL_EVERY, now),
+            stuck: HashMap::new(),
+            log: GiveUpLog {
+                window_start: now,
+                lines: 0,
+                suppressed: 0,
+            },
+        }
+    }
+
+    fn walk(&mut self, peer: &str, now: Instant) -> &mut PeerWalk {
+        if !self.peers.contains_key(peer) && self.peers.len() >= MAX_WALK_PEERS {
+            // Never drop a peer with a request outstanding first: that would
+            // free an in-flight slot without an answer.
+            let oldest = self
+                .peers
+                .iter()
+                .min_by_key(|(_, w)| (w.in_flight_at(now), w.touched))
+                .map(|(k, _)| k.clone());
+            if let Some(k) = oldest {
+                self.peers.remove(&k);
+            }
+        }
+        let w = self
+            .peers
+            .entry(peer.to_string())
+            .or_insert_with(|| PeerWalk::new(now));
+        w.touched = now;
+        w.budget.refill(now);
+        if w.last_step
+            .is_some_and(|t| now.saturating_duration_since(t) >= WALK_IDLE_RESET)
+        {
+            w.end_episode();
+        }
+        w
+    }
+
+    fn in_flight(&self, now: Instant) -> usize {
+        self.peers.values().filter(|w| w.in_flight_at(now)).count()
     }
 
     /// Walk requests outstanding across all peers.
-    pub fn in_flight_now(&self, _now: Instant) -> usize {
-        0
+    #[cfg(test)]
+    pub fn in_flight_now(&self, now: Instant) -> usize {
+        self.in_flight(now)
     }
 
-    /// A block from `peer` deferred on `missing_parent` (gossip path).
+    /// Take one step for `peer` towards `parent` at `height`, if the budgets,
+    /// the in-flight cap and the window allow it.
+    fn step(&mut self, peer: &str, parent: Hash, height: u64, applied: u64, now: Instant) -> Step {
+        if parent == Hash::new([0u8; 32]) {
+            return Step::Idle;
+        }
+        self.node_budget.refill(now);
+        let in_flight = self.in_flight(now);
+        let node_has_budget = self.node_budget.tokens > 0;
+        let w = self.walk(peer, now);
+        if w.last_height.is_some_and(|last| height >= last) {
+            // Already asked in this episode.
+            return Step::Idle;
+        }
+        let reason = if applied.saturating_sub(height) > MAX_WALK_DEPTH {
+            Some(GiveUp::BeyondWindow)
+        } else if w.budget.tokens == 0 {
+            Some(GiveUp::PeerBudget)
+        } else if !node_has_budget {
+            Some(GiveUp::NodeBudget)
+        } else if in_flight >= MAX_WALKS_IN_FLIGHT {
+            Some(GiveUp::InFlightCap)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            let first = !w.gave_up_reported;
+            w.gave_up_reported = true;
+            let log = if first { self.log.allow(now) } else { None };
+            return Step::GaveUp {
+                reason,
+                parent,
+                height,
+                log,
+            };
+        }
+        w.budget.take();
+        w.prev_height = w.last_height;
+        w.last_height = Some(height);
+        w.last_step = Some(now);
+        w.in_flight = Some(now);
+        self.node_budget.take();
+        Step::Ask { parent, height }
+    }
+
+    /// A block from `peer` deferred on `missing_parent` (gossip path). Starts a
+    /// walk at the parent, one height below the block, unless a request to this
+    /// peer is outstanding or this episode already asked at or below it. A walk
+    /// that stopped short (budget, cap) resumes here once budget is back.
     pub fn begin(
         &mut self,
-        _peer: &str,
+        peer: &str,
         missing_parent: Hash,
         parent_height: u64,
-        _applied: u64,
-        _now: Instant,
+        applied: u64,
+        now: Instant,
     ) -> Step {
-        Step::Ask {
-            parent: missing_parent,
-            height: parent_height,
+        let w = self.walk(peer, now);
+        if w.in_flight_at(now) {
+            return Step::Idle;
+        }
+        if w.gave_up_reported {
+            w.resume();
+        }
+        self.step(peer, missing_parent, parent_height, applied, now)
+    }
+
+    /// After `peer`'s `Blocks` answer: returns the parent to ask `peer` for
+    /// next (the parent of the answer's lowest still-deferred block).
+    pub fn next(&mut self, peer: &str, answer: WalkAnswer, now: Instant) -> Step {
+        let admitted = u32::try_from(answer.admitted).unwrap_or(u32::MAX);
+        if admitted > 0 {
+            self.node_budget.add(admitted);
+        }
+        let w = self.walk(peer, now);
+        // This peer answered: its request is no longer outstanding.
+        w.in_flight = None;
+        if admitted > 0 {
+            w.budget.add(admitted);
+            w.end_episode();
+        }
+        if !answer.orphans_remaining {
+            w.end_episode();
+        }
+        let Some((height, parent)) = answer.lowest_deferred else {
+            // Nothing of this answer is waiting: the walk reached a held block
+            // (or there was nothing to walk).
+            w.end_episode();
+            return Step::Idle;
+        };
+        self.step(peer, parent, height.saturating_sub(1), answer.applied, now)
+    }
+
+    /// The request for `peer`'s last step was not sent (already pending, or the
+    /// sync manager's in-flight cap): give the step back so the same parent is
+    /// asked for later.
+    pub fn unsent(&mut self, peer: &str) {
+        if let Some(w) = self.peers.get_mut(peer) {
+            w.budget.add(1);
+            w.last_height = w.prev_height;
+            w.in_flight = None;
+            self.node_budget.add(1);
         }
     }
 
-    /// After `peer`'s `Blocks` answer: the parent to ask `peer` for next.
-    pub fn next(&mut self, _peer: &str, answer: WalkAnswer, _now: Instant) -> Step {
-        match self
-            .walk
-            .next(answer.lowest_deferred, answer.orphans_remaining)
-        {
-            Some((parent, height)) => Step::Ask { parent, height },
-            None => Step::Idle,
+    /// Record the missing parents at the bottom of the orphan buffer
+    /// ([`deferred_roots`]) after an answer from `source`. A parent keeps the
+    /// first peer that delivered its child.
+    pub fn note_stuck(&mut self, roots: &[(Hash, u64)], source: &str, now: Instant) {
+        for &(parent, height) in roots {
+            if parent == Hash::new([0u8; 32]) {
+                continue;
+            }
+            if !self.stuck.contains_key(&parent) && self.stuck.len() >= MAX_STUCK_PARENTS {
+                let oldest = self
+                    .stuck
+                    .iter()
+                    .min_by_key(|(_, s)| s.last_seen)
+                    .map(|(k, _)| *k);
+                if let Some(k) = oldest {
+                    self.stuck.remove(&k);
+                }
+            }
+            let s = self.stuck.entry(parent).or_insert_with(|| Stuck {
+                height,
+                deferrals: 0,
+                source: source.to_string(),
+                last_seen: now,
+                last_fetch: None,
+            });
+            s.deferrals = s.deferrals.saturating_add(1);
+            s.last_seen = now;
         }
     }
 
-    /// The request for `peer`'s last step was not sent: give the step back.
-    pub fn unsent(&mut self, _peer: &str) {
-        self.walk.unsent();
-    }
-
-    /// Record the missing parents at the bottom of the orphan buffer.
-    pub fn note_stuck(&mut self, _roots: &[(Hash, u64)], _source: &str, _now: Instant) {}
-
-    /// Stuck parents due a fetch by their own hash.
+    /// Stuck parents due a fetch by their own hash: deferred at least
+    /// [`REFETCH_AFTER_DEFERRALS`] times and not fetched in the last
+    /// [`REFETCH_EVERY`]. Each starts a new episode for its source peer at that
+    /// parent and is charged like any walk step. `held` drops parents this node
+    /// now holds. Give-ups are returned with their log decision.
     pub fn refetch_stuck(
         &mut self,
-        _held: impl Fn(&Hash) -> bool,
-        _applied: u64,
-        _now: Instant,
+        held: impl Fn(&Hash) -> bool,
+        applied: u64,
+        now: Instant,
     ) -> (Vec<Refetch>, Vec<(String, Step)>) {
-        (Vec::new(), Vec::new())
+        self.stuck.retain(|p, s| {
+            !held(p)
+                && now.saturating_duration_since(s.last_seen) < WALK_IDLE_RESET
+                && applied.saturating_sub(s.height) <= MAX_WALK_DEPTH
+        });
+        let mut due: Vec<(Hash, u64, String)> = self
+            .stuck
+            .iter()
+            .filter(|(_, s)| {
+                s.deferrals >= REFETCH_AFTER_DEFERRALS
+                    && s.last_fetch
+                        .is_none_or(|t| now.saturating_duration_since(t) >= REFETCH_EVERY)
+            })
+            .map(|(p, s)| (*p, s.height, s.source.clone()))
+            .collect();
+        // Deepest first: the bottom of the orphan buffer unblocks the most.
+        due.sort_by_key(|(_, h, _)| *h);
+        let mut asks = Vec::new();
+        let mut gave_up = Vec::new();
+        for (parent, height, peer) in due.into_iter().take(MAX_REFETCH_PER_ROUND) {
+            if self.walk(&peer, now).in_flight_at(now) {
+                continue;
+            }
+            // Descend again from this parent.
+            self.walk(&peer, now).resume();
+            match self.step(&peer, parent, height, applied, now) {
+                Step::Ask { parent, height } => {
+                    if let Some(s) = self.stuck.get_mut(&parent) {
+                        s.last_fetch = Some(now);
+                        s.deferrals = 0;
+                    }
+                    asks.push(Refetch {
+                        peer,
+                        parent,
+                        height,
+                    });
+                }
+                Step::Idle => {}
+                g @ Step::GaveUp { .. } => gave_up.push((peer, g)),
+            }
+        }
+        (asks, gave_up)
     }
 }
 
@@ -292,10 +578,22 @@ pub fn missing_parent(storage: &StorageManager, block: &Block) -> Option<Hash> {
 pub fn lowest_deferred(
     storage: &StorageManager,
     from_answer: &[&Block],
-    _orphans: &[Block],
+    orphans: &[Block],
 ) -> Option<(u64, Hash)> {
     let lowest = from_answer.iter().min_by_key(|b| b.header.height)?;
-    missing_parent(storage, lowest).map(|p| (lowest.header.height, p))
+    let mut at = (lowest.header.height, missing_parent(storage, lowest)?);
+    let by_hash: HashMap<Hash, &Block> = orphans.iter().map(|b| (b.header.block_hash, b)).collect();
+    // Bounded by the buffer: each hop moves to a different buffered block.
+    for _ in 0..orphans.len() {
+        let Some(b) = by_hash.get(&at.1) else {
+            break;
+        };
+        match missing_parent(storage, b) {
+            Some(p) => at = (b.header.height, p),
+            None => break,
+        }
+    }
+    Some(at)
 }
 
 /// Carry out a walk step for `peer`: send an [`Step::Ask`] (giving the step
