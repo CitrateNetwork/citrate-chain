@@ -7389,7 +7389,10 @@ mod tests {
                 producer,
                 orphans: Vec::new(),
                 attested,
-                walk: ParentWalks::new(std::time::Instant::now()),
+                walk: ParentWalks::new(
+                    std::time::Instant::now(),
+                    std::time::Duration::from_secs(30),
+                ),
                 id: format!("node-{i}"),
                 clock: std::time::Instant::now(),
                 asked: Vec::new(),

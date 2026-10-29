@@ -334,7 +334,7 @@ impl Node {
             sync,
             rejoin: parking_lot::Mutex::new(sync_rejoin::RejoinTracker::new()),
             sel: sync_peer::SyncPeerSelector::new(),
-            walk: sync_recovery::ParentWalks::new(clock),
+            walk: sync_recovery::ParentWalks::new(clock, SyncConfig::default().request_timeout),
             pm: Arc::new(citrate_network::PeerManager::new(
                 citrate_network::PeerManagerConfig::default(),
             )),

@@ -351,6 +351,13 @@ impl RejoinTracker {
         out
     }
 
+    /// The tick did not send this round's request to `peer` (its anchor was
+    /// still pending).
+    pub fn note_unsent(&mut self, peer: &str) -> Option<Transition> {
+        let _ = peer;
+        None
+    }
+
     /// Whether a `Blocks` message from `peer` answers the outstanding request;
     /// if so, the anchor height it answers. `received` is the answer as it
     /// arrived (only its emptiness is used); `verified` holds the hashes of
@@ -3696,7 +3703,10 @@ mod tests {
             |_| false,
             now,
         );
-        assert_eq!(src, Source::Pinned("sib".into()));
+        // P1-2: a peer more than the catch-up gap ahead of the pinned one ends
+        // the pin; the selector's peer is asked instead.
+        assert_eq!(src, Source::Ahead("aaa".into()));
+        let _ = t.start_split_pull("sib", 50);
         // No answers: bounded, then over, with no rejoin cooldown owed.
         let mut gave_up = false;
         for _ in 0..=MAX_UNANSWERED {
@@ -3725,6 +3735,116 @@ mod tests {
             now + std::time::Duration::from_secs(20),
         );
         assert_eq!(src, Source::Nobody);
+    }
+
+    /// P1-2: a pinned peer whose re-sends are skipped (its anchor is still
+    /// pending in the sync manager) gets no answer either: those rounds count
+    /// as unanswered, so a silent pin ends after `MAX_UNANSWERED` rounds.
+    #[test]
+    fn a_pinned_search_whose_resends_are_skipped_ends() {
+        let mut t = RejoinTracker::new();
+        let _ = t.start_split_pull("sib", 50);
+        let a = t.anchor((hx(1), 50), |_| Some(hx(2)));
+        t.note_asked("sib", a);
+        let mut ended = false;
+        for _ in 0..MAX_UNANSWERED {
+            if let Some(Transition::GaveUp { .. }) = t.note_unsent("sib") {
+                ended = true;
+                break;
+            }
+        }
+        assert!(ended, "a silent pin held the tick: {:?}", t.mode());
+        assert_eq!(t.search_peer(), None);
+    }
+
+    /// P1-2: a slow peer answering one request in seven keeps `unanswered`
+    /// below its limit forever. The search still ends within its request cap,
+    /// which is sized to the search's own log bound.
+    #[test]
+    fn a_slow_peer_cannot_hold_a_search_past_its_request_cap() {
+        let top = 86_000u64;
+        let bound = 2 * (64 - top.leading_zeros()) + MAX_UNANSWERED;
+        let mut t = RejoinTracker::new();
+        let _ = t.start_split_pull("slow", top);
+        let mut requests = 0u32;
+        while t.search_peer().is_some() && requests < 10_000 {
+            let a = t.anchor((hx(1), top), |_| Some(hx(2)));
+            t.note_asked("slow", a);
+            requests += 1;
+            if requests % 7 == 0 && t.search_peer().is_some() {
+                if let Some(ah) = t.take_answer("slow", &[], &HashSet::new()) {
+                    t.on_answer(Answer::Unconnected, true, ah);
+                }
+            }
+        }
+        assert!(
+            requests <= bound,
+            "the search took {requests} requests (bound {bound})"
+        );
+    }
+
+    /// P1-2: a follow that admits one block per answer never runs dry. A split
+    /// follow stops at its height bound; any follow that only trickles ends.
+    #[test]
+    fn an_endless_follow_ends_within_its_bound() {
+        use crate::sync_peer::SPLIT_PULL_HEIGHT_BAND;
+        let depth = crate::canonical_apply::MAX_REORG_DEPTH;
+        for split in [true, false] {
+            let mut t = RejoinTracker::new();
+            let top = 500u64;
+            if split {
+                let _ = t.start_split_pull("drip", top);
+            } else {
+                t.note_sync_target(top + 10_000, top);
+                for _ in 0..PROBE_AFTER_STRIKES {
+                    let a = t.anchor((hx(1), top), |_| Some(hx(2)));
+                    t.note_asked("drip", a);
+                    let ah = t.take_answer("drip", &[], &HashSet::new()).expect("answer");
+                    t.on_answer(Answer::Unconnected, true, ah);
+                }
+            }
+            let mut cursor = top - 1;
+            let mut answers = 0u32;
+            while t.search_peer().is_some() && answers < 10_000 {
+                let a = t.anchor((hx(1), top), |_| Some(hx(2)));
+                t.note_asked("drip", a);
+                let ah = t
+                    .take_answer("drip", &[a.0], &[a.0].into_iter().collect())
+                    .expect("answer");
+                cursor += 1;
+                t.on_answer(
+                    Answer::Progress {
+                        highest: (hx(3), cursor),
+                    },
+                    true,
+                    ah,
+                );
+                answers += 1;
+            }
+            assert!(
+                t.search_peer().is_none(),
+                "split={split}: the follow never ended"
+            );
+            assert!(
+                cursor <= top + SPLIT_PULL_HEIGHT_BAND + depth,
+                "split={split}: followed to {cursor}"
+            );
+            assert!(
+                answers <= 2 * MAX_UNANSWERED,
+                "split={split}: {answers} trickling answers"
+            );
+        }
+    }
+
+    /// P3: the tick's split-pull check reads no storage under the selector
+    /// lock: held heads are looked up before it is taken.
+    #[test]
+    fn choose_source_reads_no_storage_under_the_selector_lock() {
+        let main = include_str!("main.rs");
+        assert!(
+            main.contains("|h| held_heads.contains(h)"),
+            "choose_source's `holds` must use heads looked up before the selector lock"
+        );
     }
 
     /// A pinned peer that disconnects ends the search; the tick falls back to

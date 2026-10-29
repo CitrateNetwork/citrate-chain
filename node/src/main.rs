@@ -3518,7 +3518,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             let mut rejoin_log = sync_rejoin::RejoinLogBudget::new();
             // sync_recovery.rs: missing-parent walks, one per peer, each with a
             // budget that refills, under a node-wide budget and in-flight cap.
-            let mut parent_walks = sync_recovery::ParentWalks::new(std::time::Instant::now());
+            let mut parent_walks = sync_recovery::ParentWalks::new(
+                std::time::Instant::now(),
+                sync_for_rx.request_timeout(),
+            );
             while let Some((pid, msg)) = in_rx.recv().await {
                 // #149 liveness heartbeat. Bumped BEFORE the message is handled,
                 // so a loop that is stuck inside a handler stops advancing this

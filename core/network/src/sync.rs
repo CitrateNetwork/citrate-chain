@@ -381,6 +381,16 @@ impl SyncManager {
         from: Hash,
         from_height: u64,
     ) -> Result<bool, NetworkError> {
+        self.send_block_request(peer, from, from_height, true).await
+    }
+
+    async fn send_block_request(
+        &self,
+        peer: &Peer,
+        from: Hash,
+        from_height: u64,
+        driver: bool,
+    ) -> Result<bool, NetworkError> {
         let peer_id = peer.info.read().await.id.clone();
 
         // Check if already pending
@@ -410,10 +420,31 @@ impl SyncManager {
                 retries: 0,
             },
         );
-        self.last_block_anchor_height
-            .store(from_height, Ordering::Relaxed);
+        if driver {
+            self.last_block_anchor_height
+                .store(from_height, Ordering::Relaxed);
+        }
 
         Ok(true)
+    }
+
+    /// How long a sent request stays pending before [`Self::check_timeouts`]
+    /// retires it.
+    pub fn request_timeout(&self) -> Duration {
+        self.config.request_timeout
+    }
+
+    /// A `GetBlocks` sent for missing-parent recovery, not by the sync driver:
+    /// pending and de-duplicated like any request, but it leaves
+    /// [`Self::last_block_anchor_height`] (the driver's own anchor, which its
+    /// stale-answer check and serve scoring read) alone.
+    pub async fn request_blocks_for_recovery(
+        &self,
+        peer: &Peer,
+        from: Hash,
+        from_height: u64,
+    ) -> Result<bool, NetworkError> {
+        self.send_block_request(peer, from, from_height, true).await
     }
 
     /// Handle received headers

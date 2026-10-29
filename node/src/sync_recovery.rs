@@ -81,6 +81,10 @@ pub const WALK_IDLE_RESET: Duration = Duration::from_secs(30);
 /// A walk request with no answer for this long no longer counts as in flight.
 pub const WALK_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The sync tick sends a block request only while fewer than this many are
+/// pending in the sync manager (main.rs).
+pub const TICK_PENDING_GATE: usize = 8;
+
 /// Most walk requests outstanding across all peers. Half the sync manager's
 /// download window (`SyncConfig::max_concurrent_downloads` = 16), so recovery
 /// never takes the slots the forward sync driver needs.
@@ -330,7 +334,8 @@ pub struct ParentWalks {
 }
 
 impl ParentWalks {
-    pub fn new(now: Instant) -> Self {
+    pub fn new(now: Instant, request_timeout: Duration) -> Self {
+        let _ = request_timeout;
         Self {
             peers: HashMap::new(),
             node_budget: Bucket::full(NODE_WALK_BURST, NODE_WALK_REFILL_EVERY, now),
@@ -483,6 +488,12 @@ impl ParentWalks {
             w.in_flight = None;
             self.node_budget.add(1);
         }
+    }
+
+    /// A block delivered by `peer` went into the orphan buffer waiting on
+    /// `parent`.
+    pub fn note_buffered(&mut self, parent: Hash, peer: &str, now: Instant) {
+        let _ = (parent, peer, now);
     }
 
     /// Record the missing parents at the bottom of the orphan buffer
@@ -707,6 +718,9 @@ pub fn initial_sync_complete(
 mod tests {
     use super::*;
 
+    /// The sync manager's default request timeout (`SyncConfig`).
+    const TEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
     fn h(b: u8) -> Hash {
         Hash::new([b; 32])
     }
@@ -780,7 +794,7 @@ mod tests {
     #[test]
     fn walk_goes_down_only_and_never_repeats_a_height() {
         let t = Instant::now();
-        let mut w = ParentWalks::new(t);
+        let mut w = ParentWalks::new(t, TEST_REQUEST_TIMEOUT);
         assert_eq!(
             w.next("a", ans(Some((100, h(1))), 0, 100), t),
             Step::Ask {
@@ -794,7 +808,7 @@ mod tests {
         assert_eq!(w.next("a", ans(Some((150, h(2))), 0, 150), t), Step::Idle);
         assert!(is_ask(w.next("a", ans(Some((99, h(3))), 0, 100), t)));
         // The zero hash is never asked for.
-        let mut w = ParentWalks::new(t);
+        let mut w = ParentWalks::new(t, TEST_REQUEST_TIMEOUT);
         assert_eq!(
             w.next("a", ans(Some((5, Hash::new([0; 32]))), 0, 5), t),
             Step::Idle
@@ -806,7 +820,7 @@ mod tests {
     #[test]
     fn exhausting_one_peer_does_not_block_another() {
         let t = Instant::now();
-        let mut w = ParentWalks::new(t);
+        let mut w = ParentWalks::new(t, TEST_REQUEST_TIMEOUT);
         // Peer A serves an endless branch that never reaches a held block; the
         // applied tip follows so the window is never what stops it.
         let mut steps_a = 0u32;
@@ -843,7 +857,7 @@ mod tests {
     #[test]
     fn budget_refills_after_progress_and_with_time() {
         let t0 = Instant::now();
-        let mut w = ParentWalks::new(t0);
+        let mut w = ParentWalks::new(t0, TEST_REQUEST_TIMEOUT);
         let (spent, last) = descend(&mut w, "a", 1_000_000, None, t0);
         assert_eq!(spent, MAX_PARENT_WALK_STEPS);
         assert!(matches!(
@@ -860,7 +874,7 @@ mod tests {
             "an answer that admitted blocks refills the peer's budget"
         );
         // Time: four intervals later, four more steps.
-        let mut w = ParentWalks::new(t0);
+        let mut w = ParentWalks::new(t0, TEST_REQUEST_TIMEOUT);
         descend(&mut w, "a", 1_000_000, None, t0);
         let later = t0 + WALK_REFILL_EVERY * 4;
         let mut refilled = 0u64;
@@ -881,7 +895,7 @@ mod tests {
     #[test]
     fn a_fork_82_deep_is_reached() {
         let t = Instant::now();
-        let mut w = ParentWalks::new(t);
+        let mut w = ParentWalks::new(t, TEST_REQUEST_TIMEOUT);
         let tip = 4_160u64;
         let fork = tip - 82;
         let mut height = tip;
@@ -903,7 +917,7 @@ mod tests {
     #[test]
     fn walk_never_goes_below_the_reorg_window() {
         let t = Instant::now();
-        let mut w = ParentWalks::new(t);
+        let mut w = ParentWalks::new(t, TEST_REQUEST_TIMEOUT);
         let applied = 10_000u64;
         let (steps, last) = descend(&mut w, "a", applied, Some(applied), t);
         assert_eq!(u64::from(steps), MAX_WALK_DEPTH);
@@ -920,7 +934,7 @@ mod tests {
     #[test]
     fn an_unsent_step_is_given_back() {
         let t = Instant::now();
-        let mut w = ParentWalks::new(t);
+        let mut w = ParentWalks::new(t, TEST_REQUEST_TIMEOUT);
         let ask = Step::Ask {
             parent: h(1),
             height: 99,
@@ -939,6 +953,103 @@ mod tests {
         w.unsent("nobody");
     }
 
+    /// A peer handle whose messages nobody answers, registered with `pm`. The
+    /// returned receiver keeps its channel open.
+    async fn silent_peer(
+        pm: &citrate_network::PeerManager,
+        id: &str,
+    ) -> tokio::sync::mpsc::Receiver<citrate_network::NetworkMessage> {
+        let (tx, rx) = tokio::sync::mpsc::channel(1 << 12);
+        let (_in_tx, in_rx) = tokio::sync::mpsc::channel(1);
+        let mut info = citrate_network::PeerInfo::new(
+            citrate_network::PeerId::new(id.to_string()),
+            "127.0.0.1:1".parse().expect("addr"),
+            citrate_network::peer::Direction::Outbound,
+        );
+        info.state = citrate_network::peer::PeerState::Connected;
+        pm.add_peer(std::sync::Arc::new(citrate_network::Peer::new(
+            info, tx, in_rx,
+        )))
+        .await
+        .expect("add peer");
+        rx
+    }
+
+    /// P1-1: eight silent peers gossiping blocks on parents nobody holds keep
+    /// asking this node to walk. Their requests are never answered, so they
+    /// stay pending in the sync manager for its whole request timeout. The
+    /// sync tick sends only below `TICK_PENDING_GATE` pending requests: the
+    /// walk must always leave it room, round after round.
+    #[tokio::test]
+    async fn silent_walk_peers_leave_the_tick_its_headroom() {
+        let pm = citrate_network::PeerManager::new(citrate_network::PeerManagerConfig::default());
+        let sync = citrate_network::SyncManager::new(citrate_network::SyncConfig::default());
+        let mut keep = Vec::new();
+        for i in 0..8 {
+            keep.push(silent_peer(&pm, &format!("sybil-{i}")).await);
+        }
+        let t0 = Instant::now();
+        let mut w = ParentWalks::new(t0, sync.request_timeout());
+        for round in 0..20u64 {
+            let now = t0 + Duration::from_secs(2 * round);
+            for i in 0..8u64 {
+                let peer = format!("sybil-{i}");
+                let step = w.begin(&peer, hn(round * 8 + i + 1), 5_000, 5_000, now);
+                send_step(&mut w, &pm, &sync, &peer, step, 5_000).await;
+            }
+            let (_, pb) = sync.pending_counts().await;
+            assert!(
+                pb < TICK_PENDING_GATE,
+                "round {round}: {pb} block requests pending, the sync tick cannot send"
+            );
+        }
+        assert!(MAX_WALKS_IN_FLIGHT < TICK_PENDING_GATE);
+    }
+
+    /// P3: a walk request does not move the anchor height the sync driver
+    /// judges its own answers against (`last_block_anchor_height`).
+    #[tokio::test]
+    async fn walk_requests_do_not_move_the_tick_anchor() {
+        let pm = citrate_network::PeerManager::new(citrate_network::PeerManagerConfig::default());
+        let sync = citrate_network::SyncManager::new(citrate_network::SyncConfig::default());
+        let _keep = silent_peer(&pm, "honest").await;
+        let peer = pm
+            .get_peer(&citrate_network::PeerId::new("honest".into()))
+            .expect("peer");
+        assert_eq!(
+            sync.request_blocks(&peer, hn(1), 100).await.ok(),
+            Some(true)
+        );
+        let t = Instant::now();
+        let mut w = ParentWalks::new(t, sync.request_timeout());
+        let step = w.begin("honest", hn(2), 50, 100, t);
+        assert!(send_step(&mut w, &pm, &sync, "honest", step, 100).await);
+        assert_eq!(
+            sync.last_block_anchor_height(),
+            100,
+            "the walk request moved the tick's anchor height"
+        );
+    }
+
+    /// P2: a stuck parent is fetched from the peer that delivered its child
+    /// (recorded when the child was buffered), not from whichever peer's
+    /// answer first left it at the bottom of the buffer.
+    #[test]
+    fn stuck_parent_is_charged_to_the_peer_that_delivered_its_child() {
+        let t = Instant::now();
+        let mut w = ParentWalks::new(t, TEST_REQUEST_TIMEOUT);
+        w.note_buffered(h(7), "honest", t);
+        for _ in 0..REFETCH_AFTER_DEFERRALS {
+            w.note_stuck(&[(h(7), 4_095)], "spam", t);
+        }
+        let (asks, _) = w.refetch_stuck(|_| false, 4_160, t);
+        assert_eq!(
+            asks.iter().map(|r| r.peer.as_str()).collect::<Vec<_>>(),
+            vec!["honest"],
+            "the refetch went to the first answerer, not the deliverer"
+        );
+    }
+
     /// (d) Amplification: a hostile peer sending endless unknown parents, by
     /// gossip and by unsolicited answers, gets at most its budget plus one step
     /// per refill interval out of this node; many hostile identities together
@@ -950,7 +1061,7 @@ mod tests {
         let secs = 120u64;
         // One peer, 100 messages a second, every one carrying a fresh unknown
         // parent (alternating gossip and answers, heights going down).
-        let mut w = ParentWalks::new(t0);
+        let mut w = ParentWalks::new(t0, TEST_REQUEST_TIMEOUT);
         let mut asks = 0u64;
         let mut height = 1_000_000u64;
         for i in 0..(secs * 100) {
@@ -972,7 +1083,7 @@ mod tests {
             "one hostile peer got {asks} requests (bound {bound})"
         );
         // Many identities, nobody ever answering: the in-flight cap holds.
-        let mut w = ParentWalks::new(t0);
+        let mut w = ParentWalks::new(t0, TEST_REQUEST_TIMEOUT);
         let mut max_in_flight = 0usize;
         let mut asks = 0u64;
         for i in 0..10_000u64 {
@@ -993,7 +1104,7 @@ mod tests {
         );
         // Several identities, each answering at once with an ever-lower
         // unknown parent: together they get no more than the node budget.
-        let mut w = ParentWalks::new(t0);
+        let mut w = ParentWalks::new(t0, TEST_REQUEST_TIMEOUT);
         let mut asks = 0u64;
         for i in 0..20_000u64 {
             let now = t0 + Duration::from_millis(i);
@@ -1014,7 +1125,7 @@ mod tests {
     #[test]
     fn give_up_is_reported_once_per_episode_and_rate_limited() {
         let t = Instant::now();
-        let mut w = ParentWalks::new(t);
+        let mut w = ParentWalks::new(t, TEST_REQUEST_TIMEOUT);
         let applied = 10_000u64;
         let deep = applied - MAX_WALK_DEPTH - 5;
         let first = w.next("a", ans(Some((deep, hn(deep - 1))), 0, applied), t);
@@ -1061,7 +1172,7 @@ mod tests {
     #[test]
     fn a_stuck_parent_is_fetched_by_hash() {
         let t = Instant::now();
-        let mut w = ParentWalks::new(t);
+        let mut w = ParentWalks::new(t, TEST_REQUEST_TIMEOUT);
         let stuck = (h(7), 4_095u64);
         // The walk against `b` stopped at the window and moved on.
         descend(&mut w, "b", 4_160, Some(4_160), t);
@@ -1074,7 +1185,7 @@ mod tests {
             "not yet repeated"
         );
         w.note_stuck(&[stuck], "c", t);
-        let later = t + WALK_REQUEST_TIMEOUT;
+        let later = t + TEST_REQUEST_TIMEOUT;
         let (asks, _) = w.refetch_stuck(none, 4_160, later);
         assert_eq!(
             asks,
