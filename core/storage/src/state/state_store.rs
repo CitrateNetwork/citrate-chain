@@ -4,7 +4,7 @@ use crate::db::{column_families::*, RocksDB};
 use anyhow::Result;
 use citrate_consensus::types::Hash;
 use citrate_execution::executor::{
-    BlockUndo, ReceiptIndexBatch, StateStorageChange, StateStoreTrait,
+    BlockUndo, ModelJobUndo, ReceiptIndexBatch, StateStorageChange, StateStoreTrait,
 };
 use citrate_execution::types::{AccountState, Address, JobId, ModelId, ModelState, TrainingJob};
 use std::sync::Arc;
@@ -73,6 +73,22 @@ fn reorg_undo_height(key: &[u8]) -> Option<u64> {
     let rest = key.strip_prefix(REORG_UNDO_PREFIX)?;
     let bytes = <[u8; 8]>::try_from(rest).ok()?;
     Some(u64::from_be_bytes(bytes))
+}
+
+/// `held` with the entries of `more` it does not hold yet: the pre-images of a
+/// rewrite at the same tip, where the first value seen is the parent's.
+fn merge_model_job_undo(mut held: ModelJobUndo, more: &ModelJobUndo) -> ModelJobUndo {
+    let models: std::collections::HashSet<ModelId> = held.models.iter().map(|(k, _)| *k).collect();
+    held.models.extend(
+        more.models
+            .iter()
+            .filter(|(k, _)| !models.contains(k))
+            .cloned(),
+    );
+    let jobs: std::collections::HashSet<JobId> = held.jobs.iter().map(|(k, _)| *k).collect();
+    held.jobs
+        .extend(more.jobs.iter().filter(|(k, _)| !jobs.contains(k)).cloned());
+    held
 }
 
 /// Whether height `h` is inside the kept window at tip height `tip`.
@@ -167,6 +183,7 @@ impl StateStoreTrait for StateStore {
             storage,
             None,
             &ReceiptIndexBatch::default(),
+            None,
         )
     }
 
@@ -174,13 +191,15 @@ impl StateStoreTrait for StateStore {
     /// cross-CF RocksDB `WriteBatch`, so the durable state and the committed applied tip
     /// can never diverge across a crash/restart (see the trait doc). The applied-tip key
     /// (`CF_METADATA`/`APPLIED_TIP_KEY`) is written in the SAME batch as the account +
-    /// storage mutations — the whole thing commits or nothing does.
+    /// storage mutations — the whole thing commits or nothing does. So does the
+    /// block's undo record, model and job pre-images included.
     fn write_state_batch_with_applied_tip(
         &self,
         accounts: &[(Address, AccountState)],
         storage: &[StateStorageChange],
         applied_tip: Option<(Hash, u64)>,
         index: &ReceiptIndexBatch,
+        models_jobs: Option<&ModelJobUndo>,
     ) -> Result<()> {
         if accounts.is_empty() && storage.is_empty() && applied_tip.is_none() && index.is_empty() {
             return Ok(());
@@ -213,7 +232,7 @@ impl StateStoreTrait for StateStore {
         let _index_guard = match applied_tip {
             Some((hash, height)) => {
                 let guard = crate::chain::block_store::canonical_index_lock();
-                self.stage_block_undo(&mut batch, accounts, storage, (hash, height))?;
+                self.stage_block_undo(&mut batch, accounts, storage, models_jobs, (hash, height))?;
                 self.stage_applied_tip_locked(&mut batch, &hash, height)?;
                 Some(guard)
             }
@@ -445,7 +464,8 @@ impl StateStore {
 
     /// Stage the undo record of the block a linear commit applies at `tip`:
     /// the stored value of every account and slot the batch writes, read
-    /// before the batch commits, with the previous durable tip as parent.
+    /// before the batch commits, with the previous durable tip as parent, and
+    /// the block's model/job pre-images as the executor computed them.
     /// Records outside the kept window are deleted in the same batch. A
     /// rewrite at the tip already durable adds the pre-images of keys its
     /// record does not hold yet, so the record keeps reverting to the parent.
@@ -459,10 +479,11 @@ impl StateStore {
         batch: &mut rocksdb::WriteBatch,
         accounts: &[(Address, AccountState)],
         storage: &[StateStorageChange],
+        models_jobs: Option<&ModelJobUndo>,
         tip: (Hash, u64),
     ) -> Result<()> {
         let (hash, height) = tip;
-        match self.block_undo(accounts, storage, tip) {
+        match self.block_undo(accounts, storage, models_jobs, tip) {
             Ok(Some(record)) => {
                 self.db.batch_put_cf(
                     batch,
@@ -496,17 +517,29 @@ impl StateStore {
     /// is already durable, its own record extended. `None` when the tip is
     /// already durable and the record at its height names another block or
     /// parent (or there is none).
+    ///
+    /// Model/job pre-images of a rewrite are merged the same way (entries the
+    /// record already holds win). A rewrite without them, or onto a record
+    /// without them, leaves the record without model/job pre-images: unusable
+    /// for a revert, never wrong.
     fn block_undo(
         &self,
         accounts: &[(Address, AccountState)],
         storage: &[StateStorageChange],
+        models_jobs: Option<&ModelJobUndo>,
         tip: (Hash, u64),
     ) -> Result<Option<BlockUndo>> {
         let (hash, height) = tip;
         let parent = self.durable_tip()?;
         let mut record = if parent == Some(tip) {
             match self.get_reorg_undo(height)? {
-                Some(r) if r.hash == hash && r.height == height => r,
+                Some(mut r) if r.hash == hash && r.height == height => {
+                    r.models_jobs = match (r.models_jobs.take(), models_jobs) {
+                        (Some(held), Some(more)) => Some(merge_model_job_undo(held, more)),
+                        _ => None,
+                    };
+                    r
+                }
                 _ => return Ok(None),
             }
         } else {
@@ -516,7 +549,7 @@ impl StateStore {
                 parent,
                 accounts: Vec::new(),
                 storage: Vec::new(),
-                models_jobs: None,
+                models_jobs: models_jobs.cloned(),
             }
         };
         let held_accounts: std::collections::HashSet<Address> =
@@ -587,31 +620,6 @@ impl StateStore {
 
     pub fn new(db: Arc<RocksDB>) -> Self {
         Self { db }
-    }
-
-    /// Add the model and training-job pre-images to the record of the block
-    /// `hash` at `height` (see [`BlockUndo::models_jobs`]). `Ok(false)` when no
-    /// record names that block (nothing is written). A lost write only leaves
-    /// the record unusable for a revert, so it is not fsync'd.
-    pub fn complete_reorg_undo(
-        &self,
-        height: u64,
-        hash: Hash,
-        models_jobs: citrate_execution::executor::ModelJobUndo,
-    ) -> Result<bool> {
-        let _guard = crate::chain::block_store::canonical_index_lock();
-        match self.get_reorg_undo(height)? {
-            Some(mut record) if record.hash == hash => {
-                record.models_jobs = Some(models_jobs);
-                self.db.put_cf(
-                    CF_METADATA,
-                    &reorg_undo_key(height),
-                    &bincode::serialize(&record)?,
-                )?;
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
     }
 
     /// Heights that hold an undo record, ascending.
@@ -977,6 +985,7 @@ mod tests {
                 &[slot(a, b"k", Some(b"v1"))],
                 Some((block_hash(1), 1)),
                 &none,
+                None,
             )
             .unwrap();
         store
@@ -985,6 +994,7 @@ mod tests {
                 &[slot(a, b"k", None), slot(a, b"j", Some(b"x"))],
                 Some((block_hash(2), 2)),
                 &none,
+                None,
             )
             .unwrap();
         let rec = store.get_reorg_undo(2).unwrap().expect("record");
@@ -1006,6 +1016,7 @@ mod tests {
                 &[],
                 Some((block_hash(2), 2)),
                 &none,
+                None,
             )
             .unwrap();
         let rec = store.get_reorg_undo(2).unwrap().expect("record");
@@ -1019,29 +1030,42 @@ mod tests {
     /// A record at the height of a new block that names another block (an
     /// abandoned branch's, left after a crash between a reorg's revert and its
     /// commit) is replaced, not extended; a rewrite at the durable tip whose
-    /// record names another block drops it. Model pre-images are added to the
-    /// record of the named block only.
+    /// record names another block drops it. Model/job pre-images commit with
+    /// the block's own batch, and a rewrite at the durable tip merges them
+    /// (the first value seen wins), or leaves the record without them when the
+    /// rewrite does not carry any.
     #[test]
     fn a_stale_record_at_the_height_is_replaced_not_merged() {
-        let temp_dir = TempDir::new().unwrap();
-        let store = StateStore::new(Arc::new(RocksDB::open(temp_dir.path()).unwrap()));
+        let temp_dir = TempDir::new().expect("tempdir");
+        let store = StateStore::new(Arc::new(RocksDB::open(temp_dir.path()).expect("open")));
         let (a, b) = (Address([1; 20]), Address([2; 20]));
         let none = ReceiptIndexBatch::default();
-        let commit = |accts: &[(Address, AccountState)], tip: (Hash, u64)| {
-            store
-                .write_state_batch_with_applied_tip(accts, &[], Some(tip), &none)
-                .unwrap()
+        let model = |n: u8| ModelId(Hash::new([n; 32]));
+        let mj = |ids: &[u8]| ModelJobUndo {
+            models: ids.iter().map(|n| (model(*n), None)).collect(),
+            jobs: vec![],
         };
-        commit(&[(a, acct(1))], (block_hash(1), 1));
-        commit(&[(a, acct(2)), (b, acct(9))], (block_hash(2), 2));
+        let commit = |accts: &[(Address, AccountState)],
+                      tip: (Hash, u64),
+                      models_jobs: Option<&ModelJobUndo>| {
+            store
+                .write_state_batch_with_applied_tip(accts, &[], Some(tip), &none, models_jobs)
+                .expect("commit")
+        };
+        commit(&[(a, acct(1))], (block_hash(1), 1), Some(&mj(&[])));
+        commit(
+            &[(a, acct(2)), (b, acct(9))],
+            (block_hash(2), 2),
+            Some(&mj(&[1])),
+        );
         // Back to the fork point at 1 (a reorg's revert): record 2 stays.
         store
             .write_reorg_batch_sync(&[], &[], &[], &[], Some((block_hash(1), 1)), &none, &[])
-            .unwrap();
+            .expect("revert");
         // The other branch's block at 2: a new record, nothing of the stale one.
         let other = Hash::new([0xEE; 32]);
-        commit(&[(a, acct(3))], (other, 2));
-        let rec = store.get_reorg_undo(2).unwrap().expect("record");
+        commit(&[(a, acct(3))], (other, 2), Some(&mj(&[2])));
+        let rec = store.get_reorg_undo(2).expect("read").expect("record");
         assert_eq!(rec.hash, other);
         assert_eq!(rec.parent, Some((block_hash(1), 1)));
         assert_eq!(
@@ -1049,26 +1073,27 @@ mod tests {
             vec![(a, Some(acct(2)))],
             "pre-image from the store"
         );
-        assert!(rec.models_jobs.is_none());
-        // Model pre-images go to the named block's record only.
-        let mj = citrate_execution::executor::ModelJobUndo::default();
-        assert!(!store
-            .complete_reorg_undo(2, block_hash(2), mj.clone())
-            .unwrap());
-        assert!(store.complete_reorg_undo(2, other, mj.clone()).unwrap());
         assert_eq!(
-            store.get_reorg_undo(2).unwrap().unwrap().models_jobs,
-            Some(mj)
+            rec.models_jobs,
+            Some(mj(&[2])),
+            "the block's own model pre-images, in its batch"
         );
-        // A rewrite at the durable tip (other @ 2) keeps and extends its record...
-        commit(&[(Address([5; 20]), acct(1))], (other, 2));
-        let rec = store.get_reorg_undo(2).unwrap().expect("record");
+        // A rewrite at the durable tip (other @ 2) keeps and extends its record,
+        // model pre-images merged (model 2 is already held: its first value wins)...
+        commit(
+            &[(Address([5; 20]), acct(1))],
+            (other, 2),
+            Some(&mj(&[2, 3])),
+        );
+        let rec = store.get_reorg_undo(2).expect("read").expect("record");
         assert_eq!(rec.accounts.len(), 2);
-        assert!(
-            rec.models_jobs.is_some(),
-            "the completed record stays usable"
-        );
-        // ...but a record that names another block at the durable tip is dropped.
+        assert_eq!(rec.models_jobs, Some(mj(&[2, 3])));
+        // ...a rewrite without model pre-images leaves the record unusable for
+        // a revert (it may have changed models the record cannot undo)...
+        commit(&[(Address([7; 20]), acct(1))], (other, 2), None);
+        let rec = store.get_reorg_undo(2).expect("read").expect("record");
+        assert!(rec.models_jobs.is_none());
+        // ...and a record that names another block at the durable tip is dropped.
         let stale = BlockUndo {
             height: 2,
             hash: block_hash(2),
@@ -1079,11 +1104,11 @@ mod tests {
             .put_cf(
                 CF_METADATA,
                 &reorg_undo_key(2),
-                &bincode::serialize(&stale).unwrap(),
+                &bincode::serialize(&stale).expect("encode"),
             )
-            .unwrap();
-        commit(&[(Address([6; 20]), acct(1))], (other, 2));
-        assert!(store.get_reorg_undo(2).unwrap().is_none());
+            .expect("put");
+        commit(&[(Address([6; 20]), acct(1))], (other, 2), Some(&mj(&[])));
+        assert!(store.get_reorg_undo(2).expect("read").is_none());
     }
 
     /// Records are kept for exactly the last REORG_UNDO_DEPTH heights; a reorg
@@ -1103,6 +1128,7 @@ mod tests {
                     &[],
                     Some((block_hash(h), h)),
                     &none,
+                    None,
                 )
                 .unwrap();
         }
@@ -1173,6 +1199,7 @@ mod tests {
                 &[],
                 Some((block_hash(1), 1)),
                 &none,
+                None,
             )
             .expect("block 1");
         assert!(store.get_reorg_undo(1).expect("read").is_some(), "fixture");
@@ -1183,6 +1210,7 @@ mod tests {
             &[slot(a, b"k", Some(b"v"))],
             Some((block_hash(2), 2)),
             &none,
+            None,
         );
         let winner = [BlockUndo {
             height: 3,
@@ -1249,6 +1277,7 @@ mod tests {
                 &[slot(a, b"big", Some(&big))],
                 Some((block_hash(1), 1)),
                 &none,
+                None,
             )
             .expect("block 1");
         // Block 2 overwrites the big slot: its pre-image is over the cap.
@@ -1258,6 +1287,7 @@ mod tests {
                 &[slot(a, b"big", Some(b"small"))],
                 Some((block_hash(2), 2)),
                 &none,
+                None,
             )
             .expect("block 2 commits");
         assert_eq!(store.durable_tip().expect("tip"), Some((block_hash(2), 2)));

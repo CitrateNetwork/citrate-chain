@@ -2710,10 +2710,17 @@ impl BlockProducer {
 
         // 2) Persist state changes + advance the durable applied tip ATOMICALLY to THIS
         //    block, so durable state and the committed tip can never diverge on a crash.
+        //    The block's model/job pre-images (from the state the round opened on)
+        //    commit in its undo record in the same batch.
         info!("Persisting state changes to storage...");
+        let models_jobs = round_state.model_job_undo();
         let modified_count = self
             .executor
-            .persist_state_changes_with_tip(Some((block.header.block_hash, block.header.height)))
+            .persist_state_changes_with_undo(
+                Some((block.header.block_hash, block.header.height)),
+                &citrate_execution::executor::ReceiptIndexBatch::default(),
+                models_jobs.as_ref(),
+            )
             .await?;
         // The block's state is durable: keep it.
         round_state.commit();
@@ -8824,7 +8831,7 @@ mod producer_panic_breaker {
             .find("self.executor.set_block_context(")
             .expect("first executor mutation");
         let persist = body
-            .find(".persist_state_changes_with_tip(")
+            .find(".persist_state_changes_with_undo(")
             .expect("persist");
         let commit = body.find("round_state.commit()").expect("commit");
         assert!(open < first_mutation);

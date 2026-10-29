@@ -1630,9 +1630,7 @@ impl CanonicalApplicator {
                 .await;
             match apply_result {
                 Ok(_root) => {
-                    let after = self.executor.state_snapshot();
-                    complete_block_undo(&self.storage, state, &block, &after);
-                    state.record(block_hash, height, after);
+                    state.record(block_hash, height, self.executor.state_snapshot());
                     self.persist_applied(&block_hash, height, &block.state_root);
                     applied.push(block_hash);
                     info!(
@@ -3019,12 +3017,7 @@ impl CanonicalApplicator {
         // keeps the ring bounded to the last MAX_REORG_DEPTH heights, so the rebuilt
         // ring ends populated across the recent window (future live reorgs work).
         let mut replayed: usize = 0;
-        // Model and job pre-images are added only where the rebuilt ring keeps
-        // the window: the spine's last MAX_REORG_DEPTH blocks.
-        let window_from = spine
-            .len()
-            .saturating_sub(usize::try_from(MAX_REORG_DEPTH).unwrap_or(usize::MAX));
-        for (i, h) in spine.iter().enumerate() {
+        for h in &spine {
             let block = match read_block(&self.storage, h) {
                 Ok(Some(b)) => b,
                 Ok(None) => break, // missing block — reach check below rolls back
@@ -3049,9 +3042,6 @@ impl CanonicalApplicator {
                     // Record the block's CLAIMED root (trusted) in the ring; the ring
                     // snapshot is the executor state, which is correct regardless.
                     let snap = self.executor.state_snapshot();
-                    if i >= window_from {
-                        complete_block_undo(&self.storage, &state, &block, &snap);
-                    }
                     state.record(block.header.block_hash, block.header.height, snap);
                     self.persist_applied(
                         &block.header.block_hash,
@@ -3458,9 +3448,7 @@ pub fn record_produced(
 ) {
     let hash = block.header.block_hash;
     let height = block.header.height;
-    let after = executor.state_snapshot();
-    complete_block_undo(storage, state, block, &after);
-    state.record(hash, height, after);
+    state.record(hash, height, executor.state_snapshot());
     // SRP-S3b: the durable applied-tip is advanced ATOMICALLY with the state batch by the
     // producer's `persist_state_changes_with_tip` (see produce_block) — the crash-consistency
     // guarantee. This re-writes the SAME tip value: idempotent in production (right after the
@@ -3471,41 +3459,6 @@ pub fn record_produced(
             "execute-on-receive: produced block {} @ {} but failed to persist applied tip: {}",
             hash, height, e
         );
-    }
-}
-
-/// Add the model and training-job pre-images of `block`, just applied with
-/// post-state `after`, to its undo record. The pre-state is the ring's entry
-/// for the parent (the applied tip before `block`); without it nothing is
-/// written, and the record is then never used to revert (fail-safe). Call it
-/// before `AppliedState::record`.
-fn complete_block_undo(
-    storage: &StorageManager,
-    state: &AppliedState,
-    block: &Block,
-    after: &StateSnapshot,
-) {
-    let Some(below) = block.header.height.checked_sub(1) else {
-        return;
-    };
-    let before = match state.snapshots.get(&below) {
-        Some((hash, snap)) if *hash == block.selected_parent() => snap,
-        _ => return,
-    };
-    let undo = after.model_job_pre_images_since(before);
-    match storage
-        .state
-        .complete_reorg_undo(block.header.height, block.header.block_hash, undo)
-    {
-        Ok(true) => {}
-        Ok(false) => debug!(
-            "reorg window: no undo record for {} @ {} to add model/job pre-images to",
-            block.header.block_hash, block.header.height
-        ),
-        Err(e) => warn!(
-            "reorg window: model/job pre-images of {} @ {} not recorded: {e}",
-            block.header.block_hash, block.header.height
-        ),
     }
 }
 
@@ -9874,9 +9827,10 @@ pub(crate) mod tests {
             s: &[V251Change],
             t: Option<(Hash, u64)>,
             i: &citrate_execution::executor::ReceiptIndexBatch,
+            m: Option<&citrate_execution::executor::ModelJobUndo>,
         ) -> anyhow::Result<()> {
             let n = self.w("write_state_batch_with_applied_tip");
-            let r = V251Trait::write_state_batch_with_applied_tip(&*self.inner, a, s, t, i);
+            let r = V251Trait::write_state_batch_with_applied_tip(&*self.inner, a, s, t, i, m);
             self.after(n, "write_state_batch_with_applied_tip", r)
         }
         // V251_REORG_OVERRIDE_BEGIN
@@ -14035,9 +13989,34 @@ pub(crate) mod tests {
             let linear = body(store, "fn write_state_batch_with_applied_tip(");
             assert!(
                 linear.contains("self.stage_block_undo(")
+                    && linear.contains("models_jobs,")
                     && linear.contains("stage_applied_tip_locked("),
-                "a linear tip commit stages its undo record under the index lock"
+                "a linear tip commit stages its whole undo record (model/job pre-images \
+                 included) under the index lock"
             );
+            // The whole record commits in the block's batch: nothing completes it
+            // after the commit (a crash in between would lose the window).
+            let exec = include_str!("../../core/execution/src/executor.rs");
+            let inner = body(exec, "async fn apply_block_inner(");
+            assert!(
+                inner.contains(".persist_state_changes_with_undo(")
+                    && inner.contains("model_job_pre_images(&snapshot"),
+                "block import commits the block's model/job pre-images in its batch"
+            );
+            let producer = include_str!("producer.rs");
+            let produce = body(producer, "async fn produce_block(&self)");
+            assert!(
+                produce.contains("round_state.model_job_undo()")
+                    && produce.contains(".persist_state_changes_with_undo("),
+                "the producer commits the block's model/job pre-images in its batch"
+            );
+            for (name, src) in [("canonical_apply.rs", apply), ("state_store.rs", store)] {
+                let completion = ["complete_", "reorg_undo("].concat();
+                assert!(
+                    !src.contains(&completion),
+                    "{name}: an undo record must not be completed after its commit"
+                );
+            }
             assert!(body(store, "fn write_reorg_batch_sync(").contains("self.stage_branch_undo("));
             assert_eq!(
                 store.matches("self.stage_applied_tip(").count()
