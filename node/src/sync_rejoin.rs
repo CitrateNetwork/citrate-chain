@@ -45,6 +45,34 @@
 // empty answer from the peer that was asked. Unsolicited `Blocks` messages are
 // processed as before but never steer the search.
 //
+// ONE PEER PER SEARCH (r1006 devnet, 2026-10-29)
+//
+// A producer forked 35 below its tip and 250 behind logged `StartedProbe` and
+// `GaveUp` half a second apart. Its tick asked whichever peer the selector
+// ranked first, and relayed gossip makes every peer advertise the network
+// head, so the probe went to another producer stuck on the SAME branch. That
+// peer holds our tip and nothing above it: its answer held only known
+// blocks, which reads as "the fork point is above this height", and the
+// bisection ended one height below the top. The same answers reset the
+// strikes the leading peer's empty answers had built. So strikes now count
+// one peer's answers, and a search is pinned to the peer whose answers
+// started it: the tick asks only that peer until the search ends, or drops
+// it if the peer disconnects (`choose_source`).
+//
+// SPLIT HEALING (r1006, 2026-10-29)
+//
+// Producers whose branches grow at the same rate sit at equal heights, so no
+// peer is ever ahead, nothing is ever asked, and each one's blocks defer at
+// the others forever. When no peer is ahead, a peer at or a few heights below
+// our tip whose advertised tip we do not store starts a split pull: the same
+// fork-point search, pinned to that peer, straight from the probe (its tip
+// answers could only be unconnected). The blocks found are stored, fork
+// choice sees both branches, and the next block merges them. Bounded by
+// `sync_peer::SplitPullGate`: one pull per peer per window, one in total per
+// interval. A split pull only fetches (the applied tip moves only through the
+// applicator's fork-choice and strictly-heavier rules), an equal-height answer
+// does not end it as "caught up", and its give-up owes no rejoin backoff.
+//
 // NOTHING HERE DECIDES VALIDITY. The tracker only picks the anchor of the next
 // `GetBlocks`. Every block still goes through `SyncManager::handle_blocks` and
 // `BlockAdmission::admit`; fork choice still picks the head.
@@ -182,6 +210,22 @@ pub struct RejoinTracker {
     /// Whether the sync tick's clamped target is above the applied tip (see
     /// [`RejoinTracker::note_sync_target`]).
     target_behind: bool,
+    /// The peer whose unconnected answers the current strikes count. An
+    /// answer from another peer neither adds to them nor clears them: a
+    /// sibling on our own branch holds our tip and says nothing about whether
+    /// the striking peer's chain extends it.
+    strike_peer: Option<String>,
+    /// The peer the running search (probe or follow) is pinned to: the one
+    /// whose answers started it. The sync tick asks only this peer while the
+    /// search runs (see [`choose_source`]); answers from any other peer were
+    /// what moved and ended the search on the r1006 devnet.
+    peer: Option<String>,
+    /// The peer whose answer [`Self::take_answer`] last matched.
+    answered_by: Option<String>,
+    /// The running search is a split pull ([`Self::start_split_pull`]): the
+    /// peer is at our height, so "not behind" does not end it, and its
+    /// give-up owes no rejoin backoff (the split gate rate-limits pulls).
+    split: bool,
 }
 
 impl Default for RejoinTracker {
@@ -199,7 +243,56 @@ impl RejoinTracker {
             cooldown: 0,
             unanswered: 0,
             target_behind: false,
+            strike_peer: None,
+            peer: None,
+            answered_by: None,
+            split: false,
         }
+    }
+
+    /// The peer the running search is pinned to; `None` in `Tip` mode.
+    pub fn search_peer(&self) -> Option<&str> {
+        match self.mode {
+            Mode::Tip { .. } => None,
+            _ => self.peer.as_deref(),
+        }
+    }
+
+    /// Whether a split pull may start now: no search is running and the node
+    /// holds more than genesis.
+    pub fn can_start_split(&self, applied_height: u64) -> bool {
+        matches!(self.mode, Mode::Tip { .. }) && applied_height > 0
+    }
+
+    /// Start pulling a sibling branch from `peer`, a peer at or near our
+    /// height whose tip we do not hold. The tip anchor would only be answered
+    /// with blocks at and above our own height whose parents we lack, so this
+    /// goes straight to the fork-point search below `top` (our applied
+    /// height), pinned to `peer`. Fetching only: the blocks go through
+    /// admission, and whether the applied tip moves stays with fork choice and
+    /// the applicator's strictly-heavier rule.
+    pub fn start_split_pull(&mut self, peer: &str, top: u64) -> Option<Transition> {
+        if !self.can_start_split(top) {
+            return None;
+        }
+        self.mode = Mode::Probe {
+            top,
+            unconnected: top,
+            known: None,
+            step: 1,
+            height: top.saturating_sub(1),
+        };
+        self.peer = Some(peer.to_string());
+        self.split = true;
+        self.strike_peer = None;
+        self.unanswered = 0;
+        Some(Transition::StartedSplitPull { top })
+    }
+
+    /// End the running search because its peer is no longer connected. Not a
+    /// failure of the search, so no backoff.
+    pub fn abandon(&mut self) -> Option<Transition> {
+        self.reset("peer left")
     }
 
     #[cfg(test)]
@@ -282,6 +375,7 @@ impl RejoinTracker {
             return None;
         }
         let height = *height;
+        self.answered_by = Some(asked_peer.clone());
         self.asked = None;
         self.unanswered = 0;
         Some(height)
@@ -301,7 +395,8 @@ impl RejoinTracker {
         behind: bool,
         anchor_height: u64,
     ) -> Option<Transition> {
-        let behind = behind || self.target_behind;
+        let from = self.answered_by.take();
+        let behind = behind || self.target_behind || self.split;
         if !behind {
             self.give_ups = 0;
             self.cooldown = 0;
@@ -309,7 +404,11 @@ impl RejoinTracker {
         }
         match (self.mode.clone(), answer) {
             (Mode::Tip { .. }, Answer::Progress { .. }) | (Mode::Tip { .. }, Answer::Known) => {
-                self.mode = Mode::Tip { strikes: 0 };
+                // Only the striking peer's own answer clears its strikes.
+                if self.strike_peer == from {
+                    self.mode = Mode::Tip { strikes: 0 };
+                    self.strike_peer = None;
+                }
                 None
             }
             (Mode::Tip { strikes }, Answer::Unconnected) => {
@@ -317,12 +416,18 @@ impl RejoinTracker {
                     self.cooldown = self.cooldown.saturating_sub(1);
                     return None;
                 }
-                let strikes = strikes.saturating_add(1);
+                let strikes = if self.strike_peer == from {
+                    strikes.saturating_add(1)
+                } else {
+                    self.strike_peer = from;
+                    1
+                };
                 if strikes < PROBE_AFTER_STRIKES || anchor_height == 0 {
                     self.mode = Mode::Tip { strikes };
                     return None;
                 }
                 let top = anchor_height;
+                self.peer = self.strike_peer.take();
                 self.mode = Mode::Probe {
                     top,
                     unconnected: top,
@@ -401,6 +506,9 @@ impl RejoinTracker {
     }
 
     fn reset(&mut self, from: &'static str) -> Option<Transition> {
+        self.peer = None;
+        self.split = false;
+        self.strike_peer = None;
         let was = std::mem::replace(&mut self.mode, Mode::Tip { strikes: 0 });
         match was {
             Mode::Tip { .. } => None,
@@ -410,6 +518,13 @@ impl RejoinTracker {
 
     fn give_up(&mut self, at: u64) -> Option<Transition> {
         self.mode = Mode::Tip { strikes: 0 };
+        self.peer = None;
+        self.strike_peer = None;
+        if std::mem::take(&mut self.split) {
+            // The split gate rate-limits pulls; an ordinary search later
+            // must not wait behind this one.
+            return Some(Transition::GaveUp { at });
+        }
         let shift = self.give_ups.min(31);
         self.cooldown = BACKOFF_BASE_ANSWERS
             .saturating_mul(2u32.saturating_pow(shift))
@@ -455,10 +570,25 @@ pub fn choose_source(
     holds: impl Fn(&Hash) -> bool,
     now: Instant,
 ) -> (Source, Option<Transition>) {
-    let _ = (&tracker, &gate, split, holds(&applied.0), now);
-    match selector.select(candidates, applied.1) {
-        Some(c) => (Source::Ahead(c.id.clone()), None),
-        None => (Source::Nobody, None),
+    let mut transition = None;
+    if let Some(p) = tracker.search_peer().map(str::to_string) {
+        if candidates.iter().any(|c| c.id == p) {
+            return (Source::Pinned(p), None);
+        }
+        transition = tracker.abandon();
+    }
+    if let Some(c) = selector.select(candidates, applied.1) {
+        return (Source::Ahead(c.id.clone()), transition);
+    }
+    if !tracker.can_start_split(applied.1) {
+        return (Source::Nobody, transition);
+    }
+    match gate.pick(split, applied, holds, now) {
+        Some(c) => {
+            let started = tracker.start_split_pull(&c.id, applied.1);
+            (Source::Split(c.id.clone()), transition.or(started))
+        }
+        None => (Source::Nobody, transition),
     }
 }
 

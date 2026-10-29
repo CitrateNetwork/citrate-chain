@@ -50,7 +50,10 @@
 // THE INVARIANTS
 //
 //   I1. Only a peer whose advertised head is ABOVE our applied height is a
-//       candidate. Nothing else can move us forward.
+//       candidate. Nothing else can move us forward. (A peer at our height
+//       on a sibling branch is not a forward source either; pulling its
+//       branch so fork choice can merge it is split healing, a separate and
+//       rate-limited path: `SplitPullGate` below and `sync_rejoin::choose_source`.)
 //   I2. The failure count is a PREFERENCE among useful peers, never a veto on
 //       all of them. If penalties would empty a non-empty useful set, the set is
 //       used anyway. Being behind is present-tense evidence; a stale timeout is
@@ -565,15 +568,51 @@ impl SplitPullGate {
     }
 
     /// The peer to pull a sibling branch from now, if any; recorded as pulled.
+    ///
+    /// A candidate advertises a head at most [`SPLIT_PULL_HEIGHT_BAND`] below
+    /// our applied height and not above it, a known hash other than our tip,
+    /// and a block `holds` says we do not store (a tip we store is a branch we
+    /// already have, or our own chain). Among those not pulled within
+    /// [`SPLIT_PULL_PEER_BACKOFF`]: the highest head, then the smallest id.
+    /// Nothing at all within [`SPLIT_PULL_MIN_INTERVAL`] of the last pull.
+    ///
+    /// Advertised heads are unauthenticated hints (I4). A peer that lies about
+    /// its tip gets at most one bounded fork-point search per window, and the
+    /// blocks it serves still go through admission like any others.
     pub fn pick<'a>(
         &mut self,
-        _candidates: &'a [SplitCandidate],
-        _applied: (Hash, u64),
-        _holds: impl Fn(&Hash) -> bool,
-        _now: Instant,
+        candidates: &'a [SplitCandidate],
+        applied: (Hash, u64),
+        holds: impl Fn(&Hash) -> bool,
+        now: Instant,
     ) -> Option<&'a SplitCandidate> {
-        let _ = (&self.last_by_peer, &self.last_any);
-        None
+        // Bounded: an entry lives for one backoff window.
+        self.last_by_peer
+            .retain(|_, t| now.saturating_duration_since(*t) < SPLIT_PULL_PEER_BACKOFF);
+        if let Some(t) = self.last_any {
+            if now.saturating_duration_since(t) < SPLIT_PULL_MIN_INTERVAL {
+                return None;
+            }
+        }
+        let unknown = Hash::new([0u8; 32]);
+        let pick = candidates
+            .iter()
+            .filter(|c| {
+                c.head_height <= applied.1
+                    && applied.1.saturating_sub(c.head_height) <= SPLIT_PULL_HEIGHT_BAND
+                    && c.head_hash != applied.0
+                    && c.head_hash != unknown
+                    && !self.last_by_peer.contains_key(&c.id)
+            })
+            .filter(|c| !holds(&c.head_hash))
+            .max_by(|a, b| {
+                a.head_height
+                    .cmp(&b.head_height)
+                    .then_with(|| b.id.cmp(&a.id))
+            })?;
+        self.last_by_peer.insert(pick.id.clone(), now);
+        self.last_any = Some(now);
+        Some(pick)
     }
 
     #[cfg(test)]
