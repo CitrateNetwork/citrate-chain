@@ -4242,6 +4242,92 @@ mod tests {
         }
     }
 
+    /// A fork-point probe admits nothing until it reaches the fork point, yet
+    /// each of its steps is an answer from the pinned peer to a hash-verified
+    /// anchor. A deep fork at the real 2 s tick, or one tick of answer
+    /// latency, runs a probe past `PIN_STALL_TIMEOUT`; an advertised lead must
+    /// not end it before it reaches the fork point.
+    #[test]
+    fn a_long_answering_probe_holds_its_pin_against_an_advertised_lead() {
+        // (top, fork, span, answer every n-th tick)
+        for (top, fork, span, every) in [
+            (1_000_000u64, 700_000u64, 0u64, 1u64),
+            (100_000, 99_000, 0, 2),
+            (100_000, 92_000, 64, 2),
+        ] {
+            let mut t = RejoinTracker::new();
+            let sel = SyncPeerSelector::new();
+            let mut gate = SplitPullGate::new();
+            for _ in 0..PROBE_AFTER_STRIKES {
+                t.note_asked("leader", (hx(1), top));
+                let ah = t
+                    .take_answer("leader", &[], &HashSet::new())
+                    .expect("answer");
+                t.on_answer(Answer::Unconnected, true, ah);
+            }
+            assert!(matches!(t.mode(), Mode::Probe { .. }));
+            let cands = [
+                SyncCandidate {
+                    id: "leader".into(),
+                    head_height: top + 100,
+                },
+                SyncCandidate {
+                    id: "liar".into(),
+                    head_height: u64::MAX,
+                },
+            ];
+            let t0 = Instant::now();
+            let tick_every = Duration::from_secs(2);
+            let mut elapsed = Duration::ZERO;
+            let mut tick = 0u64;
+            while matches!(t.mode(), Mode::Probe { .. }) {
+                assert!(tick < 1_000, "top={top}: the probe never ended");
+                let now = t0 + tick_every * tick as u32;
+                let (src, tr) = choose_source(
+                    &mut t,
+                    &sel,
+                    &mut gate,
+                    &cands,
+                    &[],
+                    (hx(1), top),
+                    |_| true,
+                    now,
+                );
+                assert_eq!(
+                    src,
+                    Source::Pinned("leader".into()),
+                    "top={top} fork={fork} span={span} every={every}: pin ended at {}s: \
+                     {tr:?} mode={:?}",
+                    (now - t0).as_secs(),
+                    t.mode()
+                );
+                if tick.is_multiple_of(every) {
+                    let a = t.anchor((hx(1), top), |_| Some(hx(2)));
+                    t.note_asked("leader", a);
+                    let ah = t
+                        .take_answer("leader", &[a.0], &[a.0].into_iter().collect())
+                        .expect("the leader answers");
+                    t.on_answer(model(fork, span, a.1), true, ah);
+                } else {
+                    // Its anchor is still pending: no re-send, no answer.
+                    t.note_unsent("leader");
+                }
+                elapsed = now - t0;
+                tick += 1;
+            }
+            assert!(
+                elapsed > PIN_STALL_TIMEOUT,
+                "top={top}: the probe ended at {}s, inside the timeout; the case tests nothing",
+                elapsed.as_secs()
+            );
+            assert!(
+                matches!(t.mode(), Mode::Follow { .. }),
+                "top={top} fork={fork}: the probe ended without the fork point: {:?}",
+                t.mode()
+            );
+        }
+    }
+
     /// The stall clock restarts on the first tick after an answer from the
     /// pinned peer that admitted a block, and runs from the last such tick.
     #[test]
