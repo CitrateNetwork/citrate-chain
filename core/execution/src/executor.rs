@@ -397,11 +397,24 @@ impl Drop for DeferGuard<'_> {
 pub struct ProductionRound<'a> {
     executor: &'a Executor,
     snapshot: Option<crate::state::StateSnapshot>,
+    /// The model/job generation when `snapshot` was taken.
+    model_job_generation: u64,
     block_context: crate::revm_adapter::BlockContext,
     defer: Option<DeferGuard<'a>>,
 }
 
 impl ProductionRound<'_> {
+    /// The model and training-job pre-images of the round's block so far:
+    /// what differs from the state the round opened on (see
+    /// [`BlockUndo::models_jobs`]). Passed to the round's state commit.
+    pub fn model_job_undo(&self) -> Option<ModelJobUndo> {
+        self.snapshot.as_ref().map(|before| {
+            self.executor
+                .state_db
+                .model_job_pre_images(before, self.model_job_generation)
+        })
+    }
+
     /// The round's block is sealed and its state persisted: keep the state
     /// and restore eager persistence.
     pub fn commit(mut self) {
@@ -430,6 +443,53 @@ pub struct StateStorageChange {
     pub key: Vec<u8>,
     /// `Some(value)` writes a slot; `None` deletes it.
     pub value: Option<Vec<u8>>,
+}
+
+/// The undo record of one applied block: the value every account and storage
+/// slot the block wrote held BEFORE the block (`None`: the key was absent).
+/// Applying the pre-images to the state after `height` gives the state after
+/// `parent`. Local metadata only: kept for the last reorg window so a restarted
+/// node can revert a few blocks without replaying from genesis. It is never
+/// hashed, gossiped or read by execution, so it cannot move a state root.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BlockUndo {
+    /// Height of the block this record undoes.
+    pub height: u64,
+    /// Hash of the block this record undoes.
+    pub hash: Hash,
+    /// The applied block the record reverts to, when known.
+    pub parent: Option<(Hash, u64)>,
+    /// Account pre-images.
+    pub accounts: Vec<crate::state::state_db::AccountPreImage>,
+    /// Storage pre-images: `(address, slot key, value)`.
+    pub storage: Vec<crate::state::state_db::StoragePreImage>,
+    /// Model and training-job pre-images. They live in memory only (not in
+    /// the flat store), so the executor computes them from its states before
+    /// and after the block and they commit in the block's own state batch.
+    /// `None` when the writer did not know them (a commit without a pre-block
+    /// state); a record without them is never used to revert (the window
+    /// stops above it).
+    pub models_jobs: Option<ModelJobUndo>,
+}
+
+/// The model and training-job pre-images of one block (see [`BlockUndo`]).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ModelJobUndo {
+    /// Model pre-images (`None`: the model did not exist).
+    pub models: Vec<(crate::types::ModelId, Option<crate::types::ModelState>)>,
+    /// Training-job pre-images (`None`: the job did not exist).
+    pub jobs: Vec<(crate::types::JobId, Option<crate::types::TrainingJob>)>,
+}
+
+impl PartialEq for ModelJobUndo {
+    /// Equal when both encode to the same bytes (`ModelState` and
+    /// `TrainingJob` have no `PartialEq` of their own).
+    fn eq(&self, other: &Self) -> bool {
+        matches!(
+            (bincode::serialize(self), bincode::serialize(other)),
+            (Ok(a), Ok(b)) if a == b
+        )
+    }
 }
 
 /// C1-R: the RPC receipt index (NOT consensus data) committed in the SAME write
@@ -615,12 +675,18 @@ pub trait StateStoreTrait: Send + Sync {
     /// C1-R: `index` is the block's RPC receipt index, committed in the same batch
     /// (see [`ReceiptIndexBatch`]); the default writes it last via
     /// [`Self::put_receipt_index`].
+    ///
+    /// `models_jobs`: the block's model and training-job pre-images (see
+    /// [`BlockUndo::models_jobs`]), kept in the block's undo record in the same
+    /// batch; `None` when the caller has no pre-block state. Stores that keep
+    /// no undo records ignore it.
     fn write_state_batch_with_applied_tip(
         &self,
         accounts: &[(Address, crate::types::AccountState)],
         storage: &[StateStorageChange],
         applied_tip: Option<(Hash, u64)>,
         index: &ReceiptIndexBatch,
+        _models_jobs: Option<&ModelJobUndo>,
     ) -> anyhow::Result<()> {
         self.write_state_batch_sync(accounts, storage)?;
         if !index.is_empty() {
@@ -665,6 +731,12 @@ pub trait StateStoreTrait: Send + Sync {
     ///
     /// C1-R: `index` carries the receipt-index changes of the reorg (abandoned
     /// blocks' receipts removed, the winning branch's written) in the same batch.
+    ///
+    /// `undo`: the undo records of the winning branch's last reorg-window blocks,
+    /// committed in the same batch (the store keeps one per applied height for
+    /// the last window; see [`BlockUndo`]). Empty leaves the kept records as
+    /// they are (the revert to the fork point, and every abort).
+    #[allow(clippy::too_many_arguments)]
     fn write_reorg_batch_sync(
         &self,
         accounts: &[(Address, crate::types::AccountState)],
@@ -673,6 +745,7 @@ pub trait StateStoreTrait: Send + Sync {
         code: &[(Hash, Vec<u8>)],
         applied_tip: Option<(Hash, u64)>,
         index: &ReceiptIndexBatch,
+        undo: &[BlockUndo],
     ) -> anyhow::Result<()>;
 
     /// Persist the applied-tip pointer (block hash + height). Default no-op for test
@@ -1197,6 +1270,20 @@ impl Executor {
         applied_tip: Option<(Hash, u64)>,
         index: &ReceiptIndexBatch,
     ) -> anyhow::Result<usize> {
+        self.persist_state_changes_with_undo(applied_tip, index, None)
+            .await
+    }
+
+    /// [`Self::persist_state_changes_with_tip_and_index`] plus the block's model
+    /// and training-job pre-images, committed in its undo record in the SAME
+    /// batch (see [`BlockUndo::models_jobs`]): after a crash the record is
+    /// either complete or absent with the block, never half-written.
+    pub async fn persist_state_changes_with_undo(
+        &self,
+        applied_tip: Option<(Hash, u64)>,
+        index: &ReceiptIndexBatch,
+        models_jobs: Option<&ModelJobUndo>,
+    ) -> anyhow::Result<usize> {
         let _guard = self.commit_coordinator.acquire_exec_lock().await;
         if let Some(store) = &self.state_store {
             let dirty_accounts = self.state_db.accounts.get_dirty_accounts();
@@ -1236,6 +1323,7 @@ impl Executor {
                     &storage_changes,
                     applied_tip,
                     index,
+                    models_jobs,
                 )?;
             }
 
@@ -1480,9 +1568,11 @@ impl Executor {
     /// partially advanced while the applied tip stayed put.
     pub fn begin_production_round(&self) -> ProductionRound<'_> {
         let defer = DeferGuard::engage(&self.defer_persist);
+        let model_job_generation = self.state_db.model_job_generation();
         ProductionRound {
             executor: self,
             snapshot: Some(self.state_db.snapshot()),
+            model_job_generation,
             block_context: self.get_block_context(),
             defer: Some(defer),
         }
@@ -1525,6 +1615,19 @@ impl Executor {
         baseline: &crate::state::StateSnapshot,
         applied_tip: Option<(Hash, u64)>,
         index: &ReceiptIndexBatch,
+    ) -> anyhow::Result<()> {
+        self.reconcile_store_from_with_undo(baseline, applied_tip, index, &[])
+    }
+
+    /// [`Self::reconcile_store_from_with_index`] plus the undo records of the
+    /// newly executed branch (see [`BlockUndo`]) in the same fsync'd batch, so
+    /// the kept records always describe the durable applied chain.
+    pub fn reconcile_store_from_with_undo(
+        &self,
+        baseline: &crate::state::StateSnapshot,
+        applied_tip: Option<(Hash, u64)>,
+        index: &ReceiptIndexBatch,
+        undo: &[BlockUndo],
     ) -> anyhow::Result<()> {
         use std::collections::{HashMap, HashSet};
         let store = match &self.state_store {
@@ -1592,7 +1695,8 @@ impl Executor {
             || !account_dels.is_empty()
             || !code.is_empty()
             || applied_tip.is_some()
-            || !index.is_empty();
+            || !index.is_empty()
+            || !undo.is_empty();
         if must_commit {
             store.write_reorg_batch_sync(
                 &account_puts,
@@ -1601,6 +1705,7 @@ impl Executor {
                 &code,
                 applied_tip,
                 index,
+                undo,
             )?;
         }
         Ok(())
@@ -1713,6 +1818,7 @@ impl Executor {
         // height legacy validity is unchanged (never re-judged).
         self.verify_block_body(block)?;
 
+        let model_job_generation = self.state_db.model_job_generation();
         let snapshot = self.state_db.snapshot();
         let prev_ctx = self.get_block_context();
 
@@ -1807,10 +1913,16 @@ impl Executor {
         // a block (not only its producer) can serve them, with no crash window between
         // "block applied" and "receipts stored".
         let index = ReceiptIndexBatch::for_block(block, &receipts);
+        // The block's model/job pre-images ride in the same batch, in its undo
+        // record (see `BlockUndo::models_jobs`).
+        let models_jobs = self
+            .state_db
+            .model_job_pre_images(&snapshot, model_job_generation);
         if let Err(e) = self
-            .persist_state_changes_with_tip_and_index(
+            .persist_state_changes_with_undo(
                 Some((block.header.block_hash, block.header.height)),
                 &index,
+                Some(&models_jobs),
             )
             .await
         {

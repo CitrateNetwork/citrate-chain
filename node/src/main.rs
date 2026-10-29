@@ -87,6 +87,8 @@ mod producer;
 mod registration_proof;
 mod registry_sync;
 mod rollback;
+#[cfg(test)]
+mod split_heal_tests;
 mod startup_guards;
 mod sync_peer;
 mod sync_recovery;
@@ -2694,12 +2696,13 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // path that forgot to call it.
         // SAME-HEIGHT-SIBLING WEDGE RECOVERY (2026-08-06; chain 40204 halted at
         // 90,998 then 91,109). Before the periodic drain or the producer starts,
-        // converge a node whose persisted applied tip is a NON-canonical sibling. A
-        // plain restart cannot self-heal this — `CanonicalApplicator::new` seeds the
-        // reorg ring with only the tip's snapshot, so `reorg_to(head)` can never
-        // reach the fork point. `recover_to_head` rebuilds the executor from genesis
-        // and re-applies the canonical chain from the node's OWN stored blocks
-        // (repopulating the ring so the reorg at each fork converges). Atomic + a
+        // converge a node whose persisted applied tip is a NON-canonical sibling.
+        // `CanonicalApplicator::new` rebuilds the reorg ring for the last
+        // MAX_REORG_DEPTH heights from the store's undo records, so a fork point
+        // inside it is reverted in place (`recover_automatic` reorgs; the durable
+        // tip never goes below the fork point). Below the ring, `recover_automatic`
+        // rebuilds the executor from genesis and re-applies the canonical chain from
+        // the node's OWN stored blocks (refused on a pruned DAG store). Atomic + a
         // no-op on a healthy node (tip already == fork-choice head).
         if let Some(app) = canonical_applicator.clone() {
             // Reconstruct the genesis world-state deterministically via the same
@@ -3049,6 +3052,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             let mut rotate_idx: u64 = 0;
             // #155: last peer we logged choosing, so SYNCPEER only fires on change.
             let mut last_logged_choice: Option<String> = None;
+            // Split healing: rate limits on pulls from same-height peers whose
+            // tip we do not hold (sync_peer.rs, sync_rejoin.rs).
+            let mut split_gate = sync_peer::SplitPullGate::new();
             // #310: Skip — a slow sync round must not be followed by a burst
             // of back-to-back block requests to peers.
             let mut interval = timing::cadence_interval(std::time::Duration::from_secs(2));
@@ -3066,6 +3072,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 )> = Vec::new();
                 let mut best_h: u64 = 0;
                 let mut best_hash = citrate_consensus::types::Hash::new([0u8; 32]);
+                let mut split_candidates: Vec<sync_peer::SplitCandidate> = Vec::new();
                 for p in pm_for_sync.get_all_peers() {
                     let info = p.info.read().await;
                     if info.state != citrate_network::peer::PeerState::Connected {
@@ -3075,6 +3082,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         best_h = info.head_height;
                         best_hash = info.head_hash;
                     }
+                    split_candidates.push(sync_peer::SplitCandidate {
+                        id: info.id.0.clone(),
+                        head_height: info.head_height,
+                        head_hash: info.head_hash,
+                    });
                     connected_peers.push((
                         sync_peer::SyncCandidate {
                             id: info.id.0.clone(),
@@ -3143,10 +3155,47 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 // ever vetoing the last one that could actually serve us.
                 let candidates: Vec<sync_peer::SyncCandidate> =
                     connected_peers.iter().map(|(c, _)| c.clone()).collect();
+                //
+                // sync_rejoin.rs `choose_source`: a running fork-point search
+                // stays on the peer it started against; with no peer ahead, a
+                // peer at or near our height whose tip we do not hold is pulled
+                // (split healing), bounded by `split_gate`. Fetching only:
+                // whether the applied tip moves stays with canonical_apply.
+                // Storage is read before the selector lock is taken.
+                let applied_tip_now = storage_for_sync
+                    .blocks
+                    .get_applied_tip()
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| (citrate_consensus::types::Hash::new([0u8; 32]), 0));
+                // A read error counts as held: no pull on a guess.
+                let held_heads: std::collections::HashSet<citrate_consensus::types::Hash> =
+                    split_candidates
+                        .iter()
+                        .map(|c| c.head_hash)
+                        .filter(|h| storage_for_sync.blocks.has_block(h).unwrap_or(true))
+                        .collect();
                 let chosen_id = {
                     let sel = sync_peers_for_loop.lock().await;
-                    sel.select(&candidates, applied_height)
-                        .map(|c| c.id.clone())
+                    let (source, transition) = sync_rejoin::choose_source(
+                        &mut rejoin_for_loop.lock(),
+                        &sel,
+                        &mut split_gate,
+                        &candidates,
+                        &split_candidates,
+                        applied_tip_now,
+                        |h| held_heads.contains(h),
+                        std::time::Instant::now(),
+                    );
+                    if let Some(t) = transition {
+                        tracing::info!(
+                            "SYNCREJOIN {:?} (source={:?} applied={})",
+                            t,
+                            source,
+                            applied_tip_now.1
+                        );
+                    }
+                    source.peer().map(str::to_string)
                 };
                 // #155: log WHICH PEER WE ARE PULLING FROM — but only when it
                 // CHANGES.
@@ -3293,7 +3342,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     {
                         send_failed = true;
                     }
-                    if pb < 8 {
+                    if pb < sync_recovery::TICK_PENDING_GATE {
                         // Only a request that was actually SENT is recorded as
                         // asked (Ok(false): anchor already pending, or the
                         // in-flight cap; nothing went on the wire).
@@ -3302,6 +3351,15 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             .await;
                         if sent.is_err() {
                             send_failed = true;
+                        } else if matches!(sent, Ok(false)) {
+                            // Not re-sent (its anchor is still pending): a round
+                            // without an answer for a pinned search too.
+                            let pid = peer.info.read().await.id.clone();
+                            let gave_up = rejoin_for_loop.lock().note_unsent(&pid.0);
+                            if let Some(t) = gave_up {
+                                tracing::info!("SYNCREJOIN {:?} (re-sends to a silent peer)", t);
+                                sync_peers_for_loop.lock().await.record_give_up(&pid.0);
+                            }
                         } else if matches!(sent, Ok(true)) {
                             let pid = peer.info.read().await.id.clone();
                             let gave_up = rejoin_for_loop
@@ -3475,8 +3533,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             let mut orphan_blocks: Vec<citrate_consensus::types::Block> = Vec::new();
             // sync_rejoin.rs: bound on SYNCREJOIN info lines.
             let mut rejoin_log = sync_rejoin::RejoinLogBudget::new();
-            // sync_recovery.rs: missing-parent walk (bounded per orphan episode).
-            let mut parent_walk = sync_recovery::ParentWalk::new();
+            // sync_recovery.rs: missing-parent walks, one per peer, each with a
+            // budget that refills, under a node-wide budget and in-flight cap.
+            let mut parent_walks = sync_recovery::ParentWalks::new(
+                std::time::Instant::now(),
+                sync_for_rx.request_timeout(),
+            );
             while let Some((pid, msg)) = in_rx.recv().await {
                 // #149 liveness heartbeat. Bumped BEFORE the message is handled,
                 // so a loop that is stuck inside a handler stops advancing this
@@ -3805,24 +3867,37 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                                 block.header.height.saturating_sub(applied_now),
                                                 applied_now
                                             );
-                                            } else if let Some(peer) = pm_for_rx.get_peer(&pid) {
-                                                if let Err(e) = sync_for_rx
-                                                    .request_blocks(
-                                                        &peer,
-                                                        missing_parent,
-                                                        // The selected parent sits exactly one
-                                                        // height below the block that deferred.
-                                                        block.header.height.saturating_sub(1),
-                                                    )
-                                                    .await
-                                                {
-                                                    tracing::debug!(
-                                                    "SYNC-S3: ancestry request to {} for {} failed: {}",
-                                                    pid,
-                                                    hex::encode(&missing_parent.as_bytes()[..8]),
-                                                    e
+                                            } else {
+                                                // Starts (or resumes) this peer's missing-parent
+                                                // walk, within its budget (sync_recovery.rs).
+                                                let now = std::time::Instant::now();
+                                                let step = parent_walks.begin(
+                                                    &pid.0,
+                                                    missing_parent,
+                                                    // The selected parent sits exactly one
+                                                    // height below the block that deferred.
+                                                    block.header.height.saturating_sub(1),
+                                                    applied_now,
+                                                    now,
                                                 );
-                                                }
+                                                // The step, then any stuck parents due
+                                                // a fetch by their own hash.
+                                                sync_recovery::run_step(
+                                                    &mut parent_walks,
+                                                    &pm_for_rx,
+                                                    &sync_for_rx,
+                                                    &pid.0,
+                                                    step,
+                                                    applied_now,
+                                                    |p| {
+                                                        storage_for_handler
+                                                            .blocks
+                                                            .has_block(p)
+                                                            .unwrap_or(false)
+                                                    },
+                                                    now,
+                                                )
+                                                .await;
                                             }
                                         }
                                         admission::AdmitOutcome::Rejected(why) => {
@@ -3950,14 +4025,40 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             .filter(|b| verified_hashes.contains(&b.header.block_hash))
                             .count();
                         // sync_recovery.rs: the lowest block of THIS answer still
-                        // deferred, and the parent it lacks (the walk's next step).
+                        // deferred, followed down the buffered orphans, and the
+                        // parent it lacks (the walk's next step).
                         let lowest_deferred = {
                             let from_answer: Vec<&citrate_consensus::types::Block> = fixpoint
                                 .deferred
                                 .iter()
                                 .filter(|b| verified_hashes.contains(&b.header.block_hash))
                                 .collect();
-                            sync_recovery::lowest_deferred(&storage_for_handler, &from_answer)
+                            sync_recovery::lowest_deferred(&from_answer, &fixpoint)
+                        };
+                        // Who delivered each block of THIS answer that is now
+                        // waiting on a parent: a later by-hash fetch of that
+                        // parent goes to them (sync_recovery.rs).
+                        {
+                            let now = std::time::Instant::now();
+                            for b in fixpoint
+                                .deferred
+                                .iter()
+                                .filter(|b| verified_hashes.contains(&b.header.block_hash))
+                            {
+                                if let Some((_, parent)) =
+                                    fixpoint.waiting_on.get(&b.header.block_hash)
+                                {
+                                    parent_walks.note_buffered(*parent, &pid.0, now);
+                                }
+                            }
+                        }
+                        // The missing parents at the bottom of the orphan buffer
+                        // (counted per re-deferral; a repeated one is fetched by
+                        // hash), from what the fixpoint pass recorded.
+                        let stuck_roots = if reprocessed_orphans {
+                            sync_recovery::deferred_roots(&fixpoint)
+                        } else {
+                            Vec::new()
                         };
                         let mut pending = fixpoint.deferred;
                         // Buffer unresolved orphans for the next Blocks batch (their
@@ -4020,30 +4121,32 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                 applied_now,
                                 answer_hashes.len(),
                             );
-                            // Missing-parent recovery continues by hash, one height
-                            // per answer, within the walk budget (sync_recovery.rs).
-                            if let Some((parent, parent_height)) =
-                                parent_walk.next(lowest_deferred, !orphan_blocks.is_empty())
+                            // Missing-parent recovery continues by hash, within this
+                            // peer's walk budget (sync_recovery.rs).
                             {
-                                let sent = match pm_for_rx.get_peer(&pid) {
-                                    Some(peer) => sync_for_rx
-                                        .request_blocks(&peer, parent, parent_height)
-                                        .await
-                                        .unwrap_or_else(|e| {
-                                            tracing::debug!(
-                                                "missing-parent request to {} for {} failed: {}",
-                                                pid,
-                                                hex::encode(&parent.as_bytes()[..8]),
-                                                e
-                                            );
-                                            false
-                                        }),
-                                    None => false,
-                                };
-                                // Only a request that went on the wire spends a step.
-                                if !sent {
-                                    parent_walk.unsent();
-                                }
+                                let now = std::time::Instant::now();
+                                let step = parent_walks.next(
+                                    &pid.0,
+                                    sync_recovery::WalkAnswer {
+                                        lowest_deferred,
+                                        admitted: newly_admitted,
+                                        orphans_remaining: !orphan_blocks.is_empty(),
+                                        applied: applied_now,
+                                    },
+                                    now,
+                                );
+                                parent_walks.note_stuck(&stuck_roots, &pid.0, now);
+                                sync_recovery::run_step(
+                                    &mut parent_walks,
+                                    &pm_for_rx,
+                                    &sync_for_rx,
+                                    &pid.0,
+                                    step,
+                                    applied_now,
+                                    |p| storage_for_handler.blocks.has_block(p).unwrap_or(false),
+                                    now,
+                                )
+                                .await;
                             }
                             // sync_rejoin.rs: steer the next anchor on this answer.
                             let mut search_gave_up = false;
@@ -4342,6 +4445,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 interval.tick().await;
                 let processed = msgs_processed.load(std::sync::atomic::Ordering::Relaxed);
                 let drops = pm_for_stall.inbound_drops();
+                metrics::record_inbound_drops(&pm_for_stall.inbound_drops_by_kind());
                 let shed_this_window = drops.saturating_sub(last_drops);
                 let starved = shed_this_window > 0 && processed == last_processed;
                 last_processed = processed;

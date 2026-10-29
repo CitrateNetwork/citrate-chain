@@ -119,6 +119,11 @@ pub struct SyncManager {
     /// (PBA-L1b-002). Captured from the process-wide activation at
     /// construction; see `citrate_consensus::hardening`.
     pba_hardening: citrate_consensus::hardening::PbaHardening,
+
+    /// Milliseconds added to the monotonic clock this manager stamps and ages
+    /// requests with. `None` in a node; a simulation that runs many seconds of
+    /// sync in a few milliseconds advances it (see [`Self::with_clock_offset`]).
+    clock_offset_ms: Option<Arc<AtomicU64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -186,7 +191,26 @@ impl SyncManager {
             last_requested_header: Arc::new(RwLock::new(None)),
             local_height: None,
             pba_hardening: citrate_consensus::hardening::PbaHardening::from_process(),
+            clock_offset_ms: None,
         }
+    }
+
+    /// Age requests on the monotonic clock plus `offset` milliseconds, so a
+    /// simulated network's request timeouts follow its own time.
+    pub fn with_clock_offset(mut self, offset: Arc<AtomicU64>) -> Self {
+        self.clock_offset_ms = Some(offset);
+        self
+    }
+
+    fn now(&self) -> Instant {
+        let offset = self
+            .clock_offset_ms
+            .as_ref()
+            .map(|o| o.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        let now = Instant::now();
+        now.checked_add(Duration::from_millis(offset))
+            .unwrap_or(now)
     }
 
     /// The PBA-R2 hardening activation this instance enforces.
@@ -350,7 +374,7 @@ impl SyncManager {
             BlockRequest {
                 hash: from,
                 peer_id,
-                requested_at: Instant::now(),
+                requested_at: self.now(),
                 retries: 0,
             },
         );
@@ -381,6 +405,16 @@ impl SyncManager {
         from: Hash,
         from_height: u64,
     ) -> Result<bool, NetworkError> {
+        self.send_block_request(peer, from, from_height, true).await
+    }
+
+    async fn send_block_request(
+        &self,
+        peer: &Peer,
+        from: Hash,
+        from_height: u64,
+        driver: bool,
+    ) -> Result<bool, NetworkError> {
         let peer_id = peer.info.read().await.id.clone();
 
         // Check if already pending
@@ -406,14 +440,36 @@ impl SyncManager {
             BlockRequest {
                 hash: from,
                 peer_id,
-                requested_at: Instant::now(),
+                requested_at: self.now(),
                 retries: 0,
             },
         );
-        self.last_block_anchor_height
-            .store(from_height, Ordering::Relaxed);
+        if driver {
+            self.last_block_anchor_height
+                .store(from_height, Ordering::Relaxed);
+        }
 
         Ok(true)
+    }
+
+    /// How long a sent request stays pending before [`Self::check_timeouts`]
+    /// retires it.
+    pub fn request_timeout(&self) -> Duration {
+        self.config.request_timeout
+    }
+
+    /// A `GetBlocks` sent for missing-parent recovery, not by the sync driver:
+    /// pending and de-duplicated like any request, but it leaves
+    /// [`Self::last_block_anchor_height`] (the driver's own anchor, which its
+    /// stale-answer check and serve scoring read) alone.
+    pub async fn request_blocks_for_recovery(
+        &self,
+        peer: &Peer,
+        from: Hash,
+        from_height: u64,
+    ) -> Result<bool, NetworkError> {
+        self.send_block_request(peer, from, from_height, false)
+            .await
     }
 
     /// Handle received headers
@@ -786,7 +842,7 @@ impl SyncManager {
     /// Check for timed out requests
     pub async fn check_timeouts(&self) -> Vec<(Hash, PeerId)> {
         let mut timed_out: Vec<(Hash, PeerId)> = Vec::new();
-        let now = Instant::now();
+        let now = self.now();
 
         // Check header requests
         {

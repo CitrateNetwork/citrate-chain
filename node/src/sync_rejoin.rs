@@ -45,6 +45,34 @@
 // empty answer from the peer that was asked. Unsolicited `Blocks` messages are
 // processed as before but never steer the search.
 //
+// ONE PEER PER SEARCH (r1006 devnet, 2026-10-29)
+//
+// A producer forked 35 below its tip and 250 behind logged `StartedProbe` and
+// `GaveUp` half a second apart. Its tick asked whichever peer the selector
+// ranked first, and relayed gossip makes every peer advertise the network
+// head, so the probe went to another producer stuck on the SAME branch. That
+// peer holds our tip and nothing above it: its answer held only known
+// blocks, which reads as "the fork point is above this height", and the
+// bisection ended one height below the top. The same answers reset the
+// strikes the leading peer's empty answers had built. So strikes now count
+// one peer's answers, and a search is pinned to the peer whose answers
+// started it: the tick asks only that peer until the search ends, or drops
+// it if the peer disconnects (`choose_source`).
+//
+// SPLIT HEALING (r1006, 2026-10-29)
+//
+// Producers whose branches grow at the same rate sit at equal heights, so no
+// peer is ever ahead, nothing is ever asked, and each one's blocks defer at
+// the others forever. When no peer is ahead, a peer at or a few heights below
+// our tip whose advertised tip we do not store starts a split pull: the same
+// fork-point search, pinned to that peer, straight from the probe (its tip
+// answers could only be unconnected). The blocks found are stored, fork
+// choice sees both branches, and the next block merges them. Bounded by
+// `sync_peer::SplitPullGate`: one pull per peer per window, one in total per
+// interval. A split pull only fetches (the applied tip moves only through the
+// applicator's fork-choice and strictly-heavier rules), an equal-height answer
+// does not end it as "caught up", and its give-up owes no rejoin backoff.
+//
 // NOTHING HERE DECIDES VALIDITY. The tracker only picks the anchor of the next
 // `GetBlocks`. Every block still goes through `SyncManager::handle_blocks` and
 // `BlockAdmission::admit`; fork choice still picks the head.
@@ -63,11 +91,13 @@
     )
 )]
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use citrate_consensus::types::Hash;
 use citrate_storage::StorageManager;
+
+use crate::sync_peer::{SplitCandidate, SplitPullGate, SyncCandidate, SyncPeerSelector};
 
 /// Consecutive unconnected answers to the tip anchor, while behind, before the
 /// driver starts looking for the fork point. Two, so a single answer that raced
@@ -86,11 +116,49 @@ pub const BACKOFF_MAX_ANSWERS: u32 = 256;
 /// up (see [`RejoinTracker::note_asked`]).
 pub const MAX_UNANSWERED: u32 = 8;
 
+/// A follow answer that moves the cursor up by fewer than this many heights
+/// trickles: a quarter of one 32-block answer (`sync_peer::MATERIAL_FRACTION`).
+pub const FOLLOW_TRICKLE_ADVANCE: u64 = 8;
+
+/// The trickle window, in follow entries: a follow ends once its last this
+/// many entries moved the cursor by less than [`FOLLOW_TRICKLE_ADVANCE`] each
+/// on average. An entry is an answer's cursor advance, or a zero for a sync
+/// tick on which the pinned peer kept a request waiting and gave no answer,
+/// so the window averages per tick and a peer cannot hold the pin by
+/// answering rarely (re-review of 5a1f8a80, P2'). A tick on which nothing was
+/// outstanding (the tick's own pending gate sent nothing) is no entry. A peer
+/// that keeps delivering one admissible block per answer can otherwise hold
+/// the tick for as long as it has blocks (DGX review of 49465b5e, P1-2). It is
+/// a rolling window, not a counter that one larger answer resets, so mixing
+/// trickles with an occasional larger answer does not hold it either (DGX
+/// review of 017cdbe6, P2).
+pub const MAX_TRICKLE_ANSWERS: u32 = MAX_UNANSWERED;
+
+/// Requests one fork-point search (the probe) may send before it gives up:
+/// twice the doubling-then-bisecting bound for `top`, plus the unanswered
+/// allowance. A slow peer that answers just often enough to keep `unanswered`
+/// below [`MAX_UNANSWERED`] can hold a search no longer than this.
+pub fn search_request_cap(top: u64) -> u32 {
+    2u32.saturating_mul(64u32.saturating_sub(top.leading_zeros()))
+        .saturating_add(MAX_UNANSWERED)
+}
+
 /// `SYNCREJOIN` info lines allowed per [`REJOIN_LOG_WINDOW`]; the rest are
 /// counted and reported on the next line that is allowed.
 pub const REJOIN_LOG_PER_WINDOW: u32 = 8;
 /// See [`REJOIN_LOG_PER_WINDOW`].
 pub const REJOIN_LOG_WINDOW: Duration = Duration::from_secs(600);
+
+/// How long a pinned search may go without a consumed answer from its peer
+/// before a peer ahead of it can take the tick (DGX review of 49465b5e, P1-2).
+/// The producer's no-progress stall bound. A consumed answer is one
+/// [`RejoinTracker::take_answer`] matched (only the asked peer, with the
+/// anchor among the hash-verified blocks, or empty) that moved the search: a
+/// probe step (unconnected or known) or admitted blocks. A stale probe answer
+/// does not count. An advertised head alone never ends a pin: it is
+/// self-reported and is raised by gossip before the block is validated. An
+/// answering probe stays bounded by its request cap and [`MAX_UNANSWERED`].
+pub const PIN_STALL_TIMEOUT: Duration = crate::producer::CATCHUP_STALL_ALERT;
 
 /// What an answer to the tracker's anchor did, judged after admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,10 +215,22 @@ pub enum Mode {
 /// A change of mode worth one log line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Transition {
-    StartedProbe { top: u64 },
-    Following { cursor_height: u64 },
-    Finished { from: &'static str },
-    GaveUp { at: u64 },
+    StartedProbe {
+        top: u64,
+    },
+    /// A pull of a sibling branch from a peer at or near our height.
+    StartedSplitPull {
+        top: u64,
+    },
+    Following {
+        cursor_height: u64,
+    },
+    Finished {
+        from: &'static str,
+    },
+    GaveUp {
+        at: u64,
+    },
 }
 
 /// The anchor policy described at the top of this file.
@@ -168,6 +248,43 @@ pub struct RejoinTracker {
     /// Whether the sync tick's clamped target is above the applied tip (see
     /// [`RejoinTracker::note_sync_target`]).
     target_behind: bool,
+    /// The peer whose unconnected answers the current strikes count. An
+    /// answer from another peer neither adds to them nor clears them: a
+    /// sibling on our own branch holds our tip and says nothing about whether
+    /// the striking peer's chain extends it.
+    strike_peer: Option<String>,
+    /// The peer the running search (probe or follow) is pinned to: the one
+    /// whose answers started it. The sync tick asks only this peer while the
+    /// search runs (see [`choose_source`]); answers from any other peer were
+    /// what moved and ended the search on the r1006 devnet.
+    peer: Option<String>,
+    /// The peer whose answer [`Self::take_answer`] last matched.
+    answered_by: Option<String>,
+    /// The running search is a split pull ([`Self::start_split_pull`]): the
+    /// peer is at our height, so "not behind" does not end it, and its
+    /// give-up owes no rejoin backoff (the split gate rate-limits pulls).
+    split: bool,
+    /// The applied height a split pull started at; its follow stops
+    /// `SPLIT_PULL_HEIGHT_BAND + MAX_REORG_DEPTH` above it.
+    split_top: u64,
+    /// Requests the running probe has sent (or skipped while its anchor was
+    /// pending), against [`search_request_cap`].
+    requests: u32,
+    /// [`search_request_cap`] of the running probe's top.
+    request_cap: u32,
+    /// How far each of the running follow's last [`MAX_TRICKLE_ANSWERS`]
+    /// answers moved the cursor, oldest first.
+    follow_advances: VecDeque<u64>,
+    /// The running follow got an answer from its peer since the last tick.
+    follow_answered: bool,
+    /// A re-send to the running follow's peer was skipped since the last
+    /// tick (its anchor still pending).
+    follow_unsent: bool,
+    /// When the running search's peer last gave a consumed answer (or the
+    /// search was first seen by [`choose_source`]); see [`PIN_STALL_TIMEOUT`].
+    pin_live_at: Option<Instant>,
+    /// The pinned peer gave a consumed answer since `pin_live_at`.
+    pin_answered: bool,
 }
 
 impl Default for RejoinTracker {
@@ -185,7 +302,95 @@ impl RejoinTracker {
             cooldown: 0,
             unanswered: 0,
             target_behind: false,
+            strike_peer: None,
+            peer: None,
+            answered_by: None,
+            split: false,
+            split_top: 0,
+            requests: 0,
+            request_cap: 0,
+            follow_advances: VecDeque::new(),
+            follow_answered: false,
+            follow_unsent: false,
+            pin_live_at: None,
+            pin_answered: false,
         }
+    }
+
+    /// A search starts below `top`: its request budget and follow state.
+    fn start_search(&mut self, top: u64) {
+        self.requests = 0;
+        self.request_cap = search_request_cap(top);
+        self.follow_advances.clear();
+        self.follow_answered = false;
+        self.follow_unsent = false;
+        self.clear_pin_clock();
+    }
+
+    fn clear_pin_clock(&mut self) {
+        self.pin_live_at = None;
+        self.pin_answered = false;
+    }
+
+    /// How long the running search's peer has gone without a consumed answer,
+    /// as of `now`. The clock starts the first time it is read for a search
+    /// and restarts at the first read after a consumed answer from the pinned
+    /// peer (at most one tick late, which only favours the pin).
+    fn pin_stalled_for(&mut self, now: Instant) -> Duration {
+        let since = match self.pin_live_at {
+            Some(at) if !self.pin_answered => at,
+            _ => now,
+        };
+        self.pin_live_at = Some(since);
+        self.pin_answered = false;
+        now.saturating_duration_since(since)
+    }
+
+    /// The peer the running search is pinned to; `None` in `Tip` mode.
+    pub fn search_peer(&self) -> Option<&str> {
+        match self.mode {
+            Mode::Tip { .. } => None,
+            _ => self.peer.as_deref(),
+        }
+    }
+
+    /// Whether a split pull may start now: no search is running and the node
+    /// holds more than genesis.
+    pub fn can_start_split(&self, applied_height: u64) -> bool {
+        matches!(self.mode, Mode::Tip { .. }) && applied_height > 0
+    }
+
+    /// Start pulling a sibling branch from `peer`, a peer at or near our
+    /// height whose tip we do not hold. The tip anchor would only be answered
+    /// with blocks at and above our own height whose parents we lack, so this
+    /// goes straight to the fork-point search below `top` (our applied
+    /// height), pinned to `peer`. Fetching only: the blocks go through
+    /// admission, and whether the applied tip moves stays with fork choice and
+    /// the applicator's strictly-heavier rule.
+    pub fn start_split_pull(&mut self, peer: &str, top: u64) -> Option<Transition> {
+        if !self.can_start_split(top) {
+            return None;
+        }
+        self.mode = Mode::Probe {
+            top,
+            unconnected: top,
+            known: None,
+            step: 1,
+            height: top.saturating_sub(1),
+        };
+        self.peer = Some(peer.to_string());
+        self.split = true;
+        self.split_top = top;
+        self.strike_peer = None;
+        self.unanswered = 0;
+        self.start_search(top);
+        Some(Transition::StartedSplitPull { top })
+    }
+
+    /// End the running search because its peer is no longer connected. Not a
+    /// failure of the search, so no backoff.
+    pub fn abandon(&mut self) -> Option<Transition> {
+        self.reset("peer left")
     }
 
     #[cfg(test)]
@@ -241,7 +446,45 @@ impl RejoinTracker {
             }
         }
         self.asked = Some((peer.to_string(), anchor.0, anchor.1));
+        if out.is_none() {
+            out = self.count_probe_request(anchor.1);
+        }
         out
+    }
+
+    /// One more request (sent or skipped) by the running probe; the probe gives
+    /// up once it has used [`search_request_cap`].
+    fn count_probe_request(&mut self, at: u64) -> Option<Transition> {
+        if !matches!(self.mode, Mode::Probe { .. }) {
+            return None;
+        }
+        self.requests = self.requests.saturating_add(1);
+        if self.requests >= self.request_cap {
+            return self.give_up(at);
+        }
+        None
+    }
+
+    /// The tick did not send this round's request to `peer` (its anchor was
+    /// still pending).
+    /// It got no answer this round either, so it counts as unanswered (and
+    /// against the probe's request cap): a pinned peer that never answers
+    /// ends the search after [`MAX_UNANSWERED`] rounds whether or not the
+    /// request was re-sent (DGX review of 49465b5e, P1-2).
+    pub fn note_unsent(&mut self, peer: &str) -> Option<Transition> {
+        if matches!(self.mode, Mode::Tip { .. }) || self.peer.as_deref() != Some(peer) {
+            return None;
+        }
+        let at = self.asked.as_ref().map(|a| a.2).unwrap_or(0);
+        if matches!(self.mode, Mode::Follow { .. }) {
+            self.follow_unsent = true;
+        }
+        self.unanswered = self.unanswered.saturating_add(1);
+        if self.unanswered >= MAX_UNANSWERED {
+            self.unanswered = 0;
+            return self.give_up(at);
+        }
+        self.count_probe_request(at)
     }
 
     /// Whether a `Blocks` message from `peer` answers the outstanding request;
@@ -268,6 +511,7 @@ impl RejoinTracker {
             return None;
         }
         let height = *height;
+        self.answered_by = Some(asked_peer.clone());
         self.asked = None;
         self.unanswered = 0;
         Some(height)
@@ -287,7 +531,8 @@ impl RejoinTracker {
         behind: bool,
         anchor_height: u64,
     ) -> Option<Transition> {
-        let behind = behind || self.target_behind;
+        let from = self.answered_by.take();
+        let behind = behind || self.target_behind || self.split;
         if !behind {
             self.give_ups = 0;
             self.cooldown = 0;
@@ -295,7 +540,11 @@ impl RejoinTracker {
         }
         match (self.mode.clone(), answer) {
             (Mode::Tip { .. }, Answer::Progress { .. }) | (Mode::Tip { .. }, Answer::Known) => {
-                self.mode = Mode::Tip { strikes: 0 };
+                // Only the striking peer's own answer clears its strikes.
+                if self.strike_peer == from {
+                    self.mode = Mode::Tip { strikes: 0 };
+                    self.strike_peer = None;
+                }
                 None
             }
             (Mode::Tip { strikes }, Answer::Unconnected) => {
@@ -303,12 +552,19 @@ impl RejoinTracker {
                     self.cooldown = self.cooldown.saturating_sub(1);
                     return None;
                 }
-                let strikes = strikes.saturating_add(1);
+                let strikes = if self.strike_peer == from {
+                    strikes.saturating_add(1)
+                } else {
+                    self.strike_peer = from;
+                    1
+                };
                 if strikes < PROBE_AFTER_STRIKES || anchor_height == 0 {
                     self.mode = Mode::Tip { strikes };
                     return None;
                 }
                 let top = anchor_height;
+                self.peer = self.strike_peer.take();
+                self.start_search(top);
                 self.mode = Mode::Probe {
                     top,
                     unconnected: top,
@@ -320,11 +576,40 @@ impl RejoinTracker {
             }
             (Mode::Probe { .. }, Answer::Progress { highest })
             | (Mode::Follow { .. }, Answer::Progress { highest }) => {
+                let previous = match &self.mode {
+                    Mode::Follow { cursor } => Some(cursor.1),
+                    _ => None,
+                };
                 let cursor = match &self.mode {
                     Mode::Follow { cursor } if cursor.1 > highest.1 => *cursor,
                     _ => highest,
                 };
-                let was_following = matches!(self.mode, Mode::Follow { .. });
+                let was_following = previous.is_some();
+                // A split pull fetches a sibling branch, never a catch-up: its
+                // follow stops past the band plus the reorg window.
+                let split_limit = self
+                    .split_top
+                    .saturating_add(crate::sync_peer::SPLIT_PULL_HEIGHT_BAND)
+                    .saturating_add(crate::canonical_apply::MAX_REORG_DEPTH);
+                if self.split && cursor.1 > split_limit {
+                    return self.give_up(cursor.1);
+                }
+                match previous {
+                    // The probe found the fork point: a consumed probe answer.
+                    None => self.note_pin_answer(&from),
+                    Some(prev) => {
+                        self.follow_answered = true;
+                        let advance = cursor.1.saturating_sub(prev);
+                        // In Follow only a material advance is liveness for
+                        // the pin stall clock (DGX review of 017cdbe6, P2).
+                        if advance >= FOLLOW_TRICKLE_ADVANCE {
+                            self.note_pin_answer(&from);
+                        }
+                        if self.follow_trickles(advance) {
+                            return self.give_up(cursor.1);
+                        }
+                    }
+                }
                 // The search found the fork point: no backoff owed.
                 self.give_ups = 0;
                 self.mode = Mode::Follow { cursor };
@@ -352,6 +637,7 @@ impl RejoinTracker {
                 if anchor_height != height {
                     return None;
                 }
+                self.note_pin_answer(&from);
                 let (unconnected, known, step) = match verdict {
                     Answer::Unconnected => (height, known, step.saturating_mul(2)),
                     // Progress is handled above; this arm is Known.
@@ -386,7 +672,58 @@ impl RejoinTracker {
         }
     }
 
+    /// One sync tick of the running follow, called by [`choose_source`]
+    /// before the tick's request: if the pinned peer gave no answer since the
+    /// last tick while a request to it was waiting (sent and unanswered, or
+    /// its re-send skipped as pending), that tick is a zero in the trickle
+    /// window. Ends the follow if the window trickles.
+    fn follow_tick(&mut self) -> Option<Transition> {
+        let answered = std::mem::take(&mut self.follow_answered);
+        let unsent = std::mem::take(&mut self.follow_unsent);
+        let cursor = match &self.mode {
+            Mode::Follow { cursor } => cursor.1,
+            _ => return None,
+        };
+        let waiting = unsent
+            || matches!(
+                (&self.asked, &self.peer),
+                (Some((asked, _, _)), Some(pinned)) if asked == pinned
+            );
+        if !answered && waiting && self.follow_trickles(0) {
+            return self.give_up(cursor);
+        }
+        None
+    }
+
+    /// Record one follow entry's cursor advance; whether the last
+    /// [`MAX_TRICKLE_ANSWERS`] entries averaged less than
+    /// [`FOLLOW_TRICKLE_ADVANCE`].
+    fn follow_trickles(&mut self, advance: u64) -> bool {
+        let window = MAX_TRICKLE_ANSWERS as usize;
+        if self.follow_advances.len() >= window {
+            self.follow_advances.pop_front();
+        }
+        self.follow_advances.push_back(advance);
+        let total = self
+            .follow_advances
+            .iter()
+            .fold(0u64, |a, b| a.saturating_add(*b));
+        self.follow_advances.len() >= window
+            && total < FOLLOW_TRICKLE_ADVANCE.saturating_mul(u64::from(MAX_TRICKLE_ANSWERS))
+    }
+
+    /// The pinned peer's answer was consumed by the search: it is live.
+    fn note_pin_answer(&mut self, from: &Option<String>) {
+        if from.is_some() && *from == self.peer {
+            self.pin_answered = true;
+        }
+    }
+
     fn reset(&mut self, from: &'static str) -> Option<Transition> {
+        self.peer = None;
+        self.clear_pin_clock();
+        self.split = false;
+        self.strike_peer = None;
         let was = std::mem::replace(&mut self.mode, Mode::Tip { strikes: 0 });
         match was {
             Mode::Tip { .. } => None,
@@ -396,12 +733,102 @@ impl RejoinTracker {
 
     fn give_up(&mut self, at: u64) -> Option<Transition> {
         self.mode = Mode::Tip { strikes: 0 };
+        self.peer = None;
+        self.strike_peer = None;
+        self.clear_pin_clock();
+        if std::mem::take(&mut self.split) {
+            // The split gate rate-limits pulls; an ordinary search later
+            // must not wait behind this one.
+            return Some(Transition::GaveUp { at });
+        }
         let shift = self.give_ups.min(31);
         self.cooldown = BACKOFF_BASE_ANSWERS
             .saturating_mul(2u32.saturating_pow(shift))
             .min(BACKOFF_MAX_ANSWERS);
         self.give_ups = self.give_ups.saturating_add(1);
         Some(Transition::GaveUp { at })
+    }
+}
+
+/// The peer the sync tick asks this round, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// A fork-point search or follow is running against this peer.
+    Pinned(String),
+    /// The selector's pick among peers ahead of us (sync_peer.rs).
+    Ahead(String),
+    /// A peer at or near our height whose tip we do not hold: pull its branch.
+    Split(String),
+    /// Nobody to ask.
+    Nobody,
+}
+
+impl Source {
+    pub fn peer(&self) -> Option<&str> {
+        match self {
+            Source::Pinned(p) | Source::Ahead(p) | Source::Split(p) => Some(p),
+            Source::Nobody => None,
+        }
+    }
+}
+
+/// Which peer the sync tick asks this round. `candidates` and `split` describe
+/// the same connected peers; `holds(h)` says whether this node stores block
+/// `h`. Returns the source and a transition worth one log line.
+#[allow(clippy::too_many_arguments)]
+pub fn choose_source(
+    tracker: &mut RejoinTracker,
+    selector: &SyncPeerSelector,
+    gate: &mut SplitPullGate,
+    candidates: &[SyncCandidate],
+    split: &[SplitCandidate],
+    applied: (Hash, u64),
+    holds: impl Fn(&Hash) -> bool,
+    now: Instant,
+) -> (Source, Option<Transition>) {
+    let mut transition = None;
+    if let Some(p) = tracker.search_peer().map(str::to_string) {
+        match candidates.iter().find(|c| c.id == p) {
+            Some(pinned) => {
+                // A follow whose peer keeps it waiting ends here (see
+                // MAX_TRICKLE_ANSWERS).
+                if let Some(t) = tracker.follow_tick() {
+                    transition = Some(t);
+                } else {
+                    // A pinned peer that has given no consumed answer for
+                    // PIN_STALL_TIMEOUT, while another peer is more than the
+                    // catch-up gap ahead of it, ends the pin: the selector asks
+                    // the peer that can carry us (DGX review of 49465b5e, P1-2).
+                    // The lead alone never does: advertised heads are unverified.
+                    let stalled = tracker.pin_stalled_for(now) >= PIN_STALL_TIMEOUT;
+                    let lead = candidates
+                        .iter()
+                        .filter(|c| c.id != p)
+                        .map(|c| c.head_height)
+                        .max()
+                        .unwrap_or(0);
+                    let gap = crate::producer::CATCHUP_REFUSE_GAP;
+                    if !stalled || lead <= pinned.head_height.saturating_add(gap) {
+                        return (Source::Pinned(p), None);
+                    }
+                    transition = tracker.reset("pinned peer stalled, a peer is ahead");
+                }
+            }
+            None => transition = tracker.abandon(),
+        }
+    }
+    if let Some(c) = selector.select(candidates, applied.1) {
+        return (Source::Ahead(c.id.clone()), transition);
+    }
+    if !tracker.can_start_split(applied.1) {
+        return (Source::Nobody, transition);
+    }
+    match gate.pick(split, applied, holds, now) {
+        Some(c) => {
+            let started = tracker.start_split_pull(&c.id, applied.1);
+            (Source::Split(c.id.clone()), transition.or(started))
+        }
+        None => (Source::Nobody, transition),
     }
 }
 
@@ -643,6 +1070,7 @@ mod tests {
         app: Arc<CanonicalApplicator>,
         admission: Arc<BlockAdmission>,
         sync: SyncManager,
+        ghostdag: Arc<GhostDag>,
     }
 
     /// A node that applied `own` (prefix and, optionally, its side branch).
@@ -680,7 +1108,7 @@ mod tests {
         let admission = Arc::new(BlockAdmission::new(
             storage.clone(),
             dag,
-            ghostdag,
+            ghostdag.clone(),
             Some(app.clone()),
         ));
         let sync = SyncManager::new(SyncConfig::default())
@@ -692,6 +1120,7 @@ mod tests {
             app,
             admission,
             sync,
+            ghostdag,
         };
         let fx = n.admission.admit_to_fixpoint(own.to_vec(), |_, _| {}).await;
         assert_eq!(fx.newly_admitted, own.len(), "own blocks admit");
@@ -728,7 +1157,7 @@ mod tests {
         from: &str,
         answer: Vec<Block>,
         network_height: u64,
-    ) {
+    ) -> (usize, u64) {
         let received: Vec<Hash> = answer.iter().map(h).collect();
         node.sync
             .handle_blocks(&PeerId(from.to_string()), answer)
@@ -762,6 +1191,10 @@ mod tests {
             );
             tracker.on_answer(verdict, network_height > applied_now, ah);
         }
+        (
+            fx.newly_admitted,
+            fx.highest_admitted.map(|(_, ht)| ht).unwrap_or(0),
+        )
     }
 
     /// Drive the node's sync against one peer the way the 2 s tick and the
@@ -1204,6 +1637,7 @@ mod tests {
                 app,
                 admission,
                 sync,
+                ghostdag,
             },
             dag,
         )
@@ -1213,6 +1647,21 @@ mod tests {
     /// `dag_prune::MIN_RETAIN_BLOCKS` when `prune`, restarted. Returns the
     /// restarted node and its storage dir.
     async fn restarted_node(net: &Net, own: &[Block], prune: bool) -> (Node, tempfile::TempDir) {
+        restarted_node_retaining(
+            net,
+            own,
+            prune.then_some(crate::dag_prune::MIN_RETAIN_BLOCKS),
+        )
+        .await
+    }
+
+    /// [`restarted_node`] with the DAG store pruned to the last `retain`
+    /// blocks (any window, below the node's configured minimum too).
+    async fn restarted_node_retaining(
+        net: &Net,
+        own: &[Block],
+        retain: Option<u64>,
+    ) -> (Node, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage =
             Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
@@ -1230,14 +1679,15 @@ mod tests {
             assert_eq!(fx.newly_admitted, own.len(), "own blocks admit");
             n.app.drive_drain().await;
             assert_eq!(n.applied(), Some((h(tip), tip_height)), "fixture: applied");
-            if prune {
-                let dropped = crate::dag_prune::prune_once(
-                    &storage,
-                    &dag,
-                    tip_height,
-                    crate::dag_prune::MIN_RETAIN_BLOCKS,
-                )
-                .await;
+            if let Some(retain) = retain {
+                let point = tip_height - retain;
+                let at = storage
+                    .blocks
+                    .get_canonical_block_by_height(point)
+                    .expect("canonical read")
+                    .expect("canonical block at the pruning point");
+                dag.update_pruning_point(at).await.expect("pruning point");
+                let dropped = dag.prune().await.expect("prune");
                 assert!(dropped > 0, "fixture: the DAG store was pruned");
             }
             n.executor.state_snapshot()
@@ -1383,11 +1833,10 @@ mod tests {
 
     /// The same restart, but the node's last block (its own, sealed before it
     /// stopped) never reached the network: the restart tip is one block off
-    /// the heavier chain, and the fork point is below the only state snapshot
-    /// a restart keeps. Reaching the heavier chain from there takes a replay
-    /// from genesis, which on a pruned node is refused: the durable applied
-    /// tip never goes below the fork point (it stays on its own tip, as before
-    /// the fork-point search existed; an operator resync moves it).
+    /// the heavier chain. The restart keeps the reorg window (the undo records
+    /// persisted with every applied block), so the node reverts that one block
+    /// and follows the heavier chain; the durable applied tip never goes below
+    /// the fork point (no replay from genesis, which a pruned node refuses).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pruned_restart_one_block_off_never_rewinds_below_the_fork_point() {
         let fork = 1_199u64;
@@ -1422,10 +1871,12 @@ mod tests {
         );
         assert_eq!(
             n.applied(),
-            Some((h(&net.side[0]), fork + 1)),
-            "the node keeps its own tip: anchors {:?}",
+            Some((h(main_tip), network_tip)),
+            "the node reorgs onto the heavier chain from its persisted reorg window: \
+             anchors {:?}",
             run.anchors
         );
+        assert_eq!(n.executor.calculate_state_root(), main_tip.state_root);
     }
 
     /// A restarted node on the canonical chain hears of a sibling of its tip
@@ -1503,6 +1954,16 @@ mod tests {
                 out.push("sync tick: the tracker must get the clamped sync target before anchor()")
             }
         }
+        // Split healing: the tick's source comes from `choose_source` (a
+        // running search stays on its peer; equal-height siblings are pulled),
+        // never from the selector alone.
+        match (src.find("sync_rejoin::choose_source("), tick) {
+            (Some(c), Some(t)) if c < t => {}
+            _ => out.push("sync tick: the request peer must come from sync_rejoin::choose_source"),
+        }
+        if src.contains(".select(&candidates,") {
+            out.push("sync tick: the selector is asked directly, bypassing a pinned search");
+        }
         if src.contains(".request_blocks(&peer, start_from, start_height)") {
             out.push("sync tick: a GetBlocks still anchored on the applied tip directly");
         }
@@ -1549,9 +2010,11 @@ mod tests {
 
     /// Every node, pruned or not: a restarted node on the canonical chain
     /// hears one same-height sibling of its restart tip that wins the
-    /// tie-break. An equal-weight head never triggers a rebuild from genesis:
-    /// the durable applied tip never drops, and the node converges as the
-    /// tip's children arrive.
+    /// tie-break. An equal-weight head never triggers a rebuild from genesis.
+    /// The restart keeps the reorg window, so the node follows the tie-break
+    /// as a running node does (a one-block reorg): the durable applied tip
+    /// never goes below the fork point, the restart tip's parent, and the
+    /// node converges as the tip's children arrive.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unpruned_restart_tip_sibling_never_rewinds() {
         let tip_height = 1_200u64;
@@ -1579,23 +2042,25 @@ mod tests {
             .finish()
             .min(applied.iter().copied().min().unwrap_or(0));
         assert!(
-            lowest >= tip_height,
-            "the durable applied tip dropped below the restart tip {tip_height}: lowest \
-             {lowest}; applied {applied:?}; anchors {:?}",
+            lowest >= tip_height - 1,
+            "the durable applied tip went below the fork point {}: lowest {lowest}; \
+             applied {applied:?}; anchors {:?}",
+            tip_height - 1,
             run.anchors
         );
         assert_eq!(n.applied(), Some((h(main_tip), network_tip)));
         assert_eq!(n.executor.calculate_state_root(), main_tip.state_root);
     }
 
-    /// Control: an unpruned node restarted one block off a genuinely heavier
-    /// chain still rebuilds onto it (the from-genesis rebuild is kept for a
-    /// strictly heavier head).
+    /// Control: an unpruned node restarted on a side branch deeper than the
+    /// reorg window, off a genuinely heavier chain, still rebuilds onto it
+    /// (the from-genesis rebuild is kept for a strictly heavier head).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn unpruned_restart_one_block_off_still_rebuilds_onto_the_heavier_chain() {
+    async fn unpruned_restart_deeper_than_the_window_still_rebuilds_onto_the_heavier_chain() {
         let fork = 1_199u64;
-        let network_tip = fork + 90;
-        let net = net(fork, fork + 1, network_tip);
+        let side_tip = fork + crate::canonical_apply::MAX_REORG_DEPTH + 5;
+        let network_tip = side_tip + 90;
+        let net = net(fork, side_tip, network_tip);
         let pdir = tempfile::tempdir().expect("tempdir");
         let peer = peer_store(&net, false, pdir.path());
         let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
@@ -1633,24 +2098,33 @@ mod tests {
     /// keeps its tip.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn runtime_rebuild_refuses_an_equal_weight_head() {
-        let tip_height = 1_200u64;
-        let net = net(tip_height, tip_height, tip_height + 1);
-        let tip = net.prefix.last().expect("prefix");
-        let sibling = tie_winning_sibling(tip, h(&net.prefix[net.prefix.len() - 2]));
-        let (n, _ndir) = restarted_node(&net, &net.prefix, false).await;
+        // An equal-length rival branch forking deeper than the reorg window:
+        // only a rebuild from genesis could switch to it.
+        let fork = 1_200u64 - crate::canonical_apply::MAX_REORG_DEPTH - 5;
+        let net = net(fork, 1_200, 1_200);
+        let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
+        let (n, _ndir) = restarted_node(&net, &own, false).await;
         let fx = n
             .admission
-            .admit_to_fixpoint(vec![sibling.clone()], |_, _| {})
+            .admit_to_fixpoint(net.main.clone(), |_, _| {})
             .await;
-        assert_eq!(fx.newly_admitted, 1, "fixture: the sibling admits");
+        assert_eq!(
+            fx.newly_admitted,
+            net.main.len(),
+            "fixture: the rival admits"
+        );
+        let rival = net.main.last().expect("main");
         let watch = TipWatch::start(n.storage.clone());
-        n.app.maybe_runtime_rebuild(h(&sibling)).await;
+        n.app.maybe_runtime_rebuild(h(rival)).await;
         let lowest = watch.finish();
         assert!(
-            lowest >= tip_height,
+            lowest >= 1_200,
             "rebuilt toward an equal-weight head: {lowest}"
         );
-        assert_eq!(n.applied(), Some((h(tip), tip_height)));
+        assert_eq!(
+            n.applied(),
+            Some((h(net.side.last().expect("side")), 1_200))
+        );
     }
 
     /// The rebuild itself re-checks the prune floor: asked to rebuild toward
@@ -1658,8 +2132,10 @@ mod tests {
     /// tip.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn runtime_rebuild_refuses_on_a_pruned_node() {
+        // The node's own branch is deeper than the reorg window.
         let fork = 1_199u64;
-        let net = net(fork, fork + 1, fork + 40);
+        let side_tip = fork + crate::canonical_apply::MAX_REORG_DEPTH + 5;
+        let net = net(fork, side_tip, side_tip + 40);
         let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
         let (n, _ndir) = restarted_node(&net, &own, true).await;
         let fx = n
@@ -1672,7 +2148,67 @@ mod tests {
         n.app.maybe_runtime_rebuild(h(main_tip)).await;
         let lowest = watch.finish();
         assert!(lowest > fork, "rebuilt on a pruned node: {lowest}");
-        assert_eq!(n.applied(), Some((h(&net.side[0]), fork + 1)));
+        assert_eq!(
+            n.applied(),
+            Some((h(net.side.last().expect("side")), side_tip))
+        );
+    }
+
+    /// A restarted node whose DAG store is pruned to a small window (50
+    /// blocks at height 500) sits on its own branch, 40 blocks off a heavier
+    /// chain. It switches by a bounded reorg from its persisted reorg window:
+    /// the durable tip never goes below the fork point, and it ends on the
+    /// heavier chain's state. (Before, the switch needed a replay from
+    /// genesis, which a pruned node refuses: the node held its tip forever.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pruned_restart_40_off_reorgs_within_the_window() {
+        let fork = 460u64;
+        let net = net(fork, 500, 530);
+        let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
+        let (n, _ndir) = restarted_node_retaining(&net, &own, Some(50)).await;
+        let fx = n
+            .admission
+            .admit_to_fixpoint(net.main.clone(), |_, _| {})
+            .await;
+        assert_eq!(fx.newly_admitted, net.main.len(), "fixture: main admits");
+        let main_tip = net.main.last().expect("main");
+        let watch = TipWatch::start(n.storage.clone());
+        n.app.drive_drain().await;
+        let lowest = watch.finish();
+        assert!(
+            lowest >= fork,
+            "the durable tip went below the fork point {fork}: {lowest}"
+        );
+        assert_eq!(
+            n.applied(),
+            Some((h(main_tip), 530)),
+            "the pruned node switches to the heavier chain"
+        );
+        assert_eq!(n.executor.calculate_state_root(), main_tip.state_root);
+    }
+
+    /// The same pruned node (150 retained) with its fork point deeper than the
+    /// reorg window (105 below its tip): still refused, as before. The node keeps its tip
+    /// and its state; an operator resync moves it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pruned_restart_deeper_than_the_window_still_refuses() {
+        let fork = 395u64;
+        let net = net(fork, 500, 530);
+        let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
+        let (n, _ndir) = restarted_node_retaining(&net, &own, Some(150)).await;
+        let fx = n
+            .admission
+            .admit_to_fixpoint(net.main.clone(), |_, _| {})
+            .await;
+        assert_eq!(fx.newly_admitted, net.main.len(), "fixture: main admits");
+        let own_tip = net.side.last().expect("side");
+        let root = n.executor.calculate_state_root();
+        let watch = TipWatch::start(n.storage.clone());
+        n.app.drive_drain().await;
+        let lowest = watch.finish();
+        assert_eq!(lowest, 500, "the durable tip never moved");
+        assert_eq!(n.applied(), Some((h(own_tip), 500)));
+        assert_eq!(n.executor.calculate_state_root(), root);
     }
 
     /// The node's applicator is built with the DAG prune floor wired, on the
@@ -2223,6 +2759,7 @@ mod tests {
                 app,
                 admission,
                 sync,
+                ghostdag: ghostdag.clone(),
             },
             ghostdag,
             dag,
@@ -2261,12 +2798,12 @@ mod tests {
     /// advertises a higher head and answers the tip anchor with nothing (it
     /// never held the node's tip); when the fork-point search probes below the
     /// tip it serves a validly signed sibling of the tip that fork choice ranks
-    /// first (equal score, smaller hash). The reorg ring cannot reach the fork
-    /// point after a restart, so switching would be a from-genesis rebuild.
-    /// An equal-weight head never starts one (owner decision 2026-10-28): the
-    /// durable applied tip never drops and the node keeps its verified tip
-    /// until a strictly heavier branch exists. (A legitimate rebuild must not
-    /// stall the receive path: `the_receive_path_does_not_wait_on_a_rebuild`.)
+    /// first (equal score, smaller hash). The restart keeps the reorg window,
+    /// so the node follows the tie-break as a running node does: a one-block
+    /// reorg. An equal-weight head never starts a from-genesis rebuild (owner
+    /// decision 2026-10-28): the durable applied tip never goes below the fork
+    /// point and no rebuild runs. (A legitimate rebuild must not stall the
+    /// receive path: `the_receive_path_does_not_wait_on_a_rebuild`.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restarted_node_keeps_its_verified_height_through_a_rebuild() {
         let key = crypto::generate_keypair();
@@ -2304,16 +2841,17 @@ mod tests {
         })
         .await;
         assert!(
-            lowest >= RESTART_TIP,
-            "the durable applied tip dropped to {lowest} (verified height {RESTART_TIP}): \
+            lowest >= RESTART_TIP - 1,
+            "the durable applied tip dropped to {lowest}, below the fork point {}: \
              anchors {:?}",
+            RESTART_TIP - 1,
             run.anchors
         );
         assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(
             n.applied(),
-            Some((h(&tip), RESTART_TIP)),
-            "an equal-weight sibling never moves the node off its verified tip"
+            Some((h(&rival), RESTART_TIP)),
+            "the node follows the tie-break by a one-block reorg, as a running node does"
         );
     }
 
@@ -2769,5 +3307,1530 @@ mod tests {
         assert!(
             body("pub async fn drive_drain(").contains("self.forward_step_toward(&state, new_tip)")
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Split healing (r1006, 2026-10-29). Producers on branches that grow at
+    // the same rate sit at equal heights, so no peer is ever "ahead" and the
+    // tick never asked anyone; and a forked node that IS behind had its search
+    // steered, then ended, by answers from peers on its own branch.
+    //
+    // The mesh below runs every node's 2 s tick as `start_node` runs it:
+    // `choose_source` (the same function main.rs calls), the tracker's anchor,
+    // `note_asked`, the answer from the asked peer's real `serve_blocks`, the
+    // `Blocks` steps in `deliver`, and the serve credit the handler records.
+    // ---------------------------------------------------------------------
+
+    use crate::sync_peer::{SplitCandidate, SplitPullGate, SyncCandidate, SyncPeerSelector};
+
+    struct MeshNode {
+        name: String,
+        node: Node,
+        tracker: RejoinTracker,
+        selector: SyncPeerSelector,
+        gate: SplitPullGate,
+        orphans: Vec<Block>,
+        /// Advertised head when relayed gossip inflated it (I4): the height
+        /// and the hash of the relayed block.
+        inflated: Option<(Hash, u64)>,
+        /// Every source this node chose, with the anchor height it asked.
+        asked: Vec<(Source, u64)>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl MeshNode {
+        fn advertised(&self) -> (Hash, u64) {
+            let own = self.node.applied().expect("applied tip");
+            match self.inflated {
+                Some(inf) if inf.1 > own.1 => inf,
+                _ => own,
+            }
+        }
+    }
+
+    async fn mesh_node(name: &str, net: &Net, own: &[Block]) -> MeshNode {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let node = node(net, own, dir.path()).await;
+        MeshNode {
+            name: name.to_string(),
+            node,
+            tracker: RejoinTracker::new(),
+            selector: SyncPeerSelector::new(),
+            gate: SplitPullGate::new(),
+            orphans: Vec::new(),
+            inflated: None,
+            asked: Vec::new(),
+            _dir: dir,
+        }
+    }
+
+    /// One 2 s sync tick on `mesh[i]` at `now`. Returns the source it chose.
+    async fn mesh_tick(mesh: &mut [MeshNode], i: usize, now: Instant) -> Source {
+        let applied = mesh[i].node.applied().expect("applied tip");
+        let mut cands = Vec::new();
+        let mut split = Vec::new();
+        for (j, m) in mesh.iter().enumerate() {
+            if j == i {
+                continue;
+            }
+            let (hash, height) = m.advertised();
+            cands.push(SyncCandidate {
+                id: m.name.clone(),
+                head_height: height,
+            });
+            split.push(SplitCandidate {
+                id: m.name.clone(),
+                head_height: height,
+                head_hash: hash,
+            });
+        }
+        let target = cands
+            .iter()
+            .map(|c| c.head_height)
+            .max()
+            .unwrap_or(0)
+            .max(applied.1);
+        let me = &mut mesh[i];
+        me.tracker.note_sync_target(target, applied.1);
+        let storage = me.node.storage.clone();
+        let (source, _) = choose_source(
+            &mut me.tracker,
+            &me.selector,
+            &mut me.gate,
+            &cands,
+            &split,
+            applied,
+            |hh| storage.blocks.has_block(hh).unwrap_or(true),
+            now,
+        );
+        let Some(peer) = source.peer().map(str::to_string) else {
+            me.asked.push((source.clone(), applied.1));
+            return source;
+        };
+        let anchor = me
+            .tracker
+            .anchor(applied, |ht| anchor_at_height(&me.node.storage, ht));
+        me.tracker.note_asked(&peer, anchor);
+        me.asked.push((source.clone(), anchor.1));
+        let j = mesh
+            .iter()
+            .position(|m| m.name == peer)
+            .expect("asked a mesh peer");
+        let answer = block_serve::serve_blocks(&mesh[j].node.storage, &anchor.0, 32);
+        let served = answer.len();
+        let me = &mut mesh[i];
+        let (newly, highest) = deliver(
+            &me.node,
+            &mut me.tracker,
+            &mut me.orphans,
+            &peer,
+            answer,
+            target,
+        )
+        .await;
+        let applied_now = me.node.applied().expect("applied tip").1;
+        let stale = crate::sync_recovery::answer_anchor_was_stale(anchor.1, applied_now, served);
+        me.selector.record_serve(
+            &peer,
+            newly,
+            highest,
+            target.saturating_sub(applied_now),
+            32,
+            stale,
+        );
+        source
+    }
+
+    /// One round: every node ticks once, `now` advances one tick.
+    async fn mesh_round(mesh: &mut [MeshNode], now: Instant) {
+        for i in 0..mesh.len() {
+            mesh_tick(mesh, i, now).await;
+        }
+    }
+
+    /// Seal the block `m` would produce now, as the producer does: drain, the
+    /// initial-sync gate (#126), fork choice's tip as the selected parent and
+    /// only when it is the applied tip (MP-S1), the other tips as merge
+    /// parents (heaviest-parent and MP-DEPTH filters). `None` when the
+    /// producer would refuse.
+    async fn mesh_produce(
+        m: &MeshNode,
+        key: &ed25519_dalek::SigningKey,
+        r: &[Hash],
+        target: u64,
+    ) -> Option<Block> {
+        m.node.app.drive_drain().await;
+        let applied = m.node.applied().expect("applied tip");
+        if !crate::sync_recovery::initial_sync_complete(
+            applied.1,
+            target,
+            1,
+            std::time::Duration::from_secs(1),
+        ) {
+            return None;
+        }
+        let sp_hash = m.node.ghostdag.select_tip().await.ok()?;
+        if sp_hash != applied.0 {
+            return None;
+        }
+        let sp = m.node.storage.blocks.get_block(&sp_hash).ok()??;
+        let height = sp.header.height + 1;
+        let mut merges = Vec::new();
+        for tip in m.node.ghostdag.get_tips().await {
+            if tip == sp_hash || merges.len() + 1 >= GhostDagParams::default().max_parents {
+                continue;
+            }
+            let Ok(Some(b)) = m.node.storage.blocks.get_block(&tip) else {
+                continue;
+            };
+            if b.header.blue_score <= sp.header.blue_score
+                && height - b.header.height <= citrate_consensus::ghostdag::MERGE_PARENT_MAX_DEPTH
+            {
+                merges.push(tip);
+            }
+        }
+        merges.sort();
+        let score = sp.header.blue_score + 1;
+        let mut b = BlockBuilder::new()
+            .version(2)
+            .height(height)
+            .parent(sp_hash)
+            .merge_parents(merges)
+            .coinbase(CB)
+            .timestamp(sp.header.timestamp + 1)
+            .vrf_reveal(VrfProof {
+                proof: vec![],
+                output: Hash::new([0x5A; 32]),
+            })
+            .transactions(vec![])
+            .state_root(r[height as usize])
+            .blue_score(score)
+            .blue_work(blue_work_for_score(score))
+            .proposer(PublicKey::new(key.verifying_key().to_bytes()))
+            .build_unhashed();
+        b.tx_root = citrate_consensus::tx_auth::tx_root_for_height(
+            PbaHardening::off(),
+            height,
+            &b.transactions,
+        );
+        b.header.block_hash = b.compute_hash();
+        b.signature = crypto::sign_block(&b.header.block_hash, key);
+        Some(b)
+    }
+
+    /// `block` produced by `mesh[from]`: admitted there, gossiped to the rest.
+    /// A receiver that defers it on a missing parent asks the sender for that
+    /// parent (SYNC-S3, `main.rs` NewBlock arm: anchored at the parent, so the
+    /// answer carries the parent's whole height group).
+    async fn mesh_gossip(mesh: &mut [MeshNode], from: usize, block: &Block, target: u64) {
+        let fx = mesh[from]
+            .node
+            .admission
+            .admit_to_fixpoint(vec![block.clone()], |_, _| {})
+            .await;
+        assert_eq!(fx.newly_admitted, 1, "the producer admits its own block");
+        mesh[from].node.app.drive_drain().await;
+        let name = mesh[from].name.clone();
+        let sender = mesh[from].node.storage.clone();
+        for (j, m) in mesh.iter_mut().enumerate() {
+            if j == from {
+                continue;
+            }
+            deliver(
+                &m.node,
+                &mut m.tracker,
+                &mut m.orphans,
+                &name,
+                vec![block.clone()],
+                target,
+            )
+            .await;
+            if !holds(m, block) {
+                let missing = block
+                    .parents()
+                    .into_iter()
+                    .find(|p| !m.node.storage.blocks.has_block(p).expect("read"));
+                if let Some(parent) = missing {
+                    let answer = block_serve::serve_blocks(&sender, &parent, 32);
+                    deliver(
+                        &m.node,
+                        &mut m.tracker,
+                        &mut m.orphans,
+                        &name,
+                        answer,
+                        target,
+                    )
+                    .await;
+                }
+            }
+            m.node.app.drive_drain().await;
+        }
+    }
+
+    fn holds(m: &MeshNode, b: &Block) -> bool {
+        m.node.storage.blocks.has_block(&h(b)).expect("read")
+    }
+
+    /// Producers on equal-height branches: a common prefix `1..=fork`, then
+    /// each producer's own `len` blocks on it. Blocks pay the same coinbase,
+    /// so every branch has the same state roots.
+    struct Split {
+        net: Net,
+        roots: Vec<Hash>,
+        keys: Vec<ed25519_dalek::SigningKey>,
+        branches: Vec<Vec<Block>>,
+    }
+
+    fn split_net(fork: u64, len: u64, producers: usize) -> Split {
+        let common = crypto::generate_keypair();
+        let r = roots(fork + len + 40, &common);
+        let g = genesis();
+        let prefix = extend(&common, h(&g), 1, fork, &r);
+        let fork_hash = prefix.last().map(h).unwrap_or_else(|| h(&g));
+        let keys: Vec<_> = (0..producers).map(|_| crypto::generate_keypair()).collect();
+        let branches = keys
+            .iter()
+            .map(|k| extend(k, fork_hash, fork + 1, fork + len, &r))
+            .collect();
+        Split {
+            net: Net {
+                genesis: g,
+                prefix,
+                main: Vec::new(),
+                side: Vec::new(),
+            },
+            roots: r,
+            keys,
+            branches,
+        }
+    }
+
+    async fn split_mesh(sp: &Split) -> Vec<MeshNode> {
+        let mut mesh = Vec::new();
+        for (i, br) in sp.branches.iter().enumerate() {
+            let own: Vec<Block> = sp.net.prefix.iter().chain(br.iter()).cloned().collect();
+            mesh.push(mesh_node(&format!("prod-{i}"), &sp.net, &own).await);
+        }
+        mesh
+    }
+
+    /// Pull rounds until every node stores every branch, at most `max`.
+    /// Returns the rounds used and the lowest durable applied height any node
+    /// had meanwhile.
+    async fn heal_rounds(mesh: &mut [MeshNode], sp: &Split, max: usize) -> (usize, u64) {
+        let watches: Vec<TipWatch> = mesh
+            .iter()
+            .map(|m| TipWatch::start(m.node.storage.clone()))
+            .collect();
+        let t0 = Instant::now();
+        let mut rounds = 0;
+        while rounds < max {
+            let all = mesh
+                .iter()
+                .all(|m| sp.branches.iter().flatten().all(|b| holds(m, b)));
+            if all {
+                break;
+            }
+            mesh_round(mesh, t0 + std::time::Duration::from_secs(2 * rounds as u64)).await;
+            rounds += 1;
+        }
+        let lowest = watches.into_iter().map(TipWatch::finish).min().unwrap_or(0);
+        (rounds, lowest)
+    }
+
+    /// After the pull, produce round-robin (each producer seals when its gates
+    /// pass, the block is gossiped, then every node ticks once) until every
+    /// node stores every branch, applies the same block, and that block is
+    /// its only DAG tip (every other branch is merged into its past). At most
+    /// `max` rounds. Returns that block, the blocks produced, and the rounds
+    /// in which the nodes' applied tips differed after the first block.
+    async fn converge(
+        mesh: &mut [MeshNode],
+        sp: &Split,
+        max: usize,
+    ) -> Option<(Block, Vec<Block>, usize)> {
+        let mut disagreed = 0;
+        let t0 = Instant::now() + std::time::Duration::from_secs(3_600);
+        let mut produced = Vec::new();
+        for round in 0..max {
+            let target = mesh.iter().map(|m| m.advertised().1).max().unwrap_or(0);
+            let i = round % mesh.len();
+            if let Some(b) = mesh_produce(&mesh[i], &sp.keys[i], &sp.roots, target).await {
+                mesh_gossip(mesh, i, &b, target + 1).await;
+                produced.push(b);
+            }
+            mesh_round(mesh, t0 + std::time::Duration::from_secs(2 * round as u64)).await;
+            for m in mesh.iter() {
+                m.node.app.drive_drain().await;
+            }
+            let Some(last) = produced.last() else {
+                continue;
+            };
+            let want = Some((h(last), last.header.height));
+            if mesh.iter().any(|m| m.node.applied() != want) {
+                disagreed += 1;
+            }
+            let mut done = true;
+            for m in mesh.iter() {
+                done &= m.node.applied() == want
+                    && sp.branches.iter().flatten().all(|b| holds(m, b))
+                    && m.node.ghostdag.get_tips().await == vec![h(last)];
+            }
+            if done {
+                return Some((last.clone(), produced, disagreed));
+            }
+        }
+        None
+    }
+
+    /// RED. Two producers, 10 own blocks each on a common prefix, at equal
+    /// height, connected, nothing in flight. Neither is ahead, so neither ever
+    /// asks the other for anything and each producer's blocks defer at the
+    /// other forever. The tick must pull the sibling branch from the peer whose
+    /// tip it does not hold, so both nodes store both branches; GhostDAG then
+    /// selects one and the next block merges the other, and both nodes apply
+    /// that block. Nothing rewinds while the branches are fetched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn equal_height_producers_pull_each_others_branch_and_converge() {
+        let sp = split_net(6, 10, 2);
+        let mut mesh = split_mesh(&sp).await;
+        let (rounds, lowest) = heal_rounds(&mut mesh, &sp, 30).await;
+        for m in &mesh {
+            for (k, br) in sp.branches.iter().enumerate() {
+                assert!(
+                    br.iter().all(|b| holds(m, b)),
+                    "{} does not store prod-{k}'s branch after {rounds} rounds: asked {:?}",
+                    m.name,
+                    m.asked
+                );
+            }
+        }
+        // An equal-weight in-window reorg may pass through the fork point;
+        // a rebuild from genesis would reset the durable tip below it.
+        assert!(
+            lowest >= 6,
+            "a durable applied tip fell to {lowest}, below the fork point: the pull \
+             must never cause a rebuild from genesis"
+        );
+        // Both nodes hold the same DAG, so fork choice agrees.
+        let a = mesh[0].node.ghostdag.select_tip().await.expect("tip");
+        let b = mesh[1].node.ghostdag.select_tip().await.expect("tip");
+        assert_eq!(a, b, "fork choice disagrees over the same DAG");
+        let (tip, produced, disagreed) = converge(&mut mesh, &sp, 4).await.expect("converged");
+        assert_eq!(produced.len(), 1, "one block converges both nodes");
+        assert_eq!(disagreed, 0);
+        let tips: Vec<Hash> = sp
+            .branches
+            .iter()
+            .map(|br| h(br.last().expect("tip")))
+            .collect();
+        let parents = tip.parents();
+        assert!(
+            tips.iter().all(|t| parents.contains(t)),
+            "the converged block merges both branch tips: parents {parents:?}"
+        );
+    }
+
+    /// RED. Seven producers, one own block each at the same height (the
+    /// shape of a 7-way partition that healed its links but not its
+    /// branches). The pulls spread the siblings (a peer's advertised tip names
+    /// one block, so a node learns of the rest through what that peer serves),
+    /// production merges what each producer holds, and ordinary sync fetches
+    /// the merge parents a node lacks: every node ends up storing all seven,
+    /// applying the same block, with no other DAG tip.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn seven_equal_height_singletons_converge() {
+        let sp = split_net(6, 1, 7);
+        let mut mesh = split_mesh(&sp).await;
+        let (rounds, lowest) = heal_rounds(&mut mesh, &sp, 60).await;
+        for m in &mesh {
+            let held = sp.branches.iter().flatten().filter(|b| holds(m, b)).count();
+            assert!(
+                held >= 2,
+                "{} stores {held} of 7 siblings after {rounds} rounds: asked {:?}",
+                m.name,
+                m.asked
+            );
+        }
+        assert!(lowest >= 6, "a durable applied tip fell to {lowest}");
+        let (tip, produced, disagreed) = converge(&mut mesh, &sp, 14).await.expect("converged");
+        // One selected chain from the first block on: every node applies
+        // each produced block. Merging finishes within one turn per producer
+        // (a sibling nobody pulled is merged by its own producer).
+        assert_eq!(
+            disagreed, 0,
+            "the nodes' applied tips differed after a block"
+        );
+        assert!(
+            produced.len() <= 7,
+            "took {} blocks to merge every sibling",
+            produced.len()
+        );
+        let merged: usize = produced.iter().map(|b| b.parents().len() - 1).sum();
+        assert_eq!(merged, 6, "the six other siblings are merged once each");
+        assert_eq!(tip.header.height, 7 + produced.len() as u64);
+    }
+
+    /// RED, the devnet shape (DGX, fed#331 c.6502292059). A producer
+    /// restarted onto its own branch: forked 35 below its tip, the network 250
+    /// ahead of it on the other branch. Two other producers stuck on the SAME
+    /// side branch advertise the network head (relayed gossip inflates it,
+    /// I4), so the selector alternates between the leading producer, which
+    /// does not hold our tip (empty answers), and siblings that hold our tip
+    /// and nothing above it (answers we already have). Those sibling answers
+    /// reset the search's strikes and, once a probe ran, ended it on the first
+    /// probe ("StartedProbe { top } then GaveUp { at: top - 1 } 0.5 s later").
+    /// Every stuck node must find the fork point against the leading
+    /// producer, fetch its branch, switch to it, and produce again (it was
+    /// held by the initial-sync gate), with its block accepted by the leader.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forked_and_behind_node_rejoins_and_produces_again() {
+        let fork = 100u64;
+        let side_tip = fork + 35;
+        let main_tip = side_tip + 250;
+        let leader_key = crypto::generate_keypair();
+        let side_key = crypto::generate_keypair();
+        let r = roots(main_tip + 4, &leader_key);
+        let g = genesis();
+        let prefix = extend(&leader_key, h(&g), 1, fork, &r);
+        let fork_hash = h(prefix.last().expect("prefix"));
+        let main = extend(&leader_key, fork_hash, fork + 1, main_tip, &r);
+        let side = extend(&side_key, fork_hash, fork + 1, side_tip, &r);
+        let net = Net {
+            genesis: g,
+            prefix: prefix.clone(),
+            main: main.clone(),
+            side: side.clone(),
+        };
+        let main_own: Vec<Block> = prefix.iter().chain(main.iter()).cloned().collect();
+        let side_own: Vec<Block> = prefix.iter().chain(side.iter()).cloned().collect();
+        let head = main.last().expect("main tip").clone();
+        let mut mesh = vec![mesh_node("a-leader", &net, &main_own).await];
+        let stuck = ["b-stuck", "c-stuck", "d-stuck"];
+        for name in stuck {
+            let mut m = mesh_node(name, &net, &side_own).await;
+            m.inflated = Some((h(&head), main_tip));
+            // History before the stall: the other stuck producers delivered
+            // this node's branch, the leader only the common prefix. So once
+            // scores tie, the served watermark ranks every sibling above the
+            // leader (sync_peer.rs ordering), as on the devnet.
+            for sib in stuck.iter().filter(|s| **s != name) {
+                m.selector.record_serve(sib, 32, side_tip, 32, 32, false);
+            }
+            m.selector.record_serve("a-leader", 32, fork, 32, 32, false);
+            mesh.push(m);
+        }
+        let watches: Vec<TipWatch> = mesh
+            .iter()
+            .map(|m| TipWatch::start(m.node.storage.clone()))
+            .collect();
+        let t0 = Instant::now();
+        let mut rounds = 0;
+        while rounds < 120
+            && !mesh
+                .iter()
+                .all(|m| m.node.applied() == Some((h(&head), main_tip)))
+        {
+            mesh_round(&mut mesh, t0 + std::time::Duration::from_secs(2 * rounds)).await;
+            rounds += 1;
+        }
+        let lowest = watches.into_iter().map(TipWatch::finish).min().unwrap_or(0);
+        for m in &mesh[1..] {
+            assert!(
+                main.iter().all(|b| holds(m, b)),
+                "{} did not store the leader's branch after {rounds} rounds",
+                m.name
+            );
+            assert_eq!(
+                m.node.applied(),
+                Some((h(&head), main_tip)),
+                "{} stayed on its branch after {rounds} rounds: asked {:?}",
+                m.name,
+                m.asked
+                    .iter()
+                    .map(|(s, a)| (s.peer().map(str::to_string), *a))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(m.node.executor.calculate_state_root(), head.state_root);
+        }
+        assert!(
+            lowest >= fork,
+            "a durable applied tip fell to {lowest}, below the fork point {fork}: the \
+             switch is an in-window reorg, never a rebuild from genesis"
+        );
+        // Produces again: past the initial-sync gate, on the network head,
+        // and the leader applies the block.
+        let stuck_key = crypto::generate_keypair();
+        let b = mesh_produce(&mesh[1], &stuck_key, &r, main_tip)
+            .await
+            .expect("the rejoined producer produces");
+        assert_eq!(b.selected_parent(), h(&head));
+        mesh_gossip(&mut mesh, 1, &b, main_tip + 1).await;
+        for m in &mesh {
+            assert_eq!(
+                m.node.applied(),
+                Some((h(&b), main_tip + 1)),
+                "{} did not apply the rejoined producer's block",
+                m.name
+            );
+        }
+    }
+
+    /// Control: a peer strictly ahead on our own chain is synced from as
+    /// before (the selector's pick, tip anchors only), and no split pull or
+    /// search ever starts on either side.
+    #[tokio::test]
+    async fn a_peer_strictly_ahead_still_syncs_as_before() {
+        let net = net(6, 6, 120);
+        let ahead: Vec<Block> = net.prefix.iter().chain(net.main.iter()).cloned().collect();
+        let mut mesh = vec![
+            mesh_node("a-ahead", &net, &ahead).await,
+            mesh_node("b-behind", &net, &net.prefix).await,
+        ];
+        let tip = net.main.last().expect("tip");
+        let t0 = Instant::now();
+        for round in 0..20u64 {
+            if mesh[1].node.applied() == Some((h(tip), 120)) {
+                break;
+            }
+            mesh_round(&mut mesh, t0 + std::time::Duration::from_secs(2 * round)).await;
+        }
+        assert_eq!(mesh[1].node.applied(), Some((h(tip), 120)));
+        let mut applied = 6;
+        for (src, anchor) in &mesh[1].asked {
+            assert!(
+                matches!(src, Source::Ahead(p) if p == "a-ahead") || *src == Source::Nobody,
+                "behind node chose {src:?}"
+            );
+            assert!(*anchor >= applied, "anchored below the tip: {anchor}");
+            applied = *anchor;
+        }
+        assert!(
+            mesh[0].asked.iter().all(|(s, _)| *s == Source::Nobody),
+            "the node ahead asked: {:?}",
+            mesh[0].asked
+        );
+        assert_eq!(mesh[1].tracker.mode(), &Mode::Tip { strikes: 0 });
+    }
+
+    /// Control: equal height on the SAME tip, and a peer whose advertised tip
+    /// we already hold, are not split pulls; nothing is ever asked.
+    #[tokio::test]
+    async fn no_pull_when_the_peer_tip_is_held() {
+        let net = net(6, 6, 20);
+        let chain: Vec<Block> = net.prefix.iter().chain(net.main.iter()).cloned().collect();
+        let mut mesh = [
+            mesh_node("a", &net, &chain).await,
+            mesh_node("b", &net, &chain).await,
+            mesh_node("c", &net, &chain[..chain.len() - 3]).await,
+        ];
+        let t0 = Instant::now();
+        for round in 0..10u64 {
+            mesh_round(
+                &mut mesh[..2],
+                t0 + std::time::Duration::from_secs(2 * round),
+            )
+            .await;
+        }
+        for m in &mesh[..2] {
+            assert!(
+                m.asked.iter().all(|(s, _)| *s == Source::Nobody),
+                "{} asked {:?}",
+                m.name,
+                m.asked
+            );
+        }
+        // `a` sees `c` 3 below with a tip on a's own chain: held, no pull.
+        let applied = mesh[0].node.applied().expect("tip");
+        let c = mesh[2].node.applied().expect("tip");
+        let storage = mesh[0].node.storage.clone();
+        let m0 = &mut mesh[0];
+        let (src, _) = choose_source(
+            &mut m0.tracker,
+            &m0.selector,
+            &mut m0.gate,
+            &[SyncCandidate {
+                id: "c".into(),
+                head_height: c.1,
+            }],
+            &[SplitCandidate {
+                id: "c".into(),
+                head_height: c.1,
+                head_hash: c.0,
+            }],
+            applied,
+            |hh| storage.blocks.has_block(hh).unwrap_or(true),
+            t0,
+        );
+        assert_eq!(src, Source::Nobody);
+    }
+
+    /// A split pull is a search against one peer: while it runs, the tick
+    /// keeps asking that peer even when the selector would pick another, an
+    /// equal-height answer does not end it as "caught up", a peer ahead takes
+    /// the tick only once the pinned peer has stalled for
+    /// `PIN_STALL_TIMEOUT`, and a peer that stops answering ends it after
+    /// `MAX_UNANSWERED` requests without throttling the next ordinary search.
+    #[test]
+    fn a_split_pull_is_pinned_bounded_and_yields_only_when_its_peer_stalls() {
+        let mut t = RejoinTracker::new();
+        let sel = SyncPeerSelector::new();
+        let mut gate = SplitPullGate::new();
+        let now = Instant::now();
+        let split = [SplitCandidate {
+            id: "sib".into(),
+            head_height: 50,
+            head_hash: hx(9),
+        }];
+        let cands = [SyncCandidate {
+            id: "sib".into(),
+            head_height: 50,
+        }];
+        let (src, tr) = choose_source(
+            &mut t,
+            &sel,
+            &mut gate,
+            &cands,
+            &split,
+            (hx(1), 50),
+            |_| false,
+            now,
+        );
+        assert_eq!(src, Source::Split("sib".into()));
+        assert!(matches!(tr, Some(Transition::StartedSplitPull { top: 50 })));
+        assert!(matches!(t.mode(), Mode::Probe { height: 49, .. }));
+        // An equal-height answer (not behind) does not end the pull.
+        let a = t.anchor((hx(1), 50), |_| Some(hx(2)));
+        t.note_asked("sib", a);
+        assert_eq!(t.take_answer("sib", &[], &HashSet::new()), Some(49));
+        t.on_answer(Answer::Unconnected, false, 49);
+        assert!(
+            matches!(t.mode(), Mode::Probe { height: 48, .. }),
+            "{:?}",
+            t.mode()
+        );
+        // A peer now ahead does not take over the running pull on its
+        // advertised head alone.
+        let ahead = [
+            SyncCandidate {
+                id: "sib".into(),
+                head_height: 50,
+            },
+            SyncCandidate {
+                id: "aaa".into(),
+                head_height: 90,
+            },
+        ];
+        let (src, _) = choose_source(
+            &mut t,
+            &sel,
+            &mut gate,
+            &ahead,
+            &split,
+            (hx(1), 50),
+            |_| false,
+            now,
+        );
+        assert_eq!(src, Source::Pinned("sib".into()));
+        // P1-2: once the pinned peer has gone PIN_STALL_TIMEOUT without a
+        // consumed answer, the peer ahead takes the tick.
+        let (src, tr) = choose_source(
+            &mut t,
+            &sel,
+            &mut gate,
+            &ahead,
+            &split,
+            (hx(1), 50),
+            |_| false,
+            now + PIN_STALL_TIMEOUT,
+        );
+        assert_eq!(src, Source::Ahead("aaa".into()));
+        assert!(matches!(tr, Some(Transition::Finished { .. })), "{tr:?}");
+        let _ = t.start_split_pull("sib", 50);
+        // No answers: bounded, then over, with no rejoin cooldown owed.
+        let mut gave_up = false;
+        for _ in 0..=MAX_UNANSWERED {
+            let a = t.anchor((hx(1), 50), |_| Some(hx(2)));
+            if let Some(Transition::GaveUp { .. }) = t.note_asked("sib", a) {
+                gave_up = true;
+                break;
+            }
+        }
+        assert!(gave_up, "a silent split peer must end the pull");
+        assert_eq!(t.mode(), &Mode::Tip { strikes: 0 });
+        assert_eq!(
+            t.cooldown(),
+            0,
+            "a split pull's give-up must not throttle rejoin"
+        );
+        // Within the per-peer window the same peer is not pulled again.
+        let (src, _) = choose_source(
+            &mut t,
+            &sel,
+            &mut gate,
+            &cands,
+            &split,
+            (hx(1), 50),
+            |_| false,
+            now + std::time::Duration::from_secs(20),
+        );
+        assert_eq!(src, Source::Nobody);
+    }
+
+    /// P1-2: a pinned peer whose re-sends are skipped (its anchor is still
+    /// pending in the sync manager) gets no answer either: those rounds count
+    /// as unanswered, so a silent pin ends after `MAX_UNANSWERED` rounds.
+    #[test]
+    fn a_pinned_search_whose_resends_are_skipped_ends() {
+        let mut t = RejoinTracker::new();
+        let _ = t.start_split_pull("sib", 50);
+        let a = t.anchor((hx(1), 50), |_| Some(hx(2)));
+        t.note_asked("sib", a);
+        let mut ended = false;
+        for _ in 0..MAX_UNANSWERED {
+            if let Some(Transition::GaveUp { .. }) = t.note_unsent("sib") {
+                ended = true;
+                break;
+            }
+        }
+        assert!(ended, "a silent pin held the tick: {:?}", t.mode());
+        assert_eq!(t.search_peer(), None);
+    }
+
+    /// P1-2: a slow peer answering one request in seven keeps `unanswered`
+    /// below its limit forever. The search still ends within its request cap,
+    /// which is sized to the search's own log bound.
+    #[test]
+    fn a_slow_peer_cannot_hold_a_search_past_its_request_cap() {
+        let top = 86_000u64;
+        let bound = 2 * (64 - top.leading_zeros()) + MAX_UNANSWERED;
+        let mut t = RejoinTracker::new();
+        let _ = t.start_split_pull("slow", top);
+        let mut requests = 0u32;
+        while t.search_peer().is_some() && requests < 10_000 {
+            let a = t.anchor((hx(1), top), |_| Some(hx(2)));
+            t.note_asked("slow", a);
+            requests += 1;
+            if requests.is_multiple_of(7) && t.search_peer().is_some() {
+                if let Some(ah) = t.take_answer("slow", &[], &HashSet::new()) {
+                    t.on_answer(Answer::Unconnected, true, ah);
+                }
+            }
+        }
+        assert!(
+            requests <= bound,
+            "the search took {requests} requests (bound {bound})"
+        );
+    }
+
+    /// P1-2: a follow that admits one block per answer never runs dry. A split
+    /// follow stops at its height bound; any follow that only trickles ends.
+    #[test]
+    fn an_endless_follow_ends_within_its_bound() {
+        use crate::sync_peer::SPLIT_PULL_HEIGHT_BAND;
+        let depth = crate::canonical_apply::MAX_REORG_DEPTH;
+        for split in [true, false] {
+            let mut t = RejoinTracker::new();
+            let top = 500u64;
+            if split {
+                let _ = t.start_split_pull("drip", top);
+            } else {
+                t.note_sync_target(top + 10_000, top);
+                for _ in 0..PROBE_AFTER_STRIKES {
+                    let a = t.anchor((hx(1), top), |_| Some(hx(2)));
+                    t.note_asked("drip", a);
+                    let ah = t.take_answer("drip", &[], &HashSet::new()).expect("answer");
+                    t.on_answer(Answer::Unconnected, true, ah);
+                }
+            }
+            let mut cursor = top - 1;
+            let mut answers = 0u32;
+            while t.search_peer().is_some() && answers < 10_000 {
+                let a = t.anchor((hx(1), top), |_| Some(hx(2)));
+                t.note_asked("drip", a);
+                let ah = t
+                    .take_answer("drip", &[a.0], &[a.0].into_iter().collect())
+                    .expect("answer");
+                cursor += 1;
+                t.on_answer(
+                    Answer::Progress {
+                        highest: (hx(3), cursor),
+                    },
+                    true,
+                    ah,
+                );
+                answers += 1;
+            }
+            assert!(
+                t.search_peer().is_none(),
+                "split={split}: the follow never ended"
+            );
+            assert!(
+                cursor <= top + SPLIT_PULL_HEIGHT_BAND + depth,
+                "split={split}: followed to {cursor}"
+            );
+            assert!(
+                answers <= 2 * MAX_UNANSWERED,
+                "split={split}: {answers} trickling answers"
+            );
+        }
+    }
+
+    /// P3: the tick's split-pull check reads no storage under the selector
+    /// lock: held heads are looked up before it is taken.
+    #[test]
+    fn choose_source_reads_no_storage_under_the_selector_lock() {
+        let main = include_str!("main.rs");
+        assert!(
+            main.contains("|h| held_heads.contains(h)"),
+            "choose_source's `holds` must use heads looked up before the selector lock"
+        );
+    }
+
+    /// A pinned peer that disconnects ends the search; the tick falls back to
+    /// the selector at once.
+    #[test]
+    fn a_search_whose_peer_left_is_abandoned() {
+        let mut t = RejoinTracker::new();
+        let sel = SyncPeerSelector::new();
+        let mut gate = SplitPullGate::new();
+        let now = Instant::now();
+        let split = [SplitCandidate {
+            id: "sib".into(),
+            head_height: 50,
+            head_hash: hx(9),
+        }];
+        let (src, _) = choose_source(
+            &mut t,
+            &sel,
+            &mut gate,
+            &[SyncCandidate {
+                id: "sib".into(),
+                head_height: 50,
+            }],
+            &split,
+            (hx(1), 50),
+            |_| false,
+            now,
+        );
+        assert_eq!(src, Source::Split("sib".into()));
+        let other = [SyncCandidate {
+            id: "other".into(),
+            head_height: 60,
+        }];
+        let (src, tr) = choose_source(
+            &mut t,
+            &sel,
+            &mut gate,
+            &other,
+            &[],
+            (hx(1), 50),
+            |_| false,
+            now,
+        );
+        assert_eq!(src, Source::Ahead("other".into()));
+        assert!(matches!(tr, Some(Transition::Finished { .. })), "{tr:?}");
+        assert_eq!(t.mode(), &Mode::Tip { strikes: 0 });
+    }
+
+    /// An advertised head is self-reported and is raised by gossip before the
+    /// block is validated, so it is no evidence that its peer can carry us.
+    /// A search pinned to an honest leader that keeps answering stays pinned
+    /// while another peer advertises any height, however large, and serves
+    /// nothing.
+    #[test]
+    fn an_advertised_lead_alone_never_ends_a_pinned_search() {
+        for liar_head in [1_000_000_000u64, u64::MAX / 2, u64::MAX] {
+            let mut t = RejoinTracker::new();
+            let sel = SyncPeerSelector::new();
+            let mut gate = SplitPullGate::new();
+            let top = 500u64;
+            let fork = 450u64;
+            // Two unconnected tip answers from the leader start the search,
+            // pinned to it.
+            let mut tr = None;
+            for _ in 0..PROBE_AFTER_STRIKES {
+                t.note_asked("leader", (hx(1), top));
+                let ah = t
+                    .take_answer("leader", &[], &HashSet::new())
+                    .expect("answer");
+                tr = t.on_answer(Answer::Unconnected, true, ah);
+            }
+            assert_eq!(tr, Some(Transition::StartedProbe { top }));
+            let t0 = Instant::now();
+            let mut leader_head = 600u64;
+            let mut followed = false;
+            // Well past any stall bound, one tick per second.
+            for tick in 0..240u64 {
+                let now = t0 + Duration::from_secs(tick);
+                let cands = [
+                    SyncCandidate {
+                        id: "leader".into(),
+                        head_height: leader_head,
+                    },
+                    SyncCandidate {
+                        id: "liar".into(),
+                        head_height: liar_head,
+                    },
+                ];
+                let (src, tr) = choose_source(
+                    &mut t,
+                    &sel,
+                    &mut gate,
+                    &cands,
+                    &[],
+                    (hx(1), top),
+                    |_| true,
+                    now,
+                );
+                assert_eq!(
+                    src,
+                    Source::Pinned("leader".into()),
+                    "liar@{liar_head} tick {tick}: {tr:?} mode={:?}",
+                    t.mode()
+                );
+                assert!(
+                    !matches!(tr, Some(Transition::Finished { .. })),
+                    "liar@{liar_head} tick {tick}: {tr:?}"
+                );
+                // The leader answers this tick's request.
+                let a = t.anchor((hx(1), top), |_| Some(hx(2)));
+                t.note_asked("leader", a);
+                let ah = t
+                    .take_answer("leader", &[a.0], &[a.0].into_iter().collect())
+                    .expect("the leader answers");
+                let answer = match t.mode() {
+                    Mode::Follow { cursor } => Answer::Progress {
+                        highest: (hx(7), cursor.1 + FOLLOW_TRICKLE_ADVANCE),
+                    },
+                    _ => model(fork, 64, a.1),
+                };
+                if let Answer::Progress { highest } = answer {
+                    leader_head = leader_head.max(highest.1);
+                }
+                t.on_answer(answer, true, ah);
+                followed |= matches!(t.mode(), Mode::Follow { .. });
+                assert_eq!(
+                    t.search_peer(),
+                    Some("leader"),
+                    "liar@{liar_head} tick {tick}: the search ended: {:?}",
+                    t.mode()
+                );
+            }
+            assert!(
+                followed,
+                "liar@{liar_head}: the search never found the fork"
+            );
+        }
+    }
+
+    /// A fork-point probe admits nothing until it reaches the fork point, yet
+    /// each of its steps is an answer from the pinned peer to a hash-verified
+    /// anchor. A deep fork at the real 2 s tick, or one tick of answer
+    /// latency, runs a probe past `PIN_STALL_TIMEOUT`; an advertised lead must
+    /// not end it before it reaches the fork point.
+    #[test]
+    fn a_long_answering_probe_holds_its_pin_against_an_advertised_lead() {
+        // (top, fork, span, answer every n-th tick)
+        for (top, fork, span, every) in [
+            (1_000_000u64, 700_000u64, 0u64, 1u64),
+            (100_000, 99_000, 0, 2),
+            (100_000, 92_000, 64, 2),
+        ] {
+            let mut t = RejoinTracker::new();
+            let sel = SyncPeerSelector::new();
+            let mut gate = SplitPullGate::new();
+            for _ in 0..PROBE_AFTER_STRIKES {
+                t.note_asked("leader", (hx(1), top));
+                let ah = t
+                    .take_answer("leader", &[], &HashSet::new())
+                    .expect("answer");
+                t.on_answer(Answer::Unconnected, true, ah);
+            }
+            assert!(matches!(t.mode(), Mode::Probe { .. }));
+            let cands = [
+                SyncCandidate {
+                    id: "leader".into(),
+                    head_height: top + 100,
+                },
+                SyncCandidate {
+                    id: "liar".into(),
+                    head_height: u64::MAX,
+                },
+            ];
+            let t0 = Instant::now();
+            let tick_every = Duration::from_secs(2);
+            let mut elapsed = Duration::ZERO;
+            let mut tick = 0u64;
+            while matches!(t.mode(), Mode::Probe { .. }) {
+                assert!(tick < 1_000, "top={top}: the probe never ended");
+                let now = t0 + tick_every * tick as u32;
+                let (src, tr) = choose_source(
+                    &mut t,
+                    &sel,
+                    &mut gate,
+                    &cands,
+                    &[],
+                    (hx(1), top),
+                    |_| true,
+                    now,
+                );
+                assert_eq!(
+                    src,
+                    Source::Pinned("leader".into()),
+                    "top={top} fork={fork} span={span} every={every}: pin ended at {}s: \
+                     {tr:?} mode={:?}",
+                    (now - t0).as_secs(),
+                    t.mode()
+                );
+                if tick.is_multiple_of(every) {
+                    let a = t.anchor((hx(1), top), |_| Some(hx(2)));
+                    t.note_asked("leader", a);
+                    let ah = t
+                        .take_answer("leader", &[a.0], &[a.0].into_iter().collect())
+                        .expect("the leader answers");
+                    t.on_answer(model(fork, span, a.1), true, ah);
+                } else {
+                    // Its anchor is still pending: no re-send, no answer.
+                    t.note_unsent("leader");
+                }
+                elapsed = now - t0;
+                tick += 1;
+            }
+            assert!(
+                elapsed > PIN_STALL_TIMEOUT,
+                "top={top}: the probe ended at {}s, inside the timeout; the case tests nothing",
+                elapsed.as_secs()
+            );
+            assert!(
+                matches!(t.mode(), Mode::Follow { .. }),
+                "top={top} fork={fork}: the probe ended without the fork point: {:?}",
+                t.mode()
+            );
+        }
+    }
+
+    /// A tracker following `peer` from `top`: two unconnected tip answers
+    /// start the probe, and an answer admitting `top` ends it in Follow.
+    fn following(peer: &str, top: u64) -> RejoinTracker {
+        let mut t = RejoinTracker::new();
+        for _ in 0..PROBE_AFTER_STRIKES {
+            t.note_asked(peer, (hx(1), top));
+            let ah = t.take_answer(peer, &[], &HashSet::new()).expect("answer");
+            t.on_answer(Answer::Unconnected, true, ah);
+        }
+        let a = t.anchor((hx(1), top), |_| Some(hx(2)));
+        t.note_asked(peer, a);
+        let ah = t
+            .take_answer(peer, &[a.0], &[a.0].into_iter().collect())
+            .expect("answer");
+        t.on_answer(
+            Answer::Progress {
+                highest: (hx(7), top),
+            },
+            true,
+            ah,
+        );
+        assert!(matches!(t.mode(), Mode::Follow { .. }), "{:?}", t.mode());
+        t
+    }
+
+    /// One follow tick against `peer`: ask, and take an answer that admitted
+    /// blocks up to `highest`.
+    fn follow_answer(t: &mut RejoinTracker, peer: &str, highest: u64) {
+        let a = t.anchor((hx(1), 0), |_| Some(hx(2)));
+        t.note_asked(peer, a);
+        let ah = t
+            .take_answer(peer, &[a.0], &[a.0].into_iter().collect())
+            .expect("answer");
+        t.on_answer(
+            Answer::Progress {
+                highest: (hx(8), highest),
+            },
+            true,
+            ah,
+        );
+    }
+
+    /// A pinned follow peer that drips (seven answers that admit blocks
+    /// without moving the cursor, then one that moves it by
+    /// `FOLLOW_TRICKLE_ADVANCE`) averages about one block per answer and
+    /// never lets the node catch up. Whether it advertises its own low head
+    /// or the true one, the pin yields to the peer far ahead within a bounded
+    /// number of answers (DGX review of 017cdbe6, P2).
+    #[test]
+    fn a_dripping_follow_peer_cannot_hold_the_pin() {
+        let top = 500u64;
+        let honest = 1_000_000u64;
+        for true_head in [false, true] {
+            let mut t = following("drip", top);
+            let sel = SyncPeerSelector::new();
+            let mut gate = SplitPullGate::new();
+            let t0 = Instant::now();
+            let mut cursor = top;
+            let mut answers = 0u64;
+            let mut yielded = None;
+            for tick in 0..5_000u64 {
+                let now = t0 + Duration::from_secs(2 * tick);
+                let cands = [
+                    SyncCandidate {
+                        id: "drip".into(),
+                        head_height: if true_head { honest } else { cursor + 1 },
+                    },
+                    SyncCandidate {
+                        id: "honest".into(),
+                        head_height: honest,
+                    },
+                ];
+                let (src, _) = choose_source(
+                    &mut t,
+                    &sel,
+                    &mut gate,
+                    &cands,
+                    &[],
+                    (hx(1), top),
+                    |_| true,
+                    now,
+                );
+                if src != Source::Pinned("drip".into()) {
+                    yielded = Some((tick, src));
+                    break;
+                }
+                answers += 1;
+                let highest = if answers.is_multiple_of(8) {
+                    cursor += FOLLOW_TRICKLE_ADVANCE;
+                    cursor
+                } else {
+                    cursor.saturating_sub(1)
+                };
+                follow_answer(&mut t, "drip", highest);
+            }
+            let (tick, src) = yielded.unwrap_or_else(|| {
+                panic!("true_head={true_head}: the drip held the pin for 10000s, cursor {cursor}")
+            });
+            assert!(
+                answers <= 2 * u64::from(MAX_TRICKLE_ANSWERS),
+                "true_head={true_head}: the drip held the pin for {answers} answers \
+                 ({tick} ticks), then {src:?}"
+            );
+        }
+    }
+
+    /// In Follow, only an answer that moves the cursor by at least
+    /// `FOLLOW_TRICKLE_ADVANCE` keeps the pin live: slow answers that admit
+    /// blocks without moving it let a peer far ahead take the tick once
+    /// `PIN_STALL_TIMEOUT` passes, before the trickle window fills.
+    #[test]
+    fn a_follow_answer_below_the_trickle_advance_is_not_liveness() {
+        let top = 500u64;
+        let mut t = following("drip", top);
+        let sel = SyncPeerSelector::new();
+        let mut gate = SplitPullGate::new();
+        let t0 = Instant::now();
+        let cands = [
+            SyncCandidate {
+                id: "drip".into(),
+                head_height: top + 1,
+            },
+            SyncCandidate {
+                id: "honest".into(),
+                head_height: 1_000_000,
+            },
+        ];
+        // Seven answers below the advance, 13 s apart, leave the trickle
+        // window one short of full; the eighth tick is 91 s in.
+        let step = Duration::from_secs(13);
+        let drips = MAX_TRICKLE_ANSWERS - 1;
+        let mut src = Source::Nobody;
+        for tick in 0..=drips {
+            src = choose_source(
+                &mut t,
+                &sel,
+                &mut gate,
+                &cands,
+                &[],
+                (hx(1), top),
+                |_| true,
+                t0 + step * tick,
+            )
+            .0;
+            if src != Source::Pinned("drip".into()) {
+                break;
+            }
+            if tick < drips {
+                follow_answer(&mut t, "drip", top - 1);
+            }
+        }
+        assert!(step * drips > PIN_STALL_TIMEOUT);
+        assert_eq!(src, Source::Ahead("honest".into()), "mode={:?}", t.mode());
+    }
+
+    /// What happens after one tick's `choose_source` in [`drive_follow`].
+    #[derive(Clone, Copy)]
+    enum Step {
+        /// A request goes out.
+        Send,
+        /// The re-send is skipped: the anchor is still pending.
+        Unsent,
+        /// The outstanding request is answered with blocks that move the
+        /// cursor by this much.
+        Answer(u64),
+    }
+
+    /// Drive a follow pinned to "pin" at a 2 s tick, with an honest peer at
+    /// 1M; "pin" advertises 1M too when `true_head`, else just above its
+    /// cursor. `plan(tick)` is what happens after each tick's source is
+    /// chosen. Returns the tick and source at which the pin ended, if it did.
+    fn drive_follow(
+        true_head: bool,
+        ticks: u64,
+        plan: impl Fn(u64) -> Vec<Step>,
+    ) -> Option<(u64, Source)> {
+        let top = 500u64;
+        let honest = 1_000_000u64;
+        let mut t = following("pin", top);
+        let sel = SyncPeerSelector::new();
+        let mut gate = SplitPullGate::new();
+        let t0 = Instant::now();
+        let mut outstanding = None;
+        let cursor_of = |t: &RejoinTracker| match t.mode() {
+            Mode::Follow { cursor } => Some(cursor.1),
+            _ => None,
+        };
+        for tick in 0..ticks {
+            let cursor = cursor_of(&t).unwrap_or(top);
+            let cands = [
+                SyncCandidate {
+                    id: "pin".into(),
+                    head_height: if true_head { honest } else { cursor + 1 },
+                },
+                SyncCandidate {
+                    id: "honest".into(),
+                    head_height: honest,
+                },
+            ];
+            let now = t0 + Duration::from_secs(2 * tick);
+            let (src, _) = choose_source(
+                &mut t,
+                &sel,
+                &mut gate,
+                &cands,
+                &[],
+                (hx(1), top),
+                |_| true,
+                now,
+            );
+            if src != Source::Pinned("pin".into()) {
+                return Some((tick, src));
+            }
+            for step in plan(tick) {
+                let Some(cursor) = cursor_of(&t) else { break };
+                match step {
+                    Step::Send => {
+                        let a = t.anchor((hx(1), top), |_| Some(hx(2)));
+                        t.note_asked("pin", a);
+                        outstanding = Some(a.0);
+                    }
+                    Step::Unsent => {
+                        t.note_unsent("pin");
+                    }
+                    Step::Answer(advance) => {
+                        let a = outstanding.take().expect("an outstanding request");
+                        let ah = t
+                            .take_answer("pin", &[a], &[a].into_iter().collect())
+                            .expect("answer");
+                        t.on_answer(
+                            Answer::Progress {
+                                highest: (hx(8), cursor + advance),
+                            },
+                            true,
+                            ah,
+                        );
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// A pinned follow peer that serves `FOLLOW_TRICKLE_ADVANCE` blocks per
+    /// answer but answers only every 4th or 8th tick moves the node at about
+    /// chain rate and never closes the gap. The trickle window counts ticks
+    /// the peer kept a request waiting, so the pin yields to the peer far
+    /// ahead within a bounded time, whatever head the drip advertises, and
+    /// whether the waiting ticks re-send (skipped as pending) or are not sent
+    /// at all (the tick's pending gate) (re-review of 5a1f8a80, P2').
+    #[test]
+    fn a_slow_dripping_follow_peer_cannot_hold_the_pin() {
+        let bound = 3 * u64::from(MAX_TRICKLE_ANSWERS);
+        for every in [8u64, 4] {
+            for gate_skips in [false, true] {
+                for true_head in [false, true] {
+                    let plan = |tick: u64| match tick {
+                        0 => vec![Step::Send],
+                        _ if tick.is_multiple_of(every) => {
+                            vec![Step::Answer(FOLLOW_TRICKLE_ADVANCE), Step::Send]
+                        }
+                        _ if gate_skips => vec![],
+                        _ => vec![Step::Unsent],
+                    };
+                    let ended = drive_follow(true_head, 5_000, plan);
+                    let case =
+                        format!("every={every} gate_skips={gate_skips} true_head={true_head}");
+                    let (tick, src) =
+                        ended.unwrap_or_else(|| panic!("{case}: the drip held the pin for 10000s"));
+                    assert!(
+                        tick <= bound,
+                        "{case}: held the pin for {tick} ticks, then {src:?}"
+                    );
+                    assert_eq!(src, Source::Ahead("honest".into()), "{case}");
+                }
+            }
+        }
+    }
+
+    /// An honest peer serving a full answer (32 blocks) with one tick of
+    /// latency keeps its pin, however long the follow runs: whether the
+    /// request waits a tick (its re-send skipped as pending), is answered in
+    /// the tick it was sent, or the tick's own pending gate sends nothing on
+    /// the ticks between (which is no fault of the peer).
+    #[test]
+    fn an_honest_follow_with_one_tick_latency_keeps_its_pin() {
+        type Plan = fn(u64) -> Vec<Step>;
+        let plans: [(&str, Plan); 3] = [
+            ("waits a tick", |tick| match tick {
+                0 => vec![Step::Send],
+                _ if tick.is_multiple_of(2) => vec![Step::Answer(32), Step::Send],
+                _ => vec![Step::Unsent],
+            }),
+            ("answers every 2nd tick", |tick| {
+                if tick.is_multiple_of(2) {
+                    vec![Step::Send, Step::Answer(32)]
+                } else {
+                    vec![Step::Unsent]
+                }
+            }),
+            ("gate sends every 5th tick", |tick| {
+                if tick.is_multiple_of(5) {
+                    vec![Step::Send, Step::Answer(32)]
+                } else {
+                    vec![]
+                }
+            }),
+        ];
+        for (name, plan) in plans {
+            for true_head in [false, true] {
+                assert_eq!(
+                    drive_follow(true_head, 500, plan),
+                    None,
+                    "{name}, true_head={true_head}: an honest follow lost its pin"
+                );
+            }
+        }
+    }
+
+    /// The stall clock restarts on the first tick after a consumed answer
+    /// from the pinned peer (here, admitted blocks), and runs from the last
+    /// such tick.
+    #[test]
+    fn a_consumed_answer_restarts_the_pin_stall_clock() {
+        let mut t = RejoinTracker::new();
+        let sel = SyncPeerSelector::new();
+        let mut gate = SplitPullGate::new();
+        let t0 = Instant::now();
+        let _ = t.start_split_pull("sib", 50);
+        let cands = [
+            SyncCandidate {
+                id: "sib".into(),
+                head_height: 50,
+            },
+            SyncCandidate {
+                id: "aaa".into(),
+                head_height: 90,
+            },
+        ];
+        let tick = |t: &mut RejoinTracker, gate: &mut SplitPullGate, at: Duration| {
+            choose_source(t, &sel, gate, &cands, &[], (hx(1), 50), |_| false, t0 + at).0
+        };
+        assert_eq!(
+            tick(&mut t, &mut gate, Duration::ZERO),
+            Source::Pinned("sib".into())
+        );
+        let half = PIN_STALL_TIMEOUT / 2;
+        assert_eq!(tick(&mut t, &mut gate, half), Source::Pinned("sib".into()));
+        // The pinned peer serves a block that admission accepts.
+        let a = t.anchor((hx(1), 50), |_| Some(hx(2)));
+        t.note_asked("sib", a);
+        let ah = t
+            .take_answer("sib", &[a.0], &[a.0].into_iter().collect())
+            .expect("answer");
+        t.on_answer(
+            Answer::Progress {
+                highest: (hx(7), 52),
+            },
+            false,
+            ah,
+        );
+        // Past the timeout from the start: the progress restarted the clock.
+        let after = PIN_STALL_TIMEOUT + Duration::from_secs(1);
+        assert_eq!(tick(&mut t, &mut gate, after), Source::Pinned("sib".into()));
+        let almost = after + PIN_STALL_TIMEOUT - Duration::from_secs(1);
+        assert_eq!(
+            tick(&mut t, &mut gate, almost),
+            Source::Pinned("sib".into())
+        );
+        assert_eq!(
+            tick(&mut t, &mut gate, after + PIN_STALL_TIMEOUT),
+            Source::Ahead("aaa".into())
+        );
+    }
+
+    /// Strikes count unconnected answers from ONE peer. An answer from a peer
+    /// on our own branch (it holds our tip, nothing above) says nothing about
+    /// whether the striking peer extends us and must not reset them; the
+    /// search that starts is pinned to the striking peer.
+    #[test]
+    fn a_sibling_answer_does_not_reset_another_peers_strikes() {
+        let mut t = RejoinTracker::new();
+        let ask = |t: &mut RejoinTracker, peer: &str, empty: bool| {
+            t.note_asked(peer, (hx(1), 50));
+            let got: Vec<Hash> = if empty { vec![] } else { vec![hx(1)] };
+            let verified: HashSet<Hash> = got.iter().copied().collect();
+            t.take_answer(peer, &got, &verified).expect("answers")
+        };
+        let ah = ask(&mut t, "leader", true);
+        t.on_answer(Answer::Unconnected, true, ah);
+        let ah = ask(&mut t, "sibling", false);
+        t.on_answer(Answer::Known, true, ah);
+        let ah = ask(&mut t, "leader", true);
+        let tr = t.on_answer(Answer::Unconnected, true, ah);
+        assert_eq!(
+            tr,
+            Some(Transition::StartedProbe { top: 50 }),
+            "{:?}",
+            t.mode()
+        );
+        let sel = SyncPeerSelector::new();
+        let mut gate = SplitPullGate::new();
+        let (src, _) = choose_source(
+            &mut t,
+            &sel,
+            &mut gate,
+            &[
+                SyncCandidate {
+                    id: "leader".into(),
+                    head_height: 300,
+                },
+                SyncCandidate {
+                    id: "sibling".into(),
+                    head_height: 300,
+                },
+            ],
+            &[],
+            (hx(1), 50),
+            |_| true,
+            Instant::now(),
+        );
+        assert_eq!(src, Source::Pinned("leader".into()));
     }
 }

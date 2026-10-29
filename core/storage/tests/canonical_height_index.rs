@@ -98,6 +98,7 @@ impl Node {
                 &[],
                 Some((hash, height)),
                 &ReceiptIndexBatch::default(),
+                None,
             )
             .expect("commit");
     }
@@ -112,6 +113,7 @@ impl Node {
                 &[],
                 Some((hash, height)),
                 &ReceiptIndexBatch::default(),
+                &[],
             )
             .expect("reorg commit");
     }
