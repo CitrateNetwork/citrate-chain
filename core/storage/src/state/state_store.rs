@@ -356,6 +356,19 @@ impl StateStore {
         Self { db }
     }
 
+    /// Heights that hold an undo record.
+    pub fn reorg_undo_heights(&self) -> Result<Vec<u64>> {
+        Ok(Vec::new())
+    }
+
+    /// The undo record of the block applied at `height`, if one is kept.
+    pub fn get_reorg_undo(
+        &self,
+        _height: u64,
+    ) -> Result<Option<citrate_execution::executor::BlockUndo>> {
+        Ok(None)
+    }
+
     /// Store account state
     pub fn put_account(&self, address: &Address, account: &AccountState) -> Result<()> {
         let account_bytes = bincode::serialize(account)?;

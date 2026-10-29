@@ -12922,4 +12922,564 @@ pub(crate) mod tests {
             assert_eq!(canonical(&reopened, 3), Some(b3.header.block_hash));
         }
     }
+
+    // =====================================================================
+    // Restart-safe reorg window. A restarted node must switch branches by a
+    // bounded reorg (fork point at most MAX_REORG_DEPTH below its tip), from
+    // the undo records persisted with every applied block, and not by the
+    // from-genesis rebuild that a pruned node refuses.
+    // =====================================================================
+    mod restart_safe_reorg {
+        use super::*;
+
+        /// The genesis state of these scenarios: ALICE funded.
+        fn rsr_genesis() -> StateSnapshot {
+            let e = Executor::new(Arc::new(StateDB::new()));
+            e.set_balance(&Address(ALICE), U256::from(FUND));
+            e.state_snapshot()
+        }
+
+        /// A branch of `n` blocks from `start` (the state after `parent` at
+        /// `first - 1`): one ALICE→`to` transfer per block, sealed like the
+        /// producer. Returns the blocks and the state after each one.
+        async fn rsr_extend(
+            start: StateSnapshot,
+            parent: Hash,
+            first: u64,
+            n: u64,
+            vrf: [u8; 32],
+            to: [u8; 20],
+        ) -> (Vec<Block>, Vec<StateSnapshot>) {
+            let exec = Executor::new(Arc::new(StateDB::new()));
+            exec.state_restore(start);
+            let mut blocks = Vec::new();
+            let mut snaps = Vec::new();
+            let mut parent = parent;
+            for h in first..first + n {
+                let tx = v251_transfer(&exec, ALICE, to, 1_000);
+                let b = produce(&exec, parent, h, vrf, vec![tx]).await;
+                parent = b.header.block_hash;
+                blocks.push(b);
+                snaps.push(exec.state_snapshot());
+            }
+            (blocks, snaps)
+        }
+
+        /// The main chain `1..=n` from genesis (ALICE→BOB).
+        async fn rsr_main(n: u64) -> (Vec<Block>, Vec<StateSnapshot>) {
+            rsr_extend(rsr_genesis(), Hash::default(), 1, n, VRF_OUT, BOB).await
+        }
+
+        /// A branch forking from `main` after height `fork` (ALICE→`to`).
+        async fn rsr_fork(
+            main: &[Block],
+            snaps: &[StateSnapshot],
+            fork: u64,
+            n: u64,
+            vrf: [u8; 32],
+            to: [u8; 20],
+        ) -> Vec<Block> {
+            let i = usize::try_from(fork - 1).expect("index");
+            rsr_extend(
+                snaps[i].clone(),
+                main[i].header.block_hash,
+                fork + 1,
+                n,
+                vrf,
+                to,
+            )
+            .await
+            .0
+        }
+
+        /// A store-backed node with the genesis state persisted.
+        async fn rsr_node() -> (Arc<StorageManager>, tempfile::TempDir) {
+            let dir = tempfile::tempdir().expect("dir");
+            let storage = Arc::new(
+                StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
+            );
+            let exec = store_backed(&storage);
+            exec.state_restore(rsr_genesis());
+            exec.set_balance(&Address(ALICE), U256::from(FUND));
+            exec.persist_state_changes().await.expect("persist genesis");
+            (storage, dir)
+        }
+
+        /// Apply `blocks` in order on a running node over `storage`.
+        async fn rsr_apply(storage: &Arc<StorageManager>, exec: &Arc<Executor>, blocks: &[Block]) {
+            let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            for b in blocks {
+                persist(storage, b);
+                assert!(
+                    matches!(app.apply_received(b).await, ApplyOutcome::Applied { .. }),
+                    "fixture: block {} applies",
+                    b.header.height
+                );
+            }
+        }
+
+        /// The executor a restarted node runs: hydrated from the durable store
+        /// the way `start_node` does (every account and storage record, the
+        /// root height of the applied tip, dirty sets cleared).
+        pub(crate) fn rsr_hydrated(storage: &Arc<StorageManager>) -> Arc<Executor> {
+            let exec = store_backed(storage);
+            let sdb = exec.state_db();
+            for (addr, acct) in storage.state.get_all_accounts().expect("accounts") {
+                sdb.accounts.load_account(addr, acct);
+            }
+            let tip_height = storage
+                .blocks
+                .get_applied_tip()
+                .expect("tip")
+                .map(|t| t.1)
+                .unwrap_or(0);
+            let records = storage.state.get_all_storage().expect("storage");
+            let records = if citrate_execution::storage_root_hardening::active_at(
+                citrate_execution::storage_root_hardening::storage_root_hardening_height(),
+                tip_height.saturating_add(1),
+            ) {
+                records
+            } else {
+                citrate_storage::state::legacy_hydration_view(records)
+            };
+            for ((addr, key), val) in records {
+                sdb.set_storage(addr, key.into_vec(), val.into_vec());
+            }
+            let _ = sdb.take_dirty_storage();
+            sdb.set_root_height(tip_height);
+            let _ = sdb.calculate_state_root();
+            sdb.accounts.clear_dirty();
+            exec
+        }
+
+        /// The lowest durable applied height seen while it runs (a from-genesis
+        /// rebuild resets the durable tip to genesis inside one drain).
+        struct LowestTip {
+            stop: Arc<AtomicBool>,
+            lowest: Arc<AtomicU64>,
+            handle: Option<std::thread::JoinHandle<()>>,
+        }
+
+        impl LowestTip {
+            fn start(storage: Arc<StorageManager>) -> Self {
+                let stop = Arc::new(AtomicBool::new(false));
+                let lowest = Arc::new(AtomicU64::new(u64::MAX));
+                let (s, l) = (stop.clone(), lowest.clone());
+                let handle = std::thread::spawn(move || {
+                    while !s.load(Ordering::SeqCst) {
+                        if let Ok(Some((_, h))) = storage.blocks.get_applied_tip() {
+                            l.fetch_min(h, Ordering::SeqCst);
+                        }
+                    }
+                });
+                Self {
+                    stop,
+                    lowest,
+                    handle: Some(handle),
+                }
+            }
+
+            fn finish(mut self) -> u64 {
+                self.stop.store(true, Ordering::SeqCst);
+                if let Some(h) = self.handle.take() {
+                    h.join().expect("watch thread");
+                }
+                self.lowest.load(Ordering::SeqCst)
+            }
+        }
+
+        /// The root a node reaches by applying `blocks` from genesis with no
+        /// restart and no reorg, read back from its durable store.
+        async fn rsr_fresh_root(blocks: &[Block]) -> Hash {
+            let (storage, _dir) = rsr_node().await;
+            let exec = rsr_hydrated(&storage);
+            rsr_apply(&storage, &exec, blocks).await;
+            let restarted = rsr_hydrated(&storage);
+            let root = restarted.calculate_state_root();
+            assert_eq!(
+                root,
+                exec.calculate_state_root(),
+                "fixture: fresh node durable"
+            );
+            root
+        }
+
+        /// Heights of the reorg ring a node holds right now.
+        async fn ring_heights(app: &CanonicalApplicator) -> Vec<u64> {
+            app.lock.lock().await.snapshots.keys().copied().collect()
+        }
+
+        /// A restarted node: 150 blocks applied, then stopped. A heavier branch
+        /// forking 40 below its tip arrives. The node switches by a bounded
+        /// reorg: the durable tip never goes below the fork point (no rebuild
+        /// from genesis), and the state equals a fresh node's on the winner.
+        #[tokio::test]
+        async fn restarted_node_reorgs_40_below_its_tip_without_a_rebuild() {
+            let (main, snaps) = rsr_main(150).await;
+            let fork = 110u64;
+            let side = rsr_fork(&main, &snaps, fork, 45, [0x5B; 32], CAROL).await;
+            let head = side.last().expect("side").clone();
+
+            let (storage, _dir) = rsr_node().await;
+            let exec = rsr_hydrated(&storage);
+            rsr_apply(&storage, &exec, &main).await;
+            drop(exec);
+
+            // Restart.
+            let exec = rsr_hydrated(&storage);
+            let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            assert_eq!(app.applied_tip().await.height, 150, "fixture: restart tip");
+            app.set_genesis(rsr_genesis(), Hash::default());
+            app.fork_choice = Some(fork_choice_returning(head.header.block_hash));
+            let tip = main.last().expect("main").header.block_hash;
+            app.fork_weight = Some(weights(&[(head.header.block_hash, 1_000), (tip, 150)]));
+            for b in &side {
+                persist(&storage, b);
+            }
+            let watch = LowestTip::start(storage.clone());
+            app.drive_drain().await;
+            let lowest = watch.finish();
+
+            assert_eq!(
+                app.applied_tip().await,
+                AppliedTip {
+                    hash: head.header.block_hash,
+                    height: head.header.height
+                },
+                "the restarted node switches to the heavier branch"
+            );
+            assert!(
+                lowest >= fork,
+                "the switch went below the fork point {fork} (lowest durable tip {lowest}): \
+                 a rebuild from genesis, not a bounded reorg"
+            );
+            let winner: Vec<Block> = main[..fork as usize]
+                .iter()
+                .chain(side.iter())
+                .cloned()
+                .collect();
+            let fresh = rsr_fresh_root(&winner).await;
+            assert_eq!(exec.calculate_state_root(), head.state_root);
+            assert_eq!(exec.calculate_state_root(), fresh, "memory == a fresh node");
+            assert_eq!(
+                rsr_hydrated(&storage).calculate_state_root(),
+                fresh,
+                "durable state == a fresh node"
+            );
+        }
+
+        /// A fork more than MAX_REORG_DEPTH below the restart tip is still beyond
+        /// the window: `reorg_to` reports it as before and changes nothing.
+        #[tokio::test]
+        async fn restarted_node_still_refuses_a_fork_deeper_than_the_window() {
+            let (main, snaps) = rsr_main(150).await;
+            let fork = 150 - MAX_REORG_DEPTH - 5;
+            let side = rsr_fork(&main, &snaps, fork, 120, [0x5B; 32], CAROL).await;
+            let head = side.last().expect("side").clone();
+            let (storage, _dir) = rsr_node().await;
+            let exec = rsr_hydrated(&storage);
+            rsr_apply(&storage, &exec, &main).await;
+            drop(exec);
+
+            let exec = rsr_hydrated(&storage);
+            let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            for b in &side {
+                persist(&storage, b);
+            }
+            let before = exec.calculate_state_root();
+            let out = {
+                let mut state = app.lock.lock().await;
+                app.reorg_to(&mut state, head.header.block_hash).await
+            };
+            assert!(
+                matches!(out, ReorgOutcome::BeyondReorgWindow { stopped_at, .. } if stopped_at <= 150 - MAX_REORG_DEPTH),
+                "a fork {} below the tip is beyond the window: {out:?}",
+                150 - fork
+            );
+            assert_eq!(app.applied_tip().await.height, 150);
+            assert_eq!(exec.calculate_state_root(), before, "state untouched");
+            assert_eq!(
+                storage.blocks.get_applied_tip().expect("tip").map(|t| t.1),
+                Some(150)
+            );
+        }
+
+        /// The store keeps undo records for exactly the last MAX_REORG_DEPTH
+        /// applied heights, through linear growth and through a reorg.
+        #[tokio::test]
+        async fn undo_records_cover_exactly_the_last_window() {
+            let (main, snaps) = rsr_main(150).await;
+            let (storage, _dir) = rsr_node().await;
+            let exec = rsr_hydrated(&storage);
+            let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            for b in &main {
+                persist(&storage, b);
+                app.apply_received(b).await;
+            }
+            assert_eq!(
+                storage.state.reorg_undo_heights().expect("heights"),
+                (151 - MAX_REORG_DEPTH..=150).collect::<Vec<u64>>(),
+                "linear: the last {MAX_REORG_DEPTH} heights"
+            );
+            // A reorg 30 below the tip onto a longer branch (to 160).
+            let side = rsr_fork(&main, &snaps, 120, 40, [0x5B; 32], CAROL).await;
+            let head = side.last().expect("side").clone();
+            for b in &side {
+                persist(&storage, b);
+            }
+            app.fork_choice = Some(fork_choice_returning(head.header.block_hash));
+            app.drive_drain().await;
+            assert_eq!(app.applied_tip().await.height, 160, "fixture: reorged");
+            assert_eq!(
+                storage.state.reorg_undo_heights().expect("heights"),
+                (161 - MAX_REORG_DEPTH..=160).collect::<Vec<u64>>(),
+                "after a reorg: the last {MAX_REORG_DEPTH} heights of the new chain"
+            );
+            for h in 121..=160u64 {
+                let rec = storage
+                    .state
+                    .get_reorg_undo(h)
+                    .expect("read")
+                    .expect("record");
+                assert_eq!(
+                    rec.hash,
+                    side[usize::try_from(h - 121).expect("i")].header.block_hash,
+                    "the record at {h} names the new chain's block"
+                );
+            }
+            let sizes: Vec<usize> = (61..=160u64)
+                .map(|h| {
+                    let rec = storage.state.get_reorg_undo(h).expect("read").expect("rec");
+                    bincode::serialize(&rec).expect("encode").len()
+                })
+                .collect();
+            println!(
+                "RSR undo bytes per one-transfer block: min {} max {} total window {}",
+                sizes.iter().min().expect("sizes"),
+                sizes.iter().max().expect("sizes"),
+                sizes.iter().sum::<usize>()
+            );
+        }
+
+        /// A restart seeds the reorg ring with every verified height of the
+        /// window, each snapshot reproducing its block's state root.
+        #[tokio::test]
+        async fn restart_seeds_the_full_window_from_the_undo_records() {
+            let (main, _) = rsr_main(130).await;
+            let (storage, _dir) = rsr_node().await;
+            let exec = rsr_hydrated(&storage);
+            rsr_apply(&storage, &exec, &main).await;
+            drop(exec);
+            let exec = rsr_hydrated(&storage);
+            let app = CanonicalApplicator::new(exec, storage.clone());
+            assert_eq!(
+                ring_heights(&app).await,
+                (130 - MAX_REORG_DEPTH..=130).collect::<Vec<u64>>(),
+                "the restart rebuilds the whole reorg window"
+            );
+            let state = app.lock.lock().await;
+            for (h, (hash, snap)) in &state.snapshots {
+                let b = &main[usize::try_from(h - 1).expect("i")];
+                assert_eq!(*hash, b.header.block_hash, "ring block at {h}");
+                let scratch = StateDB::new();
+                scratch.restore(snap.clone());
+                assert_eq!(
+                    scratch.calculate_state_root(),
+                    b.state_root,
+                    "ring root at {h}"
+                );
+            }
+        }
+
+        // -- crash consistency --------------------------------------------
+
+        const RSR_DIR: &str = "RSR_CHILD_DIR";
+        const RSR_ABORT_AT: &str = "RSR_ABORT_AT";
+        const RSR_MAIN: u64 = 12;
+        const RSR_FORK: u64 = 8;
+        const RSR_SIDE: u64 = 6;
+
+        async fn rsr_crash_blocks() -> (Vec<Block>, Vec<Block>, Vec<Block>) {
+            let (main, snaps) = rsr_main(RSR_MAIN).await;
+            let side = rsr_fork(&main, &snaps, RSR_FORK, RSR_SIDE, [0x5B; 32], CAROL).await;
+            // A third branch, forking low in the window, for the post-crash reorg.
+            let third = rsr_fork(&main, &snaps, 5, 16, [0x6C; 32], DAVE).await;
+            (main, side, third)
+        }
+
+        /// CHILD body: genesis, 12 linear blocks, then a reorg 4 below the tip
+        /// onto a heavier branch; every state write goes through the abort
+        /// store (kill -9 before its k-th write).
+        #[tokio::test]
+        async fn rsr_crash_child() {
+            let Ok(dir) = std::env::var(RSR_DIR) else {
+                return;
+            };
+            let abort_at: u64 = std::env::var(RSR_ABORT_AT)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(u64::MAX);
+            let storage = Arc::new(
+                StorageManager::new(std::path::Path::new(&dir), PruningConfig::default())
+                    .expect("storage"),
+            );
+            let store = Arc::new(V251AbortStore {
+                inner: storage.state.clone(),
+                writes: AtomicU64::new(0),
+                abort_at,
+                fail_receipt_index: AtomicBool::new(false),
+                fail_reorg_batch_at: AtomicU64::new(0),
+                reorg_batches: AtomicU64::new(0),
+            });
+            let exec = Arc::new(Executor::with_storage(
+                Arc::new(StateDB::new()),
+                Some(store.clone()),
+            ));
+            exec.set_balance(&Address(ALICE), U256::from(FUND));
+            exec.persist_state_changes().await.expect("persist genesis");
+            let (main, side, _) = rsr_crash_blocks().await;
+            let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            for b in &main {
+                persist(&storage, b);
+                app.apply_received(b).await;
+            }
+            for b in &side {
+                persist(&storage, b);
+            }
+            let head = side.last().expect("side");
+            app.fork_choice = Some(fork_choice_returning(head.header.block_hash));
+            app.drive_drain().await;
+            assert_eq!(app.applied_tip().await.hash, head.header.block_hash);
+            println!("RSR_TOTAL_WRITES={}", store.writes.load(Ordering::SeqCst));
+        }
+
+        /// Reopen a crashed store like `start_node` and check: the hydrated state
+        /// reproduces the durable tip's root; the restart seeds a ring with every
+        /// height of the durable chain (the window survives the crash); every
+        /// seeded snapshot reproduces its block's root; and the node then
+        /// switches to a heavier branch forking at height 5 by a bounded reorg.
+        async fn rsr_check_crashed(
+            dir: &std::path::Path,
+            main: &[Block],
+            side: &[Block],
+            third: &[Block],
+        ) -> Result<String, String> {
+            let storage =
+                Arc::new(StorageManager::new(dir, PruningConfig::default()).expect("reopen"));
+            let Some((tip_hash, tip_height)) = storage.blocks.get_applied_tip().expect("tip")
+            else {
+                return Ok("no block applied yet".into());
+            };
+            let all: Vec<&Block> = main.iter().chain(side).chain(third).collect();
+            let tip_block = all
+                .iter()
+                .find(|b| b.header.block_hash == tip_hash)
+                .ok_or("tip names an unknown block")?;
+            let exec = rsr_hydrated(&storage);
+            if exec.calculate_state_root() != tip_block.state_root {
+                return Err(format!("torn: hydrated root != tip {tip_height} root"));
+            }
+            let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            let ring = ring_heights(&app).await;
+            if ring != (1..=tip_height).collect::<Vec<u64>>() {
+                return Err(format!("window lost: ring {ring:?} at tip {tip_height}"));
+            }
+            {
+                let state = app.lock.lock().await;
+                for (h, (hash, snap)) in &state.snapshots {
+                    let b = all
+                        .iter()
+                        .find(|b| b.header.block_hash == *hash)
+                        .ok_or(format!("ring {h} names an unknown block"))?;
+                    let scratch = StateDB::new();
+                    scratch.restore(snap.clone());
+                    if scratch.calculate_state_root() != b.state_root {
+                        return Err(format!("ring snapshot at {h} has a wrong root"));
+                    }
+                }
+            }
+            // A restarted node hears every block again from its peers.
+            for b in all.iter() {
+                persist(&storage, b);
+            }
+            let head = third.last().expect("third");
+            app.fork_choice = Some(fork_choice_returning(head.header.block_hash));
+            let watch = LowestTip::start(storage.clone());
+            app.drive_drain().await;
+            let lowest = watch.finish();
+            if app.applied_tip().await.hash != head.header.block_hash {
+                return Err(format!(
+                    "did not reorg to the third branch (tip {tip_height})"
+                ));
+            }
+            if lowest < tip_height.min(5) {
+                return Err(format!("went below the fork point: lowest {lowest}"));
+            }
+            if rsr_hydrated(&storage).calculate_state_root() != head.state_root {
+                return Err("durable state after the reorg has a wrong root".into());
+            }
+            Ok(format!("tip {tip_height}, ring 1..={tip_height}"))
+        }
+
+        /// kill -9 before every state write of 12 blocks plus a reorg: the
+        /// restarted node always keeps the whole window, never a wrong
+        /// snapshot, and reorgs from it.
+        #[tokio::test]
+        async fn crash_at_every_write_keeps_the_reorg_window() {
+            if std::env::var(RSR_DIR).is_ok() {
+                return;
+            }
+            let test = "canonical_apply::tests::restart_safe_reorg::rsr_crash_child";
+            let (main, side, third) = rsr_crash_blocks().await;
+            let dry = tempfile::tempdir().expect("dir");
+            let out = v251_spawn(test, &[(RSR_DIR, dry.path().to_string_lossy().into())])
+                .wait_with_output()
+                .expect("dry");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let total: u64 = stdout
+                .lines()
+                .find_map(|l| {
+                    l.split("RSR_TOTAL_WRITES=")
+                        .nth(1)
+                        .and_then(|v| v.trim().parse().ok())
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "dry run failed: {stdout}\n{}",
+                        String::from_utf8_lossy(&out.stderr)
+                    )
+                });
+            let mut bad = Vec::new();
+            match rsr_check_crashed(dry.path(), &main, &side, &third).await {
+                Ok(d) => println!("RSR dry run: {total} writes; {d}"),
+                Err(e) => bad.push(format!("dry: {e}")),
+            }
+            for k in 1..=total {
+                let dir = tempfile::tempdir().expect("dir");
+                let out = v251_spawn(
+                    test,
+                    &[
+                        (RSR_DIR, dir.path().to_string_lossy().into()),
+                        (RSR_ABORT_AT, k.to_string()),
+                    ],
+                )
+                .wait_with_output()
+                .expect("child");
+                let err = String::from_utf8_lossy(&out.stderr);
+                let what = err
+                    .lines()
+                    .find(|l| l.contains("V251 ABORT"))
+                    .unwrap_or("?")
+                    .to_string();
+                match rsr_check_crashed(dir.path(), &main, &side, &third).await {
+                    Ok(d) => println!("RSR abort k={k} [{what}] -> {d}"),
+                    Err(e) => bad.push(format!("k={k} [{what}] {e}")),
+                }
+            }
+            assert!(
+                bad.is_empty(),
+                "crash points that lose or corrupt the window: {bad:#?}"
+            );
+        }
+    }
 }

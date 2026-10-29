@@ -432,6 +432,26 @@ pub struct StateStorageChange {
     pub value: Option<Vec<u8>>,
 }
 
+/// The undo record of one applied block: the value every account and storage
+/// slot the block wrote held BEFORE the block (`None`: the key was absent).
+/// Applying the pre-images to the state after `height` gives the state after
+/// `parent`. Local metadata only: kept for the last reorg window so a restarted
+/// node can revert a few blocks without replaying from genesis. It is never
+/// hashed, gossiped or read by execution, so it cannot move a state root.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BlockUndo {
+    /// Height of the block this record undoes.
+    pub height: u64,
+    /// Hash of the block this record undoes.
+    pub hash: Hash,
+    /// The applied block the record reverts to, when known.
+    pub parent: Option<(Hash, u64)>,
+    /// Account pre-images.
+    pub accounts: Vec<(Address, Option<crate::types::AccountState>)>,
+    /// Storage pre-images: `(address, slot key, value)`.
+    pub storage: Vec<(Address, Vec<u8>, Option<Vec<u8>>)>,
+}
+
 /// C1-R: the RPC receipt index (NOT consensus data) committed in the SAME write
 /// batch as a block's state + applied-tip pointer, so a node that applies a block
 /// it did not produce can serve `eth_getTransactionReceipt` / `eth_getLogs` for it,

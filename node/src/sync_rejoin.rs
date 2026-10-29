@@ -1407,6 +1407,21 @@ mod tests {
     /// `dag_prune::MIN_RETAIN_BLOCKS` when `prune`, restarted. Returns the
     /// restarted node and its storage dir.
     async fn restarted_node(net: &Net, own: &[Block], prune: bool) -> (Node, tempfile::TempDir) {
+        restarted_node_retaining(
+            net,
+            own,
+            prune.then_some(crate::dag_prune::MIN_RETAIN_BLOCKS),
+        )
+        .await
+    }
+
+    /// [`restarted_node`] with the DAG store pruned to the last `retain`
+    /// blocks (any window, below the node's configured minimum too).
+    async fn restarted_node_retaining(
+        net: &Net,
+        own: &[Block],
+        retain: Option<u64>,
+    ) -> (Node, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage =
             Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
@@ -1424,14 +1439,15 @@ mod tests {
             assert_eq!(fx.newly_admitted, own.len(), "own blocks admit");
             n.app.drive_drain().await;
             assert_eq!(n.applied(), Some((h(tip), tip_height)), "fixture: applied");
-            if prune {
-                let dropped = crate::dag_prune::prune_once(
-                    &storage,
-                    &dag,
-                    tip_height,
-                    crate::dag_prune::MIN_RETAIN_BLOCKS,
-                )
-                .await;
+            if let Some(retain) = retain {
+                let point = tip_height - retain;
+                let at = storage
+                    .blocks
+                    .get_canonical_block_by_height(point)
+                    .expect("canonical read")
+                    .expect("canonical block at the pruning point");
+                dag.update_pruning_point(at).await.expect("pruning point");
+                let dropped = dag.prune().await.expect("prune");
                 assert!(dropped > 0, "fixture: the DAG store was pruned");
             }
             n.executor.state_snapshot()
@@ -1577,11 +1593,10 @@ mod tests {
 
     /// The same restart, but the node's last block (its own, sealed before it
     /// stopped) never reached the network: the restart tip is one block off
-    /// the heavier chain, and the fork point is below the only state snapshot
-    /// a restart keeps. Reaching the heavier chain from there takes a replay
-    /// from genesis, which on a pruned node is refused: the durable applied
-    /// tip never goes below the fork point (it stays on its own tip, as before
-    /// the fork-point search existed; an operator resync moves it).
+    /// the heavier chain. The restart keeps the reorg window (the undo records
+    /// persisted with every applied block), so the node reverts that one block
+    /// and follows the heavier chain; the durable applied tip never goes below
+    /// the fork point (no replay from genesis, which a pruned node refuses).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pruned_restart_one_block_off_never_rewinds_below_the_fork_point() {
         let fork = 1_199u64;
@@ -1616,10 +1631,12 @@ mod tests {
         );
         assert_eq!(
             n.applied(),
-            Some((h(&net.side[0]), fork + 1)),
-            "the node keeps its own tip: anchors {:?}",
+            Some((h(main_tip), network_tip)),
+            "the node reorgs onto the heavier chain from its persisted reorg window: \
+             anchors {:?}",
             run.anchors
         );
+        assert_eq!(n.executor.calculate_state_root(), main_tip.state_root);
     }
 
     /// A restarted node on the canonical chain hears of a sibling of its tip
@@ -1792,14 +1809,15 @@ mod tests {
         assert_eq!(n.executor.calculate_state_root(), main_tip.state_root);
     }
 
-    /// Control: an unpruned node restarted one block off a genuinely heavier
-    /// chain still rebuilds onto it (the from-genesis rebuild is kept for a
-    /// strictly heavier head).
+    /// Control: an unpruned node restarted on a side branch deeper than the
+    /// reorg window, off a genuinely heavier chain, still rebuilds onto it
+    /// (the from-genesis rebuild is kept for a strictly heavier head).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn unpruned_restart_one_block_off_still_rebuilds_onto_the_heavier_chain() {
+    async fn unpruned_restart_deeper_than_the_window_still_rebuilds_onto_the_heavier_chain() {
         let fork = 1_199u64;
-        let network_tip = fork + 90;
-        let net = net(fork, fork + 1, network_tip);
+        let side_tip = fork + crate::canonical_apply::MAX_REORG_DEPTH + 5;
+        let network_tip = side_tip + 90;
+        let net = net(fork, side_tip, network_tip);
         let pdir = tempfile::tempdir().expect("tempdir");
         let peer = peer_store(&net, false, pdir.path());
         let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
@@ -1877,6 +1895,63 @@ mod tests {
         let lowest = watch.finish();
         assert!(lowest > fork, "rebuilt on a pruned node: {lowest}");
         assert_eq!(n.applied(), Some((h(&net.side[0]), fork + 1)));
+    }
+
+    /// A restarted node whose DAG store is pruned to a small window (50
+    /// blocks at height 500) sits on its own branch, 40 blocks off a heavier
+    /// chain. It switches by a bounded reorg from its persisted reorg window:
+    /// the durable tip never goes below the fork point, and it ends on the
+    /// heavier chain's state. (Before, the switch needed a replay from
+    /// genesis, which a pruned node refuses: the node held its tip forever.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pruned_restart_40_off_reorgs_within_the_window() {
+        let fork = 460u64;
+        let net = net(fork, 500, 530);
+        let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
+        let (n, _ndir) = restarted_node_retaining(&net, &own, Some(50)).await;
+        let fx = n
+            .admission
+            .admit_to_fixpoint(net.main.clone(), |_, _| {})
+            .await;
+        assert_eq!(fx.newly_admitted, net.main.len(), "fixture: main admits");
+        let main_tip = net.main.last().expect("main");
+        let watch = TipWatch::start(n.storage.clone());
+        n.app.drive_drain().await;
+        let lowest = watch.finish();
+        assert!(
+            lowest >= fork,
+            "the durable tip went below the fork point {fork}: {lowest}"
+        );
+        assert_eq!(
+            n.applied(),
+            Some((h(main_tip), 530)),
+            "the pruned node switches to the heavier chain"
+        );
+        assert_eq!(n.executor.calculate_state_root(), main_tip.state_root);
+    }
+
+    /// The same pruned node (150 retained) with its fork point deeper than the
+    /// reorg window (105 below its tip): still refused, as before. The node keeps its tip
+    /// and its state; an operator resync moves it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pruned_restart_deeper_than_the_window_still_refuses() {
+        let fork = 395u64;
+        let net = net(fork, 500, 530);
+        let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
+        let (n, _ndir) = restarted_node_retaining(&net, &own, Some(150)).await;
+        let fx = n
+            .admission
+            .admit_to_fixpoint(net.main.clone(), |_, _| {})
+            .await;
+        assert_eq!(fx.newly_admitted, net.main.len(), "fixture: main admits");
+        let own_tip = net.side.last().expect("side");
+        let root = n.executor.calculate_state_root();
+        let watch = TipWatch::start(n.storage.clone());
+        n.app.drive_drain().await;
+        let lowest = watch.finish();
+        assert_eq!(lowest, 500, "the durable tip never moved");
+        assert_eq!(n.applied(), Some((h(own_tip), 500)));
+        assert_eq!(n.executor.calculate_state_root(), root);
     }
 
     /// The node's applicator is built with the DAG prune floor wired, on the

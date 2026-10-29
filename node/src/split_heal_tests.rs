@@ -124,6 +124,10 @@ pub(crate) struct Scenario {
     /// Every producer must be sealing again (a block in the last
     /// [`PRODUCING_WINDOW`] slots).
     pub require_producing: bool,
+    /// At every restart, the stopped node's DAG store is pruned to its last
+    /// this many blocks (as `dag_prune` does on a node running with a retain
+    /// window), so the restarted node runs with a prune floor.
+    pub prune_retain: Option<u64>,
 }
 
 /// See [`Scenario::require_producing`].
@@ -135,6 +139,7 @@ const SLOT: std::time::Duration = std::time::Duration::from_secs(2);
 struct Node {
     name: String,
     storage: Arc<StorageManager>,
+    dag: Arc<DagStore>,
     executor: Arc<Executor>,
     app: Arc<CanonicalApplicator>,
     adm: Arc<BlockAdmission>,
@@ -175,6 +180,8 @@ pub(crate) struct Fleet {
     down: HashSet<usize>,
     /// Producers that seal nothing.
     quiet: HashSet<usize>,
+    /// See [`Scenario::prune_retain`].
+    prune_retain: Option<u64>,
     genesis: Block,
     /// Simulated time, in slots, from `epoch`.
     epoch: std::time::Instant,
@@ -273,6 +280,7 @@ impl Node {
         );
         dag.set_configured_genesis(genesis.header.block_hash);
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+        let dag_handle = dag.clone();
         let app = Arc::new(
             CanonicalApplicator::new(executor.clone(), storage.clone())
                 .with_fork_choice(ghostdag.clone())
@@ -327,6 +335,7 @@ impl Node {
         Self {
             name: format!("p{i}"),
             storage,
+            dag: dag_handle,
             executor,
             app,
             adm,
@@ -391,6 +400,7 @@ impl Fleet {
             links: vec![vec![false; n]; n],
             down: HashSet::new(),
             quiet: HashSet::new(),
+            prune_retain: None,
             genesis,
             epoch,
             slot_no: 0,
@@ -446,6 +456,22 @@ impl Fleet {
         self.pump().await;
         let n = self.nodes.len();
         let old = self.nodes.remove(i);
+        if let Some(retain) = self.prune_retain {
+            let tip = old.applied().1;
+            if let Some(point) = tip.checked_sub(retain).filter(|p| *p > 0) {
+                let at = old
+                    .storage
+                    .blocks
+                    .get_canonical_block_by_height(point)
+                    .expect("canonical read")
+                    .expect("canonical block at the pruning point");
+                old.dag
+                    .update_pruning_point(at)
+                    .await
+                    .expect("pruning point");
+                old.dag.prune().await.expect("prune");
+            }
+        }
         let boot = old.executor.state_snapshot();
         let Node { storage, dir, .. } = old;
         let node = Node::start(
@@ -1017,6 +1043,7 @@ pub(crate) struct Outcome {
 pub(crate) async fn run(s: Scenario) -> Outcome {
     let n = s.producers;
     let mut fleet = Fleet::new(n).await;
+    fleet.prune_retain = s.prune_retain;
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     for _ in 0..s.warmup {
         let o = rng.order(n);
@@ -1243,6 +1270,7 @@ mod tests {
             heal_rounds: 40,
             require_merged: true,
             require_producing: true,
+            prune_retain: None,
         }
     }
 
@@ -1330,6 +1358,33 @@ mod tests {
                 restart_all: true,
                 solo: Some((4, 250)),
                 require_merged: false,
+                ..base(7)
+            },
+        )
+        .await;
+    }
+
+    /// DGX devnet C2/D1/D2: the 4v3 restart scenario on producers that run
+    /// with a DAG prune window (a small one here). The four restart forked
+    /// below their tip on a pruned DAG store, where a replay from genesis is
+    /// refused; they must switch by a bounded reorg, rejoin and seal again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn four_three_partition_with_restarts_past_prune_retention_heals() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::four_three_partition_with_restarts_past_prune_retention_heals",
+            );
+        }
+        assert_heals(
+            "4v3 + restarts + lone producer, pruned DAG stores",
+            Scenario {
+                warmup: ACT + 30,
+                groups: vec![vec![0, 1, 2, 3], vec![4, 5, 6]],
+                partition: 9,
+                restart_all: true,
+                solo: Some((4, 60)),
+                require_merged: false,
+                prune_retain: Some(60),
                 ..base(7)
             },
         )
