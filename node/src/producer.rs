@@ -7287,7 +7287,7 @@ mod tests {
         use super::*;
         use crate::admission::{AdmitOutcome, BlockAdmission};
         use crate::canonical_apply::CanonicalApplicator;
-        use crate::sync_recovery::ParentWalk;
+        use crate::sync_recovery::{ParentWalks, Step, WalkAnswer};
         use citrate_execution::StateDB;
 
         pub(super) struct N {
@@ -7297,7 +7297,13 @@ mod tests {
             pub producer: BlockProducer,
             pub orphans: Vec<Block>,
             pub attested: AttestedNetworkHead,
-            pub walk: ParentWalk,
+            pub walk: ParentWalks,
+            /// This node's peer id, as the others see it.
+            pub id: String,
+            /// The walk's clock (advanced by the tests).
+            pub clock: std::time::Instant,
+            /// Every request the walk sent, as `(peer, parent height)`.
+            pub asked: Vec<(String, u64)>,
             pub initial_sync: Arc<AtomicBool>,
             _dir: TempDir,
         }
@@ -7383,7 +7389,10 @@ mod tests {
                 producer,
                 orphans: Vec::new(),
                 attested,
-                walk: ParentWalk::new(),
+                walk: ParentWalks::new(std::time::Instant::now()),
+                id: format!("node-{i}"),
+                clock: std::time::Instant::now(),
+                asked: Vec::new(),
                 initial_sync,
                 _dir: dir,
             }
@@ -7418,16 +7427,24 @@ mod tests {
                 AdmitOutcome::Deferred { missing_parent } => {
                     n.attested.observe_deferred(b);
                     if let Some(server) = server {
+                        let applied_now = applied(n).1;
                         if crate::sync_peer::should_attempt_ancestry_recovery(
                             b.header.height,
-                            applied(n).1,
+                            applied_now,
                         ) {
-                            let resp = crate::block_serve::serve_blocks(
-                                &server.storage,
-                                &missing_parent,
-                                32,
+                            let step = n.walk.begin(
+                                &server.id,
+                                missing_parent,
+                                b.header.height.saturating_sub(1),
+                                applied_now,
+                                n.clock,
                             );
-                            on_blocks(n, server, resp).await;
+                            if let Step::Ask { parent, height } = step {
+                                n.asked.push((server.id.clone(), height));
+                                let resp =
+                                    crate::block_serve::serve_blocks(&server.storage, &parent, 32);
+                                on_blocks(n, server, resp).await;
+                            }
                         }
                     }
                     "deferred"
@@ -7436,10 +7453,11 @@ mod tests {
             }
         }
 
-        /// One `Blocks` answer through main.rs's receive arm (the shared fixpoint,
-        /// the bounded orphan buffer, then the parent walk). Returns the newly
-        /// admitted count and the walk's follow-up request.
-        async fn admit_answer(n: &mut N, blocks: Vec<Block>) -> (usize, Option<(Hash, u64)>) {
+        /// One `Blocks` answer from `from` through main.rs's receive arm (the
+        /// shared fixpoint, the bounded orphan buffer, then the parent walk and
+        /// the stuck-parent fetch). Returns the newly admitted count and the
+        /// follow-up requests to `from`.
+        async fn admit_answer(n: &mut N, from: &str, blocks: Vec<Block>) -> (usize, Vec<Hash>) {
             let answer: std::collections::HashSet<Hash> =
                 blocks.iter().map(|b| b.header.block_hash).collect();
             let mut pending = blocks;
@@ -7461,25 +7479,63 @@ mod tests {
                 .iter()
                 .filter(|b| answer.contains(&b.header.block_hash))
                 .collect();
-            let lowest = crate::sync_recovery::lowest_deferred(&n.storage, &from_answer);
+            let lowest =
+                crate::sync_recovery::lowest_deferred(&n.storage, &from_answer, &fixpoint.deferred);
+            let roots = if reprocess {
+                crate::sync_recovery::deferred_roots(&n.storage, &fixpoint.deferred)
+            } else {
+                Vec::new()
+            };
             if reprocess {
                 n.orphans = crate::admission::bound_orphan_buffer(fixpoint.deferred);
             }
             n.app.drive_drain().await;
-            let walk = n.walk.next(lowest, !n.orphans.is_empty());
-            (fixpoint.newly_admitted, walk)
+            let applied_now = applied(n).1;
+            let now = n.clock;
+            let mut asks = Vec::new();
+            let step = n.walk.next(
+                from,
+                WalkAnswer {
+                    lowest_deferred: lowest,
+                    admitted: fixpoint.newly_admitted,
+                    orphans_remaining: !n.orphans.is_empty(),
+                    applied: applied_now,
+                },
+                now,
+            );
+            if let Step::Ask { parent, height } = step {
+                n.asked.push((from.to_string(), height));
+                asks.push(parent);
+            }
+            n.walk.note_stuck(&roots, from, now);
+            let storage = n.storage.clone();
+            let (refetch, _) = n.walk.refetch_stuck(
+                |p| storage.blocks.has_block(p).unwrap_or(false),
+                applied_now,
+                now,
+            );
+            for r in refetch {
+                if r.peer == from {
+                    n.asked.push((r.peer.clone(), r.height));
+                    asks.push(r.parent);
+                } else {
+                    // Only `from` is reachable in this harness.
+                    n.walk.unsent(&r.peer);
+                }
+            }
+            (fixpoint.newly_admitted, asks)
         }
 
         /// A `Blocks` answer plus every missing-parent request it triggers, each
         /// served by the same peer (main.rs sends them to the answering peer).
         pub(super) async fn on_blocks(n: &mut N, server: &N, blocks: Vec<Block>) -> usize {
             let mut total = 0usize;
-            let mut next = Some(blocks);
-            while let Some(bs) = next.take() {
-                let (newly, walk) = admit_answer(n, bs).await;
+            let mut queue = std::collections::VecDeque::from([blocks]);
+            while let Some(bs) = queue.pop_front() {
+                let (newly, asks) = admit_answer(n, &server.id, bs).await;
                 total += newly;
-                if let Some((parent, _)) = walk {
-                    next = Some(crate::block_serve::serve_blocks(
+                for parent in asks {
+                    queue.push_back(crate::block_serve::serve_blocks(
                         &server.storage,
                         &parent,
                         32,
@@ -7869,6 +7925,177 @@ mod tests {
                 sync_from_tip(&mut b, &a).await;
             }
             assert_eq!(applied(&b), applied(&a));
+        }
+
+        /// `len` blocks signed by node `i` (from `tmpl`), heights `1..=len`, the
+        /// first on a parent nobody holds: a branch no walk can connect.
+        fn unconnected_chain(tmpl: &Block, i: u8, len: u64) -> Vec<Block> {
+            let mut parent = Hash::new([0xEE; 32]);
+            let mut out = Vec::new();
+            for k in 1..=len {
+                let mut x = tmpl.clone();
+                x.header.height = k;
+                x.header.selected_parent_hash = parent;
+                x.header.merge_parent_hashes.clear();
+                x.header.timestamp = chrono::Utc::now().timestamp().max(0) as u64;
+                let x = resign(x, i);
+                parent = x.header.block_hash;
+                out.push(x);
+            }
+            out
+        }
+
+        /// Blocks of `branch` that `n` has not fully admitted.
+        async fn not_admitted(n: &N, branch: &[Block]) -> Vec<u64> {
+            let mut out = Vec::new();
+            for blk in branch {
+                if !n.adm.is_fully_admitted(&blk.header.block_hash).await {
+                    out.push(blk.header.height);
+                }
+            }
+            out
+        }
+
+        fn asks_to(n: &N, peer: &N) -> usize {
+            n.asked.iter().filter(|(p, _)| *p == peer.id).count()
+        }
+
+        /// (a) + (c): equal-height branches, as on r1006. After an earlier burst
+        /// against another peer spent more than the old shared 64-step budget
+        /// (and left orphans that never resolve), a 20-block foreign branch
+        /// whose parents are missing is still walked back to the fork and every
+        /// block of it is admitted through BlockAdmission.
+        #[tokio::test(flavor = "current_thread")]
+        async fn foreign_branch_20_deep_is_fully_stored_after_another_peers_burst() {
+            let a = node(1, false).await;
+            let mut b = node(7, false).await;
+            for _ in 0..39 {
+                let blk = produce(&a).await;
+                assert_eq!(gossip(&mut b, None, &blk).await, "admitted");
+            }
+            // Each side seals 20 on its own: equal-height branches.
+            let mut branch = Vec::new();
+            for _ in 0..20 {
+                branch.push(produce(&a).await);
+            }
+            for _ in 0..20 {
+                produce(&b).await;
+            }
+            assert_eq!(applied(&b).1, 59);
+            // Peer X serves a 70-block branch nobody can connect.
+            let tmpl = produce(&node(9, false).await).await;
+            let x = node(9, false).await;
+            let fake = unconnected_chain(&tmpl, 9, 70);
+            for blk in &fake {
+                x.storage.blocks.put_block(blk).expect("put");
+            }
+            let top = fake.last().expect("top").clone();
+            on_blocks(&mut b, &x, vec![top]).await;
+            assert!(
+                asks_to(&b, &x) >= 64,
+                "precondition: the burst against X took at least 64 steps ({})",
+                asks_to(&b, &x)
+            );
+            assert!(!b.orphans.is_empty(), "X's orphans stay buffered");
+            // The foreign tip arrives by gossip; its parents are missing.
+            let tip = branch.last().expect("tip").clone();
+            assert_eq!(gossip(&mut b, Some(&a), &tip).await, "deferred");
+            assert_eq!(
+                not_admitted(&b, &branch).await,
+                Vec::<u64>::new(),
+                "every block of the foreign branch is admitted"
+            );
+            assert!(
+                b.orphans.iter().all(|o| !branch
+                    .iter()
+                    .any(|f| f.header.block_hash == o.header.block_hash)),
+                "no block of the foreign branch is left in the orphan buffer"
+            );
+        }
+
+        /// DGX's numbers (r1006 4v3 partition, restarted mid-partition): the fork
+        /// point is 82 below the restart tip, inside MAX_REORG_DEPTH. The old walk
+        /// spent its 64 steps and stopped short; the walk must reach the fork, and
+        /// the heavier branch is then applied.
+        #[tokio::test(flavor = "current_thread")]
+        async fn fork_82_deep_below_the_restart_tip_is_recovered() {
+            let a = node(1, false).await;
+            let mut b = node(7, false).await;
+            for _ in 0..39 {
+                let blk = produce(&a).await;
+                assert_eq!(gossip(&mut b, None, &blk).await, "admitted");
+            }
+            let mut branch = Vec::new();
+            for _ in 0..83 {
+                branch.push(produce(&a).await);
+            }
+            for _ in 0..82 {
+                produce(&b).await;
+            }
+            assert_eq!(applied(&b).1, 39 + 82, "the restart tip");
+            let tip = branch.last().expect("tip").clone();
+            assert_eq!(gossip(&mut b, Some(&a), &tip).await, "deferred");
+            assert_eq!(
+                not_admitted(&b, &branch).await,
+                Vec::<u64>::new(),
+                "the walk reached the fork 82 below the tip"
+            );
+            assert!(asks_to(&b, &a) <= crate::sync_recovery::MAX_PARENT_WALK_STEPS as usize);
+            assert_eq!(applied(&b), applied(&a), "the heavier branch is applied");
+        }
+
+        /// A walk that stopped short (this peer's budget spent by an earlier
+        /// burst) descends again while the orphan buffer is still non-empty,
+        /// from the bottom of what it holds, as budget comes back: no restart,
+        /// no operator action.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_walk_that_stopped_short_resumes_while_orphans_remain() {
+            let a = node(1, false).await;
+            let mut b = node(7, false).await;
+            for _ in 0..39 {
+                let blk = produce(&a).await;
+                assert_eq!(gossip(&mut b, None, &blk).await, "admitted");
+            }
+            let mut branch = Vec::new();
+            for _ in 0..30 {
+                branch.push(produce(&a).await);
+            }
+            for _ in 0..30 {
+                produce(&b).await;
+            }
+            // Peer `a` (same id) first serves a branch nobody can connect, which
+            // spends nearly all of its walk budget.
+            let a_fake = node(1, false).await;
+            let fake = unconnected_chain(&branch[0], 1, 125);
+            for blk in &fake {
+                a_fake.storage.blocks.put_block(blk).expect("put");
+            }
+            on_blocks(&mut b, &a_fake, vec![fake.last().expect("top").clone()]).await;
+            let tip = branch.last().expect("tip").clone();
+            assert_eq!(gossip(&mut b, Some(&a), &tip).await, "deferred");
+            assert!(
+                !not_admitted(&b, &branch).await.is_empty(),
+                "precondition: the walk stopped short of the fork"
+            );
+            // Time passes (less than the idle reset each round) and `a` keeps
+            // sealing; each new tip's deferral resumes the walk.
+            let mut rounds = 0;
+            while !not_admitted(&b, &branch).await.is_empty() && rounds < 6 {
+                rounds += 1;
+                b.clock += Duration::from_secs(20);
+                let blk = produce(&a).await;
+                branch.push(blk.clone());
+                gossip(&mut b, Some(&a), &blk).await;
+            }
+            assert_eq!(
+                not_admitted(&b, &branch).await,
+                Vec::<u64>::new(),
+                "the walk resumed and reached the fork ({rounds} rounds)"
+            );
+            assert!(
+                !b.orphans.is_empty(),
+                "the unconnectable orphans are still buffered"
+            );
         }
     }
 }
