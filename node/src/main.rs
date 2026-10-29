@@ -3049,6 +3049,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             let mut rotate_idx: u64 = 0;
             // #155: last peer we logged choosing, so SYNCPEER only fires on change.
             let mut last_logged_choice: Option<String> = None;
+            // Split healing: rate limits on pulls from same-height peers whose
+            // tip we do not hold (sync_peer.rs, sync_rejoin.rs).
+            let mut split_gate = sync_peer::SplitPullGate::new();
             // #310: Skip — a slow sync round must not be followed by a burst
             // of back-to-back block requests to peers.
             let mut interval = timing::cadence_interval(std::time::Duration::from_secs(2));
@@ -3066,6 +3069,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 )> = Vec::new();
                 let mut best_h: u64 = 0;
                 let mut best_hash = citrate_consensus::types::Hash::new([0u8; 32]);
+                let mut split_candidates: Vec<sync_peer::SplitCandidate> = Vec::new();
                 for p in pm_for_sync.get_all_peers() {
                     let info = p.info.read().await;
                     if info.state != citrate_network::peer::PeerState::Connected {
@@ -3075,6 +3079,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         best_h = info.head_height;
                         best_hash = info.head_hash;
                     }
+                    split_candidates.push(sync_peer::SplitCandidate {
+                        id: info.id.0.clone(),
+                        head_height: info.head_height,
+                        head_hash: info.head_hash,
+                    });
                     connected_peers.push((
                         sync_peer::SyncCandidate {
                             id: info.id.0.clone(),
@@ -3143,10 +3152,40 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 // ever vetoing the last one that could actually serve us.
                 let candidates: Vec<sync_peer::SyncCandidate> =
                     connected_peers.iter().map(|(c, _)| c.clone()).collect();
+                //
+                // sync_rejoin.rs `choose_source`: a running fork-point search
+                // stays on the peer it started against; with no peer ahead, a
+                // peer at or near our height whose tip we do not hold is pulled
+                // (split healing), bounded by `split_gate`. Fetching only:
+                // whether the applied tip moves stays with canonical_apply.
                 let chosen_id = {
                     let sel = sync_peers_for_loop.lock().await;
-                    sel.select(&candidates, applied_height)
-                        .map(|c| c.id.clone())
+                    let applied_tip_now = storage_for_sync
+                        .blocks
+                        .get_applied_tip()
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| (citrate_consensus::types::Hash::new([0u8; 32]), 0));
+                    let (source, transition) = sync_rejoin::choose_source(
+                        &mut rejoin_for_loop.lock(),
+                        &sel,
+                        &mut split_gate,
+                        &candidates,
+                        &split_candidates,
+                        applied_tip_now,
+                        // A read error counts as held: no pull on a guess.
+                        |h| storage_for_sync.blocks.has_block(h).unwrap_or(true),
+                        std::time::Instant::now(),
+                    );
+                    if let Some(t) = transition {
+                        tracing::info!(
+                            "SYNCREJOIN {:?} (source={:?} applied={})",
+                            t,
+                            source,
+                            applied_tip_now.1
+                        );
+                    }
+                    source.peer().map(str::to_string)
                 };
                 // #155: log WHICH PEER WE ARE PULLING FROM — but only when it
                 // CHANGES.
