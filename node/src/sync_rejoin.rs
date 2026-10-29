@@ -91,7 +91,7 @@
     )
 )]
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use citrate_consensus::types::Hash;
@@ -120,9 +120,13 @@ pub const MAX_UNANSWERED: u32 = 8;
 /// trickles: a quarter of one 32-block answer (`sync_peer::MATERIAL_FRACTION`).
 pub const FOLLOW_TRICKLE_ADVANCE: u64 = 8;
 
-/// Trickling follow answers in a row before the follow ends. A peer that keeps
-/// delivering one admissible block per answer can otherwise hold the tick for
-/// as long as it has blocks (DGX review of 49465b5e, P1-2).
+/// The trickle window, in follow answers: a follow ends once its last this
+/// many answers moved the cursor by less than [`FOLLOW_TRICKLE_ADVANCE`] each
+/// on average. A peer that keeps delivering one admissible block per answer
+/// can otherwise hold the tick for as long as it has blocks (DGX review of
+/// 49465b5e, P1-2). It is a rolling window, not a counter that one larger
+/// answer resets, so mixing trickles with an occasional larger answer does
+/// not hold it either (DGX review of 017cdbe6, P2).
 pub const MAX_TRICKLE_ANSWERS: u32 = MAX_UNANSWERED;
 
 /// Requests one fork-point search (the probe) may send before it gives up:
@@ -263,8 +267,9 @@ pub struct RejoinTracker {
     requests: u32,
     /// [`search_request_cap`] of the running probe's top.
     request_cap: u32,
-    /// Trickling follow answers in a row ([`FOLLOW_TRICKLE_ADVANCE`]).
-    trickles: u32,
+    /// How far each of the running follow's last [`MAX_TRICKLE_ANSWERS`]
+    /// answers moved the cursor, oldest first.
+    follow_advances: VecDeque<u64>,
     /// When the running search's peer last gave a consumed answer (or the
     /// search was first seen by [`choose_source`]); see [`PIN_STALL_TIMEOUT`].
     pin_live_at: Option<Instant>,
@@ -294,7 +299,7 @@ impl RejoinTracker {
             split_top: 0,
             requests: 0,
             request_cap: 0,
-            trickles: 0,
+            follow_advances: VecDeque::new(),
             pin_live_at: None,
             pin_answered: false,
         }
@@ -304,7 +309,7 @@ impl RejoinTracker {
     fn start_search(&mut self, top: u64) {
         self.requests = 0;
         self.request_cap = search_request_cap(top);
-        self.trickles = 0;
+        self.follow_advances.clear();
         self.clear_pin_clock();
     }
 
@@ -554,7 +559,6 @@ impl RejoinTracker {
             }
             (Mode::Probe { .. }, Answer::Progress { highest })
             | (Mode::Follow { .. }, Answer::Progress { highest }) => {
-                self.note_pin_answer(&from);
                 let previous = match &self.mode {
                     Mode::Follow { cursor } => Some(cursor.1),
                     _ => None,
@@ -573,14 +577,19 @@ impl RejoinTracker {
                 if self.split && cursor.1 > split_limit {
                     return self.give_up(cursor.1);
                 }
-                if let Some(prev) = previous {
-                    if cursor.1.saturating_sub(prev) < FOLLOW_TRICKLE_ADVANCE {
-                        self.trickles = self.trickles.saturating_add(1);
-                        if self.trickles >= MAX_TRICKLE_ANSWERS {
+                match previous {
+                    // The probe found the fork point: a consumed probe answer.
+                    None => self.note_pin_answer(&from),
+                    Some(prev) => {
+                        let advance = cursor.1.saturating_sub(prev);
+                        // In Follow only a material advance is liveness for
+                        // the pin stall clock (DGX review of 017cdbe6, P2).
+                        if advance >= FOLLOW_TRICKLE_ADVANCE {
+                            self.note_pin_answer(&from);
+                        }
+                        if self.follow_trickles(advance) {
                             return self.give_up(cursor.1);
                         }
-                    } else {
-                        self.trickles = 0;
                     }
                 }
                 // The search found the fork point: no backoff owed.
@@ -643,6 +652,23 @@ impl RejoinTracker {
                 None
             }
         }
+    }
+
+    /// Record one follow answer's cursor advance; whether the last
+    /// [`MAX_TRICKLE_ANSWERS`] answers averaged less than
+    /// [`FOLLOW_TRICKLE_ADVANCE`].
+    fn follow_trickles(&mut self, advance: u64) -> bool {
+        let window = MAX_TRICKLE_ANSWERS as usize;
+        if self.follow_advances.len() >= window {
+            self.follow_advances.pop_front();
+        }
+        self.follow_advances.push_back(advance);
+        let total = self
+            .follow_advances
+            .iter()
+            .fold(0u64, |a, b| a.saturating_add(*b));
+        self.follow_advances.len() >= window
+            && total < FOLLOW_TRICKLE_ADVANCE.saturating_mul(u64::from(MAX_TRICKLE_ANSWERS))
     }
 
     /// The pinned peer's answer was consumed by the search: it is live.
