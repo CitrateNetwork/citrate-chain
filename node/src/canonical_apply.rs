@@ -9799,8 +9799,13 @@ pub(crate) mod tests {
         reorg_batches: AtomicU64,
     }
 
+    /// Env: abort the process right AFTER write `k` commits (`V251_ABORT_AFTER=k`),
+    /// for the batch writes: a kill between a commit and whatever the caller
+    /// does next.
+    const V251_ABORT_AFTER: &str = "V251_ABORT_AFTER";
+
     impl V251AbortStore {
-        fn w(&self, what: &str) {
+        fn w(&self, what: &str) -> u64 {
             let n = self.writes.fetch_add(1, Ordering::SeqCst) + 1;
             if std::env::var("V251_TRACE").is_ok() {
                 eprintln!("V251 write#{n} {what}");
@@ -9809,6 +9814,19 @@ pub(crate) mod tests {
                 eprintln!("V251 ABORT before write#{n} {what}");
                 std::process::abort();
             }
+            n
+        }
+
+        /// After write `n` committed: abort if it is the `V251_ABORT_AFTER` one.
+        fn after(&self, n: u64, what: &str, result: anyhow::Result<()>) -> anyhow::Result<()> {
+            let at = std::env::var(V251_ABORT_AFTER)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok());
+            if result.is_ok() && at == Some(n) {
+                eprintln!("V251 ABORT after write#{n} {what}");
+                std::process::abort();
+            }
+            result
         }
     }
 
@@ -9857,8 +9875,9 @@ pub(crate) mod tests {
             t: Option<(Hash, u64)>,
             i: &citrate_execution::executor::ReceiptIndexBatch,
         ) -> anyhow::Result<()> {
-            self.w("write_state_batch_with_applied_tip");
-            V251Trait::write_state_batch_with_applied_tip(&*self.inner, a, s, t, i)
+            let n = self.w("write_state_batch_with_applied_tip");
+            let r = V251Trait::write_state_batch_with_applied_tip(&*self.inner, a, s, t, i);
+            self.after(n, "write_state_batch_with_applied_tip", r)
         }
         // V251_REORG_OVERRIDE_BEGIN
         fn write_reorg_batch_sync(
@@ -9871,12 +9890,13 @@ pub(crate) mod tests {
             i: &citrate_execution::executor::ReceiptIndexBatch,
             u: &[citrate_execution::executor::BlockUndo],
         ) -> anyhow::Result<()> {
-            self.w("write_reorg_batch_sync");
+            let k = self.w("write_reorg_batch_sync");
             let n = self.reorg_batches.fetch_add(1, Ordering::SeqCst) + 1;
             if n == self.fail_reorg_batch_at.load(Ordering::SeqCst) {
                 anyhow::bail!("injected storage failure (write_reorg_batch_sync #{n})");
             }
-            V251Trait::write_reorg_batch_sync(&*self.inner, a, s, d, c, t, i, u)
+            let r = V251Trait::write_reorg_batch_sync(&*self.inner, a, s, d, c, t, i, u);
+            self.after(k, "write_reorg_batch_sync", r)
         }
         // V251_REORG_OVERRIDE_END
         fn put_applied_tip_meta(&self, h: &Hash, n: u64) -> anyhow::Result<()> {
@@ -13764,6 +13784,92 @@ pub(crate) mod tests {
             );
         }
 
+        /// An UNPRUNED node whose in-place reorg toward a strictly heavier head is
+        /// rejected for a reason other than finality (here the winning branch's
+        /// store commit fails once) falls back to the from-genesis rebuild and
+        /// converges, as it did before the window was rebuilt from undo records.
+        /// A rejection must never leave it on its tip for good.
+        #[tokio::test]
+        async fn unpruned_node_heals_by_rebuild_when_the_in_place_reorg_is_rejected() {
+            if std::env::var(RSR_DIR).is_ok() || std::env::var(V251_DIR).is_ok() {
+                return;
+            }
+            let (main, snaps) = rsr_main(30).await;
+            let fork = 25u64;
+            let side = rsr_fork(&main, &snaps, fork, 10, [0x5B; 32], CAROL).await;
+            let head = side.last().expect("side").clone();
+
+            let dir = tempfile::tempdir().expect("dir");
+            let storage = Arc::new(
+                StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
+            );
+            let store = Arc::new(V251AbortStore {
+                inner: storage.state.clone(),
+                writes: AtomicU64::new(0),
+                abort_at: u64::MAX,
+                fail_receipt_index: AtomicBool::new(false),
+                fail_reorg_batch_at: AtomicU64::new(0),
+                reorg_batches: AtomicU64::new(0),
+            });
+            let exec = Arc::new(Executor::with_storage(
+                Arc::new(StateDB::new()),
+                Some(store.clone()),
+            ));
+            exec.state_restore(rsr_genesis());
+            exec.set_balance(&Address(ALICE), U256::from(FUND));
+            exec.persist_state_changes().await.expect("persist genesis");
+            let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            for b in &main {
+                persist(&storage, b);
+                assert!(matches!(
+                    app.apply_received(b).await,
+                    ApplyOutcome::Applied { .. }
+                ));
+            }
+            for b in &side {
+                persist(&storage, b);
+            }
+            let tip = main.last().expect("main").header.block_hash;
+            app.fork_choice = Some(fork_choice_returning(head.header.block_hash));
+            app.fork_weight = Some(weights(&[(head.header.block_hash, 1_000), (tip, 30)]));
+            assert!(
+                app.lock.lock().await.snapshots.contains_key(&fork),
+                "fixture: the fork point is inside the ring"
+            );
+
+            // Reorg batch 1 reverts to the fork point; batch 2 (the winner's
+            // commit) fails once, so the in-place reorg is rejected.
+            store.fail_reorg_batch_at.store(
+                store.reorg_batches.load(Ordering::SeqCst) + 2,
+                Ordering::SeqCst,
+            );
+            let healed = app
+                .recover_automatic(rsr_genesis(), Hash::default(), head.header.block_hash)
+                .await
+                .expect("recovery");
+            assert!(
+                store.reorg_batches.load(Ordering::SeqCst) >= 2,
+                "fixture: the in-place reorg was attempted"
+            );
+            assert!(
+                healed,
+                "an unpruned node falls back to the rebuild when the in-place reorg is rejected"
+            );
+            assert_eq!(
+                app.applied_tip().await,
+                AppliedTip {
+                    hash: head.header.block_hash,
+                    height: head.header.height
+                }
+            );
+            assert_eq!(exec.calculate_state_root(), head.state_root);
+            assert_eq!(
+                rsr_hydrated(&storage).calculate_state_root(),
+                head.state_root,
+                "durable state on the heavier branch"
+            );
+        }
+
         // -- crash consistency --------------------------------------------
 
         const RSR_DIR: &str = "RSR_CHILD_DIR";
@@ -13999,6 +14105,77 @@ pub(crate) mod tests {
             assert!(
                 bad.is_empty(),
                 "crash points that lose or corrupt the window: {bad:#?}"
+            );
+        }
+
+        /// kill -9 right AFTER every state commit (the fsync'd linear batch or
+        /// a reorg batch) and before anything the caller writes next: the
+        /// restarted node still keeps the whole window. A block's undo record is
+        /// complete when its batch commits; nothing written after the commit is
+        /// needed to revert it.
+        #[tokio::test]
+        async fn crash_right_after_every_commit_keeps_the_reorg_window() {
+            if std::env::var(RSR_DIR).is_ok() {
+                return;
+            }
+            let test = "canonical_apply::tests::restart_safe_reorg::rsr_crash_child";
+            let (main, side, third) = rsr_crash_blocks().await;
+            let dry = tempfile::tempdir().expect("dir");
+            let out = v251_spawn(
+                test,
+                &[
+                    (RSR_DIR, dry.path().to_string_lossy().into()),
+                    ("V251_TRACE", "1".into()),
+                ],
+            )
+            .wait_with_output()
+            .expect("dry");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let commits: Vec<(u64, String)> = stderr
+                .lines()
+                .filter_map(|l| {
+                    let rest = l.strip_prefix("V251 write#")?;
+                    let (n, what) = rest.split_once(' ')?;
+                    let what = what.trim();
+                    (what == "write_state_batch_with_applied_tip"
+                        || what == "write_reorg_batch_sync")
+                        .then(|| Some((n.parse().ok()?, what.to_string())))
+                        .flatten()
+                })
+                .collect();
+            assert!(
+                commits
+                    .iter()
+                    .filter(|(_, w)| w == "write_state_batch_with_applied_tip")
+                    .count()
+                    >= usize::try_from(RSR_MAIN).expect("n"),
+                "fixture: every linear block commits through the store: {commits:?}\n{stderr}"
+            );
+            let mut bad = Vec::new();
+            for (k, what) in &commits {
+                let dir = tempfile::tempdir().expect("dir");
+                let out = v251_spawn(
+                    test,
+                    &[
+                        (RSR_DIR, dir.path().to_string_lossy().into()),
+                        (V251_ABORT_AFTER, k.to_string()),
+                    ],
+                )
+                .wait_with_output()
+                .expect("child");
+                let err = String::from_utf8_lossy(&out.stderr);
+                if !err.contains("V251 ABORT after") {
+                    bad.push(format!("k={k} [{what}]: the child did not abort"));
+                    continue;
+                }
+                match rsr_check_crashed(dir.path(), &main, &side, &third).await {
+                    Ok(d) => println!("RSR abort after k={k} [{what}] -> {d}"),
+                    Err(e) => bad.push(format!("after k={k} [{what}] {e}")),
+                }
+            }
+            assert!(
+                bad.is_empty(),
+                "crash points right after a commit that lose or corrupt the window: {bad:#?}"
             );
         }
     }
