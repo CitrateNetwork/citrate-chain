@@ -4518,6 +4518,169 @@ mod tests {
         assert_eq!(src, Source::Ahead("honest".into()), "mode={:?}", t.mode());
     }
 
+    /// What happens after one tick's `choose_source` in [`drive_follow`].
+    #[derive(Clone, Copy)]
+    enum Step {
+        /// A request goes out.
+        Send,
+        /// The re-send is skipped: the anchor is still pending.
+        Unsent,
+        /// The outstanding request is answered with blocks that move the
+        /// cursor by this much.
+        Answer(u64),
+    }
+
+    /// Drive a follow pinned to "pin" at a 2 s tick, with an honest peer at
+    /// 1M; "pin" advertises 1M too when `true_head`, else just above its
+    /// cursor. `plan(tick)` is what happens after each tick's source is
+    /// chosen. Returns the tick and source at which the pin ended, if it did.
+    fn drive_follow(
+        true_head: bool,
+        ticks: u64,
+        plan: impl Fn(u64) -> Vec<Step>,
+    ) -> Option<(u64, Source)> {
+        let top = 500u64;
+        let honest = 1_000_000u64;
+        let mut t = following("pin", top);
+        let sel = SyncPeerSelector::new();
+        let mut gate = SplitPullGate::new();
+        let t0 = Instant::now();
+        let mut outstanding = None;
+        let cursor_of = |t: &RejoinTracker| match t.mode() {
+            Mode::Follow { cursor } => Some(cursor.1),
+            _ => None,
+        };
+        for tick in 0..ticks {
+            let cursor = cursor_of(&t).unwrap_or(top);
+            let cands = [
+                SyncCandidate {
+                    id: "pin".into(),
+                    head_height: if true_head { honest } else { cursor + 1 },
+                },
+                SyncCandidate {
+                    id: "honest".into(),
+                    head_height: honest,
+                },
+            ];
+            let now = t0 + Duration::from_secs(2 * tick);
+            let (src, _) = choose_source(
+                &mut t,
+                &sel,
+                &mut gate,
+                &cands,
+                &[],
+                (hx(1), top),
+                |_| true,
+                now,
+            );
+            if src != Source::Pinned("pin".into()) {
+                return Some((tick, src));
+            }
+            for step in plan(tick) {
+                let Some(cursor) = cursor_of(&t) else { break };
+                match step {
+                    Step::Send => {
+                        let a = t.anchor((hx(1), top), |_| Some(hx(2)));
+                        t.note_asked("pin", a);
+                        outstanding = Some(a.0);
+                    }
+                    Step::Unsent => {
+                        t.note_unsent("pin");
+                    }
+                    Step::Answer(advance) => {
+                        let a = outstanding.take().expect("an outstanding request");
+                        let ah = t
+                            .take_answer("pin", &[a], &[a].into_iter().collect())
+                            .expect("answer");
+                        t.on_answer(
+                            Answer::Progress {
+                                highest: (hx(8), cursor + advance),
+                            },
+                            true,
+                            ah,
+                        );
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// A pinned follow peer that serves `FOLLOW_TRICKLE_ADVANCE` blocks per
+    /// answer but answers only every 4th or 8th tick moves the node at about
+    /// chain rate and never closes the gap. The trickle window counts ticks
+    /// the peer kept a request waiting, so the pin yields to the peer far
+    /// ahead within a bounded time, whatever head the drip advertises, and
+    /// whether the waiting ticks re-send (skipped as pending) or are not sent
+    /// at all (the tick's pending gate) (re-review of 5a1f8a80, P2').
+    #[test]
+    fn a_slow_dripping_follow_peer_cannot_hold_the_pin() {
+        let bound = 3 * u64::from(MAX_TRICKLE_ANSWERS);
+        for every in [8u64, 4] {
+            for gate_skips in [false, true] {
+                for true_head in [false, true] {
+                    let plan = |tick: u64| match tick {
+                        0 => vec![Step::Send],
+                        _ if tick.is_multiple_of(every) => {
+                            vec![Step::Answer(FOLLOW_TRICKLE_ADVANCE), Step::Send]
+                        }
+                        _ if gate_skips => vec![],
+                        _ => vec![Step::Unsent],
+                    };
+                    let ended = drive_follow(true_head, 5_000, plan);
+                    let case =
+                        format!("every={every} gate_skips={gate_skips} true_head={true_head}");
+                    let (tick, src) =
+                        ended.unwrap_or_else(|| panic!("{case}: the drip held the pin for 10000s"));
+                    assert!(
+                        tick <= bound,
+                        "{case}: held the pin for {tick} ticks, then {src:?}"
+                    );
+                    assert_eq!(src, Source::Ahead("honest".into()), "{case}");
+                }
+            }
+        }
+    }
+
+    /// An honest peer serving a full answer (32 blocks) with one tick of
+    /// latency keeps its pin, however long the follow runs: whether the
+    /// request waits a tick (its re-send skipped as pending), is answered in
+    /// the tick it was sent, or the tick's own pending gate sends nothing on
+    /// the ticks between (which is no fault of the peer).
+    #[test]
+    fn an_honest_follow_with_one_tick_latency_keeps_its_pin() {
+        let plans: [(&str, fn(u64) -> Vec<Step>); 3] = [
+            ("waits a tick", |tick| match tick {
+                0 => vec![Step::Send],
+                _ if tick.is_multiple_of(2) => vec![Step::Answer(32), Step::Send],
+                _ => vec![Step::Unsent],
+            }),
+            ("answers every 2nd tick", |tick| {
+                if tick.is_multiple_of(2) {
+                    vec![Step::Send, Step::Answer(32)]
+                } else {
+                    vec![Step::Unsent]
+                }
+            }),
+            ("gate sends every 5th tick", |tick| {
+                if tick.is_multiple_of(5) {
+                    vec![Step::Send, Step::Answer(32)]
+                } else {
+                    vec![]
+                }
+            }),
+        ];
+        for (name, plan) in plans {
+            for true_head in [false, true] {
+                assert_eq!(
+                    drive_follow(true_head, 500, plan),
+                    None,
+                    "{name}, true_head={true_head}: an honest follow lost its pin"
+                );
+            }
+        }
+    }
+
     /// The stall clock restarts on the first tick after a consumed answer
     /// from the pinned peer (here, admitted blocks), and runs from the last
     /// such tick.
