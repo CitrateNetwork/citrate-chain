@@ -3522,6 +3522,16 @@ fn hydrated_pre_images(storage: &[StoragePreImage], full: bool) -> Vec<StoragePr
 /// where the storage-root hydration rule changes, or `MAX_REORG_DEPTH` below
 /// the tip. Nothing is rebuilt unless `at_tip` reproduces the tip's own root.
 /// Returned highest first.
+///
+/// LIMIT (models and training jobs): they are outside the state root, are not
+/// persisted to the flat store and are not loaded at start-up, so `at_tip`
+/// holds none after a restart. The records' model/job pre-images then only
+/// restore what changed inside the window: a model created inside it reverts
+/// correctly, but one created before it is absent at every rebuilt height
+/// where it was not changed (and present, with its earlier value, below a
+/// height that changed it). The root check cannot see this. Model/job parity
+/// across a restart needs the start-up load (tracked separately; see
+/// `pre_window_model_updated_in_the_window_survives_a_restart_reorg`).
 fn restore_reorg_window(
     storage: &StorageManager,
     tip: AppliedTip,
@@ -13285,6 +13295,37 @@ pub(crate) mod tests {
             c1r_hashed(tx, ALICE, [model[0]; 20], nonce)
         }
 
+        /// A model-update transaction (new metadata for `model`) from ALICE.
+        fn rsr_update(model: [u8; 32], nonce: u64) -> Transaction {
+            let meta = serde_json::to_vec(&serde_json::json!({
+                "name": "window model",
+                "version": "2.0.0",
+                "description": "updated inside the reorg window",
+                "framework": "onnx",
+                "input_shape": [1, 4],
+                "output_shape": [1],
+                "size_bytes": 2048
+            }))
+            .expect("metadata");
+            let mut data = vec![0x03, 0x00, 0x00, 0x00];
+            data.extend_from_slice(&model);
+            data.extend_from_slice(&(meta.len() as u32).to_be_bytes());
+            data.extend_from_slice(&meta);
+            let tx = Transaction {
+                nonce,
+                from: embedded(ALICE),
+                to: Some(embedded(BOB)),
+                value: 0,
+                gas_limit: 400_000,
+                gas_price: 1_000_000_000,
+                data,
+                signature: Signature::new([1; 64]),
+                chain_id: Some(40204),
+                ..Default::default()
+            };
+            c1r_hashed(tx, ALICE, [0xD0; 20], nonce)
+        }
+
         /// [`rsr_extend`], with a model registered at `model_at`'s height.
         async fn rsr_extend_registering(
             start: StateSnapshot,
@@ -13295,6 +13336,25 @@ pub(crate) mod tests {
             to: [u8; 20],
             model_at: Option<(u64, [u8; 32])>,
         ) -> (Vec<Block>, Vec<StateSnapshot>) {
+            let register = |h: u64, nonce: u64| {
+                model_at
+                    .filter(|(at, _)| *at == h)
+                    .map(|(_, model)| rsr_register(model, nonce))
+            };
+            rsr_extend_with(start, parent, first, n, vrf, to, &register).await
+        }
+
+        /// [`rsr_extend`], plus `extra(height, nonce)`'s transaction (if any)
+        /// after each block's transfer.
+        async fn rsr_extend_with(
+            start: StateSnapshot,
+            parent: Hash,
+            first: u64,
+            n: u64,
+            vrf: [u8; 32],
+            to: [u8; 20],
+            extra: &(dyn Fn(u64, u64) -> Option<Transaction> + Sync),
+        ) -> (Vec<Block>, Vec<StateSnapshot>) {
             let exec = Executor::new(Arc::new(StateDB::new()));
             exec.state_restore(start);
             let mut blocks = Vec::new();
@@ -13302,10 +13362,9 @@ pub(crate) mod tests {
             let mut parent = parent;
             for h in first..first + n {
                 let mut txs = vec![v251_transfer(&exec, ALICE, to, 1_000)];
-                if let Some((_, model)) = model_at.filter(|(at, _)| *at == h) {
-                    // The nonce after the transfer: the producer executes in order.
-                    let nonce = exec.get_nonce(&Address(ALICE)) + 1;
-                    txs.push(rsr_register(model, nonce));
+                // The nonce after the transfer: the producer executes in order.
+                if let Some(tx) = extra(h, exec.get_nonce(&Address(ALICE)) + 1) {
+                    txs.push(tx);
                 }
                 let b = produce(&exec, parent, h, vrf, txs).await;
                 parent = b.header.block_hash;
@@ -13731,6 +13790,73 @@ pub(crate) mod tests {
             );
             assert_eq!(model_ids(&restarted), vec![Hash::new(m_won)]);
             assert_eq!(restarted.calculate_state_root(), head.state_root);
+        }
+
+        /// A model registered BEFORE the window (height 10, tip 130) and updated
+        /// inside it (120), across a real restart (state hydrated from the store)
+        /// and a reorg forking at 125 onto a branch that leaves it alone: the
+        /// restarted node must hold the same model as a node that never stopped.
+        ///
+        /// It cannot today. Models and training jobs live in memory only: they
+        /// are not persisted to the flat store and not loaded at start-up, so a
+        /// restarted node holds none at its tip, and the window rebuilt from the
+        /// undo records only knows the pre-images of what changed inside it. See
+        /// `restore_reorg_window` (the limit), tracked as its own item.
+        #[tokio::test]
+        #[ignore = "tracked: startup model/job load"]
+        async fn pre_window_model_updated_in_the_window_survives_a_restart_reorg() {
+            let model = [0x4F; 32];
+            let ops = |h: u64, nonce: u64| match h {
+                10 => Some(rsr_register(model, nonce)),
+                120 => Some(rsr_update(model, nonce)),
+                _ => None,
+            };
+            let (main, snaps) =
+                rsr_extend_with(rsr_genesis(), Hash::default(), 1, 130, VRF_OUT, BOB, &ops).await;
+            let fork = 125u64;
+            let side = rsr_fork(&main, &snaps, fork, 10, [0x5B; 32], CAROL).await;
+            let head = side.last().expect("side").clone();
+            let version = |exec: &Executor| {
+                exec.state_db()
+                    .get_model(&citrate_execution::types::ModelId(Hash::new(model)))
+                    .map(|m| m.version)
+            };
+
+            // A node that never stopped.
+            let (s1, _d1) = rsr_node().await;
+            let live = rsr_hydrated(&s1);
+            let mut app1 = CanonicalApplicator::new(live.clone(), s1.clone());
+            for b in &main {
+                persist(&s1, b);
+                app1.apply_received(b).await;
+            }
+            assert_eq!(version(&live), Some(2), "fixture: registered, then updated");
+            for b in &side {
+                persist(&s1, b);
+            }
+            app1.fork_choice = Some(fork_choice_returning(head.header.block_hash));
+            app1.drive_drain().await;
+            assert_eq!(app1.applied_tip().await.hash, head.header.block_hash);
+
+            // A node that stopped at 130 and restarted from its durable store.
+            let (s2, _d2) = rsr_node().await;
+            let before = rsr_hydrated(&s2);
+            rsr_apply(&s2, &before, &main).await;
+            drop(before);
+            let restarted = rsr_hydrated(&s2);
+            let mut app2 = CanonicalApplicator::new(restarted.clone(), s2.clone());
+            for b in &side {
+                persist(&s2, b);
+            }
+            app2.fork_choice = Some(fork_choice_returning(head.header.block_hash));
+            app2.drive_drain().await;
+            assert_eq!(app2.applied_tip().await.hash, head.header.block_hash);
+            assert_eq!(restarted.calculate_state_root(), head.state_root);
+            assert_eq!(
+                version(&restarted),
+                version(&live),
+                "the restarted node's model matches the node that never stopped"
+            );
         }
 
         /// Rebuilding the window at start-up stops at its time budget: a shorter
