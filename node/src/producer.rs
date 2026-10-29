@@ -7389,7 +7389,10 @@ mod tests {
                 producer,
                 orphans: Vec::new(),
                 attested,
-                walk: ParentWalks::new(std::time::Instant::now()),
+                walk: ParentWalks::new(
+                    std::time::Instant::now(),
+                    std::time::Duration::from_secs(30),
+                ),
                 id: format!("node-{i}"),
                 clock: std::time::Instant::now(),
                 asked: Vec::new(),
@@ -7479,10 +7482,9 @@ mod tests {
                 .iter()
                 .filter(|b| answer.contains(&b.header.block_hash))
                 .collect();
-            let lowest =
-                crate::sync_recovery::lowest_deferred(&n.storage, &from_answer, &fixpoint.deferred);
+            let lowest = crate::sync_recovery::lowest_deferred(&from_answer, &fixpoint);
             let roots = if reprocess {
-                crate::sync_recovery::deferred_roots(&n.storage, &fixpoint.deferred)
+                crate::sync_recovery::deferred_roots(&fixpoint)
             } else {
                 Vec::new()
             };

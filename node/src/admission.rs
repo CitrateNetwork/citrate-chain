@@ -64,7 +64,7 @@
 // surface. With D2.2 a partial admission becomes impossible; with D2.3 alone
 // it becomes self-healing. Self-healing first, impossible second.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -223,6 +223,10 @@ pub struct FixpointOutcome {
     pub highest_admitted: Option<(Hash, u64)>,
     /// Blocks still waiting for a parent.
     pub deferred: Vec<Block>,
+    /// For each block of `deferred`: its height and the parent admission found
+    /// missing, recorded by the pass itself, so callers walk the orphan chain
+    /// without reading storage again.
+    pub waiting_on: HashMap<Hash, (u64, Hash)>,
 }
 
 /// Result of an admission attempt.
@@ -671,6 +675,8 @@ impl BlockAdmission {
         loop {
             let mut progressed = false;
             let mut deferred: Vec<Block> = Vec::new();
+            // The last pass's record is the one that describes `out.deferred`.
+            out.waiting_on.clear();
             for block in std::mem::take(&mut pending) {
                 match self.admit(&block).await {
                     AdmitOutcome::Admitted { completed_partial } => {
@@ -689,6 +695,10 @@ impl BlockAdmission {
                     AdmitOutcome::AlreadyAdmitted => {}
                     // Parent not admitted yet: DEFER, never drop.
                     AdmitOutcome::Deferred { missing_parent } => {
+                        out.waiting_on.insert(
+                            block.header.block_hash,
+                            (block.header.height, missing_parent),
+                        );
                         debug!(
                             "Deferred synced block {} @ {}: missing parent {}",
                             hex::encode(&block.header.block_hash.as_bytes()[..8]),

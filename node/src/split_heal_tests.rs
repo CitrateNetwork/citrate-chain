@@ -128,6 +128,10 @@ pub(crate) struct Scenario {
     /// this many blocks (as `dag_prune` does on a node running with a retain
     /// window), so the restarted node runs with a prune floor.
     pub prune_retain: Option<u64>,
+    /// Silent hostile peers per node: each connects to every node, answers
+    /// nothing, and from the heal on gossips, every slot, a block it signed
+    /// itself on a parent nobody holds (P1-1).
+    pub sybils: usize,
 }
 
 /// See [`Scenario::require_producing`].
@@ -176,6 +180,11 @@ pub(crate) struct Fleet {
     peers: Vec<Vec<Option<PeerLink>>>,
     /// links[i][j]: messages from i reach j.
     links: Vec<Vec<bool>>,
+    /// sybils[i]: node i's handles on the silent hostile peers, and what it
+    /// sent them (dropped unanswered).
+    sybils: Vec<Vec<PeerLink>>,
+    /// Sybils gossip from now on.
+    sybils_active: bool,
     /// Nodes not running.
     down: HashSet<usize>,
     /// Producers that seal nothing.
@@ -185,6 +194,9 @@ pub(crate) struct Fleet {
     genesis: Block,
     /// Simulated time, in slots, from `epoch`.
     epoch: std::time::Instant,
+    /// The same simulated time, in milliseconds, for the sync managers'
+    /// request clocks (`SyncManager::with_clock_offset`).
+    clock_ms: Arc<AtomicU64>,
     slot_no: u64,
     /// Messages lost on down links (diagnostics).
     pub lost: usize,
@@ -240,6 +252,7 @@ impl Node {
         boot: Option<citrate_execution::state::StateSnapshot>,
         slot_no: u64,
         clock: std::time::Instant,
+        clock_ms: Arc<AtomicU64>,
     ) -> Self {
         if boot.is_none() {
             storage.blocks.put_block(genesis).expect("genesis");
@@ -330,8 +343,9 @@ impl Node {
         .with_produce_catchup_gate(&app)
         .with_network_height_gate(&attested)
         .with_initial_sync_gate(initial_sync.clone());
-        let sync =
-            SyncManager::new(SyncConfig::default()).with_local_height(app.applied_height_handle());
+        let sync = SyncManager::new(SyncConfig::default())
+            .with_local_height(app.applied_height_handle())
+            .with_clock_offset(clock_ms);
         Self {
             name: format!("p{i}"),
             storage,
@@ -343,7 +357,7 @@ impl Node {
             sync,
             rejoin: parking_lot::Mutex::new(sync_rejoin::RejoinTracker::new()),
             sel: sync_peer::SyncPeerSelector::new(),
-            walk: sync_recovery::ParentWalks::new(clock),
+            walk: sync_recovery::ParentWalks::new(clock, SyncConfig::default().request_timeout),
             pm: Arc::new(citrate_network::PeerManager::new(
                 citrate_network::PeerManagerConfig::default(),
             )),
@@ -366,13 +380,27 @@ impl Fleet {
         let empty_root = Executor::new(Arc::new(StateDB::new())).calculate_state_root();
         let genesis = genesis_block(empty_root);
         let epoch = std::time::Instant::now();
+        let clock_ms = Arc::new(AtomicU64::new(0));
         let mut nodes = Vec::new();
         for i in 0..n {
             let dir = TempDir::new().expect("tempdir");
             let storage = Arc::new(
                 StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
             );
-            nodes.push(Node::start(i, n, &genesis, storage, dir, None, 0, epoch).await);
+            nodes.push(
+                Node::start(
+                    i,
+                    n,
+                    &genesis,
+                    storage,
+                    dir,
+                    None,
+                    0,
+                    epoch,
+                    clock_ms.clone(),
+                )
+                .await,
+            );
         }
         let mut peers = Vec::new();
         for i in 0..n {
@@ -398,11 +426,14 @@ impl Fleet {
             nodes,
             peers,
             links: vec![vec![false; n]; n],
+            sybils: (0..n).map(|_| Vec::new()).collect(),
+            sybils_active: false,
             down: HashSet::new(),
             quiet: HashSet::new(),
             prune_retain: None,
             genesis,
             epoch,
+            clock_ms,
             slot_no: 0,
             lost: 0,
         };
@@ -448,6 +479,76 @@ impl Fleet {
                     .expect("add peer");
             }
         }
+        for (p, _) in &self.sybils[i] {
+            self.nodes[i]
+                .pm
+                .add_peer(p.clone())
+                .await
+                .expect("add sybil");
+        }
+    }
+
+    /// Give every node `k` silent hostile peers.
+    async fn add_sybils(&mut self, k: usize) {
+        for i in 0..self.nodes.len() {
+            for s in 0..k {
+                let (tx, rx) = mpsc::channel(1 << 16);
+                let (_in_tx, in_rx) = mpsc::channel(1);
+                let mut info = PeerInfo::new(
+                    PeerId::new(format!("sybil{s}")),
+                    "127.0.0.1:1".parse().expect("addr"),
+                    Direction::Inbound,
+                );
+                info.state = PeerState::Connected;
+                self.sybils[i].push((Arc::new(Peer::new(info, tx, in_rx)), rx));
+            }
+            self.attach_peers(i).await;
+        }
+    }
+
+    /// Each sybil gossips each node a block it signed itself, at the node's
+    /// height plus two, on a parent nobody holds.
+    async fn sybil_gossip(&mut self) {
+        for i in 0..self.nodes.len() {
+            if self.down.contains(&i) {
+                continue;
+            }
+            for k in 0..self.sybils[i].len() {
+                let key = Ed25519SigningKey::from_bytes(&[0xA0 ^ k as u8; 32]);
+                let height = self.nodes[i].applied().1 + 2;
+                let mut seed = [0u8; 32];
+                seed[..8].copy_from_slice(&self.slot_no.to_le_bytes());
+                seed[8] = k as u8;
+                seed[9] = i as u8;
+                let mut b = BlockBuilder::new()
+                    .version(2)
+                    .height(height)
+                    .parent(Hash::new(seed))
+                    .coinbase([0xBB; 20])
+                    .timestamp(chrono::Utc::now().timestamp().max(0) as u64)
+                    .vrf_reveal(VrfProof {
+                        proof: vec![],
+                        output: Hash::new([0x5C; 32]),
+                    })
+                    .transactions(vec![])
+                    .state_root(Hash::default())
+                    .blue_score(height)
+                    .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                    .proposer(PublicKey::new(key.verifying_key().to_bytes()))
+                    .build_unhashed();
+                b.tx_root = citrate_consensus::tx_auth::tx_root_for_height(
+                    citrate_consensus::hardening::PbaHardening::from_process(),
+                    height,
+                    &b.transactions,
+                );
+                b.header.block_hash = b.compute_hash();
+                b.signature = citrate_consensus::crypto::sign_block(&b.header.block_hash, &key);
+                let peer = self.sybils[i][k].0.clone();
+                let pid = PeerId::new(format!("sybil{k}"));
+                self.nodes[i].on_new_block(&peer, &pid, b).await;
+            }
+        }
+        self.pump().await;
     }
 
     /// Stop node `i` and start a new process on its store. Messages in flight
@@ -484,6 +585,7 @@ impl Fleet {
             Some(boot),
             self.slot_no,
             self.now(),
+            self.clock_ms.clone(),
         )
         .await;
         self.nodes.insert(i, node);
@@ -522,6 +624,9 @@ impl Fleet {
                         self.lost += 1;
                     }
                 }
+            }
+            for (_, rx) in &mut self.sybils[i] {
+                while rx.try_recv().is_ok() {}
             }
         }
         out
@@ -593,9 +698,16 @@ impl Fleet {
     /// block is gossiped, then each running node runs its sync tick and drain.
     pub(crate) async fn slot(&mut self, order: &[usize]) -> Vec<(usize, Block)> {
         self.slot_no += 1;
+        self.clock_ms.store(
+            self.slot_no * u64::try_from(SLOT.as_millis()).expect("ms"),
+            Ordering::Relaxed,
+        );
         let now = self.now();
         for node in &mut self.nodes {
             node.clock = now;
+        }
+        if self.sybils_active {
+            self.sybil_gossip().await;
         }
         let n = self.nodes.len();
         let mut produced = Vec::new();
@@ -624,7 +736,8 @@ impl Fleet {
         let running: Vec<usize> = (0..n).filter(|i| !self.down.contains(i)).collect();
         for i in running.iter().copied() {
             let linked: Vec<usize> = (0..n).filter(|&j| self.up(i, j) && self.up(j, i)).collect();
-            let peers: Vec<Arc<Peer>> = linked.iter().map(|&j| self.peer(i, j)).collect();
+            let mut peers: Vec<Arc<Peer>> = linked.iter().map(|&j| self.peer(i, j)).collect();
+            peers.extend(self.sybils[i].iter().map(|(p, _)| p.clone()));
             let since =
                 SLOT * u32::try_from(self.slot_no - self.nodes[i].started_slot).expect("slots");
             self.nodes[i].tick(&peers, since).await;
@@ -761,16 +874,7 @@ impl Node {
                         applied_now,
                         now,
                     );
-                    sync_recovery::send_step(
-                        &mut self.walk,
-                        &self.pm,
-                        &self.sync,
-                        &pid.0,
-                        step,
-                        applied_now,
-                    )
-                    .await;
-                    self.refetch(applied_now, now).await;
+                    self.run_step(&pid.0, step, applied_now, now).await;
                 }
                 let _ = peer;
             }
@@ -785,41 +889,26 @@ impl Node {
         }
     }
 
-    /// main.rs: stuck parents get a fetch by their own hash, and give-ups are
-    /// carried out (both call sites run this after a walk step).
-    async fn refetch(&mut self, applied_now: u64, now: std::time::Instant) {
+    /// `sync_recovery::run_step`, as both receive-loop call sites run it.
+    async fn run_step(
+        &mut self,
+        peer: &str,
+        step: sync_recovery::Step,
+        applied_now: u64,
+        now: std::time::Instant,
+    ) {
         let storage = self.storage.clone();
-        let (refetch, gave_up) = self.walk.refetch_stuck(
-            |p| storage.blocks.has_block(p).unwrap_or(false),
+        sync_recovery::run_step(
+            &mut self.walk,
+            &self.pm,
+            &self.sync,
+            peer,
+            step,
             applied_now,
+            |p| storage.blocks.has_block(p).unwrap_or(false),
             now,
-        );
-        for r in refetch {
-            let step = sync_recovery::Step::Ask {
-                parent: r.parent,
-                height: r.height,
-            };
-            sync_recovery::send_step(
-                &mut self.walk,
-                &self.pm,
-                &self.sync,
-                &r.peer,
-                step,
-                applied_now,
-            )
-            .await;
-        }
-        for (peer, step) in gave_up {
-            sync_recovery::send_step(
-                &mut self.walk,
-                &self.pm,
-                &self.sync,
-                &peer,
-                step,
-                applied_now,
-            )
-            .await;
-        }
+        )
+        .await;
     }
 
     /// main.rs `NetworkMessage::Blocks` arm.
@@ -858,10 +947,19 @@ impl Node {
                 .iter()
                 .filter(|b| verified.contains(&b.header.block_hash))
                 .collect();
-            sync_recovery::lowest_deferred(&self.storage, &from_answer, &fx.deferred)
+            sync_recovery::lowest_deferred(&from_answer, &fx)
         };
+        for b in fx
+            .deferred
+            .iter()
+            .filter(|b| verified.contains(&b.header.block_hash))
+        {
+            if let Some((_, parent)) = fx.waiting_on.get(&b.header.block_hash) {
+                self.walk.note_buffered(*parent, &pid.0, self.clock);
+            }
+        }
         let stuck_roots = if reprocessed {
-            sync_recovery::deferred_roots(&self.storage, &fx.deferred)
+            sync_recovery::deferred_roots(&fx)
         } else {
             Vec::new()
         };
@@ -888,17 +986,8 @@ impl Node {
                 },
                 now,
             );
-            sync_recovery::send_step(
-                &mut self.walk,
-                &self.pm,
-                &self.sync,
-                &pid.0,
-                step,
-                applied_now,
-            )
-            .await;
             self.walk.note_stuck(&stuck_roots, &pid.0, now);
-            self.refetch(applied_now, now).await;
+            self.run_step(&pid.0, step, applied_now, now).await;
         }
         let _ = peer;
         let mut gave_up = false;
@@ -963,6 +1052,11 @@ impl Node {
         {
             self.initial_sync.store(true, Ordering::Relaxed);
         }
+        let held_heads: HashSet<Hash> = split
+            .iter()
+            .map(|c| c.head_hash)
+            .filter(|h| self.storage.blocks.has_block(h).unwrap_or(true))
+            .collect();
         let (source, _transition) = sync_rejoin::choose_source(
             &mut self.rejoin.lock(),
             &self.sel,
@@ -970,7 +1064,7 @@ impl Node {
             &candidates,
             &split,
             applied_tip,
-            |h| self.storage.blocks.has_block(h).unwrap_or(true),
+            |h| held_heads.contains(h),
             self.clock,
         );
         let chosen = source.peer().map(str::to_string);
@@ -996,8 +1090,15 @@ impl Node {
             if ph < 8 {
                 let _ = self.sync.request_headers(&peer, applied_tip.0).await;
             }
-            if pb < 8 {
-                if let Ok(true) = self.sync.request_blocks(&peer, from, height).await {
+            if pb < sync_recovery::TICK_PENDING_GATE {
+                let sent = self.sync.request_blocks(&peer, from, height).await;
+                if matches!(sent, Ok(false)) {
+                    let pid = peer.info.read().await.id.clone();
+                    if self.rejoin.lock().note_unsent(&pid.0).is_some() {
+                        self.sel.record_give_up(&pid.0);
+                    }
+                }
+                if let Ok(true) = sent {
                     let pid = peer.info.read().await.id.clone();
                     let t = self.rejoin.lock().note_asked(&pid.0, (from, height));
                     if matches!(t, Some(sync_rejoin::Transition::GaveUp { .. })) {
@@ -1045,6 +1146,7 @@ pub(crate) async fn run(s: Scenario) -> Outcome {
     let n = s.producers;
     let mut fleet = Fleet::new(n).await;
     fleet.prune_retain = s.prune_retain;
+    fleet.add_sybils(s.sybils).await;
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     for _ in 0..s.warmup {
         let o = rng.order(n);
@@ -1107,6 +1209,7 @@ pub(crate) async fn run(s: Scenario) -> Outcome {
             .expect("producers");
         fleet.quiet.insert(low);
     }
+    fleet.sybils_active = s.sybils > 0;
     let mut last_sealed: HashMap<usize, u64> = HashMap::new();
     for round in 1..=s.heal_rounds {
         let o = rng.order(n);
@@ -1272,6 +1375,7 @@ mod tests {
             require_merged: true,
             require_producing: true,
             prune_retain: None,
+            sybils: 0,
         }
     }
 
@@ -1337,6 +1441,33 @@ mod tests {
                 restart_all: true,
                 solo: Some((4, 60)),
                 require_merged: false,
+                ..base(7)
+            },
+        )
+        .await;
+    }
+
+    /// P1-1 / P3: DGX's phase 3 with eight silent hostile peers on every node,
+    /// each gossiping a self-signed block on an unknown parent every slot and
+    /// answering nothing. Their walk requests sit pending for the sync
+    /// manager's whole timeout; recovery and the sync tick must still bring
+    /// the stuck side back and sealing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn four_three_partition_heals_under_silent_sybils() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::four_three_partition_heals_under_silent_sybils",
+            );
+        }
+        assert_heals(
+            "4v3 + restarts + lone producer + 8 silent sybils",
+            Scenario {
+                groups: vec![vec![0, 1, 2, 3], vec![4, 5, 6]],
+                partition: 9,
+                restart_all: true,
+                solo: Some((4, 60)),
+                require_merged: false,
+                sybils: 8,
                 ..base(7)
             },
         )
@@ -1458,10 +1589,13 @@ mod tests {
             "sync_recovery::lowest_deferred(",
             "parent_walks.begin(",
             "parent_walks.next(",
-            "sync_recovery::send_step(",
+            "sync_recovery::run_step(",
+            "parent_walks.note_buffered(*parent, &pid.0, now)",
             "parent_walks.note_stuck(&stuck_roots, &pid.0, now)",
-            ".refetch_stuck(",
-            "sync_recovery::deferred_roots(",
+            "sync_recovery::deferred_roots(&fixpoint)",
+            "rejoin_for_loop.lock().note_unsent(&pid.0)",
+            "pb < sync_recovery::TICK_PENDING_GATE",
+            "|h| held_heads.contains(h)",
             "sync_rejoin::classify(",
             "sel.record_serve(",
             // Sync tick.
