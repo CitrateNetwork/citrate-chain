@@ -1463,6 +1463,46 @@ mod tests {
         );
     }
 
+    /// The orphan buffer's BYTE cap binds on its own: blocks near the 1 MiB
+    /// frame limit reach `MAX_ORPHAN_BYTES` long before `MAX_ORPHAN_BLOCKS`.
+    /// (The count test above uses tiny blocks, so it never reaches the byte
+    /// cap.) The lowest heights are the ones kept.
+    #[test]
+    fn orphan_buffer_byte_cap_binds_before_the_count_cap() {
+        let padded = |i: u64| {
+            let mut parent = [0u8; 32];
+            parent[..8].copy_from_slice(&i.to_le_bytes());
+            let mut b = mk(i + 1, Hash::new(parent), i, [0x5C; 32]);
+            b.transactions.push(citrate_consensus::types::Transaction {
+                data: vec![0u8; 1 << 20],
+                ..Default::default()
+            });
+            b
+        };
+        let n: u64 = (MAX_ORPHAN_BYTES >> 20) as u64 + 16;
+        // Highest heights first, so a plain truncation would keep the wrong end.
+        let input: Vec<Block> = (0..n).rev().map(padded).collect();
+        let out = bound_orphan_buffer(input);
+
+        let bytes: usize = out
+            .iter()
+            .map(|b| bincode::serialized_size(b).unwrap_or(u64::MAX) as usize)
+            .sum();
+        assert!(
+            bytes <= MAX_ORPHAN_BYTES,
+            "orphan buffer must stay within {MAX_ORPHAN_BYTES} bytes, holds {bytes}"
+        );
+        assert!(
+            (out.len() as u64) < n,
+            "the byte cap must drop some of {n} ~1 MiB blocks, kept {}",
+            out.len()
+        );
+        assert!(!out.is_empty());
+        let heights: Vec<u64> = out.iter().map(|b| b.header.height).collect();
+        let want: Vec<u64> = (1..=out.len() as u64).collect();
+        assert_eq!(heights, want, "the lowest heights are retained");
+    }
+
     /// A linear chain of `n` blocks above `root`, each sealed with `seed` so two
     /// chains from the same root differ from their first block on.
     fn chain_from(root: &Block, n: u64, seed: u8) -> Vec<Block> {
