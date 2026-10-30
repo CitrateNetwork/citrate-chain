@@ -232,7 +232,7 @@ async fn assemble_with(
     );
     let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
     for b in &known {
-        let _ = dag.store_block(b.clone()).await;
+        dag.store_block(b.clone()).await.expect("fixture DAG write");
     }
     let sel = VrfProposerSelector::new().with_snapshot_schedule(vals.schedule.0, vals.schedule.1);
     sel.sync_active_set_at(1, vals.set.clone(), 1).await;
@@ -316,7 +316,10 @@ impl TestNode {
             return;
         }
         persist(&self.storage, b);
-        let _ = self.dag.store_block(b.clone()).await;
+        self.dag
+            .store_block(b.clone())
+            .await
+            .expect("import: DAG write");
         self.known.push(b.clone());
     }
 
