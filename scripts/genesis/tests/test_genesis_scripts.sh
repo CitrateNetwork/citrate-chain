@@ -93,6 +93,15 @@ case "${args[0]}" in
       [[ -f "$d/block-${args[1]}" ]] || exit 1; cat "$d/block-${args[1]}"
     fi ;;
   nonce) cat "$d/nonce" 2>/dev/null || echo 0 ;;
+  rpc)
+    # citrate_isExecuted HASH: $d/exec-<hash> holds the answer; $d/exec-error makes every
+    # such call fail. Default: a block the node stores (block-<hash>-number) is executed.
+    [[ "${args[1]}" == citrate_isExecuted ]] || { echo "fake cast: unsupported rpc ${args[1]}" >&2; exit 9; }
+    [[ ! -e "$d/exec-error" ]] || { echo "server returned an error response: error code -32603" >&2; exit 1; }
+    hh="${args[2]}"
+    if [[ -f "$d/exec-$hh" ]]; then cat "$d/exec-$hh"
+    elif [[ -f "$d/block-$hh-number" ]]; then printf '{"executed":true,"number":"0x%x"}\n' "$(cat "$d/block-$hh-number")"
+    else echo '{"executed":false,"number":null}'; fi ;;
   call)
     # $FAKE/call/<addr>/<function>[_<arg>...] holds the decoded answer; a missing file is a
     # revert, except hasRole, which answers false.
@@ -598,14 +607,23 @@ h64() { printf '%064d' 0 | tr 0 "$1"; }
 GEN=0x$(h64 a)
 TIP=0x$(h64 b)
 mk_node() { # url chain head genesis tiphash(at head-6) [by-number answer at head-6]
-  # A canonical chain head-6..head: block-latest, and per block its number and parentHash.
+  # A canonical chain head-12..head: block-latest, and per block its number and parentHash.
+  # Below head-6 the blocks derive from tiphash only (shared by nodes that agree there).
   local d i hb pb
   d=$(rpcdir "$1")
   mkdir -p "$d"
   echo "$2" >"$d/chain-id"
   echo "$3" >"$d/head"
   echo "$4" >"$d/block-0"
-  rm -f "$d"/block-[1-9]* "$d"/block-0x* "$d"/block-latest
+  rm -f "$d"/block-[1-9]* "$d"/block-0x* "$d"/block-latest "$d"/exec-*
+  pb=""
+  for i in 12 11 10 9 8 7; do
+    hb=0x$(printf '%s-%s' "$5" "$i" | sha256sum | cut -c1-64)
+    echo "$(($3 - i))" >"$d/block-$hb-number"
+    [[ -n "$pb" ]] && echo "$pb" >"$d/block-$hb-parentHash"
+    pb="$hb"
+  done
+  echo "$pb" >"$d/block-$5-parentHash"
   pb="$5"
   echo "$(($3 - 6))" >"$d/block-$5-number"
   for i in 5 4 3 2 1 0; do
@@ -646,6 +664,32 @@ fi
 mk_node http://n3 1 100 "$GEN" "$TIP"
 expect "fleet: a wrong chain id fails" 1 'chain id 1, want 40204' -- bash "$FA" http://n1 http://n3
 expect "fleet: an unreachable node fails" 1 'unreachable' -- bash "$FA" http://n1 http://nowhere
+# Execution (2026-10-29): eth_getBlockBy* serve STORED blocks, so a node whose applied tip is
+# stuck still walks the network's chain. Every node must report citrate_isExecuted(the
+# majority hash at the common height) = {executed: true, number: H}, and its own block 10
+# below its head executed; any RPC error fails closed.
+mk_node http://n3 40204 100 "$GEN" "$TIP"
+reset_calls
+expect "fleet: three agreeing, executing nodes pass" 0 'FLEET AGREE \(3 endpoints' -- bash "$FA" http://n1 http://n2 http://n3
+if [[ $(calls | grep -c "rpc citrate_isExecuted $TIP --rpc-url") -eq 3 ]]; then
+  ok "fleet: every node is asked whether it executed the common block"
+else
+  bad "fleet: every node is asked whether it executed the common block" "$(calls | grep -i rpc)"
+fi
+echo '{"executed":false,"number":null}' >"$(rpcdir http://n3)/exec-$TIP"
+expect "fleet: a node that stores but has not executed the common block fails" 1 'n3 .*not executed' -- bash "$FA" http://n1 http://n2 http://n3
+echo '{"executed":true,"number":"0x1"}' >"$(rpcdir http://n3)/exec-$TIP"
+expect "fleet: executed at another height fails" 1 'n3 .*not executed' -- bash "$FA" http://n1 http://n2 http://n3
+mk_node http://n3 40204 100 "$GEN" "$TIP"
+BACK10=0x$(printf '%s-%s' "$TIP" 10 | sha256sum | cut -c1-64)
+echo '{"executed":false,"number":null}' >"$(rpcdir http://n3)/exec-$BACK10"
+expect "fleet: a node whose own block 10 below its head is not executed (applied tip stuck) fails" 1 'n3 .*applied tip' -- bash "$FA" http://n1 http://n2 http://n3
+mk_node http://n3 40204 100 "$GEN" "$TIP"
+: >"$(rpcdir http://n3)/exec-error"
+expect "fleet: an isExecuted RPC error fails closed" 1 'n3 .*not executed' -- bash "$FA" http://n1 http://n2 http://n3
+echo garbage >"$(rpcdir http://n3)/exec-$TIP"; rm -f "$(rpcdir http://n3)/exec-error"
+expect "fleet: an unparseable isExecuted answer fails closed" 1 'n3 .*not executed' -- bash "$FA" http://n1 http://n2 http://n3
+mk_node http://n3 40204 100 "$GEN" "$TIP"
 mk_node http://n3 40204 400 "$GEN" "$TIP"
 expect "fleet: heads far apart fail" 1 'blocks apart' -- bash "$FA" http://n1 http://n3
 reset_calls

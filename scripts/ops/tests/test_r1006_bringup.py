@@ -15,10 +15,13 @@ from __future__ import annotations
 import json
 import os
 import re
+import select
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -87,8 +90,10 @@ class Env:
         (self.state / "build.json").write_text(json.dumps({"sha": "0" * 40, "sha256": s256, "fingerprint": "0x",
                                                            "arch": "test", "built_on": "test", "from_main": False,
                                                            "r1006_genesis": R1006_TEST}))
+        # R1006_WATCHDOG_CTL: a path that does not exist, so no test ever reaches a height
+        # watchdog installed on the machine running the tests; a test that wants one sets it.
         self.env = dict(os.environ, HOME=str(self.tmp), TMPDIR=str(self.tmp), CANARY="CANARY-7f3a9c",
-                        PYTHONDONTWRITEBYTECODE="1")
+                        PYTHONDONTWRITEBYTECODE="1", R1006_WATCHDOG_CTL=str(self.tmp / "no-watchdog-ctl"))
         # A repo tree the orchestrator runs from: the real scripts, plus the committed r1006
         # genesis pin (core/consensus/src/hardening.rs) and address book this test controls.
         self.repo = self.tmp / "repo"
@@ -177,7 +182,8 @@ class Env:
         return Path(self.hosts[i - 1]["root"])
 
     def agent(self, host: int, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
-        e = dict(self.env, R1006_ROOT=self.hosts[host - 1]["root"], R1006_SERVICE="proc", R1006_RUN_AS="", **(env or {}))
+        e = dict(self.env, R1006_ROOT=self.hosts[host - 1]["root"], R1006_SERVICE="proc", R1006_RUN_AS="")
+        e.update(env or {})
         return subprocess.run(["bash", str(AGENT), *args], capture_output=True, text=True, env=e, timeout=120,
                               stdin=subprocess.DEVNULL)
 
@@ -1050,6 +1056,69 @@ exit $rc
             env.close()
             shutil.rmtree(d)
 
+    def test_smoke_pins_forge_below_the_head_and_a_failed_log_read_fails_the_scan(self):
+        """admins: forge is pinned (--fork-block-number) R1006_ADMINS_PIN_BACK (10) blocks below
+        the operator host's head, so a one-block sibling reorg of the head cannot take away the
+        state forge reads. logs: a host whose log cannot be read fails the scan (and smoke goes
+        on to its other checks), never counting as 0 matches."""
+        d = Path(tempfile.mkdtemp(prefix="dgx-r1006p."))
+        fake = d / "forge"
+        fake.write_text(self.FAKE_FORGE)
+        fake.chmod(0o755)
+        common = "--min-height 0 --gate-minutes 1 --skip code,orangeseed"
+        def smoke(e: Env) -> str:
+            return "\n".join([
+                f'printf 0x64 >"{e.host_root(1)}/fake-head"; printf 0x64 >"{e.host_root(2)}/fake-head"',
+                f'FORGE={fake} B smoke {common} >"{d}/smoke-pin.out" 2>&1',
+                f'rm -f "{e.host_root(2)}/var/log/citrate-node.log"',
+                f'FORGE={fake} B smoke {common} >"{d}/smoke-nolog.out" 2>&1; echo $? >"{d}/nolog.rc"',
+            ])
+        env, r = self._fleet(2, {}, after_start=smoke, fill_extra=" --address-book",
+                             inv_extra={"p1": {"serve_recent_state_tags": 64}})
+        try:
+            pin = (d / "smoke-pin.out").read_text()
+            self.assertIn("PASS  admins (genesis-chain mode)", pin, pin[-2500:])
+            args = (d / "forge.args").read_text().splitlines()
+            self.assertTrue(args, "forge ran")
+            self.assertIn("--fork-block-number 90", args[0], args)
+            nolog = (d / "smoke-nolog.out").read_text()
+            self.assertRegex(nolog, r"FAIL  .*log", nolog[-2500:])
+            self.assertNotRegex(nolog, r"PASS  no CONFLICT / fork lines", nolog[-2500:])
+            self.assertIn("finality:", nolog, "smoke went on past the failed scan: " + nolog[-2500:])
+            self.assertEqual((d / "nolog.rc").read_text().strip(), "1", nolog[-2500:])
+        finally:
+            env.close()
+            shutil.rmtree(d)
+
+    def test_start_rearms_the_height_watchdog_after_a_successful_start(self):
+        """stop pauses an installed height watchdog for 12 h; a successful start re-arms it on
+        every host it started (citrate-watchdog-ctl.sh resume), after its gates passed."""
+        def pre(e: Env) -> str:
+            shim = e.tmp / "wdshim"
+            shim.mkdir()
+            (shim / "citrate-watchdog-ctl.sh").write_text(
+                f'#!/bin/sh\necho "ctl $* root=$R1006_ROOT t=$(date +%s.%N)" >>"{e.tmp}/wd.calls"\n'
+                'echo "watchdog resumed and armed"\n')
+            (shim / "systemctl").write_text('#!/bin/sh\ncase "$*" in *is-enabled*citrate-height-watchdog.timer*) exit 0 ;; esac\n'
+                                            'exit 1\n')
+            for f in ("citrate-watchdog-ctl.sh", "systemctl"):
+                (shim / f).chmod(0o755)
+            return f'export PATH="{shim}:$PATH" R1006_WATCHDOG_CTL=citrate-watchdog-ctl.sh'
+        env, r = self._fleet(2, {}, pre_start=pre)
+        try:
+            self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
+            calls = (env.tmp / "wd.calls").read_text().splitlines() if (env.tmp / "wd.calls").exists() else []
+            resumes = [c for c in calls if c.startswith("ctl resume")]
+            self.assertEqual(len(resumes), 2, calls)
+            for i in (1, 2):
+                self.assertTrue(any(f"root={env.host_root(i)} " in c for c in resumes), (i, resumes))
+            last_mining_on = max(t for i in (1, 2) for (m, _, t) in self.starts(env, i) if m)
+            first_resume = min(float(c.rsplit("t=", 1)[1]) for c in resumes)
+            self.assertGreater(first_resume, last_mining_on, "re-armed only after every host was started")
+            self.assertIn("re-armed", r.stdout)
+        finally:
+            env.close()
+
     def test_start_refuses_a_host_binary_older_than_min_chain_rev_before_any_start(self):
         """Pre-join guard: every host's installed binary must report a clean build rev that
         is MIN_CHAIN_REV or a descendant of it in the local checkout (git merge-base
@@ -1316,6 +1385,102 @@ class AgentTest(unittest.TestCase):
         r = self.env.agent(1, "logs-scan", "0")
         self.assertIn("matches 1", r.stdout, r.stdout)
 
+    def test_log_scan_exempts_healthy_startup_recovery_notices(self):
+        # A healthy multi-producer start logs these info lines while each node's applied tip
+        # catches up with fork choice (node/src/canonical_apply.rs, node/src/main.rs). They
+        # name the fork-choice head, not a fork: exempt. A recovery that abandons more than
+        # R1006_MAX_RECOVERY_ABANDON (default 100) applied blocks still counts.
+        log = self.root / "var/log/citrate-node.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        a, b, c = "0x" + "aa" * 32, "0x" + "bb" * 32, "0x" + "cc" * 32
+        outranks = ("INFO citrate::canonical_apply: canonical recovery: fork-choice head {b} outranks the applied tip "
+                    "{a} @ 50; fork point {c} @ 48 ({n} applied block(s) abandoned)\n")
+        log.write_text(
+            f"INFO citrate::canonical_apply: canonical recovery: converged to fork-choice head {b} @ 51\n"
+            + outranks.format(a=a, b=b, c=c, n=2)
+            + f"INFO citrate: canonical recovery: applied tip {a} @ 40 is behind the fork-choice head {b} @ 60 on the "
+              "same chain; the drain advances it (no rebuild)\n"
+            + f"INFO citrate::canonical_apply: periodic drain: fork-choice head {b} extends the applied chain beyond "
+              f"the forward cap; stepped toward it via {c}: Applied\n")
+        r = self.env.agent(1, "logs-scan", "0")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("matches 0", r.stdout, r.stdout)
+        self.assertIn("recovery_reorgs 1", r.stdout, r.stdout)
+        with log.open("a") as f:
+            f.write(outranks.format(a=a, b=b, c=c, n=500))
+            f.write(f"WARN citrate::canonical_apply: canonical recovery: applied tip {a} @ 50 is NOT the fork-choice "
+                    f"head {b} \u2014 rebuilding state from genesis (same-height-sibling wedge remediation)\n")
+        r = self.env.agent(1, "logs-scan", "0")
+        self.assertIn("matches 2", r.stdout, r.stdout)
+
+    def test_log_scan_fails_refused_rebuilds_and_consensus_alarms(self):
+        # Neither line need name a fork or a conflict, and neither is ever exempt, even when
+        # it also carries an exempt phrase.
+        log = self.root / "var/log/citrate-node.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("INFO block 12 imported\n")
+        r = self.env.agent(1, "logs-scan", "0")
+        self.assertIn("matches 0", r.stdout, r.stdout)
+        for line in ("WARN citrate::canonical_apply: canonical recovery: NOT rebuilding from genesis toward 0xab "
+                     "(applied tip 0xcd @ 3): the head is not heavier. The applied tip is kept and sync continues forward.",
+                     "WARN citrate::canonical_apply: CONSENSUS ALARM (I4/CHAIN-B-A002): refusing spine rebuild to head "
+                     "0xab \u2014 it does not descend from the finalized block 0xcd @ 9 (applied tip 0xef @ 12). A deep "
+                     "reorg below finality was blocked; NOT self-healing.",
+                     "WARN CONSENSUS ALARM: runtime reorg: spine rebuild converged to the fork-choice head"):
+            with self.subTest(line=line[:60]):
+                log.write_text("INFO block 12 imported\n" + line + "\n")
+                r = self.env.agent(1, "logs-scan", "0")
+                self.assertIn("matches 1", r.stdout, r.stdout)
+                self.assertIn("hard_fails 1", r.stdout, r.stdout)
+
+    def test_log_scan_read_error_fails_the_scan(self):
+        # A log the scan cannot read is a failed scan, never "0 matches".
+        log = self.root / "var/log/citrate-node.log"
+        log.unlink(missing_ok=True)
+        r = self.env.agent(1, "logs-scan", "0")
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertNotIn("matches 0", r.stdout)
+        shim = self.env.tmp / "jshim"
+        shim.mkdir()
+        (shim / "journalctl").write_text("#!/bin/sh\necho 'Failed to open journal' >&2\nexit 1\n")
+        (shim / "journalctl").chmod(0o755)
+        r = self.env.agent(1, "logs-scan", "0", env={"R1006_SERVICE": "systemd", "PATH": f"{shim}:{os.environ['PATH']}"})
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertNotIn("matches 0", r.stdout)
+        (shim / "journalctl").write_text("#!/bin/sh\necho 'INFO block 1 imported'\n")
+        r = self.env.agent(1, "logs-scan", "0", env={"R1006_SERVICE": "systemd", "PATH": f"{shim}:{os.environ['PATH']}"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("matches 0", r.stdout)
+
+    def test_watchdog_rearm_resumes_an_installed_watchdog_and_is_a_noop_without_one(self):
+        # `stop` pauses the height watchdog for 12 h; `watchdog-rearm` (the end of a
+        # successful start) resumes it where one is installed (ctl on PATH + timer enabled).
+        shim = self.env.tmp / "wdshim"
+        shim.mkdir()
+        calls = self.env.tmp / "wd.calls"
+        (shim / "citrate-watchdog-ctl.sh").write_text(f'#!/bin/sh\necho "ctl $*" >>"{calls}"\n'
+                                                      '[ "${FAKE_WD_RC:-0}" = 0 ] || exit "$FAKE_WD_RC"\n'
+                                                      'echo "watchdog resumed and armed"\n')
+        (shim / "systemctl").write_text(f'#!/bin/sh\necho "systemctl $*" >>"{calls}"\n'
+                                        'case "$*" in *is-enabled*citrate-height-watchdog.timer*) exit 0 ;; esac\nexit 1\n')
+        for f in ("citrate-watchdog-ctl.sh", "systemctl"):
+            (shim / f).chmod(0o755)
+        path = f"{shim}:{os.environ['PATH']}"
+        r = self.env.agent(1, "watchdog-rearm", env={"PATH": path, "R1006_WATCHDOG_CTL": "citrate-watchdog-ctl.sh"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("ctl resume", calls.read_text())
+        self.assertIn("re-armed", r.stdout)
+        # a resume that fails (e.g. the host is contained) fails the command
+        r = self.env.agent(1, "watchdog-rearm", env={"PATH": path, "R1006_WATCHDOG_CTL": "citrate-watchdog-ctl.sh",
+                                                     "FAKE_WD_RC": "1"})
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        # no watchdog installed: nothing to do, rc 0, and no resume
+        calls.unlink()
+        r = self.env.agent(1, "watchdog-rearm", env={"PATH": path})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("no height watchdog", r.stdout)
+        self.assertNotIn("ctl", calls.read_text() if calls.exists() else "")
+
     def test_generated_config_has_no_contribution_recorder(self):
         tool = (REPO / "scripts/producers/gen_node_config.py").read_text().lower()
         self.assertNotIn("contribution", tool)
@@ -1515,6 +1680,128 @@ class BuildRevRunsAsNodeUser(unittest.TestCase):
             self.assertIn("runuser -u citrate -- ", calls)
             self.assertIn("node uid-switched=citrate consensus --json", calls)
             self.assertNotIn("uid-switched=no", calls)
+
+class LocalDevnetOrchestration(unittest.TestCase):
+    """scripts/ops/r1006/local_devnet.sh next to a fake r1006_bringup.sh that records its
+    arguments (and fails a step on request), so the devnet's own option handling, step
+    sequencing and lifetime are tested without a build. It runs in its own unprivileged
+    user + net + pid namespace like the real rehearsal; nothing reaches the host network."""
+
+    FAKE_BRINGUP = """#!/usr/bin/env bash
+echo "$*" >>"$FAKE_BRINGUP_LOG"
+step="$1"
+rc_var="FAKE_RC_${step//-/_}"
+exit "${!rc_var:-0}"
+"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="dgx-r1006d."))
+        (self.tmp / "ops/r1006").mkdir(parents=True)
+        shutil.copy(OPS / "r1006/local_devnet.sh", self.tmp / "ops/r1006/local_devnet.sh")
+        (self.tmp / "ops/r1006_bringup.sh").write_text(self.FAKE_BRINGUP)
+        self.work = self.tmp / "work"
+        (self.work / "state").mkdir(parents=True)
+        self.log = self.tmp / "bringup.calls"
+        self.env = dict(os.environ, HOME=str(self.tmp), TMPDIR=str(self.tmp), FAKE_BRINGUP_LOG=str(self.log))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def devnet(self, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run(["bash", str(self.tmp / "ops/r1006/local_devnet.sh"), "--nodes", "2", "--work",
+                               str(self.work), *args], capture_output=True, text=True, timeout=120,
+                              env=dict(self.env, **(env or {})), stdin=subprocess.DEVNULL)
+
+    def calls(self) -> list[str]:
+        return self.log.read_text().splitlines() if self.log.exists() else []
+
+    def test_min_chain_rev_reaches_start_inside_the_namespace(self):
+        sha = "56cc2bc80439c350dd9eca8817f173c1986096e6"
+        r = self.devnet("--steps", "start", "--min-chain-rev", sha)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        start = [c for c in self.calls() if c.startswith("start ")]
+        self.assertEqual(len(start), 1, self.calls())
+        self.assertIn(f"--min-chain-rev {sha}", start[0])
+
+    def test_a_failed_step_stops_the_run(self):
+        r = self.devnet("--steps", "start smoke status", env={"FAKE_RC_start": "1"})
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        steps = [c.split()[0] for c in self.calls()]
+        self.assertEqual(steps, ["start"], self.calls())
+        # wipe-keys-refused passes when the bring-up refuses (rc != 0), and fails when it does not
+        self.log.unlink()
+        r = self.devnet("--steps", "wipe-keys-refused status", env={"FAKE_RC_wipe": "2"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual([c.split()[0] for c in self.calls()], ["wipe", "status"], self.calls())
+        self.log.unlink()
+        r = self.devnet("--steps", "wipe-keys-refused status")
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual([c.split()[0] for c in self.calls()], ["wipe"], self.calls())
+
+    def test_keep_holds_the_devnet_until_it_is_signalled(self):
+        p = subprocess.Popen(["bash", str(self.tmp / "ops/r1006/local_devnet.sh"), "--nodes", "2", "--work",
+                              str(self.work), "--steps", "status", "--keep"], stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, env=self.env, stdin=subprocess.DEVNULL,
+                             start_new_session=True)
+        try:
+            seen = ""
+            deadline = time.time() + 60
+            while "devnet: kept" not in seen and time.time() < deadline:
+                if p.poll() is not None:
+                    seen += p.stdout.read()
+                    break
+                ready, _, _ = select.select([p.stdout], [], [], 1)
+                if ready:
+                    seen += p.stdout.readline()
+            self.assertIn("devnet: kept", seen, seen)
+            time.sleep(1.5)
+            self.assertIsNone(p.poll(), "the devnet ended although --keep was given: " + seen)
+            # SIGTERM to the process group, as a terminal's Ctrl-C reaches it (SIGINT): the
+            # namespace's PID 1 ends, and the devnet with it.
+            os.killpg(p.pid, signal.SIGTERM)
+            p.wait(timeout=20)
+        finally:
+            if p.poll() is None:
+                os.killpg(p.pid, signal.SIGKILL)
+                p.wait()
+        r = self.devnet("--steps", "status")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("devnet: kept", r.stdout)
+
+    def test_the_rehearsal_stand_in_fill_warns_that_it_halts_at_activation(self):
+        r = self.devnet("--steps", "genesis-fill")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(r.stdout + r.stderr, r"WARNING.*stand-in.*halts? at")
+        self.assertIn("rehearsal_fill.py", self.calls()[0])
+        self.log.unlink()
+        r = self.devnet("--steps", "genesis-fill", "--fill-cmd", "python3 real_fill.py {producers} {stakes} {out}")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("stand-in", r.stdout + r.stderr)
+        self.assertIn("real_fill.py", self.calls()[0])
+
+
+class RehearsalFillWarns(unittest.TestCase):
+    def test_stand_in_says_it_halts_at_the_activation_height(self):
+        with tempfile.TemporaryDirectory(prefix="dgx-r1006w.") as td:
+            t = Path(td)
+            ident = good_identity(1)
+            (t / "p.json").write_text(json.dumps({"producers": [ident]}))
+            (t / "s.json").write_text(json.dumps({"stakes": {ident["staker_address"]: {"stake_wei": "1"}}}))
+            r = subprocess.run([sys.executable, str(FILL_FIXTURE), "--producers", str(t / "p.json"), "--stakes",
+                                str(t / "s.json"), "--out", str(t / "out"), "--genesis-hash", R1006_TEST,
+                                "--registry", REG_TEST], capture_output=True, text=True, cwd=td)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertRegex(r.stderr, r"WARNING.*halts at block 1000")
+            self.assertIn("fill_producers.py", r.stderr)
+
+
+class CommittedMinChainRev(unittest.TestCase):
+    def test_the_reviewed_floor_is_committed(self):
+        f = OPS / "r1006" / "min_chain_rev"
+        self.assertTrue(f.is_file(), "scripts/ops/r1006/min_chain_rev is committed")
+        lines = [l.strip() for l in f.read_text().splitlines() if l.strip() and not l.strip().startswith("#")]
+        self.assertEqual(lines, ["56cc2bc80439c350dd9eca8817f173c1986096e6"])
+
 
 if __name__ == "__main__":
     unittest.main()

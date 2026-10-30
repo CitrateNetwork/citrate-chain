@@ -11,7 +11,8 @@
 # `--config FILE`: a fake node. It serves eth_getBlockByNumber / eth_blockNumber /
 # net_peerCount / eth_chainId on the [rpc] listen_addr, answers block 0 with the hash in
 # <root>/fake-block0 (root = the dir holding usr/local/bin/<this file>, the host's
-# R1006_ROOT; default below), and appends "start mining=<true|false> block0=<hash> t=<time> probe=<0|1>" to
+# R1006_ROOT; default below), answers eth_blockNumber with <root>/fake-head (read per
+# request; default 0x0), and appends "start mining=<true|false> block0=<hash> t=<time> probe=<0|1>" to
 # <root>/fake-node.log (probe=1: started by host_agent.sh probe-genesis).
 #
 # Set R1006_TEST_KEYTOOL to a real `citrate` binary to run the key tests against it.
@@ -68,7 +69,10 @@ class H(BaseHTTPRequestHandler):
             res = {"hash": block0, "number": "0x0"} if n in ("0x0", "finalized") else \
                   {"hash": "0x" + "ab" * 32, "number": n, "miner": coinbase}
         elif m == "eth_blockNumber":
-            res = "0x0"
+            try:
+                res = open(os.path.join(root, "fake-head")).read().strip() or "0x0"
+            except OSError:
+                res = "0x0"
         elif m == "net_peerCount":
             res = "0x10"
         elif m == "eth_chainId":
