@@ -11,7 +11,7 @@ consistency check has something to compare; this stand-in does not change the ge
 So the devnet producers are NOT registered, and a rehearsal chain halts at the validator
 activation height (block 1000; the last block is 999). It says so on stderr. To run past
 activation, use the real fill and a throwaway rebuild that pins its genesis
-(scripts/ops/r1006/local_devnet.sh header, docs/ops/R1006_BRINGUP.md).
+(the local_devnet header in scripts/ops/r1006/, docs/ops/R1006_BRINGUP.md).
 With --genesis-hash it skips the probe and writes that hash with --profile (default
 r1006): the unit tests use it to plant a fill.
 
